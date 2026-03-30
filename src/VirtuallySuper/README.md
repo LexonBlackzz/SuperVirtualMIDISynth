@@ -2,8 +2,9 @@
 
 This folder is the runtime home for the planned `VirtuallySuper` engine.
 
-At the current stage it is a scaffold only. The engine is still being defined in
-the design documents under [../SceneSynth](../SceneSynth/README.md).
+The engine is still being defined in the design documents under
+[../SceneSynth](../SceneSynth/README.md), but Phase 10 has now started with a
+small real code slice: a scheduler-only prototype.
 
 ## Intent
 
@@ -26,5 +27,19 @@ the design documents under [../SceneSynth](../SceneSynth/README.md).
 - `VirtuallySuperTelemetry*`
 - `VirtuallySuperOverload*`
 
-No runtime code is integrated yet. This folder exists so Phase 1 has a real
-source root and a stable place to grow from.
+## Current Phase 10 Slice
+
+The first concrete runtime slice is:
+
+- `VirtuallySuperTypes.h`
+- `VirtuallySuperScheduler.h/.cpp`
+- `VirtuallySuperEngine.h/.cpp`
+
+This slice is intentionally limited:
+
+- fixed-capacity ingress and scheduled-event storage
+- per-key transition queues
+- deterministic scheduled ordering
+- scheduler-only prototype API
+
+It is not integrated into the existing playback path yet.

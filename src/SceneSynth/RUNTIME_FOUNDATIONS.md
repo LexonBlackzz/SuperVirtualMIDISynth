@@ -17,6 +17,31 @@ Phase 1 freezes:
 - deterministic offline mode expectations
 - configuration layering rules
 - the modular source tree direction for implementation
+- toolchain policy for modern versus legacy-compatible builds
+
+## Toolchain Policy
+
+`VirtuallySuper` should treat compiler choice as part of platform policy, not as
+an incidental local detail.
+
+Current intended split:
+
+- `MSVC` for mainstream `x86` and `x64` builds
+- legacy `MinGW` path for `Windows XP` builds
+
+Rationale:
+
+- the project is primarily developed with the modern `MSVC` toolchain
+- prior attempts to use XP-targeted `MSVC` flows still produced undesired
+  Windows 8+ kernel imports in practice
+- the XP build should therefore be handled as a deliberately separate legacy
+  toolchain path
+
+Implementation implications:
+
+- avoid compiler-specific dependencies in hot runtime code unless guarded
+- keep headers conservative and portable between `MSVC` and `MinGW`
+- validate new runtime slices against the expected toolchain matrix early
 
 ## Runtime State Model
 

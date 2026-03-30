@@ -116,3 +116,11 @@ This file is intended to be updated as work lands.
 - [x] Audio hash regression strategy specified
 - [x] Black MIDI benchmark set specified
 - [x] Scheduler fuzz strategy specified
+
+## Prototype And Integration
+
+- [x] First scheduler-only prototype started in `src/VirtuallySuper`
+- [ ] First exact-tier-only prototype started
+- [ ] First grouped rendering prototype started
+- [ ] First density prototype started
+- [ ] Prototype telemetry wired for Configurator consumption
