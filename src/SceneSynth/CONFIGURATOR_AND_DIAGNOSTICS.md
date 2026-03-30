@@ -25,7 +25,7 @@ The intended model is:
   Safe day-to-day settings for most users.
 - `Advanced`
   More detailed tuning for power users.
-- `Expert`
+- `PowerUser`
   Voice, layer, grouping, density, and overload controls.
 - `Developer`
   Experimental or diagnostic-only settings.
@@ -57,7 +57,7 @@ Examples of `Advanced` settings:
 - limiter and FX policy
 - general scheduler mode
 
-Examples of `Expert` settings:
+Examples of `PowerUser` settings:
 
 - exact-tier ceilings
 - grouped-tier admission thresholds
