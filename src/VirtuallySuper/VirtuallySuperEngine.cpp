@@ -3,11 +3,12 @@
 namespace virtuallysuper {
 
 EnginePrototype::EnginePrototype()
-    : scheduler_(), exact_(), initialized_(false), drainBatch_() {}
+    : scheduler_(), exact_(), grouped_(), initialized_(false), drainBatch_() {}
 
 bool EnginePrototype::Initialize(const EngineConfig &config) {
   initialized_ =
-      scheduler_.Initialize(config.scheduler) && exact_.Initialize(config.exact);
+      scheduler_.Initialize(config.scheduler) && exact_.Initialize(config.exact) &&
+      grouped_.Initialize(config.grouped);
   return initialized_;
 }
 
@@ -22,6 +23,7 @@ void EnginePrototype::Reset() {
     return;
   scheduler_.Reset();
   exact_.Reset();
+  grouped_.Reset();
 }
 
 ScheduleDecision EnginePrototype::SubmitEvent(const NormalizedEvent &event) {
@@ -48,6 +50,7 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
 
   size_t totalApplied = 0;
   int64_t localRenderUntil = blockEndSample;
+  grouped_.BeginWindow();
 
   while (true) {
     const size_t drained = scheduler_.DrainScheduledWindow(
@@ -60,8 +63,10 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
       return totalApplied;
     }
 
-    for (size_t i = 0; i < drained; ++i)
+    for (size_t i = 0; i < drained; ++i) {
       exact_.ApplyEvent(drainBatch_[i]);
+      grouped_.AccumulateEvent(drainBatch_[i]);
+    }
 
     totalApplied += drained;
     cursorSample = localRenderUntil;
@@ -90,5 +95,11 @@ Scheduler &EnginePrototype::GetScheduler() { return scheduler_; }
 const ExactSystem &EnginePrototype::GetExactSystem() const { return exact_; }
 
 ExactSystem &EnginePrototype::GetExactSystem() { return exact_; }
+
+const GroupedSystem &EnginePrototype::GetGroupedSystem() const {
+  return grouped_;
+}
+
+GroupedSystem &EnginePrototype::GetGroupedSystem() { return grouped_; }
 
 } // namespace virtuallysuper

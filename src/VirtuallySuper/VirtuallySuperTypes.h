@@ -19,6 +19,7 @@ static const uint32_t kDefaultIngressCapacity = 4096;
 static const uint32_t kDefaultScheduledCapacity = 16384;
 static const int64_t kDefaultCoalesceWindowSamples = 8;
 static const uint32_t kDefaultExactVoiceCapacity = 256;
+static const uint32_t kDefaultGroupedCapacity = 128;
 static const uint32_t kDrainBatchCapacity = 256;
 static const uint32_t kInvalidVoiceHandle = 0xFFFFFFFFu;
 
@@ -128,11 +129,6 @@ struct ExactConfig {
                   quietVelocityThreshold(60) {}
 };
 
-struct EngineConfig {
-  SchedulerConfig scheduler;
-  ExactConfig exact;
-};
-
 struct SchedulerStats {
   uint32_t ingressQueued;
   uint32_t ingressDropped;
@@ -194,6 +190,56 @@ struct ExactStats {
       : activeVoices(0), releasedVoices(0), peakActiveVoices(0),
         noteOnsApplied(0), noteOffsApplied(0), steals(0), quietSteals(0),
         releaseSteals(0) {}
+};
+
+struct GroupedConfig {
+  uint32_t maxGroups;
+  uint8_t pitchBandSemitones;
+  uint8_t reserved0;
+  uint16_t reserved1;
+  int64_t timingBucketSamples;
+
+  GroupedConfig()
+      : maxGroups(kDefaultGroupedCapacity), pitchBandSemitones(6),
+        reserved0(0), reserved1(0), timingBucketSamples(32) {}
+};
+
+struct EngineConfig {
+  SchedulerConfig scheduler;
+  ExactConfig exact;
+  GroupedConfig grouped;
+};
+
+struct GroupedObject {
+  uint8_t active;
+  uint8_t channel;
+  uint8_t pitchBandId;
+  uint8_t layerTemplateId;
+  uint16_t sampleFamilyId;
+  uint16_t reserved;
+  uint32_t groupId;
+  uint32_t timingBucketId;
+  uint32_t representedNoteCount;
+  uint32_t representedLayerCount;
+  uint32_t noteOnCount;
+  int64_t lastTargetSample;
+
+  GroupedObject()
+      : active(0), channel(0), pitchBandId(0), layerTemplateId(0),
+        sampleFamilyId(0), reserved(0), groupId(0), timingBucketId(0),
+        representedNoteCount(0), representedLayerCount(0), noteOnCount(0),
+        lastTargetSample(0) {}
+};
+
+struct GroupedStats {
+  uint32_t activeGroups;
+  uint32_t peakActiveGroups;
+  uint32_t noteOnsAccumulated;
+  uint32_t droppedNoteOns;
+
+  GroupedStats()
+      : activeGroups(0), peakActiveGroups(0), noteOnsAccumulated(0),
+        droppedNoteOns(0) {}
 };
 
 inline bool EventUsesKey(EventKind kind) {
