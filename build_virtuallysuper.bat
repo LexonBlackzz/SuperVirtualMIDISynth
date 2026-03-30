@@ -51,10 +51,13 @@ set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /WX- /permissive- /I\"%ROOT%\src\Virt
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperEngine.cpp" /Fo"%OBJDIR%\VirtuallySuperEngine.obj"
 if errorlevel 1 exit /b %errorlevel%
 
+cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperExact.cpp" /Fo"%OBJDIR%\VirtuallySuperExact.obj"
+if errorlevel 1 exit /b %errorlevel%
+
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperScheduler.cpp" /Fo"%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
-lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
+lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
 echo Built "%OUTDIR%\VirtuallySuperPrototype.lib"
