@@ -33,6 +33,7 @@ The first concrete runtime slice is:
 
 - `VirtuallySuperTypes.h`
 - `VirtuallySuperScheduler.h/.cpp`
+- `VirtuallySuperExact.h/.cpp`
 - `VirtuallySuperEngine.h/.cpp`
 
 This slice is intentionally limited:
@@ -40,6 +41,9 @@ This slice is intentionally limited:
 - fixed-capacity ingress and scheduled-event storage
 - per-key transition queues
 - deterministic scheduled ordering
-- scheduler-only prototype API
+- fixed-capacity exact voice pool
+- direct `(channel, note)` exact voice lookup
+- queue-based exact voice stealing
+- scheduler-to-exact prototype API
 
 It is not integrated into the existing playback path yet.

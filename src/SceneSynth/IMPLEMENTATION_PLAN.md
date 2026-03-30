@@ -103,7 +103,7 @@ engines while the new engine is designed and prototyped in parallel.
 ## Phase 10: Prototype And Integration
 
 - [x] Build first scheduler-only prototype
-- [ ] Build first exact-tier-only prototype
+- [x] Build first exact-tier-only prototype
 - [ ] Add grouped rendering prototype
 - [ ] Add first density prototype
 - [ ] Wire Configurator to prototype telemetry
