@@ -102,7 +102,7 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 10: Prototype And Integration
 
-- [ ] Build first scheduler-only prototype
+- [x] Build first scheduler-only prototype
 - [ ] Build first exact-tier-only prototype
 - [ ] Add grouped rendering prototype
 - [ ] Add first density prototype

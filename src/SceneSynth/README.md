@@ -55,3 +55,18 @@ The initial target matrix for `VirtuallySuper` is:
 - `Windows XP` compatibility for the supported legacy build path
 
 `NT 4` is out of scope for the initial design.
+
+## Toolchain Policy
+
+The intended build-toolchain split is:
+
+- modern `x86` and `x64`: `MSVC` (current Visual Studio toolset)
+- `Windows XP` compatibility path: `MinGW` legacy toolchain kept in the older
+  workspace
+
+This reflects current practical experience:
+
+- the normal `MSVC` path is preferred for current Windows targets
+- the XP-oriented `MSVC` route has previously produced newer kernel imports than
+  desired
+- the XP path should therefore remain a distinct legacy-compatible build lane

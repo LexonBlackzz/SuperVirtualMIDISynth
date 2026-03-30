@@ -298,7 +298,10 @@ The project should support a headless validation path suitable for automation.
 
 ### Recommended CI Jobs
 
-- build matrix: `x86`, `x64`, XP-compatible path
+- build matrix:
+  - `x86` with `MSVC`
+  - `x64` with `MSVC`
+  - XP-compatible path with legacy `MinGW`
 - offline deterministic render tests
 - audio hash checks
 - protocol schema checks
