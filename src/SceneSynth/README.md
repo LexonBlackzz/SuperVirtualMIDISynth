@@ -27,6 +27,7 @@ This folder currently contains design documents only. No runtime code lives here
 - [Module Map](./MODULE_MAP.md)
 - [Event Model](./EVENT_MODEL.md)
 - [Scheduler Design](./SCHEDULER_DESIGN.md)
+- [Scene Compiler](./SCENE_COMPILER.md)
 - [Configurator And Diagnostics](./CONFIGURATOR_AND_DIAGNOSTICS.md)
 - [Implementation Plan](./IMPLEMENTATION_PLAN.md)
 - [Checklist](./CHECKLIST.md)

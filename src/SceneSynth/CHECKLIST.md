@@ -12,6 +12,7 @@ This file is intended to be updated as work lands.
 - [x] Module map document written
 - [x] Event model document written
 - [x] Scheduler design document written
+- [x] Scene compiler document written
 - [x] Initial configurator and diagnostics document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
@@ -45,6 +46,15 @@ This file is intended to be updated as work lands.
 - [x] Same-key buzz protection rules specified
 - [x] Sustain overload rules specified
 - [x] Event reduction heuristics specified
+
+## Scene Compiler
+
+- [x] Exact note allocation path specified
+- [x] Grouped object allocation path specified
+- [x] Density object allocation path specified
+- [x] Promotion and demotion rules specified
+- [x] Note importance scoring model specified
+- [x] Exact attack protection specified
 
 ## Render
 
