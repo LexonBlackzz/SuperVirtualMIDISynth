@@ -50,11 +50,11 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 4: Exact Voice System
 
-- [ ] Define exact voice runtime state
-- [ ] Define note-off direct lookup model
-- [ ] Define steal heaps or queues
-- [ ] Define release shortening and quiet-tail culling policy
-- [ ] Define per-note expression escape path
+- [x] Define exact voice runtime state
+- [x] Define note-off direct lookup model
+- [x] Define steal heaps or queues
+- [x] Define release shortening and quiet-tail culling policy
+- [x] Define per-note expression escape path
 
 ## Phase 5: Grouped And Density Rendering
 
