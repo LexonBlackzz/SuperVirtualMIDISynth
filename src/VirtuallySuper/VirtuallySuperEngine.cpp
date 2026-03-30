@@ -2,17 +2,26 @@
 
 namespace virtuallysuper {
 
-EnginePrototype::EnginePrototype() : scheduler_(), initialized_(false) {}
+EnginePrototype::EnginePrototype()
+    : scheduler_(), exact_(), initialized_(false), drainBatch_() {}
+
+bool EnginePrototype::Initialize(const EngineConfig &config) {
+  initialized_ =
+      scheduler_.Initialize(config.scheduler) && exact_.Initialize(config.exact);
+  return initialized_;
+}
 
 bool EnginePrototype::Initialize(const SchedulerConfig &schedulerConfig) {
-  initialized_ = scheduler_.Initialize(schedulerConfig);
-  return initialized_;
+  EngineConfig config;
+  config.scheduler = schedulerConfig;
+  return Initialize(config);
 }
 
 void EnginePrototype::Reset() {
   if (!initialized_)
     return;
   scheduler_.Reset();
+  exact_.Reset();
 }
 
 ScheduleDecision EnginePrototype::SubmitEvent(const NormalizedEvent &event) {
@@ -25,6 +34,38 @@ uint32_t EnginePrototype::FlushPendingIngress(uint32_t maxEvents) {
   if (!initialized_)
     return 0;
   return scheduler_.FlushIngressToScheduled(maxEvents);
+}
+
+size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
+                                             int64_t blockEndSample,
+                                             int64_t windowEndSample,
+                                             int64_t *renderUntilSample) {
+  if (!initialized_) {
+    if (renderUntilSample)
+      *renderUntilSample = blockEndSample;
+    return 0;
+  }
+
+  size_t totalApplied = 0;
+  int64_t localRenderUntil = blockEndSample;
+
+  while (true) {
+    const size_t drained = scheduler_.DrainScheduledWindow(
+        cursorSample, blockEndSample, windowEndSample, drainBatch_,
+        kDrainBatchCapacity, &localRenderUntil);
+
+    if (drained == 0) {
+      if (renderUntilSample)
+        *renderUntilSample = localRenderUntil;
+      return totalApplied;
+    }
+
+    for (size_t i = 0; i < drained; ++i)
+      exact_.ApplyEvent(drainBatch_[i]);
+
+    totalApplied += drained;
+    cursorSample = localRenderUntil;
+  }
 }
 
 size_t EnginePrototype::DrainWindow(int64_t cursorSample, int64_t blockEndSample,
@@ -45,5 +86,9 @@ size_t EnginePrototype::DrainWindow(int64_t cursorSample, int64_t blockEndSample
 const Scheduler &EnginePrototype::GetScheduler() const { return scheduler_; }
 
 Scheduler &EnginePrototype::GetScheduler() { return scheduler_; }
+
+const ExactSystem &EnginePrototype::GetExactSystem() const { return exact_; }
+
+ExactSystem &EnginePrototype::GetExactSystem() { return exact_; }
 
 } // namespace virtuallysuper

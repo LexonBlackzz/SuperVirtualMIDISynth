@@ -18,6 +18,9 @@ static const uint32_t kTransitionQueueCapacity = 8;
 static const uint32_t kDefaultIngressCapacity = 4096;
 static const uint32_t kDefaultScheduledCapacity = 16384;
 static const int64_t kDefaultCoalesceWindowSamples = 8;
+static const uint32_t kDefaultExactVoiceCapacity = 256;
+static const uint32_t kDrainBatchCapacity = 256;
+static const uint32_t kInvalidVoiceHandle = 0xFFFFFFFFu;
 
 enum class EventKind : uint8_t {
   Invalid = 0,
@@ -40,6 +43,20 @@ enum class ScheduledKeyStateValue : uint8_t {
   Unknown = 0,
   Off,
   On
+};
+
+enum class ExactLifecycleState : uint8_t {
+  Free = 0,
+  Active,
+  Released
+};
+
+enum class ExactQueueClass : uint8_t {
+  None = 0,
+  QuietActive,
+  LoudActive,
+  QuietRelease,
+  LoudRelease
 };
 
 struct NormalizedEvent {
@@ -103,6 +120,19 @@ struct SchedulerConfig {
         coalesceWindowSamples(kDefaultCoalesceWindowSamples) {}
 };
 
+struct ExactConfig {
+  uint32_t maxVoices;
+  uint8_t quietVelocityThreshold;
+
+  ExactConfig() : maxVoices(kDefaultExactVoiceCapacity),
+                  quietVelocityThreshold(60) {}
+};
+
+struct EngineConfig {
+  SchedulerConfig scheduler;
+  ExactConfig exact;
+};
+
 struct SchedulerStats {
   uint32_t ingressQueued;
   uint32_t ingressDropped;
@@ -121,6 +151,49 @@ struct SchedulerStats {
         scheduledDropped(0), coalescedEvents(0), replacedEvents(0),
         drainedEvents(0), queueOverflowDrops(0), maxScheduledDepth(0),
         maxIngressDepth(0), maxTransitionQueueDepth(0) {}
+};
+
+struct ExactVoice {
+  uint32_t voiceId;
+  uint32_t generation;
+  uint32_t startSequence;
+  ExactLifecycleState state;
+  ExactQueueClass queueClass;
+  uint8_t channel;
+  uint8_t note;
+  uint8_t velocity;
+  uint8_t layerTemplateId;
+  uint8_t protectedAttack;
+  uint8_t releaseShortened;
+  uint16_t reserved;
+  uint32_t nextSameKey;
+  uint32_t prevSameKey;
+  uint32_t nextQueue;
+  uint32_t prevQueue;
+
+  ExactVoice()
+      : voiceId(0), generation(0), startSequence(0),
+        state(ExactLifecycleState::Free), queueClass(ExactQueueClass::None),
+        channel(0), note(0), velocity(0), layerTemplateId(0),
+        protectedAttack(0), releaseShortened(0), reserved(0),
+        nextSameKey(kInvalidVoiceHandle), prevSameKey(kInvalidVoiceHandle),
+        nextQueue(kInvalidVoiceHandle), prevQueue(kInvalidVoiceHandle) {}
+};
+
+struct ExactStats {
+  uint32_t activeVoices;
+  uint32_t releasedVoices;
+  uint32_t peakActiveVoices;
+  uint32_t noteOnsApplied;
+  uint32_t noteOffsApplied;
+  uint32_t steals;
+  uint32_t quietSteals;
+  uint32_t releaseSteals;
+
+  ExactStats()
+      : activeVoices(0), releasedVoices(0), peakActiveVoices(0),
+        noteOnsApplied(0), noteOffsApplied(0), steals(0), quietSteals(0),
+        releaseSteals(0) {}
 };
 
 inline bool EventUsesKey(EventKind kind) {
