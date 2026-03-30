@@ -18,6 +18,7 @@ This file is intended to be updated as work lands.
 - [x] Tile renderer and threading document written
 - [x] Diagnostics and live protocol document written
 - [x] Initial configurator and diagnostics document written
+- [x] Configurator rewrite document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
 - [x] Engine name chosen: `VirtuallySuper`
@@ -101,12 +102,12 @@ This file is intended to be updated as work lands.
 
 ## Configurator
 
-- [ ] New tab layout finalized
-- [ ] Basic/advanced/power-user/developer settings split finalized
-- [ ] SoundFont folder UX finalized
-- [ ] Debug window finalized
-- [ ] Graph set finalized
-- [ ] Profile system finalized
+- [x] New tab layout finalized
+- [x] Basic/advanced/power-user/developer settings split finalized
+- [x] SoundFont folder UX finalized
+- [x] Debug window finalized
+- [x] Graph set finalized
+- [x] Profile system finalized
 
 ## Validation
 

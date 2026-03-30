@@ -84,13 +84,13 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 8: Configurator Rewrite
 
-- [ ] Define tab structure
-- [ ] Define basic, advanced, power-user, and developer setting surfaces
-- [ ] Define SoundFont discovery UX
-- [ ] Define diagnostics graphs and views
-- [ ] Define profile import/export format
-- [ ] Define advanced and developer modes
-- [ ] Define versioning strategy for protocol changes
+- [x] Define tab structure
+- [x] Define basic, advanced, power-user, and developer setting surfaces
+- [x] Define SoundFont discovery UX
+- [x] Define diagnostics graphs and views
+- [x] Define profile import/export format
+- [x] Define advanced and developer modes
+- [x] Define versioning strategy for protocol changes
 
 ## Phase 9: Test And Validation Infrastructure
 

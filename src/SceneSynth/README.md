@@ -33,6 +33,7 @@ This folder currently contains design documents only. No runtime code lives here
 - [Tile Renderer And Threading](./TILE_RENDERER_AND_THREADING.md)
 - [Diagnostics And Live Protocol](./DIAGNOSTICS_AND_LIVE_PROTOCOL.md)
 - [Configurator And Diagnostics](./CONFIGURATOR_AND_DIAGNOSTICS.md)
+- [Configurator Rewrite](./CONFIGURATOR_REWRITE.md)
 - [Implementation Plan](./IMPLEMENTATION_PLAN.md)
 - [Checklist](./CHECKLIST.md)
 
