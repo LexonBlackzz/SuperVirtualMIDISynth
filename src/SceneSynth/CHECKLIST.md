@@ -15,6 +15,7 @@ This file is intended to be updated as work lands.
 - [x] Scene compiler document written
 - [x] Exact voice system document written
 - [x] Grouped and density rendering document written
+- [x] Tile renderer and threading document written
 - [x] Initial configurator and diagnostics document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
@@ -73,13 +74,22 @@ This file is intended to be updated as work lands.
 - [x] Density gain and phase-randomization strategy specified
 - [x] Grouped/density handoff rules specified
 
+## Tile Renderer And Threading
+
+- [x] Tile size policy specified
+- [x] Job queue format specified
+- [x] Worker thread model specified
+- [x] Tile merge path specified
+- [x] Deterministic offline worker policy specified
+- [x] Scalar and SIMD helper strategy specified
+
 ## Render
 
-- [ ] Exact tier design specified
+- [x] Exact tier design specified
 - [x] Grouped tier design specified
 - [x] Density tier design specified
-- [ ] Tile renderer design specified
-- [ ] Threading design specified
+- [x] Tile renderer design specified
+- [x] Threading design specified
 
 ## Diagnostics
 

@@ -144,6 +144,8 @@ Design rules:
 - job-based threading over giant full-block worker buffers
 - contiguous or page-local sample work whenever possible
 - exact, grouped, and density jobs can coexist in one tile
+- SIMD helper specialization should be explicit rather than hidden inside one
+  monolithic render loop
 
 Proposed implementation split:
 

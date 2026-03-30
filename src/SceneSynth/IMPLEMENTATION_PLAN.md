@@ -67,12 +67,12 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 6: Tile Renderer And Threading
 
-- [ ] Define tile size policy
-- [ ] Define job queue format
-- [ ] Define worker thread model
-- [ ] Define tile merge path
-- [ ] Define deterministic worker policy for offline mode
-- [ ] Define scalar and SIMD render helper strategy
+- [x] Define tile size policy
+- [x] Define job queue format
+- [x] Define worker thread model
+- [x] Define tile merge path
+- [x] Define deterministic worker policy for offline mode
+- [x] Define scalar and SIMD render helper strategy
 
 ## Phase 7: Diagnostics And Live Protocol
 
