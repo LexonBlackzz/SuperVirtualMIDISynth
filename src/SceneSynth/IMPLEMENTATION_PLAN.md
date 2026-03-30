@@ -58,12 +58,12 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 5: Grouped And Density Rendering
 
-- [ ] Define grouped render object structure
-- [ ] Define grouping keys: page, pitch band, layer template, timing bucket
-- [ ] Define grouped modulation-sharing rules
-- [ ] Choose first density approach: likely granular cloud
-- [ ] Define density gain and phase randomization strategy
-- [ ] Define handoff rules between grouped and density tiers
+- [x] Define grouped render object structure
+- [x] Define grouping keys: page, pitch band, layer template, timing bucket
+- [x] Define grouped modulation-sharing rules
+- [x] Choose first density approach: granular cloud
+- [x] Define density gain and phase randomization strategy
+- [x] Define handoff rules between grouped and density tiers
 
 ## Phase 6: Tile Renderer And Threading
 

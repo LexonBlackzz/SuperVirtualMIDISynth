@@ -122,6 +122,10 @@ Candidate approaches:
 - pitch-bucket texture synthesis
 - later spectral density experiment
 
+Initial chosen direction:
+
+- granular cloud renderer as the first density implementation
+
 Proposed implementation split:
 
 - `VirtuallySuperDensity.h/.cpp`

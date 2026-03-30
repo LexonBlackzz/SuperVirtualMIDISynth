@@ -14,6 +14,7 @@ This file is intended to be updated as work lands.
 - [x] Scheduler design document written
 - [x] Scene compiler document written
 - [x] Exact voice system document written
+- [x] Grouped and density rendering document written
 - [x] Initial configurator and diagnostics document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
@@ -27,9 +28,7 @@ This file is intended to be updated as work lands.
 
 ## Open Design Decisions
 
-- [ ] First density implementation choice
 - [ ] Whether SceneSynth ships alongside TSF first or starts as an internal prototype
-- [ ] Whether grouped rendering is per-channel, per-bucket, or hybrid by default
 
 ## Engine Foundation
 
@@ -65,11 +64,20 @@ This file is intended to be updated as work lands.
 - [x] Release shortening and quiet-tail policy specified
 - [x] Per-note expression escape path specified
 
+## Grouped And Density Rendering
+
+- [x] Grouped object structure specified
+- [x] Grouping keys specified
+- [x] Grouped modulation-sharing rules specified
+- [x] First density implementation chosen: granular cloud
+- [x] Density gain and phase-randomization strategy specified
+- [x] Grouped/density handoff rules specified
+
 ## Render
 
 - [ ] Exact tier design specified
-- [ ] Grouped tier design specified
-- [ ] Density tier design specified
+- [x] Grouped tier design specified
+- [x] Density tier design specified
 - [ ] Tile renderer design specified
 - [ ] Threading design specified
 
