@@ -76,16 +76,16 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 7: Diagnostics And Live Protocol
 
-- [ ] Define hot, warm, and cold stat groups
-- [ ] Define shared-memory snapshot format
-- [ ] Define SPSC debug event ring
-- [ ] Define stat update cadence
-- [ ] Define debug level policy
+- [x] Define hot, warm, and cold stat groups
+- [x] Define shared-memory snapshot format
+- [x] Define SPSC debug event ring
+- [x] Define stat update cadence
+- [x] Define debug level policy
 
 ## Phase 8: Configurator Rewrite
 
 - [ ] Define tab structure
-- [ ] Define basic, advanced, expert, and developer setting surfaces
+- [ ] Define basic, advanced, power-user, and developer setting surfaces
 - [ ] Define SoundFont discovery UX
 - [ ] Define diagnostics graphs and views
 - [ ] Define profile import/export format

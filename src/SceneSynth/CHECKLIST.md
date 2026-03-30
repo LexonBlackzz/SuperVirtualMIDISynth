@@ -16,6 +16,7 @@ This file is intended to be updated as work lands.
 - [x] Exact voice system document written
 - [x] Grouped and density rendering document written
 - [x] Tile renderer and threading document written
+- [x] Diagnostics and live protocol document written
 - [x] Initial configurator and diagnostics document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
@@ -93,15 +94,15 @@ This file is intended to be updated as work lands.
 
 ## Diagnostics
 
-- [ ] Shared snapshot schema specified
-- [ ] Event ring schema specified
-- [ ] Hot/warm/cold stat groups specified
-- [ ] Debug level policy specified
+- [x] Shared snapshot schema specified
+- [x] Event ring schema specified
+- [x] Hot/warm/cold stat groups specified
+- [x] Debug level policy specified
 
 ## Configurator
 
 - [ ] New tab layout finalized
-- [ ] Basic/advanced/expert/developer settings split finalized
+- [ ] Basic/advanced/power-user/developer settings split finalized
 - [ ] SoundFont folder UX finalized
 - [ ] Debug window finalized
 - [ ] Graph set finalized

@@ -31,6 +31,7 @@ This folder currently contains design documents only. No runtime code lives here
 - [Exact Voice System](./EXACT_VOICE_SYSTEM.md)
 - [Grouped And Density Rendering](./GROUPED_AND_DENSITY_RENDERING.md)
 - [Tile Renderer And Threading](./TILE_RENDERER_AND_THREADING.md)
+- [Diagnostics And Live Protocol](./DIAGNOSTICS_AND_LIVE_PROTOCOL.md)
 - [Configurator And Diagnostics](./CONFIGURATOR_AND_DIAGNOSTICS.md)
 - [Implementation Plan](./IMPLEMENTATION_PLAN.md)
 - [Checklist](./CHECKLIST.md)
