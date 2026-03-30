@@ -13,6 +13,7 @@ This file is intended to be updated as work lands.
 - [x] Event model document written
 - [x] Scheduler design document written
 - [x] Scene compiler document written
+- [x] Exact voice system document written
 - [x] Initial configurator and diagnostics document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
@@ -55,6 +56,14 @@ This file is intended to be updated as work lands.
 - [x] Promotion and demotion rules specified
 - [x] Note importance scoring model specified
 - [x] Exact attack protection specified
+
+## Exact Voice System
+
+- [x] Exact voice runtime state specified
+- [x] Note-off direct lookup model specified
+- [x] Steal structure policy specified
+- [x] Release shortening and quiet-tail policy specified
+- [x] Per-note expression escape path specified
 
 ## Render
 
