@@ -19,6 +19,7 @@ This file is intended to be updated as work lands.
 - [x] Diagnostics and live protocol document written
 - [x] Initial configurator and diagnostics document written
 - [x] Configurator rewrite document written
+- [x] Test and validation document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
 - [x] Engine name chosen: `VirtuallySuper`
@@ -111,7 +112,7 @@ This file is intended to be updated as work lands.
 
 ## Validation
 
-- [ ] Deterministic offline mode specified
-- [ ] Audio hash regression strategy specified
-- [ ] Black MIDI benchmark set specified
-- [ ] Scheduler fuzz strategy specified
+- [x] Deterministic offline mode specified
+- [x] Audio hash regression strategy specified
+- [x] Black MIDI benchmark set specified
+- [x] Scheduler fuzz strategy specified

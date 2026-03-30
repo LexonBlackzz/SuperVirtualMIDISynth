@@ -34,6 +34,7 @@ This folder currently contains design documents only. No runtime code lives here
 - [Diagnostics And Live Protocol](./DIAGNOSTICS_AND_LIVE_PROTOCOL.md)
 - [Configurator And Diagnostics](./CONFIGURATOR_AND_DIAGNOSTICS.md)
 - [Configurator Rewrite](./CONFIGURATOR_REWRITE.md)
+- [Test And Validation](./TEST_AND_VALIDATION.md)
 - [Implementation Plan](./IMPLEMENTATION_PLAN.md)
 - [Checklist](./CHECKLIST.md)
 
