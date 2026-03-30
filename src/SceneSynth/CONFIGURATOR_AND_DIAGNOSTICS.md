@@ -14,6 +14,67 @@ The Configurator performs expensive interpretation.
 - If the Configurator is open, synth overhead should rise only slightly.
 - If the Configurator stalls or crashes, audio must continue unaffected.
 
+## Configuration Philosophy
+
+`VirtuallySuper` should support deep configurability without forcing complexity
+onto every user.
+
+The intended model is:
+
+- `Basic`
+  Safe day-to-day settings for most users.
+- `Advanced`
+  More detailed tuning for power users.
+- `Expert`
+  Voice, layer, grouping, density, and overload controls.
+- `Developer`
+  Experimental or diagnostic-only settings.
+
+Important rule:
+
+- the synth consumes normalized config snapshots
+- the Configurator owns presentation, grouping, tooltips, warnings, and
+  discoverability
+
+## Safe Versus Expert Settings
+
+Examples of `Basic` settings:
+
+- audio output device
+- sample rate
+- buffer or latency
+- master polyphony target
+- layer count
+- SoundFont folders and ordering
+- quality profile
+
+Examples of `Advanced` settings:
+
+- worker count
+- tile size
+- interpolation quality
+- preload policy
+- limiter and FX policy
+- general scheduler mode
+
+Examples of `Expert` settings:
+
+- exact-tier ceilings
+- grouped-tier admission thresholds
+- density-tier enable or disable policy
+- release shortening thresholds
+- quiet-tail culling policy
+- sustain overload behavior
+- per-tier gain scaling and collapse heuristics
+- per-module experimental tuning values
+
+Examples of `Developer` settings:
+
+- debug counters
+- deterministic stress switches
+- instrumentation cadence
+- sampled voice inspection toggles
+
 ## Diagnostics Transport
 
 ## Shared Snapshot
@@ -116,6 +177,9 @@ Updated on change only:
 - max layers
 - quality profile
 
+This tab should default to safe settings, with advanced sections hidden behind
+an expand/collapsible expert surface.
+
 ### Timing
 
 - accurate or quantized behavior
@@ -131,6 +195,9 @@ Updated on change only:
 - layer reduction thresholds
 - density thresholds
 - CPU safety settings
+
+This is the most likely home for end-user-facing expert controls over voices,
+layers, grouped behavior, and density policy.
 
 ### FX And Output
 
@@ -154,10 +221,16 @@ Updated on change only:
 - compatibility settings
 - debug controls
 
+This tab should be clearly separated from normal user settings so the engine can
+remain extremely configurable without becoming hostile to ordinary use.
+
 ### Profiles
 
 - import and export
 - built-in presets such as `Reference`, `Realtime`, and `Extreme`
+
+Profiles should be the primary way most users interact with the full engine
+flexibility without hand-editing dozens of expert settings.
 
 ## SoundFont Discovery
 

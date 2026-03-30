@@ -5,8 +5,13 @@ This file is intended to be updated as work lands.
 ## Already Done
 
 - [x] New engine design folder created
+- [x] New runtime engine folder created at `src/VirtuallySuper`
 - [x] Initial architecture document written
 - [x] Initial subsystem document written
+- [x] Runtime foundations document written
+- [x] Module map document written
+- [x] Event model document written
+- [x] Scheduler design document written
 - [x] Initial configurator and diagnostics document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
@@ -26,18 +31,20 @@ This file is intended to be updated as work lands.
 
 ## Engine Foundation
 
-- [ ] Finalize runtime object model
-- [ ] Finalize memory pool layout
+- [x] Finalize runtime object model
+- [x] Finalize initial file/module split for `VirtuallySuper`
+- [x] Finalize layered configuration model
+- [x] Finalize memory pool layout
 - [ ] Finalize exact/grouped/density accounting model
 - [ ] Finalize voice-equivalent definition
 
 ## Scheduler
 
-- [ ] Fixed-capacity per-key transition queues specified
-- [ ] Macro-culling rules specified
-- [ ] Same-key buzz protection rules specified
-- [ ] Sustain overload rules specified
-- [ ] Event reduction heuristics specified
+- [x] Fixed-capacity per-key transition queues specified
+- [x] Macro-culling rules specified
+- [x] Same-key buzz protection rules specified
+- [x] Sustain overload rules specified
+- [x] Event reduction heuristics specified
 
 ## Render
 
@@ -57,6 +64,7 @@ This file is intended to be updated as work lands.
 ## Configurator
 
 - [ ] New tab layout finalized
+- [ ] Basic/advanced/expert/developer settings split finalized
 - [ ] SoundFont folder UX finalized
 - [ ] Debug window finalized
 - [ ] Graph set finalized

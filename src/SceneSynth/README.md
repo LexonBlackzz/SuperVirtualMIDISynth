@@ -23,6 +23,10 @@ This folder currently contains design documents only. No runtime code lives here
 
 - [Architecture](./ARCHITECTURE.md)
 - [Subsystems](./SUBSYSTEMS.md)
+- [Runtime Foundations](./RUNTIME_FOUNDATIONS.md)
+- [Module Map](./MODULE_MAP.md)
+- [Event Model](./EVENT_MODEL.md)
+- [Scheduler Design](./SCHEDULER_DESIGN.md)
 - [Configurator And Diagnostics](./CONFIGURATOR_AND_DIAGNOSTICS.md)
 - [Implementation Plan](./IMPLEMENTATION_PLAN.md)
 - [Checklist](./CHECKLIST.md)

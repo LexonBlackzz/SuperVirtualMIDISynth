@@ -60,6 +60,32 @@ traditional one-voice-per-note sampler.
 - The Configurator performs history, graphing, smoothing, text formatting, and
   expensive analysis in its own process and thread.
 
+### 6. Modularity First
+
+- The engine must be split into small, ownership-oriented files rather than a
+  single giant implementation unit.
+- Each subsystem should have a clear home and a narrow public surface.
+- Hot-path code organization should still favor locality, but module boundaries
+  must remain understandable for maintenance and review.
+- Internal interfaces should be designed so exact, grouped, density, telemetry,
+  and Configurator-related work can evolve largely independently.
+- The design should prefer "many focused files" over "one mega-engine file"
+  unless a measured performance reason forces consolidation.
+
+### 7. Deeply Configurable, Safely Presented
+
+- The engine should be highly configurable by the end-user, including voice,
+  layer, grouping, density, overload, and render behavior.
+- The default presentation must still remain safe and understandable for normal
+  users who only want to change practical controls such as output, latency,
+  polyphony, layer count, and SoundFonts.
+- Advanced or risky settings should exist, but they should be grouped into
+  expert-facing surfaces rather than forced into the basic workflow.
+- Runtime hot paths must consume compiled config snapshots, not parse or
+  interpret UI-oriented settings directly.
+- Configurability should be treated as a first-class product feature, not a
+  debugging backdoor.
+
 ## Code Terminology
 
 The following names should be treated as the preferred code vocabulary unless
@@ -91,6 +117,40 @@ implementation discovers a compelling reason to adjust them:
   One cheap published diagnostics snapshot for the Configurator.
 
 These terms are now considered frozen for planning purposes.
+
+## Modularity And File Ownership
+
+`VirtuallySuper` should be implemented as a modular engine with clear ownership
+per subsystem.
+
+Suggested high-level layout:
+
+- `src/VirtuallySuper/VirtuallySuperEngine.*`
+  Top-level engine lifetime and public integration surface.
+- `src/VirtuallySuper/VirtuallySuperScheduler.*`
+  MIDI ingress, timing, per-key transitions, and event reduction.
+- `src/VirtuallySuper/VirtuallySuperScene.*`
+  Scene compilation, tier decisions, and promotion/demotion logic.
+- `src/VirtuallySuper/VirtuallySuperExact.*`
+  Exact-tier runtime and exact voice policies.
+- `src/VirtuallySuper/VirtuallySuperGrouped.*`
+  Grouped/swam object logic and grouped rendering policies.
+- `src/VirtuallySuper/VirtuallySuperDensity.*`
+  Density-tier runtime and perceptual mass rendering.
+- `src/VirtuallySuper/VirtuallySuperRender.*`
+  Tile generation, worker dispatch, and render orchestration.
+- `src/VirtuallySuper/VirtuallySuperTelemetry.*`
+  Shared-memory snapshots, debug event ring, and cheap stats publishing.
+- `src/VirtuallySuper/VirtuallySuperConfig.*`
+  Runtime-facing config translation, validation, presets, and snapshot
+  compilation.
+- `src/VirtuallySuper/VirtuallySuperTypes.h`
+  Shared POD-style runtime types, enums, constants, and IDs.
+- `src/VirtuallySuper/VirtuallySuperPools.*`
+  Pools, free-lists, and fixed-capacity allocators for real-time use.
+
+This layout is a starting point, not a hard freeze, but the engine should be
+planned around subsystem files from the beginning.
 
 ## Top-Level Pipeline
 

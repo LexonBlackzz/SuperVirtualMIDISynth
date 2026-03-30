@@ -18,21 +18,26 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 1: Runtime Foundations
 
-- [ ] Define `EngineState`, `SchedulerState`, `SceneState`, and `TelemetryState`
-- [ ] Define zero-allocation memory policy for all real-time threads
-- [ ] Define object pools and free-list strategy
-- [ ] Define hot memory layout and page-locking policy where supported
-- [ ] Define deterministic offline mode requirements
+- [x] Define `EngineState`, `SchedulerState`, `SceneState`, and `TelemetryState`
+- [x] Define the initial `VirtuallySuper` file and module map
+- [x] Decide which shared types live in `VirtuallySuperTypes.h`
+- [x] Decide which helpers stay header-only and which belong in `.cpp` units
+- [x] Define the layered configuration model and runtime snapshot approach
+- [x] Define zero-allocation memory policy for all real-time threads
+- [x] Define object pools and free-list strategy
+- [x] Define hot memory layout and page-locking policy where supported
+- [x] Define deterministic offline mode requirements
+- [x] Create the initial `src/VirtuallySuper/` source home
 
 ## Phase 2: Event Ingress And Scheduler
 
-- [ ] Define normalized MIDI event format
-- [ ] Define fixed-capacity ingress rings
-- [ ] Define far-future scheduling structure
-- [ ] Define per-key same-key transition queues
-- [ ] Define event reduction rules for exact/grouped/density classification
-- [ ] Define sustain-pressure policy
-- [ ] Define Black MIDI macro-culling rules
+- [x] Define normalized MIDI event format
+- [x] Define fixed-capacity ingress rings
+- [x] Define far-future scheduling structure
+- [x] Define per-key same-key transition queues
+- [x] Define event reduction rules for exact/grouped/density classification
+- [x] Define sustain-pressure policy
+- [x] Define Black MIDI macro-culling rules
 
 ## Phase 3: Scene Compiler
 
@@ -80,6 +85,7 @@ engines while the new engine is designed and prototyped in parallel.
 ## Phase 8: Configurator Rewrite
 
 - [ ] Define tab structure
+- [ ] Define basic, advanced, expert, and developer setting surfaces
 - [ ] Define SoundFont discovery UX
 - [ ] Define diagnostics graphs and views
 - [ ] Define profile import/export format

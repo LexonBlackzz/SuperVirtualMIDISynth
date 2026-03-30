@@ -15,6 +15,13 @@ Planned core runtime objects:
 - `TileRenderState`
 - `TelemetryState`
 
+Proposed implementation split:
+
+- `VirtuallySuperTypes.h`
+- `VirtuallySuperEngine.h/.cpp`
+- `VirtuallySuperScene.h/.cpp`
+- `VirtuallySuperPools.h/.cpp`
+
 ## 2. Scheduler
 
 Responsibilities:
@@ -32,6 +39,12 @@ Planned structures:
 - per-key local transition queues for near-window accuracy
 - per-channel density counters and burst detectors
 
+Proposed implementation split:
+
+- `VirtuallySuperScheduler.h/.cpp`
+- `VirtuallySuperSchedulerQueues.h/.cpp`
+- `VirtuallySuperSchedulerReduce.h/.cpp`
+
 ## 3. Scene Compiler
 
 Responsibilities:
@@ -48,6 +61,12 @@ Planned decisions:
 - density substitution eligibility
 - per-channel layer reduction
 
+Proposed implementation split:
+
+- `VirtuallySuperScene.h/.cpp`
+- `VirtuallySuperSceneReduce.h/.cpp`
+- `VirtuallySuperSceneScore.h/.cpp`
+
 ## 4. Exact Voice System
 
 Responsibilities:
@@ -61,6 +80,12 @@ Desired behavior:
 - no global scans for note-off
 - no global scans for stealing
 - bounded heaps or queues for steal candidates
+
+Proposed implementation split:
+
+- `VirtuallySuperExact.h/.cpp`
+- `VirtuallySuperExactVoices.h/.cpp`
+- `VirtuallySuperExactSteal.h/.cpp`
 
 ## 5. Grouped Rendering System
 
@@ -78,6 +103,11 @@ Likely grouping axes:
 - layer template
 - timing bucket
 
+Proposed implementation split:
+
+- `VirtuallySuperGrouped.h/.cpp`
+- `VirtuallySuperGroupedBuckets.h/.cpp`
+
 ## 6. Density System
 
 Responsibilities:
@@ -92,6 +122,11 @@ Candidate approaches:
 - pitch-bucket texture synthesis
 - later spectral density experiment
 
+Proposed implementation split:
+
+- `VirtuallySuperDensity.h/.cpp`
+- `VirtuallySuperDensityGranular.h/.cpp`
+
 ## 7. Tile Renderer
 
 Responsibilities:
@@ -105,6 +140,12 @@ Design rules:
 - job-based threading over giant full-block worker buffers
 - contiguous or page-local sample work whenever possible
 - exact, grouped, and density jobs can coexist in one tile
+
+Proposed implementation split:
+
+- `VirtuallySuperRender.h/.cpp`
+- `VirtuallySuperRenderJobs.h/.cpp`
+- `VirtuallySuperRenderWorkers.h/.cpp`
 
 ## 8. Voice And Layer Accounting
 
@@ -139,6 +180,10 @@ Tools available to it:
 - density substitution
 - stale event rejection
 
+Proposed implementation split:
+
+- `VirtuallySuperOverload.h/.cpp`
+
 ## 10. Diagnostics Publisher
 
 Responsibilities:
@@ -153,6 +198,11 @@ Data classes:
 - warm stats
 - cold/static info
 
+Proposed implementation split:
+
+- `VirtuallySuperTelemetry.h/.cpp`
+- `VirtuallySuperTelemetryShared.h`
+
 ## 11. Configurator
 
 Responsibilities:
@@ -165,3 +215,8 @@ Responsibilities:
 Non-goal:
 
 - it must not force the engine to do expensive UI-oriented work
+
+Related implementation split outside the engine folder:
+
+- existing `Configurator.cpp` can later be refactored to consume
+  `VirtuallySuper` telemetry without forcing UI code into the engine modules
