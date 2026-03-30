@@ -94,11 +94,11 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 9: Test And Validation Infrastructure
 
-- [ ] Define deterministic audio hash tests
-- [ ] Define Black MIDI stress corpus
-- [ ] Define fuzzing strategy for scheduler and MIDI parser
-- [ ] Define live diagnostics regression checks
-- [ ] Define performance benchmark harness
+- [x] Define deterministic audio hash tests
+- [x] Define Black MIDI stress corpus
+- [x] Define fuzzing strategy for scheduler and MIDI parser
+- [x] Define live diagnostics regression checks
+- [x] Define performance benchmark harness
 
 ## Phase 10: Prototype And Integration
 
