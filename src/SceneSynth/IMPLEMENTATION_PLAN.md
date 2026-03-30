@@ -41,12 +41,12 @@ engines while the new engine is designed and prototyped in parallel.
 
 ## Phase 3: Scene Compiler
 
-- [ ] Define exact note allocation path
-- [ ] Define grouped object allocation path
-- [ ] Define density object allocation path
-- [ ] Define promotion and demotion rules between tiers
-- [ ] Define note importance scoring
-- [ ] Define exact attack protection policy
+- [x] Define exact note allocation path
+- [x] Define grouped object allocation path
+- [x] Define density object allocation path
+- [x] Define promotion and demotion rules between tiers
+- [x] Define note importance scoring
+- [x] Define exact attack protection policy
 
 ## Phase 4: Exact Voice System
 
