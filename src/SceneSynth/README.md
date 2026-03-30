@@ -1,6 +1,7 @@
 # SceneSynth
 
-`SceneSynth` is the planned next-generation sampler engine for SuperVirtualMIDISynth.
+`VirtuallySuper` is the planned next-generation sampler engine for
+SuperVirtualMIDISynth.
 
 It is intentionally being designed as a new engine instead of an incremental `tsf.h`
 rewrite. The target is not just "more voices," but better musical behavior under
@@ -26,9 +27,20 @@ This folder currently contains design documents only. No runtime code lives here
 - [Implementation Plan](./IMPLEMENTATION_PLAN.md)
 - [Checklist](./CHECKLIST.md)
 
-## Working Name
+## Engine Name
 
-`SceneSynth` is a placeholder name chosen to match the planned shift from a
-traditional linear sampler into a perceptual audio scene renderer.
+The engine name is `VirtuallySuper`.
 
-It can be renamed later without changing the structure of the design documents.
+The folder name `SceneSynth` is retained for the design workspace because it
+already groups the architecture documents cleanly. Runtime code can adopt the
+`VirtuallySuper` naming directly when implementation begins.
+
+## Platform Targets
+
+The initial target matrix for `VirtuallySuper` is:
+
+- `x86`
+- `x64`
+- `Windows XP` compatibility for the supported legacy build path
+
+`NT 4` is out of scope for the initial design.

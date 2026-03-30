@@ -10,6 +10,9 @@ This file is intended to be updated as work lands.
 - [x] Initial configurator and diagnostics document written
 - [x] Initial staged implementation plan written
 - [x] `syndrv.dll` first-pass Ghidra analysis completed
+- [x] Engine name chosen: `VirtuallySuper`
+- [x] Initial code terminology frozen for planning
+- [x] Target platform policy chosen: `x86`, `x64`, `Windows XP`
 - [x] Current project already has a portable Configurator baseline
 - [x] Current project already has a live diagnostics bridge baseline
 - [x] Current project already has multiple existing engines for comparison:
@@ -17,9 +20,7 @@ This file is intended to be updated as work lands.
 
 ## Open Design Decisions
 
-- [ ] Final engine name
 - [ ] First density implementation choice
-- [ ] XP support policy for the new engine
 - [ ] Whether SceneSynth ships alongside TSF first or starts as an internal prototype
 - [ ] Whether grouped rendering is per-channel, per-bucket, or hybrid by default
 

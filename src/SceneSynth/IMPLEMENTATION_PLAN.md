@@ -8,10 +8,13 @@ engines while the new engine is designed and prototyped in parallel.
 - [x] Create a dedicated design home under `src/SceneSynth`
 - [x] Write initial architecture documents
 - [x] Capture Ghidra observations from `syndrv.dll`
-- [ ] Agree on the engine name
-- [ ] Freeze baseline terminology: voice, layer, grouped object, density object,
-      voice equivalent
-- [ ] Freeze target platform policy: x86, x64, XP compatibility expectations
+- [x] Agree on the engine name: `VirtuallySuper`
+- [x] Freeze baseline terminology for code planning: `EngineState`,
+      `SchedulerState`, `SceneState`, `KeyState`, `TransitionQueue`,
+      `ExactVoice`, `LayerInstance`, `GroupedObject`, `DensityObject`,
+      `VoiceEquivalent`, `TileJob`, `TelemetrySnapshot`
+- [x] Freeze target platform policy: `x86`, `x64`, and `Windows XP`
+      compatibility for the legacy-supported build path
 
 ## Phase 1: Runtime Foundations
 

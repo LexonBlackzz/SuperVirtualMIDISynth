@@ -1,5 +1,7 @@
 # SceneSynth Architecture
 
+This document describes the architecture of the `VirtuallySuper` engine.
+
 ## Summary
 
 `SceneSynth` is designed as a three-tier synthesis engine:
@@ -57,6 +59,38 @@ traditional one-voice-per-note sampler.
 - The DLL publishes cheap counters and snapshots only.
 - The Configurator performs history, graphing, smoothing, text formatting, and
   expensive analysis in its own process and thread.
+
+## Code Terminology
+
+The following names should be treated as the preferred code vocabulary unless
+implementation discovers a compelling reason to adjust them:
+
+- `EngineState`
+  Top-level runtime state for `VirtuallySuper`.
+- `SchedulerState`
+  The event ingress, timing, and transition-management subsystem.
+- `SceneState`
+  The current musical scene after scheduling and reduction.
+- `KeyState`
+  Direct state for one `(channel, note)` pair.
+- `TransitionQueue`
+  Fixed-capacity same-key event queue for a `KeyState`.
+- `ExactVoice`
+  A fully independent per-note playback object.
+- `LayerInstance`
+  One runtime layer created from a layer template or note plan.
+- `GroupedObject`
+  A runtime clustered renderer object representing many similar notes or layers.
+- `DensityObject`
+  A perceptual background-mass renderer object.
+- `VoiceEquivalent`
+  Aggregate polyphony-style metric spanning exact, grouped, and density tiers.
+- `TileJob`
+  One fixed-size render job for the worker system.
+- `TelemetrySnapshot`
+  One cheap published diagnostics snapshot for the Configurator.
+
+These terms are now considered frozen for planning purposes.
 
 ## Top-Level Pipeline
 
