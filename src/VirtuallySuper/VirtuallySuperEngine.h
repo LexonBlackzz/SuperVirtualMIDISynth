@@ -2,6 +2,7 @@
 #define VIRTUALLYSUPER_ENGINE_H
 
 #include "VirtuallySuperExact.h"
+#include "VirtuallySuperGrouped.h"
 #include "VirtuallySuperScheduler.h"
 
 namespace virtuallysuper {
@@ -27,10 +28,13 @@ public:
   Scheduler &GetScheduler();
   const ExactSystem &GetExactSystem() const;
   ExactSystem &GetExactSystem();
+  const GroupedSystem &GetGroupedSystem() const;
+  GroupedSystem &GetGroupedSystem();
 
 private:
   Scheduler scheduler_;
   ExactSystem exact_;
+  GroupedSystem grouped_;
   bool initialized_;
   NormalizedEvent drainBatch_[kDrainBatchCapacity];
 };
