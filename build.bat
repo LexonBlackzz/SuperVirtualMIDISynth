@@ -35,7 +35,7 @@ echo Use the legacy MinGW lane as a later follow-up once the main MSVC path is s
 exit /b 0
 
 :build_x86
-call "%VS_VCVARSALL%" x86 -vcvars_ver=14.1
+call "%VS_VCVARSALL%" x86
 if errorlevel 1 exit /b %errorlevel%
 call "%~dp0write_exports.bat" x86 "%~dp0build\exports_x86.def"
 if errorlevel 1 exit /b %errorlevel%
@@ -56,7 +56,7 @@ echo x86 build succeeded: SuperVirtualMIDISynth.dll
 exit /b 0
 
 :build_x64
-call "%VS_VCVARSALL%" x64 -vcvars_ver=14.1
+call "%VS_VCVARSALL%" x64
 if errorlevel 1 exit /b %errorlevel%
 call "%~dp0write_exports.bat" x64 "%~dp0build\exports_x64.def"
 if errorlevel 1 exit /b %errorlevel%
@@ -77,7 +77,7 @@ echo x64 build succeeded: SuperVirtualMIDISynthx64.dll
 exit /b 0
 
 :build_configurator
-call "%VS_VCVARSALL%" x86 -vcvars_ver=14.1
+call "%VS_VCVARSALL%" x86
 if errorlevel 1 exit /b %errorlevel%
 if not exist "%~dp0build\obj\configurator" mkdir "%~dp0build\obj\configurator"
 cl.exe /nologo /O2 /EHsc /MT /DNDEBUG /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 ^
@@ -94,15 +94,18 @@ echo Configurator build succeeded: SVMSConfigurator.exe
 exit /b 0
 
 :build_configurator_v2
-call "%VS_VCVARSALL%" x86 -vcvars_ver=14.1
+call "%VS_VCVARSALL%" x86
 if errorlevel 1 exit /b %errorlevel%
 if not exist "%~dp0build\obj\configurator_v2" mkdir "%~dp0build\obj\configurator_v2"
 cl.exe /nologo /O2 /EHsc /MT /DNDEBUG /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 ^
   /Fe:"%~dp0SVMSConfiguratorV2.exe" ^
   /Fo:"%~dp0build\obj\configurator_v2\\" ^
   /Fd:"%~dp0build\obj\configurator_v2\SVMSConfiguratorV2.pdb" ^
+  /I"%~dp0third_party\imgui" /I"%~dp0third_party\imgui\backends" ^
   src\ConfiguratorV2.cpp ^
-  user32.lib gdi32.lib comdlg32.lib shell32.lib comctl32.lib
+  third_party\imgui\imgui.cpp third_party\imgui\imgui_draw.cpp third_party\imgui\imgui_tables.cpp third_party\imgui\imgui_widgets.cpp ^
+  third_party\imgui\backends\imgui_impl_win32.cpp third_party\imgui\backends\imgui_impl_dx9.cpp ^
+  user32.lib gdi32.lib comdlg32.lib shell32.lib comctl32.lib d3d9.lib
 if errorlevel 1 (
   echo Configurator V2 build failed!
   exit /b %errorlevel%
