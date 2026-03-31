@@ -18,6 +18,8 @@ enum ControlId {
   IDC_DIAG_PANEL,
   IDC_ENGINE_LABEL,
   IDC_ENGINE_COMBO,
+  IDC_TIMING_LABEL,
+  IDC_TIMING_COMBO,
   IDC_SOURCE_LABEL,
   IDC_SOURCE_EDIT,
   IDC_HOME_SUMMARY,
@@ -36,6 +38,7 @@ struct UiState {
   HWND homePanel;
   HWND diagPanel;
   HWND engineCombo;
+  HWND timingCombo;
   HWND sourceEdit;
   HWND homeSummary;
   HWND diagSummary;
@@ -233,8 +236,19 @@ void PopulateSamplerEngineCombo(HWND comboBox) {
 #endif
 }
 
+void PopulateTimingModeCombo(HWND comboBox) {
+  SendMessageA(comboBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("accurate"));
+  SendMessageA(comboBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("quantized"));
+  SendMessageA(comboBox, CB_ADDSTRING, 0,
+               reinterpret_cast<LPARAM>("legacy-sync"));
+}
+
 void SeedEditorsFromSnapshot(const LiveBridgeSharedState &snapshot) {
   SelectComboString(g_ui.engineCombo, snapshot.currentSettings.samplerEngine);
+  SelectComboString(g_ui.timingCombo,
+                    snapshot.currentSettings.eventTimingMode[0]
+                        ? snapshot.currentSettings.eventTimingMode
+                        : "accurate");
   SetEditText(g_ui.sourceEdit,
               snapshot.resolvedSoundfontPath[0]
                   ? snapshot.resolvedSoundfontPath
@@ -267,6 +281,7 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
       summary,
       "Engine %s   Backend %s\r\n"
       "Source %s\r\n"
+      "Timing %s   Async %s\r\n"
       "Render %.3f ms   Block %.3f ms / budget %.3f ms\r\n"
       "Voices %lu   Queue %lu   Overload %lu\r\n"
       "VirtuallySuper   Exact %lu   Grouped %lu   Density %lu   VoiceEq %lu   Pressure %lu   State %lu   Err %lu\r\n"
@@ -277,6 +292,10 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
                                        : snapshot.currentSettings.audioBackend,
       snapshot.resolvedSoundfontPath[0] ? snapshot.resolvedSoundfontPath
                                         : snapshot.currentSettings.soundfontPath,
+      snapshot.currentSettings.eventTimingMode[0]
+          ? snapshot.currentSettings.eventTimingMode
+          : "accurate",
+      snapshot.currentStats.asyncNoteStartsEnabled ? "On" : "Off",
       snapshot.currentStats.synthRenderMs, snapshot.currentStats.audioBlockMs,
       snapshot.currentStats.audioBudgetMs,
       static_cast<unsigned long>(snapshot.currentStats.totalActiveVoices),
@@ -382,6 +401,10 @@ void BuildSettingsFromUi(LiveBridgeSettings &settings) {
   settings = g_ui.lastSnapshot.currentSettings;
   CopyCString(settings.samplerEngine, sizeof(settings.samplerEngine),
               GetComboSelectionString(g_ui.engineCombo).c_str());
+  CopyCString(settings.eventTimingMode, sizeof(settings.eventTimingMode),
+              GetComboSelectionString(g_ui.timingCombo).c_str());
+  settings.asyncNoteStarts =
+      strcmp(settings.eventTimingMode, "legacy-sync") != 0 ? 1 : 0;
 }
 
 LONG DetermineApplyCommand(const LiveBridgeSettings &settings,
@@ -524,13 +547,17 @@ void BuildUi(HWND hwnd) {
                                    GetModuleHandle(NULL), NULL);
 
   HWND engineLabel = CreateLabel(g_ui.homePanel, "Sampler Engine", 10, 12, 120, 18);
-  HWND sourceLabel = CreateLabel(g_ui.homePanel, "Resolved Source", 250, 12, 120, 18);
+  HWND timingLabel = CreateLabel(g_ui.homePanel, "Timing Mode", 210, 12, 120, 18);
+  HWND sourceLabel = CreateLabel(g_ui.homePanel, "Resolved Source", 410, 12, 120, 18);
   SendMessage(engineLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui.bodyFont), TRUE);
+  SendMessage(timingLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui.bodyFont), TRUE);
   SendMessage(sourceLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui.bodyFont), TRUE);
 
   g_ui.engineCombo = CreateCombo(g_ui.homePanel, IDC_ENGINE_COMBO, 10, 34, 180, 240);
   PopulateSamplerEngineCombo(g_ui.engineCombo);
-  g_ui.sourceEdit = CreateEdit(g_ui.homePanel, IDC_SOURCE_EDIT, 250, 34, 440, 24,
+  g_ui.timingCombo = CreateCombo(g_ui.homePanel, IDC_TIMING_COMBO, 210, 34, 180, 240);
+  PopulateTimingModeCombo(g_ui.timingCombo);
+  g_ui.sourceEdit = CreateEdit(g_ui.homePanel, IDC_SOURCE_EDIT, 410, 34, 280, 24,
                                ES_AUTOHSCROLL | ES_READONLY);
   g_ui.homeSummary = CreateEdit(g_ui.homePanel, IDC_HOME_SUMMARY, 10, 72, 680,
                                 240, ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY |
@@ -548,7 +575,8 @@ void BuildUi(HWND hwnd) {
   g_ui.resetButton = CreateButton(hwnd, "Hard Reset", IDC_RESET, 530, 534, 104, 28);
   g_ui.killButton = CreateButton(hwnd, "Kill", IDC_KILL, 646, 534, 92, 28);
 
-  const HWND bodyControls[] = {g_ui.statusText, g_ui.engineCombo, g_ui.sourceEdit,
+  const HWND bodyControls[] = {g_ui.statusText, g_ui.engineCombo, g_ui.timingCombo,
+                               g_ui.sourceEdit,
                                g_ui.homeSummary, g_ui.diagSummary, g_ui.perChannel,
                                g_ui.applyButton, g_ui.reloadButton,
                                g_ui.resetButton, g_ui.killButton};
