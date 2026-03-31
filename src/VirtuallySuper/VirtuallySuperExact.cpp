@@ -12,6 +12,14 @@ static float VelocityToGain(uint8_t velocity) {
   return ((float)velocity / 127.0f) * 0.045f;
 }
 
+static float ClampFloat(float value, float minValue, float maxValue) {
+  if (value < minValue)
+    return minValue;
+  if (value > maxValue)
+    return maxValue;
+  return value;
+}
+
 static float ExactPan(uint32_t channel, uint32_t note) {
   const uint32_t index = (channel * 17u + note * 13u) & 15u;
   return ((float)index / 7.5f) - 1.0f;
@@ -51,6 +59,7 @@ void ExactSystem::Reset() {
   nextVoiceId_ = 1;
   freeCount_ = (uint32_t)voices_.size();
   stats_ = ExactStats();
+  ResetPitchChannels();
 
   for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
     for (uint32_t note = 0; note < kNoteCount; ++note) {
@@ -79,13 +88,21 @@ bool ExactSystem::ApplyEvent(const NormalizedEvent &event) {
     return NoteOff(event.channel, event.note) > 0;
   case EventKind::ProgramChange:
     return soundFont_ ? soundFont_->HandleEvent(event) : true;
-  case EventKind::PitchBend:
-    if (soundFont_ && soundFont_->HandleEvent(event))
-      RefreshChannelVoices(event.channel);
+  case EventKind::PitchBend: {
+    pitchChannels_[event.channel].pitchWheel =
+        (uint16_t)((event.value & 0x7Fu) | ((uint16_t)(event.velocity & 0x7Fu) << 7));
+    if (pitchChannels_[event.channel].pitchWheel > 0x3FFFu)
+      pitchChannels_[event.channel].pitchWheel = 0x3FFFu;
+    if (soundFont_)
+      soundFont_->HandleEvent(event);
+    RefreshChannelVoices(event.channel);
     return true;
+  }
   case EventKind::ControlChange:
     {
       const uint8_t controller = event.value;
+      const bool pitchHandled =
+          HandlePitchControl(event.channel, controller, event.velocity);
       const bool handled = soundFont_ ? soundFont_->HandleEvent(event) : false;
       if (controller == 64 && soundFont_ &&
           !soundFont_->IsSustainEnabled(event.channel))
@@ -95,10 +112,10 @@ bool ExactSystem::ApplyEvent(const NormalizedEvent &event) {
       else if (controller == 123)
         ReleaseAllChannelVoices(event.channel, false);
       else if (controller == 7 || controller == 10 || controller == 11 ||
-               controller == 121) {
+               controller == 121 || pitchHandled) {
         RefreshChannelVoices(event.channel);
       }
-      return handled || controller == 64 || controller == 120 ||
+      return handled || pitchHandled || controller == 64 || controller == 120 ||
              controller == 123 || controller == 7 || controller == 10 ||
              controller == 11 || controller == 121;
     }
@@ -268,6 +285,8 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
   voice.channel = event.channel;
   voice.note = event.note;
   voice.velocity = event.velocity;
+  voice.mappedVelocity =
+      event.mappedVelocity > 0 ? event.mappedVelocity : event.velocity;
   voice.startSequence = event.sequence;
   voice.generation = ++generationCounters_[event.channel][event.note];
   voice.state = ExactLifecycleState::Active;
@@ -323,11 +342,12 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
       return;
     }
 
-    voice.frequencyHz = MidiNoteToFrequencyHz(event.note);
-    voice.phaseStep =
-        voice.frequencyHz /
-        (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
-    voice.currentGain = VelocityToGain(event.velocity);
+    const float pitchShift = GetPitchShiftSemitones(event.channel);
+    voice.frequencyHz = MidiNoteToFrequencyHz(event.note) *
+                        powf(2.0f, pitchShift * (1.0f / 12.0f));
+    voice.phaseStep = voice.frequencyHz /
+                      (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
+    voice.currentGain = VelocityToGain(voice.mappedVelocity);
     voice.targetGain = voice.currentGain;
     voice.releaseDecay = 0.9985f;
     ExactStereoGains(ExactPan(event.channel, event.note), &voice.leftGain,
@@ -361,7 +381,8 @@ void ExactSystem::RefreshVoiceFromSoundFont(uint32_t handle) {
 
   SoundFontNoteInfo info;
   if (!soundFont_->RefreshVoiceInfo(voice.channel, voice.note, voice.velocity,
-                                    voice.regionIndex, &info) ||
+                                    voice.mappedVelocity, voice.regionIndex,
+                                    &info) ||
       !info.valid) {
     return;
   }
@@ -377,18 +398,102 @@ void ExactSystem::RefreshVoiceFromSoundFont(uint32_t handle) {
   }
 }
 
+void ExactSystem::RefreshSyntheticVoice(uint32_t handle) {
+  if (handle >= voices_.size())
+    return;
+
+  ExactVoice &voice = voices_[handle];
+  if (voice.sampleBacked || voice.state == ExactLifecycleState::Free)
+    return;
+
+  const float pitchShift = GetPitchShiftSemitones(voice.channel);
+  voice.frequencyHz = MidiNoteToFrequencyHz(voice.note) *
+                      powf(2.0f, pitchShift * (1.0f / 12.0f));
+  voice.phaseStep = voice.frequencyHz /
+                    (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
+}
+
 void ExactSystem::RefreshChannelVoices(uint8_t channel) {
-  if (!soundFont_ || !soundFont_->IsLoaded() || channel >= kChannelCount)
+  if (channel >= kChannelCount)
     return;
 
   for (uint32_t note = 0; note < kNoteCount; ++note) {
     uint32_t handle = keyHeads_[channel][note];
     while (handle != kInvalidVoiceHandle) {
       const uint32_t next = voices_[handle].nextSameKey;
-      RefreshVoiceFromSoundFont(handle);
+      if (voices_[handle].sampleBacked)
+        RefreshVoiceFromSoundFont(handle);
+      else
+        RefreshSyntheticVoice(handle);
       handle = next;
     }
   }
+}
+
+void ExactSystem::ResetPitchChannels() {
+  for (uint32_t channel = 0; channel < kChannelCount; ++channel)
+    pitchChannels_[channel] = ChannelPitchState();
+}
+
+bool ExactSystem::HandlePitchControl(uint8_t channel, uint8_t controller,
+                                     uint8_t value) {
+  if (channel >= kChannelCount)
+    return false;
+
+  ChannelPitchState &state = pitchChannels_[channel];
+  switch (controller) {
+  case 101:
+    state.rpnMsb = value;
+    return true;
+  case 100:
+    state.rpnLsb = value;
+    return true;
+  case 99:
+  case 98:
+    state.rpnMsb = 127;
+    state.rpnLsb = 127;
+    return true;
+  case 6:
+    state.dataEntryMsb = value;
+    break;
+  case 38:
+    state.dataEntryLsb = value;
+    break;
+  case 121:
+    state = ChannelPitchState();
+    return true;
+  default:
+    return false;
+  }
+
+  if (state.rpnMsb != 0)
+    return true;
+
+  if (state.rpnLsb == 0) {
+    state.pitchRange =
+        ClampFloat((float)state.dataEntryMsb + (float)state.dataEntryLsb * 0.01f,
+                   0.0f, 96.0f);
+  } else if (state.rpnLsb == 1) {
+    const uint16_t midiData =
+        (uint16_t)(((uint16_t)state.dataEntryMsb << 7) | state.dataEntryLsb);
+    state.tuning =
+        (float)((int)state.tuning) + ((float)midiData - 8192.0f) / 8192.0f;
+  } else if (state.rpnLsb == 2 && controller == 6) {
+    state.tuning = ((float)state.dataEntryMsb - 64.0f) +
+                   (state.tuning - (float)((int)state.tuning));
+  }
+  return true;
+}
+
+float ExactSystem::GetPitchShiftSemitones(uint8_t channel) const {
+  if (channel >= kChannelCount)
+    return 0.0f;
+
+  const ChannelPitchState &state = pitchChannels_[channel];
+  if (state.pitchWheel == 8192)
+    return state.tuning;
+  return ((float)state.pitchWheel / 16383.0f) * state.pitchRange * 2.0f -
+         state.pitchRange + state.tuning;
 }
 
 void ExactSystem::ReleaseSustainedVoices(uint8_t channel) {

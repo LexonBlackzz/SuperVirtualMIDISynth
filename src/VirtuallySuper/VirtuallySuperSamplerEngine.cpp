@@ -1,6 +1,7 @@
 #include "VirtuallySuperSamplerEngine.h"
 
 #include <algorithm>
+#include <math.h>
 #include <string.h>
 
 namespace {
@@ -11,6 +12,14 @@ static uint8_t ClampMidiData(int value) {
   if (value > 127)
     return 127;
   return (uint8_t)value;
+}
+
+static uint16_t ClampPitchBend14(int value) {
+  if (value < 0)
+    return 0;
+  if (value > 0x3FFF)
+    return 0x3FFFu;
+  return (uint16_t)value;
 }
 
 } // namespace
@@ -170,6 +179,10 @@ void VirtuallySuperSamplerEngine::ProcessMidiEvent(const MidiEvent &event) {
     return;
 
   const virtuallysuper::NormalizedEvent normalized = ConvertMidiEvent(event);
+  if (normalized.kind == virtuallysuper::EventKind::NoteOn &&
+      normalized.mappedVelocity == 0) {
+    return;
+  }
   const virtuallysuper::ScheduleDecision decision =
       prototype_.SubmitEvent(normalized);
 
@@ -364,9 +377,48 @@ DWORD VirtuallySuperSamplerEngine::GetActiveVoiceStats(DWORD *channelCounts,
 SamplerDiagnostics VirtuallySuperSamplerEngine::GetDiagnostics() const {
   compat::LockGuard<compat::Mutex> lock(engineMutex);
   SamplerDiagnostics copy = diagnostics_;
+  for (uint32_t channel = 0; channel < 16; ++channel)
+    copy.pitchBendRange[channel] = soundFontRuntime_.GetPitchBendRange((uint8_t)channel);
   copy.samplerStateCode = (unsigned int)stateCode_;
   copy.samplerErrorCode = (unsigned int)errorCode_;
   return copy;
+}
+
+uint8_t VirtuallySuperSamplerEngine::MapMidiVelocity(int velocity) const {
+  if (velocity <= 0)
+    return 0;
+  if (velocity >= 127)
+    return 127;
+
+  int ignoreBelow = runtimeSettings_.velocityIgnoreBelow;
+  if (ignoreBelow < 0)
+    ignoreBelow = 0;
+  if (ignoreBelow > 126)
+    ignoreBelow = 126;
+  if (velocity <= ignoreBelow)
+    return 0;
+
+  float normalized =
+      (float)(velocity - ignoreBelow) / (127.0f - (float)ignoreBelow);
+  float curve = runtimeSettings_.velocityCurve;
+  if (curve < 0.25f)
+    curve = 0.25f;
+  if (curve > 6.0f)
+    curve = 6.0f;
+
+  float floor = runtimeSettings_.velocityFloor;
+  if (floor < 0.0f)
+    floor = 0.0f;
+  if (floor > 0.5f)
+    floor = 0.5f;
+
+  const float mapped = floor + (1.0f - floor) * powf(normalized, curve);
+  int midi = (int)(mapped * 127.0f + 0.5f);
+  if (midi < 1)
+    midi = 1;
+  if (midi > 127)
+    midi = 127;
+  return (uint8_t)midi;
 }
 
 virtuallysuper::NormalizedEvent
@@ -376,12 +428,14 @@ VirtuallySuperSamplerEngine::ConvertMidiEvent(const MidiEvent &event) const {
   normalized.note = ClampMidiData(event.data1);
   normalized.value = ClampMidiData(event.data1);
   normalized.velocity = ClampMidiData(event.data2);
+  normalized.mappedVelocity = normalized.velocity;
   normalized.sequence = event.sequence;
   normalized.targetSample = event.targetSample;
 
   switch (event.type) {
   case MidiEvent::NOTE_ON:
     normalized.kind = virtuallysuper::EventKind::NoteOn;
+    normalized.mappedVelocity = MapMidiVelocity(event.data2);
     break;
   case MidiEvent::NOTE_OFF:
     normalized.kind = virtuallysuper::EventKind::NoteOff;
@@ -394,6 +448,13 @@ VirtuallySuperSamplerEngine::ConvertMidiEvent(const MidiEvent &event) const {
     break;
   case MidiEvent::PITCH_BEND:
     normalized.kind = virtuallysuper::EventKind::PitchBend;
+    {
+      const uint16_t bend = ClampPitchBend14(event.data1);
+      normalized.note = 0;
+      normalized.value = (uint8_t)(bend & 0x7Fu);
+      normalized.velocity = (uint8_t)((bend >> 7) & 0x7Fu);
+      normalized.mappedVelocity = 0;
+    }
     break;
   case MidiEvent::RESET:
     normalized.kind = virtuallysuper::EventKind::Reset;

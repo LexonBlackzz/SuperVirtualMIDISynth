@@ -32,6 +32,20 @@ public:
   void RetireVoice(uint32_t handle);
 
 private:
+  struct ChannelPitchState {
+    uint16_t pitchWheel;
+    uint8_t rpnMsb;
+    uint8_t rpnLsb;
+    uint8_t dataEntryMsb;
+    uint8_t dataEntryLsb;
+    float pitchRange;
+    float tuning;
+
+    ChannelPitchState()
+        : pitchWheel(8192), rpnMsb(127), rpnLsb(127), dataEntryMsb(2),
+          dataEntryLsb(0), pitchRange(2.0f), tuning(0.0f) {}
+  };
+
   struct QueueState {
     uint32_t head;
     uint32_t tail;
@@ -45,9 +59,13 @@ private:
   void ActivateVoice(uint32_t handle, const NormalizedEvent &event);
   void TransitionVoiceToReleased(uint32_t handle);
   void RefreshVoiceFromSoundFont(uint32_t handle);
+  void RefreshSyntheticVoice(uint32_t handle);
   void RefreshChannelVoices(uint8_t channel);
   void ReleaseSustainedVoices(uint8_t channel);
   void ReleaseAllChannelVoices(uint8_t channel, bool hardKill);
+  void ResetPitchChannels();
+  bool HandlePitchControl(uint8_t channel, uint8_t controller, uint8_t value);
+  float GetPitchShiftSemitones(uint8_t channel) const;
   void InsertKeyVoice(uint32_t handle);
   void RemoveKeyVoice(uint32_t handle);
   void LinkQueueTail(ExactQueueClass queueClass, uint32_t handle);
@@ -61,6 +79,7 @@ private:
   bool initialized_;
   uint32_t nextVoiceId_;
   SoundFontRuntime *soundFont_;
+  ChannelPitchState pitchChannels_[kChannelCount];
   uint32_t generationCounters_[kChannelCount][kNoteCount];
   uint32_t keyHeads_[kChannelCount][kNoteCount];
   QueueState queues_[5];

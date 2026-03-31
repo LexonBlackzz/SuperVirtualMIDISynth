@@ -84,17 +84,18 @@ struct NormalizedEvent {
   uint8_t note;
   uint8_t value;
   uint8_t velocity;
+  uint8_t mappedVelocity;
   uint8_t applyPriority;
   uint8_t flags;
-  uint16_t reserved;
+  uint8_t reserved;
   uint32_t sequence;
   uint32_t sourceTrack;
   int64_t targetSample;
 
   NormalizedEvent()
       : kind(EventKind::Invalid), channel(0), note(0), value(0), velocity(0),
-        applyPriority(0), flags(0), reserved(0), sequence(0), sourceTrack(0),
-        targetSample(0) {}
+        mappedVelocity(0), applyPriority(0), flags(0), reserved(0),
+        sequence(0), sourceTrack(0), targetSample(0) {}
 };
 
 struct TransitionEntry {
@@ -179,6 +180,7 @@ struct ExactVoice {
   uint8_t channel;
   uint8_t note;
   uint8_t velocity;
+  uint8_t mappedVelocity;
   uint8_t layerTemplateId;
   uint8_t protectedAttack;
   uint8_t releaseShortened;
@@ -211,7 +213,7 @@ struct ExactVoice {
   ExactVoice()
       : voiceId(0), generation(0), startSequence(0),
         state(ExactLifecycleState::Free), queueClass(ExactQueueClass::None),
-        channel(0), note(0), velocity(0), layerTemplateId(0),
+        channel(0), note(0), velocity(0), mappedVelocity(0), layerTemplateId(0),
         protectedAttack(0), releaseShortened(0), sampleBacked(0),
         heldBySustain(0), regionIndex(kInvalidSoundFontIndex),
         sampleIndex(kInvalidSoundFontIndex),
