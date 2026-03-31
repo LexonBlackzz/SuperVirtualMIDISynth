@@ -35,6 +35,7 @@ The first concrete runtime slice is:
 - `VirtuallySuperScheduler.h/.cpp`
 - `VirtuallySuperExact.h/.cpp`
 - `VirtuallySuperGrouped.h/.cpp`
+- `VirtuallySuperDensity.h/.cpp`
 - `VirtuallySuperEngine.h/.cpp`
 
 This slice is intentionally limited:
@@ -46,6 +47,7 @@ This slice is intentionally limited:
 - direct `(channel, note)` exact voice lookup
 - queue-based exact voice stealing
 - window-local grouped bucket prototype
+- window-local density cloud prototype
 - scheduler-to-exact prototype API
 
 It is not integrated into the existing playback path yet.
