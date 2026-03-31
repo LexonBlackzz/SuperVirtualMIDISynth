@@ -375,6 +375,27 @@ static bool IsResetLikeEvent(const MidiEvent &event) {
   return event.data1 == 120 || event.data1 == 121 || event.data1 == 123;
 }
 
+static bool CanCoalesceReleaseLaneEvent(const MidiEvent &queued,
+                                        const MidiEvent &incoming) {
+  const bool sameNoteOff =
+      ((queued.type == MidiEvent::NOTE_OFF ||
+        (queued.type == MidiEvent::NOTE_ON && queued.data2 <= 0)) &&
+       (incoming.type == MidiEvent::NOTE_OFF ||
+        (incoming.type == MidiEvent::NOTE_ON && incoming.data2 <= 0)) &&
+       queued.channel == incoming.channel && queued.data1 == incoming.data1);
+  const bool sameController =
+      incoming.type == MidiEvent::CONTROL_CHANGE &&
+      queued.type == MidiEvent::CONTROL_CHANGE &&
+      queued.channel == incoming.channel && queued.data1 == incoming.data1;
+  const bool samePitch = incoming.type == MidiEvent::PITCH_BEND &&
+                         queued.type == MidiEvent::PITCH_BEND &&
+                         queued.channel == incoming.channel;
+  const bool sameProgram = incoming.type == MidiEvent::PROGRAM_CHANGE &&
+                           queued.type == MidiEvent::PROGRAM_CHANGE &&
+                           queued.channel == incoming.channel;
+  return sameNoteOff || sameController || samePitch || sameProgram;
+}
+
 static void LogTimingDebug(const char *format, ...) {
 #if SVMS_PERF_DEBUG
   char buffer[512];
@@ -637,6 +658,11 @@ bool Synth::IsAccurateEventThreadEnabledLocked() const {
 
 bool Synth::IsPositiveNoteOn(const MidiEvent &event) {
   return event.type == MidiEvent::NOTE_ON && event.data2 > 0;
+}
+
+bool Synth::IsActualNoteOffEvent(const MidiEvent &event) {
+  return event.type == MidiEvent::NOTE_OFF ||
+         (event.type == MidiEvent::NOTE_ON && event.data2 <= 0);
 }
 
 bool Synth::IsNoteTransitionEvent(const MidiEvent &event) {
@@ -1276,35 +1302,39 @@ unsigned int Synth::GetIngressDepthLocked() const {
 }
 
 void Synth::EnqueueReleaseLaneEventLocked(const MidiEvent &event) {
-  if (!overloadReleaseEvents.empty()) {
-    MidiEvent &tail = overloadReleaseEvents.back();
-    bool sameController =
-        event.type == MidiEvent::CONTROL_CHANGE &&
-        tail.type == MidiEvent::CONTROL_CHANGE && tail.channel == event.channel &&
-        tail.data1 == event.data1;
-    bool samePitch = event.type == MidiEvent::PITCH_BEND &&
-                     tail.type == MidiEvent::PITCH_BEND &&
-                     tail.channel == event.channel;
-    bool sameProgram = event.type == MidiEvent::PROGRAM_CHANGE &&
-                       tail.type == MidiEvent::PROGRAM_CHANGE &&
-                       tail.channel == event.channel;
-    if (sameController || samePitch || sameProgram) {
-      tail = event;
+  for (uint32_t i = overloadReleaseEvents.size(); i > 0; --i) {
+    MidiEvent &queued = overloadReleaseEvents.at(i - 1u);
+    if (CanCoalesceReleaseLaneEvent(queued, event)) {
+      queued = event;
       ++accurateControlsCoalesced;
       return;
     }
   }
-  if (overloadReleaseEvents.size() >= kReleaseLaneMaxEvents)
+
+  if (overloadReleaseEvents.size() >= kReleaseLaneMaxEvents) {
+    if (IsActualNoteOffEvent(event) || IsReleaseAffectingControlEvent(event) ||
+        IsCriticalControlEvent(event)) {
+      EnqueueDeferredEvent(event);
+      return;
+    }
     overloadReleaseEvents.pop_front();
-  overloadReleaseEvents.push_back(event);
+  }
+
+  if (overloadReleaseEvents.push_back(event) && IsActualNoteOffEvent(event)) {
+    noteOffReleaseLaneQueuedCounter.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 unsigned int Synth::PopReleaseLaneEventsLocked(std::vector<MidiEvent> &events,
                                                unsigned int maxCount) {
   events.clear();
   while (!overloadReleaseEvents.empty() && events.size() < maxCount) {
-    events.push_back(overloadReleaseEvents.front());
+    const MidiEvent event = overloadReleaseEvents.front();
     overloadReleaseEvents.pop_front();
+    if (IsActualNoteOffEvent(event)) {
+      noteOffReleaseLaneAppliedCounter.fetch_add(1, std::memory_order_relaxed);
+    }
+    events.push_back(event);
   }
   return static_cast<unsigned int>(events.size());
 }
@@ -1392,6 +1422,8 @@ void Synth::InsertScheduledTimedEventLocked(const MidiEvent &event,
   if (targetSample < earliestRenderableSample) {
     targetSample = earliestRenderableSample;
     ++lastSchedulerLateEvents;
+    if (IsActualNoteOffEvent(event))
+      ++lastNoteOffLate;
   }
 
   if (noteOn)
@@ -1974,12 +2006,30 @@ bool Synth::IsCriticalControlEvent(const MidiEvent &event) const {
 
 void Synth::EnqueueDeferredEvent(const MidiEvent &event) {
   int priority = GetEventPriority(event);
-  if (priority == 0 || IsCriticalControlEvent(event))
-    deferredCriticalEvents.push_back(event);
-  else if (priority == 1)
-    deferredRealtimeEvents.push_back(event);
-  else
-    deferredNoteOnEvents.push_back(event);
+  FlatMidiQueue *targetQueue =
+      (priority == 0 || IsCriticalControlEvent(event))
+          ? &deferredCriticalEvents
+          : (priority == 1 ? &deferredRealtimeEvents : &deferredNoteOnEvents);
+  if (targetQueue->push_back(event)) {
+    if (IsActualNoteOffEvent(event))
+      noteOffDeferredCounter.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  if (IsPositiveNoteOn(event)) {
+    droppedNoteOnEvents.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  if (IsActualNoteOffEvent(event) || IsReleaseAffectingControlEvent(event) ||
+      IsCriticalControlEvent(event)) {
+    pendingCriticalEvents.push_back(event);
+    if (IsActualNoteOffEvent(event))
+      noteOffDeferredCounter.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  droppedNonNoteEvents.fetch_add(1, std::memory_order_relaxed);
 }
 
 unsigned int Synth::DropDeferredNoteOnsForKey(int channel, int note) {
@@ -2360,11 +2410,19 @@ void Synth::Shutdown(bool waitForThreads) {
   maxAsyncQueueDepth.store(0, std::memory_order_relaxed);
   lastPendingQueueDepth = 0;
   lastDeferredQueueDepth = 0;
+  lastCriticalQueueDepth = 0;
+  lastRealtimeQueueDepth = 0;
+  lastNoteOnQueueDepth = 0;
   lastEventsProcessed = 0;
   lastNoteOnsAttempted = 0;
   lastNoteOnsStarted = 0;
   lastNoteOnsDropped = 0;
   lastNoteOffsProcessed = 0;
+  lastNoteOffIngress = 0;
+  lastNoteOffDeferred = 0;
+  lastNoteOffReleaseLaneQueued = 0;
+  lastNoteOffReleaseLaneApplied = 0;
+  lastNoteOffLate = 0;
   lastAsyncPendingNoteOns = 0;
   lastAsyncStarted = 0;
   lastAsyncDropped = 0;
@@ -2398,6 +2456,10 @@ void Synth::Shutdown(bool waitForThreads) {
   accurateReleaseLaneDepth = 0;
   accurateIngressDepth = 0;
   accurateControlsCoalesced = 0;
+  noteOffIngressCounter.store(0, std::memory_order_relaxed);
+  noteOffDeferredCounter.store(0, std::memory_order_relaxed);
+  noteOffReleaseLaneQueuedCounter.store(0, std::memory_order_relaxed);
+  noteOffReleaseLaneAppliedCounter.store(0, std::memory_order_relaxed);
 }
 
 void Synth::ForceShutdown(bool waitForThreads) {
@@ -2438,13 +2500,25 @@ void Synth::ForceShutdown(bool waitForThreads) {
   droppedNonNoteEvents.store(0, std::memory_order_relaxed);
   maxObservedQueueDepth.store(0, std::memory_order_relaxed);
   maxAsyncQueueDepth.store(0, std::memory_order_relaxed);
+  noteOffIngressCounter.store(0, std::memory_order_relaxed);
+  noteOffDeferredCounter.store(0, std::memory_order_relaxed);
+  noteOffReleaseLaneQueuedCounter.store(0, std::memory_order_relaxed);
+  noteOffReleaseLaneAppliedCounter.store(0, std::memory_order_relaxed);
   lastPendingQueueDepth = 0;
   lastDeferredQueueDepth = 0;
+  lastCriticalQueueDepth = 0;
+  lastRealtimeQueueDepth = 0;
+  lastNoteOnQueueDepth = 0;
   lastEventsProcessed = 0;
   lastNoteOnsAttempted = 0;
   lastNoteOnsStarted = 0;
   lastNoteOnsDropped = 0;
   lastNoteOffsProcessed = 0;
+  lastNoteOffIngress = 0;
+  lastNoteOffDeferred = 0;
+  lastNoteOffReleaseLaneQueued = 0;
+  lastNoteOffReleaseLaneApplied = 0;
+  lastNoteOffLate = 0;
   lastAsyncPendingNoteOns = 0;
   lastAsyncStarted = 0;
   lastAsyncDropped = 0;
@@ -2555,13 +2629,25 @@ void Synth::Initialize() {
       droppedNonNoteEvents.store(0, std::memory_order_relaxed);
       maxObservedQueueDepth.store(0, std::memory_order_relaxed);
       maxAsyncQueueDepth.store(0, std::memory_order_relaxed);
+      noteOffIngressCounter.store(0, std::memory_order_relaxed);
+      noteOffDeferredCounter.store(0, std::memory_order_relaxed);
+      noteOffReleaseLaneQueuedCounter.store(0, std::memory_order_relaxed);
+      noteOffReleaseLaneAppliedCounter.store(0, std::memory_order_relaxed);
       lastPendingQueueDepth = 0;
       lastDeferredQueueDepth = 0;
+      lastCriticalQueueDepth = 0;
+      lastRealtimeQueueDepth = 0;
+      lastNoteOnQueueDepth = 0;
       lastEventsProcessed = 0;
       lastNoteOnsAttempted = 0;
       lastNoteOnsStarted = 0;
       lastNoteOnsDropped = 0;
       lastNoteOffsProcessed = 0;
+      lastNoteOffIngress = 0;
+      lastNoteOffDeferred = 0;
+      lastNoteOffReleaseLaneQueued = 0;
+      lastNoteOffReleaseLaneApplied = 0;
+      lastNoteOffLate = 0;
       lastAsyncPendingNoteOns = 0;
       lastAsyncStarted = 0;
       lastAsyncDropped = 0;
@@ -2633,6 +2719,9 @@ void Synth::Initialize() {
 void Synth::PushEvent(MidiEvent ev) {
   if (acceptingEvents.load(std::memory_order_relaxed) == 0)
     return;
+
+  if (IsActualNoteOffEvent(ev))
+    noteOffIngressCounter.fetch_add(1, std::memory_order_relaxed);
 
   ev.sequence = nextEventSequence.fetch_add(1, std::memory_order_relaxed);
   const EventTimingMode timingMode = GetEventTimingModeFast();
@@ -2779,6 +2868,11 @@ void Synth::ProcessEventsLocked() {
   lastNoteOnsStarted = 0;
   lastNoteOnsDropped = 0;
   lastNoteOffsProcessed = 0;
+  lastNoteOffIngress = 0;
+  lastNoteOffDeferred = 0;
+  lastNoteOffReleaseLaneQueued = 0;
+  lastNoteOffReleaseLaneApplied = 0;
+  lastNoteOffLate = 0;
   lastAsyncPendingNoteOns = 0;
   lastAsyncStarted = 0;
   lastAsyncDropped = 0;
@@ -3066,17 +3160,38 @@ void Synth::ProcessEventsLocked() {
   unsigned int releaseLaneDepthSnapshot = 0;
   unsigned int accuratePendingSnapshot = 0;
   unsigned int ingressDepthSnapshot = 0;
+  unsigned int criticalQueueDepthSnapshot = 0;
+  unsigned int realtimeQueueDepthSnapshot = 0;
+  unsigned int noteOnQueueDepthSnapshot = 0;
   {
     compat::LockGuard<compat::Mutex> queueLock(eventQueueMutex);
     releaseLaneDepthSnapshot =
         static_cast<unsigned int>(overloadReleaseEvents.size());
     accuratePendingSnapshot =
         static_cast<unsigned int>(accuratePendingEvents.size());
+    criticalQueueDepthSnapshot = static_cast<unsigned int>(
+        pendingCriticalEvents.size() + deferredCriticalEvents.size());
+    realtimeQueueDepthSnapshot = static_cast<unsigned int>(
+        pendingRealtimeEvents.size() + deferredRealtimeEvents.size());
+    noteOnQueueDepthSnapshot = static_cast<unsigned int>(
+        pendingNoteOnEvents.size() + deferredNoteOnEvents.size() +
+        accuratePendingEvents.size());
     ingressDepthSnapshot = GetIngressDepthLocked();
   }
   lastDeferredQueueDepth = GetDeferredEventCount(
       deferredCriticalEvents, deferredRealtimeEvents, deferredNoteOnEvents) +
                            releaseLaneDepthSnapshot;
+  lastCriticalQueueDepth = criticalQueueDepthSnapshot;
+  lastRealtimeQueueDepth = realtimeQueueDepthSnapshot;
+  lastNoteOnQueueDepth = noteOnQueueDepthSnapshot;
+  lastNoteOffIngress =
+      noteOffIngressCounter.exchange(0, std::memory_order_relaxed);
+  lastNoteOffDeferred =
+      noteOffDeferredCounter.exchange(0, std::memory_order_relaxed);
+  lastNoteOffReleaseLaneQueued =
+      noteOffReleaseLaneQueuedCounter.exchange(0, std::memory_order_relaxed);
+  lastNoteOffReleaseLaneApplied =
+      noteOffReleaseLaneAppliedCounter.exchange(0, std::memory_order_relaxed);
   lastAsyncPendingNoteOns =
       ComputeScheduledPendingCountLocked() + accuratePendingSnapshot;
   lastAsyncQueueAgeMs = ComputeScheduledQueueAgeMsLocked();
@@ -3699,6 +3814,10 @@ SamplerDiagnostics Synth::GetSamplerDiagnostics() {
 
   diagnostics.queuedMidiEvents = lastPendingQueueDepth;
   diagnostics.deferredMidiEvents = lastDeferredQueueDepth;
+  diagnostics.criticalQueueDepth = lastCriticalQueueDepth;
+  diagnostics.realtimeQueueDepth = lastRealtimeQueueDepth;
+  diagnostics.noteOnQueueDepth = lastNoteOnQueueDepth;
+  diagnostics.releaseLaneDepth = accurateReleaseLaneDepth;
   diagnostics.maxQueuedMidiEvents =
       maxObservedQueueDepth.load(std::memory_order_relaxed);
   diagnostics.droppedNoteOnEvents =
@@ -3710,6 +3829,13 @@ SamplerDiagnostics Synth::GetSamplerDiagnostics() {
   diagnostics.noteOnStartedThisBlock = lastNoteOnsStarted;
   diagnostics.noteOnDroppedThisBlock = lastNoteOnsDropped;
   diagnostics.noteOffEventsThisBlock = lastNoteOffsProcessed;
+  diagnostics.noteOffIngressThisBlock = lastNoteOffIngress;
+  diagnostics.noteOffDeferredThisBlock = lastNoteOffDeferred;
+  diagnostics.noteOffReleaseLaneQueuedThisBlock =
+      lastNoteOffReleaseLaneQueued;
+  diagnostics.noteOffReleaseLaneAppliedThisBlock =
+      lastNoteOffReleaseLaneApplied;
+  diagnostics.noteOffLateThisBlock = lastNoteOffLate;
   diagnostics.asyncPendingNoteOns = lastAsyncPendingNoteOns;
   diagnostics.asyncStartedThisBlock = lastSchedulerDueEvents;
   diagnostics.asyncDroppedThisBlock = lastAsyncDropped;

@@ -429,6 +429,14 @@ void LiveRuntime::PublishSnapshot() {
       samplerDiagnostics.queuedMidiEvents;
   sharedState->currentStats.deferredMidiEvents =
       samplerDiagnostics.deferredMidiEvents;
+  sharedState->currentStats.criticalQueueDepth =
+      samplerDiagnostics.criticalQueueDepth;
+  sharedState->currentStats.realtimeQueueDepth =
+      samplerDiagnostics.realtimeQueueDepth;
+  sharedState->currentStats.noteOnQueueDepth =
+      samplerDiagnostics.noteOnQueueDepth;
+  sharedState->currentStats.releaseLaneDepth =
+      samplerDiagnostics.releaseLaneDepth;
   sharedState->currentStats.maxQueuedMidiEvents =
       samplerDiagnostics.maxQueuedMidiEvents;
   sharedState->currentStats.droppedNoteOnEvents =
@@ -445,6 +453,16 @@ void LiveRuntime::PublishSnapshot() {
       samplerDiagnostics.noteOnDroppedThisBlock;
   sharedState->currentStats.noteOffEventsThisBlock =
       samplerDiagnostics.noteOffEventsThisBlock;
+  sharedState->currentStats.noteOffIngressThisBlock =
+      samplerDiagnostics.noteOffIngressThisBlock;
+  sharedState->currentStats.noteOffDeferredThisBlock =
+      samplerDiagnostics.noteOffDeferredThisBlock;
+  sharedState->currentStats.noteOffReleaseLaneQueuedThisBlock =
+      samplerDiagnostics.noteOffReleaseLaneQueuedThisBlock;
+  sharedState->currentStats.noteOffReleaseLaneAppliedThisBlock =
+      samplerDiagnostics.noteOffReleaseLaneAppliedThisBlock;
+  sharedState->currentStats.noteOffLateThisBlock =
+      samplerDiagnostics.noteOffLateThisBlock;
   sharedState->currentStats.asyncPendingNoteOns =
       samplerDiagnostics.asyncPendingNoteOns;
   sharedState->currentStats.asyncStartedThisBlock =

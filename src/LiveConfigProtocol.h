@@ -4,9 +4,11 @@
 #include <windows.h>
 
 #define SVMS_LIVE_BRIDGE_MAGIC 0x53564D53u
-#define SVMS_LIVE_BRIDGE_VERSION 22u
-#define SVMS_LIVE_BRIDGE_MAPPING_NAME "Local\\SVMS_LiveBridge_v22"
-#define SVMS_LIVE_BRIDGE_MUTEX_NAME "Local\\SVMS_LiveBridgeMutex_v22"
+#define SVMS_LIVE_BRIDGE_VERSION 23u
+#define SVMS_LIVE_BRIDGE_MAPPING_NAME "Local\\SVMS_LiveBridge_v23"
+#define SVMS_LIVE_BRIDGE_MUTEX_NAME "Local\\SVMS_LiveBridgeMutex_v23"
+#define SVMS_LIVE_BRIDGE_MAPPING_NAME_V22 "Local\\SVMS_LiveBridge_v22"
+#define SVMS_LIVE_BRIDGE_MUTEX_NAME_V22 "Local\\SVMS_LiveBridgeMutex_v22"
 #define SVMS_LIVE_BRIDGE_MAPPING_NAME_V21 "Local\\SVMS_LiveBridge_v21"
 #define SVMS_LIVE_BRIDGE_MUTEX_NAME_V21 "Local\\SVMS_LiveBridgeMutex_v21"
 #define SVMS_LIVE_BRIDGE_MAPPING_NAME_V20 "Local\\SVMS_LiveBridge_v20"
@@ -114,6 +116,10 @@ struct LiveBridgeStats {
   DWORD activeVoices[16];
   DWORD queuedMidiEvents;
   DWORD deferredMidiEvents;
+  DWORD criticalQueueDepth;
+  DWORD realtimeQueueDepth;
+  DWORD noteOnQueueDepth;
+  DWORD releaseLaneDepth;
   DWORD maxQueuedMidiEvents;
   DWORD droppedNoteOnEvents;
   DWORD droppedNonNoteEvents;
@@ -122,6 +128,11 @@ struct LiveBridgeStats {
   DWORD noteOnStartedThisBlock;
   DWORD noteOnDroppedThisBlock;
   DWORD noteOffEventsThisBlock;
+  DWORD noteOffIngressThisBlock;
+  DWORD noteOffDeferredThisBlock;
+  DWORD noteOffReleaseLaneQueuedThisBlock;
+  DWORD noteOffReleaseLaneAppliedThisBlock;
+  DWORD noteOffLateThisBlock;
   DWORD asyncPendingNoteOns;
   DWORD asyncStartedThisBlock;
   DWORD asyncDroppedThisBlock;

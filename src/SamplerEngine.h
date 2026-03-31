@@ -157,6 +157,10 @@ struct SamplerDiagnostics {
   unsigned int failedSampleCount;
   unsigned int queuedMidiEvents;
   unsigned int deferredMidiEvents;
+  unsigned int criticalQueueDepth;
+  unsigned int realtimeQueueDepth;
+  unsigned int noteOnQueueDepth;
+  unsigned int releaseLaneDepth;
   unsigned int maxQueuedMidiEvents;
   unsigned int droppedNoteOnEvents;
   unsigned int droppedNonNoteEvents;
@@ -165,6 +169,11 @@ struct SamplerDiagnostics {
   unsigned int noteOnStartedThisBlock;
   unsigned int noteOnDroppedThisBlock;
   unsigned int noteOffEventsThisBlock;
+  unsigned int noteOffIngressThisBlock;
+  unsigned int noteOffDeferredThisBlock;
+  unsigned int noteOffReleaseLaneQueuedThisBlock;
+  unsigned int noteOffReleaseLaneAppliedThisBlock;
+  unsigned int noteOffLateThisBlock;
   unsigned int asyncPendingNoteOns;
   unsigned int asyncStartedThisBlock;
   unsigned int asyncDroppedThisBlock;
@@ -241,11 +250,16 @@ struct SamplerDiagnostics {
 
   SamplerDiagnostics()
       : warningCount(0), loadedSampleCount(0), failedSampleCount(0),
-        queuedMidiEvents(0), deferredMidiEvents(0), maxQueuedMidiEvents(0),
+        queuedMidiEvents(0), deferredMidiEvents(0), criticalQueueDepth(0),
+        realtimeQueueDepth(0), noteOnQueueDepth(0), releaseLaneDepth(0),
+        maxQueuedMidiEvents(0),
         droppedNoteOnEvents(0), droppedNonNoteEvents(0),
         eventsProcessedThisBlock(0), noteOnEventsThisBlock(0),
         noteOnStartedThisBlock(0), noteOnDroppedThisBlock(0),
-        noteOffEventsThisBlock(0), asyncPendingNoteOns(0),
+        noteOffEventsThisBlock(0), noteOffIngressThisBlock(0),
+        noteOffDeferredThisBlock(0), noteOffReleaseLaneQueuedThisBlock(0),
+        noteOffReleaseLaneAppliedThisBlock(0), noteOffLateThisBlock(0),
+        asyncPendingNoteOns(0),
         asyncStartedThisBlock(0), asyncDroppedThisBlock(0),
         asyncCoalescedThisBlock(0), overloadNoteOnsDroppedThisBlock(0),
         staleNoteOnsDroppedThisBlock(0), preScheduleDropsThisBlock(0),
