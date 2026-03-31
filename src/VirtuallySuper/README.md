@@ -37,6 +37,8 @@ The first concrete runtime slice is:
 - `VirtuallySuperExact.h/.cpp`
 - `VirtuallySuperGrouped.h/.cpp`
 - `VirtuallySuperDensity.h/.cpp`
+- `VirtuallySuperOverload.h/.cpp`
+- `VirtuallySuperRender.h/.cpp`
 - `VirtuallySuperTelemetryShared.h`
 - `VirtuallySuperTelemetry.h/.cpp`
 - `VirtuallySuperSamplerEngine.h/.cpp`
@@ -52,6 +54,7 @@ This slice is intentionally limited:
 - queue-based exact voice stealing
 - window-local grouped bucket prototype
 - window-local density cloud prototype
+- overload-aware scene tier selection
 - explicit scene action compiler between scheduler and tiers
 - compact prototype telemetry snapshots
 - scheduler-to-exact prototype API

@@ -13,7 +13,7 @@ public:
   void Publish(const SchedulerStats &schedulerStats, const SceneStats &sceneStats,
                const ExactStats &exactStats, const GroupedStats &groupedStats,
                const DensityStats &densityStats, uint32_t schedulerQueuedEvents,
-               uint32_t lastAppliedEvents);
+               uint32_t lastAppliedEvents, PressureLevel pressureLevel);
 
   const TelemetrySnapshot &GetLatestSnapshot() const;
   const TelemetrySharedState &GetSharedState() const;

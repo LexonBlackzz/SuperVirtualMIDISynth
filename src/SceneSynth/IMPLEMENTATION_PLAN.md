@@ -107,6 +107,7 @@ engines while the new engine is designed and prototyped in parallel.
 - [x] Add grouped rendering prototype
 - [x] Add first density prototype
 - [x] Add first tile-oriented prototype render backbone
+- [x] Add first overload-aware scene reduction prototype
 - [ ] Wire Configurator to prototype telemetry
 - [ ] Decide when the new engine is ready for side-by-side runtime integration
 

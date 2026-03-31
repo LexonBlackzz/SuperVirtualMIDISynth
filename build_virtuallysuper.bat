@@ -69,13 +69,16 @@ if errorlevel 1 exit /b %errorlevel%
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperDensity.cpp" /Fo"%OBJDIR%\VirtuallySuperDensity.obj"
 if errorlevel 1 exit /b %errorlevel%
 
+cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperOverload.cpp" /Fo"%OBJDIR%\VirtuallySuperOverload.obj"
+if errorlevel 1 exit /b %errorlevel%
+
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperRender.cpp" /Fo"%OBJDIR%\VirtuallySuperRender.obj"
 if errorlevel 1 exit /b %errorlevel%
 
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperScheduler.cpp" /Fo"%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
-lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperSamplerEngine.obj" "%OBJDIR%\VirtuallySuperScene.obj" "%OBJDIR%\VirtuallySuperTelemetry.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperGrouped.obj" "%OBJDIR%\VirtuallySuperDensity.obj" "%OBJDIR%\VirtuallySuperRender.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
+lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperSamplerEngine.obj" "%OBJDIR%\VirtuallySuperScene.obj" "%OBJDIR%\VirtuallySuperTelemetry.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperGrouped.obj" "%OBJDIR%\VirtuallySuperDensity.obj" "%OBJDIR%\VirtuallySuperOverload.obj" "%OBJDIR%\VirtuallySuperRender.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
 echo Built "%OUTDIR%\VirtuallySuperPrototype.lib"

@@ -1,6 +1,7 @@
 #include "VirtuallySuperEngine.h"
 #include "VirtuallySuperDensity.h"
 #include "VirtuallySuperGrouped.h"
+#include "VirtuallySuperOverload.h"
 #include "VirtuallySuperSamplerEngine.h"
 #include "VirtuallySuperScene.h"
 #include "VirtuallySuperTelemetry.h"
@@ -198,20 +199,70 @@ static bool TestEngineDensityAccumulation() {
   config.density.pitchBandSemitones = 12;
   config.density.timingBucketSamples = 16;
   config.density.activationThreshold = 2;
+  config.overload.softExactVoiceThreshold = 1;
+  config.overload.hardExactVoiceThreshold = 1;
+  config.overload.panicExactVoiceThreshold = 1;
+  config.overload.softSchedulerQueueThreshold = 1;
+  config.overload.hardSchedulerQueueThreshold = 1;
+  config.overload.panicSchedulerQueueThreshold = 1;
   if (!engine.Initialize(config))
     return false;
 
-  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 60, 100, 0, 1));
-  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 61, 90, 2, 2));
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 60, 18, 0, 1));
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 61, 20, 2, 2));
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 62, 22, 4, 3));
   engine.FlushPendingIngress(16);
 
   int64_t renderUntil = 0;
-  if (engine.ApplyScheduledWindow(0, 100, 100, &renderUntil) != 2)
+  if (engine.ApplyScheduledWindow(0, 100, 100, &renderUntil) != 3)
     return false;
   if (engine.GetDensitySystem().GetActiveObjectCount() != 1)
     return false;
   if (engine.GetDensitySystem().GetStats().promotedClouds != 1)
     return false;
+  return true;
+}
+
+static bool TestOverloadPressureReducesExactWork() {
+  EnginePrototype engine;
+  EngineConfig config;
+  config.scheduler.ingressCapacity = 32;
+  config.scheduler.scheduledCapacity = 32;
+  config.exact.maxVoices = 16;
+  config.grouped.maxGroups = 16;
+  config.density.maxObjects = 16;
+  config.overload.softExactVoiceThreshold = 2;
+  config.overload.hardExactVoiceThreshold = 3;
+  config.overload.panicExactVoiceThreshold = 4;
+  config.overload.softSchedulerQueueThreshold = 4;
+  config.overload.hardSchedulerQueueThreshold = 6;
+  config.overload.panicSchedulerQueueThreshold = 8;
+  if (!engine.Initialize(config))
+    return false;
+
+  for (uint32_t i = 0; i < 10; ++i) {
+    if (engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, (uint8_t)(60 + i),
+                                     (uint8_t)(32 + i), (int64_t)i,
+                                     i + 1)) == ScheduleDecision::Dropped) {
+      return false;
+    }
+  }
+  engine.FlushPendingIngress(32);
+
+  int64_t renderUntil = 0;
+  if (engine.ApplyScheduledWindow(0, 128, 128, &renderUntil) != 10)
+    return false;
+
+  if (engine.GetExactSystem().GetActiveVoiceCount() >= 10)
+    return false;
+  if (engine.GetGroupedSystem().GetStats().noteOnsAccumulated == 0)
+    return false;
+  if (engine.GetDensitySystem().GetStats().noteOnsAccumulated == 0)
+    return false;
+  if (engine.GetLatestTelemetrySnapshot().overloadPressureLevel <
+      (uint32_t)PressureLevel::Hard) {
+    return false;
+  }
   return true;
 }
 
@@ -320,23 +371,38 @@ static bool TestSceneCompilerActions() {
   ExactStats exactStats;
   scene.BeginWindow();
 
-  SceneAction on =
-      scene.CompileEvent(MakeEvent(EventKind::NoteOn, 0, 60, 100, 0, 1), exactStats);
+  SceneAction on = scene.CompileEvent(
+      MakeEvent(EventKind::NoteOn, 0, 60, 100, 0, 1), exactStats,
+      PressureLevel::Normal);
   if (on.kind != SceneActionKind::SpawnExactVoice)
     return false;
-  if (on.observeGrouped == 0 || on.observeDensity == 0 ||
+  if (on.observeGrouped != 0 || on.observeDensity != 0 ||
       on.protectedAttack == 0) {
     return false;
   }
 
-  SceneAction off =
-      scene.CompileEvent(MakeEvent(EventKind::NoteOff, 0, 60, 0, 8, 2), exactStats);
+  SceneAction off = scene.CompileEvent(
+      MakeEvent(EventKind::NoteOff, 0, 60, 0, 8, 2), exactStats,
+      PressureLevel::Normal);
   if (off.kind != SceneActionKind::ReleaseExactVoice)
     return false;
 
-  SceneAction reset =
-      scene.CompileEvent(MakeEvent(EventKind::Reset, 0, 0, 0, 16, 3), exactStats);
+  SceneAction reset = scene.CompileEvent(
+      MakeEvent(EventKind::Reset, 0, 0, 0, 16, 3), exactStats,
+      PressureLevel::Normal);
   if (reset.kind != SceneActionKind::ResetScene)
+    return false;
+
+  SceneAction hard = scene.CompileEvent(
+      MakeEvent(EventKind::NoteOn, 0, 48, 48, 24, 4), exactStats,
+      PressureLevel::Hard);
+  if (hard.kind != SceneActionKind::None || hard.observeGrouped == 0)
+    return false;
+
+  SceneAction panic = scene.CompileEvent(
+      MakeEvent(EventKind::NoteOn, 0, 40, 12, 32, 5), exactStats,
+      PressureLevel::Panic);
+  if (panic.kind != SceneActionKind::None || panic.observeDensity == 0)
     return false;
 
   if (scene.GetStats().exactActions != 2)
@@ -368,7 +434,8 @@ static bool TestTelemetryPublisher() {
   density.noteOnsAccumulated = 10;
   density.promotedClouds = 11;
 
-  telemetry.Publish(scheduler, scene, exact, grouped, density, 12, 13);
+  telemetry.Publish(scheduler, scene, exact, grouped, density, 12, 13,
+                    PressureLevel::Hard);
   const TelemetrySnapshot &snapshot = telemetry.GetLatestSnapshot();
   if (snapshot.exactVoices != 6)
     return false;
@@ -381,6 +448,8 @@ static bool TestTelemetryPublisher() {
   if (snapshot.schedulerQueuedEvents != 12)
     return false;
   if (snapshot.lastAppliedEvents != 13)
+    return false;
+  if (snapshot.overloadPressureLevel != (uint32_t)PressureLevel::Hard)
     return false;
   if (telemetry.GetSharedState().sequence == 0)
     return false;
@@ -398,6 +467,7 @@ int main() {
       {"grouped prototype buckets", TestGroupedPrototypeBuckets},
       {"density prototype clouds", TestDensityPrototypeClouds},
       {"engine density accumulation", TestEngineDensityAccumulation},
+      {"overload pressure reduces exact work", TestOverloadPressureReducesExactWork},
       {"engine render produces audio and retires release",
        TestEngineRenderProducesAudioAndRetiresRelease},
       {"sampler engine shell", TestSamplerEngineShell},

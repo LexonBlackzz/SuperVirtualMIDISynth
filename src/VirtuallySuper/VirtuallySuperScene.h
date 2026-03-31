@@ -12,12 +12,14 @@ public:
   void Reset();
   void BeginWindow();
   SceneAction CompileEvent(const NormalizedEvent &event,
-                           const ExactStats &exactStats);
+                           const ExactStats &exactStats,
+                           PressureLevel pressureLevel);
   const SceneStats &GetStats() const;
 
 private:
   uint16_t ScoreEvent(const NormalizedEvent &event,
-                      const ExactStats &exactStats) const;
+                      const ExactStats &exactStats,
+                      PressureLevel pressureLevel) const;
 
   SceneStats stats_;
 };
