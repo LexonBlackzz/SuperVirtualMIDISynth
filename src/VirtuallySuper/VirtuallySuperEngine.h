@@ -1,6 +1,7 @@
 #ifndef VIRTUALLYSUPER_ENGINE_H
 #define VIRTUALLYSUPER_ENGINE_H
 
+#include "VirtuallySuperDensity.h"
 #include "VirtuallySuperExact.h"
 #include "VirtuallySuperGrouped.h"
 #include "VirtuallySuperScheduler.h"
@@ -30,11 +31,14 @@ public:
   ExactSystem &GetExactSystem();
   const GroupedSystem &GetGroupedSystem() const;
   GroupedSystem &GetGroupedSystem();
+  const DensitySystem &GetDensitySystem() const;
+  DensitySystem &GetDensitySystem();
 
 private:
   Scheduler scheduler_;
   ExactSystem exact_;
   GroupedSystem grouped_;
+  DensitySystem density_;
   bool initialized_;
   NormalizedEvent drainBatch_[kDrainBatchCapacity];
 };

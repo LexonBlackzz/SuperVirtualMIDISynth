@@ -20,6 +20,7 @@ static const uint32_t kDefaultScheduledCapacity = 16384;
 static const int64_t kDefaultCoalesceWindowSamples = 8;
 static const uint32_t kDefaultExactVoiceCapacity = 256;
 static const uint32_t kDefaultGroupedCapacity = 128;
+static const uint32_t kDefaultDensityCapacity = 64;
 static const uint32_t kDrainBatchCapacity = 256;
 static const uint32_t kInvalidVoiceHandle = 0xFFFFFFFFu;
 
@@ -204,10 +205,25 @@ struct GroupedConfig {
         reserved0(0), reserved1(0), timingBucketSamples(32) {}
 };
 
+struct DensityConfig {
+  uint32_t maxObjects;
+  uint8_t pitchBandSemitones;
+  uint8_t activationThreshold;
+  uint16_t reserved0;
+  uint32_t saturationK;
+  int64_t timingBucketSamples;
+
+  DensityConfig()
+      : maxObjects(kDefaultDensityCapacity), pitchBandSemitones(12),
+        activationThreshold(4), reserved0(0), saturationK(4),
+        timingBucketSamples(32) {}
+};
+
 struct EngineConfig {
   SchedulerConfig scheduler;
   ExactConfig exact;
   GroupedConfig grouped;
+  DensityConfig density;
 };
 
 struct GroupedObject {
@@ -240,6 +256,40 @@ struct GroupedStats {
   GroupedStats()
       : activeGroups(0), peakActiveGroups(0), noteOnsAccumulated(0),
         droppedNoteOns(0) {}
+};
+
+struct DensityObject {
+  uint8_t active;
+  uint8_t channel;
+  uint8_t pitchBandId;
+  uint8_t activationThreshold;
+  uint16_t sampleFamilyId;
+  uint16_t reserved;
+  uint32_t densityId;
+  uint32_t timingBucketId;
+  uint32_t representedNoteCount;
+  uint32_t representedLayerCount;
+  uint32_t grainJitterSeed;
+  float energyLevel;
+  float saturatedGain;
+
+  DensityObject()
+      : active(0), channel(0), pitchBandId(0), activationThreshold(0),
+        sampleFamilyId(0), reserved(0), densityId(0), timingBucketId(0),
+        representedNoteCount(0), representedLayerCount(0), grainJitterSeed(0),
+        energyLevel(0.0f), saturatedGain(0.0f) {}
+};
+
+struct DensityStats {
+  uint32_t activeObjects;
+  uint32_t peakActiveObjects;
+  uint32_t noteOnsAccumulated;
+  uint32_t promotedClouds;
+  uint32_t droppedNoteOns;
+
+  DensityStats()
+      : activeObjects(0), peakActiveObjects(0), noteOnsAccumulated(0),
+        promotedClouds(0), droppedNoteOns(0) {}
 };
 
 inline bool EventUsesKey(EventKind kind) {
