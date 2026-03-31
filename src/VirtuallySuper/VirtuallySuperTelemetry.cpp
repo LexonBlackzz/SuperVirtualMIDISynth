@@ -12,7 +12,8 @@ void TelemetryPublisher::Publish(const SchedulerStats &schedulerStats,
                                  const GroupedStats &groupedStats,
                                  const DensityStats &densityStats,
                                  uint32_t schedulerQueuedEvents,
-                                 uint32_t lastAppliedEvents) {
+                                 uint32_t lastAppliedEvents,
+                                 PressureLevel pressureLevel) {
   TelemetrySnapshot snapshot;
   snapshot.exactVoices = exactStats.activeVoices;
   snapshot.releasedExactVoices = exactStats.releasedVoices;
@@ -33,6 +34,7 @@ void TelemetryPublisher::Publish(const SchedulerStats &schedulerStats,
   snapshot.densityAccumulatedNotes = densityStats.noteOnsAccumulated;
   snapshot.densityPromotedClouds = densityStats.promotedClouds;
   snapshot.lastAppliedEvents = lastAppliedEvents;
+  snapshot.overloadPressureLevel = (uint32_t)pressureLevel;
 
   ++sharedState_.sequence;
   sharedState_.latest = snapshot;

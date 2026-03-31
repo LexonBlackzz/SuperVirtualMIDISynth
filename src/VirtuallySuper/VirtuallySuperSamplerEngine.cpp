@@ -162,6 +162,7 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
   diagnostics_.failedSampleCount = snapshot.densityObjects;
   diagnostics_.schedulerPendingSameKeyTransitions =
       snapshot.schedulerQueuedEvents;
+  diagnostics_.overloadState = snapshot.overloadPressureLevel;
 }
 
 std::string VirtuallySuperSamplerEngine::GetResolvedSourcePath() const {

@@ -4,6 +4,7 @@
 #include "VirtuallySuperDensity.h"
 #include "VirtuallySuperExact.h"
 #include "VirtuallySuperGrouped.h"
+#include "VirtuallySuperOverload.h"
 #include "VirtuallySuperRender.h"
 #include "VirtuallySuperScheduler.h"
 #include "VirtuallySuperScene.h"
@@ -37,6 +38,8 @@ public:
   GroupedSystem &GetGroupedSystem();
   const DensitySystem &GetDensitySystem() const;
   DensitySystem &GetDensitySystem();
+  const OverloadController &GetOverloadController() const;
+  OverloadController &GetOverloadController();
   const SceneCompiler &GetSceneCompiler() const;
   SceneCompiler &GetSceneCompiler();
   const TelemetryPublisher &GetTelemetryPublisher() const;
@@ -49,6 +52,7 @@ private:
   ExactSystem exact_;
   GroupedSystem grouped_;
   DensitySystem density_;
+  OverloadController overload_;
   RenderSystem render_;
   TelemetryPublisher telemetry_;
   bool initialized_;

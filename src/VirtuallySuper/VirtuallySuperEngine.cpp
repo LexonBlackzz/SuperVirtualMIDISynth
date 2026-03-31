@@ -4,12 +4,13 @@ namespace virtuallysuper {
 
 EnginePrototype::EnginePrototype()
     : scheduler_(), scene_(), exact_(), grouped_(), density_(),
-      render_(), telemetry_(), initialized_(false), drainBatch_() {}
+      overload_(), render_(), telemetry_(), initialized_(false), drainBatch_() {}
 
 bool EnginePrototype::Initialize(const EngineConfig &config) {
   initialized_ =
       scheduler_.Initialize(config.scheduler) && exact_.Initialize(config.exact) &&
-      grouped_.Initialize(config.grouped) && density_.Initialize(config.density);
+      grouped_.Initialize(config.grouped) && density_.Initialize(config.density) &&
+      overload_.Initialize(config.overload, config.exact, config.scheduler);
   return initialized_;
 }
 
@@ -27,6 +28,7 @@ void EnginePrototype::Reset() {
   exact_.Reset();
   grouped_.Reset();
   density_.Reset();
+  overload_.Reset();
   render_.Reset();
   telemetry_.Reset();
 }
@@ -67,16 +69,27 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
     if (drained == 0) {
       telemetry_.Publish(scheduler_.GetStats(), scene_.GetStats(),
                          exact_.GetStats(), grouped_.GetStats(),
-                         density_.GetStats(), scheduler_.GetIngressCount(),
-                         (uint32_t)totalApplied);
+                         density_.GetStats(),
+                         scheduler_.GetIngressCount() +
+                             scheduler_.GetScheduledCount(),
+                         (uint32_t)totalApplied,
+                         overload_.Evaluate(scheduler_.GetScheduledCount(),
+                                            scheduler_.GetStats(),
+                                            exact_.GetStats(),
+                                            grouped_.GetStats(),
+                                            density_.GetStats()));
       if (renderUntilSample)
         *renderUntilSample = localRenderUntil;
       return totalApplied;
     }
 
     for (size_t i = 0; i < drained; ++i) {
+      const PressureLevel pressureLevel =
+          overload_.Evaluate(scheduler_.GetScheduledCount(),
+                             scheduler_.GetStats(), exact_.GetStats(),
+                             grouped_.GetStats(), density_.GetStats());
       const virtuallysuper::SceneAction action =
-          scene_.CompileEvent(drainBatch_[i], exact_.GetStats());
+          scene_.CompileEvent(drainBatch_[i], exact_.GetStats(), pressureLevel);
 
       switch (action.kind) {
       case virtuallysuper::SceneActionKind::SpawnExactVoice:
@@ -139,6 +152,14 @@ const DensitySystem &EnginePrototype::GetDensitySystem() const {
 }
 
 DensitySystem &EnginePrototype::GetDensitySystem() { return density_; }
+
+const OverloadController &EnginePrototype::GetOverloadController() const {
+  return overload_;
+}
+
+OverloadController &EnginePrototype::GetOverloadController() {
+  return overload_;
+}
 
 const SceneCompiler &EnginePrototype::GetSceneCompiler() const { return scene_; }
 

@@ -125,4 +125,5 @@ This file is intended to be updated as work lands.
 - [x] First density prototype started
 - [x] Prototype `ISamplerEngine` shell added for current synth integration
 - [x] Prototype tile render backbone added for audible runtime validation
+- [x] Overload-aware scene tier selection prototype added
 - [ ] Prototype telemetry wired for Configurator consumption

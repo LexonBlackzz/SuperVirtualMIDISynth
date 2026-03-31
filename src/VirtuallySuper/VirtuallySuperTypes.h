@@ -70,6 +70,13 @@ enum class SceneActionKind : uint8_t {
   ResetScene
 };
 
+enum class PressureLevel : uint8_t {
+  Normal = 0,
+  Soft,
+  Hard,
+  Panic
+};
+
 struct NormalizedEvent {
   EventKind kind;
   uint8_t channel;
@@ -234,11 +241,26 @@ struct DensityConfig {
         timingBucketSamples(32) {}
 };
 
+struct OverloadConfig {
+  uint32_t softExactVoiceThreshold;
+  uint32_t hardExactVoiceThreshold;
+  uint32_t panicExactVoiceThreshold;
+  uint32_t softSchedulerQueueThreshold;
+  uint32_t hardSchedulerQueueThreshold;
+  uint32_t panicSchedulerQueueThreshold;
+
+  OverloadConfig()
+      : softExactVoiceThreshold(0), hardExactVoiceThreshold(0),
+        panicExactVoiceThreshold(0), softSchedulerQueueThreshold(0),
+        hardSchedulerQueueThreshold(0), panicSchedulerQueueThreshold(0) {}
+};
+
 struct EngineConfig {
   SchedulerConfig scheduler;
   ExactConfig exact;
   GroupedConfig grouped;
   DensityConfig density;
+  OverloadConfig overload;
 };
 
 struct GroupedObject {
@@ -329,10 +351,14 @@ struct SceneStats {
   uint32_t densityObservations;
   uint32_t resetActions;
   uint32_t protectedAttacks;
+  uint32_t groupedOnlyActions;
+  uint32_t densityOnlyActions;
+  uint32_t panicDecisions;
 
   SceneStats()
       : exactActions(0), groupedObservations(0), densityObservations(0),
-        resetActions(0), protectedAttacks(0) {}
+        resetActions(0), protectedAttacks(0), groupedOnlyActions(0),
+        densityOnlyActions(0), panicDecisions(0) {}
 };
 
 struct TelemetrySnapshot {
@@ -352,6 +378,7 @@ struct TelemetrySnapshot {
   uint32_t densityAccumulatedNotes;
   uint32_t densityPromotedClouds;
   uint32_t lastAppliedEvents;
+  uint32_t overloadPressureLevel;
 
   TelemetrySnapshot()
       : exactVoices(0), releasedExactVoices(0), groupedObjects(0),
@@ -360,7 +387,8 @@ struct TelemetrySnapshot {
         sceneExactActions(0), sceneGroupedObservations(0),
         sceneDensityObservations(0), exactSteals(0),
         groupedAccumulatedNotes(0), densityAccumulatedNotes(0),
-        densityPromotedClouds(0), lastAppliedEvents(0) {}
+        densityPromotedClouds(0), lastAppliedEvents(0),
+        overloadPressureLevel(0) {}
 };
 
 inline bool EventUsesKey(EventKind kind) {
