@@ -328,6 +328,7 @@ static bool TestSamplerEngineShell() {
   if (!engine.Initialize(params))
     return false;
 
+  engine.SetRenderWindow(1024, 32, 44100, 0, 0, false);
   engine.BeginRenderBlock();
 
   MidiEvent on = {};
@@ -336,7 +337,7 @@ static bool TestSamplerEngineShell() {
   on.data1 = 60;
   on.data2 = 100;
   on.sequence = 1;
-  on.targetSample = 0;
+  on.targetSample = 1024;
   engine.ProcessMidiEvent(on);
 
   float buffer[64] = {};
@@ -351,6 +352,9 @@ static bool TestSamplerEngineShell() {
   if (diagnostics.noteOnEventsThisBlock != 1)
     return false;
   if (diagnostics.lastWarning.empty())
+    return false;
+  if (diagnostics.samplerErrorCode !=
+      (unsigned int)SamplerErrorCode::NONE)
     return false;
 
   bool hasAudio = false;

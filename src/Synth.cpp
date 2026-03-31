@@ -1918,6 +1918,10 @@ void Synth::SetRenderBlockContext(unsigned long long blockStartSample,
       SignalAccurateEventThread();
     }
   }
+  if (engine) {
+    engine->SetRenderWindow(blockStartSample, blockFrames, sampleRate,
+                            blockStartQpc, blockEndQpc, quantizedByPollingRate);
+  }
 }
 
 int Synth::GetEventPriority(const MidiEvent &event) {
@@ -3290,7 +3294,6 @@ void Synth::ProcessAccuratePendingEvents() {
         }
       }
     }
-
     if (localEvents.empty())
       continue;
 

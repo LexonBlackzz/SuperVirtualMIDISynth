@@ -561,6 +561,10 @@ void LiveRuntime::PublishSnapshot() {
       samplerDiagnostics.virtuallySuperVoiceEquivalent;
   sharedState->currentStats.virtuallySuperPressureLevel =
       samplerDiagnostics.virtuallySuperPressureLevel;
+  sharedState->currentStats.samplerStateCode =
+      samplerDiagnostics.samplerStateCode;
+  sharedState->currentStats.samplerErrorCode =
+      samplerDiagnostics.samplerErrorCode;
   sharedState->currentStats.schedulerSliceMs =
       samplerDiagnostics.schedulerSliceMs;
   sharedState->currentStats.schedulerLagMs =

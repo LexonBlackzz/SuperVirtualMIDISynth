@@ -251,7 +251,8 @@ void DisconnectBridge() {
 }
 
 bool LegacyBridgeExists() {
-  const char *legacyMappings[] = {SVMS_LIVE_BRIDGE_MAPPING_NAME_V19,
+  const char *legacyMappings[] = {SVMS_LIVE_BRIDGE_MAPPING_NAME_V20,
+                                  SVMS_LIVE_BRIDGE_MAPPING_NAME_V19,
                                   SVMS_LIVE_BRIDGE_MAPPING_NAME_V18,
                                   SVMS_LIVE_BRIDGE_MAPPING_NAME_V17,
                                   SVMS_LIVE_BRIDGE_MAPPING_NAME_V16,
@@ -411,6 +412,28 @@ std::string GetWindowString(HWND hwnd) {
   return buffer;
 }
 
+std::string GetComboSelectionString(HWND hwnd) {
+  if (!hwnd)
+    return std::string();
+  int selected = (int)SendMessageA(hwnd, CB_GETCURSEL, 0, 0);
+  if (selected != CB_ERR) {
+    char buffer[SVMS_MAX_BACKEND_TEXT] = {};
+    SendMessageA(hwnd, CB_GETLBTEXT, selected, reinterpret_cast<LPARAM>(buffer));
+    return std::string(buffer);
+  }
+  return GetWindowString(hwnd);
+}
+
+void SelectComboString(HWND hwnd, const char *text) {
+  if (!hwnd)
+    return;
+  LRESULT result =
+      SendMessageA(hwnd, CB_SELECTSTRING, (WPARAM)-1,
+                   reinterpret_cast<LPARAM>(text ? text : ""));
+  if (result == CB_ERR)
+    SetWindowTextA(hwnd, text ? text : "");
+}
+
 int GetWindowIntOrDefault(HWND hwnd, int fallback) {
   char buffer[64];
   GetWindowTextA(hwnd, buffer, sizeof(buffer));
@@ -444,14 +467,14 @@ void EnableEditorControls(BOOL enabled) {
 
 void SeedEditorsFromSnapshot(const LiveBridgeSharedState &snapshot) {
   SetEditText(g_ui.soundfontEdit, snapshot.currentSettings.soundfontPath, true);
-  SetWindowTextA(g_ui.backendCombo, snapshot.currentSettings.audioBackend);
-  SetWindowTextA(g_ui.samplerEngineCombo,
-                 snapshot.currentSettings.samplerEngine);
+  SelectComboString(g_ui.backendCombo, snapshot.currentSettings.audioBackend);
+  SelectComboString(g_ui.samplerEngineCombo,
+                    snapshot.currentSettings.samplerEngine);
   SetIntText(g_ui.sampleRateCombo, snapshot.currentSettings.sampleRate);
   SetIntText(g_ui.maxVoicesEdit, snapshot.currentSettings.maxVoices);
   SetFloatText(g_ui.masterVolumeEdit, snapshot.currentSettings.masterVolume);
   SetIntText(g_ui.pollingRateEdit, snapshot.currentSettings.pollingRate);
-  SetWindowTextA(g_ui.timingModeCombo, snapshot.currentSettings.eventTimingMode);
+  SelectComboString(g_ui.timingModeCombo, snapshot.currentSettings.eventTimingMode);
   SetFloatText(g_ui.velocityCurveEdit, snapshot.currentSettings.velocityCurve);
   SetFloatText(g_ui.velocityFloorEdit, snapshot.currentSettings.velocityFloor);
   SetIntText(g_ui.velocityIgnoreEdit,
@@ -657,7 +680,7 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
     char vsBuffer[320];
     sprintf(
         vsBuffer,
-        "\r\nVirtuallySuper   Exact %lu   Released %lu   Grouped %lu   Density %lu   VoiceEq %lu   Pressure %lu",
+        "\r\nVirtuallySuper   Exact %lu   Released %lu   Grouped %lu   Density %lu   VoiceEq %lu   Pressure %lu   State %lu   Err %lu",
         static_cast<unsigned long>(
             snapshot.currentStats.virtuallySuperExactVoices),
         static_cast<unsigned long>(
@@ -669,9 +692,16 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
         static_cast<unsigned long>(
             snapshot.currentStats.virtuallySuperVoiceEquivalent),
         static_cast<unsigned long>(
-            snapshot.currentStats.virtuallySuperPressureLevel));
+            snapshot.currentStats.virtuallySuperPressureLevel),
+        static_cast<unsigned long>(snapshot.currentStats.samplerStateCode),
+        static_cast<unsigned long>(snapshot.currentStats.samplerErrorCode));
     strncat(summaryBuffer, vsBuffer,
             sizeof(summaryBuffer) - strlen(summaryBuffer) - 1);
+    if (snapshot.samplerLastWarning[0]) {
+      strncat(summaryBuffer, "\r\n", sizeof(summaryBuffer) - strlen(summaryBuffer) - 1);
+      strncat(summaryBuffer, snapshot.samplerLastWarning,
+              sizeof(summaryBuffer) - strlen(summaryBuffer) - 1);
+    }
   }
   SetEditText(g_ui.liveSummary, summaryBuffer, true);
   {
@@ -742,7 +772,7 @@ void BuildSettingsFromUi(LiveBridgeSettings &settings) {
   settings.pollingRate = GetWindowIntOrDefault(g_ui.pollingRateEdit,
                                                settings.pollingRate);
   CopyCString(settings.eventTimingMode, sizeof(settings.eventTimingMode),
-              GetWindowString(g_ui.timingModeCombo).c_str());
+              GetComboSelectionString(g_ui.timingModeCombo).c_str());
   settings.asyncNoteStarts =
       strcmp(settings.eventTimingMode, "legacy-sync") != 0;
   settings.masterVolume =
@@ -770,9 +800,9 @@ void BuildSettingsFromUi(LiveBridgeSettings &settings) {
   settings.limiterReleaseMs = GetWindowFloatOrDefault(
       g_ui.limiterReleaseEdit, settings.limiterReleaseMs);
   CopyCString(settings.audioBackend, sizeof(settings.audioBackend),
-              GetWindowString(g_ui.backendCombo).c_str());
+              GetComboSelectionString(g_ui.backendCombo).c_str());
   CopyCString(settings.samplerEngine, sizeof(settings.samplerEngine),
-              GetWindowString(g_ui.samplerEngineCombo).c_str());
+              GetComboSelectionString(g_ui.samplerEngineCombo).c_str());
   CopyCString(settings.soundfontPath, sizeof(settings.soundfontPath),
               GetWindowString(g_ui.soundfontEdit).c_str());
 }

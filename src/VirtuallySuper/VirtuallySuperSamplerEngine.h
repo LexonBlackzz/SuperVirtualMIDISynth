@@ -16,6 +16,10 @@ public:
   void Shutdown(bool waitForThreads) override;
   void Reset() override;
   void ReloadRuntimeSettings(const RuntimeSettings &settings) override;
+  void SetRenderWindow(unsigned long long blockStartSample, int blockFrames,
+                       int sampleRate, long long blockStartQpc,
+                       long long blockEndQpc,
+                       bool quantizedByPollingRate) override;
   void BeginRenderBlock() override;
   void ProcessMidiEvent(const MidiEvent &event) override;
   void Render(float *output, int numFrames) override;
@@ -28,6 +32,8 @@ public:
 private:
   virtuallysuper::NormalizedEvent ConvertMidiEvent(const MidiEvent &event) const;
   void ResetPerBlockStatsLocked();
+  void SetStateLocked(SamplerRuntimeStateCode stateCode,
+                      SamplerErrorCode errorCode, const char *warningText);
 
   mutable compat::Mutex engineMutex;
   virtuallysuper::EnginePrototype prototype_;
@@ -37,8 +43,17 @@ private:
   std::string resolvedSourceFormat_;
   RuntimeSettings runtimeSettings_;
   SamplerDiagnostics diagnostics_;
+  SamplerRuntimeStateCode stateCode_;
+  SamplerErrorCode errorCode_;
   unsigned int noteOnEventsThisBlock_;
   unsigned int noteOffEventsThisBlock_;
+  unsigned long long currentBlockStartSample_;
+  int currentBlockFrames_;
+  long long currentBlockStartQpc_;
+  long long currentBlockEndQpc_;
+  bool currentBlockQuantized_;
+  bool hasRenderWindow_;
+  long long renderCursorSample_;
 };
 
 #endif
