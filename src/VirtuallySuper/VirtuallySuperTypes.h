@@ -22,6 +22,8 @@ static const uint32_t kDefaultExactVoiceCapacity = 256;
 static const uint32_t kDefaultGroupedCapacity = 128;
 static const uint32_t kDefaultDensityCapacity = 64;
 static const uint32_t kDrainBatchCapacity = 256;
+static const uint32_t kDefaultRenderTileFrames = 128;
+static const uint32_t kMaxRenderTileFrames = 256;
 static const uint32_t kInvalidVoiceHandle = 0xFFFFFFFFu;
 
 enum class EventKind : uint8_t {
@@ -174,6 +176,10 @@ struct ExactVoice {
   uint32_t prevSameKey;
   uint32_t nextQueue;
   uint32_t prevQueue;
+  float phase;
+  float frequencyHz;
+  float currentGain;
+  float releaseDecay;
 
   ExactVoice()
       : voiceId(0), generation(0), startSequence(0),
@@ -181,7 +187,9 @@ struct ExactVoice {
         channel(0), note(0), velocity(0), layerTemplateId(0),
         protectedAttack(0), releaseShortened(0), reserved(0),
         nextSameKey(kInvalidVoiceHandle), prevSameKey(kInvalidVoiceHandle),
-        nextQueue(kInvalidVoiceHandle), prevQueue(kInvalidVoiceHandle) {}
+        nextQueue(kInvalidVoiceHandle), prevQueue(kInvalidVoiceHandle),
+        phase(0.0f), frequencyHz(0.0f), currentGain(0.0f),
+        releaseDecay(0.0f) {}
 };
 
 struct ExactStats {
@@ -325,6 +333,34 @@ struct SceneStats {
   SceneStats()
       : exactActions(0), groupedObservations(0), densityObservations(0),
         resetActions(0), protectedAttacks(0) {}
+};
+
+struct TelemetrySnapshot {
+  uint32_t exactVoices;
+  uint32_t releasedExactVoices;
+  uint32_t groupedObjects;
+  uint32_t densityObjects;
+  uint32_t voiceEquivalent;
+  uint32_t schedulerQueuedEvents;
+  uint32_t schedulerMaxTransitionQueueDepth;
+  uint32_t schedulerCoalescedEvents;
+  uint32_t sceneExactActions;
+  uint32_t sceneGroupedObservations;
+  uint32_t sceneDensityObservations;
+  uint32_t exactSteals;
+  uint32_t groupedAccumulatedNotes;
+  uint32_t densityAccumulatedNotes;
+  uint32_t densityPromotedClouds;
+  uint32_t lastAppliedEvents;
+
+  TelemetrySnapshot()
+      : exactVoices(0), releasedExactVoices(0), groupedObjects(0),
+        densityObjects(0), voiceEquivalent(0), schedulerQueuedEvents(0),
+        schedulerMaxTransitionQueueDepth(0), schedulerCoalescedEvents(0),
+        sceneExactActions(0), sceneGroupedObservations(0),
+        sceneDensityObservations(0), exactSteals(0),
+        groupedAccumulatedNotes(0), densityAccumulatedNotes(0),
+        densityPromotedClouds(0), lastAppliedEvents(0) {}
 };
 
 inline bool EventUsesKey(EventKind kind) {

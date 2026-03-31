@@ -128,6 +128,8 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
   const size_t applied =
       prototype_.ApplyScheduledWindow(0, numFrames, numFrames, &renderUntilSample);
 
+  prototype_.RenderBlock(output, numFrames, sampleRate_);
+
   QueryPerformanceCounter(&end);
   diagnostics_.sampleRenderMs =
       freq.QuadPart > 0
@@ -154,12 +156,12 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
   diagnostics_.noteOnStartedThisBlock = exactStats.noteOnsApplied;
   diagnostics_.overloadNoteOnsDroppedThisBlock = exactStats.steals;
 
-  const virtuallysuper::GroupedStats &groupedStats =
-      prototype_.GetGroupedSystem().GetStats();
-  const virtuallysuper::DensityStats &densityStats =
-      prototype_.GetDensitySystem().GetStats();
-  diagnostics_.loadedSampleCount = groupedStats.activeGroups;
-  diagnostics_.failedSampleCount = densityStats.activeObjects;
+  const virtuallysuper::TelemetrySnapshot &snapshot =
+      prototype_.GetLatestTelemetrySnapshot();
+  diagnostics_.loadedSampleCount = snapshot.groupedObjects;
+  diagnostics_.failedSampleCount = snapshot.densityObjects;
+  diagnostics_.schedulerPendingSameKeyTransitions =
+      snapshot.schedulerQueuedEvents;
 }
 
 std::string VirtuallySuperSamplerEngine::GetResolvedSourcePath() const {
@@ -211,8 +213,9 @@ SamplerDiagnostics VirtuallySuperSamplerEngine::GetDiagnostics() const {
   compat::LockGuard<compat::Mutex> lock(engineMutex);
   SamplerDiagnostics copy = diagnostics_;
   copy.lastWarning =
-      "VirtuallySuper prototype shell active. Runtime state is integrated, "
-      "but audio rendering is still placeholder silence.";
+      "VirtuallySuper prototype shell active. Deterministic prototype audio "
+      "rendering is enabled, but real SoundFont/sample playback is not "
+      "implemented yet.";
   return copy;
 }
 

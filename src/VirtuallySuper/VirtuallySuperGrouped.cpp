@@ -68,9 +68,15 @@ bool GroupedSystem::AccumulateEvent(const NormalizedEvent &event) {
   return true;
 }
 
+const GroupedConfig &GroupedSystem::GetConfig() const { return config_; }
+
 const GroupedStats &GroupedSystem::GetStats() const { return stats_; }
 
 uint32_t GroupedSystem::GetActiveGroupCount() const { return stats_.activeGroups; }
+
+uint32_t GroupedSystem::GetGroupCapacity() const {
+  return (uint32_t)groups_.size();
+}
 
 const GroupedObject *GroupedSystem::GetGroup(uint32_t handle) const {
   if (handle >= groups_.size())

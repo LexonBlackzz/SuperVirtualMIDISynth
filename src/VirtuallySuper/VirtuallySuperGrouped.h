@@ -16,8 +16,10 @@ public:
   void BeginWindow();
   bool AccumulateEvent(const NormalizedEvent &event);
 
+  const GroupedConfig &GetConfig() const;
   const GroupedStats &GetStats() const;
   uint32_t GetActiveGroupCount() const;
+  uint32_t GetGroupCapacity() const;
   const GroupedObject *GetGroup(uint32_t handle) const;
 
 private:
