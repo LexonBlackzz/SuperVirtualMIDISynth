@@ -83,10 +83,18 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
       return totalApplied;
     }
 
+    const bool sampleBackedExactMode = exact_.IsSampleBackedMode();
     for (size_t i = 0; i < drained; ++i) {
       const EventKind kind = drainBatch_[i].kind;
       if (kind == EventKind::ProgramChange || kind == EventKind::ControlChange ||
           kind == EventKind::PitchBend) {
+        exact_.ApplyEvent(drainBatch_[i]);
+        continue;
+      }
+
+      if (sampleBackedExactMode) {
+        // Native SF2 playback is exact-only for now. Grouped and density tiers
+        // are still prototype renderers and would collapse pitch identity.
         exact_.ApplyEvent(drainBatch_[i]);
         continue;
       }
