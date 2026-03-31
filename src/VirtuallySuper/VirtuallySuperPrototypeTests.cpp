@@ -613,17 +613,82 @@ static bool TestSoundFontRuntimeLoadsAndDispatches() {
     return false;
   const float neutralStep = info.phaseStep;
 
-  NormalizedEvent bend = MakeEvent(EventKind::PitchBend, 0, 0, 127, 0, 2);
+  NormalizedEvent octave = MakeEvent(EventKind::NoteOn, 0, 72, 100, 0, 2);
+  if (!runtime.PrepareNoteOn(octave, &info) || info.phaseStep <= neutralStep)
+    return false;
+
+  NormalizedEvent bend = MakeEvent(EventKind::PitchBend, 0, 0, 127, 0, 3);
   bend.value = 127;
   if (!runtime.HandleEvent(bend))
     return false;
   if (!runtime.PrepareNoteOn(noteOn, &info) || info.phaseStep <= neutralStep)
     return false;
 
-  NormalizedEvent program = MakeEvent(EventKind::ProgramChange, 0, 5, 0, 0, 3);
+  NormalizedEvent program = MakeEvent(EventKind::ProgramChange, 0, 5, 0, 0, 4);
   if (!runtime.HandleEvent(program))
     return false;
   if (runtime.PrepareNoteOn(noteOn, &info))
+    return false;
+
+  return true;
+}
+
+static bool TestSampleBackedEngineStaysExactOnlyUnderPressure() {
+  std::string path;
+  if (!CreateMinimalSf2File(&path))
+    return false;
+
+  SoundFontRuntime runtime;
+  std::string warning;
+  const bool loaded = runtime.Load(path.c_str(), 44100, &warning);
+  DeleteFileA(path.c_str());
+  if (!loaded)
+    return false;
+
+  EnginePrototype engine;
+  EngineConfig config;
+  config.scheduler.ingressCapacity = 16;
+  config.scheduler.scheduledCapacity = 16;
+  config.exact.maxVoices = 8;
+  config.grouped.maxGroups = 8;
+  config.density.maxObjects = 8;
+  config.overload.softExactVoiceThreshold = 1;
+  config.overload.hardExactVoiceThreshold = 1;
+  config.overload.panicExactVoiceThreshold = 64;
+  config.overload.softSchedulerQueueThreshold = 64;
+  config.overload.hardSchedulerQueueThreshold = 64;
+  config.overload.panicSchedulerQueueThreshold = 64;
+  if (!engine.Initialize(config))
+    return false;
+
+  engine.GetExactSystem().SetSoundFontRuntime(&runtime);
+
+  if (engine.SubmitEvent(MakeEvent(EventKind::ProgramChange, 0, 0, 0, 0, 1)) ==
+      ScheduleDecision::Dropped) {
+    return false;
+  }
+  if (engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 60, 100, 1, 2)) ==
+      ScheduleDecision::Dropped) {
+    return false;
+  }
+  if (engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 61, 40, 2, 3)) ==
+      ScheduleDecision::Dropped) {
+    return false;
+  }
+  if (engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 62, 24, 3, 4)) ==
+      ScheduleDecision::Dropped) {
+    return false;
+  }
+  engine.FlushPendingIngress(16);
+
+  int64_t renderUntil = 0;
+  if (engine.ApplyScheduledWindow(0, 128, 128, &renderUntil) != 4)
+    return false;
+  if (engine.GetExactSystem().GetActiveVoiceCount() != 3)
+    return false;
+  if (engine.GetGroupedSystem().GetStats().noteOnsAccumulated != 0)
+    return false;
+  if (engine.GetDensitySystem().GetStats().noteOnsAccumulated != 0)
     return false;
 
   return true;
@@ -833,6 +898,8 @@ int main() {
       {"sampler engine idle fast path", TestSamplerEngineIdleFastPath},
       {"soundfont runtime loads and dispatches",
        TestSoundFontRuntimeLoadsAndDispatches},
+      {"sample-backed engine stays exact only under pressure",
+       TestSampleBackedEngineStaysExactOnlyUnderPressure},
       {"soundfont invalid file fails", TestSoundFontInvalidFileFails},
       {"sampler engine native sf2 playback", TestSamplerEngineNativeSf2Playback},
       {"scene compiler actions", TestSceneCompilerActions},

@@ -19,6 +19,7 @@ public:
   bool ApplyEvent(const NormalizedEvent &event);
   bool NoteOn(const NormalizedEvent &event);
   uint32_t NoteOff(uint8_t channel, uint8_t note);
+  bool IsSampleBackedMode() const;
 
   uint32_t GetActiveVoiceCount() const;
   uint32_t GetReleasedVoiceCount() const;

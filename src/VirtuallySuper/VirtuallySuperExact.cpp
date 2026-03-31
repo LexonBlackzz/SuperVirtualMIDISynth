@@ -158,6 +158,10 @@ uint32_t ExactSystem::NoteOff(uint8_t channel, uint8_t note) {
   return applied;
 }
 
+bool ExactSystem::IsSampleBackedMode() const {
+  return soundFont_ != 0 && soundFont_->IsLoaded();
+}
+
 uint32_t ExactSystem::GetActiveVoiceCount() const { return stats_.activeVoices; }
 
 uint32_t ExactSystem::GetReleasedVoiceCount() const {
