@@ -25,6 +25,7 @@ static const uint32_t kDrainBatchCapacity = 256;
 static const uint32_t kDefaultRenderTileFrames = 128;
 static const uint32_t kMaxRenderTileFrames = 256;
 static const uint32_t kInvalidVoiceHandle = 0xFFFFFFFFu;
+static const uint16_t kInvalidSoundFontIndex = 0xFFFFu;
 
 enum class EventKind : uint8_t {
   Invalid = 0,
@@ -181,15 +182,28 @@ struct ExactVoice {
   uint8_t layerTemplateId;
   uint8_t protectedAttack;
   uint8_t releaseShortened;
-  uint16_t reserved;
+  uint8_t sampleBacked;
+  uint8_t heldBySustain;
+  uint16_t regionIndex;
+  uint16_t sampleIndex;
   uint32_t nextSameKey;
   uint32_t prevSameKey;
   uint32_t nextQueue;
   uint32_t prevQueue;
+  const float *sampleData;
+  uint32_t sampleStart;
+  uint32_t sampleEnd;
+  uint32_t loopStart;
+  uint32_t loopEnd;
+  uint8_t loopMode;
+  uint8_t reserved;
+  uint16_t attackSamplesRemaining;
   float phase;
   float frequencyHz;
   float phaseStep;
   float currentGain;
+  float targetGain;
+  float attackGainStep;
   float releaseDecay;
   float leftGain;
   float rightGain;
@@ -198,11 +212,16 @@ struct ExactVoice {
       : voiceId(0), generation(0), startSequence(0),
         state(ExactLifecycleState::Free), queueClass(ExactQueueClass::None),
         channel(0), note(0), velocity(0), layerTemplateId(0),
-        protectedAttack(0), releaseShortened(0), reserved(0),
+        protectedAttack(0), releaseShortened(0), sampleBacked(0),
+        heldBySustain(0), regionIndex(kInvalidSoundFontIndex),
+        sampleIndex(kInvalidSoundFontIndex),
         nextSameKey(kInvalidVoiceHandle), prevSameKey(kInvalidVoiceHandle),
         nextQueue(kInvalidVoiceHandle), prevQueue(kInvalidVoiceHandle),
-        phase(0.0f), frequencyHz(0.0f), phaseStep(0.0f), currentGain(0.0f),
-        releaseDecay(0.0f), leftGain(0.0f), rightGain(0.0f) {}
+        sampleData(0), sampleStart(0), sampleEnd(0), loopStart(0), loopEnd(0),
+        loopMode(0), reserved(0), attackSamplesRemaining(0), phase(0.0f),
+        frequencyHz(0.0f), phaseStep(0.0f), currentGain(0.0f),
+        targetGain(0.0f), attackGainStep(0.0f), releaseDecay(0.0f),
+        leftGain(0.0f), rightGain(0.0f) {}
 };
 
 struct ExactStats {

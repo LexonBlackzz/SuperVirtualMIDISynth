@@ -28,8 +28,8 @@ static void ExactStereoGains(float pan, float *left, float *right) {
 namespace virtuallysuper {
 
 ExactSystem::ExactSystem()
-    : config_(), initialized_(false), nextVoiceId_(1), voices_(), freeList_(),
-      freeCount_(0), stats_() {}
+    : config_(), initialized_(false), nextVoiceId_(1), soundFont_(0),
+      voices_(), freeList_(), freeCount_(0), stats_() {}
 
 bool ExactSystem::Initialize(const ExactConfig &config) {
   if (config.maxVoices == 0)
@@ -41,6 +41,10 @@ bool ExactSystem::Initialize(const ExactConfig &config) {
   initialized_ = true;
   Reset();
   return true;
+}
+
+void ExactSystem::SetSoundFontRuntime(SoundFontRuntime *soundFont) {
+  soundFont_ = soundFont;
 }
 
 void ExactSystem::Reset() {
@@ -65,7 +69,7 @@ void ExactSystem::Reset() {
 }
 
 bool ExactSystem::ApplyEvent(const NormalizedEvent &event) {
-  if (!initialized_)
+  if (!initialized_ || event.channel >= kChannelCount)
     return false;
 
   switch (event.kind) {
@@ -73,7 +77,34 @@ bool ExactSystem::ApplyEvent(const NormalizedEvent &event) {
     return NoteOn(event);
   case EventKind::NoteOff:
     return NoteOff(event.channel, event.note) > 0;
+  case EventKind::ProgramChange:
+    return soundFont_ ? soundFont_->HandleEvent(event) : true;
+  case EventKind::PitchBend:
+    if (soundFont_ && soundFont_->HandleEvent(event))
+      RefreshChannelVoices(event.channel);
+    return true;
+  case EventKind::ControlChange:
+    {
+      const uint8_t controller = event.value;
+      const bool handled = soundFont_ ? soundFont_->HandleEvent(event) : false;
+      if (controller == 64 && soundFont_ &&
+          !soundFont_->IsSustainEnabled(event.channel))
+        ReleaseSustainedVoices(event.channel);
+      else if (controller == 120)
+        ReleaseAllChannelVoices(event.channel, true);
+      else if (controller == 123)
+        ReleaseAllChannelVoices(event.channel, false);
+      else if (controller == 7 || controller == 10 || controller == 11 ||
+               controller == 121) {
+        RefreshChannelVoices(event.channel);
+      }
+      return handled || controller == 64 || controller == 120 ||
+             controller == 123 || controller == 7 || controller == 10 ||
+             controller == 11 || controller == 121;
+    }
   case EventKind::Reset:
+    if (soundFont_)
+      soundFont_->HandleEvent(event);
     Reset();
     return true;
   default:
@@ -91,6 +122,9 @@ bool ExactSystem::NoteOn(const NormalizedEvent &event) {
     return false;
 
   ActivateVoice(handle, event);
+  if (voices_[handle].state == ExactLifecycleState::Free)
+    return false;
+
   ++stats_.noteOnsApplied;
   if (stolen)
     ++stats_.steals;
@@ -107,8 +141,14 @@ uint32_t ExactSystem::NoteOff(uint8_t channel, uint8_t note) {
     ExactVoice &voice = voices_[handle];
     const uint32_t next = voice.nextSameKey;
     if (voice.state == ExactLifecycleState::Active) {
-      TransitionVoiceToReleased(handle);
-      ++applied;
+      if (soundFont_ && soundFont_->IsLoaded() &&
+          soundFont_->IsSustainEnabled(channel)) {
+        voice.heldBySustain = 1;
+        ++applied;
+      } else {
+        TransitionVoiceToReleased(handle);
+        ++applied;
+      }
     }
     handle = next;
   }
@@ -219,6 +259,7 @@ void ExactSystem::ReleaseVoiceHandle(uint32_t handle) {
 
 void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
   ExactVoice &voice = voices_[handle];
+  voice = ExactVoice();
   voice.voiceId = nextVoiceId_++;
   voice.channel = event.channel;
   voice.note = event.note;
@@ -228,14 +269,64 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
   voice.state = ExactLifecycleState::Active;
   voice.queueClass = ExactQueueClass::None;
   voice.phase = 0.0f;
-  voice.frequencyHz = MidiNoteToFrequencyHz(event.note);
-  voice.phaseStep =
-      voice.frequencyHz /
-      (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
-  voice.currentGain = VelocityToGain(event.velocity);
+  voice.heldBySustain = 0;
   voice.releaseDecay = 0.9985f;
-  ExactStereoGains(ExactPan(event.channel, event.note), &voice.leftGain,
-                   &voice.rightGain);
+
+  bool initializedVoice = false;
+  if (soundFont_ && soundFont_->IsLoaded()) {
+    SoundFontNoteInfo info;
+    if (soundFont_->PrepareNoteOn(event, &info) && info.valid) {
+      voice.sampleBacked = 1;
+      voice.regionIndex = info.regionIndex;
+      voice.sampleIndex = info.sampleIndex;
+      voice.sampleData = info.sampleData;
+      voice.sampleStart = info.sampleStart;
+      voice.sampleEnd = info.sampleEnd;
+      voice.loopStart = info.loopStart;
+      voice.loopEnd = info.loopEnd;
+      voice.loopMode = info.loopMode;
+      voice.phase = (float)info.sampleStart;
+      voice.phaseStep = info.phaseStep;
+      voice.targetGain = info.initialGain;
+      voice.leftGain = info.leftGain;
+      voice.rightGain = info.rightGain;
+      voice.releaseDecay = info.releaseDecay;
+      if (info.attackSeconds > 0.0001f) {
+        const float attackSamples =
+            info.attackSeconds * (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
+        voice.attackSamplesRemaining =
+            attackSamples > 1.0f ? (uint16_t)(attackSamples > 65535.0f ? 65535u : (uint32_t)attackSamples)
+                                 : 0u;
+        voice.currentGain = 0.0f;
+        voice.attackGainStep =
+            voice.attackSamplesRemaining > 0
+                ? (info.initialGain / (float)voice.attackSamplesRemaining)
+                : info.initialGain;
+      } else {
+        voice.currentGain = info.initialGain;
+        voice.attackSamplesRemaining = 0;
+        voice.attackGainStep = info.initialGain;
+      }
+      initializedVoice = true;
+    }
+  }
+
+  if (!initializedVoice) {
+    if (soundFont_ && soundFont_->IsLoaded()) {
+      ReleaseVoiceHandle(handle);
+      return;
+    }
+
+    voice.frequencyHz = MidiNoteToFrequencyHz(event.note);
+    voice.phaseStep =
+        voice.frequencyHz /
+        (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
+    voice.currentGain = VelocityToGain(event.velocity);
+    voice.targetGain = voice.currentGain;
+    voice.releaseDecay = 0.9985f;
+    ExactStereoGains(ExactPan(event.channel, event.note), &voice.leftGain,
+                     &voice.rightGain);
+  }
 
   InsertKeyVoice(handle);
   ReclassifyVoiceQueue(handle);
@@ -248,9 +339,84 @@ void ExactSystem::TransitionVoiceToReleased(uint32_t handle) {
     return;
 
   voice.state = ExactLifecycleState::Released;
+  voice.heldBySustain = 0;
   ReclassifyVoiceQueue(handle);
   RemoveVoiceState(ExactLifecycleState::Active);
   AddVoiceState(ExactLifecycleState::Released);
+}
+
+void ExactSystem::RefreshVoiceFromSoundFont(uint32_t handle) {
+  if (!soundFont_ || !soundFont_->IsLoaded() || handle >= voices_.size())
+    return;
+
+  ExactVoice &voice = voices_[handle];
+  if (!voice.sampleBacked || voice.regionIndex == kInvalidSoundFontIndex)
+    return;
+
+  SoundFontNoteInfo info;
+  if (!soundFont_->RefreshVoiceInfo(voice.channel, voice.note, voice.velocity,
+                                    voice.regionIndex, &info) ||
+      !info.valid) {
+    return;
+  }
+
+  voice.phaseStep = info.phaseStep;
+  voice.targetGain = info.initialGain;
+  voice.leftGain = info.leftGain;
+  voice.rightGain = info.rightGain;
+  voice.releaseDecay = info.releaseDecay;
+  if (voice.attackSamplesRemaining == 0 &&
+      voice.state == ExactLifecycleState::Active) {
+    voice.currentGain = info.initialGain;
+  }
+}
+
+void ExactSystem::RefreshChannelVoices(uint8_t channel) {
+  if (!soundFont_ || !soundFont_->IsLoaded() || channel >= kChannelCount)
+    return;
+
+  for (uint32_t note = 0; note < kNoteCount; ++note) {
+    uint32_t handle = keyHeads_[channel][note];
+    while (handle != kInvalidVoiceHandle) {
+      const uint32_t next = voices_[handle].nextSameKey;
+      RefreshVoiceFromSoundFont(handle);
+      handle = next;
+    }
+  }
+}
+
+void ExactSystem::ReleaseSustainedVoices(uint8_t channel) {
+  if (channel >= kChannelCount)
+    return;
+
+  for (uint32_t note = 0; note < kNoteCount; ++note) {
+    uint32_t handle = keyHeads_[channel][note];
+    while (handle != kInvalidVoiceHandle) {
+      const uint32_t next = voices_[handle].nextSameKey;
+      ExactVoice &voice = voices_[handle];
+      if (voice.state == ExactLifecycleState::Active && voice.heldBySustain) {
+        TransitionVoiceToReleased(handle);
+      }
+      handle = next;
+    }
+  }
+}
+
+void ExactSystem::ReleaseAllChannelVoices(uint8_t channel, bool hardKill) {
+  if (channel >= kChannelCount)
+    return;
+
+  for (uint32_t note = 0; note < kNoteCount; ++note) {
+    uint32_t handle = keyHeads_[channel][note];
+    while (handle != kInvalidVoiceHandle) {
+      const uint32_t next = voices_[handle].nextSameKey;
+      if (hardKill)
+        RetireVoice(handle);
+      else if (voices_[handle].state == ExactLifecycleState::Active)
+        TransitionVoiceToReleased(handle);
+      handle = next;
+    }
+  }
 }
 
 void ExactSystem::InsertKeyVoice(uint32_t handle) {

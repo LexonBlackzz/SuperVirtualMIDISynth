@@ -131,4 +131,5 @@ This file is intended to be updated as work lands.
 - [x] Minimal current Configurator support added for `virtuallysuper`
 - [x] Separate native Win32 `Configurator V2` shell added
 - [x] Main `x86` and `x64` MSVC DLL builds include `VirtuallySuper`
-- [ ] Real sample or SoundFont playback path integrated into `VirtuallySuper`
+- [x] Native cleanroom SF2 exact-tier playback path integrated into
+      `VirtuallySuper`

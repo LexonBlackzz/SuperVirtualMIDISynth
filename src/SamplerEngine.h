@@ -221,6 +221,9 @@ struct SamplerDiagnostics {
   unsigned int virtuallySuperDensityObjects;
   unsigned int virtuallySuperVoiceEquivalent;
   unsigned int virtuallySuperPressureLevel;
+  unsigned int virtuallySuperLoadedPresets;
+  unsigned int virtuallySuperLoadedRegions;
+  unsigned int virtuallySuperExactMode;
   unsigned int virtuallySuperIdleFastPathHits;
   unsigned int virtuallySuperExactVisitedThisBlock;
   unsigned int virtuallySuperGroupedVisitedThisBlock;
@@ -275,6 +278,8 @@ struct SamplerDiagnostics {
         virtuallySuperExactVoices(0), virtuallySuperReleasedExactVoices(0),
         virtuallySuperGroupedObjects(0), virtuallySuperDensityObjects(0),
         virtuallySuperVoiceEquivalent(0), virtuallySuperPressureLevel(0),
+        virtuallySuperLoadedPresets(0), virtuallySuperLoadedRegions(0),
+        virtuallySuperExactMode(0),
         virtuallySuperIdleFastPathHits(0),
         virtuallySuperExactVisitedThisBlock(0),
         virtuallySuperGroupedVisitedThisBlock(0),

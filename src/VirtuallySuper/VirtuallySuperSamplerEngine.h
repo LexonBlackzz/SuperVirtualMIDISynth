@@ -4,6 +4,7 @@
 #include "../Compat.h"
 #include "../SamplerEngine.h"
 #include "VirtuallySuperEngine.h"
+#include "VirtuallySuperSoundFontRuntime.h"
 
 #include <string>
 
@@ -34,9 +35,11 @@ private:
   void ResetPerBlockStatsLocked();
   void SetStateLocked(SamplerRuntimeStateCode stateCode,
                       SamplerErrorCode errorCode, const char *warningText);
+  void UpdateSoundFontDiagnosticsLocked();
 
   mutable compat::Mutex engineMutex;
   virtuallysuper::EnginePrototype prototype_;
+  virtuallysuper::SoundFontRuntime soundFontRuntime_;
   bool initialized_;
   int sampleRate_;
   std::string resolvedSourcePath_;

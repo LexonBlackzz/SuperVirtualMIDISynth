@@ -45,7 +45,7 @@ cl.exe /nologo /O2 /EHsc /LD /MT /DNDEBUG /D_USRDLL /D_WINDLL /DWINVER=0x0601 /D
   /Fo:"%~dp0build\obj\x86\\" ^
   /Fd:"%~dp0build\obj\x86\SuperVirtualMIDISynth.pdb" ^
   src\dllmain.cpp src\Config.cpp src\Synth.cpp src\TsfEngine.cpp src\BassMidiEngine.cpp src\SfzEngine.cpp src\WavLoader.cpp src\AudioOutput.cpp src\SystemWinmm.cpp src\LiveRuntime.cpp ^
-  src\VirtuallySuper\VirtuallySuperEngine.cpp src\VirtuallySuper\VirtuallySuperScheduler.cpp src\VirtuallySuper\VirtuallySuperScene.cpp src\VirtuallySuper\VirtuallySuperExact.cpp src\VirtuallySuper\VirtuallySuperGrouped.cpp src\VirtuallySuper\VirtuallySuperDensity.cpp src\VirtuallySuper\VirtuallySuperOverload.cpp src\VirtuallySuper\VirtuallySuperRender.cpp src\VirtuallySuper\VirtuallySuperTelemetry.cpp src\VirtuallySuper\VirtuallySuperSamplerEngine.cpp ^
+  src\VirtuallySuper\VirtuallySuperEngine.cpp src\VirtuallySuper\VirtuallySuperScheduler.cpp src\VirtuallySuper\VirtuallySuperScene.cpp src\VirtuallySuper\VirtuallySuperExact.cpp src\VirtuallySuper\VirtuallySuperGrouped.cpp src\VirtuallySuper\VirtuallySuperDensity.cpp src\VirtuallySuper\VirtuallySuperOverload.cpp src\VirtuallySuper\VirtuallySuperRender.cpp src\VirtuallySuper\VirtuallySuperTelemetry.cpp src\VirtuallySuper\VirtuallySuperSamplerEngine.cpp src\VirtuallySuper\VirtuallySuperSoundFontParser.cpp src\VirtuallySuper\VirtuallySuperSoundFontDispatch.cpp src\VirtuallySuper\VirtuallySuperSoundFontRuntime.cpp ^
   user32.lib winmm.lib advapi32.lib shell32.lib dsound.lib dxguid.lib ole32.lib uuid.lib avrt.lib ^
   /link /DEF:"%~dp0build\exports_x86.def" /IMPLIB:"%~dp0build\SuperVirtualMIDISynth.x86.lib"
 if errorlevel 1 (
@@ -66,7 +66,7 @@ cl.exe /nologo /O2 /EHsc /LD /MT /DNDEBUG /D_USRDLL /D_WINDLL /DWINVER=0x0601 /D
   /Fo:"%~dp0build\obj\x64\\" ^
   /Fd:"%~dp0build\obj\x64\SuperVirtualMIDISynthx64.pdb" ^
   src\dllmain.cpp src\Config.cpp src\Synth.cpp src\TsfEngine.cpp src\BassMidiEngine.cpp src\SfzEngine.cpp src\WavLoader.cpp src\AudioOutput.cpp src\SystemWinmm.cpp src\LiveRuntime.cpp ^
-  src\VirtuallySuper\VirtuallySuperEngine.cpp src\VirtuallySuper\VirtuallySuperScheduler.cpp src\VirtuallySuper\VirtuallySuperScene.cpp src\VirtuallySuper\VirtuallySuperExact.cpp src\VirtuallySuper\VirtuallySuperGrouped.cpp src\VirtuallySuper\VirtuallySuperDensity.cpp src\VirtuallySuper\VirtuallySuperOverload.cpp src\VirtuallySuper\VirtuallySuperRender.cpp src\VirtuallySuper\VirtuallySuperTelemetry.cpp src\VirtuallySuper\VirtuallySuperSamplerEngine.cpp ^
+  src\VirtuallySuper\VirtuallySuperEngine.cpp src\VirtuallySuper\VirtuallySuperScheduler.cpp src\VirtuallySuper\VirtuallySuperScene.cpp src\VirtuallySuper\VirtuallySuperExact.cpp src\VirtuallySuper\VirtuallySuperGrouped.cpp src\VirtuallySuper\VirtuallySuperDensity.cpp src\VirtuallySuper\VirtuallySuperOverload.cpp src\VirtuallySuper\VirtuallySuperRender.cpp src\VirtuallySuper\VirtuallySuperTelemetry.cpp src\VirtuallySuper\VirtuallySuperSamplerEngine.cpp src\VirtuallySuper\VirtuallySuperSoundFontParser.cpp src\VirtuallySuper\VirtuallySuperSoundFontDispatch.cpp src\VirtuallySuper\VirtuallySuperSoundFontRuntime.cpp ^
   user32.lib winmm.lib advapi32.lib shell32.lib dsound.lib dxguid.lib ole32.lib uuid.lib avrt.lib ^
   /link /DEF:"%~dp0build\exports_x64.def" /IMPLIB:"%~dp0build\SuperVirtualMIDISynth.x64.lib"
 if errorlevel 1 (

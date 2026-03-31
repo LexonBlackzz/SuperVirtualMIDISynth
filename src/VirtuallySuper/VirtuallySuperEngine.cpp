@@ -84,6 +84,13 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
     }
 
     for (size_t i = 0; i < drained; ++i) {
+      const EventKind kind = drainBatch_[i].kind;
+      if (kind == EventKind::ProgramChange || kind == EventKind::ControlChange ||
+          kind == EventKind::PitchBend) {
+        exact_.ApplyEvent(drainBatch_[i]);
+        continue;
+      }
+
       const PressureLevel pressureLevel =
           overload_.Evaluate(scheduler_.GetScheduledCount(),
                              scheduler_.GetStats(), exact_.GetStats(),

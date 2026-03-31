@@ -39,6 +39,10 @@ The first concrete runtime slice is:
 - `VirtuallySuperDensity.h/.cpp`
 - `VirtuallySuperOverload.h/.cpp`
 - `VirtuallySuperRender.h/.cpp`
+- `VirtuallySuperSoundFontTypes.h`
+- `VirtuallySuperSoundFontParser.h/.cpp`
+- `VirtuallySuperSoundFontDispatch.h/.cpp`
+- `VirtuallySuperSoundFontRuntime.h/.cpp`
 - `VirtuallySuperTelemetryShared.h`
 - `VirtuallySuperTelemetry.h/.cpp`
 - `VirtuallySuperSamplerEngine.h/.cpp`
@@ -77,8 +81,12 @@ Current scope:
 - separate `Configurator V2` shell can attach and display compact live
   diagnostics
 - deterministic prototype audio rendering available
-- render path is still synthetic and does not use SoundFont/sample playback yet
+- native cleanroom `.sf2` ingestion available for exact-tier playback
+- exact tier now renders real sample-backed voices for `.sf2` sources
+- grouped and density tiers remain prototype-synthetic for now
+- `.sf2` load failure is explicit; there is no silent fallback when a real
+  SoundFont was requested
 
-So the shell is integrated into the current playback path and the prototype now
-renders audible output, but the real sampler or SoundFont playback path is not
-finished yet.
+So the shell is integrated into the current playback path and `VirtuallySuper`
+now has a first real native sampler path for exact voices, but grouped and
+density SoundFont playback are still future work.

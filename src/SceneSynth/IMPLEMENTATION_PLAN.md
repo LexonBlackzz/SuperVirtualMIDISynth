@@ -114,8 +114,8 @@ engines while the new engine is designed and prototyped in parallel.
       targets
 - [x] Land first host-usable side-by-side runtime integration through the
       current synth engine-selection path
-- [ ] Add real sample or SoundFont playback to replace prototype-synthetic
-      rendering
+- [x] Add first native cleanroom SF2 exact-tier playback path while grouped
+      and density remain prototype-synthetic
 - [ ] Decide when `VirtuallySuper` is ready to become a serious side-by-side
       engine candidate rather than a host-usable prototype
 

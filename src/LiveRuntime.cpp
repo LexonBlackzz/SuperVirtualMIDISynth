@@ -561,6 +561,12 @@ void LiveRuntime::PublishSnapshot() {
       samplerDiagnostics.virtuallySuperVoiceEquivalent;
   sharedState->currentStats.virtuallySuperPressureLevel =
       samplerDiagnostics.virtuallySuperPressureLevel;
+  sharedState->currentStats.virtuallySuperLoadedPresets =
+      samplerDiagnostics.virtuallySuperLoadedPresets;
+  sharedState->currentStats.virtuallySuperLoadedRegions =
+      samplerDiagnostics.virtuallySuperLoadedRegions;
+  sharedState->currentStats.virtuallySuperExactMode =
+      samplerDiagnostics.virtuallySuperExactMode;
   sharedState->currentStats.samplerStateCode =
       samplerDiagnostics.samplerStateCode;
   sharedState->currentStats.samplerErrorCode =
