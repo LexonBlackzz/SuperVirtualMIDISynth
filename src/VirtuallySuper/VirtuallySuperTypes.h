@@ -140,10 +140,13 @@ struct SchedulerConfig {
 
 struct ExactConfig {
   uint32_t maxVoices;
+  uint32_t sampleRate;
   uint8_t quietVelocityThreshold;
+  uint8_t reserved0[3];
 
-  ExactConfig() : maxVoices(kDefaultExactVoiceCapacity),
-                  quietVelocityThreshold(60) {}
+  ExactConfig()
+      : maxVoices(kDefaultExactVoiceCapacity), sampleRate(44100),
+        quietVelocityThreshold(60), reserved0() {}
 };
 
 struct SchedulerStats {
@@ -185,8 +188,11 @@ struct ExactVoice {
   uint32_t prevQueue;
   float phase;
   float frequencyHz;
+  float phaseStep;
   float currentGain;
   float releaseDecay;
+  float leftGain;
+  float rightGain;
 
   ExactVoice()
       : voiceId(0), generation(0), startSequence(0),
@@ -195,8 +201,8 @@ struct ExactVoice {
         protectedAttack(0), releaseShortened(0), reserved(0),
         nextSameKey(kInvalidVoiceHandle), prevSameKey(kInvalidVoiceHandle),
         nextQueue(kInvalidVoiceHandle), prevQueue(kInvalidVoiceHandle),
-        phase(0.0f), frequencyHz(0.0f), currentGain(0.0f),
-        releaseDecay(0.0f) {}
+        phase(0.0f), frequencyHz(0.0f), phaseStep(0.0f), currentGain(0.0f),
+        releaseDecay(0.0f), leftGain(0.0f), rightGain(0.0f) {}
 };
 
 struct ExactStats {
@@ -217,14 +223,16 @@ struct ExactStats {
 
 struct GroupedConfig {
   uint32_t maxGroups;
+  uint32_t sampleRate;
   uint8_t pitchBandSemitones;
   uint8_t reserved0;
   uint16_t reserved1;
   int64_t timingBucketSamples;
 
   GroupedConfig()
-      : maxGroups(kDefaultGroupedCapacity), pitchBandSemitones(6),
-        reserved0(0), reserved1(0), timingBucketSamples(32) {}
+      : maxGroups(kDefaultGroupedCapacity), sampleRate(44100),
+        pitchBandSemitones(6), reserved0(0), reserved1(0),
+        timingBucketSamples(32) {}
 };
 
 struct DensityConfig {
@@ -275,13 +283,20 @@ struct GroupedObject {
   uint32_t representedNoteCount;
   uint32_t representedLayerCount;
   uint32_t noteOnCount;
+  uint32_t activeListIndex;
   int64_t lastTargetSample;
+  float phase;
+  float phaseStep;
+  float leftGain;
+  float rightGain;
+  float gain;
 
   GroupedObject()
       : active(0), channel(0), pitchBandId(0), layerTemplateId(0),
         sampleFamilyId(0), reserved(0), groupId(0), timingBucketId(0),
         representedNoteCount(0), representedLayerCount(0), noteOnCount(0),
-        lastTargetSample(0) {}
+        activeListIndex(kInvalidVoiceHandle), lastTargetSample(0), phase(0.0f),
+        phaseStep(0.0f), leftGain(0.0f), rightGain(0.0f), gain(0.0f) {}
 };
 
 struct GroupedStats {
@@ -306,15 +321,30 @@ struct DensityObject {
   uint32_t timingBucketId;
   uint32_t representedNoteCount;
   uint32_t representedLayerCount;
+  uint32_t activeListIndex;
   uint32_t grainJitterSeed;
   float energyLevel;
   float saturatedGain;
+  float leftGain;
+  float rightGain;
 
   DensityObject()
       : active(0), channel(0), pitchBandId(0), activationThreshold(0),
         sampleFamilyId(0), reserved(0), densityId(0), timingBucketId(0),
-        representedNoteCount(0), representedLayerCount(0), grainJitterSeed(0),
-        energyLevel(0.0f), saturatedGain(0.0f) {}
+        representedNoteCount(0), representedLayerCount(0),
+        activeListIndex(kInvalidVoiceHandle), grainJitterSeed(0),
+        energyLevel(0.0f), saturatedGain(0.0f), leftGain(0.0f),
+        rightGain(0.0f) {}
+};
+
+struct RenderStats {
+  uint32_t exactVoicesVisited;
+  uint32_t groupedObjectsVisited;
+  uint32_t densityObjectsVisited;
+
+  RenderStats()
+      : exactVoicesVisited(0), groupedObjectsVisited(0),
+        densityObjectsVisited(0) {}
 };
 
 struct DensityStats {

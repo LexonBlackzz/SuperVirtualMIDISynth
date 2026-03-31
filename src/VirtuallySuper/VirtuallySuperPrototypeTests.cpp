@@ -370,6 +370,45 @@ static bool TestSamplerEngineShell() {
   return true;
 }
 
+static bool TestSamplerEngineIdleFastPath() {
+  VirtuallySuperSamplerEngine engine;
+  SamplerInitParams params;
+  params.sourcePath = "gm.sf2";
+  params.sampleRate = 44100;
+  params.maxVoices = 8;
+  params.runtimeSettings.velocityCurve = 2.4f;
+  params.runtimeSettings.velocityFloor = 0.0f;
+  params.runtimeSettings.velocityIgnoreBelow = 0;
+  params.runtimeSettings.asyncNoteStarts = true;
+  params.runtimeSettings.eventTimingMode = EventTimingMode::ACCURATE;
+
+  if (!engine.Initialize(params))
+    return false;
+
+  engine.SetRenderWindow(2048, 32, 44100, 0, 0, false);
+  engine.BeginRenderBlock();
+
+  float buffer[64];
+  for (size_t i = 0; i < sizeof(buffer) / sizeof(buffer[0]); ++i)
+    buffer[i] = 1.0f;
+
+  engine.Render(buffer, 32);
+
+  for (size_t i = 0; i < sizeof(buffer) / sizeof(buffer[0]); ++i) {
+    if (buffer[i] != 0.0f)
+      return false;
+  }
+
+  SamplerDiagnostics diagnostics = engine.GetDiagnostics();
+  if (diagnostics.sampleRenderMs != 0.0f)
+    return false;
+  if (diagnostics.virtuallySuperIdleFastPathHits == 0)
+    return false;
+  if (diagnostics.virtuallySuperVoiceEquivalent != 0)
+    return false;
+  return true;
+}
+
 static bool TestSceneCompilerActions() {
   SceneCompiler scene;
   ExactStats exactStats;
@@ -475,6 +514,7 @@ int main() {
       {"engine render produces audio and retires release",
        TestEngineRenderProducesAudioAndRetiresRelease},
       {"sampler engine shell", TestSamplerEngineShell},
+      {"sampler engine idle fast path", TestSamplerEngineIdleFastPath},
       {"scene compiler actions", TestSceneCompilerActions},
       {"telemetry publisher", TestTelemetryPublisher},
   };

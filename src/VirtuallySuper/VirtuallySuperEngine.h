@@ -29,6 +29,7 @@ public:
                      int64_t windowEndSample, NormalizedEvent *outEvents,
                      size_t outCapacity, int64_t *renderUntilSample);
   void RenderBlock(float *output, int numFrames, int sampleRate);
+  bool CanIdleFastPath() const;
 
   const Scheduler &GetScheduler() const;
   Scheduler &GetScheduler();
@@ -45,6 +46,7 @@ public:
   const TelemetryPublisher &GetTelemetryPublisher() const;
   TelemetryPublisher &GetTelemetryPublisher();
   const TelemetrySnapshot &GetLatestTelemetrySnapshot() const;
+  const RenderStats &GetLatestRenderStats() const;
 
 private:
   Scheduler scheduler_;

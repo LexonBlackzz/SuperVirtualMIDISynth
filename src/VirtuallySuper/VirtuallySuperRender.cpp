@@ -1,33 +1,17 @@
 #include "VirtuallySuperRender.h"
 
-#include <math.h>
+#include <string.h>
 
 namespace {
 
-static float WrapPhase(float phase) {
-  while (phase >= 1.0f)
+static float AdvancePhase(float phase, float phaseStep) {
+  phase += phaseStep;
+  if (phase >= 1.0f)
     phase -= 1.0f;
-  while (phase < 0.0f)
-    phase += 1.0f;
   return phase;
 }
 
 static float MakeSaw(float phase) { return phase * 2.0f - 1.0f; }
-
-static float NoteToFrequencyHz(float note) {
-  return 440.0f * powf(2.0f, (note - 69.0f) * (1.0f / 12.0f));
-}
-
-static float MakePan(uint32_t channel, uint32_t note) {
-  const uint32_t index = (channel * 17u + note * 13u) & 15u;
-  return ((float)index / 7.5f) - 1.0f;
-}
-
-static void MakeStereoGains(float pan, float *left, float *right) {
-  const float clamped = pan < -1.0f ? -1.0f : (pan > 1.0f ? 1.0f : pan);
-  *left = 0.5f * (1.0f - clamped * 0.35f);
-  *right = 0.5f * (1.0f + clamped * 0.35f);
-}
 
 static uint32_t HashNoise(uint32_t seed, uint32_t index) {
   uint32_t x = seed ^ (index * 747796405u + 2891336453u);
@@ -43,15 +27,22 @@ static uint32_t HashNoise(uint32_t seed, uint32_t index) {
 
 namespace virtuallysuper {
 
-RenderSystem::RenderSystem() : tileBuffer_() {}
+RenderSystem::RenderSystem() : stats_() {}
 
-void RenderSystem::Reset() {}
+void RenderSystem::Reset() { stats_ = RenderStats(); }
+
+void RenderSystem::ResetBlockStats() { stats_ = RenderStats(); }
+
+const RenderStats &RenderSystem::GetStats() const { return stats_; }
 
 void RenderSystem::RenderBlock(ExactSystem &exact, const GroupedSystem &grouped,
                                const DensitySystem &density, float *output,
                                int numFrames, int sampleRate) {
-  if (!output || numFrames <= 0 || sampleRate <= 0)
+  (void)sampleRate;
+  if (!output || numFrames <= 0)
     return;
+
+  ResetBlockStats();
 
   uint32_t tileStart = 0;
   while (tileStart < (uint32_t)numFrames) {
@@ -59,19 +50,21 @@ void RenderSystem::RenderBlock(ExactSystem &exact, const GroupedSystem &grouped,
     const uint32_t frames =
         remaining > kDefaultRenderTileFrames ? kDefaultRenderTileFrames
                                              : remaining;
+    float *tileOutput = output + tileStart * 2u;
 
-    ClearTileBuffer(frames);
-    RenderExactTile(exact, tileStart, frames, sampleRate);
-    RenderGroupedTile(grouped, tileStart, frames, sampleRate);
-    RenderDensityTile(density, tileStart, frames);
-    CopyTileToOutput(output, tileStart, frames);
+    if (exact.GetActiveVoiceCount() != 0 || exact.GetReleasedVoiceCount() != 0)
+      RenderExactTile(exact, tileOutput, frames);
+    if (grouped.GetActiveHandleCount() != 0)
+      RenderGroupedTile(grouped, tileOutput, frames);
+    if (density.GetActiveHandleCount() != 0)
+      RenderDensityTile(density, tileOutput, frames, tileStart);
+
     tileStart += frames;
   }
 }
 
-void RenderSystem::RenderExactTile(ExactSystem &exact, uint32_t tileStart,
-                                   uint32_t frames, int sampleRate) {
-  (void)tileStart;
+void RenderSystem::RenderExactTile(ExactSystem &exact, float *tileOutput,
+                                   uint32_t frames) {
   static const ExactQueueClass kOrder[] = {
       ExactQueueClass::QuietActive, ExactQueueClass::LoudActive,
       ExactQueueClass::QuietRelease, ExactQueueClass::LoudRelease};
@@ -79,6 +72,9 @@ void RenderSystem::RenderExactTile(ExactSystem &exact, uint32_t tileStart,
   for (size_t classIndex = 0; classIndex < sizeof(kOrder) / sizeof(kOrder[0]);
        ++classIndex) {
     uint32_t handle = exact.GetQueueHead(kOrder[classIndex]);
+    if (handle == kInvalidVoiceHandle)
+      continue;
+
     while (handle != kInvalidVoiceHandle) {
       ExactVoice *voice = exact.GetMutableVoice(handle);
       if (!voice)
@@ -90,19 +86,15 @@ void RenderSystem::RenderExactTile(ExactSystem &exact, uint32_t tileStart,
         continue;
       }
 
-      const float phaseStep = voice->frequencyHz / (float)sampleRate;
+      ++stats_.exactVoicesVisited;
       float phase = voice->phase;
       float gain = voice->currentGain;
-      float leftGain = 0.0f;
-      float rightGain = 0.0f;
-      MakeStereoGains(MakePan(voice->channel, voice->note), &leftGain,
-                      &rightGain);
 
       for (uint32_t frame = 0; frame < frames; ++frame) {
         const float sample = MakeSaw(phase) * gain;
-        tileBuffer_[frame * 2u] += sample * leftGain;
-        tileBuffer_[frame * 2u + 1u] += sample * rightGain;
-        phase = WrapPhase(phase + phaseStep);
+        tileOutput[frame * 2u] += sample * voice->leftGain;
+        tileOutput[frame * 2u + 1u] += sample * voice->rightGain;
+        phase = AdvancePhase(phase, voice->phaseStep);
         if (voice->state == ExactLifecycleState::Released)
           gain *= voice->releaseDecay;
       }
@@ -119,77 +111,47 @@ void RenderSystem::RenderExactTile(ExactSystem &exact, uint32_t tileStart,
 }
 
 void RenderSystem::RenderGroupedTile(const GroupedSystem &grouped,
-                                     uint32_t tileStart, uint32_t frames,
-                                     int sampleRate) {
-  const GroupedConfig &config = grouped.GetConfig();
-  const uint32_t capacity = grouped.GetGroupCapacity();
-
-  for (uint32_t i = 0; i < capacity; ++i) {
-    const GroupedObject *group = grouped.GetGroup(i);
+                                     float *tileOutput, uint32_t frames) {
+  const uint32_t activeCount = grouped.GetActiveHandleCount();
+  for (uint32_t i = 0; i < activeCount; ++i) {
+    const GroupedObject *group = grouped.GetGroup(grouped.GetActiveHandle(i));
     if (!group || group->active == 0 || group->representedNoteCount == 0)
       continue;
 
-    const float centerNote =
-        (float)(group->pitchBandId * config.pitchBandSemitones) +
-        (float)config.pitchBandSemitones * 0.5f;
-    const float phaseOffset =
-        (float)((group->groupId * 1103515245u + 12345u) & 1023u) / 1024.0f;
-    const float phaseStep = NoteToFrequencyHz(centerNote) / (float)sampleRate;
-    const float gain =
-        ((float)group->representedNoteCount * 0.0012f) > 0.02f
-            ? 0.02f
-            : (float)group->representedNoteCount * 0.0012f;
-    float leftGain = 0.0f;
-    float rightGain = 0.0f;
-    MakeStereoGains(MakePan(group->channel, (uint32_t)centerNote), &leftGain,
-                    &rightGain);
-
-    float phase = WrapPhase(phaseOffset + (float)tileStart * phaseStep);
+    ++stats_.groupedObjectsVisited;
+    float phase = group->phase;
     for (uint32_t frame = 0; frame < frames; ++frame) {
-      const float sample = MakeSaw(phase) * gain;
-      tileBuffer_[frame * 2u] += sample * leftGain;
-      tileBuffer_[frame * 2u + 1u] += sample * rightGain;
-      phase = WrapPhase(phase + phaseStep);
+      const float sample = MakeSaw(phase) * group->gain;
+      tileOutput[frame * 2u] += sample * group->leftGain;
+      tileOutput[frame * 2u + 1u] += sample * group->rightGain;
+      phase = AdvancePhase(phase, group->phaseStep);
     }
+
+    const_cast<GroupedObject *>(group)->phase = phase;
   }
 }
 
 void RenderSystem::RenderDensityTile(const DensitySystem &density,
-                                     uint32_t tileStart, uint32_t frames) {
-  const uint32_t capacity = density.GetObjectCapacity();
-
-  for (uint32_t i = 0; i < capacity; ++i) {
-    const DensityObject *object = density.GetDensityObject(i);
+                                     float *tileOutput, uint32_t frames,
+                                     uint32_t tileStart) {
+  const uint32_t activeCount = density.GetActiveHandleCount();
+  for (uint32_t i = 0; i < activeCount; ++i) {
+    const DensityObject *object =
+        density.GetDensityObject(density.GetActiveHandle(i));
     if (!object || object->active == 0 || object->representedNoteCount == 0 ||
         object->representedNoteCount < object->activationThreshold) {
       continue;
     }
 
+    ++stats_.densityObjectsVisited;
     const float gain = object->saturatedGain * 0.012f;
-    float leftGain = 0.0f;
-    float rightGain = 0.0f;
-    MakeStereoGains(MakePan(object->channel, object->pitchBandId * 12u),
-                    &leftGain, &rightGain);
-
     for (uint32_t frame = 0; frame < frames; ++frame) {
       const uint32_t hash = HashNoise(object->grainJitterSeed, tileStart + frame);
       const float sample = (((hash >> 8) & 0xFFFFu) / 32767.5f - 1.0f) * gain;
-      tileBuffer_[frame * 2u] += sample * leftGain;
-      tileBuffer_[frame * 2u + 1u] += sample * rightGain;
+      tileOutput[frame * 2u] += sample * object->leftGain;
+      tileOutput[frame * 2u + 1u] += sample * object->rightGain;
     }
   }
-}
-
-void RenderSystem::ClearTileBuffer(uint32_t frames) {
-  for (uint32_t i = 0; i < frames * 2u; ++i)
-    tileBuffer_[i] = 0.0f;
-}
-
-void RenderSystem::CopyTileToOutput(float *output, uint32_t tileStart,
-                                    uint32_t frames) {
-  float *dest = output + tileStart * 2u;
-  for (uint32_t i = 0; i < frames * 2u; ++i)
-    dest[i] += tileBuffer_[i];
 }
 
 } // namespace virtuallysuper

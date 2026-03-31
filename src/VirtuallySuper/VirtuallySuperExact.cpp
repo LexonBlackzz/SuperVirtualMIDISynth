@@ -12,6 +12,17 @@ static float VelocityToGain(uint8_t velocity) {
   return ((float)velocity / 127.0f) * 0.045f;
 }
 
+static float ExactPan(uint32_t channel, uint32_t note) {
+  const uint32_t index = (channel * 17u + note * 13u) & 15u;
+  return ((float)index / 7.5f) - 1.0f;
+}
+
+static void ExactStereoGains(float pan, float *left, float *right) {
+  const float clamped = pan < -1.0f ? -1.0f : (pan > 1.0f ? 1.0f : pan);
+  *left = 0.5f * (1.0f - clamped * 0.35f);
+  *right = 0.5f * (1.0f + clamped * 0.35f);
+}
+
 } // namespace
 
 namespace virtuallysuper {
@@ -145,10 +156,10 @@ void ExactSystem::RetireVoice(uint32_t handle) {
   if (voice.state == ExactLifecycleState::Free)
     return;
 
+  RemoveVoiceState(voice.state);
   UnlinkQueue(handle);
   RemoveKeyVoice(handle);
   ReleaseVoiceHandle(handle);
-  UpdateStatsAfterStateChange();
 }
 
 bool ExactSystem::AllocateVoiceHandle(uint32_t *handle, bool *stolen) {
@@ -166,6 +177,7 @@ bool ExactSystem::AllocateVoiceHandle(uint32_t *handle, bool *stolen) {
     return false;
 
   ExactVoice &voice = voices_[candidate];
+  RemoveVoiceState(voice.state);
   UnlinkQueue(candidate);
   RemoveKeyVoice(candidate);
   voice = ExactVoice();
@@ -176,7 +188,6 @@ bool ExactSystem::AllocateVoiceHandle(uint32_t *handle, bool *stolen) {
     ++stats_.quietSteals;
   if (released)
     ++stats_.releaseSteals;
-  UpdateStatsAfterStateChange();
   return true;
 }
 
@@ -218,12 +229,17 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
   voice.queueClass = ExactQueueClass::None;
   voice.phase = 0.0f;
   voice.frequencyHz = MidiNoteToFrequencyHz(event.note);
+  voice.phaseStep =
+      voice.frequencyHz /
+      (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
   voice.currentGain = VelocityToGain(event.velocity);
   voice.releaseDecay = 0.9985f;
+  ExactStereoGains(ExactPan(event.channel, event.note), &voice.leftGain,
+                   &voice.rightGain);
 
   InsertKeyVoice(handle);
   ReclassifyVoiceQueue(handle);
-  UpdateStatsAfterStateChange();
+  AddVoiceState(voice.state);
 }
 
 void ExactSystem::TransitionVoiceToReleased(uint32_t handle) {
@@ -233,7 +249,8 @@ void ExactSystem::TransitionVoiceToReleased(uint32_t handle) {
 
   voice.state = ExactLifecycleState::Released;
   ReclassifyVoiceQueue(handle);
-  UpdateStatsAfterStateChange();
+  RemoveVoiceState(ExactLifecycleState::Active);
+  AddVoiceState(ExactLifecycleState::Released);
 }
 
 void ExactSystem::InsertKeyVoice(uint32_t handle) {
@@ -316,20 +333,24 @@ void ExactSystem::ReclassifyVoiceQueue(uint32_t handle) {
     LinkQueueTail(queueClass, handle);
 }
 
-void ExactSystem::UpdateStatsAfterStateChange() {
-  uint32_t active = 0;
-  uint32_t released = 0;
-  for (size_t i = 0; i < voices_.size(); ++i) {
-    if (voices_[i].state == ExactLifecycleState::Active)
-      ++active;
-    else if (voices_[i].state == ExactLifecycleState::Released)
-      ++released;
+void ExactSystem::AddVoiceState(ExactLifecycleState state) {
+  if (state == ExactLifecycleState::Active) {
+    ++stats_.activeVoices;
+    if (stats_.activeVoices > stats_.peakActiveVoices)
+      stats_.peakActiveVoices = stats_.activeVoices;
+  } else if (state == ExactLifecycleState::Released) {
+    ++stats_.releasedVoices;
   }
+}
 
-  stats_.activeVoices = active;
-  stats_.releasedVoices = released;
-  if (active > stats_.peakActiveVoices)
-    stats_.peakActiveVoices = active;
+void ExactSystem::RemoveVoiceState(ExactLifecycleState state) {
+  if (state == ExactLifecycleState::Active) {
+    if (stats_.activeVoices > 0)
+      --stats_.activeVoices;
+  } else if (state == ExactLifecycleState::Released) {
+    if (stats_.releasedVoices > 0)
+      --stats_.releasedVoices;
+  }
 }
 
 } // namespace virtuallysuper

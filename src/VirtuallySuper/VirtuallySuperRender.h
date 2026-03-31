@@ -12,21 +12,20 @@ public:
   RenderSystem();
 
   void Reset();
+  void ResetBlockStats();
   void RenderBlock(ExactSystem &exact, const GroupedSystem &grouped,
                    const DensitySystem &density, float *output, int numFrames,
                    int sampleRate);
+  const RenderStats &GetStats() const;
 
 private:
-  void RenderExactTile(ExactSystem &exact, uint32_t tileStart, uint32_t frames,
-                       int sampleRate);
-  void RenderGroupedTile(const GroupedSystem &grouped, uint32_t tileStart,
-                         uint32_t frames, int sampleRate);
-  void RenderDensityTile(const DensitySystem &density, uint32_t tileStart,
+  void RenderExactTile(ExactSystem &exact, float *tileOutput, uint32_t frames);
+  void RenderGroupedTile(const GroupedSystem &grouped, float *tileOutput,
                          uint32_t frames);
-  void ClearTileBuffer(uint32_t frames);
-  void CopyTileToOutput(float *output, uint32_t tileStart, uint32_t frames);
+  void RenderDensityTile(const DensitySystem &density, float *tileOutput,
+                         uint32_t frames, uint32_t tileStart);
 
-  float tileBuffer_[kMaxRenderTileFrames * 2];
+  RenderStats stats_;
 };
 
 } // namespace virtuallysuper

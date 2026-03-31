@@ -21,6 +21,8 @@ public:
   uint32_t GetActiveObjectCount() const;
   uint32_t GetObjectCapacity() const;
   const DensityObject *GetDensityObject(uint32_t handle) const;
+  uint32_t GetActiveHandleCount() const;
+  uint32_t GetActiveHandle(uint32_t index) const;
 
 private:
   bool MatchesObject(const DensityObject &object, const NormalizedEvent &event,
@@ -32,12 +34,15 @@ private:
   uint32_t MakeDeterministicSeed(const NormalizedEvent &event,
                                  uint32_t pitchBandId,
                                  uint32_t timingBucketId) const;
+  void ReleaseActiveObjects();
 
   DensityConfig config_;
   bool initialized_;
   uint32_t nextDensityId_;
   std::vector<DensityObject> objects_;
+  std::vector<uint32_t> activeHandles_;
   std::vector<uint32_t> freeList_;
+  uint32_t activeCount_;
   uint32_t freeCount_;
   DensityStats stats_;
 };

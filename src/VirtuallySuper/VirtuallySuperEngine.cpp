@@ -133,6 +133,17 @@ void EnginePrototype::RenderBlock(float *output, int numFrames, int sampleRate) 
   render_.RenderBlock(exact_, grouped_, density_, output, numFrames, sampleRate);
 }
 
+bool EnginePrototype::CanIdleFastPath() const {
+  if (!initialized_)
+    return true;
+
+  return scheduler_.GetIngressCount() == 0 && scheduler_.GetScheduledCount() == 0 &&
+         exact_.GetStats().activeVoices == 0 &&
+         exact_.GetStats().releasedVoices == 0 &&
+         grouped_.GetActiveGroupCount() == 0 &&
+         density_.GetActiveObjectCount() == 0;
+}
+
 const Scheduler &EnginePrototype::GetScheduler() const { return scheduler_; }
 
 Scheduler &EnginePrototype::GetScheduler() { return scheduler_; }
@@ -175,6 +186,10 @@ TelemetryPublisher &EnginePrototype::GetTelemetryPublisher() {
 
 const TelemetrySnapshot &EnginePrototype::GetLatestTelemetrySnapshot() const {
   return telemetry_.GetLatestSnapshot();
+}
+
+const RenderStats &EnginePrototype::GetLatestRenderStats() const {
+  return render_.GetStats();
 }
 
 } // namespace virtuallysuper

@@ -221,6 +221,10 @@ struct SamplerDiagnostics {
   unsigned int virtuallySuperDensityObjects;
   unsigned int virtuallySuperVoiceEquivalent;
   unsigned int virtuallySuperPressureLevel;
+  unsigned int virtuallySuperIdleFastPathHits;
+  unsigned int virtuallySuperExactVisitedThisBlock;
+  unsigned int virtuallySuperGroupedVisitedThisBlock;
+  unsigned int virtuallySuperDensityVisitedThisBlock;
   unsigned int samplerStateCode;
   unsigned int samplerErrorCode;
   float midiProcessMs;
@@ -271,6 +275,10 @@ struct SamplerDiagnostics {
         virtuallySuperExactVoices(0), virtuallySuperReleasedExactVoices(0),
         virtuallySuperGroupedObjects(0), virtuallySuperDensityObjects(0),
         virtuallySuperVoiceEquivalent(0), virtuallySuperPressureLevel(0),
+        virtuallySuperIdleFastPathHits(0),
+        virtuallySuperExactVisitedThisBlock(0),
+        virtuallySuperGroupedVisitedThisBlock(0),
+        virtuallySuperDensityVisitedThisBlock(0),
         samplerStateCode(
             (unsigned int)SamplerRuntimeStateCode::UNINITIALIZED),
         samplerErrorCode((unsigned int)SamplerErrorCode::NONE),

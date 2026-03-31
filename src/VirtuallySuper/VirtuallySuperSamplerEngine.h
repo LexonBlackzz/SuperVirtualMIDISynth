@@ -45,6 +45,7 @@ private:
   SamplerDiagnostics diagnostics_;
   SamplerRuntimeStateCode stateCode_;
   SamplerErrorCode errorCode_;
+  unsigned int idleFastPathHits_;
   unsigned int noteOnEventsThisBlock_;
   unsigned int noteOffEventsThisBlock_;
   unsigned long long currentBlockStartSample_;

@@ -21,6 +21,8 @@ public:
   uint32_t GetActiveGroupCount() const;
   uint32_t GetGroupCapacity() const;
   const GroupedObject *GetGroup(uint32_t handle) const;
+  uint32_t GetActiveHandleCount() const;
+  uint32_t GetActiveHandle(uint32_t index) const;
 
 private:
   bool MatchesGroup(const GroupedObject &group, const NormalizedEvent &event,
@@ -28,12 +30,15 @@ private:
   uint32_t FindOrAllocateGroup(const NormalizedEvent &event,
                                uint32_t pitchBandId,
                                uint32_t timingBucketId);
+  void ReleaseActiveGroups();
 
   GroupedConfig config_;
   bool initialized_;
   uint32_t nextGroupId_;
   std::vector<GroupedObject> groups_;
+  std::vector<uint32_t> activeHandles_;
   std::vector<uint32_t> freeList_;
+  uint32_t activeCount_;
   uint32_t freeCount_;
   GroupedStats stats_;
 };
