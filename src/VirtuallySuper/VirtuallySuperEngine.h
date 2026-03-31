@@ -5,6 +5,7 @@
 #include "VirtuallySuperExact.h"
 #include "VirtuallySuperGrouped.h"
 #include "VirtuallySuperScheduler.h"
+#include "VirtuallySuperScene.h"
 
 namespace virtuallysuper {
 
@@ -33,9 +34,12 @@ public:
   GroupedSystem &GetGroupedSystem();
   const DensitySystem &GetDensitySystem() const;
   DensitySystem &GetDensitySystem();
+  const SceneCompiler &GetSceneCompiler() const;
+  SceneCompiler &GetSceneCompiler();
 
 private:
   Scheduler scheduler_;
+  SceneCompiler scene_;
   ExactSystem exact_;
   GroupedSystem grouped_;
   DensitySystem density_;
