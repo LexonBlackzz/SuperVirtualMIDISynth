@@ -31,6 +31,7 @@ public:
   SamplerDiagnostics GetDiagnostics() const override;
 
 private:
+  uint8_t MapMidiVelocity(int velocity) const;
   virtuallysuper::NormalizedEvent ConvertMidiEvent(const MidiEvent &event) const;
   void ResetPerBlockStatsLocked();
   void SetStateLocked(SamplerRuntimeStateCode stateCode,

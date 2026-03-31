@@ -78,14 +78,18 @@ bool GroupedSystem::AccumulateEvent(const NormalizedEvent &event) {
   }
 
   GroupedObject &group = groups_[handle];
+  const uint8_t effectiveVelocity =
+      event.mappedVelocity > 0 ? event.mappedVelocity : event.velocity;
+  const float velocityScale = (float)effectiveVelocity / 127.0f;
   ++group.representedNoteCount;
   ++group.representedLayerCount;
   ++group.noteOnCount;
   group.lastTargetSample = event.targetSample;
   group.gain =
-      ((float)group.representedNoteCount * 0.0012f) > 0.02f
+      ((float)group.representedNoteCount * (0.0004f + velocityScale * 0.0008f)) >
+              0.02f
           ? 0.02f
-          : (float)group.representedNoteCount * 0.0012f;
+          : (float)group.representedNoteCount * (0.0004f + velocityScale * 0.0008f);
 
   ++stats_.noteOnsAccumulated;
   return true;

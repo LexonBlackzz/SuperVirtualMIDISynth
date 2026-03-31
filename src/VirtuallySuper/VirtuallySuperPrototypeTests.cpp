@@ -617,8 +617,9 @@ static bool TestSoundFontRuntimeLoadsAndDispatches() {
   if (!runtime.PrepareNoteOn(octave, &info) || info.phaseStep <= neutralStep)
     return false;
 
-  NormalizedEvent bend = MakeEvent(EventKind::PitchBend, 0, 0, 127, 0, 3);
-  bend.value = 127;
+  NormalizedEvent bend = MakeEvent(EventKind::PitchBend, 0, 0, 0, 0, 3);
+  bend.value = 0x7F;
+  bend.velocity = 0x7F;
   if (!runtime.HandleEvent(bend))
     return false;
   if (!runtime.PrepareNoteOn(noteOn, &info) || info.phaseStep <= neutralStep)
@@ -630,6 +631,37 @@ static bool TestSoundFontRuntimeLoadsAndDispatches() {
   if (runtime.PrepareNoteOn(noteOn, &info))
     return false;
 
+  return true;
+}
+
+static bool TestExactSyntheticPitchBendRefresh() {
+  ExactSystem exact;
+  ExactConfig config;
+  config.maxVoices = 4;
+  config.sampleRate = 44100;
+  if (!exact.Initialize(config))
+    return false;
+
+  NormalizedEvent noteOn = MakeEvent(EventKind::NoteOn, 0, 60, 100, 0, 1);
+  noteOn.mappedVelocity = 100;
+  if (!exact.ApplyEvent(noteOn))
+    return false;
+
+  const uint32_t head = exact.GetKeyHead(0, 60);
+  const ExactVoice *voice = exact.GetVoice(head);
+  if (!voice)
+    return false;
+  const float neutralStep = voice->phaseStep;
+
+  NormalizedEvent bend = MakeEvent(EventKind::PitchBend, 0, 0, 0, 0, 2);
+  bend.value = 0x7F;
+  bend.velocity = 0x7F;
+  if (!exact.ApplyEvent(bend))
+    return false;
+
+  voice = exact.GetVoice(head);
+  if (!voice || voice->phaseStep <= neutralStep)
+    return false;
   return true;
 }
 
@@ -790,6 +822,124 @@ static bool TestSamplerEngineNativeSf2Playback() {
   return true;
 }
 
+static bool TestSamplerEngineCenterPitchBendIsNeutral() {
+  std::string path;
+  if (!CreateMinimalSf2File(&path))
+    return false;
+
+  SamplerInitParams params;
+  params.sourcePath = path;
+  params.sampleRate = 44100;
+  params.maxVoices = 8;
+  params.runtimeSettings.velocityCurve = 2.4f;
+  params.runtimeSettings.velocityFloor = 0.0f;
+  params.runtimeSettings.velocityIgnoreBelow = 0;
+  params.runtimeSettings.asyncNoteStarts = true;
+  params.runtimeSettings.eventTimingMode = EventTimingMode::ACCURATE;
+
+  VirtuallySuperSamplerEngine baseline;
+  VirtuallySuperSamplerEngine centered;
+  if (!baseline.Initialize(params) || !centered.Initialize(params)) {
+    DeleteFileA(path.c_str());
+    return false;
+  }
+
+  baseline.SetRenderWindow(0, 64, 44100, 0, 0, false);
+  baseline.BeginRenderBlock();
+  centered.SetRenderWindow(0, 64, 44100, 0, 0, false);
+  centered.BeginRenderBlock();
+
+  MidiEvent program = {};
+  program.type = MidiEvent::PROGRAM_CHANGE;
+  program.channel = 0;
+  program.data1 = 0;
+  program.sequence = 1;
+  baseline.ProcessMidiEvent(program);
+  centered.ProcessMidiEvent(program);
+
+  MidiEvent bend = {};
+  bend.type = MidiEvent::PITCH_BEND;
+  bend.channel = 0;
+  bend.data1 = 8192;
+  bend.sequence = 2;
+  centered.ProcessMidiEvent(bend);
+
+  MidiEvent on = {};
+  on.type = MidiEvent::NOTE_ON;
+  on.channel = 0;
+  on.data1 = 60;
+  on.data2 = 120;
+  on.sequence = 3;
+  baseline.ProcessMidiEvent(on);
+  centered.ProcessMidiEvent(on);
+
+  float baselineBuffer[128] = {};
+  float centeredBuffer[128] = {};
+  baseline.Render(baselineBuffer, 64);
+  centered.Render(centeredBuffer, 64);
+  DeleteFileA(path.c_str());
+
+  for (size_t i = 0; i < sizeof(baselineBuffer) / sizeof(baselineBuffer[0]); ++i) {
+    const float delta = baselineBuffer[i] - centeredBuffer[i];
+    if (delta < -0.00001f || delta > 0.00001f)
+      return false;
+  }
+  return true;
+}
+
+static bool TestSamplerEngineVelocityIgnoreBelowSkipsQuietNotes() {
+  VirtuallySuperSamplerEngine engine;
+  SamplerInitParams params;
+  params.sourcePath = "prototype.vs";
+  params.sampleRate = 44100;
+  params.maxVoices = 8;
+  params.runtimeSettings.velocityCurve = 2.4f;
+  params.runtimeSettings.velocityFloor = 0.0f;
+  params.runtimeSettings.velocityIgnoreBelow = 64;
+  params.runtimeSettings.asyncNoteStarts = true;
+  params.runtimeSettings.eventTimingMode = EventTimingMode::ACCURATE;
+
+  if (!engine.Initialize(params))
+    return false;
+
+  engine.SetRenderWindow(0, 64, 44100, 0, 0, false);
+  engine.BeginRenderBlock();
+
+  MidiEvent quiet = {};
+  quiet.type = MidiEvent::NOTE_ON;
+  quiet.channel = 0;
+  quiet.data1 = 60;
+  quiet.data2 = 32;
+  quiet.sequence = 1;
+  engine.ProcessMidiEvent(quiet);
+
+  float quietBuffer[128] = {};
+  engine.Render(quietBuffer, 64);
+  for (size_t i = 0; i < sizeof(quietBuffer) / sizeof(quietBuffer[0]); ++i) {
+    if (quietBuffer[i] != 0.0f)
+      return false;
+  }
+
+  engine.SetRenderWindow(64, 64, 44100, 0, 0, false);
+  engine.BeginRenderBlock();
+
+  MidiEvent strong = quiet;
+  strong.data2 = 100;
+  strong.sequence = 2;
+  engine.ProcessMidiEvent(strong);
+
+  float strongBuffer[128] = {};
+  engine.Render(strongBuffer, 64);
+  bool hasAudio = false;
+  for (size_t i = 0; i < sizeof(strongBuffer) / sizeof(strongBuffer[0]); ++i) {
+    if (strongBuffer[i] != 0.0f) {
+      hasAudio = true;
+      break;
+    }
+  }
+  return hasAudio;
+}
+
 static bool TestSceneCompilerActions() {
   SceneCompiler scene;
   ExactStats exactStats;
@@ -898,10 +1048,15 @@ int main() {
       {"sampler engine idle fast path", TestSamplerEngineIdleFastPath},
       {"soundfont runtime loads and dispatches",
        TestSoundFontRuntimeLoadsAndDispatches},
+      {"exact synthetic pitch bend refresh", TestExactSyntheticPitchBendRefresh},
       {"sample-backed engine stays exact only under pressure",
        TestSampleBackedEngineStaysExactOnlyUnderPressure},
       {"soundfont invalid file fails", TestSoundFontInvalidFileFails},
       {"sampler engine native sf2 playback", TestSamplerEngineNativeSf2Playback},
+      {"sampler engine center pitch bend is neutral",
+       TestSamplerEngineCenterPitchBendIsNeutral},
+      {"sampler engine velocity ignore below skips quiet notes",
+       TestSamplerEngineVelocityIgnoreBelowSkipsQuietNotes},
       {"scene compiler actions", TestSceneCompilerActions},
       {"telemetry publisher", TestTelemetryPublisher},
   };

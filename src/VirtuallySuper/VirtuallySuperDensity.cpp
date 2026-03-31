@@ -149,10 +149,14 @@ uint32_t DensitySystem::FindOrAllocateObject(const NormalizedEvent &event,
 
 void DensitySystem::UpdateDerivedState(DensityObject &object,
                                        const NormalizedEvent &event) {
-  object.energyLevel = (float)object.representedNoteCount * (float)event.velocity;
+  const uint8_t effectiveVelocity =
+      event.mappedVelocity > 0 ? event.mappedVelocity : event.velocity;
+  object.energyLevel =
+      (float)object.representedNoteCount * (float)effectiveVelocity;
   const float represented = (float)object.representedNoteCount;
   const float k = (float)config_.saturationK;
-  object.saturatedGain = represented / (represented + k);
+  object.saturatedGain =
+      (represented / (represented + k)) * ((float)effectiveVelocity / 127.0f);
 }
 
 uint32_t DensitySystem::MakeDeterministicSeed(const NormalizedEvent &event,

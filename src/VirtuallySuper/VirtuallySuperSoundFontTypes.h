@@ -122,6 +122,10 @@ struct SoundFontChannelState {
   uint16_t program;
   uint16_t presetIndex;
   uint16_t pitchWheel;
+  uint8_t rpnMsb;
+  uint8_t rpnLsb;
+  uint8_t dataEntryMsb;
+  uint8_t dataEntryLsb;
   float volume;
   float expression;
   float pan;
@@ -133,6 +137,7 @@ struct SoundFontChannelState {
   SoundFontChannelState()
       : bankMsb(0), bankLsb(0), resolvedBank(0), program(0),
         presetIndex(kInvalidSoundFontIndex), pitchWheel(8192), volume(1.0f),
+        rpnMsb(127), rpnLsb(127), dataEntryMsb(2), dataEntryLsb(0),
         expression(1.0f), pan(0.5f), tuning(0.0f), pitchRange(2.0f),
         sustain(0), reserved() {}
 };
