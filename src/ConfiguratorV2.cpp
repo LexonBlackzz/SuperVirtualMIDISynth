@@ -249,6 +249,10 @@ void DrawModeSelector();
 const char *ModeName(int mode);
 void RenderStatusPill(const char *label, const ImVec4 &color);
 bool DrawActionButtonWrapped(const char *label, const ImVec2 &size);
+void RenderSparklineCard(const char *id, const char *title,
+                         const HistorySeries &series, float maxValue,
+                         const char *primary, const char *secondary,
+                         const char *footer);
 bool ComboFromValue(const char *label, char *buffer, size_t capacity,
                     const char *const *items, int itemCount);
 void InputIntClamped(const char *label, LONG *value, LONG minValue,
@@ -562,7 +566,13 @@ void HelpText(const char *text) {
 }
 
 void BeginCard(const char *id, const char *title, float width, float height) {
-  ImGui::BeginChild(id, ImVec2(width, height), true);
+  ImGuiChildFlags childFlags =
+      ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding;
+  ImGuiWindowFlags windowFlags =
+      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+  if (height <= 0.0f)
+    childFlags |= ImGuiChildFlags_AutoResizeY;
+  ImGui::BeginChild(id, ImVec2(width, height), childFlags, windowFlags);
   ImGui::TextUnformatted(title);
   ImGui::Separator();
 }
@@ -632,6 +642,39 @@ bool ToggleButton(const char *label, LONG *value) {
     return true;
   }
   return false;
+}
+
+void RenderSparklineCard(const char *id, const char *title,
+                         const HistorySeries &series, float maxValue,
+                         const char *primary, const char *secondary,
+                         const char *footer) {
+  ImGui::BeginChild(
+      id, ImVec2(0, 156),
+      ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
+      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  ImGui::TextUnformatted(title);
+  ImGui::Separator();
+  ImGui::TextWrapped("%s", primary ? primary : "");
+  if (secondary && secondary[0])
+    HelpText(secondary);
+
+  std::vector<float> values;
+  CopyHistory(series, values);
+  if (!values.empty()) {
+    char plotId[64];
+    sprintf(plotId, "##%s_plot", id);
+    ImGui::PlotLines(plotId, &values[0], (int)values.size(), 0, NULL, 0.0f,
+                     maxValue, ImVec2(-1, 56));
+  } else {
+    ImGui::Dummy(ImVec2(0.0f, 56.0f));
+    ImGui::TextDisabled("No history yet");
+  }
+
+  if (footer && footer[0]) {
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", footer);
+  }
+  ImGui::EndChild();
 }
 
 void PlotHistory(const char *label, const HistorySeries &series, float maxValue,
@@ -1063,39 +1106,104 @@ void RenderFxTab() {
 }
 
 void RenderDiagnosticsTab() {
-  BeginCard("Graphs1", "Graphs", 0, 0);
-  PlotHistory("Render ms", g_ui.historyRenderMs, 10.0f, ImVec2(-1, 72));
-  PlotHistory("Audio block ms", g_ui.historyBlockMs, 10.0f, ImVec2(-1, 72));
-  PlotHistory("Queue depth", g_ui.historyQueueDepth, 4096.0f, ImVec2(-1, 72));
-  PlotHistory("Deferred depth", g_ui.historyDeferredDepth, 4096.0f, ImVec2(-1, 72));
-  PlotHistory("Release lane", g_ui.historyReleaseLaneDepth, 512.0f, ImVec2(-1, 72));
-  PlotHistory("Exact voices", g_ui.historyVsExact, 1024.0f, ImVec2(-1, 72));
-  PlotHistory("Grouped objects", g_ui.historyVsGrouped, 1024.0f, ImVec2(-1, 72));
-  PlotHistory("Density objects", g_ui.historyVsDensity, 1024.0f, ImVec2(-1, 72));
-  PlotHistory("Voice equivalent", g_ui.historyVsVoiceEq, 2048.0f, ImVec2(-1, 72));
-  PlotHistory("Overload state", g_ui.historyOverload, 2.0f, ImVec2(-1, 72));
-  PlotHistory("NoteOn started", g_ui.historyNoteOnStarted, 512.0f, ImVec2(-1, 72));
-  PlotHistory("NoteOn dropped", g_ui.historyNoteOnDropped, 512.0f, ImVec2(-1, 72));
-  PlotHistory("NoteOff applied", g_ui.historyNoteOffApplied, 512.0f, ImVec2(-1, 72));
-  PlotHistory("NoteOff canceled", g_ui.historyNoteOffCanceled, 512.0f, ImVec2(-1, 72));
-  PlotHistory("NoteOff coalesced", g_ui.historyNoteOffCoalesced, 512.0f, ImVec2(-1, 72));
+  BeginCard("DiagSummary", "Diagnostics Overview", 0, 0);
+  HelpText("Hot stats are summarized here as compact trend cards. The synth only publishes raw counters; smoothing, graph history, and status interpretation stay in the configurator.");
   EndCard();
 
-  BeginCard("ReleaseDiag", "Release Diagnostics", 0, 0);
   if (g_ui.connected) {
-    ImGui::Text("State: %s", GetReleaseHealth(g_ui.lastSnapshot));
-    ImGui::Text("Ingress %lu  Deferred %lu  Lane queued %lu  Lane applied %lu  Late %lu",
-                (unsigned long)g_ui.lastSnapshot.currentStats.noteOffIngressThisBlock,
-                (unsigned long)g_ui.lastSnapshot.currentStats.noteOffDeferredThisBlock,
-                (unsigned long)g_ui.lastSnapshot.currentStats.noteOffReleaseLaneQueuedThisBlock,
-                (unsigned long)g_ui.lastSnapshot.currentStats.noteOffReleaseLaneAppliedThisBlock,
-                (unsigned long)g_ui.lastSnapshot.currentStats.noteOffLateThisBlock);
-    ImGui::Text("Same-key applied %lu  coalesced %lu  canceled %lu",
-                (unsigned long)g_ui.lastSnapshot.currentStats.schedulerNoteOffsAppliedThisBlock,
-                (unsigned long)g_ui.lastSnapshot.currentStats.schedulerNoteOffsCoalescedThisBlock,
-                (unsigned long)g_ui.lastSnapshot.currentStats.schedulerNoteOffsCanceledThisBlock);
+    const LiveBridgeStats &stats = g_ui.lastSnapshot.currentStats;
+    char primary[256];
+    char secondary[256];
+    char footer[256];
+
+    if (ImGui::BeginTable("DiagnosticsGrid", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                              ImGuiTableFlags_BordersInnerV)) {
+      ImGui::TableNextColumn();
+      sprintf(primary, "Block %.3f ms of %.3f ms budget | Render avg %.3f ms",
+              stats.audioBlockMs, stats.audioBudgetMs, stats.synthRenderAvgMs);
+      sprintf(secondary, "Peak block %.3f ms | Peak render %.3f ms",
+              stats.audioBlockPeakMs, stats.synthRenderPeakMs);
+      sprintf(footer, "Load state: %s", GetLoadStatus(
+                          stats.audioBudgetMs > 0.0f
+                              ? stats.audioBlockMs * 100.0f / stats.audioBudgetMs
+                              : 0.0f));
+      RenderSparklineCard("DiagAudio", "Audio Load", g_ui.historyBlockMs, 10.0f,
+                          primary, secondary, footer);
+
+      ImGui::TableNextColumn();
+      sprintf(primary, "Queued %lu | Deferred %lu | Release lane %lu",
+              (unsigned long)stats.queuedMidiEvents,
+              (unsigned long)stats.deferredMidiEvents,
+              (unsigned long)stats.releaseLaneDepth);
+      sprintf(secondary, "Critical %lu | Realtime %lu | NoteOn %lu",
+              (unsigned long)stats.criticalQueueDepth,
+              (unsigned long)stats.realtimeQueueDepth,
+              (unsigned long)stats.noteOnQueueDepth);
+      sprintf(footer, "Queue max seen: %lu",
+              (unsigned long)stats.maxQueuedMidiEvents);
+      RenderSparklineCard("DiagQueues", "Queue Health", g_ui.historyQueueDepth,
+                          4096.0f, primary, secondary, footer);
+
+      ImGui::TableNextColumn();
+      sprintf(primary, "VoiceEq %lu | Exact %lu | Grouped %lu | Density %lu",
+              (unsigned long)stats.virtuallySuperVoiceEquivalent,
+              (unsigned long)stats.virtuallySuperExactVoices,
+              (unsigned long)stats.virtuallySuperGroupedObjects,
+              (unsigned long)stats.virtuallySuperDensityObjects);
+      sprintf(secondary, "Released exact %lu | Pressure %lu",
+              (unsigned long)stats.virtuallySuperReleasedExactVoices,
+              (unsigned long)stats.virtuallySuperPressureLevel);
+      sprintf(footer, "Tier mix reflects current live scene state");
+      RenderSparklineCard("DiagScene", "Scene Activity", g_ui.historyVsVoiceEq,
+                          2048.0f, primary, secondary, footer);
+
+      ImGui::TableNextColumn();
+      sprintf(primary, "Overload %s | Consecutive blocks %lu",
+              GetOverloadStatus(stats.overloadState),
+              (unsigned long)stats.consecutiveOverloadBlocks);
+      sprintf(secondary, "Hard entries %lu | Recoveries %lu | Worker blocked %lu",
+              (unsigned long)stats.accurateHardOverloadEntries,
+              (unsigned long)stats.accurateHardOverloadRecoveries,
+              (unsigned long)stats.accurateWorkerBlockedCount);
+      sprintf(footer, "Pressure level %lu", (unsigned long)stats.virtuallySuperPressureLevel);
+      RenderSparklineCard("DiagOverload", "Overload", g_ui.historyOverload, 2.0f,
+                          primary, secondary, footer);
+
+      ImGui::TableNextColumn();
+      sprintf(primary, "Started %lu | Dropped %lu | Attempted %lu",
+              (unsigned long)stats.noteOnStartedThisBlock,
+              (unsigned long)stats.noteOnDroppedThisBlock,
+              (unsigned long)stats.noteOnEventsThisBlock);
+      sprintf(secondary, "Async started %lu | Async dropped %lu | Coalesced %lu",
+              (unsigned long)stats.asyncStartedThisBlock,
+              (unsigned long)stats.asyncDroppedThisBlock,
+              (unsigned long)stats.asyncCoalescedThisBlock);
+      sprintf(footer, "Dropped note-ons under overload: %lu",
+              (unsigned long)stats.overloadNoteOnsDroppedThisBlock);
+      RenderSparklineCard("DiagNoteOn", "Note-On Flow", g_ui.historyNoteOnStarted,
+                          512.0f, primary, secondary, footer);
+
+      ImGui::TableNextColumn();
+      sprintf(primary, "Applied %lu | Canceled %lu | Coalesced %lu",
+              (unsigned long)stats.schedulerNoteOffsAppliedThisBlock,
+              (unsigned long)stats.schedulerNoteOffsCanceledThisBlock,
+              (unsigned long)stats.schedulerNoteOffsCoalescedThisBlock);
+      sprintf(secondary, "Ingress %lu | Deferred %lu | Late %lu",
+              (unsigned long)stats.noteOffIngressThisBlock,
+              (unsigned long)stats.noteOffDeferredThisBlock,
+              (unsigned long)stats.noteOffLateThisBlock);
+      sprintf(footer, "Release state: %s", GetReleaseHealth(g_ui.lastSnapshot));
+      RenderSparklineCard("DiagRelease", "Release Flow", g_ui.historyNoteOffApplied,
+                          512.0f, primary, secondary, footer);
+      ImGui::EndTable();
+    }
+  } else {
+    BeginCard("DiagOffline", "Diagnostics", 0, 0);
+    HelpText(g_ui.disconnectedSummary[0] ? g_ui.disconnectedSummary
+                                         : "No live bridge is attached.");
+    EndCard();
   }
-  EndCard();
 
   if (g_ui.currentMode >= VIEW_ADVANCED) {
     BeginCard("RawStats", "Raw Stats", 0, 0);
