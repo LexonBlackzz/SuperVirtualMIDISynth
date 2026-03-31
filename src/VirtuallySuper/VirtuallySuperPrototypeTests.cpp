@@ -2,6 +2,7 @@
 #include "VirtuallySuperDensity.h"
 #include "VirtuallySuperGrouped.h"
 #include "VirtuallySuperSamplerEngine.h"
+#include "VirtuallySuperScene.h"
 
 #include <stdio.h>
 
@@ -261,6 +262,37 @@ static bool TestSamplerEngineShell() {
   return true;
 }
 
+static bool TestSceneCompilerActions() {
+  SceneCompiler scene;
+  ExactStats exactStats;
+  scene.BeginWindow();
+
+  SceneAction on =
+      scene.CompileEvent(MakeEvent(EventKind::NoteOn, 0, 60, 100, 0, 1), exactStats);
+  if (on.kind != SceneActionKind::SpawnExactVoice)
+    return false;
+  if (on.observeGrouped == 0 || on.observeDensity == 0 ||
+      on.protectedAttack == 0) {
+    return false;
+  }
+
+  SceneAction off =
+      scene.CompileEvent(MakeEvent(EventKind::NoteOff, 0, 60, 0, 8, 2), exactStats);
+  if (off.kind != SceneActionKind::ReleaseExactVoice)
+    return false;
+
+  SceneAction reset =
+      scene.CompileEvent(MakeEvent(EventKind::Reset, 0, 0, 0, 16, 3), exactStats);
+  if (reset.kind != SceneActionKind::ResetScene)
+    return false;
+
+  if (scene.GetStats().exactActions != 2)
+    return false;
+  if (scene.GetStats().resetActions != 1)
+    return false;
+  return true;
+}
+
 int main() {
   const struct {
     const char *name;
@@ -273,6 +305,7 @@ int main() {
       {"density prototype clouds", TestDensityPrototypeClouds},
       {"engine density accumulation", TestEngineDensityAccumulation},
       {"sampler engine shell", TestSamplerEngineShell},
+      {"scene compiler actions", TestSceneCompilerActions},
   };
 
   for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {

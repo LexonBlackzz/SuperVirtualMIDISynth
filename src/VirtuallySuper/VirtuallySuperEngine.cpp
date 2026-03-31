@@ -3,8 +3,8 @@
 namespace virtuallysuper {
 
 EnginePrototype::EnginePrototype()
-    : scheduler_(), exact_(), grouped_(), density_(), initialized_(false),
-      drainBatch_() {}
+    : scheduler_(), scene_(), exact_(), grouped_(), density_(),
+      initialized_(false), drainBatch_() {}
 
 bool EnginePrototype::Initialize(const EngineConfig &config) {
   initialized_ =
@@ -23,6 +23,7 @@ void EnginePrototype::Reset() {
   if (!initialized_)
     return;
   scheduler_.Reset();
+  scene_.Reset();
   exact_.Reset();
   grouped_.Reset();
   density_.Reset();
@@ -52,6 +53,7 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
 
   size_t totalApplied = 0;
   int64_t localRenderUntil = blockEndSample;
+  scene_.BeginWindow();
   grouped_.BeginWindow();
   density_.BeginWindow();
 
@@ -67,9 +69,23 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
     }
 
     for (size_t i = 0; i < drained; ++i) {
-      exact_.ApplyEvent(drainBatch_[i]);
-      grouped_.AccumulateEvent(drainBatch_[i]);
-      density_.AccumulateEvent(drainBatch_[i]);
+      const virtuallysuper::SceneAction action =
+          scene_.CompileEvent(drainBatch_[i], exact_.GetStats());
+
+      switch (action.kind) {
+      case virtuallysuper::SceneActionKind::SpawnExactVoice:
+      case virtuallysuper::SceneActionKind::ReleaseExactVoice:
+      case virtuallysuper::SceneActionKind::ResetScene:
+        exact_.ApplyEvent(action.event);
+        break;
+      default:
+        break;
+      }
+
+      if (action.observeGrouped != 0)
+        grouped_.AccumulateEvent(action.event);
+      if (action.observeDensity != 0)
+        density_.AccumulateEvent(action.event);
     }
 
     totalApplied += drained;
@@ -111,5 +127,9 @@ const DensitySystem &EnginePrototype::GetDensitySystem() const {
 }
 
 DensitySystem &EnginePrototype::GetDensitySystem() { return density_; }
+
+const SceneCompiler &EnginePrototype::GetSceneCompiler() const { return scene_; }
+
+SceneCompiler &EnginePrototype::GetSceneCompiler() { return scene_; }
 
 } // namespace virtuallysuper

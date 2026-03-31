@@ -33,6 +33,7 @@ The first concrete runtime slice is:
 
 - `VirtuallySuperTypes.h`
 - `VirtuallySuperScheduler.h/.cpp`
+- `VirtuallySuperScene.h/.cpp`
 - `VirtuallySuperExact.h/.cpp`
 - `VirtuallySuperGrouped.h/.cpp`
 - `VirtuallySuperDensity.h/.cpp`
@@ -49,6 +50,7 @@ This slice is intentionally limited:
 - queue-based exact voice stealing
 - window-local grouped bucket prototype
 - window-local density cloud prototype
+- explicit scene action compiler between scheduler and tiers
 - scheduler-to-exact prototype API
 - `ISamplerEngine` shell adapter for the current synth code
 

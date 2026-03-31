@@ -61,6 +61,13 @@ enum class ExactQueueClass : uint8_t {
   LoudRelease
 };
 
+enum class SceneActionKind : uint8_t {
+  None = 0,
+  SpawnExactVoice,
+  ReleaseExactVoice,
+  ResetScene
+};
+
 struct NormalizedEvent {
   EventKind kind;
   uint8_t channel;
@@ -290,6 +297,34 @@ struct DensityStats {
   DensityStats()
       : activeObjects(0), peakActiveObjects(0), noteOnsAccumulated(0),
         promotedClouds(0), droppedNoteOns(0) {}
+};
+
+struct SceneAction {
+  SceneActionKind kind;
+  uint16_t importanceScore;
+  uint8_t observeGrouped;
+  uint8_t observeDensity;
+  uint8_t protectedAttack;
+  uint8_t reserved0;
+  uint16_t reserved1;
+  NormalizedEvent event;
+
+  SceneAction()
+      : kind(SceneActionKind::None), importanceScore(0), observeGrouped(0),
+        observeDensity(0), protectedAttack(0), reserved0(0), reserved1(0),
+        event() {}
+};
+
+struct SceneStats {
+  uint32_t exactActions;
+  uint32_t groupedObservations;
+  uint32_t densityObservations;
+  uint32_t resetActions;
+  uint32_t protectedAttacks;
+
+  SceneStats()
+      : exactActions(0), groupedObservations(0), densityObservations(0),
+        resetActions(0), protectedAttacks(0) {}
 };
 
 inline bool EventUsesKey(EventKind kind) {
