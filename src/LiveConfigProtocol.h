@@ -4,9 +4,11 @@
 #include <windows.h>
 
 #define SVMS_LIVE_BRIDGE_MAGIC 0x53564D53u
-#define SVMS_LIVE_BRIDGE_VERSION 19u
-#define SVMS_LIVE_BRIDGE_MAPPING_NAME "Local\\SVMS_LiveBridge_v19"
-#define SVMS_LIVE_BRIDGE_MUTEX_NAME "Local\\SVMS_LiveBridgeMutex_v19"
+#define SVMS_LIVE_BRIDGE_VERSION 20u
+#define SVMS_LIVE_BRIDGE_MAPPING_NAME "Local\\SVMS_LiveBridge_v20"
+#define SVMS_LIVE_BRIDGE_MUTEX_NAME "Local\\SVMS_LiveBridgeMutex_v20"
+#define SVMS_LIVE_BRIDGE_MAPPING_NAME_V19 "Local\\SVMS_LiveBridge_v19"
+#define SVMS_LIVE_BRIDGE_MUTEX_NAME_V19 "Local\\SVMS_LiveBridgeMutex_v19"
 #define SVMS_LIVE_BRIDGE_MAPPING_NAME_V18 "Local\\SVMS_LiveBridge_v18"
 #define SVMS_LIVE_BRIDGE_MUTEX_NAME_V18 "Local\\SVMS_LiveBridgeMutex_v18"
 #define SVMS_LIVE_BRIDGE_MAPPING_NAME_V17 "Local\\SVMS_LiveBridge_v17"
@@ -169,6 +171,12 @@ struct LiveBridgeStats {
   DWORD tsfThreadedFragments;
   DWORD schedulerCacheRebuilds;
   DWORD schedulerTrimHeapTombstonePrunes;
+  DWORD virtuallySuperExactVoices;
+  DWORD virtuallySuperReleasedExactVoices;
+  DWORD virtuallySuperGroupedObjects;
+  DWORD virtuallySuperDensityObjects;
+  DWORD virtuallySuperVoiceEquivalent;
+  DWORD virtuallySuperPressureLevel;
   FLOAT schedulerSliceMs;
   FLOAT schedulerLagMs;
   ULONGLONG schedulerBlockStartSample;

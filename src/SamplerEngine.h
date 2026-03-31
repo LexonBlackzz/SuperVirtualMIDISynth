@@ -200,6 +200,12 @@ struct SamplerDiagnostics {
   unsigned int tsfThreadedFragments;
   unsigned int schedulerCacheRebuilds;
   unsigned int schedulerTrimHeapTombstonePrunes;
+  unsigned int virtuallySuperExactVoices;
+  unsigned int virtuallySuperReleasedExactVoices;
+  unsigned int virtuallySuperGroupedObjects;
+  unsigned int virtuallySuperDensityObjects;
+  unsigned int virtuallySuperVoiceEquivalent;
+  unsigned int virtuallySuperPressureLevel;
   float midiProcessMs;
   float voiceStartMs;
   float sampleRenderMs;
@@ -245,6 +251,9 @@ struct SamplerDiagnostics {
         tsfClusteredVoicesGather(0), tsfClusteredVoicesComplex(0),
         tsfSingleThreadFragments(0), tsfThreadedFragments(0),
         schedulerCacheRebuilds(0), schedulerTrimHeapTombstonePrunes(0),
+        virtuallySuperExactVoices(0), virtuallySuperReleasedExactVoices(0),
+        virtuallySuperGroupedObjects(0), virtuallySuperDensityObjects(0),
+        virtuallySuperVoiceEquivalent(0), virtuallySuperPressureLevel(0),
         midiProcessMs(0.0f),
         voiceStartMs(0.0f), sampleRenderMs(0.0f), schedulerSliceMs(0.0f),
         schedulerLagMs(0.0f), schedulerBlockStartSample(0) {
