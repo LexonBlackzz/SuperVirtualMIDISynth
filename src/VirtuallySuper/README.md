@@ -36,6 +36,7 @@ The first concrete runtime slice is:
 - `VirtuallySuperExact.h/.cpp`
 - `VirtuallySuperGrouped.h/.cpp`
 - `VirtuallySuperDensity.h/.cpp`
+- `VirtuallySuperSamplerEngine.h/.cpp`
 - `VirtuallySuperEngine.h/.cpp`
 
 This slice is intentionally limited:
@@ -49,5 +50,20 @@ This slice is intentionally limited:
 - window-local grouped bucket prototype
 - window-local density cloud prototype
 - scheduler-to-exact prototype API
+- `ISamplerEngine` shell adapter for the current synth code
+
+## Current Integration Status
+
+`VirtuallySuper` now has a runtime shell that plugs into the existing
+`ISamplerEngine` abstraction.
+
+Current scope:
+
+- selectable by engine name in source/config as `virtuallysuper`
+- event ingress and runtime state reachable through the current synth layer
+- diagnostics and active-voice reporting available
+- render output still placeholder silence
+
+So the shell is integrated, but the sampler/audio path is not finished yet.
 
 It is not integrated into the existing playback path yet.

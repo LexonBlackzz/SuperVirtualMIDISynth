@@ -31,7 +31,7 @@ if /I "%ARCH%"=="x86" (
 call "%VS_ENV%"
 if errorlevel 1 exit /b %errorlevel%
 
-set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /WX- /permissive- /I\"%ROOT%\src\VirtuallySuper\""
+set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /WX- /permissive- /I\"%ROOT%\src\" /I\"%ROOT%\src\VirtuallySuper\""
 
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperPrototypeTests.cpp" /Fo"%OBJDIR%\VirtuallySuperPrototypeTests.obj"
 if errorlevel 1 exit /b %errorlevel%

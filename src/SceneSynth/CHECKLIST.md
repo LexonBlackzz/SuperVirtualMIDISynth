@@ -123,4 +123,5 @@ This file is intended to be updated as work lands.
 - [x] First exact-tier-only prototype started
 - [x] First grouped rendering prototype started
 - [x] First density prototype started
+- [x] Prototype `ISamplerEngine` shell added for current synth integration
 - [ ] Prototype telemetry wired for Configurator consumption

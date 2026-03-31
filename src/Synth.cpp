@@ -5,6 +5,7 @@
 #include "SfzEngine.h"
 #endif
 #include "TsfEngine.h"
+#include "VirtuallySuper/VirtuallySuperSamplerEngine.h"
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -2484,6 +2485,8 @@ void Synth::Initialize() {
       engine.reset(new TsfEngine());
     } else if (resolvedEngine == SamplerEngineId::BASSMIDI) {
       engine.reset(new BassMidiEngine());
+    } else if (resolvedEngine == SamplerEngineId::VIRTUALLYSUPER) {
+      engine.reset(new VirtuallySuperSamplerEngine());
 #ifndef SVMS_LEGACY_XP
     } else if (resolvedEngine == SamplerEngineId::SFZ) {
       engine.reset(new SfzEngine());

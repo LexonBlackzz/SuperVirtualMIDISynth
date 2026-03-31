@@ -46,9 +46,12 @@ if errorlevel 1 exit /b %errorlevel%
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 if not exist "%OBJDIR%" mkdir "%OBJDIR%"
 
-set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /WX- /permissive- /I\"%ROOT%\src\VirtuallySuper\""
+set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /WX- /permissive- /I\"%ROOT%\src\" /I\"%ROOT%\src\VirtuallySuper\""
 
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperEngine.cpp" /Fo"%OBJDIR%\VirtuallySuperEngine.obj"
+if errorlevel 1 exit /b %errorlevel%
+
+cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperSamplerEngine.cpp" /Fo"%OBJDIR%\VirtuallySuperSamplerEngine.obj"
 if errorlevel 1 exit /b %errorlevel%
 
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperExact.cpp" /Fo"%OBJDIR%\VirtuallySuperExact.obj"
@@ -63,7 +66,7 @@ if errorlevel 1 exit /b %errorlevel%
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperScheduler.cpp" /Fo"%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
-lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperGrouped.obj" "%OBJDIR%\VirtuallySuperDensity.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
+lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperSamplerEngine.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperGrouped.obj" "%OBJDIR%\VirtuallySuperDensity.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
 echo Built "%OUTDIR%\VirtuallySuperPrototype.lib"

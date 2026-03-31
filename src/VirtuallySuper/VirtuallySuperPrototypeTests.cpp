@@ -1,6 +1,7 @@
 #include "VirtuallySuperEngine.h"
 #include "VirtuallySuperDensity.h"
 #include "VirtuallySuperGrouped.h"
+#include "VirtuallySuperSamplerEngine.h"
 
 #include <stdio.h>
 
@@ -172,7 +173,7 @@ static bool TestDensityPrototypeClouds() {
 
   if (density.GetActiveObjectCount() != 1)
     return false;
-  const DensityObject *object = density.GetObject(0);
+  const DensityObject *object = density.GetDensityObject(0);
   if (!object || object->representedNoteCount != 3)
     return false;
   if (object->saturatedGain <= 0.0f || object->saturatedGain >= 1.0f)
@@ -212,6 +213,54 @@ static bool TestEngineDensityAccumulation() {
   return true;
 }
 
+static bool TestSamplerEngineShell() {
+  VirtuallySuperSamplerEngine engine;
+  SamplerInitParams params;
+  params.sourcePath = "gm.sf2";
+  params.sampleRate = 44100;
+  params.maxVoices = 8;
+  params.runtimeSettings.velocityCurve = 2.4f;
+  params.runtimeSettings.velocityFloor = 0.0f;
+  params.runtimeSettings.velocityIgnoreBelow = 0;
+  params.runtimeSettings.asyncNoteStarts = true;
+  params.runtimeSettings.eventTimingMode = EventTimingMode::ACCURATE;
+
+  if (!engine.Initialize(params))
+    return false;
+
+  engine.BeginRenderBlock();
+
+  MidiEvent on = {};
+  on.type = MidiEvent::NOTE_ON;
+  on.channel = 0;
+  on.data1 = 60;
+  on.data2 = 100;
+  on.sequence = 1;
+  on.targetSample = 0;
+  engine.ProcessMidiEvent(on);
+
+  float buffer[64] = {};
+  engine.Render(buffer, 32);
+
+  DWORD channels[16] = {};
+  const DWORD active = engine.GetActiveVoiceStats(channels, 16);
+  if (active != 1 || channels[0] != 1)
+    return false;
+
+  SamplerDiagnostics diagnostics = engine.GetDiagnostics();
+  if (diagnostics.noteOnEventsThisBlock != 1)
+    return false;
+  if (diagnostics.lastWarning.empty())
+    return false;
+
+  for (size_t i = 0; i < sizeof(buffer) / sizeof(buffer[0]); ++i) {
+    if (buffer[i] != 0.0f)
+      return false;
+  }
+
+  return true;
+}
+
 int main() {
   const struct {
     const char *name;
@@ -223,6 +272,7 @@ int main() {
       {"grouped prototype buckets", TestGroupedPrototypeBuckets},
       {"density prototype clouds", TestDensityPrototypeClouds},
       {"engine density accumulation", TestEngineDensityAccumulation},
+      {"sampler engine shell", TestSamplerEngineShell},
   };
 
   for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
