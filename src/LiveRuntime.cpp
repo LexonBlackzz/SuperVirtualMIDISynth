@@ -585,6 +585,14 @@ void LiveRuntime::PublishSnapshot() {
       samplerDiagnostics.virtuallySuperLoadedRegions;
   sharedState->currentStats.virtuallySuperExactMode =
       samplerDiagnostics.virtuallySuperExactMode;
+  sharedState->currentStats.virtuallySuperIdleFastPathHits =
+      samplerDiagnostics.virtuallySuperIdleFastPathHits;
+  sharedState->currentStats.virtuallySuperExactVisitedThisBlock =
+      samplerDiagnostics.virtuallySuperExactVisitedThisBlock;
+  sharedState->currentStats.virtuallySuperGroupedVisitedThisBlock =
+      samplerDiagnostics.virtuallySuperGroupedVisitedThisBlock;
+  sharedState->currentStats.virtuallySuperDensityVisitedThisBlock =
+      samplerDiagnostics.virtuallySuperDensityVisitedThisBlock;
   sharedState->currentStats.samplerStateCode =
       samplerDiagnostics.samplerStateCode;
   sharedState->currentStats.samplerErrorCode =

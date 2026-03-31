@@ -195,6 +195,10 @@ struct LiveBridgeStats {
   DWORD virtuallySuperLoadedPresets;
   DWORD virtuallySuperLoadedRegions;
   DWORD virtuallySuperExactMode;
+  DWORD virtuallySuperIdleFastPathHits;
+  DWORD virtuallySuperExactVisitedThisBlock;
+  DWORD virtuallySuperGroupedVisitedThisBlock;
+  DWORD virtuallySuperDensityVisitedThisBlock;
   DWORD samplerStateCode;
   DWORD samplerErrorCode;
   FLOAT schedulerSliceMs;
