@@ -23,6 +23,53 @@ static uint32_t HashNoise(uint32_t seed, uint32_t index) {
   return x;
 }
 
+static bool ShouldLoopVoice(const virtuallysuper::ExactVoice &voice) {
+  if (!voice.sampleBacked)
+    return false;
+  if (voice.loopMode == virtuallysuper::SoundFontLoopNone)
+    return false;
+  if (voice.state == virtuallysuper::ExactLifecycleState::Released &&
+      voice.loopMode == virtuallysuper::SoundFontLoopSustain) {
+    return false;
+  }
+  return voice.loopEnd > voice.loopStart + 1u;
+}
+
+static bool AdvanceSampleVoice(virtuallysuper::ExactVoice *voice, float *sampleOut) {
+  if (!voice || !sampleOut || !voice->sampleData)
+    return false;
+
+  float phase = voice->phase;
+  if (phase < (float)voice->sampleStart)
+    phase = (float)voice->sampleStart;
+
+  uint32_t baseIndex = (uint32_t)phase;
+  if (baseIndex + 1u >= voice->sampleEnd) {
+    if (!ShouldLoopVoice(*voice))
+      return false;
+    phase = (float)voice->loopStart;
+    baseIndex = voice->loopStart;
+  }
+
+  uint32_t nextIndex = baseIndex + 1u;
+  if (ShouldLoopVoice(*voice) && nextIndex >= voice->loopEnd)
+    nextIndex = voice->loopStart;
+  if (nextIndex >= voice->sampleEnd)
+    nextIndex = voice->sampleEnd - 1u;
+
+  const float frac = phase - (float)baseIndex;
+  const float s0 = voice->sampleData[baseIndex];
+  const float s1 = voice->sampleData[nextIndex];
+  *sampleOut = s0 + (s1 - s0) * frac;
+
+  phase += voice->phaseStep;
+  if (ShouldLoopVoice(*voice) && phase >= (float)voice->loopEnd) {
+    phase = (float)voice->loopStart + (phase - (float)voice->loopEnd);
+  }
+  voice->phase = phase;
+  return true;
+}
+
 } // namespace
 
 namespace virtuallysuper {
@@ -89,12 +136,30 @@ void RenderSystem::RenderExactTile(ExactSystem &exact, float *tileOutput,
       ++stats_.exactVoicesVisited;
       float phase = voice->phase;
       float gain = voice->currentGain;
+      bool retireVoice = false;
 
       for (uint32_t frame = 0; frame < frames; ++frame) {
-        const float sample = MakeSaw(phase) * gain;
+        float sample = 0.0f;
+        if (voice->sampleBacked && voice->sampleData != 0) {
+          if (!AdvanceSampleVoice(voice, &sample)) {
+            retireVoice = true;
+            break;
+          }
+          if (voice->attackSamplesRemaining > 0) {
+            gain += voice->attackGainStep;
+            --voice->attackSamplesRemaining;
+            if (voice->attackSamplesRemaining == 0 || gain > voice->targetGain)
+              gain = voice->targetGain;
+          }
+          sample *= gain;
+          phase = voice->phase;
+        } else {
+          sample = MakeSaw(phase) * gain;
+          phase = AdvancePhase(phase, voice->phaseStep);
+        }
+
         tileOutput[frame * 2u] += sample * voice->leftGain;
         tileOutput[frame * 2u + 1u] += sample * voice->rightGain;
-        phase = AdvancePhase(phase, voice->phaseStep);
         if (voice->state == ExactLifecycleState::Released)
           gain *= voice->releaseDecay;
       }
@@ -102,7 +167,8 @@ void RenderSystem::RenderExactTile(ExactSystem &exact, float *tileOutput,
       voice->phase = phase;
       voice->currentGain = gain;
 
-      if (voice->state == ExactLifecycleState::Released && gain < 0.00015f)
+      if (retireVoice ||
+          (voice->state == ExactLifecycleState::Released && gain < 0.00015f))
         exact.RetireVoice(handle);
 
       handle = nextHandle;

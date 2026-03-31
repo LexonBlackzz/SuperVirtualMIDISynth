@@ -54,6 +54,15 @@ if errorlevel 1 exit /b %errorlevel%
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperSamplerEngine.cpp" /Fo"%OBJDIR%\VirtuallySuperSamplerEngine.obj"
 if errorlevel 1 exit /b %errorlevel%
 
+cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperSoundFontParser.cpp" /Fo"%OBJDIR%\VirtuallySuperSoundFontParser.obj"
+if errorlevel 1 exit /b %errorlevel%
+
+cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperSoundFontDispatch.cpp" /Fo"%OBJDIR%\VirtuallySuperSoundFontDispatch.obj"
+if errorlevel 1 exit /b %errorlevel%
+
+cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperSoundFontRuntime.cpp" /Fo"%OBJDIR%\VirtuallySuperSoundFontRuntime.obj"
+if errorlevel 1 exit /b %errorlevel%
+
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperScene.cpp" /Fo"%OBJDIR%\VirtuallySuperScene.obj"
 if errorlevel 1 exit /b %errorlevel%
 
@@ -78,7 +87,7 @@ if errorlevel 1 exit /b %errorlevel%
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperScheduler.cpp" /Fo"%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
-lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperSamplerEngine.obj" "%OBJDIR%\VirtuallySuperScene.obj" "%OBJDIR%\VirtuallySuperTelemetry.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperGrouped.obj" "%OBJDIR%\VirtuallySuperDensity.obj" "%OBJDIR%\VirtuallySuperOverload.obj" "%OBJDIR%\VirtuallySuperRender.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
+lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperSamplerEngine.obj" "%OBJDIR%\VirtuallySuperSoundFontParser.obj" "%OBJDIR%\VirtuallySuperSoundFontDispatch.obj" "%OBJDIR%\VirtuallySuperSoundFontRuntime.obj" "%OBJDIR%\VirtuallySuperScene.obj" "%OBJDIR%\VirtuallySuperTelemetry.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperGrouped.obj" "%OBJDIR%\VirtuallySuperDensity.obj" "%OBJDIR%\VirtuallySuperOverload.obj" "%OBJDIR%\VirtuallySuperRender.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
 echo Built "%OUTDIR%\VirtuallySuperPrototype.lib"

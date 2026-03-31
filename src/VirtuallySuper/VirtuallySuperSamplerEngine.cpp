@@ -16,7 +16,7 @@ static uint8_t ClampMidiData(int value) {
 } // namespace
 
 VirtuallySuperSamplerEngine::VirtuallySuperSamplerEngine()
-    : prototype_(), initialized_(false), sampleRate_(44100),
+    : prototype_(), soundFontRuntime_(), initialized_(false), sampleRate_(44100),
       resolvedSourcePath_(), resolvedSourceFormat_(), runtimeSettings_(),
       diagnostics_(), stateCode_(SamplerRuntimeStateCode::UNINITIALIZED),
       errorCode_(SamplerErrorCode::NONE), idleFastPathHits_(0),
@@ -43,6 +43,26 @@ bool VirtuallySuperSamplerEngine::Initialize(const SamplerInitParams &params) {
   resolvedSourcePath_ = params.sourcePath;
   resolvedSourceFormat_ = DetectSourceFormat(params.sourcePath);
 
+  const bool wantsSf2 = resolvedSourceFormat_ == "sf2";
+  std::string initWarning;
+  if (wantsSf2) {
+    if (!soundFontRuntime_.Load(params.sourcePath.c_str(),
+                                params.sampleRate > 0 ? (uint32_t)params.sampleRate
+                                                      : 44100u,
+                                &initWarning)) {
+      initialized_ = false;
+      SetStateLocked(SamplerRuntimeStateCode::FAILED,
+                     SamplerErrorCode::INIT_FAILED,
+                     initWarning.empty()
+                         ? "VirtuallySuper failed to load the requested SoundFont."
+                         : initWarning.c_str());
+      diagnostics_.failedSampleCount = 1;
+      return false;
+    }
+  } else {
+    soundFontRuntime_.Reset();
+  }
+
   virtuallysuper::EngineConfig config;
   config.scheduler.scheduledCapacity =
       params.maxVoices > 0 ? (uint32_t)(params.maxVoices * 8) : 4096u;
@@ -65,10 +85,12 @@ bool VirtuallySuperSamplerEngine::Initialize(const SamplerInitParams &params) {
 
   initialized_ = prototype_.Initialize(config);
   if (initialized_) {
+    prototype_.GetExactSystem().SetSoundFontRuntime(
+        soundFontRuntime_.IsLoaded() ? &soundFontRuntime_ : 0);
     SetStateLocked(SamplerRuntimeStateCode::READY, SamplerErrorCode::NONE,
-                   "VirtuallySuper host prototype active. Synthetic audio is "
-                   "enabled; real SoundFont/sample playback is not implemented "
-                   "yet.");
+                   soundFontRuntime_.IsLoaded()
+                       ? initWarning.c_str()
+                       : "VirtuallySuper host prototype active. Synthetic exact/grouped/density rendering is enabled.");
   } else {
     SetStateLocked(SamplerRuntimeStateCode::FAILED,
                    SamplerErrorCode::INIT_FAILED,
@@ -82,6 +104,8 @@ void VirtuallySuperSamplerEngine::Shutdown(bool waitForThreads) {
   (void)waitForThreads;
   initialized_ = false;
   prototype_.Reset();
+  prototype_.GetExactSystem().SetSoundFontRuntime(0);
+  soundFontRuntime_.Reset();
   resolvedSourcePath_.clear();
   resolvedSourceFormat_.clear();
   currentBlockStartSample_ = 0;
@@ -101,6 +125,7 @@ void VirtuallySuperSamplerEngine::Reset() {
   compat::LockGuard<compat::Mutex> lock(engineMutex);
   if (!initialized_)
     return;
+  soundFontRuntime_.ResetChannels();
   prototype_.Reset();
   renderCursorSample_ = 0;
   SetStateLocked(SamplerRuntimeStateCode::READY, SamplerErrorCode::NONE,
@@ -197,8 +222,7 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
         prototype_.GetScheduler().GetStats().coalescedEvents;
     diagnostics_.accuratePeakScheduledEvents =
         prototype_.GetScheduler().GetStats().maxScheduledDepth;
-    diagnostics_.loadedSampleCount = 0;
-    diagnostics_.failedSampleCount = 0;
+    UpdateSoundFontDiagnosticsLocked();
     diagnostics_.overloadState = 0;
     diagnostics_.virtuallySuperExactVoices = 0;
     diagnostics_.virtuallySuperReleasedExactVoices = 0;
@@ -263,8 +287,7 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
 
   const virtuallysuper::TelemetrySnapshot &snapshot =
       prototype_.GetLatestTelemetrySnapshot();
-  diagnostics_.loadedSampleCount = 0;
-  diagnostics_.failedSampleCount = 0;
+  UpdateSoundFontDiagnosticsLocked();
   diagnostics_.schedulerPendingSameKeyTransitions =
       snapshot.schedulerQueuedEvents;
   diagnostics_.overloadState = snapshot.overloadPressureLevel;
@@ -287,9 +310,9 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
   diagnostics_.schedulerBlockStartSample = currentBlockStartSample_;
   if (stateCode_ != SamplerRuntimeStateCode::FAILED) {
     SetStateLocked(SamplerRuntimeStateCode::ACTIVE, SamplerErrorCode::NONE,
-                   "VirtuallySuper host prototype active. Synthetic audio is "
-                   "enabled; real SoundFont/sample playback is not implemented "
-                   "yet.");
+                   soundFontRuntime_.IsLoaded()
+                       ? "VirtuallySuper native SF2 exact tier active."
+                       : "VirtuallySuper host prototype active. Synthetic exact/grouped/density rendering is enabled.");
   }
 }
 
@@ -384,6 +407,7 @@ void VirtuallySuperSamplerEngine::ResetPerBlockStatsLocked() {
   std::string lastWarning = diagnostics_.lastWarning;
   diagnostics_ = SamplerDiagnostics();
   diagnostics_.lastWarning = lastWarning;
+  UpdateSoundFontDiagnosticsLocked();
   diagnostics_.virtuallySuperIdleFastPathHits = idleFastPathHits_;
   noteOnEventsThisBlock_ = 0;
   noteOffEventsThisBlock_ = 0;
@@ -400,4 +424,11 @@ void VirtuallySuperSamplerEngine::SetStateLocked(SamplerRuntimeStateCode stateCo
   diagnostics_.samplerErrorCode = (unsigned int)errorCode_;
   if (warningText)
     diagnostics_.lastWarning = warningText;
+}
+
+void VirtuallySuperSamplerEngine::UpdateSoundFontDiagnosticsLocked() {
+  diagnostics_.loadedSampleCount = soundFontRuntime_.GetSampleCount();
+  diagnostics_.virtuallySuperLoadedPresets = soundFontRuntime_.GetPresetCount();
+  diagnostics_.virtuallySuperLoadedRegions = soundFontRuntime_.GetRegionCount();
+  diagnostics_.virtuallySuperExactMode = soundFontRuntime_.IsLoaded() ? 1u : 0u;
 }

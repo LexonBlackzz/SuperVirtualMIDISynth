@@ -1,6 +1,7 @@
 #ifndef VIRTUALLYSUPER_EXACT_H
 #define VIRTUALLYSUPER_EXACT_H
 
+#include "VirtuallySuperSoundFontRuntime.h"
 #include "VirtuallySuperTypes.h"
 
 #include <vector>
@@ -12,6 +13,7 @@ public:
   ExactSystem();
 
   bool Initialize(const ExactConfig &config);
+  void SetSoundFontRuntime(SoundFontRuntime *soundFont);
   void Reset();
 
   bool ApplyEvent(const NormalizedEvent &event);
@@ -41,6 +43,10 @@ private:
   void ReleaseVoiceHandle(uint32_t handle);
   void ActivateVoice(uint32_t handle, const NormalizedEvent &event);
   void TransitionVoiceToReleased(uint32_t handle);
+  void RefreshVoiceFromSoundFont(uint32_t handle);
+  void RefreshChannelVoices(uint8_t channel);
+  void ReleaseSustainedVoices(uint8_t channel);
+  void ReleaseAllChannelVoices(uint8_t channel, bool hardKill);
   void InsertKeyVoice(uint32_t handle);
   void RemoveKeyVoice(uint32_t handle);
   void LinkQueueTail(ExactQueueClass queueClass, uint32_t handle);
@@ -53,6 +59,7 @@ private:
   ExactConfig config_;
   bool initialized_;
   uint32_t nextVoiceId_;
+  SoundFontRuntime *soundFont_;
   uint32_t generationCounters_[kChannelCount][kNoteCount];
   uint32_t keyHeads_[kChannelCount][kNoteCount];
   QueueState queues_[5];

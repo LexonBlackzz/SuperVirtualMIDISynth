@@ -4,11 +4,193 @@
 #include "VirtuallySuperOverload.h"
 #include "VirtuallySuperSamplerEngine.h"
 #include "VirtuallySuperScene.h"
+#include "VirtuallySuperSoundFontRuntime.h"
 #include "VirtuallySuperTelemetry.h"
 
 #include <stdio.h>
+#include <string>
+#include <vector>
+#include <windows.h>
 
 using namespace virtuallysuper;
+
+static void AppendU16(std::vector<uint8_t> *data, uint16_t value) {
+  data->push_back((uint8_t)(value & 0xFFu));
+  data->push_back((uint8_t)((value >> 8) & 0xFFu));
+}
+
+static void AppendS16(std::vector<uint8_t> *data, int16_t value) {
+  AppendU16(data, (uint16_t)value);
+}
+
+static void AppendU32(std::vector<uint8_t> *data, uint32_t value) {
+  data->push_back((uint8_t)(value & 0xFFu));
+  data->push_back((uint8_t)((value >> 8) & 0xFFu));
+  data->push_back((uint8_t)((value >> 16) & 0xFFu));
+  data->push_back((uint8_t)((value >> 24) & 0xFFu));
+}
+
+static size_t BeginChunk(std::vector<uint8_t> *data, const char *id) {
+  data->insert(data->end(), id, id + 4);
+  const size_t sizeOffset = data->size();
+  AppendU32(data, 0);
+  return sizeOffset;
+}
+
+static void EndChunk(std::vector<uint8_t> *data, size_t sizeOffset) {
+  uint32_t chunkSize = (uint32_t)(data->size() - sizeOffset - 4u);
+  (*data)[sizeOffset + 0] = (uint8_t)(chunkSize & 0xFFu);
+  (*data)[sizeOffset + 1] = (uint8_t)((chunkSize >> 8) & 0xFFu);
+  (*data)[sizeOffset + 2] = (uint8_t)((chunkSize >> 16) & 0xFFu);
+  (*data)[sizeOffset + 3] = (uint8_t)((chunkSize >> 24) & 0xFFu);
+  if (chunkSize & 1u)
+    data->push_back(0);
+}
+
+static size_t BeginList(std::vector<uint8_t> *data, const char *listType) {
+  const size_t sizeOffset = BeginChunk(data, "LIST");
+  data->insert(data->end(), listType, listType + 4);
+  return sizeOffset;
+}
+
+static void AppendName20(std::vector<uint8_t> *data, const char *name) {
+  char buffer[20] = {};
+  if (name)
+    strncpy_s(buffer, name, _TRUNCATE);
+  data->insert(data->end(), buffer, buffer + 20);
+}
+
+static std::string MakeTempPath(const char *suffix) {
+  char tempDir[MAX_PATH] = {};
+  char tempFile[MAX_PATH] = {};
+  GetTempPathA(MAX_PATH, tempDir);
+  GetTempFileNameA(tempDir, "vss", 0, tempFile);
+  std::string path = tempFile;
+  if (suffix)
+    path += suffix;
+  return path;
+}
+
+static bool WriteAllBytes(const std::string &path,
+                          const std::vector<uint8_t> &bytes) {
+  FILE *file = 0;
+  if (fopen_s(&file, path.c_str(), "wb") != 0 || !file)
+    return false;
+  const size_t written = fwrite(bytes.data(), 1, bytes.size(), file);
+  fclose(file);
+  return written == bytes.size();
+}
+
+static bool CreateMinimalSf2File(std::string *outPath) {
+  if (!outPath)
+    return false;
+
+  const uint32_t sampleFrames = 96;
+  const uint32_t guardFrames = 46;
+  std::vector<uint8_t> fileData;
+
+  const size_t riffSize = BeginChunk(&fileData, "RIFF");
+  fileData.insert(fileData.end(), {'s','f','b','k'});
+
+  const size_t sdtaSize = BeginList(&fileData, "sdta");
+  const size_t smplSize = BeginChunk(&fileData, "smpl");
+  for (uint32_t i = 0; i < sampleFrames; ++i) {
+    const float phase = (float)i / (float)sampleFrames;
+    const int16_t value = (int16_t)((phase * 2.0f - 1.0f) * 28000.0f);
+    AppendS16(&fileData, value);
+  }
+  for (uint32_t i = 0; i < guardFrames; ++i)
+    AppendS16(&fileData, 0);
+  EndChunk(&fileData, smplSize);
+  EndChunk(&fileData, sdtaSize);
+
+  const size_t pdtaSize = BeginList(&fileData, "pdta");
+
+  const size_t phdrSize = BeginChunk(&fileData, "phdr");
+  AppendName20(&fileData, "Preset");
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 0);
+  AppendU32(&fileData, 0);
+  AppendU32(&fileData, 0);
+  AppendU32(&fileData, 0);
+  AppendName20(&fileData, "EOP");
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 1);
+  AppendU32(&fileData, 0);
+  AppendU32(&fileData, 0);
+  AppendU32(&fileData, 0);
+  EndChunk(&fileData, phdrSize);
+
+  const size_t pbagSize = BeginChunk(&fileData, "pbag");
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 1);
+  AppendU16(&fileData, 0);
+  EndChunk(&fileData, pbagSize);
+
+  const size_t pgenSize = BeginChunk(&fileData, "pgen");
+  AppendU16(&fileData, 41);
+  AppendU16(&fileData, 0);
+  EndChunk(&fileData, pgenSize);
+
+  const size_t instSize = BeginChunk(&fileData, "inst");
+  AppendName20(&fileData, "Instrument");
+  AppendU16(&fileData, 0);
+  AppendName20(&fileData, "EOI");
+  AppendU16(&fileData, 1);
+  EndChunk(&fileData, instSize);
+
+  const size_t ibagSize = BeginChunk(&fileData, "ibag");
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 1);
+  AppendU16(&fileData, 0);
+  EndChunk(&fileData, ibagSize);
+
+  const size_t igenSize = BeginChunk(&fileData, "igen");
+  AppendU16(&fileData, 53);
+  AppendU16(&fileData, 0);
+  EndChunk(&fileData, igenSize);
+
+  const size_t shdrSize = BeginChunk(&fileData, "shdr");
+  AppendName20(&fileData, "Sample");
+  AppendU32(&fileData, 0);
+  AppendU32(&fileData, sampleFrames);
+  AppendU32(&fileData, 8);
+  AppendU32(&fileData, sampleFrames - 8);
+  AppendU32(&fileData, 44100);
+  fileData.push_back(60);
+  fileData.push_back(0);
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 1);
+  AppendName20(&fileData, "EOS");
+  AppendU32(&fileData, sampleFrames);
+  AppendU32(&fileData, sampleFrames);
+  AppendU32(&fileData, sampleFrames);
+  AppendU32(&fileData, sampleFrames);
+  AppendU32(&fileData, 44100);
+  fileData.push_back(60);
+  fileData.push_back(0);
+  AppendU16(&fileData, 0);
+  AppendU16(&fileData, 1);
+  EndChunk(&fileData, shdrSize);
+
+  EndChunk(&fileData, pdtaSize);
+  EndChunk(&fileData, riffSize);
+
+  *outPath = MakeTempPath(".sf2");
+  return WriteAllBytes(*outPath, fileData);
+}
+
+static bool CreateInvalidSf2File(std::string *outPath) {
+  if (!outPath)
+    return false;
+  *outPath = MakeTempPath(".sf2");
+  const std::vector<uint8_t> bytes = {'n','o','p','e'};
+  return WriteAllBytes(*outPath, bytes);
+}
 
 static NormalizedEvent MakeEvent(EventKind kind, uint8_t channel, uint8_t note,
                                  uint8_t velocity, int64_t targetSample,
@@ -316,7 +498,7 @@ static bool TestEngineRenderProducesAudioAndRetiresRelease() {
 static bool TestSamplerEngineShell() {
   VirtuallySuperSamplerEngine engine;
   SamplerInitParams params;
-  params.sourcePath = "gm.sf2";
+  params.sourcePath = "prototype.vs";
   params.sampleRate = 44100;
   params.maxVoices = 8;
   params.runtimeSettings.velocityCurve = 2.4f;
@@ -373,7 +555,7 @@ static bool TestSamplerEngineShell() {
 static bool TestSamplerEngineIdleFastPath() {
   VirtuallySuperSamplerEngine engine;
   SamplerInitParams params;
-  params.sourcePath = "gm.sf2";
+  params.sourcePath = "prototype.vs";
   params.sampleRate = 44100;
   params.maxVoices = 8;
   params.runtimeSettings.velocityCurve = 2.4f;
@@ -406,6 +588,140 @@ static bool TestSamplerEngineIdleFastPath() {
     return false;
   if (diagnostics.virtuallySuperVoiceEquivalent != 0)
     return false;
+  return true;
+}
+
+static bool TestSoundFontRuntimeLoadsAndDispatches() {
+  std::string path;
+  if (!CreateMinimalSf2File(&path))
+    return false;
+
+  SoundFontRuntime runtime;
+  std::string warning;
+  const bool loaded = runtime.Load(path.c_str(), 44100, &warning);
+  DeleteFileA(path.c_str());
+  if (!loaded)
+    return false;
+  if (runtime.GetPresetCount() != 1 || runtime.GetRegionCount() != 1 ||
+      runtime.GetSampleCount() != 1) {
+    return false;
+  }
+
+  NormalizedEvent noteOn = MakeEvent(EventKind::NoteOn, 0, 60, 100, 0, 1);
+  SoundFontNoteInfo info;
+  if (!runtime.PrepareNoteOn(noteOn, &info) || !info.valid)
+    return false;
+  const float neutralStep = info.phaseStep;
+
+  NormalizedEvent bend = MakeEvent(EventKind::PitchBend, 0, 0, 127, 0, 2);
+  bend.value = 127;
+  if (!runtime.HandleEvent(bend))
+    return false;
+  if (!runtime.PrepareNoteOn(noteOn, &info) || info.phaseStep <= neutralStep)
+    return false;
+
+  NormalizedEvent program = MakeEvent(EventKind::ProgramChange, 0, 5, 0, 0, 3);
+  if (!runtime.HandleEvent(program))
+    return false;
+  if (runtime.PrepareNoteOn(noteOn, &info))
+    return false;
+
+  return true;
+}
+
+static bool TestSoundFontInvalidFileFails() {
+  std::string path;
+  if (!CreateInvalidSf2File(&path))
+    return false;
+
+  VirtuallySuperSamplerEngine engine;
+  SamplerInitParams params;
+  params.sourcePath = path;
+  params.sampleRate = 44100;
+  params.maxVoices = 8;
+  params.runtimeSettings.velocityCurve = 2.4f;
+  params.runtimeSettings.velocityFloor = 0.0f;
+  params.runtimeSettings.velocityIgnoreBelow = 0;
+  params.runtimeSettings.asyncNoteStarts = true;
+  params.runtimeSettings.eventTimingMode = EventTimingMode::ACCURATE;
+
+  const bool initialized = engine.Initialize(params);
+  DeleteFileA(path.c_str());
+  if (initialized)
+    return false;
+
+  SamplerDiagnostics diagnostics = engine.GetDiagnostics();
+  if (diagnostics.samplerStateCode !=
+          (unsigned int)SamplerRuntimeStateCode::FAILED ||
+      diagnostics.failedSampleCount == 0) {
+    return false;
+  }
+  return true;
+}
+
+static bool TestSamplerEngineNativeSf2Playback() {
+  std::string path;
+  if (!CreateMinimalSf2File(&path))
+    return false;
+
+  VirtuallySuperSamplerEngine engine;
+  SamplerInitParams params;
+  params.sourcePath = path;
+  params.sampleRate = 44100;
+  params.maxVoices = 8;
+  params.runtimeSettings.velocityCurve = 2.4f;
+  params.runtimeSettings.velocityFloor = 0.0f;
+  params.runtimeSettings.velocityIgnoreBelow = 0;
+  params.runtimeSettings.asyncNoteStarts = true;
+  params.runtimeSettings.eventTimingMode = EventTimingMode::ACCURATE;
+
+  if (!engine.Initialize(params)) {
+    DeleteFileA(path.c_str());
+    return false;
+  }
+
+  engine.SetRenderWindow(0, 64, 44100, 0, 0, false);
+  engine.BeginRenderBlock();
+
+  MidiEvent program = {};
+  program.type = MidiEvent::PROGRAM_CHANGE;
+  program.channel = 0;
+  program.data1 = 0;
+  program.sequence = 1;
+  program.targetSample = 0;
+  engine.ProcessMidiEvent(program);
+
+  MidiEvent on = {};
+  on.type = MidiEvent::NOTE_ON;
+  on.channel = 0;
+  on.data1 = 60;
+  on.data2 = 120;
+  on.sequence = 2;
+  on.targetSample = 0;
+  engine.ProcessMidiEvent(on);
+
+  float buffer[128] = {};
+  engine.Render(buffer, 64);
+  DeleteFileA(path.c_str());
+
+  bool hasAudio = false;
+  for (size_t i = 0; i < sizeof(buffer) / sizeof(buffer[0]); ++i) {
+    if (buffer[i] != 0.0f) {
+      hasAudio = true;
+      break;
+    }
+  }
+  if (!hasAudio)
+    return false;
+
+  SamplerDiagnostics diagnostics = engine.GetDiagnostics();
+  if (diagnostics.loadedSampleCount != 1 ||
+      diagnostics.virtuallySuperLoadedPresets != 1 ||
+      diagnostics.virtuallySuperLoadedRegions != 1 ||
+      diagnostics.virtuallySuperExactMode != 1 ||
+      diagnostics.virtuallySuperExactVoices == 0) {
+    return false;
+  }
   return true;
 }
 
@@ -515,6 +831,10 @@ int main() {
        TestEngineRenderProducesAudioAndRetiresRelease},
       {"sampler engine shell", TestSamplerEngineShell},
       {"sampler engine idle fast path", TestSamplerEngineIdleFastPath},
+      {"soundfont runtime loads and dispatches",
+       TestSoundFontRuntimeLoadsAndDispatches},
+      {"soundfont invalid file fails", TestSoundFontInvalidFileFails},
+      {"sampler engine native sf2 playback", TestSamplerEngineNativeSf2Playback},
       {"scene compiler actions", TestSceneCompilerActions},
       {"telemetry publisher", TestTelemetryPublisher},
   };
