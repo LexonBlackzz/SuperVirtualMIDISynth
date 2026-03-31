@@ -1881,6 +1881,38 @@ void Synth::SetRenderBlockContext(unsigned long long blockStartSample,
                                   long long blockStartQpc, long long blockEndQpc,
                                   bool quantizedByPollingRate) {
   compat::LockGuard<compat::Mutex> lock(synthMutex);
+  const unsigned long long previousBlockStartSample = currentRenderBlockStartSample;
+  const long long previousBlockStartQpc = currentRenderBlockStartQpc;
+  const long long previousRenderEndSample =
+      renderProgressEndSample.load(std::memory_order_relaxed);
+  const bool timelineRewound =
+      (previousRenderEndSample > 0 &&
+       (blockStartSample == 0 ||
+        (long long)blockStartSample + (blockFrames > 0 ? blockFrames : 0) <
+            previousRenderEndSample));
+  const bool qpcRewound =
+      previousBlockStartQpc != 0 && blockStartQpc != 0 &&
+      blockStartQpc < previousBlockStartQpc;
+
+  if (timelineRewound || qpcRewound) {
+    compat::LockGuard<compat::Mutex> queueLock(eventQueueMutex);
+    ResetScheduledStateLocked();
+    overloadState = 0;
+    consecutiveOverloadBlocks = 0;
+    lastAsyncLagState = 0;
+    lastSchedulerLagSamples = 0;
+    lastSchedulerLateEvents = 0;
+    lastSchedulerDueEvents = 0;
+    accurateReleaseLaneDepth = 0;
+    accurateIngressDepth = 0;
+    accurateControlsCoalesced = 0;
+    accurateCatchupPrevented = 0;
+    LogTimingDebug(
+        "SVMS: Render timeline rewind detected sample=%llu prev=%llu qpc=%lld prevQpc=%lld, resetting accurate session state\n",
+        blockStartSample, previousBlockStartSample, blockStartQpc,
+        previousBlockStartQpc);
+  }
+
   currentRenderBlockStartSample = blockStartSample;
   currentRenderBlockStartQpc = blockStartQpc;
   currentRenderBlockEndQpc = blockEndQpc;
