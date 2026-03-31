@@ -36,6 +36,21 @@ struct RuntimeSettings {
 
 enum class SamplerEngineId { AUTO, TSF, SFZ, BASSMIDI, VIRTUALLYSUPER };
 
+enum class SamplerRuntimeStateCode {
+  UNINITIALIZED = 0,
+  READY = 1,
+  ACTIVE = 2,
+  FAILED = 3
+};
+
+enum class SamplerErrorCode {
+  NONE = 0,
+  INIT_FAILED = 1,
+  INVALID_CONFIG = 2,
+  MISSING_RENDER_CONTEXT = 3,
+  TIMELINE_MISMATCH = 4
+};
+
 inline std::string NormalizeSamplerString(const std::string &value) {
   std::string normalized = value;
   std::transform(normalized.begin(), normalized.end(), normalized.begin(),
@@ -206,6 +221,8 @@ struct SamplerDiagnostics {
   unsigned int virtuallySuperDensityObjects;
   unsigned int virtuallySuperVoiceEquivalent;
   unsigned int virtuallySuperPressureLevel;
+  unsigned int samplerStateCode;
+  unsigned int samplerErrorCode;
   float midiProcessMs;
   float voiceStartMs;
   float sampleRenderMs;
@@ -254,6 +271,9 @@ struct SamplerDiagnostics {
         virtuallySuperExactVoices(0), virtuallySuperReleasedExactVoices(0),
         virtuallySuperGroupedObjects(0), virtuallySuperDensityObjects(0),
         virtuallySuperVoiceEquivalent(0), virtuallySuperPressureLevel(0),
+        samplerStateCode(
+            (unsigned int)SamplerRuntimeStateCode::UNINITIALIZED),
+        samplerErrorCode((unsigned int)SamplerErrorCode::NONE),
         midiProcessMs(0.0f),
         voiceStartMs(0.0f), sampleRenderMs(0.0f), schedulerSliceMs(0.0f),
         schedulerLagMs(0.0f), schedulerBlockStartSample(0) {
@@ -274,6 +294,17 @@ public:
                                    unsigned int schedulerLagState,
                                    unsigned int cadenceStreak,
                                    unsigned int scheduledPendingEvents) {}
+  virtual void SetRenderWindow(unsigned long long blockStartSample,
+                               int blockFrames, int sampleRate,
+                               long long blockStartQpc, long long blockEndQpc,
+                               bool quantizedByPollingRate) {
+    (void)blockStartSample;
+    (void)blockFrames;
+    (void)sampleRate;
+    (void)blockStartQpc;
+    (void)blockEndQpc;
+    (void)quantizedByPollingRate;
+  }
   virtual void BeginRenderBlock() = 0;
   virtual void EndRenderBlock() {}
   virtual void ProcessMidiEvent(const MidiEvent &event) = 0;

@@ -17,7 +17,12 @@ static uint8_t ClampMidiData(int value) {
 VirtuallySuperSamplerEngine::VirtuallySuperSamplerEngine()
     : prototype_(), initialized_(false), sampleRate_(44100),
       resolvedSourcePath_(), resolvedSourceFormat_(), runtimeSettings_(),
-      diagnostics_(), noteOnEventsThisBlock_(0), noteOffEventsThisBlock_(0) {
+      diagnostics_(), stateCode_(SamplerRuntimeStateCode::UNINITIALIZED),
+      errorCode_(SamplerErrorCode::NONE), noteOnEventsThisBlock_(0),
+      noteOffEventsThisBlock_(0), currentBlockStartSample_(0),
+      currentBlockFrames_(0), currentBlockStartQpc_(0), currentBlockEndQpc_(0),
+      currentBlockQuantized_(false), hasRenderWindow_(false),
+      renderCursorSample_(0) {
   runtimeSettings_.velocityCurve = 2.4f;
   runtimeSettings_.velocityFloor = 0.0f;
   runtimeSettings_.velocityIgnoreBelow = 0;
@@ -54,6 +59,16 @@ bool VirtuallySuperSamplerEngine::Initialize(const SamplerInitParams &params) {
                          config.exact.maxVoices / 4u);
 
   initialized_ = prototype_.Initialize(config);
+  if (initialized_) {
+    SetStateLocked(SamplerRuntimeStateCode::READY, SamplerErrorCode::NONE,
+                   "VirtuallySuper host prototype active. Synthetic audio is "
+                   "enabled; real SoundFont/sample playback is not implemented "
+                   "yet.");
+  } else {
+    SetStateLocked(SamplerRuntimeStateCode::FAILED,
+                   SamplerErrorCode::INIT_FAILED,
+                   "VirtuallySuper failed to initialize its prototype runtime.");
+  }
   ResetPerBlockStatsLocked();
   return initialized_;
 }
@@ -64,6 +79,15 @@ void VirtuallySuperSamplerEngine::Shutdown(bool waitForThreads) {
   prototype_.Reset();
   resolvedSourcePath_.clear();
   resolvedSourceFormat_.clear();
+  currentBlockStartSample_ = 0;
+  currentBlockFrames_ = 0;
+  currentBlockStartQpc_ = 0;
+  currentBlockEndQpc_ = 0;
+  currentBlockQuantized_ = false;
+  hasRenderWindow_ = false;
+  renderCursorSample_ = 0;
+  SetStateLocked(SamplerRuntimeStateCode::UNINITIALIZED, SamplerErrorCode::NONE,
+                 "VirtuallySuper is not initialized.");
   ResetPerBlockStatsLocked();
 }
 
@@ -72,6 +96,9 @@ void VirtuallySuperSamplerEngine::Reset() {
   if (!initialized_)
     return;
   prototype_.Reset();
+  renderCursorSample_ = 0;
+  SetStateLocked(SamplerRuntimeStateCode::READY, SamplerErrorCode::NONE,
+                 "VirtuallySuper reset cleanly.");
   ResetPerBlockStatsLocked();
 }
 
@@ -81,9 +108,29 @@ void VirtuallySuperSamplerEngine::ReloadRuntimeSettings(
   runtimeSettings_ = settings;
 }
 
+void VirtuallySuperSamplerEngine::SetRenderWindow(
+    unsigned long long blockStartSample, int blockFrames, int sampleRate,
+    long long blockStartQpc, long long blockEndQpc,
+    bool quantizedByPollingRate) {
+  compat::LockGuard<compat::Mutex> lock(engineMutex);
+  currentBlockStartSample_ = blockStartSample;
+  currentBlockFrames_ = blockFrames > 0 ? blockFrames : 0;
+  currentBlockStartQpc_ = blockStartQpc;
+  currentBlockEndQpc_ = blockEndQpc;
+  currentBlockQuantized_ = quantizedByPollingRate;
+  if (sampleRate > 0)
+    sampleRate_ = sampleRate;
+  hasRenderWindow_ = true;
+}
+
 void VirtuallySuperSamplerEngine::BeginRenderBlock() {
   compat::LockGuard<compat::Mutex> lock(engineMutex);
   ResetPerBlockStatsLocked();
+  renderCursorSample_ = (long long)currentBlockStartSample_;
+  if (initialized_) {
+    SetStateLocked(SamplerRuntimeStateCode::ACTIVE, SamplerErrorCode::NONE,
+                   diagnostics_.lastWarning.c_str());
+  }
 }
 
 void VirtuallySuperSamplerEngine::ProcessMidiEvent(const MidiEvent &event) {
@@ -122,13 +169,26 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
   QueryPerformanceFrequency(&freq);
   QueryPerformanceCounter(&start);
 
+  if (!hasRenderWindow_) {
+    SetStateLocked(
+        SamplerRuntimeStateCode::FAILED,
+        SamplerErrorCode::MISSING_RENDER_CONTEXT,
+        "VirtuallySuper did not receive a render timeline context from the "
+        "host.");
+    return;
+  }
+
+  const long long blockStartSample = renderCursorSample_;
+  const long long blockEndSample = blockStartSample + numFrames;
+
   prototype_.FlushPendingIngress(virtuallysuper::kDefaultIngressCapacity);
 
-  int64_t renderUntilSample = numFrames;
-  const size_t applied =
-      prototype_.ApplyScheduledWindow(0, numFrames, numFrames, &renderUntilSample);
+  int64_t renderUntilSample = blockEndSample;
+  const size_t applied = prototype_.ApplyScheduledWindow(
+      blockStartSample, blockEndSample, blockEndSample, &renderUntilSample);
 
   prototype_.RenderBlock(output, numFrames, sampleRate_);
+  renderCursorSample_ = blockEndSample;
 
   QueryPerformanceCounter(&end);
   diagnostics_.sampleRenderMs =
@@ -170,6 +230,15 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
   diagnostics_.virtuallySuperDensityObjects = snapshot.densityObjects;
   diagnostics_.virtuallySuperVoiceEquivalent = snapshot.voiceEquivalent;
   diagnostics_.virtuallySuperPressureLevel = snapshot.overloadPressureLevel;
+  diagnostics_.samplerStateCode = (unsigned int)stateCode_;
+  diagnostics_.samplerErrorCode = (unsigned int)errorCode_;
+  diagnostics_.schedulerBlockStartSample = currentBlockStartSample_;
+  if (stateCode_ != SamplerRuntimeStateCode::FAILED) {
+    SetStateLocked(SamplerRuntimeStateCode::ACTIVE, SamplerErrorCode::NONE,
+                   "VirtuallySuper host prototype active. Synthetic audio is "
+                   "enabled; real SoundFont/sample playback is not implemented "
+                   "yet.");
+  }
 }
 
 std::string VirtuallySuperSamplerEngine::GetResolvedSourcePath() const {
@@ -220,10 +289,8 @@ DWORD VirtuallySuperSamplerEngine::GetActiveVoiceStats(DWORD *channelCounts,
 SamplerDiagnostics VirtuallySuperSamplerEngine::GetDiagnostics() const {
   compat::LockGuard<compat::Mutex> lock(engineMutex);
   SamplerDiagnostics copy = diagnostics_;
-  copy.lastWarning =
-      "VirtuallySuper prototype shell active. Deterministic prototype audio "
-      "rendering is enabled, but real SoundFont/sample playback is not "
-      "implemented yet.";
+  copy.samplerStateCode = (unsigned int)stateCode_;
+  copy.samplerErrorCode = (unsigned int)errorCode_;
   return copy;
 }
 
@@ -262,7 +329,22 @@ VirtuallySuperSamplerEngine::ConvertMidiEvent(const MidiEvent &event) const {
 }
 
 void VirtuallySuperSamplerEngine::ResetPerBlockStatsLocked() {
+  std::string lastWarning = diagnostics_.lastWarning;
   diagnostics_ = SamplerDiagnostics();
+  diagnostics_.lastWarning = lastWarning;
   noteOnEventsThisBlock_ = 0;
   noteOffEventsThisBlock_ = 0;
+  diagnostics_.samplerStateCode = (unsigned int)stateCode_;
+  diagnostics_.samplerErrorCode = (unsigned int)errorCode_;
+}
+
+void VirtuallySuperSamplerEngine::SetStateLocked(SamplerRuntimeStateCode stateCode,
+                                                 SamplerErrorCode errorCode,
+                                                 const char *warningText) {
+  stateCode_ = stateCode;
+  errorCode_ = errorCode;
+  diagnostics_.samplerStateCode = (unsigned int)stateCode_;
+  diagnostics_.samplerErrorCode = (unsigned int)errorCode_;
+  if (warningText)
+    diagnostics_.lastWarning = warningText;
 }

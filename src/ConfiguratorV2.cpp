@@ -111,7 +111,8 @@ void DisconnectBridge() {
 }
 
 bool LegacyBridgeExists() {
-  const char *legacyMappings[] = {SVMS_LIVE_BRIDGE_MAPPING_NAME_V19,
+  const char *legacyMappings[] = {SVMS_LIVE_BRIDGE_MAPPING_NAME_V20,
+                                  SVMS_LIVE_BRIDGE_MAPPING_NAME_V19,
                                   SVMS_LIVE_BRIDGE_MAPPING_NAME_V18};
   for (size_t i = 0; i < sizeof(legacyMappings) / sizeof(legacyMappings[0]);
        ++i) {
@@ -198,6 +199,28 @@ std::string GetWindowString(HWND hwnd) {
   return buffer;
 }
 
+std::string GetComboSelectionString(HWND hwnd) {
+  if (!hwnd)
+    return std::string();
+  int selected = (int)SendMessageA(hwnd, CB_GETCURSEL, 0, 0);
+  if (selected != CB_ERR) {
+    char buffer[SVMS_MAX_BACKEND_TEXT] = {};
+    SendMessageA(hwnd, CB_GETLBTEXT, selected, reinterpret_cast<LPARAM>(buffer));
+    return std::string(buffer);
+  }
+  return GetWindowString(hwnd);
+}
+
+void SelectComboString(HWND hwnd, const char *text) {
+  if (!hwnd)
+    return;
+  LRESULT result =
+      SendMessageA(hwnd, CB_SELECTSTRING, (WPARAM)-1,
+                   reinterpret_cast<LPARAM>(text ? text : ""));
+  if (result == CB_ERR)
+    SetWindowTextA(hwnd, text ? text : "");
+}
+
 void PopulateSamplerEngineCombo(HWND comboBox) {
   SendMessageA(comboBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("auto"));
   SendMessageA(comboBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("tsf"));
@@ -211,7 +234,7 @@ void PopulateSamplerEngineCombo(HWND comboBox) {
 }
 
 void SeedEditorsFromSnapshot(const LiveBridgeSharedState &snapshot) {
-  SetWindowTextA(g_ui.engineCombo, snapshot.currentSettings.samplerEngine);
+  SelectComboString(g_ui.engineCombo, snapshot.currentSettings.samplerEngine);
   SetEditText(g_ui.sourceEdit,
               snapshot.resolvedSoundfontPath[0]
                   ? snapshot.resolvedSoundfontPath
@@ -246,7 +269,8 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
       "Source %s\r\n"
       "Render %.3f ms   Block %.3f ms / budget %.3f ms\r\n"
       "Voices %lu   Queue %lu   Overload %lu\r\n"
-      "VirtuallySuper   Exact %lu   Grouped %lu   Density %lu   VoiceEq %lu   Pressure %lu",
+      "VirtuallySuper   Exact %lu   Grouped %lu   Density %lu   VoiceEq %lu   Pressure %lu   State %lu   Err %lu\r\n"
+      "Warning %s",
       snapshot.resolvedSamplerEngine[0] ? snapshot.resolvedSamplerEngine
                                         : snapshot.currentSettings.samplerEngine,
       snapshot.resolvedAudioBackend[0] ? snapshot.resolvedAudioBackend
@@ -267,7 +291,10 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
       static_cast<unsigned long>(
           snapshot.currentStats.virtuallySuperVoiceEquivalent),
       static_cast<unsigned long>(
-          snapshot.currentStats.virtuallySuperPressureLevel));
+          snapshot.currentStats.virtuallySuperPressureLevel),
+      static_cast<unsigned long>(snapshot.currentStats.samplerStateCode),
+      static_cast<unsigned long>(snapshot.currentStats.samplerErrorCode),
+      snapshot.samplerLastWarning[0] ? snapshot.samplerLastWarning : "None");
   SetEditText(g_ui.homeSummary, summary);
 
   char diagnostics[1200];
@@ -279,7 +306,9 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
       "Same-key pending %lu   max depth %lu\r\n"
       "Events processed %lu   NoteOn started %lu   NoteOff %lu\r\n"
       "VS released exact %lu   grouped %lu   density %lu   voice eq %lu\r\n"
-      "VS pressure %lu   scheduler queue %lu   sampler warning count %lu",
+      "VS pressure %lu   state %lu   err %lu\r\n"
+      "Scheduler queue %lu   sampler warning count %lu\r\n"
+      "Warning %s",
       snapshot.currentStats.synthRenderAvgMs,
       snapshot.currentStats.synthRenderPeakMs,
       snapshot.currentStats.audioBlockAvgMs,
@@ -304,9 +333,12 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
           snapshot.currentStats.virtuallySuperVoiceEquivalent),
       static_cast<unsigned long>(
           snapshot.currentStats.virtuallySuperPressureLevel),
+      static_cast<unsigned long>(snapshot.currentStats.samplerStateCode),
+      static_cast<unsigned long>(snapshot.currentStats.samplerErrorCode),
       static_cast<unsigned long>(
           snapshot.currentStats.schedulerPendingSameKeyTransitions),
-      static_cast<unsigned long>(snapshot.currentStats.samplerWarningCount));
+      static_cast<unsigned long>(snapshot.currentStats.samplerWarningCount),
+      snapshot.samplerLastWarning[0] ? snapshot.samplerLastWarning : "None");
   SetEditText(g_ui.diagSummary, diagnostics);
 
   char perChannel[512];
@@ -349,7 +381,7 @@ void PollLiveState() {
 void BuildSettingsFromUi(LiveBridgeSettings &settings) {
   settings = g_ui.lastSnapshot.currentSettings;
   CopyCString(settings.samplerEngine, sizeof(settings.samplerEngine),
-              GetWindowString(g_ui.engineCombo).c_str());
+              GetComboSelectionString(g_ui.engineCombo).c_str());
 }
 
 LONG DetermineApplyCommand(const LiveBridgeSettings &settings,
