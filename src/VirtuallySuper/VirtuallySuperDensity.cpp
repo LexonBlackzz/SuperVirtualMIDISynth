@@ -1,10 +1,25 @@
 #include "VirtuallySuperDensity.h"
 
+namespace {
+
+static float DensityPan(uint32_t channel, uint32_t note) {
+  const uint32_t index = (channel * 17u + note * 13u) & 15u;
+  return ((float)index / 7.5f) - 1.0f;
+}
+
+static void DensityStereoGains(float pan, float *left, float *right) {
+  const float clamped = pan < -1.0f ? -1.0f : (pan > 1.0f ? 1.0f : pan);
+  *left = 0.5f * (1.0f - clamped * 0.35f);
+  *right = 0.5f * (1.0f + clamped * 0.35f);
+}
+
+} // namespace
+
 namespace virtuallysuper {
 
 DensitySystem::DensitySystem()
     : config_(), initialized_(false), nextDensityId_(1), objects_(), freeList_(),
-      freeCount_(0), stats_() {}
+      activeHandles_(), activeCount_(0), freeCount_(0), stats_() {}
 
 bool DensitySystem::Initialize(const DensityConfig &config) {
   if (config.maxObjects == 0 || config.pitchBandSemitones == 0 ||
@@ -14,6 +29,7 @@ bool DensitySystem::Initialize(const DensityConfig &config) {
 
   config_ = config;
   objects_.assign(config_.maxObjects, DensityObject());
+  activeHandles_.assign(config_.maxObjects, 0);
   freeList_.assign(config_.maxObjects, 0);
   initialized_ = true;
   Reset();
@@ -22,6 +38,7 @@ bool DensitySystem::Initialize(const DensityConfig &config) {
 
 void DensitySystem::Reset() {
   nextDensityId_ = 1;
+  activeCount_ = 0;
   freeCount_ = (uint32_t)objects_.size();
   stats_ = DensityStats();
 
@@ -35,12 +52,8 @@ void DensitySystem::BeginWindow() {
   if (!initialized_)
     return;
 
-  freeCount_ = (uint32_t)objects_.size();
+  ReleaseActiveObjects();
   stats_.activeObjects = 0;
-  for (uint32_t i = 0; i < freeCount_; ++i) {
-    objects_[i] = DensityObject();
-    freeList_[i] = freeCount_ - 1U - i;
-  }
 }
 
 bool DensitySystem::AccumulateEvent(const NormalizedEvent &event) {
@@ -84,6 +97,14 @@ const DensityObject *DensitySystem::GetDensityObject(uint32_t handle) const {
   return &objects_[handle];
 }
 
+uint32_t DensitySystem::GetActiveHandleCount() const { return activeCount_; }
+
+uint32_t DensitySystem::GetActiveHandle(uint32_t index) const {
+  if (index >= activeCount_)
+    return kInvalidVoiceHandle;
+  return activeHandles_[index];
+}
+
 bool DensitySystem::MatchesObject(const DensityObject &object,
                                   const NormalizedEvent &event,
                                   uint32_t pitchBandId,
@@ -96,9 +117,10 @@ bool DensitySystem::MatchesObject(const DensityObject &object,
 uint32_t DensitySystem::FindOrAllocateObject(const NormalizedEvent &event,
                                              uint32_t pitchBandId,
                                              uint32_t timingBucketId) {
-  for (uint32_t i = 0; i < objects_.size(); ++i) {
-    if (MatchesObject(objects_[i], event, pitchBandId, timingBucketId))
-      return i;
+  for (uint32_t i = 0; i < activeCount_; ++i) {
+    const uint32_t handle = activeHandles_[i];
+    if (MatchesObject(objects_[handle], event, pitchBandId, timingBucketId))
+      return handle;
   }
 
   if (freeCount_ == 0)
@@ -113,7 +135,11 @@ uint32_t DensitySystem::FindOrAllocateObject(const NormalizedEvent &event,
   object.sampleFamilyId = 0;
   object.densityId = nextDensityId_++;
   object.timingBucketId = timingBucketId;
+  object.activeListIndex = activeCount_;
   object.grainJitterSeed = MakeDeterministicSeed(event, pitchBandId, timingBucketId);
+  DensityStereoGains(DensityPan(event.channel, pitchBandId * 12u),
+                     &object.leftGain, &object.rightGain);
+  activeHandles_[activeCount_++] = handle;
 
   ++stats_.activeObjects;
   if (stats_.activeObjects > stats_.peakActiveObjects)
@@ -140,6 +166,15 @@ uint32_t DensitySystem::MakeDeterministicSeed(const NormalizedEvent &event,
   if (seed == 0)
     seed = 1;
   return seed;
+}
+
+void DensitySystem::ReleaseActiveObjects() {
+  for (uint32_t i = 0; i < activeCount_; ++i) {
+    const uint32_t handle = activeHandles_[i];
+    objects_[handle] = DensityObject();
+    freeList_[freeCount_++] = handle;
+  }
+  activeCount_ = 0;
 }
 
 } // namespace virtuallysuper

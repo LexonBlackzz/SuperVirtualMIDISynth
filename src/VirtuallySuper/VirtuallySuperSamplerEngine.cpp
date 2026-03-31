@@ -1,6 +1,7 @@
 #include "VirtuallySuperSamplerEngine.h"
 
 #include <algorithm>
+#include <string.h>
 
 namespace {
 
@@ -18,8 +19,9 @@ VirtuallySuperSamplerEngine::VirtuallySuperSamplerEngine()
     : prototype_(), initialized_(false), sampleRate_(44100),
       resolvedSourcePath_(), resolvedSourceFormat_(), runtimeSettings_(),
       diagnostics_(), stateCode_(SamplerRuntimeStateCode::UNINITIALIZED),
-      errorCode_(SamplerErrorCode::NONE), noteOnEventsThisBlock_(0),
-      noteOffEventsThisBlock_(0), currentBlockStartSample_(0),
+      errorCode_(SamplerErrorCode::NONE), idleFastPathHits_(0),
+      noteOnEventsThisBlock_(0), noteOffEventsThisBlock_(0),
+      currentBlockStartSample_(0),
       currentBlockFrames_(0), currentBlockStartQpc_(0), currentBlockEndQpc_(0),
       currentBlockQuantized_(false), hasRenderWindow_(false),
       renderCursorSample_(0) {
@@ -51,9 +53,12 @@ bool VirtuallySuperSamplerEngine::Initialize(const SamplerInitParams &params) {
   config.exact.maxVoices =
       params.maxVoices > 0 ? (uint32_t)params.maxVoices
                            : virtuallysuper::kDefaultExactVoiceCapacity;
+  config.exact.sampleRate =
+      params.sampleRate > 0 ? (uint32_t)params.sampleRate : 44100u;
   config.grouped.maxGroups =
       std::max<uint32_t>(virtuallysuper::kDefaultGroupedCapacity,
                          config.exact.maxVoices / 2u);
+  config.grouped.sampleRate = config.exact.sampleRate;
   config.density.maxObjects =
       std::max<uint32_t>(virtuallysuper::kDefaultDensityCapacity,
                          config.exact.maxVoices / 4u);
@@ -86,6 +91,7 @@ void VirtuallySuperSamplerEngine::Shutdown(bool waitForThreads) {
   currentBlockQuantized_ = false;
   hasRenderWindow_ = false;
   renderCursorSample_ = 0;
+  idleFastPathHits_ = 0;
   SetStateLocked(SamplerRuntimeStateCode::UNINITIALIZED, SamplerErrorCode::NONE,
                  "VirtuallySuper is not initialized.");
   ResetPerBlockStatsLocked();
@@ -157,26 +163,65 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
   if (!output || numFrames <= 0)
     return;
 
-  std::fill(output, output + numFrames * 2, 0.0f);
-
   compat::LockGuard<compat::Mutex> lock(engineMutex);
-  if (!initialized_)
+  if (!initialized_) {
+    memset(output, 0, (size_t)numFrames * 2u * sizeof(float));
     return;
+  }
+
+  if (!hasRenderWindow_) {
+    memset(output, 0, (size_t)numFrames * 2u * sizeof(float));
+    SetStateLocked(
+        SamplerRuntimeStateCode::FAILED,
+        SamplerErrorCode::MISSING_RENDER_CONTEXT,
+        "VirtuallySuper did not receive a render timeline context from the "
+        "host.");
+    diagnostics_.sampleRenderMs = 0.0f;
+    diagnostics_.virtuallySuperIdleFastPathHits = idleFastPathHits_;
+    return;
+  }
+
+  if (prototype_.CanIdleFastPath()) {
+    memset(output, 0, (size_t)numFrames * 2u * sizeof(float));
+    ++idleFastPathHits_;
+    diagnostics_.sampleRenderMs = 0.0f;
+    diagnostics_.eventsProcessedThisBlock = 0;
+    diagnostics_.noteOnEventsThisBlock = noteOnEventsThisBlock_;
+    diagnostics_.noteOffEventsThisBlock = noteOffEventsThisBlock_;
+    diagnostics_.queuedMidiEvents = 0;
+    diagnostics_.schedulerDueEventsThisBlock = 0;
+    diagnostics_.schedulerPendingSameKeyTransitions = 0;
+    diagnostics_.schedulerMaxSameKeyQueueDepth =
+        prototype_.GetScheduler().GetStats().maxTransitionQueueDepth;
+    diagnostics_.schedulerNoteOnsCoalescedThisBlock =
+        prototype_.GetScheduler().GetStats().coalescedEvents;
+    diagnostics_.accuratePeakScheduledEvents =
+        prototype_.GetScheduler().GetStats().maxScheduledDepth;
+    diagnostics_.loadedSampleCount = 0;
+    diagnostics_.failedSampleCount = 0;
+    diagnostics_.overloadState = 0;
+    diagnostics_.virtuallySuperExactVoices = 0;
+    diagnostics_.virtuallySuperReleasedExactVoices = 0;
+    diagnostics_.virtuallySuperGroupedObjects = 0;
+    diagnostics_.virtuallySuperDensityObjects = 0;
+    diagnostics_.virtuallySuperVoiceEquivalent = 0;
+    diagnostics_.virtuallySuperPressureLevel = 0;
+    diagnostics_.virtuallySuperIdleFastPathHits = idleFastPathHits_;
+    diagnostics_.virtuallySuperExactVisitedThisBlock = 0;
+    diagnostics_.virtuallySuperGroupedVisitedThisBlock = 0;
+    diagnostics_.virtuallySuperDensityVisitedThisBlock = 0;
+    diagnostics_.samplerStateCode = (unsigned int)stateCode_;
+    diagnostics_.samplerErrorCode = (unsigned int)errorCode_;
+    return;
+  }
+
+  memset(output, 0, (size_t)numFrames * 2u * sizeof(float));
 
   LARGE_INTEGER freq = {};
   LARGE_INTEGER start = {};
   LARGE_INTEGER end = {};
   QueryPerformanceFrequency(&freq);
   QueryPerformanceCounter(&start);
-
-  if (!hasRenderWindow_) {
-    SetStateLocked(
-        SamplerRuntimeStateCode::FAILED,
-        SamplerErrorCode::MISSING_RENDER_CONTEXT,
-        "VirtuallySuper did not receive a render timeline context from the "
-        "host.");
-    return;
-  }
 
   const long long blockStartSample = renderCursorSample_;
   const long long blockEndSample = blockStartSample + numFrames;
@@ -230,6 +275,13 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
   diagnostics_.virtuallySuperDensityObjects = snapshot.densityObjects;
   diagnostics_.virtuallySuperVoiceEquivalent = snapshot.voiceEquivalent;
   diagnostics_.virtuallySuperPressureLevel = snapshot.overloadPressureLevel;
+  diagnostics_.virtuallySuperIdleFastPathHits = idleFastPathHits_;
+  diagnostics_.virtuallySuperExactVisitedThisBlock =
+      prototype_.GetLatestRenderStats().exactVoicesVisited;
+  diagnostics_.virtuallySuperGroupedVisitedThisBlock =
+      prototype_.GetLatestRenderStats().groupedObjectsVisited;
+  diagnostics_.virtuallySuperDensityVisitedThisBlock =
+      prototype_.GetLatestRenderStats().densityObjectsVisited;
   diagnostics_.samplerStateCode = (unsigned int)stateCode_;
   diagnostics_.samplerErrorCode = (unsigned int)errorCode_;
   diagnostics_.schedulerBlockStartSample = currentBlockStartSample_;
@@ -332,6 +384,7 @@ void VirtuallySuperSamplerEngine::ResetPerBlockStatsLocked() {
   std::string lastWarning = diagnostics_.lastWarning;
   diagnostics_ = SamplerDiagnostics();
   diagnostics_.lastWarning = lastWarning;
+  diagnostics_.virtuallySuperIdleFastPathHits = idleFastPathHits_;
   noteOnEventsThisBlock_ = 0;
   noteOffEventsThisBlock_ = 0;
   diagnostics_.samplerStateCode = (unsigned int)stateCode_;

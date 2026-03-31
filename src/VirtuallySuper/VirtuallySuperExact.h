@@ -47,7 +47,8 @@ private:
   void UnlinkQueue(uint32_t handle);
   ExactQueueClass ClassifyQueue(const ExactVoice &voice) const;
   void ReclassifyVoiceQueue(uint32_t handle);
-  void UpdateStatsAfterStateChange();
+  void AddVoiceState(ExactLifecycleState state);
+  void RemoveVoiceState(ExactLifecycleState state);
 
   ExactConfig config_;
   bool initialized_;
