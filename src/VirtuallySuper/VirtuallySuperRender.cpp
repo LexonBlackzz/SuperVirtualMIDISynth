@@ -39,32 +39,45 @@ static bool AdvanceSampleVoice(virtuallysuper::ExactVoice *voice, float *sampleO
   if (!voice || !sampleOut || !voice->sampleData)
     return false;
 
-  float phase = voice->phase;
-  if (phase < (float)voice->sampleStart)
-    phase = (float)voice->sampleStart;
+  if (voice->sampleEnd <= voice->sampleStart + 1u)
+    return false;
 
-  uint32_t baseIndex = (uint32_t)phase;
-  if (baseIndex + 1u >= voice->sampleEnd) {
+  float phase = voice->phase;
+  if (phase < 0.0f)
+    phase = 0.0f;
+
+  const uint32_t relativeSampleEnd = voice->sampleEnd - voice->sampleStart;
+  const uint32_t relativeLoopStart =
+      voice->loopStart > voice->sampleStart ? voice->loopStart - voice->sampleStart
+                                            : 0u;
+  const uint32_t relativeLoopEnd =
+      voice->loopEnd > voice->sampleStart ? voice->loopEnd - voice->sampleStart
+                                          : 0u;
+
+  uint32_t baseOffset = (uint32_t)phase;
+  if (baseOffset + 1u >= relativeSampleEnd) {
     if (!ShouldLoopVoice(*voice))
       return false;
-    phase = (float)voice->loopStart;
-    baseIndex = voice->loopStart;
+    phase = (float)relativeLoopStart;
+    baseOffset = relativeLoopStart;
   }
 
+  uint32_t baseIndex = voice->sampleStart + baseOffset;
   uint32_t nextIndex = baseIndex + 1u;
   if (ShouldLoopVoice(*voice) && nextIndex >= voice->loopEnd)
     nextIndex = voice->loopStart;
   if (nextIndex >= voice->sampleEnd)
     nextIndex = voice->sampleEnd - 1u;
 
-  const float frac = phase - (float)baseIndex;
+  const float frac = phase - (float)baseOffset;
   const float s0 = voice->sampleData[baseIndex];
   const float s1 = voice->sampleData[nextIndex];
   *sampleOut = s0 + (s1 - s0) * frac;
 
   phase += voice->phaseStep;
-  if (ShouldLoopVoice(*voice) && phase >= (float)voice->loopEnd) {
-    phase = (float)voice->loopStart + (phase - (float)voice->loopEnd);
+  if (ShouldLoopVoice(*voice) && phase >= (float)relativeLoopEnd) {
+    phase =
+        (float)relativeLoopStart + (phase - (float)relativeLoopEnd);
   }
   voice->phase = phase;
   return true;

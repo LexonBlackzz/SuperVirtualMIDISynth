@@ -289,7 +289,9 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
       voice.loopStart = info.loopStart;
       voice.loopEnd = info.loopEnd;
       voice.loopMode = info.loopMode;
-      voice.phase = (float)info.sampleStart;
+      // Keep sample-backed phase relative to sampleStart so a float cursor
+      // retains sub-sample precision even when the packed SF2 smpl chunk is large.
+      voice.phase = 0.0f;
       voice.phaseStep = info.phaseStep;
       voice.targetGain = info.initialGain;
       voice.leftGain = info.leftGain;

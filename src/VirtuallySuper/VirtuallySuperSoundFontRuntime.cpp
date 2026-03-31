@@ -246,14 +246,20 @@ bool SoundFontRuntime::FillNoteInfo(uint8_t channelIndex, uint8_t note,
   const SoundFontChannelState &channel = channels_[channelIndex];
   const SoundFontSample &sample = runtimeData_.samples[region.sampleIndex];
 
-  const int rootKey = region.rootKey >= 0 ? region.rootKey : (int)sample.originalPitch;
+  const float rootKey =
+      (float)(region.rootKey >= 0 ? region.rootKey : (int)sample.originalPitch);
   const float pitchBendSemitones =
       (((float)channel.pitchWheel - 8192.0f) / 8192.0f) * channel.pitchRange;
-  const float pitchCorrection = (float)sample.pitchCorrection * (1.0f / 100.0f);
-  const float semitoneOffset =
-      (((float)note - (float)rootKey) * ((float)region.keyTrack / 100.0f)) +
-      (float)region.coarseTune + ((float)region.fineTune * (1.0f / 100.0f)) +
-      channel.tuning + pitchBendSemitones - pitchCorrection;
+  const float noteTuneSemitones =
+      (float)region.coarseTune +
+      ((float)region.fineTune + (float)sample.pitchCorrection) *
+          (1.0f / 100.0f);
+  const float adjustedPitch =
+      rootKey +
+      ((((float)note + noteTuneSemitones) - rootKey) *
+       ((float)region.keyTrack / 100.0f)) +
+      channel.tuning + pitchBendSemitones;
+  const float semitoneOffset = adjustedPitch - rootKey;
   const float pitchRatio = powf(2.0f, semitoneOffset * (1.0f / 12.0f));
   const float sourceRate = (float)(region.sampleRate > 0 ? region.sampleRate : sample.sampleRate);
   const float outRate = (float)(outputSampleRate_ > 0 ? outputSampleRate_ : 44100u);
