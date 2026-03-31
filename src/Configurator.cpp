@@ -251,7 +251,8 @@ void DisconnectBridge() {
 }
 
 bool LegacyBridgeExists() {
-  const char *legacyMappings[] = {SVMS_LIVE_BRIDGE_MAPPING_NAME_V18,
+  const char *legacyMappings[] = {SVMS_LIVE_BRIDGE_MAPPING_NAME_V19,
+                                  SVMS_LIVE_BRIDGE_MAPPING_NAME_V18,
                                   SVMS_LIVE_BRIDGE_MAPPING_NAME_V17,
                                   SVMS_LIVE_BRIDGE_MAPPING_NAME_V16,
                                   SVMS_LIVE_BRIDGE_MAPPING_NAME_V15,
@@ -652,6 +653,26 @@ void UpdateUiFromSnapshot(const LiveBridgeSharedState &snapshot) {
     strncat(summaryBuffer, perfBuffer,
             sizeof(summaryBuffer) - strlen(summaryBuffer) - 1);
   }
+  if (_stricmp(resolvedSampler, "virtuallysuper") == 0) {
+    char vsBuffer[320];
+    sprintf(
+        vsBuffer,
+        "\r\nVirtuallySuper   Exact %lu   Released %lu   Grouped %lu   Density %lu   VoiceEq %lu   Pressure %lu",
+        static_cast<unsigned long>(
+            snapshot.currentStats.virtuallySuperExactVoices),
+        static_cast<unsigned long>(
+            snapshot.currentStats.virtuallySuperReleasedExactVoices),
+        static_cast<unsigned long>(
+            snapshot.currentStats.virtuallySuperGroupedObjects),
+        static_cast<unsigned long>(
+            snapshot.currentStats.virtuallySuperDensityObjects),
+        static_cast<unsigned long>(
+            snapshot.currentStats.virtuallySuperVoiceEquivalent),
+        static_cast<unsigned long>(
+            snapshot.currentStats.virtuallySuperPressureLevel));
+    strncat(summaryBuffer, vsBuffer,
+            sizeof(summaryBuffer) - strlen(summaryBuffer) - 1);
+  }
   SetEditText(g_ui.liveSummary, summaryBuffer, true);
   {
     char resolvedSource[SVMS_MAX_PATH_TEXT + 32];
@@ -951,6 +972,8 @@ void PopulateSamplerEngineCombo(HWND comboBox) {
   SendMessageA(comboBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("tsf"));
   SendMessageA(comboBox, CB_ADDSTRING, 0,
                reinterpret_cast<LPARAM>("bassmidi"));
+  SendMessageA(comboBox, CB_ADDSTRING, 0,
+               reinterpret_cast<LPARAM>("virtuallysuper"));
 #ifndef SVMS_LEGACY_XP
   SendMessageA(comboBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("sfz"));
 #endif

@@ -108,8 +108,16 @@ engines while the new engine is designed and prototyped in parallel.
 - [x] Add first density prototype
 - [x] Add first tile-oriented prototype render backbone
 - [x] Add first overload-aware scene reduction prototype
-- [ ] Wire Configurator to prototype telemetry
-- [ ] Decide when the new engine is ready for side-by-side runtime integration
+- [x] Wire existing live bridge and current Configurator to prototype telemetry
+- [x] Add separate native Win32 `Configurator V2` shell
+- [x] Make `VirtuallySuper` buildable in the normal `x86` and `x64` MSVC DLL
+      targets
+- [x] Land first host-usable side-by-side runtime integration through the
+      current synth engine-selection path
+- [ ] Add real sample or SoundFont playback to replace prototype-synthetic
+      rendering
+- [ ] Decide when `VirtuallySuper` is ready to become a serious side-by-side
+      engine candidate rather than a host-usable prototype
 
 ## Exit Criteria For First Public Prototype
 

@@ -158,11 +158,18 @@ void VirtuallySuperSamplerEngine::Render(float *output, int numFrames) {
 
   const virtuallysuper::TelemetrySnapshot &snapshot =
       prototype_.GetLatestTelemetrySnapshot();
-  diagnostics_.loadedSampleCount = snapshot.groupedObjects;
-  diagnostics_.failedSampleCount = snapshot.densityObjects;
+  diagnostics_.loadedSampleCount = 0;
+  diagnostics_.failedSampleCount = 0;
   diagnostics_.schedulerPendingSameKeyTransitions =
       snapshot.schedulerQueuedEvents;
   diagnostics_.overloadState = snapshot.overloadPressureLevel;
+  diagnostics_.virtuallySuperExactVoices = snapshot.exactVoices;
+  diagnostics_.virtuallySuperReleasedExactVoices =
+      snapshot.releasedExactVoices;
+  diagnostics_.virtuallySuperGroupedObjects = snapshot.groupedObjects;
+  diagnostics_.virtuallySuperDensityObjects = snapshot.densityObjects;
+  diagnostics_.virtuallySuperVoiceEquivalent = snapshot.voiceEquivalent;
+  diagnostics_.virtuallySuperPressureLevel = snapshot.overloadPressureLevel;
 }
 
 std::string VirtuallySuperSamplerEngine::GetResolvedSourcePath() const {

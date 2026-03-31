@@ -126,4 +126,9 @@ This file is intended to be updated as work lands.
 - [x] Prototype `ISamplerEngine` shell added for current synth integration
 - [x] Prototype tile render backbone added for audible runtime validation
 - [x] Overload-aware scene tier selection prototype added
-- [ ] Prototype telemetry wired for Configurator consumption
+- [x] Prototype telemetry wired through the live bridge for Configurator
+      consumption
+- [x] Minimal current Configurator support added for `virtuallysuper`
+- [x] Separate native Win32 `Configurator V2` shell added
+- [x] Main `x86` and `x64` MSVC DLL builds include `VirtuallySuper`
+- [ ] Real sample or SoundFont playback path integrated into `VirtuallySuper`

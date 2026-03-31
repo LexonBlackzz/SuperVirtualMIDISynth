@@ -549,6 +549,18 @@ void LiveRuntime::PublishSnapshot() {
       samplerDiagnostics.schedulerCacheRebuilds;
   sharedState->currentStats.schedulerTrimHeapTombstonePrunes =
       samplerDiagnostics.schedulerTrimHeapTombstonePrunes;
+  sharedState->currentStats.virtuallySuperExactVoices =
+      samplerDiagnostics.virtuallySuperExactVoices;
+  sharedState->currentStats.virtuallySuperReleasedExactVoices =
+      samplerDiagnostics.virtuallySuperReleasedExactVoices;
+  sharedState->currentStats.virtuallySuperGroupedObjects =
+      samplerDiagnostics.virtuallySuperGroupedObjects;
+  sharedState->currentStats.virtuallySuperDensityObjects =
+      samplerDiagnostics.virtuallySuperDensityObjects;
+  sharedState->currentStats.virtuallySuperVoiceEquivalent =
+      samplerDiagnostics.virtuallySuperVoiceEquivalent;
+  sharedState->currentStats.virtuallySuperPressureLevel =
+      samplerDiagnostics.virtuallySuperPressureLevel;
   sharedState->currentStats.schedulerSliceMs =
       samplerDiagnostics.schedulerSliceMs;
   sharedState->currentStats.schedulerLagMs =

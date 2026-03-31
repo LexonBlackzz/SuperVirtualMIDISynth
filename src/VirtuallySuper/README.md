@@ -69,12 +69,16 @@ This slice is intentionally limited:
 Current scope:
 
 - selectable by engine name in source/config as `virtuallysuper`
+- included in the normal `x86` and `x64` MSVC DLL builds
 - event ingress and runtime state reachable through the current synth layer
-- diagnostics and active-voice reporting available
+- diagnostics and active-voice reporting available through the existing live
+  bridge
+- current Configurator can display minimal `VirtuallySuper` summary data
+- separate `Configurator V2` shell can attach and display compact live
+  diagnostics
 - deterministic prototype audio rendering available
 - render path is still synthetic and does not use SoundFont/sample playback yet
 
-So the shell is integrated, and the prototype now renders audible output, but
-the real sampler/audio path is not finished yet.
-
-It is not integrated into the existing playback path yet.
+So the shell is integrated into the current playback path and the prototype now
+renders audible output, but the real sampler or SoundFont playback path is not
+finished yet.
