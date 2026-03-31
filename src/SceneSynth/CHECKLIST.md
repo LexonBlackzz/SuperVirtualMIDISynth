@@ -122,5 +122,5 @@ This file is intended to be updated as work lands.
 - [x] First scheduler-only prototype started in `src/VirtuallySuper`
 - [x] First exact-tier-only prototype started
 - [x] First grouped rendering prototype started
-- [ ] First density prototype started
+- [x] First density prototype started
 - [ ] Prototype telemetry wired for Configurator consumption

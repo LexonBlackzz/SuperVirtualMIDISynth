@@ -57,10 +57,13 @@ if errorlevel 1 exit /b %errorlevel%
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperGrouped.cpp" /Fo"%OBJDIR%\VirtuallySuperGrouped.obj"
 if errorlevel 1 exit /b %errorlevel%
 
+cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperDensity.cpp" /Fo"%OBJDIR%\VirtuallySuperDensity.obj"
+if errorlevel 1 exit /b %errorlevel%
+
 cl %CXXFLAGS% /c "%ROOT%\src\VirtuallySuper\VirtuallySuperScheduler.cpp" /Fo"%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
-lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperGrouped.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
+lib /nologo /OUT:"%OUTDIR%\VirtuallySuperPrototype.lib" "%OBJDIR%\VirtuallySuperEngine.obj" "%OBJDIR%\VirtuallySuperExact.obj" "%OBJDIR%\VirtuallySuperGrouped.obj" "%OBJDIR%\VirtuallySuperDensity.obj" "%OBJDIR%\VirtuallySuperScheduler.obj"
 if errorlevel 1 exit /b %errorlevel%
 
 echo Built "%OUTDIR%\VirtuallySuperPrototype.lib"
