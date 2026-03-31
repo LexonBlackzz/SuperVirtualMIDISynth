@@ -1,4 +1,5 @@
 #include "VirtuallySuperEngine.h"
+#include "VirtuallySuperDensity.h"
 #include "VirtuallySuperGrouped.h"
 
 #include <stdio.h>
@@ -150,6 +151,67 @@ static bool TestGroupedPrototypeBuckets() {
   return true;
 }
 
+static bool TestDensityPrototypeClouds() {
+  DensitySystem density;
+  DensityConfig config;
+  config.maxObjects = 8;
+  config.pitchBandSemitones = 12;
+  config.timingBucketSamples = 16;
+  config.activationThreshold = 3;
+  config.saturationK = 4;
+  if (!density.Initialize(config))
+    return false;
+
+  density.BeginWindow();
+  if (!density.AccumulateEvent(MakeEvent(EventKind::NoteOn, 0, 60, 90, 0, 1)))
+    return false;
+  if (!density.AccumulateEvent(MakeEvent(EventKind::NoteOn, 0, 61, 80, 4, 2)))
+    return false;
+  if (!density.AccumulateEvent(MakeEvent(EventKind::NoteOn, 0, 62, 70, 8, 3)))
+    return false;
+
+  if (density.GetActiveObjectCount() != 1)
+    return false;
+  const DensityObject *object = density.GetObject(0);
+  if (!object || object->representedNoteCount != 3)
+    return false;
+  if (object->saturatedGain <= 0.0f || object->saturatedGain >= 1.0f)
+    return false;
+  if (object->grainJitterSeed == 0)
+    return false;
+  if (density.GetStats().promotedClouds != 1)
+    return false;
+  return true;
+}
+
+static bool TestEngineDensityAccumulation() {
+  EnginePrototype engine;
+  EngineConfig config;
+  config.scheduler.ingressCapacity = 16;
+  config.scheduler.scheduledCapacity = 16;
+  config.exact.maxVoices = 8;
+  config.grouped.maxGroups = 8;
+  config.density.maxObjects = 8;
+  config.density.pitchBandSemitones = 12;
+  config.density.timingBucketSamples = 16;
+  config.density.activationThreshold = 2;
+  if (!engine.Initialize(config))
+    return false;
+
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 60, 100, 0, 1));
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 61, 90, 2, 2));
+  engine.FlushPendingIngress(16);
+
+  int64_t renderUntil = 0;
+  if (engine.ApplyScheduledWindow(0, 100, 100, &renderUntil) != 2)
+    return false;
+  if (engine.GetDensitySystem().GetActiveObjectCount() != 1)
+    return false;
+  if (engine.GetDensitySystem().GetStats().promotedClouds != 1)
+    return false;
+  return true;
+}
+
 int main() {
   const struct {
     const char *name;
@@ -159,6 +221,8 @@ int main() {
       {"engine apply window and note off", TestEngineApplyWindowAndNoteOff},
       {"quiet release steal", TestQuietReleaseSteal},
       {"grouped prototype buckets", TestGroupedPrototypeBuckets},
+      {"density prototype clouds", TestDensityPrototypeClouds},
+      {"engine density accumulation", TestEngineDensityAccumulation},
   };
 
   for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {

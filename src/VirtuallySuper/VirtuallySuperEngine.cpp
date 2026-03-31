@@ -3,12 +3,13 @@
 namespace virtuallysuper {
 
 EnginePrototype::EnginePrototype()
-    : scheduler_(), exact_(), grouped_(), initialized_(false), drainBatch_() {}
+    : scheduler_(), exact_(), grouped_(), density_(), initialized_(false),
+      drainBatch_() {}
 
 bool EnginePrototype::Initialize(const EngineConfig &config) {
   initialized_ =
       scheduler_.Initialize(config.scheduler) && exact_.Initialize(config.exact) &&
-      grouped_.Initialize(config.grouped);
+      grouped_.Initialize(config.grouped) && density_.Initialize(config.density);
   return initialized_;
 }
 
@@ -24,6 +25,7 @@ void EnginePrototype::Reset() {
   scheduler_.Reset();
   exact_.Reset();
   grouped_.Reset();
+  density_.Reset();
 }
 
 ScheduleDecision EnginePrototype::SubmitEvent(const NormalizedEvent &event) {
@@ -51,6 +53,7 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
   size_t totalApplied = 0;
   int64_t localRenderUntil = blockEndSample;
   grouped_.BeginWindow();
+  density_.BeginWindow();
 
   while (true) {
     const size_t drained = scheduler_.DrainScheduledWindow(
@@ -66,6 +69,7 @@ size_t EnginePrototype::ApplyScheduledWindow(int64_t cursorSample,
     for (size_t i = 0; i < drained; ++i) {
       exact_.ApplyEvent(drainBatch_[i]);
       grouped_.AccumulateEvent(drainBatch_[i]);
+      density_.AccumulateEvent(drainBatch_[i]);
     }
 
     totalApplied += drained;
@@ -101,5 +105,11 @@ const GroupedSystem &EnginePrototype::GetGroupedSystem() const {
 }
 
 GroupedSystem &EnginePrototype::GetGroupedSystem() { return grouped_; }
+
+const DensitySystem &EnginePrototype::GetDensitySystem() const {
+  return density_;
+}
+
+DensitySystem &EnginePrototype::GetDensitySystem() { return density_; }
 
 } // namespace virtuallysuper
