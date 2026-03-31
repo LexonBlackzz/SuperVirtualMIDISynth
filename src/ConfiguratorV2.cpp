@@ -248,6 +248,7 @@ void DrawPlaceholderField(const char *label, const char *value);
 void DrawModeSelector();
 const char *ModeName(int mode);
 void RenderStatusPill(const char *label, const ImVec4 &color);
+bool DrawActionButtonWrapped(const char *label, const ImVec2 &size);
 bool ComboFromValue(const char *label, char *buffer, size_t capacity,
                     const char *const *items, int itemCount);
 void InputIntClamped(const char *label, LONG *value, LONG minValue,
@@ -758,13 +759,19 @@ void BuildAdvancedText(char *buffer, size_t capacity) {
 
 void DrawModeSelector() {
   static const int modes[] = {VIEW_BASIC, VIEW_ADVANCED, VIEW_POWERUSER, VIEW_DEVELOPER};
+  const float availableWidth = ImGui::GetContentRegionAvail().x;
+  float buttonWidth = (availableWidth - 24.0f) / 4.0f;
+  if (buttonWidth < 88.0f)
+    buttonWidth = 88.0f;
+  if (buttonWidth > 132.0f)
+    buttonWidth = 132.0f;
   for (int i = 0; i < 4; ++i) {
     if (i > 0)
       ImGui::SameLine();
     const bool selected = g_ui.currentMode == modes[i];
     if (selected)
       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.27f, 0.36f, 0.72f, 1.0f));
-    if (ImGui::Button(ModeName(modes[i]), ImVec2(110.0f, 0.0f)))
+    if (ImGui::Button(ModeName(modes[i]), ImVec2(buttonWidth, 0.0f)))
       g_ui.currentMode = modes[i];
     if (selected)
       ImGui::PopStyleColor();
@@ -782,8 +789,21 @@ void RenderStatusPill(const char *label, const ImVec4 &color) {
   ImGui::PopStyleColor(3);
 }
 
+bool DrawActionButtonWrapped(const char *label, const ImVec2 &size) {
+  const float neededWidth =
+      size.x + ImGui::GetStyle().ItemSpacing.x;
+  if (ImGui::GetCursorPosX() > ImGui::GetStyle().WindowPadding.x &&
+      neededWidth > ImGui::GetContentRegionAvail().x) {
+    ImGui::NewLine();
+  }
+  const bool pressed = ImGui::Button(label, size);
+  if (ImGui::GetContentRegionAvail().x > neededWidth)
+    ImGui::SameLine();
+  return pressed;
+}
+
 void RenderHeaderBar() {
-  ImGui::BeginChild("HeaderBar", ImVec2(0, 96), true, ImGuiWindowFlags_NoScrollbar);
+  ImGui::BeginChild("HeaderBar", ImVec2(0, 128), true, ImGuiWindowFlags_NoScrollbar);
   const bool online = g_ui.connected;
   const ImVec4 onlineColor =
       online ? ImVec4(0.18f, 0.65f, 0.38f, 1.0f)
@@ -812,39 +832,48 @@ void RenderHeaderBar() {
                   g_ui.lastSnapshot.currentStats.audioBudgetMs;
   }
 
-  ImGui::TextUnformatted("VirtuallySuper Control Center");
-  ImGui::SameLine();
-  RenderStatusPill(online ? "ONLINE" : "OFFLINE", onlineColor);
-  ImGui::SameLine();
-  RenderStatusPill(g_ui.versionMismatch ? "PROTOCOL MISMATCH" : "PROTOCOL OK",
-                   protocolColor);
-  ImGui::SameLine();
-  ImGui::TextDisabled("Engine %s", engineName);
-  ImGui::SameLine();
-  ImGui::TextDisabled("| Profile Not wired yet");
-  ImGui::SameLine();
-  ImGui::TextDisabled("| Output %s @ %ld Hz", backendName,
-                      (long)g_ui.pendingSettings.sampleRate);
-  ImGui::SameLine();
-  if (online) {
-    ImGui::TextDisabled("| Voices %lu / Eq %lu / %s",
-                        (unsigned long)g_ui.lastSnapshot.currentStats.totalActiveVoices,
-                        (unsigned long)g_ui.lastSnapshot.currentStats.virtuallySuperVoiceEquivalent,
-                        GetLoadStatus(loadPercent));
-  } else {
-    ImGui::TextDisabled("| Voices unavailable");
+  if (ImGui::BeginTable("HeaderLayout", 2,
+                        ImGuiTableFlags_SizingStretchProp |
+                            ImGuiTableFlags_BordersInnerV)) {
+    ImGui::TableSetupColumn("Summary", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+    ImGui::TableSetupColumn("Mode", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted("VirtuallySuper Control Center");
+    ImGui::SameLine();
+    RenderStatusPill(online ? "ONLINE" : "OFFLINE", onlineColor);
+    ImGui::SameLine();
+    RenderStatusPill(g_ui.versionMismatch ? "PROTOCOL MISMATCH" : "PROTOCOL OK",
+                     protocolColor);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.67f, 0.71f, 0.79f, 1.0f));
+    ImGui::TextWrapped("Engine %s | Profile Not wired yet | Output %s @ %ld Hz | %s",
+                       engineName, backendName, (long)g_ui.pendingSettings.sampleRate,
+                       online ? "Live bridge attached" : "Waiting for bridge");
+    if (online) {
+      ImGui::TextWrapped("Voices %lu | VoiceEq %lu | Load %s | Overload %s",
+                         (unsigned long)g_ui.lastSnapshot.currentStats.totalActiveVoices,
+                         (unsigned long)g_ui.lastSnapshot.currentStats.virtuallySuperVoiceEquivalent,
+                         GetLoadStatus(loadPercent),
+                         GetOverloadStatus(g_ui.lastSnapshot.currentStats.overloadState));
+    } else {
+      ImGui::TextWrapped("Voices unavailable");
+    }
+    ImGui::PopStyleColor();
+
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted("Mode");
+    DrawModeSelector();
+    ImGui::TextDisabled("%s surfaces are visible.", ModeName(g_ui.currentMode));
+
+    ImGui::EndTable();
   }
-  ImGui::SameLine();
-  ImGui::TextDisabled("| Mode");
-  ImGui::SameLine();
-  DrawModeSelector();
   ImGui::Separator();
   ImGui::TextWrapped(
       "%s",
       online ? g_ui.lastSnapshot.statusText
              : (g_ui.disconnectedStatus[0] ? g_ui.disconnectedStatus
                                            : "Waiting for synth"));
-  ImGui::TextDisabled("Source: %s", sourcePath);
+  ImGui::TextWrapped("Source: %s", sourcePath);
   ImGui::EndChild();
 }
 
@@ -881,31 +910,28 @@ void RenderHomeTab() {
                      : LIVE_CMD_APPLY_SOFT;
   const char *applyLabel =
       applyCommand == LIVE_CMD_APPLY_HEAVY ? "Apply Heavy" : "Apply Soft";
-  if (ImGui::Button(applyLabel, ImVec2(120, 0)) && g_ui.connected) {
+  if (DrawActionButtonWrapped(applyLabel, ImVec2(120, 0)) && g_ui.connected) {
     std::string message;
     SendCommandAndWait(applyCommand, g_ui.pendingSettings, message);
     CopyCString(g_ui.actionMessage, sizeof(g_ui.actionMessage), message.c_str());
   }
-  ImGui::SameLine();
-  if (ImGui::Button("Reload Config", ImVec2(140, 0)) && g_ui.connected) {
+  if (DrawActionButtonWrapped("Reload Config", ImVec2(140, 0)) && g_ui.connected) {
     LiveBridgeSettings emptySettings;
     memset(&emptySettings, 0, sizeof(emptySettings));
     std::string message;
     SendCommandAndWait(LIVE_CMD_RELOAD_CONFIG, emptySettings, message);
     CopyCString(g_ui.actionMessage, sizeof(g_ui.actionMessage), message.c_str());
   }
-  ImGui::SameLine();
-  if (ImGui::Button("Hard Reset", ImVec2(120, 0)) && g_ui.connected) {
+  if (DrawActionButtonWrapped("Hard Reset", ImVec2(120, 0)) && g_ui.connected) {
     LiveBridgeSettings emptySettings;
     memset(&emptySettings, 0, sizeof(emptySettings));
     std::string message;
     SendCommandAndWait(LIVE_CMD_RESET_ENGINE, emptySettings, message);
     CopyCString(g_ui.actionMessage, sizeof(g_ui.actionMessage), message.c_str());
   }
-  ImGui::SameLine();
   ImGui::BeginDisabled();
-  ImGui::Button("Rescan SoundFonts", ImVec2(150, 0));
-  ImGui::Button("Open Debug Window", ImVec2(150, 0));
+  DrawActionButtonWrapped("Rescan SoundFonts", ImVec2(150, 0));
+  DrawActionButtonWrapped("Open Debug Window", ImVec2(150, 0));
   ImGui::EndDisabled();
   if (g_ui.actionMessage[0])
     HelpText(g_ui.actionMessage);
@@ -1147,8 +1173,7 @@ void RenderUI() {
   ImGui::SetNextWindowSize(io.DisplaySize);
   ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                           ImGuiWindowFlags_NoBringToFrontOnFocus |
-                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+                           ImGuiWindowFlags_NoBringToFrontOnFocus;
   ImGui::Begin("SVMSRoot", NULL, flags);
   RenderHeaderBar();
 
