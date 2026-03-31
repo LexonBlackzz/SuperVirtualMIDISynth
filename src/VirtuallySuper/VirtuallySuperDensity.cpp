@@ -68,9 +68,15 @@ bool DensitySystem::AccumulateEvent(const NormalizedEvent &event) {
   return true;
 }
 
+const DensityConfig &DensitySystem::GetConfig() const { return config_; }
+
 const DensityStats &DensitySystem::GetStats() const { return stats_; }
 
 uint32_t DensitySystem::GetActiveObjectCount() const { return stats_.activeObjects; }
+
+uint32_t DensitySystem::GetObjectCapacity() const {
+  return (uint32_t)objects_.size();
+}
 
 const DensityObject *DensitySystem::GetDensityObject(uint32_t handle) const {
   if (handle >= objects_.size())

@@ -106,6 +106,7 @@ engines while the new engine is designed and prototyped in parallel.
 - [x] Build first exact-tier-only prototype
 - [x] Add grouped rendering prototype
 - [x] Add first density prototype
+- [x] Add first tile-oriented prototype render backbone
 - [ ] Wire Configurator to prototype telemetry
 - [ ] Decide when the new engine is ready for side-by-side runtime integration
 

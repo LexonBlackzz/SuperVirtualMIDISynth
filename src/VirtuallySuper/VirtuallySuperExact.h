@@ -21,8 +21,12 @@ public:
   uint32_t GetActiveVoiceCount() const;
   uint32_t GetReleasedVoiceCount() const;
   const ExactStats &GetStats() const;
+  const ExactConfig &GetConfig() const;
   const ExactVoice *GetVoice(uint32_t handle) const;
+  ExactVoice *GetMutableVoice(uint32_t handle);
   uint32_t GetKeyHead(uint32_t channel, uint32_t note) const;
+  uint32_t GetQueueHead(ExactQueueClass queueClass) const;
+  void RetireVoice(uint32_t handle);
 
 private:
   struct QueueState {

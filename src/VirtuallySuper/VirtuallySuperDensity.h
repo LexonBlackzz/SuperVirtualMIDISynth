@@ -16,8 +16,10 @@ public:
   void BeginWindow();
   bool AccumulateEvent(const NormalizedEvent &event);
 
+  const DensityConfig &GetConfig() const;
   const DensityStats &GetStats() const;
   uint32_t GetActiveObjectCount() const;
+  uint32_t GetObjectCapacity() const;
   const DensityObject *GetDensityObject(uint32_t handle) const;
 
 private:

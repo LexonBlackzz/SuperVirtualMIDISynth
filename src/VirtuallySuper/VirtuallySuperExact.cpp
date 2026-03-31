@@ -1,5 +1,19 @@
 #include "VirtuallySuperExact.h"
 
+#include <math.h>
+
+namespace {
+
+static float MidiNoteToFrequencyHz(uint8_t note) {
+  return 440.0f * powf(2.0f, ((float)note - 69.0f) * (1.0f / 12.0f));
+}
+
+static float VelocityToGain(uint8_t velocity) {
+  return ((float)velocity / 127.0f) * 0.045f;
+}
+
+} // namespace
+
 namespace virtuallysuper {
 
 ExactSystem::ExactSystem()
@@ -101,7 +115,15 @@ uint32_t ExactSystem::GetReleasedVoiceCount() const {
 
 const ExactStats &ExactSystem::GetStats() const { return stats_; }
 
+const ExactConfig &ExactSystem::GetConfig() const { return config_; }
+
 const ExactVoice *ExactSystem::GetVoice(uint32_t handle) const {
+  if (handle >= voices_.size())
+    return 0;
+  return &voices_[handle];
+}
+
+ExactVoice *ExactSystem::GetMutableVoice(uint32_t handle) {
   if (handle >= voices_.size())
     return 0;
   return &voices_[handle];
@@ -109,6 +131,24 @@ const ExactVoice *ExactSystem::GetVoice(uint32_t handle) const {
 
 uint32_t ExactSystem::GetKeyHead(uint32_t channel, uint32_t note) const {
   return keyHeads_[channel][note];
+}
+
+uint32_t ExactSystem::GetQueueHead(ExactQueueClass queueClass) const {
+  return queues_[(uint32_t)queueClass].head;
+}
+
+void ExactSystem::RetireVoice(uint32_t handle) {
+  if (handle >= voices_.size())
+    return;
+
+  ExactVoice &voice = voices_[handle];
+  if (voice.state == ExactLifecycleState::Free)
+    return;
+
+  UnlinkQueue(handle);
+  RemoveKeyVoice(handle);
+  ReleaseVoiceHandle(handle);
+  UpdateStatsAfterStateChange();
 }
 
 bool ExactSystem::AllocateVoiceHandle(uint32_t *handle, bool *stolen) {
@@ -176,6 +216,10 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
   voice.generation = ++generationCounters_[event.channel][event.note];
   voice.state = ExactLifecycleState::Active;
   voice.queueClass = ExactQueueClass::None;
+  voice.phase = 0.0f;
+  voice.frequencyHz = MidiNoteToFrequencyHz(event.note);
+  voice.currentGain = VelocityToGain(event.velocity);
+  voice.releaseDecay = 0.9985f;
 
   InsertKeyVoice(handle);
   ReclassifyVoiceQueue(handle);

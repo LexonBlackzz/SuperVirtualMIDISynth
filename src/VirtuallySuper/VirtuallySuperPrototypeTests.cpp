@@ -3,6 +3,7 @@
 #include "VirtuallySuperGrouped.h"
 #include "VirtuallySuperSamplerEngine.h"
 #include "VirtuallySuperScene.h"
+#include "VirtuallySuperTelemetry.h"
 
 #include <stdio.h>
 
@@ -214,6 +215,53 @@ static bool TestEngineDensityAccumulation() {
   return true;
 }
 
+static bool TestEngineRenderProducesAudioAndRetiresRelease() {
+  EnginePrototype engine;
+  EngineConfig config;
+  config.scheduler.ingressCapacity = 16;
+  config.scheduler.scheduledCapacity = 16;
+  config.exact.maxVoices = 4;
+  config.grouped.maxGroups = 8;
+  config.density.maxObjects = 8;
+  config.density.activationThreshold = 2;
+  if (!engine.Initialize(config))
+    return false;
+
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 60, 100, 0, 1));
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOn, 0, 61, 90, 2, 2));
+  engine.FlushPendingIngress(16);
+
+  int64_t renderUntil = 0;
+  if (engine.ApplyScheduledWindow(0, 256, 256, &renderUntil) != 2)
+    return false;
+
+  float buffer[512] = {};
+  engine.RenderBlock(buffer, 256, 44100);
+
+  bool hasAudio = false;
+  for (size_t i = 0; i < sizeof(buffer) / sizeof(buffer[0]); ++i) {
+    if (buffer[i] != 0.0f) {
+      hasAudio = true;
+      break;
+    }
+  }
+  if (!hasAudio)
+    return false;
+
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOff, 0, 60, 0, 260, 3));
+  engine.SubmitEvent(MakeEvent(EventKind::NoteOff, 0, 61, 0, 262, 4));
+  engine.FlushPendingIngress(16);
+  if (engine.ApplyScheduledWindow(256, 4096, 4096, &renderUntil) != 2)
+    return false;
+
+  for (int i = 0; i < 32; ++i)
+    engine.RenderBlock(buffer, 256, 44100);
+
+  if (engine.GetExactSystem().GetReleasedVoiceCount() != 0)
+    return false;
+  return true;
+}
+
 static bool TestSamplerEngineShell() {
   VirtuallySuperSamplerEngine engine;
   SamplerInitParams params;
@@ -254,10 +302,15 @@ static bool TestSamplerEngineShell() {
   if (diagnostics.lastWarning.empty())
     return false;
 
+  bool hasAudio = false;
   for (size_t i = 0; i < sizeof(buffer) / sizeof(buffer[0]); ++i) {
-    if (buffer[i] != 0.0f)
-      return false;
+    if (buffer[i] != 0.0f) {
+      hasAudio = true;
+      break;
+    }
   }
+  if (!hasAudio)
+    return false;
 
   return true;
 }
@@ -293,6 +346,47 @@ static bool TestSceneCompilerActions() {
   return true;
 }
 
+static bool TestTelemetryPublisher() {
+  TelemetryPublisher telemetry;
+  SchedulerStats scheduler;
+  SceneStats scene;
+  ExactStats exact;
+  GroupedStats grouped;
+  DensityStats density;
+
+  scheduler.maxTransitionQueueDepth = 5;
+  scheduler.coalescedEvents = 2;
+  scene.exactActions = 3;
+  scene.groupedObservations = 4;
+  scene.densityObservations = 5;
+  exact.activeVoices = 6;
+  exact.releasedVoices = 1;
+  exact.steals = 2;
+  grouped.activeGroups = 7;
+  grouped.noteOnsAccumulated = 8;
+  density.activeObjects = 9;
+  density.noteOnsAccumulated = 10;
+  density.promotedClouds = 11;
+
+  telemetry.Publish(scheduler, scene, exact, grouped, density, 12, 13);
+  const TelemetrySnapshot &snapshot = telemetry.GetLatestSnapshot();
+  if (snapshot.exactVoices != 6)
+    return false;
+  if (snapshot.groupedObjects != 7)
+    return false;
+  if (snapshot.densityObjects != 9)
+    return false;
+  if (snapshot.voiceEquivalent != 24)
+    return false;
+  if (snapshot.schedulerQueuedEvents != 12)
+    return false;
+  if (snapshot.lastAppliedEvents != 13)
+    return false;
+  if (telemetry.GetSharedState().sequence == 0)
+    return false;
+  return true;
+}
+
 int main() {
   const struct {
     const char *name;
@@ -304,8 +398,11 @@ int main() {
       {"grouped prototype buckets", TestGroupedPrototypeBuckets},
       {"density prototype clouds", TestDensityPrototypeClouds},
       {"engine density accumulation", TestEngineDensityAccumulation},
+      {"engine render produces audio and retires release",
+       TestEngineRenderProducesAudioAndRetiresRelease},
       {"sampler engine shell", TestSamplerEngineShell},
       {"scene compiler actions", TestSceneCompilerActions},
+      {"telemetry publisher", TestTelemetryPublisher},
   };
 
   for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
