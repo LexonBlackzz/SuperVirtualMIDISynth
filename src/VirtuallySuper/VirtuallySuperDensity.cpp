@@ -72,7 +72,7 @@ const DensityStats &DensitySystem::GetStats() const { return stats_; }
 
 uint32_t DensitySystem::GetActiveObjectCount() const { return stats_.activeObjects; }
 
-const DensityObject *DensitySystem::GetObject(uint32_t handle) const {
+const DensityObject *DensitySystem::GetDensityObject(uint32_t handle) const {
   if (handle >= objects_.size())
     return 0;
   return &objects_[handle];

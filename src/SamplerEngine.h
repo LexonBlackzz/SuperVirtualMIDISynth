@@ -34,7 +34,7 @@ struct RuntimeSettings {
   EventTimingMode eventTimingMode;
 };
 
-enum class SamplerEngineId { AUTO, TSF, SFZ, BASSMIDI };
+enum class SamplerEngineId { AUTO, TSF, SFZ, BASSMIDI, VIRTUALLYSUPER };
 
 inline std::string NormalizeSamplerString(const std::string &value) {
   std::string normalized = value;
@@ -71,6 +71,9 @@ inline SamplerEngineId ParseSamplerEngineId(const std::string &value) {
     return SamplerEngineId::SFZ;
   if (normalized == "bass" || normalized == "bassmidi")
     return SamplerEngineId::BASSMIDI;
+  if (normalized == "virtuallysuper" || normalized == "vs" ||
+      normalized == "scenesynth")
+    return SamplerEngineId::VIRTUALLYSUPER;
   return SamplerEngineId::AUTO;
 }
 
@@ -82,6 +85,8 @@ inline const char *SamplerEngineIdToConfigString(SamplerEngineId engineId) {
     return "sfz";
   case SamplerEngineId::BASSMIDI:
     return "bassmidi";
+  case SamplerEngineId::VIRTUALLYSUPER:
+    return "virtuallysuper";
   default:
     return "auto";
   }
@@ -95,6 +100,8 @@ inline const char *SamplerEngineIdToDisplayString(SamplerEngineId engineId) {
     return "SFZ";
   case SamplerEngineId::BASSMIDI:
     return "BASSMIDI";
+  case SamplerEngineId::VIRTUALLYSUPER:
+    return "VirtuallySuper";
   default:
     return "Auto";
   }

@@ -18,7 +18,7 @@ public:
 
   const DensityStats &GetStats() const;
   uint32_t GetActiveObjectCount() const;
-  const DensityObject *GetObject(uint32_t handle) const;
+  const DensityObject *GetDensityObject(uint32_t handle) const;
 
 private:
   bool MatchesObject(const DensityObject &object, const NormalizedEvent &event,
