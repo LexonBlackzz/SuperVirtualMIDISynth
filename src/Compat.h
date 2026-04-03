@@ -3,6 +3,45 @@
 
 #include <windows.h>
 
+// Windows 7 compatibility: GetSystemTimePreciseAsFileTime is only available on Windows 8+
+// We provide a fallback that uses GetSystemTimeAsFileTime on older systems
+#ifndef GetSystemTimePreciseAsFileTime
+#define SVMS_NEED_GETSYSTEMTIMEPRECISE 1
+#else
+#define SVMS_NEED_GETSYSTEMTIMEPRECISE 0
+#endif
+
+#if SVMS_NEED_GETSYSTEMTIMEPRECISE
+// Function pointer type for GetSystemTimePreciseAsFileTime
+typedef void (WINAPI *PFN_GetSystemTimePreciseAsFileTime)(LPFILETIME);
+
+// Runtime-initialized function pointer (will be NULL on Windows 7)
+extern PFN_GetSystemTimePreciseAsFileTime g_pfnGetSystemTimePreciseAsFileTime;
+
+// Initialize the function pointer (call once at startup)
+inline void CompatInitializeTimeFunctions() {
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    if (hKernel32) {
+        g_pfnGetSystemTimePreciseAsFileTime = 
+            (PFN_GetSystemTimePreciseAsFileTime)GetProcAddress(hKernel32, "GetSystemTimePreciseAsFileTime");
+    }
+}
+
+// Wrapper that uses precise time on Windows 8+, falls back to regular time on Windows 7
+inline void CompatGetSystemTimePreciseAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
+    if (g_pfnGetSystemTimePreciseAsFileTime != NULL) {
+        g_pfnGetSystemTimePreciseAsFileTime(lpSystemTimeAsFileTime);
+    } else {
+        GetSystemTimeAsFileTime(lpSystemTimeAsFileTime);
+    }
+}
+#else
+inline void CompatInitializeTimeFunctions() {}
+inline void CompatGetSystemTimePreciseAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
+    GetSystemTimePreciseAsFileTime(lpSystemTimeAsFileTime);
+}
+#endif
+
 #ifdef SVMS_LEGACY_XP
 namespace compat {
 

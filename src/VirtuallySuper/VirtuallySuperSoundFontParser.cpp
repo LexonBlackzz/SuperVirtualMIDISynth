@@ -91,6 +91,9 @@ struct ZoneSettings {
   int16_t attenuation;
   int16_t pan;
   int16_t attackVolEnv;
+  int16_t decayVolEnv;
+  int16_t sustainVolEnv;
+  int16_t holdVolEnv;
   int16_t releaseVolEnv;
   uint16_t sampleIndex;
   uint16_t instrumentIndex;
@@ -104,6 +107,9 @@ struct ZoneSettings {
   bool hasKeyRange;
   bool hasVelocityRange;
   bool hasAttack;
+  bool hasDecay;
+  bool hasSustain;
+  bool hasHold;
   bool hasRelease;
 
   ZoneSettings()
@@ -111,13 +117,14 @@ struct ZoneSettings {
         startCoarseOffset(0), endCoarseOffset(0), loopStartCoarseOffset(0),
         loopEndCoarseOffset(0), coarseTune(0), fineTune(0), keyTrack(100),
         rootKey(-1), exclusiveClass(0), attenuation(0), pan(0),
-        attackVolEnv(-32768), releaseVolEnv(-32768),
+        attackVolEnv(-32768), decayVolEnv(-32768), sustainVolEnv(-32768),
+        releaseVolEnv(-32768), holdVolEnv(-32768),
         sampleIndex(virtuallysuper::kInvalidSoundFontIndex),
         instrumentIndex(virtuallysuper::kInvalidSoundFontIndex),
         sampleModes(0), keyRange(), velocityRange(), hasInstrument(false),
         hasSample(false), hasSampleModes(false), hasRootKey(false),
         hasKeyRange(false), hasVelocityRange(false), hasAttack(false),
-        hasRelease(false) {}
+        hasDecay(false), hasSustain(false), hasRelease(false), hasHold(false) {}
 };
 
 static void CopyName21(char *dest, const uint8_t *src) {
@@ -174,9 +181,21 @@ static void ApplyGenerator(ZoneSettings &settings,
     settings.attackVolEnv = amount;
     settings.hasAttack = true;
     break;
+  case 35:
+    settings.decayVolEnv = amount;
+    settings.hasDecay = true;
+    break;
+  case 36:
+    settings.sustainVolEnv = amount;
+    settings.hasSustain = true;
+    break;
   case 38:
     settings.releaseVolEnv = amount;
     settings.hasRelease = true;
+    break;
+  case 39:
+    settings.holdVolEnv = amount;
+    settings.hasHold = true;
     break;
   case 41:
     settings.instrumentIndex = (uint16_t)generator.amount;
@@ -281,6 +300,18 @@ static void MergeSettings(ZoneSettings *dst, const ZoneSettings &src) {
   if (src.hasAttack) {
     dst->attackVolEnv = src.attackVolEnv;
     dst->hasAttack = true;
+  }
+  if (src.hasDecay) {
+    dst->decayVolEnv = src.decayVolEnv;
+    dst->hasDecay = true;
+  }
+  if (src.hasSustain) {
+    dst->sustainVolEnv = src.sustainVolEnv;
+    dst->hasSustain = true;
+  }
+  if (src.hasHold) {
+    dst->holdVolEnv = src.holdVolEnv;
+    dst->hasHold = true;
   }
   if (src.hasRelease) {
     dst->releaseVolEnv = src.releaseVolEnv;
@@ -439,10 +470,13 @@ static bool BuildRuntime(const std::vector<HydraPresetHeader> &presetHeaders,
         region.keyTrack = merged.keyTrack;
         region.attenuationDb = (float)merged.attenuation * 0.1f;
         region.pan = ClampFloat((float)merged.pan / 500.0f, -1.0f, 1.0f);
-        region.attackSeconds =
-            TimecentsToSeconds(merged.attackVolEnv, 0.0f);
-        region.releaseSeconds =
-            TimecentsToSeconds(merged.releaseVolEnv, 0.03f);
+        region.attackSeconds = TimecentsToSeconds(merged.attackVolEnv, 0.0f);
+        region.decaySeconds = TimecentsToSeconds(merged.decayVolEnv, 0.0f);
+        region.sustainLevel = merged.hasSustain
+            ? ClampFloat(1.0f - ((float)merged.sustainVolEnv / 1000.0f), 0.0f, 1.0f)
+            : 1.0f;
+        region.holdSeconds = TimecentsToSeconds(merged.holdVolEnv, 0.0f);
+        region.releaseSeconds = TimecentsToSeconds(merged.releaseVolEnv, 0.03f);
 
         if (region.sampleEnd <= region.sampleStart + 1u)
           continue;

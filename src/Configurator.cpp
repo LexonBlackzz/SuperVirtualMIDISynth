@@ -43,7 +43,22 @@ enum ControlId {
   IDC_APPLY,
   IDC_RELOAD,
   IDC_RESET,
-  IDC_KILL
+  IDC_KILL,
+  
+  // Advanced settings
+  IDC_OVERLOAD_SOFT_VOICE,
+  IDC_OVERLOAD_HARD_VOICE,
+  IDC_OVERLOAD_PANIC_VOICE,
+  IDC_OVERLOAD_SOFT_QUEUE,
+  IDC_OVERLOAD_HARD_QUEUE,
+  IDC_SCHEDULER_INGRESS,
+  IDC_SCHEDULER_SCHEDULED,
+  IDC_SCHEDULER_TRANSITION,
+  IDC_GROUPED_MAX,
+  IDC_DENSITY_MAX,
+  IDC_DENSITY_THRESHOLD,
+  IDC_VOICE_TILE_FRAMES,
+  IDC_ADVANCED_PANEL_TOGGLE
 };
 
 struct UiState {
@@ -80,6 +95,22 @@ struct UiState {
   HWND resetButton;
   HWND killButton;
   HWND velocityHint;
+  
+  // Advanced settings controls
+  HWND advancedPanelVisible;
+  HWND overloadSoftVoiceEdit;
+  HWND overloadHardVoiceEdit;
+  HWND overloadPanicVoiceEdit;
+  HWND overloadSoftQueueEdit;
+  HWND overloadHardQueueEdit;
+  HWND schedulerIngressEdit;
+  HWND schedulerScheduledEdit;
+  HWND schedulerTransitionEdit;
+  HWND groupedMaxEdit;
+  HWND densityMaxEdit;
+  HWND densityThresholdEdit;
+  HWND voiceTileFramesEdit;
+  
   HFONT titleFont;
   HFONT sectionFont;
   HFONT bodyFont;
@@ -103,6 +134,7 @@ struct UiState {
   bool seededEditors;
   bool smoothingSeeded;
   bool versionMismatch;
+  bool advancedPanelShown;
   float smoothedSynthRenderMs;
   float smoothedAudioBlockMs;
   float smoothedTotalVoices;
@@ -457,7 +489,12 @@ void EnableEditorControls(BOOL enabled) {
       g_ui.reverbFeedbackEdit,  g_ui.reverbToneEdit,      g_ui.reverbWidthEdit,
       g_ui.reverbBlurEdit,      g_ui.limiterEnableCheck,  g_ui.limiterThresholdEdit,
       g_ui.limiterReleaseEdit,  g_ui.applyButton,         g_ui.reloadButton,
-      g_ui.resetButton,         g_ui.killButton};
+      g_ui.resetButton,         g_ui.killButton,          g_ui.advancedPanelVisible,
+      g_ui.overloadSoftVoiceEdit, g_ui.overloadHardVoiceEdit, g_ui.overloadPanicVoiceEdit,
+      g_ui.overloadSoftQueueEdit, g_ui.overloadHardQueueEdit,
+      g_ui.schedulerIngressEdit, g_ui.schedulerScheduledEdit, g_ui.schedulerTransitionEdit,
+      g_ui.groupedMaxEdit, g_ui.densityMaxEdit, g_ui.densityThresholdEdit,
+      g_ui.voiceTileFramesEdit};
 
   for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); ++i) {
     if (controls[i])
@@ -1032,6 +1069,7 @@ void BuildUi(HWND hwnd) {
   g_ui.sectionFont = CreateAppFont(12, FW_BOLD);
   g_ui.bodyFont = CreateAppFont(9, FW_NORMAL);
   g_ui.hintFont = CreateItalicAppFont(8, FW_NORMAL);
+  g_ui.advancedPanelShown = false;
   SetDisconnectedState("Waiting for a live SuperVirtualMIDISynth instance...",
                        "Open a MIDI host that uses SuperVirtualMIDISynth, then "
                        "this window will attach automatically.");
@@ -1131,10 +1169,48 @@ void BuildUi(HWND hwnd) {
   g_ui.limiterReleaseEdit =
       CreateEditBox(hwnd, IDC_LIMITER_RELEASE, 828, 612, 116, 24);
 
+  // Advanced settings toggle button
+  g_ui.advancedPanelVisible =
+      CreateButton(hwnd, "Advanced Tuning", IDC_ADVANCED_PANEL_TOGGLE, 24, 656, 140, 26);
+
   AddSectionTitle(hwnd, "Voices", 736, 312);
   g_ui.perChannelVoices = CreateReadOnlyBox(
       hwnd, IDC_PER_CHANNEL, 736, 344, 208, 202,
       ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL);
+
+  // Advanced settings panel (initially hidden)
+  const int advancedPanelTop = 720;
+  const int advancedPanelHeight = 180;
+  
+  AddSectionTitle(hwnd, "Overload Thresholds", 24, advancedPanelTop + 8);
+  AddFieldLabel(hwnd, "Soft Voice", 24, advancedPanelTop + 44, 80);
+  g_ui.overloadSoftVoiceEdit = CreateEditBox(hwnd, IDC_OVERLOAD_SOFT_VOICE, 24, advancedPanelTop + 64, 90, 24);
+  AddFieldLabel(hwnd, "Hard Voice", 134, advancedPanelTop + 44, 80);
+  g_ui.overloadHardVoiceEdit = CreateEditBox(hwnd, IDC_OVERLOAD_HARD_VOICE, 134, advancedPanelTop + 64, 90, 24);
+  AddFieldLabel(hwnd, "Panic Voice", 244, advancedPanelTop + 44, 80);
+  g_ui.overloadPanicVoiceEdit = CreateEditBox(hwnd, IDC_OVERLOAD_PANIC_VOICE, 244, advancedPanelTop + 64, 90, 24);
+  AddFieldLabel(hwnd, "Soft Queue", 354, advancedPanelTop + 44, 80);
+  g_ui.overloadSoftQueueEdit = CreateEditBox(hwnd, IDC_OVERLOAD_SOFT_QUEUE, 354, advancedPanelTop + 64, 90, 24);
+  AddFieldLabel(hwnd, "Hard Queue", 464, advancedPanelTop + 44, 80);
+  g_ui.overloadHardQueueEdit = CreateEditBox(hwnd, IDC_OVERLOAD_HARD_QUEUE, 464, advancedPanelTop + 64, 90, 24);
+  
+  AddSectionTitle(hwnd, "Scheduler", 24, advancedPanelTop + 96);
+  AddFieldLabel(hwnd, "Ingress", 24, advancedPanelTop + 132, 70);
+  g_ui.schedulerIngressEdit = CreateEditBox(hwnd, IDC_SCHEDULER_INGRESS, 24, advancedPanelTop + 152, 80, 24);
+  AddFieldLabel(hwnd, "Scheduled", 124, advancedPanelTop + 132, 80);
+  g_ui.schedulerScheduledEdit = CreateEditBox(hwnd, IDC_SCHEDULER_SCHEDULED, 124, advancedPanelTop + 152, 80, 24);
+  AddFieldLabel(hwnd, "Transition", 224, advancedPanelTop + 132, 80);
+  g_ui.schedulerTransitionEdit = CreateEditBox(hwnd, IDC_SCHEDULER_TRANSITION, 224, advancedPanelTop + 152, 80, 24);
+  
+  AddSectionTitle(hwnd, "Layer System", 420, advancedPanelTop + 8);
+  AddFieldLabel(hwnd, "Grouped Max", 420, advancedPanelTop + 44, 90);
+  g_ui.groupedMaxEdit = CreateEditBox(hwnd, IDC_GROUPED_MAX, 420, advancedPanelTop + 64, 90, 24);
+  AddFieldLabel(hwnd, "Density Max", 530, advancedPanelTop + 44, 90);
+  g_ui.densityMaxEdit = CreateEditBox(hwnd, IDC_DENSITY_MAX, 530, advancedPanelTop + 64, 90, 24);
+  AddFieldLabel(hwnd, "Density Threshold", 640, advancedPanelTop + 44, 100);
+  g_ui.densityThresholdEdit = CreateEditBox(hwnd, IDC_DENSITY_THRESHOLD, 640, advancedPanelTop + 64, 90, 24);
+  AddFieldLabel(hwnd, "Tile Frames", 420, advancedPanelTop + 96, 90);
+  g_ui.voiceTileFramesEdit = CreateEditBox(hwnd, IDC_VOICE_TILE_FRAMES, 420, advancedPanelTop + 116, 90, 24);
 
   g_ui.applyButton = CreateButton(hwnd, "Apply Live", IDC_APPLY, 470, 680, 110, 32);
   g_ui.reloadButton =
@@ -1147,6 +1223,20 @@ void BuildUi(HWND hwnd) {
   ApplyFonts();
   EnableEditorControls(FALSE);
   UpdateDisconnectedUi();
+  
+  // Hide advanced controls initially
+  ShowWindow(g_ui.overloadSoftVoiceEdit, SW_HIDE);
+  ShowWindow(g_ui.overloadHardVoiceEdit, SW_HIDE);
+  ShowWindow(g_ui.overloadPanicVoiceEdit, SW_HIDE);
+  ShowWindow(g_ui.overloadSoftQueueEdit, SW_HIDE);
+  ShowWindow(g_ui.overloadHardQueueEdit, SW_HIDE);
+  ShowWindow(g_ui.schedulerIngressEdit, SW_HIDE);
+  ShowWindow(g_ui.schedulerScheduledEdit, SW_HIDE);
+  ShowWindow(g_ui.schedulerTransitionEdit, SW_HIDE);
+  ShowWindow(g_ui.groupedMaxEdit, SW_HIDE);
+  ShowWindow(g_ui.densityMaxEdit, SW_HIDE);
+  ShowWindow(g_ui.densityThresholdEdit, SW_HIDE);
+  ShowWindow(g_ui.voiceTileFramesEdit, SW_HIDE);
 }
 
 void DrawPanel(HDC hdc, int left, int top, int right, int bottom) {
@@ -1197,6 +1287,11 @@ void PaintBackground(HDC hdc) {
   DrawPanel(hdc, 736, 308, 948, 556);
   DrawPanel(hdc, 20, 486, 948, 578);
   DrawPanel(hdc, 20, 576, 948, 688);
+  
+  // Draw advanced panel if visible
+  if (g_ui.advancedPanelShown) {
+    DrawPanel(hdc, 20, 716, 948, 900);
+  }
 }
 
 LRESULT HandleStaticColor(HDC hdc, HWND hwndControl) {
@@ -1344,6 +1439,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case IDC_BROWSE:
       BrowseForSoundfont();
       return 0;
+    case IDC_ADVANCED_PANEL_TOGGLE:
+      g_ui.advancedPanelShown = !g_ui.advancedPanelShown;
+      InvalidateRect(g_ui.hwnd, NULL, TRUE);
+      ShowWindow(g_ui.overloadSoftVoiceEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.overloadHardVoiceEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.overloadPanicVoiceEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.overloadSoftQueueEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.overloadHardQueueEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.schedulerIngressEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.schedulerScheduledEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.schedulerTransitionEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.groupedMaxEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.densityMaxEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.densityThresholdEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      ShowWindow(g_ui.voiceTileFramesEdit, g_ui.advancedPanelShown ? SW_SHOW : SW_HIDE);
+      return 0;
     case IDC_REVERB_ENABLE:
     case IDC_LIMITER_ENABLE:
       if (HIWORD(wParam) == BN_CLICKED) {
@@ -1438,8 +1549,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
   HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "SVMS Configurator",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
-                                  WS_MINIMIZEBOX,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 984, 780, NULL,
+                                  WS_MINIMIZEBOX | WS_THICKFRAME,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 984, 920, NULL,
                               NULL, hInstance, NULL);
   if (!hwnd)
     return 1;

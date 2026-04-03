@@ -1,6 +1,7 @@
 #include "VirtuallySuperExact.h"
 
 #include <math.h>
+#include <windows.h>
 
 namespace {
 
@@ -46,6 +47,10 @@ bool ExactSystem::Initialize(const ExactConfig &config) {
   config_ = config;
   voices_.assign(config_.maxVoices, ExactVoice());
   freeList_.assign(config_.maxVoices, 0);
+  
+  // Initialize SoA buffer
+  voiceSoA_.Reserve(config_.maxVoices);
+  
   initialized_ = true;
   Reset();
   return true;
@@ -59,6 +64,7 @@ void ExactSystem::Reset() {
   nextVoiceId_ = 1;
   freeCount_ = (uint32_t)voices_.size();
   stats_ = ExactStats();
+  voiceSoA_.Reset();
   ResetPitchChannels();
 
   for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
@@ -276,6 +282,11 @@ bool ExactSystem::SelectStealCandidate(uint32_t *handle, bool *quiet,
 void ExactSystem::ReleaseVoiceHandle(uint32_t handle) {
   voices_[handle] = ExactVoice();
   freeList_[freeCount_++] = handle;
+  
+  // Sync SoA buffer
+  if (handle < voiceSoA_.capacity) {
+    voiceSoA_.states[handle] = (uint8_t)ExactLifecycleState::Free;
+  }
 }
 
 void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
@@ -293,6 +304,7 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
   voice.queueClass = ExactQueueClass::None;
   voice.phase = 0.0f;
   voice.heldBySustain = 0;
+  voice.envelopeStage = 0;  // Start at delay/attack stage
   voice.releaseDecay = 0.9985f;
 
   bool initializedVoice = false;
@@ -308,30 +320,82 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
       voice.loopStart = info.loopStart;
       voice.loopEnd = info.loopEnd;
       voice.loopMode = info.loopMode;
-      // Keep sample-backed phase relative to sampleStart so a float cursor
-      // retains sub-sample precision even when the packed SF2 smpl chunk is large.
       voice.phase = 0.0f;
       voice.phaseStep = info.phaseStep;
       voice.targetGain = info.initialGain;
       voice.leftGain = info.leftGain;
       voice.rightGain = info.rightGain;
-      voice.releaseDecay = info.releaseDecay;
-      if (info.attackSeconds > 0.0001f) {
-        const float attackSamples =
-            info.attackSeconds * (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
-        voice.attackSamplesRemaining =
-            attackSamples > 1.0f ? (uint16_t)(attackSamples > 65535.0f ? 65535u : (uint32_t)attackSamples)
-                                 : 0u;
-        voice.currentGain = 0.0f;
-        voice.attackGainStep =
-            voice.attackSamplesRemaining > 0
-                ? (info.initialGain / (float)voice.attackSamplesRemaining)
-                : info.initialGain;
+      voice.sustainLevel = info.sustainLevel * info.initialGain;
+      
+      // Calculate envelope parameters from SoundFont time values
+      const float sampleRate = (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
+      
+      // Debug: print envelope values for first few voices
+      static int debugCount = 0;
+      if (debugCount < 3) {
+        char dbg[256];
+        sprintf(dbg, "SVMS ENV: attack=%.3fs decay=%.3fs sustain=%.2f release=%.3fs gain=%.3f\n",
+                info.attackSeconds, info.decaySeconds, info.sustainLevel, info.releaseSeconds, info.initialGain);
+        OutputDebugStringA(dbg);
+        ++debugCount;
+      }
+      
+      // Delay stage (usually 0 for most instruments)
+      const float delaySamples = info.holdSeconds * sampleRate;  // Reusing holdSeconds as delay
+      voice.holdSamplesRemaining = delaySamples > 0.0f
+          ? (uint16_t)(delaySamples > 65535.0f ? 65535u : (uint32_t)delaySamples)
+          : 0u;
+      
+      // Attack stage - linear ramp from 0 to targetGain
+      const float attackSamples = info.attackSeconds * sampleRate;
+      voice.attackSamplesRemaining = attackSamples > 0.0001f
+          ? (uint16_t)(attackSamples > 65535.0f ? 65535u : (uint32_t)attackSamples)
+          : 0u;
+      
+      // Decay stage - from targetGain to sustainLevel
+      const float decaySamples = info.decaySeconds * sampleRate;
+      voice.decaySamplesRemaining = decaySamples > 0.0001f
+          ? (uint16_t)(decaySamples > 65535.0f ? 65535u : (uint32_t)decaySamples)
+          : 0u;
+      
+      // Calculate gain steps for linear segments
+      voice.currentGain = 0.0f;
+      
+      if (voice.attackSamplesRemaining > 0) {
+        voice.attackGainStep = info.initialGain / (float)voice.attackSamplesRemaining;
       } else {
         voice.currentGain = info.initialGain;
-        voice.attackSamplesRemaining = 0;
-        voice.attackGainStep = info.initialGain;
+        voice.attackGainStep = 0.0f;
       }
+      
+      // Decay slope: from targetGain down to sustainLevel
+      if (voice.decaySamplesRemaining > 0 && voice.sustainLevel < info.initialGain) {
+        voice.decayGainStep = (info.initialGain - voice.sustainLevel) / (float)voice.decaySamplesRemaining;
+      } else {
+        voice.decayGainStep = 0.0f;
+      }
+      
+      // Release decay factor (exponential) - calculate from release seconds
+      if (info.releaseSeconds > 0.001f) {
+        // Convert release time to per-sample decay factor (exponential)
+        const float releaseSamples = info.releaseSeconds * sampleRate;
+        voice.releaseDecay = powf(0.001f, 1.0f / releaseSamples);  // Decay to 0.1% in releaseSeconds
+      } else {
+        voice.releaseDecay = 0.9985f;  // Default fast release
+      }
+      
+      // Determine starting envelope stage
+      if (voice.holdSamplesRemaining > 0) {
+        voice.envelopeStage = 0;  // Delay
+      } else if (voice.attackSamplesRemaining > 0) {
+        voice.envelopeStage = 1;  // Attack
+      } else if (voice.decaySamplesRemaining > 0) {
+        voice.envelopeStage = 2;  // Decay
+      } else {
+        voice.envelopeStage = 3;  // Sustain - start at full gain since no attack/decay
+        voice.currentGain = info.initialGain;
+      }
+      
       initializedVoice = true;
     }
   }
@@ -342,6 +406,7 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
       return;
     }
 
+    // Synthetic voice with simple ADSR
     const float pitchShift = GetPitchShiftSemitones(event.channel);
     voice.frequencyHz = MidiNoteToFrequencyHz(event.note) *
                         powf(2.0f, pitchShift * (1.0f / 12.0f));
@@ -349,7 +414,11 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
                       (float)(config_.sampleRate > 0 ? config_.sampleRate : 44100u);
     voice.currentGain = VelocityToGain(voice.mappedVelocity);
     voice.targetGain = voice.currentGain;
+    voice.sustainLevel = voice.currentGain * 0.7f;
     voice.releaseDecay = 0.9985f;
+    voice.attackSamplesRemaining = 0;  // Instant attack for synthetic
+    voice.decaySamplesRemaining = 0;   // No decay for synthetic
+    voice.envelopeStage = 3;  // Start at sustain
     ExactStereoGains(ExactPan(event.channel, event.note), &voice.leftGain,
                      &voice.rightGain);
   }
@@ -357,6 +426,33 @@ void ExactSystem::ActivateVoice(uint32_t handle, const NormalizedEvent &event) {
   InsertKeyVoice(handle);
   ReclassifyVoiceQueue(handle);
   AddVoiceState(voice.state);
+  
+  // Sync SoA buffer for SIMD rendering
+  if (handle < voiceSoA_.capacity) {
+    voiceSoA_.phases[handle] = voice.phase;
+    voiceSoA_.phaseSteps[handle] = voice.phaseStep;
+    voiceSoA_.currentGains[handle] = voice.currentGain;
+    voiceSoA_.targetGains[handle] = voice.targetGain;
+    voiceSoA_.leftGains[handle] = voice.leftGain;
+    voiceSoA_.rightGains[handle] = voice.rightGain;
+    voiceSoA_.releaseDecays[handle] = voice.releaseDecay;
+    voiceSoA_.attackGainSteps[handle] = voice.attackGainStep;
+    voiceSoA_.attackSamplesRemaining[handle] = voice.attackSamplesRemaining;
+    voiceSoA_.sampleData[handle] = voice.sampleData;
+    voiceSoA_.sampleStarts[handle] = voice.sampleStart;
+    voiceSoA_.sampleEnds[handle] = voice.sampleEnd;
+    voiceSoA_.loopStarts[handle] = voice.loopStart;
+    voiceSoA_.loopEnds[handle] = voice.loopEnd;
+    voiceSoA_.loopModes[handle] = voice.loopMode;
+    voiceSoA_.states[handle] = (uint8_t)voice.state;
+    voiceSoA_.queueClasses[handle] = (uint8_t)voice.queueClass;
+    voiceSoA_.sampleBacked[handle] = voice.sampleBacked;
+    voiceSoA_.heldBySustain[handle] = voice.heldBySustain;
+    voiceSoA_.nextSameKeys[handle] = voice.nextSameKey;
+    voiceSoA_.prevSameKeys[handle] = voice.prevSameKey;
+    voiceSoA_.nextQueues[handle] = voice.nextQueue;
+    voiceSoA_.prevQueues[handle] = voice.prevQueue;
+  }
 }
 
 void ExactSystem::TransitionVoiceToReleased(uint32_t handle) {
@@ -369,6 +465,12 @@ void ExactSystem::TransitionVoiceToReleased(uint32_t handle) {
   ReclassifyVoiceQueue(handle);
   RemoveVoiceState(ExactLifecycleState::Active);
   AddVoiceState(ExactLifecycleState::Released);
+  
+  // Sync SoA buffer
+  if (handle < voiceSoA_.capacity) {
+    voiceSoA_.states[handle] = (uint8_t)ExactLifecycleState::Released;
+    voiceSoA_.queueClasses[handle] = (uint8_t)voice.queueClass;
+  }
 }
 
 void ExactSystem::RefreshVoiceFromSoundFont(uint32_t handle) {
@@ -538,6 +640,15 @@ void ExactSystem::InsertKeyVoice(uint32_t handle) {
   if (head != kInvalidVoiceHandle)
     voices_[head].prevSameKey = handle;
   head = handle;
+  
+  // Sync SoA linked list pointers
+  if (handle < voiceSoA_.capacity) {
+    voiceSoA_.prevSameKeys[handle] = kInvalidVoiceHandle;
+    voiceSoA_.nextSameKeys[handle] = head;
+    if (head != kInvalidVoiceHandle && head < voiceSoA_.capacity) {
+      voiceSoA_.prevSameKeys[head] = handle;
+    }
+  }
 }
 
 void ExactSystem::RemoveKeyVoice(uint32_t handle) {
@@ -556,6 +667,12 @@ void ExactSystem::RemoveKeyVoice(uint32_t handle) {
 
   voice.prevSameKey = kInvalidVoiceHandle;
   voice.nextSameKey = kInvalidVoiceHandle;
+  
+  // Sync SoA linked list pointers
+  if (handle < voiceSoA_.capacity) {
+    voiceSoA_.prevSameKeys[handle] = kInvalidVoiceHandle;
+    voiceSoA_.nextSameKeys[handle] = kInvalidVoiceHandle;
+  }
 }
 
 void ExactSystem::LinkQueueTail(ExactQueueClass queueClass, uint32_t handle) {
@@ -570,6 +687,16 @@ void ExactSystem::LinkQueueTail(ExactQueueClass queueClass, uint32_t handle) {
   else
     queue.head = handle;
   queue.tail = handle;
+  
+  // Sync SoA linked list pointers
+  if (handle < voiceSoA_.capacity) {
+    voiceSoA_.queueClasses[handle] = (uint8_t)queueClass;
+    voiceSoA_.prevQueues[handle] = queue.tail;
+    voiceSoA_.nextQueues[handle] = kInvalidVoiceHandle;
+    if (queue.tail != kInvalidVoiceHandle && queue.tail < voiceSoA_.capacity) {
+      voiceSoA_.nextQueues[queue.tail] = handle;
+    }
+  }
 }
 
 void ExactSystem::UnlinkQueue(uint32_t handle) {
@@ -591,6 +718,13 @@ void ExactSystem::UnlinkQueue(uint32_t handle) {
   voice.queueClass = ExactQueueClass::None;
   voice.prevQueue = kInvalidVoiceHandle;
   voice.nextQueue = kInvalidVoiceHandle;
+  
+  // Sync SoA linked list pointers
+  if (handle < voiceSoA_.capacity) {
+    voiceSoA_.queueClasses[handle] = (uint8_t)ExactQueueClass::None;
+    voiceSoA_.prevQueues[handle] = kInvalidVoiceHandle;
+    voiceSoA_.nextQueues[handle] = kInvalidVoiceHandle;
+  }
 }
 
 ExactQueueClass ExactSystem::ClassifyQueue(const ExactVoice &voice) const {

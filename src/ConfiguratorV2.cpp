@@ -45,6 +45,7 @@ struct UiState {
   LiveBridgeSharedState *sharedState;
   LiveBridgeSharedState lastSnapshot;
   LiveBridgeSettings pendingSettings;
+  LiveBridgeSettingsExtended pendingExtendedSettings;
   bool connected;
   bool needsReseed;
   bool versionMismatch;
@@ -328,6 +329,7 @@ bool ReadSnapshot(LiveBridgeSharedState &snapshot) {
 
 void SyncPendingSettingsFromSnapshot(const LiveBridgeSharedState &snapshot) {
   g_ui.pendingSettings = snapshot.currentSettings;
+  g_ui.pendingExtendedSettings = snapshot.extendedSettings;
   g_ui.needsReseed = false;
 }
 
@@ -378,6 +380,7 @@ bool SendCommandAndWait(LONG commandCode, const LiveBridgeSettings &settings,
   g_ui.sharedState->commandCode = commandCode;
   g_ui.sharedState->commandSourcePid = GetCurrentProcessId();
   g_ui.sharedState->requestedSettings = settings;
+  g_ui.sharedState->requestedExtendedSettings = g_ui.pendingExtendedSettings;
   g_ui.sharedState->commandInProgress = 0;
   g_ui.sharedState->commandResult = LIVE_RESULT_BUSY;
   CopyCString(g_ui.sharedState->commandMessage,
@@ -1230,17 +1233,71 @@ void RenderProfilesTab() {
 }
 
 void RenderAdvancedTab() {
-  BeginCard("Advanced", "Advanced Readout", 0, 0);
-  char buffer[2048];
-  BuildAdvancedText(buffer, sizeof(buffer));
-  ImGui::InputTextMultiline("##advanced", buffer, sizeof(buffer), ImVec2(-1, 180),
-                            ImGuiInputTextFlags_ReadOnly);
-  if (g_ui.currentMode >= VIEW_POWERUSER) {
-    DrawPlaceholderField("Engine topology knobs", "Not wired yet");
-    DrawPlaceholderField("Scheduler stress knobs", "Not wired yet");
-    DrawPlaceholderField("Source policy presets", "Not wired yet");
+  BeginCard("OverloadThresholds", "Overload Protection", 0, 0);
+  HelpText("When too many notes play at once, the synth drops quiet notes to stay stable. Higher = more voices allowed before dropping.");
+  ImGui::Separator();
+  if (ImGui::CollapsingHeader("Voice Limits", ImGuiTreeNodeFlags_DefaultOpen)) {
+    InputIntClamped("Soft Limit", &g_ui.pendingExtendedSettings.overloadSoftVoiceThreshold, 64, 65535, 64);
+    HelpText("Start trimming quiet notes");
+    InputIntClamped("Hard Limit", &g_ui.pendingExtendedSettings.overloadHardVoiceThreshold, 128, 131072, 128);
+    HelpText("Aggressive trimming");
+    InputIntClamped("Panic Limit", &g_ui.pendingExtendedSettings.overloadPanicVoiceThreshold, 256, 262144, 256);
+    HelpText("Emergency cutoff");
+  }
+  if (ImGui::CollapsingHeader("Queue Limits", ImGuiTreeNodeFlags_DefaultOpen)) {
+    InputIntClamped("Soft Queue", &g_ui.pendingExtendedSettings.overloadSoftQueueThreshold, 512, 65536, 512);
+    HelpText("Start dropping queued events");
+    InputIntClamped("Hard Queue", &g_ui.pendingExtendedSettings.overloadHardQueueThreshold, 1024, 131072, 1024);
+    HelpText("Force drop events");
   }
   EndCard();
+
+  BeginCard("SchedulerTuning", "MIDI Event Queue", 0, 0);
+  HelpText("How many MIDI events can wait to be processed. Higher = handles bigger bursts but uses more memory.");
+  ImGui::Separator();
+  InputIntClamped("Input Buffer", &g_ui.pendingExtendedSettings.schedulerIngressCapacity, 256, 1048576, 256);
+  HelpText("Incoming MIDI events");
+  InputIntClamped("Scheduled Buffer", &g_ui.pendingExtendedSettings.schedulerScheduledCapacity, 1024, 524288, 1024);
+  HelpText("Events waiting to play");
+  InputIntClamped("Per-Key Queue", &g_ui.pendingExtendedSettings.schedulerTransitionQueueCapacity, 4, 32, 1);
+  HelpText("Note changes per key (4-8 normal, 16+ for buzz rolls)");
+  EndCard();
+
+  BeginCard("LayerSystem", "Voice Quality Modes", 0, 0);
+  HelpText("Trade accuracy for more voices. Exact = one voice per note. Grouped/Density = blend many notes together.");
+  ImGui::Separator();
+  if (ImGui::CollapsingHeader("Grouped Voices", ImGuiTreeNodeFlags_DefaultOpen)) {
+    InputIntClamped("Max Groups", &g_ui.pendingExtendedSettings.groupedMaxGroups, 16, 8192, 16);
+    HelpText("Blended voice clusters");
+    InputIntClamped("Pitch Range", &g_ui.pendingExtendedSettings.groupedPitchBandSemitones, 1, 24, 1);
+    HelpText("Semitones per group (lower = more accurate)");
+  }
+  if (ImGui::CollapsingHeader("Density Clouds", ImGuiTreeNodeFlags_DefaultOpen)) {
+    InputIntClamped("Max Clouds", &g_ui.pendingExtendedSettings.densityMaxObjects, 8, 4096, 8);
+    HelpText("Statistical note clouds");
+    InputIntClamped("Activate At", &g_ui.pendingExtendedSettings.densityActivationThreshold, 2, 256, 2);
+    HelpText("Notes needed before switching to density");
+    InputIntClamped("Pitch Range", &g_ui.pendingExtendedSettings.densityPitchBandSemitones, 1, 24, 1);
+    HelpText("Semitones per cloud");
+  }
+  EndCard();
+
+  BeginCard("VoiceRendering", "Audio Quality", 0, 0);
+  HelpText("Fine-tune how voices are rendered. Default values work well for most cases.");
+  ImGui::Separator();
+  InputIntClamped("Render Chunk", &g_ui.pendingExtendedSettings.voiceRenderTileFrames, 32, 1024, 32);
+  HelpText("Samples processed at once (higher = slightly faster, more latency)");
+  InputIntClamped("Release Speed", &g_ui.pendingExtendedSettings.voiceReleaseDecayScale, 50, 150, 5);
+  HelpText("Note release tail length (100 = normal, lower = shorter)");
+  EndCard();
+
+  if (g_ui.currentMode >= VIEW_POWERUSER) {
+    BeginCard("EngineFuture", "Experimental", 0, 0);
+    DrawPlaceholderField("Output device", "Not wired yet");
+    DrawPlaceholderField("Worker threads", "Not wired yet");
+    DrawPlaceholderField("Quality preset", "Not wired yet");
+    EndCard();
+  }
 }
 
 void RenderDeveloperTab() {

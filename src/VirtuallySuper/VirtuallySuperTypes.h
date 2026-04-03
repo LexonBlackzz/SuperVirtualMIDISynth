@@ -198,14 +198,18 @@ struct ExactVoice {
   uint32_t loopStart;
   uint32_t loopEnd;
   uint8_t loopMode;
-  uint8_t reserved;
+  uint8_t envelopeStage;       // 0=hold, 1=attack, 2=decay, 3=sustain, 4=release
   uint16_t attackSamplesRemaining;
+  uint16_t decaySamplesRemaining;
+  uint16_t holdSamplesRemaining;
   float phase;
   float frequencyHz;
   float phaseStep;
   float currentGain;
   float targetGain;
   float attackGainStep;
+  float decayGainStep;
+  float sustainLevel;
   float releaseDecay;
   float leftGain;
   float rightGain;
@@ -220,10 +224,11 @@ struct ExactVoice {
         nextSameKey(kInvalidVoiceHandle), prevSameKey(kInvalidVoiceHandle),
         nextQueue(kInvalidVoiceHandle), prevQueue(kInvalidVoiceHandle),
         sampleData(0), sampleStart(0), sampleEnd(0), loopStart(0), loopEnd(0),
-        loopMode(0), reserved(0), attackSamplesRemaining(0), phase(0.0f),
+        loopMode(0), envelopeStage(0), attackSamplesRemaining(0),
+        decaySamplesRemaining(0), holdSamplesRemaining(0), phase(0.0f),
         frequencyHz(0.0f), phaseStep(0.0f), currentGain(0.0f),
-        targetGain(0.0f), attackGainStep(0.0f), releaseDecay(0.0f),
-        leftGain(0.0f), rightGain(0.0f) {}
+        targetGain(0.0f), attackGainStep(0.0f), decayGainStep(0.0f),
+        sustainLevel(1.0f), releaseDecay(0.0f), leftGain(0.0f), rightGain(0.0f) {}
 };
 
 struct ExactStats {

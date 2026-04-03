@@ -43,3 +43,5 @@
 /build/
 
 /.vscode
+/w64devkit-x86
+/.qwen

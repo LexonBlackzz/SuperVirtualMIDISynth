@@ -6,6 +6,7 @@
 #include "VirtuallySuperEngine.h"
 #include "VirtuallySuperSoundFontRuntime.h"
 
+#include <atomic>
 #include <string>
 
 class VirtuallySuperSamplerEngine : public ISamplerEngine {
@@ -33,11 +34,32 @@ public:
 private:
   uint8_t MapMidiVelocity(int velocity) const;
   virtuallysuper::NormalizedEvent ConvertMidiEvent(const MidiEvent &event) const;
-  void ResetPerBlockStatsLocked();
-  void SetStateLocked(SamplerRuntimeStateCode stateCode,
+  void ResetPerBlockStats();
+  void SetState(SamplerRuntimeStateCode stateCode,
                       SamplerErrorCode errorCode, const char *warningText);
-  void UpdateSoundFontDiagnosticsLocked();
+  void UpdateSoundFontDiagnostics();
 
+  // Lock-free render window parameters (atomic for cross-thread access)
+  struct RenderWindowParams {
+    std::atomic<unsigned long long> blockStartSample{0};
+    std::atomic<int> blockFrames{0};
+    std::atomic<int> sampleRate{0};
+    std::atomic<long long> blockStartQpc{0};
+    std::atomic<long long> blockEndQpc{0};
+    std::atomic<bool> quantized{false};
+    std::atomic<bool> valid{false};
+  };
+  RenderWindowParams renderWindow_;
+
+  // Atomic state variables for lock-free access from audio thread
+  std::atomic<SamplerRuntimeStateCode> stateCode_{SamplerRuntimeStateCode::UNINITIALIZED};
+  std::atomic<SamplerErrorCode> errorCode_{SamplerErrorCode::NONE};
+  std::atomic<unsigned int> idleFastPathHits_{0};
+  std::atomic<unsigned int> noteOnEventsThisBlock_{0};
+  std::atomic<unsigned int> noteOffEventsThisBlock_{0};
+  std::atomic<long long> renderCursorSample_{0};
+
+  // Protected by mutex (UI thread only access)
   mutable compat::Mutex engineMutex;
   virtuallysuper::EnginePrototype prototype_;
   virtuallysuper::SoundFontRuntime soundFontRuntime_;
@@ -47,18 +69,7 @@ private:
   std::string resolvedSourceFormat_;
   RuntimeSettings runtimeSettings_;
   SamplerDiagnostics diagnostics_;
-  SamplerRuntimeStateCode stateCode_;
-  SamplerErrorCode errorCode_;
-  unsigned int idleFastPathHits_;
-  unsigned int noteOnEventsThisBlock_;
-  unsigned int noteOffEventsThisBlock_;
-  unsigned long long currentBlockStartSample_;
-  int currentBlockFrames_;
-  long long currentBlockStartQpc_;
-  long long currentBlockEndQpc_;
-  bool currentBlockQuantized_;
-  bool hasRenderWindow_;
-  long long renderCursorSample_;
+  SamplerErrorCode errorCodeUI_;  // Non-atomic for UI thread
 };
 
 #endif

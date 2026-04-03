@@ -342,6 +342,10 @@ bool SoundFontRuntime::FillNoteInfo(uint8_t channelIndex, uint8_t note,
   info->initialGain = gain;
   ComputeStereoGains(combinedPan, &info->leftGain, &info->rightGain);
   info->attackSeconds = region.attackSeconds;
+  info->decaySeconds = region.decaySeconds;
+  info->sustainLevel = region.sustainLevel;
+  info->holdSeconds = region.holdSeconds;
+  info->releaseSeconds = region.releaseSeconds;
   info->releaseDecay = MakeReleaseDecay(region.releaseSeconds, outputSampleRate_);
   return true;
 }
