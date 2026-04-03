@@ -1,398 +1,411 @@
 #include "VirtuallySuperScheduler.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace virtuallysuper {
 
-Scheduler::Scheduler()
-    : config_(), initialized_(false), ingress_(), ingressHead_(0),
-      ingressTail_(0), ingressCount_(0), slots_(), heap_(), heapPositions_(),
-      freeList_(), heapCount_(0), freeCount_(0), nextEventId_(1), stats_() {}
+// ------------------------------------------------------------
+// IngressQueue (lock-free ring buffer) implementation
+// ------------------------------------------------------------
+bool Scheduler::IngressQueue::Push(const NormalizedEvent &ev) {
+    uint32_t t = tail.load(std::memory_order_relaxed);
+    uint32_t next = (t + 1) & mask;
+    if (next == head.load(std::memory_order_acquire)) {
+        return false; // Queue is full
+    }
+    buffer[t] = ev;
+    tail.store(next, std::memory_order_release);
+    return true;
+}
+
+bool Scheduler::IngressQueue::Pop(NormalizedEvent &ev) {
+    uint32_t h = head.load(std::memory_order_relaxed);
+    if (h == tail.load(std::memory_order_acquire)) {
+        return false; // Queue is empty
+    }
+    ev = buffer[h];
+    head.store((h + 1) & mask, std::memory_order_release);
+    return true;
+}
+
+bool Scheduler::IngressQueue::IsEmpty() const {
+    return head.load(std::memory_order_acquire) == tail.load(std::memory_order_acquire);
+}
+
+void Scheduler::IngressQueue::Clear() {
+    head.store(0, std::memory_order_release);
+    tail.store(0, std::memory_order_release);
+}
+
+void Scheduler::IngressQueue::Resize(uint32_t capacity) {
+    // Ensure capacity is power of 2
+    uint32_t actualCapacity = 1;
+    while (actualCapacity < capacity) {
+        actualCapacity <<= 1;
+    }
+    buffer.resize(actualCapacity);
+    mask = actualCapacity - 1;
+    head.store(0, std::memory_order_release);
+    tail.store(0, std::memory_order_release);
+}
+
+// ------------------------------------------------------------
+// Scheduler implementation
+// ------------------------------------------------------------
+Scheduler::Scheduler() 
+    : bucketMask_(0), 
+      bucketDurationSamples_(0), 
+      wheelStartSample_(0), 
+      wheelCurrentBucket_(0),
+      scheduledCount_(0) {}
+
+Scheduler::~Scheduler() {}
 
 bool Scheduler::Initialize(const SchedulerConfig &config) {
-  if (config.ingressCapacity == 0 || config.scheduledCapacity == 0)
-    return false;
+    if (config.ingressCapacity == 0 || config.scheduledCapacity == 0) {
+        return false;
+    }
 
-  config_ = config;
-  ingress_.assign(config_.ingressCapacity, NormalizedEvent());
-  slots_.assign(config_.scheduledCapacity, ScheduledSlot());
-  heap_.assign(config_.scheduledCapacity, 0);
-  heapPositions_.assign(config_.scheduledCapacity, -1);
-  freeList_.assign(config_.scheduledCapacity, 0);
+    // Initialize ingress queue with power-of-2 capacity
+    ingress_.Resize(config.ingressCapacity);
 
-  initialized_ = true;
-  Reset();
-  return true;
+    // Initialize timing wheel
+    // Number of buckets based on scheduled capacity and average events per bucket
+    // We use a fixed number of buckets (power of two) for efficient modulo
+    bucketDurationSamples_ = config.coalesceWindowSamples;
+    if (bucketDurationSamples_ <= 0) {
+        bucketDurationSamples_ = kDefaultCoalesceWindowSamples;
+    }
+    
+    // Calculate bucket count - aim for ~64 events per bucket on average
+    uint32_t targetBucketCount = config.scheduledCapacity / 64;
+    if (targetBucketCount < 64) targetBucketCount = 64;
+    if (targetBucketCount > 1024) targetBucketCount = 1024;
+    
+    // Round up to power of 2
+    uint32_t bucketCount = 64;
+    while (bucketCount < targetBucketCount) {
+        bucketCount <<= 1;
+    }
+    
+    bucketMask_ = bucketCount - 1;
+    buckets_.resize(bucketCount);
+    wheelStartSample_ = 0;
+    wheelCurrentBucket_ = 0;
+
+    // Initialize coalesce buffer
+    coalesceBuffer_.reserve(16);
+
+    // Reset key states
+    for (uint32_t ch = 0; ch < kChannelCount; ++ch) {
+        for (uint32_t n = 0; n < kNoteCount; ++n) {
+            transitionQueues_[ch][n].count = 0;
+            keyStates_[ch][n] = ScheduledKeyState();
+        }
+    }
+
+    stats_ = SchedulerStats();
+    scheduledCount_.store(0, std::memory_order_release);
+    return true;
 }
 
 void Scheduler::Reset() {
-  ingressHead_ = 0;
-  ingressTail_ = 0;
-  ingressCount_ = 0;
-  heapCount_ = 0;
-  freeCount_ = (uint32_t)slots_.size();
-  nextEventId_ = 1;
-  stats_ = SchedulerStats();
-
-  for (uint32_t i = 0; i < freeCount_; ++i) {
-    slots_[i] = ScheduledSlot();
-    heap_[i] = 0;
-    heapPositions_[i] = -1;
-    freeList_[i] = freeCount_ - 1U - i;
-  }
-
-  for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
-    for (uint32_t note = 0; note < kNoteCount; ++note) {
-      transitionQueues_[channel][note] = TransitionQueue();
-      keyStates_[channel][note] = ScheduledKeyState();
+    // Clear all buckets
+    for (auto &b : buckets_) {
+        AcquireBucketLock(b);
+        b.events.clear();
+        ReleaseBucketLock(b);
     }
-  }
+    scheduledCount_.store(0, std::memory_order_release);
+    
+    // Reset ingress queue
+    ingress_.Clear();
+    
+    // Reset wheel position
+    wheelStartSample_ = 0;
+    wheelCurrentBucket_ = 0;
+    
+    // Reset key state
+    for (uint32_t ch = 0; ch < kChannelCount; ++ch) {
+        for (uint32_t n = 0; n < kNoteCount; ++n) {
+            transitionQueues_[ch][n].count = 0;
+            keyStates_[ch][n] = ScheduledKeyState();
+        }
+    }
+
+    stats_ = SchedulerStats();
+    coalesceBuffer_.clear();
+}
+
+void Scheduler::AcquireBucketLock(Bucket &bucket) {
+    // Spin-lock with memory ordering
+    while (bucket.lock.exchange(true, std::memory_order_acquire)) {
+        // Spin - on x86/x64 this is very fast
+    }
+}
+
+void Scheduler::ReleaseBucketLock(Bucket &bucket) {
+    bucket.lock.store(false, std::memory_order_release);
 }
 
 ScheduleDecision Scheduler::EnqueueIngressEvent(const NormalizedEvent &event) {
-  if (!initialized_)
-    return ScheduleDecision::Dropped;
-
-  if (ingressCount_ >= config_.ingressCapacity) {
-    ++stats_.ingressDropped;
-    return ScheduleDecision::Dropped;
-  }
-
-  ingress_[ingressTail_] = event;
-  ingressTail_ = (ingressTail_ + 1U) % config_.ingressCapacity;
-  ++ingressCount_;
-  ++stats_.ingressQueued;
-  stats_.maxIngressDepth = std::max(stats_.maxIngressDepth, ingressCount_);
-  return ScheduleDecision::Accepted;
+    if (!ingress_.Push(event)) {
+        ++stats_.ingressDropped;
+        return ScheduleDecision::Dropped;
+    }
+    ++stats_.ingressQueued;
+    stats_.maxIngressDepth = std::max(stats_.maxIngressDepth, GetIngressCount());
+    return ScheduleDecision::Accepted;
 }
 
 uint32_t Scheduler::FlushIngressToScheduled(uint32_t maxEvents) {
-  if (!initialized_)
-    return 0;
-
-  uint32_t processed = 0;
-  while (ingressCount_ > 0 && processed < maxEvents) {
-    NormalizedEvent event = ingress_[ingressHead_];
-    ingressHead_ = (ingressHead_ + 1U) % config_.ingressCapacity;
-    --ingressCount_;
-    ScheduleInternal(event);
-    ++processed;
-  }
-  return processed;
+    uint32_t processed = 0;
+    NormalizedEvent ev;
+    while (processed < maxEvents && ingress_.Pop(ev)) {
+        ScheduleDirect(ev);
+        ++processed;
+    }
+    return processed;
 }
 
 ScheduleDecision Scheduler::ScheduleDirect(const NormalizedEvent &event) {
-  return ScheduleInternal(event);
+    if (!ValidateKeyEvent(event)) {
+        ++stats_.scheduledDropped;
+        return ScheduleDecision::Dropped;
+    }
+
+    // Determine bucket index for this event
+    int64_t bucketIdx = GetBucketIndex(event.targetSample);
+    if (bucketIdx < 0) {
+        ++stats_.scheduledDropped;
+        return ScheduleDecision::Dropped;
+    }
+
+    // Get the bucket (with wrap-around)
+    uint32_t bucketPos = (uint32_t)(bucketIdx & (int64_t)bucketMask_);
+    Bucket &bucket = buckets_[bucketPos];
+
+    // Check for duplicate events before adding (coalescing)
+    AcquireBucketLock(bucket);
+    
+    // Check for duplicates in the same bucket
+    bool isDuplicate = false;
+    if (EventUsesKey(event.kind)) {
+        for (const auto &existing : bucket.events) {
+            if (existing.kind == event.kind &&
+                existing.channel == event.channel &&
+                existing.note == event.note &&
+                existing.targetSample == event.targetSample &&
+                existing.applyPriority == event.applyPriority) {
+                isDuplicate = true;
+                break;
+            }
+        }
+    }
+    
+    if (isDuplicate) {
+        ReleaseBucketLock(bucket);
+        ++stats_.coalescedEvents;
+        return ScheduleDecision::Coalesced;
+    }
+
+    // Add event to bucket
+    bucket.events.push_back(event);
+    ReleaseBucketLock(bucket);
+
+    // Update key state for note events
+    if (EventUsesKey(event.kind)) {
+        ScheduledKeyState &keyState = keyStates_[event.channel][event.note];
+        if (event.kind == EventKind::NoteOn) {
+            ++keyState.pendingNoteOnCount;
+        } else if (event.kind == EventKind::NoteOff) {
+            ++keyState.pendingNoteOffCount;
+        }
+        keyState.lastScheduledState = EventToScheduledState(event.kind);
+        
+        // Update transition queue stats
+        const TransitionQueue &queue = transitionQueues_[event.channel][event.note];
+        stats_.maxTransitionQueueDepth = std::max(stats_.maxTransitionQueueDepth, queue.count);
+    }
+
+    ++stats_.scheduledQueued;
+    scheduledCount_.fetch_add(1, std::memory_order_relaxed);
+    stats_.maxScheduledDepth = std::max(stats_.maxScheduledDepth, GetScheduledCount());
+    
+    return ScheduleDecision::Accepted;
 }
 
 size_t Scheduler::DrainScheduledWindow(int64_t cursorSample, int64_t blockEndSample,
-                                       int64_t windowEndSample,
-                                       NormalizedEvent *outEvents,
-                                       size_t outCapacity,
-                                       int64_t *renderUntilSample) {
-  if (!initialized_) {
-    if (renderUntilSample)
-      *renderUntilSample = blockEndSample;
-    return 0;
-  }
-
-  size_t drained = 0;
-  int64_t latestSample = cursorSample;
-
-  while (heapCount_ > 0 && drained < outCapacity) {
-    const ScheduledSlot &slot = slots_[heap_[0]];
-    if (!slot.active || slot.event.targetSample >= windowEndSample)
-      break;
-
-    uint32_t slotIndex = HeapPop();
-    NormalizedEvent event = slots_[slotIndex].event;
-
-    if (EventUsesKey(event.kind))
-      RemoveTransitionSlot(event.channel, event.note, slotIndex);
-
-    ReleaseSlot(slotIndex);
-
-    outEvents[drained++] = event;
-    ++stats_.drainedEvents;
-    if (event.targetSample > latestSample)
-      latestSample = event.targetSample;
-  }
-
-  if (renderUntilSample) {
-    if (drained > 0) {
-      *renderUntilSample = std::min(latestSample, blockEndSample);
-    } else if (heapCount_ > 0) {
-      const int64_t nextSample = slots_[heap_[0]].event.targetSample;
-      *renderUntilSample =
-          std::max(cursorSample, std::min(nextSample, blockEndSample));
-    } else {
-      *renderUntilSample = blockEndSample;
+                                       int64_t windowEndSample, NormalizedEvent *outEvents,
+                                       size_t outCapacity, int64_t *renderUntilSample) {
+    // Initialize wheel start sample if not set
+    if (wheelStartSample_ == 0) {
+        wheelStartSample_ = cursorSample;
+        wheelCurrentBucket_ = 0;
     }
-  }
 
-  return drained;
-}
+    size_t drained = 0;
+    int64_t latestSample = cursorSample;
 
-uint32_t Scheduler::GetScheduledCount() const { return heapCount_; }
+    // Calculate starting bucket
+    int64_t startBucketIdx = GetBucketIndex(cursorSample);
+    int64_t endBucketIdx = GetBucketIndex(windowEndSample);
+    
+    // Process buckets in order
+    for (int64_t bucketIdx = startBucketIdx; 
+         bucketIdx <= endBucketIdx && drained < outCapacity; 
+         ++bucketIdx) {
+        
+        uint32_t bucketPos = (uint32_t)(bucketIdx & (int64_t)bucketMask_);
+        Bucket &bucket = buckets_[bucketPos];
 
-uint32_t Scheduler::GetIngressCount() const { return ingressCount_; }
-
-const SchedulerStats &Scheduler::GetStats() const { return stats_; }
-
-const ScheduledKeyState &Scheduler::GetKeyState(uint32_t channel,
-                                                uint32_t note) const {
-  return keyStates_[channel][note];
-}
-
-uint32_t Scheduler::GetTransitionQueueDepth(uint32_t channel,
-                                            uint32_t note) const {
-  return transitionQueues_[channel][note].count;
-}
-
-ScheduleDecision Scheduler::ScheduleInternal(const NormalizedEvent &event) {
-  if (!initialized_)
-    return ScheduleDecision::Dropped;
-
-  bool replacedExisting = false;
-
-  if (EventUsesKey(event.kind) && !ValidateKeyEvent(event)) {
-    ++stats_.scheduledDropped;
-    return ScheduleDecision::Dropped;
-  }
-
-  const int duplicateSlot = FindDuplicateTransitionSlot(event);
-  if (duplicateSlot >= 0) {
-    ++stats_.coalescedEvents;
-    return ScheduleDecision::Coalesced;
-  }
-
-  if (EventUsesKey(event.kind)) {
-    TransitionQueue &queue = transitionQueues_[event.channel][event.note];
-    if (queue.count >= kTransitionQueueCapacity) {
-      const int replacementSlot = FindOverflowReplacementSlot(event);
-      if (replacementSlot < 0) {
-        ++stats_.scheduledDropped;
-        ++stats_.queueOverflowDrops;
-        return ScheduleDecision::Dropped;
-      }
-
-      const NormalizedEvent &replaced = slots_[(uint32_t)replacementSlot].event;
-      RemoveTransitionSlot(replaced.channel, replaced.note,
-                           (uint32_t)replacementSlot);
-      HeapRemove((uint32_t)replacementSlot);
-      ReleaseSlot((uint32_t)replacementSlot);
-      ++stats_.replacedEvents;
-      replacedExisting = true;
+        // Process events in this bucket
+        AcquireBucketLock(bucket);
+        
+        // Sort events by targetSample within the bucket for ordered draining
+        // (only if there are multiple events)
+        if (bucket.events.size() > 1) {
+            std::sort(bucket.events.begin(), bucket.events.end(),
+                [](const NormalizedEvent &a, const NormalizedEvent &b) {
+                    if (a.targetSample != b.targetSample)
+                        return a.targetSample < b.targetSample;
+                    if (a.applyPriority != b.applyPriority)
+                        return a.applyPriority < b.applyPriority;
+                    return a.sequence < b.sequence;
+                });
+        }
+        
+        // Drain events that fall within the window
+        for (auto it = bucket.events.begin(); it != bucket.events.end() && drained < outCapacity;) {
+            if (it->targetSample >= windowEndSample) {
+                break; // Events are sorted, so we can stop early
+            }
+            
+            // Copy event to output
+            outEvents[drained++] = *it;
+            latestSample = std::max(latestSample, it->targetSample);
+            
+            // Update key state
+            if (EventUsesKey(it->kind)) {
+                ScheduledKeyState &ks = keyStates_[it->channel][it->note];
+                if (it->kind == EventKind::NoteOn && ks.pendingNoteOnCount > 0) {
+                    --ks.pendingNoteOnCount;
+                } else if (it->kind == EventKind::NoteOff && ks.pendingNoteOffCount > 0) {
+                    --ks.pendingNoteOffCount;
+                }
+            }
+            
+            it = bucket.events.erase(it);
+            scheduledCount_.fetch_sub(1, std::memory_order_relaxed);
+            ++stats_.drainedEvents;
+        }
+        
+        ReleaseBucketLock(bucket);
     }
-  }
 
-  if (freeCount_ == 0) {
-    ++stats_.scheduledDropped;
-    return ScheduleDecision::Dropped;
-  }
+    if (renderUntilSample) {
+        if (drained > 0) {
+            *renderUntilSample = std::min(latestSample, blockEndSample);
+        } else {
+            // No events drained - render until end of block or next scheduled event
+            *renderUntilSample = blockEndSample;
+        }
+    }
 
-  const uint32_t slotIndex = AllocateSlot();
-  ScheduledSlot &slot = slots_[slotIndex];
-  slot.active = true;
-  slot.eventId = nextEventId_++;
-  slot.event = event;
+    return drained;
+}
 
-  HeapPush(slotIndex);
-  ++stats_.scheduledQueued;
-  stats_.maxScheduledDepth = std::max(stats_.maxScheduledDepth, heapCount_);
+uint32_t Scheduler::GetScheduledCount() const {
+    return scheduledCount_.load(std::memory_order_acquire);
+}
 
-  if (EventUsesKey(event.kind)) {
-    TransitionQueue &queue = transitionQueues_[event.channel][event.note];
-    TransitionEntry &entry = queue.entries[queue.count++];
-    entry.slotIndex = slotIndex;
-    entry.kind = event.kind;
-    entry.velocity = event.velocity;
-    entry.applyPriority = event.applyPriority;
-    entry.sequence = event.sequence;
-    entry.targetSample = event.targetSample;
-    stats_.maxTransitionQueueDepth =
-        std::max(stats_.maxTransitionQueueDepth, queue.count);
-    RecomputeKeyState(event.channel, event.note);
-  }
+uint32_t Scheduler::GetIngressCount() const {
+    uint32_t t = ingress_.tail.load(std::memory_order_acquire);
+    uint32_t h = ingress_.head.load(std::memory_order_acquire);
+    return (t - h) & ingress_.mask;
+}
 
-  return replacedExisting ? ScheduleDecision::ReplacedExisting
-                          : ScheduleDecision::Accepted;
+const SchedulerStats &Scheduler::GetStats() const {
+    return stats_;
+}
+
+const ScheduledKeyState &Scheduler::GetKeyState(uint32_t channel, uint32_t note) const {
+    return keyStates_[channel][note];
+}
+
+uint32_t Scheduler::GetTransitionQueueDepth(uint32_t channel, uint32_t note) const {
+    return transitionQueues_[channel][note].count;
 }
 
 bool Scheduler::ValidateKeyEvent(const NormalizedEvent &event) const {
-  return event.channel < kChannelCount && event.note < kNoteCount;
+    return event.channel < kChannelCount && event.note < kNoteCount;
 }
 
-bool Scheduler::IsEarlier(uint32_t lhsSlot, uint32_t rhsSlot) const {
-  const NormalizedEvent &lhs = slots_[lhsSlot].event;
-  const NormalizedEvent &rhs = slots_[rhsSlot].event;
-
-  if (lhs.targetSample != rhs.targetSample)
-    return lhs.targetSample < rhs.targetSample;
-  if (lhs.applyPriority != rhs.applyPriority)
-    return lhs.applyPriority < rhs.applyPriority;
-  return lhs.sequence < rhs.sequence;
-}
-
-void Scheduler::HeapSwap(uint32_t a, uint32_t b) {
-  const uint32_t lhs = heap_[a];
-  const uint32_t rhs = heap_[b];
-  heap_[a] = rhs;
-  heap_[b] = lhs;
-  heapPositions_[lhs] = (int32_t)b;
-  heapPositions_[rhs] = (int32_t)a;
-}
-
-void Scheduler::HeapSiftUp(uint32_t index) {
-  while (index > 0) {
-    const uint32_t parent = (index - 1U) / 2U;
-    if (!IsEarlier(heap_[index], heap_[parent]))
-      break;
-    HeapSwap(index, parent);
-    index = parent;
-  }
-}
-
-void Scheduler::HeapSiftDown(uint32_t index) {
-  while (true) {
-    const uint32_t left = index * 2U + 1U;
-    const uint32_t right = left + 1U;
-    uint32_t smallest = index;
-
-    if (left < heapCount_ && IsEarlier(heap_[left], heap_[smallest]))
-      smallest = left;
-    if (right < heapCount_ && IsEarlier(heap_[right], heap_[smallest]))
-      smallest = right;
-    if (smallest == index)
-      break;
-
-    HeapSwap(index, smallest);
-    index = smallest;
-  }
-}
-
-void Scheduler::HeapPush(uint32_t slotIndex) {
-  heap_[heapCount_] = slotIndex;
-  heapPositions_[slotIndex] = (int32_t)heapCount_;
-  ++heapCount_;
-  HeapSiftUp(heapCount_ - 1U);
-}
-
-uint32_t Scheduler::HeapPop() {
-  const uint32_t slotIndex = heap_[0];
-  HeapRemove(slotIndex);
-  return slotIndex;
-}
-
-void Scheduler::HeapRemove(uint32_t slotIndex) {
-  const int32_t position = heapPositions_[slotIndex];
-  if (position < 0)
-    return;
-
-  const uint32_t index = (uint32_t)position;
-  const uint32_t lastIndex = heapCount_ - 1U;
-  HeapSwap(index, lastIndex);
-  heapPositions_[heap_[lastIndex]] = (int32_t)lastIndex;
-  heapPositions_[slotIndex] = -1;
-  --heapCount_;
-
-  if (index < heapCount_) {
-    HeapSiftUp(index);
-    HeapSiftDown(index);
-  }
-}
-
-uint32_t Scheduler::AllocateSlot() {
-  return freeList_[--freeCount_];
-}
-
-void Scheduler::ReleaseSlot(uint32_t slotIndex) {
-  slots_[slotIndex] = ScheduledSlot();
-  heapPositions_[slotIndex] = -1;
-  freeList_[freeCount_++] = slotIndex;
-}
-
-void Scheduler::RemoveTransitionSlot(uint8_t channel, uint8_t note,
-                                     uint32_t slotIndex) {
-  TransitionQueue &queue = transitionQueues_[channel][note];
-  for (uint32_t i = 0; i < queue.count; ++i) {
-    if (queue.entries[i].slotIndex != slotIndex)
-      continue;
-
-    for (uint32_t j = i + 1; j < queue.count; ++j)
-      queue.entries[j - 1U] = queue.entries[j];
-    --queue.count;
-    break;
-  }
-  RecomputeKeyState(channel, note);
+int64_t Scheduler::GetBucketIndex(int64_t targetSample) const {
+    if (bucketDurationSamples_ <= 0) {
+        return -1;
+    }
+    int64_t offset = targetSample - wheelStartSample_;
+    if (offset < 0) {
+        offset = 0;
+    }
+    return offset / bucketDurationSamples_;
 }
 
 void Scheduler::RecomputeKeyState(uint8_t channel, uint8_t note) {
-  ScheduledKeyState &state = keyStates_[channel][note];
-  const TransitionQueue &queue = transitionQueues_[channel][note];
+    ScheduledKeyState &state = keyStates_[channel][note];
+    const TransitionQueue &queue = transitionQueues_[channel][note];
 
-  state.pendingNoteOnCount = 0;
-  state.pendingNoteOffCount = 0;
-  state.lastScheduledState = ScheduledKeyStateValue::Unknown;
+    state.pendingNoteOnCount = 0;
+    state.pendingNoteOffCount = 0;
+    state.soundingGenerations = 0;
+    state.lastScheduledState = ScheduledKeyStateValue::Unknown;
 
-  for (uint32_t i = 0; i < queue.count; ++i) {
-    if (EventIsNoteOn(queue.entries[i].kind))
-      ++state.pendingNoteOnCount;
-    else if (EventIsNoteOff(queue.entries[i].kind))
-      ++state.pendingNoteOffCount;
-  }
+    for (uint32_t i = 0; i < queue.count; ++i) {
+        if (EventIsNoteOn(queue.entries[i].kind)) {
+            ++state.pendingNoteOnCount;
+        } else if (EventIsNoteOff(queue.entries[i].kind)) {
+            ++state.pendingNoteOffCount;
+        }
+    }
 
-  if (queue.count > 0)
-    state.lastScheduledState = EventToScheduledState(queue.entries[queue.count - 1U].kind);
+    if (queue.count > 0) {
+        state.lastScheduledState = EventToScheduledState(queue.entries[queue.count - 1].kind);
+    }
 }
 
-int Scheduler::FindDuplicateTransitionSlot(const NormalizedEvent &event) const {
-  if (!EventUsesKey(event.kind))
-    return -1;
-
-  const TransitionQueue &queue = transitionQueues_[event.channel][event.note];
-  for (uint32_t i = 0; i < queue.count; ++i) {
-    const TransitionEntry &entry = queue.entries[i];
-    if (entry.kind == event.kind && entry.targetSample == event.targetSample &&
-        entry.applyPriority == event.applyPriority) {
-      return (int)entry.slotIndex;
+void Scheduler::RemoveTransitionSlot(uint8_t channel, uint8_t note, uint32_t slotIndex) {
+    TransitionQueue &queue = transitionQueues_[channel][note];
+    for (uint32_t i = 0; i < queue.count; ++i) {
+        if (queue.entries[i].slotIndex != slotIndex) {
+            continue;
+        }
+        for (uint32_t j = i + 1; j < queue.count; ++j) {
+            queue.entries[j - 1] = queue.entries[j];
+        }
+        --queue.count;
+        break;
     }
-  }
-  return -1;
+    RecomputeKeyState(channel, note);
 }
 
-int Scheduler::FindOverflowReplacementSlot(const NormalizedEvent &event) const {
-  if (!EventUsesKey(event.kind))
-    return -1;
-
-  const TransitionQueue &queue = transitionQueues_[event.channel][event.note];
-  int candidateIndex = -1;
-  uint8_t candidateVelocity = 0;
-  int64_t candidateTarget = 0;
-
-  for (uint32_t i = 0; i < queue.count; ++i) {
-    const TransitionEntry &entry = queue.entries[i];
-    if (!EventIsNoteOn(entry.kind))
-      continue;
-
-    if (candidateIndex < 0 || entry.velocity < candidateVelocity ||
-        (entry.velocity == candidateVelocity &&
-         entry.targetSample > candidateTarget)) {
-      candidateIndex = (int)entry.slotIndex;
-      candidateVelocity = entry.velocity;
-      candidateTarget = entry.targetSample;
+int Scheduler::FindDuplicateInBucket(const Bucket &bucket, const NormalizedEvent &event) const {
+    if (!EventUsesKey(event.kind)) {
+        return -1;
     }
-  }
-
-  if (candidateIndex < 0)
+    
+    for (size_t i = 0; i < bucket.events.size(); ++i) {
+        const NormalizedEvent &existing = bucket.events[i];
+        if (existing.kind == event.kind &&
+            existing.channel == event.channel &&
+            existing.note == event.note &&
+            existing.targetSample == event.targetSample &&
+            existing.applyPriority == event.applyPriority) {
+            return (int)i;
+        }
+    }
     return -1;
-
-  if (EventIsNoteOn(event.kind) && candidateVelocity > event.velocity &&
-      candidateTarget <= event.targetSample) {
-    return -1;
-  }
-
-  return candidateIndex;
 }
 
 } // namespace virtuallysuper

@@ -207,6 +207,35 @@ struct LiveBridgeStats {
   FLOAT pitchBendRange[16];
 };
 
+// Extended configuration for advanced tuning
+struct LiveBridgeSettingsExtended {
+  // Overload management
+  LONG overloadSoftVoiceThreshold;
+  LONG overloadHardVoiceThreshold;
+  LONG overloadPanicVoiceThreshold;
+  LONG overloadSoftQueueThreshold;
+  LONG overloadHardQueueThreshold;
+  
+  // Scheduler tuning
+  LONG schedulerIngressCapacity;
+  LONG schedulerScheduledCapacity;
+  LONG schedulerTransitionQueueCapacity;
+  
+  // Voice rendering
+  LONG voiceRenderTileFrames;
+  LONG voiceReleaseDecayScale; // Percentage adjustment
+  
+  // Layer configuration (for grouped/density tiers)
+  LONG groupedMaxGroups;
+  LONG densityMaxObjects;
+  LONG densityActivationThreshold;
+  LONG groupedPitchBandSemitones;
+  LONG densityPitchBandSemitones;
+  
+  // Reserved for future expansion
+  LONG reserved[16];
+};
+
 struct LiveBridgeSharedState {
   DWORD magic;
   DWORD version;
@@ -217,6 +246,7 @@ struct LiveBridgeSharedState {
 
   LiveBridgeSettings currentSettings;
   LiveBridgeStats currentStats;
+  LiveBridgeSettingsExtended extendedSettings;
   CHAR resolvedAudioBackend[SVMS_MAX_BACKEND_TEXT];
   CHAR resolvedSamplerEngine[SVMS_MAX_BACKEND_TEXT];
   CHAR resolvedSourceFormat[16];
@@ -231,9 +261,10 @@ struct LiveBridgeSharedState {
   volatile LONG commandResult;
   DWORD commandSourcePid;
   LiveBridgeSettings requestedSettings;
+  LiveBridgeSettingsExtended requestedExtendedSettings;
   CHAR commandMessage[SVMS_MAX_STATUS_TEXT];
 
-  DWORD reserved[32];
+  DWORD reserved[16];
 };
 
 #pragma pack(pop)

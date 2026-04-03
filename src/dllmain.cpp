@@ -17,6 +17,11 @@ static const char *kStartupAttributionLine =
 
 static volatile LONG g_runtimeInitState = 0;
 
+// Windows 7 compatibility: global function pointer for GetSystemTimePreciseAsFileTime
+#if SVMS_NEED_GETSYSTEMTIMEPRECISE
+PFN_GetSystemTimePreciseAsFileTime g_pfnGetSystemTimePreciseAsFileTime = NULL;
+#endif
+
 #ifdef SVMS_LEGACY_XP
 static HMODULE GetSystemWinmmModule() {
   static HMODULE module = NULL;
@@ -1143,6 +1148,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
                       LPVOID lpReserved) {
   switch (ul_reason_for_call) {
   case DLL_PROCESS_ATTACH:
+    // Initialize Windows 7 compatibility layer for time functions
+    CompatInitializeTimeFunctions();
+    
     OutputDebugStringA("SVMS: DLL_PROCESS_ATTACH\n");
     OutputDebugStringA(kStartupAttributionLine);
     OutputDebugStringA(kAttributionLine);

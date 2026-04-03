@@ -19,9 +19,22 @@ void TelemetryPublisher::Publish(const SchedulerStats &schedulerStats,
   snapshot.releasedExactVoices = exactStats.releasedVoices;
   snapshot.groupedObjects = groupedStats.activeGroups;
   snapshot.densityObjects = densityStats.activeObjects;
-  snapshot.voiceEquivalent = exactStats.activeVoices +
-                             groupedStats.noteOnsAccumulated +
-                             densityStats.noteOnsAccumulated;
+  
+  // Calculate proper voice equivalent:
+  // - Each exact voice = 1 voice
+  // - Each grouped object represents multiple notes, weighted by representation
+  // - Each density object represents a statistical cloud, weighted by activation
+  const uint32_t groupedVoiceEq = groupedStats.activeGroups > 0
+      ? (groupedStats.noteOnsAccumulated + groupedStats.activeGroups - 1) / groupedStats.activeGroups
+      : 0;
+  const uint32_t densityVoiceEq = densityStats.activeObjects > 0
+      ? (densityStats.noteOnsAccumulated + densityStats.activeObjects - 1) / densityStats.activeObjects
+      : 0;
+  
+  snapshot.voiceEquivalent = exactStats.activeVoices + 
+                             groupedVoiceEq * groupedStats.activeGroups +
+                             densityVoiceEq * densityStats.activeObjects;
+  
   snapshot.schedulerQueuedEvents = schedulerQueuedEvents;
   snapshot.schedulerMaxTransitionQueueDepth =
       schedulerStats.maxTransitionQueueDepth;

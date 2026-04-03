@@ -3,6 +3,7 @@
 
 #include "VirtuallySuperSoundFontRuntime.h"
 #include "VirtuallySuperTypes.h"
+#include "VirtuallySuperRenderSIMD.h"
 
 #include <vector>
 
@@ -30,6 +31,16 @@ public:
   uint32_t GetKeyHead(uint32_t channel, uint32_t note) const;
   uint32_t GetQueueHead(ExactQueueClass queueClass) const;
   void RetireVoice(uint32_t handle);
+
+  // SoA access for SIMD rendering
+  VoiceSoABuffer &GetVoiceSoA() { return voiceSoA_; }
+  const VoiceSoABuffer &GetVoiceSoA() const { return voiceSoA_; }
+
+  // Linking / queue management (exposed for render system)
+  void LinkQueueTail(ExactQueueClass queueClass, uint32_t handle);
+  void UnlinkQueue(uint32_t handle);
+  void InsertKeyVoice(uint32_t handle);
+  void RemoveKeyVoice(uint32_t handle);
 
 private:
   struct ChannelPitchState {
@@ -66,10 +77,6 @@ private:
   void ResetPitchChannels();
   bool HandlePitchControl(uint8_t channel, uint8_t controller, uint8_t value);
   float GetPitchShiftSemitones(uint8_t channel) const;
-  void InsertKeyVoice(uint32_t handle);
-  void RemoveKeyVoice(uint32_t handle);
-  void LinkQueueTail(ExactQueueClass queueClass, uint32_t handle);
-  void UnlinkQueue(uint32_t handle);
   ExactQueueClass ClassifyQueue(const ExactVoice &voice) const;
   void ReclassifyVoiceQueue(uint32_t handle);
   void AddVoiceState(ExactLifecycleState state);
@@ -83,6 +90,10 @@ private:
   uint32_t generationCounters_[kChannelCount][kNoteCount];
   uint32_t keyHeads_[kChannelCount][kNoteCount];
   QueueState queues_[5];
+  
+  // SoA voice data for SIMD rendering
+  VoiceSoABuffer voiceSoA_;
+  // AoS voice data for compatibility (can be removed in future)
   std::vector<ExactVoice> voices_;
   std::vector<uint32_t> freeList_;
   uint32_t freeCount_;

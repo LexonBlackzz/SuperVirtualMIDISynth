@@ -63,7 +63,10 @@ struct SoundFontRegion {
   float attenuationDb;
   float pan;
   float attackSeconds;
+  float decaySeconds;
+  float sustainLevel;      // 0.0 to 1.0 (1.0 = no decay)
   float releaseSeconds;
+  float holdSeconds;
 
   SoundFontRegion()
       : sampleIndex(kInvalidSoundFontIndex),
@@ -71,7 +74,8 @@ struct SoundFontRegion {
         loopMode(SoundFontLoopNone), reserved0(0), sampleStart(0),
         sampleEnd(0), loopStart(0), loopEnd(0), sampleRate(0), coarseTune(0),
         fineTune(0), rootKey(-1), keyTrack(100), attenuationDb(0.0f),
-        pan(0.0f), attackSeconds(0.0f), releaseSeconds(0.03f) {}
+        pan(0.0f), attackSeconds(0.0f), decaySeconds(0.0f),
+        sustainLevel(1.0f), releaseSeconds(0.03f), holdSeconds(0.0f) {}
 };
 
 struct SoundFontDispatchEntry {
@@ -157,6 +161,10 @@ struct SoundFontNoteInfo {
   float leftGain;
   float rightGain;
   float attackSeconds;
+  float decaySeconds;
+  float sustainLevel;      // 0.0 to 1.0
+  float holdSeconds;
+  float releaseSeconds;
   float releaseDecay;
 
   SoundFontNoteInfo()
@@ -164,7 +172,8 @@ struct SoundFontNoteInfo {
         sampleIndex(kInvalidSoundFontIndex), sampleData(0), sampleStart(0),
         sampleEnd(0), loopStart(0), loopEnd(0), loopMode(SoundFontLoopNone),
         phaseStep(0.0f), initialGain(0.0f), leftGain(0.0f), rightGain(0.0f),
-        attackSeconds(0.0f), releaseDecay(0.0f) {}
+        attackSeconds(0.0f), decaySeconds(0.0f), sustainLevel(1.0f),
+        holdSeconds(0.0f), releaseSeconds(0.0f), releaseDecay(0.0f) {}
 };
 
 } // namespace virtuallysuper
