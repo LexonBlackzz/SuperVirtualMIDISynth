@@ -58,6 +58,7 @@ echo     midiOutSetVolume
 echo     midiOutGetVolume
 echo     midiOutGetErrorTextA
 echo     midiOutGetErrorTextW
+echo     midiOutMessage
 echo.
 echo     midiInGetNumDevs
 echo     midiInGetDevCapsA
@@ -70,6 +71,7 @@ echo     midiInAddBuffer
 echo     midiInStart
 echo     midiInStop
 echo     midiInReset
+echo     midiInMessage
 echo     waveInGetNumDevs
 echo     waveInGetDevCapsA
 echo     waveInGetDevCapsW
@@ -167,6 +169,7 @@ echo     midiOutSetVolume=_midiOutSetVolume@8
 echo     midiOutGetVolume=_midiOutGetVolume@8
 echo     midiOutGetErrorTextA=_midiOutGetErrorTextA@12
 echo     midiOutGetErrorTextW=_midiOutGetErrorTextW@12
+echo     midiOutMessage=_midiOutMessage@16
 echo.
 echo     midiInGetNumDevs=_midiInGetNumDevs@0
 echo     midiInGetDevCapsA=_midiInGetDevCapsA@12
@@ -179,6 +182,7 @@ echo     midiInAddBuffer=_midiInAddBuffer@12
 echo     midiInStart=_midiInStart@4
 echo     midiInStop=_midiInStop@4
 echo     midiInReset=_midiInReset@4
+echo     midiInMessage=_midiInMessage@16
 echo     waveInGetNumDevs=_waveInGetNumDevs@0
 echo     waveInGetDevCapsA=_waveInGetDevCapsA@12
 echo     waveInGetDevCapsW=_waveInGetDevCapsW@12
