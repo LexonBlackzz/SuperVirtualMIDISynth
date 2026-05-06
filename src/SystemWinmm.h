@@ -16,6 +16,8 @@ typedef MMRESULT (WINAPI *Func_midiInAddBuffer)(HMIDIIN, LPMIDIHDR, UINT);
 typedef MMRESULT (WINAPI *Func_midiInStart)(HMIDIIN);
 typedef MMRESULT (WINAPI *Func_midiInStop)(HMIDIIN);
 typedef MMRESULT (WINAPI *Func_midiInReset)(HMIDIIN);
+typedef MMRESULT (WINAPI *Func_midiInMessage)(HMIDIIN, UINT, DWORD_PTR,
+                                              DWORD_PTR);
 typedef UINT (WINAPI *Func_waveInGetNumDevs)(void);
 typedef MMRESULT (WINAPI *Func_waveInGetDevCapsA)(UINT_PTR, LPWAVEINCAPSA, UINT);
 typedef MMRESULT (WINAPI *Func_waveInGetDevCapsW)(UINT_PTR, LPWAVEINCAPSW, UINT);
@@ -58,6 +60,8 @@ typedef MMRESULT (WINAPI *Func_mixerSetControlDetails)(
 
 typedef MMRESULT (WINAPI *Func_midiOutSetVolume)(HMIDIOUT, DWORD);
 typedef MMRESULT (WINAPI *Func_midiOutGetVolume)(HMIDIOUT, LPDWORD);
+typedef MMRESULT (WINAPI *Func_midiOutMessage)(HMIDIOUT, UINT, DWORD_PTR,
+                                               DWORD_PTR);
 
 typedef MMRESULT (WINAPI *Func_waveOutGetNumDevs)(void);
 typedef MMRESULT (WINAPI *Func_waveOutGetDevCapsA)(UINT_PTR, LPWAVEOUTCAPSA, UINT);
@@ -109,6 +113,7 @@ public:
     Func_midiInStart Real_midiInStart = nullptr;
     Func_midiInStop Real_midiInStop = nullptr;
     Func_midiInReset Real_midiInReset = nullptr;
+    Func_midiInMessage Real_midiInMessage = nullptr;
     Func_waveInGetNumDevs Real_waveInGetNumDevs = nullptr;
     Func_waveInGetDevCapsA Real_waveInGetDevCapsA = nullptr;
     Func_waveInGetDevCapsW Real_waveInGetDevCapsW = nullptr;
@@ -140,6 +145,7 @@ public:
     // MIDI Out Pointers
     Func_midiOutSetVolume Real_midiOutSetVolume = nullptr;
     Func_midiOutGetVolume Real_midiOutGetVolume = nullptr;
+    Func_midiOutMessage Real_midiOutMessage = nullptr;
 
     // Wave Out Pointers
     Func_waveOutGetNumDevs Real_waveOutGetNumDevs = nullptr;

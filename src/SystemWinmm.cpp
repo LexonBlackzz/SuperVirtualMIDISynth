@@ -31,6 +31,7 @@ void SystemWinmm::Initialize() {
     Real_midiInStart = (Func_midiInStart)GetProcAddress(hSystemWinmm, "midiInStart");
     Real_midiInStop = (Func_midiInStop)GetProcAddress(hSystemWinmm, "midiInStop");
     Real_midiInReset = (Func_midiInReset)GetProcAddress(hSystemWinmm, "midiInReset");
+    Real_midiInMessage = (Func_midiInMessage)GetProcAddress(hSystemWinmm, "midiInMessage");
     Real_waveInGetNumDevs = (Func_waveInGetNumDevs)GetProcAddress(hSystemWinmm, "waveInGetNumDevs");
     Real_waveInGetDevCapsA = (Func_waveInGetDevCapsA)GetProcAddress(hSystemWinmm, "waveInGetDevCapsA");
     Real_waveInGetDevCapsW = (Func_waveInGetDevCapsW)GetProcAddress(hSystemWinmm, "waveInGetDevCapsW");
@@ -62,6 +63,7 @@ void SystemWinmm::Initialize() {
     // MIDI Out
     Real_midiOutSetVolume = (Func_midiOutSetVolume)GetProcAddress(hSystemWinmm, "midiOutSetVolume");
     Real_midiOutGetVolume = (Func_midiOutGetVolume)GetProcAddress(hSystemWinmm, "midiOutGetVolume");
+    Real_midiOutMessage = (Func_midiOutMessage)GetProcAddress(hSystemWinmm, "midiOutMessage");
 
     // Wave Out
     Real_waveOutGetNumDevs = (Func_waveOutGetNumDevs)GetProcAddress(hSystemWinmm, "waveOutGetNumDevs");
