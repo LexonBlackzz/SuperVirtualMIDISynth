@@ -45,3 +45,8 @@
 /.vscode
 /w64devkit-x86
 /.qwen
+/.ghidra
+/.ghidra_home\AppData
+/.ghidra_11.4_PUBLIC
+*ghidra*
+config.ini
