@@ -548,6 +548,15 @@ __declspec(dllexport) MMRESULT WINAPI midiOutGetErrorTextW(MMRESULT mmrError,
   return MMSYSERR_NOERROR;
 }
 
+__declspec(dllexport) MMRESULT WINAPI midiOutMessage(HMIDIOUT hmo, UINT uMsg,
+                                                     DWORD_PTR dw1,
+                                                     DWORD_PTR dw2) {
+  InitializeRuntimeIfNeeded();
+  if (SystemWinmm::Instance().Real_midiOutMessage)
+    return SystemWinmm::Instance().Real_midiOutMessage(hmo, uMsg, dw1, dw2);
+  return MMSYSERR_NODRIVER;
+}
+
 // ========================== MIDI IN (PASSTHROUGH) ==========================
 
 __declspec(dllexport) MMRESULT WINAPI midiInGetNumDevs(void) {
@@ -640,6 +649,16 @@ __declspec(dllexport) MMRESULT WINAPI midiInReset(HMIDIIN hmi) {
   InitializeRuntimeIfNeeded();
   if (SystemWinmm::Instance().Real_midiInReset)
     return SystemWinmm::Instance().Real_midiInReset(hmi);
+  return MMSYSERR_NODRIVER;
+}
+
+__declspec(dllexport) MMRESULT WINAPI midiInMessage(HMIDIIN hmi, UINT uMsg,
+                                                    DWORD_PTR dwParam1,
+                                                    DWORD_PTR dwParam2) {
+  InitializeRuntimeIfNeeded();
+  if (SystemWinmm::Instance().Real_midiInMessage)
+    return SystemWinmm::Instance().Real_midiInMessage(hmi, uMsg, dwParam1,
+                                                      dwParam2);
   return MMSYSERR_NODRIVER;
 }
 
