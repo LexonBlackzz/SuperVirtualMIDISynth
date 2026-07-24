@@ -341,6 +341,11 @@ private:
   std::vector<MidiEvent> releaseEventsScratch;
   std::vector<MidiEvent> scheduledIngressScratch;
   std::vector<MidiEvent> accurateWorksetScratch;
+  std::vector<unsigned char> dueEventKeepFlagsScratch;
+  std::vector<size_t> dueEventOnTimeStrongScratch;
+  std::vector<size_t> dueEventOnTimeQuietScratch;
+  std::vector<size_t> dueEventOverdueStrongScratch;
+  std::vector<size_t> dueEventOverdueQuietScratch;
   EventTimingMode eventTimingMode = EventTimingMode::ACCURATE;
   std::atomic<unsigned int> nextEventSequence{1};
   std::atomic<unsigned int> droppedNoteOnEvents{0};

@@ -243,38 +243,17 @@ static unsigned int NextPowerOfTwo(unsigned int value) {
   return value + 1u;
 }
 
-static void InsertMidiEventBySequence(std::vector<MidiEvent> &events,
-                                      const MidiEvent &event) {
-  std::vector<MidiEvent>::iterator pos = events.end();
-  while (pos != events.begin() && (pos - 1)->sequence > event.sequence)
-    --pos;
-  events.insert(pos, event);
+static bool MidiEventSequenceLess(const MidiEvent &lhs,
+                                  const MidiEvent &rhs) {
+  return lhs.sequence < rhs.sequence;
 }
 
-static void MergeMidiEventVectorsBySequence(std::vector<MidiEvent> &dst,
-                                            const std::vector<MidiEvent> &src) {
-  if (src.empty())
+static void EnsureMidiEventsSortedBySequence(std::vector<MidiEvent> &events) {
+  if (events.size() < 2)
     return;
-  if (dst.empty()) {
-    dst = src;
+  if (std::is_sorted(events.begin(), events.end(), MidiEventSequenceLess))
     return;
-  }
-
-  std::vector<MidiEvent> merged;
-  merged.reserve(dst.size() + src.size());
-  size_t dstIndex = 0;
-  size_t srcIndex = 0;
-  while (dstIndex < dst.size() && srcIndex < src.size()) {
-    if (dst[dstIndex].sequence <= src[srcIndex].sequence)
-      merged.push_back(dst[dstIndex++]);
-    else
-      merged.push_back(src[srcIndex++]);
-  }
-  while (dstIndex < dst.size())
-    merged.push_back(dst[dstIndex++]);
-  while (srcIndex < src.size())
-    merged.push_back(src[srcIndex++]);
-  dst.swap(merged);
+  std::sort(events.begin(), events.end(), MidiEventSequenceLess);
 }
 
 static std::string GetConfiguredSoundSource() {
@@ -443,6 +422,11 @@ Synth::Synth() {
   releaseEventsScratch.reserve(kReleaseLaneApplyLimit);
   scheduledIngressScratch.reserve(kAccurateDrainBatchLimit);
   accurateWorksetScratch.reserve(kAccurateDrainBatchLimit);
+  dueEventKeepFlagsScratch.reserve(kAccurateDrainBatchLimit);
+  dueEventOnTimeStrongScratch.reserve(kAccurateDrainBatchLimit);
+  dueEventOnTimeQuietScratch.reserve(kAccurateDrainBatchLimit);
+  dueEventOverdueStrongScratch.reserve(kAccurateDrainBatchLimit);
+  dueEventOverdueQuietScratch.reserve(kAccurateDrainBatchLimit);
   heapIndexByEventId.reserve(kHardDeferredThreshold + 1u);
   scheduledHeap.reserve(kHardDeferredThreshold);
   scheduledNoteOnTrimHeap.reserve(kHardDeferredThreshold);
@@ -1247,18 +1231,22 @@ void Synth::FlushScheduledEventsLocked() {
 
 void Synth::CollectPendingScheduledEventsLocked(std::vector<MidiEvent> &events) {
   events.clear();
+  events.reserve(deferredCriticalEvents.size() + deferredRealtimeEvents.size() +
+                 deferredNoteOnEvents.size() + incomingCriticalEvents.size() +
+                 incomingRealtimeEvents.size() + incomingNoteOnEvents.size());
 
   auto collectFromVector = [&](std::vector<MidiEvent> &source) {
-    std::vector<MidiEvent> retained;
-    retained.reserve(source.size());
-    for (std::vector<MidiEvent>::const_iterator it = source.begin();
-         it != source.end(); ++it) {
-      if (IsScheduledTimingEvent(*it))
-        InsertMidiEventBySequence(events, *it);
-      else
-        retained.push_back(*it);
+    size_t writeIndex = 0;
+    for (size_t i = 0; i < source.size(); ++i) {
+      if (IsScheduledTimingEvent(source[i]))
+        events.push_back(source[i]);
+      else {
+        if (writeIndex != i)
+          source[writeIndex] = source[i];
+        ++writeIndex;
+      }
     }
-    source.swap(retained);
+    source.resize(writeIndex);
   };
 
   auto collectFromFlatQueue = [&](FlatMidiQueue &source) {
@@ -1267,7 +1255,7 @@ void Synth::CollectPendingScheduledEventsLocked(std::vector<MidiEvent> &events) 
       MidiEvent event = source.front();
       source.pop_front();
       if (IsScheduledTimingEvent(event))
-        InsertMidiEventBySequence(events, event);
+        events.push_back(event);
       else
         source.push_back(event);
     }
@@ -1279,6 +1267,7 @@ void Synth::CollectPendingScheduledEventsLocked(std::vector<MidiEvent> &events) 
   collectFromVector(incomingCriticalEvents);
   collectFromVector(incomingRealtimeEvents);
   collectFromVector(incomingNoteOnEvents);
+  EnsureMidiEventsSortedBySequence(events);
 }
 
 void Synth::EnqueuePendingEventLocked(const MidiEvent &event) {
@@ -1763,18 +1752,22 @@ void Synth::FilterDueEventsForOverloadLocked(std::vector<MidiEvent> &events,
       effectiveOverloadState >= 2
           ? GetAdaptiveHardDueApplyLimit(configuredMaxVoices)
           : GetAdaptiveSoftDueApplyLimit(configuredMaxVoices);
-  std::vector<MidiEvent> kept;
-  std::vector<unsigned char> keepFlags(events.size(), 0u);
-  std::vector<size_t> onTimeStrong;
-  std::vector<size_t> onTimeQuiet;
-  std::vector<size_t> overdueStrong;
-  std::vector<size_t> overdueQuiet;
-  kept.reserve(events.size());
+  std::vector<unsigned char> &keepFlags = dueEventKeepFlagsScratch;
+  std::vector<size_t> &onTimeStrong = dueEventOnTimeStrongScratch;
+  std::vector<size_t> &onTimeQuiet = dueEventOnTimeQuietScratch;
+  std::vector<size_t> &overdueStrong = dueEventOverdueStrongScratch;
+  std::vector<size_t> &overdueQuiet = dueEventOverdueQuietScratch;
+  unsigned int fixedEventCount = 0u;
+  keepFlags.assign(events.size(), 0u);
+  onTimeStrong.clear();
+  onTimeQuiet.clear();
+  overdueStrong.clear();
+  overdueQuiet.clear();
   for (size_t i = 0; i < events.size(); ++i) {
     const MidiEvent &event = events[i];
     if (!IsPositiveNoteOn(event)) {
       keepFlags[i] = 1u;
-      kept.push_back(event);
+      ++fixedEventCount;
     } else if (event.targetSample < currentSample) {
       if (event.data2 <= kSoftScheduledTrimVelocityFloor)
         overdueQuiet.push_back(i);
@@ -1789,7 +1782,7 @@ void Synth::FilterDueEventsForOverloadLocked(std::vector<MidiEvent> &events,
   }
 
   unsigned int noteOnBudget =
-      kept.size() >= applyLimit ? 0u : (applyLimit - (unsigned int)kept.size());
+      fixedEventCount >= applyLimit ? 0u : (applyLimit - fixedEventCount);
   if (effectiveOverloadState >= 2) {
     const unsigned int onTimeBudget =
         GetAdaptiveHardDueOnTimeBudget(configuredMaxVoices);
@@ -1853,12 +1846,15 @@ void Synth::FilterDueEventsForOverloadLocked(std::vector<MidiEvent> &events,
   if (droppedCount == 0)
     return;
 
-  kept.clear();
+  size_t writeIndex = 0;
   for (size_t i = 0; i < events.size(); ++i) {
-    if (keepFlags[i] != 0u)
-      kept.push_back(events[i]);
+    if (keepFlags[i] != 0u) {
+      if (writeIndex != i)
+        events[writeIndex] = events[i];
+      ++writeIndex;
+    }
   }
-  events.swap(kept);
+  events.resize(writeIndex);
   droppedNoteOnEvents.fetch_add(droppedCount, std::memory_order_relaxed);
   lastNoteOnsDropped += droppedCount;
   lastOverloadNoteOnsDropped += droppedCount;
@@ -3019,7 +3015,7 @@ void Synth::ProcessEventsLocked() {
         for (std::vector<MidiEvent>::const_iterator it = bypassEvents.begin();
              it != bypassEvents.end(); ++it) {
           if (accurateEvents.size() < worksetCap) {
-            InsertMidiEventBySequence(accurateEvents, *it);
+            accurateEvents.push_back(*it);
           } else if (IsPositiveNoteOn(*it)) {
             ++lastNoteOnsDropped;
             ++lastAsyncDropped;
@@ -3032,32 +3028,33 @@ void Synth::ProcessEventsLocked() {
           }
         }
       } else {
-        MergeMidiEventVectorsBySequence(accurateEvents, bypassEvents);
+        accurateEvents.insert(accurateEvents.end(), bypassEvents.begin(),
+                              bypassEvents.end());
       }
     }
     if (!accurateEvents.empty()) {
+      EnsureMidiEventsSortedBySequence(accurateEvents);
       if (accurateEvents.size() > kFallbackScheduledBatchCap) {
-        std::vector<MidiEvent> overflow(accurateEvents.begin() +
-                                            kFallbackScheduledBatchCap,
-                                        accurateEvents.end());
-        accurateEvents.resize(kFallbackScheduledBatchCap);
-        for (std::vector<MidiEvent>::const_iterator it = overflow.begin();
-             it != overflow.end(); ++it) {
-          if (IsPositiveNoteOn(*it)) {
+        for (size_t i = kFallbackScheduledBatchCap; i < accurateEvents.size();
+             ++i) {
+          const MidiEvent &overflowEvent = accurateEvents[i];
+          if (IsPositiveNoteOn(overflowEvent)) {
             ++lastNoteOnsDropped;
             ++lastAsyncDropped;
             ++lastOverloadNoteOnsDropped;
             ++lastPostScheduleDrops;
             ++lastCatchupPrevented;
             droppedNoteOnEvents.fetch_add(1, std::memory_order_relaxed);
-          } else if (IsReleaseLikeEvent(*it) || IsCriticalControlEvent(*it)) {
-            releaseLaneEvents.push_back(*it);
+          } else if (IsReleaseLikeEvent(overflowEvent) ||
+                     IsCriticalControlEvent(overflowEvent)) {
+            releaseLaneEvents.push_back(overflowEvent);
           } else {
             ++lastPostScheduleDrops;
             ++lastCatchupPrevented;
-            EnqueueDeferredEvent(*it);
+            EnqueueDeferredEvent(overflowEvent);
           }
         }
+        accurateEvents.resize(kFallbackScheduledBatchCap);
       }
       if (!releaseLaneEvents.empty()) {
         compat::LockGuard<compat::Mutex> queueLock(eventQueueMutex);
@@ -3286,6 +3283,8 @@ DWORD WINAPI Synth::AccurateEventThreadProc(LPVOID param) {
 void Synth::PrepareAccurateTimedEvents(std::vector<MidiEvent> &events) {
   if (events.empty())
     return;
+
+  EnsureMidiEventsSortedBySequence(events);
 
   const LARGE_INTEGER freq = GetPerfFrequency();
   int sampleRate = accurateEventClockSampleRate.load(std::memory_order_relaxed);
@@ -3662,11 +3661,6 @@ void Synth::Render(float *output, int numFrames) {
         if (cursorSample != blockStartSample)
           appliedInsideBlock = true;
       }
-      const long long pollSliceEnd =
-          cursorSample +
-          (long long)((kRenderPollSliceFrames < (unsigned int)(numFrames - renderedFrames))
-                          ? kRenderPollSliceFrames
-                          : (unsigned int)(numFrames - renderedFrames));
       const long long coalesceWindowEnd =
           cursorSample +
           (long long)((kAccurateCoalesceWindowSamples <
@@ -3679,10 +3673,6 @@ void Synth::Render(float *output, int numFrames) {
           renderUntilSample);
       if (!drainedWindow && !dueEvents.empty())
         dueEvents.clear();
-      if (!drainedWindow && IsStrictAccurateModeLocked() &&
-          pollSliceEnd < blockEndSample) {
-        renderUntilSample = pollSliceEnd;
-      }
 
       if (renderUntilSample > cursorSample) {
         int chunkFrames = (int)(renderUntilSample - cursorSample);

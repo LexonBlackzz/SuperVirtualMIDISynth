@@ -870,22 +870,19 @@ int AudioOutput::FillOutputBuffer(int16_t *destPtr, int numFrames, int sampleRat
       audioSettings.wasapiAsyncFeed &&
       GetResolvedBackendName() == "WASAPI Shared";
 
-  int renderBlockSize = BLOCK_SIZE;
+  int renderBlockSize = numFrames;
+  if (renderBlockSize < 1)
+    renderBlockSize = 1;
   if (usePollingRate && audioSettings.pollingRate > 0) {
     renderBlockSize = sampleRate / audioSettings.pollingRate;
     if (renderBlockSize < 1)
       renderBlockSize = 1;
     if (renderBlockSize > BLOCK_SIZE)
       renderBlockSize = BLOCK_SIZE;
-  } else if (useWasapiAsyncFeed && sampleRate > 0) {
-    renderBlockSize = sampleRate / 1000;
-    if (renderBlockSize < 64)
-      renderBlockSize = 64;
-    if (renderBlockSize > 128)
-      renderBlockSize = 128;
-    if (renderBlockSize > BLOCK_SIZE)
-      renderBlockSize = BLOCK_SIZE;
   }
+
+  if ((int)mixBuffer.size() < renderBlockSize * 2)
+    mixBuffer.resize(renderBlockSize * 2);
 
   {
     static bool s_lastLoggedUsePollingRate = false;
@@ -921,7 +918,7 @@ int AudioOutput::FillOutputBuffer(int16_t *destPtr, int numFrames, int sampleRat
   float reportedAudioBlockMs = 0.0f;
   float reportedBudgetMs = 0.0f;
 
-  if ((usePollingRate && audioSettings.pollingRate > 0) || useWasapiAsyncFeed) {
+  if (usePollingRate && audioSettings.pollingRate > 0) {
     reportedBudgetMs =
         (float)((double)renderBlockSize * 1000.0 / (double)sampleRate);
   } else {
