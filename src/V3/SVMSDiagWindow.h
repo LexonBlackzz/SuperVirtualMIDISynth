@@ -1,0 +1,17 @@
+#ifndef SVMS_DIAG_WINDOW_H
+#define SVMS_DIAG_WINDOW_H
+
+#include "SVMSTypes.h"
+
+namespace svms {
+
+void DiagWindow_Create(bool showWindow, bool debugOutput);
+void DiagWindow_Destroy();
+void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
+                        float cpuPercent, uint32_t decimationStep,
+                        uint32_t retired, uint32_t retiredImmediate,
+                        const LiveSF2Telemetry& sf2);
+
+} // namespace svms
+
+#endif

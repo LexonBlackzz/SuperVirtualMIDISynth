@@ -6,6 +6,7 @@
 #include "SVMSChannelCache.h"
 #include "SVMSEnvelope.h"
 #include "SVMSPageAllocator.h"
+#include <algorithm>
 #include "SVMSSoundFont.h"
 
 namespace svms {
@@ -18,19 +19,90 @@ inline float InterpolateSample(const float* data, uint32_t baseIndex,
     return s0 + (s1 - s0) * frac;
 }
 
+// Render the compact continuation captured when this primary voice slot was
+// stolen.  The tail follows the old sample cursor and loop for a fixed 10 ms
+// linear ramp.  It has no MIDI identity and cannot consume another voice
+// slot, so note-off/controller handling remains attached only to the new
+// occupant of the slot.
+inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
+                                  const float* sampleData,
+                                  uint32_t sampleDataFrames,
+                                  float* outL, float* outR) {
+    uint32_t remaining = v.stealTailFramesRemaining[idx];
+    if (remaining == 0 || v.stealTailSampleBacked[idx] == 0 || !sampleData)
+        return;
+
+    const uint32_t relEnd = v.stealTailRelEnd[idx];
+    if (relEnd < 2u) {
+        v.stealTailFramesRemaining[idx] = 0;
+        return;
+    }
+
+    float phase = v.stealTailPhase[idx];
+    if (phase < 0.0f) phase = 0.0f;
+    uint32_t baseOffset = static_cast<uint32_t>(phase);
+    const bool loop = v.stealTailLoopEnabled[idx] != 0;
+
+    if (baseOffset + 1u >= relEnd) {
+        if (!loop) {
+            v.stealTailFramesRemaining[idx] = 0;
+            return;
+        }
+        phase = v.stealTailRelLoopSF[idx];
+        baseOffset = v.stealTailRelLoopS[idx];
+    }
+
+    uint32_t nextRel = baseOffset + 1u;
+    if (loop && nextRel >= v.stealTailRelLoopE[idx])
+        nextRel = v.stealTailRelLoopS[idx];
+    if (nextRel >= relEnd) nextRel = relEnd - 1u;
+
+    const uint32_t sampleStart = v.stealTailSampleStart[idx];
+    const uint32_t baseIndex = sampleStart + baseOffset;
+    const uint32_t nextIndex = sampleStart + nextRel;
+    if (baseIndex >= sampleDataFrames || nextIndex >= sampleDataFrames) {
+        v.stealTailFramesRemaining[idx] = 0;
+        return;
+    }
+
+    const float frac = phase - static_cast<float>(baseOffset);
+    const float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+    const uint32_t total = v.stealTailFramesTotal[idx];
+    const float fade = total > 0u
+        ? static_cast<float>(remaining) / static_cast<float>(total)
+        : 0.0f;
+    const float scaled = sample * v.stealTailGain[idx] * fade;
+    *outL += scaled * v.stealTailMixGainL[idx];
+    *outR += scaled * v.stealTailMixGainR[idx];
+
+    phase += v.stealTailPhaseInc[idx];
+    const float loopEnd = v.stealTailRelLoopEF[idx];
+    if (loop && phase >= loopEnd) {
+        float overflow = phase - loopEnd;
+        const float loopStart = v.stealTailRelLoopSF[idx];
+        const float loopLength = loopEnd - loopStart;
+        if (loopLength > 0.0f && overflow >= loopLength)
+            overflow -= floorf(overflow / loopLength) * loopLength;
+        phase = loopStart + overflow;
+    }
+
+    v.stealTailPhase[idx] = phase;
+    v.stealTailFramesRemaining[idx] = remaining - 1u;
+}
+
 // ── Loop eligibility check ──────────────────────────────────────────────
 inline bool ShouldLoopSVMS(uint8_t loopMode, uint32_t loopStart, uint32_t loopEnd,
                             uint8_t state) {
-    if (loopMode == 0) return false;
-    if (state == static_cast<uint8_t>(VoiceState::Releasing) && loopMode == 2)
+    // SF2 sampleModes: 0=no loop, 1=continuous, 2=reserved,
+    // 3=loop while the key is held and continue past the loop on release.
+    if (loopMode == 0 || loopMode == 2) return false;
+    if (state == static_cast<uint8_t>(VoiceState::Releasing) && loopMode == 3)
         return false;
     return loopEnd > loopStart + 1u;
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Event descriptor for sub-sample-precise dispatch.
-// `sampleOffset` is a float so it carries fractional-sample resolution
-// (e.g. 127.37 = 127 samples + 0.37 of a sample into the block).
+// RenderEvent — sub-sample-precise MIDI event descriptor.
 // ════════════════════════════════════════════════════════════════════════
 enum class RenderEventType : uint8_t {
     NoteOn       = 0,
@@ -40,104 +112,72 @@ enum class RenderEventType : uint8_t {
     PitchBend    = 4,
     AllNotesOff  = 5,
     AllSoundOff  = 6,
+    Reset         = 7,
 };
 
 struct RenderEvent {
     RenderEventType type;
     uint8_t  channel;
-    uint8_t  data1;     // note or controller
-    uint8_t  data2;     // velocity or value
-    float    sampleOffset; // fractional sample position within the block
+    uint8_t  data1;
+    uint8_t  data2;
+    uint32_t frameOffset;
+    // Original producer order.  Termination fences use this to reject note
+    // ons that were queued before a later CC120/CC123/reset but reached the
+    // audio thread afterward through another priority lane.
+    uint32_t ingressSequence;
 };
 
-// ════════════════════════════════════════════════════════════════════════
-// Event dispatcher callback.
-//
-// The Driver registers a function of this signature with RenderScalar.
-// During RenderBlock, at each event's exact sampleOffset, the renderer
-// calls this dispatcher so the Driver can perform voice allocation,
-// release, CC updates, etc.  The dispatcher receives the event and the
-// current blockCursor (absolute sample within the block) so it can set
-// phaseOffset and releaseStartInBlock on newly allocated / released voices.
-//
-// Parameters:
-//   event       — the RenderEvent to dispatch
-//   blockCursor — the integer sample position within the block where the
-//                 event fires (floor of event.sampleOffset)
-//   userData    — opaque pointer to the Driver instance
-// ════════════════════════════════════════════════════════════════════════
 using EventDispatcher = void(*)(const RenderEvent& event, uint32_t blockCursor,
                                  void* userData);
 
 // ════════════════════════════════════════════════════════════════════════
-// RenderScalar — sub-sample-accurate scalar render pipeline.
+// RenderScalar — per-sample dispatch + adaptive-decimation scalar render.
 //
 // Architecture:
-//   1. Caller (Driver) pushes timestamped MIDI events into an SPSC queue.
-//      Before each RenderBlock call, the Driver drains the queue into a
-//      sorted RenderEvent array with fractional sample offsets computed
-//      from QPC timestamps.
-//   2. RenderBlock walks the event list, slicing the render at each
-//      event boundary.  Between consecutive events, every active voice
-//      is processed for exactly that sub-block length.
-//   3. At each event boundary, the registered EventDispatcher callback
-//      is invoked so the Driver can handle voice allocation, release,
-//      CC updates, etc.
-//   4. Each newly triggered voice carries a `phaseOffset` that
-//      initializes its sample reader at the exact fractional position,
-//      enabling sub-sample event timing without quantization.
+//   1. Producers push QPC-timestamped events into priority MPSC lanes;
+//      the audio thread schedules them by absolute integer output frame.
+//   2. RenderBlock processes one sample at a time.  At each sample:
+//      a. Dispatch all events assigned to the current output frame.
+//      b. Compute a decimation step from the active voice count.
+//      c. Render one sample of each active voice, advancing the
+//         envelope and mixing output for every Nth voice (step).
+//   3. Equal-frame events retain global ingress sequence ordering.
 //
-// This code path is identical for live WASAPI output and deterministic
-// offline file rendering — the only difference is how the event array
-// is populated.
+// Performance notes (scalar hot loop):
+//   - The per-voice body is fused directly into RenderBlock's voice loop.
+//     A previous out-of-line version cost ~10 cycles/voice-sample in call
+//     + 11-argument marshaling overhead and blocked SoA base registers
+//     from staying cached across iterations.
+//   - At decimation step 1 (< 2K voices) every voice mixes, so the
+//     mixLimit division and newborn check are skipped entirely and
+//     newborn age is derived from the absolute output-frame clock.
+//   - Envelope dispatch is 3-way: sustained voices (stage 3, the
+//     steady-state majority) skip the whole stage chain and the
+//     currentGain store; releasing voices do one multiply; only
+//     transient stages run the sequential chain.
+//   - Loop bounds (relEnd/relLoopS/relLoopE), the loop-enabled flag and
+//     the pan×volume mix gains are precomputed per voice (see
+//     VoiceManager) so the per-sample path never recomputes them or
+//     touches ChannelParamsSnapshot.
+//
+// This is the same path for live WASAPI output and offline rendering.
 // ════════════════════════════════════════════════════════════════════════
 class RenderScalar {
 public:
     RenderScalar();
 
-    // ── Primary entry point ─────────────────────────────────────────────
-    // Renders `numFrames` of audio into the planar L/R output buffers.
-    // `events` / `eventCount` describe timed MIDI events within the block,
-    // sorted by sampleOffset.  Pass eventCount=0 for event-free blocks.
-    //
-    // [HOOK] Density management / decimation: wrap this call with a layer
-    //        that decides how many voices to actually process when voice
-    //        pressure is extreme.  The core path is deterministic, so any
-    //        voice culling must be audibly transparent.
     void RenderBlock(VoiceManager& voices, const ChannelCache& channels,
                      const float* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                      const RenderEvent* events = nullptr,
-                     uint32_t eventCount = 0);
+                     uint32_t eventCount = 0,
+                     bool correctnessMode = false,
+                     uint64_t blockStartFrame = 0);
 
-    // ── Dispatcher registration ─────────────────────────────────────────
-    // The Driver calls this once during initialization to register its
-    // event handler.  The renderer invokes the dispatcher at each event's
-    // exact sample offset during RenderBlock.
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
 
 private:
-    // Process a single voice for a contiguous sub-block [startFrame, startFrame+numFrames).
-    // `startFrame` is the absolute sample position within the current block,
-    // used for release gate timing.  The output pointers are already advanced
-    // to the correct write position.
-    //
-    // On the first sub-block after a note-on, phaseOffset positions the
-    // read cursor at the exact fractional trigger point.  After that first
-    // sub-block, phaseOffset is zeroed so subsequent sub-blocks continue
-    // from where the voice left off.
-    //
-    // [HOOK] Voice-density scaling: a future layer can wrap this to skip
-    //        voices that are perceptually masked or below an audibility
-    //        threshold under heavy polyphony.
-    void ProcessVoice(VoiceManager& voices, VoiceHandle handle,
-                      const ChannelParamsSnapshot& chanParams,
-                      const float* sampleData, uint32_t sampleDataFrames,
-                      float* outLeft, float* outRight,
-                      uint32_t startFrame, uint32_t numFrames,
-                      const RuntimeConfigSnapshot& cfg);
-
     EventDispatcher dispatcher_;
     void* dispatcherUserData_;
 };
@@ -150,269 +190,267 @@ inline void RenderScalar::SetEventDispatcher(EventDispatcher dispatcher, void* u
     dispatcherUserData_ = userData;
 }
 
+
+
 // ════════════════════════════════════════════════════════════════════════
-// ProcessVoice — render one voice for a sub-block of frames.
+// RenderBlock — per-sample dispatch + decimation-stride render.
 //
-// The voice reads from the sample buffer starting at its current phase.
-// On the first sub-block after a note-on, phaseOffset positions the
-// read cursor at the exact fractional trigger point.  After that first
-// sub-block, phaseOffset is zeroed so subsequent sub-blocks continue
-// from where the voice left off.
+// Walk the frame range one sample at a time.  At each sample:
+//   1. Dispatch all events whose integer floor equals the current frame.
+//   2. Compute decimation step from the active voice count.
+//   3. Process every active voice for this sample (fused per-voice body).
 //
-// The envelope (delay/hold/attack/decay/sustain/release) is evaluated
-// per-sample.  Release respects releaseStartInBlock so note-offs
-// triggered mid-block take effect at the exact frame.
+// The per-voice DSP body is fused into the loop below (it used to be a
+// separate ProcessVoiceOneSample call — see class comment for why).
+// `mixAudio` gates only the sample fetch + output accumulation; envelope,
+// phase and retirement always advance so decimated voices don't freeze.
 // ════════════════════════════════════════════════════════════════════════
-inline void RenderScalar::ProcessVoice(VoiceManager& voices, VoiceHandle handle,
-                                        const ChannelParamsSnapshot& chanParams,
+inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& channels,
                                         const float* sampleData, uint32_t sampleDataFrames,
-                                        float* outLeft, float* outRight,
-                                        uint32_t startFrame, uint32_t numFrames,
-                                        const RuntimeConfigSnapshot& cfg) {
+                                        float* outputLeft, float* outputRight,
+                                        uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
+                                        const RenderEvent* events, uint32_t eventCount,
+                                        bool correctnessMode,
+                                        uint64_t blockStartFrame) {
     (void)cfg;
     VoiceSoA& v = voices.v;
 
-    // Apply phaseOffset on first sub-block after trigger, then clear it
-    // so it does not re-accumulate on subsequent sub-blocks.
-    float phase = v.phases[handle] + v.phaseOffset[handle];
-    v.phaseOffset[handle] = 0.0f;
+    // Refresh premultiplied mix gains against the latest channel snapshot
+    // (block-rate, matching how chanParams were consumed before).
+    voices.RefreshMixGains(channels.GetParams());
 
-    float phaseStep = v.phaseIncs[handle];
-    float gain = v.currentGain[handle];
-    uint8_t voiceState = v.state[handle];
-    float voiceGainL = v.gainLeft[handle];
-    float voiceGainR = v.gainRight[handle];
+    uint32_t eventIdx = 0;
 
-    const uint32_t sStart = v.sampleStart[handle];
-    const uint32_t sEnd = v.sampleEnd[handle];
-    const uint32_t sLoopS = v.loopStart[handle];
-    const uint32_t sLoopE = v.loopEnd[handle];
-    const uint8_t  sLoopM = v.loopMode[handle];
-    const uint8_t  sb = v.sampleBacked[handle];
+    uint32_t step = correctnessMode ? 1u : ComputeDecimationStep(voices.activeCount_);
 
-    const bool isSampleBacked = (sb != 0 && sampleData != nullptr);
-    const bool isReleased = (voiceState == static_cast<uint8_t>(VoiceState::Releasing));
-
-    uint32_t relativeSampleEnd = 0;
-    uint32_t relativeLoopStart = 0;
-    uint32_t relativeLoopEnd = 0;
-    if (isSampleBacked) {
-        relativeSampleEnd = sEnd - sStart;
-        relativeLoopStart = (sLoopS > sStart) ? sLoopS - sStart : 0u;
-        relativeLoopEnd = (sLoopE > sStart) ? sLoopE - sStart : 0u;
+    // ── Sort activeList_ by velocity descending ───────────────────────
+    // Only needed when decimation is active (step > 1).  At step=1 all
+    // voices are mixed regardless of position, so the sort is dead weight.
+    if (step > 1 && voices.activeCount_ > 1) {
+        std::sort(voices.activeList_, voices.activeList_ + voices.activeCount_,
+            [&v](uint32_t a, uint32_t b) {
+                return v.velocity[a] > v.velocity[b];
+            });
+        voices.RebuildActivePositions();
     }
-    const bool loop = isSampleBacked && ShouldLoopSVMS(sLoopM, sLoopS, sLoopE, voiceState);
 
-    const float chanVol = chanParams.volume;
-    const float panL = chanParams.panLeft;
-    const float panR = chanParams.panRight;
+    // Running float copy of the frame index for the event-floor compare
+    // (avoids a float→int conversion per event check per sample).
+    uint32_t frameCursor = 0;
 
-    // Release gate is absolute (relative to block start).
-    const uint32_t releaseGate = v.releaseStartInBlock[handle];
-    bool retireVoice = false;
+    for (uint32_t f = 0; f < numFrames; ++f, ++frameCursor) {
+        voices.SetCurrentFrame(blockStartFrame + f);
+        // ── 1. Dispatch events at this frame ──────────────────────────
+        // floor(sampleOffset) <= f  <=>  sampleOffset < f + 1
+        while (eventIdx < eventCount) {
+            if (events[eventIdx].frameOffset > frameCursor) break;
+            if (dispatcher_)
+                dispatcher_(events[eventIdx], f, dispatcherUserData_);
+            ++eventIdx;
+        }
 
-    for (uint32_t f = 0; f < numFrames; ++f) {
-        float sample = 0.0f;
+        // ── 2. Determine decimation step ──────────────────────────────
+        // At step=1 every voice mixes: mixLimit and the newborn check are
+        // dead work, so they are skipped entirely (fullMix fast path).
+        // mixLimit is hoisted per-sample; staleness by one retirement is
+        // harmless (at most one extra voice mixes for one sample).
+        uint32_t stepNow = correctnessMode ? 1u
+                                           : ComputeDecimationStep(voices.activeCount_);
+        const bool fullMix = (stepNow == 1);
+        const uint32_t mixLimit = fullMix ? 0u : (voices.activeCount_ / stepNow);
 
-        if (isSampleBacked) {
-            if (phase < 0.0f) phase = 0.0f;
+        // ── 3. Process active voices ──────────────────────────────────
+        float* outL = outputLeft + f;
+        float* outR = outputRight + f;
 
-            uint32_t baseOffset = static_cast<uint32_t>(phase);
-            if (baseOffset + 1u >= relativeSampleEnd) {
-                if (!loop) {
-                    retireVoice = true;
-                    break;
-                }
-                phase = static_cast<float>(relativeLoopStart);
-                baseOffset = relativeLoopStart;
+        for (uint32_t i = 0; i < voices.activeCount_; ) {
+            uint32_t idx = voices.activeList_[i];
+
+            // Steal tails are always mixed.  Decimating the short ramp could
+            // itself reintroduce the discontinuity this path removes.
+            RenderStealTailSample(v, idx, sampleData, sampleDataFrames, outL, outR);
+
+            if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) {
+                // Retired earlier but not yet cleaned from activeList_ by
+                // the swap-remove in RetireVoice.  Skip; the list compacts
+                // naturally as retirements shrink activeCount_.
+                ++i;
+                continue;
             }
 
-            uint32_t baseIndex = sStart + baseOffset;
-            uint32_t nextIndex = baseIndex + 1u;
+            const bool mixAudio = fullMix
+                || (i < mixLimit)
+                || (voices.GetVoiceAge(static_cast<VoiceHandle>(idx)) <
+                    kNewbornProtectSamples);
 
-            if (loop && nextIndex >= sLoopE)
-                nextIndex = sLoopS;
-            if (nextIndex >= sEnd)
-                nextIndex = sEnd - 1u;
+            // ── Fused per-voice body ──────────────────────────────────
+            float phase          = v.phases[idx];
+            const float phaseStep = v.phaseIncs[idx];
+            float gain           = v.currentGain[idx];
+            const uint8_t voiceState = v.state[idx];
+            const uint32_t sStart = v.sampleStart[idx];
 
-            const float frac = phase - static_cast<float>(baseOffset);
-            sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+            const bool isSampleBacked = (v.sampleBacked[idx] != 0 && sampleData != nullptr);
+            const bool isReleased = (voiceState == static_cast<uint8_t>(VoiceState::Releasing));
 
-            if (!isReleased) {
-                // ── Envelope: delay → hold → attack → decay → sustain ──
-                if (v.envelopeStage[handle] == 4) {
-                    if (v.delaySamplesRemaining[handle] > 0) {
-                        --v.delaySamplesRemaining[handle];
-                        gain = 0.0f;
-                    } else {
-                        v.envelopeStage[handle] = 0;
+            // Precomputed region constants (see VoiceManager::SetVoiceSample).
+            const uint32_t relEnd    = v.relEnd[idx];
+            const uint32_t relLoopS  = v.relLoopS[idx];
+            const uint32_t relLoopE  = v.relLoopE[idx];
+            const float    relLoopSF = v.relLoopSF[idx];
+            const float    relLoopEF = v.relLoopEF[idx];
+            const bool loop = isSampleBacked && (v.loopEnabled[idx] != 0);
+
+            float sample = 0.0f;
+            bool retireVoice = false;
+            bool releaseFinished = false;
+            bool sustain = false;
+
+            if (isSampleBacked) {
+                if (phase < 0.0f) phase = 0.0f;
+
+                uint32_t baseOffset = static_cast<uint32_t>(phase);
+                if (baseOffset + 1u >= relEnd) {
+                    if (!loop) {
+                        retireVoice = true;
+                        goto done;
+                    }
+                    phase = relLoopSF;
+                    baseOffset = relLoopS;
+                }
+
+                {
+                    const uint32_t baseIdx = sStart + baseOffset;
+                    uint32_t nextRel = baseOffset + 1u;
+                    if (loop && nextRel >= relLoopE) nextRel = relLoopS;
+                    if (nextRel >= relEnd) nextRel = relEnd - 1u;
+                    const uint32_t nextIdx = sStart + nextRel;
+
+                    const float frac = phase - static_cast<float>(baseOffset);
+
+                    // Skip expensive sample memory access when decimated.
+                    // The voice still advances phase and envelope so it
+                    // retires correctly; only the audio output is skipped.
+                    if (mixAudio) {
+                        sample = InterpolateSample(sampleData, baseIdx, nextIdx, frac);
                     }
                 }
 
-                if (v.envelopeStage[handle] == 0) {
-                    if (v.holdSamplesRemaining[handle] > 0) {
-                        --v.holdSamplesRemaining[handle];
-                        gain = v.targetGain[handle];
-                    } else {
-                        v.envelopeStage[handle] = 1;
+                // ── Envelope — 3-way early dispatch ───────────────────
+                // Sustain (stage 3, steady-state majority): no envelope
+                // work at all and no currentGain store.  Release: one
+                // multiply.  Transient stages run the sequential chain.
+                {
+                    const uint8_t stage = v.envelopeStage[idx];
+                    sustain = !isReleased && (stage == 3);
+
+                    if (isReleased) {
+                        uint32_t releaseRemaining = v.releaseSamplesRemaining[idx];
+                        if (releaseRemaining == 0u) {
+                            releaseFinished = true;
+                        } else {
+                            gain *= v.releaseDecay[idx];
+                            if (releaseRemaining != UINT32_MAX) {
+                                --releaseRemaining;
+                                v.releaseSamplesRemaining[idx] = releaseRemaining;
+                                releaseFinished = (releaseRemaining == 0u);
+                            }
+                        }
+                    } else if (!sustain) {
+                        if (v.envelopeStage[idx] == 4) {
+                            if (v.delaySamplesRemaining[idx] > 0) {
+                                --v.delaySamplesRemaining[idx];
+                                gain = 0.0f;
+                            } else {
+                                v.envelopeStage[idx] = 0;
+                            }
+                        }
+                        if (v.envelopeStage[idx] == 0) {
+                            if (v.holdSamplesRemaining[idx] > 0) {
+                                --v.holdSamplesRemaining[idx];
+                                gain = v.targetGain[idx];
+                            } else {
+                                v.envelopeStage[idx] = 1;
+                            }
+                        }
+                        if (v.envelopeStage[idx] == 1) {
+                            if (v.attackSamplesRemaining[idx] > 0) {
+                                gain += v.attackGainStep[idx];
+                                --v.attackSamplesRemaining[idx];
+                                if (gain > v.targetGain[idx]) gain = v.targetGain[idx];
+                            } else {
+                                gain = v.targetGain[idx];
+                            }
+                            if (v.attackSamplesRemaining[idx] == 0)
+                                v.envelopeStage[idx] = (v.decaySamplesRemaining[idx] > 0) ? 2 : 3;
+                        }
+                        if (v.envelopeStage[idx] == 2) {
+                            if (v.decaySamplesRemaining[idx] > 0) {
+                                gain *= v.decaySlope[idx];
+                                --v.decaySamplesRemaining[idx];
+                                if (gain < v.sustainLevel[idx]) gain = v.sustainLevel[idx];
+                            } else {
+                                gain = v.sustainLevel[idx];
+                            }
+                            if (v.decaySamplesRemaining[idx] == 0)
+                                v.envelopeStage[idx] = 3;
+                        }
                     }
                 }
 
-                if (v.envelopeStage[handle] == 1) {
-                    if (v.attackSamplesRemaining[handle] > 0) {
-                        gain += v.attackGainStep[handle];
-                        --v.attackSamplesRemaining[handle];
-                        if (gain > v.targetGain[handle]) gain = v.targetGain[handle];
-                    } else {
-                        gain = v.targetGain[handle];
-                    }
-                    if (v.attackSamplesRemaining[handle] == 0) {
-                        v.envelopeStage[handle] = (v.decaySamplesRemaining[handle] > 0) ? 2 : 3;
-                    }
-                }
+                phase += phaseStep;
 
-                if (v.envelopeStage[handle] == 2) {
-                    if (v.decaySamplesRemaining[handle] > 0) {
-                        gain *= v.decaySlope[handle];
-                        --v.decaySamplesRemaining[handle];
-                        if (gain < v.sustainLevel[handle]) gain = v.sustainLevel[handle];
-                    } else {
-                        gain = v.sustainLevel[handle];
-                    }
-                    if (v.decaySamplesRemaining[handle] == 0) {
-                        v.envelopeStage[handle] = 3;
-                    }
+                if (loop && phase >= relLoopEF) {
+                    float overflow = phase - relLoopEF;
+                    const float loopLength = relLoopEF - relLoopSF;
+                    if (loopLength > 0.0f && overflow >= loopLength)
+                        overflow -= floorf(overflow / loopLength) * loopLength;
+                    phase = relLoopSF + overflow;
                 }
+            }
+
+        done:
+            v.phases[idx] = phase;
+            if (!sustain) v.currentGain[idx] = gain;
+
+            float stealFadeIn = 1.0f;
+            uint32_t fadeInRemaining = v.stealFadeInFramesRemaining[idx];
+            if (fadeInRemaining > 0u) {
+                const uint32_t fadeInTotal = v.stealFadeInFramesTotal[idx];
+                stealFadeIn = fadeInTotal > 0u
+                    ? static_cast<float>(fadeInTotal - fadeInRemaining + 1u) /
+                      static_cast<float>(fadeInTotal)
+                    : 1.0f;
+                v.stealFadeInFramesRemaining[idx] = fadeInRemaining - 1u;
+            }
+
+            if (mixAudio) {
+                const float scaled = sample * gain * stealFadeIn;
+                *outL += scaled * v.mixGainL[idx];
+                *outR += scaled * v.mixGainR[idx];
+            }
+
+            const bool thresholdReleaseFinished = isReleased &&
+                v.releaseSamplesRemaining[idx] == UINT32_MAX &&
+                gain < kVoiceRetireThreshold;
+            if (retireVoice || releaseFinished || thresholdReleaseFinished) {
+                voices.RetireVoice(static_cast<VoiceHandle>(idx));
+                // RetireVoice swap-removes: the voice at the end of
+                // activeList_ moves into position i.  Don't advance i —
+                // re-process the swapped-in voice at this frame.
             } else {
-                // Release: gain decays after the absolute frame reaches
-                // the release trigger point (releaseStartInBlock).
-                if ((startFrame + f) >= releaseGate) {
-                    gain *= v.releaseDecay[handle];
-                }
-            }
-
-            sample *= gain;
-            phase += phaseStep;
-
-            if (loop && phase >= static_cast<float>(relativeLoopEnd)) {
-                phase = static_cast<float>(relativeLoopStart) +
-                        (phase - static_cast<float>(relativeLoopEnd));
+                ++i;
             }
         }
-
-        float outL = sample * voiceGainL * panL * chanVol;
-        float outR = sample * voiceGainR * panR * chanVol;
-        outLeft[f] += outL;
-        outRight[f] += outR;
     }
 
-    v.phases[handle] = phase;
-    v.currentGain[handle] = gain;
-
-    if (retireVoice || (isReleased && gain < kVoiceRetireThreshold)) {
-        voices.RetireVoice(handle);
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// RenderBlock — sub-sample event-sliced render.
-//
-// The event array MUST be sorted by ascending sampleOffset.
-// Events are dispatched at their exact fractional position:
-//   1. All events whose sampleOffset falls at the current cursor are
-//      dispatched via the EventDispatcher callback.
-//   2. Active voices are rendered for the sub-block from cursor to the
-//      next event boundary (or end of block).
-//   3. The cursor advances and the process repeats.
-//
-// For zero-length sub-blocks (multiple events at the same sample),
-// only dispatch occurs — no voice rendering is needed.
-//
-// This is the single code path used by both real-time WASAPI output and
-// deterministic offline file rendering.
-// ════════════════════════════════════════════════════════════════════════
-inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& channels,
-                                       const float* sampleData, uint32_t sampleDataFrames,
-                                       float* outputLeft, float* outputRight,
-                                       uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
-                                       const RenderEvent* events, uint32_t eventCount) {
-    VoiceSoA& v = voices.v;
-    uint32_t maxVoices = voices.GetMaxVoices();
-    const ChannelParamsSnapshot* chParams = channels.GetParams();
-
-    // ── [HOOK] Grouping layer: group voices by channel / key / instrument
-    //    for efficient cache-friendly processing.  Insert before the
-    //    per-voice loop.
-
-    // ── [HOOK] Voice-density scaling: when activeCount > threshold,
-    //    mark low-priority voices for decimation.  Insert here.
-
-    uint32_t cursor = 0;
-    uint32_t ei = 0;
-
-    while (cursor < numFrames) {
-        // ── Dispatch all events at or before the current cursor ────────
-        // Events at the same fractional position are batched: all are
-        // dispatched before any rendering occurs at that position.
-        while (ei < eventCount) {
-            float evtOffset = events[ei].sampleOffset;
-            if (evtOffset >= static_cast<float>(cursor) + 1.0f)
-                break; // next event is beyond this cursor
-
-            // Event fires at this cursor position.
-            if (dispatcher_) {
-                // ── [HOOK] Event classification / grouping: the dispatcher
-                //    can classify events into voice allocation, release, or
-                //    CC update paths.  Current implementation dispatches
-                //    directly to Driver handlers.
-                dispatcher_(events[ei], cursor, dispatcherUserData_);
-            }
-            ++ei;
-        }
-
-        // ── Determine sub-block end ────────────────────────────────────
-        // The sub-block extends from `cursor` to the next event's
-        // sampleOffset, or to end-of-block if no more events.
-        uint32_t subEnd = numFrames;
-        if (ei < eventCount) {
-            uint32_t nextEvt = static_cast<uint32_t>(events[ei].sampleOffset);
-            if (nextEvt < subEnd) subEnd = nextEvt;
-        }
-        if (subEnd < cursor) subEnd = cursor;
-
-        uint32_t subLen = subEnd - cursor;
-
-        // For events at the exact same sample position, subLen can be 0.
-        // In that case we skip rendering (dispatch-only) and advance the
-        // cursor to re-evaluate on the next iteration.
-        if (subLen == 0) {
-            cursor = subEnd;
-            continue;
-        }
-
-        // ── Render all active voices for this sub-block ────────────────
-        // Output pointers are advanced by `cursor` so voices write into
-        // the correct position within the full block.
-        float* subOutL = outputLeft + cursor;
-        float* subOutR = outputRight + cursor;
-
-        for (uint32_t i = 0; i < maxVoices; ++i) {
-            if (v.state[i] == static_cast<uint8_t>(VoiceState::Free)) continue;
-            uint8_t ch = v.channel[i];
-            ProcessVoice(voices, static_cast<VoiceHandle>(i), chParams[ch],
-                         sampleData, sampleDataFrames,
-                         subOutL, subOutR,
-                         cursor, subLen, cfg);
-        }
-
-        cursor = subEnd;
-    }
-
-    // ── [HOOK] Decimation: if voice count exceeded budget, retroactively
-    //    zero the output for decimated frames.  Insert after the render loop.
-    //
-    // ── [HOOK] Overload ladder: check active voice count against soft/
-    //    hard/panic thresholds and flag RenderStats accordingly.
+    // ── Batched age update ────────────────────────────────────────────
+    // Whole block ran at step=1: per-sample age increments were skipped
+    // in the loop, so add the block length once here.  Voices that
+    // retired mid-block keep their (stale) block-start age — this makes
+    // retireImmediateCount_ over-count voices that died young but past
+    // their first 2 samples within the same block.  Diagnostic only.
+    voices.SetCurrentFrame(blockStartFrame + numFrames);
 }
 
 } // namespace svms

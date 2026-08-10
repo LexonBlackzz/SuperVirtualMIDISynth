@@ -1,6 +1,7 @@
 #include "SVMSSoundFont.h"
 #include <windows.h>
 #include <cstdio>
+#include <vector>
 
 namespace svms {
 
@@ -36,16 +37,10 @@ static uint32_t seek_pad(uint32_t size) {
     return (size + 1) & ~1u;
 }
 
-bool sf2_load(const char* path, SF2Data* outData) {
+static bool sf2_load_file(FILE* f, SF2Data* outData) {
     std::memset(outData, 0, sizeof(SF2Data));
 
     char dbg[256];
-    FILE* f = fopen(path, "rb");
-    if (!f) {
-        sprintf(dbg, "[SVMS-SF2] fopen FAILED: \"%s\"\n", path);
-        OutputDebugStringA(dbg);
-        return false;
-    }
 
     uint8_t riffHeader[12];
     if (fread(riffHeader, 1, 12, f) != 12) {
@@ -247,6 +242,28 @@ bool sf2_load(const char* path, SF2Data* outData) {
     return outData->loaded;
 }
 
+bool sf2_load(const char* path, SF2Data* outData) {
+    if (!path || !outData) return false;
+    FILE* file = fopen(path, "rb");
+    if (!file) {
+        std::memset(outData, 0, sizeof(SF2Data));
+        OutputDebugStringA("[SVMS-SF2] unable to open SoundFont\n");
+        return false;
+    }
+    return sf2_load_file(file, outData);
+}
+
+bool sf2_load(const wchar_t* path, SF2Data* outData) {
+    if (!path || !outData) return false;
+    FILE* file = _wfopen(path, L"rb");
+    if (!file) {
+        std::memset(outData, 0, sizeof(SF2Data));
+        OutputDebugStringA("[SVMS-SF2] unable to open Unicode SoundFont path\n");
+        return false;
+    }
+    return sf2_load_file(file, outData);
+}
+
 void sf2_free(SF2Data* data) {
     free(data->sampleData);
     free(data->resampledData);
@@ -318,19 +335,29 @@ static int16_t clamp_gen_value(SF2GeneratorType gen, int16_t amount) {
 
 bool sf2_find_preset(const SF2Data* data, uint16_t bank, uint16_t preset,
                      uint32_t* outPresetIndex) {
+    if (!data || !outPresetIndex) return false;
     for (uint32_t i = 0; i < data->presetCount; ++i) {
         if (data->presets[i].bank == bank && data->presets[i].preset == preset) {
             *outPresetIndex = i;
             return true;
         }
     }
-    for (uint32_t i = 0; i < data->presetCount; ++i) {
-        if (data->presets[i].preset == preset) {
-            *outPresetIndex = i;
-            return true;
-        }
-    }
     return false;
+}
+
+bool sf2_resolve_preset(const SF2Data* data, uint16_t bank, uint8_t program,
+                        bool percussionChannel, uint32_t* outPresetIndex) {
+    if (!data || !outPresetIndex) return false;
+
+    if (percussionChannel) {
+        if (sf2_find_preset(data, static_cast<uint16_t>(128u | bank), program,
+                            outPresetIndex)) return true;
+        if (sf2_find_preset(data, 128, program, outPresetIndex)) return true;
+        if (sf2_find_preset(data, 128, 0, outPresetIndex)) return true;
+    }
+
+    if (sf2_find_preset(data, bank, program, outPresetIndex)) return true;
+    return bank != 0 && sf2_find_preset(data, 0, program, outPresetIndex);
 }
 
 bool sf2_build_voice_params(const SF2Data* data, uint32_t instrumentIndex,
@@ -376,13 +403,17 @@ struct ZoneGenState {
     int16_t keyTrack;
     int8_t  rootKey;
     uint8_t loopMode;
-    int16_t attackVolEnv;
-    int16_t decayVolEnv;
-    int16_t sustainVolEnv;
-    int16_t releaseVolEnv;
-    int16_t holdVolEnv;
-    int16_t delayVolEnv;
+    int32_t attackVolEnv;
+    int32_t decayVolEnv;
+    int32_t sustainVolEnv;
+    int32_t releaseVolEnv;
+    int32_t holdVolEnv;
+    int32_t delayVolEnv;
     int16_t initialAttenuation;
+    int16_t initialFilterFc, initialFilterQ, pan, reverbSend, chorusSend;
+    int16_t modLfoToPitch, vibLfoToPitch, modEnvToPitch;
+    int16_t modLfoToFilterFc, modEnvToFilterFc, modLfoToVolume;
+    int16_t exclusiveClass;
     uint8_t keyLo, keyHi;
     uint8_t velLo, velHi;
     int32_t startOffset, endOffset;
@@ -393,6 +424,29 @@ struct ZoneGenState {
     bool hasKeyRange;
     bool hasVelRange;
     bool hasRootKey;
+    bool hasLoopMode;
+    bool hasCoarseTune;
+    bool hasFineTune;
+    bool hasScaleTuning;
+    bool hasInitialAttenuation;
+    bool hasAttackVolEnv;
+    bool hasDecayVolEnv;
+    bool hasSustainVolEnv;
+    bool hasReleaseVolEnv;
+    bool hasHoldVolEnv;
+    bool hasDelayVolEnv;
+    bool hasInitialFilterFc;
+    bool hasInitialFilterQ;
+    bool hasPan;
+    bool hasReverbSend;
+    bool hasChorusSend;
+    bool hasModLfoToPitch;
+    bool hasVibLfoToPitch;
+    bool hasModEnvToPitch;
+    bool hasModLfoToFilterFc;
+    bool hasModEnvToFilterFc;
+    bool hasModLfoToVolume;
+    bool hasExclusiveClass;
 
     ZoneGenState()
         : coarseTune(0), fineTune(0), keyTrack(100), rootKey(-1), loopMode(0),
@@ -403,8 +457,21 @@ struct ZoneGenState {
           loopStartOffset(0), loopEndOffset(0),
            startCoarseOffset(0), endCoarseOffset(0),
            sampleIndex(0), hasSample(false),
-           initialAttenuation(0),
-          hasKeyRange(false), hasVelRange(false), hasRootKey(false) {}
+           initialAttenuation(0), initialFilterFc(0), initialFilterQ(0), pan(0),
+           reverbSend(0), chorusSend(0), modLfoToPitch(0), vibLfoToPitch(0),
+           modEnvToPitch(0), modLfoToFilterFc(0), modEnvToFilterFc(0),
+           modLfoToVolume(0), exclusiveClass(0),
+           hasKeyRange(false), hasVelRange(false), hasRootKey(false),
+           hasLoopMode(false), hasCoarseTune(false), hasFineTune(false),
+           hasScaleTuning(false), hasInitialAttenuation(false),
+           hasAttackVolEnv(false), hasDecayVolEnv(false), hasSustainVolEnv(false),
+           hasReleaseVolEnv(false), hasHoldVolEnv(false), hasDelayVolEnv(false),
+           hasInitialFilterFc(false), hasInitialFilterQ(false), hasPan(false),
+           hasReverbSend(false), hasChorusSend(false),
+           hasModLfoToPitch(false), hasVibLfoToPitch(false),
+           hasModEnvToPitch(false), hasModLfoToFilterFc(false),
+           hasModEnvToFilterFc(false), hasModLfoToVolume(false),
+           hasExclusiveClass(false) {}
 };
 
 static void applyGenSet(ZoneGenState& st, const SF2Generator& gen) {
@@ -425,15 +492,19 @@ static void applyGenSet(ZoneGenState& st, const SF2Generator& gen) {
             break;
         case Gen_CoarseTune:
             st.coarseTune = static_cast<int16_t>(gen.amount);
+            st.hasCoarseTune = true;
             break;
         case Gen_FineTune:
             st.fineTune = static_cast<int16_t>(gen.amount);
+            st.hasFineTune = true;
             break;
         case Gen_ScaleTuning:
             st.keyTrack = static_cast<int16_t>(gen.amount);
+            st.hasScaleTuning = true;
             break;
         case Gen_SampleModes:
             st.loopMode = static_cast<uint8_t>(gen.amount & 0x3);
+            st.hasLoopMode = true;
             break;
         case Gen_SampleID:
             st.sampleIndex = static_cast<uint16_t>(gen.amount);
@@ -459,24 +530,79 @@ static void applyGenSet(ZoneGenState& st, const SF2Generator& gen) {
             break;
         case Gen_AttackVolEnv:
             st.attackVolEnv = static_cast<int16_t>(gen.amount);
+            st.hasAttackVolEnv = true;
             break;
         case Gen_DecayVolEnv:
             st.decayVolEnv = static_cast<int16_t>(gen.amount);
+            st.hasDecayVolEnv = true;
             break;
         case Gen_SustainVolEnv:
             st.sustainVolEnv = static_cast<int16_t>(gen.amount);
+            st.hasSustainVolEnv = true;
             break;
         case Gen_ReleaseVolEnv:
             st.releaseVolEnv = static_cast<int16_t>(gen.amount);
+            st.hasReleaseVolEnv = true;
             break;
         case Gen_HoldVolEnv:
             st.holdVolEnv = static_cast<int16_t>(gen.amount);
+            st.hasHoldVolEnv = true;
             break;
         case Gen_DelayVolEnv:
             st.delayVolEnv = static_cast<int16_t>(gen.amount);
+            st.hasDelayVolEnv = true;
             break;
         case Gen_InitialAttenuation:
             st.initialAttenuation = static_cast<int16_t>(gen.amount);
+            st.hasInitialAttenuation = true;
+            break;
+        case Gen_InitialFilterFc:
+            st.initialFilterFc = static_cast<int16_t>(gen.amount);
+            st.hasInitialFilterFc = true;
+            break;
+        case Gen_InitialFilterQ:
+            st.initialFilterQ = static_cast<int16_t>(gen.amount);
+            st.hasInitialFilterQ = true;
+            break;
+        case Gen_Pan:
+            st.pan = static_cast<int16_t>(gen.amount);
+            st.hasPan = true;
+            break;
+        case Gen_ReverbEffectsSend:
+            st.reverbSend = static_cast<int16_t>(gen.amount);
+            st.hasReverbSend = true;
+            break;
+        case Gen_ChorusEffectsSend:
+            st.chorusSend = static_cast<int16_t>(gen.amount);
+            st.hasChorusSend = true;
+            break;
+        case Gen_ModLfoToPitch:
+            st.modLfoToPitch = static_cast<int16_t>(gen.amount);
+            st.hasModLfoToPitch = true;
+            break;
+        case Gen_VibLfoToPitch:
+            st.vibLfoToPitch = static_cast<int16_t>(gen.amount);
+            st.hasVibLfoToPitch = true;
+            break;
+        case Gen_ModEnvToPitch:
+            st.modEnvToPitch = static_cast<int16_t>(gen.amount);
+            st.hasModEnvToPitch = true;
+            break;
+        case Gen_ModLfoToFilterFc:
+            st.modLfoToFilterFc = static_cast<int16_t>(gen.amount);
+            st.hasModLfoToFilterFc = true;
+            break;
+        case Gen_ModEnvToFilterFc:
+            st.modEnvToFilterFc = static_cast<int16_t>(gen.amount);
+            st.hasModEnvToFilterFc = true;
+            break;
+        case Gen_ModLfoToVolume:
+            st.modLfoToVolume = static_cast<int16_t>(gen.amount);
+            st.hasModLfoToVolume = true;
+            break;
+        case Gen_ExclusiveClass:
+            st.exclusiveClass = static_cast<int16_t>(gen.amount);
+            st.hasExclusiveClass = true;
             break;
         default:
             break;
@@ -484,10 +610,16 @@ static void applyGenSet(ZoneGenState& st, const SF2Generator& gen) {
 }
 
 static void mergeZoneInto(ZoneGenState& dst, const ZoneGenState& src) {
+    // SF2 ranges intersect; additive generators accumulate; overriding
+    // generators use the later (more local) zone's value.
     dst.coarseTune = static_cast<int16_t>(dst.coarseTune + src.coarseTune);
     dst.fineTune = static_cast<int16_t>(dst.fineTune + src.fineTune);
-    if (src.keyTrack != 100)
-        dst.keyTrack = src.keyTrack;
+    if (src.hasCoarseTune) dst.hasCoarseTune = true;
+    if (src.hasFineTune) dst.hasFineTune = true;
+    if (src.hasScaleTuning) {
+        dst.keyTrack = static_cast<int16_t>(dst.keyTrack + src.keyTrack - 100);
+        dst.hasScaleTuning = true;
+    }
     if (src.hasRootKey) {
         dst.rootKey = src.rootKey;
         dst.hasRootKey = true;
@@ -500,9 +632,15 @@ static void mergeZoneInto(ZoneGenState& dst, const ZoneGenState& src) {
         if (dst.hasKeyRange) {
             uint8_t lo = src.keyLo > dst.keyLo ? src.keyLo : dst.keyLo;
             uint8_t hi = src.keyHi < dst.keyHi ? src.keyHi : dst.keyHi;
-            if (lo > hi) lo = hi;
-            dst.keyLo = lo;
-            dst.keyHi = hi;
+            if (lo > hi) {
+                // Preserve an empty intersection. Collapsing it to a
+                // single key creates a region that does not exist in SF2.
+                dst.keyLo = 1;
+                dst.keyHi = 0;
+            } else {
+                dst.keyLo = lo;
+                dst.keyHi = hi;
+            }
         } else {
             dst.keyLo = src.keyLo;
             dst.keyHi = src.keyHi;
@@ -513,30 +651,42 @@ static void mergeZoneInto(ZoneGenState& dst, const ZoneGenState& src) {
         if (dst.hasVelRange) {
             uint8_t lo = src.velLo > dst.velLo ? src.velLo : dst.velLo;
             uint8_t hi = src.velHi < dst.velHi ? src.velHi : dst.velHi;
-            if (lo > hi) lo = hi;
-            dst.velLo = lo;
-            dst.velHi = hi;
+            if (lo > hi) {
+                dst.velLo = 1;
+                dst.velHi = 0;
+            } else {
+                dst.velLo = lo;
+                dst.velHi = hi;
+            }
         } else {
             dst.velLo = src.velLo;
             dst.velHi = src.velHi;
             dst.hasVelRange = true;
         }
     }
-    if (src.loopMode != 0)
+    if (src.hasLoopMode) {
         dst.loopMode = src.loopMode;
-    if (src.attackVolEnv != -12000)
-        dst.attackVolEnv = src.attackVolEnv;
-    if (src.decayVolEnv != -12000)
-        dst.decayVolEnv = src.decayVolEnv;
-    if (src.sustainVolEnv != 0)
-        dst.sustainVolEnv = src.sustainVolEnv;
-    if (src.releaseVolEnv != -12000)
-        dst.releaseVolEnv = src.releaseVolEnv;
-    if (src.holdVolEnv != -12000)
-        dst.holdVolEnv = src.holdVolEnv;
-    if (src.delayVolEnv != -12000)
-        dst.delayVolEnv = src.delayVolEnv;
-        dst.initialAttenuation = src.initialAttenuation;
+        dst.hasLoopMode = true;
+    }
+    if (src.hasAttackVolEnv) { dst.attackVolEnv = dst.hasAttackVolEnv ? dst.attackVolEnv + src.attackVolEnv : src.attackVolEnv; dst.hasAttackVolEnv = true; }
+    if (src.hasDecayVolEnv) { dst.decayVolEnv = dst.hasDecayVolEnv ? dst.decayVolEnv + src.decayVolEnv : src.decayVolEnv; dst.hasDecayVolEnv = true; }
+    if (src.hasSustainVolEnv) { dst.sustainVolEnv += src.sustainVolEnv; dst.hasSustainVolEnv = true; }
+    if (src.hasReleaseVolEnv) { dst.releaseVolEnv = dst.hasReleaseVolEnv ? dst.releaseVolEnv + src.releaseVolEnv : src.releaseVolEnv; dst.hasReleaseVolEnv = true; }
+    if (src.hasHoldVolEnv) { dst.holdVolEnv = dst.hasHoldVolEnv ? dst.holdVolEnv + src.holdVolEnv : src.holdVolEnv; dst.hasHoldVolEnv = true; }
+    if (src.hasDelayVolEnv) { dst.delayVolEnv = dst.hasDelayVolEnv ? dst.delayVolEnv + src.delayVolEnv : src.delayVolEnv; dst.hasDelayVolEnv = true; }
+    if (src.hasInitialAttenuation) { dst.initialAttenuation = static_cast<int16_t>(dst.initialAttenuation + src.initialAttenuation); dst.hasInitialAttenuation = true; }
+    if (src.hasInitialFilterFc) { dst.initialFilterFc = src.initialFilterFc; dst.hasInitialFilterFc = true; }
+    if (src.hasInitialFilterQ) { dst.initialFilterQ = src.initialFilterQ; dst.hasInitialFilterQ = true; }
+    if (src.hasPan) { dst.pan = static_cast<int16_t>(dst.pan + src.pan); dst.hasPan = true; }
+    if (src.hasReverbSend) { dst.reverbSend = static_cast<int16_t>(dst.reverbSend + src.reverbSend); dst.hasReverbSend = true; }
+    if (src.hasChorusSend) { dst.chorusSend = static_cast<int16_t>(dst.chorusSend + src.chorusSend); dst.hasChorusSend = true; }
+    if (src.hasModLfoToPitch) { dst.modLfoToPitch = static_cast<int16_t>(dst.modLfoToPitch + src.modLfoToPitch); dst.hasModLfoToPitch = true; }
+    if (src.hasVibLfoToPitch) { dst.vibLfoToPitch = static_cast<int16_t>(dst.vibLfoToPitch + src.vibLfoToPitch); dst.hasVibLfoToPitch = true; }
+    if (src.hasModEnvToPitch) { dst.modEnvToPitch = static_cast<int16_t>(dst.modEnvToPitch + src.modEnvToPitch); dst.hasModEnvToPitch = true; }
+    if (src.hasModLfoToFilterFc) { dst.modLfoToFilterFc = static_cast<int16_t>(dst.modLfoToFilterFc + src.modLfoToFilterFc); dst.hasModLfoToFilterFc = true; }
+    if (src.hasModEnvToFilterFc) { dst.modEnvToFilterFc = static_cast<int16_t>(dst.modEnvToFilterFc + src.modEnvToFilterFc); dst.hasModEnvToFilterFc = true; }
+    if (src.hasModLfoToVolume) { dst.modLfoToVolume = static_cast<int16_t>(dst.modLfoToVolume + src.modLfoToVolume); dst.hasModLfoToVolume = true; }
+    if (src.hasExclusiveClass) { dst.exclusiveClass = src.exclusiveClass; dst.hasExclusiveClass = true; }
     dst.startOffset += src.startOffset;
     dst.endOffset += src.endOffset;
     dst.loopStartOffset += src.loopStartOffset;
@@ -557,7 +707,7 @@ bool sf2_find_instrument(const SF2Data* data, uint32_t presetIndex,
 
     for (uint16_t zi = zoneIdx; zi < zoneEnd; ++zi) {
         const SF2PresetZone& zone = data->presetZones[zi];
-        uint16_t nextGenIdx = (zi + 1 < zoneEnd)
+        uint16_t nextGenIdx = (static_cast<uint32_t>(zi) + 1u < data->presetZoneCount)
                                   ? data->presetZones[zi + 1].generatorIndex
                                   : static_cast<uint16_t>(data->pgenCount);
 
@@ -582,7 +732,7 @@ bool sf2_find_instrument(const SF2Data* data, uint32_t presetIndex,
         for (uint16_t izi = izoneIdx; izi < izoneEnd; ++izi) {
             const SF2InstrumentZone& izone = data->instrumentZones[izi];
             uint16_t genIdx = izone.generatorIndex;
-            uint16_t genNext = (izi + 1 < izoneEnd)
+            uint16_t genNext = (static_cast<uint32_t>(izi) + 1u < data->instrumentZoneCount)
                                    ? data->instrumentZones[izi + 1].generatorIndex
                                    : static_cast<uint16_t>(data->generatorCount);
 
@@ -625,9 +775,170 @@ bool sf2_find_instrument(const SF2Data* data, uint32_t presetIndex,
 }
 
 
+static ZoneGenState ParseZone(const SF2Data* data, uint16_t generatorIndex,
+                              uint16_t generatorEnd) {
+    ZoneGenState state;
+    if (generatorIndex >= data->generatorCount) return state;
+    if (generatorEnd > data->generatorCount) generatorEnd = static_cast<uint16_t>(data->generatorCount);
+    for (uint16_t g = generatorIndex; g < generatorEnd; ++g)
+        applyGenSet(state, data->generators[g]);
+    return state;
+}
+
+static bool ZoneHasGenerator(const SF2Data* data, uint16_t generatorIndex,
+                             uint16_t generatorEnd, uint16_t operation) {
+    if (generatorIndex >= data->generatorCount) return false;
+    generatorEnd = (std::min)(generatorEnd, static_cast<uint16_t>(data->generatorCount));
+    for (uint16_t g = generatorIndex; g < generatorEnd; ++g)
+        if (data->generators[g].genOper == operation) return true;
+    return false;
+}
+
+static int16_t ClampEnvelopeTimecents(int32_t value) {
+    if (value < -12000) value = -12000;
+    if (value > 8000) value = 8000;
+    return static_cast<int16_t>(value);
+}
+
+static int16_t ClampVolumeEnvelopeSustain(int32_t value) {
+    if (value < 0) value = 0;
+    if (value > 1440) value = 1440;
+    return static_cast<int16_t>(value);
+}
+
+static void AppendCompiledRegion(SF2Data* data, uint32_t presetIndex,
+                                 const ZoneGenState& merged) {
+    if (merged.sampleIndex >= data->sampleCount) return;
+    if (data->regionCount >= SF2Data::kMaxCompiledRegions) {
+        data->regionOverflow = true;
+        return;
+    }
+
+    const SF2Sample& sample = data->samples[merged.sampleIndex];
+    const uint32_t maxFrame = data->sampleDataFrames > 0 ? data->sampleDataFrames - 1 : 0;
+    int64_t start = static_cast<int64_t>(sample.start) + merged.startOffset +
+                    static_cast<int64_t>(merged.startCoarseOffset) * 32768;
+    int64_t end = static_cast<int64_t>(sample.end) + merged.endOffset +
+                  static_cast<int64_t>(merged.endCoarseOffset) * 32768;
+    int64_t loopStart = static_cast<int64_t>(sample.loopStart) + merged.loopStartOffset;
+    int64_t loopEnd = static_cast<int64_t>(sample.loopEnd) + merged.loopEndOffset;
+
+    start = (std::max)(int64_t(0), start);
+    end = (std::min)(static_cast<int64_t>(maxFrame), end);
+    loopStart = (std::max)(start, loopStart);
+    loopEnd = (std::min)(end, loopEnd);
+    if (end <= start) return;
+    if (loopEnd <= loopStart + 1) loopStart = loopEnd = 0;
+
+    int8_t root = merged.rootKey;
+    if (root < 0) root = (sample.originalPitch == 0 || sample.originalPitch == 255)
+        ? 60 : static_cast<int8_t>(sample.originalPitch);
+
+    SFSampleRegion& region = data->regions[data->regionCount++];
+    std::memset(&region, 0, sizeof(region));
+    region.sampleIndex = merged.sampleIndex;
+    region.presetIndex = static_cast<uint16_t>(presetIndex);
+    region.keyLo = merged.keyLo; region.keyHi = merged.keyHi;
+    region.velLo = merged.velLo; region.velHi = merged.velHi;
+    region.rootKey = root;
+    region.loopMode = (loopEnd > loopStart + 1) ? merged.loopMode : 0;
+    region.coarseTune = merged.coarseTune;
+    region.fineTune = static_cast<int16_t>(merged.fineTune + sample.pitchCorrection);
+    region.scaleTuning = merged.keyTrack;
+    region.attackVolEnv = ClampEnvelopeTimecents(merged.attackVolEnv);
+    region.decayVolEnv = ClampEnvelopeTimecents(merged.decayVolEnv);
+    region.sustainVolEnv = ClampVolumeEnvelopeSustain(merged.sustainVolEnv);
+    region.releaseVolEnv = ClampEnvelopeTimecents(merged.releaseVolEnv);
+    region.holdVolEnv = ClampEnvelopeTimecents(merged.holdVolEnv);
+    region.delayVolEnv = ClampEnvelopeTimecents(merged.delayVolEnv);
+    region.initialAttenuation = merged.initialAttenuation;
+    region.startOffset = static_cast<int32_t>(start);
+    region.endOffset = static_cast<int32_t>(end);
+    region.loopStartOffset = static_cast<int32_t>(loopStart);
+    region.loopEndOffset = static_cast<int32_t>(loopEnd);
+    region.initialFilterFc = merged.initialFilterFc;
+    region.initialFilterQ = merged.initialFilterQ;
+    region.pan = merged.pan;
+    region.reverbSend = merged.reverbSend;
+    region.chorusSend = merged.chorusSend;
+    region.modLfoToPitch = merged.modLfoToPitch;
+    region.vibLfoToPitch = merged.vibLfoToPitch;
+    region.modEnvToPitch = merged.modEnvToPitch;
+    region.modLfoToFilterFc = merged.modLfoToFilterFc;
+    region.modEnvToFilterFc = merged.modEnvToFilterFc;
+    region.modLfoToVolume = merged.modLfoToVolume;
+    region.exclusiveClass = merged.exclusiveClass;
+}
+
 void sf2_build_regions(SF2Data* data) {
     data->regionCount = 0;
+    data->regionOverflow = false;
 
+    for (uint32_t pi = 0; pi < data->presetCount; ++pi) {
+        if (data->presets[pi].preset == 0xFFFF) continue;
+        const uint16_t pBegin = data->presets[pi].zoneIndex;
+        const uint16_t pEnd = (pi + 1 < data->presetCount)
+            ? data->presets[pi + 1].zoneIndex
+            : static_cast<uint16_t>(data->presetZoneCount);
+        ZoneGenState presetGlobal;
+        std::vector<std::pair<uint16_t, ZoneGenState>> presetLocal;
+
+        for (uint16_t zi = pBegin; zi < pEnd; ++zi) {
+            // The bag at pEnd belongs to the next preset (or the terminal
+            // record), but its generator index is precisely the end of this
+            // preset's last zone. Do not let that zone consume later pgen.
+            const uint16_t next = (static_cast<uint32_t>(zi) + 1u < data->presetZoneCount)
+                ? data->presetZones[zi + 1].generatorIndex
+                : static_cast<uint16_t>(data->pgenCount);
+            ZoneGenState zone = ParseZone(data, data->presetZones[zi].generatorIndex, next);
+            if (!ZoneHasGenerator(data, data->presetZones[zi].generatorIndex, next, Gen_Instrument))
+                mergeZoneInto(presetGlobal, zone);
+            else {
+                uint32_t instrumentIndex = UINT32_MAX;
+                for (uint16_t g = data->presetZones[zi].generatorIndex; g < next; ++g) {
+                    if (data->generators[g].genOper == Gen_Instrument) {
+                        instrumentIndex = data->generators[g].amount;
+                        break;
+                    }
+                }
+                if (instrumentIndex != UINT32_MAX)
+                    presetLocal.emplace_back(static_cast<uint16_t>(instrumentIndex), zone);
+            }
+        }
+
+        for (const auto& presetZone : presetLocal) {
+            const uint32_t instrumentIndex = presetZone.first;
+            if (instrumentIndex >= data->instrumentCount) continue;
+            const uint16_t iBegin = data->instruments[instrumentIndex].zoneIndex;
+            const uint16_t iEnd = (instrumentIndex + 1 < data->instrumentCount)
+                ? data->instruments[instrumentIndex + 1].zoneIndex
+                : static_cast<uint16_t>(data->instrumentZoneCount);
+            ZoneGenState instrumentGlobal;
+
+            for (uint16_t izi = iBegin; izi < iEnd; ++izi) {
+                // As with pbag, the first bag of the next instrument is the
+                // sentinel that terminates this instrument's final zone.
+                const uint16_t next = (static_cast<uint32_t>(izi) + 1u < data->instrumentZoneCount)
+                    ? data->instrumentZones[izi + 1].generatorIndex
+                    : static_cast<uint16_t>(data->generatorCount);
+                ZoneGenState zone = ParseZone(data, data->instrumentZones[izi].generatorIndex, next);
+                if (!ZoneHasGenerator(data, data->instrumentZones[izi].generatorIndex, next, Gen_SampleID)) {
+                    mergeZoneInto(instrumentGlobal, zone);
+                    continue;
+                }
+                ZoneGenState merged;
+                mergeZoneInto(merged, presetGlobal);
+                mergeZoneInto(merged, instrumentGlobal);
+                mergeZoneInto(merged, zone);
+                mergeZoneInto(merged, presetZone.second);
+                if (merged.keyLo <= merged.keyHi && merged.velLo <= merged.velHi)
+                    AppendCompiledRegion(data, pi, merged);
+            }
+        }
+    }
+
+    /* Legacy compiler retained below for reference during migration. */
+#if 0
     for (uint32_t pi = 0; pi < data->presetCount; ++pi) {
         if (data->presets[pi].preset == 0xFFFF) continue;
 
@@ -750,12 +1061,12 @@ void sf2_build_regions(SF2Data* data) {
                 r.coarseTune = merged.coarseTune;
                 r.fineTune = static_cast<int16_t>(merged.fineTune + samp.pitchCorrection);
                 r.scaleTuning = merged.keyTrack;
-                r.attackVolEnv = merged.attackVolEnv;
-                r.decayVolEnv = merged.decayVolEnv;
-                r.sustainVolEnv = merged.sustainVolEnv;
-                r.releaseVolEnv = merged.releaseVolEnv;
-                r.holdVolEnv = merged.holdVolEnv;
-                r.delayVolEnv = merged.delayVolEnv;
+                r.attackVolEnv = ClampEnvelopeTimecents(merged.attackVolEnv);
+                r.decayVolEnv = ClampEnvelopeTimecents(merged.decayVolEnv);
+                r.sustainVolEnv = ClampVolumeEnvelopeSustain(merged.sustainVolEnv);
+                r.releaseVolEnv = ClampEnvelopeTimecents(merged.releaseVolEnv);
+                r.holdVolEnv = ClampEnvelopeTimecents(merged.holdVolEnv);
+                r.delayVolEnv = ClampEnvelopeTimecents(merged.delayVolEnv);
                 r.initialAttenuation = merged.initialAttenuation;
                 r.startOffset = static_cast<int32_t>(sStart);
                 r.endOffset = static_cast<int32_t>(sEnd);
@@ -767,10 +1078,13 @@ void sf2_build_regions(SF2Data* data) {
         }
     }
 
+#endif
     char dbg[128];
     sprintf(dbg, "[SVMS-SF2] build_regions: %u regions from %u presets\n",
             data->regionCount, data->presetCount);
     OutputDebugStringA(dbg);
+    if (data->regionOverflow)
+        OutputDebugStringA("[SVMS-SF2] ERROR: compiled region capacity exceeded; SoundFont rejected partially\n");
 
     for (uint32_t ri = 0; ri < data->regionCount && ri < 20; ++ri) {
         const SFSampleRegion& r = data->regions[ri];
@@ -780,6 +1094,56 @@ void sf2_build_regions(SF2Data* data) {
                 r.loopMode, r.sampleIndex);
         OutputDebugStringA(dbg);
     }
+}
+
+uint32_t sf2_find_regions(const SF2Data* data, uint32_t presetIndex,
+                          uint8_t note, uint8_t velocity,
+                          const SFSampleRegion** outRegions,
+                          uint32_t outCapacity) {
+    if (!data || !outRegions || presetIndex >= data->presetCount) return 0;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < data->regionCount; ++i) {
+        const SFSampleRegion& region = data->regions[i];
+        if (region.presetIndex != static_cast<uint16_t>(presetIndex)) continue;
+        if (note < region.keyLo || note > region.keyHi ||
+            velocity < region.velLo || velocity > region.velHi) continue;
+        if (count < outCapacity) outRegions[count] = &region;
+        ++count;
+    }
+    return count;
+}
+
+bool sf2_validate_region(const SF2Data* data, const SFSampleRegion* region) {
+    if (!data || !region || !data->sampleData ||
+        region->sampleIndex >= data->sampleCount || data->sampleDataFrames < 2)
+        return false;
+
+    const int64_t start = region->startOffset;
+    const int64_t end = region->endOffset;
+    const int64_t loopStart = region->loopStartOffset;
+    const int64_t loopEnd = region->loopEndOffset;
+    const int64_t frames = data->sampleDataFrames;
+
+    if (start < 0 || end <= start || end >= frames) return false;
+    if (region->loopMode != 0 &&
+        (loopStart < start || loopEnd <= loopStart + 1 || loopEnd > end))
+        return false;
+    return true;
+}
+
+float sf2_region_initial_peak(const SF2Data* data, const SFSampleRegion* region,
+                              uint32_t windowFrames) {
+    if (!sf2_validate_region(data, region) || windowFrames == 0) return 0.0f;
+    const uint32_t start = static_cast<uint32_t>(region->startOffset);
+    const uint32_t end = static_cast<uint32_t>(region->endOffset);
+    const uint32_t count = (std::min)(windowFrames, end - start);
+    int32_t peak = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const int32_t value = data->sampleData[start + i];
+        const int32_t magnitude = value < 0 ? -value : value;
+        if (magnitude > peak) peak = magnitude;
+    }
+    return static_cast<float>(peak) / 32768.0f;
 }
 
 } // namespace svms

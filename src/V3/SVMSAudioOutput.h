@@ -1,15 +1,29 @@
 #ifndef SVMS_AUDIO_OUTPUT_H
 #define SVMS_AUDIO_OUTPUT_H
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <avrt.h>
+#include <ksmedia.h>
 #include <atomic>
 #include <cstring>
 #include <algorithm>
+#include <vector>
+#include <xmmintrin.h>
+#include <cstddef>
+
+// WAVEFORMATEX is a packed wire structure. Including mmeapi.h before
+// mmreg.h with some Windows SDKs defines it at the default packing (20 bytes),
+// which shifts WAVEFORMATEXTENSIBLE::SubFormat by two bytes and makes a float
+// endpoint look like integer PCM. Keep this guard beside the parsing code.
+static_assert(sizeof(WAVEFORMATEX) == 18, "WAVEFORMATEX must use wire packing");
+static_assert(offsetof(WAVEFORMATEXTENSIBLE, SubFormat) == 24,
+              "WAVEFORMATEXTENSIBLE layout is invalid; include mmreg.h first");
 
 namespace svms {
 
@@ -40,6 +54,7 @@ private:
     IMMDevice* device_;
     HANDLE threadHandle_;
     HANDLE stopEvent_;
+    HANDLE audioEvent_;
     std::atomic<bool> running_;
     uint32_t sampleRate_;
     uint32_t bufferFrames_;
@@ -49,13 +64,16 @@ private:
     bool formatIsFloat_;
     uint16_t formatBitsPerSample_;
     uint16_t formatChannels_;
+    std::vector<float> renderScratch_;
+    bool comInitialized_;
 };
 
 inline AudioOutput::AudioOutput()
     : audioClient_(nullptr), renderClient_(nullptr), device_(nullptr),
-      threadHandle_(nullptr), stopEvent_(nullptr), running_(false),
+      threadHandle_(nullptr), stopEvent_(nullptr), audioEvent_(nullptr), running_(false),
       sampleRate_(0), bufferFrames_(0), renderCallback_(nullptr), userData_(nullptr),
-      lastHResult_(S_OK), formatIsFloat_(true), formatBitsPerSample_(32), formatChannels_(2) {}
+      lastHResult_(S_OK), formatIsFloat_(true), formatBitsPerSample_(32), formatChannels_(2),
+      renderScratch_(), comInitialized_(false) {}
 
 inline AudioOutput::~AudioOutput() {
     Shutdown();
@@ -75,6 +93,7 @@ inline bool AudioOutput::Initialize(uint32_t sampleRate, uint32_t bufferFrames) 
         OutputDebugStringA(dbg);
         return false;
     }
+    comInitialized_ = SUCCEEDED(hr);
 
     IMMDeviceEnumerator* enumerator = nullptr;
     hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
@@ -113,8 +132,11 @@ inline bool AudioOutput::Initialize(uint32_t sampleRate, uint32_t bufferFrames) 
     }
 
     sampleRate_ = pwfx->nSamplesPerSec;
-    formatIsFloat_ = (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
-                      (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pwfx->wBitsPerSample == 32));
+    formatIsFloat_ = (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+    if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        const WAVEFORMATEXTENSIBLE* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pwfx);
+        formatIsFloat_ = IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) != FALSE;
+    }
     formatBitsPerSample_ = pwfx->wBitsPerSample;
     formatChannels_ = pwfx->nChannels;
 
@@ -123,13 +145,27 @@ inline bool AudioOutput::Initialize(uint32_t sampleRate, uint32_t bufferFrames) 
     OutputDebugStringA(dbg);
 
     REFERENCE_TIME bufferDuration = (REFERENCE_TIME)bufferFrames_ * 10000000ULL / sampleRate_;
-    hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+    audioEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!audioEvent_) {
+        lastHResult_ = HRESULT_FROM_WIN32(GetLastError());
+        CoTaskMemFree(pwfx);
+        return false;
+    }
+
+    hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                   AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                    bufferDuration, 0, pwfx, nullptr);
     CoTaskMemFree(pwfx);
     if (FAILED(hr)) {
         lastHResult_ = hr;
         sprintf(dbg, "[SVMS] AudioOutput::Initialize: IAudioClient::Initialize FAILED hr=0x%08X\n", (unsigned)hr);
         OutputDebugStringA(dbg);
+        return false;
+    }
+
+    hr = audioClient_->SetEventHandle(audioEvent_);
+    if (FAILED(hr)) {
+        lastHResult_ = hr;
         return false;
     }
 
@@ -142,6 +178,7 @@ inline bool AudioOutput::Initialize(uint32_t sampleRate, uint32_t bufferFrames) 
         return false;
     }
     bufferFrames_ = actualFrames;
+    renderScratch_.resize(static_cast<size_t>(bufferFrames_) * 2u);
 
     hr = audioClient_->GetService(__uuidof(IAudioRenderClient), (void**)&renderClient_);
     if (FAILED(hr)) {
@@ -162,6 +199,8 @@ inline void AudioOutput::Shutdown() {
     if (renderClient_) { renderClient_->Release(); renderClient_ = nullptr; }
     if (audioClient_) { audioClient_->Release(); audioClient_ = nullptr; }
     if (device_) { device_->Release(); device_ = nullptr; }
+    if (audioEvent_) { CloseHandle(audioEvent_); audioEvent_ = nullptr; }
+    if (comInitialized_) { CoUninitialize(); comInitialized_ = false; }
 }
 
 inline bool AudioOutput::Start() {
@@ -180,8 +219,6 @@ inline bool AudioOutput::Start() {
         return false;
     }
 
-    SetThreadPriority(threadHandle_, THREAD_PRIORITY_TIME_CRITICAL);
-    OutputDebugStringA("[SVMS] AudioOutput::Start: thread created\n");
     return true;
 }
 
@@ -190,7 +227,7 @@ inline void AudioOutput::Stop() {
     running_.store(false);
     if (stopEvent_) SetEvent(stopEvent_);
     if (threadHandle_) {
-        WaitForSingleObject(threadHandle_, 2000);
+        WaitForSingleObject(threadHandle_, INFINITE);
         CloseHandle(threadHandle_);
         threadHandle_ = nullptr;
     }
@@ -218,42 +255,79 @@ inline DWORD WINAPI AudioOutput::AudioThreadProc(LPVOID param) {
 }
 
 inline void AudioOutput::AudioThreadLoop() {
-    char dbg[256];
-    sprintf(dbg, "[SVMS] AudioThreadLoop: START bufferFrames=%u\n", bufferFrames_);
-    OutputDebugStringA(dbg);
+    const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    DWORD mmcssTaskIndex = 0;
+    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTaskIndex);
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
+    BYTE* initialBuffer = nullptr;
+    if (SUCCEEDED(renderClient_->GetBuffer(bufferFrames_, &initialBuffer)))
+        renderClient_->ReleaseBuffer(bufferFrames_, AUDCLNT_BUFFERFLAGS_SILENT);
     audioClient_->Start();
 
-    int loopCount = 0;
+    HANDLE waitHandles[2] = { stopEvent_, audioEvent_ };
     while (running_.load()) {
-        if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) break;
+        const DWORD wait = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
+        if (wait != WAIT_OBJECT_0 + 1) continue;
 
         UINT32 padding = 0;
         HRESULT hr = audioClient_->GetCurrentPadding(&padding);
         if (FAILED(hr)) continue;
 
+        if (padding >= bufferFrames_) continue;
         UINT32 availFrames = bufferFrames_ - padding;
-        if (availFrames == 0) {
-            Sleep(1);
-            continue;
-        }
+        if (availFrames == 0) continue;
 
         BYTE* destBuffer = nullptr;
         hr = renderClient_->GetBuffer(availFrames, &destBuffer);
         if (SUCCEEDED(hr)) {
-            if (renderCallback_) {
+            const size_t destBytes = static_cast<size_t>(availFrames) * formatChannels_
+                                   * formatBitsPerSample_ / 8u;
+            if (!renderCallback_) {
+                std::memset(destBuffer, 0, destBytes);
+            } else if (formatIsFloat_ && formatBitsPerSample_ == 32 && formatChannels_ == 2) {
                 renderCallback_(reinterpret_cast<float*>(destBuffer), availFrames, userData_);
             } else {
-                std::memset(destBuffer, 0, availFrames * formatChannels_ * formatBitsPerSample_ / 8);
+                renderCallback_(renderScratch_.data(), availFrames, userData_);
+
+                auto clamp = [](float x) {
+                    return x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);
+                };
+                for (UINT32 f = 0; f < availFrames; ++f) {
+                    const float l = renderScratch_[f * 2u];
+                    const float r = renderScratch_[f * 2u + 1u];
+                    for (uint16_t ch = 0; ch < formatChannels_; ++ch) {
+                        const float x = clamp(ch == 0 ? l : (ch == 1 ? r : (l + r) * 0.5f));
+                        BYTE* p = destBuffer + (static_cast<size_t>(f) * formatChannels_ + ch)
+                                             * formatBitsPerSample_ / 8u;
+                        if (formatIsFloat_ && formatBitsPerSample_ == 32) {
+                            std::memcpy(p, &x, sizeof(float));
+                        } else if (formatBitsPerSample_ == 32) {
+                            const int32_t sample = static_cast<int32_t>(x * 2147483647.0f);
+                            std::memcpy(p, &sample, sizeof(sample));
+                        } else if (formatBitsPerSample_ == 24) {
+                            const int32_t sample = static_cast<int32_t>(x * 8388607.0f);
+                            p[0] = static_cast<BYTE>(sample & 0xff);
+                            p[1] = static_cast<BYTE>((sample >> 8) & 0xff);
+                            p[2] = static_cast<BYTE>((sample >> 16) & 0xff);
+                        } else if (formatBitsPerSample_ == 16) {
+                            const int16_t sample = static_cast<int16_t>(x * 32767.0f);
+                            std::memcpy(p, &sample, sizeof(sample));
+                        } else if (formatBitsPerSample_ == 8) {
+                            *p = static_cast<BYTE>((x + 1.0f) * 127.5f);
+                        }
+                    }
+                }
             }
             renderClient_->ReleaseBuffer(availFrames, 0);
         }
-
-        loopCount++;
     }
 
     audioClient_->Stop();
-    OutputDebugStringA("[SVMS] AudioThreadLoop: STOP\n");
+    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+    if (SUCCEEDED(comHr)) CoUninitialize();
 }
 
 } // namespace svms

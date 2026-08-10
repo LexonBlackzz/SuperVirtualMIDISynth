@@ -35,7 +35,7 @@ private:
     static void DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                                      void* userData);
 
-    void HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, float fractionalOffset);
+    void HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity);
     void HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset);
     void HandleControlChange(uint8_t channel, uint8_t controller, uint8_t value);
     void HandleProgramChange(uint8_t channel, uint8_t program);
@@ -43,7 +43,7 @@ private:
 
     // Lock-free SPSC queue: MIDI thread pushes, audio thread pops.
     // Capacity 16384 = 128 KB (8 bytes per event).  Power of two.
-    SPSCQueue<TimestampedMidiEvent, 16384> midiEventQueue_;
+    SPSCQueue<TimestampedMidiEvent, kDefaultEventRingCapacity> midiEventQueue_;
 
     void* audioOutputPtr;
     void* voiceManagerPtr;

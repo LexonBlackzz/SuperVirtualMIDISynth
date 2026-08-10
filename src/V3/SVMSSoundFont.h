@@ -54,7 +54,7 @@ struct SFSampleRegion {
     uint8_t keyLo, keyHi;
     uint8_t velLo, velHi;
     int8_t  rootKey;
-    uint8_t loopMode;       // 0=none, 1=continuous, 2=until release, 3=loop until release
+    uint8_t loopMode;       // SF2 sampleModes: 0=none, 1=continuous, 2=reserved, 3=until release
     int16_t coarseTune;
     int16_t fineTune;
     int16_t scaleTuning;
@@ -71,6 +71,18 @@ struct SFSampleRegion {
     int32_t loopEndOffset;
     int32_t startCoarseOffset;
     int32_t endCoarseOffset;
+    int16_t initialFilterFc;
+    int16_t initialFilterQ;
+    int16_t pan;
+    int16_t reverbSend;
+    int16_t chorusSend;
+    int16_t modLfoToPitch;
+    int16_t vibLfoToPitch;
+    int16_t modEnvToPitch;
+    int16_t modLfoToFilterFc;
+    int16_t modEnvToFilterFc;
+    int16_t modLfoToVolume;
+    int16_t exclusiveClass;
 };
 
 enum SF2GeneratorType : uint16_t {
@@ -180,8 +192,10 @@ struct SF2Data {
     uint32_t generatorCount;
     uint32_t pgenCount;
 
-    SFSampleRegion regions[4096];
+    static constexpr uint32_t kMaxCompiledRegions = 65536;
+    SFSampleRegion regions[kMaxCompiledRegions];
     uint32_t regionCount;
+    bool regionOverflow;
 
     int16_t* sampleData;
     uint32_t sampleDataSize;
@@ -217,11 +231,14 @@ struct InstrumentVoiceParams {
 };
 
 bool sf2_load(const char* path, SF2Data* outData);
+bool sf2_load(const wchar_t* path, SF2Data* outData);
 void sf2_free(SF2Data* data);
 bool sf2_resample(SF2Data* data, uint32_t targetRate, InterpolationMode mode);
 
 bool sf2_find_preset(const SF2Data* data, uint16_t bank, uint16_t preset,
                      uint32_t* outPresetIndex);
+bool sf2_resolve_preset(const SF2Data* data, uint16_t bank, uint8_t program,
+                        bool percussionChannel, uint32_t* outPresetIndex);
 bool sf2_find_instrument(const SF2Data* data, uint32_t presetIndex,
                          uint8_t note, uint8_t velocity,
                          uint32_t* outInstrumentIndex, uint32_t* outSampleIndex);
@@ -229,6 +246,13 @@ bool sf2_build_voice_params(const SF2Data* data, uint32_t instrumentIndex,
                              uint32_t sampleIndex, uint8_t note, uint8_t velocity,
                              float sampleRate, InstrumentVoiceParams* outParams);
 void sf2_build_regions(SF2Data* data);
+uint32_t sf2_find_regions(const SF2Data* data, uint32_t presetIndex,
+                          uint8_t note, uint8_t velocity,
+                          const SFSampleRegion** outRegions,
+                          uint32_t outCapacity);
+bool sf2_validate_region(const SF2Data* data, const SFSampleRegion* region);
+float sf2_region_initial_peak(const SF2Data* data, const SFSampleRegion* region,
+                              uint32_t windowFrames = 512);
 
 uint32_t sf2_read_u32(const uint8_t* buf);
 uint16_t sf2_read_u16(const uint8_t* buf);

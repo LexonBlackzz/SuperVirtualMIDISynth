@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(SuperVirtualMIDISynthV3 LANGUAGES CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -18,6 +20,7 @@ set(SOURCES
     SVMSConfig.cpp
     SVMSSoundFont.cpp
     SVMSDriver.cpp
+    SVMSDiagWindow.cpp
 )
 
 set(HEADERS
@@ -30,6 +33,9 @@ set(HEADERS
     SVMSAudioOutput.h
     SVMSSoundFont.h
     SVMSPageAllocator.h
+    SVMSDiagWindow.h
+    SVMSMPSCQueue.h
+    SVMSFrameClock.h
 )
 
 add_library(svmsynth SHARED ${SOURCES} ${HEADERS})
@@ -41,7 +47,12 @@ target_link_libraries(svmsynth PRIVATE
     ole32
     uuid
     avrt
+    shell32
 )
+
+# nlohmann/json is vendored under third_party and intentionally confined to
+# the configuration translation unit.
+target_include_directories(svmsynth PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
 
 if(MSVC)
     set(EXPORTS
@@ -74,6 +85,7 @@ if(MSVC)
         UnprepareLongData
         DriverSettings
         GetDriverDebugInfo
+        SVMSGetDriverDebugInfoV1
         LoadCustomSoundFontsList
         timeGetTime64
         midiInGetNumDevs
@@ -155,3 +167,24 @@ set_target_properties(svmsynth PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
+
+if(SVMS_BUILD_TESTS)
+    add_executable(svms_v3_tests
+        tests/SVMSV3Tests.cpp
+        SVMSConfig.cpp
+        SVMSSoundFont.cpp
+    )
+    target_compile_definitions(svms_v3_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(svms_v3_tests PRIVATE user32)
+    target_link_libraries(svms_v3_tests PRIVATE shell32)
+    target_include_directories(svms_v3_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+    add_test(NAME svms_v3_correctness COMMAND svms_v3_tests)
+
+    add_executable(svms_v3_live_smoke tests/SVMSLiveSmoke.cpp)
+    target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
+endif()

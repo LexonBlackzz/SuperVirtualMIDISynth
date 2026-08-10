@@ -8,15 +8,9 @@
 namespace svms {
 
 // ── Timestamped MIDI event for the SPSC pipeline ──────────────────────
-// Carries the raw MIDI message, a high-precision QPC timestamp from the
-// host thread, and the pre-computed fractional sample offset within the
-// current render block.  The render thread consumes these directly.
-struct TimestampedMidiEvent {
-    uint64_t qpcTimestamp;       // QueryPerformanceCounter value
-    uint32_t message;            // raw MIDI message (status | data1<<8 | data2<<16)
-    float    targetSampleOffset; // fractional sample position within the block
-};
-
+// Carries the raw MIDI message, QPC timestamp, and an ingress sequence.
+// The sequence replaces the old unused targetSampleOffset field, keeping
+// this structure at 16 bytes for the normal ABI.
 // ── Cache line size for false-sharing prevention ──────────────────────
 static constexpr uint32_t kCacheLineSize = 64;
 
@@ -26,8 +20,8 @@ static constexpr uint32_t kCacheLineSize = 64;
 // Producer (MIDI/host thread) calls Push().
 // Consumer (audio render thread) calls TryPop() / Pop().
 //
-// Capacity is rounded up to the next power of two internally so that
-// the modulo operation becomes a fast bitmask.
+// Capacity is exact. Monotonic counters make full/empty unambiguous even
+// when the logical capacity is not a power of two (393216 is intentional).
 //
 // head_ and tail_ sit on separate cache lines to eliminate false sharing
 // between the producer and consumer cores.
@@ -36,8 +30,7 @@ template <typename T, uint32_t Capacity>
 class SPSCQueue {
 public:
     SPSCQueue() : head_(0), tail_(0) {
-        static_assert((Capacity & (Capacity - 1)) == 0,
-                      "SPSCQueue capacity must be a power of two");
+        static_assert(Capacity > 0, "SPSCQueue capacity must be non-zero");
         storage_ = static_cast<T*>(::operator new(sizeof(T) * Capacity,
                                                     std::align_val_t{alignof(T)}));
     }
@@ -47,7 +40,7 @@ public:
         uint32_t h = head_.load(std::memory_order_relaxed);
         uint32_t t = tail_.load(std::memory_order_acquire);
         while (t != h) {
-            storage_[t & kMask].~T();
+            storage_[Index(t)].~T();
             ++t;
         }
         ::operator delete(storage_, std::align_val_t{alignof(T)});
@@ -64,7 +57,7 @@ public:
         const uint32_t next = h + 1;
         if ((next - tail_.load(std::memory_order_acquire)) > Capacity)
             return false; // full
-        storage_[h & kMask] = event;
+        storage_[Index(h)] = event;
         head_.store(next, std::memory_order_release);
         return true;
     }
@@ -76,8 +69,8 @@ public:
         const uint32_t t = tail_.load(std::memory_order_relaxed);
         if (t == head_.load(std::memory_order_acquire))
             return false; // empty
-        out = storage_[t & kMask];
-        storage_[t & kMask].~T();
+        out = storage_[Index(t)];
+        storage_[Index(t)].~T();
         tail_.store(t + 1, std::memory_order_release);
         return true;
     }
@@ -128,7 +121,9 @@ public:
     }
 
 private:
-    static constexpr uint32_t kMask = Capacity - 1;
+    static constexpr uint32_t Index(uint32_t counter) {
+        return counter % Capacity;
+    }
 
     // Producer cache line.
     alignas(kCacheLineSize) std::atomic<uint32_t> head_;
