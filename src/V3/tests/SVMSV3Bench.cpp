@@ -2,6 +2,8 @@
 #include "SVMSRenderScalar.h"
 
 #include <windows.h>
+#include <avrt.h>
+#include <immintrin.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -12,7 +14,7 @@
 
 namespace {
 
-enum class Workload { Sustained, Envelope, Release, Steal, Dense };
+enum class Workload { Sustained, Envelope, Release, Steal, Dense, MixedEvents };
 
 const char* WorkloadName(Workload workload) {
     switch (workload) {
@@ -21,6 +23,7 @@ const char* WorkloadName(Workload workload) {
         case Workload::Release: return "release";
         case Workload::Steal: return "steal";
         case Workload::Dense: return "dense";
+        case Workload::MixedEvents: return "mixed-events";
     }
     return "unknown";
 }
@@ -31,6 +34,7 @@ bool ParseWorkload(const char* value, Workload& result) {
     else if (std::strcmp(value, "release") == 0) result = Workload::Release;
     else if (std::strcmp(value, "steal") == 0) result = Workload::Steal;
     else if (std::strcmp(value, "dense") == 0) result = Workload::Dense;
+    else if (std::strcmp(value, "mixed-events") == 0) result = Workload::MixedEvents;
     else return false;
     return true;
 }
@@ -52,6 +56,8 @@ struct Options {
     Workload workload = Workload::Sustained;
     bool enforce = false;
     bool reference = false;
+    uint32_t eventStride = 1;
+    uint32_t pinCore = UINT32_MAX;
 };
 
 bool ParseOptions(int argc, char** argv, Options& options) {
@@ -71,6 +77,12 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             if (!nextNumber(options.warmupSeconds)) return false;
         } else if (std::strcmp(argv[i], "--workload") == 0) {
             if (i + 1 >= argc || !ParseWorkload(argv[++i], options.workload)) return false;
+        } else if (std::strcmp(argv[i], "--event-stride") == 0) {
+            if (!nextNumber(options.eventStride) || options.eventStride == 0u)
+                return false;
+        } else if (std::strcmp(argv[i], "--pin-core") == 0) {
+            if (!nextNumber(options.pinCore) || options.pinCore >= 64u)
+                return false;
         } else if (std::strcmp(argv[i], "--enforce") == 0) {
             options.enforce = true;
         } else if (std::strcmp(argv[i], "--reference") == 0) {
@@ -147,6 +159,56 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
     }
 }
 
+struct MixedDispatchContext {
+    svms::VoiceManager* voices;
+    svms::ChannelCache* channels;
+    const svms::RuntimeConfigSnapshot* config;
+    uint32_t sampleFrames;
+    uint32_t sequence;
+};
+
+void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
+    auto* context = static_cast<MixedDispatchContext*>(userData);
+    auto& voices = *context->voices;
+    auto& channels = *context->channels;
+    switch (event.type) {
+        case svms::RenderEventType::NoteOn:
+            PerformSteals(voices, channels, context->sequence, 1u,
+                          context->sampleFrames);
+            break;
+        case svms::RenderEventType::NoteOff: {
+            const uint32_t count = voices.GetChannelActiveCount(event.channel);
+            const uint32_t* handles = voices.GetChannelActiveList(event.channel);
+            if (count > 0u) voices.StartRelease(handles[count - 1u]);
+            break;
+        }
+        case svms::RenderEventType::ControlChange:
+            channels.ControlChange(event.channel, event.data1, event.data2);
+            channels.RebuildCache(*context->config, 44100.0f);
+            if (event.data1 == 7u || event.data1 == 10u || event.data1 == 11u)
+                voices.RefreshMixGainsForChannel(
+                    event.channel, channels.GetParams()[event.channel]);
+            break;
+        case svms::RenderEventType::PitchBend: {
+            const int32_t wheel = (static_cast<int32_t>(event.data2) << 7) |
+                                  event.data1;
+            const float semitones = static_cast<float>(wheel - 8192) / 4096.0f;
+            const float ratio = std::pow(2.0f, semitones / 12.0f);
+            const uint32_t count = voices.GetChannelActiveCount(event.channel);
+            const uint32_t* handles = voices.GetChannelActiveList(event.channel);
+            for (uint32_t position = 0; position < count; ++position) {
+                const uint32_t handle = handles[position];
+                voices.v.phaseIncs[handle] =
+                    voices.v.basePhaseIncs[handle] * ratio;
+            }
+            voices.InvalidateStealCandidates();
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -154,10 +216,19 @@ int main(int argc, char** argv) {
     if (!ParseOptions(argc, argv, options)) {
         std::fprintf(stderr,
             "usage: svms_v3_bench [--voices 1..4096] [--frames 16..8192] "
-            "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense] "
+            "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events] "
+            "[--event-stride N] "
+            "[--pin-core 0..63] "
             "[--quick] [--reference] [--enforce]\n");
         return 1;
     }
+
+    if (options.pinCore != UINT32_MAX)
+        SetThreadAffinityMask(GetCurrentThread(), 1ull << options.pinCore);
+    DWORD mmcssTaskIndex = 0u;
+    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTaskIndex);
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
     constexpr uint32_t sampleFrames = 64u * 2048u;
     std::vector<float> samples(sampleFrames);
@@ -179,14 +250,57 @@ int main(int argc, char** argv) {
     auto renderer = std::make_unique<svms::RenderScalar>();
 
     std::vector<svms::RenderEvent> events;
-    if (options.workload == Workload::Dense) {
-        events.resize(options.frames);
-        for (uint32_t frame = 0; frame < options.frames; ++frame) {
-            events[frame].type = svms::RenderEventType::ControlChange;
-            events[frame].frameOffset = frame;
-            events[frame].ingressSequence = frame;
+    MixedDispatchContext mixedContext{
+        voices.get(), &channels, &cfg, sampleFrames, options.voices};
+    if (options.workload == Workload::Dense ||
+        options.workload == Workload::MixedEvents) {
+        const uint32_t eventCount =
+            (options.frames + options.eventStride - 1u) / options.eventStride;
+        events.resize(eventCount);
+        for (uint32_t index = 0; index < eventCount; ++index) {
+            const uint32_t frame = index * options.eventStride;
+            auto& event = events[index];
+            event.frameOffset = frame;
+            event.ingressSequence = index;
+            event.channel = static_cast<uint8_t>(index & 15u);
+            if (options.workload == Workload::Dense) {
+                event.type = svms::RenderEventType::ControlChange;
+                continue;
+            }
+            switch (index % 6u) {
+                case 0u:
+                    event.type = svms::RenderEventType::NoteOn;
+                    event.data1 = static_cast<uint8_t>(48u + index % 48u);
+                    event.data2 = static_cast<uint8_t>(80u + index % 47u);
+                    break;
+                case 1u:
+                    event.type = svms::RenderEventType::NoteOff;
+                    break;
+                case 2u:
+                    event.type = svms::RenderEventType::ControlChange;
+                    event.data1 = 11u;
+                    event.data2 = static_cast<uint8_t>(48u + index % 80u);
+                    break;
+                case 3u:
+                    event.type = svms::RenderEventType::PitchBend;
+                    event.data1 = static_cast<uint8_t>((index * 37u) & 0x7fu);
+                    event.data2 = static_cast<uint8_t>(48u + index % 32u);
+                    break;
+                case 4u:
+                    event.type = svms::RenderEventType::ControlChange;
+                    event.data1 = 7u;
+                    event.data2 = static_cast<uint8_t>(72u + index % 56u);
+                    break;
+                default:
+                    event.type = svms::RenderEventType::NoteOn;
+                    event.data1 = static_cast<uint8_t>(36u + index % 60u);
+                    event.data2 = static_cast<uint8_t>(96u + index % 31u);
+                    break;
+            }
         }
-        renderer->SetEventDispatcher(NoopDispatch, nullptr);
+        renderer->SetEventDispatcher(
+            options.workload == Workload::Dense ? NoopDispatch : MixedDispatch,
+            options.workload == Workload::Dense ? nullptr : &mixedContext);
     }
 
     std::vector<float> left(options.frames);
@@ -225,16 +339,31 @@ int main(int argc, char** argv) {
     std::vector<double> callbackPercent;
     callbackPercent.reserve(measuredCallbacks);
     double elapsedTotal = 0.0;
+    uint64_t cycleTotal = 0u;
+    uint32_t consecutiveOverruns = 0u;
+    uint32_t maximumConsecutiveOverruns = 0u;
+    const uint32_t initialSteals = voices->stealCount_;
     const double budgetSeconds = static_cast<double>(options.frames) / 44100.0;
     for (uint32_t i = 0; i < measuredCallbacks; ++i) {
         LARGE_INTEGER begin{}, end{};
+        ULONG64 cycleBegin = 0u, cycleEnd = 0u;
+        QueryThreadCycleTime(GetCurrentThread(), &cycleBegin);
         QueryPerformanceCounter(&begin);
         renderOne();
         QueryPerformanceCounter(&end);
+        QueryThreadCycleTime(GetCurrentThread(), &cycleEnd);
         const double elapsed = static_cast<double>(end.QuadPart - begin.QuadPart) /
                                static_cast<double>(frequency.QuadPart);
         elapsedTotal += elapsed;
         callbackPercent.push_back(elapsed / budgetSeconds * 100.0);
+        cycleTotal += cycleEnd - cycleBegin;
+        if (elapsed > budgetSeconds) {
+            ++consecutiveOverruns;
+            maximumConsecutiveOverruns =
+                (std::max)(maximumConsecutiveOverruns, consecutiveOverruns);
+        } else {
+            consecutiveOverruns = 0u;
+        }
     }
 
     const double p50 = Percentile(callbackPercent, 0.50);
@@ -245,19 +374,54 @@ int main(int argc, char** argv) {
     const double voiceSamples = static_cast<double>(options.voices) * options.frames *
                                 measuredCallbacks;
     const double voiceSamplesPerSecond = voiceSamples / elapsedTotal;
+    const double cyclesPerVoiceSample = voiceSamples > 0.0
+        ? static_cast<double>(cycleTotal) / voiceSamples : 0.0;
+    const double eventsPerSecond = elapsedTotal > 0.0
+        ? static_cast<double>(events.size()) * measuredCallbacks / elapsedTotal : 0.0;
+    const uint32_t measuredSteals = voices->stealCount_ - initialSteals;
+    const double stealsPerSecond = elapsedTotal > 0.0
+        ? static_cast<double>(measuredSteals) / elapsedTotal : 0.0;
+    uint32_t classCounts[svms::kVoiceRenderClassCount]{};
+    for (uint32_t classIndex = 0; classIndex < svms::kVoiceRenderClassCount;
+         ++classIndex) {
+        classCounts[classIndex] = voices->GetRenderClassCount(
+            static_cast<svms::VoiceRenderClass>(classIndex));
+    }
 
     std::printf(
         "{\"renderer\":\"%s\",\"workload\":\"%s\",\"voices\":%u,\"frames\":%u,"
-        "\"callbacks\":%u,\"voice_samples_per_second\":%.0f,"
+        "\"callbacks\":%u,\"event_stride\":%u,\"pinned_core\":%d,"
+        "\"voice_samples_per_second\":%.0f,"
+        "\"cycles_per_voice_sample\":%.3f,\"events_per_second\":%.0f,"
+        "\"steals_per_second\":%.0f,\"max_consecutive_overruns\":%u,"
+        "\"render_classes\":{\"sustained_loop\":%u,\"sustained_one_shot\":%u,"
+        "\"transient_loop\":%u,\"release_loop\":%u,\"release_one_shot\":%u,"
+        "\"generic\":%u,\"steal_tails\":%u},"
         "\"callback_percent\":{\"p50\":%.2f,\"p95\":%.2f,"
         "\"p99\":%.2f,\"p99_9\":%.2f,\"max\":%.2f}}\n",
         options.reference ? "reference" : "span", WorkloadName(options.workload),
         options.voices, options.frames,
-        measuredCallbacks, voiceSamplesPerSecond, p50, p95, p99, p999, maximum);
+        measuredCallbacks, options.eventStride,
+        options.pinCore == UINT32_MAX ? -1 : static_cast<int>(options.pinCore),
+        voiceSamplesPerSecond,
+        cyclesPerVoiceSample, eventsPerSecond, stealsPerSecond,
+        maximumConsecutiveOverruns,
+        classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedLoop)],
+        classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedOneShot)],
+        classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::TransientLoop)],
+        classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::ReleaseLoop)],
+        classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::ReleaseOneShot)],
+        classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::Generic)],
+        voices->GetStealTailCount(), p50, p95, p99, p999, maximum);
 
+    int result = 0;
     if (options.enforce && options.voices == 4096u) {
-        const double limit = options.workload == Workload::Sustained ? 60.0 : 70.0;
-        if (p99 >= limit) return 2;
+        const bool denseTarget = options.workload == Workload::Dense ||
+                                 options.workload == Workload::MixedEvents;
+        const double limit = (options.workload == Workload::Sustained || denseTarget)
+            ? 60.0 : 70.0;
+        if (p99 >= limit) result = 2;
     }
-    return 0;
+    if (mmcss != nullptr) AvRevertMmThreadCharacteristics(mmcss);
+    return result;
 }

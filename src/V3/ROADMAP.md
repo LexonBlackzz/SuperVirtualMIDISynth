@@ -153,22 +153,42 @@ larger phase containing that item is complete.
 ### 4096-Voice Full-Quality Scalar Optimization
 
 - [x] Split sparse-event blocks into exact event-free frame spans
-- [x] Capture span voice handles in fixed storage and defer retirements in
-  chronological order so swap-removal cannot skip or duplicate a voice
+- [x] Keep persistent O(1) render-class lists for sustained loop/one-shot,
+  looping transient/release, one-shot release/envelope, generic states, and
+  independent steal tails; keep `activeList` for lifecycle/stealing only
+- [x] Defer retirements and render-class transitions until a span completes so
+  swap-removal cannot skip or duplicate a voice
 - [x] Keep phase, gain, envelope, loop, fade, and release state in registers
   across each span and commit it once
-- [x] Add specialized sustained-loop, attack/decay, continuous-release, and
-  steal-tail scalar kernels without SIMD or quality reduction
-- [x] Retain the fused frame-major renderer as the test oracle and automatic
-  dense-event fallback
+- [x] Add aligned `RenderKernelSet`, `RenderSpanContext`, and
+  `VoiceRenderClass` interfaces and move the sustained hot kernels into the
+  dedicated `SVMSRenderKernels.cpp` translation unit
+- [x] Add fixed 1/2/3/4-frame dense-event kernels plus specialized
+  sustained-loop, one-shot, attack/decay, release, generic, and steal-tail
+  paths without decimation, intrinsics, or relaxed floating-point mode
+- [x] Remove production active-list copying and the frame-major dense fallback;
+  retain the old frame-major renderer only as the differential test oracle
+- [x] Maintain per-channel active indices for channel-local controller,
+  sustain, termination, note-generation, and pitch-bend updates
+- [x] Cache unbent phase increments and steady-state output gains; refresh only
+  the affected channel on CC7/CC10/CC11/CC121
+- [x] Preserve exact steal scores/ties with a lazily rebuilt fixed max heap for
+  same-frame full-pool bursts
 - [x] Add allocation-free rolling callback p95/p99/p99.9 and over-budget
   diagnostics without changing `DriverDebugInfoV1`
-- [x] Add `svms_v3_bench` workloads for sustained, envelope, release, real
-  stealing, and per-frame dense events
+- [x] Extend `svms_v3_bench` with event stride, real mixed MIDI traffic,
+  cycles/voice-sample, events/s, steals/s, render-class counts, consecutive
+  deadline misses, MMCSS/FTZ/DAZ parity, and optional core affinity
 - [x] Verify 4096 voices for 60 seconds at 44.1 kHz/2048 frames on the
   i5-13600KF: sustained p99 36.72%, envelope p99 50.82%, release p99 37.42%
-- [x] Verify dense per-frame events select the frame-major fallback without a
-  throughput regression
+- [x] Differentially validate exact event order, active identities, steal
+  victims/tails, phase/envelope/release state, and tolerant audio at buffers
+  from 16 through 8192 frames
+- [ ] Reach modern-CPU 4096-voice mixed/dense event-stride-2 p99 below 60%; the
+  current warmed scalar result is about 65% p99 with no deadline misses
+- [ ] Run and pass the three Celeron 420 acceptance profiles on target hardware
+- [ ] Complete live high-Hz listening validation for pitch, natural tails,
+  CC120/123 termination, and callback-grid artifacts
 
 ## Reference and Regression Testing
 

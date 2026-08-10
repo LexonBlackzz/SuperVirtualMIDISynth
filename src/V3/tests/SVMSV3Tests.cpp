@@ -171,6 +171,7 @@ void TestRegionValidationAndLiveConfiguration() {
     cfg.masterVolume = 1.0f;
     cfg.panLaw = svms::PanLaw::ConstantPower;
     channels.RebuildCache(cfg, 44100.0f);
+    voices->RefreshMixGain(voice, channels.GetParams()[0]);
     float left[32]{}, right[32]{};
     svms::RenderScalar renderer;
     renderer.RenderBlock(*voices, channels, renderSamples, 64, left, right, 32, cfg);
@@ -525,6 +526,71 @@ void TestPriorityAwareStealingAndFadeTail() {
     }
 }
 
+void TestExactStealHeapAndVoiceIndices() {
+    svms::ChannelCache channels;
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    channels.RebuildCache(cfg, 44100.0f);
+
+    auto voices = std::make_unique<svms::VoiceManager>();
+    voices->Initialize(4, 44100);
+    svms::VoiceHandle handles[4]{};
+    const uint8_t velocities[4] = {10, 20, 30, 40};
+    for (uint32_t i = 0; i < 4; ++i) {
+        handles[i] = voices->AllocateVoice(
+            static_cast<uint8_t>(i & 1u), static_cast<uint8_t>(60u + i),
+            velocities[i]);
+        voices->SetVoiceSample(handles[i], 0, 128, 8, 120, 1, 1.0f, 1);
+        voices->SetVoiceEnvelope(handles[i], 1.0f, 1.0f, 0, 0, 0, 0,
+                                 0.0f, 1.0f, 0.999f);
+        voices->SetVoiceGain(handles[i], 1.0f, 1.0f);
+        voices->RefreshMixGain(handles[i], channels.GetParams()[i & 1u]);
+    }
+
+    Check(voices->GetChannelActiveCount(0) == 2u &&
+              voices->GetChannelActiveCount(1) == 2u,
+          "per-channel active indices track allocation");
+    Check(voices->GetRenderClassCount(svms::VoiceRenderClass::SustainedLoop) == 4u,
+          "render-class index tracks configured sustained loops");
+
+    voices->SetCurrentFrame(1024);
+    bool stolen = false;
+    const svms::VoiceHandle firstVictim =
+        voices->AllocateVoiceOrSteal(1, 80, 127, &stolen);
+    Check(stolen && firstVictim == handles[0],
+          "exact steal heap chooses the same lowest-velocity victim as a scan");
+    voices->SetVoiceSample(firstVictim, 0, 128, 8, 120, 1, 1.0f, 1);
+    voices->SetVoiceEnvelope(firstVictim, 1.0f, 1.0f, 0, 0, 0, 0,
+                             0.0f, 1.0f, 0.999f);
+    voices->SetVoiceGain(firstVictim, 1.0f, 1.0f);
+    voices->RefreshMixGain(firstVictim, channels.GetParams()[1]);
+
+    const svms::VoiceHandle secondVictim =
+        voices->AllocateVoiceOrSteal(1, 81, 127, &stolen);
+    Check(stolen && secondVictim == handles[1],
+          "same-frame heap pop preserves exact next-victim ordering");
+
+    voices->StartRelease(handles[3]);
+    const svms::VoiceHandle releasedVictim =
+        voices->AllocateVoiceOrSteal(0, 82, 127, &stolen);
+    Check(stolen && releasedVictim == handles[3],
+          "intervening release updates the exact same-frame steal ranking");
+
+    uint32_t indexedVoices = 0u;
+    for (uint32_t channel = 0; channel < svms::kChannelCount; ++channel)
+        indexedVoices += voices->GetChannelActiveCount(static_cast<uint8_t>(channel));
+    Check(indexedVoices == voices->activeCount_,
+          "channel indices remain complete after in-place steals");
+
+    voices->RetireVoice(secondVictim);
+    indexedVoices = 0u;
+    for (uint32_t channel = 0; channel < svms::kChannelCount; ++channel)
+        indexedVoices += voices->GetChannelActiveCount(static_cast<uint8_t>(channel));
+    Check(indexedVoices == voices->activeCount_,
+          "channel indices remain complete after retirement");
+}
+
 void TestChannelTerminationControllers() {
     {
         auto voices = std::make_unique<svms::VoiceManager>();
@@ -563,6 +629,8 @@ void TestChannelTerminationControllers() {
         voices->v.stealFadeInFramesRemaining[first] = 128;
         voices->v.stealTailFramesRemaining[otherChannel] = 128;
         voices->v.stealTailChannel[otherChannel] = 0;
+        voices->RefreshStealTail(first);
+        voices->RefreshStealTail(otherChannel);
 
         voices->SilenceChannelImmediate(0);
         Check(!voices->IsActive(first) && !voices->IsActive(second),
@@ -1080,7 +1148,9 @@ void DispatchDifferentialEvent(const svms::RenderEvent& event, uint32_t,
 
 void ConfigureDifferentialSeed(svms::VoiceManager& voices,
                                const svms::ChannelCache& channels) {
-    voices.Initialize(128, 44100);
+    // Start full so randomized note-ons exercise exact stealing and the
+    // independent steal-tail batch in every differential buffer-size case.
+    voices.Initialize(48, 44100);
     for (uint32_t i = 0; i < 48; ++i) {
         const uint8_t channel = static_cast<uint8_t>(i & 3u);
         const uint8_t note = static_cast<uint8_t>(48u + i % 24u);
@@ -1297,6 +1367,7 @@ int main() {
     TestReleaseGeneratorMerging();
     TestVoiceIdentityAndStealing();
     TestPriorityAwareStealingAndFadeTail();
+    TestExactStealHeapAndVoiceIndices();
     TestChannelTerminationControllers();
     TestOverlappingRetriggerGenerations();
     TestPitchAndDeterministicRender();

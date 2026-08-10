@@ -1268,14 +1268,19 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
             ? (float)matchedRegion->scaleTuning : 100.0f;
 
         float noteTuneSemitones = coarseTune + fineTune;
-        float adjustedPitch = rootKey +
-            (((float)note + noteTuneSemitones + pitchBendSemitones - rootKey) * (keyTrack / 100.0f));
-        float semitoneOffset = adjustedPitch - rootKey;
-        float pitchRatio = powf(2.0f, semitoneOffset / 12.0f);
+        const float bendScale = keyTrack / 100.0f;
+        const float baseSemitoneOffset =
+            ((float)note + noteTuneSemitones - rootKey) * bendScale;
+        const float basePitchRatio = powf(2.0f, baseSemitoneOffset / 12.0f);
+        const float bendRatio = powf(
+            2.0f, pitchBendSemitones * bendScale / 12.0f);
 
         float srcRate = (float)(samp.sampleRate > 0 ? samp.sampleRate : 44100u);
         float outRate = (float)(sampleRate > 0 ? sampleRate : 44100u);
-        float phaseStep = (outRate > 0.0f && srcRate > 0.0f) ? (srcRate / outRate) * pitchRatio : pitchRatio;
+        const float rateRatio = (outRate > 0.0f && srcRate > 0.0f)
+            ? srcRate / outRate : 1.0f;
+        float basePhaseStep = rateRatio * basePitchRatio;
+        float phaseStep = basePhaseStep * bendRatio;
         // A corrupt SF2 pitch generator must not poison the scalar loop with
         // NaN/Inf phase values: float-to-integer conversion then pins sample
         // lookup unpredictably and silently poisons the mixed output.
@@ -1289,7 +1294,9 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         uint32_t sLoopEnd = static_cast<uint32_t>(matchedRegion->loopEndOffset);
         uint8_t loopMode = matchedRegion->loopMode;
 
-        voiceManager->SetVoiceSample(vh, sStart, sEnd, sLoopStart, sLoopEnd, loopMode, phaseStep, 1);
+        voiceManager->SetVoiceSample(vh, sStart, sEnd, sLoopStart, sLoopEnd,
+                                     loopMode, phaseStep, 1);
+        voiceManager->SetVoicePitchBase(vh, basePhaseStep, bendScale);
 
         uint32_t mappedVelocityIndex = static_cast<uint32_t>(
             mappedVelocity * 127.0f + 0.5f);
@@ -1380,24 +1387,9 @@ void Driver::HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset) 
     // pool pressure.  BASSMIDI and SnappySynth both use SF2-specified
     // release times; adaptive release causes audible inconsistency under
     // varying polyphony loads.
-    VoiceSoA& v = voiceManager->v;
-
     const uint32_t playIndex = voiceManager->FindOldestPlayIndex(channel, note);
     if (playIndex == UINT32_MAX) return;
-
-    for (uint32_t ai = 0; ai < voiceManager->activeCount_; ++ai) {
-        uint32_t i = voiceManager->activeList_[ai];
-        if (v.channel[i] != channel || v.note[i] != note ||
-            v.playIndex[i] != playIndex) continue;
-        if (v.state[i] == static_cast<uint8_t>(VoiceState::Free)) continue;
-
-        if (sustain) {
-            v.heldBySustain[i] = 1;
-        } else {
-            v.releaseStartInBlock[i] = blockOffset;
-            voiceManager->StartRelease(i);
-        }
-    }
+    voiceManager->NoteOffPlayIndex(channel, note, playIndex, sustain, blockOffset);
 }
 
 void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t value,
@@ -1407,10 +1399,11 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
 
     if (controller == 64) {
         if (value < 64) {
-            for (uint32_t ai = 0; ai < voiceManager->activeCount_; ++ai) {
-                uint32_t i = voiceManager->activeList_[ai];
-                if (voiceManager->v.channel[i] == channel
-                    && voiceManager->v.heldBySustain[i]) {
+            const uint32_t count = voiceManager->GetChannelActiveCount(channel);
+            const uint32_t* handles = voiceManager->GetChannelActiveList(channel);
+            for (uint32_t position = 0; position < count; ++position) {
+                const uint32_t i = handles[position];
+                if (voiceManager->v.heldBySustain[i]) {
                     voiceManager->v.heldBySustain[i] = 0;
                     voiceManager->StartRelease(i);
                 }
@@ -1423,9 +1416,11 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     } else if (controller == 123) {
         voiceManager->ReleaseChannel(channel, blockOffset);
     } else if (controller == 121 && sustainWasActive) {
-        for (uint32_t ai = 0; ai < voiceManager->activeCount_; ++ai) {
-            uint32_t i = voiceManager->activeList_[ai];
-            if (voiceManager->v.channel[i] == channel && voiceManager->v.heldBySustain[i]) {
+        const uint32_t count = voiceManager->GetChannelActiveCount(channel);
+        const uint32_t* handles = voiceManager->GetChannelActiveList(channel);
+        for (uint32_t position = 0; position < count; ++position) {
+            const uint32_t i = handles[position];
+            if (voiceManager->v.heldBySustain[i]) {
                 voiceManager->v.heldBySustain[i] = 0;
                 voiceManager->StartRelease(i);
             }
@@ -1443,7 +1438,11 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     // the new channel state rather than waiting for the next callback.
     if (channelCache && configSnapshot) {
         channelCache->RebuildCache(*configSnapshot, static_cast<float>(sampleRate));
-        voiceManager->RefreshMixGains(channelCache->GetParams());
+        if (controller == 7 || controller == 10 || controller == 11 ||
+            controller == 121) {
+            voiceManager->RefreshMixGainsForChannel(
+                channel, channelCache->GetParams()[channel]);
+        }
     }
 }
 
@@ -1470,43 +1469,20 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
     if (channelCache)
         channelCache->PitchBend(channel, static_cast<int16_t>((msb << 7) | lsb));
 
-    if (!voiceManager || !samplesStore || !soundFontData) return;
+    if (!voiceManager || !channelCache || channel >= kChannelCount) return;
 
-    float pitchBendSemitones = channelCache->GetPitchBendSemitones(channel);
-
-    for (uint32_t ai = 0; ai < voiceManager->activeCount_; ++ai) {
-        uint32_t i = voiceManager->activeList_[ai];
-        if (voiceManager->v.channel[i] != channel) continue;
-
-        const uint16_t regionIndex = voiceManager->v.regionIndex[i];
-        if (regionIndex >= soundFontData->regionCount) continue;
-
-        const uint8_t note = voiceManager->v.note[i];
-        const SFSampleRegion* matchedRegion = &soundFontData->regions[regionIndex];
-        uint32_t sampleIndex = matchedRegion->sampleIndex;
-        if (sampleIndex >= sampleStoreCount) continue;
-
-        const SF2Sample& samp = samplesStore[sampleIndex];
-        int effRootKey = (matchedRegion && matchedRegion->rootKey >= 0)
-            ? matchedRegion->rootKey : (int)samp.originalPitch;
-        float rootKey = (float)effRootKey;
-        float coarseTune = (float)(matchedRegion ? matchedRegion->coarseTune : 0);
-        float fineTune = (float)(matchedRegion ? matchedRegion->fineTune : 0) / 100.0f;
-        float keyTrack = (matchedRegion && matchedRegion->scaleTuning != 0)
-            ? (float)matchedRegion->scaleTuning : 100.0f;
-
-        float noteTuneSemitones = coarseTune + fineTune;
-        float adjustedPitch = rootKey +
-            (((float)note + noteTuneSemitones + pitchBendSemitones - rootKey) * (keyTrack / 100.0f));
-        float semitoneOffset = adjustedPitch - rootKey;
-        float pitchRatio = powf(2.0f, semitoneOffset / 12.0f);
-
-        float srcRate = (float)(samp.sampleRate > 0 ? samp.sampleRate : 44100u);
-        float outRate = (float)(sampleRate > 0 ? sampleRate : 44100u);
-        float phaseStep = (outRate > 0.0f && srcRate > 0.0f) ? (srcRate / outRate) * pitchRatio : pitchRatio;
-
-        voiceManager->v.phaseIncs[i] = phaseStep;
+    const float bendSemitones = channelCache->GetPitchBendSemitones(channel);
+    const float commonRatio = powf(2.0f, bendSemitones / 12.0f);
+    const uint32_t count = voiceManager->GetChannelActiveCount(channel);
+    const uint32_t* handles = voiceManager->GetChannelActiveList(channel);
+    for (uint32_t position = 0; position < count; ++position) {
+        const uint32_t i = handles[position];
+        const float scale = voiceManager->v.pitchBendScales[i];
+        const float ratio = scale == 1.0f
+            ? commonRatio : powf(2.0f, bendSemitones * scale / 12.0f);
+        voiceManager->v.phaseIncs[i] = voiceManager->v.basePhaseIncs[i] * ratio;
     }
+    voiceManager->InvalidateStealCandidates();
 }
 
 } // namespace svms

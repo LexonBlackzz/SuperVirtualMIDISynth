@@ -212,7 +212,8 @@ inline float ChannelCache::GetPitchBendSemitones(uint8_t channel) const {
         * kDefaultPitchBendRangeSemitones;
 }
 
-float ChannelCache::ComputeVelocity(uint8_t velocity, const RuntimeConfigSnapshot& cfg) const {
+inline float ChannelCache::ComputeVelocity(
+    uint8_t velocity, const RuntimeConfigSnapshot& cfg) const {
     if (velocity == 0 || velocity < cfg.velocityIgnoreBelow) return 0.0f;
     if (cfg.ignoreVelocity) return 1.0f;
 

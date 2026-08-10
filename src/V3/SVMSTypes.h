@@ -201,6 +201,22 @@ enum class VoiceState : uint8_t {
     Releasing = 2,
 };
 
+// Stable kernel eligibility shared by scalar and future SIMD backends.  The
+// lifecycle list remains independent so render ordering never changes MIDI or
+// stealing semantics.
+enum class VoiceRenderClass : uint8_t {
+    SustainedLoop = 0,
+    SustainedOneShot,
+    TransientLoop,
+    ReleaseLoop,
+    ReleaseOneShot,
+    Generic,
+    Count
+};
+
+inline constexpr uint32_t kVoiceRenderClassCount =
+    static_cast<uint32_t>(VoiceRenderClass::Count);
+
 enum class SampleInterpolation : uint8_t {
     Nearest = 0,
     Linear = 1,
@@ -324,17 +340,20 @@ struct SamplePage {
 //     StartRelease for loopMode==3 (loop-during-key-depression) voices.
 //   - mixGainL / mixGainR: gainLeft/Right × channel pan × channel volume,
 //     premultiplied so the per-sample mix is a single FMA per channel.
-//     Refreshed at note-on and once per block from the channel snapshot.
+//     Refreshed at note-on and only for a channel whose gain state changes.
+//   - renderGainL / renderGainR: sustained-envelope gain folded into mixGain,
+//     avoiding redundant multiplies in dense short-span kernels.
 //
 // Removed: fractional phase offsets; event starts are integer output frames.
 // ════════════════════════════════════════════════════════════════════════
-struct VoiceSoA {
+struct alignas(64) VoiceSoA {
     uint8_t  channel[kMaxPolyphony];
     uint8_t  note[kMaxPolyphony];
     uint8_t  velocity[kMaxPolyphony];
     uint8_t  state[kMaxPolyphony];
     uint8_t  envelopeStage[kMaxPolyphony];
     uint8_t  sampleBacked[kMaxPolyphony];
+    uint8_t  renderClass[kMaxPolyphony];
     uint16_t pad16;
 
     // SoundFont identity captured at note-on.  These fields must remain
@@ -348,31 +367,38 @@ struct VoiceSoA {
     // matching TSF's playIndex behavior for overlapping retriggers.
     uint32_t playIndex[kMaxPolyphony];
 
-    float phases[kMaxPolyphony];
-    float phaseIncs[kMaxPolyphony];
-    float currentGain[kMaxPolyphony];
-    float targetGain[kMaxPolyphony];
-    float sustainLevel[kMaxPolyphony];
-    float attackGainStep[kMaxPolyphony];
-    float decayGainStep[kMaxPolyphony];
-    float releaseDecay[kMaxPolyphony];
-    float gainLeft[kMaxPolyphony];
-    float gainRight[kMaxPolyphony];
-    float mixGainL[kMaxPolyphony];
-    float mixGainR[kMaxPolyphony];
+    alignas(64) float phases[kMaxPolyphony];
+    alignas(64) float phaseIncs[kMaxPolyphony];
+    // Pitch increment before the channel pitch-bend contribution.  Most SF2
+    // regions use 100% scale tuning and can therefore share one channel bend
+    // ratio; unusual scale-tuned regions retain their per-voice multiplier.
+    alignas(64) float basePhaseIncs[kMaxPolyphony];
+    alignas(64) float pitchBendScales[kMaxPolyphony];
+    alignas(64) float currentGain[kMaxPolyphony];
+    alignas(64) float targetGain[kMaxPolyphony];
+    alignas(64) float sustainLevel[kMaxPolyphony];
+    alignas(64) float attackGainStep[kMaxPolyphony];
+    alignas(64) float decayGainStep[kMaxPolyphony];
+    alignas(64) float releaseDecay[kMaxPolyphony];
+    alignas(64) float gainLeft[kMaxPolyphony];
+    alignas(64) float gainRight[kMaxPolyphony];
+    alignas(64) float mixGainL[kMaxPolyphony];
+    alignas(64) float mixGainR[kMaxPolyphony];
+    alignas(64) float renderGainL[kMaxPolyphony];
+    alignas(64) float renderGainR[kMaxPolyphony];
 
-    uint32_t sampleStart[kMaxPolyphony];
-    uint32_t sampleEnd[kMaxPolyphony];
-    uint32_t loopStart[kMaxPolyphony];
-    uint32_t loopEnd[kMaxPolyphony];
+    alignas(64) uint32_t sampleStart[kMaxPolyphony];
+    alignas(64) uint32_t sampleEnd[kMaxPolyphony];
+    alignas(64) uint32_t loopStart[kMaxPolyphony];
+    alignas(64) uint32_t loopEnd[kMaxPolyphony];
     uint8_t  loopMode[kMaxPolyphony];
     uint8_t  loopEnabled[kMaxPolyphony];
 
-    uint32_t relEnd[kMaxPolyphony];
-    uint32_t relLoopS[kMaxPolyphony];
-    uint32_t relLoopE[kMaxPolyphony];
-    float    relLoopSF[kMaxPolyphony];
-    float    relLoopEF[kMaxPolyphony];
+    alignas(64) uint32_t relEnd[kMaxPolyphony];
+    alignas(64) uint32_t relLoopS[kMaxPolyphony];
+    alignas(64) uint32_t relLoopE[kMaxPolyphony];
+    alignas(64) float    relLoopSF[kMaxPolyphony];
+    alignas(64) float    relLoopEF[kMaxPolyphony];
 
     uint32_t holdSamplesRemaining[kMaxPolyphony];
     uint32_t attackSamplesRemaining[kMaxPolyphony];

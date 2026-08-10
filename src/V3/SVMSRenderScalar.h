@@ -6,6 +6,7 @@
 #include "SVMSChannelCache.h"
 #include "SVMSEnvelope.h"
 #include "SVMSPageAllocator.h"
+#include "SVMSRenderKernels.h"
 #include <algorithm>
 #include "SVMSSoundFont.h"
 
@@ -207,7 +208,8 @@ private:
                      bool correctnessMode, uint64_t blockStartFrame);
     EventDispatcher dispatcher_;
     void* dispatcherUserData_;
-    alignas(64) uint32_t spanVoices_[kMaxPolyphony];
+    alignas(64) uint32_t classChanges_[kMaxPolyphony];
+    alignas(64) uint32_t tailFrameCounts_[kMaxPolyphony];
     alignas(64) SpanRetirement retirements_[kMaxPolyphony];
 };
 
@@ -242,11 +244,12 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                                         bool correctnessMode,
                                         uint64_t blockStartFrame) {
     (void)cfg;
+    (void)channels;
     VoiceSoA& v = voices.v;
 
-    // Refresh premultiplied mix gains against the latest channel snapshot
-    // (block-rate, matching how chanParams were consumed before).
-    voices.RefreshMixGains(channels.GetParams());
+    // Premultiplied gains are refreshed at note-on and by the exact-frame
+    // controller dispatcher.  A callback-wide refresh is both redundant and
+    // disproportionately expensive at small buffers on legacy processors.
 
     uint32_t eventIdx = 0;
 
@@ -986,27 +989,12 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       const RenderEvent* events, uint32_t eventCount,
                                       bool correctnessMode,
                                       uint64_t blockStartFrame) {
-    // Voice-major spans win decisively when events are sparse, but very short
-    // spans cannot amortize state capture.  Count distinct in-block event
-    // frames and retain the fused frame-major oracle for event-dense blocks.
-    const uint32_t denseBoundaryThreshold = (std::max)(1u, numFrames / 4u);
-    uint32_t distinctBoundaries = 0u;
-    uint32_t previousBoundary = UINT32_MAX;
-    for (uint32_t i = 0; i < eventCount; ++i) {
-        const uint32_t boundary = events[i].frameOffset;
-        if (boundary >= numFrames || boundary == previousBoundary) continue;
-        previousBoundary = boundary;
-        if (++distinctBoundaries >= denseBoundaryThreshold) {
-            RenderBlockFrameMajor(voices, channels, sampleData, sampleDataFrames,
-                                  outputLeft, outputRight, numFrames, cfg, events,
-                                  eventCount, correctnessMode, blockStartFrame);
-            return;
-        }
-    }
-
     (void)cfg;
+    (void)channels;
     VoiceSoA& v = voices.v;
-    voices.RefreshMixGains(channels.GetParams());
+    const RenderKernelSet& kernelSet = GetScalarRenderKernelSet();
+    // Gain state is already current for this boundary; see the frame-major
+    // oracle above and Driver::HandleControlChange.
 
     const uint32_t initialStep = correctnessMode
         ? 1u : ComputeDecimationStep(voices.activeCount_);
@@ -1034,76 +1022,82 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         if (spanEnd <= cursor) continue;
 
         const uint32_t spanFrames = spanEnd - cursor;
-
-        // With an event on every output frame, copying the complete active
-        // list costs as much as rendering it.  A one-frame span cannot suffer
-        // cross-frame swap-removal hazards, so use the live list directly and
-        // retire immediately, reprocessing the swap-in at the same position.
-        if (spanFrames == 1u) {
-            const uint32_t step = correctnessMode
-                ? 1u : ComputeDecimationStep(voices.activeCount_);
-            const bool fullMix = step == 1u;
-            const uint32_t mixLimit = fullMix ? voices.activeCount_
-                                               : voices.activeCount_ / step;
-            for (uint32_t position = 0; position < voices.activeCount_;) {
-                const uint32_t idx = voices.activeList_[position];
-                uint32_t mixedFrames = 1u;
-                if (!fullMix && position >= mixLimit &&
-                    voices.GetVoiceAge(static_cast<VoiceHandle>(idx)) >=
-                        kNewbornProtectSamples) {
-                    mixedFrames = 0u;
-                }
-                const uint32_t retiredAt = RenderPrimaryVoiceSpan(
-                    v, idx, sampleData, sampleDataFrames, outputLeft, outputRight,
-                    cursor, 1u, mixedFrames);
-                RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
-                                    outputLeft, outputRight, cursor, 1u);
-                if (retiredAt != UINT32_MAX) {
-                    voices.RetireVoice(static_cast<VoiceHandle>(idx));
-                } else {
-                    ++position;
-                }
-            }
-            cursor = spanEnd;
-            continue;
-        }
-
-        const uint32_t spanCount = voices.activeCount_;
-        std::copy_n(voices.activeList_, spanCount, spanVoices_);
-
-        const uint32_t step = correctnessMode ? 1u : ComputeDecimationStep(spanCount);
-        const bool fullMix = step == 1u;
-        const uint32_t mixLimit = fullMix ? spanCount : spanCount / step;
         uint32_t retireCount = 0u;
+        uint32_t classChangeCount = 0u;
+        const uint32_t tailCount = voices.GetStealTailCount();
+        const uint32_t* tailHandles = voices.GetStealTailList();
+        for (uint32_t position = 0; position < tailCount; ++position)
+            tailFrameCounts_[tailHandles[position]] = spanFrames;
 
-        for (uint32_t position = 0; position < spanCount; ++position) {
-            const uint32_t idx = spanVoices_[position];
-            if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) continue;
+        // Class counts are captured before rendering.  Natural retirements
+        // and envelope transitions are deferred, so every list stays stable
+        // while all backends consume the span without copying activeList_.
+        for (uint32_t classIndex = 0; classIndex < kVoiceRenderClassCount;
+             ++classIndex) {
+            const VoiceRenderClass renderClass =
+                static_cast<VoiceRenderClass>(classIndex);
+            const uint32_t classCount = voices.GetRenderClassCount(renderClass);
+            const uint32_t* handles = voices.GetRenderClassList(renderClass);
 
-            uint32_t mixedFrames = spanFrames;
-            if (!fullMix && position >= mixLimit) {
-                const uint32_t age = voices.GetVoiceAge(static_cast<VoiceHandle>(idx));
-                mixedFrames = age < kNewbornProtectSamples
-                    ? (std::min)(spanFrames, kNewbornProtectSamples - age)
-                    : 0u;
+            RenderClassKernel classKernel = kernelSet.kernels[classIndex];
+            if (classKernel != nullptr && sampleData != nullptr) {
+                const RenderSpanContext context{
+                    &v, sampleData, sampleDataFrames, outputLeft, outputRight,
+                    cursor, spanFrames};
+                classKernel(context, handles, classCount);
+                continue;
             }
 
-            const uint32_t retiredAt = RenderPrimaryVoiceSpan(
-                v, idx, sampleData, sampleDataFrames, outputLeft, outputRight,
-                cursor, spanFrames, mixedFrames);
-            const uint32_t tailFrames = retiredAt == UINT32_MAX
-                ? spanFrames : retiredAt + 1u;
-            RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
-                                outputLeft, outputRight, cursor, tailFrames);
+            for (uint32_t position = 0; position < classCount; ++position) {
+                const uint32_t idx = handles[position];
+                if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) continue;
 
-            if (retiredAt != UINT32_MAX) {
-                retirements_[retireCount] = {idx, retiredAt, position};
-                ++retireCount;
+                uint32_t retiredAt = UINT32_MAX;
+                const bool cleanPrimary =
+                    v.stealFadeInFramesRemaining[idx] == 0u;
+                if (cleanPrimary && renderClass == VoiceRenderClass::SustainedLoop) {
+                    retiredAt = ScalarRenderSustainedLoop(
+                        v, idx, sampleData, sampleDataFrames, outputLeft,
+                        outputRight, cursor, spanFrames);
+                } else if (cleanPrimary &&
+                           renderClass == VoiceRenderClass::SustainedOneShot) {
+                    retiredAt = ScalarRenderSustainedOneShot(
+                        v, idx, sampleData, sampleDataFrames, outputLeft,
+                        outputRight, cursor, spanFrames);
+                } else {
+                    retiredAt = RenderPrimaryVoiceSpan(
+                        v, idx, sampleData, sampleDataFrames, outputLeft,
+                        outputRight, cursor, spanFrames, spanFrames);
+                }
+
+                if (retiredAt != UINT32_MAX) {
+                    if (v.stealTailFramesRemaining[idx] != 0u)
+                        tailFrameCounts_[idx] = retiredAt + 1u;
+                    retirements_[retireCount++] = {
+                        idx, retiredAt, voices.activePosition_[idx]};
+                } else if (renderClass == VoiceRenderClass::TransientLoop ||
+                           renderClass == VoiceRenderClass::Generic) {
+                    classChanges_[classChangeCount++] = idx;
+                }
             }
         }
+
+        // Tails have their own sparse lifecycle list and render independently
+        // from primary class ordering.  Iterate backwards so O(1) swap-removal
+        // of a completed tail cannot skip an unprocessed entry.
+        for (uint32_t position = tailCount; position > 0u; --position) {
+            const uint32_t idx = tailHandles[position - 1u];
+            RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
+                                outputLeft, outputRight, cursor,
+                                tailFrameCounts_[idx]);
+            voices.RefreshStealTail(static_cast<VoiceHandle>(idx));
+        }
+
+        for (uint32_t i = 0; i < classChangeCount; ++i)
+            voices.RefreshRenderClass(static_cast<VoiceHandle>(classChanges_[i]));
 
         // Retirement is deferred until every captured handle has rendered,
-        // so active-list swap removal cannot skip or duplicate a span voice.
+        // so class-list and active-list swap removal cannot skip a voice.
         std::sort(retirements_, retirements_ + retireCount,
             [](const SpanRetirement& a, const SpanRetirement& b) {
                 if (a.frameOffset != b.frameOffset)
