@@ -53,13 +53,14 @@ inline bool SequenceAtOrBefore(uint32_t sequence, uint32_t fence) noexcept {
 // samples, effectively pausing their temporal resolution.
 // The step changes per-block based on active voice count.
 //
-// Tiers (from SnappySynth V2 decompilation):
-//   <  2,000 voices: step 1  (full quality, expect small voice counts)
-//   < 20,000 voices: step 2  (half: still near-full quality)
-//   < 50,000 voices: step 4  (quarter: light cull)
-//   < 150,000 voices: step 8  (eighth: moderate cull)
-//   >= 150,000 voices: step 16 (heavy cull, 6.25% of voices rendered)
-constexpr uint32_t kDecimationTier1 = 2000;    // step 1 (no decimation)
+// The stabilized 4096-voice engine is always full quality. Decimation tiers
+// remain reserved for the future storage expansion beyond the current pool:
+//   <= 4,096 voices: step 1
+//   < 50,000 voices: step 2
+//   < 150,000 voices: step 4
+//   < 500,000 voices: step 8
+//   >= 500,000 voices: step 16
+constexpr uint32_t kDecimationTier1 = kMaxPolyphony + 1; // step 1 through 4096
 constexpr uint32_t kDecimationTier2 = 50000;   // step 2
 constexpr uint32_t kDecimationTier3 = 150000;  // step 4
 constexpr uint32_t kDecimationTier4 = 500000;  // step 8
@@ -108,12 +109,19 @@ struct EventTelemetry {
     uint64_t scheduledHighWater = 0;
     uint64_t dispatched = 0;
     uint64_t late = 0;
+    uint64_t skippedOutputFrames = 0;
+    uint64_t staleNoteOnsSkipped = 0;
     uint64_t sequenceGaps = 0;
     uint64_t zeroMatchedRegions = 0;
     uint64_t allocationFailures = 0;
     uint64_t voiceSteals = 0;
     uint64_t immediateRetirements = 0;
     uint64_t maxCallbackQPC = 0;
+    float callbackP95Percent = 0.0f;
+    float callbackP99Percent = 0.0f;
+    float callbackP999Percent = 0.0f;
+    uint64_t overBudgetCallbacks = 0;
+    uint32_t maxConsecutiveOverBudget = 0;
     uint64_t shedNoteOns = 0;
     uint64_t shedByVelocity[128]{};
     uint64_t cancelledSubmissions = 0;

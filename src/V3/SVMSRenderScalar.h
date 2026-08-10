@@ -130,6 +130,12 @@ struct RenderEvent {
 using EventDispatcher = void(*)(const RenderEvent& event, uint32_t blockCursor,
                                  void* userData);
 
+struct SpanRetirement {
+    uint32_t handle;
+    uint32_t frameOffset;
+    uint32_t capturePosition;
+};
+
 // ════════════════════════════════════════════════════════════════════════
 // RenderScalar — per-sample dispatch + adaptive-decimation scalar render.
 //
@@ -175,11 +181,34 @@ public:
                      bool correctnessMode = false,
                      uint64_t blockStartFrame = 0);
 
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    // Test-only oracle: the pre-optimization frame-major renderer.  It is
+    // intentionally excluded from production builds so the DLL carries only
+    // the span renderer, while differential tests can still prove state and
+    // waveform equivalence.
+    void RenderBlockReference(VoiceManager& voices, const ChannelCache& channels,
+                     const float* sampleData, uint32_t sampleDataFrames,
+                     float* outputLeft, float* outputRight,
+                     uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
+                     const RenderEvent* events = nullptr,
+                     uint32_t eventCount = 0,
+                     bool correctnessMode = false,
+                     uint64_t blockStartFrame = 0);
+#endif
+
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
 
 private:
+    void RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
+                     const float* sampleData, uint32_t sampleDataFrames,
+                     float* outputLeft, float* outputRight,
+                     uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
+                     const RenderEvent* events, uint32_t eventCount,
+                     bool correctnessMode, uint64_t blockStartFrame);
     EventDispatcher dispatcher_;
     void* dispatcherUserData_;
+    alignas(64) uint32_t spanVoices_[kMaxPolyphony];
+    alignas(64) SpanRetirement retirements_[kMaxPolyphony];
 };
 
 inline RenderScalar::RenderScalar()
@@ -205,7 +234,7 @@ inline void RenderScalar::SetEventDispatcher(EventDispatcher dispatcher, void* u
 // `mixAudio` gates only the sample fetch + output accumulation; envelope,
 // phase and retirement always advance so decimated voices don't freeze.
 // ════════════════════════════════════════════════════════════════════════
-inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& channels,
+inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
                                         const float* sampleData, uint32_t sampleDataFrames,
                                         float* outputLeft, float* outputRight,
                                         uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
@@ -450,6 +479,644 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // retired mid-block keep their (stale) block-start age — this makes
     // retireImmediateCount_ over-count voices that died young but past
     // their first 2 samples within the same block.  Diagnostic only.
+    voices.SetCurrentFrame(blockStartFrame + numFrames);
+}
+
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
+                                        const ChannelCache& channels,
+                                        const float* sampleData,
+                                        uint32_t sampleDataFrames,
+                                        float* outputLeft, float* outputRight,
+                                        uint32_t numFrames,
+                                        const RuntimeConfigSnapshot& cfg,
+                                        const RenderEvent* events,
+                                        uint32_t eventCount,
+                                        bool correctnessMode,
+                                        uint64_t blockStartFrame) {
+    RenderBlockFrameMajor(voices, channels, sampleData, sampleDataFrames,
+                          outputLeft, outputRight, numFrames, cfg, events,
+                          eventCount, correctnessMode, blockStartFrame);
+}
+#endif
+
+// Render a stolen voice continuation across an event-free span.  All state is
+// held in locals and committed once, avoiding the former SoA round-trip on
+// every frame.  The caller limits frameCount when the replacement voice
+// retires inside the span because the tail is owned by that primary slot.
+inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
+                                const float* sampleData,
+                                uint32_t sampleDataFrames,
+                                float* outputLeft, float* outputRight,
+                                uint32_t frameStart, uint32_t frameCount) {
+    uint32_t remaining = v.stealTailFramesRemaining[idx];
+    if (remaining == 0u || v.stealTailSampleBacked[idx] == 0u ||
+        sampleData == nullptr || frameCount == 0u) {
+        return;
+    }
+
+    const uint32_t relEnd = v.stealTailRelEnd[idx];
+    if (relEnd < 2u) {
+        v.stealTailFramesRemaining[idx] = 0u;
+        return;
+    }
+
+    float phase = (std::max)(0.0f, v.stealTailPhase[idx]);
+    const float phaseStep = v.stealTailPhaseInc[idx];
+    const float gain = v.stealTailGain[idx];
+    const float mixL = v.stealTailMixGainL[idx];
+    const float mixR = v.stealTailMixGainR[idx];
+    const uint32_t sampleStart = v.stealTailSampleStart[idx];
+    const uint32_t relLoopS = v.stealTailRelLoopS[idx];
+    const uint32_t relLoopE = v.stealTailRelLoopE[idx];
+    const float relLoopSF = v.stealTailRelLoopSF[idx];
+    const float relLoopEF = v.stealTailRelLoopEF[idx];
+    const bool loop = v.stealTailLoopEnabled[idx] != 0u;
+    const uint32_t total = v.stealTailFramesTotal[idx];
+    const uint32_t count = (std::min)(frameCount, remaining);
+
+    for (uint32_t n = 0; n < count; ++n) {
+        uint32_t baseOffset = static_cast<uint32_t>(phase);
+        if (baseOffset + 1u >= relEnd) {
+            if (!loop) {
+                remaining = 0u;
+                break;
+            }
+            phase = relLoopSF;
+            baseOffset = relLoopS;
+        }
+
+        uint32_t nextRel = baseOffset + 1u;
+        if (loop && nextRel >= relLoopE) nextRel = relLoopS;
+        if (nextRel >= relEnd) nextRel = relEnd - 1u;
+        const uint32_t baseIndex = sampleStart + baseOffset;
+        const uint32_t nextIndex = sampleStart + nextRel;
+        if (baseIndex >= sampleDataFrames || nextIndex >= sampleDataFrames) {
+            remaining = 0u;
+            break;
+        }
+
+        const float frac = phase - static_cast<float>(baseOffset);
+        const float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+        const float fade = total > 0u
+            ? static_cast<float>(remaining) / static_cast<float>(total)
+            : 0.0f;
+        const float scaled = sample * gain * fade;
+        outputLeft[frameStart + n] += scaled * mixL;
+        outputRight[frameStart + n] += scaled * mixR;
+
+        phase += phaseStep;
+        if (loop && phase >= relLoopEF) {
+            float overflow = phase - relLoopEF;
+            const float loopLength = relLoopEF - relLoopSF;
+            if (loopLength > 0.0f && overflow >= loopLength)
+                overflow -= floorf(overflow / loopLength) * loopLength;
+            phase = relLoopSF + overflow;
+        }
+        --remaining;
+    }
+
+    v.stealTailPhase[idx] = phase;
+    v.stealTailFramesRemaining[idx] = remaining;
+}
+
+// Render one primary voice across a span.  The return value is the zero-based
+// frame inside the span on which the voice retires, or UINT32_MAX when it
+// remains active.  Event dispatch cannot mutate voice state inside a span.
+inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
+                                       const float* sampleData,
+                                       uint32_t sampleDataFrames,
+                                       float* outputLeft, float* outputRight,
+                                       uint32_t frameStart, uint32_t frameCount,
+                                       uint32_t mixedFrameCount) {
+    if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free) || frameCount == 0u)
+        return UINT32_MAX;
+
+    const bool sampleBacked = v.sampleBacked[idx] != 0u && sampleData != nullptr;
+    uint32_t fadeRemaining = v.stealFadeInFramesRemaining[idx];
+    const uint32_t fadeTotal = v.stealFadeInFramesTotal[idx];
+
+    // Preserve the legacy behavior for synthetic voices without sample data:
+    // they are silent and stationary, but an outstanding replacement fade
+    // still advances.
+    if (!sampleBacked) {
+        const uint32_t consumed = (std::min)(fadeRemaining, frameCount);
+        v.stealFadeInFramesRemaining[idx] -= consumed;
+        return UINT32_MAX;
+    }
+
+    const uint32_t sampleStart = v.sampleStart[idx];
+    const uint32_t relEnd = v.relEnd[idx];
+    const uint32_t relLoopS = v.relLoopS[idx];
+    const uint32_t relLoopE = v.relLoopE[idx];
+    const float relLoopSF = v.relLoopSF[idx];
+    const float relLoopEF = v.relLoopEF[idx];
+    const bool loop = v.loopEnabled[idx] != 0u;
+    const float phaseStep = v.phaseIncs[idx];
+    const float mixL = v.mixGainL[idx];
+    const float mixR = v.mixGainR[idx];
+    float phase = (std::max)(0.0f, v.phases[idx]);
+    float gain = v.currentGain[idx];
+    const bool released = v.state[idx] == static_cast<uint8_t>(VoiceState::Releasing);
+    uint8_t stage = v.envelopeStage[idx];
+
+    if (relEnd < 2u || sampleStart >= sampleDataFrames ||
+        relEnd > sampleDataFrames - sampleStart ||
+        (loop && (relLoopS >= relLoopE || relLoopE > relEnd))) {
+        return 0u;
+    }
+
+    // The overwhelmingly common path: a held, sustained, looping SF2 voice.
+    // Only phase/fade state is written back after the span.
+    if (!released && stage == 3u && loop) {
+        // Full-quality steady state: no decimation, no replacement fade, and
+        // bounds already validated above.  This is the 4K acceptance kernel.
+        if (mixedFrameCount == frameCount && fadeRemaining == 0u) {
+            const float gainL = gain * mixL;
+            const float gainR = gain * mixR;
+            float* outL = outputLeft + frameStart;
+            float* outR = outputRight + frameStart;
+            for (uint32_t n = 0; n < frameCount; ++n) {
+                uint32_t baseOffset = static_cast<uint32_t>(phase);
+                if (baseOffset + 1u >= relEnd) {
+                    phase = relLoopSF;
+                    baseOffset = relLoopS;
+                }
+                uint32_t nextRel = baseOffset + 1u;
+                if (nextRel >= relLoopE) nextRel = relLoopS;
+                const float frac = phase - static_cast<float>(baseOffset);
+                const float sample = InterpolateSample(
+                    sampleData, sampleStart + baseOffset, sampleStart + nextRel, frac);
+                outL[n] += sample * gainL;
+                outR[n] += sample * gainR;
+
+                phase += phaseStep;
+                if (phase >= relLoopEF) {
+                    float overflow = phase - relLoopEF;
+                    const float loopLength = relLoopEF - relLoopSF;
+                    if (overflow >= loopLength)
+                        overflow -= floorf(overflow / loopLength) * loopLength;
+                    phase = relLoopSF + overflow;
+                }
+            }
+            v.phases[idx] = phase;
+            return UINT32_MAX;
+        }
+
+        // Decimated steady voices still advance phase without fetching sample
+        // memory or touching the output buffers.
+        if (mixedFrameCount == 0u && fadeRemaining == 0u) {
+            phase += phaseStep * static_cast<float>(frameCount);
+            if (phase >= relLoopEF) {
+                float overflow = phase - relLoopEF;
+                const float loopLength = relLoopEF - relLoopSF;
+                if (loopLength > 0.0f && overflow >= loopLength)
+                    overflow -= floorf(overflow / loopLength) * loopLength;
+                phase = relLoopSF + overflow;
+            }
+            v.phases[idx] = phase;
+            return UINT32_MAX;
+        }
+
+        for (uint32_t n = 0; n < frameCount; ++n) {
+            uint32_t baseOffset = static_cast<uint32_t>(phase);
+            if (baseOffset + 1u >= relEnd) {
+                phase = relLoopSF;
+                baseOffset = relLoopS;
+            }
+
+            float fade = 1.0f;
+            if (fadeRemaining > 0u) {
+                fade = fadeTotal > 0u
+                    ? static_cast<float>(fadeTotal - fadeRemaining + 1u) /
+                      static_cast<float>(fadeTotal)
+                    : 1.0f;
+                --fadeRemaining;
+            }
+
+            if (n < mixedFrameCount) {
+                uint32_t nextRel = baseOffset + 1u;
+                if (nextRel >= relLoopE) nextRel = relLoopS;
+                if (nextRel >= relEnd) nextRel = relEnd - 1u;
+                const uint32_t baseIndex = sampleStart + baseOffset;
+                const uint32_t nextIndex = sampleStart + nextRel;
+                const float frac = phase - static_cast<float>(baseOffset);
+                const float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+                const float scaled = sample * gain * fade;
+                outputLeft[frameStart + n] += scaled * mixL;
+                outputRight[frameStart + n] += scaled * mixR;
+            }
+
+            phase += phaseStep;
+            if (phase >= relLoopEF) {
+                float overflow = phase - relLoopEF;
+                const float loopLength = relLoopEF - relLoopSF;
+                if (loopLength > 0.0f && overflow >= loopLength)
+                    overflow -= floorf(overflow / loopLength) * loopLength;
+                phase = relLoopSF + overflow;
+            }
+        }
+        v.phases[idx] = phase;
+        v.stealFadeInFramesRemaining[idx] = fadeRemaining;
+        return UINT32_MAX;
+    }
+
+    // Full-quality looping attack/decay voices.  Envelope state remains local
+    // while the sample cursor follows the same validated loop as steady state.
+    if (!released && loop && fadeRemaining == 0u &&
+        mixedFrameCount == frameCount && (stage == 1u || stage == 2u)) {
+        uint32_t attackRemaining = v.attackSamplesRemaining[idx];
+        uint32_t decayRemaining = v.decaySamplesRemaining[idx];
+        const float targetGain = v.targetGain[idx];
+        const float sustainLevel = v.sustainLevel[idx];
+        const float attackStep = v.attackGainStep[idx];
+        const float decaySlope = v.decaySlope[idx];
+        float* outL = outputLeft + frameStart;
+        float* outR = outputRight + frameStart;
+
+        for (uint32_t n = 0; n < frameCount; ++n) {
+            uint32_t baseOffset = static_cast<uint32_t>(phase);
+            if (baseOffset + 1u >= relEnd) {
+                phase = relLoopSF;
+                baseOffset = relLoopS;
+            }
+            uint32_t nextRel = baseOffset + 1u;
+            if (nextRel >= relLoopE) nextRel = relLoopS;
+            const float frac = phase - static_cast<float>(baseOffset);
+            const float sample = InterpolateSample(
+                sampleData, sampleStart + baseOffset, sampleStart + nextRel, frac);
+
+            if (stage == 1u) {
+                if (attackRemaining > 0u) {
+                    gain += attackStep;
+                    --attackRemaining;
+                    if (gain > targetGain) gain = targetGain;
+                } else {
+                    gain = targetGain;
+                }
+                if (attackRemaining == 0u)
+                    stage = decayRemaining > 0u ? 2u : 3u;
+            }
+            if (stage == 2u) {
+                if (decayRemaining > 0u) {
+                    gain *= decaySlope;
+                    --decayRemaining;
+                    if (gain < sustainLevel) gain = sustainLevel;
+                } else {
+                    gain = sustainLevel;
+                }
+                if (decayRemaining == 0u) stage = 3u;
+            }
+
+            const float scaled = sample * gain;
+            outL[n] += scaled * mixL;
+            outR[n] += scaled * mixR;
+            phase += phaseStep;
+            if (phase >= relLoopEF) {
+                float overflow = phase - relLoopEF;
+                const float loopLength = relLoopEF - relLoopSF;
+                if (overflow >= loopLength)
+                    overflow -= floorf(overflow / loopLength) * loopLength;
+                phase = relLoopSF + overflow;
+            }
+        }
+
+        v.phases[idx] = phase;
+        v.currentGain[idx] = gain;
+        v.envelopeStage[idx] = stage;
+        v.attackSamplesRemaining[idx] = attackRemaining;
+        v.decaySamplesRemaining[idx] = decayRemaining;
+        return UINT32_MAX;
+    }
+
+    // Full-quality continuous-loop release. Mode-3 key-held loops are already
+    // disabled by StartRelease and therefore remain on the generic path.
+    if (released && loop && fadeRemaining == 0u &&
+        mixedFrameCount == frameCount) {
+        uint32_t releaseRemaining = v.releaseSamplesRemaining[idx];
+        const float releaseDecay = v.releaseDecay[idx];
+        float* outL = outputLeft + frameStart;
+        float* outR = outputRight + frameStart;
+        uint32_t retiredAt = UINT32_MAX;
+
+        for (uint32_t n = 0; n < frameCount; ++n) {
+            uint32_t baseOffset = static_cast<uint32_t>(phase);
+            if (baseOffset + 1u >= relEnd) {
+                phase = relLoopSF;
+                baseOffset = relLoopS;
+            }
+            uint32_t nextRel = baseOffset + 1u;
+            if (nextRel >= relLoopE) nextRel = relLoopS;
+            const float frac = phase - static_cast<float>(baseOffset);
+            const float sample = InterpolateSample(
+                sampleData, sampleStart + baseOffset, sampleStart + nextRel, frac);
+
+            bool releaseFinished = false;
+            if (releaseRemaining == 0u) {
+                releaseFinished = true;
+            } else {
+                gain *= releaseDecay;
+                if (releaseRemaining != UINT32_MAX) {
+                    --releaseRemaining;
+                    releaseFinished = releaseRemaining == 0u;
+                }
+            }
+            const float scaled = sample * gain;
+            outL[n] += scaled * mixL;
+            outR[n] += scaled * mixR;
+
+            phase += phaseStep;
+            if (phase >= relLoopEF) {
+                float overflow = phase - relLoopEF;
+                const float loopLength = relLoopEF - relLoopSF;
+                if (overflow >= loopLength)
+                    overflow -= floorf(overflow / loopLength) * loopLength;
+                phase = relLoopSF + overflow;
+            }
+            if (releaseFinished ||
+                (releaseRemaining == UINT32_MAX && gain < kVoiceRetireThreshold)) {
+                retiredAt = n;
+                break;
+            }
+        }
+
+        v.phases[idx] = phase;
+        v.currentGain[idx] = gain;
+        v.releaseSamplesRemaining[idx] = releaseRemaining;
+        return retiredAt;
+    }
+
+    uint32_t delayRemaining = v.delaySamplesRemaining[idx];
+    uint32_t holdRemaining = v.holdSamplesRemaining[idx];
+    uint32_t attackRemaining = v.attackSamplesRemaining[idx];
+    uint32_t decayRemaining = v.decaySamplesRemaining[idx];
+    uint32_t releaseRemaining = v.releaseSamplesRemaining[idx];
+    const float targetGain = v.targetGain[idx];
+    const float sustainLevel = v.sustainLevel[idx];
+    const float attackStep = v.attackGainStep[idx];
+    const float decaySlope = v.decaySlope[idx];
+    const float releaseDecay = v.releaseDecay[idx];
+    uint32_t retiredAt = UINT32_MAX;
+
+    for (uint32_t n = 0; n < frameCount; ++n) {
+        float sample = 0.0f;
+        bool sampleEnded = false;
+        uint32_t baseOffset = static_cast<uint32_t>(phase);
+        if (baseOffset + 1u >= relEnd) {
+            if (!loop) {
+                sampleEnded = true;
+            } else {
+                phase = relLoopSF;
+                baseOffset = relLoopS;
+            }
+        }
+
+        if (!sampleEnded && n < mixedFrameCount) {
+            uint32_t nextRel = baseOffset + 1u;
+            if (loop && nextRel >= relLoopE) nextRel = relLoopS;
+            if (nextRel >= relEnd) nextRel = relEnd - 1u;
+            const uint32_t baseIndex = sampleStart + baseOffset;
+            const uint32_t nextIndex = sampleStart + nextRel;
+            const float frac = phase - static_cast<float>(baseOffset);
+            sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+        }
+
+        bool releaseFinished = false;
+        const bool sustained = !released && stage == 3u;
+        if (!sampleEnded) {
+            if (released) {
+                if (releaseRemaining == 0u) {
+                    releaseFinished = true;
+                } else {
+                    gain *= releaseDecay;
+                    if (releaseRemaining != UINT32_MAX) {
+                        --releaseRemaining;
+                        releaseFinished = releaseRemaining == 0u;
+                    }
+                }
+            } else if (!sustained) {
+                if (stage == 4u) {
+                    if (delayRemaining > 0u) {
+                        --delayRemaining;
+                        gain = 0.0f;
+                    } else {
+                        stage = 0u;
+                    }
+                }
+                if (stage == 0u) {
+                    if (holdRemaining > 0u) {
+                        --holdRemaining;
+                        gain = targetGain;
+                    } else {
+                        stage = 1u;
+                    }
+                }
+                if (stage == 1u) {
+                    if (attackRemaining > 0u) {
+                        gain += attackStep;
+                        --attackRemaining;
+                        if (gain > targetGain) gain = targetGain;
+                    } else {
+                        gain = targetGain;
+                    }
+                    if (attackRemaining == 0u)
+                        stage = decayRemaining > 0u ? 2u : 3u;
+                }
+                if (stage == 2u) {
+                    if (decayRemaining > 0u) {
+                        gain *= decaySlope;
+                        --decayRemaining;
+                        if (gain < sustainLevel) gain = sustainLevel;
+                    } else {
+                        gain = sustainLevel;
+                    }
+                    if (decayRemaining == 0u) stage = 3u;
+                }
+            }
+
+            phase += phaseStep;
+            if (loop && phase >= relLoopEF) {
+                float overflow = phase - relLoopEF;
+                const float loopLength = relLoopEF - relLoopSF;
+                if (loopLength > 0.0f && overflow >= loopLength)
+                    overflow -= floorf(overflow / loopLength) * loopLength;
+                phase = relLoopSF + overflow;
+            }
+        }
+
+        float fade = 1.0f;
+        if (fadeRemaining > 0u) {
+            fade = fadeTotal > 0u
+                ? static_cast<float>(fadeTotal - fadeRemaining + 1u) /
+                  static_cast<float>(fadeTotal)
+                : 1.0f;
+            --fadeRemaining;
+        }
+
+        if (!sampleEnded && n < mixedFrameCount) {
+            const float scaled = sample * gain * fade;
+            outputLeft[frameStart + n] += scaled * mixL;
+            outputRight[frameStart + n] += scaled * mixR;
+        }
+
+        const bool thresholdFinished = released && releaseRemaining == UINT32_MAX &&
+                                       gain < kVoiceRetireThreshold;
+        if (sampleEnded || releaseFinished || thresholdFinished) {
+            retiredAt = n;
+            break;
+        }
+    }
+
+    v.phases[idx] = phase;
+    v.currentGain[idx] = gain;
+    v.envelopeStage[idx] = stage;
+    v.delaySamplesRemaining[idx] = delayRemaining;
+    v.holdSamplesRemaining[idx] = holdRemaining;
+    v.attackSamplesRemaining[idx] = attackRemaining;
+    v.decaySamplesRemaining[idx] = decayRemaining;
+    v.releaseSamplesRemaining[idx] = releaseRemaining;
+    v.stealFadeInFramesRemaining[idx] = fadeRemaining;
+    return retiredAt;
+}
+
+inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& channels,
+                                      const float* sampleData, uint32_t sampleDataFrames,
+                                      float* outputLeft, float* outputRight,
+                                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
+                                      const RenderEvent* events, uint32_t eventCount,
+                                      bool correctnessMode,
+                                      uint64_t blockStartFrame) {
+    // Voice-major spans win decisively when events are sparse, but very short
+    // spans cannot amortize state capture.  Count distinct in-block event
+    // frames and retain the fused frame-major oracle for event-dense blocks.
+    const uint32_t denseBoundaryThreshold = (std::max)(1u, numFrames / 4u);
+    uint32_t distinctBoundaries = 0u;
+    uint32_t previousBoundary = UINT32_MAX;
+    for (uint32_t i = 0; i < eventCount; ++i) {
+        const uint32_t boundary = events[i].frameOffset;
+        if (boundary >= numFrames || boundary == previousBoundary) continue;
+        previousBoundary = boundary;
+        if (++distinctBoundaries >= denseBoundaryThreshold) {
+            RenderBlockFrameMajor(voices, channels, sampleData, sampleDataFrames,
+                                  outputLeft, outputRight, numFrames, cfg, events,
+                                  eventCount, correctnessMode, blockStartFrame);
+            return;
+        }
+    }
+
+    (void)cfg;
+    VoiceSoA& v = voices.v;
+    voices.RefreshMixGains(channels.GetParams());
+
+    const uint32_t initialStep = correctnessMode
+        ? 1u : ComputeDecimationStep(voices.activeCount_);
+    if (initialStep > 1u && voices.activeCount_ > 1u) {
+        std::sort(voices.activeList_, voices.activeList_ + voices.activeCount_,
+            [&v](uint32_t a, uint32_t b) { return v.velocity[a] > v.velocity[b]; });
+        voices.RebuildActivePositions();
+    }
+
+    uint32_t eventIndex = 0u;
+    uint32_t cursor = 0u;
+    while (cursor < numFrames) {
+        voices.SetCurrentFrame(blockStartFrame + cursor);
+
+        // State changes at this boundary are visible to the first rendered
+        // frame of the span.  Equal-frame order is already ingress order.
+        while (eventIndex < eventCount && events[eventIndex].frameOffset <= cursor) {
+            if (dispatcher_) dispatcher_(events[eventIndex], cursor, dispatcherUserData_);
+            ++eventIndex;
+        }
+
+        uint32_t spanEnd = numFrames;
+        if (eventIndex < eventCount && events[eventIndex].frameOffset < spanEnd)
+            spanEnd = events[eventIndex].frameOffset;
+        if (spanEnd <= cursor) continue;
+
+        const uint32_t spanFrames = spanEnd - cursor;
+
+        // With an event on every output frame, copying the complete active
+        // list costs as much as rendering it.  A one-frame span cannot suffer
+        // cross-frame swap-removal hazards, so use the live list directly and
+        // retire immediately, reprocessing the swap-in at the same position.
+        if (spanFrames == 1u) {
+            const uint32_t step = correctnessMode
+                ? 1u : ComputeDecimationStep(voices.activeCount_);
+            const bool fullMix = step == 1u;
+            const uint32_t mixLimit = fullMix ? voices.activeCount_
+                                               : voices.activeCount_ / step;
+            for (uint32_t position = 0; position < voices.activeCount_;) {
+                const uint32_t idx = voices.activeList_[position];
+                uint32_t mixedFrames = 1u;
+                if (!fullMix && position >= mixLimit &&
+                    voices.GetVoiceAge(static_cast<VoiceHandle>(idx)) >=
+                        kNewbornProtectSamples) {
+                    mixedFrames = 0u;
+                }
+                const uint32_t retiredAt = RenderPrimaryVoiceSpan(
+                    v, idx, sampleData, sampleDataFrames, outputLeft, outputRight,
+                    cursor, 1u, mixedFrames);
+                RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
+                                    outputLeft, outputRight, cursor, 1u);
+                if (retiredAt != UINT32_MAX) {
+                    voices.RetireVoice(static_cast<VoiceHandle>(idx));
+                } else {
+                    ++position;
+                }
+            }
+            cursor = spanEnd;
+            continue;
+        }
+
+        const uint32_t spanCount = voices.activeCount_;
+        std::copy_n(voices.activeList_, spanCount, spanVoices_);
+
+        const uint32_t step = correctnessMode ? 1u : ComputeDecimationStep(spanCount);
+        const bool fullMix = step == 1u;
+        const uint32_t mixLimit = fullMix ? spanCount : spanCount / step;
+        uint32_t retireCount = 0u;
+
+        for (uint32_t position = 0; position < spanCount; ++position) {
+            const uint32_t idx = spanVoices_[position];
+            if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) continue;
+
+            uint32_t mixedFrames = spanFrames;
+            if (!fullMix && position >= mixLimit) {
+                const uint32_t age = voices.GetVoiceAge(static_cast<VoiceHandle>(idx));
+                mixedFrames = age < kNewbornProtectSamples
+                    ? (std::min)(spanFrames, kNewbornProtectSamples - age)
+                    : 0u;
+            }
+
+            const uint32_t retiredAt = RenderPrimaryVoiceSpan(
+                v, idx, sampleData, sampleDataFrames, outputLeft, outputRight,
+                cursor, spanFrames, mixedFrames);
+            const uint32_t tailFrames = retiredAt == UINT32_MAX
+                ? spanFrames : retiredAt + 1u;
+            RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
+                                outputLeft, outputRight, cursor, tailFrames);
+
+            if (retiredAt != UINT32_MAX) {
+                retirements_[retireCount] = {idx, retiredAt, position};
+                ++retireCount;
+            }
+        }
+
+        // Retirement is deferred until every captured handle has rendered,
+        // so active-list swap removal cannot skip or duplicate a span voice.
+        std::sort(retirements_, retirements_ + retireCount,
+            [](const SpanRetirement& a, const SpanRetirement& b) {
+                if (a.frameOffset != b.frameOffset)
+                    return a.frameOffset < b.frameOffset;
+                return a.capturePosition < b.capturePosition;
+            });
+        for (uint32_t i = 0; i < retireCount; ++i) {
+            voices.SetCurrentFrame(blockStartFrame + cursor + retirements_[i].frameOffset);
+            voices.RetireVoice(static_cast<VoiceHandle>(retirements_[i].handle));
+        }
+        cursor = spanEnd;
+    }
+
     voices.SetCurrentFrame(blockStartFrame + numFrames);
 }
 

@@ -18,11 +18,14 @@ larger phase containing that item is complete.
 - [x] SoA voice state with flat active list, inverse active positions, and free
   stack
 - [x] Fresh allocation for overlapping same-key retriggers
-- [x] Priority-aware score-based voice stealing with a short outgoing fade tail
+- [x] Priority-aware score-based voice stealing with a short outgoing fade
+  tail and an unblurred replacement attack
 - [x] Scalar fused per-sample renderer with linear interpolation
 - [x] SF2 volume envelopes, sample loops, attenuation, tuning, and release tails
-- [x] Velocity LUT, CC7/CC10/CC11 gains, and precomputed loop bounds
-- [x] Adaptive decimation up to the current 4096-voice hard pool limit
+- [x] Configured velocity threshold/curve/floor, velocity LUT,
+  CC7/CC10/CC11 gains, and precomputed loop bounds
+- [x] Full-quality rendering throughout the current 4096-voice hard pool;
+  adaptive decimation is reserved for future larger storage
 - [x] Limiter, double-buffered diagnostic statistics, and optional diagnostic
   window
 
@@ -30,8 +33,9 @@ larger phase containing that item is complete.
 
 ### JSON Configuration
 
-- [x] Make `%APPDATA%\SuperVirtualMIDISynth\config.json` the canonical V3
-  configuration
+- [x] Read portable `config.json` beside `winmm.dll` first, then fall back to
+  `%APPDATA%\SuperVirtualMIDISynth\config.json`; create locally when AppData is
+  unavailable
 - [x] Vendor `nlohmann/json` and confine its use to `SVMSConfig.cpp`
 - [x] Resolve Roaming AppData with `SHGetKnownFolderPath` and Unicode paths
 - [x] Create the directory and complete schema-versioned defaults on first run
@@ -49,8 +53,9 @@ larger phase containing that item is complete.
   for a future schema
 - [x] Reject invalid fields individually and publish a configuration warning
 - [x] Leave malformed or newer-schema JSON untouched and run with defaults
-- [x] Test first-run creation, concurrent creation, Unicode paths, INI import,
-  invalid fields, malformed/newer schemas, and environment precedence
+- [x] Test first-run creation, concurrent creation, portable/AppData
+  precedence and fallback, Unicode paths, INI import, invalid fields,
+  malformed/newer schemas, and environment precedence
 - [ ] Add a settings-save/update API that round-trips unknown fields; V3
   currently only writes during first creation/migration
 - [ ] Add live configuration reload; configuration changes currently require an
@@ -70,8 +75,8 @@ larger phase containing that item is complete.
   and offline rendering
 - [ ] Load SoundFonts into immutable bundles off-thread, swap only at a block
   boundary, and reclaim retired bundles off the audio thread
-- [ ] Remove every remaining callback-side logging/critical-section path and
-  add tests that fail on callback heap allocation or general-purpose locking
+- [x] Remove callback-side logging/critical-section paths and add allocation
+  instrumentation plus a source audit rejecting lock, debug-output, and UI calls
 - [ ] Exercise live WASAPI device-buffer sizes from 16 through 8192 frames; the
   current sweep covers timing conversion, not device initialization/rendering
 - [ ] Add reset and SoundFont-swap stress under ASan or an equivalent Windows
@@ -110,6 +115,8 @@ larger phase containing that item is complete.
 - [x] Preserve deterministic equal-frame event ordering
 - [x] Dispatch MIDI state changes and notes at exact render-frame boundaries
 - [x] Clamp late events to the next writable frame and record lateness
+- [x] Fast-forward missed output time after callback overruns and discard only
+  obsolete note-ons so overload cannot become a permanent post-pause backlog
 - [x] Bound callback dispatch with `max_events_per_block`; excess remains
   ordered in the scheduler
 - [x] Remove the old fractional pending-event/stable-sort execution path
@@ -140,12 +147,34 @@ larger phase containing that item is complete.
 - [x] Keep the TSF-compatible 10 ms fallback/floor only for zero or
   near-instantaneous SF2 releases
 - [x] Keep scalar correctness mode enabled by default
-- [ ] Implement SF2 per-voice pan in the live mixer
+- [x] Implement SF2 per-voice pan in the live mixer
 - [ ] Implement sostenuto, default modulators, filters, LFOs, chorus, and reverb
+
+### 4096-Voice Full-Quality Scalar Optimization
+
+- [x] Split sparse-event blocks into exact event-free frame spans
+- [x] Capture span voice handles in fixed storage and defer retirements in
+  chronological order so swap-removal cannot skip or duplicate a voice
+- [x] Keep phase, gain, envelope, loop, fade, and release state in registers
+  across each span and commit it once
+- [x] Add specialized sustained-loop, attack/decay, continuous-release, and
+  steal-tail scalar kernels without SIMD or quality reduction
+- [x] Retain the fused frame-major renderer as the test oracle and automatic
+  dense-event fallback
+- [x] Add allocation-free rolling callback p95/p99/p99.9 and over-budget
+  diagnostics without changing `DriverDebugInfoV1`
+- [x] Add `svms_v3_bench` workloads for sustained, envelope, release, real
+  stealing, and per-frame dense events
+- [x] Verify 4096 voices for 60 seconds at 44.1 kHz/2048 frames on the
+  i5-13600KF: sustained p99 36.72%, envelope p99 50.82%, release p99 37.42%
+- [x] Verify dense per-frame events select the frame-major fallback without a
+  throughput regression
 
 ## Reference and Regression Testing
 
 - [x] Add deterministic scalar block-render tests
+- [x] Differentially validate span and frame-major renderers with randomized
+  events and buffer sizes from 16 through 8192 frames
 - [x] Add tests for bank/program selection, compiled zones, layered regions,
   region validation, and the shipped `gm.sf2`
 - [x] Add tests for pitch, overlapping retriggers, sustain, channel

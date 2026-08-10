@@ -231,6 +231,57 @@ struct LimiterState {
     }
 };
 
+// Allocation-free rolling callback histogram. One-percent bins are precise
+// enough for the diagnostic/acceptance thresholds and make percentile reads a
+// bounded 201-bin scan instead of sorting on the audio thread.
+struct CallbackTimingWindow {
+    static constexpr uint32_t kWindowSize = 1024;
+    static constexpr uint32_t kBinCount = 201; // 0..199%, 200 = 200%+
+
+    uint16_t samples[kWindowSize]{};
+    uint16_t bins[kBinCount]{};
+    uint32_t cursor = 0;
+    uint32_t count = 0;
+    uint64_t overBudgetCallbacks = 0;
+    uint32_t consecutiveOverBudget = 0;
+    uint32_t maxConsecutiveOverBudget = 0;
+
+    void Reset() noexcept { *this = CallbackTimingWindow{}; }
+
+    void Observe(float percent) noexcept {
+        uint32_t bin = percent > 0.0f ? static_cast<uint32_t>(percent + 0.5f) : 0u;
+        if (bin >= kBinCount) bin = kBinCount - 1u;
+        if (count == kWindowSize) {
+            --bins[samples[cursor]];
+        } else {
+            ++count;
+        }
+        samples[cursor] = static_cast<uint16_t>(bin);
+        ++bins[bin];
+        cursor = (cursor + 1u) & (kWindowSize - 1u);
+
+        if (percent > 100.0f) {
+            ++overBudgetCallbacks;
+            ++consecutiveOverBudget;
+            maxConsecutiveOverBudget = (std::max)(maxConsecutiveOverBudget,
+                                                   consecutiveOverBudget);
+        } else {
+            consecutiveOverBudget = 0;
+        }
+    }
+
+    float Percentile(uint32_t numerator, uint32_t denominator) const noexcept {
+        if (count == 0u) return 0.0f;
+        const uint32_t rank = (count * numerator + denominator - 1u) / denominator;
+        uint32_t accumulated = 0u;
+        for (uint32_t bin = 0; bin < kBinCount; ++bin) {
+            accumulated += bins[bin];
+            if (accumulated >= rank) return static_cast<float>(bin);
+        }
+        return static_cast<float>(kBinCount - 1u);
+    }
+};
+
 class Driver {
 public:
     static Driver& Instance();
@@ -298,6 +349,7 @@ private:
     DriverDebugInfo debugSnapshots_[2];
     std::atomic<uint32_t> debugSnapshotIndex_;
     uint64_t callbackCount_;
+    CallbackTimingWindow callbackTiming_;
 
     AudioOutput* audioOutput;
     VoiceManager* voiceManager;
@@ -404,6 +456,7 @@ bool Driver::Initialize() {
     virtualRenderClockQPC = 0;
     virtualRenderSample_ = 0;
     clockInitialized = false;
+    callbackTiming_.Reset();
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
@@ -803,6 +856,18 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->clockInitialized = true;
     }
 
+    const int64_t wallRenderSample = QpcDeltaToFrames(
+        static_cast<int64_t>(blockStartQPC) -
+            static_cast<int64_t>(self->virtualRenderClockQPC),
+        static_cast<int64_t>(self->qpcFreq), self->sampleRate);
+    const int64_t recoveredRenderSample = RecoverRealtimeRenderFrame(
+        self->virtualRenderSample_, wallRenderSample, numFrames);
+    if (recoveredRenderSample > self->virtualRenderSample_) {
+        self->telemetry_.skippedOutputFrames += static_cast<uint64_t>(
+            recoveredRenderSample - self->virtualRenderSample_);
+        self->virtualRenderSample_ = recoveredRenderSample;
+    }
+
     // ── Drift recovery ──────────────────────────────────────────────
     // If the render takes >100% CPU, the virtual clock falls behind
     // wall time.  Left unchecked this causes permanent desync: event
@@ -817,7 +882,6 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
            self->midiIngress_.TryPop(timed)) {
         ++drainedEvents;
         if (self->eventScheduler_.Size() >= kEventBufferCapacity) {
-            LOG("RenderCallback: pending queue full, events stay in SPSC");
             break;
         }
 
@@ -864,6 +928,13 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         scheduled.event = ev;
         scheduled.targetFrame = deltaFrames + static_cast<int64_t>(self->bufferFrames);
         scheduled.sequence = timed.sequence;
+        if (etype == RenderEventType::NoteOn &&
+            IsObsoleteNoteOn(scheduled.targetFrame, self->virtualRenderSample_,
+                             self->bufferFrames)) {
+            ++self->telemetry_.late;
+            ++self->telemetry_.staleNoteOnsSkipped;
+            continue;
+        }
         if (!self->eventScheduler_.Enqueue(scheduled)) {
             ++self->telemetry_.dropped;
             break;
@@ -881,10 +952,21 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // Extract only this render window.  Future events remain in the heap.
     RenderEvent* evtBuf = self->eventBuffer;
     uint32_t evCount = 0;
+    uint32_t examinedCount = 0;
+    const uint32_t eventBudget =
+        (std::min)(self->maxEventsPerBlock_, kEventBufferCapacity);
     ScheduledRenderEvent scheduledOut;
-    while (evCount < (std::min)(self->maxEventsPerBlock_, kEventBufferCapacity) &&
+    while (examinedCount < eventBudget &&
            self->eventScheduler_.PopBefore(self->virtualRenderSample_ + numFrames,
                                            scheduledOut)) {
+        ++examinedCount;
+        if (scheduledOut.event.type == RenderEventType::NoteOn &&
+            IsObsoleteNoteOn(scheduledOut.targetFrame,
+                             self->virtualRenderSample_, self->bufferFrames)) {
+            ++self->telemetry_.late;
+            ++self->telemetry_.staleNoteOnsSkipped;
+            continue;
+        }
         int64_t offset = scheduledOut.targetFrame - self->virtualRenderSample_;
         if (offset < 0) { ++self->telemetry_.late; offset = 0; }
         scheduledOut.event.frameOffset = static_cast<uint32_t>(offset);
@@ -952,8 +1034,15 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                      / (double)self->qpcFreq * 1e6;
     double budgetUs = (double)numFrames / (double)self->sampleRate * 1e6;
     float cpuPct = (budgetUs > 0.0) ? (float)(elapsedUs / budgetUs * 100.0) : 0.0f;
+    self->callbackTiming_.Observe(cpuPct);
     self->telemetry_.maxCallbackQPC = (std::max)(self->telemetry_.maxCallbackQPC,
         static_cast<uint64_t>(renderEndQPC.QuadPart - renderStartQPC.QuadPart));
+    self->telemetry_.callbackP95Percent = self->callbackTiming_.Percentile(95u, 100u);
+    self->telemetry_.callbackP99Percent = self->callbackTiming_.Percentile(99u, 100u);
+    self->telemetry_.callbackP999Percent = self->callbackTiming_.Percentile(999u, 1000u);
+    self->telemetry_.overBudgetCallbacks = self->callbackTiming_.overBudgetCallbacks;
+    self->telemetry_.maxConsecutiveOverBudget =
+        self->callbackTiming_.maxConsecutiveOverBudget;
     self->telemetry_.immediateRetirements = vm->retireImmediateCount_;
     self->telemetry_.voiceSteals = vm->stealCount_;
     self->telemetry_.submitted = self->submittedAtomic_.load(std::memory_order_relaxed);
@@ -1000,11 +1089,28 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         static int diagTick = 0;
         if (++diagTick >= 1) {
             diagTick = 0;
-            if (self->diagnosticsWindow_ || self->diagnosticsDebugOutput_)
+            if (self->diagnosticsWindow_ || self->diagnosticsDebugOutput_) {
+                uint32_t releasingVoices = 0;
+                uint32_t sustainHeldVoices = 0;
+                for (uint32_t position = 0; position < vm->activeCount_; ++position) {
+                    const uint32_t voice = vm->activeList_[position];
+                    releasingVoices += vm->v.state[voice] ==
+                        static_cast<uint8_t>(VoiceState::Releasing);
+                    sustainHeldVoices += vm->v.heldBySustain[voice] != 0;
+                }
                 DiagWindow_Update(vm->activeCount_, vm->GetMaxVoices(),
-                                  s_cpuSmoothed, ComputeDecimationStep(vm->activeCount_),
+                                  releasingVoices, sustainHeldVoices,
+                                  vm->stealCount_,
+                                  s_cpuSmoothed, self->correctnessMode_ ? 1u
+                                      : ComputeDecimationStep(vm->activeCount_),
+                                  self->telemetry_.callbackP95Percent,
+                                  self->telemetry_.callbackP99Percent,
+                                  self->telemetry_.callbackP999Percent,
+                                  self->telemetry_.overBudgetCallbacks,
+                                  self->telemetry_.maxConsecutiveOverBudget,
                                   vm->retireCount_, vm->retireImmediateCount_,
                                   self->sf2Telemetry_);
+            }
         }
     }
 }
@@ -1066,13 +1172,10 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     sf2Telemetry_.lastNote = note;
     sf2Telemetry_.lastVelocity = velocity;
 
-    static int noteOnCount = 0;
-    if (noteOnCount < 50) {
-        LOG("HandleNoteOn: ch=%u note=%u vel=%u regionCount=%u",
-            channel, note, velocity,
-            soundFontData ? soundFontData->regionCount : 0);
-    }
-    noteOnCount++;
+    const float mappedVelocity = configSnapshot
+        ? channelCache->ComputeVelocity(velocity, *configSnapshot)
+        : static_cast<float>(velocity) / 127.0f;
+    if (mappedVelocity <= 0.0f) return;
 
     channelCache->NoteOn(channel, note, velocity);
 
@@ -1097,7 +1200,6 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
                                            matchingRegions, kMaxMatchingRegions);
     if (matchCount > kMaxMatchingRegions) {
         ++telemetry_.allocationFailures;
-        LOG("HandleNoteOn: %u matching layers exceeds fixed dispatch capacity", matchCount);
         return;
     }
 
@@ -1140,8 +1242,6 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
             channel, note, velocity);
         if (allocatedVoices[allocatedCount] == kInvalidVoice) {
             ++telemetry_.allocationFailures;
-            LOG("HandleNoteOn: VOICE ALLOC FAILED ch=%u note=%u vel=%u active=%u",
-                channel, note, velocity, voiceManager->GetActiveCount());
             for (uint32_t rollback = 0; rollback < allocatedCount; ++rollback)
                 voiceManager->RetireVoice(allocatedVoices[rollback]);
             return;
@@ -1180,7 +1280,6 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         // NaN/Inf phase values: float-to-integer conversion then pins sample
         // lookup unpredictably and silently poisons the mixed output.
         if (!std::isfinite(phaseStep) || phaseStep <= 0.0f) {
-            LOG("HandleNoteOn: invalid phase step ch=%u note=%u step=%g; using unity", channel, note, phaseStep);
             phaseStep = 1.0f;
         }
 
@@ -1192,7 +1291,11 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
 
         voiceManager->SetVoiceSample(vh, sStart, sEnd, sLoopStart, sLoopEnd, loopMode, phaseStep, 1);
 
-        float velGain = g_velGainLUT[velocity];
+        uint32_t mappedVelocityIndex = static_cast<uint32_t>(
+            mappedVelocity * 127.0f + 0.5f);
+        if (mappedVelocityIndex < 1u) mappedVelocityIndex = 1u;
+        if (mappedVelocityIndex > 127u) mappedVelocityIndex = 127u;
+        float velGain = g_velGainLUT[mappedVelocityIndex];
         float initialGain = velGain;
 
         if (matchedRegion->initialAttenuation > 0) {
@@ -1238,7 +1341,11 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
                                         delaySamples, holdSamples, attackSamples,
                                         decaySamples, attackGainStep, decaySlope, releaseDecay,
                                         releaseSamples);
-        voiceManager->SetVoiceGain(vh, 1.0f, 1.0f);
+        float regionPanLeft = 1.0f;
+        float regionPanRight = 1.0f;
+        channelCache->ComputeSoundFontPan(matchedRegion->pan,
+                                          regionPanLeft, regionPanRight);
+        voiceManager->SetVoiceGain(vh, regionPanLeft, regionPanRight);
         voiceManager->RefreshMixGain(vh, channelCache->GetParams()[channel]);
 
         // Sub-sample start position: folded directly into the initial phase
@@ -1298,12 +1405,6 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     const bool sustainWasActive = channelCache && channelCache->IsSustainActive(channel);
     if (channelCache) channelCache->ControlChange(channel, controller, value);
 
-    static int ccLogCount = 0;
-    if (ccLogCount < 20) {
-        LOG("HandleControlChange: ch=%u cc=%u val=%u", channel, controller, value);
-        ccLogCount++;
-    }
-
     if (controller == 64) {
         if (value < 64) {
             for (uint32_t ai = 0; ai < voiceManager->activeCount_; ++ai) {
@@ -1357,27 +1458,17 @@ void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
     uint32_t presetIndex = 0;
     if (ResolveChannelPreset(soundFontData, *channelCache, channel, &presetIndex)) {
         channelCache->SetSelectedPreset(channel, static_cast<uint16_t>(presetIndex));
-        LOG("ProgramChange: ch=%u bank=%u program=%u preset=%u",
-            channel, channelCache->GetBank(channel), program, presetIndex);
         return;
     }
 
     // Invalid selection: restore the prior program and leave the prior preset
     // active, matching TSF's failed preset-selection behavior.
     channelCache->ProgramChange(channel, oldProgram);
-    LOG("ProgramChange rejected: ch=%u bank=%u program=%u",
-        channel, channelCache->GetBank(channel), program);
 }
 
 void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
     if (channelCache)
         channelCache->PitchBend(channel, static_cast<int16_t>((msb << 7) | lsb));
-
-    static int pbLogCount = 0;
-    if (pbLogCount < 10) {
-        LOG("HandlePitchBend: ch=%u lsb=%u msb=%u val=%u", channel, lsb, msb, (msb << 7) | lsb);
-        pbLogCount++;
-    }
 
     if (!voiceManager || !samplesStore || !soundFontData) return;
 

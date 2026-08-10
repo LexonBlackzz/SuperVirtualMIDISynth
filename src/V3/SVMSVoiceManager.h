@@ -381,8 +381,11 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         v.stealTailFramesRemaining[bestIdx] = stealFadeFrames_;
         v.stealTailFramesTotal[bestIdx] = stealFadeFrames_;
     }
-    v.stealFadeInFramesRemaining[bestIdx] = stealFadeFrames_;
-    v.stealFadeInFramesTotal[bestIdx] = stealFadeFrames_;
+    // The outgoing victim needs an anti-click tail. The replacement is a
+    // legitimate new attack and must start at its SF2 envelope level; fading
+    // every replacement in smears dense streams once stealing becomes steady.
+    v.stealFadeInFramesRemaining[bestIdx] = 0;
+    v.stealFadeInFramesTotal[bestIdx] = 0;
     LinkChannelKey(static_cast<VoiceHandle>(bestIdx));
     activeList_[bestPos] = bestIdx;  // reuse the victim's position
     activePosition_[bestIdx] = bestPos;

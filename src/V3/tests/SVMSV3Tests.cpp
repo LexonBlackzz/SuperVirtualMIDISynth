@@ -15,13 +15,52 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <new>
+#include <string>
 #include <atomic>
 #include <thread>
 #include <vector>
+
+static std::atomic<uint64_t> g_realtimeAllocationCount{0};
+static thread_local bool g_trackRealtimeAllocations = false;
+
+void* operator new(std::size_t size) {
+    if (g_trackRealtimeAllocations)
+        g_realtimeAllocationCount.fetch_add(1, std::memory_order_relaxed);
+    if (void* memory = std::malloc(size)) return memory;
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+
+void* operator new(std::size_t size, std::align_val_t alignment) {
+    if (g_trackRealtimeAllocations)
+        g_realtimeAllocationCount.fetch_add(1, std::memory_order_relaxed);
+    if (void* memory = _aligned_malloc(size, static_cast<std::size_t>(alignment)))
+        return memory;
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size, std::align_val_t alignment) {
+    return ::operator new(size, alignment);
+}
+void operator delete(void* memory, std::align_val_t) noexcept { _aligned_free(memory); }
+void operator delete[](void* memory, std::align_val_t) noexcept { _aligned_free(memory); }
+void operator delete(void* memory, std::size_t, std::align_val_t) noexcept {
+    _aligned_free(memory);
+}
+void operator delete[](void* memory, std::size_t, std::align_val_t) noexcept {
+    _aligned_free(memory);
+}
 
 namespace {
 
@@ -459,8 +498,8 @@ void TestPriorityAwareStealingAndFadeTail() {
         const uint32_t fadeFrames = voices->v.stealTailFramesTotal[replacement];
         Check(stolen && fadeFrames == 441,
               "44.1 kHz stealing captures a 10 ms outgoing tail");
-        Check(voices->v.stealFadeInFramesTotal[replacement] == fadeFrames,
-              "replacement uses an independent matching fade-in");
+        Check(voices->v.stealFadeInFramesTotal[replacement] == 0,
+              "replacement attack is not blurred by the outgoing tail fade");
 
         float samples[64];
         std::fill(std::begin(samples), std::end(samples), 1.0f);
@@ -613,6 +652,50 @@ void TestPitchAndDeterministicRender() {
           "scalar left output is deterministic");
     Check(std::memcmp(rightA, rightB, sizeof(rightA)) == 0,
           "scalar right output is deterministic");
+}
+
+void TestConfiguredVelocityMapping() {
+    svms::ChannelCache cache;
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.velocityCurve = 1.0f;
+    cfg.velocityFloor = 0.0f;
+    cfg.velocityIgnoreBelow = 64;
+
+    Check(cache.ComputeVelocity(1, cfg) == 0.0f &&
+              cache.ComputeVelocity(63, cfg) == 0.0f,
+          "velocity_ignore_below suppresses only notes below the threshold");
+    Check(NearlyEqual(cache.ComputeVelocity(64, cfg), 64.0f / 127.0f) &&
+              cache.ComputeVelocity(65, cfg) > 0.0f &&
+              NearlyEqual(cache.ComputeVelocity(127, cfg), 1.0f),
+          "the threshold velocity and higher retain their original mapping");
+
+    const float gatedVelocity64 = cache.ComputeVelocity(64, cfg);
+    cfg.velocityIgnoreBelow = 0;
+    Check(NearlyEqual(gatedVelocity64, cache.ComputeVelocity(64, cfg)),
+          "velocity gating does not make admitted velocities quieter");
+
+    cfg.velocityCurve = 2.0f;
+    cfg.velocityFloor = 0.2f;
+    const float expected = 0.2f + 0.8f * ::powf(64.0f / 127.0f, 2.0f);
+    Check(NearlyEqual(cache.ComputeVelocity(64, cfg), expected, 1.0e-5f),
+          "velocity curve and floor transform admitted note velocity");
+
+    cfg.velocityIgnoreBelow = 32;
+    cfg.ignoreVelocity = true;
+    Check(cache.ComputeVelocity(31, cfg) == 0.0f &&
+              cache.ComputeVelocity(32, cfg) == 1.0f,
+          "ignore-velocity mode still honors the configured note threshold");
+
+    float panLeft = 0.0f, panRight = 0.0f;
+    cache.ComputeSoundFontPan(0, panLeft, panRight);
+    Check(NearlyEqual(panLeft, 1.0f) && NearlyEqual(panRight, 1.0f),
+          "centered SF2 pan preserves channel gain");
+    cache.ComputeSoundFontPan(-500, panLeft, panRight);
+    Check(NearlyEqual(panLeft, ::sqrtf(2.0f)) && NearlyEqual(panRight, 0.0f),
+          "hard-left SF2 pan preserves power and stereo placement");
+
+    Check(svms::ComputeDecimationStep(svms::kMaxPolyphony) == 1,
+          "the complete 4096-voice pool remains full quality");
 }
 
 void TestEventRingWrapAndCapacity() {
@@ -815,10 +898,46 @@ void TestJsonConfigurationLifecycle() {
     Check(!environment.correctnessMode && environment.diagnosticsEnabled,
           "correctness and diagnostics environment overrides have final precedence");
 
+    const fs::path portableDirectory = directory / L"portable demo";
+    const fs::path portableConfig = portableDirectory / L"config.json";
+    fs::create_directories(portableDirectory, ec);
+    {
+        std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
+        output << R"({"schema_version":1,"audio":{"sample_rate":48000}})";
+    }
+    {
+        std::ofstream output(portableConfig, std::ios::binary | std::ios::trunc);
+        output << R"({"schema_version":1,"audio":{"sample_rate":96000}})";
+    }
+    SetEnvironmentVariableW(L"SVMS_TEST_LOCAL_CONFIG_PATH", portableConfig.c_str());
+    svms::EngineConfig portable = svms::EngineConfig::Load();
+    Check(portable.sampleRate == 96000 &&
+              fs::path(portable.configPath) == portableConfig,
+          "local config.json takes precedence over the AppData config");
+
+    fs::remove(portableConfig, ec);
+    svms::EngineConfig appDataFallback = svms::EngineConfig::Load();
+    Check(appDataFallback.sampleRate == 48000 &&
+              fs::path(appDataFallback.configPath) == configPath,
+          "missing local config.json falls back to AppData");
+
+    const fs::path blockedParent = directory / L"blocked AppData";
+    {
+        std::ofstream output(blockedParent, std::ios::binary | std::ios::trunc);
+        output << "not a directory";
+    }
+    const fs::path unavailableAppData = blockedParent / L"config.json";
+    SetEnvironmentVariableW(L"SVMS_TEST_CONFIG_PATH", unavailableAppData.c_str());
+    svms::EngineConfig portableCreation = svms::EngineConfig::Load();
+    Check(fs::exists(portableConfig) &&
+              fs::path(portableCreation.configPath) == portableConfig,
+          "unavailable AppData creates a portable config beside the DLL");
+
     SetEnvironmentVariableW(L"SVMS_NO_DROP_EVENTS", nullptr);
     SetEnvironmentVariableW(L"SVMS_CORRECTNESS_MODE", nullptr);
     SetEnvironmentVariableW(L"SVMS_DIAGNOSTICS", nullptr);
     SetEnvironmentVariableW(L"SVMS_TEST_CONFIG_PATH", nullptr);
+    SetEnvironmentVariableW(L"SVMS_TEST_LOCAL_CONFIG_PATH", nullptr);
     fs::remove_all(directory, ec);
 }
 
@@ -842,6 +961,19 @@ void TestSixHourFrameClockDrift() {
         Check(std::llabs(recovered - nearEndFrame) <= 1,
               "fixed-epoch frame conversion remains within one frame");
     }
+}
+
+void TestOverloadTimelineRecovery() {
+    Check(svms::RecoverRealtimeRenderFrame(4096, 4120, 512) == 4096,
+          "small QPC jitter does not move the render timeline");
+    Check(svms::RecoverRealtimeRenderFrame(4096, 5000, 512) == 5000,
+          "missed callback frames fast-forward the render timeline");
+    Check(svms::RecoverRealtimeRenderFrame(5000, 4096, 512) == 5000,
+          "wall-clock recovery never moves the render timeline backward");
+    Check(!svms::IsObsoleteNoteOn(3000, 4096, 2048),
+          "a note-on within one buffer is clamped instead of skipped");
+    Check(svms::IsObsoleteNoteOn(1000, 4096, 2048),
+          "a note-on from skipped audio time is discarded");
 }
 
 void TestExpressionAgeRetirementAndLoopWrap() {
@@ -891,6 +1023,267 @@ void TestExpressionAgeRetirementAndLoopWrap() {
           "loop wrapping preserves overshoot across multiple loop lengths");
 }
 
+struct DifferentialDispatchContext {
+    svms::VoiceManager* voices;
+    svms::ChannelCache* channels;
+    const svms::RuntimeConfigSnapshot* cfg;
+    uint32_t order[256]{};
+    uint32_t orderCount = 0;
+    uint32_t playIndex = 1000;
+};
+
+void DispatchDifferentialEvent(const svms::RenderEvent& event, uint32_t,
+                               void* userData) {
+    auto* context = static_cast<DifferentialDispatchContext*>(userData);
+    if (context->orderCount < std::size(context->order))
+        context->order[context->orderCount++] = event.ingressSequence;
+
+    switch (event.type) {
+        case svms::RenderEventType::NoteOn: {
+            const svms::VoiceHandle voice = context->voices->AllocateVoiceOrSteal(
+                event.channel, event.data1, event.data2);
+            if (voice == svms::kInvalidVoice) break;
+            context->voices->SetVoicePlayIndex(voice, context->playIndex++);
+            context->voices->SetVoiceSample(voice, 0, 4096, 64, 4032, 1,
+                                             0.75f + event.data1 * 0.005f, 1);
+            context->voices->SetVoiceEnvelope(voice, 0.6f, 0.5f, 0, 0, 17, 53,
+                                               0.6f / 17.0f, 0.99f, 0.9995f,
+                                               400);
+            context->voices->SetVoiceGain(voice, 0.02f, 0.02f);
+            context->voices->RefreshMixGain(
+                voice, context->channels->GetParams()[event.channel]);
+            break;
+        }
+        case svms::RenderEventType::NoteOff:
+            for (uint32_t i = 0; i < context->voices->activeCount_; ++i) {
+                const uint32_t voice = context->voices->activeList_[i];
+                if (context->voices->v.channel[voice] == event.channel &&
+                    context->voices->v.note[voice] == event.data1) {
+                    context->voices->StartRelease(voice);
+                }
+            }
+            break;
+        case svms::RenderEventType::ControlChange:
+            context->channels->ControlChange(event.channel, event.data1, event.data2);
+            context->channels->RebuildCache(*context->cfg, 44100.0f);
+            context->voices->RefreshMixGains(context->channels->GetParams());
+            break;
+        case svms::RenderEventType::Reset:
+            context->voices->Reset();
+            context->channels->Reset();
+            context->channels->RebuildCache(*context->cfg, 44100.0f);
+            break;
+        default:
+            break;
+    }
+}
+
+void ConfigureDifferentialSeed(svms::VoiceManager& voices,
+                               const svms::ChannelCache& channels) {
+    voices.Initialize(128, 44100);
+    for (uint32_t i = 0; i < 48; ++i) {
+        const uint8_t channel = static_cast<uint8_t>(i & 3u);
+        const uint8_t note = static_cast<uint8_t>(48u + i % 24u);
+        const svms::VoiceHandle voice = voices.AllocateVoice(
+            channel, note, static_cast<uint8_t>(48u + i));
+        const bool loop = (i % 4u) != 1u;
+        voices.SetVoiceSample(voice, 0, 4096, 64, 4032, loop ? 1u : 0u,
+                              0.4f + static_cast<float>(i % 17u) * 0.11f, 1);
+        voices.v.phases[voice] = static_cast<float>((i * 37u) % 1700u) + 0.375f;
+        if ((i % 4u) == 2u) {
+            voices.SetVoiceEnvelope(voice, 0.8f, 0.35f, 0, 0, 101 + i, 0,
+                                    0.8f / static_cast<float>(101 + i),
+                                    1.0f, 0.9997f, 700 + i);
+        } else if ((i % 4u) == 3u) {
+            voices.SetVoiceEnvelope(voice, 0.8f, 0.35f, 0, 0, 0, 307 + i,
+                                    0.0f, 0.997f, 0.9997f, 700 + i);
+            voices.StartRelease(voice);
+        } else {
+            voices.SetVoiceEnvelope(voice, 0.8f, 0.7f, 0, 0, 0, 0,
+                                    0.0f, 1.0f, 0.9997f, 700 + i);
+        }
+        voices.SetVoicePlayIndex(voice, i + 1u);
+        voices.SetVoiceGain(voice, 0.02f, 0.02f);
+        voices.RefreshMixGain(voice, channels.GetParams()[channel]);
+    }
+}
+
+void TestSpanRendererDifferential() {
+    static constexpr uint32_t bufferSizes[] = {16, 64, 257, 2048, 8192};
+    std::vector<float> samples(4096);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = 0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+                     0.15f * std::cos(static_cast<float>(i) * 0.079f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.velocityCurve = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    for (const uint32_t frames : bufferSizes) {
+        svms::ChannelCache seedChannels;
+        seedChannels.SetMasterVolume(1.0f);
+        seedChannels.RebuildCache(cfg, 44100.0f);
+        auto seedVoices = std::make_unique<svms::VoiceManager>();
+        ConfigureDifferentialSeed(*seedVoices, seedChannels);
+        auto referenceVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+        auto spanVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+        svms::ChannelCache referenceChannels = seedChannels;
+        svms::ChannelCache spanChannels = seedChannels;
+
+        std::vector<svms::RenderEvent> events;
+        uint32_t random = 0x6d2b79f5u ^ frames;
+        for (uint32_t sequence = 0; sequence < 48; ++sequence) {
+            random = random * 1664525u + 1013904223u;
+            svms::RenderEvent event{};
+            event.frameOffset = random % frames;
+            event.ingressSequence = sequence;
+            event.channel = static_cast<uint8_t>((random >> 8) & 3u);
+            if ((sequence % 3u) == 0u) {
+                event.type = svms::RenderEventType::NoteOn;
+                event.data1 = static_cast<uint8_t>(72u + sequence % 24u);
+                event.data2 = static_cast<uint8_t>(80u + sequence % 40u);
+            } else if ((sequence % 3u) == 1u) {
+                event.type = svms::RenderEventType::NoteOff;
+                event.data1 = static_cast<uint8_t>(48u + sequence % 24u);
+            } else {
+                event.type = svms::RenderEventType::ControlChange;
+                event.data1 = static_cast<uint8_t>((sequence & 1u) ? 11u : 7u);
+                event.data2 = static_cast<uint8_t>(40u + sequence);
+            }
+            events.push_back(event);
+        }
+        std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
+            if (a.frameOffset != b.frameOffset) return a.frameOffset < b.frameOffset;
+            return a.ingressSequence < b.ingressSequence;
+        });
+
+        std::vector<float> referenceLeft(frames, 0.0f), referenceRight(frames, 0.0f);
+        std::vector<float> spanLeft(frames, 0.0f), spanRight(frames, 0.0f);
+        DifferentialDispatchContext referenceContext{
+            referenceVoices.get(), &referenceChannels, &cfg};
+        DifferentialDispatchContext spanContext{spanVoices.get(), &spanChannels, &cfg};
+        auto referenceRenderer = std::make_unique<svms::RenderScalar>();
+        auto spanRenderer = std::make_unique<svms::RenderScalar>();
+        referenceRenderer->SetEventDispatcher(DispatchDifferentialEvent, &referenceContext);
+        spanRenderer->SetEventDispatcher(DispatchDifferentialEvent, &spanContext);
+
+        referenceRenderer->RenderBlockReference(
+            *referenceVoices, referenceChannels, samples.data(),
+            static_cast<uint32_t>(samples.size()), referenceLeft.data(),
+            referenceRight.data(), frames, cfg, events.data(),
+            static_cast<uint32_t>(events.size()), true, 10000);
+        spanRenderer->RenderBlock(
+            *spanVoices, spanChannels, samples.data(),
+            static_cast<uint32_t>(samples.size()), spanLeft.data(), spanRight.data(),
+            frames, cfg, events.data(), static_cast<uint32_t>(events.size()), true, 10000);
+
+        Check(referenceContext.orderCount == spanContext.orderCount &&
+                  std::memcmp(referenceContext.order, spanContext.order,
+                              referenceContext.orderCount * sizeof(uint32_t)) == 0,
+              "span renderer preserves exact event dispatch order");
+
+        float maximumDifference = 0.0f;
+        for (uint32_t frame = 0; frame < frames; ++frame) {
+            maximumDifference = (std::max)(maximumDifference,
+                std::fabs(referenceLeft[frame] - spanLeft[frame]));
+            maximumDifference = (std::max)(maximumDifference,
+                std::fabs(referenceRight[frame] - spanRight[frame]));
+        }
+        Check(maximumDifference <= 2.0e-4f,
+              "span waveform matches the frame-major scalar reference");
+
+        std::vector<uint32_t> referenceActive(
+            referenceVoices->activeList_,
+            referenceVoices->activeList_ + referenceVoices->activeCount_);
+        std::vector<uint32_t> spanActive(
+            spanVoices->activeList_, spanVoices->activeList_ + spanVoices->activeCount_);
+        std::sort(referenceActive.begin(), referenceActive.end());
+        std::sort(spanActive.begin(), spanActive.end());
+        if (referenceActive != spanActive) {
+            std::fprintf(stderr, "differential active mismatch at %u frames: ref=%zu span=%zu\n",
+                         frames, referenceActive.size(), spanActive.size());
+        }
+        Check(referenceActive == spanActive,
+              "span renderer preserves active voice identity and retirement");
+        for (uint32_t voice : referenceActive) {
+            const bool stateMatches =
+                referenceVoices->v.state[voice] == spanVoices->v.state[voice] &&
+                NearlyEqual(referenceVoices->v.phases[voice],
+                            spanVoices->v.phases[voice], 2.0e-3f) &&
+                NearlyEqual(referenceVoices->v.currentGain[voice],
+                            spanVoices->v.currentGain[voice], 2.0e-5f) &&
+                referenceVoices->v.releaseSamplesRemaining[voice] ==
+                    spanVoices->v.releaseSamplesRemaining[voice];
+            if (!stateMatches) {
+                std::fprintf(stderr,
+                    "differential state mismatch frames=%u voice=%u state=%u/%u phase=%g/%g gain=%g/%g release=%u/%u\n",
+                    frames, voice, referenceVoices->v.state[voice], spanVoices->v.state[voice],
+                    referenceVoices->v.phases[voice], spanVoices->v.phases[voice],
+                    referenceVoices->v.currentGain[voice], spanVoices->v.currentGain[voice],
+                    referenceVoices->v.releaseSamplesRemaining[voice],
+                    spanVoices->v.releaseSamplesRemaining[voice]);
+            }
+            Check(stateMatches, "span renderer preserves active voice state");
+        }
+    }
+}
+
+void TestRenderCallbackPurity() {
+    constexpr uint32_t frames = 512;
+    constexpr uint32_t voiceCount = 256;
+    std::vector<float> samples(4096, 0.25f);
+    std::vector<float> left(frames, 0.0f), right(frames, 0.0f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    auto voices = std::make_unique<svms::VoiceManager>();
+    voices->Initialize(voiceCount, 44100);
+    for (uint32_t i = 0; i < voiceCount; ++i) {
+        const svms::VoiceHandle voice = voices->AllocateVoice(0, 60, 100);
+        voices->SetVoiceSample(voice, 0, 4096, 64, 4032, 1, 1.0f, 1);
+        voices->SetVoiceEnvelope(voice, 1.0f, 1.0f, 0, 0, 0, 0,
+                                 0.0f, 1.0f, 0.999f);
+        voices->SetVoiceGain(voice, 0.01f, 0.01f);
+        voices->RefreshMixGain(voice, channels.GetParams()[0]);
+    }
+    auto renderer = std::make_unique<svms::RenderScalar>();
+
+    g_realtimeAllocationCount.store(0, std::memory_order_relaxed);
+    g_trackRealtimeAllocations = true;
+    renderer->RenderBlock(*voices, channels, samples.data(),
+                          static_cast<uint32_t>(samples.size()), left.data(),
+                          right.data(), frames, cfg, nullptr, 0, true, 0);
+    g_trackRealtimeAllocations = false;
+    Check(g_realtimeAllocationCount.load(std::memory_order_relaxed) == 0,
+          "production scalar render performs no heap allocation");
+}
+
+void TestCallbackSourcePurity() {
+    const std::filesystem::path sourcePath =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "SVMSDriver.cpp";
+    std::ifstream input(sourcePath, std::ios::binary);
+    const std::string source((std::istreambuf_iterator<char>(input)), {});
+    const size_t callbackBegin = source.find("void Driver::RenderCallback");
+    const size_t callbackEnd = source.find("} // namespace svms", callbackBegin);
+    Check(callbackBegin != std::string::npos && callbackEnd != std::string::npos,
+          "callback purity audit locates the production real-time section");
+    if (callbackBegin == std::string::npos || callbackEnd == std::string::npos) return;
+    const std::string realtimeSection =
+        source.substr(callbackBegin, callbackEnd - callbackBegin);
+    Check(realtimeSection.find("EnterCriticalSection") == std::string::npos &&
+              realtimeSection.find("OutputDebugString") == std::string::npos &&
+              realtimeSection.find("LOG(") == std::string::npos &&
+              realtimeSection.find("DiagWindow_Create") == std::string::npos &&
+              realtimeSection.find("CreateWindow") == std::string::npos,
+          "audio callback and MIDI dispatch contain no lock, debug, or UI calls");
+}
+
 } // namespace
 
 int main() {
@@ -907,12 +1300,17 @@ int main() {
     TestChannelTerminationControllers();
     TestOverlappingRetriggerGenerations();
     TestPitchAndDeterministicRender();
+    TestConfiguredVelocityMapping();
     TestEventRingWrapAndCapacity();
     TestWindowedSchedulerOrdering();
     TestFourProducerMPSCIntegrity();
     TestJsonConfigurationLifecycle();
     TestSixHourFrameClockDrift();
+    TestOverloadTimelineRecovery();
     TestExpressionAgeRetirementAndLoopWrap();
+    TestSpanRendererDifferential();
+    TestRenderCallbackPurity();
+    TestCallbackSourcePurity();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);

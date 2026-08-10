@@ -41,6 +41,7 @@ public:
     float GetPitchBendSemitones(uint8_t channel) const;
 
     float ComputeVelocity(uint8_t velocity, const struct RuntimeConfigSnapshot& cfg) const;
+    void ComputeSoundFontPan(int16_t pan, float& outLeft, float& outRight) const;
     float ComputePanGain(uint8_t pan, float& outLeft, float& outRight,
                          const struct RuntimeConfigSnapshot& cfg) const;
     float NoteToFrequency(uint8_t note) const;
@@ -212,14 +213,35 @@ inline float ChannelCache::GetPitchBendSemitones(uint8_t channel) const {
 }
 
 float ChannelCache::ComputeVelocity(uint8_t velocity, const RuntimeConfigSnapshot& cfg) const {
-    if (cfg.ignoreVelocity || velocity < cfg.velocityIgnoreBelow) {
-        return 1.0f;
-    }
-    float v = velocity / 127.0f;
-    v = (v - cfg.velocityFloor) / (1.0f - cfg.velocityFloor);
-    if (v < 0.0f) v = 0.0f;
-    if (v > 1.0f) v = 1.0f;
-    return ::powf(v, cfg.velocityCurve);
+    if (velocity == 0 || velocity < cfg.velocityIgnoreBelow) return 0.0f;
+    if (cfg.ignoreVelocity) return 1.0f;
+
+    // velocityIgnoreBelow is only an admission gate. It must not remap the
+    // surviving range: velocity N has identical loudness whether the gate is
+    // zero or N, matching the setting's "ignore below" wording.
+    float normalized = static_cast<float>(velocity) / 127.0f;
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+
+    float mapped = cfg.velocityFloor +
+        (1.0f - cfg.velocityFloor) * ::powf(normalized, cfg.velocityCurve);
+    if (mapped < 0.0f) mapped = 0.0f;
+    if (mapped > 1.0f) mapped = 1.0f;
+    return mapped;
+}
+
+inline void ChannelCache::ComputeSoundFontPan(int16_t pan, float& outLeft,
+                                               float& outRight) const {
+    float normalized = static_cast<float>(pan) / 500.0f;
+    if (normalized < -1.0f) normalized = -1.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+
+    // Relative constant-power gains: center is 1/1 so it leaves the channel
+    // pan unchanged; hard left/right becomes sqrt(2)/0. Combined with the
+    // channel's centered constant-power gain this yields unity on the
+    // selected side without attenuating center-panned SF2 regions twice.
+    outLeft = ::sqrtf(1.0f - normalized);
+    outRight = ::sqrtf(1.0f + normalized);
 }
 
 inline float ChannelCache::ComputePanGain(uint8_t pan, float& outLeft, float& outRight,

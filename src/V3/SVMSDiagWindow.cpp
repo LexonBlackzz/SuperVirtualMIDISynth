@@ -10,7 +10,15 @@ namespace {
 struct DiagStats {
     uint32_t activeVoices;
     uint32_t maxVoices;
+    uint32_t releasingVoices;
+    uint32_t sustainHeldVoices;
+    uint32_t voiceSteals;
     float cpuPercent;
+    float callbackP95;
+    float callbackP99;
+    float callbackP999;
+    uint64_t overBudgetCallbacks;
+    uint32_t maxConsecutiveOverBudget;
     uint32_t decimationStep;
     uint32_t retired;
     uint32_t retiredImmediate;
@@ -42,7 +50,7 @@ static HMODULE GetCurrentModule() {
 
 static const wchar_t* kWindowClass = L"SVMS V3 Diag";
 static const int kWindowWidth = 540;
-static const int kWindowHeight = 380;
+static const int kWindowHeight = 460;
 static const int kTimerId = 1;
 // Diagnostic-only refresh. Windows timers are scheduler-limited, but 1 ms
 // gives the monitor the fastest practical readout without touching audio.
@@ -117,8 +125,24 @@ static void OnPaint(HWND hwnd) {
     DrawStat(memDC, kPadX, y, L"Pool Usage:       ", buf);
     y += kLineH;
 
+    swprintf_s(buf, L"release=%u sustain=%u steals=%u",
+               s.releasingVoices, s.sustainHeldVoices, s.voiceSteals);
+    DrawStat(memDC, kPadX, y, L"Voice states:     ", buf);
+    y += kLineH;
+
     swprintf_s(buf, L"%.1f%%", s.cpuPercent);
     DrawStat(memDC, kPadX, y, L"CPU Render:       ", buf);
+    y += kLineH;
+
+    swprintf_s(buf, L"%.0f / %.0f / %.0f%%", s.callbackP95,
+               s.callbackP99, s.callbackP999);
+    DrawStat(memDC, kPadX, y, L"CPU p95/99/99.9:  ", buf);
+    y += kLineH;
+
+    swprintf_s(buf, L"%llu (max run %u)",
+               static_cast<unsigned long long>(s.overBudgetCallbacks),
+               s.maxConsecutiveOverBudget);
+    DrawStat(memDC, kPadX, y, L"Over budget:      ", buf);
     y += kLineH;
 
     swprintf_s(buf, L"%u", s.decimationStep);
@@ -201,10 +225,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     const DiagStats stats = ReadPublishedStats();
                     char text[192];
                     sprintf_s(text,
-                        "[SVMS] voices=%u/%u retire=%u immediate=%u step=%u cpu=%.1f%%\n",
+                        "[SVMS] voices=%u/%u retire=%u immediate=%u step=%u cpu=%.1f%% p99=%.0f%% over=%llu\n",
                         stats.activeVoices, stats.maxVoices, stats.retired,
                         stats.retiredImmediate, stats.decimationStep,
-                        static_cast<double>(stats.cpuPercent));
+                        static_cast<double>(stats.cpuPercent),
+                        static_cast<double>(stats.callbackP99),
+                        static_cast<unsigned long long>(stats.overBudgetCallbacks));
                     OutputDebugStringA(text);
                 }
             }
@@ -297,7 +323,12 @@ void DiagWindow_Destroy() {
 }
 
 void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
+                        uint32_t releasingVoices, uint32_t sustainHeldVoices,
+                        uint32_t voiceSteals,
                         float cpuPercent, uint32_t decimationStep,
+                        float callbackP95, float callbackP99,
+                        float callbackP999, uint64_t overBudgetCallbacks,
+                        uint32_t maxConsecutiveOverBudget,
                         uint32_t retired, uint32_t retiredImmediate,
                         const LiveSF2Telemetry& sf2) {
     if (!g_running.load(std::memory_order_acquire)) return;
@@ -307,7 +338,15 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     DiagStats& stats = g_stats[target];
     stats.activeVoices = activeVoices;
     stats.maxVoices = maxVoices;
+    stats.releasingVoices = releasingVoices;
+    stats.sustainHeldVoices = sustainHeldVoices;
+    stats.voiceSteals = voiceSteals;
     stats.cpuPercent = cpuPercent;
+    stats.callbackP95 = callbackP95;
+    stats.callbackP99 = callbackP99;
+    stats.callbackP999 = callbackP999;
+    stats.overBudgetCallbacks = overBudgetCallbacks;
+    stats.maxConsecutiveOverBudget = maxConsecutiveOverBudget;
     stats.decimationStep = decimationStep;
     stats.retired = retired;
     stats.retiredImmediate = retiredImmediate;

@@ -176,7 +176,8 @@ if(SVMS_BUILD_TESTS)
         SVMSConfig.cpp
         SVMSSoundFont.cpp
     )
-    target_compile_definitions(svms_v3_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(svms_v3_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+        _CRT_SECURE_NO_WARNINGS SVMS_ENABLE_REFERENCE_RENDERER=1)
     target_include_directories(svms_v3_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(svms_v3_tests PRIVATE user32)
     target_link_libraries(svms_v3_tests PRIVATE shell32)
@@ -187,4 +188,9 @@ if(SVMS_BUILD_TESTS)
     target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
+
+    add_executable(svms_v3_bench tests/SVMSV3Bench.cpp)
+    target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+        SVMS_ENABLE_REFERENCE_RENDERER=1)
+    target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

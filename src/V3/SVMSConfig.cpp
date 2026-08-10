@@ -25,6 +25,13 @@ namespace fs = std::filesystem;
 constexpr uint32_t kConfigSchemaVersion = 1;
 constexpr wchar_t kConfigMutexName[] = L"Local\\SuperVirtualMIDISynth_Config_v1";
 
+bool PathExists(const fs::path& path) noexcept {
+    if (path.empty()) return false;
+    std::error_code error;
+    const bool exists = fs::exists(path, error);
+    return !error && exists;
+}
+
 std::string WideToUtf8(const std::wstring& value) {
     if (value.empty()) return {};
     const int count = WideCharToMultiByte(CP_UTF8, 0, value.data(),
@@ -382,18 +389,36 @@ EngineConfig EngineConfig::Default() {
 
 EngineConfig EngineConfig::Load() {
     EngineConfig cfg = Default();
-    cfg.configPath = GetV3ConfigPath();
-    const fs::path path(cfg.configPath);
 
     HANDLE mutex = CreateMutexW(nullptr, FALSE, kConfigMutexName);
     if (mutex) WaitForSingleObject(mutex, INFINITE);
 
-    if (!fs::exists(path)) {
+    const fs::path localPath(GetV3LocalConfigPath());
+    const fs::path appDataPath(GetV3AppDataConfigPath());
+    fs::path path;
+    if (PathExists(localPath)) path = localPath;
+    else if (PathExists(appDataPath)) path = appDataPath;
+    else if (!appDataPath.empty()) path = appDataPath;
+    else path = localPath;
+    cfg.configPath = path.wstring();
+
+    if (!PathExists(path)) {
         json root = MakeDefaultJson(cfg);
         const fs::path legacy = FindLegacyIni();
         if (!legacy.empty()) ImportLegacyIni(root, legacy);
-        if (!AtomicWriteJson(path, root))
-            cfg.configWarning = "unable to create AppData config.json";
+        if (!AtomicWriteJson(path, root)) {
+            // Portable/demo systems may not expose a writable Roaming
+            // AppData folder. In that case use the DLL directory as the
+            // first-run store if it is writable.
+            if (path != localPath && !localPath.empty() &&
+                AtomicWriteJson(localPath, root)) {
+                path = localPath;
+                cfg.configPath = path.wstring();
+            } else {
+                cfg.configWarning =
+                    "unable to create config.json in AppData or DLL directory";
+            }
+        }
     }
 
     try {
@@ -435,9 +460,21 @@ bool EngineConfig::Validate() const {
            maxEventsPerBlock > 0;
 }
 
-std::wstring GetV3ConfigPath() {
-    // Test harness isolation only. Normal hosts never set this variable and
-    // always use the canonical Roaming AppData location below.
+std::wstring GetV3LocalConfigPath() {
+    // Test harness isolation only. Normal hosts use the directory containing
+    // this winmm.dll module.
+    std::wstring testPath(32768, L'\0');
+    DWORD testLength = GetEnvironmentVariableW(L"SVMS_TEST_LOCAL_CONFIG_PATH",
+        testPath.data(), static_cast<DWORD>(testPath.size()));
+    if (testLength > 0 && testLength < testPath.size()) {
+        testPath.resize(testLength);
+        return testPath;
+    }
+    return (fs::path(GetV3ModuleDirectory()) / L"config.json").wstring();
+}
+
+std::wstring GetV3AppDataConfigPath() {
+    // Test harness isolation only. Normal hosts use Roaming AppData.
     std::wstring testPath(32768, L'\0');
     DWORD testLength = GetEnvironmentVariableW(L"SVMS_TEST_CONFIG_PATH",
         testPath.data(), static_cast<DWORD>(testPath.size()));
@@ -454,6 +491,14 @@ std::wstring GetV3ConfigPath() {
         CoTaskMemFree(roaming);
     }
     return result;
+}
+
+std::wstring GetV3ConfigPath() {
+    const fs::path local(GetV3LocalConfigPath());
+    if (PathExists(local)) return local.wstring();
+    const fs::path appData(GetV3AppDataConfigPath());
+    if (!appData.empty()) return appData.wstring();
+    return local.wstring();
 }
 
 std::wstring GetV3ModuleDirectory() {

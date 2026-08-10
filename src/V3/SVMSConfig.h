@@ -46,8 +46,11 @@ struct EngineConfig {
     bool Validate() const;
 };
 
-// Canonical V3 configuration location and SoundFont path resolution.
+// Active V3 configuration location. A portable config beside winmm.dll takes
+// precedence over the Roaming AppData configuration.
 std::wstring GetV3ConfigPath();
+std::wstring GetV3LocalConfigPath();
+std::wstring GetV3AppDataConfigPath();
 std::wstring GetV3ModuleDirectory();
 std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg);
 
