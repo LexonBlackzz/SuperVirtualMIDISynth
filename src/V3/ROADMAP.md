@@ -300,6 +300,10 @@ larger phase containing that item is complete.
 - [x] Characterize the Paprika 2/3 stress corpus without committing it: PNC2
   peaks at 554,240 note-ons/s and PNC3 at 942,960 note-ons/s; expose peak
   channel-event, note-on, and same-frame density in scan-only output
+- [x] Recover BASSMIDI's runtime-unpacked voice-stealing paths: ordinary pool
+  exhaustion ranks an envelope/control-derived effective level with an age
+  bias, CPU overload batch-prunes by effective level alone, and audible stolen
+  voices use a conditional reserve fade tail
 - [ ] Establish scalar baselines and practical voice limits on a Celeron 420
 - [ ] Establish modern-CPU event-flood and eventual 500K-voice baselines
 - [ ] Add cycle/cache-miss profiling; callback duration, queue pressure,
