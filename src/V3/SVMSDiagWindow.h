@@ -22,7 +22,7 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         bool audioRunning, int32_t audioError,
                         bool soundFontLoaded, uint32_t sampleRate,
                         uint32_t bufferFrames, float masterVolume,
-                        bool waveOutFallback,
+                        bool waveOutFallback, RenderBackend renderBackend,
                         const LiveSF2Telemetry& sf2);
 
 } // namespace svms

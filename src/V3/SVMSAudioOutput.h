@@ -7,12 +7,15 @@
 #include <windows.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propidl.h>
 #include <audiopolicy.h>
 #include <avrt.h>
 #include <ksmedia.h>
 #include <atomic>
 #include <cstring>
 #include <algorithm>
+#include <string>
 #include <vector>
 #include <xmmintrin.h>
 #include <cstddef>
@@ -32,7 +35,8 @@ public:
     AudioOutput();
     ~AudioOutput();
 
-    bool Initialize(uint32_t sampleRate, uint32_t bufferFrames);
+    bool Initialize(uint32_t sampleRate, uint32_t bufferFrames,
+                    const std::wstring& deviceName = {});
     void Shutdown();
     bool Start();
     void Stop();
@@ -79,7 +83,8 @@ inline AudioOutput::~AudioOutput() {
     Shutdown();
 }
 
-inline bool AudioOutput::Initialize(uint32_t sampleRate, uint32_t bufferFrames) {
+inline bool AudioOutput::Initialize(uint32_t sampleRate, uint32_t bufferFrames,
+                                    const std::wstring& deviceName) {
     sampleRate_ = sampleRate;
     bufferFrames_ = bufferFrames;
     lastHResult_ = S_OK;
@@ -105,11 +110,41 @@ inline bool AudioOutput::Initialize(uint32_t sampleRate, uint32_t bufferFrames) 
         return false;
     }
 
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
+    if (deviceName.empty()) {
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
+    } else {
+        IMMDeviceCollection* collection = nullptr;
+        hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+        if (SUCCEEDED(hr) && collection) {
+            UINT count = 0;
+            collection->GetCount(&count);
+            for (UINT index = 0; index < count && !device_; ++index) {
+                IMMDevice* candidate = nullptr;
+                IPropertyStore* properties = nullptr;
+                PROPVARIANT friendlyName;
+                PropVariantInit(&friendlyName);
+                if (SUCCEEDED(collection->Item(index, &candidate)) && candidate &&
+                    SUCCEEDED(candidate->OpenPropertyStore(STGM_READ, &properties)) &&
+                    properties &&
+                    SUCCEEDED(properties->GetValue(PKEY_Device_FriendlyName,
+                                                   &friendlyName)) &&
+                    friendlyName.vt == VT_LPWSTR && friendlyName.pwszVal &&
+                    _wcsicmp(friendlyName.pwszVal, deviceName.c_str()) == 0) {
+                    device_ = candidate;
+                    candidate = nullptr;
+                }
+                PropVariantClear(&friendlyName);
+                if (properties) properties->Release();
+                if (candidate) candidate->Release();
+            }
+            collection->Release();
+            if (!device_) hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        }
+    }
     enumerator->Release();
     if (FAILED(hr)) {
         lastHResult_ = hr;
-        sprintf(dbg, "[SVMS] AudioOutput::Initialize: GetDefaultAudioEndpoint FAILED hr=0x%08X\n", (unsigned)hr);
+        sprintf(dbg, "[SVMS] AudioOutput::Initialize: render endpoint selection FAILED hr=0x%08X\n", (unsigned)hr);
         OutputDebugStringA(dbg);
         return false;
     }

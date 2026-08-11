@@ -872,9 +872,12 @@ static void AppendCompiledRegion(SF2Data* data, uint32_t presetIndex,
 
 void sf2_build_regions(SF2Data* data) {
     data->regionCount = 0;
+    std::memset(data->presetRegionStart, 0, sizeof(data->presetRegionStart));
+    std::memset(data->presetRegionCount, 0, sizeof(data->presetRegionCount));
     data->regionOverflow = false;
 
     for (uint32_t pi = 0; pi < data->presetCount; ++pi) {
+        data->presetRegionStart[pi] = data->regionCount;
         if (data->presets[pi].preset == 0xFFFF) continue;
         const uint16_t pBegin = data->presets[pi].zoneIndex;
         const uint16_t pEnd = (pi + 1 < data->presetCount)
@@ -935,6 +938,8 @@ void sf2_build_regions(SF2Data* data) {
                     AppendCompiledRegion(data, pi, merged);
             }
         }
+        data->presetRegionCount[pi] =
+            data->regionCount - data->presetRegionStart[pi];
     }
 
     /* Legacy compiler retained below for reference during migration. */
@@ -1102,9 +1107,11 @@ uint32_t sf2_find_regions(const SF2Data* data, uint32_t presetIndex,
                           uint32_t outCapacity) {
     if (!data || !outRegions || presetIndex >= data->presetCount) return 0;
     uint32_t count = 0;
-    for (uint32_t i = 0; i < data->regionCount; ++i) {
+    const uint32_t begin = data->presetRegionStart[presetIndex];
+    const uint32_t end = begin + data->presetRegionCount[presetIndex];
+    if (begin > data->regionCount || end > data->regionCount) return 0;
+    for (uint32_t i = begin; i < end; ++i) {
         const SFSampleRegion& region = data->regions[i];
-        if (region.presetIndex != static_cast<uint16_t>(presetIndex)) continue;
         if (note < region.keyLo || note > region.keyHi ||
             velocity < region.velLo || velocity > region.velHi) continue;
         if (count < outCapacity) outRegions[count] = &region;

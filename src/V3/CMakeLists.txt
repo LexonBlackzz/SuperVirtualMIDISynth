@@ -39,7 +39,13 @@ set(SOURCES
     SVMSDriver.cpp
     SVMSDiagWindow.cpp
     SVMSRenderKernels.cpp
+    SVMSRenderDispatch.cpp
+    SVMSRenderKernelsSSE2.cpp
 )
+
+if(NOT SVMS_XP_COMPAT)
+    list(APPEND SOURCES SVMSRenderKernelsAVX2.cpp)
+endif()
 
 set(HEADERS
     SVMSTypes.h
@@ -59,6 +65,22 @@ set(HEADERS
 )
 
 add_library(svmsynth SHARED ${SOURCES} ${HEADERS})
+
+if(MSVC)
+    set_source_files_properties(SVMSRenderKernelsSSE2.cpp PROPERTIES
+        COMPILE_OPTIONS "$<$<EQUAL:${CMAKE_SIZEOF_VOID_P},4>:/arch:SSE2>")
+    if(NOT SVMS_XP_COMPAT)
+        set_source_files_properties(SVMSRenderKernelsAVX2.cpp PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX2")
+    endif()
+elseif(MINGW)
+    set_source_files_properties(SVMSRenderKernelsSSE2.cpp PROPERTIES
+        COMPILE_OPTIONS "-msse2;-mno-avx")
+    if(NOT SVMS_XP_COMPAT)
+        set_source_files_properties(SVMSRenderKernelsAVX2.cpp PROPERTIES
+            COMPILE_OPTIONS "-mavx2;-mno-fma")
+    endif()
+endif()
 
 target_compile_definitions(svmsynth PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
     UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
@@ -103,6 +125,9 @@ set(EXPORTS
         UnprepareLongData
         DriverSettings
         GetDriverDebugInfo
+        GetRenderingTime
+        GetVoiceCount
+        GetVoiceStatistics
         SVMSGetDriverDebugInfoV1
         LoadCustomSoundFontsList
         timeGetTime64
@@ -196,15 +221,38 @@ set_target_properties(svmsynth PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Ziggy's direct-synth loader probes SnappySynth.dll and then discovers the
+# SSV2-compatible telemetry/KDMAPI exports. Keep winmm.dll as the canonical
+# drop-in output and emit a byte-identical alias for that host integration.
+add_custom_target(svms_ziggy_alias ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:svmsynth>"
+            "$<TARGET_FILE_DIR:svmsynth>/SnappySynth.dll"
+    DEPENDS svmsynth
+    VERBATIM)
+
 option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
 
 if(SVMS_BUILD_TESTS)
+    add_executable(svms_v3_telemetry_abi_smoke
+        tests/SVMSTelemetryABISmoke.cpp)
+    target_compile_definitions(svms_v3_telemetry_abi_smoke PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    add_dependencies(svms_v3_telemetry_abi_smoke svmsynth)
+    add_test(NAME svms_v3_telemetry_abi_smoke
+             COMMAND svms_v3_telemetry_abi_smoke "$<TARGET_FILE:svmsynth>")
+
     add_executable(svms_v3_tests
         tests/SVMSV3Tests.cpp
         SVMSConfig.cpp
         SVMSSoundFont.cpp
         SVMSRenderKernels.cpp
+        SVMSRenderDispatch.cpp
+        SVMSRenderKernelsSSE2.cpp
     )
+    if(NOT SVMS_XP_COMPAT)
+        target_sources(svms_v3_tests PRIVATE SVMSRenderKernelsAVX2.cpp)
+    endif()
     target_compile_definitions(svms_v3_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS SVMS_ENABLE_REFERENCE_RENDERER=1)
     target_include_directories(svms_v3_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -258,7 +306,8 @@ if(SVMS_BUILD_TESTS)
         target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
 
-        add_executable(svms_v3_bench tests/SVMSV3Bench.cpp SVMSRenderKernels.cpp)
+        add_executable(svms_v3_bench tests/SVMSV3Bench.cpp SVMSSoundFont.cpp SVMSRenderKernels.cpp
+            SVMSRenderDispatch.cpp SVMSRenderKernelsSSE2.cpp SVMSRenderKernelsAVX2.cpp)
         target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
             SVMS_ENABLE_REFERENCE_RENDERER=1)
         target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

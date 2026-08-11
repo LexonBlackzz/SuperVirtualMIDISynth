@@ -369,6 +369,8 @@ struct CallbackTimingWindow {
     }
 };
 
+struct PreparedSF2Region;
+
 class Driver {
 public:
     static Driver& Instance();
@@ -381,6 +383,9 @@ public:
     void ResetAllVoices();
     bool IsInitialized() const;
     void CopyDebugInfo(DriverDebugInfo& out) const;
+    void CopyVoiceStatistics(SnappyVoiceStatistics& out) const;
+    float GetRenderingTimeMilliseconds() const;
+    const LegacyDriverDebugInfo* GetLegacyDebugInfo() const;
 
     void SubmitShortMsg(uint32_t msg);
 
@@ -434,6 +439,9 @@ private:
     EventTelemetry telemetry_;
     LiveSF2Telemetry sf2Telemetry_;
     DriverDebugInfo debugSnapshots_[2];
+    SnappyVoiceStatistics voiceStatisticsSnapshots_[2];
+    LegacyDriverDebugInfo legacyDebugSnapshots_[2];
+    float renderingTimeSnapshots_[2]{};
     std::atomic<uint32_t> debugSnapshotIndex_;
     uint64_t callbackCount_;
     CallbackTimingWindow callbackTiming_;
@@ -446,6 +454,10 @@ private:
     RuntimeConfigSnapshot* configSnapshot;
     float* sampleDataStore;
     SF2Sample* samplesStore;
+    float* regionInitialPeaks;
+    uint32_t regionInitialPeakCount;
+    PreparedSF2Region* preparedRegions;
+    uint32_t preparedRegionCount;
     uint32_t sampleStoreCount;
     uint32_t sampleDataFrames;
     uint64_t qpcFreq;
@@ -459,6 +471,17 @@ private:
     // whole working set stays in L1/L2/L3 during dispatch.  Size is
     // kEventBufferCapacity (see SVMSTypes.h).  65536 entries = 512 KB.
     svms::RenderEvent* eventBuffer;
+
+    // When the renderer falls behind by more than one device buffer, old
+    // note-ons no longer have a meaningful historical frame at which they
+    // can be rendered. Keep only the newest still-on note for each MIDI
+    // channel/key while draining that obsolete window. This bounded catch-up
+    // set prevents overload from converging to permanent silence.
+    static constexpr uint32_t kStaleRecoveryKeys = kChannelCount * kNoteCount;
+    RenderEvent staleRecoveryEvents_[kStaleRecoveryKeys];
+    uint8_t staleRecoveryValid_[kStaleRecoveryKeys];
+    uint32_t staleRecoveryNoteOffSequence_[kStaleRecoveryKeys];
+    uint8_t staleRecoveryNoteOffValid_[kStaleRecoveryKeys];
 
     // Persistent audio-thread-only overflow queue.  Events whose
     // sampleOffset lands beyond the current block (sampleOffset >=
@@ -492,6 +515,88 @@ static bool ResolveChannelPreset(const SF2Data* data, const ChannelCache& cache,
                               channel == 9, outPresetIndex);
 }
 
+struct PreparedSF2Region {
+    float basePhaseStep[kNoteCount];
+    float bendScale;
+    float attenuationGain;
+    float sustainLevel;
+    float decaySlope;
+    float releaseDecay;
+    float panLeft;
+    float panRight;
+    uint32_t delaySamples;
+    uint32_t holdSamples;
+    uint32_t attackSamples;
+    uint32_t decaySamples;
+    uint32_t releaseSamples;
+    uint8_t valid;
+};
+
+static void PrepareSF2Region(const SF2Data* data, const SFSampleRegion& region,
+                             uint32_t outputRate, ChannelCache* channelCache,
+                             PreparedSF2Region& out) {
+    std::memset(&out, 0, sizeof(out));
+    if (!data || region.sampleIndex >= data->sampleCount ||
+        !sf2_validate_region(data, &region)) return;
+
+    const SF2Sample& sample = data->samples[region.sampleIndex];
+    const int rootKey = region.rootKey >= 0
+        ? static_cast<int>(region.rootKey)
+        : static_cast<int>(sample.originalPitch);
+    const float tune = static_cast<float>(region.coarseTune) +
+        static_cast<float>(region.fineTune) / 100.0f;
+    out.bendScale = static_cast<float>(
+        region.scaleTuning != 0 ? region.scaleTuning : 100) / 100.0f;
+    const float sourceRate = static_cast<float>(
+        sample.sampleRate > 0u ? sample.sampleRate : 44100u);
+    const float targetRate = static_cast<float>(
+        outputRate > 0u ? outputRate : 44100u);
+    const float rateRatio = sourceRate / targetRate;
+    for (uint32_t note = 0; note < kNoteCount; ++note) {
+        const float semitones =
+            (static_cast<float>(note) + tune - static_cast<float>(rootKey)) *
+            out.bendScale;
+        out.basePhaseStep[note] =
+            rateRatio * powf(2.0f, semitones / 12.0f);
+    }
+
+    out.attenuationGain = region.initialAttenuation > 0
+        ? InitialAttenuationToGain(static_cast<float>(region.initialAttenuation))
+        : 1.0f;
+    out.sustainLevel = SustainAttenuationToGain((std::max)(
+        0.0f, static_cast<float>(region.sustainVolEnv)));
+    if (out.sustainLevel > 1.0f) out.sustainLevel = 1.0f;
+
+    const float rate = static_cast<float>(outputRate > 0u ? outputRate : 44100u);
+    const float delaySeconds = TimecentsToSeconds(region.delayVolEnv);
+    const float holdSeconds = TimecentsToSeconds(region.holdVolEnv);
+    const float attackSeconds = TimecentsToSeconds(region.attackVolEnv);
+    const float decaySeconds = TimecentsToSeconds(region.decayVolEnv);
+    const float releaseSeconds = TimecentsToSeconds(region.releaseVolEnv);
+    out.delaySamples = delaySeconds > 0.0f
+        ? static_cast<uint32_t>(delaySeconds * rate) : 0u;
+    out.holdSamples = holdSeconds > 0.0f
+        ? static_cast<uint32_t>(holdSeconds * rate) : 0u;
+    out.attackSamples = attackSeconds > 0.0001f
+        ? static_cast<uint32_t>(attackSeconds * rate) : 0u;
+    out.decaySamples = decaySeconds > 0.0001f
+        ? static_cast<uint32_t>(decaySeconds * rate) : 0u;
+    out.decaySlope = 1.0f;
+    if (out.decaySamples > 0u) {
+        const float slope = -9.226f / static_cast<float>(out.decaySamples);
+        out.decaySlope = expf(slope);
+        if (out.sustainLevel > 0.0f && out.sustainLevel < 1.0f)
+            out.decaySamples = static_cast<uint32_t>(logf(out.sustainLevel) / slope);
+    }
+    out.releaseDecay = MakeReleaseDecay(releaseSeconds, outputRate);
+    out.releaseSamples = MakeReleaseSamples(releaseSeconds, outputRate);
+    out.panLeft = 1.0f;
+    out.panRight = 1.0f;
+    if (channelCache)
+        channelCache->ComputeSoundFontPan(region.pan, out.panLeft, out.panRight);
+    out.valid = 1u;
+}
+
 Driver& Driver::Instance() {
     if (!s_instance) {
         s_instance = new Driver();
@@ -503,7 +608,9 @@ Driver::Driver()
     : initialized(false), sampleRate(44100), bufferFrames(512),
       audioOutput(nullptr), voiceManager(nullptr), channelCache(nullptr),
       renderScalar(nullptr), soundFontData(nullptr), configSnapshot(nullptr),
-      sampleDataStore(nullptr), samplesStore(nullptr), sampleStoreCount(0), sampleDataFrames(0),
+      sampleDataStore(nullptr), samplesStore(nullptr), regionInitialPeaks(nullptr),
+      regionInitialPeakCount(0), preparedRegions(nullptr), preparedRegionCount(0),
+      sampleStoreCount(0), sampleDataFrames(0),
       qpcFreq(1),
       leftBuffer(nullptr), rightBuffer(nullptr), bufferCapacity(0),
       eventBuffer(nullptr),
@@ -582,7 +689,11 @@ bool Driver::Initialize() {
     }
 
     audioOutput = new AudioOutput();
+#if defined(SVMS_XP_COMPAT)
     if (!audioOutput->Initialize(sampleRate, bufferFrames)) {
+#else
+    if (!audioOutput->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
+#endif
         HRESULT hr = audioOutput->GetLastError();
         LOG("FAILED: AudioOutput::Initialize hr=0x%08X", (unsigned)hr);
         XPBootstrapTrace("[SVMS XP] DirectSound initialization FAILED\r\n");
@@ -609,6 +720,17 @@ bool Driver::Initialize() {
 
     voiceManager = new VoiceManager();
     voiceManager->Initialize(cfg.maxVoices, sampleRate);
+    for (uint32_t index = 0; index < 2u; ++index) {
+        voiceStatisticsSnapshots_[index] = SnappyVoiceStatistics{};
+        voiceStatisticsSnapshots_[index].freeVoices = cfg.maxVoices;
+        legacyDebugSnapshots_[index] = LegacyDriverDebugInfo{};
+        legacyDebugSnapshots_[index].audioLatency =
+            static_cast<double>(bufferFrames) * 1000.0 /
+            static_cast<double>(sampleRate);
+        legacyDebugSnapshots_[index].audioBufferSize = bufferFrames;
+        renderingTimeSnapshots_[index] = 0.0f;
+    }
+    debugSnapshotIndex_.store(0u, std::memory_order_release);
     LOG("VoiceManager initialized, maxVoices=%u", cfg.maxVoices);
 
     channelCache = new ChannelCache();
@@ -661,6 +783,10 @@ void Driver::Shutdown() {
     delete channelCache; channelCache = nullptr;
     delete renderScalar; renderScalar = nullptr;
     delete configSnapshot; configSnapshot = nullptr;
+    free(regionInitialPeaks); regionInitialPeaks = nullptr;
+    regionInitialPeakCount = 0;
+    free(preparedRegions); preparedRegions = nullptr;
+    preparedRegionCount = 0;
     _aligned_free(leftBuffer); leftBuffer = nullptr;
     _aligned_free(rightBuffer); rightBuffer = nullptr;
     bufferCapacity = 0;
@@ -759,12 +885,41 @@ bool Driver::LoadSoundFont(const wchar_t* path) {
     }
 
     if (soundFontData) {
+        free(regionInitialPeaks); regionInitialPeaks = nullptr;
+        regionInitialPeakCount = 0;
+        free(preparedRegions); preparedRegions = nullptr;
+        preparedRegionCount = 0;
         free(sampleDataStore); sampleDataStore = nullptr;
         free(samplesStore); samplesStore = nullptr;
         sf2_free(soundFontData);
         delete soundFontData;
     }
     soundFontData = sf2;
+
+    // Diagnostic peak inspection walks up to 512 source samples.  Doing
+    // that for every configured voice made diagnostics catastrophically
+    // expensive in dense MIDI.  Compile the immutable values once while
+    // loading off the audio thread; note-on becomes a single cached read.
+    if (sf2->regionCount != 0u) {
+        regionInitialPeaks = static_cast<float*>(
+            malloc(static_cast<size_t>(sf2->regionCount) * sizeof(float)));
+        if (regionInitialPeaks) {
+            regionInitialPeakCount = sf2->regionCount;
+            for (uint32_t region = 0; region < sf2->regionCount; ++region) {
+                regionInitialPeaks[region] =
+                    sf2_region_initial_peak(sf2, &sf2->regions[region]);
+            }
+        }
+        preparedRegions = static_cast<PreparedSF2Region*>(malloc(
+            static_cast<size_t>(sf2->regionCount) * sizeof(PreparedSF2Region)));
+        if (preparedRegions) {
+            preparedRegionCount = sf2->regionCount;
+            for (uint32_t region = 0; region < sf2->regionCount; ++region) {
+                PrepareSF2Region(sf2, sf2->regions[region], sampleRate,
+                                 channelCache, preparedRegions[region]);
+            }
+        }
+    }
 
     // Establish the initial selected preset for every channel.  Future
     // invalid program changes do not overwrite this committed selection.
@@ -818,6 +973,21 @@ void Driver::CopyDebugInfo(DriverDebugInfo& out) const {
     out.sampleCount = sampleStoreCount;
     out.audioRunning = audioOutput && audioOutput->IsRunning() ? 1u : 0u;
     out.audioHResult = audioOutput ? static_cast<int32_t>(audioOutput->GetLastError()) : 0;
+}
+
+void Driver::CopyVoiceStatistics(SnappyVoiceStatistics& out) const {
+    const uint32_t index = debugSnapshotIndex_.load(std::memory_order_acquire) & 1u;
+    out = voiceStatisticsSnapshots_[index];
+}
+
+float Driver::GetRenderingTimeMilliseconds() const {
+    const uint32_t index = debugSnapshotIndex_.load(std::memory_order_acquire) & 1u;
+    return renderingTimeSnapshots_[index];
+}
+
+const LegacyDriverDebugInfo* Driver::GetLegacyDebugInfo() const {
+    const uint32_t index = debugSnapshotIndex_.load(std::memory_order_acquire) & 1u;
+    return &legacyDebugSnapshots_[index];
 }
 
 bool Driver::StartAudio() {
@@ -1016,11 +1186,19 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // up and rescale queued event offsets so they land in this block.
     // ── Step 1: Drain ALL SPSC events → append to pending queue ─────────
     TimestampedMidiEvent timed;
-    uint32_t drainedEvents = 0;
-    while (drainedEvents < self->maxEventsPerBlock_ &&
+    uint32_t scannedIngress = 0;
+    uint32_t admittedEvents = 0;
+    std::memset(self->staleRecoveryValid_, 0,
+                sizeof(self->staleRecoveryValid_));
+    std::memset(self->staleRecoveryNoteOffValid_, 0,
+                sizeof(self->staleRecoveryNoteOffValid_));
+    const uint32_t ingressScanBudget =
+        PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity();
+    while (scannedIngress < ingressScanBudget &&
+           admittedEvents < self->maxEventsPerBlock_ &&
            self->eventScheduler_.Size() < kEventBufferCapacity &&
            self->midiIngress_.TryPop(timed)) {
-        ++drainedEvents;
+        ++scannedIngress;
         if (self->eventScheduler_.Size() >= kEventBufferCapacity) {
             break;
         }
@@ -1079,20 +1257,79 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             scheduled.targetFrame = self->virtualRenderSample_;
         }
 #endif
+        const uint32_t recoveryKey =
+            static_cast<uint32_t>(ch) * kNoteCount + d1;
+        if (etype == RenderEventType::NoteOff && d1 < kNoteCount &&
+            scheduled.targetFrame <= self->virtualRenderSample_) {
+            if (!self->staleRecoveryNoteOffValid_[recoveryKey] ||
+                !SequenceAtOrBefore(
+                    timed.sequence,
+                    self->staleRecoveryNoteOffSequence_[recoveryKey])) {
+                self->staleRecoveryNoteOffSequence_[recoveryKey] = timed.sequence;
+                self->staleRecoveryNoteOffValid_[recoveryKey] = 1u;
+            }
+            if (self->staleRecoveryValid_[recoveryKey] &&
+                SequenceAtOrBefore(
+                    self->staleRecoveryEvents_[recoveryKey].ingressSequence,
+                    timed.sequence)) {
+                self->staleRecoveryValid_[recoveryKey] = 0u;
+                ++self->telemetry_.staleNoteOnsSkipped;
+            }
+        }
         if (etype == RenderEventType::NoteOn &&
             IsObsoleteNoteOn(scheduled.targetFrame, self->virtualRenderSample_,
                              self->bufferFrames)) {
             ++self->telemetry_.late;
-            ++self->telemetry_.staleNoteOnsSkipped;
+            if (d1 >= kNoteCount ||
+                (self->staleRecoveryNoteOffValid_[recoveryKey] &&
+                 SequenceAtOrBefore(
+                     timed.sequence,
+                     self->staleRecoveryNoteOffSequence_[recoveryKey]))) {
+                ++self->telemetry_.staleNoteOnsSkipped;
+                continue;
+            }
+            if (self->staleRecoveryValid_[recoveryKey]) {
+                if (SequenceAtOrBefore(
+                        timed.sequence,
+                        self->staleRecoveryEvents_[recoveryKey].ingressSequence)) {
+                    ++self->telemetry_.staleNoteOnsSkipped;
+                    continue;
+                }
+                ++self->telemetry_.staleNoteOnsSkipped;
+            }
+            ev.frameOffset = 0u;
+            self->staleRecoveryEvents_[recoveryKey] = ev;
+            self->staleRecoveryValid_[recoveryKey] = 1u;
             continue;
         }
         if (!self->eventScheduler_.Enqueue(scheduled)) {
             ++self->telemetry_.dropped;
             break;
         }
+        ++admittedEvents;
         self->telemetry_.scheduledHighWater =
             (std::max)(self->telemetry_.scheduledHighWater,
                        static_cast<uint64_t>(self->eventScheduler_.Size()));
+    }
+
+    // Recovered notes all become writable at this block's first frame. The
+    // scheduler's sequence tie-break restores producer order even though the
+    // compact set is walked by channel/key here.
+    for (uint32_t key = 0;
+         key < Driver::kStaleRecoveryKeys &&
+         admittedEvents < self->maxEventsPerBlock_ &&
+         self->eventScheduler_.Size() < kEventBufferCapacity;
+         ++key) {
+        if (!self->staleRecoveryValid_[key]) continue;
+        ScheduledRenderEvent recovered;
+        recovered.event = self->staleRecoveryEvents_[key];
+        recovered.targetFrame = self->virtualRenderSample_;
+        recovered.sequence = recovered.event.ingressSequence;
+        if (!self->eventScheduler_.Enqueue(recovered)) {
+            ++self->telemetry_.staleNoteOnsSkipped;
+            break;
+        }
+        ++admittedEvents;
     }
 
     self->producerWakeEpoch_.fetch_add(1, std::memory_order_release);
@@ -1224,6 +1461,23 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     debug.audioHResult = self->audioOutput
         ? static_cast<int32_t>(self->audioOutput->GetLastError()) : 0;
     debug.renderPeak = self->sf2Telemetry_.renderPeak;
+
+    SnappyVoiceStatistics& voiceStats =
+        self->voiceStatisticsSnapshots_[nextDebugIndex];
+    voiceStats.activeVoices = vm->activeCount_;
+    voiceStats.freeVoices = vm->GetMaxVoices() - vm->activeCount_;
+    voiceStats.voiceSteals = vm->stealCount_;
+
+    LegacyDriverDebugInfo& legacy =
+        self->legacyDebugSnapshots_[nextDebugIndex];
+    legacy = LegacyDriverDebugInfo{};
+    legacy.renderingTime = static_cast<float>(elapsedUs / 1000.0);
+    for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
+        legacy.activeVoices[channel] = vm->GetChannelActiveCount(channel);
+    }
+    legacy.audioLatency = budgetUs / 1000.0;
+    legacy.audioBufferSize = numFrames;
+    self->renderingTimeSnapshots_[nextDebugIndex] = legacy.renderingTime;
     self->debugSnapshotIndex_.store(nextDebugIndex, std::memory_order_release);
     if (self->diagnosticsEnabled_) {
         for (uint32_t velocity = 0; velocity < 128; ++velocity) {
@@ -1268,6 +1522,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                                    self->sampleRate, self->bufferFrames,
                                    snap->masterVolume,
                                    UsesXPWaveOut(self->audioOutput),
+                                   render->GetRenderBackend(),
                                    self->sf2Telemetry_);
             }
         }
@@ -1377,7 +1632,12 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
             ++sf2Telemetry_.invalidRegions;
             return;
         }
-        if (!sf2_validate_region(soundFontData, region)) {
+        const uint32_t regionIndex = static_cast<uint32_t>(
+            region - soundFontData->regions);
+        const bool valid = preparedRegions && regionIndex < preparedRegionCount
+            ? preparedRegions[regionIndex].valid != 0u
+            : sf2_validate_region(soundFontData, region);
+        if (!valid) {
             ++sf2Telemetry_.invalidSampleRanges;
             return;
         }
@@ -1393,12 +1653,14 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
 
     float sr = (float)(sampleRate > 0 ? sampleRate : 44100u);
     float pitchBendSemitones = channelCache->GetPitchBendSemitones(channel);
+    const float commonBendRatio = powf(
+        2.0f, pitchBendSemitones / 12.0f);
 
     VoiceHandle allocatedVoices[kMaxMatchingRegions];
     uint32_t allocatedCount = 0;
     for (; allocatedCount < matchCount; ++allocatedCount) {
         allocatedVoices[allocatedCount] = voiceManager->AllocateVoiceOrSteal(
-            channel, note, velocity);
+            channel, note, velocity, nullptr, matchCount == 1u);
         if (allocatedVoices[allocatedCount] == kInvalidVoice) {
             ++telemetry_.allocationFailures;
             for (uint32_t rollback = 0; rollback < allocatedCount; ++rollback)
@@ -1409,36 +1671,38 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
 
     for (uint32_t mi = 0; mi < matchCount; ++mi) {
         const SFSampleRegion* matchedRegion = matchingRegions[mi];
+        const uint32_t matchedRegionIndex = static_cast<uint32_t>(
+            matchedRegion - soundFontData->regions);
+        const PreparedSF2Region* prepared =
+            preparedRegions && matchedRegionIndex < preparedRegionCount
+                ? &preparedRegions[matchedRegionIndex] : nullptr;
         uint32_t sampleIndex = matchedRegion->sampleIndex;
         const SF2Sample& samp = samplesStore[sampleIndex];
         const VoiceHandle vh = allocatedVoices[mi];
 
-        voiceManager->SetVoiceSoundFontIdentity(
-            vh, static_cast<uint16_t>(presetIndex),
-            static_cast<uint16_t>(matchedRegion - soundFontData->regions));
-        voiceManager->SetVoicePlayIndex(vh, playIndex);
-
-        int effRootKey = (matchedRegion->rootKey >= 0)
-            ? matchedRegion->rootKey : (int)samp.originalPitch;
-        float rootKey = (float)effRootKey;
-        float coarseTune = (float)matchedRegion->coarseTune;
-        float fineTune = (float)matchedRegion->fineTune / 100.0f;
-        float keyTrack = (matchedRegion->scaleTuning != 0)
-            ? (float)matchedRegion->scaleTuning : 100.0f;
-
-        float noteTuneSemitones = coarseTune + fineTune;
-        const float bendScale = keyTrack / 100.0f;
-        const float baseSemitoneOffset =
-            ((float)note + noteTuneSemitones - rootKey) * bendScale;
-        const float basePitchRatio = powf(2.0f, baseSemitoneOffset / 12.0f);
-        const float bendRatio = powf(
+        const float bendScale = prepared ? prepared->bendScale
+            : static_cast<float>(matchedRegion->scaleTuning != 0
+                ? matchedRegion->scaleTuning : 100) / 100.0f;
+        float basePhaseStep;
+        if (prepared) {
+            basePhaseStep = prepared->basePhaseStep[note];
+        } else {
+            const int rootKey = matchedRegion->rootKey >= 0
+                ? matchedRegion->rootKey : static_cast<int>(samp.originalPitch);
+            const float tune = static_cast<float>(matchedRegion->coarseTune) +
+                static_cast<float>(matchedRegion->fineTune) / 100.0f;
+            const float semitones =
+                (static_cast<float>(note) + tune - static_cast<float>(rootKey)) *
+                bendScale;
+            const float sourceRate = static_cast<float>(
+                samp.sampleRate > 0 ? samp.sampleRate : 44100u);
+            const float outputRate = static_cast<float>(
+                sampleRate > 0 ? sampleRate : 44100u);
+            basePhaseStep = sourceRate / outputRate *
+                powf(2.0f, semitones / 12.0f);
+        }
+        const float bendRatio = bendScale == 1.0f ? commonBendRatio : powf(
             2.0f, pitchBendSemitones * bendScale / 12.0f);
-
-        float srcRate = (float)(samp.sampleRate > 0 ? samp.sampleRate : 44100u);
-        float outRate = (float)(sampleRate > 0 ? sampleRate : 44100u);
-        const float rateRatio = (outRate > 0.0f && srcRate > 0.0f)
-            ? srcRate / outRate : 1.0f;
-        float basePhaseStep = rateRatio * basePitchRatio;
         float phaseStep = basePhaseStep * bendRatio;
         // A corrupt SF2 pitch generator must not poison the scalar loop with
         // NaN/Inf phase values: float-to-integer conversion then pins sample
@@ -1453,66 +1717,99 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         uint32_t sLoopEnd = static_cast<uint32_t>(matchedRegion->loopEndOffset);
         uint8_t loopMode = matchedRegion->loopMode;
 
-        voiceManager->SetVoiceSample(vh, sStart, sEnd, sLoopStart, sLoopEnd,
-                                     loopMode, phaseStep, 1);
-        voiceManager->SetVoicePitchBase(vh, basePhaseStep, bendScale);
-
         uint32_t mappedVelocityIndex = static_cast<uint32_t>(
             mappedVelocity * 127.0f + 0.5f);
         if (mappedVelocityIndex < 1u) mappedVelocityIndex = 1u;
         if (mappedVelocityIndex > 127u) mappedVelocityIndex = 127u;
         float velGain = g_velGainLUT[mappedVelocityIndex];
-        float initialGain = velGain;
-
-        if (matchedRegion->initialAttenuation > 0) {
-            float attenDb = matchedRegion->initialAttenuation / 10.0f;
-            initialGain *= InitialAttenuationToGain(attenDb * 10.0f);
-        }
-
-        const float sustainCentibels = (std::max)(0.0f,
-            static_cast<float>(matchedRegion->sustainVolEnv));
-        float sustainLevel = SustainAttenuationToGain(sustainCentibels);
-        if (sustainLevel > 1.0f) sustainLevel = 1.0f;
-
-        const float delaySeconds = TimecentsToSeconds(matchedRegion->delayVolEnv);
-        const float holdSeconds = TimecentsToSeconds(matchedRegion->holdVolEnv);
-        const float attackSeconds = TimecentsToSeconds(matchedRegion->attackVolEnv);
-        const float decaySeconds = TimecentsToSeconds(matchedRegion->decayVolEnv);
-        const float releaseSeconds = TimecentsToSeconds(matchedRegion->releaseVolEnv);
-
-        uint32_t delaySamples = (delaySeconds > 0.0f) ? (uint32_t)(delaySeconds * sr) : 0u;
-        uint32_t holdSamples = (holdSeconds > 0.0f) ? (uint32_t)(holdSeconds * sr) : 0u;
-        uint32_t attackSamples = (attackSeconds > 0.0001f) ? (uint32_t)(attackSeconds * sr) : 0u;
-        uint32_t decaySamples = (decaySeconds > 0.0001f) ? (uint32_t)(decaySeconds * sr) : 0u;
-
-        float attackGainStep = 0.0f;
-        float decaySlope = 1.0f;
-
-        if (attackSamples > 0) {
-            attackGainStep = initialGain / (float)attackSamples;
-        }
-
-        if (decaySamples > 0) {
-            float mysterySlope = -9.226f / (float)decaySamples;
-            decaySlope = expf(mysterySlope);
-            if (sustainLevel > 0.0f && sustainLevel < 1.0f) {
-                decaySamples = (uint32_t)(logf(sustainLevel) / mysterySlope);
+        float initialGain;
+        float sustainLevel;
+        uint32_t delaySamples;
+        uint32_t holdSamples;
+        uint32_t attackSamples;
+        uint32_t decaySamples;
+        float decaySlope;
+        float releaseDecay;
+        uint32_t releaseSamples;
+        float regionPanLeft;
+        float regionPanRight;
+        if (prepared) {
+            initialGain = velGain * prepared->attenuationGain;
+            sustainLevel = prepared->sustainLevel;
+            delaySamples = prepared->delaySamples;
+            holdSamples = prepared->holdSamples;
+            attackSamples = prepared->attackSamples;
+            decaySamples = prepared->decaySamples;
+            decaySlope = prepared->decaySlope;
+            releaseDecay = prepared->releaseDecay;
+            releaseSamples = prepared->releaseSamples;
+            regionPanLeft = prepared->panLeft;
+            regionPanRight = prepared->panRight;
+        } else {
+            initialGain = velGain;
+            if (matchedRegion->initialAttenuation > 0)
+                initialGain *= InitialAttenuationToGain(
+                    static_cast<float>(matchedRegion->initialAttenuation));
+            sustainLevel = SustainAttenuationToGain((std::max)(
+                0.0f, static_cast<float>(matchedRegion->sustainVolEnv)));
+            if (sustainLevel > 1.0f) sustainLevel = 1.0f;
+            const float delaySeconds = TimecentsToSeconds(matchedRegion->delayVolEnv);
+            const float holdSeconds = TimecentsToSeconds(matchedRegion->holdVolEnv);
+            const float attackSeconds = TimecentsToSeconds(matchedRegion->attackVolEnv);
+            const float decaySeconds = TimecentsToSeconds(matchedRegion->decayVolEnv);
+            const float releaseSeconds = TimecentsToSeconds(matchedRegion->releaseVolEnv);
+            delaySamples = delaySeconds > 0.0f
+                ? static_cast<uint32_t>(delaySeconds * sr) : 0u;
+            holdSamples = holdSeconds > 0.0f
+                ? static_cast<uint32_t>(holdSeconds * sr) : 0u;
+            attackSamples = attackSeconds > 0.0001f
+                ? static_cast<uint32_t>(attackSeconds * sr) : 0u;
+            decaySamples = decaySeconds > 0.0001f
+                ? static_cast<uint32_t>(decaySeconds * sr) : 0u;
+            decaySlope = 1.0f;
+            if (decaySamples > 0u) {
+                const float slope = -9.226f / static_cast<float>(decaySamples);
+                decaySlope = expf(slope);
+                if (sustainLevel > 0.0f && sustainLevel < 1.0f)
+                    decaySamples = static_cast<uint32_t>(logf(sustainLevel) / slope);
             }
+            releaseDecay = MakeReleaseDecay(releaseSeconds, sampleRate);
+            releaseSamples = MakeReleaseSamples(releaseSeconds, sampleRate);
+            regionPanLeft = 1.0f;
+            regionPanRight = 1.0f;
+            channelCache->ComputeSoundFontPan(matchedRegion->pan,
+                                              regionPanLeft, regionPanRight);
         }
+        const float attackGainStep = attackSamples > 0u
+            ? initialGain / static_cast<float>(attackSamples) : 0.0f;
 
-        float releaseDecay = MakeReleaseDecay(releaseSeconds, sampleRate);
-        const uint32_t releaseSamples = MakeReleaseSamples(releaseSeconds, sampleRate);
-
-        voiceManager->SetVoiceEnvelope(vh, initialGain, sustainLevel,
-                                        delaySamples, holdSamples, attackSamples,
-                                        decaySamples, attackGainStep, decaySlope, releaseDecay,
-                                        releaseSamples);
-        float regionPanLeft = 1.0f;
-        float regionPanRight = 1.0f;
-        channelCache->ComputeSoundFontPan(matchedRegion->pan,
-                                          regionPanLeft, regionPanRight);
-        voiceManager->SetVoiceGain(vh, regionPanLeft, regionPanRight);
-        voiceManager->RefreshMixGain(vh, channelCache->GetParams()[channel]);
+        VoiceConfiguration setup{};
+        setup.sampleStart = sStart;
+        setup.sampleEnd = sEnd;
+        setup.loopStart = sLoopStart;
+        setup.loopEnd = sLoopEnd;
+        setup.playIndex = playIndex;
+        setup.delaySamples = delaySamples;
+        setup.holdSamples = holdSamples;
+        setup.attackSamples = attackSamples;
+        setup.decaySamples = decaySamples;
+        setup.releaseSamples = releaseSamples;
+        setup.phaseStep = phaseStep;
+        setup.basePhaseStep = basePhaseStep;
+        setup.pitchBendScale = bendScale;
+        setup.initialGain = initialGain;
+        setup.sustainLevel = sustainLevel;
+        setup.attackGainStep = attackGainStep;
+        setup.decaySlope = decaySlope;
+        setup.releaseDecay = releaseDecay;
+        setup.gainLeft = regionPanLeft;
+        setup.gainRight = regionPanRight;
+        setup.presetIndex = static_cast<uint16_t>(presetIndex);
+        setup.regionIndex = static_cast<uint16_t>(matchedRegionIndex);
+        setup.loopMode = loopMode;
+        setup.sampleBacked = 1u;
+        voiceManager->ConfigureVoice(
+            vh, setup, channelCache->GetParams()[channel], matchCount == 1u);
 
         // Sub-sample start position: folded directly into the initial phase
         // (on top of the hash randomization from SetVoiceSample).
@@ -1521,7 +1818,9 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         sf2Telemetry_.lastSample = static_cast<uint16_t>(sampleIndex);
         sf2Telemetry_.lastSampleStart = sStart;
         sf2Telemetry_.lastSampleEnd = sEnd;
-        sf2Telemetry_.lastInitialPeak = sf2_region_initial_peak(soundFontData, matchedRegion);
+        sf2Telemetry_.lastInitialPeak =
+            regionInitialPeaks && matchedRegionIndex < regionInitialPeakCount
+                ? regionInitialPeaks[matchedRegionIndex] : 0.0f;
         sf2Telemetry_.lastVoiceGain = initialGain;
         sf2Telemetry_.lastMixGainL = voiceManager->v.mixGainL[vh];
         sf2Telemetry_.lastMixGainR = voiceManager->v.mixGainR[vh];
@@ -1641,7 +1940,6 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
             ? commonRatio : powf(2.0f, bendSemitones * scale / 12.0f);
         voiceManager->v.phaseIncs[i] = voiceManager->v.basePhaseIncs[i] * ratio;
     }
-    voiceManager->InvalidateStealCandidates();
 }
 
 } // namespace svms
@@ -1932,9 +2230,32 @@ UINT WINAPI DriverSettings(DWORD dwSetting, LPVOID pValue, DWORD dwSize, LPVOID 
     return 1;
 }
 
-DWORD WINAPI GetDriverDebugInfo(LPVOID pMem) {
-    (void)pMem;
-    return 0;
+svms::LegacyDriverDebugInfo* WINAPI GetDriverDebugInfo(void) {
+    if (!g_driver) return nullptr;
+    return const_cast<svms::LegacyDriverDebugInfo*>(
+        g_driver->GetLegacyDebugInfo());
+}
+
+FLOAT WINAPI GetRenderingTime(void) {
+    return g_driver ? g_driver->GetRenderingTimeMilliseconds() : 0.0f;
+}
+
+DWORD WINAPI GetVoiceCount(void) {
+    if (!g_driver) return 0u;
+    svms::SnappyVoiceStatistics statistics;
+    g_driver->CopyVoiceStatistics(statistics);
+    return statistics.activeVoices;
+}
+
+svms::SnappyVoiceStatistics* WINAPI GetVoiceStatistics(
+        svms::SnappyVoiceStatistics* statistics) {
+    if (!statistics) return nullptr;
+    if (g_driver) {
+        g_driver->CopyVoiceStatistics(*statistics);
+    } else {
+        *statistics = svms::SnappyVoiceStatistics{};
+    }
+    return statistics;
 }
 
 DWORD WINAPI SVMSGetDriverDebugInfoV1(LPVOID pMem, DWORD cbMem) {

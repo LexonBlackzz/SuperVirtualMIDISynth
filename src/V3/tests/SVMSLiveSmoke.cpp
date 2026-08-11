@@ -6,6 +6,8 @@
 #include <mmeapi.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propidl.h>
 #include <ksmedia.h>
 
 #include <algorithm>
@@ -21,17 +23,52 @@ static void ReleaseCom(T*& value) {
     if (value) { value->Release(); value = nullptr; }
 }
 
+static HRESULT SelectRenderDevice(IMMDeviceEnumerator* enumerator,
+                                  const wchar_t* requested,
+                                  IMMDevice** selected) {
+    if (!requested || !*requested)
+        return enumerator->GetDefaultAudioEndpoint(eRender, eConsole, selected);
+    IMMDeviceCollection* collection = nullptr;
+    HRESULT hr = enumerator->EnumAudioEndpoints(
+        eRender, DEVICE_STATE_ACTIVE, &collection);
+    if (FAILED(hr) || !collection) return hr;
+    UINT count = 0;
+    collection->GetCount(&count);
+    for (UINT index = 0; index < count && !*selected; ++index) {
+        IMMDevice* candidate = nullptr;
+        IPropertyStore* properties = nullptr;
+        PROPVARIANT friendlyName;
+        PropVariantInit(&friendlyName);
+        if (SUCCEEDED(collection->Item(index, &candidate)) && candidate &&
+            SUCCEEDED(candidate->OpenPropertyStore(STGM_READ, &properties)) &&
+            properties &&
+            SUCCEEDED(properties->GetValue(PKEY_Device_FriendlyName,
+                                           &friendlyName)) &&
+            friendlyName.vt == VT_LPWSTR && friendlyName.pwszVal &&
+            _wcsicmp(friendlyName.pwszVal, requested) == 0) {
+            *selected = candidate;
+            candidate = nullptr;
+        }
+        PropVariantClear(&friendlyName);
+        ReleaseCom(properties);
+        ReleaseCom(candidate);
+    }
+    collection->Release();
+    return *selected ? S_OK : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
 int wmain(int argc, wchar_t** argv) {
-    if (argc < 2 || argc > 4) {
+    if (argc < 2 || argc > 5) {
         std::fwprintf(stderr,
-            L"usage: svms_v3_live_smoke <winmm.dll> [repeat-count] [midi-note]\n");
+            L"usage: svms_v3_live_smoke <winmm.dll> [repeat-count] [midi-note] [output-device]\n");
         return 2;
     }
     const uint32_t repeatCount = argc >= 3
         ? static_cast<uint32_t>(wcstoul(argv[2], nullptr, 10)) : 1u;
     const uint32_t midiNote = argc >= 4
         ? static_cast<uint32_t>(wcstoul(argv[3], nullptr, 10)) : 60u;
-    if (repeatCount == 0 || repeatCount > 4096 || midiNote > 127) return 2;
+    const wchar_t* outputDevice = argc >= 5 ? argv[4] : nullptr;
+    if (repeatCount > 4096 || midiNote > 127) return 2;
 
     std::printf("sizeof_waveformatex=%zu sizeof_extensible=%zu offsets=%zu,%zu,%zu\n",
                 sizeof(WAVEFORMATEX), sizeof(WAVEFORMATEXTENSIBLE),
@@ -64,7 +101,7 @@ int wmain(int argc, wchar_t** argv) {
                           __uuidof(IMMDeviceEnumerator),
                           reinterpret_cast<void**>(&enumerator));
     if (FAILED(hr) || !enumerator) { cleanup(); return 4; }
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    hr = SelectRenderDevice(enumerator, outputDevice, &device);
     if (FAILED(hr) || !device) { cleanup(); return 5; }
     hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                           reinterpret_cast<void**>(&captureClient));
@@ -99,6 +136,7 @@ int wmain(int argc, wchar_t** argv) {
     hr = captureClient->Start();
     if (FAILED(hr)) { cleanup(); return 10; }
 
+    if (outputDevice) SetEnvironmentVariableW(L"SVMS_AUDIO_DEVICE", outputDevice);
     synth = LoadLibraryW(argv[1]);
     if (!synth) {
         std::fprintf(stderr, "LoadLibrary failed: %lu\n", GetLastError());
@@ -109,11 +147,28 @@ int wmain(int argc, wchar_t** argv) {
     using ShortProc = MMRESULT (WINAPI*)(HMIDIOUT, DWORD);
     using CloseProc = MMRESULT (WINAPI*)(HMIDIOUT);
     using DebugProc = DWORD (WINAPI*)(LPVOID, DWORD);
+    using VoiceStatsProc = svms::SnappyVoiceStatistics* (WINAPI*)(
+        svms::SnappyVoiceStatistics*);
+    using VoiceCountProc = DWORD (WINAPI*)();
+    using RenderingTimeProc = FLOAT (WINAPI*)();
+    using LegacyDebugProc = svms::LegacyDriverDebugInfo* (WINAPI*)();
     auto open = reinterpret_cast<OpenProc>(GetProcAddress(synth, "midiOutOpen"));
     auto shortMessage = reinterpret_cast<ShortProc>(GetProcAddress(synth, "midiOutShortMsg"));
     auto close = reinterpret_cast<CloseProc>(GetProcAddress(synth, "midiOutClose"));
     auto debug = reinterpret_cast<DebugProc>(GetProcAddress(synth, "SVMSGetDriverDebugInfoV1"));
-    if (!open || !shortMessage || !close || !debug) { cleanup(); return 12; }
+    auto voiceStats = reinterpret_cast<VoiceStatsProc>(
+        GetProcAddress(synth, "GetVoiceStatistics"));
+    auto voiceCount = reinterpret_cast<VoiceCountProc>(
+        GetProcAddress(synth, "GetVoiceCount"));
+    auto renderingTime = reinterpret_cast<RenderingTimeProc>(
+        GetProcAddress(synth, "GetRenderingTime"));
+    auto legacyDebug = reinterpret_cast<LegacyDebugProc>(
+        GetProcAddress(synth, "GetDriverDebugInfo"));
+    if (!open || !shortMessage || !close || !debug || !voiceStats ||
+        !voiceCount || !renderingTime || !legacyDebug) {
+        cleanup();
+        return 12;
+    }
 
     const MMRESULT openResult = open(&midi, 0, 0, 0, CALLBACK_NULL);
     if (openResult != MMSYSERR_NOERROR) {
@@ -168,6 +223,13 @@ int wmain(int argc, wchar_t** argv) {
 
     svms::DriverDebugInfo debugInfo;
     const DWORD debugBytes = debug(&debugInfo, sizeof(debugInfo));
+    svms::SnappyVoiceStatistics compatibilityStats;
+    const float compatibilityRenderMilliseconds = renderingTime();
+    const bool compatibilityValid =
+        voiceStats(&compatibilityStats) == &compatibilityStats &&
+        voiceCount() == compatibilityStats.activeVoices &&
+        compatibilityStats.activeVoices + compatibilityStats.freeVoices > 0u &&
+        compatibilityRenderMilliseconds > 0.0f && legacyDebug() != nullptr;
     for (uint32_t i = 0; i < repeatCount; ++i) shortMessage(midi, noteOff);
     close(midi);
     midi = nullptr;
@@ -192,6 +254,11 @@ int wmain(int argc, wchar_t** argv) {
                     debugInfo.audioRunning, static_cast<unsigned>(debugInfo.audioHResult),
                     debugInfo.renderPeak);
     }
+    std::printf("ziggy_active=%u free=%u steals=%u render_ms=%.4f valid=%u\n",
+                compatibilityStats.activeVoices, compatibilityStats.freeVoices,
+                compatibilityStats.voiceSteals, compatibilityRenderMilliseconds,
+                compatibilityValid ? 1u : 0u);
     cleanup();
-    return peak > 1.0e-5f ? 0 : 1;
+    // repeat-count 0 is a silent endpoint/initialization probe.
+    return (repeatCount == 0u || peak > 1.0e-5f) && compatibilityValid ? 0 : 1;
 }

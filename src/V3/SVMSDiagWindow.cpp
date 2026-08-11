@@ -16,6 +16,7 @@ struct DiagStats {
     uint32_t bufferFrames;
     float masterVolume;
     bool waveOutFallback;
+    RenderBackend renderBackend;
     uint32_t activeVoices;
     uint32_t maxVoices;
     uint32_t releasingVoices;
@@ -58,7 +59,7 @@ static HMODULE GetCurrentModule() {
 
 static const wchar_t* kWindowClass = L"SVMS V3 Diag";
 static const int kWindowWidth = 540;
-static const int kWindowHeight = 460;
+static const int kWindowHeight = 480;
 static const int kTimerId = 1;
 // Diagnostic-only refresh. Windows timers are scheduler-limited, but 1 ms
 // gives the monitor the fastest practical readout without touching audio.
@@ -113,7 +114,7 @@ static void OnPaint(HWND hwnd) {
     SelectObject(memDC, g_fontTitle);
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, kTextTitle);
-    TextOutW(memDC, kPadX, kPadY, L"SuperVirtualMIDISynth V3", 20);
+    TextOutW(memDC, kPadX, kPadY, L"SuperVirtualMIDISynth V3", 25);
 
     SelectObject(memDC, g_font);
     int y = kPadY + 28;
@@ -157,6 +158,11 @@ static void OnPaint(HWND hwnd) {
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"release=%u sustain=%u steals=%u",
                s.releasingVoices, s.sustainHeldVoices, s.voiceSteals);
     DrawStat(memDC, kPadX, y, L"Voice states:     ", buf);
+    y += kLineH;
+
+    const wchar_t* renderer = s.renderBackend == RenderBackend::AVX2 ? L"AVX2"
+        : s.renderBackend == RenderBackend::SSE2 ? L"SSE2" : L"scalar";
+    DrawStat(memDC, kPadX, y, L"Renderer:         ", renderer);
     y += kLineH;
 
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.1f%%", s.cpuPercent);
@@ -380,7 +386,7 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         bool audioRunning, int32_t audioError,
                         bool soundFontLoaded, uint32_t sampleRate,
                         uint32_t bufferFrames, float masterVolume,
-                        bool waveOutFallback,
+                        bool waveOutFallback, RenderBackend renderBackend,
                         const LiveSF2Telemetry& sf2) {
     if (!g_running.load(std::memory_order_acquire)) return;
     const uint32_t target = 1u - g_publishedStats.load(std::memory_order_relaxed);
@@ -394,6 +400,7 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     stats.bufferFrames = bufferFrames;
     stats.masterVolume = masterVolume;
     stats.waveOutFallback = waveOutFallback;
+    stats.renderBackend = renderBackend;
     stats.activeVoices = activeVoices;
     stats.maxVoices = maxVoices;
     stats.releasingVoices = releasingVoices;

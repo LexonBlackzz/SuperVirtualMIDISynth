@@ -160,6 +160,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"schema_version", kConfigSchemaVersion},
         {"audio", {
             {"backend", backend},
+            {"device", WideToUtf8(cfg.audioDevice)},
             {"sample_rate", cfg.sampleRate},
             {"buffer_frames", cfg.bufferFrames}
         }},
@@ -301,6 +302,11 @@ void AppendWarning(std::string& warning, const char* field) {
 
 void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("audio"); it != root.end() && it->is_object()) {
+        auto device = it->find("device");
+        if (device != it->end()) {
+            if (device->is_string()) cfg.audioDevice = Utf8ToWide(device->get<std::string>());
+            else AppendWarning(cfg.configWarning, "audio.device");
+        }
         auto backend = it->find("backend");
         if (backend != it->end()) {
             if (!backend->is_string()) {
@@ -406,6 +412,12 @@ bool EnvironmentFlag(const wchar_t* name, bool current) {
 }
 
 void ApplyEnvironment(EngineConfig& cfg) {
+    wchar_t audioDevice[1024]{};
+    const DWORD audioDeviceLength = GetEnvironmentVariableW(
+        L"SVMS_AUDIO_DEVICE", audioDevice,
+        static_cast<DWORD>(_countof(audioDevice)));
+    if (audioDeviceLength > 0u && audioDeviceLength < _countof(audioDevice))
+        cfg.audioDevice.assign(audioDevice, audioDeviceLength);
     if (EnvironmentFlag(L"SVMS_NO_DROP_EVENTS", false))
         cfg.eventOverflowMode = EventOverflowMode::LosslessBackpressure;
     cfg.correctnessMode = EnvironmentFlag(L"SVMS_CORRECTNESS_MODE", cfg.correctnessMode);
@@ -460,6 +472,7 @@ EngineConfig EngineConfig::Default() {
     cfg.diagnosticsWindow = false;
 #endif
     cfg.diagnosticsDebugOutput = false;
+    cfg.audioDevice.clear();
     cfg.soundFontPath.clear();
     return cfg;
 }

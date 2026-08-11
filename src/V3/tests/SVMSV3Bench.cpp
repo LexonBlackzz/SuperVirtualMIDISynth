@@ -1,5 +1,6 @@
 #include <cmath>
 #include "SVMSRenderScalar.h"
+#include "SVMSSoundFont.h"
 
 #include <windows.h>
 #include <avrt.h>
@@ -14,7 +15,9 @@
 
 namespace {
 
-enum class Workload { Sustained, Envelope, Release, Steal, Dense, MixedEvents };
+enum class Workload {
+    Sustained, Envelope, Release, Steal, Dense, MixedEvents, NoteBurst
+};
 
 const char* WorkloadName(Workload workload) {
     switch (workload) {
@@ -24,6 +27,7 @@ const char* WorkloadName(Workload workload) {
         case Workload::Steal: return "steal";
         case Workload::Dense: return "dense";
         case Workload::MixedEvents: return "mixed-events";
+        case Workload::NoteBurst: return "note-burst";
     }
     return "unknown";
 }
@@ -35,11 +39,18 @@ bool ParseWorkload(const char* value, Workload& result) {
     else if (std::strcmp(value, "steal") == 0) result = Workload::Steal;
     else if (std::strcmp(value, "dense") == 0) result = Workload::Dense;
     else if (std::strcmp(value, "mixed-events") == 0) result = Workload::MixedEvents;
+    else if (std::strcmp(value, "note-burst") == 0) result = Workload::NoteBurst;
     else return false;
     return true;
 }
 
 void NoopDispatch(const svms::RenderEvent&, uint32_t, void*) {}
+
+bool gCollectBreakdown = false;
+uint64_t gRenderCycles = 0u;
+uint64_t gDispatchCycles = 0u;
+uint64_t gStealCycles = 0u;
+uint64_t gMatchedRegions = 0u;
 
 double Percentile(std::vector<double> values, double percentile) {
     if (values.empty()) return 0.0;
@@ -56,9 +67,32 @@ struct Options {
     Workload workload = Workload::Sustained;
     bool enforce = false;
     bool reference = false;
+    bool breakdown = false;
     uint32_t eventStride = 1;
+    uint32_t noteRate = 64000;
+    uint32_t keyCount = 128;
+    uint32_t attackFrames = 0;
+    std::string soundFontPath;
     uint32_t pinCore = UINT32_MAX;
+    bool automaticBackend = true;
+    svms::RenderBackend backend = svms::RenderBackend::Scalar;
 };
+
+bool ParseBackend(const char* value, Options& options) {
+    if (std::strcmp(value, "auto") == 0) {
+        options.automaticBackend = true;
+        return true;
+    }
+    options.automaticBackend = false;
+    if (std::strcmp(value, "scalar") == 0)
+        options.backend = svms::RenderBackend::Scalar;
+    else if (std::strcmp(value, "sse2") == 0)
+        options.backend = svms::RenderBackend::SSE2;
+    else if (std::strcmp(value, "avx2") == 0)
+        options.backend = svms::RenderBackend::AVX2;
+    else return false;
+    return true;
+}
 
 bool ParseOptions(int argc, char** argv, Options& options) {
     for (int i = 1; i < argc; ++i) {
@@ -80,13 +114,28 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         } else if (std::strcmp(argv[i], "--event-stride") == 0) {
             if (!nextNumber(options.eventStride) || options.eventStride == 0u)
                 return false;
+        } else if (std::strcmp(argv[i], "--note-rate") == 0) {
+            if (!nextNumber(options.noteRate) || options.noteRate == 0u)
+                return false;
+        } else if (std::strcmp(argv[i], "--key-count") == 0) {
+            if (!nextNumber(options.keyCount) || options.keyCount == 0u ||
+                options.keyCount > 128u) return false;
+        } else if (std::strcmp(argv[i], "--attack-frames") == 0) {
+            if (!nextNumber(options.attackFrames)) return false;
+        } else if (std::strcmp(argv[i], "--soundfont") == 0) {
+            if (i + 1 >= argc) return false;
+            options.soundFontPath = argv[++i];
         } else if (std::strcmp(argv[i], "--pin-core") == 0) {
             if (!nextNumber(options.pinCore) || options.pinCore >= 64u)
                 return false;
+        } else if (std::strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 >= argc || !ParseBackend(argv[++i], options)) return false;
         } else if (std::strcmp(argv[i], "--enforce") == 0) {
             options.enforce = true;
         } else if (std::strcmp(argv[i], "--reference") == 0) {
             options.reference = true;
+        } else if (std::strcmp(argv[i], "--breakdown") == 0) {
+            options.breakdown = true;
         } else if (std::strcmp(argv[i], "--quick") == 0) {
             options.seconds = 1;
             options.warmupSeconds = 1;
@@ -138,24 +187,40 @@ void ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
 }
 
 void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channels,
-                   uint32_t& sequence, uint32_t count, uint32_t sampleFrames) {
+                   uint32_t& sequence, uint32_t count, uint32_t sampleFrames,
+                   const svms::RenderEvent* sourceEvent = nullptr,
+                   uint32_t attackFrames = 0u) {
     constexpr uint32_t regionFrames = 2048;
     const uint32_t regionCount = sampleFrames / regionFrames;
     for (uint32_t i = 0; i < count; ++i, ++sequence) {
-        const uint8_t channel = static_cast<uint8_t>(sequence & 15u);
-        const uint8_t note = static_cast<uint8_t>(24u + sequence % 88u);
-        const uint8_t velocity = static_cast<uint8_t>(64u + sequence % 64u);
+        const uint8_t channel = sourceEvent ? sourceEvent->channel
+            : static_cast<uint8_t>(sequence & 15u);
+        const uint8_t note = sourceEvent ? sourceEvent->data1
+            : static_cast<uint8_t>(24u + sequence % 88u);
+        const uint8_t velocity = sourceEvent ? sourceEvent->data2
+            : static_cast<uint8_t>(64u + sequence % 64u);
         const svms::VoiceHandle handle = voices.AllocateVoiceOrSteal(
-            channel, note, velocity);
+            channel, note, velocity, nullptr, true);
         if (handle == svms::kInvalidVoice) continue;
         const uint32_t start = (sequence % regionCount) * regionFrames;
-        voices.SetVoiceSample(handle, start, start + regionFrames,
-                              start + 16u, start + regionFrames - 16u, 1u,
-                              0.5f + static_cast<float>(sequence % 97u) / 64.0f, 1u);
-        voices.SetVoiceEnvelope(handle, 1.0f, 0.7f, 0u, 0u, 0u, 0u,
-                                0.0f, 1.0f, 0.9999999f);
-        voices.SetVoiceGain(handle, 0.001f, 0.001f);
-        voices.RefreshMixGain(handle, channels.GetParams()[channel]);
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = start;
+        setup.sampleEnd = start + regionFrames;
+        setup.loopStart = start + 16u;
+        setup.loopEnd = start + regionFrames - 16u;
+        setup.loopMode = 1u;
+        setup.phaseStep = 0.5f +
+            static_cast<float>(sequence % 97u) / 64.0f;
+        setup.basePhaseStep = setup.phaseStep;
+        setup.initialGain = 1.0f;
+        setup.attackSamples = attackFrames;
+        setup.attackGainStep = attackFrames > 0u
+            ? setup.initialGain / static_cast<float>(attackFrames) : 0.0f;
+        setup.sustainLevel = 0.7f;
+        setup.releaseDecay = 0.9999999f;
+        setup.gainLeft = 0.001f;
+        setup.gainRight = 0.001f;
+        voices.ConfigureVoice(handle, setup, channels.GetParams()[channel], true);
     }
 }
 
@@ -165,17 +230,41 @@ struct MixedDispatchContext {
     const svms::RuntimeConfigSnapshot* config;
     uint32_t sampleFrames;
     uint32_t sequence;
+    const svms::SF2Data* soundFont;
+    uint32_t presetIndex;
+    uint32_t attackFrames;
 };
 
 void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
+    const uint64_t dispatchBegin = gCollectBreakdown ? __rdtsc() : 0u;
     auto* context = static_cast<MixedDispatchContext*>(userData);
     auto& voices = *context->voices;
     auto& channels = *context->channels;
     switch (event.type) {
-        case svms::RenderEventType::NoteOn:
-            PerformSteals(voices, channels, context->sequence, 1u,
-                          context->sampleFrames);
+        case svms::RenderEventType::NoteOn: {
+            uint32_t layerCount = 1u;
+            if (context->soundFont) {
+                const svms::SFSampleRegion* regions[512]{};
+                layerCount = svms::sf2_find_regions(
+                    context->soundFont, context->presetIndex, event.data1,
+                    event.data2, regions, 512u);
+                gMatchedRegions += layerCount;
+                if (layerCount == 0u) break;
+            }
+            if (gCollectBreakdown) {
+                const uint64_t begin = __rdtsc();
+                PerformSteals(voices, channels, context->sequence, layerCount,
+                              context->sampleFrames, &event,
+                              context->attackFrames);
+                const uint64_t end = __rdtsc();
+                gStealCycles += end - begin;
+                break;
+            }
+            PerformSteals(voices, channels, context->sequence, layerCount,
+                          context->sampleFrames, &event,
+                          context->attackFrames);
             break;
+        }
         case svms::RenderEventType::NoteOff: {
             const uint32_t count = voices.GetChannelActiveCount(event.channel);
             const uint32_t* handles = voices.GetChannelActiveList(event.channel);
@@ -201,11 +290,14 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
                 voices.v.phaseIncs[handle] =
                     voices.v.basePhaseIncs[handle] * ratio;
             }
-            voices.InvalidateStealCandidates();
             break;
         }
         default:
             break;
+    }
+    if (gCollectBreakdown) {
+        const uint64_t dispatchEnd = __rdtsc();
+        gDispatchCycles += dispatchEnd - dispatchBegin;
     }
 }
 
@@ -216,8 +308,10 @@ int main(int argc, char** argv) {
     if (!ParseOptions(argc, argv, options)) {
         std::fprintf(stderr,
             "usage: svms_v3_bench [--voices 1..4096] [--frames 16..8192] "
-            "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events] "
-            "[--event-stride N] "
+            "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst] "
+            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--attack-frames N] [--soundfont PATH] "
+            "[--backend auto|scalar|sse2|avx2] "
+            "[--breakdown] "
             "[--pin-core 0..63] "
             "[--quick] [--reference] [--enforce]\n");
         return 1;
@@ -248,23 +342,56 @@ int main(int argc, char** argv) {
     svms::ChannelCache channels;
     ConfigureVoices(*voices, channels, cfg, options.voices, options.workload, sampleFrames);
     auto renderer = std::make_unique<svms::RenderScalar>();
+    if (!options.automaticBackend && !renderer->SetRenderBackend(options.backend)) {
+        std::fprintf(stderr, "requested render backend is not supported by this CPU/build\n");
+        return 3;
+    }
 
     std::vector<svms::RenderEvent> events;
+    std::unique_ptr<svms::SF2Data> soundFont;
+    uint32_t soundFontPreset = UINT32_MAX;
+    if (!options.soundFontPath.empty()) {
+        soundFont = std::make_unique<svms::SF2Data>();
+        if (!svms::sf2_load(options.soundFontPath.c_str(), soundFont.get())) {
+            std::fprintf(stderr, "failed to load benchmark SoundFont: %s\n",
+                         options.soundFontPath.c_str());
+            return 4;
+        }
+        svms::sf2_build_regions(soundFont.get());
+        if (!svms::sf2_resolve_preset(soundFont.get(), 0u, 0u, false,
+                                      &soundFontPreset)) {
+            std::fprintf(stderr, "benchmark SoundFont has no bank 0 program 0\n");
+            return 4;
+        }
+    }
     MixedDispatchContext mixedContext{
-        voices.get(), &channels, &cfg, sampleFrames, options.voices};
+        voices.get(), &channels, &cfg, sampleFrames, options.voices,
+        soundFont.get(), soundFontPreset, options.attackFrames};
     if (options.workload == Workload::Dense ||
-        options.workload == Workload::MixedEvents) {
-        const uint32_t eventCount =
-            (options.frames + options.eventStride - 1u) / options.eventStride;
+        options.workload == Workload::MixedEvents ||
+        options.workload == Workload::NoteBurst) {
+        const uint32_t eventCount = options.workload == Workload::NoteBurst
+            ? static_cast<uint32_t>((static_cast<uint64_t>(options.noteRate) *
+                                     options.frames + 44099u) / 44100u)
+            : (options.frames + options.eventStride - 1u) / options.eventStride;
         events.resize(eventCount);
         for (uint32_t index = 0; index < eventCount; ++index) {
-            const uint32_t frame = index * options.eventStride;
+            const uint32_t frame = options.workload == Workload::NoteBurst
+                ? static_cast<uint32_t>(static_cast<uint64_t>(index) *
+                                        options.frames / eventCount)
+                : index * options.eventStride;
             auto& event = events[index];
             event.frameOffset = frame;
             event.ingressSequence = index;
             event.channel = static_cast<uint8_t>(index & 15u);
             if (options.workload == Workload::Dense) {
                 event.type = svms::RenderEventType::ControlChange;
+                continue;
+            }
+            if (options.workload == Workload::NoteBurst) {
+                event.type = svms::RenderEventType::NoteOn;
+                event.data1 = static_cast<uint8_t>(index % options.keyCount);
+                event.data2 = 127u;
                 continue;
             }
             switch (index % 6u) {
@@ -319,6 +446,7 @@ int main(int argc, char** argv) {
             PerformSteals(*voices, channels, stealSequence, 16u, sampleFrames);
         std::fill(left.begin(), left.end(), 0.0f);
         std::fill(right.begin(), right.end(), 0.0f);
+        const uint64_t renderBegin = gCollectBreakdown ? __rdtsc() : 0u;
         if (options.reference) {
             renderer->RenderBlockReference(
                 *voices, channels, samples.data(), sampleFrames,
@@ -331,10 +459,17 @@ int main(int argc, char** argv) {
                                   events.empty() ? nullptr : events.data(),
                                   static_cast<uint32_t>(events.size()), true, absoluteFrame);
         }
+        if (gCollectBreakdown) {
+            const uint64_t renderEnd = __rdtsc();
+            gRenderCycles += renderEnd - renderBegin;
+        }
         absoluteFrame += options.frames;
     };
 
     for (uint32_t i = 0; i < warmupCallbacks; ++i) renderOne();
+
+    gRenderCycles = gDispatchCycles = gStealCycles = gMatchedRegions = 0u;
+    gCollectBreakdown = options.breakdown;
 
     std::vector<double> callbackPercent;
     callbackPercent.reserve(measuredCallbacks);
@@ -389,23 +524,33 @@ int main(int argc, char** argv) {
     }
 
     std::printf(
-        "{\"renderer\":\"%s\",\"workload\":\"%s\",\"voices\":%u,\"frames\":%u,"
-        "\"callbacks\":%u,\"event_stride\":%u,\"pinned_core\":%d,"
+        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"workload\":\"%s\",\"voices\":%u,\"frames\":%u,"
+        "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,"
+        "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
         "\"voice_samples_per_second\":%.0f,"
         "\"cycles_per_voice_sample\":%.3f,\"events_per_second\":%.0f,"
-        "\"steals_per_second\":%.0f,\"max_consecutive_overruns\":%u,"
+        "\"steals_per_second\":%.0f,\"matched_regions\":%llu,\"max_consecutive_overruns\":%u,"
+        "\"cycle_breakdown\":{\"render\":%llu,\"dispatch_excluding_steal\":%llu,\"steal\":%llu},"
         "\"render_classes\":{\"sustained_loop\":%u,\"sustained_one_shot\":%u,"
         "\"transient_loop\":%u,\"release_loop\":%u,\"release_one_shot\":%u,"
         "\"generic\":%u,\"steal_tails\":%u},"
         "\"callback_percent\":{\"p50\":%.2f,\"p95\":%.2f,"
         "\"p99\":%.2f,\"p99_9\":%.2f,\"max\":%.2f}}\n",
-        options.reference ? "reference" : "span", WorkloadName(options.workload),
+        options.reference ? "reference" : "span", renderer->GetRenderBackendName(),
+        WorkloadName(options.workload),
         options.voices, options.frames,
-        measuredCallbacks, options.eventStride,
+        measuredCallbacks, options.eventStride, options.noteRate, options.keyCount,
+        options.attackFrames,
+        soundFont ? soundFont->regionCount : 0u,
+        soundFont ? soundFont->presetRegionCount[soundFontPreset] : 0u,
         options.pinCore == UINT32_MAX ? -1 : static_cast<int>(options.pinCore),
         voiceSamplesPerSecond,
         cyclesPerVoiceSample, eventsPerSecond, stealsPerSecond,
-        maximumConsecutiveOverruns,
+        static_cast<unsigned long long>(gMatchedRegions), maximumConsecutiveOverruns,
+        static_cast<unsigned long long>(gRenderCycles),
+        static_cast<unsigned long long>(gDispatchCycles -
+            (std::min)(gDispatchCycles, gStealCycles)),
+        static_cast<unsigned long long>(gStealCycles),
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedLoop)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedOneShot)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::TransientLoop)],
@@ -416,12 +561,12 @@ int main(int argc, char** argv) {
 
     int result = 0;
     if (options.enforce && options.voices == 4096u) {
-        const bool denseTarget = options.workload == Workload::Dense ||
-                                 options.workload == Workload::MixedEvents;
-        const double limit = (options.workload == Workload::Sustained || denseTarget)
-            ? 60.0 : 70.0;
+        const double limit = options.workload == Workload::MixedEvents ? 35.0
+            : options.workload == Workload::Dense ? 25.0
+            : options.workload == Workload::Sustained ? 60.0 : 70.0;
         if (p99 >= limit) result = 2;
     }
     if (mmcss != nullptr) AvRevertMmThreadCharacteristics(mmcss);
+    if (soundFont) svms::sf2_free(soundFont.get());
     return result;
 }

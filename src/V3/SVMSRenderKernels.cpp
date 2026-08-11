@@ -236,6 +236,8 @@ const RenderKernelSet& GetScalarRenderKernelSet() {
         RenderKernelSet result{};
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::SustainedLoop)] =
             RenderSustainedLoopClassKernel;
+        result.backend = RenderBackend::Scalar;
+        result.name = "scalar";
         return result;
     }();
     return kernelSet;

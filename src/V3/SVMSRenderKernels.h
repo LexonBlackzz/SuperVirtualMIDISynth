@@ -15,17 +15,26 @@ struct RenderSpanContext {
     float* outputRight;
     uint32_t frameStart;
     uint32_t frameCount;
+    uint32_t voiceCapacity;
 };
 
 using RenderClassKernel = void(*)(const RenderSpanContext& context,
                                   const uint32_t* handles,
                                   uint32_t handleCount);
-
 struct RenderKernelSet {
     RenderClassKernel kernels[kVoiceRenderClassCount];
+    RenderBackend backend;
+    const char* name;
 };
 
 const RenderKernelSet& GetScalarRenderKernelSet();
+const RenderKernelSet& GetSSE2RenderKernelSet();
+#if !defined(SVMS_XP_COMPAT)
+const RenderKernelSet& GetAVX2RenderKernelSet();
+#endif
+const RenderKernelSet& SelectBestRenderKernelSet();
+const RenderKernelSet* SelectRenderKernelSet(RenderBackend backend);
+bool IsRenderBackendSupported(RenderBackend backend);
 
 uint32_t ScalarRenderSustainedLoop(
     VoiceSoA& voices, uint32_t handle, const float* sampleData,

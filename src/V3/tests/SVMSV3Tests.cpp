@@ -193,6 +193,22 @@ void TestShippedGmSoundFontSmoke() {
     if (!data->loaded) return;
     svms::sf2_build_regions(data.get());
 
+    uint32_t indexedRegionTotal = 0u;
+    for (uint32_t preset = 0; preset < data->presetCount; ++preset) {
+        const uint32_t begin = data->presetRegionStart[preset];
+        const uint32_t end = begin + data->presetRegionCount[preset];
+        Check(end <= data->regionCount,
+              "shipped SF2 preset region index stays in bounds");
+        for (uint32_t region = begin; region < end && region < data->regionCount;
+             ++region) {
+            Check(data->regions[region].presetIndex == preset,
+                  "shipped SF2 preset region index contains only its preset");
+        }
+        indexedRegionTotal += data->presetRegionCount[preset];
+    }
+    Check(indexedRegionTotal == data->regionCount,
+          "shipped SF2 preset region index covers every compiled region");
+
     uint32_t pianoPreset = UINT32_MAX;
     Check(svms::sf2_resolve_preset(data.get(), 0, 0, false, &pianoPreset),
           "shipped gm.sf2 resolves acoustic piano preset zero");
@@ -497,8 +513,8 @@ void TestPriorityAwareStealingAndFadeTail() {
         const svms::VoiceHandle replacement =
             voices->AllocateVoiceOrSteal(0, 67, 100, &stolen);
         const uint32_t fadeFrames = voices->v.stealTailFramesTotal[replacement];
-        Check(stolen && fadeFrames == 441,
-              "44.1 kHz stealing captures a 10 ms outgoing tail");
+        Check(stolen && fadeFrames == svms::kStealFadeFrames,
+              "stealing captures the fixed 64-frame outgoing tail");
         Check(voices->v.stealFadeInFramesTotal[replacement] == 0,
               "replacement attack is not blurred by the outgoing tail fade");
 
@@ -519,7 +535,7 @@ void TestPriorityAwareStealingAndFadeTail() {
               "stolen tail begins continuously at the victim's current amplitude");
         Check(left[fadeFrames / 2] > 0.45f && left[fadeFrames / 2] < 0.55f,
               "stolen tail ramps linearly instead of being hard-cut");
-        Check(left.back() > 0.0f && left.back() < 0.01f,
+        Check(std::fabs(left.back()) <= 1.0e-7f,
               "stolen tail reaches silence at the end of its fade");
         Check(voices->v.stealTailFramesRemaining[replacement] == 0,
               "stolen tail retires without consuming a voice slot");
@@ -589,6 +605,108 @@ void TestExactStealHeapAndVoiceIndices() {
         indexedVoices += voices->GetChannelActiveCount(static_cast<uint8_t>(channel));
     Check(indexedVoices == voices->activeCount_,
           "channel indices remain complete after retirement");
+}
+
+void TestPersistentStealIndexAgainstOracle() {
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    auto voices = std::make_unique<svms::VoiceManager>();
+    voices->Initialize(128, 44100);
+    for (uint32_t i = 0; i < 128u; ++i) {
+        voices->SetCurrentFrame(i * 53u);
+        const svms::VoiceHandle h = voices->AllocateVoice(
+            static_cast<uint8_t>(i & 15u), static_cast<uint8_t>(24u + i % 88u),
+            static_cast<uint8_t>(1u + i % 127u));
+        voices->SetVoiceSample(h, 0, 512, 8, 504, 1, 0.75f, 1);
+        voices->SetVoiceEnvelope(h, 1.0f, 1.0f, 0, 0, 0, 0,
+                                 0.0f, 1.0f, 0.9999f);
+        voices->SetVoiceGain(h, 0.5f, 0.5f);
+        voices->RefreshMixGain(h, channels.GetParams()[i & 15u]);
+    }
+
+    uint64_t frame = 9000u;
+    for (uint32_t iteration = 0; iteration < 512u; ++iteration) {
+        frame += (iteration == 256u) ? 441000u : 37u;
+        voices->SetCurrentFrame(frame);
+        if ((iteration % 7u) == 0u) {
+            const uint32_t h = voices->activeList_[(iteration * 17u) % voices->activeCount_];
+            voices->StartRelease(static_cast<svms::VoiceHandle>(h));
+        }
+        if ((iteration % 11u) == 0u) {
+            const uint8_t channel = static_cast<uint8_t>(iteration & 15u);
+            channels.ControlChange(channel, 11u,
+                static_cast<uint8_t>(32u + iteration % 96u));
+            channels.RebuildCache(cfg, 44100.0f);
+            voices->RefreshMixGainsForChannel(channel,
+                channels.GetParams()[channel]);
+        }
+        const svms::VoiceHandle expected =
+            voices->FindStealVictimExhaustiveForTest();
+        bool stolen = false;
+        const svms::VoiceHandle actual = voices->AllocateVoiceOrSteal(
+            static_cast<uint8_t>(iteration & 15u),
+            static_cast<uint8_t>(36u + iteration % 72u),
+            static_cast<uint8_t>(64u + iteration % 64u), &stolen);
+        Check(stolen && actual == expected,
+              "persistent steal index matches exhaustive victim selection");
+        voices->SetVoiceSample(actual, 0, 512, 8, 504, 1, 0.75f, 1);
+        voices->SetVoiceEnvelope(actual, 1.0f, 1.0f, 0, 0, 0, 0,
+                                 0.0f, 1.0f, 0.9999f);
+        voices->SetVoiceGain(actual, 0.5f, 0.5f);
+        voices->RefreshMixGain(actual,
+            channels.GetParams()[iteration & 15u]);
+    }
+
+    // Dense piano attacks used to live in the exact fallback list and force
+    // a complete pool scan for every equal-frame layer. Verify that the
+    // per-frame volatile heap retains the exhaustive oracle's victim and tie
+    // decisions both within a frame and after envelope time advances.
+    auto attacks = std::make_unique<svms::VoiceManager>();
+    attacks->Initialize(64u, 44100u);
+    for (uint32_t i = 0; i < 64u; ++i) {
+        const svms::VoiceHandle handle = attacks->AllocateVoice(
+            static_cast<uint8_t>(i & 15u), static_cast<uint8_t>(36u + i),
+            static_cast<uint8_t>(96u + i % 32u));
+        svms::VoiceConfiguration setup{};
+        setup.sampleEnd = 512u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 504u;
+        setup.loopMode = 1u;
+        setup.initialGain = 0.8f;
+        setup.attackSamples = 2048u;
+        setup.attackGainStep = setup.initialGain / 2048.0f;
+        setup.gainLeft = setup.gainRight = 0.5f;
+        attacks->ConfigureVoice(handle, setup,
+            channels.GetParams()[i & 15u], false);
+    }
+    uint64_t attackFrame = 12000u;
+    for (uint32_t iteration = 0; iteration < 512u; ++iteration) {
+        if ((iteration & 31u) == 0u) ++attackFrame;
+        attacks->SetCurrentFrame(attackFrame);
+        const svms::VoiceHandle expected =
+            attacks->FindStealVictimExhaustiveForTest();
+        const uint8_t channel = static_cast<uint8_t>(iteration & 15u);
+        const svms::VoiceHandle actual = attacks->AllocateVoiceOrSteal(
+            channel, static_cast<uint8_t>(24u + iteration % 96u),
+            static_cast<uint8_t>(96u + iteration % 32u), nullptr, true);
+        Check(actual == expected,
+              "per-frame transient steal heap matches exhaustive victim selection");
+        svms::VoiceConfiguration setup{};
+        setup.sampleEnd = 512u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 504u;
+        setup.loopMode = 1u;
+        setup.initialGain = 0.8f;
+        setup.attackSamples = 2048u;
+        setup.attackGainStep = setup.initialGain / 2048.0f;
+        setup.gainLeft = setup.gainRight = 0.5f;
+        attacks->ConfigureVoice(actual, setup,
+            channels.GetParams()[channel], true);
+    }
 }
 
 void TestChannelTerminationControllers() {
@@ -938,13 +1056,15 @@ void TestJsonConfigurationLifecycle() {
 
     {
         std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
-        output << R"({"schema_version":1,"audio":{"sample_rate":1,"buffer_frames":256},"synth":{"max_voices":64},"unknown":{"preserve_me":true}})";
+        output << R"json({"schema_version":1,"audio":{"device":"Playback 1/2 (E4x4 Pre)","sample_rate":1,"buffer_frames":256},"synth":{"max_voices":64},"unknown":{"preserve_me":true}})json";
     }
     svms::EngineConfig invalidField = svms::EngineConfig::Load();
     Check(invalidField.sampleRate == 44100,
           "invalid JSON field retains its compiled default");
     Check(invalidField.bufferFrames == 256 && invalidField.maxVoices == 64,
           "valid JSON fields still apply beside an invalid field");
+    Check(invalidField.audioDevice == L"Playback 1/2 (E4x4 Pre)",
+          "configured WASAPI endpoint friendly name is preserved");
     Check(!invalidField.configWarning.empty(), "invalid JSON field publishes warning");
 
     {
@@ -999,11 +1119,14 @@ void TestJsonConfigurationLifecycle() {
     SetEnvironmentVariableW(L"SVMS_NO_DROP_EVENTS", L"1");
     SetEnvironmentVariableW(L"SVMS_CORRECTNESS_MODE", L"0");
     SetEnvironmentVariableW(L"SVMS_DIAGNOSTICS", L"1");
+    SetEnvironmentVariableW(L"SVMS_AUDIO_DEVICE", L"Test Render Endpoint");
     svms::EngineConfig environment = svms::EngineConfig::Load();
     Check(environment.eventOverflowMode == svms::EventOverflowMode::LosslessBackpressure,
           "lossless compatibility environment override has final precedence");
     Check(!environment.correctnessMode && environment.diagnosticsEnabled,
           "correctness and diagnostics environment overrides have final precedence");
+    Check(environment.audioDevice == L"Test Render Endpoint",
+          "audio endpoint environment override has final precedence");
 
     const fs::path portableDirectory = directory / L"portable demo";
     const fs::path portableConfig = portableDirectory / L"config.json";
@@ -1052,6 +1175,7 @@ void TestJsonConfigurationLifecycle() {
     SetEnvironmentVariableW(L"SVMS_NO_DROP_EVENTS", nullptr);
     SetEnvironmentVariableW(L"SVMS_CORRECTNESS_MODE", nullptr);
     SetEnvironmentVariableW(L"SVMS_DIAGNOSTICS", nullptr);
+    SetEnvironmentVariableW(L"SVMS_AUDIO_DEVICE", nullptr);
     SetEnvironmentVariableW(L"SVMS_TEST_CONFIG_PATH", nullptr);
     SetEnvironmentVariableW(L"SVMS_TEST_LOCAL_CONFIG_PATH", nullptr);
     SetEnvironmentVariableW(L"SVMS_TEST_SOUNDFONT_DIRECTORY", nullptr);
@@ -1349,6 +1473,62 @@ void TestSpanRendererDifferential() {
     }
 }
 
+void TestRenderBackendSelectionAndDenseEquivalence() {
+    constexpr uint32_t voiceCount = 32u;
+    constexpr uint32_t frames = 4u;
+    std::vector<float> samples(2048);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = std::sin(static_cast<float>(i) * 0.021f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    auto seed = std::make_unique<svms::VoiceManager>();
+    seed->Initialize(voiceCount, 44100);
+    for (uint32_t i = 0; i < voiceCount; ++i) {
+        const svms::VoiceHandle h = seed->AllocateVoice(0, 60, 100);
+        seed->SetVoiceSample(h, 0, 2048, 16, 2032, 1,
+                             0.5f + static_cast<float>(i) * 0.01f, 1);
+        seed->SetVoiceEnvelope(h, 1.0f, 1.0f, 0, 0, 0, 0,
+                               0.0f, 1.0f, 0.9999f);
+        seed->SetVoiceGain(h, 0.01f, 0.01f);
+        seed->RefreshMixGain(h, channels.GetParams()[0]);
+    }
+
+    const svms::RenderBackend backends[] = {
+        svms::RenderBackend::SSE2, svms::RenderBackend::AVX2};
+    for (svms::RenderBackend backend : backends) {
+        if (!svms::IsRenderBackendSupported(backend)) continue;
+        auto scalarVoices = std::make_unique<svms::VoiceManager>(*seed);
+        auto acceleratedVoices = std::make_unique<svms::VoiceManager>(*seed);
+        svms::RenderScalar scalar;
+        svms::RenderScalar accelerated;
+        Check(scalar.SetRenderBackend(svms::RenderBackend::Scalar) &&
+                  accelerated.SetRenderBackend(backend),
+              "supported render backend can be selected explicitly");
+        float scalarLeft[frames]{}, scalarRight[frames]{};
+        float acceleratedLeft[frames]{}, acceleratedRight[frames]{};
+        scalar.RenderBlock(*scalarVoices, channels, samples.data(),
+            static_cast<uint32_t>(samples.size()), scalarLeft, scalarRight,
+            frames, cfg, nullptr, 0, true, 1000u);
+        accelerated.RenderBlock(*acceleratedVoices, channels, samples.data(),
+            static_cast<uint32_t>(samples.size()), acceleratedLeft,
+            acceleratedRight, frames, cfg, nullptr, 0, true, 1000u);
+        for (uint32_t frame = 0; frame < frames; ++frame) {
+            Check(NearlyEqual(scalarLeft[frame], acceleratedLeft[frame], 2.0e-5f) &&
+                      NearlyEqual(scalarRight[frame], acceleratedRight[frame], 2.0e-5f),
+                  "accelerated dense kernel matches scalar audio");
+        }
+        for (uint32_t h = 0; h < voiceCount; ++h)
+            Check(NearlyEqual(scalarVoices->v.phases[h],
+                              acceleratedVoices->v.phases[h], 1.0e-5f),
+                  "accelerated dense kernel preserves phase state");
+    }
+}
+
 void TestRenderCallbackPurity() {
     constexpr uint32_t frames = 512;
     constexpr uint32_t voiceCount = 256;
@@ -1417,6 +1597,7 @@ int main() {
     TestVoiceIdentityAndStealing();
     TestPriorityAwareStealingAndFadeTail();
     TestExactStealHeapAndVoiceIndices();
+    TestPersistentStealIndexAgainstOracle();
     TestChannelTerminationControllers();
     TestOverlappingRetriggerGenerations();
     TestPitchAndDeterministicRender();
@@ -1429,6 +1610,7 @@ int main() {
     TestOverloadTimelineRecovery();
     TestExpressionAgeRetirementAndLoopWrap();
     TestSpanRendererDifferential();
+    TestRenderBackendSelectionAndDenseEquivalence();
     TestRenderCallbackPurity();
     TestCallbackSourcePurity();
 

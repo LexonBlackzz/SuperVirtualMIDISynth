@@ -195,6 +195,8 @@ struct SF2Data {
     static constexpr uint32_t kMaxCompiledRegions = 65536;
     SFSampleRegion regions[kMaxCompiledRegions];
     uint32_t regionCount;
+    uint32_t presetRegionStart[kMaxPresets];
+    uint32_t presetRegionCount[kMaxPresets];
     bool regionOverflow;
 
     int16_t* sampleData;

@@ -21,7 +21,8 @@ inline float InterpolateSample(const float* data, uint32_t baseIndex,
 }
 
 // Render the compact continuation captured when this primary voice slot was
-// stolen.  The tail follows the old sample cursor and loop for a fixed 10 ms
+// stolen.  The tail follows the old sample cursor and loop for a fixed,
+// short 64-frame
 // linear ramp.  It has no MIDI identity and cannot consume another voice
 // slot, so note-off/controller handling remains attached only to the new
 // occupant of the slot.
@@ -69,8 +70,8 @@ inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
     const float frac = phase - static_cast<float>(baseOffset);
     const float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
     const uint32_t total = v.stealTailFramesTotal[idx];
-    const float fade = total > 0u
-        ? static_cast<float>(remaining) / static_cast<float>(total)
+    const float fade = total > 1u
+        ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
         : 0.0f;
     const float scaled = sample * v.stealTailGain[idx] * fade;
     *outL += scaled * v.stealTailMixGainL[idx];
@@ -198,6 +199,9 @@ public:
 #endif
 
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
+    bool SetRenderBackend(RenderBackend backend);
+    RenderBackend GetRenderBackend() const { return kernelSet_->backend; }
+    const char* GetRenderBackendName() const { return kernelSet_->name; }
 
 private:
     void RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
@@ -208,13 +212,22 @@ private:
                      bool correctnessMode, uint64_t blockStartFrame);
     EventDispatcher dispatcher_;
     void* dispatcherUserData_;
+    const RenderKernelSet* kernelSet_;
     alignas(64) uint32_t classChanges_[kMaxPolyphony];
     alignas(64) uint32_t tailFrameCounts_[kMaxPolyphony];
     alignas(64) SpanRetirement retirements_[kMaxPolyphony];
 };
 
 inline RenderScalar::RenderScalar()
-    : dispatcher_(nullptr), dispatcherUserData_(nullptr) {}
+    : dispatcher_(nullptr), dispatcherUserData_(nullptr),
+      kernelSet_(&SelectBestRenderKernelSet()) {}
+
+inline bool RenderScalar::SetRenderBackend(RenderBackend backend) {
+    const RenderKernelSet* selected = SelectRenderKernelSet(backend);
+    if (selected == nullptr) return false;
+    kernelSet_ = selected;
+    return true;
+}
 
 inline void RenderScalar::SetEventDispatcher(EventDispatcher dispatcher, void* userData) {
     dispatcher_ = dispatcher;
@@ -561,8 +574,8 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
 
         const float frac = phase - static_cast<float>(baseOffset);
         const float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
-        const float fade = total > 0u
-            ? static_cast<float>(remaining) / static_cast<float>(total)
+        const float fade = total > 1u
+            ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
             : 0.0f;
         const float scaled = sample * gain * fade;
         outputLeft[frameStart + n] += scaled * mixL;
@@ -992,7 +1005,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     (void)cfg;
     (void)channels;
     VoiceSoA& v = voices.v;
-    const RenderKernelSet& kernelSet = GetScalarRenderKernelSet();
+    const RenderKernelSet& kernelSet = *kernelSet_;
     // Gain state is already current for this boundary; see the frame-major
     // oracle above and Driver::HandleControlChange.
 
@@ -1026,14 +1039,29 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         uint32_t classChangeCount = 0u;
         const uint32_t tailCount = voices.GetStealTailCount();
         const uint32_t* tailHandles = voices.GetStealTailList();
-        for (uint32_t position = 0; position < tailCount; ++position)
-            tailFrameCounts_[tailHandles[position]] = spanFrames;
+        const uint32_t voiceCapacity = voices.GetMaxVoices();
+        const bool denseTails = tailCount * 2u >= voiceCapacity;
+        if (denseTails) {
+            // Continuous full-pool stealing leaves nearly every slot with a
+            // tail. Sequential slot traversal is cheaper and much friendlier
+            // to the SoA caches than chasing the constantly shuffled sparse
+            // list. Normal playback retains the sparse O(tailCount) path.
+            for (uint32_t idx = 0; idx < voiceCapacity; ++idx) {
+                if (v.stealTailFramesRemaining[idx] != 0u)
+                    tailFrameCounts_[idx] = spanFrames;
+            }
+        } else {
+            for (uint32_t position = 0; position < tailCount; ++position)
+                tailFrameCounts_[tailHandles[position]] = spanFrames;
+        }
 
         // Class counts are captured before rendering.  Natural retirements
         // and envelope transitions are deferred, so every list stays stable
         // while all backends consume the span without copying activeList_.
+        uint32_t remainingClasses = voices.GetNonemptyRenderClassMask();
         for (uint32_t classIndex = 0; classIndex < kVoiceRenderClassCount;
              ++classIndex) {
+            if ((remainingClasses & (1u << classIndex)) == 0u) continue;
             const VoiceRenderClass renderClass =
                 static_cast<VoiceRenderClass>(classIndex);
             const uint32_t classCount = voices.GetRenderClassCount(renderClass);
@@ -1043,7 +1071,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             if (classKernel != nullptr && sampleData != nullptr) {
                 const RenderSpanContext context{
                     &v, sampleData, sampleDataFrames, outputLeft, outputRight,
-                    cursor, spanFrames};
+                    cursor, spanFrames, voices.GetMaxVoices()};
                 classKernel(context, handles, classCount);
                 continue;
             }
@@ -1085,12 +1113,22 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         // Tails have their own sparse lifecycle list and render independently
         // from primary class ordering.  Iterate backwards so O(1) swap-removal
         // of a completed tail cannot skip an unprocessed entry.
-        for (uint32_t position = tailCount; position > 0u; --position) {
-            const uint32_t idx = tailHandles[position - 1u];
-            RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
-                                outputLeft, outputRight, cursor,
-                                tailFrameCounts_[idx]);
-            voices.RefreshStealTail(static_cast<VoiceHandle>(idx));
+        if (denseTails) {
+            for (uint32_t idx = 0; idx < voiceCapacity; ++idx) {
+                if (v.stealTailFramesRemaining[idx] == 0u) continue;
+                RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
+                                    outputLeft, outputRight, cursor,
+                                    tailFrameCounts_[idx]);
+                voices.RefreshStealTail(static_cast<VoiceHandle>(idx));
+            }
+        } else {
+            for (uint32_t position = tailCount; position > 0u; --position) {
+                const uint32_t idx = tailHandles[position - 1u];
+                RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
+                                    outputLeft, outputRight, cursor,
+                                    tailFrameCounts_[idx]);
+                voices.RefreshStealTail(static_cast<VoiceHandle>(idx));
+            }
         }
 
         for (uint32_t i = 0; i < classChangeCount; ++i)

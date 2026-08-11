@@ -24,9 +24,10 @@ constexpr uint32_t kMaxEventsPerBlock = UINT32_MAX;
 
 constexpr uint32_t kNewbornProtectSamples = 64;
 // A stolen voice is not allowed to disappear at an arbitrary waveform
-// phase.  Keep a compact copy of its render state and ramp that copy to zero
-// over 10 ms while the replacement starts in the reclaimed primary slot.
-constexpr uint32_t kStealFadeMilliseconds = 10;
+// phase. Keep a compact copy for a short fixed ramp. Sixty-four output frames
+// suppress the discontinuity without retaining a near-second voice layer
+// throughout sustained full-pool stealing.
+constexpr uint32_t kStealFadeFrames = 64;
 
 // Raw MIDI ingress record. Producers capture both timestamp and global
 // sequence before any backpressure wait.
@@ -186,6 +187,33 @@ struct DriverDebugInfo {
     int32_t audioHResult = 0;
     float renderPeak = 0.0f;
 };
+
+// Compatibility payload used by SnappySynth V2's GetVoiceStatistics export.
+// Ziggy reads these three DWORDs in this exact order.
+struct SnappyVoiceStatistics {
+    uint32_t activeVoices = 0;
+    uint32_t freeVoices = 0;
+    uint32_t voiceSteals = 0;
+};
+
+// Legacy OmniMIDI/KDMAPI debug layout returned by GetDriverDebugInfo().
+// Keep this separate from DriverDebugInfo: the latter is V3's versioned ABI.
+struct LegacyDriverDebugInfo {
+    float renderingTime = 0.0f;
+    uint32_t activeVoices[kChannelCount]{};
+    double asioInputLatency = 0.0;
+    double asioOutputLatency = 0.0;
+    double healthThreadTime = 0.0;
+    double activeThreadTime = 0.0;
+    double eventProcessingThreadTime = 0.0;
+    double cookedThreadTime = 0.0;
+    uint32_t currentSoundFontList = 0;
+    double audioLatency = 0.0;
+    uint32_t audioBufferSize = 0;
+};
+
+static_assert(sizeof(SnappyVoiceStatistics) == 12,
+              "SSV2 voice statistics ABI changed");
 
 struct MidiEvent {
     EventType type;
@@ -413,6 +441,7 @@ struct alignas(64) VoiceSoA {
     uint8_t heldBySustain[kMaxPolyphony];
     uint32_t releaseStartInBlock[kMaxPolyphony];
     int32_t nextChannelKeyVoice[kMaxPolyphony];
+    int32_t prevChannelKeyVoice[kMaxPolyphony];
 
     uint64_t birthFrame[kMaxPolyphony];
 

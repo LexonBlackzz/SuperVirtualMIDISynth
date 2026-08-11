@@ -14,11 +14,14 @@ larger phase containing that item is complete.
 - [x] SF2 parser, preset/instrument region compilation, and resampled storage
 - [x] Preset/instrument global and local zone merging with layered key/velocity
   matching
+- [x] Index compiled SF2 regions by preset so dense note-ons never scan regions
+  belonging to unrelated banks and programs
 - [x] WASAPI shared-mode output and `winmm.dll`/KDMAPI-compatible entry points
 - [x] SoA voice state with flat active list, inverse active positions, and free
   stack
 - [x] Fresh allocation for overlapping same-key retriggers
-- [x] Priority-aware score-based voice stealing with a short outgoing fade
+- [x] Priority-aware score-based voice stealing with a fixed 64-frame outgoing
+  fade that reaches exact zero without delaying the replacement attack
   tail and an unblurred replacement attack
 - [x] Scalar fused per-sample renderer with linear interpolation
 - [x] SF2 volume envelopes, sample loops, attenuation, tuning, and release tails
@@ -52,6 +55,9 @@ larger phase containing that item is complete.
   API-set, Known Folder, WaitOnAddress, or other post-XP entry points
 - [x] Export the complete undecorated WinMM/KDMAPI surface from the MinGW x86
   DLL and exercise DirectSound notification/start/stop behavior in smoke tests
+- [x] Export Ziggy/SSV2-compatible active/free/steal statistics plus V2 render
+  time/voice-count telemetry, retain the full diagnostic window, and emit a
+  `SnappySynth.dll` direct-loader alias beside every `winmm.dll` build
 - [x] Accept both device `0` and the legacy `MIDI_MAPPER` ID in WinMM open/caps
   calls, reject false-success opens when the backend cannot start, and cover
   DLL load/open plus diagnostic-window creation with end-to-end XP tests
@@ -74,6 +80,9 @@ larger phase containing that item is complete.
 - [x] Apply compiled defaults, JSON, then environment overrides
 - [x] Support `SVMS_NO_DROP_EVENTS`, diagnostics, diagnostic-window/debug-output,
   and correctness-mode environment overrides
+- [x] Select a named WASAPI render endpoint through `audio.device` or
+  `SVMS_AUDIO_DEVICE`; a missing configured endpoint fails safely instead of
+  falling back to an unintended default output
 - [x] Honor explicit absolute or DLL-relative SoundFont paths; when absent or
   missing, deterministically discover DLL-local `.sf2` files and record the
   discovered filename in newly created JSON without assuming `gm.sf2`
@@ -147,6 +156,10 @@ larger phase containing that item is complete.
 - [x] Clamp late events to the next writable frame and record lateness
 - [x] Fast-forward missed output time after callback overruns and discard only
   obsolete note-ons so overload cannot become a permanent post-pause backlog
+- [x] Drain obsolete ingress independently of the per-block admission budget
+  and recover the newest still-on note per channel/key, with newer note-offs
+  and termination fences winning, so extreme backlog converges to audible
+  current state instead of permanent zero-voice output
 - [x] Bound callback dispatch with `max_events_per_block`; excess remains
   ordered in the scheduler
 - [x] Remove the old fractional pending-event/stable-sort execution path
@@ -202,20 +215,38 @@ larger phase containing that item is complete.
   sustain, termination, note-generation, and pitch-bend updates
 - [x] Cache unbent phase increments and steady-state output gains; refresh only
   the affected channel on CC7/CC10/CC11/CC121
-- [x] Preserve exact steal scores/ties with a lazily rebuilt fixed max heap for
-  same-frame full-pool bursts
+- [x] Preserve exact steal scores/ties with a persistent stable max heap plus
+  an exact per-frame volatile heap for newborn, transient, releasing, and
+  age-capped voices; rebuild only when rendered state advances and validate
+  every selected victim against an exhaustive oracle
+- [x] Keep sustained newborn candidates in a persistent exact heap, batch
+  deferred voice setup into one candidate update, and replace same-frame heap
+  roots in place without changing exhaustive victim selection
+- [x] Apply each prepared SF2 layer through one transactional voice setup and
+  expose attack-frame control in the dense note-burst benchmark
+- [x] Make channel/key unlink O(1) with intrusive previous/next positions so
+  dense same-key replacement never walks an entire retrigger generation
+- [x] Precompute immutable SF2 region peaks, validation, per-key base pitch,
+  envelope coefficients, attenuation, sustain, and pan while loading so the
+  audio callback performs no diagnostic sample scans or transcendental region
+  setup for ordinary note-ons
 - [x] Add allocation-free rolling callback p95/p99/p99.9 and over-budget
   diagnostics without changing `DriverDebugInfoV1`
 - [x] Extend `svms_v3_bench` with event stride, real mixed MIDI traffic,
   cycles/voice-sample, events/s, steals/s, render-class counts, consecutive
   deadline misses, MMCSS/FTZ/DAZ parity, and optional core affinity
+- [x] Add full-velocity note-burst rates/key spreads and optional real-SF2
+  layered-region matching to `svms_v3_bench`; characterize the supplied Krash
+  corpus at 94k average and 792k peak note-ons/s
 - [x] Verify 4096 voices for 60 seconds at 44.1 kHz/2048 frames on the
   i5-13600KF: sustained p99 36.72%, envelope p99 50.82%, release p99 37.42%
 - [x] Differentially validate exact event order, active identities, steal
   victims/tails, phase/envelope/release state, and tolerant audio at buffers
   from 16 through 8192 frames
-- [ ] Reach modern-CPU 4096-voice mixed/dense event-stride-2 p99 below 60%; the
-  current warmed scalar result is about 65% p99 with no deadline misses
+- [x] Reach modern-CPU 4096-voice event-stride-2 targets with no deadline
+  misses: latest warmed AVX2 dense p99 16.67% and mixed-event p99 29.78%
+- [x] Reduce the supplied 1000-voice Krash peak-rate synthetic profile from
+  roughly 326% to 75.6% p99 without consecutive callback misses
 - [ ] Run and pass the three Celeron 420 acceptance profiles on target hardware
 - [ ] Complete live high-Hz listening validation for pitch, natural tails,
   CC120/123 termination, and callback-grid artifacts
@@ -238,7 +269,8 @@ larger phase containing that item is complete.
 - [ ] Measure the reference requirements: timing within one frame, exact event
   ordering, pitch within one cent, envelope checkpoints within 1 dB, waveform
   correlation, and RMS
-- [ ] Add reusable dense-note/event flood generators and a Black MIDI corpus
+- [x] Add reusable dense-note/event flood generators and analyze a local Black
+  MIDI corpus without committing its large MIDI/SF2 assets
 - [ ] Establish scalar baselines and practical voice limits on a Celeron 420
 - [ ] Establish modern-CPU event-flood and eventual 500K-voice baselines
 - [ ] Add cycle/cache-miss profiling; callback duration, queue pressure,
@@ -259,8 +291,10 @@ larger phase containing that item is complete.
 
 ## Parallel and SIMD Acceleration
 
-- [ ] SSE2 renderer with scalar-equivalence coverage
-- [ ] AVX2 renderer and runtime feature detection
+- [x] Add an SSE2 backend boundary with scalar-equivalence coverage and retain
+  the faster scalar short-span kernel where SSE2 lacks gather support
+- [x] Add the AVX2 dense-span renderer with CPUID/OSXSAVE/XCR0 runtime
+  detection, isolated compilation, and scalar/SSE2 fallback
 - [ ] Per-worker mix buffers and tile-based render orchestration
 - [ ] Optional worker-thread backend for modern multicore CPUs
 - [ ] Prefetch strategies for decimated voices
