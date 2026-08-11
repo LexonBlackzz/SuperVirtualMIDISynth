@@ -9,10 +9,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <vector>
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
@@ -63,6 +65,52 @@ std::wstring GetExecutableDirectory() {
     return fs::path(path).parent_path().wstring();
 }
 
+fs::path GetSoundFontSearchDirectory() {
+    // Test-only override. Production always discovers beside winmm.dll.
+    std::wstring testPath(32768, L'\0');
+    const DWORD length = GetEnvironmentVariableW(
+        L"SVMS_TEST_SOUNDFONT_DIRECTORY", testPath.data(),
+        static_cast<DWORD>(testPath.size()));
+    if (length > 0u && length < testPath.size()) {
+        testPath.resize(length);
+        return fs::path(testPath);
+    }
+    return fs::path(GetV3ModuleDirectory());
+}
+
+bool IsSoundFontFile(const fs::path& path) {
+    std::error_code error;
+    if (!fs::is_regular_file(path, error) || error) return false;
+    std::wstring extension = path.extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+    return extension == L".sf2";
+}
+
+std::vector<fs::path> DiscoverLocalSoundFonts() {
+    std::vector<fs::path> paths;
+    std::error_code error;
+    const fs::path directory = GetSoundFontSearchDirectory();
+    fs::directory_iterator iterator(directory, error);
+    const fs::directory_iterator end;
+    while (!error && iterator != end) {
+        if (IsSoundFontFile(iterator->path())) paths.push_back(iterator->path());
+        iterator.increment(error);
+    }
+    std::sort(paths.begin(), paths.end(), [](const fs::path& left,
+                                             const fs::path& right) {
+        std::wstring a = left.filename().wstring();
+        std::wstring b = right.filename().wstring();
+        std::transform(a.begin(), a.end(), a.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        std::transform(b.begin(), b.end(), b.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        if (a != b) return a < b;
+        return left.filename().wstring() < right.filename().wstring();
+    });
+    return paths;
+}
+
 std::string Trim(std::string value) {
     auto notSpace = [](unsigned char ch) { return !std::isspace(ch); };
     value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
@@ -106,10 +154,12 @@ void ImportNumber(const std::map<std::string, std::string>& ini,
 }
 
 json MakeDefaultJson(const EngineConfig& cfg) {
+    const char* backend = cfg.audioBackend == AudioBackend::DirectSound
+                            ? "directsound" : "wasapi-shared";
     return json{
         {"schema_version", kConfigSchemaVersion},
         {"audio", {
-            {"backend", "wasapi-shared"},
+            {"backend", backend},
             {"sample_rate", cfg.sampleRate},
             {"buffer_frames", cfg.bufferFrames}
         }},
@@ -252,9 +302,24 @@ void AppendWarning(std::string& warning, const char* field) {
 void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("audio"); it != root.end() && it->is_object()) {
         auto backend = it->find("backend");
-        if (backend != it->end() &&
-            (!backend->is_string() || backend->get<std::string>() != "wasapi-shared"))
-            AppendWarning(cfg.configWarning, "audio.backend");
+        if (backend != it->end()) {
+            if (!backend->is_string()) {
+                AppendWarning(cfg.configWarning, "audio.backend");
+            } else {
+                const std::string value = backend->get<std::string>();
+#if defined(SVMS_XP_COMPAT)
+                if (value == "directsound")
+                    cfg.audioBackend = AudioBackend::DirectSound;
+                else
+                    AppendWarning(cfg.configWarning, "audio.backend");
+#else
+                if (value == "wasapi-shared")
+                    cfg.audioBackend = AudioBackend::WASAPIShared;
+                else
+                    AppendWarning(cfg.configWarning, "audio.backend");
+#endif
+            }
+        }
         if (!ReadValue(*it, "sample_rate", cfg.sampleRate, 8000u, 384000u))
             AppendWarning(cfg.configWarning, "audio.sample_rate");
         if (!ReadValue(*it, "buffer_frames", cfg.bufferFrames, 16u, 8192u))
@@ -359,7 +424,11 @@ EngineConfig EngineConfig::Default() {
     cfg.maxSampleCacheMB = 256;
     cfg.interpolation = InterpolationMode::Linear;
     cfg.filterType = FilterType::None;
+#if defined(SVMS_XP_COMPAT)
+    cfg.audioBackend = AudioBackend::DirectSound;
+#else
     cfg.audioBackend = AudioBackend::WASAPIShared;
+#endif
     cfg.renderBackend = RenderBackend::Scalar;
     cfg.panLaw = PanLaw::ConstantPower;
     cfg.masterVolume = 0.1f;
@@ -380,10 +449,18 @@ EngineConfig EngineConfig::Default() {
     cfg.shedStartPercent = 70;
     cfg.maxEventsPerBlock = 65536;
     cfg.correctnessMode = true;
+#if defined(SVMS_XP_COMPAT)
+    // XP has no WASAPI status tooling and audio failures otherwise look like
+    // a completely silent synth. Keep this configurable, but make the first
+    // XP run visible by default.
+    cfg.diagnosticsEnabled = true;
+    cfg.diagnosticsWindow = true;
+#else
     cfg.diagnosticsEnabled = false;
     cfg.diagnosticsWindow = false;
+#endif
     cfg.diagnosticsDebugOutput = false;
-    cfg.soundFontPath = L"gm.sf2";
+    cfg.soundFontPath.clear();
     return cfg;
 }
 
@@ -403,6 +480,11 @@ EngineConfig EngineConfig::Load() {
     cfg.configPath = path.wstring();
 
     if (!PathExists(path)) {
+        // A new configuration records an actually discovered DLL-local SF2
+        // instead of baking a particular filename into every installation.
+        const auto localSoundFonts = DiscoverLocalSoundFonts();
+        if (!localSoundFonts.empty())
+            cfg.soundFontPath = localSoundFonts.front().filename().wstring();
         json root = MakeDefaultJson(cfg);
         const fs::path legacy = FindLegacyIni();
         if (!legacy.empty()) ImportLegacyIni(root, legacy);
@@ -483,13 +565,21 @@ std::wstring GetV3AppDataConfigPath() {
         return testPath;
     }
 
-    PWSTR roaming = nullptr;
     std::wstring result;
+#if defined(SVMS_XP_COMPAT)
+    wchar_t roaming[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA | CSIDL_FLAG_CREATE,
+                                   nullptr, SHGFP_TYPE_CURRENT, roaming))) {
+        result = (fs::path(roaming) / L"SuperVirtualMIDISynth" / L"config.json").wstring();
+    }
+#else
+    PWSTR roaming = nullptr;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData,
                                        KF_FLAG_DEFAULT, nullptr, &roaming))) {
         result = (fs::path(roaming) / L"SuperVirtualMIDISynth" / L"config.json").wstring();
         CoTaskMemFree(roaming);
     }
+#endif
     return result;
 }
 
@@ -511,11 +601,36 @@ std::wstring GetV3ModuleDirectory() {
     return fs::path(path).parent_path().wstring();
 }
 
-std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg) {
-    fs::path requested(cfg.soundFontPath.empty() ? L"gm.sf2" : cfg.soundFontPath);
-    if (requested.is_relative()) requested = fs::path(GetV3ModuleDirectory()) / requested;
-    if (fs::exists(requested)) return requested.wstring();
-    return (fs::path(GetV3ModuleDirectory()) / L"gm.sf2").wstring();
+std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
+                                    std::string* warning) {
+    const fs::path searchDirectory = GetSoundFontSearchDirectory();
+    if (!cfg.soundFontPath.empty()) {
+        fs::path requested(cfg.soundFontPath);
+        if (requested.is_relative()) requested = searchDirectory / requested;
+        if (IsSoundFontFile(requested)) return requested.wstring();
+        if (warning) {
+            *warning = "configured SoundFont was not found: " +
+                       WideToUtf8(cfg.soundFontPath);
+        }
+    }
+
+    const auto localSoundFonts = DiscoverLocalSoundFonts();
+    if (localSoundFonts.empty()) {
+        if (warning) {
+            if (!warning->empty()) *warning += "; ";
+            *warning += "no .sf2 file found beside winmm.dll";
+        }
+        return {};
+    }
+
+    if (warning && (cfg.soundFontPath.empty() || localSoundFonts.size() > 1u)) {
+        if (!warning->empty()) *warning += "; ";
+        *warning += "using DLL-local SoundFont " +
+                    WideToUtf8(localSoundFonts.front().filename().wstring());
+        if (localSoundFonts.size() > 1u)
+            *warning += " (multiple .sf2 files found; set synth.soundfont explicitly)";
+    }
+    return localSoundFonts.front().wstring();
 }
 
 } // namespace svms

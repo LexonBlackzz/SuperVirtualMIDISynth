@@ -3,6 +3,11 @@ project(SuperVirtualMIDISynthV3 LANGUAGES CXX)
 
 include(CTest)
 
+option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
+if(SVMS_XP_COMPAT AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "SVMS_XP_COMPAT is a 32-bit-only target")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -13,6 +18,18 @@ if(MSVC)
     add_definitions(-DUNICODE -D_UNICODE)
     if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
         add_compile_options(/O2 /Oi /Gy)
+    endif()
+endif()
+
+if(SVMS_XP_COMPAT)
+    add_compile_definitions(SVMS_XP_COMPAT=1 WINVER=0x0501 _WIN32_WINNT=0x0501)
+endif()
+
+if(MINGW)
+    add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+    if(SVMS_XP_COMPAT)
+        add_compile_options(-O3 -msse2 -mfpmath=sse)
+        add_link_options(-static -static-libgcc -static-libstdc++)
     endif()
 endif()
 
@@ -33,6 +50,7 @@ set(HEADERS
     SVMSRenderScalar.h
     SVMSRenderKernels.h
     SVMSAudioOutput.h
+    SVMSAudioOutputDirectSound.h
     SVMSSoundFont.h
     SVMSPageAllocator.h
     SVMSDiagWindow.h
@@ -42,22 +60,20 @@ set(HEADERS
 
 add_library(svmsynth SHARED ${SOURCES} ${HEADERS})
 
-target_compile_definitions(svmsynth PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(svmsynth PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+    UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 
-target_link_libraries(svmsynth PRIVATE
-    winmm
-    ole32
-    uuid
-    avrt
-    shell32
-)
+if(SVMS_XP_COMPAT)
+    target_link_libraries(svmsynth PRIVATE dsound dxguid shell32 user32)
+else()
+    target_link_libraries(svmsynth PRIVATE winmm ole32 uuid avrt shell32)
+endif()
 
 # nlohmann/json is vendored under third_party and intentionally confined to
 # the configuration translation unit.
 target_include_directories(svmsynth PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
 
-if(MSVC)
-    set(EXPORTS
+set(EXPORTS
         midiOutGetNumDevs
         midiOutGetDevCapsA
         midiOutGetDevCapsW
@@ -158,14 +174,24 @@ if(MSVC)
         timeGetDevCaps
         timeSetEvent
         timeKillEvent
-    )
+)
+if(MSVC)
     foreach(exp ${EXPORTS})
         target_link_options(svmsynth PRIVATE /EXPORT:${exp})
     endforeach()
+elseif(MINGW)
+    set(SVMS_EXPORT_FILE "${CMAKE_CURRENT_BINARY_DIR}/SVMSExports.def")
+    file(WRITE "${SVMS_EXPORT_FILE}" "EXPORTS\n")
+    foreach(exp ${EXPORTS})
+        file(APPEND "${SVMS_EXPORT_FILE}" "    ${exp}\n")
+    endforeach()
+    target_sources(svmsynth PRIVATE "${SVMS_EXPORT_FILE}")
+    target_link_options(svmsynth PRIVATE -Wl,--kill-at)
 endif()
 
 set_target_properties(svmsynth PROPERTIES
     OUTPUT_NAME "winmm"
+    PREFIX ""
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
@@ -187,14 +213,55 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
     add_test(NAME svms_v3_correctness COMMAND svms_v3_tests)
 
-    add_executable(svms_v3_live_smoke tests/SVMSLiveSmoke.cpp)
-    target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
+    if(SVMS_XP_COMPAT)
+        add_executable(svms_v3_xp_directsound_smoke
+            tests/SVMSXPDirectSoundSmoke.cpp)
+        target_compile_definitions(svms_v3_xp_directsound_smoke PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+        target_include_directories(svms_v3_xp_directsound_smoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(svms_v3_xp_directsound_smoke PRIVATE
+            dsound dxguid user32)
+        add_test(NAME svms_v3_xp_directsound_smoke
+                 COMMAND svms_v3_xp_directsound_smoke)
+        set_tests_properties(svms_v3_xp_directsound_smoke PROPERTIES
+            SKIP_RETURN_CODE 77)
+        add_test(NAME svms_v3_xp_waveout_smoke
+                 COMMAND svms_v3_xp_directsound_smoke --waveout)
+        set_tests_properties(svms_v3_xp_waveout_smoke PROPERTIES
+            SKIP_RETURN_CODE 77)
 
-    add_executable(svms_v3_bench tests/SVMSV3Bench.cpp SVMSRenderKernels.cpp)
-    target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
-        SVMS_ENABLE_REFERENCE_RENDERER=1)
-    target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(svms_v3_bench PRIVATE avrt)
+        add_executable(svms_v3_xp_dll_smoke
+            tests/SVMSXPDllSmoke.cpp)
+        target_compile_definitions(svms_v3_xp_dll_smoke PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+        target_link_libraries(svms_v3_xp_dll_smoke PRIVATE user32)
+        add_dependencies(svms_v3_xp_dll_smoke svmsynth)
+        add_test(NAME svms_v3_xp_dll_smoke
+                 COMMAND svms_v3_xp_dll_smoke
+                         "$<TARGET_FILE:svmsynth>")
+        set_tests_properties(svms_v3_xp_dll_smoke PROPERTIES
+            SKIP_RETURN_CODE 77)
+        add_test(NAME svms_v3_xp_waveout_dll_smoke
+                 COMMAND svms_v3_xp_dll_smoke
+                         "$<TARGET_FILE:svmsynth>" --waveout)
+        set_tests_properties(svms_v3_xp_waveout_dll_smoke PROPERTIES
+            SKIP_RETURN_CODE 77)
+        add_test(NAME svms_v3_xp_diag_window_smoke
+                 COMMAND svms_v3_xp_dll_smoke
+                         "$<TARGET_FILE:svmsynth>" --diag-window)
+        set_tests_properties(svms_v3_xp_diag_window_smoke PROPERTIES
+            SKIP_RETURN_CODE 77)
+    else()
+        add_executable(svms_v3_live_smoke tests/SVMSLiveSmoke.cpp)
+        target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
+
+        add_executable(svms_v3_bench tests/SVMSV3Bench.cpp SVMSRenderKernels.cpp)
+        target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+            SVMS_ENABLE_REFERENCE_RENDERER=1)
+        target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(svms_v3_bench PRIVATE avrt)
+    endif()
 endif()

@@ -29,6 +29,35 @@ larger phase containing that item is complete.
 - [x] Limiter, double-buffered diagnostic statistics, and optional diagnostic
   window
 
+### Compatibility Builds
+
+- [x] Provide a separate modern Windows x86/WASAPI build through
+  `build_v3_x86.bat`
+- [x] Provide a separate XP-compatible x86/SSE2 build through
+  `build_v3_xp_x86.bat`, using the bundled MSVCRT-based MinGW toolchain
+- [x] Replace WASAPI/MMCSS with a notification-driven DirectSound PCM output
+  layer only in the XP target while retaining the common scalar renderer and
+  sample-accurate scheduler
+- [x] Use V1-compatible `DirectSoundCreate` interfaces on XP and fall back to
+  ordered play-cursor feeding when legacy drivers reject position notifications
+- [x] Fall back to event-driven `waveOut` through the absolute system
+  `winmm.dll` when DirectSound cannot initialize, with forced backend and full
+  DLL integration tests
+- [x] Match V1's absolute-System32 WinMM loading and forward XP waveOut and
+  mixer exports so DirectSound and legacy drivers see the real default device
+- [x] Treat XP `buffer_frames` as the per-callback segment size (with a
+  four-segment DirectSound safety ring) and show audio/SoundFont health in the
+  XP diagnostic window, enabled by default for new XP configurations
+- [x] Use XP's `SHGetFolderPathW` configuration path and avoid importing UCRT,
+  API-set, Known Folder, WaitOnAddress, or other post-XP entry points
+- [x] Export the complete undecorated WinMM/KDMAPI surface from the MinGW x86
+  DLL and exercise DirectSound notification/start/stop behavior in smoke tests
+- [x] Accept both device `0` and the legacy `MIDI_MAPPER` ID in WinMM open/caps
+  calls, reject false-success opens when the backend cannot start, and cover
+  DLL load/open plus diagnostic-window creation with end-to-end XP tests
+- [ ] Run live MIDI/SF2 playback and shutdown stress on physical Windows XP
+  hardware; PE/import auditing and 32-bit tests pass on the development host
+
 ## Stabilization Tranche
 
 ### JSON Configuration
@@ -45,8 +74,9 @@ larger phase containing that item is complete.
 - [x] Apply compiled defaults, JSON, then environment overrides
 - [x] Support `SVMS_NO_DROP_EVENTS`, diagnostics, diagnostic-window/debug-output,
   and correctness-mode environment overrides
-- [x] Resolve relative SoundFont paths beside `winmm.dll`, fall back to
-  DLL-local `gm.sf2`, and remove the nonfunctional DLS fallback
+- [x] Honor explicit absolute or DLL-relative SoundFont paths; when absent or
+  missing, deterministically discover DLL-local `.sf2` files and record the
+  discovered filename in newly created JSON without assuming `gm.sf2`
 - [x] Import recognized `config.ini` values once from beside the DLL or host
   executable without modifying the INI
 - [x] Preserve recognized legacy effects/limiter values in the migration JSON

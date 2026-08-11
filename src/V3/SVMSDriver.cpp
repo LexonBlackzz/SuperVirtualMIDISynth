@@ -9,7 +9,11 @@
 #include <cstdarg>
 #include <algorithm>
 
+#if defined(SVMS_XP_COMPAT)
+#include "SVMSAudioOutputDirectSound.h"
+#else
 #include "SVMSAudioOutput.h"
+#endif
 #include "SVMSVoiceManager.h"
 #include "SVMSChannelCache.h"
 #include "SVMSRenderScalar.h"
@@ -74,7 +78,90 @@ static void Log(const char* fmt, ...) {
 
 #define LOG(fmt, ...) Log("[SVMS] " fmt "\n", ##__VA_ARGS__)
 
+#if defined(SVMS_XP_COMPAT)
+static void XPBootstrapTrace(const char* message) {
+    OutputDebugStringA(message);
+}
+
+// A drop-in winmm.dll must continue forwarding the non-MIDI multimedia API.
+// DirectSound and XP audio drivers import these exports by module name, so
+// returning placeholder values here makes a perfectly healthy audio device
+// disappear inside the host process. Match V1: load the genuine DLL by its
+// absolute System32 path and forward into that module.
+static volatile LONG g_xpSystemWinmmState = 0;
+static HMODULE g_xpSystemWinmm = nullptr;
+
+static void TraceXPModuleA(const char* label, HMODULE module) {
+    wchar_t widePath[MAX_PATH] = {};
+    char path[MAX_PATH * 3] = {};
+    if (module) GetModuleFileNameW(module, widePath, MAX_PATH);
+    if (widePath[0]) {
+        WideCharToMultiByte(CP_ACP, 0, widePath, -1, path,
+                            static_cast<int>(sizeof(path)), nullptr, nullptr);
+    }
+    char message[1200] = {};
+    std::snprintf(message, sizeof(message),
+                  "[SVMS XP] %s handle=%p path='%s' lastError=0x%08lX\r\n",
+                  label, static_cast<void*>(module), path[0] ? path : "<none>",
+                  static_cast<unsigned long>(GetLastError()));
+    OutputDebugStringA(message);
+}
+
+static HMODULE GetXPSystemWinmm() {
+    LONG state = InterlockedCompareExchange(&g_xpSystemWinmmState, 1, 0);
+    if (state == 0) {
+        wchar_t systemPath[MAX_PATH] = {};
+        const UINT length = GetSystemDirectoryW(systemPath, MAX_PATH);
+        static const wchar_t suffix[] = L"\\winmm.dll";
+        bool success = length != 0 &&
+            length + (sizeof(suffix) / sizeof(suffix[0])) <= MAX_PATH;
+        if (success) std::wcscat(systemPath, suffix);
+        if (success) {
+            g_xpSystemWinmm = LoadLibraryW(systemPath);
+            success = g_xpSystemWinmm != nullptr;
+        }
+        TraceXPModuleA("proxy GetModuleHandle(winmm.dll)",
+                       GetModuleHandleW(L"winmm.dll"));
+        TraceXPModuleA("absolute system WinMM result", g_xpSystemWinmm);
+        OutputDebugStringA(success
+            ? "[SVMS XP] system WinMM forwarding bridge initialized\r\n"
+            : "[SVMS XP] system WinMM forwarding bridge FAILED\r\n");
+        InterlockedExchange(&g_xpSystemWinmmState, success ? 2 : 3);
+        return g_xpSystemWinmm;
+    }
+    while (state == 1) {
+        Sleep(0);
+        state = InterlockedCompareExchange(&g_xpSystemWinmmState, 0, 0);
+    }
+    return state == 2 ? g_xpSystemWinmm : nullptr;
+}
+
+static FARPROC GetXPSystemWinmmProc(const char* name) {
+    HMODULE module = GetXPSystemWinmm();
+    FARPROC proc = module ? GetProcAddress(module, name) : nullptr;
+    if (!proc) {
+        char message[256] = {};
+        std::snprintf(message, sizeof(message),
+                      "[SVMS XP] system WinMM export '%s' missing, error=0x%08lX\r\n",
+                      name, static_cast<unsigned long>(GetLastError()));
+        OutputDebugStringA(message);
+    }
+    return proc;
+}
+#else
+static void XPBootstrapTrace(const char*) {}
+#endif
+
 namespace svms {
+
+static bool UsesXPWaveOut(const AudioOutput* output) {
+#if defined(SVMS_XP_COMPAT)
+    return output && output->IsWaveOutFallback();
+#else
+    (void)output;
+    return false;
+#endif
+}
 
 static constexpr uint32_t kInternalResetMessage = 0xFF000001u;
 
@@ -290,7 +377,7 @@ public:
     void Shutdown();
     bool LoadSoundFont(const wchar_t* path);
     bool LoadConfiguredSoundFont();
-    void StartAudio();
+    bool StartAudio();
     void ResetAllVoices();
     bool IsInitialized() const;
     void CopyDebugInfo(DriverDebugInfo& out) const;
@@ -486,12 +573,26 @@ bool Driver::Initialize() {
     bufferFrames = cfg.bufferFrames;
     LOG("Initialize: sampleRate=%u bufferFrames=%u maxVoices=%u", sampleRate, bufferFrames, cfg.maxVoices);
 
+    // Start diagnostics before the backend so an XP DirectSound failure is
+    // visible rather than returning from midiOutOpen with no evidence.
+    if (diagnosticsEnabled_ && (diagnosticsWindow_ || diagnosticsDebugOutput_)) {
+        DiagWindow_Create(diagnosticsWindow_, diagnosticsDebugOutput_);
+        DiagWindow_UpdateStartup(false, 0, false, sampleRate, bufferFrames,
+                                 cfg.masterVolume);
+    }
+
     audioOutput = new AudioOutput();
     if (!audioOutput->Initialize(sampleRate, bufferFrames)) {
         HRESULT hr = audioOutput->GetLastError();
         LOG("FAILED: AudioOutput::Initialize hr=0x%08X", (unsigned)hr);
+        XPBootstrapTrace("[SVMS XP] DirectSound initialization FAILED\r\n");
+        DiagWindow_UpdateStartup(false, static_cast<int32_t>(hr), false,
+                                 sampleRate, bufferFrames, cfg.masterVolume,
+                                 UsesXPWaveOut(audioOutput));
+#if !defined(SVMS_XP_COMPAT)
         delete audioOutput;
         audioOutput = nullptr;
+#endif
         return false;
     }
     bufferFrames = audioOutput->GetBufferFrames();
@@ -539,9 +640,6 @@ bool Driver::Initialize() {
 
     initialized = true;
     LOG("Initialize SUCCESS");
-
-    if (diagnosticsEnabled_ && (diagnosticsWindow_ || diagnosticsDebugOutput_))
-        DiagWindow_Create(diagnosticsWindow_, diagnosticsDebugOutput_);
 
     return true;
 }
@@ -591,9 +689,26 @@ void Driver::Shutdown() {
 }
 
 bool Driver::LoadConfiguredSoundFont() {
-    const std::wstring widePath = ResolveV3SoundFontPath(engineConfig_);
-    if (widePath.empty()) return false;
-    return LoadSoundFont(widePath.c_str());
+    std::string resolutionWarning;
+    const std::wstring widePath =
+        ResolveV3SoundFontPath(engineConfig_, &resolutionWarning);
+    if (!resolutionWarning.empty()) {
+        const std::string message =
+            "[SVMS] SoundFont configuration warning: " +
+            resolutionWarning + "\n";
+        OutputDebugStringA(message.c_str());
+    }
+    const bool loaded = !widePath.empty() && LoadSoundFont(widePath.c_str());
+    if (diagnosticsEnabled_ && (diagnosticsWindow_ || diagnosticsDebugOutput_)) {
+        DiagWindow_UpdateStartup(audioOutput && audioOutput->IsRunning(),
+                                 audioOutput
+                                     ? static_cast<int32_t>(audioOutput->GetLastError())
+                                     : 0,
+                                 loaded, sampleRate, bufferFrames,
+                                 engineConfig_.masterVolume,
+                                 UsesXPWaveOut(audioOutput));
+    }
+    return loaded;
 }
 
 bool Driver::LoadSoundFont(const wchar_t* path) {
@@ -705,12 +820,23 @@ void Driver::CopyDebugInfo(DriverDebugInfo& out) const {
     out.audioHResult = audioOutput ? static_cast<int32_t>(audioOutput->GetLastError()) : 0;
 }
 
-void Driver::StartAudio() {
+bool Driver::StartAudio() {
     if (audioOutput && !audioOutput->IsRunning()) {
-        LOG("StartAudio: starting WASAPI stream...");
-        bool ok = audioOutput->Start();
+        LOG("StartAudio: starting audio stream...");
+        const bool ok = audioOutput->Start();
         LOG("StartAudio: %s", ok ? "SUCCESS" : "FAILED");
+        if (!ok) {
+            XPBootstrapTrace("[SVMS XP] audio stream start FAILED\r\n");
+            DiagWindow_UpdateStartup(false,
+                                     static_cast<int32_t>(audioOutput->GetLastError()),
+                                     soundFontData && sampleDataStore,
+                                     sampleRate, bufferFrames,
+                                     engineConfig_.masterVolume,
+                                     UsesXPWaveOut(audioOutput));
+        }
+        return ok;
     }
+    return audioOutput && audioOutput->IsRunning();
 }
 
 void Driver::ResetAllVoices() {
@@ -780,6 +906,20 @@ void Driver::SubmitShortMsg(uint32_t msg) {
     for (;;) {
         if (midiIngress_.TryPush(lane, evt)) {
             acceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
+#if defined(SVMS_XP_COMPAT)
+            static LONG acceptedTraceCount = 0;
+            const LONG acceptedIndex = InterlockedIncrement(&acceptedTraceCount);
+            if (acceptedIndex <= 32) {
+                char message[224] = {};
+                std::snprintf(message, sizeof(message),
+                              "[SVMS XP] ingress accepted #%ld seq=%lu lane=%u queued=%lu\r\n",
+                              static_cast<long>(acceptedIndex),
+                              static_cast<unsigned long>(evt.sequence),
+                              static_cast<unsigned>(lane),
+                              static_cast<unsigned long>(midiIngress_.TotalSize()));
+                OutputDebugStringA(message);
+            }
+#endif
             return;
         }
         if (!lossless) {
@@ -926,8 +1066,19 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             deltaQPC, static_cast<int64_t>(self->qpcFreq), self->sampleRate);
         ScheduledRenderEvent scheduled;
         scheduled.event = ev;
-        scheduled.targetFrame = deltaFrames + static_cast<int64_t>(self->bufferFrames);
+        const int64_t schedulingLeadFrames =
+            static_cast<int64_t>(self->bufferFrames);
+        scheduled.targetFrame = deltaFrames + schedulingLeadFrames;
         scheduled.sequence = timed.sequence;
+#if defined(SVMS_XP_COMPAT)
+        // DirectSound's notification cursor and the QPC playback position can
+        // differ by several ring segments on XP. A live event behind the next
+        // writable frame is late, not obsolete: dispatch it at that frame.
+        if (scheduled.targetFrame < self->virtualRenderSample_) {
+            ++self->telemetry_.late;
+            scheduled.targetFrame = self->virtualRenderSample_;
+        }
+#endif
         if (etype == RenderEventType::NoteOn &&
             IsObsoleteNoteOn(scheduled.targetFrame, self->virtualRenderSample_,
                              self->bufferFrames)) {
@@ -1109,7 +1260,15 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                                   self->telemetry_.overBudgetCallbacks,
                                   self->telemetry_.maxConsecutiveOverBudget,
                                   vm->retireCount_, vm->retireImmediateCount_,
-                                  self->sf2Telemetry_);
+                                  self->audioOutput && self->audioOutput->IsRunning(),
+                                  self->audioOutput
+                                      ? static_cast<int32_t>(self->audioOutput->GetLastError())
+                                      : 0,
+                                  self->soundFontData && self->sampleDataStore,
+                                   self->sampleRate, self->bufferFrames,
+                                   snap->masterVolume,
+                                   UsesXPWaveOut(self->audioOutput),
+                                   self->sf2Telemetry_);
             }
         }
     }
@@ -1488,16 +1647,22 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
 } // namespace svms
 
 static svms::Driver* g_driver = nullptr;
+static const HMIDIOUT kSVMSMidiOutHandle = reinterpret_cast<HMIDIOUT>(0x1234);
+
+static bool IsSupportedMidiOutputDevice(UINT_PTR deviceId) {
+    return deviceId == 0u || deviceId == static_cast<UINT_PTR>(MIDI_MAPPER);
+}
 
 extern "C" {
 
 UINT WINAPI midiOutGetNumDevs(void) {
+    XPBootstrapTrace("[SVMS XP] midiOutGetNumDevs reached\r\n");
     LOG("midiOutGetNumDevs -> 1");
     return 1;
 }
 
 MMRESULT WINAPI midiOutGetDevCapsA(UINT_PTR uDeviceID, LPMIDIOUTCAPSA lpCaps, UINT cbCaps) {
-    if (uDeviceID != 0 || !lpCaps || cbCaps < sizeof(MIDIOUTCAPSA))
+    if (!IsSupportedMidiOutputDevice(uDeviceID) || !lpCaps || cbCaps < sizeof(MIDIOUTCAPSA))
         return MMSYSERR_BADDEVICEID;
     std::memset(lpCaps, 0, cbCaps);
     lpCaps->wMid = 1;
@@ -1513,7 +1678,7 @@ MMRESULT WINAPI midiOutGetDevCapsA(UINT_PTR uDeviceID, LPMIDIOUTCAPSA lpCaps, UI
 }
 
 MMRESULT WINAPI midiOutGetDevCapsW(UINT_PTR uDeviceID, LPMIDIOUTCAPSW lpCaps, UINT cbCaps) {
-    if (uDeviceID != 0 || !lpCaps || cbCaps < sizeof(MIDIOUTCAPSW))
+    if (!IsSupportedMidiOutputDevice(uDeviceID) || !lpCaps || cbCaps < sizeof(MIDIOUTCAPSW))
         return MMSYSERR_BADDEVICEID;
     std::memset(lpCaps, 0, cbCaps);
     lpCaps->wMid = 1;
@@ -1532,8 +1697,12 @@ MMRESULT WINAPI midiOutGetDevCapsW(UINT_PTR uDeviceID, LPMIDIOUTCAPSW lpCaps, UI
 MMRESULT WINAPI midiOutOpen(LPHMIDIOUT phmo, UINT uDeviceID,
     DWORD_PTR dwCallback, DWORD_PTR dwInstance, DWORD fdwOpen) {
     (void)dwCallback; (void)dwInstance; (void)fdwOpen;
+    XPBootstrapTrace("[SVMS XP] midiOutOpen reached\r\n");
     LOG("midiOutOpen: uDeviceID=%u", uDeviceID);
-    if (uDeviceID != 0) return MMSYSERR_BADDEVICEID;
+    if (!IsSupportedMidiOutputDevice(uDeviceID)) {
+        XPBootstrapTrace("[SVMS XP] midiOutOpen rejected unsupported device ID\r\n");
+        return MMSYSERR_BADDEVICEID;
+    }
     if (!phmo) return MMSYSERR_INVALPARAM;
 
     if (!g_driver || !g_driver->initialized) {
@@ -1541,8 +1710,11 @@ MMRESULT WINAPI midiOutOpen(LPHMIDIOUT phmo, UINT uDeviceID,
         g_driver = &svms::Driver::Instance();
         if (!g_driver->Initialize()) {
             LOG("midiOutOpen: Initialize FAILED");
+            XPBootstrapTrace("[SVMS XP] engine initialization FAILED\r\n");
+#if !defined(SVMS_XP_COMPAT)
             g_driver->Shutdown();
             g_driver = nullptr;
+#endif
             return MMSYSERR_NOMEM;
         }
     }
@@ -1550,21 +1722,43 @@ MMRESULT WINAPI midiOutOpen(LPHMIDIOUT phmo, UINT uDeviceID,
     const bool loaded = g_driver->LoadConfiguredSoundFont();
 
     LOG("midiOutOpen: SF loaded=%d", loaded);
-    g_driver->StartAudio();
+    if (!g_driver->StartAudio()) {
+        LOG("midiOutOpen: audio start FAILED");
+#if !defined(SVMS_XP_COMPAT)
+        g_driver->Shutdown();
+        g_driver = nullptr;
+#endif
+        return MMSYSERR_ERROR;
+    }
 
     LOG("midiOutOpen: SUCCESS, returning handle");
-    *phmo = reinterpret_cast<HMIDIOUT>(1);
+    *phmo = kSVMSMidiOutHandle;
+    XPBootstrapTrace("[SVMS XP] midiOutOpen SUCCESS handle=0x00001234\r\n");
     return MMSYSERR_NOERROR;
 }
 
 MMRESULT WINAPI midiOutClose(HMIDIOUT hmo) {
-    if (hmo != reinterpret_cast<HMIDIOUT>(1)) return MMSYSERR_INVALHANDLE;
+    (void)hmo;
+    XPBootstrapTrace("[SVMS XP] midiOutClose reached\r\n");
     if (g_driver) { g_driver->Shutdown(); g_driver = nullptr; }
     return MMSYSERR_NOERROR;
 }
 
 MMRESULT WINAPI midiOutShortMsg(HMIDIOUT hmo, DWORD dwMsg) {
-    if (hmo != reinterpret_cast<HMIDIOUT>(1)) return MMSYSERR_INVALHANDLE;
+    static LONG traceCount = 0;
+    const LONG traceIndex = InterlockedIncrement(&traceCount);
+    if (traceIndex <= 32) {
+        char message[256] = {};
+        std::snprintf(message, sizeof(message),
+                      "[SVMS XP] midiOutShortMsg #%ld handle=%p raw=0x%08lX status=0x%02lX data1=%lu data2=%lu driver=%s\r\n",
+                      static_cast<long>(traceIndex), static_cast<void*>(hmo),
+                      static_cast<unsigned long>(dwMsg),
+                      static_cast<unsigned long>(dwMsg & 0xFFu),
+                      static_cast<unsigned long>((dwMsg >> 8) & 0x7Fu),
+                      static_cast<unsigned long>((dwMsg >> 16) & 0x7Fu),
+                      g_driver ? "ready" : "null");
+        OutputDebugStringA(message);
+    }
     if (g_driver) {
         static int msgCount = 0;
         if (msgCount < 15) {
@@ -1577,12 +1771,13 @@ MMRESULT WINAPI midiOutShortMsg(HMIDIOUT hmo, DWORD dwMsg) {
 }
 
 MMRESULT WINAPI midiOutLongMsg(HMIDIOUT hmo, LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
+    XPBootstrapTrace("[SVMS XP] midiOutLongMsg reached\r\n");
     (void)hmo; (void)lpMidiHdr; (void)cbMidiHdr;
     return MMSYSERR_NOERROR;
 }
 
 MMRESULT WINAPI midiOutReset(HMIDIOUT hmo) {
-    if (hmo != reinterpret_cast<HMIDIOUT>(1)) return MMSYSERR_INVALHANDLE;
+    (void)hmo;
     if (g_driver) g_driver->ResetAllVoices();
     LOG("midiOutReset: all voices released");
     return MMSYSERR_NOERROR;
@@ -1659,16 +1854,19 @@ static bool EnsureDriverInitialized() {
     g_driver = &svms::Driver::Instance();
     if (!g_driver->Initialize()) {
         LOG("KDMAPI: Initialize FAILED");
+        XPBootstrapTrace("[SVMS XP] KDMAPI engine initialization FAILED\r\n");
+#if !defined(SVMS_XP_COMPAT)
         g_driver->Shutdown();
         g_driver = nullptr;
+#endif
         return false;
     }
     g_driver->LoadConfiguredSoundFont();
-    g_driver->StartAudio();
-    return true;
+    return g_driver->StartAudio();
 }
 
 BOOL WINAPI IsKDMAPIAvailable(void) {
+    XPBootstrapTrace("[SVMS XP] IsKDMAPIAvailable reached\r\n");
     return TRUE;
 }
 
@@ -1886,146 +2084,305 @@ MMRESULT WINAPI waveInGetPosition(HWAVEIN hwi, LPMMTIME pmmt, UINT cbmmt) {
 
 // ── Mixer ──────────────────────────────────────────────────────────────
 
-UINT WINAPI mixerGetNumDevs(void) { return 0; }
+UINT WINAPI mixerGetNumDevs(void) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = UINT (WINAPI*)(void);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetNumDevs"));
+    if (proc) return proc();
+#endif
+    return 0;
+}
 
 MMRESULT WINAPI mixerGetDevCapsA(UINT_PTR uMxId, LPMIXERCAPSA lpCaps, UINT cbCaps) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(UINT_PTR, LPMIXERCAPSA, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetDevCapsA"));
+    if (proc) return proc(uMxId, lpCaps, cbCaps);
+#endif
     (void)uMxId; (void)lpCaps; (void)cbCaps;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI mixerGetDevCapsW(UINT_PTR uMxId, LPMIXERCAPSW lpCaps, UINT cbCaps) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(UINT_PTR, LPMIXERCAPSW, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetDevCapsW"));
+    if (proc) return proc(uMxId, lpCaps, cbCaps);
+#endif
     (void)uMxId; (void)lpCaps; (void)cbCaps;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI mixerOpen(LPHMIXER phmx, UINT uMxId, DWORD_PTR dwCallback,
                           DWORD_PTR dwInstance, DWORD fdwOpen) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(LPHMIXER, UINT, DWORD_PTR, DWORD_PTR, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerOpen"));
+    if (proc) return proc(phmx, uMxId, dwCallback, dwInstance, fdwOpen);
+#endif
     (void)phmx; (void)uMxId; (void)dwCallback; (void)dwInstance; (void)fdwOpen;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI mixerClose(HMIXER hmx) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXER);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerClose"));
+    if (proc) return proc(hmx);
+#endif
     (void)hmx;
     return MMSYSERR_BADDEVICEID;
 }
 
 DWORD WINAPI mixerMessage(HMIXER hmx, UINT uMsg, DWORD_PTR dw1, DWORD_PTR dw2) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = DWORD (WINAPI*)(HMIXER, UINT, DWORD_PTR, DWORD_PTR);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerMessage"));
+    if (proc) return proc(hmx, uMsg, dw1, dw2);
+#endif
     (void)hmx; (void)uMsg; (void)dw1; (void)dw2;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI mixerGetLineInfoA(HMIXEROBJ hmxobj, LPMIXERLINEA pmxl, DWORD fdwInfo) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXEROBJ, LPMIXERLINEA, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetLineInfoA"));
+    if (proc) return proc(hmxobj, pmxl, fdwInfo);
+#endif
     (void)hmxobj; (void)pmxl; (void)fdwInfo;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI mixerGetLineInfoW(HMIXEROBJ hmxobj, LPMIXERLINEW pmxl, DWORD fdwInfo) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXEROBJ, LPMIXERLINEW, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetLineInfoW"));
+    if (proc) return proc(hmxobj, pmxl, fdwInfo);
+#endif
     (void)hmxobj; (void)pmxl; (void)fdwInfo;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI mixerGetID(HMIXEROBJ hmxobj, LPUINT puMxId, DWORD fdwId) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXEROBJ, LPUINT, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetID"));
+    if (proc) return proc(hmxobj, puMxId, fdwId);
+#endif
     (void)hmxobj; (void)puMxId; (void)fdwId;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI mixerGetLineControlsA(HMIXEROBJ hmxobj, LPMIXERLINECONTROLSA pmxlc, DWORD fdwControls) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXEROBJ, LPMIXERLINECONTROLSA, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetLineControlsA"));
+    if (proc) return proc(hmxobj, pmxlc, fdwControls);
+#endif
     (void)hmxobj; (void)pmxlc; (void)fdwControls;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI mixerGetLineControlsW(HMIXEROBJ hmxobj, LPMIXERLINECONTROLSW pmxlc, DWORD fdwControls) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXEROBJ, LPMIXERLINECONTROLSW, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetLineControlsW"));
+    if (proc) return proc(hmxobj, pmxlc, fdwControls);
+#endif
     (void)hmxobj; (void)pmxlc; (void)fdwControls;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI mixerGetControlDetailsA(HMIXEROBJ hmxobj, LPMIXERCONTROLDETAILS pmxcd, DWORD fdwDetails) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXEROBJ, LPMIXERCONTROLDETAILS, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetControlDetailsA"));
+    if (proc) return proc(hmxobj, pmxcd, fdwDetails);
+#endif
     (void)hmxobj; (void)pmxcd; (void)fdwDetails;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI mixerGetControlDetailsW(HMIXEROBJ hmxobj, LPMIXERCONTROLDETAILS pmxcd, DWORD fdwDetails) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXEROBJ, LPMIXERCONTROLDETAILS, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerGetControlDetailsW"));
+    if (proc) return proc(hmxobj, pmxcd, fdwDetails);
+#endif
     (void)hmxobj; (void)pmxcd; (void)fdwDetails;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI mixerSetControlDetails(HMIXEROBJ hmxobj, LPMIXERCONTROLDETAILS pmxcd, DWORD fdwDetails) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HMIXEROBJ, LPMIXERCONTROLDETAILS, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("mixerSetControlDetails"));
+    if (proc) return proc(hmxobj, pmxcd, fdwDetails);
+#endif
     (void)hmxobj; (void)pmxcd; (void)fdwDetails;
     return MMSYSERR_ERROR;
 }
 
 // ── Wave Output ────────────────────────────────────────────────────────
 
-UINT WINAPI waveOutGetNumDevs(void) { return 0; }
+UINT WINAPI waveOutGetNumDevs(void) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = UINT (WINAPI*)(void);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutGetNumDevs"));
+    if (proc) {
+        const UINT count = proc();
+        char message[256] = {};
+        std::snprintf(message, sizeof(message),
+                      "[SVMS XP] forwarded waveOutGetNumDevs proc=%p result=%u\r\n",
+                      reinterpret_cast<void*>(proc),
+                      static_cast<unsigned>(count));
+        OutputDebugStringA(message);
+        return count;
+    }
+#endif
+    return 0;
+}
 
 MMRESULT WINAPI waveOutGetDevCapsA(UINT_PTR uDeviceID, LPWAVEOUTCAPSA lpCaps, UINT cbCaps) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(UINT_PTR, LPWAVEOUTCAPSA, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutGetDevCapsA"));
+    if (proc) return proc(uDeviceID, lpCaps, cbCaps);
+#endif
     (void)uDeviceID; (void)lpCaps; (void)cbCaps;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI waveOutGetDevCapsW(UINT_PTR uDeviceID, LPWAVEOUTCAPSW lpCaps, UINT cbCaps) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(UINT_PTR, LPWAVEOUTCAPSW, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutGetDevCapsW"));
+    if (proc) return proc(uDeviceID, lpCaps, cbCaps);
+#endif
     (void)uDeviceID; (void)lpCaps; (void)cbCaps;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI waveOutOpen(LPHWAVEOUT phwo, UINT uDeviceID, LPCWAVEFORMATEX pwfx,
                             DWORD_PTR dwCallback, DWORD_PTR dwInstance, DWORD fdwOpen) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(LPHWAVEOUT, UINT, LPCWAVEFORMATEX,
+                                     DWORD_PTR, DWORD_PTR, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutOpen"));
+    if (proc) return proc(phwo, uDeviceID, pwfx, dwCallback, dwInstance, fdwOpen);
+#endif
     (void)phwo; (void)uDeviceID; (void)pwfx; (void)dwCallback; (void)dwInstance; (void)fdwOpen;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI waveOutClose(HWAVEOUT hwo) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutClose"));
+    if (proc) return proc(hwo);
+#endif
     (void)hwo;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI waveOutPrepareHeader(HWAVEOUT hwo, LPWAVEHDR lpWaveHdr, UINT cbWaveHdr) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT, LPWAVEHDR, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutPrepareHeader"));
+    if (proc) return proc(hwo, lpWaveHdr, cbWaveHdr);
+#endif
     (void)hwo; (void)lpWaveHdr; (void)cbWaveHdr;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI waveOutUnprepareHeader(HWAVEOUT hwo, LPWAVEHDR lpWaveHdr, UINT cbWaveHdr) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT, LPWAVEHDR, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutUnprepareHeader"));
+    if (proc) return proc(hwo, lpWaveHdr, cbWaveHdr);
+#endif
     (void)hwo; (void)lpWaveHdr; (void)cbWaveHdr;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI waveOutWrite(HWAVEOUT hwo, LPWAVEHDR lpWaveHdr, UINT cbWaveHdr) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT, LPWAVEHDR, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutWrite"));
+    if (proc) return proc(hwo, lpWaveHdr, cbWaveHdr);
+#endif
     (void)hwo; (void)lpWaveHdr; (void)cbWaveHdr;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI waveOutReset(HWAVEOUT hwo) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutReset"));
+    if (proc) return proc(hwo);
+#endif
     (void)hwo;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI waveOutRestart(HWAVEOUT hwo) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutRestart"));
+    if (proc) return proc(hwo);
+#endif
     (void)hwo;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI waveOutPause(HWAVEOUT hwo) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutPause"));
+    if (proc) return proc(hwo);
+#endif
     (void)hwo;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI waveOutBreakLoop(HWAVEOUT hwo) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutBreakLoop"));
+    if (proc) return proc(hwo);
+#endif
     (void)hwo;
     return MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI waveOutGetPosition(HWAVEOUT hwo, LPMMTIME pmmt, UINT cbmmt) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT, LPMMTIME, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutGetPosition"));
+    if (proc) return proc(hwo, pmmt, cbmmt);
+#endif
     (void)hwo; (void)pmmt; (void)cbmmt;
     return MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI waveOutGetVolume(HWAVEOUT hwo, LPDWORD pdwVolume) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT, LPDWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutGetVolume"));
+    if (proc) return proc(hwo, pdwVolume);
+#endif
     (void)hwo;
     if (pdwVolume) *pdwVolume = 0xFFFFFFFF;
     return MMSYSERR_NOERROR;
 }
 
 MMRESULT WINAPI waveOutSetVolume(HWAVEOUT hwo, DWORD dwVolume) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutSetVolume"));
+    if (proc) return proc(hwo, dwVolume);
+#endif
     (void)hwo; (void)dwVolume;
     return MMSYSERR_NOERROR;
 }
@@ -2053,6 +2410,11 @@ MMRESULT WINAPI waveOutSetPlaybackRate(HWAVEOUT hwo, DWORD dwRate) {
 }
 
 MMRESULT WINAPI waveOutGetID(HWAVEOUT hwo, LPUINT puDeviceID) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT, LPUINT);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutGetID"));
+    if (proc) return proc(hwo, puDeviceID);
+#endif
     (void)hwo;
     if (puDeviceID) *puDeviceID = 0;
     return MMSYSERR_NOERROR;
@@ -2079,6 +2441,11 @@ MMRESULT WINAPI waveOutGetErrorTextW(MMRESULT mmrError, LPWSTR lpText, UINT cchT
 }
 
 MMRESULT WINAPI waveOutMessage(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dw1, DWORD_PTR dw2) {
+#if defined(SVMS_XP_COMPAT)
+    using Proc = MMRESULT (WINAPI*)(HWAVEOUT, UINT, DWORD_PTR, DWORD_PTR);
+    Proc proc = reinterpret_cast<Proc>(GetXPSystemWinmmProc("waveOutMessage"));
+    if (proc) return proc(hwo, uMsg, dw1, dw2);
+#endif
     (void)hwo; (void)uMsg; (void)dw1; (void)dw2;
     return MMSYSERR_ERROR;
 }
@@ -2134,6 +2501,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)hinstDLL; (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
+        XPBootstrapTrace("[SVMS XP] V3 winmm.dll loaded\r\n");
         LogInit();
         LOG("DLL_PROCESS_ATTACH");
     } else if (fdwReason == DLL_PROCESS_DETACH) {

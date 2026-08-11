@@ -240,6 +240,7 @@ enum class AudioBackend : uint8_t {
     WASAPIShared = 0,
     WASAPIExclusive = 1,
     ASIO = 2,
+    DirectSound = 3,
 };
 
 enum class RenderBackend : uint8_t {

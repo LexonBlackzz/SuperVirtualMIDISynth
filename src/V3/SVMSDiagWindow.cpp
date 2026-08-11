@@ -1,6 +1,7 @@
 #include "SVMSDiagWindow.h"
 #include <windows.h>
 #include <cstdio>
+#include <cwchar>
 #include <cstring>
 #include <atomic>
 
@@ -8,6 +9,13 @@ namespace svms {
 namespace {
 
 struct DiagStats {
+    bool audioRunning;
+    bool soundFontLoaded;
+    int32_t audioError;
+    uint32_t sampleRate;
+    uint32_t bufferFrames;
+    float masterVolume;
+    bool waveOutFallback;
     uint32_t activeVoices;
     uint32_t maxVoices;
     uint32_t releasingVoices;
@@ -112,55 +120,76 @@ static void OnPaint(HWND hwnd) {
 
     wchar_t buf[160];
 
-    swprintf_s(buf, L"%u / %u", s.activeVoices, s.maxVoices);
+#if defined(SVMS_XP_COMPAT)
+    const wchar_t* backend = s.waveOutFallback
+                                 ? L"waveOut fallback (XP x86)"
+                                 : L"DirectSound (XP x86)";
+#else
+    const wchar_t* backend = L"WASAPI shared";
+#endif
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]),
+                  L"%ls: %ls, %u Hz / %u frames, hr=0x%08X", backend,
+                  s.audioRunning ? L"running" : L"stopped", s.sampleRate,
+                  s.bufferFrames, static_cast<unsigned int>(s.audioError));
+    DrawStat(memDC, kPadX, y, L"Audio:            ", buf);
+    y += kLineH;
+
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]),
+                  L"%ls, master=%.3f, render peak=%.5f",
+                  s.soundFontLoaded ? L"loaded" : L"MISSING / FAILED TO LOAD",
+                  s.masterVolume, s.sf2.renderPeak);
+    DrawStat(memDC, kPadX, y, L"SoundFont:        ", buf);
+    y += kLineH;
+
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u / %u", s.activeVoices, s.maxVoices);
     DrawStat(memDC, kPadX, y, L"Active Voices:    ", buf);
     y += kLineH;
 
     if (s.maxVoices > 0) {
         float pct = (float)s.activeVoices / (float)s.maxVoices * 100.0f;
-        swprintf_s(buf, L"%.0f%%", pct);
+        std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.0f%%", pct);
     } else {
-        wcscpy_s(buf, L"-");
+        std::wcscpy(buf, L"-");
     }
     DrawStat(memDC, kPadX, y, L"Pool Usage:       ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"release=%u sustain=%u steals=%u",
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"release=%u sustain=%u steals=%u",
                s.releasingVoices, s.sustainHeldVoices, s.voiceSteals);
     DrawStat(memDC, kPadX, y, L"Voice states:     ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%.1f%%", s.cpuPercent);
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.1f%%", s.cpuPercent);
     DrawStat(memDC, kPadX, y, L"CPU Render:       ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%.0f / %.0f / %.0f%%", s.callbackP95,
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.0f / %.0f / %.0f%%", s.callbackP95,
                s.callbackP99, s.callbackP999);
     DrawStat(memDC, kPadX, y, L"CPU p95/99/99.9:  ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%llu (max run %u)",
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%llu (max run %u)",
                static_cast<unsigned long long>(s.overBudgetCallbacks),
                s.maxConsecutiveOverBudget);
     DrawStat(memDC, kPadX, y, L"Over budget:      ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%u", s.decimationStep);
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u", s.decimationStep);
     DrawStat(memDC, kPadX, y, L"Decimation Step:  ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%u (%u immediate)", s.retired, s.retiredImmediate);
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u (%u immediate)", s.retired, s.retiredImmediate);
     DrawStat(memDC, kPadX, y, L"Retired:          ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%llu / %llu / %llu",
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%llu / %llu / %llu",
                static_cast<unsigned long long>(s.sf2.noteOns),
                static_cast<unsigned long long>(s.sf2.exactRegionMatches),
                static_cast<unsigned long long>(s.sf2.configuredVoices));
     DrawStat(memDC, kPadX, y, L"SF2 notes/match/voice: ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"zero=%llu preset=%llu region=%llu range=%llu",
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"zero=%llu preset=%llu region=%llu range=%llu",
                static_cast<unsigned long long>(s.sf2.zeroMatchedRegions),
                static_cast<unsigned long long>(s.sf2.invalidPresets),
                static_cast<unsigned long long>(s.sf2.invalidRegions),
@@ -168,29 +197,29 @@ static void OnPaint(HWND hwnd) {
     DrawStat(memDC, kPadX, y, L"SF2 rejects:       ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"ch=%u n=%u v=%u p=%u r=%u s=%u raw=%.3f mix=%.3f",
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"ch=%u n=%u v=%u p=%u r=%u s=%u raw=%.3f mix=%.3f",
                s.sf2.lastChannel, s.sf2.lastNote, s.sf2.lastVelocity,
                s.sf2.lastPreset, s.sf2.lastRegion, s.sf2.lastSample,
                s.sf2.lastInitialPeak, s.sf2.renderPeak);
     DrawStat(memDC, kPadX, y, L"Last SF2 voice:    ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%.4f  %.4f / %.4f  %u / %u", s.sf2.lastVoiceGain,
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.4f  %.4f / %.4f  %u / %u", s.sf2.lastVoiceGain,
                s.sf2.lastMixGainL, s.sf2.lastMixGainR, s.sf2.lastDelaySamples,
                s.sf2.lastAttackSamples);
     DrawStat(memDC, kPadX, y, L"Gain/mix/del/atk:  ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%.5f / %.5f  relEnd=%u backed=%u", s.sf2.lastPhase,
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.5f / %.5f  relEnd=%u backed=%u", s.sf2.lastPhase,
                s.sf2.lastPhaseStep, s.sf2.lastRelativeEnd, s.sf2.lastSampleBacked);
     DrawStat(memDC, kPadX, y, L"Phase/step/region: ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%.6f", s.sf2.lastFloatSample);
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.6f", s.sf2.lastFloatSample);
     DrawStat(memDC, kPadX, y, L"Cached sample[0]:  ", buf);
     y += kLineH;
 
-    swprintf_s(buf, L"%u .. %u", s.sf2.lastSampleStart, s.sf2.lastSampleEnd);
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u .. %u", s.sf2.lastSampleStart, s.sf2.lastSampleEnd);
     DrawStat(memDC, kPadX, y, L"Sample bounds:     ", buf);
 
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
@@ -224,7 +253,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_debugOutput) {
                     const DiagStats stats = ReadPublishedStats();
                     char text[192];
-                    sprintf_s(text,
+                    std::snprintf(text, sizeof(text),
                         "[SVMS] voices=%u/%u retire=%u immediate=%u step=%u cpu=%.1f%% p99=%.0f%% over=%llu\n",
                         stats.activeVoices, stats.maxVoices, stats.retired,
                         stats.retiredImmediate, stats.decimationStep,
@@ -322,6 +351,24 @@ void DiagWindow_Destroy() {
     }
 }
 
+void DiagWindow_UpdateStartup(bool audioRunning, int32_t audioError,
+                              bool soundFontLoaded, uint32_t sampleRate,
+                              uint32_t bufferFrames, float masterVolume,
+                              bool waveOutFallback) {
+    const uint32_t target = 1u - g_publishedStats.load(std::memory_order_relaxed);
+    if (g_statsReader.load(std::memory_order_acquire) == target) return;
+    DiagStats& stats = g_stats[target];
+    stats = g_stats[g_publishedStats.load(std::memory_order_acquire)];
+    stats.audioRunning = audioRunning;
+    stats.audioError = audioError;
+    stats.soundFontLoaded = soundFontLoaded;
+    stats.sampleRate = sampleRate;
+    stats.bufferFrames = bufferFrames;
+    stats.masterVolume = masterVolume;
+    stats.waveOutFallback = waveOutFallback;
+    g_publishedStats.store(target, std::memory_order_release);
+}
+
 void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         uint32_t releasingVoices, uint32_t sustainHeldVoices,
                         uint32_t voiceSteals,
@@ -330,12 +377,23 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         float callbackP999, uint64_t overBudgetCallbacks,
                         uint32_t maxConsecutiveOverBudget,
                         uint32_t retired, uint32_t retiredImmediate,
+                        bool audioRunning, int32_t audioError,
+                        bool soundFontLoaded, uint32_t sampleRate,
+                        uint32_t bufferFrames, float masterVolume,
+                        bool waveOutFallback,
                         const LiveSF2Telemetry& sf2) {
     if (!g_running.load(std::memory_order_acquire)) return;
     const uint32_t target = 1u - g_publishedStats.load(std::memory_order_relaxed);
     if (g_statsReader.load(std::memory_order_acquire) == target) return;
 
     DiagStats& stats = g_stats[target];
+    stats.audioRunning = audioRunning;
+    stats.audioError = audioError;
+    stats.soundFontLoaded = soundFontLoaded;
+    stats.sampleRate = sampleRate;
+    stats.bufferFrames = bufferFrames;
+    stats.masterVolume = masterVolume;
+    stats.waveOutFallback = waveOutFallback;
     stats.activeVoices = activeVoices;
     stats.maxVoices = maxVoices;
     stats.releasingVoices = releasingVoices;

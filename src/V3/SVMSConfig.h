@@ -52,7 +52,10 @@ std::wstring GetV3ConfigPath();
 std::wstring GetV3LocalConfigPath();
 std::wstring GetV3AppDataConfigPath();
 std::wstring GetV3ModuleDirectory();
-std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg);
+// An explicit absolute or DLL-relative synth.soundfont wins. If it is absent
+// or missing, deterministically discover .sf2 files beside winmm.dll.
+std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
+                                    std::string* warning = nullptr);
 
 struct RuntimeConfigSnapshot {
     float masterVolume;

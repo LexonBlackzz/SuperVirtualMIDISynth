@@ -870,7 +870,19 @@ void TestJsonConfigurationLifecycle() {
     const fs::path configPath = directory / L"config.json";
     std::error_code ec;
     fs::remove_all(directory, ec);
+    const fs::path soundFontDirectory = directory / L"soundfonts";
+    fs::create_directories(soundFontDirectory, ec);
+    const fs::path alphaSoundFont = soundFontDirectory / L"Alpha Piano.SF2";
+    const fs::path betaSoundFont = soundFontDirectory / L"beta.sf2";
+    {
+        std::ofstream alpha(alphaSoundFont, std::ios::binary);
+        std::ofstream beta(betaSoundFont, std::ios::binary);
+        alpha << "test";
+        beta << "test";
+    }
     SetEnvironmentVariableW(L"SVMS_TEST_CONFIG_PATH", configPath.c_str());
+    SetEnvironmentVariableW(L"SVMS_TEST_SOUNDFONT_DIRECTORY",
+                            soundFontDirectory.c_str());
 
     svms::EngineConfig created = svms::EngineConfig::Load();
     Check(fs::exists(configPath), "first run creates config.json");
@@ -878,6 +890,15 @@ void TestJsonConfigurationLifecycle() {
           "first-run JSON uses compiled audio defaults");
     Check(created.eventRingCapacity == 393216 && created.highPriorityVelocity == 96,
           "first-run JSON uses priority ingress defaults");
+#if defined(SVMS_XP_COMPAT)
+    Check(created.diagnosticsEnabled && created.diagnosticsWindow,
+          "first-run XP JSON opens the diagnostic window by default");
+#else
+    Check(!created.diagnosticsEnabled && !created.diagnosticsWindow,
+          "first-run modern JSON keeps diagnostics opt-in");
+#endif
+    Check(created.soundFontPath == L"Alpha Piano.SF2",
+          "first-run JSON records a discovered DLL-local SoundFont name");
     {
         std::ifstream input(configPath, std::ios::binary);
         std::string text((std::istreambuf_iterator<char>(input)), {});
@@ -885,7 +906,25 @@ void TestJsonConfigurationLifecycle() {
               "created JSON carries schema version");
         Check(text.find("\"correctness_mode\": true") != std::string::npos,
               "created JSON enables scalar correctness mode");
+        Check(text.find("Alpha Piano.SF2") != std::string::npos,
+              "created JSON explicitly stores the discovered SoundFont");
     }
+
+    svms::EngineConfig explicitAbsolute = svms::EngineConfig::Default();
+    explicitAbsolute.soundFontPath = betaSoundFont.wstring();
+    Check(fs::path(svms::ResolveV3SoundFontPath(explicitAbsolute)) == betaSoundFont,
+          "absolute configured SoundFont paths take precedence");
+    svms::EngineConfig explicitRelative = svms::EngineConfig::Default();
+    explicitRelative.soundFontPath = L"Alpha Piano.SF2";
+    Check(fs::path(svms::ResolveV3SoundFontPath(explicitRelative)) == alphaSoundFont,
+          "relative configured SoundFont paths resolve beside winmm.dll");
+    svms::EngineConfig missingConfigured = svms::EngineConfig::Default();
+    missingConfigured.soundFontPath = L"missing.sf2";
+    std::string discoveryWarning;
+    Check(fs::path(svms::ResolveV3SoundFontPath(
+              missingConfigured, &discoveryWarning)) == alphaSoundFont &&
+              !discoveryWarning.empty(),
+          "missing configured SoundFont falls back to deterministic local discovery");
 
     fs::remove(configPath, ec);
     svms::EngineConfig concurrentA{};
@@ -1001,11 +1040,21 @@ void TestJsonConfigurationLifecycle() {
               fs::path(portableCreation.configPath) == portableConfig,
           "unavailable AppData creates a portable config beside the DLL");
 
+    fs::remove(alphaSoundFont, ec);
+    fs::remove(betaSoundFont, ec);
+    svms::EngineConfig noConfiguredSoundFont = svms::EngineConfig::Default();
+    std::string noSoundFontWarning;
+    Check(svms::ResolveV3SoundFontPath(
+              noConfiguredSoundFont, &noSoundFontWarning).empty() &&
+              !noSoundFontWarning.empty(),
+          "missing configuration and local SF2 produce an explicit warning");
+
     SetEnvironmentVariableW(L"SVMS_NO_DROP_EVENTS", nullptr);
     SetEnvironmentVariableW(L"SVMS_CORRECTNESS_MODE", nullptr);
     SetEnvironmentVariableW(L"SVMS_DIAGNOSTICS", nullptr);
     SetEnvironmentVariableW(L"SVMS_TEST_CONFIG_PATH", nullptr);
     SetEnvironmentVariableW(L"SVMS_TEST_LOCAL_CONFIG_PATH", nullptr);
+    SetEnvironmentVariableW(L"SVMS_TEST_SOUNDFONT_DIRECTORY", nullptr);
     fs::remove_all(directory, ec);
 }
 

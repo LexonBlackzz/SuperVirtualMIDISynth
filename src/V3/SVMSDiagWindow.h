@@ -7,6 +7,10 @@ namespace svms {
 
 void DiagWindow_Create(bool showWindow, bool debugOutput);
 void DiagWindow_Destroy();
+void DiagWindow_UpdateStartup(bool audioRunning, int32_t audioError,
+                              bool soundFontLoaded, uint32_t sampleRate,
+                              uint32_t bufferFrames, float masterVolume,
+                              bool waveOutFallback = false);
 void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         uint32_t releasingVoices, uint32_t sustainHeldVoices,
                         uint32_t voiceSteals,
@@ -15,6 +19,10 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         float callbackP999, uint64_t overBudgetCallbacks,
                         uint32_t maxConsecutiveOverBudget,
                         uint32_t retired, uint32_t retiredImmediate,
+                        bool audioRunning, int32_t audioError,
+                        bool soundFontLoaded, uint32_t sampleRate,
+                        uint32_t bufferFrames, float masterVolume,
+                        bool waveOutFallback,
                         const LiveSF2Telemetry& sf2);
 
 } // namespace svms
