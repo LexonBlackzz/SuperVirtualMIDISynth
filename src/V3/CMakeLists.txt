@@ -221,6 +221,22 @@ set_target_properties(svmsynth PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+if(NOT SVMS_XP_COMPAT)
+    add_executable(svms_v3_render
+        SVMSOfflineRenderer.cpp
+        SVMSMidiStream.cpp
+        SVMSSoundFont.cpp
+        SVMSRenderKernels.cpp
+        SVMSRenderDispatch.cpp
+        SVMSRenderKernelsSSE2.cpp
+        SVMSRenderKernelsAVX2.cpp)
+    target_compile_definitions(svms_v3_render PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    set_target_properties(svms_v3_render PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
+
 # Ziggy's direct-synth loader probes SnappySynth.dll and then discovers the
 # SSV2-compatible telemetry/KDMAPI exports. Keep winmm.dll as the canonical
 # drop-in output and emit a byte-identical alias for that host integration.
@@ -301,6 +317,14 @@ if(SVMS_BUILD_TESTS)
         set_tests_properties(svms_v3_xp_diag_window_smoke PROPERTIES
             SKIP_RETURN_CODE 77)
     else()
+        add_executable(svms_v3_midi_stream_tests
+            tests/SVMSMidiStreamTests.cpp SVMSMidiStream.cpp)
+        target_compile_definitions(svms_v3_midi_stream_tests PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+        target_include_directories(svms_v3_midi_stream_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME svms_v3_midi_stream COMMAND svms_v3_midi_stream_tests)
+
         add_executable(svms_v3_live_smoke tests/SVMSLiveSmoke.cpp)
         target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

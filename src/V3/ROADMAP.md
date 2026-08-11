@@ -177,8 +177,13 @@ larger phase containing that item is complete.
   block sizes from 16 through 8192 frames
 - [ ] Add explicit sequence-gap/corruption detection beyond queue integrity
   tests
-- [ ] Provide an offline/reference scheduling mode that processes every event
-  without shedding or callback budgeting
+- [x] Provide `svms_v3_render`, an offline scheduling mode that processes every
+  channel event without shedding or callback budgeting, memory-maps the SMF,
+  streams parsed events through a bounded 128 MiB ring, and writes WAV/RF64
+  incrementally with voice/steal/render-speed/ETA telemetry
+- [x] Validate offline format-1 merging, running status, tempo changes, exact
+  frame conversion, ring wrap, x64/x86 builds, and the 13,477,488-event Krash
+  corpus using the production scalar/SSE2/AVX2 render backend
 
 ### Scalar, MIDI, and Voice Correctness
 
