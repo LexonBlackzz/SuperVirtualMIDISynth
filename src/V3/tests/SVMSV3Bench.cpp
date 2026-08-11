@@ -50,6 +50,8 @@ bool gCollectBreakdown = false;
 uint64_t gRenderCycles = 0u;
 uint64_t gDispatchCycles = 0u;
 uint64_t gStealCycles = 0u;
+uint64_t gRegionResolveCycles = 0u;
+uint64_t gLaunchPrepareCycles = 0u;
 uint64_t gMatchedRegions = 0u;
 
 double Percentile(std::vector<double> values, double percentile) {
@@ -68,6 +70,7 @@ struct Options {
     bool enforce = false;
     bool reference = false;
     bool breakdown = false;
+    bool transactionalLaunch = true;
     uint32_t eventStride = 1;
     uint32_t noteRate = 64000;
     uint32_t keyCount = 128;
@@ -136,6 +139,15 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.reference = true;
         } else if (std::strcmp(argv[i], "--breakdown") == 0) {
             options.breakdown = true;
+        } else if (std::strcmp(argv[i], "--launch-path") == 0) {
+            if (i + 1 >= argc) return false;
+            const char* path = argv[++i];
+            if (std::strcmp(path, "transactional") == 0)
+                options.transactionalLaunch = true;
+            else if (std::strcmp(path, "legacy") == 0)
+                options.transactionalLaunch = false;
+            else
+                return false;
         } else if (std::strcmp(argv[i], "--quick") == 0) {
             options.seconds = 1;
             options.warmupSeconds = 1;
@@ -189,13 +201,48 @@ void ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
 void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channels,
                    uint32_t& sequence, uint32_t count, uint32_t sampleFrames,
                    const svms::RenderEvent* sourceEvent = nullptr,
-                   uint32_t attackFrames = 0u) {
+                   uint32_t attackFrames = 0u,
+                   bool transactional = false) {
     constexpr uint32_t regionFrames = 2048;
     const uint32_t regionCount = sampleFrames / regionFrames;
     // Every physical SF2 region produced by one MIDI note belongs to one
     // playIndex. This makes the synthetic layered benchmark exercise the
     // same atomic stereo-stealing path as the production driver.
     const uint32_t playIndex = sequence + 1u;
+    if (transactional && count == 1u) {
+        const uint64_t prepareBegin = gCollectBreakdown ? __rdtsc() : 0u;
+        const uint8_t channel = sourceEvent ? sourceEvent->channel
+            : static_cast<uint8_t>(sequence & 15u);
+        const uint8_t note = sourceEvent ? sourceEvent->data1
+            : static_cast<uint8_t>(24u + sequence % 88u);
+        const uint8_t velocity = sourceEvent ? sourceEvent->data2
+            : static_cast<uint8_t>(64u + sequence % 64u);
+        const uint32_t start = (sequence % regionCount) * regionFrames;
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = start;
+        setup.sampleEnd = start + regionFrames;
+        setup.loopStart = start + 16u;
+        setup.loopEnd = start + regionFrames - 16u;
+        setup.loopMode = 1u;
+        setup.playIndex = playIndex;
+        setup.phaseStep = 0.5f +
+            static_cast<float>(sequence % 97u) / 64.0f;
+        setup.basePhaseStep = setup.phaseStep;
+        setup.initialGain = 1.0f;
+        setup.attackSamples = attackFrames;
+        setup.attackGainStep = attackFrames > 0u
+            ? setup.initialGain / static_cast<float>(attackFrames) : 0.0f;
+        setup.sustainLevel = 0.7f;
+        setup.releaseDecay = 0.9999999f;
+        setup.gainLeft = setup.gainRight = 0.001f;
+        if (gCollectBreakdown)
+            gLaunchPrepareCycles += __rdtsc() - prepareBegin;
+        svms::VoiceHandle handle = svms::kInvalidVoice;
+        ++sequence;
+        voices.LaunchVoiceGroup(channel, note, velocity, &setup, 1u,
+                                channels.GetParams()[channel], &handle);
+        return;
+    }
     for (uint32_t i = 0; i < count; ++i, ++sequence) {
         const uint8_t channel = sourceEvent ? sourceEvent->channel
             : static_cast<uint8_t>(sequence & 15u);
@@ -238,6 +285,9 @@ struct MixedDispatchContext {
     const svms::SF2Data* soundFont;
     uint32_t presetIndex;
     uint32_t attackFrames;
+    bool transactionalLaunch;
+    uint16_t regionCacheCount[128];
+    uint32_t regionCacheIndices[128][8];
 };
 
 void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
@@ -247,27 +297,49 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
     auto& channels = *context->channels;
     switch (event.type) {
         case svms::RenderEventType::NoteOn: {
+            const uint64_t resolveBegin = gCollectBreakdown ? __rdtsc() : 0u;
             uint32_t layerCount = 1u;
             if (context->soundFont) {
                 const svms::SFSampleRegion* regions[512]{};
-                layerCount = svms::sf2_find_regions(
-                    context->soundFont, context->presetIndex, event.data1,
-                    event.data2, regions, 512u);
+                const uint16_t cachedCount =
+                    context->regionCacheCount[event.data1];
+                if (cachedCount != UINT16_MAX) {
+                    layerCount = cachedCount;
+                    for (uint32_t i = 0; i < layerCount; ++i)
+                        regions[i] = &context->soundFont->regions[
+                            context->regionCacheIndices[event.data1][i]];
+                } else {
+                    layerCount = svms::sf2_find_regions(
+                        context->soundFont, context->presetIndex, event.data1,
+                        event.data2, regions, 512u);
+                    if (layerCount <= 8u) {
+                        context->regionCacheCount[event.data1] =
+                            static_cast<uint16_t>(layerCount);
+                        for (uint32_t i = 0; i < layerCount; ++i)
+                            context->regionCacheIndices[event.data1][i] =
+                                static_cast<uint32_t>(regions[i] -
+                                    context->soundFont->regions);
+                    }
+                }
                 gMatchedRegions += layerCount;
                 if (layerCount == 0u) break;
             }
+            if (gCollectBreakdown)
+                gRegionResolveCycles += __rdtsc() - resolveBegin;
             if (gCollectBreakdown) {
                 const uint64_t begin = __rdtsc();
                 PerformSteals(voices, channels, context->sequence, layerCount,
                               context->sampleFrames, &event,
-                              context->attackFrames);
+                              context->attackFrames,
+                              context->transactionalLaunch);
                 const uint64_t end = __rdtsc();
                 gStealCycles += end - begin;
                 break;
             }
             PerformSteals(voices, channels, context->sequence, layerCount,
                           context->sampleFrames, &event,
-                          context->attackFrames);
+                          context->attackFrames,
+                          context->transactionalLaunch);
             break;
         }
         case svms::RenderEventType::NoteOff: {
@@ -322,6 +394,7 @@ int main(int argc, char** argv) {
             "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst] "
             "[--event-stride N] [--note-rate N] [--key-count 1..128] [--attack-frames N] [--soundfont PATH] "
             "[--backend auto|scalar|sse2|avx2] "
+            "[--launch-path legacy|transactional] "
             "[--breakdown] "
             "[--pin-core 0..63] "
             "[--quick] [--reference] [--enforce]\n");
@@ -377,7 +450,10 @@ int main(int argc, char** argv) {
     }
     MixedDispatchContext mixedContext{
         voices.get(), &channels, &cfg, sampleFrames, options.voices,
-        soundFont.get(), soundFontPreset, options.attackFrames};
+        soundFont.get(), soundFontPreset, options.attackFrames,
+        options.transactionalLaunch};
+    std::fill(std::begin(mixedContext.regionCacheCount),
+              std::end(mixedContext.regionCacheCount), UINT16_MAX);
     if (options.workload == Workload::Dense ||
         options.workload == Workload::MixedEvents ||
         options.workload == Workload::NoteBurst) {
@@ -455,7 +531,8 @@ int main(int argc, char** argv) {
 
     auto renderOne = [&] {
         if (options.workload == Workload::Steal)
-            PerformSteals(*voices, channels, stealSequence, 16u, sampleFrames);
+            PerformSteals(*voices, channels, stealSequence, 16u, sampleFrames,
+                          nullptr, 0u, options.transactionalLaunch);
         std::fill(left.begin(), left.end(), 0.0f);
         std::fill(right.begin(), right.end(), 0.0f);
         const uint64_t renderBegin = gCollectBreakdown ? __rdtsc() : 0u;
@@ -481,6 +558,7 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < warmupCallbacks; ++i) renderOne();
 
     gRenderCycles = gDispatchCycles = gStealCycles = gMatchedRegions = 0u;
+    gRegionResolveCycles = gLaunchPrepareCycles = 0u;
     gCollectBreakdown = options.breakdown;
 
     std::vector<double> callbackPercent;
@@ -536,13 +614,14 @@ int main(int argc, char** argv) {
     }
 
     std::printf(
-        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"workload\":\"%s\",\"voices\":%u,\"frames\":%u,"
+        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"workload\":\"%s\",\"launch_path\":\"%s\",\"voices\":%u,\"frames\":%u,"
         "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,"
         "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
         "\"voice_samples_per_second\":%.0f,"
         "\"cycles_per_voice_sample\":%.3f,\"events_per_second\":%.0f,"
         "\"steals_per_second\":%.0f,\"matched_regions\":%llu,\"max_consecutive_overruns\":%u,"
-        "\"cycle_breakdown\":{\"render\":%llu,\"dispatch_excluding_steal\":%llu,\"steal\":%llu},"
+        "\"cycle_breakdown\":{\"total\":%llu,\"synthesis\":%llu,\"event_dispatch\":%llu,"
+        "\"region_resolution\":%llu,\"launch_preparation\":%llu,\"index_and_steal\":%llu},"
         "\"render_classes\":{\"sustained_loop\":%u,\"sustained_one_shot\":%u,"
         "\"transient_loop\":%u,\"release_loop\":%u,\"release_one_shot\":%u,"
         "\"generic\":%u,\"steal_tails\":%u},"
@@ -550,6 +629,7 @@ int main(int argc, char** argv) {
         "\"p99\":%.2f,\"p99_9\":%.2f,\"max\":%.2f}}\n",
         options.reference ? "reference" : "span", renderer->GetRenderBackendName(),
         WorkloadName(options.workload),
+        options.transactionalLaunch ? "transactional" : "legacy",
         options.voices, options.frames,
         measuredCallbacks, options.eventStride, options.noteRate, options.keyCount,
         options.attackFrames,
@@ -560,9 +640,14 @@ int main(int argc, char** argv) {
         cyclesPerVoiceSample, eventsPerSecond, stealsPerSecond,
         static_cast<unsigned long long>(gMatchedRegions), maximumConsecutiveOverruns,
         static_cast<unsigned long long>(gRenderCycles),
+        static_cast<unsigned long long>(gRenderCycles -
+            (std::min)(gRenderCycles, gDispatchCycles)),
         static_cast<unsigned long long>(gDispatchCycles -
-            (std::min)(gDispatchCycles, gStealCycles)),
-        static_cast<unsigned long long>(gStealCycles),
+            (std::min)(gDispatchCycles, gStealCycles + gRegionResolveCycles)),
+        static_cast<unsigned long long>(gRegionResolveCycles),
+        static_cast<unsigned long long>(gLaunchPrepareCycles),
+        static_cast<unsigned long long>(gStealCycles -
+            (std::min)(gStealCycles, gLaunchPrepareCycles)),
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedLoop)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedOneShot)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::TransientLoop)],
@@ -572,7 +657,11 @@ int main(int argc, char** argv) {
         voices->GetStealTailCount(), p50, p95, p99, p999, maximum);
 
     int result = 0;
-    if (options.enforce && options.voices == 4096u) {
+    if (options.enforce && options.voices == 2000u &&
+        options.workload == Workload::NoteBurst &&
+        options.noteRate >= 943000u) {
+        if (p99 >= 40.0 || maximumConsecutiveOverruns != 0u) result = 2;
+    } else if (options.enforce && options.voices == 4096u) {
         const double limit = options.workload == Workload::MixedEvents ? 35.0
             : options.workload == Workload::Dense ? 25.0
             : options.workload == Workload::Sustained ? 60.0 : 70.0;

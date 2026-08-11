@@ -629,6 +629,58 @@ void TestPriorityAwareStealingAndFadeTail() {
     }
 
     {
+        auto legacy = std::make_unique<svms::VoiceManager>();
+        auto transactional = std::make_unique<svms::VoiceManager>();
+        legacy->Initialize(8u, 44100u);
+        transactional->Initialize(8u, 44100u);
+        svms::ChannelParamsSnapshot channel{};
+        channel.volume = channel.expression = 1.0f;
+        channel.panLeft = channel.panRight = 0.70710678f;
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 128u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 120u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep = 1.0f;
+        setup.initialGain = setup.sustainLevel = 1.0f;
+        setup.releaseDecay = 0.999f;
+        setup.gainLeft = setup.gainRight = 0.1f;
+        setup.sampleBacked = 1u;
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            setup.playIndex = i + 1u;
+            const auto first = legacy->AllocateVoice(0u, 60u, 100u);
+            const auto second = transactional->AllocateVoice(0u, 60u, 100u);
+            legacy->ConfigureVoice(first, setup, channel, false);
+            transactional->ConfigureVoice(second, setup, channel, false);
+        }
+        setup.playIndex = 100u;
+        const auto replacement = legacy->AllocateVoiceOrSteal(
+            0u, 67u, 127u, nullptr, true);
+        legacy->ConfigureVoice(replacement, setup, channel, true);
+        svms::VoiceHandle launched = svms::kInvalidVoice;
+        const bool launchOk = transactional->LaunchVoiceGroup(
+            0u, 67u, 127u, &setup, 1u, channel, &launched);
+        Check(launchOk && launched == replacement,
+              "transactional mono launch selects the legacy steal victim");
+        bool sameState = launchOk &&
+            legacy->GetActiveCount() == transactional->GetActiveCount() &&
+            legacy->GetStealTailCount() == transactional->GetStealTailCount();
+        for (uint32_t i = 0u; sameState && i < 8u; ++i) {
+            sameState = legacy->v.state[i] == transactional->v.state[i] &&
+                legacy->v.playIndex[i] == transactional->v.playIndex[i] &&
+                legacy->v.envelopeStage[i] ==
+                    transactional->v.envelopeStage[i] &&
+                std::fabs(legacy->v.phases[i] -
+                          transactional->v.phases[i]) < 1.0e-7f &&
+                std::fabs(legacy->v.currentGain[i] -
+                          transactional->v.currentGain[i]) < 1.0e-7f;
+        }
+        Check(sameState,
+              "transactional mono launch preserves semantic voice state");
+    }
+
+    {
         auto voices = std::make_unique<svms::VoiceManager>();
         voices->Initialize(2, 44100);
         const svms::VoiceHandle mature = voices->AllocateVoice(0, 60, 100);

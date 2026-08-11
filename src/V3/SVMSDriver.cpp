@@ -415,6 +415,7 @@ struct PreparedSF2Region;
 
 static constexpr uint32_t kNoteRegionCacheSize = 4096u;
 static constexpr uint32_t kNoteRegionCacheLayers = 8u;
+static constexpr uint32_t kMaxMatchingRegions = 512u;
 static_assert((kNoteRegionCacheSize & (kNoteRegionCacheSize - 1u)) == 0u,
               "note-region cache size must be a power of two");
 
@@ -423,6 +424,18 @@ struct alignas(64) NoteRegionCacheEntry {
     uint16_t count;
     uint16_t reserved;
     uint32_t regionIndices[kNoteRegionCacheLayers];
+};
+
+struct alignas(64) NoteLaunchPlanCacheEntry {
+    uint32_t soundFontGeneration;
+    uint32_t channelRevision;
+    uint16_t presetIndex;
+    uint8_t channel;
+    uint8_t note;
+    uint8_t velocity;
+    uint8_t count;
+    uint16_t reserved;
+    VoiceConfiguration setup[kNoteRegionCacheLayers];
 };
 
 class Driver {
@@ -526,7 +539,13 @@ private:
     uint32_t regionInitialPeakCount;
     PreparedSF2Region* preparedRegions;
     uint32_t preparedRegionCount;
+    uint32_t soundFontGeneration_;
+    uint32_t channelLaunchRevision_[kChannelCount];
     NoteRegionCacheEntry noteRegionCache_[kNoteRegionCacheSize];
+    NoteLaunchPlanCacheEntry noteLaunchPlanCache_[kNoteRegionCacheSize];
+    const SFSampleRegion* noteRegionScratch_[kMaxMatchingRegions];
+    VoiceConfiguration noteLaunchScratch_[kMaxMatchingRegions];
+    VoiceHandle noteLaunchHandles_[kMaxMatchingRegions];
     float configuredVelocityGain_[128];
     float channelPitchBendRatio_[kChannelCount];
     uint32_t sampleStoreCount;
@@ -681,6 +700,7 @@ Driver::Driver()
       renderScalar(nullptr), soundFontData(nullptr), configSnapshot(nullptr),
       sampleDataStore(nullptr), samplesStore(nullptr), regionInitialPeaks(nullptr),
       regionInitialPeakCount(0), preparedRegions(nullptr), preparedRegionCount(0),
+      soundFontGeneration_(1u),
       sampleStoreCount(0), sampleDataFrames(0),
       qpcFreq(1),
       leftBuffer(nullptr), rightBuffer(nullptr), bufferCapacity(0),
@@ -698,6 +718,9 @@ Driver::Driver()
       virtualRenderClockQPC(0),
       virtualRenderSample_(0), clockInitialized(false), nextPlayIndex_(1) {
     std::memset(noteRegionCache_, 0xff, sizeof(noteRegionCache_));
+    std::memset(noteLaunchPlanCache_, 0, sizeof(noteLaunchPlanCache_));
+    std::fill(std::begin(channelLaunchRevision_),
+              std::end(channelLaunchRevision_), 1u);
     std::memset(configuredVelocityGain_, 0, sizeof(configuredVelocityGain_));
     std::fill(std::begin(channelPitchBendRatio_),
               std::end(channelPitchBendRatio_), 1.0f);
@@ -1005,6 +1028,11 @@ bool Driver::LoadSoundFont(const wchar_t* path) {
         delete soundFontData;
     }
     soundFontData = sf2;
+    if (++soundFontGeneration_ == 0u) {
+        soundFontGeneration_ = 1u;
+        std::memset(noteLaunchPlanCache_, 0,
+                    sizeof(noteLaunchPlanCache_));
+    }
     // Region pointers are immutable for one SoundFont bundle.  Reset the
     // direct-mapped note lookup cache at the swap boundary so callback-side
     // note-ons can never observe indices from the retired bundle.
@@ -1133,6 +1161,8 @@ void Driver::ResetAllVoices() {
     RefreshSelectedPresets();
     std::fill(std::begin(channelPitchBendRatio_),
               std::end(channelPitchBendRatio_), 1.0f);
+    for (uint32_t channel = 0; channel < kChannelCount; ++channel)
+        ++channelLaunchRevision_[channel];
     nextPlayIndex_ = 1;
     eventScheduler_.Reset();
     limiter.Reset();
@@ -1716,6 +1746,8 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
             self->RefreshSelectedPresets();
             std::fill(std::begin(self->channelPitchBendRatio_),
                       std::end(self->channelPitchBendRatio_), 1.0f);
+            for (uint32_t channel = 0; channel < kChannelCount; ++channel)
+                ++self->channelLaunchRevision_[channel];
             self->nextPlayIndex_ = 1;
             self->limiter.Reset();
             break;
@@ -1729,11 +1761,29 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
     if (!self || !events) return;
 
     // The renderer has already grouped this range by exact output frame and
-    // ingress sequence.  One indirect callback per frame is substantially
-    // cheaper than one per MIDI event during multi-million-NPS bursts, while
-    // the ordinary dispatcher remains the single semantic implementation.
-    for (uint32_t i = 0; i < eventCount; ++i)
-        DispatchRenderEvent(events[i], blockCursor, self);
+    // ingress sequence. Process maximal note-on runs directly; any state or
+    // termination event breaks the run and goes through the full dispatcher.
+    uint32_t index = 0u;
+    while (index < eventCount) {
+        if (events[index].type != RenderEventType::NoteOn) {
+            DispatchRenderEvent(events[index++], blockCursor, self);
+            continue;
+        }
+        const uint64_t globalFence =
+            self->globalTerminationFence_.load(std::memory_order_acquire);
+        do {
+            const RenderEvent& event = events[index++];
+            const uint64_t channelFence = event.channel < kChannelCount
+                ? self->channelTerminationFence_[event.channel].load(
+                    std::memory_order_acquire)
+                : 0u;
+            if (!FenceSuppresses(event.ingressSequence, globalFence) &&
+                !FenceSuppresses(event.ingressSequence, channelFence)) {
+                self->HandleNoteOn(event.channel, event.data1, event.data2);
+            }
+        } while (index < eventCount &&
+                 events[index].type == RenderEventType::NoteOn);
+    }
 }
 
 uint32_t Driver::ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
@@ -1823,10 +1873,8 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     }
     sf2Telemetry_.lastPreset = static_cast<uint16_t>(presetIndex);
 
-    static constexpr uint32_t kMaxMatchingRegions = 512;
-    const SFSampleRegion* matchingRegions[kMaxMatchingRegions];
     uint32_t matchCount = ResolveNoteRegions(presetIndex, note, velocity,
-                                             matchingRegions,
+                                             noteRegionScratch_,
                                              kMaxMatchingRegions);
     if (matchCount > kMaxMatchingRegions) {
         ++telemetry_.allocationFailures;
@@ -1843,7 +1891,7 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     // SoundFont region must reject the complete generation, never leave a
     // partial instrument whose remaining layers become audible artifacts.
     for (uint32_t mi = 0; mi < matchCount; ++mi) {
-        const SFSampleRegion* region = matchingRegions[mi];
+        const SFSampleRegion* region = noteRegionScratch_[mi];
         if (!region || region->sampleIndex >= sampleStoreCount) {
             ++sf2Telemetry_.invalidRegions;
             return;
@@ -1871,21 +1919,28 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     const float pitchBendSemitones = channelCache->GetPitchBendSemitones(channel);
     const float commonBendRatio = channelPitchBendRatio_[channel];
 
-    VoiceHandle allocatedVoices[kMaxMatchingRegions];
-    uint32_t allocatedCount = 0;
-    for (; allocatedCount < matchCount; ++allocatedCount) {
-        allocatedVoices[allocatedCount] = voiceManager->AllocateVoiceOrSteal(
-            channel, note, velocity, nullptr, matchCount == 1u);
-        if (allocatedVoices[allocatedCount] == kInvalidVoice) {
-            ++telemetry_.allocationFailures;
-            for (uint32_t rollback = 0; rollback < allocatedCount; ++rollback)
-                voiceManager->RetireVoice(allocatedVoices[rollback]);
-            return;
-        }
-    }
+    uint32_t launchHash = presetIndex * 0x9e3779b9u;
+    launchHash ^= static_cast<uint32_t>(note) * 0x85ebca6bu;
+    launchHash ^= static_cast<uint32_t>(velocity) * 0xc2b2ae35u;
+    launchHash ^= static_cast<uint32_t>(channel) * 0x27d4eb2fu;
+    launchHash ^= channelLaunchRevision_[channel] * 0x165667b1u;
+    launchHash ^= launchHash >> 16u;
+    NoteLaunchPlanCacheEntry& launchCache =
+        noteLaunchPlanCache_[launchHash & (kNoteRegionCacheSize - 1u)];
+    const bool launchCacheHit = matchCount <= kNoteRegionCacheLayers &&
+        launchCache.soundFontGeneration == soundFontGeneration_ &&
+        launchCache.channelRevision == channelLaunchRevision_[channel] &&
+        launchCache.presetIndex == presetIndex &&
+        launchCache.channel == channel && launchCache.note == note &&
+        launchCache.velocity == velocity && launchCache.count == matchCount;
 
-    for (uint32_t mi = 0; mi < matchCount; ++mi) {
-        const SFSampleRegion* matchedRegion = matchingRegions[mi];
+    if (launchCacheHit) {
+        for (uint32_t layer = 0u; layer < matchCount; ++layer) {
+            noteLaunchScratch_[layer] = launchCache.setup[layer];
+            noteLaunchScratch_[layer].playIndex = playIndex;
+        }
+    } else for (uint32_t mi = 0; mi < matchCount; ++mi) {
+        const SFSampleRegion* matchedRegion = noteRegionScratch_[mi];
         const uint32_t matchedRegionIndex = static_cast<uint32_t>(
             matchedRegion - soundFontData->regions);
         const PreparedSF2Region* prepared =
@@ -1893,7 +1948,6 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
                 ? &preparedRegions[matchedRegionIndex] : nullptr;
         uint32_t sampleIndex = matchedRegion->sampleIndex;
         const SF2Sample& samp = samplesStore[sampleIndex];
-        const VoiceHandle vh = allocatedVoices[mi];
 
         const float bendScale = prepared ? prepared->bendScale
             : static_cast<float>(matchedRegion->scaleTuning != 0
@@ -2019,31 +2073,51 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         setup.regionIndex = static_cast<uint16_t>(matchedRegionIndex);
         setup.loopMode = loopMode;
         setup.sampleBacked = 1u;
-        voiceManager->ConfigureVoice(
-            vh, setup, channelCache->GetParams()[channel], matchCount == 1u);
-
-        // Sub-sample start position: folded directly into the initial phase
-        // (on top of the hash randomization from SetVoiceSample).
-        ++sf2Telemetry_.configuredVoices;
-        sf2Telemetry_.lastRegion = static_cast<uint16_t>(matchedRegion - soundFontData->regions);
-        sf2Telemetry_.lastSample = static_cast<uint16_t>(sampleIndex);
-        sf2Telemetry_.lastSampleStart = sStart;
-        sf2Telemetry_.lastSampleEnd = sEnd;
-        sf2Telemetry_.lastInitialPeak =
-            regionInitialPeaks && matchedRegionIndex < regionInitialPeakCount
-                ? regionInitialPeaks[matchedRegionIndex] : 0.0f;
-        sf2Telemetry_.lastVoiceGain = initialGain;
-        sf2Telemetry_.lastMixGainL = voiceManager->v.mixGainL[vh];
-        sf2Telemetry_.lastMixGainR = voiceManager->v.mixGainR[vh];
-        sf2Telemetry_.lastDelaySamples = delaySamples;
-        sf2Telemetry_.lastAttackSamples = attackSamples;
-        sf2Telemetry_.lastFloatSample = sampleDataStore[sStart];
-        sf2Telemetry_.lastPhaseStep = phaseStep;
-        sf2Telemetry_.lastPhase = voiceManager->v.phases[vh];
-        sf2Telemetry_.lastRelativeEnd = voiceManager->v.relEnd[vh];
-        sf2Telemetry_.lastSampleBacked = voiceManager->v.sampleBacked[vh];
-        sf2Telemetry_.lastVoiceHandle = vh;
+        noteLaunchScratch_[mi] = setup;
     }
+
+    if (!launchCacheHit && matchCount <= kNoteRegionCacheLayers) {
+        launchCache.soundFontGeneration = soundFontGeneration_;
+        launchCache.channelRevision = channelLaunchRevision_[channel];
+        launchCache.presetIndex = static_cast<uint16_t>(presetIndex);
+        launchCache.channel = channel;
+        launchCache.note = note;
+        launchCache.velocity = velocity;
+        launchCache.count = static_cast<uint8_t>(matchCount);
+        for (uint32_t layer = 0u; layer < matchCount; ++layer)
+            launchCache.setup[layer] = noteLaunchScratch_[layer];
+    }
+
+    if (!voiceManager->LaunchVoiceGroup(
+            channel, note, velocity, noteLaunchScratch_, matchCount,
+            channelCache->GetParams()[channel], noteLaunchHandles_)) {
+        ++telemetry_.allocationFailures;
+        return;
+    }
+
+    sf2Telemetry_.configuredVoices += matchCount;
+    const uint32_t last = matchCount - 1u;
+    const VoiceConfiguration& lastSetup = noteLaunchScratch_[last];
+    const VoiceHandle lastVoice = noteLaunchHandles_[last];
+    const SFSampleRegion* lastRegion = noteRegionScratch_[last];
+    sf2Telemetry_.lastRegion = lastSetup.regionIndex;
+    sf2Telemetry_.lastSample = static_cast<uint16_t>(lastRegion->sampleIndex);
+    sf2Telemetry_.lastSampleStart = lastSetup.sampleStart;
+    sf2Telemetry_.lastSampleEnd = lastSetup.sampleEnd;
+    sf2Telemetry_.lastInitialPeak =
+        regionInitialPeaks && lastSetup.regionIndex < regionInitialPeakCount
+            ? regionInitialPeaks[lastSetup.regionIndex] : 0.0f;
+    sf2Telemetry_.lastVoiceGain = lastSetup.initialGain;
+    sf2Telemetry_.lastMixGainL = voiceManager->v.mixGainL[lastVoice];
+    sf2Telemetry_.lastMixGainR = voiceManager->v.mixGainR[lastVoice];
+    sf2Telemetry_.lastDelaySamples = lastSetup.delaySamples;
+    sf2Telemetry_.lastAttackSamples = lastSetup.attackSamples;
+    sf2Telemetry_.lastFloatSample = sampleDataStore[lastSetup.sampleStart];
+    sf2Telemetry_.lastPhaseStep = lastSetup.phaseStep;
+    sf2Telemetry_.lastPhase = voiceManager->v.phases[lastVoice];
+    sf2Telemetry_.lastRelativeEnd = voiceManager->v.relEnd[lastVoice];
+    sf2Telemetry_.lastSampleBacked = voiceManager->v.sampleBacked[lastVoice];
+    sf2Telemetry_.lastVoiceHandle = lastVoice;
 }
 
 void Driver::HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset) {
@@ -2065,6 +2139,12 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
                                  uint32_t blockOffset) {
     const bool sustainWasActive = channelCache && channelCache->IsSustainActive(channel);
     if (channelCache) channelCache->ControlChange(channel, controller, value);
+    if (channel < kChannelCount &&
+        (controller == 0u || controller == 32u || controller == 6u ||
+         controller == 38u || controller == 96u || controller == 97u ||
+         controller == 100u || controller == 101u)) {
+        ++channelLaunchRevision_[channel];
+    }
 
     if ((controller == 0 || controller == 32) && channelCache && soundFontData &&
         channel < kChannelCount) {
@@ -2141,6 +2221,7 @@ void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
     uint32_t presetIndex = 0;
     if (ResolveChannelPreset(soundFontData, *channelCache, channel, &presetIndex)) {
         channelCache->SetSelectedPreset(channel, static_cast<uint16_t>(presetIndex));
+        ++channelLaunchRevision_[channel];
         return;
     }
 
@@ -2154,6 +2235,7 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
         channelCache->PitchBend(channel, static_cast<int16_t>((msb << 7) | lsb));
 
     if (!voiceManager || !channelCache || channel >= kChannelCount) return;
+    ++channelLaunchRevision_[channel];
 
     const float bendSemitones = channelCache->GetPitchBendSemitones(channel);
     const float commonRatio = powf(2.0f, bendSemitones / 12.0f);

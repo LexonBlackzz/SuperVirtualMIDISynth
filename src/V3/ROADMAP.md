@@ -233,19 +233,26 @@ larger phase containing that item is complete.
   sustain, termination, note-generation, and pitch-bend updates
 - [x] Cache unbent phase increments and steady-state output gains; refresh only
   the affected channel on CC7/CC10/CC11/CC121
-- [x] Preserve exact BASS-like steal scores/ties with a persistent sustained
-  max heap plus an exact per-frame volatile heap for changing envelopes;
+- [x] Preserve exact BASS-like steal scores/ties with a fixed-leaf sustained
+  winner tree plus an exact per-frame volatile heap for changing envelopes;
   validate every selected victim against an exhaustive oracle
 - [x] Remove the shared current-frame age term from persistent heap keys, batch
   deferred voice setup into one candidate update, and replace same-frame heap
   roots in place without changing victim selection
 - [x] Apply each prepared SF2 layer through one transactional voice setup and
   expose attack-frame control in the dense note-burst benchmark
+- [x] Prepare complete layered note launches before pool mutation, cache the
+  common eight-layer launch plans by SoundFont/preset/pitch/note/velocity, and
+  retain an explicit legacy-versus-transactional benchmark control
+- [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
+  once-per-frame minimum heap and cached tail levels
 - [x] Cache immutable preset/note/velocity region matches in an allocation-free
   direct-mapped table, cache committed channel presets, precompute the complete
   configured velocity-gain table, and cache channel pitch-bend ratios
 - [x] Rebuild only the affected channel's derived controller state at an exact
   event boundary instead of recomputing all 16 channels per controller event
+- [x] Batch channel-wide steal-key refreshes into one contiguous winner-tree
+  rebuild so dense CC7/CC10/CC11 traffic does not thrash random tree paths
 - [x] Make channel/key unlink O(1) with intrusive previous/next positions so
   dense same-key replacement never walks an entire retrigger generation
 - [x] Track the oldest outstanding same-key generation directly, release only
@@ -272,6 +279,10 @@ larger phase containing that item is complete.
   misses: latest warmed AVX2 dense p99 16.67% and mixed-event p99 29.78%
 - [x] Reduce the supplied 1000-voice Krash peak-rate synthetic profile from
   roughly 326% to 75.6% p99 without consecutive callback misses
+- [x] Pass the warmed 60-second 2000-voice PNC peak profile at 943k note-ons/s:
+  AVX2 p99 34.73%, p99.9 40.65%, and no consecutive deadline misses; the
+  500k-note profile reaches 26.55% p99. The non-gating 5.5M-note stretch case
+  drops from roughly 206% to 105.31% p99
 - [ ] Run and pass the three Celeron 420 acceptance profiles on target hardware
 - [ ] Complete live high-Hz listening validation for pitch, natural tails,
   CC120/123 termination, and callback-grid artifacts
