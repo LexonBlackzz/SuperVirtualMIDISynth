@@ -50,3 +50,17 @@
 /.ghidra_11.4_PUBLIC
 *ghidra*
 config.ini
+
+# Local development artifacts and analysis tools
+/.backup/
+*.wav
+*.bak
+*.zip
+*.dll.*
+*.dllold
+/AGENTS.md
+/analyze_pitch*.py
+/parse_sf2.py
+/bassmidi_unpacked_code.bin
+/build_dumper.bat
+/dump_unpacked.cpp
