@@ -221,8 +221,14 @@ private:
 
     // Per-key tracking for EndVoicesForChannelKey
     int32_t channelKeyVoiceHead_[kChannelCount][kNoteCount];
+    // Tail of the newest-to-oldest intrusive chain. Note-off can therefore
+    // identify the oldest outstanding generation in O(1), then touch only
+    // that generation's adjacent SF2 layers.
+    int32_t channelKeyVoiceOldest_[kChannelCount][kNoteCount];
 
     void InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity);
+    void InitializePreparedVoice(VoiceHandle handle, uint8_t channel,
+                                 uint8_t note, uint8_t velocity);
     void LinkChannelKey(VoiceHandle handle);
     void UnlinkChannelKey(VoiceHandle handle);
     void LinkChannelActive(VoiceHandle handle);
@@ -294,7 +300,7 @@ inline VoiceManager::VoiceManager()
     std::memset(stealCandidateReserved_, 0, sizeof(stealCandidateReserved_));
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
         for (uint32_t n = 0; n < kNoteCount; ++n)
-            channelKeyVoiceHead_[ch][n] = -1;
+            channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
 }
 
 inline void VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
@@ -343,7 +349,7 @@ inline void VoiceManager::Reset() {
     }
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
         for (uint32_t n = 0; n < kNoteCount; ++n)
-            channelKeyVoiceHead_[ch][n] = -1;
+            channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
 }
 
 inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
@@ -494,6 +500,32 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     stealCandidateDeferred_[handle] = 0u;
 }
 
+inline void VoiceManager::InitializePreparedVoice(
+    VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity) {
+    // ConfigureVoice immediately supplies every sample/envelope/gain field.
+    // Initialize only state observed by lifecycle indices before that
+    // transaction commits, avoiding dozens of default stores per SF2 note.
+    v.state[handle] = static_cast<uint8_t>(VoiceState::Active);
+    v.channel[handle] = channel;
+    v.note[handle] = note;
+    v.velocity[handle] = velocity;
+    v.sampleBacked[handle] = 0u;
+    v.relEnd[handle] = 0u;
+    v.envelopeStage[handle] = 0u;
+    v.renderClass[handle] = static_cast<uint8_t>(VoiceRenderClass::Generic);
+    v.heldBySustain[handle] = 0u;
+    v.releaseStartInBlock[handle] = 0u;
+    v.nextChannelKeyVoice[handle] = -1;
+    v.prevChannelKeyVoice[handle] = -1;
+    v.birthFrame[handle] = currentFrame_;
+    v.stealTailFramesRemaining[handle] = 0u;
+    v.stealTailFramesTotal[handle] = 0u;
+    v.stealTailChannel[handle] = UINT8_MAX;
+    v.stealFadeInFramesRemaining[handle] = 0u;
+    v.stealFadeInFramesTotal[handle] = 0u;
+    stealCandidateDeferred_[handle] = 0u;
+}
+
 inline void VoiceManager::LinkChannelKey(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     uint8_t ch = v.channel[handle];
@@ -504,6 +536,8 @@ inline void VoiceManager::LinkChannelKey(VoiceHandle handle) {
     if (previousHead >= 0)
         v.prevChannelKeyVoice[static_cast<uint32_t>(previousHead)] =
             static_cast<int32_t>(handle);
+    else
+        channelKeyVoiceOldest_[ch][nt] = static_cast<int32_t>(handle);
     channelKeyVoiceHead_[ch][nt] = static_cast<int32_t>(handle);
 }
 
@@ -521,6 +555,8 @@ inline void VoiceManager::UnlinkChannelKey(VoiceHandle handle) {
         return;
     if (next >= 0)
         v.prevChannelKeyVoice[static_cast<uint32_t>(next)] = previous;
+    else if (channelKeyVoiceOldest_[ch][nt] == static_cast<int32_t>(handle))
+        channelKeyVoiceOldest_[ch][nt] = previous;
     v.nextChannelKeyVoice[handle] = -1;
     v.prevChannelKeyVoice[handle] = -1;
 }
@@ -1001,7 +1037,20 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
                                                         uint8_t velocity,
                                                         bool* outStolen,
                                                         bool deferCandidate) {
-    VoiceHandle vh = AllocateVoice(channel, note, velocity);
+    VoiceHandle vh = kInvalidVoice;
+    if (deferCandidate && freeTop_ != 0u) {
+        const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
+        vh = static_cast<VoiceHandle>(idx);
+        InitializePreparedVoice(vh, channel, note, velocity);
+        LinkChannelKey(vh);
+        LinkChannelActive(vh);
+        LinkRenderClass(vh);
+        activeList_[activeCount_] = idx;
+        activePosition_[idx] = activeCount_++;
+        stealHeapValid_ = false;
+    } else {
+        vh = AllocateVoice(channel, note, velocity);
+    }
     if (vh != kInvalidVoice) {
         stealCandidateDeferred_[vh] = deferCandidate ? 1u : 0u;
         if (outStolen) *outStolen = false;
@@ -1044,7 +1093,11 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     v.state[bestIdx] = static_cast<uint8_t>(VoiceState::Free);
 
     // Reinitialize in-place
-    InitializeVoice(static_cast<VoiceHandle>(bestIdx), channel, note, velocity);
+    if (deferCandidate)
+        InitializePreparedVoice(static_cast<VoiceHandle>(bestIdx), channel,
+                                note, velocity);
+    else
+        InitializeVoice(static_cast<VoiceHandle>(bestIdx), channel, note, velocity);
     stealCandidateDeferred_[bestIdx] = deferCandidate ? 1u : 0u;
     if (tailAudible) {
         v.stealTailPhase[bestIdx] = tailPhase;
@@ -1301,19 +1354,11 @@ inline void VoiceManager::SetVoicePlayIndex(VoiceHandle handle,
 inline uint32_t VoiceManager::FindOldestPlayIndex(uint8_t channel,
                                                    uint8_t note) const {
     if (channel >= kChannelCount || note >= kNoteCount) return UINT32_MAX;
-    uint32_t oldest = UINT32_MAX;
-    int32_t current = channelKeyVoiceHead_[channel][note];
-    while (current >= 0) {
-        const uint32_t i = static_cast<uint32_t>(current);
-        // Match TSF: note-off searches only voices that are still active.
-        // Releasing/held generations must not mask a newer retrigger.
-        if (v.state[i] == static_cast<uint8_t>(VoiceState::Active) &&
-            !v.heldBySustain[i] && v.playIndex[i] < oldest) {
-            oldest = v.playIndex[i];
-        }
-        current = v.nextChannelKeyVoice[i];
-    }
-    return oldest;
+    const int32_t oldest = channelKeyVoiceOldest_[channel][note];
+    if (oldest < 0) return UINT32_MAX;
+    const uint32_t handle = static_cast<uint32_t>(oldest);
+    return v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
+        !v.heldBySustain[handle] ? v.playIndex[handle] : UINT32_MAX;
 }
 
 inline void VoiceManager::StartReleaseForPlayIndex(uint8_t channel,
@@ -1336,7 +1381,32 @@ inline void VoiceManager::NoteOffPlayIndex(uint8_t channel, uint8_t note,
                                             uint32_t blockOffset) {
     if (channel >= kChannelCount || note >= kNoteCount || playIndex == UINT32_MAX)
         return;
-    int32_t current = channelKeyVoiceHead_[channel][note];
+    // Generations are inserted as adjacent layers at the head. The tail is
+    // the oldest outstanding generation, so ordinary note-off is O(layers)
+    // instead of walking every same-key retrigger in the pool.
+    int32_t current = channelKeyVoiceOldest_[channel][note];
+    if (current >= 0 && v.playIndex[static_cast<uint32_t>(current)] == playIndex) {
+        while (current >= 0) {
+            const VoiceHandle handle = static_cast<VoiceHandle>(current);
+            if (v.playIndex[handle] != playIndex) break;
+            current = v.prevChannelKeyVoice[handle];
+            if (sustain) {
+                v.heldBySustain[handle] = 1u;
+                // A sustained generation has received its note-off and must
+                // not mask the next retrigger. Sustain release uses the
+                // channel-active index, so key-chain membership is unnecessary.
+                UnlinkChannelKey(handle);
+            } else {
+                v.releaseStartInBlock[handle] = blockOffset;
+                StartRelease(handle);
+            }
+        }
+        return;
+    }
+
+    // Preserve the public helper's behavior for uncommon callers that name a
+    // non-oldest generation explicitly.
+    current = channelKeyVoiceHead_[channel][note];
     while (current >= 0) {
         const VoiceHandle handle = static_cast<VoiceHandle>(current);
         current = v.nextChannelKeyVoice[handle];
@@ -1346,6 +1416,7 @@ inline void VoiceManager::NoteOffPlayIndex(uint8_t channel, uint8_t note,
         }
         if (sustain) {
             v.heldBySustain[handle] = 1u;
+            UnlinkChannelKey(handle);
         } else {
             v.releaseStartInBlock[handle] = blockOffset;
             StartRelease(handle);

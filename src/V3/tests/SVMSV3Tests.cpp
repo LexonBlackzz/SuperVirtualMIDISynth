@@ -834,12 +834,18 @@ void TestOverlappingRetriggerGenerations() {
 
     Check(voices->FindOldestPlayIndex(0, 60) == 10,
           "note-off selects the oldest retrigger generation");
-    voices->StartReleaseForPlayIndex(0, 60, 10);
+    voices->NoteOffPlayIndex(0, 60, 10, false, 37);
     Check(voices->v.state[firstLayer] == static_cast<uint8_t>(svms::VoiceState::Releasing) &&
               voices->v.state[firstLayer2] == static_cast<uint8_t>(svms::VoiceState::Releasing),
           "all layered regions from one retrigger are released together");
     Check(voices->v.state[secondLayer] == static_cast<uint8_t>(svms::VoiceState::Active),
           "a later same-key retrigger survives the earlier note-off");
+    Check(voices->FindOldestPlayIndex(0, 60) == 11,
+          "O(1) oldest-generation tail advances after layered release");
+    voices->NoteOffPlayIndex(0, 60, 11, true, 0);
+    Check(voices->v.heldBySustain[secondLayer] == 1 &&
+              voices->FindOldestPlayIndex(0, 60) == UINT32_MAX,
+          "sustain-held generation leaves the pending note-off chain");
 }
 
 void RenderDeterministic(float* left, float* right, uint32_t frames) {

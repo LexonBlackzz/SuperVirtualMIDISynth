@@ -158,6 +158,8 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
         if (event.valid) heap.push({event, i});
     }
     uint64_t tick = 0, frame = 0, remainder = 0, count = 0, noteOns = 0;
+    uint64_t bucketSecond = UINT64_MAX, bucketEvents = 0, bucketNotes = 0;
+    uint64_t groupFrame = UINT64_MAX, groupEvents = 0;
     uint32_t tempo = 500000, sequence = 0;
     const uint64_t denom = uint64_t(info.division) * 1000000ull;
     while (!heap.empty()) {
@@ -176,15 +178,46 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
         tick = item.event.tick;
         if (item.event.tempo) tempo = item.event.tempo;
         else if (item.event.midi) {
+            const uint64_t second = rate ? frame / rate : 0;
+            if (second != bucketSecond) {
+                if (bucketEvents > info.peakEventsPerSecond) {
+                    info.peakEventsPerSecond = bucketEvents;
+                    info.peakEventSecond = bucketSecond;
+                }
+                if (bucketNotes > info.peakNoteOnsPerSecond) {
+                    info.peakNoteOnsPerSecond = bucketNotes;
+                    info.peakNoteOnSecond = bucketSecond;
+                }
+                bucketSecond = second; bucketEvents = 0; bucketNotes = 0;
+            }
+            if (frame != groupFrame) {
+                if (groupEvents > info.peakEventsAtFrame) {
+                    info.peakEventsAtFrame = groupEvents;
+                    info.peakFrame = groupFrame;
+                }
+                groupFrame = frame; groupEvents = 0;
+            }
             PackedMidiEvent packed{frame, sequence++, item.event.message};
             if (sink && !sink(packed, user)) return false;
             ++count;
+            ++bucketEvents; ++groupEvents;
             if ((item.event.message & 0xf0u) == 0x90u &&
-                ((item.event.message >> 16) & 0x7fu) != 0u) ++noteOns;
+                ((item.event.message >> 16) & 0x7fu) != 0u) {
+                ++noteOns; ++bucketNotes;
+            }
         }
         RawEvent next;
         if (!Next(tracks[item.track], next, error)) return false;
         if (next.valid) heap.push({next, item.track});
+    }
+    if (bucketEvents > info.peakEventsPerSecond) {
+        info.peakEventsPerSecond = bucketEvents; info.peakEventSecond = bucketSecond;
+    }
+    if (bucketNotes > info.peakNoteOnsPerSecond) {
+        info.peakNoteOnsPerSecond = bucketNotes; info.peakNoteOnSecond = bucketSecond;
+    }
+    if (groupEvents > info.peakEventsAtFrame) {
+        info.peakEventsAtFrame = groupEvents; info.peakFrame = groupFrame;
     }
     info.eventCount = count;
     info.noteOnCount = noteOns;

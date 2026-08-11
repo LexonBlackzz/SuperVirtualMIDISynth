@@ -36,6 +36,7 @@ int wmain() {
     svms::MidiStreamDecoder decoder;svms::MidiStreamInfo info{};
     if(!decoder.Scan(file,48000,info,error)){DeleteFileW(path);return 3;}
     if(info.eventCount!=3||info.noteOnCount!=2||info.totalFrames!=36000||info.format!=1||info.tracks!=2)return 4;
+    if(info.peakEventsPerSecond!=3||info.peakNoteOnsPerSecond!=2||info.peakEventsAtFrame!=1)return 13;
     std::vector<svms::PackedMidiEvent> events;std::atomic<bool> cancel{false};
     if(!decoder.Decode(file,48000,Collect,&events,&cancel,nullptr,error))return 5;
     DeleteFileW(path);

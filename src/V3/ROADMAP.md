@@ -246,6 +246,9 @@ larger phase containing that item is complete.
   event boundary instead of recomputing all 16 channels per controller event
 - [x] Make channel/key unlink O(1) with intrusive previous/next positions so
   dense same-key replacement never walks an entire retrigger generation
+- [x] Track the oldest outstanding same-key generation directly, release only
+  its adjacent SF2 layers on note-off, and avoid redundant default voice-state
+  stores when prepared region setup immediately overwrites them
 - [x] Precompute immutable SF2 region peaks, validation, per-key base pitch,
   envelope coefficients, attenuation, sustain, and pan while loading so the
   audio callback performs no diagnostic sample scans or transcendental region
@@ -285,7 +288,8 @@ larger phase containing that item is complete.
   configuration lifecycle, and six-hour timing tests
 - [x] Verify batch scheduler rebuilds and exact-frame batch dispatch preserve
   frame/sequence ordering
-- [ ] Build a complete offline MIDI-to-WAV renderer
+- [x] Build a streaming offline MIDI-to-WAV renderer with bounded parser/audio
+  queues, progress telemetry, cancellation, and a scan-only analysis mode
 - [ ] Render identical streams through V3 and BASSMIDI using the same SF2,
   sample rate, bend range, and disabled effects
 - [ ] Measure the reference requirements: timing within one frame, exact event
@@ -293,6 +297,9 @@ larger phase containing that item is complete.
   correlation, and RMS
 - [x] Add reusable dense-note/event flood generators and analyze a local Black
   MIDI corpus without committing its large MIDI/SF2 assets
+- [x] Characterize the Paprika 2/3 stress corpus without committing it: PNC2
+  peaks at 554,240 note-ons/s and PNC3 at 942,960 note-ons/s; expose peak
+  channel-event, note-on, and same-frame density in scan-only output
 - [ ] Establish scalar baselines and practical voice limits on a Celeron 420
 - [ ] Establish modern-CPU event-flood and eventual 500K-voice baselines
 - [ ] Add cycle/cache-miss profiling; callback duration, queue pressure,

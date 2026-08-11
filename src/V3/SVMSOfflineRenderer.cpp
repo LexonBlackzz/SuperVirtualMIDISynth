@@ -197,6 +197,8 @@ public:
     uint64_t InvalidRegions() const { return invalidRegions_; }
     const char* Backend() const { return renderer_.GetRenderBackendName(); }
 private:
+    struct RegionCacheEntry { uint32_t tag=UINT32_MAX;uint16_t count=0;uint16_t reserved=0;uint32_t indices[8]{}; };
+    uint32_t ResolveRegions(uint32_t preset,uint8_t note,uint8_t velocity,const SFSampleRegion** out,uint32_t capacity){const uint32_t tag=(preset<<14u)|(uint32_t(note)<<7u)|velocity;uint32_t hash=tag;hash^=hash>>16u;hash*=0x7feb352du;hash^=hash>>15u;RegionCacheEntry& cached=regionCache_[hash&4095u];if(cached.tag==tag&&cached.count<=8u){const uint32_t copied=(std::min)(uint32_t(cached.count),capacity);for(uint32_t i=0;i<copied;++i)out[i]=&sf2_->regions[cached.indices[i]];return cached.count;}const uint32_t count=sf2_find_regions(sf2_.get(),preset,note,velocity,out,capacity);if(count<=8u&&count<=capacity){cached.tag=tag;cached.count=uint16_t(count);for(uint32_t i=0;i<count;++i)cached.indices[i]=uint32_t(out[i]-sf2_->regions);}return count;}
     struct Limiter {
         float delayL[128]{},delayR[128]{};uint32_t position=0;float envelope=1.0f;
         void Process(float* left,float* right,uint32_t frames){for(uint32_t i=0;i<frames;++i){const float inL=left[i],inR=right[i];const float peak=(std::max)(fabsf(inL),fabsf(inR));envelope+=(peak>envelope?0.25f:0.001f)*(peak-envelope);const float gain=envelope>0.9f?0.9f/envelope:1.0f;float outL=delayL[position]*gain,outR=delayR[position]*gain;delayL[position]=inL;delayR[position]=inR;auto soft=[](float x){const float a=fabsf(x);if(a<=0.9f)return x;const float y=0.9f+0.1f*tanhf((a-0.9f)*10.0f);return x<0?-y:y;};left[i]=soft(outL);right[i]=soft(outR);position=(position+1)&127u;}}
@@ -222,7 +224,7 @@ private:
     void RefreshPreset(uint8_t ch) { uint32_t p=0;channels_.SetSelectedPreset(ch,Resolve(ch,p)?uint16_t(p):UINT16_MAX); }
     void NoteOn(uint8_t ch,uint8_t note,uint8_t vel) {
         ++noteCalls_;if(note>=128)return;channels_.NoteOn(ch,note,vel);uint32_t pi=channels_.GetSelectedPreset(ch);if(pi>=sf2_->presetCount){if(!Resolve(ch,pi)){++missingPresets_;return;}channels_.SetSelectedPreset(ch,uint16_t(pi));}
-        const SFSampleRegion* regions[512];const uint32_t count=sf2_find_regions(sf2_.get(),pi,note,vel,regions,512);if(!count||count>512){++missingRegions_;return;}
+        const SFSampleRegion* regions[512];const uint32_t count=ResolveRegions(pi,note,vel,regions,512);if(!count||count>512){++missingRegions_;return;}
         for(uint32_t i=0;i<count;++i){const uint32_t ri=uint32_t(regions[i]-sf2_->regions);if(ri>=prepared_.size()||!prepared_[ri].valid){++invalidRegions_;return;}}
         if(playIndex_==0||playIndex_>=UINT32_MAX-1)playIndex_=1;const uint32_t generation=playIndex_++; VoiceHandle handles[512];uint32_t made=0;
         for(;made<count;++made){handles[made]=voices_.AllocateVoiceOrSteal(ch,note,vel,nullptr,count==1);if(handles[made]==kInvalidVoice){for(uint32_t j=0;j<made;++j)voices_.RetireVoice(handles[j]);return;}}
@@ -240,7 +242,7 @@ private:
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;const uint32_t n=voices_.GetChannelActiveCount(ch);const uint32_t* h=voices_.GetChannelActiveList(ch);for(uint32_t i=0;i<n;++i){const uint32_t v=h[i];const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));}}
     uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0;
     std::unique_ptr<SF2Data> sf2_;std::vector<float> sampleData_;std::vector<PreparedRegion> prepared_;
-    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};Limiter limiter_{};
+    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};Limiter limiter_{};RegionCacheEntry regionCache_[4096]{};
 };
 
 struct ProducerContext { ParsedEventRing* ring; const MappedMidiFile* file; uint32_t rate; std::atomic<bool>* cancel; std::atomic<bool>* done; std::atomic<uint64_t>* decoded; std::string* error; };
@@ -254,7 +256,7 @@ int wmain(int argc,wchar_t** argv) {
     Options o;if(!ParseOptions(argc,argv,o)){Usage();return 2;}
     std::string error;MappedMidiFile midi;if(!midi.Open(o.midi.c_str(),error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
     MidiStreamDecoder decoder;MidiStreamInfo info;if(!decoder.Scan(midi,o.sampleRate,info,error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
-    if(o.scanOnly){fwprintf(stdout,L"SMF %u, %u tracks, %llu channel events, %llu note-ons, %llu frames (%s at %u Hz)\n",info.format,info.tracks,info.eventCount,info.noteOnCount,info.totalFrames,FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),o.sampleRate);return 0;}
+    if(o.scanOnly){fwprintf(stdout,L"SMF %u, %u tracks, %llu channel events, %llu note-ons, %llu frames (%s at %u Hz)\nPeak 1s: %llu events at %s, %llu note-ons at %s; peak frame: %llu events at frame %llu\n",info.format,info.tracks,info.eventCount,info.noteOnCount,info.totalFrames,FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),o.sampleRate,info.peakEventsPerSecond,FormatTime(double(info.peakEventSecond)).c_str(),info.peakNoteOnsPerSecond,FormatTime(double(info.peakNoteOnSecond)).c_str(),info.peakEventsAtFrame,info.peakFrame);return 0;}
     ParsedEventRing ring(o.eventBufferMB);if(!ring.IsValid()){fprintf(stderr,"error: cannot allocate parsed-event ring\n");return 1;}
     auto synth=std::make_unique<OfflineSynth>();if(!synth->Initialize(o,error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
     WaveWriter wave;if(!wave.Open(o.output.c_str(),o.sampleRate,info.totalFrames+uint64_t(o.maxTailSeconds)*o.sampleRate)){fprintf(stderr,"error: cannot create output file\n");return 1;}

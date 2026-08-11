@@ -22,6 +22,12 @@ struct MidiStreamInfo {
     uint64_t eventCount = 0;
     uint64_t noteOnCount = 0;
     uint64_t totalFrames = 0;
+    uint64_t peakEventsPerSecond = 0;
+    uint64_t peakNoteOnsPerSecond = 0;
+    uint64_t peakEventsAtFrame = 0;
+    uint64_t peakEventSecond = 0;
+    uint64_t peakNoteOnSecond = 0;
+    uint64_t peakFrame = 0;
 };
 
 class MappedMidiFile {
