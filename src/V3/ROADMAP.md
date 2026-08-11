@@ -20,9 +20,9 @@ larger phase containing that item is complete.
 - [x] SoA voice state with flat active list, inverse active positions, and free
   stack
 - [x] Fresh allocation for overlapping same-key retriggers
-- [x] Priority-aware score-based voice stealing with a fixed 64-frame outgoing
-  fade that reaches exact zero without delaying the replacement attack
-  tail and an unblurred replacement attack
+- [x] BASSMIDI-like voice stealing based on effective control/envelope level
+  and rendered age rather than raw velocity, with at most 50 independent
+  64-frame outgoing tails and an unblurred replacement attack
 - [x] Scalar fused per-sample renderer with linear interpolation
 - [x] SF2 volume envelopes, sample loops, attenuation, tuning, and release tails
 - [x] Configured velocity threshold/curve/floor, velocity LUT,
@@ -230,13 +230,12 @@ larger phase containing that item is complete.
   sustain, termination, note-generation, and pitch-bend updates
 - [x] Cache unbent phase increments and steady-state output gains; refresh only
   the affected channel on CC7/CC10/CC11/CC121
-- [x] Preserve exact steal scores/ties with a persistent stable max heap plus
-  an exact per-frame volatile heap for newborn, transient, releasing, and
-  age-capped voices; rebuild only when rendered state advances and validate
-  every selected victim against an exhaustive oracle
-- [x] Keep sustained newborn candidates in a persistent exact heap, batch
+- [x] Preserve exact BASS-like steal scores/ties with a persistent sustained
+  max heap plus an exact per-frame volatile heap for changing envelopes;
+  validate every selected victim against an exhaustive oracle
+- [x] Remove the shared current-frame age term from persistent heap keys, batch
   deferred voice setup into one candidate update, and replace same-frame heap
-  roots in place without changing exhaustive victim selection
+  roots in place without changing victim selection
 - [x] Apply each prepared SF2 layer through one transactional voice setup and
   expose attack-frame control in the dense note-burst benchmark
 - [x] Cache immutable preset/note/velocity region matches in an allocation-free
@@ -283,7 +282,7 @@ larger phase containing that item is complete.
   region validation, and the shipped `gm.sf2`
 - [x] Add tests for pitch, overlapping retriggers, sustain, channel
   termination, exact release duration, loop wrapping, CC11, voice identity,
-  priority stealing, and fade tails
+  BASS-like loudness/age stealing, velocity independence, and bounded fade tails
 - [x] Add bounded scheduler ordering, queue wrap/capacity, four-producer MPSC,
   configuration lifecycle, and six-hour timing tests
 - [x] Verify batch scheduler rebuilds and exact-frame batch dispatch preserve

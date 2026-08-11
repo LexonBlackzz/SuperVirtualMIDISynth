@@ -513,22 +513,22 @@ void TestPriorityAwareStealingAndFadeTail() {
     {
         auto voices = std::make_unique<svms::VoiceManager>();
         voices->Initialize(2, 44100);
-        const svms::VoiceHandle quiet = voices->AllocateVoice(0, 60, 24);
-        const svms::VoiceHandle loud = voices->AllocateVoice(0, 64, 120);
+        const svms::VoiceHandle quiet = voices->AllocateVoice(0, 60, 127);
+        const svms::VoiceHandle loud = voices->AllocateVoice(0, 64, 1);
         voices->SetVoiceEnvelope(quiet, 1.0f, 1.0f, 0, 0, 0, 0,
                                  0.0f, 1.0f, 0.999f);
         voices->SetVoiceEnvelope(loud, 1.0f, 1.0f, 0, 0, 0, 0,
                                  0.0f, 1.0f, 0.999f);
-        voices->v.mixGainL[quiet] = voices->v.mixGainR[quiet] = 1.0f;
+        voices->v.mixGainL[quiet] = voices->v.mixGainR[quiet] = 0.05f;
         voices->v.mixGainL[loud] = voices->v.mixGainR[loud] = 1.0f;
 
         bool stolen = false;
         const svms::VoiceHandle replacement =
             voices->AllocateVoiceOrSteal(0, 67, 100, &stolen);
         Check(stolen && replacement == quiet,
-              "voice pressure steals low velocity before velocity >= 96");
-        Check(voices->v.velocity[loud] == 120,
-              "high-priority loud voice survives pool stealing");
+              "BASS-like stealing chooses effective quietness over velocity");
+        Check(voices->v.velocity[loud] == 1,
+              "a low-velocity but louder voice survives pool stealing");
     }
 
     {
@@ -563,7 +563,8 @@ void TestPriorityAwareStealingAndFadeTail() {
         bool stolen = false;
         const svms::VoiceHandle replacement =
             voices->AllocateVoiceOrSteal(0, 67, 100, &stolen);
-        const uint32_t fadeFrames = voices->v.stealTailFramesTotal[replacement];
+        const uint32_t tailSlot = voices->GetStealTailList()[0];
+        const uint32_t fadeFrames = voices->v.stealTailFramesTotal[tailSlot];
         Check(stolen && fadeFrames == svms::kStealFadeFrames,
               "stealing captures the fixed 64-frame outgoing tail");
         Check(voices->v.stealFadeInFramesTotal[replacement] == 0,
@@ -588,8 +589,64 @@ void TestPriorityAwareStealingAndFadeTail() {
               "stolen tail ramps linearly instead of being hard-cut");
         Check(std::fabs(left.back()) <= 1.0e-7f,
               "stolen tail reaches silence at the end of its fade");
-        Check(voices->v.stealTailFramesRemaining[replacement] == 0,
+        Check(voices->v.stealTailFramesRemaining[tailSlot] == 0,
               "stolen tail retires without consuming a voice slot");
+    }
+
+    {
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(64, 44100);
+        for (uint32_t i = 0; i < 64u; ++i) {
+            const svms::VoiceHandle handle = voices->AllocateVoice(
+                0, static_cast<uint8_t>(i + 24u), 100);
+            voices->SetVoiceSample(handle, 0, 256, 8, 248, 1, 1.0f, 1);
+            voices->SetVoiceEnvelope(handle, 1.0f, 1.0f, 0, 0, 0, 0,
+                                     0.0f, 1.0f, 0.999f);
+            voices->v.mixGainL[handle] = voices->v.mixGainR[handle] = 1.0f;
+        }
+        for (uint32_t i = 0; i < 60u; ++i) {
+            const svms::VoiceHandle replacement = voices->AllocateVoiceOrSteal(
+                0, static_cast<uint8_t>(36u + i % 72u), 100);
+            voices->SetVoiceSample(replacement, 0, 256, 8, 248, 1, 1.0f, 1);
+            voices->SetVoiceEnvelope(replacement, 1.0f, 1.0f, 0, 0, 0, 0,
+                                     0.0f, 1.0f, 0.999f);
+            voices->v.mixGainL[replacement] =
+                voices->v.mixGainR[replacement] = 1.0f;
+        }
+        Check(voices->GetStealTailCount() == svms::kStealTailReserve,
+              "BASS-like outgoing tail reserve is capped at 50 voices");
+
+        const svms::VoiceHandle quietVictim =
+            static_cast<svms::VoiceHandle>(voices->activeList_[0]);
+        voices->SetVoiceEnvelope(quietVictim, 0.1f, 1.0f, 0, 0, 0, 0,
+                                 0.0f, 1.0f, 0.999f);
+        voices->InvalidateStealCandidates();
+        voices->AllocateVoiceOrSteal(0, 96, 100);
+        bool retainedOnlyLouderTails = true;
+        for (uint32_t i = 0; i < voices->GetStealTailCount(); ++i) {
+            const uint32_t slot = voices->GetStealTailList()[i];
+            retainedOnlyLouderTails &= voices->v.stealTailGain[slot] > 0.9f;
+        }
+        Check(retainedOnlyLouderTails,
+              "a quieter outgoing victim cannot evict a louder reserve tail");
+
+        for (uint32_t i = 0; i < voices->activeCount_; ++i) {
+            const svms::VoiceHandle handle = static_cast<svms::VoiceHandle>(
+                voices->activeList_[i]);
+            voices->SetVoiceSample(handle, 0, 256, 8, 248, 1, 1.0f, 1);
+            voices->SetVoiceEnvelope(handle, i == 0u ? 2.0f : 3.0f, 1.0f,
+                                     0, 0, 0, 0, 0.0f, 1.0f, 0.999f);
+            voices->v.mixGainL[handle] = voices->v.mixGainR[handle] = 1.0f;
+        }
+        voices->InvalidateStealCandidates();
+        voices->AllocateVoiceOrSteal(0, 97, 100);
+        bool admittedLouderTail = false;
+        for (uint32_t i = 0; i < voices->GetStealTailCount(); ++i) {
+            const uint32_t slot = voices->GetStealTailList()[i];
+            admittedLouderTail |= voices->v.stealTailGain[slot] > 1.5f;
+        }
+        Check(admittedLouderTail,
+              "a louder outgoing victim replaces the quietest reserve tail");
     }
 }
 
@@ -637,7 +694,13 @@ void TestExactStealHeapAndVoiceIndices() {
         voices->AllocateVoiceOrSteal(1, 81, 127, &stolen);
     Check(stolen && secondVictim == handles[1],
           "same-frame heap pop preserves exact next-victim ordering");
+    voices->SetVoiceSample(secondVictim, 0, 128, 8, 120, 1, 1.0f, 1);
+    voices->SetVoiceEnvelope(secondVictim, 1.0f, 1.0f, 0, 0, 0, 0,
+                             0.0f, 1.0f, 0.999f);
+    voices->SetVoiceGain(secondVictim, 1.0f, 1.0f);
+    voices->RefreshMixGain(secondVictim, channels.GetParams()[1]);
 
+    voices->v.currentGain[handles[3]] = 0.01f;
     voices->StartRelease(handles[3]);
     const svms::VoiceHandle releasedVictim =
         voices->AllocateVoiceOrSteal(0, 82, 127, &stolen);
@@ -681,7 +744,8 @@ void TestPersistentStealIndexAgainstOracle() {
 
     uint64_t frame = 9000u;
     for (uint32_t iteration = 0; iteration < 512u; ++iteration) {
-        frame += (iteration == 256u) ? 441000u : 37u;
+        frame += (iteration == 256u)
+            ? 44100ull * 6ull * 60ull * 60ull : 37u;
         voices->SetCurrentFrame(frame);
         if ((iteration % 7u) == 0u) {
             const uint32_t h = voices->activeList_[(iteration * 17u) % voices->activeCount_];

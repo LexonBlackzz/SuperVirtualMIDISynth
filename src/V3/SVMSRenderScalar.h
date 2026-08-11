@@ -20,12 +20,9 @@ inline float InterpolateSample(const float* data, uint32_t baseIndex,
     return s0 + (s1 - s0) * frac;
 }
 
-// Render the compact continuation captured when this primary voice slot was
-// stolen.  The tail follows the old sample cursor and loop for a fixed,
-// short 64-frame
-// linear ramp.  It has no MIDI identity and cannot consume another voice
-// slot, so note-off/controller handling remains attached only to the new
-// occupant of the slot.
+// Render a compact continuation from the independent BASS-like tail reserve.
+// It follows the old sample cursor and loop for a fixed 64-frame linear ramp,
+// has no MIDI identity, and does not consume a primary voice slot.
 inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
                                   const float* sampleData,
                                   uint32_t sampleDataFrames,
@@ -326,12 +323,19 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
         float* outL = outputLeft + f;
         float* outR = outputRight + f;
 
+        // Tail slots are independent from active voice handles. Iterate the
+        // dense reserve backwards so completed-tail swap removal is safe.
+        const uint32_t tailCount = voices.GetStealTailCount();
+        const uint32_t* tailHandles = voices.GetStealTailList();
+        for (uint32_t position = tailCount; position > 0u; --position) {
+            const uint32_t tailSlot = tailHandles[position - 1u];
+            RenderStealTailSample(v, tailSlot, sampleData, sampleDataFrames,
+                                  outL, outR);
+            voices.RefreshStealTail(static_cast<VoiceHandle>(tailSlot));
+        }
+
         for (uint32_t i = 0; i < voices.activeCount_; ) {
             uint32_t idx = voices.activeList_[i];
-
-            // Steal tails are always mixed.  Decimating the short ramp could
-            // itself reintroduce the discontinuity this path removes.
-            RenderStealTailSample(v, idx, sampleData, sampleDataFrames, outL, outR);
 
             if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) {
                 // Retired earlier but not yet cleaned from activeList_ by
@@ -534,10 +538,8 @@ inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
 }
 #endif
 
-// Render a stolen voice continuation across an event-free span.  All state is
-// held in locals and committed once, avoiding the former SoA round-trip on
-// every frame.  The caller limits frameCount when the replacement voice
-// retires inside the span because the tail is owned by that primary slot.
+// Render an independent stolen-voice continuation across an event-free span.
+// All state is held in locals and committed once.
 inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
                                 const float* sampleData,
                                 uint32_t sampleDataFrames,
@@ -1125,8 +1127,6 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                 }
 
                 if (retiredAt != UINT32_MAX) {
-                    if (v.stealTailFramesRemaining[idx] != 0u)
-                        tailFrameCounts_[idx] = retiredAt + 1u;
                     retirements_[retireCount++] = {
                         idx, retiredAt, voices.activePosition_[idx]};
                 } else if (renderClass == VoiceRenderClass::TransientLoop ||

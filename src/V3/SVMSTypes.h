@@ -28,6 +28,11 @@ constexpr uint32_t kNewbornProtectSamples = 64;
 // suppress the discontinuity without retaining a near-second voice layer
 // throughout sustained full-pool stealing.
 constexpr uint32_t kStealFadeFrames = 64;
+constexpr uint32_t kStealTailReserve = 50;
+// BASSMIDI converts its internal voice gain back to mixer amplitude with a
+// 1/42000 factor. Keep the inverse scale so loudness and age retain the same
+// relative weight in the replicated victim score.
+constexpr float kBassMidiStealGainScale = 42000.0f;
 
 // Raw MIDI ingress record. Producers capture both timestamp and global
 // sequence before any backpressure wait.

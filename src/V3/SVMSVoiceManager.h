@@ -3,7 +3,9 @@
 
 #include "SVMSTypes.h"
 #include "SVMSEnvelope.h"
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 
 namespace svms {
@@ -45,11 +47,10 @@ struct VoiceConfiguration {
 //   activeList[]  — indices of currently active/releasing voices
 //   freeStack[]   — LIFO stack of free slot indices for O(1) allocation
 //
-// Stealing: when the pool is full, the least audible/important voice is
-// replaced.  Released, quiet and low-velocity voices are preferred while
-// loud (velocity >= 96) and newborn/attack voices are protected.  The old
-// sample cursor is retained as a short fade tail so replacement never cuts a
-// waveform at full amplitude.
+// Stealing follows BASSMIDI's pool-limit policy: effective control/envelope
+// level protects audible voices while rendered age makes older voices easier
+// to replace. MIDI velocity is not a separate priority. Audible victims enter
+// a bounded reserve of short fade tails so replacement never hard-cuts them.
 // ════════════════════════════════════════════════════════════════════════
 class VoiceManager {
 public:
@@ -216,8 +217,6 @@ private:
     // and active position do not change, so CommitVoiceConfiguration can
     // update the key in place instead of remove + insert heap traversals.
     uint8_t stealCandidateReserved_[kMaxPolyphony];
-    uint64_t nextVolatileTransitionFrame_;
-    uint64_t nextStableExpiryFrame_;
 
     // Per-key tracking for EndVoicesForChannelKey
     int32_t channelKeyVoiceHead_[kChannelCount][kNoteCount];
@@ -254,17 +253,18 @@ private:
     void VolatileHeapSiftUp(uint32_t position);
     void VolatileHeapSiftDown(uint32_t position);
     void RemoveVolatileHeapCandidate(VoiceHandle handle);
-    void ProcessStealTransitions();
     bool IsStableStealCandidate(VoiceHandle handle) const;
-    bool IsPersistentNewbornCandidate(VoiceHandle handle) const;
+    float ComputeEffectiveStealLevel(VoiceHandle handle) const;
+    float ComputeTailLevel(uint32_t tailSlot) const;
+    uint32_t SelectStealTailSlot(float outgoingLevel) const;
     float ComputeStableStealKey(VoiceHandle handle) const;
     static bool HigherPriorityCandidate(const StealCandidate& a,
                                         const StealCandidate& b);
 
     // ── Score-based steal priority ─────────────────────────────────────
-    // Computes a priority score for a voice.  HIGHER score = stolen FIRST.
-    //   Released, low-output and low-velocity voices score higher.
-    //   Velocity >= 96 and attack/newborn voices receive protection.
+    // Computes BASSMIDI-like priority. HIGHER score = stolen FIRST.
+    // Effective control/envelope level protects audible voices; rendered age
+    // is the only independent bias. Velocity is not a separate priority.
     float ComputeStealScore(uint32_t idx) const;
 };
 
@@ -279,9 +279,7 @@ inline VoiceManager::VoiceManager()
       retireCount_(0), retireImmediateCount_(0), stealCount_(0),
       stealTailCount_(0), stealHeapCount_(0), stealHeapValid_(false),
       stealVolatileCount_(0), stealVolatileHeapCount_(0),
-      stealVolatileHeapFrame_(UINT64_MAX), stealVolatileHeapValid_(false),
-      nextVolatileTransitionFrame_(UINT64_MAX),
-      nextStableExpiryFrame_(UINT64_MAX) {
+      stealVolatileHeapFrame_(UINT64_MAX), stealVolatileHeapValid_(false) {
     std::memset(&v, 0, sizeof(v));
     std::memset(activeList_, 0, sizeof(activeList_));
     std::memset(activePosition_, 0xff, sizeof(activePosition_));
@@ -338,8 +336,6 @@ inline void VoiceManager::Reset() {
     stealVolatileHeapCount_ = 0;
     stealVolatileHeapFrame_ = UINT64_MAX;
     stealVolatileHeapValid_ = false;
-    nextVolatileTransitionFrame_ = UINT64_MAX;
-    nextStableExpiryFrame_ = UINT64_MAX;
     freeTop_ = maxVoices_;
     for (uint32_t i = 0; i < maxVoices_; ++i) {
         v.state[i] = static_cast<uint8_t>(VoiceState::Free);
@@ -354,10 +350,6 @@ inline void VoiceManager::Reset() {
 
 inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
     currentFrame_ = frame;
-    if (stealHeapValid_ &&
-        (frame >= nextVolatileTransitionFrame_ || frame >= nextStableExpiryFrame_)) {
-        ProcessStealTransitions();
-    }
 }
 
 inline uint32_t VoiceManager::GetChannelActiveCount(uint8_t channel) const {
@@ -407,39 +399,31 @@ inline VoiceHandle VoiceManager::FindStealVictimExhaustiveForTest() const {
 }
 #endif
 
+inline float VoiceManager::ComputeEffectiveStealLevel(
+    VoiceHandle handle) const {
+    const float left = v.mixGainL[handle];
+    const float right = v.mixGainR[handle];
+    // BASS ranks a control-derived level before waveform sampling. The
+    // stereo energy norm removes constant-power pan from that estimate.
+    const float outputGain = std::sqrt(left * left + right * right);
+    const uint8_t stage = v.envelopeStage[handle];
+    const bool preDecay =
+        v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
+        (stage == 4u || stage == 0u || stage == 1u);
+    const float envelopeGain = preDecay
+        ? v.targetGain[handle] : v.currentGain[handle];
+    return std::fabs(envelopeGain) * outputGain;
+}
+
 inline float VoiceManager::ComputeStealScore(uint32_t idx) const {
-    const uint32_t ageFrames = GetVoiceAge(static_cast<VoiceHandle>(idx));
-    const float ageSeconds = static_cast<float>(ageFrames) /
-                             static_cast<float>(sampleRate_);
-    const float cappedAge = ageSeconds < 10.0f ? ageSeconds : 10.0f;
-
-    float audibleGain = v.currentGain[idx];
-    if (audibleGain < 0.0f) audibleGain = -audibleGain;
-    float outputGain = v.mixGainL[idx];
-    if (outputGain < 0.0f) outputGain = -outputGain;
-    float rightGain = v.mixGainR[idx];
-    if (rightGain < 0.0f) rightGain = -rightGain;
-    if (rightGain > outputGain) outputGain = rightGain;
-    audibleGain *= outputGain;
-    if (audibleGain > 1.0f) audibleGain = 1.0f;
-
-    // Higher score means less important and therefore stolen first.
-    float score = (1.0f - audibleGain) * 10000.0f;
-    score += static_cast<float>(127u - v.velocity[idx]) * 100.0f;
-    score += cappedAge * 100.0f;
-
-    if (v.state[idx] == static_cast<uint8_t>(VoiceState::Releasing))
-        score += 20000.0f;
-    if (v.velocity[idx] >= 96)
-        score -= 5000.0f;
-
-    const uint8_t stage = v.envelopeStage[idx];
-    const bool attackPhase = (stage == 0 || stage == 1 || stage == 4);
-    if (v.state[idx] == static_cast<uint8_t>(VoiceState::Active) &&
-        (attackPhase || ageFrames < kNewbornProtectSamples)) {
-        score -= 30000.0f;
-    }
-    return score;
+    // Reversed form of BASSMIDI's minimum-priority scan:
+    //   int(effectiveLevel * 42000) - (ageSamples >> 8)
+    // A continuous /256 age term keeps the persistent heap invariant between
+    // voice-state changes while preserving the same ordering and scale.
+    const float ageUnits = static_cast<float>(GetVoiceAge(
+        static_cast<VoiceHandle>(idx))) * (1.0f / 256.0f);
+    return ageUnits - ComputeEffectiveStealLevel(
+        static_cast<VoiceHandle>(idx)) * kBassMidiStealGainScale;
 }
 
 inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity) {
@@ -492,11 +476,8 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.relLoopEF[handle]         = 0.0f;
     v.loopEnabled[handle]       = 0;
     v.birthFrame[handle]        = currentFrame_;
-    v.stealTailFramesRemaining[handle] = 0;
-    v.stealTailFramesTotal[handle] = 0;
     v.stealFadeInFramesRemaining[handle] = 0;
     v.stealFadeInFramesTotal[handle] = 0;
-    v.stealTailChannel[handle] = UINT8_MAX;
     stealCandidateDeferred_[handle] = 0u;
 }
 
@@ -518,9 +499,6 @@ inline void VoiceManager::InitializePreparedVoice(
     v.nextChannelKeyVoice[handle] = -1;
     v.prevChannelKeyVoice[handle] = -1;
     v.birthFrame[handle] = currentFrame_;
-    v.stealTailFramesRemaining[handle] = 0u;
-    v.stealTailFramesTotal[handle] = 0u;
-    v.stealTailChannel[handle] = UINT8_MAX;
     v.stealFadeInFramesRemaining[handle] = 0u;
     v.stealFadeInFramesTotal[handle] = 0u;
     stealCandidateDeferred_[handle] = 0u;
@@ -690,6 +668,42 @@ inline void VoiceManager::RefreshStealTail(VoiceHandle handle) {
         UnlinkStealTail(handle);
 }
 
+inline float VoiceManager::ComputeTailLevel(uint32_t tailSlot) const {
+    if (tailSlot >= maxVoices_ ||
+        v.stealTailFramesRemaining[tailSlot] == 0u) return 0.0f;
+    const uint32_t total = v.stealTailFramesTotal[tailSlot];
+    const float fade = total > 1u
+        ? static_cast<float>(v.stealTailFramesRemaining[tailSlot] - 1u) /
+          static_cast<float>(total - 1u)
+        : 0.0f;
+    const float gain = std::fabs(v.stealTailGain[tailSlot]) * fade;
+    return gain * (std::fabs(v.stealTailMixGainL[tailSlot]) +
+                   std::fabs(v.stealTailMixGainR[tailSlot]));
+}
+
+inline uint32_t VoiceManager::SelectStealTailSlot(float outgoingLevel) const {
+    const uint32_t reserveLimit = (std::min)(maxVoices_, kStealTailReserve);
+    if (reserveLimit == 0u || outgoingLevel <= 0.0f) return UINT32_MAX;
+    if (stealTailCount_ < reserveLimit) {
+        for (uint32_t slot = 0; slot < maxVoices_; ++slot) {
+            if (v.stealTailFramesRemaining[slot] == 0u) return slot;
+        }
+        return UINT32_MAX;
+    }
+
+    uint32_t quietest = stealTailList_[0];
+    float quietestLevel = ComputeTailLevel(quietest);
+    for (uint32_t position = 1u; position < stealTailCount_; ++position) {
+        const uint32_t slot = stealTailList_[position];
+        const float level = ComputeTailLevel(slot);
+        if (level < quietestLevel) {
+            quietest = slot;
+            quietestLevel = level;
+        }
+    }
+    return outgoingLevel > quietestLevel ? quietest : UINT32_MAX;
+}
+
 inline bool VoiceManager::HigherPriorityCandidate(const StealCandidate& a,
                                                    const StealCandidate& b) {
     if (a.score != b.score) return a.score > b.score;
@@ -734,8 +748,6 @@ inline void VoiceManager::BuildStealHeap() {
     stealVolatileCount_ = 0u;
     stealVolatileHeapCount_ = 0u;
     stealVolatileHeapValid_ = false;
-    nextVolatileTransitionFrame_ = UINT64_MAX;
-    nextStableExpiryFrame_ = UINT64_MAX;
     std::memset(stealHeapPosition_, 0xff, sizeof(stealHeapPosition_));
     std::memset(stealVolatilePosition_, 0xff, sizeof(stealVolatilePosition_));
     for (uint32_t position = 0; position < activeCount_; ++position) {
@@ -745,9 +757,6 @@ inline void VoiceManager::BuildStealHeap() {
             stealHeap_[heapPosition] = {
                 ComputeStableStealKey(handle), handle, position};
             stealHeapPosition_[handle] = heapPosition;
-            const uint64_t expiry = v.birthFrame[handle] +
-                static_cast<uint64_t>(sampleRate_) * 10u;
-            if (expiry < nextStableExpiryFrame_) nextStableExpiryFrame_ = expiry;
         } else {
             LinkVolatileCandidate(static_cast<VoiceHandle>(handle));
         }
@@ -762,7 +771,6 @@ inline void VoiceManager::BuildStealHeap() {
 inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
                                                     bool reserveVolatileRoot) {
     if (!stealHeapValid_) BuildStealHeap();
-    ProcessStealTransitions();
     // Transient gains change while samples render, not between equal-frame
     // MIDI events. Rebuild once when the output frame advances and keep exact
     // O(log N) replacement updates for the rest of that frame.
@@ -831,9 +839,6 @@ inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
         ComputeStableStealKey(handle), handle, activePosition};
     stealHeapPosition_[handle] = position;
     HeapSiftUp(position);
-    const uint64_t expiry = v.birthFrame[handle] +
-        static_cast<uint64_t>(sampleRate_) * 10u;
-    if (expiry < nextStableExpiryFrame_) nextStableExpiryFrame_ = expiry;
 }
 
 inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
@@ -845,28 +850,14 @@ inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
 }
 
 inline bool VoiceManager::IsStableStealCandidate(VoiceHandle handle) const {
-    if (handle >= maxVoices_ ||
-        v.state[handle] != static_cast<uint8_t>(VoiceState::Active) ||
-        v.envelopeStage[handle] != 3u) return false;
-    const uint64_t age = currentFrame_ > v.birthFrame[handle]
-        ? currentFrame_ - v.birthFrame[handle] : 0u;
-    return age >= kNewbornProtectSamples &&
-        age < static_cast<uint64_t>(sampleRate_) * 10u;
-}
-
-inline bool VoiceManager::IsPersistentNewbornCandidate(
-    VoiceHandle handle) const {
-    if (handle >= maxVoices_ ||
-        v.state[handle] != static_cast<uint8_t>(VoiceState::Active) ||
-        v.envelopeStage[handle] != 3u) return false;
-    const uint64_t age = currentFrame_ > v.birthFrame[handle]
-        ? currentFrame_ - v.birthFrame[handle] : 0u;
-    return age < kNewbornProtectSamples;
+    return handle < maxVoices_ &&
+        v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
+        v.envelopeStage[handle] == 3u;
 }
 
 inline float VoiceManager::ComputeStableStealKey(VoiceHandle handle) const {
-    const float commonAgeScore = static_cast<float>(currentFrame_) /
-        static_cast<float>(sampleRate_) * 100.0f;
+    const float commonAgeScore =
+        static_cast<float>(currentFrame_) * (1.0f / 256.0f);
     return ComputeStealScore(handle) - commonAgeScore;
 }
 
@@ -882,12 +873,6 @@ inline void VoiceManager::LinkVolatileCandidate(VoiceHandle handle) {
             ComputeStableStealKey(handle), handle, activePosition_[handle]};
         stealVolatileHeapPosition_[handle] = heapPosition;
         VolatileHeapSiftUp(heapPosition);
-    }
-    if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
-        v.envelopeStage[handle] == 3u) {
-        const uint64_t deadline = v.birthFrame[handle] + kNewbornProtectSamples;
-        if (deadline > currentFrame_ && deadline < nextVolatileTransitionFrame_)
-            nextVolatileTransitionFrame_ = deadline;
     }
 }
 
@@ -990,32 +975,6 @@ inline void VoiceManager::RemoveStealCandidate(VoiceHandle handle) {
     }
 }
 
-inline void VoiceManager::ProcessStealTransitions() {
-    if (!stealHeapValid_) return;
-    if (currentFrame_ >= nextStableExpiryFrame_) {
-        // Age capping changes the slope relative to uncapped candidates.
-        // It is rare (once per voice after ten seconds), so rebuilding here
-        // keeps the common dense-note path incremental and the policy exact.
-        BuildStealHeap();
-        return;
-    }
-    if (currentFrame_ < nextVolatileTransitionFrame_) return;
-    nextVolatileTransitionFrame_ = UINT64_MAX;
-    for (uint32_t position = stealVolatileCount_; position > 0u; --position) {
-        const VoiceHandle handle = static_cast<VoiceHandle>(
-            stealVolatileList_[position - 1u]);
-        if (IsStableStealCandidate(handle)) {
-            UnlinkVolatileCandidate(handle);
-            PushStealCandidate(handle, activePosition_[handle]);
-        } else if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
-                   v.envelopeStage[handle] == 3u) {
-            const uint64_t deadline = v.birthFrame[handle] + kNewbornProtectSamples;
-            if (deadline > currentFrame_ && deadline < nextVolatileTransitionFrame_)
-                nextVolatileTransitionFrame_ = deadline;
-        }
-    }
-}
-
 inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (freeTop_ == 0) return kInvalidVoice;
     uint32_t idx = freeStack_[--freeTop_];
@@ -1080,16 +1039,18 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     const uint8_t tailSampleBacked = v.sampleBacked[bestIdx];
     const uint8_t tailLoopEnabled = v.loopEnabled[bestIdx];
     const uint8_t tailChannel = v.channel[bestIdx];
+    const float outgoingTailLevel = std::fabs(tailGain) *
+        (std::fabs(tailMixGainL) + std::fabs(tailMixGainR));
     const bool tailAudible = tailSampleBacked != 0 && tailRelEnd > 1u &&
-        tailGain > kVoiceRetireThreshold &&
-        (tailMixGainL != 0.0f || tailMixGainR != 0.0f);
+        outgoingTailLevel > kVoiceRetireThreshold;
+    const uint32_t tailSlot = tailAudible
+        ? SelectStealTailSlot(outgoingTailLevel) : UINT32_MAX;
 
     // Retire the victim.
     ++stealCount_;
     UnlinkChannelKey(static_cast<VoiceHandle>(bestIdx));
     UnlinkChannelActive(static_cast<VoiceHandle>(bestIdx));
     UnlinkRenderClass(static_cast<VoiceHandle>(bestIdx));
-    UnlinkStealTail(static_cast<VoiceHandle>(bestIdx));
     v.state[bestIdx] = static_cast<uint8_t>(VoiceState::Free);
 
     // Reinitialize in-place
@@ -1099,24 +1060,24 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     else
         InitializeVoice(static_cast<VoiceHandle>(bestIdx), channel, note, velocity);
     stealCandidateDeferred_[bestIdx] = deferCandidate ? 1u : 0u;
-    if (tailAudible) {
-        v.stealTailPhase[bestIdx] = tailPhase;
-        v.stealTailPhaseInc[bestIdx] = tailPhaseInc;
-        v.stealTailGain[bestIdx] = tailGain;
-        v.stealTailMixGainL[bestIdx] = tailMixGainL;
-        v.stealTailMixGainR[bestIdx] = tailMixGainR;
-        v.stealTailSampleStart[bestIdx] = tailSampleStart;
-        v.stealTailRelEnd[bestIdx] = tailRelEnd;
-        v.stealTailRelLoopS[bestIdx] = tailRelLoopS;
-        v.stealTailRelLoopE[bestIdx] = tailRelLoopE;
-        v.stealTailRelLoopSF[bestIdx] = tailRelLoopSF;
-        v.stealTailRelLoopEF[bestIdx] = tailRelLoopEF;
-        v.stealTailSampleBacked[bestIdx] = tailSampleBacked;
-        v.stealTailLoopEnabled[bestIdx] = tailLoopEnabled;
-        v.stealTailChannel[bestIdx] = tailChannel;
-        v.stealTailFramesRemaining[bestIdx] = stealFadeFrames_;
-        v.stealTailFramesTotal[bestIdx] = stealFadeFrames_;
-        LinkStealTail(static_cast<VoiceHandle>(bestIdx));
+    if (tailSlot != UINT32_MAX) {
+        v.stealTailPhase[tailSlot] = tailPhase;
+        v.stealTailPhaseInc[tailSlot] = tailPhaseInc;
+        v.stealTailGain[tailSlot] = tailGain;
+        v.stealTailMixGainL[tailSlot] = tailMixGainL;
+        v.stealTailMixGainR[tailSlot] = tailMixGainR;
+        v.stealTailSampleStart[tailSlot] = tailSampleStart;
+        v.stealTailRelEnd[tailSlot] = tailRelEnd;
+        v.stealTailRelLoopS[tailSlot] = tailRelLoopS;
+        v.stealTailRelLoopE[tailSlot] = tailRelLoopE;
+        v.stealTailRelLoopSF[tailSlot] = tailRelLoopSF;
+        v.stealTailRelLoopEF[tailSlot] = tailRelLoopEF;
+        v.stealTailSampleBacked[tailSlot] = tailSampleBacked;
+        v.stealTailLoopEnabled[tailSlot] = tailLoopEnabled;
+        v.stealTailChannel[tailSlot] = tailChannel;
+        v.stealTailFramesRemaining[tailSlot] = stealFadeFrames_;
+        v.stealTailFramesTotal[tailSlot] = stealFadeFrames_;
+        LinkStealTail(static_cast<VoiceHandle>(tailSlot));
     }
     // The outgoing victim needs an anti-click tail. The replacement is a
     // legitimate new attack and must start at its SF2 envelope level; fading
@@ -1189,7 +1150,6 @@ inline void VoiceManager::RetireVoice(VoiceHandle handle) {
     UnlinkChannelKey(handle);
     UnlinkChannelActive(handle);
     UnlinkRenderClass(handle);
-    UnlinkStealTail(handle);
     stealHeapValid_ = false;
     v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
     v.currentGain[handle] = 0.0f;
@@ -1550,10 +1510,8 @@ inline void VoiceManager::SilenceChannelImmediate(uint8_t channel) {
     while (channelActiveCount_[channel] > 0u) {
         const uint32_t idx =
             channelActiveList_[channel][channelActiveCount_[channel] - 1u];
-        // CC120 is the hard-stop controller.  It also cancels any transient
-        // steal crossfade attached to the slot; no audio from this channel is
-        // permitted after the controller's target frame.
-        v.stealTailFramesRemaining[idx] = 0;
+        // Tail ownership is independent from the active slot and was handled
+        // by channel identity above.
         v.stealFadeInFramesRemaining[idx] = 0;
         RetireVoice(static_cast<VoiceHandle>(idx));
     }
