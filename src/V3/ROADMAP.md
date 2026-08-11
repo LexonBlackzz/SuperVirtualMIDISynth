@@ -195,6 +195,9 @@ larger phase containing that item is complete.
 - [x] Make CC121 reset sustain and release notes that it held
 - [x] Track overlapping same-key generations so note-off releases the oldest
   still-active generation without killing a later retrigger
+- [x] Treat every physical SF2 region sharing one `playIndex` as an atomic
+  steal group, so stereo and layered notes cannot lose only one channel while
+  mono notes continue to consume and retire one physical voice
 - [x] Derive voice age from an absolute birth frame
 - [x] Retire voices in O(1) with inverse active positions and append allocation
 - [x] Preserve phase overshoot when one increment crosses multiple loop lengths
@@ -282,7 +285,8 @@ larger phase containing that item is complete.
   region validation, and the shipped `gm.sf2`
 - [x] Add tests for pitch, overlapping retriggers, sustain, channel
   termination, exact release duration, loop wrapping, CC11, voice identity,
-  BASS-like loudness/age stealing, velocity independence, and bounded fade tails
+  BASS-like loudness/age stealing, velocity independence, atomic stereo/mono
+  steal groups, and bounded fade tails
 - [x] Add bounded scheduler ordering, queue wrap/capacity, four-producer MPSC,
   configuration lifecycle, and six-hour timing tests
 - [x] Verify batch scheduler rebuilds and exact-frame batch dispatch preserve

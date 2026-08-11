@@ -533,6 +533,59 @@ void TestPriorityAwareStealingAndFadeTail() {
 
     {
         auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(3, 44100);
+        const svms::VoiceHandle left = voices->AllocateVoice(0, 60, 100);
+        const svms::VoiceHandle right = voices->AllocateVoice(0, 60, 100);
+        const svms::VoiceHandle mono = voices->AllocateVoice(0, 64, 100);
+        for (const svms::VoiceHandle handle : {left, right, mono}) {
+            voices->SetVoiceSample(handle, 0, 128, 8, 120, 1, 1.0f, 1);
+            voices->SetVoiceEnvelope(handle, 1.0f, 1.0f, 0, 0, 0, 0,
+                                     0.0f, 1.0f, 0.999f);
+        }
+        voices->SetVoicePlayIndex(left, 10u);
+        voices->SetVoicePlayIndex(right, 10u);
+        voices->SetVoicePlayIndex(mono, 11u);
+        voices->v.mixGainL[left] = 0.1f;
+        voices->v.mixGainR[left] = 0.0f;
+        voices->v.mixGainL[right] = 0.0f;
+        voices->v.mixGainR[right] = 0.1f;
+        voices->v.mixGainL[mono] = voices->v.mixGainR[mono] = 1.0f;
+
+        bool stolen = false;
+        const svms::VoiceHandle replacement =
+            voices->AllocateVoiceOrSteal(0, 67, 100, &stolen);
+        const svms::VoiceHandle sibling = replacement == left ? right : left;
+        Check(stolen && !voices->IsActive(sibling) && voices->IsActive(mono),
+              "stealing one stereo region retires its complete playIndex group");
+        Check(voices->GetActiveCount() == 2u && voices->freeTop_ == 1u &&
+                  voices->stealCount_ == 2u,
+              "group stealing counts and frees both physical stereo voices");
+        const svms::VoiceHandle secondLayer = voices->AllocateVoice(0, 67, 100);
+        Check(secondLayer == sibling && voices->GetActiveCount() == 3u,
+              "the following replacement layer reuses the freed stereo sibling");
+    }
+
+    {
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(2, 44100);
+        const svms::VoiceHandle quiet = voices->AllocateVoice(0, 60, 100);
+        const svms::VoiceHandle loud = voices->AllocateVoice(0, 64, 100);
+        voices->SetVoicePlayIndex(quiet, 20u);
+        voices->SetVoicePlayIndex(loud, 21u);
+        voices->SetVoiceEnvelope(quiet, 0.1f, 1.0f, 0, 0, 0, 0,
+                                 0.0f, 1.0f, 0.999f);
+        voices->SetVoiceEnvelope(loud, 1.0f, 1.0f, 0, 0, 0, 0,
+                                 0.0f, 1.0f, 0.999f);
+        voices->v.mixGainL[quiet] = voices->v.mixGainR[quiet] = 0.1f;
+        voices->v.mixGainL[loud] = voices->v.mixGainR[loud] = 1.0f;
+        voices->AllocateVoiceOrSteal(0, 67, 100);
+        Check(voices->GetActiveCount() == 2u && voices->freeTop_ == 0u &&
+                  voices->stealCount_ == 1u,
+              "a mono playIndex still steals exactly one physical voice");
+    }
+
+    {
+        auto voices = std::make_unique<svms::VoiceManager>();
         voices->Initialize(2, 44100);
         const svms::VoiceHandle mature = voices->AllocateVoice(0, 60, 100);
         voices->SetVoiceEnvelope(mature, 1.0f, 1.0f, 0, 0, 0, 0,
