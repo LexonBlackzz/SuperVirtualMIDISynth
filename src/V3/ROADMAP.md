@@ -141,6 +141,11 @@ larger phase containing that item is complete.
   cannot resurrect terminated sound
 - [x] Verify four-producer MPSC integrity without duplicates, torn payloads, or
   lost events
+- [x] Move raw MIDI decoding and remainder-preserving QPC-to-frame compilation
+  to a persistent preallocated worker on modern multi-core systems; retain the
+  synchronous callback path on single-core and XP targets
+- [x] Feed compiled commands through a cancellable SPSC handoff and include
+  both raw and compiled backlog in admission pressure
 - [ ] Saturate every priority lane and test monotonic shedding, lossless-lane
   wakeup/backpressure, and shutdown cancellation
 - [ ] Add bulk-packed MIDI ingestion and safe redundant-controller coalescing
@@ -151,7 +156,12 @@ larger phase containing that item is complete.
 - [x] Convert QPC timestamps to integer output frames from a fixed epoch
 - [x] Store future events in a bounded audio-thread-owned min-heap ordered by
   absolute frame and global ingress sequence
+- [x] Append each callback's newly compiled commands as one batch and rebuild
+  the scheduler heap once instead of performing one logarithmic insertion per
+  event
 - [x] Preserve deterministic equal-frame event ordering
+- [x] Dispatch each equal-frame run through one batch callback while preserving
+  every event and its global ingress order
 - [x] Dispatch MIDI state changes and notes at exact render-frame boundaries
 - [x] Clamp late events to the next writable frame and record lateness
 - [x] Fast-forward missed output time after callback overruns and discard only
@@ -224,6 +234,11 @@ larger phase containing that item is complete.
   roots in place without changing exhaustive victim selection
 - [x] Apply each prepared SF2 layer through one transactional voice setup and
   expose attack-frame control in the dense note-burst benchmark
+- [x] Cache immutable preset/note/velocity region matches in an allocation-free
+  direct-mapped table, cache committed channel presets, precompute the complete
+  configured velocity-gain table, and cache channel pitch-bend ratios
+- [x] Rebuild only the affected channel's derived controller state at an exact
+  event boundary instead of recomputing all 16 channels per controller event
 - [x] Make channel/key unlink O(1) with intrusive previous/next positions so
   dense same-key replacement never walks an entire retrigger generation
 - [x] Precompute immutable SF2 region peaks, validation, per-key base pitch,
@@ -263,6 +278,8 @@ larger phase containing that item is complete.
   priority stealing, and fade tails
 - [x] Add bounded scheduler ordering, queue wrap/capacity, four-producer MPSC,
   configuration lifecycle, and six-hour timing tests
+- [x] Verify batch scheduler rebuilds and exact-frame batch dispatch preserve
+  frame/sequence ordering
 - [ ] Build a complete offline MIDI-to-WAV renderer
 - [ ] Render identical streams through V3 and BASSMIDI using the same SF2,
   sample rate, bend range, and disabled effects

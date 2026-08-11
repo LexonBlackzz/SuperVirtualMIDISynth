@@ -31,6 +31,9 @@ public:
     void AllSoundOff(uint8_t channel);
 
     void RebuildCache(const struct RuntimeConfigSnapshot& cfg, float sampleRate);
+    void RebuildChannel(uint8_t channel,
+                        const struct RuntimeConfigSnapshot& cfg,
+                        float sampleRate);
     const ChannelParamsSnapshot* GetParams() const;
     uint8_t GetProgram(uint8_t channel) const;
     uint8_t GetBankMSB(uint8_t channel) const;
@@ -157,23 +160,31 @@ inline void ChannelCache::AllSoundOff(uint8_t channel) {
 }
 
 inline void ChannelCache::RebuildCache(const RuntimeConfigSnapshot& cfg, float sampleRate) {
+    for (uint32_t channel = 0; channel < kChannelCount; ++channel)
+        RebuildChannel(static_cast<uint8_t>(channel), cfg, sampleRate);
+}
+
+inline void ChannelCache::RebuildChannel(uint8_t channel,
+                                         const RuntimeConfigSnapshot& cfg,
+                                         float sampleRate) {
     (void)sampleRate;
-    for (uint32_t ch = 0; ch < kChannelCount; ++ch) {
-        float vol = masterVolume_ * (channelVolume_[ch] / 127.0f);
-        channels_[ch].volume = vol;
-        channels_[ch].expression = channelExpression_[ch] / 127.0f;
+    if (channel >= kChannelCount) return;
+    const uint32_t ch = channel;
+    const float vol = masterVolume_ * (channelVolume_[ch] / 127.0f);
+    channels_[ch].volume = vol;
+    channels_[ch].expression = channelExpression_[ch] / 127.0f;
 
-        ComputePanGain(static_cast<uint8_t>(channelPan_[ch]),
-                       channels_[ch].panLeft, channels_[ch].panRight, cfg);
+    ComputePanGain(static_cast<uint8_t>(channelPan_[ch]),
+                   channels_[ch].panLeft, channels_[ch].panRight, cfg);
 
-        float bend = (channelPitchBend_[ch] - 8192.0f) / 8192.0f;
-        channels_[ch].pitchBendCents = bend * (kDefaultPitchBendRangeSemitones * 100.0f);
+    const float bend = (channelPitchBend_[ch] - 8192.0f) / 8192.0f;
+    channels_[ch].pitchBendCents =
+        bend * (kDefaultPitchBendRangeSemitones * 100.0f);
 
-        channels_[ch].sustainActive = channelSustain_[ch] >= 64 ? 1 : 0;
-        channels_[ch].filterCutoff = 20000.0f;
-        channels_[ch].filterResonance = 0.0f;
-        channels_[ch].modDepth = 0.0f;
-    }
+    channels_[ch].sustainActive = channelSustain_[ch] >= 64 ? 1u : 0u;
+    channels_[ch].filterCutoff = 20000.0f;
+    channels_[ch].filterResonance = 0.0f;
+    channels_[ch].modDepth = 0.0f;
 }
 
 inline const ChannelParamsSnapshot* ChannelCache::GetParams() const {

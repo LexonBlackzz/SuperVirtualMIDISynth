@@ -131,6 +131,8 @@ struct RenderEvent {
 
 using EventDispatcher = void(*)(const RenderEvent& event, uint32_t blockCursor,
                                  void* userData);
+using EventBatchDispatcher = void(*)(const RenderEvent* events, uint32_t eventCount,
+                                     uint32_t blockCursor, void* userData);
 
 struct SpanRetirement {
     uint32_t handle;
@@ -199,6 +201,7 @@ public:
 #endif
 
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
+    void SetEventBatchDispatcher(EventBatchDispatcher dispatcher, void* userData);
     bool SetRenderBackend(RenderBackend backend);
     RenderBackend GetRenderBackend() const { return kernelSet_->backend; }
     const char* GetRenderBackendName() const { return kernelSet_->name; }
@@ -211,6 +214,7 @@ private:
                      const RenderEvent* events, uint32_t eventCount,
                      bool correctnessMode, uint64_t blockStartFrame);
     EventDispatcher dispatcher_;
+    EventBatchDispatcher batchDispatcher_;
     void* dispatcherUserData_;
     const RenderKernelSet* kernelSet_;
     alignas(64) uint32_t classChanges_[kMaxPolyphony];
@@ -219,7 +223,7 @@ private:
 };
 
 inline RenderScalar::RenderScalar()
-    : dispatcher_(nullptr), dispatcherUserData_(nullptr),
+    : dispatcher_(nullptr), batchDispatcher_(nullptr), dispatcherUserData_(nullptr),
       kernelSet_(&SelectBestRenderKernelSet()) {}
 
 inline bool RenderScalar::SetRenderBackend(RenderBackend backend) {
@@ -231,6 +235,12 @@ inline bool RenderScalar::SetRenderBackend(RenderBackend backend) {
 
 inline void RenderScalar::SetEventDispatcher(EventDispatcher dispatcher, void* userData) {
     dispatcher_ = dispatcher;
+    dispatcherUserData_ = userData;
+}
+
+inline void RenderScalar::SetEventBatchDispatcher(EventBatchDispatcher dispatcher,
+                                                   void* userData) {
+    batchDispatcher_ = dispatcher;
     dispatcherUserData_ = userData;
 }
 
@@ -287,11 +297,19 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
         voices.SetCurrentFrame(blockStartFrame + f);
         // ── 1. Dispatch events at this frame ──────────────────────────
         // floor(sampleOffset) <= f  <=>  sampleOffset < f + 1
+        const uint32_t batchBegin = eventIdx;
         while (eventIdx < eventCount) {
             if (events[eventIdx].frameOffset > frameCursor) break;
-            if (dispatcher_)
-                dispatcher_(events[eventIdx], f, dispatcherUserData_);
             ++eventIdx;
+        }
+        if (eventIdx != batchBegin) {
+            if (batchDispatcher_) {
+                batchDispatcher_(events + batchBegin, eventIdx - batchBegin,
+                                 f, dispatcherUserData_);
+            } else if (dispatcher_) {
+                for (uint32_t i = batchBegin; i < eventIdx; ++i)
+                    dispatcher_(events[i], f, dispatcherUserData_);
+            }
         }
 
         // ── 2. Determine decimation step ──────────────────────────────
@@ -1024,9 +1042,17 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 
         // State changes at this boundary are visible to the first rendered
         // frame of the span.  Equal-frame order is already ingress order.
-        while (eventIndex < eventCount && events[eventIndex].frameOffset <= cursor) {
-            if (dispatcher_) dispatcher_(events[eventIndex], cursor, dispatcherUserData_);
+        const uint32_t batchBegin = eventIndex;
+        while (eventIndex < eventCount && events[eventIndex].frameOffset <= cursor)
             ++eventIndex;
+        if (eventIndex != batchBegin) {
+            if (batchDispatcher_) {
+                batchDispatcher_(events + batchBegin, eventIndex - batchBegin,
+                                 cursor, dispatcherUserData_);
+            } else if (dispatcher_) {
+                for (uint32_t i = batchBegin; i < eventIndex; ++i)
+                    dispatcher_(events[i], cursor, dispatcherUserData_);
+            }
         }
 
         uint32_t spanEnd = numFrames;

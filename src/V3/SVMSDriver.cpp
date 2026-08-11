@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdarg>
 #include <algorithm>
+#include <iterator>
+#include <thread>
 
 #if defined(SVMS_XP_COMPAT)
 #include "SVMSAudioOutputDirectSound.h"
@@ -20,6 +22,7 @@
 #include "SVMSSoundFont.h"
 #include "SVMSConfig.h"
 #include "SVMSMPSCQueue.h"
+#include "SVMSPSCQueue.h"
 #include "SVMSEventScheduler.h"
 #include "SVMSFrameClock.h"
 #include "SVMSDiagWindow.h"
@@ -165,6 +168,42 @@ static bool UsesXPWaveOut(const AudioOutput* output) {
 
 static constexpr uint32_t kInternalResetMessage = 0xFF000001u;
 
+static bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
+                                    uint64_t epochQPC, uint64_t qpcFrequency,
+                                    uint32_t sampleRate, uint32_t leadFrames,
+                                    ScheduledRenderEvent& scheduled) noexcept {
+    uint32_t message = timed.message;
+    uint8_t status = static_cast<uint8_t>(message & 0xffu);
+    uint8_t data1 = static_cast<uint8_t>((message >> 8u) & 0x7fu);
+    uint8_t data2 = static_cast<uint8_t>((message >> 16u) & 0x7fu);
+    uint8_t channel = status & 0x0fu;
+    RenderEventType type;
+    if (message == kInternalResetMessage) {
+        type = RenderEventType::Reset;
+        channel = data1 = data2 = 0u;
+    } else {
+        switch (status & 0xf0u) {
+            case 0x90u:
+                if (data2 != 0u) type = RenderEventType::NoteOn;
+                else type = RenderEventType::NoteOff;
+                break;
+            case 0x80u: type = RenderEventType::NoteOff; break;
+            case 0xb0u: type = RenderEventType::ControlChange; break;
+            case 0xc0u: type = RenderEventType::ProgramChange; break;
+            case 0xe0u: type = RenderEventType::PitchBend; break;
+            default: return false;
+        }
+    }
+
+    scheduled.event = {type, channel, data1, data2, 0u, timed.sequence};
+    scheduled.targetFrame = QpcDeltaToFrames(
+        static_cast<int64_t>(timed.qpcTimestamp) -
+            static_cast<int64_t>(epochQPC),
+        static_cast<int64_t>(qpcFrequency), sampleRate) + leadFrames;
+    scheduled.sequence = timed.sequence;
+    return true;
+}
+
 // WaitOnAddress is available on Windows 8 and newer, but some older Windows
 // SDK import libraries do not expose the API-set forwarding symbols. Resolve
 // it once during engine initialization so the audio callback never invokes
@@ -190,7 +229,10 @@ static void WaitForAddressChange(std::atomic<uint32_t>& address,
         g_waitOnAddress(reinterpret_cast<volatile VOID*>(&address),
                         &observed, sizeof(observed), 50);
     } else {
-        SwitchToThread();
+        // Windows 7 and some Wine configurations do not expose
+        // WaitOnAddress. Avoid turning an idle compiler/backpressure waiter
+        // into a full-core spin loop on those systems.
+        Sleep(1);
     }
 }
 
@@ -371,6 +413,18 @@ struct CallbackTimingWindow {
 
 struct PreparedSF2Region;
 
+static constexpr uint32_t kNoteRegionCacheSize = 4096u;
+static constexpr uint32_t kNoteRegionCacheLayers = 8u;
+static_assert((kNoteRegionCacheSize & (kNoteRegionCacheSize - 1u)) == 0u,
+              "note-region cache size must be a power of two");
+
+struct alignas(64) NoteRegionCacheEntry {
+    uint32_t tag;
+    uint16_t count;
+    uint16_t reserved;
+    uint32_t regionIndices[kNoteRegionCacheLayers];
+};
+
 class Driver {
 public:
     static Driver& Instance();
@@ -403,6 +457,9 @@ private:
     // exact integer output frame during RenderBlock.
     static void DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                                      void* userData);
+    static void DispatchRenderEventBatch(const RenderEvent* events,
+                                         uint32_t eventCount,
+                                         uint32_t blockCursor, void* userData);
 
     void HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity);
     void HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset);
@@ -410,8 +467,15 @@ private:
                              uint32_t blockOffset);
     void HandleProgramChange(uint8_t channel, uint8_t program);
     void HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb);
+    void EventCompilerLoop();
+    uint32_t ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
+                                uint8_t velocity,
+                                const SFSampleRegion** outRegions,
+                                uint32_t outCapacity);
+    void RefreshSelectedPresets();
 
     PriorityEventIngress<TimestampedMidiEvent> midiIngress_;
+    SPSCQueue<ScheduledRenderEvent, kDefaultEventRingCapacity> compiledIngress_;
     EventScheduler eventScheduler_;
     EventOverflowMode overflowMode_;
     bool correctnessMode_;
@@ -435,6 +499,10 @@ private:
     std::atomic<uint64_t> shedAtomic_;
     std::atomic<uint64_t> cancelledAtomic_;
     std::atomic<uint32_t> currentVelocityCutoffAtomic_;
+    std::atomic<uint64_t> compilerEpochQPC_;
+    std::atomic<uint32_t> compilerWakeEpoch_;
+    std::thread eventCompilerThread_;
+    bool useEventCompiler_;
     std::atomic<uint64_t> shedByVelocityAtomic_[128];
     EventTelemetry telemetry_;
     LiveSF2Telemetry sf2Telemetry_;
@@ -458,6 +526,9 @@ private:
     uint32_t regionInitialPeakCount;
     PreparedSF2Region* preparedRegions;
     uint32_t preparedRegionCount;
+    NoteRegionCacheEntry noteRegionCache_[kNoteRegionCacheSize];
+    float configuredVelocityGain_[128];
+    float channelPitchBendRatio_[kChannelCount];
     uint32_t sampleStoreCount;
     uint32_t sampleDataFrames;
     uint64_t qpcFreq;
@@ -622,9 +693,14 @@ Driver::Driver()
       producerWakeEpoch_(0),
       scheduledSizePublished_(0), submittedAtomic_(0), acceptedAtomic_(0), shedAtomic_(0),
       cancelledAtomic_(0), currentVelocityCutoffAtomic_(1),
+      compilerEpochQPC_(0), compilerWakeEpoch_(0), useEventCompiler_(false),
       telemetry_{}, debugSnapshotIndex_(0), callbackCount_(0),
       virtualRenderClockQPC(0),
       virtualRenderSample_(0), clockInitialized(false), nextPlayIndex_(1) {
+    std::memset(noteRegionCache_, 0xff, sizeof(noteRegionCache_));
+    std::memset(configuredVelocityGain_, 0, sizeof(configuredVelocityGain_));
+    std::fill(std::begin(channelPitchBendRatio_),
+              std::end(channelPitchBendRatio_), 1.0f);
     for (auto& counter : shedByVelocityAtomic_) counter.store(0, std::memory_order_relaxed);
     for (auto& fence : channelTerminationFence_) fence.store(0, std::memory_order_relaxed);
     limiter.Reset();
@@ -644,7 +720,9 @@ bool Driver::Initialize() {
 
     ResolveAddressWaitApi();
     midiIngress_.DrainAvailable();
+    compiledIngress_.Reset();
     eventScheduler_.Reset();
+    compilerEpochQPC_.store(0u, std::memory_order_relaxed);
     globalTerminationFence_.store(0, std::memory_order_relaxed);
     for (auto& fence : channelTerminationFence_) fence.store(0, std::memory_order_relaxed);
     virtualRenderClockQPC = 0;
@@ -740,6 +818,7 @@ bool Driver::Initialize() {
     // Register the EventDispatcher callback so RenderScalar can dispatch
     // MIDI events at their exact sub-sample positions during RenderBlock.
     renderScalar->SetEventDispatcher(DispatchRenderEvent, this);
+    renderScalar->SetEventBatchDispatcher(DispatchRenderEventBatch, this);
 
     configSnapshot = new RuntimeConfigSnapshot();
     std::memset(configSnapshot, 0, sizeof(RuntimeConfigSnapshot));
@@ -758,7 +837,33 @@ bool Driver::Initialize() {
     configSnapshot->panLaw = cfg.panLaw;
     configSnapshot->correctnessMode = cfg.correctnessMode;
 
+    // Velocity curve/floor are restart-only configuration.  Preserve the
+    // exact historical quantization into g_velGainLUT, but pay powf once at
+    // initialization instead of once per note-on.
+    for (uint32_t velocity = 0; velocity < 128u; ++velocity) {
+        const float mapped = channelCache->ComputeVelocity(
+            static_cast<uint8_t>(velocity), *configSnapshot);
+        if (mapped <= 0.0f) {
+            configuredVelocityGain_[velocity] = 0.0f;
+            continue;
+        }
+        uint32_t mappedIndex = static_cast<uint32_t>(mapped * 127.0f + 0.5f);
+        mappedIndex = (std::max)(1u, (std::min)(127u, mappedIndex));
+        configuredVelocityGain_[velocity] = g_velGainLUT[mappedIndex];
+    }
+
     audioOutput->SetRenderCallback(RenderCallback, this);
+
+#if !defined(SVMS_XP_COMPAT)
+    useEventCompiler_ = std::thread::hardware_concurrency() >= 2u;
+    if (useEventCompiler_) {
+        try {
+            eventCompilerThread_ = std::thread(&Driver::EventCompilerLoop, this);
+        } catch (...) {
+            useEventCompiler_ = false;
+        }
+    }
+#endif
 
     initialized = true;
     LOG("Initialize SUCCESS");
@@ -770,13 +875,18 @@ void Driver::Shutdown() {
     cancelProducers_.store(true, std::memory_order_release);
     producerWakeEpoch_.fetch_add(1, std::memory_order_release);
     WakeAddressWaiters(producerWakeEpoch_);
+    compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
+    WakeAddressWaiters(compilerWakeEpoch_);
     if (audioOutput) {
         audioOutput->Stop();
         audioOutput->Shutdown();
         delete audioOutput;
         audioOutput = nullptr;
     }
+    if (eventCompilerThread_.joinable()) eventCompilerThread_.join();
+    useEventCompiler_ = false;
     midiIngress_.DrainAvailable();
+    compiledIngress_.Reset();
     eventScheduler_.Reset();
     scheduledSizePublished_.store(0, std::memory_order_release);
     delete voiceManager; voiceManager = nullptr;
@@ -895,6 +1005,10 @@ bool Driver::LoadSoundFont(const wchar_t* path) {
         delete soundFontData;
     }
     soundFontData = sf2;
+    // Region pointers are immutable for one SoundFont bundle.  Reset the
+    // direct-mapped note lookup cache at the swap boundary so callback-side
+    // note-ons can never observe indices from the retired bundle.
+    std::memset(noteRegionCache_, 0xff, sizeof(noteRegionCache_));
 
     // Diagnostic peak inspection walks up to 512 source samples.  Doing
     // that for every configured voice made diagnostics catastrophically
@@ -1016,6 +1130,9 @@ void Driver::ResetAllVoices() {
     }
     if (voiceManager) voiceManager->Reset();
     if (channelCache) channelCache->Reset();
+    RefreshSelectedPresets();
+    std::fill(std::begin(channelPitchBendRatio_),
+              std::end(channelPitchBendRatio_), 1.0f);
     nextPlayIndex_ = 1;
     eventScheduler_.Reset();
     limiter.Reset();
@@ -1052,7 +1169,7 @@ void Driver::SubmitShortMsg(uint32_t msg) {
         else lane = EventLane::Quiet;
     }
 
-    const uint32_t ingress = midiIngress_.TotalSize();
+    const uint32_t ingress = midiIngress_.TotalSize() + compiledIngress_.Size();
     const uint32_t scheduled = scheduledSizePublished_.load(std::memory_order_acquire);
     const uint32_t ingressPressure = ingress * 100u / PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity();
     const uint32_t scheduledPressure = scheduled * 100u / kEventBufferCapacity;
@@ -1076,6 +1193,8 @@ void Driver::SubmitShortMsg(uint32_t msg) {
     for (;;) {
         if (midiIngress_.TryPush(lane, evt)) {
             acceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
+            compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
+            WakeAddressWaiters(compilerWakeEpoch_);
 #if defined(SVMS_XP_COMPAT)
             static LONG acceptedTraceCount = 0;
             const LONG acceptedIndex = InterlockedIncrement(&acceptedTraceCount);
@@ -1103,6 +1222,48 @@ void Driver::SubmitShortMsg(uint32_t msg) {
         }
         uint32_t observed = producerWakeEpoch_.load(std::memory_order_acquire);
         WaitForAddressChange(producerWakeEpoch_, observed);
+    }
+}
+
+void Driver::EventCompilerLoop() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    uint32_t producerWakeBatch = 0u;
+    while (!cancelProducers_.load(std::memory_order_acquire)) {
+        const uint64_t epoch = compilerEpochQPC_.load(std::memory_order_acquire);
+        if (epoch == 0u) {
+            const uint32_t observed = compilerWakeEpoch_.load(std::memory_order_acquire);
+            WaitForAddressChange(compilerWakeEpoch_, observed);
+            continue;
+        }
+
+        TimestampedMidiEvent timed{};
+        if (!midiIngress_.TryPop(timed)) {
+            if (producerWakeBatch != 0u) {
+                producerWakeEpoch_.fetch_add(1, std::memory_order_release);
+                WakeAddressWaiters(producerWakeEpoch_);
+                producerWakeBatch = 0u;
+            }
+            const uint32_t observed = compilerWakeEpoch_.load(std::memory_order_acquire);
+            WaitForAddressChange(compilerWakeEpoch_, observed);
+            continue;
+        }
+
+        ScheduledRenderEvent scheduled{};
+        if (!CompileTimestampedEvent(timed, epoch, qpcFreq, sampleRate,
+                                     bufferFrames, scheduled)) {
+            ++producerWakeBatch;
+            continue;
+        }
+        while (!compiledIngress_.Push(scheduled)) {
+            if (cancelProducers_.load(std::memory_order_acquire)) return;
+            const uint32_t observed = compilerWakeEpoch_.load(std::memory_order_acquire);
+            WaitForAddressChange(compilerWakeEpoch_, observed);
+        }
+        if (++producerWakeBatch >= 64u) {
+            producerWakeEpoch_.fetch_add(1, std::memory_order_release);
+            WakeAddressWaiters(producerWakeEpoch_);
+            producerWakeBatch = 0u;
+        }
     }
 }
 
@@ -1164,6 +1325,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     if (!self->clockInitialized) {
         self->virtualRenderClockQPC = blockStartQPC;
         self->clockInitialized = true;
+        self->compilerEpochQPC_.store(blockStartQPC, std::memory_order_release);
+        self->compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
+        WakeAddressWaiters(self->compilerWakeEpoch_);
     }
 
     const int64_t wallRenderSample = QpcDeltaToFrames(
@@ -1185,7 +1349,6 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // audio is delayed until reset.  Fast-forward the clock to catch
     // up and rescale queued event offsets so they land in this block.
     // ── Step 1: Drain ALL SPSC events → append to pending queue ─────────
-    TimestampedMidiEvent timed;
     uint32_t scannedIngress = 0;
     uint32_t admittedEvents = 0;
     std::memset(self->staleRecoveryValid_, 0,
@@ -1196,58 +1359,30 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity();
     while (scannedIngress < ingressScanBudget &&
            admittedEvents < self->maxEventsPerBlock_ &&
-           self->eventScheduler_.Size() < kEventBufferCapacity &&
-           self->midiIngress_.TryPop(timed)) {
+           self->eventScheduler_.Size() < kEventBufferCapacity) {
+        ScheduledRenderEvent scheduled{};
+        if (self->useEventCompiler_) {
+            if (!self->compiledIngress_.TryPop(scheduled)) break;
+        } else {
+            TimestampedMidiEvent timed{};
+            if (!self->midiIngress_.TryPop(timed)) break;
+            if (!CompileTimestampedEvent(
+                    timed, self->virtualRenderClockQPC, self->qpcFreq,
+                    self->sampleRate, self->bufferFrames, scheduled)) {
+                ++scannedIngress;
+                continue;
+            }
+        }
         ++scannedIngress;
         if (self->eventScheduler_.Size() >= kEventBufferCapacity) {
             break;
         }
 
-        int64_t deltaQPC = static_cast<int64_t>(timed.qpcTimestamp) -
-                           static_cast<int64_t>(self->virtualRenderClockQPC);
-
-        uint32_t msg = timed.message;
-        uint8_t st = static_cast<uint8_t>(msg & 0xFF);
-        uint8_t d1 = static_cast<uint8_t>((msg >> 8) & 0xFF);
-        uint8_t d2 = static_cast<uint8_t>((msg >> 16) & 0xFF);
-        uint8_t ch = st & 0x0F;
-
-        RenderEventType etype;
-        if (msg == kInternalResetMessage) {
-            etype = RenderEventType::Reset;
-            ch = d1 = d2 = 0;
-        } else {
-            switch (st & 0xF0) {
-                case 0x90:
-                    if (d2 > 0) etype = RenderEventType::NoteOn;
-                    else        { etype = RenderEventType::NoteOff; d2 = 0; }
-                    break;
-                case 0x80: etype = RenderEventType::NoteOff; break;
-                case 0xB0: etype = RenderEventType::ControlChange; break;
-                case 0xC0: etype = RenderEventType::ProgramChange; break;
-                case 0xE0: etype = RenderEventType::PitchBend; break;
-                default: continue;
-            }
-        }
-
-        RenderEvent ev;
-        ev.type = etype;
-        ev.channel = ch;
-        ev.data1 = d1;
-        ev.data2 = d2;
-        ev.frameOffset = 0;
-        ev.ingressSequence = timed.sequence;
-
-        // Keep the legacy scratch array empty in the new path; the bounded
-        // audio-thread heap owns future events and orders by sample/sequence.
-        const int64_t deltaFrames = QpcDeltaToFrames(
-            deltaQPC, static_cast<int64_t>(self->qpcFreq), self->sampleRate);
-        ScheduledRenderEvent scheduled;
-        scheduled.event = ev;
-        const int64_t schedulingLeadFrames =
-            static_cast<int64_t>(self->bufferFrames);
-        scheduled.targetFrame = deltaFrames + schedulingLeadFrames;
-        scheduled.sequence = timed.sequence;
+        RenderEvent& ev = scheduled.event;
+        const RenderEventType etype = ev.type;
+        const uint8_t ch = ev.channel;
+        const uint8_t d1 = ev.data1;
+        const uint32_t sequence = scheduled.sequence;
 #if defined(SVMS_XP_COMPAT)
         // DirectSound's notification cursor and the QPC playback position can
         // differ by several ring segments on XP. A live event behind the next
@@ -1263,15 +1398,15 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             scheduled.targetFrame <= self->virtualRenderSample_) {
             if (!self->staleRecoveryNoteOffValid_[recoveryKey] ||
                 !SequenceAtOrBefore(
-                    timed.sequence,
+                    sequence,
                     self->staleRecoveryNoteOffSequence_[recoveryKey])) {
-                self->staleRecoveryNoteOffSequence_[recoveryKey] = timed.sequence;
+                self->staleRecoveryNoteOffSequence_[recoveryKey] = sequence;
                 self->staleRecoveryNoteOffValid_[recoveryKey] = 1u;
             }
             if (self->staleRecoveryValid_[recoveryKey] &&
                 SequenceAtOrBefore(
                     self->staleRecoveryEvents_[recoveryKey].ingressSequence,
-                    timed.sequence)) {
+                    sequence)) {
                 self->staleRecoveryValid_[recoveryKey] = 0u;
                 ++self->telemetry_.staleNoteOnsSkipped;
             }
@@ -1283,14 +1418,14 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             if (d1 >= kNoteCount ||
                 (self->staleRecoveryNoteOffValid_[recoveryKey] &&
                  SequenceAtOrBefore(
-                     timed.sequence,
+                     sequence,
                      self->staleRecoveryNoteOffSequence_[recoveryKey]))) {
                 ++self->telemetry_.staleNoteOnsSkipped;
                 continue;
             }
             if (self->staleRecoveryValid_[recoveryKey]) {
                 if (SequenceAtOrBefore(
-                        timed.sequence,
+                        sequence,
                         self->staleRecoveryEvents_[recoveryKey].ingressSequence)) {
                     ++self->telemetry_.staleNoteOnsSkipped;
                     continue;
@@ -1302,7 +1437,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             self->staleRecoveryValid_[recoveryKey] = 1u;
             continue;
         }
-        if (!self->eventScheduler_.Enqueue(scheduled)) {
+        if (!self->eventScheduler_.EnqueueBatched(scheduled)) {
             ++self->telemetry_.dropped;
             break;
         }
@@ -1310,6 +1445,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->telemetry_.scheduledHighWater =
             (std::max)(self->telemetry_.scheduledHighWater,
                        static_cast<uint64_t>(self->eventScheduler_.Size()));
+    }
+    if (self->useEventCompiler_ && scannedIngress != 0u) {
+        self->compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
+        WakeAddressWaiters(self->compilerWakeEpoch_);
     }
 
     // Recovered notes all become writable at this block's first frame. The
@@ -1325,12 +1464,14 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         recovered.event = self->staleRecoveryEvents_[key];
         recovered.targetFrame = self->virtualRenderSample_;
         recovered.sequence = recovered.event.ingressSequence;
-        if (!self->eventScheduler_.Enqueue(recovered)) {
+        if (!self->eventScheduler_.EnqueueBatched(recovered)) {
             ++self->telemetry_.staleNoteOnsSkipped;
             break;
         }
         ++admittedEvents;
     }
+
+    self->eventScheduler_.FinalizeBatch();
 
     self->producerWakeEpoch_.fetch_add(1, std::memory_order_release);
     WakeAddressWaiters(self->producerWakeEpoch_);
@@ -1572,46 +1713,121 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
         case RenderEventType::Reset:
             if (self->voiceManager) self->voiceManager->Reset();
             if (self->channelCache) self->channelCache->Reset();
+            self->RefreshSelectedPresets();
+            std::fill(std::begin(self->channelPitchBendRatio_),
+                      std::end(self->channelPitchBendRatio_), 1.0f);
             self->nextPlayIndex_ = 1;
             self->limiter.Reset();
             break;
     }
 }
 
+void Driver::DispatchRenderEventBatch(const RenderEvent* events,
+                                      uint32_t eventCount,
+                                      uint32_t blockCursor, void* userData) {
+    Driver* self = static_cast<Driver*>(userData);
+    if (!self || !events) return;
+
+    // The renderer has already grouped this range by exact output frame and
+    // ingress sequence.  One indirect callback per frame is substantially
+    // cheaper than one per MIDI event during multi-million-NPS bursts, while
+    // the ordinary dispatcher remains the single semantic implementation.
+    for (uint32_t i = 0; i < eventCount; ++i)
+        DispatchRenderEvent(events[i], blockCursor, self);
+}
+
+uint32_t Driver::ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
+                                    uint8_t velocity,
+                                    const SFSampleRegion** outRegions,
+                                    uint32_t outCapacity) {
+    if (!soundFontData || !outRegions || presetIndex >= soundFontData->presetCount)
+        return 0u;
+
+    const uint32_t tag = (presetIndex << 14u) |
+        (static_cast<uint32_t>(note) << 7u) | velocity;
+    uint32_t hash = tag;
+    hash ^= hash >> 16u;
+    hash *= 0x7feb352du;
+    hash ^= hash >> 15u;
+    const uint32_t slot = hash & (kNoteRegionCacheSize - 1u);
+    NoteRegionCacheEntry& cached = noteRegionCache_[slot];
+    if (cached.tag == tag && cached.count <= kNoteRegionCacheLayers) {
+        ++telemetry_.noteRegionCacheHits;
+        const uint32_t count = cached.count;
+        const uint32_t copied = (std::min)(count, outCapacity);
+        for (uint32_t i = 0; i < copied; ++i)
+            outRegions[i] = &soundFontData->regions[cached.regionIndices[i]];
+        return count;
+    }
+
+    ++telemetry_.noteRegionCacheMisses;
+    const uint32_t count = sf2_find_regions(soundFontData, presetIndex, note,
+                                            velocity, outRegions, outCapacity);
+    if (count <= kNoteRegionCacheLayers && count <= outCapacity) {
+        cached.tag = tag;
+        cached.count = static_cast<uint16_t>(count);
+        cached.reserved = 0u;
+        for (uint32_t i = 0; i < count; ++i) {
+            cached.regionIndices[i] = static_cast<uint32_t>(
+                outRegions[i] - soundFontData->regions);
+        }
+    }
+    return count;
+}
+
+void Driver::RefreshSelectedPresets() {
+    if (!channelCache || !soundFontData) return;
+    for (uint8_t channel = 0; channel < kChannelCount; ++channel) {
+        uint32_t presetIndex = 0u;
+        if (ResolveChannelPreset(soundFontData, *channelCache, channel,
+                                 &presetIndex)) {
+            channelCache->SetSelectedPreset(channel,
+                static_cast<uint16_t>(presetIndex));
+        } else {
+            channelCache->SetSelectedPreset(channel, UINT16_MAX);
+        }
+    }
+}
+
 void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (!channelCache || !voiceManager) return;
+    if (channel >= kChannelCount || note >= kNoteCount) return;
+    velocity &= 0x7fu;
 
     ++sf2Telemetry_.noteOns;
     sf2Telemetry_.lastChannel = channel;
     sf2Telemetry_.lastNote = note;
     sf2Telemetry_.lastVelocity = velocity;
 
-    const float mappedVelocity = configSnapshot
-        ? channelCache->ComputeVelocity(velocity, *configSnapshot)
-        : static_cast<float>(velocity) / 127.0f;
-    if (mappedVelocity <= 0.0f) return;
+    const float velGain = configuredVelocityGain_[velocity];
+    if (velGain <= 0.0f) return;
 
     channelCache->NoteOn(channel, note, velocity);
 
     if (!soundFontData || !samplesStore || !sampleDataStore) return;
 
-    // The selected-preset cache is a committed optimization, not the source
-    // of truth. Re-resolve current bank/program at every note-on so a stale
-    // cache can never turn a live piano note into a silent allocation.
-    uint32_t presetIndex = UINT32_MAX;
-    if (!ResolveChannelPreset(soundFontData, *channelCache, channel, &presetIndex)) {
-        ++sf2Telemetry_.invalidPresets;
-        sf2Telemetry_.lastPreset = UINT16_MAX;
-        return;
+    // Bank/program handlers commit this cache at their exact event frame.
+    // The fallback covers reset and SoundFont-swap boundaries only; the
+    // multi-million-NPS path therefore avoids scanning the preset table for
+    // every repeated note.
+    uint32_t presetIndex = channelCache->GetSelectedPreset(channel);
+    if (presetIndex >= soundFontData->presetCount) {
+        if (!ResolveChannelPreset(soundFontData, *channelCache, channel,
+                                  &presetIndex)) {
+            ++sf2Telemetry_.invalidPresets;
+            sf2Telemetry_.lastPreset = UINT16_MAX;
+            return;
+        }
+        channelCache->SetSelectedPreset(channel,
+                                        static_cast<uint16_t>(presetIndex));
     }
-    if (channelCache->GetSelectedPreset(channel) != presetIndex)
-        channelCache->SetSelectedPreset(channel, static_cast<uint16_t>(presetIndex));
     sf2Telemetry_.lastPreset = static_cast<uint16_t>(presetIndex);
 
     static constexpr uint32_t kMaxMatchingRegions = 512;
     const SFSampleRegion* matchingRegions[kMaxMatchingRegions];
-    uint32_t matchCount = sf2_find_regions(soundFontData, presetIndex, note, velocity,
-                                           matchingRegions, kMaxMatchingRegions);
+    uint32_t matchCount = ResolveNoteRegions(presetIndex, note, velocity,
+                                             matchingRegions,
+                                             kMaxMatchingRegions);
     if (matchCount > kMaxMatchingRegions) {
         ++telemetry_.allocationFailures;
         return;
@@ -1652,9 +1868,8 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     const uint32_t playIndex = nextPlayIndex_++;
 
     float sr = (float)(sampleRate > 0 ? sampleRate : 44100u);
-    float pitchBendSemitones = channelCache->GetPitchBendSemitones(channel);
-    const float commonBendRatio = powf(
-        2.0f, pitchBendSemitones / 12.0f);
+    const float pitchBendSemitones = channelCache->GetPitchBendSemitones(channel);
+    const float commonBendRatio = channelPitchBendRatio_[channel];
 
     VoiceHandle allocatedVoices[kMaxMatchingRegions];
     uint32_t allocatedCount = 0;
@@ -1701,8 +1916,9 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
             basePhaseStep = sourceRate / outputRate *
                 powf(2.0f, semitones / 12.0f);
         }
-        const float bendRatio = bendScale == 1.0f ? commonBendRatio : powf(
-            2.0f, pitchBendSemitones * bendScale / 12.0f);
+        const float bendRatio = bendScale == 1.0f || pitchBendSemitones == 0.0f
+            ? commonBendRatio
+            : powf(2.0f, pitchBendSemitones * bendScale / 12.0f);
         float phaseStep = basePhaseStep * bendRatio;
         // A corrupt SF2 pitch generator must not poison the scalar loop with
         // NaN/Inf phase values: float-to-integer conversion then pins sample
@@ -1717,11 +1933,6 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         uint32_t sLoopEnd = static_cast<uint32_t>(matchedRegion->loopEndOffset);
         uint8_t loopMode = matchedRegion->loopMode;
 
-        uint32_t mappedVelocityIndex = static_cast<uint32_t>(
-            mappedVelocity * 127.0f + 0.5f);
-        if (mappedVelocityIndex < 1u) mappedVelocityIndex = 1u;
-        if (mappedVelocityIndex > 127u) mappedVelocityIndex = 127u;
-        float velGain = g_velGainLUT[mappedVelocityIndex];
         float initialGain;
         float sustainLevel;
         uint32_t delaySamples;
@@ -1855,6 +2066,18 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     const bool sustainWasActive = channelCache && channelCache->IsSustainActive(channel);
     if (channelCache) channelCache->ControlChange(channel, controller, value);
 
+    if ((controller == 0 || controller == 32) && channelCache && soundFontData &&
+        channel < kChannelCount) {
+        uint32_t presetIndex = 0u;
+        if (ResolveChannelPreset(soundFontData, *channelCache, channel,
+                                 &presetIndex)) {
+            channelCache->SetSelectedPreset(channel,
+                                            static_cast<uint16_t>(presetIndex));
+        } else {
+            channelCache->SetSelectedPreset(channel, UINT16_MAX);
+        }
+    }
+
     if (controller == 64) {
         if (value < 64) {
             const uint32_t count = voiceManager->GetChannelActiveCount(channel);
@@ -1894,8 +2117,11 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     // Controller events are dispatched before the sample at their target
     // frame. Rebuild now so existing voices and same-frame note-ons observe
     // the new channel state rather than waiting for the next callback.
-    if (channelCache && configSnapshot) {
-        channelCache->RebuildCache(*configSnapshot, static_cast<float>(sampleRate));
+    if (channelCache && configSnapshot &&
+        (controller == 7 || controller == 10 || controller == 11 ||
+         controller == 64 || controller == 121)) {
+        channelCache->RebuildChannel(channel, *configSnapshot,
+                                     static_cast<float>(sampleRate));
         if (controller == 7 || controller == 10 || controller == 11 ||
             controller == 121) {
             voiceManager->RefreshMixGainsForChannel(
@@ -1931,6 +2157,7 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
 
     const float bendSemitones = channelCache->GetPitchBendSemitones(channel);
     const float commonRatio = powf(2.0f, bendSemitones / 12.0f);
+    channelPitchBendRatio_[channel] = commonRatio;
     const uint32_t count = voiceManager->GetChannelActiveCount(channel);
     const uint32_t* handles = voiceManager->GetChannelActiveList(channel);
     for (uint32_t position = 0; position < count; ++position) {

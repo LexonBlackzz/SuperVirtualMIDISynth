@@ -343,6 +343,57 @@ void DispatchReleaseForTest(const svms::RenderEvent&, uint32_t blockCursor,
     context->voices->StartRelease(context->second);
 }
 
+struct BatchDispatchContext {
+    uint32_t calls = 0;
+    uint32_t counts[4]{};
+    uint32_t cursors[4]{};
+    uint32_t sequences[8]{};
+    uint32_t sequenceCount = 0;
+};
+
+void DispatchBatchForTest(const svms::RenderEvent* events, uint32_t eventCount,
+                          uint32_t blockCursor, void* userData) {
+    auto* context = static_cast<BatchDispatchContext*>(userData);
+    context->counts[context->calls] = eventCount;
+    context->cursors[context->calls] = blockCursor;
+    ++context->calls;
+    for (uint32_t i = 0; i < eventCount; ++i)
+        context->sequences[context->sequenceCount++] = events[i].ingressSequence;
+}
+
+void TestExactFrameBatchDispatch() {
+    auto voices = std::make_unique<svms::VoiceManager>();
+    voices->Initialize(8, 44100);
+    svms::ChannelCache channels;
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+
+    const svms::RenderEvent events[] = {
+        {svms::RenderEventType::NoteOn, 0, 60, 100, 1, 10},
+        {svms::RenderEventType::ControlChange, 0, 11, 90, 1, 11},
+        {svms::RenderEventType::NoteOn, 0, 61, 100, 1, 12},
+        {svms::RenderEventType::NoteOff, 0, 60, 0, 3, 13},
+    };
+    float samples[2]{0.0f, 0.0f};
+    float left[4]{}, right[4]{};
+    BatchDispatchContext context{};
+    svms::RenderScalar renderer;
+    renderer.SetEventBatchDispatcher(DispatchBatchForTest, &context);
+    renderer.RenderBlock(*voices, channels, samples, 2, left, right, 4, cfg,
+                         events, 4, true, 100);
+
+    Check(context.calls == 2 && context.counts[0] == 3 &&
+              context.counts[1] == 1 && context.cursors[0] == 1 &&
+              context.cursors[1] == 3,
+          "equal-frame events are delivered through one exact-frame batch");
+    Check(context.sequenceCount == 4 && context.sequences[0] == 10 &&
+              context.sequences[1] == 11 && context.sequences[2] == 12 &&
+              context.sequences[3] == 13,
+          "batch dispatch preserves global ingress ordering exactly");
+}
+
 void TestExactReleaseDurationAcrossBlocks() {
     auto voices = std::make_unique<svms::VoiceManager>();
     voices->Initialize(2, 1000);
@@ -927,6 +978,28 @@ void TestWindowedSchedulerOrdering() {
     Check(scheduler.PopBefore(5, out) && out.sequence == 3,
           "scheduler drains final equal-time event");
     Check(scheduler.Empty(), "scheduler drains completely");
+
+    svms::EventScheduler batched(256);
+    for (uint32_t i = 0; i < 200; ++i) {
+        svms::ScheduledRenderEvent event;
+        event.targetFrame = static_cast<int64_t>((i * 37u) % 11u);
+        event.sequence = 1000u - i;
+        Check(batched.EnqueueBatched(event), "batched scheduler accepts event");
+    }
+    batched.FinalizeBatch();
+    int64_t previousFrame = -1;
+    uint32_t previousSequence = 0;
+    uint32_t popped = 0;
+    while (batched.PopBefore(12, out)) {
+        const bool ordered = out.targetFrame > previousFrame ||
+            (out.targetFrame == previousFrame && out.sequence >= previousSequence);
+        Check(ordered, "linear heap rebuild preserves frame/sequence ordering");
+        previousFrame = out.targetFrame;
+        previousSequence = out.sequence;
+        ++popped;
+    }
+    Check(popped == 200 && batched.Empty(),
+          "batched scheduler drains every rebuilt-heap event");
 }
 
 void TestFourProducerMPSCIntegrity() {
@@ -1592,6 +1665,7 @@ int main() {
     TestCompiledSF2ZonesAndExactResolver();
     TestShippedGmSoundFontSmoke();
     TestEnvelopeConversions();
+    TestExactFrameBatchDispatch();
     TestExactReleaseDurationAcrossBlocks();
     TestReleaseGeneratorMerging();
     TestVoiceIdentityAndStealing();

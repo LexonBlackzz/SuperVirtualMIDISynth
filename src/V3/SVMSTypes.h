@@ -114,6 +114,8 @@ struct EventTelemetry {
     uint64_t staleNoteOnsSkipped = 0;
     uint64_t sequenceGaps = 0;
     uint64_t zeroMatchedRegions = 0;
+    uint64_t noteRegionCacheHits = 0;
+    uint64_t noteRegionCacheMisses = 0;
     uint64_t allocationFailures = 0;
     uint64_t voiceSteals = 0;
     uint64_t immediateRetirements = 0;

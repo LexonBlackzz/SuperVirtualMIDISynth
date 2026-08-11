@@ -44,7 +44,7 @@ bool ParseWorkload(const char* value, Workload& result) {
     return true;
 }
 
-void NoopDispatch(const svms::RenderEvent&, uint32_t, void*) {}
+void NoopBatchDispatch(const svms::RenderEvent*, uint32_t, uint32_t, void*) {}
 
 bool gCollectBreakdown = false;
 uint64_t gRenderCycles = 0u;
@@ -301,6 +301,12 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
     }
 }
 
+void MixedBatchDispatch(const svms::RenderEvent* events, uint32_t eventCount,
+                        uint32_t blockCursor, void* userData) {
+    for (uint32_t i = 0; i < eventCount; ++i)
+        MixedDispatch(events[i], blockCursor, userData);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -425,8 +431,9 @@ int main(int argc, char** argv) {
                     break;
             }
         }
-        renderer->SetEventDispatcher(
-            options.workload == Workload::Dense ? NoopDispatch : MixedDispatch,
+        renderer->SetEventBatchDispatcher(
+            options.workload == Workload::Dense
+                ? NoopBatchDispatch : MixedBatchDispatch,
             options.workload == Workload::Dense ? nullptr : &mixedContext);
     }
 
