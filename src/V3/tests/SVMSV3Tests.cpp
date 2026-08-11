@@ -585,6 +585,50 @@ void TestPriorityAwareStealingAndFadeTail() {
     }
 
     {
+        constexpr uint32_t kVoiceCount = 64u;
+        constexpr uint32_t kIterations = 256u;
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(kVoiceCount, 44100);
+        svms::ChannelParamsSnapshot channel{};
+        channel.volume = channel.expression = 1.0f;
+        channel.panLeft = channel.panRight = 0.70710678f;
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 128u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 120u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep = 1.0f;
+        setup.initialGain = setup.sustainLevel = 1.0f;
+        setup.releaseDecay = 0.999f;
+        setup.gainLeft = setup.gainRight = 0.1f;
+        setup.sampleBacked = 1u;
+
+        for (uint32_t group = 0; group < kVoiceCount / 2u; ++group) {
+            setup.playIndex = group + 1u;
+            for (uint32_t layer = 0; layer < 2u; ++layer) {
+                const svms::VoiceHandle voice =
+                    voices->AllocateVoice(0, 60, 100);
+                voices->ConfigureVoice(voice, setup, channel, false);
+            }
+        }
+        for (uint32_t iteration = 0; iteration < kIterations; ++iteration) {
+            const svms::VoiceHandle first =
+                voices->AllocateVoiceOrSteal(0, 60, 100);
+            const svms::VoiceHandle second =
+                voices->AllocateVoiceOrSteal(0, 60, 100);
+            setup.playIndex = 1000u + iteration;
+            voices->ConfigureVoice(first, setup, channel, false);
+            voices->ConfigureVoice(second, setup, channel, false);
+        }
+        Check(voices->GetStealHeapBuildCountForTest() == 1u,
+              "dense stereo group stealing retains its incremental heap");
+        Check(voices->GetActiveCount() == kVoiceCount &&
+                  voices->freeTop_ == 0u,
+              "dense stereo group replacement keeps the pool full");
+    }
+
+    {
         auto voices = std::make_unique<svms::VoiceManager>();
         voices->Initialize(2, 44100);
         const svms::VoiceHandle mature = voices->AllocateVoice(0, 60, 100);

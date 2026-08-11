@@ -142,6 +142,9 @@ public:
     void RefreshStealTail(VoiceHandle handle);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     VoiceHandle FindStealVictimExhaustiveForTest() const;
+    uint64_t GetStealHeapBuildCountForTest() const {
+        return stealHeapBuildCount_;
+    }
 #endif
 
     // ── Public read-only access ────────────────────────────────────────
@@ -203,6 +206,7 @@ private:
     uint32_t stealHeapPosition_[kMaxPolyphony];
     uint32_t stealHeapCount_;
     bool stealHeapValid_;
+    uint64_t stealHeapBuildCount_;
     uint32_t stealVolatileList_[kMaxPolyphony];
     uint32_t stealVolatilePosition_[kMaxPolyphony];
     uint32_t stealVolatileCount_;
@@ -266,7 +270,8 @@ private:
     float ComputeTailLevel(uint32_t tailSlot) const;
     uint32_t SelectStealTailSlot(float outgoingLevel) const;
     void CaptureStealTail(VoiceHandle handle);
-    void RetireStolenSibling(VoiceHandle handle);
+    void RetireStolenSibling(VoiceHandle handle,
+                             VoiceHandle selectedVictim);
     float ComputeStableStealKey(VoiceHandle handle) const;
     static bool HigherPriorityCandidate(const StealCandidate& a,
                                         const StealCandidate& b);
@@ -288,6 +293,7 @@ inline VoiceManager::VoiceManager()
       currentFrame_(0), freeTop_(0),
       retireCount_(0), retireImmediateCount_(0), stealCount_(0),
       stealTailCount_(0), stealHeapCount_(0), stealHeapValid_(false),
+      stealHeapBuildCount_(0),
       stealVolatileCount_(0), stealVolatileHeapCount_(0),
       stealVolatileHeapFrame_(UINT64_MAX), stealVolatileHeapValid_(false) {
     std::memset(&v, 0, sizeof(v));
@@ -348,6 +354,7 @@ inline void VoiceManager::Reset() {
     stealTailCount_ = 0;
     stealHeapCount_ = 0;
     stealHeapValid_ = false;
+    stealHeapBuildCount_ = 0;
     stealVolatileCount_ = 0;
     stealVolatileHeapCount_ = 0;
     stealVolatileHeapFrame_ = UINT64_MAX;
@@ -778,9 +785,11 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     LinkStealTail(static_cast<VoiceHandle>(tailSlot));
 }
 
-inline void VoiceManager::RetireStolenSibling(VoiceHandle handle) {
+inline void VoiceManager::RetireStolenSibling(VoiceHandle handle,
+                                               VoiceHandle selectedVictim) {
     if (handle >= maxVoices_ ||
         v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) return;
+    if (stealHeapValid_) RemoveStealCandidate(handle);
     CaptureStealTail(handle);
     ++stealCount_;
     UnlinkChannelKey(handle);
@@ -801,6 +810,10 @@ inline void VoiceManager::RetireStolenSibling(VoiceHandle handle) {
         const uint32_t moved = activeList_[lastPosition];
         activeList_[position] = moved;
         activePosition_[moved] = position;
+        // Heap ties use active-list position. The already-popped selected
+        // victim deliberately remains absent until its replacement is ready.
+        if (stealHeapValid_ && moved != selectedVictim)
+            UpdateStealCandidate(static_cast<VoiceHandle>(moved));
     }
     activePosition_[handle] = UINT32_MAX;
 }
@@ -845,6 +858,7 @@ inline void VoiceManager::HeapSiftDown(uint32_t position) {
 }
 
 inline void VoiceManager::BuildStealHeap() {
+    ++stealHeapBuildCount_;
     stealHeapCount_ = 0u;
     stealVolatileCount_ = 0u;
     stealVolatileHeapCount_ = 0u;
@@ -1088,7 +1102,9 @@ inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, ui
     activeList_[activeCount_] = idx;
     activePosition_[idx] = activeCount_;
     activeCount_++;
-    stealHeapValid_ = false;
+    if (stealHeapValid_)
+        PushStealCandidate(static_cast<VoiceHandle>(idx),
+                           activePosition_[idx]);
 
     return static_cast<VoiceHandle>(idx);
 }
@@ -1107,7 +1123,8 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         LinkRenderClass(vh);
         activeList_[activeCount_] = idx;
         activePosition_[idx] = activeCount_++;
-        stealHeapValid_ = false;
+        // A deferred voice is invisible to the steal index until its
+        // configuration transaction commits. Keep the existing heap valid.
     } else {
         vh = AllocateVoice(channel, note, velocity);
     }
@@ -1144,10 +1161,16 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         }
     }
     if (siblingCount != 0u) {
-        stealHeapValid_ = false;
-        stealCandidateReserved_[bestIdx] = 0u;
+        // A reserved volatile root was intentionally left in the index for a
+        // single deferred replacement. Group retirement changes its active
+        // position, so remove it now and insert the configured replacement at
+        // commit instead of invalidating and rebuilding the complete heap.
+        if (stealCandidateReserved_[bestIdx] != 0u) {
+            stealCandidateReserved_[bestIdx] = 0u;
+            RemoveStealCandidate(static_cast<VoiceHandle>(bestIdx));
+        }
         for (uint32_t i = 0; i < siblingCount; ++i)
-            RetireStolenSibling(siblings[i]);
+            RetireStolenSibling(siblings[i], bestHandle);
         bestPos = activePosition_[bestIdx];
     }
     CaptureStealTail(bestHandle);

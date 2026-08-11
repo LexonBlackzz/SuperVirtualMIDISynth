@@ -192,6 +192,10 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
                    uint32_t attackFrames = 0u) {
     constexpr uint32_t regionFrames = 2048;
     const uint32_t regionCount = sampleFrames / regionFrames;
+    // Every physical SF2 region produced by one MIDI note belongs to one
+    // playIndex. This makes the synthetic layered benchmark exercise the
+    // same atomic stereo-stealing path as the production driver.
+    const uint32_t playIndex = sequence + 1u;
     for (uint32_t i = 0; i < count; ++i, ++sequence) {
         const uint8_t channel = sourceEvent ? sourceEvent->channel
             : static_cast<uint8_t>(sequence & 15u);
@@ -209,6 +213,7 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
         setup.loopStart = start + 16u;
         setup.loopEnd = start + regionFrames - 16u;
         setup.loopMode = 1u;
+        setup.playIndex = playIndex;
         setup.phaseStep = 0.5f +
             static_cast<float>(sequence % 97u) / 64.0f;
         setup.basePhaseStep = setup.phaseStep;
