@@ -209,7 +209,7 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
     // playIndex. This makes the synthetic layered benchmark exercise the
     // same atomic stereo-stealing path as the production driver.
     const uint32_t playIndex = sequence + 1u;
-    if (transactional && count == 1u) {
+    if (transactional && count <= 8u) {
         const uint64_t prepareBegin = gCollectBreakdown ? __rdtsc() : 0u;
         const uint8_t channel = sourceEvent ? sourceEvent->channel
             : static_cast<uint8_t>(sequence & 15u);
@@ -217,30 +217,34 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
             : static_cast<uint8_t>(24u + sequence % 88u);
         const uint8_t velocity = sourceEvent ? sourceEvent->data2
             : static_cast<uint8_t>(64u + sequence % 64u);
-        const uint32_t start = (sequence % regionCount) * regionFrames;
-        svms::VoiceConfiguration setup{};
-        setup.sampleStart = start;
-        setup.sampleEnd = start + regionFrames;
-        setup.loopStart = start + 16u;
-        setup.loopEnd = start + regionFrames - 16u;
-        setup.loopMode = 1u;
-        setup.playIndex = playIndex;
-        setup.phaseStep = 0.5f +
-            static_cast<float>(sequence % 97u) / 64.0f;
-        setup.basePhaseStep = setup.phaseStep;
-        setup.initialGain = 1.0f;
-        setup.attackSamples = attackFrames;
-        setup.attackGainStep = attackFrames > 0u
-            ? setup.initialGain / static_cast<float>(attackFrames) : 0.0f;
-        setup.sustainLevel = 0.7f;
-        setup.releaseDecay = 0.9999999f;
-        setup.gainLeft = setup.gainRight = 0.001f;
+        svms::VoiceConfiguration setups[8]{};
+        svms::VoiceHandle handles[8]{};
+        for (uint32_t layer = 0u; layer < count; ++layer) {
+            const uint32_t layerSequence = sequence + layer;
+            const uint32_t start = (layerSequence % regionCount) * regionFrames;
+            auto& setup = setups[layer];
+            setup.sampleStart = start;
+            setup.sampleEnd = start + regionFrames;
+            setup.loopStart = start + 16u;
+            setup.loopEnd = start + regionFrames - 16u;
+            setup.loopMode = 1u;
+            setup.playIndex = playIndex;
+            setup.phaseStep = 0.5f +
+                static_cast<float>(layerSequence % 97u) / 64.0f;
+            setup.basePhaseStep = setup.phaseStep;
+            setup.initialGain = 1.0f;
+            setup.attackSamples = attackFrames;
+            setup.attackGainStep = attackFrames > 0u
+                ? setup.initialGain / static_cast<float>(attackFrames) : 0.0f;
+            setup.sustainLevel = 0.7f;
+            setup.releaseDecay = 0.9999999f;
+            setup.gainLeft = setup.gainRight = 0.001f;
+        }
         if (gCollectBreakdown)
             gLaunchPrepareCycles += __rdtsc() - prepareBegin;
-        svms::VoiceHandle handle = svms::kInvalidVoice;
-        ++sequence;
-        voices.LaunchVoiceGroup(channel, note, velocity, &setup, 1u,
-                                channels.GetParams()[channel], &handle);
+        sequence += count;
+        voices.LaunchVoiceGroup(channel, note, velocity, setups, count,
+                                channels.GetParams()[channel], handles);
         return;
     }
     for (uint32_t i = 0; i < count; ++i, ++sequence) {

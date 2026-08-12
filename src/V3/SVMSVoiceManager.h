@@ -211,10 +211,9 @@ private:
     uint64_t stealTailMinHeapFrame_;
     bool stealTailMinHeapValid_;
 
-    // Fixed-leaf tournament tree for steady-state candidates. Leaves are
-    // indexed by voice handle, so an in-place replacement changes exactly one
-    // root path instead of removing and reinserting a binary-heap element.
-    // The volatile attack/release heap remains separate below.
+    // Fixed-leaf tournament tree for candidates whose relative steal score is
+    // time-invariant. This includes delay/hold/attack because stealing protects
+    // them using their fixed target gain. Decay/release remain volatile.
     static constexpr uint32_t kStealTreeLeafBase = kMaxPolyphony;
     StealCandidate stealStableCandidate_[kMaxPolyphony];
     uint32_t stealWinnerTree_[kStealTreeLeafBase * 2u];
@@ -269,6 +268,7 @@ private:
     VoiceHandle SelectStableWinner(VoiceHandle left,
                                    VoiceHandle right) const;
     void RefreshStealWinnerPath(VoiceHandle handle);
+    void RefreshStealWinnerPaths(const VoiceHandle* handles, uint32_t count);
     void RebuildStableWinnerTree();
     VoiceHandle PopStealCandidate(uint32_t& activePosition,
                                   bool reserveVolatileRoot);
@@ -288,8 +288,13 @@ private:
     uint32_t SelectStealTailSlot(float outgoingLevel);
     void CaptureStealTail(VoiceHandle handle);
     bool ReuseMatchingStealGroup(uint8_t channel, uint8_t note,
-                                 uint8_t velocity, uint32_t count,
-                                 VoiceHandle* outHandles);
+                                 uint8_t velocity,
+                                 const VoiceConfiguration* setups,
+                                 uint32_t count, VoiceHandle* outHandles,
+                                 bool& candidatesReservedInPlace);
+    void CommitVoiceGroupConfigurations(const VoiceHandle* handles,
+                                        uint32_t count,
+                                        bool candidatesReservedInPlace);
     void RetireStolenSibling(VoiceHandle handle,
                              VoiceHandle selectedVictim);
     float ComputeStableStealKey(VoiceHandle handle) const;
@@ -706,6 +711,16 @@ inline void VoiceManager::RefreshRenderClass(VoiceHandle handle) {
     if (v.renderClass[handle] == static_cast<uint8_t>(desired) &&
         renderClassPosition_[handle] <
             renderClassCount_[static_cast<uint32_t>(desired)]) {
+        // Attack and decay intentionally share the transient render class,
+        // but only attack has a time-invariant protected steal level. Move
+        // the candidate between the persistent tree and volatile heap even
+        // when no render-list migration is required.
+        if (stealHeapValid_ && stealCandidateDeferred_[handle] == 0u) {
+            const bool indexedStable =
+                stealWinnerTree_[kStealTreeLeafBase + handle] == handle;
+            if (indexedStable != IsStableStealCandidate(handle))
+                UpdateStealCandidate(handle);
+        }
         return;
     }
     UnlinkRenderClass(handle);
@@ -919,6 +934,47 @@ inline void VoiceManager::RefreshStealWinnerPath(VoiceHandle handle) {
     }
 }
 
+inline void VoiceManager::RefreshStealWinnerPaths(
+    const VoiceHandle* handles, uint32_t count) {
+    // Cached launch plans cover at most eight layers. Recompute the union of
+    // their tournament-tree paths bottom-up so shared ancestors are touched
+    // once instead of once per physical voice.
+    static constexpr uint32_t kBatchPaths = 8u;
+    if (!handles || count == 0u) return;
+    if (count > kBatchPaths) {
+        for (uint32_t i = 0u; i < count; ++i)
+            RefreshStealWinnerPath(handles[i]);
+        return;
+    }
+
+    uint32_t nodes[kBatchPaths]{};
+    uint32_t nodeCount = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        uint32_t node = (kStealTreeLeafBase + handles[i]) >> 1u;
+        bool duplicate = false;
+        for (uint32_t existing = 0u; existing < nodeCount; ++existing)
+            duplicate |= nodes[existing] == node;
+        if (!duplicate) nodes[nodeCount++] = node;
+    }
+
+    while (nodeCount != 0u) {
+        uint32_t parentCount = 0u;
+        for (uint32_t i = 0u; i < nodeCount; ++i) {
+            const uint32_t node = nodes[i];
+            stealWinnerTree_[node] = SelectStableWinner(
+                static_cast<VoiceHandle>(stealWinnerTree_[node << 1u]),
+                static_cast<VoiceHandle>(stealWinnerTree_[(node << 1u) + 1u]));
+            if (node == 1u) continue;
+            const uint32_t parent = node >> 1u;
+            bool duplicate = false;
+            for (uint32_t existing = 0u; existing < parentCount; ++existing)
+                duplicate |= nodes[existing] == parent;
+            if (!duplicate) nodes[parentCount++] = parent;
+        }
+        nodeCount = parentCount;
+    }
+}
+
 inline void VoiceManager::RebuildStableWinnerTree() {
     for (uint32_t node = kStealTreeLeafBase; node-- > 1u;)
         stealWinnerTree_[node] = SelectStableWinner(
@@ -1037,9 +1093,15 @@ inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
 }
 
 inline bool VoiceManager::IsStableStealCandidate(VoiceHandle handle) const {
-    return handle < maxVoices_ &&
-        v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
-        v.envelopeStage[handle] == 3u;
+    if (handle >= maxVoices_ ||
+        v.state[handle] != static_cast<uint8_t>(VoiceState::Active)) {
+        return false;
+    }
+    // ComputeEffectiveStealLevel uses targetGain throughout delay, hold and
+    // attack, so after removing the shared current-frame age term their key is
+    // constant just like sustain. Decay is the only active stage whose
+    // effective level changes every rendered frame.
+    return v.envelopeStage[handle] != 2u;
 }
 
 inline float VoiceManager::ComputeStableStealKey(VoiceHandle handle) const {
@@ -1457,13 +1519,20 @@ inline void VoiceManager::ConfigureVoice(
 }
 
 inline bool VoiceManager::ReuseMatchingStealGroup(
-    uint8_t channel, uint8_t note, uint8_t velocity, uint32_t count,
-    VoiceHandle* outHandles) {
-    if (freeTop_ != 0u || count < 2u || count > maxVoices_ || !outHandles)
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count,
+    VoiceHandle* outHandles, bool& candidatesReservedInPlace) {
+    candidatesReservedInPlace = false;
+    if (freeTop_ != 0u || count < 2u || count > maxVoices_ || !setups ||
+        !outHandles)
         return false;
 
     uint32_t selectedPosition = 0u;
-    const VoiceHandle selected = PopStealCandidate(selectedPosition, false);
+    // Keep the selected leaf present until we know whether the complete
+    // physical group can be replaced in-place. No other selection occurs
+    // during this transaction, so the reservation is exact and private to
+    // the audio thread.
+    const VoiceHandle selected = PopStealCandidate(selectedPosition, true);
     if (selected == kInvalidVoice) return false;
 
     uint32_t groupCount = 1u;
@@ -1488,37 +1557,123 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         // The caller needs a different number of slots. Restore the exact
         // candidate and use the general allocation path, which may retire a
         // larger/smaller physical group according to the existing policy.
-        PushStealCandidate(selected, activePosition_[selected]);
+        stealCandidateReserved_[selected] = 0u;
         return false;
     }
 
-    // The selected leaf was removed by PopStealCandidate. Remove every
-    // sibling leaf before mutating any semantic state, then capture all old
-    // audio tails and replace the complete physical note in-place. Active
-    // positions and the free stack never move in this common stereo case.
-    for (uint32_t i = 1u; i < count; ++i)
-        RemoveStealCandidate(outHandles[i]);
+    bool canReserveInPlace = count <= 8u;
+    for (uint32_t i = 0u; i < count && canReserveInPlace; ++i) {
+        const VoiceHandle handle = outHandles[i];
+        const VoiceConfiguration& setup = setups[i];
+        const bool preDecay = setup.delaySamples != 0u ||
+            setup.holdSamples != 0u || setup.attackSamples != 0u;
+        const bool configuredStable = setup.sampleBacked != 0u &&
+            setup.sampleEnd > setup.sampleStart + 1u &&
+            (preDecay || setup.decaySamples == 0u);
+        canReserveInPlace = configuredStable &&
+            IsStableStealCandidate(handle) &&
+            stealWinnerTree_[kStealTreeLeafBase + handle] == handle;
+    }
+
+    if (canReserveInPlace) {
+        // The old and new voices occupy the same leaves. Preserve the leaves
+        // while lifecycle/sample state is rewritten, then refresh their
+        // cached scores and the union of both paths once at commit.
+        candidatesReservedInPlace = true;
+        for (uint32_t i = 0u; i < count; ++i) {
+            stealCandidateReserved_[outHandles[i]] = 2u;
+            stealCandidateDeferred_[outHandles[i]] = 1u;
+        }
+    } else {
+        stealCandidateReserved_[selected] = 0u;
+        RemoveStealCandidate(selected);
+        for (uint32_t i = 1u; i < count; ++i)
+            RemoveStealCandidate(outHandles[i]);
+    }
+
+    // Capture every old layer, then replace the complete physical note in
+    // place. The fast path keeps its winner-tree leaves reserved; the fallback
+    // removed them above. Active positions and the free stack never move.
     for (uint32_t i = 0u; i < count; ++i)
         CaptureStealTail(outHandles[i]);
 
     for (uint32_t i = 0u; i < count; ++i) {
         const VoiceHandle handle = outHandles[i];
+        const bool preserveChannelIndex = candidatesReservedInPlace &&
+            v.channel[handle] == channel;
+        const bool configuredLoop =
+            (setups[i].loopMode == 1u || setups[i].loopMode == 3u) &&
+            setups[i].loopEnd > setups[i].loopStart + 1u;
+        uint8_t configuredStage = 3u;
+        if (setups[i].delaySamples != 0u) configuredStage = 4u;
+        else if (setups[i].holdSamples != 0u) configuredStage = 0u;
+        else if (setups[i].attackSamples != 0u) configuredStage = 1u;
+        else if (setups[i].decaySamples != 0u) configuredStage = 2u;
+        VoiceRenderClass desiredClass = VoiceRenderClass::Generic;
+        if (configuredStage == 3u) {
+            desiredClass = configuredLoop
+                ? VoiceRenderClass::SustainedLoop
+                : VoiceRenderClass::SustainedOneShot;
+        } else if (configuredLoop &&
+                   (configuredStage == 1u || configuredStage == 2u)) {
+            desiredClass = VoiceRenderClass::TransientLoop;
+        }
+        const uint8_t configuredClass = static_cast<uint8_t>(desiredClass);
+        const bool preserveRenderIndex = candidatesReservedInPlace &&
+            v.renderClass[handle] == configuredClass;
         ++stealCount_;
         UnlinkChannelKey(handle);
         UnlinkPlayGroup(handle);
-        UnlinkChannelActive(handle);
-        UnlinkRenderClass(handle);
+        if (!preserveChannelIndex) UnlinkChannelActive(handle);
+        if (!preserveRenderIndex) UnlinkRenderClass(handle);
         stealCandidateDeferred_[handle] = 1u;
-        stealCandidateReserved_[handle] = 0u;
+        if (!candidatesReservedInPlace)
+            stealCandidateReserved_[handle] = 0u;
         v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
         v.currentGain[handle] = 0.0f;
 
         InitializePreparedVoice(handle, channel, note, velocity);
+        if (preserveRenderIndex)
+            v.renderClass[handle] = configuredClass;
         stealCandidateDeferred_[handle] = 1u;
         LinkChannelKey(handle);
-        LinkChannelActive(handle);
+        if (!preserveChannelIndex) LinkChannelActive(handle);
     }
     return true;
+}
+
+inline void VoiceManager::CommitVoiceGroupConfigurations(
+    const VoiceHandle* handles, uint32_t count,
+    bool candidatesReservedInPlace) {
+    if (!candidatesReservedInPlace) {
+        for (uint32_t layer = 0u; layer < count; ++layer)
+            CommitVoiceConfiguration(handles[layer]);
+        return;
+    }
+
+    bool stillStable = stealHeapValid_ && count <= 8u;
+    for (uint32_t layer = 0u; layer < count && stillStable; ++layer) {
+        const VoiceHandle handle = handles[layer];
+        stillStable = handle < maxVoices_ &&
+            stealCandidateDeferred_[handle] != 0u &&
+            stealCandidateReserved_[handle] == 2u &&
+            IsStableStealCandidate(handle) &&
+            stealWinnerTree_[kStealTreeLeafBase + handle] == handle;
+    }
+    if (!stillStable) {
+        for (uint32_t layer = 0u; layer < count; ++layer)
+            CommitVoiceConfiguration(handles[layer]);
+        return;
+    }
+
+    for (uint32_t layer = 0u; layer < count; ++layer) {
+        const VoiceHandle handle = handles[layer];
+        stealCandidateDeferred_[handle] = 0u;
+        stealCandidateReserved_[handle] = 0u;
+        stealStableCandidate_[handle] = {
+            ComputeStableStealKey(handle), handle, activePosition_[handle]};
+    }
+    RefreshStealWinnerPaths(handles, count);
 }
 
 inline bool VoiceManager::LaunchVoiceGroup(
@@ -1527,7 +1682,9 @@ inline bool VoiceManager::LaunchVoiceGroup(
     const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles) {
     if (!setups || !outHandles || count == 0u || count > maxVoices_)
         return false;
-    if (!ReuseMatchingStealGroup(channel, note, velocity, count, outHandles)) {
+    bool candidatesReservedInPlace = false;
+    if (!ReuseMatchingStealGroup(channel, note, velocity, setups, count,
+                                 outHandles, candidatesReservedInPlace)) {
         uint32_t allocated = 0u;
         for (; allocated < count; ++allocated) {
             outHandles[allocated] = AllocateVoiceOrSteal(
@@ -1546,8 +1703,8 @@ inline bool VoiceManager::LaunchVoiceGroup(
         // a time, multiplying tree/list work for stereo SoundFonts.
         ConfigureVoice(outHandles[layer], setups[layer], channelParams, false);
     }
-    for (uint32_t layer = 0u; layer < count; ++layer)
-        CommitVoiceConfiguration(outHandles[layer]);
+    CommitVoiceGroupConfigurations(outHandles, count,
+                                   candidatesReservedInPlace);
     return true;
 }
 

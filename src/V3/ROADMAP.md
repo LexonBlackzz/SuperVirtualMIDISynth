@@ -249,6 +249,12 @@ larger phase containing that item is complete.
 - [x] Remove the shared current-frame age term from persistent heap keys, batch
   deferred voice setup into one candidate update, and replace same-frame heap
   roots in place without changing victim selection
+- [x] Replace saturated matching stereo/layer groups in their existing winner-
+  tree leaves and refresh the union of their paths once; preserve exact group
+  victims, both 64-sample tails, and future victim ordering
+- [x] Keep delay/hold/attack voices in the persistent exact steal tree because
+  their protected target-gain score is time-invariant; reserve per-frame
+  volatile rebuilding for decay and release only
 - [x] Apply each prepared SF2 layer through one transactional voice setup and
   expose attack-frame control in the dense note-burst benchmark
 - [x] Prepare complete layered note launches before pool mutation, cache the
@@ -280,6 +286,8 @@ larger phase containing that item is complete.
 - [x] Add full-velocity note-burst rates/key spreads and optional real-SF2
   layered-region matching to `svms_v3_bench`; characterize the supplied Krash
   corpus at 94k average and 792k peak note-ons/s
+- [x] Make the benchmark's transactional mode exercise complete two-to-eight-
+  layer launches instead of silently falling back to legacy per-layer steals
 - [x] Verify 4096 voices for 60 seconds at 44.1 kHz/2048 frames on the
   i5-13600KF: sustained p99 36.72%, envelope p99 50.82%, release p99 37.42%
 - [x] Differentially validate exact event order, active identities, steal

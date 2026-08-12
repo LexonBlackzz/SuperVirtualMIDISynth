@@ -359,6 +359,7 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
 
             const bool isSampleBacked = (v.sampleBacked[idx] != 0 && sampleData != nullptr);
             const bool isReleased = (voiceState == static_cast<uint8_t>(VoiceState::Releasing));
+            const uint8_t envelopeStageBefore = v.envelopeStage[idx];
 
             // Precomputed region constants (see VoiceManager::SetVoiceSample).
             const uint32_t relEnd    = v.relEnd[idx];
@@ -506,6 +507,8 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                 // activeList_ moves into position i.  Don't advance i —
                 // re-process the swapped-in voice at this frame.
             } else {
+                if (v.envelopeStage[idx] != envelopeStageBefore)
+                    voices.RefreshRenderClass(static_cast<VoiceHandle>(idx));
                 ++i;
             }
         }

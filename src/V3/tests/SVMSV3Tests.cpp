@@ -681,6 +681,90 @@ void TestPriorityAwareStealingAndFadeTail() {
     }
 
     {
+        // Exercise the saturated common stereo path repeatedly. The in-place
+        // transaction must remain equivalent to selecting the exhaustive
+        // victim, retiring its complete play group, and configuring the two
+        // replacement slots sequentially.
+        auto legacy = std::make_unique<svms::VoiceManager>();
+        auto transactional = std::make_unique<svms::VoiceManager>();
+        legacy->Initialize(8u, 44100u);
+        transactional->Initialize(8u, 44100u);
+        svms::ChannelParamsSnapshot channel{};
+        channel.volume = channel.expression = 1.0f;
+        channel.panLeft = channel.panRight = 0.70710678f;
+        svms::VoiceConfiguration setups[2]{};
+        for (auto& setup : setups) {
+            setup.sampleStart = 0u;
+            setup.sampleEnd = 128u;
+            setup.loopStart = 8u;
+            setup.loopEnd = 120u;
+            setup.loopMode = 1u;
+            setup.phaseStep = setup.basePhaseStep = 1.0f;
+            setup.initialGain = setup.sustainLevel = 1.0f;
+            setup.releaseDecay = 0.999f;
+            setup.gainLeft = setup.gainRight = 0.1f;
+            setup.sampleBacked = 1u;
+        }
+        for (uint32_t group = 0u; group < 4u; ++group) {
+            setups[0].playIndex = setups[1].playIndex = group + 1u;
+            for (uint32_t layer = 0u; layer < 2u; ++layer) {
+                const auto a = legacy->AllocateVoice(0u, 60u, 100u);
+                const auto b = transactional->AllocateVoice(0u, 60u, 100u);
+                legacy->ConfigureVoice(a, setups[layer], channel, false);
+                transactional->ConfigureVoice(b, setups[layer], channel, false);
+            }
+        }
+
+        bool equivalent = true;
+        for (uint32_t iteration = 0u; iteration < 64u && equivalent;
+             ++iteration) {
+            const uint8_t note = static_cast<uint8_t>(36u + iteration % 72u);
+            const uint32_t playIndex = 100u + iteration;
+            setups[0].playIndex = setups[1].playIndex = playIndex;
+            setups[0].phaseStep = setups[0].basePhaseStep =
+                0.75f + static_cast<float>(iteration & 3u) * 0.125f;
+            setups[1].phaseStep = setups[1].basePhaseStep =
+                setups[0].phaseStep + 0.03125f;
+
+            const auto expected = legacy->FindStealVictimExhaustiveForTest();
+            svms::VoiceHandle legacyHandles[2]{};
+            legacyHandles[0] = legacy->AllocateVoiceOrSteal(
+                0u, note, 127u, nullptr, true);
+            legacyHandles[1] = legacy->AllocateVoiceOrSteal(
+                0u, note, 127u, nullptr, true);
+            for (uint32_t layer = 0u; layer < 2u; ++layer)
+                legacy->ConfigureVoice(legacyHandles[layer], setups[layer],
+                                       channel, true);
+
+            svms::VoiceHandle transactionHandles[2]{};
+            const bool launched = transactional->LaunchVoiceGroup(
+                0u, note, 127u, setups, 2u, channel, transactionHandles);
+            equivalent = launched && legacyHandles[0] == expected &&
+                transactionHandles[0] == expected &&
+                legacy->GetActiveCount() == transactional->GetActiveCount() &&
+                legacy->GetStealTailCount() ==
+                    transactional->GetStealTailCount() &&
+                legacy->FindStealVictimExhaustiveForTest() ==
+                    transactional->FindStealVictimExhaustiveForTest();
+            for (uint32_t handle = 0u; handle < 8u && equivalent; ++handle) {
+                equivalent = legacy->v.state[handle] ==
+                        transactional->v.state[handle] &&
+                    legacy->v.channel[handle] ==
+                        transactional->v.channel[handle] &&
+                    legacy->v.note[handle] == transactional->v.note[handle] &&
+                    legacy->v.playIndex[handle] ==
+                        transactional->v.playIndex[handle] &&
+                    legacy->v.renderClass[handle] ==
+                        transactional->v.renderClass[handle] &&
+                    std::fabs(legacy->v.phaseIncs[handle] -
+                              transactional->v.phaseIncs[handle]) < 1.0e-7f;
+            }
+        }
+        Check(equivalent,
+              "in-place stereo transactions preserve exhaustive victims and voice state");
+    }
+
+    {
         auto voices = std::make_unique<svms::VoiceManager>();
         voices->Initialize(2, 44100);
         const svms::VoiceHandle mature = voices->AllocateVoice(0, 60, 100);
@@ -925,10 +1009,9 @@ void TestPersistentStealIndexAgainstOracle() {
             channels.GetParams()[iteration & 15u]);
     }
 
-    // Dense piano attacks used to live in the exact fallback list and force
-    // a complete pool scan for every equal-frame layer. Verify that the
-    // per-frame volatile heap retains the exhaustive oracle's victim and tie
-    // decisions both within a frame and after envelope time advances.
+    // Delay/hold/attack use fixed target gain for stealing and therefore live
+    // in the persistent exact tree. Verify the tree retains the exhaustive
+    // oracle's victim and tie decisions within and across output frames.
     auto attacks = std::make_unique<svms::VoiceManager>();
     attacks->Initialize(64u, 44100u);
     for (uint32_t i = 0; i < 64u; ++i) {
@@ -958,7 +1041,7 @@ void TestPersistentStealIndexAgainstOracle() {
             channel, static_cast<uint8_t>(24u + iteration % 96u),
             static_cast<uint8_t>(96u + iteration % 32u), nullptr, true);
         Check(actual == expected,
-              "per-frame transient steal heap matches exhaustive victim selection");
+              "persistent attack steal tree matches exhaustive victim selection");
         svms::VoiceConfiguration setup{};
         setup.sampleEnd = 512u;
         setup.loopStart = 8u;
@@ -970,6 +1053,49 @@ void TestPersistentStealIndexAgainstOracle() {
         setup.gainLeft = setup.gainRight = 0.5f;
         attacks->ConfigureVoice(actual, setup,
             channels.GetParams()[channel], true);
+    }
+
+    {
+        auto transitions = std::make_unique<svms::VoiceManager>();
+        transitions->Initialize(2u, 44100u);
+        for (uint32_t i = 0u; i < 2u; ++i) {
+            const auto handle = transitions->AllocateVoice(
+                0u, static_cast<uint8_t>(60u + i), 100u);
+            transitions->SetVoiceSample(handle, 0u, 512u, 8u, 504u,
+                                        1u, 0.75f, 1u);
+            transitions->SetVoiceEnvelope(handle, 1.0f, 0.4f, 0u, 0u,
+                                           8u, 64u, 0.125f, 0.98f,
+                                           0.9999f);
+            transitions->SetVoiceGain(handle, 0.5f, 0.5f);
+            transitions->RefreshMixGain(handle, channels.GetParams()[0]);
+        }
+        // Materialize the persistent attack index, configure its replacement
+        // as another attack, then emulate the exact attack-to-decay boundary
+        // without changing render-class membership.
+        const auto indexed = transitions->AllocateVoiceOrSteal(
+            0u, 71u, 100u, nullptr, true);
+        svms::VoiceConfiguration setup{};
+        setup.sampleEnd = 512u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 504u;
+        setup.loopMode = 1u;
+        setup.initialGain = 1.0f;
+        setup.sustainLevel = 0.4f;
+        setup.attackSamples = 8u;
+        setup.decaySamples = 64u;
+        setup.attackGainStep = 0.125f;
+        setup.decaySlope = 0.98f;
+        setup.gainLeft = setup.gainRight = 0.5f;
+        transitions->ConfigureVoice(indexed, setup,
+                                    channels.GetParams()[0], true);
+        transitions->v.envelopeStage[indexed] = 2u;
+        transitions->v.currentGain[indexed] = 0.01f;
+        transitions->RefreshRenderClass(indexed);
+        const auto expected = transitions->FindStealVictimExhaustiveForTest();
+        const auto actual = transitions->AllocateVoiceOrSteal(
+            0u, 72u, 127u, nullptr, true);
+        Check(actual == expected,
+              "attack-to-decay transition migrates to the volatile steal index");
     }
 }
 
