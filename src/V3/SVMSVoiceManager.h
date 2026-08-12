@@ -287,6 +287,9 @@ private:
     float ComputeTailLevel(uint32_t tailSlot) const;
     uint32_t SelectStealTailSlot(float outgoingLevel);
     void CaptureStealTail(VoiceHandle handle);
+    bool ReuseMatchingStealGroup(uint8_t channel, uint8_t note,
+                                 uint8_t velocity, uint32_t count,
+                                 VoiceHandle* outHandles);
     void RetireStolenSibling(VoiceHandle handle,
                              VoiceHandle selectedVictim);
     float ComputeStableStealKey(VoiceHandle handle) const;
@@ -1453,26 +1456,98 @@ inline void VoiceManager::ConfigureVoice(
         UpdateStealCandidate(handle);
 }
 
+inline bool VoiceManager::ReuseMatchingStealGroup(
+    uint8_t channel, uint8_t note, uint8_t velocity, uint32_t count,
+    VoiceHandle* outHandles) {
+    if (freeTop_ != 0u || count < 2u || count > maxVoices_ || !outHandles)
+        return false;
+
+    uint32_t selectedPosition = 0u;
+    const VoiceHandle selected = PopStealCandidate(selectedPosition, false);
+    if (selected == kInvalidVoice) return false;
+
+    uint32_t groupCount = 1u;
+    outHandles[0] = selected;
+    bool tooMany = false;
+    int32_t linked = playGroupPrev_[selected];
+    while (linked >= 0) {
+        if (groupCount >= count) { tooMany = true; break; }
+        outHandles[groupCount++] = static_cast<VoiceHandle>(linked);
+        linked = playGroupPrev_[static_cast<uint32_t>(linked)];
+    }
+    if (!tooMany) {
+        linked = playGroupNext_[selected];
+        while (linked >= 0) {
+            if (groupCount >= count) { tooMany = true; break; }
+            outHandles[groupCount++] = static_cast<VoiceHandle>(linked);
+            linked = playGroupNext_[static_cast<uint32_t>(linked)];
+        }
+    }
+
+    if (groupCount != count || tooMany) {
+        // The caller needs a different number of slots. Restore the exact
+        // candidate and use the general allocation path, which may retire a
+        // larger/smaller physical group according to the existing policy.
+        PushStealCandidate(selected, activePosition_[selected]);
+        return false;
+    }
+
+    // The selected leaf was removed by PopStealCandidate. Remove every
+    // sibling leaf before mutating any semantic state, then capture all old
+    // audio tails and replace the complete physical note in-place. Active
+    // positions and the free stack never move in this common stereo case.
+    for (uint32_t i = 1u; i < count; ++i)
+        RemoveStealCandidate(outHandles[i]);
+    for (uint32_t i = 0u; i < count; ++i)
+        CaptureStealTail(outHandles[i]);
+
+    for (uint32_t i = 0u; i < count; ++i) {
+        const VoiceHandle handle = outHandles[i];
+        ++stealCount_;
+        UnlinkChannelKey(handle);
+        UnlinkPlayGroup(handle);
+        UnlinkChannelActive(handle);
+        UnlinkRenderClass(handle);
+        stealCandidateDeferred_[handle] = 1u;
+        stealCandidateReserved_[handle] = 0u;
+        v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
+        v.currentGain[handle] = 0.0f;
+
+        InitializePreparedVoice(handle, channel, note, velocity);
+        stealCandidateDeferred_[handle] = 1u;
+        LinkChannelKey(handle);
+        LinkChannelActive(handle);
+    }
+    return true;
+}
+
 inline bool VoiceManager::LaunchVoiceGroup(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count,
     const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles) {
     if (!setups || !outHandles || count == 0u || count > maxVoices_)
         return false;
-    uint32_t allocated = 0u;
-    for (; allocated < count; ++allocated) {
-        outHandles[allocated] = AllocateVoiceOrSteal(
-            channel, note, velocity, nullptr, count == 1u);
-        if (outHandles[allocated] == kInvalidVoice) {
-            for (uint32_t rollback = 0u; rollback < allocated; ++rollback)
-                RetireVoice(outHandles[rollback]);
-            return false;
+    if (!ReuseMatchingStealGroup(channel, note, velocity, count, outHandles)) {
+        uint32_t allocated = 0u;
+        for (; allocated < count; ++allocated) {
+            outHandles[allocated] = AllocateVoiceOrSteal(
+                channel, note, velocity, nullptr, true);
+            if (outHandles[allocated] == kInvalidVoice) {
+                for (uint32_t rollback = 0u; rollback < allocated; ++rollback)
+                    RetireVoice(outHandles[rollback]);
+                return false;
+            }
         }
     }
     for (uint32_t layer = 0u; layer < count; ++layer) {
-        ConfigureVoice(outHandles[layer], setups[layer], channelParams,
-                       count == 1u);
+        // Keep every layer invisible to the steal index until the complete
+        // physical note has been prepared.  The former layered path linked a
+        // Generic candidate, configured it, and reclassified it one layer at
+        // a time, multiplying tree/list work for stereo SoundFonts.
+        ConfigureVoice(outHandles[layer], setups[layer], channelParams, false);
     }
+    for (uint32_t layer = 0u; layer < count; ++layer)
+        CommitVoiceConfiguration(outHandles[layer]);
     return true;
 }
 

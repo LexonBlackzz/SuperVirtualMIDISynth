@@ -23,6 +23,9 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         bool soundFontLoaded, uint32_t sampleRate,
                         uint32_t bufferFrames, float masterVolume,
                         bool waveOutFallback, RenderBackend renderBackend,
+                        float schedulerPercent, float dispatchPercent,
+                        float synthesisPercent, float postPercent,
+                        uint32_t eventsThisBlock, uint32_t scheduledEvents,
                         const LiveSF2Telemetry& sf2);
 
 } // namespace svms

@@ -31,6 +31,12 @@ struct DiagStats {
     uint32_t decimationStep;
     uint32_t retired;
     uint32_t retiredImmediate;
+    float schedulerPercent;
+    float dispatchPercent;
+    float synthesisPercent;
+    float postPercent;
+    uint32_t eventsThisBlock;
+    uint32_t scheduledEvents;
     LiveSF2Telemetry sf2;
 };
 
@@ -59,7 +65,7 @@ static HMODULE GetCurrentModule() {
 
 static const wchar_t* kWindowClass = L"SVMS V3 Diag";
 static const int kWindowWidth = 540;
-static const int kWindowHeight = 480;
+static const int kWindowHeight = 520;
 static const int kTimerId = 1;
 // Diagnostic-only refresh. Windows timers are scheduler-limited, but 1 ms
 // gives the monitor the fastest practical readout without touching audio.
@@ -172,6 +178,17 @@ static void OnPaint(HWND hwnd) {
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.0f / %.0f / %.0f%%", s.callbackP95,
                s.callbackP99, s.callbackP999);
     DrawStat(memDC, kPadX, y, L"CPU p95/99/99.9:  ", buf);
+    y += kLineH;
+
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.1f / %.1f / %.1f / %.1f%%",
+                  s.schedulerPercent, s.dispatchPercent,
+                  s.synthesisPercent, s.postPercent);
+    DrawStat(memDC, kPadX, y, L"CPU sch/evt/syn/post: ", buf);
+    y += kLineH;
+
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u / %u",
+                  s.eventsThisBlock, s.scheduledEvents);
+    DrawStat(memDC, kPadX, y, L"Events block/queued: ", buf);
     y += kLineH;
 
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%llu (max run %u)",
@@ -387,6 +404,9 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         bool soundFontLoaded, uint32_t sampleRate,
                         uint32_t bufferFrames, float masterVolume,
                         bool waveOutFallback, RenderBackend renderBackend,
+                        float schedulerPercent, float dispatchPercent,
+                        float synthesisPercent, float postPercent,
+                        uint32_t eventsThisBlock, uint32_t scheduledEvents,
                         const LiveSF2Telemetry& sf2) {
     if (!g_running.load(std::memory_order_acquire)) return;
     const uint32_t target = 1u - g_publishedStats.load(std::memory_order_relaxed);
@@ -415,6 +435,12 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     stats.decimationStep = decimationStep;
     stats.retired = retired;
     stats.retiredImmediate = retiredImmediate;
+    stats.schedulerPercent = schedulerPercent;
+    stats.dispatchPercent = dispatchPercent;
+    stats.synthesisPercent = synthesisPercent;
+    stats.postPercent = postPercent;
+    stats.eventsThisBlock = eventsThisBlock;
+    stats.scheduledEvents = scheduledEvents;
     stats.sf2 = sf2;
     g_publishedStats.store(target, std::memory_order_release);
 }
