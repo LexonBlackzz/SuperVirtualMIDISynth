@@ -1184,7 +1184,6 @@ void TestWindowedSchedulerOrdering() {
         svms::ScheduledRenderEvent e;
         e.targetFrame = (i & 1) ? 4 : 2;
         e.sequence = i;
-        e.event.frameOffset = 0;
         Check(scheduler.Enqueue(e), "scheduler accepts event");
     }
     svms::ScheduledRenderEvent out;
@@ -1219,6 +1218,66 @@ void TestWindowedSchedulerOrdering() {
     }
     Check(popped == 200 && batched.Empty(),
           "batched scheduler drains every rebuilt-heap event");
+
+    // Production receives concatenated compiler chunks. Each chunk is
+    // ordered internally, but adjacent chunks overlap in absolute time.
+    svms::EventScheduler merged(4096);
+    std::vector<svms::ScheduledRenderEvent> expected;
+    for (uint32_t chunk = 0u; chunk < 12u; ++chunk) {
+        for (uint32_t i = 0u; i < 128u; ++i) {
+            svms::ScheduledRenderEvent event;
+            event.targetFrame = static_cast<int64_t>(i) - 32;
+            event.sequence = chunk * 128u + i;
+            Check(merged.EnqueueBatched(event),
+                  "scheduler accepts a sorted compiler chunk");
+            expected.push_back(event);
+        }
+    }
+    std::stable_sort(expected.begin(), expected.end(),
+        [](const auto& a, const auto& b) {
+            return a.targetFrame < b.targetFrame ||
+                (a.targetFrame == b.targetFrame && a.sequence < b.sequence);
+        });
+    merged.FinalizeBatch();
+    for (const auto& event : expected) {
+        Check(merged.PopBefore(INT64_MAX, out) &&
+                  out.targetFrame == event.targetFrame &&
+                  out.sequence == event.sequence,
+              "natural-run merge preserves exact frame/sequence order");
+    }
+    Check(merged.Empty(), "natural-run scheduler drains completely");
+
+    merged.ConfigureCapacity(32u);
+    Check(merged.Capacity() == 32u && merged.Empty(),
+          "scheduler capacity can be configured before real-time use");
+}
+
+void TestFairPriorityLaneDrain() {
+    svms::PriorityEventIngress<svms::TimestampedMidiEvent> ingress;
+    for (uint32_t i = 0u; i < 64u; ++i) {
+        svms::TimestampedMidiEvent state{};
+        state.sequence = i * 2u;
+        svms::TimestampedMidiEvent loud{};
+        loud.sequence = i * 2u + 1u;
+        Check(ingress.TryPush(svms::EventLane::State, state),
+              "state lane accepts fairness test event");
+        Check(ingress.TryPush(svms::EventLane::Loud, loud),
+              "loud lane accepts fairness test event");
+    }
+    uint32_t cursor = 0u;
+    uint32_t stateCount = 0u;
+    uint32_t loudCount = 0u;
+    for (uint32_t i = 0u; i < 128u; ++i) {
+        svms::TimestampedMidiEvent event{};
+        Check(ingress.TryPopFair(event, cursor),
+              "fair drain returns every queued event");
+        if ((event.sequence & 1u) == 0u) ++stateCount;
+        else ++loudCount;
+        Check(stateCount <= loudCount + 1u && loudCount <= stateCount + 1u,
+              "saturated state and loud lanes cannot starve each other");
+    }
+    Check(stateCount == 64u && loudCount == 64u,
+          "fair drain consumes both saturated priority lanes");
 }
 
 void TestFourProducerMPSCIntegrity() {
@@ -1897,6 +1956,7 @@ int main() {
     TestConfiguredVelocityMapping();
     TestEventRingWrapAndCapacity();
     TestWindowedSchedulerOrdering();
+    TestFairPriorityLaneDrain();
     TestFourProducerMPSCIntegrity();
     TestJsonConfigurationLifecycle();
     TestSixHourFrameClockDrift();

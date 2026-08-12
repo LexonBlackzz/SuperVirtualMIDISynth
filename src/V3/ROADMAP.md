@@ -146,6 +146,12 @@ larger phase containing that item is complete.
   synchronous callback path on single-core and XP targets
 - [x] Feed compiled commands through a cancellable SPSC handoff and include
   both raw and compiled backlog in admission pressure
+- [x] Order fixed-size compiler chunks before the SPSC handoff so the audio
+  callback merges natural runs instead of sorting raw ingress
+- [x] Rotate fairly across priority lanes during compilation so saturated
+  state traffic cannot indefinitely starve full-velocity note-ons
+- [x] Suppress per-event compiler wakeups and amortize producer pressure scans
+  without weakening cancellable lossless backpressure
 - [ ] Saturate every priority lane and test monotonic shedding, lossless-lane
   wakeup/backpressure, and shutdown cancellation
 - [ ] Add bulk-packed MIDI ingestion and safe redundant-controller coalescing
@@ -159,6 +165,10 @@ larger phase containing that item is complete.
 - [x] Append each callback's newly compiled commands as one batch and rebuild
   the scheduler heap once instead of performing one logarithmic insertion per
   event
+- [x] Compact scheduled commands to 16 bytes and size the scheduler/event
+  working sets from the configured ring and per-block capacities
+- [x] Add a production-path event-pipeline benchmark covering MPSC admission,
+  frame compilation, chunk ordering, SPSC handoff, callback merge, and extract
 - [x] Preserve deterministic equal-frame event ordering
 - [x] Dispatch each equal-frame run through one batch callback while preserving
   every event and its global ingress order

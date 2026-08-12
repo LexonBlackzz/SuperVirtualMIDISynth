@@ -352,7 +352,7 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     }
     if (auto it = root.find("events"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "ring_capacity", cfg.eventRingCapacity,
-                       kDefaultEventRingCapacity, kDefaultEventRingCapacity))
+                       4096u, kDefaultEventRingCapacity))
             AppendWarning(cfg.configWarning, "events.ring_capacity");
         if (!ReadValue(*it, "high_priority_velocity", cfg.highPriorityVelocity, 1u, 127u))
             AppendWarning(cfg.configWarning, "events.high_priority_velocity");
@@ -361,6 +361,11 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "max_events_per_block", cfg.maxEventsPerBlock, 1u,
                        kEventBufferCapacity))
             AppendWarning(cfg.configWarning, "events.max_events_per_block");
+        if (cfg.maxEventsPerBlock > cfg.eventRingCapacity) {
+            cfg.maxEventsPerBlock = cfg.eventRingCapacity;
+            AppendWarning(cfg.configWarning,
+                          "events.max_events_per_block exceeds ring_capacity");
+        }
         auto mode = it->find("overflow_mode");
         if (mode != it->end()) {
             if (mode->is_string() && mode->get<std::string>() == "lossless")
@@ -550,9 +555,12 @@ bool EngineConfig::Validate() const {
            masterVolume >= 0.0f && masterVolume <= 4.0f &&
            velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
            velocityFloor >= 0.0f && velocityFloor < 1.0f &&
+           eventRingCapacity >= 4096u &&
+           eventRingCapacity <= kDefaultEventRingCapacity &&
            highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
            shedStartPercent >= 1 && shedStartPercent < 100 &&
-           maxEventsPerBlock > 0;
+           maxEventsPerBlock > 0 &&
+           maxEventsPerBlock <= eventRingCapacity;
 }
 
 std::wstring GetV3LocalConfigPath() {

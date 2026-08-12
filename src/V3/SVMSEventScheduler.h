@@ -11,10 +11,27 @@
 namespace svms {
 
 struct ScheduledRenderEvent {
-    RenderEvent event{};
     int64_t targetFrame = 0;
     uint32_t sequence = 0;
+    RenderEventType type = RenderEventType::NoteOn;
+    uint8_t channel = 0u;
+    uint8_t data1 = 0u;
+    uint8_t data2 = 0u;
+
+    RenderEvent ToRenderEvent(uint32_t frameOffset = 0u) const noexcept {
+        return {type, channel, data1, data2, frameOffset, sequence};
+    }
+
+    void SetRenderEvent(const RenderEvent& event) noexcept {
+        type = event.type;
+        channel = event.channel;
+        data1 = event.data1;
+        data2 = event.data2;
+        sequence = event.ingressSequence;
+    }
 };
+static_assert(sizeof(ScheduledRenderEvent) == 16u,
+              "scheduled events must remain one compact 16-byte record");
 
 // Audio-thread-owned ordered event store. Incoming priority lanes are not
 // globally ordered, so each callback must restore absolute-frame/sequence
@@ -28,6 +45,20 @@ public:
         : capacity_(capacity) {
         events_.reserve(capacity_);
         scratch_.resize(capacity_);
+    }
+
+    void ConfigureCapacity(uint32_t capacity) {
+        if (capacity == 0u) capacity = 1u;
+        std::vector<ScheduledRenderEvent> events;
+        std::vector<ScheduledRenderEvent> scratch;
+        events.reserve(capacity);
+        scratch.resize(capacity);
+        events_.swap(events);
+        scratch_.swap(scratch);
+        capacity_ = capacity;
+        readIndex_ = 0u;
+        highWater_ = 0u;
+        batchDirty_ = false;
     }
 
     bool Enqueue(const ScheduledRenderEvent& ev) {
@@ -69,6 +100,7 @@ public:
         return static_cast<uint32_t>(events_.size() - readIndex_);
     }
     uint32_t HighWater() const { return highWater_; }
+    uint32_t Capacity() const { return capacity_; }
 
     bool PopBefore(int64_t endSample, ScheduledRenderEvent& out) {
         FinalizeBatch();
@@ -205,8 +237,11 @@ private:
             minimumFrame = (std::min)(minimumFrame, events_[i].targetFrame);
             maximumFrame = (std::max)(maximumFrame, events_[i].targetFrame);
         }
-        const bool compactFrame = static_cast<uint64_t>(
-            maximumFrame - minimumFrame) <= UINT32_MAX;
+        const uint64_t orderedMinimum =
+            static_cast<uint64_t>(minimumFrame) ^ (uint64_t{1} << 63u);
+        const uint64_t orderedMaximum =
+            static_cast<uint64_t>(maximumFrame) ^ (uint64_t{1} << 63u);
+        const bool compactFrame = orderedMaximum - orderedMinimum <= UINT32_MAX;
         const uint32_t passCount = compactFrame ? 8u : 12u;
 
         ScheduledRenderEvent* source = events_.data();

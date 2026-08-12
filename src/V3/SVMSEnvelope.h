@@ -2,6 +2,7 @@
 #define SVMS_ENVELOPE_H
 
 #include "SVMSTypes.h"
+#include <cmath>
 
 namespace svms {
 

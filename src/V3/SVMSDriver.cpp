@@ -25,6 +25,7 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSPSCQueue.h"
 #include "SVMSEventScheduler.h"
+#include "SVMSEventCompile.h"
 #include "SVMSFrameClock.h"
 #include "SVMSDiagWindow.h"
 
@@ -165,44 +166,6 @@ static bool UsesXPWaveOut(const AudioOutput* output) {
     (void)output;
     return false;
 #endif
-}
-
-static constexpr uint32_t kInternalResetMessage = 0xFF000001u;
-
-static bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
-                                    uint64_t epochQPC, uint64_t qpcFrequency,
-                                    uint32_t sampleRate, uint32_t leadFrames,
-                                    ScheduledRenderEvent& scheduled) noexcept {
-    uint32_t message = timed.message;
-    uint8_t status = static_cast<uint8_t>(message & 0xffu);
-    uint8_t data1 = static_cast<uint8_t>((message >> 8u) & 0x7fu);
-    uint8_t data2 = static_cast<uint8_t>((message >> 16u) & 0x7fu);
-    uint8_t channel = status & 0x0fu;
-    RenderEventType type;
-    if (message == kInternalResetMessage) {
-        type = RenderEventType::Reset;
-        channel = data1 = data2 = 0u;
-    } else {
-        switch (status & 0xf0u) {
-            case 0x90u:
-                if (data2 != 0u) type = RenderEventType::NoteOn;
-                else type = RenderEventType::NoteOff;
-                break;
-            case 0x80u: type = RenderEventType::NoteOff; break;
-            case 0xb0u: type = RenderEventType::ControlChange; break;
-            case 0xc0u: type = RenderEventType::ProgramChange; break;
-            case 0xe0u: type = RenderEventType::PitchBend; break;
-            default: return false;
-        }
-    }
-
-    scheduled.event = {type, channel, data1, data2, 0u, timed.sequence};
-    scheduled.targetFrame = QpcDeltaToFrames(
-        static_cast<int64_t>(timed.qpcTimestamp) -
-            static_cast<int64_t>(epochQPC),
-        static_cast<int64_t>(qpcFrequency), sampleRate) + leadFrames;
-    scheduled.sequence = timed.sequence;
-    return true;
 }
 
 // WaitOnAddress is available on Windows 8 and newer, but some older Windows
@@ -515,6 +478,7 @@ private:
     std::atomic<uint32_t> currentVelocityCutoffAtomic_;
     std::atomic<uint64_t> compilerEpochQPC_;
     std::atomic<uint32_t> compilerWakeEpoch_;
+    std::atomic<bool> compilerSleeping_;
     std::thread eventCompilerThread_;
     bool useEventCompiler_;
     std::atomic<uint64_t> shedByVelocityAtomic_[128];
@@ -559,10 +523,10 @@ private:
     uint32_t bufferCapacity;
     LimiterState limiter;
 
-    // Per-block render-event queue.  Allocated as a flat array so the
-    // whole working set stays in L1/L2/L3 during dispatch.  Size is
-    // kEventBufferCapacity (see SVMSTypes.h).  65536 entries = 512 KB.
+    // Per-block dispatch queue. Allocated once during initialization from the
+    // smaller of max_events_per_block and the configured scheduler capacity.
     svms::RenderEvent* eventBuffer;
+    uint32_t eventBufferCapacity_;
 
     // When the renderer falls behind by more than one device buffer, old
     // note-ons no longer have a meaningful historical frame at which they
@@ -706,8 +670,8 @@ Driver::Driver()
       sampleStoreCount(0), sampleDataFrames(0),
       qpcFreq(1),
       leftBuffer(nullptr), rightBuffer(nullptr), bufferCapacity(0),
-      eventBuffer(nullptr),
-      eventScheduler_(kDefaultEventRingCapacity),
+      eventBuffer(nullptr), eventBufferCapacity_(0u),
+      eventScheduler_(1u),
       overflowMode_(EventOverflowMode::PriorityVelocity), correctnessMode_(false),
       highPriorityVelocity_(96), shedStartPercent_(70), maxEventsPerBlock_(65536),
       diagnosticsEnabled_(false), diagnosticsWindow_(false), diagnosticsDebugOutput_(false),
@@ -715,7 +679,8 @@ Driver::Driver()
       producerWakeEpoch_(0),
       scheduledSizePublished_(0), submittedAtomic_(0), acceptedAtomic_(0), shedAtomic_(0),
       cancelledAtomic_(0), currentVelocityCutoffAtomic_(1),
-      compilerEpochQPC_(0), compilerWakeEpoch_(0), useEventCompiler_(false),
+      compilerEpochQPC_(0), compilerWakeEpoch_(0), compilerSleeping_(false),
+      useEventCompiler_(false),
       telemetry_{}, debugSnapshotIndex_(0), callbackCount_(0),
       virtualRenderClockQPC(0),
       virtualRenderSample_(0), clockInitialized(false), nextPlayIndex_(1) {
@@ -729,8 +694,6 @@ Driver::Driver()
     for (auto& counter : shedByVelocityAtomic_) counter.store(0, std::memory_order_relaxed);
     for (auto& fence : channelTerminationFence_) fence.store(0, std::memory_order_relaxed);
     limiter.Reset();
-    eventBuffer = static_cast<svms::RenderEvent*>(
-        _aligned_malloc(sizeof(svms::RenderEvent) * kEventBufferCapacity, 64));
     InitializeCriticalSection(&cs);
 }
 
@@ -778,6 +741,29 @@ bool Driver::Initialize() {
     diagnosticsWindow_ = cfg.diagnosticsEnabled && cfg.diagnosticsWindow;
     diagnosticsDebugOutput_ = cfg.diagnosticsEnabled && cfg.diagnosticsDebugOutput;
     cancelProducers_.store(false, std::memory_order_release);
+    compilerSleeping_.store(false, std::memory_order_relaxed);
+
+    try {
+        eventScheduler_.ConfigureCapacity(cfg.eventRingCapacity);
+    } catch (...) {
+        LOG("FAILED: Could not allocate event scheduler capacity=%u",
+            cfg.eventRingCapacity);
+        return false;
+    }
+    if (eventBuffer) {
+        _aligned_free(eventBuffer);
+        eventBuffer = nullptr;
+        eventBufferCapacity_ = 0u;
+    }
+    eventBufferCapacity_ = (std::min)(maxEventsPerBlock_, cfg.eventRingCapacity);
+    eventBuffer = static_cast<svms::RenderEvent*>(_aligned_malloc(
+        sizeof(svms::RenderEvent) * eventBufferCapacity_, 64));
+    if (!eventBuffer) {
+        LOG("FAILED: Could not allocate event buffer capacity=%u",
+            eventBufferCapacity_);
+        eventBufferCapacity_ = 0u;
+        return false;
+    }
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -902,6 +888,7 @@ void Driver::Shutdown() {
     WakeAddressWaiters(producerWakeEpoch_);
     compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
     WakeAddressWaiters(compilerWakeEpoch_);
+    compilerSleeping_.store(false, std::memory_order_release);
     if (audioOutput) {
         audioOutput->Stop();
         audioOutput->Shutdown();
@@ -914,6 +901,11 @@ void Driver::Shutdown() {
     compiledIngress_.Reset();
     eventScheduler_.Reset();
     scheduledSizePublished_.store(0, std::memory_order_release);
+    if (eventBuffer) {
+        _aligned_free(eventBuffer);
+        eventBuffer = nullptr;
+        eventBufferCapacity_ = 0u;
+    }
     delete voiceManager; voiceManager = nullptr;
     delete channelCache; channelCache = nullptr;
     delete renderScalar; renderScalar = nullptr;
@@ -1201,17 +1193,38 @@ void Driver::SubmitShortMsg(uint32_t msg) {
         else lane = EventLane::Quiet;
     }
 
-    const uint32_t ingress = midiIngress_.TotalSize() + compiledIngress_.Size();
-    const uint32_t scheduled = scheduledSizePublished_.load(std::memory_order_acquire);
-    const uint32_t ingressPressure = ingress * 100u / PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity();
-    const uint32_t scheduledPressure = scheduled * 100u / kEventBufferCapacity;
-    const uint32_t pressure = (std::max)(ingressPressure, scheduledPressure);
-    uint32_t cutoff = 1;
-    if (pressure > shedStartPercent_) {
-        const uint32_t range = 100u - shedStartPercent_;
-        cutoff = 1u + ((std::min)(pressure - shedStartPercent_, range) * 94u) / range;
+    // Queue pressure changes much more slowly than MIDI arrives. Sampling it
+    // once per 256 global events removes twelve shared atomic loads from the
+    // ordinary producer path while still reacting within a fraction of one
+    // audio block at extreme rates.
+    uint32_t cutoff = currentVelocityCutoffAtomic_.load(
+        std::memory_order_relaxed);
+    if ((evt.sequence & 0xffu) == 0u) {
+        const uint32_t ingress =
+            midiIngress_.TotalSize() + compiledIngress_.Size();
+        const uint32_t scheduled =
+            scheduledSizePublished_.load(std::memory_order_acquire);
+        const uint32_t ingressPressure = ingress * 100u /
+            PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity();
+        const uint32_t laneCapacity =
+            PriorityEventIngress<TimestampedMidiEvent>::LaneCapacity(lane);
+        const uint32_t lanePressure =
+            midiIngress_.LaneSize(lane) * 100u / laneCapacity;
+        const uint32_t scheduledCapacity = eventScheduler_.Capacity();
+        const uint32_t scheduledPressure = scheduledCapacity != 0u
+            ? scheduled * 100u / scheduledCapacity : 100u;
+        const uint32_t pressure = (std::max)(
+            lanePressure, (std::max)(ingressPressure, scheduledPressure));
+        cutoff = 1u;
+        if (pressure > shedStartPercent_) {
+            const uint32_t range = 100u - shedStartPercent_;
+            cutoff = 1u +
+                ((std::min)(pressure - shedStartPercent_, range) * 94u) /
+                    range;
+        }
+        currentVelocityCutoffAtomic_.store(cutoff,
+                                            std::memory_order_relaxed);
     }
-    currentVelocityCutoffAtomic_.store(cutoff, std::memory_order_relaxed);
 
     if (noteOn && velocity < cutoff &&
         overflowMode_ == EventOverflowMode::PriorityVelocity) {
@@ -1225,8 +1238,14 @@ void Driver::SubmitShortMsg(uint32_t msg) {
     for (;;) {
         if (midiIngress_.TryPush(lane, evt)) {
             acceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
-            compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
-            WakeAddressWaiters(compilerWakeEpoch_);
+            // A running compiler will observe the queue without help. Only
+            // cross the kernel/API boundary when it explicitly published
+            // that it is asleep.
+            if (compilerSleeping_.exchange(false,
+                    std::memory_order_acq_rel)) {
+                compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
+                WakeAddressWaiters(compilerWakeEpoch_);
+            }
 #if defined(SVMS_XP_COMPAT)
             static LONG acceptedTraceCount = 0;
             const LONG acceptedIndex = InterlockedIncrement(&acceptedTraceCount);
@@ -1259,43 +1278,78 @@ void Driver::SubmitShortMsg(uint32_t msg) {
 
 void Driver::EventCompilerLoop() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    uint32_t producerWakeBatch = 0u;
+    // Small enough to stay cache-friendly, large enough that one 2048-frame
+    // Black-MIDI callback arrives as only a handful of ordered runs.
+    static constexpr uint32_t kCompilerChunkCapacity = 8192u;
+    EventScheduler chunkScheduler(kCompilerChunkCapacity);
+    uint32_t fairLaneCursor = 0u;
+
+    auto publishProducerSpace = [this]() {
+        producerWakeEpoch_.fetch_add(1, std::memory_order_release);
+        WakeAddressWaiters(producerWakeEpoch_);
+    };
+
     while (!cancelProducers_.load(std::memory_order_acquire)) {
         const uint64_t epoch = compilerEpochQPC_.load(std::memory_order_acquire);
         if (epoch == 0u) {
+            compilerSleeping_.store(true, std::memory_order_release);
             const uint32_t observed = compilerWakeEpoch_.load(std::memory_order_acquire);
-            WaitForAddressChange(compilerWakeEpoch_, observed);
+            if (compilerEpochQPC_.load(std::memory_order_acquire) == 0u)
+                WaitForAddressChange(compilerWakeEpoch_, observed);
+            compilerSleeping_.store(false, std::memory_order_release);
             continue;
         }
 
         TimestampedMidiEvent timed{};
-        if (!midiIngress_.TryPop(timed)) {
-            if (producerWakeBatch != 0u) {
-                producerWakeEpoch_.fetch_add(1, std::memory_order_release);
-                WakeAddressWaiters(producerWakeEpoch_);
-                producerWakeBatch = 0u;
-            }
+        if (!midiIngress_.TryPopFair(timed, fairLaneCursor)) {
+            compilerSleeping_.store(true, std::memory_order_release);
             const uint32_t observed = compilerWakeEpoch_.load(std::memory_order_acquire);
-            WaitForAddressChange(compilerWakeEpoch_, observed);
-            continue;
+            // Close the store-to-sleep race: a producer that arrived before
+            // the epoch load either wakes us or is observed by this retry.
+            if (!midiIngress_.TryPopFair(timed, fairLaneCursor)) {
+                WaitForAddressChange(compilerWakeEpoch_, observed);
+                compilerSleeping_.store(false, std::memory_order_release);
+                continue;
+            }
+            compilerSleeping_.store(false, std::memory_order_release);
         }
 
+        chunkScheduler.Reset();
+        uint32_t drained = 0u;
+        do {
+            ScheduledRenderEvent scheduled{};
+            if (CompileTimestampedEvent(timed, epoch, qpcFreq, sampleRate,
+                                        bufferFrames, scheduled)) {
+                const bool admitted = chunkScheduler.EnqueueBatched(scheduled);
+                assert(admitted);
+                (void)admitted;
+            }
+            ++drained;
+        } while (drained < kCompilerChunkCapacity &&
+                 midiIngress_.TryPopFair(timed, fairLaneCursor));
+
+        // Ordering is deliberately paid here, outside the callback. Chunks
+        // remain individually sorted in compiledIngress_; the audio thread
+        // only merges their natural runs with any carried future events.
+        chunkScheduler.FinalizeBatch();
         ScheduledRenderEvent scheduled{};
-        if (!CompileTimestampedEvent(timed, epoch, qpcFreq, sampleRate,
-                                     bufferFrames, scheduled)) {
-            ++producerWakeBatch;
+        while (chunkScheduler.PopBefore(INT64_MAX, scheduled)) {
+            for (;;) {
+                if (compiledIngress_.Push(scheduled)) break;
+                if (cancelProducers_.load(std::memory_order_acquire)) return;
+                const uint32_t observed =
+                    compilerWakeEpoch_.load(std::memory_order_acquire);
+                // Recheck after observing the wake epoch so a just-freed slot
+                // cannot be missed between the failed push and the wait.
+                if (compiledIngress_.Push(scheduled)) break;
+                WaitForAddressChange(compilerWakeEpoch_, observed);
+            }
+        }
+        if (drained != 0u) {
+            publishProducerSpace();
+        }
+        if (cancelProducers_.load(std::memory_order_acquire))
             continue;
-        }
-        while (!compiledIngress_.Push(scheduled)) {
-            if (cancelProducers_.load(std::memory_order_acquire)) return;
-            const uint32_t observed = compilerWakeEpoch_.load(std::memory_order_acquire);
-            WaitForAddressChange(compilerWakeEpoch_, observed);
-        }
-        if (++producerWakeBatch >= 64u) {
-            producerWakeEpoch_.fetch_add(1, std::memory_order_release);
-            WakeAddressWaiters(producerWakeEpoch_);
-            producerWakeBatch = 0u;
-        }
     }
 }
 
@@ -1393,7 +1447,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity();
     while (scannedIngress < ingressScanBudget &&
            admittedEvents < self->maxEventsPerBlock_ &&
-           self->eventScheduler_.Size() < kEventBufferCapacity) {
+           self->eventScheduler_.Size() < self->eventScheduler_.Capacity()) {
         ScheduledRenderEvent scheduled{};
         if (self->useEventCompiler_) {
             if (!self->compiledIngress_.TryPop(scheduled)) break;
@@ -1408,11 +1462,11 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             }
         }
         ++scannedIngress;
-        if (self->eventScheduler_.Size() >= kEventBufferCapacity) {
+        if (self->eventScheduler_.Size() >= self->eventScheduler_.Capacity()) {
             break;
         }
 
-        RenderEvent& ev = scheduled.event;
+        RenderEvent ev = scheduled.ToRenderEvent();
         const RenderEventType etype = ev.type;
         const uint8_t ch = ev.channel;
         const uint8_t d1 = ev.data1;
@@ -1491,13 +1545,13 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     for (uint32_t key = 0;
          key < Driver::kStaleRecoveryKeys &&
          admittedEvents < self->maxEventsPerBlock_ &&
-         self->eventScheduler_.Size() < kEventBufferCapacity;
+         self->eventScheduler_.Size() < self->eventScheduler_.Capacity();
          ++key) {
         if (!self->staleRecoveryValid_[key]) continue;
         ScheduledRenderEvent recovered;
-        recovered.event = self->staleRecoveryEvents_[key];
+        recovered.SetRenderEvent(self->staleRecoveryEvents_[key]);
         recovered.targetFrame = self->virtualRenderSample_;
-        recovered.sequence = recovered.event.ingressSequence;
+        recovered.sequence = self->staleRecoveryEvents_[key].ingressSequence;
         if (!self->eventScheduler_.EnqueueBatched(recovered)) {
             ++self->telemetry_.staleNoteOnsSkipped;
             break;
@@ -1517,13 +1571,13 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     uint32_t evCount = 0;
     uint32_t examinedCount = 0;
     const uint32_t eventBudget =
-        (std::min)(self->maxEventsPerBlock_, kEventBufferCapacity);
+        self->eventBufferCapacity_;
     ScheduledRenderEvent scheduledOut;
     while (examinedCount < eventBudget &&
            self->eventScheduler_.PopBefore(self->virtualRenderSample_ + numFrames,
                                            scheduledOut)) {
         ++examinedCount;
-        if (scheduledOut.event.type == RenderEventType::NoteOn &&
+        if (scheduledOut.type == RenderEventType::NoteOn &&
             IsObsoleteNoteOn(scheduledOut.targetFrame,
                              self->virtualRenderSample_, self->bufferFrames)) {
             ++self->telemetry_.late;
@@ -1532,8 +1586,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         }
         int64_t offset = scheduledOut.targetFrame - self->virtualRenderSample_;
         if (offset < 0) { ++self->telemetry_.late; offset = 0; }
-        scheduledOut.event.frameOffset = static_cast<uint32_t>(offset);
-        evtBuf[evCount++] = scheduledOut.event;
+        evtBuf[evCount++] = scheduledOut.ToRenderEvent(
+            static_cast<uint32_t>(offset));
         ++self->telemetry_.dispatched;
     }
     self->scheduledSizePublished_.store(self->eventScheduler_.Size(),

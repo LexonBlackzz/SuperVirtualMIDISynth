@@ -115,9 +115,51 @@ public:
                quiet_.TryPop(event);
     }
 
+    // Fair consumer-side drain. Priority affects admission/backpressure, but
+    // must not let a saturated state/note-off lane permanently starve loud
+    // note-ons. Absolute frame and ingress sequence restore semantic order
+    // after compilation, so the physical lane drain order is irrelevant.
+    bool TryPopFair(T& event, uint32_t& cursor) noexcept {
+        for (uint32_t attempt = 0u; attempt < 5u; ++attempt) {
+            const uint32_t lane = cursor++ % 5u;
+            bool popped = false;
+            switch (lane) {
+                case 0u: popped = state_.TryPop(event); break;
+                case 1u: popped = loud_.TryPop(event); break;
+                case 2u: popped = upperMedium_.TryPop(event); break;
+                case 3u: popped = medium_.TryPop(event); break;
+                default: popped = quiet_.TryPop(event); break;
+            }
+            if (popped) return true;
+        }
+        return false;
+    }
+
     uint32_t TotalSize() const noexcept {
         return state_.Size() + loud_.Size() + upperMedium_.Size() +
                medium_.Size() + quiet_.Size();
+    }
+
+    uint32_t LaneSize(EventLane lane) const noexcept {
+        switch (lane) {
+            case EventLane::State: return state_.Size();
+            case EventLane::Loud: return loud_.Size();
+            case EventLane::UpperMedium: return upperMedium_.Size();
+            case EventLane::Medium: return medium_.Size();
+            case EventLane::Quiet: return quiet_.Size();
+        }
+        return 0u;
+    }
+
+    static constexpr uint32_t LaneCapacity(EventLane lane) noexcept {
+        switch (lane) {
+            case EventLane::State: return 131072u;
+            case EventLane::Loud: return 131072u;
+            case EventLane::UpperMedium: return 65536u;
+            case EventLane::Medium: return 32768u;
+            case EventLane::Quiet: return 32768u;
+        }
+        return 1u;
     }
 
     uint32_t DrainAvailable() noexcept {

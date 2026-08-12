@@ -61,6 +61,8 @@ set(HEADERS
     SVMSPageAllocator.h
     SVMSDiagWindow.h
     SVMSMPSCQueue.h
+    SVMSEventCompile.h
+    SVMSEventScheduler.h
     SVMSFrameClock.h
 )
 
@@ -336,5 +338,11 @@ if(SVMS_BUILD_TESTS)
             SVMS_ENABLE_REFERENCE_RENDERER=1)
         target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_bench PRIVATE avrt)
+
+        add_executable(svms_v3_event_bench tests/SVMSEventPipelineBench.cpp)
+        target_compile_definitions(svms_v3_event_bench PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN)
+        target_include_directories(svms_v3_event_bench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
     endif()
 endif()
