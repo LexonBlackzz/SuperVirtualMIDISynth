@@ -170,6 +170,10 @@ larger phase containing that item is complete.
   event
 - [x] Compact scheduled commands to 16 bytes and size the scheduler/event
   working sets from the configured ring and per-block capacities
+- [x] Remove the former 393,216-event validation/allocation ceiling: the
+  compiler handoff, scheduler, and callback buffer now use the requested
+  runtime capacity up to the process address-space/allocation limit, with a
+  safe low-memory fallback when the request cannot be allocated
 - [x] Add a production-path event-pipeline benchmark covering MPSC admission,
   frame compilation, chunk ordering, SPSC handoff, callback merge, and extract
 - [x] Preserve deterministic equal-frame event ordering
@@ -183,6 +187,9 @@ larger phase containing that item is complete.
   and recover the newest still-on note per channel/key, with newer note-offs
   and termination fences winning, so extreme backlog converges to audible
   current state instead of permanent zero-voice output
+- [x] Compact only already-late note-off history into counted per-key batches,
+  preserving stereo/layer play groups and the current timeline while preventing
+  dead history from filling an entire callback and starving fresh note-ons
 - [x] Bound callback dispatch with `max_events_per_block`; excess remains
   ordered in the scheduler
 - [x] Remove the old fractional pending-event/stable-sort execution path

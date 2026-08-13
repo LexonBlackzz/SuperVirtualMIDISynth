@@ -352,14 +352,14 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     }
     if (auto it = root.find("events"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "ring_capacity", cfg.eventRingCapacity,
-                       4096u, kDefaultEventRingCapacity))
+                       4096u, kMaxConfigurableEventCapacity))
             AppendWarning(cfg.configWarning, "events.ring_capacity");
         if (!ReadValue(*it, "high_priority_velocity", cfg.highPriorityVelocity, 1u, 127u))
             AppendWarning(cfg.configWarning, "events.high_priority_velocity");
         if (!ReadValue(*it, "shed_start_percent", cfg.shedStartPercent, 1u, 99u))
             AppendWarning(cfg.configWarning, "events.shed_start_percent");
         if (!ReadValue(*it, "max_events_per_block", cfg.maxEventsPerBlock, 1u,
-                       kEventBufferCapacity))
+                       kMaxConfigurableEventCapacity))
             AppendWarning(cfg.configWarning, "events.max_events_per_block");
         if (cfg.maxEventsPerBlock > cfg.eventRingCapacity) {
             cfg.maxEventsPerBlock = cfg.eventRingCapacity;
@@ -558,7 +558,6 @@ bool EngineConfig::Validate() const {
            velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
            velocityFloor >= 0.0f && velocityFloor < 1.0f &&
            eventRingCapacity >= 4096u &&
-           eventRingCapacity <= kDefaultEventRingCapacity &&
            highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
            shedStartPercent >= 1 && shedStartPercent < 100 &&
            maxEventsPerBlock > 0 &&

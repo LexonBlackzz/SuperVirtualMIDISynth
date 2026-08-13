@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <iterator>
 #include <intrin.h>
+#include <limits>
 #include <thread>
 
 #if defined(SVMS_XP_COMPAT)
@@ -447,6 +448,8 @@ private:
 
     void HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity);
     void HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset);
+    void HandleStaleNoteOffBatch(uint8_t channel, uint8_t note, uint8_t count,
+                                 uint32_t blockOffset);
     void HandleControlChange(uint8_t channel, uint8_t controller, uint8_t value,
                              uint32_t blockOffset);
     void HandleProgramChange(uint8_t channel, uint8_t program);
@@ -459,7 +462,7 @@ private:
     void RefreshSelectedPresets();
 
     PriorityEventIngress<TimestampedMidiEvent> midiIngress_;
-    SPSCQueue<ScheduledRenderEvent, kDefaultEventRingCapacity> compiledIngress_;
+    DynamicSPSCQueue<ScheduledRenderEvent> compiledIngress_;
     EventScheduler eventScheduler_;
     EventOverflowMode overflowMode_;
     bool correctnessMode_;
@@ -546,6 +549,8 @@ private:
     RenderEvent staleRecoveryEvents_[kStaleRecoveryKeys];
     uint8_t staleRecoveryValid_[kStaleRecoveryKeys];
     uint32_t staleRecoveryNoteOffSequence_[kStaleRecoveryKeys];
+    int64_t staleRecoveryNoteOffFrame_[kStaleRecoveryKeys];
+    uint32_t staleRecoveryNoteOffCount_[kStaleRecoveryKeys];
     uint8_t staleRecoveryNoteOffValid_[kStaleRecoveryKeys];
 
     // Persistent audio-thread-only overflow queue.  Events whose
@@ -739,40 +744,66 @@ bool Driver::Initialize() {
     }
     if (!cfg.Validate()) { LOG("EngineConfig validation failed"); return false; }
 
-    engineConfig_ = cfg;
-
     overflowMode_ = cfg.eventOverflowMode;
     correctnessMode_ = cfg.correctnessMode;
     highPriorityVelocity_ = cfg.highPriorityVelocity;
     shedStartPercent_ = cfg.shedStartPercent;
-    maxEventsPerBlock_ = cfg.maxEventsPerBlock;
     diagnosticsEnabled_ = cfg.diagnosticsEnabled;
     diagnosticsWindow_ = cfg.diagnosticsEnabled && cfg.diagnosticsWindow;
     diagnosticsDebugOutput_ = cfg.diagnosticsEnabled && cfg.diagnosticsDebugOutput;
     cancelProducers_.store(false, std::memory_order_release);
     compilerSleeping_.store(false, std::memory_order_relaxed);
 
-    try {
-        eventScheduler_.ConfigureCapacity(cfg.eventRingCapacity);
-    } catch (...) {
-        LOG("FAILED: Could not allocate event scheduler capacity=%u",
-            cfg.eventRingCapacity);
-        return false;
+    auto configureEventStorage = [this](uint32_t ringCapacity,
+                                        uint32_t blockCapacity) -> bool {
+        if (!compiledIngress_.ConfigureCapacity(ringCapacity)) return false;
+        try {
+            eventScheduler_.ConfigureCapacity(ringCapacity);
+        } catch (...) {
+            return false;
+        }
+        const uint32_t actualBlockCapacity =
+            (std::min)(blockCapacity, ringCapacity);
+        if (static_cast<size_t>(actualBlockCapacity) >
+            (std::numeric_limits<size_t>::max)() / sizeof(svms::RenderEvent)) {
+            return false;
+        }
+        svms::RenderEvent* replacement =
+            static_cast<svms::RenderEvent*>(_aligned_malloc(
+                sizeof(svms::RenderEvent) *
+                    static_cast<size_t>(actualBlockCapacity),
+                64));
+        if (!replacement) return false;
+        if (eventBuffer) _aligned_free(eventBuffer);
+        eventBuffer = replacement;
+        eventBufferCapacity_ = actualBlockCapacity;
+        return true;
+    };
+
+    if (!configureEventStorage(cfg.eventRingCapacity,
+                               cfg.maxEventsPerBlock)) {
+        char warning[256]{};
+        std::snprintf(
+            warning, sizeof(warning),
+            "[SVMS] configuration warning: event capacity %u / block %u "
+            "could not be allocated; using %u / %u\n",
+            cfg.eventRingCapacity, cfg.maxEventsPerBlock,
+            kDefaultEventRingCapacity, 65536u);
+        OutputDebugStringA(warning);
+        LOG("Configuration warning: event capacity %u / block %u could not "
+            "be allocated; falling back to %u / %u",
+            cfg.eventRingCapacity, cfg.maxEventsPerBlock,
+            kDefaultEventRingCapacity, 65536u);
+        cfg.eventRingCapacity = kDefaultEventRingCapacity;
+        cfg.maxEventsPerBlock = 65536u;
+        if (!configureEventStorage(cfg.eventRingCapacity,
+                                   cfg.maxEventsPerBlock)) {
+            LOG("FAILED: Could not allocate default event storage");
+            return false;
+        }
     }
-    if (eventBuffer) {
-        _aligned_free(eventBuffer);
-        eventBuffer = nullptr;
-        eventBufferCapacity_ = 0u;
-    }
-    eventBufferCapacity_ = (std::min)(maxEventsPerBlock_, cfg.eventRingCapacity);
-    eventBuffer = static_cast<svms::RenderEvent*>(_aligned_malloc(
-        sizeof(svms::RenderEvent) * eventBufferCapacity_, 64));
-    if (!eventBuffer) {
-        LOG("FAILED: Could not allocate event buffer capacity=%u",
-            eventBufferCapacity_);
-        eventBufferCapacity_ = 0u;
-        return false;
-    }
+    maxEventsPerBlock_ = cfg.maxEventsPerBlock;
+    engineConfig_ = cfg;
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -1220,21 +1251,34 @@ void Driver::SubmitShortMsg(uint32_t msg) {
     uint32_t cutoff = currentVelocityCutoffAtomic_.load(
         std::memory_order_relaxed);
     if ((evt.sequence & 0xffu) == 0u) {
-        const uint32_t ingress =
-            midiIngress_.TotalSize() + compiledIngress_.Size();
+        const uint32_t rawIngress = midiIngress_.TotalSize();
+        const uint32_t compiledIngress = compiledIngress_.Size();
         const uint32_t scheduled =
             scheduledSizePublished_.load(std::memory_order_acquire);
-        const uint32_t ingressPressure = ingress * 100u /
-            PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity();
+        const uint32_t rawIngressPressure = static_cast<uint32_t>(
+            static_cast<uint64_t>(rawIngress) * 100u /
+            PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity());
+        const uint32_t compiledCapacity = compiledIngress_.CapacityValue();
+        const uint32_t compiledIngressPressure = compiledCapacity != 0u
+            ? static_cast<uint32_t>(
+                  static_cast<uint64_t>(compiledIngress) * 100u /
+                  compiledCapacity)
+            : 100u;
         const uint32_t laneCapacity =
             PriorityEventIngress<TimestampedMidiEvent>::LaneCapacity(lane);
-        const uint32_t lanePressure =
-            midiIngress_.LaneSize(lane) * 100u / laneCapacity;
+        const uint32_t lanePressure = static_cast<uint32_t>(
+            static_cast<uint64_t>(midiIngress_.LaneSize(lane)) * 100u /
+            laneCapacity);
         const uint32_t scheduledCapacity = eventScheduler_.Capacity();
         const uint32_t scheduledPressure = scheduledCapacity != 0u
-            ? scheduled * 100u / scheduledCapacity : 100u;
+            ? static_cast<uint32_t>(
+                  static_cast<uint64_t>(scheduled) * 100u /
+                  scheduledCapacity)
+            : 100u;
         const uint32_t pressure = (std::max)(
-            lanePressure, (std::max)(ingressPressure, scheduledPressure));
+            lanePressure,
+            (std::max)(rawIngressPressure,
+                (std::max)(compiledIngressPressure, scheduledPressure)));
         cutoff = 1u;
         if (pressure > shedStartPercent_) {
             const uint32_t range = 100u - shedStartPercent_;
@@ -1474,8 +1518,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                 sizeof(self->staleRecoveryValid_));
     std::memset(self->staleRecoveryNoteOffValid_, 0,
                 sizeof(self->staleRecoveryNoteOffValid_));
+    std::memset(self->staleRecoveryNoteOffCount_, 0,
+                sizeof(self->staleRecoveryNoteOffCount_));
     const uint32_t ingressScanBudget =
-        PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity();
+        self->eventScheduler_.Capacity();
     while (scannedIngress < ingressScanBudget &&
            admittedEvents < self->maxEventsPerBlock_ &&
            self->eventScheduler_.Size() < self->eventScheduler_.Capacity()) {
@@ -1514,12 +1560,18 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         const uint32_t recoveryKey =
             static_cast<uint32_t>(ch) * kNoteCount + d1;
         if (etype == RenderEventType::NoteOff && d1 < kNoteCount &&
-            scheduled.targetFrame <= self->virtualRenderSample_) {
+            scheduled.targetFrame < self->virtualRenderSample_) {
+            if (self->staleRecoveryNoteOffCount_[recoveryKey] <
+                kMaxPolyphony) {
+                ++self->staleRecoveryNoteOffCount_[recoveryKey];
+            }
             if (!self->staleRecoveryNoteOffValid_[recoveryKey] ||
                 !SequenceAtOrBefore(
                     sequence,
                     self->staleRecoveryNoteOffSequence_[recoveryKey])) {
                 self->staleRecoveryNoteOffSequence_[recoveryKey] = sequence;
+                self->staleRecoveryNoteOffFrame_[recoveryKey] =
+                    scheduled.targetFrame;
                 self->staleRecoveryNoteOffValid_[recoveryKey] = 1u;
             }
             if (self->staleRecoveryValid_[recoveryKey] &&
@@ -1529,6 +1581,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                 self->staleRecoveryValid_[recoveryKey] = 0u;
                 ++self->telemetry_.staleNoteOnsSkipped;
             }
+            ++self->telemetry_.staleNoteOffsCompacted;
+            continue;
         }
         if (etype == RenderEventType::NoteOn &&
             IsObsoleteNoteOn(scheduled.targetFrame, self->virtualRenderSample_,
@@ -1570,14 +1624,39 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         WakeAddressWaiters(self->compilerWakeEpoch_);
     }
 
-    // Recovered notes all become writable at this block's first frame. The
-    // scheduler's sequence tie-break restores producer order even though the
-    // compact set is walked by channel/key here.
+    // Recovered notes all become writable at this block's first frame. Late
+    // note-offs are replayed in batches of at most 255, capped by the current
+    // maximum possible voice generations. This retains note-off multiplicity
+    // without allowing millions of dead historical messages to consume the
+    // callback quota. The scheduler restores frame/sequence order even though
+    // the compact set is walked by channel/key here.
     for (uint32_t key = 0;
          key < Driver::kStaleRecoveryKeys &&
          admittedEvents < self->maxEventsPerBlock_ &&
          self->eventScheduler_.Size() < self->eventScheduler_.Capacity();
          ++key) {
+        uint32_t remainingNoteOffs =
+            self->staleRecoveryNoteOffValid_[key]
+                ? self->staleRecoveryNoteOffCount_[key]
+                : 0u;
+        while (remainingNoteOffs != 0u &&
+               admittedEvents < self->maxEventsPerBlock_ &&
+               self->eventScheduler_.Size() <
+                   self->eventScheduler_.Capacity()) {
+            const uint32_t batch = (std::min)(remainingNoteOffs, 255u);
+            ScheduledRenderEvent recoveredOff{};
+            recoveredOff.targetFrame =
+                self->staleRecoveryNoteOffFrame_[key];
+            recoveredOff.sequence =
+                self->staleRecoveryNoteOffSequence_[key];
+            recoveredOff.type = RenderEventType::StaleNoteOffBatch;
+            recoveredOff.channel = static_cast<uint8_t>(key / kNoteCount);
+            recoveredOff.data1 = static_cast<uint8_t>(key % kNoteCount);
+            recoveredOff.data2 = static_cast<uint8_t>(batch);
+            if (!self->eventScheduler_.EnqueueBatched(recoveredOff)) break;
+            remainingNoteOffs -= batch;
+            ++admittedEvents;
+        }
         if (!self->staleRecoveryValid_[key]) continue;
         ScheduledRenderEvent recovered;
         recovered.SetRenderEvent(self->staleRecoveryEvents_[key]);
@@ -1853,6 +1932,10 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
         }
         case RenderEventType::NoteOff:
             self->HandleNoteOff(event.channel, event.data1, blockCursor);
+            break;
+        case RenderEventType::StaleNoteOffBatch:
+            self->HandleStaleNoteOffBatch(event.channel, event.data1,
+                                          event.data2, blockCursor);
             break;
         case RenderEventType::ControlChange:
             self->HandleControlChange(event.channel, event.data1, event.data2,
@@ -2276,6 +2359,16 @@ void Driver::HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset) 
     const uint32_t playIndex = voiceManager->FindOldestPlayIndex(channel, note);
     if (playIndex == UINT32_MAX) return;
     voiceManager->NoteOffPlayIndex(channel, note, playIndex, sustain, blockOffset);
+}
+
+void Driver::HandleStaleNoteOffBatch(uint8_t channel, uint8_t note,
+                                     uint8_t count,
+                                     uint32_t blockOffset) {
+    if (!channelCache || !voiceManager || count == 0u) return;
+    const bool sustain = channelCache->IsSustainActive(channel);
+    channelCache->NoteOff(channel, note);
+    voiceManager->NoteOffOldestPlayIndices(channel, note, count, sustain,
+                                           blockOffset);
 }
 
 void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t value,

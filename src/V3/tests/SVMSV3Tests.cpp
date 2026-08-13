@@ -1606,6 +1606,31 @@ void TestOverlappingRetriggerGenerations() {
     Check(voices->v.heldBySustain[secondLayer] == 1 &&
               voices->FindOldestPlayIndex(0, 60) == UINT32_MAX,
           "sustain-held generation leaves the pending note-off chain");
+
+    auto batched = std::make_unique<svms::VoiceManager>();
+    batched->Initialize(8);
+    const auto oldestLeft = batched->AllocateVoice(2, 72, 100);
+    const auto oldestRight = batched->AllocateVoice(2, 72, 100);
+    const auto newest = batched->AllocateVoice(2, 72, 100);
+    const auto otherKey = batched->AllocateVoice(2, 73, 100);
+    batched->SetVoicePlayIndex(oldestLeft, 20u);
+    batched->SetVoicePlayIndex(oldestRight, 20u);
+    batched->SetVoicePlayIndex(newest, 21u);
+    batched->SetVoicePlayIndex(otherKey, 22u);
+    Check(batched->NoteOffOldestPlayIndices(2, 72, 1u, false, 19u) == 1u &&
+              batched->v.state[oldestLeft] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+              batched->v.state[oldestRight] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+              batched->v.state[newest] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active),
+          "batched stale note-off preserves stereo grouping and exact count");
+    Check(batched->NoteOffOldestPlayIndices(2, 72, 255u, false, 23u) == 1u &&
+              batched->v.state[newest] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+              batched->v.state[otherKey] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active),
+          "batched stale note-off stops at an empty key without touching others");
 }
 
 void RenderDeterministic(float* left, float* right, uint32_t frames) {
@@ -1723,6 +1748,28 @@ void TestEventRingWrapAndCapacity() {
               "wrapped event ring preserves order");
     }
     Check(queue.IsEmpty(), "event ring is empty after full wrap test");
+
+    // Configuration-controlled handoff queues are not constrained by the
+    // old 393,216-slot compile-time array.
+    constexpr uint32_t dynamicCapacity = 400003u;
+    svms::DynamicSPSCQueue<svms::TimestampedMidiEvent> dynamicQueue;
+    Check(dynamicQueue.ConfigureCapacity(dynamicCapacity) &&
+              dynamicQueue.CapacityValue() == dynamicCapacity,
+          "runtime event ring accepts a capacity above the legacy ceiling");
+    for (uint32_t i = 0u; i < dynamicCapacity; ++i) {
+        event.sequence = i;
+        Check(dynamicQueue.Push(event),
+              "runtime event ring accepts every configured slot");
+    }
+    Check(!dynamicQueue.Push(event),
+          "runtime event ring detects its configured full state");
+    for (uint32_t i = 0u; i < dynamicCapacity; ++i) {
+        svms::TimestampedMidiEvent out{};
+        Check(dynamicQueue.TryPop(out) && out.sequence == i,
+              "runtime event ring preserves sequence above legacy capacity");
+    }
+    Check(dynamicQueue.IsEmpty(),
+          "runtime event ring drains after a capacity-sized burst");
 }
 
 void TestWindowedSchedulerOrdering() {
@@ -1797,6 +1844,9 @@ void TestWindowedSchedulerOrdering() {
     merged.ConfigureCapacity(32u);
     Check(merged.Capacity() == 32u && merged.Empty(),
           "scheduler capacity can be configured before real-time use");
+    merged.ConfigureCapacity(400003u);
+    Check(merged.Capacity() == 400003u && merged.Empty(),
+          "scheduler allocation also exceeds the former fixed ceiling");
 }
 
 void TestFairPriorityLaneDrain() {
@@ -2036,6 +2086,16 @@ void TestJsonConfigurationLifecycle() {
     Check(invalidField.audioDevice == L"Playback 1/2 (E4x4 Pre)",
           "configured WASAPI endpoint friendly name is preserved");
     Check(!invalidField.configWarning.empty(), "invalid JSON field publishes warning");
+
+    {
+        std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
+        output << R"json({"schema_version":1,"events":{"ring_capacity":1048576,"max_events_per_block":700000}})json";
+    }
+    svms::EngineConfig largeEventStorage = svms::EngineConfig::Load();
+    Check(largeEventStorage.eventRingCapacity == 1048576u &&
+              largeEventStorage.maxEventsPerBlock == 700000u &&
+              largeEventStorage.Validate(),
+          "JSON accepts event storage above the former fixed ceiling");
 
     {
         std::ofstream output(configPath, std::ios::binary | std::ios::trunc);

@@ -118,6 +118,9 @@ public:
                                   uint32_t playIndex);
     void NoteOffPlayIndex(uint8_t channel, uint8_t note, uint32_t playIndex,
                           bool sustain, uint32_t blockOffset);
+    uint32_t NoteOffOldestPlayIndices(uint8_t channel, uint8_t note,
+                                      uint32_t count, bool sustain,
+                                      uint32_t blockOffset);
 
     void SetVoiceEnvelope(VoiceHandle handle, float initialGain, float sustainLevel,
                           uint32_t delaySamples, uint32_t holdSamples, uint32_t attackSamples,
@@ -2621,6 +2624,19 @@ inline void VoiceManager::ReleaseChannel(uint8_t channel, uint32_t blockOffset) 
         v.releaseStartInBlock[idx] = blockOffset;
         StartRelease(static_cast<VoiceHandle>(idx));
     });
+}
+
+inline uint32_t VoiceManager::NoteOffOldestPlayIndices(
+        uint8_t channel, uint8_t note, uint32_t count, bool sustain,
+        uint32_t blockOffset) {
+    uint32_t released = 0u;
+    while (released < count) {
+        const uint32_t playIndex = FindOldestPlayIndex(channel, note);
+        if (playIndex == UINT32_MAX) break;
+        NoteOffPlayIndex(channel, note, playIndex, sustain, blockOffset);
+        ++released;
+    }
+    return released;
 }
 
 } // namespace svms

@@ -114,6 +114,9 @@ enum class RenderEventType : uint8_t {
     AllNotesOff  = 5,
     AllSoundOff  = 6,
     Reset         = 7,
+    // Internal overload-recovery command. data2 carries a count from 1..255.
+    // It is never created for events that still have a writable exact frame.
+    StaleNoteOffBatch = 8,
 };
 
 struct RenderEvent {

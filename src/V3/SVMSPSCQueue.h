@@ -3,7 +3,11 @@
 
 #include "SVMSTypes.h"
 #include <atomic>
+#include <cstddef>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <type_traits>
 
 namespace svms {
 
@@ -133,6 +137,86 @@ private:
 
     // Storage.
     T* storage_;
+};
+
+// Runtime-sized counterpart used by configuration-controlled queues.  It is
+// configured only while the engine is stopped, then has the same allocation-
+// free SPSC hot path as the fixed-capacity queue above.  64-bit monotonic
+// cursors keep even a UINT32_MAX-sized logical capacity unambiguous.
+template <typename T>
+class DynamicSPSCQueue {
+public:
+    DynamicSPSCQueue() = default;
+    ~DynamicSPSCQueue() {
+        ::operator delete(storage_, std::align_val_t{alignof(T)});
+    }
+
+    DynamicSPSCQueue(const DynamicSPSCQueue&) = delete;
+    DynamicSPSCQueue& operator=(const DynamicSPSCQueue&) = delete;
+
+    bool ConfigureCapacity(uint32_t capacity) noexcept {
+        static_assert(std::is_trivially_copyable<T>::value,
+                      "DynamicSPSCQueue requires trivial records");
+        if (capacity == 0u ||
+            static_cast<size_t>(capacity) >
+                (std::numeric_limits<size_t>::max)() / sizeof(T)) {
+            return false;
+        }
+        T* replacement = static_cast<T*>(::operator new(
+            sizeof(T) * static_cast<size_t>(capacity),
+            std::align_val_t{alignof(T)}, std::nothrow));
+        if (!replacement) return false;
+        ::operator delete(storage_, std::align_val_t{alignof(T)});
+        storage_ = replacement;
+        capacity_ = capacity;
+        Reset();
+        return true;
+    }
+
+    bool Push(const T& event) noexcept {
+        const uint64_t head = head_.load(std::memory_order_relaxed);
+        if (head - tail_.load(std::memory_order_acquire) >= capacity_)
+            return false;
+        storage_[Index(head)] = event;
+        head_.store(head + 1u, std::memory_order_release);
+        return true;
+    }
+
+    bool TryPop(T& out) noexcept {
+        const uint64_t tail = tail_.load(std::memory_order_relaxed);
+        if (tail == head_.load(std::memory_order_acquire)) return false;
+        out = storage_[Index(tail)];
+        tail_.store(tail + 1u, std::memory_order_release);
+        return true;
+    }
+
+    bool IsEmpty() const noexcept {
+        return tail_.load(std::memory_order_acquire) ==
+               head_.load(std::memory_order_acquire);
+    }
+
+    uint32_t Size() const noexcept {
+        const uint64_t size = head_.load(std::memory_order_acquire) -
+                              tail_.load(std::memory_order_acquire);
+        return static_cast<uint32_t>(size);
+    }
+
+    uint32_t CapacityValue() const noexcept { return capacity_; }
+
+    void Reset() noexcept {
+        head_.store(0u, std::memory_order_relaxed);
+        tail_.store(0u, std::memory_order_relaxed);
+    }
+
+private:
+    size_t Index(uint64_t cursor) const noexcept {
+        return static_cast<size_t>(cursor % capacity_);
+    }
+
+    alignas(kCacheLineSize) std::atomic<uint64_t> head_{0u};
+    alignas(kCacheLineSize) std::atomic<uint64_t> tail_{0u};
+    T* storage_ = nullptr;
+    uint32_t capacity_ = 0u;
 };
 
 } // namespace svms

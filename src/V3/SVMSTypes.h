@@ -23,6 +23,10 @@ constexpr uint32_t kMixBufferAlign = 64;
 // event count, not a byte count; TimestampedMidiEvent remains compact.
 constexpr uint32_t kDefaultEventRingCapacity = 393216;
 constexpr uint32_t kEventBufferCapacity = kDefaultEventRingCapacity;
+// Configuration is intentionally not capped to a cache-size-derived value.
+// Runtime allocation and the process address space define the practical
+// ceiling (especially for 32-bit/XP builds).
+constexpr uint32_t kMaxConfigurableEventCapacity = UINT32_MAX;
 constexpr uint32_t kMaxEventsPerBlock = UINT32_MAX;
 
 constexpr uint32_t kNewbornProtectSamples = 64;
@@ -120,6 +124,7 @@ struct EventTelemetry {
     uint64_t late = 0;
     uint64_t skippedOutputFrames = 0;
     uint64_t staleNoteOnsSkipped = 0;
+    uint64_t staleNoteOffsCompacted = 0;
     uint64_t sequenceGaps = 0;
     uint64_t zeroMatchedRegions = 0;
     uint64_t noteRegionCacheHits = 0;
