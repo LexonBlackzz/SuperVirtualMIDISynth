@@ -300,6 +300,10 @@ larger phase containing that item is complete.
   512 frames, 300-voice total cycles fall about 20% and clean-run p99 falls
   from 121.8% to 100.6%, with an exact 512-victim oracle and byte-identical
   full PNC3 output
+- [x] Size the logical exact-stealing tournament to the next power of two
+  above configured polyphony while retaining fixed preallocated storage. A
+  300-voice pool now updates 9 levels instead of 12, reducing steal/index
+  cycles 5.8% and total 5.5M-NPS work 2.9%, with identical victims and audio
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the

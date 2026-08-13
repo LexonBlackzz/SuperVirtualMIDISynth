@@ -606,6 +606,8 @@ void TestCapacitySizedVoiceStorage() {
     Check(voices->v.GetCapacity() == 1000u &&
               voices->GetMaxVoices() == 1000u,
           "voice storage capacity matches max_voices");
+    Check(voices->GetStealTreeLeafBaseForTest() == 1024u,
+          "steal tournament uses the next power of two above capacity");
 
     const auto aligned64 = [](const void* pointer) {
         return (reinterpret_cast<uintptr_t>(pointer) & 63u) == 0u;
@@ -647,6 +649,8 @@ void TestCapacitySizedVoiceStorage() {
               voices->GetAllocatedBytes() > bytesAt1000 &&
               voices->GetActiveCount() == 0u,
           "voice reinitialization grows storage and resets lifecycle state");
+    Check(voices->GetStealTreeLeafBaseForTest() == svms::kMaxPolyphony,
+          "maximum voice pool retains the complete steal tournament");
 }
 
 void TestCapacitySizedRendererScratch() {
