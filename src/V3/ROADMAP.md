@@ -250,6 +250,10 @@ larger phase containing that item is complete.
   index pages, avoiding an unindexed intermediate state and redundant unlink/
   relink bookkeeping. Corrected 5.5M-NPS cost falls 1.8% at 300 voices and is
   slightly lower at 1,000 voices, with byte-identical PNC3 output
+- [x] Reuse the saturated fast path's known sustained render class while
+  applying voice fields, skipping duplicate loop and envelope classification.
+  Corrected 5.5M-NPS cost falls another 0.8% at 300 voices and 1.2% at 1,000
+  voices, with byte-identical PNC3 output
 - [x] Cache unbent phase increments and steady-state output gains; refresh only
   the affected channel on CC7/CC10/CC11/CC121
 - [x] Preserve exact BASS-like steal scores/ties with a fixed-leaf sustained

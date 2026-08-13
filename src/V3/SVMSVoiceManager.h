@@ -353,7 +353,8 @@ private:
                                  uint8_t note, uint8_t velocity);
     void ApplyVoiceConfigurationFields(
         VoiceHandle handle, const VoiceConfiguration& setup,
-        const ChannelParamsSnapshot& channelParams);
+        const ChannelParamsSnapshot& channelParams,
+        VoiceRenderClass knownClass = VoiceRenderClass::Generic);
     static VoiceRenderClass ClassifyConfiguration(
         const VoiceConfiguration& setup);
     static bool IsStableConfiguration(const VoiceConfiguration& setup);
@@ -1848,7 +1849,7 @@ inline void VoiceManager::ConfigureVoice(
 
 inline void VoiceManager::ApplyVoiceConfigurationFields(
     VoiceHandle handle, const VoiceConfiguration& setup,
-    const ChannelParamsSnapshot& cp) {
+    const ChannelParamsSnapshot& cp, VoiceRenderClass knownClass) {
 
     v.sampleStart[handle] = setup.sampleStart;
     v.sampleEnd[handle] = setup.sampleEnd;
@@ -1872,9 +1873,15 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.relLoopE[handle] = relLoopEnd;
     v.relLoopSF[handle] = static_cast<float>(relLoopStart);
     v.relLoopEF[handle] = static_cast<float>(relLoopEnd);
-    v.loopEnabled[handle] =
-        ((setup.loopMode == 1u || setup.loopMode == 3u) &&
-         setup.loopEnd > setup.loopStart + 1u) ? 1u : 0u;
+    const bool knownSustained =
+        knownClass == VoiceRenderClass::SustainedLoop ||
+        knownClass == VoiceRenderClass::SustainedOneShot;
+    v.loopEnabled[handle] = knownSustained
+        ? static_cast<uint8_t>(
+            knownClass == VoiceRenderClass::SustainedLoop)
+        : static_cast<uint8_t>(
+            (setup.loopMode == 1u || setup.loopMode == 3u) &&
+            setup.loopEnd > setup.loopStart + 1u);
 
     v.presetIndex[handle] = setup.presetIndex;
     v.regionIndex[handle] = setup.regionIndex;
@@ -1890,7 +1897,10 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.releaseSamplesRemaining[handle] = setup.releaseSamples > 0u
         ? setup.releaseSamples : UINT32_MAX;
     v.currentGain[handle] = 0.0f;
-    if (setup.delaySamples > 0u) {
+    if (knownSustained) {
+        v.envelopeStage[handle] = 3u;
+        v.currentGain[handle] = setup.initialGain;
+    } else if (setup.delaySamples > 0u) {
         v.envelopeStage[handle] = 4u;
     } else if (setup.holdSamples > 0u) {
         v.envelopeStage[handle] = 0u;
@@ -1999,7 +2009,7 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     lastLinkedPlayIndex_ = playIndex;
     lastLinkedPlayVoice_ = handle;
 
-    ApplyVoiceConfigurationFields(handle, setup, cp);
+    ApplyVoiceConfigurationFields(handle, setup, cp, desiredClass);
     if (preserveRenderIndex) {
         v.renderClass[handle] = desiredClassValue;
     } else {
