@@ -304,6 +304,10 @@ larger phase containing that item is complete.
   above configured polyphony while retaining fixed preallocated storage. A
   300-voice pool now updates 9 levels instead of 12, reducing steal/index
   cycles 5.8% and total 5.5M-NPS work 2.9%, with identical victims and audio
+- [x] Make exact tournament selection branchless and send single-voice updates
+  directly down one winner path. At 5.5M one-layer note-ons/s this reduces
+  steal/index work about 10-11% and total callback work about 5-6% at both 300
+  and 1,000 voices, with byte-identical full PNC3 output
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the

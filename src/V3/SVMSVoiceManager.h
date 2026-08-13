@@ -1212,9 +1212,9 @@ inline void VoiceManager::RefreshStealWinnerPath(VoiceHandle handle) {
     while (node > 1u) {
         const VoiceHandle sibling = static_cast<VoiceHandle>(
             stealWinnerTree_[node ^ 1u]);
-        winner = (node & 1u) != 0u
-            ? SelectStableWinner(sibling, winner)
-            : SelectStableWinner(winner, sibling);
+        // Winner keys include the unique active position, so selection is
+        // commutative. The former left/right branch did not affect ties.
+        winner = SelectStableWinner(winner, sibling);
         node >>= 1u;
         stealWinnerTree_[node] = winner;
     }
@@ -1227,6 +1227,10 @@ inline void VoiceManager::RefreshStealWinnerPaths(
     // once instead of once per physical voice.
     static constexpr uint32_t kBatchPaths = 8u;
     if (!handles || count == 0u) return;
+    if (count == 1u) {
+        RefreshStealWinnerPath(handles[0]);
+        return;
+    }
     if (count > kBatchPaths) {
         for (uint32_t i = 0u; i < count; ++i)
             RefreshStealWinnerPath(handles[i]);
