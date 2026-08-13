@@ -2099,6 +2099,16 @@ void TestJsonConfigurationLifecycle() {
 
     {
         std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
+        output << R"json({"schema_version":1,"events":{"ring_capacity":4294967295,"max_events_per_block":4294967295}})json";
+    }
+    svms::EngineConfig maximumEventStorage = svms::EngineConfig::Load();
+    Check(maximumEventStorage.eventRingCapacity == UINT32_MAX &&
+              maximumEventStorage.maxEventsPerBlock == UINT32_MAX &&
+              maximumEventStorage.Validate(),
+          "JSON event storage has no cache-size-derived ceiling");
+
+    {
+        std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
         output << "{ malformed";
     }
     svms::EngineConfig malformed = svms::EngineConfig::Load();
