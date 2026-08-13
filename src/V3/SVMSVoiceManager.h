@@ -1911,17 +1911,22 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     CaptureStealTail(handle);
     ++stealCount_;
     UnlinkChannelKey(handle);
-    UnlinkPlayGroup(handle);
     if (!preserveChannelIndex) UnlinkChannelActive(handle);
     if (!preserveRenderIndex) UnlinkRenderClass(handle);
 
-    v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
-    v.currentGain[handle] = 0.0f;
-    InitializePreparedVoice(handle, channel, note, velocity);
-    stealCandidateDeferred_[handle] = 1u;
-    // PopStealCandidate reserved this stable leaf; InitializePreparedVoice
-    // deliberately leaves the reservation byte intact.
-    stealCandidateReserved_[handle] = 2u;
+    // This atomic path has no observer between victim removal and complete
+    // configuration. Initialize only lifecycle fields that survive the
+    // transaction; the generic prepared initializer's placeholder sample,
+    // envelope, class, links, and gains would all be overwritten below.
+    v.state[handle] = static_cast<uint8_t>(VoiceState::Active);
+    v.channel[handle] = channel;
+    v.note[handle] = note;
+    v.velocity[handle] = velocity;
+    v.heldBySustain[handle] = 0u;
+    v.releaseStartInBlock[handle] = 0u;
+    v.birthFrame[handle] = currentFrame_;
+    v.stealFadeInFramesRemaining[handle] = 0u;
+    v.stealFadeInFramesTotal[handle] = 0u;
     LinkChannelKey(handle);
     if (!preserveChannelIndex) LinkChannelActive(handle);
 
@@ -1940,7 +1945,6 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
 
     // The eligibility test guarantees that the replacement remains in the
     // stable tree. Refresh its cached key and its one root path exactly once.
-    stealCandidateDeferred_[handle] = 0u;
     stealCandidateReserved_[handle] = 0u;
     stealStableCandidate_[handle] = {
         ComputeStableStealKey(handle), handle, activePosition_[handle]};

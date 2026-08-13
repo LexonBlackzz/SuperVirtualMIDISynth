@@ -309,6 +309,10 @@ larger phase containing that item is complete.
   transaction, bypassing the generic eight-layer reservation and commit loops.
   Under concurrent game load, 5.5M-NPS median callback use falls about 5% at
   300 voices and 6% at 1,000 voices with exact predecessor audio
+- [x] Initialize only the observable lifecycle fields during saturated stable-
+  mono replacement, removing placeholder voice state and redundant index work.
+  On an otherwise idle development machine, corrected 5.5M-NPS cost falls
+  2.7% at 300 voices and 2.5% at 1,000 voices, with byte-identical PNC3 output
 - [x] Size the logical exact-stealing tournament to the next power of two
   above configured polyphony while retaining fixed preallocated storage. A
   300-voice pool now updates 9 levels instead of 12, reducing steal/index
