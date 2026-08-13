@@ -320,6 +320,10 @@ struct ChannelParamsSnapshot {
     float expression;
     float panLeft;
     float panRight;
+    // Rebuilt only when this channel changes. Note launch and controller gain
+    // refresh then need one region-gain multiply per side instead of three.
+    float mixScaleLeft;
+    float mixScaleRight;
     float pitchBendCents;
     float filterCutoff;
     float filterResonance;

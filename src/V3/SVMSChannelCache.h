@@ -176,6 +176,10 @@ inline void ChannelCache::RebuildChannel(uint8_t channel,
 
     ComputePanGain(static_cast<uint8_t>(channelPan_[ch]),
                    channels_[ch].panLeft, channels_[ch].panRight, cfg);
+    channels_[ch].mixScaleLeft =
+        channels_[ch].panLeft * vol * channels_[ch].expression;
+    channels_[ch].mixScaleRight =
+        channels_[ch].panRight * vol * channels_[ch].expression;
 
     const float bend = (channelPitchBend_[ch] - 8192.0f) / 8192.0f;
     channels_[ch].pitchBendCents =

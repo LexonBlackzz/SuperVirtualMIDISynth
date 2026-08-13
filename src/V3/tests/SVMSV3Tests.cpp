@@ -750,6 +750,7 @@ void TestPriorityAwareStealingAndFadeTail() {
         svms::ChannelParamsSnapshot channel{};
         channel.volume = channel.expression = 1.0f;
         channel.panLeft = channel.panRight = 0.70710678f;
+        channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
         svms::VoiceConfiguration setup{};
         setup.sampleStart = 0u;
         setup.sampleEnd = 128u;
@@ -798,6 +799,7 @@ void TestPriorityAwareStealingAndFadeTail() {
         svms::ChannelParamsSnapshot channel{};
         channel.volume = channel.expression = 1.0f;
         channel.panLeft = channel.panRight = 0.70710678f;
+        channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
         svms::VoiceConfiguration mono{};
         mono.sampleStart = 0u;
         mono.sampleEnd = 128u;
@@ -855,6 +857,7 @@ void TestPriorityAwareStealingAndFadeTail() {
         svms::ChannelParamsSnapshot channel{};
         channel.volume = channel.expression = 1.0f;
         channel.panLeft = channel.panRight = 0.70710678f;
+        channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
         svms::VoiceConfiguration setup{};
         setup.sampleStart = 0u;
         setup.sampleEnd = 128u;
@@ -925,6 +928,7 @@ void TestPriorityAwareStealingAndFadeTail() {
         svms::ChannelParamsSnapshot channel{};
         channel.volume = channel.expression = 1.0f;
         channel.panLeft = channel.panRight = 0.70710678f;
+        channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
         svms::VoiceConfiguration setups[2]{};
         for (auto& setup : setups) {
             setup.sampleStart = 0u;

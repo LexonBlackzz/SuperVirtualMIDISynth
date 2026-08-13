@@ -1958,8 +1958,8 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
 
     v.gainLeft[handle] = setup.gainLeft;
     v.gainRight[handle] = setup.gainRight;
-    v.mixGainL[handle] = setup.gainLeft * cp.panLeft * cp.volume * cp.expression;
-    v.mixGainR[handle] = setup.gainRight * cp.panRight * cp.volume * cp.expression;
+    v.mixGainL[handle] = setup.gainLeft * cp.mixScaleLeft;
+    v.mixGainR[handle] = setup.gainRight * cp.mixScaleRight;
     v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
     v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
 }
@@ -2503,8 +2503,8 @@ inline void VoiceManager::SetVoiceGain(VoiceHandle handle, float left, float rig
 
 inline void VoiceManager::RefreshMixGain(VoiceHandle handle, const ChannelParamsSnapshot& cp) {
     if (handle >= maxVoices_) return;
-    v.mixGainL[handle] = v.gainLeft[handle]  * cp.panLeft  * cp.volume * cp.expression;
-    v.mixGainR[handle] = v.gainRight[handle] * cp.panRight * cp.volume * cp.expression;
+    v.mixGainL[handle] = v.gainLeft[handle] * cp.mixScaleLeft;
+    v.mixGainR[handle] = v.gainRight[handle] * cp.mixScaleRight;
     v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
     v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
     UpdateStealCandidate(handle);
@@ -2515,8 +2515,8 @@ inline void VoiceManager::RefreshMixGains(const ChannelParamsSnapshot* chParams)
     for (uint32_t ai = 0; ai < activeCount_; ++ai) {
         uint32_t i = activeList_[ai];
         const ChannelParamsSnapshot& cp = chParams[v.channel[i]];
-        v.mixGainL[i] = v.gainLeft[i]  * cp.panLeft  * cp.volume * cp.expression;
-        v.mixGainR[i] = v.gainRight[i] * cp.panRight * cp.volume * cp.expression;
+        v.mixGainL[i] = v.gainLeft[i] * cp.mixScaleLeft;
+        v.mixGainR[i] = v.gainRight[i] * cp.mixScaleRight;
         v.renderGainL[i] = v.currentGain[i] * v.mixGainL[i];
         v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
         if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
@@ -2543,8 +2543,8 @@ inline void VoiceManager::RefreshMixGainsForChannel(
     bool stableTreeDirty = false;
     ForEachChannelActive(channel, [&](VoiceHandle voice) {
         const uint32_t i = voice;
-        v.mixGainL[i] = v.gainLeft[i] * cp.panLeft * cp.volume * cp.expression;
-        v.mixGainR[i] = v.gainRight[i] * cp.panRight * cp.volume * cp.expression;
+        v.mixGainL[i] = v.gainLeft[i] * cp.mixScaleLeft;
+        v.mixGainR[i] = v.gainRight[i] * cp.mixScaleRight;
         v.renderGainL[i] = v.currentGain[i] * v.mixGainL[i];
         v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
         if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&

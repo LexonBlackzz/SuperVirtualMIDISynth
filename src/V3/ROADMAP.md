@@ -373,6 +373,9 @@ larger phase containing that item is complete.
   configured velocity-gain table, and cache channel pitch-bend ratios
 - [x] Rebuild only the affected channel's derived controller state at an exact
   event boundary instead of recomputing all 16 channels per controller event
+- [x] Cache each channel's pan/volume/expression mix scales during that rebuild,
+  reducing note-launch gain setup from three multiplies to one per side; the
+  1,000-voice 5.5M-note/s path gains about 1.3% with byte-identical PNC3 audio
 - [x] Batch channel-wide steal-key refreshes into one contiguous winner-tree
   rebuild so dense CC7/CC10/CC11 traffic does not thrash random tree paths
 - [x] Make channel/key unlink O(1) with intrusive previous/next positions so
