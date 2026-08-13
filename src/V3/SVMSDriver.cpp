@@ -499,6 +499,7 @@ private:
     uint64_t callbackCount_;
     CallbackTimingWindow callbackTiming_;
     uint64_t dispatchCyclesCurrent_ = 0u;
+    bool captureSf2Detail_ = false;
 
     AudioOutput* audioOutput;
     VoiceManager* voiceManager;
@@ -1646,6 +1647,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // release, CC updates) happens inside the render loop via the callback.
     const uint64_t profileScheduleEnd = profileCallback ? __rdtsc() : 0u;
     self->dispatchCyclesCurrent_ = 0u;
+    // The diagnostic UI publishes once per callback. Capture one successful
+    // voice launch for its detailed SF2 probe instead of rewriting ~20 fields
+    // for every dense note-on; lifetime counters remain exact below.
+    self->captureSf2Detail_ = self->diagnosticsEnabled_;
     render->RenderBlock(*vm, *cc, sd, self->sampleDataFrames,
                         leftBuf, rightBuf, numFrames, *snap,
                         evtBuf, evCount, self->correctnessMode_,
@@ -1968,9 +1973,7 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     velocity &= 0x7fu;
 
     ++sf2Telemetry_.noteOns;
-    sf2Telemetry_.lastChannel = channel;
-    sf2Telemetry_.lastNote = note;
-    sf2Telemetry_.lastVelocity = velocity;
+    const bool captureDetail = captureSf2Detail_;
 
     const float velGain = configuredVelocityGain_[velocity];
     if (velGain <= 0.0f) return;
@@ -1988,14 +1991,11 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         if (!ResolveChannelPreset(soundFontData, *channelCache, channel,
                                   &presetIndex)) {
             ++sf2Telemetry_.invalidPresets;
-            sf2Telemetry_.lastPreset = UINT16_MAX;
             return;
         }
         channelCache->SetSelectedPreset(channel,
                                         static_cast<uint16_t>(presetIndex));
     }
-    sf2Telemetry_.lastPreset = static_cast<uint16_t>(presetIndex);
-
     // Probe the complete launch-plan cache before doing even the cached
     // region lookup.  The former ordering resolved/copied regions and
     // revalidated every layer before discovering that the fully prepared
@@ -2228,6 +2228,12 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     }
 
     sf2Telemetry_.configuredVoices += matchCount;
+    if (!captureDetail) return;
+    captureSf2Detail_ = false;
+    sf2Telemetry_.lastChannel = channel;
+    sf2Telemetry_.lastNote = note;
+    sf2Telemetry_.lastVelocity = velocity;
+    sf2Telemetry_.lastPreset = static_cast<uint16_t>(presetIndex);
     const uint32_t last = matchCount - 1u;
     const VoiceConfiguration& lastSetup = launchSetups[last];
     const VoiceHandle lastVoice = noteLaunchHandles_[last];
