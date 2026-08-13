@@ -25,6 +25,15 @@ struct MidiStreamInfo {
     uint64_t peakEventsPerSecond = 0;
     uint64_t peakNoteOnsPerSecond = 0;
     uint64_t peakEventsAtFrame = 0;
+    uint64_t peakNoteOnsAtFrame = 0;
+    uint64_t peakExactDuplicateNoteOnsAtFrame = 0;
+    uint64_t peakKeyDuplicateNoteOnsAtFrame = 0;
+    uint64_t exactDuplicateNoteOnCount = 0;
+    uint64_t keyDuplicateNoteOnCount = 0;
+    uint64_t noteRunExactDuplicateCount = 0;
+    uint64_t peakNoteRunExactDuplicatesAtFrame = 0;
+    uint64_t adjacentExactDuplicateNoteOnCount = 0;
+    uint64_t noteOnFrameCount = 0;
     uint64_t peakEventSecond = 0;
     uint64_t peakNoteOnSecond = 0;
     uint64_t peakFrame = 0;

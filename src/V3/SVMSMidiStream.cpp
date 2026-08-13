@@ -159,7 +159,38 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
     }
     uint64_t tick = 0, frame = 0, remainder = 0, count = 0, noteOns = 0;
     uint64_t bucketSecond = UINT64_MAX, bucketEvents = 0, bucketNotes = 0;
-    uint64_t groupFrame = UINT64_MAX, groupEvents = 0;
+    uint64_t groupFrame = UINT64_MAX, groupEvents = 0, groupNotes = 0;
+    uint64_t groupExactDuplicates = 0, groupKeyDuplicates = 0;
+    uint64_t groupRunExactDuplicates = 0;
+    uint32_t groupGeneration = 0u;
+    uint32_t noteRunGeneration = 0u;
+    uint32_t previousNoteMessage = UINT32_MAX;
+    std::vector<uint32_t> exactSeen;
+    std::vector<uint32_t> keySeen;
+    std::vector<uint32_t> noteRunExactSeen;
+    const bool collectFrameRepetition = sink == nullptr;
+    if (collectFrameRepetition) {
+        exactSeen.resize(1u << 18u, 0u);
+        keySeen.resize(1u << 11u, 0u);
+        noteRunExactSeen.resize(1u << 18u, 0u);
+    }
+    auto finishFrame = [&]() {
+        if (groupFrame == UINT64_MAX) return;
+        if (groupEvents > info.peakEventsAtFrame) {
+            info.peakEventsAtFrame = groupEvents;
+            info.peakFrame = groupFrame;
+        }
+        info.peakNoteOnsAtFrame =
+            (std::max)(info.peakNoteOnsAtFrame, groupNotes);
+        info.peakExactDuplicateNoteOnsAtFrame = (std::max)(
+            info.peakExactDuplicateNoteOnsAtFrame, groupExactDuplicates);
+        info.peakKeyDuplicateNoteOnsAtFrame = (std::max)(
+            info.peakKeyDuplicateNoteOnsAtFrame, groupKeyDuplicates);
+        info.peakNoteRunExactDuplicatesAtFrame = (std::max)(
+            info.peakNoteRunExactDuplicatesAtFrame,
+            groupRunExactDuplicates);
+        if (groupNotes != 0u) ++info.noteOnFrameCount;
+    };
     uint32_t tempo = 500000, sequence = 0;
     const uint64_t denom = uint64_t(info.division) * 1000000ull;
     while (!heap.empty()) {
@@ -191,11 +222,24 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
                 bucketSecond = second; bucketEvents = 0; bucketNotes = 0;
             }
             if (frame != groupFrame) {
-                if (groupEvents > info.peakEventsAtFrame) {
-                    info.peakEventsAtFrame = groupEvents;
-                    info.peakFrame = groupFrame;
+                finishFrame();
+                groupFrame = frame;
+                groupEvents = 0;
+                groupNotes = 0;
+                groupExactDuplicates = 0;
+                groupKeyDuplicates = 0;
+                groupRunExactDuplicates = 0;
+                previousNoteMessage = UINT32_MAX;
+                if (collectFrameRepetition && ++groupGeneration == 0u) {
+                    std::fill(exactSeen.begin(), exactSeen.end(), 0u);
+                    std::fill(keySeen.begin(), keySeen.end(), 0u);
+                    groupGeneration = 1u;
                 }
-                groupFrame = frame; groupEvents = 0;
+                if (collectFrameRepetition && ++noteRunGeneration == 0u) {
+                    std::fill(noteRunExactSeen.begin(),
+                              noteRunExactSeen.end(), 0u);
+                    noteRunGeneration = 1u;
+                }
             }
             PackedMidiEvent packed{frame, sequence++, item.event.message};
             if (sink && !sink(packed, user)) return false;
@@ -204,6 +248,46 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
             if ((item.event.message & 0xf0u) == 0x90u &&
                 ((item.event.message >> 16) & 0x7fu) != 0u) {
                 ++noteOns; ++bucketNotes;
+                ++groupNotes;
+                if (collectFrameRepetition) {
+                    const uint32_t channel = item.event.message & 0x0fu;
+                    const uint32_t note =
+                        (item.event.message >> 8u) & 0x7fu;
+                    const uint32_t velocity =
+                        (item.event.message >> 16u) & 0x7fu;
+                    const uint32_t keyIdentity = (channel << 7u) | note;
+                    const uint32_t exactIdentity =
+                        (keyIdentity << 7u) | velocity;
+                    if (keySeen[keyIdentity] == groupGeneration) {
+                        ++groupKeyDuplicates;
+                        ++info.keyDuplicateNoteOnCount;
+                    } else {
+                        keySeen[keyIdentity] = groupGeneration;
+                    }
+                    if (exactSeen[exactIdentity] == groupGeneration) {
+                        ++groupExactDuplicates;
+                        ++info.exactDuplicateNoteOnCount;
+                    } else {
+                        exactSeen[exactIdentity] = groupGeneration;
+                    }
+                    if (noteRunExactSeen[exactIdentity] ==
+                        noteRunGeneration) {
+                        ++groupRunExactDuplicates;
+                        ++info.noteRunExactDuplicateCount;
+                    } else {
+                        noteRunExactSeen[exactIdentity] = noteRunGeneration;
+                    }
+                    if (previousNoteMessage == item.event.message)
+                        ++info.adjacentExactDuplicateNoteOnCount;
+                    previousNoteMessage = item.event.message;
+                }
+            } else if (collectFrameRepetition) {
+                previousNoteMessage = UINT32_MAX;
+                if (++noteRunGeneration == 0u) {
+                    std::fill(noteRunExactSeen.begin(),
+                              noteRunExactSeen.end(), 0u);
+                    noteRunGeneration = 1u;
+                }
             }
         }
         RawEvent next;
@@ -216,9 +300,7 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
     if (bucketNotes > info.peakNoteOnsPerSecond) {
         info.peakNoteOnsPerSecond = bucketNotes; info.peakNoteOnSecond = bucketSecond;
     }
-    if (groupEvents > info.peakEventsAtFrame) {
-        info.peakEventsAtFrame = groupEvents; info.peakFrame = groupFrame;
-    }
+    finishFrame();
     info.eventCount = count;
     info.noteOnCount = noteOns;
     info.totalFrames = frame;

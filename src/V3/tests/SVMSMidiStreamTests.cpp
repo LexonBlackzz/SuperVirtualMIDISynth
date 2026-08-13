@@ -19,8 +19,12 @@ bool WriteFixture(const wchar_t* path) {
         0,0xff,0x51,3,7,0xa1,0x20,
         0x83,0x60,0xff,0x51,3,3,0xd0,0x90,
         0,0xff,0x2f,0,
-        'M','T','r','k',0,0,0,17,
+        'M','T','r','k',0,0,0,31,
         0,0x90,60,100,
+        0,60,100,
+        0,0xb0,7,127,
+        0,0x90,60,100,
+        0,60,100,
         0x83,0x60,64,100,
         0x83,0x60,0x80,60,0,
         0,0xff,0x2f,0
@@ -35,14 +39,27 @@ int wmain() {
     svms::MappedMidiFile file;std::string error;if(!file.Open(path,error)){DeleteFileW(path);return 2;}
     svms::MidiStreamDecoder decoder;svms::MidiStreamInfo info{};
     if(!decoder.Scan(file,48000,info,error)){DeleteFileW(path);return 3;}
-    if(info.eventCount!=3||info.noteOnCount!=2||info.totalFrames!=36000||info.format!=1||info.tracks!=2)return 4;
-    if(info.peakEventsPerSecond!=3||info.peakNoteOnsPerSecond!=2||info.peakEventsAtFrame!=1)return 13;
+    if(info.eventCount!=7||info.noteOnCount!=5||info.totalFrames!=36000||info.format!=1||info.tracks!=2)return 4;
+    if(info.peakEventsPerSecond!=7||info.peakNoteOnsPerSecond!=5||
+       info.peakEventsAtFrame!=5||info.peakNoteOnsAtFrame!=4||
+       info.exactDuplicateNoteOnCount!=3||info.keyDuplicateNoteOnCount!=3||
+       info.peakExactDuplicateNoteOnsAtFrame!=3||
+       info.peakKeyDuplicateNoteOnsAtFrame!=3||
+       info.noteRunExactDuplicateCount!=2||
+       info.peakNoteRunExactDuplicatesAtFrame!=2||
+       info.adjacentExactDuplicateNoteOnCount!=2||info.noteOnFrameCount!=2)return 13;
     std::vector<svms::PackedMidiEvent> events;std::atomic<bool> cancel{false};
     if(!decoder.Decode(file,48000,Collect,&events,&cancel,nullptr,error))return 5;
     DeleteFileW(path);
-    if(events.size()!=3)return 6;
-    if(events[0].outputFrame!=0||events[1].outputFrame!=24000||events[2].outputFrame!=36000)return 7;
-    if(events[0].message!=0x00643c90||events[1].message!=0x00644090||events[2].message!=0x00003c80)return 8;
+    if(events.size()!=7)return 6;
+    if(events[0].outputFrame!=0||events[1].outputFrame!=0||
+       events[2].outputFrame!=0||events[3].outputFrame!=0||
+       events[4].outputFrame!=0||events[5].outputFrame!=24000||
+       events[6].outputFrame!=36000)return 7;
+    if(events[0].message!=0x00643c90||events[1].message!=0x00643c90||
+       events[2].message!=0x007f07b0||events[3].message!=0x00643c90||
+       events[4].message!=0x00643c90||events[5].message!=0x00644090||
+       events[6].message!=0x00003c80)return 8;
     svms::ParsedEventRing ring(1);if(!ring.IsValid()||ring.Capacity()!=65536)return 9;
     for(const auto& e:events)if(!ring.Push(e,cancel))return 10;
     svms::PackedMidiEvent e{};for(const auto& expected:events){if(!ring.Pop(e)||e.sequence!=expected.sequence)return 11;}
