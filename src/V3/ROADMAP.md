@@ -249,6 +249,10 @@ larger phase containing that item is complete.
 - [x] Preserve exact BASS-like steal scores/ties with a fixed-leaf sustained
   winner tree plus an exact per-frame volatile heap for changing envelopes;
   validate every selected victim against an exhaustive oracle
+- [x] Encode each stable candidate's float score and active-position tie into
+  one exact monotonic 64-bit winner key, reducing hot tournament comparisons
+  to a single integer compare; the 2,000-voice Morphine 943K-note profile
+  improves another roughly 2.5% with byte-identical full PNC3 output
 - [x] Remove the shared current-frame age term from persistent heap keys, batch
   deferred voice setup into one candidate update, and replace same-frame heap
   roots in place without changing victim selection
