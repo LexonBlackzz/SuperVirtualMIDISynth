@@ -362,6 +362,7 @@ private:
     void UnlinkPlayGroup(VoiceHandle handle);
     void LinkChannelActive(VoiceHandle handle);
     void UnlinkChannelActive(VoiceHandle handle);
+    void MoveChannelActiveInPlace(VoiceHandle handle, uint8_t newChannel);
     uint32_t AllocateChannelIndexBlock();
     void FreeChannelIndexBlock(uint32_t block);
     VoiceHandle LastChannelActive(uint8_t channel) const;
@@ -886,6 +887,63 @@ inline void VoiceManager::UnlinkChannelActive(VoiceHandle handle) {
         channelActiveTail_[channel] = previous;
         FreeChannelIndexBlock(tail);
     }
+}
+
+inline void VoiceManager::MoveChannelActiveInPlace(VoiceHandle handle,
+                                                    uint8_t newChannel) {
+    assert(handle < maxVoices_ && newChannel < kChannelCount);
+    const uint8_t oldChannel = v.channel[handle];
+    assert(oldChannel != newChannel);
+
+    // Remove from the old dense channel pages, but keep this handle live and
+    // transfer it directly into the new channel instead of publishing an
+    // unindexed intermediate state.
+    const uint32_t oldBlock = channelActiveBlock_[handle];
+    const uint32_t oldOffset = channelActiveOffset_[handle];
+    const uint32_t oldTail = channelActiveTail_[oldChannel];
+    assert(oldBlock < kChannelIndexBlockCount &&
+           oldTail < kChannelIndexBlockCount &&
+           oldOffset < channelIndexBlocks_[oldBlock].count);
+    ChannelIndexBlock& oldTailPage = channelIndexBlocks_[oldTail];
+    const uint32_t oldLastOffset = oldTailPage.count - 1u;
+    const uint32_t moved = oldTailPage.handles[oldLastOffset];
+    if (oldBlock != oldTail || oldOffset != oldLastOffset) {
+        channelIndexBlocks_[oldBlock].handles[oldOffset] = moved;
+        channelActiveBlock_[moved] = oldBlock;
+        channelActiveOffset_[moved] = static_cast<uint8_t>(oldOffset);
+    }
+    --oldTailPage.count;
+    --channelActiveCount_[oldChannel];
+    if (oldTailPage.count == 0u) {
+        const uint32_t previous = oldTailPage.previous;
+        if (previous != UINT32_MAX)
+            channelIndexBlocks_[previous].next = UINT32_MAX;
+        else
+            channelActiveHead_[oldChannel] = UINT32_MAX;
+        channelActiveTail_[oldChannel] = previous;
+        FreeChannelIndexBlock(oldTail);
+    }
+
+    v.channel[handle] = newChannel;
+    uint32_t newTail = channelActiveTail_[newChannel];
+    if (newTail == UINT32_MAX ||
+        channelIndexBlocks_[newTail].count == kChannelIndexBlockSize) {
+        const uint32_t block = AllocateChannelIndexBlock();
+        assert(block != UINT32_MAX);
+        channelIndexBlocks_[block].previous = newTail;
+        if (newTail != UINT32_MAX)
+            channelIndexBlocks_[newTail].next = block;
+        else
+            channelActiveHead_[newChannel] = block;
+        channelActiveTail_[newChannel] = block;
+        newTail = block;
+    }
+    ChannelIndexBlock& newPage = channelIndexBlocks_[newTail];
+    const uint32_t newOffset = newPage.count++;
+    newPage.handles[newOffset] = handle;
+    channelActiveBlock_[handle] = newTail;
+    channelActiveOffset_[handle] = static_cast<uint8_t>(newOffset);
+    ++channelActiveCount_[newChannel];
 }
 
 inline VoiceRenderClass VoiceManager::ClassifyVoice(VoiceHandle handle) const {
@@ -1917,7 +1975,7 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     CaptureStealTail(handle);
     ++stealCount_;
     UnlinkChannelKey(handle);
-    if (!preserveChannelIndex) UnlinkChannelActive(handle);
+    if (!preserveChannelIndex) MoveChannelActiveInPlace(handle, channel);
     if (!preserveRenderIndex) UnlinkRenderClass(handle);
 
     // This atomic path has no observer between victim removal and complete
@@ -1925,7 +1983,7 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     // transaction; the generic prepared initializer's placeholder sample,
     // envelope, class, links, and gains would all be overwritten below.
     v.state[handle] = static_cast<uint8_t>(VoiceState::Active);
-    v.channel[handle] = channel;
+    if (preserveChannelIndex) v.channel[handle] = channel;
     v.note[handle] = note;
     v.velocity[handle] = velocity;
     v.heldBySustain[handle] = 0u;
@@ -1934,7 +1992,6 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     v.stealFadeInFramesRemaining[handle] = 0u;
     v.stealFadeInFramesTotal[handle] = 0u;
     LinkChannelKey(handle);
-    if (!preserveChannelIndex) LinkChannelActive(handle);
 
     // A playIndex is unique to this MIDI note-on. The old group has already
     // been unlinked, so SetVoicePlayIndex's second unlink is unnecessary.

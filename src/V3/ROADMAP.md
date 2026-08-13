@@ -246,6 +246,10 @@ larger phase containing that item is complete.
   retain the old frame-major renderer only as the differential test oracle
 - [x] Maintain per-channel active indices for channel-local controller,
   sustain, termination, note-generation, and pitch-bend updates
+- [x] Transfer saturated stable-mono replacements directly between channel-
+  index pages, avoiding an unindexed intermediate state and redundant unlink/
+  relink bookkeeping. Corrected 5.5M-NPS cost falls 1.8% at 300 voices and is
+  slightly lower at 1,000 voices, with byte-identical PNC3 output
 - [x] Cache unbent phase increments and steady-state output gains; refresh only
   the affected channel on CC7/CC10/CC11/CC121
 - [x] Preserve exact BASS-like steal scores/ties with a fixed-leaf sustained
