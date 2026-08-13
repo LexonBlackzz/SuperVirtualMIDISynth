@@ -304,7 +304,11 @@ private:
     static constexpr uint32_t kMaxStealTreeLeafBase = kMaxPolyphony;
     StealCandidate stealStableCandidate_[kMaxPolyphony];
     alignas(64) uint64_t stealStableKey_[kMaxPolyphony];
-    uint32_t stealWinnerTree_[kMaxStealTreeLeafBase * 2u];
+    // Each node stores the complete ordered winner key. The low word encodes
+    // the unique active-list position, so the root can recover its handle
+    // without carrying handles through the tree and reloading both leaf keys
+    // at every level.
+    uint64_t stealWinnerTree_[kMaxStealTreeLeafBase * 2u];
     uint32_t stealTreeLeafBase_;
     uint32_t stealHeapCount_;
     bool stealHeapValid_;
@@ -372,8 +376,6 @@ private:
     void BuildStealTailMinHeap();
     void StealTailHeapSiftDown(uint32_t position);
     void BuildStealHeap();
-    VoiceHandle SelectStableWinner(VoiceHandle left,
-                                   VoiceHandle right) const;
     void RefreshStealWinnerPath(VoiceHandle handle);
     void RefreshStealWinnerPaths(const VoiceHandle* handles, uint32_t count);
     void RebuildStableWinnerTree();
@@ -467,7 +469,7 @@ inline VoiceManager::VoiceManager()
         renderClassBlocks_[block].next = UINT32_MAX;
     }
     std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
-    std::memset(stealWinnerTree_, 0xff, sizeof(stealWinnerTree_));
+    std::memset(stealWinnerTree_, 0, sizeof(stealWinnerTree_));
     std::memset(stealStableKey_, 0, sizeof(stealStableKey_));
     std::memset(stealVolatilePosition_, 0xff, sizeof(stealVolatilePosition_));
     std::memset(stealVolatileHeapPosition_, 0xff,
@@ -528,7 +530,7 @@ inline void VoiceManager::Reset() {
         renderClassBlocks_[block].next = UINT32_MAX;
     }
     std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
-    std::memset(stealWinnerTree_, 0xff, sizeof(stealWinnerTree_));
+    std::memset(stealWinnerTree_, 0, sizeof(stealWinnerTree_));
     std::memset(stealStableKey_, 0, sizeof(stealStableKey_));
     std::memset(stealVolatilePosition_, 0xff, sizeof(stealVolatilePosition_));
     std::memset(stealVolatileHeapPosition_, 0xff,
@@ -1013,7 +1015,7 @@ inline void VoiceManager::RefreshRenderClass(VoiceHandle handle) {
         // when no render-list migration is required.
         if (stealHeapValid_ && stealCandidateDeferred_[handle] == 0u) {
             const bool indexedStable =
-                stealWinnerTree_[stealTreeLeafBase_ + handle] == handle;
+                stealWinnerTree_[stealTreeLeafBase_ + handle] != 0u;
             if (indexedStable != IsStableStealCandidate(handle))
                 UpdateStealCandidate(handle);
         }
@@ -1208,13 +1210,6 @@ inline bool VoiceManager::HigherPriorityCandidate(const StealCandidate& a,
     return a.activePosition < b.activePosition;
 }
 
-inline VoiceHandle VoiceManager::SelectStableWinner(VoiceHandle left,
-                                                     VoiceHandle right) const {
-    if (left == kInvalidVoice) return right;
-    if (right == kInvalidVoice) return left;
-    return stealStableKey_[left] > stealStableKey_[right] ? left : right;
-}
-
 inline uint64_t VoiceManager::EncodeStableWinnerKey(
     float score, uint32_t activePosition) {
     if (score == 0.0f) score = 0.0f;
@@ -1228,13 +1223,10 @@ inline uint64_t VoiceManager::EncodeStableWinnerKey(
 
 inline void VoiceManager::RefreshStealWinnerPath(VoiceHandle handle) {
     uint32_t node = stealTreeLeafBase_ + handle;
-    VoiceHandle winner = static_cast<VoiceHandle>(stealWinnerTree_[node]);
+    uint64_t winner = stealWinnerTree_[node];
     while (node > 1u) {
-        const VoiceHandle sibling = static_cast<VoiceHandle>(
-            stealWinnerTree_[node ^ 1u]);
-        // Winner keys include the unique active position, so selection is
-        // commutative. The former left/right branch did not affect ties.
-        winner = SelectStableWinner(winner, sibling);
+        const uint64_t sibling = stealWinnerTree_[node ^ 1u];
+        winner = winner > sibling ? winner : sibling;
         node >>= 1u;
         stealWinnerTree_[node] = winner;
     }
@@ -1271,9 +1263,9 @@ inline void VoiceManager::RefreshStealWinnerPaths(
         uint32_t parentCount = 0u;
         for (uint32_t i = 0u; i < nodeCount; ++i) {
             const uint32_t node = nodes[i];
-            stealWinnerTree_[node] = SelectStableWinner(
-                static_cast<VoiceHandle>(stealWinnerTree_[node << 1u]),
-                static_cast<VoiceHandle>(stealWinnerTree_[(node << 1u) + 1u]));
+            const uint64_t left = stealWinnerTree_[node << 1u];
+            const uint64_t right = stealWinnerTree_[(node << 1u) + 1u];
+            stealWinnerTree_[node] = left > right ? left : right;
             if (node == 1u) continue;
             const uint32_t parent = node >> 1u;
             bool duplicate = false;
@@ -1286,10 +1278,11 @@ inline void VoiceManager::RefreshStealWinnerPaths(
 }
 
 inline void VoiceManager::RebuildStableWinnerTree() {
-    for (uint32_t node = stealTreeLeafBase_; node-- > 1u;)
-        stealWinnerTree_[node] = SelectStableWinner(
-            static_cast<VoiceHandle>(stealWinnerTree_[node << 1u]),
-            static_cast<VoiceHandle>(stealWinnerTree_[(node << 1u) + 1u]));
+    for (uint32_t node = stealTreeLeafBase_; node-- > 1u;) {
+        const uint64_t left = stealWinnerTree_[node << 1u];
+        const uint64_t right = stealWinnerTree_[(node << 1u) + 1u];
+        stealWinnerTree_[node] = left > right ? left : right;
+    }
 }
 
 inline void VoiceManager::BuildStealHeap() {
@@ -1298,7 +1291,7 @@ inline void VoiceManager::BuildStealHeap() {
     stealVolatileCount_ = 0u;
     stealVolatileHeapCount_ = 0u;
     stealVolatileHeapValid_ = false;
-    std::memset(stealWinnerTree_, 0xff, sizeof(stealWinnerTree_));
+    std::memset(stealWinnerTree_, 0, sizeof(stealWinnerTree_));
     std::memset(stealVolatilePosition_, 0xff, sizeof(stealVolatilePosition_));
     for (uint32_t position = 0; position < activeCount_; ++position) {
         const uint32_t handle = activeList_[position];
@@ -1308,7 +1301,8 @@ inline void VoiceManager::BuildStealHeap() {
                 ComputeStableStealKey(handle), handle, position};
             stealStableKey_[handle] = EncodeStableWinnerKey(
                 stealStableCandidate_[handle].score, position);
-            stealWinnerTree_[stealTreeLeafBase_ + handle] = handle;
+            stealWinnerTree_[stealTreeLeafBase_ + handle] =
+                stealStableKey_[handle];
         } else {
             LinkVolatileCandidate(static_cast<VoiceHandle>(handle));
         }
@@ -1330,9 +1324,13 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
     bool haveBest = false;
     bool bestIsVolatile = false;
     if (stealHeapCount_ > 0u) {
+        const uint64_t rootKey = stealWinnerTree_[1];
+        const uint32_t winnerPosition =
+            UINT32_MAX - static_cast<uint32_t>(rootKey);
+        assert(rootKey != 0u && winnerPosition < activeCount_);
         const VoiceHandle stableWinner = static_cast<VoiceHandle>(
-            stealWinnerTree_[1]);
-        assert(stableWinner != kInvalidVoice);
+            activeList_[winnerPosition]);
+        assert(stealStableKey_[stableWinner] == rootKey);
         best = stealStableCandidate_[stableWinner];
         haveBest = true;
     }
@@ -1375,7 +1373,7 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
             stealCandidateReserved_[best.handle] = 2u;
         } else {
             --stealHeapCount_;
-            stealWinnerTree_[stealTreeLeafBase_ + best.handle] = kInvalidVoice;
+            stealWinnerTree_[stealTreeLeafBase_ + best.handle] = 0u;
             RefreshStealWinnerPath(static_cast<VoiceHandle>(best.handle));
         }
     }
@@ -1394,7 +1392,7 @@ inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
         ComputeStableStealKey(handle), handle, activePosition};
     stealStableKey_[handle] = EncodeStableWinnerKey(
         stealStableCandidate_[handle].score, activePosition);
-    stealWinnerTree_[stealTreeLeafBase_ + handle] = handle;
+    stealWinnerTree_[stealTreeLeafBase_ + handle] = stealStableKey_[handle];
     RefreshStealWinnerPath(handle);
 }
 
@@ -1528,8 +1526,8 @@ inline void VoiceManager::RemoveStealCandidate(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     UnlinkVolatileCandidate(handle);
     const uint32_t leaf = stealTreeLeafBase_ + handle;
-    if (stealWinnerTree_[leaf] == kInvalidVoice) return;
-    stealWinnerTree_[leaf] = kInvalidVoice;
+    if (stealWinnerTree_[leaf] == 0u) return;
+    stealWinnerTree_[leaf] = 0u;
     assert(stealHeapCount_ > 0u);
     --stealHeapCount_;
     RefreshStealWinnerPath(handle);
@@ -1666,6 +1664,8 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
                 stealStableKey_[handle] = EncodeStableWinnerKey(
                     stealStableCandidate_[handle].score,
                     activePosition_[handle]);
+                stealWinnerTree_[stealTreeLeafBase_ + handle] =
+                    stealStableKey_[handle];
                 RefreshStealWinnerPath(handle);
             } else {
                 RemoveStealCandidate(handle);
@@ -1896,7 +1896,8 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const bool eligible = stealCandidateReserved_[handle] == 2u &&
         playGroupPrev_[handle] < 0 && playGroupNext_[handle] < 0 &&
         IsStableStealCandidate(handle) &&
-        stealWinnerTree_[stealTreeLeafBase_ + handle] == handle;
+        stealWinnerTree_[stealTreeLeafBase_ + handle] ==
+            stealStableKey_[handle];
     if (!eligible) {
         stealCandidateReserved_[handle] = 0u;
         return false;
@@ -1950,6 +1951,7 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
         ComputeStableStealKey(handle), handle, activePosition_[handle]};
     stealStableKey_[handle] = EncodeStableWinnerKey(
         stealStableCandidate_[handle].score, activePosition_[handle]);
+    stealWinnerTree_[stealTreeLeafBase_ + handle] = stealStableKey_[handle];
     RefreshStealWinnerPath(handle);
     outHandle = handle;
     return true;
@@ -2014,7 +2016,8 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         const VoiceConfiguration& setup = setups[i];
         canReserveInPlace = IsStableConfiguration(setup) &&
             IsStableStealCandidate(handle) &&
-            stealWinnerTree_[stealTreeLeafBase_ + handle] == handle;
+            stealWinnerTree_[stealTreeLeafBase_ + handle] ==
+                stealStableKey_[handle];
     }
 
     if (canReserveInPlace) {
@@ -2088,7 +2091,8 @@ inline void VoiceManager::CommitVoiceGroupConfigurations(
             stealCandidateDeferred_[handle] != 0u &&
             stealCandidateReserved_[handle] == 2u &&
             IsStableStealCandidate(handle) &&
-            stealWinnerTree_[stealTreeLeafBase_ + handle] == handle;
+            stealWinnerTree_[stealTreeLeafBase_ + handle] ==
+                stealStableKey_[handle];
     }
     if (!stillStable) {
         for (uint32_t layer = 0u; layer < count; ++layer)
@@ -2104,6 +2108,8 @@ inline void VoiceManager::CommitVoiceGroupConfigurations(
             ComputeStableStealKey(handle), handle, activePosition_[handle]};
         stealStableKey_[handle] = EncodeStableWinnerKey(
             stealStableCandidate_[handle].score, activePosition_[handle]);
+        stealWinnerTree_[stealTreeLeafBase_ + handle] =
+            stealStableKey_[handle];
     }
     RefreshStealWinnerPaths(handles, count);
 }
@@ -2373,12 +2379,14 @@ inline void VoiceManager::RefreshMixGains(const ChannelParamsSnapshot* chParams)
         v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
         if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
             IsStableStealCandidate(static_cast<VoiceHandle>(i)) &&
-            stealWinnerTree_[stealTreeLeafBase_ + i] == i) {
+            stealWinnerTree_[stealTreeLeafBase_ + i] ==
+                stealStableKey_[i]) {
             stealStableCandidate_[i] = {
                 ComputeStableStealKey(static_cast<VoiceHandle>(i)), i,
                 activePosition_[i]};
             stealStableKey_[i] = EncodeStableWinnerKey(
                 stealStableCandidate_[i].score, activePosition_[i]);
+            stealWinnerTree_[stealTreeLeafBase_ + i] = stealStableKey_[i];
             stableTreeDirty = true;
         } else {
             UpdateStealCandidate(static_cast<VoiceHandle>(i));
@@ -2400,12 +2408,14 @@ inline void VoiceManager::RefreshMixGainsForChannel(
         v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
         if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
             IsStableStealCandidate(static_cast<VoiceHandle>(i)) &&
-            stealWinnerTree_[stealTreeLeafBase_ + i] == i) {
+            stealWinnerTree_[stealTreeLeafBase_ + i] ==
+                stealStableKey_[i]) {
             stealStableCandidate_[i] = {
                 ComputeStableStealKey(static_cast<VoiceHandle>(i)), i,
                 activePosition_[i]};
             stealStableKey_[i] = EncodeStableWinnerKey(
                 stealStableCandidate_[i].score, activePosition_[i]);
+            stealWinnerTree_[stealTreeLeafBase_ + i] = stealStableKey_[i];
             stableTreeDirty = true;
         } else {
             UpdateStealCandidate(static_cast<VoiceHandle>(i));

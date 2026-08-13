@@ -321,6 +321,11 @@ larger phase containing that item is complete.
   directly down one winner path. At 5.5M one-layer note-ons/s this reduces
   steal/index work about 10-11% and total callback work about 5-6% at both 300
   and 1,000 voices, with byte-identical full PNC3 output
+- [x] Store complete ordered 64-bit winner keys in the tournament nodes, so
+  each level is one integer maximum with no indirect leaf-key loads. Corrected
+  5.5M-NPS cost falls another 6.3% at 300 voices and 7.1% at 1,000 voices;
+  the root still selects the exact active-position tie winner and PNC3 is
+  byte-identical
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the
