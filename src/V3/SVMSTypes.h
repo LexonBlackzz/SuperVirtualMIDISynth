@@ -456,24 +456,27 @@ struct alignas(64) VoiceSoA {
     // of a slot after that slot has been stolen.  They are intentionally much
     // smaller than a second complete VoiceSoA: a steal tail needs only sample
     // traversal and its instantaneous output gain, not MIDI/envelope state.
-    float stealTailPhase[kMaxPolyphony];
-    float stealTailPhaseInc[kMaxPolyphony];
-    float stealTailGain[kMaxPolyphony];
-    float stealTailMixGainL[kMaxPolyphony];
-    float stealTailMixGainR[kMaxPolyphony];
-    uint32_t stealTailSampleStart[kMaxPolyphony];
-    uint32_t stealTailRelEnd[kMaxPolyphony];
-    uint32_t stealTailRelLoopS[kMaxPolyphony];
-    uint32_t stealTailRelLoopE[kMaxPolyphony];
-    float stealTailRelLoopSF[kMaxPolyphony];
-    float stealTailRelLoopEF[kMaxPolyphony];
-    uint32_t stealTailFramesRemaining[kMaxPolyphony];
-    uint32_t stealTailFramesTotal[kMaxPolyphony];
+    // Tail slots are independent from primary voice handles and are hard-
+    // capped by kStealTailReserve. Keeping one tail record per potential voice
+    // wasted roughly 55 bytes/voice despite only 50 ever being addressable.
+    float stealTailPhase[kStealTailReserve];
+    float stealTailPhaseInc[kStealTailReserve];
+    float stealTailGain[kStealTailReserve];
+    float stealTailMixGainL[kStealTailReserve];
+    float stealTailMixGainR[kStealTailReserve];
+    uint32_t stealTailSampleStart[kStealTailReserve];
+    uint32_t stealTailRelEnd[kStealTailReserve];
+    uint32_t stealTailRelLoopS[kStealTailReserve];
+    uint32_t stealTailRelLoopE[kStealTailReserve];
+    float stealTailRelLoopSF[kStealTailReserve];
+    float stealTailRelLoopEF[kStealTailReserve];
+    uint32_t stealTailFramesRemaining[kStealTailReserve];
+    uint32_t stealTailFramesTotal[kStealTailReserve];
     uint32_t stealFadeInFramesRemaining[kMaxPolyphony];
     uint32_t stealFadeInFramesTotal[kMaxPolyphony];
-    uint8_t stealTailSampleBacked[kMaxPolyphony];
-    uint8_t stealTailLoopEnabled[kMaxPolyphony];
-    uint8_t stealTailChannel[kMaxPolyphony];
+    uint8_t stealTailSampleBacked[kStealTailReserve];
+    uint8_t stealTailLoopEnabled[kStealTailReserve];
+    uint8_t stealTailChannel[kStealTailReserve];
 };
 
 } // namespace svms

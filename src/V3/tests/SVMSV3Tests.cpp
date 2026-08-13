@@ -952,6 +952,21 @@ void TestPriorityAwareStealingAndFadeTail() {
         }
         Check(admittedLouderTail,
               "a louder outgoing victim replaces the quietest reserve tail");
+
+        float tailSamples[256];
+        std::fill(std::begin(tailSamples), std::end(tailSamples), 0.25f);
+        float tailLeft[8]{};
+        float tailRight[8]{};
+        svms::ChannelCache tailChannels;
+        svms::RuntimeConfigSnapshot tailConfig{};
+        tailConfig.masterVolume = 1.0f;
+        tailChannels.RebuildCache(tailConfig, 44100.0f);
+        svms::RenderScalar tailRenderer;
+        tailRenderer.RenderBlock(*voices, tailChannels, tailSamples, 256u,
+                                 tailLeft, tailRight, 8u, tailConfig,
+                                 nullptr, 0u, true, 0u);
+        Check(voices->GetStealTailCount() <= svms::kStealTailReserve,
+              "dense fixed tail storage renders without exceeding its reserve");
     }
 }
 

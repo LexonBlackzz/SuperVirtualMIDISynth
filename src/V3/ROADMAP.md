@@ -291,6 +291,11 @@ larger phase containing that item is complete.
   97.5% to 73.7% p99, with all 2,000 physical voices correctly grouped
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
+- [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the
+  fixed 50-tail reserve instead of maximum voice capacity; this removes about
+  271 KiB at 4,096 voices and roughly 33.5 MB from a future 500K layout while
+  improving the 2,000-voice Morphine 943K-note p99 from about 71-72% to a
+  clean-run 66-68%, with byte-identical full PNC3 output
 - [x] Cache immutable preset/note/velocity region matches in an allocation-free
   direct-mapped table, cache committed channel presets, precompute the complete
   configured velocity-gain table, and cache channel pitch-bend ratios

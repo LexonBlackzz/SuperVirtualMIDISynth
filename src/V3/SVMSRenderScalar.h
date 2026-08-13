@@ -215,7 +215,7 @@ private:
     void* dispatcherUserData_;
     const RenderKernelSet* kernelSet_;
     alignas(64) uint32_t classChanges_[kMaxPolyphony];
-    alignas(64) uint32_t tailFrameCounts_[kMaxPolyphony];
+    alignas(64) uint32_t tailFrameCounts_[kStealTailReserve];
     alignas(64) SpanRetirement retirements_[kMaxPolyphony];
 };
 
@@ -1071,13 +1071,15 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         const uint32_t tailCount = voices.GetStealTailCount();
         const uint32_t* tailHandles = voices.GetStealTailList();
         const uint32_t voiceCapacity = voices.GetMaxVoices();
+        const uint32_t tailCapacity =
+            (std::min)(voiceCapacity, kStealTailReserve);
         const bool denseTails = tailCount * 2u >= voiceCapacity;
         if (denseTails) {
             // Continuous full-pool stealing leaves nearly every slot with a
             // tail. Sequential slot traversal is cheaper and much friendlier
             // to the SoA caches than chasing the constantly shuffled sparse
             // list. Normal playback retains the sparse O(tailCount) path.
-            for (uint32_t idx = 0; idx < voiceCapacity; ++idx) {
+            for (uint32_t idx = 0; idx < tailCapacity; ++idx) {
                 if (v.stealTailFramesRemaining[idx] != 0u)
                     tailFrameCounts_[idx] = spanFrames;
             }
@@ -1145,7 +1147,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         // from primary class ordering.  Iterate backwards so O(1) swap-removal
         // of a completed tail cannot skip an unprocessed entry.
         if (denseTails) {
-            for (uint32_t idx = 0; idx < voiceCapacity; ++idx) {
+            for (uint32_t idx = 0; idx < tailCapacity; ++idx) {
                 if (v.stealTailFramesRemaining[idx] == 0u) continue;
                 RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
                                     outputLeft, outputRight, cursor,

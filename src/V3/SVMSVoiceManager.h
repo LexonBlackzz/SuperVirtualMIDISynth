@@ -238,8 +238,8 @@ private:
     // Steal tails are rendered independently from primary render classes.
     // Keeping a dense list avoids probing all active voices in every short
     // event span when the overwhelmingly common tail count is zero.
-    alignas(64) uint32_t stealTailList_[kMaxPolyphony];
-    alignas(64) uint32_t stealTailPosition_[kMaxPolyphony];
+    alignas(64) uint32_t stealTailList_[kStealTailReserve];
+    alignas(64) uint32_t stealTailPosition_[kStealTailReserve];
     uint32_t stealTailCount_;
     // Tail levels are unchanged between render boundaries. Build the exact
     // quietest-tail heap once per frame, then update only its root when a
@@ -782,7 +782,8 @@ inline void VoiceManager::RefreshRenderClass(VoiceHandle handle) {
 }
 
 inline void VoiceManager::LinkStealTail(VoiceHandle handle) {
-    if (handle >= maxVoices_ || v.stealTailFramesRemaining[handle] == 0u ||
+    if (handle >= maxVoices_ || handle >= kStealTailReserve ||
+        v.stealTailFramesRemaining[handle] == 0u ||
         stealTailPosition_[handle] < stealTailCount_) return;
     const uint32_t position = stealTailCount_++;
     stealTailList_[position] = handle;
@@ -791,7 +792,7 @@ inline void VoiceManager::LinkStealTail(VoiceHandle handle) {
 }
 
 inline void VoiceManager::UnlinkStealTail(VoiceHandle handle) {
-    if (handle >= maxVoices_) return;
+    if (handle >= maxVoices_ || handle >= kStealTailReserve) return;
     const uint32_t position = stealTailPosition_[handle];
     if (position >= stealTailCount_) return;
     const uint32_t lastPosition = --stealTailCount_;
@@ -805,7 +806,7 @@ inline void VoiceManager::UnlinkStealTail(VoiceHandle handle) {
 }
 
 inline void VoiceManager::RefreshStealTail(VoiceHandle handle) {
-    if (handle >= maxVoices_) return;
+    if (handle >= maxVoices_ || handle >= kStealTailReserve) return;
     if (v.stealTailFramesRemaining[handle] != 0u)
         LinkStealTail(handle);
     else
@@ -813,7 +814,7 @@ inline void VoiceManager::RefreshStealTail(VoiceHandle handle) {
 }
 
 inline float VoiceManager::ComputeTailLevel(uint32_t tailSlot) const {
-    if (tailSlot >= maxVoices_ ||
+    if (tailSlot >= maxVoices_ || tailSlot >= kStealTailReserve ||
         v.stealTailFramesRemaining[tailSlot] == 0u) return 0.0f;
     const uint32_t total = v.stealTailFramesTotal[tailSlot];
     const float fade = total > 1u
@@ -870,7 +871,7 @@ inline uint32_t VoiceManager::SelectStealTailSlot(float outgoingLevel) {
     const uint32_t reserveLimit = (std::min)(maxVoices_, kStealTailReserve);
     if (reserveLimit == 0u || outgoingLevel <= 0.0f) return UINT32_MAX;
     if (stealTailCount_ < reserveLimit) {
-        for (uint32_t slot = 0; slot < maxVoices_; ++slot) {
+        for (uint32_t slot = 0; slot < reserveLimit; ++slot) {
             if (v.stealTailFramesRemaining[slot] == 0u) return slot;
         }
         return UINT32_MAX;

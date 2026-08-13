@@ -626,6 +626,7 @@ int main(int argc, char** argv) {
         "{\"renderer\":\"%s\",\"backend\":\"%s\",\"workload\":\"%s\",\"launch_path\":\"%s\",\"voices\":%u,\"frames\":%u,"
         "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,"
         "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
+        "\"voice_soa_bytes\":%zu,\"voice_manager_bytes\":%zu,\"renderer_bytes\":%zu,"
         "\"voice_samples_per_second\":%.0f,"
         "\"cycles_per_voice_sample\":%.3f,\"events_per_second\":%.0f,"
         "\"steals_per_second\":%.0f,\"matched_regions\":%llu,\"max_consecutive_overruns\":%u,"
@@ -647,6 +648,8 @@ int main(int argc, char** argv) {
         soundFont ? soundFont->regionCount : 0u,
         soundFont ? soundFont->presetRegionCount[soundFontPreset] : 0u,
         options.pinCore == UINT32_MAX ? -1 : static_cast<int>(options.pinCore),
+        sizeof(svms::VoiceSoA), sizeof(svms::VoiceManager),
+        sizeof(svms::RenderScalar),
         voiceSamplesPerSecond,
         cyclesPerVoiceSample, eventsPerSecond, stealsPerSecond,
         static_cast<unsigned long long>(gMatchedRegions), maximumConsecutiveOverruns,
