@@ -237,7 +237,7 @@ inline RenderScalar::RenderScalar()
     : dispatcher_(nullptr), batchDispatcher_(nullptr), dispatcherUserData_(nullptr),
       kernelSet_(&SelectBestRenderKernelSet()), classChanges_(nullptr),
       retirements_(nullptr), scratchCapacity_(0u) {
-    const bool reserved = ReserveVoiceCapacity(kMaxPolyphony);
+    const bool reserved = ReserveVoiceCapacity(kMaxVoicesDefault);
     assert(reserved);
     (void)reserved;
 }

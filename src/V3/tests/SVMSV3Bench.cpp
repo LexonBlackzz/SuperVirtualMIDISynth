@@ -434,6 +434,10 @@ int main(int argc, char** argv) {
         return 3;
     }
     auto renderer = std::make_unique<svms::RenderScalar>();
+    if (!renderer->ReserveVoiceCapacity(options.voices)) {
+        std::fprintf(stderr, "cannot allocate renderer scratch\n");
+        return 3;
+    }
     if (!options.automaticBackend && !renderer->SetRenderBackend(options.backend)) {
         std::fprintf(stderr, "requested render backend is not supported by this CPU/build\n");
         return 3;

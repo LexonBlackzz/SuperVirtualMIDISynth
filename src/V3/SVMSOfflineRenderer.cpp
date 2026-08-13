@@ -156,7 +156,9 @@ public:
         sampleData_.resize(sf2_->sampleDataFrames);
         for (uint32_t i=0;i<sf2_->sampleDataFrames;++i) sampleData_[i]=sf2_->sampleData[i]/32768.0f;
         prepared_.resize(sf2_->regionCount);
-        if (!voices_.Initialize(maxVoices_,rate_)) { error="cannot allocate voice storage"; return false; } channels_.Reset(); channels_.SetMasterVolume(master_);
+        if (!voices_.Initialize(maxVoices_,rate_)) { error="cannot allocate voice storage"; return false; }
+        if (!renderer_.ReserveVoiceCapacity(maxVoices_)) { error="cannot allocate renderer scratch"; return false; }
+        channels_.Reset(); channels_.SetMasterVolume(master_);
         cfg_={master_,1.0f,0.0f,0,false,false,false,false,false,false,
               InterpolationMode::Linear,FilterType::None,PanLaw::ConstantPower,true};
         channels_.RebuildCache(cfg_,static_cast<float>(rate_));

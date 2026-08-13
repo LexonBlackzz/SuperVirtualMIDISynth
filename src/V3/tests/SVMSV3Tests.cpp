@@ -649,6 +649,20 @@ void TestCapacitySizedVoiceStorage() {
           "voice reinitialization grows storage and resets lifecycle state");
 }
 
+void TestCapacitySizedRendererScratch() {
+    auto renderer = std::make_unique<svms::RenderScalar>();
+    Check(renderer->GetScratchCapacity() == svms::kMaxVoicesDefault,
+          "renderer scratch defaults to configured default polyphony");
+    const size_t defaultBytes = renderer->GetAllocatedBytes();
+    Check(renderer->ReserveVoiceCapacity(svms::kMaxPolyphony) &&
+              renderer->GetScratchCapacity() == svms::kMaxPolyphony &&
+              renderer->GetAllocatedBytes() > defaultBytes,
+          "renderer scratch grows explicitly with voice capacity");
+    Check(renderer->ReserveVoiceCapacity(1000u) &&
+              renderer->GetScratchCapacity() == svms::kMaxPolyphony,
+          "renderer scratch never reallocates or shrinks in the callback path");
+}
+
 void TestPriorityAwareStealingAndFadeTail() {
     {
         auto voices = std::make_unique<svms::VoiceManager>();
@@ -2624,6 +2638,7 @@ int main() {
     TestExactReleaseDurationAcrossBlocks();
     TestReleaseGeneratorMerging();
     TestCapacitySizedVoiceStorage();
+    TestCapacitySizedRendererScratch();
     TestVoiceIdentityAndStealing();
     TestPriorityAwareStealingAndFadeTail();
     TestExactStealHeapAndVoiceIndices();

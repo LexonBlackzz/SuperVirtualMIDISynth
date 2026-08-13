@@ -86,6 +86,10 @@ still 4096 because several lifecycle and stealing indices in `VoiceManager`
 remain fixed-capacity. Those indices must also become capacity-sized or paged
 before the pool can grow toward the 500K target.
 
+The renderer's class-transition and deferred-retirement scratch arrays are
+also allocated once at initialization for configured polyphony. They never
+grow, shrink, or allocate from the audio callback.
+
 The current pool uses:
 
 - `activeList_[0..activeCount_)` for all active and releasing voices

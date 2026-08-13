@@ -315,6 +315,10 @@ larger phase containing that item is complete.
   to configured polyphony. The default 1,000-voice manager shrinks from
   1,144,512 to 607,712 bytes (46.9%), 4,096-voice rendering is unchanged, and
   full PNC3 + Morphine Piano output remains byte-identical
+- [x] Size renderer class-transition and deferred-retirement scratch to
+  configured polyphony during initialization. The default allocation shrinks
+  from 65,856 to 16,320 bytes (75.2%) without callback allocation or an audio
+  change
 - [x] Cache immutable preset/note/velocity region matches in an allocation-free
   direct-mapped table, cache committed channel presets, precompute the complete
   configured velocity-gain table, and cache channel pitch-bend ratios

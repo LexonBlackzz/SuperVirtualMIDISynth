@@ -838,6 +838,11 @@ bool Driver::Initialize() {
     channelCache = new ChannelCache();
     channelCache->SetMasterVolume(cfg.masterVolume);
     renderScalar = new RenderScalar();
+    if (!renderScalar->ReserveVoiceCapacity(cfg.maxVoices)) {
+        LOG("FAILED: Could not allocate renderer scratch maxVoices=%u",
+            cfg.maxVoices);
+        return false;
+    }
 
     // Register the EventDispatcher callback so RenderScalar can dispatch
     // MIDI events at their exact sub-sample positions during RenderBlock.
