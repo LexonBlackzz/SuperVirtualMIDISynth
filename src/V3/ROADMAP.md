@@ -266,6 +266,10 @@ larger phase containing that item is complete.
   render-class kernels shared by every backend; on the 2,000-voice Morphine
   943K-note profile this cuts transient synthesis cycles by roughly 40% while
   preserving scalar arithmetic order and exact envelope transitions
+- [x] Bypass the mutable per-sample envelope state machine when an attack or
+  decay counter cannot expire inside its 1-4-frame span; the Morphine 943K-note
+  profile drops another 14-15% of synthesis cycles and about 7.5% total work,
+  with byte-identical PNC3 output on scalar-compatible arithmetic
 - [x] Treat audio-thread-owned render-class membership as the kernel contract
   and remove the redundant full transient-class validation sweep from every
   1-4-frame span; the same Morphine profile drops another roughly 11% of

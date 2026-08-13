@@ -260,6 +260,62 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
         const float relLoopEF = v.relLoopEF[idx];
         const float loopLength = relLoopEF - relLoopSF;
 
+        if (stage == 1u && attackRemaining > FrameCount) {
+            for (uint32_t n = 0; n < FrameCount; ++n) {
+                const uint32_t baseOffset = static_cast<uint32_t>(phase);
+                uint32_t nextRel = baseOffset + 1u;
+                if (nextRel >= relLoopE) nextRel = relLoopS;
+                const float fraction = phase - static_cast<float>(baseOffset);
+                const float first = c.sampleData[sampleStart + baseOffset];
+                const float sample = first +
+                    (c.sampleData[sampleStart + nextRel] - first) * fraction;
+                gain += attackStep;
+                if (gain > targetGain) gain = targetGain;
+                const float scaled = sample * gain;
+                outL[n] += scaled * mixL;
+                outR[n] += scaled * mixR;
+                phase += phaseStep;
+                if (phase >= relLoopEF) {
+                    float overflow = phase - relLoopEF;
+                    if (overflow >= loopLength)
+                        overflow -= floorf(overflow / loopLength) * loopLength;
+                    phase = relLoopSF + overflow;
+                }
+            }
+            v.phases[idx] = phase;
+            v.currentGain[idx] = gain;
+            v.attackSamplesRemaining[idx] = attackRemaining - FrameCount;
+            continue;
+        }
+
+        if (stage == 2u && decayRemaining > FrameCount) {
+            for (uint32_t n = 0; n < FrameCount; ++n) {
+                const uint32_t baseOffset = static_cast<uint32_t>(phase);
+                uint32_t nextRel = baseOffset + 1u;
+                if (nextRel >= relLoopE) nextRel = relLoopS;
+                const float fraction = phase - static_cast<float>(baseOffset);
+                const float first = c.sampleData[sampleStart + baseOffset];
+                const float sample = first +
+                    (c.sampleData[sampleStart + nextRel] - first) * fraction;
+                gain *= decaySlope;
+                if (gain < sustainLevel) gain = sustainLevel;
+                const float scaled = sample * gain;
+                outL[n] += scaled * mixL;
+                outR[n] += scaled * mixR;
+                phase += phaseStep;
+                if (phase >= relLoopEF) {
+                    float overflow = phase - relLoopEF;
+                    if (overflow >= loopLength)
+                        overflow -= floorf(overflow / loopLength) * loopLength;
+                    phase = relLoopSF + overflow;
+                }
+            }
+            v.phases[idx] = phase;
+            v.currentGain[idx] = gain;
+            v.decaySamplesRemaining[idx] = decayRemaining - FrameCount;
+            continue;
+        }
+
         for (uint32_t n = 0; n < FrameCount; ++n) {
             uint32_t baseOffset = static_cast<uint32_t>(phase);
             if (baseOffset + 1u >= relEnd) {
