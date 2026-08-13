@@ -869,16 +869,28 @@ void TestPriorityAwareStealingAndFadeTail() {
             legacy->ConfigureVoice(first, setup, channel, false);
             transactional->ConfigureVoice(second, setup, channel, false);
         }
-        setup.playIndex = 100u;
-        const auto replacement = legacy->AllocateVoiceOrSteal(
-            0u, 67u, 127u, nullptr, true);
-        legacy->ConfigureVoice(replacement, setup, channel, true);
-        svms::VoiceHandle launched = svms::kInvalidVoice;
-        const bool launchOk = transactional->LaunchVoiceGroup(
-            0u, 67u, 127u, &setup, 1u, channel, &launched);
-        Check(launchOk && launched == replacement,
-              "transactional mono launch selects the legacy steal victim");
-        bool sameState = launchOk &&
+        bool launchOk = true;
+        bool sameVictims = true;
+        for (uint32_t iteration = 0u; iteration < 512u; ++iteration) {
+            const uint8_t note = static_cast<uint8_t>(36u + iteration % 72u);
+            const uint8_t velocity = static_cast<uint8_t>(64u + iteration % 64u);
+            setup.playIndex = 100u + iteration;
+            setup.initialGain = setup.sustainLevel =
+                0.25f + static_cast<float>(iteration % 17u) * 0.03125f;
+            const auto replacement = legacy->AllocateVoiceOrSteal(
+                0u, note, velocity, nullptr, true);
+            legacy->ConfigureVoice(replacement, setup, channel, true);
+            svms::VoiceHandle launched = svms::kInvalidVoice;
+            launchOk = transactional->LaunchVoiceGroup(
+                0u, note, velocity, &setup, 1u, channel, &launched);
+            sameVictims = sameVictims && launchOk && launched == replacement &&
+                legacy->FindStealVictimExhaustiveForTest() ==
+                    transactional->FindStealVictimExhaustiveForTest();
+            if (!launchOk || !sameVictims) break;
+        }
+        Check(launchOk && sameVictims,
+              "transactional mono replacement preserves exact victim sequence");
+        bool sameState = launchOk && sameVictims &&
             legacy->GetActiveCount() == transactional->GetActiveCount() &&
             legacy->GetStealTailCount() == transactional->GetStealTailCount();
         for (uint32_t i = 0u; sameState && i < 8u; ++i) {
@@ -892,7 +904,7 @@ void TestPriorityAwareStealingAndFadeTail() {
                           transactional->v.currentGain[i]) < 1.0e-7f;
         }
         Check(sameState,
-              "transactional mono launch preserves semantic voice state");
+              "repeated transactional mono replacement preserves voice state");
     }
 
     {

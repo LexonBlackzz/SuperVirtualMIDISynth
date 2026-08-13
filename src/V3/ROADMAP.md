@@ -295,6 +295,11 @@ larger phase containing that item is complete.
   twice, preserves stereo play groups, and enables the existing in-place group
   replacement path. The 2,000-voice Morphine 943K-note profile improves from
   97.5% to 73.7% p99, with all 2,000 physical voices correctly grouped
+- [x] Apply the exact in-place saturated replacement transaction to mono
+  SoundFonts as well as layered instruments. At 5.5M one-layer note-ons/s and
+  512 frames, 300-voice total cycles fall about 20% and clean-run p99 falls
+  from 121.8% to 100.6%, with an exact 512-victim oracle and byte-identical
+  full PNC3 output
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the

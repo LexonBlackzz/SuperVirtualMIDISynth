@@ -1811,7 +1811,7 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     const VoiceConfiguration* setups, uint32_t count,
     VoiceHandle* outHandles, bool& candidatesReservedInPlace) {
     candidatesReservedInPlace = false;
-    if (freeTop_ != 0u || count < 2u || count > maxVoices_ || !setups ||
+    if (freeTop_ != 0u || count == 0u || count > maxVoices_ || !setups ||
         !outHandles)
         return false;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
