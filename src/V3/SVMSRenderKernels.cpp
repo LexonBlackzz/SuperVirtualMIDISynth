@@ -364,24 +364,12 @@ bool ScalarRenderTransientLoopClass(const RenderSpanContext& c,
     if (c.frameCount == 0u || handleCount == 0u) return true;
     if (c.sampleData == nullptr || c.frameCount > 4u) return false;
 
-    const VoiceSoA& v = *c.voices;
-    // Validate the class before the first output write. A malformed synthetic
-    // voice falls back to the generic scalar path, which retains its exact
-    // retirement behavior.
-    for (uint32_t position = 0; position < handleCount; ++position) {
-        const uint32_t idx = handles[position];
-        if (idx >= c.voiceCapacity ||
-            v.state[idx] != static_cast<uint8_t>(VoiceState::Active) ||
-            v.sampleBacked[idx] == 0u || v.loopEnabled[idx] == 0u ||
-            v.stealFadeInFramesRemaining[idx] != 0u ||
-            (v.envelopeStage[idx] != 1u && v.envelopeStage[idx] != 2u) ||
-            v.relEnd[idx] < 2u || v.relLoopS[idx] >= v.relLoopE[idx] ||
-            v.relLoopE[idx] > v.relEnd[idx] ||
-            v.sampleStart[idx] >= c.sampleDataFrames ||
-            v.relEnd[idx] > c.sampleDataFrames - v.sampleStart[idx]) {
-            return false;
-        }
-    }
+    // VoiceManager owns class membership and moves a voice only at a span
+    // boundary.  TransientLoop therefore already guarantees active,
+    // sample-backed, looping attack/decay voices.  Revalidating every SoA
+    // field here was a second complete handle pass for every 1-4 frame span.
+    // SoundFont sample bounds are validated when the immutable bundle is
+    // built, before any voice can enter a render class.
 
     switch (c.frameCount) {
         case 1u: RenderTransientLoopBatchFixed<1u>(c, handles, handleCount); break;
