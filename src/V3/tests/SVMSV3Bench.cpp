@@ -53,6 +53,11 @@ uint64_t gStealCycles = 0u;
 uint64_t gRegionResolveCycles = 0u;
 uint64_t gLaunchPrepareCycles = 0u;
 uint64_t gMatchedRegions = 0u;
+uint64_t gBreakdownSampleCounter = 0u;
+constexpr uint32_t kBreakdownSampleInterval = 1024u;
+static_assert((kBreakdownSampleInterval &
+               (kBreakdownSampleInterval - 1u)) == 0u,
+              "breakdown sample interval must be a power of two");
 
 double Percentile(std::vector<double> values, double percentile) {
     if (values.empty()) return 0.0;
@@ -214,7 +219,8 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
                    const svms::RenderEvent* sourceEvent = nullptr,
                    uint32_t attackFrames = 0u,
                    bool transactional = false,
-                   bool copiedLaunchPlan = false) {
+                   bool copiedLaunchPlan = false,
+                   uint32_t profileScale = 0u) {
     constexpr uint32_t regionFrames = 2048;
     const uint32_t regionCount = sampleFrames / regionFrames;
     // Every physical SF2 region produced by one MIDI note belongs to one
@@ -222,7 +228,7 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
     // same atomic stereo-stealing path as the production driver.
     const uint32_t playIndex = sequence + 1u;
     if (transactional && count <= 8u) {
-        const uint64_t prepareBegin = gCollectBreakdown ? __rdtsc() : 0u;
+        const uint64_t prepareBegin = profileScale != 0u ? __rdtsc() : 0u;
         const uint8_t channel = sourceEvent ? sourceEvent->channel
             : static_cast<uint8_t>(sequence & 15u);
         const uint8_t note = sourceEvent ? sourceEvent->data1
@@ -251,8 +257,9 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
             setup.releaseDecay = 0.9999999f;
             setup.gainLeft = setup.gainRight = 0.001f;
         }
-        if (gCollectBreakdown)
-            gLaunchPrepareCycles += __rdtsc() - prepareBegin;
+        if (profileScale != 0u)
+            gLaunchPrepareCycles +=
+                (__rdtsc() - prepareBegin) * profileScale;
         sequence += count;
         if (copiedLaunchPlan) {
             svms::VoiceConfiguration copied[8]{};
@@ -318,13 +325,18 @@ struct MixedDispatchContext {
 };
 
 void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
-    const uint64_t dispatchBegin = gCollectBreakdown ? __rdtsc() : 0u;
+    const uint32_t profileScale = gCollectBreakdown &&
+        ((gBreakdownSampleCounter++ &
+          (kBreakdownSampleInterval - 1u)) == 0u)
+        ? kBreakdownSampleInterval : 0u;
+    const uint64_t dispatchBegin = profileScale != 0u ? __rdtsc() : 0u;
     auto* context = static_cast<MixedDispatchContext*>(userData);
     auto& voices = *context->voices;
     auto& channels = *context->channels;
     switch (event.type) {
         case svms::RenderEventType::NoteOn: {
-            const uint64_t resolveBegin = gCollectBreakdown ? __rdtsc() : 0u;
+            const uint64_t resolveBegin =
+                profileScale != 0u ? __rdtsc() : 0u;
             uint32_t layerCount = 1u;
             if (context->soundFont) {
                 const svms::SFSampleRegion* regions[512]{};
@@ -351,17 +363,18 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
                 gMatchedRegions += layerCount;
                 if (layerCount == 0u) break;
             }
-            if (gCollectBreakdown)
-                gRegionResolveCycles += __rdtsc() - resolveBegin;
-            if (gCollectBreakdown) {
+            if (profileScale != 0u)
+                gRegionResolveCycles +=
+                    (__rdtsc() - resolveBegin) * profileScale;
+            if (profileScale != 0u) {
                 const uint64_t begin = __rdtsc();
                 PerformSteals(voices, channels, context->sequence, layerCount,
                               context->sampleFrames, &event,
                               context->attackFrames,
                               context->transactionalLaunch,
-                              context->copiedLaunchPlan);
+                              context->copiedLaunchPlan, profileScale);
                 const uint64_t end = __rdtsc();
-                gStealCycles += end - begin;
+                gStealCycles += (end - begin) * profileScale;
                 break;
             }
             PerformSteals(voices, channels, context->sequence, layerCount,
@@ -400,9 +413,9 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
         default:
             break;
     }
-    if (gCollectBreakdown) {
+    if (profileScale != 0u) {
         const uint64_t dispatchEnd = __rdtsc();
-        gDispatchCycles += dispatchEnd - dispatchBegin;
+        gDispatchCycles += (dispatchEnd - dispatchBegin) * profileScale;
     }
 }
 
@@ -569,7 +582,8 @@ int main(int argc, char** argv) {
     auto renderOne = [&] {
         if (options.workload == Workload::Steal)
             PerformSteals(*voices, channels, stealSequence, 16u, sampleFrames,
-                          nullptr, 0u, options.transactionalLaunch);
+                          nullptr, 0u, options.transactionalLaunch, false,
+                          gCollectBreakdown ? 1u : 0u);
         std::fill(left.begin(), left.end(), 0.0f);
         std::fill(right.begin(), right.end(), 0.0f);
         const uint64_t renderBegin = gCollectBreakdown ? __rdtsc() : 0u;
@@ -596,6 +610,7 @@ int main(int argc, char** argv) {
 
     gRenderCycles = gDispatchCycles = gStealCycles = gMatchedRegions = 0u;
     gRegionResolveCycles = gLaunchPrepareCycles = 0u;
+    gBreakdownSampleCounter = 0u;
     voices->ResetGroupReuseCountersForTest();
     gCollectBreakdown = options.breakdown;
 

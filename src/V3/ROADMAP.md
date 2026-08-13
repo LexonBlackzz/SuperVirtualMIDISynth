@@ -358,6 +358,9 @@ larger phase containing that item is complete.
 - [x] Extend `svms_v3_bench` with event stride, real mixed MIDI traffic,
   cycles/voice-sample, events/s, steals/s, render-class counts, consecutive
   deadline misses, MMCSS/FTZ/DAZ parity, and optional core affinity
+- [x] Sample dense-event cycle breakdowns instead of reading the timestamp
+  counter around every event; this removes the profiler's former 2x callback
+  distortion while retaining scaled region, launch, dispatch, and steal costs
 - [x] Add full-velocity note-burst rates/key spreads and optional real-SF2
   layered-region matching to `svms_v3_bench`; characterize the supplied Krash
   corpus at 94k average and 792k peak note-ons/s
