@@ -176,11 +176,11 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
     _mm256_zeroupper();
 }
 
-void RenderSustainedLoopAVX2(const RenderSpanContext& context,
+bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                              const uint32_t* handles,
                              uint32_t handleCount) {
     VoiceSoA& v = *context.voices;
-    if (context.frameCount == 0u || context.sampleData == nullptr) return;
+    if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     if (context.frameCount > 4u) {
         for (uint32_t i = 0; i < handleCount; ++i) {
             ScalarRenderSustainedLoop(v, handles[i], context.sampleData,
@@ -188,7 +188,7 @@ void RenderSustainedLoopAVX2(const RenderSpanContext& context,
                 context.outputRight, context.frameStart, context.frameCount);
         }
         _mm256_zeroupper();
-        return;
+        return true;
     }
 
     const bool denseHandles = context.voiceCapacity >= 8u &&
@@ -323,6 +323,7 @@ void RenderSustainedLoopAVX2(const RenderSpanContext& context,
             HorizontalSum(accumulatedRight[frame]);
     }
     _mm256_zeroupper();
+    return true;
 }
 
 } // namespace
@@ -332,6 +333,8 @@ const RenderKernelSet& GetAVX2RenderKernelSet() {
         RenderKernelSet result{};
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::SustainedLoop)] =
             RenderSustainedLoopAVX2;
+        result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientLoop)] =
+            ScalarRenderTransientLoopClass;
         result.backend = RenderBackend::AVX2;
         result.name = "avx2";
         return result;

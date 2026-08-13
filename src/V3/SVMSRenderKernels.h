@@ -18,7 +18,9 @@ struct RenderSpanContext {
     uint32_t voiceCapacity;
 };
 
-using RenderClassKernel = void(*)(const RenderSpanContext& context,
+// A backend returns false without mutating state when it cannot safely consume
+// the complete class, allowing the established scalar voice path to take over.
+using RenderClassKernel = bool(*)(const RenderSpanContext& context,
                                   const uint32_t* handles,
                                   uint32_t handleCount);
 struct RenderKernelSet {
@@ -50,6 +52,10 @@ void ScalarRenderSustainedLoopShortBatch(
     VoiceSoA& voices, const uint32_t* handles, uint32_t handleCount,
     const float* sampleData, uint32_t sampleDataFrames, float* outputLeft,
     float* outputRight, uint32_t frameStart, uint32_t frameCount);
+
+bool ScalarRenderTransientLoopClass(const RenderSpanContext& context,
+                                    const uint32_t* handles,
+                                    uint32_t handleCount);
 
 } // namespace svms
 

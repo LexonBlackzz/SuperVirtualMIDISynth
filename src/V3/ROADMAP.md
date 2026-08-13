@@ -258,6 +258,10 @@ larger phase containing that item is complete.
 - [x] Keep delay/hold/attack voices in the persistent exact steal tree because
   their protected target-gain score is time-invariant; reserve per-frame
   volatile rebuilding for decay and release only
+- [x] Batch 1-4-frame looping attack/decay spans through unrolled scalar
+  render-class kernels shared by every backend; on the 2,000-voice Morphine
+  943K-note profile this cuts transient synthesis cycles by roughly 40% while
+  preserving scalar arithmetic order and exact envelope transitions
 - [x] Apply each prepared SF2 layer through one transactional voice setup and
   expose attack-frame control in the dense note-burst benchmark
 - [x] Prepare complete layered note launches before pool mutation, cache the

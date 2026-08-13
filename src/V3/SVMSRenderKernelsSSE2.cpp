@@ -13,11 +13,11 @@ float HorizontalSum(__m128 value) {
     return (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
 }
 
-void RenderSustainedLoopSSE2(const RenderSpanContext& context,
+bool RenderSustainedLoopSSE2(const RenderSpanContext& context,
                              const uint32_t* handles,
                              uint32_t handleCount) {
     VoiceSoA& v = *context.voices;
-    if (context.frameCount == 0u || context.sampleData == nullptr) return;
+    if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     // SSE2 has no gather instruction.  For 1-4 frame event spans, packing
     // four unrelated SoundFont cursors costs more than the tuned scalar
     // batch, particularly on the legacy CPUs this backend serves.  Keep the
@@ -26,7 +26,7 @@ void RenderSustainedLoopSSE2(const RenderSpanContext& context,
         ScalarRenderSustainedLoopShortBatch(v, handles, handleCount,
             context.sampleData, context.sampleDataFrames, context.outputLeft,
             context.outputRight, context.frameStart, context.frameCount);
-        return;
+        return true;
     }
     if (context.frameCount > 4u) {
         for (uint32_t i = 0; i < handleCount; ++i) {
@@ -34,7 +34,7 @@ void RenderSustainedLoopSSE2(const RenderSpanContext& context,
                 context.sampleDataFrames, context.outputLeft,
                 context.outputRight, context.frameStart, context.frameCount);
         }
-        return;
+        return true;
     }
 
     __m128 accumulatedLeft[4] = {
@@ -104,6 +104,7 @@ void RenderSustainedLoopSSE2(const RenderSpanContext& context,
         context.outputRight[context.frameStart + frame] +=
             HorizontalSum(accumulatedRight[frame]);
     }
+    return true;
 }
 
 } // namespace
@@ -113,6 +114,8 @@ const RenderKernelSet& GetSSE2RenderKernelSet() {
         RenderKernelSet result{};
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::SustainedLoop)] =
             RenderSustainedLoopSSE2;
+        result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientLoop)] =
+            ScalarRenderTransientLoopClass;
         result.backend = RenderBackend::SSE2;
         result.name = "sse2";
         return result;

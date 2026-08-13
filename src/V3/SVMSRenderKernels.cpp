@@ -210,7 +210,7 @@ void RenderSustainedLoopShortBatch(
     }
 }
 
-void RenderSustainedLoopClassKernel(const RenderSpanContext& context,
+bool RenderSustainedLoopClassKernel(const RenderSpanContext& context,
                                     const uint32_t* handles,
                                     uint32_t handleCount) {
     VoiceSoA& voices = *context.voices;
@@ -219,13 +219,98 @@ void RenderSustainedLoopClassKernel(const RenderSpanContext& context,
             voices, handles, handleCount, context.sampleData,
             context.outputLeft, context.outputRight, context.frameStart,
             context.frameCount);
-        return;
+        return true;
     }
     for (uint32_t position = 0; position < handleCount; ++position) {
         RenderSustainedLoopSpan(
             voices, handles[position], context.sampleData,
             context.sampleDataFrames, context.outputLeft, context.outputRight,
             context.frameStart, context.frameCount);
+    }
+    return true;
+}
+
+template <uint32_t FrameCount>
+void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
+                                   const uint32_t* handles,
+                                   uint32_t handleCount) {
+    VoiceSoA& v = *c.voices;
+    float* outL = c.outputLeft + c.frameStart;
+    float* outR = c.outputRight + c.frameStart;
+    for (uint32_t position = 0; position < handleCount; ++position) {
+        const uint32_t idx = handles[position];
+        float phase = (std::max)(0.0f, v.phases[idx]);
+        float gain = v.currentGain[idx];
+        uint8_t stage = v.envelopeStage[idx];
+        uint32_t attackRemaining = v.attackSamplesRemaining[idx];
+        uint32_t decayRemaining = v.decaySamplesRemaining[idx];
+        const float phaseStep = v.phaseIncs[idx];
+        const float targetGain = v.targetGain[idx];
+        const float sustainLevel = v.sustainLevel[idx];
+        const float attackStep = v.attackGainStep[idx];
+        const float decaySlope = v.decaySlope[idx];
+        const float mixL = v.mixGainL[idx];
+        const float mixR = v.mixGainR[idx];
+        const uint32_t sampleStart = v.sampleStart[idx];
+        const uint32_t relEnd = v.relEnd[idx];
+        const uint32_t relLoopS = v.relLoopS[idx];
+        const uint32_t relLoopE = v.relLoopE[idx];
+        const float relLoopSF = v.relLoopSF[idx];
+        const float relLoopEF = v.relLoopEF[idx];
+        const float loopLength = relLoopEF - relLoopSF;
+
+        for (uint32_t n = 0; n < FrameCount; ++n) {
+            uint32_t baseOffset = static_cast<uint32_t>(phase);
+            if (baseOffset + 1u >= relEnd) {
+                phase = relLoopSF;
+                baseOffset = relLoopS;
+            }
+            uint32_t nextRel = baseOffset + 1u;
+            if (nextRel >= relLoopE) nextRel = relLoopS;
+            const float fraction = phase - static_cast<float>(baseOffset);
+            const float first = c.sampleData[sampleStart + baseOffset];
+            const float sample = first +
+                (c.sampleData[sampleStart + nextRel] - first) * fraction;
+
+            if (stage == 1u) {
+                if (attackRemaining > 0u) {
+                    gain += attackStep;
+                    --attackRemaining;
+                    if (gain > targetGain) gain = targetGain;
+                } else {
+                    gain = targetGain;
+                }
+                if (attackRemaining == 0u)
+                    stage = decayRemaining > 0u ? 2u : 3u;
+            }
+            if (stage == 2u) {
+                if (decayRemaining > 0u) {
+                    gain *= decaySlope;
+                    --decayRemaining;
+                    if (gain < sustainLevel) gain = sustainLevel;
+                } else {
+                    gain = sustainLevel;
+                }
+                if (decayRemaining == 0u) stage = 3u;
+            }
+
+            const float scaled = sample * gain;
+            outL[n] += scaled * mixL;
+            outR[n] += scaled * mixR;
+            phase += phaseStep;
+            if (phase >= relLoopEF) {
+                float overflow = phase - relLoopEF;
+                if (overflow >= loopLength)
+                    overflow -= floorf(overflow / loopLength) * loopLength;
+                phase = relLoopSF + overflow;
+            }
+        }
+
+        v.phases[idx] = phase;
+        v.currentGain[idx] = gain;
+        v.envelopeStage[idx] = stage;
+        v.attackSamplesRemaining[idx] = attackRemaining;
+        v.decaySamplesRemaining[idx] = decayRemaining;
     }
 }
 
@@ -236,6 +321,8 @@ const RenderKernelSet& GetScalarRenderKernelSet() {
         RenderKernelSet result{};
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::SustainedLoop)] =
             RenderSustainedLoopClassKernel;
+        result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientLoop)] =
+            ScalarRenderTransientLoopClass;
         result.backend = RenderBackend::Scalar;
         result.name = "scalar";
         return result;
@@ -269,6 +356,41 @@ void ScalarRenderSustainedLoopShortBatch(
     RenderSustainedLoopShortBatch(
         voices, handles, handleCount, sampleData, outputLeft,
         outputRight, frameStart, frameCount);
+}
+
+bool ScalarRenderTransientLoopClass(const RenderSpanContext& c,
+                                    const uint32_t* handles,
+                                    uint32_t handleCount) {
+    if (c.frameCount == 0u || handleCount == 0u) return true;
+    if (c.sampleData == nullptr || c.frameCount > 4u) return false;
+
+    const VoiceSoA& v = *c.voices;
+    // Validate the class before the first output write. A malformed synthetic
+    // voice falls back to the generic scalar path, which retains its exact
+    // retirement behavior.
+    for (uint32_t position = 0; position < handleCount; ++position) {
+        const uint32_t idx = handles[position];
+        if (idx >= c.voiceCapacity ||
+            v.state[idx] != static_cast<uint8_t>(VoiceState::Active) ||
+            v.sampleBacked[idx] == 0u || v.loopEnabled[idx] == 0u ||
+            v.stealFadeInFramesRemaining[idx] != 0u ||
+            (v.envelopeStage[idx] != 1u && v.envelopeStage[idx] != 2u) ||
+            v.relEnd[idx] < 2u || v.relLoopS[idx] >= v.relLoopE[idx] ||
+            v.relLoopE[idx] > v.relEnd[idx] ||
+            v.sampleStart[idx] >= c.sampleDataFrames ||
+            v.relEnd[idx] > c.sampleDataFrames - v.sampleStart[idx]) {
+            return false;
+        }
+    }
+
+    switch (c.frameCount) {
+        case 1u: RenderTransientLoopBatchFixed<1u>(c, handles, handleCount); break;
+        case 2u: RenderTransientLoopBatchFixed<2u>(c, handles, handleCount); break;
+        case 3u: RenderTransientLoopBatchFixed<3u>(c, handles, handleCount); break;
+        case 4u: RenderTransientLoopBatchFixed<4u>(c, handles, handleCount); break;
+        default: return false;
+    }
+    return true;
 }
 
 } // namespace svms
