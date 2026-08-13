@@ -280,6 +280,11 @@ larger phase containing that item is complete.
 - [x] Prepare complete layered note launches before pool mutation, cache the
   common eight-layer launch plans by SoundFont/preset/pitch/note/velocity, and
   retain an explicit legacy-versus-transactional benchmark control
+- [x] Reserve distinct exact victims for every layer in a saturated fallback
+  transaction; this prevents a deferred winner-tree leaf from being selected
+  twice, preserves stereo play groups, and enables the existing in-place group
+  replacement path. The 2,000-voice Morphine 943K-note profile improves from
+  97.5% to 73.7% p99, with all 2,000 physical voices correctly grouped
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Cache immutable preset/note/velocity region matches in an allocation-free

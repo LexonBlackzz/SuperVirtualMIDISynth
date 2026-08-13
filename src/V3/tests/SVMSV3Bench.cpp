@@ -563,6 +563,7 @@ int main(int argc, char** argv) {
 
     gRenderCycles = gDispatchCycles = gStealCycles = gMatchedRegions = 0u;
     gRegionResolveCycles = gLaunchPrepareCycles = 0u;
+    voices->ResetGroupReuseCountersForTest();
     gCollectBreakdown = options.breakdown;
 
     std::vector<double> callbackPercent;
@@ -616,6 +617,10 @@ int main(int argc, char** argv) {
         classCounts[classIndex] = voices->GetRenderClassCount(
             static_cast<svms::VoiceRenderClass>(classIndex));
     }
+    uint32_t groupedVoices = 0u;
+    for (uint32_t position = 0u; position < voices->GetActiveCount(); ++position)
+        groupedVoices += voices->GetPlayGroupSizeForTest(
+            static_cast<svms::VoiceHandle>(voices->activeList_[position])) > 1u;
 
     std::printf(
         "{\"renderer\":\"%s\",\"backend\":\"%s\",\"workload\":\"%s\",\"launch_path\":\"%s\",\"voices\":%u,\"frames\":%u,"
@@ -626,6 +631,8 @@ int main(int argc, char** argv) {
         "\"steals_per_second\":%.0f,\"matched_regions\":%llu,\"max_consecutive_overruns\":%u,"
         "\"cycle_breakdown\":{\"total\":%llu,\"synthesis\":%llu,\"event_dispatch\":%llu,"
         "\"region_resolution\":%llu,\"launch_preparation\":%llu,\"index_and_steal\":%llu},"
+        "\"group_reuse\":{\"attempts\":%llu,\"matches\":%llu,\"reserved\":%llu,"
+        "\"smaller\":%llu,\"larger\":%llu,\"grouped_voices\":%u},"
         "\"render_classes\":{\"sustained_loop\":%u,\"sustained_one_shot\":%u,"
         "\"transient_loop\":%u,\"release_loop\":%u,\"release_one_shot\":%u,"
         "\"generic\":%u,\"steal_tails\":%u},"
@@ -652,6 +659,12 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(gLaunchPrepareCycles),
         static_cast<unsigned long long>(gStealCycles -
             (std::min)(gStealCycles, gLaunchPrepareCycles)),
+        static_cast<unsigned long long>(voices->GetGroupReuseAttemptCountForTest()),
+        static_cast<unsigned long long>(voices->GetGroupReuseMatchCountForTest()),
+        static_cast<unsigned long long>(voices->GetGroupReuseReservedCountForTest()),
+        static_cast<unsigned long long>(voices->GetGroupReuseSmallerCountForTest()),
+        static_cast<unsigned long long>(voices->GetGroupReuseLargerCountForTest()),
+        groupedVoices,
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedLoop)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedOneShot)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::TransientLoop)],

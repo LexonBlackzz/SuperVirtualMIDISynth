@@ -630,6 +630,67 @@ void TestPriorityAwareStealingAndFadeTail() {
     }
 
     {
+        // A layered transactional launch starting from singleton victims must
+        // reserve two distinct slots. Keeping the first winner-tree leaf live
+        // allowed the second layer to steal the same deferred handle again,
+        // overwriting one stereo side and collapsing its play group.
+        auto voices = std::make_unique<svms::VoiceManager>();
+        auto oracle = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(4u, 44100u);
+        oracle->Initialize(4u, 44100u);
+        svms::ChannelParamsSnapshot channel{};
+        channel.volume = channel.expression = 1.0f;
+        channel.panLeft = channel.panRight = 0.70710678f;
+        svms::VoiceConfiguration mono{};
+        mono.sampleStart = 0u;
+        mono.sampleEnd = 128u;
+        mono.loopStart = 8u;
+        mono.loopEnd = 120u;
+        mono.loopMode = 1u;
+        mono.phaseStep = mono.basePhaseStep = 1.0f;
+        mono.initialGain = mono.sustainLevel = 1.0f;
+        mono.gainLeft = mono.gainRight = 0.1f;
+        for (uint32_t i = 0u; i < 4u; ++i) {
+            mono.playIndex = i + 1u;
+            const auto handle = voices->AllocateVoice(0u, 60u, 100u);
+            voices->ConfigureVoice(handle, mono, channel, false);
+            const auto oracleHandle = oracle->AllocateVoice(0u, 60u, 100u);
+            oracle->ConfigureVoice(oracleHandle, mono, channel, false);
+        }
+        svms::VoiceConfiguration stereo[2] = {mono, mono};
+        stereo[0].playIndex = stereo[1].playIndex = 100u;
+        svms::VoiceHandle handles[2]{};
+        Check(voices->LaunchVoiceGroup(0u, 67u, 127u, stereo, 2u,
+                                      channel, handles),
+              "layered launch succeeds from singleton victims");
+        svms::VoiceHandle oracleHandles[2]{};
+        for (uint32_t layer = 0u; layer < 2u; ++layer) {
+            oracleHandles[layer] = oracle->AllocateVoiceOrSteal(
+                0u, 67u, 127u, nullptr, true, false);
+        }
+        for (uint32_t layer = 0u; layer < 2u; ++layer) {
+            oracle->ConfigureVoice(oracleHandles[layer], stereo[layer],
+                                   channel, true);
+        }
+        Check(handles[0] != handles[1] &&
+                  voices->GetPlayGroupSizeForTest(handles[0]) == 2u &&
+                  voices->GetPlayGroupSizeForTest(handles[1]) == 2u,
+              "layered fallback reserves distinct slots and links both sides");
+        bool matchesOracle = handles[0] == oracleHandles[0] &&
+            handles[1] == oracleHandles[1] &&
+            voices->FindStealVictimExhaustiveForTest() ==
+                oracle->FindStealVictimExhaustiveForTest();
+        for (uint32_t handle = 0u; handle < 4u && matchesOracle; ++handle) {
+            matchesOracle = voices->v.state[handle] == oracle->v.state[handle] &&
+                voices->v.playIndex[handle] == oracle->v.playIndex[handle] &&
+                voices->v.note[handle] == oracle->v.note[handle] &&
+                voices->v.renderClass[handle] == oracle->v.renderClass[handle];
+        }
+        Check(matchesOracle,
+              "layered fallback matches explicit distinct-slot steal oracle");
+    }
+
+    {
         auto legacy = std::make_unique<svms::VoiceManager>();
         auto transactional = std::make_unique<svms::VoiceManager>();
         legacy->Initialize(8u, 44100u);
@@ -715,6 +776,9 @@ void TestPriorityAwareStealingAndFadeTail() {
                 transactional->ConfigureVoice(b, setups[layer], channel, false);
             }
         }
+        Check(transactional->GetPlayGroupSizeForTest(6u) == 2u &&
+                  transactional->GetPlayGroupSizeForTest(7u) == 2u,
+              "transactional fixture starts with intact stereo play groups");
 
         bool equivalent = true;
         for (uint32_t iteration = 0u; iteration < 64u && equivalent;
@@ -740,6 +804,13 @@ void TestPriorityAwareStealingAndFadeTail() {
             svms::VoiceHandle transactionHandles[2]{};
             const bool launched = transactional->LaunchVoiceGroup(
                 0u, note, 127u, setups, 2u, channel, transactionHandles);
+            if (launched) {
+                Check(transactional->GetPlayGroupSizeForTest(
+                          transactionHandles[0]) == 2u &&
+                          transactional->GetPlayGroupSizeForTest(
+                          transactionHandles[1]) == 2u,
+                      "transactional launch keeps replacement stereo group linked");
+            }
             equivalent = launched && legacyHandles[0] == expected &&
                 transactionHandles[0] == expected &&
                 legacy->GetActiveCount() == transactional->GetActiveCount() &&

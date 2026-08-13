@@ -67,7 +67,8 @@ public:
     // fade itself; `outStolen` is retained for diagnostics/tests.
     VoiceHandle AllocateVoiceOrSteal(uint8_t channel, uint8_t note, uint8_t velocity,
                                      bool* outStolen = nullptr,
-                                     bool deferCandidate = false);
+                                     bool deferCandidate = false,
+                                     bool reserveCandidateInPlace = true);
     // Complete a deferred note-on setup with one exact steal-index update.
     // This avoids repeatedly removing/reinserting the same newborn while its
     // sample, envelope and gains are filled in sequentially.
@@ -148,6 +149,44 @@ public:
     VoiceHandle FindStealVictimExhaustiveForTest() const;
     uint64_t GetStealHeapBuildCountForTest() const {
         return stealHeapBuildCount_;
+    }
+    uint64_t GetGroupReuseAttemptCountForTest() const {
+        return groupReuseAttemptCount_;
+    }
+    uint64_t GetGroupReuseMatchCountForTest() const {
+        return groupReuseMatchCount_;
+    }
+    uint64_t GetGroupReuseReservedCountForTest() const {
+        return groupReuseReservedCount_;
+    }
+    uint64_t GetGroupReuseSmallerCountForTest() const {
+        return groupReuseSmallerCount_;
+    }
+    uint64_t GetGroupReuseLargerCountForTest() const {
+        return groupReuseLargerCount_;
+    }
+    uint32_t GetPlayGroupSizeForTest(VoiceHandle handle) const {
+        if (handle >= maxVoices_ ||
+            v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) return 0u;
+        uint32_t count = 1u;
+        int32_t linked = playGroupPrev_[handle];
+        while (linked >= 0) {
+            ++count;
+            linked = playGroupPrev_[static_cast<uint32_t>(linked)];
+        }
+        linked = playGroupNext_[handle];
+        while (linked >= 0) {
+            ++count;
+            linked = playGroupNext_[static_cast<uint32_t>(linked)];
+        }
+        return count;
+    }
+    void ResetGroupReuseCountersForTest() {
+        groupReuseAttemptCount_ = 0u;
+        groupReuseMatchCount_ = 0u;
+        groupReuseReservedCount_ = 0u;
+        groupReuseSmallerCount_ = 0u;
+        groupReuseLargerCount_ = 0u;
     }
 #endif
 
@@ -234,6 +273,13 @@ private:
     // and active position do not change, so CommitVoiceConfiguration can
     // update the key in place instead of remove + insert heap traversals.
     uint8_t stealCandidateReserved_[kMaxPolyphony];
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    uint64_t groupReuseAttemptCount_ = 0u;
+    uint64_t groupReuseMatchCount_ = 0u;
+    uint64_t groupReuseReservedCount_ = 0u;
+    uint64_t groupReuseSmallerCount_ = 0u;
+    uint64_t groupReuseLargerCount_ = 0u;
+#endif
 
     // Per-key tracking for EndVoicesForChannelKey
     int32_t channelKeyVoiceHead_[kChannelCount][kNoteCount];
@@ -1243,7 +1289,8 @@ inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, ui
 inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t note,
                                                         uint8_t velocity,
                                                         bool* outStolen,
-                                                        bool deferCandidate) {
+                                                        bool deferCandidate,
+                                                        bool reserveCandidateInPlace) {
     VoiceHandle vh = kInvalidVoice;
     if (deferCandidate && freeTop_ != 0u) {
         const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
@@ -1266,7 +1313,8 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
 
     // Pool is full — find the lowest-priority voice to steal.
     uint32_t bestPos = 0;
-    const VoiceHandle bestHandle = PopStealCandidate(bestPos, deferCandidate);
+    const VoiceHandle bestHandle = PopStealCandidate(
+        bestPos, deferCandidate && reserveCandidateInPlace);
     if (bestHandle == kInvalidVoice) return kInvalidVoice;
     const uint32_t bestIdx = bestHandle;
 
@@ -1526,6 +1574,9 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     if (freeTop_ != 0u || count < 2u || count > maxVoices_ || !setups ||
         !outHandles)
         return false;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    ++groupReuseAttemptCount_;
+#endif
 
     uint32_t selectedPosition = 0u;
     // Keep the selected leaf present until we know whether the complete
@@ -1554,12 +1605,19 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     }
 
     if (groupCount != count || tooMany) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (tooMany || groupCount > count) ++groupReuseLargerCount_;
+        else ++groupReuseSmallerCount_;
+#endif
         // The caller needs a different number of slots. Restore the exact
         // candidate and use the general allocation path, which may retire a
         // larger/smaller physical group according to the existing policy.
         stealCandidateReserved_[selected] = 0u;
         return false;
     }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    ++groupReuseMatchCount_;
+#endif
 
     bool canReserveInPlace = count <= 8u;
     for (uint32_t i = 0u; i < count && canReserveInPlace; ++i) {
@@ -1576,6 +1634,9 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     }
 
     if (canReserveInPlace) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        ++groupReuseReservedCount_;
+#endif
         // The old and new voices occupy the same leaves. Preserve the leaves
         // while lifecycle/sample state is rewritten, then refresh their
         // cached scores and the union of both paths once at commit.
@@ -1688,7 +1749,7 @@ inline bool VoiceManager::LaunchVoiceGroup(
         uint32_t allocated = 0u;
         for (; allocated < count; ++allocated) {
             outHandles[allocated] = AllocateVoiceOrSteal(
-                channel, note, velocity, nullptr, true);
+                channel, note, velocity, nullptr, true, false);
             if (outHandles[allocated] == kInvalidVoice) {
                 for (uint32_t rollback = 0u; rollback < allocated; ++rollback)
                     RetireVoice(outHandles[rollback]);
