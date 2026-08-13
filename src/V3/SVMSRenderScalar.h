@@ -8,6 +8,8 @@
 #include "SVMSPageAllocator.h"
 #include "SVMSRenderKernels.h"
 #include <algorithm>
+#include <cstdlib>
+#include <malloc.h>
 #include "SVMSSoundFont.h"
 
 namespace svms {
@@ -172,6 +174,17 @@ struct SpanRetirement {
 class RenderScalar {
 public:
     RenderScalar();
+    ~RenderScalar();
+    RenderScalar(const RenderScalar&) = delete;
+    RenderScalar& operator=(const RenderScalar&) = delete;
+
+    bool ReserveVoiceCapacity(uint32_t voiceCapacity);
+    uint32_t GetScratchCapacity() const { return scratchCapacity_; }
+    size_t GetAllocatedBytes() const {
+        return sizeof(*this) +
+            static_cast<size_t>(scratchCapacity_) *
+                (sizeof(uint32_t) + sizeof(SpanRetirement));
+    }
 
     void RenderBlock(VoiceManager& voices, const ChannelCache& channels,
                      const float* sampleData, uint32_t sampleDataFrames,
@@ -214,14 +227,47 @@ private:
     EventBatchDispatcher batchDispatcher_;
     void* dispatcherUserData_;
     const RenderKernelSet* kernelSet_;
-    alignas(64) uint32_t classChanges_[kMaxPolyphony];
+    uint32_t* classChanges_;
     alignas(64) uint32_t tailFrameCounts_[kStealTailReserve];
-    alignas(64) SpanRetirement retirements_[kMaxPolyphony];
+    SpanRetirement* retirements_;
+    uint32_t scratchCapacity_;
 };
 
 inline RenderScalar::RenderScalar()
     : dispatcher_(nullptr), batchDispatcher_(nullptr), dispatcherUserData_(nullptr),
-      kernelSet_(&SelectBestRenderKernelSet()) {}
+      kernelSet_(&SelectBestRenderKernelSet()), classChanges_(nullptr),
+      retirements_(nullptr), scratchCapacity_(0u) {
+    const bool reserved = ReserveVoiceCapacity(kMaxPolyphony);
+    assert(reserved);
+    (void)reserved;
+}
+
+inline RenderScalar::~RenderScalar() {
+    _aligned_free(classChanges_);
+    _aligned_free(retirements_);
+}
+
+inline bool RenderScalar::ReserveVoiceCapacity(uint32_t voiceCapacity) {
+    if (voiceCapacity <= scratchCapacity_) return true;
+    if (voiceCapacity == 0u || voiceCapacity > kMaxPolyphony) return false;
+    uint32_t* classChanges = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(voiceCapacity) * sizeof(uint32_t),
+        kMixBufferAlign));
+    SpanRetirement* retirements = static_cast<SpanRetirement*>(_aligned_malloc(
+        static_cast<size_t>(voiceCapacity) * sizeof(SpanRetirement),
+        kMixBufferAlign));
+    if (!classChanges || !retirements) {
+        _aligned_free(classChanges);
+        _aligned_free(retirements);
+        return false;
+    }
+    _aligned_free(classChanges_);
+    _aligned_free(retirements_);
+    classChanges_ = classChanges;
+    retirements_ = retirements;
+    scratchCapacity_ = voiceCapacity;
+    return true;
+}
 
 inline bool RenderScalar::SetRenderBackend(RenderBackend backend) {
     const RenderKernelSet* selected = SelectRenderKernelSet(backend);
@@ -263,6 +309,8 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                                         const RenderEvent* events, uint32_t eventCount,
                                         bool correctnessMode,
                                         uint64_t blockStartFrame) {
+    if (voices.GetMaxVoices() > scratchCapacity_ || !classChanges_ ||
+        !retirements_) return;
     (void)cfg;
     (void)channels;
     VoiceSoA& v = voices.v;
@@ -1025,6 +1073,8 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       const RenderEvent* events, uint32_t eventCount,
                                       bool correctnessMode,
                                       uint64_t blockStartFrame) {
+    if (voices.GetMaxVoices() > scratchCapacity_ || !classChanges_ ||
+        !retirements_) return;
     (void)cfg;
     (void)channels;
     VoiceSoA& v = voices.v;

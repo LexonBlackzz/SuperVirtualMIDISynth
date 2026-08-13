@@ -648,7 +648,7 @@ int main(int argc, char** argv) {
         soundFont ? soundFont->presetRegionCount[soundFontPreset] : 0u,
         options.pinCore == UINT32_MAX ? -1 : static_cast<int>(options.pinCore),
         sizeof(svms::VoiceSoA), sizeof(svms::VoiceManager),
-        sizeof(svms::RenderScalar),
+        renderer->GetAllocatedBytes(),
         voiceSamplesPerSecond,
         cyclesPerVoiceSample, eventsPerSecond, stealsPerSecond,
         static_cast<unsigned long long>(gMatchedRegions), maximumConsecutiveOverruns,
