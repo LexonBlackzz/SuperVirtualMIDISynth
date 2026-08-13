@@ -326,6 +326,10 @@ larger phase containing that item is complete.
   5.5M-NPS cost falls another 6.3% at 300 voices and 7.1% at 1,000 voices;
   the root still selects the exact active-position tie winner and PNC3 is
   byte-identical
+- [x] Decode the exact stable score and active position directly from the
+  tournament root, removing the redundant stable-candidate array. This trims
+  VoiceManager by 48 KiB and reduces corrected 5.5M-NPS cost another 2% at
+  both 300 and 1,000 voices with byte-identical PNC3 output
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the
