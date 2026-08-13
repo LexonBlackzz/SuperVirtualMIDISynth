@@ -878,15 +878,17 @@ void TestPriorityAwareStealingAndFadeTail() {
         for (uint32_t iteration = 0u; iteration < 512u; ++iteration) {
             const uint8_t note = static_cast<uint8_t>(36u + iteration % 72u);
             const uint8_t velocity = static_cast<uint8_t>(64u + iteration % 64u);
-            setup.playIndex = 100u + iteration;
+            const uint32_t playIndex = 100u + iteration;
             setup.initialGain = setup.sustainLevel =
                 0.25f + static_cast<float>(iteration % 17u) * 0.03125f;
+            svms::VoiceConfiguration copiedSetup = setup;
+            copiedSetup.playIndex = playIndex;
             const auto replacement = legacy->AllocateVoiceOrSteal(
                 0u, note, velocity, nullptr, true);
-            legacy->ConfigureVoice(replacement, setup, channel, true);
+            legacy->ConfigureVoice(replacement, copiedSetup, channel, true);
             svms::VoiceHandle launched = svms::kInvalidVoice;
             launchOk = transactional->LaunchVoiceGroup(
-                0u, note, velocity, &setup, 1u, channel, &launched);
+                0u, note, velocity, &setup, 1u, playIndex, channel, &launched);
             sameVictims = sameVictims && launchOk && launched == replacement &&
                 legacy->FindStealVictimExhaustiveForTest() ==
                     transactional->FindStealVictimExhaustiveForTest();

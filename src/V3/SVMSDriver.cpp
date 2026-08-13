@@ -2061,21 +2061,17 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         nextPlayIndex_ = 1;
     const uint32_t playIndex = nextPlayIndex_++;
 
-    float sr = (float)(sampleRate > 0 ? sampleRate : 44100u);
-    const float pitchBendSemitones = channelCache->GetPitchBendSemitones(channel);
+    const float sr = static_cast<float>(
+        sampleRate > 0 ? sampleRate : 44100u);
+    const float pitchBendSemitones =
+        channelCache->GetPitchBendSemitones(channel);
     const float commonBendRatio = channelPitchBendRatio_[channel];
-
+    const VoiceConfiguration* launchSetups = noteLaunchScratch_;
     if (launchCacheHit) {
-        for (uint32_t layer = 0u; layer < matchCount; ++layer) {
-            noteLaunchScratch_[layer] = launchCache.setup[layer];
-            noteLaunchScratch_[layer].playIndex = playIndex;
-            const uint32_t regionIndex = noteLaunchScratch_[layer].regionIndex;
-            if (regionIndex >= soundFontData->regionCount) {
-                ++sf2Telemetry_.invalidRegions;
-                return;
-            }
-            noteRegionScratch_[layer] = &soundFontData->regions[regionIndex];
-        }
+        // The cached setup is immutable. playIndex is the only per-note field;
+        // pass it separately instead of copying every layer into scratch just
+        // to patch four bytes at multi-million-note rates.
+        launchSetups = launchCache.setup;
     } else for (uint32_t mi = 0; mi < matchCount; ++mi) {
         const SFSampleRegion* matchedRegion = noteRegionScratch_[mi];
         const uint32_t matchedRegionIndex = static_cast<uint32_t>(
@@ -2190,7 +2186,6 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         setup.sampleEnd = sEnd;
         setup.loopStart = sLoopStart;
         setup.loopEnd = sLoopEnd;
-        setup.playIndex = playIndex;
         setup.delaySamples = delaySamples;
         setup.holdSamples = holdSamples;
         setup.attackSamples = attackSamples;
@@ -2226,7 +2221,7 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     }
 
     if (!voiceManager->LaunchVoiceGroup(
-            channel, note, velocity, noteLaunchScratch_, matchCount,
+            channel, note, velocity, launchSetups, matchCount, playIndex,
             channelCache->GetParams()[channel], noteLaunchHandles_)) {
         ++telemetry_.allocationFailures;
         return;
@@ -2234,9 +2229,10 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
 
     sf2Telemetry_.configuredVoices += matchCount;
     const uint32_t last = matchCount - 1u;
-    const VoiceConfiguration& lastSetup = noteLaunchScratch_[last];
+    const VoiceConfiguration& lastSetup = launchSetups[last];
     const VoiceHandle lastVoice = noteLaunchHandles_[last];
-    const SFSampleRegion* lastRegion = noteRegionScratch_[last];
+    const SFSampleRegion* lastRegion =
+        &soundFontData->regions[lastSetup.regionIndex];
     sf2Telemetry_.lastRegion = lastSetup.regionIndex;
     sf2Telemetry_.lastSample = static_cast<uint16_t>(lastRegion->sampleIndex);
     sf2Telemetry_.lastSampleStart = lastSetup.sampleStart;

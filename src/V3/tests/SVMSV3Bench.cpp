@@ -71,6 +71,7 @@ struct Options {
     bool reference = false;
     bool breakdown = false;
     bool transactionalLaunch = true;
+    bool copiedLaunchPlan = false;
     uint32_t eventStride = 1;
     uint32_t noteRate = 64000;
     uint32_t keyCount = 128;
@@ -148,6 +149,15 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                 options.transactionalLaunch = false;
             else
                 return false;
+        } else if (std::strcmp(argv[i], "--launch-plan") == 0) {
+            if (i + 1 >= argc) return false;
+            const char* plan = argv[++i];
+            if (std::strcmp(plan, "direct") == 0)
+                options.copiedLaunchPlan = false;
+            else if (std::strcmp(plan, "copy") == 0)
+                options.copiedLaunchPlan = true;
+            else
+                return false;
         } else if (std::strcmp(argv[i], "--quick") == 0) {
             options.seconds = 1;
             options.warmupSeconds = 1;
@@ -203,7 +213,8 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
                    uint32_t& sequence, uint32_t count, uint32_t sampleFrames,
                    const svms::RenderEvent* sourceEvent = nullptr,
                    uint32_t attackFrames = 0u,
-                   bool transactional = false) {
+                   bool transactional = false,
+                   bool copiedLaunchPlan = false) {
     constexpr uint32_t regionFrames = 2048;
     const uint32_t regionCount = sampleFrames / regionFrames;
     // Every physical SF2 region produced by one MIDI note belongs to one
@@ -229,7 +240,6 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
             setup.loopStart = start + 16u;
             setup.loopEnd = start + regionFrames - 16u;
             setup.loopMode = 1u;
-            setup.playIndex = playIndex;
             setup.phaseStep = 0.5f +
                 static_cast<float>(layerSequence % 97u) / 64.0f;
             setup.basePhaseStep = setup.phaseStep;
@@ -244,8 +254,19 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
         if (gCollectBreakdown)
             gLaunchPrepareCycles += __rdtsc() - prepareBegin;
         sequence += count;
-        voices.LaunchVoiceGroup(channel, note, velocity, setups, count,
-                                channels.GetParams()[channel], handles);
+        if (copiedLaunchPlan) {
+            svms::VoiceConfiguration copied[8]{};
+            for (uint32_t layer = 0u; layer < count; ++layer) {
+                copied[layer] = setups[layer];
+                copied[layer].playIndex = playIndex;
+            }
+            voices.LaunchVoiceGroup(channel, note, velocity, copied, count,
+                                    channels.GetParams()[channel], handles);
+        } else {
+            voices.LaunchVoiceGroup(channel, note, velocity, setups, count,
+                                    playIndex, channels.GetParams()[channel],
+                                    handles);
+        }
         return;
     }
     for (uint32_t i = 0; i < count; ++i, ++sequence) {
@@ -291,6 +312,7 @@ struct MixedDispatchContext {
     uint32_t presetIndex;
     uint32_t attackFrames;
     bool transactionalLaunch;
+    bool copiedLaunchPlan;
     uint16_t regionCacheCount[128];
     uint32_t regionCacheIndices[128][8];
 };
@@ -336,7 +358,8 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
                 PerformSteals(voices, channels, context->sequence, layerCount,
                               context->sampleFrames, &event,
                               context->attackFrames,
-                              context->transactionalLaunch);
+                              context->transactionalLaunch,
+                              context->copiedLaunchPlan);
                 const uint64_t end = __rdtsc();
                 gStealCycles += end - begin;
                 break;
@@ -344,7 +367,8 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
             PerformSteals(voices, channels, context->sequence, layerCount,
                           context->sampleFrames, &event,
                           context->attackFrames,
-                          context->transactionalLaunch);
+                          context->transactionalLaunch,
+                          context->copiedLaunchPlan);
             break;
         }
         case svms::RenderEventType::NoteOff: {
@@ -399,6 +423,7 @@ int main(int argc, char** argv) {
             "[--event-stride N] [--note-rate N] [--key-count 1..128] [--attack-frames N] [--soundfont PATH] "
             "[--backend auto|scalar|sse2|avx2] "
             "[--launch-path legacy|transactional] "
+            "[--launch-plan direct|copy] "
             "[--breakdown] "
             "[--pin-core 0..63] "
             "[--quick] [--reference] [--enforce]\n");
@@ -463,7 +488,7 @@ int main(int argc, char** argv) {
     MixedDispatchContext mixedContext{
         voices.get(), &channels, &cfg, sampleFrames, options.voices,
         soundFont.get(), soundFontPreset, options.attackFrames,
-        options.transactionalLaunch};
+        options.transactionalLaunch, options.copiedLaunchPlan};
     std::fill(std::begin(mixedContext.regionCacheCount),
               std::end(mixedContext.regionCacheCount), UINT16_MAX);
     if (options.workload == Workload::Dense ||
@@ -631,7 +656,7 @@ int main(int argc, char** argv) {
             static_cast<svms::VoiceHandle>(voices->activeList_[position])) > 1u;
 
     std::printf(
-        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"workload\":\"%s\",\"launch_path\":\"%s\",\"voices\":%u,\"frames\":%u,"
+        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"voices\":%u,\"frames\":%u,"
         "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,"
         "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
         "\"voice_soa_bytes\":%zu,\"voice_manager_bytes\":%zu,\"renderer_bytes\":%zu,"
@@ -650,6 +675,7 @@ int main(int argc, char** argv) {
         options.reference ? "reference" : "span", renderer->GetRenderBackendName(),
         WorkloadName(options.workload),
         options.transactionalLaunch ? "transactional" : "legacy",
+        options.copiedLaunchPlan ? "copy" : "direct",
         options.voices, options.frames,
         measuredCallbacks, options.eventStride, options.noteRate, options.keyCount,
         options.attackFrames,

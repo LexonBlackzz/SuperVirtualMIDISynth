@@ -290,6 +290,11 @@ larger phase containing that item is complete.
 - [x] Prepare complete layered note launches before pool mutation, cache the
   common eight-layer launch plans by SoundFont/preset/pitch/note/velocity, and
   retain an explicit legacy-versus-transactional benchmark control
+- [x] Launch directly from immutable cached SF2 plans and pass the per-note
+  play generation separately, removing full-plan copies, repeated region
+  checks, and scratch patching. The modeled 5.5M-NPS one-layer path drops
+  total work 8-9%; the 943K-NPS two-layer Morphine path drops 5.2%
+  with identical victims, state, and full PNC3 output
 - [x] Reserve distinct exact victims for every layer in a saturated fallback
   transaction; this prevents a deferred winner-tree leaf from being selected
   twice, preserves stereo play groups, and enables the existing in-place group

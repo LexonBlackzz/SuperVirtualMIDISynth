@@ -76,8 +76,17 @@ public:
     void ConfigureVoice(VoiceHandle handle, const VoiceConfiguration& setup,
                         const ChannelParamsSnapshot& channelParams,
                         bool commitDeferred);
+    void ConfigureVoice(VoiceHandle handle, const VoiceConfiguration& setup,
+                        uint32_t playIndex,
+                        const ChannelParamsSnapshot& channelParams,
+                        bool commitDeferred);
     bool LaunchVoiceGroup(uint8_t channel, uint8_t note, uint8_t velocity,
                           const VoiceConfiguration* setups, uint32_t count,
+                          const ChannelParamsSnapshot& channelParams,
+                          VoiceHandle* outHandles);
+    bool LaunchVoiceGroup(uint8_t channel, uint8_t note, uint8_t velocity,
+                          const VoiceConfiguration* setups, uint32_t count,
+                          uint32_t playIndex,
                           const ChannelParamsSnapshot& channelParams,
                           VoiceHandle* outHandles);
 
@@ -1746,6 +1755,12 @@ inline bool VoiceManager::IsActive(VoiceHandle handle) const {
 inline void VoiceManager::ConfigureVoice(
     VoiceHandle handle, const VoiceConfiguration& setup,
     const ChannelParamsSnapshot& cp, bool commitDeferred) {
+    ConfigureVoice(handle, setup, setup.playIndex, cp, commitDeferred);
+}
+
+inline void VoiceManager::ConfigureVoice(
+    VoiceHandle handle, const VoiceConfiguration& setup, uint32_t playIndex,
+    const ChannelParamsSnapshot& cp, bool commitDeferred) {
     if (handle >= maxVoices_) return;
 
     v.sampleStart[handle] = setup.sampleStart;
@@ -1776,7 +1791,7 @@ inline void VoiceManager::ConfigureVoice(
 
     v.presetIndex[handle] = setup.presetIndex;
     v.regionIndex[handle] = setup.regionIndex;
-    SetVoicePlayIndex(handle, setup.playIndex);
+    SetVoicePlayIndex(handle, playIndex);
     v.targetGain[handle] = setup.initialGain;
     v.sustainLevel[handle] = setup.sustainLevel * setup.initialGain;
     v.delaySamplesRemaining[handle] = setup.delaySamples;
@@ -1994,6 +2009,16 @@ inline bool VoiceManager::LaunchVoiceGroup(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count,
     const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles) {
+    const uint32_t playIndex = setups && count != 0u
+        ? setups[0].playIndex : UINT32_MAX;
+    return LaunchVoiceGroup(channel, note, velocity, setups, count, playIndex,
+                            channelParams, outHandles);
+}
+
+inline bool VoiceManager::LaunchVoiceGroup(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
+    const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles) {
     if (!setups || !outHandles || count == 0u || count > maxVoices_)
         return false;
     bool candidatesReservedInPlace = false;
@@ -2015,7 +2040,8 @@ inline bool VoiceManager::LaunchVoiceGroup(
         // physical note has been prepared.  The former layered path linked a
         // Generic candidate, configured it, and reclassified it one layer at
         // a time, multiplying tree/list work for stereo SoundFonts.
-        ConfigureVoice(outHandles[layer], setups[layer], channelParams, false);
+        ConfigureVoice(outHandles[layer], setups[layer], playIndex,
+                       channelParams, false);
     }
     CommitVoiceGroupConfigurations(outHandles, count,
                                    candidatesReservedInPlace);
