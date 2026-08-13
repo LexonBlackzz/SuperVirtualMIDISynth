@@ -1192,6 +1192,10 @@ void TestPagedChannelIndexFragmentation() {
     std::vector<uint8_t> expectedActive(svms::kMaxPolyphony, 0u);
     std::vector<uint8_t> expectedChannel(svms::kMaxPolyphony, 0u);
     std::vector<svms::VoiceHandle> expectedLists[svms::kChannelCount];
+    std::vector<svms::VoiceHandle>
+        expectedRender[svms::kVoiceRenderClassCount];
+    const uint32_t genericClass =
+        static_cast<uint32_t>(svms::VoiceRenderClass::Generic);
 
     for (uint32_t i = 0u; i < svms::kMaxPolyphony; ++i) {
         const uint8_t channel = static_cast<uint8_t>((i * 7u + i / 97u) & 15u);
@@ -1203,6 +1207,7 @@ void TestPagedChannelIndexFragmentation() {
             expectedActive[handle] = 1u;
             expectedChannel[handle] = channel;
             expectedLists[channel].push_back(handle);
+            expectedRender[genericClass].push_back(handle);
         }
     }
 
@@ -1218,6 +1223,15 @@ void TestPagedChannelIndexFragmentation() {
             *where = expected.back();
             expected.pop_back();
         }
+        auto& expectedGeneric = expectedRender[genericClass];
+        const auto genericWhere = std::find(
+            expectedGeneric.begin(), expectedGeneric.end(), handle);
+        Check(genericWhere != expectedGeneric.end(),
+              "paged render-class oracle finds retired handle");
+        if (genericWhere != expectedGeneric.end()) {
+            *genericWhere = expectedGeneric.back();
+            expectedGeneric.pop_back();
+        }
         voices->RetireVoice(static_cast<svms::VoiceHandle>(handle));
         expectedActive[handle] = 0u;
     }
@@ -1232,7 +1246,48 @@ void TestPagedChannelIndexFragmentation() {
             expectedActive[handle] = 1u;
             expectedChannel[handle] = channel;
             expectedLists[channel].push_back(handle);
+            expectedRender[genericClass].push_back(handle);
         }
+    }
+
+    const auto moveExpectedRender = [&](svms::VoiceHandle handle,
+                                        svms::VoiceRenderClass from,
+                                        svms::VoiceRenderClass to) {
+        auto& source = expectedRender[static_cast<uint32_t>(from)];
+        const auto where = std::find(source.begin(), source.end(), handle);
+        Check(where != source.end(),
+              "paged render-class oracle finds transitioned handle");
+        if (where != source.end()) {
+            *where = source.back();
+            source.pop_back();
+        }
+        expectedRender[static_cast<uint32_t>(to)].push_back(handle);
+    };
+    for (uint32_t position = 0u; position < voices->GetActiveCount();
+         position += 2u) {
+        const svms::VoiceHandle handle = static_cast<svms::VoiceHandle>(
+            voices->activeList_[position]);
+        voices->v.sampleBacked[handle] = 1u;
+        voices->v.relEnd[handle] = 256u;
+        voices->v.relLoopS[handle] = 16u;
+        voices->v.relLoopE[handle] = 240u;
+        voices->v.loopEnabled[handle] = 1u;
+        voices->v.envelopeStage[handle] = 3u;
+        voices->v.stealFadeInFramesRemaining[handle] = 0u;
+        voices->RefreshRenderClass(handle);
+        moveExpectedRender(handle, svms::VoiceRenderClass::Generic,
+                           svms::VoiceRenderClass::SustainedLoop);
+    }
+    const auto sustainedBeforeRelease = expectedRender[
+        static_cast<uint32_t>(svms::VoiceRenderClass::SustainedLoop)];
+    for (uint32_t position = 0u; position < sustainedBeforeRelease.size();
+         position += 3u) {
+        const svms::VoiceHandle handle = sustainedBeforeRelease[position];
+        voices->v.state[handle] =
+            static_cast<uint8_t>(svms::VoiceState::Releasing);
+        voices->RefreshRenderClass(handle);
+        moveExpectedRender(handle, svms::VoiceRenderClass::SustainedLoop,
+                           svms::VoiceRenderClass::ReleaseLoop);
     }
 
     std::vector<uint8_t> seen(svms::kMaxPolyphony, 0u);
@@ -1265,6 +1320,29 @@ void TestPagedChannelIndexFragmentation() {
     for (uint32_t handle = 0u; handle < svms::kMaxPolyphony; ++handle)
         Check(seen[handle] == expectedActive[handle],
               "paged channel membership matches lifecycle oracle");
+
+    uint32_t renderIndexed = 0u;
+    for (uint32_t classIndex = 0u;
+         classIndex < svms::kVoiceRenderClassCount; ++classIndex) {
+        uint32_t classPosition = 0u;
+        voices->ForEachRenderClassBlock(
+            static_cast<svms::VoiceRenderClass>(classIndex),
+            [&](const uint32_t* handles, uint32_t count) {
+                for (uint32_t offset = 0u; offset < count; ++offset) {
+                    Check(classPosition < expectedRender[classIndex].size() &&
+                              handles[offset] ==
+                                  expectedRender[classIndex][classPosition],
+                          "paged render-class traversal preserves flat order");
+                    ++classPosition;
+                    ++renderIndexed;
+                }
+            });
+        Check(classPosition == voices->GetRenderClassCount(
+                  static_cast<svms::VoiceRenderClass>(classIndex)),
+              "paged render-class count matches block traversal");
+    }
+    Check(renderIndexed == voices->GetActiveCount(),
+          "paged render classes contain every active voice exactly once");
 }
 
 void TestChannelTerminationControllers() {

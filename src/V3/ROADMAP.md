@@ -301,6 +301,10 @@ larger phase containing that item is complete.
   this removes 236,096 bytes at 4,096 voices and about 28 MiB from an equivalent
   500K layout, with unchanged sustained performance and byte-identical PNC3
   output
+- [x] Store all seven render-class memberships in a shared allocation-free pool
+  of 1,024-handle kernel tiles instead of seven full-capacity arrays; exact
+  render ordering crosses tile boundaries, 4,096-voice speed is unchanged, and
+  an equivalent 500K layout avoids about 10.5 MiB
 - [x] Cache immutable preset/note/velocity region matches in an allocation-free
   direct-mapped table, cache committed channel presets, precompute the complete
   configured velocity-gain table, and cache channel pitch-bend ratios

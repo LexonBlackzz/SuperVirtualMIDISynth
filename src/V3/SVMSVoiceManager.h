@@ -141,7 +141,9 @@ public:
     void InvalidateStealCandidates();
     void RefreshRenderClass(VoiceHandle handle);
     uint32_t GetRenderClassCount(VoiceRenderClass renderClass) const;
-    const uint32_t* GetRenderClassList(VoiceRenderClass renderClass) const;
+    template <typename Consumer>
+    void ForEachRenderClassBlock(VoiceRenderClass renderClass,
+                                 Consumer&& consume) const noexcept;
     uint32_t GetNonemptyRenderClassMask() const { return renderClassMask_; }
     uint32_t GetStealTailCount() const { return stealTailCount_; }
     const uint32_t* GetStealTailList() const { return stealTailList_; }
@@ -247,9 +249,24 @@ private:
 
     alignas(64) uint32_t renderClassCount_[kVoiceRenderClassCount];
     uint32_t renderClassMask_;
-    alignas(64) uint32_t
-        renderClassList_[kVoiceRenderClassCount][kMaxPolyphony];
-    alignas(64) uint32_t renderClassPosition_[kMaxPolyphony];
+    static constexpr uint32_t kRenderClassBlockSize = 1024u;
+    static constexpr uint32_t kRenderClassBlockCount =
+        (kMaxPolyphony + kRenderClassBlockSize - 1u) /
+            kRenderClassBlockSize + kVoiceRenderClassCount;
+    struct RenderClassBlock {
+        uint32_t handles[kRenderClassBlockSize];
+        uint32_t count;
+        uint32_t previous;
+        uint32_t next;
+    };
+    uint32_t renderClassHead_[kVoiceRenderClassCount];
+    uint32_t renderClassTail_[kVoiceRenderClassCount];
+    alignas(64) RenderClassBlock
+        renderClassBlocks_[kRenderClassBlockCount];
+    uint32_t renderClassFreeStack_[kRenderClassBlockCount];
+    uint32_t renderClassFreeTop_;
+    uint32_t renderClassBlock_[kMaxPolyphony];
+    uint16_t renderClassOffset_[kMaxPolyphony];
 
     // Steal tails are rendered independently from primary render classes.
     // Keeping a dense list avoids probing all active voices in every short
@@ -326,6 +343,8 @@ private:
     VoiceRenderClass ClassifyVoice(VoiceHandle handle) const;
     void LinkRenderClass(VoiceHandle handle);
     void UnlinkRenderClass(VoiceHandle handle);
+    uint32_t AllocateRenderClassBlock();
+    void FreeRenderClassBlock(uint32_t block);
     void LinkStealTail(VoiceHandle handle);
     void UnlinkStealTail(VoiceHandle handle);
     void BuildStealTailMinHeap();
@@ -409,7 +428,17 @@ inline VoiceManager::VoiceManager()
     }
     std::memset(renderClassCount_, 0, sizeof(renderClassCount_));
     renderClassMask_ = 0u;
-    std::memset(renderClassPosition_, 0xff, sizeof(renderClassPosition_));
+    std::memset(renderClassHead_, 0xff, sizeof(renderClassHead_));
+    std::memset(renderClassTail_, 0xff, sizeof(renderClassTail_));
+    std::memset(renderClassBlock_, 0xff, sizeof(renderClassBlock_));
+    std::memset(renderClassOffset_, 0xff, sizeof(renderClassOffset_));
+    renderClassFreeTop_ = kRenderClassBlockCount;
+    for (uint32_t block = 0u; block < kRenderClassBlockCount; ++block) {
+        renderClassFreeStack_[block] = kRenderClassBlockCount - 1u - block;
+        renderClassBlocks_[block].count = 0u;
+        renderClassBlocks_[block].previous = UINT32_MAX;
+        renderClassBlocks_[block].next = UINT32_MAX;
+    }
     std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
     std::memset(stealWinnerTree_, 0xff, sizeof(stealWinnerTree_));
     std::memset(stealStableKey_, 0, sizeof(stealStableKey_));
@@ -452,7 +481,17 @@ inline void VoiceManager::Reset() {
     }
     std::memset(renderClassCount_, 0, sizeof(renderClassCount_));
     renderClassMask_ = 0u;
-    std::memset(renderClassPosition_, 0xff, sizeof(renderClassPosition_));
+    std::memset(renderClassHead_, 0xff, sizeof(renderClassHead_));
+    std::memset(renderClassTail_, 0xff, sizeof(renderClassTail_));
+    std::memset(renderClassBlock_, 0xff, sizeof(renderClassBlock_));
+    std::memset(renderClassOffset_, 0xff, sizeof(renderClassOffset_));
+    renderClassFreeTop_ = kRenderClassBlockCount;
+    for (uint32_t block = 0u; block < kRenderClassBlockCount; ++block) {
+        renderClassFreeStack_[block] = kRenderClassBlockCount - 1u - block;
+        renderClassBlocks_[block].count = 0u;
+        renderClassBlocks_[block].previous = UINT32_MAX;
+        renderClassBlocks_[block].next = UINT32_MAX;
+    }
     std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
     std::memset(stealWinnerTree_, 0xff, sizeof(stealWinnerTree_));
     std::memset(stealStableKey_, 0, sizeof(stealStableKey_));
@@ -525,10 +564,17 @@ inline uint32_t VoiceManager::GetRenderClassCount(
     return index < kVoiceRenderClassCount ? renderClassCount_[index] : 0u;
 }
 
-inline const uint32_t* VoiceManager::GetRenderClassList(
-    VoiceRenderClass renderClass) const {
+template <typename Consumer>
+inline void VoiceManager::ForEachRenderClassBlock(
+    VoiceRenderClass renderClass, Consumer&& consume) const noexcept {
     const uint32_t index = static_cast<uint32_t>(renderClass);
-    return index < kVoiceRenderClassCount ? renderClassList_[index] : nullptr;
+    if (index >= kVoiceRenderClassCount) return;
+    uint32_t block = renderClassHead_[index];
+    while (block != UINT32_MAX) {
+        const RenderClassBlock& page = renderClassBlocks_[block];
+        consume(page.handles, page.count);
+        block = page.next;
+    }
 }
 
 inline uint32_t VoiceManager::GetVoiceAge(VoiceHandle handle) const {
@@ -831,14 +877,50 @@ inline VoiceRenderClass VoiceManager::ClassifyVoice(VoiceHandle handle) const {
     return VoiceRenderClass::Generic;
 }
 
+inline uint32_t VoiceManager::AllocateRenderClassBlock() {
+    assert(renderClassFreeTop_ != 0u);
+    if (renderClassFreeTop_ == 0u) return UINT32_MAX;
+    const uint32_t block = renderClassFreeStack_[--renderClassFreeTop_];
+    renderClassBlocks_[block].count = 0u;
+    renderClassBlocks_[block].previous = UINT32_MAX;
+    renderClassBlocks_[block].next = UINT32_MAX;
+    return block;
+}
+
+inline void VoiceManager::FreeRenderClassBlock(uint32_t block) {
+    if (block >= kRenderClassBlockCount) return;
+    renderClassBlocks_[block].count = 0u;
+    renderClassBlocks_[block].previous = UINT32_MAX;
+    renderClassBlocks_[block].next = UINT32_MAX;
+    assert(renderClassFreeTop_ < kRenderClassBlockCount);
+    renderClassFreeStack_[renderClassFreeTop_++] = block;
+}
+
 inline void VoiceManager::LinkRenderClass(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     const VoiceRenderClass renderClass = ClassifyVoice(handle);
     const uint32_t classIndex = static_cast<uint32_t>(renderClass);
-    const uint32_t position = renderClassCount_[classIndex]++;
-    renderClassList_[classIndex][position] = handle;
+    uint32_t tail = renderClassTail_[classIndex];
+    if (tail == UINT32_MAX ||
+        renderClassBlocks_[tail].count == kRenderClassBlockSize) {
+        const uint32_t block = AllocateRenderClassBlock();
+        assert(block != UINT32_MAX);
+        if (block == UINT32_MAX) return;
+        renderClassBlocks_[block].previous = tail;
+        if (tail != UINT32_MAX)
+            renderClassBlocks_[tail].next = block;
+        else
+            renderClassHead_[classIndex] = block;
+        renderClassTail_[classIndex] = block;
+        tail = block;
+    }
+    RenderClassBlock& page = renderClassBlocks_[tail];
+    const uint32_t offset = page.count++;
+    page.handles[offset] = handle;
+    renderClassBlock_[handle] = tail;
+    renderClassOffset_[handle] = static_cast<uint16_t>(offset);
+    ++renderClassCount_[classIndex];
     renderClassMask_ |= 1u << classIndex;
-    renderClassPosition_[handle] = position;
     v.renderClass[handle] = static_cast<uint8_t>(renderClass);
     if (renderClass == VoiceRenderClass::SustainedLoop ||
         renderClass == VoiceRenderClass::SustainedOneShot) {
@@ -851,18 +933,35 @@ inline void VoiceManager::UnlinkRenderClass(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     const uint32_t classIndex = v.renderClass[handle];
     if (classIndex >= kVoiceRenderClassCount) return;
-    const uint32_t position = renderClassPosition_[handle];
-    const uint32_t count = renderClassCount_[classIndex];
-    if (position >= count) return;
-    const uint32_t lastPosition = count - 1u;
-    if (position != lastPosition) {
-        const uint32_t moved = renderClassList_[classIndex][lastPosition];
-        renderClassList_[classIndex][position] = moved;
-        renderClassPosition_[moved] = position;
+    const uint32_t block = renderClassBlock_[handle];
+    const uint32_t offset = renderClassOffset_[handle];
+    const uint32_t tail = renderClassTail_[classIndex];
+    if (block >= kRenderClassBlockCount || tail >= kRenderClassBlockCount ||
+        offset >= renderClassBlocks_[block].count) return;
+
+    RenderClassBlock& tailPage = renderClassBlocks_[tail];
+    const uint32_t lastOffset = tailPage.count - 1u;
+    const uint32_t moved = tailPage.handles[lastOffset];
+    if (block != tail || offset != lastOffset) {
+        renderClassBlocks_[block].handles[offset] = moved;
+        renderClassBlock_[moved] = block;
+        renderClassOffset_[moved] = static_cast<uint16_t>(offset);
     }
-    renderClassCount_[classIndex] = lastPosition;
-    if (lastPosition == 0u) renderClassMask_ &= ~(1u << classIndex);
-    renderClassPosition_[handle] = UINT32_MAX;
+    --tailPage.count;
+    const uint32_t remaining = --renderClassCount_[classIndex];
+    renderClassBlock_[handle] = UINT32_MAX;
+    renderClassOffset_[handle] = UINT16_MAX;
+
+    if (tailPage.count == 0u) {
+        const uint32_t previous = tailPage.previous;
+        if (previous != UINT32_MAX)
+            renderClassBlocks_[previous].next = UINT32_MAX;
+        else
+            renderClassHead_[classIndex] = UINT32_MAX;
+        renderClassTail_[classIndex] = previous;
+        FreeRenderClassBlock(tail);
+    }
+    if (remaining == 0u) renderClassMask_ &= ~(1u << classIndex);
 }
 
 inline void VoiceManager::RefreshRenderClass(VoiceHandle handle) {
@@ -870,8 +969,9 @@ inline void VoiceManager::RefreshRenderClass(VoiceHandle handle) {
         v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) return;
     const VoiceRenderClass desired = ClassifyVoice(handle);
     if (v.renderClass[handle] == static_cast<uint8_t>(desired) &&
-        renderClassPosition_[handle] <
-            renderClassCount_[static_cast<uint32_t>(desired)]) {
+        renderClassBlock_[handle] < kRenderClassBlockCount &&
+        renderClassOffset_[handle] <
+            renderClassBlocks_[renderClassBlock_[handle]].count) {
         // Attack and decay intentionally share the transient render class,
         // but only attack has a time-invariant protected steal level. Move
         // the candidate between the persistent tree and volatile heap even

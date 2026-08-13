@@ -1097,50 +1097,50 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             if ((remainingClasses & (1u << classIndex)) == 0u) continue;
             const VoiceRenderClass renderClass =
                 static_cast<VoiceRenderClass>(classIndex);
-            const uint32_t classCount = voices.GetRenderClassCount(renderClass);
-            const uint32_t* handles = voices.GetRenderClassList(renderClass);
-
             RenderClassKernel classKernel = kernelSet.kernels[classIndex];
-            if (classKernel != nullptr && sampleData != nullptr) {
-                const RenderSpanContext context{
-                    &v, sampleData, sampleDataFrames, outputLeft, outputRight,
-                    cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
-                    &classChangeCount};
-                if (classKernel(context, handles, classCount)) {
-                    continue;
-                }
-            }
+            const RenderSpanContext context{
+                &v, sampleData, sampleDataFrames, outputLeft, outputRight,
+                cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
+                &classChangeCount};
+            voices.ForEachRenderClassBlock(renderClass,
+                [&](const uint32_t* handles, uint32_t classCount) {
+                if (classKernel != nullptr && sampleData != nullptr &&
+                    classKernel(context, handles, classCount)) return;
 
-            for (uint32_t position = 0; position < classCount; ++position) {
-                const uint32_t idx = handles[position];
-                if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) continue;
+                for (uint32_t position = 0; position < classCount; ++position) {
+                    const uint32_t idx = handles[position];
+                    if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free))
+                        continue;
 
-                uint32_t retiredAt = UINT32_MAX;
-                const bool cleanPrimary =
-                    v.stealFadeInFramesRemaining[idx] == 0u;
-                if (cleanPrimary && renderClass == VoiceRenderClass::SustainedLoop) {
-                    retiredAt = ScalarRenderSustainedLoop(
-                        v, idx, sampleData, sampleDataFrames, outputLeft,
-                        outputRight, cursor, spanFrames);
-                } else if (cleanPrimary &&
-                           renderClass == VoiceRenderClass::SustainedOneShot) {
-                    retiredAt = ScalarRenderSustainedOneShot(
-                        v, idx, sampleData, sampleDataFrames, outputLeft,
-                        outputRight, cursor, spanFrames);
-                } else {
-                    retiredAt = RenderPrimaryVoiceSpan(
-                        v, idx, sampleData, sampleDataFrames, outputLeft,
-                        outputRight, cursor, spanFrames, spanFrames);
-                }
+                    uint32_t retiredAt = UINT32_MAX;
+                    const bool cleanPrimary =
+                        v.stealFadeInFramesRemaining[idx] == 0u;
+                    if (cleanPrimary &&
+                        renderClass == VoiceRenderClass::SustainedLoop) {
+                        retiredAt = ScalarRenderSustainedLoop(
+                            v, idx, sampleData, sampleDataFrames, outputLeft,
+                            outputRight, cursor, spanFrames);
+                    } else if (cleanPrimary &&
+                               renderClass == VoiceRenderClass::SustainedOneShot) {
+                        retiredAt = ScalarRenderSustainedOneShot(
+                            v, idx, sampleData, sampleDataFrames, outputLeft,
+                            outputRight, cursor, spanFrames);
+                    } else {
+                        retiredAt = RenderPrimaryVoiceSpan(
+                            v, idx, sampleData, sampleDataFrames, outputLeft,
+                            outputRight, cursor, spanFrames, spanFrames);
+                    }
 
-                if (retiredAt != UINT32_MAX) {
-                    retirements_[retireCount++] = {
-                        idx, retiredAt, voices.activePosition_[idx]};
-                } else if (renderClass == VoiceRenderClass::TransientLoop ||
-                           renderClass == VoiceRenderClass::Generic) {
-                    classChanges_[classChangeCount++] = idx;
+                    if (retiredAt != UINT32_MAX) {
+                        retirements_[retireCount++] = {
+                            idx, retiredAt, voices.activePosition_[idx]};
+                    } else if (
+                        renderClass == VoiceRenderClass::TransientLoop ||
+                        renderClass == VoiceRenderClass::Generic) {
+                        classChanges_[classChangeCount++] = idx;
+                    }
                 }
-            }
+            });
         }
 
         // Tails have their own sparse lifecycle list and render independently
