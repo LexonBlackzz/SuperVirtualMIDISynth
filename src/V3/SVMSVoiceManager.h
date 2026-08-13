@@ -348,6 +348,12 @@ private:
     void InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity);
     void InitializePreparedVoice(VoiceHandle handle, uint8_t channel,
                                  uint8_t note, uint8_t velocity);
+    void ApplyVoiceConfigurationFields(
+        VoiceHandle handle, const VoiceConfiguration& setup,
+        const ChannelParamsSnapshot& channelParams);
+    static VoiceRenderClass ClassifyConfiguration(
+        const VoiceConfiguration& setup);
+    static bool IsStableConfiguration(const VoiceConfiguration& setup);
     void LinkChannelKey(VoiceHandle handle);
     void UnlinkChannelKey(VoiceHandle handle);
     void UnlinkPlayGroup(VoiceHandle handle);
@@ -393,6 +399,11 @@ private:
                                  const VoiceConfiguration* setups,
                                  uint32_t count, VoiceHandle* outHandles,
                                  bool& candidatesReservedInPlace);
+    bool TryLaunchSingleVoiceInPlace(
+        uint8_t channel, uint8_t note, uint8_t velocity,
+        const VoiceConfiguration& setup, uint32_t playIndex,
+        const ChannelParamsSnapshot& channelParams,
+        VoiceHandle& outHandle);
     void CommitVoiceGroupConfigurations(const VoiceHandle* handles,
                                         uint32_t count,
                                         bool candidatesReservedInPlace);
@@ -1763,6 +1774,19 @@ inline void VoiceManager::ConfigureVoice(
     const ChannelParamsSnapshot& cp, bool commitDeferred) {
     if (handle >= maxVoices_) return;
 
+    SetVoicePlayIndex(handle, playIndex);
+    ApplyVoiceConfigurationFields(handle, setup, cp);
+    RefreshRenderClass(handle);
+    if (commitDeferred)
+        CommitVoiceConfiguration(handle);
+    else
+        UpdateStealCandidate(handle);
+}
+
+inline void VoiceManager::ApplyVoiceConfigurationFields(
+    VoiceHandle handle, const VoiceConfiguration& setup,
+    const ChannelParamsSnapshot& cp) {
+
     v.sampleStart[handle] = setup.sampleStart;
     v.sampleEnd[handle] = setup.sampleEnd;
     v.loopStart[handle] = setup.loopStart;
@@ -1791,7 +1815,6 @@ inline void VoiceManager::ConfigureVoice(
 
     v.presetIndex[handle] = setup.presetIndex;
     v.regionIndex[handle] = setup.regionIndex;
-    SetVoicePlayIndex(handle, playIndex);
     v.targetGain[handle] = setup.initialGain;
     v.sustainLevel[handle] = setup.sustainLevel * setup.initialGain;
     v.delaySamplesRemaining[handle] = setup.delaySamples;
@@ -1824,12 +1847,108 @@ inline void VoiceManager::ConfigureVoice(
     v.mixGainR[handle] = setup.gainRight * cp.panRight * cp.volume * cp.expression;
     v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
     v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
+}
 
-    RefreshRenderClass(handle);
-    if (commitDeferred)
-        CommitVoiceConfiguration(handle);
-    else
-        UpdateStealCandidate(handle);
+inline VoiceRenderClass VoiceManager::ClassifyConfiguration(
+    const VoiceConfiguration& setup) {
+    if (setup.sampleBacked == 0u ||
+        setup.sampleEnd <= setup.sampleStart + 1u)
+        return VoiceRenderClass::Generic;
+    const bool loop =
+        (setup.loopMode == 1u || setup.loopMode == 3u) &&
+        setup.loopEnd > setup.loopStart + 1u;
+    uint8_t stage = 3u;
+    if (setup.delaySamples != 0u) stage = 4u;
+    else if (setup.holdSamples != 0u) stage = 0u;
+    else if (setup.attackSamples != 0u) stage = 1u;
+    else if (setup.decaySamples != 0u) stage = 2u;
+    if (stage == 3u)
+        return loop ? VoiceRenderClass::SustainedLoop
+                    : VoiceRenderClass::SustainedOneShot;
+    if (loop && (stage == 1u || stage == 2u))
+        return VoiceRenderClass::TransientLoop;
+    return VoiceRenderClass::Generic;
+}
+
+inline bool VoiceManager::IsStableConfiguration(
+    const VoiceConfiguration& setup) {
+    const bool preDecay = setup.delaySamples != 0u ||
+        setup.holdSamples != 0u || setup.attackSamples != 0u;
+    return setup.sampleBacked != 0u &&
+        setup.sampleEnd > setup.sampleStart + 1u &&
+        (preDecay || setup.decaySamples == 0u);
+}
+
+inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration& setup, uint32_t playIndex,
+    const ChannelParamsSnapshot& cp, VoiceHandle& outHandle) {
+    if (freeTop_ != 0u || !IsStableConfiguration(setup)) return false;
+
+    uint32_t selectedPosition = 0u;
+    const VoiceHandle handle = PopStealCandidate(selectedPosition, true);
+    if (handle == kInvalidVoice) return false;
+
+    // This compact transaction is valid only when the exact winner is a
+    // stable, ungrouped voice whose winner-tree leaf was reserved in place.
+    // Restore any other reservation and let the general grouped path repeat
+    // the (unchanged) exact selection.
+    const bool eligible = stealCandidateReserved_[handle] == 2u &&
+        playGroupPrev_[handle] < 0 && playGroupNext_[handle] < 0 &&
+        IsStableStealCandidate(handle) &&
+        stealWinnerTree_[stealTreeLeafBase_ + handle] == handle;
+    if (!eligible) {
+        stealCandidateReserved_[handle] = 0u;
+        return false;
+    }
+
+    const VoiceRenderClass desiredClass = ClassifyConfiguration(setup);
+    const uint8_t desiredClassValue = static_cast<uint8_t>(desiredClass);
+    const bool preserveChannelIndex = v.channel[handle] == channel;
+    const bool preserveRenderIndex =
+        v.renderClass[handle] == desiredClassValue;
+
+    CaptureStealTail(handle);
+    ++stealCount_;
+    UnlinkChannelKey(handle);
+    UnlinkPlayGroup(handle);
+    if (!preserveChannelIndex) UnlinkChannelActive(handle);
+    if (!preserveRenderIndex) UnlinkRenderClass(handle);
+
+    v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
+    v.currentGain[handle] = 0.0f;
+    InitializePreparedVoice(handle, channel, note, velocity);
+    stealCandidateDeferred_[handle] = 1u;
+    // PopStealCandidate reserved this stable leaf; InitializePreparedVoice
+    // deliberately leaves the reservation byte intact.
+    stealCandidateReserved_[handle] = 2u;
+    LinkChannelKey(handle);
+    if (!preserveChannelIndex) LinkChannelActive(handle);
+
+    // A playIndex is unique to this MIDI note-on. The old group has already
+    // been unlinked, so SetVoicePlayIndex's second unlink is unnecessary.
+    v.playIndex[handle] = playIndex;
+    lastLinkedPlayIndex_ = playIndex;
+    lastLinkedPlayVoice_ = handle;
+
+    ApplyVoiceConfigurationFields(handle, setup, cp);
+    if (preserveRenderIndex) {
+        v.renderClass[handle] = desiredClassValue;
+    } else {
+        LinkRenderClass(handle);
+    }
+
+    // The eligibility test guarantees that the replacement remains in the
+    // stable tree. Refresh its cached key and its one root path exactly once.
+    stealCandidateDeferred_[handle] = 0u;
+    stealCandidateReserved_[handle] = 0u;
+    stealStableCandidate_[handle] = {
+        ComputeStableStealKey(handle), handle, activePosition_[handle]};
+    stealStableKey_[handle] = EncodeStableWinnerKey(
+        stealStableCandidate_[handle].score, activePosition_[handle]);
+    RefreshStealWinnerPath(handle);
+    outHandle = handle;
+    return true;
 }
 
 inline bool VoiceManager::ReuseMatchingStealGroup(
@@ -1889,12 +2008,7 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     for (uint32_t i = 0u; i < count && canReserveInPlace; ++i) {
         const VoiceHandle handle = outHandles[i];
         const VoiceConfiguration& setup = setups[i];
-        const bool preDecay = setup.delaySamples != 0u ||
-            setup.holdSamples != 0u || setup.attackSamples != 0u;
-        const bool configuredStable = setup.sampleBacked != 0u &&
-            setup.sampleEnd > setup.sampleStart + 1u &&
-            (preDecay || setup.decaySamples == 0u);
-        canReserveInPlace = configuredStable &&
+        canReserveInPlace = IsStableConfiguration(setup) &&
             IsStableStealCandidate(handle) &&
             stealWinnerTree_[stealTreeLeafBase_ + handle] == handle;
     }
@@ -1928,23 +2042,8 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         const VoiceHandle handle = outHandles[i];
         const bool preserveChannelIndex = candidatesReservedInPlace &&
             v.channel[handle] == channel;
-        const bool configuredLoop =
-            (setups[i].loopMode == 1u || setups[i].loopMode == 3u) &&
-            setups[i].loopEnd > setups[i].loopStart + 1u;
-        uint8_t configuredStage = 3u;
-        if (setups[i].delaySamples != 0u) configuredStage = 4u;
-        else if (setups[i].holdSamples != 0u) configuredStage = 0u;
-        else if (setups[i].attackSamples != 0u) configuredStage = 1u;
-        else if (setups[i].decaySamples != 0u) configuredStage = 2u;
-        VoiceRenderClass desiredClass = VoiceRenderClass::Generic;
-        if (configuredStage == 3u) {
-            desiredClass = configuredLoop
-                ? VoiceRenderClass::SustainedLoop
-                : VoiceRenderClass::SustainedOneShot;
-        } else if (configuredLoop &&
-                   (configuredStage == 1u || configuredStage == 2u)) {
-            desiredClass = VoiceRenderClass::TransientLoop;
-        }
+        const VoiceRenderClass desiredClass =
+            ClassifyConfiguration(setups[i]);
         const uint8_t configuredClass = static_cast<uint8_t>(desiredClass);
         const bool preserveRenderIndex = candidatesReservedInPlace &&
             v.renderClass[handle] == configuredClass;
@@ -2021,6 +2120,16 @@ inline bool VoiceManager::LaunchVoiceGroup(
     const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles) {
     if (!setups || !outHandles || count == 0u || count > maxVoices_)
         return false;
+    if (count == 1u && TryLaunchSingleVoiceInPlace(
+            channel, note, velocity, setups[0], playIndex, channelParams,
+            outHandles[0])) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        ++groupReuseAttemptCount_;
+        ++groupReuseMatchCount_;
+        ++groupReuseReservedCount_;
+#endif
+        return true;
+    }
     bool candidatesReservedInPlace = false;
     if (!ReuseMatchingStealGroup(channel, note, velocity, setups, count,
                                  outHandles, candidatesReservedInPlace)) {

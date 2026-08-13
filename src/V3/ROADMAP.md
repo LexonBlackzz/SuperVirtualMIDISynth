@@ -305,6 +305,10 @@ larger phase containing that item is complete.
   512 frames, 300-voice total cycles fall about 20% and clean-run p99 falls
   from 121.8% to 100.6%, with an exact 512-victim oracle and byte-identical
   full PNC3 output
+- [x] Specialize stable mono in-place launches as one lifecycle/configuration
+  transaction, bypassing the generic eight-layer reservation and commit loops.
+  Under concurrent game load, 5.5M-NPS median callback use falls about 5% at
+  300 voices and 6% at 1,000 voices with exact predecessor audio
 - [x] Size the logical exact-stealing tournament to the next power of two
   above configured polyphony while retaining fixed preallocated storage. A
   300-voice pool now updates 9 levels instead of 12, reducing steal/index
