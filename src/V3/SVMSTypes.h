@@ -11,7 +11,9 @@ namespace svms {
 
 constexpr uint32_t kChannelCount = 16;
 constexpr uint32_t kNoteCount = 128;
-constexpr uint32_t kMaxPolyphony = 4096;
+// Logical hard ceiling. Storage is sized to the configured pool, so this does
+// not impose a 500K allocation on ordinary 1K/4K instances.
+constexpr uint32_t kMaxPolyphony = 524288;
 constexpr uint32_t kSamplesPerPage = 4096;
 constexpr uint32_t kDefaultSampleRate = 44100;
 constexpr uint32_t kDefaultBufferFrames = 2048;
@@ -66,14 +68,10 @@ inline bool SequenceAtOrBefore(uint32_t sequence, uint32_t fence) noexcept {
 // samples, effectively pausing their temporal resolution.
 // The step changes per-block based on active voice count.
 //
-// The stabilized 4096-voice engine is always full quality. Decimation tiers
-// remain reserved for the future storage expansion beyond the current pool:
-//   <= 4,096 voices: step 1
-//   < 50,000 voices: step 2
-//   < 150,000 voices: step 4
-//   < 500,000 voices: step 8
-//   >= 500,000 voices: step 16
-constexpr uint32_t kDecimationTier1 = kMaxPolyphony + 1; // step 1 through 4096
+// Correctness mode currently renders the complete configured pool at full
+// quality. The dormant tier constants are retained for a future explicitly
+// selectable overload policy; none are reached at the current hard ceiling.
+constexpr uint32_t kDecimationTier1 = kMaxPolyphony + 1; // full quality through configured ceiling
 constexpr uint32_t kDecimationTier2 = 50000;   // step 2
 constexpr uint32_t kDecimationTier3 = 150000;  // step 4
 constexpr uint32_t kDecimationTier4 = 500000;  // step 8

@@ -481,7 +481,7 @@ int main(int argc, char** argv) {
     Options options;
     if (!ParseOptions(argc, argv, options)) {
         std::fprintf(stderr,
-            "usage: svms_v3_bench [--voices 1..4096] [--frames 16..8192] "
+            "usage: svms_v3_bench [--voices 1..524288] [--frames 16..8192] "
             "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst] "
             "[--event-stride N] [--note-rate N] [--key-count 1..128] [--attack-frames N] [--soundfont PATH] "
             "[--render-threads 1..64] "

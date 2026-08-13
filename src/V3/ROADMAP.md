@@ -27,8 +27,8 @@ larger phase containing that item is complete.
 - [x] SF2 volume envelopes, sample loops, attenuation, tuning, and release tails
 - [x] Configured velocity threshold/curve/floor, velocity LUT,
   CC7/CC10/CC11 gains, and precomputed loop bounds
-- [x] Full-quality rendering throughout the current 4096-voice hard pool;
-  adaptive decimation is reserved for future larger storage
+- [x] Full-quality rendering throughout the 4096-voice validated baseline;
+  selectable capacity now extends to 524,288 voices
 - [x] Limiter, double-buffered diagnostic statistics, and optional diagnostic
   window
 
@@ -479,7 +479,9 @@ larger phase containing that item is complete.
 
 ## Scalar Density and 500K Storage
 
-- [ ] Raise the pool beyond the current 4096 manager/index limit
+- [x] Raise the selectable pool beyond 4096 with capacity-sized voice and
+  lifecycle indices (524,288 logical ceiling; practical limits remain to be
+  characterized)
 - [ ] Implement segmented/paged SoA storage with bounded memory locality
 - [ ] Separate hot audible state from cold metadata and release state
 - [ ] Replace full active-list sorting with bucketed velocity/energy classes or

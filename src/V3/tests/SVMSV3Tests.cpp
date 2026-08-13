@@ -1723,7 +1723,7 @@ void TestConfiguredVelocityMapping() {
           "hard-left SF2 pan preserves power and stereo placement");
 
     Check(svms::ComputeDecimationStep(svms::kMaxPolyphony) == 1,
-          "the complete 4096-voice pool remains full quality");
+          "the complete configured voice pool remains full quality");
 }
 
 void TestEventRingWrapAndCapacity() {

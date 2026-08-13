@@ -53,7 +53,7 @@ void Usage() {
            L"svms_v3_render <input.mid> <soundfont.sf2> <output.wav> [options]\n\n"
            L"svms_v3_render <input.mid> --scan-only\n\n"
            L"  --sample-rate N       Output rate (default 44100)\n"
-           L"  --max-voices N        Voice limit, 1-4096 (default 4096)\n"
+           L"  --max-voices N        Voice limit, 1-524288 (default 4096)\n"
            L"  --render-threads N     Total voice-render threads, 1-64 (default 1)\n"
            L"  --event-buffer-mb N   Parsed-event ring (default 128 MiB)\n"
            L"  --block-frames N      Render block size (default 8192)\n"
