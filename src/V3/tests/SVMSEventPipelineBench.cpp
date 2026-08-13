@@ -13,6 +13,7 @@
 namespace {
 
 constexpr uint32_t kChunkCapacity = 8192u;
+constexpr uint32_t kLaneRunQuota = (kChunkCapacity + 4u) / 5u;
 
 uint32_t ParseU32(const char* value, uint32_t fallback) {
     if (!value || !*value) return fallback;
@@ -68,6 +69,8 @@ int main(int argc, char** argv) {
     constexpr uint32_t leadFrames = 2048u;
     double producerMs = 0.0;
     double compilerMs = 0.0;
+    double compilerSortMs = 0.0;
+    double compilerPublishMs = 0.0;
     double callbackMs = 0.0;
     uint64_t checksum = 0u;
 
@@ -99,19 +102,37 @@ int main(int argc, char** argv) {
         while (remaining != 0u) {
             chunk->Reset();
             const uint32_t count = (std::min)(remaining, kChunkCapacity);
-            for (uint32_t i = 0u; i < count; ++i) {
-                svms::TimestampedMidiEvent timed{};
-                if (!ingress->TryPopFair(timed, laneCursor)) return 3;
+            uint32_t drained = 0u;
+            auto compileOne = [&](const svms::TimestampedMidiEvent& timed) {
                 svms::ScheduledRenderEvent scheduled{};
                 if (!svms::CompileTimestampedEvent(
                         timed, epoch, qpcFrequency, sampleRate, leadFrames,
-                        scheduled) || !chunk->EnqueueBatched(scheduled)) return 3;
-            }
+                        scheduled) || !chunk->EnqueueBatched(scheduled)) {
+                    return false;
+                }
+                return true;
+            };
+            svms::TimestampedMidiEvent timed{};
+            if (!ingress->TryPopFair(timed, laneCursor) ||
+                !compileOne(timed)) return 3;
+            ++drained;
+            bool compileFailed = false;
+            drained += ingress->DrainFairRuns(
+                count - drained, kLaneRunQuota, laneCursor,
+                [&](const svms::TimestampedMidiEvent& event) {
+                    if (!compileOne(event)) compileFailed = true;
+                });
+            if (compileFailed || drained != count) return 3;
+            const auto sortBegin = std::chrono::steady_clock::now();
             chunk->FinalizeBatch();
+            const auto sortEnd = std::chrono::steady_clock::now();
             svms::ScheduledRenderEvent scheduled{};
             while (chunk->PopBefore(INT64_MAX, scheduled)) {
                 if (!compiled->Push(scheduled)) return 3;
             }
+            const auto publishEnd = std::chrono::steady_clock::now();
+            compilerSortMs += Milliseconds(sortBegin, sortEnd);
+            compilerPublishMs += Milliseconds(sortEnd, publishEnd);
             remaining -= count;
         }
         const auto compilerEnd = std::chrono::steady_clock::now();
@@ -153,11 +174,14 @@ int main(int argc, char** argv) {
         "events=%u iterations=%u chunk=%u scheduled_bytes=%zu\n"
         "producer_ms=%.3f producer_Mevents_s=%.3f\n"
         "compiler_ms=%.3f compiler_Mevents_s=%.3f\n"
+        "compiler_drain_compile_ms=%.3f sort_ms=%.3f publish_ms=%.3f\n"
         "callback_order_ms=%.3f callback_Mevents_s=%.3f "
         "callback_budget_pct=%.2f checksum=%llu\n",
         eventCount, iterations, kChunkCapacity,
         sizeof(svms::ScheduledRenderEvent),
         producerMs, rate(producerMs), compilerMs, rate(compilerMs),
+        compilerMs - compilerSortMs - compilerPublishMs,
+        compilerSortMs, compilerPublishMs,
         callbackMs, rate(callbackMs),
         callbackPerBatch * 100.0 / audioDeadlineMs,
         static_cast<unsigned long long>(checksum));

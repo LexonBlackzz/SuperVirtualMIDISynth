@@ -6,6 +6,7 @@
 #include "SVMSPSCQueue.h"
 #include "SVMSMPSCQueue.h"
 #include "SVMSEventScheduler.h"
+#include "SVMSEventCompile.h"
 #include "SVMSConfig.h"
 #include "SVMSFrameClock.h"
 
@@ -1404,6 +1405,74 @@ void TestFairPriorityLaneDrain() {
     }
     Check(stateCount == 64u && loudCount == 64u,
           "fair drain consumes both saturated priority lanes");
+
+    constexpr uint32_t eventsPerLane = 257u;
+    constexpr uint32_t totalRunEvents = eventsPerLane * 5u;
+    constexpr uint64_t epoch = 50'000'000u;
+    constexpr uint64_t frequency = 10'000'000u;
+    constexpr uint32_t sampleRate = 44'100u;
+    svms::PriorityEventIngress<svms::TimestampedMidiEvent> runIngress;
+    std::vector<svms::ScheduledRenderEvent> expected;
+    expected.reserve(totalRunEvents);
+    for (uint32_t laneIndex = 0u; laneIndex < 5u; ++laneIndex) {
+        const auto lane = static_cast<svms::EventLane>(laneIndex);
+        for (uint32_t i = 0u; i < eventsPerLane; ++i) {
+            svms::TimestampedMidiEvent event{};
+            event.sequence = i * 5u + laneIndex;
+            event.qpcTimestamp = epoch +
+                static_cast<uint64_t>((event.sequence * 7'919u) % 100'003u);
+            event.message = 0x90u | ((event.sequence & 0x7fu) << 8u) |
+                (127u << 16u);
+            Check(runIngress.TryPush(lane, event),
+                  "run drain accepts every lane event");
+            svms::ScheduledRenderEvent scheduled{};
+            Check(svms::CompileTimestampedEvent(
+                      event, epoch, frequency, sampleRate, 2048u, scheduled),
+                  "run drain fixture compiles");
+            expected.push_back(scheduled);
+        }
+    }
+    svms::EventScheduler runScheduler(totalRunEvents);
+    std::vector<uint8_t> runSeen(totalRunEvents, 0u);
+    uint32_t runCursor = 0u;
+    const uint32_t runDrained = runIngress.DrainFairRuns(
+        totalRunEvents, 37u, runCursor,
+        [&](const svms::TimestampedMidiEvent& event) {
+            Check(event.sequence < totalRunEvents,
+                  "run drain sequence remains in range");
+            if (event.sequence < totalRunEvents) {
+                Check(runSeen[event.sequence] == 0u,
+                      "run drain never duplicates an event");
+                runSeen[event.sequence] = 1u;
+            }
+            svms::ScheduledRenderEvent scheduled{};
+            Check(svms::CompileTimestampedEvent(
+                      event, epoch, frequency, sampleRate, 2048u, scheduled) &&
+                      runScheduler.EnqueueBatched(scheduled),
+                  "run drain compiles every event into the scheduler");
+        });
+    Check(runDrained == totalRunEvents && runIngress.TotalSize() == 0u,
+          "run drain consumes every lane without starvation");
+    Check(std::all_of(runSeen.begin(), runSeen.end(),
+                      [](uint8_t value) { return value == 1u; }),
+          "run drain preserves every event exactly once");
+
+    std::sort(expected.begin(), expected.end(), [](const auto& left,
+                                                    const auto& right) {
+        return left.targetFrame < right.targetFrame ||
+            (left.targetFrame == right.targetFrame &&
+             left.sequence < right.sequence);
+    });
+    runScheduler.FinalizeBatch();
+    svms::ScheduledRenderEvent actual{};
+    for (const auto& wanted : expected) {
+        Check(runScheduler.PopBefore(INT64_MAX, actual) &&
+                  actual.targetFrame == wanted.targetFrame &&
+                  actual.sequence == wanted.sequence,
+              "bounded lane runs restore exact frame/sequence order");
+    }
+    Check(runScheduler.Empty(),
+          "bounded lane-run scheduler drains without extra events");
 }
 
 void TestFourProducerMPSCIntegrity() {

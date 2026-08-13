@@ -270,6 +270,11 @@ larger phase containing that item is complete.
   envelope-stage boundary, eliminating copy/reclassification passes over every
   unchanged attack/decay voice; the 2,000-voice Morphine profile drops another
   roughly 29% of synthesis cycles and returns below its real-time deadline
+- [x] Drain priority ingress as bounded FIFO lane runs before exact scheduling,
+  removing artificial event-by-event lane inversions while preserving final
+  absolute-frame/ingress-sequence order; the 262,144-event dense benchmark
+  improves from 28.86M to 121.01M compiled events/s (4.19x), with byte-identical
+  full PNC3 + Morphine Piano output
 - [x] Apply each prepared SF2 layer through one transactional voice setup and
   expose attack-frame control in the dense note-burst benchmark
 - [x] Prepare complete layered note launches before pool mutation, cache the

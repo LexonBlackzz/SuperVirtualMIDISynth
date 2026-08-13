@@ -135,6 +135,35 @@ public:
         return false;
     }
 
+    // Drain bounded FIFO runs instead of alternating lanes for every event.
+    // Admission priority and consumer fairness stay unchanged, while ordered
+    // producers reach the downstream sorter as a handful of natural runs.
+    template <typename Consumer>
+    uint32_t DrainFairRuns(uint32_t maxEvents, uint32_t runQuota,
+                           uint32_t& cursor, Consumer&& consume) noexcept {
+        if (maxEvents == 0u) return 0u;
+        if (runQuota == 0u) runQuota = 1u;
+        uint32_t drained = 0u;
+        T event{};
+        while (drained < maxEvents) {
+            bool madeProgress = false;
+            for (uint32_t attempt = 0u;
+                 attempt < 5u && drained < maxEvents; ++attempt) {
+                const EventLane lane = static_cast<EventLane>(cursor++ % 5u);
+                uint32_t laneCount = 0u;
+                while (laneCount < runQuota && drained < maxEvents &&
+                       TryPop(lane, event)) {
+                    consume(event);
+                    ++laneCount;
+                    ++drained;
+                    madeProgress = true;
+                }
+            }
+            if (!madeProgress) break;
+        }
+        return drained;
+    }
+
     uint32_t TotalSize() const noexcept {
         return state_.Size() + loud_.Size() + upperMedium_.Size() +
                medium_.Size() + quiet_.Size();

@@ -1281,6 +1281,8 @@ void Driver::EventCompilerLoop() {
     // Small enough to stay cache-friendly, large enough that one 2048-frame
     // Black-MIDI callback arrives as only a handful of ordered runs.
     static constexpr uint32_t kCompilerChunkCapacity = 8192u;
+    static constexpr uint32_t kCompilerLaneRunQuota =
+        (kCompilerChunkCapacity + 4u) / 5u;
     EventScheduler chunkScheduler(kCompilerChunkCapacity);
     uint32_t fairLaneCursor = 0u;
 
@@ -1316,17 +1318,26 @@ void Driver::EventCompilerLoop() {
 
         chunkScheduler.Reset();
         uint32_t drained = 0u;
-        do {
+        auto compileOne = [&](const TimestampedMidiEvent& source) {
             ScheduledRenderEvent scheduled{};
-            if (CompileTimestampedEvent(timed, epoch, qpcFreq, sampleRate,
+            if (CompileTimestampedEvent(source, epoch, qpcFreq, sampleRate,
                                         bufferFrames, scheduled)) {
                 const bool admitted = chunkScheduler.EnqueueBatched(scheduled);
                 assert(admitted);
                 (void)admitted;
             }
-            ++drained;
-        } while (drained < kCompilerChunkCapacity &&
-                 midiIngress_.TryPopFair(timed, fairLaneCursor));
+        };
+        compileOne(timed);
+        ++drained;
+
+        // Priority lanes are FIFO runs in normal host traffic. Round-robin
+        // popping used to alternate those runs event-by-event, manufacturing
+        // thousands of inversions that the chunk sorter immediately had to
+        // undo. Drain a bounded run per lane instead: fairness is retained,
+        // but a normal chunk reaches the sorter as only a handful of runs.
+        drained += midiIngress_.DrainFairRuns(
+            kCompilerChunkCapacity - drained, kCompilerLaneRunQuota,
+            fairLaneCursor, compileOne);
 
         // Ordering is deliberately paid here, outside the callback. Chunks
         // remain individually sorted in compiledIngress_; the audio thread
