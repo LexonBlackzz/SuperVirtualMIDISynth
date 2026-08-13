@@ -7,6 +7,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace svms {
 
@@ -183,6 +186,24 @@ public:
     uint64_t GetGroupReuseLargerCountForTest() const {
         return groupReuseLargerCount_;
     }
+    uint64_t GetLaunchProfileSamplesForTest() const {
+        return launchProfileSamples_;
+    }
+    uint64_t GetLaunchProfilePopCyclesForTest() const {
+        return launchProfilePopCycles_;
+    }
+    uint64_t GetLaunchProfileTailCyclesForTest() const {
+        return launchProfileTailCycles_;
+    }
+    uint64_t GetLaunchProfileLifecycleCyclesForTest() const {
+        return launchProfileLifecycleCycles_;
+    }
+    uint64_t GetLaunchProfileConfigureCyclesForTest() const {
+        return launchProfileConfigureCycles_;
+    }
+    uint64_t GetLaunchProfileTreeCyclesForTest() const {
+        return launchProfileTreeCycles_;
+    }
     uint32_t GetPlayGroupSizeForTest(VoiceHandle handle) const {
         if (handle >= maxVoices_ ||
             v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) return 0u;
@@ -205,6 +226,13 @@ public:
         groupReuseReservedCount_ = 0u;
         groupReuseSmallerCount_ = 0u;
         groupReuseLargerCount_ = 0u;
+        launchProfileCounter_ = 0u;
+        launchProfileSamples_ = 0u;
+        launchProfilePopCycles_ = 0u;
+        launchProfileTailCycles_ = 0u;
+        launchProfileLifecycleCycles_ = 0u;
+        launchProfileConfigureCycles_ = 0u;
+        launchProfileTreeCycles_ = 0u;
     }
 #endif
 
@@ -292,8 +320,7 @@ private:
     // Tail levels are unchanged between render boundaries. Build the exact
     // quietest-tail heap once per frame, then update only its root when a
     // denser same-frame burst replaces that tail.
-    uint32_t stealTailMinHeap_[kStealTailReserve];
-    float stealTailMinHeapLevel_[kStealTailReserve];
+    uint64_t stealTailMinHeapKey_[kStealTailReserve];
     uint32_t stealTailMinHeapCount_;
     uint64_t stealTailMinHeapFrame_;
     bool stealTailMinHeapValid_;
@@ -332,6 +359,13 @@ private:
     uint64_t groupReuseReservedCount_ = 0u;
     uint64_t groupReuseSmallerCount_ = 0u;
     uint64_t groupReuseLargerCount_ = 0u;
+    uint64_t launchProfileCounter_ = 0u;
+    uint64_t launchProfileSamples_ = 0u;
+    uint64_t launchProfilePopCycles_ = 0u;
+    uint64_t launchProfileTailCycles_ = 0u;
+    uint64_t launchProfileLifecycleCycles_ = 0u;
+    uint64_t launchProfileConfigureCycles_ = 0u;
+    uint64_t launchProfileTreeCycles_ = 0u;
 #endif
 
     // Per-key tracking for EndVoicesForChannelKey
@@ -1138,23 +1172,14 @@ inline void VoiceManager::StealTailHeapSiftDown(uint32_t position) {
         if (left >= stealTailMinHeapCount_) break;
         const uint32_t right = left + 1u;
         uint32_t quietest = left;
-        auto lessQuiet = [this](uint32_t a, uint32_t b) {
-            const float levelA = stealTailMinHeapLevel_[a];
-            const float levelB = stealTailMinHeapLevel_[b];
-            if (levelA != levelB) return levelA < levelB;
-            return stealTailPosition_[stealTailMinHeap_[a]] <
-                   stealTailPosition_[stealTailMinHeap_[b]];
-        };
         if (right < stealTailMinHeapCount_ &&
-            lessQuiet(right, left))
+            stealTailMinHeapKey_[right] < stealTailMinHeapKey_[left])
             quietest = right;
-        if (!lessQuiet(quietest, position)) break;
-        const uint32_t temporary = stealTailMinHeap_[position];
-        stealTailMinHeap_[position] = stealTailMinHeap_[quietest];
-        stealTailMinHeap_[quietest] = temporary;
-        const float temporaryLevel = stealTailMinHeapLevel_[position];
-        stealTailMinHeapLevel_[position] = stealTailMinHeapLevel_[quietest];
-        stealTailMinHeapLevel_[quietest] = temporaryLevel;
+        if (stealTailMinHeapKey_[quietest] >=
+            stealTailMinHeapKey_[position]) break;
+        const uint64_t temporaryKey = stealTailMinHeapKey_[position];
+        stealTailMinHeapKey_[position] = stealTailMinHeapKey_[quietest];
+        stealTailMinHeapKey_[quietest] = temporaryKey;
         position = quietest;
     }
 }
@@ -1162,8 +1187,16 @@ inline void VoiceManager::StealTailHeapSiftDown(uint32_t position) {
 inline void VoiceManager::BuildStealTailMinHeap() {
     stealTailMinHeapCount_ = (std::min)(stealTailCount_, kStealTailReserve);
     for (uint32_t i = 0; i < stealTailMinHeapCount_; ++i) {
-        stealTailMinHeap_[i] = stealTailList_[i];
-        stealTailMinHeapLevel_[i] = ComputeTailLevel(stealTailList_[i]);
+        const uint32_t tailSlot = stealTailList_[i];
+        const float level = ComputeTailLevel(tailSlot);
+        uint32_t levelBits = 0u;
+        std::memcpy(&levelBits, &level, sizeof(levelBits));
+        // Tail levels are finite and non-negative, so IEEE-754 bit order is
+        // numeric order. The low word preserves the existing list-position
+        // tie rule without a second load or floating-point branch.
+        stealTailMinHeapKey_[i] =
+            (static_cast<uint64_t>(levelBits) << 32u) |
+            stealTailPosition_[tailSlot];
     }
     if (stealTailMinHeapCount_ > 1u) {
         for (uint32_t position = stealTailMinHeapCount_ / 2u;
@@ -1185,8 +1218,13 @@ inline uint32_t VoiceManager::SelectStealTailSlot(float outgoingLevel) {
 
     if (!stealTailMinHeapValid_ || stealTailMinHeapFrame_ != currentFrame_)
         BuildStealTailMinHeap();
-    const uint32_t quietest = stealTailMinHeap_[0];
-    const float quietestLevel = stealTailMinHeapLevel_[0];
+    const uint32_t quietestPosition = static_cast<uint32_t>(
+        stealTailMinHeapKey_[0]);
+    const uint32_t quietest = stealTailList_[quietestPosition];
+    const uint32_t quietestBits = static_cast<uint32_t>(
+        stealTailMinHeapKey_[0] >> 32u);
+    float quietestLevel = 0.0f;
+    std::memcpy(&quietestLevel, &quietestBits, sizeof(quietestLevel));
     return outgoingLevel > quietestLevel ? quietest : UINT32_MAX;
 }
 
@@ -1222,10 +1260,16 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     LinkStealTail(static_cast<VoiceHandle>(tailSlot));
     if (alreadyLinked && stealTailMinHeapValid_ &&
         stealTailMinHeapFrame_ == currentFrame_ &&
-        stealTailMinHeapCount_ != 0u && stealTailMinHeap_[0] == tailSlot) {
+        stealTailMinHeapCount_ != 0u &&
+        stealTailList_[static_cast<uint32_t>(stealTailMinHeapKey_[0])] ==
+            tailSlot) {
         // SelectStealTailSlot accepts a replacement only when it is louder
         // than the current root, so the updated root can move only downward.
-        stealTailMinHeapLevel_[0] = outgoingLevel;
+        uint32_t levelBits = 0u;
+        std::memcpy(&levelBits, &outgoingLevel, sizeof(levelBits));
+        stealTailMinHeapKey_[0] =
+            (static_cast<uint64_t>(levelBits) << 32u) |
+            stealTailPosition_[tailSlot];
         StealTailHeapSiftDown(0u);
     }
 }
@@ -1959,7 +2003,14 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     if (freeTop_ != 0u || !IsStableConfiguration(setup)) return false;
 
     uint32_t selectedPosition = 0u;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const bool profileLaunch = (++launchProfileCounter_ & 4095u) == 0u;
+    const uint64_t profileBegin = profileLaunch ? __rdtsc() : 0u;
+#endif
     const VoiceHandle handle = PopStealCandidate(selectedPosition, true);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const uint64_t profileAfterPop = profileLaunch ? __rdtsc() : 0u;
+#endif
     if (handle == kInvalidVoice) return false;
 
     // This compact transaction is valid only when the exact winner is a
@@ -1983,6 +2034,9 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
         v.renderClass[handle] == desiredClassValue;
 
     CaptureStealTail(handle);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const uint64_t profileAfterTail = profileLaunch ? __rdtsc() : 0u;
+#endif
     ++stealCount_;
     UnlinkChannelKey(handle);
     if (!preserveChannelIndex) MoveChannelActiveInPlace(handle, channel);
@@ -2009,12 +2063,19 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     lastLinkedPlayIndex_ = playIndex;
     lastLinkedPlayVoice_ = handle;
 
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const uint64_t profileAfterLifecycle = profileLaunch ? __rdtsc() : 0u;
+#endif
+
     ApplyVoiceConfigurationFields(handle, setup, cp, desiredClass);
     if (preserveRenderIndex) {
         v.renderClass[handle] = desiredClassValue;
     } else {
         LinkRenderClass(handle);
     }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const uint64_t profileAfterConfigure = profileLaunch ? __rdtsc() : 0u;
+#endif
 
     // The eligibility test guarantees that the replacement remains in the
     // stable tree. Refresh its cached key and its one root path exactly once.
@@ -2024,6 +2085,19 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
         score, activePosition_[handle]);
     stealWinnerTree_[stealTreeLeafBase_ + handle] = stealStableKey_[handle];
     RefreshStealWinnerPath(handle);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    if (profileLaunch) {
+        const uint64_t profileEnd = __rdtsc();
+        ++launchProfileSamples_;
+        launchProfilePopCycles_ += profileAfterPop - profileBegin;
+        launchProfileTailCycles_ += profileAfterTail - profileAfterPop;
+        launchProfileLifecycleCycles_ +=
+            profileAfterLifecycle - profileAfterTail;
+        launchProfileConfigureCycles_ +=
+            profileAfterConfigure - profileAfterLifecycle;
+        launchProfileTreeCycles_ += profileEnd - profileAfterConfigure;
+    }
+#endif
     outHandle = handle;
     return true;
 }

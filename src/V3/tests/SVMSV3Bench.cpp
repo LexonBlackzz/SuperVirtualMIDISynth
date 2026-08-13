@@ -735,6 +735,8 @@ int main(int argc, char** argv) {
         "\"region_resolution\":%llu,\"launch_preparation\":%llu,\"index_and_steal\":%llu},"
         "\"group_reuse\":{\"attempts\":%llu,\"matches\":%llu,\"reserved\":%llu,"
         "\"smaller\":%llu,\"larger\":%llu,\"grouped_voices\":%u},"
+        "\"launch_profile\":{\"samples\":%llu,\"pop\":%llu,\"tail\":%llu,"
+        "\"lifecycle\":%llu,\"configure\":%llu,\"tree\":%llu},"
         "\"render_classes\":{\"sustained_loop\":%u,\"sustained_one_shot\":%u,"
         "\"transient_loop\":%u,\"release_loop\":%u,\"release_one_shot\":%u,"
         "\"generic\":%u,\"steal_tails\":%u},"
@@ -770,6 +772,12 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(voices->GetGroupReuseSmallerCountForTest()),
         static_cast<unsigned long long>(voices->GetGroupReuseLargerCountForTest()),
         groupedVoices,
+        static_cast<unsigned long long>(voices->GetLaunchProfileSamplesForTest()),
+        static_cast<unsigned long long>(voices->GetLaunchProfilePopCyclesForTest()),
+        static_cast<unsigned long long>(voices->GetLaunchProfileTailCyclesForTest()),
+        static_cast<unsigned long long>(voices->GetLaunchProfileLifecycleCyclesForTest()),
+        static_cast<unsigned long long>(voices->GetLaunchProfileConfigureCyclesForTest()),
+        static_cast<unsigned long long>(voices->GetLaunchProfileTreeCyclesForTest()),
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedLoop)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedOneShot)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::TransientLoop)],

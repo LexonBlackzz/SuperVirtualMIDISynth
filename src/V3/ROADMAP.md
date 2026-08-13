@@ -340,6 +340,9 @@ larger phase containing that item is complete.
   both 300 and 1,000 voices with byte-identical PNC3 output
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
+- [x] Pack each outgoing-tail heap level and list-position tie into one exact
+  64-bit key. This cuts tail admission bookkeeping about 25% and improves the
+  full 5.5M-note/s launch workload about 2.6-2.7% without changing PNC3 audio
 - [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the
   fixed 50-tail reserve instead of maximum voice capacity; this removes about
   271 KiB at 4,096 voices and roughly 33.5 MB from a future 500K layout while
@@ -386,6 +389,9 @@ larger phase containing that item is complete.
 - [x] Sample dense-event cycle breakdowns instead of reading the timestamp
   counter around every event; this removes the profiler's former 2x callback
   distortion while retaining scaled region, launch, dispatch, and steal costs
+- [x] Add benchmark-only sampled decomposition of saturated mono replacement
+  into victim lookup, tail capture, lifecycle indices, configuration stores,
+  and winner-tree commit, with no instrumentation in the production DLL
 - [x] Make the dense note benchmark reuse complete direct-mapped immutable
   launch plans like the live driver, rather than zeroing a 512-pointer array,
   copying cached regions, and rebuilding synthetic setup on every note. Its
