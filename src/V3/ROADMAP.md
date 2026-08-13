@@ -83,6 +83,9 @@ larger phase containing that item is complete.
 - [x] Select a named WASAPI render endpoint through `audio.device` or
   `SVMS_AUDIO_DEVICE`; a missing configured endpoint fails safely instead of
   falling back to an unintended default output
+- [x] Write `audio.device: "default"` on first creation and resolve that
+  sentinel through the current Windows default render endpoint, while retaining
+  compatibility with older empty-device configurations
 - [x] Honor explicit absolute or DLL-relative SoundFont paths; when absent or
   missing, deterministically discover DLL-local `.sf2` files and record the
   discovered filename in newly created JSON without assuming `gm.sf2`

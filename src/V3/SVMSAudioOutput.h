@@ -110,7 +110,10 @@ inline bool AudioOutput::Initialize(uint32_t sampleRate, uint32_t bufferFrames,
         return false;
     }
 
-    if (deviceName.empty()) {
+    // Empty is retained for configurations created by older V3 builds.
+    // New configurations write the explicit "default" sentinel so first-run
+    // behavior is visible and editable instead of looking unconfigured.
+    if (deviceName.empty() || _wcsicmp(deviceName.c_str(), L"default") == 0) {
         hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
     } else {
         IMMDeviceCollection* collection = nullptr;

@@ -37,8 +37,9 @@ struct EngineConfig {
     bool diagnosticsEnabled;
     bool diagnosticsWindow;
     bool diagnosticsDebugOutput;
-    // Empty selects the Windows default render endpoint. Otherwise this is
-    // an exact (case-insensitive) WASAPI endpoint friendly name.
+    // "default" (and legacy empty values) select the current Windows default
+    // render endpoint. Otherwise this is an exact (case-insensitive) WASAPI
+    // endpoint friendly name.
     std::wstring audioDevice;
     std::wstring soundFontPath;
     std::wstring configPath;

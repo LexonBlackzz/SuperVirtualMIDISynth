@@ -477,7 +477,9 @@ EngineConfig EngineConfig::Default() {
     cfg.diagnosticsWindow = false;
 #endif
     cfg.diagnosticsDebugOutput = false;
-    cfg.audioDevice.clear();
+    // Keep the first-run choice explicit in config.json while following the
+    // user's current Windows default if that default changes later.
+    cfg.audioDevice = L"default";
     cfg.soundFontPath.clear();
     return cfg;
 }

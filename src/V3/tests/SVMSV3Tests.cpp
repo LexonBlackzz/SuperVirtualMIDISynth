@@ -1483,6 +1483,8 @@ void TestJsonConfigurationLifecycle() {
     Check(fs::exists(configPath), "first run creates config.json");
     Check(created.sampleRate == 44100 && created.bufferFrames == 2048,
           "first-run JSON uses compiled audio defaults");
+    Check(created.audioDevice == L"default",
+          "first-run JSON selects the current Windows default audio output");
     Check(created.eventRingCapacity == 393216 && created.highPriorityVelocity == 96,
           "first-run JSON uses priority ingress defaults");
 #if defined(SVMS_XP_COMPAT)
@@ -1501,6 +1503,8 @@ void TestJsonConfigurationLifecycle() {
               "created JSON carries schema version");
         Check(text.find("\"correctness_mode\": true") != std::string::npos,
               "created JSON enables scalar correctness mode");
+        Check(text.find("\"device\": \"default\"") != std::string::npos,
+              "created JSON immediately records the default audio output");
         Check(text.find("Alpha Piano.SF2") != std::string::npos,
               "created JSON explicitly stores the discovered SoundFont");
     }
