@@ -16,6 +16,8 @@ struct RenderSpanContext {
     uint32_t frameStart;
     uint32_t frameCount;
     uint32_t voiceCapacity;
+    uint32_t* classChangeHandles;
+    uint32_t* classChangeCount;
 };
 
 // A backend returns false without mutating state when it cannot safely consume

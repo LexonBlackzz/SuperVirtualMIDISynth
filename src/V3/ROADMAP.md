@@ -266,6 +266,10 @@ larger phase containing that item is complete.
   and remove the redundant full transient-class validation sweep from every
   1-4-frame span; the same Morphine profile drops another roughly 11% of
   synthesis cycles with byte-identical PNC3 output
+- [x] Have transient kernels report only voices that actually cross an
+  envelope-stage boundary, eliminating copy/reclassification passes over every
+  unchanged attack/decay voice; the 2,000-voice Morphine profile drops another
+  roughly 29% of synthesis cycles and returns below its real-time deadline
 - [x] Apply each prepared SF2 layer through one transactional voice setup and
   expose attack-frame control in the dense note-burst benchmark
 - [x] Prepare complete layered note launches before pool mutation, cache the

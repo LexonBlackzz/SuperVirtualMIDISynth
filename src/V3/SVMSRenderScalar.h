@@ -1102,14 +1102,9 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             if (classKernel != nullptr && sampleData != nullptr) {
                 const RenderSpanContext context{
                     &v, sampleData, sampleDataFrames, outputLeft, outputRight,
-                    cursor, spanFrames, voices.GetMaxVoices()};
+                    cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
+                    &classChangeCount};
                 if (classKernel(context, handles, classCount)) {
-                    if (renderClass == VoiceRenderClass::TransientLoop) {
-                        for (uint32_t position = 0; position < classCount;
-                             ++position) {
-                            classChanges_[classChangeCount++] = handles[position];
-                        }
-                    }
                     continue;
                 }
             }

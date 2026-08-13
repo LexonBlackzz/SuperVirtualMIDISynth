@@ -242,6 +242,7 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
         float phase = (std::max)(0.0f, v.phases[idx]);
         float gain = v.currentGain[idx];
         uint8_t stage = v.envelopeStage[idx];
+        const uint8_t initialStage = stage;
         uint32_t attackRemaining = v.attackSamplesRemaining[idx];
         uint32_t decayRemaining = v.decaySamplesRemaining[idx];
         const float phaseStep = v.phaseIncs[idx];
@@ -311,6 +312,10 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
         v.envelopeStage[idx] = stage;
         v.attackSamplesRemaining[idx] = attackRemaining;
         v.decaySamplesRemaining[idx] = decayRemaining;
+        if (stage != initialStage && c.classChangeHandles != nullptr &&
+            c.classChangeCount != nullptr) {
+            c.classChangeHandles[(*c.classChangeCount)++] = idx;
+        }
     }
 }
 
