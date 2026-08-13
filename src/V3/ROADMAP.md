@@ -80,6 +80,9 @@ larger phase containing that item is complete.
 - [x] Apply compiled defaults, JSON, then environment overrides
 - [x] Support `SVMS_NO_DROP_EVENTS`, diagnostics, diagnostic-window/debug-output,
   and correctness-mode environment overrides
+- [x] Select one to 64 total voice-render threads through
+  `synth.render_threads`/`SVMS_RENDER_THREADS`; zero requests a conservative
+  automatic count and one preserves the original single-thread path
 - [x] Select a named WASAPI render endpoint through `audio.device` or
   `SVMS_AUDIO_DEVICE`; a missing configured endpoint fails safely instead of
   falling back to an unintended default output
@@ -493,8 +496,12 @@ larger phase containing that item is complete.
   the faster scalar short-span kernel where SSE2 lacks gather support
 - [x] Add the AVX2 dense-span renderer with CPUID/OSXSAVE/XCR0 runtime
   detection, isolated compilation, and scalar/SSE2 fallback
-- [ ] Per-worker mix buffers and tile-based render orchestration
-- [ ] Optional worker-thread backend for modern multicore CPUs
+- [x] Add persistent per-worker mix buffers and deterministic 256-handle tile
+  orchestration for sustained-loop spans, with no callback allocation and a
+  fixed-order audio-thread reduction
+- [x] Add an optional one-to-64-thread voice renderer for modern multicore
+  CPUs; keep exact-frame MIDI dispatch/lifecycle ownership on the audio thread
+  and bypass workers for tiny spans where synchronization would cost more
 - [ ] Prefetch strategies for decimated voices
 - [ ] Ensure every accelerated path retains scalar fallback coverage
 

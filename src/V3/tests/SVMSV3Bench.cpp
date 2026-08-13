@@ -89,6 +89,7 @@ struct Options {
     uint32_t noteRate = 64000;
     uint32_t keyCount = 128;
     uint32_t attackFrames = 0;
+    uint32_t renderThreads = 1;
     std::string soundFontPath;
     uint32_t pinCore = UINT32_MAX;
     bool automaticBackend = true;
@@ -139,6 +140,10 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                 options.keyCount > 128u) return false;
         } else if (std::strcmp(argv[i], "--attack-frames") == 0) {
             if (!nextNumber(options.attackFrames)) return false;
+        } else if (std::strcmp(argv[i], "--render-threads") == 0) {
+            if (!nextNumber(options.renderThreads) ||
+                options.renderThreads < 1u || options.renderThreads > 64u)
+                return false;
         } else if (std::strcmp(argv[i], "--soundfont") == 0) {
             if (i + 1 >= argc) return false;
             options.soundFontPath = argv[++i];
@@ -479,6 +484,7 @@ int main(int argc, char** argv) {
             "usage: svms_v3_bench [--voices 1..4096] [--frames 16..8192] "
             "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst] "
             "[--event-stride N] [--note-rate N] [--key-count 1..128] [--attack-frames N] [--soundfont PATH] "
+            "[--render-threads 1..64] "
             "[--backend auto|scalar|sse2|avx2] "
             "[--launch-path legacy|transactional] "
             "[--launch-plan direct|copy] "
@@ -525,6 +531,11 @@ int main(int argc, char** argv) {
     auto renderer = std::make_unique<svms::RenderScalar>();
     if (!renderer->ReserveVoiceCapacity(options.voices)) {
         std::fprintf(stderr, "cannot allocate renderer scratch\n");
+        return 3;
+    }
+    if (!renderer->ConfigureRenderThreads(options.renderThreads,
+                                          options.frames)) {
+        std::fprintf(stderr, "cannot initialize render workers\n");
         return 3;
     }
     if (!options.automaticBackend && !renderer->SetRenderBackend(options.backend)) {
@@ -724,7 +735,7 @@ int main(int argc, char** argv) {
             static_cast<svms::VoiceHandle>(voices->activeList_[position])) > 1u;
 
     std::printf(
-        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"voices\":%u,\"frames\":%u,"
+        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"render_threads\":%u,\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"voices\":%u,\"frames\":%u,"
         "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,"
         "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
         "\"voice_soa_bytes\":%zu,\"voice_manager_bytes\":%zu,\"renderer_bytes\":%zu,"
@@ -743,6 +754,7 @@ int main(int argc, char** argv) {
         "\"callback_percent\":{\"p50\":%.2f,\"p95\":%.2f,"
         "\"p99\":%.2f,\"p99_9\":%.2f,\"max\":%.2f}}\n",
         options.reference ? "reference" : "span", renderer->GetRenderBackendName(),
+        renderer->GetRenderThreadCount(),
         WorkloadName(options.workload),
         options.transactionalLaunch ? "transactional" : "legacy",
         options.copiedLaunchPlan ? "copy" : "direct",

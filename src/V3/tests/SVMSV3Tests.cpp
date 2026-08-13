@@ -2042,6 +2042,8 @@ void TestJsonConfigurationLifecycle() {
               "created JSON carries schema version");
         Check(text.find("\"correctness_mode\": true") != std::string::npos,
               "created JSON enables scalar correctness mode");
+        Check(text.find("\"render_threads\": 1") != std::string::npos,
+              "created JSON records the single-thread compatibility default");
         Check(text.find("\"device\": \"default\"") != std::string::npos,
               "created JSON immediately records the default audio output");
         Check(text.find("Alpha Piano.SF2") != std::string::npos,
@@ -2096,6 +2098,15 @@ void TestJsonConfigurationLifecycle() {
               largeEventStorage.maxEventsPerBlock == 700000u &&
               largeEventStorage.Validate(),
           "JSON accepts event storage above the former fixed ceiling");
+
+    {
+        std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
+        output << R"json({"schema_version":1,"synth":{"render_threads":8}})json";
+    }
+    svms::EngineConfig workerConfiguration = svms::EngineConfig::Load();
+    Check(workerConfiguration.renderThreads == 8u &&
+              workerConfiguration.Validate(),
+          "JSON selects a fixed voice-render thread count");
 
     {
         std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
@@ -2696,6 +2707,76 @@ void TestRenderCallbackPurity() {
           "production scalar render performs no heap allocation");
 }
 
+void TestParallelSustainedRenderDifferential() {
+    constexpr uint32_t voiceCount = 1024u;
+    constexpr uint32_t frames = 2048u;
+    std::vector<float> samples(8192u);
+    for (uint32_t index = 0u; index < samples.size(); ++index)
+        samples[index] = 0.4f * std::sin(static_cast<float>(index) * 0.037f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.interpolation = svms::InterpolationMode::Linear;
+    cfg.correctnessMode = true;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+
+    auto makeVoices = [&]() {
+        auto result = std::make_unique<svms::VoiceManager>();
+        Check(result->Initialize(voiceCount, 44100u),
+              "parallel differential allocates voice storage");
+        for (uint32_t index = 0u; index < voiceCount; ++index) {
+            const svms::VoiceHandle voice = result->AllocateVoice(
+                static_cast<uint8_t>(index & 15u),
+                static_cast<uint8_t>(24u + index % 88u), 127u);
+            result->SetVoiceSample(voice, 0u, 8192u, 64u, 8128u, 1u,
+                0.5f + static_cast<float>(index % 31u) * 0.03125f, 1u);
+            result->SetVoiceEnvelope(voice, 1.0f, 1.0f, 0u, 0u, 0u, 0u,
+                                     0.0f, 1.0f, 0.999f);
+            result->SetVoiceGain(voice, 0.0001f, 0.0001f);
+            result->RefreshMixGain(voice,
+                channels.GetParams()[index & 15u]);
+        }
+        return result;
+    };
+
+    auto serialVoices = makeVoices();
+    auto parallelVoices = makeVoices();
+    svms::RenderScalar serial;
+    svms::RenderScalar parallel;
+    Check(serial.ReserveVoiceCapacity(voiceCount) &&
+              parallel.ReserveVoiceCapacity(voiceCount) &&
+              serial.ConfigureRenderThreads(1u, frames) &&
+              parallel.ConfigureRenderThreads(4u, frames) &&
+              parallel.GetRenderThreadCount() == 4u,
+          "parallel differential starts four deterministic render lanes");
+
+    std::vector<float> serialLeft(frames, 0.0f), serialRight(frames, 0.0f);
+    std::vector<float> parallelLeft(frames, 0.0f), parallelRight(frames, 0.0f);
+    serial.RenderBlock(*serialVoices, channels, samples.data(),
+        static_cast<uint32_t>(samples.size()), serialLeft.data(),
+        serialRight.data(), frames, cfg, nullptr, 0u, true, 1000u);
+    parallel.RenderBlock(*parallelVoices, channels, samples.data(),
+        static_cast<uint32_t>(samples.size()), parallelLeft.data(),
+        parallelRight.data(), frames, cfg, nullptr, 0u, true, 1000u);
+
+    for (uint32_t frame = 0u; frame < frames; ++frame) {
+        Check(NearlyEqual(serialLeft[frame], parallelLeft[frame], 5.0e-5f) &&
+                  NearlyEqual(serialRight[frame], parallelRight[frame],
+                              5.0e-5f),
+              "parallel sustained renderer preserves waveform tolerance");
+    }
+    for (uint32_t voice = 0u; voice < voiceCount; ++voice) {
+        Check(serialVoices->v.phases[voice] ==
+                  parallelVoices->v.phases[voice] &&
+                  serialVoices->v.state[voice] ==
+                  parallelVoices->v.state[voice],
+              "parallel sustained renderer preserves exact voice state");
+    }
+}
+
 void TestCallbackSourcePurity() {
     const std::filesystem::path sourcePath =
         std::filesystem::path(__FILE__).parent_path().parent_path() / "SVMSDriver.cpp";
@@ -2751,6 +2832,7 @@ int main() {
     TestSpanRendererDifferential();
     TestRenderBackendSelectionAndDenseEquivalence();
     TestTransientClassKernelDifferential();
+    TestParallelSustainedRenderDifferential();
     TestRenderCallbackPurity();
     TestCallbackSourcePurity();
 

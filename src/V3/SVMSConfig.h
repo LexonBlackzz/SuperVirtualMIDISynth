@@ -10,6 +10,9 @@ struct EngineConfig {
     uint32_t sampleRate;
     uint32_t bufferFrames;
     uint32_t maxVoices;
+    // Total voice-render threads. 1 preserves the original audio-thread-only
+    // path; 0 selects a conservative automatic count.
+    uint32_t renderThreads;
     uint32_t maxSampleCacheMB;
     InterpolationMode interpolation;
     FilterType filterType;

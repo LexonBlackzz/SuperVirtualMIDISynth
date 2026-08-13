@@ -17,6 +17,7 @@ struct DiagStats {
     float masterVolume;
     bool waveOutFallback;
     RenderBackend renderBackend;
+    uint32_t renderThreadCount;
     uint32_t activeVoices;
     uint32_t maxVoices;
     uint32_t releasingVoices;
@@ -168,7 +169,10 @@ static void OnPaint(HWND hwnd) {
 
     const wchar_t* renderer = s.renderBackend == RenderBackend::AVX2 ? L"AVX2"
         : s.renderBackend == RenderBackend::SSE2 ? L"SSE2" : L"scalar";
-    DrawStat(memDC, kPadX, y, L"Renderer:         ", renderer);
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%ls, %u thread%ls",
+                  renderer, s.renderThreadCount,
+                  s.renderThreadCount == 1u ? L"" : L"s");
+    DrawStat(memDC, kPadX, y, L"Renderer:         ", buf);
     y += kLineH;
 
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.1f%%", s.cpuPercent);
@@ -404,6 +408,7 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         bool soundFontLoaded, uint32_t sampleRate,
                         uint32_t bufferFrames, float masterVolume,
                         bool waveOutFallback, RenderBackend renderBackend,
+                        uint32_t renderThreadCount,
                         float schedulerPercent, float dispatchPercent,
                         float synthesisPercent, float postPercent,
                         uint32_t eventsThisBlock, uint32_t scheduledEvents,
@@ -421,6 +426,7 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     stats.masterVolume = masterVolume;
     stats.waveOutFallback = waveOutFallback;
     stats.renderBackend = renderBackend;
+    stats.renderThreadCount = renderThreadCount;
     stats.activeVoices = activeVoices;
     stats.maxVoices = maxVoices;
     stats.releasingVoices = releasingVoices;

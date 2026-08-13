@@ -875,6 +875,21 @@ bool Driver::Initialize() {
             cfg.maxVoices);
         return false;
     }
+    uint32_t renderThreads = cfg.renderThreads;
+    if (renderThreads == 0u) {
+        SYSTEM_INFO systemInfo{};
+        GetSystemInfo(&systemInfo);
+        renderThreads = (std::max)(1u, (std::min)(8u,
+            static_cast<uint32_t>(systemInfo.dwNumberOfProcessors)));
+    }
+    if (!renderScalar->ConfigureRenderThreads(renderThreads, bufferCapacity)) {
+        LOG("Configuration warning: could not start %u render threads; "
+            "using the audio thread only", renderThreads);
+        renderScalar->ConfigureRenderThreads(1u, bufferCapacity);
+    }
+    LOG("Voice renderer initialized: backend=%s threads=%u",
+        renderScalar->GetRenderBackendName(),
+        renderScalar->GetRenderThreadCount());
 
     // Register the EventDispatcher callback so RenderScalar can dispatch
     // MIDI events at their exact sub-sample positions during RenderBlock.
@@ -1898,6 +1913,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                                    snap->masterVolume,
                                   UsesXPWaveOut(self->audioOutput),
                                   render->GetRenderBackend(),
+                                  render->GetRenderThreadCount(),
                                   s_schedulerSmoothed, s_dispatchSmoothed,
                                   s_synthesisSmoothed, s_postSmoothed,
                                   evCount, self->eventScheduler_.Size(),

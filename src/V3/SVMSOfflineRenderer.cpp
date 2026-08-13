@@ -25,6 +25,7 @@ struct Options {
     uint32_t sampleRate = 44100;
     uint32_t blockFrames = 8192;
     uint32_t maxVoices = 4096;
+    uint32_t renderThreads = 1;
     uint32_t eventBufferMB = 128;
     uint32_t maxTailSeconds = 30;
     float masterVolume = 0.1f;
@@ -53,6 +54,7 @@ void Usage() {
            L"svms_v3_render <input.mid> --scan-only\n\n"
            L"  --sample-rate N       Output rate (default 44100)\n"
            L"  --max-voices N        Voice limit, 1-4096 (default 4096)\n"
+           L"  --render-threads N     Total voice-render threads, 1-64 (default 1)\n"
            L"  --event-buffer-mb N   Parsed-event ring (default 128 MiB)\n"
            L"  --block-frames N      Render block size (default 8192)\n"
            L"  --tail-seconds N      Maximum natural-release tail (default 30)\n"
@@ -77,6 +79,7 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
         else if (arg == L"--scan-only") o.scanOnly = true;
         else if (arg == L"--sample-rate") { const auto p=value(); if (!p || !ParseU32(p,8000,384000,o.sampleRate)) return false; }
         else if (arg == L"--max-voices") { const auto p=value(); if (!p || !ParseU32(p,1,kMaxPolyphony,o.maxVoices)) return false; }
+        else if (arg == L"--render-threads") { const auto p=value(); if (!p || !ParseU32(p,1,64,o.renderThreads)) return false; }
         else if (arg == L"--event-buffer-mb") { const auto p=value(); if (!p || !ParseU32(p,1,4096,o.eventBufferMB)) return false; }
         else if (arg == L"--block-frames") { const auto p=value(); if (!p || !ParseU32(p,16,1048576,o.blockFrames)) return false; }
         else if (arg == L"--tail-seconds") { const auto p=value(); if (!p || !ParseU32(p,0,3600,o.maxTailSeconds)) return false; }
@@ -158,6 +161,9 @@ public:
         prepared_.resize(sf2_->regionCount);
         if (!voices_.Initialize(maxVoices_,rate_)) { error="cannot allocate voice storage"; return false; }
         if (!renderer_.ReserveVoiceCapacity(maxVoices_)) { error="cannot allocate renderer scratch"; return false; }
+        if (!renderer_.ConfigureRenderThreads(o.renderThreads, o.blockFrames)) {
+            error="cannot initialize render workers"; return false;
+        }
         channels_.Reset(); channels_.SetMasterVolume(master_);
         cfg_={master_,1.0f,0.0f,0,false,false,false,false,false,false,
               InterpolationMode::Linear,FilterType::None,PanLaw::ConstantPower,true};

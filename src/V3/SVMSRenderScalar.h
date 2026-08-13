@@ -7,6 +7,7 @@
 #include "SVMSEnvelope.h"
 #include "SVMSPageAllocator.h"
 #include "SVMSRenderKernels.h"
+#include "SVMSRenderWorkers.h"
 #include <algorithm>
 #include <cstdlib>
 #include <malloc.h>
@@ -182,11 +183,15 @@ public:
     RenderScalar& operator=(const RenderScalar&) = delete;
 
     bool ReserveVoiceCapacity(uint32_t voiceCapacity);
+    bool ConfigureRenderThreads(uint32_t totalRenderThreads,
+                                uint32_t maximumBlockFrames);
+    uint32_t GetRenderThreadCount() const;
     uint32_t GetScratchCapacity() const { return scratchCapacity_; }
     size_t GetAllocatedBytes() const {
         return sizeof(*this) +
             static_cast<size_t>(scratchCapacity_) *
-                (sizeof(uint32_t) + sizeof(SpanRetirement));
+                (sizeof(uint32_t) + sizeof(SpanRetirement)) +
+            (workerPool_ ? workerPool_->GetAllocatedBytes() : 0u);
     }
 
     void RenderBlock(VoiceManager& voices, const ChannelCache& channels,
@@ -234,20 +239,34 @@ private:
     alignas(64) uint32_t tailFrameCounts_[kStealTailReserve];
     SpanRetirement* retirements_;
     uint32_t scratchCapacity_;
+    RenderWorkerPool* workerPool_;
 };
 
 inline RenderScalar::RenderScalar()
     : dispatcher_(nullptr), batchDispatcher_(nullptr), dispatcherUserData_(nullptr),
       kernelSet_(&SelectBestRenderKernelSet()), classChanges_(nullptr),
-      retirements_(nullptr), scratchCapacity_(0u) {
+      retirements_(nullptr), scratchCapacity_(0u),
+      workerPool_(new (std::nothrow) RenderWorkerPool()) {
     const bool reserved = ReserveVoiceCapacity(kMaxVoicesDefault);
     assert(reserved);
     (void)reserved;
 }
 
 inline RenderScalar::~RenderScalar() {
+    delete workerPool_;
     _aligned_free(classChanges_);
     _aligned_free(retirements_);
+}
+
+inline bool RenderScalar::ConfigureRenderThreads(
+    uint32_t totalRenderThreads, uint32_t maximumBlockFrames) {
+    if (!workerPool_) return totalRenderThreads <= 1u;
+    return workerPool_->Initialize(totalRenderThreads, maximumBlockFrames,
+                                   scratchCapacity_);
+}
+
+inline uint32_t RenderScalar::GetRenderThreadCount() const {
+    return workerPool_ ? workerPool_->GetThreadCount() : 1u;
 }
 
 inline bool RenderScalar::ReserveVoiceCapacity(uint32_t voiceCapacity) {
@@ -1155,6 +1174,21 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                 &v, sampleData, sampleDataFrames, outputLeft, outputRight,
                 cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
                 &classChangeCount};
+            if (renderClass == VoiceRenderClass::SustainedLoop &&
+                classKernel != nullptr && sampleData != nullptr &&
+                workerPool_ && workerPool_->ShouldParallelize(
+                    voices.GetRenderClassCount(renderClass), spanFrames)) {
+                workerPool_->BeginSpan(context);
+                bool queued = true;
+                voices.ForEachRenderClassBlock(renderClass,
+                    [&](const uint32_t* handles, uint32_t classCount) {
+                        if (queued) {
+                            queued = workerPool_->AddClassRange(
+                                classKernel, handles, classCount);
+                        }
+                    });
+                if (queued && workerPool_->Execute()) continue;
+            }
             voices.ForEachRenderClassBlock(renderClass,
                 [&](const uint32_t* handles, uint32_t classCount) {
                 if (classKernel != nullptr && sampleData != nullptr &&

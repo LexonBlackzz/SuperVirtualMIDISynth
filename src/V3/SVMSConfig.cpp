@@ -167,6 +167,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"synth", {
             {"soundfont", WideToUtf8(cfg.soundFontPath)},
             {"max_voices", cfg.maxVoices},
+            {"render_threads", cfg.renderThreads},
             {"master_volume", cfg.masterVolume},
             {"velocity_curve", cfg.velocityCurve},
             {"velocity_floor", cfg.velocityFloor},
@@ -334,6 +335,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("synth"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "max_voices", cfg.maxVoices, 1u, kMaxPolyphony))
             AppendWarning(cfg.configWarning, "synth.max_voices");
+        if (!ReadValue(*it, "render_threads", cfg.renderThreads, 0u, 64u))
+            AppendWarning(cfg.configWarning, "synth.render_threads");
         if (!ReadValue(*it, "master_volume", cfg.masterVolume, 0.0f, 4.0f))
             AppendWarning(cfg.configWarning, "synth.master_volume");
         if (!ReadValue(*it, "velocity_curve", cfg.velocityCurve, 0.1f, 10.0f))
@@ -423,6 +426,16 @@ void ApplyEnvironment(EngineConfig& cfg) {
         static_cast<DWORD>(_countof(audioDevice)));
     if (audioDeviceLength > 0u && audioDeviceLength < _countof(audioDevice))
         cfg.audioDevice.assign(audioDevice, audioDeviceLength);
+    wchar_t renderThreads[32]{};
+    const DWORD renderThreadLength = GetEnvironmentVariableW(
+        L"SVMS_RENDER_THREADS", renderThreads,
+        static_cast<DWORD>(_countof(renderThreads)));
+    if (renderThreadLength > 0u && renderThreadLength < _countof(renderThreads)) {
+        wchar_t* end = nullptr;
+        const unsigned long value = wcstoul(renderThreads, &end, 10);
+        if (end != renderThreads && *end == L'\0' && value <= 64u)
+            cfg.renderThreads = static_cast<uint32_t>(value);
+    }
     if (EnvironmentFlag(L"SVMS_NO_DROP_EVENTS", false))
         cfg.eventOverflowMode = EventOverflowMode::LosslessBackpressure;
     cfg.correctnessMode = EnvironmentFlag(L"SVMS_CORRECTNESS_MODE", cfg.correctnessMode);
@@ -438,6 +451,7 @@ EngineConfig EngineConfig::Default() {
     cfg.sampleRate = kDefaultSampleRate;
     cfg.bufferFrames = kDefaultBufferFrames;
     cfg.maxVoices = kMaxVoicesDefault;
+    cfg.renderThreads = 1u;
     cfg.maxSampleCacheMB = 256;
     cfg.interpolation = InterpolationMode::Linear;
     cfg.filterType = FilterType::None;
@@ -554,6 +568,7 @@ bool EngineConfig::Validate() const {
     return sampleRate >= 8000 && sampleRate <= 384000 &&
            bufferFrames >= 16 && bufferFrames <= 8192 &&
            maxVoices >= 1 && maxVoices <= kMaxPolyphony &&
+           renderThreads <= 64u &&
            masterVolume >= 0.0f && masterVolume <= 4.0f &&
            velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
            velocityFloor >= 0.0f && velocityFloor < 1.0f &&

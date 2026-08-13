@@ -39,6 +39,7 @@ set(SOURCES
     SVMSDriver.cpp
     SVMSDiagWindow.cpp
     SVMSRenderKernels.cpp
+    SVMSRenderWorkers.cpp
     SVMSRenderDispatch.cpp
     SVMSRenderKernelsSSE2.cpp
 )
@@ -55,6 +56,7 @@ set(HEADERS
     SVMSChannelCache.h
     SVMSRenderScalar.h
     SVMSRenderKernels.h
+    SVMSRenderWorkers.h
     SVMSAudioOutput.h
     SVMSAudioOutputDirectSound.h
     SVMSSoundFont.h
@@ -230,6 +232,7 @@ if(NOT SVMS_XP_COMPAT)
         SVMSMidiStream.cpp
         SVMSSoundFont.cpp
         SVMSRenderKernels.cpp
+        SVMSRenderWorkers.cpp
         SVMSRenderDispatch.cpp
         SVMSRenderKernelsSSE2.cpp
         SVMSRenderKernelsAVX2.cpp)
@@ -266,6 +269,7 @@ if(SVMS_BUILD_TESTS)
         SVMSConfig.cpp
         SVMSSoundFont.cpp
         SVMSRenderKernels.cpp
+        SVMSRenderWorkers.cpp
         SVMSRenderDispatch.cpp
         SVMSRenderKernelsSSE2.cpp
     )
@@ -333,7 +337,7 @@ if(SVMS_BUILD_TESTS)
         target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
 
-        add_executable(svms_v3_bench tests/SVMSV3Bench.cpp SVMSSoundFont.cpp SVMSRenderKernels.cpp
+        add_executable(svms_v3_bench tests/SVMSV3Bench.cpp SVMSSoundFont.cpp SVMSRenderKernels.cpp SVMSRenderWorkers.cpp
             SVMSRenderDispatch.cpp SVMSRenderKernelsSSE2.cpp SVMSRenderKernelsAVX2.cpp)
         target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
             SVMS_ENABLE_REFERENCE_RENDERER=1)
