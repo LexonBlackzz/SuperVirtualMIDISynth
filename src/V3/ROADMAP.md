@@ -369,6 +369,9 @@ larger phase containing that item is complete.
   callback instead of once per successful note-on. Exact lifetime counters and
   public voice/steal/render telemetry remain per event, while a 5.5M-NPS stream
   avoids roughly 110 million redundant detail stores per second
+- [x] Fuse diagnostic peak collection into the mandatory stereo interleave
+  pass, and omit peak arithmetic entirely when diagnostics are disabled; this
+  removes one complete left/right mix-buffer read pass from every callback
 - [x] Add full-velocity note-burst rates/key spreads and optional real-SF2
   layered-region matching to `svms_v3_bench`; characterize the supplied Krash
   corpus at 94k average and 792k peak note-ons/s

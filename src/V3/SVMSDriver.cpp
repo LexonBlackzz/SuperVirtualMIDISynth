@@ -1657,25 +1657,29 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                         static_cast<uint64_t>(self->virtualRenderSample_));
     const uint64_t profileRenderEnd = profileCallback ? __rdtsc() : 0u;
 
-    float renderPeak = 0.0f;
-    for (uint32_t i = 0; i < numFrames; ++i) {
-        renderPeak = (std::max)(renderPeak, std::fabs(leftBuf[i]));
-        renderPeak = (std::max)(renderPeak, std::fabs(rightBuf[i]));
-    }
-    self->sf2Telemetry_.renderPeak = renderPeak;
-    if (self->sf2Telemetry_.lastVoiceHandle < vm->GetMaxVoices()) {
-        const uint32_t h = self->sf2Telemetry_.lastVoiceHandle;
-        self->sf2Telemetry_.lastPhase = vm->v.phases[h];
-    }
-
     // ── Advance virtual render clock for the next callback ──────────
     self->virtualRenderSample_ += static_cast<int64_t>(numFrames);
 
     // masterVolume is already included in ChannelCache's per-channel mix
     // gains. Applying it here again would attenuate the output twice.
+    float renderPeak = 0.0f;
+    const bool collectRenderPeak = self->diagnosticsEnabled_;
     for (uint32_t i = 0; i < numFrames; ++i) {
-        output[i * 2u] = leftBuf[i];
-        output[i * 2u + 1u] = rightBuf[i];
+        const float left = leftBuf[i];
+        const float right = rightBuf[i];
+        output[i * 2u] = left;
+        output[i * 2u + 1u] = right;
+        if (collectRenderPeak) {
+            renderPeak = (std::max)(renderPeak, std::fabs(left));
+            renderPeak = (std::max)(renderPeak, std::fabs(right));
+        }
+    }
+    if (collectRenderPeak) {
+        self->sf2Telemetry_.renderPeak = renderPeak;
+        if (self->sf2Telemetry_.lastVoiceHandle < vm->GetMaxVoices()) {
+            const uint32_t h = self->sf2Telemetry_.lastVoiceHandle;
+            self->sf2Telemetry_.lastPhase = vm->v.phases[h];
+        }
     }
     // Filter the final limited samples in the same loop so the 3 Hz cutoff
     // neither changes gain detection nor requires another memory pass.
