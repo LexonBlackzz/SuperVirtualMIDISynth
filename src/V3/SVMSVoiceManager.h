@@ -1426,6 +1426,30 @@ inline void VoiceManager::BuildStealHeap() {
 inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
                                                     bool reserveVolatileRoot) {
     if (!stealHeapValid_) BuildStealHeap();
+
+    // Saturated sustained playback has no decay/release candidates. The
+    // tournament root is already the exact exhaustive winner, including the
+    // active-position tie, so avoid constructing/comparing generic candidate
+    // records and touching the empty volatile heap on every note launch.
+    if (stealHeapCount_ > 0u && stealVolatileCount_ == 0u) {
+        const uint64_t rootKey = stealWinnerTree_[1];
+        const uint32_t winnerPosition =
+            UINT32_MAX - static_cast<uint32_t>(rootKey);
+        assert(rootKey != 0u && winnerPosition < activeCount_);
+        const VoiceHandle winner = static_cast<VoiceHandle>(
+            activeList_[winnerPosition]);
+        assert(stealStableKey_[winner] == rootKey);
+        activePosition = winnerPosition;
+        if (reserveVolatileRoot) {
+            stealCandidateReserved_[winner] = 2u;
+        } else {
+            --stealHeapCount_;
+            stealWinnerTree_[stealTreeLeafBase_ + winner] = 0u;
+            RefreshStealWinnerPath(winner);
+        }
+        return winner;
+    }
+
     // Transient gains change while samples render, not between equal-frame
     // MIDI events. Rebuild once when the output frame advances and keep exact
     // O(log N) replacement updates for the rest of that frame.
