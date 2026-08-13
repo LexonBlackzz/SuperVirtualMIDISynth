@@ -1218,14 +1218,12 @@ inline uint32_t VoiceManager::SelectStealTailSlot(float outgoingLevel) {
 
     if (!stealTailMinHeapValid_ || stealTailMinHeapFrame_ != currentFrame_)
         BuildStealTailMinHeap();
-    const uint32_t quietestPosition = static_cast<uint32_t>(
-        stealTailMinHeapKey_[0]);
-    const uint32_t quietest = stealTailList_[quietestPosition];
-    const uint32_t quietestBits = static_cast<uint32_t>(
-        stealTailMinHeapKey_[0] >> 32u);
+    const uint64_t quietestKey = stealTailMinHeapKey_[0];
+    const uint32_t quietestBits = static_cast<uint32_t>(quietestKey >> 32u);
     float quietestLevel = 0.0f;
     std::memcpy(&quietestLevel, &quietestBits, sizeof(quietestLevel));
-    return outgoingLevel > quietestLevel ? quietest : UINT32_MAX;
+    if (outgoingLevel <= quietestLevel) return UINT32_MAX;
+    return stealTailList_[static_cast<uint32_t>(quietestKey)];
 }
 
 inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {

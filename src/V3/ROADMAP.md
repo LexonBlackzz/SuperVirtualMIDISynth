@@ -343,6 +343,9 @@ larger phase containing that item is complete.
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact
   64-bit key. This cuts tail admission bookkeeping about 25% and improves the
   full 5.5M-note/s launch workload about 2.6-2.7% without changing PNC3 audio
+- [x] Resolve the packed root's tail slot only after its level passes the
+  strict-louder admission test; the common full-reserve rejection path gains
+  another roughly 0.7-1.0% at 5.5M note-ons/s with identical output
 - [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the
   fixed 50-tail reserve instead of maximum voice capacity; this removes about
   271 KiB at 4,096 voices and roughly 33.5 MB from a future 500K layout while
