@@ -54,10 +54,18 @@ uint64_t gRegionResolveCycles = 0u;
 uint64_t gLaunchPrepareCycles = 0u;
 uint64_t gMatchedRegions = 0u;
 uint64_t gBreakdownSampleCounter = 0u;
-constexpr uint32_t kBreakdownSampleInterval = 1024u;
+uint64_t gRdtscPairOverhead = 0u;
+constexpr uint32_t kBreakdownSampleInterval = 4096u;
 static_assert((kBreakdownSampleInterval &
                (kBreakdownSampleInterval - 1u)) == 0u,
               "breakdown sample interval must be a power of two");
+
+uint64_t ScaledProfileDelta(uint64_t begin, uint64_t end, uint32_t scale,
+                            uint32_t timestampPairs = 1u) {
+    const uint64_t elapsed = end - begin;
+    const uint64_t overhead = gRdtscPairOverhead * timestampPairs;
+    return (elapsed > overhead ? elapsed - overhead : 0u) * scale;
+}
 
 double Percentile(std::vector<double> values, double percentile) {
     if (values.empty()) return 0.0;
@@ -214,13 +222,42 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
     return true;
 }
 
+void PrepareSyntheticLaunchPlan(svms::VoiceConfiguration* setups,
+                                uint32_t count, uint32_t sampleFrames,
+                                uint8_t note, uint32_t attackFrames) {
+    constexpr uint32_t regionFrames = 2048u;
+    const uint32_t regionCount = sampleFrames / regionFrames;
+    for (uint32_t layer = 0u; layer < count; ++layer) {
+        const uint32_t identity = static_cast<uint32_t>(note) * 8u + layer;
+        const uint32_t start = (identity % regionCount) * regionFrames;
+        auto& setup = setups[layer];
+        setup = svms::VoiceConfiguration{};
+        setup.sampleStart = start;
+        setup.sampleEnd = start + regionFrames;
+        setup.loopStart = start + 16u;
+        setup.loopEnd = start + regionFrames - 16u;
+        setup.loopMode = 1u;
+        setup.phaseStep = 0.5f +
+            static_cast<float>(identity % 97u) / 64.0f;
+        setup.basePhaseStep = setup.phaseStep;
+        setup.initialGain = 1.0f;
+        setup.attackSamples = attackFrames;
+        setup.attackGainStep = attackFrames > 0u
+            ? setup.initialGain / static_cast<float>(attackFrames) : 0.0f;
+        setup.sustainLevel = 0.7f;
+        setup.releaseDecay = 0.9999999f;
+        setup.gainLeft = setup.gainRight = 0.001f;
+    }
+}
+
 void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channels,
                    uint32_t& sequence, uint32_t count, uint32_t sampleFrames,
                    const svms::RenderEvent* sourceEvent = nullptr,
                    uint32_t attackFrames = 0u,
                    bool transactional = false,
                    bool copiedLaunchPlan = false,
-                   uint32_t profileScale = 0u) {
+                   uint32_t profileScale = 0u,
+                   const svms::VoiceConfiguration* preparedSetups = nullptr) {
     constexpr uint32_t regionFrames = 2048;
     const uint32_t regionCount = sampleFrames / regionFrames;
     // Every physical SF2 region produced by one MIDI note belongs to one
@@ -228,38 +265,25 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
     // same atomic stereo-stealing path as the production driver.
     const uint32_t playIndex = sequence + 1u;
     if (transactional && count <= 8u) {
-        const uint64_t prepareBegin = profileScale != 0u ? __rdtsc() : 0u;
+        const uint64_t prepareBegin =
+            profileScale != 0u && !preparedSetups ? __rdtsc() : 0u;
         const uint8_t channel = sourceEvent ? sourceEvent->channel
             : static_cast<uint8_t>(sequence & 15u);
         const uint8_t note = sourceEvent ? sourceEvent->data1
             : static_cast<uint8_t>(24u + sequence % 88u);
         const uint8_t velocity = sourceEvent ? sourceEvent->data2
             : static_cast<uint8_t>(64u + sequence % 64u);
-        svms::VoiceConfiguration setups[8]{};
+        svms::VoiceConfiguration localSetups[8]{};
         svms::VoiceHandle handles[8]{};
-        for (uint32_t layer = 0u; layer < count; ++layer) {
-            const uint32_t layerSequence = sequence + layer;
-            const uint32_t start = (layerSequence % regionCount) * regionFrames;
-            auto& setup = setups[layer];
-            setup.sampleStart = start;
-            setup.sampleEnd = start + regionFrames;
-            setup.loopStart = start + 16u;
-            setup.loopEnd = start + regionFrames - 16u;
-            setup.loopMode = 1u;
-            setup.phaseStep = 0.5f +
-                static_cast<float>(layerSequence % 97u) / 64.0f;
-            setup.basePhaseStep = setup.phaseStep;
-            setup.initialGain = 1.0f;
-            setup.attackSamples = attackFrames;
-            setup.attackGainStep = attackFrames > 0u
-                ? setup.initialGain / static_cast<float>(attackFrames) : 0.0f;
-            setup.sustainLevel = 0.7f;
-            setup.releaseDecay = 0.9999999f;
-            setup.gainLeft = setup.gainRight = 0.001f;
+        const svms::VoiceConfiguration* setups = preparedSetups;
+        if (!setups) {
+            PrepareSyntheticLaunchPlan(localSetups, count, sampleFrames, note,
+                                       attackFrames);
+            setups = localSetups;
         }
-        if (profileScale != 0u)
-            gLaunchPrepareCycles +=
-                (__rdtsc() - prepareBegin) * profileScale;
+        if (prepareBegin != 0u)
+            gLaunchPrepareCycles += ScaledProfileDelta(
+                prepareBegin, __rdtsc(), profileScale);
         sequence += count;
         if (copiedLaunchPlan) {
             svms::VoiceConfiguration copied[8]{};
@@ -309,6 +333,12 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
     }
 }
 
+struct BenchLaunchPlanEntry {
+    uint64_t tag = UINT64_MAX;
+    uint8_t count = 0u;
+    svms::VoiceConfiguration setups[8]{};
+};
+
 struct MixedDispatchContext {
     svms::VoiceManager* voices;
     svms::ChannelCache* channels;
@@ -320,68 +350,82 @@ struct MixedDispatchContext {
     uint32_t attackFrames;
     bool transactionalLaunch;
     bool copiedLaunchPlan;
-    uint16_t regionCacheCount[128];
-    uint32_t regionCacheIndices[128][8];
+    BenchLaunchPlanEntry* launchPlanCache;
 };
 
 void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
-    const uint32_t profileScale = gCollectBreakdown &&
-        ((gBreakdownSampleCounter++ &
-          (kBreakdownSampleInterval - 1u)) == 0u)
+    const uint32_t sampleSlot = static_cast<uint32_t>(
+        gBreakdownSampleCounter++ & (kBreakdownSampleInterval - 1u));
+    const uint32_t dispatchScale = gCollectBreakdown && sampleSlot == 0u
         ? kBreakdownSampleInterval : 0u;
-    const uint64_t dispatchBegin = profileScale != 0u ? __rdtsc() : 0u;
+    const uint32_t regionScale = gCollectBreakdown && sampleSlot == 1u
+        ? kBreakdownSampleInterval : 0u;
+    const uint32_t stealScale = gCollectBreakdown && sampleSlot == 2u
+        ? kBreakdownSampleInterval : 0u;
+    const uint64_t dispatchBegin =
+        dispatchScale != 0u ? __rdtsc() : 0u;
     auto* context = static_cast<MixedDispatchContext*>(userData);
     auto& voices = *context->voices;
     auto& channels = *context->channels;
     switch (event.type) {
         case svms::RenderEventType::NoteOn: {
             const uint64_t resolveBegin =
-                profileScale != 0u ? __rdtsc() : 0u;
+                regionScale != 0u ? __rdtsc() : 0u;
             uint32_t layerCount = 1u;
-            if (context->soundFont) {
-                const svms::SFSampleRegion* regions[512]{};
-                const uint16_t cachedCount =
-                    context->regionCacheCount[event.data1];
-                if (cachedCount != UINT16_MAX) {
-                    layerCount = cachedCount;
-                    for (uint32_t i = 0; i < layerCount; ++i)
-                        regions[i] = &context->soundFont->regions[
-                            context->regionCacheIndices[event.data1][i]];
-                } else {
+            uint32_t planHash = context->presetIndex * 0x9e3779b9u;
+            planHash ^= static_cast<uint32_t>(event.data1) * 0x85ebca6bu;
+            planHash ^= static_cast<uint32_t>(event.data2) * 0xc2b2ae35u;
+            planHash ^= static_cast<uint32_t>(event.channel) * 0x27d4eb2fu;
+            planHash ^= planHash >> 16u;
+            const uint64_t planTag =
+                (static_cast<uint64_t>(context->presetIndex) << 19u) |
+                (static_cast<uint64_t>(event.channel) << 15u) |
+                (static_cast<uint64_t>(event.data1) << 8u) | event.data2;
+            auto& plan = context->launchPlanCache[planHash & 4095u];
+            const bool planHit = plan.tag == planTag && plan.count != 0u;
+            if (planHit) {
+                layerCount = plan.count;
+            } else {
+                if (context->soundFont) {
+                    const svms::SFSampleRegion* regions[512];
                     layerCount = svms::sf2_find_regions(
                         context->soundFont, context->presetIndex, event.data1,
                         event.data2, regions, 512u);
-                    if (layerCount <= 8u) {
-                        context->regionCacheCount[event.data1] =
-                            static_cast<uint16_t>(layerCount);
-                        for (uint32_t i = 0; i < layerCount; ++i)
-                            context->regionCacheIndices[event.data1][i] =
-                                static_cast<uint32_t>(regions[i] -
-                                    context->soundFont->regions);
-                    }
                 }
-                gMatchedRegions += layerCount;
-                if (layerCount == 0u) break;
+                if (layerCount == 0u || layerCount > 8u) break;
+                const uint64_t prepareBegin =
+                    regionScale != 0u ? __rdtsc() : 0u;
+                PrepareSyntheticLaunchPlan(plan.setups, layerCount,
+                                           context->sampleFrames, event.data1,
+                                           context->attackFrames);
+                if (regionScale != 0u)
+                    gLaunchPrepareCycles += ScaledProfileDelta(
+                        prepareBegin, __rdtsc(), regionScale);
+                plan.tag = planTag;
+                plan.count = static_cast<uint8_t>(layerCount);
             }
-            if (profileScale != 0u)
-                gRegionResolveCycles +=
-                    (__rdtsc() - resolveBegin) * profileScale;
-            if (profileScale != 0u) {
+            gMatchedRegions += layerCount;
+            if (regionScale != 0u)
+                gRegionResolveCycles += ScaledProfileDelta(
+                    resolveBegin, __rdtsc(), regionScale);
+            if (stealScale != 0u) {
                 const uint64_t begin = __rdtsc();
                 PerformSteals(voices, channels, context->sequence, layerCount,
                               context->sampleFrames, &event,
                               context->attackFrames,
                               context->transactionalLaunch,
-                              context->copiedLaunchPlan, profileScale);
+                              context->copiedLaunchPlan, 0u,
+                              plan.setups);
                 const uint64_t end = __rdtsc();
-                gStealCycles += (end - begin) * profileScale;
+                gStealCycles += ScaledProfileDelta(
+                    begin, end, stealScale);
                 break;
             }
             PerformSteals(voices, channels, context->sequence, layerCount,
                           context->sampleFrames, &event,
                           context->attackFrames,
                           context->transactionalLaunch,
-                          context->copiedLaunchPlan);
+                          context->copiedLaunchPlan, 0u, plan.setups);
             break;
         }
         case svms::RenderEventType::NoteOff: {
@@ -413,9 +457,10 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
         default:
             break;
     }
-    if (profileScale != 0u) {
+    if (dispatchScale != 0u) {
         const uint64_t dispatchEnd = __rdtsc();
-        gDispatchCycles += (dispatchEnd - dispatchBegin) * profileScale;
+        gDispatchCycles += ScaledProfileDelta(
+            dispatchBegin, dispatchEnd, dispatchScale);
     }
 }
 
@@ -449,6 +494,12 @@ int main(int argc, char** argv) {
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTaskIndex);
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+    gRdtscPairOverhead = UINT64_MAX;
+    for (uint32_t sample = 0u; sample < 4096u; ++sample) {
+        const uint64_t begin = __rdtsc();
+        const uint64_t end = __rdtsc();
+        gRdtscPairOverhead = (std::min)(gRdtscPairOverhead, end - begin);
+    }
 
     constexpr uint32_t sampleFrames = 64u * 2048u;
     std::vector<float> samples(sampleFrames);
@@ -498,12 +549,13 @@ int main(int argc, char** argv) {
             return 4;
         }
     }
+    auto launchPlanCache =
+        std::make_unique<BenchLaunchPlanEntry[]>(4096u);
     MixedDispatchContext mixedContext{
         voices.get(), &channels, &cfg, sampleFrames, options.voices,
         soundFont.get(), soundFontPreset, options.attackFrames,
-        options.transactionalLaunch, options.copiedLaunchPlan};
-    std::fill(std::begin(mixedContext.regionCacheCount),
-              std::end(mixedContext.regionCacheCount), UINT16_MAX);
+        options.transactionalLaunch, options.copiedLaunchPlan,
+        launchPlanCache.get()};
     if (options.workload == Workload::Dense ||
         options.workload == Workload::MixedEvents ||
         options.workload == Workload::NoteBurst) {
@@ -601,7 +653,8 @@ int main(int argc, char** argv) {
         }
         if (gCollectBreakdown) {
             const uint64_t renderEnd = __rdtsc();
-            gRenderCycles += renderEnd - renderBegin;
+            gRenderCycles += ScaledProfileDelta(
+                renderBegin, renderEnd, 1u);
         }
         absoluteFrame += options.frames;
     };

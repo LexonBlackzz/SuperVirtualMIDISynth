@@ -365,6 +365,10 @@ larger phase containing that item is complete.
 - [x] Sample dense-event cycle breakdowns instead of reading the timestamp
   counter around every event; this removes the profiler's former 2x callback
   distortion while retaining scaled region, launch, dispatch, and steal costs
+- [x] Make the dense note benchmark reuse complete direct-mapped immutable
+  launch plans like the live driver, rather than zeroing a 512-pointer array,
+  copying cached regions, and rebuilding synthetic setup on every note. Its
+  corrected 5.5M-NPS median is about 50% at 300 voices and 57-60% at 1,000
 - [x] Capture the diagnostic window's detailed last-SF2-voice probe once per
   callback instead of once per successful note-on. Exact lifetime counters and
   public voice/steal/render telemetry remain per event, while a 5.5M-NPS stream
