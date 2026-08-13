@@ -296,6 +296,11 @@ larger phase containing that item is complete.
   271 KiB at 4,096 voices and roughly 33.5 MB from a future 500K layout while
   improving the 2,000-voice Morphine 943K-note p99 from about 71-72% to a
   clean-run 66-68%, with byte-identical full PNC3 output
+- [x] Replace the 16 full-capacity channel voice arrays with an allocation-free
+  pool of 64-handle blocks while preserving exact append/swap-remove traversal;
+  this removes 236,096 bytes at 4,096 voices and about 28 MiB from an equivalent
+  500K layout, with unchanged sustained performance and byte-identical PNC3
+  output
 - [x] Cache immutable preset/note/velocity region matches in an allocation-free
   direct-mapped table, cache committed channel presets, precompute the complete
   configured velocity-gain table, and cache channel pitch-bend ratios

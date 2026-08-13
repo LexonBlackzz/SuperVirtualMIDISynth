@@ -2278,15 +2278,13 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
 
     if (controller == 64) {
         if (value < 64) {
-            const uint32_t count = voiceManager->GetChannelActiveCount(channel);
-            const uint32_t* handles = voiceManager->GetChannelActiveList(channel);
-            for (uint32_t position = 0; position < count; ++position) {
-                const uint32_t i = handles[position];
+            voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
+                const uint32_t i = voice;
                 if (voiceManager->v.heldBySustain[i]) {
                     voiceManager->v.heldBySustain[i] = 0;
                     voiceManager->StartRelease(i);
                 }
-            }
+            });
         }
     }
 
@@ -2295,15 +2293,13 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     } else if (controller == 123) {
         voiceManager->ReleaseChannel(channel, blockOffset);
     } else if (controller == 121 && sustainWasActive) {
-        const uint32_t count = voiceManager->GetChannelActiveCount(channel);
-        const uint32_t* handles = voiceManager->GetChannelActiveList(channel);
-        for (uint32_t position = 0; position < count; ++position) {
-            const uint32_t i = handles[position];
+        voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
+            const uint32_t i = voice;
             if (voiceManager->v.heldBySustain[i]) {
                 voiceManager->v.heldBySustain[i] = 0;
                 voiceManager->StartRelease(i);
             }
-        }
+        });
     }
 
     if (controller == 121) {
@@ -2358,15 +2354,13 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
     const float bendSemitones = channelCache->GetPitchBendSemitones(channel);
     const float commonRatio = powf(2.0f, bendSemitones / 12.0f);
     channelPitchBendRatio_[channel] = commonRatio;
-    const uint32_t count = voiceManager->GetChannelActiveCount(channel);
-    const uint32_t* handles = voiceManager->GetChannelActiveList(channel);
-    for (uint32_t position = 0; position < count; ++position) {
-        const uint32_t i = handles[position];
+    voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
+        const uint32_t i = voice;
         const float scale = voiceManager->v.pitchBendScales[i];
         const float ratio = scale == 1.0f
             ? commonRatio : powf(2.0f, bendSemitones * scale / 12.0f);
         voiceManager->v.phaseIncs[i] = voiceManager->v.basePhaseIncs[i] * ratio;
-    }
+    });
 }
 
 } // namespace svms

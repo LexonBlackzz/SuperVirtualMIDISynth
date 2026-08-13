@@ -136,7 +136,8 @@ public:
     void SetCurrentFrame(uint64_t frame);
     uint32_t GetVoiceAge(VoiceHandle handle) const;
     uint32_t GetChannelActiveCount(uint8_t channel) const;
-    const uint32_t* GetChannelActiveList(uint8_t channel) const;
+    template <typename Consumer>
+    void ForEachChannelActive(uint8_t channel, Consumer&& consume) const noexcept;
     void InvalidateStealCandidates();
     void RefreshRenderClass(VoiceHandle handle);
     uint32_t GetRenderClassCount(VoiceRenderClass renderClass) const;
@@ -225,9 +226,24 @@ private:
 
     // Dense per-channel indices make controller, sustain, pitch-bend and
     // channel termination work proportional to that channel's polyphony.
+    static constexpr uint32_t kChannelIndexBlockSize = 64u;
+    static constexpr uint32_t kChannelIndexBlockCount =
+        (kMaxPolyphony + kChannelIndexBlockSize - 1u) /
+            kChannelIndexBlockSize + kChannelCount;
+    struct ChannelIndexBlock {
+        uint32_t handles[kChannelIndexBlockSize];
+        uint32_t count;
+        uint32_t previous;
+        uint32_t next;
+    };
     uint32_t channelActiveCount_[kChannelCount];
-    uint32_t channelActiveList_[kChannelCount][kMaxPolyphony];
-    uint32_t channelActivePosition_[kMaxPolyphony];
+    uint32_t channelActiveHead_[kChannelCount];
+    uint32_t channelActiveTail_[kChannelCount];
+    alignas(64) ChannelIndexBlock channelIndexBlocks_[kChannelIndexBlockCount];
+    uint32_t channelIndexFreeStack_[kChannelIndexBlockCount];
+    uint32_t channelIndexFreeTop_;
+    uint32_t channelActiveBlock_[kMaxPolyphony];
+    uint8_t channelActiveOffset_[kMaxPolyphony];
 
     alignas(64) uint32_t renderClassCount_[kVoiceRenderClassCount];
     uint32_t renderClassMask_;
@@ -304,6 +320,9 @@ private:
     void UnlinkPlayGroup(VoiceHandle handle);
     void LinkChannelActive(VoiceHandle handle);
     void UnlinkChannelActive(VoiceHandle handle);
+    uint32_t AllocateChannelIndexBlock();
+    void FreeChannelIndexBlock(uint32_t block);
+    VoiceHandle LastChannelActive(uint8_t channel) const;
     VoiceRenderClass ClassifyVoice(VoiceHandle handle) const;
     void LinkRenderClass(VoiceHandle handle);
     void UnlinkRenderClass(VoiceHandle handle);
@@ -377,7 +396,17 @@ inline VoiceManager::VoiceManager()
     std::memset(activePosition_, 0xff, sizeof(activePosition_));
     std::memset(freeStack_, 0, sizeof(freeStack_));
     std::memset(channelActiveCount_, 0, sizeof(channelActiveCount_));
-    std::memset(channelActivePosition_, 0xff, sizeof(channelActivePosition_));
+    std::memset(channelActiveHead_, 0xff, sizeof(channelActiveHead_));
+    std::memset(channelActiveTail_, 0xff, sizeof(channelActiveTail_));
+    std::memset(channelActiveBlock_, 0xff, sizeof(channelActiveBlock_));
+    std::memset(channelActiveOffset_, 0xff, sizeof(channelActiveOffset_));
+    channelIndexFreeTop_ = kChannelIndexBlockCount;
+    for (uint32_t block = 0u; block < kChannelIndexBlockCount; ++block) {
+        channelIndexFreeStack_[block] = kChannelIndexBlockCount - 1u - block;
+        channelIndexBlocks_[block].count = 0u;
+        channelIndexBlocks_[block].previous = UINT32_MAX;
+        channelIndexBlocks_[block].next = UINT32_MAX;
+    }
     std::memset(renderClassCount_, 0, sizeof(renderClassCount_));
     renderClassMask_ = 0u;
     std::memset(renderClassPosition_, 0xff, sizeof(renderClassPosition_));
@@ -410,7 +439,17 @@ inline void VoiceManager::Reset() {
     std::memset(activeList_, 0, sizeof(activeList_));
     std::memset(activePosition_, 0xff, sizeof(activePosition_));
     std::memset(channelActiveCount_, 0, sizeof(channelActiveCount_));
-    std::memset(channelActivePosition_, 0xff, sizeof(channelActivePosition_));
+    std::memset(channelActiveHead_, 0xff, sizeof(channelActiveHead_));
+    std::memset(channelActiveTail_, 0xff, sizeof(channelActiveTail_));
+    std::memset(channelActiveBlock_, 0xff, sizeof(channelActiveBlock_));
+    std::memset(channelActiveOffset_, 0xff, sizeof(channelActiveOffset_));
+    channelIndexFreeTop_ = kChannelIndexBlockCount;
+    for (uint32_t block = 0u; block < kChannelIndexBlockCount; ++block) {
+        channelIndexFreeStack_[block] = kChannelIndexBlockCount - 1u - block;
+        channelIndexBlocks_[block].count = 0u;
+        channelIndexBlocks_[block].previous = UINT32_MAX;
+        channelIndexBlocks_[block].next = UINT32_MAX;
+    }
     std::memset(renderClassCount_, 0, sizeof(renderClassCount_));
     renderClassMask_ = 0u;
     std::memset(renderClassPosition_, 0xff, sizeof(renderClassPosition_));
@@ -463,8 +502,17 @@ inline uint32_t VoiceManager::GetChannelActiveCount(uint8_t channel) const {
     return channel < kChannelCount ? channelActiveCount_[channel] : 0u;
 }
 
-inline const uint32_t* VoiceManager::GetChannelActiveList(uint8_t channel) const {
-    return channel < kChannelCount ? channelActiveList_[channel] : nullptr;
+template <typename Consumer>
+inline void VoiceManager::ForEachChannelActive(
+    uint8_t channel, Consumer&& consume) const noexcept {
+    if (channel >= kChannelCount) return;
+    uint32_t block = channelActiveHead_[channel];
+    while (block != UINT32_MAX) {
+        const ChannelIndexBlock& page = channelIndexBlocks_[block];
+        for (uint32_t offset = 0u; offset < page.count; ++offset)
+            consume(static_cast<VoiceHandle>(page.handles[offset]));
+        block = page.next;
+    }
 }
 
 inline void VoiceManager::InvalidateStealCandidates() {
@@ -671,28 +719,90 @@ inline void VoiceManager::UnlinkPlayGroup(VoiceHandle handle) {
     playGroupNext_[handle] = -1;
 }
 
+inline uint32_t VoiceManager::AllocateChannelIndexBlock() {
+    assert(channelIndexFreeTop_ != 0u);
+    if (channelIndexFreeTop_ == 0u) return UINT32_MAX;
+    const uint32_t block = channelIndexFreeStack_[--channelIndexFreeTop_];
+    channelIndexBlocks_[block].count = 0u;
+    channelIndexBlocks_[block].previous = UINT32_MAX;
+    channelIndexBlocks_[block].next = UINT32_MAX;
+    return block;
+}
+
+inline void VoiceManager::FreeChannelIndexBlock(uint32_t block) {
+    if (block >= kChannelIndexBlockCount) return;
+    channelIndexBlocks_[block].count = 0u;
+    channelIndexBlocks_[block].previous = UINT32_MAX;
+    channelIndexBlocks_[block].next = UINT32_MAX;
+    assert(channelIndexFreeTop_ < kChannelIndexBlockCount);
+    channelIndexFreeStack_[channelIndexFreeTop_++] = block;
+}
+
+inline VoiceHandle VoiceManager::LastChannelActive(uint8_t channel) const {
+    if (channel >= kChannelCount) return kInvalidVoice;
+    const uint32_t tail = channelActiveTail_[channel];
+    if (tail == UINT32_MAX || channelIndexBlocks_[tail].count == 0u)
+        return kInvalidVoice;
+    return static_cast<VoiceHandle>(channelIndexBlocks_[tail].handles[
+        channelIndexBlocks_[tail].count - 1u]);
+}
+
 inline void VoiceManager::LinkChannelActive(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     const uint8_t channel = v.channel[handle];
-    const uint32_t position = channelActiveCount_[channel]++;
-    channelActiveList_[channel][position] = handle;
-    channelActivePosition_[handle] = position;
+    uint32_t tail = channelActiveTail_[channel];
+    if (tail == UINT32_MAX ||
+        channelIndexBlocks_[tail].count == kChannelIndexBlockSize) {
+        const uint32_t block = AllocateChannelIndexBlock();
+        assert(block != UINT32_MAX);
+        if (block == UINT32_MAX) return;
+        channelIndexBlocks_[block].previous = tail;
+        if (tail != UINT32_MAX)
+            channelIndexBlocks_[tail].next = block;
+        else
+            channelActiveHead_[channel] = block;
+        channelActiveTail_[channel] = block;
+        tail = block;
+    }
+    ChannelIndexBlock& page = channelIndexBlocks_[tail];
+    const uint32_t offset = page.count++;
+    page.handles[offset] = handle;
+    channelActiveBlock_[handle] = tail;
+    channelActiveOffset_[handle] = static_cast<uint8_t>(offset);
+    ++channelActiveCount_[channel];
 }
 
 inline void VoiceManager::UnlinkChannelActive(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     const uint8_t channel = v.channel[handle];
-    const uint32_t position = channelActivePosition_[handle];
-    const uint32_t count = channelActiveCount_[channel];
-    if (position >= count) return;
-    const uint32_t lastPosition = count - 1u;
-    if (position != lastPosition) {
-        const uint32_t moved = channelActiveList_[channel][lastPosition];
-        channelActiveList_[channel][position] = moved;
-        channelActivePosition_[moved] = position;
+    const uint32_t block = channelActiveBlock_[handle];
+    const uint32_t offset = channelActiveOffset_[handle];
+    const uint32_t tail = channelActiveTail_[channel];
+    if (block >= kChannelIndexBlockCount || tail >= kChannelIndexBlockCount ||
+        offset >= channelIndexBlocks_[block].count) return;
+
+    ChannelIndexBlock& tailPage = channelIndexBlocks_[tail];
+    const uint32_t lastOffset = tailPage.count - 1u;
+    const uint32_t moved = tailPage.handles[lastOffset];
+    if (block != tail || offset != lastOffset) {
+        channelIndexBlocks_[block].handles[offset] = moved;
+        channelActiveBlock_[moved] = block;
+        channelActiveOffset_[moved] = static_cast<uint8_t>(offset);
     }
-    channelActiveCount_[channel] = lastPosition;
-    channelActivePosition_[handle] = UINT32_MAX;
+    --tailPage.count;
+    --channelActiveCount_[channel];
+    channelActiveBlock_[handle] = UINT32_MAX;
+    channelActiveOffset_[handle] = UINT8_MAX;
+
+    if (tailPage.count == 0u) {
+        const uint32_t previous = tailPage.previous;
+        if (previous != UINT32_MAX)
+            channelIndexBlocks_[previous].next = UINT32_MAX;
+        else
+            channelActiveHead_[channel] = UINT32_MAX;
+        channelActiveTail_[channel] = previous;
+        FreeChannelIndexBlock(tail);
+    }
 }
 
 inline VoiceRenderClass VoiceManager::ClassifyVoice(VoiceHandle handle) const {
@@ -2023,10 +2133,9 @@ inline void VoiceManager::RefreshMixGains(const ChannelParamsSnapshot* chParams)
 inline void VoiceManager::RefreshMixGainsForChannel(
     uint8_t channel, const ChannelParamsSnapshot& cp) {
     if (channel >= kChannelCount) return;
-    const uint32_t count = channelActiveCount_[channel];
     bool stableTreeDirty = false;
-    for (uint32_t position = 0; position < count; ++position) {
-        const uint32_t i = channelActiveList_[channel][position];
+    ForEachChannelActive(channel, [&](VoiceHandle voice) {
+        const uint32_t i = voice;
         v.mixGainL[i] = v.gainLeft[i] * cp.panLeft * cp.volume * cp.expression;
         v.mixGainR[i] = v.gainRight[i] * cp.panRight * cp.volume * cp.expression;
         v.renderGainL[i] = v.currentGain[i] * v.mixGainL[i];
@@ -2043,7 +2152,7 @@ inline void VoiceManager::RefreshMixGainsForChannel(
         } else {
             UpdateStealCandidate(static_cast<VoiceHandle>(i));
         }
-    }
+    });
     if (stableTreeDirty) RebuildStableWinnerTree();
 }
 
@@ -2086,8 +2195,8 @@ inline void VoiceManager::SilenceChannelImmediate(uint8_t channel) {
         ++tailPosition;
     }
     while (channelActiveCount_[channel] > 0u) {
-        const uint32_t idx =
-            channelActiveList_[channel][channelActiveCount_[channel] - 1u];
+        const uint32_t idx = LastChannelActive(channel);
+        assert(idx != kInvalidVoice);
         // Tail ownership is independent from the active slot and was handled
         // by channel identity above.
         v.stealFadeInFramesRemaining[idx] = 0;
@@ -2097,14 +2206,13 @@ inline void VoiceManager::SilenceChannelImmediate(uint8_t channel) {
 
 inline void VoiceManager::ReleaseChannel(uint8_t channel, uint32_t blockOffset) {
     if (channel >= kChannelCount) return;
-    const uint32_t count = channelActiveCount_[channel];
-    for (uint32_t position = 0; position < count; ++position) {
-        const uint32_t idx = channelActiveList_[channel][position];
-        if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) continue;
+    ForEachChannelActive(channel, [&](VoiceHandle voice) {
+        const uint32_t idx = voice;
+        if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) return;
         v.heldBySustain[idx] = 0;
         v.releaseStartInBlock[idx] = blockOffset;
         StartRelease(static_cast<VoiceHandle>(idx));
-    }
+    });
 }
 
 } // namespace svms

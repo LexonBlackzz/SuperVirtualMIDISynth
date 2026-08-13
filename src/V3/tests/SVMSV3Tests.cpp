@@ -1186,6 +1186,87 @@ void TestPersistentStealIndexAgainstOracle() {
     }
 }
 
+void TestPagedChannelIndexFragmentation() {
+    auto voices = std::make_unique<svms::VoiceManager>();
+    voices->Initialize(svms::kMaxPolyphony, 44100u);
+    std::vector<uint8_t> expectedActive(svms::kMaxPolyphony, 0u);
+    std::vector<uint8_t> expectedChannel(svms::kMaxPolyphony, 0u);
+    std::vector<svms::VoiceHandle> expectedLists[svms::kChannelCount];
+
+    for (uint32_t i = 0u; i < svms::kMaxPolyphony; ++i) {
+        const uint8_t channel = static_cast<uint8_t>((i * 7u + i / 97u) & 15u);
+        const svms::VoiceHandle handle = voices->AllocateVoice(
+            channel, static_cast<uint8_t>(i & 127u), 100u);
+        Check(handle != svms::kInvalidVoice,
+              "paged channel index fills complete voice capacity");
+        if (handle != svms::kInvalidVoice) {
+            expectedActive[handle] = 1u;
+            expectedChannel[handle] = channel;
+            expectedLists[channel].push_back(handle);
+        }
+    }
+
+    for (uint32_t i = 0u; i < svms::kMaxPolyphony; ++i) {
+        const uint32_t handle = (i * 4051u) % svms::kMaxPolyphony;
+        if ((i % 3u) != 0u) continue;
+        const uint8_t channel = expectedChannel[handle];
+        auto& expected = expectedLists[channel];
+        const auto where = std::find(expected.begin(), expected.end(), handle);
+        Check(where != expected.end(),
+              "paged channel oracle finds retired handle");
+        if (where != expected.end()) {
+            *where = expected.back();
+            expected.pop_back();
+        }
+        voices->RetireVoice(static_cast<svms::VoiceHandle>(handle));
+        expectedActive[handle] = 0u;
+    }
+
+    for (uint32_t i = 0u; i < 1000u; ++i) {
+        const uint8_t channel = static_cast<uint8_t>((i * 11u + 3u) & 15u);
+        const svms::VoiceHandle handle = voices->AllocateVoice(
+            channel, static_cast<uint8_t>((i * 13u) & 127u), 110u);
+        Check(handle != svms::kInvalidVoice,
+              "paged channel index reuses fragmented capacity");
+        if (handle != svms::kInvalidVoice) {
+            expectedActive[handle] = 1u;
+            expectedChannel[handle] = channel;
+            expectedLists[channel].push_back(handle);
+        }
+    }
+
+    std::vector<uint8_t> seen(svms::kMaxPolyphony, 0u);
+    uint32_t indexed = 0u;
+    for (uint32_t channel = 0u; channel < svms::kChannelCount; ++channel) {
+        uint32_t channelCount = 0u;
+        voices->ForEachChannelActive(static_cast<uint8_t>(channel),
+            [&](svms::VoiceHandle handle) {
+                Check(handle < svms::kMaxPolyphony,
+                      "paged channel handle remains in range");
+                if (handle >= svms::kMaxPolyphony) return;
+                Check(expectedActive[handle] != 0u &&
+                          expectedChannel[handle] == channel,
+                      "paged channel handle remains in its owning channel");
+                Check(seen[handle] == 0u,
+                      "paged channel index contains no duplicate handle");
+                Check(channelCount < expectedLists[channel].size() &&
+                          handle == expectedLists[channel][channelCount],
+                      "paged channel traversal preserves flat swap-remove order");
+                seen[handle] = 1u;
+                ++channelCount;
+                ++indexed;
+            });
+        Check(channelCount == voices->GetChannelActiveCount(
+                  static_cast<uint8_t>(channel)),
+              "paged channel count matches block traversal");
+    }
+    Check(indexed == voices->GetActiveCount(),
+          "paged channel blocks contain every active voice exactly once");
+    for (uint32_t handle = 0u; handle < svms::kMaxPolyphony; ++handle)
+        Check(seen[handle] == expectedActive[handle],
+              "paged channel membership matches lifecycle oracle");
+}
+
 void TestChannelTerminationControllers() {
     {
         auto voices = std::make_unique<svms::VoiceManager>();
@@ -2328,6 +2409,7 @@ int main() {
     TestPriorityAwareStealingAndFadeTail();
     TestExactStealHeapAndVoiceIndices();
     TestPersistentStealIndexAgainstOracle();
+    TestPagedChannelIndexFragmentation();
     TestChannelTerminationControllers();
     TestOverlappingRetriggerGenerations();
     TestPitchAndDeterministicRender();

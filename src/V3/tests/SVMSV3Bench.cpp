@@ -347,9 +347,10 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
             break;
         }
         case svms::RenderEventType::NoteOff: {
-            const uint32_t count = voices.GetChannelActiveCount(event.channel);
-            const uint32_t* handles = voices.GetChannelActiveList(event.channel);
-            if (count > 0u) voices.StartRelease(handles[count - 1u]);
+            svms::VoiceHandle last = svms::kInvalidVoice;
+            voices.ForEachChannelActive(event.channel,
+                [&](svms::VoiceHandle handle) { last = handle; });
+            if (last != svms::kInvalidVoice) voices.StartRelease(last);
             break;
         }
         case svms::RenderEventType::ControlChange:
@@ -364,13 +365,11 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
                                   event.data1;
             const float semitones = static_cast<float>(wheel - 8192) / 4096.0f;
             const float ratio = std::pow(2.0f, semitones / 12.0f);
-            const uint32_t count = voices.GetChannelActiveCount(event.channel);
-            const uint32_t* handles = voices.GetChannelActiveList(event.channel);
-            for (uint32_t position = 0; position < count; ++position) {
-                const uint32_t handle = handles[position];
+            voices.ForEachChannelActive(event.channel,
+                [&](svms::VoiceHandle handle) {
                 voices.v.phaseIncs[handle] =
                     voices.v.basePhaseIncs[handle] * ratio;
-            }
+            });
             break;
         }
         default:
