@@ -28,6 +28,7 @@
 #include "SVMSEventCompile.h"
 #include "SVMSFrameClock.h"
 #include "SVMSDiagWindow.h"
+#include "SVMSPostFilter.h"
 
 // ── Logging ────────────────────────────────────────────────────────────
 
@@ -271,8 +272,12 @@ struct LimiterState {
         enabled = true;
     }
 
-    void Process(float* interleaved, uint32_t numFrames, uint32_t channels) {
-        if (!enabled) return;
+    void Process(float* interleaved, uint32_t numFrames, uint32_t channels,
+                 PostHighPass3Hz& highPass) {
+        if (!enabled) {
+            highPass.ProcessInterleavedStereo(interleaved, numFrames);
+            return;
+        }
 
         for (uint32_t f = 0; f < numFrames; ++f) {
             float inL = interleaved[f * channels];
@@ -315,12 +320,14 @@ struct LimiterState {
             };
             dL = softLimit(dL);
             dR = softLimit(dR);
+            highPass.ProcessStereoSample(dL, dR);
 
             interleaved[f * channels] = dL;
             if (channels > 1) interleaved[f * channels + 1] = dR;
 
             delayWritePos = (delayWritePos + 1) % kDelayFrames;
         }
+        highPass.FinishBlock();
     }
 };
 
@@ -521,6 +528,7 @@ private:
     float* leftBuffer;
     float* rightBuffer;
     uint32_t bufferCapacity;
+    PostHighPass3Hz postHighPass;
     LimiterState limiter;
 
     // Per-block dispatch queue. Allocated once during initialization from the
@@ -797,6 +805,7 @@ bool Driver::Initialize() {
     }
     bufferFrames = audioOutput->GetBufferFrames();
     sampleRate = audioOutput->GetSampleRate();
+    postHighPass.Initialize(sampleRate);
     LOG("AudioOutput initialized, rate=%u bufferFrames=%u", sampleRate, bufferFrames);
 
     bufferCapacity = bufferFrames;
@@ -1159,6 +1168,7 @@ void Driver::ResetAllVoices() {
         ++channelLaunchRevision_[channel];
     nextPlayIndex_ = 1;
     eventScheduler_.Reset();
+    postHighPass.Reset();
     limiter.Reset();
 }
 
@@ -1647,16 +1657,15 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // ── Advance virtual render clock for the next callback ──────────
     self->virtualRenderSample_ += static_cast<int64_t>(numFrames);
 
-    // Interleave planar L/R into the interleaved output buffer
+    // masterVolume is already included in ChannelCache's per-channel mix
+    // gains. Applying it here again would attenuate the output twice.
     for (uint32_t i = 0; i < numFrames; ++i) {
-        // masterVolume is already included in ChannelCache's per-channel
-        // mix gains. Applying it here as well attenuates the final signal a
-        // second time (the default 0.1 becomes 0.01).
-        output[i * 2]     = leftBuf[i];
-        output[i * 2 + 1] = rightBuf[i];
+        output[i * 2u] = leftBuf[i];
+        output[i * 2u + 1u] = rightBuf[i];
     }
-
-    self->limiter.Process(output, numFrames, 2);
+    // Filter the final limited samples in the same loop so the 3 Hz cutoff
+    // neither changes gain detection nor requires another memory pass.
+    self->limiter.Process(output, numFrames, 2, self->postHighPass);
 
     const uint64_t profilePostEnd = profileCallback ? __rdtsc() : 0u;
 
@@ -1850,6 +1859,7 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
             for (uint32_t channel = 0; channel < kChannelCount; ++channel)
                 ++self->channelLaunchRevision_[channel];
             self->nextPlayIndex_ = 1;
+            self->postHighPass.Reset();
             self->limiter.Reset();
             break;
     }

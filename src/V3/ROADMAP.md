@@ -222,6 +222,8 @@ larger phase containing that item is complete.
   near-instantaneous SF2 releases
 - [x] Keep scalar correctness mode enabled by default
 - [x] Implement SF2 per-voice pan in the live mixer
+- [x] Remove DC and subsonic output with a stateful 3 Hz post-limiter
+  high-pass, fused into the limiter loop and shared by live/offline output
 - [ ] Implement sostenuto, default modulators, filters, LFOs, chorus, and reverb
 
 ### 4096-Voice Full-Quality Scalar Optimization

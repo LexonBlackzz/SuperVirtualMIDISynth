@@ -64,6 +64,7 @@ set(HEADERS
     SVMSEventCompile.h
     SVMSEventScheduler.h
     SVMSFrameClock.h
+    SVMSPostFilter.h
 )
 
 add_library(svmsynth SHARED ${SOURCES} ${HEADERS})

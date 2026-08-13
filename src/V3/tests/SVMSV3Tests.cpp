@@ -9,6 +9,7 @@
 #include "SVMSEventCompile.h"
 #include "SVMSConfig.h"
 #include "SVMSFrameClock.h"
+#include "SVMSPostFilter.h"
 
 #include <windows.h>
 
@@ -76,6 +77,94 @@ void Check(bool condition, const char* message) {
 
 bool NearlyEqual(float a, float b, float epsilon = 1.0e-5f) {
     return std::fabs(a - b) <= epsilon;
+}
+
+void TestPostHighPass3Hz() {
+    constexpr uint32_t kRate = 44100u;
+
+    svms::PostHighPass3Hz dcFilter;
+    dcFilter.Initialize(kRate);
+    Check(dcFilter.GetPole() > 0.999f && dcFilter.GetPole() < 1.0f,
+          "3 Hz post filter has a stable low-frequency pole");
+    const double cutoffOmega = 6.28318530717958647692 * 3.0 / kRate;
+    const double pole = dcFilter.GetPole();
+    const double cutoffGain =
+        (2.0 * std::sin(cutoffOmega * 0.5)) /
+        std::sqrt(1.0 + pole * pole - 2.0 * pole * std::cos(cutoffOmega));
+    Check(cutoffGain > 0.70 && cutoffGain < 0.72,
+          "3 Hz post filter is approximately -3 dB at its cutoff");
+    std::vector<float> dcLeft(kRate, 1.0f);
+    std::vector<float> dcRight(kRate, -0.5f);
+    dcFilter.ProcessPlanar(dcLeft.data(), dcRight.data(), kRate);
+    Check(std::fabs(dcLeft.back()) < 1.0e-7f &&
+              std::fabs(dcRight.back()) < 1.0e-7f,
+          "3 Hz post filter rejects steady DC within one second");
+
+    constexpr uint32_t kFrames = kRate * 3u;
+    std::vector<float> passLeft(kFrames);
+    std::vector<float> passRight(kFrames);
+    double inputEnergy = 0.0;
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        const float sample = std::sin(6.28318530717958647692f * 100.0f *
+                                      static_cast<float>(i) /
+                                      static_cast<float>(kRate));
+        passLeft[i] = sample;
+        passRight[i] = sample;
+        if (i >= kRate) inputEnergy += static_cast<double>(sample) * sample;
+    }
+    svms::PostHighPass3Hz passFilter;
+    passFilter.Initialize(kRate);
+    passFilter.ProcessPlanar(passLeft.data(), passRight.data(), kFrames);
+    double outputEnergy = 0.0;
+    for (uint32_t i = kRate; i < kFrames; ++i)
+        outputEnergy += static_cast<double>(passLeft[i]) * passLeft[i];
+    const double passbandGain = std::sqrt(outputEnergy / inputEnergy);
+    Check(passbandGain > 0.995 && passbandGain < 1.005,
+          "3 Hz post filter preserves the 100 Hz passband");
+
+    constexpr uint32_t kContinuityFrames = 4096u;
+    std::vector<float> whole(kContinuityFrames * 2u);
+    for (uint32_t i = 0; i < kContinuityFrames; ++i) {
+        whole[i * 2u] = 0.2f + std::sin(static_cast<float>(i) * 0.017f);
+        whole[i * 2u + 1u] = -0.1f + std::cos(static_cast<float>(i) * 0.013f);
+    }
+    std::vector<float> chunked = whole;
+    std::vector<float> fused(kContinuityFrames * 2u);
+    svms::PostHighPass3Hz wholeFilter;
+    svms::PostHighPass3Hz chunkedFilter;
+    svms::PostHighPass3Hz fusedFilter;
+    wholeFilter.Initialize(kRate);
+    chunkedFilter.Initialize(kRate);
+    fusedFilter.Initialize(kRate);
+    wholeFilter.ProcessInterleavedStereo(whole.data(), kContinuityFrames);
+    for (uint32_t i = 0; i < kContinuityFrames; ++i) {
+        float left = chunked[i * 2u];
+        float right = chunked[i * 2u + 1u];
+        fusedFilter.ProcessStereoSample(left, right);
+        fused[i * 2u] = left;
+        fused[i * 2u + 1u] = right;
+    }
+    fusedFilter.FinishBlock();
+    const uint32_t chunks[] = {17u, 1u, 511u, 3u, 1024u, 29u, 2048u, 463u};
+    uint32_t cursor = 0u;
+    for (uint32_t chunk : chunks) {
+        chunkedFilter.ProcessInterleavedStereo(chunked.data() + cursor * 2u,
+                                               chunk);
+        cursor += chunk;
+    }
+    Check(cursor == kContinuityFrames,
+          "3 Hz post filter continuity test covers the complete buffer");
+    bool identical = true;
+    for (uint32_t i = 0; i < kContinuityFrames * 2u; ++i) {
+        if (whole[i] != chunked[i]) {
+            identical = false;
+            break;
+        }
+    }
+    Check(identical,
+          "3 Hz post filter is exactly continuous across callback boundaries");
+    Check(whole == fused,
+          "per-sample post filter matches the block filter");
 }
 
 void TestBankProgramState() {
@@ -2474,6 +2563,7 @@ void TestCallbackSourcePurity() {
 } // namespace
 
 int main() {
+    TestPostHighPass3Hz();
     TestBankProgramState();
     TestExactPresetLookup();
     TestRegionValidationAndLiveConfiguration();
