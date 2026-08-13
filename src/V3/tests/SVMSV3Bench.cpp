@@ -159,11 +159,11 @@ bool ParseOptions(int argc, char** argv, Options& options) {
            options.frames >= 16u && options.frames <= 8192u && options.seconds > 0u;
 }
 
-void ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
+bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
                      const svms::RuntimeConfigSnapshot& cfg,
                      uint32_t voiceCount, Workload workload,
                      uint32_t sampleFrames) {
-    voices.Initialize(voiceCount, 44100);
+    if (!voices.Initialize(voiceCount, 44100)) return false;
     channels.SetMasterVolume(1.0f);
     channels.RebuildCache(cfg, 44100.0f);
     constexpr uint32_t regionFrames = 2048;
@@ -196,6 +196,7 @@ void ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
 
         if (workload == Workload::Release) voices.StartRelease(handle);
     }
+    return true;
 }
 
 void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channels,
@@ -427,7 +428,11 @@ int main(int argc, char** argv) {
 
     auto voices = std::make_unique<svms::VoiceManager>();
     svms::ChannelCache channels;
-    ConfigureVoices(*voices, channels, cfg, options.voices, options.workload, sampleFrames);
+    if (!ConfigureVoices(*voices, channels, cfg, options.voices,
+                         options.workload, sampleFrames)) {
+        std::fprintf(stderr, "cannot allocate voice storage\n");
+        return 3;
+    }
     auto renderer = std::make_unique<svms::RenderScalar>();
     if (!options.automaticBackend && !renderer->SetRenderBackend(options.backend)) {
         std::fprintf(stderr, "requested render backend is not supported by this CPU/build\n");
@@ -647,7 +652,7 @@ int main(int argc, char** argv) {
         soundFont ? soundFont->regionCount : 0u,
         soundFont ? soundFont->presetRegionCount[soundFontPreset] : 0u,
         options.pinCore == UINT32_MAX ? -1 : static_cast<int>(options.pinCore),
-        sizeof(svms::VoiceSoA), sizeof(svms::VoiceManager),
+        voices->v.GetAllocatedBytes(), voices->GetAllocatedBytes(),
         renderer->GetAllocatedBytes(),
         voiceSamplesPerSecond,
         cyclesPerVoiceSample, eventsPerSecond, stealsPerSecond,

@@ -311,6 +311,10 @@ larger phase containing that item is complete.
   of 1,024-handle kernel tiles instead of seven full-capacity arrays; exact
   render ordering crosses tile boundaries, 4,096-voice speed is unchanged, and
   an equivalent 500K layout avoids about 10.5 MiB
+- [x] Allocate all primary `VoiceSoA` fields in one 64-byte-aligned block sized
+  to configured polyphony. The default 1,000-voice manager shrinks from
+  1,144,512 to 607,712 bytes (46.9%), 4,096-voice rendering is unchanged, and
+  full PNC3 + Morphine Piano output remains byte-identical
 - [x] Cache immutable preset/note/velocity region matches in an allocation-free
   direct-mapped table, cache committed channel presets, precompute the complete
   configured velocity-gain table, and cache channel pitch-bend ratios
@@ -392,7 +396,7 @@ larger phase containing that item is complete.
 
 ## Scalar Density and 500K Storage
 
-- [ ] Raise the pool beyond the current 4096 fixed-array limit
+- [ ] Raise the pool beyond the current 4096 manager/index limit
 - [ ] Implement segmented/paged SoA storage with bounded memory locality
 - [ ] Separate hot audible state from cold metadata and release state
 - [ ] Replace full active-list sorting with bucketed velocity/energy classes or

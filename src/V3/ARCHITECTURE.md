@@ -79,10 +79,12 @@ voices.
 
 ## Voice Pool
 
-Voice state is stored in `VoiceSoA`, with arrays sized for `kMaxPolyphony`
-(currently 4096). The configured default pool is 1000 voices, but the data model
-is designed to grow toward the 500K target by replacing fixed compile-time
-arrays with segmented or paged pools.
+Voice state is stored in `VoiceSoA`. Its hot field arrays share one 64-byte-
+aligned allocation sized to the configured voice capacity, so the default
+1000-voice pool no longer pays for 4096 entries. The current hard ceiling is
+still 4096 because several lifecycle and stealing indices in `VoiceManager`
+remain fixed-capacity. Those indices must also become capacity-sized or paged
+before the pool can grow toward the 500K target.
 
 The current pool uses:
 

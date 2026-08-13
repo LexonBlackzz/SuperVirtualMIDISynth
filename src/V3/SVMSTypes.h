@@ -3,6 +3,9 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
+#include <malloc.h>
+#include <new>
 
 namespace svms {
 
@@ -382,76 +385,87 @@ struct SamplePage {
 //
 // Removed: fractional phase offsets; event starts are integer output frames.
 // ════════════════════════════════════════════════════════════════════════
+#define SVMS_VOICE_SOA_DYNAMIC_FIELDS(X) \
+    X(uint8_t, channel) \
+    X(uint8_t, note) \
+    X(uint8_t, velocity) \
+    X(uint8_t, state) \
+    X(uint8_t, envelopeStage) \
+    X(uint8_t, sampleBacked) \
+    X(uint8_t, renderClass) \
+    X(uint16_t, presetIndex) \
+    X(uint16_t, regionIndex) \
+    X(uint32_t, playIndex) \
+    X(float, phases) \
+    X(float, phaseIncs) \
+    X(float, basePhaseIncs) \
+    X(float, pitchBendScales) \
+    X(float, currentGain) \
+    X(float, targetGain) \
+    X(float, sustainLevel) \
+    X(float, attackGainStep) \
+    X(float, decayGainStep) \
+    X(float, releaseDecay) \
+    X(float, gainLeft) \
+    X(float, gainRight) \
+    X(float, mixGainL) \
+    X(float, mixGainR) \
+    X(float, renderGainL) \
+    X(float, renderGainR) \
+    X(uint32_t, sampleStart) \
+    X(uint32_t, sampleEnd) \
+    X(uint32_t, loopStart) \
+    X(uint32_t, loopEnd) \
+    X(uint8_t, loopMode) \
+    X(uint8_t, loopEnabled) \
+    X(uint32_t, relEnd) \
+    X(uint32_t, relLoopS) \
+    X(uint32_t, relLoopE) \
+    X(float, relLoopSF) \
+    X(float, relLoopEF) \
+    X(uint32_t, holdSamplesRemaining) \
+    X(uint32_t, attackSamplesRemaining) \
+    X(uint32_t, decaySamplesRemaining) \
+    X(uint32_t, delaySamplesRemaining) \
+    X(uint32_t, releaseSamplesRemaining) \
+    X(float, decaySlope) \
+    X(uint32_t, samplePageId) \
+    X(uint8_t, heldBySustain) \
+    X(uint32_t, releaseStartInBlock) \
+    X(int32_t, nextChannelKeyVoice) \
+    X(int32_t, prevChannelKeyVoice) \
+    X(uint64_t, birthFrame) \
+    X(uint32_t, stealFadeInFramesRemaining) \
+    X(uint32_t, stealFadeInFramesTotal)
+
+#define SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(X) \
+    X(float, stealTailPhase, kStealTailReserve) \
+    X(float, stealTailPhaseInc, kStealTailReserve) \
+    X(float, stealTailGain, kStealTailReserve) \
+    X(float, stealTailMixGainL, kStealTailReserve) \
+    X(float, stealTailMixGainR, kStealTailReserve) \
+    X(uint32_t, stealTailSampleStart, kStealTailReserve) \
+    X(uint32_t, stealTailRelEnd, kStealTailReserve) \
+    X(uint32_t, stealTailRelLoopS, kStealTailReserve) \
+    X(uint32_t, stealTailRelLoopE, kStealTailReserve) \
+    X(float, stealTailRelLoopSF, kStealTailReserve) \
+    X(float, stealTailRelLoopEF, kStealTailReserve) \
+    X(uint32_t, stealTailFramesRemaining, kStealTailReserve) \
+    X(uint32_t, stealTailFramesTotal, kStealTailReserve) \
+    X(uint8_t, stealTailSampleBacked, kStealTailReserve) \
+    X(uint8_t, stealTailLoopEnabled, kStealTailReserve) \
+    X(uint8_t, stealTailChannel, kStealTailReserve)
+
 struct alignas(64) VoiceSoA {
-    uint8_t  channel[kMaxPolyphony];
-    uint8_t  note[kMaxPolyphony];
-    uint8_t  velocity[kMaxPolyphony];
-    uint8_t  state[kMaxPolyphony];
-    uint8_t  envelopeStage[kMaxPolyphony];
-    uint8_t  sampleBacked[kMaxPolyphony];
-    uint8_t  renderClass[kMaxPolyphony];
-    uint16_t pad16;
+#define SVMS_DECLARE_DYNAMIC_FIELD(type, name) type* name = nullptr;
+    SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_DECLARE_DYNAMIC_FIELD)
+#undef SVMS_DECLARE_DYNAMIC_FIELD
+
+    uint16_t pad16 = 0;
 
     // SoundFont identity captured at note-on.  These fields must remain
     // attached to the voice so later program changes and pitch bends cannot
     // reinterpret an already sounding voice through another preset/region.
-    uint16_t presetIndex[kMaxPolyphony];
-    uint16_t regionIndex[kMaxPolyphony];
-
-    // One generation is shared by every layered region created by a single
-    // MIDI note-on.  Note-off releases only the oldest active generation,
-    // matching TSF's playIndex behavior for overlapping retriggers.
-    uint32_t playIndex[kMaxPolyphony];
-
-    alignas(64) float phases[kMaxPolyphony];
-    alignas(64) float phaseIncs[kMaxPolyphony];
-    // Pitch increment before the channel pitch-bend contribution.  Most SF2
-    // regions use 100% scale tuning and can therefore share one channel bend
-    // ratio; unusual scale-tuned regions retain their per-voice multiplier.
-    alignas(64) float basePhaseIncs[kMaxPolyphony];
-    alignas(64) float pitchBendScales[kMaxPolyphony];
-    alignas(64) float currentGain[kMaxPolyphony];
-    alignas(64) float targetGain[kMaxPolyphony];
-    alignas(64) float sustainLevel[kMaxPolyphony];
-    alignas(64) float attackGainStep[kMaxPolyphony];
-    alignas(64) float decayGainStep[kMaxPolyphony];
-    alignas(64) float releaseDecay[kMaxPolyphony];
-    alignas(64) float gainLeft[kMaxPolyphony];
-    alignas(64) float gainRight[kMaxPolyphony];
-    alignas(64) float mixGainL[kMaxPolyphony];
-    alignas(64) float mixGainR[kMaxPolyphony];
-    alignas(64) float renderGainL[kMaxPolyphony];
-    alignas(64) float renderGainR[kMaxPolyphony];
-
-    alignas(64) uint32_t sampleStart[kMaxPolyphony];
-    alignas(64) uint32_t sampleEnd[kMaxPolyphony];
-    alignas(64) uint32_t loopStart[kMaxPolyphony];
-    alignas(64) uint32_t loopEnd[kMaxPolyphony];
-    uint8_t  loopMode[kMaxPolyphony];
-    uint8_t  loopEnabled[kMaxPolyphony];
-
-    alignas(64) uint32_t relEnd[kMaxPolyphony];
-    alignas(64) uint32_t relLoopS[kMaxPolyphony];
-    alignas(64) uint32_t relLoopE[kMaxPolyphony];
-    alignas(64) float    relLoopSF[kMaxPolyphony];
-    alignas(64) float    relLoopEF[kMaxPolyphony];
-
-    uint32_t holdSamplesRemaining[kMaxPolyphony];
-    uint32_t attackSamplesRemaining[kMaxPolyphony];
-    uint32_t decaySamplesRemaining[kMaxPolyphony];
-    uint32_t delaySamplesRemaining[kMaxPolyphony];
-    uint32_t releaseSamplesRemaining[kMaxPolyphony];
-    float decaySlope[kMaxPolyphony];
-
-    uint32_t samplePageId[kMaxPolyphony];
-
-    uint8_t heldBySustain[kMaxPolyphony];
-    uint32_t releaseStartInBlock[kMaxPolyphony];
-    int32_t nextChannelKeyVoice[kMaxPolyphony];
-    int32_t prevChannelKeyVoice[kMaxPolyphony];
-
-    uint64_t birthFrame[kMaxPolyphony];
-
     // Click-free voice replacement.  These arrays hold the previous contents
     // of a slot after that slot has been stolen.  They are intentionally much
     // smaller than a second complete VoiceSoA: a steal tail needs only sample
@@ -459,25 +473,146 @@ struct alignas(64) VoiceSoA {
     // Tail slots are independent from primary voice handles and are hard-
     // capped by kStealTailReserve. Keeping one tail record per potential voice
     // wasted roughly 55 bytes/voice despite only 50 ever being addressable.
-    float stealTailPhase[kStealTailReserve];
-    float stealTailPhaseInc[kStealTailReserve];
-    float stealTailGain[kStealTailReserve];
-    float stealTailMixGainL[kStealTailReserve];
-    float stealTailMixGainR[kStealTailReserve];
-    uint32_t stealTailSampleStart[kStealTailReserve];
-    uint32_t stealTailRelEnd[kStealTailReserve];
-    uint32_t stealTailRelLoopS[kStealTailReserve];
-    uint32_t stealTailRelLoopE[kStealTailReserve];
-    float stealTailRelLoopSF[kStealTailReserve];
-    float stealTailRelLoopEF[kStealTailReserve];
-    uint32_t stealTailFramesRemaining[kStealTailReserve];
-    uint32_t stealTailFramesTotal[kStealTailReserve];
-    uint32_t stealFadeInFramesRemaining[kMaxPolyphony];
-    uint32_t stealFadeInFramesTotal[kMaxPolyphony];
-    uint8_t stealTailSampleBacked[kStealTailReserve];
-    uint8_t stealTailLoopEnabled[kStealTailReserve];
-    uint8_t stealTailChannel[kStealTailReserve];
+#define SVMS_DECLARE_FIXED_TAIL_FIELD(type, name, count) type name[count]{};
+    SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(SVMS_DECLARE_FIXED_TAIL_FIELD)
+#undef SVMS_DECLARE_FIXED_TAIL_FIELD
+
+    VoiceSoA() noexcept { ResetFixedTails(); }
+
+    ~VoiceSoA() { _aligned_free(storage_); }
+
+    VoiceSoA(const VoiceSoA& other) {
+        ResetFixedTails();
+        if (!Reserve(other.capacity_)) throw std::bad_alloc();
+        CopyFrom(other);
+    }
+
+    VoiceSoA& operator=(const VoiceSoA& other) {
+        if (this == &other) return *this;
+        if (!Reserve(other.capacity_)) throw std::bad_alloc();
+        CopyFrom(other);
+        return *this;
+    }
+
+    VoiceSoA(VoiceSoA&& other) noexcept { MoveFrom(other); }
+
+    VoiceSoA& operator=(VoiceSoA&& other) noexcept {
+        if (this == &other) return *this;
+        _aligned_free(storage_);
+        MoveFrom(other);
+        return *this;
+    }
+
+    bool Reserve(uint32_t capacity) noexcept {
+        if (capacity == capacity_) return true;
+        if (capacity == 0u) {
+            ReleaseStorage();
+            return true;
+        }
+
+        size_t bytes = 0u;
+#define SVMS_ACCUMULATE_FIELD_SIZE(type, name) \
+        bytes = AlignUp(bytes); \
+        bytes += static_cast<size_t>(capacity) * sizeof(type);
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ACCUMULATE_FIELD_SIZE)
+#undef SVMS_ACCUMULATE_FIELD_SIZE
+
+        void* allocation = _aligned_malloc(bytes, kMixBufferAlign);
+        if (!allocation) return false;
+        _aligned_free(storage_);
+        storage_ = allocation;
+        storageBytes_ = bytes;
+        capacity_ = capacity;
+
+        size_t offset = 0u;
+        uint8_t* base = static_cast<uint8_t*>(storage_);
+#define SVMS_BIND_DYNAMIC_FIELD(type, name) \
+        offset = AlignUp(offset); \
+        name = reinterpret_cast<type*>(base + offset); \
+        offset += static_cast<size_t>(capacity_) * sizeof(type);
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_BIND_DYNAMIC_FIELD)
+#undef SVMS_BIND_DYNAMIC_FIELD
+        return true;
+    }
+
+    void Reset() noexcept {
+#define SVMS_CLEAR_DYNAMIC_FIELD(type, name) \
+        if (name) std::memset(name, 0, static_cast<size_t>(capacity_) * sizeof(type));
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CLEAR_DYNAMIC_FIELD)
+#undef SVMS_CLEAR_DYNAMIC_FIELD
+        pad16 = 0u;
+        ResetFixedTails();
+    }
+
+    uint32_t GetCapacity() const noexcept { return capacity_; }
+    size_t GetAllocatedBytes() const noexcept {
+        return sizeof(*this) + storageBytes_;
+    }
+
+private:
+    static size_t AlignUp(size_t value) noexcept {
+        return (value + (kMixBufferAlign - 1u)) &
+               ~(static_cast<size_t>(kMixBufferAlign) - 1u);
+    }
+
+    void ResetFixedTails() noexcept {
+#define SVMS_CLEAR_FIXED_TAIL_FIELD(type, name, count) \
+        std::memset(name, 0, sizeof(name));
+        SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(SVMS_CLEAR_FIXED_TAIL_FIELD)
+#undef SVMS_CLEAR_FIXED_TAIL_FIELD
+    }
+
+    void CopyFrom(const VoiceSoA& other) noexcept {
+#define SVMS_COPY_DYNAMIC_FIELD(type, name) \
+        if (name) std::memcpy(name, other.name, \
+            static_cast<size_t>(capacity_) * sizeof(type));
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_DYNAMIC_FIELD)
+#undef SVMS_COPY_DYNAMIC_FIELD
+#define SVMS_COPY_FIXED_TAIL_FIELD(type, name, count) \
+        std::memcpy(name, other.name, sizeof(name));
+        SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(SVMS_COPY_FIXED_TAIL_FIELD)
+#undef SVMS_COPY_FIXED_TAIL_FIELD
+        pad16 = other.pad16;
+    }
+
+    void MoveFrom(VoiceSoA& other) noexcept {
+        storage_ = other.storage_;
+        storageBytes_ = other.storageBytes_;
+        capacity_ = other.capacity_;
+#define SVMS_MOVE_DYNAMIC_FIELD(type, name) \
+        name = other.name; \
+        other.name = nullptr;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_MOVE_DYNAMIC_FIELD)
+#undef SVMS_MOVE_DYNAMIC_FIELD
+#define SVMS_MOVE_FIXED_TAIL_FIELD(type, name, count) \
+        std::memcpy(name, other.name, sizeof(name));
+        SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(SVMS_MOVE_FIXED_TAIL_FIELD)
+#undef SVMS_MOVE_FIXED_TAIL_FIELD
+        pad16 = other.pad16;
+        other.storage_ = nullptr;
+        other.storageBytes_ = 0u;
+        other.capacity_ = 0u;
+        other.pad16 = 0u;
+        other.ResetFixedTails();
+    }
+
+    void ReleaseStorage() noexcept {
+        _aligned_free(storage_);
+        storage_ = nullptr;
+        storageBytes_ = 0u;
+        capacity_ = 0u;
+#define SVMS_NULL_DYNAMIC_FIELD(type, name) name = nullptr;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_DYNAMIC_FIELD)
+#undef SVMS_NULL_DYNAMIC_FIELD
+    }
+
+    void* storage_ = nullptr;
+    size_t storageBytes_ = 0u;
+    uint32_t capacity_ = 0u;
 };
+
+#undef SVMS_VOICE_SOA_FIXED_TAIL_FIELDS
+#undef SVMS_VOICE_SOA_DYNAMIC_FIELDS
 
 } // namespace svms
 

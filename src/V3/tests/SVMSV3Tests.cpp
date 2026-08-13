@@ -599,6 +599,56 @@ void TestVoiceIdentityAndStealing() {
           "stolen slot receives the replacement voice identity");
 }
 
+void TestCapacitySizedVoiceStorage() {
+    auto voices = std::make_unique<svms::VoiceManager>();
+    Check(voices->Initialize(1000u, 44100u),
+          "capacity-sized voice storage allocates the configured pool");
+    Check(voices->v.GetCapacity() == 1000u &&
+              voices->GetMaxVoices() == 1000u,
+          "voice storage capacity matches max_voices");
+
+    const auto aligned64 = [](const void* pointer) {
+        return (reinterpret_cast<uintptr_t>(pointer) & 63u) == 0u;
+    };
+    Check(aligned64(voices->v.channel) && aligned64(voices->v.phases) &&
+              aligned64(voices->v.currentGain) &&
+              aligned64(voices->v.sampleStart) &&
+              aligned64(voices->v.birthFrame),
+          "render-hot voice arrays retain 64-byte alignment");
+
+    const size_t bytesAt1000 = voices->GetAllocatedBytes();
+    const svms::VoiceHandle handle = voices->AllocateVoice(3u, 67u, 111u);
+    Check(handle != svms::kInvalidVoice,
+          "capacity-sized storage supports voice allocation");
+    if (handle != svms::kInvalidVoice) {
+        voices->v.phases[handle] = 123.25f;
+        voices->v.currentGain[handle] = 0.625f;
+        voices->v.birthFrame[handle] = 987654321ull;
+    }
+
+    auto copied = std::make_unique<svms::VoiceManager>(*voices);
+    Check(copied->v.phases != voices->v.phases &&
+              copied->v.currentGain != voices->v.currentGain &&
+              copied->v.GetCapacity() == voices->v.GetCapacity(),
+          "VoiceManager copies own independent voice storage");
+    if (handle != svms::kInvalidVoice) {
+        Check(copied->v.phases[handle] == 123.25f &&
+                  copied->v.currentGain[handle] == 0.625f &&
+                  copied->v.birthFrame[handle] == 987654321ull,
+              "VoiceManager deep copy preserves voice state");
+        voices->v.phases[handle] = 7.0f;
+        Check(copied->v.phases[handle] == 123.25f,
+              "VoiceManager deep copy is isolated from source writes");
+    }
+
+    Check(voices->Initialize(svms::kMaxPolyphony, 48000u),
+          "voice storage can be reinitialized at maximum capacity");
+    Check(voices->v.GetCapacity() == svms::kMaxPolyphony &&
+              voices->GetAllocatedBytes() > bytesAt1000 &&
+              voices->GetActiveCount() == 0u,
+          "voice reinitialization grows storage and resets lifecycle state");
+}
+
 void TestPriorityAwareStealingAndFadeTail() {
     {
         auto voices = std::make_unique<svms::VoiceManager>();
@@ -2573,6 +2623,7 @@ int main() {
     TestExactFrameBatchDispatch();
     TestExactReleaseDurationAcrossBlocks();
     TestReleaseGeneratorMerging();
+    TestCapacitySizedVoiceStorage();
     TestVoiceIdentityAndStealing();
     TestPriorityAwareStealingAndFadeTail();
     TestExactStealHeapAndVoiceIndices();

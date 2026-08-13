@@ -55,7 +55,7 @@ struct VoiceConfiguration {
 class VoiceManager {
 public:
     VoiceManager();
-    void Initialize(uint32_t maxVoices, uint32_t sampleRate = 44100);
+    bool Initialize(uint32_t maxVoices, uint32_t sampleRate = 44100);
     void Reset();
 
     // Allocate a fresh voice slot.  Returns kInvalidVoice when pool is full
@@ -133,6 +133,9 @@ public:
 
     uint32_t GetActiveCount() const { return activeCount_; }
     uint32_t GetMaxVoices() const { return maxVoices_; }
+    size_t GetAllocatedBytes() const {
+        return sizeof(*this) + v.GetAllocatedBytes() - sizeof(v);
+    }
     void SetCurrentFrame(uint64_t frame);
     uint32_t GetVoiceAge(VoiceHandle handle) const;
     uint32_t GetChannelActiveCount(uint8_t channel) const;
@@ -410,7 +413,7 @@ inline VoiceManager::VoiceManager()
       stealHeapBuildCount_(0),
       stealVolatileCount_(0), stealVolatileHeapCount_(0),
       stealVolatileHeapFrame_(UINT64_MAX), stealVolatileHeapValid_(false) {
-    std::memset(&v, 0, sizeof(v));
+    v.Reset();
     std::memset(activeList_, 0, sizeof(activeList_));
     std::memset(activePosition_, 0xff, sizeof(activePosition_));
     std::memset(freeStack_, 0, sizeof(freeStack_));
@@ -456,15 +459,20 @@ inline VoiceManager::VoiceManager()
             channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
 }
 
-inline void VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
+inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
     maxVoices_ = maxVoices < kMaxPolyphony ? maxVoices : kMaxPolyphony;
+    if (!v.Reserve(maxVoices_)) {
+        maxVoices_ = 0u;
+        return false;
+    }
     sampleRate_ = sampleRate > 0 ? sampleRate : 44100;
     stealFadeFrames_ = kStealFadeFrames;
     Reset();
+    return true;
 }
 
 inline void VoiceManager::Reset() {
-    std::memset(&v, 0, sizeof(v));
+    v.Reset();
     std::memset(activeList_, 0, sizeof(activeList_));
     std::memset(activePosition_, 0xff, sizeof(activePosition_));
     std::memset(channelActiveCount_, 0, sizeof(channelActiveCount_));

@@ -817,7 +817,11 @@ bool Driver::Initialize() {
     }
 
     voiceManager = new VoiceManager();
-    voiceManager->Initialize(cfg.maxVoices, sampleRate);
+    if (!voiceManager->Initialize(cfg.maxVoices, sampleRate)) {
+        LOG("FAILED: Could not allocate voice storage maxVoices=%u",
+            cfg.maxVoices);
+        return false;
+    }
     for (uint32_t index = 0; index < 2u; ++index) {
         voiceStatisticsSnapshots_[index] = SnappyVoiceStatistics{};
         voiceStatisticsSnapshots_[index].freeVoices = cfg.maxVoices;
