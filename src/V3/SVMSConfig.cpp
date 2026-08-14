@@ -192,6 +192,13 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"attack_ms", cfg.limiterAttackMs},
             {"release_ms", cfg.limiterReleaseMs}
         }},
+        {"reverb", {
+            {"enabled", cfg.enableReverb},
+            {"mix", cfg.reverbMix},
+            {"room_size", cfg.reverbRoomSize},
+            {"damping", cfg.reverbDamping},
+            {"width", cfg.reverbWidth}
+        }},
         {"diagnostics", {
             {"enabled", cfg.diagnosticsEnabled},
             {"window", cfg.diagnosticsWindow},
@@ -418,6 +425,18 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "release_ms", cfg.limiterReleaseMs, 1.0f, 5000.0f))
             AppendWarning(cfg.configWarning, "limiter.release_ms");
     }
+    if (auto it = root.find("reverb"); it != root.end() && it->is_object()) {
+        if (!ReadBool(*it, "enabled", cfg.enableReverb))
+            AppendWarning(cfg.configWarning, "reverb.enabled");
+        if (!ReadValue(*it, "mix", cfg.reverbMix, 0.0f, 1.0f))
+            AppendWarning(cfg.configWarning, "reverb.mix");
+        if (!ReadValue(*it, "room_size", cfg.reverbRoomSize, 0.0f, 1.0f))
+            AppendWarning(cfg.configWarning, "reverb.room_size");
+        if (!ReadValue(*it, "damping", cfg.reverbDamping, 0.0f, 1.0f))
+            AppendWarning(cfg.configWarning, "reverb.damping");
+        if (!ReadValue(*it, "width", cfg.reverbWidth, 0.0f, 1.0f))
+            AppendWarning(cfg.configWarning, "reverb.width");
+    }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "enabled", cfg.diagnosticsEnabled))
             AppendWarning(cfg.configWarning, "diagnostics.enabled");
@@ -493,6 +512,10 @@ EngineConfig EngineConfig::Default() {
     cfg.ignoreVelocity = false;
     cfg.monoOutput = false;
     cfg.enableReverb = false;
+    cfg.reverbMix = 0.2f;
+    cfg.reverbRoomSize = 0.6f;
+    cfg.reverbDamping = 0.4f;
+    cfg.reverbWidth = 1.0f;
     cfg.enableChorus = false;
     cfg.enableFilter = false;
     cfg.enableModulators = false;
@@ -598,6 +621,10 @@ bool EngineConfig::Validate() const {
            limiterLookaheadMs >= 0.0f && limiterLookaheadMs <= 20.0f &&
            limiterAttackMs >= 0.01f && limiterAttackMs <= 100.0f &&
            limiterReleaseMs >= 1.0f && limiterReleaseMs <= 5000.0f &&
+           reverbMix >= 0.0f && reverbMix <= 1.0f &&
+           reverbRoomSize >= 0.0f && reverbRoomSize <= 1.0f &&
+           reverbDamping >= 0.0f && reverbDamping <= 1.0f &&
+           reverbWidth >= 0.0f && reverbWidth <= 1.0f &&
            velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
            velocityFloor >= 0.0f && velocityFloor < 1.0f &&
            eventRingCapacity >= 4096u &&

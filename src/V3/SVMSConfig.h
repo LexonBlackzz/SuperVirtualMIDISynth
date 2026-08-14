@@ -31,6 +31,10 @@ struct EngineConfig {
     bool ignoreVelocity;
     bool monoOutput;
     bool enableReverb;
+    float reverbMix;
+    float reverbRoomSize;
+    float reverbDamping;
+    float reverbWidth;
     bool enableChorus;
     bool enableFilter;
     bool enableModulators;

@@ -251,6 +251,64 @@ static const float g_velGainLUT[128] = {
     0.891909f, 0.906834f, 0.921882f, 0.937054f, 0.952350f, 0.967770f, 0.983313f, 1.000000f,
 };
 
+struct ReverbState {
+    static constexpr uint32_t kCombCount = 4u;
+    static constexpr uint32_t kMaxDelayFrames = 16384u;
+    alignas(64) float delay[kCombCount][kMaxDelayFrames][2]{};
+    uint32_t position[kCombCount]{};
+    uint32_t length[kCombCount]{1u, 1u, 1u, 1u};
+    float filteredL[kCombCount]{};
+    float filteredR[kCombCount]{};
+    float mix = 0.2f, feedback = 0.8f, damping = 0.4f, width = 1.0f;
+    bool enabled = false;
+
+    void Reset() noexcept {
+        std::memset(delay, 0, sizeof(delay));
+        std::memset(position, 0, sizeof(position));
+        std::memset(filteredL, 0, sizeof(filteredL));
+        std::memset(filteredR, 0, sizeof(filteredR));
+    }
+    void Configure(uint32_t sampleRate, const EngineConfig& cfg) noexcept {
+        enabled = cfg.enableReverb;
+        mix = cfg.reverbMix;
+        damping = cfg.reverbDamping;
+        width = cfg.reverbWidth;
+        feedback = 0.68f + cfg.reverbRoomSize * 0.28f;
+        static constexpr float delayMs[kCombCount] = {29.7f, 37.1f, 41.1f, 43.7f};
+        const float scale = 0.55f + cfg.reverbRoomSize * 0.9f;
+        for (uint32_t i = 0; i < kCombCount; ++i)
+            length[i] = (std::min)(kMaxDelayFrames, (std::max)(1u,
+                static_cast<uint32_t>(delayMs[i] * scale * sampleRate * 0.001f)));
+        Reset();
+    }
+    void Process(float* audio, uint32_t frames, uint32_t channels) noexcept {
+        if (!enabled || mix <= 0.0f) return;
+        const float wetSame = 0.5f + width * 0.5f;
+        const float wetCross = 0.5f - width * 0.5f;
+        const float dampInput = 1.0f - damping;
+        for (uint32_t f = 0; f < frames; ++f) {
+            const float inL = audio[f * channels];
+            const float inR = channels > 1u ? audio[f * channels + 1u] : inL;
+            float wetL = 0.0f, wetR = 0.0f;
+            for (uint32_t i = 0; i < kCombCount; ++i) {
+                const uint32_t p = position[i];
+                const float dL = delay[i][p][0], dR = delay[i][p][1];
+                filteredL[i] += dampInput * (dL - filteredL[i]);
+                filteredR[i] += dampInput * (dR - filteredR[i]);
+                delay[i][p][0] = inL + filteredL[i] * feedback;
+                delay[i][p][1] = inR + filteredR[i] * feedback;
+                wetL += dL; wetR += dR;
+                position[i] = p + 1u == length[i] ? 0u : p + 1u;
+            }
+            wetL *= 0.25f; wetR *= 0.25f;
+            audio[f * channels] = inL * (1.0f - mix) +
+                (wetL * wetSame + wetR * wetCross) * mix;
+            if (channels > 1u) audio[f * channels + 1u] = inR * (1.0f - mix) +
+                (wetR * wetSame + wetL * wetCross) * mix;
+        }
+    }
+};
+
 struct LimiterState {
     static constexpr uint32_t kMaxDelayFrames = 8192;
 
@@ -547,6 +605,7 @@ private:
     float* rightBuffer;
     uint32_t bufferCapacity;
     PostHighPass3Hz postHighPass;
+    ReverbState reverb;
     LimiterState limiter;
 
     // Per-block dispatch queue. Allocated once during initialization from the
@@ -721,6 +780,7 @@ Driver::Driver()
               std::end(channelPitchBendRatio_), 1.0f);
     for (auto& counter : shedByVelocityAtomic_) counter.store(0, std::memory_order_relaxed);
     for (auto& fence : channelTerminationFence_) fence.store(0, std::memory_order_relaxed);
+    reverb.Reset();
     limiter.Reset();
     InitializeCriticalSection(&cs);
 }
@@ -852,6 +912,7 @@ bool Driver::Initialize() {
     bufferFrames = audioOutput->GetBufferFrames();
     sampleRate = audioOutput->GetSampleRate();
     postHighPass.Initialize(sampleRate);
+    reverb.Configure(sampleRate, cfg);
     limiter.Configure(sampleRate, cfg);
     LOG("AudioOutput initialized, rate=%u bufferFrames=%u", sampleRate, bufferFrames);
 
@@ -1240,6 +1301,7 @@ void Driver::ResetAllVoices() {
     nextPlayIndex_ = 1;
     eventScheduler_.Reset();
     postHighPass.Reset();
+    reverb.Reset();
     limiter.Reset();
 }
 
@@ -1792,6 +1854,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     }
     // Filter the final limited samples in the same loop so the 3 Hz cutoff
     // neither changes gain detection nor requires another memory pass.
+    self->reverb.Process(output, numFrames, 2);
     self->limiter.Process(output, numFrames, 2, self->postHighPass);
 
     const uint64_t profilePostEnd = profileCallback ? __rdtsc() : 0u;
@@ -1992,6 +2055,7 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                 ++self->channelLaunchRevision_[channel];
             self->nextPlayIndex_ = 1;
             self->postHighPass.Reset();
+            self->reverb.Reset();
             self->limiter.Reset();
             break;
     }
