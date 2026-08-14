@@ -252,25 +252,36 @@ static const float g_velGainLUT[128] = {
 };
 
 struct LimiterState {
-    static constexpr uint32_t kDelayFrames = 128;
-    // The delay line provides look-ahead.  React quickly enough that a dense
-    // Black MIDI chord does not spend the whole look-ahead window clipping.
-    static constexpr float kAttackCoeff = 0.25f;
-    static constexpr float kReleaseCoeff = 0.001f;
-    static constexpr float kThreshold = 0.9f;
-    static constexpr float kEpsilon = 0.0001f;
-    static constexpr float kSoftClipGain = 1.0f;
+    static constexpr uint32_t kMaxDelayFrames = 8192;
 
-    float delayBuffer[kDelayFrames * 2];
-    uint32_t delayWritePos;
-    float envelope;
-    bool enabled;
+    float delayBuffer[kMaxDelayFrames * 2];
+    uint32_t delayWritePos = 0;
+    uint32_t delayFrames = 128;
+    float envelope = 0.0f;
+    float threshold = 0.95f;
+    float attackCoeff = 0.25f;
+    float releaseCoeff = 0.001f;
+    bool enabled = true;
 
     void Reset() {
         std::memset(delayBuffer, 0, sizeof(delayBuffer));
         delayWritePos = 0;
-        envelope = 1.0f;
-        enabled = true;
+        envelope = 0.0f;
+    }
+
+    void Configure(uint32_t sampleRate, const EngineConfig& cfg) {
+        Reset();
+        enabled = cfg.limiterEnabled;
+        threshold = cfg.limiterThreshold;
+        delayFrames = (std::min)(kMaxDelayFrames,
+            (std::max)(1u, static_cast<uint32_t>(
+                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f)));
+        const float attackSamples = (std::max)(1.0f,
+            cfg.limiterAttackMs * sampleRate * 0.001f);
+        const float releaseSamples = (std::max)(1.0f,
+            cfg.limiterReleaseMs * sampleRate * 0.001f);
+        attackCoeff = 1.0f - std::exp(-1.0f / attackSamples);
+        releaseCoeff = 1.0f - std::exp(-1.0f / releaseSamples);
     }
 
     void Process(float* interleaved, uint32_t numFrames, uint32_t channels,
@@ -289,16 +300,15 @@ struct LimiterState {
             float peak = absL > absR ? absL : absR;
 
             if (peak > envelope) {
-                envelope += kAttackCoeff * (peak - envelope);
+                envelope += attackCoeff * (peak - envelope);
             } else {
-                envelope += kReleaseCoeff * (peak - envelope);
+                envelope += releaseCoeff * (peak - envelope);
             }
 
             float gain = 1.0f;
-            if (envelope > kThreshold) {
-                gain = kThreshold / envelope;
+            if (envelope > threshold) {
+                gain = threshold / envelope;
             }
-            gain *= kSoftClipGain;
 
             uint32_t dw = delayWritePos * channels;
             float dL = delayBuffer[dw];
@@ -313,10 +323,14 @@ struct LimiterState {
             // Soft-knee saturation is only used above the limiter knee; it
             // avoids the former hard clip that made dense reference renders
             // visibly flatten while still guaranteeing bounded output.
-            auto softLimit = [](float x) {
+            const float limitThreshold = threshold;
+            auto softLimit = [limitThreshold](float x) {
                 const float ax = std::fabs(x);
-                if (ax <= 0.9f) return x;
-                const float compressed = 0.9f + 0.1f * std::tanh((ax - 0.9f) * 10.0f);
+                if (ax <= limitThreshold) return x;
+                const float headroom = 1.0f - limitThreshold;
+                const float compressed = limitThreshold + headroom *
+                    std::tanh((ax - limitThreshold) /
+                              (headroom > 0.0001f ? headroom : 0.0001f));
                 return x < 0.0f ? -compressed : compressed;
             };
             dL = softLimit(dL);
@@ -326,7 +340,7 @@ struct LimiterState {
             interleaved[f * channels] = dL;
             if (channels > 1) interleaved[f * channels + 1] = dR;
 
-            delayWritePos = (delayWritePos + 1) % kDelayFrames;
+            delayWritePos = (delayWritePos + 1) % delayFrames;
         }
         highPass.FinishBlock();
     }
@@ -838,6 +852,7 @@ bool Driver::Initialize() {
     bufferFrames = audioOutput->GetBufferFrames();
     sampleRate = audioOutput->GetSampleRate();
     postHighPass.Initialize(sampleRate);
+    limiter.Configure(sampleRate, cfg);
     LOG("AudioOutput initialized, rate=%u bufferFrames=%u", sampleRate, bufferFrames);
 
     bufferCapacity = bufferFrames;

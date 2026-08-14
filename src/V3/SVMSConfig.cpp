@@ -185,6 +185,13 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"interpolation", "linear"},
             {"pan_law", "constant-power"}
         }},
+        {"limiter", {
+            {"enabled", cfg.limiterEnabled},
+            {"threshold", cfg.limiterThreshold},
+            {"lookahead_ms", cfg.limiterLookaheadMs},
+            {"attack_ms", cfg.limiterAttackMs},
+            {"release_ms", cfg.limiterReleaseMs}
+        }},
         {"diagnostics", {
             {"enabled", cfg.diagnosticsEnabled},
             {"window", cfg.diagnosticsWindow},
@@ -399,6 +406,18 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             else AppendWarning(cfg.configWarning, "quality.pan_law");
         }
     }
+    if (auto it = root.find("limiter"); it != root.end() && it->is_object()) {
+        if (!ReadBool(*it, "enabled", cfg.limiterEnabled))
+            AppendWarning(cfg.configWarning, "limiter.enabled");
+        if (!ReadValue(*it, "threshold", cfg.limiterThreshold, 0.1f, 1.0f))
+            AppendWarning(cfg.configWarning, "limiter.threshold");
+        if (!ReadValue(*it, "lookahead_ms", cfg.limiterLookaheadMs, 0.0f, 20.0f))
+            AppendWarning(cfg.configWarning, "limiter.lookahead_ms");
+        if (!ReadValue(*it, "attack_ms", cfg.limiterAttackMs, 0.01f, 100.0f))
+            AppendWarning(cfg.configWarning, "limiter.attack_ms");
+        if (!ReadValue(*it, "release_ms", cfg.limiterReleaseMs, 1.0f, 5000.0f))
+            AppendWarning(cfg.configWarning, "limiter.release_ms");
+    }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "enabled", cfg.diagnosticsEnabled))
             AppendWarning(cfg.configWarning, "diagnostics.enabled");
@@ -462,7 +481,12 @@ EngineConfig EngineConfig::Default() {
 #endif
     cfg.renderBackend = RenderBackend::Scalar;
     cfg.panLaw = PanLaw::ConstantPower;
-    cfg.masterVolume = 0.1f;
+    cfg.masterVolume = 1.0f;
+    cfg.limiterEnabled = true;
+    cfg.limiterThreshold = 0.95f;
+    cfg.limiterLookaheadMs = 3.0f;
+    cfg.limiterAttackMs = 0.5f;
+    cfg.limiterReleaseMs = 100.0f;
     cfg.velocityCurve = 1.0f;
     cfg.velocityFloor = 0.0f;
     cfg.velocityIgnoreBelow = 0;
@@ -570,6 +594,10 @@ bool EngineConfig::Validate() const {
            maxVoices >= 1 && maxVoices <= kMaxPolyphony &&
            renderThreads <= 64u &&
            masterVolume >= 0.0f && masterVolume <= 4.0f &&
+           limiterThreshold >= 0.1f && limiterThreshold <= 1.0f &&
+           limiterLookaheadMs >= 0.0f && limiterLookaheadMs <= 20.0f &&
+           limiterAttackMs >= 0.01f && limiterAttackMs <= 100.0f &&
+           limiterReleaseMs >= 1.0f && limiterReleaseMs <= 5000.0f &&
            velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
            velocityFloor >= 0.0f && velocityFloor < 1.0f &&
            eventRingCapacity >= 4096u &&

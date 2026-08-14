@@ -20,6 +20,11 @@ struct EngineConfig {
     RenderBackend renderBackend;
     PanLaw panLaw;
     float masterVolume;
+    bool limiterEnabled;
+    float limiterThreshold;
+    float limiterLookaheadMs;
+    float limiterAttackMs;
+    float limiterReleaseMs;
     float velocityCurve;
     float velocityFloor;
     uint8_t velocityIgnoreBelow;
