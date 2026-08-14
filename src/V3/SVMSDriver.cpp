@@ -2457,12 +2457,20 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
         HandlePitchBend(channel, 0, 64);
     }
 
+    if (channelCache && (controller == 6u || controller == 38u ||
+                         controller == 96u || controller == 97u)) {
+        const uint16_t wheel = channelCache->GetPitchBendValue(channel);
+        HandlePitchBend(channel, static_cast<uint8_t>(wheel & 0x7fu),
+                        static_cast<uint8_t>(wheel >> 7u));
+    }
+
     // Controller events are dispatched before the sample at their target
     // frame. Rebuild now so existing voices and same-frame note-ons observe
     // the new channel state rather than waiting for the next callback.
     if (channelCache && configSnapshot &&
         (controller == 7 || controller == 10 || controller == 11 ||
-         controller == 64 || controller == 121)) {
+         controller == 64 || controller == 121 || controller == 6 ||
+         controller == 38 || controller == 96 || controller == 97)) {
         channelCache->RebuildChannel(channel, *configSnapshot,
                                      static_cast<float>(sampleRate));
         if (controller == 7 || controller == 10 || controller == 11 ||

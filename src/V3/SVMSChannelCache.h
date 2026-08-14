@@ -8,10 +8,7 @@
 
 namespace svms {
 
-// MIDI pitch-wheel range used by V3.  This is intentionally wider than the
-// General MIDI default so Black MIDI bends can cover a full octave in either
-// direction without changing the event format or renderer path.
-static constexpr float kDefaultPitchBendRangeSemitones = 12.0f;
+static constexpr float kDefaultPitchBendRangeSemitones = 2.0f;
 
 class ChannelCache {
 public:
@@ -42,6 +39,7 @@ public:
     uint16_t GetSelectedPreset(uint8_t channel) const;
     bool IsSustainActive(uint8_t channel) const;
     float GetPitchBendSemitones(uint8_t channel) const;
+    uint16_t GetPitchBendValue(uint8_t channel) const;
 
     float ComputeVelocity(uint8_t velocity, const struct RuntimeConfigSnapshot& cfg) const;
     void ComputeSoundFontPan(int16_t pan, float& outLeft, float& outRight) const;
@@ -55,6 +53,10 @@ private:
     uint8_t channelExpression_[kChannelCount];
     uint8_t channelPan_[kChannelCount];
     int16_t channelPitchBend_[kChannelCount];
+    uint8_t channelRpnMSB_[kChannelCount];
+    uint8_t channelRpnLSB_[kChannelCount];
+    uint8_t channelBendRangeSemitones_[kChannelCount];
+    uint8_t channelBendRangeCents_[kChannelCount];
     uint8_t channelSustain_[kChannelCount];
     uint8_t channelProgram_[kChannelCount];
     uint8_t channelBankMSB_[kChannelCount];
@@ -74,6 +76,9 @@ inline void ChannelCache::Reset() {
         channelExpression_[ch] = 127;
         channelPan_[ch] = 64;
         channelPitchBend_[ch] = 8192;
+        channelRpnMSB_[ch] = channelRpnLSB_[ch] = 127;
+        channelBendRangeSemitones_[ch] = 2;
+        channelBendRangeCents_[ch] = 0;
         channelSustain_[ch] = 0;
         channelProgram_[ch] = 0;
         channelBankMSB_[ch] = 0;
@@ -114,6 +119,26 @@ inline void ChannelCache::ControlChange(uint8_t channel, uint8_t controller, uin
         case 0:  channelBankMSB_[channel] = value; break;
         case 32: channelBankLSB_[channel] = value; break;
         case 64: channelSustain_[channel] = value; break;
+        case 101: channelRpnMSB_[channel] = value; break;
+        case 100: channelRpnLSB_[channel] = value; break;
+        case 6:
+            if (channelRpnMSB_[channel] == 0 && channelRpnLSB_[channel] == 0)
+                channelBendRangeSemitones_[channel] = value;
+            break;
+        case 38:
+            if (channelRpnMSB_[channel] == 0 && channelRpnLSB_[channel] == 0)
+                channelBendRangeCents_[channel] = value > 99 ? 99 : value;
+            break;
+        case 96:
+            if (channelRpnMSB_[channel] == 0 && channelRpnLSB_[channel] == 0 &&
+                channelBendRangeSemitones_[channel] < 127)
+                ++channelBendRangeSemitones_[channel];
+            break;
+        case 97:
+            if (channelRpnMSB_[channel] == 0 && channelRpnLSB_[channel] == 0 &&
+                channelBendRangeSemitones_[channel] > 0)
+                --channelBendRangeSemitones_[channel];
+            break;
         case 120: AllSoundOff(channel); break;
         case 121: ResetControllers(channel); break;
         case 123: AllNotesOff(channel); break;
@@ -138,6 +163,9 @@ inline void ChannelCache::ResetControllers(uint8_t channel) {
     channelExpression_[channel] = 127;
     channelPan_[channel] = 64;
     channelPitchBend_[channel] = 8192;
+    channelRpnMSB_[channel] = channelRpnLSB_[channel] = 127;
+    channelBendRangeSemitones_[channel] = 2;
+    channelBendRangeCents_[channel] = 0;
     channelSustain_[channel] = 0;
 }
 
@@ -183,7 +211,8 @@ inline void ChannelCache::RebuildChannel(uint8_t channel,
 
     const float bend = (channelPitchBend_[ch] - 8192.0f) / 8192.0f;
     channels_[ch].pitchBendCents =
-        bend * (kDefaultPitchBendRangeSemitones * 100.0f);
+        bend * ((channelBendRangeSemitones_[ch] * 100.0f) +
+                channelBendRangeCents_[ch]);
 
     channels_[ch].sustainActive = channelSustain_[ch] >= 64 ? 1u : 0u;
     channels_[ch].filterCutoff = 20000.0f;
@@ -224,7 +253,13 @@ inline bool ChannelCache::IsSustainActive(uint8_t channel) const {
 inline float ChannelCache::GetPitchBendSemitones(uint8_t channel) const {
     if (channel >= kChannelCount) return 0.0f;
     return (float)(channelPitchBend_[channel] - 8192) / 8192.0f
-        * kDefaultPitchBendRangeSemitones;
+        * (channelBendRangeSemitones_[channel] +
+           channelBendRangeCents_[channel] * 0.01f);
+}
+
+inline uint16_t ChannelCache::GetPitchBendValue(uint8_t channel) const {
+    return channel < kChannelCount
+        ? static_cast<uint16_t>(channelPitchBend_[channel]) : 8192u;
 }
 
 inline float ChannelCache::ComputeVelocity(

@@ -1664,14 +1664,19 @@ void RenderDeterministic(float* left, float* right, uint32_t frames) {
 void TestPitchAndDeterministicRender() {
     svms::ChannelCache cache;
     cache.PitchBend(0, 0);
-    Check(NearlyEqual(cache.GetPitchBendSemitones(0), -12.0f),
-          "minimum pitch wheel is -12 semitones");
+    Check(NearlyEqual(cache.GetPitchBendSemitones(0), -2.0f),
+          "minimum pitch wheel uses the MIDI default -2 semitones");
     cache.PitchBend(0, 8192);
     Check(NearlyEqual(cache.GetPitchBendSemitones(0), 0.0f),
           "center pitch wheel is unpitched");
     cache.PitchBend(0, 16383);
+    Check(NearlyEqual(cache.GetPitchBendSemitones(0), 2.0f, 2.0e-3f),
+          "maximum pitch wheel uses the MIDI default +2 semitones");
+    cache.ControlChange(0, 101, 0);
+    cache.ControlChange(0, 100, 0);
+    cache.ControlChange(0, 6, 12);
     Check(NearlyEqual(cache.GetPitchBendSemitones(0), 12.0f, 2.0e-3f),
-          "maximum pitch wheel is +12 semitones");
+          "RPN pitch-bend sensitivity changes the range to +12 semitones");
 
     float leftA[32], rightA[32], leftB[32], rightB[32];
     RenderDeterministic(leftA, rightA, 32);
