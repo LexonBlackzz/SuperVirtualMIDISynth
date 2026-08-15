@@ -33,8 +33,17 @@ struct EngineConfig {
     bool enableReverb;
     float reverbMix;
     float reverbRoomSize;
+    float reverbDecay;
     float reverbDamping;
     float reverbWidth;
+    float reverbDiffusion;
+    float reverbPreDelayMs;
+    float reverbEarlyLevel;
+    float reverbLateLevel;
+    float reverbModDepth;
+    float reverbModRate;
+    float reverbLowCutHz;
+    float reverbHighCutHz;
     bool enableChorus;
     bool enableFilter;
     bool enableModulators;

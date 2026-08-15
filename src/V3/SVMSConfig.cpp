@@ -194,10 +194,25 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         }},
         {"reverb", {
             {"enabled", cfg.enableReverb},
+
             {"mix", cfg.reverbMix},
+
             {"room_size", cfg.reverbRoomSize},
+            {"decay", cfg.reverbDecay},
             {"damping", cfg.reverbDamping},
-            {"width", cfg.reverbWidth}
+            {"width", cfg.reverbWidth},
+
+            {"diffusion", cfg.reverbDiffusion},
+            {"pre_delay_ms", cfg.reverbPreDelayMs},
+
+            {"early_level", cfg.reverbEarlyLevel},
+            {"late_level", cfg.reverbLateLevel},
+
+            {"mod_depth", cfg.reverbModDepth},
+            {"mod_rate", cfg.reverbModRate},
+
+            {"low_cut_hz", cfg.reverbLowCutHz},
+            {"high_cut_hz", cfg.reverbHighCutHz}
         }},
         {"diagnostics", {
             {"enabled", cfg.diagnosticsEnabled},
@@ -426,16 +441,47 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "limiter.release_ms");
     }
     if (auto it = root.find("reverb"); it != root.end() && it->is_object()) {
-        if (!ReadBool(*it, "enabled", cfg.enableReverb))
-            AppendWarning(cfg.configWarning, "reverb.enabled");
-        if (!ReadValue(*it, "mix", cfg.reverbMix, 0.0f, 1.0f))
-            AppendWarning(cfg.configWarning, "reverb.mix");
-        if (!ReadValue(*it, "room_size", cfg.reverbRoomSize, 0.0f, 1.0f))
-            AppendWarning(cfg.configWarning, "reverb.room_size");
-        if (!ReadValue(*it, "damping", cfg.reverbDamping, 0.0f, 1.0f))
-            AppendWarning(cfg.configWarning, "reverb.damping");
-        if (!ReadValue(*it, "width", cfg.reverbWidth, 0.0f, 1.0f))
-            AppendWarning(cfg.configWarning, "reverb.width");
+            if (!ReadBool(*it, "enabled", cfg.enableReverb))
+                AppendWarning(cfg.configWarning, "reverb.enabled");
+
+            if (!ReadValue(*it, "mix", cfg.reverbMix, 0.0f, 1.0f))
+                AppendWarning(cfg.configWarning, "reverb.mix");
+
+            if (!ReadValue(*it, "room_size", cfg.reverbRoomSize, 0.0f, 1.0f))
+                AppendWarning(cfg.configWarning, "reverb.room_size");
+
+            if (!ReadValue(*it, "decay", cfg.reverbDecay, 0.0f, 1.0f))
+                AppendWarning(cfg.configWarning, "reverb.decay");
+
+            if (!ReadValue(*it, "damping", cfg.reverbDamping, 0.0f, 1.0f))
+                AppendWarning(cfg.configWarning, "reverb.damping");
+
+            if (!ReadValue(*it, "width", cfg.reverbWidth, 0.0f, 1.0f))
+                AppendWarning(cfg.configWarning, "reverb.width");
+
+            if (!ReadValue(*it, "diffusion", cfg.reverbDiffusion, 0.0f, 1.0f))
+                AppendWarning(cfg.configWarning, "reverb.diffusion");
+
+            if (!ReadValue(*it, "pre_delay_ms", cfg.reverbPreDelayMs, 0.0f, 200.0f))
+                AppendWarning(cfg.configWarning, "reverb.pre_delay_ms");
+
+            if (!ReadValue(*it, "early_level", cfg.reverbEarlyLevel, 0.0f, 1.5f))
+                AppendWarning(cfg.configWarning, "reverb.early_level");
+
+            if (!ReadValue(*it, "late_level", cfg.reverbLateLevel, 0.0f, 1.5f))
+                AppendWarning(cfg.configWarning, "reverb.late_level");
+
+            if (!ReadValue(*it, "mod_depth", cfg.reverbModDepth, 0.0f, 1.0f))
+                AppendWarning(cfg.configWarning, "reverb.mod_depth");
+
+            if (!ReadValue(*it, "mod_rate", cfg.reverbModRate, 0.0f, 1.0f))
+                AppendWarning(cfg.configWarning, "reverb.mod_rate");
+
+            if (!ReadValue(*it, "low_cut_hz", cfg.reverbLowCutHz, 0.0f, 2000.0f))
+                AppendWarning(cfg.configWarning, "reverb.low_cut_hz");
+
+            if (!ReadValue(*it, "high_cut_hz", cfg.reverbHighCutHz, 1000.0f, 20000.0f))
+                AppendWarning(cfg.configWarning, "reverb.high_cut_hz");
     }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "enabled", cfg.diagnosticsEnabled))
@@ -512,10 +558,19 @@ EngineConfig EngineConfig::Default() {
     cfg.ignoreVelocity = false;
     cfg.monoOutput = false;
     cfg.enableReverb = false;
-    cfg.reverbMix = 0.2f;
-    cfg.reverbRoomSize = 0.6f;
-    cfg.reverbDamping = 0.4f;
+    cfg.reverbMix = 0.25f;
+    cfg.reverbRoomSize = 0.60f;
+    cfg.reverbDecay = 0.50f;
+    cfg.reverbDamping = 0.35f;
     cfg.reverbWidth = 1.0f;
+    cfg.reverbDiffusion = 0.70f;
+    cfg.reverbPreDelayMs = 12.0f;
+    cfg.reverbEarlyLevel = 0.35f;
+    cfg.reverbLateLevel = 0.85f;
+    cfg.reverbModDepth = 0.30f;
+    cfg.reverbModRate = 0.35f;
+    cfg.reverbLowCutHz = 70.0f;
+    cfg.reverbHighCutHz = 16000.0f;
     cfg.enableChorus = false;
     cfg.enableFilter = false;
     cfg.enableModulators = false;
@@ -613,25 +668,34 @@ EngineConfig EngineConfig::Load() {
 
 bool EngineConfig::Validate() const {
     return sampleRate >= 8000 && sampleRate <= 384000 &&
-           bufferFrames >= 16 && bufferFrames <= 8192 &&
-           maxVoices >= 1 && maxVoices <= kMaxPolyphony &&
-           renderThreads <= 64u &&
-           masterVolume >= 0.0f && masterVolume <= 4.0f &&
-           limiterThreshold >= 0.1f && limiterThreshold <= 1.0f &&
-           limiterLookaheadMs >= 0.0f && limiterLookaheadMs <= 20.0f &&
-           limiterAttackMs >= 0.01f && limiterAttackMs <= 100.0f &&
-           limiterReleaseMs >= 1.0f && limiterReleaseMs <= 5000.0f &&
-           reverbMix >= 0.0f && reverbMix <= 1.0f &&
-           reverbRoomSize >= 0.0f && reverbRoomSize <= 1.0f &&
-           reverbDamping >= 0.0f && reverbDamping <= 1.0f &&
-           reverbWidth >= 0.0f && reverbWidth <= 1.0f &&
-           velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
-           velocityFloor >= 0.0f && velocityFloor < 1.0f &&
-           eventRingCapacity >= 4096u &&
-           highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
-           shedStartPercent >= 1 && shedStartPercent < 100 &&
-           maxEventsPerBlock > 0 &&
-           maxEventsPerBlock <= eventRingCapacity;
+            bufferFrames >= 16 && bufferFrames <= 8192 &&
+            maxVoices >= 1 && maxVoices <= kMaxPolyphony &&
+            renderThreads <= 64u &&
+            masterVolume >= 0.0f && masterVolume <= 4.0f &&
+            limiterThreshold >= 0.1f && limiterThreshold <= 1.0f &&
+            limiterLookaheadMs >= 0.0f && limiterLookaheadMs <= 20.0f &&
+            limiterAttackMs >= 0.01f && limiterAttackMs <= 100.0f &&
+            limiterReleaseMs >= 1.0f && limiterReleaseMs <= 5000.0f &&
+            reverbMix >= 0.0f && reverbMix <= 1.0f &&
+            reverbRoomSize >= 0.0f && reverbRoomSize <= 1.0f &&
+            reverbDecay >= 0.0f && reverbDecay <= 1.0f &&
+            reverbDamping >= 0.0f && reverbDamping <= 1.0f &&
+            reverbWidth >= 0.0f && reverbWidth <= 1.0f &&
+            reverbDiffusion >= 0.0f && reverbDiffusion <= 1.0f &&
+            reverbPreDelayMs >= 0.0f && reverbPreDelayMs <= 200.0f &&
+            reverbEarlyLevel >= 0.0f && reverbEarlyLevel <= 1.5f &&
+            reverbLateLevel >= 0.0f && reverbLateLevel <= 1.5f &&
+            reverbModDepth >= 0.0f && reverbModDepth <= 1.0f &&
+            reverbModRate >= 0.0f && reverbModRate <= 1.0f &&
+            reverbLowCutHz >= 0.0f && reverbLowCutHz <= 2000.0f &&
+            reverbHighCutHz >= 1000.0f && reverbHighCutHz <= 20000.0f &&
+            velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
+            velocityFloor >= 0.0f && velocityFloor < 1.0f &&
+            eventRingCapacity >= 4096u &&
+            highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
+            shedStartPercent >= 1 && shedStartPercent < 100 &&
+            maxEventsPerBlock > 0 &&
+            maxEventsPerBlock <= eventRingCapacity;
 }
 
 std::wstring GetV3LocalConfigPath() {
