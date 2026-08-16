@@ -7,6 +7,8 @@
 #include "../SVMSRuntimeLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
+#include <vector>
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -42,22 +44,30 @@ public:
 
     bool IsRunning() const { return running_; }
 
+    const wchar_t* LastInitError() const { return lastInitError_.c_str(); }
+
     // Live-parameter entry points for widgets (see FlushLiveChanges):
     // mutate the coalescing working state and mark the group dirty.
     void SetLiveFloat(svms::RLCommandType type, float value);
     void SetLiveBool(svms::RLCommandType type, bool value);
 
-    // DPI change hook called from WndProc (WM_DPICHANGED): rescales the
-    // window to the suggested rect and rebuilds the ImGui font atlas.
-    void ApplyDpiScale(float scale, const RECT* suggestedRect);
+    // DPI change hook called from WndProc (WM_DPICHANGED).  Applies the
+    // suggested window rectangle immediately, but only records the font
+    // rebuild as pending: the actual atlas rebuild happens in the normal
+    // frame loop, never re-entrantly inside WndProc.
+    void HandleDpiChange(float scale, const RECT* suggestedRect);
 
 private:
+    friend LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam,
+                                    LPARAM lParam);
+
     bool CreateMainWindow(HINSTANCE hInstance);
     bool CreateD3D11();
-    void CreateImGui();
-    void RecreateFonts(float scale);
+    bool CreateImGui();
+    void RecreateFonts(float scale, bool rendererBackendInitialized);
     void DestroyD3D11();
     void DestroyMainWindow();
+    void ResizeSwapChain(int width, int height);
 
     void DrawHeader();
     void DrawSidebar();
@@ -65,8 +75,6 @@ private:
     void DrawPageContent();
     void DrawToastOverlay();
     void HandleKeyboardShortcuts();
-
-    void HandleWindowSize();
 
     bool running_ = false;
     bool dirty_ = false;
@@ -80,6 +88,18 @@ private:
     int windowWidth_ = 1180;
     int windowHeight_ = 760;
     float dpiScale_ = 1.0f;
+
+    // Window lifecycle state written by WndProc, consumed by the main
+    // render loop.  Rendering and swap-chain work never happen inside
+    // WndProc itself.
+    bool resizePending_ = false;
+    UINT pendingWidth_ = 0;
+    UINT pendingHeight_ = 0;
+    float pendingDpiScale_ = 1.0f;
+    bool dpiRebuildPending_ = false;
+    bool shutdownDone_ = false;
+    std::wstring lastInitError_;
+    std::vector<unsigned char> fontData_;
 
     Page currentPage_ = Page::Overview;
 

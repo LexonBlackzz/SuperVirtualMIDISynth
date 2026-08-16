@@ -28,6 +28,9 @@
 #include "PageAdvanced.h"
 #include "PageAbout.h"
 
+#include <cstdio>
+#include <vector>
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "shcore.lib")
@@ -37,31 +40,100 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 
 namespace svms::cfg {
 
-static ConfiguratorApp* g_app = nullptr;
-
 static const wchar_t* kWindowClass = L"SVMS_V3_Configurator";
 static const wchar_t* kWindowTitle = L"SuperVirtualMIDISynth V3";
 
+static void LogStartupFailure(const wchar_t* what) {
+    wchar_t buf[1024];
+    swprintf(buf, 1024, L"SVMS V3 Configurator failed to start: %s\n", what);
+    OutputDebugStringW(buf);
+}
+
+static void LogStartupFailure(const wchar_t* what, HRESULT hr) {
+    wchar_t buf[1024];
+    swprintf(buf, 1024,
+             L"SVMS V3 Configurator failed to start: %s (HRESULT 0x%08lX)\n",
+             what, static_cast<unsigned long>(hr));
+    OutputDebugStringW(buf);
+}
+
+static std::wstring StartupFailureText(const wchar_t* what) {
+    wchar_t buf[1024];
+    swprintf(buf, 1024, L"SVMS V3 Configurator failed to start: %s", what);
+    return std::wstring(buf);
+}
+
+static std::wstring StartupFailureText(const wchar_t* what, HRESULT hr) {
+    wchar_t buf[1024];
+    swprintf(buf, 1024,
+             L"SVMS V3 Configurator failed to start: %s (HRESULT 0x%08lX)",
+             what, static_cast<unsigned long>(hr));
+    return std::wstring(buf);
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto appFromHwnd = [](HWND hWnd) -> ConfiguratorApp* {
+        return reinterpret_cast<ConfiguratorApp*>(
+            GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    };
+
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
         return 1;
 
     switch (msg) {
-    case WM_SIZE:
-        if (g_app && wParam != SIZE_MINIMIZED) {
-            g_app->RenderFrame();
+    case WM_NCCREATE: {
+        // Attach the owning ConfiguratorApp; CreateWindowExW passes `this`
+        // as lpCreateParams.
+        CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hWnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        return TRUE;
+    }
+    case WM_SIZE: {
+        // Record the new client size only; the swap chain is resized in
+        // the normal render loop (never re-entrantly from WndProc).
+        ConfiguratorApp* app = appFromHwnd(hWnd);
+        if (app && wParam != SIZE_MINIMIZED) {
+            app->pendingWidth_ = static_cast<UINT>(LOWORD(lParam));
+            app->pendingHeight_ = static_cast<UINT>(HIWORD(lParam));
+            app->resizePending_ = true;
         }
         return 0;
-    case WM_DESTROY:
-        if (g_app) g_app->Shutdown();
-        return 0;
-    case WM_DPICHANGED:
-        if (g_app) {
+    }
+    case WM_DPICHANGED: {
+        // Apply the suggested rect; the font rebuild is deferred to the
+        // render loop via pending flags.
+        ConfiguratorApp* app = appFromHwnd(hWnd);
+        if (app) {
             const float newScale =
                 static_cast<float>(HIWORD(wParam)) / 96.0f;
-            g_app->ApplyDpiScale(newScale,
+            app->HandleDpiChange(newScale,
                                  reinterpret_cast<const RECT*>(lParam));
         }
+        return 0;
+    }
+    case WM_CLOSE: {
+        // Ask before discarding unsaved configuration edits.
+        ConfiguratorApp* app = appFromHwnd(hWnd);
+        if (app && app->config_.IsDirty()) {
+            const int choice = MessageBoxW(
+                hWnd,
+                L"Configuration has unsaved changes.\nClose anyway?",
+                L"SuperVirtualMIDISynth V3",
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+            if (choice != IDYES) return 0;
+        }
+        DestroyWindow(hWnd);
+        return 0;
+    }
+    case WM_DESTROY:
+        // The window is already gone; forget the handle so Shutdown()
+        // (which runs once in WinMain after the message loop) cannot call
+        // DestroyWindow on a stale HWND, then end the message loop.
+        if (appFromHwnd(hWnd)) {
+            appFromHwnd(hWnd)->hwnd_ = nullptr;
+        }
+        PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -118,7 +190,7 @@ bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
 
     if (!CreateMainWindow(hInstance)) return false;
     if (!CreateD3D11()) return false;
-    CreateImGui();
+    if (!CreateImGui()) return false;
     ApplyTheme();
 
     // Connect to RuntimeLink if PID was specified, otherwise try auto-discovery
@@ -145,18 +217,19 @@ bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
 }
 
 void ConfiguratorApp::Shutdown() {
+    // Idempotent: runs exactly once (from WinMain after the message loop
+    // exits).  Never invoked from WndProc/WM_DESTROY.
+    if (shutdownDone_) return;
+    shutdownDone_ = true;
+
     rlClient_.Close();
     rlConnected_ = false;
-
-    if (renderTarget_) { renderTarget_->Release(); renderTarget_ = nullptr; }
-    if (swapChain_) { swapChain_->Release(); swapChain_ = nullptr; }
-    if (d3dContext_) { d3dContext_->Release(); d3dContext_ = nullptr; }
-    if (d3dDevice_) { d3dDevice_->Release(); d3dDevice_ = nullptr; }
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
 
+    DestroyD3D11();
     DestroyMainWindow();
     running_ = false;
 }
@@ -169,7 +242,14 @@ bool ConfiguratorApp::CreateMainWindow(HINSTANCE hInstance) {
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = kWindowClass;
-    RegisterClassExW(&wc);
+    if (!RegisterClassExW(&wc)) {
+        lastInitError_ = StartupFailureText(
+            L"RegisterClassExW failed",
+            HRESULT_FROM_WIN32(GetLastError()));
+        LogStartupFailure(L"RegisterClassExW failed",
+                          HRESULT_FROM_WIN32(GetLastError()));
+        return false;
+    }
 
     UINT dpi = GetDpiForSystem();
     dpiScale_ = static_cast<float>(dpi) / 96.0f;
@@ -184,13 +264,22 @@ bool ConfiguratorApp::CreateMainWindow(HINSTANCE hInstance) {
     int x = (scrW - (rc.right - rc.left)) / 2;
     int y = (scrH - (rc.bottom - rc.top)) / 2;
 
+    // lpParam = this: WM_NCCREATE stores the pointer in GWLP_USERDATA so
+    // every later message can reach the owning app instance.
     hwnd_ = CreateWindowExW(
         0, kWindowClass, kWindowTitle,
         WS_OVERLAPPEDWINDOW,
         x, y, rc.right - rc.left, rc.bottom - rc.top,
-        nullptr, nullptr, hInstance, nullptr);
+        nullptr, nullptr, hInstance, this);
 
-    if (!hwnd_) return false;
+    if (!hwnd_) {
+        lastInitError_ = StartupFailureText(
+            L"CreateWindowExW failed",
+            HRESULT_FROM_WIN32(GetLastError()));
+        LogStartupFailure(L"CreateWindowExW failed",
+                          HRESULT_FROM_WIN32(GetLastError()));
+        return false;
+    }
 
     // With per-monitor V2 awareness the real scale is the window's,
     // not the system's.
@@ -240,15 +329,27 @@ bool ConfiguratorApp::CreateD3D11() {
             &sd, &swapChain_, &d3dDevice_, &featureLevel, &d3dContext_);
     }
 
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        lastInitError_ = StartupFailureText(L"D3D11CreateDeviceAndSwapChain failed", hr);
+        LogStartupFailure(L"D3D11CreateDeviceAndSwapChain failed", hr);
+        return false;
+    }
 
     ID3D11Texture2D* backBuffer = nullptr;
     hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        lastInitError_ = StartupFailureText(L"swap chain GetBuffer failed", hr);
+        LogStartupFailure(L"swap chain GetBuffer failed", hr);
+        return false;
+    }
 
     hr = d3dDevice_->CreateRenderTargetView(backBuffer, nullptr, &renderTarget_);
     backBuffer->Release();
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        lastInitError_ = StartupFailureText(L"CreateRenderTargetView failed", hr);
+        LogStartupFailure(L"CreateRenderTargetView failed", hr);
+        return false;
+    }
 
     return true;
 }
@@ -260,7 +361,7 @@ void ConfiguratorApp::DestroyD3D11() {
     if (d3dDevice_) { d3dDevice_->Release(); d3dDevice_ = nullptr; }
 }
 
-void ConfiguratorApp::CreateImGui() {
+bool ConfiguratorApp::CreateImGui() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -270,36 +371,88 @@ void ConfiguratorApp::CreateImGui() {
     ImGui::StyleColorsDark();
     ApplyTheme();
 
-    RecreateFonts(dpiScale_);
+    // Initial font build: the DX11 backend does not exist yet, so the
+    // atlas is only prepared here (no backend invalidation call).  The
+    // backend uploads the atlas during its first NewFrame/CreateDeviceObjects.
+    RecreateFonts(dpiScale_, false);
 
-    ImGui_ImplWin32_Init(hwnd_);
-    ImGui_ImplDX11_Init(d3dDevice_, d3dContext_);
+    if (!ImGui_ImplWin32_Init(hwnd_)) {
+        lastInitError_ = StartupFailureText(L"ImGui_ImplWin32_Init failed");
+        LogStartupFailure(L"ImGui_ImplWin32_Init failed");
+        return false;
+    }
+    if (!ImGui_ImplDX11_Init(d3dDevice_, d3dContext_)) {
+        lastInitError_ = StartupFailureText(L"ImGui_ImplDX11_Init failed");
+        LogStartupFailure(L"ImGui_ImplDX11_Init failed");
+        return false;
+    }
+    return true;
 }
 
-void ConfiguratorApp::RecreateFonts(float scale) {
+void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized) {
+    // Runtime (post-init) rebuilds must invalidate the DX11 backend's
+    // references to the CURRENT atlas before the atlas is rebuilt; the
+    // backend recreates its device/font objects from the new atlas during
+    // the next NewFrame.  Before ImGui_ImplDX11_Init() there is no backend
+    // data yet, and calling InvalidateDeviceObjects() would dereference it
+    // (startup crash), so it is skipped when rendererBackendInitialized
+    // is false.
+    if (rendererBackendInitialized) {
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+    }
+
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
 
+    // Since 1.92 the font data referenced by an ImFontConfig must persist
+    // for the whole atlas lifetime (the atlas no longer makes its own copy
+    // and keeps the caller's pointer for on-demand glyph rasterization).
+    // Keep our copy in a member, and keep ownership so the atlas does not
+    // free() a C++-allocated buffer on shutdown (heap corruption).
     ImFontConfig cfg;
     cfg.OversampleH = 1;
     cfg.OversampleV = 1;
     cfg.PixelSnapH = true;
+    cfg.FontDataOwnedByAtlas = false;
+
+    // Windows is not necessarily installed on C:; resolve the real
+    // Windows directory for the Segoe UI font file and load it through
+    // the wide-character file API (AddFontFromFileTTF only accepts
+    // narrow paths).
+    wchar_t windowsDir[MAX_PATH] = {};
+    const UINT len = GetWindowsDirectoryW(windowsDir, MAX_PATH);
+    fontData_.clear();
+    if (len > 0u && len < MAX_PATH) {
+        FILE* f = _wfopen((std::wstring(windowsDir) + L"\\Fonts\\segoeui.ttf").c_str(),
+                          L"rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            const long size = ftell(f);
+            if (size > 0) {
+                fontData_.resize(static_cast<size_t>(size));
+                fseek(f, 0, SEEK_SET);
+                fread(fontData_.data(), 1, fontData_.size(), f);
+            }
+            fclose(f);
+        }
+    }
 
     const float fontSize = 16.0f * scale;
-    ImFont* font = io.Fonts->AddFontFromFileTTF(
-        "C:\\Windows\\Fonts\\segoeui.ttf", fontSize, &cfg);
+    ImFont* font = nullptr;
+    if (!fontData_.empty()) {
+        font = io.Fonts->AddFontFromMemoryTTF(
+            fontData_.data(), static_cast<int>(fontData_.size()), fontSize, &cfg);
+    }
     if (!font) {
         // Fall back to the built-in font when Segoe UI is unavailable.
         font = io.Fonts->AddFontDefault();
     }
     io.FontDefault = font;
 
-    // Force the DX11 backend to rebuild the font atlas at the new size.
     io.Fonts->Build();
-    ImGui_ImplDX11_InvalidateDeviceObjects();
 }
 
-void ConfiguratorApp::ApplyDpiScale(float scale, const RECT* suggestedRect) {
+void ConfiguratorApp::HandleDpiChange(float scale, const RECT* suggestedRect) {
     if (!hwnd_) return;
     dpiScale_ = scale;
 
@@ -310,9 +463,10 @@ void ConfiguratorApp::ApplyDpiScale(float scale, const RECT* suggestedRect) {
                      SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
-    // The main window was created with the old scaled size; recreate the
-    // font atlas for the new DPI.
-    RecreateFonts(scale);
+    // The font atlas rebuild is deferred to the start of the next frame;
+    // doing it here would render re-entrantly inside WndProc.
+    pendingDpiScale_ = scale;
+    dpiRebuildPending_ = true;
 }
 
 bool ConfiguratorApp::PumpMessages() {
@@ -328,31 +482,72 @@ bool ConfiguratorApp::PumpMessages() {
     return running_;
 }
 
-void ConfiguratorApp::HandleWindowSize() {
+void ConfiguratorApp::ResizeSwapChain(int width, int height) {
     if (!swapChain_ || !d3dDevice_) return;
+    if (width <= 0 || height <= 0) return;
 
-    RECT rc;
-    GetClientRect(hwnd_, &rc);
-    int w = rc.right - rc.left;
-    int h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0) return;
+    // Resize only when something actually changed; keeping the current
+    // render target means the swap chain and RTV stay in sync.
+    if (width == windowWidth_ && height == windowHeight_ && renderTarget_) {
+        return;
+    }
 
     if (renderTarget_) { renderTarget_->Release(); renderTarget_ = nullptr; }
-    swapChain_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
 
+    HRESULT hr = swapChain_->ResizeBuffers(
+        0, static_cast<UINT>(width), static_cast<UINT>(height),
+        DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) {
+        LogStartupFailure(L"ResizeBuffers failed (retrying with the "
+                          L"current back buffer)", hr);
+    }
+
+    // Even when ResizeBuffers fails, the previous back buffer may still
+    // be usable — recreate the RTV from whatever the swap chain holds now.
     ID3D11Texture2D* backBuffer = nullptr;
-    swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-    if (backBuffer) {
-        d3dDevice_->CreateRenderTargetView(backBuffer, nullptr, &renderTarget_);
+    hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (SUCCEEDED(hr) && backBuffer) {
+        hr = d3dDevice_->CreateRenderTargetView(backBuffer, nullptr,
+                                                &renderTarget_);
+        backBuffer->Release();
+    } else if (backBuffer) {
         backBuffer->Release();
     }
 
-    windowWidth_ = w;
-    windowHeight_ = h;
+    windowWidth_ = width;
+    windowHeight_ = height;
+
+    if (FAILED(hr) || !renderTarget_) {
+        // No valid render target: re-arm the pending resize so the next
+        // frame retries instead of rendering into a null resource.
+        resizePending_ = true;
+        if (FAILED(hr)) {
+            LogStartupFailure(L"GetBuffer/CreateRenderTargetView after "
+                              L"resize failed", hr);
+        }
+    }
 }
 
 void ConfiguratorApp::RenderFrame() {
-    HandleWindowSize();
+    // Deferred window-size handling: the swap chain is resized exactly
+    // once per actual WM_SIZE, in the render loop (never in WndProc).
+    if (resizePending_) {
+        resizePending_ = false;
+        ResizeSwapChain(static_cast<int>(pendingWidth_),
+                        static_cast<int>(pendingHeight_));
+    }
+
+    // Deferred DPI font rebuild (WM_DPICHANGED only records it).
+    if (dpiRebuildPending_) {
+        dpiRebuildPending_ = false;
+        RecreateFonts(pendingDpiScale_, true);
+    }
+
+    // A failed resize may have left no render target; drop the frame
+    // instead of dereferencing invalid resources (ResizeSwapChain re-arms
+    // resizePending_ so the next frame retries).
+    if (!renderTarget_) return;
+
     HandleKeyboardShortcuts();
     PollRuntimeLink();
 

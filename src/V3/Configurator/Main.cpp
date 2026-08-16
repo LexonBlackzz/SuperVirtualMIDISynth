@@ -5,6 +5,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <string>
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     svms::cfg::ConfiguratorApp app;
@@ -29,8 +30,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     if (!app.Initialize(hInstance, argc, argv)) {
-        MessageBoxW(nullptr, L"Failed to initialize configurator.",
-                    L"SVMS V3 Configurator", MB_OK | MB_ICONERROR);
+        const wchar_t* detail = app.LastInitError();
+        std::wstring message = (detail && detail[0] != L'\0')
+            ? std::wstring(detail)
+            : std::wstring(L"Failed to initialize the configurator.");
+        MessageBoxW(nullptr, message.c_str(), L"SVMS V3 Configurator",
+                    MB_OK | MB_ICONERROR);
         return 1;
     }
 
