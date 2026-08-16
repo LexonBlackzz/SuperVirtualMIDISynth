@@ -91,7 +91,8 @@ inline void ChannelCache::Reset() {
 }
 
 inline void ChannelCache::SetMasterVolume(float vol) {
-    masterVolume_ = vol < 0.0f ? 0.0f : (vol > 1.0f ? 1.0f : vol);
+    // Master volume contract is 0..4 (SnappySynth-style headroom boost).
+    masterVolume_ = vol < 0.0f ? 0.0f : (vol > 4.0f ? 4.0f : vol);
 }
 
 inline void ChannelCache::NoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {

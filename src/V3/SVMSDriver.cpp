@@ -691,6 +691,28 @@ struct ReverbState {
                     configuredSampleRate) *
                     0.45f);
 
+        // Derived coefficients (FDN delays, feedback, taps, filters,
+        // LFOs) from the raw fields.  UpdateDerived never clears the
+        // delay lines, so live parameter changes morph the tail in
+        // place instead of cutting it dead.  Reset() here zeroes
+        // everything for the init/reload path only.
+        UpdateDerived();
+        Reset();
+    }
+
+    // =====================================================================
+    // UpdateDerived
+    // =====================================================================
+    //
+    // Recomputes all derived coefficients (FDN delay lengths, feedback,
+    // damping, diffuser/allpass lengths, predelay/early taps, wet EQ and
+    // LFO increments) from the current raw fields.  Deliberately does NOT
+    // clear any delay line or state: the audio thread calls this once per
+    // block after folding live reverb parameters from the mailbox, so
+    // knob moves morph the existing tail instead of cutting it.
+    void UpdateDerived() noexcept
+    {
+
         // =============================================================
         // RT60
         //
@@ -1032,8 +1054,6 @@ struct ReverbState {
             lfoCosIncrement[i] =
                 std::cos(increment);
         }
-
-        Reset();
     }
 
     // =====================================================================
@@ -1553,10 +1573,21 @@ struct LimiterState {
     float releaseCoeff = 0.001f;
     bool enabled = true;
 
+    // Per-block meters, written by Process() on the audio thread and
+    // published into g_audioSnapshot by RenderCallback.  gainReductionDb
+    // is positive (amount of reduction); peaks are linear sample scale.
+    float inputPeakL = 0.0f;
+    float inputPeakR = 0.0f;
+    float outputPeakL = 0.0f;
+    float outputPeakR = 0.0f;
+    float gainReductionDb = 0.0f;
+
     void Reset() {
         std::memset(delayBuffer, 0, sizeof(delayBuffer));
         delayWritePos = 0;
         envelope = 0.0f;
+        inputPeakL = inputPeakR = outputPeakL = outputPeakR = 0.0f;
+        gainReductionDb = 0.0f;
     }
 
     void Configure(uint32_t sampleRate, const EngineConfig& cfg) {
@@ -1576,7 +1607,22 @@ struct LimiterState {
 
     void Process(float* interleaved, uint32_t numFrames, uint32_t channels,
                  PostHighPass3Hz& highPass) {
+        inputPeakL = inputPeakR = outputPeakL = outputPeakR = 0.0f;
+        gainReductionDb = 0.0f;
+
         if (!enabled) {
+            // Bypass: no limiting, so the meters just mirror the
+            // passthrough signal (input == output).
+            for (uint32_t f = 0; f < numFrames; ++f) {
+                const float inL = interleaved[f * channels];
+                const float inR = (channels > 1) ? interleaved[f * channels + 1] : inL;
+                const float aL = inL > 0.0f ? inL : -inL;
+                const float aR = inR > 0.0f ? inR : -inR;
+                if (aL > inputPeakL) inputPeakL = aL;
+                if (aR > inputPeakR) inputPeakR = aR;
+            }
+            outputPeakL = inputPeakL;
+            outputPeakR = inputPeakR;
             highPass.ProcessInterleavedStereo(interleaved, numFrames);
             return;
         }
@@ -1588,6 +1634,8 @@ struct LimiterState {
             float absL = inL > 0 ? inL : -inL;
             float absR = inR > 0 ? inR : -inR;
             float peak = absL > absR ? absL : absR;
+            if (absL > inputPeakL) inputPeakL = absL;
+            if (absR > inputPeakR) inputPeakR = absR;
 
             if (peak > envelope) {
                 envelope += attackCoeff * (peak - envelope);
@@ -1598,6 +1646,9 @@ struct LimiterState {
             float gain = 1.0f;
             if (envelope > threshold) {
                 gain = threshold / envelope;
+                const float reduction =
+                    -20.0f * std::log10(gain);
+                if (reduction > gainReductionDb) gainReductionDb = reduction;
             }
 
             uint32_t dw = delayWritePos * channels;
@@ -1625,6 +1676,10 @@ struct LimiterState {
             };
             dL = softLimit(dL);
             dR = softLimit(dR);
+            const float oL = dL > 0.0f ? dL : -dL;
+            const float oR = dR > 0.0f ? dR : -dR;
+            if (oL > outputPeakL) outputPeakL = oL;
+            if (oR > outputPeakR) outputPeakR = oR;
             highPass.ProcessStereoSample(dL, dR);
 
             interleaved[f * channels] = dL;
@@ -1840,18 +1895,21 @@ private:
     ReverbState reverb;
     LimiterState limiter;
 
-    // ── Atomic live-config mailbox (double-buffer) ───────────────────
-    // Control thread writes to the back buffer, then publishes the front
-    // pointer with release semantics.  Audio thread loads the front
-    // pointer with acquire semantics once per render block.  Lock-free,
-    // wait-free, no torn reads.
-    LiveConfigMailbox liveMailboxA_;
-    LiveConfigMailbox liveMailboxB_;
-    std::atomic<LiveConfigMailbox*> liveMailboxFront_{&liveMailboxA_};
-    LiveConfigMailbox* liveMailboxBack() {
-        return (liveMailboxFront_.load(std::memory_order_relaxed) == &liveMailboxA_)
-            ? &liveMailboxB_ : &liveMailboxA_;
-    }
+    // ── Atomic live-config mailbox (seqlock) ─────────────────────────
+    // The control thread is the ONLY writer.  It bumps liveMailboxSeq_
+    // to ODD, writes the mailbox fields, then bumps to EVEN (release).
+    // The audio thread reads once per render block: if the sequence is
+    // even and unchanged after the copy, the copy is torn-free; otherwise
+    // it falls back to liveMailboxApplied_ (the last stable read).  No
+    // locks, no torn reads, no ABA (single writer, monotonically even
+    // sequence values 2, 4, 6, ...).
+    svms::LiveConfigMailbox liveMailbox_;
+    std::atomic<uint32_t> liveMailboxSeq_{2u};
+    svms::LiveConfigMailbox liveMailboxApplied_;
+
+    // Last master volume the audio thread actually folded into playing
+    // voices' mix gains.  Audio-thread only.
+    float appliedMasterVolume_ = 1.0f;
 
     // Per-block dispatch queue. Allocated once during initialization from the
     // smaller of max_events_per_block and the configured scheduler capacity.
@@ -1886,209 +1944,316 @@ private:
     uint32_t nextPlayIndex_;
     EngineConfig engineConfig_;
 
-    void HandleRuntimeLinkCommand(const svms::RLCommand& cmd);
-    void PublishRuntimeLinkTelemetry(const VoiceManager* vm, float cpuPct);
+    #if !defined(SVMS_XP_COMPAT)
+    svms::RLResult HandleRuntimeLinkCommand(const svms::RuntimeLinkCommandV2& cmd,
+                                  char* resultText);
+    svms::RuntimeLinkTelemetryV2 BuildRuntimeLinkTelemetry();
+#endif
+
+    // Path of the last successfully loaded SoundFont.  Written by the
+    // host/control thread under LoadSoundFont(); read by the control
+    // thread for telemetry.  Never touched by the audio thread.
+    wchar_t loadedSoundFontPath_[MAX_PATH] = {};
+
+    uint32_t lastReleasingVoices_ = 0;
+    uint32_t releasingScanTick_ = 0;
+
+    // Control-thread-owned echo of the live parameters the audio thread
+    // is applying (via the mailbox).  Published in RuntimeLink telemetry.
+#if !defined(SVMS_XP_COMPAT)
+    svms::RuntimeLiveStateV2 appliedLive_;
+#endif
 
     CRITICAL_SECTION cs;
 };
 
 static Driver* s_instance = nullptr;
 
-// ── RuntimeLink IPC (driver side) ───────────────────────────────────────
-// The control thread polls for commands at 100ms intervals and applies
-// live config changes.  The audio thread never touches IPC; telemetry
-// is copied from process-local double-buffers to shared memory by
-// the control thread (triggered by the command-event signal).
-static svms::RuntimeLinkDriver g_rlDriver;
+// ── RuntimeLink V2 IPC (driver side) ───────────────────────────────────────
+// The control thread polls the command mailbox every ~33 ms, applies
+// live config changes (grouped ApplyLiveConfig), runs the reload/reset
+// commands, and publishes telemetry at ~30 Hz.  The audio thread never
+// touches IPC; it only updates the process-local g_audioSnapshot, which
+// the control thread reads at publish time.
+#if !defined(SVMS_XP_COMPAT)
+static svms::RuntimeLinkDriverV2 g_rlDriver;
+
+// Process-local audio→control snapshot.  Audio thread writes (odd/even
+// sequence), control thread reads.  Never mapped into shared memory.
+static svms::RuntimeAudioSnapshot g_audioSnapshot;
+#endif
 
 // ── RuntimeLink command handler (runs on control thread) ────────────────
-// Writes every live param to the back buffer of the double-buffered
-// mailbox, then publishes via atomic pointer swap.  The audio thread
-// reads the front pointer once per block — no locks, no torn reads.
-void Driver::HandleRuntimeLinkCommand(const svms::RLCommand& cmd) {
-    using RT = svms::RLCommandType;
-    LiveConfigMailbox* back = liveMailboxBack();
-
-    switch (cmd.type) {
-    case RT::Ping:
-        LOG("RuntimeLink: Ping received");
-        break;
-
-    // ── LIVE params → mailbox back buffer ──────────────────────────
-    case RT::SetMasterVolume:
-        back->masterVolume = cmd.value0;
-        break;
-
-    case RT::SetReverbEnabled:
-        back->reverbEnabled = (cmd.param0 != 0);
-        break;
-    case RT::SetReverbMix:
-        back->reverbMix = (std::max)(0.0f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetReverbRoomSize:
-        back->reverbRoomSize = (std::max)(0.0f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetReverbDecay:
-        back->reverbDecay = (std::max)(0.0f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetReverbDamping:
-        back->reverbDamping = (std::max)(0.0f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetReverbWidth:
-        back->reverbWidth = (std::max)(0.0f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetReverbDiffusion:
-        back->reverbDiffusion = (std::max)(0.0f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetReverbPreDelayMs:
-        back->reverbPreDelayMs = (std::max)(0.0f, (std::min)(200.0f, cmd.value0));
-        break;
-    case RT::SetReverbEarlyLevel:
-        back->reverbEarlyLevel = (std::max)(0.0f, (std::min)(1.5f, cmd.value0));
-        break;
-    case RT::SetReverbLateLevel:
-        back->reverbLateLevel = (std::max)(0.0f, (std::min)(1.5f, cmd.value0));
-        break;
-    case RT::SetReverbModDepth:
-        back->reverbModDepth = (std::max)(0.0f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetReverbModRate:
-        back->reverbModRate = (std::max)(0.0f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetReverbLowCutHz:
-        back->reverbLowCutHz = (std::max)(0.0f, (std::min)(2000.0f, cmd.value0));
-        break;
-    case RT::SetReverbHighCutHz:
-        back->reverbHighCutHz = (std::max)(1000.0f,
-            (std::min)(static_cast<float>(sampleRate) * 0.45f, cmd.value0));
-        break;
-
-    case RT::SetLimiterEnabled:
-        back->limiterEnabled = (cmd.param0 != 0);
-        break;
-    case RT::SetLimiterThreshold:
-        back->limiterThreshold = (std::max)(0.1f, (std::min)(1.0f, cmd.value0));
-        break;
-    case RT::SetLimiterLookahead: {
-        uint32_t frames = static_cast<uint32_t>(
-            (std::max)(0.0f, (std::min)(20.0f, cmd.value0)) * sampleRate * 0.001f + 0.5f);
-        back->limiterDelayFrames = (std::max)(1u,
-            (std::min)(svms::LimiterState::kMaxDelayFrames, frames));
-        break;
-    }
-    case RT::SetLimiterAttack: {
-        float attackSamples = (std::max)(0.01f, (std::min)(100.0f, cmd.value0))
-                            * sampleRate * 0.001f;
-        attackSamples = (std::max)(1.0f, attackSamples);
-        back->limiterAttackCoeff = 1.0f - std::exp(-1.0f / attackSamples);
-        break;
-    }
-    case RT::SetLimiterRelease: {
-        float releaseSamples = (std::max)(1.0f, (std::min)(5000.0f, cmd.value0))
-                             * sampleRate * 0.001f;
-        releaseSamples = (std::max)(1.0f, releaseSamples);
-        back->limiterReleaseCoeff = 1.0f - std::exp(-1.0f / releaseSamples);
-        break;
-    }
-
-    case RT::SetCorrectnessMode:
-        back->correctnessMode = (cmd.param0 != 0);
-        break;
-
-    case RT::RequestRestart:
-        LOG("RuntimeLink: restart requested (not implemented yet)");
-        break;
-
-    default:
-        LOG("RuntimeLink: unknown command type %u", static_cast<unsigned>(cmd.type));
-        break;
-    }
-
-    // Publish the back buffer as the new front (release store).
-    liveMailboxFront_.store(back, std::memory_order_release);
-}
-
-// ── RuntimeLink telemetry publisher (called from control thread) ────────
-// Copies process-local state into shared memory for the configurator.
-void Driver::PublishRuntimeLinkTelemetry(const VoiceManager* vm, float cpuPct) {
-    if (!g_rlDriver.IsInitialized()) return;
-
-    // Acquire the current mailbox snapshot (written by control thread).
-    const LiveConfigMailbox& mb = *liveMailboxFront_.load(std::memory_order_acquire);
-
-    svms::RLTelemetry snap{};
-    snap.activeVoices = vm ? vm->activeCount_ : 0;
-    snap.maxVoices = vm ? vm->GetMaxVoices() : 0;
-    snap.releasingVoices = 0;
-    if (vm) {
-        for (uint32_t i = 0; i < vm->activeCount_; ++i) {
-            uint32_t v = vm->activeList_[i];
-            snap.releasingVoices += vm->v.state[v] ==
-                static_cast<uint8_t>(svms::VoiceState::Releasing);
-        }
-    }
-    snap.freeTop = vm ? vm->freeTop_ : 0;
-    snap.voiceSteals = vm ? vm->stealCount_ : 0;
-    snap.retiredCount = vm ? vm->retireCount_ : 0;
-    snap.retiredImmediateCount = vm ? vm->retireImmediateCount_ : 0;
-    snap.decimationStep = mb.correctnessMode ? 1u : svms::ComputeDecimationStep(snap.activeVoices);
-
-    snap.sampleRate = sampleRate;
-    snap.bufferFrames = bufferFrames;
-    snap.renderPeak = sf2Telemetry_.renderPeak;
-    snap.masterVolume = mb.masterVolume;
-    snap.audioRunning = (audioOutput && audioOutput->IsRunning()) ? 1u : 0u;
-    snap.soundFontLoaded = (soundFontData && sampleDataStore) ? 1u : 0u;
-    snap.audioHResult = audioOutput
-        ? static_cast<int32_t>(audioOutput->GetLastError()) : 0;
-
-    snap.cpuLoadPercent = cpuPct;
-    snap.callbackP95 = telemetry_.callbackP95Percent;
-    snap.callbackP99 = telemetry_.callbackP99Percent;
-    snap.callbackP999 = telemetry_.callbackP999Percent;
-    snap.overBudgetCallbacks = telemetry_.overBudgetCallbacks;
-    snap.maxConsecutiveOverBudget = telemetry_.maxConsecutiveOverBudget;
-
-    snap.eventsSubmitted = telemetry_.submitted;
-    snap.eventsAccepted = telemetry_.accepted;
-    snap.eventsDropped = telemetry_.dropped;
-    snap.eventsDispatched = telemetry_.dispatched;
-
-    // Reverb live params from mailbox
-    snap.reverbMix = mb.reverbMix;
-    snap.reverbRoomSize = mb.reverbRoomSize;
-    snap.reverbDecay = mb.reverbDecay;
-    snap.reverbDamping = mb.reverbDamping;
-    snap.reverbWidth = mb.reverbWidth;
-    snap.reverbDiffusion = mb.reverbDiffusion;
-    snap.reverbPreDelayMs = mb.reverbPreDelayMs;
-    snap.reverbEarlyLevel = mb.reverbEarlyLevel;
-    snap.reverbLateLevel = mb.reverbLateLevel;
-    snap.reverbModDepth = mb.reverbModDepth;
-    snap.reverbModRate = mb.reverbModRate;
-    snap.reverbLowCutHz = mb.reverbLowCutHz;
-    snap.reverbHighCutHz = mb.reverbHighCutHz;
-
-    // Limiter live params from mailbox
-    snap.limiterEnabled = mb.limiterEnabled ? 1u : 0u;
-    snap.limiterThreshold = mb.limiterThreshold;
-    snap.limiterLookaheadMs = static_cast<float>(mb.limiterDelayFrames)
-                            / sampleRate * 1000.0f;
-    snap.limiterAttackMs = mb.limiterAttackCoeff > 0.0f
+// V2 command handling.  Live parameters arrive as ONE grouped
+// ApplyLiveConfig command carrying the full RuntimeLiveStateV2 payload
+// and a groupMask; the handler validates the payload, writes only the
+// masked groups into the seqlock mailbox (odd sequence = in-progress,
+// even = published; the audio thread reads it once per block — no locks,
+// no torn reads).  Heavy commands (ReloadSoundFont) run here, never on
+// the audio thread; ResetVoices routes through the SPSC ingress exactly
+// like midiOutReset so the audio thread performs the release work.
+#if !defined(SVMS_XP_COMPAT)
+static svms::RuntimeLiveStateV2 LiveStateFromMailbox(
+    const LiveConfigMailbox& mb, uint32_t sampleRate) {
+    svms::RuntimeLiveStateV2 l{};
+    l.masterVolume = mb.masterVolume;
+    l.correctnessMode = mb.correctnessMode ? 1u : 0u;
+    l.reverbEnabled = mb.reverbEnabled ? 1u : 0u;
+    l.reverbMix = mb.reverbMix;
+    l.reverbRoomSize = mb.reverbRoomSize;
+    l.reverbDecay = mb.reverbDecay;
+    l.reverbDamping = mb.reverbDamping;
+    l.reverbWidth = mb.reverbWidth;
+    l.reverbDiffusion = mb.reverbDiffusion;
+    l.reverbPreDelayMs = mb.reverbPreDelayMs;
+    l.reverbEarlyLevel = mb.reverbEarlyLevel;
+    l.reverbLateLevel = mb.reverbLateLevel;
+    l.reverbModDepth = mb.reverbModDepth;
+    l.reverbModRate = mb.reverbModRate;
+    l.reverbLowCutHz = mb.reverbLowCutHz;
+    l.reverbHighCutHz = mb.reverbHighCutHz;
+    l.limiterEnabled = mb.limiterEnabled ? 1u : 0u;
+    l.limiterThreshold = mb.limiterThreshold;
+    l.limiterLookaheadMs = static_cast<float>(mb.limiterDelayFrames)
+                         / sampleRate * 1000.0f;
+    l.limiterAttackMs = mb.limiterAttackCoeff > 0.0f
         ? -1000.0f / (sampleRate * std::log(1.0f - mb.limiterAttackCoeff))
         : 0.01f;
-    snap.limiterReleaseMs = mb.limiterReleaseCoeff > 0.0f
+    l.limiterReleaseMs = mb.limiterReleaseCoeff > 0.0f
         ? -1000.0f / (sampleRate * std::log(1.0f - mb.limiterReleaseCoeff))
         : 100.0f;
-
-    snap.correctnessMode = mb.correctnessMode ? 1u : 0u;
-
-    LARGE_INTEGER qpc;
-    QueryPerformanceCounter(&qpc);
-    snap.timestampQPC = static_cast<uint64_t>(qpc.QuadPart);
-
-    g_rlDriver.PublishTelemetry(snap);
+    return l;
 }
+
+svms::RLResult Driver::HandleRuntimeLinkCommand(
+    const svms::RuntimeLinkCommandV2& cmd, char* resultText) {
+    using RT = svms::RLCommandType;
+    constexpr uint32_t kText = svms::kRuntimeLinkResultTextCapacity;
+
+    switch (static_cast<RT>(cmd.type)) {
+    case RT::Ping:
+        return svms::RLResult::Ok;
+
+    case RT::ApplyLiveConfig: {
+        if (cmd.groupMask == 0u) {
+            strncpy_s(resultText, kText, "empty group mask", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        const svms::RuntimeLiveStateV2& l = cmd.live;
+        // Reject non-finite payloads before touching the mailbox.
+        if (!svms::RLV2_IsFinite(l.masterVolume) ||
+            !svms::RLV2_IsFinite(l.reverbMix) ||
+            !svms::RLV2_IsFinite(l.reverbRoomSize) ||
+            !svms::RLV2_IsFinite(l.reverbDecay) ||
+            !svms::RLV2_IsFinite(l.reverbDamping) ||
+            !svms::RLV2_IsFinite(l.reverbWidth) ||
+            !svms::RLV2_IsFinite(l.reverbDiffusion) ||
+            !svms::RLV2_IsFinite(l.reverbPreDelayMs) ||
+            !svms::RLV2_IsFinite(l.reverbEarlyLevel) ||
+            !svms::RLV2_IsFinite(l.reverbLateLevel) ||
+            !svms::RLV2_IsFinite(l.reverbModDepth) ||
+            !svms::RLV2_IsFinite(l.reverbModRate) ||
+            !svms::RLV2_IsFinite(l.reverbLowCutHz) ||
+            !svms::RLV2_IsFinite(l.reverbHighCutHz) ||
+            !svms::RLV2_IsFinite(l.limiterThreshold) ||
+            !svms::RLV2_IsFinite(l.limiterLookaheadMs) ||
+            !svms::RLV2_IsFinite(l.limiterAttackMs) ||
+            !svms::RLV2_IsFinite(l.limiterReleaseMs)) {
+            strncpy_s(resultText, kText, "non-finite parameter", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        if (l.correctnessMode > 1u || l.reverbEnabled > 1u ||
+            l.limiterEnabled > 1u) {
+            strncpy_s(resultText, kText, "boolean flags must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+
+        // Seqlock write: odd sequence marks the mailbox as in-progress
+        // for the audio thread, even publishes the completed copy.
+        LiveConfigMailbox* mb = &liveMailbox_;
+        const uint32_t even = liveMailboxSeq_.load(std::memory_order_relaxed);
+        liveMailboxSeq_.store(even | 1u, std::memory_order_relaxed);
+        RLV2_MemBarrier();
+
+        if (cmd.groupMask & svms::RLGroupMaster) {
+            mb->masterVolume = (std::max)(0.0f, (std::min)(4.0f, l.masterVolume));
+        }
+        if (cmd.groupMask & svms::RLGroupCorrectness) {
+            mb->correctnessMode = l.correctnessMode != 0u;
+        }
+        if (cmd.groupMask & svms::RLGroupReverb) {
+            mb->reverbEnabled = l.reverbEnabled != 0u;
+            mb->reverbMix = (std::max)(0.0f, (std::min)(1.0f, l.reverbMix));
+            mb->reverbRoomSize = (std::max)(0.0f, (std::min)(1.0f, l.reverbRoomSize));
+            mb->reverbDecay = (std::max)(0.0f, (std::min)(1.0f, l.reverbDecay));
+            mb->reverbDamping = (std::max)(0.0f, (std::min)(1.0f, l.reverbDamping));
+            mb->reverbWidth = (std::max)(0.0f, (std::min)(1.0f, l.reverbWidth));
+            mb->reverbDiffusion = (std::max)(0.0f, (std::min)(1.0f, l.reverbDiffusion));
+            mb->reverbPreDelayMs = (std::max)(0.0f, (std::min)(200.0f, l.reverbPreDelayMs));
+            mb->reverbEarlyLevel = (std::max)(0.0f, (std::min)(1.5f, l.reverbEarlyLevel));
+            mb->reverbLateLevel = (std::max)(0.0f, (std::min)(1.5f, l.reverbLateLevel));
+            mb->reverbModDepth = (std::max)(0.0f, (std::min)(1.0f, l.reverbModDepth));
+            mb->reverbModRate = (std::max)(0.0f, (std::min)(1.0f, l.reverbModRate));
+            mb->reverbLowCutHz = (std::max)(0.0f, (std::min)(2000.0f, l.reverbLowCutHz));
+            mb->reverbHighCutHz = (std::max)(1000.0f,
+                (std::min)(static_cast<float>(sampleRate) * 0.45f, l.reverbHighCutHz));
+        }
+        if (cmd.groupMask & svms::RLGroupLimiter) {
+            mb->limiterEnabled = l.limiterEnabled != 0u;
+            mb->limiterThreshold = (std::max)(0.1f, (std::min)(1.0f, l.limiterThreshold));
+            uint32_t frames = static_cast<uint32_t>(
+                (std::max)(0.0f, (std::min)(20.0f, l.limiterLookaheadMs))
+                * sampleRate * 0.001f + 0.5f);
+            mb->limiterDelayFrames = (std::max)(1u,
+                (std::min)(svms::LimiterState::kMaxDelayFrames, frames));
+            float attackSamples = (std::max)(0.01f, (std::min)(100.0f, l.limiterAttackMs))
+                                * sampleRate * 0.001f;
+            attackSamples = (std::max)(1.0f, attackSamples);
+            mb->limiterAttackCoeff = 1.0f - std::exp(-1.0f / attackSamples);
+            float releaseSamples = (std::max)(1.0f, (std::min)(5000.0f, l.limiterReleaseMs))
+                                 * sampleRate * 0.001f;
+            releaseSamples = (std::max)(1.0f, releaseSamples);
+            mb->limiterReleaseCoeff = 1.0f - std::exp(-1.0f / releaseSamples);
+        }
+
+        // Publish the completed copy (even sequence, release store).
+        RLV2_MemBarrier();
+        liveMailboxSeq_.store(even + 2u, std::memory_order_release);
+        appliedLive_ = LiveStateFromMailbox(*mb, sampleRate);
+        return svms::RLResult::Ok;
+    }
+
+    case RT::ReloadSoundFont: {
+        // Transactional reload: resolve the configured SoundFont, parse
+        // it (control thread — never the audio thread), and swap while
+        // the audio device is stopped.  A failed parse leaves the
+        // existing runtime untouched.
+        std::string resolutionWarning;
+        const std::wstring widePath =
+            ResolveV3SoundFontPath(engineConfig_, &resolutionWarning);
+        if (widePath.empty()) {
+            strncpy_s(resultText, kText, "no SoundFont configured", _TRUNCATE);
+            if (!resolutionWarning.empty()) {
+                strncpy_s(resultText, kText, resolutionWarning.c_str(), _TRUNCATE);
+            }
+            return svms::RLResult::LoadFailed;
+        }
+        if (!LoadSoundFont(widePath.c_str())) {
+            strncpy_s(resultText, kText,
+                      "SoundFont parse failed; previous SoundFont kept",
+                      _TRUNCATE);
+            return svms::RLResult::LoadFailed;
+        }
+        return svms::RLResult::Ok;
+    }
+
+    case RT::ResetVoices:
+        // Routes through the SPSC ingress when audio is running, so the
+        // release work happens on the audio thread exactly like
+        // midiOutReset.
+        ResetAllVoices();
+        return svms::RLResult::Ok;
+
+    case RT::RequestRestart:
+        strncpy_s(resultText, kText,
+                  "restart is a manual operation: change restart-only "
+                  "fields and restart the driver",
+                  _TRUNCATE);
+        return svms::RLResult::Unsupported;
+
+    default:
+        strncpy_s(resultText, kText, "unknown command type", _TRUNCATE);
+        return svms::RLResult::InvalidArgument;
+    }
+}
+#endif // !defined(SVMS_XP_COMPAT)
+
+// ── RuntimeLink telemetry builder (runs on the control thread) ──────────
+// Reads the process-local audio snapshot (written by the audio thread),
+// the immutable engine parameters, and the applied-live echo, then hands
+// the result to the driver for publication.  No audio-thread structures
+// are touched here: every per-block counter travels through the snapshot.
+#if !defined(SVMS_XP_COMPAT)
+svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
+    // Wide→UTF-8 for the SoundFont name broadcast (local helper; the
+    // SVMSConfig.cpp copy of WideToUtf8 is not exported via the header).
+    auto wideToUtf8 = [](const std::wstring& value) -> std::string {
+        if (value.empty()) return std::string();
+        const int count = WideCharToMultiByte(CP_UTF8, 0, value.data(),
+                                              static_cast<int>(value.size()),
+                                              nullptr, 0, nullptr, nullptr);
+        if (count <= 0) return std::string();
+        std::string out(static_cast<size_t>(count), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, value.data(),
+                            static_cast<int>(value.size()), out.data(), count,
+                            nullptr, nullptr);
+        return out;
+    };
+
+    svms::RuntimeLinkTelemetryV2 snap{};
+    static svms::RuntimeLinkTelemetryV2 s_lastBuilt;  // last stable publish
+
+    constexpr uint32_t kStamp = 1u;
+    const svms::RuntimeAudioSnapshot& as = g_audioSnapshot;
+    const bool settled = as.sequence == svms::RLV2_SnapshotSettledSequence;
+    if (settled) {
+        float f = 0.0f;
+        if (as.activeVoices.TryLoad(f, kStamp)) snap.activeVoices = static_cast<uint32_t>(f);
+        if (as.releasingVoices.TryLoad(f, kStamp)) snap.releasingVoices = static_cast<uint32_t>(f);
+        if (as.freeTop.TryLoad(f, kStamp)) snap.freeTop = static_cast<uint32_t>(f);
+        if (as.voiceSteals.TryLoad(f, kStamp)) snap.voiceSteals = static_cast<uint32_t>(f);
+        if (as.retiredCount.TryLoad(f, kStamp)) snap.retiredCount = static_cast<uint32_t>(f);
+        if (as.retiredImmediateCount.TryLoad(f, kStamp)) snap.retiredImmediateCount = static_cast<uint32_t>(f);
+        if (as.decimationStep.TryLoad(f, kStamp)) snap.decimationStep = static_cast<uint32_t>(f);
+        if (as.renderPeak.TryLoad(f, kStamp)) snap.renderPeak = f;
+        if (as.audioRunning.TryLoad(f, kStamp)) snap.audioRunning = static_cast<uint32_t>(f);
+        if (as.soundFontLoaded.TryLoad(f, kStamp)) snap.soundFontLoaded = static_cast<uint32_t>(f);
+        if (as.audioHResult.TryLoad(f, kStamp)) snap.audioHResult = static_cast<int32_t>(f);
+        if (as.cpuLoadPercent.TryLoad(f, kStamp)) snap.cpuLoadPercent = f;
+        if (as.callbackP95Percent.TryLoad(f, kStamp)) snap.callbackP95Percent = f;
+        if (as.callbackP99Percent.TryLoad(f, kStamp)) snap.callbackP99Percent = f;
+        if (as.callbackP999Percent.TryLoad(f, kStamp)) snap.callbackP999Percent = f;
+        if (as.maxConsecutiveOverBudget.TryLoad(f, kStamp)) snap.maxConsecutiveOverBudget = static_cast<uint32_t>(f);
+        if (as.limiterInputPeakL.TryLoad(f, kStamp)) snap.limiterInputPeakL = f;
+        if (as.limiterInputPeakR.TryLoad(f, kStamp)) snap.limiterInputPeakR = f;
+        if (as.limiterOutputPeakL.TryLoad(f, kStamp)) snap.limiterOutputPeakL = f;
+        if (as.limiterOutputPeakR.TryLoad(f, kStamp)) snap.limiterOutputPeakR = f;
+        if (as.limiterGainReductionDb.TryLoad(f, kStamp)) snap.limiterGainReductionDb = f;
+        snap.overBudgetCallbacks = as.overBudgetCallbacks;
+        snap.eventsSubmitted = as.eventsSubmitted;
+        snap.eventsAccepted = as.eventsAccepted;
+        snap.eventsDropped = as.eventsDropped;
+        snap.eventsDispatched = as.eventsDispatched;
+
+        // Re-verify the settle marker: a writer that started mid-copy
+        // (sequence flipped back to 1) means this frame may be torn —
+        // reuse the last stable publish instead (same skip-if-busy
+        // pattern as the client side).
+        RLV2_MemBarrier();
+        if (as.sequence != svms::RLV2_SnapshotSettledSequence) return s_lastBuilt;
+        s_lastBuilt = snap;
+    } else {
+        return s_lastBuilt;
+    }
+
+    snap.maxVoices = voiceManager ? voiceManager->GetMaxVoices() : 0u;
+    snap.sampleRate = sampleRate;
+    snap.bufferFrames = bufferFrames;
+
+    // Live-state echo: what the control thread last published to the
+    // mailbox (i.e. what the audio thread is applying).
+    snap.live = appliedLive_;
+
+    if (loadedSoundFontPath_[0] != L'\0') {
+        std::string narrow = wideToUtf8(loadedSoundFontPath_);
+        strncpy_s(snap.soundFontName, sizeof(snap.soundFontName),
+                  narrow.c_str(), _TRUNCATE);
+    }
+
+    return snap;
+}
+#endif // !defined(SVMS_XP_COMPAT)
 
 // Resolve a channel's active preset using the same bank/program rules as TSF:
 // normal channels use their selected bank and program; MIDI channel 10 first
@@ -2434,9 +2599,13 @@ bool Driver::Initialize() {
     configSnapshot->correctnessMode = cfg.correctnessMode;
 
     // Initialize both mailbox buffers with the same starting state.
-    liveMailboxA_.InitFromEngineConfig(cfg, sampleRate);
-    liveMailboxB_ = liveMailboxA_;
-    liveMailboxFront_.store(&liveMailboxA_, std::memory_order_release);
+    liveMailbox_.InitFromEngineConfig(cfg, sampleRate);
+    liveMailboxApplied_ = liveMailbox_;
+    liveMailboxSeq_.store(2u, std::memory_order_release);
+    appliedMasterVolume_ = cfg.masterVolume;
+#if !defined(SVMS_XP_COMPAT)
+    appliedLive_ = LiveStateFromMailbox(liveMailbox_, sampleRate);
+#endif
 
     // Velocity curve/floor are restart-only configuration.  Preserve the
     // exact historical quantization into g_velGainLUT, but pay powf once at
@@ -2469,21 +2638,30 @@ bool Driver::Initialize() {
     initialized = true;
     LOG("Initialize SUCCESS");
 
-    // Start RuntimeLink IPC so the V3 Configurator can connect
+    // Start RuntimeLink V2 IPC so the V3 Configurator can connect.
+    // Optional: failure must never break midiOutOpen/KDMAPI/audio.
+#if !defined(SVMS_XP_COMPAT)
     if (g_rlDriver.Initialize()) {
-        g_rlDriver.StartControlThread([this](const svms::RLCommand& cmd) {
-            HandleRuntimeLinkCommand(cmd);
-        });
-        LOG("RuntimeLink initialized, PID=%u", g_rlDriver.GetPID());
+        g_rlDriver.StartControlThread(
+            [this]() { return BuildRuntimeLinkTelemetry(); },
+            [this](const svms::RuntimeLinkCommandV2& cmd, char* resultText) {
+                return HandleRuntimeLinkCommand(cmd, resultText);
+            });
+        LOG("RuntimeLink V2 initialized: PID=%u session=%016llX",
+            g_rlDriver.GetPID(),
+            static_cast<unsigned long long>(g_rlDriver.GetSessionId()));
     } else {
-        LOG("RuntimeLink initialization skipped (non-fatal)");
+        LOG("RuntimeLink V2 initialization skipped (non-fatal)");
     }
+#endif
 
     return true;
 }
 
 void Driver::Shutdown() {
+#if !defined(SVMS_XP_COMPAT)
     g_rlDriver.Shutdown();
+#endif
 
     cancelProducers_.store(true, std::memory_order_release);
     producerWakeEpoch_.fetch_add(1, std::memory_order_release);
@@ -2693,6 +2871,7 @@ bool Driver::LoadSoundFont(const wchar_t* path) {
     sampleStoreCount = sampCount;
 
     LOG("  LoadSoundFont SUCCESS: %u samples cached", sampCount);
+    wcsncpy_s(loadedSoundFontPath_, MAX_PATH, path, _TRUNCATE);
     LeaveCriticalSection(&cs);
     return true;
 }
@@ -2994,13 +3173,25 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
 
     if (!vm || !cc || !render || !snap) return;
 
-    // ── Mailbox sync: acquire front pointer, copy live params ──────
-    // The control thread publishes via release store; we acquire once
-    // per block and copy all live params into the local structs that
-    // the render path reads.  This eliminates every data race between
+    // ── Mailbox sync: seqlock read of the live params ──────────────
+    // The control thread publishes via odd→even sequence; we copy once
+    // per block, retrying on a torn (odd / stale) sequence by falling
+    // back to the last stable copy.  All live params land in the local
+    // structs the render path reads, eliminating every data race between
     // the control thread (writer) and this audio thread (reader).
-    const LiveConfigMailbox& mb =
-        *self->liveMailboxFront_.load(std::memory_order_acquire);
+    LiveConfigMailbox mb;
+    const uint32_t seq =
+        self->liveMailboxSeq_.load(std::memory_order_acquire);
+    if ((seq & 1u) == 0u) {
+        mb = self->liveMailbox_;
+        if (self->liveMailboxSeq_.load(std::memory_order_acquire) == seq) {
+            self->liveMailboxApplied_ = mb;
+        } else {
+            mb = self->liveMailboxApplied_;
+        }
+    } else {
+        mb = self->liveMailboxApplied_;
+    }
 
     snap->masterVolume   = mb.masterVolume;
     snap->correctnessMode = mb.correctnessMode;
@@ -3022,6 +3213,12 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     self->reverb.lowCutHz    = mb.reverbLowCutHz;
     self->reverb.highCutHz   = mb.reverbHighCutHz;
 
+    // FDN delays, feedback, taps, filters and LFOs derive from the raw
+    // fields.  UpdateDerived recomputes them WITHOUT clearing the delay
+    // lines, so live parameter changes morph the tail instead of cutting
+    // it dead.  (~50 scalar ops once per block: negligible.)
+    self->reverb.UpdateDerived();
+
     self->limiter.enabled       = mb.limiterEnabled;
     self->limiter.threshold     = mb.limiterThreshold;
     self->limiter.delayFrames   = mb.limiterDelayFrames;
@@ -3036,6 +3233,18 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     const uint64_t profileCycleStart = profileCallback ? __rdtsc() : 0u;
 
     cc->RebuildCache(*snap, static_cast<float>(self->sampleRate));
+
+    // Fold a live master-volume change into ALL playing voices (their
+    // mixGainL/R are only refreshed at note-on otherwise).  Per-channel
+    // refresh over the active list — done only when the value actually
+    // changed, never per block at 500K voices.
+    if (self->appliedMasterVolume_ != snap->masterVolume) {
+        self->appliedMasterVolume_ = snap->masterVolume;
+        for (uint32_t ch = 0u; ch < kChannelCount; ++ch) {
+            vm->RefreshMixGainsForChannel(
+                static_cast<uint8_t>(ch), cc->GetParams()[ch]);
+        }
+    }
 
     if (!self->leftBuffer || !self->rightBuffer) {
         std::memset(output, 0, numFrames * 2 * sizeof(float));
@@ -3497,14 +3706,62 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         }
     }
 
-    // ── RuntimeLink telemetry (rate-limited to ~30 Hz) ──────────────
+    // ── Audio→control snapshot (RuntimeLink V2) ────────────────────
+    // The control thread publishes at ~30 Hz from this process-local
+    // snapshot; the audio thread never touches shared memory.  The
+    // O(activeN) releasing-voice scan is throttled to every 3rd block.
+    // Snapshot stores are ~30 aligned 32-bit writes per block.
+#if !defined(SVMS_XP_COMPAT)
     {
-        static uint32_t rlTick = 0;
-        if (++rlTick >= 3) {
-            rlTick = 0;
-            self->PublishRuntimeLinkTelemetry(vm, s_cpuSmoothed);
+        constexpr uint32_t kStamp = 1u;
+        if (++self->releasingScanTick_ % 3u == 0u) {
+            uint32_t releasing = 0;
+            for (uint32_t i = 0; i < vm->activeCount_; ++i) {
+                const uint32_t v = vm->activeList_[i];
+                releasing += vm->v.state[v] ==
+                    static_cast<uint8_t>(svms::VoiceState::Releasing);
+            }
+            self->lastReleasingVoices_ = releasing;
         }
+        svms::RuntimeAudioSnapshot& as = g_audioSnapshot;
+        as.sequence = 1;
+        RLV2_MemBarrier();
+        as.activeVoices.Store(static_cast<float>(vm->activeCount_), kStamp);
+        as.releasingVoices.Store(static_cast<float>(self->lastReleasingVoices_), kStamp);
+        as.freeTop.Store(static_cast<float>(vm->freeTop_), kStamp);
+        as.voiceSteals.Store(static_cast<float>(vm->stealCount_), kStamp);
+        as.retiredCount.Store(static_cast<float>(vm->retireCount_), kStamp);
+        as.retiredImmediateCount.Store(static_cast<float>(vm->retireImmediateCount_), kStamp);
+        as.decimationStep.Store(static_cast<float>(self->correctnessMode_ ? 1u
+            : svms::ComputeDecimationStep(vm->activeCount_)), kStamp);
+        as.renderPeak.Store(self->sf2Telemetry_.renderPeak, kStamp);
+        as.audioRunning.Store(self->audioOutput && self->audioOutput->IsRunning()
+            ? 1.0f : 0.0f, kStamp);
+        as.soundFontLoaded.Store(self->soundFontData && self->sampleDataStore
+            ? 1.0f : 0.0f, kStamp);
+        as.audioHResult.Store(static_cast<float>(self->audioOutput
+            ? static_cast<int32_t>(self->audioOutput->GetLastError()) : 0), kStamp);
+        as.cpuLoadPercent.Store(s_cpuSmoothed, kStamp);
+        as.callbackP95Percent.Store(self->telemetry_.callbackP95Percent, kStamp);
+        as.callbackP99Percent.Store(self->telemetry_.callbackP99Percent, kStamp);
+        as.callbackP999Percent.Store(self->telemetry_.callbackP999Percent, kStamp);
+        as.maxConsecutiveOverBudget.Store(
+            static_cast<float>(self->telemetry_.maxConsecutiveOverBudget), kStamp);
+        as.overBudgetCallbacks = self->telemetry_.overBudgetCallbacks;
+        as.eventsSubmitted = self->telemetry_.submitted;
+        as.eventsAccepted = self->telemetry_.accepted;
+        as.eventsDropped = self->telemetry_.dropped;
+        as.eventsDispatched = self->telemetry_.dispatched;
+        as.limiterInputPeakL.Store(self->limiter.inputPeakL, kStamp);
+        as.limiterInputPeakR.Store(self->limiter.inputPeakR, kStamp);
+        as.limiterOutputPeakL.Store(self->limiter.outputPeakL, kStamp);
+        as.limiterOutputPeakR.Store(self->limiter.outputPeakR, kStamp);
+        as.limiterGainReductionDb.Store(self->limiter.gainReductionDb, kStamp);
+        as.tickMs = static_cast<uint32_t>(GetTickCount());
+        RLV2_MemBarrier();
+        as.sequence = RLV2_SnapshotSettledSequence;
     }
+#endif
 }
 
 // ── EventDispatcher callback ─────────────────────────────────────────────
