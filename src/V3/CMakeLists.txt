@@ -241,6 +241,50 @@ if(NOT SVMS_XP_COMPAT)
     target_include_directories(svms_v3_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     set_target_properties(svms_v3_render PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/imgui")
+    set(IMGUI_SOURCES
+        ${IMGUI_DIR}/imgui.cpp
+        ${IMGUI_DIR}/imgui_draw.cpp
+        ${IMGUI_DIR}/imgui_tables.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp
+    )
+    set(CONFIGURATOR_SOURCES
+        Configurator/Main.cpp
+        Configurator/ConfiguratorApp.cpp
+        Configurator/ConfigDocument.cpp
+        Configurator/Theme.cpp
+        Configurator/Widgets.cpp
+        Configurator/WasapiDevices.cpp
+        Configurator/EasterEggs.cpp
+        Configurator/PageOverview.cpp
+        Configurator/PageAudio.cpp
+        Configurator/PagePerformance.cpp
+        Configurator/PageMidi.cpp
+        Configurator/PageReverb.cpp
+        Configurator/PageLimiter.cpp
+        Configurator/PageDiagnostics.cpp
+        Configurator/PageAdvanced.cpp
+        Configurator/PageAbout.cpp
+    )
+    add_executable(svms_v3_configurator WIN32
+        ${IMGUI_SOURCES}
+        ${CONFIGURATOR_SOURCES}
+    )
+    target_include_directories(svms_v3_configurator PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${IMGUI_DIR}"
+        "${IMGUI_DIR}/backends"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party"
+    )
+    target_compile_definitions(svms_v3_configurator PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(svms_v3_configurator PRIVATE
+        d3d11 dxgi user32 gdi32 shell32 ole32 uuid comdlg32)
+    set_target_properties(svms_v3_configurator PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
 # Ziggy's direct-synth loader probes SnappySynth.dll and then discovers the
@@ -263,6 +307,15 @@ if(SVMS_BUILD_TESTS)
     add_dependencies(svms_v3_telemetry_abi_smoke svmsynth)
     add_test(NAME svms_v3_telemetry_abi_smoke
              COMMAND svms_v3_telemetry_abi_smoke "$<TARGET_FILE:svmsynth>")
+
+    add_executable(svms_v3_runtime_link_abi_smoke
+        tests/SVMSRuntimeLinkABISmoke.cpp)
+    target_compile_definitions(svms_v3_runtime_link_abi_smoke PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_include_directories(svms_v3_runtime_link_abi_smoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME svms_v3_runtime_link_abi_smoke
+             COMMAND svms_v3_runtime_link_abi_smoke)
 
     add_executable(svms_v3_tests
         tests/SVMSV3Tests.cpp

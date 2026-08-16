@@ -2,6 +2,9 @@
 #define SVMS_CONFIG_H
 
 #include "SVMSTypes.h"
+#include <atomic>
+#include <cmath>
+#include <cstring>
 #include <string>
 
 namespace svms {
@@ -97,6 +100,76 @@ struct RuntimeConfigSnapshot {
     FilterType filterType;
     PanLaw panLaw;
     bool correctnessMode;
+};
+
+// ── Atomic process-local live-config mailbox ───────────────────────────
+// POD struct of all live-tweakable parameters.  Published via a double-
+// buffer + atomic pointer pattern so the audio thread reads a consistent
+// snapshot without locks or spinlocks.
+//
+// Writer (control thread):  write to back buffer, then atomic_store the
+//   front pointer with release semantics.
+// Reader (audio thread):    atomic_load the front pointer with acquire
+//   semantics once per render block.
+struct LiveConfigMailbox {
+    // Master
+    float masterVolume    = 1.0f;
+    bool correctnessMode  = false;
+
+    // Reverb
+    bool  reverbEnabled   = false;
+    float reverbMix       = 0.25f;
+    float reverbRoomSize  = 0.60f;
+    float reverbDecay     = 0.50f;
+    float reverbDamping   = 0.35f;
+    float reverbWidth     = 1.0f;
+    float reverbDiffusion = 0.70f;
+    float reverbPreDelayMs    = 12.0f;
+    float reverbEarlyLevel    = 0.35f;
+    float reverbLateLevel     = 0.85f;
+    float reverbModDepth      = 0.30f;
+    float reverbModRate       = 0.35f;
+    float reverbLowCutHz      = 70.0f;
+    float reverbHighCutHz     = 16000.0f;
+
+    // Limiter
+    bool     limiterEnabled      = true;
+    float    limiterThreshold    = 0.95f;
+    float    limiterAttackCoeff  = 0.25f;
+    float    limiterReleaseCoeff = 0.001f;
+    uint32_t limiterDelayFrames  = 128;
+
+    void InitFromEngineConfig(const EngineConfig& cfg, uint32_t sampleRate) {
+        masterVolume   = cfg.masterVolume;
+        correctnessMode = cfg.correctnessMode;
+
+        reverbEnabled   = cfg.enableReverb;
+        reverbMix       = cfg.reverbMix;
+        reverbRoomSize  = cfg.reverbRoomSize;
+        reverbDecay     = cfg.reverbDecay;
+        reverbDamping   = cfg.reverbDamping;
+        reverbWidth     = cfg.reverbWidth;
+        reverbDiffusion = cfg.reverbDiffusion;
+        reverbPreDelayMs    = cfg.reverbPreDelayMs;
+        reverbEarlyLevel    = cfg.reverbEarlyLevel;
+        reverbLateLevel     = cfg.reverbLateLevel;
+        reverbModDepth      = cfg.reverbModDepth;
+        reverbModRate       = cfg.reverbModRate;
+        reverbLowCutHz      = cfg.reverbLowCutHz;
+        reverbHighCutHz     = cfg.reverbHighCutHz;
+
+        limiterEnabled      = cfg.limiterEnabled;
+        limiterThreshold    = cfg.limiterThreshold;
+        limiterDelayFrames  = (std::min)(128u,
+            (std::max)(1u, static_cast<uint32_t>(
+                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f)));
+        float attackSamples = (std::max)(1.0f,
+            cfg.limiterAttackMs * sampleRate * 0.001f);
+        float releaseSamples = (std::max)(1.0f,
+            cfg.limiterReleaseMs * sampleRate * 0.001f);
+        limiterAttackCoeff  = 1.0f - std::exp(-1.0f / attackSamples);
+        limiterReleaseCoeff = 1.0f - std::exp(-1.0f / releaseSamples);
+    }
 };
 
 } // namespace svms

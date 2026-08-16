@@ -1,0 +1,609 @@
+#include "Widgets.h"
+#include "imgui.h"
+#include "imgui_internal.h"
+#include "../SVMSRuntimeLink.h"
+#include "../SVMSRuntimeLinkProtocol.h"
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+namespace svms::cfg {
+
+static LiveLinkContext g_liveLink = {};
+
+void SetLiveLinkContext(const LiveLinkContext& ctx) { g_liveLink = ctx; }
+const LiveLinkContext& GetLiveLinkContext() { return g_liveLink; }
+
+void PushLiveFloat(svms::RLCommandType type, float value) {
+    if (g_liveLink.connected && g_liveLink.client)
+        g_liveLink.client->PushFloatCommand(type, value);
+}
+
+void PushLiveBool(svms::RLCommandType type, bool value) {
+    if (g_liveLink.connected && g_liveLink.client)
+        g_liveLink.client->PushBoolCommand(type, value);
+}
+
+static float g_toastTimer = 0.0f;
+static char g_toastText[512] = {};
+static bool g_toastActive = false;
+
+void SectionHeader(const char* label) {
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+    ImGui::PushFont(nullptr);
+    ImGui::TextUnformatted(label);
+    ImGui::PopFont();
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+    ImGui::Spacing();
+}
+
+void HelpMarker(const char* desc) {
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+        ImGui::TextUnformatted(desc);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+bool ToggleSwitch(const char* label, bool* value, const char* tooltip) {
+    ImGui::PushID(label);
+    bool changed = false;
+
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    float w = 44.0f;
+    float h = 22.0f;
+    float radius = h * 0.5f;
+
+    ImGui::InvisibleButton("toggle", ImVec2(w, h));
+    if (ImGui::IsItemClicked()) {
+        *value = !*value;
+        changed = true;
+    }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 bgCol = *value
+        ? ImGui::GetColorU32(ImVec4(0.447f, 0.533f, 0.855f, 1.0f))
+        : ImGui::GetColorU32(ImVec4(0.20f, 0.22f, 0.25f, 1.0f));
+    float t = *value ? 1.0f : 0.0f;
+    float cx = pos.x + radius + t * (w - radius * 2.0f);
+    float cy = pos.y + radius;
+
+    dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h), bgCol, h * 0.5f);
+    dl->AddCircleFilled(ImVec2(cx, cy), radius - 2.0f,
+                        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.95f)));
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4.0f);
+    ImGui::TextUnformatted(label);
+
+    if (tooltip && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+bool LabeledFloat(const char* label, float* value, float min, float max,
+                  const char* format, const char* tooltip) {
+    bool changed = false;
+    ImGui::PushID(label);
+
+    float labelWidth = ImGui::CalcTextSize(label).x + 8.0f;
+    float avail = ImGui::GetContentRegionAvail().x;
+    float inputWidth = ImMin(avail - labelWidth - 8.0f, 160.0f);
+
+    ImGui::PushItemWidth(inputWidth);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - labelWidth - inputWidth);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() - avail + labelWidth + inputWidth);
+
+    if (ImGui::InputFloat("##val", value, 0.0f, 0.0f, format)) {
+        if (*value < min) *value = min;
+        if (*value > max) *value = max;
+        changed = true;
+    }
+    ImGui::PopItemWidth();
+
+    if (tooltip && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+bool LabeledInt(const char* label, int* value, int min, int max,
+                const char* tooltip) {
+    bool changed = false;
+    ImGui::PushID(label);
+
+    float labelWidth = ImGui::CalcTextSize(label).x + 8.0f;
+    float avail = ImGui::GetContentRegionAvail().x;
+    float inputWidth = ImMin(avail - labelWidth - 8.0f, 160.0f);
+
+    ImGui::PushItemWidth(inputWidth);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - labelWidth - inputWidth);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() - avail + labelWidth + inputWidth);
+
+    if (ImGui::InputInt("##val", value, 0, 0)) {
+        if (*value < min) *value = min;
+        if (*value > max) *value = max;
+        changed = true;
+    }
+    ImGui::PopItemWidth();
+
+    if (tooltip && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+bool LabeledUInt(const char* label, unsigned int* value, unsigned int min,
+                 unsigned int max, const char* tooltip) {
+    int signedVal = static_cast<int>(*value);
+    bool changed = LabeledInt(label, &signedVal, static_cast<int>(min),
+                              static_cast<int>(max), tooltip);
+    if (changed) *value = static_cast<unsigned int>(signedVal);
+    return changed;
+}
+
+bool LabeledCombo(const char* label, int* current, const char* const* items,
+                  int itemCount, const char* tooltip) {
+    bool changed = false;
+    ImGui::PushID(label);
+
+    float labelWidth = ImGui::CalcTextSize(label).x + 8.0f;
+    float avail = ImGui::GetContentRegionAvail().x;
+    float comboWidth = ImMin(avail - labelWidth - 8.0f, 240.0f);
+
+    ImGui::PushItemWidth(comboWidth);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - labelWidth - comboWidth);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() - avail + labelWidth + comboWidth);
+
+    if (ImGui::Combo("##val", current, items, itemCount)) {
+        changed = true;
+    }
+    ImGui::PopItemWidth();
+
+    if (tooltip && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+bool SliderFloat(const char* label, float* value, float min, float max,
+                 const char* format, const char* tooltip) {
+    bool changed = false;
+    ImGui::PushID(label);
+
+    float labelWidth = ImGui::CalcTextSize(label).x + 8.0f;
+    float avail = ImGui::GetContentRegionAvail().x;
+    float sliderWidth = ImMin(avail - labelWidth - 8.0f, 300.0f);
+
+    ImGui::PushItemWidth(sliderWidth);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - labelWidth - sliderWidth);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() - avail + labelWidth + sliderWidth);
+
+    if (ImGui::SliderFloat("##val", value, min, max, format)) {
+        changed = true;
+    }
+    ImGui::PopItemWidth();
+
+    if (tooltip && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+bool SliderInt(const char* label, int* value, int min, int max,
+               const char* tooltip) {
+    bool changed = false;
+    ImGui::PushID(label);
+
+    float labelWidth = ImGui::CalcTextSize(label).x + 8.0f;
+    float avail = ImGui::GetContentRegionAvail().x;
+    float sliderWidth = ImMin(avail - labelWidth - 8.0f, 300.0f);
+
+    ImGui::PushItemWidth(sliderWidth);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - labelWidth - sliderWidth);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() - avail + labelWidth + sliderWidth);
+
+    if (ImGui::SliderInt("##val", value, min, max)) {
+        changed = true;
+    }
+    ImGui::PopItemWidth();
+
+    if (tooltip && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+void StatusBar(const char* text, bool modified) {
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
+
+    if (modified) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+        ImGui::Text("Configuration modified");
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+        ImGui::TextUnformatted(text);
+        ImGui::PopStyleColor();
+    }
+}
+
+void ToastNotification(const char* message, float durationSeconds) {
+    snprintf(g_toastText, sizeof(g_toastText), "%s", message);
+    g_toastTimer = durationSeconds;
+    g_toastActive = true;
+}
+
+void PushToastStyle() {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 10));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.14f, 0.18f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.447f, 0.533f, 0.855f, 0.5f));
+}
+
+void PopToastStyle() {
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
+bool BeginToast(const char* id) {
+    if (!g_toastActive) return false;
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 pos(io.DisplaySize.x - 20.0f, io.DisplaySize.y - 20.0f);
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.95f);
+
+    PushToastStyle();
+    bool visible = ImGui::Begin(id, nullptr,
+                                ImGuiWindowFlags_NoDecoration |
+                                ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_NoSavedSettings |
+                                ImGuiWindowFlags_NoNav |
+                                ImGuiWindowFlags_NoFocusOnAppearing);
+    return visible;
+}
+
+void EndToast() {
+    ImGui::End();
+    PopToastStyle();
+}
+
+bool BeginToastOverlay() {
+    if (!g_toastActive) return false;
+
+    ImGuiIO& io = ImGui::GetIO();
+    float dt = io.DeltaTime;
+    g_toastTimer -= dt;
+    if (g_toastTimer <= 0.0f) {
+        g_toastActive = false;
+        return false;
+    }
+
+    ImVec2 pos(io.DisplaySize.x - 20.0f, io.DisplaySize.y - 20.0f);
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.95f);
+
+    PushToastStyle();
+    bool visible = ImGui::Begin("##toast", nullptr,
+                                ImGuiWindowFlags_NoDecoration |
+                                ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_NoSavedSettings |
+                                ImGuiWindowFlags_NoNav |
+                                ImGuiWindowFlags_NoFocusOnAppearing);
+    return visible;
+}
+
+void EndToastOverlay() {
+    ImGui::End();
+    PopToastStyle();
+}
+
+bool RotaryKnob(KnobState& state, const char* format) {
+    ImGui::PushID(state.label);
+
+    bool changed = false;
+    float size = state.size > 0 ? state.size : 58.0f;
+    float radius = size * 0.42f;
+    float innerRadius = radius - 4.0f;
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImVec2 cursor = ImGui::GetCursorScreenPos();
+    ImVec2 center(cursor.x + size * 0.5f, cursor.y + radius + 8.0f);
+    ImVec2 totalSize(size, size + 24.0f);
+
+    ImGui::InvisibleButton("knob", totalSize);
+
+    bool hovered = ImGui::IsItemHovered();
+    bool active = ImGui::IsItemActive();
+
+    float t = (state.value - state.minValue) / (state.maxValue - state.minValue);
+    t = ImClamp(t, 0.0f, 1.0f);
+
+    float startAngle = 0.75f * 3.14159265f;
+    float endAngle = 2.25f * 3.14159265f;
+    float angle = startAngle + t * (endAngle - startAngle);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    ImU32 borderCol = ImGui::GetColorU32(
+        hovered ? ImVec4(0.30f, 0.35f, 0.42f, 1.0f)
+                : ImVec4(0.20f, 0.22f, 0.25f, 1.0f));
+    ImU32 arcCol = ImGui::GetColorU32(ImVec4(0.447f, 0.533f, 0.855f, 0.85f));
+    ImU32 knobFace = ImGui::GetColorU32(
+        active ? ImVec4(0.16f, 0.18f, 0.22f, 1.0f)
+               : ImVec4(0.13f, 0.145f, 0.176f, 1.0f));
+
+    dl->AddCircleFilled(center, radius, knobFace, 32);
+    dl->AddCircle(center, radius, borderCol, 32, 1.5f);
+
+    int arcSegments = 24;
+    float arcFrac = t;
+    if (arcFrac > 0.01f) {
+        for (int i = 0; i < arcSegments; ++i) {
+            float a0 = startAngle + (static_cast<float>(i) / arcSegments) * arcFrac * (endAngle - startAngle);
+            float a1 = startAngle + (static_cast<float>(i + 1) / arcSegments) * arcFrac * (endAngle - startAngle);
+            if (a1 > endAngle) a1 = endAngle;
+            ImVec2 p0(center.x + std::cos(a0) * (radius - 3.0f),
+                      center.y + std::sin(a0) * (radius - 3.0f));
+            ImVec2 p1(center.x + std::cos(a1) * (radius - 3.0f),
+                      center.y + std::sin(a1) * (radius - 3.0f));
+            dl->AddLine(p0, p1, arcCol, 3.0f);
+        }
+    }
+
+    ImVec2 pointer(center.x + std::cos(angle) * innerRadius,
+                   center.y + std::sin(angle) * innerRadius);
+    dl->AddLine(center, pointer, ImGui::GetColorU32(ImVec4(0.85f, 0.88f, 0.92f, 0.9f)),
+                2.0f);
+
+    char valueBuf[64];
+    float displayVal = state.displayFn ? state.displayFn(state.value)
+                                       : state.value * state.displayScale;
+    snprintf(valueBuf, sizeof(valueBuf), format, displayVal);
+    ImVec2 textSize = ImGui::CalcTextSize(valueBuf);
+    dl->AddText(ImVec2(center.x - textSize.x * 0.5f, center.y + radius + 4.0f),
+                ImGui::GetColorU32(ImVec4(0.90f, 0.91f, 0.92f, 1.0f)), valueBuf);
+
+    char labelBuf[128];
+    snprintf(labelBuf, sizeof(labelBuf), "%s", state.label);
+    ImVec2 labelText = ImGui::CalcTextSize(labelBuf);
+    dl->AddText(ImVec2(center.x - labelText.x * 0.5f, center.y + radius + 22.0f),
+                ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)), labelBuf);
+
+    if (active) {
+        float delta = ImGui::GetIO().MouseDelta.y;
+        float range = state.maxValue - state.minValue;
+        float step = range * 0.002f;
+        if (ImGui::GetIO().KeyShift) step *= 0.1f;
+        float newVal = state.value - delta * step;
+        newVal = ImClamp(newVal, state.minValue, state.maxValue);
+        if (newVal != state.value) {
+            state.value = newVal;
+            changed = true;
+        }
+    } else if (hovered) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            float range = state.maxValue - state.minValue;
+            float step = range * 0.02f;
+            if (ImGui::GetIO().KeyShift) step *= 0.1f;
+            float newVal = state.value + wheel * step;
+            newVal = ImClamp(newVal, state.minValue, state.maxValue);
+            if (newVal != state.value) {
+                state.value = newVal;
+                changed = true;
+            }
+        }
+    }
+
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Middle) ||
+        (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))) {
+        state.value = state.defaultValue;
+        changed = true;
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+void DrawVerticalMeter(const char* /*id*/, float value, float peak,
+                       const ImVec2& size, bool showScale) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+
+    ImU32 bgCol = ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.11f, 1.0f));
+    dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bgCol, 2.0f);
+
+    float h = size.y * ImClamp(value, 0.0f, 1.0f);
+
+    ImVec2 barBottom(pos.x + 1, pos.y + size.y);
+    ImVec2 barTop(pos.x + 1, pos.y + size.y - h);
+
+    if (h > 0) {
+        float frac = h / size.y;
+        ImU32 barCol;
+        if (frac < 0.6f)
+            barCol = ImGui::GetColorU32(ImVec4(0.30f, 0.75f, 0.40f, 0.9f));
+        else if (frac < 0.8f)
+            barCol = ImGui::GetColorU32(ImVec4(0.90f, 0.75f, 0.20f, 0.9f));
+        else
+            barCol = ImGui::GetColorU32(ImVec4(0.85f, 0.30f, 0.30f, 0.9f));
+        dl->AddRectFilled(barBottom, barTop, barCol, 1.0f);
+    }
+
+    if (peak > 0.01f) {
+        float peakY = pos.y + size.y - size.y * ImClamp(peak, 0.0f, 1.0f);
+        ImU32 peakCol = ImGui::GetColorU32(ImVec4(0.95f, 0.95f, 0.95f, 0.8f));
+        dl->AddLine(ImVec2(pos.x, peakY), ImVec2(pos.x + size.x, peakY), peakCol, 1.0f);
+    }
+
+    if (showScale) {
+        auto drawTick = [&](float db, const char* text) {
+            float frac = (db + 48.0f) / 48.0f;
+            float y = pos.y + size.y - size.y * frac;
+            dl->AddText(ImVec2(pos.x + size.x + 3.0f, y - 5.0f),
+                        ImGui::GetColorU32(ImVec4(0.45f, 0.48f, 0.52f, 0.8f)), text);
+        };
+        drawTick(0.0f, "0");
+        drawTick(-3.0f, "-3");
+        drawTick(-6.0f, "-6");
+        drawTick(-12.0f, "-12");
+        drawTick(-24.0f, "-24");
+        drawTick(-48.0f, "-48");
+    }
+
+    ImGui::Dummy(ImVec2(size.x + (showScale ? 30.0f : 0.0f), size.y));
+}
+
+void DrawGainReductionMeter(const char* /*id*/, float gr,
+                            const ImVec2& size) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+
+    ImU32 bgCol = ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.11f, 1.0f));
+    dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bgCol, 2.0f);
+
+    float grAbs = fabsf(gr);
+    float h = size.y * ImClamp(grAbs / 24.0f, 0.0f, 1.0f);
+
+    if (h > 0) {
+        ImVec2 barTop(pos.x + 1, pos.y + 1);
+        ImVec2 barBottom(pos.x + 1, pos.y + 1 + h);
+        ImU32 barCol = ImGui::GetColorU32(ImVec4(0.90f, 0.70f, 0.20f, 0.9f));
+        dl->AddRectFilled(barTop, barBottom, barCol, 1.0f);
+    }
+
+    auto drawTick = [&](float db, const char* text) {
+        float frac = db / 24.0f;
+        float y = pos.y + size.y * frac;
+        dl->AddText(ImVec2(pos.x + size.x + 3.0f, y - 5.0f),
+                    ImGui::GetColorU32(ImVec4(0.45f, 0.48f, 0.52f, 0.8f)), text);
+    };
+    drawTick(0.0f, "0");
+    drawTick(-3.0f, "-3");
+    drawTick(-6.0f, "-6");
+    drawTick(-12.0f, "-12");
+    drawTick(-24.0f, "-24");
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.1f dB", gr);
+    dl->AddText(ImVec2(pos.x + 2.0f, pos.y + size.y + 2.0f),
+                ImGui::GetColorU32(ImVec4(0.70f, 0.72f, 0.75f, 1.0f)), buf);
+
+    ImGui::Dummy(ImVec2(size.x + 30.0f, size.y + 16.0f));
+}
+
+void DrawReverbVisualizer(ImDrawList* dl, ImVec2 center, float radius,
+                           float roomSize, float decay, float diffusion,
+                           float width, float modDepth, float time) {
+    int ringCount = 6 + static_cast<int>(roomSize * 10.0f);
+    if (ringCount > 18) ringCount = 18;
+
+    for (int i = 0; i < ringCount; ++i) {
+        float t = static_cast<float>(i) / ringCount;
+        float r = radius * (0.15f + t * 0.85f) * roomSize;
+        float alpha = (1.0f - t * 0.7f) * decay;
+        float wobble = std::sin(time * 1.5f + i * 0.7f) * modDepth * 4.0f * t;
+
+        ImU32 col = ImGui::GetColorU32(ImVec4(
+            0.447f, 0.533f, 0.855f, alpha * 0.35f));
+
+        int segments = 32;
+        for (int j = 0; j < segments; ++j) {
+            float a0 = (static_cast<float>(j) / segments) * 6.28318f;
+            float a1 = (static_cast<float>(j + 1) / segments) * 6.28318f;
+
+            float spread = 1.0f + std::sin(a0 * 2.0f) * (1.0f - diffusion) * 0.3f;
+            float spread2 = 1.0f + std::sin(a1 * 2.0f) * (1.0f - diffusion) * 0.3f;
+
+            float xw = width;
+            ImVec2 p0(center.x + std::cos(a0) * r * spread * xw + wobble,
+                      center.y + std::sin(a0) * r * spread + wobble * 0.5f);
+            ImVec2 p1(center.x + std::cos(a1) * r * spread2 * xw + wobble * 0.8f,
+                      center.y + std::sin(a1) * r * spread2 + wobble * 0.3f);
+            dl->AddLine(p0, p1, col, 1.0f);
+        }
+    }
+
+    int cloudPoints = static_cast<int>(diffusion * 60.0f) + 10;
+    for (int i = 0; i < cloudPoints; ++i) {
+        float angle = static_cast<float>(i) / cloudPoints * 6.28318f;
+        float dist = radius * (0.1f + fmodf(static_cast<float>(i * 7 + 3),
+                                             17.0f) / 17.0f * 0.6f * roomSize);
+        float modOffset = std::sin(time * 0.8f + angle * 3.0f) * modDepth * dist * 0.15f;
+        ImVec2 pt(center.x + std::cos(angle) * (dist + modOffset) * width,
+                  center.y + std::sin(angle) * (dist + modOffset));
+        ImU32 dotCol = ImGui::GetColorU32(ImVec4(0.447f, 0.533f, 0.855f,
+                                                  0.15f + decay * 0.15f));
+        dl->AddCircleFilled(pt, 1.5f, dotCol, 6);
+    }
+}
+
+void LiveBadge(const char* tooltip) {
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.80f, 0.45f, 1.0f));
+    ImGui::TextDisabled("LIVE");
+    ImGui::PopStyleColor();
+    if (tooltip && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+}
+
+void RestartRequiredBadge() {
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+    ImGui::TextDisabled("RESTART");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Requires driver restart to take effect.");
+        ImGui::EndTooltip();
+    }
+}
+
+} // namespace svms::cfg
