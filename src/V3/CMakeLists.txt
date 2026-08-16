@@ -390,6 +390,39 @@ if(SVMS_BUILD_TESTS)
         target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
 
+        add_executable(svms_v3_runtime_link_smoke
+            tests/SVMSRuntimeLinkSmoke.cpp)
+        target_compile_definitions(svms_v3_runtime_link_smoke PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+        target_include_directories(svms_v3_runtime_link_smoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_dependencies(svms_v3_runtime_link_smoke svmsynth)
+        add_test(NAME svms_v3_runtime_link_smoke
+                 COMMAND svms_v3_runtime_link_smoke "$<TARGET_FILE:svmsynth>")
+        set_tests_properties(svms_v3_runtime_link_smoke PROPERTIES
+            SKIP_RETURN_CODE 77)
+
+        add_executable(svms_v3_runtime_link_probe
+            tests/SVMSRuntimeLinkProbe.cpp)
+        target_compile_definitions(svms_v3_runtime_link_probe PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+        target_include_directories(svms_v3_runtime_link_probe PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+
+        add_executable(svms_v3_two_process_smoke
+            tests/SVMSTwoProcessSmoke.cpp)
+        target_compile_definitions(svms_v3_two_process_smoke PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+        target_include_directories(svms_v3_two_process_smoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_dependencies(svms_v3_two_process_smoke svmsynth)
+        add_test(NAME svms_v3_two_process_smoke
+                 COMMAND svms_v3_two_process_smoke
+                         "$<TARGET_FILE:svms_v3_runtime_link_probe>"
+                         "$<TARGET_FILE:svmsynth>")
+        set_tests_properties(svms_v3_two_process_smoke PROPERTIES
+            SKIP_RETURN_CODE 77)
+
         add_executable(svms_v3_bench tests/SVMSV3Bench.cpp SVMSSoundFont.cpp SVMSRenderKernels.cpp SVMSRenderWorkers.cpp
             SVMSRenderDispatch.cpp SVMSRenderKernelsSSE2.cpp SVMSRenderKernelsAVX2.cpp)
         target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
