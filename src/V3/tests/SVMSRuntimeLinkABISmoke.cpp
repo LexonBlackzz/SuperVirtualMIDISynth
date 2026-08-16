@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <cstddef>
 
 namespace {
 
@@ -16,7 +17,7 @@ int g_failures = 0;
 } while(0)
 
 #define CHECK_EQ(a, b, msg) do { \
-    if ((a) != (b)) { \
+    if (static_cast<size_t>(a) != static_cast<size_t>(b)) { \
         std::printf("FAIL: %s — got %zu, expected %zu (line %d)\n", \
                     msg, static_cast<size_t>(a), static_cast<size_t>(b), \
                     __LINE__); \
@@ -25,220 +26,175 @@ int g_failures = 0;
 } while(0)
 
 void TestConstants() {
-    CHECK(svms::kRuntimeLinkMagic == 0x53524C56u, "magic must be 'SRLV'");
-    CHECK(svms::kRuntimeLinkVersion == 1, "version must be 1");
-    CHECK(svms::kRuntimeLinkCmdRingCapacity == 256, "cmd ring capacity must be 256");
+    CHECK(svms::kRuntimeLinkMagic == 0x53524C32u, "magic must be 'SRL2'");
+    CHECK_EQ(svms::kRuntimeLinkVersion, 2u, "version must be 2");
+    CHECK_EQ(svms::kRuntimeLinkArchX86, 0u, "arch X86 must be 0");
+    CHECK_EQ(svms::kRuntimeLinkArchX64, 1u, "arch X64 must be 1");
+    CHECK_EQ(svms::kRuntimeHostMaxCount, 16u, "hosts max count must be 16");
+    CHECK_EQ(svms::kRuntimeHostTimeoutMs, 5000u, "host timeout must be 5000 ms");
+    CHECK_EQ(svms::kRuntimeLinkMutexTimeoutMs, 1000u, "mutex timeout must be 1000 ms");
+    CHECK_EQ(svms::kRuntimeLinkResultTextCapacity, 256u,
+             "result text capacity must be 256");
+    CHECK_EQ(svms::kRuntimeLinkDefaultCommandTimeoutMs, 400u,
+             "command timeout must be 400 ms");
+    CHECK_EQ(svms::kRuntimeLinkPublishIntervalMs, 33u,
+             "publish interval must be 33 ms");
+    CHECK_EQ(svms::RLV2_PadTo64(1), 64u, "PadTo64(1) must be 64");
+    CHECK_EQ(svms::RLV2_PadTo64(64), 64u, "PadTo64(64) must be 64");
+    CHECK_EQ(svms::RLV2_PadTo64(65), 128u, "PadTo64(65) must be 128");
+    CHECK_EQ(svms::RLV2_SnapshotSettledSequence, 2u,
+             "snapshot settled sequence must be 2");
 }
 
-void TestRLCommandLayout() {
-    CHECK_EQ(sizeof(svms::RLCommand), 16u, "RLCommand must be 16 bytes");
-    CHECK_EQ(alignof(svms::RLCommand), 16u, "RLCommand must be 16-byte aligned");
+void TestPODLayout() {
+    // Each mapped struct must be trivially copyable & the right size.
+    CHECK(svms::RLV2_FloatBits(1.0f) != 0, "FloatBits store must not be 0");
 
-    svms::RLCommand cmd{};
-    CHECK(cmd.type == svms::RLCommandType::Invalid, "default type must be Invalid");
-    CHECK(cmd.param0 == 0, "default param0 must be 0");
-    CHECK(cmd.param1 == 0, "default param1 must be 0");
-    CHECK(cmd.value0 == 0.0f, "default value0 must be 0.0f");
+    // Hand-computed sizes must hold (guards against padding drift).
+    CHECK_EQ(sizeof(svms::AtomicFloatBits), 4u, "AtomicFloatBits must be 4 bytes");
+    CHECK_EQ(sizeof(svms::RuntimeLiveStateV2), 92u,
+             "RuntimeLiveStateV2 must be 92 bytes (12 + 18*4 + 8)");
+    CHECK_EQ(sizeof(svms::RuntimeLinkHeaderV2), 64u,
+             "RuntimeLinkHeaderV2 must be exactly one cache line");
+    CHECK_EQ(sizeof(svms::RuntimeHostSlotV2), 64u,
+             "RuntimeHostSlotV2 must be exactly one cache line");
+    CHECK_EQ(sizeof(svms::RuntimeHostsRegistryV2), 64u + 64u * svms::kRuntimeHostMaxCount,
+             "RuntimeHostsRegistryV2 must be 64 + 16 slots * 64");
+    CHECK_EQ(sizeof(svms::RuntimeLinkSharedMemoryV2), 1088u,
+             "mapping must be 1088 bytes");
+    CHECK_EQ(sizeof(svms::RuntimeAudioSnapshot) % 64, 0u,
+             "RuntimeAudioSnapshot must be a cache-line multiple");
 
-    // Verify specific sizes of enum
-    CHECK_EQ(sizeof(svms::RLCommandType), 4u, "RLCommandType must be uint32_t sized");
+    CHECK_EQ(alignof(svms::RuntimeLinkHeaderV2) >= 64 ? size_t(1) : size_t(0), 1u,
+             "RuntimeLinkHeaderV2 must be 64-aligned");
+    CHECK_EQ(alignof(svms::RuntimeLinkTelemetryV2) >= 64 ? size_t(1) : size_t(0), 1u,
+             "RuntimeLinkTelemetryV2 must be 64-aligned");
+    CHECK_EQ(alignof(svms::RuntimeLinkCommandV2) >= 64 ? size_t(1) : size_t(0), 1u,
+             "RuntimeLinkCommandV2 must be 64-aligned");
 }
 
-void TestRLTelemetryLayout() {
-    CHECK(sizeof(svms::RLTelemetry) % 64 == 0,
-          "RLTelemetry must be cache-line aligned");
-    CHECK(alignof(svms::RLTelemetry) >= 64,
-          "RLTelemetry alignof must be >= 64");
-
-    svms::RLTelemetry t{};
-    CHECK(t.activeVoices == 0, "default activeVoices must be 0");
-    CHECK(t.sampleRate == 44100, "default sampleRate must be 44100");
-    CHECK(t.bufferFrames == 2048, "default bufferFrames must be 2048");
-    CHECK(t.masterVolume == 1.0f, "default masterVolume must be 1.0f");
-    CHECK(t.audioRunning == 0, "default audioRunning must be 0");
-    CHECK(t.soundFontLoaded == 0, "default soundFontLoaded must be 0");
-    CHECK(t.limiterEnabled == 1, "default limiterEnabled must be 1");
-    CHECK(t.limiterThreshold == 0.95f, "default limiterThreshold must be 0.95f");
-    CHECK(t.correctnessMode == 1, "default correctnessMode must be 1");
-    CHECK(t.decimationStep == 1, "default decimationStep must be 1");
-
-    // Verify reverb defaults match ConfigDocument::Defaults()
-    CHECK(t.reverbMix == 0.25f, "default reverbMix must be 0.25f");
-    CHECK(t.reverbRoomSize == 0.60f, "default reverbRoomSize must be 0.60f");
-    CHECK(t.reverbDecay == 0.50f, "default reverbDecay must be 0.50f");
-    CHECK(t.reverbDamping == 0.35f, "default reverbDamping must be 0.35f");
+void TestLiveDefaults() {
+    svms::RuntimeLiveStateV2 l{};
+    CHECK_EQ(l.correctnessMode, 0u, "default correctnessMode must be 0");
+    CHECK_EQ(l.reverbEnabled, 0u, "default reverbEnabled must be 0");
+    CHECK_EQ(l.limiterEnabled, 1u, "default limiterEnabled must be 1");
+    CHECK(l.masterVolume == 1.0f, "default masterVolume must be 1.0f");
+    CHECK(l.reverbMix == 0.25f, "default reverbMix must be 0.25f");
+    CHECK(l.reverbRoomSize == 0.60f, "default reverbRoomSize must be 0.60f");
+    CHECK(l.reverbDecay == 0.50f, "default reverbDecay must be 0.50f");
+    CHECK(l.reverbDamping == 0.35f, "default reverbDamping must be 0.35f");
+    CHECK(l.reverbWidth == 1.0f, "default reverbWidth must be 1.0f");
+    CHECK(l.reverbDiffusion == 0.70f, "default reverbDiffusion must be 0.70f");
+    CHECK(l.reverbPreDelayMs == 12.0f, "default reverbPreDelayMs must be 12.0f");
+    CHECK(l.reverbEarlyLevel == 0.35f, "default reverbEarlyLevel must be 0.35f");
+    CHECK(l.reverbLateLevel == 0.85f, "default reverbLateLevel must be 0.85f");
+    CHECK(l.reverbModDepth == 0.30f, "default reverbModDepth must be 0.30f");
+    CHECK(l.reverbModRate == 0.35f, "default reverbModRate must be 0.35f");
+    CHECK(l.reverbLowCutHz == 70.0f, "default reverbLowCutHz must be 70.0f");
+    CHECK(l.reverbHighCutHz == 16000.0f, "default reverbHighCutHz must be 16000.0f");
+    CHECK(l.limiterThreshold == 0.95f, "default limiterThreshold must be 0.95f");
+    CHECK(l.limiterLookaheadMs == 3.0f, "default limiterLookaheadMs must be 3.0f");
+    CHECK(l.limiterAttackMs == 0.5f, "default limiterAttackMs must be 0.5f");
+    CHECK(l.limiterReleaseMs == 100.0f, "default limiterReleaseMs must be 100.0f");
 }
 
-void TestRuntimeLinkHeaderLayout() {
-    CHECK_EQ(sizeof(svms::RuntimeLinkHeader), 64u,
-             "RuntimeLinkHeader must be exactly 64 bytes (one cache line)");
-    CHECK(alignof(svms::RuntimeLinkHeader) >= 64,
-          "RuntimeLinkHeader must be cache-line aligned");
+void TestTelemetryLayout() {
+    CHECK_EQ(sizeof(svms::RuntimeLinkTelemetryV2) % 64, 0u,
+             "RuntimeLinkTelemetryV2 must be a cache-line multiple");
+    CHECK_EQ(sizeof(svms::RuntimeLinkTelemetryV2), 512u,
+             "RuntimeLinkTelemetryV2 must be 512 bytes");
+    // Field offsets must be deterministic (no padding drift).
+    CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, live), 144u,
+             "telemetry.live must sit at byte 144");
+    CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, soundFontName), 236u,
+             "telemetry.soundFontName must sit at byte 236");
 
-    svms::RuntimeLinkHeader h{};
-    CHECK(h.magic == svms::kRuntimeLinkMagic, "header magic must match");
-    CHECK(h.version == svms::kRuntimeLinkVersion, "header version must match");
-    CHECK(h.cmdCapacity == svms::kRuntimeLinkCmdRingCapacity,
-          "header cmdCapacity must match");
+    svms::RuntimeLinkTelemetryV2 t{};
+    CHECK_EQ(t.activeVoices, 0u, "default activeVoices must be 0");
+    CHECK_EQ(t.sampleRate, 44100u, "default sampleRate must be 44100");
+    CHECK_EQ(t.bufferFrames, 2048u, "default bufferFrames must be 2048");
+    CHECK_EQ(t.decimationStep, 1u, "default decimationStep must be 1");
+    CHECK_EQ(t.maxVoices, 0u, "default maxVoices must be 0");
 }
 
-void TestSharedMemoryLayout() {
-    size_t size = svms::RuntimeLinkMappingSize();
-    CHECK(size > 0, "RuntimeLinkMappingSize must be > 0");
+void TestCommandLayout() {
+    CHECK_EQ(sizeof(svms::RuntimeLinkCommandV2) % 64, 0u,
+             "RuntimeLinkCommandV2 must be a cache-line multiple");
+    CHECK_EQ(offsetof(svms::RuntimeLinkCommandV2, live), 16u,
+             "command.live must sit at byte 16");
+    CHECK_EQ(offsetof(svms::RuntimeLinkCommandV2, resultText), 108u,
+             "command.resultText must sit at byte 108");
 
-    // Verify layout is deterministic: header + 2*telemetry + cmdRing
-    size_t expected = sizeof(svms::RuntimeLinkHeader)
-                    + 2 * sizeof(svms::RLTelemetry)
-                    + svms::kRuntimeLinkCmdRingCapacity * sizeof(svms::RLCommand);
-    CHECK_EQ(size, expected, "mapping size must equal header + 2*telemetry + cmdRing");
-
-    svms::RuntimeLinkSharedMemory mem{};
-    CHECK_EQ(mem.header.size, 0u, "header.size must be 0 by default (set at init)");
-    CHECK_EQ(sizeof(mem.telemetry) / sizeof(mem.telemetry[0]), 2u,
-             "must have exactly 2 telemetry slots");
-    CHECK_EQ(sizeof(mem.cmdRing) / sizeof(mem.cmdRing[0]),
-             svms::kRuntimeLinkCmdRingCapacity,
-             "cmdRing must have correct capacity");
-
-    // Verify telemetry slots are properly aligned
-    size_t off0 = reinterpret_cast<const char*>(&mem.telemetry[0])
-                - reinterpret_cast<const char*>(&mem);
-    size_t off1 = reinterpret_cast<const char*>(&mem.telemetry[1])
-                - reinterpret_cast<const char*>(&mem);
-    CHECK(off0 % 64 == 0, "telemetry[0] must be cache-line aligned in mapping");
-    CHECK(off1 % 64 == 0, "telemetry[1] must be cache-line aligned in mapping");
+    svms::RuntimeLinkCommandV2 c{};
+    CHECK_EQ(c.type, 0u, "default command type must be NoCommand (0)");
+    CHECK_EQ(c.param, 0u, "default param must be 0");
+    CHECK_EQ(sizeof(c.resultText), svms::kRuntimeLinkResultTextCapacity,
+             "resultText capacity must match protocol constant");
 }
 
-void TestCommandRingSPSC() {
-    svms::RuntimeLinkSharedMemory mem{};
-    mem.header.cmdCapacity = svms::kRuntimeLinkCmdRingCapacity;
-    mem.header.cmdHead = 0;
-    mem.header.cmdTail.store(0);
+void TestMappingOffsets() {
+    svms::RuntimeLinkSharedMemoryV2 mem{};
+    // Committed offsets: header@0, telemetry@64, command@576.
+    size_t offTele = reinterpret_cast<const char*>(&mem.telemetry)
+                   - reinterpret_cast<const char*>(&mem);
+    size_t offCmd  = reinterpret_cast<const char*>(&mem.command)
+                   - reinterpret_cast<const char*>(&mem);
+    CHECK_EQ(offTele, 64u, "telemetry must sit at offset 64");
+    CHECK_EQ(offCmd, 576u, "command must sit at offset 576");
+    CHECK(offTele % 64 == 0 && offCmd % 64 == 0,
+          "telemetry and command must be cache-line aligned in mapping");
 
-    svms::RLCommand cmd;
-    cmd.type = svms::RLCommandType::Ping;
-    cmd.param0 = 42;
-    cmd.value0 = 3.14f;
-
-    // Ring should be empty
-    svms::RLCommand outCmd{svms::RLCommandType::Ping, 99, 0, 1.0f};
-    CHECK(!svms::RL_PopCommand(&mem, outCmd), "pop from empty ring must fail");
-    CHECK(outCmd.type == svms::RLCommandType::Ping, "pop must not modify cmd on failure");
-    CHECK(outCmd.param0 == 99u, "pop must not modify param0 on failure");
-
-    // Push one command
-    CHECK(svms::RL_PushCommand(&mem, cmd), "push must succeed");
-
-    // Pop it back
-    svms::RLCommand out{};
-    CHECK(svms::RL_PopCommand(&mem, out), "pop must succeed after push");
-    CHECK(out.type == svms::RLCommandType::Ping, "popped type must match");
-    CHECK(out.param0 == 42u, "popped param0 must match");
-    CHECK(out.value0 == 3.14f, "popped value0 must match");
-
-    // Ring should be empty again
-    CHECK(!svms::RL_PopCommand(&mem, out), "pop from drained ring must fail");
+    // The same offsets must be derivable from the header protocol.
+    svms::RuntimeLinkHeaderV2 h{};
+    h.structSize = static_cast<uint32_t>(sizeof(svms::RuntimeLinkTelemetryV2));
+    CHECK_EQ(svms::RLV2_TelemetryOffset(h), 64u, "RLV2_TelemetryOffset must be 64");
+    CHECK_EQ(svms::RLV2_CommandOffset(h), 576u, "RLV2_CommandOffset must be 576");
+    CHECK_EQ(svms::RuntimeLinkMappingSizeV2(), 1088u,
+             "mapping size must be 1088");
 }
 
-void TestCommandRingFull() {
-    svms::RuntimeLinkSharedMemory mem{};
-    mem.header.cmdCapacity = svms::kRuntimeLinkCmdRingCapacity;
+void TestHeaderCrc() {
+    svms::RuntimeLinkHeaderV2 h{};
+    h.size = svms::RuntimeLinkMappingSizeV2();
+    h.publisherPid = 12345;
+    h.structSize = static_cast<uint32_t>(sizeof(svms::RuntimeLinkTelemetryV2));
+    h.archClass = svms::kRuntimeLinkArchX64;
 
-    // Fill the ring to capacity
-    for (uint32_t i = 0; i < svms::kRuntimeLinkCmdRingCapacity; ++i) {
-        svms::RLCommand cmd{};
-        cmd.type = svms::RLCommandType::SetMasterVolume;
-        cmd.param0 = i;
-        cmd.value0 = static_cast<float>(i) / 100.0f;
-        bool pushed = svms::RL_PushCommand(&mem, cmd);
-        if (!pushed) {
-            std::printf("FAIL: push failed at index %u (line %d)\n", i, __LINE__);
-            ++g_failures;
-            return;
-        }
-    }
+    const uint32_t crc = svms::RLV2_HeaderCrc(h);
+    CHECK(crc != 0, "header Crc must be non-zero");
 
-    // Next push must fail (ring full)
-    svms::RLCommand extra{};
-    extra.type = svms::RLCommandType::Ping;
-    CHECK(!svms::RL_PushCommand(&mem, extra), "push to full ring must fail");
-
-    // Drain all and verify ordering
-    for (uint32_t i = 0; i < svms::kRuntimeLinkCmdRingCapacity; ++i) {
-        svms::RLCommand out{};
-        bool popped = svms::RL_PopCommand(&mem, out);
-        if (!popped) {
-            std::printf("FAIL: pop failed at index %u (line %d)\n", i, __LINE__);
-            ++g_failures;
-            return;
-        }
-        if (out.param0 != i) {
-            std::printf("FAIL: pop order mismatch at index %u: got param0=%u (line %d)\n",
-                        i, out.param0, __LINE__);
-            ++g_failures;
-        }
-        if (out.value0 != static_cast<float>(i) / 100.0f) {
-            std::printf("FAIL: pop value mismatch at index %u (line %d)\n", i, __LINE__);
-            ++g_failures;
-        }
-    }
-
-    // Should be empty now
-    svms::RLCommand drain{};
-    CHECK(!svms::RL_PopCommand(&mem, drain), "pop from drained ring must fail");
+    // Mutating any stable identity field must change the crc.
+    h.publisherPid = 12346;
+    CHECK(svms::RLV2_HeaderCrc(h) != crc, "crc must change with publisherPid");
+    h.publisherPid = 12345;
+    CHECK(svms::RLV2_HeaderCrc(h) == crc, "crc must be stable for identical header");
+    h.version = 3;
+    CHECK(svms::RLV2_HeaderCrc(h) != crc, "crc must change with version");
 }
 
-void TestTelemetryReadWrite() {
-    svms::RuntimeLinkSharedMemory mem{};
+void TestAtomicFloatBits() {
+    svms::AtomicFloatBits af{};
+    float v = 0.0f;
+    CHECK(!af.TryLoad(v, 1u), "empty AtomicFloatBits must reject stamp 1");
 
-    // Write to slot 1 (initially writeIndex is 0, so we write to slot 1)
-    svms::RLTelemetry snap{};
-    snap.activeVoices = 1234;
-    snap.sampleRate = 48000;
-    snap.masterVolume = 0.75f;
-    snap.cpuLoadPercent = 42.5f;
-    snap.eventsSubmitted = 9999;
+    af.Store(1.25f, 1u);
+    CHECK(af.TryLoad(v, 1u) && v == 1.25f, "Store/TryLoad round trip must match");
+    CHECK(!af.TryLoad(v, 0u), "mismatched stamp must fail TryLoad");
 
-    mem.telemetry[1] = snap;
-    mem.header.telemetryWriteIndex.store(1, std::memory_order_release);
+    af.Store(-7.5f, 1u);
+    CHECK(af.TryLoad(v, 1u) && v == -7.5f, "negative float round trip must match");
 
-    // Read should return slot 1
-    const svms::RLTelemetry& read = svms::RL_ReadTelemetry(&mem);
-    CHECK(read.activeVoices == 1234, "read telemetry activeVoices must match");
-    CHECK(read.sampleRate == 48000u, "read telemetry sampleRate must match");
-    CHECK(read.masterVolume == 0.75f, "read telemetry masterVolume must match");
-    CHECK(read.cpuLoadPercent == 42.5f, "read telemetry cpuLoadPercent must match");
-    CHECK(read.eventsSubmitted == 9999u, "read telemetry eventsSubmitted must match");
-
-    // Write to slot 0 (flip)
-    snap.activeVoices = 5678;
-    mem.telemetry[0] = snap;
-    mem.header.telemetryWriteIndex.store(0, std::memory_order_release);
-
-    const svms::RLTelemetry& read2 = svms::RL_ReadTelemetry(&mem);
-    CHECK(read2.activeVoices == 5678, "flip read must return new slot");
-}
-
-void TestNamingConventions() {
-    wchar_t buf[128];
-
-    svms::RL_SharedMemName(12345, buf, 128);
-    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeLink_v1_12345") == 0,
-          "shared mem name format must match");
-
-    svms::RL_MutexName(12345, buf, 128);
-    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RL_Mutex_12345") == 0,
-          "mutex name format must match");
-
-    svms::RL_CmdEventName(12345, buf, 128);
-    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RL_CmdEvent_12345") == 0,
-          "cmd event name format must match");
+    // Bit 0 is the stamp; the sender's float payload must survive.
+    af.Store(0.5f, 1u);
+    const uint32_t bits = af.bits;
+    CHECK((bits & 1u) == 1u, "bit 0 must carry the stamp");
+    CHECK(svms::RLV2_BitsToFloat(bits & ~1u) == 0.5f,
+          "float payload must sit in bits 31..1");
 }
 
 void TestEnumCompleteness() {
-    // Verify all command types are distinct
     svms::RLCommandType types[] = {
-        svms::RLCommandType::Ping,
+        svms::RLCommandType::NoCommand,
         svms::RLCommandType::SetMasterVolume,
         svms::RLCommandType::SetReverbEnabled,
         svms::RLCommandType::SetReverbMix,
@@ -254,12 +210,16 @@ void TestEnumCompleteness() {
         svms::RLCommandType::SetReverbModRate,
         svms::RLCommandType::SetReverbLowCutHz,
         svms::RLCommandType::SetReverbHighCutHz,
+        svms::RLCommandType::SetCorrectnessMode,
         svms::RLCommandType::SetLimiterEnabled,
         svms::RLCommandType::SetLimiterThreshold,
         svms::RLCommandType::SetLimiterLookahead,
         svms::RLCommandType::SetLimiterAttack,
         svms::RLCommandType::SetLimiterRelease,
-        svms::RLCommandType::SetCorrectnessMode,
+        svms::RLCommandType::Ping,
+        svms::RLCommandType::ApplyLiveConfig,
+        svms::RLCommandType::ReloadSoundFont,
+        svms::RLCommandType::ResetVoices,
         svms::RLCommandType::RequestRestart,
         svms::RLCommandType::Invalid,
     };
@@ -274,32 +234,159 @@ void TestEnumCompleteness() {
         }
     }
 
-    CHECK(static_cast<uint32_t>(svms::RLCommandType::Ping) == 0,
-          "Ping must be 0");
-    CHECK(static_cast<uint32_t>(svms::RLCommandType::RequestRestart) == 0x100,
-          "RequestRestart must be 0x100");
-    CHECK(static_cast<uint32_t>(svms::RLCommandType::Invalid) == 0xFFFFFFFF,
-          "Invalid must be 0xFFFFFFFF");
+    CHECK_EQ(svms::RLCommandType::NoCommand, 0u, "NoCommand must be 0");
+    CHECK_EQ(svms::RLCommandType::Ping, 0x20u, "Ping must be 0x20");
+    CHECK_EQ(svms::RLCommandType::ApplyLiveConfig, 0x100u,
+             "ApplyLiveConfig must be 0x100");
+    CHECK_EQ(svms::RLCommandType::ReloadSoundFont, 0x101u,
+             "ReloadSoundFont must be 0x101");
+    CHECK_EQ(svms::RLCommandType::ResetVoices, 0x102u, "ResetVoices must be 0x102");
+    CHECK_EQ(svms::RLCommandType::RequestRestart, 0x110u,
+             "RequestRestart must be 0x110");
+    CHECK_EQ(svms::RLCommandType::Invalid, 0xFFFFFFFFu, "Invalid must be 0xFFFFFFFF");
+}
+
+void TestGroups() {
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetMasterVolume),
+             svms::RLGroupMaster, "master volume must map to master group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetReverbMix),
+             svms::RLGroupReverb, "reverb mix must map to reverb group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetReverbHighCutHz),
+             svms::RLGroupReverb, "high cut must map to reverb group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetCorrectnessMode),
+             svms::RLGroupCorrectness, "correctness must map to correctness group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetLimiterRelease),
+             svms::RLGroupLimiter, "limiter release must map to limiter group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetLimiterThreshold),
+             svms::RLGroupLimiter, "limiter threshold must map to limiter group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::Ping), 0u,
+             "wire commands must not map to a group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::ApplyLiveConfig), 0u,
+             "ApplyLiveConfig must not map to a group");
+    CHECK_EQ(svms::RLGroupAll, 0xFu, "RLGroupAll must be the union of all groups");
+}
+
+void TestNamingConventions() {
+    wchar_t buf[128];
+    svms::RLV2_SharedMemName(12345, buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeLink_v2_12345") == 0,
+          "shared mem name format must match");
+    svms::RLV2_MutexName(12345, buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeMutex_v2_12345") == 0,
+          "mutex name format must match");
+    svms::RLV2_CmdEventName(12345, buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeCommand_v2_12345") == 0,
+          "command event name format must match");
+    svms::RLV2_HostsRegName(buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeHosts_v2") == 0,
+          "hosts registry name format must match");
+    svms::RLV2_HostsMutexName(buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeHostsMutex_v2") == 0,
+          "hosts mutex name format must match");
+}
+
+void TestHostsRegistry() {
+    svms::RuntimeHostsRegistryV2 reg{};
+    CHECK(reg.magic == svms::kRuntimeLinkMagic, "hosts registry magic must be set");
+    CHECK(reg.version == svms::kRuntimeLinkVersion, "hosts registry version must be 2");
+    CHECK(reg.slotCapacity == svms::kRuntimeHostMaxCount,
+          "hosts registry capacity must be 16");
+
+    const svms::RuntimeHostSlotV2& empty = reg.slots[0];
+    CHECK(svms::RLV2_HostsSlotIsEmpty(empty), "default slot must be empty");
+    CHECK(!svms::RLV2_HostsSlotIsFresh(empty, 1000u, 10000u,
+                                       svms::kRuntimeHostTimeoutMs),
+          "empty slot must never be fresh");
+
+    svms::RuntimeHostSlotV2 slot{};
+    slot.magic = svms::kRuntimeLinkMagic;
+    slot.pid = 7777;
+    slot.sessionId = 42;
+    slot.lastHeartbeatQpc = 5000u;
+    CHECK(!svms::RLV2_HostsSlotIsEmpty(slot), "populated slot must not be empty");
+    CHECK(svms::RLV2_HostsSlotIsFresh(slot, 6000u, 10000u, 1000u),
+          "recent heartbeat must be fresh");
+    CHECK(!svms::RLV2_HostsSlotIsFresh(slot, 60000u, 10000u, 1000u),
+          "old heartbeat must be stale");
+}
+
+void TestSnapshotProtocol() {
+    svms::RuntimeAudioSnapshot snap{};
+    CHECK(snap.sequence == svms::RLV2_SnapshotSettledSequence,
+          "fresh snapshot must start settled");
+    CHECK(snap.tickMs == 0, "fresh snapshot tickMs must be 0");
+
+    // Simulate an audio-thread publish: flags *within* the writer side
+    // (odd sequence), payload stores, then the settle word (even).
+    snap.sequence = 1;
+    snap.activeVoices.Store(1234.0f, 1u);
+    snap.releasingVoices.Store(99.0f, 1u);
+    snap.eventsSubmitted = 9999;
+    snap.limiterInputPeakL.Store(0.75f, 1u);
+    snap.sequence = svms::RLV2_SnapshotSettledSequence;
+
+    // Settled copy must read every field through the stamp.
+    const svms::RuntimeAudioSnapshot& settled = snap;
+    float f = 0.0f;
+    CHECK(settled.activeVoices.TryLoad(f, 1u) && f == 1234.0f,
+          "settled activeVoices must read back");
+    CHECK(settled.releasingVoices.TryLoad(f, 1u) && f == 99.0f,
+          "settled releasingVoices must read back");
+    CHECK(settled.limiterInputPeakL.TryLoad(f, 1u) && f == 0.75f,
+          "settled limiter meter must read back");
+    CHECK(settled.sequence == 2u, "settled sequence must be 2");
+    CHECK(settled.eventsSubmitted == 9999u, "settled u64 counter must read back");
+
+    // A torn snapshot (sequence==1) must be identifiable.
+    snap.sequence = 1;
+    CHECK(snap.sequence != svms::RLV2_SnapshotSettledSequence,
+          "writer-in-progress sequence must be detectable");
+}
+
+void TestResultStrings() {
+    CHECK(strcmp(svms::RLV2_ResultToString(svms::RLResult::Ok), "OK") == 0,
+          "Ok must stringify to OK");
+    CHECK(strcmp(svms::RLV2_ResultToString(svms::RLResult::Busy), "Busy") == 0,
+          "Busy must stringify to Busy");
+    CHECK(strcmp(svms::RLV2_ResultToString(svms::RLResult::LoadFailed),
+                 "Load failed") == 0,
+          "LoadFailed must stringify to Load failed");
+    CHECK(strcmp(svms::RLV2_ResultToString(svms::RLResult::RestartRequired),
+                 "Restart required") == 0,
+          "RestartRequired must stringify to Restart required");
+    CHECK(strcmp(svms::RLV2_ResultToString(svms::RLResult::InvalidArgument),
+                 "Invalid argument") == 0,
+          "InvalidArgument must stringify correctly");
+    CHECK(strcmp(svms::RLV2_ResultToString(svms::RLResult::Unsupported),
+                 "Unsupported") == 0,
+          "Unsupported must stringify correctly");
+    CHECK(strcmp(svms::RLV2_ResultToString(svms::RLResult::InternalError),
+                 "Internal error") == 0,
+          "InternalError must stringify correctly");
 }
 
 } // anonymous namespace
 
 int main() {
-    std::puts("=== SVMS RuntimeLink Protocol ABI Tests ===");
+    std::puts("=== SVMS RuntimeLink V2 Protocol ABI Tests ===");
 
     TestConstants();
-    TestRLCommandLayout();
-    TestRLTelemetryLayout();
-    TestRuntimeLinkHeaderLayout();
-    TestSharedMemoryLayout();
-    TestCommandRingSPSC();
-    TestCommandRingFull();
-    TestTelemetryReadWrite();
-    TestNamingConventions();
+    TestPODLayout();
+    TestLiveDefaults();
+    TestTelemetryLayout();
+    TestCommandLayout();
+    TestMappingOffsets();
+    TestHeaderCrc();
+    TestAtomicFloatBits();
     TestEnumCompleteness();
+    TestGroups();
+    TestNamingConventions();
+    TestHostsRegistry();
+    TestSnapshotProtocol();
+    TestResultStrings();
 
     if (g_failures == 0) {
-        std::puts("PASS: all RuntimeLink protocol ABI tests passed");
+        std::puts("PASS: all RuntimeLink V2 protocol ABI tests passed");
         return 0;
     } else {
         std::printf("FAIL: %d test(s) failed\n", g_failures);
