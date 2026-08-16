@@ -1,4 +1,5 @@
 #include "Widgets.h"
+#include "ConfiguratorApp.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "../SVMSRuntimeLink.h"
@@ -14,14 +15,16 @@ static LiveLinkContext g_liveLink = {};
 void SetLiveLinkContext(const LiveLinkContext& ctx) { g_liveLink = ctx; }
 const LiveLinkContext& GetLiveLinkContext() { return g_liveLink; }
 
+// Live changes are routed through the ConfiguratorApp so widgets never
+// talk to the driver directly: every knob/edit marks its group dirty on
+// the app's coalescing working live state, and the app sends ONE grouped
+// ApplyLiveConfig command per flush interval.
 void PushLiveFloat(svms::RLCommandType type, float value) {
-    if (g_liveLink.connected && g_liveLink.client)
-        g_liveLink.client->PushFloatCommand(type, value);
+    if (g_liveLink.app) g_liveLink.app->SetLiveFloat(type, value);
 }
 
 void PushLiveBool(svms::RLCommandType type, bool value) {
-    if (g_liveLink.connected && g_liveLink.client)
-        g_liveLink.client->PushBoolCommand(type, value);
+    if (g_liveLink.app) g_liveLink.app->SetLiveBool(type, value);
 }
 
 static float g_toastTimer = 0.0f;

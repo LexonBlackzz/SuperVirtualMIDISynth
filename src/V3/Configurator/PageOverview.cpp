@@ -134,7 +134,7 @@ void DrawOverviewPage(ConfigDocument& doc) {
 
         ImGui::Text("CPU load: %.1f%%", t->cpuLoadPercent);
         ImGui::Text("Peak: %.3f", t->renderPeak);
-        ImGui::Text("Master volume: %.2f", t->masterVolume);
+        ImGui::Text("Master volume: %.2f", t->live.masterVolume);
         ImGui::Text("Sample rate: %u Hz", t->sampleRate);
         ImGui::Text("Buffer: %u frames", t->bufferFrames);
 

@@ -57,7 +57,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_DPICHANGED:
         if (g_app) {
-            g_app->RenderFrame();
+            const float newScale =
+                static_cast<float>(HIWORD(wParam)) / 96.0f;
+            g_app->ApplyDpiScale(newScale,
+                                 reinterpret_cast<const RECT*>(lParam));
         }
         return 0;
     }
@@ -65,7 +68,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
+    // Per-monitor V2 DPI awareness: the window and its ImGui font follow
+    // the monitor the window actually lives on.  Must be set before any
+    // window is created.  (Configurator builds target modern Windows.)
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     easterEggs_ = RollEasterEggs(argc, argv);
+    // The notification popup must be opened by default: ShowMegaFuckerNotification
+    // early-returns unless *open is already true.
+    showMegaFuckerPopup_ = easterEggs_.megaFuckerDac;
 
     wchar_t configPath[MAX_PATH] = {};
     bool configPathSpecified = false;
@@ -103,6 +114,7 @@ bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
     } else {
         config_.Load(configPath);
     }
+    SeedWorkingLive();
 
     if (!CreateMainWindow(hInstance)) return false;
     if (!CreateD3D11()) return false;
@@ -180,6 +192,10 @@ bool ConfiguratorApp::CreateMainWindow(HINSTANCE hInstance) {
 
     if (!hwnd_) return false;
 
+    // With per-monitor V2 awareness the real scale is the window's,
+    // not the system's.
+    dpiScale_ = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
+
     ShowWindow(hwnd_, SW_SHOWDEFAULT);
     UpdateWindow(hwnd_);
     return true;
@@ -254,19 +270,49 @@ void ConfiguratorApp::CreateImGui() {
     ImGui::StyleColorsDark();
     ApplyTheme();
 
-    const wchar_t* fontPath = L"C:\\Windows\\Fonts\\segoeui.ttf";
-    DWORD attr = GetFileAttributesW(fontPath);
-    if (attr != INVALID_FILE_ATTRIBUTES) {
-        ImFontConfig cfg;
-        cfg.OversampleH = 1;
-        cfg.OversampleV = 1;
-        cfg.PixelSnapH = true;
-        io.Fonts->AddFontFromFileTTF(
-            "C:\\Windows\\Fonts\\segoeui.ttf", 16.0f, &cfg);
-    }
+    RecreateFonts(dpiScale_);
 
     ImGui_ImplWin32_Init(hwnd_);
     ImGui_ImplDX11_Init(d3dDevice_, d3dContext_);
+}
+
+void ConfiguratorApp::RecreateFonts(float scale) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+
+    ImFontConfig cfg;
+    cfg.OversampleH = 1;
+    cfg.OversampleV = 1;
+    cfg.PixelSnapH = true;
+
+    const float fontSize = 16.0f * scale;
+    ImFont* font = io.Fonts->AddFontFromFileTTF(
+        "C:\\Windows\\Fonts\\segoeui.ttf", fontSize, &cfg);
+    if (!font) {
+        // Fall back to the built-in font when Segoe UI is unavailable.
+        font = io.Fonts->AddFontDefault();
+    }
+    io.FontDefault = font;
+
+    // Force the DX11 backend to rebuild the font atlas at the new size.
+    io.Fonts->Build();
+    ImGui_ImplDX11_InvalidateDeviceObjects();
+}
+
+void ConfiguratorApp::ApplyDpiScale(float scale, const RECT* suggestedRect) {
+    if (!hwnd_) return;
+    dpiScale_ = scale;
+
+    if (suggestedRect) {
+        SetWindowPos(hwnd_, nullptr, suggestedRect->left, suggestedRect->top,
+                     suggestedRect->right - suggestedRect->left,
+                     suggestedRect->bottom - suggestedRect->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // The main window was created with the old scaled size; recreate the
+    // font atlas for the new DPI.
+    RecreateFonts(scale);
 }
 
 bool ConfiguratorApp::PumpMessages() {
@@ -593,6 +639,7 @@ void ConfiguratorApp::DrawFooter() {
 void ConfiguratorApp::DrawPageContent() {
     // Make live telemetry available to all pages
     LiveLinkContext lc;
+    lc.app = this;
     lc.client = rlConnected_ ? &rlClient_ : nullptr;
     lc.telemetry = rlConnected_ ? &rlTelemetry_ : nullptr;
     lc.connected = rlConnected_;
@@ -692,8 +739,8 @@ void ConfiguratorApp::PollRuntimeLink() {
     if (rlPollTimer_ < kRlPollInterval) return;
     rlPollTimer_ = 0.0f;
 
-    // Check if driver is still alive
-    if (!rlClient_.IsOpen()) {
+    // Heartbeat-based death detection (no process scanning).
+    if (!rlClient_.IsHostAlive(svms::kRuntimeHostTimeoutMs)) {
         rlConnected_ = false;
         rlReconnectTimer_ = 0.0f;
         statusMessage_ = "Driver disconnected — will attempt reconnect";
@@ -702,90 +749,185 @@ void ConfiguratorApp::PollRuntimeLink() {
         return;
     }
 
-    rlTelemetry_ = rlClient_.ReadTelemetry();
+    // Skip-if-busy telemetry read: mid-publish snapshots are skipped and
+    // the last good snapshot is kept.
+    rlClient_.ReadTelemetry(rlTelemetry_);
+
+    FlushLiveChanges();
 }
 
-void ConfiguratorApp::SendLiveCommand(svms::RLCommandType type, float value) {
-    if (!rlConnected_) return;
-    rlClient_.PushFloatCommand(type, value);
+void ConfiguratorApp::FlushLiveChanges() {
+    if (!rlConnected_ || pendingLiveMask_ == 0u) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    rlFlushTimer_ += io.DeltaTime;
+    if (rlFlushTimer_ < kRlFlushInterval) return;
+    rlFlushTimer_ = 0.0f;
+
+    char err[svms::kRuntimeLinkResultTextCapacity] = {};
+    const svms::RLResult result = rlClient_.SendCommand(
+        svms::RLCommandType::ApplyLiveConfig, pendingLiveMask_, 0u,
+        workingLive_, svms::kRuntimeLinkDefaultCommandTimeoutMs, err);
+    if (result == svms::RLResult::Ok) {
+        pendingLiveMask_ = 0u;
+        rlFailedFlushes_ = 0u;
+        return;
+    }
+    // Keep the mask so the change is re-sent on the next flush; surface
+    // persistent failures to the user (every 5th failed attempt).
+    if (++rlFailedFlushes_ >= 5u) {
+        rlFailedFlushes_ = 0u;
+        statusMessage_ = "Live update failed: " +
+            std::string(svms::RLV2_ResultToString(result));
+        if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
+        toastTimer_ = 3.0f;
+        toastMessage_ = statusMessage_;
+    }
 }
 
-void ConfiguratorApp::SendLiveBoolCommand(svms::RLCommandType type, bool value) {
-    if (!rlConnected_) return;
-    rlClient_.PushBoolCommand(type, value);
+void ConfiguratorApp::SetLiveFloat(svms::RLCommandType type, float value) {
+    switch (type) {
+    case svms::RLCommandType::SetMasterVolume:
+        workingLive_.masterVolume = value; break;
+    case svms::RLCommandType::SetReverbMix:
+        workingLive_.reverbMix = value; break;
+    case svms::RLCommandType::SetReverbRoomSize:
+        workingLive_.reverbRoomSize = value; break;
+    case svms::RLCommandType::SetReverbDecay:
+        workingLive_.reverbDecay = value; break;
+    case svms::RLCommandType::SetReverbDamping:
+        workingLive_.reverbDamping = value; break;
+    case svms::RLCommandType::SetReverbWidth:
+        workingLive_.reverbWidth = value; break;
+    case svms::RLCommandType::SetReverbDiffusion:
+        workingLive_.reverbDiffusion = value; break;
+    case svms::RLCommandType::SetReverbPreDelayMs:
+        workingLive_.reverbPreDelayMs = value; break;
+    case svms::RLCommandType::SetReverbEarlyLevel:
+        workingLive_.reverbEarlyLevel = value; break;
+    case svms::RLCommandType::SetReverbLateLevel:
+        workingLive_.reverbLateLevel = value; break;
+    case svms::RLCommandType::SetReverbModDepth:
+        workingLive_.reverbModDepth = value; break;
+    case svms::RLCommandType::SetReverbModRate:
+        workingLive_.reverbModRate = value; break;
+    case svms::RLCommandType::SetReverbLowCutHz:
+        workingLive_.reverbLowCutHz = value; break;
+    case svms::RLCommandType::SetReverbHighCutHz:
+        workingLive_.reverbHighCutHz = value; break;
+    case svms::RLCommandType::SetLimiterThreshold:
+        workingLive_.limiterThreshold = value; break;
+    case svms::RLCommandType::SetLimiterLookahead:
+        workingLive_.limiterLookaheadMs = value; break;
+    case svms::RLCommandType::SetLimiterAttack:
+        workingLive_.limiterAttackMs = value; break;
+    case svms::RLCommandType::SetLimiterRelease:
+        workingLive_.limiterReleaseMs = value; break;
+    default:
+        return; // unknown field — do not mark dirty
+    }
+    pendingLiveMask_ |= svms::RLV2_GroupForType(type);
+}
+
+void ConfiguratorApp::SetLiveBool(svms::RLCommandType type, bool value) {
+    switch (type) {
+    case svms::RLCommandType::SetReverbEnabled:
+        workingLive_.reverbEnabled = value ? 1u : 0u; break;
+    case svms::RLCommandType::SetLimiterEnabled:
+        workingLive_.limiterEnabled = value ? 1u : 0u; break;
+    case svms::RLCommandType::SetCorrectnessMode:
+        workingLive_.correctnessMode = value ? 1u : 0u; break;
+    default:
+        return;
+    }
+    pendingLiveMask_ |= svms::RLV2_GroupForType(type);
+}
+
+// Maps the (saved or working) config values onto the live payload used
+// for grouped ApplyLiveConfig commands.
+static svms::RuntimeLiveStateV2 LiveStateFromConfig(const ConfigValues& w) {
+    svms::RuntimeLiveStateV2 l{};
+    l.masterVolume = w.masterVolume;
+    l.correctnessMode = w.correctnessMode ? 1u : 0u;
+    l.reverbEnabled = w.enableReverb ? 1u : 0u;
+    l.reverbMix = w.reverbMix;
+    l.reverbRoomSize = w.reverbRoomSize;
+    l.reverbDecay = w.reverbDecay;
+    l.reverbDamping = w.reverbDamping;
+    l.reverbWidth = w.reverbWidth;
+    l.reverbDiffusion = w.reverbDiffusion;
+    l.reverbPreDelayMs = w.reverbPreDelayMs;
+    l.reverbEarlyLevel = w.reverbEarlyLevel;
+    l.reverbLateLevel = w.reverbLateLevel;
+    l.reverbModDepth = w.reverbModDepth;
+    l.reverbModRate = w.reverbModRate;
+    l.reverbLowCutHz = w.reverbLowCutHz;
+    l.reverbHighCutHz = w.reverbHighCutHz;
+    l.limiterEnabled = w.limiterEnabled ? 1u : 0u;
+    l.limiterThreshold = w.limiterThreshold;
+    l.limiterLookaheadMs = w.limiterLookaheadMs;
+    l.limiterAttackMs = w.limiterAttackMs;
+    l.limiterReleaseMs = w.limiterReleaseMs;
+    return l;
+}
+
+void ConfiguratorApp::SeedWorkingLive() {
+    workingLive_ = LiveStateFromConfig(config_.Working());
 }
 
 void ConfiguratorApp::PushAllLiveParams() {
     if (!rlConnected_) return;
-    auto& w = config_.Working();
 
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetMasterVolume, w.masterVolume);
-    rlClient_.PushBoolCommand(svms::RLCommandType::SetCorrectnessMode, w.correctnessMode);
-
-    rlClient_.PushBoolCommand(svms::RLCommandType::SetReverbEnabled, w.enableReverb);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbMix, w.reverbMix);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbRoomSize, w.reverbRoomSize);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbDecay, w.reverbDecay);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbDamping, w.reverbDamping);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbWidth, w.reverbWidth);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbDiffusion, w.reverbDiffusion);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbPreDelayMs, w.reverbPreDelayMs);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbEarlyLevel, w.reverbEarlyLevel);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbLateLevel, w.reverbLateLevel);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbModDepth, w.reverbModDepth);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbModRate, w.reverbModRate);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbLowCutHz, w.reverbLowCutHz);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetReverbHighCutHz, w.reverbHighCutHz);
-
-    rlClient_.PushBoolCommand(svms::RLCommandType::SetLimiterEnabled, w.limiterEnabled);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetLimiterThreshold, w.limiterThreshold);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetLimiterLookahead, w.limiterLookaheadMs);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetLimiterAttack, w.limiterAttackMs);
-    rlClient_.PushFloatCommand(svms::RLCommandType::SetLimiterRelease, w.limiterReleaseMs);
+    workingLive_ = LiveStateFromConfig(config_.Working());
+    char err[svms::kRuntimeLinkResultTextCapacity] = {};
+    const svms::RLResult result = rlClient_.SendCommand(
+        svms::RLCommandType::ApplyLiveConfig, svms::RLGroupAll, 0u,
+        workingLive_, 1500u, err);
+    if (result == svms::RLResult::Ok) {
+        pendingLiveMask_ = 0u;
+    } else {
+        statusMessage_ = "Live push failed: " +
+            std::string(svms::RLV2_ResultToString(result));
+        if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
+        toastTimer_ = 4.0f;
+        toastMessage_ = statusMessage_;
+    }
 }
 
 void ConfiguratorApp::OnConnected() {
     rlConnected_ = true;
     rlLastKnownPid_ = rlClient_.GetPID();
     rlReconnectTimer_ = 0.0f;
+    rlPollTimer_ = 0.0f;
+    rlFlushTimer_ = 0.0f;
+    rlFailedFlushes_ = 0u;
     statusMessage_ = "Connected to driver (PID " +
                      std::to_string(rlLastKnownPid_) + ")";
     toastTimer_ = 3.0f;
     toastMessage_ = statusMessage_;
 
-    // Push all config values to the driver so it matches the loaded config
-    PushAllLiveParams();
+    // Connecting is READ-ONLY: no live parameters are pushed on connect.
+    // The RUNTIME state is displayed from telemetry and only diverges
+    // from the config after the user changes something.
 }
 
 bool ConfiguratorApp::TryAutoDiscoverDriver() {
-    wchar_t memName[128];
+    // Discovery goes through the hosts registry (well-known mapping),
+    // preferring the most recently used driver PID.
+    svms::RuntimeLinkClientV2::HostInfo hosts[svms::kRuntimeHostMaxCount];
+    const uint32_t count = svms::RuntimeLinkClientV2::EnumerateHosts(
+        hosts, svms::kRuntimeHostMaxCount);
+    if (count == 0u) return false;
 
-    // Enumerate running processes looking for one with our shared memory
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-
-    PROCESSENTRY32W pe = {};
-    pe.dwSize = sizeof(pe);
-    bool found = false;
-
-    if (Process32FirstW(snap, &pe)) {
-        do {
-            // Try opening the shared memory mapping for this PID
-            svms::RL_SharedMemName(pe.th32ProcessID, memName, 128);
-            HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, memName);
-            if (hMap) {
-                CloseHandle(hMap);
-                // Found a process with our shared memory — try connecting
-                if (rlClient_.Open(pe.th32ProcessID)) {
-                    found = true;
-                    break;
-                }
-            }
-        } while (Process32NextW(snap, &pe));
+    for (uint32_t pass = 0; pass < 2u; ++pass) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (pass == 0u && hosts[i].pid != rlLastKnownPid_) continue;
+            if (pass == 1u && hosts[i].pid == rlLastKnownPid_) continue;
+            if (!hosts[i].fresh) continue;
+            if (rlClient_.Open(hosts[i].pid)) return true;
+        }
     }
-
-    CloseHandle(snap);
-    return found;
+    return false;
 }
 
 } // namespace svms::cfg

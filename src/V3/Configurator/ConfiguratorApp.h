@@ -5,6 +5,7 @@
 #include "WasapiDevices.h"
 #include "EasterEggs.h"
 #include "../SVMSRuntimeLink.h"
+#include "../SVMSRuntimeLinkProtocol.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -41,10 +42,20 @@ public:
 
     bool IsRunning() const { return running_; }
 
+    // Live-parameter entry points for widgets (see FlushLiveChanges):
+    // mutate the coalescing working state and mark the group dirty.
+    void SetLiveFloat(svms::RLCommandType type, float value);
+    void SetLiveBool(svms::RLCommandType type, bool value);
+
+    // DPI change hook called from WndProc (WM_DPICHANGED): rescales the
+    // window to the suggested rect and rebuilds the ImGui font atlas.
+    void ApplyDpiScale(float scale, const RECT* suggestedRect);
+
 private:
     bool CreateMainWindow(HINSTANCE hInstance);
     bool CreateD3D11();
     void CreateImGui();
+    void RecreateFonts(float scale);
     void DestroyD3D11();
     void DestroyMainWindow();
 
@@ -76,12 +87,21 @@ private:
     EasterEggState easterEggs_;
     bool showMegaFuckerPopup_ = false;
 
-    // RuntimeLink — live telemetry from the driver
-    svms::RuntimeLinkClient rlClient_;
-    svms::RLTelemetry rlTelemetry_{};
+    // RuntimeLink V2 — live telemetry + grouped live commands
+    svms::RuntimeLinkClientV2 rlClient_;
+    svms::RuntimeLinkTelemetryV2 rlTelemetry_{};
     bool rlConnected_ = false;
     float rlPollTimer_ = 0.0f;
     static constexpr float kRlPollInterval = 1.0f / 30.0f; // 30 Hz
+
+    // Coalesced live-parameter sending: widgets mutate workingLive_ and
+    // set pendingLiveMask_; FlushLiveChanges() sends ONE grouped
+    // ApplyLiveConfig command per flush interval.
+    svms::RuntimeLiveStateV2 workingLive_{};
+    uint32_t pendingLiveMask_ = 0;
+    float rlFlushTimer_ = 0.0f;
+    static constexpr float kRlFlushInterval = 0.25f; // 4 Hz
+    uint32_t rlFailedFlushes_ = 0;
 
     // Auto-discovery and reconnection
     float rlReconnectTimer_ = 0.0f;
@@ -93,8 +113,8 @@ private:
     void OnConnected();
 
     void PollRuntimeLink();
-    void SendLiveCommand(svms::RLCommandType type, float value);
-    void SendLiveBoolCommand(svms::RLCommandType type, bool value);
+    void FlushLiveChanges();
+    void SeedWorkingLive();
     void PushAllLiveParams();
 
     std::string statusMessage_;

@@ -63,16 +63,20 @@ void DrawDiagnosticsPage(ConfigDocument& doc) {
         ImGui::Spacing();
         SectionHeader("LIVE CALLBACK PERFORMANCE");
 
+        // Callback percentiles are PERCENT OF BUDGET (P95 = 48 means the
+        // P95 callback consumed 48% of its budget).  Budget ms is one
+        // device buffer: bufferFrames / sampleRate * 1000.
+        const float budgetMs = t->bufferFrames > 0u
+            ? 1000.0f * static_cast<float>(t->bufferFrames)
+              / static_cast<float>(t->sampleRate)
+            : 0.0f;
         ImGui::Text("CPU load: %.1f%%", t->cpuLoadPercent);
-        ImGui::Text("Callback P95: %.2f ms",
-                    t->callbackP95 * 1000.0f /
-                    static_cast<float>(t->sampleRate));
-        ImGui::Text("Callback P99: %.2f ms",
-                    t->callbackP99 * 1000.0f /
-                    static_cast<float>(t->sampleRate));
-        ImGui::Text("Callback P99.9: %.2f ms",
-                    t->callbackP999 * 1000.0f /
-                    static_cast<float>(t->sampleRate));
+        ImGui::Text("Callback P95: %.1f%% of budget (%.2f ms)",
+                    t->callbackP95Percent, budgetMs * t->callbackP95Percent / 100.0f);
+        ImGui::Text("Callback P99: %.1f%% of budget (%.2f ms)",
+                    t->callbackP99Percent, budgetMs * t->callbackP99Percent / 100.0f);
+        ImGui::Text("Callback P99.9: %.1f%% of budget (%.2f ms)",
+                    t->callbackP999Percent, budgetMs * t->callbackP999Percent / 100.0f);
         ImGui::Text("Over-budget callbacks: %llu",
                     static_cast<unsigned long long>(t->overBudgetCallbacks));
         ImGui::Text("Max consecutive over-budget: %u",

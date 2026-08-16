@@ -59,7 +59,7 @@ void DrawLimiterPage(ConfigDocument& doc) {
     ImVec2 meterStart = ImGui::GetCursorScreenPos();
 
     float livePeak = t ? t->renderPeak : 0.0f;
-    float liveGR = t ? t->limiterGainReduction : 0.0f;
+    float liveGR = t ? t->limiterGainReductionDb : 0.0f;
 
     DrawVerticalMeter("##input", livePeak, livePeak, ImVec2(meterW, meterH), true);
     drawMeterLabel("INPUT", meterStart.x, meterStart.y);
