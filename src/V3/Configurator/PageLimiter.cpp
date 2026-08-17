@@ -89,9 +89,6 @@ void UpdateMeterVisualState(MeterVisualState& state, bool telemetryAvailable,
     const float targetOutR = telemetryAvailable ? outR : 0.0f;
     const float targetGr = telemetryAvailable ? gr : 0.0f;
 
-    // RuntimeLink telemetry intentionally arrives at ~30 Hz. Smooth the
-    // displayed meters every rendered/VSync frame so the visuals do not step
-    // at the IPC sampling rate. The history remains a true ~30 Hz history.
     state.inL = SmoothVisual(state.inL, targetInL, dt, 0.012f, 0.120f);
     state.inR = SmoothVisual(state.inR, targetInR, dt, 0.012f, 0.120f);
     state.outL = SmoothVisual(state.outL, targetOutL, dt, 0.012f, 0.120f);
@@ -152,16 +149,93 @@ void DrawGrBar(const char* id, float reductionDb, const ImVec2& size) {
 
 void DrawDbScale(float x, float top, float height) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float ticks[] = { 0.0f, -3.0f, -6.0f, -12.0f, -24.0f, -48.0f, -60.0f };
+    constexpr int tickCount = 7;
+    const float ticks[tickCount] = {
+        0.0f, -3.0f, -6.0f, -12.0f, -24.0f, -48.0f, -60.0f
+    };
+
     const float fontH = ImGui::GetFontSize();
-    for (float db : ticks) {
-        const float norm = (db - kMeterFloorDb) / -kMeterFloorDb;
-        const float y = top + height * (1.0f - norm);
+    const float minGap = fontH + 2.0f;
+    const float minCenter = top + fontH * 0.5f;
+    const float maxCenter = top + height - fontH * 0.5f;
+
+    float desired[tickCount]{};
+    float placed[tickCount]{};
+    bool visible[tickCount]{};
+
+    // If DPI/window size becomes too small to fit every label, progressively
+    // remove the least important intermediate markings. The remaining labels
+    // are then repelled from each other while still pointing at their exact
+    // dB position with a small leader line.
+    int maxLabels = static_cast<int>(height / minGap) + 1;
+    maxLabels = (std::max)(2, (std::min)(tickCount, maxLabels));
+
+    for (int i = 0; i < tickCount; ++i) visible[i] = true;
+    if (maxLabels < 7) visible[1] = false; // -3
+    if (maxLabels < 6) visible[5] = false; // -48
+    if (maxLabels < 5) visible[2] = false; // -6
+    if (maxLabels < 4) visible[4] = false; // -24
+    if (maxLabels < 3) visible[3] = false; // -12
+
+    int indices[tickCount]{};
+    int count = 0;
+    for (int i = 0; i < tickCount; ++i) {
+        if (!visible[i]) continue;
+        const float norm = (ticks[i] - kMeterFloorDb) / -kMeterFloorDb;
+        desired[i] = top + height * (1.0f - norm);
+        desired[i] = ImClamp(desired[i], minCenter, maxCenter);
+        placed[i] = desired[i];
+        indices[count++] = i;
+    }
+
+    // Forward/backward relaxation guarantees that text rectangles never
+    // intersect, without losing the true tick location.
+    for (int n = 1; n < count; ++n) {
+        const int prev = indices[n - 1];
+        const int cur = indices[n];
+        placed[cur] = (std::max)(placed[cur], placed[prev] + minGap);
+    }
+    if (count > 0) {
+        const int last = indices[count - 1];
+        placed[last] = (std::min)(placed[last], maxCenter);
+    }
+    for (int n = count - 2; n >= 0; --n) {
+        const int cur = indices[n];
+        const int next = indices[n + 1];
+        placed[cur] = (std::min)(placed[cur], placed[next] - minGap);
+    }
+    if (count > 0) {
+        const int first = indices[0];
+        if (placed[first] < minCenter) {
+            const float offset = minCenter - placed[first];
+            for (int n = 0; n < count; ++n) placed[indices[n]] += offset;
+        }
+    }
+
+    const ImU32 textColor = ImGui::GetColorU32(
+        ImVec4(0.43f, 0.46f, 0.51f, 0.9f));
+    const ImU32 leaderColor = ImGui::GetColorU32(
+        ImVec4(0.30f, 0.33f, 0.38f, 0.72f));
+
+    for (int n = 0; n < count; ++n) {
+        const int i = indices[n];
         char text[16];
-        std::snprintf(text, sizeof(text), "%.0f", db);
-        const float textY = ImClamp(y - fontH * 0.5f, top, top + height - fontH);
-        dl->AddText(ImVec2(x, textY),
-                    ImGui::GetColorU32(ImVec4(0.43f, 0.46f, 0.51f, 0.9f)), text);
+        std::snprintf(text, sizeof(text), "%.0f", ticks[i]);
+
+        const float labelCenter = placed[i];
+        const float labelY = labelCenter - fontH * 0.5f;
+        const float exactY = desired[i];
+
+        // A short tick plus a diagonal leader makes the readout feel like it
+        // is dynamically attached to the exact scale point even when labels
+        // have to slide apart at small sizes/high DPI.
+        dl->AddLine(ImVec2(x - 5.0f, exactY), ImVec2(x - 1.0f, exactY),
+                    leaderColor, 1.0f);
+        if (std::fabs(labelCenter - exactY) > 0.75f) {
+            dl->AddLine(ImVec2(x - 1.0f, exactY), ImVec2(x + 2.0f, labelCenter),
+                        leaderColor, 1.0f);
+        }
+        dl->AddText(ImVec2(x + 4.0f, labelY), textColor, text);
     }
 }
 
@@ -169,7 +243,7 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
                    float height) {
     const float avail = ImGui::GetContentRegionAvail().x;
     const float scaleGap = 5.0f;
-    const float scaleWidth = ImGui::CalcTextSize("-60").x;
+    const float scaleWidth = ImGui::CalcTextSize("-60").x + 8.0f;
     const float stereoGap = 6.0f;
     const float captionGap = 5.0f;
     const float captionHeight = ImGui::GetFontSize() * 2.0f + captionGap + 4.0f;
@@ -183,9 +257,6 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         const float colStart = ImGui::GetCursorPosX();
         const float colAvail = ImGui::GetContentRegionAvail().x;
 
-        // Fit the complete visual group (bars + dB labels) inside the cell.
-        // The bars resize with the available width instead of letting labels
-        // drift or clip independently.
         const float maxPairW = (std::max)(52.0f,
             colAvail - scaleGap - scaleWidth - 12.0f);
         const float pairW = (std::min)(112.0f, maxPairW);
