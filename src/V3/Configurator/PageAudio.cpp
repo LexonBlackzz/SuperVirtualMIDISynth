@@ -18,8 +18,9 @@
 #include <vector>
 
 namespace svms::cfg {
+namespace {
 
-static std::string WideToUtf8Str(const std::wstring& ws) {
+std::string WideToUtf8Str(const std::wstring& ws) {
     if (ws.empty()) return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(),
                                   static_cast<int>(ws.size()),
@@ -31,6 +32,48 @@ static std::string WideToUtf8Str(const std::wstring& ws) {
     return s;
 }
 
+bool EqualAsciiCI(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool BeginAudioSettingsTable(const char* id) {
+    if (!ImGui::BeginTable(id, 3,
+                           ImGuiTableFlags_SizingStretchProp |
+                           ImGuiTableFlags_BordersInnerH |
+                           ImGuiTableFlags_RowBg,
+                           ImVec2(0.0f, 0.0f))) {
+        return false;
+    }
+    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 135.0f);
+    return true;
+}
+
+void AudioLabelCell(const char* label, const char* tooltip = nullptr) {
+    ImGui::TableNextColumn();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    if (tooltip) {
+        ImGui::SameLine();
+        HelpMarker(tooltip);
+    }
+}
+
+void RestartCell() {
+    ImGui::TableNextColumn();
+    RestartRequiredBadge();
+}
+
+} // namespace
+
 void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
     auto& w = doc.Working();
 
@@ -41,147 +84,178 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         devicesEnumerated = true;
     }
 
-    SectionHeader("OUTPUT DEVICE");
+    SectionHeader("AUDIO OUTPUT");
 
     auto names = deviceList.FriendlyNames();
-    int currentDevice = 0;
-    std::string configuredUtf8 = WideToUtf8Str(w.audioDevice);
+    int currentDevice = -1;
+    const std::string configuredUtf8 = WideToUtf8Str(w.audioDevice);
 
+    // Preserve the semantic "default" entry instead of replacing it in the
+    // UI with whichever concrete endpoint happens to be default today.
     if (w.audioDevice.empty() || w.audioDevice == L"default") {
-        currentDevice = deviceList.DefaultIndex();
+        currentDevice = 0;
     } else {
         for (size_t i = 0; i < deviceList.Devices().size(); ++i) {
             const auto& dev = deviceList.Devices()[i];
-            std::string devName = WideToUtf8Str(dev.friendlyName);
-            std::string cfgLower = configuredUtf8;
-            std::string devLower = devName;
-            std::transform(cfgLower.begin(), cfgLower.end(), cfgLower.begin(),
-                           [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
-            std::transform(devLower.begin(), devLower.end(), devLower.begin(),
-                           [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
-            if (devLower.find(cfgLower) != std::string::npos ||
-                cfgLower == WideToUtf8Str(dev.id)) {
+            const std::string devName = WideToUtf8Str(dev.friendlyName);
+            const std::string devId = WideToUtf8Str(dev.id);
+            if (EqualAsciiCI(devName, configuredUtf8) || devId == configuredUtf8) {
                 currentDevice = static_cast<int>(i + 1);
                 break;
             }
         }
     }
 
-    const char** namePtrs = new const char*[names.size()];
-    for (size_t i = 0; i < names.size(); ++i) {
-        namePtrs[i] = names[i].c_str();
-    }
+    if (BeginAudioSettingsTable("##audio_output_settings")) {
+        ImGui::TableNextRow();
+        AudioLabelCell("Output device",
+                       "WASAPI output endpoint. 'Default Windows Output Device' follows the current Windows default endpoint.");
+        ImGui::TableNextColumn();
 
-    const char* displayDevice = namePtrs[currentDevice];
-    if (easterEggs.megaFuckerDac && currentDevice != 0) {
-        static const char* megaName = "MegaFucker DAC Pro 9000";
-        displayDevice = megaName;
-    }
-
-    int newDevice = currentDevice;
-    ImGui::PushItemWidth(300.0f);
-    if (ImGui::Combo("##device", &newDevice, namePtrs, static_cast<int>(names.size()))) {
-        if (newDevice == 0) {
-            w.audioDevice = L"default";
+        std::string devicePreview;
+        if (easterEggs.megaFuckerDac) {
+            devicePreview = "MegaFucker DAC Pro 9000";
+        } else if (currentDevice >= 0 && currentDevice < static_cast<int>(names.size())) {
+            devicePreview = names[static_cast<size_t>(currentDevice)];
         } else {
-            const auto& dev = deviceList.Devices()[static_cast<size_t>(newDevice - 1)];
-            w.audioDevice = dev.friendlyName;
+            devicePreview = "Missing: " + configuredUtf8;
         }
-        doc.MarkDirty();
-    }
-    ImGui::PopItemWidth();
 
-    if (currentDevice == 0) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted(
-                "Uses the current Windows default audio output device.");
-            ImGui::EndTooltip();
+        const float deviceWidth = (std::min)(360.0f, ImGui::GetContentRegionAvail().x);
+        ImGui::SetNextItemWidth((std::max)(180.0f, deviceWidth));
+        if (ImGui::BeginCombo("##device", devicePreview.c_str())) {
+            for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+                const bool selected = i == currentDevice;
+                if (ImGui::Selectable(names[static_cast<size_t>(i)].c_str(), selected)) {
+                    currentDevice = i;
+                    if (i == 0) {
+                        w.audioDevice = L"default";
+                    } else {
+                        w.audioDevice = deviceList.Devices()[static_cast<size_t>(i - 1)].friendlyName;
+                    }
+                    doc.MarkDirty();
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
         }
+
+        ImGui::TableNextColumn();
+        if (ImGui::SmallButton("Refresh devices")) {
+            deviceList.Enumerate();
+        }
+
+        ImGui::TableNextRow();
+        AudioLabelCell("Sample rate",
+                       "Sample rate for audio output. Higher rates increase the amount of work per second.");
+        ImGui::TableNextColumn();
+
+        static const char* sampleRateItems[] = {
+            "44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz",
+            "176400 Hz", "192000 Hz"
+        };
+        static const uint32_t sampleRateValues[] = {
+            44100, 48000, 88200, 96000, 176400, 192000
+        };
+
+        int srIdx = -1;
+        for (int i = 0; i < 6; ++i) {
+            if (sampleRateValues[i] == w.sampleRate) {
+                srIdx = i;
+                break;
+            }
+        }
+        char srPreview[48];
+        if (srIdx >= 0) {
+            std::snprintf(srPreview, sizeof(srPreview), "%u Hz", w.sampleRate);
+        } else {
+            std::snprintf(srPreview, sizeof(srPreview), "%u Hz (custom)", w.sampleRate);
+        }
+        ImGui::SetNextItemWidth((std::min)(220.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::BeginCombo("##samplerate", srPreview)) {
+            for (int i = 0; i < 6; ++i) {
+                const bool selected = srIdx == i;
+                if (ImGui::Selectable(sampleRateItems[i], selected)) {
+                    w.sampleRate = sampleRateValues[i];
+                    doc.MarkDirty();
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        RestartCell();
+
+        ImGui::TableNextRow();
+        AudioLabelCell("Buffer frames",
+                       "Audio endpoint buffer size. Smaller buffers reduce latency but leave less time for each render callback.");
+        ImGui::TableNextColumn();
+
+        static const char* bufferItems[] = {
+            "64", "128", "256", "512", "1024", "2048", "4096", "8192"
+        };
+        static const uint32_t bufferValues[] = {
+            64, 128, 256, 512, 1024, 2048, 4096, 8192
+        };
+
+        int bufIdx = -1;
+        for (int i = 0; i < 8; ++i) {
+            if (bufferValues[i] == w.bufferFrames) {
+                bufIdx = i;
+                break;
+            }
+        }
+        char bufferPreview[48];
+        if (bufIdx >= 0) {
+            std::snprintf(bufferPreview, sizeof(bufferPreview), "%u", w.bufferFrames);
+        } else {
+            std::snprintf(bufferPreview, sizeof(bufferPreview), "%u (custom)", w.bufferFrames);
+        }
+
+        const float comboWidth = (std::min)(220.0f, ImGui::GetContentRegionAvail().x);
+        ImGui::SetNextItemWidth(comboWidth);
+        if (ImGui::BeginCombo("##buffer", bufferPreview)) {
+            for (int i = 0; i < 8; ++i) {
+                const bool selected = bufIdx == i;
+                if (ImGui::Selectable(bufferItems[i], selected)) {
+                    w.bufferFrames = bufferValues[i];
+                    doc.MarkDirty();
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        const float latencyMs = (static_cast<float>(w.bufferFrames) /
+                                 static_cast<float>(w.sampleRate)) * 1000.0f;
+        char latencyBuf[64];
+        std::snprintf(latencyBuf, sizeof(latencyBuf), "%.2f ms @ %u Hz",
+                      latencyMs, w.sampleRate);
+        if (ImGui::GetContentRegionAvail().x > 150.0f) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", latencyBuf);
+        } else {
+            ImGui::TextDisabled("%s", latencyBuf);
+        }
+        RestartCell();
+
+        ImGui::TableNextRow();
+        AudioLabelCell("Audio backend",
+                       "V3 uses Windows Audio Session API in shared mode. This is the production backend on modern builds.");
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("WASAPI Shared Mode");
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("fixed");
+
+        ImGui::EndTable();
     }
 
     if (easterEggs.megaFuckerDac) {
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.20f, 1.0f));
-        ImGui::Text("Note: Display override active. "
-                    "Your actual device has NOT changed.");
+        ImGui::TextUnformatted("Display override active — your actual audio device has not changed.");
         ImGui::PopStyleColor();
     }
-
-    bool needsRefresh = ImGui::Button("Refresh Devices");
-    if (needsRefresh) {
-        deviceList.Enumerate();
-    }
-
-    delete[] namePtrs;
-
-    ImGui::Spacing();
-    SectionHeader("SAMPLE RATE");
-
-    static const char* sampleRateItems[] = {
-        "44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz",
-        "176400 Hz", "192000 Hz"
-    };
-    static const uint32_t sampleRateValues[] = {
-        44100, 48000, 88200, 96000, 176400, 192000
-    };
-
-    int srIdx = 0;
-    for (int i = 0; i < 6; ++i) {
-        if (sampleRateValues[i] == w.sampleRate) {
-            srIdx = i;
-            break;
-        }
-    }
-
-    ImGui::PushItemWidth(200.0f);
-    if (ImGui::Combo("##samplerate", &srIdx, sampleRateItems, 6)) {
-        w.sampleRate = sampleRateValues[srIdx];
-        doc.MarkDirty();
-    }
-    ImGui::PopItemWidth();
-
-    HelpMarker("Sample rate for audio output. Higher rates improve quality "
-               "but increase CPU load.");
-
-    ImGui::Spacing();
-    SectionHeader("BUFFER FRAMES");
-
-    static const char* bufferItems[] = {
-        "64", "128", "256", "512", "1024", "2048", "4096", "8192"
-    };
-    static const uint32_t bufferValues[] = {
-        64, 128, 256, 512, 1024, 2048, 4096, 8192
-    };
-
-    int bufIdx = 5;
-    for (int i = 0; i < 8; ++i) {
-        if (bufferValues[i] == w.bufferFrames) {
-            bufIdx = i;
-            break;
-        }
-    }
-
-    ImGui::PushItemWidth(200.0f);
-    if (ImGui::Combo("##buffer", &bufIdx, bufferItems, 8)) {
-        w.bufferFrames = bufferValues[bufIdx];
-        doc.MarkDirty();
-    }
-    ImGui::PopItemWidth();
-
-    float latencyMs = (static_cast<float>(w.bufferFrames) /
-                       static_cast<float>(w.sampleRate)) *
-                      1000.0f;
-    ImGui::SameLine();
-    char latencyBuf[64];
-    snprintf(latencyBuf, sizeof(latencyBuf), "%u frames @ %u Hz = %.2f ms",
-             w.bufferFrames, w.sampleRate, latencyMs);
-    ImGui::TextDisabled("%s", latencyBuf);
-
-    HelpMarker("Audio endpoint buffer size. Smaller buffers reduce latency "
-               "but leave less time for each render callback.");
 
     ImGui::Spacing();
     SectionHeader("SOUND FONT");
@@ -198,9 +272,6 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         }
         ImGui::Spacing();
 
-        // Repick cache: remembers the last folder used by Browse or the
-        // folder search, so re-picking the SoundFont starts where the
-        // user left off.  Initialized from the current file's folder.
         static std::wstring lastSoundFontDir;
         if (lastSoundFontDir.empty() && !w.soundFontPath.empty()) {
             lastSoundFontDir =
@@ -233,13 +304,12 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 w.soundFontPath.clear();
                 doc.MarkDirty();
             }
+            ImGui::SameLine();
         }
+        ImGui::TextDisabled("restart-only");
         ImGui::SameLine();
-        ImGui::TextDisabled("(restart-only: takes effect when the driver reloads)");
         RestartRequiredBadge();
 
-        // Split search: a filter box plus a scrolling list of matching
-        // SoundFonts from the current folder (or the last browse folder).
         static char searchBuf[128] = {};
         static std::vector<std::wstring> folderFonts;
         static std::wstring scannedDir;
@@ -261,13 +331,14 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 std::sort(folderFonts.begin(), folderFonts.end());
             }
         }
-        ImGui::PushItemWidth(360.0f);
+
+        const float sfWidth = (std::min)(420.0f, ImGui::GetContentRegionAvail().x);
+        ImGui::SetNextItemWidth(sfWidth);
         ImGui::InputTextWithHint("##sfsearch",
                                  "Filter SoundFonts in folder…",
                                  searchBuf, sizeof(searchBuf));
-        ImGui::PopItemWidth();
 
-        ImGui::BeginChild("sfList", ImVec2(360.0f, 150.0f), true);
+        ImGui::BeginChild("sfList", ImVec2(sfWidth, 150.0f), true);
         std::string filter = searchBuf;
         std::transform(filter.begin(), filter.end(), filter.begin(),
                        [](unsigned char c) -> char {
@@ -283,8 +354,9 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
             if (!filter.empty() && lower.find(filter) == std::string::npos) {
                 continue;
             }
-            const bool selected =
-                _wcsicmp(file.c_str(), w.soundFontPath.c_str()) == 0;
+            const bool selected = !w.soundFontPath.empty() &&
+                _wcsicmp(file.c_str(),
+                         std::filesystem::path(w.soundFontPath).filename().c_str()) == 0;
             if (ImGui::Selectable(name.c_str(), selected)) {
                 w.soundFontPath = std::filesystem::path(scannedDir) / file;
                 doc.MarkDirty();
@@ -292,15 +364,6 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         }
         ImGui::EndChild();
     }
-
-    ImGui::Spacing();
-    SectionHeader("AUDIO BACKEND");
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
-    ImGui::Text("WASAPI Shared Mode (default)");
-    ImGui::PopStyleColor();
-    HelpMarker("V3 uses Windows Audio Session API in shared mode. "
-               "This is the only production backend on modern builds.");
 }
 
 } // namespace svms::cfg
