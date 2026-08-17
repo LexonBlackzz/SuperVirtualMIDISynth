@@ -7,6 +7,7 @@
 #include "../SVMSRuntimeLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
+#include <algorithm>
 #include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -46,15 +47,9 @@ public:
 
     const wchar_t* LastInitError() const { return lastInitError_.c_str(); }
 
-    // Live-parameter entry points for widgets (see FlushLiveChanges):
-    // mutate the coalescing working state and mark the group dirty.
     void SetLiveFloat(svms::RLCommandType type, float value);
     void SetLiveBool(svms::RLCommandType type, bool value);
 
-    // DPI change hook called from WndProc (WM_DPICHANGED).  Applies the
-    // suggested window rectangle immediately, but only records the font
-    // rebuild as pending: the actual atlas rebuild happens in the normal
-    // frame loop, never re-entrantly inside WndProc.
     void HandleDpiChange(float scale, const RECT* suggestedRect);
 
 private:
@@ -89,9 +84,6 @@ private:
     int windowHeight_ = 760;
     float dpiScale_ = 1.0f;
 
-    // Window lifecycle state written by WndProc, consumed by the main
-    // render loop.  Rendering and swap-chain work never happen inside
-    // WndProc itself.
     bool resizePending_ = false;
     UINT pendingWidth_ = 0;
     UINT pendingHeight_ = 0;
@@ -107,25 +99,20 @@ private:
     EasterEggState easterEggs_;
     bool showMegaFuckerPopup_ = false;
 
-    // RuntimeLink V2 — live telemetry + grouped live commands
     svms::RuntimeLinkClientV2 rlClient_;
     svms::RuntimeLinkTelemetryV2 rlTelemetry_{};
     bool rlConnected_ = false;
     float rlPollTimer_ = 0.0f;
-    static constexpr float kRlPollInterval = 1.0f / 30.0f; // 30 Hz
+    static constexpr float kRlPollInterval = 1.0f / 30.0f;
 
-    // Coalesced live-parameter sending: widgets mutate workingLive_ and
-    // set pendingLiveMask_; FlushLiveChanges() sends ONE grouped
-    // ApplyLiveConfig command per flush interval.
     svms::RuntimeLiveStateV2 workingLive_{};
     uint32_t pendingLiveMask_ = 0;
     float rlFlushTimer_ = 0.0f;
-    static constexpr float kRlFlushInterval = 0.25f; // 4 Hz
+    static constexpr float kRlFlushInterval = 0.25f;
     uint32_t rlFailedFlushes_ = 0;
 
-    // Auto-discovery and reconnection
     float rlReconnectTimer_ = 0.0f;
-    static constexpr float kRlReconnectInterval = 3.0f; // scan every 3s when disconnected
+    static constexpr float kRlReconnectInterval = 3.0f;
     bool rlAutoReconnect_ = true;
     uint32_t rlLastKnownPid_ = 0;
 
@@ -136,11 +123,6 @@ private:
     void FlushLiveChanges();
     void SeedWorkingLive();
     void PushAllLiveParams();
-
-    // Part G: adopt the engine's APPLIED live state (telemetry echo) into
-    // the working copy — the reverse of PushAllLiveParams.  Lets the user
-    // pull out-of-band engine changes (e.g. from a second configurator)
-    // into the document, then save them to disk.
     void AdoptEngineLiveState();
 
     std::string statusMessage_;
