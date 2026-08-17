@@ -57,7 +57,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
         int maxVoices = static_cast<int>(w.maxVoices);
         ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
         if (ImGui::InputInt("##maxvoices", &maxVoices, 0, 0)) {
-            maxVoices = ImClamp(maxVoices, 1, 524288);
+            maxVoices = (std::max)(1, (std::min)(524288, maxVoices));
             w.maxVoices = static_cast<uint32_t>(maxVoices);
             doc.MarkDirty();
         }
