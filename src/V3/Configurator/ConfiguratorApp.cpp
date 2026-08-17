@@ -603,54 +603,7 @@ void ConfiguratorApp::RenderFrame() {
     d3dContext_->OMSetRenderTargets(1, &renderTarget_, nullptr);
     d3dContext_->ClearRenderTargetView(renderTarget_, clearColor);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    ImGuiIO& io = ImGui::GetIO();
-    RecordFrameTime(io.DeltaTime * 1000.0f);
-    swapChain_->Present(vsync_ ? 1u : 0u, 0);
-}
-
-void ConfiguratorApp::RecordFrameTime(float ms) {
-    frameTimeMs_[frameTimePos_] = ms;
-    frameTimePos_ = (frameTimePos_ + 1) % 256;
-    if (frameTimeCount_ < 256) ++frameTimeCount_;
-}
-
-FramePacingStats ConfiguratorApp::GetFramePacingStats() const {
-    FramePacingStats stats;
-    if (frameTimeCount_ == 0) return stats;
-
-    float sorted[256] = {};
-    const int n = frameTimeCount_;
-    double sum = 0.0;
-    float worst = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        const float ms = frameTimeMs_[(frameTimePos_ - n + i + 256) % 256];
-        sorted[i] = ms;
-        sum += ms;
-        if (ms > worst) worst = ms;
-    }
-    for (int i = 1; i < n; ++i) {
-        const float key = sorted[i];
-        int j = i - 1;
-        while (j >= 0 && sorted[j] > key) {
-            sorted[j + 1] = sorted[j];
-            --j;
-        }
-        sorted[j + 1] = key;
-    }
-
-    stats.frameCount = n;
-    stats.avgMs = static_cast<float>(sum / n);
-    stats.p95Ms = sorted[static_cast<int>(n * 0.95f)];
-    stats.worstMs = worst;
-
-    constexpr int kBins = 10;
-    for (int i = 0; i < n; ++i) {
-        const float ms = frameTimeMs_[(frameTimePos_ - n + i + 256) % 256];
-        int bin = static_cast<int>(ms / 4.0f);
-        if (bin >= kBins) bin = kBins - 1;
-        ++stats.histogram[bin];
-    }
-    return stats;
+    swapChain_->Present(1, 0);
 }
 
 void ConfiguratorApp::DrawHeader() {
@@ -774,7 +727,9 @@ void ConfiguratorApp::DrawFooter() {
     }
 
     // RuntimeLink status + Connect/Disconnect button
-    ImGui::SameLine(200.0f);
+    ImGui::SameLine();
+    ImGui::Spacing();
+    ImGui::SameLine();
     if (rlConnected_) {
         ImGui::PushStyleColor(ImGuiCol_Text,
                               ImVec4(0.30f, 0.80f, 0.45f, 1.0f));
@@ -805,18 +760,9 @@ void ConfiguratorApp::DrawFooter() {
         }
     }
 
-    ImGui::SameLine(420.0f);
-    ImGui::Checkbox("VSync", &vsync_);
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::Text("Synchronize presents to the display refresh (1 vsync\n"
-                    "interval). Off uncaps the frame rate at the cost of\n"
-                    "potential tearing. Frame pacing is graphed on the\n"
-                    "About page.");
-        ImGui::EndTooltip();
-    }
-
-    ImGui::SameLine(avail - 480.0f);
+    // Right-aligned button group: Revert | Discard | Adopt Engine | Save
+    float btnGroupW = 70 + 8 + 70 + 8 + 108 + 8 + 160;
+    ImGui::SameLine(avail - btnGroupW);
 
     if (ImGui::Button("Revert", ImVec2(70, 28))) {
         config_.Revert();
@@ -923,7 +869,7 @@ void ConfiguratorApp::DrawPageContent() {
     case Page::Limiter:     DrawLimiterPage(config_); break;
     case Page::Diagnostics: DrawDiagnosticsPage(config_); break;
     case Page::Advanced:    DrawAdvancedPage(config_); break;
-    case Page::About:      DrawAboutPage(config_, vsync_, GetFramePacingStats()); break;
+    case Page::About:       DrawAboutPage(config_); break;
     }
 }
 

@@ -463,9 +463,6 @@ void DrawVerticalMeter(const char* /*id*/, float value, float peak,
 
     float h = size.y * ImClamp(value, 0.0f, 1.0f);
 
-    ImVec2 barBottom(pos.x + 1, pos.y + size.y);
-    ImVec2 barTop(pos.x + 1, pos.y + size.y - h);
-
     if (h > 0) {
         float frac = h / size.y;
         ImU32 barCol;
@@ -475,7 +472,9 @@ void DrawVerticalMeter(const char* /*id*/, float value, float peak,
             barCol = ImGui::GetColorU32(ImVec4(0.90f, 0.75f, 0.20f, 0.9f));
         else
             barCol = ImGui::GetColorU32(ImVec4(0.85f, 0.30f, 0.30f, 0.9f));
-        dl->AddRectFilled(barBottom, barTop, barCol, 1.0f);
+        dl->AddRectFilled(ImVec2(pos.x + 1, pos.y + size.y),
+                          ImVec2(pos.x + size.x - 1, pos.y + size.y - h),
+                          barCol, 1.0f);
     }
 
     if (peak > 0.01f) {
@@ -514,10 +513,10 @@ void DrawGainReductionMeter(const char* /*id*/, float gr,
     float h = size.y * ImClamp(grAbs / 24.0f, 0.0f, 1.0f);
 
     if (h > 0) {
-        ImVec2 barTop(pos.x + 1, pos.y + 1);
-        ImVec2 barBottom(pos.x + 1, pos.y + 1 + h);
+        ImVec2 barTL(pos.x + 1, pos.y + 1);
+        ImVec2 barBR(pos.x + size.x - 1, pos.y + 1 + h);
         ImU32 barCol = ImGui::GetColorU32(ImVec4(0.90f, 0.70f, 0.20f, 0.9f));
-        dl->AddRectFilled(barTop, barBottom, barCol, 1.0f);
+        dl->AddRectFilled(barTL, barBR, barCol, 1.0f);
     }
 
     auto drawTick = [&](float db, const char* text) {
@@ -596,24 +595,24 @@ bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,
     if (e.correctnessMode != (working.correctnessMode ? 1u : 0u)) return false;
     if (e.reverbEnabled != (working.enableReverb ? 1u : 0u)) return false;
     if (e.limiterEnabled != (working.limiterEnabled ? 1u : 0u)) return false;
-    if (!near(e.masterVolume, working.masterVolume)) return false;
-    if (!near(e.reverbMix, working.reverbMix)) return false;
-    if (!near(e.reverbRoomSize, working.reverbRoomSize)) return false;
-    if (!near(e.reverbDecay, working.reverbDecay)) return false;
-    if (!near(e.reverbDamping, working.reverbDamping)) return false;
-    if (!near(e.reverbWidth, working.reverbWidth)) return false;
-    if (!near(e.reverbDiffusion, working.reverbDiffusion)) return false;
-    if (!near(e.reverbPreDelayMs, working.reverbPreDelayMs)) return false;
-    if (!near(e.reverbEarlyLevel, working.reverbEarlyLevel)) return false;
-    if (!near(e.reverbLateLevel, working.reverbLateLevel)) return false;
-    if (!near(e.reverbModDepth, working.reverbModDepth)) return false;
-    if (!near(e.reverbModRate, working.reverbModRate)) return false;
-    if (!near(e.reverbLowCutHz, working.reverbLowCutHz)) return false;
-    if (!near(e.reverbHighCutHz, working.reverbHighCutHz)) return false;
-    if (!near(e.limiterThreshold, working.limiterThreshold)) return false;
-    if (!near(e.limiterLookaheadMs, working.limiterLookaheadMs)) return false;
-    if (!near(e.limiterAttackMs, working.limiterAttackMs)) return false;
-    if (!near(e.limiterReleaseMs, working.limiterReleaseMs)) return false;
+    if (!closeEnough(e.masterVolume, working.masterVolume)) return false;
+    if (!closeEnough(e.reverbMix, working.reverbMix)) return false;
+    if (!closeEnough(e.reverbRoomSize, working.reverbRoomSize)) return false;
+    if (!closeEnough(e.reverbDecay, working.reverbDecay)) return false;
+    if (!closeEnough(e.reverbDamping, working.reverbDamping)) return false;
+    if (!closeEnough(e.reverbWidth, working.reverbWidth)) return false;
+    if (!closeEnough(e.reverbDiffusion, working.reverbDiffusion)) return false;
+    if (!closeEnough(e.reverbPreDelayMs, working.reverbPreDelayMs)) return false;
+    if (!closeEnough(e.reverbEarlyLevel, working.reverbEarlyLevel)) return false;
+    if (!closeEnough(e.reverbLateLevel, working.reverbLateLevel)) return false;
+    if (!closeEnough(e.reverbModDepth, working.reverbModDepth)) return false;
+    if (!closeEnough(e.reverbModRate, working.reverbModRate)) return false;
+    if (!closeEnough(e.reverbLowCutHz, working.reverbLowCutHz)) return false;
+    if (!closeEnough(e.reverbHighCutHz, working.reverbHighCutHz)) return false;
+    if (!closeEnough(e.limiterThreshold, working.limiterThreshold)) return false;
+    if (!closeEnough(e.limiterLookaheadMs, working.limiterLookaheadMs)) return false;
+    if (!closeEnough(e.limiterAttackMs, working.limiterAttackMs)) return false;
+    if (!closeEnough(e.limiterReleaseMs, working.limiterReleaseMs)) return false;
     return true;
 }
 
