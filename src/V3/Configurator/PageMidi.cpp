@@ -112,7 +112,7 @@ void DrawMidiPage(ConfigDocument& doc) {
         int ignore = static_cast<int>(w.velocityIgnoreBelow);
         ImGui::SetNextItemWidth((std::min)(220.0f, ImGui::GetContentRegionAvail().x));
         if (ImGui::InputInt("##velocityignore", &ignore, 0, 0)) {
-            ignore = ImClamp(ignore, 0, 127);
+            ignore = (std::max)(0, (std::min)(127, ignore));
             w.velocityIgnoreBelow = static_cast<uint32_t>(ignore);
             doc.MarkDirty();
         }
