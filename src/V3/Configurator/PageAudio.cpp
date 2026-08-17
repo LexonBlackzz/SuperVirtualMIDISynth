@@ -87,6 +87,24 @@ void RestartCell() {
     }
 }
 
+void FixedCell() {
+    ImGui::TableNextColumn();
+    ImGui::AlignTextToFramePadding();
+
+    constexpr const char* label = "FIXED";
+    const float startX = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    const float labelWidth = ImGui::CalcTextSize(label).x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
+
+    ImGui::TextDisabled("%s", label);
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("The audio backend is currently fixed to WASAPI Shared Mode.");
+        ImGui::EndTooltip();
+    }
+}
+
 } // namespace
 
 void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
@@ -257,8 +275,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         ImGui::TableNextColumn();
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("WASAPI Shared Mode");
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("fixed");
+        FixedCell();
 
         ImGui::EndTable();
     }
