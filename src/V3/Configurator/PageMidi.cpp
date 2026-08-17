@@ -3,112 +3,193 @@
 #include "Widgets.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
+
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace svms::cfg {
+namespace {
+
+bool BeginSettingsTable(const char* id) {
+    if (!ImGui::BeginTable(id, 3,
+                           ImGuiTableFlags_SizingStretchProp |
+                           ImGuiTableFlags_BordersInnerH |
+                           ImGuiTableFlags_RowBg)) {
+        return false;
+    }
+    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 185.0f);
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 135.0f);
+    return true;
+}
+
+void LabelCell(const char* label, const char* tooltip = nullptr) {
+    ImGui::TableNextColumn();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    if (tooltip) {
+        ImGui::SameLine();
+        HelpMarker(tooltip);
+    }
+}
+
+void RestartCell() {
+    ImGui::TableNextColumn();
+    RestartRequiredBadge();
+}
+
+bool InputU32(const char* id, uint32_t& value, uint32_t minValue, uint32_t maxValue) {
+    uint32_t temp = value;
+    ImGui::SetNextItemWidth((std::min)(300.0f, ImGui::GetContentRegionAvail().x));
+    if (!ImGui::InputScalar(id, ImGuiDataType_U32, &temp, nullptr, nullptr, "%u")) {
+        return false;
+    }
+    temp = (std::max)(minValue, (std::min)(maxValue, temp));
+    value = temp;
+    return true;
+}
+
+} // namespace
 
 void DrawMidiPage(ConfigDocument& doc) {
     auto& w = doc.Working();
+    const auto& lc = GetLiveLinkContext();
 
     SectionHeader("SYNTH SETTINGS");
 
-    float masterVol = w.masterVolume;
-    if (SliderFloat("Master Volume", &masterVol, 0.0f, 4.0f, "%.2f",
-                    "Master output volume multiplier. 1.0 is unity gain.")) {
-        w.masterVolume = masterVol;
-        doc.MarkDirty();
-        PushLiveFloat(svms::RLCommandType::SetMasterVolume, masterVol);
-    }
-    {
-        auto& lc = GetLiveLinkContext();
+    if (BeginSettingsTable("##synth_settings")) {
+        ImGui::TableNextRow();
+        LabelCell("Master volume",
+                  "Master output volume multiplier. 1.0 is unity gain.");
+        ImGui::TableNextColumn();
+        float master = w.masterVolume;
+        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::SliderFloat("##mastervolume", &master, 0.0f, 4.0f, "%.2f")) {
+            w.masterVolume = master;
+            doc.MarkDirty();
+            PushLiveFloat(svms::RLCommandType::SetMasterVolume, master);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%.1f dB",
+                            20.0f * std::log10((std::max)(master, 0.001f)));
+        ImGui::TableNextColumn();
         if (lc.connected) LiveBadge("Applied live via RuntimeLink");
         AppliedStateBadge(lc.connected, lc.telemetry, w,
                           "Master-volume applied state vs working copy");
-    }
-    ImGui::TextDisabled("%.1f dB", 20.0f * std::log10(std::max(masterVol, 0.001f)));
 
-    float velCurve = w.velocityCurve;
-    if (SliderFloat("Velocity Curve", &velCurve, 0.1f, 10.0f, "%.2f",
-                    "Exponent applied to MIDI velocity. >1 boosts loud notes, "
-                    "<1 boosts quiet notes.")) {
-        w.velocityCurve = velCurve;
-        doc.MarkDirty();
-    }
+        ImGui::TableNextRow();
+        LabelCell("Velocity curve",
+                  "Exponent applied to MIDI velocity. Values above 1 emphasize loud notes; "
+                  "values below 1 lift quieter notes.");
+        ImGui::TableNextColumn();
+        float curve = w.velocityCurve;
+        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::SliderFloat("##velocitycurve", &curve, 0.1f, 10.0f, "%.2f")) {
+            w.velocityCurve = curve;
+            doc.MarkDirty();
+        }
+        RestartCell();
 
-    float velFloor = w.velocityFloor;
-    if (SliderFloat("Velocity Floor", &velFloor, 0.0f, 0.99f, "%.2f",
-                    "Velocities below this fraction of max are attenuated. "
-                    "Useful for shedding very quiet events under load.")) {
-        w.velocityFloor = velFloor;
-        doc.MarkDirty();
-    }
+        ImGui::TableNextRow();
+        LabelCell("Velocity floor",
+                  "Raises the minimum mapped loudness of notes that survive the ignore threshold. "
+                  "This is not the event-shedding threshold.");
+        ImGui::TableNextColumn();
+        float floor = w.velocityFloor;
+        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::SliderFloat("##velocityfloor", &floor, 0.0f, 0.99f, "%.2f")) {
+            w.velocityFloor = floor;
+            doc.MarkDirty();
+        }
+        RestartCell();
 
-    int velIgnore = static_cast<int>(w.velocityIgnoreBelow);
-    if (LabeledInt("Ignore velocity below", &velIgnore, 0, 127,
-                   "MIDI notes with velocity at or below this value are "
-                   "silently discarded.")) {
-        w.velocityIgnoreBelow = static_cast<uint32_t>(velIgnore);
-        doc.MarkDirty();
+        ImGui::TableNextRow();
+        LabelCell("Ignore velocity below",
+                  "MIDI note-ons with velocity strictly below this value are ignored. "
+                  "The threshold itself is still accepted.");
+        ImGui::TableNextColumn();
+        int ignore = static_cast<int>(w.velocityIgnoreBelow);
+        ImGui::SetNextItemWidth((std::min)(220.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::InputInt("##velocityignore", &ignore, 0, 0)) {
+            ignore = ImClamp(ignore, 0, 127);
+            w.velocityIgnoreBelow = static_cast<uint32_t>(ignore);
+            doc.MarkDirty();
+        }
+        RestartCell();
+
+        ImGui::EndTable();
     }
 
     ImGui::Spacing();
     SectionHeader("EVENT QUEUE");
 
-    static const char* overflowItems[] = { "Priority", "Lossless" };
-    int overflowIdx = w.overflowMode;
-    if (LabeledCombo("Overflow Mode", &overflowIdx, overflowItems, 2,
-                     "Priority: quiet note-ons may be discarded under severe "
-                     "queue pressure. Lossless: favors backpressure rather "
-                     "than event shedding.")) {
-        w.overflowMode = overflowIdx;
-        doc.MarkDirty();
-    }
+    if (BeginSettingsTable("##event_settings")) {
+        ImGui::TableNextRow();
+        LabelCell("Overflow mode",
+                  "Priority allows quiet note-ons to be shed under severe pressure. "
+                  "Lossless favors backpressure instead.");
+        ImGui::TableNextColumn();
+        static const char* modes[] = { "Priority", "Lossless" };
+        int mode = w.overflowMode;
+        ImGui::SetNextItemWidth((std::min)(300.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::Combo("##overflowmode", &mode, modes, 2)) {
+            w.overflowMode = mode;
+            doc.MarkDirty();
+        }
+        RestartCell();
 
-    int ringCap = static_cast<int>(w.eventRingCapacity);
-    if (LabeledInt("Ring Capacity", &ringCap, 4096, 1048576,
-                   "Size of the MIDI event ring buffer. Larger values "
-                   "absorb longer bursts but use more memory.")) {
-        w.eventRingCapacity = static_cast<uint32_t>(ringCap);
-        doc.MarkDirty();
-    }
+        ImGui::TableNextRow();
+        LabelCell("Ring capacity",
+                  "Total MIDI event ring capacity. Larger values absorb longer bursts but use more memory.");
+        ImGui::TableNextColumn();
+        if (InputU32("##ringcapacity", w.eventRingCapacity, 4096u, UINT32_MAX)) {
+            if (w.maxEventsPerBlock > w.eventRingCapacity)
+                w.maxEventsPerBlock = w.eventRingCapacity;
+            doc.MarkDirty();
+        }
+        RestartCell();
 
-    int hiPriVel = static_cast<int>(w.highPriorityVelocity);
-    if (LabeledInt("High-Priority Velocity", &hiPriVel, 1, 127,
-                   "MIDI note-ons at or above this velocity are protected "
-                   "from priority shedding.")) {
-        w.highPriorityVelocity = static_cast<uint32_t>(hiPriVel);
-        doc.MarkDirty();
-    }
+        ImGui::TableNextRow();
+        LabelCell("High-priority velocity",
+                  "MIDI note-ons at or above this velocity are protected from priority shedding.");
+        ImGui::TableNextColumn();
+        uint32_t high = w.highPriorityVelocity;
+        if (InputU32("##highpriority", high, 1u, 127u)) {
+            w.highPriorityVelocity = high;
+            doc.MarkDirty();
+        }
+        RestartCell();
 
-    int shedPct = static_cast<int>(w.shedStartPercent);
-    if (LabeledInt("Shed Start Percent", &shedPct, 1, 99,
-                   "Queue fill percentage at which priority shedding "
-                   "begins activating.")) {
-        w.shedStartPercent = static_cast<uint32_t>(shedPct);
-        doc.MarkDirty();
-    }
+        ImGui::TableNextRow();
+        LabelCell("Shed start percent",
+                  "Queue fill percentage where priority shedding begins.");
+        ImGui::TableNextColumn();
+        uint32_t shed = w.shedStartPercent;
+        if (InputU32("##shedstart", shed, 1u, 99u)) {
+            w.shedStartPercent = shed;
+            doc.MarkDirty();
+        }
+        RestartCell();
 
-    int maxEvts = static_cast<int>(w.maxEventsPerBlock);
-    if (LabeledInt("Max Events Per Block", &maxEvts, 1, 1048576,
-                   "Maximum MIDI events processed per audio callback. "
-                   "Cannot exceed ring capacity.")) {
-        w.maxEventsPerBlock = static_cast<uint32_t>(maxEvts);
-        doc.MarkDirty();
+        ImGui::TableNextRow();
+        LabelCell("Max events per block",
+                  "Maximum MIDI events processed during one audio callback. Must not exceed ring capacity.");
+        ImGui::TableNextColumn();
+        if (InputU32("##maxevents", w.maxEventsPerBlock, 1u,
+                     (std::max)(1u, w.eventRingCapacity))) {
+            doc.MarkDirty();
+        }
+        RestartCell();
+
+        ImGui::EndTable();
     }
 
     ImGui::Spacing();
     SectionHeader("MIDI INPUT");
-
-    // The driver ships winmm's midiIn* entry points for drop-in
-    // compatibility, but input routing to the synth is not implemented —
-    // they return MMSYSERR_BADDEVICEID.  Nothing to configure here yet.
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
-    ImGui::TextWrapped(
-        "MIDI In is not implemented: the winmm compatibility layer "
-        "exposes midiIn* entry points that return MMSYSERR_BADDEVICEID. "
-        "External controllers and virtual MIDI cables cannot drive the "
-        "synth yet.");
-    ImGui::PopStyleColor();
+    ImGui::TextDisabled(
+        "MIDI In routing is not implemented yet. The winmm midiIn* compatibility entry points "
+        "currently return MMSYSERR_BADDEVICEID.");
 }
 
 } // namespace svms::cfg
