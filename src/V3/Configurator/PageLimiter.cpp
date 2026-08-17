@@ -26,6 +26,12 @@ float MeterNorm(float linear) {
     return ImClamp((db - kMeterFloorDb) / -kMeterFloorDb, 0.0f, 1.0f);
 }
 
+void DrawCenteredText(ImDrawList* dl, float centerX, float y,
+                      ImU32 color, const char* text) {
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    dl->AddText(ImVec2(centerX - size.x * 0.5f, y), color, text);
+}
+
 struct GrHistory {
     float values[kGrHistoryCapacity]{};
     int writePos = 0;
@@ -43,6 +49,55 @@ struct GrHistory {
         return values[(start + i) % kGrHistoryCapacity];
     }
 };
+
+struct MeterVisualState {
+    float inL = 0.0f;
+    float inR = 0.0f;
+    float outL = 0.0f;
+    float outR = 0.0f;
+    float gr = 0.0f;
+    bool initialized = false;
+};
+
+float SmoothVisual(float current, float target, float dt,
+                   float riseSeconds, float fallSeconds) {
+    if (!std::isfinite(target)) target = 0.0f;
+    const float tau = target > current ? riseSeconds : fallSeconds;
+    const float safeTau = (std::max)(0.001f, tau);
+    const float alpha = 1.0f - std::exp(-dt / safeTau);
+    return current + (target - current) * ImClamp(alpha, 0.0f, 1.0f);
+}
+
+void UpdateMeterVisualState(MeterVisualState& state, bool telemetryAvailable,
+                            float inL, float inR, float gr,
+                            float outL, float outR) {
+    const float dt = ImClamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
+
+    if (telemetryAvailable && !state.initialized) {
+        state.inL = inL;
+        state.inR = inR;
+        state.outL = outL;
+        state.outR = outR;
+        state.gr = gr;
+        state.initialized = true;
+        return;
+    }
+
+    const float targetInL = telemetryAvailable ? inL : 0.0f;
+    const float targetInR = telemetryAvailable ? inR : 0.0f;
+    const float targetOutL = telemetryAvailable ? outL : 0.0f;
+    const float targetOutR = telemetryAvailable ? outR : 0.0f;
+    const float targetGr = telemetryAvailable ? gr : 0.0f;
+
+    // RuntimeLink telemetry intentionally arrives at ~30 Hz. Smooth the
+    // displayed meters every rendered/VSync frame so the visuals do not step
+    // at the IPC sampling rate. The history remains a true ~30 Hz history.
+    state.inL = SmoothVisual(state.inL, targetInL, dt, 0.012f, 0.120f);
+    state.inR = SmoothVisual(state.inR, targetInR, dt, 0.012f, 0.120f);
+    state.outL = SmoothVisual(state.outL, targetOutL, dt, 0.012f, 0.120f);
+    state.outR = SmoothVisual(state.outR, targetOutR, dt, 0.012f, 0.120f);
+    state.gr = SmoothVisual(state.gr, targetGr, dt, 0.020f, 0.140f);
+}
 
 void DrawLevelBar(const char* id, float linear, const ImVec2& size) {
     ImGui::PushID(id);
@@ -98,12 +153,14 @@ void DrawGrBar(const char* id, float reductionDb, const ImVec2& size) {
 void DrawDbScale(float x, float top, float height) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float ticks[] = { 0.0f, -3.0f, -6.0f, -12.0f, -24.0f, -48.0f, -60.0f };
+    const float fontH = ImGui::GetFontSize();
     for (float db : ticks) {
         const float norm = (db - kMeterFloorDb) / -kMeterFloorDb;
         const float y = top + height * (1.0f - norm);
         char text[16];
         std::snprintf(text, sizeof(text), "%.0f", db);
-        dl->AddText(ImVec2(x, y - ImGui::GetFontSize() * 0.5f),
+        const float textY = ImClamp(y - fontH * 0.5f, top, top + height - fontH);
+        dl->AddText(ImVec2(x, textY),
                     ImGui::GetColorU32(ImVec4(0.43f, 0.46f, 0.51f, 0.9f)), text);
     }
 }
@@ -111,15 +168,13 @@ void DrawDbScale(float x, float top, float height) {
 void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
                    float height) {
     const float avail = ImGui::GetContentRegionAvail().x;
-    const float labelColumn = 26.0f;
-    const float groupGap = 14.0f;
-    const float usable = (std::max)(220.0f, avail - labelColumn * 2.0f - groupGap * 2.0f);
-    const float groupW = usable / 3.0f;
-    const float stereoGap = 5.0f;
-    // Leave a little extra room for the dB text, but center the actual bars
-    // themselves inside each third instead of centering bars + scale together.
-    const float stereoBarW = (std::max)(18.0f, (groupW - 30.0f - stereoGap) * 0.5f);
-    const float grBarW = (std::max)(30.0f, groupW * 0.46f);
+    const float scaleGap = 5.0f;
+    const float scaleWidth = ImGui::CalcTextSize("-60").x;
+    const float stereoGap = 6.0f;
+    const float captionGap = 5.0f;
+    const float captionHeight = ImGui::GetFontSize() * 2.0f + captionGap + 4.0f;
+    const ImU32 captionColor = ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+    const ImU32 mainCaptionColor = ImGui::GetColorU32(ImVec4(0.82f, 0.84f, 0.87f, 1.0f));
 
     if (!ImGui::BeginTable("##meter_bank", 3, ImGuiTableFlags_SizingStretchSame)) return;
 
@@ -127,26 +182,41 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         ImGui::TableNextColumn();
         const float colStart = ImGui::GetCursorPosX();
         const float colAvail = ImGui::GetContentRegionAvail().x;
-        const float barsWidth = stereoBarW * 2.0f + stereoGap;
-        ImGui::SetCursorPosX(colStart + (colAvail - barsWidth) * 0.5f);
+
+        // Fit the complete visual group (bars + dB labels) inside the cell.
+        // The bars resize with the available width instead of letting labels
+        // drift or clip independently.
+        const float maxPairW = (std::max)(52.0f,
+            colAvail - scaleGap - scaleWidth - 12.0f);
+        const float pairW = (std::min)(112.0f, maxPairW);
+        const float barW = (std::max)(20.0f, (pairW - stereoGap) * 0.5f);
+        const float barsWidth = barW * 2.0f + stereoGap;
+        const float visualWidth = barsWidth + scaleGap + scaleWidth;
+        const float groupX = colStart + (colAvail - visualWidth) * 0.5f;
+
+        ImGui::SetCursorPosX(groupX);
         const ImVec2 screen = ImGui::GetCursorScreenPos();
 
         char idL[32], idR[32];
         std::snprintf(idL, sizeof(idL), "%sL", idPrefix);
         std::snprintf(idR, sizeof(idR), "%sR", idPrefix);
-        DrawLevelBar(idL, l, ImVec2(stereoBarW, height));
+        DrawLevelBar(idL, l, ImVec2(barW, height));
         ImGui::SameLine(0.0f, stereoGap);
-        DrawLevelBar(idR, r, ImVec2(stereoBarW, height));
-        DrawDbScale(screen.x + barsWidth + 4.0f, screen.y, height);
+        DrawLevelBar(idR, r, ImVec2(barW, height));
+        DrawDbScale(screen.x + barsWidth + scaleGap, screen.y, height);
 
-        ImGui::SetCursorPosX(colStart + (colAvail - barsWidth) * 0.5f);
-        ImGui::TextDisabled("L");
-        ImGui::SameLine(stereoBarW + stereoGap + 4.0f);
-        ImGui::TextDisabled("R");
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float labelsY = screen.y + height + 4.0f;
+        DrawCenteredText(dl, screen.x + barW * 0.5f,
+                         labelsY, captionColor, "L");
+        DrawCenteredText(dl, screen.x + barW + stereoGap + barW * 0.5f,
+                         labelsY, captionColor, "R");
+        DrawCenteredText(dl, screen.x + barsWidth * 0.5f,
+                         labelsY + ImGui::GetFontSize() + captionGap,
+                         mainCaptionColor, name);
 
-        const ImVec2 ts = ImGui::CalcTextSize(name);
-        ImGui::SetCursorPosX(colStart + (colAvail - ts.x) * 0.5f);
-        ImGui::TextUnformatted(name);
+        ImGui::SetCursorPosX(colStart);
+        ImGui::Dummy(ImVec2(1.0f, captionHeight));
     };
 
     stereoGroup("INPUT", "##input", inL, inR);
@@ -155,20 +225,34 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
     {
         const float colStart = ImGui::GetCursorPosX();
         const float colAvail = ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosX(colStart + (colAvail - grBarW) * 0.5f);
-        const ImVec2 screen = ImGui::GetCursorScreenPos();
-        DrawGrBar("##gain_reduction", gr, ImVec2(grBarW, height));
-        DrawDbScale(screen.x + grBarW + 4.0f, screen.y, height);
+        const float nameWidth = ImGui::CalcTextSize("GAIN REDUCTION").x;
+        const float maxBarW = (std::max)(44.0f,
+            colAvail - scaleGap - scaleWidth - 12.0f);
+        const float desiredBarW = (std::max)(72.0f, nameWidth + 12.0f);
+        const float barW = (std::min)(desiredBarW, maxBarW);
+        const float visualWidth = barW + scaleGap + scaleWidth;
+        const float groupX = colStart + (colAvail - visualWidth) * 0.5f;
 
-        const char* valueLabel = "GAIN REDUCTION";
-        const ImVec2 ts = ImGui::CalcTextSize(valueLabel);
-        ImGui::SetCursorPosX(colStart + (colAvail - ts.x) * 0.5f);
-        ImGui::TextUnformatted(valueLabel);
+        ImGui::SetCursorPosX(groupX);
+        const ImVec2 screen = ImGui::GetCursorScreenPos();
+        DrawGrBar("##gain_reduction", gr, ImVec2(barW, height));
+        DrawDbScale(screen.x + barW + scaleGap, screen.y, height);
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float centerX = screen.x + barW * 0.5f;
+        const float labelsY = screen.y + height + 4.0f;
+        DrawCenteredText(dl, centerX, labelsY,
+                         mainCaptionColor, "GAIN REDUCTION");
 
         const float db = ImClamp(gr, 0.0f, kGrMaxDb);
-        const char* fmt = db < 10.0f ? "%.1f dB" : "%.0f dB";
-        ImGui::SetCursorPosX(colStart + (colAvail - 60.0f) * 0.5f);
-        ImGui::TextDisabled(fmt, db);
+        char dbText[32];
+        std::snprintf(dbText, sizeof(dbText), db < 10.0f ? "%.1f dB" : "%.0f dB", db);
+        DrawCenteredText(dl, centerX,
+                         labelsY + ImGui::GetFontSize() + captionGap,
+                         captionColor, dbText);
+
+        ImGui::SetCursorPosX(colStart);
+        ImGui::Dummy(ImVec2(1.0f, captionHeight));
     }
 
     stereoGroup("OUTPUT", "##output", outL, outR);
@@ -271,10 +355,10 @@ void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr) {
         ImVec2 previous{};
         bool havePrevious = false;
         for (int i = 0; i < history.count; ++i) {
-            const float gr = history.AtOldestOffset(i);
+            const float histGr = history.AtOldestOffset(i);
             const float x = left + (right - left) *
                 (static_cast<float>(i) / static_cast<float>(history.count - 1));
-            const float y = top + plotH * (ImClamp(gr, 0.0f, kGrMaxDb) / kGrMaxDb);
+            const float y = top + plotH * (ImClamp(histGr, 0.0f, kGrMaxDb) / kGrMaxDb);
             const ImVec2 point(x, y);
             if (havePrevious) {
                 dl->AddLine(previous, point,
@@ -322,6 +406,7 @@ void DrawLimiterPage(ConfigDocument& doc) {
     const auto* t = lc.telemetry;
     const bool telemetryAvailable = lc.connected && t != nullptr;
     static GrHistory history;
+    static MeterVisualState meterVisuals;
 
     if (ImGui::BeginTable("##limiter_header", 3, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("enable", ImGuiTableColumnFlags_WidthFixed, 155.0f);
@@ -363,6 +448,9 @@ void DrawLimiterPage(ConfigDocument& doc) {
     const float outR = telemetryAvailable ? t->limiterOutputPeakR : 0.0f;
     const float gr = telemetryAvailable ? t->limiterGainReductionDb : 0.0f;
 
+    UpdateMeterVisualState(meterVisuals, telemetryAvailable,
+                           inL, inR, gr, outL, outR);
+
     const float availableWidth = ImGui::GetContentRegionAvail().x;
     const float topHeight = (std::max)(285.0f,
         (std::min)(360.0f, ImGui::GetContentRegionAvail().y * 0.52f));
@@ -380,7 +468,8 @@ void DrawLimiterPage(ConfigDocument& doc) {
         ImGui::TextDisabled("METERS");
         ImGui::Spacing();
         const float meterHeight = (std::max)(140.0f, topHeight - 102.0f);
-        DrawMeterBank(inL, inR, gr, outL, outR, meterHeight);
+        DrawMeterBank(meterVisuals.inL, meterVisuals.inR, meterVisuals.gr,
+                      meterVisuals.outL, meterVisuals.outR, meterHeight);
         ImGui::EndChild();
 
         ImGui::TableNextColumn();
