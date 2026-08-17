@@ -103,72 +103,130 @@ struct RuntimeConfigSnapshot {
 };
 
 // ── Atomic process-local live-config mailbox ───────────────────────────
-// POD struct of all live-tweakable parameters.  Published via a double-
-// buffer + atomic pointer pattern so the audio thread reads a consistent
-// snapshot without locks or spinlocks.
-//
-// Writer (control thread):  write to back buffer, then atomic_store the
-//   front pointer with release semantics.
-// Reader (audio thread):    atomic_load the front pointer with acquire
-//   semantics once per render block.
+// Every field is std::atomic so the audio thread's seqlock-guarded copy
+// never performs a non-atomic read while the control thread is writing.
+// Writer (control thread): bump liveMailboxSeq_ to ODD, store the fields,
+//   then bump to EVEN (release) — the sequence only ever increases, so no
+//   odd/even ABA and no torn capture can be mistaken for a settled one.
+// Reader (audio thread): load the sequence once per render block; copy
+//   only when even and unchanged after the copy; skip DSP application
+//   entirely when the sequence equals the last applied value.
+
+// Plain (non-atomic) mirror of the live mailbox, used by the control
+// thread as the last-applied echo and by the audio thread as its applied
+// record.  Never shared across threads directly.
+struct NonAtomicLiveConfigMailbox {
+    float masterVolume = 1.0f;
+    bool  correctnessMode = false;
+    bool  reverbEnabled = false;
+    float reverbMix = 0.25f;
+    float reverbRoomSize = 0.60f;
+    float reverbDecay = 0.50f;
+    float reverbDamping = 0.35f;
+    float reverbWidth = 1.0f;
+    float reverbDiffusion = 0.70f;
+    float reverbPreDelayMs = 12.0f;
+    float reverbEarlyLevel = 0.35f;
+    float reverbLateLevel = 0.85f;
+    float reverbModDepth = 0.30f;
+    float reverbModRate = 0.35f;
+    float reverbLowCutHz = 70.0f;
+    float reverbHighCutHz = 16000.0f;
+    bool  limiterEnabled = true;
+    float limiterThreshold = 0.95f;
+    float limiterAttackCoeff = 0.25f;
+    float limiterReleaseCoeff = 0.001f;
+    uint32_t limiterDelayFrames = 128;
+};
+
 struct LiveConfigMailbox {
     // Master
-    float masterVolume    = 1.0f;
-    bool correctnessMode  = false;
+    std::atomic<float> masterVolume{1.0f};
+    std::atomic<bool>  correctnessMode{false};
 
     // Reverb
-    bool  reverbEnabled   = false;
-    float reverbMix       = 0.25f;
-    float reverbRoomSize  = 0.60f;
-    float reverbDecay     = 0.50f;
-    float reverbDamping   = 0.35f;
-    float reverbWidth     = 1.0f;
-    float reverbDiffusion = 0.70f;
-    float reverbPreDelayMs    = 12.0f;
-    float reverbEarlyLevel    = 0.35f;
-    float reverbLateLevel     = 0.85f;
-    float reverbModDepth      = 0.30f;
-    float reverbModRate       = 0.35f;
-    float reverbLowCutHz      = 70.0f;
-    float reverbHighCutHz     = 16000.0f;
+    std::atomic<bool>  reverbEnabled{false};
+    std::atomic<float> reverbMix{0.25f};
+    std::atomic<float> reverbRoomSize{0.60f};
+    std::atomic<float> reverbDecay{0.50f};
+    std::atomic<float> reverbDamping{0.35f};
+    std::atomic<float> reverbWidth{1.0f};
+    std::atomic<float> reverbDiffusion{0.70f};
+    std::atomic<float> reverbPreDelayMs{12.0f};
+    std::atomic<float> reverbEarlyLevel{0.35f};
+    std::atomic<float> reverbLateLevel{0.85f};
+    std::atomic<float> reverbModDepth{0.30f};
+    std::atomic<float> reverbModRate{0.35f};
+    std::atomic<float> reverbLowCutHz{70.0f};
+    std::atomic<float> reverbHighCutHz{16000.0f};
 
     // Limiter
-    bool     limiterEnabled      = true;
-    float    limiterThreshold    = 0.95f;
-    float    limiterAttackCoeff  = 0.25f;
-    float    limiterReleaseCoeff = 0.001f;
-    uint32_t limiterDelayFrames  = 128;
+    std::atomic<bool>     limiterEnabled{true};
+    std::atomic<float>    limiterThreshold{0.95f};
+    std::atomic<float>    limiterAttackCoeff{0.25f};
+    std::atomic<float>    limiterReleaseCoeff{0.001f};
+    std::atomic<uint32_t> limiterDelayFrames{128};
 
     void InitFromEngineConfig(const EngineConfig& cfg, uint32_t sampleRate) {
-        masterVolume   = cfg.masterVolume;
-        correctnessMode = cfg.correctnessMode;
+        masterVolume.store(cfg.masterVolume, std::memory_order_relaxed);
+        correctnessMode.store(cfg.correctnessMode, std::memory_order_relaxed);
 
-        reverbEnabled   = cfg.enableReverb;
-        reverbMix       = cfg.reverbMix;
-        reverbRoomSize  = cfg.reverbRoomSize;
-        reverbDecay     = cfg.reverbDecay;
-        reverbDamping   = cfg.reverbDamping;
-        reverbWidth     = cfg.reverbWidth;
-        reverbDiffusion = cfg.reverbDiffusion;
-        reverbPreDelayMs    = cfg.reverbPreDelayMs;
-        reverbEarlyLevel    = cfg.reverbEarlyLevel;
-        reverbLateLevel     = cfg.reverbLateLevel;
-        reverbModDepth      = cfg.reverbModDepth;
-        reverbModRate       = cfg.reverbModRate;
-        reverbLowCutHz      = cfg.reverbLowCutHz;
-        reverbHighCutHz     = cfg.reverbHighCutHz;
+        reverbEnabled.store(cfg.enableReverb, std::memory_order_relaxed);
+        reverbMix.store(cfg.reverbMix, std::memory_order_relaxed);
+        reverbRoomSize.store(cfg.reverbRoomSize, std::memory_order_relaxed);
+        reverbDecay.store(cfg.reverbDecay, std::memory_order_relaxed);
+        reverbDamping.store(cfg.reverbDamping, std::memory_order_relaxed);
+        reverbWidth.store(cfg.reverbWidth, std::memory_order_relaxed);
+        reverbDiffusion.store(cfg.reverbDiffusion, std::memory_order_relaxed);
+        reverbPreDelayMs.store(cfg.reverbPreDelayMs, std::memory_order_relaxed);
+        reverbEarlyLevel.store(cfg.reverbEarlyLevel, std::memory_order_relaxed);
+        reverbLateLevel.store(cfg.reverbLateLevel, std::memory_order_relaxed);
+        reverbModDepth.store(cfg.reverbModDepth, std::memory_order_relaxed);
+        reverbModRate.store(cfg.reverbModRate, std::memory_order_relaxed);
+        reverbLowCutHz.store(cfg.reverbLowCutHz, std::memory_order_relaxed);
+        reverbHighCutHz.store(cfg.reverbHighCutHz, std::memory_order_relaxed);
 
-        limiterEnabled      = cfg.limiterEnabled;
-        limiterThreshold    = cfg.limiterThreshold;
-        limiterDelayFrames  = (std::min)(128u,
+        limiterEnabled.store(cfg.limiterEnabled, std::memory_order_relaxed);
+        limiterThreshold.store(cfg.limiterThreshold, std::memory_order_relaxed);
+        limiterDelayFrames.store((std::min)(128u,
             (std::max)(1u, static_cast<uint32_t>(
-                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f)));
+                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f))),
+            std::memory_order_relaxed);
         float attackSamples = (std::max)(1.0f,
             cfg.limiterAttackMs * sampleRate * 0.001f);
         float releaseSamples = (std::max)(1.0f,
             cfg.limiterReleaseMs * sampleRate * 0.001f);
-        limiterAttackCoeff  = 1.0f - std::exp(-1.0f / attackSamples);
-        limiterReleaseCoeff = 1.0f - std::exp(-1.0f / releaseSamples);
+        limiterAttackCoeff.store(1.0f - std::exp(-1.0f / attackSamples),
+                                 std::memory_order_relaxed);
+        limiterReleaseCoeff.store(1.0f - std::exp(-1.0f / releaseSamples),
+                                  std::memory_order_relaxed);
+    }
+
+    // Field-by-field copy (LiveConfigMailbox is not copy-assignable
+    // because of its atomic members).  Memory_order_relaxed is correct
+    // for both directions: the caller owns the seqlock sync.
+    void StoreToNonAtomic(svms::NonAtomicLiveConfigMailbox& out) const {
+        out.masterVolume = masterVolume.load(std::memory_order_relaxed);
+        out.correctnessMode = correctnessMode.load(std::memory_order_relaxed);
+        out.reverbEnabled = reverbEnabled.load(std::memory_order_relaxed);
+        out.reverbMix = reverbMix.load(std::memory_order_relaxed);
+        out.reverbRoomSize = reverbRoomSize.load(std::memory_order_relaxed);
+        out.reverbDecay = reverbDecay.load(std::memory_order_relaxed);
+        out.reverbDamping = reverbDamping.load(std::memory_order_relaxed);
+        out.reverbWidth = reverbWidth.load(std::memory_order_relaxed);
+        out.reverbDiffusion = reverbDiffusion.load(std::memory_order_relaxed);
+        out.reverbPreDelayMs = reverbPreDelayMs.load(std::memory_order_relaxed);
+        out.reverbEarlyLevel = reverbEarlyLevel.load(std::memory_order_relaxed);
+        out.reverbLateLevel = reverbLateLevel.load(std::memory_order_relaxed);
+        out.reverbModDepth = reverbModDepth.load(std::memory_order_relaxed);
+        out.reverbModRate = reverbModRate.load(std::memory_order_relaxed);
+        out.reverbLowCutHz = reverbLowCutHz.load(std::memory_order_relaxed);
+        out.reverbHighCutHz = reverbHighCutHz.load(std::memory_order_relaxed);
+        out.limiterEnabled = limiterEnabled.load(std::memory_order_relaxed);
+        out.limiterThreshold = limiterThreshold.load(std::memory_order_relaxed);
+        out.limiterAttackCoeff = limiterAttackCoeff.load(std::memory_order_relaxed);
+        out.limiterReleaseCoeff = limiterReleaseCoeff.load(std::memory_order_relaxed);
+        out.limiterDelayFrames = limiterDelayFrames.load(std::memory_order_relaxed);
     }
 };
 

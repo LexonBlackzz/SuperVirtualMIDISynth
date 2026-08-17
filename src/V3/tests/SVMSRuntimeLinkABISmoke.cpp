@@ -42,8 +42,8 @@ void TestConstants() {
     CHECK_EQ(svms::RLV2_PadTo64(1), 64u, "PadTo64(1) must be 64");
     CHECK_EQ(svms::RLV2_PadTo64(64), 64u, "PadTo64(64) must be 64");
     CHECK_EQ(svms::RLV2_PadTo64(65), 128u, "PadTo64(65) must be 128");
-    CHECK_EQ(svms::RLV2_SnapshotSettledSequence, 2u,
-             "snapshot settled sequence must be 2");
+    CHECK_EQ(svms::RLV2_SnapshotSettledParity, 0,
+             "snapshot settled parity must be 0 (even sequence)");
 }
 
 void TestPODLayout() {
@@ -51,7 +51,6 @@ void TestPODLayout() {
     CHECK(svms::RLV2_FloatBits(1.0f) != 0, "FloatBits store must not be 0");
 
     // Hand-computed sizes must hold (guards against padding drift).
-    CHECK_EQ(sizeof(svms::AtomicFloatBits), 4u, "AtomicFloatBits must be 4 bytes");
     CHECK_EQ(sizeof(svms::RuntimeLiveStateV2), 92u,
              "RuntimeLiveStateV2 must be 92 bytes (12 + 18*4 + 8)");
     CHECK_EQ(sizeof(svms::RuntimeLinkHeaderV2), 64u,
@@ -172,24 +171,17 @@ void TestHeaderCrc() {
     CHECK(svms::RLV2_HeaderCrc(h) != crc, "crc must change with version");
 }
 
-void TestAtomicFloatBits() {
-    svms::AtomicFloatBits af{};
-    float v = 0.0f;
-    CHECK(!af.TryLoad(v, 1u), "empty AtomicFloatBits must reject stamp 1");
-
-    af.Store(1.25f, 1u);
-    CHECK(af.TryLoad(v, 1u) && v == 1.25f, "Store/TryLoad round trip must match");
-    CHECK(!af.TryLoad(v, 0u), "mismatched stamp must fail TryLoad");
-
-    af.Store(-7.5f, 1u);
-    CHECK(af.TryLoad(v, 1u) && v == -7.5f, "negative float round trip must match");
-
-    // Bit 0 is the stamp; the sender's float payload must survive.
-    af.Store(0.5f, 1u);
-    const uint32_t bits = af.bits;
-    CHECK((bits & 1u) == 1u, "bit 0 must carry the stamp");
-    CHECK(svms::RLV2_BitsToFloat(bits & ~1u) == 0.5f,
-          "float payload must sit in bits 31..1");
+void TestFloatBits() {
+    // Exact IEEE bit-pattern transports: identity and negative values.
+    CHECK(svms::RLV2_BitsToFloat(svms::RLV2_FloatBits(1.25f)) == 1.25f,
+          "float→bits→float round trip must match");
+    CHECK(svms::RLV2_BitsToFloat(svms::RLV2_FloatBits(-7.5f)) == -7.5f,
+          "negative float round trip must match");
+    CHECK(svms::RLV2_BitsToFloat(svms::RLV2_FloatBits(0.0f)) == 0.0f,
+          "zero round trip must match");
+    const uint32_t bits = svms::RLV2_FloatBits(0.5f);
+    CHECK(bits != 0u, "float bits must be nonzero");
+    CHECK(svms::RLV2_BitsToFloat(bits) == 0.5f, "bits→float must match 0.5f");
 }
 
 void TestEnumCompleteness() {
@@ -312,35 +304,42 @@ void TestHostsRegistry() {
 
 void TestSnapshotProtocol() {
     svms::RuntimeAudioSnapshot snap{};
-    CHECK(snap.sequence == svms::RLV2_SnapshotSettledSequence,
-          "fresh snapshot must start settled");
-    CHECK(snap.tickMs == 0, "fresh snapshot tickMs must be 0");
+    CHECK_EQ(snap.sequence.load(std::memory_order_relaxed) & 1u,
+             svms::RLV2_SnapshotSettledParity,
+             "fresh snapshot must start settled (even sequence)");
 
-    // Simulate an audio-thread publish: flags *within* the writer side
-    // (odd sequence), payload stores, then the settle word (even).
-    snap.sequence = 1;
-    snap.activeVoices.Store(1234.0f, 1u);
-    snap.releasingVoices.Store(99.0f, 1u);
-    snap.eventsSubmitted = 9999;
-    snap.limiterInputPeakL.Store(0.75f, 1u);
-    snap.sequence = svms::RLV2_SnapshotSettledSequence;
+    // Simulate an audio-thread publish: odd sequence, payload stores,
+    // then the settle word (even, monotonic +2 from the apex).
+    const uint32_t startSeq = snap.sequence.load(std::memory_order_relaxed);
+    snap.sequence.store(startSeq | 1u, std::memory_order_relaxed);
+    snap.activeVoices.store(1234u, std::memory_order_relaxed);
+    snap.releasingVoices.store(99u, std::memory_order_relaxed);
+    snap.limiterInputPeakLBits.store(svms::RLV2_FloatBits(0.75f),
+                                     std::memory_order_relaxed);
+    snap.eventsSubmitted.store(9999u, std::memory_order_relaxed);
+    snap.sequence.store(startSeq + 2u, std::memory_order_release);
 
-    // Settled copy must read every field through the stamp.
-    const svms::RuntimeAudioSnapshot& settled = snap;
-    float f = 0.0f;
-    CHECK(settled.activeVoices.TryLoad(f, 1u) && f == 1234.0f,
-          "settled activeVoices must read back");
-    CHECK(settled.releasingVoices.TryLoad(f, 1u) && f == 99.0f,
-          "settled releasingVoices must read back");
-    CHECK(settled.limiterInputPeakL.TryLoad(f, 1u) && f == 0.75f,
+    // Settled copy must read every field.
+    CHECK_EQ(snap.sequence.load(std::memory_order_acquire), startSeq + 2u,
+             "settled sequence must advance by exactly 2");
+    CHECK_EQ(snap.activeVoices.load(std::memory_order_relaxed), 1234u,
+             "settled activeVoices must read back");
+    CHECK_EQ(snap.releasingVoices.load(std::memory_order_relaxed), 99u,
+             "settled releasingVoices must read back");
+    CHECK(svms::RLV2_BitsToFloat(
+              snap.limiterInputPeakLBits.load(std::memory_order_relaxed)) == 0.75f,
           "settled limiter meter must read back");
-    CHECK(settled.sequence == 2u, "settled sequence must be 2");
-    CHECK(settled.eventsSubmitted == 9999u, "settled u64 counter must read back");
+    CHECK_EQ(snap.eventsSubmitted.load(std::memory_order_relaxed), 9999u,
+             "settled u64 counter must read back");
 
-    // A torn snapshot (sequence==1) must be identifiable.
-    snap.sequence = 1;
-    CHECK(snap.sequence != svms::RLV2_SnapshotSettledSequence,
-          "writer-in-progress sequence must be detectable");
+    // The sequence is strictly monotonic: a writer-in-progress (odd)
+    // sequence must be detectable and the word must never go backwards.
+    const uint32_t even2 = snap.sequence.load(std::memory_order_relaxed);
+    snap.sequence.store(even2 | 1u, std::memory_order_relaxed);
+    CHECK_EQ(snap.sequence.load(std::memory_order_relaxed) & 1u, 1u,
+             "writer-in-progress sequence must be detectable (odd)");
+    CHECK(snap.sequence.load(std::memory_order_relaxed) > even2,
+          "sequenced word must never go backwards");
 }
 
 void TestResultStrings() {
@@ -377,7 +376,7 @@ int main() {
     TestCommandLayout();
     TestMappingOffsets();
     TestHeaderCrc();
-    TestAtomicFloatBits();
+    TestFloatBits();
     TestEnumCompleteness();
     TestGroups();
     TestNamingConventions();

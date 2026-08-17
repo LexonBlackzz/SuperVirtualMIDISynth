@@ -4,6 +4,7 @@
 #include "SVMSTypes.h"
 #include "SVMSEnvelope.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -261,6 +262,18 @@ public:
     uint32_t retireCount_;
     uint32_t retireImmediateCount_;
     uint32_t stealCount_;
+
+    // Exact count of voices currently in the Releasing state, maintained
+    // O(1) at every state transition.  Audio-thread-only writes; read by
+    // the audio thread for telemetry.  Atomic so a diagnostic reader can
+    // never observe a torn value, at zero cost for the single-threaded
+    // transitions (uncontended atomic load/store on x86/x64 is a plain
+    // mov).
+    std::atomic<uint32_t> releasingCount_{0u};
+
+    uint32_t GetReleasingCount() const {
+        return releasingCount_.load(std::memory_order_relaxed);
+    }
 
 private:
     struct StealCandidate {
@@ -778,6 +791,7 @@ inline void VoiceManager::Reset() {
     lastLinkedPlayIndex_ = UINT32_MAX;
     lastLinkedPlayVoice_ = kInvalidVoice;
     freeTop_ = maxVoices_;
+    releasingCount_.store(0u, std::memory_order_relaxed);
     for (uint32_t i = 0; i < maxVoices_; ++i) {
         v.state[i] = static_cast<uint8_t>(VoiceState::Free);
         v.nextChannelKeyVoice[i] = -1;
@@ -1463,6 +1477,8 @@ inline void VoiceManager::RetireStolenSibling(VoiceHandle handle,
     if (stealHeapValid_) RemoveStealCandidate(handle);
     CaptureStealTail(handle);
     ++stealCount_;
+    if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
+        releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
     UnlinkChannelKey(handle);
     UnlinkPlayGroup(handle);
     UnlinkChannelActive(handle);
@@ -1938,6 +1954,8 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
 
     // Retire the victim.
     ++stealCount_;
+    if (v.state[bestIdx] == static_cast<uint8_t>(VoiceState::Releasing))
+        releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
     UnlinkChannelKey(static_cast<VoiceHandle>(bestIdx));
     UnlinkPlayGroup(static_cast<VoiceHandle>(bestIdx));
     UnlinkChannelActive(static_cast<VoiceHandle>(bestIdx));
@@ -2022,6 +2040,7 @@ inline void VoiceManager::StartRelease(VoiceHandle handle) {
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active)) {
         UnlinkChannelKey(handle);
         v.state[handle] = static_cast<uint8_t>(VoiceState::Releasing);
+        releasingCount_.fetch_add(1u, std::memory_order_relaxed);
         // SF2 sampleModes 3 = loop during key depression: stop looping so the
         // sample plays out to its end through the release tail.
         if (v.loopMode[handle] == 3) v.loopEnabled[handle] = 0;
@@ -2035,6 +2054,11 @@ inline void VoiceManager::RetireVoice(VoiceHandle handle) {
 
     ++retireCount_;
     if (GetVoiceAge(handle) < 2) ++retireImmediateCount_;
+
+    const bool wasReleasing =
+        v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing);
+    if (wasReleasing)
+        releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
 
     // Stable one-shot retirement is cheap to maintain incrementally. Release
     // storms can retire hundreds of volatile voices in one span; updating a
@@ -2241,11 +2265,13 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const bool preserveRenderIndex =
         v.renderClass[handle] == desiredClassValue;
 
-    CaptureStealTail(handle);
+CaptureStealTail(handle);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const uint64_t profileAfterTail = profileLaunch ? __rdtsc() : 0u;
 #endif
     ++stealCount_;
+    if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
+        releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
     UnlinkChannelKey(handle);
     if (!preserveChannelIndex) MoveChannelActiveInPlace(handle, channel);
     if (!preserveRenderIndex) UnlinkRenderClass(handle);
@@ -2405,9 +2431,11 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         const VoiceRenderClass desiredClass =
             ClassifyConfiguration(setups[i]);
         const uint8_t configuredClass = static_cast<uint8_t>(desiredClass);
-        const bool preserveRenderIndex = candidatesReservedInPlace &&
+const bool preserveRenderIndex = candidatesReservedInPlace &&
             v.renderClass[handle] == configuredClass;
         ++stealCount_;
+        if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
+            releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
         UnlinkChannelKey(handle);
         UnlinkPlayGroup(handle);
         if (!preserveChannelIndex) UnlinkChannelActive(handle);

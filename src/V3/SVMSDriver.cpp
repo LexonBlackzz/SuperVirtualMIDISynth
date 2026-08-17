@@ -414,6 +414,50 @@ struct ReverbState {
     uint32_t configuredSampleRate = 44100u;
 
     // =====================================================================
+    // Live-change morph targets
+    //
+    // Delay lengths never jump: UpdateDerived() writes the *target* values
+    // here, and Process() glides the current values toward them by a small
+    // per-sample step.  A length step on a ring buffer is otherwise a
+    // splice (read-position jump = click); the glide turns it into a brief
+    // pitch/behaviour wobble instead.  Coefficients (feedback, damping,
+    // filter alphas, gains) apply instantly — a coefficient step is a
+    // smooth amplitude/tone transition on material already in the lines.
+    // =====================================================================
+
+    uint32_t preDelayLengthTarget = 0u;
+    uint32_t allpassLengthTarget[2][kInputDiffusers]{
+        {1u, 1u},
+        {1u, 1u}
+    };
+    uint32_t earlyTapFramesTarget[kEarlyTapCount][2]{};
+    float fdnBaseDelayFramesTarget[kFdnLines]{};
+
+    // True while any delay-length current differs from its target.
+    // UpdateDerived() arms it (it runs only when live reverb parameters
+    // actually changed); Process() clears it once every glide lands.
+    bool gliding_ = false;
+
+    static uint32_t GlideU32(uint32_t current, uint32_t target,
+                             uint32_t step) noexcept {
+        if (current < target) {
+            const uint32_t next = current + step;
+            return next > target ? target : next;
+        }
+        if (current > target) {
+            const uint32_t next = current - step;
+            return next < target ? target : next;
+        }
+        return current;
+    }
+
+    static float GlideF32(float current, float target, float step) noexcept {
+        if (current < target) return (std::min)(target, current + step);
+        if (current > target) return (std::max)(target, current - step);
+        return current;
+    }
+
+    // =====================================================================
     // Helpers
     // =====================================================================
 
@@ -566,6 +610,13 @@ struct ReverbState {
                 ? 0u
                 : p + 1u;
 
+        // Safety wrap: if the length ever lands below the advancing
+        // position (shrinking lengths are glided, but a stale position
+        // from a reparameterization would otherwise walk past the wrap
+        // condition and read out of the ring until the buffer edge).
+        if (allpassPosition[channel][stage] >= kAllpassBufferFrames)
+            allpassPosition[channel][stage] = 0u;
+
         return output;
     }
 
@@ -585,6 +636,27 @@ struct ReverbState {
             sizeof(fdnDampingState));
 
         fdnWritePosition = 0u;
+
+        // Seed the FDN LFOs with their spread initial phases.  Live
+        // reparameterizations preserve the phase (UpdateDerived only
+        // rewrites the increments); Reset is the init/reload point where
+        // a fresh phase is wanted.
+        static constexpr float kInitialPhase[kFdnLines] =
+        {
+            0.03f,
+            0.17f,
+            0.31f,
+            0.46f,
+            0.59f,
+            0.71f,
+            0.83f,
+            0.94f
+        };
+        for (uint32_t i = 0u; i < kFdnLines; ++i) {
+            const float angle = 2.0f * kPi * kInitialPhase[i];
+            lfoSin[i] = std::sin(angle);
+            lfoCos[i] = std::cos(angle);
+        }
 
         std::memset(
             allpassDelay,
@@ -811,8 +883,14 @@ struct ReverbState {
                     2.0f,
                     maximumBase);
 
-            fdnBaseDelayFrames[i] =
+            fdnBaseDelayFramesTarget[i] =
                 baseFrames;
+
+            // Snap the current length on the first update (and on
+            // Configure/Reset, where the lines are empty anyway); later
+            // live changes are glided by Process().
+            if (fdnBaseDelayFrames[i] == 0.0f)
+                fdnBaseDelayFrames[i] = baseFrames;
 
             fdnModDepthFrames[i] =
                 modFrames;
@@ -878,20 +956,42 @@ struct ReverbState {
              i < kInputDiffusers;
              ++i)
         {
-            allpassLength[0][i] =
+            const uint32_t targetL =
                 MsToFrames(
                     kDiffuserMs[i] *
                     diffuserScale,
                     configuredSampleRate,
                     kAllpassBufferFrames);
 
-            allpassLength[1][i] =
+            const uint32_t targetR =
                 MsToFrames(
                     (kDiffuserMs[i] +
                      kRightOffsetMs[i]) *
                     diffuserScale,
                     configuredSampleRate,
                     kAllpassBufferFrames);
+
+            allpassLengthTarget[0][i] =
+                targetL;
+            allpassLengthTarget[1][i] =
+                targetR;
+
+            // First-time snap; live changes are glided in Process().
+            if (allpassLength[0][i] == 0u)
+                allpassLength[0][i] = targetL;
+            if (allpassLength[1][i] == 0u)
+                allpassLength[1][i] = targetR;
+
+            // Ring-cursor normalization: a position past the (possibly
+            // shrunken) length would never hit the wrap condition and
+            // would read stale or out-of-wrap content until it wrapped
+            // at the buffer edge; ProcessAllpass now also wraps at the
+            // buffer edge, so clamp here for the warm-up case only.
+            for (uint32_t ch = 0u; ch < 2u; ++ch) {
+                const uint32_t len = allpassLength[ch][i];
+                allpassPosition[ch][i] =
+                    (std::min)(allpassPosition[ch][i], len != 0u ? len - 1u : 0u);
+            }
         }
 
         allpassFeedback =
@@ -904,15 +1004,23 @@ struct ReverbState {
         // =============================================================
 
         if (preDelayMs <= 0.0f) {
-            preDelayLength = 0u;
+            preDelayLengthTarget = 0u;
         }
         else {
-            preDelayLength =
+            preDelayLengthTarget =
                 MsToFrames(
                     preDelayMs,
                     configuredSampleRate,
                     kPreDelayBufferFrames - 1u);
         }
+
+        // First-time snap (glided on live changes by Process()).
+        preDelayLength =
+            preDelayLengthTarget == 0u
+                ? 0u
+                : (preDelayLength != 0u
+                       ? preDelayLength
+                       : preDelayLengthTarget);
 
         // =============================================================
         // Early reflections
@@ -949,20 +1057,31 @@ struct ReverbState {
              i < kEarlyTapCount;
              ++i)
         {
-            earlyTapFrames[i][0] =
+            const uint32_t target0 =
                 MsToFrames(
                     kEarlyMs[i] *
                     earlyScale,
                     configuredSampleRate,
                     kEarlyBufferFrames - 1u);
 
-            earlyTapFrames[i][1] =
+            const uint32_t target1 =
                 MsToFrames(
                     (kEarlyMs[i] +
                      kEarlyStereoOffsetMs[i]) *
                     earlyScale,
                     configuredSampleRate,
                     kEarlyBufferFrames - 1u);
+
+            earlyTapFramesTarget[i][0] =
+                target0;
+            earlyTapFramesTarget[i][1] =
+                target1;
+
+            // First-time snap; live changes are glided in Process().
+            if (earlyTapFrames[i][0] == 0u)
+                earlyTapFrames[i][0] = target0;
+            if (earlyTapFrames[i][1] == 0u)
+                earlyTapFrames[i][1] = target1;
         }
 
         // =============================================================
@@ -990,19 +1109,6 @@ struct ReverbState {
         // =============================================================
 
         static constexpr float
-            kInitialPhase[kFdnLines] =
-        {
-            0.03f,
-            0.17f,
-            0.31f,
-            0.46f,
-            0.59f,
-            0.71f,
-            0.83f,
-            0.94f
-        };
-
-        static constexpr float
             kRateMultiplier[kFdnLines] =
         {
             0.79f,
@@ -1026,17 +1132,12 @@ struct ReverbState {
              i < kFdnLines;
              ++i)
         {
-            const float initialAngle =
-                2.0f *
-                kPi *
-                kInitialPhase[i];
-
-            lfoSin[i] =
-                std::sin(initialAngle);
-
-            lfoCos[i] =
-                std::cos(initialAngle);
-
+            // LFO PHASE IS PRESERVED across live reparameterizations:
+            // only the per-sample increment is recomputed, so a modRate
+            // change sweeps the existing oscillator rather than resetting
+            // it (the old code re-seeded sin/cos to the initial phase on
+            // every UpdateDerived call, making each knob move restart the
+            // modulation pattern).
             const float rateHz =
                 baseRateHz *
                 kRateMultiplier[i];
@@ -1054,6 +1155,11 @@ struct ReverbState {
             lfoCosIncrement[i] =
                 std::cos(increment);
         }
+
+        // Arm the per-sample glides.  UpdateDerived only runs when live
+        // reverb parameters changed (or on init/reload), so this flag is
+        // not a per-block cost.
+        gliding_ = true;
     }
 
     // =====================================================================
@@ -1076,6 +1182,47 @@ struct ReverbState {
 
         const float dryGain =
             1.0f - mix;
+
+        // =============================================================
+        // Delay-length glides (click-free live parameter changes)
+        //
+        // UpdateDerived() writes targets; here the current lengths creep
+        // toward them by one frame per sample (FDN base delays by 1/4
+        // frame — the read is interpolated, so a slower creep sounds
+        // smoother).  A stepped ring length would be a splice/click.
+        // =============================================================
+        if (gliding_) {
+            gliding_ = false;
+            preDelayLength = GlideU32(preDelayLength,
+                                      preDelayLengthTarget, 1u);
+            if (preDelayLength != preDelayLengthTarget) gliding_ = true;
+            for (uint32_t ch = 0u; ch < 2u; ++ch) {
+                for (uint32_t i = 0u; i < kInputDiffusers; ++i) {
+                    allpassLength[ch][i] = GlideU32(
+                        allpassLength[ch][i],
+                        allpassLengthTarget[ch][i], 1u);
+                    if (allpassLength[ch][i] != allpassLengthTarget[ch][i])
+                        gliding_ = true;
+                }
+            }
+            for (uint32_t i = 0u; i < kEarlyTapCount; ++i) {
+                earlyTapFrames[i][0] = GlideU32(
+                    earlyTapFrames[i][0], earlyTapFramesTarget[i][0], 1u);
+                if (earlyTapFrames[i][0] != earlyTapFramesTarget[i][0])
+                    gliding_ = true;
+                earlyTapFrames[i][1] = GlideU32(
+                    earlyTapFrames[i][1], earlyTapFramesTarget[i][1], 1u);
+                if (earlyTapFrames[i][1] != earlyTapFramesTarget[i][1])
+                    gliding_ = true;
+            }
+            for (uint32_t i = 0u; i < kFdnLines; ++i) {
+                fdnBaseDelayFrames[i] = GlideF32(
+                    fdnBaseDelayFrames[i],
+                    fdnBaseDelayFramesTarget[i], 0.25f);
+                if (fdnBaseDelayFrames[i] != fdnBaseDelayFramesTarget[i])
+                    gliding_ = true;
+            }
+        }
 
         // Fixed early reflection gains.
         static constexpr float
@@ -1566,9 +1713,16 @@ struct LimiterState {
 
     float delayBuffer[kMaxDelayFrames * 2];
     uint32_t delayWritePos = 0;
+    // Current lookahead length, glided per sample toward delayFramesTarget
+    // so a live lookahead change morphs the read position instead of
+    // splicing the delay ring (click).
     uint32_t delayFrames = 128;
-    float envelope = 0.0f;
+    uint32_t delayFramesTarget = 128;
+    // Current threshold, glided toward thresholdTarget (a threshold step
+    // while the envelope is above it would otherwise jump the gain).
     float threshold = 0.95f;
+    float thresholdTarget = 0.95f;
+    float envelope = 0.0f;
     float attackCoeff = 0.25f;
     float releaseCoeff = 0.001f;
     bool enabled = true;
@@ -1586,6 +1740,8 @@ struct LimiterState {
         std::memset(delayBuffer, 0, sizeof(delayBuffer));
         delayWritePos = 0;
         envelope = 0.0f;
+        delayFrames = delayFramesTarget;
+        threshold = thresholdTarget;
         inputPeakL = inputPeakR = outputPeakL = outputPeakR = 0.0f;
         gainReductionDb = 0.0f;
     }
@@ -1593,10 +1749,12 @@ struct LimiterState {
     void Configure(uint32_t sampleRate, const EngineConfig& cfg) {
         Reset();
         enabled = cfg.limiterEnabled;
-        threshold = cfg.limiterThreshold;
-        delayFrames = (std::min)(kMaxDelayFrames,
+        thresholdTarget = cfg.limiterThreshold;
+        threshold = thresholdTarget;
+        delayFramesTarget = (std::min)(kMaxDelayFrames,
             (std::max)(1u, static_cast<uint32_t>(
                 cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f)));
+        delayFrames = delayFramesTarget;
         const float attackSamples = (std::max)(1.0f,
             cfg.limiterAttackMs * sampleRate * 0.001f);
         const float releaseSamples = (std::max)(1.0f,
@@ -1612,7 +1770,10 @@ struct LimiterState {
 
         if (!enabled) {
             // Bypass: no limiting, so the meters just mirror the
-            // passthrough signal (input == output).
+            // passthrough signal (input == output).  The delay ring keeps
+            // being written (and the lookahead length keeps gliding) so a
+            // re-enable is seamless instead of reading stale pre-bypass
+            // audio.
             for (uint32_t f = 0; f < numFrames; ++f) {
                 const float inL = interleaved[f * channels];
                 const float inR = (channels > 1) ? interleaved[f * channels + 1] : inL;
@@ -1620,6 +1781,15 @@ struct LimiterState {
                 const float aR = inR > 0.0f ? inR : -inR;
                 if (aL > inputPeakL) inputPeakL = aL;
                 if (aR > inputPeakR) inputPeakR = aR;
+
+                if (delayFrames != delayFramesTarget)
+                    delayFrames = ReverbState::GlideU32(
+                        delayFrames, delayFramesTarget, 1u);
+
+                const uint32_t dw = delayWritePos * channels;
+                delayBuffer[dw] = inL;
+                delayBuffer[dw + 1] = inR;
+                delayWritePos = (delayWritePos + 1) % delayFrames;
             }
             outputPeakL = inputPeakL;
             outputPeakR = inputPeakR;
@@ -1630,6 +1800,15 @@ struct LimiterState {
         for (uint32_t f = 0; f < numFrames; ++f) {
             float inL = interleaved[f * channels];
             float inR = (channels > 1) ? interleaved[f * channels + 1] : inL;
+
+            // Click-free live updates: glide the lookahead read position
+            // and the threshold instead of stepping them.
+            if (delayFrames != delayFramesTarget)
+                delayFrames = ReverbState::GlideU32(
+                    delayFrames, delayFramesTarget, 1u);
+            if (threshold != thresholdTarget)
+                threshold = ReverbState::GlideF32(
+                    threshold, thresholdTarget, 0.0005f);
 
             float absL = inL > 0 ? inL : -inL;
             float absR = inR > 0 ? inR : -inR;
@@ -1897,15 +2076,17 @@ private:
 
     // ── Atomic live-config mailbox (seqlock) ─────────────────────────
     // The control thread is the ONLY writer.  It bumps liveMailboxSeq_
-    // to ODD, writes the mailbox fields, then bumps to EVEN (release).
+    // to ODD, stores the atomic fields, then bumps to EVEN (release).
     // The audio thread reads once per render block: if the sequence is
     // even and unchanged after the copy, the copy is torn-free; otherwise
-    // it falls back to liveMailboxApplied_ (the last stable read).  No
+    // it falls back to appliedMailbox_ (the last state it applied).  No
     // locks, no torn reads, no ABA (single writer, monotonically even
-    // sequence values 2, 4, 6, ...).
+    // sequence values 2, 4, 6, ...).  DSP application is skipped entirely
+    // when the sequence equals lastAppliedLiveSeq_, so derived
+    // recomputation (reverb.UpdateDerived, limiter targets) happens only
+    // when live values actually changed.
     svms::LiveConfigMailbox liveMailbox_;
     std::atomic<uint32_t> liveMailboxSeq_{2u};
-    svms::LiveConfigMailbox liveMailboxApplied_;
 
     // Last master volume the audio thread actually folded into playing
     // voices' mix gains.  Audio-thread only.
@@ -1955,13 +2136,28 @@ private:
     // thread for telemetry.  Never touched by the audio thread.
     wchar_t loadedSoundFontPath_[MAX_PATH] = {};
 
-    uint32_t lastReleasingVoices_ = 0;
-    uint32_t releasingScanTick_ = 0;
+    // Audio-thread record of the LAST live state it actually applied
+    // (from the mailbox seqlock), plus the mailbox sequence that
+    // produced it.  The control thread reads both for the telemetry
+    // "applied live" echo; the release/acquire pair on appliedSeq_
+    // makes the plain appliedMailbox_ copy coherent on the reader side.
+    svms::NonAtomicLiveConfigMailbox appliedMailbox_;
+    std::atomic<uint32_t> appliedSeq_{2u};
 
-    // Control-thread-owned echo of the live parameters the audio thread
-    // is applying (via the mailbox).  Published in RuntimeLink telemetry.
+    // Audio-thread-only: the most recent mailbox sequence folded into
+    // the render path.  The DSP apply (incl. reverb.UpdateDerived) is
+    // skipped entirely when it equals the latest publish, so derived
+    // recomputation happens only when live values actually changed.
+    uint32_t lastAppliedLiveSeq_ = 0u;
+
+    // Control-thread-owned telemetry echo bookkeeping: the last applied
+    // sequence the control thread echoed, the sequence of the last
+    // ApplyLiveConfig publish, and the cached RuntimeLiveStateV2 echoed
+    // to telemetry.  Control-thread-only.
 #if !defined(SVMS_XP_COMPAT)
-    svms::RuntimeLiveStateV2 appliedLive_;
+    uint32_t lastEchoedAppliedSeq_ = 0u;
+    uint32_t lastPublishedMailboxSeq_ = 2u;
+    svms::RuntimeLiveStateV2 appliedLiveEcho_{};
 #endif
 
     CRITICAL_SECTION cs;
@@ -1992,9 +2188,21 @@ static svms::RuntimeAudioSnapshot g_audioSnapshot;
 // no torn reads).  Heavy commands (ReloadSoundFont) run here, never on
 // the audio thread; ResetVoices routes through the SPSC ingress exactly
 // like midiOutReset so the audio thread performs the release work.
+static uint32_t FloatToU32Bits(float value) noexcept {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static float U32BitsToFloat(uint32_t bits) noexcept {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 #if !defined(SVMS_XP_COMPAT)
 static svms::RuntimeLiveStateV2 LiveStateFromMailbox(
-    const LiveConfigMailbox& mb, uint32_t sampleRate) {
+    const NonAtomicLiveConfigMailbox& mb, uint32_t sampleRate) {
     svms::RuntimeLiveStateV2 l{};
     l.masterVolume = mb.masterVolume;
     l.correctnessMode = mb.correctnessMode ? 1u : 0u;
@@ -2016,11 +2224,13 @@ static svms::RuntimeLiveStateV2 LiveStateFromMailbox(
     l.limiterThreshold = mb.limiterThreshold;
     l.limiterLookaheadMs = static_cast<float>(mb.limiterDelayFrames)
                          / sampleRate * 1000.0f;
-    l.limiterAttackMs = mb.limiterAttackCoeff > 0.0f
-        ? -1000.0f / (sampleRate * std::log(1.0f - mb.limiterAttackCoeff))
+    const float attackCoeff = mb.limiterAttackCoeff;
+    const float releaseCoeff = mb.limiterReleaseCoeff;
+    l.limiterAttackMs = attackCoeff > 0.0f
+        ? -1000.0f / (sampleRate * std::log(1.0f - attackCoeff))
         : 0.01f;
-    l.limiterReleaseMs = mb.limiterReleaseCoeff > 0.0f
-        ? -1000.0f / (sampleRate * std::log(1.0f - mb.limiterReleaseCoeff))
+    l.limiterReleaseMs = releaseCoeff > 0.0f
+        ? -1000.0f / (sampleRate * std::log(1.0f - releaseCoeff))
         : 100.0f;
     return l;
 }
@@ -2120,7 +2330,7 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         // Publish the completed copy (even sequence, release store).
         RLV2_MemBarrier();
         liveMailboxSeq_.store(even + 2u, std::memory_order_release);
-        appliedLive_ = LiveStateFromMailbox(*mb, sampleRate);
+        lastPublishedMailboxSeq_ = even + 2u;
         return svms::RLResult::Ok;
     }
 
@@ -2194,44 +2404,62 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
     svms::RuntimeLinkTelemetryV2 snap{};
     static svms::RuntimeLinkTelemetryV2 s_lastBuilt;  // last stable publish
 
-    constexpr uint32_t kStamp = 1u;
+    // Monotonic seqlock read: take the even sequence, copy the relaxed
+    // payload, then confirm nothing moved (odd, or the sequence advanced
+    // mid-copy = the frame may be torn).  Because the sequence only ever
+    // grows by 2, an equality check is exact (no ABA).
     const svms::RuntimeAudioSnapshot& as = g_audioSnapshot;
-    const bool settled = as.sequence == svms::RLV2_SnapshotSettledSequence;
-    if (settled) {
-        float f = 0.0f;
-        if (as.activeVoices.TryLoad(f, kStamp)) snap.activeVoices = static_cast<uint32_t>(f);
-        if (as.releasingVoices.TryLoad(f, kStamp)) snap.releasingVoices = static_cast<uint32_t>(f);
-        if (as.freeTop.TryLoad(f, kStamp)) snap.freeTop = static_cast<uint32_t>(f);
-        if (as.voiceSteals.TryLoad(f, kStamp)) snap.voiceSteals = static_cast<uint32_t>(f);
-        if (as.retiredCount.TryLoad(f, kStamp)) snap.retiredCount = static_cast<uint32_t>(f);
-        if (as.retiredImmediateCount.TryLoad(f, kStamp)) snap.retiredImmediateCount = static_cast<uint32_t>(f);
-        if (as.decimationStep.TryLoad(f, kStamp)) snap.decimationStep = static_cast<uint32_t>(f);
-        if (as.renderPeak.TryLoad(f, kStamp)) snap.renderPeak = f;
-        if (as.audioRunning.TryLoad(f, kStamp)) snap.audioRunning = static_cast<uint32_t>(f);
-        if (as.soundFontLoaded.TryLoad(f, kStamp)) snap.soundFontLoaded = static_cast<uint32_t>(f);
-        if (as.audioHResult.TryLoad(f, kStamp)) snap.audioHResult = static_cast<int32_t>(f);
-        if (as.cpuLoadPercent.TryLoad(f, kStamp)) snap.cpuLoadPercent = f;
-        if (as.callbackP95Percent.TryLoad(f, kStamp)) snap.callbackP95Percent = f;
-        if (as.callbackP99Percent.TryLoad(f, kStamp)) snap.callbackP99Percent = f;
-        if (as.callbackP999Percent.TryLoad(f, kStamp)) snap.callbackP999Percent = f;
-        if (as.maxConsecutiveOverBudget.TryLoad(f, kStamp)) snap.maxConsecutiveOverBudget = static_cast<uint32_t>(f);
-        if (as.limiterInputPeakL.TryLoad(f, kStamp)) snap.limiterInputPeakL = f;
-        if (as.limiterInputPeakR.TryLoad(f, kStamp)) snap.limiterInputPeakR = f;
-        if (as.limiterOutputPeakL.TryLoad(f, kStamp)) snap.limiterOutputPeakL = f;
-        if (as.limiterOutputPeakR.TryLoad(f, kStamp)) snap.limiterOutputPeakR = f;
-        if (as.limiterGainReductionDb.TryLoad(f, kStamp)) snap.limiterGainReductionDb = f;
-        snap.overBudgetCallbacks = as.overBudgetCallbacks;
-        snap.eventsSubmitted = as.eventsSubmitted;
-        snap.eventsAccepted = as.eventsAccepted;
-        snap.eventsDropped = as.eventsDropped;
-        snap.eventsDispatched = as.eventsDispatched;
+    const uint32_t seq = as.sequence.load(std::memory_order_acquire);
+    if ((seq & 1u) == 0u) {
+        const uint32_t tick = as.tickMs.load(std::memory_order_relaxed);
+        snap.activeVoices = as.activeVoices.load(std::memory_order_relaxed);
+        snap.releasingVoices = as.releasingVoices.load(std::memory_order_relaxed);
+        snap.freeTop = as.freeTop.load(std::memory_order_relaxed);
+        snap.voiceSteals = as.voiceSteals.load(std::memory_order_relaxed);
+        snap.retiredCount = as.retiredCount.load(std::memory_order_relaxed);
+        snap.retiredImmediateCount =
+            as.retiredImmediateCount.load(std::memory_order_relaxed);
+        snap.decimationStep = as.decimationStep.load(std::memory_order_relaxed);
+        snap.renderPeak = U32BitsToFloat(
+            as.renderPeakBits.load(std::memory_order_relaxed));
+        snap.audioRunning = as.audioRunning.load(std::memory_order_relaxed);
+        snap.soundFontLoaded = as.soundFontLoaded.load(std::memory_order_relaxed);
+        snap.audioHResult = as.audioHResult.load(std::memory_order_relaxed);
+        snap.cpuLoadPercent = U32BitsToFloat(
+            as.cpuLoadPercentBits.load(std::memory_order_relaxed));
+        snap.callbackP95Percent = U32BitsToFloat(
+            as.callbackP95PercentBits.load(std::memory_order_relaxed));
+        snap.callbackP99Percent = U32BitsToFloat(
+            as.callbackP99PercentBits.load(std::memory_order_relaxed));
+        snap.callbackP999Percent = U32BitsToFloat(
+            as.callbackP999PercentBits.load(std::memory_order_relaxed));
+        snap.maxConsecutiveOverBudget =
+            as.maxConsecutiveOverBudget.load(std::memory_order_relaxed);
+        snap.overBudgetCallbacks =
+            as.overBudgetCallbacks.load(std::memory_order_relaxed);
+        snap.eventsSubmitted = as.eventsSubmitted.load(std::memory_order_relaxed);
+        snap.eventsAccepted = as.eventsAccepted.load(std::memory_order_relaxed);
+        snap.eventsDropped = as.eventsDropped.load(std::memory_order_relaxed);
+        snap.eventsDispatched = as.eventsDispatched.load(std::memory_order_relaxed);
+        snap.limiterInputPeakL = U32BitsToFloat(
+            as.limiterInputPeakLBits.load(std::memory_order_relaxed));
+        snap.limiterInputPeakR = U32BitsToFloat(
+            as.limiterInputPeakRBits.load(std::memory_order_relaxed));
+        snap.limiterOutputPeakL = U32BitsToFloat(
+            as.limiterOutputPeakLBits.load(std::memory_order_relaxed));
+        snap.limiterOutputPeakR = U32BitsToFloat(
+            as.limiterOutputPeakRBits.load(std::memory_order_relaxed));
+        snap.limiterGainReductionDb = U32BitsToFloat(
+            as.limiterGainReductionDbBits.load(std::memory_order_relaxed));
 
-        // Re-verify the settle marker: a writer that started mid-copy
-        // (sequence flipped back to 1) means this frame may be torn —
-        // reuse the last stable publish instead (same skip-if-busy
-        // pattern as the client side).
+        // Re-verify the settlement: a writer that started mid-copy means
+        // this frame may be torn — reuse the last stable publish instead
+        // (same skip-if-busy pattern as the client side).
         RLV2_MemBarrier();
-        if (as.sequence != svms::RLV2_SnapshotSettledSequence) return s_lastBuilt;
+        if (as.sequence.load(std::memory_order_acquire) != seq ||
+            as.tickMs.load(std::memory_order_relaxed) != tick) {
+            return s_lastBuilt;
+        }
         s_lastBuilt = snap;
     } else {
         return s_lastBuilt;
@@ -2241,9 +2469,15 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
     snap.sampleRate = sampleRate;
     snap.bufferFrames = bufferFrames;
 
-    // Live-state echo: what the control thread last published to the
-    // mailbox (i.e. what the audio thread is applying).
-    snap.live = appliedLive_;
+    // Live-state echo: what the audio thread last applied from the
+    // mailbox (appliedMailbox_ + appliedSeq_ — release/acquire ordered),
+    // forwarded to the client as the "applied" live config.
+    const uint32_t appliedSeq = appliedSeq_.load(std::memory_order_acquire);
+    if (appliedSeq != lastEchoedAppliedSeq_) {
+        lastEchoedAppliedSeq_ = appliedSeq;
+        appliedLiveEcho_ = LiveStateFromMailbox(appliedMailbox_, sampleRate);
+    }
+    snap.live = appliedLiveEcho_;
 
     if (loadedSoundFontPath_[0] != L'\0') {
         std::string narrow = wideToUtf8(loadedSoundFontPath_);
@@ -2600,12 +2834,11 @@ bool Driver::Initialize() {
 
     // Initialize both mailbox buffers with the same starting state.
     liveMailbox_.InitFromEngineConfig(cfg, sampleRate);
-    liveMailboxApplied_ = liveMailbox_;
+    liveMailbox_.StoreToNonAtomic(appliedMailbox_);
     liveMailboxSeq_.store(2u, std::memory_order_release);
+    appliedSeq_.store(2u, std::memory_order_release);
+    lastAppliedLiveSeq_ = 0u;
     appliedMasterVolume_ = cfg.masterVolume;
-#if !defined(SVMS_XP_COMPAT)
-    appliedLive_ = LiveStateFromMailbox(liveMailbox_, sampleRate);
-#endif
 
     // Velocity curve/floor are restart-only configuration.  Preserve the
     // exact historical quantization into g_velGainLUT, but pay powf once at
@@ -3173,59 +3406,71 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
 
     if (!vm || !cc || !render || !snap) return;
 
-    // ── Mailbox sync: seqlock read of the live params ──────────────
-    // The control thread publishes via odd→even sequence; we copy once
-    // per block, retrying on a torn (odd / stale) sequence by falling
-    // back to the last stable copy.  All live params land in the local
-    // structs the render path reads, eliminating every data race between
-    // the control thread (writer) and this audio thread (reader).
-    LiveConfigMailbox mb;
-    const uint32_t seq =
-        self->liveMailboxSeq_.load(std::memory_order_acquire);
-    if ((seq & 1u) == 0u) {
-        mb = self->liveMailbox_;
-        if (self->liveMailboxSeq_.load(std::memory_order_acquire) == seq) {
-            self->liveMailboxApplied_ = mb;
+    // ── Mailbox sync: dirty-gated monotonic seqlock read ───────────
+    // The control thread publishes only when the user actually moves a
+    // knob; the mailbox is skipped entirely when the sequence matches
+    // lastAppliedLiveSeq_ (the common per-block case).  On a torn (odd
+    // or mid-flight) read we fall back to appliedMailbox_, the last
+    // state this audio thread applied.  The DSP apply (incl.
+    // reverb.UpdateDerived and the limiter glide targets) runs only on
+    // change, so the per-block overhead of the live path is one atomic
+    // load and one compare.
+    const uint32_t seq = self->liveMailboxSeq_.load(std::memory_order_acquire);
+    if (seq != self->lastAppliedLiveSeq_) {
+        NonAtomicLiveConfigMailbox mb;
+        uint32_t appliedSeq = seq;
+        if ((seq & 1u) == 0u) {
+            self->liveMailbox_.StoreToNonAtomic(mb);
+            if (self->liveMailboxSeq_.load(std::memory_order_acquire) != seq) {
+                mb = self->appliedMailbox_;
+                appliedSeq = self->appliedSeq_.load(std::memory_order_acquire);
+            }
         } else {
-            mb = self->liveMailboxApplied_;
+            mb = self->appliedMailbox_;
+            appliedSeq = self->appliedSeq_.load(std::memory_order_acquire);
         }
-    } else {
-        mb = self->liveMailboxApplied_;
+
+        snap->masterVolume   = mb.masterVolume;
+        snap->correctnessMode = mb.correctnessMode;
+        snap->enableReverb   = mb.reverbEnabled;
+        self->correctnessMode_ = mb.correctnessMode;
+
+        self->reverb.enabled     = mb.reverbEnabled;
+        self->reverb.mix         = mb.reverbMix;
+        self->reverb.roomSize    = mb.reverbRoomSize;
+        self->reverb.decay       = mb.reverbDecay;
+        self->reverb.damping     = mb.reverbDamping;
+        self->reverb.width       = mb.reverbWidth;
+        self->reverb.diffusion   = mb.reverbDiffusion;
+        self->reverb.preDelayMs  = mb.reverbPreDelayMs;
+        self->reverb.earlyLevel  = mb.reverbEarlyLevel;
+        self->reverb.lateLevel   = mb.reverbLateLevel;
+        self->reverb.modDepth    = mb.reverbModDepth;
+        self->reverb.modRate     = mb.reverbModRate;
+        self->reverb.lowCutHz    = mb.reverbLowCutHz;
+        self->reverb.highCutHz   = mb.reverbHighCutHz;
+
+        // Derived parameters (FDN feedback, tap gains, lengths, LFO
+        // increments) recompute WITHOUT clearing the delay lines, so a
+        // live change morphs the tail instead of cutting it dead.
+        self->reverb.UpdateDerived();
+
+        self->limiter.enabled           = mb.limiterEnabled;
+        self->limiter.thresholdTarget   = mb.limiterThreshold;
+        self->limiter.delayFramesTarget = mb.limiterDelayFrames;
+        self->limiter.attackCoeff       = mb.limiterAttackCoeff;
+        self->limiter.releaseCoeff      = mb.limiterReleaseCoeff;
+
+        self->channelCache->SetMasterVolume(mb.masterVolume);
+
+        // Echo the applied state to the control thread (telemetry audit).
+        // The echo must be coherent BEFORE lastAppliedLiveSeq_ advances
+        // so no reader can ever observe a newer appliedSeq_ with an
+        // older mailbox.
+        self->appliedMailbox_ = mb;
+        self->appliedSeq_.store(appliedSeq, std::memory_order_release);
+        self->lastAppliedLiveSeq_ = appliedSeq;
     }
-
-    snap->masterVolume   = mb.masterVolume;
-    snap->correctnessMode = mb.correctnessMode;
-    snap->enableReverb   = mb.reverbEnabled;
-    self->correctnessMode_ = mb.correctnessMode;
-
-    self->reverb.enabled     = mb.reverbEnabled;
-    self->reverb.mix         = mb.reverbMix;
-    self->reverb.roomSize    = mb.reverbRoomSize;
-    self->reverb.decay       = mb.reverbDecay;
-    self->reverb.damping     = mb.reverbDamping;
-    self->reverb.width       = mb.reverbWidth;
-    self->reverb.diffusion   = mb.reverbDiffusion;
-    self->reverb.preDelayMs  = mb.reverbPreDelayMs;
-    self->reverb.earlyLevel  = mb.reverbEarlyLevel;
-    self->reverb.lateLevel   = mb.reverbLateLevel;
-    self->reverb.modDepth    = mb.reverbModDepth;
-    self->reverb.modRate     = mb.reverbModRate;
-    self->reverb.lowCutHz    = mb.reverbLowCutHz;
-    self->reverb.highCutHz   = mb.reverbHighCutHz;
-
-    // FDN delays, feedback, taps, filters and LFOs derive from the raw
-    // fields.  UpdateDerived recomputes them WITHOUT clearing the delay
-    // lines, so live parameter changes morph the tail instead of cutting
-    // it dead.  (~50 scalar ops once per block: negligible.)
-    self->reverb.UpdateDerived();
-
-    self->limiter.enabled       = mb.limiterEnabled;
-    self->limiter.threshold     = mb.limiterThreshold;
-    self->limiter.delayFrames   = mb.limiterDelayFrames;
-    self->limiter.attackCoeff   = mb.limiterAttackCoeff;
-    self->limiter.releaseCoeff  = mb.limiterReleaseCoeff;
-
-    self->channelCache->SetMasterVolume(mb.masterVolume);
 
     LARGE_INTEGER renderStartQPC;
     QueryPerformanceCounter(&renderStartQPC);
@@ -3669,12 +3914,14 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         if (++diagTick >= 1) {
             diagTick = 0;
             if (self->diagnosticsWindow_ || self->diagnosticsDebugOutput_) {
-                uint32_t releasingVoices = 0;
+                // Extreme-polyphony rule: never scan activeList for
+                // diagnostics; the releasing count comes from the exact
+                // transition counter (VoiceManager::releasingCount_), so
+                // only the sustain-held tally still needs a walk.
+                const uint32_t releasingVoices = vm->GetReleasingCount();
                 uint32_t sustainHeldVoices = 0;
                 for (uint32_t position = 0; position < vm->activeCount_; ++position) {
                     const uint32_t voice = vm->activeList_[position];
-                    releasingVoices += vm->v.state[voice] ==
-                        static_cast<uint8_t>(VoiceState::Releasing);
                     sustainHeldVoices += vm->v.heldBySustain[voice] != 0;
                 }
                 DiagWindow_Update(vm->activeCount_, vm->GetMaxVoices(),
@@ -3709,57 +3956,74 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // ── Audio→control snapshot (RuntimeLink V2) ────────────────────
     // The control thread publishes at ~30 Hz from this process-local
     // snapshot; the audio thread never touches shared memory.  The
-    // O(activeN) releasing-voice scan is throttled to every 3rd block.
-    // Snapshot stores are ~30 aligned 32-bit writes per block.
+    // releasing-voice count comes from the exact transition counter
+    // (VoiceManager::releasingCount_), so no O(activeN) scan is needed;
+    // the only remaining walk is the diag window's sustain tally.
+    // Writes are relaxed atomics wrapped in a monotonic odd/even
+    // sequence (2, 4, 6, ...): odd = writer inside, even = settled.
 #if !defined(SVMS_XP_COMPAT)
     {
-        constexpr uint32_t kStamp = 1u;
-        if (++self->releasingScanTick_ % 3u == 0u) {
-            uint32_t releasing = 0;
-            for (uint32_t i = 0; i < vm->activeCount_; ++i) {
-                const uint32_t v = vm->activeList_[i];
-                releasing += vm->v.state[v] ==
-                    static_cast<uint8_t>(svms::VoiceState::Releasing);
-            }
-            self->lastReleasingVoices_ = releasing;
-        }
         svms::RuntimeAudioSnapshot& as = g_audioSnapshot;
-        as.sequence = 1;
+        const uint32_t odd = as.sequence.load(std::memory_order_relaxed) | 1u;
+        as.sequence.store(odd, std::memory_order_relaxed);
         RLV2_MemBarrier();
-        as.activeVoices.Store(static_cast<float>(vm->activeCount_), kStamp);
-        as.releasingVoices.Store(static_cast<float>(self->lastReleasingVoices_), kStamp);
-        as.freeTop.Store(static_cast<float>(vm->freeTop_), kStamp);
-        as.voiceSteals.Store(static_cast<float>(vm->stealCount_), kStamp);
-        as.retiredCount.Store(static_cast<float>(vm->retireCount_), kStamp);
-        as.retiredImmediateCount.Store(static_cast<float>(vm->retireImmediateCount_), kStamp);
-        as.decimationStep.Store(static_cast<float>(self->correctnessMode_ ? 1u
-            : svms::ComputeDecimationStep(vm->activeCount_)), kStamp);
-        as.renderPeak.Store(self->sf2Telemetry_.renderPeak, kStamp);
-        as.audioRunning.Store(self->audioOutput && self->audioOutput->IsRunning()
-            ? 1.0f : 0.0f, kStamp);
-        as.soundFontLoaded.Store(self->soundFontData && self->sampleDataStore
-            ? 1.0f : 0.0f, kStamp);
-        as.audioHResult.Store(static_cast<float>(self->audioOutput
-            ? static_cast<int32_t>(self->audioOutput->GetLastError()) : 0), kStamp);
-        as.cpuLoadPercent.Store(s_cpuSmoothed, kStamp);
-        as.callbackP95Percent.Store(self->telemetry_.callbackP95Percent, kStamp);
-        as.callbackP99Percent.Store(self->telemetry_.callbackP99Percent, kStamp);
-        as.callbackP999Percent.Store(self->telemetry_.callbackP999Percent, kStamp);
-        as.maxConsecutiveOverBudget.Store(
-            static_cast<float>(self->telemetry_.maxConsecutiveOverBudget), kStamp);
-        as.overBudgetCallbacks = self->telemetry_.overBudgetCallbacks;
-        as.eventsSubmitted = self->telemetry_.submitted;
-        as.eventsAccepted = self->telemetry_.accepted;
-        as.eventsDropped = self->telemetry_.dropped;
-        as.eventsDispatched = self->telemetry_.dispatched;
-        as.limiterInputPeakL.Store(self->limiter.inputPeakL, kStamp);
-        as.limiterInputPeakR.Store(self->limiter.inputPeakR, kStamp);
-        as.limiterOutputPeakL.Store(self->limiter.outputPeakL, kStamp);
-        as.limiterOutputPeakR.Store(self->limiter.outputPeakR, kStamp);
-        as.limiterGainReductionDb.Store(self->limiter.gainReductionDb, kStamp);
-        as.tickMs = static_cast<uint32_t>(GetTickCount());
+        as.tickMs.store(static_cast<uint32_t>(GetTickCount()),
+                        std::memory_order_relaxed);
+        as.activeVoices.store(vm->activeCount_, std::memory_order_relaxed);
+        as.releasingVoices.store(vm->GetReleasingCount(), std::memory_order_relaxed);
+        as.freeTop.store(vm->freeTop_, std::memory_order_relaxed);
+        as.voiceSteals.store(vm->stealCount_, std::memory_order_relaxed);
+        as.retiredCount.store(vm->retireCount_, std::memory_order_relaxed);
+        as.retiredImmediateCount.store(vm->retireImmediateCount_, std::memory_order_relaxed);
+        as.decimationStep.store(self->correctnessMode_ ? 1u
+            : svms::ComputeDecimationStep(vm->activeCount_),
+            std::memory_order_relaxed);
+        as.renderPeakBits.store(FloatToU32Bits(self->sf2Telemetry_.renderPeak),
+                                std::memory_order_relaxed);
+        as.audioRunning.store(self->audioOutput && self->audioOutput->IsRunning()
+            ? 1u : 0u, std::memory_order_relaxed);
+        as.soundFontLoaded.store(self->soundFontData && self->sampleDataStore
+            ? 1u : 0u, std::memory_order_relaxed);
+        as.audioHResult.store(self->audioOutput
+            ? static_cast<int32_t>(self->audioOutput->GetLastError()) : 0,
+            std::memory_order_relaxed);
+        as.cpuLoadPercentBits.store(FloatToU32Bits(s_cpuSmoothed),
+                                    std::memory_order_relaxed);
+        as.callbackP95PercentBits.store(
+            FloatToU32Bits(self->telemetry_.callbackP95Percent),
+            std::memory_order_relaxed);
+        as.callbackP99PercentBits.store(
+            FloatToU32Bits(self->telemetry_.callbackP99Percent),
+            std::memory_order_relaxed);
+        as.callbackP999PercentBits.store(
+            FloatToU32Bits(self->telemetry_.callbackP999Percent),
+            std::memory_order_relaxed);
+        as.maxConsecutiveOverBudget.store(
+            self->telemetry_.maxConsecutiveOverBudget,
+            std::memory_order_relaxed);
+        as.overBudgetCallbacks.store(self->telemetry_.overBudgetCallbacks,
+                                     std::memory_order_relaxed);
+        as.eventsSubmitted.store(self->telemetry_.submitted,
+                                 std::memory_order_relaxed);
+        as.eventsAccepted.store(self->telemetry_.accepted,
+                                std::memory_order_relaxed);
+        as.eventsDropped.store(self->telemetry_.dropped,
+                               std::memory_order_relaxed);
+        as.eventsDispatched.store(self->telemetry_.dispatched,
+                                  std::memory_order_relaxed);
+        as.limiterInputPeakLBits.store(FloatToU32Bits(self->limiter.inputPeakL),
+                                       std::memory_order_relaxed);
+        as.limiterInputPeakRBits.store(FloatToU32Bits(self->limiter.inputPeakR),
+                                       std::memory_order_relaxed);
+        as.limiterOutputPeakLBits.store(FloatToU32Bits(self->limiter.outputPeakL),
+                                        std::memory_order_relaxed);
+        as.limiterOutputPeakRBits.store(FloatToU32Bits(self->limiter.outputPeakR),
+                                        std::memory_order_relaxed);
+        as.limiterGainReductionDbBits.store(
+            FloatToU32Bits(self->limiter.gainReductionDb),
+            std::memory_order_relaxed);
         RLV2_MemBarrier();
-        as.sequence = RLV2_SnapshotSettledSequence;
+        as.sequence.store(odd + 1u, std::memory_order_release);
     }
 #endif
 }

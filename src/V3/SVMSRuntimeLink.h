@@ -253,11 +253,17 @@ private:
         snap.timestampQpc = static_cast<uint64_t>(qpc.QuadPart);
 
         volatile RuntimeLinkHeaderV2* h = &view_->header;
-        h->telemetrySequence = 1;
+        // Monotonic seqlock publish: odd = writer inside the slot, even =
+        // stable.  telemetrySeq_ only ever advances by 2 per publish, so a
+        // reader can never mistake two consecutive publishes for one (the
+        // old 1 -> 2 toggle repeated its values and could hide a torn
+        // mid-copy capture under ABA).
+        h->telemetrySequence = telemetrySeq_ | 1u;
         RLV2_MemBarrier();
         view_->telemetry = snap;
         RLV2_MemBarrier();
-        h->telemetrySequence = 2;
+        telemetrySeq_ += 2u;
+        h->telemetrySequence = telemetrySeq_;
         h->heartbeatQpc = snap.timestampQpc;
         RLV2_MemBarrier();
 
@@ -300,13 +306,14 @@ private:
             }
         }
 
-        hostsMutex_ = OpenMutexW(SYNCHRONIZE, FALSE, mtxName);
+        hostsMutex_ = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mtxName);
         if (!hostsMutex_) {
             HANDLE createdMutex = CreateMutexW(nullptr, FALSE, mtxName);
             if (createdMutex) {
                 if (GetLastError() == ERROR_ALREADY_EXISTS) {
                     CloseHandle(createdMutex);
-                    hostsMutex_ = OpenMutexW(SYNCHRONIZE, FALSE, mtxName);
+                    hostsMutex_ = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE,
+                                             FALSE, mtxName);
                 } else {
                     hostsMutex_ = createdMutex;
                 }
@@ -348,7 +355,11 @@ private:
             RuntimeHostSlotV2& s = hostsView_->slots[target];
             s.magic = kRuntimeLinkMagic;
             s.pid = pid_;
+#ifdef _WIN64
             s.archClass = kRuntimeLinkArchX64;
+#else
+            s.archClass = kRuntimeLinkArchX86;
+#endif
             s.sessionId = sessionId_;
             s.lastHeartbeatQpc = now;
             hostRegistered_ = true;
@@ -412,6 +423,9 @@ private:
     CommandHandler commandHandler_;
     uint32_t processedId_      = 0;
     uint32_t processedToken_   = 0;
+    // Monotonic telemetry seqlock word; starts settled (even) at 2 and
+    // advances by 2 per publish (see PublishTelemetry).
+    uint32_t telemetrySeq_     = 2u;
     bool busyWithReload_       = false;
 };
 
@@ -453,7 +467,10 @@ public:
 
         if (!ValidateHeader(pid)) { Close(); return false; }
 
-        hMutex_ = OpenMutexW(SYNCHRONIZE, FALSE, mutexName);
+        // The client releases the mutex after writing a command, so it
+        // needs MUTEX_MODIFY_STATE in addition to SYNCHRONIZE (a mutex
+        // opened with SYNCHRONIZE alone makes ReleaseMutex fail).
+        hMutex_ = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mutexName);
         if (!hMutex_) { Close(); return false; }
         hCmdEvent_ = OpenEventW(EVENT_MODIFY_STATE, FALSE, evtName);  // optional
 
@@ -612,7 +629,7 @@ public:
         if (!hMap) return 0u;
         RuntimeHostsRegistryV2* reg = static_cast<RuntimeHostsRegistryV2*>(
             MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-        HANDLE hMtx = OpenMutexW(SYNCHRONIZE, FALSE, mtxName);
+        HANDLE hMtx = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mtxName);
         uint32_t count = 0u;
         if (reg && hMtx &&
             WaitForSingleObject(hMtx, kRuntimeLinkMutexTimeoutMs)

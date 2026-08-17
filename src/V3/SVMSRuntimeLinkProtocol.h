@@ -41,9 +41,11 @@
 //      == its token, so two clients can never falsely observe each
 //      other's results.
 //   6. The audio thread never touches shared memory.  It only updates
-//      a process-local RuntimeAudioSnapshot (odd/even sequence, floats
-//      via AtomicFloatBits).  The driver control thread reads that
-//      snapshot and publishes the shared-memory telemetry at ~30 Hz.
+//      a process-local RuntimeAudioSnapshot (monotonic odd/even
+//      sequence; payload fields are C++ atomics carrying integers and
+//      IEEE float values as exact bit patterns).  The driver control
+//      thread reads that snapshot and publishes the shared-memory
+//      telemetry at ~30 Hz.
 //   7. Discovery uses a fixed, well-known hosts registry mapping
 //      (Local\SVMS_V3_RuntimeHosts_v2) with per-slot heartbeats, so
 //      the configurator can enumerate running drivers without scanning
@@ -53,6 +55,7 @@
 #include <cstring>
 #include <type_traits>
 #include <cmath>
+#include <atomic>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -238,16 +241,11 @@ inline uint32_t RLV2_GroupForType(RLCommandType type) {
     }
 }
 
-// ─── AtomicFloatBits ────────────────────────────────────────────────────────
+// ─── Float bit-pattern helpers ────────────────────────────────────────────
 //
-// A float transported in a single 32-bit word where bit 0 is reserved as
-// a write stamp.  Storing alternates the float payload in bits[31..1]
-// and pins the stamp; a reader that observes a stamp different from the
-// stamp it expects knows the value was written by a *different* publish
-// epoch (or is mid-tearing on a hypothetical non-atomic platform).  On
-// x86/x64 the aligned 32-bit access is atomic, so the stamp is a
-// defense-in-depth marker used together with the enclosing odd/even
-// sequence guards.
+// Telemetry floats travel as exact IEEE-754 bit patterns in integer
+// slot fields (plain uint32_t / std::atomic<uint32_t>), so no float
+// atomic traffic ever crosses the ABI or the snapshot.
 
 inline uint32_t RLV2_FloatBits(float v) {
     static_assert(sizeof(float) == sizeof(uint32_t), "float must be 32-bit");
@@ -261,34 +259,6 @@ inline float RLV2_BitsToFloat(uint32_t b) {
     std::memcpy(&v, &b, sizeof(v));
     return v;
 }
-
-struct AtomicFloatBits {
-    uint32_t bits = 0;
-
-    void Store(float v, uint32_t stamp) {
-        const uint32_t b = RLV2_FloatBits(v);
-        bits = (b & ~1u) | (stamp & 1u);
-    }
-
-    // Returns the value if (and only if) the nested stamp matches the
-    // expected stamp; otherwise leaves out untouched and returns false.
-    bool TryLoad(float& out, uint32_t expectedStamp) const {
-        const uint32_t b = bits;
-        if ((b & 1u) != (expectedStamp & 1u)) return false;
-        out = RLV2_BitsToFloat(b & ~1u);
-        return true;
-    }
-
-    // Unsafe fast read — only correct when the enclosing sequence guard
-    // (odd/even) already proves the whole snapshot is settled.
-    float LoadUnchecked() const {
-        return RLV2_BitsToFloat(bits & ~1u);
-    }
-};
-
-static_assert(std::is_trivially_copyable<AtomicFloatBits>::value,
-              "AtomicFloatBits must be trivially copyable");
-static_assert(sizeof(AtomicFloatBits) == 4, "AtomicFloatBits must be 4 bytes");
 
 // ─── Live-parameter payload ─────────────────────────────────────────────────
 //
@@ -569,60 +539,74 @@ inline bool RLV2_HostsSlotIsFresh(const RuntimeHostSlotV2& s,
 // ─── Process-local audio snapshot ───────────────────────────────────────────
 //
 // NEVER MAPPED.  The audio thread stores into this structure once per
-// render block (seq 1 → payload → seq 2).  The driver control thread
-// reads it at publish time; a non-2 sequence means a torn/in-progress
-// snapshot and the reader keeps the previous snapshot.  Float fields use
-// AtomicFloatBits with a fixed stamp of 1 (every publish re-stores all
-// floats, so a constant stamp identifies the current epoch).  The 64-bit
-// counters are protected by the same odd/even sequence.  The snapshot
-// also carries decoder-visible audio-running flags and the limiter
-// meter maxima measured in the render loop.
+// render block under a monotonically increasing seqlock: sequence is set
+// ODD (previous even value + 1), all payload fields are stored, the
+// sequence is set EVEN (previous value + 2).  The driver control thread
+// reads it at publish time; an odd sequence or a sequence that changed
+// mid-copy means a torn/in-progress snapshot and the reader keeps the
+// previous snapshot.  Because the sequence only ever increases (2, 4, 6,
+// ...), a reader can never mistake two consecutive publishes for one
+// (no odd/even ABA), unlike the old 1 -> 2 toggle.
+//
+// All payload fields are std::atomic so the individual 32-bit/64-bit
+// accesses are race-free even while the seqlock is mid-write; the seqlock
+// provides cross-field consistency (integers transport their exact
+// values, no float round-trip).  Float fields travel as their exact
+// IEEE-754 bit patterns in std::atomic<uint32_t> words.
+//
+// 64-bit counters race only against the seqlock parity (the writer stores
+// them before releasing the even sequence), and on x86/x64 an aligned
+// 64-bit atomic load is a single instruction.
 
 struct alignas(64) RuntimeAudioSnapshot {
-    uint32_t sequence = 2;    // 1 = writer inside, 2 = settled (initial state)
-    uint32_t tickMs   = 0;    // GetTickCount64() truncated, for diagnostics
+    // Monotonically increasing seqlock word.  Odd = writer inside the
+    // snapshot, even = settled.  Starts at 2 (settled, empty slot).
+    std::atomic<uint32_t> sequence{2u};
+    // GetTickCount() truncated, for diagnostics.
+    std::atomic<uint32_t> tickMs{0u};
 
-    AtomicFloatBits activeVoices;
-    AtomicFloatBits releasingVoices;
-    AtomicFloatBits freeTop;
-    AtomicFloatBits voiceSteals;
-    AtomicFloatBits retiredCount;
-    AtomicFloatBits retiredImmediateCount;
-    AtomicFloatBits decimationStep;
+    // Integer quantities — exact bit transport, no float round-trip.
+    std::atomic<uint32_t> activeVoices{0u};
+    std::atomic<uint32_t> releasingVoices{0u};
+    std::atomic<uint32_t> freeTop{0u};
+    std::atomic<uint32_t> voiceSteals{0u};
+    std::atomic<uint32_t> retiredCount{0u};
+    std::atomic<uint32_t> retiredImmediateCount{0u};
+    std::atomic<uint32_t> decimationStep{1u};
 
-    AtomicFloatBits renderPeak;
-    AtomicFloatBits audioRunning;
-    AtomicFloatBits soundFontLoaded;
-    AtomicFloatBits audioHResult;
-    AtomicFloatBits cpuLoadPercent;
+    std::atomic<uint32_t> audioRunning{0u};
+    std::atomic<uint32_t> soundFontLoaded{0u};
+    std::atomic<int32_t>  audioHResult{0};
+    std::atomic<uint32_t> maxConsecutiveOverBudget{0u};
 
-    AtomicFloatBits callbackP95Percent;
-    AtomicFloatBits callbackP99Percent;
-    AtomicFloatBits callbackP999Percent;
-    AtomicFloatBits maxConsecutiveOverBudget;
+    // Float fields as exact IEEE-754 bit patterns (see RLV2_FloatBits).
+    std::atomic<uint32_t> renderPeakBits{0u};
+    std::atomic<uint32_t> cpuLoadPercentBits{0u};
+    std::atomic<uint32_t> callbackP95PercentBits{0u};
+    std::atomic<uint32_t> callbackP99PercentBits{0u};
+    std::atomic<uint32_t> callbackP999PercentBits{0u};
 
     // Limiter meters (linear peaks + positive dB gain reduction)
-    AtomicFloatBits limiterInputPeakL;
-    AtomicFloatBits limiterInputPeakR;
-    AtomicFloatBits limiterOutputPeakL;
-    AtomicFloatBits limiterOutputPeakR;
-    AtomicFloatBits limiterGainReductionDb;
+    std::atomic<uint32_t> limiterInputPeakLBits{0u};
+    std::atomic<uint32_t> limiterInputPeakRBits{0u};
+    std::atomic<uint32_t> limiterOutputPeakLBits{0u};
+    std::atomic<uint32_t> limiterOutputPeakRBits{0u};
+    std::atomic<uint32_t> limiterGainReductionDbBits{0u};
 
-    uint64_t overBudgetCallbacks   = 0;
-    uint64_t eventsSubmitted       = 0;
-    uint64_t eventsAccepted        = 0;
-    uint64_t eventsDropped         = 0;
-    uint64_t eventsDispatched      = 0;
+    // 64-bit event/overload counters (each atomic on its own).
+    std::atomic<uint64_t> overBudgetCallbacks{0u};
+    std::atomic<uint64_t> eventsSubmitted{0u};
+    std::atomic<uint64_t> eventsAccepted{0u};
+    std::atomic<uint64_t> eventsDropped{0u};
+    std::atomic<uint64_t> eventsDispatched{0u};
 
-    uint32_t reserved[14]          = {};
+    uint32_t reserved[2] = {};
 };
 
-static_assert(std::is_trivially_copyable<RuntimeAudioSnapshot>::value,
-              "RuntimeAudioSnapshot must be trivially copyable");
 static_assert(sizeof(RuntimeAudioSnapshot) % 64 == 0,
               "RuntimeAudioSnapshot must be a multiple of one cache line");
 
-inline constexpr uint32_t RLV2_SnapshotSettledSequence = 2u;
+inline constexpr int32_t RLV2_SnapshotSettledParity = 0;
 
 } // namespace svms
 
