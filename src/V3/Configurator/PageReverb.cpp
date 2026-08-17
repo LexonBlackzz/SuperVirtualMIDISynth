@@ -51,6 +51,8 @@ void DrawReverbPage(ConfigDocument& doc) {
     {
         auto& lc = GetLiveLinkContext();
         if (lc.connected) LiveBadge("All reverb params are applied live via RuntimeLink");
+        AppliedStateBadge(lc.connected, lc.telemetry, w,
+                          "Reverb group applied state vs working copy");
     }
 
     ImGui::SameLine(ImGui::GetWindowWidth() - 200.0f);

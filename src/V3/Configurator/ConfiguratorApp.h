@@ -2,6 +2,7 @@
 #define SVMS_CONFIGURATOR_CONFIGURATORAPP_H
 
 #include "ConfigDocument.h"
+#include "PageAbout.h"
 #include "WasapiDevices.h"
 #include "EasterEggs.h"
 #include "../SVMSRuntimeLink.h"
@@ -136,6 +137,22 @@ private:
     void FlushLiveChanges();
     void SeedWorkingLive();
     void PushAllLiveParams();
+
+    // Part G: adopt the engine's APPLIED live state (telemetry echo) into
+    // the working copy — the reverse of PushAllLiveParams.  Lets the user
+    // pull out-of-band engine changes (e.g. from a second configurator)
+    // into the document, then save them to disk.
+    void AdoptEngineLiveState();
+
+    // Part Q-T: display sync + frame pacing.  vsync_ drives the swap
+    // chain's present interval; the frame-time ring feeds the About page
+    // histogram grid.
+    bool vsync_ = true;
+    void RecordFrameTime(float ms);
+    FramePacingStats GetFramePacingStats() const;
+    float frameTimeMs_[256] = {};
+    int frameTimePos_ = 0;
+    int frameTimeCount_ = 0;
 
     std::string statusMessage_;
     float toastTimer_ = 0.0f;

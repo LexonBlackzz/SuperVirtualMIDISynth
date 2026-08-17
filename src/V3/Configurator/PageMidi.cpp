@@ -22,6 +22,8 @@ void DrawMidiPage(ConfigDocument& doc) {
     {
         auto& lc = GetLiveLinkContext();
         if (lc.connected) LiveBadge("Applied live via RuntimeLink");
+        AppliedStateBadge(lc.connected, lc.telemetry, w,
+                          "Master-volume applied state vs working copy");
     }
     ImGui::TextDisabled("%.1f dB", 20.0f * std::log10(std::max(masterVol, 0.001f)));
 
@@ -93,6 +95,20 @@ void DrawMidiPage(ConfigDocument& doc) {
         w.maxEventsPerBlock = static_cast<uint32_t>(maxEvts);
         doc.MarkDirty();
     }
+
+    ImGui::Spacing();
+    SectionHeader("MIDI INPUT");
+
+    // The driver ships winmm's midiIn* entry points for drop-in
+    // compatibility, but input routing to the synth is not implemented —
+    // they return MMSYSERR_BADDEVICEID.  Nothing to configure here yet.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+    ImGui::TextWrapped(
+        "MIDI In is not implemented: the winmm compatibility layer "
+        "exposes midiIn* entry points that return MMSYSERR_BADDEVICEID. "
+        "External controllers and virtual MIDI cables cannot drive the "
+        "synth yet.");
+    ImGui::PopStyleColor();
 }
 
 } // namespace svms::cfg

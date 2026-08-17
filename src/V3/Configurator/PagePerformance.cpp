@@ -119,6 +119,8 @@ void DrawPerformancePage(ConfigDocument& doc) {
         PushLiveBool(svms::RLCommandType::SetCorrectnessMode, correctness);
     }
     if (lc.connected) LiveBadge("Applied live via RuntimeLink");
+    AppliedStateBadge(lc.connected, lc.telemetry, w,
+                      "Correctness-mode applied state vs working copy");
 }
 
 } // namespace svms::cfg

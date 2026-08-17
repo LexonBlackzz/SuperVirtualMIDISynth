@@ -1,5 +1,6 @@
 #include "Widgets.h"
 #include "ConfiguratorApp.h"
+#include "ConfigDocument.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "../SVMSRuntimeLink.h"
@@ -582,6 +583,65 @@ void DrawReverbVisualizer(ImDrawList* dl, ImVec2 center, float radius,
         ImU32 dotCol = ImGui::GetColorU32(ImVec4(0.447f, 0.533f, 0.855f,
                                                   0.15f + decay * 0.15f));
         dl->AddCircleFilled(pt, 1.5f, dotCol, 6);
+    }
+}
+
+bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,
+                        const ConfigValues& working) {
+    const svms::RuntimeLiveStateV2& e = telemetry.live;
+    const auto closeEnough = [](float a, float b) {
+        const float d = a - b;
+        return d > -1e-4f && d < 1e-4f;
+    };
+    if (e.correctnessMode != (working.correctnessMode ? 1u : 0u)) return false;
+    if (e.reverbEnabled != (working.enableReverb ? 1u : 0u)) return false;
+    if (e.limiterEnabled != (working.limiterEnabled ? 1u : 0u)) return false;
+    if (!near(e.masterVolume, working.masterVolume)) return false;
+    if (!near(e.reverbMix, working.reverbMix)) return false;
+    if (!near(e.reverbRoomSize, working.reverbRoomSize)) return false;
+    if (!near(e.reverbDecay, working.reverbDecay)) return false;
+    if (!near(e.reverbDamping, working.reverbDamping)) return false;
+    if (!near(e.reverbWidth, working.reverbWidth)) return false;
+    if (!near(e.reverbDiffusion, working.reverbDiffusion)) return false;
+    if (!near(e.reverbPreDelayMs, working.reverbPreDelayMs)) return false;
+    if (!near(e.reverbEarlyLevel, working.reverbEarlyLevel)) return false;
+    if (!near(e.reverbLateLevel, working.reverbLateLevel)) return false;
+    if (!near(e.reverbModDepth, working.reverbModDepth)) return false;
+    if (!near(e.reverbModRate, working.reverbModRate)) return false;
+    if (!near(e.reverbLowCutHz, working.reverbLowCutHz)) return false;
+    if (!near(e.reverbHighCutHz, working.reverbHighCutHz)) return false;
+    if (!near(e.limiterThreshold, working.limiterThreshold)) return false;
+    if (!near(e.limiterLookaheadMs, working.limiterLookaheadMs)) return false;
+    if (!near(e.limiterAttackMs, working.limiterAttackMs)) return false;
+    if (!near(e.limiterReleaseMs, working.limiterReleaseMs)) return false;
+    return true;
+}
+
+void AppliedStateBadge(bool connected,
+                       const svms::RuntimeLinkTelemetryV2* telemetry,
+                       const ConfigValues& working, const char* scopeTooltip) {
+    ImGui::SameLine();
+    bool synced = connected && telemetry && LiveAppliedMatches(*telemetry, working);
+    if (connected && telemetry && !synced) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+        ImGui::TextDisabled("PENDING");
+    } else if (connected && telemetry) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.80f, 0.45f, 1.0f));
+        ImGui::TextDisabled("APPLIED");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+        ImGui::TextDisabled("OFFLINE");
+    }
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(scopeTooltip ? scopeTooltip
+            : "Engine applied state vs working copy");
+        if (connected && telemetry && !synced) {
+            ImGui::TextUnformatted("Working values differ from the engine's");
+            ImGui::TextUnformatted("applied echo — awaiting the next live flush.");
+        }
+        ImGui::EndTooltip();
     }
 }
 

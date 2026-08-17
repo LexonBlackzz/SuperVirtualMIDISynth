@@ -15,6 +15,7 @@ enum class RLCommandType : uint32_t;
 namespace svms::cfg {
 
 class ConfiguratorApp;
+struct ConfigValues;
 
 struct LiveLinkContext {
     ConfiguratorApp* app = nullptr;              // routing target for live changes
@@ -69,6 +70,17 @@ void DrawVerticalMeter(const char* id, float value, float peak,
                        const ImVec2& size, bool showScale = true);
 void DrawGainReductionMeter(const char* id, float gr,
                             const ImVec2& size);
+
+// Applied-echo badge: compares the WORKING copy against the live state
+// the engine echoes back in telemetry ("applied"), so the user sees the
+// RuntimeLink flush converge (or stall).  Green APPLIED when they match,
+// amber PENDING while a flush is in flight, grey OFFLINE when no host.
+void AppliedStateBadge(bool connected,
+                       const svms::RuntimeLinkTelemetryV2* telemetry,
+                       const ConfigValues& working,
+                       const char* scopeTooltip = nullptr);
+bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,
+                        const ConfigValues& working);
 
 void DrawReverbVisualizer(ImDrawList* dl, ImVec2 center, float radius,
                            float roomSize, float decay, float diffusion,

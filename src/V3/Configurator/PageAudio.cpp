@@ -4,15 +4,18 @@
 #include "EasterEggs.h"
 #include "Widgets.h"
 #include "imgui.h"
-#include <algorithm>
-#include <cctype>
-#include <cmath>
-#include <string>
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <commdlg.h>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cwchar>
+#include <filesystem>
+#include <string>
+#include <vector>
 
 namespace svms::cfg {
 
@@ -179,6 +182,116 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
 
     HelpMarker("Audio endpoint buffer size. Smaller buffers reduce latency "
                "but leave less time for each render callback.");
+
+    ImGui::Spacing();
+    SectionHeader("SOUND FONT");
+
+    {
+        ImGui::TextUnformatted("Configured SoundFont:");
+        ImGui::SameLine();
+        if (w.soundFontPath.empty()) {
+            ImGui::TextDisabled("(none — engine uses the local fallback)");
+        } else {
+            std::string utf8 = WideToUtf8Str(w.soundFontPath);
+            if (utf8.size() > 72) utf8 = "…" + utf8.substr(utf8.size() - 72);
+            ImGui::TextDisabled("%s", utf8.c_str());
+        }
+        ImGui::Spacing();
+
+        // Repick cache: remembers the last folder used by Browse or the
+        // folder search, so re-picking the SoundFont starts where the
+        // user left off.  Initialized from the current file's folder.
+        static std::wstring lastSoundFontDir;
+        if (lastSoundFontDir.empty() && !w.soundFontPath.empty()) {
+            lastSoundFontDir =
+                std::filesystem::path(w.soundFontPath).parent_path().wstring();
+        }
+
+        if (ImGui::Button("Browse…", ImVec2(90, 0))) {
+            wchar_t fileBuf[1024] = {};
+            std::wstring initialDir = lastSoundFontDir;
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.lpstrFilter =
+                L"SoundFont files (*.sf2;*.dls)\0*.sf2;*.dls\0"
+                L"All files (*.*)\0*.*\0";
+            ofn.lpstrFile = fileBuf;
+            ofn.nMaxFile = 1024;
+            ofn.lpstrInitialDir = initialDir.empty() ? nullptr : initialDir.c_str();
+            ofn.lpstrTitle = L"Select SoundFont";
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+            if (GetOpenFileNameW(&ofn)) {
+                w.soundFontPath = fileBuf;
+                lastSoundFontDir =
+                    std::filesystem::path(fileBuf).parent_path().wstring();
+                doc.MarkDirty();
+            }
+        }
+        ImGui::SameLine();
+        if (!w.soundFontPath.empty()) {
+            if (ImGui::Button("Clear", ImVec2(60, 0))) {
+                w.soundFontPath.clear();
+                doc.MarkDirty();
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(restart-only: takes effect when the driver reloads)");
+        RestartRequiredBadge();
+
+        // Split search: a filter box plus a scrolling list of matching
+        // SoundFonts from the current folder (or the last browse folder).
+        static char searchBuf[128] = {};
+        static std::vector<std::wstring> folderFonts;
+        static std::wstring scannedDir;
+        {
+            std::wstring scanDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
+            if (scannedDir != scanDir) {
+                scannedDir = scanDir;
+                folderFonts.clear();
+                std::error_code ec;
+                for (std::filesystem::directory_iterator it(scanDir, ec), end;
+                     it != end; ++it) {
+                    if (ec) break;
+                    const std::wstring ext = it->path().extension().wstring();
+                    if (_wcsicmp(ext.c_str(), L".sf2") == 0 ||
+                        _wcsicmp(ext.c_str(), L".dls") == 0) {
+                        folderFonts.push_back(it->path().filename().wstring());
+                    }
+                }
+                std::sort(folderFonts.begin(), folderFonts.end());
+            }
+        }
+        ImGui::PushItemWidth(360.0f);
+        ImGui::InputTextWithHint("##sfsearch",
+                                 "Filter SoundFonts in folder…",
+                                 searchBuf, sizeof(searchBuf));
+        ImGui::PopItemWidth();
+
+        ImGui::BeginChild("sfList", ImVec2(360.0f, 150.0f), true);
+        std::string filter = searchBuf;
+        std::transform(filter.begin(), filter.end(), filter.begin(),
+                       [](unsigned char c) -> char {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        for (const auto& file : folderFonts) {
+            std::string name = WideToUtf8Str(file);
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) -> char {
+                               return static_cast<char>(std::tolower(c));
+                           });
+            if (!filter.empty() && lower.find(filter) == std::string::npos) {
+                continue;
+            }
+            const bool selected =
+                _wcsicmp(file.c_str(), w.soundFontPath.c_str()) == 0;
+            if (ImGui::Selectable(name.c_str(), selected)) {
+                w.soundFontPath = std::filesystem::path(scannedDir) / file;
+                doc.MarkDirty();
+            }
+        }
+        ImGui::EndChild();
+    }
 
     ImGui::Spacing();
     SectionHeader("AUDIO BACKEND");
