@@ -1,10 +1,9 @@
 #ifndef SVMS_CONFIGURATOR_PAGEPERFORMANCE_H
 #define SVMS_CONFIGURATOR_PAGEPERFORMANCE_H
 
-struct ConfigDocument;
-
 namespace svms::cfg {
 
+class ConfigDocument;
 void DrawPerformancePage(ConfigDocument& doc);
 
 } // namespace svms::cfg
