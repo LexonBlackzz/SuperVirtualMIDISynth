@@ -69,7 +69,22 @@ void AudioLabelCell(const char* label, const char* tooltip = nullptr) {
 
 void RestartCell() {
     ImGui::TableNextColumn();
-    RestartRequiredBadge();
+    ImGui::AlignTextToFramePadding();
+
+    constexpr const char* label = "RESTART";
+    const float startX = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    const float labelWidth = ImGui::CalcTextSize(label).x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Requires driver restart to take effect.");
+        ImGui::EndTooltip();
+    }
 }
 
 } // namespace
@@ -90,8 +105,6 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
     int currentDevice = -1;
     const std::string configuredUtf8 = WideToUtf8Str(w.audioDevice);
 
-    // Preserve the semantic "default" entry instead of replacing it in the
-    // UI with whichever concrete endpoint happens to be default today.
     if (w.audioDevice.empty() || w.audioDevice == L"default") {
         currentDevice = 0;
     } else {
@@ -304,10 +317,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 w.soundFontPath.clear();
                 doc.MarkDirty();
             }
-            ImGui::SameLine();
         }
-        ImGui::TextDisabled("restart-only");
-        ImGui::SameLine();
         RestartRequiredBadge();
 
         static char searchBuf[128] = {};
