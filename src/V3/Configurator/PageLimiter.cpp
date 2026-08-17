@@ -2,425 +2,400 @@
 #include "ConfigDocument.h"
 #include "Widgets.h"
 #include "imgui.h"
-#include "imgui_internal.h"
 #include "Theme.h"
 #include "../SVMSRuntimeLinkProtocol.h"
-#include <cmath>
+
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 
 namespace svms::cfg {
+namespace {
 
-static float LinearToDb(float linear) {
-    return 20.0f * std::log10(std::max(linear, 0.001f));
+constexpr float kMeterFloorDb = -60.0f;
+constexpr float kGrMaxDb = 24.0f;
+constexpr int kGrHistoryCapacity = 320; // ~10.7 s at 30 Hz
+
+float LinearToDb(float linear) {
+    if (!std::isfinite(linear) || linear <= 0.000001f) return kMeterFloorDb;
+    return (std::max)(kMeterFloorDb, 20.0f * std::log10(linear));
 }
 
-static constexpr float kGrHistorySeconds = 10.0f;
-static constexpr int kGrHistoryMaxPixels = 1024;
+float MeterNorm(float linear) {
+    const float db = LinearToDb(linear);
+    return ImClamp((db - kMeterFloorDb) / -kMeterFloorDb, 0.0f, 1.0f);
+}
 
 struct GrHistory {
-    float buf[kGrHistoryMaxPixels] = {};
+    float values[kGrHistoryCapacity]{};
     int writePos = 0;
     int count = 0;
+    float accumulator = 0.0f;
+
+    void Push(float value) {
+        values[writePos] = ImClamp(value, 0.0f, kGrMaxDb);
+        writePos = (writePos + 1) % kGrHistoryCapacity;
+        if (count < kGrHistoryCapacity) ++count;
+    }
+
+    float AtOldestOffset(int i) const {
+        const int start = (writePos - count + kGrHistoryCapacity) % kGrHistoryCapacity;
+        return values[(start + i) % kGrHistoryCapacity];
+    }
 };
 
-static void GrHistory_Push(GrHistory& h, float db) {
-    h.buf[h.writePos] = db;
-    h.writePos = (h.writePos + 1) % kGrHistoryMaxPixels;
-    if (h.count < kGrHistoryMaxPixels) ++h.count;
+void DrawLevelBar(const char* id, float linear, const ImVec2& size) {
+    ImGui::PushID(id);
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    const ImU32 bg = ImGui::GetColorU32(ImVec4(0.055f, 0.062f, 0.074f, 1.0f));
+    const ImU32 border = ImGui::GetColorU32(ImVec4(0.16f, 0.18f, 0.22f, 1.0f));
+    dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bg, 3.0f);
+    dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), border, 3.0f);
+
+    const float norm = MeterNorm(linear);
+    if (norm > 0.0f) {
+        const float top = pos.y + size.y * (1.0f - norm);
+        const float db = LinearToDb(linear);
+        ImVec4 c = db < -12.0f
+            ? ImVec4(0.25f, 0.76f, 0.43f, 0.95f)
+            : (db < -3.0f
+                ? ImVec4(0.92f, 0.72f, 0.18f, 0.95f)
+                : ImVec4(0.90f, 0.30f, 0.28f, 0.95f));
+        dl->AddRectFilled(ImVec2(pos.x + 2.0f, top),
+                          ImVec2(pos.x + size.x - 2.0f, pos.y + size.y - 2.0f),
+                          ImGui::GetColorU32(c), 2.0f);
+    }
+
+    ImGui::Dummy(size);
+    ImGui::PopID();
 }
+
+void DrawGrBar(const char* id, float reductionDb, const ImVec2& size) {
+    ImGui::PushID(id);
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    const ImU32 bg = ImGui::GetColorU32(ImVec4(0.055f, 0.062f, 0.074f, 1.0f));
+    const ImU32 border = ImGui::GetColorU32(ImVec4(0.16f, 0.18f, 0.22f, 1.0f));
+    dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bg, 3.0f);
+    dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), border, 3.0f);
+
+    const float norm = ImClamp(reductionDb / kGrMaxDb, 0.0f, 1.0f);
+    if (norm > 0.0f) {
+        dl->AddRectFilled(ImVec2(pos.x + 2.0f, pos.y + 2.0f),
+                          ImVec2(pos.x + size.x - 2.0f,
+                                 pos.y + 2.0f + (size.y - 4.0f) * norm),
+                          ImGui::GetColorU32(ImVec4(0.94f, 0.68f, 0.16f, 0.95f)),
+                          2.0f);
+    }
+
+    ImGui::Dummy(size);
+    ImGui::PopID();
+}
+
+void DrawDbScale(float x, float top, float height) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float ticks[] = { 0.0f, -3.0f, -6.0f, -12.0f, -24.0f, -48.0f, -60.0f };
+    for (float db : ticks) {
+        const float norm = (db - kMeterFloorDb) / -kMeterFloorDb;
+        const float y = top + height * (1.0f - norm);
+        char text[16];
+        std::snprintf(text, sizeof(text), "%.0f", db);
+        dl->AddText(ImVec2(x, y - ImGui::GetFontSize() * 0.5f),
+                    ImGui::GetColorU32(ImVec4(0.43f, 0.46f, 0.51f, 0.9f)), text);
+    }
+}
+
+void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
+                   float height) {
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const float labelColumn = 26.0f;
+    const float groupGap = 14.0f;
+    const float usable = (std::max)(220.0f, avail - labelColumn * 2.0f - groupGap * 2.0f);
+    const float groupW = usable / 3.0f;
+    const float stereoGap = 5.0f;
+    const float stereoBarW = (std::max)(18.0f, (groupW - 24.0f - stereoGap) * 0.5f);
+    const float grBarW = (std::max)(30.0f, groupW * 0.46f);
+
+    if (!ImGui::BeginTable("##meter_bank", 3, ImGuiTableFlags_SizingStretchSame)) return;
+
+    auto stereoGroup = [&](const char* name, const char* idPrefix, float l, float r) {
+        ImGui::TableNextColumn();
+        const float colStart = ImGui::GetCursorPosX();
+        const float colAvail = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(colStart + (colAvail - (stereoBarW * 2.0f + stereoGap + labelColumn)) * 0.5f);
+        const ImVec2 screen = ImGui::GetCursorScreenPos();
+        char idL[32], idR[32];
+        std::snprintf(idL, sizeof(idL), "%sL", idPrefix);
+        std::snprintf(idR, sizeof(idR), "%sR", idPrefix);
+        DrawLevelBar(idL, l, ImVec2(stereoBarW, height));
+        ImGui::SameLine(0.0f, stereoGap);
+        DrawLevelBar(idR, r, ImVec2(stereoBarW, height));
+        DrawDbScale(screen.x + stereoBarW * 2.0f + stereoGap + 5.0f, screen.y, height);
+
+        ImGui::SetCursorPosX(colStart + (colAvail - (stereoBarW * 2.0f + stereoGap)) * 0.5f);
+        ImGui::TextDisabled("L");
+        ImGui::SameLine(stereoBarW + stereoGap + 4.0f);
+        ImGui::TextDisabled("R");
+        const ImVec2 ts = ImGui::CalcTextSize(name);
+        ImGui::SetCursorPosX(colStart + (colAvail - ts.x) * 0.5f);
+        ImGui::TextUnformatted(name);
+    };
+
+    stereoGroup("INPUT", "##input", inL, inR);
+
+    ImGui::TableNextColumn();
+    {
+        const float colStart = ImGui::GetCursorPosX();
+        const float colAvail = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(colStart + (colAvail - (grBarW + labelColumn)) * 0.5f);
+        const ImVec2 screen = ImGui::GetCursorScreenPos();
+        DrawGrBar("##gain_reduction", gr, ImVec2(grBarW, height));
+        DrawDbScale(screen.x + grBarW + 5.0f, screen.y, height);
+        const char* valueLabel = "GAIN REDUCTION";
+        const ImVec2 ts = ImGui::CalcTextSize(valueLabel);
+        ImGui::SetCursorPosX(colStart + (colAvail - ts.x) * 0.5f);
+        ImGui::TextUnformatted(valueLabel);
+        const float db = ImClamp(gr, 0.0f, kGrMaxDb);
+        const char* fmt = db < 10.0f ? "%.1f dB" : "%.0f dB";
+        ImGui::SetCursorPosX(colStart + (colAvail - 60.0f) * 0.5f);
+        ImGui::TextDisabled(fmt, db);
+    }
+
+    stereoGroup("OUTPUT", "##output", outL, outR);
+    ImGui::EndTable();
+}
+
+void DrawControls(ConfigValues& w, ConfigDocument& doc) {
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const float mainKnob = avail > 420.0f ? 96.0f : 84.0f;
+    const float smallKnob = avail > 420.0f ? 66.0f : 58.0f;
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.71f, 0.76f, 1.0f));
+    ImGui::TextUnformatted("CONTROLS");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    // Threshold is deliberately dominant and centered.
+    {
+        const float start = ImGui::GetCursorPosX();
+        ImGui::SetCursorPosX(start + (avail - mainKnob) * 0.5f);
+        float threshold = w.limiterThreshold;
+        KnobState ks = { threshold, 0.1f, 1.0f, 0.95f,
+                         "THRESHOLD", nullptr, mainKnob, 1.0f, LinearToDb };
+        if (RotaryKnob(ks, "%.1f dB")) {
+            w.limiterThreshold = ks.value;
+            doc.MarkDirty();
+            PushLiveFloat(svms::RLCommandType::SetLimiterThreshold, ks.value);
+        }
+    }
+
+    ImGui::Spacing();
+
+    if (ImGui::BeginTable("##limiter_timing", 3, ImGuiTableFlags_SizingStretchSame)) {
+        auto timingKnob = [&](const char* label, float& value,
+                              float minValue, float maxValue, float defaultValue,
+                              svms::RLCommandType command) {
+            ImGui::TableNextColumn();
+            const float colStart = ImGui::GetCursorPosX();
+            const float colAvail = ImGui::GetContentRegionAvail().x;
+            ImGui::SetCursorPosX(colStart + (colAvail - smallKnob) * 0.5f);
+            KnobState ks = { value, minValue, maxValue, defaultValue,
+                             label, "ms", smallKnob };
+            if (RotaryKnob(ks, "%.1f ms")) {
+                value = ks.value;
+                doc.MarkDirty();
+                PushLiveFloat(command, ks.value);
+            }
+        };
+
+        timingKnob("LOOKAHEAD", w.limiterLookaheadMs, 0.0f, 20.0f, 3.0f,
+                   svms::RLCommandType::SetLimiterLookahead);
+        timingKnob("ATTACK", w.limiterAttackMs, 0.01f, 100.0f, 0.5f,
+                   svms::RLCommandType::SetLimiterAttack);
+        timingKnob("RELEASE", w.limiterReleaseMs, 1.0f, 5000.0f, 100.0f,
+                   svms::RLCommandType::SetLimiterRelease);
+        ImGui::EndTable();
+    }
+}
+
+void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr) {
+    const float dt = ImGui::GetIO().DeltaTime;
+    history.accumulator += dt;
+    while (history.accumulator >= (1.0f / 30.0f)) {
+        history.accumulator -= 1.0f / 30.0f;
+        history.Push(telemetryAvailable ? currentGr : 0.0f);
+    }
+
+    const float graphW = ImGui::GetContentRegionAvail().x;
+    const float graphH = (std::max)(150.0f, (std::min)(220.0f, ImGui::GetContentRegionAvail().y - 28.0f));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    dl->AddRectFilled(p, ImVec2(p.x + graphW, p.y + graphH),
+                      ImGui::GetColorU32(ImVec4(0.050f, 0.058f, 0.070f, 1.0f)), 5.0f);
+    dl->AddRect(p, ImVec2(p.x + graphW, p.y + graphH),
+                ImGui::GetColorU32(ImVec4(0.15f, 0.17f, 0.21f, 1.0f)), 5.0f);
+
+    const float left = p.x + 42.0f;
+    const float right = p.x + graphW - 10.0f;
+    const float top = p.y + 24.0f;
+    const float bottom = p.y + graphH - 24.0f;
+    const float plotH = bottom - top;
+
+    const float ticks[] = { 0.0f, 3.0f, 6.0f, 12.0f, 18.0f, 24.0f };
+    for (float db : ticks) {
+        const float y = top + plotH * (db / kGrMaxDb);
+        dl->AddLine(ImVec2(left, y), ImVec2(right, y),
+                    ImGui::GetColorU32(ImVec4(0.16f, 0.18f, 0.22f, 1.0f)), 1.0f);
+        char label[16];
+        std::snprintf(label, sizeof(label), db == 0.0f ? "0" : "-%.0f", db);
+        dl->AddText(ImVec2(p.x + 7.0f, y - ImGui::GetFontSize() * 0.5f),
+                    ImGui::GetColorU32(ImVec4(0.43f, 0.46f, 0.51f, 0.9f)), label);
+    }
+
+    const char* title = "GAIN REDUCTION HISTORY";
+    dl->AddText(ImVec2(left, p.y + 5.0f),
+                ImGui::GetColorU32(ImVec4(0.68f, 0.71f, 0.76f, 1.0f)), title);
+
+    if (telemetryAvailable && history.count >= 2) {
+        ImVec2 previous{};
+        bool havePrevious = false;
+        for (int i = 0; i < history.count; ++i) {
+            const float gr = history.AtOldestOffset(i);
+            const float x = left + (right - left) *
+                (static_cast<float>(i) / static_cast<float>(history.count - 1));
+            const float y = top + plotH * (ImClamp(gr, 0.0f, kGrMaxDb) / kGrMaxDb);
+            const ImVec2 point(x, y);
+            if (havePrevious) {
+                dl->AddLine(previous, point,
+                            ImGui::GetColorU32(ImVec4(0.94f, 0.68f, 0.16f, 0.95f)), 2.0f);
+                // subtle filled strip beneath the curve segment
+                dl->AddQuadFilled(previous, point,
+                                  ImVec2(point.x, top), ImVec2(previous.x, top),
+                                  ImGui::GetColorU32(ImVec4(0.94f, 0.68f, 0.16f, 0.07f)));
+            }
+            previous = point;
+            havePrevious = true;
+        }
+
+        char latest[32];
+        std::snprintf(latest, sizeof(latest), "%.1f dB", currentGr);
+        const ImVec2 ts = ImGui::CalcTextSize(latest);
+        dl->AddText(ImVec2(right - ts.x, p.y + 5.0f),
+                    ImGui::GetColorU32(ImVec4(0.94f, 0.68f, 0.16f, 1.0f)), latest);
+    } else {
+        const char* offline = telemetryAvailable
+            ? "Waiting for limiter telemetry..."
+            : "Runtime telemetry unavailable";
+        const ImVec2 ts = ImGui::CalcTextSize(offline);
+        dl->AddText(ImVec2((left + right - ts.x) * 0.5f,
+                           (top + bottom - ts.y) * 0.5f),
+                    ImGui::GetColorU32(ImVec4(0.42f, 0.45f, 0.50f, 1.0f)), offline);
+    }
+
+    dl->AddText(ImVec2(left, bottom + 5.0f),
+                ImGui::GetColorU32(ImVec4(0.38f, 0.41f, 0.46f, 1.0f)), "10 s ago");
+    const char* now = "now";
+    const ImVec2 nowSize = ImGui::CalcTextSize(now);
+    dl->AddText(ImVec2(right - nowSize.x, bottom + 5.0f),
+                ImGui::GetColorU32(ImVec4(0.38f, 0.41f, 0.46f, 1.0f)), now);
+
+    ImGui::Dummy(ImVec2(graphW, graphH));
+}
+
+} // namespace
 
 void DrawLimiterPage(ConfigDocument& doc) {
     PushEffectPageStyle();
 
     auto& w = doc.Working();
-    auto& lc = GetLiveLinkContext();
+    const auto& lc = GetLiveLinkContext();
     const auto* t = lc.telemetry;
+    const bool telemetryAvailable = lc.connected && t != nullptr;
+    static GrHistory history;
 
-    static GrHistory grHist = {};
+    // Header uses a table so the title and badges cannot collide with the toggle.
+    if (ImGui::BeginTable("##limiter_header", 3, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("enable", ImGuiTableColumnFlags_WidthFixed, 155.0f);
+        ImGui::TableSetupColumn("title", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthFixed, 190.0f);
+        ImGui::TableNextRow();
 
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
-
-    // ── Header row: ENABLED toggle + title + badges ────────────────────
-    {
-        bool limiterEnabled = w.limiterEnabled;
-        if (ToggleSwitch("ENABLED", &limiterEnabled,
-                         "Enable the transparent brick-wall limiter.")) {
-            w.limiterEnabled = limiterEnabled;
+        ImGui::TableNextColumn();
+        bool enabled = w.limiterEnabled;
+        if (ToggleSwitch("ENABLED", &enabled, "Enable the transparent brick-wall limiter.")) {
+            w.limiterEnabled = enabled;
             doc.MarkDirty();
-            PushLiveBool(svms::RLCommandType::SetLimiterEnabled, limiterEnabled);
+            PushLiveBool(svms::RLCommandType::SetLimiterEnabled, enabled);
         }
-    }
-    ImGui::SameLine();
-    if (lc.connected) LiveBadge("All limiter params applied live");
-    AppliedStateBadge(lc.connected, lc.telemetry, w,
-                      "Limiter group applied state vs working copy");
 
-    ImGui::SameLine(ImGui::GetWindowWidth() * 0.3f);
-    ImGui::PushFont(nullptr);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.55f, 1.0f));
-    ImGui::Text("LIMITER");
-    ImGui::PopStyleColor();
-    ImGui::PopFont();
+        ImGui::TableNextColumn();
+        const char* title = "LIMITER";
+        const ImVec2 titleSize = ImGui::CalcTextSize(title);
+        const float start = ImGui::GetCursorPosX();
+        const float width = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(start + (width - titleSize.x) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.55f, 1.0f));
+        ImGui::TextUnformatted(title);
+        ImGui::PopStyleColor();
+
+        ImGui::TableNextColumn();
+        if (lc.connected) LiveBadge("All limiter parameters are live-previewed");
+        AppliedStateBadge(lc.connected, lc.telemetry, w,
+                          "Limiter group applied state vs working copy");
+        ImGui::EndTable();
+    }
 
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── Meters + knobs using a table ───────────────────────────────────
-    // Col 0: Input meter, Col 1: GR meter, Col 2: Output meter,
-    // Col 3: knob group (threshold + timing controls)
-    float meterH = 220.0f;
-    float stereoBarW = 28.0f;
-    float stereoGap = 8.0f;
-    float stereoPairW = stereoBarW * 2.0f + stereoGap + 30.0f;
-    float knobAreaW = 280.0f;
-    float gap = 16.0f;
-    float colW[4] = {
-        stereoPairW + gap,
-        60.0f + 30.0f + gap,
-        stereoPairW + gap,
-        knobAreaW
-    };
+    const float inL = telemetryAvailable ? t->limiterInputPeakL : 0.0f;
+    const float inR = telemetryAvailable ? t->limiterInputPeakR : 0.0f;
+    const float outL = telemetryAvailable ? t->limiterOutputPeakL : 0.0f;
+    const float outR = telemetryAvailable ? t->limiterOutputPeakR : 0.0f;
+    const float gr = telemetryAvailable ? t->limiterGainReductionDb : 0.0f;
 
-    float liveInL = t ? t->limiterInputPeakL : 0.0f;
-    float liveInR = t ? t->limiterInputPeakR : 0.0f;
-    float liveOutL = t ? t->limiterOutputPeakL : 0.0f;
-    float liveOutR = t ? t->limiterOutputPeakR : 0.0f;
-    float liveGR = t ? t->limiterGainReductionDb : 0.0f;
+    const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float topHeight = (std::max)(285.0f, (std::min)(360.0f, ImGui::GetContentRegionAvail().y * 0.52f));
 
-    if (ImGui::BeginTable("##limiter_main", 4,
-                          ImGuiTableFlags_BordersInnerV |
-                          ImGuiTableFlags_NoBordersInBody |
-                          ImGuiTableFlags_NoHostExtendX,
-                          ImVec2(0, 0))) {
-        ImGui::TableSetupColumn("input",  ImGuiTableColumnFlags_WidthFixed, colW[0]);
-        ImGui::TableSetupColumn("gr",     ImGuiTableColumnFlags_WidthFixed, colW[1]);
-        ImGui::TableSetupColumn("output", ImGuiTableColumnFlags_WidthFixed, colW[2]);
-        ImGui::TableSetupColumn("knobs",  ImGuiTableColumnFlags_WidthFixed, colW[3]);
-        ImGui::TableNextRow();
+    if (ImGui::BeginTable("##limiter_top", 2,
+                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("meters", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("controls", ImGuiTableColumnFlags_WidthStretch,
+                                availableWidth > 900.0f ? 1.10f : 0.95f);
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, topHeight);
 
-        // ── Column 0: Input meter (stereo L/R) ────────────────────────
         ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
-        {
-            ImVec2 mStart = ImGui::GetCursorScreenPos();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-
-            // L bar
-            DrawVerticalMeter("##inL", liveInL, liveInL,
-                              ImVec2(stereoBarW, meterH), false);
-            // R bar
-            ImGui::SameLine(0, stereoGap);
-            DrawVerticalMeter("##inR", liveInR, liveInR,
-                              ImVec2(stereoBarW, meterH), false);
-
-            // dB scale (to the right of the pair)
-            auto drawPairScale = [&](float x, float h) {
-                auto tick = [&](float db, const char* text) {
-                    float frac = (db + 48.0f) / 48.0f;
-                    float y = mStart.y + h - h * frac;
-                    dl->AddText(ImVec2(x, y - 5.0f),
-                                ImGui::GetColorU32(
-                                    ImVec4(0.45f, 0.48f, 0.52f, 0.8f)),
-                                text);
-                };
-                tick(0.0f, "0");
-                tick(-3.0f, "-3");
-                tick(-6.0f, "-6");
-                tick(-12.0f, "-12");
-                tick(-24.0f, "-24");
-                tick(-48.0f, "-48");
-            };
-            drawPairScale(mStart.x + stereoBarW * 2.0f + stereoGap + 4.0f,
-                          meterH);
-
-            // L/R labels
-            float pairW = stereoBarW * 2.0f + stereoGap;
-            ImVec2 lblL(mStart.x + stereoBarW * 0.5f - 4.0f,
-                        mStart.y + meterH + 4.0f);
-            dl->AddText(lblL,
-                        ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                        "L");
-            ImVec2 lblR(mStart.x + stereoBarW + stereoGap + stereoBarW * 0.5f - 4.0f,
-                        mStart.y + meterH + 4.0f);
-            dl->AddText(lblR,
-                        ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                        "R");
-            ImVec2 lblMain(mStart.x + pairW * 0.5f - 16.0f,
-                           mStart.y + meterH + 16.0f);
-            dl->AddText(lblMain,
-                        ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                        "INPUT");
-
-            ImGui::Dummy(ImVec2(stereoPairW, meterH + 32.0f));
-        }
-
-        // ── Column 1: Gain Reduction meter ─────────────────────────────
-        ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
-        {
-            ImVec2 mStart = ImGui::GetCursorScreenPos();
-            DrawGainReductionMeter("##gr", liveGR, ImVec2(60.0f, meterH));
-
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            ImVec2 lblPos(mStart.x + 60.0f * 0.5f - 30.0f,
-                          mStart.y + meterH + 16.0f);
-            dl->AddText(lblPos,
-                        ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                        "GAIN RED.");
-        }
-
-        // ── Column 2: Output meter (stereo L/R) ───────────────────────
-        ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
-        {
-            ImVec2 mStart = ImGui::GetCursorScreenPos();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-
-            // L bar
-            DrawVerticalMeter("##outL", liveOutL, liveOutL,
-                              ImVec2(stereoBarW, meterH), false);
-            // R bar
-            ImGui::SameLine(0, stereoGap);
-            DrawVerticalMeter("##outR", liveOutR, liveOutR,
-                              ImVec2(stereoBarW, meterH), false);
-
-            // dB scale
-            auto drawPairScale = [&](float x, float h) {
-                auto tick = [&](float db, const char* text) {
-                    float frac = (db + 48.0f) / 48.0f;
-                    float y = mStart.y + h - h * frac;
-                    dl->AddText(ImVec2(x, y - 5.0f),
-                                ImGui::GetColorU32(
-                                    ImVec4(0.45f, 0.48f, 0.52f, 0.8f)),
-                                text);
-                };
-                tick(0.0f, "0");
-                tick(-3.0f, "-3");
-                tick(-6.0f, "-6");
-                tick(-12.0f, "-12");
-                tick(-24.0f, "-24");
-                tick(-48.0f, "-48");
-            };
-            drawPairScale(mStart.x + stereoBarW * 2.0f + stereoGap + 4.0f,
-                          meterH);
-
-            // L/R labels
-            float pairW = stereoBarW * 2.0f + stereoGap;
-            ImVec2 lblL(mStart.x + stereoBarW * 0.5f - 4.0f,
-                        mStart.y + meterH + 4.0f);
-            dl->AddText(lblL,
-                        ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                        "L");
-            ImVec2 lblR(mStart.x + stereoBarW + stereoGap + stereoBarW * 0.5f - 4.0f,
-                        mStart.y + meterH + 4.0f);
-            dl->AddText(lblR,
-                        ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                        "R");
-            ImVec2 lblMain(mStart.x + pairW * 0.5f - 20.0f,
-                           mStart.y + meterH + 16.0f);
-            dl->AddText(lblMain,
-                        ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                        "OUTPUT");
-
-            ImGui::Dummy(ImVec2(stereoPairW, meterH + 32.0f));
-        }
-
-        // ── Column 3: Four knobs in a single row ───────────────────────
-        ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 8.0f);
-        {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.70f, 0.72f, 0.75f, 1.0f));
-            ImGui::Text("CONTROLS");
-            ImGui::PopStyleColor();
-        }
-
+        ImGui::BeginChild("##meter_panel", ImVec2(0.0f, topHeight - 6.0f), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::TextDisabled("METERS");
         ImGui::Spacing();
+        DrawMeterBank(inL, inR, gr, outL, outR, topHeight - 78.0f);
+        ImGui::EndChild();
 
-        {
-            float thresh = w.limiterThreshold;
-            KnobState ks = { thresh, 0.1f, 1.0f, 0.95f, "THRESHOLD", nullptr,
-                             72.0f, 1.0f, LinearToDb };
-            if (RotaryKnob(ks, "%.1f dB")) {
-                w.limiterThreshold = ks.value;
-                doc.MarkDirty();
-                PushLiveFloat(svms::RLCommandType::SetLimiterThreshold, ks.value);
-            }
-        }
-
-        ImGui::SameLine(0, 8.0f);
-        {
-            float la = w.limiterLookaheadMs;
-            KnobState ks = { la, 0.0f, 20.0f, 3.0f, "LOOKAHEAD", "ms", 60.0f };
-            if (RotaryKnob(ks, "%.1f")) {
-                w.limiterLookaheadMs = ks.value;
-                doc.MarkDirty();
-                PushLiveFloat(svms::RLCommandType::SetLimiterLookahead, ks.value);
-            }
-        }
-
-        ImGui::SameLine(0, 8.0f);
-        {
-            float atk = w.limiterAttackMs;
-            KnobState ks = { atk, 0.01f, 100.0f, 0.5f, "ATTACK", "ms", 60.0f };
-            if (RotaryKnob(ks, "%.1f")) {
-                w.limiterAttackMs = ks.value;
-                doc.MarkDirty();
-                PushLiveFloat(svms::RLCommandType::SetLimiterAttack, ks.value);
-            }
-        }
-
-        ImGui::SameLine(0, 8.0f);
-        {
-            float rel = w.limiterReleaseMs;
-            KnobState ks = { rel, 1.0f, 5000.0f, 100.0f, "RELEASE", "ms", 60.0f };
-            if (RotaryKnob(ks, "%.1f")) {
-                w.limiterReleaseMs = ks.value;
-                doc.MarkDirty();
-                PushLiveFloat(svms::RLCommandType::SetLimiterRelease, ks.value);
-            }
-        }
-
+        ImGui::TableNextColumn();
+        ImGui::BeginChild("##control_panel", ImVec2(0.0f, topHeight - 6.0f), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        DrawControls(w, doc);
+        ImGui::EndChild();
         ImGui::EndTable();
     }
 
     ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
 
-    // ── Live telemetry readout ─────────────────────────────────────────
-    if (lc.connected && t) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.80f, 0.45f, 1.0f));
-        ImGui::Text("Live limiter telemetry active");
-        ImGui::PopStyleColor();
-
-        ImGui::Text("Input peak:  L %.3f (%.1f dB)  R %.3f (%.1f dB)",
-                    liveInL, LinearToDb(liveInL), liveInR, LinearToDb(liveInR));
-        ImGui::Text("Output peak: L %.3f (%.1f dB)  R %.3f (%.1f dB)",
-                    liveOutL, LinearToDb(liveOutL), liveOutR, LinearToDb(liveOutR));
-        ImGui::Text("Gain reduction: %.1f dB", liveGR);
-        ImGui::Text("Threshold: %.1f dB", LinearToDb(w.limiterThreshold));
-
-        // Push GR into the scrolling history
-        GrHistory_Push(grHist, liveGR);
+    if (telemetryAvailable) {
+        ImGui::TextDisabled("IN  L %.1f / R %.1f dB     OUT  L %.1f / R %.1f dB     GR %.1f dB",
+                            LinearToDb(inL), LinearToDb(inR),
+                            LinearToDb(outL), LinearToDb(outR), gr);
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
-        ImGui::Text("Live meter source: Runtime telemetry unavailable");
-        ImGui::PopStyleColor();
-
-        GrHistory_Push(grHist, 0.0f);
+        ImGui::TextDisabled("Runtime telemetry unavailable — controls remain editable and live preview resumes when a driver connects.");
     }
 
     ImGui::Spacing();
-
-    // ── Scrolling 10-second gain-reduction history ─────────────────────
-    {
-        float graphW = ImGui::GetContentRegionAvail().x;
-        float graphH = 120.0f;
-        ImVec2 graphPos = ImGui::GetCursorScreenPos();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-
-        // Background
-        dl->AddRectFilled(graphPos,
-                          ImVec2(graphPos.x + graphW, graphPos.y + graphH),
-                          ImGui::GetColorU32(ImVec4(0.06f, 0.07f, 0.085f, 1.0f)),
-                          4.0f);
-        dl->AddRect(graphPos,
-                    ImVec2(graphPos.x + graphW, graphPos.y + graphH),
-                    ImGui::GetColorU32(ImVec4(0.15f, 0.17f, 0.21f, 1.0f)),
-                    4.0f, 0, 1.0f);
-
-        const float plotLeft = graphPos.x + 34.0f;
-        const float plotRight = graphPos.x + graphW - 8.0f;
-        const float plotTop = graphPos.y + 8.0f;
-        const float plotBot = graphPos.y + graphH - 18.0f;
-
-        // Graticule: 6 dB gridlines with labels
-        for (int db = 6; db <= 24; db += 6) {
-            float y = plotBot - (plotBot - plotTop) * (static_cast<float>(db) / 24.0f);
-            dl->AddLine(ImVec2(plotLeft, y), ImVec2(plotRight, y),
-                        ImGui::GetColorU32(ImVec4(0.18f, 0.20f, 0.24f, 1.0f)),
-                        1.0f);
-            char lbl[16];
-            snprintf(lbl, sizeof(lbl), "-%d dB", db);
-            dl->AddText(ImVec2(graphPos.x + 4.0f, y - 7.0f),
-                        ImGui::GetColorU32(ImVec4(0.42f, 0.45f, 0.50f, 1.0f)),
-                        lbl);
-        }
-
-        // Draw the GR history as a filled polygon
-        if (grHist.count >= 2) {
-            const int n = grHist.count;
-            const float plotW = plotRight - plotLeft;
-            const float plotH = plotBot - plotTop;
-
-            // Build path points
-            ImVec2 pts[kGrHistoryMaxPixels + 2];
-            int numPts = 0;
-
-            for (int i = 0; i < n; ++i) {
-                const int idx = (grHist.writePos - n + i + kGrHistoryMaxPixels)
-                                % kGrHistoryMaxPixels;
-                const float gr = grHist.buf[idx];
-                const float x = plotLeft + plotW * (static_cast<float>(i) / (n - 1));
-                const float grNorm = ImClamp(-gr / 24.0f, 0.0f, 1.0f);
-                const float y = plotBot - plotH * grNorm;
-                pts[numPts++] = ImVec2(x, y);
-            }
-
-            // Close the polygon along the bottom
-            pts[numPts++] = ImVec2(plotRight, plotBot);
-            pts[numPts++] = ImVec2(plotLeft, plotBot);
-
-            // Filled area
-            dl->AddConvexPolyFilled(pts, numPts,
-                ImGui::GetColorU32(ImVec4(0.90f, 0.70f, 0.20f, 0.15f)));
-
-            // Line on top
-            for (int i = 0; i < numPts - 3; ++i) {
-                dl->AddLine(pts[i], pts[i + 1],
-                            ImGui::GetColorU32(ImVec4(0.90f, 0.70f, 0.20f, 0.9f)),
-                            1.5f);
-            }
-        }
-
-        // Axis labels
-        dl->AddText(ImVec2(plotRight - 40.0f, plotBot + 4.0f),
-                    ImGui::GetColorU32(ImVec4(0.42f, 0.45f, 0.50f, 1.0f)),
-                    "10 s ago");
-        dl->AddText(ImVec2(plotLeft, plotBot + 4.0f),
-                    ImGui::GetColorU32(ImVec4(0.42f, 0.45f, 0.50f, 1.0f)),
-                    "now");
-
-        dl->AddText(ImVec2(plotLeft + (plotRight - plotLeft) * 0.5f - 56.0f,
-                           graphPos.y + 2.0f),
-                    ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                    "Gain reduction (dB)");
-
-        ImGui::Dummy(ImVec2(graphW, graphH));
-    }
-
-    ImGui::Spacing();
-
-    // ── Callback budget stats ──────────────────────────────────────────
-    if (lc.connected && t) {
-        if (t->overBudgetCallbacks > 0u || t->maxConsecutiveOverBudget > 0u) {
-            ImGui::TextDisabled(
-                "Callback budget: P95 %.0f%%  P99 %.0f%%  P999 %.0f%%  "
-                "over-budget %llu (max streak %u)",
-                static_cast<double>(t->callbackP95Percent),
-                static_cast<double>(t->callbackP99Percent),
-                static_cast<double>(t->callbackP999Percent),
-                static_cast<unsigned long long>(t->overBudgetCallbacks),
-                t->maxConsecutiveOverBudget);
-        } else {
-            ImGui::TextDisabled(
-                "Callback budget: P95 %.0f%%  P99 %.0f%%  P999 %.0f%%",
-                static_cast<double>(t->callbackP95Percent),
-                static_cast<double>(t->callbackP99Percent),
-                static_cast<double>(t->callbackP999Percent));
-        }
-    }
+    DrawHistory(history, telemetryAvailable, gr);
 
     PopEffectPageStyle();
 }
