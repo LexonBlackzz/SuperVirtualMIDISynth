@@ -116,7 +116,9 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
     const float usable = (std::max)(220.0f, avail - labelColumn * 2.0f - groupGap * 2.0f);
     const float groupW = usable / 3.0f;
     const float stereoGap = 5.0f;
-    const float stereoBarW = (std::max)(18.0f, (groupW - 24.0f - stereoGap) * 0.5f);
+    // Leave a little extra room for the dB text, but center the actual bars
+    // themselves inside each third instead of centering bars + scale together.
+    const float stereoBarW = (std::max)(18.0f, (groupW - 30.0f - stereoGap) * 0.5f);
     const float grBarW = (std::max)(30.0f, groupW * 0.46f);
 
     if (!ImGui::BeginTable("##meter_bank", 3, ImGuiTableFlags_SizingStretchSame)) return;
@@ -126,7 +128,7 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         const float colStart = ImGui::GetCursorPosX();
         const float colAvail = ImGui::GetContentRegionAvail().x;
         const float barsWidth = stereoBarW * 2.0f + stereoGap;
-        ImGui::SetCursorPosX(colStart + (colAvail - (barsWidth + labelColumn)) * 0.5f);
+        ImGui::SetCursorPosX(colStart + (colAvail - barsWidth) * 0.5f);
         const ImVec2 screen = ImGui::GetCursorScreenPos();
 
         char idL[32], idR[32];
@@ -135,10 +137,8 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         DrawLevelBar(idL, l, ImVec2(stereoBarW, height));
         ImGui::SameLine(0.0f, stereoGap);
         DrawLevelBar(idR, r, ImVec2(stereoBarW, height));
-        DrawDbScale(screen.x + barsWidth + 5.0f, screen.y, height);
+        DrawDbScale(screen.x + barsWidth + 4.0f, screen.y, height);
 
-        // Keep all captions inside the meter-panel child. The previous
-        // meter height left too little room and clipped INPUT/OUTPUT.
         ImGui::SetCursorPosX(colStart + (colAvail - barsWidth) * 0.5f);
         ImGui::TextDisabled("L");
         ImGui::SameLine(stereoBarW + stereoGap + 4.0f);
@@ -155,10 +155,10 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
     {
         const float colStart = ImGui::GetCursorPosX();
         const float colAvail = ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosX(colStart + (colAvail - (grBarW + labelColumn)) * 0.5f);
+        ImGui::SetCursorPosX(colStart + (colAvail - grBarW) * 0.5f);
         const ImVec2 screen = ImGui::GetCursorScreenPos();
         DrawGrBar("##gain_reduction", gr, ImVec2(grBarW, height));
-        DrawDbScale(screen.x + grBarW + 5.0f, screen.y, height);
+        DrawDbScale(screen.x + grBarW + 4.0f, screen.y, height);
 
         const char* valueLabel = "GAIN REDUCTION";
         const ImVec2 ts = ImGui::CalcTextSize(valueLabel);
@@ -379,8 +379,6 @@ void DrawLimiterPage(ConfigDocument& doc) {
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::TextDisabled("METERS");
         ImGui::Spacing();
-        // Leave enough vertical room for L/R, INPUT/OUTPUT and GR captions.
-        // At the old -78 offset the final line intersected the child clip rect.
         const float meterHeight = (std::max)(140.0f, topHeight - 102.0f);
         DrawMeterBank(inL, inR, gr, outL, outR, meterHeight);
         ImGui::EndChild();
