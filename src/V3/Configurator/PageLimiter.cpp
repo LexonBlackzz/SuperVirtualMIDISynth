@@ -58,7 +58,7 @@ void DrawLevelBar(const char* id, float linear, const ImVec2& size) {
     if (norm > 0.0f) {
         const float top = pos.y + size.y * (1.0f - norm);
         const float db = LinearToDb(linear);
-        ImVec4 c = db < -12.0f
+        const ImVec4 c = db < -12.0f
             ? ImVec4(0.25f, 0.76f, 0.43f, 0.95f)
             : (db < -3.0f
                 ? ImVec4(0.92f, 0.72f, 0.18f, 0.95f)
@@ -125,20 +125,25 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         ImGui::TableNextColumn();
         const float colStart = ImGui::GetCursorPosX();
         const float colAvail = ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosX(colStart + (colAvail - (stereoBarW * 2.0f + stereoGap + labelColumn)) * 0.5f);
+        const float barsWidth = stereoBarW * 2.0f + stereoGap;
+        ImGui::SetCursorPosX(colStart + (colAvail - (barsWidth + labelColumn)) * 0.5f);
         const ImVec2 screen = ImGui::GetCursorScreenPos();
+
         char idL[32], idR[32];
         std::snprintf(idL, sizeof(idL), "%sL", idPrefix);
         std::snprintf(idR, sizeof(idR), "%sR", idPrefix);
         DrawLevelBar(idL, l, ImVec2(stereoBarW, height));
         ImGui::SameLine(0.0f, stereoGap);
         DrawLevelBar(idR, r, ImVec2(stereoBarW, height));
-        DrawDbScale(screen.x + stereoBarW * 2.0f + stereoGap + 5.0f, screen.y, height);
+        DrawDbScale(screen.x + barsWidth + 5.0f, screen.y, height);
 
-        ImGui::SetCursorPosX(colStart + (colAvail - (stereoBarW * 2.0f + stereoGap)) * 0.5f);
+        // Keep all captions inside the meter-panel child. The previous
+        // meter height left too little room and clipped INPUT/OUTPUT.
+        ImGui::SetCursorPosX(colStart + (colAvail - barsWidth) * 0.5f);
         ImGui::TextDisabled("L");
         ImGui::SameLine(stereoBarW + stereoGap + 4.0f);
         ImGui::TextDisabled("R");
+
         const ImVec2 ts = ImGui::CalcTextSize(name);
         ImGui::SetCursorPosX(colStart + (colAvail - ts.x) * 0.5f);
         ImGui::TextUnformatted(name);
@@ -154,10 +159,12 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         const ImVec2 screen = ImGui::GetCursorScreenPos();
         DrawGrBar("##gain_reduction", gr, ImVec2(grBarW, height));
         DrawDbScale(screen.x + grBarW + 5.0f, screen.y, height);
+
         const char* valueLabel = "GAIN REDUCTION";
         const ImVec2 ts = ImGui::CalcTextSize(valueLabel);
         ImGui::SetCursorPosX(colStart + (colAvail - ts.x) * 0.5f);
         ImGui::TextUnformatted(valueLabel);
+
         const float db = ImClamp(gr, 0.0f, kGrMaxDb);
         const char* fmt = db < 10.0f ? "%.1f dB" : "%.0f dB";
         ImGui::SetCursorPosX(colStart + (colAvail - 60.0f) * 0.5f);
@@ -178,7 +185,6 @@ void DrawControls(ConfigValues& w, ConfigDocument& doc) {
     ImGui::PopStyleColor();
     ImGui::Spacing();
 
-    // Threshold is deliberately dominant and centered.
     {
         const float start = ImGui::GetCursorPosX();
         ImGui::SetCursorPosX(start + (avail - mainKnob) * 0.5f);
@@ -230,7 +236,8 @@ void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr) {
     }
 
     const float graphW = ImGui::GetContentRegionAvail().x;
-    const float graphH = (std::max)(150.0f, (std::min)(220.0f, ImGui::GetContentRegionAvail().y - 28.0f));
+    const float graphH = (std::max)(150.0f,
+        (std::min)(220.0f, ImGui::GetContentRegionAvail().y - 28.0f));
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -256,9 +263,9 @@ void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr) {
                     ImGui::GetColorU32(ImVec4(0.43f, 0.46f, 0.51f, 0.9f)), label);
     }
 
-    const char* title = "GAIN REDUCTION HISTORY";
     dl->AddText(ImVec2(left, p.y + 5.0f),
-                ImGui::GetColorU32(ImVec4(0.68f, 0.71f, 0.76f, 1.0f)), title);
+                ImGui::GetColorU32(ImVec4(0.68f, 0.71f, 0.76f, 1.0f)),
+                "GAIN REDUCTION HISTORY");
 
     if (telemetryAvailable && history.count >= 2) {
         ImVec2 previous{};
@@ -272,7 +279,6 @@ void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr) {
             if (havePrevious) {
                 dl->AddLine(previous, point,
                             ImGui::GetColorU32(ImVec4(0.94f, 0.68f, 0.16f, 0.95f)), 2.0f);
-                // subtle filled strip beneath the curve segment
                 dl->AddQuadFilled(previous, point,
                                   ImVec2(point.x, top), ImVec2(previous.x, top),
                                   ImGui::GetColorU32(ImVec4(0.94f, 0.68f, 0.16f, 0.07f)));
@@ -317,7 +323,6 @@ void DrawLimiterPage(ConfigDocument& doc) {
     const bool telemetryAvailable = lc.connected && t != nullptr;
     static GrHistory history;
 
-    // Header uses a table so the title and badges cannot collide with the toggle.
     if (ImGui::BeginTable("##limiter_header", 3, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("enable", ImGuiTableColumnFlags_WidthFixed, 155.0f);
         ImGui::TableSetupColumn("title", ImGuiTableColumnFlags_WidthStretch);
@@ -359,7 +364,8 @@ void DrawLimiterPage(ConfigDocument& doc) {
     const float gr = telemetryAvailable ? t->limiterGainReductionDb : 0.0f;
 
     const float availableWidth = ImGui::GetContentRegionAvail().x;
-    const float topHeight = (std::max)(285.0f, (std::min)(360.0f, ImGui::GetContentRegionAvail().y * 0.52f));
+    const float topHeight = (std::max)(285.0f,
+        (std::min)(360.0f, ImGui::GetContentRegionAvail().y * 0.52f));
 
     if (ImGui::BeginTable("##limiter_top", 2,
                           ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
@@ -373,7 +379,10 @@ void DrawLimiterPage(ConfigDocument& doc) {
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::TextDisabled("METERS");
         ImGui::Spacing();
-        DrawMeterBank(inL, inR, gr, outL, outR, topHeight - 78.0f);
+        // Leave enough vertical room for L/R, INPUT/OUTPUT and GR captions.
+        // At the old -78 offset the final line intersected the child clip rect.
+        const float meterHeight = (std::max)(140.0f, topHeight - 102.0f);
+        DrawMeterBank(inL, inR, gr, outL, outR, meterHeight);
         ImGui::EndChild();
 
         ImGui::TableNextColumn();
