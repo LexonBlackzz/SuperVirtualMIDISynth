@@ -82,16 +82,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     switch (msg) {
     case WM_NCCREATE: {
-        // Attach the owning ConfiguratorApp; CreateWindowExW passes `this`
-        // as lpCreateParams.
         CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
         SetWindowLongPtrW(hWnd, GWLP_USERDATA,
                           reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
         return TRUE;
     }
     case WM_SIZE: {
-        // Record the new client size only; the swap chain is resized in
-        // the normal render loop (never re-entrantly from WndProc).
         ConfiguratorApp* app = appFromHwnd(hWnd);
         if (app && wParam != SIZE_MINIMIZED) {
             app->pendingWidth_ = static_cast<UINT>(LOWORD(lParam));
@@ -101,8 +97,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_DPICHANGED: {
-        // Apply the suggested rect; the font rebuild is deferred to the
-        // render loop via pending flags.
         ConfiguratorApp* app = appFromHwnd(hWnd);
         if (app) {
             const float newScale =
@@ -113,7 +107,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_CLOSE: {
-        // Ask before discarding unsaved configuration edits.
         ConfiguratorApp* app = appFromHwnd(hWnd);
         if (app && app->config_.IsDirty()) {
             const int choice = MessageBoxW(
@@ -127,9 +120,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_DESTROY:
-        // The window is already gone; forget the handle so Shutdown()
-        // (which runs once in WinMain after the message loop) cannot call
-        // DestroyWindow on a stale HWND, then end the message loop.
         if (appFromHwnd(hWnd)) {
             appFromHwnd(hWnd)->hwnd_ = nullptr;
         }
@@ -140,14 +130,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
-    // Per-monitor V2 DPI awareness: the window and its ImGui font follow
-    // the monitor the window actually lives on.  Must be set before any
-    // window is created.  (Configurator builds target modern Windows.)
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     easterEggs_ = RollEasterEggs(argc, argv);
-    // The notification popup must be opened by default: ShowMegaFuckerNotification
-    // early-returns unless *open is already true.
     showMegaFuckerPopup_ = easterEggs_.megaFuckerDac;
 
     wchar_t configPath[MAX_PATH] = {};
@@ -193,7 +178,6 @@ bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
     if (!CreateImGui()) return false;
     ApplyTheme();
 
-    // Connect to RuntimeLink if PID was specified, otherwise try auto-discovery
     if (runtimeLinkPid > 0) {
         rlConnected_ = rlClient_.Open(runtimeLinkPid);
         if (rlConnected_) {
@@ -217,8 +201,6 @@ bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
 }
 
 void ConfiguratorApp::Shutdown() {
-    // Idempotent: runs exactly once (from WinMain after the message loop
-    // exits).  Never invoked from WndProc/WM_DESTROY.
     if (shutdownDone_) return;
     shutdownDone_ = true;
 
@@ -264,8 +246,6 @@ bool ConfiguratorApp::CreateMainWindow(HINSTANCE hInstance) {
     int x = (scrW - (rc.right - rc.left)) / 2;
     int y = (scrH - (rc.bottom - rc.top)) / 2;
 
-    // lpParam = this: WM_NCCREATE stores the pointer in GWLP_USERDATA so
-    // every later message can reach the owning app instance.
     hwnd_ = CreateWindowExW(
         0, kWindowClass, kWindowTitle,
         WS_OVERLAPPEDWINDOW,
@@ -281,8 +261,6 @@ bool ConfiguratorApp::CreateMainWindow(HINSTANCE hInstance) {
         return false;
     }
 
-    // With per-monitor V2 awareness the real scale is the window's,
-    // not the system's.
     dpiScale_ = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
 
     ShowWindow(hwnd_, SW_SHOWDEFAULT);
@@ -371,9 +349,6 @@ bool ConfiguratorApp::CreateImGui() {
     ImGui::StyleColorsDark();
     ApplyTheme();
 
-    // Initial font build: the DX11 backend does not exist yet, so the
-    // atlas is only prepared here (no backend invalidation call).  The
-    // backend uploads the atlas during its first NewFrame/CreateDeviceObjects.
     RecreateFonts(dpiScale_, false);
 
     if (!ImGui_ImplWin32_Init(hwnd_)) {
@@ -390,13 +365,6 @@ bool ConfiguratorApp::CreateImGui() {
 }
 
 void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized) {
-    // Runtime (post-init) rebuilds must invalidate the DX11 backend's
-    // references to the CURRENT atlas before the atlas is rebuilt; the
-    // backend recreates its device/font objects from the new atlas during
-    // the next NewFrame.  Before ImGui_ImplDX11_Init() there is no backend
-    // data yet, and calling InvalidateDeviceObjects() would dereference it
-    // (startup crash), so it is skipped when rendererBackendInitialized
-    // is false.
     if (rendererBackendInitialized) {
         ImGui_ImplDX11_InvalidateDeviceObjects();
     }
@@ -404,21 +372,12 @@ void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
 
-    // Since 1.92 the font data referenced by an ImFontConfig must persist
-    // for the whole atlas lifetime (the atlas no longer makes its own copy
-    // and keeps the caller's pointer for on-demand glyph rasterization).
-    // Keep our copy in a member, and keep ownership so the atlas does not
-    // free() a C++-allocated buffer on shutdown (heap corruption).
     ImFontConfig cfg;
     cfg.OversampleH = 1;
     cfg.OversampleV = 1;
     cfg.PixelSnapH = true;
     cfg.FontDataOwnedByAtlas = false;
 
-    // Windows is not necessarily installed on C:; resolve the real
-    // Windows directory for the Segoe UI font file and load it through
-    // the wide-character file API (AddFontFromFileTTF only accepts
-    // narrow paths).
     wchar_t windowsDir[MAX_PATH] = {};
     const UINT len = GetWindowsDirectoryW(windowsDir, MAX_PATH);
     fontData_.clear();
@@ -444,7 +403,6 @@ void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized
             fontData_.data(), static_cast<int>(fontData_.size()), fontSize, &cfg);
     }
     if (!font) {
-        // Fall back to the built-in font when Segoe UI is unavailable.
         font = io.Fonts->AddFontDefault();
     }
     io.FontDefault = font;
@@ -463,8 +421,6 @@ void ConfiguratorApp::HandleDpiChange(float scale, const RECT* suggestedRect) {
                      SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
-    // The font atlas rebuild is deferred to the start of the next frame;
-    // doing it here would render re-entrantly inside WndProc.
     pendingDpiScale_ = scale;
     dpiRebuildPending_ = true;
 }
@@ -486,8 +442,6 @@ void ConfiguratorApp::ResizeSwapChain(int width, int height) {
     if (!swapChain_ || !d3dDevice_) return;
     if (width <= 0 || height <= 0) return;
 
-    // Resize only when something actually changed; keeping the current
-    // render target means the swap chain and RTV stay in sync.
     if (width == windowWidth_ && height == windowHeight_ && renderTarget_) {
         return;
     }
@@ -498,12 +452,9 @@ void ConfiguratorApp::ResizeSwapChain(int width, int height) {
         0, static_cast<UINT>(width), static_cast<UINT>(height),
         DXGI_FORMAT_UNKNOWN, 0);
     if (FAILED(hr)) {
-        LogStartupFailure(L"ResizeBuffers failed (retrying with the "
-                          L"current back buffer)", hr);
+        LogStartupFailure(L"ResizeBuffers failed (retrying with the current back buffer)", hr);
     }
 
-    // Even when ResizeBuffers fails, the previous back buffer may still
-    // be usable — recreate the RTV from whatever the swap chain holds now.
     ID3D11Texture2D* backBuffer = nullptr;
     hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
     if (SUCCEEDED(hr) && backBuffer) {
@@ -518,34 +469,25 @@ void ConfiguratorApp::ResizeSwapChain(int width, int height) {
     windowHeight_ = height;
 
     if (FAILED(hr) || !renderTarget_) {
-        // No valid render target: re-arm the pending resize so the next
-        // frame retries instead of rendering into a null resource.
         resizePending_ = true;
         if (FAILED(hr)) {
-            LogStartupFailure(L"GetBuffer/CreateRenderTargetView after "
-                              L"resize failed", hr);
+            LogStartupFailure(L"GetBuffer/CreateRenderTargetView after resize failed", hr);
         }
     }
 }
 
 void ConfiguratorApp::RenderFrame() {
-    // Deferred window-size handling: the swap chain is resized exactly
-    // once per actual WM_SIZE, in the render loop (never in WndProc).
     if (resizePending_) {
         resizePending_ = false;
         ResizeSwapChain(static_cast<int>(pendingWidth_),
                         static_cast<int>(pendingHeight_));
     }
 
-    // Deferred DPI font rebuild (WM_DPICHANGED only records it).
     if (dpiRebuildPending_) {
         dpiRebuildPending_ = false;
         RecreateFonts(pendingDpiScale_, true);
     }
 
-    // A failed resize may have left no render target; drop the frame
-    // instead of dereferencing invalid resources (ResizeSwapChain re-arms
-    // resizePending_ so the next frame retries).
     if (!renderTarget_) return;
 
     HandleKeyboardShortcuts();
@@ -618,8 +560,7 @@ void ConfiguratorApp::DrawHeader() {
 
     ImGui::SameLine(300.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.48f, 0.52f, 1.0f));
-    ImGui::Text("\"Semi-Professional*\" Audio Software "
-                "tailored for Black MIDI");
+    ImGui::Text("\"Semi-Professional*\" Audio Software tailored for Black MIDI");
     ImGui::PopStyleColor();
 
     if (ImGui::IsItemHovered()) {
@@ -712,30 +653,48 @@ void ConfiguratorApp::DrawSidebar() {
 }
 
 void ConfiguratorApp::DrawFooter() {
-    float avail = ImGui::GetContentRegionAvail().x;
+    const float startX = ImGui::GetCursorPosX();
+    const float avail = ImGui::GetContentRegionAvail().x;
 
-    if (config_.IsDirty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
-        ImGui::Text("Configuration modified");
-        ImGui::PopStyleColor();
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
-        ImGui::Text("Configuration saved");
-        ImGui::PopStyleColor();
+    // Revert and Discard were duplicates: both restored the saved working
+    // copy and pushed it back to the runtime. Keep one clear action and use
+    // the recovered width to make the footer robust at smaller window sizes.
+    constexpr float kRevertW = 70.0f;
+    constexpr float kAdoptW = 108.0f;
+    constexpr float kSaveW = 160.0f;
+    constexpr float kGap = 8.0f;
+    constexpr float kButtonGroupW = kRevertW + kGap + kAdoptW + kGap + kSaveW;
+
+    const float buttonX = startX + (std::max)(0.0f, avail - kButtonGroupW);
+    const float leftBudget = (std::max)(0.0f, buttonX - startX - 12.0f);
+    const bool compact = leftBudget < 330.0f;
+    const bool veryCompact = leftBudget < 230.0f;
+
+    if (!veryCompact) {
+        if (config_.IsDirty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+            ImGui::TextUnformatted(compact ? "Modified" : "Configuration modified");
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+            ImGui::TextUnformatted(compact ? "Saved" : "Configuration saved");
+            ImGui::PopStyleColor();
+        }
+        ImGui::SameLine(0.0f, 12.0f);
     }
 
-    // RuntimeLink status + Connect/Disconnect button
-    ImGui::SameLine();
-    ImGui::Spacing();
-    ImGui::SameLine();
     if (rlConnected_) {
         ImGui::PushStyleColor(ImGuiCol_Text,
                               ImVec4(0.30f, 0.80f, 0.45f, 1.0f));
-        ImGui::Text("Driver PID %u", rlClient_.GetPID());
+        if (compact || veryCompact) {
+            ImGui::Text("PID %u", rlClient_.GetPID());
+        } else {
+            ImGui::Text("Driver PID %u", rlClient_.GetPID());
+        }
         ImGui::PopStyleColor();
-        ImGui::SameLine();
+        ImGui::SameLine(0.0f, 6.0f);
         if (ImGui::SmallButton("Disconnect")) {
             rlClient_.Close();
             rlConnected_ = false;
@@ -744,11 +703,8 @@ void ConfiguratorApp::DrawFooter() {
             toastMessage_ = statusMessage_;
         }
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(0.45f, 0.48f, 0.52f, 1.0f));
-        ImGui::TextDisabled("No driver");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
+        ImGui::TextDisabled(veryCompact ? "Offline" : "No driver");
+        ImGui::SameLine(0.0f, 6.0f);
         if (ImGui::SmallButton("Connect")) {
             if (TryAutoDiscoverDriver()) {
                 OnConnected();
@@ -760,11 +716,13 @@ void ConfiguratorApp::DrawFooter() {
         }
     }
 
-    // Right-aligned button group: Revert | Discard | Adopt Engine | Save
-    float btnGroupW = 70 + 8 + 70 + 8 + 108 + 8 + 160;
-    ImGui::SameLine(avail - btnGroupW);
+    // SameLine(pos_x) uses a window-local absolute X coordinate. The old
+    // code passed only `avail - width`, forgetting that this footer starts
+    // to the right of the sidebar; at narrow sizes that moved the buttons
+    // back into the status text. Anchor the group to startX explicitly.
+    ImGui::SameLine(buttonX);
 
-    if (ImGui::Button("Revert", ImVec2(70, 28))) {
+    if (ImGui::Button("Revert", ImVec2(kRevertW, 28))) {
         config_.Revert();
         PushAllLiveParams();
         statusMessage_ = "Configuration reverted";
@@ -772,41 +730,20 @@ void ConfiguratorApp::DrawFooter() {
         toastMessage_ = "Configuration reverted";
     }
 
-    ImGui::SameLine();
+    ImGui::SameLine(0.0f, kGap);
 
-    // Discard: push loaded (saved) values back to driver, clear working changes
-    bool canDiscard = config_.IsDirty();
-    if (!canDiscard) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-    }
-    if (ImGui::Button("Discard", ImVec2(70, 28)) && canDiscard) {
-        config_.Revert();  // restore working = loaded
-        PushAllLiveParams(); // push loaded values to driver
-        statusMessage_ = "Changes discarded — driver restored";
-        toastTimer_ = 3.0f;
-        toastMessage_ = "Changes discarded";
-    }
-    if (!canDiscard) {
-        ImGui::PopStyleVar();
-    }
-
-    ImGui::SameLine();
-
-    // Adopt Engine: pull the engine's APPLIED live state (telemetry echo)
-    // into the working copy.  Useful after out-of-band changes (a second
-    // configurator, or a driver reload) — review then Save.
     bool canAdopt = rlConnected_;
     if (!canAdopt) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
     }
-    if (ImGui::Button("Adopt Engine", ImVec2(108, 28)) && canAdopt) {
+    if (ImGui::Button("Adopt Engine", ImVec2(kAdoptW, 28)) && canAdopt) {
         AdoptEngineLiveState();
     }
     if (!canAdopt) {
         ImGui::PopStyleVar();
     }
 
-    ImGui::SameLine();
+    ImGui::SameLine(0.0f, kGap);
 
     bool canSave = config_.IsDirty();
     if (!canSave) {
@@ -820,12 +757,11 @@ void ConfiguratorApp::DrawFooter() {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
                           ImVec4(0.510f, 0.596f, 0.922f, 0.8f));
 
-    if (ImGui::Button("Save Configuration", ImVec2(160, 28)) && canSave) {
+    if (ImGui::Button("Save Configuration", ImVec2(kSaveW, 28)) && canSave) {
         auto path = config_.GetActivePath();
         ConfigValidation v = config_.Validate();
         if (v.valid) {
             if (config_.Save(path)) {
-                // Also push all live params so driver matches saved config
                 PushAllLiveParams();
                 toastTimer_ = 3.0f;
                 toastMessage_ = "Configuration saved & pushed to driver";
@@ -852,7 +788,6 @@ void ConfiguratorApp::DrawFooter() {
 }
 
 void ConfiguratorApp::DrawPageContent() {
-    // Make live telemetry available to all pages
     LiveLinkContext lc;
     lc.app = this;
     lc.client = rlConnected_ ? &rlClient_ : nullptr;
@@ -938,7 +873,6 @@ void ConfiguratorApp::PollRuntimeLink() {
     ImGuiIO& io = ImGui::GetIO();
 
     if (!rlConnected_) {
-        // Auto-reconnect: periodically scan for a running driver
         if (!rlAutoReconnect_) return;
         rlReconnectTimer_ += io.DeltaTime;
         if (rlReconnectTimer_ < kRlReconnectInterval) return;
@@ -954,7 +888,6 @@ void ConfiguratorApp::PollRuntimeLink() {
     if (rlPollTimer_ < kRlPollInterval) return;
     rlPollTimer_ = 0.0f;
 
-    // Heartbeat-based death detection (no process scanning).
     if (!rlClient_.IsHostAlive(svms::kRuntimeHostTimeoutMs)) {
         rlConnected_ = false;
         rlReconnectTimer_ = 0.0f;
@@ -964,8 +897,6 @@ void ConfiguratorApp::PollRuntimeLink() {
         return;
     }
 
-    // Skip-if-busy telemetry read: mid-publish snapshots are skipped and
-    // the last good snapshot is kept.
     rlClient_.ReadTelemetry(rlTelemetry_);
 
     FlushLiveChanges();
@@ -988,8 +919,6 @@ void ConfiguratorApp::FlushLiveChanges() {
         rlFailedFlushes_ = 0u;
         return;
     }
-    // Keep the mask so the change is re-sent on the next flush; surface
-    // persistent failures to the user (every 5th failed attempt).
     if (++rlFailedFlushes_ >= 5u) {
         rlFailedFlushes_ = 0u;
         statusMessage_ = "Live update failed: " +
@@ -1039,7 +968,7 @@ void ConfiguratorApp::SetLiveFloat(svms::RLCommandType type, float value) {
     case svms::RLCommandType::SetLimiterRelease:
         workingLive_.limiterReleaseMs = value; break;
     default:
-        return; // unknown field — do not mark dirty
+        return;
     }
     pendingLiveMask_ |= svms::RLV2_GroupForType(type);
 }
@@ -1058,8 +987,6 @@ void ConfiguratorApp::SetLiveBool(svms::RLCommandType type, bool value) {
     pendingLiveMask_ |= svms::RLV2_GroupForType(type);
 }
 
-// Maps the (saved or working) config values onto the live payload used
-// for grouped ApplyLiveConfig commands.
 static svms::RuntimeLiveStateV2 LiveStateFromConfig(const ConfigValues& w) {
     svms::RuntimeLiveStateV2 l{};
     l.masterVolume = w.masterVolume;
@@ -1153,15 +1080,9 @@ void ConfiguratorApp::OnConnected() {
                      std::to_string(rlLastKnownPid_) + ")";
     toastTimer_ = 3.0f;
     toastMessage_ = statusMessage_;
-
-    // Connecting is READ-ONLY: no live parameters are pushed on connect.
-    // The RUNTIME state is displayed from telemetry and only diverges
-    // from the config after the user changes something.
 }
 
 bool ConfiguratorApp::TryAutoDiscoverDriver() {
-    // Discovery goes through the hosts registry (well-known mapping),
-    // preferring the most recently used driver PID.
     svms::RuntimeLinkClientV2::HostInfo hosts[svms::kRuntimeHostMaxCount];
     const uint32_t count = svms::RuntimeLinkClientV2::EnumerateHosts(
         hosts, svms::kRuntimeHostMaxCount);
