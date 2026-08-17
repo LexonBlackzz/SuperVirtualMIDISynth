@@ -36,7 +36,22 @@ void LabelCell(const char* label, const char* tooltip = nullptr) {
 
 void RestartCell() {
     ImGui::TableNextColumn();
-    RestartRequiredBadge();
+    ImGui::AlignTextToFramePadding();
+
+    constexpr const char* label = "RESTART";
+    const float startX = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    const float labelWidth = ImGui::CalcTextSize(label).x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Requires driver restart to take effect.");
+        ImGui::EndTooltip();
+    }
 }
 
 bool InputU32(const char* id, uint32_t& value, uint32_t minValue, uint32_t maxValue) {
