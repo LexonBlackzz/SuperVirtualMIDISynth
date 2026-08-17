@@ -227,6 +227,11 @@ void DrawReverbPage(ConfigDocument& doc) {
         }
     }
 
+    // RotaryKnob draws its text slightly below its interaction rectangle.
+    // Reserve that tail explicitly so the final FILTER labels remain above
+    // the fixed footer instead of being clipped at the bottom of the page.
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() + 12.0f));
+
     ImGui::EndGroup();
 
     PopEffectPageStyle();
