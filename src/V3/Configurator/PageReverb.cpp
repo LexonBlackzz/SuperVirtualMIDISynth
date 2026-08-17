@@ -4,235 +4,510 @@
 #include "imgui.h"
 #include "Theme.h"
 #include "../SVMSRuntimeLinkProtocol.h"
+
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace svms::cfg {
+namespace {
+
+constexpr float kPi = 3.14159265358979323846f;
+constexpr float kTau = kPi * 2.0f;
+
+float Clamp01(float value) {
+    return ImClamp(value, 0.0f, 1.0f);
+}
+
+float SmoothValue(float current, float target, float dt, float speed) {
+    const float clampedDt = ImClamp(dt, 0.0f, 0.05f);
+    const float alpha = 1.0f - std::exp(-speed * clampedDt);
+    return current + (target - current) * alpha;
+}
+
+float Hash01(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return static_cast<float>(value & 0x00ffffffu) / 16777215.0f;
+}
+
+float HzToKHz(float hz) {
+    return hz / 1000.0f;
+}
+
+struct AtmosphereState {
+    bool initialized = false;
+    float roomSize = 0.0f;
+    float decay = 0.0f;
+    float damping = 0.0f;
+    float width = 0.0f;
+    float diffusion = 0.0f;
+    float preDelayMs = 0.0f;
+    float earlyLevel = 0.0f;
+    float lateLevel = 0.0f;
+    float modDepth = 0.0f;
+    float modRate = 0.0f;
+    float lowCutHz = 0.0f;
+    float highCutHz = 0.0f;
+    float mix = 0.0f;
+    float phase = 0.0f;
+};
+
+void UpdateAtmosphere(AtmosphereState& state, const ConfigValues& values, float dt) {
+    if (!state.initialized) {
+        state.initialized = true;
+        state.roomSize = values.reverbRoomSize;
+        state.decay = values.reverbDecay;
+        state.damping = values.reverbDamping;
+        state.width = values.reverbWidth;
+        state.diffusion = values.reverbDiffusion;
+        state.preDelayMs = values.reverbPreDelayMs;
+        state.earlyLevel = values.reverbEarlyLevel;
+        state.lateLevel = values.reverbLateLevel;
+        state.modDepth = values.reverbModDepth;
+        state.modRate = values.reverbModRate;
+        state.lowCutHz = values.reverbLowCutHz;
+        state.highCutHz = values.reverbHighCutHz;
+        state.mix = values.reverbMix;
+    } else {
+        // Purely visual smoothing. The DSP still receives the exact working
+        // values through RuntimeLink; only the eye-candy field eases between
+        // parameter states so dragging a knob feels fluid at VSync rate.
+        constexpr float shapeSpeed = 8.5f;
+        constexpr float toneSpeed = 6.0f;
+        state.roomSize = SmoothValue(state.roomSize, values.reverbRoomSize, dt, shapeSpeed);
+        state.decay = SmoothValue(state.decay, values.reverbDecay, dt, shapeSpeed);
+        state.damping = SmoothValue(state.damping, values.reverbDamping, dt, toneSpeed);
+        state.width = SmoothValue(state.width, values.reverbWidth, dt, shapeSpeed);
+        state.diffusion = SmoothValue(state.diffusion, values.reverbDiffusion, dt, shapeSpeed);
+        state.preDelayMs = SmoothValue(state.preDelayMs, values.reverbPreDelayMs, dt, shapeSpeed);
+        state.earlyLevel = SmoothValue(state.earlyLevel, values.reverbEarlyLevel, dt, shapeSpeed);
+        state.lateLevel = SmoothValue(state.lateLevel, values.reverbLateLevel, dt, shapeSpeed);
+        state.modDepth = SmoothValue(state.modDepth, values.reverbModDepth, dt, shapeSpeed);
+        state.modRate = SmoothValue(state.modRate, values.reverbModRate, dt, shapeSpeed);
+        state.lowCutHz = SmoothValue(state.lowCutHz, values.reverbLowCutHz, dt, toneSpeed);
+        state.highCutHz = SmoothValue(state.highCutHz, values.reverbHighCutHz, dt, toneSpeed);
+        state.mix = SmoothValue(state.mix, values.reverbMix, dt, shapeSpeed);
+    }
+
+    state.phase += ImClamp(dt, 0.0f, 0.05f) * (0.35f + state.modRate * 2.6f);
+    if (state.phase > 10000.0f) state.phase = std::fmod(state.phase, kTau);
+}
+
+void DrawEllipse(ImDrawList* drawList, const ImVec2& center,
+                 float radiusX, float radiusY, float phase,
+                 float irregularity, ImU32 color, float thickness) {
+    constexpr int segments = 64;
+    ImVec2 previous{};
+    for (int i = 0; i <= segments; ++i) {
+        const float angle = (static_cast<float>(i) / segments) * kTau;
+        const float warp = 1.0f +
+            std::sin(angle * 2.0f + phase) * irregularity +
+            std::sin(angle * 5.0f - phase * 0.7f) * irregularity * 0.35f;
+        const ImVec2 point(center.x + std::cos(angle) * radiusX * warp,
+                           center.y + std::sin(angle) * radiusY * warp);
+        if (i > 0) drawList->AddLine(previous, point, color, thickness);
+        previous = point;
+    }
+}
+
+void DrawAtmospherePanel(const ImVec2& pos, const ImVec2& size,
+                         const AtmosphereState& state, bool enabled) {
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 max(pos.x + size.x, pos.y + size.y);
+
+    const ImU32 topColor = ImGui::GetColorU32(ImVec4(0.052f, 0.060f, 0.073f, 1.0f));
+    const ImU32 bottomColor = ImGui::GetColorU32(ImVec4(0.036f, 0.043f, 0.057f, 1.0f));
+    drawList->AddRectFilledMultiColor(pos, max,
+                                      topColor, topColor,
+                                      bottomColor, bottomColor);
+    drawList->AddRect(pos, max,
+                      ImGui::GetColorU32(ImVec4(0.15f, 0.17f, 0.21f, 1.0f)),
+                      6.0f, 0, 1.0f);
+
+    if (size.x < 80.0f || size.y < 80.0f) return;
+
+    drawList->PushClipRect(ImVec2(pos.x + 2.0f, pos.y + 2.0f),
+                           ImVec2(max.x - 2.0f, max.y - 2.0f), true);
+
+    const ImVec2 center(pos.x + size.x * 0.5f,
+                        pos.y + size.y * 0.49f);
+
+    const float room = Clamp01(state.roomSize);
+    const float decay = Clamp01(state.decay);
+    const float damping = Clamp01(state.damping);
+    const float width = Clamp01(state.width);
+    const float diffusion = Clamp01(state.diffusion);
+    const float preDelay = Clamp01(state.preDelayMs / 200.0f);
+    const float early = Clamp01(state.earlyLevel / 1.5f);
+    const float late = Clamp01(state.lateLevel / 1.5f);
+    const float modDepth = Clamp01(state.modDepth);
+    const float lowCut = Clamp01(state.lowCutHz / 2000.0f);
+    const float highCut = Clamp01((state.highCutHz - 1000.0f) / 19000.0f);
+    const float mix = Clamp01(state.mix);
+
+    const float enabledGain = enabled ? 1.0f : 0.26f;
+    const float wetGain = (0.38f + mix * 0.62f) * enabledGain;
+    const float brightness = (0.48f + highCut * 0.52f) *
+                             (1.0f - damping * 0.38f);
+
+    // Width directly stretches the field. Radius is compensated so even
+    // maximum width remains inside the available panel.
+    const float xScale = 0.58f + width * 0.78f;
+    const float yScale = 0.88f + room * 0.08f;
+    const float maxRadiusX = (size.x * 0.43f) / xScale;
+    const float maxRadiusY = (size.y * 0.39f) / yScale;
+    const float outerRadius = (std::max)(20.0f,
+        (std::min)(maxRadiusX, maxRadiusY));
+    const float fieldRadius = outerRadius * (0.58f + room * 0.42f);
+    const float deadZone = fieldRadius * (0.055f + preDelay * 0.19f);
+
+    // Center glow and the pre-delay boundary. Low Cut reduces the warm/inner
+    // energy while Pre-delay opens an obvious quiet space before the room.
+    for (int i = 5; i >= 1; --i) {
+        const float t = static_cast<float>(i) / 5.0f;
+        const float radius = deadZone * (1.15f + t * 2.8f);
+        const float alpha = (0.012f + early * 0.020f) *
+                            (1.0f - lowCut * 0.45f) * wetGain;
+        drawList->AddCircleFilled(center, radius,
+            ImGui::GetColorU32(ImVec4(0.34f, 0.43f, 0.78f, alpha / t)), 40);
+    }
+
+    DrawEllipse(drawList, center,
+                deadZone * xScale, deadZone * yScale,
+                state.phase * 0.25f, 0.012f,
+                ImGui::GetColorU32(ImVec4(0.56f, 0.65f, 0.94f,
+                    (0.10f + early * 0.10f) * wetGain)),
+                1.0f);
+
+    // Early reflections remain comparatively crisp and live near the center.
+    const int earlyShells = 3 + static_cast<int>(early * 3.0f);
+    for (int i = 0; i < earlyShells; ++i) {
+        const float t = (static_cast<float>(i) + 1.0f) /
+                        (static_cast<float>(earlyShells) + 1.0f);
+        const float radius = deadZone +
+            (fieldRadius * 0.43f - deadZone) * t;
+        const float irregularity = (1.0f - diffusion) * 0.045f +
+            modDepth * 0.014f * std::sin(state.phase * 1.7f + i * 1.9f);
+        const float alpha = (0.065f + early * 0.16f) *
+                            (1.0f - t * 0.38f) * wetGain;
+        DrawEllipse(drawList, center,
+                    radius * xScale, radius * yScale,
+                    state.phase * 0.18f + i,
+                    irregularity,
+                    ImGui::GetColorU32(ImVec4(0.49f, 0.59f, 0.93f, alpha)),
+                    1.0f + early * 0.35f);
+    }
+
+    // Late FDN-style field. This is intentionally parameter-driven eye candy,
+    // not a fake spectrum or signal analyzer.
+    const int ringCount = 8 + static_cast<int>(diffusion * 9.0f + decay * 4.0f);
+    for (int i = 0; i < ringCount; ++i) {
+        const float t = ringCount > 1
+            ? static_cast<float>(i) / static_cast<float>(ringCount - 1)
+            : 0.0f;
+        const float radius = fieldRadius * (0.28f + t * 0.72f);
+        const float tail = std::pow(1.0f - t,
+                                    0.45f + (1.0f - decay) * 1.8f);
+        const float distantDamping = 1.0f - t * damping * 0.62f;
+        const float alpha = (0.030f + late * 0.115f) *
+                            (0.30f + decay * 0.70f) *
+                            tail * distantDamping * brightness * wetGain;
+        const float phase = state.phase * (0.32f + modDepth * 0.70f) + i * 0.61f;
+        const float irregularity = (1.0f - diffusion) * 0.070f +
+            modDepth * 0.018f * std::sin(state.phase * 1.3f + i * 0.7f);
+
+        const float coolShift = highCut * 0.08f;
+        DrawEllipse(drawList, center,
+                    radius * xScale, radius * yScale,
+                    phase, irregularity,
+                    ImGui::GetColorU32(ImVec4(0.36f + coolShift,
+                                              0.48f + coolShift,
+                                              0.86f + highCut * 0.08f,
+                                              alpha)),
+                    1.0f);
+    }
+
+    // Deterministic diffuse cloud. It never randomly pops between frames;
+    // the points drift and breathe from Mod Rate/Depth while the smoothed
+    // shape responds continuously to the other controls.
+    const int pointCount = 32 + static_cast<int>(diffusion * 82.0f);
+    for (int i = 0; i < pointCount; ++i) {
+        const uint32_t seed = static_cast<uint32_t>(i);
+        const float h0 = Hash01(seed * 747796405u + 2891336453u);
+        const float h1 = Hash01(seed * 277803737u + 1013904223u);
+        const float h2 = Hash01(seed * 1597334677u + 3812015801u);
+
+        const float baseT = 0.18f + h0 * 0.82f;
+        const float radialShape = std::pow(baseT, 0.72f + diffusion * 0.55f);
+        const float radius = fieldRadius * radialShape;
+        const float baseAngle = h1 * kTau;
+        const float drift = state.phase * (0.16f + h2 * 0.40f);
+        const float angle = baseAngle + drift * (0.18f + modDepth * 0.42f);
+        const float breathe = 1.0f +
+            std::sin(state.phase * (0.7f + h2) + h1 * 8.0f) * modDepth * 0.065f;
+
+        const ImVec2 point(center.x + std::cos(angle) * radius * breathe * xScale,
+                           center.y + std::sin(angle) * radius * breathe * yScale);
+        const float tailEnergy = 1.0f - radialShape *
+            (0.40f + (1.0f - decay) * 0.45f);
+        const float alpha = (0.050f + diffusion * 0.072f) *
+                            (0.32f + late * 0.68f) *
+                            Clamp01(tailEnergy) * brightness * wetGain;
+        const float dotSize = 0.9f + diffusion * 0.70f + h2 * 0.50f;
+
+        const float trailAngle = angle - 0.018f *
+            (0.5f + decay + modDepth);
+        const ImVec2 trail(center.x + std::cos(trailAngle) * radius * breathe * xScale,
+                           center.y + std::sin(trailAngle) * radius * breathe * yScale);
+        drawList->AddLine(trail, point,
+            ImGui::GetColorU32(ImVec4(0.42f, 0.56f, 0.94f, alpha * 0.55f)), 1.0f);
+        drawList->AddCircleFilled(point, dotSize,
+            ImGui::GetColorU32(ImVec4(0.48f, 0.61f, 0.98f, alpha)), 8);
+    }
+
+    // Stereo focus points make Width readable immediately without claiming
+    // to represent live audio energy.
+    const float stereoOffset = fieldRadius * xScale * width * 0.28f;
+    const float focusAlpha = (0.06f + width * 0.08f) * wetGain;
+    drawList->AddCircleFilled(ImVec2(center.x - stereoOffset, center.y), 2.2f,
+        ImGui::GetColorU32(ImVec4(0.58f, 0.68f, 1.0f, focusAlpha)), 10);
+    drawList->AddCircleFilled(ImVec2(center.x + stereoOffset, center.y), 2.2f,
+        ImGui::GetColorU32(ImVec4(0.58f, 0.68f, 1.0f, focusAlpha)), 10);
+
+    drawList->AddText(ImVec2(pos.x + 12.0f, pos.y + 10.0f),
+        ImGui::GetColorU32(ImVec4(0.48f, 0.52f, 0.58f, 0.90f)),
+        "SPACE FIELD");
+
+    const char* hint = enabled ? "parameter-driven atmosphere" : "reverb bypassed";
+    const ImVec2 hintSize = ImGui::CalcTextSize(hint);
+    drawList->AddText(ImVec2(max.x - hintSize.x - 12.0f,
+                             max.y - hintSize.y - 10.0f),
+        ImGui::GetColorU32(ImVec4(0.36f, 0.40f, 0.46f, 0.85f)), hint);
+
+    drawList->PopClipRect();
+}
+
+void CompactSectionHeader(const char* label) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.63f, 0.68f, 1.0f));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+}
+
+bool DrawLiveKnob(ConfigDocument& doc, float& value,
+                  float minValue, float maxValue, float defaultValue,
+                  const char* label, float size, const char* format,
+                  svms::RLCommandType command,
+                  float displayScale = 1.0f,
+                  float (*displayFn)(float) = nullptr) {
+    const float startX = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - size) * 0.5f));
+
+    KnobState knob = {
+        value, minValue, maxValue, defaultValue,
+        label, nullptr, size, displayScale, displayFn
+    };
+    if (!RotaryKnob(knob, format)) return false;
+
+    value = knob.value;
+    doc.MarkDirty();
+    PushLiveFloat(command, knob.value);
+    return true;
+}
+
+void DrawControlPanel(ConfigDocument& doc, float panelHeight) {
+    auto& values = doc.Working();
+    const float panelWidth = ImGui::GetContentRegionAvail().x;
+
+    float knobSize = 52.0f;
+    if (panelHeight < 400.0f || panelWidth < 440.0f) knobSize = 47.0f;
+    if (panelHeight < 350.0f || panelWidth < 380.0f) knobSize = 42.0f;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(7.0f, 3.0f));
+
+    CompactSectionHeader("SPACE");
+    if (ImGui::BeginTable("##reverb_space", 3, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        DrawLiveKnob(doc, values.reverbRoomSize, 0.0f, 1.0f, 0.60f,
+                     "ROOM SIZE", knobSize, "%.0f%%",
+                     svms::RLCommandType::SetReverbRoomSize, 100.0f);
+        ImGui::TableNextColumn();
+        DrawLiveKnob(doc, values.reverbDecay, 0.0f, 1.0f, 0.50f,
+                     "DECAY", knobSize, "%.0f%%",
+                     svms::RLCommandType::SetReverbDecay, 100.0f);
+        ImGui::TableNextColumn();
+        DrawLiveKnob(doc, values.reverbPreDelayMs, 0.0f, 200.0f, 12.0f,
+                     "PRE-DELAY", knobSize, "%.0f ms",
+                     svms::RLCommandType::SetReverbPreDelayMs);
+        ImGui::EndTable();
+    }
+
+    CompactSectionHeader("STEREO / BALANCE");
+    if (ImGui::BeginTable("##reverb_stereo", 3, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        DrawLiveKnob(doc, values.reverbWidth, 0.0f, 1.0f, 1.0f,
+                     "WIDTH", knobSize, "%.0f%%",
+                     svms::RLCommandType::SetReverbWidth, 100.0f);
+        ImGui::TableNextColumn();
+        DrawLiveKnob(doc, values.reverbEarlyLevel, 0.0f, 1.5f, 0.35f,
+                     "EARLY", knobSize, "%.2f",
+                     svms::RLCommandType::SetReverbEarlyLevel);
+        ImGui::TableNextColumn();
+        DrawLiveKnob(doc, values.reverbLateLevel, 0.0f, 1.5f, 0.85f,
+                     "LATE", knobSize, "%.2f",
+                     svms::RLCommandType::SetReverbLateLevel);
+        ImGui::EndTable();
+    }
+
+    // Three compact mini-sections use the page width much more efficiently
+    // than stacking Texture, Modulation, and Filter vertically.
+    if (ImGui::BeginTable("##reverb_lower", 3,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableNextRow();
+
+        ImGui::TableNextColumn();
+        CompactSectionHeader("TEXTURE");
+        if (ImGui::BeginTable("##reverb_texture", 2, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            DrawLiveKnob(doc, values.reverbDiffusion, 0.0f, 1.0f, 0.70f,
+                         "DIFFUSION", knobSize, "%.0f%%",
+                         svms::RLCommandType::SetReverbDiffusion, 100.0f);
+            ImGui::TableNextColumn();
+            DrawLiveKnob(doc, values.reverbDamping, 0.0f, 1.0f, 0.35f,
+                         "DAMPING", knobSize, "%.0f%%",
+                         svms::RLCommandType::SetReverbDamping, 100.0f);
+            ImGui::EndTable();
+        }
+
+        ImGui::TableNextColumn();
+        CompactSectionHeader("MODULATION");
+        if (ImGui::BeginTable("##reverb_modulation", 2, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            DrawLiveKnob(doc, values.reverbModDepth, 0.0f, 1.0f, 0.30f,
+                         "DEPTH", knobSize, "%.0f%%",
+                         svms::RLCommandType::SetReverbModDepth, 100.0f);
+            ImGui::TableNextColumn();
+            DrawLiveKnob(doc, values.reverbModRate, 0.0f, 1.0f, 0.35f,
+                         "RATE", knobSize, "%.2f",
+                         svms::RLCommandType::SetReverbModRate);
+            ImGui::EndTable();
+        }
+
+        ImGui::TableNextColumn();
+        CompactSectionHeader("FILTER");
+        if (ImGui::BeginTable("##reverb_filter", 2, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            DrawLiveKnob(doc, values.reverbLowCutHz, 0.0f, 2000.0f, 70.0f,
+                         "LOW CUT", knobSize, "%.0f Hz",
+                         svms::RLCommandType::SetReverbLowCutHz);
+            ImGui::TableNextColumn();
+            DrawLiveKnob(doc, values.reverbHighCutHz, 1000.0f, 20000.0f, 16000.0f,
+                         "HIGH CUT", knobSize, "%.1f kHz",
+                         svms::RLCommandType::SetReverbHighCutHz, 1.0f, HzToKHz);
+            ImGui::EndTable();
+        }
+
+        ImGui::EndTable();
+    }
+
+    ImGui::PopStyleVar();
+}
+
+} // namespace
 
 void DrawReverbPage(ConfigDocument& doc) {
     PushEffectPageStyle();
 
-    auto& w = doc.Working();
-    static float animTime = 0.0f;
-    animTime += ImGui::GetIO().DeltaTime;
+    auto& values = doc.Working();
+    const auto& live = GetLiveLinkContext();
 
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
+    static AtmosphereState atmosphere;
+    UpdateAtmosphere(atmosphere, values, ImGui::GetIO().DeltaTime);
 
-    {
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14, 6));
+    // Header behaves like a small plugin header: power/state on the left,
+    // title in the center, and Mix as the one global control on the right.
+    if (ImGui::BeginTable("##reverb_header", 3,
+                          ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("power", ImGuiTableColumnFlags_WidthFixed, 175.0f);
+        ImGui::TableSetupColumn("title", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("mix", ImGuiTableColumnFlags_WidthFixed, 118.0f);
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, 86.0f);
 
-        ImGui::PushStyleColor(ImGuiCol_FrameBg,
-                              w.enableReverb
-                                  ? ImVec4(0.15f, 0.35f, 0.55f, 0.5f)
-                                  : ImVec4(0.15f, 0.16f, 0.19f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
-                              ImVec4(0.18f, 0.40f, 0.60f, 0.5f));
-
-        bool reverbEnabled = w.enableReverb;
-        if (ToggleSwitch("POWER", &reverbEnabled, "Enable the FDN reverb effect.")) {
-            w.enableReverb = reverbEnabled;
+        ImGui::TableNextColumn();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 24.0f);
+        bool enabled = values.enableReverb;
+        if (ToggleSwitch("POWER", &enabled, "Enable the FDN reverb effect.")) {
+            values.enableReverb = enabled;
             doc.MarkDirty();
-            PushLiveBool(svms::RLCommandType::SetReverbEnabled, reverbEnabled);
+            PushLiveBool(svms::RLCommandType::SetReverbEnabled, enabled);
         }
-        auto& lc = GetLiveLinkContext();
-        if (lc.connected) LiveBadge("Reverb toggle applied live via RuntimeLink");
+        if (live.connected) LiveBadge("Reverb toggle is live-previewed through RuntimeLink");
 
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(2);
-    }
-
-    ImGui::SameLine(ImGui::GetWindowWidth() * 0.3f);
-    ImGui::PushFont(nullptr);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.78f, 0.95f, 1.0f));
-    ImGui::Text("REVERB");
-    ImGui::PopStyleColor();
-    ImGui::PopFont();
-
-    {
-        auto& lc = GetLiveLinkContext();
-        if (lc.connected) LiveBadge("All reverb params are applied live via RuntimeLink");
-        AppliedStateBadge(lc.connected, lc.telemetry, w,
+        ImGui::TableNextColumn();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 18.0f);
+        const char* title = "REVERB";
+        const float startX = ImGui::GetCursorPosX();
+        const float available = ImGui::GetContentRegionAvail().x;
+        const float titleWidth = ImGui::CalcTextSize(title).x;
+        ImGui::SetCursorPosX(startX + (available - titleWidth) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.78f, 0.95f, 1.0f));
+        ImGui::TextUnformatted(title);
+        ImGui::PopStyleColor();
+        if (live.connected) LiveBadge("All reverb parameters support live preview");
+        AppliedStateBadge(live.connected, live.telemetry, values,
                           "Reverb group applied state vs working copy");
-    }
 
-    ImGui::SameLine(ImGui::GetWindowWidth() - 200.0f);
-    {
-        KnobState mixKnob = {
-            w.reverbMix, 0.0f, 1.0f, 0.25f, "MIX", nullptr, 72.0f, 100.0f
-        };
-        if (RotaryKnob(mixKnob, "%.0f%%")) {
-            w.reverbMix = mixKnob.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbMix, mixKnob.value);
-        }
+        ImGui::TableNextColumn();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
+        DrawLiveKnob(doc, values.reverbMix, 0.0f, 1.0f, 0.25f,
+                     "MIX", 62.0f, "%.0f%%",
+                     svms::RLCommandType::SetReverbMix, 100.0f);
+
+        ImGui::EndTable();
     }
 
     ImGui::Separator();
     ImGui::Spacing();
 
-    float availW = ImGui::GetContentRegionAvail().x;
-    float vizW = availW * 0.35f;
-    float vizH = 240.0f;
+    const ImVec2 bodyAvailable = ImGui::GetContentRegionAvail();
+    const float bodyHeight = (std::max)(330.0f, bodyAvailable.y - 2.0f);
 
-    ImVec2 vizPos = ImGui::GetCursorScreenPos();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec4 panelBg = ImVec4(0.065f, 0.075f, 0.090f, 1.0f);
-    dl->AddRectFilled(vizPos,
-                      ImVec2(vizPos.x + vizW, vizPos.y + vizH),
-                      ImGui::GetColorU32(panelBg), 6.0f);
-    dl->AddRect(vizPos,
-                ImVec2(vizPos.x + vizW, vizPos.y + vizH),
-                ImGui::GetColorU32(ImVec4(0.15f, 0.17f, 0.21f, 1.0f)),
-                6.0f, 0, 1.0f);
+    if (ImGui::BeginTable("##reverb_body", 2,
+                          ImGuiTableFlags_SizingStretchProp |
+                          ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("atmosphere", ImGuiTableColumnFlags_WidthStretch, 0.86f);
+        ImGui::TableSetupColumn("controls", ImGuiTableColumnFlags_WidthStretch, 1.34f);
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, bodyHeight);
 
-    DrawReverbVisualizer(
-        dl,
-        ImVec2(vizPos.x + vizW * 0.5f, vizPos.y + vizH * 0.5f),
-        vizW * 0.42f,
-        w.reverbRoomSize, w.reverbDecay, w.reverbDiffusion,
-        w.reverbWidth, w.reverbModDepth, animTime);
+        ImGui::TableNextColumn();
+        ImGui::BeginChild("##reverb_atmosphere", ImVec2(0.0f, bodyHeight), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        const ImVec2 visualPos = ImGui::GetCursorScreenPos();
+        const ImVec2 visualSize((std::max)(80.0f, ImGui::GetContentRegionAvail().x - 6.0f),
+                                (std::max)(80.0f, ImGui::GetContentRegionAvail().y - 6.0f));
+        DrawAtmospherePanel(visualPos, visualSize, atmosphere, values.enableReverb);
+        ImGui::Dummy(visualSize);
+        ImGui::EndChild();
 
-    ImGui::Dummy(ImVec2(vizW, vizH));
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12.0f);
+        ImGui::TableNextColumn();
+        ImGui::BeginChild("##reverb_controls", ImVec2(0.0f, bodyHeight), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        DrawControlPanel(doc, bodyHeight);
+        ImGui::EndChild();
 
-    ImGui::BeginGroup();
-
-    SectionHeader("SPACE");
-    {
-        float roomSize = w.reverbRoomSize;
-        KnobState ks = { roomSize, 0.0f, 1.0f, 0.60f, "ROOM SIZE", nullptr, 58.0f, 100.0f };
-        if (RotaryKnob(ks, "%.0f%%")) {
-            w.reverbRoomSize = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbRoomSize, ks.value);
-        }
-        ImGui::SameLine();
+        ImGui::EndTable();
     }
-    {
-        float decay = w.reverbDecay;
-        KnobState ks = { decay, 0.0f, 1.0f, 0.50f, "DECAY", nullptr, 58.0f, 100.0f };
-        if (RotaryKnob(ks, "%.0f%%")) {
-            w.reverbDecay = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbDecay, ks.value);
-        }
-        ImGui::SameLine();
-    }
-    {
-        float pd = w.reverbPreDelayMs;
-        KnobState ks = { pd, 0.0f, 200.0f, 12.0f, "PRE-DELAY", "ms", 58.0f };
-        if (RotaryKnob(ks, "%.1f")) {
-            w.reverbPreDelayMs = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbPreDelayMs, ks.value);
-        }
-    }
-
-    ImGui::Spacing();
-    SectionHeader("TEXTURE");
-    {
-        float diff = w.reverbDiffusion;
-        KnobState ks = { diff, 0.0f, 1.0f, 0.70f, "DIFFUSION", nullptr, 52.0f, 100.0f };
-        if (RotaryKnob(ks, "%.0f%%")) {
-            w.reverbDiffusion = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbDiffusion, ks.value);
-        }
-        ImGui::SameLine();
-    }
-    {
-        float damp = w.reverbDamping;
-        KnobState ks = { damp, 0.0f, 1.0f, 0.35f, "DAMPING", nullptr, 52.0f, 100.0f };
-        if (RotaryKnob(ks, "%.0f%%")) {
-            w.reverbDamping = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbDamping, ks.value);
-        }
-    }
-
-    ImGui::Spacing();
-    SectionHeader("STEREO / BALANCE");
-    {
-        float width = w.reverbWidth;
-        KnobState ks = { width, 0.0f, 1.0f, 1.0f, "WIDTH", nullptr, 52.0f, 100.0f };
-        if (RotaryKnob(ks, "%.0f%%")) {
-            w.reverbWidth = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbWidth, ks.value);
-        }
-        ImGui::SameLine();
-    }
-    {
-        float early = w.reverbEarlyLevel;
-        KnobState ks = { early, 0.0f, 1.5f, 0.35f, "EARLY", nullptr, 52.0f };
-        if (RotaryKnob(ks, "%.2f")) {
-            w.reverbEarlyLevel = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbEarlyLevel, ks.value);
-        }
-        ImGui::SameLine();
-    }
-    {
-        float late = w.reverbLateLevel;
-        KnobState ks = { late, 0.0f, 1.5f, 0.85f, "LATE", nullptr, 52.0f };
-        if (RotaryKnob(ks, "%.2f")) {
-            w.reverbLateLevel = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbLateLevel, ks.value);
-        }
-    }
-
-    ImGui::Spacing();
-    SectionHeader("MODULATION");
-    {
-        float md = w.reverbModDepth;
-        KnobState ks = { md, 0.0f, 1.0f, 0.30f, "DEPTH", nullptr, 52.0f, 100.0f };
-        if (RotaryKnob(ks, "%.0f%%")) {
-            w.reverbModDepth = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbModDepth, ks.value);
-        }
-        ImGui::SameLine();
-    }
-    {
-        float mr = w.reverbModRate;
-        KnobState ks = { mr, 0.0f, 1.0f, 0.35f, "RATE", nullptr, 52.0f };
-        if (RotaryKnob(ks, "%.2f")) {
-            w.reverbModRate = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbModRate, ks.value);
-        }
-    }
-
-    ImGui::Spacing();
-    SectionHeader("FILTER");
-    {
-        float lc = w.reverbLowCutHz;
-        KnobState ks = { lc, 0.0f, 2000.0f, 70.0f, "LOW CUT", "Hz", 52.0f };
-        if (RotaryKnob(ks, "%.0f")) {
-            w.reverbLowCutHz = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbLowCutHz, ks.value);
-        }
-        ImGui::SameLine();
-    }
-    {
-        float hc = w.reverbHighCutHz;
-        KnobState ks = { hc, 1000.0f, 20000.0f, 16000.0f, "HIGH CUT", "Hz", 52.0f };
-        if (RotaryKnob(ks, "%.0f")) {
-            w.reverbHighCutHz = ks.value;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetReverbHighCutHz, ks.value);
-        }
-    }
-
-    // RotaryKnob draws its text slightly below its interaction rectangle.
-    // Reserve that tail explicitly so the final FILTER labels remain above
-    // the fixed footer instead of being clipped at the bottom of the page.
-    ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() + 12.0f));
-
-    ImGui::EndGroup();
 
     PopEffectPageStyle();
 }
