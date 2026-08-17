@@ -36,7 +36,22 @@ void LabelCell(const char* label, const char* tooltip = nullptr) {
 
 void RestartCell() {
     ImGui::TableNextColumn();
-    RestartRequiredBadge();
+    ImGui::AlignTextToFramePadding();
+
+    constexpr const char* label = "RESTART";
+    const float startX = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    const float labelWidth = ImGui::CalcTextSize(label).x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Requires driver restart to take effect.");
+        ImGui::EndTooltip();
+    }
 }
 
 } // namespace
@@ -85,8 +100,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
             }
             if (selected) ImGui::PopStyleColor();
         }
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("restart");
+        RestartCell();
 
         ImGui::TableNextRow();
         LabelCell("Render threads",
