@@ -161,11 +161,14 @@ bool LoadThemeFile(const std::filesystem::path& path,
         ReadColor(root, "error", t.error);
         ReadColor(root, "success", t.success);
 
+        if (root.contains("colorStrength") && root["colorStrength"].is_number())
+            t.colorStrength = root["colorStrength"].get<float>();
         if (root.contains("cornerRadius") && root["cornerRadius"].is_number())
             t.cornerRadius = root["cornerRadius"].get<float>();
         if (root.contains("density") && root["density"].is_number())
             t.density = root["density"].get<float>();
 
+        t.colorStrength = (std::max)(0.0f, (std::min)(1.0f, t.colorStrength));
         t.cornerRadius = (std::max)(0.0f, (std::min)(12.0f, t.cornerRadius));
         t.density = (std::max)(0.75f, (std::min)(1.35f, t.density));
         out = t;
@@ -189,6 +192,7 @@ nlohmann::json ThemeToJson(const ThemeSettings& t) {
         {"warning", ColorToHex(t.warning)},
         {"error", ColorToHex(t.error)},
         {"success", ColorToHex(t.success)},
+        {"colorStrength", t.colorStrength},
         {"cornerRadius", t.cornerRadius},
         {"density", t.density},
     };
@@ -368,6 +372,7 @@ ThemeSettings BuiltInTheme() {
     t.warning    = ImVec4(0.90f, 0.70f, 0.20f, 1.00f);
     t.error      = ImVec4(0.85f, 0.30f, 0.30f, 1.00f);
     t.success    = ImVec4(0.30f, 0.75f, 0.40f, 1.00f);
+    t.colorStrength = 0.65f;
     t.cornerRadius = 4.0f;
     t.density = 1.0f;
     return t;
