@@ -155,12 +155,13 @@ void DrawMidiPage(ConfigDocument& doc) {
         RestartCell();
 
         ImGui::TableNextRow();
-        LabelCell("Ring capacity",
-                  "Total MIDI event ring capacity. Larger values absorb longer bursts but use more memory.");
+        LabelCell("EV buffer",
+                  "MIDI event-buffer capacity. This single control sets both the queued-event ring and the maximum event batch admitted to one audio callback. Larger values absorb denser bursts but reserve more memory and increase worst-case callback work.");
         ImGui::TableNextColumn();
-        if (InputU32("##ringcapacity", w.eventRingCapacity, 4096u, UINT32_MAX)) {
-            if (w.maxEventsPerBlock > w.eventRingCapacity)
-                w.maxEventsPerBlock = w.eventRingCapacity;
+        uint32_t eventBuffer = w.eventRingCapacity;
+        if (InputU32("##evbuffer", eventBuffer, 4096u, UINT32_MAX)) {
+            w.eventRingCapacity = eventBuffer;
+            w.maxEventsPerBlock = eventBuffer;
             doc.MarkDirty();
         }
         RestartCell();
@@ -183,16 +184,6 @@ void DrawMidiPage(ConfigDocument& doc) {
         uint32_t shed = w.shedStartPercent;
         if (InputU32("##shedstart", shed, 1u, 99u)) {
             w.shedStartPercent = shed;
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Max events per block",
-                  "Maximum MIDI events processed during one audio callback. Must not exceed ring capacity.");
-        ImGui::TableNextColumn();
-        if (InputU32("##maxevents", w.maxEventsPerBlock, 1u,
-                     (std::max)(1u, w.eventRingCapacity))) {
             doc.MarkDirty();
         }
         RestartCell();
