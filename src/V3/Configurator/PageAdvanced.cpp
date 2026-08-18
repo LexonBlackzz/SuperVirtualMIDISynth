@@ -99,7 +99,6 @@ void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked,
 bool confirmReset = false;
 std::string themeStatus;
 bool themeStatusError = false;
-float themeColorStrength = 0.65f;
 
 } // namespace
 
@@ -144,10 +143,10 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     ImGui::Spacing();
     ImGui::TextDisabled("Colour strength");
     ImGui::SetNextItemWidth(220.0f);
-    float strengthPercent = themeColorStrength * 100.0f;
+    float strengthPercent = theme.colorStrength * 100.0f;
     if (ImGui::SliderFloat("##theme_colour_strength", &strengthPercent,
                            0.0f, 100.0f, "%.0f%%")) {
-        themeColorStrength = strengthPercent / 100.0f;
+        theme.colorStrength = strengthPercent / 100.0f;
         themeStrengthChanged = true;
     }
     if (ImGui::IsItemHovered()) {
@@ -163,7 +162,7 @@ void DrawAdvancedPage(ConfigDocument& doc) {
 
     if (themeColorChanged || themeStrengthChanged) {
         const ImVec4 picked = theme.accent;
-        RebuildPaletteFromThemeColor(theme, picked, themeColorStrength);
+        RebuildPaletteFromThemeColor(theme, picked, theme.colorStrength);
         themeChanged = true;
     }
 
@@ -243,7 +242,6 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     ImGui::SameLine();
     if (ImGui::Button("Reset preview")) {
         ResetThemePreview();
-        themeColorStrength = 0.65f;
         themeStatus = "Built-in theme restored in memory. Save it if you want to replace a saved theme.";
         themeStatusError = false;
     }
