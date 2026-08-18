@@ -29,6 +29,7 @@ const LiveLinkContext& GetLiveLinkContext();
 
 void PushLiveFloat(svms::RLCommandType type, float value);
 void PushLiveBool(svms::RLCommandType type, bool value);
+void PushLiveMaxVoices(uint32_t value);
 
 void SectionHeader(const char* label);
 void HelpMarker(const char* desc);
