@@ -1,6 +1,7 @@
 #include "Widgets.h"
 #include "ConfiguratorApp.h"
 #include "ConfigDocument.h"
+#include "Theme.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "../SVMSRuntimeLink.h"
@@ -34,7 +35,7 @@ static bool g_toastActive = false;
 
 void SectionHeader(const char* label) {
     ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
     ImGui::PushFont(nullptr);
     ImGui::TextUnformatted(label);
     ImGui::PopFont();
@@ -71,15 +72,15 @@ bool ToggleSwitch(const char* label, bool* value, const char* tooltip) {
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImU32 bgCol = *value
-        ? ImGui::GetColorU32(ImVec4(0.447f, 0.533f, 0.855f, 1.0f))
-        : ImGui::GetColorU32(ImVec4(0.20f, 0.22f, 0.25f, 1.0f));
+        ? ImGui::GetColorU32(GetAccent())
+        : ImGui::GetColorU32(GetThemeSettings().control);
     float t = *value ? 1.0f : 0.0f;
     float cx = pos.x + radius + t * (w - radius * 2.0f);
     float cy = pos.y + radius;
 
     dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h), bgCol, h * 0.5f);
     dl->AddCircleFilled(ImVec2(cx, cy), radius - 2.0f,
-                        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.95f)));
+                        ImGui::GetColorU32(GetThemeSettings().text));
 
     ImGui::SameLine();
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4.0f);
@@ -262,11 +263,11 @@ void StatusBar(const char* text, bool modified) {
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
 
     if (modified) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
         ImGui::Text("Configuration modified");
         ImGui::PopStyleColor();
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
         ImGui::TextUnformatted(text);
         ImGui::PopStyleColor();
     }
@@ -279,10 +280,13 @@ void ToastNotification(const char* message, float durationSeconds) {
 }
 
 void PushToastStyle() {
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,
+                        (std::max)(6.0f, GetThemeSettings().cornerRadius));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 10));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.14f, 0.18f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.447f, 0.533f, 0.855f, 0.5f));
+    ImVec4 bg = GetPanelBg();
+    bg.w = 0.97f;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
+    ImGui::PushStyleColor(ImGuiCol_Border, GetAccentDim());
 }
 
 void PopToastStyle() {
@@ -371,14 +375,17 @@ bool RotaryKnob(KnobState& state, const char* format) {
     float angle = startAngle + t * (endAngle - startAngle);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ThemeSettings& theme = GetThemeSettings();
 
     ImU32 borderCol = ImGui::GetColorU32(
-        hovered ? ImVec4(0.30f, 0.35f, 0.42f, 1.0f)
-                : ImVec4(0.20f, 0.22f, 0.25f, 1.0f));
-    ImU32 arcCol = ImGui::GetColorU32(ImVec4(0.447f, 0.533f, 0.855f, 0.85f));
+        hovered ? ImGui::GetStyleColorVec4(ImGuiCol_Border)
+                : GetInputBorder());
+    ImVec4 arc = GetAccent();
+    arc.w = 0.88f;
+    ImU32 arcCol = ImGui::GetColorU32(arc);
     ImU32 knobFace = ImGui::GetColorU32(
-        active ? ImVec4(0.16f, 0.18f, 0.22f, 1.0f)
-               : ImVec4(0.13f, 0.145f, 0.176f, 1.0f));
+        active ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive)
+               : theme.control);
 
     dl->AddCircleFilled(center, radius, knobFace, 32);
     dl->AddCircle(center, radius, borderCol, 32, 1.5f);
@@ -400,8 +407,9 @@ bool RotaryKnob(KnobState& state, const char* format) {
 
     ImVec2 pointer(center.x + std::cos(angle) * innerRadius,
                    center.y + std::sin(angle) * innerRadius);
-    dl->AddLine(center, pointer, ImGui::GetColorU32(ImVec4(0.85f, 0.88f, 0.92f, 0.9f)),
-                2.0f);
+    ImVec4 pointerColor = theme.text;
+    pointerColor.w = 0.90f;
+    dl->AddLine(center, pointer, ImGui::GetColorU32(pointerColor), 2.0f);
 
     char valueBuf[64];
     float displayVal = state.displayFn ? state.displayFn(state.value)
@@ -409,13 +417,13 @@ bool RotaryKnob(KnobState& state, const char* format) {
     snprintf(valueBuf, sizeof(valueBuf), format, displayVal);
     ImVec2 textSize = ImGui::CalcTextSize(valueBuf);
     dl->AddText(ImVec2(center.x - textSize.x * 0.5f, center.y + radius + 4.0f),
-                ImGui::GetColorU32(ImVec4(0.90f, 0.91f, 0.92f, 1.0f)), valueBuf);
+                ImGui::GetColorU32(theme.text), valueBuf);
 
     char labelBuf[128];
     snprintf(labelBuf, sizeof(labelBuf), "%s", state.label);
     ImVec2 labelText = ImGui::CalcTextSize(labelBuf);
     dl->AddText(ImVec2(center.x - labelText.x * 0.5f, center.y + radius + 22.0f),
-                ImGui::GetColorU32(ImVec4(0.56f, 0.59f, 0.62f, 1.0f)), labelBuf);
+                ImGui::GetColorU32(theme.mutedText), labelBuf);
 
     if (active) {
         float delta = ImGui::GetIO().MouseDelta.y;
@@ -458,7 +466,7 @@ void DrawVerticalMeter(const char* /*id*/, float value, float peak,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 pos = ImGui::GetCursorScreenPos();
 
-    ImU32 bgCol = ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.11f, 1.0f));
+    ImU32 bgCol = ImGui::GetColorU32(GetPanelBg());
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bgCol, 2.0f);
 
     float h = size.y * ImClamp(value, 0.0f, 1.0f);
@@ -467,11 +475,11 @@ void DrawVerticalMeter(const char* /*id*/, float value, float peak,
         float frac = h / size.y;
         ImU32 barCol;
         if (frac < 0.6f)
-            barCol = ImGui::GetColorU32(ImVec4(0.30f, 0.75f, 0.40f, 0.9f));
+            barCol = ImGui::GetColorU32(GetSuccess());
         else if (frac < 0.8f)
-            barCol = ImGui::GetColorU32(ImVec4(0.90f, 0.75f, 0.20f, 0.9f));
+            barCol = ImGui::GetColorU32(GetWarning());
         else
-            barCol = ImGui::GetColorU32(ImVec4(0.85f, 0.30f, 0.30f, 0.9f));
+            barCol = ImGui::GetColorU32(GetError());
         dl->AddRectFilled(ImVec2(pos.x + 1, pos.y + size.y),
                           ImVec2(pos.x + size.x - 1, pos.y + size.y - h),
                           barCol, 1.0f);
@@ -479,7 +487,9 @@ void DrawVerticalMeter(const char* /*id*/, float value, float peak,
 
     if (peak > 0.01f) {
         float peakY = pos.y + size.y - size.y * ImClamp(peak, 0.0f, 1.0f);
-        ImU32 peakCol = ImGui::GetColorU32(ImVec4(0.95f, 0.95f, 0.95f, 0.8f));
+        ImVec4 peakColor = GetThemeSettings().text;
+        peakColor.w = 0.82f;
+        ImU32 peakCol = ImGui::GetColorU32(peakColor);
         dl->AddLine(ImVec2(pos.x, peakY), ImVec2(pos.x + size.x, peakY), peakCol, 1.0f);
     }
 
@@ -487,8 +497,10 @@ void DrawVerticalMeter(const char* /*id*/, float value, float peak,
         auto drawTick = [&](float db, const char* text) {
             float frac = (db + 48.0f) / 48.0f;
             float y = pos.y + size.y - size.y * frac;
+            ImVec4 tick = GetMutedText();
+            tick.w = 0.82f;
             dl->AddText(ImVec2(pos.x + size.x + 3.0f, y - 5.0f),
-                        ImGui::GetColorU32(ImVec4(0.45f, 0.48f, 0.52f, 0.8f)), text);
+                        ImGui::GetColorU32(tick), text);
         };
         drawTick(0.0f, "0");
         drawTick(-3.0f, "-3");
@@ -506,7 +518,7 @@ void DrawGainReductionMeter(const char* /*id*/, float gr,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 pos = ImGui::GetCursorScreenPos();
 
-    ImU32 bgCol = ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.11f, 1.0f));
+    ImU32 bgCol = ImGui::GetColorU32(GetPanelBg());
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bgCol, 2.0f);
 
     float grAbs = fabsf(gr);
@@ -515,15 +527,17 @@ void DrawGainReductionMeter(const char* /*id*/, float gr,
     if (h > 0) {
         ImVec2 barTL(pos.x + 1, pos.y + 1);
         ImVec2 barBR(pos.x + size.x - 1, pos.y + 1 + h);
-        ImU32 barCol = ImGui::GetColorU32(ImVec4(0.90f, 0.70f, 0.20f, 0.9f));
+        ImU32 barCol = ImGui::GetColorU32(GetWarning());
         dl->AddRectFilled(barTL, barBR, barCol, 1.0f);
     }
 
     auto drawTick = [&](float db, const char* text) {
         float frac = db / 24.0f;
         float y = pos.y + size.y * frac;
+        ImVec4 tick = GetMutedText();
+        tick.w = 0.82f;
         dl->AddText(ImVec2(pos.x + size.x + 3.0f, y - 5.0f),
-                    ImGui::GetColorU32(ImVec4(0.45f, 0.48f, 0.52f, 0.8f)), text);
+                    ImGui::GetColorU32(tick), text);
     };
     drawTick(0.0f, "0");
     drawTick(-3.0f, "-3");
@@ -534,7 +548,7 @@ void DrawGainReductionMeter(const char* /*id*/, float gr,
     char buf[32];
     snprintf(buf, sizeof(buf), "%.1f dB", gr);
     dl->AddText(ImVec2(pos.x + 2.0f, pos.y + size.y + 2.0f),
-                ImGui::GetColorU32(ImVec4(0.70f, 0.72f, 0.75f, 1.0f)), buf);
+                ImGui::GetColorU32(GetMutedText()), buf);
 
     ImGui::Dummy(ImVec2(size.x + 30.0f, size.y + 16.0f));
 }
@@ -551,8 +565,9 @@ void DrawReverbVisualizer(ImDrawList* dl, ImVec2 center, float radius,
         float alpha = (1.0f - t * 0.7f) * decay;
         float wobble = std::sin(time * 1.5f + i * 0.7f) * modDepth * 4.0f * t;
 
-        ImU32 col = ImGui::GetColorU32(ImVec4(
-            0.447f, 0.533f, 0.855f, alpha * 0.35f));
+        ImVec4 ring = GetAccent();
+        ring.w = alpha * 0.35f;
+        ImU32 col = ImGui::GetColorU32(ring);
 
         int segments = 32;
         for (int j = 0; j < segments; ++j) {
@@ -579,8 +594,9 @@ void DrawReverbVisualizer(ImDrawList* dl, ImVec2 center, float radius,
         float modOffset = std::sin(time * 0.8f + angle * 3.0f) * modDepth * dist * 0.15f;
         ImVec2 pt(center.x + std::cos(angle) * (dist + modOffset) * width,
                   center.y + std::sin(angle) * (dist + modOffset));
-        ImU32 dotCol = ImGui::GetColorU32(ImVec4(0.447f, 0.533f, 0.855f,
-                                                  0.15f + decay * 0.15f));
+        ImVec4 dot = GetAccent();
+        dot.w = 0.15f + decay * 0.15f;
+        ImU32 dotCol = ImGui::GetColorU32(dot);
         dl->AddCircleFilled(pt, 1.5f, dotCol, 6);
     }
 }
@@ -622,13 +638,13 @@ void AppliedStateBadge(bool connected,
     ImGui::SameLine();
     bool synced = connected && telemetry && LiveAppliedMatches(*telemetry, working);
     if (connected && telemetry && !synced) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
         ImGui::TextDisabled("PENDING");
     } else if (connected && telemetry) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.80f, 0.45f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
         ImGui::TextDisabled("APPLIED");
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
         ImGui::TextDisabled("OFFLINE");
     }
     ImGui::PopStyleColor();
@@ -646,7 +662,7 @@ void AppliedStateBadge(bool connected,
 
 void LiveBadge(const char* tooltip) {
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.80f, 0.45f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
     ImGui::TextDisabled("LIVE");
     ImGui::PopStyleColor();
     if (tooltip && ImGui::IsItemHovered()) {
@@ -658,7 +674,7 @@ void LiveBadge(const char* tooltip) {
 
 void RestartRequiredBadge() {
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
     ImGui::TextDisabled("RESTART");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) {
