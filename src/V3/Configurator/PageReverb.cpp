@@ -25,6 +25,19 @@ float SmoothValue(float current, float target, float dt, float speed) {
     return current + (target - current) * alpha;
 }
 
+ImVec4 MixColor(const ImVec4& a, const ImVec4& b, float t) {
+    t = ImClamp(t, 0.0f, 1.0f);
+    return ImVec4(a.x + (b.x - a.x) * t,
+                  a.y + (b.y - a.y) * t,
+                  a.z + (b.z - a.z) * t,
+                  a.w + (b.w - a.w) * t);
+}
+
+ImVec4 WithAlpha(ImVec4 color, float alpha) {
+    color.w = ImClamp(alpha, 0.0f, 1.0f);
+    return color;
+}
+
 float Hash01(uint32_t value) {
     value ^= value >> 16;
     value *= 0x7feb352du;
@@ -118,14 +131,22 @@ void DrawAtmospherePanel(const ImVec2& pos, const ImVec2& size,
                          const AtmosphereState& state, bool enabled) {
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const ImVec2 max(pos.x + size.x, pos.y + size.y);
+    const ThemeSettings& theme = GetThemeSettings();
+    const ImVec4 accent = theme.accent;
+    const ImVec4 accentMid = MixColor(accent, theme.text, 0.13f);
+    const ImVec4 accentBright = MixColor(accent, theme.text, 0.34f);
 
-    const ImU32 topColor = ImGui::GetColorU32(ImVec4(0.052f, 0.060f, 0.073f, 1.0f));
-    const ImU32 bottomColor = ImGui::GetColorU32(ImVec4(0.036f, 0.043f, 0.057f, 1.0f));
+    // Keep the visual darker than the surrounding effect page so the coloured
+    // field has somewhere to glow, but tint the panel with the active theme.
+    const ImVec4 top = MixColor(theme.background, theme.panel, 0.56f);
+    const ImVec4 bottom = MixColor(theme.background, ImVec4(0, 0, 0, 1), 0.28f);
+    const ImU32 topColor = ImGui::GetColorU32(top);
+    const ImU32 bottomColor = ImGui::GetColorU32(bottom);
     drawList->AddRectFilledMultiColor(pos, max,
                                       topColor, topColor,
                                       bottomColor, bottomColor);
     drawList->AddRect(pos, max,
-                      ImGui::GetColorU32(ImVec4(0.15f, 0.17f, 0.21f, 1.0f)),
+                      ImGui::GetColorU32(MixColor(theme.panel, theme.text, 0.16f)),
                       6.0f, 0, 1.0f);
 
     if (size.x < 80.0f || size.y < 80.0f) return;
@@ -149,10 +170,13 @@ void DrawAtmospherePanel(const ImVec2& pos, const ImVec2& size,
     const float highCut = Clamp01((state.highCutHz - 1000.0f) / 19000.0f);
     const float mix = Clamp01(state.mix);
 
-    const float enabledGain = enabled ? 1.0f : 0.26f;
-    const float wetGain = (0.38f + mix * 0.62f) * enabledGain;
-    const float brightness = (0.48f + highCut * 0.52f) *
-                             (1.0f - damping * 0.38f);
+    const float enabledGain = enabled ? 1.0f : 0.22f;
+    // The old field multiplied already-small alpha values by roughly 0.5 at
+    // the default mix, which made the animation practically disappear. Keep
+    // mix meaningful, but give the visual a healthy baseline presence.
+    const float wetGain = (0.62f + mix * 0.38f) * enabledGain;
+    const float brightness = (0.78f + highCut * 0.30f) *
+                             (1.0f - damping * 0.24f);
 
     // Width directly stretches the field. Radius is compensated so even
     // maximum width remains inside the available panel.
@@ -170,18 +194,18 @@ void DrawAtmospherePanel(const ImVec2& pos, const ImVec2& size,
     for (int i = 5; i >= 1; --i) {
         const float t = static_cast<float>(i) / 5.0f;
         const float radius = deadZone * (1.15f + t * 2.8f);
-        const float alpha = (0.012f + early * 0.020f) *
-                            (1.0f - lowCut * 0.45f) * wetGain;
+        const float alpha = (0.025f + early * 0.050f) *
+                            (1.0f - lowCut * 0.38f) * wetGain;
         drawList->AddCircleFilled(center, radius,
-            ImGui::GetColorU32(ImVec4(0.34f, 0.43f, 0.78f, alpha / t)), 40);
+            ImGui::GetColorU32(WithAlpha(accentMid, alpha / t)), 40);
     }
 
     DrawEllipse(drawList, center,
                 deadZone * xScale, deadZone * yScale,
                 state.phase * 0.25f, 0.012f,
-                ImGui::GetColorU32(ImVec4(0.56f, 0.65f, 0.94f,
-                    (0.10f + early * 0.10f) * wetGain)),
-                1.0f);
+                ImGui::GetColorU32(WithAlpha(
+                    accentBright, (0.18f + early * 0.18f) * wetGain)),
+                1.2f);
 
     // Early reflections remain comparatively crisp and live near the center.
     const int earlyShells = 3 + static_cast<int>(early * 3.0f);
@@ -192,14 +216,14 @@ void DrawAtmospherePanel(const ImVec2& pos, const ImVec2& size,
             (fieldRadius * 0.43f - deadZone) * t;
         const float irregularity = (1.0f - diffusion) * 0.045f +
             modDepth * 0.014f * std::sin(state.phase * 1.7f + i * 1.9f);
-        const float alpha = (0.065f + early * 0.16f) *
-                            (1.0f - t * 0.38f) * wetGain;
+        const float alpha = (0.11f + early * 0.25f) *
+                            (1.0f - t * 0.32f) * wetGain;
         DrawEllipse(drawList, center,
                     radius * xScale, radius * yScale,
                     state.phase * 0.18f + i,
                     irregularity,
-                    ImGui::GetColorU32(ImVec4(0.49f, 0.59f, 0.93f, alpha)),
-                    1.0f + early * 0.35f);
+                    ImGui::GetColorU32(WithAlpha(accentBright, alpha)),
+                    1.1f + early * 0.45f);
     }
 
     // Late FDN-style field. This is intentionally parameter-driven eye candy,
@@ -212,22 +236,20 @@ void DrawAtmospherePanel(const ImVec2& pos, const ImVec2& size,
         const float radius = fieldRadius * (0.28f + t * 0.72f);
         const float tail = std::pow(1.0f - t,
                                     0.45f + (1.0f - decay) * 1.8f);
-        const float distantDamping = 1.0f - t * damping * 0.62f;
-        const float alpha = (0.030f + late * 0.115f) *
-                            (0.30f + decay * 0.70f) *
+        const float distantDamping = 1.0f - t * damping * 0.56f;
+        const float alpha = (0.060f + late * 0.190f) *
+                            (0.38f + decay * 0.62f) *
                             tail * distantDamping * brightness * wetGain;
         const float phase = state.phase * (0.32f + modDepth * 0.70f) + i * 0.61f;
         const float irregularity = (1.0f - diffusion) * 0.070f +
             modDepth * 0.018f * std::sin(state.phase * 1.3f + i * 0.7f);
 
-        const float coolShift = highCut * 0.08f;
+        const ImVec4 ringColor = MixColor(accentMid, theme.text,
+                                          0.04f + highCut * 0.12f);
         DrawEllipse(drawList, center,
                     radius * xScale, radius * yScale,
                     phase, irregularity,
-                    ImGui::GetColorU32(ImVec4(0.36f + coolShift,
-                                              0.48f + coolShift,
-                                              0.86f + highCut * 0.08f,
-                                              alpha)),
+                    ImGui::GetColorU32(WithAlpha(ringColor, alpha)),
                     1.0f);
     }
 
@@ -254,45 +276,45 @@ void DrawAtmospherePanel(const ImVec2& pos, const ImVec2& size,
                            center.y + std::sin(angle) * radius * breathe * yScale);
         const float tailEnergy = 1.0f - radialShape *
             (0.40f + (1.0f - decay) * 0.45f);
-        const float alpha = (0.050f + diffusion * 0.072f) *
-                            (0.32f + late * 0.68f) *
+        const float alpha = (0.085f + diffusion * 0.120f) *
+                            (0.34f + late * 0.66f) *
                             Clamp01(tailEnergy) * brightness * wetGain;
-        const float dotSize = 0.9f + diffusion * 0.70f + h2 * 0.50f;
+        const float dotSize = 1.0f + diffusion * 0.82f + h2 * 0.52f;
 
         const float trailAngle = angle - 0.018f *
             (0.5f + decay + modDepth);
         const ImVec2 trail(center.x + std::cos(trailAngle) * radius * breathe * xScale,
                            center.y + std::sin(trailAngle) * radius * breathe * yScale);
         drawList->AddLine(trail, point,
-            ImGui::GetColorU32(ImVec4(0.42f, 0.56f, 0.94f, alpha * 0.55f)), 1.0f);
+            ImGui::GetColorU32(WithAlpha(accentMid, alpha * 0.62f)), 1.0f);
         drawList->AddCircleFilled(point, dotSize,
-            ImGui::GetColorU32(ImVec4(0.48f, 0.61f, 0.98f, alpha)), 8);
+            ImGui::GetColorU32(WithAlpha(accentBright, alpha)), 8);
     }
 
     // Stereo focus points make Width readable immediately without claiming
     // to represent live audio energy.
     const float stereoOffset = fieldRadius * xScale * width * 0.28f;
-    const float focusAlpha = (0.06f + width * 0.08f) * wetGain;
-    drawList->AddCircleFilled(ImVec2(center.x - stereoOffset, center.y), 2.2f,
-        ImGui::GetColorU32(ImVec4(0.58f, 0.68f, 1.0f, focusAlpha)), 10);
-    drawList->AddCircleFilled(ImVec2(center.x + stereoOffset, center.y), 2.2f,
-        ImGui::GetColorU32(ImVec4(0.58f, 0.68f, 1.0f, focusAlpha)), 10);
+    const float focusAlpha = (0.14f + width * 0.18f) * wetGain;
+    drawList->AddCircleFilled(ImVec2(center.x - stereoOffset, center.y), 2.4f,
+        ImGui::GetColorU32(WithAlpha(accentBright, focusAlpha)), 10);
+    drawList->AddCircleFilled(ImVec2(center.x + stereoOffset, center.y), 2.4f,
+        ImGui::GetColorU32(WithAlpha(accentBright, focusAlpha)), 10);
 
     drawList->AddText(ImVec2(pos.x + 12.0f, pos.y + 10.0f),
-        ImGui::GetColorU32(ImVec4(0.48f, 0.52f, 0.58f, 0.90f)),
+        ImGui::GetColorU32(WithAlpha(theme.mutedText, 0.94f)),
         "SPACE FIELD");
 
     const char* hint = enabled ? "parameter-driven atmosphere" : "reverb bypassed";
     const ImVec2 hintSize = ImGui::CalcTextSize(hint);
     drawList->AddText(ImVec2(max.x - hintSize.x - 12.0f,
                              max.y - hintSize.y - 10.0f),
-        ImGui::GetColorU32(ImVec4(0.36f, 0.40f, 0.46f, 0.85f)), hint);
+        ImGui::GetColorU32(WithAlpha(theme.mutedText, 0.72f)), hint);
 
     drawList->PopClipRect();
 }
 
 void CompactSectionHeader(const char* label) {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.63f, 0.68f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
     ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
     ImGui::Separator();
@@ -468,7 +490,8 @@ void DrawReverbPage(ConfigDocument& doc) {
         const float available = ImGui::GetContentRegionAvail().x;
         const float titleWidth = ImGui::CalcTextSize(title).x;
         ImGui::SetCursorPosX(startX + (available - titleWidth) * 0.5f);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.78f, 0.95f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              MixColor(GetAccent(), GetThemeSettings().text, 0.28f));
         ImGui::TextUnformatted(title);
         ImGui::PopStyleColor();
         if (live.connected) LiveBadge("All reverb parameters support live preview");
