@@ -383,9 +383,94 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
     ImGui::EndTable();
 }
 
+bool DrawHeaderToggle(const char* id, const char* label, bool* value,
+                      const char* tooltip) {
+    ImGui::PushID(id);
+    const float switchW = 44.0f;
+    const float switchH = 22.0f;
+    const float gap = 10.0f;
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    const ImVec2 itemSize(switchW + gap + textSize.x, switchH);
+
+    ImGui::InvisibleButton("##header_toggle", itemSize);
+    bool changed = false;
+    if (ImGui::IsItemClicked()) {
+        *value = !*value;
+        changed = true;
+    }
+    const bool hovered = ImGui::IsItemHovered();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ThemeSettings& theme = GetThemeSettings();
+    const float radius = switchH * 0.5f;
+    const float t = *value ? 1.0f : 0.0f;
+    const float cx = pos.x + radius + t * (switchW - radius * 2.0f);
+    const float cy = pos.y + radius;
+    dl->AddRectFilled(pos, ImVec2(pos.x + switchW, pos.y + switchH),
+                      ImGui::GetColorU32(*value ? GetAccent() : theme.control),
+                      radius);
+    dl->AddCircleFilled(ImVec2(cx, cy), radius - 2.0f,
+                        ImGui::GetColorU32(theme.text));
+    dl->AddText(ImVec2(pos.x + switchW + gap,
+                       pos.y + (switchH - textSize.y) * 0.5f),
+                ImGui::GetColorU32(theme.text), label);
+
+    if (tooltip && hovered) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+void DrawHeaderState(bool connected,
+                     const svms::RuntimeLinkTelemetryV2* telemetry,
+                     const ConfigValues& values,
+                     const char* liveTooltip,
+                     const char* appliedTooltip) {
+    const bool synced = connected && telemetry &&
+                        LiveAppliedMatches(*telemetry, values);
+    const char* stateText = !connected || !telemetry
+        ? "OFFLINE" : (synced ? "APPLIED" : "PENDING");
+    const ImVec4 stateColor = !connected || !telemetry
+        ? GetMutedText() : (synced ? GetSuccess() : GetWarning());
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    float totalWidth = ImGui::CalcTextSize(stateText).x;
+    if (connected) totalWidth += ImGui::CalcTextSize("LIVE").x + spacing;
+
+    const float startX = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, available - totalWidth));
+
+    if (connected) {
+        ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
+        ImGui::TextUnformatted("LIVE");
+        ImGui::PopStyleColor();
+        if (liveTooltip && ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(liveTooltip);
+            ImGui::EndTooltip();
+        }
+        ImGui::SameLine();
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, stateColor);
+    ImGui::TextUnformatted(stateText);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(appliedTooltip);
+        if (connected && telemetry && !synced)
+            ImGui::TextUnformatted("Working values differ from the engine's applied echo.");
+        ImGui::EndTooltip();
+    }
+}
+
 void DrawControls(ConfigValues& w, ConfigDocument& doc) {
     const float avail = ImGui::GetContentRegionAvail().x;
-    const float mainKnob = avail > 420.0f ? 96.0f : 84.0f;
+    const float mainKnob = avail > 420.0f ? 104.0f : 92.0f;
     const float smallKnob = avail > 420.0f ? 66.0f : 58.0f;
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.71f, 0.76f, 1.0f));
@@ -532,15 +617,19 @@ void DrawLimiterPage(ConfigDocument& doc) {
     static GrHistory history;
     static MeterVisualState meterVisuals;
 
+    constexpr float headerSideWidth = 190.0f;
+    constexpr float headerRowHeight = 40.0f;
     if (ImGui::BeginTable("##limiter_header", 3, ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("enable", ImGuiTableColumnFlags_WidthFixed, 155.0f);
+        ImGui::TableSetupColumn("enable", ImGuiTableColumnFlags_WidthFixed, headerSideWidth);
         ImGui::TableSetupColumn("title", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthFixed, 190.0f);
-        ImGui::TableNextRow();
+        ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthFixed, headerSideWidth);
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, headerRowHeight);
 
         ImGui::TableNextColumn();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (headerRowHeight - 22.0f) * 0.5f);
         bool enabled = w.limiterEnabled;
-        if (ToggleSwitch("ENABLED", &enabled, "Enable the transparent brick-wall limiter.")) {
+        if (DrawHeaderToggle("limiter_enabled", "ENABLED", &enabled,
+                             "Enable the transparent brick-wall limiter.")) {
             w.limiterEnabled = enabled;
             doc.MarkDirty();
             PushLiveBool(svms::RLCommandType::SetLimiterEnabled, enabled);
@@ -549,6 +638,9 @@ void DrawLimiterPage(ConfigDocument& doc) {
         ImGui::TableNextColumn();
         const char* title = "LIMITER";
         const ImVec2 titleSize = ImGui::CalcTextSize(title);
+        const float titleHeight = ImGui::GetTextLineHeight();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+                             (headerRowHeight - titleHeight) * 0.5f);
         const float start = ImGui::GetCursorPosX();
         const float width = ImGui::GetContentRegionAvail().x;
         ImGui::SetCursorPosX(start + (width - titleSize.x) * 0.5f);
@@ -557,9 +649,11 @@ void DrawLimiterPage(ConfigDocument& doc) {
         ImGui::PopStyleColor();
 
         ImGui::TableNextColumn();
-        if (lc.connected) LiveBadge("All limiter parameters are live-previewed");
-        AppliedStateBadge(lc.connected, lc.telemetry, w,
-                          "Limiter group applied state vs working copy");
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+                             (headerRowHeight - titleHeight) * 0.5f);
+        DrawHeaderState(lc.connected, lc.telemetry, w,
+                        "All limiter parameters are live-previewed",
+                        "Limiter group applied state vs working copy");
         ImGui::EndTable();
     }
 
