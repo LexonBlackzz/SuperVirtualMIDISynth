@@ -44,6 +44,9 @@ public:
     void RenderFrame();
 
     bool IsRunning() const { return running_; }
+    bool IsMinimized() const {
+        return hwnd_ != nullptr && IsIconic(hwnd_) != FALSE;
+    }
 
     const wchar_t* LastInitError() const { return lastInitError_.c_str(); }
 
