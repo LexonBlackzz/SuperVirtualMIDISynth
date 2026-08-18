@@ -118,6 +118,7 @@ struct RuntimeConfigSnapshot {
 struct NonAtomicLiveConfigMailbox {
     float masterVolume = 1.0f;
     bool  correctnessMode = false;
+    uint32_t maxVoices = 1000u;
     bool  reverbEnabled = false;
     float reverbMix = 0.25f;
     float reverbRoomSize = 0.60f;
@@ -140,9 +141,10 @@ struct NonAtomicLiveConfigMailbox {
 };
 
 struct LiveConfigMailbox {
-    // Master
+    // Master / engine limits
     std::atomic<float> masterVolume{1.0f};
     std::atomic<bool>  correctnessMode{false};
+    std::atomic<uint32_t> maxVoices{1000u};
 
     // Reverb
     std::atomic<bool>  reverbEnabled{false};
@@ -170,6 +172,7 @@ struct LiveConfigMailbox {
     void InitFromEngineConfig(const EngineConfig& cfg, uint32_t sampleRate) {
         masterVolume.store(cfg.masterVolume, std::memory_order_relaxed);
         correctnessMode.store(cfg.correctnessMode, std::memory_order_relaxed);
+        maxVoices.store(cfg.maxVoices, std::memory_order_relaxed);
 
         reverbEnabled.store(cfg.enableReverb, std::memory_order_relaxed);
         reverbMix.store(cfg.reverbMix, std::memory_order_relaxed);
@@ -208,6 +211,7 @@ struct LiveConfigMailbox {
     void StoreToNonAtomic(svms::NonAtomicLiveConfigMailbox& out) const {
         out.masterVolume = masterVolume.load(std::memory_order_relaxed);
         out.correctnessMode = correctnessMode.load(std::memory_order_relaxed);
+        out.maxVoices = maxVoices.load(std::memory_order_relaxed);
         out.reverbEnabled = reverbEnabled.load(std::memory_order_relaxed);
         out.reverbMix = reverbMix.load(std::memory_order_relaxed);
         out.reverbRoomSize = reverbRoomSize.load(std::memory_order_relaxed);
