@@ -23,6 +23,7 @@ struct ThemeSettings {
     ImVec4 warning;
     ImVec4 error;
     ImVec4 success;
+    float colorStrength = 0.65f;
     float cornerRadius = 4.0f;
     float density = 1.0f;
 };
