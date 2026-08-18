@@ -51,6 +51,44 @@ bool ThemeFloatRow(const char* label, const char* id, float& value,
     return ImGui::SliderFloat(id, &value, minValue, maxValue, format);
 }
 
+ImVec4 HsvColor(float h, float s, float v, float a = 1.0f) {
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    ImGui::ColorConvertHSVtoRGB(h, s, v, r, g, b);
+    return ImVec4(r, g, b, a);
+}
+
+void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked) {
+    float h = 0.0f;
+    float s = 0.0f;
+    float v = 0.0f;
+    ImGui::ColorConvertRGBtoHSV(picked.x, picked.y, picked.z, h, s, v);
+
+    // One wheel controls the entire visual family. Surfaces stay deliberately
+    // dark and low-saturation so a fully themed UI remains readable rather
+    // than turning into one giant slab of the accent colour.
+    const float chroma = (std::max)(0.0f, (std::min)(1.0f, s));
+    const float surfaceSat = 0.08f + chroma * 0.30f;
+
+    theme.accent = ImVec4(picked.x, picked.y, picked.z, 1.0f);
+    theme.background = HsvColor(h, surfaceSat * 0.62f, 0.080f);
+    theme.sidebar    = HsvColor(h, surfaceSat * 0.72f, 0.108f);
+    theme.panel      = HsvColor(h, surfaceSat * 0.68f, 0.098f);
+    theme.control    = HsvColor(h, surfaceSat * 0.82f, 0.175f);
+
+    // Text follows the selected hue only very slightly; enough to belong to
+    // the palette without sacrificing contrast or looking like coloured CRT text.
+    theme.text      = HsvColor(h, chroma * 0.035f, 0.920f);
+    theme.mutedText = HsvColor(h, 0.035f + chroma * 0.075f, 0.620f);
+
+    // Warning/error remain semantic colours. Success may follow the theme a
+    // little, but stays visibly green enough to still mean success.
+    theme.warning = ImVec4(0.90f, 0.70f, 0.20f, 1.0f);
+    theme.error   = ImVec4(0.85f, 0.30f, 0.30f, 1.0f);
+    theme.success = ImVec4(0.30f, 0.75f, 0.40f, 1.0f);
+}
+
 bool confirmReset = false;
 std::string themeStatus;
 bool themeStatusError = false;
@@ -62,18 +100,16 @@ void DrawAdvancedPage(ConfigDocument& doc) {
 
     SectionHeader("APPEARANCE");
     ImGui::TextDisabled(
-        "Pick an accent and the UI derives its active/hover shades automatically.");
+        "Pick one colour and the background, panels, controls and accents follow it automatically.");
 
     ThemeSettings& theme = EditThemeSettings();
     bool themeChanged = false;
+    bool themeColorChanged = false;
 
-    // The default theme editor is deliberately just the useful bit: one
-    // hue wheel. The neutral surfaces keep the configurator restrained while
-    // the accent propagates through controls, meters and status highlights.
     ImGui::BeginGroup();
-    ImGui::TextUnformatted("ACCENT");
+    ImGui::TextUnformatted("THEME COLOR");
     ImGui::SetNextItemWidth(220.0f);
-    themeChanged |= ImGui::ColorPicker3(
+    themeColorChanged |= ImGui::ColorPicker3(
         "##theme_accent_wheel", &theme.accent.x,
         ImGuiColorEditFlags_PickerHueWheel |
         ImGuiColorEditFlags_NoSidePreview |
@@ -84,25 +120,31 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     ImGui::SameLine(0.0f, 24.0f);
     ImGui::BeginGroup();
     ImGui::Dummy(ImVec2(0.0f, 24.0f));
-    ImGui::TextDisabled("Selected accent");
+    ImGui::TextDisabled("Selected colour");
     ImGui::ColorButton("##theme_accent_preview", theme.accent,
                        ImGuiColorEditFlags_NoTooltip,
                        ImVec2(52.0f, 28.0f));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(128.0f);
-    themeChanged |= ImGui::ColorEdit3(
+    themeColorChanged |= ImGui::ColorEdit3(
         "##theme_accent_hex", &theme.accent.x,
         ImGuiColorEditFlags_DisplayHex |
         ImGuiColorEditFlags_NoPicker |
         ImGuiColorEditFlags_NoSmallPreview);
     ImGui::Spacing();
-    ImGui::TextDisabled("Everything else is optional.");
+    ImGui::TextDisabled("Advanced overrides remain available below.");
     ImGui::EndGroup();
+
+    if (themeColorChanged) {
+        const ImVec4 picked = theme.accent;
+        RebuildPaletteFromThemeColor(theme, picked);
+        themeChanged = true;
+    }
 
     ImGui::Spacing();
     if (ImGui::CollapsingHeader("Advanced palette / layout")) {
         ImGui::TextDisabled(
-            "Only use this if you want to override the neutral surfaces or geometry.");
+            "Override any generated colour here. Moving the theme wheel again regenerates this palette.");
         if (ImGui::BeginTable("##theme_advanced_settings", 2,
                               ImGuiTableFlags_SizingStretchProp |
                               ImGuiTableFlags_BordersInnerH |
