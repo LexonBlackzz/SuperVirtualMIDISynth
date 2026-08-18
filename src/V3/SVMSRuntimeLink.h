@@ -31,11 +31,13 @@
 #include <cstdlib>
 #include <stdlib.h>
 #include <cstring>
+#include <cstdio>
 #include <functional>
 #include <atomic>
 #include <thread>
 
 #include "SVMSRuntimeLinkProtocol.h"
+#include "SVMSLiveControl.h"
 
 namespace svms {
 
@@ -216,7 +218,33 @@ private:
             local = view_->command;  // re-read post-commit
             RLResult result = RLResult::InternalError;
             char resultText[kRuntimeLinkResultTextCapacity] = {};
-            if (commandHandler_) {
+            bool skipHandler = false;
+
+            // Voice-cap changes are process-local control state, not shared
+            // memory consumed by the audio thread. Validate against the pool
+            // allocated at startup, then publish one atomic request that the
+            // VoiceManager observes at a render boundary.
+            if (local.type == static_cast<uint32_t>(RLCommandType::ApplyLiveConfig) &&
+                (local.groupMask & RLGroupVoices) != 0u) {
+                const uint32_t requested = local.live.maxVoices;
+                const uint32_t capacity = RuntimeVoicePoolCapacity();
+                if (requested == 0u) {
+                    result = RLResult::InvalidArgument;
+                    strncpy_s(resultText, kRuntimeLinkResultTextCapacity,
+                              "voice cap must be at least 1", _TRUNCATE);
+                    skipHandler = true;
+                } else if (capacity != 0u && requested > capacity) {
+                    result = RLResult::RestartRequired;
+                    std::snprintf(resultText, kRuntimeLinkResultTextCapacity,
+                                  "voice cap %u exceeds startup pool %u",
+                                  requested, capacity);
+                    skipHandler = true;
+                } else {
+                    RequestRuntimeVoiceLimit(requested);
+                }
+            }
+
+            if (!skipHandler && commandHandler_) {
                 if (local.type == static_cast<uint32_t>(RLCommandType::ReloadSoundFont)) {
                     busyWithReload_ = true;
                 }
@@ -248,6 +276,13 @@ private:
 
         RuntimeLinkTelemetryV2 snap = telemetryProvider_
             ? telemetryProvider_() : RuntimeLinkTelemetryV2{};
+        // The driver mailbox echo predates the live voice-cap field. Overlay
+        // the audio-thread-applied logical cap here; snap.maxVoices remains
+        // the physical startup pool so the Configurator can distinguish
+        // "live now" from "restart required to grow".
+        const uint32_t appliedVoiceLimit = AppliedRuntimeVoiceLimit();
+        if (appliedVoiceLimit != 0u) snap.live.maxVoices = appliedVoiceLimit;
+
         LARGE_INTEGER qpc;
         QueryPerformanceCounter(&qpc);
         snap.timestampQpc = static_cast<uint64_t>(qpc.QuadPart);
