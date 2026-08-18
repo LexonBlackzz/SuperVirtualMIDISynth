@@ -3,6 +3,7 @@
 
 #include "SVMSTypes.h"
 #include "SVMSEnvelope.h"
+#include "SVMSLiveControl.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -293,6 +294,7 @@ private:
     uint32_t sampleRate_;
     uint32_t stealFadeFrames_;
     uint64_t currentFrame_;
+    uint64_t lastVoiceLimitEnforceFrame_;
 
     // LIFO free slot stack
     int32_t* freeStack_;
@@ -495,7 +497,8 @@ inline VoiceManager::VoiceManager()
     : activeCount_(0), activeList_(nullptr), activePosition_(nullptr),
       freeTop_(0), maxVoices_(0), voiceLimit_(0), sampleRate_(44100),
       stealFadeFrames_(kStealFadeFrames),
-      currentFrame_(0), freeStack_(nullptr),
+      currentFrame_(0), lastVoiceLimitEnforceFrame_(UINT64_MAX),
+      freeStack_(nullptr),
       channelIndexBlocks_(nullptr), channelIndexFreeStack_(nullptr),
       channelIndexBlockCount_(0u), channelIndexFreeTop_(0u),
       channelActiveBlock_(nullptr), channelActiveOffset_(nullptr),
@@ -661,6 +664,7 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     voiceLimit_ = other.voiceLimit_;
     stealFadeFrames_ = other.stealFadeFrames_;
     currentFrame_ = other.currentFrame_;
+    lastVoiceLimitEnforceFrame_ = other.lastVoiceLimitEnforceFrame_;
     std::memcpy(channelActiveCount_, other.channelActiveCount_,
                 sizeof(channelActiveCount_));
     std::memcpy(channelActiveHead_, other.channelActiveHead_,
@@ -784,6 +788,7 @@ inline void VoiceManager::Reset() {
                 sizeof(*playGroupPrev_) * maxVoices_);
     activeCount_ = 0;
     currentFrame_ = 0;
+    lastVoiceLimitEnforceFrame_ = UINT64_MAX;
     retireCount_ = 0;
     retireImmediateCount_ = 0;
     stealCount_ = 0;
@@ -816,6 +821,7 @@ inline void VoiceManager::Reset() {
 inline bool VoiceManager::SetVoiceLimit(uint32_t limit) {
     if (limit == 0u || limit > maxVoices_) return false;
     voiceLimit_ = limit;
+    PublishAppliedRuntimeVoiceLimit(limit);
     return true;
 }
 
@@ -861,6 +867,31 @@ inline uint32_t VoiceManager::EnforceVoiceLimit(uint32_t maxReleases,
 inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
     if (frame != currentFrame_) stealTailMinHeapValid_ = false;
     currentFrame_ = frame;
+
+    // RuntimeLink publishes only a process-local atomic request. Applying it
+    // here keeps VoiceManager mutation entirely on the audio/render thread.
+    // The request is sampled at render boundaries, so there are no mutexes,
+    // shared-memory accesses, or control-thread writes to voice state.
+    const uint32_t requestedLimit = RequestedRuntimeVoiceLimit();
+    if (requestedLimit != 0u && requestedLimit <= maxVoices_ &&
+        requestedLimit != voiceLimit_) {
+        SetVoiceLimit(requestedLimit);
+        lastVoiceLimitEnforceFrame_ = UINT64_MAX; // enforce this boundary
+    }
+
+    if (voiceLimit_ != 0u && activeCount_ > voiceLimit_) {
+        const uint64_t enforceInterval =
+            (std::max)(uint64_t{1}, static_cast<uint64_t>(sampleRate_) / 100u);
+        if (lastVoiceLimitEnforceFrame_ == UINT64_MAX ||
+            frame >= lastVoiceLimitEnforceFrame_ + enforceInterval) {
+            // Bound each reduction pass so a giant 100k -> 1k change cannot
+            // spend an unbounded amount of one callback in victim selection.
+            // Repeated boundaries continue shedding until the logical cap is
+            // reached; each victim receives the requested ~50 ms release.
+            EnforceVoiceLimit(8192u, 0.050f);
+            lastVoiceLimitEnforceFrame_ = frame;
+        }
+    }
 }
 
 inline uint32_t VoiceManager::GetChannelActiveCount(uint8_t channel) const {
@@ -2840,7 +2871,6 @@ inline void VoiceManager::RefreshMixGains(const ChannelParamsSnapshot* chParams)
     }
     if (stableTreeDirty) RebuildStableWinnerTree();
 }
-
 
 inline void VoiceManager::RefreshMixGainsForChannel(
     uint8_t channel, const ChannelParamsSnapshot& cp) {
