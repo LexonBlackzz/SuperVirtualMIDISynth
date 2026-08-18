@@ -558,17 +558,6 @@ void ConfiguratorApp::DrawHeader() {
     ImGui::PopStyleColor();
     ImGui::PopFont();
 
-    ImGui::SameLine(300.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.48f, 0.52f, 1.0f));
-    ImGui::Text("\"Semi-Professional*\" Audio Software tailored for Black MIDI");
-    ImGui::PopStyleColor();
-
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::Text("*Professionalism may decrease as NPS increases.");
-        ImGui::EndTooltip();
-    }
-
     float lineY = kHeaderHeight * dpiScale_ - 1.0f;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddLine(ImVec2(0, lineY),
@@ -656,9 +645,6 @@ void ConfiguratorApp::DrawFooter() {
     const float startX = ImGui::GetCursorPosX();
     const float avail = ImGui::GetContentRegionAvail().x;
 
-    // Revert and Discard were duplicates: both restored the saved working
-    // copy and pushed it back to the runtime. Keep one clear action and use
-    // the recovered width to make the footer robust at smaller window sizes.
     constexpr float kRevertW = 70.0f;
     constexpr float kAdoptW = 108.0f;
     constexpr float kSaveW = 160.0f;
@@ -716,10 +702,6 @@ void ConfiguratorApp::DrawFooter() {
         }
     }
 
-    // SameLine(pos_x) uses a window-local absolute X coordinate. The old
-    // code passed only `avail - width`, forgetting that this footer starts
-    // to the right of the sidebar; at narrow sizes that moved the buttons
-    // back into the status text. Anchor the group to startX explicitly.
     ImGui::SameLine(buttonX);
 
     if (ImGui::Button("Revert", ImVec2(kRevertW, 28))) {
