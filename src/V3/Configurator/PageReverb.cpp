@@ -313,6 +313,91 @@ void DrawAtmospherePanel(const ImVec2& pos, const ImVec2& size,
     drawList->PopClipRect();
 }
 
+bool DrawHeaderToggle(const char* id, const char* label, bool* value,
+                      const char* tooltip) {
+    ImGui::PushID(id);
+    const float switchW = 44.0f;
+    const float switchH = 22.0f;
+    const float gap = 10.0f;
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    const ImVec2 itemSize(switchW + gap + textSize.x, switchH);
+
+    ImGui::InvisibleButton("##header_toggle", itemSize);
+    bool changed = false;
+    if (ImGui::IsItemClicked()) {
+        *value = !*value;
+        changed = true;
+    }
+    const bool hovered = ImGui::IsItemHovered();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ThemeSettings& theme = GetThemeSettings();
+    const float radius = switchH * 0.5f;
+    const float t = *value ? 1.0f : 0.0f;
+    const float cx = pos.x + radius + t * (switchW - radius * 2.0f);
+    const float cy = pos.y + radius;
+    dl->AddRectFilled(pos, ImVec2(pos.x + switchW, pos.y + switchH),
+                      ImGui::GetColorU32(*value ? GetAccent() : theme.control),
+                      radius);
+    dl->AddCircleFilled(ImVec2(cx, cy), radius - 2.0f,
+                        ImGui::GetColorU32(theme.text));
+    dl->AddText(ImVec2(pos.x + switchW + gap,
+                       pos.y + (switchH - textSize.y) * 0.5f),
+                ImGui::GetColorU32(theme.text), label);
+
+    if (tooltip && hovered) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tooltip);
+        ImGui::EndTooltip();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+void DrawHeaderState(bool connected,
+                     const svms::RuntimeLinkTelemetryV2* telemetry,
+                     const ConfigValues& values,
+                     const char* liveTooltip,
+                     const char* appliedTooltip) {
+    const bool synced = connected && telemetry &&
+                        LiveAppliedMatches(*telemetry, values);
+    const char* stateText = !connected || !telemetry
+        ? "OFFLINE" : (synced ? "APPLIED" : "PENDING");
+    const ImVec4 stateColor = !connected || !telemetry
+        ? GetMutedText() : (synced ? GetSuccess() : GetWarning());
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    float totalWidth = ImGui::CalcTextSize(stateText).x;
+    if (connected) totalWidth += ImGui::CalcTextSize("LIVE").x + spacing;
+
+    const float startX = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, available - totalWidth));
+
+    if (connected) {
+        ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
+        ImGui::TextUnformatted("LIVE");
+        ImGui::PopStyleColor();
+        if (liveTooltip && ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(liveTooltip);
+            ImGui::EndTooltip();
+        }
+        ImGui::SameLine();
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, stateColor);
+    ImGui::TextUnformatted(stateText);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(appliedTooltip);
+        if (connected && telemetry && !synced)
+            ImGui::TextUnformatted("Working values differ from the engine's applied echo.");
+        ImGui::EndTooltip();
+    }
+}
+
 void CompactSectionHeader(const char* label) {
     ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
     ImGui::TextUnformatted(label);
@@ -349,12 +434,17 @@ void DrawControlPanel(ConfigDocument& doc, float panelHeight) {
     float knobSize = 52.0f;
     if (panelHeight < 400.0f || panelWidth < 440.0f) knobSize = 47.0f;
     if (panelHeight < 350.0f || panelWidth < 380.0f) knobSize = 42.0f;
+    const float mixKnobSize = (std::min)(74.0f, knobSize * 1.32f);
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(7.0f, 3.0f));
 
     CompactSectionHeader("SPACE");
-    if (ImGui::BeginTable("##reverb_space", 3, ImGuiTableFlags_SizingStretchSame)) {
+    if (ImGui::BeginTable("##reverb_space", 4, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        DrawLiveKnob(doc, values.reverbMix, 0.0f, 1.0f, 0.25f,
+                     "MIX", mixKnobSize, "%.0f%%",
+                     svms::RLCommandType::SetReverbMix, 100.0f);
         ImGui::TableNextColumn();
         DrawLiveKnob(doc, values.reverbRoomSize, 0.0f, 1.0f, 0.60f,
                      "ROOM SIZE", knobSize, "%.0f%%",
@@ -464,28 +554,33 @@ void DrawReverbPage(ConfigDocument& doc) {
     static AtmosphereState atmosphere;
     UpdateAtmosphere(atmosphere, values, ImGui::GetIO().DeltaTime);
 
-    // Header behaves like a small plugin header: power/state on the left,
-    // title in the center, and Mix as the one global control on the right.
+    // Compact plugin header: enable on the left, effect identity centered in
+    // the whole page, and runtime state right-aligned. Mix belongs with the
+    // other parameters below, where it has comfortable drag space.
+    constexpr float headerSideWidth = 190.0f;
+    constexpr float headerRowHeight = 40.0f;
     if (ImGui::BeginTable("##reverb_header", 3,
                           ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("power", ImGuiTableColumnFlags_WidthFixed, 175.0f);
+        ImGui::TableSetupColumn("power", ImGuiTableColumnFlags_WidthFixed, headerSideWidth);
         ImGui::TableSetupColumn("title", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("mix", ImGuiTableColumnFlags_WidthFixed, 118.0f);
-        ImGui::TableNextRow(ImGuiTableRowFlags_None, 86.0f);
+        ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthFixed, headerSideWidth);
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, headerRowHeight);
 
         ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 24.0f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (headerRowHeight - 22.0f) * 0.5f);
         bool enabled = values.enableReverb;
-        if (ToggleSwitch("POWER", &enabled, "Enable the FDN reverb effect.")) {
+        if (DrawHeaderToggle("reverb_power", "POWER", &enabled,
+                             "Enable the FDN reverb effect.")) {
             values.enableReverb = enabled;
             doc.MarkDirty();
             PushLiveBool(svms::RLCommandType::SetReverbEnabled, enabled);
         }
-        if (live.connected) LiveBadge("Reverb toggle is live-previewed through RuntimeLink");
 
         ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 18.0f);
         const char* title = "REVERB";
+        const float titleHeight = ImGui::GetTextLineHeight();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+                             (headerRowHeight - titleHeight) * 0.5f);
         const float startX = ImGui::GetCursorPosX();
         const float available = ImGui::GetContentRegionAvail().x;
         const float titleWidth = ImGui::CalcTextSize(title).x;
@@ -494,15 +589,13 @@ void DrawReverbPage(ConfigDocument& doc) {
                               MixColor(GetAccent(), GetThemeSettings().text, 0.28f));
         ImGui::TextUnformatted(title);
         ImGui::PopStyleColor();
-        if (live.connected) LiveBadge("All reverb parameters support live preview");
-        AppliedStateBadge(live.connected, live.telemetry, values,
-                          "Reverb group applied state vs working copy");
 
         ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
-        DrawLiveKnob(doc, values.reverbMix, 0.0f, 1.0f, 0.25f,
-                     "MIX", 62.0f, "%.0f%%",
-                     svms::RLCommandType::SetReverbMix, 100.0f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+                             (headerRowHeight - titleHeight) * 0.5f);
+        DrawHeaderState(live.connected, live.telemetry, values,
+                        "All reverb parameters support live preview",
+                        "Reverb group applied state vs working copy");
 
         ImGui::EndTable();
     }
