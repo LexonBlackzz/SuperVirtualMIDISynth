@@ -19,14 +19,18 @@ const LiveLinkContext& GetLiveLinkContext() { return g_liveLink; }
 
 // Live changes are routed through the ConfiguratorApp so widgets never
 // talk to the driver directly: every knob/edit marks its group dirty on
-// the app's coalescing working live state, and the app sends ONE grouped
-// ApplyLiveConfig command per flush interval.
+// the app's coalescing working live state, and the app sends one grouped
+// ApplyLiveConfig command as soon as the current UI frame finishes.
 void PushLiveFloat(svms::RLCommandType type, float value) {
     if (g_liveLink.app) g_liveLink.app->SetLiveFloat(type, value);
 }
 
 void PushLiveBool(svms::RLCommandType type, bool value) {
     if (g_liveLink.app) g_liveLink.app->SetLiveBool(type, value);
+}
+
+void PushLiveMaxVoices(uint32_t value) {
+    if (g_liveLink.app) g_liveLink.app->SetLiveMaxVoices(value);
 }
 
 static float g_toastTimer = 0.0f;
@@ -611,6 +615,7 @@ bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,
     if (e.correctnessMode != (working.correctnessMode ? 1u : 0u)) return false;
     if (e.reverbEnabled != (working.enableReverb ? 1u : 0u)) return false;
     if (e.limiterEnabled != (working.limiterEnabled ? 1u : 0u)) return false;
+    if (e.maxVoices != 0u && e.maxVoices != working.maxVoices) return false;
     if (!closeEnough(e.masterVolume, working.masterVolume)) return false;
     if (!closeEnough(e.reverbMix, working.reverbMix)) return false;
     if (!closeEnough(e.reverbRoomSize, working.reverbRoomSize)) return false;
