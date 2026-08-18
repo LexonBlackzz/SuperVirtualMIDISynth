@@ -152,7 +152,13 @@ public:
     void ReleaseChannel(uint8_t channel, uint32_t blockOffset);
 
     uint32_t GetActiveCount() const { return activeCount_; }
+    // Physical allocation ceiling. This is fixed until the driver restarts.
     uint32_t GetMaxVoices() const { return maxVoices_; }
+    // Logical live ceiling. It may move freely inside the physical pool.
+    uint32_t GetVoiceLimit() const { return voiceLimit_; }
+    bool SetVoiceLimit(uint32_t limit);
+    uint32_t EnforceVoiceLimit(uint32_t maxReleases = 8192u,
+                               float releaseSeconds = 0.050f);
     size_t GetAllocatedBytes() const {
         return sizeof(*this) + v.GetAllocatedBytes() - sizeof(v) +
                metadataBytes_;
@@ -283,6 +289,7 @@ private:
     };
 
     uint32_t maxVoices_;
+    uint32_t voiceLimit_;
     uint32_t sampleRate_;
     uint32_t stealFadeFrames_;
     uint64_t currentFrame_;
@@ -486,7 +493,7 @@ private:
 
 inline VoiceManager::VoiceManager()
     : activeCount_(0), activeList_(nullptr), activePosition_(nullptr),
-      freeTop_(0), maxVoices_(0), sampleRate_(44100),
+      freeTop_(0), maxVoices_(0), voiceLimit_(0), sampleRate_(44100),
       stealFadeFrames_(kStealFadeFrames),
       currentFrame_(0), freeStack_(nullptr),
       channelIndexBlocks_(nullptr), channelIndexFreeStack_(nullptr),
@@ -651,6 +658,7 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     retireCount_ = other.retireCount_;
     retireImmediateCount_ = other.retireImmediateCount_;
     stealCount_ = other.stealCount_;
+    voiceLimit_ = other.voiceLimit_;
     stealFadeFrames_ = other.stealFadeFrames_;
     currentFrame_ = other.currentFrame_;
     std::memcpy(channelActiveCount_, other.channelActiveCount_,
@@ -712,9 +720,11 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
     if (requested == 0u || !v.Reserve(requested) ||
         !ReserveMetadata(requested)) {
         maxVoices_ = 0u;
+        voiceLimit_ = 0u;
         return false;
     }
     maxVoices_ = requested;
+    voiceLimit_ = requested;
     sampleRate_ = sampleRate > 0 ? sampleRate : 44100;
     stealFadeFrames_ = kStealFadeFrames;
     Reset();
@@ -801,6 +811,51 @@ inline void VoiceManager::Reset() {
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
         for (uint32_t n = 0; n < kNoteCount; ++n)
             channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
+}
+
+inline bool VoiceManager::SetVoiceLimit(uint32_t limit) {
+    if (limit == 0u || limit > maxVoices_) return false;
+    voiceLimit_ = limit;
+    return true;
+}
+
+inline uint32_t VoiceManager::EnforceVoiceLimit(uint32_t maxReleases,
+                                                 float releaseSeconds) {
+    if (voiceLimit_ == 0u || maxReleases == 0u) return 0u;
+    const uint32_t releasing = GetReleasingCount();
+    const uint32_t primaryVoices = activeCount_ > releasing
+        ? activeCount_ - releasing : 0u;
+    if (primaryVoices <= voiceLimit_) return 0u;
+
+    uint32_t remaining = primaryVoices - voiceLimit_;
+    remaining = (std::min)(remaining, maxReleases);
+    const float seconds = (std::max)(0.005f, (std::min)(0.250f, releaseSeconds));
+    const float releaseDecay = MakeReleaseDecay(seconds, sampleRate_);
+    const uint32_t releaseSamples = MakeReleaseSamples(seconds, sampleRate_);
+
+    uint32_t released = 0u;
+    while (released < remaining) {
+        uint32_t position = 0u;
+        const VoiceHandle victim = PopStealCandidate(position, false);
+        if (victim == kInvalidVoice) break;
+        if (v.state[victim] != static_cast<uint8_t>(VoiceState::Active))
+            continue;
+
+        v.heldBySustain[victim] = 0u;
+        v.releaseStartInBlock[victim] = 0u;
+        v.releaseDecay[victim] = releaseDecay;
+        v.releaseSamplesRemaining[victim] = releaseSamples;
+        StartRelease(victim);
+        // StartRelease reclassifies the voice and can reinsert it into the
+        // exact steal index. Keep this one absent while selecting the rest of
+        // the forced-cap victims, then rebuild lazily on the next real steal.
+        if (stealHeapValid_) RemoveStealCandidate(victim);
+        ++released;
+    }
+
+    stealHeapValid_ = false;
+    stealVolatileHeapValid_ = false;
+    return released;
 }
 
 inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
@@ -1869,7 +1924,8 @@ inline void VoiceManager::RemoveStealCandidate(VoiceHandle handle) {
 }
 
 inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, uint8_t velocity) {
-    if (freeTop_ == 0) return kInvalidVoice;
+    if (voiceLimit_ == 0u || activeCount_ >= voiceLimit_ || freeTop_ == 0u)
+        return kInvalidVoice;
     uint32_t idx = freeStack_[--freeTop_];
 
     InitializeVoice(static_cast<VoiceHandle>(idx), channel, note, velocity);
@@ -1892,8 +1948,16 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
                                                         bool* outStolen,
                                                         bool deferCandidate,
                                                         bool reserveCandidateInPlace) {
+    // While a lowered cap is still draining its forced-release tails, do not
+    // admit replacement notes that would turn those tails back into primaries.
+    // The transition is bounded by the forced release (normally 50 ms).
+    if (voiceLimit_ == 0u || activeCount_ > voiceLimit_) {
+        if (outStolen) *outStolen = false;
+        return kInvalidVoice;
+    }
+
     VoiceHandle vh = kInvalidVoice;
-    if (deferCandidate && freeTop_ != 0u) {
+    if (deferCandidate && freeTop_ != 0u && activeCount_ < voiceLimit_) {
         const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
         vh = static_cast<VoiceHandle>(idx);
         InitializePreparedVoice(vh, channel, note, velocity);
@@ -1912,7 +1976,9 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         return vh;
     }
 
-    // Pool is full — find the lowest-priority voice to steal.
+    // Physical pool or logical live cap is full — find the lowest-priority
+    // voice to steal. Replacement happens in-place, so the live cap cannot
+    // grow past its configured value.
     uint32_t bestPos = 0;
     const VoiceHandle bestHandle = PopStealCandidate(
         bestPos, deferCandidate && reserveCandidateInPlace);
@@ -2265,7 +2331,7 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const bool preserveRenderIndex =
         v.renderClass[handle] == desiredClassValue;
 
-CaptureStealTail(handle);
+    CaptureStealTail(handle);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const uint64_t profileAfterTail = profileLaunch ? __rdtsc() : 0u;
 #endif
@@ -2431,7 +2497,7 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         const VoiceRenderClass desiredClass =
             ClassifyConfiguration(setups[i]);
         const uint8_t configuredClass = static_cast<uint8_t>(desiredClass);
-const bool preserveRenderIndex = candidatesReservedInPlace &&
+        const bool preserveRenderIndex = candidatesReservedInPlace &&
             v.renderClass[handle] == configuredClass;
         ++stealCount_;
         if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
@@ -2508,7 +2574,8 @@ inline bool VoiceManager::LaunchVoiceGroup(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
     const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles) {
-    if (!setups || !outHandles || count == 0u || count > maxVoices_)
+    if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
+        count > voiceLimit_)
         return false;
     if (count == 1u && TryLaunchSingleVoiceInPlace(
             channel, note, velocity, setups[0], playIndex, channelParams,
