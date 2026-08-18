@@ -21,12 +21,6 @@ void DrawAboutPage(ConfigDocument& doc) {
     ImGui::PopFont();
 
     ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
-    ImGui::Text("\"Semi-Professional*\" Audio Software "
-                "tailored for Black MIDI");
-    ImGui::PopStyleColor();
-
-    ImGui::Spacing();
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -74,6 +68,12 @@ void DrawAboutPage(ConfigDocument& doc) {
     ImGui::PopStyleColor();
 
     ImGui::Spacing();
+    ImGui::Spacing();
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+    ImGui::TextWrapped("Semi-Professional software... for Black MIDI");
+    ImGui::PopStyleColor();
+
     ImGui::Spacing();
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.37f, 0.40f, 0.44f, 1.0f));
