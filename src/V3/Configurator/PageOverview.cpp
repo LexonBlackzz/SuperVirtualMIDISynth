@@ -1,153 +1,173 @@
 #include "PageOverview.h"
 #include "ConfigDocument.h"
+#include "Theme.h"
 #include "Widgets.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
-#include <filesystem>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <commdlg.h>
+
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <string>
 
 namespace svms::cfg {
+namespace {
+
+std::string WideToUtf8Overview(const std::wstring& ws) {
+    if (ws.empty()) return {};
+    const int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(),
+                                        static_cast<int>(ws.size()),
+                                        nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string result(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()),
+                        result.data(), len, nullptr, nullptr);
+    return result;
+}
+
+float LinearToDb(float linear) {
+    if (linear <= 0.000001f) return -60.0f;
+    return (std::max)(-60.0f, (std::min)(0.0f, 20.0f * std::log10(linear)));
+}
+
+void DrawOverviewOutputMeter(const svms::RuntimeLinkTelemetryV2* telemetry,
+                             bool connected,
+                             float height) {
+    constexpr float kMeterWidth = 26.0f;
+    constexpr float kFloorDb = -60.0f;
+
+    static float visualDb = kFloorDb;
+    float targetDb = kFloorDb;
+    if (connected && telemetry) {
+        const float linear = (std::max)(telemetry->limiterOutputPeakL,
+                                        telemetry->limiterOutputPeakR);
+        targetDb = LinearToDb(linear);
+    }
+
+    const float dt = (std::max)(0.0f, ImGui::GetIO().DeltaTime);
+    const float speed = targetDb > visualDb ? 22.0f : 9.0f;
+    const float alpha = 1.0f - std::exp(-speed * dt);
+    visualDb += (targetDb - visualDb) * alpha;
+
+    height = (std::max)(80.0f, height);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImVec2 size(kMeterWidth, height);
+    ImGui::InvisibleButton("##overview_limiter_output", size);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 maxP(p.x + size.x, p.y + size.y);
+    const float rounding = (std::min)(GetThemeSettings().cornerRadius, 5.0f);
+    dl->AddRectFilled(p, maxP, ImGui::GetColorU32(GetPanelBg()), rounding);
+    dl->AddRect(p, maxP, ImGui::GetColorU32(GetInputBorder()), rounding);
+
+    const float t = (visualDb - kFloorDb) / -kFloorDb;
+    const float clamped = (std::max)(0.0f, (std::min)(1.0f, t));
+    const float inset = 3.0f;
+    const float innerTop = p.y + inset;
+    const float innerBottom = maxP.y - inset;
+    const float fillTop = innerBottom - (innerBottom - innerTop) * clamped;
+
+    ImVec4 fill = GetAccent();
+    if (visualDb > -3.0f) fill = GetError();
+    else if (visualDb > -9.0f) fill = GetWarning();
+
+    if (clamped > 0.0f) {
+        dl->AddRectFilled(ImVec2(p.x + inset, fillTop),
+                          ImVec2(maxP.x - inset, innerBottom),
+                          ImGui::GetColorU32(fill),
+                          (std::max)(0.0f, rounding - 2.0f));
+    }
+
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        if (connected && telemetry)
+            ImGui::Text("Limiter output: %.1f dBFS", targetDb);
+        else
+            ImGui::TextUnformatted("Limiter output: RuntimeLink offline");
+        ImGui::EndTooltip();
+    }
+}
+
+} // namespace
 
 void DrawOverviewPage(ConfigDocument& doc) {
     auto& w = doc.Working();
-    auto& lc = GetLiveLinkContext();
+    const auto& lc = GetLiveLinkContext();
 
-    SectionHeader("SOUND SOURCE");
+    if (!ImGui::BeginTable("##overview_layout", 2,
+                           ImGuiTableFlags_SizingStretchProp,
+                           ImVec2(0.0f, ImGui::GetContentRegionAvail().y))) {
+        return;
+    }
+    ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("Output", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+
+    SectionHeader("SOUNDFONT");
 
     if (w.soundFontPath.empty()) {
-        ImGui::TextDisabled("SoundFont: Automatic");
-        auto resolved = std::filesystem::path(w.soundFontPath);
-        if (!resolved.empty()) {
-            ImGui::Text("Resolved: %s", resolved.string().c_str());
-        } else {
-            ImGui::TextDisabled("Resolved: (no SoundFont found)");
-        }
+        ImGui::TextUnformatted("Automatic / local fallback");
+        ImGui::TextDisabled("Choose a SoundFont to make it the configured source.");
     } else {
-        ImGui::Text("SoundFont: %s", std::filesystem::path(w.soundFontPath)
-                                         .filename()
-                                         .string()
-                                         .c_str());
-        ImGui::TextDisabled("Full path: %s",
-                            std::filesystem::path(w.soundFontPath)
-                                .string()
-                                .c_str());
+        const std::filesystem::path sfPath(w.soundFontPath);
+        const std::string filename = WideToUtf8Overview(sfPath.filename().wstring());
+        const std::string fullPath = WideToUtf8Overview(sfPath.wstring());
+        ImGui::Text("%s", filename.c_str());
+        ImGui::TextDisabled("%s", fullPath.c_str());
     }
+
     ImGui::Spacing();
 
-    SectionHeader("AUDIO");
+    static std::wstring lastSoundFontDir;
+    if (lastSoundFontDir.empty() && !w.soundFontPath.empty()) {
+        lastSoundFontDir = std::filesystem::path(w.soundFontPath).parent_path().wstring();
+    }
 
-    const char* deviceName = "Default Windows Output Device";
-    std::string deviceStr;
-    if (!w.audioDevice.empty() && w.audioDevice != L"default") {
-        int len = WideCharToMultiByte(CP_UTF8, 0, w.audioDevice.data(),
-                                      static_cast<int>(w.audioDevice.size()),
-                                      nullptr, 0, nullptr, nullptr);
-        if (len > 0) {
-            deviceStr.resize(static_cast<size_t>(len));
-            WideCharToMultiByte(CP_UTF8, 0, w.audioDevice.data(),
-                                static_cast<int>(w.audioDevice.size()),
-                                deviceStr.data(), len, nullptr, nullptr);
-            deviceName = deviceStr.c_str();
+    if (ImGui::Button("Choose SoundFont...", ImVec2(150.0f, 0.0f))) {
+        wchar_t fileBuf[1024] = {};
+        const std::wstring initialDir = lastSoundFontDir;
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.lpstrFilter =
+            L"SoundFont files (*.sf2;*.dls)\0*.sf2;*.dls\0"
+            L"All files (*.*)\0*.*\0";
+        ofn.lpstrFile = fileBuf;
+        ofn.nMaxFile = static_cast<DWORD>(std::size(fileBuf));
+        ofn.lpstrInitialDir = initialDir.empty() ? nullptr : initialDir.c_str();
+        ofn.lpstrTitle = L"Select SoundFont";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+        if (GetOpenFileNameW(&ofn)) {
+            w.soundFontPath = fileBuf;
+            lastSoundFontDir = std::filesystem::path(fileBuf).parent_path().wstring();
+            doc.MarkDirty();
         }
     }
-    ImGui::Text("Device: %s", deviceName);
-    RestartRequiredBadge();
-    ImGui::Text("Sample rate: %u Hz", w.sampleRate);
-    RestartRequiredBadge();
-    float latencyMs = (static_cast<float>(w.bufferFrames) /
-                       static_cast<float>(w.sampleRate)) *
-                      1000.0f;
-    ImGui::Text("Buffer: %u frames / %.2f ms", w.bufferFrames, latencyMs);
-    RestartRequiredBadge();
-    ImGui::Spacing();
-
-    SectionHeader("PERFORMANCE");
-
-    ImGui::Text("Max voices: %u", w.maxVoices);
-    RestartRequiredBadge();
-    if (w.renderThreads == 0)
-        ImGui::Text("Render threads: Auto");
-    else
-        ImGui::Text("Render threads: %u", w.renderThreads);
-    RestartRequiredBadge();
-    ImGui::Spacing();
-
-    SectionHeader("EFFECTS");
-
-    ImGui::Text("Reverb: %s", w.enableReverb ? "Enabled" : "Disabled");
-    LiveBadge("Reverb enable/disable is applied live via RuntimeLink");
-    ImGui::Text("Limiter: %s", w.limiterEnabled ? "Enabled" : "Disabled");
-    LiveBadge("Limiter enable/disable is applied live via RuntimeLink");
-    ImGui::Spacing();
-
-    SectionHeader("CONFIGURATION");
-
-    auto path = doc.GetActivePath();
-    if (!path.empty()) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path.data(),
-                                      static_cast<int>(path.size()),
-                                      nullptr, 0, nullptr, nullptr);
-        if (len > 0) {
-            std::string pathStr(static_cast<size_t>(len), '\0');
-            WideCharToMultiByte(CP_UTF8, 0, path.data(),
-                                static_cast<int>(path.size()),
-                                pathStr.data(), len, nullptr, nullptr);
-            ImGui::TextWrapped("%s", pathStr.c_str());
+    if (!w.soundFontPath.empty()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Clear", ImVec2(64.0f, 0.0f))) {
+            w.soundFontPath.clear();
+            doc.MarkDirty();
         }
-    } else {
-        ImGui::TextDisabled("No config loaded");
     }
+    ImGui::SameLine();
+    RestartRequiredBadge();
 
-    // ── Live telemetry (when RuntimeLink is connected) ─────────────────
-    if (lc.connected && lc.telemetry) {
-        ImGui::Spacing();
-        SectionHeader("LIVE TELEMETRY");
+    ImGui::Spacing();
+    ImGui::TextDisabled(
+        "SoundFont changes are saved to the synth configuration and currently take effect after restart.");
 
-        auto* t = lc.telemetry;
+    ImGui::TableNextColumn();
+    const float meterHeight = ImGui::GetContentRegionAvail().y;
+    DrawOverviewOutputMeter(lc.telemetry, lc.connected, meterHeight);
 
-        const char* audioStatus = t->audioRunning ? "Running" : "Stopped";
-        ImGui::Text("Audio: %s", audioStatus);
-        if (!t->audioRunning && t->audioHResult != 0) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(HRESULT 0x%08X)",
-                                static_cast<unsigned>(t->audioHResult));
-        }
-
-        ImGui::Text("SoundFont: %s",
-                    t->soundFontLoaded ? "Loaded" : "Not loaded");
-
-        ImGui::Spacing();
-
-        ImGui::Text("Active voices: %u / %u", t->activeVoices, t->maxVoices);
-        ImGui::Text("Releasing: %u", t->releasingVoices);
-        ImGui::Text("Free slots: %u", t->freeTop);
-        ImGui::Text("Steals: %u", t->voiceSteals);
-        ImGui::Text("Retired: %u (immediate: %u)",
-                    t->retiredCount, t->retiredImmediateCount);
-        ImGui::Text("Decimation step: %u", t->decimationStep);
-
-        ImGui::Spacing();
-
-        ImGui::Text("CPU load: %.1f%%", t->cpuLoadPercent);
-        ImGui::Text("Peak: %.3f", t->renderPeak);
-        ImGui::Text("Master volume: %.2f", t->live.masterVolume);
-        ImGui::Text("Sample rate: %u Hz", t->sampleRate);
-        ImGui::Text("Buffer: %u frames", t->bufferFrames);
-
-        ImGui::Spacing();
-        ImGui::Text("Events submitted: %llu",
-                    static_cast<unsigned long long>(t->eventsSubmitted));
-        ImGui::Text("Events accepted: %llu",
-                    static_cast<unsigned long long>(t->eventsAccepted));
-        ImGui::Text("Events dropped: %llu",
-                    static_cast<unsigned long long>(t->eventsDropped));
-        ImGui::Text("Events dispatched: %llu",
-                    static_cast<unsigned long long>(t->eventsDispatched));
-    }
+    ImGui::EndTable();
 }
 
 } // namespace svms::cfg
