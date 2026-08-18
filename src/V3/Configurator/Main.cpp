@@ -40,6 +40,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     while (app.PumpMessages()) {
+        // A minimized DXGI window is not guaranteed to block in Present().
+        // Continuing to build ImGui/D3D11 frames while it is iconified can
+        // therefore spin extremely fast and make the driver accumulate
+        // transient WRITE_DISCARD backing allocations. Sleep on the Win32
+        // message queue instead; the restore message wakes us immediately.
+        if (app.IsMinimized()) {
+            WaitMessage();
+            continue;
+        }
         app.RenderFrame();
     }
 
