@@ -1,6 +1,7 @@
 #include "PagePerformance.h"
 #include "ConfigDocument.h"
 #include "Widgets.h"
+#include "Theme.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
@@ -34,24 +35,54 @@ void LabelCell(const char* label, const char* tooltip = nullptr) {
     }
 }
 
-void RestartCell() {
+void CenteredStatusCell(const char* label, const ImVec4& color,
+                        const char* tooltip) {
     ImGui::TableNextColumn();
     ImGui::AlignTextToFramePadding();
-
-    constexpr const char* label = "RESTART";
     const float startX = ImGui::GetCursorPosX();
     const float available = ImGui::GetContentRegionAvail().x;
     const float labelWidth = ImGui::CalcTextSize(label).x;
     ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
     ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) {
+    if (tooltip && ImGui::IsItemHovered()) {
         ImGui::BeginTooltip();
-        ImGui::TextUnformatted("Requires driver restart to take effect.");
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.0f);
+        ImGui::TextUnformatted(tooltip);
+        ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
+}
+
+void RestartCell() {
+    CenteredStatusCell("RESTART", GetWarning(),
+                       "Requires driver restart to take effect.");
+}
+
+void LiveVoiceCell() {
+    CenteredStatusCell(
+        "LIVE", GetSuccess(),
+        "Changes apply immediately while the requested cap fits inside the voice pool allocated at driver startup. Lowering the cap force-releases the least-important excess voices over about 50 ms. Growing beyond the startup pool still requires a restart.");
+}
+
+float BlockBudgetMs(const svms::RuntimeLinkTelemetryV2& t) {
+    if (t.sampleRate == 0u) return 0.0f;
+    return static_cast<float>(t.bufferFrames) * 1000.0f /
+           static_cast<float>(t.sampleRate);
+}
+
+float PercentToMs(float percent, float budgetMs) {
+    return budgetMs * percent * 0.01f;
+}
+
+void BudgetMetric(const char* label, const char* format, ...) {
+    ImGui::TableNextColumn();
+    ImGui::TextDisabled("%s", label);
+    va_list args;
+    va_start(args, format);
+    ImGui::TextV(format, args);
+    va_end(args);
 }
 
 } // namespace
@@ -66,17 +97,25 @@ void DrawPerformancePage(ConfigDocument& doc) {
     if (BeginSettingsTable("##performance_settings")) {
         ImGui::TableNextRow();
         LabelCell("Maximum voices",
-                  "Maximum number of simultaneously allocated/rendered primary voices. "
-                  "This is not the same as source MIDI polyphony.");
+                  "Logical primary-voice ceiling. Lowering it live releases excess voices using the normal steal-priority policy and a short anti-click release. The physical pool size is fixed until restart.");
         ImGui::TableNextColumn();
         int maxVoices = static_cast<int>(w.maxVoices);
         ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::InputInt("##maxvoices", &maxVoices, 0, 0)) {
+        const bool editedMaxVoices = ImGui::InputInt("##maxvoices", &maxVoices, 0, 0);
+        if (editedMaxVoices) {
             maxVoices = (std::max)(1, (std::min)(524288, maxVoices));
             w.maxVoices = static_cast<uint32_t>(maxVoices);
             doc.MarkDirty();
         }
-        RestartCell();
+        // Avoid shedding thousands of voices because the user temporarily
+        // deleted a digit while typing. Commit the text field when editing is
+        // finished; presets below are applied immediately on click.
+        if (editedMaxVoices && !ImGui::IsItemActive()) {
+            PushLiveMaxVoices(w.maxVoices);
+        } else if (ImGui::IsItemDeactivatedAfterEdit()) {
+            PushLiveMaxVoices(w.maxVoices);
+        }
+        LiveVoiceCell();
 
         ImGui::TableNextRow();
         LabelCell("Voice presets");
@@ -91,16 +130,18 @@ void DrawPerformancePage(ConfigDocument& doc) {
             std::snprintf(label, sizeof(label), "%d###voices_%d", presetValues[i], i);
             const bool selected = static_cast<int>(w.maxVoices) == presetValues[i];
             if (selected) {
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                                      ImVec4(0.447f, 0.533f, 0.855f, 0.35f));
+                ImVec4 selectedButton = GetAccent();
+                selectedButton.w = 0.35f;
+                ImGui::PushStyleColor(ImGuiCol_Button, selectedButton);
             }
             if (ImGui::SmallButton(label)) {
                 w.maxVoices = static_cast<uint32_t>(presetValues[i]);
                 doc.MarkDirty();
+                PushLiveMaxVoices(w.maxVoices);
             }
             if (selected) ImGui::PopStyleColor();
         }
-        RestartCell();
+        LiveVoiceCell();
 
         ImGui::TableNextRow();
         LabelCell("Render threads",
@@ -149,7 +190,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
 
     ImGui::Spacing();
     if (w.maxVoices > 4096) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
         ImGui::TextWrapped("Extreme voice capacity. Actual realtime performance is workload and CPU dependent.");
         ImGui::PopStyleColor();
     } else {
@@ -159,25 +200,50 @@ void DrawPerformancePage(ConfigDocument& doc) {
 
     if (lc.connected && t) {
         ImGui::Spacing();
-        SectionHeader("LIVE");
-        if (ImGui::BeginTable("##performance_live", 4,
+        SectionHeader("LIVE RENDER BUDGET");
+
+        const float budgetMs = BlockBudgetMs(*t);
+        const float load = (std::max)(0.0f, t->cpuLoadPercent);
+        const float headroom = (std::max)(0.0f, 100.0f - load);
+        const float renderMs = PercentToMs(load, budgetMs);
+        const uint32_t appliedVoiceCap = t->live.maxVoices != 0u
+            ? t->live.maxVoices : t->maxVoices;
+
+        if (ImGui::BeginTable("##performance_live_primary", 4,
                               ImGuiTableFlags_SizingStretchSame |
                               ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("ACTIVE VOICES");
-            ImGui::Text("%u / %u", t->activeVoices, t->maxVoices);
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("CPU LOAD");
-            ImGui::Text("%.1f%%", t->cpuLoadPercent);
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("P99 BUDGET");
-            ImGui::Text("%.0f%%", t->callbackP99Percent);
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("DECIMATION");
-            ImGui::Text("%u", t->decimationStep);
+            BudgetMetric("ACTIVE VOICES", "%u / %u", t->activeVoices, appliedVoiceCap);
+            BudgetMetric("RENDER / BUDGET", "%.2f / %.2f ms", renderMs, budgetMs);
+            BudgetMetric("RENDER LOAD", "%.1f%%", load);
+            BudgetMetric("HEADROOM", "%.1f%%", headroom);
             ImGui::EndTable();
         }
+
+        ImGui::Spacing();
+        if (ImGui::BeginTable("##performance_live_percentiles", 4,
+                              ImGuiTableFlags_SizingStretchSame |
+                              ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableNextRow();
+            BudgetMetric("P95", "%.2f ms  (%.0f%%)",
+                         PercentToMs(t->callbackP95Percent, budgetMs),
+                         t->callbackP95Percent);
+            BudgetMetric("P99", "%.2f ms  (%.0f%%)",
+                         PercentToMs(t->callbackP99Percent, budgetMs),
+                         t->callbackP99Percent);
+            BudgetMetric("P99.9", "%.2f ms  (%.0f%%)",
+                         PercentToMs(t->callbackP999Percent, budgetMs),
+                         t->callbackP999Percent);
+            BudgetMetric("OVER BUDGET", "%llu  |  streak %u",
+                         static_cast<unsigned long long>(t->overBudgetCallbacks),
+                         t->maxConsecutiveOverBudget);
+            ImGui::EndTable();
+        }
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("Physical pool: %u voices   |   Buffer: %u frames @ %u Hz   |   Decimation: %ux",
+                            t->maxVoices, t->bufferFrames, t->sampleRate,
+                            (std::max)(1u, t->decimationStep));
     }
 }
 
