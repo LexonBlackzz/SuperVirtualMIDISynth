@@ -62,35 +62,71 @@ void DrawAdvancedPage(ConfigDocument& doc) {
 
     SectionHeader("APPEARANCE");
     ImGui::TextDisabled(
-        "Theme changes are previewed immediately. No theme JSON is created until you save one.");
+        "Pick an accent and the UI derives its active/hover shades automatically.");
 
     ThemeSettings& theme = EditThemeSettings();
     bool themeChanged = false;
 
-    if (ImGui::BeginTable("##theme_settings", 2,
-                          ImGuiTableFlags_SizingStretchProp |
-                          ImGuiTableFlags_BordersInnerH |
-                          ImGuiTableFlags_RowBg,
-                          ImVec2(0.0f, 0.0f))) {
-        ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthFixed, 170.0f);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    // The default theme editor is deliberately just the useful bit: one
+    // hue wheel. The neutral surfaces keep the configurator restrained while
+    // the accent propagates through controls, meters and status highlights.
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted("ACCENT");
+    ImGui::SetNextItemWidth(220.0f);
+    themeChanged |= ImGui::ColorPicker3(
+        "##theme_accent_wheel", &theme.accent.x,
+        ImGuiColorEditFlags_PickerHueWheel |
+        ImGuiColorEditFlags_NoSidePreview |
+        ImGuiColorEditFlags_NoSmallPreview |
+        ImGuiColorEditFlags_NoInputs);
+    ImGui::EndGroup();
 
-        themeChanged |= ThemeColorRow("Accent", "##theme_accent", theme.accent);
-        themeChanged |= ThemeColorRow("Background", "##theme_background", theme.background);
-        themeChanged |= ThemeColorRow("Sidebar", "##theme_sidebar", theme.sidebar);
-        themeChanged |= ThemeColorRow("Panel", "##theme_panel", theme.panel);
-        themeChanged |= ThemeColorRow("Controls", "##theme_control", theme.control);
-        themeChanged |= ThemeColorRow("Primary text", "##theme_text", theme.text);
-        themeChanged |= ThemeColorRow("Muted text", "##theme_muted", theme.mutedText);
-        themeChanged |= ThemeColorRow("Warning", "##theme_warning", theme.warning);
-        themeChanged |= ThemeColorRow("Error", "##theme_error", theme.error);
-        themeChanged |= ThemeColorRow("Success", "##theme_success", theme.success);
-        themeChanged |= ThemeFloatRow("Corner radius", "##theme_rounding",
-                                      theme.cornerRadius, 0.0f, 12.0f, "%.0f px");
-        themeChanged |= ThemeFloatRow("UI density", "##theme_density",
-                                      theme.density, 0.75f, 1.35f, "%.2fx");
+    ImGui::SameLine(0.0f, 24.0f);
+    ImGui::BeginGroup();
+    ImGui::Dummy(ImVec2(0.0f, 24.0f));
+    ImGui::TextDisabled("Selected accent");
+    ImGui::ColorButton("##theme_accent_preview", theme.accent,
+                       ImGuiColorEditFlags_NoTooltip,
+                       ImVec2(52.0f, 28.0f));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(128.0f);
+    themeChanged |= ImGui::ColorEdit3(
+        "##theme_accent_hex", &theme.accent.x,
+        ImGuiColorEditFlags_DisplayHex |
+        ImGuiColorEditFlags_NoPicker |
+        ImGuiColorEditFlags_NoSmallPreview);
+    ImGui::Spacing();
+    ImGui::TextDisabled("Everything else is optional.");
+    ImGui::EndGroup();
 
-        ImGui::EndTable();
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Advanced palette / layout")) {
+        ImGui::TextDisabled(
+            "Only use this if you want to override the neutral surfaces or geometry.");
+        if (ImGui::BeginTable("##theme_advanced_settings", 2,
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_BordersInnerH |
+                              ImGuiTableFlags_RowBg,
+                              ImVec2(0.0f, 0.0f))) {
+            ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+
+            themeChanged |= ThemeColorRow("Background", "##theme_background", theme.background);
+            themeChanged |= ThemeColorRow("Sidebar", "##theme_sidebar", theme.sidebar);
+            themeChanged |= ThemeColorRow("Panel", "##theme_panel", theme.panel);
+            themeChanged |= ThemeColorRow("Controls", "##theme_control", theme.control);
+            themeChanged |= ThemeColorRow("Primary text", "##theme_text", theme.text);
+            themeChanged |= ThemeColorRow("Muted text", "##theme_muted", theme.mutedText);
+            themeChanged |= ThemeColorRow("Warning", "##theme_warning", theme.warning);
+            themeChanged |= ThemeColorRow("Error", "##theme_error", theme.error);
+            themeChanged |= ThemeColorRow("Success", "##theme_success", theme.success);
+            themeChanged |= ThemeFloatRow("Corner radius", "##theme_rounding",
+                                          theme.cornerRadius, 0.0f, 12.0f, "%.0f px");
+            themeChanged |= ThemeFloatRow("UI density", "##theme_density",
+                                          theme.density, 0.75f, 1.35f, "%.2fx");
+
+            ImGui::EndTable();
+        }
     }
 
     if (themeChanged) {
