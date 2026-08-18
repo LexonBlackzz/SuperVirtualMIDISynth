@@ -49,6 +49,7 @@ public:
 
     void SetLiveFloat(svms::RLCommandType type, float value);
     void SetLiveBool(svms::RLCommandType type, bool value);
+    void SetLiveMaxVoices(uint32_t value);
 
     void HandleDpiChange(float scale, const RECT* suggestedRect);
 
@@ -108,8 +109,13 @@ private:
     svms::RuntimeLiveStateV2 workingLive_{};
     uint32_t pendingLiveMask_ = 0;
     float rlFlushTimer_ = 0.0f;
-    static constexpr float kRlFlushInterval = 0.25f;
+    // Live controls are coalesced only across extremely fast UI frames. At
+    // 60/120/144 Hz this means a change is eligible immediately on the frame
+    // that produced it, rather than sitting in the old quarter-second queue.
+    static constexpr float kRlFlushInterval = 1.0f / 240.0f;
+    static constexpr uint32_t kRlLiveCommandTimeoutMs = 50u;
     uint32_t rlFailedFlushes_ = 0;
+    float rlRetryBackoff_ = 0.0f;
 
     float rlReconnectTimer_ = 0.0f;
     static constexpr float kRlReconnectInterval = 3.0f;
