@@ -7,9 +7,11 @@
 namespace svms {
 
 // Process-local bridge between RuntimeLink's control thread and the audio
-// thread's VoiceManager.  This is deliberately NOT part of shared memory:
-// RuntimeLink validates and publishes the requested cap here, then the audio
-// thread observes it at render boundaries without locks or IPC traffic.
+// thread's VoiceManager. This is deliberately NOT part of shared memory:
+// RuntimeLink publishes a requested logical cap here, then the audio thread
+// observes it at a render boundary. A request above the current allocation is
+// handled by VoiceManager::GrowCapacity before the logical cap is applied.
+inline constexpr uint32_t kRuntimeVoiceGrowthCeiling = 524288u;
 inline std::atomic<uint32_t> g_runtimeVoicePoolCapacity{0u};
 inline std::atomic<uint32_t> g_runtimeRequestedVoiceLimit{0u};
 inline std::atomic<uint32_t> g_runtimeAppliedVoiceLimit{0u};
@@ -23,7 +25,18 @@ inline void PublishRuntimeVoicePoolCapacity(uint32_t capacity) noexcept {
     }
 }
 
+// RuntimeLink uses this as its command-validation ceiling. Once a VoiceManager
+// exists, the pool is growable up to V3's hard polyphony ceiling; the current
+// physical allocation is intentionally NOT the limit for a live request.
 inline uint32_t RuntimeVoicePoolCapacity() noexcept {
+    return g_runtimeVoicePoolCapacity.load(std::memory_order_acquire) == 0u
+        ? 0u : kRuntimeVoiceGrowthCeiling;
+}
+
+// Actual allocation currently owned by the running VoiceManager. Telemetry
+// normally obtains this directly from VoiceManager::GetMaxVoices(); expose it
+// here as well for process-local diagnostics that need the distinction.
+inline uint32_t RuntimeAllocatedVoicePoolCapacity() noexcept {
     return g_runtimeVoicePoolCapacity.load(std::memory_order_acquire);
 }
 
