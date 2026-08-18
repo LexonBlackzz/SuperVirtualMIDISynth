@@ -144,9 +144,12 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     ImGui::Spacing();
     ImGui::TextDisabled("Colour strength");
     ImGui::SetNextItemWidth(220.0f);
-    themeStrengthChanged |= ImGui::SliderFloat(
-        "##theme_colour_strength", &themeColorStrength,
-        0.0f, 1.0f, "%.0f%%", ImGuiSliderFlags_None);
+    float strengthPercent = themeColorStrength * 100.0f;
+    if (ImGui::SliderFloat("##theme_colour_strength", &strengthPercent,
+                           0.0f, 100.0f, "%.0f%%")) {
+        themeColorStrength = strengthPercent / 100.0f;
+        themeStrengthChanged = true;
+    }
     if (ImGui::IsItemHovered()) {
         ImGui::BeginTooltip();
         ImGui::TextUnformatted(
