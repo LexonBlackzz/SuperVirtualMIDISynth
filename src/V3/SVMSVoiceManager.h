@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -153,10 +154,12 @@ public:
     void ReleaseChannel(uint8_t channel, uint32_t blockOffset);
 
     uint32_t GetActiveCount() const { return activeCount_; }
-    // Physical allocation ceiling. This is fixed until the driver restarts.
+    // Physical allocation ceiling. It can grow at a render boundary; it is
+    // never shrunk live so existing voice handles remain stable.
     uint32_t GetMaxVoices() const { return maxVoices_; }
-    // Logical live ceiling. It may move freely inside the physical pool.
+    // Logical live ceiling. It may move freely inside (or grow) the pool.
     uint32_t GetVoiceLimit() const { return voiceLimit_; }
+    bool GrowCapacity(uint32_t capacity);
     bool SetVoiceLimit(uint32_t limit);
     uint32_t EnforceVoiceLimit(uint32_t maxReleases = 8192u,
                                float releaseSeconds = 0.050f);
@@ -818,6 +821,265 @@ inline void VoiceManager::Reset() {
             channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
 }
 
+inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
+    if (capacity <= maxVoices_) return capacity != 0u;
+    if (capacity == 0u || capacity > kMaxPolyphony) return false;
+
+    const uint32_t oldCapacity = maxVoices_;
+    VoiceManager grown;
+    if (!grown.Initialize(capacity, sampleRate_)) return false;
+
+    // Preserve every render-visible per-voice field. Handles are stable: old
+    // voices keep the same array index, while the newly added range remains
+    // Free from grown.Initialize().
+#define SVMS_COPY_GROWN_VOICE_FIELD(name) \
+    std::memcpy(grown.v.name, v.name, \
+                static_cast<size_t>(oldCapacity) * sizeof(*v.name))
+    SVMS_COPY_GROWN_VOICE_FIELD(channel);
+    SVMS_COPY_GROWN_VOICE_FIELD(note);
+    SVMS_COPY_GROWN_VOICE_FIELD(velocity);
+    SVMS_COPY_GROWN_VOICE_FIELD(state);
+    SVMS_COPY_GROWN_VOICE_FIELD(envelopeStage);
+    SVMS_COPY_GROWN_VOICE_FIELD(sampleBacked);
+    SVMS_COPY_GROWN_VOICE_FIELD(renderClass);
+    SVMS_COPY_GROWN_VOICE_FIELD(presetIndex);
+    SVMS_COPY_GROWN_VOICE_FIELD(regionIndex);
+    SVMS_COPY_GROWN_VOICE_FIELD(playIndex);
+    SVMS_COPY_GROWN_VOICE_FIELD(phases);
+    SVMS_COPY_GROWN_VOICE_FIELD(phaseIncs);
+    SVMS_COPY_GROWN_VOICE_FIELD(basePhaseIncs);
+    SVMS_COPY_GROWN_VOICE_FIELD(pitchBendScales);
+    SVMS_COPY_GROWN_VOICE_FIELD(currentGain);
+    SVMS_COPY_GROWN_VOICE_FIELD(targetGain);
+    SVMS_COPY_GROWN_VOICE_FIELD(sustainLevel);
+    SVMS_COPY_GROWN_VOICE_FIELD(attackGainStep);
+    SVMS_COPY_GROWN_VOICE_FIELD(decayGainStep);
+    SVMS_COPY_GROWN_VOICE_FIELD(releaseDecay);
+    SVMS_COPY_GROWN_VOICE_FIELD(gainLeft);
+    SVMS_COPY_GROWN_VOICE_FIELD(gainRight);
+    SVMS_COPY_GROWN_VOICE_FIELD(mixGainL);
+    SVMS_COPY_GROWN_VOICE_FIELD(mixGainR);
+    SVMS_COPY_GROWN_VOICE_FIELD(renderGainL);
+    SVMS_COPY_GROWN_VOICE_FIELD(renderGainR);
+    SVMS_COPY_GROWN_VOICE_FIELD(sampleStart);
+    SVMS_COPY_GROWN_VOICE_FIELD(sampleEnd);
+    SVMS_COPY_GROWN_VOICE_FIELD(loopStart);
+    SVMS_COPY_GROWN_VOICE_FIELD(loopEnd);
+    SVMS_COPY_GROWN_VOICE_FIELD(loopMode);
+    SVMS_COPY_GROWN_VOICE_FIELD(loopEnabled);
+    SVMS_COPY_GROWN_VOICE_FIELD(relEnd);
+    SVMS_COPY_GROWN_VOICE_FIELD(relLoopS);
+    SVMS_COPY_GROWN_VOICE_FIELD(relLoopE);
+    SVMS_COPY_GROWN_VOICE_FIELD(relLoopSF);
+    SVMS_COPY_GROWN_VOICE_FIELD(relLoopEF);
+    SVMS_COPY_GROWN_VOICE_FIELD(holdSamplesRemaining);
+    SVMS_COPY_GROWN_VOICE_FIELD(attackSamplesRemaining);
+    SVMS_COPY_GROWN_VOICE_FIELD(decaySamplesRemaining);
+    SVMS_COPY_GROWN_VOICE_FIELD(delaySamplesRemaining);
+    SVMS_COPY_GROWN_VOICE_FIELD(releaseSamplesRemaining);
+    SVMS_COPY_GROWN_VOICE_FIELD(decaySlope);
+    SVMS_COPY_GROWN_VOICE_FIELD(samplePageId);
+    SVMS_COPY_GROWN_VOICE_FIELD(heldBySustain);
+    SVMS_COPY_GROWN_VOICE_FIELD(releaseStartInBlock);
+    SVMS_COPY_GROWN_VOICE_FIELD(nextChannelKeyVoice);
+    SVMS_COPY_GROWN_VOICE_FIELD(prevChannelKeyVoice);
+    SVMS_COPY_GROWN_VOICE_FIELD(birthFrame);
+    SVMS_COPY_GROWN_VOICE_FIELD(stealFadeInFramesRemaining);
+    SVMS_COPY_GROWN_VOICE_FIELD(stealFadeInFramesTotal);
+#undef SVMS_COPY_GROWN_VOICE_FIELD
+
+#define SVMS_COPY_GROWN_TAIL_FIELD(name) \
+    std::memcpy(grown.v.name, v.name, sizeof(v.name))
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailPhase);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailPhaseInc);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailGain);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailMixGainL);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailMixGainR);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailSampleStart);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailRelEnd);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailRelLoopS);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailRelLoopE);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailRelLoopSF);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailRelLoopEF);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailFramesRemaining);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailFramesTotal);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailSampleBacked);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailLoopEnabled);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailChannel);
+#undef SVMS_COPY_GROWN_TAIL_FIELD
+    grown.v.pad16 = v.pad16;
+
+    grown.activeCount_ = activeCount_;
+    if (activeCount_ != 0u)
+        std::memcpy(grown.activeList_, activeList_,
+                    static_cast<size_t>(activeCount_) * sizeof(*activeList_));
+    std::memset(grown.activePosition_, 0xff,
+                static_cast<size_t>(capacity) * sizeof(*grown.activePosition_));
+    for (uint32_t position = 0u; position < grown.activeCount_; ++position)
+        grown.activePosition_[grown.activeList_[position]] = position;
+
+    // Rebuild the free stack from copied voice state. The order of free slots
+    // is not semantic; rebuilding also naturally includes the newly grown
+    // handle range without touching any active handle.
+    grown.freeTop_ = 0u;
+    for (uint32_t handle = 0u; handle < capacity; ++handle) {
+        if (grown.v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
+            grown.freeStack_[grown.freeTop_++] = static_cast<int32_t>(handle);
+    }
+
+    std::memcpy(grown.channelKeyVoiceHead_, channelKeyVoiceHead_,
+                sizeof(channelKeyVoiceHead_));
+    std::memcpy(grown.channelKeyVoiceOldest_, channelKeyVoiceOldest_,
+                sizeof(channelKeyVoiceOldest_));
+    std::memcpy(grown.playGroupNext_, playGroupNext_,
+                static_cast<size_t>(oldCapacity) * sizeof(*playGroupNext_));
+    std::memcpy(grown.playGroupPrev_, playGroupPrev_,
+                static_cast<size_t>(oldCapacity) * sizeof(*playGroupPrev_));
+    grown.lastLinkedPlayIndex_ = lastLinkedPlayIndex_;
+    grown.lastLinkedPlayVoice_ = lastLinkedPlayVoice_;
+
+    // The dense channel/render indices depend on allocation capacity, so
+    // rebuild them from the stable active list instead of copying pages whose
+    // geometry changed. Steal candidates are rebuilt lazily on the next steal.
+    for (uint32_t position = 0u; position < grown.activeCount_; ++position) {
+        const VoiceHandle handle = static_cast<VoiceHandle>(grown.activeList_[position]);
+        grown.LinkChannelActive(handle);
+        grown.LinkRenderClass(handle);
+    }
+    grown.stealHeapCount_ = 0u;
+    grown.stealHeapValid_ = false;
+    grown.stealVolatileCount_ = 0u;
+    grown.stealVolatileHeapCount_ = 0u;
+    grown.stealVolatileHeapFrame_ = UINT64_MAX;
+    grown.stealVolatileHeapValid_ = false;
+    std::memset(grown.stealWinnerTree_, 0,
+                sizeof(*grown.stealWinnerTree_) * grown.stealTreeLeafBase_ * 2u);
+    std::memset(grown.stealStableKey_, 0,
+                static_cast<size_t>(capacity) * sizeof(*grown.stealStableKey_));
+    std::memset(grown.stealVolatilePosition_, 0xff,
+                static_cast<size_t>(capacity) * sizeof(*grown.stealVolatilePosition_));
+    std::memset(grown.stealVolatileHeapPosition_, 0xff,
+                static_cast<size_t>(capacity) * sizeof(*grown.stealVolatileHeapPosition_));
+    std::memset(grown.stealCandidateDeferred_, 0,
+                static_cast<size_t>(capacity) * sizeof(*grown.stealCandidateDeferred_));
+    std::memset(grown.stealCandidateReserved_, 0,
+                static_cast<size_t>(capacity) * sizeof(*grown.stealCandidateReserved_));
+
+    std::memcpy(grown.stealTailList_, stealTailList_, sizeof(stealTailList_));
+    std::memcpy(grown.stealTailPosition_, stealTailPosition_,
+                sizeof(stealTailPosition_));
+    grown.stealTailCount_ = stealTailCount_;
+    grown.stealTailMinHeapCount_ = 0u;
+    grown.stealTailMinHeapFrame_ = UINT64_MAX;
+    grown.stealTailMinHeapValid_ = false;
+
+    grown.retireCount_ = retireCount_;
+    grown.retireImmediateCount_ = retireImmediateCount_;
+    grown.stealCount_ = stealCount_;
+    grown.releasingCount_.store(GetReleasingCount(), std::memory_order_relaxed);
+    grown.voiceLimit_ = voiceLimit_;
+    grown.currentFrame_ = currentFrame_;
+    grown.lastVoiceLimitEnforceFrame_ = lastVoiceLimitEnforceFrame_;
+    grown.stealFadeFrames_ = stealFadeFrames_;
+    grown.stealHeapBuildCount_ = stealHeapBuildCount_;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    grown.groupReuseAttemptCount_ = groupReuseAttemptCount_;
+    grown.groupReuseMatchCount_ = groupReuseMatchCount_;
+    grown.groupReuseReservedCount_ = groupReuseReservedCount_;
+    grown.groupReuseSmallerCount_ = groupReuseSmallerCount_;
+    grown.groupReuseLargerCount_ = groupReuseLargerCount_;
+    grown.launchProfileCounter_ = launchProfileCounter_;
+    grown.launchProfileSamples_ = launchProfileSamples_;
+    grown.launchProfilePopCycles_ = launchProfilePopCycles_;
+    grown.launchProfileTailCycles_ = launchProfileTailCycles_;
+    grown.launchProfileLifecycleCycles_ = launchProfileLifecycleCycles_;
+    grown.launchProfileConfigureCycles_ = launchProfileConfigureCycles_;
+    grown.launchProfileTreeCycles_ = launchProfileTreeCycles_;
+#endif
+
+    // The staging manager now owns a complete larger representation. Move
+    // only its owning allocations/pointers into this instance; the old
+    // metadata and VoiceSoA storage are freed after the swap, while all fixed
+    // counters and indices are copied below. No live voice is re-launched.
+    void* oldMetadataStorage = metadataStorage_;
+    VoiceSoA oldVoices = std::move(v);
+    v = std::move(grown.v);
+
+    activeList_ = grown.activeList_;
+    activePosition_ = grown.activePosition_;
+    freeStack_ = grown.freeStack_;
+    channelIndexBlocks_ = grown.channelIndexBlocks_;
+    channelIndexFreeStack_ = grown.channelIndexFreeStack_;
+    channelActiveBlock_ = grown.channelActiveBlock_;
+    channelActiveOffset_ = grown.channelActiveOffset_;
+    renderClassBlocks_ = grown.renderClassBlocks_;
+    renderClassFreeStack_ = grown.renderClassFreeStack_;
+    renderClassBlock_ = grown.renderClassBlock_;
+    renderClassOffset_ = grown.renderClassOffset_;
+    stealStableKey_ = grown.stealStableKey_;
+    stealWinnerTree_ = grown.stealWinnerTree_;
+    stealVolatileList_ = grown.stealVolatileList_;
+    stealVolatilePosition_ = grown.stealVolatilePosition_;
+    stealVolatileHeap_ = grown.stealVolatileHeap_;
+    stealVolatileHeapPosition_ = grown.stealVolatileHeapPosition_;
+    stealCandidateDeferred_ = grown.stealCandidateDeferred_;
+    stealCandidateReserved_ = grown.stealCandidateReserved_;
+    playGroupNext_ = grown.playGroupNext_;
+    playGroupPrev_ = grown.playGroupPrev_;
+    metadataStorage_ = grown.metadataStorage_;
+    metadataBytes_ = grown.metadataBytes_;
+    grown.metadataStorage_ = nullptr;
+    grown.metadataBytes_ = 0u;
+
+    maxVoices_ = capacity;
+    voiceLimit_ = grown.voiceLimit_;
+    activeCount_ = grown.activeCount_;
+    freeTop_ = grown.freeTop_;
+    channelIndexBlockCount_ = grown.channelIndexBlockCount_;
+    channelIndexFreeTop_ = grown.channelIndexFreeTop_;
+    std::memcpy(channelActiveCount_, grown.channelActiveCount_,
+                sizeof(channelActiveCount_));
+    std::memcpy(channelActiveHead_, grown.channelActiveHead_,
+                sizeof(channelActiveHead_));
+    std::memcpy(channelActiveTail_, grown.channelActiveTail_,
+                sizeof(channelActiveTail_));
+    renderClassBlockCount_ = grown.renderClassBlockCount_;
+    renderClassFreeTop_ = grown.renderClassFreeTop_;
+    renderClassMask_ = grown.renderClassMask_;
+    std::memcpy(renderClassCount_, grown.renderClassCount_,
+                sizeof(renderClassCount_));
+    std::memcpy(renderClassHead_, grown.renderClassHead_,
+                sizeof(renderClassHead_));
+    std::memcpy(renderClassTail_, grown.renderClassTail_,
+                sizeof(renderClassTail_));
+    stealTreeLeafBase_ = grown.stealTreeLeafBase_;
+    stealHeapCount_ = grown.stealHeapCount_;
+    stealHeapValid_ = grown.stealHeapValid_;
+    stealVolatileCount_ = grown.stealVolatileCount_;
+    stealVolatileHeapCount_ = grown.stealVolatileHeapCount_;
+    stealVolatileHeapFrame_ = grown.stealVolatileHeapFrame_;
+    stealVolatileHeapValid_ = grown.stealVolatileHeapValid_;
+    std::memcpy(stealTailList_, grown.stealTailList_, sizeof(stealTailList_));
+    std::memcpy(stealTailPosition_, grown.stealTailPosition_,
+                sizeof(stealTailPosition_));
+    stealTailCount_ = grown.stealTailCount_;
+    stealTailMinHeapCount_ = grown.stealTailMinHeapCount_;
+    stealTailMinHeapFrame_ = grown.stealTailMinHeapFrame_;
+    stealTailMinHeapValid_ = grown.stealTailMinHeapValid_;
+    lastLinkedPlayIndex_ = grown.lastLinkedPlayIndex_;
+    lastLinkedPlayVoice_ = grown.lastLinkedPlayVoice_;
+    currentFrame_ = grown.currentFrame_;
+    lastVoiceLimitEnforceFrame_ = grown.lastVoiceLimitEnforceFrame_;
+    retireCount_ = grown.retireCount_;
+    retireImmediateCount_ = grown.retireImmediateCount_;
+    stealCount_ = grown.stealCount_;
+    releasingCount_.store(grown.GetReleasingCount(), std::memory_order_relaxed);
+
+    _aligned_free(oldMetadataStorage);
+    PublishRuntimeVoicePoolCapacity(capacity);
+    return true;
+}
+
 inline bool VoiceManager::SetVoiceLimit(uint32_t limit) {
     if (limit == 0u || limit > maxVoices_) return false;
     voiceLimit_ = limit;
@@ -869,10 +1131,19 @@ inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
     currentFrame_ = frame;
 
     // RuntimeLink publishes only a process-local atomic request. Applying it
-    // here keeps VoiceManager mutation entirely on the audio/render thread.
-    // The request is sampled at render boundaries, so there are no mutexes,
-    // shared-memory accesses, or control-thread writes to voice state.
-    const uint32_t requestedLimit = RequestedRuntimeVoiceLimit();
+    // here keeps all VoiceManager mutation on the audio/render thread. A cap
+    // above the current physical allocation first grows the pool while
+    // preserving handles and render state, then becomes the new logical cap.
+    uint32_t requestedLimit = RequestedRuntimeVoiceLimit();
+    if (requestedLimit > maxVoices_ && requestedLimit <= kMaxPolyphony) {
+        if (!GrowCapacity(requestedLimit)) {
+            // Do not retry a failed large allocation every render boundary.
+            // Keep the last applied cap and let a later user action request
+            // growth again explicitly.
+            RequestRuntimeVoiceLimit(voiceLimit_);
+            requestedLimit = voiceLimit_;
+        }
+    }
     if (requestedLimit != 0u && requestedLimit <= maxVoices_ &&
         requestedLimit != voiceLimit_) {
         SetVoiceLimit(requestedLimit);
