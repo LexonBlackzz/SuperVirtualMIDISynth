@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <string>
 
 namespace svms::cfg {
