@@ -348,6 +348,11 @@ void DrawControlPanel(ConfigDocument& doc, float panelHeight) {
         ImGui::EndTable();
     }
 
+    // RotaryKnob draws its label below the invisible interaction item. Reserve
+    // explicit breathing room before the next section so the label can never
+    // collide with the following header at smaller panel sizes.
+    ImGui::Dummy(ImVec2(0.0f, 16.0f));
+
     CompactSectionHeader("STEREO / BALANCE");
     if (ImGui::BeginTable("##reverb_stereo", 3, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
@@ -365,6 +370,8 @@ void DrawControlPanel(ConfigDocument& doc, float panelHeight) {
                      svms::RLCommandType::SetReverbLateLevel);
         ImGui::EndTable();
     }
+
+    ImGui::Dummy(ImVec2(0.0f, 16.0f));
 
     // Three compact mini-sections use the page width much more efficiently
     // than stacking Texture, Modulation, and Filter vertically.
