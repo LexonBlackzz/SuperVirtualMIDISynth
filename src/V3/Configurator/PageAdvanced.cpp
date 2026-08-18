@@ -59,31 +59,38 @@ ImVec4 HsvColor(float h, float s, float v, float a = 1.0f) {
     return ImVec4(r, g, b, a);
 }
 
-void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked) {
+void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked,
+                                  float strength) {
     float h = 0.0f;
     float s = 0.0f;
     float v = 0.0f;
     ImGui::ColorConvertRGBtoHSV(picked.x, picked.y, picked.z, h, s, v);
 
-    // One wheel controls the entire visual family. Surfaces stay deliberately
-    // dark and low-saturation so a fully themed UI remains readable rather
-    // than turning into one giant slab of the accent colour.
-    const float chroma = (std::max)(0.0f, (std::min)(1.0f, s));
-    const float surfaceSat = 0.08f + chroma * 0.30f;
+    strength = ImClamp(strength, 0.0f, 1.0f);
+    const float chroma = ImClamp(s, 0.0f, 1.0f);
+
+    // Strength controls both saturation and luminance of the generated dark
+    // surfaces. 0% is almost-neutral SVMS dark; 100% is intentionally bold,
+    // but still dark enough to preserve contrast and avoid paint-bucket mode.
+    const float surfaceSat = chroma * (0.06f + strength * 0.64f);
 
     theme.accent = ImVec4(picked.x, picked.y, picked.z, 1.0f);
-    theme.background = HsvColor(h, surfaceSat * 0.62f, 0.080f);
-    theme.sidebar    = HsvColor(h, surfaceSat * 0.72f, 0.108f);
-    theme.panel      = HsvColor(h, surfaceSat * 0.68f, 0.098f);
-    theme.control    = HsvColor(h, surfaceSat * 0.82f, 0.175f);
+    theme.background = HsvColor(h, surfaceSat * 0.78f,
+                                0.070f + strength * 0.072f);
+    theme.sidebar    = HsvColor(h, surfaceSat * 0.88f,
+                                0.095f + strength * 0.090f);
+    theme.panel      = HsvColor(h, surfaceSat * 0.84f,
+                                0.086f + strength * 0.082f);
+    theme.control    = HsvColor(h, surfaceSat,
+                                0.150f + strength * 0.125f);
 
-    // Text follows the selected hue only very slightly; enough to belong to
-    // the palette without sacrificing contrast or looking like coloured CRT text.
-    theme.text      = HsvColor(h, chroma * 0.035f, 0.920f);
-    theme.mutedText = HsvColor(h, 0.035f + chroma * 0.075f, 0.620f);
+    // Keep text highly readable while letting stronger themes tint it just
+    // enough that the whole UI belongs to the same colour family.
+    theme.text      = HsvColor(h, chroma * (0.015f + strength * 0.040f), 0.925f);
+    theme.mutedText = HsvColor(h, 0.025f + chroma * strength * 0.115f,
+                               0.615f + strength * 0.025f);
 
-    // Warning/error remain semantic colours. Success may follow the theme a
-    // little, but stays visibly green enough to still mean success.
+    // These remain semantic instead of changing meaning with the theme hue.
     theme.warning = ImVec4(0.90f, 0.70f, 0.20f, 1.0f);
     theme.error   = ImVec4(0.85f, 0.30f, 0.30f, 1.0f);
     theme.success = ImVec4(0.30f, 0.75f, 0.40f, 1.0f);
@@ -92,6 +99,7 @@ void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked) {
 bool confirmReset = false;
 std::string themeStatus;
 bool themeStatusError = false;
+float themeColorStrength = 0.65f;
 
 } // namespace
 
@@ -105,6 +113,7 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     ThemeSettings& theme = EditThemeSettings();
     bool themeChanged = false;
     bool themeColorChanged = false;
+    bool themeStrengthChanged = false;
 
     ImGui::BeginGroup();
     ImGui::TextUnformatted("THEME COLOR");
@@ -131,20 +140,34 @@ void DrawAdvancedPage(ConfigDocument& doc) {
         ImGuiColorEditFlags_DisplayHex |
         ImGuiColorEditFlags_NoPicker |
         ImGuiColorEditFlags_NoSmallPreview);
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Colour strength");
+    ImGui::SetNextItemWidth(220.0f);
+    themeStrengthChanged |= ImGui::SliderFloat(
+        "##theme_colour_strength", &themeColorStrength,
+        0.0f, 1.0f, "%.0f%%", ImGuiSliderFlags_None);
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(
+            "Controls how strongly the selected hue tints and brightens the generated UI surfaces.");
+        ImGui::EndTooltip();
+    }
+
     ImGui::Spacing();
     ImGui::TextDisabled("Advanced overrides remain available below.");
     ImGui::EndGroup();
 
-    if (themeColorChanged) {
+    if (themeColorChanged || themeStrengthChanged) {
         const ImVec4 picked = theme.accent;
-        RebuildPaletteFromThemeColor(theme, picked);
+        RebuildPaletteFromThemeColor(theme, picked, themeColorStrength);
         themeChanged = true;
     }
 
     ImGui::Spacing();
     if (ImGui::CollapsingHeader("Advanced palette / layout")) {
         ImGui::TextDisabled(
-            "Override any generated colour here. Moving the theme wheel again regenerates this palette.");
+            "Override any generated colour here. Moving the wheel or strength slider again regenerates this palette.");
         if (ImGui::BeginTable("##theme_advanced_settings", 2,
                               ImGuiTableFlags_SizingStretchProp |
                               ImGuiTableFlags_BordersInnerH |
@@ -217,6 +240,7 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     ImGui::SameLine();
     if (ImGui::Button("Reset preview")) {
         ResetThemePreview();
+        themeColorStrength = 0.65f;
         themeStatus = "Built-in theme restored in memory. Save it if you want to replace a saved theme.";
         themeStatusError = false;
     }
