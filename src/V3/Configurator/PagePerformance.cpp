@@ -60,10 +60,31 @@ void RestartCell() {
                        "Requires driver restart to take effect.");
 }
 
-void LiveVoiceCell() {
+bool VoiceCapFitsCurrentPool(const LiveLinkContext& lc, uint32_t requested) {
+    if (!lc.connected || !lc.telemetry || lc.telemetry->maxVoices == 0u)
+        return true;
+    return requested <= lc.telemetry->maxVoices;
+}
+
+void VoiceCapStatusCell(const LiveLinkContext& lc, uint32_t requested) {
+    if (!VoiceCapFitsCurrentPool(lc, requested)) {
+        CenteredStatusCell(
+            "RESTART", GetWarning(),
+            "The requested cap is larger than the physical voice pool allocated when this driver instance started. Save the value and restart the driver to grow that pool. Lowering the cap, or raising it within the existing pool, is live.");
+        return;
+    }
+
     CenteredStatusCell(
         "LIVE", GetSuccess(),
-        "Changes apply immediately while the requested cap fits inside the voice pool allocated at driver startup. Lowering the cap force-releases the least-important excess voices over about 50 ms. Growing beyond the startup pool still requires a restart.");
+        "Changes apply immediately while the requested cap fits inside the voice pool allocated at driver startup. Lowering the cap force-releases the least-important excess voices over about 50 ms.");
+}
+
+void QueueVoiceCapIfLive(const LiveLinkContext& lc, uint32_t requested) {
+    // Do not queue a command we already know the current driver cannot honor.
+    // The edited value is still kept in the working config so Save + restart
+    // can grow the physical pool deliberately.
+    if (VoiceCapFitsCurrentPool(lc, requested))
+        PushLiveMaxVoices(requested);
 }
 
 float BlockBudgetMs(const svms::RuntimeLinkTelemetryV2& t) {
@@ -97,7 +118,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
     if (BeginSettingsTable("##performance_settings")) {
         ImGui::TableNextRow();
         LabelCell("Maximum voices",
-                  "Logical primary-voice ceiling. Lowering it live releases excess voices using the normal steal-priority policy and a short anti-click release. The physical pool size is fixed until restart.");
+                  "Logical primary-voice ceiling. Lowering it live releases excess voices using the normal steal-priority policy and a short anti-click release. The current physical pool size is fixed until restart.");
         ImGui::TableNextColumn();
         int maxVoices = static_cast<int>(w.maxVoices);
         ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
@@ -111,17 +132,17 @@ void DrawPerformancePage(ConfigDocument& doc) {
         // deleted a digit while typing. Commit the text field when editing is
         // finished; presets below are applied immediately on click.
         if (editedMaxVoices && !ImGui::IsItemActive()) {
-            PushLiveMaxVoices(w.maxVoices);
+            QueueVoiceCapIfLive(lc, w.maxVoices);
         } else if (ImGui::IsItemDeactivatedAfterEdit()) {
-            PushLiveMaxVoices(w.maxVoices);
+            QueueVoiceCapIfLive(lc, w.maxVoices);
         }
-        LiveVoiceCell();
+        VoiceCapStatusCell(lc, w.maxVoices);
 
         ImGui::TableNextRow();
         LabelCell("Voice presets");
         ImGui::TableNextColumn();
         static const int presetValues[] = {
-            1000, 2048, 4096, 8192, 16384, 32768,
+            1024, 2048, 4096, 8192, 16384, 32768,
             65536, 131072, 262144, 524288
         };
         for (int i = 0; i < 10; ++i) {
@@ -137,11 +158,11 @@ void DrawPerformancePage(ConfigDocument& doc) {
             if (ImGui::SmallButton(label)) {
                 w.maxVoices = static_cast<uint32_t>(presetValues[i]);
                 doc.MarkDirty();
-                PushLiveMaxVoices(w.maxVoices);
+                QueueVoiceCapIfLive(lc, w.maxVoices);
             }
             if (selected) ImGui::PopStyleColor();
         }
-        LiveVoiceCell();
+        VoiceCapStatusCell(lc, w.maxVoices);
 
         ImGui::TableNextRow();
         LabelCell("Render threads",
@@ -244,6 +265,14 @@ void DrawPerformancePage(ConfigDocument& doc) {
         ImGui::TextDisabled("Physical pool: %u voices   |   Buffer: %u frames @ %u Hz   |   Decimation: %ux",
                             t->maxVoices, t->bufferFrames, t->sampleRate,
                             (std::max)(1u, t->decimationStep));
+
+        if (w.maxVoices > t->maxVoices && t->maxVoices != 0u) {
+            ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
+            ImGui::TextWrapped(
+                "Requested cap: %u. This driver instance only allocated %u physical voices, so growing to the requested value requires a restart.",
+                w.maxVoices, t->maxVoices);
+            ImGui::PopStyleColor();
+        }
     }
 }
 
