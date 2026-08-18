@@ -133,6 +133,17 @@ std::string SoundFontText(const ConfigValues& w) {
     return WideToUtf8Diag(w.soundFontPath);
 }
 
+float BudgetMs(const svms::RuntimeLinkTelemetryV2& t) {
+    return t.sampleRate > 0u
+        ? 1000.0f * static_cast<float>(t.bufferFrames) /
+          static_cast<float>(t.sampleRate)
+        : 0.0f;
+}
+
+float BudgetPercentMs(const svms::RuntimeLinkTelemetryV2& t, float percent) {
+    return BudgetMs(t) * percent * 0.01f;
+}
+
 std::string BuildClipboardReport(const ConfigValues& w,
                                  const svms::RuntimeLinkTelemetryV2* t,
                                  bool connected,
@@ -155,19 +166,25 @@ std::string BuildClipboardReport(const ConfigValues& w,
     out << "Configured buffer: " << w.bufferFrames << " frames\n";
 
     if (connected && t) {
-        const float budgetMs = t->sampleRate > 0u
-            ? 1000.0f * static_cast<float>(t->bufferFrames) /
-              static_cast<float>(t->sampleRate)
-            : 0.0f;
-        const float renderMs = budgetMs * t->cpuLoadPercent / 100.0f;
-        out << "Active voices: " << t->activeVoices << " / " << t->maxVoices << "\n";
+        const float budgetMs = BudgetMs(*t);
+        const float renderMs = BudgetPercentMs(*t, t->cpuLoadPercent);
+        const uint32_t logicalCap = t->live.maxVoices != 0u
+            ? t->live.maxVoices : t->maxVoices;
+        out << "Active voices: " << t->activeVoices << " / " << logicalCap << " logical\n";
+        out << "Physical voice pool: " << t->maxVoices << "\n";
         out << "Releasing voices: " << t->releasingVoices << "\n";
         out << "Voice steals: " << t->voiceSteals << "\n";
+        out << "Callback budget: " << budgetMs << " ms\n";
         out << "Render load: " << t->cpuLoadPercent << "% (~" << renderMs << " ms)\n";
-        out << "Callback P95/P99/P99.9: "
-            << t->callbackP95Percent << "% / "
-            << t->callbackP99Percent << "% / "
-            << t->callbackP999Percent << "%\n";
+        out << "Render headroom: " << (std::max)(0.0f, 100.0f - t->cpuLoadPercent) << "%\n";
+        out << "Callback P95: " << t->callbackP95Percent << "% (~"
+            << BudgetPercentMs(*t, t->callbackP95Percent) << " ms)\n";
+        out << "Callback P99: " << t->callbackP99Percent << "% (~"
+            << BudgetPercentMs(*t, t->callbackP99Percent) << " ms)\n";
+        out << "Callback P99.9: " << t->callbackP999Percent << "% (~"
+            << BudgetPercentMs(*t, t->callbackP999Percent) << " ms)\n";
+        out << "Over-budget callbacks: " << t->overBudgetCallbacks << "\n";
+        out << "Max consecutive over-budget: " << t->maxConsecutiveOverBudget << "\n";
         out << "Events submitted/accepted/dropped/dispatched: "
             << t->eventsSubmitted << " / " << t->eventsAccepted << " / "
             << t->eventsDropped << " / " << t->eventsDispatched << "\n";
@@ -205,16 +222,19 @@ void DrawDiagnosticsPage(ConfigDocument& doc) {
         ImGui::TableNextColumn();
         ImGui::TextDisabled("VOICES");
         ImGui::TableNextColumn();
-        if (lc.connected && t) ImGui::Text("%u / %u", t->activeVoices, t->maxVoices);
-        else ImGui::TextDisabled("-- / %u", w.maxVoices);
+        if (lc.connected && t) {
+            const uint32_t logicalCap = t->live.maxVoices != 0u
+                ? t->live.maxVoices : t->maxVoices;
+            ImGui::Text("%u / %u", t->activeVoices, logicalCap);
+        } else {
+            ImGui::TextDisabled("-- / %u", w.maxVoices);
+        }
 
         ImGui::TableNextColumn();
         ImGui::TextDisabled("RENDER");
         ImGui::TableNextColumn();
         if (lc.connected && t && t->sampleRate > 0u) {
-            const float budgetMs = 1000.0f * static_cast<float>(t->bufferFrames) /
-                                   static_cast<float>(t->sampleRate);
-            const float renderMs = budgetMs * t->cpuLoadPercent / 100.0f;
+            const float renderMs = BudgetPercentMs(*t, t->cpuLoadPercent);
             ImGui::Text("%.2f ms", renderMs);
             ImGui::SameLine();
             ImGui::TextDisabled("(%.1f%% of callback budget)", t->cpuLoadPercent);
@@ -246,9 +266,51 @@ void DrawDiagnosticsPage(ConfigDocument& doc) {
         showDetails = !showDetails;
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("Engine, audio and event-pipeline details");
+    ImGui::TextDisabled("Engine, render-budget, audio and event-pipeline details");
 
     if (!showDetails) return;
+
+    if (lc.connected && t) {
+        ImGui::Spacing();
+        SectionHeader("RENDER BUDGET");
+        if (BeginDetailsTable("##diag_budget")) {
+            char value[160] = {};
+            const float budget = BudgetMs(*t);
+            std::snprintf(value, sizeof(value), "%.2f ms (%u frames @ %u Hz)",
+                          budget, t->bufferFrames, t->sampleRate);
+            KeyValue("Block budget", value);
+
+            std::snprintf(value, sizeof(value), "%.2f ms / %.1f%%",
+                          BudgetPercentMs(*t, t->cpuLoadPercent),
+                          t->cpuLoadPercent);
+            KeyValue("Current render", value);
+
+            std::snprintf(value, sizeof(value), "%.1f%%",
+                          (std::max)(0.0f, 100.0f - t->cpuLoadPercent));
+            KeyValue("Current headroom", value);
+
+            std::snprintf(value, sizeof(value), "%.2f ms / %.1f%%",
+                          BudgetPercentMs(*t, t->callbackP95Percent),
+                          t->callbackP95Percent);
+            KeyValue("P95", value);
+
+            std::snprintf(value, sizeof(value), "%.2f ms / %.1f%%",
+                          BudgetPercentMs(*t, t->callbackP99Percent),
+                          t->callbackP99Percent);
+            KeyValue("P99", value);
+
+            std::snprintf(value, sizeof(value), "%.2f ms / %.1f%%",
+                          BudgetPercentMs(*t, t->callbackP999Percent),
+                          t->callbackP999Percent);
+            KeyValue("P99.9", value);
+
+            std::snprintf(value, sizeof(value), "%llu total / %u max streak",
+                          static_cast<unsigned long long>(t->overBudgetCallbacks),
+                          t->maxConsecutiveOverBudget);
+            KeyValue("Over budget", value);
+            ImGui::EndTable();
+        }
+    }
 
     ImGui::Spacing();
     SectionHeader("ENGINE / AUDIO");
@@ -280,22 +342,18 @@ void DrawDiagnosticsPage(ConfigDocument& doc) {
             KeyValue("Audio state", t->audioRunning ? "Running" : "Stopped");
             KeyValue("SoundFont state", t->soundFontLoaded ? "Loaded" : "Not loaded");
 
-            char voices[128] = {};
+            char voices[160] = {};
+            const uint32_t logicalCap = t->live.maxVoices != 0u
+                ? t->live.maxVoices : t->maxVoices;
             std::snprintf(voices, sizeof(voices),
-                          "%u active / %u releasing / %u free",
-                          t->activeVoices, t->releasingVoices, t->freeTop);
+                          "%u active / %u releasing / %u logical cap / %u physical pool",
+                          t->activeVoices, t->releasingVoices,
+                          logicalCap, t->maxVoices);
             KeyValue("Voice state", voices);
 
             char steals[64] = {};
             std::snprintf(steals, sizeof(steals), "%u", t->voiceSteals);
             KeyValue("Voice steals", steals);
-
-            char callbacks[160] = {};
-            std::snprintf(callbacks, sizeof(callbacks),
-                          "P95 %.1f%% / P99 %.1f%% / P99.9 %.1f%%",
-                          t->callbackP95Percent, t->callbackP99Percent,
-                          t->callbackP999Percent);
-            KeyValue("Callback percentiles", callbacks);
         }
         ImGui::EndTable();
     }
