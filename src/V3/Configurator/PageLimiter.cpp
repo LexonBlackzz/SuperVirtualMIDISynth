@@ -163,19 +163,15 @@ void DrawDbScale(float x, float top, float height) {
     float placed[tickCount]{};
     bool visible[tickCount]{};
 
-    // If DPI/window size becomes too small to fit every label, progressively
-    // remove the least important intermediate markings. The remaining labels
-    // are then repelled from each other while still pointing at their exact
-    // dB position with a small leader line.
     int maxLabels = static_cast<int>(height / minGap) + 1;
     maxLabels = (std::max)(2, (std::min)(tickCount, maxLabels));
 
     for (int i = 0; i < tickCount; ++i) visible[i] = true;
-    if (maxLabels < 7) visible[1] = false; // -3
-    if (maxLabels < 6) visible[5] = false; // -48
-    if (maxLabels < 5) visible[2] = false; // -6
-    if (maxLabels < 4) visible[4] = false; // -24
-    if (maxLabels < 3) visible[3] = false; // -12
+    if (maxLabels < 7) visible[1] = false;
+    if (maxLabels < 6) visible[5] = false;
+    if (maxLabels < 5) visible[2] = false;
+    if (maxLabels < 4) visible[4] = false;
+    if (maxLabels < 3) visible[3] = false;
 
     int indices[tickCount]{};
     int count = 0;
@@ -188,8 +184,6 @@ void DrawDbScale(float x, float top, float height) {
         indices[count++] = i;
     }
 
-    // Forward/backward relaxation guarantees that text rectangles never
-    // intersect, without losing the true tick location.
     for (int n = 1; n < count; ++n) {
         const int prev = indices[n - 1];
         const int cur = indices[n];
@@ -226,9 +220,6 @@ void DrawDbScale(float x, float top, float height) {
         const float labelY = labelCenter - fontH * 0.5f;
         const float exactY = desired[i];
 
-        // A short tick plus a diagonal leader makes the readout feel like it
-        // is dynamically attached to the exact scale point even when labels
-        // have to slide apart at small sizes/high DPI.
         dl->AddLine(ImVec2(x - 5.0f, exactY), ImVec2(x - 1.0f, exactY),
                     leaderColor, 1.0f);
         if (std::fabs(labelCenter - exactY) > 0.75f) {
@@ -239,9 +230,71 @@ void DrawDbScale(float x, float top, float height) {
     }
 }
 
+void DrawGrScale(float x, float top, float height, float currentGr) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    constexpr int tickCount = 6;
+    const float ticks[tickCount] = { 0.0f, 3.0f, 6.0f, 12.0f, 18.0f, 24.0f };
+
+    const float fontH = ImGui::GetFontSize();
+    const float minGap = fontH + 2.0f;
+    const float minCenter = top + fontH * 0.5f;
+    const float maxCenter = top + height - fontH * 0.5f;
+    const float live = ImClamp(currentGr, 0.0f, kGrMaxDb);
+    const float liveExactY = top + height * (live / kGrMaxDb);
+    const float liveCenter = ImClamp(liveExactY, minCenter, maxCenter);
+
+    const ImU32 textColor = ImGui::GetColorU32(
+        ImVec4(0.43f, 0.46f, 0.51f, 0.9f));
+    const ImU32 leaderColor = ImGui::GetColorU32(
+        ImVec4(0.30f, 0.33f, 0.38f, 0.72f));
+    const ImU32 liveColor = ImGui::GetColorU32(
+        ImVec4(0.94f, 0.68f, 0.16f, 1.0f));
+
+    float desired[tickCount]{};
+    bool visible[tickCount]{};
+    for (int i = 0; i < tickCount; ++i) {
+        desired[i] = top + height * (ticks[i] / kGrMaxDb);
+        desired[i] = ImClamp(desired[i], minCenter, maxCenter);
+        visible[i] = true;
+
+        // The animated live readout owns its exact slot. Hide any static tick
+        // whose text box would collide with it; the tick itself is still
+        // indicated by the short scale mark.
+        if (std::fabs(desired[i] - liveCenter) < minGap * 0.92f &&
+            std::fabs(ticks[i] - live) > 0.05f) {
+            visible[i] = false;
+        }
+    }
+
+    // If the live value essentially sits on a standard tick, draw only the
+    // highlighted live label there instead of two almost-identical numbers.
+    for (int i = 0; i < tickCount; ++i) {
+        if (std::fabs(ticks[i] - live) <= 0.05f) visible[i] = false;
+    }
+
+    // Static scale marks always stay at their real positions, even when the
+    // text has to disappear to make room for the moving live readout.
+    for (int i = 0; i < tickCount; ++i) {
+        dl->AddLine(ImVec2(x - 5.0f, desired[i]), ImVec2(x - 1.0f, desired[i]),
+                    leaderColor, 1.0f);
+        if (!visible[i]) continue;
+
+        char text[16];
+        std::snprintf(text, sizeof(text), "%.0f", ticks[i]);
+        dl->AddText(ImVec2(x + 4.0f, desired[i] - fontH * 0.5f), textColor, text);
+    }
+
+    // Moving gain-reduction readout follows the end of the animated fill.
+    // It uses the same 0..24 dB magnitude convention as the bar itself.
+    char liveText[16];
+    std::snprintf(liveText, sizeof(liveText), live < 10.0f ? "%.1f" : "%.0f", live);
+    dl->AddLine(ImVec2(x - 8.0f, liveExactY), ImVec2(x + 1.0f, liveExactY),
+                liveColor, 1.5f);
+    dl->AddText(ImVec2(x + 4.0f, liveCenter - fontH * 0.5f), liveColor, liveText);
+}
+
 void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
                    float height) {
-    const float avail = ImGui::GetContentRegionAvail().x;
     const float scaleGap = 5.0f;
     const float scaleWidth = ImGui::CalcTextSize("-60").x + 8.0f;
     const float stereoGap = 6.0f;
@@ -307,7 +360,7 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         ImGui::SetCursorPosX(groupX);
         const ImVec2 screen = ImGui::GetCursorScreenPos();
         DrawGrBar("##gain_reduction", gr, ImVec2(barW, height));
-        DrawDbScale(screen.x + barW + scaleGap, screen.y, height);
+        DrawGrScale(screen.x + barW + scaleGap, screen.y, height, gr);
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float centerX = screen.x + barW * 0.5f;
