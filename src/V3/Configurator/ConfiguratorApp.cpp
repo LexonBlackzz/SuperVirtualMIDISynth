@@ -541,7 +541,8 @@ void ConfiguratorApp::RenderFrame() {
     DrawToastOverlay();
 
     ImGui::Render();
-    const float clearColor[4] = { 0.066f, 0.075f, 0.082f, 1.0f };
+    const ImVec4 clear = GetThemeSettings().background;
+    const float clearColor[4] = { clear.x, clear.y, clear.z, clear.w };
     d3dContext_->OMSetRenderTargets(1, &renderTarget_, nullptr);
     d3dContext_->ClearRenderTargetView(renderTarget_, clearColor);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -553,7 +554,7 @@ void ConfiguratorApp::DrawHeader() {
     ImGui::SetCursorPosX(14.0f);
 
     ImGui::PushFont(nullptr);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.88f, 0.92f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, GetThemeSettings().text);
     ImGui::Text("SuperVirtualMIDISynth V3");
     ImGui::PopStyleColor();
     ImGui::PopFont();
@@ -562,7 +563,7 @@ void ConfiguratorApp::DrawHeader() {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddLine(ImVec2(0, lineY),
                 ImVec2(static_cast<float>(windowWidth_), lineY),
-                ImGui::GetColorU32(ImVec4(0.176f, 0.196f, 0.227f, 1.0f)),
+                ImGui::GetColorU32(GetInputBorder()),
                 1.0f);
 }
 
@@ -575,8 +576,7 @@ void ConfiguratorApp::DrawSidebar() {
     ImVec2 sidebarPos(0, headerH);
     ImGui::SetCursorPos(sidebarPos);
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                          ImVec4(0.090f, 0.102f, 0.118f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, GetSidebarBg());
 
     ImGui::BeginChild("##sidebar", ImVec2(sidebarW, sidebarH),
                       ImGuiChildFlags_None);
@@ -586,8 +586,9 @@ void ConfiguratorApp::DrawSidebar() {
     auto drawNavItem = [&](const char* label, Page page, const char* category) {
         if (category) {
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6.0f);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.37f, 0.40f, 0.44f, 1.0f));
+            ImVec4 categoryColor = GetMutedText();
+            categoryColor.w = 0.72f;
+            ImGui::PushStyleColor(ImGuiCol_Text, categoryColor);
             ImGui::PushFont(nullptr);
             ImGui::SetCursorPosX(14.0f);
             ImGui::TextUnformatted(category);
@@ -597,21 +598,21 @@ void ConfiguratorApp::DrawSidebar() {
         }
 
         bool selected = (currentPage_ == page);
-        ImVec4 textColor = selected
-            ? ImVec4(0.85f, 0.88f, 0.92f, 1.0f)
-            : ImVec4(0.56f, 0.59f, 0.62f, 1.0f);
+        ImVec4 textColor = selected ? GetThemeSettings().text : GetMutedText();
 
         if (selected) {
             ImVec2 pos = ImGui::GetCursorScreenPos();
             ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec4 selectedBg = GetAccent();
+            selectedBg.w = 0.18f;
+            ImVec4 selectedBar = GetAccent();
+            selectedBar.w = 0.95f;
             dl->AddRectFilled(pos,
                               ImVec2(pos.x + sidebarW, pos.y + 28.0f),
-                              ImGui::GetColorU32(ImVec4(0.447f, 0.533f,
-                                                       0.855f, 0.08f)));
+                              ImGui::GetColorU32(selectedBg));
             dl->AddRectFilled(ImVec2(pos.x, pos.y + 4.0f),
                               ImVec2(pos.x + 3.0f, pos.y + 24.0f),
-                              ImGui::GetColorU32(ImVec4(0.447f, 0.533f,
-                                                       0.855f, 0.9f)),
+                              ImGui::GetColorU32(selectedBar),
                               1.5f);
         }
 
@@ -658,13 +659,11 @@ void ConfiguratorApp::DrawFooter() {
 
     if (!veryCompact) {
         if (config_.IsDirty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
             ImGui::TextUnformatted(compact ? "Modified" : "Configuration modified");
             ImGui::PopStyleColor();
         } else {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
             ImGui::TextUnformatted(compact ? "Saved" : "Configuration saved");
             ImGui::PopStyleColor();
         }
@@ -672,8 +671,7 @@ void ConfiguratorApp::DrawFooter() {
     }
 
     if (rlConnected_) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(0.30f, 0.80f, 0.45f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
         if (compact || veryCompact) {
             ImGui::Text("PID %u", rlClient_.GetPID());
         } else {
@@ -732,12 +730,12 @@ void ConfiguratorApp::DrawFooter() {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
     }
 
-    ImGui::PushStyleColor(ImGuiCol_Button,
-                          canSave
-                              ? ImVec4(0.447f, 0.533f, 0.855f, 0.6f)
-                              : ImVec4(0.15f, 0.17f, 0.20f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                          ImVec4(0.510f, 0.596f, 0.922f, 0.8f));
+    ImVec4 saveButton = canSave ? GetAccent() : GetThemeSettings().control;
+    saveButton.w = canSave ? 0.60f : 1.0f;
+    ImVec4 saveHover = GetAccentHover();
+    saveHover.w = 0.82f;
+    ImGui::PushStyleColor(ImGuiCol_Button, saveButton);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, saveHover);
 
     if (ImGui::Button("Save Configuration", ImVec2(kSaveW, 28)) && canSave) {
         auto path = config_.GetActivePath();
@@ -803,10 +801,12 @@ void ConfiguratorApp::DrawToastOverlay() {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 8));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,
-                          ImVec4(0.10f, 0.12f, 0.16f, 0.92f * alpha));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-                          ImVec4(0.447f, 0.533f, 0.855f, 0.4f * alpha));
+    ImVec4 toastBg = GetPanelBg();
+    toastBg.w = 0.92f * alpha;
+    ImVec4 toastBorder = GetAccent();
+    toastBorder.w = 0.40f * alpha;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, toastBg);
+    ImGui::PushStyleColor(ImGuiCol_Border, toastBorder);
 
     ImGui::Begin("##toast", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -816,9 +816,8 @@ void ConfiguratorApp::DrawToastOverlay() {
     bool isError = toastMessage_.find("Could not") != std::string::npos ||
                    toastMessage_.find("Validation") != std::string::npos;
 
-    ImVec4 textColor = isError
-        ? ImVec4(0.90f, 0.45f, 0.35f, alpha)
-        : ImVec4(0.30f, 0.80f, 0.45f, alpha);
+    ImVec4 textColor = isError ? GetError() : GetSuccess();
+    textColor.w = alpha;
 
     ImGui::PushStyleColor(ImGuiCol_Text, textColor);
     ImGui::TextWrapped("%s", toastMessage_.c_str());
