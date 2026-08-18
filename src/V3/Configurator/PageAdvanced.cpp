@@ -66,8 +66,8 @@ void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked,
     float v = 0.0f;
     ImGui::ColorConvertRGBtoHSV(picked.x, picked.y, picked.z, h, s, v);
 
-    strength = ImClamp(strength, 0.0f, 1.0f);
-    const float chroma = ImClamp(s, 0.0f, 1.0f);
+    strength = std::clamp(strength, 0.0f, 1.0f);
+    const float chroma = std::clamp(s, 0.0f, 1.0f);
 
     // Strength controls both saturation and luminance of the generated dark
     // surfaces. 0% is almost-neutral SVMS dark; 100% is intentionally bold,
