@@ -547,6 +547,12 @@ void ConfiguratorApp::RenderFrame() {
     d3dContext_->ClearRenderTargetView(renderTarget_, clearColor);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     swapChain_->Present(1, 0);
+
+    // Present the click/drag first, then perform the cross-process update.
+    // This prevents a slow or temporarily busy driver from making the button
+    // itself feel like it ignored the user. Normally the ACK arrives almost
+    // immediately; the 50 ms timeout is only a safety ceiling.
+    FlushLiveChanges();
 }
 
 void ConfiguratorApp::DrawHeader() {
@@ -744,7 +750,7 @@ void ConfiguratorApp::DrawFooter() {
             if (config_.Save(path)) {
                 PushAllLiveParams();
                 toastTimer_ = 3.0f;
-                toastMessage_ = "Configuration saved & pushed to driver";
+                toastMessage_ = "Configuration saved & queued for driver";
                 statusMessage_ = "Saved";
             } else {
                 toastTimer_ = 4.0f;
@@ -814,7 +820,8 @@ void ConfiguratorApp::DrawToastOverlay() {
                  ImGuiWindowFlags_NoFocusOnAppearing);
 
     bool isError = toastMessage_.find("Could not") != std::string::npos ||
-                   toastMessage_.find("Validation") != std::string::npos;
+                   toastMessage_.find("Validation") != std::string::npos ||
+                   toastMessage_.find("failed") != std::string::npos;
 
     ImVec4 textColor = isError ? GetError() : GetSuccess();
     textColor.w = alpha;
@@ -837,8 +844,9 @@ void ConfiguratorApp::HandleKeyboardShortcuts() {
         ConfigValidation v = config_.Validate();
         if (v.valid) {
             if (config_.Save(path)) {
+                PushAllLiveParams();
                 toastTimer_ = 3.0f;
-                toastMessage_ = "Configuration saved";
+                toastMessage_ = "Configuration saved & queued for driver";
             } else {
                 toastTimer_ = 4.0f;
                 toastMessage_ = "Could not save configuration";
@@ -879,30 +887,55 @@ void ConfiguratorApp::PollRuntimeLink() {
     }
 
     rlClient_.ReadTelemetry(rlTelemetry_);
-
-    FlushLiveChanges();
 }
 
 void ConfiguratorApp::FlushLiveChanges() {
     if (!rlConnected_ || pendingLiveMask_ == 0u) return;
 
     ImGuiIO& io = ImGui::GetIO();
+    if (rlRetryBackoff_ > 0.0f) {
+        rlRetryBackoff_ -= io.DeltaTime;
+        return;
+    }
+
     rlFlushTimer_ += io.DeltaTime;
     if (rlFlushTimer_ < kRlFlushInterval) return;
     rlFlushTimer_ = 0.0f;
 
+    const uint32_t submittedMask = pendingLiveMask_;
     char err[svms::kRuntimeLinkResultTextCapacity] = {};
     const svms::RLResult result = rlClient_.SendCommand(
-        svms::RLCommandType::ApplyLiveConfig, pendingLiveMask_, 0u,
-        workingLive_, svms::kRuntimeLinkDefaultCommandTimeoutMs, err);
+        svms::RLCommandType::ApplyLiveConfig, submittedMask, 0u,
+        workingLive_, kRlLiveCommandTimeoutMs, err);
     if (result == svms::RLResult::Ok) {
-        pendingLiveMask_ = 0u;
+        // Only clear the bits actually submitted. A widget can mutate another
+        // group while an ACK is in flight, and that new work must survive.
+        pendingLiveMask_ &= ~submittedMask;
+        rlFailedFlushes_ = 0u;
+        rlRetryBackoff_ = 0.0f;
+        return;
+    }
+
+    if (result == svms::RLResult::RestartRequired &&
+        (submittedMask & svms::RLGroupVoices) != 0u) {
+        // A live voice cap may grow only inside the pool allocated at driver
+        // startup. Keep any unrelated pending live groups and stop retrying
+        // the impossible voice-cap request every frame.
+        pendingLiveMask_ &= ~svms::RLGroupVoices;
+        statusMessage_ = "Voice cap exceeds the startup pool — restart required to grow it";
+        if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
+        toastTimer_ = 4.0f;
+        toastMessage_ = statusMessage_;
         rlFailedFlushes_ = 0u;
         return;
     }
-    if (++rlFailedFlushes_ >= 5u) {
+
+    // A timeout/busy driver must not turn into a 50-ms stall every VSync.
+    // Keep the latest values pending and retry after a short cooldown.
+    rlRetryBackoff_ = 0.15f;
+    if (++rlFailedFlushes_ >= 3u) {
         rlFailedFlushes_ = 0u;
-        statusMessage_ = "Live update failed: " +
+        statusMessage_ = "Live update delayed: " +
             std::string(svms::RLV2_ResultToString(result));
         if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
         toastTimer_ = 3.0f;
@@ -952,6 +985,7 @@ void ConfiguratorApp::SetLiveFloat(svms::RLCommandType type, float value) {
         return;
     }
     pendingLiveMask_ |= svms::RLV2_GroupForType(type);
+    rlFlushTimer_ = kRlFlushInterval;
 }
 
 void ConfiguratorApp::SetLiveBool(svms::RLCommandType type, bool value) {
@@ -966,12 +1000,21 @@ void ConfiguratorApp::SetLiveBool(svms::RLCommandType type, bool value) {
         return;
     }
     pendingLiveMask_ |= svms::RLV2_GroupForType(type);
+    rlFlushTimer_ = kRlFlushInterval;
+}
+
+void ConfiguratorApp::SetLiveMaxVoices(uint32_t value) {
+    if (value == 0u) value = 1u;
+    workingLive_.maxVoices = value;
+    pendingLiveMask_ |= svms::RLGroupVoices;
+    rlFlushTimer_ = kRlFlushInterval;
 }
 
 static svms::RuntimeLiveStateV2 LiveStateFromConfig(const ConfigValues& w) {
     svms::RuntimeLiveStateV2 l{};
     l.masterVolume = w.masterVolume;
     l.correctnessMode = w.correctnessMode ? 1u : 0u;
+    l.maxVoices = w.maxVoices;
     l.reverbEnabled = w.enableReverb ? 1u : 0u;
     l.reverbMix = w.reverbMix;
     l.reverbRoomSize = w.reverbRoomSize;
@@ -1001,20 +1044,13 @@ void ConfiguratorApp::SeedWorkingLive() {
 void ConfiguratorApp::PushAllLiveParams() {
     if (!rlConnected_) return;
 
+    // Persistence and RuntimeLink are deliberately decoupled. Save/Revert
+    // updates the working live snapshot and queues it; no UI button waits up
+    // to 1.5 seconds for a cross-process ACK anymore.
     workingLive_ = LiveStateFromConfig(config_.Working());
-    char err[svms::kRuntimeLinkResultTextCapacity] = {};
-    const svms::RLResult result = rlClient_.SendCommand(
-        svms::RLCommandType::ApplyLiveConfig, svms::RLGroupAll, 0u,
-        workingLive_, 1500u, err);
-    if (result == svms::RLResult::Ok) {
-        pendingLiveMask_ = 0u;
-    } else {
-        statusMessage_ = "Live push failed: " +
-            std::string(svms::RLV2_ResultToString(result));
-        if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
-        toastTimer_ = 4.0f;
-        toastMessage_ = statusMessage_;
-    }
+    pendingLiveMask_ |= svms::RLGroupAll;
+    rlFlushTimer_ = kRlFlushInterval;
+    rlRetryBackoff_ = 0.0f;
 }
 
 void ConfiguratorApp::AdoptEngineLiveState() {
@@ -1024,6 +1060,7 @@ void ConfiguratorApp::AdoptEngineLiveState() {
     ConfigValues& w = config_.Working();
     w.masterVolume = e.masterVolume;
     w.correctnessMode = e.correctnessMode != 0u;
+    if (e.maxVoices != 0u) w.maxVoices = e.maxVoices;
     w.enableReverb = e.reverbEnabled != 0u;
     w.reverbMix = e.reverbMix;
     w.reverbRoomSize = e.reverbRoomSize;
@@ -1056,6 +1093,7 @@ void ConfiguratorApp::OnConnected() {
     rlReconnectTimer_ = 0.0f;
     rlPollTimer_ = 0.0f;
     rlFlushTimer_ = 0.0f;
+    rlRetryBackoff_ = 0.0f;
     rlFailedFlushes_ = 0u;
     statusMessage_ = "Connected to driver (PID " +
                      std::to_string(rlLastKnownPid_) + ")";
