@@ -337,6 +337,21 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
     add_test(NAME svms_v3_correctness COMMAND svms_v3_tests)
 
+    add_executable(svms_v3_voice_growth_tests
+        tests/SVMSVoiceGrowthRegression.cpp
+        SVMSRenderKernels.cpp
+        SVMSRenderWorkers.cpp
+        SVMSRenderDispatch.cpp
+        SVMSRenderKernelsSSE2.cpp)
+    if(NOT SVMS_XP_COMPAT)
+        target_sources(svms_v3_voice_growth_tests PRIVATE SVMSRenderKernelsAVX2.cpp)
+    endif()
+    target_compile_definitions(svms_v3_voice_growth_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_voice_growth_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME svms_v3_voice_growth COMMAND svms_v3_voice_growth_tests)
+
     if(SVMS_XP_COMPAT)
         add_executable(svms_v3_xp_directsound_smoke
             tests/SVMSXPDirectSoundSmoke.cpp)
