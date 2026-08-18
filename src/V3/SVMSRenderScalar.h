@@ -261,8 +261,12 @@ inline RenderScalar::~RenderScalar() {
 inline bool RenderScalar::ConfigureRenderThreads(
     uint32_t totalRenderThreads, uint32_t maximumBlockFrames) {
     if (!workerPool_) return totalRenderThreads <= 1u;
+    // Jobs contain only a kernel and a handle range. Sizing this small
+    // descriptor queue for the hard voice ceiling keeps worker storage
+    // independent of the VoiceManager's growable physical allocation, so a
+    // later live grow never requires restarting the persistent worker lanes.
     return workerPool_->Initialize(totalRenderThreads, maximumBlockFrames,
-                                   scratchCapacity_);
+                                   kMaxPolyphony);
 }
 
 inline uint32_t RenderScalar::GetRenderThreadCount() const {
@@ -331,8 +335,13 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                                         const RenderEvent* events, uint32_t eventCount,
                                         bool correctnessMode,
                                         uint64_t blockStartFrame) {
-    if (voices.GetMaxVoices() > scratchCapacity_ || !classChanges_ ||
-        !retirements_) return;
+    // Scratch is indexed by the number of voices that can retire/reclassify in
+    // one span, not by the physical handle ceiling. A live VoiceSoA grow may
+    // therefore safely leave scratch at its old size until active polyphony
+    // actually crosses it.
+    if (voices.activeCount_ > scratchCapacity_ &&
+        !ReserveVoiceCapacity(voices.activeCount_)) return;
+    if (!classChanges_ || !retirements_) return;
     (void)cfg;
     (void)channels;
     VoiceSoA& v = voices.v;
@@ -378,6 +387,8 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                     dispatcher_(events[i], f, dispatcherUserData_);
             }
         }
+        if (voices.activeCount_ > scratchCapacity_ &&
+            !ReserveVoiceCapacity(voices.activeCount_)) return;
 
         // ── 2. Determine decimation step ──────────────────────────────
         // At step=1 every voice mixes: mixLimit and the newborn check are
@@ -1095,8 +1106,9 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       const RenderEvent* events, uint32_t eventCount,
                                       bool correctnessMode,
                                       uint64_t blockStartFrame) {
-    if (voices.GetMaxVoices() > scratchCapacity_ || !classChanges_ ||
-        !retirements_) return;
+    if (voices.activeCount_ > scratchCapacity_ &&
+        !ReserveVoiceCapacity(voices.activeCount_)) return;
+    if (!classChanges_ || !retirements_) return;
     (void)cfg;
     (void)channels;
     VoiceSoA& v = voices.v;
@@ -1131,6 +1143,8 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                     dispatcher_(events[i], cursor, dispatcherUserData_);
             }
         }
+        if (voices.activeCount_ > scratchCapacity_ &&
+            !ReserveVoiceCapacity(voices.activeCount_)) return;
 
         uint32_t spanEnd = numFrames;
         if (eventIndex < eventCount && events[eventIndex].frameOffset < spanEnd)
