@@ -73,6 +73,14 @@ void ReadOverflowMode(const json& obj, const char* key, int& dest) {
     else if (v == "lossless") dest = 1;
 }
 
+void ReadLimiterAlgorithm(const json& obj, const char* key, uint32_t& dest) {
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_string()) return;
+    const std::string v = it->get<std::string>();
+    if (v == "classic") dest = 0u;
+    else if (v == "adaptive") dest = 1u;
+}
+
 } // namespace
 
 ConfigValues ConfigDocument::Defaults() {
@@ -86,6 +94,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.velocityFloor = 0.0f;
     d.velocityIgnoreBelow = 0;
     d.limiterEnabled = true;
+    d.limiterAlgorithm = 0u;
     d.limiterThreshold = 0.95f;
     d.limiterLookaheadMs = 3.0f;
     d.limiterAttackMs = 0.5f;
@@ -149,6 +158,7 @@ void ConfigDocument::FromJson(const json& root) {
     }
     if (auto it = root.find("limiter"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.limiterEnabled);
+        ReadLimiterAlgorithm(*it, "algorithm", working_.limiterAlgorithm);
         ReadNum(*it, "threshold", working_.limiterThreshold, 0.1f, 1.0f);
         ReadNum(*it, "lookahead_ms", working_.limiterLookaheadMs, 0.0f, 20.0f);
         ReadNum(*it, "attack_ms", working_.limiterAttackMs, 0.01f, 100.0f);
@@ -206,6 +216,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["quality"]["pan_law"] = "constant-power";
 
     root["limiter"]["enabled"] = working_.limiterEnabled;
+    root["limiter"]["algorithm"] = working_.limiterAlgorithm == 1u ? "adaptive" : "classic";
     root["limiter"]["threshold"] = working_.limiterThreshold;
     root["limiter"]["lookahead_ms"] = working_.limiterLookaheadMs;
     root["limiter"]["attack_ms"] = working_.limiterAttackMs;
@@ -329,6 +340,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && AlmostEquals(a.velocityFloor, b.velocityFloor)
         && a.velocityIgnoreBelow == b.velocityIgnoreBelow
         && a.limiterEnabled == b.limiterEnabled
+        && a.limiterAlgorithm == b.limiterAlgorithm
         && AlmostEquals(a.limiterThreshold, b.limiterThreshold)
         && AlmostEquals(a.limiterLookaheadMs, b.limiterLookaheadMs)
         && AlmostEquals(a.limiterAttackMs, b.limiterAttackMs)
@@ -403,6 +415,8 @@ ConfigValidation ConfigDocument::Validate() const {
         warn("synth.velocity_floor", "must be 0..0.99");
     if (working_.velocityIgnoreBelow > 127)
         warn("synth.velocity_ignore_below", "must be 0..127");
+    if (working_.limiterAlgorithm > 1u)
+        warn("limiter.algorithm", "must be classic or adaptive");
     if (working_.limiterThreshold < 0.1f || working_.limiterThreshold > 1.0f)
         warn("limiter.threshold", "must be 0.1..1");
     if (working_.limiterLookaheadMs < 0.0f || working_.limiterLookaheadMs > 20.0f)
