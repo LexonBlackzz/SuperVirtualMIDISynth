@@ -196,6 +196,7 @@ enum class RLCommandType : uint32_t {
     SetLimiterAttack     = 0x00000014,
     SetLimiterRelease    = 0x00000015,
     SetMaxVoices         = 0x00000016,
+    SetLimiterAlgorithm  = 0x00000017,
 
     // Wire commands (cross the process boundary)
     Ping                 = 0x00000020,
@@ -239,7 +240,8 @@ inline uint32_t RLV2_GroupForType(RLCommandType type) {
         case RLCommandType::SetLimiterThreshold:
         case RLCommandType::SetLimiterLookahead:
         case RLCommandType::SetLimiterAttack:
-        case RLCommandType::SetLimiterRelease:   return RLGroupLimiter;
+        case RLCommandType::SetLimiterRelease:
+        case RLCommandType::SetLimiterAlgorithm: return RLGroupLimiter;
         case RLCommandType::SetMaxVoices:        return RLGroupVoices;
         default:                                 return 0u;
     }
@@ -297,11 +299,10 @@ struct RuntimeLiveStateV2 {
     float limiterAttackMs      = 0.5f;
     float limiterReleaseMs     = 100.0f;
 
-    // Logical runtime cap.  The first implementation may lower this live up
-    // to the pool capacity allocated at driver startup; growing the physical
-    // pool still requires a restart.
+    // Logical runtime cap. The trailing word used to be reserved; it is now
+    // an ABI-preserving limiter algorithm selector: 0 = Classic, 1 = Adaptive.
     uint32_t maxVoices         = 0;
-    uint32_t reserved[1]       = {};
+    uint32_t limiterAlgorithm  = 0;
 };
 
 static_assert(std::is_trivially_copyable<RuntimeLiveStateV2>::value,
