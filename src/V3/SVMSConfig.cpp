@@ -156,6 +156,8 @@ void ImportNumber(const std::map<std::string, std::string>& ini,
 json MakeDefaultJson(const EngineConfig& cfg) {
     const char* backend = cfg.audioBackend == AudioBackend::DirectSound
                             ? "directsound" : "wasapi-shared";
+    const char* limiterAlgorithm = cfg.limiterAlgorithm == LimiterAlgorithm::Adaptive
+                            ? "adaptive" : "classic";
     return json{
         {"schema_version", kConfigSchemaVersion},
         {"audio", {
@@ -187,6 +189,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         }},
         {"limiter", {
             {"enabled", cfg.limiterEnabled},
+            {"algorithm", limiterAlgorithm},
             {"threshold", cfg.limiterThreshold},
             {"lookahead_ms", cfg.limiterLookaheadMs},
             {"attack_ms", cfg.limiterAttackMs},
@@ -431,6 +434,20 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("limiter"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "enabled", cfg.limiterEnabled))
             AppendWarning(cfg.configWarning, "limiter.enabled");
+        auto algorithm = it->find("algorithm");
+        if (algorithm != it->end()) {
+            if (!algorithm->is_string()) {
+                AppendWarning(cfg.configWarning, "limiter.algorithm");
+            } else {
+                const std::string value = algorithm->get<std::string>();
+                if (value == "classic")
+                    cfg.limiterAlgorithm = LimiterAlgorithm::Classic;
+                else if (value == "adaptive")
+                    cfg.limiterAlgorithm = LimiterAlgorithm::Adaptive;
+                else
+                    AppendWarning(cfg.configWarning, "limiter.algorithm");
+            }
+        }
         if (!ReadValue(*it, "threshold", cfg.limiterThreshold, 0.1f, 1.0f))
             AppendWarning(cfg.configWarning, "limiter.threshold");
         if (!ReadValue(*it, "lookahead_ms", cfg.limiterLookaheadMs, 0.0f, 20.0f))
@@ -548,6 +565,7 @@ EngineConfig EngineConfig::Default() {
     cfg.panLaw = PanLaw::ConstantPower;
     cfg.masterVolume = 1.0f;
     cfg.limiterEnabled = true;
+    cfg.limiterAlgorithm = LimiterAlgorithm::Classic;
     cfg.limiterThreshold = 0.95f;
     cfg.limiterLookaheadMs = 3.0f;
     cfg.limiterAttackMs = 0.5f;
@@ -672,6 +690,8 @@ bool EngineConfig::Validate() const {
             maxVoices >= 1 && maxVoices <= kMaxPolyphony &&
             renderThreads <= 64u &&
             masterVolume >= 0.0f && masterVolume <= 4.0f &&
+            (limiterAlgorithm == LimiterAlgorithm::Classic ||
+             limiterAlgorithm == LimiterAlgorithm::Adaptive) &&
             limiterThreshold >= 0.1f && limiterThreshold <= 1.0f &&
             limiterLookaheadMs >= 0.0f && limiterLookaheadMs <= 20.0f &&
             limiterAttackMs >= 0.01f && limiterAttackMs <= 100.0f &&
