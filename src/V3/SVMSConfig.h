@@ -202,8 +202,8 @@ struct LiveConfigMailbox {
                                std::memory_order_relaxed);
         limiterThreshold.store(cfg.limiterThreshold, std::memory_order_relaxed);
         limiterDelayFrames.store((std::min)(8192u,
-            (std::max)(1u, static_cast<uint32_t>(
-                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f))),
+            static_cast<uint32_t>(
+                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f)),
             std::memory_order_relaxed);
         float attackSamples = (std::max)(1.0f,
             cfg.limiterAttackMs * sampleRate * 0.001f);
