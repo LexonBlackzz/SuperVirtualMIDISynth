@@ -13,7 +13,8 @@ namespace svms::cfg {
 namespace {
 
 constexpr float kMeterFloorDb = -60.0f;
-constexpr float kGrMaxDb = 24.0f;
+constexpr float kGrBaseMaxDb = 24.0f;
+constexpr float kGrHardMaxDb = 240.0f;
 constexpr int kGrHistoryCapacity = 320; // ~10.7 s at 30 Hz
 
 float LinearToDb(float linear) {
@@ -24,6 +25,21 @@ float LinearToDb(float linear) {
 float MeterNorm(float linear) {
     const float db = LinearToDb(linear);
     return ImClamp((db - kMeterFloorDb) / -kMeterFloorDb, 0.0f, 1.0f);
+}
+
+float SelectGrDisplayMax(float observedDb) {
+    if (!std::isfinite(observedDb)) return kGrBaseMaxDb;
+    observedDb = ImClamp(observedDb, 0.0f, kGrHardMaxDb);
+    if (observedDb <= kGrBaseMaxDb) return kGrBaseMaxDb;
+    const float steps = std::ceil(observedDb / kGrBaseMaxDb);
+    return ImClamp(steps * kGrBaseMaxDb, kGrBaseMaxDb, kGrHardMaxDb);
+}
+
+float GrTickStep(float displayMaxDb) {
+    if (displayMaxDb <= 24.0f) return 6.0f;
+    if (displayMaxDb <= 72.0f) return 12.0f;
+    if (displayMaxDb <= 144.0f) return 24.0f;
+    return 48.0f;
 }
 
 void DrawCenteredText(ImDrawList* dl, float centerX, float y,
@@ -39,7 +55,8 @@ struct GrHistory {
     float accumulator = 0.0f;
 
     void Push(float value) {
-        values[writePos] = ImClamp(value, 0.0f, kGrMaxDb);
+        if (!std::isfinite(value)) value = 0.0f;
+        values[writePos] = ImClamp(value, 0.0f, kGrHardMaxDb);
         writePos = (writePos + 1) % kGrHistoryCapacity;
         if (count < kGrHistoryCapacity) ++count;
     }
@@ -47,6 +64,13 @@ struct GrHistory {
     float AtOldestOffset(int i) const {
         const int start = (writePos - count + kGrHistoryCapacity) % kGrHistoryCapacity;
         return values[(start + i) % kGrHistoryCapacity];
+    }
+
+    float Maximum() const {
+        float maximum = 0.0f;
+        for (int i = 0; i < count; ++i)
+            maximum = (std::max)(maximum, AtOldestOffset(i));
+        return maximum;
     }
 };
 
@@ -124,7 +148,8 @@ void DrawLevelBar(const char* id, float linear, const ImVec2& size) {
     ImGui::PopID();
 }
 
-void DrawGrBar(const char* id, float reductionDb, const ImVec2& size) {
+void DrawGrBar(const char* id, float reductionDb, float displayMaxDb,
+               const ImVec2& size) {
     ImGui::PushID(id);
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -134,7 +159,8 @@ void DrawGrBar(const char* id, float reductionDb, const ImVec2& size) {
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bg, 3.0f);
     dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), border, 3.0f);
 
-    const float norm = ImClamp(reductionDb / kGrMaxDb, 0.0f, 1.0f);
+    displayMaxDb = (std::max)(kGrBaseMaxDb, displayMaxDb);
+    const float norm = ImClamp(reductionDb / displayMaxDb, 0.0f, 1.0f);
     if (norm > 0.0f) {
         dl->AddRectFilled(ImVec2(pos.x + 2.0f, pos.y + 2.0f),
                           ImVec2(pos.x + size.x - 2.0f,
@@ -230,17 +256,27 @@ void DrawDbScale(float x, float top, float height) {
     }
 }
 
-void DrawGrScale(float x, float top, float height, float currentGr) {
+void DrawGrScale(float x, float top, float height, float currentGr,
+                 float displayMaxDb) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    constexpr int tickCount = 6;
-    const float ticks[tickCount] = { 0.0f, 3.0f, 6.0f, 12.0f, 18.0f, 24.0f };
+    displayMaxDb = ImClamp(displayMaxDb, kGrBaseMaxDb, kGrHardMaxDb);
+    const float tickStep = GrTickStep(displayMaxDb);
+
+    float ticks[16]{};
+    int tickCount = 0;
+    for (float db = 0.0f;
+         db < displayMaxDb - 0.01f && tickCount < 15;
+         db += tickStep) {
+        ticks[tickCount++] = db;
+    }
+    ticks[tickCount++] = displayMaxDb;
 
     const float fontH = ImGui::GetFontSize();
     const float minGap = fontH + 2.0f;
     const float minCenter = top + fontH * 0.5f;
     const float maxCenter = top + height - fontH * 0.5f;
-    const float live = ImClamp(currentGr, 0.0f, kGrMaxDb);
-    const float liveExactY = top + height * (live / kGrMaxDb);
+    const float live = ImClamp(currentGr, 0.0f, displayMaxDb);
+    const float liveExactY = top + height * (live / displayMaxDb);
     const float liveCenter = ImClamp(liveExactY, minCenter, maxCenter);
 
     const ImU32 textColor = ImGui::GetColorU32(
@@ -250,30 +286,23 @@ void DrawGrScale(float x, float top, float height, float currentGr) {
     const ImU32 liveColor = ImGui::GetColorU32(
         ImVec4(0.94f, 0.68f, 0.16f, 1.0f));
 
-    float desired[tickCount]{};
-    bool visible[tickCount]{};
+    float desired[16]{};
+    bool visible[16]{};
     for (int i = 0; i < tickCount; ++i) {
-        desired[i] = top + height * (ticks[i] / kGrMaxDb);
+        desired[i] = top + height * (ticks[i] / displayMaxDb);
         desired[i] = ImClamp(desired[i], minCenter, maxCenter);
         visible[i] = true;
 
-        // The animated live readout owns its exact slot. Hide any static tick
-        // whose text box would collide with it; the tick itself is still
-        // indicated by the short scale mark.
         if (std::fabs(desired[i] - liveCenter) < minGap * 0.92f &&
             std::fabs(ticks[i] - live) > 0.05f) {
             visible[i] = false;
         }
     }
 
-    // If the live value essentially sits on a standard tick, draw only the
-    // highlighted live label there instead of two almost-identical numbers.
     for (int i = 0; i < tickCount; ++i) {
         if (std::fabs(ticks[i] - live) <= 0.05f) visible[i] = false;
     }
 
-    // Static scale marks always stay at their real positions, even when the
-    // text has to disappear to make room for the moving live readout.
     for (int i = 0; i < tickCount; ++i) {
         dl->AddLine(ImVec2(x - 5.0f, desired[i]), ImVec2(x - 1.0f, desired[i]),
                     leaderColor, 1.0f);
@@ -284,19 +313,20 @@ void DrawGrScale(float x, float top, float height, float currentGr) {
         dl->AddText(ImVec2(x + 4.0f, desired[i] - fontH * 0.5f), textColor, text);
     }
 
-    // Moving gain-reduction readout follows the end of the animated fill.
-    // It uses the same 0..24 dB magnitude convention as the bar itself.
     char liveText[16];
-    std::snprintf(liveText, sizeof(liveText), live < 10.0f ? "%.1f" : "%.0f", live);
+    const float liveValue = (std::max)(0.0f,
+        std::isfinite(currentGr) ? currentGr : 0.0f);
+    std::snprintf(liveText, sizeof(liveText),
+                  liveValue < 10.0f ? "%.1f" : "%.0f", liveValue);
     dl->AddLine(ImVec2(x - 8.0f, liveExactY), ImVec2(x + 1.0f, liveExactY),
                 liveColor, 1.5f);
     dl->AddText(ImVec2(x + 4.0f, liveCenter - fontH * 0.5f), liveColor, liveText);
 }
 
 void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
-                   float height) {
+                   float height, float grDisplayMaxDb) {
     const float scaleGap = 5.0f;
-    const float scaleWidth = ImGui::CalcTextSize("-60").x + 8.0f;
+    const float scaleWidth = ImGui::CalcTextSize("-240").x + 8.0f;
     const float stereoGap = 6.0f;
     const float captionGap = 5.0f;
     const float captionHeight = ImGui::GetFontSize() * 2.0f + captionGap + 4.0f;
@@ -359,8 +389,10 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
 
         ImGui::SetCursorPosX(groupX);
         const ImVec2 screen = ImGui::GetCursorScreenPos();
-        DrawGrBar("##gain_reduction", gr, ImVec2(barW, height));
-        DrawGrScale(screen.x + barW + scaleGap, screen.y, height, gr);
+        DrawGrBar("##gain_reduction", gr, grDisplayMaxDb,
+                  ImVec2(barW, height));
+        DrawGrScale(screen.x + barW + scaleGap, screen.y, height, gr,
+                    grDisplayMaxDb);
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float centerX = screen.x + barW * 0.5f;
@@ -368,7 +400,8 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         DrawCenteredText(dl, centerX, labelsY,
                          mainCaptionColor, "GAIN REDUCTION");
 
-        const float db = ImClamp(gr, 0.0f, kGrMaxDb);
+        const float db = (std::max)(0.0f,
+            std::isfinite(gr) ? gr : 0.0f);
         char dbText[32];
         std::snprintf(dbText, sizeof(dbText), db < 10.0f ? "%.1f dB" : "%.0f dB", db);
         DrawCenteredText(dl, centerX,
@@ -546,7 +579,8 @@ void DrawControls(ConfigValues& w, ConfigDocument& doc) {
     }
 }
 
-void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr) {
+void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr,
+                 float grDisplayMaxDb) {
     const float dt = ImGui::GetIO().DeltaTime;
     history.accumulator += dt;
     while (history.accumulator >= (1.0f / 30.0f)) {
@@ -565,22 +599,26 @@ void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr) {
     dl->AddRect(p, ImVec2(p.x + graphW, p.y + graphH),
                 ImGui::GetColorU32(ImVec4(0.15f, 0.17f, 0.21f, 1.0f)), 5.0f);
 
-    const float left = p.x + 42.0f;
+    const float left = p.x + 48.0f;
     const float right = p.x + graphW - 10.0f;
     const float top = p.y + 24.0f;
     const float bottom = p.y + graphH - 24.0f;
     const float plotH = bottom - top;
 
-    const float ticks[] = { 0.0f, 3.0f, 6.0f, 12.0f, 18.0f, 24.0f };
-    for (float db : ticks) {
-        const float y = top + plotH * (db / kGrMaxDb);
+    grDisplayMaxDb = ImClamp(grDisplayMaxDb, kGrBaseMaxDb, kGrHardMaxDb);
+    const float tickStep = GrTickStep(grDisplayMaxDb);
+    auto drawHistoryTick = [&](float db) {
+        const float y = top + plotH * (db / grDisplayMaxDb);
         dl->AddLine(ImVec2(left, y), ImVec2(right, y),
                     ImGui::GetColorU32(ImVec4(0.16f, 0.18f, 0.22f, 1.0f)), 1.0f);
         char label[16];
         std::snprintf(label, sizeof(label), db == 0.0f ? "0" : "-%.0f", db);
         dl->AddText(ImVec2(p.x + 7.0f, y - ImGui::GetFontSize() * 0.5f),
                     ImGui::GetColorU32(ImVec4(0.43f, 0.46f, 0.51f, 0.9f)), label);
-    }
+    };
+    for (float db = 0.0f; db < grDisplayMaxDb - 0.01f; db += tickStep)
+        drawHistoryTick(db);
+    drawHistoryTick(grDisplayMaxDb);
 
     dl->AddText(ImVec2(left, p.y + 5.0f),
                 ImGui::GetColorU32(ImVec4(0.68f, 0.71f, 0.76f, 1.0f)),
@@ -593,7 +631,8 @@ void DrawHistory(GrHistory& history, bool telemetryAvailable, float currentGr) {
             const float histGr = history.AtOldestOffset(i);
             const float x = left + (right - left) *
                 (static_cast<float>(i) / static_cast<float>(history.count - 1));
-            const float y = top + plotH * (ImClamp(histGr, 0.0f, kGrMaxDb) / kGrMaxDb);
+            const float y = top + plotH *
+                (ImClamp(histGr, 0.0f, grDisplayMaxDb) / grDisplayMaxDb);
             const ImVec2 point(x, y);
             if (havePrevious) {
                 dl->AddLine(previous, point,
@@ -694,6 +733,8 @@ void DrawLimiterPage(ConfigDocument& doc) {
 
     UpdateMeterVisualState(meterVisuals, telemetryAvailable,
                            inL, inR, gr, outL, outR);
+    const float grDisplayMaxDb = SelectGrDisplayMax((std::max)(
+        gr, (std::max)(meterVisuals.gr, history.Maximum())));
 
     const float availableWidth = ImGui::GetContentRegionAvail().x;
     const float topHeight = (std::max)(285.0f,
@@ -713,7 +754,8 @@ void DrawLimiterPage(ConfigDocument& doc) {
         ImGui::Spacing();
         const float meterHeight = (std::max)(140.0f, topHeight - 102.0f);
         DrawMeterBank(meterVisuals.inL, meterVisuals.inR, meterVisuals.gr,
-                      meterVisuals.outL, meterVisuals.outR, meterHeight);
+                      meterVisuals.outL, meterVisuals.outR, meterHeight,
+                      grDisplayMaxDb);
         ImGui::EndChild();
 
         ImGui::TableNextColumn();
@@ -735,7 +777,7 @@ void DrawLimiterPage(ConfigDocument& doc) {
     }
 
     ImGui::Spacing();
-    DrawHistory(history, telemetryAvailable, gr);
+    DrawHistory(history, telemetryAvailable, gr, grDisplayMaxDb);
 
     PopEffectPageStyle();
 }
