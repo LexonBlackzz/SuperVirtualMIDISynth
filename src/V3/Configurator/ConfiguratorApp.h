@@ -53,6 +53,7 @@ public:
     void SetLiveFloat(svms::RLCommandType type, float value);
     void SetLiveBool(svms::RLCommandType type, bool value);
     void SetLiveMaxVoices(uint32_t value);
+    void SetLiveLimiterAlgorithm(uint32_t value);
 
     void HandleDpiChange(float scale, const RECT* suggestedRect);
 
