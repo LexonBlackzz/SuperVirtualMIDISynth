@@ -908,8 +908,6 @@ void ConfiguratorApp::FlushLiveChanges() {
         svms::RLCommandType::ApplyLiveConfig, submittedMask, 0u,
         workingLive_, kRlLiveCommandTimeoutMs, err);
     if (result == svms::RLResult::Ok) {
-        // Only clear the bits actually submitted. A widget can mutate another
-        // group while an ACK is in flight, and that new work must survive.
         pendingLiveMask_ &= ~submittedMask;
         rlFailedFlushes_ = 0u;
         rlRetryBackoff_ = 0.0f;
@@ -918,9 +916,6 @@ void ConfiguratorApp::FlushLiveChanges() {
 
     if (result == svms::RLResult::RestartRequired &&
         (submittedMask & svms::RLGroupVoices) != 0u) {
-        // A live voice cap may grow only inside the pool allocated at driver
-        // startup. Keep any unrelated pending live groups and stop retrying
-        // the impossible voice-cap request every frame.
         pendingLiveMask_ &= ~svms::RLGroupVoices;
         statusMessage_ = "Voice cap exceeds the startup pool — restart required to grow it";
         if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
@@ -930,8 +925,6 @@ void ConfiguratorApp::FlushLiveChanges() {
         return;
     }
 
-    // A timeout/busy driver must not turn into a 50-ms stall every VSync.
-    // Keep the latest values pending and retry after a short cooldown.
     rlRetryBackoff_ = 0.15f;
     if (++rlFailedFlushes_ >= 3u) {
         rlFailedFlushes_ = 0u;
@@ -1010,6 +1003,12 @@ void ConfiguratorApp::SetLiveMaxVoices(uint32_t value) {
     rlFlushTimer_ = kRlFlushInterval;
 }
 
+void ConfiguratorApp::SetLiveLimiterAlgorithm(uint32_t value) {
+    workingLive_.limiterAlgorithm = (std::min)(1u, value);
+    pendingLiveMask_ |= svms::RLGroupLimiter;
+    rlFlushTimer_ = kRlFlushInterval;
+}
+
 static svms::RuntimeLiveStateV2 LiveStateFromConfig(const ConfigValues& w) {
     svms::RuntimeLiveStateV2 l{};
     l.masterVolume = w.masterVolume;
@@ -1030,6 +1029,7 @@ static svms::RuntimeLiveStateV2 LiveStateFromConfig(const ConfigValues& w) {
     l.reverbLowCutHz = w.reverbLowCutHz;
     l.reverbHighCutHz = w.reverbHighCutHz;
     l.limiterEnabled = w.limiterEnabled ? 1u : 0u;
+    l.limiterAlgorithm = (std::min)(1u, w.limiterAlgorithm);
     l.limiterThreshold = w.limiterThreshold;
     l.limiterLookaheadMs = w.limiterLookaheadMs;
     l.limiterAttackMs = w.limiterAttackMs;
@@ -1044,9 +1044,6 @@ void ConfiguratorApp::SeedWorkingLive() {
 void ConfiguratorApp::PushAllLiveParams() {
     if (!rlConnected_) return;
 
-    // Persistence and RuntimeLink are deliberately decoupled. Save/Revert
-    // updates the working live snapshot and queues it; no UI button waits up
-    // to 1.5 seconds for a cross-process ACK anymore.
     workingLive_ = LiveStateFromConfig(config_.Working());
     pendingLiveMask_ |= svms::RLGroupAll;
     rlFlushTimer_ = kRlFlushInterval;
@@ -1076,6 +1073,7 @@ void ConfiguratorApp::AdoptEngineLiveState() {
     w.reverbLowCutHz = e.reverbLowCutHz;
     w.reverbHighCutHz = e.reverbHighCutHz;
     w.limiterEnabled = e.limiterEnabled != 0u;
+    w.limiterAlgorithm = (std::min)(1u, e.limiterAlgorithm);
     w.limiterThreshold = e.limiterThreshold;
     w.limiterLookaheadMs = e.limiterLookaheadMs;
     w.limiterAttackMs = e.limiterAttackMs;
