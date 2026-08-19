@@ -182,7 +182,6 @@ set(EXPORTS
         waveOutClose
         waveOutPrepareHeader
         waveOutUnprepareHeader
-        waveOutAddBuffer
         waveOutWrite
         waveOutReset
         waveOutRestart
