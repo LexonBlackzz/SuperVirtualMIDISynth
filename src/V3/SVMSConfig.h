@@ -9,6 +9,11 @@
 
 namespace svms {
 
+enum class LimiterAlgorithm : uint32_t {
+    Classic = 0u,
+    Adaptive = 1u,
+};
+
 struct EngineConfig {
     uint32_t sampleRate;
     uint32_t bufferFrames;
@@ -24,6 +29,7 @@ struct EngineConfig {
     PanLaw panLaw;
     float masterVolume;
     bool limiterEnabled;
+    LimiterAlgorithm limiterAlgorithm;
     float limiterThreshold;
     float limiterLookaheadMs;
     float limiterAttackMs;
@@ -134,6 +140,7 @@ struct NonAtomicLiveConfigMailbox {
     float reverbLowCutHz = 70.0f;
     float reverbHighCutHz = 16000.0f;
     bool  limiterEnabled = true;
+    uint32_t limiterAlgorithm = static_cast<uint32_t>(LimiterAlgorithm::Classic);
     float limiterThreshold = 0.95f;
     float limiterAttackCoeff = 0.25f;
     float limiterReleaseCoeff = 0.001f;
@@ -164,6 +171,7 @@ struct LiveConfigMailbox {
 
     // Limiter
     std::atomic<bool>     limiterEnabled{true};
+    std::atomic<uint32_t> limiterAlgorithm{static_cast<uint32_t>(LimiterAlgorithm::Classic)};
     std::atomic<float>    limiterThreshold{0.95f};
     std::atomic<float>    limiterAttackCoeff{0.25f};
     std::atomic<float>    limiterReleaseCoeff{0.001f};
@@ -190,8 +198,10 @@ struct LiveConfigMailbox {
         reverbHighCutHz.store(cfg.reverbHighCutHz, std::memory_order_relaxed);
 
         limiterEnabled.store(cfg.limiterEnabled, std::memory_order_relaxed);
+        limiterAlgorithm.store(static_cast<uint32_t>(cfg.limiterAlgorithm),
+                               std::memory_order_relaxed);
         limiterThreshold.store(cfg.limiterThreshold, std::memory_order_relaxed);
-        limiterDelayFrames.store((std::min)(128u,
+        limiterDelayFrames.store((std::min)(8192u,
             (std::max)(1u, static_cast<uint32_t>(
                 cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f))),
             std::memory_order_relaxed);
@@ -227,6 +237,7 @@ struct LiveConfigMailbox {
         out.reverbLowCutHz = reverbLowCutHz.load(std::memory_order_relaxed);
         out.reverbHighCutHz = reverbHighCutHz.load(std::memory_order_relaxed);
         out.limiterEnabled = limiterEnabled.load(std::memory_order_relaxed);
+        out.limiterAlgorithm = limiterAlgorithm.load(std::memory_order_relaxed);
         out.limiterThreshold = limiterThreshold.load(std::memory_order_relaxed);
         out.limiterAttackCoeff = limiterAttackCoeff.load(std::memory_order_relaxed);
         out.limiterReleaseCoeff = limiterReleaseCoeff.load(std::memory_order_relaxed);
