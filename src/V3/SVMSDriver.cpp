@@ -30,6 +30,7 @@
 #include "SVMSFrameClock.h"
 #include "SVMSDiagWindow.h"
 #include "SVMSPostFilter.h"
+#include "SVMSLimiter.h"
 #include "SVMSRuntimeLink.h"
 
 // ── Logging ────────────────────────────────────────────────────────────
@@ -1708,167 +1709,7 @@ struct ReverbState {
     }
 };
 
-struct LimiterState {
-    static constexpr uint32_t kMaxDelayFrames = 8192;
-
-    float delayBuffer[kMaxDelayFrames * 2];
-    uint32_t delayWritePos = 0;
-    // Current lookahead length, glided per sample toward delayFramesTarget
-    // so a live lookahead change morphs the read position instead of
-    // splicing the delay ring (click).
-    uint32_t delayFrames = 128;
-    uint32_t delayFramesTarget = 128;
-    // Current threshold, glided toward thresholdTarget (a threshold step
-    // while the envelope is above it would otherwise jump the gain).
-    float threshold = 0.95f;
-    float thresholdTarget = 0.95f;
-    float envelope = 0.0f;
-    float attackCoeff = 0.25f;
-    float releaseCoeff = 0.001f;
-    bool enabled = true;
-
-    // Per-block meters, written by Process() on the audio thread and
-    // published into g_audioSnapshot by RenderCallback.  gainReductionDb
-    // is positive (amount of reduction); peaks are linear sample scale.
-    float inputPeakL = 0.0f;
-    float inputPeakR = 0.0f;
-    float outputPeakL = 0.0f;
-    float outputPeakR = 0.0f;
-    float gainReductionDb = 0.0f;
-
-    void Reset() {
-        std::memset(delayBuffer, 0, sizeof(delayBuffer));
-        delayWritePos = 0;
-        envelope = 0.0f;
-        delayFrames = delayFramesTarget;
-        threshold = thresholdTarget;
-        inputPeakL = inputPeakR = outputPeakL = outputPeakR = 0.0f;
-        gainReductionDb = 0.0f;
-    }
-
-    void Configure(uint32_t sampleRate, const EngineConfig& cfg) {
-        Reset();
-        enabled = cfg.limiterEnabled;
-        thresholdTarget = cfg.limiterThreshold;
-        threshold = thresholdTarget;
-        delayFramesTarget = (std::min)(kMaxDelayFrames,
-            (std::max)(1u, static_cast<uint32_t>(
-                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f)));
-        delayFrames = delayFramesTarget;
-        const float attackSamples = (std::max)(1.0f,
-            cfg.limiterAttackMs * sampleRate * 0.001f);
-        const float releaseSamples = (std::max)(1.0f,
-            cfg.limiterReleaseMs * sampleRate * 0.001f);
-        attackCoeff = 1.0f - std::exp(-1.0f / attackSamples);
-        releaseCoeff = 1.0f - std::exp(-1.0f / releaseSamples);
-    }
-
-    void Process(float* interleaved, uint32_t numFrames, uint32_t channels,
-                 PostHighPass3Hz& highPass) {
-        inputPeakL = inputPeakR = outputPeakL = outputPeakR = 0.0f;
-        gainReductionDb = 0.0f;
-
-        if (!enabled) {
-            // Bypass: no limiting, so the meters just mirror the
-            // passthrough signal (input == output).  The delay ring keeps
-            // being written (and the lookahead length keeps gliding) so a
-            // re-enable is seamless instead of reading stale pre-bypass
-            // audio.
-            for (uint32_t f = 0; f < numFrames; ++f) {
-                const float inL = interleaved[f * channels];
-                const float inR = (channels > 1) ? interleaved[f * channels + 1] : inL;
-                const float aL = inL > 0.0f ? inL : -inL;
-                const float aR = inR > 0.0f ? inR : -inR;
-                if (aL > inputPeakL) inputPeakL = aL;
-                if (aR > inputPeakR) inputPeakR = aR;
-
-                if (delayFrames != delayFramesTarget)
-                    delayFrames = ReverbState::GlideU32(
-                        delayFrames, delayFramesTarget, 1u);
-
-                const uint32_t dw = delayWritePos * channels;
-                delayBuffer[dw] = inL;
-                delayBuffer[dw + 1] = inR;
-                delayWritePos = (delayWritePos + 1) % delayFrames;
-            }
-            outputPeakL = inputPeakL;
-            outputPeakR = inputPeakR;
-            highPass.ProcessInterleavedStereo(interleaved, numFrames);
-            return;
-        }
-
-        for (uint32_t f = 0; f < numFrames; ++f) {
-            float inL = interleaved[f * channels];
-            float inR = (channels > 1) ? interleaved[f * channels + 1] : inL;
-
-            // Click-free live updates: glide the lookahead read position
-            // and the threshold instead of stepping them.
-            if (delayFrames != delayFramesTarget)
-                delayFrames = ReverbState::GlideU32(
-                    delayFrames, delayFramesTarget, 1u);
-            if (threshold != thresholdTarget)
-                threshold = ReverbState::GlideF32(
-                    threshold, thresholdTarget, 0.0005f);
-
-            float absL = inL > 0 ? inL : -inL;
-            float absR = inR > 0 ? inR : -inR;
-            float peak = absL > absR ? absL : absR;
-            if (absL > inputPeakL) inputPeakL = absL;
-            if (absR > inputPeakR) inputPeakR = absR;
-
-            if (peak > envelope) {
-                envelope += attackCoeff * (peak - envelope);
-            } else {
-                envelope += releaseCoeff * (peak - envelope);
-            }
-
-            float gain = 1.0f;
-            if (envelope > threshold) {
-                gain = threshold / envelope;
-                const float reduction =
-                    -20.0f * std::log10(gain);
-                if (reduction > gainReductionDb) gainReductionDb = reduction;
-            }
-
-            uint32_t dw = delayWritePos * channels;
-            float dL = delayBuffer[dw];
-            float dR = delayBuffer[dw + 1];
-
-            delayBuffer[dw] = inL;
-            delayBuffer[dw + 1] = inR;
-
-            dL *= gain;
-            dR *= gain;
-
-            // Soft-knee saturation is only used above the limiter knee; it
-            // avoids the former hard clip that made dense reference renders
-            // visibly flatten while still guaranteeing bounded output.
-            const float limitThreshold = threshold;
-            auto softLimit = [limitThreshold](float x) {
-                const float ax = std::fabs(x);
-                if (ax <= limitThreshold) return x;
-                const float headroom = 1.0f - limitThreshold;
-                const float compressed = limitThreshold + headroom *
-                    std::tanh((ax - limitThreshold) /
-                              (headroom > 0.0001f ? headroom : 0.0001f));
-                return x < 0.0f ? -compressed : compressed;
-            };
-            dL = softLimit(dL);
-            dR = softLimit(dR);
-            const float oL = dL > 0.0f ? dL : -dL;
-            const float oR = dR > 0.0f ? dR : -dR;
-            if (oL > outputPeakL) outputPeakL = oL;
-            if (oR > outputPeakR) outputPeakR = oR;
-            highPass.ProcessStereoSample(dL, dR);
-
-            interleaved[f * channels] = dL;
-            if (channels > 1) interleaved[f * channels + 1] = dR;
-
-            delayWritePos = (delayWritePos + 1) % delayFrames;
-        }
-        highPass.FinishBlock();
-    }
-};
+using LimiterState = LimiterRouterState;
 
 // Allocation-free rolling callback histogram. One-percent bins are precise
 // enough for the diagnostic/acceptance thresholds and make percentile reads a
@@ -2221,6 +2062,7 @@ static svms::RuntimeLiveStateV2 LiveStateFromMailbox(
     l.reverbLowCutHz = mb.reverbLowCutHz;
     l.reverbHighCutHz = mb.reverbHighCutHz;
     l.limiterEnabled = mb.limiterEnabled ? 1u : 0u;
+    l.limiterAlgorithm = mb.limiterAlgorithm;
     l.limiterThreshold = mb.limiterThreshold;
     l.limiterLookaheadMs = static_cast<float>(mb.limiterDelayFrames)
                          / sampleRate * 1000.0f;
@@ -2278,6 +2120,11 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                       _TRUNCATE);
             return svms::RLResult::InvalidArgument;
         }
+        if (l.limiterAlgorithm > 1u) {
+            strncpy_s(resultText, kText,
+                      "limiter algorithm must be 0 or 1", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
 
         // Seqlock write: odd sequence marks the mailbox as in-progress
         // for the audio thread, even publishes the completed copy.
@@ -2311,12 +2158,13 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         }
         if (cmd.groupMask & svms::RLGroupLimiter) {
             mb->limiterEnabled = l.limiterEnabled != 0u;
+            mb->limiterAlgorithm = l.limiterAlgorithm;
             mb->limiterThreshold = (std::max)(0.1f, (std::min)(1.0f, l.limiterThreshold));
             uint32_t frames = static_cast<uint32_t>(
                 (std::max)(0.0f, (std::min)(20.0f, l.limiterLookaheadMs))
                 * sampleRate * 0.001f + 0.5f);
-            mb->limiterDelayFrames = (std::max)(1u,
-                (std::min)(svms::LimiterState::kMaxDelayFrames, frames));
+            mb->limiterDelayFrames =
+                (std::min)(svms::LimiterState::kMaxDelayFrames, frames);
             float attackSamples = (std::max)(0.01f, (std::min)(100.0f, l.limiterAttackMs))
                                 * sampleRate * 0.001f;
             attackSamples = (std::max)(1.0f, attackSamples);
@@ -3456,6 +3304,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->reverb.UpdateDerived();
 
         self->limiter.enabled           = mb.limiterEnabled;
+        self->limiter.algorithmTarget   = mb.limiterAlgorithm;
         self->limiter.thresholdTarget   = mb.limiterThreshold;
         self->limiter.delayFramesTarget = mb.limiterDelayFrames;
         self->limiter.attackCoeff       = mb.limiterAttackCoeff;

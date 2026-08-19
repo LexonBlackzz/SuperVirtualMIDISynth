@@ -32,6 +32,7 @@ struct Options {
     uint32_t maxTailSeconds = 30;
     float masterVolume = 1.0f;
     bool limiterEnabled = true;
+    LimiterAlgorithm limiterAlgorithm = LimiterAlgorithm::Classic;
     float limiterThreshold = 0.95f;
     float limiterLookaheadMs = 3.0f;
     float limiterAttackMs = 0.5f;
@@ -50,6 +51,7 @@ void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
     o.renderThreads = cfg.renderThreads;
     o.masterVolume = cfg.masterVolume;
     o.limiterEnabled = cfg.limiterEnabled;
+    o.limiterAlgorithm = cfg.limiterAlgorithm;
     o.limiterThreshold = cfg.limiterThreshold;
     o.limiterLookaheadMs = cfg.limiterLookaheadMs;
     o.limiterAttackMs = cfg.limiterAttackMs;
@@ -93,6 +95,20 @@ bool ParseOnOff(const wchar_t* s, bool& out) {
     return false;
 }
 
+bool ParseLimiterAlgorithm(const wchar_t* s, LimiterAlgorithm& out) {
+    if (!s) return false;
+    const std::wstring value = s;
+    if (value == L"classic") {
+        out = LimiterAlgorithm::Classic;
+        return true;
+    }
+    if (value == L"adaptive") {
+        out = LimiterAlgorithm::Adaptive;
+        return true;
+    }
+    return false;
+}
+
 void Usage() {
     fputws(L"SuperVirtualMIDISynth V3 offline renderer\n\n"
            L"svms_v3_render <input.mid> <soundfont.sf2> <output.wav> [options]\n\n"
@@ -106,6 +122,7 @@ void Usage() {
            L"  --tail-seconds N      Maximum natural-release tail (default 30)\n"
            L"  --master-volume F     Linear master gain, 0-4 (default: V3 config)\n"
            L"  --limiter on|off      Override V3 limiter enabled state\n"
+           L"  --limiter-algorithm classic|adaptive  Override limiter algorithm\n"
            L"  --no-limiter          Alias for --limiter off\n"
            L"  --limiter-threshold F Override limiter threshold, 0.1-1.0\n"
            L"  --limiter-lookahead-ms F  Override lookahead, 0-20 ms\n"
@@ -140,6 +157,8 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             const auto p=value(); if (!p || !ParseFloat(p,0.0f,4.0f,o.masterVolume)) return false;
         } else if (arg == L"--limiter") {
             const auto p=value(); if (!p || !ParseOnOff(p,o.limiterEnabled)) return false;
+        } else if (arg == L"--limiter-algorithm") {
+            const auto p=value(); if (!p || !ParseLimiterAlgorithm(p,o.limiterAlgorithm)) return false;
         } else if (arg == L"--limiter-threshold") {
             const auto p=value(); if (!p || !ParseFloat(p,0.1f,1.0f,o.limiterThreshold)) return false;
         } else if (arg == L"--limiter-lookahead-ms") {
@@ -239,6 +258,7 @@ public:
         postHighPass_.Initialize(rate_);
         EngineConfig limiterConfig{};
         limiterConfig.limiterEnabled = o.limiterEnabled;
+        limiterConfig.limiterAlgorithm = o.limiterAlgorithm;
         limiterConfig.limiterThreshold = o.limiterThreshold;
         limiterConfig.limiterLookaheadMs = o.limiterLookaheadMs;
         limiterConfig.limiterAttackMs = o.limiterAttackMs;
@@ -317,7 +337,7 @@ private:
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;voices_.ForEachChannelActive(ch,[&](VoiceHandle v){const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));});}
     uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0;
     std::unique_ptr<SF2Data> sf2_;std::vector<float> sampleData_;std::vector<PreparedRegion> prepared_;
-    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};AdaptiveLimiterState limiter_{};RegionCacheEntry regionCache_[4096]{};
+    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};
 };
 
 struct ProducerContext { ParsedEventRing* ring; const MappedMidiFile* file; uint32_t rate; std::atomic<bool>* cancel; std::atomic<bool>* done; std::atomic<uint64_t>* decoded; std::string* error; };
@@ -343,7 +363,7 @@ int wmain(int argc,wchar_t** argv) {
     std::vector<float> left(o.blockFrames),right(o.blockFrames);uint64_t frame=0,events=0,renderNs=0,lastRenderNs=0;bool ioOk=true;auto start=std::chrono::steady_clock::now(),last=start;uint64_t lastFrame=0;
     if(!o.quiet){
         fwprintf(stderr,L"SMF %u, %u tracks, %llu channel events (%llu note-ons) | %.2f min | %hs | ring %llu events\n",info.format,info.tracks,info.eventCount,info.noteOnCount,double(info.totalFrames)/o.sampleRate/60.0,synth->Backend(),ring.Capacity());
-        fwprintf(stderr,L"Render config: %u Hz | voices %u | threads %u | master %.3f | limiter %ls",o.sampleRate,o.maxVoices,o.renderThreads,o.masterVolume,o.limiterEnabled?L"ON":L"OFF");
+        fwprintf(stderr,L"Render config: %u Hz | voices %u | threads %u | master %.3f | limiter %ls [%ls]",o.sampleRate,o.maxVoices,o.renderThreads,o.masterVolume,o.limiterEnabled?L"ON":L"OFF",o.limiterAlgorithm==LimiterAlgorithm::Adaptive?L"Adaptive":L"Classic");
         if(o.limiterEnabled)fwprintf(stderr,L" (threshold %.3f, lookahead %.2f ms, attack %.2f ms, release %.1f ms)",o.limiterThreshold,o.limiterLookaheadMs,o.limiterAttackMs,o.limiterReleaseMs);
         fputws(L"\n",stderr);
     }

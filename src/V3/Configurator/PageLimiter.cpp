@@ -479,6 +479,32 @@ void DrawControls(ConfigValues& w, ConfigDocument& doc) {
     ImGui::Spacing();
 
     {
+        static const char* algorithms[] = {
+            "Classic",
+            "Adaptive (Experimental)"
+        };
+        int algorithm = static_cast<int>((std::min)(1u, w.limiterAlgorithm));
+        const float comboWidth = (std::min)(260.0f, (std::max)(150.0f, avail - 92.0f));
+        ImGui::SetNextItemWidth(comboWidth);
+        if (ImGui::Combo("##limiter_algorithm", &algorithm, algorithms, 2)) {
+            w.limiterAlgorithm = static_cast<uint32_t>(algorithm);
+            doc.MarkDirty();
+            PushLiveLimiterAlgorithm(w.limiterAlgorithm);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(w.limiterAlgorithm == 0u
+                ? "Original SVMS limiter used by v0.6.5 and earlier."
+                : "Predictive lookahead limiter with program-dependent release.");
+            ImGui::EndTooltip();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("ALGORITHM");
+    }
+
+    ImGui::Spacing();
+
+    {
         const float start = ImGui::GetCursorPosX();
         ImGui::SetCursorPosX(start + (avail - mainKnob) * 0.5f);
         float threshold = w.limiterThreshold;
