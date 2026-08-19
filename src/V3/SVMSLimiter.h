@@ -244,6 +244,7 @@ struct AdaptiveLimiterState {
         averagePeak_ = 0.0f;
         peakMemory_ = 0.0f;
         limitingDensity_ = 0.0f;
+        releaseHoldRemaining_ = 0u;
         delayFrames = ClampDelay(delayFramesTarget);
         threshold = ClampThreshold(thresholdTarget);
         cachedDeadlineFrames_ = UINT32_MAX;
@@ -266,11 +267,17 @@ struct AdaptiveLimiterState {
         releaseCoeff = TimeToCoeff(cfg.limiterReleaseMs, configuredSampleRate_,
                                    1.0f);
 
-        averagePeakCoeff_ = TimeToCoeff(20.0f, configuredSampleRate_, 1.0f);
-        densityCoeff_ = TimeToCoeff(25.0f, configuredSampleRate_, 1.0f);
+        // Recognize dense passages quickly, but forget them slowly. Black MIDI
+        // walls often contain tiny waveform gaps that should not cause gain to
+        // surge back toward unity between peaks.
+        averagePeakCoeff_ = TimeToCoeff(30.0f, configuredSampleRate_, 1.0f);
+        densityAttackCoeff_ = TimeToCoeff(15.0f, configuredSampleRate_, 1.0f);
+        densityReleaseCoeff_ = TimeToCoeff(220.0f, configuredSampleRate_, 1.0f);
         peakMemoryDecay_ = std::exp(-1.0f /
             ((std::max)(1.0f,
-                15.0f * static_cast<float>(configuredSampleRate_) * 0.001f)));
+                80.0f * static_cast<float>(configuredSampleRate_) * 0.001f)));
+        releaseHoldFrames_ = (std::max)(1u, static_cast<uint32_t>(
+            8.0f * static_cast<float>(configuredSampleRate_) * 0.001f + 0.5f));
 
         Reset();
     }
@@ -390,6 +397,7 @@ private:
 
         if (!enabled) {
             currentGain_ = 1.0f;
+            releaseHoldRemaining_ = 0u;
             outL = inL;
             outR = inR;
             highPass.ProcessStereoSample(outL, outR);
@@ -407,6 +415,13 @@ private:
         if (predictiveTarget < currentGain_) {
             currentGain_ += effectiveAttack *
                 (predictiveTarget - currentGain_);
+            // A short hold stops the gain from charging back toward unity in
+            // microscopic gaps between dense peaks. It restarts only while
+            // real attenuation is still being requested.
+            if (predictiveTarget < 0.995f || currentGain_ < 0.995f)
+                releaseHoldRemaining_ = releaseHoldFrames_;
+        } else if (releaseHoldRemaining_ > 0u) {
+            --releaseHoldRemaining_;
         } else {
             const float adaptiveRelease = ComputeAdaptiveReleaseCoeff();
             currentGain_ += adaptiveRelease *
@@ -481,7 +496,9 @@ private:
         averagePeak_ += averagePeakCoeff_ * (peak - averagePeak_);
         peakMemory_ = (std::max)(peak, peakMemory_ * peakMemoryDecay_);
         const float demand = 1.0f - rawRequiredGain;
-        limitingDensity_ += densityCoeff_ * (demand - limitingDensity_);
+        const float densityCoeff = demand > limitingDensity_
+            ? densityAttackCoeff_ : densityReleaseCoeff_;
+        limitingDensity_ += densityCoeff * (demand - limitingDensity_);
     }
 
     float ComputeAdaptiveReleaseCoeff() const noexcept {
@@ -495,10 +512,19 @@ private:
         const float transient = (std::max)(0.0f,
             (std::min)(1.0f, (crest - 1.5f) / 4.5f));
 
-        float timeScale = 0.65f + 1.85f * density;
-        timeScale *= 1.0f - 0.35f * transient;
-        timeScale = (std::max)(0.35f, (std::min)(3.0f, timeScale));
-        return (std::min)(1.0f, base / timeScale);
+        // Release is the fastest normal recovery. Density only stretches it;
+        // a transient may relax part of that extra stretch, but it can never
+        // make recovery faster than the user's Release setting.
+        const float densityStretch =
+            4.5f * density * (1.0f - 0.18f * transient);
+        const float timeScale = (std::max)(1.0f,
+            (std::min)(5.5f, 1.0f + densityStretch));
+
+        // Scale the actual one-pole time constant rather than just dividing
+        // the coefficient, which is only an approximation for tiny values.
+        const float oneMinusBase = (std::max)(1.0e-9f, 1.0f - base);
+        return ClampCoeff(1.0f - std::exp(
+            std::log(oneMinusBase) / timeScale));
     }
 
     uint32_t detectorHead_ = 0u;
@@ -513,8 +539,11 @@ private:
 
     uint32_t configuredSampleRate_ = 44100u;
     float averagePeakCoeff_ = 0.001f;
-    float densityCoeff_ = 0.001f;
+    float densityAttackCoeff_ = 0.001f;
+    float densityReleaseCoeff_ = 0.0001f;
     float peakMemoryDecay_ = 0.999f;
+    uint32_t releaseHoldFrames_ = 1u;
+    uint32_t releaseHoldRemaining_ = 0u;
 
     uint32_t cachedDeadlineFrames_ = UINT32_MAX;
     float deadlineAttackCoeff_ = 1.0f;
