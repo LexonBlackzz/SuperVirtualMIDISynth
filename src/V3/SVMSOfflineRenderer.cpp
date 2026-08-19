@@ -5,6 +5,7 @@
 #include "SVMSChannelCache.h"
 #include "SVMSRenderScalar.h"
 #include "SVMSPostFilter.h"
+#include "SVMSLimiter.h"
 #include "SVMSEnvelope.h"
 #include "SVMSConfig.h"
 #include <algorithm>
@@ -236,7 +237,13 @@ public:
         }
         for (float& r:bendRatio_) r=1.0f;
         postHighPass_.Initialize(rate_);
-        limiter_.Configure(o);
+        EngineConfig limiterConfig{};
+        limiterConfig.limiterEnabled = o.limiterEnabled;
+        limiterConfig.limiterThreshold = o.limiterThreshold;
+        limiterConfig.limiterLookaheadMs = o.limiterLookaheadMs;
+        limiterConfig.limiterAttackMs = o.limiterAttackMs;
+        limiterConfig.limiterReleaseMs = o.limiterReleaseMs;
+        limiter_.Configure(rate_, limiterConfig);
         return true;
     }
     ~OfflineSynth() { if (sf2_) sf2_free(sf2_.get()); }
@@ -255,7 +262,7 @@ public:
     void Render(float* l,float* r,uint32_t n,uint64_t frame) {
         std::fill(l,l+n,0.0f); std::fill(r,r+n,0.0f);
         renderer_.RenderBlock(voices_,channels_,sampleData_.data(),uint32_t(sampleData_.size()),l,r,n,cfg_,nullptr,0,true,frame);
-        limiter_.Process(l,r,n,postHighPass_);
+        limiter_.ProcessPlanar(l,r,n,postHighPass_);
     }
     void ReleaseAll() { for(uint8_t ch=0;ch<kChannelCount;++ch) voices_.ReleaseChannel(ch,0); }
     uint32_t Active() const { return voices_.GetActiveCount(); }
@@ -271,68 +278,6 @@ public:
 private:
     struct RegionCacheEntry { uint32_t tag=UINT32_MAX;uint16_t count=0;uint16_t reserved=0;uint32_t indices[8]{}; };
     uint32_t ResolveRegions(uint32_t preset,uint8_t note,uint8_t velocity,const SFSampleRegion** out,uint32_t capacity){const uint32_t tag=(preset<<14u)|(uint32_t(note)<<7u)|velocity;uint32_t hash=tag;hash^=hash>>16u;hash*=0x7feb352du;hash^=hash>>15u;RegionCacheEntry& cached=regionCache_[hash&4095u];if(cached.tag==tag&&cached.count<=8u){const uint32_t copied=(std::min)(uint32_t(cached.count),capacity);for(uint32_t i=0;i<copied;++i)out[i]=&sf2_->regions[cached.indices[i]];return cached.count;}const uint32_t count=sf2_find_regions(sf2_.get(),preset,note,velocity,out,capacity);if(count<=8u&&count<=capacity){cached.tag=tag;cached.count=uint16_t(count);for(uint32_t i=0;i<count;++i)cached.indices[i]=uint32_t(out[i]-sf2_->regions);}return count;}
-    struct Limiter {
-        bool enabled=true;
-        float threshold=0.95f;
-        float attackCoeff=0.25f;
-        float releaseCoeff=0.001f;
-        float envelope=0.0f;
-        uint32_t position=0;
-        uint32_t delayFrames=1;
-        std::vector<float> delayL,delayR;
-
-        void Configure(const Options& o) {
-            enabled=o.limiterEnabled;
-            threshold=(std::max)(0.1f,(std::min)(1.0f,o.limiterThreshold));
-            delayFrames=(std::max)(1u,static_cast<uint32_t>(
-                o.limiterLookaheadMs*o.sampleRate*0.001f+0.5f));
-            delayL.assign(delayFrames,0.0f);
-            delayR.assign(delayFrames,0.0f);
-            position=0;
-            envelope=0.0f;
-            const float attackSamples=(std::max)(1.0f,o.limiterAttackMs*o.sampleRate*0.001f);
-            const float releaseSamples=(std::max)(1.0f,o.limiterReleaseMs*o.sampleRate*0.001f);
-            attackCoeff=1.0f-std::exp(-1.0f/attackSamples);
-            releaseCoeff=1.0f-std::exp(-1.0f/releaseSamples);
-        }
-
-        void Process(float* left,float* right,uint32_t frames,PostHighPass3Hz& highPass) {
-            if(!enabled) {
-                // True bypass: no lookahead delay, gain reduction or soft
-                // limiting. Keep the engine's 3 Hz DC blocker, matching the
-                // live path when its limiter is disabled.
-                for(uint32_t i=0;i<frames;++i)
-                    highPass.ProcessStereoSample(left[i],right[i]);
-                highPass.FinishBlock();
-                return;
-            }
-
-            for(uint32_t i=0;i<frames;++i) {
-                const float inL=left[i],inR=right[i];
-                const float peak=(std::max)(std::fabs(inL),std::fabs(inR));
-                envelope+=(peak>envelope?attackCoeff:releaseCoeff)*(peak-envelope);
-                const float gain=envelope>threshold?threshold/envelope:1.0f;
-                float outL=delayL[position]*gain,outR=delayR[position]*gain;
-                delayL[position]=inL;
-                delayR[position]=inR;
-
-                const float limitThreshold=threshold;
-                auto soft=[limitThreshold](float x) {
-                    const float a=std::fabs(x);
-                    if(a<=limitThreshold)return x;
-                    const float headroom=1.0f-limitThreshold;
-                    const float y=limitThreshold+headroom*std::tanh(
-                        (a-limitThreshold)/(headroom>0.0001f?headroom:0.0001f));
-                    return x<0.0f?-y:y;
-                };
-                outL=soft(outL);outR=soft(outR);
-                highPass.ProcessStereoSample(outL,outR);
-                left[i]=outL;right[i]=outR;
-                position=(position+1u)%delayFrames;
-            }
-            highPass.FinishBlock();
-        }
-    };
     void Prepare(const SFSampleRegion& rg, PreparedRegion& p) {
         p={}; if(!sf2_validate_region(sf2_.get(),&rg)||rg.sampleIndex>=sf2_->sampleCount)return;
         const SF2Sample& s=sf2_->samples[rg.sampleIndex]; const int root=rg.rootKey>=0?rg.rootKey:s.originalPitch;
@@ -372,7 +317,7 @@ private:
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;voices_.ForEachChannelActive(ch,[&](VoiceHandle v){const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));});}
     uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0;
     std::unique_ptr<SF2Data> sf2_;std::vector<float> sampleData_;std::vector<PreparedRegion> prepared_;
-    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};Limiter limiter_{};RegionCacheEntry regionCache_[4096]{};
+    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};AdaptiveLimiterState limiter_{};RegionCacheEntry regionCache_[4096]{};
 };
 
 struct ProducerContext { ParsedEventRing* ring; const MappedMidiFile* file; uint32_t rate; std::atomic<bool>* cancel; std::atomic<bool>* done; std::atomic<uint64_t>* decoded; std::string* error; };
