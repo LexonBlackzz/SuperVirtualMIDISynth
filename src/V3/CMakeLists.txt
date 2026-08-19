@@ -67,6 +67,7 @@ set(HEADERS
     SVMSEventScheduler.h
     SVMSFrameClock.h
     SVMSPostFilter.h
+    SVMSLimiter.h
 )
 
 add_library(svmsynth SHARED ${SOURCES} ${HEADERS})
@@ -355,6 +356,14 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_voice_growth_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_voice_growth COMMAND svms_v3_voice_growth_tests)
+
+    add_executable(svms_v3_limiter_tests
+        tests/SVMSLimiterTests.cpp)
+    target_compile_definitions(svms_v3_limiter_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_limiter_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
 
     if(SVMS_XP_COMPAT)
         add_executable(svms_v3_xp_directsound_smoke
