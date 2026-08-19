@@ -1,0 +1,25 @@
+name: V3 limiter integration smoke
+
+on:
+  push:
+    branches: [v3]
+    paths:
+      - .github/workflows/v3-limiter-integration-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        shell: pwsh
+        run: cmake -S src/V3 -B build/V3 -G "Visual Studio 17 2022" -A x64 -DSVMS_BUILD_TESTS=ON
+      - name: Build integration targets
+        shell: pwsh
+        run: cmake --build build/V3 --config Release --target svmsynth svms_v3_configurator svms_v3_render svms_v3_limiter_tests svms_v3_runtime_link_abi_smoke
+      - name: Run limiter and RuntimeLink ABI tests
+        shell: pwsh
+        run: ctest --test-dir build/V3 -C Release -R "svms_v3_(limiter|runtime_link_abi_smoke)" --output-on-failure
