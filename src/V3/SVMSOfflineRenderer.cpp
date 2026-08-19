@@ -6,6 +6,7 @@
 #include "SVMSRenderScalar.h"
 #include "SVMSPostFilter.h"
 #include "SVMSEnvelope.h"
+#include "SVMSConfig.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -28,11 +29,31 @@ struct Options {
     uint32_t renderThreads = 1;
     uint32_t eventBufferMB = 128;
     uint32_t maxTailSeconds = 30;
-    float masterVolume = 0.1f;
+    float masterVolume = 1.0f;
+    bool limiterEnabled = true;
+    float limiterThreshold = 0.95f;
+    float limiterLookaheadMs = 3.0f;
+    float limiterAttackMs = 0.5f;
+    float limiterReleaseMs = 100.0f;
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
     bool quiet = false;
     bool scanOnly = false;
 };
+
+void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
+    // The standalone renderer is still explicitly given a MIDI, SoundFont and
+    // output path, but its engine-facing defaults should match the current V3
+    // configuration. Command-line options below remain authoritative.
+    o.sampleRate = cfg.sampleRate;
+    o.maxVoices = cfg.maxVoices;
+    o.renderThreads = cfg.renderThreads;
+    o.masterVolume = cfg.masterVolume;
+    o.limiterEnabled = cfg.limiterEnabled;
+    o.limiterThreshold = cfg.limiterThreshold;
+    o.limiterLookaheadMs = cfg.limiterLookaheadMs;
+    o.limiterAttackMs = cfg.limiterAttackMs;
+    o.limiterReleaseMs = cfg.limiterReleaseMs;
+}
 
 std::wstring FormatTime(double seconds) {
     if (!std::isfinite(seconds) || seconds < 0) return L"--:--:--";
@@ -48,17 +69,47 @@ bool ParseU32(const wchar_t* s, uint32_t lo, uint32_t hi, uint32_t& out) {
     out = static_cast<uint32_t>(v); return true;
 }
 
+bool ParseFloat(const wchar_t* s, float lo, float hi, float& out) {
+    if (!s || !s[0]) return false;
+    wchar_t* end = nullptr;
+    const double v = wcstod(s, &end);
+    if (*end || !std::isfinite(v) || v < lo || v > hi) return false;
+    out = static_cast<float>(v);
+    return true;
+}
+
+bool ParseOnOff(const wchar_t* s, bool& out) {
+    if (!s) return false;
+    const std::wstring value = s;
+    if (value == L"on" || value == L"true" || value == L"1") {
+        out = true;
+        return true;
+    }
+    if (value == L"off" || value == L"false" || value == L"0") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
 void Usage() {
     fputws(L"SuperVirtualMIDISynth V3 offline renderer\n\n"
            L"svms_v3_render <input.mid> <soundfont.sf2> <output.wav> [options]\n\n"
            L"svms_v3_render <input.mid> --scan-only\n\n"
-           L"  --sample-rate N       Output rate (default 44100)\n"
-           L"  --max-voices N        Voice limit, 1-524288 (default 4096)\n"
-           L"  --render-threads N     Total voice-render threads, 1-64 (default 1)\n"
+           L"Engine-facing defaults are loaded from the active V3 config; CLI options override them.\n\n"
+           L"  --sample-rate N       Output rate (default: V3 config)\n"
+           L"  --max-voices N        Voice limit, 1-524288 (default: V3 config)\n"
+           L"  --render-threads N     Total voice-render threads, 0-64 (default: V3 config)\n"
            L"  --event-buffer-mb N   Parsed-event ring (default 128 MiB)\n"
            L"  --block-frames N      Render block size (default 8192)\n"
            L"  --tail-seconds N      Maximum natural-release tail (default 30)\n"
-           L"  --master-volume F     Linear master gain, 0-1 (default 0.1)\n"
+           L"  --master-volume F     Linear master gain, 0-4 (default: V3 config)\n"
+           L"  --limiter on|off      Override V3 limiter enabled state\n"
+           L"  --no-limiter          Alias for --limiter off\n"
+           L"  --limiter-threshold F Override limiter threshold, 0.1-1.0\n"
+           L"  --limiter-lookahead-ms F  Override lookahead, 0-20 ms\n"
+           L"  --limiter-attack-ms F     Override attack, 0.01-100 ms\n"
+           L"  --limiter-release-ms F    Override release, 1-5000 ms\n"
            L"  --backend auto|scalar|sse2|avx2\n"
            L"  --scan-only           Validate/count without loading SF2 or rendering\n"
            L"  --quiet               Disable once-per-second telemetry\n", stderr);
@@ -77,15 +128,25 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
         auto value = [&]() -> const wchar_t* { return ++i < argc ? argv[i] : nullptr; };
         if (arg == L"--quiet") o.quiet = true;
         else if (arg == L"--scan-only") o.scanOnly = true;
+        else if (arg == L"--no-limiter") o.limiterEnabled = false;
         else if (arg == L"--sample-rate") { const auto p=value(); if (!p || !ParseU32(p,8000,384000,o.sampleRate)) return false; }
         else if (arg == L"--max-voices") { const auto p=value(); if (!p || !ParseU32(p,1,kMaxPolyphony,o.maxVoices)) return false; }
-        else if (arg == L"--render-threads") { const auto p=value(); if (!p || !ParseU32(p,1,64,o.renderThreads)) return false; }
+        else if (arg == L"--render-threads") { const auto p=value(); if (!p || !ParseU32(p,0,64,o.renderThreads)) return false; }
         else if (arg == L"--event-buffer-mb") { const auto p=value(); if (!p || !ParseU32(p,1,4096,o.eventBufferMB)) return false; }
         else if (arg == L"--block-frames") { const auto p=value(); if (!p || !ParseU32(p,16,1048576,o.blockFrames)) return false; }
         else if (arg == L"--tail-seconds") { const auto p=value(); if (!p || !ParseU32(p,0,3600,o.maxTailSeconds)) return false; }
         else if (arg == L"--master-volume") {
-            const auto p=value(); if (!p) return false; wchar_t* end=nullptr; const double v=wcstod(p,&end);
-            if (*end || v < 0 || v > 1) return false; o.masterVolume=static_cast<float>(v);
+            const auto p=value(); if (!p || !ParseFloat(p,0.0f,4.0f,o.masterVolume)) return false;
+        } else if (arg == L"--limiter") {
+            const auto p=value(); if (!p || !ParseOnOff(p,o.limiterEnabled)) return false;
+        } else if (arg == L"--limiter-threshold") {
+            const auto p=value(); if (!p || !ParseFloat(p,0.1f,1.0f,o.limiterThreshold)) return false;
+        } else if (arg == L"--limiter-lookahead-ms") {
+            const auto p=value(); if (!p || !ParseFloat(p,0.0f,20.0f,o.limiterLookaheadMs)) return false;
+        } else if (arg == L"--limiter-attack-ms") {
+            const auto p=value(); if (!p || !ParseFloat(p,0.01f,100.0f,o.limiterAttackMs)) return false;
+        } else if (arg == L"--limiter-release-ms") {
+            const auto p=value(); if (!p || !ParseFloat(p,1.0f,5000.0f,o.limiterReleaseMs)) return false;
         } else if (arg == L"--backend") {
             const auto p=value(); if (!p) return false; const std::wstring name=p;
             if (name == L"auto") o.backend=RenderBackend::AVX512;
@@ -175,6 +236,7 @@ public:
         }
         for (float& r:bendRatio_) r=1.0f;
         postHighPass_.Initialize(rate_);
+        limiter_.Configure(o);
         return true;
     }
     ~OfflineSynth() { if (sf2_) sf2_free(sf2_.get()); }
@@ -210,8 +272,66 @@ private:
     struct RegionCacheEntry { uint32_t tag=UINT32_MAX;uint16_t count=0;uint16_t reserved=0;uint32_t indices[8]{}; };
     uint32_t ResolveRegions(uint32_t preset,uint8_t note,uint8_t velocity,const SFSampleRegion** out,uint32_t capacity){const uint32_t tag=(preset<<14u)|(uint32_t(note)<<7u)|velocity;uint32_t hash=tag;hash^=hash>>16u;hash*=0x7feb352du;hash^=hash>>15u;RegionCacheEntry& cached=regionCache_[hash&4095u];if(cached.tag==tag&&cached.count<=8u){const uint32_t copied=(std::min)(uint32_t(cached.count),capacity);for(uint32_t i=0;i<copied;++i)out[i]=&sf2_->regions[cached.indices[i]];return cached.count;}const uint32_t count=sf2_find_regions(sf2_.get(),preset,note,velocity,out,capacity);if(count<=8u&&count<=capacity){cached.tag=tag;cached.count=uint16_t(count);for(uint32_t i=0;i<count;++i)cached.indices[i]=uint32_t(out[i]-sf2_->regions);}return count;}
     struct Limiter {
-        float delayL[128]{},delayR[128]{};uint32_t position=0;float envelope=1.0f;
-        void Process(float* left,float* right,uint32_t frames,PostHighPass3Hz& highPass){for(uint32_t i=0;i<frames;++i){const float inL=left[i],inR=right[i];const float peak=(std::max)(fabsf(inL),fabsf(inR));envelope+=(peak>envelope?0.25f:0.001f)*(peak-envelope);const float gain=envelope>0.9f?0.9f/envelope:1.0f;float outL=delayL[position]*gain,outR=delayR[position]*gain;delayL[position]=inL;delayR[position]=inR;auto soft=[](float x){const float a=fabsf(x);if(a<=0.9f)return x;const float y=0.9f+0.1f*tanhf((a-0.9f)*10.0f);return x<0?-y:y;};outL=soft(outL);outR=soft(outR);highPass.ProcessStereoSample(outL,outR);left[i]=outL;right[i]=outR;position=(position+1)&127u;}highPass.FinishBlock();}
+        bool enabled=true;
+        float threshold=0.95f;
+        float attackCoeff=0.25f;
+        float releaseCoeff=0.001f;
+        float envelope=0.0f;
+        uint32_t position=0;
+        uint32_t delayFrames=1;
+        std::vector<float> delayL,delayR;
+
+        void Configure(const Options& o) {
+            enabled=o.limiterEnabled;
+            threshold=(std::max)(0.1f,(std::min)(1.0f,o.limiterThreshold));
+            delayFrames=(std::max)(1u,static_cast<uint32_t>(
+                o.limiterLookaheadMs*o.sampleRate*0.001f+0.5f));
+            delayL.assign(delayFrames,0.0f);
+            delayR.assign(delayFrames,0.0f);
+            position=0;
+            envelope=0.0f;
+            const float attackSamples=(std::max)(1.0f,o.limiterAttackMs*o.sampleRate*0.001f);
+            const float releaseSamples=(std::max)(1.0f,o.limiterReleaseMs*o.sampleRate*0.001f);
+            attackCoeff=1.0f-std::exp(-1.0f/attackSamples);
+            releaseCoeff=1.0f-std::exp(-1.0f/releaseSamples);
+        }
+
+        void Process(float* left,float* right,uint32_t frames,PostHighPass3Hz& highPass) {
+            if(!enabled) {
+                // True bypass: no lookahead delay, gain reduction or soft
+                // limiting. Keep the engine's 3 Hz DC blocker, matching the
+                // live path when its limiter is disabled.
+                for(uint32_t i=0;i<frames;++i)
+                    highPass.ProcessStereoSample(left[i],right[i]);
+                highPass.FinishBlock();
+                return;
+            }
+
+            for(uint32_t i=0;i<frames;++i) {
+                const float inL=left[i],inR=right[i];
+                const float peak=(std::max)(std::fabs(inL),std::fabs(inR));
+                envelope+=(peak>envelope?attackCoeff:releaseCoeff)*(peak-envelope);
+                const float gain=envelope>threshold?threshold/envelope:1.0f;
+                float outL=delayL[position]*gain,outR=delayR[position]*gain;
+                delayL[position]=inL;
+                delayR[position]=inR;
+
+                const float limitThreshold=threshold;
+                auto soft=[limitThreshold](float x) {
+                    const float a=std::fabs(x);
+                    if(a<=limitThreshold)return x;
+                    const float headroom=1.0f-limitThreshold;
+                    const float y=limitThreshold+headroom*std::tanh(
+                        (a-limitThreshold)/(headroom>0.0001f?headroom:0.0001f));
+                    return x<0.0f?-y:y;
+                };
+                outL=soft(outL);outR=soft(outR);
+                highPass.ProcessStereoSample(outL,outR);
+                left[i]=outL;right[i]=outR;
+                position=(position+1u)%delayFrames;
+            }
+            highPass.FinishBlock();
+        }
     };
     void Prepare(const SFSampleRegion& rg, PreparedRegion& p) {
         p={}; if(!sf2_validate_region(sf2_.get(),&rg)||rg.sampleIndex>=sf2_->sampleCount)return;
@@ -263,7 +383,9 @@ bool RingSink(const PackedMidiEvent& e,void* p){auto& c=*static_cast<ProducerCon
 
 int wmain(int argc,wchar_t** argv) {
     using namespace svms;
-    Options o;if(!ParseOptions(argc,argv,o)){Usage();return 2;}
+    const EngineConfig engineConfig=EngineConfig::Load();
+    Options o;ApplyConfigDefaults(engineConfig,o);if(!ParseOptions(argc,argv,o)){Usage();return 2;}
+    if(!o.quiet&&!engineConfig.configWarning.empty())fprintf(stderr,"config warning: %s\n",engineConfig.configWarning.c_str());
     std::string error;MappedMidiFile midi;if(!midi.Open(o.midi.c_str(),error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
     MidiStreamDecoder decoder;MidiStreamInfo info;if(!decoder.Scan(midi,o.sampleRate,info,error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
     if(o.scanOnly){fwprintf(stdout,L"SMF %u, %u tracks, %llu channel events, %llu note-ons, %llu frames (%s at %u Hz)\nPeak 1s: %llu events at %s, %llu note-ons at %s; peak frame: %llu events (%llu note-ons) at frame %llu\nExact-frame repetition: %llu exact duplicates total (peak %llu/frame), %llu channel/key duplicates total (peak %llu/frame), across %llu note-on frames\nWithin uninterrupted note-on runs: %llu exact duplicates (peak %llu/frame), %llu immediately adjacent\n",info.format,info.tracks,info.eventCount,info.noteOnCount,info.totalFrames,FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),o.sampleRate,info.peakEventsPerSecond,FormatTime(double(info.peakEventSecond)).c_str(),info.peakNoteOnsPerSecond,FormatTime(double(info.peakNoteOnSecond)).c_str(),info.peakEventsAtFrame,info.peakNoteOnsAtFrame,info.peakFrame,info.exactDuplicateNoteOnCount,info.peakExactDuplicateNoteOnsAtFrame,info.keyDuplicateNoteOnCount,info.peakKeyDuplicateNoteOnsAtFrame,info.noteOnFrameCount,info.noteRunExactDuplicateCount,info.peakNoteRunExactDuplicatesAtFrame,info.adjacentExactDuplicateNoteOnCount);return 0;}
@@ -274,7 +396,12 @@ int wmain(int argc,wchar_t** argv) {
     ProducerContext context{&ring,&midi,o.sampleRate,&cancel,&done,&decoded,&producerError};
     std::thread producer([&]{MidiStreamInfo ignored;decoder.Decode(midi,o.sampleRate,RingSink,&context,&cancel,&ignored,producerError);done.store(true,std::memory_order_release);});
     std::vector<float> left(o.blockFrames),right(o.blockFrames);uint64_t frame=0,events=0,renderNs=0,lastRenderNs=0;bool ioOk=true;auto start=std::chrono::steady_clock::now(),last=start;uint64_t lastFrame=0;
-    if(!o.quiet)fwprintf(stderr,L"SMF %u, %u tracks, %llu channel events (%llu note-ons) | %.2f min | %hs | ring %llu events\n",info.format,info.tracks,info.eventCount,info.noteOnCount,double(info.totalFrames)/o.sampleRate/60.0,synth->Backend(),ring.Capacity());
+    if(!o.quiet){
+        fwprintf(stderr,L"SMF %u, %u tracks, %llu channel events (%llu note-ons) | %.2f min | %hs | ring %llu events\n",info.format,info.tracks,info.eventCount,info.noteOnCount,double(info.totalFrames)/o.sampleRate/60.0,synth->Backend(),ring.Capacity());
+        fwprintf(stderr,L"Render config: %u Hz | voices %u | threads %u | master %.3f | limiter %ls",o.sampleRate,o.maxVoices,o.renderThreads,o.masterVolume,o.limiterEnabled?L"ON":L"OFF");
+        if(o.limiterEnabled)fwprintf(stderr,L" (threshold %.3f, lookahead %.2f ms, attack %.2f ms, release %.1f ms)",o.limiterThreshold,o.limiterLookaheadMs,o.limiterAttackMs,o.limiterReleaseMs);
+        fputws(L"\n",stderr);
+    }
     auto renderTo=[&](uint64_t target){while(frame<target&&ioOk){const uint32_t n=uint32_t((std::min<uint64_t>)(o.blockFrames,target-frame));const auto dspStart=std::chrono::steady_clock::now();synth->Render(left.data(),right.data(),n,frame);const auto dspEnd=std::chrono::steady_clock::now();renderNs+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(dspEnd-dspStart).count());ioOk=wave.Write(left.data(),right.data(),n);frame+=n;
         const auto now=std::chrono::steady_clock::now();if(!o.quiet&&now-last>=std::chrono::seconds(1)){const double audioDelta=double(frame-lastFrame)/o.sampleRate;const double recent=audioDelta/std::chrono::duration<double>(now-last).count();const double dspMsPerAudioSecond=audioDelta>0?double(renderNs-lastRenderNs)/1000000.0/audioDelta:0.0;const double eta=recent>0?double(info.totalFrames>frame?info.totalFrames-frame:0)/o.sampleRate/recent:INFINITY;fwprintf(stderr,L"\r%s / %s  %6.2f%% | voices %u free %u steals %u | events %llu/%llu | %.2fx | DSP %.1f ms/audio-s | ETA %s   ",FormatTime(double(frame)/o.sampleRate).c_str(),FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),info.totalFrames?100.0*frame/info.totalFrames:100.0,synth->Active(),synth->Free(),synth->Steals(),events,info.eventCount,recent,dspMsPerAudioSecond,FormatTime(eta).c_str());last=now;lastFrame=frame;lastRenderNs=renderNs;}}
     };
