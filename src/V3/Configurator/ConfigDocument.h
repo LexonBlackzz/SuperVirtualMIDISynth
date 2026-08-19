@@ -18,6 +18,7 @@ struct ConfigValues {
     uint32_t velocityIgnoreBelow = 0;
 
     bool limiterEnabled = true;
+    uint32_t limiterAlgorithm = 0; // 0 = Classic, 1 = Adaptive
     float limiterThreshold = 0.95f;
     float limiterLookaheadMs = 3.0f;
     float limiterAttackMs = 0.5f;
