@@ -33,6 +33,10 @@ void PushLiveMaxVoices(uint32_t value) {
     if (g_liveLink.app) g_liveLink.app->SetLiveMaxVoices(value);
 }
 
+void PushLiveLimiterAlgorithm(uint32_t value) {
+    if (g_liveLink.app) g_liveLink.app->SetLiveLimiterAlgorithm(value);
+}
+
 static float g_toastTimer = 0.0f;
 static char g_toastText[512] = {};
 static bool g_toastActive = false;
@@ -615,6 +619,7 @@ bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,
     if (e.correctnessMode != (working.correctnessMode ? 1u : 0u)) return false;
     if (e.reverbEnabled != (working.enableReverb ? 1u : 0u)) return false;
     if (e.limiterEnabled != (working.limiterEnabled ? 1u : 0u)) return false;
+    if (e.limiterAlgorithm != working.limiterAlgorithm) return false;
     if (e.maxVoices != 0u && e.maxVoices != working.maxVoices) return false;
     if (!closeEnough(e.masterVolume, working.masterVolume)) return false;
     if (!closeEnough(e.reverbMix, working.reverbMix)) return false;
