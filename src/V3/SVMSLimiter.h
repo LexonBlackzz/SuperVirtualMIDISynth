@@ -10,29 +10,193 @@
 
 namespace svms {
 
-// Low-latency lookahead limiter used by both the live driver and the
-// standalone renderer.
-//
-// The old limiter delayed the audio, but its detector was a conventional
-// attack/release envelope. A one-sample transient could therefore disappear
-// before the detector ever reached its true peak, leaving the final tanh
-// stage to do most of the real peak control.
-//
-// This limiter treats lookahead as an actual prediction window:
-//   1. Detect the undelayed stereo sample peak immediately.
-//   2. Convert that peak to the gain required to meet the threshold.
-//   3. Hold the strongest requirement in a monotonic sliding window for the
-//      configured lookahead duration.
-//   4. Ramp the gain toward that requirement while the matching audio is
-//      still travelling through the delay line.
-//   5. Recover with a light program-dependent release: isolated transients
-//      recover faster, sustained dense material recovers more slowly.
-//
-// The user-facing controls remain the existing Enabled / Threshold /
-// Lookahead / Attack / Release controls. No extra latency beyond Lookahead is
-// introduced. A final linked safety gain catches the tiny numerical or live-
-// parameter overshoot that can remain after the predictive stage; unlike the
-// old tanh stage it is not intended to be part of the normal sound.
+// The v0.6.5 limiter, kept intact as the A/B reference implementation.
+// It intentionally preserves the original envelope + lookahead-delay + tanh
+// behavior so "Classic" really means the limiter users were hearing before
+// the predictive implementation was introduced.
+struct ClassicLimiterState {
+    static constexpr uint32_t kMaxDelayFrames = 8192u;
+
+    alignas(64) float delayBuffer[kMaxDelayFrames * 2u]{};
+    uint32_t delayWritePos = 0u;
+    uint32_t delayFrames = 128u;
+    uint32_t delayFramesTarget = 128u;
+    float threshold = 0.95f;
+    float thresholdTarget = 0.95f;
+    float envelope = 0.0f;
+    float attackCoeff = 0.25f;
+    float releaseCoeff = 0.001f;
+    bool enabled = true;
+
+    float inputPeakL = 0.0f;
+    float inputPeakR = 0.0f;
+    float outputPeakL = 0.0f;
+    float outputPeakR = 0.0f;
+    float gainReductionDb = 0.0f;
+
+    void Reset() noexcept {
+        std::memset(delayBuffer, 0, sizeof(delayBuffer));
+        delayWritePos = 0u;
+        envelope = 0.0f;
+        delayFrames = ClampDelay(delayFramesTarget);
+        threshold = ClampThreshold(thresholdTarget);
+        ResetMeters();
+    }
+
+    void Configure(uint32_t sampleRate, const EngineConfig& cfg) noexcept {
+        enabled = cfg.limiterEnabled;
+        thresholdTarget = ClampThreshold(cfg.limiterThreshold);
+        threshold = thresholdTarget;
+        delayFramesTarget = ClampDelay(static_cast<uint32_t>(
+            (std::max)(0.0f, cfg.limiterLookaheadMs) *
+            static_cast<float>((std::max)(1u, sampleRate)) * 0.001f + 0.5f));
+        delayFrames = delayFramesTarget;
+        attackCoeff = TimeToCoeff(cfg.limiterAttackMs, sampleRate, 0.01f);
+        releaseCoeff = TimeToCoeff(cfg.limiterReleaseMs, sampleRate, 1.0f);
+        Reset();
+    }
+
+    void Process(float* interleaved, uint32_t numFrames, uint32_t channels,
+                 PostHighPass3Hz& highPass) noexcept {
+        ResetMeters();
+        if (!interleaved || numFrames == 0u || channels == 0u) return;
+
+        for (uint32_t f = 0u; f < numFrames; ++f) {
+            const uint32_t offset = f * channels;
+            const float inL = interleaved[offset];
+            const float inR = channels > 1u ? interleaved[offset + 1u] : inL;
+            float outL = 0.0f;
+            float outR = 0.0f;
+            ProcessStereoFrame(inL, inR, outL, outR, highPass);
+            interleaved[offset] = outL;
+            if (channels > 1u) interleaved[offset + 1u] = outR;
+        }
+        highPass.FinishBlock();
+    }
+
+    void ProcessPlanar(float* left, float* right, uint32_t numFrames,
+                       PostHighPass3Hz& highPass) noexcept {
+        ResetMeters();
+        if (!left || !right || numFrames == 0u) return;
+        for (uint32_t f = 0u; f < numFrames; ++f) {
+            const float inL = left[f];
+            const float inR = right[f];
+            float outL = 0.0f;
+            float outR = 0.0f;
+            ProcessStereoFrame(inL, inR, outL, outR, highPass);
+            left[f] = outL;
+            right[f] = outR;
+        }
+        highPass.FinishBlock();
+    }
+
+private:
+    static float ClampThreshold(float value) noexcept {
+        return (std::max)(0.1f, (std::min)(1.0f, value));
+    }
+
+    static uint32_t ClampDelay(uint32_t frames) noexcept {
+        // Classic historically always had at least one frame of delay even
+        // when the UI requested 0 ms.
+        return (std::max)(1u, (std::min)(kMaxDelayFrames, frames));
+    }
+
+    static float TimeToCoeff(float milliseconds, uint32_t sampleRate,
+                             float minimumMs) noexcept {
+        milliseconds = (std::max)(minimumMs, milliseconds);
+        const float samples = (std::max)(1.0f,
+            milliseconds * static_cast<float>((std::max)(1u, sampleRate)) * 0.001f);
+        return 1.0f - std::exp(-1.0f / samples);
+    }
+
+    static uint32_t GlideU32(uint32_t current, uint32_t target) noexcept {
+        if (current < target) return current + 1u;
+        if (current > target) return current - 1u;
+        return current;
+    }
+
+    static float GlideF32(float current, float target, float step) noexcept {
+        if (current < target) return (std::min)(target, current + step);
+        if (current > target) return (std::max)(target, current - step);
+        return current;
+    }
+
+    void ResetMeters() noexcept {
+        inputPeakL = inputPeakR = outputPeakL = outputPeakR = 0.0f;
+        gainReductionDb = 0.0f;
+    }
+
+    void ProcessStereoFrame(float inL, float inR, float& outL, float& outR,
+                            PostHighPass3Hz& highPass) noexcept {
+        if (delayFrames != delayFramesTarget)
+            delayFrames = ClampDelay(GlideU32(delayFrames, delayFramesTarget));
+        if (threshold != thresholdTarget)
+            threshold = ClampThreshold(GlideF32(threshold, thresholdTarget, 0.0005f));
+
+        const float absL = std::fabs(inL);
+        const float absR = std::fabs(inR);
+        const float peak = (std::max)(absL, absR);
+        inputPeakL = (std::max)(inputPeakL, absL);
+        inputPeakR = (std::max)(inputPeakR, absR);
+
+        const uint32_t writeOffset = delayWritePos * 2u;
+
+        if (!enabled) {
+            // Original live path bypassed lookahead entirely while still
+            // keeping the delay ring warm for a later re-enable.
+            delayBuffer[writeOffset] = inL;
+            delayBuffer[writeOffset + 1u] = inR;
+            delayWritePos = (delayWritePos + 1u) % delayFrames;
+            outL = inL;
+            outR = inR;
+            highPass.ProcessStereoSample(outL, outR);
+            outputPeakL = (std::max)(outputPeakL, std::fabs(outL));
+            outputPeakR = (std::max)(outputPeakR, std::fabs(outR));
+            return;
+        }
+
+        if (peak > envelope)
+            envelope += attackCoeff * (peak - envelope);
+        else
+            envelope += releaseCoeff * (peak - envelope);
+
+        float gain = 1.0f;
+        if (envelope > threshold) {
+            gain = threshold / envelope;
+            gainReductionDb = (std::max)(gainReductionDb,
+                -20.0f * std::log10((std::max)(gain, 1.0e-12f)));
+        }
+
+        outL = delayBuffer[writeOffset] * gain;
+        outR = delayBuffer[writeOffset + 1u] * gain;
+        delayBuffer[writeOffset] = inL;
+        delayBuffer[writeOffset + 1u] = inR;
+
+        const float limitThreshold = threshold;
+        const auto softLimit = [limitThreshold](float x) noexcept {
+            const float ax = std::fabs(x);
+            if (ax <= limitThreshold) return x;
+            const float headroom = 1.0f - limitThreshold;
+            const float compressed = limitThreshold + headroom *
+                std::tanh((ax - limitThreshold) /
+                    (headroom > 0.0001f ? headroom : 0.0001f));
+            return x < 0.0f ? -compressed : compressed;
+        };
+        outL = softLimit(outL);
+        outR = softLimit(outR);
+
+        // Preserve the old meter ordering: Classic measured the post-limiter
+        // sample before the 3 Hz DC blocker.
+        outputPeakL = (std::max)(outputPeakL, std::fabs(outL));
+        outputPeakR = (std::max)(outputPeakR, std::fabs(outR));
+        highPass.ProcessStereoSample(outL, outR);
+        delayWritePos = (delayWritePos + 1u) % delayFrames;
+    }
+};
+
+// Low-latency predictive limiter used by both the live driver and standalone
+// renderer. It uses the configured lookahead as an actual future constraint
+// window rather than merely delaying the audio behind a smoothed detector.
 struct AdaptiveLimiterState {
     static constexpr uint32_t kMaxDelayFrames = 8192u;
 
@@ -45,9 +209,6 @@ struct AdaptiveLimiterState {
     static_assert(kDelayCapacity > kMaxDelayFrames,
                   "limiter delay storage must exceed maximum lookahead");
 
-    // The monotonic detector deque can contain delayFrames + 1 entries. Use a
-    // power-of-two ring larger than the maximum lookahead so all wrapping is
-    // cheap and there is always a spare queue slot.
     static constexpr uint32_t kDetectorCapacity = 16384u;
     static constexpr uint32_t kDetectorMask = kDetectorCapacity - 1u;
 
@@ -61,19 +222,12 @@ struct AdaptiveLimiterState {
 
     float threshold = 0.95f;
     float thresholdTarget = 0.95f;
-
-    // Kept public because RuntimeLink already publishes these coefficients
-    // directly. They represent the user's requested attack/release time.
     float attackCoeff = 0.25f;
     float releaseCoeff = 0.001f;
     bool enabled = true;
 
-    // Legacy/public state name retained for diagnostic/source compatibility.
-    // It now mirrors the instantaneous undelayed peak detector rather than a
-    // smoothed peak envelope.
     float envelope = 0.0f;
 
-    // Per-block meters. gainReductionDb is a positive reduction magnitude.
     float inputPeakL = 0.0f;
     float inputPeakR = 0.0f;
     float outputPeakL = 0.0f;
@@ -112,9 +266,6 @@ struct AdaptiveLimiterState {
         releaseCoeff = TimeToCoeff(cfg.limiterReleaseMs, configuredSampleRate_,
                                    1.0f);
 
-        // Program analysis is intentionally much shorter than the user
-        // release. It classifies "single transient" versus "continuous wall"
-        // without becoming another audible compressor envelope.
         averagePeakCoeff_ = TimeToCoeff(20.0f, configuredSampleRate_, 1.0f);
         densityCoeff_ = TimeToCoeff(25.0f, configuredSampleRate_, 1.0f);
         peakMemoryDecay_ = std::exp(-1.0f /
@@ -211,8 +362,6 @@ private:
         inputPeakL = (std::max)(inputPeakL, absL);
         inputPeakR = (std::max)(inputPeakR, absR);
 
-        // Keep delay storage warm even in bypass mode so enabling the limiter
-        // never reads uninitialized/stale memory.
         const uint32_t writeOffset = delayWritePos * 2u;
         delayBuffer[writeOffset] = inL;
         delayBuffer[writeOffset + 1u] = inR;
@@ -240,9 +389,6 @@ private:
         UpdateProgramAnalysis(peak, rawRequiredGain);
 
         if (!enabled) {
-            // True bypass: no lookahead latency and no gain processing.
-            // The detector/delay histories still run so re-enable does not
-            // start from entirely stale memory.
             currentGain_ = 1.0f;
             outL = inL;
             outR = inR;
@@ -259,16 +405,9 @@ private:
             (std::max)(ClampCoeff(attackCoeff), deadlineAttackCoeff_);
 
         if (predictiveTarget < currentGain_) {
-            // The offending sample is still in the future relative to the
-            // delayed output. The deadline coefficient guarantees that even a
-            // user Attack slower than the lookahead cannot miss a one-sample
-            // transient.
             currentGain_ += effectiveAttack *
                 (predictiveTarget - currentGain_);
         } else {
-            // Program-dependent recovery. Sparse/high-crest events get out of
-            // the way quickly; sustained limiting lengthens release so dense
-            // material does not chatter around every individual peak.
             const float adaptiveRelease = ComputeAdaptiveReleaseCoeff();
             currentGain_ += adaptiveRelease *
                 (predictiveTarget - currentGain_);
@@ -281,14 +420,8 @@ private:
         outL = delayBuffer[readOffset] * currentGain_;
         outR = delayBuffer[readOffset + 1u] * currentGain_;
 
-        // DC blocking remains after gain detection, exactly as in the old
-        // signal path.
         highPass.ProcessStereoSample(outL, outR);
 
-        // Linked last-resort sample-peak guard. The predictive stage should do
-        // virtually all normal work; this catches parameter glides,
-        // startup/history holes and floating-point residue without making a
-        // tanh waveshaper part of the limiter's normal sound.
         float safetyGain = 1.0f;
         const float postPeak = (std::max)(std::fabs(outL), std::fabs(outR));
         if (postPeak > threshold && postPeak > 0.0f) {
@@ -309,8 +442,6 @@ private:
     float PushDetectorTarget(float target) noexcept {
         target = (std::max)(0.0f, (std::min)(1.0f, target));
 
-        // Maintain monotonically increasing gain requirements. The front is
-        // always the strongest (smallest) gain target in the live window.
         while (detectorHead_ != detectorTail_) {
             const uint32_t back = (detectorTail_ - 1u) & kDetectorMask;
             if (detectorGain[back] < target) break;
@@ -320,8 +451,6 @@ private:
         detectorIndex[detectorTail_] = sampleCounter_;
         detectorTail_ = (detectorTail_ + 1u) & kDetectorMask;
 
-        // An input sample detected at n is heard at n + delayFrames. Keep its
-        // constraint alive through that exact output sample (age <= delay).
         while (detectorHead_ != detectorTail_) {
             const uint64_t index = detectorIndex[detectorHead_];
             if (sampleCounter_ - index <= delayFrames) break;
@@ -342,9 +471,6 @@ private:
             return;
         }
 
-        // Reach 99.9% of a newly required reduction by the time its sample
-        // exits the lookahead delay. This is an attack *floor*; a faster user
-        // Attack setting still wins.
         constexpr float kResidual = 0.001f;
         deadlineAttackCoeff_ = 1.0f - std::exp(
             std::log(kResidual) / static_cast<float>(delayFrames));
@@ -354,9 +480,6 @@ private:
     void UpdateProgramAnalysis(float peak, float rawRequiredGain) noexcept {
         averagePeak_ += averagePeakCoeff_ * (peak - averagePeak_);
         peakMemory_ = (std::max)(peak, peakMemory_ * peakMemoryDecay_);
-
-        // Reduction demand rather than a boolean gives a dense +12 dB wall
-        // more weight than a barely-over-threshold waveform.
         const float demand = 1.0f - rawRequiredGain;
         limitingDensity_ += densityCoeff_ * (demand - limitingDensity_);
     }
@@ -372,15 +495,9 @@ private:
         const float transient = (std::max)(0.0f,
             (std::min)(1.0f, (crest - 1.5f) / 4.5f));
 
-        // ~0.42x user release at the sparse/high-crest extreme;
-        // ~2.5x for continuously limited dense material.
         float timeScale = 0.65f + 1.85f * density;
         timeScale *= 1.0f - 0.35f * transient;
         timeScale = (std::max)(0.35f, (std::min)(3.0f, timeScale));
-
-        // For limiter release coefficients (normally << 1), scaling the
-        // one-pole coefficient inversely is a close approximation to scaling
-        // its time constant and avoids exp()/pow() in the per-sample path.
         return (std::min)(1.0f, base / timeScale);
     }
 
@@ -401,6 +518,215 @@ private:
 
     uint32_t cachedDeadlineFrames_ = UINT32_MAX;
     float deadlineAttackCoeff_ = 1.0f;
+};
+
+// Keeps both algorithms hot and crossfades between them on a live selector
+// change. No allocation occurs on the audio thread. The destination limiter
+// has already seen the same input history when the switch begins, so A/B is
+// immediate without flushing either lookahead buffer.
+struct LimiterRouterState {
+    static constexpr uint32_t kMaxDelayFrames = AdaptiveLimiterState::kMaxDelayFrames;
+    static constexpr uint32_t kScratchFrames = 8192u;
+
+    bool enabled = true;
+    uint32_t algorithmTarget = static_cast<uint32_t>(LimiterAlgorithm::Classic);
+    float thresholdTarget = 0.95f;
+    uint32_t delayFramesTarget = 128u;
+    float attackCoeff = 0.25f;
+    float releaseCoeff = 0.001f;
+
+    // Public compatibility fields used by current diagnostics / RuntimeLink.
+    float inputPeakL = 0.0f;
+    float inputPeakR = 0.0f;
+    float outputPeakL = 0.0f;
+    float outputPeakR = 0.0f;
+    float gainReductionDb = 0.0f;
+
+    void Configure(uint32_t sampleRate, const EngineConfig& cfg) noexcept {
+        configuredSampleRate_ = (std::max)(1u, sampleRate);
+        enabled = cfg.limiterEnabled;
+        algorithmTarget = static_cast<uint32_t>(cfg.limiterAlgorithm);
+        if (algorithmTarget > 1u) algorithmTarget = 0u;
+        thresholdTarget = (std::max)(0.1f, (std::min)(1.0f, cfg.limiterThreshold));
+        delayFramesTarget = (std::min)(kMaxDelayFrames,
+            static_cast<uint32_t>((std::max)(0.0f, cfg.limiterLookaheadMs) *
+                static_cast<float>(configuredSampleRate_) * 0.001f + 0.5f));
+        attackCoeff = TimeToCoeff(cfg.limiterAttackMs, configuredSampleRate_, 0.01f);
+        releaseCoeff = TimeToCoeff(cfg.limiterReleaseMs, configuredSampleRate_, 1.0f);
+
+        classicHighPass_.Initialize(configuredSampleRate_);
+        adaptiveHighPass_.Initialize(configuredSampleRate_);
+        classic.Configure(configuredSampleRate_, cfg);
+        adaptive.Configure(configuredSampleRate_, cfg);
+
+        blend_ = algorithmTarget == static_cast<uint32_t>(LimiterAlgorithm::Adaptive)
+            ? 1.0f : 0.0f;
+        blendStep_ = 1.0f / (std::max)(1.0f,
+            static_cast<float>(configuredSampleRate_) * 0.005f); // ~5 ms
+        ResetMeters();
+    }
+
+    void Reset() noexcept {
+        classic.Reset();
+        adaptive.Reset();
+        classicHighPass_.Reset();
+        adaptiveHighPass_.Reset();
+        blend_ = algorithmTarget == static_cast<uint32_t>(LimiterAlgorithm::Adaptive)
+            ? 1.0f : 0.0f;
+        ResetMeters();
+    }
+
+    void Process(float* interleaved, uint32_t numFrames, uint32_t channels,
+                 PostHighPass3Hz& legacyHighPass) noexcept {
+        (void)legacyHighPass;
+        ResetMeters();
+        if (!interleaved || numFrames == 0u || channels == 0u) return;
+
+        SyncChildren();
+
+        uint32_t base = 0u;
+        while (base < numFrames) {
+            const uint32_t count = (std::min)(kScratchFrames, numFrames - base);
+            for (uint32_t f = 0u; f < count; ++f) {
+                const uint32_t sourceOffset = (base + f) * channels;
+                scratch_[f * 2u] = interleaved[sourceOffset];
+                scratch_[f * 2u + 1u] = channels > 1u
+                    ? interleaved[sourceOffset + 1u]
+                    : interleaved[sourceOffset];
+            }
+
+            // Classic gets the host buffer; Adaptive gets the copy. Both see
+            // identical undelayed input and therefore stay warm continuously.
+            classic.Process(interleaved + base * channels, count, channels,
+                            classicHighPass_);
+            adaptive.Process(scratch_, count, 2u, adaptiveHighPass_);
+
+            AccumulateReduction();
+            for (uint32_t f = 0u; f < count; ++f) {
+                StepBlend();
+                const uint32_t outputOffset = (base + f) * channels;
+                const float classicL = interleaved[outputOffset];
+                const float classicR = channels > 1u
+                    ? interleaved[outputOffset + 1u] : classicL;
+                const float adaptiveL = scratch_[f * 2u];
+                const float adaptiveR = scratch_[f * 2u + 1u];
+                const float inverse = 1.0f - blend_;
+                const float outL = classicL * inverse + adaptiveL * blend_;
+                const float outR = classicR * inverse + adaptiveR * blend_;
+                interleaved[outputOffset] = outL;
+                if (channels > 1u) interleaved[outputOffset + 1u] = outR;
+                outputPeakL = (std::max)(outputPeakL, std::fabs(outL));
+                outputPeakR = (std::max)(outputPeakR, std::fabs(outR));
+            }
+            inputPeakL = (std::max)(inputPeakL,
+                (std::max)(classic.inputPeakL, adaptive.inputPeakL));
+            inputPeakR = (std::max)(inputPeakR,
+                (std::max)(classic.inputPeakR, adaptive.inputPeakR));
+            base += count;
+        }
+    }
+
+    void ProcessPlanar(float* left, float* right, uint32_t numFrames,
+                       PostHighPass3Hz& legacyHighPass) noexcept {
+        (void)legacyHighPass;
+        ResetMeters();
+        if (!left || !right || numFrames == 0u) return;
+
+        SyncChildren();
+
+        uint32_t base = 0u;
+        while (base < numFrames) {
+            const uint32_t count = (std::min)(kScratchFrames, numFrames - base);
+            float* scratchL = scratch_;
+            float* scratchR = scratch_ + kScratchFrames;
+            std::memcpy(scratchL, left + base,
+                        static_cast<size_t>(count) * sizeof(float));
+            std::memcpy(scratchR, right + base,
+                        static_cast<size_t>(count) * sizeof(float));
+
+            classic.ProcessPlanar(left + base, right + base, count,
+                                  classicHighPass_);
+            adaptive.ProcessPlanar(scratchL, scratchR, count,
+                                   adaptiveHighPass_);
+
+            AccumulateReduction();
+            for (uint32_t f = 0u; f < count; ++f) {
+                StepBlend();
+                const float inverse = 1.0f - blend_;
+                const float outL = left[base + f] * inverse + scratchL[f] * blend_;
+                const float outR = right[base + f] * inverse + scratchR[f] * blend_;
+                left[base + f] = outL;
+                right[base + f] = outR;
+                outputPeakL = (std::max)(outputPeakL, std::fabs(outL));
+                outputPeakR = (std::max)(outputPeakR, std::fabs(outR));
+            }
+            inputPeakL = (std::max)(inputPeakL,
+                (std::max)(classic.inputPeakL, adaptive.inputPeakL));
+            inputPeakR = (std::max)(inputPeakR,
+                (std::max)(classic.inputPeakR, adaptive.inputPeakR));
+            base += count;
+        }
+    }
+
+    ClassicLimiterState classic;
+    AdaptiveLimiterState adaptive;
+
+private:
+    static float TimeToCoeff(float milliseconds, uint32_t sampleRate,
+                             float minimumMs) noexcept {
+        milliseconds = (std::max)(minimumMs, milliseconds);
+        const float samples = (std::max)(1.0f,
+            milliseconds * static_cast<float>(sampleRate) * 0.001f);
+        return 1.0f - std::exp(-1.0f / samples);
+    }
+
+    void ResetMeters() noexcept {
+        inputPeakL = inputPeakR = outputPeakL = outputPeakR = 0.0f;
+        gainReductionDb = 0.0f;
+    }
+
+    void SyncChildren() noexcept {
+        if (algorithmTarget > 1u) algorithmTarget = 0u;
+
+        classic.enabled = enabled;
+        adaptive.enabled = enabled;
+        classic.thresholdTarget = thresholdTarget;
+        adaptive.thresholdTarget = thresholdTarget;
+        classic.delayFramesTarget = (std::max)(1u,
+            (std::min)(ClassicLimiterState::kMaxDelayFrames, delayFramesTarget));
+        adaptive.delayFramesTarget = (std::min)(AdaptiveLimiterState::kMaxDelayFrames,
+                                                 delayFramesTarget);
+        classic.attackCoeff = attackCoeff;
+        adaptive.attackCoeff = attackCoeff;
+        classic.releaseCoeff = releaseCoeff;
+        adaptive.releaseCoeff = releaseCoeff;
+    }
+
+    void StepBlend() noexcept {
+        const float target = algorithmTarget ==
+            static_cast<uint32_t>(LimiterAlgorithm::Adaptive) ? 1.0f : 0.0f;
+        if (blend_ < target) blend_ = (std::min)(target, blend_ + blendStep_);
+        else if (blend_ > target) blend_ = (std::max)(target, blend_ - blendStep_);
+    }
+
+    void AccumulateReduction() noexcept {
+        // While crossfading, report the stronger child so the GR meter never
+        // misleadingly drops to zero during an A/B transition.
+        if (blend_ > 0.001f && blend_ < 0.999f)
+            gainReductionDb = (std::max)(gainReductionDb,
+                (std::max)(classic.gainReductionDb, adaptive.gainReductionDb));
+        else if (blend_ >= 0.999f)
+            gainReductionDb = (std::max)(gainReductionDb, adaptive.gainReductionDb);
+        else
+            gainReductionDb = (std::max)(gainReductionDb, classic.gainReductionDb);
+    }
+
+    uint32_t configuredSampleRate_ = 44100u;
+    float blend_ = 0.0f;
+    float blendStep_ = 1.0f / 220.5f;
+    alignas(64) float scratch_[kScratchFrames * 2u]{};
+    PostHighPass3Hz classicHighPass_{};
+    PostHighPass3Hz adaptiveHighPass_{};
 };
 
 } // namespace svms
