@@ -1,0 +1,169 @@
+name: Apply V3 limiter router integration
+
+on:
+  push:
+    branches: [v3]
+    paths:
+      - .github/workflows/apply-v3-limiter-router.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v3
+          fetch-depth: 0
+
+      - name: Apply exact source patches
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          # -----------------------------------------------------------------
+          # Live driver: replace the in-file classic limiter with the shared
+          # router, carry the algorithm through RuntimeLink and apply it at the
+          # audio-thread mailbox boundary.
+          # -----------------------------------------------------------------
+          path = Path("src/V3/SVMSDriver.cpp")
+          text = path.read_text(encoding="utf-8")
+
+          text = replace_once(
+              text,
+              '#include "SVMSPostFilter.h"\n#include "SVMSRuntimeLink.h"',
+              '#include "SVMSPostFilter.h"\n#include "SVMSLimiter.h"\n#include "SVMSRuntimeLink.h"',
+              "driver include")
+
+          start = text.find("struct LimiterState {")
+          marker = "// Allocation-free rolling callback histogram."
+          end = text.find(marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit("driver limiter block markers not found")
+          if text.find("struct LimiterState {", start + 1) >= 0:
+              raise SystemExit("driver contains more than one LimiterState block")
+          text = text[:start] + "using LimiterState = LimiterRouterState;\n\n" + text[end:]
+
+          text = replace_once(
+              text,
+              "    l.limiterEnabled = mb.limiterEnabled ? 1u : 0u;\n    l.limiterThreshold = mb.limiterThreshold;",
+              "    l.limiterEnabled = mb.limiterEnabled ? 1u : 0u;\n    l.limiterAlgorithm = mb.limiterAlgorithm;\n    l.limiterThreshold = mb.limiterThreshold;",
+              "driver live echo algorithm")
+
+          text = replace_once(
+              text,
+              "        if (l.correctnessMode > 1u || l.reverbEnabled > 1u ||\n            l.limiterEnabled > 1u) {\n            strncpy_s(resultText, kText, \"boolean flags must be 0 or 1\",\n                      _TRUNCATE);\n            return svms::RLResult::InvalidArgument;\n        }",
+              "        if (l.correctnessMode > 1u || l.reverbEnabled > 1u ||\n            l.limiterEnabled > 1u) {\n            strncpy_s(resultText, kText, \"boolean flags must be 0 or 1\",\n                      _TRUNCATE);\n            return svms::RLResult::InvalidArgument;\n        }\n        if (l.limiterAlgorithm > 1u) {\n            strncpy_s(resultText, kText,\n                      \"limiter algorithm must be 0 or 1\", _TRUNCATE);\n            return svms::RLResult::InvalidArgument;\n        }",
+              "driver algorithm validation")
+
+          text = replace_once(
+              text,
+              "        if (cmd.groupMask & svms::RLGroupLimiter) {\n            mb->limiterEnabled = l.limiterEnabled != 0u;\n            mb->limiterThreshold",
+              "        if (cmd.groupMask & svms::RLGroupLimiter) {\n            mb->limiterEnabled = l.limiterEnabled != 0u;\n            mb->limiterAlgorithm = l.limiterAlgorithm;\n            mb->limiterThreshold",
+              "driver limiter mailbox algorithm")
+
+          text = replace_once(
+              text,
+              "            mb->limiterDelayFrames = (std::max)(1u,\n                (std::min)(svms::LimiterState::kMaxDelayFrames, frames));",
+              "            mb->limiterDelayFrames =\n                (std::min)(svms::LimiterState::kMaxDelayFrames, frames);",
+              "driver zero-ms lookahead")
+
+          text = replace_once(
+              text,
+              "        self->limiter.enabled           = mb.limiterEnabled;\n        self->limiter.thresholdTarget",
+              "        self->limiter.enabled           = mb.limiterEnabled;\n        self->limiter.algorithmTarget   = mb.limiterAlgorithm;\n        self->limiter.thresholdTarget",
+              "driver audio apply algorithm")
+
+          path.write_text(text, encoding="utf-8")
+
+          # -----------------------------------------------------------------
+          # Limiter page: compact real product names only. The silly dev name
+          # stays out of the UI.
+          # -----------------------------------------------------------------
+          path = Path("src/V3/Configurator/PageLimiter.cpp")
+          text = path.read_text(encoding="utf-8")
+          old = '''    ImGui::Spacing();\n\n    {\n        const float start = ImGui::GetCursorPosX();\n        ImGui::SetCursorPosX(start + (avail - mainKnob) * 0.5f);\n        float threshold = w.limiterThreshold;'''
+          new = '''    ImGui::Spacing();\n\n    {\n        static const char* algorithms[] = {\n            "Classic",\n            "Adaptive (Experimental)"\n        };\n        int algorithm = static_cast<int>((std::min)(1u, w.limiterAlgorithm));\n        const float comboWidth = (std::min)(260.0f, (std::max)(150.0f, avail - 92.0f));\n        ImGui::SetNextItemWidth(comboWidth);\n        if (ImGui::Combo("##limiter_algorithm", &algorithm, algorithms, 2)) {\n            w.limiterAlgorithm = static_cast<uint32_t>(algorithm);\n            doc.MarkDirty();\n            PushLiveLimiterAlgorithm(w.limiterAlgorithm);\n        }\n        if (ImGui::IsItemHovered()) {\n            ImGui::BeginTooltip();\n            ImGui::TextUnformatted(w.limiterAlgorithm == 0u\n                ? "Original SVMS limiter used by v0.6.5 and earlier."\n                : "Predictive lookahead limiter with program-dependent release.");\n            ImGui::EndTooltip();\n        }\n        ImGui::SameLine();\n        ImGui::TextDisabled("ALGORITHM");\n    }\n\n    ImGui::Spacing();\n\n    {\n        const float start = ImGui::GetCursorPosX();\n        ImGui::SetCursorPosX(start + (avail - mainKnob) * 0.5f);\n        float threshold = w.limiterThreshold;'''
+          text = replace_once(text, old, new, "limiter page selector")
+          path.write_text(text, encoding="utf-8")
+
+          # -----------------------------------------------------------------
+          # Standalone renderer: inherit the persisted algorithm and route
+          # through the same shared limiter router as the live driver.
+          # -----------------------------------------------------------------
+          path = Path("src/V3/SVMSOfflineRenderer.cpp")
+          text = path.read_text(encoding="utf-8")
+
+          text = replace_once(
+              text,
+              "    bool limiterEnabled = true;\n    float limiterThreshold = 0.95f;",
+              "    bool limiterEnabled = true;\n    LimiterAlgorithm limiterAlgorithm = LimiterAlgorithm::Classic;\n    float limiterThreshold = 0.95f;",
+              "offline options algorithm")
+
+          text = replace_once(
+              text,
+              "    o.limiterEnabled = cfg.limiterEnabled;\n    o.limiterThreshold = cfg.limiterThreshold;",
+              "    o.limiterEnabled = cfg.limiterEnabled;\n    o.limiterAlgorithm = cfg.limiterAlgorithm;\n    o.limiterThreshold = cfg.limiterThreshold;",
+              "offline config algorithm")
+
+          text = replace_once(
+              text,
+              '''bool ParseOnOff(const wchar_t* s, bool& out) {\n    if (!s) return false;\n    const std::wstring value = s;\n    if (value == L"on" || value == L"true" || value == L"1") {\n        out = true;\n        return true;\n    }\n    if (value == L"off" || value == L"false" || value == L"0") {\n        out = false;\n        return true;\n    }\n    return false;\n}\n''',
+              '''bool ParseOnOff(const wchar_t* s, bool& out) {\n    if (!s) return false;\n    const std::wstring value = s;\n    if (value == L"on" || value == L"true" || value == L"1") {\n        out = true;\n        return true;\n    }\n    if (value == L"off" || value == L"false" || value == L"0") {\n        out = false;\n        return true;\n    }\n    return false;\n}\n\nbool ParseLimiterAlgorithm(const wchar_t* s, LimiterAlgorithm& out) {\n    if (!s) return false;\n    const std::wstring value = s;\n    if (value == L"classic") {\n        out = LimiterAlgorithm::Classic;\n        return true;\n    }\n    if (value == L"adaptive") {\n        out = LimiterAlgorithm::Adaptive;\n        return true;\n    }\n    return false;\n}\n''',
+              "offline parser algorithm")
+
+          text = replace_once(
+              text,
+              '           L"  --limiter on|off      Override V3 limiter enabled state\\n"\n           L"  --no-limiter          Alias for --limiter off\\n"',
+              '           L"  --limiter on|off      Override V3 limiter enabled state\\n"\n           L"  --limiter-algorithm classic|adaptive  Override limiter algorithm\\n"\n           L"  --no-limiter          Alias for --limiter off\\n"',
+              "offline usage algorithm")
+
+          text = replace_once(
+              text,
+              '''        } else if (arg == L"--limiter") {\n            const auto p=value(); if (!p || !ParseOnOff(p,o.limiterEnabled)) return false;\n        } else if (arg == L"--limiter-threshold") {''',
+              '''        } else if (arg == L"--limiter") {\n            const auto p=value(); if (!p || !ParseOnOff(p,o.limiterEnabled)) return false;\n        } else if (arg == L"--limiter-algorithm") {\n            const auto p=value(); if (!p || !ParseLimiterAlgorithm(p,o.limiterAlgorithm)) return false;\n        } else if (arg == L"--limiter-threshold") {''',
+              "offline cli algorithm")
+
+          text = replace_once(
+              text,
+              "        limiterConfig.limiterEnabled = o.limiterEnabled;\n        limiterConfig.limiterThreshold",
+              "        limiterConfig.limiterEnabled = o.limiterEnabled;\n        limiterConfig.limiterAlgorithm = o.limiterAlgorithm;\n        limiterConfig.limiterThreshold",
+              "offline limiter configure algorithm")
+
+          text = replace_once(
+              text,
+              "PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};",
+              "PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};",
+              "offline router already selected") if "PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};" in text else text
+          if "AdaptiveLimiterState limiter_{};" in text:
+              text = text.replace("AdaptiveLimiterState limiter_{};", "LimiterRouterState limiter_{};", 1)
+          elif "LimiterRouterState limiter_{};" not in text:
+              raise SystemExit("offline limiter member not found")
+
+          text = replace_once(
+              text,
+              '        fwprintf(stderr,L"Render config: %u Hz | voices %u | threads %u | master %.3f | limiter %ls",o.sampleRate,o.maxVoices,o.renderThreads,o.masterVolume,o.limiterEnabled?L"ON":L"OFF");',
+              '        fwprintf(stderr,L"Render config: %u Hz | voices %u | threads %u | master %.3f | limiter %ls [%ls]",o.sampleRate,o.maxVoices,o.renderThreads,o.masterVolume,o.limiterEnabled?L"ON":L"OFF",o.limiterAlgorithm==LimiterAlgorithm::Adaptive?L"Adaptive":L"Classic");',
+              "offline startup algorithm")
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Commit patched sources
+        shell: bash
+        run: |
+          git config user.name "LexonBlackzz"
+          git config user.email "98592761+LexonBlackzz@users.noreply.github.com"
+          git add src/V3/SVMSDriver.cpp src/V3/Configurator/PageLimiter.cpp src/V3/SVMSOfflineRenderer.cpp
+          git diff --cached --check
+          git commit -m "dsp(v3): wire live classic adaptive limiter switching"
+          git push origin HEAD:v3
