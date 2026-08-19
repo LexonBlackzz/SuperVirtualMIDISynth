@@ -1,0 +1,41 @@
+name: Apply V3 limiter zero-lookahead fix
+
+on:
+  push:
+    branches: [v3]
+    paths:
+      - .github/workflows/apply-v3-limiter-zero-lookahead.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v3
+          fetch-depth: 0
+      - name: Preserve real zero-ms adaptive lookahead
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/V3/SVMSConfig.h')
+          s = p.read_text(encoding='utf-8')
+          old = '''        limiterDelayFrames.store((std::min)(8192u,\n            (std::max)(1u, static_cast<uint32_t>(\n                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f))),\n            std::memory_order_relaxed);'''
+          new = '''        limiterDelayFrames.store((std::min)(8192u,\n            static_cast<uint32_t>(\n                cfg.limiterLookaheadMs * sampleRate * 0.001f + 0.5f)),\n            std::memory_order_relaxed);'''
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one mailbox lookahead initializer, found {s.count(old)}')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          PY
+      - name: Commit
+        shell: bash
+        run: |
+          git config user.name "LexonBlackzz"
+          git config user.email "98592761+LexonBlackzz@users.noreply.github.com"
+          git add src/V3/SVMSConfig.h
+          git diff --cached --check
+          git commit -m "fix(v3): preserve zero-ms adaptive lookahead"
+          git push origin HEAD:v3
