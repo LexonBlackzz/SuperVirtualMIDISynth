@@ -182,6 +182,7 @@ set(EXPORTS
         waveOutClose
         waveOutPrepareHeader
         waveOutUnprepareHeader
+        waveOutAddBuffer
         waveOutWrite
         waveOutReset
         waveOutRestart
@@ -229,6 +230,7 @@ set_target_properties(svmsynth PROPERTIES
 if(NOT SVMS_XP_COMPAT)
     add_executable(svms_v3_render
         SVMSOfflineRenderer.cpp
+        SVMSConfig.cpp
         SVMSMidiStream.cpp
         SVMSSoundFont.cpp
         SVMSRenderKernels.cpp
@@ -238,7 +240,10 @@ if(NOT SVMS_XP_COMPAT)
         SVMSRenderKernelsAVX2.cpp)
     target_compile_definitions(svms_v3_render PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_include_directories(svms_v3_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(svms_v3_render PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+    target_link_libraries(svms_v3_render PRIVATE shell32)
     set_target_properties(svms_v3_render PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
