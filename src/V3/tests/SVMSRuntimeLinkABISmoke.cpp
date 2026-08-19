@@ -47,12 +47,14 @@ void TestConstants() {
 }
 
 void TestPODLayout() {
-    // Each mapped struct must be trivially copyable & the right size.
     CHECK(svms::RLV2_FloatBits(1.0f) != 0, "FloatBits store must not be 0");
 
-    // Hand-computed sizes must hold (guards against padding drift).
     CHECK_EQ(sizeof(svms::RuntimeLiveStateV2), 92u,
-             "RuntimeLiveStateV2 must be 92 bytes (12 + 18*4 + 8)");
+             "RuntimeLiveStateV2 must remain 92 bytes");
+    CHECK_EQ(offsetof(svms::RuntimeLiveStateV2, maxVoices), 84u,
+             "RuntimeLiveStateV2.maxVoices must stay at byte 84");
+    CHECK_EQ(offsetof(svms::RuntimeLiveStateV2, limiterAlgorithm), 88u,
+             "limiter algorithm must reuse the former trailing reserved word");
     CHECK_EQ(sizeof(svms::RuntimeLinkHeaderV2), 64u,
              "RuntimeLinkHeaderV2 must be exactly one cache line");
     CHECK_EQ(sizeof(svms::RuntimeHostSlotV2), 64u,
@@ -95,6 +97,8 @@ void TestLiveDefaults() {
     CHECK(l.limiterLookaheadMs == 3.0f, "default limiterLookaheadMs must be 3.0f");
     CHECK(l.limiterAttackMs == 0.5f, "default limiterAttackMs must be 0.5f");
     CHECK(l.limiterReleaseMs == 100.0f, "default limiterReleaseMs must be 100.0f");
+    CHECK_EQ(l.maxVoices, 0u, "default maxVoices must be 0");
+    CHECK_EQ(l.limiterAlgorithm, 0u, "default limiter algorithm must be Classic");
 }
 
 void TestTelemetryLayout() {
@@ -102,7 +106,6 @@ void TestTelemetryLayout() {
              "RuntimeLinkTelemetryV2 must be a cache-line multiple");
     CHECK_EQ(sizeof(svms::RuntimeLinkTelemetryV2), 512u,
              "RuntimeLinkTelemetryV2 must be 512 bytes");
-    // Field offsets must be deterministic (no padding drift).
     CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, live), 144u,
              "telemetry.live must sit at byte 144");
     CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, soundFontName), 236u,
@@ -133,7 +136,6 @@ void TestCommandLayout() {
 
 void TestMappingOffsets() {
     svms::RuntimeLinkSharedMemoryV2 mem{};
-    // Committed offsets: header@0, telemetry@64, command@576.
     size_t offTele = reinterpret_cast<const char*>(&mem.telemetry)
                    - reinterpret_cast<const char*>(&mem);
     size_t offCmd  = reinterpret_cast<const char*>(&mem.command)
@@ -143,7 +145,6 @@ void TestMappingOffsets() {
     CHECK(offTele % 64 == 0 && offCmd % 64 == 0,
           "telemetry and command must be cache-line aligned in mapping");
 
-    // The same offsets must be derivable from the header protocol.
     svms::RuntimeLinkHeaderV2 h{};
     h.structSize = static_cast<uint32_t>(sizeof(svms::RuntimeLinkTelemetryV2));
     CHECK_EQ(svms::RLV2_TelemetryOffset(h), 64u, "RLV2_TelemetryOffset must be 64");
@@ -162,7 +163,6 @@ void TestHeaderCrc() {
     const uint32_t crc = svms::RLV2_HeaderCrc(h);
     CHECK(crc != 0, "header Crc must be non-zero");
 
-    // Mutating any stable identity field must change the crc.
     h.publisherPid = 12346;
     CHECK(svms::RLV2_HeaderCrc(h) != crc, "crc must change with publisherPid");
     h.publisherPid = 12345;
@@ -172,7 +172,6 @@ void TestHeaderCrc() {
 }
 
 void TestFloatBits() {
-    // Exact IEEE bit-pattern transports: identity and negative values.
     CHECK(svms::RLV2_BitsToFloat(svms::RLV2_FloatBits(1.25f)) == 1.25f,
           "float→bits→float round trip must match");
     CHECK(svms::RLV2_BitsToFloat(svms::RLV2_FloatBits(-7.5f)) == -7.5f,
@@ -208,6 +207,8 @@ void TestEnumCompleteness() {
         svms::RLCommandType::SetLimiterLookahead,
         svms::RLCommandType::SetLimiterAttack,
         svms::RLCommandType::SetLimiterRelease,
+        svms::RLCommandType::SetMaxVoices,
+        svms::RLCommandType::SetLimiterAlgorithm,
         svms::RLCommandType::Ping,
         svms::RLCommandType::ApplyLiveConfig,
         svms::RLCommandType::ReloadSoundFont,
@@ -227,6 +228,8 @@ void TestEnumCompleteness() {
     }
 
     CHECK_EQ(svms::RLCommandType::NoCommand, 0u, "NoCommand must be 0");
+    CHECK_EQ(svms::RLCommandType::SetLimiterAlgorithm, 0x17u,
+             "SetLimiterAlgorithm must be 0x17");
     CHECK_EQ(svms::RLCommandType::Ping, 0x20u, "Ping must be 0x20");
     CHECK_EQ(svms::RLCommandType::ApplyLiveConfig, 0x100u,
              "ApplyLiveConfig must be 0x100");
@@ -251,11 +254,15 @@ void TestGroups() {
              svms::RLGroupLimiter, "limiter release must map to limiter group");
     CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetLimiterThreshold),
              svms::RLGroupLimiter, "limiter threshold must map to limiter group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetLimiterAlgorithm),
+             svms::RLGroupLimiter, "limiter algorithm must map to limiter group");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetMaxVoices),
+             svms::RLGroupVoices, "max voices must map to voices group");
     CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::Ping), 0u,
              "wire commands must not map to a group");
     CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::ApplyLiveConfig), 0u,
              "ApplyLiveConfig must not map to a group");
-    CHECK_EQ(svms::RLGroupAll, 0xFu, "RLGroupAll must be the union of all groups");
+    CHECK_EQ(svms::RLGroupAll, 0x1Fu, "RLGroupAll must be the union of all groups");
 }
 
 void TestNamingConventions() {
@@ -308,8 +315,6 @@ void TestSnapshotProtocol() {
              svms::RLV2_SnapshotSettledParity,
              "fresh snapshot must start settled (even sequence)");
 
-    // Simulate an audio-thread publish: odd sequence, payload stores,
-    // then the settle word (even, monotonic +2 from the apex).
     const uint32_t startSeq = snap.sequence.load(std::memory_order_relaxed);
     snap.sequence.store(startSeq | 1u, std::memory_order_relaxed);
     snap.activeVoices.store(1234u, std::memory_order_relaxed);
@@ -319,7 +324,6 @@ void TestSnapshotProtocol() {
     snap.eventsSubmitted.store(9999u, std::memory_order_relaxed);
     snap.sequence.store(startSeq + 2u, std::memory_order_release);
 
-    // Settled copy must read every field.
     CHECK_EQ(snap.sequence.load(std::memory_order_acquire), startSeq + 2u,
              "settled sequence must advance by exactly 2");
     CHECK_EQ(snap.activeVoices.load(std::memory_order_relaxed), 1234u,
@@ -332,8 +336,6 @@ void TestSnapshotProtocol() {
     CHECK_EQ(snap.eventsSubmitted.load(std::memory_order_relaxed), 9999u,
              "settled u64 counter must read back");
 
-    // The sequence is strictly monotonic: a writer-in-progress (odd)
-    // sequence must be detectable and the word must never go backwards.
     const uint32_t even2 = snap.sequence.load(std::memory_order_relaxed);
     snap.sequence.store(even2 | 1u, std::memory_order_relaxed);
     CHECK_EQ(snap.sequence.load(std::memory_order_relaxed) & 1u, 1u,
