@@ -15,6 +15,14 @@
 #include <intrin.h>
 #endif
 
+#if defined(_MSC_VER)
+#define SVMS_VM_FORCEINLINE __forceinline
+#elif defined(__GNUC__)
+#define SVMS_VM_FORCEINLINE inline __attribute__((always_inline))
+#else
+#define SVMS_VM_FORCEINLINE inline
+#endif
+
 namespace svms {
 
 // Fully prepared hot-path state for one SF2 layer.  Applying this as one
@@ -443,7 +451,7 @@ private:
     void BuildStealTailMinHeap();
     void StealTailHeapSiftDown(uint32_t position);
     void BuildStealHeap();
-    void RefreshStealWinnerPath(VoiceHandle handle);
+    SVMS_VM_FORCEINLINE void RefreshStealWinnerPath(VoiceHandle handle);
     void RefreshStealWinnerPaths(const VoiceHandle* handles, uint32_t count);
     void RebuildStableWinnerTree();
     VoiceHandle PopStealCandidate(uint32_t& activePosition,
@@ -468,7 +476,7 @@ private:
                                  const VoiceConfiguration* setups,
                                  uint32_t count, VoiceHandle* outHandles,
                                  bool& candidatesReservedInPlace);
-    bool TryLaunchSingleVoiceInPlace(
+    SVMS_VM_FORCEINLINE bool TryLaunchSingleVoiceInPlace(
         uint8_t channel, uint8_t note, uint8_t velocity,
         const VoiceConfiguration& setup, uint32_t playIndex,
         const ChannelParamsSnapshot& channelParams,
@@ -479,8 +487,9 @@ private:
     void RetireStolenSibling(VoiceHandle handle,
                              VoiceHandle selectedVictim);
     float ComputeStableStealKey(VoiceHandle handle) const;
-    static uint64_t EncodeStableWinnerKey(float score,
-                                          uint32_t activePosition);
+    float ComputeNewbornStableStealKey(VoiceHandle handle) const;
+    static SVMS_VM_FORCEINLINE uint64_t EncodeStableWinnerKey(
+        float score, uint32_t activePosition);
     static float DecodeStableWinnerScore(uint64_t key);
     static bool HigherPriorityCandidate(const StealCandidate& a,
                                         const StealCandidate& b);
@@ -1868,7 +1877,7 @@ inline bool VoiceManager::HigherPriorityCandidate(const StealCandidate& a,
     return a.activePosition < b.activePosition;
 }
 
-inline uint64_t VoiceManager::EncodeStableWinnerKey(
+SVMS_VM_FORCEINLINE uint64_t VoiceManager::EncodeStableWinnerKey(
     float score, uint32_t activePosition) {
     if (score == 0.0f) score = 0.0f;
     uint32_t bits = 0u;
@@ -1888,7 +1897,8 @@ inline float VoiceManager::DecodeStableWinnerScore(uint64_t key) {
     return score;
 }
 
-inline void VoiceManager::RefreshStealWinnerPath(VoiceHandle handle) {
+SVMS_VM_FORCEINLINE void VoiceManager::RefreshStealWinnerPath(
+    VoiceHandle handle) {
     uint32_t node = stealTreeLeafBase_ + handle;
     uint64_t winner = stealWinnerTree_[node];
     while (node > 1u) {
@@ -2596,7 +2606,20 @@ inline bool VoiceManager::IsStableConfiguration(
         (preDecay || setup.decaySamples == 0u);
 }
 
-inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
+inline float VoiceManager::ComputeNewbornStableStealKey(
+    VoiceHandle handle) const {
+    const float left = v.mixGainL[handle];
+    const float right = v.mixGainR[handle];
+    const float outputGain = std::sqrt(left * left + right * right);
+    const float effectiveLevel =
+        std::fabs(v.targetGain[handle]) * outputGain;
+    const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
+    const float commonAgeScore =
+        static_cast<float>(currentFrame_) * (1.0f / 256.0f);
+    return score - commonAgeScore;
+}
+
+SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration& setup, uint32_t playIndex,
     const ChannelParamsSnapshot& cp, VoiceHandle& outHandle) {
@@ -2682,7 +2705,7 @@ inline bool VoiceManager::TryLaunchSingleVoiceInPlace(
     // The eligibility test guarantees that the replacement remains in the
     // stable tree. Refresh its cached key and its one root path exactly once.
     stealCandidateReserved_[handle] = 0u;
-    const float score = ComputeStableStealKey(handle);
+    const float score = ComputeNewbornStableStealKey(handle);
     stealStableKey_[handle] = EncodeStableWinnerKey(
         score, activePosition_[handle]);
     stealWinnerTree_[stealTreeLeafBase_ + handle] = stealStableKey_[handle];
@@ -3244,4 +3267,5 @@ inline uint32_t VoiceManager::NoteOffOldestPlayIndices(
 
 } // namespace svms
 
+#undef SVMS_VM_FORCEINLINE
 #endif
