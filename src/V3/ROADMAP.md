@@ -524,6 +524,14 @@ larger phase containing that item is complete.
 - [x] Add an optional one-to-64-thread voice renderer for modern multicore
   CPUs; keep exact-frame MIDI dispatch/lifecycle ownership on the audio thread
   and bypass workers for tiny spans where synchronization would cost more
+- [x] Replace round-robin span ownership with dynamically claimed logical
+  256-handle tiles, generation-counter wakes on modern Windows, fixed tile
+  reduction order, and the XP event-wait fallback
+- [x] Add the exact 128-frame dense planner with double-buffered mutation
+  plans: chunk N synthesis overlaps chunk N+1 event/allocation planning while
+  every event retains its original frame and ingress order. At 2,000 voices
+  and 943K note-ons/s, warmed AVX2 p99 is 15.29% with four threads and 16.51%
+  with eight, versus 32.97% serial; x64/x86/XP suites pass
 - [ ] Prefetch strategies for decimated voices
 - [ ] Ensure every accelerated path retains scalar fallback coverage
 

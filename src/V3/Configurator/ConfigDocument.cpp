@@ -88,7 +88,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.sampleRate = 44100;
     d.bufferFrames = 2048;
     d.maxVoices = 1000;
-    d.renderThreads = 1;
+    d.renderThreads = 0;
     d.masterVolume = 1.0f;
     d.velocityCurve = 1.0f;
     d.velocityFloor = 0.0f;

@@ -164,6 +164,94 @@ static void XPBootstrapTrace(const char*) {}
 
 namespace svms {
 
+static uint32_t SelectAutomaticRenderThreadCount() {
+#if defined(SVMS_XP_COMPAT)
+    return 1u;
+#else
+    // Prefer one renderer lane per physical core. On hybrid processors the
+    // CPU-set efficiency class lets us select only the fastest core class;
+    // older systems fall back to the physical-core topology, then to a
+    // conservative logical-processor count.
+    using GetCpuSetsProc = BOOL (WINAPI*)(
+        PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    GetCpuSetsProc getCpuSets = kernel32
+        ? reinterpret_cast<GetCpuSetsProc>(
+              GetProcAddress(kernel32, "GetSystemCpuSetInformation"))
+        : nullptr;
+    if (getCpuSets) {
+        ULONG bytes = 0u;
+        getCpuSets(nullptr, 0u, &bytes, nullptr, 0u);
+        unsigned char* storage = bytes != 0u
+            ? static_cast<unsigned char*>(std::malloc(bytes)) : nullptr;
+        if (storage && getCpuSets(
+                reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(storage), bytes,
+                &bytes, nullptr, 0u)) {
+            BYTE fastestClass = 0u;
+            for (ULONG offset = 0u; offset < bytes;) {
+                const auto* info = reinterpret_cast<
+                    const SYSTEM_CPU_SET_INFORMATION*>(storage + offset);
+                if (info->Size == 0u || offset + info->Size > bytes) break;
+                if (info->Type == CpuSetInformation)
+                    fastestClass = (std::max)(
+                        fastestClass, info->CpuSet.EfficiencyClass);
+                offset += info->Size;
+            }
+            uint16_t cores[64]{};
+            uint32_t coreCount = 0u;
+            for (ULONG offset = 0u; offset < bytes && coreCount < 16u;) {
+                const auto* info = reinterpret_cast<
+                    const SYSTEM_CPU_SET_INFORMATION*>(storage + offset);
+                if (info->Size == 0u || offset + info->Size > bytes) break;
+                if (info->Type == CpuSetInformation &&
+                    info->CpuSet.EfficiencyClass == fastestClass) {
+                    const uint16_t key = static_cast<uint16_t>(
+                        (static_cast<uint16_t>(info->CpuSet.Group) << 8u) |
+                        info->CpuSet.CoreIndex);
+                    bool found = false;
+                    for (uint32_t index = 0u; index < coreCount; ++index)
+                        found |= cores[index] == key;
+                    if (!found) cores[coreCount++] = key;
+                }
+                offset += info->Size;
+            }
+            std::free(storage);
+            if (coreCount != 0u) return coreCount;
+        } else {
+            std::free(storage);
+        }
+    }
+
+    DWORD bytes = 0u;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    auto* topology = bytes != 0u
+        ? static_cast<unsigned char*>(std::malloc(bytes)) : nullptr;
+    if (topology && GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+                topology), &bytes)) {
+        uint32_t cores = 0u;
+        for (DWORD offset = 0u; offset < bytes;) {
+            const auto* info = reinterpret_cast<
+                const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+                    topology + offset);
+            if (info->Size == 0u || offset + info->Size > bytes) break;
+            if (info->Relationship == RelationProcessorCore) ++cores;
+            offset += info->Size;
+        }
+        std::free(topology);
+        if (cores != 0u) return (std::min)(16u, cores);
+    } else {
+        std::free(topology);
+    }
+
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    return (std::max)(1u, (std::min)(8u,
+        static_cast<uint32_t>(systemInfo.dwNumberOfProcessors)));
+#endif
+}
+
 static bool UsesXPWaveOut(const AudioOutput* output) {
 #if defined(SVMS_XP_COMPAT)
     return output && output->IsWaveOutFallback();
@@ -2656,12 +2744,8 @@ bool Driver::Initialize() {
         return false;
     }
     uint32_t renderThreads = cfg.renderThreads;
-    if (renderThreads == 0u) {
-        SYSTEM_INFO systemInfo{};
-        GetSystemInfo(&systemInfo);
-        renderThreads = (std::max)(1u, (std::min)(8u,
-            static_cast<uint32_t>(systemInfo.dwNumberOfProcessors)));
-    }
+    if (renderThreads == 0u)
+        renderThreads = SelectAutomaticRenderThreadCount();
     if (!renderScalar->ConfigureRenderThreads(renderThreads, bufferCapacity)) {
         LOG("Configuration warning: could not start %u render threads; "
             "using the audio thread only", renderThreads);
@@ -3839,6 +3923,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                                   UsesXPWaveOut(self->audioOutput),
                                   render->GetRenderBackend(),
                                   render->GetRenderThreadCount(),
+                                  render->GetMulticoreEffectiveness(),
                                   s_schedulerSmoothed, s_dispatchSmoothed,
                                   s_synthesisSmoothed, s_postSmoothed,
                                   evCount, scheduledAfterDispatch,

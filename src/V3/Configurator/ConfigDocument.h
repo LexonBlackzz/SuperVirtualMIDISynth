@@ -11,7 +11,7 @@ struct ConfigValues {
     uint32_t sampleRate = 44100;
     uint32_t bufferFrames = 2048;
     uint32_t maxVoices = 1024;
-    uint32_t renderThreads = 1;
+    uint32_t renderThreads = 0;
     float masterVolume = 1.0f;
     float velocityCurve = 1.0f;
     float velocityFloor = 0.0f;

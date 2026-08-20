@@ -2124,8 +2124,13 @@ void TestJsonConfigurationLifecycle() {
               "created JSON carries schema version");
         Check(text.find("\"correctness_mode\": true") != std::string::npos,
               "created JSON enables scalar correctness mode");
+#if defined(SVMS_XP_COMPAT)
         Check(text.find("\"render_threads\": 1") != std::string::npos,
-              "created JSON records the single-thread compatibility default");
+              "created XP JSON records the single-thread compatibility default");
+#else
+        Check(text.find("\"render_threads\": 0") != std::string::npos,
+              "created modern JSON enables topology-aware rendering");
+#endif
         Check(text.find("\"device\": \"default\"") != std::string::npos,
               "created JSON immediately records the default audio output");
         Check(text.find("Alpha Piano.SF2") != std::string::npos,
@@ -2869,6 +2874,160 @@ void TestParallelSustainedRenderDifferential() {
     }
 }
 
+struct DensePlannerDispatchContext {
+    svms::VoiceManager* voices = nullptr;
+    const svms::ChannelCache* channels = nullptr;
+    uint32_t playIndex = 10000u;
+};
+
+void DensePlannerDispatch(const svms::RenderEvent* events,
+                          uint32_t eventCount, uint32_t,
+                          void* userData) {
+    auto& context = *static_cast<DensePlannerDispatchContext*>(userData);
+    for (uint32_t index = 0u; index < eventCount; ++index) {
+        const svms::RenderEvent& event = events[index];
+        if (event.type != svms::RenderEventType::NoteOn) continue;
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 4096u;
+        setup.loopStart = 64u;
+        setup.loopEnd = 4032u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep =
+            0.625f + static_cast<float>(event.data1 & 31u) * 0.03125f;
+        setup.initialGain = setup.sustainLevel = 1.0f;
+        setup.releaseDecay = 0.999f;
+        setup.gainLeft = setup.gainRight = 0.001f;
+        setup.sampleBacked = 1u;
+        setup.playIndex = context.playIndex++;
+        svms::VoiceHandle handle = svms::kInvalidVoice;
+        context.voices->LaunchVoiceGroup(
+            event.channel, event.data1, event.data2, &setup, 1u,
+            setup.playIndex,
+            context.channels->GetParams()[event.channel], &handle);
+    }
+}
+
+void TestDensePlannerOracleDifferential() {
+    constexpr uint32_t voiceCount = 512u;
+    constexpr uint32_t frames = 256u;
+    std::vector<float> samples(4096u);
+    for (uint32_t index = 0u; index < samples.size(); ++index)
+        samples[index] = 0.35f * std::sin(static_cast<float>(index) * 0.071f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.interpolation = svms::InterpolationMode::Linear;
+    cfg.correctnessMode = true;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+
+    auto makeVoices = [&]() {
+        auto result = std::make_unique<svms::VoiceManager>();
+        Check(result->Initialize(voiceCount, 44100u),
+              "dense planner differential allocates voice storage");
+        for (uint32_t index = 0u; index < voiceCount; ++index) {
+            const svms::VoiceHandle voice = result->AllocateVoice(
+                static_cast<uint8_t>(index & 15u),
+                static_cast<uint8_t>(24u + index % 88u), 127u);
+            result->SetVoiceSample(voice, 0u, 4096u, 64u, 4032u, 1u,
+                0.625f + static_cast<float>(index & 31u) * 0.03125f, 1u);
+            result->SetVoiceEnvelope(voice, 1.0f, 1.0f, 0u, 0u, 0u, 0u,
+                                     0.0f, 1.0f, 0.999f);
+            result->SetVoiceGain(voice, 0.001f, 0.001f);
+            result->SetVoicePlayIndex(voice, index + 1u);
+            result->RefreshMixGain(voice,
+                channels.GetParams()[index & 15u]);
+        }
+        return result;
+    };
+
+    std::vector<svms::RenderEvent> events(frames);
+    for (uint32_t frame = 0u; frame < frames; ++frame) {
+        events[frame].type = svms::RenderEventType::NoteOn;
+        events[frame].channel = static_cast<uint8_t>(frame & 15u);
+        events[frame].data1 = static_cast<uint8_t>(24u + frame % 88u);
+        events[frame].data2 = 127u;
+        events[frame].frameOffset = frame;
+        events[frame].ingressSequence = frame;
+    }
+
+    auto oracleVoices = makeVoices();
+    auto plannedVoices = makeVoices();
+    svms::RenderScalar oracle;
+    svms::RenderScalar planned;
+    Check(oracle.ReserveVoiceCapacity(voiceCount) &&
+              planned.ReserveVoiceCapacity(voiceCount) &&
+              oracle.ConfigureRenderThreads(1u, frames) &&
+              planned.ConfigureRenderThreads(4u, frames),
+          "dense planner differential starts serial and parallel renderers");
+    DensePlannerDispatchContext oracleContext{oracleVoices.get(), &channels};
+    DensePlannerDispatchContext plannedContext{plannedVoices.get(), &channels};
+    oracle.SetEventBatchDispatcher(DensePlannerDispatch, &oracleContext);
+    planned.SetEventBatchDispatcher(DensePlannerDispatch, &plannedContext);
+    std::vector<float> oracleLeft(frames, 0.0f), oracleRight(frames, 0.0f);
+    std::vector<float> plannedLeft(frames, 0.0f), plannedRight(frames, 0.0f);
+    oracle.RenderBlock(*oracleVoices, channels, samples.data(),
+        static_cast<uint32_t>(samples.size()), oracleLeft.data(),
+        oracleRight.data(), frames, cfg, events.data(), frames, true, 5000u);
+    g_realtimeAllocationCount.store(0u, std::memory_order_relaxed);
+    g_trackRealtimeAllocations = true;
+    planned.RenderBlock(*plannedVoices, channels, samples.data(),
+        static_cast<uint32_t>(samples.size()), plannedLeft.data(),
+        plannedRight.data(), frames, cfg, events.data(), frames, true, 5000u);
+    g_trackRealtimeAllocations = false;
+    Check(g_realtimeAllocationCount.load(std::memory_order_relaxed) == 0u,
+          "dense planner performs no coordinator-side callback allocation");
+
+    float maximumDifference = 0.0f;
+    for (uint32_t frame = 0u; frame < frames; ++frame) {
+        maximumDifference = (std::max)(maximumDifference,
+            std::fabs(oracleLeft[frame] - plannedLeft[frame]));
+        maximumDifference = (std::max)(maximumDifference,
+            std::fabs(oracleRight[frame] - plannedRight[frame]));
+    }
+    Check(maximumDifference <= 5.0e-5f,
+          "dense planner preserves oracle waveform tolerance at every frame");
+    Check(oracleVoices->stealCount_ == plannedVoices->stealCount_ &&
+              oracleVoices->GetActiveCount() == plannedVoices->GetActiveCount(),
+          "dense planner preserves exact stealing and active voice counts");
+    bool equivalent = true;
+    for (uint32_t handle = 0u; handle < voiceCount && equivalent; ++handle) {
+        equivalent = oracleVoices->v.state[handle] ==
+                plannedVoices->v.state[handle] &&
+            oracleVoices->v.playIndex[handle] ==
+                plannedVoices->v.playIndex[handle] &&
+            oracleVoices->v.channel[handle] ==
+                plannedVoices->v.channel[handle] &&
+            oracleVoices->v.note[handle] == plannedVoices->v.note[handle] &&
+            std::fabs(oracleVoices->v.phases[handle] -
+                      plannedVoices->v.phases[handle]) <= 1.0e-4f;
+    }
+    Check(equivalent,
+          "dense planner preserves exact voice identities and phase state");
+
+    for (uint32_t threadCount : {2u, 8u}) {
+        auto repeatVoices = makeVoices();
+        svms::RenderScalar repeat;
+        Check(repeat.ReserveVoiceCapacity(voiceCount) &&
+                  repeat.ConfigureRenderThreads(threadCount, frames),
+              "dense planner starts each deterministic worker count");
+        DensePlannerDispatchContext repeatContext{repeatVoices.get(),
+                                                   &channels};
+        repeat.SetEventBatchDispatcher(DensePlannerDispatch, &repeatContext);
+        std::vector<float> repeatLeft(frames, 0.0f);
+        std::vector<float> repeatRight(frames, 0.0f);
+        repeat.RenderBlock(*repeatVoices, channels, samples.data(),
+            static_cast<uint32_t>(samples.size()), repeatLeft.data(),
+            repeatRight.data(), frames, cfg, events.data(), frames, true,
+            5000u);
+        Check(repeatLeft == plannedLeft && repeatRight == plannedRight,
+              "dense planner output is deterministic across worker counts");
+    }
+}
+
 void TestCallbackSourcePurity() {
     const std::filesystem::path sourcePath =
         std::filesystem::path(__FILE__).parent_path().parent_path() / "SVMSDriver.cpp";
@@ -2926,6 +3085,7 @@ int main() {
     TestRenderBackendSelectionAndDenseEquivalence();
     TestTransientClassKernelDifferential();
     TestParallelSustainedRenderDifferential();
+    TestDensePlannerOracleDifferential();
     TestRenderCallbackPurity();
     TestCallbackSourcePurity();
 

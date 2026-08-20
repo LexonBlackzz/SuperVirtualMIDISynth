@@ -53,7 +53,11 @@ struct RenderWorkerPool::Impl {
     alignas(64) std::atomic<uint32_t> workGeneration{0u};
     alignas(64) std::atomic<uint32_t> nextJob{0u};
     alignas(64) std::atomic<uint32_t> completedWorkers{0u};
+    alignas(64) std::atomic<uint64_t> helperJobs{0u};
+    alignas(64) std::atomic<uint64_t> coordinatorJobs{0u};
     RenderSpanContext context{};
+    IndexedRenderJob indexedCallback = nullptr;
+    void* indexedUserData = nullptr;
     uint32_t totalThreads = 1u;
     uint32_t helperCount = 0u;
     uint32_t dispatchThreads = 1u;
@@ -61,8 +65,10 @@ struct RenderWorkerPool::Impl {
     uint32_t mixStride = 0u;
     uint32_t jobCapacity = 0u;
     uint32_t jobCount = 0u;
+    uint32_t activeHelpers = 0u;
     size_t jobMixStride = 0u;
     bool queueValid = true;
+    bool indexedInFlight = false;
 
     static DWORD WINAPI ThreadEntry(void* parameter) noexcept {
         Worker* worker = static_cast<Worker*>(parameter);
@@ -100,7 +106,8 @@ struct RenderWorkerPool::Impl {
             observedGeneration =
                 self->workGeneration.load(std::memory_order_acquire);
             if (worker->lane >= self->dispatchThreads) continue;
-            self->ProcessJobs();
+            const uint32_t claimed = self->ProcessJobs();
+            self->helperJobs.fetch_add(claimed, std::memory_order_relaxed);
             self->completedWorkers.fetch_add(1u, std::memory_order_release);
 #if !defined(SVMS_XP_COMPAT)
             if (self->wakeByAddressAll)
@@ -123,11 +130,13 @@ struct RenderWorkerPool::Impl {
         return JobLeft(job) + mixStride;
     }
 
-    void ProcessJobs() noexcept {
+    uint32_t ProcessJobs() noexcept {
+        uint32_t claimed = 0u;
         for (;;) {
             const uint32_t index =
                 nextJob.fetch_add(1u, std::memory_order_relaxed);
             if (index >= jobCount) break;
+            ++claimed;
             float* left = JobLeft(index);
             float* right = JobRight(index);
             std::memset(left, 0,
@@ -142,9 +151,15 @@ struct RenderWorkerPool::Impl {
             // not retire or change render class during the span.
             local.classChangeHandles = nullptr;
             local.classChangeCount = nullptr;
-            const RenderJob& job = jobs[index];
-            job.kernel(local, job.handles, job.handleCount);
+            if (indexedCallback) {
+                indexedCallback(index, left, right, context.frameCount,
+                                indexedUserData);
+            } else {
+                const RenderJob& job = jobs[index];
+                job.kernel(local, job.handles, job.handleCount);
+            }
         }
+        return claimed;
     }
 
     void ResetStorage() noexcept {
@@ -186,7 +201,9 @@ struct RenderWorkerPool::Impl {
         mixStride = 0u;
         jobCapacity = 0u;
         jobCount = 0u;
+        activeHelpers = 0u;
         jobMixStride = 0u;
+        indexedInFlight = false;
     }
 };
 
@@ -252,6 +269,17 @@ bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
         if (worker.wakeEvent && worker.readyEvent) {
             worker.thread = CreateThread(nullptr, 0u, Impl::ThreadEntry,
                                          &worker, 0u, nullptr);
+#if !defined(SVMS_XP_COMPAT)
+            if (worker.thread) {
+                SYSTEM_INFO systemInfo{};
+                GetSystemInfo(&systemInfo);
+                if (systemInfo.dwNumberOfProcessors != 0u) {
+                    SetThreadIdealProcessor(
+                        worker.thread,
+                        (index + 1u) % systemInfo.dwNumberOfProcessors);
+                }
+            }
+#endif
         }
         if (!worker.wakeEvent || !worker.readyEvent || !worker.thread) {
             impl->stopping.store(true, std::memory_order_release);
@@ -280,6 +308,19 @@ uint32_t RenderWorkerPool::GetThreadCount() const noexcept {
     return impl_ ? impl_->totalThreads : 1u;
 }
 
+float RenderWorkerPool::GetHelperJobPercent() const noexcept {
+    if (!impl_) return 0.0f;
+    const uint64_t helper =
+        impl_->helperJobs.load(std::memory_order_relaxed);
+    const uint64_t coordinator =
+        impl_->coordinatorJobs.load(std::memory_order_relaxed);
+    const uint64_t total = helper + coordinator;
+    return total != 0u
+        ? static_cast<float>(static_cast<double>(helper) * 100.0 /
+                             static_cast<double>(total))
+        : 0.0f;
+}
+
 size_t RenderWorkerPool::GetAllocatedBytes() const noexcept {
     if (!impl_) return 0u;
     return sizeof(Impl) +
@@ -300,6 +341,8 @@ bool RenderWorkerPool::ShouldParallelize(uint32_t voiceCount,
 void RenderWorkerPool::BeginSpan(const RenderSpanContext& context) noexcept {
     if (!impl_) return;
     impl_->context = context;
+    impl_->indexedCallback = nullptr;
+    impl_->indexedUserData = nullptr;
     impl_->jobCount = 0u;
     impl_->queueValid = context.frameCount <= impl_->maxFrames;
 }
@@ -341,7 +384,9 @@ bool RenderWorkerPool::Execute() noexcept {
             SetEvent(impl->workers[index].wakeEvent);
     }
 
-    impl->ProcessJobs();
+    const uint32_t coordinatorClaimed = impl->ProcessJobs();
+    impl->coordinatorJobs.fetch_add(coordinatorClaimed,
+                                    std::memory_order_relaxed);
     if (activeHelpers != 0u) {
 #if !defined(SVMS_XP_COMPAT)
         if (impl->waitOnAddress) {
@@ -372,6 +417,98 @@ bool RenderWorkerPool::Execute() noexcept {
             destinationRight[frame] += right[frame];
         }
     }
+    return true;
+}
+
+bool RenderWorkerPool::ExecuteIndexed(uint32_t jobCount, uint32_t frameCount,
+                                      float* outputLeft, float* outputRight,
+                                      IndexedRenderJob callback,
+                                      void* userData) noexcept {
+    if (!BeginIndexed(jobCount, frameCount, outputLeft, outputRight,
+                      callback, userData)) {
+        return false;
+    }
+    return FinishIndexed();
+}
+
+bool RenderWorkerPool::BeginIndexed(uint32_t jobCount, uint32_t frameCount,
+                                    float* outputLeft, float* outputRight,
+                                    IndexedRenderJob callback,
+                                    void* userData) noexcept {
+    Impl* impl = impl_;
+    if (!impl || !callback || !outputLeft || !outputRight || jobCount < 2u ||
+        jobCount > impl->jobCapacity || frameCount == 0u ||
+        frameCount > impl->maxFrames || impl->indexedInFlight) {
+        return false;
+    }
+    impl->context = {};
+    impl->context.outputLeft = outputLeft;
+    impl->context.outputRight = outputRight;
+    impl->context.frameCount = frameCount;
+    impl->indexedCallback = callback;
+    impl->indexedUserData = userData;
+    impl->jobCount = jobCount;
+    impl->queueValid = true;
+    impl->dispatchThreads = (std::min)(impl->totalThreads, jobCount);
+    impl->activeHelpers = impl->dispatchThreads - 1u;
+    ResetEvent(impl->doneEvent);
+    impl->nextJob.store(0u, std::memory_order_relaxed);
+    impl->completedWorkers.store(0u, std::memory_order_relaxed);
+    impl->pendingWorkers.store(impl->activeHelpers,
+                               std::memory_order_release);
+    impl->indexedInFlight = true;
+    impl->workGeneration.fetch_add(1u, std::memory_order_release);
+#if !defined(SVMS_XP_COMPAT)
+    if (impl->wakeByAddressAll) {
+        impl->wakeByAddressAll(&impl->workGeneration);
+    } else
+#endif
+    {
+        for (uint32_t index = 0u; index < impl->activeHelpers; ++index)
+            SetEvent(impl->workers[index].wakeEvent);
+    }
+    return true;
+}
+
+bool RenderWorkerPool::FinishIndexed() noexcept {
+    Impl* impl = impl_;
+    if (!impl || !impl->indexedInFlight) return false;
+
+    // Once planning is complete, the coordinator joins the same atomic job
+    // queue instead of waiting idle for helpers to drain it.
+    const uint32_t coordinatorClaimed = impl->ProcessJobs();
+    impl->coordinatorJobs.fetch_add(coordinatorClaimed,
+                                    std::memory_order_relaxed);
+    if (impl->activeHelpers != 0u) {
+#if !defined(SVMS_XP_COMPAT)
+        if (impl->waitOnAddress) {
+            for (;;) {
+                uint32_t completed =
+                    impl->completedWorkers.load(std::memory_order_acquire);
+                if (completed >= impl->activeHelpers) break;
+                impl->waitOnAddress(&impl->completedWorkers, &completed,
+                                    sizeof(completed), INFINITE);
+            }
+        } else
+#endif
+        {
+            WaitForSingleObject(impl->doneEvent, INFINITE);
+        }
+    }
+
+    const uint32_t frames = impl->context.frameCount;
+    for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+        const float* left = impl->JobLeft(job);
+        const float* right = impl->JobRight(job);
+        for (uint32_t frame = 0u; frame < frames; ++frame) {
+            impl->context.outputLeft[frame] += left[frame];
+            impl->context.outputRight[frame] += right[frame];
+        }
+    }
+    impl->indexedCallback = nullptr;
+    impl->indexedUserData = nullptr;
+    impl->indexedInFlight = false;
+    impl->activeHelpers = 0u;
     return true;
 }
 

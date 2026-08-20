@@ -8,6 +8,10 @@
 
 namespace svms {
 
+using IndexedRenderJob = void(*)(uint32_t jobIndex, float* outputLeft,
+                                 float* outputRight, uint32_t frameCount,
+                                 void* userData);
+
 // Persistent, allocation-free-at-render-time voice mixing workers. MIDI
 // dispatch and every lifecycle mutation remain on the audio thread; workers
 // only render disjoint handle ranges into private buffers.
@@ -23,6 +27,7 @@ public:
     void Shutdown() noexcept;
 
     uint32_t GetThreadCount() const noexcept;
+    float GetHelperJobPercent() const noexcept;
     size_t GetAllocatedBytes() const noexcept;
     bool ShouldParallelize(uint32_t voiceCount, uint32_t frameCount) const noexcept;
 
@@ -32,6 +37,16 @@ public:
     // Returns false without invoking a kernel when the queued work is too
     // small or could not be represented. The caller can then render serially.
     bool Execute() noexcept;
+
+    // Execute fixed logical jobs with dynamic worker claiming. Each job gets
+    // a deterministic private mix buffer; reduction is always job-index order.
+    bool ExecuteIndexed(uint32_t jobCount, uint32_t frameCount,
+                        float* outputLeft, float* outputRight,
+                        IndexedRenderJob callback, void* userData) noexcept;
+    bool BeginIndexed(uint32_t jobCount, uint32_t frameCount,
+                      float* outputLeft, float* outputRight,
+                      IndexedRenderJob callback, void* userData) noexcept;
+    bool FinishIndexed() noexcept;
 
 private:
     struct Impl;

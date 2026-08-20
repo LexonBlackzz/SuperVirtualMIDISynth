@@ -556,6 +556,43 @@ struct alignas(64) VoiceSoA {
         return sizeof(*this) + storageBytes_;
     }
 
+    static void CopyVoice(VoiceSoA& destination, uint32_t destinationHandle,
+                          const VoiceSoA& source,
+                          uint32_t sourceHandle) noexcept {
+#define SVMS_COPY_ONE_DYNAMIC_FIELD(type, name) \
+        destination.name[destinationHandle] = source.name[sourceHandle];
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_ONE_DYNAMIC_FIELD)
+#undef SVMS_COPY_ONE_DYNAMIC_FIELD
+    }
+
+    static void CopyRenderProgress(VoiceSoA& destination, uint32_t handle,
+                                   const VoiceSoA& source) noexcept {
+        destination.phases[handle] = source.phases[handle];
+        destination.currentGain[handle] = source.currentGain[handle];
+        destination.envelopeStage[handle] = source.envelopeStage[handle];
+        destination.delaySamplesRemaining[handle] =
+            source.delaySamplesRemaining[handle];
+        destination.holdSamplesRemaining[handle] =
+            source.holdSamplesRemaining[handle];
+        destination.attackSamplesRemaining[handle] =
+            source.attackSamplesRemaining[handle];
+        destination.decaySamplesRemaining[handle] =
+            source.decaySamplesRemaining[handle];
+        destination.releaseSamplesRemaining[handle] =
+            source.releaseSamplesRemaining[handle];
+        destination.stealFadeInFramesRemaining[handle] =
+            source.stealFadeInFramesRemaining[handle];
+        destination.stealFadeInFramesTotal[handle] =
+            source.stealFadeInFramesTotal[handle];
+    }
+
+    void CopyFixedTailsFrom(const VoiceSoA& source) noexcept {
+#define SVMS_COPY_ONE_FIXED_TAIL_FIELD(type, name, count) \
+        std::memcpy(name, source.name, sizeof(name));
+        SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(SVMS_COPY_ONE_FIXED_TAIL_FIELD)
+#undef SVMS_COPY_ONE_FIXED_TAIL_FIELD
+    }
+
 private:
     static size_t AlignUp(size_t value) noexcept {
         return (value + (kMixBufferAlign - 1u)) &

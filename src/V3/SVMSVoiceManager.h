@@ -69,6 +69,8 @@ struct VoiceConfiguration {
 // ════════════════════════════════════════════════════════════════════════
 class VoiceManager {
 public:
+    using PreTailCaptureHook = void(*)(VoiceHandle handle, void* userData);
+    using VoiceConfiguredHook = void(*)(VoiceHandle handle, void* userData);
     VoiceManager();
     VoiceManager(const VoiceManager& other);
     VoiceManager& operator=(const VoiceManager&) = delete;
@@ -190,6 +192,16 @@ public:
     uint32_t GetStealTailCount() const { return stealTailCount_; }
     const uint32_t* GetStealTailList() const { return stealTailList_; }
     void RefreshStealTail(VoiceHandle handle);
+    void SetPreTailCaptureHook(PreTailCaptureHook hook,
+                               void* userData) noexcept {
+        preTailCaptureHook_ = hook;
+        preTailCaptureUserData_ = userData;
+    }
+    void SetVoiceConfiguredHook(VoiceConfiguredHook hook,
+                                void* userData) noexcept {
+        voiceConfiguredHook_ = hook;
+        voiceConfiguredUserData_ = userData;
+    }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     VoiceHandle FindStealVictimExhaustiveForTest() const;
     uint64_t GetStealHeapBuildCountForTest() const {
@@ -499,6 +511,10 @@ private:
     // Effective control/envelope level protects audible voices; rendered age
     // is the only independent bias. Velocity is not a separate priority.
     float ComputeStealScore(uint32_t idx) const;
+    PreTailCaptureHook preTailCaptureHook_ = nullptr;
+    void* preTailCaptureUserData_ = nullptr;
+    VoiceConfiguredHook voiceConfiguredHook_ = nullptr;
+    void* voiceConfiguredUserData_ = nullptr;
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1792,6 +1808,8 @@ inline uint32_t VoiceManager::SelectStealTailSlot(float outgoingLevel) {
 
 inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
+    if (preTailCaptureHook_)
+        preTailCaptureHook_(handle, preTailCaptureUserData_);
     const float gain = v.currentGain[handle];
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
@@ -2499,6 +2517,8 @@ inline void VoiceManager::ConfigureVoice(
         CommitVoiceConfiguration(handle);
     else
         UpdateStealCandidate(handle);
+    if (voiceConfiguredHook_)
+        voiceConfiguredHook_(handle, voiceConfiguredUserData_);
 }
 
 inline void VoiceManager::ApplyVoiceConfigurationFields(
@@ -2724,6 +2744,8 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     }
 #endif
     outHandle = handle;
+    if (voiceConfiguredHook_)
+        voiceConfiguredHook_(handle, voiceConfiguredUserData_);
     return true;
 }
 

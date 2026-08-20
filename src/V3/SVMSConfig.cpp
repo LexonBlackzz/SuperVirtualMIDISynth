@@ -547,7 +547,11 @@ EngineConfig EngineConfig::Default() {
     cfg.sampleRate = kDefaultSampleRate;
     cfg.bufferFrames = kDefaultBufferFrames;
     cfg.maxVoices = kMaxVoicesDefault;
+#if defined(SVMS_XP_COMPAT)
     cfg.renderThreads = 1u;
+#else
+    cfg.renderThreads = 0u;
+#endif
     cfg.maxSampleCacheMB = 256;
     cfg.interpolation = InterpolationMode::Linear;
     cfg.filterType = FilterType::None;
