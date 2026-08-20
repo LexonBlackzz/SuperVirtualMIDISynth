@@ -525,10 +525,16 @@ void ConfiguratorApp::RenderFrame() {
     float pageH = static_cast<float>(windowHeight_) -
                   kHeaderHeight * dpiScale_ - footerH - 4.0f;
 
-    ImGui::BeginChild("##page", ImVec2(pageW, pageH), ImGuiChildFlags_None,
+    // The shell window deliberately has zero padding so the header/sidebar can
+    // meet the viewport edges. Give page content a small horizontal safe area,
+    // otherwise labels rendered at x=0 can lose their antialiased edge pixels.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f, 0.0f));
+    ImGui::BeginChild("##page", ImVec2(pageW, pageH),
+                      ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoBackground);
     DrawPageContent();
     ImGui::EndChild();
+    ImGui::PopStyleVar();
 
     float footerY = static_cast<float>(windowHeight_) - footerH;
     ImGui::SetCursorPos(ImVec2(sidebarWidth + 12.0f, footerY + 6.0f));
