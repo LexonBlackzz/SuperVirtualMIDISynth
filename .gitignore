@@ -59,6 +59,8 @@ config.ini
 *.dll.*
 *.dllold
 /AGENTS.md
+/.freebuff/
+/imgui.ini
 /analyze_pitch*.py
 /parse_sf2.py
 /bassmidi_unpacked_code.bin
