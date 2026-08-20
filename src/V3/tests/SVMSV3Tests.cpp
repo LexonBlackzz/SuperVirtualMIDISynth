@@ -2183,6 +2183,16 @@ void TestJsonConfigurationLifecycle() {
 
     {
         std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
+        output << R"json({"schema_version":1,"events":{"ring_capacity":4096,"max_events_per_block":65536}})json";
+    }
+    svms::EngineConfig independentEventStorage = svms::EngineConfig::Load();
+    Check(independentEventStorage.eventRingCapacity == 4096u &&
+              independentEventStorage.maxEventsPerBlock == 65536u &&
+              independentEventStorage.Validate(),
+          "queue capacity and callback event budget remain independent");
+
+    {
+        std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
         output << R"json({"schema_version":1,"synth":{"render_threads":8}})json";
     }
     svms::EngineConfig workerConfiguration = svms::EngineConfig::Load();

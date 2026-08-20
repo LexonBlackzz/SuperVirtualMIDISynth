@@ -2301,6 +2301,16 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
             as.limiterOutputPeakRBits.load(std::memory_order_relaxed));
         snap.limiterGainReductionDb = U32BitsToFloat(
             as.limiterGainReductionDbBits.load(std::memory_order_relaxed));
+        snap.schedulerPercent = U32BitsToFloat(
+            as.schedulerPercentBits.load(std::memory_order_relaxed));
+        snap.eventDispatchPercent = U32BitsToFloat(
+            as.eventDispatchPercentBits.load(std::memory_order_relaxed));
+        snap.rawIngressCount =
+            as.rawIngressCount.load(std::memory_order_relaxed);
+        snap.compiledPagedCount =
+            as.compiledPagedCount.load(std::memory_order_relaxed);
+        snap.scheduledBacklogCount =
+            as.scheduledBacklogCount.load(std::memory_order_relaxed);
 
         // Re-verify the settlement: a writer that started mid-copy means
         // this frame may be torn — reuse the last stable publish instead
@@ -2531,8 +2541,7 @@ bool Driver::Initialize() {
         } catch (...) {
             return false;
         }
-        const uint32_t actualBlockCapacity =
-            (std::min)(blockCapacity, ringCapacity);
+        const uint32_t actualBlockCapacity = blockCapacity;
         if (static_cast<size_t>(actualBlockCapacity) >
             (std::numeric_limits<size_t>::max)() / sizeof(svms::RenderEvent)) {
             return false;
@@ -3907,6 +3916,16 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         as.limiterGainReductionDbBits.store(
             FloatToU32Bits(self->limiter.gainReductionDb),
             std::memory_order_relaxed);
+        as.schedulerPercentBits.store(FloatToU32Bits(s_schedulerSmoothed),
+                                      std::memory_order_relaxed);
+        as.eventDispatchPercentBits.store(FloatToU32Bits(s_dispatchSmoothed),
+                                          std::memory_order_relaxed);
+        as.rawIngressCount.store(self->midiIngress_.TotalSize(),
+                                 std::memory_order_relaxed);
+        as.compiledPagedCount.store(self->compiledPages_.ReadyEventCount(),
+                                    std::memory_order_relaxed);
+        as.scheduledBacklogCount.store(scheduledAfterDispatch,
+                                       std::memory_order_relaxed);
         RLV2_MemBarrier();
         as.sequence.store(odd + 1u, std::memory_order_release);
     }

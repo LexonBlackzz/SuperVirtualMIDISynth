@@ -188,6 +188,11 @@ std::string BuildClipboardReport(const ConfigValues& w,
         out << "Events submitted/accepted/dropped/dispatched: "
             << t->eventsSubmitted << " / " << t->eventsAccepted << " / "
             << t->eventsDropped << " / " << t->eventsDispatched << "\n";
+        out << "Scheduler / event dispatch: " << t->schedulerPercent
+            << "% / " << t->eventDispatchPercent << "%\n";
+        out << "Raw / compiled / scheduled events: "
+            << t->rawIngressCount << " / " << t->compiledPagedCount
+            << " / " << t->scheduledBacklogCount << "\n";
         out << "Audio: " << (t->audioRunning ? "Running" : "Stopped") << "\n";
         out << "SoundFont loaded: " << (t->soundFontLoaded ? "Yes" : "No") << "\n";
     }
@@ -375,6 +380,25 @@ void DrawDiagnosticsPage(ConfigDocument& doc) {
             KeyValue("Accepted", accepted);
             KeyValue("Dropped", dropped);
             KeyValue("Dispatched", dispatched);
+            char stages[96] = {}, queues[128] = {}, pressure[64] = {};
+            std::snprintf(stages, sizeof(stages),
+                          "%.2f%% scheduler / %.2f%% dispatch",
+                          t->schedulerPercent, t->eventDispatchPercent);
+            std::snprintf(queues, sizeof(queues),
+                          "%u raw / %u compiled / %u scheduled",
+                          t->rawIngressCount, t->compiledPagedCount,
+                          t->scheduledBacklogCount);
+            const uint64_t paged =
+                static_cast<uint64_t>(t->compiledPagedCount) +
+                t->scheduledBacklogCount;
+            const float pagePressure = w.eventRingCapacity != 0u
+                ? 100.0f * static_cast<float>(paged) /
+                      static_cast<float>(w.eventRingCapacity)
+                : 0.0f;
+            std::snprintf(pressure, sizeof(pressure), "%.1f%%", pagePressure);
+            KeyValue("Stage load", stages);
+            KeyValue("Queue depth", queues);
+            KeyValue("Page-pool pressure", pressure);
             ImGui::EndTable();
         }
     }

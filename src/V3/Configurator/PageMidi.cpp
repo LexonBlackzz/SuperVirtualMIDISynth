@@ -155,13 +155,23 @@ void DrawMidiPage(ConfigDocument& doc) {
         RestartCell();
 
         ImGui::TableNextRow();
-        LabelCell("EV buffer",
-                  "MIDI event-buffer capacity. This single control sets both the queued-event ring and the maximum event batch admitted to one audio callback. Larger values absorb denser bursts but reserve more memory and increase worst-case callback work.");
+        LabelCell("Queue capacity",
+                  "Total raw MIDI ingress capacity. Larger values absorb denser bursts but reserve more memory. This does not change callback work.");
         ImGui::TableNextColumn();
         uint32_t eventBuffer = w.eventRingCapacity;
         if (InputU32("##evbuffer", eventBuffer, 4096u, UINT32_MAX)) {
             w.eventRingCapacity = eventBuffer;
-            w.maxEventsPerBlock = eventBuffer;
+            doc.MarkDirty();
+        }
+        RestartCell();
+
+        ImGui::TableNextRow();
+        LabelCell("Events per callback",
+                  "Maximum due MIDI events dispatched in one audio callback. Excess work remains ordered and becomes explicitly late; changing this does not resize the ingress queue.");
+        ImGui::TableNextColumn();
+        uint32_t callbackEvents = w.maxEventsPerBlock;
+        if (InputU32("##eventspercallback", callbackEvents, 1u, UINT32_MAX)) {
+            w.maxEventsPerBlock = callbackEvents;
             doc.MarkDirty();
         }
         RestartCell();
@@ -189,6 +199,25 @@ void DrawMidiPage(ConfigDocument& doc) {
         RestartCell();
 
         ImGui::EndTable();
+    }
+
+    if (lc.connected && lc.telemetry) {
+        const auto& t = *lc.telemetry;
+        const uint64_t pagedPressureCount =
+            static_cast<uint64_t>(t.compiledPagedCount) +
+            t.scheduledBacklogCount;
+        const float pagePressure = w.eventRingCapacity != 0u
+            ? 100.0f * static_cast<float>(pagedPressureCount) /
+                  static_cast<float>(w.eventRingCapacity)
+            : 0.0f;
+        ImGui::Spacing();
+        SectionHeader("LIVE EVENT PIPELINE");
+        ImGui::Text("Raw ingress: %u", t.rawIngressCount);
+        ImGui::Text("Compiled pages: %u events", t.compiledPagedCount);
+        ImGui::Text("Scheduled backlog: %u events", t.scheduledBacklogCount);
+        ImGui::Text("Page-pool pressure: %.1f%%", pagePressure);
+        ImGui::Text("Scheduler / dispatch: %.2f%% / %.2f%%",
+                    t.schedulerPercent, t.eventDispatchPercent);
     }
 
     ImGui::Spacing();

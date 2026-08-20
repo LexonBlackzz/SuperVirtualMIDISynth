@@ -396,11 +396,6 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "max_events_per_block", cfg.maxEventsPerBlock, 1u,
                        kMaxConfigurableEventCapacity))
             AppendWarning(cfg.configWarning, "events.max_events_per_block");
-        if (cfg.maxEventsPerBlock > cfg.eventRingCapacity) {
-            cfg.maxEventsPerBlock = cfg.eventRingCapacity;
-            AppendWarning(cfg.configWarning,
-                          "events.max_events_per_block exceeds ring_capacity");
-        }
         auto mode = it->find("overflow_mode");
         if (mode != it->end()) {
             if (mode->is_string() && mode->get<std::string>() == "lossless")
@@ -714,8 +709,7 @@ bool EngineConfig::Validate() const {
             eventRingCapacity >= 4096u &&
             highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
             shedStartPercent >= 1 && shedStartPercent < 100 &&
-            maxEventsPerBlock > 0 &&
-            maxEventsPerBlock <= eventRingCapacity;
+            maxEventsPerBlock > 0;
 }
 
 std::wstring GetV3LocalConfigPath() {

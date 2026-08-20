@@ -459,8 +459,6 @@ ConfigValidation ConfigDocument::Validate() const {
         warn("events.shed_start_percent", "must be 1..99");
     if (working_.maxEventsPerBlock == 0)
         warn("events.max_events_per_block", "must be > 0");
-    if (working_.maxEventsPerBlock > working_.eventRingCapacity)
-        warn("events.max_events_per_block", "exceeds ring_capacity");
 
     return v;
 }

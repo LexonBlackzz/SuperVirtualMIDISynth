@@ -363,13 +363,20 @@ struct alignas(64) RuntimeLinkTelemetryV2 {
 
     char     soundFontName[256]      = {};
 
-    uint32_t reserved[5]             = {};
+    // ABI-preserving use of the original five reserved words.
+    float    schedulerPercent        = 0.0f;
+    float    eventDispatchPercent    = 0.0f;
+    uint32_t rawIngressCount         = 0u;
+    uint32_t compiledPagedCount      = 0u;
+    uint32_t scheduledBacklogCount   = 0u;
 };
 
 static_assert(std::is_trivially_copyable<RuntimeLinkTelemetryV2>::value,
               "RuntimeLinkTelemetryV2 must be trivially copyable");
 static_assert(sizeof(RuntimeLinkTelemetryV2) % 64 == 0,
               "RuntimeLinkTelemetryV2 must be a multiple of one cache line");
+static_assert(sizeof(RuntimeLinkTelemetryV2) == 512u,
+              "RuntimeLink V2 telemetry ABI must remain 512 bytes");
 
 // ─── Command mailbox ────────────────────────────────────────────────────────
 //
@@ -602,6 +609,12 @@ struct alignas(64) RuntimeAudioSnapshot {
     std::atomic<uint32_t> limiterOutputPeakRBits{0u};
     std::atomic<uint32_t> limiterGainReductionDbBits{0u};
 
+    std::atomic<uint32_t> schedulerPercentBits{0u};
+    std::atomic<uint32_t> eventDispatchPercentBits{0u};
+    std::atomic<uint32_t> rawIngressCount{0u};
+    std::atomic<uint32_t> compiledPagedCount{0u};
+    std::atomic<uint32_t> scheduledBacklogCount{0u};
+
     // 64-bit event/overload counters (each atomic on its own).
     std::atomic<uint64_t> overBudgetCallbacks{0u};
     std::atomic<uint64_t> eventsSubmitted{0u};
@@ -609,7 +622,6 @@ struct alignas(64) RuntimeAudioSnapshot {
     std::atomic<uint64_t> eventsDropped{0u};
     std::atomic<uint64_t> eventsDispatched{0u};
 
-    uint32_t reserved[2] = {};
 };
 
 static_assert(sizeof(RuntimeAudioSnapshot) % 64 == 0,

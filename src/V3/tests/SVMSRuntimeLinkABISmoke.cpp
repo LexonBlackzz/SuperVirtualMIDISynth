@@ -110,6 +110,10 @@ void TestTelemetryLayout() {
              "telemetry.live must sit at byte 144");
     CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, soundFontName), 236u,
              "telemetry.soundFontName must sit at byte 236");
+    CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, schedulerPercent), 492u,
+             "scheduler telemetry must consume reserved word zero");
+    CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, scheduledBacklogCount), 508u,
+             "scheduled backlog must consume the final reserved word");
 
     svms::RuntimeLinkTelemetryV2 t{};
     CHECK_EQ(t.activeVoices, 0u, "default activeVoices must be 0");
@@ -117,6 +121,7 @@ void TestTelemetryLayout() {
     CHECK_EQ(t.bufferFrames, 2048u, "default bufferFrames must be 2048");
     CHECK_EQ(t.decimationStep, 1u, "default decimationStep must be 1");
     CHECK_EQ(t.maxVoices, 0u, "default maxVoices must be 0");
+    CHECK_EQ(t.rawIngressCount, 0u, "default raw ingress count must be 0");
 }
 
 void TestCommandLayout() {
