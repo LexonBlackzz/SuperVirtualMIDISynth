@@ -131,8 +131,9 @@ larger phase containing that item is complete.
 
 - [x] Replace the single-producer ingress path with preallocated,
   sequence-numbered MPSC lanes
-- [x] Partition 393,216 slots into 131,072 state, 131,072 loud, 65,536
-  upper-medium, 32,768 medium, and 32,768 quiet entries
+- [x] Size all five sequence-numbered MPSC lanes at runtime from
+  `events.ring_capacity`, retaining the 1/3 state, 1/3 loud, 1/6
+  upper-medium, 1/12 medium, and remaining quiet proportions
 - [x] Timestamp and globally sequence events before admission/backpressure
 - [x] Give state events and velocity 96-127 note-ons cancellable lossless
   backpressure
@@ -150,10 +151,12 @@ larger phase containing that item is complete.
 - [x] Move raw MIDI decoding and remainder-preserving QPC-to-frame compilation
   to a persistent preallocated worker on modern multi-core systems; retain the
   synchronous callback path on single-core and XP targets
-- [x] Feed compiled commands through a cancellable SPSC handoff and include
-  both raw and compiled backlog in admission pressure
-- [x] Order fixed-size compiler chunks before the SPSC handoff so the audio
-  callback merges natural runs instead of sorting raw ingress
+- [x] Compile commands into immutable 8,192-event pages, stably ordered by
+  absolute frame and ingress sequence, and publish/recycle page descriptors
+  through preallocated lock-free SPSC index queues
+- [x] Preserve global sequence order while draining the five FIFO lanes with a
+  persistent lane-head merge; include raw, paged, and scheduled backlog in
+  admission pressure
 - [x] Rotate fairly across priority lanes during compilation so saturated
   state traffic cannot indefinitely starve full-velocity note-ons
 - [x] Suppress per-event compiler wakeups and amortize producer pressure scans
@@ -161,16 +164,21 @@ larger phase containing that item is complete.
 - [ ] Saturate every priority lane and test monotonic shedding, lossless-lane
   wakeup/backpressure, and shutdown cancellation
 - [ ] Add bulk-packed MIDI ingestion and safe redundant-controller coalescing
-- [ ] Measure and optimize the tens-of-millions-events-per-second path
+- [x] Measure and optimize the tens-of-millions-events-per-second path: the
+  accepted 12M-event/s fixture compiles around 126M events/s and performs
+  callback ordering around 622-689M events/s (roughly 0.4-0.5% of a
+  44.1-kHz/2,048-frame callback)
 
 ### Sample-Accurate Scheduling
 
 - [x] Convert QPC timestamps to integer output frames from a fixed epoch
-- [x] Store future events in a bounded audio-thread-owned min-heap ordered by
-  absolute frame and global ingress sequence
-- [x] Append each callback's newly compiled commands as one batch and rebuild
-  the scheduler heap once instead of performing one logarithmic insertion per
-  event
+- [x] Store future events in immutable sorted pages and select the next exact
+  `(targetFrame, ingressSequence)` through a fixed-capacity page-head winner
+  tree; importing/advancing work is bounded by page count and payloads are not
+  recopied or rescanned
+- [x] Extract only pages' events due before the callback end into the existing
+  preallocated render-event buffer, returning exhausted pages through the
+  lock-free recycle queue
 - [x] Compact scheduled commands to 16 bytes and size the scheduler/event
   working sets from the configured ring and per-block capacities
 - [x] Remove the former 393,216-event validation/allocation ceiling: the
@@ -182,6 +190,8 @@ larger phase containing that item is complete.
 - [x] Preserve deterministic equal-frame event ordering
 - [x] Dispatch each equal-frame run through one batch callback while preserving
   every event and its global ingress order
+- [x] Batch consecutive equal-frame note-offs for one channel/key through the
+  exact oldest-generation operation without changing release multiplicity
 - [x] Dispatch MIDI state changes and notes at exact render-frame boundaries
 - [x] Clamp late events to the next writable frame and record lateness
 - [x] Fast-forward missed output time after callback overruns and discard only
@@ -327,6 +337,10 @@ larger phase containing that item is complete.
   transaction, bypassing the generic eight-layer reservation and commit loops.
   Under concurrent game load, 5.5M-NPS median callback use falls about 5% at
   300 voices and 6% at 1,000 voices with exact predecessor audio
+- [x] Specialize the exact newborn stable-key calculation and force the compact
+  key encoder, binary winner path, and mono replacement transaction inline on
+  MSVC and MinGW. Fixed-core 6M-note/s medians improve about 2%, while the
+  sampled winner/key segment falls roughly 8-15% with identical oracle victims
 - [x] Initialize only the observable lifecycle fields during saturated stable-
   mono replacement, removing placeholder voice state and redundant index work.
   On an otherwise idle development machine, corrected 5.5M-NPS cost falls
@@ -437,6 +451,12 @@ larger phase containing that item is complete.
   AVX2 p99 34.73%, p99.9 40.65%, and no consecutive deadline misses; the
   500k-note profile reaches 26.55% p99. The non-gating 5.5M-note stretch case
   drops from roughly 206% to 105.31% p99
+- [x] Validate the paged scheduler live in Ziggy with Project CF-162 at 1,000
+  voices: PNC2 and Krash do not pin the callback batch or collapse to zero
+  voices, and PNC3 holds scheduler cost below 1% through its 943K-NPS peak
+- [ ] Eliminate the remaining PNC3 peak streak: the current live run reaches
+  p99.9 107% with a maximum four consecutive deadline misses while event
+  dispatch/launch—not scheduling—is saturated
 - [ ] Run and pass the three Celeron 420 acceptance profiles on target hardware
 - [ ] Complete live high-Hz listening validation for pitch, natural tails,
   CC120/123 termination, and callback-grid artifacts
@@ -510,8 +530,12 @@ larger phase containing that item is complete.
 ## Formats, Tools, and Productization
 
 - [ ] SFZ and DLS support
-- [ ] Shared-memory telemetry and performance graphs
-- [ ] Configurator, SoundFont browser, and profile import/export
+- [x] Preserve the 512-byte RuntimeLink V2 ABI while exposing scheduler load,
+  event-dispatch load, raw ingress, compiled-page pressure, and scheduled
+  backlog through its five reserved words
+- [x] Display paged-pipeline pressure and separate queue-capacity versus
+  per-callback event-budget controls in the configurator
+- [ ] Profile import/export
 - [ ] Record-to-WAV support
 - [ ] WASAPI exclusive and ASIO backends
 
