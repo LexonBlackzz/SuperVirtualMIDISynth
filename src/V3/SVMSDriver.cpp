@@ -26,6 +26,7 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSPSCQueue.h"
 #include "SVMSEventScheduler.h"
+#include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
 #include "SVMSFrameClock.h"
 #include "SVMSDiagWindow.h"
@@ -1841,7 +1842,8 @@ private:
     void RefreshSelectedPresets();
 
     PriorityEventIngress<TimestampedMidiEvent> midiIngress_;
-    DynamicSPSCQueue<ScheduledRenderEvent> compiledIngress_;
+    CompiledEventPagePool compiledPages_;
+    PagedEventScheduler pagedScheduler_;
     EventScheduler eventScheduler_;
     EventOverflowMode overflowMode_;
     bool correctnessMode_;
@@ -2487,7 +2489,6 @@ bool Driver::Initialize() {
 
     ResolveAddressWaitApi();
     midiIngress_.DrainAvailable();
-    compiledIngress_.Reset();
     eventScheduler_.Reset();
     compilerEpochQPC_.store(0u, std::memory_order_relaxed);
     globalTerminationFence_.store(0, std::memory_order_relaxed);
@@ -2521,7 +2522,10 @@ bool Driver::Initialize() {
 
     auto configureEventStorage = [this](uint32_t ringCapacity,
                                         uint32_t blockCapacity) -> bool {
-        if (!compiledIngress_.ConfigureCapacity(ringCapacity)) return false;
+        if (!midiIngress_.ConfigureCapacity(ringCapacity)) return false;
+        if (!compiledPages_.ConfigureCapacity(ringCapacity)) return false;
+        if (!pagedScheduler_.Configure(&compiledPages_, ringCapacity))
+            return false;
         try {
             eventScheduler_.ConfigureCapacity(ringCapacity);
         } catch (...) {
@@ -2759,7 +2763,7 @@ void Driver::Shutdown() {
     if (eventCompilerThread_.joinable()) eventCompilerThread_.join();
     useEventCompiler_ = false;
     midiIngress_.DrainAvailable();
-    compiledIngress_.Reset();
+    pagedScheduler_.Reset();
     eventScheduler_.Reset();
     scheduledSizePublished_.store(0, std::memory_order_release);
     if (eventBuffer) {
@@ -3065,24 +3069,26 @@ void Driver::SubmitShortMsg(uint32_t msg) {
         std::memory_order_relaxed);
     if ((evt.sequence & 0xffu) == 0u) {
         const uint32_t rawIngress = midiIngress_.TotalSize();
-        const uint32_t compiledIngress = compiledIngress_.Size();
+        const uint32_t compiledIngress = compiledPages_.ReadyEventCount();
         const uint32_t scheduled =
             scheduledSizePublished_.load(std::memory_order_acquire);
         const uint32_t rawIngressPressure = static_cast<uint32_t>(
             static_cast<uint64_t>(rawIngress) * 100u /
-            PriorityEventIngress<TimestampedMidiEvent>::TotalCapacity());
-        const uint32_t compiledCapacity = compiledIngress_.CapacityValue();
+            midiIngress_.TotalCapacity());
+        const uint32_t compiledCapacity = pagedScheduler_.Capacity();
         const uint32_t compiledIngressPressure = compiledCapacity != 0u
             ? static_cast<uint32_t>(
                   static_cast<uint64_t>(compiledIngress) * 100u /
                   compiledCapacity)
             : 100u;
         const uint32_t laneCapacity =
-            PriorityEventIngress<TimestampedMidiEvent>::LaneCapacity(lane);
+            midiIngress_.LaneCapacity(lane);
         const uint32_t lanePressure = static_cast<uint32_t>(
             static_cast<uint64_t>(midiIngress_.LaneSize(lane)) * 100u /
             laneCapacity);
-        const uint32_t scheduledCapacity = eventScheduler_.Capacity();
+        const uint32_t scheduledCapacity = useEventCompiler_
+            ? pagedScheduler_.Capacity()
+            : eventScheduler_.Capacity();
         const uint32_t scheduledPressure = scheduledCapacity != 0u
             ? static_cast<uint32_t>(
                   static_cast<uint64_t>(scheduled) * 100u /
@@ -3158,10 +3164,7 @@ void Driver::EventCompilerLoop() {
     // Small enough to stay cache-friendly, large enough that one 2048-frame
     // Black-MIDI callback arrives as only a handful of ordered runs.
     static constexpr uint32_t kCompilerChunkCapacity = 8192u;
-    static constexpr uint32_t kCompilerLaneRunQuota =
-        (kCompilerChunkCapacity + 4u) / 5u;
-    EventScheduler chunkScheduler(kCompilerChunkCapacity);
-    uint32_t fairLaneCursor = 0u;
+    PriorityEventIngress<TimestampedMidiEvent>::OrderedMergeState mergeState{};
 
     auto publishProducerSpace = [this]() {
         producerWakeEpoch_.fetch_add(1, std::memory_order_release);
@@ -3180,12 +3183,12 @@ void Driver::EventCompilerLoop() {
         }
 
         TimestampedMidiEvent timed{};
-        if (!midiIngress_.TryPopFair(timed, fairLaneCursor)) {
+        if (!midiIngress_.TryPopSequenceOrdered(timed, mergeState)) {
             compilerSleeping_.store(true, std::memory_order_release);
             const uint32_t observed = compilerWakeEpoch_.load(std::memory_order_acquire);
             // Close the store-to-sleep race: a producer that arrived before
             // the epoch load either wakes us or is observed by this retry.
-            if (!midiIngress_.TryPopFair(timed, fairLaneCursor)) {
+            if (!midiIngress_.TryPopSequenceOrdered(timed, mergeState)) {
                 WaitForAddressChange(compilerWakeEpoch_, observed);
                 compilerSleeping_.store(false, std::memory_order_release);
                 continue;
@@ -3193,45 +3196,50 @@ void Driver::EventCompilerLoop() {
             compilerSleeping_.store(false, std::memory_order_release);
         }
 
-        chunkScheduler.Reset();
+        uint32_t pageIndex = kInvalidEventPage;
+        while (!compiledPages_.AcquireForCompiler(pageIndex)) {
+            if (cancelProducers_.load(std::memory_order_acquire)) return;
+            const uint32_t observed =
+                compilerWakeEpoch_.load(std::memory_order_acquire);
+            if (compiledPages_.AcquireForCompiler(pageIndex)) break;
+            WaitForAddressChange(compilerWakeEpoch_, observed);
+        }
+        CompiledEventPage& page = compiledPages_.Page(pageIndex);
+        uint32_t compiledCount = 0u;
         uint32_t drained = 0u;
         auto compileOne = [&](const TimestampedMidiEvent& source) {
             ScheduledRenderEvent scheduled{};
             if (CompileTimestampedEvent(source, epoch, qpcFreq, sampleRate,
                                         bufferFrames, scheduled)) {
-                const bool admitted = chunkScheduler.EnqueueBatched(scheduled);
-                assert(admitted);
-                (void)admitted;
+                page.events[compiledCount++] = scheduled;
             }
         };
         compileOne(timed);
         ++drained;
 
-        // Priority lanes are FIFO runs in normal host traffic. Round-robin
-        // popping used to alternate those runs event-by-event, manufacturing
-        // thousands of inversions that the chunk sorter immediately had to
-        // undo. Drain a bounded run per lane instead: fairness is retained,
-        // but a normal chunk reaches the sorter as only a handful of runs.
-        drained += midiIngress_.DrainFairRuns(
-            kCompilerChunkCapacity - drained, kCompilerLaneRunQuota,
-            fairLaneCursor, compileOne);
+        while (drained < kCompilerChunkCapacity &&
+               midiIngress_.TryPopSequenceOrdered(timed, mergeState)) {
+            compileOne(timed);
+            ++drained;
+        }
 
-        // Ordering is deliberately paid here, outside the callback. Chunks
-        // remain individually sorted in compiledIngress_; the audio thread
-        // only merges their natural runs with any carried future events.
-        chunkScheduler.FinalizeBatch();
-        ScheduledRenderEvent scheduled{};
-        while (chunkScheduler.PopBefore(INT64_MAX, scheduled)) {
-            for (;;) {
-                if (compiledIngress_.Push(scheduled)) break;
-                if (cancelProducers_.load(std::memory_order_acquire)) return;
+        // Ordering is paid once, outside the callback, directly in the final
+        // immutable payload page. Publication transfers only its index.
+        if (compiledCount != 0u) {
+            SortCompiledEventPage(page.events, compiledPages_.SortScratch(),
+                                  compiledCount);
+            while (!compiledPages_.PublishFromCompiler(pageIndex,
+                                                        compiledCount)) {
+                if (cancelProducers_.load(std::memory_order_acquire)) {
+                    compiledPages_.ReturnUnusedFromCompiler(pageIndex);
+                    return;
+                }
                 const uint32_t observed =
                     compilerWakeEpoch_.load(std::memory_order_acquire);
-                // Recheck after observing the wake epoch so a just-freed slot
-                // cannot be missed between the failed push and the wait.
-                if (compiledIngress_.Push(scheduled)) break;
                 WaitForAddressChange(compilerWakeEpoch_, observed);
             }
+        } else {
+            compiledPages_.ReturnUnusedFromCompiler(pageIndex);
         }
         if (drained != 0u) {
             publishProducerSpace();
@@ -3412,23 +3420,27 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                 sizeof(self->staleRecoveryNoteOffValid_));
     std::memset(self->staleRecoveryNoteOffCount_, 0,
                 sizeof(self->staleRecoveryNoteOffCount_));
-    const uint32_t ingressScanBudget =
-        self->eventScheduler_.Capacity();
-    while (scannedIngress < ingressScanBudget &&
+    const uint32_t importedPages = self->useEventCompiler_
+        ? self->pagedScheduler_.ImportAllReady()
+        : 0u;
+    if (self->useEventCompiler_) {
+        self->telemetry_.scheduledHighWater = (std::max)(
+            self->telemetry_.scheduledHighWater,
+            static_cast<uint64_t>(self->pagedScheduler_.HighWater()));
+    }
+    const uint32_t ingressScanBudget = self->eventScheduler_.Capacity();
+    while (!self->useEventCompiler_ &&
+           scannedIngress < ingressScanBudget &&
            admittedEvents < self->maxEventsPerBlock_ &&
            self->eventScheduler_.Size() < self->eventScheduler_.Capacity()) {
         ScheduledRenderEvent scheduled{};
-        if (self->useEventCompiler_) {
-            if (!self->compiledIngress_.TryPop(scheduled)) break;
-        } else {
-            TimestampedMidiEvent timed{};
-            if (!self->midiIngress_.TryPop(timed)) break;
-            if (!CompileTimestampedEvent(
-                    timed, self->virtualRenderClockQPC, self->qpcFreq,
-                    self->sampleRate, self->bufferFrames, scheduled)) {
-                ++scannedIngress;
-                continue;
-            }
+        TimestampedMidiEvent timed{};
+        if (!self->midiIngress_.TryPop(timed)) break;
+        if (!CompileTimestampedEvent(
+                timed, self->virtualRenderClockQPC, self->qpcFreq,
+                self->sampleRate, self->bufferFrames, scheduled)) {
+            ++scannedIngress;
+            continue;
         }
         ++scannedIngress;
         if (self->eventScheduler_.Size() >= self->eventScheduler_.Capacity()) {
@@ -3511,11 +3523,6 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             (std::max)(self->telemetry_.scheduledHighWater,
                        static_cast<uint64_t>(self->eventScheduler_.Size()));
     }
-    if (self->useEventCompiler_ && scannedIngress != 0u) {
-        self->compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
-        WakeAddressWaiters(self->compilerWakeEpoch_);
-    }
-
     // Recovered notes all become writable at this block's first frame. Late
     // note-offs are replayed in batches of at most 255, capped by the current
     // maximum possible voice generations. This retains note-off multiplicity
@@ -3523,6 +3530,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // callback quota. The scheduler restores frame/sequence order even though
     // the compact set is walked by channel/key here.
     for (uint32_t key = 0;
+         !self->useEventCompiler_ &&
          key < Driver::kStaleRecoveryKeys &&
          admittedEvents < self->maxEventsPerBlock_ &&
          self->eventScheduler_.Size() < self->eventScheduler_.Capacity();
@@ -3561,11 +3569,14 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         ++admittedEvents;
     }
 
-    self->eventScheduler_.FinalizeBatch();
+    if (!self->useEventCompiler_) self->eventScheduler_.FinalizeBatch();
 
     self->producerWakeEpoch_.fetch_add(1, std::memory_order_release);
     WakeAddressWaiters(self->producerWakeEpoch_);
-    self->scheduledSizePublished_.store(self->eventScheduler_.Size(),
+    const uint32_t scheduledBeforeDispatch = self->useEventCompiler_
+        ? self->pagedScheduler_.Size()
+        : self->eventScheduler_.Size();
+    self->scheduledSizePublished_.store(scheduledBeforeDispatch,
                                         std::memory_order_release);
 
     // Extract only this render window.  Future events remain in the heap.
@@ -3574,26 +3585,51 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     uint32_t examinedCount = 0;
     const uint32_t eventBudget =
         self->eventBufferCapacity_;
-    ScheduledRenderEvent scheduledOut;
-    while (examinedCount < eventBudget &&
-           self->eventScheduler_.PopBefore(self->virtualRenderSample_ + numFrames,
-                                           scheduledOut)) {
+    auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
         ++examinedCount;
-        if (scheduledOut.type == RenderEventType::NoteOn &&
+        if (self->overflowMode_ == EventOverflowMode::PriorityVelocity &&
+            scheduledOut.type == RenderEventType::NoteOn &&
             IsObsoleteNoteOn(scheduledOut.targetFrame,
                              self->virtualRenderSample_, self->bufferFrames)) {
             ++self->telemetry_.late;
             ++self->telemetry_.staleNoteOnsSkipped;
-            continue;
+            return;
         }
         int64_t offset = scheduledOut.targetFrame - self->virtualRenderSample_;
         if (offset < 0) { ++self->telemetry_.late; offset = 0; }
         evtBuf[evCount++] = scheduledOut.ToRenderEvent(
             static_cast<uint32_t>(offset));
         ++self->telemetry_.dispatched;
+    };
+    if (self->useEventCompiler_) {
+        for (;;) {
+            const ScheduledRenderEvent* run = nullptr;
+            const uint32_t runCount = self->pagedScheduler_.PeekRunBefore(
+                self->virtualRenderSample_ + numFrames,
+                eventBudget - examinedCount, run);
+            if (runCount == 0u) break;
+            for (uint32_t i = 0u; i < runCount; ++i)
+                admitScheduled(run[i]);
+            self->pagedScheduler_.ConsumeRun(runCount);
+            if (examinedCount == eventBudget) break;
+        }
+    } else {
+        ScheduledRenderEvent scheduledOut{};
+        while (examinedCount < eventBudget &&
+               self->eventScheduler_.PopBefore(
+                   self->virtualRenderSample_ + numFrames, scheduledOut)) {
+            admitScheduled(scheduledOut);
+        }
     }
-    self->scheduledSizePublished_.store(self->eventScheduler_.Size(),
+    const uint32_t scheduledAfterDispatch = self->useEventCompiler_
+        ? self->pagedScheduler_.Size()
+        : self->eventScheduler_.Size();
+    self->scheduledSizePublished_.store(scheduledAfterDispatch,
                                         std::memory_order_release);
+    if (importedPages != 0u || examinedCount != 0u) {
+        self->compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
+        WakeAddressWaiters(self->compilerWakeEpoch_);
+    }
 
     // ── Step 2: Sort pending queue by sampleOffset ─────────────────────
     // Insertion sort.  The carry-forward portion (from previous blocks) is
@@ -3796,7 +3832,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                                   render->GetRenderThreadCount(),
                                   s_schedulerSmoothed, s_dispatchSmoothed,
                                   s_synthesisSmoothed, s_postSmoothed,
-                                  evCount, self->eventScheduler_.Size(),
+                                  evCount, scheduledAfterDispatch,
                                   self->sf2Telemetry_);
             }
         }
@@ -3949,6 +3985,27 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
     // termination event breaks the run and goes through the full dispatcher.
     uint32_t index = 0u;
     while (index < eventCount) {
+        if (events[index].type == RenderEventType::NoteOff) {
+            const uint8_t channel = events[index].channel;
+            const uint8_t note = events[index].data1;
+            uint32_t runEnd = index + 1u;
+            while (runEnd < eventCount &&
+                   events[runEnd].type == RenderEventType::NoteOff &&
+                   events[runEnd].channel == channel &&
+                   events[runEnd].data1 == note) {
+                ++runEnd;
+            }
+            uint32_t remaining = runEnd - index;
+            while (remaining != 0u) {
+                const uint8_t batch = static_cast<uint8_t>(
+                    (std::min)(remaining, 255u));
+                self->HandleStaleNoteOffBatch(channel, note, batch,
+                                              blockCursor);
+                remaining -= batch;
+            }
+            index = runEnd;
+            continue;
+        }
         if (events[index].type != RenderEventType::NoteOn) {
             DispatchRenderEvent(events[index++], blockCursor, self);
             continue;

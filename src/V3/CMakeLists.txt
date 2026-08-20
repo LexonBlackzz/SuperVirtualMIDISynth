@@ -65,6 +65,7 @@ set(HEADERS
     SVMSMPSCQueue.h
     SVMSEventCompile.h
     SVMSEventScheduler.h
+    SVMSEventPages.h
     SVMSFrameClock.h
     SVMSPostFilter.h
     SVMSLimiter.h

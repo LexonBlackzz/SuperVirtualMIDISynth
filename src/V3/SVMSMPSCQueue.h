@@ -5,8 +5,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <new>
 #include <type_traits>
+#include <utility>
 
 namespace svms {
 
@@ -82,11 +84,151 @@ private:
     alignas(64) std::atomic<uint64_t> dequeue_;
 };
 
+// Runtime-sized bounded MPSC queue. Capacity is selected while the engine is
+// stopped; producers and the single consumer then use the same sequence-cell
+// algorithm as the fixed-size test queue. Modulo indexing permits the exact
+// configured lane proportions instead of rounding each lane up independently.
+template <typename T>
+class DynamicMPSCQueue {
+    static_assert(std::is_trivially_copyable_v<T>);
+
+    struct Cell {
+        std::atomic<uint64_t> sequence;
+        T value;
+    };
+
+public:
+    DynamicMPSCQueue() = default;
+    ~DynamicMPSCQueue() { Release(); }
+
+    DynamicMPSCQueue(const DynamicMPSCQueue&) = delete;
+    DynamicMPSCQueue& operator=(const DynamicMPSCQueue&) = delete;
+
+    bool ConfigureCapacity(uint32_t capacity) noexcept {
+        if (capacity < 2u ||
+            static_cast<size_t>(capacity) >
+                (std::numeric_limits<size_t>::max)() / sizeof(Cell)) {
+            return false;
+        }
+        Cell* replacement = static_cast<Cell*>(::operator new[](
+            sizeof(Cell) * static_cast<size_t>(capacity),
+            std::align_val_t{64}, std::nothrow));
+        if (!replacement) return false;
+        Release();
+        cells_ = replacement;
+        capacity_ = capacity;
+        for (uint64_t i = 0u; i < capacity_; ++i)
+            new (&cells_[i]) Cell{std::atomic<uint64_t>(i), T{}};
+        enqueue_.store(0u, std::memory_order_relaxed);
+        dequeue_.store(0u, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool TryPush(const T& value) noexcept {
+        if (!cells_) return false;
+        uint64_t position = enqueue_.load(std::memory_order_relaxed);
+        for (;;) {
+            Cell& cell = cells_[static_cast<size_t>(position % capacity_)];
+            const uint64_t sequence =
+                cell.sequence.load(std::memory_order_acquire);
+            const intptr_t difference =
+                static_cast<intptr_t>(sequence - position);
+            if (difference == 0) {
+                if (enqueue_.compare_exchange_weak(
+                        position, position + 1u,
+                        std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    cell.value = value;
+                    cell.sequence.store(position + 1u,
+                                        std::memory_order_release);
+                    return true;
+                }
+            } else if (difference < 0) {
+                return false;
+            } else {
+                position = enqueue_.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+    bool TryPop(T& value) noexcept {
+        if (!cells_) return false;
+        const uint64_t position = dequeue_.load(std::memory_order_relaxed);
+        Cell& cell = cells_[static_cast<size_t>(position % capacity_)];
+        const uint64_t sequence =
+            cell.sequence.load(std::memory_order_acquire);
+        if (static_cast<intptr_t>(sequence - (position + 1u)) != 0)
+            return false;
+        value = cell.value;
+        cell.sequence.store(position + capacity_, std::memory_order_release);
+        dequeue_.store(position + 1u, std::memory_order_relaxed);
+        return true;
+    }
+
+    uint32_t Size() const noexcept {
+        const uint64_t head = enqueue_.load(std::memory_order_acquire);
+        const uint64_t tail = dequeue_.load(std::memory_order_acquire);
+        const uint64_t size = head - tail;
+        return static_cast<uint32_t>(size > capacity_ ? capacity_ : size);
+    }
+
+    uint32_t CapacityValue() const noexcept { return capacity_; }
+
+private:
+    void Release() noexcept {
+        if (cells_) {
+            for (uint32_t i = 0u; i < capacity_; ++i) cells_[i].~Cell();
+        }
+        ::operator delete[](cells_, std::align_val_t{64});
+        cells_ = nullptr;
+        capacity_ = 0u;
+    }
+
+    Cell* cells_ = nullptr;
+    uint32_t capacity_ = 0u;
+    alignas(64) std::atomic<uint64_t> enqueue_{0u};
+    alignas(64) std::atomic<uint64_t> dequeue_{0u};
+};
+
 enum class EventLane : uint8_t { State, Loud, UpperMedium, Medium, Quiet };
 
 template <typename T>
 class PriorityEventIngress {
 public:
+    struct OrderedMergeState {
+        T heads[5]{};
+        uint8_t heap[5]{};
+        uint8_t queued[5]{};
+        uint8_t heapCount = 0u;
+        uint8_t pollCountdown = 0u;
+    };
+
+    PriorityEventIngress() { (void)ConfigureCapacity(393216u); }
+
+    bool ConfigureCapacity(uint32_t totalCapacity) noexcept {
+        if (totalCapacity < 12u) return false;
+        const uint32_t state = totalCapacity / 3u;
+        const uint32_t loud = totalCapacity / 3u;
+        const uint32_t upperMedium = totalCapacity / 6u;
+        const uint32_t medium = totalCapacity / 12u;
+        const uint32_t quiet =
+            totalCapacity - state - loud - upperMedium - medium;
+        if (!state_.ConfigureCapacity(state) ||
+            !loud_.ConfigureCapacity(loud) ||
+            !upperMedium_.ConfigureCapacity(upperMedium) ||
+            !medium_.ConfigureCapacity(medium) ||
+            !quiet_.ConfigureCapacity(quiet)) {
+            return false;
+        }
+        laneCapacities_[0] = state;
+        laneCapacities_[1] = loud;
+        laneCapacities_[2] = upperMedium;
+        laneCapacities_[3] = medium;
+        laneCapacities_[4] = quiet;
+        totalCapacity_ = totalCapacity;
+        return true;
+    }
+
     bool TryPush(EventLane lane, const T& event) noexcept {
         switch (lane) {
             case EventLane::State: return state_.TryPush(event);
@@ -135,6 +277,99 @@ public:
         return false;
     }
 
+    // Merge the five FIFO lane heads by the global ingress sequence. The
+    // caller owns the tiny lookahead set so it persists across compiler pages.
+    // This keeps adjacent immutable pages non-overlapping for ordinary hosts,
+    // greatly reducing page-head winner churn without changing event order.
+    bool TryPopSequenceOrdered(T& event, T (&heads)[5],
+                               uint8_t (&valid)[5]) noexcept {
+        for (uint32_t lane = 0u; lane < 5u; ++lane) {
+            if (valid[lane]) continue;
+            valid[lane] = TryPop(static_cast<EventLane>(lane), heads[lane])
+                ? 1u : 0u;
+        }
+        uint32_t winner = UINT32_MAX;
+        for (uint32_t lane = 0u; lane < 5u; ++lane) {
+            if (!valid[lane]) continue;
+            if (winner == UINT32_MAX ||
+                static_cast<int32_t>(heads[lane].sequence -
+                                     heads[winner].sequence) < 0) {
+                winner = lane;
+            }
+        }
+        if (winner == UINT32_MAX) return false;
+        event = heads[winner];
+        valid[winner] = 0u;
+        return true;
+    }
+
+    bool TryPopSequenceOrdered(T& event,
+                               OrderedMergeState& state) noexcept {
+        auto earlierLane = [&state](uint8_t a, uint8_t b) noexcept {
+            return static_cast<int32_t>(state.heads[a].sequence -
+                                        state.heads[b].sequence) < 0;
+        };
+        auto siftUp = [&state, &earlierLane](uint32_t position) noexcept {
+            while (position != 0u) {
+                const uint32_t parent = (position - 1u) >> 1u;
+                if (!earlierLane(state.heap[position], state.heap[parent]))
+                    break;
+                std::swap(state.heap[position], state.heap[parent]);
+                position = parent;
+            }
+        };
+        auto siftDown = [&state, &earlierLane](uint32_t position) noexcept {
+            for (;;) {
+                const uint32_t left = position * 2u + 1u;
+                if (left >= state.heapCount) break;
+                const uint32_t right = left + 1u;
+                uint32_t best = left;
+                if (right < state.heapCount &&
+                    earlierLane(state.heap[right], state.heap[left])) {
+                    best = right;
+                }
+                if (!earlierLane(state.heap[best], state.heap[position]))
+                    break;
+                std::swap(state.heap[position], state.heap[best]);
+                position = best;
+            }
+        };
+
+        // Saturated lanes remain in the tiny heap. Empty lanes are sampled
+        // every 16 outputs; timestamps retain their exact target frames, and
+        // the bounded sampling delay is far below one audio frame at dense
+        // rates while avoiding three failed atomic pops per event.
+        if (state.heapCount == 0u || state.pollCountdown == 0u) {
+            state.pollCountdown = 15u;
+            for (uint8_t lane = 0u; lane < 5u; ++lane) {
+                if (state.queued[lane]) continue;
+                if (!TryPop(static_cast<EventLane>(lane), state.heads[lane]))
+                    continue;
+                state.queued[lane] = 1u;
+                const uint32_t position = state.heapCount++;
+                state.heap[position] = lane;
+                siftUp(position);
+            }
+        } else {
+            --state.pollCountdown;
+        }
+        if (state.heapCount == 0u) return false;
+
+        const uint8_t winner = state.heap[0];
+        event = state.heads[winner];
+        if (TryPop(static_cast<EventLane>(winner), state.heads[winner])) {
+            siftDown(0u);
+        } else {
+            state.queued[winner] = 0u;
+            --state.heapCount;
+            if (state.heapCount != 0u) {
+                state.heap[0] = state.heap[state.heapCount];
+                siftDown(0u);
+            }
+        }
+        return true;
+    }
+
     // Drain bounded FIFO runs instead of alternating lanes for every event.
     // Admission priority and consumer fairness stay unchanged, while ordered
     // producers reach the downstream sorter as a handful of natural runs.
@@ -180,15 +415,9 @@ public:
         return 0u;
     }
 
-    static constexpr uint32_t LaneCapacity(EventLane lane) noexcept {
-        switch (lane) {
-            case EventLane::State: return 131072u;
-            case EventLane::Loud: return 131072u;
-            case EventLane::UpperMedium: return 65536u;
-            case EventLane::Medium: return 32768u;
-            case EventLane::Quiet: return 32768u;
-        }
-        return 1u;
+    uint32_t LaneCapacity(EventLane lane) const noexcept {
+        const uint32_t index = static_cast<uint32_t>(lane);
+        return index < 5u ? laneCapacities_[index] : 1u;
     }
 
     uint32_t DrainAvailable() noexcept {
@@ -198,14 +427,16 @@ public:
         return drained;
     }
 
-    static constexpr uint32_t TotalCapacity() noexcept { return 393216; }
+    uint32_t TotalCapacity() const noexcept { return totalCapacity_; }
 
 private:
-    MPSCQueue<T, 131072> state_;
-    MPSCQueue<T, 131072> loud_;
-    MPSCQueue<T, 65536> upperMedium_;
-    MPSCQueue<T, 32768> medium_;
-    MPSCQueue<T, 32768> quiet_;
+    DynamicMPSCQueue<T> state_;
+    DynamicMPSCQueue<T> loud_;
+    DynamicMPSCQueue<T> upperMedium_;
+    DynamicMPSCQueue<T> medium_;
+    DynamicMPSCQueue<T> quiet_;
+    uint32_t laneCapacities_[5]{131072u, 131072u, 65536u, 32768u, 32768u};
+    uint32_t totalCapacity_ = 393216u;
 };
 
 } // namespace svms

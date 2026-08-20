@@ -6,6 +6,7 @@
 #include "SVMSPSCQueue.h"
 #include "SVMSMPSCQueue.h"
 #include "SVMSEventScheduler.h"
+#include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
 #include "SVMSConfig.h"
 #include "SVMSFrameClock.h"
@@ -1854,8 +1855,84 @@ void TestWindowedSchedulerOrdering() {
           "scheduler allocation also exceeds the former fixed ceiling");
 }
 
+void TestPagedSchedulerOrderingAndRecycling() {
+    constexpr uint32_t pageEvents = 257u;
+    constexpr uint32_t pageCount = 3u;
+    constexpr uint32_t totalEvents = pageEvents * pageCount;
+    svms::CompiledEventPagePool pool;
+    Check(pool.ConfigureCapacity(totalEvents),
+          "compiled page pool allocates configured event storage");
+    svms::PagedEventScheduler scheduler;
+    Check(scheduler.Configure(&pool, totalEvents),
+          "paged scheduler allocates only page cursors and winner tree");
+
+    std::vector<svms::ScheduledRenderEvent> expected;
+    expected.reserve(totalEvents);
+    constexpr uint32_t sequenceBase = UINT32_MAX - 300u;
+    for (uint32_t pageNumber = 0u; pageNumber < pageCount; ++pageNumber) {
+        uint32_t pageIndex = svms::kInvalidEventPage;
+        Check(pool.AcquireForCompiler(pageIndex),
+              "compiler obtains a free immutable page");
+        auto& page = pool.Page(pageIndex);
+        for (uint32_t i = 0u; i < pageEvents; ++i) {
+            svms::ScheduledRenderEvent event{};
+            const uint32_t logicalSequence = pageNumber * pageEvents + i;
+            event.sequence = sequenceBase + logicalSequence;
+            event.targetFrame = static_cast<int64_t>(
+                (logicalSequence * 97u + pageNumber * 13u) % 41u) - 9;
+            event.channel = static_cast<uint8_t>(logicalSequence & 15u);
+            event.data1 = static_cast<uint8_t>(logicalSequence & 127u);
+            page.events[i] = event;
+            expected.push_back(event);
+        }
+        svms::SortCompiledEventPage(page.events, pool.SortScratch(), pageEvents);
+        Check(pool.PublishFromCompiler(pageIndex, pageEvents),
+              "compiler publishes one sorted immutable page");
+    }
+
+    std::stable_sort(expected.begin(), expected.end(), [](const auto& a,
+                                                          const auto& b) {
+        if (a.targetFrame != b.targetFrame)
+            return a.targetFrame < b.targetFrame;
+        return static_cast<int32_t>(a.sequence - b.sequence) < 0;
+    });
+    Check(scheduler.ImportAllReady() == pageCount &&
+              scheduler.Size() == totalEvents &&
+              scheduler.ActivePages() == pageCount,
+          "audio imports page descriptors without copying payloads");
+
+    g_realtimeAllocationCount.store(0u, std::memory_order_relaxed);
+    g_trackRealtimeAllocations = true;
+    svms::ScheduledRenderEvent actual{};
+    for (const auto& wanted : expected) {
+        const bool popped = scheduler.PopBefore(INT64_MAX, actual);
+        if (!popped || actual.targetFrame != wanted.targetFrame ||
+            actual.sequence != wanted.sequence) {
+            g_trackRealtimeAllocations = false;
+            Check(false,
+                  "page-head winner tree preserves frame and wrapped sequence order");
+            g_trackRealtimeAllocations = true;
+            break;
+        }
+    }
+    g_trackRealtimeAllocations = false;
+    Check(g_realtimeAllocationCount.load(std::memory_order_relaxed) == 0u,
+          "page import and winner advancement allocate nothing on audio thread");
+    Check(scheduler.Size() == 0u && scheduler.ActivePages() == 0u,
+          "exhausted page cursors return every payload page to the compiler");
+
+    uint32_t recycledIndex = svms::kInvalidEventPage;
+    Check(pool.AcquireForCompiler(recycledIndex),
+          "compiler reuses a page recycled by the audio thread");
+}
+
 void TestFairPriorityLaneDrain() {
     svms::PriorityEventIngress<svms::TimestampedMidiEvent> ingress;
+    Check(ingress.ConfigureCapacity(400003u) &&
+              ingress.TotalCapacity() == 400003u &&
+              ingress.LaneCapacity(svms::EventLane::State) == 133334u &&
+              ingress.LaneCapacity(svms::EventLane::Quiet) == 33335u,
+          "priority ingress derives exact runtime lane capacities");
     for (uint32_t i = 0u; i < 64u; ++i) {
         svms::TimestampedMidiEvent state{};
         state.sequence = i * 2u;
@@ -2828,6 +2905,7 @@ int main() {
     TestConfiguredVelocityMapping();
     TestEventRingWrapAndCapacity();
     TestWindowedSchedulerOrdering();
+    TestPagedSchedulerOrderingAndRecycling();
     TestFairPriorityLaneDrain();
     TestFourProducerMPSCIntegrity();
     TestJsonConfigurationLifecycle();

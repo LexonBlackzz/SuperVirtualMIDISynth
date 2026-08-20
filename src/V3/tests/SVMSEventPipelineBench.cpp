@@ -1,6 +1,7 @@
 #include "SVMSEventCompile.h"
 #include "SVMSMPSCQueue.h"
 #include "SVMSPSCQueue.h"
+#include "SVMSEventPages.h"
 
 #include <algorithm>
 #include <chrono>
@@ -13,7 +14,6 @@
 namespace {
 
 constexpr uint32_t kChunkCapacity = 8192u;
-constexpr uint32_t kLaneRunQuota = (kChunkCapacity + 4u) / 5u;
 
 uint32_t ParseU32(const char* value, uint32_t fallback) {
     if (!value || !*value) return fallback;
@@ -58,10 +58,10 @@ int main(int argc, char** argv) {
 
     auto ingress = std::make_unique<
         svms::PriorityEventIngress<svms::TimestampedMidiEvent>>();
-    auto compiled = std::make_unique<svms::SPSCQueue<
-        svms::ScheduledRenderEvent, svms::kDefaultEventRingCapacity>>();
-    auto chunk = std::make_unique<svms::EventScheduler>(kChunkCapacity);
-    auto scheduler = std::make_unique<svms::EventScheduler>(eventCount);
+    auto pages = std::make_unique<svms::CompiledEventPagePool>();
+    auto scheduler = std::make_unique<svms::PagedEventScheduler>();
+    if (!pages->ConfigureCapacity(eventCount) ||
+        !scheduler->Configure(pages.get(), eventCount)) return 2;
 
     constexpr uint64_t qpcFrequency = 10000000u;
     constexpr uint64_t epoch = 100000000u;
@@ -73,10 +73,10 @@ int main(int argc, char** argv) {
     double compilerPublishMs = 0.0;
     double callbackMs = 0.0;
     uint64_t checksum = 0u;
+    uint64_t callbackRuns = 0u;
 
     for (uint32_t iteration = 0u; iteration < iterations; ++iteration) {
         ingress->DrainAvailable();
-        compiled->Reset();
         scheduler->Reset();
 
         const auto producerBegin = std::chrono::steady_clock::now();
@@ -97,39 +97,41 @@ int main(int argc, char** argv) {
         const auto producerEnd = std::chrono::steady_clock::now();
 
         const auto compilerBegin = producerEnd;
-        uint32_t laneCursor = 0u;
+        svms::PriorityEventIngress<svms::TimestampedMidiEvent>::
+            OrderedMergeState mergeState{};
         uint32_t remaining = eventCount;
         while (remaining != 0u) {
-            chunk->Reset();
             const uint32_t count = (std::min)(remaining, kChunkCapacity);
+            uint32_t pageIndex = svms::kInvalidEventPage;
+            if (!pages->AcquireForCompiler(pageIndex)) return 3;
+            auto& page = pages->Page(pageIndex);
             uint32_t drained = 0u;
             auto compileOne = [&](const svms::TimestampedMidiEvent& timed) {
                 svms::ScheduledRenderEvent scheduled{};
                 if (!svms::CompileTimestampedEvent(
                         timed, epoch, qpcFrequency, sampleRate, leadFrames,
-                        scheduled) || !chunk->EnqueueBatched(scheduled)) {
+                        scheduled)) {
                     return false;
                 }
+                page.events[drained++] = scheduled;
                 return true;
             };
             svms::TimestampedMidiEvent timed{};
-            if (!ingress->TryPopFair(timed, laneCursor) ||
+            if (!ingress->TryPopSequenceOrdered(timed, mergeState) ||
                 !compileOne(timed)) return 3;
-            ++drained;
             bool compileFailed = false;
-            drained += ingress->DrainFairRuns(
-                count - drained, kLaneRunQuota, laneCursor,
-                [&](const svms::TimestampedMidiEvent& event) {
-                    if (!compileOne(event)) compileFailed = true;
-                });
-            if (compileFailed || drained != count) return 3;
-            const auto sortBegin = std::chrono::steady_clock::now();
-            chunk->FinalizeBatch();
-            const auto sortEnd = std::chrono::steady_clock::now();
-            svms::ScheduledRenderEvent scheduled{};
-            while (chunk->PopBefore(INT64_MAX, scheduled)) {
-                if (!compiled->Push(scheduled)) return 3;
+            uint32_t additionallyDrained = 0u;
+            while (drained < count &&
+                   ingress->TryPopSequenceOrdered(timed, mergeState)) {
+                if (!compileOne(timed)) compileFailed = true;
+                ++additionallyDrained;
             }
+            if (compileFailed || additionallyDrained != count - 1u ||
+                drained != count) return 3;
+            const auto sortBegin = std::chrono::steady_clock::now();
+            svms::SortCompiledEventPage(page.events, pages->SortScratch(), count);
+            const auto sortEnd = std::chrono::steady_clock::now();
+            if (!pages->PublishFromCompiler(pageIndex, count)) return 3;
             const auto publishEnd = std::chrono::steady_clock::now();
             compilerSortMs += Milliseconds(sortBegin, sortEnd);
             compilerPublishMs += Milliseconds(sortEnd, publishEnd);
@@ -139,22 +141,30 @@ int main(int argc, char** argv) {
 
         const auto callbackBegin = compilerEnd;
         svms::ScheduledRenderEvent scheduled{};
-        while (compiled->TryPop(scheduled)) {
-            if (!scheduler->EnqueueBatched(scheduled)) return 4;
-        }
-        scheduler->FinalizeBatch();
+        scheduler->ImportAllReady();
         int64_t previousFrame = INT64_MIN;
         uint32_t previousSequence = 0u;
         uint32_t extracted = 0u;
-        while (scheduler->PopBefore(INT64_MAX, scheduled)) {
-            if (scheduled.targetFrame < previousFrame ||
-                (scheduled.targetFrame == previousFrame && extracted != 0u &&
-                 scheduled.sequence < previousSequence)) return 5;
-            previousFrame = scheduled.targetFrame;
-            previousSequence = scheduled.sequence;
-            checksum += scheduled.sequence +
-                static_cast<uint64_t>(scheduled.targetFrame);
-            ++extracted;
+        for (;;) {
+            const svms::ScheduledRenderEvent* run = nullptr;
+            const uint32_t runCount = scheduler->PeekRunBefore(
+                INT64_MAX, eventCount - extracted, run);
+            if (runCount == 0u) break;
+            ++callbackRuns;
+            for (uint32_t i = 0u; i < runCount; ++i) {
+                scheduled = run[i];
+                if (scheduled.targetFrame < previousFrame ||
+                    (scheduled.targetFrame == previousFrame &&
+                     extracted != 0u &&
+                     static_cast<int32_t>(scheduled.sequence -
+                                          previousSequence) < 0)) return 5;
+                previousFrame = scheduled.targetFrame;
+                previousSequence = scheduled.sequence;
+                checksum += scheduled.sequence +
+                    static_cast<uint64_t>(scheduled.targetFrame);
+                ++extracted;
+            }
+            scheduler->ConsumeRun(runCount);
         }
         if (extracted != eventCount) return 5;
         const auto callbackEnd = std::chrono::steady_clock::now();
@@ -176,7 +186,7 @@ int main(int argc, char** argv) {
         "compiler_ms=%.3f compiler_Mevents_s=%.3f\n"
         "compiler_drain_compile_ms=%.3f sort_ms=%.3f publish_ms=%.3f\n"
         "callback_order_ms=%.3f callback_Mevents_s=%.3f "
-        "callback_budget_pct=%.2f checksum=%llu\n",
+        "callback_budget_pct=%.2f merge_runs=%llu checksum=%llu\n",
         eventCount, iterations, kChunkCapacity,
         sizeof(svms::ScheduledRenderEvent),
         producerMs, rate(producerMs), compilerMs, rate(compilerMs),
@@ -184,6 +194,7 @@ int main(int argc, char** argv) {
         compilerSortMs, compilerPublishMs,
         callbackMs, rate(callbackMs),
         callbackPerBatch * 100.0 / audioDeadlineMs,
+        static_cast<unsigned long long>(callbackRuns),
         static_cast<unsigned long long>(checksum));
     return 0;
 }
