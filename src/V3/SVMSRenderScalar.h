@@ -261,12 +261,11 @@ inline RenderScalar::~RenderScalar() {
 inline bool RenderScalar::ConfigureRenderThreads(
     uint32_t totalRenderThreads, uint32_t maximumBlockFrames) {
     if (!workerPool_) return totalRenderThreads <= 1u;
-    // Jobs contain only a kernel and a handle range. Sizing this small
-    // descriptor queue for the hard voice ceiling keeps worker storage
-    // independent of the VoiceManager's growable physical allocation, so a
-    // later live grow never requires restarting the persistent worker lanes.
+    // Size deterministic tile storage for the capacity already reserved by
+    // the engine. A later live grow safely falls back to serial rendering
+    // until the worker pool is rebuilt at restart.
     return workerPool_->Initialize(totalRenderThreads, maximumBlockFrames,
-                                   kMaxPolyphony);
+                                   scratchCapacity_);
 }
 
 inline uint32_t RenderScalar::GetRenderThreadCount() const {

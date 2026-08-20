@@ -44,8 +44,15 @@ struct RenderWorkerPool::Impl {
     RenderJob* jobs = nullptr;
     float* mixStorage = nullptr;
     HANDLE doneEvent = nullptr;
+    using WaitOnAddressProc = BOOL (WINAPI*)(volatile VOID*, PVOID, SIZE_T, DWORD);
+    using WakeByAddressAllProc = VOID (WINAPI*)(PVOID);
+    WaitOnAddressProc waitOnAddress = nullptr;
+    WakeByAddressAllProc wakeByAddressAll = nullptr;
     std::atomic<bool> stopping{false};
     std::atomic<uint32_t> pendingWorkers{0u};
+    alignas(64) std::atomic<uint32_t> workGeneration{0u};
+    alignas(64) std::atomic<uint32_t> nextJob{0u};
+    alignas(64) std::atomic<uint32_t> completedWorkers{0u};
     RenderSpanContext context{};
     uint32_t totalThreads = 1u;
     uint32_t helperCount = 0u;
@@ -54,6 +61,7 @@ struct RenderWorkerPool::Impl {
     uint32_t mixStride = 0u;
     uint32_t jobCapacity = 0u;
     uint32_t jobCount = 0u;
+    size_t jobMixStride = 0u;
     bool queueValid = true;
 
     static DWORD WINAPI ThreadEntry(void* parameter) noexcept {
@@ -71,12 +79,35 @@ struct RenderWorkerPool::Impl {
         DWORD taskIndex = 0u;
         HANDLE mmcss = setMmcss ? setMmcss(L"Pro Audio", &taskIndex) : nullptr;
         SetEvent(worker->readyEvent);
+        uint32_t observedGeneration =
+            self->workGeneration.load(std::memory_order_acquire);
         for (;;) {
-            WaitForSingleObject(worker->wakeEvent, INFINITE);
+#if !defined(SVMS_XP_COMPAT)
+            if (self->waitOnAddress) {
+                while (!self->stopping.load(std::memory_order_acquire) &&
+                       self->workGeneration.load(std::memory_order_acquire) ==
+                           observedGeneration) {
+                    self->waitOnAddress(&self->workGeneration,
+                                        &observedGeneration,
+                                        sizeof(observedGeneration), INFINITE);
+                }
+            } else
+#endif
+            {
+                WaitForSingleObject(worker->wakeEvent, INFINITE);
+            }
             if (self->stopping.load(std::memory_order_acquire)) break;
-            self->ProcessLane(worker->lane);
-            if (self->pendingWorkers.fetch_sub(
-                    1u, std::memory_order_acq_rel) == 1u) {
+            observedGeneration =
+                self->workGeneration.load(std::memory_order_acquire);
+            if (worker->lane >= self->dispatchThreads) continue;
+            self->ProcessJobs();
+            self->completedWorkers.fetch_add(1u, std::memory_order_release);
+#if !defined(SVMS_XP_COMPAT)
+            if (self->wakeByAddressAll)
+                self->wakeByAddressAll(&self->completedWorkers);
+#endif
+            if (self->pendingWorkers.fetch_sub(1u,
+                                               std::memory_order_acq_rel) == 1u) {
                 SetEvent(self->doneEvent);
             }
         }
@@ -85,27 +116,32 @@ struct RenderWorkerPool::Impl {
         return 0u;
     }
 
-    float* LaneLeft(uint32_t lane) noexcept {
-        return mixStorage + static_cast<size_t>(lane) * mixStride * 2u;
+    float* JobLeft(uint32_t job) noexcept {
+        return mixStorage + static_cast<size_t>(job) * jobMixStride;
     }
-    float* LaneRight(uint32_t lane) noexcept {
-        return LaneLeft(lane) + mixStride;
+    float* JobRight(uint32_t job) noexcept {
+        return JobLeft(job) + mixStride;
     }
 
-    void ProcessLane(uint32_t lane) noexcept {
-        float* left = LaneLeft(lane);
-        float* right = LaneRight(lane);
-        std::memset(left, 0, static_cast<size_t>(context.frameCount) * sizeof(float));
-        std::memset(right, 0, static_cast<size_t>(context.frameCount) * sizeof(float));
-        RenderSpanContext local = context;
-        local.outputLeft = left;
-        local.outputRight = right;
-        local.frameStart = 0u;
-        // Parallel classes are deliberately restricted to classes whose
-        // kernels cannot retire or transition during the span.
-        local.classChangeHandles = nullptr;
-        local.classChangeCount = nullptr;
-        for (uint32_t index = lane; index < jobCount; index += dispatchThreads) {
+    void ProcessJobs() noexcept {
+        for (;;) {
+            const uint32_t index =
+                nextJob.fetch_add(1u, std::memory_order_relaxed);
+            if (index >= jobCount) break;
+            float* left = JobLeft(index);
+            float* right = JobRight(index);
+            std::memset(left, 0,
+                        static_cast<size_t>(context.frameCount) * sizeof(float));
+            std::memset(right, 0,
+                        static_cast<size_t>(context.frameCount) * sizeof(float));
+            RenderSpanContext local = context;
+            local.outputLeft = left;
+            local.outputRight = right;
+            local.frameStart = 0u;
+            // Parallel jobs currently contain only classes whose kernels do
+            // not retire or change render class during the span.
+            local.classChangeHandles = nullptr;
+            local.classChangeCount = nullptr;
             const RenderJob& job = jobs[index];
             job.kernel(local, job.handles, job.handleCount);
         }
@@ -113,6 +149,12 @@ struct RenderWorkerPool::Impl {
 
     void ResetStorage() noexcept {
         if (workers) {
+#if !defined(SVMS_XP_COMPAT)
+            if (wakeByAddressAll) {
+                workGeneration.fetch_add(1u, std::memory_order_release);
+                wakeByAddressAll(&workGeneration);
+            }
+#endif
             for (uint32_t index = 0u; index < helperCount; ++index) {
                 if (workers[index].wakeEvent) {
                     SetEvent(workers[index].wakeEvent);
@@ -144,6 +186,7 @@ struct RenderWorkerPool::Impl {
         mixStride = 0u;
         jobCapacity = 0u;
         jobCount = 0u;
+        jobMixStride = 0u;
     }
 };
 
@@ -167,12 +210,13 @@ bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
     impl->helperCount = totalRenderThreads - 1u;
     impl->maxFrames = maxFrames;
     impl->mixStride = (maxFrames + 15u) & ~15u;
+    impl->jobMixStride = static_cast<size_t>(impl->mixStride) * 2u;
     impl->jobCapacity =
         (voiceCapacity + kHandlesPerJob - 1u) / kHandlesPerJob +
         kVoiceRenderClassCount + totalRenderThreads;
 
-    const size_t mixFloats = static_cast<size_t>(totalRenderThreads) *
-        impl->mixStride * 2u;
+    const size_t mixFloats = static_cast<size_t>(impl->jobCapacity) *
+        impl->jobMixStride;
     if (mixFloats > (std::numeric_limits<size_t>::max)() / sizeof(float)) {
         delete impl;
         return false;
@@ -183,6 +227,14 @@ bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
     impl->mixStorage = static_cast<float*>(_aligned_malloc(
         mixFloats * sizeof(float), 64u));
     impl->doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#if !defined(SVMS_XP_COMPAT)
+    if (HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll")) {
+        impl->waitOnAddress = reinterpret_cast<Impl::WaitOnAddressProc>(
+            GetProcAddress(kernel32, "WaitOnAddress"));
+        impl->wakeByAddressAll = reinterpret_cast<Impl::WakeByAddressAllProc>(
+            GetProcAddress(kernel32, "WakeByAddressAll"));
+    }
+#endif
     if (!impl->workers || !impl->jobs || !impl->mixStorage ||
         !impl->doneEvent) {
         impl->stopping.store(true, std::memory_order_release);
@@ -233,8 +285,8 @@ size_t RenderWorkerPool::GetAllocatedBytes() const noexcept {
     return sizeof(Impl) +
         static_cast<size_t>(impl_->helperCount) * sizeof(Impl::Worker) +
         static_cast<size_t>(impl_->jobCapacity) * sizeof(RenderJob) +
-        static_cast<size_t>(impl_->totalThreads) * impl_->mixStride *
-            2u * sizeof(float);
+        static_cast<size_t>(impl_->jobCapacity) * impl_->jobMixStride *
+            sizeof(float);
 }
 
 bool RenderWorkerPool::ShouldParallelize(uint32_t voiceCount,
@@ -275,21 +327,46 @@ bool RenderWorkerPool::Execute() noexcept {
     impl->dispatchThreads = (std::min)(impl->totalThreads, impl->jobCount);
     const uint32_t activeHelpers = impl->dispatchThreads - 1u;
     ResetEvent(impl->doneEvent);
+    impl->nextJob.store(0u, std::memory_order_relaxed);
+    impl->completedWorkers.store(0u, std::memory_order_relaxed);
     impl->pendingWorkers.store(activeHelpers, std::memory_order_release);
-    for (uint32_t index = 0u; index < activeHelpers; ++index)
-        SetEvent(impl->workers[index].wakeEvent);
+    impl->workGeneration.fetch_add(1u, std::memory_order_release);
+#if !defined(SVMS_XP_COMPAT)
+    if (impl->wakeByAddressAll) {
+        impl->wakeByAddressAll(&impl->workGeneration);
+    } else
+#endif
+    {
+        for (uint32_t index = 0u; index < activeHelpers; ++index)
+            SetEvent(impl->workers[index].wakeEvent);
+    }
 
-    impl->ProcessLane(0u);
-    WaitForSingleObject(impl->doneEvent, INFINITE);
+    impl->ProcessJobs();
+    if (activeHelpers != 0u) {
+#if !defined(SVMS_XP_COMPAT)
+        if (impl->waitOnAddress) {
+            for (;;) {
+                uint32_t completed =
+                    impl->completedWorkers.load(std::memory_order_acquire);
+                if (completed >= activeHelpers) break;
+                impl->waitOnAddress(&impl->completedWorkers, &completed,
+                                    sizeof(completed), INFINITE);
+            }
+        } else
+#endif
+        {
+            WaitForSingleObject(impl->doneEvent, INFINITE);
+        }
+    }
 
     const uint32_t frames = impl->context.frameCount;
     float* destinationLeft = impl->context.outputLeft + impl->context.frameStart;
     float* destinationRight = impl->context.outputRight + impl->context.frameStart;
     // Fixed lane order makes each run deterministic even though worker wake
     // and completion order are intentionally unconstrained.
-    for (uint32_t lane = 0u; lane < impl->dispatchThreads; ++lane) {
-        const float* left = impl->LaneLeft(lane);
-        const float* right = impl->LaneRight(lane);
+    for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+        const float* left = impl->JobLeft(job);
+        const float* right = impl->JobRight(job);
         for (uint32_t frame = 0u; frame < frames; ++frame) {
             destinationLeft[frame] += left[frame];
             destinationRight[frame] += right[frame];
