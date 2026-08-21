@@ -1,5 +1,15 @@
 #include "SVMSMidiStream.h"
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <codecvt>
+#include <fcntl.h>
+#include <locale>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
 #include <cstring>
 #include <queue>
@@ -308,10 +318,15 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
 }
 } // namespace
 
+#if defined(_WIN32)
 MappedMidiFile::MappedMidiFile() : file_(INVALID_HANDLE_VALUE), mapping_(nullptr), data_(nullptr), size_(0) {}
+#else
+MappedMidiFile::MappedMidiFile() : file_(-1), data_(nullptr), size_(0) {}
+#endif
 MappedMidiFile::~MappedMidiFile() { Close(); }
 bool MappedMidiFile::Open(const wchar_t* path, std::string& error) {
     Close();
+#if defined(_WIN32)
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (f == INVALID_HANDLE_VALUE) { error = "cannot open MIDI file"; return false; }
@@ -325,13 +340,37 @@ bool MappedMidiFile::Open(const wchar_t* path, std::string& error) {
     const void* data = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
     if (!data) { CloseHandle(m); CloseHandle(f); error = "cannot map MIDI view"; return false; }
     file_ = f; mapping_ = m; data_ = static_cast<const uint8_t*>(data); size_ = uint64_t(size.QuadPart);
+#else
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    const std::string utf8 = converter.to_bytes(path);
+    const int file = ::open(utf8.c_str(), O_RDONLY);
+    if (file < 0) { error = "cannot open MIDI file"; return false; }
+    struct stat status{};
+    if (fstat(file, &status) != 0 || status.st_size <= 0) {
+        ::close(file); error = "empty MIDI file"; return false;
+    }
+    void* mapping = mmap(nullptr, static_cast<size_t>(status.st_size),
+                         PROT_READ, MAP_PRIVATE, file, 0);
+    if (mapping == MAP_FAILED) {
+        ::close(file); error = "cannot map MIDI file"; return false;
+    }
+    file_ = file;
+    data_ = static_cast<const uint8_t*>(mapping);
+    size_ = static_cast<uint64_t>(status.st_size);
+#endif
     return true;
 }
 void MappedMidiFile::Close() {
+#if defined(_WIN32)
     if (data_) UnmapViewOfFile(data_);
     if (mapping_) CloseHandle(static_cast<HANDLE>(mapping_));
     if (file_ != INVALID_HANDLE_VALUE) CloseHandle(static_cast<HANDLE>(file_));
     file_ = INVALID_HANDLE_VALUE; mapping_ = nullptr; data_ = nullptr; size_ = 0;
+#else
+    if (data_) munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
+    if (file_ >= 0) ::close(file_);
+    file_ = -1; data_ = nullptr; size_ = 0;
+#endif
 }
 bool MidiStreamDecoder::Scan(const MappedMidiFile& file, uint32_t rate,
                              MidiStreamInfo& info, std::string& error) const {
@@ -349,10 +388,10 @@ ParsedEventRing::ParsedEventRing(uint32_t mb) : events_(nullptr), capacity_(0), 
     uint64_t slots = (uint64_t(mb ? mb : 1) << 20) / sizeof(PackedMidiEvent);
     uint64_t power = 1; while ((power << 1) <= slots) power <<= 1;
     capacity_ = power; mask_ = power - 1;
-    events_ = static_cast<PackedMidiEvent*>(VirtualAlloc(nullptr, size_t(power * sizeof(PackedMidiEvent)),
-                                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    events_ = static_cast<PackedMidiEvent*>(_aligned_malloc(
+        size_t(power * sizeof(PackedMidiEvent)), 64u));
 }
-ParsedEventRing::~ParsedEventRing() { if (events_) VirtualFree(events_, 0, MEM_RELEASE); }
+ParsedEventRing::~ParsedEventRing() { _aligned_free(events_); }
 bool ParsedEventRing::Push(const PackedMidiEvent& event, const std::atomic<bool>& cancel) {
     while (!cancel.load(std::memory_order_relaxed)) {
         const uint64_t h = head_.load(std::memory_order_relaxed);
@@ -360,7 +399,11 @@ bool ParsedEventRing::Push(const PackedMidiEvent& event, const std::atomic<bool>
             events_[h & mask_] = event;
             head_.store(h + 1, std::memory_order_release); return true;
         }
+#if defined(_WIN32)
         Sleep(0);
+#else
+        sched_yield();
+#endif
     }
     return false;
 }

@@ -1,6 +1,7 @@
 #ifndef SVMS_MIDI_STREAM_H
 #define SVMS_MIDI_STREAM_H
 
+#include "SVMSPlatform.h"
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -50,8 +51,12 @@ public:
     const uint8_t* Data() const { return data_; }
     uint64_t Size() const { return size_; }
 private:
+#if defined(_WIN32)
     void* file_;
     void* mapping_;
+#else
+    int file_;
+#endif
     const uint8_t* data_;
     uint64_t size_;
 };

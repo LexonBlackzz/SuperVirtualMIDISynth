@@ -8,9 +8,85 @@ if(SVMS_XP_COMPAT AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR "SVMS_XP_COMPAT is a 32-bit-only target")
 endif()
 
-set(CMAKE_CXX_STANDARD 20)
+if(WIN32)
+    set(CMAKE_CXX_STANDARD 20)
+else()
+    # The portable engine does not require C++20. C++17 keeps the produced
+    # ELF binary buildable against Ubuntu 18.04's native GCC/libstdc++.
+    set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    find_package(ALSA REQUIRED)
+
+    set(SVMS_PORTABLE_RENDER_SOURCES
+        SVMSSoundFont.cpp
+        SVMSRenderKernels.cpp
+        SVMSRenderWorkersPosix.cpp
+        SVMSRenderDispatch.cpp
+        SVMSRenderKernelsSSE2.cpp
+        SVMSRenderKernelsAVX2.cpp)
+
+    set_source_files_properties(SVMSRenderKernelsSSE2.cpp PROPERTIES
+        COMPILE_OPTIONS "-msse2;-mno-avx")
+    set_source_files_properties(SVMSRenderKernelsAVX2.cpp PROPERTIES
+        COMPILE_OPTIONS "-mavx2;-mno-fma")
+
+    add_executable(svms_v3_render
+        SVMSOfflineRenderer.cpp
+        SVMSMidiStream.cpp
+        ${SVMS_PORTABLE_RENDER_SOURCES})
+    target_include_directories(svms_v3_render PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+    target_compile_options(svms_v3_render PRIVATE
+        -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(svms_v3_render PRIVATE Threads::Threads)
+
+    add_executable(svmsd
+        SVMSLinuxDaemon.cpp
+        ${SVMS_PORTABLE_RENDER_SOURCES})
+    target_include_directories(svmsd PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party"
+        ${ALSA_INCLUDE_DIRS})
+    target_compile_options(svmsd PRIVATE
+        -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(svmsd PRIVATE Threads::Threads ${ALSA_LIBRARIES})
+
+    set_target_properties(svms_v3_render svmsd PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
+    if(SVMS_BUILD_TESTS)
+        add_executable(svms_v3_voice_growth_tests
+            tests/SVMSVoiceGrowthRegression.cpp
+            ${SVMS_PORTABLE_RENDER_SOURCES})
+        target_include_directories(svms_v3_voice_growth_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(svms_v3_voice_growth_tests PRIVATE Threads::Threads)
+        add_test(NAME svms_v3_voice_growth COMMAND svms_v3_voice_growth_tests)
+
+        add_executable(svms_v3_limiter_tests tests/SVMSLimiterTests.cpp)
+        target_include_directories(svms_v3_limiter_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
+
+        add_executable(svms_v3_midi_stream_tests
+            tests/SVMSMidiStreamTests.cpp
+            SVMSMidiStream.cpp)
+        target_include_directories(svms_v3_midi_stream_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(svms_v3_midi_stream_tests PRIVATE Threads::Threads)
+        add_test(NAME svms_v3_midi_stream COMMAND svms_v3_midi_stream_tests)
+    endif()
+
+    install(TARGETS svmsd svms_v3_render RUNTIME DESTINATION bin)
+    return()
+endif()
 
 if(MSVC)
     add_compile_options(/W4 /WX- /Zc:__cplusplus)

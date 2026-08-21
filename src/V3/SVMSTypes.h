@@ -1,10 +1,10 @@
 #ifndef SVMS_TYPES_H
 #define SVMS_TYPES_H
 
+#include "SVMSPlatform.h"
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
-#include <malloc.h>
 #include <new>
 
 namespace svms {

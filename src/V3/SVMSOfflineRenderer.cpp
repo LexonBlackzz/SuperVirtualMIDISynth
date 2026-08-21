@@ -1,4 +1,9 @@
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <codecvt>
+#include <locale>
+#endif
 #include "SVMSMidiStream.h"
 #include "SVMSSoundFont.h"
 #include "SVMSVoiceManager.h"
@@ -8,14 +13,17 @@
 #include "SVMSLimiter.h"
 #include "SVMSEnvelope.h"
 #include "SVMSConfig.h"
+#include "SVMSStandaloneSynth.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cwchar>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -62,7 +70,15 @@ std::wstring FormatTime(double seconds) {
     if (!std::isfinite(seconds) || seconds < 0) return L"--:--:--";
     const uint64_t s = static_cast<uint64_t>(seconds + 0.5);
     wchar_t text[32];
+#if defined(_WIN32)
     swprintf_s(text, L"%02llu:%02llu:%02llu", s / 3600, (s / 60) % 60, s % 60);
+#else
+    std::swprintf(text, sizeof(text) / sizeof(text[0]),
+                  L"%02llu:%02llu:%02llu",
+                  static_cast<unsigned long long>(s / 3600),
+                  static_cast<unsigned long long>((s / 60) % 60),
+                  static_cast<unsigned long long>(s % 60));
+#endif
     return text;
 }
 
@@ -184,15 +200,21 @@ public:
     ~WaveWriter() { Close(); }
     bool Open(const wchar_t* path, uint32_t rate, uint64_t estimatedFrames) {
         Close(); rate_ = rate;
+#if defined(_WIN32)
         file_ = _wfopen(path, L"wb+"); if (!file_) return false;
+#else
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        const std::string utf8 = converter.to_bytes(path);
+        file_ = std::fopen(utf8.c_str(), "wb+"); if (!file_) return false;
+#endif
         rf64_ = estimatedFrames > (0xffffffffull - 80ull) / 8ull;
         if (rf64_) {
             fwrite("RF64",1,4,file_); U32(0xffffffffu); fwrite("WAVE",1,4,file_);
-            fwrite("ds64",1,4,file_); U32(28); ds64Pos_=uint64_t(_ftelli64(file_));
+            fwrite("ds64",1,4,file_); U32(28); ds64Pos_=Tell();
             U64(0); U64(0); U64(0); U32(0);
         } else { fwrite("RIFF",1,4,file_); U32(0); fwrite("WAVE",1,4,file_); }
         fwrite("fmt ",1,4,file_); U32(16); U16(3); U16(2); U32(rate); U32(rate*8); U16(8); U16(32);
-        fwrite("data",1,4,file_); dataSizePos_=uint64_t(_ftelli64(file_)); U32(rf64_ ? 0xffffffffu : 0u);
+        fwrite("data",1,4,file_); dataSizePos_=Tell(); U32(rf64_ ? 0xffffffffu : 0u);
         return true;
     }
     bool Write(const float* left, const float* right, uint32_t frames) {
@@ -203,18 +225,32 @@ public:
     }
     bool Close() {
         if (!file_) return true;
-        const uint64_t bytes=frames_*8, end=uint64_t(_ftelli64(file_));
+        const uint64_t bytes=frames_*8, end=Tell();
         if (rf64_) {
-            _fseeki64(file_, static_cast<__int64>(ds64Pos_), SEEK_SET);
+            Seek(ds64Pos_);
             U64(end-8); U64(bytes); U64(frames_);
         } else {
-            _fseeki64(file_,4,SEEK_SET); U32(static_cast<uint32_t>(end-8));
-            _fseeki64(file_,static_cast<__int64>(dataSizePos_),SEEK_SET); U32(static_cast<uint32_t>(bytes));
+            Seek(4); U32(static_cast<uint32_t>(end-8));
+            Seek(dataSizePos_); U32(static_cast<uint32_t>(bytes));
         }
         const bool ok=fclose(file_)==0; file_=nullptr; return ok;
     }
     uint64_t Frames() const { return frames_; }
 private:
+    uint64_t Tell() const {
+#if defined(_WIN32)
+        return static_cast<uint64_t>(_ftelli64(file_));
+#else
+        return static_cast<uint64_t>(ftello(file_));
+#endif
+    }
+    void Seek(uint64_t offset) {
+#if defined(_WIN32)
+        _fseeki64(file_, static_cast<__int64>(offset), SEEK_SET);
+#else
+        fseeko(file_, static_cast<off_t>(offset), SEEK_SET);
+#endif
+    }
     void U16(uint16_t v) { fwrite(&v,2,1,file_); }
     void U32(uint32_t v) { fwrite(&v,4,1,file_); }
     void U64(uint64_t v) { fwrite(&v,8,1,file_); }
@@ -222,6 +258,9 @@ private:
     uint64_t frames_=0, ds64Pos_=0, dataSizePos_=0; std::vector<float> scratch_;
 };
 
+#if 0
+// Retained temporarily as a readable oracle while the shared standalone
+// facade proves itself on both platforms. Production uses StandaloneSynth.
 struct PreparedRegion {
     float baseStep[kNoteCount]; float bendScale, attenuation, sustain, decaySlope, releaseDecay, panL, panR;
     uint32_t delay, hold, attack, decay, release; bool valid;
@@ -340,22 +379,52 @@ private:
     VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};
 };
 
+#endif
+
 struct ProducerContext { ParsedEventRing* ring; const MappedMidiFile* file; uint32_t rate; std::atomic<bool>* cancel; std::atomic<bool>* done; std::atomic<uint64_t>* decoded; std::string* error; };
 bool RingSink(const PackedMidiEvent& e,void* p){auto& c=*static_cast<ProducerContext*>(p);if(!c.ring->Push(e,*c.cancel))return false;c.decoded->fetch_add(1,std::memory_order_relaxed);return true;}
 
 } // namespace
 } // namespace svms
 
-int wmain(int argc,wchar_t** argv) {
+int RendererMain(int argc,wchar_t** argv) {
     using namespace svms;
+#if defined(_WIN32)
     const EngineConfig engineConfig=EngineConfig::Load();
+#else
+    EngineConfig engineConfig{};
+    engineConfig.sampleRate = kDefaultSampleRate;
+    engineConfig.maxVoices = 4096u;
+    engineConfig.renderThreads = 1u;
+    engineConfig.masterVolume = 1.0f;
+    engineConfig.limiterEnabled = true;
+    engineConfig.limiterAlgorithm = LimiterAlgorithm::Classic;
+    engineConfig.limiterThreshold = 0.95f;
+    engineConfig.limiterLookaheadMs = 3.0f;
+    engineConfig.limiterAttackMs = 0.5f;
+    engineConfig.limiterReleaseMs = 100.0f;
+#endif
     Options o;ApplyConfigDefaults(engineConfig,o);if(!ParseOptions(argc,argv,o)){Usage();return 2;}
     if(!o.quiet&&!engineConfig.configWarning.empty())fprintf(stderr,"config warning: %s\n",engineConfig.configWarning.c_str());
     std::string error;MappedMidiFile midi;if(!midi.Open(o.midi.c_str(),error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
     MidiStreamDecoder decoder;MidiStreamInfo info;if(!decoder.Scan(midi,o.sampleRate,info,error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
     if(o.scanOnly){fwprintf(stdout,L"SMF %u, %u tracks, %llu channel events, %llu note-ons, %llu frames (%s at %u Hz)\nPeak 1s: %llu events at %s, %llu note-ons at %s; peak frame: %llu events (%llu note-ons) at frame %llu\nExact-frame repetition: %llu exact duplicates total (peak %llu/frame), %llu channel/key duplicates total (peak %llu/frame), across %llu note-on frames\nWithin uninterrupted note-on runs: %llu exact duplicates (peak %llu/frame), %llu immediately adjacent\n",info.format,info.tracks,info.eventCount,info.noteOnCount,info.totalFrames,FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),o.sampleRate,info.peakEventsPerSecond,FormatTime(double(info.peakEventSecond)).c_str(),info.peakNoteOnsPerSecond,FormatTime(double(info.peakNoteOnSecond)).c_str(),info.peakEventsAtFrame,info.peakNoteOnsAtFrame,info.peakFrame,info.exactDuplicateNoteOnCount,info.peakExactDuplicateNoteOnsAtFrame,info.keyDuplicateNoteOnCount,info.peakKeyDuplicateNoteOnsAtFrame,info.noteOnFrameCount,info.noteRunExactDuplicateCount,info.peakNoteRunExactDuplicatesAtFrame,info.adjacentExactDuplicateNoteOnCount);return 0;}
     ParsedEventRing ring(o.eventBufferMB);if(!ring.IsValid()){fprintf(stderr,"error: cannot allocate parsed-event ring\n");return 1;}
-    auto synth=std::make_unique<OfflineSynth>();if(!synth->Initialize(o,error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
+    StandaloneSynthConfig synthConfig{};
+    synthConfig.soundfont = o.soundfont;
+    synthConfig.sampleRate = o.sampleRate;
+    synthConfig.maxVoices = o.maxVoices;
+    synthConfig.renderThreads = o.renderThreads;
+    synthConfig.maxBlockFrames = o.blockFrames;
+    synthConfig.masterVolume = o.masterVolume;
+    synthConfig.limiterEnabled = o.limiterEnabled;
+    synthConfig.limiterAlgorithm = o.limiterAlgorithm;
+    synthConfig.limiterThreshold = o.limiterThreshold;
+    synthConfig.limiterLookaheadMs = o.limiterLookaheadMs;
+    synthConfig.limiterAttackMs = o.limiterAttackMs;
+    synthConfig.limiterReleaseMs = o.limiterReleaseMs;
+    synthConfig.backend = o.backend;
+    auto synth=std::make_unique<StandaloneSynth>();if(!synth->Initialize(synthConfig,error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
     WaveWriter wave;if(!wave.Open(o.output.c_str(),o.sampleRate,info.totalFrames+uint64_t(o.maxTailSeconds)*o.sampleRate)){fprintf(stderr,"error: cannot create output file\n");return 1;}
     std::atomic<bool> cancel{false},done{false};std::atomic<uint64_t> decoded{0};std::string producerError;
     ProducerContext context{&ring,&midi,o.sampleRate,&cancel,&done,&decoded,&producerError};
@@ -371,13 +440,34 @@ int wmain(int argc,wchar_t** argv) {
         const auto now=std::chrono::steady_clock::now();if(!o.quiet&&now-last>=std::chrono::seconds(1)){const double audioDelta=double(frame-lastFrame)/o.sampleRate;const double recent=audioDelta/std::chrono::duration<double>(now-last).count();const double dspMsPerAudioSecond=audioDelta>0?double(renderNs-lastRenderNs)/1000000.0/audioDelta:0.0;const double eta=recent>0?double(info.totalFrames>frame?info.totalFrames-frame:0)/o.sampleRate/recent:INFINITY;fwprintf(stderr,L"\r%s / %s  %6.2f%% | voices %u free %u steals %u | events %llu/%llu | %.2fx | DSP %.1f ms/audio-s | ETA %s   ",FormatTime(double(frame)/o.sampleRate).c_str(),FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),info.totalFrames?100.0*frame/info.totalFrames:100.0,synth->Active(),synth->Free(),synth->Steals(),events,info.eventCount,recent,dspMsPerAudioSecond,FormatTime(eta).c_str());last=now;lastFrame=frame;lastRenderNs=renderNs;}}
     };
     PackedMidiEvent event{};bool have=false;
-    while(ioOk){while(!(have=ring.Pop(event))&&!done.load(std::memory_order_acquire))Sleep(0);if(!have)break;renderTo(event.outputFrame);synth->Dispatch(event.message,event.outputFrame);++events;
+    while(ioOk){while(!(have=ring.Pop(event))&&!done.load(std::memory_order_acquire))std::this_thread::yield();if(!have)break;renderTo(event.outputFrame);synth->Dispatch(event.message,event.outputFrame);++events;
         // Do not advance audio until the producer has exposed every possible
         // equal-frame successor; this preserves global sequence ordering.
-        for(;;){PackedMidiEvent next{};while(!ring.Peek(next)&&!done.load(std::memory_order_acquire))Sleep(0);if(!ring.Peek(next)||next.outputFrame!=event.outputFrame)break;ring.Pop(event);synth->Dispatch(event.message,event.outputFrame);++events;}
+        for(;;){PackedMidiEvent next{};while(!ring.Peek(next)&&!done.load(std::memory_order_acquire))std::this_thread::yield();if(!ring.Peek(next)||next.outputFrame!=event.outputFrame)break;ring.Pop(event);synth->Dispatch(event.message,event.outputFrame);++events;}
     }
     if(ioOk){renderTo(info.totalFrames);synth->ReleaseAll();const uint64_t tailEnd=frame+uint64_t(o.maxTailSeconds)*o.sampleRate;while((synth->Active()||synth->Tails())&&frame<tailEnd)renderTo((std::min<uint64_t>)(tailEnd,frame+o.blockFrames));}
     cancel.store(true);producer.join();if(!wave.Close())ioOk=false;
     if(!o.quiet)fwprintf(stderr,L"\nRendered %s (%llu frames), %llu MIDI events, %u steals. Notes: %llu received, %llu matched; rejects preset=%llu region=%llu invalid=%llu.\n",FormatTime(double(wave.Frames())/o.sampleRate).c_str(),wave.Frames(),events,synth->Steals(),synth->NoteCalls(),synth->MatchedNotes(),synth->MissingPresets(),synth->MissingRegions(),synth->InvalidRegions());
     if(!producerError.empty()&&events!=info.eventCount){fprintf(stderr,"decoder error: %s\n",producerError.c_str());return 1;}if(!ioOk){fprintf(stderr,"error: output write failed\n");return 1;}return 0;
 }
+
+#if defined(_WIN32)
+int wmain(int argc, wchar_t** argv) { return RendererMain(argc, argv); }
+#else
+int main(int argc, char** argv) {
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    std::vector<std::wstring> storage;
+    std::vector<wchar_t*> wideArguments;
+    storage.reserve(static_cast<size_t>(argc));
+    wideArguments.reserve(static_cast<size_t>(argc));
+    try {
+        for (int index = 0; index < argc; ++index)
+            storage.push_back(converter.from_bytes(argv[index]));
+    } catch (const std::range_error&) {
+        std::fprintf(stderr, "error: command line is not valid UTF-8\n");
+        return 2;
+    }
+    for (std::wstring& value : storage) wideArguments.push_back(&value[0]);
+    return RendererMain(argc, wideArguments.data());
+}
+#endif

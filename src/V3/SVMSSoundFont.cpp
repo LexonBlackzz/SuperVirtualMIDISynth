@@ -1,6 +1,12 @@
 #include "SVMSSoundFont.h"
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <codecvt>
+#include <locale>
+#endif
 #include <cstdio>
+#include <string>
 #include <vector>
 
 namespace svms {
@@ -255,7 +261,13 @@ bool sf2_load(const char* path, SF2Data* outData) {
 
 bool sf2_load(const wchar_t* path, SF2Data* outData) {
     if (!path || !outData) return false;
+#if defined(_WIN32)
     FILE* file = _wfopen(path, L"rb");
+#else
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    const std::string utf8 = converter.to_bytes(path);
+    FILE* file = std::fopen(utf8.c_str(), "rb");
+#endif
     if (!file) {
         std::memset(outData, 0, sizeof(SF2Data));
         OutputDebugStringA("[SVMS-SF2] unable to open Unicode SoundFont path\n");
