@@ -147,6 +147,19 @@ public:
             voices_.ReleaseChannel(channel, 0);
     }
 
+    void ResetAll(uint64_t absoluteFrame) {
+        voices_.SetCurrentFrame(absoluteFrame);
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel)
+            voices_.SilenceChannelImmediate(channel);
+        channels_.Reset();
+        channels_.SetMasterVolume(master_);
+        channels_.RebuildCache(cfg_, static_cast<float>(rate_));
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel) {
+            bendRatio_[channel] = 1.0f;
+            RefreshPreset(channel);
+        }
+    }
+
     uint32_t Active() const { return voices_.GetActiveCount(); }
     uint32_t Tails() const { return voices_.GetStealTailCount(); }
     uint32_t Steals() const { return voices_.stealCount_; }

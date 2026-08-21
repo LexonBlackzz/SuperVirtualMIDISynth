@@ -57,6 +57,19 @@ if(NOT WIN32)
         -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(svmsd PRIVATE Threads::Threads ${ALSA_LIBRARIES})
 
+    add_library(omnimidi SHARED
+        SVMSLinuxKDMAPI.cpp
+        ${SVMS_PORTABLE_RENDER_SOURCES})
+    target_include_directories(omnimidi PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party"
+        ${ALSA_INCLUDE_DIRS})
+    target_compile_options(omnimidi PRIVATE
+        -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(omnimidi PRIVATE
+        Threads::Threads ${ALSA_LIBRARIES} ${CMAKE_DL_LIBS})
+    set_target_properties(omnimidi PROPERTIES OUTPUT_NAME "OmniMIDI")
+
     set_target_properties(svms_v3_render svmsd PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -82,9 +95,20 @@ if(NOT WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_midi_stream_tests PRIVATE Threads::Threads)
         add_test(NAME svms_v3_midi_stream COMMAND svms_v3_midi_stream_tests)
+
+        add_executable(svms_v3_linux_kdmapi_smoke
+            tests/SVMSLinuxKDMAPISmoke.cpp)
+        target_include_directories(svms_v3_linux_kdmapi_smoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(svms_v3_linux_kdmapi_smoke PRIVATE
+            ${CMAKE_DL_LIBS})
+        add_test(NAME svms_v3_linux_kdmapi
+            COMMAND svms_v3_linux_kdmapi_smoke $<TARGET_FILE:omnimidi>)
     endif()
 
-    install(TARGETS svmsd svms_v3_render RUNTIME DESTINATION bin)
+    install(TARGETS svmsd svms_v3_render omnimidi
+        RUNTIME DESTINATION bin
+        LIBRARY DESTINATION lib)
     return()
 endif()
 

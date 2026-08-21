@@ -17,7 +17,8 @@ ctest --test-dir build/V3-linux --output-on-failure
 ```
 
 GitHub Actions also produces an Ubuntu 18.04-compatible archive containing
-`svmsd` and the offline `svms_v3_render` tool.
+`svmsd`, the offline `svms_v3_render` tool, and the native Ziggy-compatible
+`libOmniMIDI.so` KDMAPI library.
 
 ## Run
 
@@ -47,6 +48,39 @@ deterministic voice tiles. Incoming events are assigned absolute output frames
 from a monotonic-clock epoch plus the measured ALSA buffer lead. Events are not
 snapped to render-block boundaries.
 
-This initial target accepts MIDI 1.0 channel voice messages through ALSA
-Sequencer. Native JACK/PipeWire MIDI, Linux JSON configuration, SysEx, service
-installation, and a GUI are later work.
+The daemon target accepts MIDI 1.0 channel voice messages through ALSA
+Sequencer. Native JACK/PipeWire MIDI, SysEx, service installation, and a GUI
+are later work.
+
+## Ziggy and KDMAPI
+
+Place `libOmniMIDI.so` beside the Linux `ziggy` executable. Ziggy discovers it
+automatically and uses the same KDMAPI calls as its Windows real-time mode:
+
+```sh
+cp /path/to/libOmniMIDI.so /path/to/ziggy-directory/
+cd /path/to/ziggy-directory
+./ziggy
+```
+
+The library searches for `config.json` in the working directory, beside the
+library, and in `$XDG_CONFIG_HOME/SuperVirtualMIDISynth` (or
+`~/.config/SuperVirtualMIDISynth`). Relative SoundFont paths are resolved from
+the selected configuration. With no configuration it looks for `gm.sf2`
+beside Ziggy or the library. `SVMS_CONFIG`, `SVMS_SOUNDFONT`, and
+`SVMS_AUDIO_DEVICE` provide explicit overrides.
+
+Linux-specific ALSA output can optionally be selected without changing the
+Windows device setting:
+
+```json
+{
+  "audio": {
+    "linux_device": "default"
+  }
+}
+```
+
+The compatibility exports include rendering time, active voices, free voices,
+and voice steals. Ziggy therefore recognizes this library as an SSV2-style
+provider and can show all four overlays.

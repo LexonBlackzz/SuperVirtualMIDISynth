@@ -46,6 +46,8 @@ jobs:
               cp build/V3-linux-bionic/bin/svmsd \
                  build/V3-linux-bionic/bin/svms_v3_render \
                  build/SVMS-V3-linux-x86_64/
+              cp build/V3-linux-bionic/libOmniMIDI.so \
+                 build/SVMS-V3-linux-x86_64/
               cp src/V3/LINUX.md build/SVMS-V3-linux-x86_64/README.md
               tar -C build -czf build/SVMS-V3-linux-x86_64-ubuntu18.04.tar.gz \
                 SVMS-V3-linux-x86_64
