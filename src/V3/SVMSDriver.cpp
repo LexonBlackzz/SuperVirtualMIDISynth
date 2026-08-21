@@ -1914,7 +1914,8 @@ private:
                                          uint32_t eventCount,
                                          uint32_t blockCursor, void* userData);
 
-    void HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity);
+    uint64_t HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
+                          bool deferLifetimeCounters = false);
     void HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset);
     void HandleStaleNoteOffBatch(uint8_t channel, uint8_t note, uint8_t count,
                                  uint32_t blockOffset);
@@ -1989,6 +1990,8 @@ private:
     uint32_t channelLaunchRevision_[kChannelCount];
     NoteRegionCacheEntry noteRegionCache_[kNoteRegionCacheSize];
     NoteLaunchPlanCacheEntry noteLaunchPlanCache_[kNoteRegionCacheSize];
+    NoteLaunchPlanCacheEntry*
+        noteLaunchHotCache_[kChannelCount][kNoteCount];
     const SFSampleRegion* noteRegionScratch_[kMaxMatchingRegions];
     VoiceConfiguration noteLaunchScratch_[kMaxMatchingRegions];
     VoiceHandle noteLaunchHandles_[kMaxMatchingRegions];
@@ -2564,6 +2567,7 @@ Driver::Driver()
       virtualRenderSample_(0), clockInitialized(false), nextPlayIndex_(1) {
     std::memset(noteRegionCache_, 0xff, sizeof(noteRegionCache_));
     std::memset(noteLaunchPlanCache_, 0, sizeof(noteLaunchPlanCache_));
+    std::memset(noteLaunchHotCache_, 0, sizeof(noteLaunchHotCache_));
     std::fill(std::begin(channelLaunchRevision_),
               std::end(channelLaunchRevision_), 1u);
     std::memset(configuredVelocityGain_, 0, sizeof(configuredVelocityGain_));
@@ -4088,6 +4092,9 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
     // ingress sequence. Process maximal note-on runs directly; any state or
     // termination event breaks the run and goes through the full dispatcher.
     uint32_t index = 0u;
+    uint64_t deferredNoteOns = 0u;
+    uint64_t deferredMatches = 0u;
+    uint64_t deferredConfigured = 0u;
     while (index < eventCount) {
         if (events[index].type == RenderEventType::NoteOff) {
             const uint8_t channel = events[index].channel;
@@ -4123,12 +4130,20 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
                     std::memory_order_acquire)
                 : 0u;
             if (!FenceSuppresses(event.ingressSequence, globalFence) &&
-                !FenceSuppresses(event.ingressSequence, channelFence)) {
-                self->HandleNoteOn(event.channel, event.data1, event.data2);
+                !FenceSuppresses(event.ingressSequence, channelFence) &&
+                event.channel < kChannelCount && event.data1 < kNoteCount) {
+                ++deferredNoteOns;
+                const uint64_t delta = self->HandleNoteOn(
+                    event.channel, event.data1, event.data2, true);
+                deferredMatches += static_cast<uint32_t>(delta);
+                deferredConfigured += static_cast<uint32_t>(delta >> 32u);
             }
         } while (index < eventCount &&
                  events[index].type == RenderEventType::NoteOn);
     }
+    self->sf2Telemetry_.noteOns += deferredNoteOns;
+    self->sf2Telemetry_.exactRegionMatches += deferredMatches;
+    self->sf2Telemetry_.configuredVoices += deferredConfigured;
     if (self->diagnosticsEnabled_)
         self->dispatchCyclesCurrent_ += __rdtsc() - profileBegin;
 }
@@ -4186,20 +4201,21 @@ void Driver::RefreshSelectedPresets() {
     }
 }
 
-void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
-    if (!channelCache || !voiceManager) return;
-    if (channel >= kChannelCount || note >= kNoteCount) return;
+uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
+                              bool deferLifetimeCounters) {
+    if (!channelCache || !voiceManager) return 0u;
+    if (channel >= kChannelCount || note >= kNoteCount) return 0u;
     velocity &= 0x7fu;
 
-    ++sf2Telemetry_.noteOns;
+    if (!deferLifetimeCounters) ++sf2Telemetry_.noteOns;
     const bool captureDetail = captureSf2Detail_;
 
     const float velGain = configuredVelocityGain_[velocity];
-    if (velGain <= 0.0f) return;
+    if (velGain <= 0.0f) return 0u;
 
     channelCache->NoteOn(channel, note, velocity);
 
-    if (!soundFontData || !samplesStore || !sampleDataStore) return;
+    if (!soundFontData || !samplesStore || !sampleDataStore) return 0u;
 
     // Bank/program handlers commit this cache at their exact event frame.
     // The fallback covers reset and SoundFont-swap boundaries only; the
@@ -4210,7 +4226,7 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         if (!ResolveChannelPreset(soundFontData, *channelCache, channel,
                                   &presetIndex)) {
             ++sf2Telemetry_.invalidPresets;
-            return;
+            return 0u;
         }
         channelCache->SetSelectedPreset(channel,
                                         static_cast<uint16_t>(presetIndex));
@@ -4220,34 +4236,43 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     // revalidated every layer before discovering that the fully prepared
     // plan was already present.  At Black-MIDI rates that redundant work is
     // paid close to a million times per second.
-    uint32_t launchHash = presetIndex * 0x9e3779b9u;
-    launchHash ^= static_cast<uint32_t>(note) * 0x85ebca6bu;
-    launchHash ^= static_cast<uint32_t>(velocity) * 0xc2b2ae35u;
-    launchHash ^= static_cast<uint32_t>(channel) * 0x27d4eb2fu;
-    launchHash ^= channelLaunchRevision_[channel] * 0x165667b1u;
-    launchHash ^= launchHash >> 16u;
-    NoteLaunchPlanCacheEntry& launchCache =
-        noteLaunchPlanCache_[launchHash & (kNoteRegionCacheSize - 1u)];
-    const bool launchCacheHit =
-        launchCache.soundFontGeneration == soundFontGeneration_ &&
-        launchCache.channelRevision == channelLaunchRevision_[channel] &&
-        launchCache.presetIndex == presetIndex &&
-        launchCache.channel == channel && launchCache.note == note &&
-        launchCache.velocity == velocity && launchCache.count != 0u &&
-        launchCache.count <= kNoteRegionCacheLayers;
+    auto planMatches = [&](const NoteLaunchPlanCacheEntry* entry) {
+        return entry &&
+            entry->soundFontGeneration == soundFontGeneration_ &&
+            entry->channelRevision == channelLaunchRevision_[channel] &&
+            entry->presetIndex == presetIndex && entry->channel == channel &&
+            entry->note == note && entry->velocity == velocity &&
+            entry->count != 0u &&
+            entry->count <= kNoteRegionCacheLayers;
+    };
+    NoteLaunchPlanCacheEntry* launchCache =
+        noteLaunchHotCache_[channel][note];
+    bool launchCacheHit = planMatches(launchCache);
+    if (!launchCacheHit) {
+        uint32_t launchHash = presetIndex * 0x9e3779b9u;
+        launchHash ^= static_cast<uint32_t>(note) * 0x85ebca6bu;
+        launchHash ^= static_cast<uint32_t>(velocity) * 0xc2b2ae35u;
+        launchHash ^= static_cast<uint32_t>(channel) * 0x27d4eb2fu;
+        launchHash ^= channelLaunchRevision_[channel] * 0x165667b1u;
+        launchHash ^= launchHash >> 16u;
+        launchCache = &noteLaunchPlanCache_[
+            launchHash & (kNoteRegionCacheSize - 1u)];
+        launchCacheHit = planMatches(launchCache);
+        noteLaunchHotCache_[channel][note] = launchCache;
+    }
 
-    uint32_t matchCount = launchCacheHit ? launchCache.count
+    uint32_t matchCount = launchCacheHit ? launchCache->count
         : ResolveNoteRegions(presetIndex, note, velocity,
                              noteRegionScratch_, kMaxMatchingRegions);
     if (matchCount > kMaxMatchingRegions) {
         ++telemetry_.allocationFailures;
-        return;
+        return 0u;
     }
 
     if (matchCount == 0) {
         ++telemetry_.zeroMatchedRegions;
         ++sf2Telemetry_.zeroMatchedRegions;
-        return;
+        return 0u;
     }
 
     // Validate every layer before mutating the voice pool. A malformed
@@ -4258,7 +4283,7 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
             const SFSampleRegion* region = noteRegionScratch_[mi];
             if (!region || region->sampleIndex >= sampleStoreCount) {
                 ++sf2Telemetry_.invalidRegions;
-                return;
+                return 0u;
             }
             const uint32_t regionIndex = static_cast<uint32_t>(
                 region - soundFontData->regions);
@@ -4267,11 +4292,12 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
                 : sf2_validate_region(soundFontData, region);
             if (!valid) {
                 ++sf2Telemetry_.invalidSampleRanges;
-                return;
+                return 0u;
             }
         }
     }
-    sf2Telemetry_.exactRegionMatches += matchCount;
+    if (!deferLifetimeCounters)
+        sf2Telemetry_.exactRegionMatches += matchCount;
 
     // All regions layered by this one MIDI note-on share a generation.  A
     // later note-off must release only this generation's oldest outstanding
@@ -4290,7 +4316,7 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         // The cached setup is immutable. playIndex is the only per-note field;
         // pass it separately instead of copying every layer into scratch just
         // to patch four bytes at multi-million-note rates.
-        launchSetups = launchCache.setup;
+        launchSetups = launchCache->setup;
     } else for (uint32_t mi = 0; mi < matchCount; ++mi) {
         const SFSampleRegion* matchedRegion = noteRegionScratch_[mi];
         const uint32_t matchedRegionIndex = static_cast<uint32_t>(
@@ -4428,26 +4454,28 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     }
 
     if (!launchCacheHit && matchCount <= kNoteRegionCacheLayers) {
-        launchCache.soundFontGeneration = soundFontGeneration_;
-        launchCache.channelRevision = channelLaunchRevision_[channel];
-        launchCache.presetIndex = static_cast<uint16_t>(presetIndex);
-        launchCache.channel = channel;
-        launchCache.note = note;
-        launchCache.velocity = velocity;
-        launchCache.count = static_cast<uint8_t>(matchCount);
+        launchCache->soundFontGeneration = soundFontGeneration_;
+        launchCache->channelRevision = channelLaunchRevision_[channel];
+        launchCache->presetIndex = static_cast<uint16_t>(presetIndex);
+        launchCache->channel = channel;
+        launchCache->note = note;
+        launchCache->velocity = velocity;
+        launchCache->count = static_cast<uint8_t>(matchCount);
         for (uint32_t layer = 0u; layer < matchCount; ++layer)
-            launchCache.setup[layer] = noteLaunchScratch_[layer];
+            launchCache->setup[layer] = noteLaunchScratch_[layer];
     }
 
     if (!voiceManager->LaunchVoiceGroup(
             channel, note, velocity, launchSetups, matchCount, playIndex,
             channelCache->GetParams()[channel], noteLaunchHandles_)) {
         ++telemetry_.allocationFailures;
-        return;
+        return matchCount;
     }
 
-    sf2Telemetry_.configuredVoices += matchCount;
-    if (!captureDetail) return;
+    if (!deferLifetimeCounters) sf2Telemetry_.configuredVoices += matchCount;
+    const uint64_t lifetimeDelta = static_cast<uint64_t>(matchCount) |
+        (static_cast<uint64_t>(matchCount) << 32u);
+    if (!captureDetail) return lifetimeDelta;
     captureSf2Detail_ = false;
     sf2Telemetry_.lastChannel = channel;
     sf2Telemetry_.lastNote = note;
@@ -4476,6 +4504,7 @@ void Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     sf2Telemetry_.lastRelativeEnd = voiceManager->v.relEnd[lastVoice];
     sf2Telemetry_.lastSampleBacked = voiceManager->v.sampleBacked[lastVoice];
     sf2Telemetry_.lastVoiceHandle = lastVoice;
+    return lifetimeDelta;
 }
 
 void Driver::HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset) {
