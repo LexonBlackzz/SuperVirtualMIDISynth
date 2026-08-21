@@ -1510,8 +1510,22 @@ inline bool RenderScalar::AdvanceDenseHandleTo(
         const float loopStart = v.relLoopSF[handle];
         const float loopEnd = v.relLoopEF[handle];
         const float loopLength = loopEnd - loopStart;
-        phase += step * static_cast<float>(frameOffset - previous);
-        if (phase >= loopEnd) {
+        const uint32_t advancedFrames = frameOffset - previous;
+        phase += step * static_cast<float>(advancedFrames);
+        // AVX2's 1-4-frame kernel wraps before sampling and intentionally
+        // leaves the final increment pending.  Match that phase convention
+        // while planning the next chunk, otherwise stealing on the crossing
+        // frame captures a tail from a different sample position.  Scalar
+        // and SSE2 commit the final wrap eagerly.
+        if (kernelSet_->backend == RenderBackend::AVX2 &&
+            advancedFrames != 0u && loopLength > 0.0f) {
+            const float phaseBeforeFinalIncrement = phase - step;
+            if (phaseBeforeFinalIncrement >= loopEnd) {
+                const float completedLoops = 1.0f + floorf(
+                    (phaseBeforeFinalIncrement - loopEnd) / loopLength);
+                phase -= completedLoops * loopLength;
+            }
+        } else if (phase >= loopEnd) {
             float overflow = phase - loopEnd;
             if (loopLength > 0.0f && overflow >= loopLength)
                 overflow -= floorf(overflow / loopLength) * loopLength;
@@ -1902,6 +1916,25 @@ inline bool RenderScalar::RenderBlockDensePlanned(
             voices.SetCurrentFrame(blockStartFrame + numFrames);
             voices.RetireVoice(static_cast<VoiceHandle>(handle));
             continue;
+        }
+        // Long scalar/SSE2 tile spans use the branch-free pre-wrap loop and
+        // may leave their final increment pending.  Their exact-frame serial
+        // path commits that wrap after every 1-4-frame span, so normalize the
+        // shadow at the callback boundary before it becomes authoritative.
+        if (kernelSet_->backend != RenderBackend::AVX2 &&
+            denseRenderState_.state[handle] ==
+                static_cast<uint8_t>(VoiceState::Active) &&
+            denseRenderState_.loopEnabled[handle] != 0u) {
+            float& phase = denseRenderState_.phases[handle];
+            const float loopStart = denseRenderState_.relLoopSF[handle];
+            const float loopEnd = denseRenderState_.relLoopEF[handle];
+            const float loopLength = loopEnd - loopStart;
+            if (phase >= loopEnd && loopLength > 0.0f) {
+                float overflow = phase - loopEnd;
+                if (overflow >= loopLength)
+                    overflow -= floorf(overflow / loopLength) * loopLength;
+                phase = loopStart + overflow;
+            }
         }
         VoiceSoA::CopyRenderProgress(voices.v, handle, denseRenderState_);
         voices.RefreshRenderClass(static_cast<VoiceHandle>(handle));

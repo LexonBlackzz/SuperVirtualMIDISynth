@@ -2889,12 +2889,13 @@ void DensePlannerDispatch(const svms::RenderEvent* events,
         if (event.type != svms::RenderEventType::NoteOn) continue;
         svms::VoiceConfiguration setup{};
         setup.sampleStart = 0u;
-        setup.sampleEnd = 4096u;
-        setup.loopStart = 64u;
-        setup.loopEnd = 4032u;
+        setup.sampleEnd = 128u;
+        setup.loopStart = 16u;
+        setup.loopEnd = 96u;
         setup.loopMode = 1u;
         setup.phaseStep = setup.basePhaseStep =
-            0.625f + static_cast<float>(event.data1 & 31u) * 0.03125f;
+            0.637123f +
+            static_cast<float>(event.data1 & 31u) * 0.030731f;
         setup.initialGain = setup.sustainLevel = 1.0f;
         setup.releaseDecay = 0.999f;
         setup.gainLeft = setup.gainRight = 0.001f;
@@ -2932,8 +2933,10 @@ void TestDensePlannerOracleDifferential() {
             const svms::VoiceHandle voice = result->AllocateVoice(
                 static_cast<uint8_t>(index & 15u),
                 static_cast<uint8_t>(24u + index % 88u), 127u);
-            result->SetVoiceSample(voice, 0u, 4096u, 64u, 4032u, 1u,
-                0.625f + static_cast<float>(index & 31u) * 0.03125f, 1u);
+            result->SetVoiceSample(voice, 0u, 128u, 16u, 96u, 1u,
+                0.637123f +
+                    static_cast<float>(index & 31u) * 0.030731f,
+                1u);
             result->SetVoiceEnvelope(voice, 1.0f, 1.0f, 0u, 0u, 0u, 0u,
                                      0.0f, 1.0f, 0.999f);
             result->SetVoiceGain(voice, 0.001f, 0.001f);
@@ -2988,8 +2991,8 @@ void TestDensePlannerOracleDifferential() {
         maximumDifference = (std::max)(maximumDifference,
             std::fabs(oracleRight[frame] - plannedRight[frame]));
     }
-    Check(maximumDifference <= 5.0e-5f,
-          "dense planner preserves oracle waveform tolerance at every frame");
+    Check(maximumDifference <= 1.0e-6f,
+          "dense planner preserves loop-crossing steal tails at every frame");
     Check(oracleVoices->stealCount_ == plannedVoices->stealCount_ &&
               oracleVoices->GetActiveCount() == plannedVoices->GetActiveCount(),
           "dense planner preserves exact stealing and active voice counts");
