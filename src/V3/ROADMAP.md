@@ -385,6 +385,10 @@ larger phase containing that item is complete.
   64-frame tail, lifecycle indices, and replacement tree leaf. Sampled launch
   cost falls from about 1,146 to 921 cycles, while uninstrumented throughput
   reaches 6.16-6.25M events/s at 151.00-152.92 cycles per voice-sample
+- [x] Keep exact stable/volatile winner selection entirely in packed-key form,
+  removing float decode and generic candidate reconstruction from every steal.
+  The same corpus reaches 6.24-6.28M events/s at 150.45-151.40 cycles per
+  voice-sample, another small 0.5-1% gain
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact

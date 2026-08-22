@@ -622,7 +622,6 @@ private:
     float ComputeNewbornStableStealKey(VoiceHandle handle) const;
     static SVMS_VM_FORCEINLINE uint64_t EncodeStableWinnerKey(
         float score, uint32_t activePosition);
-    static float DecodeStableWinnerScore(uint64_t key);
     static bool HigherPriorityCandidate(const StealCandidate& a,
                                         const StealCandidate& b);
 
@@ -2305,15 +2304,6 @@ SVMS_VM_FORCEINLINE uint64_t VoiceManager::EncodeStableWinnerKey(
         (UINT32_MAX - activePosition);
 }
 
-inline float VoiceManager::DecodeStableWinnerScore(uint64_t key) {
-    const uint32_t orderedScore = static_cast<uint32_t>(key >> 32u);
-    const uint32_t bits = (orderedScore & 0x80000000u) != 0u
-        ? orderedScore ^ 0x80000000u : ~orderedScore;
-    float score = 0.0f;
-    std::memcpy(&score, &bits, sizeof(score));
-    return score;
-}
-
 SVMS_VM_FORCEINLINE void VoiceManager::RefreshStealWinnerPath(
     VoiceHandle handle) {
     uint32_t node = stealTreeLeafBase_ + handle;
@@ -2439,8 +2429,9 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
     if (!stealVolatileHeapValid_ || stealVolatileHeapFrame_ != currentFrame_)
         BuildVolatileStealHeap();
 
-    StealCandidate best{};
     uint64_t bestKey = 0u;
+    uint32_t bestHandle = UINT32_MAX;
+    uint32_t bestPosition = 0u;
     bool haveBest = false;
     bool bestIsVolatile = false;
     if (stealHeapCount_ > 0u) {
@@ -2451,9 +2442,9 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         const VoiceHandle stableWinner = static_cast<VoiceHandle>(
             activeList_[winnerPosition]);
         assert(stealStableKey_[stableWinner] == rootKey);
-        best = {DecodeStableWinnerScore(rootKey), stableWinner,
-                winnerPosition};
         bestKey = rootKey;
+        bestHandle = stableWinner;
+        bestPosition = winnerPosition;
         haveBest = true;
     }
     if (stealVolatileHeapCount_ > 0u) {
@@ -2461,9 +2452,9 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         if (!haveBest || candidateKey > bestKey) {
             const uint32_t candidatePosition =
                 UINT32_MAX - static_cast<uint32_t>(candidateKey);
-            best = {DecodeStableWinnerScore(candidateKey),
-                    stealVolatileHeapHandle_[0], candidatePosition};
             bestKey = candidateKey;
+            bestHandle = stealVolatileHeapHandle_[0];
+            bestPosition = candidatePosition;
             haveBest = true;
             bestIsVolatile = true;
         }
@@ -2483,13 +2474,14 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
             const uint32_t handle = stealVolatileList_[i];
             if (stealVolatileHeapPosition_[handle] < stealVolatileHeapCount_)
                 continue;
-            const StealCandidate candidate{
+            const uint32_t candidatePosition = activePosition_[handle];
+            const uint64_t candidateKey = EncodeStableWinnerKey(
                 ComputeStableStealKey(static_cast<VoiceHandle>(handle)),
-                handle, activePosition_[handle]};
-            if (!haveBest || HigherPriorityCandidate(candidate, best)) {
-                best = candidate;
-                bestKey = EncodeStableWinnerKey(
-                    candidate.score, candidate.activePosition);
+                candidatePosition);
+            if (!haveBest || candidateKey > bestKey) {
+                bestKey = candidateKey;
+                bestHandle = handle;
+                bestPosition = candidatePosition;
                 haveBest = true;
                 bestIsVolatile = true;
             }
@@ -2497,28 +2489,28 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
     }
 #endif
     if (!haveBest) return kInvalidVoice;
-    activePosition = best.activePosition;
+    activePosition = bestPosition;
     if (bestIsVolatile) {
         const bool canReserve = reserveVolatileRoot &&
-            stealVolatileHeapPosition_[best.handle] == 0u;
+            stealVolatileHeapPosition_[bestHandle] == 0u;
         if (canReserve) {
-            stealCandidateReserved_[best.handle] = 1u;
+            stealCandidateReserved_[bestHandle] = 1u;
         } else {
-            UnlinkVolatileCandidate(static_cast<VoiceHandle>(best.handle));
+            UnlinkVolatileCandidate(static_cast<VoiceHandle>(bestHandle));
         }
     } else {
         if (reserveVolatileRoot) {
             // A single transactional note launch overwrites this handle and
             // commits before another steal. Keep its leaf in place so commit
             // changes one winner-tree path instead of remove + insert paths.
-            stealCandidateReserved_[best.handle] = 2u;
+            stealCandidateReserved_[bestHandle] = 2u;
         } else {
             --stealHeapCount_;
-            stealWinnerTree_[stealTreeLeafBase_ + best.handle] = 0u;
-            RefreshStealWinnerPath(static_cast<VoiceHandle>(best.handle));
+            stealWinnerTree_[stealTreeLeafBase_ + bestHandle] = 0u;
+            RefreshStealWinnerPath(static_cast<VoiceHandle>(bestHandle));
         }
     }
-    return static_cast<VoiceHandle>(best.handle);
+    return static_cast<VoiceHandle>(bestHandle);
 }
 
 inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
