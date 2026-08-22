@@ -467,7 +467,8 @@ private:
     uint32_t* stealVolatileList_;
     uint32_t* stealVolatilePosition_;
     uint32_t stealVolatileCount_;
-    StealCandidate* stealVolatileHeap_;
+    uint64_t* stealVolatileHeapKey_;
+    uint32_t* stealVolatileHeapHandle_;
     uint32_t* stealVolatileHeapPosition_;
     uint32_t stealVolatileHeapCount_;
     uint64_t stealVolatileHeapFrame_;
@@ -660,7 +661,8 @@ inline VoiceManager::VoiceManager()
       stealTreeLeafBase_(1u), stealHeapCount_(0), stealHeapValid_(false),
       stealHeapBuildCount_(0),
       stealVolatileList_(nullptr), stealVolatilePosition_(nullptr),
-      stealVolatileCount_(0), stealVolatileHeap_(nullptr),
+      stealVolatileCount_(0), stealVolatileHeapKey_(nullptr),
+      stealVolatileHeapHandle_(nullptr),
       stealVolatileHeapPosition_(nullptr), stealVolatileHeapCount_(0),
       stealVolatileHeapFrame_(UINT64_MAX), stealVolatileHeapValid_(false) {
     stealCandidateDeferred_ = nullptr;
@@ -732,7 +734,8 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     add(sizeof(uint64_t), static_cast<size_t>(treeLeaves) * 2u);
     add(sizeof(uint32_t), capacity); // volatile list
     add(sizeof(uint32_t), capacity); // volatile position
-    add(sizeof(StealCandidate), capacity);
+    add(sizeof(uint64_t), capacity); // volatile heap ordered key
+    add(sizeof(uint32_t), capacity); // volatile heap handle
     add(sizeof(uint32_t), capacity); // volatile heap position
     add(sizeof(uint8_t), capacity);  // deferred
     add(sizeof(uint8_t), capacity);  // reserved
@@ -785,8 +788,10 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
         take(sizeof(uint32_t), capacity));
     stealVolatilePosition_ = static_cast<uint32_t*>(
         take(sizeof(uint32_t), capacity));
-    stealVolatileHeap_ = static_cast<StealCandidate*>(
-        take(sizeof(StealCandidate), capacity));
+    stealVolatileHeapKey_ = static_cast<uint64_t*>(
+        take(sizeof(uint64_t), capacity));
+    stealVolatileHeapHandle_ = static_cast<uint32_t*>(
+        take(sizeof(uint32_t), capacity));
     stealVolatileHeapPosition_ = static_cast<uint32_t*>(
         take(sizeof(uint32_t), capacity));
     stealCandidateDeferred_ = static_cast<uint8_t*>(
@@ -1187,7 +1192,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     stealWinnerTree_ = grown.stealWinnerTree_;
     stealVolatileList_ = grown.stealVolatileList_;
     stealVolatilePosition_ = grown.stealVolatilePosition_;
-    stealVolatileHeap_ = grown.stealVolatileHeap_;
+    stealVolatileHeapKey_ = grown.stealVolatileHeapKey_;
+    stealVolatileHeapHandle_ = grown.stealVolatileHeapHandle_;
     stealVolatileHeapPosition_ = grown.stealVolatileHeapPosition_;
     stealCandidateDeferred_ = grown.stealCandidateDeferred_;
     stealCandidateReserved_ = grown.stealCandidateReserved_;
@@ -2434,6 +2440,7 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         BuildVolatileStealHeap();
 
     StealCandidate best{};
+    uint64_t bestKey = 0u;
     bool haveBest = false;
     bool bestIsVolatile = false;
     if (stealHeapCount_ > 0u) {
@@ -2446,12 +2453,17 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         assert(stealStableKey_[stableWinner] == rootKey);
         best = {DecodeStableWinnerScore(rootKey), stableWinner,
                 winnerPosition};
+        bestKey = rootKey;
         haveBest = true;
     }
     if (stealVolatileHeapCount_ > 0u) {
-        const StealCandidate& candidate = stealVolatileHeap_[0];
-        if (!haveBest || HigherPriorityCandidate(candidate, best)) {
-            best = candidate;
+        const uint64_t candidateKey = stealVolatileHeapKey_[0];
+        if (!haveBest || candidateKey > bestKey) {
+            const uint32_t candidatePosition =
+                UINT32_MAX - static_cast<uint32_t>(candidateKey);
+            best = {DecodeStableWinnerScore(candidateKey),
+                    stealVolatileHeapHandle_[0], candidatePosition};
+            bestKey = candidateKey;
             haveBest = true;
             bestIsVolatile = true;
         }
@@ -2476,6 +2488,8 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
                 handle, activePosition_[handle]};
             if (!haveBest || HigherPriorityCandidate(candidate, best)) {
                 best = candidate;
+                bestKey = EncodeStableWinnerKey(
+                    candidate.score, candidate.activePosition);
                 haveBest = true;
                 bestIsVolatile = true;
             }
@@ -2556,8 +2570,9 @@ inline void VoiceManager::LinkVolatileCandidate(VoiceHandle handle) {
     stealVolatilePosition_[handle] = position;
     if (stealVolatileHeapValid_ && stealVolatileHeapFrame_ == currentFrame_) {
         const uint32_t heapPosition = stealVolatileHeapCount_++;
-        stealVolatileHeap_[heapPosition] = {
-            ComputeStableStealKey(handle), handle, activePosition_[handle]};
+        stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
+            ComputeStableStealKey(handle), activePosition_[handle]);
+        stealVolatileHeapHandle_[heapPosition] = handle;
         stealVolatileHeapPosition_[handle] = heapPosition;
         VolatileHeapSiftUp(heapPosition);
     }
@@ -2578,18 +2593,21 @@ inline void VoiceManager::UnlinkVolatileCandidate(VoiceHandle handle) {
 }
 
 inline void VoiceManager::VolatileHeapSwap(uint32_t a, uint32_t b) {
-    const StealCandidate temporary = stealVolatileHeap_[a];
-    stealVolatileHeap_[a] = stealVolatileHeap_[b];
-    stealVolatileHeap_[b] = temporary;
-    stealVolatileHeapPosition_[stealVolatileHeap_[a].handle] = a;
-    stealVolatileHeapPosition_[stealVolatileHeap_[b].handle] = b;
+    const uint64_t temporaryKey = stealVolatileHeapKey_[a];
+    stealVolatileHeapKey_[a] = stealVolatileHeapKey_[b];
+    stealVolatileHeapKey_[b] = temporaryKey;
+    const uint32_t temporaryHandle = stealVolatileHeapHandle_[a];
+    stealVolatileHeapHandle_[a] = stealVolatileHeapHandle_[b];
+    stealVolatileHeapHandle_[b] = temporaryHandle;
+    stealVolatileHeapPosition_[stealVolatileHeapHandle_[a]] = a;
+    stealVolatileHeapPosition_[stealVolatileHeapHandle_[b]] = b;
 }
 
 inline void VoiceManager::VolatileHeapSiftUp(uint32_t position) {
     while (position > 0u) {
         const uint32_t parent = (position - 1u) >> 1u;
-        if (!HigherPriorityCandidate(stealVolatileHeap_[position],
-                                     stealVolatileHeap_[parent])) break;
+        if (stealVolatileHeapKey_[position] <=
+            stealVolatileHeapKey_[parent]) break;
         VolatileHeapSwap(position, parent);
         position = parent;
     }
@@ -2602,10 +2620,10 @@ inline void VoiceManager::VolatileHeapSiftDown(uint32_t position) {
         const uint32_t right = left + 1u;
         uint32_t best = left;
         if (right < stealVolatileHeapCount_ &&
-            HigherPriorityCandidate(stealVolatileHeap_[right],
-                                    stealVolatileHeap_[left])) best = right;
-        if (!HigherPriorityCandidate(stealVolatileHeap_[best],
-                                     stealVolatileHeap_[position])) break;
+            stealVolatileHeapKey_[right] > stealVolatileHeapKey_[left])
+            best = right;
+        if (stealVolatileHeapKey_[best] <=
+            stealVolatileHeapKey_[position]) break;
         VolatileHeapSwap(position, best);
         position = best;
     }
@@ -2613,15 +2631,16 @@ inline void VoiceManager::VolatileHeapSiftDown(uint32_t position) {
 
 inline void VoiceManager::BuildVolatileStealHeap() {
     for (uint32_t position = 0; position < stealVolatileHeapCount_; ++position)
-        stealVolatileHeapPosition_[stealVolatileHeap_[position].handle] =
+        stealVolatileHeapPosition_[stealVolatileHeapHandle_[position]] =
             UINT32_MAX;
     stealVolatileHeapCount_ = 0u;
     for (uint32_t position = 0; position < stealVolatileCount_; ++position) {
         const uint32_t handle = stealVolatileList_[position];
         const uint32_t heapPosition = stealVolatileHeapCount_++;
-        stealVolatileHeap_[heapPosition] = {
+        stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
             ComputeStableStealKey(static_cast<VoiceHandle>(handle)),
-            handle, activePosition_[handle]};
+            activePosition_[handle]);
+        stealVolatileHeapHandle_[heapPosition] = handle;
         stealVolatileHeapPosition_[handle] = heapPosition;
     }
     if (stealVolatileHeapCount_ > 1u) {
@@ -2639,11 +2658,12 @@ inline void VoiceManager::RemoveVolatileHeapCandidate(VoiceHandle handle) {
     const uint32_t last = --stealVolatileHeapCount_;
     stealVolatileHeapPosition_[handle] = UINT32_MAX;
     if (position != last) {
-        stealVolatileHeap_[position] = stealVolatileHeap_[last];
-        stealVolatileHeapPosition_[stealVolatileHeap_[position].handle] = position;
+        stealVolatileHeapKey_[position] = stealVolatileHeapKey_[last];
+        const uint32_t movedHandle = stealVolatileHeapHandle_[last];
+        stealVolatileHeapHandle_[position] = movedHandle;
+        stealVolatileHeapPosition_[movedHandle] = position;
         VolatileHeapSiftUp(position);
-        const uint32_t adjusted =
-            stealVolatileHeapPosition_[stealVolatileHeap_[position].handle];
+        const uint32_t adjusted = stealVolatileHeapPosition_[movedHandle];
         VolatileHeapSiftDown(adjusted);
     }
 }
@@ -2851,9 +2871,9 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
         if (!IsStableStealCandidate(handle) &&
             heapPosition < stealVolatileHeapCount_ &&
             stealVolatileHeapFrame_ == currentFrame_) {
-            stealVolatileHeap_[heapPosition] = {
-                ComputeStableStealKey(handle), handle,
-                activePosition_[handle]};
+            stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
+                ComputeStableStealKey(handle), activePosition_[handle]);
+            stealVolatileHeapHandle_[heapPosition] = handle;
             VolatileHeapSiftUp(heapPosition);
             VolatileHeapSiftDown(stealVolatileHeapPosition_[handle]);
             return;

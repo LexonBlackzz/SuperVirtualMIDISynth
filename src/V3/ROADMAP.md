@@ -369,6 +369,12 @@ larger phase containing that item is complete.
   5.18M/s (45%), callback work falls about 31%, and sampled victim selection
   falls from roughly 865 to 198 cycles without changing the exhaustive victim
   oracle
+- [x] Pack volatile-heap priority and active-position ties into the same exact
+  monotonic 64-bit key used by the stable tournament, with handles kept in a
+  separate compact array. A release-heavy equal-frame oracle covers repeated
+  heap removals and repairs. On the 1,000-voice 6M chopped-note corpus,
+  realized throughput rises from about 5.10M/s to 5.86-5.90M/s and cost falls
+  from 184.98 to 160.23-160.56 cycles per voice-sample without changing victims
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact

@@ -1238,6 +1238,7 @@ void TestPersistentStealIndexAgainstOracle() {
         voices->RefreshMixGain(h, channels.GetParams()[i & 15u]);
     }
 
+    auto denseVoices = std::make_unique<svms::VoiceManager>(*voices);
     uint64_t frame = 9000u;
     for (uint32_t iteration = 0; iteration < 512u; ++iteration) {
         frame += (iteration == 256u)
@@ -1270,6 +1271,46 @@ void TestPersistentStealIndexAgainstOracle() {
         voices->SetVoiceGain(actual, 0.5f, 0.5f);
         voices->RefreshMixGain(actual,
             channels.GetParams()[iteration & 15u]);
+    }
+
+    // Exercise the release-heavy equal-frame shape used by chopped Black
+    // MIDI: many stable voices become volatile, then many exact replacements
+    // consume that heap without advancing the output frame.
+    svms::VoiceConfiguration choppedSetup{};
+    choppedSetup.sampleEnd = 512u;
+    choppedSetup.loopStart = 8u;
+    choppedSetup.loopEnd = 504u;
+    choppedSetup.loopMode = 1u;
+    choppedSetup.initialGain = choppedSetup.sustainLevel = 1.0f;
+    choppedSetup.releaseDecay = 0.9999f;
+    choppedSetup.gainLeft = choppedSetup.gainRight = 0.5f;
+    for (uint32_t denseFrame = 0u; denseFrame < 64u; ++denseFrame) {
+        denseVoices->SetCurrentFrame(9000u + denseFrame + 1u);
+        uint32_t released = 0u;
+        for (uint32_t position = 0u;
+             position < denseVoices->activeCount_ && released < 32u;
+             ++position) {
+            const svms::VoiceHandle handle = static_cast<svms::VoiceHandle>(
+                denseVoices->activeList_[(position * 17u + denseFrame) %
+                                         denseVoices->activeCount_]);
+            if (denseVoices->v.state[handle] !=
+                static_cast<uint8_t>(svms::VoiceState::Active)) continue;
+            denseVoices->StartRelease(handle);
+            ++released;
+        }
+        for (uint32_t launch = 0u; launch < released; ++launch) {
+            const svms::VoiceHandle expected =
+                denseVoices->FindStealVictimExhaustiveForTest();
+            svms::VoiceHandle actual = svms::kInvalidVoice;
+            choppedSetup.playIndex = denseFrame * 32u + launch + 1u;
+            const uint8_t channel = static_cast<uint8_t>(launch & 15u);
+            const bool launched = denseVoices->LaunchVoiceGroup(
+                channel, static_cast<uint8_t>(24u + launch % 96u), 127u,
+                &choppedSetup, 1u, choppedSetup.playIndex,
+                channels.GetParams()[channel], &actual);
+            Check(launched && actual == expected,
+                  "release-heavy same-frame heap matches exhaustive victims");
+        }
     }
 
     // Delay/hold/attack use fixed target gain for stealing and therefore live
