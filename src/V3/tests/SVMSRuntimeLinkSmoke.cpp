@@ -24,6 +24,9 @@ typedef UINT (WINAPI* MidiOutGetNumDevsProc)();
 typedef MMRESULT (WINAPI* MidiOutOpenProc)(LPHMIDIOUT, UINT, DWORD_PTR,
                                            DWORD_PTR, DWORD);
 typedef MMRESULT (WINAPI* MidiOutShortMsgProc)(HMIDIOUT, DWORD);
+typedef MMRESULT (WINAPI* MidiOutPrepareHeaderProc)(HMIDIOUT, LPMIDIHDR, UINT);
+typedef MMRESULT (WINAPI* MidiOutLongMsgProc)(HMIDIOUT, LPMIDIHDR, UINT);
+typedef MMRESULT (WINAPI* MidiOutUnprepareHeaderProc)(HMIDIOUT, LPMIDIHDR, UINT);
 typedef MMRESULT (WINAPI* MidiOutResetProc)(HMIDIOUT);
 typedef MMRESULT (WINAPI* MidiOutCloseProc)(HMIDIOUT);
 
@@ -78,11 +81,20 @@ int main(int argc, char** argv) {
         GetProcAddress(module, "midiOutOpen"));
     MidiOutShortMsgProc shortMsg = reinterpret_cast<MidiOutShortMsgProc>(
         GetProcAddress(module, "midiOutShortMsg"));
+    MidiOutPrepareHeaderProc prepareHeader =
+        reinterpret_cast<MidiOutPrepareHeaderProc>(
+            GetProcAddress(module, "midiOutPrepareHeader"));
+    MidiOutLongMsgProc longMsg = reinterpret_cast<MidiOutLongMsgProc>(
+        GetProcAddress(module, "midiOutLongMsg"));
+    MidiOutUnprepareHeaderProc unprepareHeader =
+        reinterpret_cast<MidiOutUnprepareHeaderProc>(
+            GetProcAddress(module, "midiOutUnprepareHeader"));
     MidiOutResetProc reset = reinterpret_cast<MidiOutResetProc>(
         GetProcAddress(module, "midiOutReset"));
     MidiOutCloseProc close = reinterpret_cast<MidiOutCloseProc>(
         GetProcAddress(module, "midiOutClose"));
-    if (!getNumDevs || !open || !shortMsg || !reset || !close) {
+    if (!getNumDevs || !open || !shortMsg || !prepareHeader || !longMsg ||
+        !unprepareHeader || !reset || !close) {
         std::puts("FAIL: required MIDI exports are missing");
         FreeLibrary(module);
         DeleteFileW(configPath);
@@ -107,6 +119,45 @@ int main(int argc, char** argv) {
     }
     if (!handle) {
         std::puts("FAIL: MIDI_MAPPER open returned a null handle");
+        close(handle);
+        FreeLibrary(module);
+        DeleteFileW(configPath);
+        return 1;
+    }
+
+    // Exercise the real WinMM long-message path with a universal GM reset.
+    // The driver completes its copy synchronously, just as it does for the
+    // KDMAPI raw-buffer entry point, while the reset itself stays timestamped.
+    char gmReset[] = {static_cast<char>(0xF0), static_cast<char>(0x7E),
+                      static_cast<char>(0x7F), static_cast<char>(0x09),
+                      static_cast<char>(0x01), static_cast<char>(0xF7)};
+    MIDIHDR sysexHeader = {};
+    sysexHeader.lpData = gmReset;
+    sysexHeader.dwBufferLength = sizeof(gmReset);
+    const MMRESULT prepareResult =
+        prepareHeader(handle, &sysexHeader, sizeof(sysexHeader));
+    const DWORD preparedFlags = sysexHeader.dwFlags;
+    const MMRESULT longResult =
+        longMsg(handle, &sysexHeader, sizeof(sysexHeader));
+    const DWORD completedFlags = sysexHeader.dwFlags;
+    const MMRESULT unprepareResult =
+        unprepareHeader(handle, &sysexHeader, sizeof(sysexHeader));
+    const DWORD unpreparedFlags = sysexHeader.dwFlags;
+    if (prepareResult != MMSYSERR_NOERROR ||
+        (preparedFlags & MHDR_PREPARED) == 0u ||
+        longResult != MMSYSERR_NOERROR ||
+        (completedFlags & MHDR_DONE) == 0u ||
+        (completedFlags & MHDR_INQUEUE) != 0u ||
+        unprepareResult != MMSYSERR_NOERROR ||
+        (unpreparedFlags & MHDR_PREPARED) != 0u) {
+        std::printf("FAIL: WinMM SysEx lifecycle handle=%p hdr=%zu prepare=%u/%08lX "
+                    "long=%u/%08lX unprepare=%u/%08lX\n",
+                    static_cast<void*>(handle), sizeof(sysexHeader),
+                    static_cast<unsigned int>(prepareResult), preparedFlags,
+                    static_cast<unsigned int>(longResult), completedFlags,
+                    static_cast<unsigned int>(unprepareResult),
+                    unpreparedFlags);
+        reset(handle);
         close(handle);
         FreeLibrary(module);
         DeleteFileW(configPath);

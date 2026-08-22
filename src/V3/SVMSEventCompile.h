@@ -9,6 +9,20 @@
 namespace svms {
 
 inline constexpr uint32_t kInternalResetMessage = 0xFF000001u;
+inline constexpr uint32_t kInternalMasterVolumeTag = 0xFE000000u;
+inline constexpr uint32_t kInternalRhythmPartTag = 0xFD000000u;
+
+inline constexpr uint32_t MakeInternalMasterVolumeMessage(
+    uint16_t value14) noexcept {
+    return kInternalMasterVolumeTag | (value14 & 0x3fffu);
+}
+
+inline constexpr uint32_t MakeInternalRhythmPartMessage(
+    uint8_t channel, uint8_t map) noexcept {
+    return kInternalRhythmPartTag |
+        (static_cast<uint32_t>(channel & 0x0fu) << 8u) |
+        static_cast<uint32_t>(map & 0x03u);
+}
 
 inline bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
                                     uint64_t epochQPC,
@@ -25,6 +39,16 @@ inline bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
     if (message == kInternalResetMessage) {
         type = RenderEventType::Reset;
         channel = data1 = data2 = 0u;
+    } else if ((message & 0xffffc000u) == kInternalMasterVolumeTag) {
+        type = RenderEventType::MasterVolume;
+        channel = 0u;
+        data1 = static_cast<uint8_t>(message & 0x7fu);
+        data2 = static_cast<uint8_t>((message >> 7u) & 0x7fu);
+    } else if ((message & 0xff000000u) == kInternalRhythmPartTag) {
+        type = RenderEventType::RhythmPart;
+        channel = static_cast<uint8_t>((message >> 8u) & 0x0fu);
+        data1 = static_cast<uint8_t>(message & 0x03u);
+        data2 = 0u;
     } else {
         switch (status & 0xf0u) {
             case 0x90u:

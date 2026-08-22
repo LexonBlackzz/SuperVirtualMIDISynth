@@ -151,6 +151,8 @@ enum class RenderEventType : uint8_t {
     // Internal overload-recovery command. data2 carries a count from 1..255.
     // It is never created for events that still have a writable exact frame.
     StaleNoteOffBatch = 8,
+    MasterVolume = 9,
+    RhythmPart = 10,
 };
 
 struct RenderEvent {
@@ -1683,6 +1685,7 @@ inline bool RenderScalar::CanUseDensePlan(
         }
         switch (event.type) {
             case RenderEventType::Reset:
+            case RenderEventType::MasterVolume:
             case RenderEventType::NoteOn:
                 mayTouchFullPool = true;
                 break;
@@ -2182,6 +2185,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                     const RenderEvent& event = events[index];
                     switch (event.type) {
                         case RenderEventType::Reset:
+                        case RenderEventType::MasterVolume:
                             affectAll = true;
                             break;
                         case RenderEventType::NoteOff:

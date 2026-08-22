@@ -1933,6 +1933,7 @@ public:
     const LegacyDriverDebugInfo* GetLegacyDebugInfo() const;
 
     void SubmitShortMsg(uint32_t msg);
+    void SubmitSystemExclusive(const uint8_t* data, uint32_t size);
 
     bool initialized;
     uint32_t sampleRate;
@@ -1962,6 +1963,7 @@ private:
                              uint32_t blockOffset);
     void HandleProgramChange(uint8_t channel, uint8_t program);
     void HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb);
+    void SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp);
     void EventCompilerLoop();
     uint32_t ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
                                 uint8_t velocity,
@@ -2064,6 +2066,7 @@ private:
     // Last master volume the audio thread actually folded into playing
     // voices' mix gains.  Audio-thread only.
     float appliedMasterVolume_ = 1.0f;
+    float sysexMasterVolume_ = 1.0f;
 
     // Per-block dispatch queue. Allocated once during initialization from the
     // smaller of max_events_per_block and the configured scheduler capacity.
@@ -2498,7 +2501,7 @@ static bool ResolveChannelPreset(const SF2Data* data, const ChannelCache& cache,
                                  uint8_t channel, uint32_t* outPresetIndex) {
     if (!data || !outPresetIndex || channel >= kChannelCount) return false;
     return sf2_resolve_preset(data, cache.GetBank(channel), cache.GetProgram(channel),
-                              channel == 9, outPresetIndex);
+                              cache.IsPercussion(channel), outPresetIndex);
 }
 
 struct PreparedSF2Region {
@@ -3164,6 +3167,9 @@ void Driver::ResetAllVoices() {
     }
     if (voiceManager) voiceManager->Reset();
     if (channelCache) channelCache->Reset();
+    sysexMasterVolume_ = 1.0f;
+    if (channelCache && configSnapshot)
+        channelCache->SetMasterVolume(configSnapshot->masterVolume);
     RefreshSelectedPresets();
     std::fill(std::begin(channelPitchBendRatio_),
               std::end(channelPitchBendRatio_), 1.0f);
@@ -3177,11 +3183,17 @@ void Driver::ResetAllVoices() {
 }
 
 void Driver::SubmitShortMsg(uint32_t msg) {
+    LARGE_INTEGER timestamp{};
+    QueryPerformanceCounter(&timestamp);
+    SubmitShortMsgAtQpc(msg, static_cast<uint64_t>(timestamp.QuadPart));
+}
+
+void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
     submittedAtomic_.fetch_add(1, std::memory_order_relaxed);
     TimestampedMidiEvent evt{};
     evt.message = msg;
     evt.sequence = nextEventSequence_.fetch_add(1, std::memory_order_relaxed);
-    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&evt.qpcTimestamp));
+    evt.qpcTimestamp = qpcTimestamp;
 
     const uint8_t status = static_cast<uint8_t>(msg & 0xffu);
     const uint8_t data1 = static_cast<uint8_t>((msg >> 8) & 0x7fu);
@@ -3302,6 +3314,109 @@ void Driver::SubmitShortMsg(uint32_t msg) {
         }
         uint32_t observed = producerWakeEpoch_.load(std::memory_order_acquire);
         WaitForAddressChange(producerWakeEpoch_, observed);
+    }
+}
+
+void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
+    if (!data || size < 2u || data[0] != 0xf0u ||
+        data[size - 1u] != 0xf7u) return;
+
+    LARGE_INTEGER timestamp{};
+    QueryPerformanceCounter(&timestamp);
+    const uint64_t qpc = static_cast<uint64_t>(timestamp.QuadPart);
+    auto emit = [&](uint32_t message) { SubmitShortMsgAtQpc(message, qpc); };
+    auto emitCC = [&](uint8_t channel, uint8_t controller, uint8_t value) {
+        emit(static_cast<uint32_t>(0xb0u | (channel & 0x0fu)) |
+             (static_cast<uint32_t>(controller & 0x7fu) << 8u) |
+             (static_cast<uint32_t>(value & 0x7fu) << 16u));
+    };
+    auto emitProgram = [&](uint8_t channel, uint8_t program) {
+        emit(static_cast<uint32_t>(0xc0u | (channel & 0x0fu)) |
+             (static_cast<uint32_t>(program & 0x7fu) << 8u));
+    };
+
+    // Universal non-realtime mode messages: GM1 on/off and GM2 on.  MSGS
+    // returns to its basic GM/GS state for these, just as it does for GS
+    // Reset. Device ID is intentionally accepted as either broadcast or a
+    // concrete 7-bit device number.
+    if (size >= 6u && data[1] == 0x7eu && data[3] == 0x09u &&
+        (data[4] == 0x01u || data[4] == 0x02u || data[4] == 0x03u)) {
+        emit(kInternalResetMessage);
+        return;
+    }
+
+    // Universal realtime Master Volume (14-bit, LSB then MSB).
+    if (size >= 8u && data[1] == 0x7fu && data[3] == 0x04u &&
+        data[4] == 0x01u) {
+        const uint16_t value = static_cast<uint16_t>(
+            (data[5] & 0x7fu) | ((data[6] & 0x7fu) << 7u));
+        emit(MakeInternalMasterVolumeMessage(value));
+        return;
+    }
+
+    // Roland GS Data Set 1 (DT1).  Verify the Roland checksum, then map the
+    // MSGS-relevant system and part parameters onto exact-frame engine/MIDI
+    // events. Bulk packets work too because the 7-bit GS address advances
+    // for every data byte.
+    if (size >= 11u && data[1] == 0x41u && data[3] == 0x42u &&
+        data[4] == 0x12u) {
+        uint32_t checksumSum = 0u;
+        for (uint32_t i = 5u; i + 1u < size; ++i)
+            checksumSum += data[i] & 0x7fu;
+        if ((checksumSum & 0x7fu) != 0u) return;
+
+        uint8_t address0 = data[5] & 0x7fu;
+        uint8_t address1 = data[6] & 0x7fu;
+        uint8_t address2 = data[7] & 0x7fu;
+        const uint32_t dataEnd = size - 2u; // checksum, F7
+        for (uint32_t i = 8u; i < dataEnd; ++i) {
+            const uint8_t value = data[i] & 0x7fu;
+            if (address0 == 0x40u && address1 == 0x00u) {
+                if (address2 == 0x7fu && value == 0u) {
+                    emit(kInternalResetMessage);
+                } else if (address2 == 0x04u) {
+                    emit(MakeInternalMasterVolumeMessage(
+                        static_cast<uint16_t>(value) * 129u));
+                }
+            } else if (address0 == 0x40u &&
+                       (address1 & 0x70u) == 0x10u) {
+                const uint8_t part = address1 & 0x0fu;
+                const uint8_t channel = part == 0u ? 9u
+                    : (part <= 9u ? static_cast<uint8_t>(part - 1u) : part);
+                switch (address2) {
+                    case 0x00u: emitCC(channel, 0u, value); break;
+                    case 0x01u: emitProgram(channel, value); break;
+                    case 0x15u:
+                        emit(MakeInternalRhythmPartMessage(channel, value));
+                        break;
+                    case 0x19u: emitCC(channel, 7u, value); break;
+                    case 0x1cu: emitCC(channel, 10u,
+                                      value == 0u ? 64u : value); break;
+                    default: break;
+                }
+            }
+
+            if (++address2 == 0x80u) {
+                address2 = 0u;
+                if (++address1 == 0x80u) {
+                    address1 = 0u;
+                    address0 = static_cast<uint8_t>((address0 + 1u) & 0x7fu);
+                }
+            }
+        }
+        return;
+    }
+
+    // Yamaha XG System On and Master Volume are common in nominally-GM song
+    // files. MSGS ignores most XG-specific parameters, but treating these two
+    // as their GM equivalents gives the same useful compatibility behavior.
+    if (size >= 9u && data[1] == 0x43u && data[3] == 0x4cu &&
+        data[4] == 0x00u && data[5] == 0x00u) {
+        if (data[6] == 0x7eu && data[7] == 0u)
+            emit(kInternalResetMessage);
+        else if (data[6] == 0x04u)
+            emit(MakeInternalMasterVolumeMessage(
+                static_cast<uint16_t>(data[7] & 0x7fu) * 129u));
     }
 }
 
@@ -3464,7 +3579,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->limiter.attackCoeff       = mb.limiterAttackCoeff;
         self->limiter.releaseCoeff      = mb.limiterReleaseCoeff;
 
-        self->channelCache->SetMasterVolume(mb.masterVolume);
+        self->channelCache->SetMasterVolume(
+            mb.masterVolume * self->sysexMasterVolume_);
 
         // Echo the applied state to the control thread (telemetry audit).
         // The echo must be coherent BEFORE lastAppliedLiveSeq_ advances
@@ -3486,8 +3602,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // mixGainL/R are only refreshed at note-on otherwise).  Per-channel
     // refresh over the active list — done only when the value actually
     // changed, never per block at 500K voices.
-    if (self->appliedMasterVolume_ != snap->masterVolume) {
-        self->appliedMasterVolume_ = snap->masterVolume;
+    const float effectiveMasterVolume =
+        snap->masterVolume * self->sysexMasterVolume_;
+    if (self->appliedMasterVolume_ != effectiveMasterVolume) {
+        self->appliedMasterVolume_ = effectiveMasterVolume;
         for (uint32_t ch = 0u; ch < kChannelCount; ++ch) {
             vm->RefreshMixGainsForChannel(
                 static_cast<uint8_t>(ch), cc->GetParams()[ch]);
@@ -4117,6 +4235,14 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
         case RenderEventType::Reset:
             if (self->voiceManager) self->voiceManager->Reset();
             if (self->channelCache) self->channelCache->Reset();
+            self->sysexMasterVolume_ = 1.0f;
+            if (self->channelCache && self->configSnapshot) {
+                self->channelCache->SetMasterVolume(
+                    self->configSnapshot->masterVolume);
+                self->channelCache->RebuildCache(
+                    *self->configSnapshot,
+                    static_cast<float>(self->sampleRate));
+            }
             self->RefreshSelectedPresets();
             std::fill(std::begin(self->channelPitchBendRatio_),
                       std::end(self->channelPitchBendRatio_), 1.0f);
@@ -4126,6 +4252,45 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
             self->postHighPass.Reset();
             self->reverb.Reset();
             self->limiter.Reset();
+            break;
+        case RenderEventType::MasterVolume: {
+            const uint16_t value = static_cast<uint16_t>(
+                event.data1 | (static_cast<uint16_t>(event.data2) << 7u));
+            self->sysexMasterVolume_ =
+                static_cast<float>(value) / 16383.0f;
+            if (self->channelCache && self->configSnapshot) {
+                const float effective = self->configSnapshot->masterVolume *
+                    self->sysexMasterVolume_;
+                self->channelCache->SetMasterVolume(effective);
+                self->channelCache->RebuildCache(
+                    *self->configSnapshot,
+                    static_cast<float>(self->sampleRate));
+                if (self->voiceManager) {
+                    for (uint8_t channel = 0u;
+                         channel < kChannelCount; ++channel) {
+                        self->voiceManager->RefreshMixGainsForChannel(
+                            channel,
+                            self->channelCache->GetParams()[channel]);
+                    }
+                }
+                self->appliedMasterVolume_ = effective;
+            }
+            break;
+        }
+        case RenderEventType::RhythmPart:
+            if (self->channelCache && event.channel < kChannelCount) {
+                self->channelCache->SetRhythmPart(event.channel, event.data1);
+                uint32_t presetIndex = 0u;
+                if (ResolveChannelPreset(self->soundFontData,
+                        *self->channelCache, event.channel, &presetIndex)) {
+                    self->channelCache->SetSelectedPreset(
+                        event.channel, static_cast<uint16_t>(presetIndex));
+                } else {
+                    self->channelCache->SetSelectedPreset(
+                        event.channel, UINT16_MAX);
+                }
+                ++self->channelLaunchRevision_[event.channel];
+            }
             break;
     }
 }
@@ -4803,6 +4968,55 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
 
 static svms::Driver* g_driver = nullptr;
 static const HMIDIOUT kSVMSMidiOutHandle = reinterpret_cast<HMIDIOUT>(0x1234);
+static DWORD_PTR g_midiOutCallback = 0u;
+static DWORD_PTR g_midiOutInstance = 0u;
+static DWORD g_midiOutCallbackFlags = CALLBACK_NULL;
+
+// MIDIHDR gained trailing fields in WinMM 4.0 and callers can use a
+// different structure packing than the proxy.  Submission only needs the
+// fields through dwFlags, so accept every ABI that supplies those fields.
+static bool HasMidiOutHeaderFields(const MIDIHDR* header, UINT byteCount) {
+    const UINT required = static_cast<UINT>(FIELD_OFFSET(MIDIHDR, dwFlags) +
+                                             sizeof(header->dwFlags));
+    return header != nullptr && byteCount >= required;
+}
+
+static void NotifyMidiOutClient(UINT message, DWORD_PTR param1 = 0u,
+                                DWORD_PTR param2 = 0u) {
+    switch (g_midiOutCallbackFlags & CALLBACK_TYPEMASK) {
+        case CALLBACK_FUNCTION:
+            if (g_midiOutCallback) {
+                using CallbackProc = void (CALLBACK*)(
+                    HMIDIOUT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR);
+                reinterpret_cast<CallbackProc>(g_midiOutCallback)(
+                    kSVMSMidiOutHandle, message, g_midiOutInstance,
+                    param1, param2);
+            }
+            break;
+        case CALLBACK_WINDOW:
+            if (g_midiOutCallback) {
+                PostMessageW(reinterpret_cast<HWND>(g_midiOutCallback),
+                             message,
+                             reinterpret_cast<WPARAM>(kSVMSMidiOutHandle),
+                             static_cast<LPARAM>(param1));
+            }
+            break;
+        case CALLBACK_THREAD:
+            if (g_midiOutCallback) {
+                PostThreadMessageW(static_cast<DWORD>(g_midiOutCallback),
+                                   message,
+                                   reinterpret_cast<WPARAM>(kSVMSMidiOutHandle),
+                                   static_cast<LPARAM>(param1));
+            }
+            break;
+        case CALLBACK_EVENT:
+            if (g_midiOutCallback)
+                SetEvent(reinterpret_cast<HANDLE>(g_midiOutCallback));
+            break;
+        default:
+            break;
+    }
+}
 
 static bool IsSupportedMidiOutputDevice(UINT_PTR deviceId) {
     return deviceId == 0u || deviceId == static_cast<UINT_PTR>(MIDI_MAPPER);
@@ -4863,7 +5077,6 @@ MMRESULT WINAPI midiOutGetDevCapsW(UINT_PTR uDeviceID, LPMIDIOUTCAPSW lpCaps, UI
 
 MMRESULT WINAPI midiOutOpen(LPHMIDIOUT phmo, UINT uDeviceID,
     DWORD_PTR dwCallback, DWORD_PTR dwInstance, DWORD fdwOpen) {
-    (void)dwCallback; (void)dwInstance; (void)fdwOpen;
     XPBootstrapTrace("[SVMS XP] midiOutOpen reached\r\n");
     LOG("midiOutOpen: uDeviceID=%u", uDeviceID);
     if (!IsSupportedMidiOutputDevice(uDeviceID)) {
@@ -4900,14 +5113,22 @@ MMRESULT WINAPI midiOutOpen(LPHMIDIOUT phmo, UINT uDeviceID,
 
     LOG("midiOutOpen: SUCCESS, returning handle");
     *phmo = kSVMSMidiOutHandle;
+    g_midiOutCallback = dwCallback;
+    g_midiOutInstance = dwInstance;
+    g_midiOutCallbackFlags = fdwOpen;
+    NotifyMidiOutClient(MOM_OPEN);
     XPBootstrapTrace("[SVMS XP] midiOutOpen SUCCESS handle=0x00001234\r\n");
     return MMSYSERR_NOERROR;
 }
 
 MMRESULT WINAPI midiOutClose(HMIDIOUT hmo) {
-    (void)hmo;
+    if (hmo != kSVMSMidiOutHandle) return MMSYSERR_INVALHANDLE;
     XPBootstrapTrace("[SVMS XP] midiOutClose reached\r\n");
     if (g_driver) { g_driver->Shutdown(); g_driver = nullptr; }
+    NotifyMidiOutClient(MOM_CLOSE);
+    g_midiOutCallback = 0u;
+    g_midiOutInstance = 0u;
+    g_midiOutCallbackFlags = CALLBACK_NULL;
     return MMSYSERR_NOERROR;
 }
 
@@ -4939,7 +5160,23 @@ MMRESULT WINAPI midiOutShortMsg(HMIDIOUT hmo, DWORD dwMsg) {
 
 MMRESULT WINAPI midiOutLongMsg(HMIDIOUT hmo, LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
     XPBootstrapTrace("[SVMS XP] midiOutLongMsg reached\r\n");
-    (void)hmo; (void)lpMidiHdr; (void)cbMidiHdr;
+    if (hmo != kSVMSMidiOutHandle) return MMSYSERR_INVALHANDLE;
+    if (!HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr) ||
+        (!lpMidiHdr->lpData && lpMidiHdr->dwBufferLength != 0u))
+        return MMSYSERR_INVALPARAM;
+    if ((lpMidiHdr->dwFlags & MHDR_PREPARED) == 0u)
+        return MIDIERR_UNPREPARED;
+    lpMidiHdr->dwFlags &= ~MHDR_DONE;
+    lpMidiHdr->dwFlags |= MHDR_INQUEUE;
+    if (g_driver && lpMidiHdr->dwBufferLength != 0u) {
+        g_driver->SubmitSystemExclusive(
+            reinterpret_cast<const uint8_t*>(lpMidiHdr->lpData),
+            lpMidiHdr->dwBufferLength);
+    }
+    lpMidiHdr->dwFlags &= ~MHDR_INQUEUE;
+    lpMidiHdr->dwFlags |= MHDR_DONE;
+    NotifyMidiOutClient(MOM_DONE,
+                        reinterpret_cast<DWORD_PTR>(lpMidiHdr), 0u);
     return MMSYSERR_NOERROR;
 }
 
@@ -4951,12 +5188,21 @@ MMRESULT WINAPI midiOutReset(HMIDIOUT hmo) {
 }
 
 MMRESULT WINAPI midiOutPrepareHeader(HMIDIOUT hmo, LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)hmo; (void)lpMidiHdr; (void)cbMidiHdr;
+    if (hmo != kSVMSMidiOutHandle) return MMSYSERR_INVALHANDLE;
+    if (!HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr))
+        return MMSYSERR_INVALPARAM;
+    lpMidiHdr->dwFlags |= MHDR_PREPARED;
+    lpMidiHdr->dwFlags &= ~(MHDR_DONE | MHDR_INQUEUE);
     return MMSYSERR_NOERROR;
 }
 
 MMRESULT WINAPI midiOutUnprepareHeader(HMIDIOUT hmo, LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)hmo; (void)lpMidiHdr; (void)cbMidiHdr;
+    if (hmo != kSVMSMidiOutHandle) return MMSYSERR_INVALHANDLE;
+    if (!HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr))
+        return MMSYSERR_INVALPARAM;
+    if ((lpMidiHdr->dwFlags & MHDR_INQUEUE) != 0u)
+        return MIDIERR_STILLPLAYING;
+    lpMidiHdr->dwFlags &= ~MHDR_PREPARED;
     return MMSYSERR_NOERROR;
 }
 
@@ -5076,21 +5322,41 @@ UINT WINAPI SendCustomEvent(DWORD dwEvent, LPVOID pData, DWORD dwSize) {
     return 1;
 }
 
-void WINAPI SendDirectLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)lpMidiHdr; (void)cbMidiHdr;
+UINT WINAPI SendDirectLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
+    if (!g_kdmapiInitialized || !g_driver ||
+        !HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr) ||
+        (!lpMidiHdr->lpData && lpMidiHdr->dwBufferLength != 0u))
+        return MMSYSERR_INVALPARAM;
+    g_driver->SubmitSystemExclusive(
+        reinterpret_cast<const uint8_t*>(lpMidiHdr->lpData),
+        lpMidiHdr->dwBufferLength);
+    lpMidiHdr->dwFlags |= MHDR_DONE;
+    lpMidiHdr->dwFlags &= ~MHDR_INQUEUE;
+    return MMSYSERR_NOERROR;
 }
 
-void WINAPI SendDirectLongDataNoBuf(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)lpMidiHdr; (void)cbMidiHdr;
+UINT WINAPI SendDirectLongDataNoBuf(LPSTR data, DWORD size) {
+    if (!g_kdmapiInitialized || !g_driver || (!data && size != 0u))
+        return MMSYSERR_INVALPARAM;
+    g_driver->SubmitSystemExclusive(
+        reinterpret_cast<const uint8_t*>(data), size);
+    return MMSYSERR_NOERROR;
 }
 
 MMRESULT WINAPI PrepareLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)lpMidiHdr; (void)cbMidiHdr;
+    if (!HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr))
+        return MMSYSERR_INVALPARAM;
+    lpMidiHdr->dwFlags |= MHDR_PREPARED;
+    lpMidiHdr->dwFlags &= ~(MHDR_DONE | MHDR_INQUEUE);
     return MMSYSERR_NOERROR;
 }
 
 MMRESULT WINAPI UnprepareLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)lpMidiHdr; (void)cbMidiHdr;
+    if (!HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr))
+        return MMSYSERR_INVALPARAM;
+    if ((lpMidiHdr->dwFlags & MHDR_INQUEUE) != 0u)
+        return MIDIERR_STILLPLAYING;
+    lpMidiHdr->dwFlags &= ~MHDR_PREPARED;
     return MMSYSERR_NOERROR;
 }
 

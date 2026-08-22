@@ -37,6 +37,8 @@ public:
     uint8_t GetBankLSB(uint8_t channel) const;
     uint16_t GetBank(uint8_t channel) const;
     uint16_t GetSelectedPreset(uint8_t channel) const;
+    bool IsPercussion(uint8_t channel) const;
+    void SetRhythmPart(uint8_t channel, uint8_t map);
     bool IsSustainActive(uint8_t channel) const;
     float GetPitchBendSemitones(uint8_t channel) const;
     uint16_t GetPitchBendValue(uint8_t channel) const;
@@ -62,6 +64,7 @@ private:
     uint8_t channelBankMSB_[kChannelCount];
     uint8_t channelBankLSB_[kChannelCount];
     uint16_t channelSelectedPreset_[kChannelCount];
+    uint8_t channelRhythmPart_[kChannelCount];
     bool noteActive_[kChannelCount][kNoteCount];
     float masterVolume_;
 };
@@ -84,6 +87,7 @@ inline void ChannelCache::Reset() {
         channelBankMSB_[ch] = 0;
         channelBankLSB_[ch] = 0;
         channelSelectedPreset_[ch] = 0;
+        channelRhythmPart_[ch] = ch == 9u ? 1u : 0u;
         for (uint32_t n = 0; n < kNoteCount; ++n) {
             noteActive_[ch][n] = false;
         }
@@ -241,6 +245,15 @@ inline uint16_t ChannelCache::GetBank(uint8_t channel) const {
 
 inline uint16_t ChannelCache::GetSelectedPreset(uint8_t channel) const {
     return (channel < kChannelCount) ? channelSelectedPreset_[channel] : 0;
+}
+
+inline bool ChannelCache::IsPercussion(uint8_t channel) const {
+    return channel < kChannelCount && channelRhythmPart_[channel] != 0u;
+}
+
+inline void ChannelCache::SetRhythmPart(uint8_t channel, uint8_t map) {
+    if (channel < kChannelCount)
+        channelRhythmPart_[channel] = map <= 2u ? map : 0u;
 }
 
 inline uint8_t ChannelCache::GetProgram(uint8_t channel) const {
