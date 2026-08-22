@@ -203,6 +203,8 @@ endif()
 target_include_directories(svmsynth PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
 
 set(EXPORTS
+        PlaySoundA
+        PlaySoundW
         midiOutGetNumDevs
         midiOutGetDevCapsA
         midiOutGetDevCapsW

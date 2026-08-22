@@ -158,8 +158,46 @@ static FARPROC GetXPSystemWinmmProc(const char* name) {
     }
     return proc;
 }
+
+static FARPROC GetSystemWinmmProc(const char* name) {
+    return GetXPSystemWinmmProc(name);
+}
 #else
 static void XPBootstrapTrace(const char*) {}
+
+// Hosts may use the local winmm.dll for more than MIDI. Resolve those
+// compatibility exports from the genuine system DLL by absolute path so the
+// loader cannot hand us this proxy again and recurse back into it.
+static volatile LONG g_systemWinmmState = 0;
+static HMODULE g_systemWinmm = nullptr;
+
+static HMODULE GetSystemWinmm() {
+    LONG state = InterlockedCompareExchange(&g_systemWinmmState, 1, 0);
+    if (state == 0) {
+        wchar_t systemPath[MAX_PATH] = {};
+        const UINT length = GetSystemDirectoryW(systemPath, MAX_PATH);
+        static const wchar_t suffix[] = L"\\winmm.dll";
+        bool success = length != 0 &&
+            length + (sizeof(suffix) / sizeof(suffix[0])) <= MAX_PATH;
+        if (success) std::wcscat(systemPath, suffix);
+        if (success) {
+            g_systemWinmm = LoadLibraryW(systemPath);
+            success = g_systemWinmm != nullptr;
+        }
+        InterlockedExchange(&g_systemWinmmState, success ? 2 : 3);
+        return g_systemWinmm;
+    }
+    while (state == 1) {
+        Sleep(0);
+        state = InterlockedCompareExchange(&g_systemWinmmState, 0, 0);
+    }
+    return state == 2 ? g_systemWinmm : nullptr;
+}
+
+static FARPROC GetSystemWinmmProc(const char* name) {
+    HMODULE module = GetSystemWinmm();
+    return module ? GetProcAddress(module, name) : nullptr;
+}
 #endif
 
 namespace svms {
@@ -4771,6 +4809,18 @@ static bool IsSupportedMidiOutputDevice(UINT_PTR deviceId) {
 }
 
 extern "C" {
+
+BOOL WINAPI PlaySoundA(LPCSTR pszSound, HMODULE hmod, DWORD fdwSound) {
+    using Proc = BOOL (WINAPI*)(LPCSTR, HMODULE, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("PlaySoundA"));
+    return proc ? proc(pszSound, hmod, fdwSound) : FALSE;
+}
+
+BOOL WINAPI PlaySoundW(LPCWSTR pszSound, HMODULE hmod, DWORD fdwSound) {
+    using Proc = BOOL (WINAPI*)(LPCWSTR, HMODULE, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("PlaySoundW"));
+    return proc ? proc(pszSound, hmod, fdwSound) : FALSE;
+}
 
 UINT WINAPI midiOutGetNumDevs(void) {
     XPBootstrapTrace("[SVMS XP] midiOutGetNumDevs reached\r\n");
