@@ -90,6 +90,7 @@ struct Options {
     bool copiedLaunchPlan = false;
     bool batchNoteOffIndex = false;
     bool launchChurnProfile = false;
+    bool volatileFallbackScan = false;
     uint32_t eventStride = 1;
     uint32_t noteRate = 64000;
     uint32_t keyCount = 128;
@@ -169,6 +170,15 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.breakdown = true;
         } else if (std::strcmp(argv[i], "--launch-churn") == 0) {
             options.launchChurnProfile = true;
+        } else if (std::strcmp(argv[i], "--volatile-selection") == 0) {
+            if (i + 1 >= argc) return false;
+            const char* selection = argv[++i];
+            if (std::strcmp(selection, "heap") == 0)
+                options.volatileFallbackScan = false;
+            else if (std::strcmp(selection, "scan") == 0)
+                options.volatileFallbackScan = true;
+            else
+                return false;
         } else if (std::strcmp(argv[i], "--launch-path") == 0) {
             if (i + 1 >= argc) return false;
             const char* path = argv[++i];
@@ -529,7 +539,7 @@ int main(int argc, char** argv) {
             "[--launch-path legacy|transactional] "
             "[--launch-plan direct|copy] "
             "[--noteoff-index immediate|batch] "
-            "[--breakdown] [--launch-churn] "
+            "[--breakdown] [--launch-churn] [--volatile-selection heap|scan] "
             "[--pin-core 0..63] "
             "[--quick] [--reference] [--enforce]\n");
         return 1;
@@ -571,6 +581,7 @@ int main(int argc, char** argv) {
     }
     voices->SetLaunchChurnProfilingEnabledForTest(
         options.launchChurnProfile);
+    voices->SetVolatileFallbackScanForTest(options.volatileFallbackScan);
     auto renderer = std::make_unique<svms::RenderScalar>();
     if (!renderer->ReserveVoiceCapacity(options.voices)) {
         std::fprintf(stderr, "cannot allocate renderer scratch\n");
@@ -866,7 +877,7 @@ int main(int argc, char** argv) {
     churnBuckets += "]";
 
     std::printf(
-        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"render_threads\":%u,\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"launch_churn_profile\":%s,\"voices\":%u,\"frames\":%u,"
+        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"render_threads\":%u,\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"launch_churn_profile\":%s,\"volatile_selection\":\"%s\",\"voices\":%u,\"frames\":%u,"
         "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,\"note_length_frames\":%u,\"noteoff_index\":\"%s\","
         "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
         "\"voice_soa_bytes\":%zu,\"voice_manager_bytes\":%zu,\"renderer_bytes\":%zu,"
@@ -911,6 +922,7 @@ int main(int argc, char** argv) {
         options.transactionalLaunch ? "transactional" : "legacy",
         options.copiedLaunchPlan ? "copy" : "direct",
         options.launchChurnProfile ? "true" : "false",
+        options.volatileFallbackScan ? "scan" : "heap",
         options.voices, options.frames,
         measuredCallbacks, options.eventStride, options.noteRate, options.keyCount,
         options.attackFrames, options.noteLengthFrames,

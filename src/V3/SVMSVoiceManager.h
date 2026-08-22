@@ -313,6 +313,9 @@ public:
         launchChurnProfilingEnabled_ = enabled;
         ResetGroupReuseCountersForTest();
     }
+    void SetVolatileFallbackScanForTest(bool enabled) {
+        volatileFallbackScanForTest_ = enabled;
+    }
     uint32_t GetPlayGroupSizeForTest(VoiceHandle handle) const {
         if (handle >= maxVoices_ ||
             v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) return 0u;
@@ -511,6 +514,7 @@ private:
     uint64_t launchProfileConfigureCycles_ = 0u;
     uint64_t launchProfileTreeCycles_ = 0u;
     bool launchChurnProfilingEnabled_ = false;
+    bool volatileFallbackScanForTest_ = false;
     LaunchChurnStats launchChurnStats_{};
     LaunchTestContext launchTestContext_{};
     uint64_t launchTestTrackedFrame_ = 0u;
@@ -853,6 +857,7 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     launchProfileConfigureCycles_ = other.launchProfileConfigureCycles_;
     launchProfileTreeCycles_ = other.launchProfileTreeCycles_;
     launchChurnProfilingEnabled_ = other.launchChurnProfilingEnabled_;
+    volatileFallbackScanForTest_ = other.volatileFallbackScanForTest_;
     launchChurnStats_ = other.launchChurnStats_;
     launchTestContext_ = LaunchTestContext{};
     launchTestTrackedFrame_ = other.launchTestTrackedFrame_;
@@ -1150,6 +1155,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     grown.launchProfileConfigureCycles_ = launchProfileConfigureCycles_;
     grown.launchProfileTreeCycles_ = launchProfileTreeCycles_;
     grown.launchChurnProfilingEnabled_ = launchChurnProfilingEnabled_;
+    grown.volatileFallbackScanForTest_ = volatileFallbackScanForTest_;
     grown.launchChurnStats_ = launchChurnStats_;
     grown.launchTestContext_ = LaunchTestContext{};
     grown.launchTestTrackedFrame_ = launchTestTrackedFrame_;
@@ -2450,19 +2456,32 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
             bestIsVolatile = true;
         }
     }
-    for (uint32_t i = 0; i < stealVolatileCount_; ++i) {
-        const uint32_t handle = stealVolatileList_[i];
-        if (stealVolatileHeapPosition_[handle] < stealVolatileHeapCount_)
-            continue;
-        const StealCandidate candidate{
-            ComputeStableStealKey(static_cast<VoiceHandle>(handle)),
-            handle, activePosition_[handle]};
-        if (!haveBest || HigherPriorityCandidate(candidate, best)) {
-            best = candidate;
-            haveBest = true;
-            bestIsVolatile = true;
+    // A valid current-frame heap contains every linked volatile candidate.
+    // LinkVolatileCandidate inserts into it, UnlinkVolatileCandidate removes
+    // from both structures, and a reserved root deliberately remains in both
+    // until its launch transaction commits. The former defensive list walk
+    // therefore inspected the entire volatile population for every steal and
+    // never contributed a candidate.
+    assert(stealVolatileHeapCount_ == stealVolatileCount_);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    // Retain the redundant predecessor scan as an explicit benchmark oracle,
+    // disabled by default and absent from production builds.
+    if (volatileFallbackScanForTest_) {
+        for (uint32_t i = 0u; i < stealVolatileCount_; ++i) {
+            const uint32_t handle = stealVolatileList_[i];
+            if (stealVolatileHeapPosition_[handle] < stealVolatileHeapCount_)
+                continue;
+            const StealCandidate candidate{
+                ComputeStableStealKey(static_cast<VoiceHandle>(handle)),
+                handle, activePosition_[handle]};
+            if (!haveBest || HigherPriorityCandidate(candidate, best)) {
+                best = candidate;
+                haveBest = true;
+                bestIsVolatile = true;
+            }
         }
     }
+#endif
     if (!haveBest) return kInvalidVoice;
     activePosition = best.activePosition;
     if (bestIsVolatile) {

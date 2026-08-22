@@ -362,6 +362,13 @@ larger phase containing that item is complete.
   tournament root, removing the redundant stable-candidate array. This trims
   VoiceManager by 48 KiB and reduces corrected 5.5M-NPS cost another 2% at
   both 300 and 1,000 voices with byte-identical PNC3 output
+- [x] Remove the defensive full volatile-list scan after consulting the exact
+  current-frame volatile heap. Its membership is maintained one-to-one by
+  every link, unlink, and reserved-root transaction. On the 1,000-voice 6M
+  chopped-note corpus, realized MIDI-event throughput rises from 3.57M/s to
+  5.18M/s (45%), callback work falls about 31%, and sampled victim selection
+  falls from roughly 865 to 198 cycles without changing the exhaustive victim
+  oracle
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact
