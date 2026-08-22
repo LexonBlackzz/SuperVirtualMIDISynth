@@ -3108,23 +3108,6 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const ChannelParamsSnapshot& cp, VoiceHandle& outHandle) {
     if (freeTop_ != 0u || !IsStableConfiguration(setup)) return false;
 
-    // This transaction can consume only a stable winner.  In release-heavy
-    // streams the exact winner is almost always the volatile-heap root; avoid
-    // reserving it here only to clear that reservation and select it again in
-    // ReuseMatchingStealGroup.  Packed roots carry the complete score and
-    // active-position tie, so this is the same comparison PopStealCandidate
-    // would perform, without mutating either index.
-    if (!stealHeapValid_) BuildStealHeap();
-    if (stealHeapCount_ == 0u) return false;
-    if (stealVolatileCount_ != 0u) {
-        if (!stealVolatileHeapValid_ ||
-            stealVolatileHeapFrame_ != currentFrame_)
-            BuildVolatileStealHeap();
-        if (stealVolatileHeapCount_ != 0u &&
-            stealVolatileHeapKey_[0] > stealWinnerTree_[1])
-            return false;
-    }
-
     uint32_t selectedPosition = 0u;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const bool profileLaunch = (++launchProfileCounter_ & 4095u) == 0u;
@@ -3143,15 +3126,19 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
 #endif
     if (handle == kInvalidVoice) return false;
 
-    // This compact transaction is valid only when the exact winner is a
-    // stable, ungrouped voice whose winner-tree leaf was reserved in place.
-    // Restore any other reservation and let the general grouped path repeat
-    // the (unchanged) exact selection.
-    const bool eligible = stealCandidateReserved_[handle] == 2u &&
-        playGroupPrev_[handle] < 0 && playGroupNext_[handle] < 0 &&
+    // Mono replacements can retain the selected physical slot regardless of
+    // whether the exact victim came from the stable tree or volatile heap.
+    // Grouped victims still fall back to the complete atomic group path.
+    const uint8_t reservation = stealCandidateReserved_[handle];
+    const bool stableVictim = reservation == 2u &&
         IsStableStealCandidate(handle) &&
         stealWinnerTree_[stealTreeLeafBase_ + handle] ==
             stealStableKey_[handle];
+    const bool volatileVictim = reservation == 1u &&
+        !IsStableStealCandidate(handle) &&
+        stealVolatileHeapPosition_[handle] < stealVolatileHeapCount_;
+    const bool eligible = (stableVictim || volatileVictim) &&
+        playGroupPrev_[handle] < 0 && playGroupNext_[handle] < 0;
     if (!eligible) {
         stealCandidateReserved_[handle] = 0u;
         return false;
@@ -3168,6 +3155,10 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
         v.renderClass[handle] == desiredClassValue;
 
     CaptureStealTail(handle);
+    if (volatileVictim) {
+        stealCandidateReserved_[handle] = 0u;
+        RemoveStealCandidate(handle);
+    }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const uint64_t profileAfterTail = profileLaunch ? __rdtsc() : 0u;
 #endif
@@ -3226,13 +3217,14 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const uint64_t testTreeBegin = BeginLaunchStageForTest();
 #endif
 
-    // The eligibility test guarantees that the replacement remains in the
-    // stable tree. Refresh its cached key and its one root path exactly once.
+    // The stable replacement retains its leaf; a volatile victim vacated the
+    // heap and inserts that same physical handle as a new stable leaf.
     stealCandidateReserved_[handle] = 0u;
     const float score = ComputeNewbornStableStealKey(handle);
     stealStableKey_[handle] = EncodeStableWinnerKey(
         score, activePosition_[handle]);
     stealWinnerTree_[stealTreeLeafBase_ + handle] = stealStableKey_[handle];
+    if (volatileVictim) ++stealHeapCount_;
     RefreshStealWinnerPath(handle);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance,

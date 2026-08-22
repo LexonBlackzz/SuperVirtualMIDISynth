@@ -380,6 +380,11 @@ larger phase containing that item is complete.
   reserve the same volatile victim twice; the 6M chopped-note corpus reaches
   5.94-6.00M events/s at 157.22-158.93 cycles per voice-sample with unchanged
   exhaustive-oracle victims
+- [x] Extend the saturated mono in-place transaction to exact volatile-heap
+  victims. It retains the physical slot while preserving the selected victim,
+  64-frame tail, lifecycle indices, and replacement tree leaf. Sampled launch
+  cost falls from about 1,146 to 921 cycles, while uninstrumented throughput
+  reaches 6.16-6.25M events/s at 151.00-152.92 cycles per voice-sample
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact
