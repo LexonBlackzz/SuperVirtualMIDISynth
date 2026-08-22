@@ -1719,6 +1719,24 @@ void TestPitchAndDeterministicRender() {
     cache.ControlChange(0, 6, 12);
     Check(NearlyEqual(cache.GetPitchBendSemitones(0), 12.0f, 2.0e-3f),
           "RPN pitch-bend sensitivity changes the range to +12 semitones");
+    cache.PitchBend(0, 8192);
+    cache.ControlChange(0, 100, 1);
+    cache.ControlChange(0, 6, 65);
+    cache.ControlChange(0, 38, 0);
+    Check(NearlyEqual(cache.GetPitchBendSemitones(0), 0.015625f),
+          "RPN channel fine tuning is applied around the 8192 center");
+    cache.ControlChange(0, 100, 2);
+    cache.ControlChange(0, 6, 88);
+    Check(NearlyEqual(cache.GetPitchBendSemitones(0), 24.015625f),
+          "RPN channel coarse tuning is combined with fine tuning");
+    cache.ControlChange(0, 100, 0);
+    cache.ControlChange(0, 6, 12);
+    cache.PitchBend(0, 0);
+    Check(NearlyEqual(cache.GetPitchBendSemitones(0), 12.015625f),
+          "coarse and fine tuning compensate an exact full-down wheel");
+    cache.ResetControllers(0);
+    Check(NearlyEqual(cache.GetPitchBendSemitones(0), 0.0f),
+          "reset controllers restores channel tuning and pitch wheel");
 
     float leftA[32], rightA[32], leftB[32], rightB[32];
     RenderDeterministic(leftA, rightA, 32);

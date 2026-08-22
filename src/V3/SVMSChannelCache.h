@@ -59,6 +59,8 @@ private:
     uint8_t channelRpnLSB_[kChannelCount];
     uint8_t channelBendRangeSemitones_[kChannelCount];
     uint8_t channelBendRangeCents_[kChannelCount];
+    uint16_t channelFineTune_[kChannelCount];
+    uint8_t channelCoarseTune_[kChannelCount];
     uint8_t channelSustain_[kChannelCount];
     uint8_t channelProgram_[kChannelCount];
     uint8_t channelBankMSB_[kChannelCount];
@@ -82,6 +84,8 @@ inline void ChannelCache::Reset() {
         channelRpnMSB_[ch] = channelRpnLSB_[ch] = 127;
         channelBendRangeSemitones_[ch] = 2;
         channelBendRangeCents_[ch] = 0;
+        channelFineTune_[ch] = 8192;
+        channelCoarseTune_[ch] = 64;
         channelSustain_[ch] = 0;
         channelProgram_[ch] = 0;
         channelBankMSB_[ch] = 0;
@@ -127,22 +131,51 @@ inline void ChannelCache::ControlChange(uint8_t channel, uint8_t controller, uin
         case 101: channelRpnMSB_[channel] = value; break;
         case 100: channelRpnLSB_[channel] = value; break;
         case 6:
-            if (channelRpnMSB_[channel] == 0 && channelRpnLSB_[channel] == 0)
-                channelBendRangeSemitones_[channel] = value;
+            if (channelRpnMSB_[channel] == 0) {
+                if (channelRpnLSB_[channel] == 0)
+                    channelBendRangeSemitones_[channel] = value;
+                else if (channelRpnLSB_[channel] == 1)
+                    channelFineTune_[channel] = static_cast<uint16_t>(
+                        (static_cast<uint16_t>(value) << 7u) |
+                        (channelFineTune_[channel] & 0x7fu));
+                else if (channelRpnLSB_[channel] == 2)
+                    channelCoarseTune_[channel] = value;
+            }
             break;
         case 38:
-            if (channelRpnMSB_[channel] == 0 && channelRpnLSB_[channel] == 0)
-                channelBendRangeCents_[channel] = value > 99 ? 99 : value;
+            if (channelRpnMSB_[channel] == 0) {
+                if (channelRpnLSB_[channel] == 0)
+                    channelBendRangeCents_[channel] = value > 99 ? 99 : value;
+                else if (channelRpnLSB_[channel] == 1)
+                    channelFineTune_[channel] = static_cast<uint16_t>(
+                        (channelFineTune_[channel] & 0x3f80u) | value);
+            }
             break;
         case 96:
-            if (channelRpnMSB_[channel] == 0 && channelRpnLSB_[channel] == 0 &&
-                channelBendRangeSemitones_[channel] < 127)
-                ++channelBendRangeSemitones_[channel];
+            if (channelRpnMSB_[channel] == 0) {
+                if (channelRpnLSB_[channel] == 0 &&
+                    channelBendRangeSemitones_[channel] < 127)
+                    ++channelBendRangeSemitones_[channel];
+                else if (channelRpnLSB_[channel] == 1 &&
+                         channelFineTune_[channel] < 16383)
+                    ++channelFineTune_[channel];
+                else if (channelRpnLSB_[channel] == 2 &&
+                         channelCoarseTune_[channel] < 127)
+                    ++channelCoarseTune_[channel];
+            }
             break;
         case 97:
-            if (channelRpnMSB_[channel] == 0 && channelRpnLSB_[channel] == 0 &&
-                channelBendRangeSemitones_[channel] > 0)
-                --channelBendRangeSemitones_[channel];
+            if (channelRpnMSB_[channel] == 0) {
+                if (channelRpnLSB_[channel] == 0 &&
+                    channelBendRangeSemitones_[channel] > 0)
+                    --channelBendRangeSemitones_[channel];
+                else if (channelRpnLSB_[channel] == 1 &&
+                         channelFineTune_[channel] > 0)
+                    --channelFineTune_[channel];
+                else if (channelRpnLSB_[channel] == 2 &&
+                         channelCoarseTune_[channel] > 0)
+                    --channelCoarseTune_[channel];
+            }
             break;
         case 120: AllSoundOff(channel); break;
         case 121: ResetControllers(channel); break;
@@ -171,6 +204,8 @@ inline void ChannelCache::ResetControllers(uint8_t channel) {
     channelRpnMSB_[channel] = channelRpnLSB_[channel] = 127;
     channelBendRangeSemitones_[channel] = 2;
     channelBendRangeCents_[channel] = 0;
+    channelFineTune_[channel] = 8192;
+    channelCoarseTune_[channel] = 64;
     channelSustain_[channel] = 0;
 }
 
@@ -214,10 +249,7 @@ inline void ChannelCache::RebuildChannel(uint8_t channel,
     channels_[ch].mixScaleRight =
         channels_[ch].panRight * vol * channels_[ch].expression;
 
-    const float bend = (channelPitchBend_[ch] - 8192.0f) / 8192.0f;
-    channels_[ch].pitchBendCents =
-        bend * ((channelBendRangeSemitones_[ch] * 100.0f) +
-                channelBendRangeCents_[ch]);
+    channels_[ch].pitchBendCents = GetPitchBendSemitones(channel) * 100.0f;
 
     channels_[ch].sustainActive = channelSustain_[ch] >= 64 ? 1u : 0u;
     channels_[ch].filterCutoff = 20000.0f;
@@ -266,9 +298,14 @@ inline bool ChannelCache::IsSustainActive(uint8_t channel) const {
 
 inline float ChannelCache::GetPitchBendSemitones(uint8_t channel) const {
     if (channel >= kChannelCount) return 0.0f;
-    return (float)(channelPitchBend_[channel] - 8192) / 8192.0f
-        * (channelBendRangeSemitones_[channel] +
-           channelBendRangeCents_[channel] * 0.01f);
+    const float wheel = static_cast<float>(channelPitchBend_[channel] - 8192) /
+        8192.0f * (channelBendRangeSemitones_[channel] +
+                   channelBendRangeCents_[channel] * 0.01f);
+    const float coarse = static_cast<float>(
+        static_cast<int>(channelCoarseTune_[channel]) - 64);
+    const float fine = static_cast<float>(
+        static_cast<int>(channelFineTune_[channel]) - 8192) / 8192.0f;
+    return wheel + coarse + fine;
 }
 
 inline uint16_t ChannelCache::GetPitchBendValue(uint8_t channel) const {

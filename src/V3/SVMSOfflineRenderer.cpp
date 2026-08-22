@@ -354,7 +354,7 @@ private:
         const float releaseSeconds=TimecentsToSeconds(rg.releaseVolEnv);p.releaseDecay=MakeReleaseDecay(releaseSeconds,rate_);p.release=MakeReleaseSamples(releaseSeconds,rate_);
         channels_.ComputeSoundFontPan(rg.pan,p.panL,p.panR);p.valid=true;
     }
-    bool Resolve(uint8_t ch,uint32_t& preset) { return sf2_resolve_preset(sf2_.get(),channels_.GetBank(ch),channels_.GetProgram(ch),ch==9,&preset); }
+    bool Resolve(uint8_t ch,uint32_t& preset) { return sf2_resolve_preset(sf2_.get(),channels_.GetBankMSB(ch),channels_.GetProgram(ch),channels_.IsPercussion(ch),&preset); }
     void RefreshPreset(uint8_t ch) { uint32_t p=0;channels_.SetSelectedPreset(ch,Resolve(ch,p)?uint16_t(p):UINT16_MAX); }
     void NoteOn(uint8_t ch,uint8_t note,uint8_t vel) {
         ++noteCalls_;if(note>=128)return;channels_.NoteOn(ch,note,vel);uint32_t pi=channels_.GetSelectedPreset(ch);if(pi>=sf2_->presetCount){if(!Resolve(ch,pi)){++missingPresets_;return;}channels_.SetSelectedPreset(ch,uint16_t(pi));}

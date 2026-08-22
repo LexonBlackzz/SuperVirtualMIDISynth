@@ -260,8 +260,9 @@ private:
     }
 
     bool Resolve(uint8_t channel, uint32_t& preset) {
-        return sf2_resolve_preset(sf2_.get(), channels_.GetBank(channel),
-                                  channels_.GetProgram(channel), channel == 9,
+        return sf2_resolve_preset(sf2_.get(), channels_.GetBankMSB(channel),
+                                  channels_.GetProgram(channel),
+                                  channels_.IsPercussion(channel),
                                   &preset);
     }
 

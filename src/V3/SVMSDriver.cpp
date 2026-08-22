@@ -2492,15 +2492,16 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
 }
 #endif // !defined(SVMS_XP_COMPAT)
 
-// Resolve a channel's active preset using the same bank/program rules as TSF:
-// normal channels use their selected bank and program; MIDI channel 10 first
-// searches the percussion bank (128 | bank), then the standard percussion
-// fallbacks.  The caller only commits a successful result, so an invalid
+// Resolve a channel's active preset using GS/SF2 bank semantics: CC0 selects
+// the SF2 variation bank while CC32 remains tracked as MIDI state. Combining
+// them turns GS bank 1 into SF2 bank 128 and selects the wrong instruments.
+// Percussion parts search the percussion bank before melodic fallbacks. The
+// caller only commits a successful result, so an invalid
 // program change leaves the previously selected preset untouched.
 static bool ResolveChannelPreset(const SF2Data* data, const ChannelCache& cache,
                                  uint8_t channel, uint32_t* outPresetIndex) {
     if (!data || !outPresetIndex || channel >= kChannelCount) return false;
-    return sf2_resolve_preset(data, cache.GetBank(channel), cache.GetProgram(channel),
+    return sf2_resolve_preset(data, cache.GetBankMSB(channel), cache.GetProgram(channel),
                               cache.IsPercussion(channel), outPresetIndex);
 }
 
