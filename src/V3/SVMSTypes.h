@@ -419,6 +419,7 @@ struct SamplePage {
     X(float, mixGainR) \
     X(float, renderGainL) \
     X(float, renderGainR) \
+    X(float, stealOutputGain) \
     X(uint32_t, sampleStart) \
     X(uint32_t, sampleEnd) \
     X(uint32_t, loopStart) \

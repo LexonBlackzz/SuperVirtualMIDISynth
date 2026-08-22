@@ -1027,6 +1027,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(mixGainR);
     SVMS_COPY_GROWN_VOICE_FIELD(renderGainL);
     SVMS_COPY_GROWN_VOICE_FIELD(renderGainR);
+    SVMS_COPY_GROWN_VOICE_FIELD(stealOutputGain);
     SVMS_COPY_GROWN_VOICE_FIELD(sampleStart);
     SVMS_COPY_GROWN_VOICE_FIELD(sampleEnd);
     SVMS_COPY_GROWN_VOICE_FIELD(loopStart);
@@ -1617,11 +1618,11 @@ inline VoiceHandle VoiceManager::FindStealVictimExhaustiveForTest() const {
 
 inline float VoiceManager::ComputeEffectiveStealLevel(
     VoiceHandle handle) const {
-    const float left = v.mixGainL[handle];
-    const float right = v.mixGainR[handle];
     // BASS ranks a control-derived level before waveform sampling. The
-    // stereo energy norm removes constant-power pan from that estimate.
-    const float outputGain = std::sqrt(left * left + right * right);
+    // cached stereo energy norm removes constant-power pan from that estimate.
+    // It changes only with region/channel gain, while volatile decay/release
+    // voices are rescored every output frame.
+    const float outputGain = v.stealOutputGain[handle];
     const uint8_t stage = v.envelopeStage[handle];
     const bool preDecay =
         v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
@@ -1687,6 +1688,7 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.mixGainR[handle]          = 0.0f;
     v.renderGainL[handle]       = 0.0f;
     v.renderGainR[handle]       = 0.0f;
+    v.stealOutputGain[handle]   = 0.0f;
     v.relEnd[handle]            = 0;
     v.relLoopS[handle]          = 0;
     v.relLoopE[handle]          = 0;
@@ -3054,6 +3056,9 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.gainRight[handle] = setup.gainRight;
     v.mixGainL[handle] = setup.gainLeft * cp.mixScaleLeft;
     v.mixGainR[handle] = setup.gainRight * cp.mixScaleRight;
+    v.stealOutputGain[handle] = std::sqrt(
+        v.mixGainL[handle] * v.mixGainL[handle] +
+        v.mixGainR[handle] * v.mixGainR[handle]);
     v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
     v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
 }
@@ -3090,9 +3095,7 @@ inline bool VoiceManager::IsStableConfiguration(
 
 inline float VoiceManager::ComputeNewbornStableStealKey(
     VoiceHandle handle) const {
-    const float left = v.mixGainL[handle];
-    const float right = v.mixGainR[handle];
-    const float outputGain = std::sqrt(left * left + right * right);
+    const float outputGain = v.stealOutputGain[handle];
     const float effectiveLevel =
         std::fabs(v.targetGain[handle]) * outputGain;
     const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
@@ -3726,6 +3729,9 @@ inline void VoiceManager::RefreshMixGain(VoiceHandle handle, const ChannelParams
     if (handle >= maxVoices_) return;
     v.mixGainL[handle] = v.gainLeft[handle] * cp.mixScaleLeft;
     v.mixGainR[handle] = v.gainRight[handle] * cp.mixScaleRight;
+    v.stealOutputGain[handle] = std::sqrt(
+        v.mixGainL[handle] * v.mixGainL[handle] +
+        v.mixGainR[handle] * v.mixGainR[handle]);
     v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
     v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
     UpdateStealCandidate(handle);
@@ -3738,6 +3744,9 @@ inline void VoiceManager::RefreshMixGains(const ChannelParamsSnapshot* chParams)
         const ChannelParamsSnapshot& cp = chParams[v.channel[i]];
         v.mixGainL[i] = v.gainLeft[i] * cp.mixScaleLeft;
         v.mixGainR[i] = v.gainRight[i] * cp.mixScaleRight;
+        v.stealOutputGain[i] = std::sqrt(
+            v.mixGainL[i] * v.mixGainL[i] +
+            v.mixGainR[i] * v.mixGainR[i]);
         v.renderGainL[i] = v.currentGain[i] * v.mixGainL[i];
         v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
         if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
@@ -3765,6 +3774,9 @@ inline void VoiceManager::RefreshMixGainsForChannel(
         const uint32_t i = voice;
         v.mixGainL[i] = v.gainLeft[i] * cp.mixScaleLeft;
         v.mixGainR[i] = v.gainRight[i] * cp.mixScaleRight;
+        v.stealOutputGain[i] = std::sqrt(
+            v.mixGainL[i] * v.mixGainL[i] +
+            v.mixGainR[i] * v.mixGainR[i]);
         v.renderGainL[i] = v.currentGain[i] * v.mixGainL[i];
         v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
         if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
