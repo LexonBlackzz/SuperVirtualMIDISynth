@@ -669,6 +669,7 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                                         const RenderEvent* events, uint32_t eventCount,
                                         bool correctnessMode,
                                         uint64_t blockStartFrame) {
+    voices.ApplyRuntimeVoiceLimit(blockStartFrame);
     // Scratch is indexed by the number of voices that can retire/reclassify in
     // one span, not by the physical handle ceiling. A live VoiceSoA grow may
     // therefore safely leave scratch at its old size until active polyphony
@@ -2132,6 +2133,10 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     if (coverageProfilingEnabled_) ++coverageStats_.callbacks;
 #endif
+    // Live pool-limit changes are callback-boundary commands.  Applying one
+    // before dense eligibility/snapshotting prevents a mid-plan lifecycle
+    // mutation from invalidating worker-visible voice state.
+    voices.ApplyRuntimeVoiceLimit(blockStartFrame);
     if (voices.activeCount_ > scratchCapacity_ &&
         !ReserveVoiceCapacity(voices.activeCount_)) return;
     if (!classChanges_ || !retirements_) return;

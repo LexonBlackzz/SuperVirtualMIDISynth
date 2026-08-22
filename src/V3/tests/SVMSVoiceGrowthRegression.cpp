@@ -110,11 +110,11 @@ int main() {
         };
     }
 
-    // Exercise the exact production request path: SetCurrentFrame sees a
-    // logical limit above the physical pool and grows the pool at the render
-    // boundary without resetting active voices.
+    // Exercise the exact production request path: the render-boundary command
+    // sees a logical limit above the physical pool and grows the pool without
+    // resetting active voices.
     svms::RequestRuntimeVoiceLimit(kGrownCapacity);
-    voices.SetCurrentFrame(100u);
+    voices.ApplyRuntimeVoiceLimit(100u);
     Check(voices.GetMaxVoices() == kGrownCapacity,
           "1024 -> 2048 grows the physical pool live");
     Check(voices.GetVoiceLimit() == kGrownCapacity,
@@ -201,7 +201,7 @@ int main() {
     // With 1025 active voices this also exercises the existing gradual
     // forced-release path instead of shrinking the physical allocation.
     svms::RequestRuntimeVoiceLimit(kLoweredLimit);
-    voices.SetCurrentFrame(132u);
+    voices.ApplyRuntimeVoiceLimit(132u);
     Check(voices.GetVoiceLimit() == kLoweredLimit,
           "2048 -> 512 applies after growth");
     Check(svms::AppliedRuntimeVoiceLimit() == kLoweredLimit,
@@ -214,7 +214,7 @@ int main() {
     // Raising back to an already allocated size is purely logical: no second
     // VoiceSoA replacement and no physical shrink/grow cycle is required.
     svms::RequestRuntimeVoiceLimit(kGrownCapacity);
-    voices.SetCurrentFrame(133u);
+    voices.ApplyRuntimeVoiceLimit(133u);
     Check(voices.GetVoiceLimit() == kGrownCapacity,
           "512 -> 2048 reapplies the logical cap");
     Check(svms::AppliedRuntimeVoiceLimit() == kGrownCapacity,

@@ -240,6 +240,9 @@ public:
         return sizeof(*this) + v.GetAllocatedBytes() - sizeof(v) +
                metadataBytes_;
     }
+    // Apply a process-local live limit request only at a render-block
+    // boundary, before dense plans or worker jobs can observe voice state.
+    void ApplyRuntimeVoiceLimit(uint64_t frame);
     void SetCurrentFrame(uint64_t frame);
     uint32_t GetVoiceAge(VoiceHandle handle) const;
     uint32_t GetChannelActiveCount(uint8_t channel) const;
@@ -1285,11 +1288,12 @@ inline uint32_t VoiceManager::EnforceVoiceLimit(uint32_t maxReleases,
         v.releaseStartInBlock[victim] = 0u;
         v.releaseDecay[victim] = releaseDecay;
         v.releaseSamplesRemaining[victim] = releaseSamples;
+        // PopStealCandidate already removed this victim.  Suppress the
+        // release reclassification's candidate update so a large live cap
+        // reduction does not remove, reinsert, then remove every victim.
+        stealCandidateDeferred_[victim] = 1u;
         StartRelease(victim);
-        // StartRelease reclassifies the voice and can reinsert it into the
-        // exact steal index. Keep this one absent while selecting the rest of
-        // the forced-cap victims, then rebuild lazily on the next real steal.
-        if (stealHeapValid_) RemoveStealCandidate(victim);
+        stealCandidateDeferred_[victim] = 0u;
         ++released;
     }
 
@@ -1503,17 +1507,12 @@ inline void VoiceManager::RecordVictimGroupForTest(
 }
 #endif
 
-inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
-#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-    TrackLaunchFrameForTest(frame);
-#endif
-    if (frame != currentFrame_) stealTailMinHeapValid_ = false;
-    currentFrame_ = frame;
-
+inline void VoiceManager::ApplyRuntimeVoiceLimit(uint64_t frame) {
+    SetCurrentFrame(frame);
     // RuntimeLink publishes only a process-local atomic request. Applying it
-    // here keeps all VoiceManager mutation on the audio/render thread. A cap
-    // above the current physical allocation first grows the pool while
-    // preserving handles and render state, then becomes the new logical cap.
+    // here keeps all VoiceManager mutation on the audio/render thread. This
+    // method is called once before a render block is planned, never while
+    // dense workers are consuming an immutable chunk plan.
     uint32_t requestedLimit = RequestedRuntimeVoiceLimit();
     if (requestedLimit > maxVoices_ && requestedLimit <= kMaxPolyphony) {
         if (!GrowCapacity(requestedLimit)) {
@@ -1539,10 +1538,18 @@ inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
             // spend an unbounded amount of one callback in victim selection.
             // Repeated boundaries continue shedding until the logical cap is
             // reached; each victim receives the requested ~50 ms release.
-            EnforceVoiceLimit(8192u, 0.050f);
+            EnforceVoiceLimit(256u, 0.050f);
             lastVoiceLimitEnforceFrame_ = frame;
         }
     }
+}
+
+inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    TrackLaunchFrameForTest(frame);
+#endif
+    if (frame != currentFrame_) stealTailMinHeapValid_ = false;
+    currentFrame_ = frame;
 }
 
 inline uint32_t VoiceManager::GetChannelActiveCount(uint8_t channel) const {
