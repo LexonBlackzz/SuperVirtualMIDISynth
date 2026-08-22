@@ -1915,7 +1915,8 @@ private:
                                          uint32_t blockCursor, void* userData);
 
     uint64_t HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
-                          bool deferLifetimeCounters = false);
+                          bool deferLifetimeCounters = false,
+                          const NoteLaunchPlanCacheEntry* exactFramePlan = nullptr);
     void HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset);
     void HandleStaleNoteOffBatch(uint8_t channel, uint8_t note, uint8_t count,
                                  uint32_t blockOffset);
@@ -4123,23 +4124,64 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
         }
         const uint64_t globalFence =
             self->globalTerminationFence_.load(std::memory_order_acquire);
-        do {
-            const RenderEvent& event = events[index++];
-            const uint64_t channelFence = event.channel < kChannelCount
-                ? self->channelTerminationFence_[event.channel].load(
-                    std::memory_order_acquire)
-                : 0u;
-            if (!FenceSuppresses(event.ingressSequence, globalFence) &&
-                !FenceSuppresses(event.ingressSequence, channelFence) &&
-                event.channel < kChannelCount && event.data1 < kNoteCount) {
+        while (index < eventCount &&
+               events[index].type == RenderEventType::NoteOn) {
+            const uint8_t runChannel = events[index].channel;
+            const uint8_t runNote = events[index].data1;
+            const uint8_t runVelocity = events[index].data2;
+            uint32_t runEnd = index + 1u;
+            while (runEnd < eventCount &&
+                   events[runEnd].type == RenderEventType::NoteOn &&
+                   events[runEnd].channel == runChannel &&
+                   events[runEnd].data1 == runNote &&
+                   events[runEnd].data2 == runVelocity) {
+                ++runEnd;
+            }
+
+            // A repeated chopped note on one exact frame has immutable SF2,
+            // preset, pitch and channel state. Resolve its prepared launch
+            // plan once, then reuse it for the rest of this run. No event is
+            // moved and a state event above remains a hard batch boundary.
+            const NoteLaunchPlanCacheEntry* exactFramePlan = nullptr;
+            for (; index < runEnd; ++index) {
+                const RenderEvent& event = events[index];
+                const uint64_t channelFence = event.channel < kChannelCount
+                    ? self->channelTerminationFence_[event.channel].load(
+                        std::memory_order_acquire)
+                    : 0u;
+                if (FenceSuppresses(event.ingressSequence, globalFence) ||
+                    FenceSuppresses(event.ingressSequence, channelFence) ||
+                    event.channel >= kChannelCount || event.data1 >= kNoteCount) {
+                    continue;
+                }
                 ++deferredNoteOns;
                 const uint64_t delta = self->HandleNoteOn(
-                    event.channel, event.data1, event.data2, true);
+                    event.channel, event.data1, event.data2, true,
+                    exactFramePlan);
                 deferredMatches += static_cast<uint32_t>(delta);
                 deferredConfigured += static_cast<uint32_t>(delta >> 32u);
+
+                if (!exactFramePlan && self->soundFontData &&
+                    self->channelCache) {
+                    const NoteLaunchPlanCacheEntry* candidate =
+                        self->noteLaunchHotCache_[runChannel][runNote];
+                    const uint32_t preset =
+                        self->channelCache->GetSelectedPreset(runChannel);
+                    if (candidate && candidate->soundFontGeneration ==
+                            self->soundFontGeneration_ &&
+                        candidate->channelRevision ==
+                            self->channelLaunchRevision_[runChannel] &&
+                        candidate->presetIndex == preset &&
+                        candidate->channel == runChannel &&
+                        candidate->note == runNote &&
+                        candidate->velocity == (runVelocity & 0x7fu) &&
+                        candidate->count != 0u &&
+                        candidate->count <= kNoteRegionCacheLayers) {
+                        exactFramePlan = candidate;
+                    }
+                }
             }
-        } while (index < eventCount &&
-                 events[index].type == RenderEventType::NoteOn);
+        }
     }
     self->sf2Telemetry_.noteOns += deferredNoteOns;
     self->sf2Telemetry_.exactRegionMatches += deferredMatches;
@@ -4202,7 +4244,8 @@ void Driver::RefreshSelectedPresets() {
 }
 
 uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
-                              bool deferLifetimeCounters) {
+                              bool deferLifetimeCounters,
+                              const NoteLaunchPlanCacheEntry* exactFramePlan) {
     if (!channelCache || !voiceManager) return 0u;
     if (channel >= kChannelCount || note >= kNoteCount) return 0u;
     velocity &= 0x7fu;
@@ -4245,9 +4288,12 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
             entry->count != 0u &&
             entry->count <= kNoteRegionCacheLayers;
     };
-    NoteLaunchPlanCacheEntry* launchCache =
-        noteLaunchHotCache_[channel][note];
-    bool launchCacheHit = planMatches(launchCache);
+    NoteLaunchPlanCacheEntry* launchCache = const_cast<
+        NoteLaunchPlanCacheEntry*>(exactFramePlan);
+    bool launchCacheHit = exactFramePlan != nullptr;
+    if (!launchCacheHit)
+        launchCache = noteLaunchHotCache_[channel][note];
+    if (!launchCacheHit) launchCacheHit = planMatches(launchCache);
     if (!launchCacheHit) {
         uint32_t launchHash = presetIndex * 0x9e3779b9u;
         launchHash ^= static_cast<uint32_t>(note) * 0x85ebca6bu;

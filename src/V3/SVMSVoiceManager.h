@@ -3397,6 +3397,32 @@ inline void VoiceManager::CommitVoiceGroupConfigurations(
     const VoiceHandle* handles, uint32_t count,
     bool candidatesReservedInPlace) {
     if (!candidatesReservedInPlace) {
+        // A prepared SF2 note becomes visible atomically. When every layer is
+        // a stable candidate, publish all leaves first and repair the union of
+        // their tree paths once. No event can observe an intermediate layer,
+        // and the resulting root is identical to individual commits.
+        bool canBatchStable = stealHeapValid_ && count <= 8u;
+        for (uint32_t layer = 0u; layer < count && canBatchStable; ++layer) {
+            const VoiceHandle handle = handles[layer];
+            canBatchStable = handle < maxVoices_ &&
+                stealCandidateDeferred_[handle] != 0u &&
+                stealCandidateReserved_[handle] == 0u &&
+                IsStableStealCandidate(handle);
+        }
+        if (canBatchStable) {
+            for (uint32_t layer = 0u; layer < count; ++layer) {
+                const VoiceHandle handle = handles[layer];
+                stealCandidateDeferred_[handle] = 0u;
+                ++stealHeapCount_;
+                const float score = ComputeStableStealKey(handle);
+                stealStableKey_[handle] = EncodeStableWinnerKey(
+                    score, activePosition_[handle]);
+                stealWinnerTree_[stealTreeLeafBase_ + handle] =
+                    stealStableKey_[handle];
+            }
+            RefreshStealWinnerPaths(handles, count);
+            return;
+        }
         for (uint32_t layer = 0u; layer < count; ++layer)
             CommitVoiceConfiguration(handles[layer]);
         return;
