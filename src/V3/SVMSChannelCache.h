@@ -69,9 +69,13 @@ private:
     uint8_t channelRhythmPart_[kChannelCount];
     bool noteActive_[kChannelCount][kNoteCount];
     float masterVolume_;
+    uint16_t dirtyMask_;
+    PanLaw cachedPanLaw_;
 };
 
-inline ChannelCache::ChannelCache() : masterVolume_(1.0f) {
+inline ChannelCache::ChannelCache()
+    : masterVolume_(1.0f), dirtyMask_(0xffffu),
+      cachedPanLaw_(static_cast<PanLaw>(0xffu)) {
     Reset();
 }
 
@@ -96,11 +100,16 @@ inline void ChannelCache::Reset() {
             noteActive_[ch][n] = false;
         }
     }
+    dirtyMask_ = 0xffffu;
 }
 
 inline void ChannelCache::SetMasterVolume(float vol) {
     // Master volume contract is 0..4 (SnappySynth-style headroom boost).
-    masterVolume_ = vol < 0.0f ? 0.0f : (vol > 4.0f ? 4.0f : vol);
+    const float clamped = vol < 0.0f ? 0.0f : (vol > 4.0f ? 4.0f : vol);
+    if (masterVolume_ != clamped) {
+        masterVolume_ = clamped;
+        dirtyMask_ = 0xffffu;
+    }
 }
 
 inline void ChannelCache::NoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
@@ -121,60 +130,95 @@ inline void ChannelCache::NoteOff(uint8_t channel, uint8_t note) {
 
 inline void ChannelCache::ControlChange(uint8_t channel, uint8_t controller, uint8_t value) {
     if (channel >= kChannelCount) return;
+    bool affectsCache = false;
     switch (controller) {
-        case 7:  channelVolume_[channel] = value; break;
-        case 11: channelExpression_[channel] = value; break;
-        case 10: channelPan_[channel] = value; break;
+        case 7:
+            affectsCache = channelVolume_[channel] != value;
+            channelVolume_[channel] = value;
+            break;
+        case 11:
+            affectsCache = channelExpression_[channel] != value;
+            channelExpression_[channel] = value;
+            break;
+        case 10:
+            affectsCache = channelPan_[channel] != value;
+            channelPan_[channel] = value;
+            break;
         case 0:  channelBankMSB_[channel] = value; break;
         case 32: channelBankLSB_[channel] = value; break;
-        case 64: channelSustain_[channel] = value; break;
+        case 64:
+            affectsCache = channelSustain_[channel] != value;
+            channelSustain_[channel] = value;
+            break;
         case 101: channelRpnMSB_[channel] = value; break;
         case 100: channelRpnLSB_[channel] = value; break;
         case 6:
             if (channelRpnMSB_[channel] == 0) {
-                if (channelRpnLSB_[channel] == 0)
+                if (channelRpnLSB_[channel] == 0) {
+                    affectsCache = channelBendRangeSemitones_[channel] != value;
                     channelBendRangeSemitones_[channel] = value;
-                else if (channelRpnLSB_[channel] == 1)
-                    channelFineTune_[channel] = static_cast<uint16_t>(
+                } else if (channelRpnLSB_[channel] == 1) {
+                    const uint16_t tuning = static_cast<uint16_t>(
                         (static_cast<uint16_t>(value) << 7u) |
                         (channelFineTune_[channel] & 0x7fu));
-                else if (channelRpnLSB_[channel] == 2)
+                    affectsCache = channelFineTune_[channel] != tuning;
+                    channelFineTune_[channel] = tuning;
+                } else if (channelRpnLSB_[channel] == 2) {
+                    affectsCache = channelCoarseTune_[channel] != value;
                     channelCoarseTune_[channel] = value;
+                }
             }
             break;
         case 38:
             if (channelRpnMSB_[channel] == 0) {
-                if (channelRpnLSB_[channel] == 0)
-                    channelBendRangeCents_[channel] = value > 99 ? 99 : value;
-                else if (channelRpnLSB_[channel] == 1)
-                    channelFineTune_[channel] = static_cast<uint16_t>(
+                if (channelRpnLSB_[channel] == 0) {
+                    const uint8_t cents = value > 99 ? 99 : value;
+                    affectsCache = channelBendRangeCents_[channel] != cents;
+                    channelBendRangeCents_[channel] = cents;
+                } else if (channelRpnLSB_[channel] == 1) {
+                    const uint16_t tuning = static_cast<uint16_t>(
                         (channelFineTune_[channel] & 0x3f80u) | value);
+                    affectsCache = channelFineTune_[channel] != tuning;
+                    channelFineTune_[channel] = tuning;
+                }
             }
             break;
         case 96:
             if (channelRpnMSB_[channel] == 0) {
                 if (channelRpnLSB_[channel] == 0 &&
-                    channelBendRangeSemitones_[channel] < 127)
+                    channelBendRangeSemitones_[channel] < 127) {
                     ++channelBendRangeSemitones_[channel];
+                    affectsCache = true;
+                }
                 else if (channelRpnLSB_[channel] == 1 &&
-                         channelFineTune_[channel] < 16383)
+                         channelFineTune_[channel] < 16383) {
                     ++channelFineTune_[channel];
+                    affectsCache = true;
+                }
                 else if (channelRpnLSB_[channel] == 2 &&
-                         channelCoarseTune_[channel] < 127)
+                         channelCoarseTune_[channel] < 127) {
                     ++channelCoarseTune_[channel];
+                    affectsCache = true;
+                }
             }
             break;
         case 97:
             if (channelRpnMSB_[channel] == 0) {
                 if (channelRpnLSB_[channel] == 0 &&
-                    channelBendRangeSemitones_[channel] > 0)
+                    channelBendRangeSemitones_[channel] > 0) {
                     --channelBendRangeSemitones_[channel];
+                    affectsCache = true;
+                }
                 else if (channelRpnLSB_[channel] == 1 &&
-                         channelFineTune_[channel] > 0)
+                         channelFineTune_[channel] > 0) {
                     --channelFineTune_[channel];
+                    affectsCache = true;
+                }
                 else if (channelRpnLSB_[channel] == 2 &&
-                         channelCoarseTune_[channel] > 0)
+                         channelCoarseTune_[channel] > 0) {
                     --channelCoarseTune_[channel];
+                    affectsCache = true;
+                }
             }
             break;
         case 120: AllSoundOff(channel); break;
@@ -182,6 +226,8 @@ inline void ChannelCache::ControlChange(uint8_t channel, uint8_t controller, uin
         case 123: AllNotesOff(channel); break;
         default: break;
     }
+    if (affectsCache)
+        dirtyMask_ |= static_cast<uint16_t>(1u << channel);
 }
 
 inline void ChannelCache::ProgramChange(uint8_t channel, uint8_t program) {
@@ -207,11 +253,13 @@ inline void ChannelCache::ResetControllers(uint8_t channel) {
     channelFineTune_[channel] = 8192;
     channelCoarseTune_[channel] = 64;
     channelSustain_[channel] = 0;
+    dirtyMask_ |= static_cast<uint16_t>(1u << channel);
 }
 
 inline void ChannelCache::PitchBend(uint8_t channel, int16_t value) {
-    if (channel < kChannelCount) {
+    if (channel < kChannelCount && channelPitchBend_[channel] != value) {
         channelPitchBend_[channel] = value;
+        dirtyMask_ |= static_cast<uint16_t>(1u << channel);
     }
 }
 
@@ -228,8 +276,16 @@ inline void ChannelCache::AllSoundOff(uint8_t channel) {
 }
 
 inline void ChannelCache::RebuildCache(const RuntimeConfigSnapshot& cfg, float sampleRate) {
-    for (uint32_t channel = 0; channel < kChannelCount; ++channel)
-        RebuildChannel(static_cast<uint8_t>(channel), cfg, sampleRate);
+    if (cachedPanLaw_ != cfg.panLaw) {
+        cachedPanLaw_ = cfg.panLaw;
+        dirtyMask_ = 0xffffu;
+    }
+    const uint16_t mask = dirtyMask_;
+    if (mask == 0u) return;
+    for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
+        if ((mask & static_cast<uint16_t>(1u << channel)) != 0u)
+            RebuildChannel(static_cast<uint8_t>(channel), cfg, sampleRate);
+    }
 }
 
 inline void ChannelCache::RebuildChannel(uint8_t channel,
@@ -237,6 +293,10 @@ inline void ChannelCache::RebuildChannel(uint8_t channel,
                                          float sampleRate) {
     (void)sampleRate;
     if (channel >= kChannelCount) return;
+    if (cachedPanLaw_ != cfg.panLaw) {
+        cachedPanLaw_ = cfg.panLaw;
+        dirtyMask_ = 0xffffu;
+    }
     const uint32_t ch = channel;
     const float vol = masterVolume_ * (channelVolume_[ch] / 127.0f);
     channels_[ch].volume = vol;
@@ -255,6 +315,7 @@ inline void ChannelCache::RebuildChannel(uint8_t channel,
     channels_[ch].filterCutoff = 20000.0f;
     channels_[ch].filterResonance = 0.0f;
     channels_[ch].modDepth = 0.0f;
+    dirtyMask_ &= static_cast<uint16_t>(~(1u << ch));
 }
 
 inline const ChannelParamsSnapshot* ChannelCache::GetParams() const {
