@@ -2920,16 +2920,14 @@ inline void VoiceManager::RetireVoice(VoiceHandle handle) {
     if (wasReleasing)
         releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
 
-    // Stable one-shot retirement is cheap to maintain incrementally. Release
-    // storms can retire hundreds of volatile voices in one span; updating a
-    // winner path for every swap is slower than one lazy rebuild before the
-    // next steal, so invalidate once for that workload.
-    const bool maintainStealIndex = stealHeapValid_ &&
-        IsStableStealCandidate(handle);
+    // Dense chopped streams interleave volatile retirement with immediate
+    // full-pool launches. Invalidating here made the next steal rebuild the
+    // complete candidate index, turning ordinary churn into repeated O(V)
+    // spikes. Remove the retiring candidate and repair only the swapped
+    // handle's path; both stable and volatile indices support this exactly.
+    const bool maintainStealIndex = stealHeapValid_;
     if (maintainStealIndex)
         RemoveStealCandidate(handle);
-    else
-        stealHeapValid_ = false;
     UnlinkChannelKey(handle);
     UnlinkPlayGroup(handle);
     UnlinkChannelActive(handle);
