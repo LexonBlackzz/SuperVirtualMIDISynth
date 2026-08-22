@@ -2540,9 +2540,58 @@ inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
 inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
     if (!stealHeapValid_ || handle >= maxVoices_ ||
         stealCandidateDeferred_[handle] != 0u) return;
-    RemoveStealCandidate(handle);
-    if (v.state[handle] != static_cast<uint8_t>(VoiceState::Free))
-        PushStealCandidate(handle, activePosition_[handle]);
+
+    const uint32_t leaf = stealTreeLeafBase_ + handle;
+    const bool indexedStable = stealWinnerTree_[leaf] != 0u;
+    const bool indexedVolatile =
+        stealVolatilePosition_[handle] < stealVolatileCount_;
+    const bool alive =
+        v.state[handle] != static_cast<uint8_t>(VoiceState::Free);
+    const bool wantsStable = alive && IsStableStealCandidate(handle);
+
+    if (wantsStable) {
+        if (indexedVolatile) UnlinkVolatileCandidate(handle);
+        if (!indexedStable) ++stealHeapCount_;
+        const float score = ComputeStableStealKey(handle);
+        stealStableKey_[handle] = EncodeStableWinnerKey(
+            score, activePosition_[handle]);
+        stealWinnerTree_[leaf] = stealStableKey_[handle];
+        // Updating an existing leaf used to clear and repair this path, then
+        // insert and repair it a second time. One repair is exact because no
+        // victim selection can observe the intermediate key on the audio
+        // thread.
+        RefreshStealWinnerPath(handle);
+        return;
+    }
+
+    if (indexedStable) {
+        stealWinnerTree_[leaf] = 0u;
+        assert(stealHeapCount_ > 0u);
+        --stealHeapCount_;
+        RefreshStealWinnerPath(handle);
+    }
+    if (!alive) {
+        if (indexedVolatile) UnlinkVolatileCandidate(handle);
+        return;
+    }
+    if (!indexedVolatile) {
+        LinkVolatileCandidate(handle);
+        return;
+    }
+
+    // A volatile candidate can change gain or active-position without
+    // changing class. Refresh its current-frame heap entry in place instead
+    // of unlinking it from both the heap and compact candidate list.
+    if (stealVolatileHeapValid_ &&
+        stealVolatileHeapFrame_ == currentFrame_) {
+        const uint32_t heapPosition = stealVolatileHeapPosition_[handle];
+        if (heapPosition < stealVolatileHeapCount_) {
+            stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
+                ComputeStableStealKey(handle), activePosition_[handle]);
+            VolatileHeapSiftUp(heapPosition);
+            VolatileHeapSiftDown(stealVolatileHeapPosition_[handle]);
+        }
+    }
 }
 
 inline bool VoiceManager::IsStableStealCandidate(VoiceHandle handle) const {
@@ -2631,15 +2680,32 @@ inline void VoiceManager::VolatileHeapSiftDown(uint32_t position) {
 }
 
 inline void VoiceManager::BuildVolatileStealHeap() {
-    for (uint32_t position = 0; position < stealVolatileHeapCount_; ++position)
-        stealVolatileHeapPosition_[stealVolatileHeapHandle_[position]] =
-            UINT32_MAX;
+    // The linked volatile set and the previous heap contain the same handles;
+    // removals update both structures immediately. Every surviving handle's
+    // inverse position is overwritten below, so clearing the old heap first
+    // was a redundant second pass over the hottest dense-stealing population.
     stealVolatileHeapCount_ = 0u;
+    const float commonAgeScore =
+        static_cast<float>(currentFrame_) * (1.0f / 256.0f);
     for (uint32_t position = 0; position < stealVolatileCount_; ++position) {
         const uint32_t handle = stealVolatileList_[position];
         const uint32_t heapPosition = stealVolatileHeapCount_++;
+        // Volatile means active decay or releasing, so its effective level is
+        // always currentGain * outputGain. Hoist the shared frame term and
+        // avoid re-running the stable/pre-decay classification for every
+        // candidate on every event frame. Keep the original arithmetic order
+        // so winner ties and floating-point rounding remain unchanged.
+        const uint64_t rawAge = currentFrame_ > v.birthFrame[handle]
+            ? currentFrame_ - v.birthFrame[handle] : 0u;
+        const uint32_t age = rawAge > UINT32_MAX
+            ? UINT32_MAX : static_cast<uint32_t>(rawAge);
+        const float ageUnits = static_cast<float>(age) * (1.0f / 256.0f);
+        const float effectiveLevel =
+            std::fabs(v.currentGain[handle]) * v.stealOutputGain[handle];
+        const float score = ageUnits -
+            effectiveLevel * kBassMidiStealGainScale;
         stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
-            ComputeStableStealKey(static_cast<VoiceHandle>(handle)),
+            score - commonAgeScore,
             activePosition_[handle]);
         stealVolatileHeapHandle_[heapPosition] = handle;
         stealVolatileHeapPosition_[handle] = heapPosition;
