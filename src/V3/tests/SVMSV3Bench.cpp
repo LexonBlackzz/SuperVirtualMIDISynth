@@ -16,7 +16,8 @@
 namespace {
 
 enum class Workload {
-    Sustained, Envelope, Release, Steal, Dense, MixedEvents, NoteBurst
+    Sustained, Envelope, Release, Steal, Dense, MixedEvents, NoteBurst,
+    ChoppedNotes
 };
 
 const char* WorkloadName(Workload workload) {
@@ -28,6 +29,7 @@ const char* WorkloadName(Workload workload) {
         case Workload::Dense: return "dense";
         case Workload::MixedEvents: return "mixed-events";
         case Workload::NoteBurst: return "note-burst";
+        case Workload::ChoppedNotes: return "chopped-notes";
     }
     return "unknown";
 }
@@ -40,6 +42,7 @@ bool ParseWorkload(const char* value, Workload& result) {
     else if (std::strcmp(value, "dense") == 0) result = Workload::Dense;
     else if (std::strcmp(value, "mixed-events") == 0) result = Workload::MixedEvents;
     else if (std::strcmp(value, "note-burst") == 0) result = Workload::NoteBurst;
+    else if (std::strcmp(value, "chopped-notes") == 0) result = Workload::ChoppedNotes;
     else return false;
     return true;
 }
@@ -85,10 +88,13 @@ struct Options {
     bool breakdown = false;
     bool transactionalLaunch = true;
     bool copiedLaunchPlan = false;
+    bool batchNoteOffIndex = false;
+    bool launchChurnProfile = false;
     uint32_t eventStride = 1;
     uint32_t noteRate = 64000;
     uint32_t keyCount = 128;
     uint32_t attackFrames = 0;
+    uint32_t noteLengthFrames = 1;
     uint32_t renderThreads = 1;
     std::string soundFontPath;
     uint32_t pinCore = UINT32_MAX;
@@ -140,6 +146,9 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                 options.keyCount > 128u) return false;
         } else if (std::strcmp(argv[i], "--attack-frames") == 0) {
             if (!nextNumber(options.attackFrames)) return false;
+        } else if (std::strcmp(argv[i], "--note-length-frames") == 0) {
+            if (!nextNumber(options.noteLengthFrames) ||
+                options.noteLengthFrames > options.frames) return false;
         } else if (std::strcmp(argv[i], "--render-threads") == 0) {
             if (!nextNumber(options.renderThreads) ||
                 options.renderThreads < 1u || options.renderThreads > 64u)
@@ -158,6 +167,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.reference = true;
         } else if (std::strcmp(argv[i], "--breakdown") == 0) {
             options.breakdown = true;
+        } else if (std::strcmp(argv[i], "--launch-churn") == 0) {
+            options.launchChurnProfile = true;
         } else if (std::strcmp(argv[i], "--launch-path") == 0) {
             if (i + 1 >= argc) return false;
             const char* path = argv[++i];
@@ -176,6 +187,15 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                 options.copiedLaunchPlan = true;
             else
                 return false;
+        } else if (std::strcmp(argv[i], "--noteoff-index") == 0) {
+            if (i + 1 >= argc) return false;
+            const char* mode = argv[++i];
+            if (std::strcmp(mode, "batch") == 0)
+                options.batchNoteOffIndex = true;
+            else if (std::strcmp(mode, "immediate") == 0)
+                options.batchNoteOffIndex = false;
+            else
+                return false;
         } else if (std::strcmp(argv[i], "--quick") == 0) {
             options.seconds = 1;
             options.warmupSeconds = 1;
@@ -184,7 +204,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         }
     }
     return options.voices >= 1u && options.voices <= svms::kMaxPolyphony &&
-           options.frames >= 16u && options.frames <= 8192u && options.seconds > 0u;
+           options.frames >= 16u && options.frames <= 8192u &&
+           options.noteLengthFrames <= options.frames && options.seconds > 0u;
 }
 
 bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
@@ -220,6 +241,8 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
                                     0.0f, 1.0f, 0.9999999f);
         }
         voices.SetVoiceGain(handle, 0.001f, 0.001f);
+        voices.SetVoiceSoundFontIdentity(
+            handle, 0u, static_cast<uint16_t>(i & 0xffffu));
         voices.RefreshMixGain(handle, channels.GetParams()[i & 15u]);
 
         if (workload == Workload::Release) voices.StartRelease(handle);
@@ -252,6 +275,8 @@ void PrepareSyntheticLaunchPlan(svms::VoiceConfiguration* setups,
         setup.sustainLevel = 0.7f;
         setup.releaseDecay = 0.9999999f;
         setup.gainLeft = setup.gainRight = 0.001f;
+        setup.presetIndex = 0u;
+        setup.regionIndex = static_cast<uint16_t>(identity & 0xffffu);
     }
 }
 
@@ -355,10 +380,12 @@ struct MixedDispatchContext {
     uint32_t attackFrames;
     bool transactionalLaunch;
     bool copiedLaunchPlan;
+    bool batchNoteOffIndex;
     BenchLaunchPlanEntry* launchPlanCache;
 };
 
-void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
+void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
+                   void* userData) {
     const uint32_t sampleSlot = static_cast<uint32_t>(
         gBreakdownSampleCounter++ & (kBreakdownSampleInterval - 1u));
     const uint32_t dispatchScale = gCollectBreakdown && sampleSlot == 0u
@@ -434,10 +461,8 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
             break;
         }
         case svms::RenderEventType::NoteOff: {
-            svms::VoiceHandle last = svms::kInvalidVoice;
-            voices.ForEachChannelActive(event.channel,
-                [&](svms::VoiceHandle handle) { last = handle; });
-            if (last != svms::kInvalidVoice) voices.StartRelease(last);
+            voices.NoteOffOldestPlayIndices(
+                event.channel, event.data1, 1u, false, blockCursor);
             break;
         }
         case svms::RenderEventType::ControlChange:
@@ -471,8 +496,23 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t, void* userData) {
 
 void MixedBatchDispatch(const svms::RenderEvent* events, uint32_t eventCount,
                         uint32_t blockCursor, void* userData) {
-    for (uint32_t i = 0; i < eventCount; ++i)
-        MixedDispatch(events[i], blockCursor, userData);
+    auto* context = static_cast<MixedDispatchContext*>(userData);
+    uint32_t index = 0u;
+    while (index < eventCount) {
+        if (events[index].type == svms::RenderEventType::NoteOff ||
+            events[index].type == svms::RenderEventType::StaleNoteOffBatch) {
+            if (context->batchNoteOffIndex)
+                context->voices->InvalidateStealCandidates();
+            do {
+                MixedDispatch(events[index++], blockCursor, userData);
+            } while (index < eventCount &&
+                     (events[index].type == svms::RenderEventType::NoteOff ||
+                      events[index].type ==
+                          svms::RenderEventType::StaleNoteOffBatch));
+            continue;
+        }
+        MixedDispatch(events[index++], blockCursor, userData);
+    }
 }
 
 } // namespace
@@ -482,13 +522,14 @@ int main(int argc, char** argv) {
     if (!ParseOptions(argc, argv, options)) {
         std::fprintf(stderr,
             "usage: svms_v3_bench [--voices 1..524288] [--frames 16..8192] "
-            "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst] "
-            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--attack-frames N] [--soundfont PATH] "
+            "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst|chopped-notes] "
+            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--attack-frames N] [--note-length-frames N] [--soundfont PATH] "
             "[--render-threads 1..64] "
             "[--backend auto|scalar|sse2|avx2] "
             "[--launch-path legacy|transactional] "
             "[--launch-plan direct|copy] "
-            "[--breakdown] "
+            "[--noteoff-index immediate|batch] "
+            "[--breakdown] [--launch-churn] "
             "[--pin-core 0..63] "
             "[--quick] [--reference] [--enforce]\n");
         return 1;
@@ -528,6 +569,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot allocate voice storage\n");
         return 3;
     }
+    voices->SetLaunchChurnProfilingEnabledForTest(
+        options.launchChurnProfile);
     auto renderer = std::make_unique<svms::RenderScalar>();
     if (!renderer->ReserveVoiceCapacity(options.voices)) {
         std::fprintf(stderr, "cannot allocate renderer scratch\n");
@@ -566,16 +609,57 @@ int main(int argc, char** argv) {
         voices.get(), &channels, &cfg, sampleFrames, options.voices,
         soundFont.get(), soundFontPreset, options.attackFrames,
         options.transactionalLaunch, options.copiedLaunchPlan,
+        options.batchNoteOffIndex,
         launchPlanCache.get()};
     if (options.workload == Workload::Dense ||
         options.workload == Workload::MixedEvents ||
-        options.workload == Workload::NoteBurst) {
-        const uint32_t eventCount = options.workload == Workload::NoteBurst
+        options.workload == Workload::NoteBurst ||
+        options.workload == Workload::ChoppedNotes) {
+        const bool noteStorm = options.workload == Workload::NoteBurst ||
+            options.workload == Workload::ChoppedNotes;
+        const uint32_t noteOnCount = noteStorm
             ? static_cast<uint32_t>((static_cast<uint64_t>(options.noteRate) *
                                      options.frames + 44099u) / 44100u)
             : (options.frames + options.eventStride - 1u) / options.eventStride;
+        const uint32_t eventCount = options.workload == Workload::ChoppedNotes
+            ? noteOnCount * 2u : noteOnCount;
         events.resize(eventCount);
-        for (uint32_t index = 0; index < eventCount; ++index) {
+        if (options.workload == Workload::ChoppedNotes) {
+            for (uint32_t noteIndex = 0u; noteIndex < noteOnCount;
+                 ++noteIndex) {
+                const uint32_t frame = static_cast<uint32_t>(
+                    static_cast<uint64_t>(noteIndex) * options.frames /
+                    noteOnCount);
+                const uint8_t channel = static_cast<uint8_t>(noteIndex & 15u);
+                const uint8_t note = static_cast<uint8_t>(
+                    noteIndex % options.keyCount);
+                svms::RenderEvent& on = events[noteIndex * 2u];
+                on.frameOffset = frame;
+                on.ingressSequence = noteIndex * 2u + 1u;
+                on.type = svms::RenderEventType::NoteOn;
+                on.channel = channel;
+                on.data1 = note;
+                on.data2 = 127u;
+                svms::RenderEvent& off = events[noteIndex * 2u + 1u];
+                off.frameOffset = (frame + options.noteLengthFrames) %
+                    options.frames;
+                off.ingressSequence = noteIndex * 2u;
+                off.type = svms::RenderEventType::NoteOff;
+                off.channel = channel;
+                off.data1 = note;
+            }
+            std::stable_sort(events.begin(), events.end(),
+                [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                    if (a.frameOffset != b.frameOffset)
+                        return a.frameOffset < b.frameOffset;
+                    if (a.type != b.type) {
+                        return a.type == svms::RenderEventType::NoteOff;
+                    }
+                    return a.ingressSequence < b.ingressSequence;
+                });
+            for (uint32_t index = 0u; index < eventCount; ++index)
+                events[index].ingressSequence = index;
+        } else for (uint32_t index = 0; index < eventCount; ++index) {
             const uint32_t frame = options.workload == Workload::NoteBurst
                 ? static_cast<uint32_t>(static_cast<uint64_t>(index) *
                                         options.frames / eventCount)
@@ -734,9 +818,56 @@ int main(int argc, char** argv) {
         groupedVoices += voices->GetPlayGroupSizeForTest(
             static_cast<svms::VoiceHandle>(voices->activeList_[position])) > 1u;
 
+    const svms::LaunchChurnStats& churn =
+        voices->GetLaunchChurnStatsForTest();
+    auto ratio = [](uint64_t numerator, uint64_t denominator) {
+        return denominator != 0u
+            ? 100.0 * static_cast<double>(numerator) /
+                static_cast<double>(denominator)
+            : 0.0;
+    };
+    std::string churnBuckets = "[";
+    bool firstBucket = true;
+    for (uint32_t bucket = 0u;
+         bucket < svms::LaunchChurnStats::kClassificationBuckets;
+         ++bucket) {
+        const svms::LaunchChurnBucketStats& sample = churn.buckets[bucket];
+        if (sample.samples == 0u) continue;
+        char encoded[640]{};
+        const double divisor = static_cast<double>(sample.samples);
+        std::snprintf(encoded, sizeof(encoded),
+            "%s{\"class\":%u,\"same_frame\":%s,\"layered\":%s,"
+            "\"volatile\":%s,\"general_or_unreserved\":%s,\"no_steal\":%s,"
+            "\"samples\":%llu,\"cycles_per_sample\":{\"total\":%.1f,"
+            "\"victim_selection\":%.1f,\"tail_capture\":%.1f,"
+            "\"lifecycle\":%.1f,\"configuration\":%.1f,"
+            "\"tree_maintenance\":%.1f}}",
+            firstBucket ? "" : ",", bucket,
+            bucket < 16u && (bucket & 1u) != 0u ? "true" : "false",
+            bucket < 16u && (bucket & 2u) != 0u ? "true" : "false",
+            bucket < 16u && (bucket & 4u) != 0u ? "true" : "false",
+            bucket < 16u && (bucket & 8u) != 0u ? "true" : "false",
+            bucket == 16u ? "true" : "false",
+            static_cast<unsigned long long>(sample.samples),
+            static_cast<double>(sample.totalCycles) / divisor,
+            static_cast<double>(sample.stageCycles[static_cast<uint32_t>(
+                svms::LaunchProfileStage::VictimSelection)]) / divisor,
+            static_cast<double>(sample.stageCycles[static_cast<uint32_t>(
+                svms::LaunchProfileStage::TailCapture)]) / divisor,
+            static_cast<double>(sample.stageCycles[static_cast<uint32_t>(
+                svms::LaunchProfileStage::Lifecycle)]) / divisor,
+            static_cast<double>(sample.stageCycles[static_cast<uint32_t>(
+                svms::LaunchProfileStage::Configuration)]) / divisor,
+            static_cast<double>(sample.stageCycles[static_cast<uint32_t>(
+                svms::LaunchProfileStage::TreeMaintenance)]) / divisor);
+        churnBuckets += encoded;
+        firstBucket = false;
+    }
+    churnBuckets += "]";
+
     std::printf(
-        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"render_threads\":%u,\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"voices\":%u,\"frames\":%u,"
-        "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,"
+        "{\"renderer\":\"%s\",\"backend\":\"%s\",\"render_threads\":%u,\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"launch_churn_profile\":%s,\"voices\":%u,\"frames\":%u,"
+        "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,\"note_length_frames\":%u,\"noteoff_index\":\"%s\","
         "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
         "\"voice_soa_bytes\":%zu,\"voice_manager_bytes\":%zu,\"renderer_bytes\":%zu,"
         "\"voice_samples_per_second\":%.0f,"
@@ -748,6 +879,27 @@ int main(int argc, char** argv) {
         "\"smaller\":%llu,\"larger\":%llu,\"grouped_voices\":%u},"
         "\"launch_profile\":{\"samples\":%llu,\"pop\":%llu,\"tail\":%llu,"
         "\"lifecycle\":%llu,\"configure\":%llu,\"tree\":%llu},"
+        "\"launch_churn\":{\"logical_launches\":%llu,\"successful_launches\":%llu,"
+        "\"failed_launches\":%llu,\"physical_requested\":%llu,"
+        "\"physical_configured\":%llu,\"free_slot_allocations\":%llu,"
+        "\"steal_transactions\":%llu,\"victim_groups\":%llu,"
+        "\"physical_victims\":%llu,\"same_frame_victim_groups\":%llu,"
+        "\"same_frame_physical_victims\":%llu,\"mono_groups\":%llu,"
+        "\"layered_groups\":%llu,\"matching_size_groups\":%llu,"
+        "\"mismatched_size_groups\":%llu,\"stable_groups\":%llu,"
+        "\"volatile_groups\":%llu,\"same_channel_key_groups\":%llu,"
+        "\"matching_plan_groups\":%llu,\"single_in_place_groups\":%llu,"
+        "\"matching_reuse_groups\":%llu,\"reserved_reuse_groups\":%llu,"
+        "\"general_groups\":%llu,\"next_frame_surviving_groups\":%llu,"
+        "\"next_frame_surviving_physical\":%llu,\"tail_attempts\":%llu,"
+        "\"tail_accepted\":%llu,\"tail_replaced\":%llu,"
+        "\"tail_rejected\":%llu,\"tail_ineligible\":%llu,"
+        "\"ratios_percent\":{\"steal_transactions_per_launch\":%.3f,"
+        "\"same_frame_groups_per_launch\":%.3f,"
+        "\"same_frame_groups_per_victim_group\":%.3f,"
+        "\"same_frame_physical_per_configured\":%.3f,"
+        "\"next_frame_physical_per_configured\":%.3f},"
+        "\"cycle_classes\":%s},"
         "\"render_classes\":{\"sustained_loop\":%u,\"sustained_one_shot\":%u,"
         "\"transient_loop\":%u,\"release_loop\":%u,\"release_one_shot\":%u,"
         "\"generic\":%u,\"steal_tails\":%u},"
@@ -758,9 +910,11 @@ int main(int argc, char** argv) {
         WorkloadName(options.workload),
         options.transactionalLaunch ? "transactional" : "legacy",
         options.copiedLaunchPlan ? "copy" : "direct",
+        options.launchChurnProfile ? "true" : "false",
         options.voices, options.frames,
         measuredCallbacks, options.eventStride, options.noteRate, options.keyCount,
-        options.attackFrames,
+        options.attackFrames, options.noteLengthFrames,
+        options.batchNoteOffIndex ? "batch" : "immediate",
         soundFont ? soundFont->regionCount : 0u,
         soundFont ? soundFont->presetRegionCount[soundFontPreset] : 0u,
         options.pinCore == UINT32_MAX ? -1 : static_cast<int>(options.pinCore),
@@ -790,6 +944,44 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(voices->GetLaunchProfileLifecycleCyclesForTest()),
         static_cast<unsigned long long>(voices->GetLaunchProfileConfigureCyclesForTest()),
         static_cast<unsigned long long>(voices->GetLaunchProfileTreeCyclesForTest()),
+        static_cast<unsigned long long>(churn.logicalLaunches),
+        static_cast<unsigned long long>(churn.successfulLaunches),
+        static_cast<unsigned long long>(churn.failedLaunches),
+        static_cast<unsigned long long>(churn.physicalVoicesRequested),
+        static_cast<unsigned long long>(churn.physicalVoicesConfigured),
+        static_cast<unsigned long long>(churn.freeSlotAllocations),
+        static_cast<unsigned long long>(churn.stealTransactions),
+        static_cast<unsigned long long>(churn.victimGroups),
+        static_cast<unsigned long long>(churn.physicalVictims),
+        static_cast<unsigned long long>(churn.sameFrameVictimGroups),
+        static_cast<unsigned long long>(churn.sameFramePhysicalVictims),
+        static_cast<unsigned long long>(churn.monoVictimGroups),
+        static_cast<unsigned long long>(churn.layeredVictimGroups),
+        static_cast<unsigned long long>(churn.matchingSizeVictimGroups),
+        static_cast<unsigned long long>(churn.mismatchedSizeVictimGroups),
+        static_cast<unsigned long long>(churn.stableVictimGroups),
+        static_cast<unsigned long long>(churn.volatileVictimGroups),
+        static_cast<unsigned long long>(churn.sameChannelKeyVictimGroups),
+        static_cast<unsigned long long>(churn.matchingPlanVictimGroups),
+        static_cast<unsigned long long>(churn.singleInPlaceVictimGroups),
+        static_cast<unsigned long long>(churn.matchingReuseVictimGroups),
+        static_cast<unsigned long long>(churn.reservedReuseVictimGroups),
+        static_cast<unsigned long long>(churn.generalVictimGroups),
+        static_cast<unsigned long long>(churn.nextFrameSurvivingGroups),
+        static_cast<unsigned long long>(churn.nextFrameSurvivingPhysicalVoices),
+        static_cast<unsigned long long>(churn.tailCaptureAttempts),
+        static_cast<unsigned long long>(churn.tailCaptureAccepted),
+        static_cast<unsigned long long>(churn.tailCaptureReplaced),
+        static_cast<unsigned long long>(churn.tailCaptureRejected),
+        static_cast<unsigned long long>(churn.tailCaptureIneligible),
+        ratio(churn.stealTransactions, churn.logicalLaunches),
+        ratio(churn.sameFrameVictimGroups, churn.logicalLaunches),
+        ratio(churn.sameFrameVictimGroups, churn.victimGroups),
+        ratio(churn.sameFramePhysicalVictims,
+              churn.physicalVoicesConfigured),
+        ratio(churn.nextFrameSurvivingPhysicalVoices,
+              churn.physicalVoicesConfigured),
+        churnBuckets.c_str(),
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedLoop)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedOneShot)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::TransientLoop)],

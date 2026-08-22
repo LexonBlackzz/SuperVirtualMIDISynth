@@ -55,6 +55,69 @@ struct VoiceConfiguration {
     uint8_t sampleBacked = 1;
 };
 
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+enum class LaunchProfileStage : uint32_t {
+    VictimSelection = 0u,
+    TailCapture,
+    Lifecycle,
+    Configuration,
+    TreeMaintenance,
+    Count
+};
+
+struct LaunchChurnBucketStats {
+    uint64_t samples = 0u;
+    uint64_t totalCycles = 0u;
+    uint64_t stageCycles[static_cast<uint32_t>(LaunchProfileStage::Count)]{};
+};
+
+struct LaunchChurnStats {
+    // Logical MIDI/SF2 launch transactions versus physical region voices.
+    uint64_t logicalLaunches = 0u;
+    uint64_t successfulLaunches = 0u;
+    uint64_t failedLaunches = 0u;
+    uint64_t physicalVoicesRequested = 0u;
+    uint64_t physicalVoicesConfigured = 0u;
+    uint64_t freeSlotAllocations = 0u;
+
+    // Exact steal composition. One launch may retire multiple play groups.
+    uint64_t stealTransactions = 0u;
+    uint64_t victimGroups = 0u;
+    uint64_t physicalVictims = 0u;
+    uint64_t sameFrameVictimGroups = 0u;
+    uint64_t sameFramePhysicalVictims = 0u;
+    uint64_t monoVictimGroups = 0u;
+    uint64_t layeredVictimGroups = 0u;
+    uint64_t matchingSizeVictimGroups = 0u;
+    uint64_t mismatchedSizeVictimGroups = 0u;
+    uint64_t stableVictimGroups = 0u;
+    uint64_t volatileVictimGroups = 0u;
+    uint64_t sameChannelKeyVictimGroups = 0u;
+    uint64_t matchingPlanVictimGroups = 0u;
+    uint64_t singleInPlaceVictimGroups = 0u;
+    uint64_t matchingReuseVictimGroups = 0u;
+    uint64_t reservedReuseVictimGroups = 0u;
+    uint64_t generalVictimGroups = 0u;
+
+    // The voices/groups left after all exact-frame replacements are the
+    // materialization lower bound for a future shadow-launch transaction.
+    uint64_t nextFrameSurvivingGroups = 0u;
+    uint64_t nextFrameSurvivingPhysicalVoices = 0u;
+
+    uint64_t tailCaptureAttempts = 0u;
+    uint64_t tailCaptureAccepted = 0u;
+    uint64_t tailCaptureReplaced = 0u;
+    uint64_t tailCaptureRejected = 0u;
+    uint64_t tailCaptureIneligible = 0u;
+
+    // Bits: 0=same-frame, 1=layered, 2=volatile,
+    // 3=general fallback or a non-reserved matching-group transaction.
+    // Bucket 16 contains launches which did not steal.
+    static constexpr uint32_t kClassificationBuckets = 17u;
+    LaunchChurnBucketStats buckets[kClassificationBuckets]{};
+};
+#endif
+
 // ════════════════════════════════════════════════════════════════════════
 // VoiceManager — flat-array voice pool with score-based stealing.
 //
@@ -243,6 +306,13 @@ public:
     uint64_t GetLaunchProfileTreeCyclesForTest() const {
         return launchProfileTreeCycles_;
     }
+    const LaunchChurnStats& GetLaunchChurnStatsForTest() const {
+        return launchChurnStats_;
+    }
+    void SetLaunchChurnProfilingEnabledForTest(bool enabled) {
+        launchChurnProfilingEnabled_ = enabled;
+        ResetGroupReuseCountersForTest();
+    }
     uint32_t GetPlayGroupSizeForTest(VoiceHandle handle) const {
         if (handle >= maxVoices_ ||
             v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) return 0u;
@@ -272,6 +342,11 @@ public:
         launchProfileLifecycleCycles_ = 0u;
         launchProfileConfigureCycles_ = 0u;
         launchProfileTreeCycles_ = 0u;
+        launchChurnStats_ = LaunchChurnStats{};
+        launchTestContext_ = LaunchTestContext{};
+        launchTestTrackedFrame_ = currentFrame_;
+        launchTestProvisionalGroups_ = 0;
+        launchTestProvisionalPhysicalVoices_ = 0;
     }
 #endif
 
@@ -401,6 +476,28 @@ private:
     // update the key in place instead of remove + insert heap traversals.
     uint8_t* stealCandidateReserved_;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    enum class LaunchVictimPath : uint8_t {
+        SingleInPlace,
+        MatchingReuse,
+        General
+    };
+    struct LaunchTestContext {
+        bool active = false;
+        bool sampled = false;
+        bool allVictimsSameFrame = true;
+        bool anyLayeredVictim = false;
+        bool anyVolatileVictim = false;
+        bool anyGeneralVictim = false;
+        uint8_t incomingChannel = 0u;
+        uint8_t incomingNote = 0u;
+        uint32_t incomingCount = 0u;
+        const VoiceConfiguration* incomingSetups = nullptr;
+        uint32_t victimGroups = 0u;
+        uint32_t sameFramePhysicalVictims = 0u;
+        uint64_t beginCycles = 0u;
+        uint64_t stageCycles[
+            static_cast<uint32_t>(LaunchProfileStage::Count)]{};
+    };
     uint64_t groupReuseAttemptCount_ = 0u;
     uint64_t groupReuseMatchCount_ = 0u;
     uint64_t groupReuseReservedCount_ = 0u;
@@ -413,6 +510,12 @@ private:
     uint64_t launchProfileLifecycleCycles_ = 0u;
     uint64_t launchProfileConfigureCycles_ = 0u;
     uint64_t launchProfileTreeCycles_ = 0u;
+    bool launchChurnProfilingEnabled_ = false;
+    LaunchChurnStats launchChurnStats_{};
+    LaunchTestContext launchTestContext_{};
+    uint64_t launchTestTrackedFrame_ = 0u;
+    int64_t launchTestProvisionalGroups_ = 0;
+    int64_t launchTestProvisionalPhysicalVoices_ = 0;
 #endif
 
     // Per-key tracking for EndVoicesForChannelKey
@@ -498,6 +601,18 @@ private:
                                         bool candidatesReservedInPlace);
     void RetireStolenSibling(VoiceHandle handle,
                              VoiceHandle selectedVictim);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    void BeginLaunchTestProfile(uint8_t channel, uint8_t note,
+                                const VoiceConfiguration* setups,
+                                uint32_t count);
+    void FinishLaunchTestProfile(bool success);
+    void RecordVictimGroupForTest(VoiceHandle selected,
+                                  LaunchVictimPath path,
+                                  bool reservedInPlace);
+    uint64_t BeginLaunchStageForTest() const;
+    void EndLaunchStageForTest(LaunchProfileStage stage, uint64_t begin);
+    void TrackLaunchFrameForTest(uint64_t frame);
+#endif
     float ComputeStableStealKey(VoiceHandle handle) const;
     float ComputeNewbornStableStealKey(VoiceHandle handle) const;
     static SVMS_VM_FORCEINLINE uint64_t EncodeStableWinnerKey(
@@ -737,6 +852,13 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     launchProfileLifecycleCycles_ = other.launchProfileLifecycleCycles_;
     launchProfileConfigureCycles_ = other.launchProfileConfigureCycles_;
     launchProfileTreeCycles_ = other.launchProfileTreeCycles_;
+    launchChurnProfilingEnabled_ = other.launchChurnProfilingEnabled_;
+    launchChurnStats_ = other.launchChurnStats_;
+    launchTestContext_ = LaunchTestContext{};
+    launchTestTrackedFrame_ = other.launchTestTrackedFrame_;
+    launchTestProvisionalGroups_ = other.launchTestProvisionalGroups_;
+    launchTestProvisionalPhysicalVoices_ =
+        other.launchTestProvisionalPhysicalVoices_;
 #endif
     std::memcpy(channelKeyVoiceHead_, other.channelKeyVoiceHead_,
                 sizeof(channelKeyVoiceHead_));
@@ -816,6 +938,13 @@ inline void VoiceManager::Reset() {
                 sizeof(*playGroupPrev_) * maxVoices_);
     activeCount_ = 0;
     currentFrame_ = 0;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    launchChurnStats_ = LaunchChurnStats{};
+    launchTestContext_ = LaunchTestContext{};
+    launchTestTrackedFrame_ = 0u;
+    launchTestProvisionalGroups_ = 0;
+    launchTestProvisionalPhysicalVoices_ = 0;
+#endif
     lastVoiceLimitEnforceFrame_ = UINT64_MAX;
     retireCount_ = 0;
     retireImmediateCount_ = 0;
@@ -1020,6 +1149,13 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     grown.launchProfileLifecycleCycles_ = launchProfileLifecycleCycles_;
     grown.launchProfileConfigureCycles_ = launchProfileConfigureCycles_;
     grown.launchProfileTreeCycles_ = launchProfileTreeCycles_;
+    grown.launchChurnProfilingEnabled_ = launchChurnProfilingEnabled_;
+    grown.launchChurnStats_ = launchChurnStats_;
+    grown.launchTestContext_ = LaunchTestContext{};
+    grown.launchTestTrackedFrame_ = launchTestTrackedFrame_;
+    grown.launchTestProvisionalGroups_ = launchTestProvisionalGroups_;
+    grown.launchTestProvisionalPhysicalVoices_ =
+        launchTestProvisionalPhysicalVoices_;
 #endif
 
     // The staging manager now owns a complete larger representation. Move
@@ -1151,7 +1287,215 @@ inline uint32_t VoiceManager::EnforceVoiceLimit(uint32_t maxReleases,
     return released;
 }
 
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+inline void VoiceManager::TrackLaunchFrameForTest(uint64_t frame) {
+    if (!launchChurnProfilingEnabled_) return;
+    if (frame == launchTestTrackedFrame_) return;
+    if (launchTestProvisionalGroups_ > 0) {
+        launchChurnStats_.nextFrameSurvivingGroups +=
+            static_cast<uint64_t>(launchTestProvisionalGroups_);
+    }
+    if (launchTestProvisionalPhysicalVoices_ > 0) {
+        launchChurnStats_.nextFrameSurvivingPhysicalVoices +=
+            static_cast<uint64_t>(launchTestProvisionalPhysicalVoices_);
+    }
+    launchTestTrackedFrame_ = frame;
+    launchTestProvisionalGroups_ = 0;
+    launchTestProvisionalPhysicalVoices_ = 0;
+}
+
+inline uint64_t VoiceManager::BeginLaunchStageForTest() const {
+#if defined(_MSC_VER)
+    return launchTestContext_.active && launchTestContext_.sampled
+        ? __rdtsc() : 0u;
+#else
+    return 0u;
+#endif
+}
+
+inline void VoiceManager::EndLaunchStageForTest(LaunchProfileStage stage,
+                                                 uint64_t begin) {
+#if defined(_MSC_VER)
+    if (begin == 0u || !launchTestContext_.active ||
+        !launchTestContext_.sampled) return;
+    const uint32_t index = static_cast<uint32_t>(stage);
+    if (index < static_cast<uint32_t>(LaunchProfileStage::Count))
+        launchTestContext_.stageCycles[index] += __rdtsc() - begin;
+#else
+    (void)stage;
+    (void)begin;
+#endif
+}
+
+inline void VoiceManager::BeginLaunchTestProfile(
+    uint8_t channel, uint8_t note, const VoiceConfiguration* setups,
+    uint32_t count) {
+    if (!launchChurnProfilingEnabled_) {
+        launchTestContext_.active = false;
+        return;
+    }
+    TrackLaunchFrameForTest(currentFrame_);
+    ++launchChurnStats_.logicalLaunches;
+    launchChurnStats_.physicalVoicesRequested += count;
+    launchTestContext_ = LaunchTestContext{};
+    launchTestContext_.active = true;
+    launchTestContext_.sampled =
+        ((launchChurnStats_.logicalLaunches - 1u) & 4095u) == 0u;
+    launchTestContext_.incomingChannel = channel;
+    launchTestContext_.incomingNote = note;
+    launchTestContext_.incomingCount = count;
+    launchTestContext_.incomingSetups = setups;
+#if defined(_MSC_VER)
+    if (launchTestContext_.sampled)
+        launchTestContext_.beginCycles = __rdtsc();
+#endif
+}
+
+inline void VoiceManager::FinishLaunchTestProfile(bool success) {
+    if (!launchTestContext_.active) return;
+    if (success) {
+        ++launchChurnStats_.successfulLaunches;
+        launchChurnStats_.physicalVoicesConfigured +=
+            launchTestContext_.incomingCount;
+        ++launchTestProvisionalGroups_;
+        launchTestProvisionalPhysicalVoices_ +=
+            launchTestContext_.incomingCount;
+    } else {
+        ++launchChurnStats_.failedLaunches;
+    }
+    if (launchTestContext_.victimGroups != 0u)
+        ++launchChurnStats_.stealTransactions;
+
+    uint32_t bucket = LaunchChurnStats::kClassificationBuckets - 1u;
+    if (launchTestContext_.victimGroups != 0u) {
+        bucket = 0u;
+        if (launchTestContext_.allVictimsSameFrame) bucket |= 1u;
+        if (launchTestContext_.anyLayeredVictim) bucket |= 2u;
+        if (launchTestContext_.anyVolatileVictim) bucket |= 4u;
+        if (launchTestContext_.anyGeneralVictim) bucket |= 8u;
+    }
+    if (launchTestContext_.sampled &&
+        bucket < LaunchChurnStats::kClassificationBuckets) {
+        LaunchChurnBucketStats& result = launchChurnStats_.buckets[bucket];
+        ++result.samples;
+#if defined(_MSC_VER)
+        result.totalCycles += __rdtsc() - launchTestContext_.beginCycles;
+#endif
+        for (uint32_t stage = 0u;
+             stage < static_cast<uint32_t>(LaunchProfileStage::Count);
+             ++stage) {
+            result.stageCycles[stage] +=
+                launchTestContext_.stageCycles[stage];
+        }
+    }
+    launchTestContext_.active = false;
+}
+
+inline void VoiceManager::RecordVictimGroupForTest(
+    VoiceHandle selected, LaunchVictimPath path, bool reservedInPlace) {
+    if (!launchTestContext_.active || selected >= maxVoices_ ||
+        v.state[selected] == static_cast<uint8_t>(VoiceState::Free)) return;
+
+    VoiceHandle smallGroup[8]{};
+    uint32_t smallCount = 0u;
+    uint32_t groupCount = 0u;
+    uint32_t sameFrameCount = 0u;
+    bool allStable = true;
+    auto observe = [&](VoiceHandle handle) {
+        if (handle >= maxVoices_ || groupCount >= maxVoices_) return;
+        if (smallCount < 8u) smallGroup[smallCount++] = handle;
+        ++groupCount;
+        if (v.birthFrame[handle] == currentFrame_) ++sameFrameCount;
+        if (!IsStableStealCandidate(handle)) allStable = false;
+    };
+
+    int32_t linked = playGroupPrev_[selected];
+    while (linked >= 0 && groupCount < maxVoices_) {
+        const VoiceHandle handle = static_cast<VoiceHandle>(linked);
+        linked = playGroupPrev_[handle];
+        observe(handle);
+    }
+    observe(selected);
+    linked = playGroupNext_[selected];
+    while (linked >= 0 && groupCount < maxVoices_) {
+        const VoiceHandle handle = static_cast<VoiceHandle>(linked);
+        linked = playGroupNext_[handle];
+        observe(handle);
+    }
+    if (groupCount == 0u) return;
+
+    const bool allSameFrame = sameFrameCount == groupCount;
+    ++launchChurnStats_.victimGroups;
+    launchChurnStats_.physicalVictims += groupCount;
+    launchChurnStats_.sameFramePhysicalVictims += sameFrameCount;
+    if (allSameFrame) ++launchChurnStats_.sameFrameVictimGroups;
+    if (groupCount == 1u) ++launchChurnStats_.monoVictimGroups;
+    else ++launchChurnStats_.layeredVictimGroups;
+    if (groupCount == launchTestContext_.incomingCount)
+        ++launchChurnStats_.matchingSizeVictimGroups;
+    else
+        ++launchChurnStats_.mismatchedSizeVictimGroups;
+    if (allStable) ++launchChurnStats_.stableVictimGroups;
+    else ++launchChurnStats_.volatileVictimGroups;
+    if (v.channel[selected] == launchTestContext_.incomingChannel &&
+        v.note[selected] == launchTestContext_.incomingNote) {
+        ++launchChurnStats_.sameChannelKeyVictimGroups;
+    }
+
+    bool matchingPlan = groupCount == launchTestContext_.incomingCount &&
+        groupCount <= 8u && smallCount == groupCount &&
+        launchTestContext_.incomingSetups != nullptr;
+    if (matchingPlan) {
+        uint32_t oldIdentities[8]{};
+        uint32_t newIdentities[8]{};
+        for (uint32_t i = 0u; i < groupCount; ++i) {
+            oldIdentities[i] =
+                (static_cast<uint32_t>(v.presetIndex[smallGroup[i]]) << 16u) |
+                v.regionIndex[smallGroup[i]];
+            newIdentities[i] =
+                (static_cast<uint32_t>(
+                    launchTestContext_.incomingSetups[i].presetIndex) << 16u) |
+                launchTestContext_.incomingSetups[i].regionIndex;
+        }
+        std::sort(oldIdentities, oldIdentities + groupCount);
+        std::sort(newIdentities, newIdentities + groupCount);
+        matchingPlan = std::equal(oldIdentities,
+                                  oldIdentities + groupCount,
+                                  newIdentities);
+    }
+    if (matchingPlan) ++launchChurnStats_.matchingPlanVictimGroups;
+
+    switch (path) {
+        case LaunchVictimPath::SingleInPlace:
+            ++launchChurnStats_.singleInPlaceVictimGroups;
+            break;
+        case LaunchVictimPath::MatchingReuse:
+            ++launchChurnStats_.matchingReuseVictimGroups;
+            if (reservedInPlace)
+                ++launchChurnStats_.reservedReuseVictimGroups;
+            break;
+        case LaunchVictimPath::General:
+            ++launchChurnStats_.generalVictimGroups;
+            break;
+    }
+
+    ++launchTestContext_.victimGroups;
+    launchTestContext_.sameFramePhysicalVictims += sameFrameCount;
+    launchTestContext_.allVictimsSameFrame &= allSameFrame;
+    launchTestContext_.anyLayeredVictim |= groupCount > 1u;
+    launchTestContext_.anyVolatileVictim |= !allStable;
+    launchTestContext_.anyGeneralVictim |=
+        path == LaunchVictimPath::General || !reservedInPlace;
+
+    launchTestProvisionalPhysicalVoices_ -= sameFrameCount;
+    if (allSameFrame) --launchTestProvisionalGroups_;
+}
+#endif
+
 inline void VoiceManager::SetCurrentFrame(uint64_t frame) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    TrackLaunchFrameForTest(frame);
+#endif
     if (frame != currentFrame_) stealTailMinHeapValid_ = false;
     currentFrame_ = frame;
 
@@ -1808,6 +2152,11 @@ inline uint32_t VoiceManager::SelectStealTailSlot(float outgoingLevel) {
 
 inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t tailBegin = BeginLaunchStageForTest();
+    if (launchTestContext_.active)
+        ++launchChurnStats_.tailCaptureAttempts;
+#endif
     if (preTailCaptureHook_)
         preTailCaptureHook_(handle, preTailCaptureUserData_);
     const float gain = v.currentGain[handle];
@@ -1816,9 +2165,32 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     const float outgoingLevel = std::fabs(gain) *
         (std::fabs(mixL) + std::fabs(mixR));
     if (v.sampleBacked[handle] == 0u || v.relEnd[handle] <= 1u ||
-        outgoingLevel <= kVoiceRetireThreshold) return;
+        outgoingLevel <= kVoiceRetireThreshold) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (launchTestContext_.active)
+            ++launchChurnStats_.tailCaptureIneligible;
+        EndLaunchStageForTest(LaunchProfileStage::TailCapture, tailBegin);
+#endif
+        return;
+    }
     const uint32_t tailSlot = SelectStealTailSlot(outgoingLevel);
-    if (tailSlot == UINT32_MAX) return;
+    if (tailSlot == UINT32_MAX) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (launchTestContext_.active)
+            ++launchChurnStats_.tailCaptureRejected;
+        EndLaunchStageForTest(LaunchProfileStage::TailCapture, tailBegin);
+#endif
+        return;
+    }
+
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const bool replacingTail =
+        v.stealTailFramesRemaining[tailSlot] != 0u;
+    if (launchTestContext_.active) {
+        ++launchChurnStats_.tailCaptureAccepted;
+        if (replacingTail) ++launchChurnStats_.tailCaptureReplaced;
+    }
+#endif
 
     v.stealTailPhase[tailSlot] = v.phases[handle];
     v.stealTailPhaseInc[tailSlot] = v.phaseIncs[handle];
@@ -1852,14 +2224,26 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
             stealTailPosition_[tailSlot];
         StealTailHeapSiftDown(0u);
     }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::TailCapture, tailBegin);
+#endif
 }
 
 inline void VoiceManager::RetireStolenSibling(VoiceHandle handle,
                                                VoiceHandle selectedVictim) {
     if (handle >= maxVoices_ ||
         v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) return;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t treeBegin = BeginLaunchStageForTest();
+#endif
     if (stealHeapValid_) RemoveStealCandidate(handle);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance, treeBegin);
+#endif
     CaptureStealTail(handle);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t lifecycleBegin = BeginLaunchStageForTest();
+#endif
     ++stealCount_;
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
         releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
@@ -1887,6 +2271,9 @@ inline void VoiceManager::RetireStolenSibling(VoiceHandle handle,
             UpdateStealCandidate(static_cast<VoiceHandle>(moved));
     }
     activePosition_[handle] = UINT32_MAX;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Lifecycle, lifecycleBegin);
+#endif
 }
 
 inline bool VoiceManager::HigherPriorityCandidate(const StealCandidate& a,
@@ -2287,6 +2674,9 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     }
 
     VoiceHandle vh = kInvalidVoice;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t freeLifecycleBegin = BeginLaunchStageForTest();
+#endif
     if (deferCandidate && freeTop_ != 0u && activeCount_ < voiceLimit_) {
         const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
         vh = static_cast<VoiceHandle>(idx);
@@ -2301,6 +2691,12 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         vh = AllocateVoice(channel, note, velocity);
     }
     if (vh != kInvalidVoice) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::Lifecycle,
+                              freeLifecycleBegin);
+        if (launchTestContext_.active)
+            ++launchChurnStats_.freeSlotAllocations;
+#endif
         stealCandidateDeferred_[vh] = deferCandidate ? 1u : 0u;
         if (outStolen) *outStolen = false;
         return vh;
@@ -2310,8 +2706,15 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     // voice to steal. Replacement happens in-place, so the live cap cannot
     // grow past its configured value.
     uint32_t bestPos = 0;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t selectionBegin = BeginLaunchStageForTest();
+#endif
     const VoiceHandle bestHandle = PopStealCandidate(
         bestPos, deferCandidate && reserveCandidateInPlace);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
+                          selectionBegin);
+#endif
     if (bestHandle == kInvalidVoice) return kInvalidVoice;
     const uint32_t bestIdx = bestHandle;
 
@@ -2323,6 +2726,9 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     const uint32_t victimPlayIndex = v.playIndex[bestIdx];
     const bool hasSiblings = victimPlayIndex != UINT32_MAX &&
         (playGroupPrev_[bestIdx] >= 0 || playGroupNext_[bestIdx] >= 0);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    RecordVictimGroupForTest(bestHandle, LaunchVictimPath::General, false);
+#endif
     if (hasSiblings) {
         // A reserved volatile root was intentionally left in the index for a
         // single deferred replacement. Group retirement changes its active
@@ -2349,6 +2755,9 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     CaptureStealTail(bestHandle);
 
     // Retire the victim.
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t lifecycleBegin = BeginLaunchStageForTest();
+#endif
     ++stealCount_;
     if (v.state[bestIdx] == static_cast<uint8_t>(VoiceState::Releasing))
         releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
@@ -2376,8 +2785,23 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         LinkRenderClass(static_cast<VoiceHandle>(bestIdx));
     activeList_[bestPos] = bestIdx;  // reuse the victim's position
     activePosition_[bestIdx] = bestPos;
-    if (!deferCandidate)
+    if (!deferCandidate) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::Lifecycle,
+                              lifecycleBegin);
+        const uint64_t treeBegin = BeginLaunchStageForTest();
+#endif
         PushStealCandidate(static_cast<VoiceHandle>(bestIdx), bestPos);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance,
+                              treeBegin);
+#endif
+    } else {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::Lifecycle,
+                              lifecycleBegin);
+#endif
+    }
 
     if (outStolen) *outStolen = true;
     return static_cast<VoiceHandle>(bestIdx);
@@ -2650,7 +3074,14 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const bool profileLaunch = (++launchProfileCounter_ & 4095u) == 0u;
     const uint64_t profileBegin = profileLaunch ? __rdtsc() : 0u;
 #endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t testSelectionBegin = BeginLaunchStageForTest();
+#endif
     const VoiceHandle handle = PopStealCandidate(selectedPosition, true);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
+                          testSelectionBegin);
+#endif
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const uint64_t profileAfterPop = profileLaunch ? __rdtsc() : 0u;
 #endif
@@ -2670,6 +3101,10 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
         return false;
     }
 
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    RecordVictimGroupForTest(handle, LaunchVictimPath::SingleInPlace, true);
+#endif
+
     const VoiceRenderClass desiredClass = ClassifyConfiguration(setup);
     const uint8_t desiredClassValue = static_cast<uint8_t>(desiredClass);
     const bool preserveChannelIndex = v.channel[handle] == channel;
@@ -2679,6 +3114,9 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     CaptureStealTail(handle);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const uint64_t profileAfterTail = profileLaunch ? __rdtsc() : 0u;
+#endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t testLifecycleBegin = BeginLaunchStageForTest();
 #endif
     ++stealCount_;
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
@@ -2711,6 +3149,11 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const uint64_t profileAfterLifecycle = profileLaunch ? __rdtsc() : 0u;
 #endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Lifecycle,
+                          testLifecycleBegin);
+    const uint64_t testConfigureBegin = BeginLaunchStageForTest();
+#endif
 
     ApplyVoiceConfigurationFields(handle, setup, cp, desiredClass);
     if (preserveRenderIndex) {
@@ -2721,6 +3164,11 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const uint64_t profileAfterConfigure = profileLaunch ? __rdtsc() : 0u;
 #endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Configuration,
+                          testConfigureBegin);
+    const uint64_t testTreeBegin = BeginLaunchStageForTest();
+#endif
 
     // The eligibility test guarantees that the replacement remains in the
     // stable tree. Refresh its cached key and its one root path exactly once.
@@ -2730,6 +3178,10 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
         score, activePosition_[handle]);
     stealWinnerTree_[stealTreeLeafBase_ + handle] = stealStableKey_[handle];
     RefreshStealWinnerPath(handle);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance,
+                          testTreeBegin);
+#endif
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     if (profileLaunch) {
         const uint64_t profileEnd = __rdtsc();
@@ -2766,7 +3218,14 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     // physical group can be replaced in-place. No other selection occurs
     // during this transaction, so the reservation is exact and private to
     // the audio thread.
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t selectionBegin = BeginLaunchStageForTest();
+#endif
     const VoiceHandle selected = PopStealCandidate(selectedPosition, true);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
+                          selectionBegin);
+#endif
     if (selected == kInvalidVoice) return false;
 
     uint32_t groupCount = 1u;
@@ -2825,11 +3284,23 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
             stealCandidateDeferred_[outHandles[i]] = 1u;
         }
     } else {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        const uint64_t treeBegin = BeginLaunchStageForTest();
+#endif
         stealCandidateReserved_[selected] = 0u;
         RemoveStealCandidate(selected);
         for (uint32_t i = 1u; i < count; ++i)
             RemoveStealCandidate(outHandles[i]);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance,
+                              treeBegin);
+#endif
     }
+
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    RecordVictimGroupForTest(selected, LaunchVictimPath::MatchingReuse,
+                             candidatesReservedInPlace);
+#endif
 
     // Capture every old layer, then replace the complete physical note in
     // place. The fast path keeps its winner-tree leaves reserved; the fallback
@@ -2837,6 +3308,9 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     for (uint32_t i = 0u; i < count; ++i)
         CaptureStealTail(outHandles[i]);
 
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t lifecycleBegin = BeginLaunchStageForTest();
+#endif
     for (uint32_t i = 0u; i < count; ++i) {
         const VoiceHandle handle = outHandles[i];
         const bool preserveChannelIndex = candidatesReservedInPlace &&
@@ -2866,6 +3340,9 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         LinkChannelKey(handle);
         if (!preserveChannelIndex) LinkChannelActive(handle);
     }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Lifecycle, lifecycleBegin);
+#endif
     return true;
 }
 
@@ -2924,6 +3401,9 @@ inline bool VoiceManager::LaunchVoiceGroup(
     if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
         count > voiceLimit_)
         return false;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    BeginLaunchTestProfile(channel, note, setups, count);
+#endif
     if (count == 1u && TryLaunchSingleVoiceInPlace(
             channel, note, velocity, setups[0], playIndex, channelParams,
             outHandles[0])) {
@@ -2931,6 +3411,7 @@ inline bool VoiceManager::LaunchVoiceGroup(
         ++groupReuseAttemptCount_;
         ++groupReuseMatchCount_;
         ++groupReuseReservedCount_;
+        FinishLaunchTestProfile(true);
 #endif
         return true;
     }
@@ -2944,10 +3425,16 @@ inline bool VoiceManager::LaunchVoiceGroup(
             if (outHandles[allocated] == kInvalidVoice) {
                 for (uint32_t rollback = 0u; rollback < allocated; ++rollback)
                     RetireVoice(outHandles[rollback]);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+                FinishLaunchTestProfile(false);
+#endif
                 return false;
             }
         }
     }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t configureBegin = BeginLaunchStageForTest();
+#endif
     for (uint32_t layer = 0u; layer < count; ++layer) {
         // Keep every layer invisible to the steal index until the complete
         // physical note has been prepared.  The former layered path linked a
@@ -2956,8 +3443,17 @@ inline bool VoiceManager::LaunchVoiceGroup(
         ConfigureVoice(outHandles[layer], setups[layer], playIndex,
                        channelParams, false);
     }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Configuration,
+                          configureBegin);
+    const uint64_t treeBegin = BeginLaunchStageForTest();
+#endif
     CommitVoiceGroupConfigurations(outHandles, count,
                                    candidatesReservedInPlace);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance, treeBegin);
+    FinishLaunchTestProfile(true);
+#endif
     return true;
 }
 

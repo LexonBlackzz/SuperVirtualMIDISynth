@@ -422,6 +422,11 @@ larger phase containing that item is complete.
 - [x] Add benchmark-only sampled decomposition of saturated mono replacement
   into victim lookup, tail capture, lifecycle indices, configuration stores,
   and winner-tree commit, with no instrumentation in the production DLL
+- [x] Add an explicit chopped-note corpus plus opt-in logical/physical launch
+  churn classification. At 1,000 voices and 6M requested note-ons/s with
+  five-frame notes, all 6,130,080 measured victims were older releasing voices
+  and none were born on the same output frame, rejecting shadow launch as the
+  next useful optimization; exact volatile selection is the measured target
 - [x] Make the dense note benchmark reuse complete direct-mapped immutable
   launch plans like the live driver, rather than zeroing a 512-pointer array,
   copying cached regions, and rebuilding synthetic setup on every note. Its

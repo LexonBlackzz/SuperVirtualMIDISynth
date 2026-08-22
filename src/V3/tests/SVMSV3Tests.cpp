@@ -3051,6 +3051,67 @@ void TestCallbackSourcePurity() {
           "audio callback and MIDI dispatch contain no lock, debug, or UI calls");
 }
 
+void TestLaunchChurnInstrumentation() {
+    auto voices = std::make_unique<svms::VoiceManager>();
+    Check(voices->Initialize(1u, 44100u),
+          "launch churn fixture allocates one voice");
+    voices->SetLaunchChurnProfilingEnabledForTest(true);
+    svms::ChannelParamsSnapshot channel{};
+    channel.volume = channel.expression = 1.0f;
+    channel.panLeft = channel.panRight = 0.70710678f;
+    channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
+    svms::VoiceConfiguration setup{};
+    setup.sampleStart = 0u;
+    setup.sampleEnd = 128u;
+    setup.loopStart = 8u;
+    setup.loopEnd = 120u;
+    setup.loopMode = 1u;
+    setup.phaseStep = setup.basePhaseStep = 1.0f;
+    setup.initialGain = setup.sustainLevel = 1.0f;
+    setup.releaseDecay = 0.999f;
+    setup.gainLeft = setup.gainRight = 0.1f;
+    setup.presetIndex = 0u;
+    setup.regionIndex = 7u;
+    svms::VoiceHandle handle = svms::kInvalidVoice;
+    Check(voices->LaunchVoiceGroup(0u, 60u, 127u, &setup, 1u, 1u,
+                                   channel, &handle),
+          "launch churn fixture fills its free slot");
+
+    voices->SetCurrentFrame(64u);
+    voices->ResetGroupReuseCountersForTest();
+    Check(voices->LaunchVoiceGroup(0u, 60u, 127u, &setup, 1u, 2u,
+                                   channel, &handle) &&
+              voices->LaunchVoiceGroup(0u, 60u, 127u, &setup, 1u, 3u,
+                                       channel, &handle),
+          "launch churn fixture performs previous-frame and same-frame steals");
+    voices->SetCurrentFrame(65u);
+    const svms::LaunchChurnStats& stats =
+        voices->GetLaunchChurnStatsForTest();
+    Check(stats.logicalLaunches == 2u && stats.successfulLaunches == 2u &&
+              stats.physicalVoicesRequested == 2u &&
+              stats.physicalVoicesConfigured == 2u,
+          "launch churn separates logical and physical launch denominators");
+    Check(stats.stealTransactions == 2u && stats.victimGroups == 2u &&
+              stats.physicalVictims == 2u &&
+              stats.sameFrameVictimGroups == 1u &&
+              stats.sameFramePhysicalVictims == 1u,
+          "launch churn identifies exact zero-sample victim replacement");
+    Check(stats.monoVictimGroups == 2u &&
+              stats.stableVictimGroups == 2u &&
+              stats.matchingSizeVictimGroups == 2u &&
+              stats.matchingPlanVictimGroups == 2u &&
+              stats.singleInPlaceVictimGroups == 2u,
+          "launch churn classifies stable matching in-place victims");
+    Check(stats.nextFrameSurvivingGroups == 1u &&
+              stats.nextFrameSurvivingPhysicalVoices == 1u,
+          "launch churn counts only the final same-frame survivor");
+    Check(stats.tailCaptureAttempts == 2u &&
+              stats.tailCaptureAccepted + stats.tailCaptureRejected +
+                      stats.tailCaptureIneligible ==
+                  stats.tailCaptureAttempts,
+          "launch churn accounts for every outgoing-tail decision");
+}
+
 } // namespace
 
 int main() {
@@ -3089,6 +3150,7 @@ int main() {
     TestTransientClassKernelDifferential();
     TestParallelSustainedRenderDifferential();
     TestDensePlannerOracleDifferential();
+    TestLaunchChurnInstrumentation();
     TestRenderCallbackPurity();
     TestCallbackSourcePurity();
 
