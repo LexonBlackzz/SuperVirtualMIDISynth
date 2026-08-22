@@ -263,10 +263,22 @@ size_t RenderWorkerPool::GetAllocatedBytes() const noexcept {
 
 bool RenderWorkerPool::ShouldParallelize(uint32_t voices,
                                          uint32_t frames) const noexcept {
-    return impl_ && frames >= kMinimumParallelFrames &&
-        voices >= kHandlesPerJob * 2u &&
-        static_cast<uint64_t>(voices) * frames >=
-            kMinimumParallelVoiceSamples;
+    return ClassifyParallelization(voices, frames) ==
+        RenderParallelRejectReason::None;
+}
+
+RenderParallelRejectReason RenderWorkerPool::ClassifyParallelization(
+    uint32_t voices, uint32_t frames) const noexcept {
+    if (!impl_ || impl_->totalThreads <= 1u)
+        return RenderParallelRejectReason::Unavailable;
+    if (frames < kMinimumParallelFrames)
+        return RenderParallelRejectReason::TooFewFrames;
+    if (voices < kHandlesPerJob * 2u)
+        return RenderParallelRejectReason::TooFewVoices;
+    if (static_cast<uint64_t>(voices) * frames <
+        kMinimumParallelVoiceSamples)
+        return RenderParallelRejectReason::TooFewVoiceSamples;
+    return RenderParallelRejectReason::None;
 }
 
 void RenderWorkerPool::BeginSpan(const RenderSpanContext& context) noexcept {

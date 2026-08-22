@@ -564,6 +564,11 @@ larger phase containing that item is complete.
   every event retains its original frame and ingress order. At 2,000 voices
   and 943K note-ons/s, warmed AVX2 p99 is 15.29% with four threads and 16.51%
   with eight, versus 32.97% serial; x64/x86/XP suites pass
+- [x] Add opt-in benchmark coverage telemetry for dense-plan rejection,
+  execution fallback, exact span-length buckets, sparse voice-samples, and
+  worker rejection reasons. An 8,192-voice/512-boundary fixture proves the
+  current gap: all 22 callbacks fail only the event-density gate and all
+  369,098,752 sustained voice-samples remain serial in four-frame spans
 - [ ] Prefetch strategies for decimated voices
 - [ ] Ensure every accelerated path retains scalar fallback coverage
 

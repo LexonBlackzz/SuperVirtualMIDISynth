@@ -12,6 +12,14 @@ using IndexedRenderJob = void(*)(uint32_t jobIndex, float* outputLeft,
                                  float* outputRight, uint32_t frameCount,
                                  void* userData);
 
+enum class RenderParallelRejectReason : uint8_t {
+    None,
+    Unavailable,
+    TooFewFrames,
+    TooFewVoices,
+    TooFewVoiceSamples
+};
+
 // Persistent, allocation-free-at-render-time voice mixing workers. MIDI
 // dispatch and every lifecycle mutation remain on the audio thread; workers
 // only render disjoint handle ranges into private buffers.
@@ -30,6 +38,8 @@ public:
     float GetHelperJobPercent() const noexcept;
     size_t GetAllocatedBytes() const noexcept;
     bool ShouldParallelize(uint32_t voiceCount, uint32_t frameCount) const noexcept;
+    RenderParallelRejectReason ClassifyParallelization(
+        uint32_t voiceCount, uint32_t frameCount) const noexcept;
 
     void BeginSpan(const RenderSpanContext& context) noexcept;
     bool AddClassRange(RenderClassKernel kernel, const uint32_t* handles,

@@ -181,6 +181,35 @@ constexpr uint32_t kDenseRenderHandlesPerTile = 256u;
 constexpr uint32_t kDenseRenderMaximumVoices = 8192u;
 constexpr uint32_t kDenseRenderMutationCapacity = 262144u;
 
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+enum class DensePlanRejectReason : uint32_t {
+    CorrectnessDisabled,
+    MissingEvents,
+    EventDensity,
+    MissingWorkers,
+    MissingStorage,
+    VoiceCapacity,
+    ShadowCapacity,
+    MutationCapacity,
+    Count
+};
+
+struct RenderCoverageStats {
+    static constexpr uint32_t kSpanBuckets = 10u;
+    uint64_t callbacks = 0u;
+    uint64_t denseRendered = 0u;
+    uint64_t denseExecutionFallbacks = 0u;
+    uint64_t denseRejected[
+        static_cast<uint32_t>(DensePlanRejectReason::Count)]{};
+    uint64_t spans = 0u;
+    uint64_t spanCounts[kSpanBuckets]{};
+    uint64_t spanVoiceSamples[kSpanBuckets]{};
+    uint64_t sparseVoiceSamples = 0u;
+    uint64_t sustainedParallelVoiceSamples = 0u;
+    uint64_t sustainedRejectedVoiceSamples[5]{};
+};
+#endif
+
 struct DenseVoiceMutation {
     uint32_t frameOffset;
     uint32_t handle;
@@ -390,6 +419,13 @@ public:
                      uint32_t eventCount = 0,
                      bool correctnessMode = false,
                      uint64_t blockStartFrame = 0);
+    void SetCoverageProfilingEnabledForTest(bool enabled) {
+        coverageProfilingEnabled_ = enabled;
+    }
+    void ResetCoverageStatsForTest() { coverageStats_ = {}; }
+    const RenderCoverageStats& GetCoverageStatsForTest() const {
+        return coverageStats_;
+    }
 #endif
 
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
@@ -455,6 +491,10 @@ private:
     uint64_t densePlannerChunkFrame_;
     uint32_t densePlannerCursor_;
     uint32_t denseTailAdvancedFrame_;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    bool coverageProfilingEnabled_;
+    mutable RenderCoverageStats coverageStats_;
+#endif
 };
 
 inline RenderScalar::RenderScalar()
@@ -468,7 +508,11 @@ inline RenderScalar::RenderScalar()
       denseTileCount_(0u), denseSampleData_(nullptr),
       denseSampleDataFrames_(0u), denseKernelSet_(nullptr),
       densePlannerVoices_(nullptr), densePlannerChunkFrame_(0u),
-      densePlannerCursor_(0u), denseTailAdvancedFrame_(0u) {
+      densePlannerCursor_(0u), denseTailAdvancedFrame_(0u)
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+      , coverageProfilingEnabled_(false), coverageStats_{}
+#endif
+      {
     const bool reserved = ReserveVoiceCapacity(kMaxVoicesDefault);
     assert(reserved);
     (void)reserved;
@@ -1408,12 +1452,61 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
 inline bool RenderScalar::CanUseDensePlan(
     const VoiceManager& voices, const RenderEvent* events,
     uint32_t eventCount, uint32_t numFrames, bool correctnessMode) const {
-    if (!correctnessMode || !events || eventCount < numFrames ||
-        numFrames == 0u || !workerPool_ || workerPool_->GetThreadCount() <= 1u ||
-        !densePlans_[0].mutations || !densePlans_[1].mutations ||
-        voices.GetMaxVoices() > kDenseRenderMaximumVoices ||
-        denseRenderState_.GetCapacity() < voices.GetMaxVoices()) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    auto reject = [&](DensePlanRejectReason reason) {
+        if (coverageProfilingEnabled_)
+            ++coverageStats_.denseRejected[static_cast<uint32_t>(reason)];
         return false;
+    };
+#endif
+    if (!correctnessMode) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        return reject(DensePlanRejectReason::CorrectnessDisabled);
+#else
+        return false;
+#endif
+    }
+    if (!events || numFrames == 0u) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        return reject(DensePlanRejectReason::MissingEvents);
+#else
+        return false;
+#endif
+    }
+    if (eventCount < numFrames) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        return reject(DensePlanRejectReason::EventDensity);
+#else
+        return false;
+#endif
+    }
+    if (!workerPool_ || workerPool_->GetThreadCount() <= 1u) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        return reject(DensePlanRejectReason::MissingWorkers);
+#else
+        return false;
+#endif
+    }
+    if (!densePlans_[0].mutations || !densePlans_[1].mutations) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        return reject(DensePlanRejectReason::MissingStorage);
+#else
+        return false;
+#endif
+    }
+    if (voices.GetMaxVoices() > kDenseRenderMaximumVoices) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        return reject(DensePlanRejectReason::VoiceCapacity);
+#else
+        return false;
+#endif
+    }
+    if (denseRenderState_.GetCapacity() < voices.GetMaxVoices()) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        return reject(DensePlanRejectReason::ShadowCapacity);
+#else
+        return false;
+#endif
     }
 
     // A frame can change at most every physical handle once in the immutable
@@ -1436,7 +1529,13 @@ inline bool RenderScalar::CanUseDensePlan(
         const uint64_t conservativeMutations =
             static_cast<uint64_t>(eventFramesPerChunk[chunk]) *
             voices.GetMaxVoices();
-        if (conservativeMutations > denseMutationCapacity_) return false;
+        if (conservativeMutations > denseMutationCapacity_) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+            return reject(DensePlanRejectReason::MutationCapacity);
+#else
+            return false;
+#endif
+        }
     }
     return true;
 }
@@ -1954,15 +2053,27 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       const RenderEvent* events, uint32_t eventCount,
                                       bool correctnessMode,
                                       uint64_t blockStartFrame) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    if (coverageProfilingEnabled_) ++coverageStats_.callbacks;
+#endif
     if (voices.activeCount_ > scratchCapacity_ &&
         !ReserveVoiceCapacity(voices.activeCount_)) return;
     if (!classChanges_ || !retirements_) return;
-    if (CanUseDensePlan(voices, events, eventCount, numFrames,
-                        correctnessMode) &&
-        RenderBlockDensePlanned(voices, sampleData, sampleDataFrames,
-                                outputLeft, outputRight, numFrames, events,
-                                eventCount, blockStartFrame)) {
-        return;
+    const bool denseEligible = CanUseDensePlan(
+        voices, events, eventCount, numFrames, correctnessMode);
+    if (denseEligible) {
+        if (RenderBlockDensePlanned(voices, sampleData, sampleDataFrames,
+                                    outputLeft, outputRight, numFrames, events,
+                                    eventCount, blockStartFrame)) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+            if (coverageProfilingEnabled_) ++coverageStats_.denseRendered;
+#endif
+            return;
+        }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (coverageProfilingEnabled_)
+            ++coverageStats_.denseExecutionFallbacks;
+#endif
     }
     (void)cfg;
     (void)channels;
@@ -2007,6 +2118,23 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         if (spanEnd <= cursor) continue;
 
         const uint32_t spanFrames = spanEnd - cursor;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (coverageProfilingEnabled_) {
+            uint32_t bucket = 0u;
+            uint32_t range = spanFrames;
+            while (range > 1u &&
+                   bucket + 1u < RenderCoverageStats::kSpanBuckets) {
+                range = (range + 1u) >> 1u;
+                ++bucket;
+            }
+            const uint64_t voiceSamples =
+                static_cast<uint64_t>(voices.activeCount_) * spanFrames;
+            ++coverageStats_.spans;
+            ++coverageStats_.spanCounts[bucket];
+            coverageStats_.spanVoiceSamples[bucket] += voiceSamples;
+            coverageStats_.sparseVoiceSamples += voiceSamples;
+        }
+#endif
         uint32_t retireCount = 0u;
         uint32_t classChangeCount = 0u;
         const uint32_t tailCount = voices.GetStealTailCount();
@@ -2043,6 +2171,26 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                 &v, sampleData, sampleDataFrames, outputLeft, outputRight,
                 cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
                 &classChangeCount};
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+            if (coverageProfilingEnabled_ &&
+                renderClass == VoiceRenderClass::SustainedLoop) {
+                const uint32_t classVoices =
+                    voices.GetRenderClassCount(renderClass);
+                const uint64_t voiceSamples =
+                    static_cast<uint64_t>(classVoices) * spanFrames;
+                RenderParallelRejectReason reason =
+                    RenderParallelRejectReason::Unavailable;
+                if (workerPool_ && classKernel != nullptr && sampleData != nullptr)
+                    reason = workerPool_->ClassifyParallelization(
+                        classVoices, spanFrames);
+                if (reason == RenderParallelRejectReason::None) {
+                    coverageStats_.sustainedParallelVoiceSamples += voiceSamples;
+                } else {
+                    coverageStats_.sustainedRejectedVoiceSamples[
+                        static_cast<uint32_t>(reason)] += voiceSamples;
+                }
+            }
+#endif
             if (renderClass == VoiceRenderClass::SustainedLoop &&
                 classKernel != nullptr && sampleData != nullptr &&
                 workerPool_ && workerPool_->ShouldParallelize(

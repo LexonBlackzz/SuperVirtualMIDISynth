@@ -86,6 +86,7 @@ struct Options {
     bool enforce = false;
     bool reference = false;
     bool breakdown = false;
+    bool coverageProfile = false;
     bool transactionalLaunch = true;
     bool copiedLaunchPlan = false;
     bool batchNoteOffIndex = false;
@@ -168,6 +169,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.reference = true;
         } else if (std::strcmp(argv[i], "--breakdown") == 0) {
             options.breakdown = true;
+        } else if (std::strcmp(argv[i], "--coverage") == 0) {
+            options.coverageProfile = true;
         } else if (std::strcmp(argv[i], "--launch-churn") == 0) {
             options.launchChurnProfile = true;
         } else if (std::strcmp(argv[i], "--volatile-selection") == 0) {
@@ -539,7 +542,7 @@ int main(int argc, char** argv) {
             "[--launch-path legacy|transactional] "
             "[--launch-plan direct|copy] "
             "[--noteoff-index immediate|batch] "
-            "[--breakdown] [--launch-churn] [--volatile-selection heap|scan] "
+            "[--breakdown] [--coverage] [--launch-churn] [--volatile-selection heap|scan] "
             "[--pin-core 0..63] "
             "[--quick] [--reference] [--enforce]\n");
         return 1;
@@ -592,6 +595,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot initialize render workers\n");
         return 3;
     }
+    renderer->SetCoverageProfilingEnabledForTest(options.coverageProfile);
     if (!options.automaticBackend && !renderer->SetRenderBackend(options.backend)) {
         std::fprintf(stderr, "requested render backend is not supported by this CPU/build\n");
         return 3;
@@ -771,6 +775,7 @@ int main(int argc, char** argv) {
     gRegionResolveCycles = gLaunchPrepareCycles = 0u;
     gBreakdownSampleCounter = 0u;
     voices->ResetGroupReuseCountersForTest();
+    renderer->ResetCoverageStatsForTest();
     gCollectBreakdown = options.breakdown;
 
     std::vector<double> callbackPercent;
@@ -876,6 +881,57 @@ int main(int argc, char** argv) {
     }
     churnBuckets += "]";
 
+    const svms::RenderCoverageStats& coverage =
+        renderer->GetCoverageStatsForTest();
+    char coverageHead[1200]{};
+    std::snprintf(coverageHead, sizeof(coverageHead),
+        "{\"enabled\":%s,\"callbacks\":%llu,\"dense_rendered\":%llu,"
+        "\"dense_execution_fallbacks\":%llu,\"dense_rejected\":{"
+        "\"correctness\":%llu,\"missing_events\":%llu,"
+        "\"event_density\":%llu,\"workers\":%llu,\"storage\":%llu,"
+        "\"voice_capacity\":%llu,\"shadow_capacity\":%llu,"
+        "\"mutation_capacity\":%llu},\"spans\":%llu,"
+        "\"sparse_voice_samples\":%llu,"
+        "\"sustained_parallel_voice_samples\":%llu,"
+        "\"sustained_rejected_voice_samples\":{"
+        "\"unavailable\":%llu,\"frames\":%llu,\"voices\":%llu,"
+        "\"product\":%llu},\"span_counts\":[",
+        options.coverageProfile ? "true" : "false",
+        static_cast<unsigned long long>(coverage.callbacks),
+        static_cast<unsigned long long>(coverage.denseRendered),
+        static_cast<unsigned long long>(coverage.denseExecutionFallbacks),
+        static_cast<unsigned long long>(coverage.denseRejected[0]),
+        static_cast<unsigned long long>(coverage.denseRejected[1]),
+        static_cast<unsigned long long>(coverage.denseRejected[2]),
+        static_cast<unsigned long long>(coverage.denseRejected[3]),
+        static_cast<unsigned long long>(coverage.denseRejected[4]),
+        static_cast<unsigned long long>(coverage.denseRejected[5]),
+        static_cast<unsigned long long>(coverage.denseRejected[6]),
+        static_cast<unsigned long long>(coverage.denseRejected[7]),
+        static_cast<unsigned long long>(coverage.spans),
+        static_cast<unsigned long long>(coverage.sparseVoiceSamples),
+        static_cast<unsigned long long>(coverage.sustainedParallelVoiceSamples),
+        static_cast<unsigned long long>(coverage.sustainedRejectedVoiceSamples[1]),
+        static_cast<unsigned long long>(coverage.sustainedRejectedVoiceSamples[2]),
+        static_cast<unsigned long long>(coverage.sustainedRejectedVoiceSamples[3]),
+        static_cast<unsigned long long>(coverage.sustainedRejectedVoiceSamples[4]));
+    std::string coverageJson = coverageHead;
+    auto appendCoverageArray = [&](const uint64_t* values, uint32_t count) {
+        char number[48]{};
+        for (uint32_t index = 0u; index < count; ++index) {
+            std::snprintf(number, sizeof(number), "%s%llu",
+                index == 0u ? "" : ",",
+                static_cast<unsigned long long>(values[index]));
+            coverageJson += number;
+        }
+    };
+    appendCoverageArray(coverage.spanCounts,
+                        svms::RenderCoverageStats::kSpanBuckets);
+    coverageJson += "],\"span_voice_samples\":[";
+    appendCoverageArray(coverage.spanVoiceSamples,
+                        svms::RenderCoverageStats::kSpanBuckets);
+    coverageJson += "]}";
+
     std::printf(
         "{\"renderer\":\"%s\",\"backend\":\"%s\",\"render_threads\":%u,\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"launch_churn_profile\":%s,\"volatile_selection\":\"%s\",\"voices\":%u,\"frames\":%u,"
         "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,\"note_length_frames\":%u,\"noteoff_index\":\"%s\","
@@ -911,6 +967,7 @@ int main(int argc, char** argv) {
         "\"same_frame_physical_per_configured\":%.3f,"
         "\"next_frame_physical_per_configured\":%.3f},"
         "\"cycle_classes\":%s},"
+        "\"coverage\":%s,"
         "\"render_classes\":{\"sustained_loop\":%u,\"sustained_one_shot\":%u,"
         "\"transient_loop\":%u,\"release_loop\":%u,\"release_one_shot\":%u,"
         "\"generic\":%u,\"steal_tails\":%u},"
@@ -994,6 +1051,7 @@ int main(int argc, char** argv) {
         ratio(churn.nextFrameSurvivingPhysicalVoices,
               churn.physicalVoicesConfigured),
         churnBuckets.c_str(),
+        coverageJson.c_str(),
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedLoop)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::SustainedOneShot)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::TransientLoop)],
