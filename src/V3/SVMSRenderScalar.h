@@ -456,6 +456,10 @@ private:
                      uint32_t frameCount, uint64_t absoluteFrame);
     bool AdvanceDenseHandleTo(VoiceManager& voices, uint32_t handle,
                      uint32_t frameOffset);
+    bool AdvanceDenseReleaseStateTo(VoiceManager& voices, uint32_t handle,
+                     uint32_t frameOffset);
+    bool AdvanceDensePhaseTo(VoiceManager& voices, uint32_t handle,
+                     uint32_t frameOffset);
     void AdvanceDenseTailsTo(VoiceManager& voices, uint32_t frameOffset);
     static void DensePreTailCapture(VoiceHandle handle, void* userData);
     static void DenseVoiceConfigured(VoiceHandle handle, void* userData);
@@ -481,6 +485,7 @@ private:
     uint32_t* denseMarkEpoch_;
     uint32_t* denseMarkedHandles_;
     uint32_t* denseLastAdvancedFrames_;
+    uint32_t* denseLastPhaseAdvancedFrames_;
     uint32_t denseMutationCapacity_;
     uint32_t denseMarkedCount_;
     uint32_t denseEpoch_;
@@ -504,7 +509,7 @@ inline RenderScalar::RenderScalar()
       retirements_(nullptr), scratchCapacity_(0u),
       workerPool_(new (std::nothrow) RenderWorkerPool()),
       denseMarkEpoch_(nullptr), denseMarkedHandles_(nullptr),
-      denseLastAdvancedFrames_(nullptr),
+      denseLastAdvancedFrames_(nullptr), denseLastPhaseAdvancedFrames_(nullptr),
       denseMutationCapacity_(0u), denseMarkedCount_(0u), denseEpoch_(1u),
       denseTileCount_(0u), denseSampleData_(nullptr),
       denseSampleDataFrames_(0u), denseKernelSet_(nullptr),
@@ -533,6 +538,7 @@ inline RenderScalar::~RenderScalar() {
     _aligned_free(denseMarkEpoch_);
     _aligned_free(denseMarkedHandles_);
     _aligned_free(denseLastAdvancedFrames_);
+    _aligned_free(denseLastPhaseAdvancedFrames_);
 }
 
 inline bool RenderScalar::ConfigureRenderThreads(
@@ -565,13 +571,16 @@ inline bool RenderScalar::ReserveVoiceCapacity(uint32_t voiceCapacity) {
         static_cast<size_t>(voiceCapacity) * sizeof(uint32_t), kMixBufferAlign));
     uint32_t* lastAdvancedFrames = static_cast<uint32_t*>(_aligned_malloc(
         static_cast<size_t>(voiceCapacity) * sizeof(uint32_t), kMixBufferAlign));
+    uint32_t* lastPhaseAdvancedFrames = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(voiceCapacity) * sizeof(uint32_t), kMixBufferAlign));
     if (!classChanges || !retirements || !markEpoch || !markedHandles ||
-        !lastAdvancedFrames) {
+        !lastAdvancedFrames || !lastPhaseAdvancedFrames) {
         _aligned_free(classChanges);
         _aligned_free(retirements);
         _aligned_free(markEpoch);
         _aligned_free(markedHandles);
         _aligned_free(lastAdvancedFrames);
+        _aligned_free(lastPhaseAdvancedFrames);
         return false;
     }
     std::memset(markEpoch, 0,
@@ -581,11 +590,13 @@ inline bool RenderScalar::ReserveVoiceCapacity(uint32_t voiceCapacity) {
     _aligned_free(denseMarkEpoch_);
     _aligned_free(denseMarkedHandles_);
     _aligned_free(denseLastAdvancedFrames_);
+    _aligned_free(denseLastPhaseAdvancedFrames_);
     classChanges_ = classChanges;
     retirements_ = retirements;
     denseMarkEpoch_ = markEpoch;
     denseMarkedHandles_ = markedHandles;
     denseLastAdvancedFrames_ = lastAdvancedFrames;
+    denseLastPhaseAdvancedFrames_ = lastPhaseAdvancedFrames;
     scratchCapacity_ = voiceCapacity;
     return true;
 }
@@ -1797,17 +1808,104 @@ inline bool RenderScalar::AdvanceDenseHandleTo(
         }
         v.phases[handle] = phase;
         denseLastAdvancedFrames_[handle] = frameOffset;
+        denseLastPhaseAdvancedFrames_[handle] = frameOffset;
         return true;
     }
     const uint32_t retiredAt = RenderPrimaryVoiceSpan(
         v, handle, denseSampleData_, denseSampleDataFrames_, nullptr,
         nullptr, 0u, frameOffset - previous, 0u, true);
     denseLastAdvancedFrames_[handle] = frameOffset;
+    denseLastPhaseAdvancedFrames_[handle] = frameOffset;
     if (retiredAt == UINT32_MAX) return true;
     voices.SetCurrentFrame(densePlannerChunkFrame_ + previous + retiredAt);
     voices.RetireVoice(static_cast<VoiceHandle>(handle));
     voices.SetCurrentFrame(densePlannerChunkFrame_ + frameOffset);
     return false;
+}
+
+inline bool RenderScalar::AdvanceDenseReleaseStateTo(
+    VoiceManager& voices, uint32_t handle, uint32_t frameOffset) {
+    if (handle >= voices.GetMaxVoices() ||
+        voices.v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) {
+        return false;
+    }
+    VoiceSoA& v = voices.v;
+    if (v.state[handle] != static_cast<uint8_t>(VoiceState::Releasing) ||
+        v.loopEnabled[handle] == 0u ||
+        v.stealFadeInFramesRemaining[handle] != 0u) {
+        return AdvanceDenseHandleTo(voices, handle, frameOffset);
+    }
+    const uint32_t previous = denseLastAdvancedFrames_[handle];
+    if (frameOffset <= previous) return true;
+
+    float gain = v.currentGain[handle];
+    uint32_t releaseRemaining = v.releaseSamplesRemaining[handle];
+    const float releaseDecay = v.releaseDecay[handle];
+    const uint32_t frameCount = frameOffset - previous;
+    uint32_t retiredAt = UINT32_MAX;
+    for (uint32_t n = 0u; n < frameCount; ++n) {
+        bool releaseFinished = false;
+        if (releaseRemaining == 0u) {
+            releaseFinished = true;
+        } else {
+            gain *= releaseDecay;
+            if (releaseRemaining != UINT32_MAX) {
+                --releaseRemaining;
+                releaseFinished = releaseRemaining == 0u;
+            }
+        }
+        if (releaseFinished ||
+            (releaseRemaining == UINT32_MAX &&
+             gain < kVoiceRetireThreshold)) {
+            retiredAt = n;
+            break;
+        }
+    }
+    v.currentGain[handle] = gain;
+    v.releaseSamplesRemaining[handle] = releaseRemaining;
+    denseLastAdvancedFrames_[handle] = frameOffset;
+    if (retiredAt == UINT32_MAX) return true;
+    voices.SetCurrentFrame(densePlannerChunkFrame_ + previous + retiredAt);
+    voices.RetireVoice(static_cast<VoiceHandle>(handle));
+    voices.SetCurrentFrame(densePlannerChunkFrame_ + frameOffset);
+    return false;
+}
+
+inline bool RenderScalar::AdvanceDensePhaseTo(
+    VoiceManager& voices, uint32_t handle, uint32_t frameOffset) {
+    if (handle >= voices.GetMaxVoices() ||
+        voices.v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) {
+        return false;
+    }
+    const uint32_t previous = denseLastPhaseAdvancedFrames_[handle];
+    if (frameOffset <= previous) return true;
+    VoiceSoA& v = voices.v;
+    if (v.state[handle] != static_cast<uint8_t>(VoiceState::Releasing) ||
+        v.loopEnabled[handle] == 0u) {
+        denseLastPhaseAdvancedFrames_[handle] = frameOffset;
+        return true;
+    }
+
+    float phase = (std::max)(0.0f, v.phases[handle]);
+    const float phaseStep = v.phaseIncs[handle];
+    const float loopStart = v.relLoopSF[handle];
+    const float loopEnd = v.relLoopEF[handle];
+    const uint32_t relEnd = v.relEnd[handle];
+    for (uint32_t n = previous; n < frameOffset; ++n) {
+        if (static_cast<uint32_t>(phase) + 1u >= relEnd)
+            phase = loopStart;
+        phase += phaseStep;
+        if (phase >= loopEnd) {
+            float overflow = phase - loopEnd;
+            const float loopLength = loopEnd - loopStart;
+            if (loopLength > 0.0f && overflow >= loopLength)
+                overflow -= floorf(overflow / loopLength) * loopLength;
+            phase = loopStart + overflow;
+        }
+    }
+    v.phases[handle] = phase;
+    denseLastPhaseAdvancedFrames_[handle] = frameOffset;
+    return true;
 }
 
 inline void RenderScalar::AdvanceDenseTailsTo(
@@ -1830,6 +1928,8 @@ inline void RenderScalar::DensePreTailCapture(
     if (renderer && renderer->densePlannerVoices_) {
         renderer->AdvanceDenseHandleTo(*renderer->densePlannerVoices_, handle,
                                        renderer->densePlannerCursor_);
+        renderer->AdvanceDensePhaseTo(*renderer->densePlannerVoices_, handle,
+                                      renderer->densePlannerCursor_);
     }
 }
 
@@ -1841,6 +1941,8 @@ inline void RenderScalar::DenseVoiceConfigured(
     renderer->denseMarkEpoch_[handle] = renderer->denseEpoch_;
     renderer->denseMarkedHandles_[renderer->denseMarkedCount_++] = handle;
     renderer->denseLastAdvancedFrames_[handle] =
+        renderer->densePlannerCursor_;
+    renderer->denseLastPhaseAdvancedFrames_[handle] =
         renderer->densePlannerCursor_;
 }
 
@@ -1977,6 +2079,9 @@ inline bool RenderScalar::RenderBlockDensePlanned(
     std::memset(denseLastAdvancedFrames_, 0,
                 static_cast<size_t>(voices.GetMaxVoices()) *
                     sizeof(uint32_t));
+    std::memset(denseLastPhaseAdvancedFrames_, 0,
+                static_cast<size_t>(voices.GetMaxVoices()) *
+                    sizeof(uint32_t));
     densePlannerVoices_ = &voices;
     densePlannerChunkFrame_ = blockStartFrame;
     densePlannerCursor_ = 0u;
@@ -2013,6 +2118,8 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                 // Advance only volatile/finite voices before a decision; a
                 // selected stable victim is advanced lazily by the tail hook.
                 uint32_t advanceCount = 0u;
+                uint32_t releaseLoopBegin = 0u;
+                uint32_t releaseLoopEnd = 0u;
                 // SustainedLoop's class invariant already guarantees active,
                 // clean stage-3 looping state; scanning that overwhelmingly
                 // common class here would recreate a frame-major O(V) loop.
@@ -2020,6 +2127,10 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                          static_cast<uint32_t>(
                              VoiceRenderClass::SustainedOneShot);
                      classIndex < kVoiceRenderClassCount; ++classIndex) {
+                    if (classIndex == static_cast<uint32_t>(
+                            VoiceRenderClass::ReleaseLoop)) {
+                        releaseLoopBegin = advanceCount;
+                    }
                     voices.ForEachRenderClassBlock(
                         static_cast<VoiceRenderClass>(classIndex),
                         [&](const uint32_t* handles, uint32_t count) {
@@ -2028,10 +2139,21 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                                             sizeof(uint32_t));
                             advanceCount += count;
                         });
+                    if (classIndex == static_cast<uint32_t>(
+                            VoiceRenderClass::ReleaseLoop)) {
+                        releaseLoopEnd = advanceCount;
+                    }
                 }
-                for (uint32_t index = 0u; index < advanceCount; ++index)
-                    AdvanceDenseHandleTo(
-                        voices, classChanges_[index], densePlannerCursor_);
+                for (uint32_t index = 0u; index < advanceCount; ++index) {
+                    if (index >= releaseLoopBegin &&
+                        index < releaseLoopEnd) {
+                        AdvanceDenseReleaseStateTo(
+                            voices, classChanges_[index], densePlannerCursor_);
+                    } else {
+                        AdvanceDenseHandleTo(
+                            voices, classChanges_[index], densePlannerCursor_);
+                    }
+                }
                 if (++denseEpoch_ == 0u) {
                     std::memset(denseMarkEpoch_, 0,
                         static_cast<size_t>(scratchCapacity_) *
@@ -2085,6 +2207,8 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                             affectedKeys[channel][note]) {
                             if (AdvanceDenseHandleTo(
                                     voices, handle, densePlannerCursor_)) {
+                                AdvanceDensePhaseTo(
+                                    voices, handle, densePlannerCursor_);
                                 mark(handle);
                                 ++position;
                             }
