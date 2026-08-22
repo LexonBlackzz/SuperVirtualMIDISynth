@@ -180,6 +180,7 @@ constexpr uint32_t kDenseRenderChunkFrames = 128u;
 constexpr uint32_t kDenseRenderHandlesPerTile = 256u;
 constexpr uint32_t kDenseRenderMaximumVoices = 8192u;
 constexpr uint32_t kDenseRenderMutationCapacity = 262144u;
+constexpr uint64_t kDenseRenderMinimumRejectedVoiceSamples = 1u << 22u;
 
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
 enum class DensePlanRejectReason : uint32_t {
@@ -1473,19 +1474,58 @@ inline bool RenderScalar::CanUseDensePlan(
         return false;
 #endif
     }
-    if (eventCount < numFrames) {
-#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        return reject(DensePlanRejectReason::EventDensity);
-#else
-        return false;
-#endif
-    }
     if (!workerPool_ || workerPool_->GetThreadCount() <= 1u) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
         return reject(DensePlanRejectReason::MissingWorkers);
 #else
         return false;
 #endif
+    }
+    if (eventCount < numFrames) {
+        // Sparse rendering already parallelizes profitable sustained spans.
+        // Dense planning earns its setup cost only when event fragmentation
+        // leaves substantial synthesis serial after those existing gates.
+        const uint32_t sustainedVoices = voices.GetRenderClassCount(
+            VoiceRenderClass::SustainedLoop);
+        const uint32_t otherVoices = voices.GetActiveCount() > sustainedVoices
+            ? voices.GetActiveCount() - sustainedVoices : 0u;
+        uint64_t rejectedVoiceSamples =
+            static_cast<uint64_t>(otherVoices) * numFrames;
+        uint32_t cursor = 0u;
+        uint32_t previousBoundary = UINT32_MAX;
+        for (uint32_t index = 0u; index < eventCount; ++index) {
+            const uint32_t boundary =
+                (std::min)(events[index].frameOffset, numFrames);
+            if (boundary == previousBoundary) continue;
+            previousBoundary = boundary;
+            if (boundary > cursor) {
+                const uint32_t spanFrames = boundary - cursor;
+                if (workerPool_->ClassifyParallelization(
+                        sustainedVoices, spanFrames) !=
+                    RenderParallelRejectReason::None) {
+                    rejectedVoiceSamples +=
+                        static_cast<uint64_t>(sustainedVoices) * spanFrames;
+                }
+                cursor = boundary;
+            }
+        }
+        if (cursor < numFrames) {
+            const uint32_t spanFrames = numFrames - cursor;
+            if (workerPool_->ClassifyParallelization(
+                    sustainedVoices, spanFrames) !=
+                RenderParallelRejectReason::None) {
+                rejectedVoiceSamples +=
+                    static_cast<uint64_t>(sustainedVoices) * spanFrames;
+            }
+        }
+        if (rejectedVoiceSamples <
+            kDenseRenderMinimumRejectedVoiceSamples) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+            return reject(DensePlanRejectReason::EventDensity);
+#else
+            return false;
+#endif
+        }
     }
     if (!densePlans_[0].mutations || !densePlans_[1].mutations) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
@@ -1509,27 +1549,63 @@ inline bool RenderScalar::CanUseDensePlan(
 #endif
     }
 
-    // A frame can change at most every physical handle once in the immutable
-    // plan: repeated same-frame replacement collapses to the final primary
-    // state while the fixed tail snapshot retains the audible continuations.
-    uint32_t eventFramesPerChunk[
+    // Bound the handles that can actually mutate at each event frame. Global
+    // operations and note launches may touch the full active pool; channel
+    // and key operations cannot escape their affected channel populations.
+    // Repeated same-frame changes collapse to one final snapshot per handle.
+    uint64_t estimatedMutationsPerChunk[
         (8192u + kDenseRenderChunkFrames - 1u) /
         kDenseRenderChunkFrames]{};
-    uint32_t lastFrame = UINT32_MAX;
+    uint32_t frame = UINT32_MAX;
+    uint16_t affectedChannels = 0u;
+    bool mayTouchFullPool = false;
+    auto flushFrameEstimate = [&]() {
+        if (frame == UINT32_MAX || frame >= numFrames) return;
+        uint64_t mutations = voices.GetActiveCount();
+        if (!mayTouchFullPool) {
+            mutations = 0u;
+            for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+                if ((affectedChannels & (1u << channel)) != 0u)
+                    mutations += voices.GetChannelActiveCount(
+                        static_cast<uint8_t>(channel));
+            }
+        }
+        estimatedMutationsPerChunk[
+            frame / kDenseRenderChunkFrames] += mutations;
+    };
     for (uint32_t index = 0u; index < eventCount; ++index) {
-        const uint32_t frame = events[index].frameOffset;
-        if (frame >= numFrames || frame == lastFrame) continue;
-        lastFrame = frame;
-        ++eventFramesPerChunk[frame / kDenseRenderChunkFrames];
+        const RenderEvent& event = events[index];
+        if (event.frameOffset != frame) {
+            flushFrameEstimate();
+            frame = event.frameOffset;
+            affectedChannels = 0u;
+            mayTouchFullPool = false;
+        }
+        switch (event.type) {
+            case RenderEventType::Reset:
+            case RenderEventType::NoteOn:
+                mayTouchFullPool = true;
+                break;
+            case RenderEventType::NoteOff:
+            case RenderEventType::StaleNoteOffBatch:
+            case RenderEventType::ControlChange:
+            case RenderEventType::PitchBend:
+            case RenderEventType::AllNotesOff:
+            case RenderEventType::AllSoundOff:
+                if (event.channel < kChannelCount)
+                    affectedChannels |=
+                        static_cast<uint16_t>(1u << event.channel);
+                break;
+            default:
+                break;
+        }
     }
+    flushFrameEstimate();
     const uint32_t chunks =
         (numFrames + kDenseRenderChunkFrames - 1u) /
         kDenseRenderChunkFrames;
     for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
-        const uint64_t conservativeMutations =
-            static_cast<uint64_t>(eventFramesPerChunk[chunk]) *
-            voices.GetMaxVoices();
-        if (conservativeMutations > denseMutationCapacity_) {
+        if (estimatedMutationsPerChunk[chunk] > denseMutationCapacity_) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
             return reject(DensePlanRejectReason::MutationCapacity);
 #else

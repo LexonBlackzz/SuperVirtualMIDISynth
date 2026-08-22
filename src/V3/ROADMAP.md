@@ -569,6 +569,14 @@ larger phase containing that item is complete.
   worker rejection reasons. An 8,192-voice/512-boundary fixture proves the
   current gap: all 22 callbacks fail only the event-density gate and all
   369,098,752 sustained voice-samples remain serial in four-frame spans
+- [x] Replace the dense planner's record-count gate with measured rejected
+  synthesis work after applying the existing span-worker gates. A 4M
+  voice-sample threshold preserves the faster sparse path at 2,000 voices,
+  while 8,192 voices across 512 boundaries improve from 35.96% to 28.98% p99
+- [x] Bound dense mutation storage by the union of event-affected channel
+  populations instead of `distinct frames * max voices`, retaining full-pool
+  bounds for resets and note launches. The 8,192-voice/683-boundary fixture no
+  longer rejects or falls back and improves from 48.48% to 33.09% p99
 - [ ] Prefetch strategies for decimated voices
 - [ ] Ensure every accelerated path retains scalar fallback coverage
 
