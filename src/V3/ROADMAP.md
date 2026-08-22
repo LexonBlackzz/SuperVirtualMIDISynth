@@ -375,6 +375,11 @@ larger phase containing that item is complete.
   heap removals and repairs. On the 1,000-voice 6M chopped-note corpus,
   realized throughput rises from about 5.10M/s to 5.86-5.90M/s and cost falls
   from 184.98 to 160.23-160.56 cycles per voice-sample without changing victims
+- [x] Bypass the stable mono replacement probe when the packed volatile root
+  is already the exact winner. Release-heavy launches no longer select and
+  reserve the same volatile victim twice; the 6M chopped-note corpus reaches
+  5.94-6.00M events/s at 157.22-158.93 cycles per voice-sample with unchanged
+  exhaustive-oracle victims
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact

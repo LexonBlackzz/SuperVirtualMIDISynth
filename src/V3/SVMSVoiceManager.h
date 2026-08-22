@@ -3108,6 +3108,23 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const ChannelParamsSnapshot& cp, VoiceHandle& outHandle) {
     if (freeTop_ != 0u || !IsStableConfiguration(setup)) return false;
 
+    // This transaction can consume only a stable winner.  In release-heavy
+    // streams the exact winner is almost always the volatile-heap root; avoid
+    // reserving it here only to clear that reservation and select it again in
+    // ReuseMatchingStealGroup.  Packed roots carry the complete score and
+    // active-position tie, so this is the same comparison PopStealCandidate
+    // would perform, without mutating either index.
+    if (!stealHeapValid_) BuildStealHeap();
+    if (stealHeapCount_ == 0u) return false;
+    if (stealVolatileCount_ != 0u) {
+        if (!stealVolatileHeapValid_ ||
+            stealVolatileHeapFrame_ != currentFrame_)
+            BuildVolatileStealHeap();
+        if (stealVolatileHeapCount_ != 0u &&
+            stealVolatileHeapKey_[0] > stealWinnerTree_[1])
+            return false;
+    }
+
     uint32_t selectedPosition = 0u;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const bool profileLaunch = (++launchProfileCounter_ & 4095u) == 0u;
