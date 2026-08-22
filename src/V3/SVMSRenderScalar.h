@@ -1193,6 +1193,94 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
         return UINT32_MAX;
     }
 
+    // Dense planning advances the authoritative steal/envelope state without
+    // producing samples. Releasing loops dominate chopped-note workloads, so
+    // keep them out of the generic sample/envelope machine: only the phase,
+    // release gain/countdown and exact retirement frame can change here.
+    if (released && loop && fadeRemaining == 0u &&
+        mixedFrameCount == 0u) {
+        uint32_t releaseRemaining = v.releaseSamplesRemaining[idx];
+        const float releaseDecay = v.releaseDecay[idx];
+        uint32_t retiredAt = UINT32_MAX;
+
+        for (uint32_t n = 0u; n < frameCount; ++n) {
+            const uint32_t baseOffset = static_cast<uint32_t>(phase);
+            if (baseOffset + 1u >= relEnd)
+                phase = relLoopSF;
+
+            bool releaseFinished = false;
+            if (releaseRemaining == 0u) {
+                releaseFinished = true;
+            } else {
+                gain *= releaseDecay;
+                if (releaseRemaining != UINT32_MAX) {
+                    --releaseRemaining;
+                    releaseFinished = releaseRemaining == 0u;
+                }
+            }
+
+            phase += phaseStep;
+            if (phase >= relLoopEF) {
+                float overflow = phase - relLoopEF;
+                const float loopLength = relLoopEF - relLoopSF;
+                if (loopLength > 0.0f && overflow >= loopLength)
+                    overflow -= floorf(overflow / loopLength) * loopLength;
+                phase = relLoopSF + overflow;
+            }
+
+            if (releaseFinished ||
+                (releaseRemaining == UINT32_MAX &&
+                 gain < kVoiceRetireThreshold)) {
+                retiredAt = n;
+                break;
+            }
+        }
+
+        v.phases[idx] = phase;
+        v.currentGain[idx] = gain;
+        v.releaseSamplesRemaining[idx] = releaseRemaining;
+        return retiredAt;
+    }
+
+    if (released && !loop && fadeRemaining == 0u &&
+        mixedFrameCount == 0u) {
+        uint32_t releaseRemaining = v.releaseSamplesRemaining[idx];
+        const float releaseDecay = v.releaseDecay[idx];
+        uint32_t retiredAt = UINT32_MAX;
+
+        for (uint32_t n = 0u; n < frameCount; ++n) {
+            const uint32_t baseOffset = static_cast<uint32_t>(phase);
+            if (baseOffset + 1u >= relEnd) {
+                retiredAt = n;
+                break;
+            }
+
+            bool releaseFinished = false;
+            if (releaseRemaining == 0u) {
+                releaseFinished = true;
+            } else {
+                gain *= releaseDecay;
+                if (releaseRemaining != UINT32_MAX) {
+                    --releaseRemaining;
+                    releaseFinished = releaseRemaining == 0u;
+                }
+            }
+            phase += phaseStep;
+
+            if (releaseFinished ||
+                (releaseRemaining == UINT32_MAX &&
+                 gain < kVoiceRetireThreshold)) {
+                retiredAt = n;
+                break;
+            }
+        }
+
+        v.phases[idx] = phase;
+        v.currentGain[idx] = gain;
+        v.releaseSamplesRemaining[idx] = releaseRemaining;
+        return retiredAt;
+    }
+
     // Full-quality looping attack/decay voices.  Envelope state remains local
     // while the sample cursor follows the same validated loop as steady state.
     if (!released && loop && fadeRemaining == 0u &&
