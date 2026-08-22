@@ -2045,6 +2045,16 @@ private:
     uint32_t staleRecoveryNoteOffCount_[kStaleRecoveryKeys];
     uint8_t staleRecoveryNoteOffValid_[kStaleRecoveryKeys];
 
+    // Exact-frame note-off transaction scratch. A late recovery callback can
+    // collapse a skipped interval onto frame zero, producing hundreds of
+    // thousands of interleaved note-offs. Their per-key multiplicity matters,
+    // but repeated channel/key lookups between state-event boundaries do not.
+    // Generation stamps avoid clearing all 2,048 entries for every run.
+    uint32_t noteOffBatchStamp_[kStaleRecoveryKeys]{};
+    uint32_t noteOffBatchCount_[kStaleRecoveryKeys]{};
+    uint16_t noteOffBatchKeys_[kStaleRecoveryKeys]{};
+    uint32_t noteOffBatchGeneration_ = 0u;
+
     // Persistent audio-thread-only overflow queue.  Events whose
     // sampleOffset lands beyond the current block (sampleOffset >=
     // numFrames) are kept here — NOT pushed back into the lock-free SPSC
@@ -4098,22 +4108,77 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
     uint64_t deferredConfigured = 0u;
     while (index < eventCount) {
         if (events[index].type == RenderEventType::NoteOff) {
-            const uint8_t channel = events[index].channel;
-            const uint8_t note = events[index].data1;
-            uint32_t runEnd = index + 1u;
-            while (runEnd < eventCount &&
-                   events[runEnd].type == RenderEventType::NoteOff &&
-                   events[runEnd].channel == channel &&
-                   events[runEnd].data1 == note) {
-                ++runEnd;
+            // Strict lossless mode retains literal ingress ordering. It may
+            // still combine an adjacent identical channel/key run into one
+            // counted operation because no event can observe an intermediate
+            // state, but it never reorders interleaved keys.
+            if (self->overflowMode_ !=
+                EventOverflowMode::PriorityVelocity) {
+                const uint8_t channel = events[index].channel;
+                const uint8_t note = events[index].data1;
+                uint32_t runEnd = index + 1u;
+                while (runEnd < eventCount &&
+                       events[runEnd].type == RenderEventType::NoteOff &&
+                       events[runEnd].channel == channel &&
+                       events[runEnd].data1 == note) {
+                    ++runEnd;
+                }
+                uint32_t remaining = runEnd - index;
+                while (remaining != 0u) {
+                    const uint8_t batch = static_cast<uint8_t>(
+                        (std::min)(remaining, 255u));
+                    self->HandleStaleNoteOffBatch(channel, note, batch,
+                                                  blockCursor);
+                    remaining -= batch;
+                }
+                index = runEnd;
+                continue;
             }
-            uint32_t remaining = runEnd - index;
-            while (remaining != 0u) {
-                const uint8_t batch = static_cast<uint8_t>(
-                    (std::min)(remaining, 255u));
-                self->HandleStaleNoteOffBatch(channel, note, batch,
-                                              blockCursor);
-                remaining -= batch;
+            // All events in this callback invocation share an exact output
+            // frame. Aggregate a maximal note-off-only run by channel/key;
+            // controllers, note-ons and termination events remain hard
+            // boundaries. Releasing A,B,A is observably identical to A,A,B
+            // before the next boundary, while avoiding three oldest-
+            // generation traversals when one counted operation is enough.
+            uint32_t generation = ++self->noteOffBatchGeneration_;
+            if (generation == 0u) {
+                std::memset(self->noteOffBatchStamp_, 0,
+                            sizeof(self->noteOffBatchStamp_));
+                generation = ++self->noteOffBatchGeneration_;
+            }
+            uint32_t keyCount = 0u;
+            uint32_t runEnd = index;
+            const uint32_t multiplicityLimit = self->voiceManager
+                ? self->voiceManager->GetMaxVoices() : kMaxPolyphony;
+            while (runEnd < eventCount &&
+                   events[runEnd].type == RenderEventType::NoteOff) {
+                const RenderEvent& event = events[runEnd++];
+                if (event.channel >= kChannelCount || event.data1 >= kNoteCount)
+                    continue;
+                const uint32_t key =
+                    static_cast<uint32_t>(event.channel) * kNoteCount +
+                    event.data1;
+                if (self->noteOffBatchStamp_[key] != generation) {
+                    self->noteOffBatchStamp_[key] = generation;
+                    self->noteOffBatchCount_[key] = 0u;
+                    self->noteOffBatchKeys_[keyCount++] =
+                        static_cast<uint16_t>(key);
+                }
+                if (self->noteOffBatchCount_[key] < multiplicityLimit)
+                    ++self->noteOffBatchCount_[key];
+            }
+            for (uint32_t keyIndex = 0u; keyIndex < keyCount; ++keyIndex) {
+                const uint32_t key = self->noteOffBatchKeys_[keyIndex];
+                uint32_t remaining = self->noteOffBatchCount_[key];
+                const uint8_t channel = static_cast<uint8_t>(key / kNoteCount);
+                const uint8_t note = static_cast<uint8_t>(key % kNoteCount);
+                while (remaining != 0u) {
+                    const uint8_t batch = static_cast<uint8_t>(
+                        (std::min)(remaining, 255u));
+                    self->HandleStaleNoteOffBatch(channel, note, batch,
+                                                  blockCursor);
+                    remaining -= batch;
+                }
             }
             index = runEnd;
             continue;
