@@ -5,6 +5,12 @@
 
 namespace svms {
 
+struct SpanRetirement {
+    uint32_t handle;
+    uint32_t frameOffset;
+    uint32_t capturePosition;
+};
+
 // Backend-neutral span contract.  Explicit SSE2 and AVX2 implementations can
 // replace a class function without changing scheduling or voice ownership.
 struct RenderSpanContext {
@@ -18,6 +24,9 @@ struct RenderSpanContext {
     uint32_t voiceCapacity;
     uint32_t* classChangeHandles;
     uint32_t* classChangeCount;
+    const uint32_t* activePositions;
+    SpanRetirement* retirements;
+    uint32_t* retirementCount;
 };
 
 // A backend returns false without mutating state when it cannot safely consume

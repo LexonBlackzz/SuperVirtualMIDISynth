@@ -1,4 +1,5 @@
 #include "SVMSRenderKernels.h"
+#include "SVMSEnvelope.h"
 
 #include <algorithm>
 #include <cmath>
@@ -176,6 +177,401 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
     _mm256_zeroupper();
 }
 
+void RecordRetirement(const RenderSpanContext& c, uint32_t handle,
+                      uint32_t frameOffset) {
+    if (c.retirements != nullptr && c.retirementCount != nullptr &&
+        c.activePositions != nullptr) {
+        c.retirements[(*c.retirementCount)++] = {
+            handle, frameOffset, c.activePositions[handle]};
+    } else {
+        // Dense tile state is a disposable render snapshot. Authoritative
+        // lifecycle was already committed by the exact-frame planner.
+        c.voices->state[handle] = static_cast<uint8_t>(VoiceState::Free);
+    }
+}
+
+bool ValidateLoopVoice(const RenderSpanContext& c, uint32_t handle) {
+    const VoiceSoA& v = *c.voices;
+    return v.relEnd[handle] >= 2u &&
+        v.relLoopS[handle] < v.relLoopE[handle] &&
+        v.relLoopE[handle] <= v.relEnd[handle] &&
+        v.sampleStart[handle] < c.sampleDataFrames &&
+        v.relEnd[handle] <= c.sampleDataFrames - v.sampleStart[handle] &&
+        v.phaseIncs[handle] >= 0.0f &&
+        v.phaseIncs[handle] < v.relLoopEF[handle] - v.relLoopSF[handle];
+}
+
+uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
+                                       uint32_t handle) {
+    VoiceSoA& v = *c.voices;
+    if (!ValidateLoopVoice(c, handle)) {
+        return ScalarRenderSustainedLoop(
+            v, handle, c.sampleData, c.sampleDataFrames, c.outputLeft,
+            c.outputRight, c.frameStart, c.frameCount);
+    }
+
+    float phase = (std::max)(0.0f, v.phases[handle]);
+    const float step = v.phaseIncs[handle];
+    const float loopStart = v.relLoopSF[handle];
+    const float loopEnd = v.relLoopEF[handle];
+    const float loopLength = loopEnd - loopStart;
+    const float gainL = v.renderGainL[handle];
+    const float gainR = v.renderGainR[handle];
+    const float* region = c.sampleData + v.sampleStart[handle];
+    float* outL = c.outputLeft + c.frameStart;
+    float* outR = c.outputRight + c.frameStart;
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
+                                       4.0f, 5.0f, 6.0f, 7.0f);
+    const __m256 stepVector = _mm256_set1_ps(step);
+    const __m256 gainLVector = _mm256_set1_ps(gainL);
+    const __m256 gainRVector = _mm256_set1_ps(gainR);
+    const __m256i one = _mm256_set1_epi32(1);
+    uint32_t frame = 0u;
+
+    while (frame < c.frameCount) {
+        if (phase >= loopEnd) {
+            float overflow = phase - loopEnd;
+            if (overflow >= loopLength)
+                overflow -= std::floor(overflow / loopLength) * loopLength;
+            phase = loopStart + overflow;
+        }
+        const float lastPhase = phase + step * 7.0f;
+        if (frame + 8u <= c.frameCount && lastPhase < loopEnd - 1.0f) {
+            const __m256 phases = _mm256_add_ps(
+                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
+            const __m256i bases = _mm256_cvttps_epi32(phases);
+            const __m256 first = _mm256_i32gather_ps(region, bases, 4);
+            const __m256 second = _mm256_i32gather_ps(
+                region, _mm256_add_epi32(bases, one), 4);
+            const __m256 fraction = _mm256_sub_ps(
+                phases, _mm256_cvtepi32_ps(bases));
+            const __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outL + frame),
+                _mm256_mul_ps(sample, gainLVector)));
+            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outR + frame),
+                _mm256_mul_ps(sample, gainRVector)));
+            // Preserve the scalar cursor's repeated-add rounding.
+            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                phase += step;
+            frame += 8u;
+            continue;
+        }
+
+        uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= v.relEnd[handle]) {
+            phase = loopStart;
+            base = v.relLoopS[handle];
+        }
+        uint32_t next = base + 1u;
+        if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
+        const float fraction = phase - static_cast<float>(base);
+        const float first = region[base];
+        const float sample = first + (region[next] - first) * fraction;
+        outL[frame] += sample * gainL;
+        outR[frame] += sample * gainR;
+        phase += step;
+        ++frame;
+    }
+    // Match the existing AVX2 short-span cursor contract: wrapping happens
+    // before the next rendered sample, so the final increment may remain
+    // just past loopEnd in the stored snapshot.
+    v.phases[handle] = phase;
+    return UINT32_MAX;
+}
+
+uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
+                                 uint32_t handle) {
+    VoiceSoA& v = *c.voices;
+    if (!ValidateLoopVoice(c, handle)) return 0u;
+    float phase = (std::max)(0.0f, v.phases[handle]);
+    float gain = v.currentGain[handle];
+    uint32_t remaining = v.releaseSamplesRemaining[handle];
+    const float decay = v.releaseDecay[handle];
+    const float step = v.phaseIncs[handle];
+    const float loopStart = v.relLoopSF[handle];
+    const float loopEnd = v.relLoopEF[handle];
+    const float loopLength = loopEnd - loopStart;
+    const float mixL = v.mixGainL[handle];
+    const float mixR = v.mixGainR[handle];
+    const float* region = c.sampleData + v.sampleStart[handle];
+    float* outL = c.outputLeft + c.frameStart;
+    float* outR = c.outputRight + c.frameStart;
+    uint32_t retiredAt = UINT32_MAX;
+    for (uint32_t frame = 0u; frame < c.frameCount; ++frame) {
+        uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= v.relEnd[handle]) {
+            phase = loopStart;
+            base = v.relLoopS[handle];
+        }
+        uint32_t next = base + 1u;
+        if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
+        const float fraction = phase - static_cast<float>(base);
+        const float first = region[base];
+        const float sample = first + (region[next] - first) * fraction;
+        bool finished = remaining == 0u;
+        if (!finished) {
+            gain *= decay;
+            if (remaining != UINT32_MAX) {
+                --remaining;
+                finished = remaining == 0u;
+            }
+        }
+        outL[frame] += sample * gain * mixL;
+        outR[frame] += sample * gain * mixR;
+        phase += step;
+        if (phase >= loopEnd) {
+            float overflow = phase - loopEnd;
+            if (overflow >= loopLength)
+                overflow -= std::floor(overflow / loopLength) * loopLength;
+            phase = loopStart + overflow;
+        }
+        if (finished ||
+            (remaining == UINT32_MAX && gain < kVoiceRetireThreshold)) {
+            retiredAt = frame;
+            break;
+        }
+    }
+    v.phases[handle] = phase;
+    v.currentGain[handle] = gain;
+    v.releaseSamplesRemaining[handle] = remaining;
+    return retiredAt;
+}
+
+uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
+                                     uint32_t handle) {
+    VoiceSoA& v = *c.voices;
+    if (!ValidateLoopVoice(c, handle)) return 0u;
+    float phase = (std::max)(0.0f, v.phases[handle]);
+    float gain = v.currentGain[handle];
+    uint32_t remaining = v.releaseSamplesRemaining[handle];
+    const float decay = v.releaseDecay[handle];
+    const float step = v.phaseIncs[handle];
+    const float loopStart = v.relLoopSF[handle];
+    const float loopEnd = v.relLoopEF[handle];
+    const float loopLength = loopEnd - loopStart;
+    const float mixL = v.mixGainL[handle];
+    const float mixR = v.mixGainR[handle];
+    const float* region = c.sampleData + v.sampleStart[handle];
+    float* outL = c.outputLeft + c.frameStart;
+    float* outR = c.outputRight + c.frameStart;
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
+                                       4.0f, 5.0f, 6.0f, 7.0f);
+    const __m256 stepVector = _mm256_set1_ps(step);
+    const __m256i one = _mm256_set1_epi32(1);
+    uint32_t frame = 0u;
+    uint32_t retiredAt = UINT32_MAX;
+    while (frame < c.frameCount) {
+        if (phase >= loopEnd) {
+            float overflow = phase - loopEnd;
+            if (overflow >= loopLength)
+                overflow -= std::floor(overflow / loopLength) * loopLength;
+            phase = loopStart + overflow;
+        }
+        float futureGain = gain;
+        alignas(32) float gains[8];
+        for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
+            futureGain *= decay;
+            gains[laneIndex] = futureGain;
+        }
+        const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
+        const bool thresholdSafe = remaining != UINT32_MAX ||
+            gains[7] >= kVoiceRetireThreshold;
+        const float lastPhase = phase + step * 7.0f;
+        if (frame + 8u <= c.frameCount && countdownSafe && thresholdSafe &&
+            lastPhase < loopEnd - 1.0f) {
+            const __m256 phases = _mm256_add_ps(
+                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
+            const __m256i bases = _mm256_cvttps_epi32(phases);
+            const __m256 first = _mm256_i32gather_ps(region, bases, 4);
+            const __m256 second = _mm256_i32gather_ps(
+                region, _mm256_add_epi32(bases, one), 4);
+            const __m256 fraction = _mm256_sub_ps(
+                phases, _mm256_cvtepi32_ps(bases));
+            const __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
+            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outL + frame),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
+            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outR + frame),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+            gain = futureGain;
+            if (remaining != UINT32_MAX) remaining -= 8u;
+            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                phase += step;
+            frame += 8u;
+            continue;
+        }
+
+        uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= v.relEnd[handle]) {
+            phase = loopStart;
+            base = v.relLoopS[handle];
+        }
+        uint32_t next = base + 1u;
+        if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
+        const float fraction = phase - static_cast<float>(base);
+        const float first = region[base];
+        const float sample = first + (region[next] - first) * fraction;
+        bool finished = remaining == 0u;
+        if (!finished) {
+            gain *= decay;
+            if (remaining != UINT32_MAX) {
+                --remaining;
+                finished = remaining == 0u;
+            }
+        }
+        outL[frame] += sample * gain * mixL;
+        outR[frame] += sample * gain * mixR;
+        phase += step;
+        if (phase >= loopEnd) {
+            float overflow = phase - loopEnd;
+            if (overflow >= loopLength)
+                overflow -= std::floor(overflow / loopLength) * loopLength;
+            phase = loopStart + overflow;
+        }
+        if (finished ||
+            (remaining == UINT32_MAX && gain < kVoiceRetireThreshold)) {
+            retiredAt = frame;
+            break;
+        }
+        ++frame;
+    }
+    v.phases[handle] = phase;
+    v.currentGain[handle] = gain;
+    v.releaseSamplesRemaining[handle] = remaining;
+    return retiredAt;
+}
+
+void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
+                                const uint32_t* handles,
+                                uint32_t handleCount) {
+    VoiceSoA& v = *c.voices;
+    __m256 sumsL[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                       _mm256_setzero_ps(), _mm256_setzero_ps()};
+    __m256 sumsR[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                       _mm256_setzero_ps(), _mm256_setzero_ps()};
+    uint32_t position = 0u;
+    for (; position + 8u <= handleCount; position += 8u) {
+        const __m256i h = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(handles + position));
+        alignas(32) uint32_t hs[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
+        bool valid = true;
+        for (uint32_t lane = 0u; lane < 8u; ++lane) {
+            const uint32_t handle = hs[lane];
+            float finalGain = v.currentGain[handle];
+            for (uint32_t frame = 0u; frame < c.frameCount; ++frame)
+                finalGain *= v.releaseDecay[handle];
+            const uint32_t remaining = v.releaseSamplesRemaining[handle];
+            valid = valid && ValidateLoopVoice(c, handle) &&
+                (remaining == UINT32_MAX || remaining > c.frameCount) &&
+                (remaining != UINT32_MAX ||
+                 finalGain >= kVoiceRetireThreshold);
+        }
+        if (!valid) {
+            for (uint32_t lane = 0u; lane < 8u; ++lane) {
+                const uint32_t retiredAt = RenderReleaseLoopScalar(c, hs[lane]);
+                if (retiredAt != UINT32_MAX)
+                    RecordRetirement(c, hs[lane], retiredAt);
+            }
+            continue;
+        }
+
+        __m256 phase = _mm256_i32gather_ps(v.phases, h, 4);
+        phase = _mm256_max_ps(phase, _mm256_setzero_ps());
+        const __m256 step = _mm256_i32gather_ps(v.phaseIncs, h, 4);
+        __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
+        const __m256 decay = _mm256_i32gather_ps(v.releaseDecay, h, 4);
+        const __m256 mixL = _mm256_i32gather_ps(v.mixGainL, h, 4);
+        const __m256 mixR = _mm256_i32gather_ps(v.mixGainR, h, 4);
+        const __m256 loopStartF = _mm256_i32gather_ps(v.relLoopSF, h, 4);
+        const __m256 loopEndF = _mm256_i32gather_ps(v.relLoopEF, h, 4);
+        const __m256i sampleStart = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.sampleStart), h, 4);
+        const __m256i loopStart = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.relLoopS), h, 4);
+        const __m256i loopEnd = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.relLoopE), h, 4);
+        for (uint32_t frame = 0u; frame < c.frameCount; ++frame) {
+            const __m256 pastLoop = _mm256_cmp_ps(
+                phase, loopEndF, _CMP_GE_OQ);
+            phase = _mm256_blendv_ps(phase,
+                _mm256_add_ps(loopStartF, _mm256_sub_ps(phase, loopEndF)),
+                pastLoop);
+            const __m256i base = _mm256_cvttps_epi32(phase);
+            const __m256i nextRaw = _mm256_add_epi32(
+                base, _mm256_set1_epi32(1));
+            const __m256i wraps = _mm256_cmpgt_epi32(
+                nextRaw, _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
+            const __m256i next = _mm256_blendv_epi8(nextRaw, loopStart, wraps);
+            const __m256 first = _mm256_i32gather_ps(c.sampleData,
+                _mm256_add_epi32(sampleStart, base), 4);
+            const __m256 second = _mm256_i32gather_ps(c.sampleData,
+                _mm256_add_epi32(sampleStart, next), 4);
+            const __m256 fraction = _mm256_sub_ps(
+                phase, _mm256_cvtepi32_ps(base));
+            const __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            gain = _mm256_mul_ps(gain, decay);
+            const __m256 scaled = _mm256_mul_ps(sample, gain);
+            sumsL[frame] = _mm256_add_ps(
+                sumsL[frame], _mm256_mul_ps(scaled, mixL));
+            sumsR[frame] = _mm256_add_ps(
+                sumsR[frame], _mm256_mul_ps(scaled, mixR));
+            phase = _mm256_add_ps(phase, step);
+        }
+        const __m256 wrapped = _mm256_add_ps(
+            loopStartF, _mm256_sub_ps(phase, loopEndF));
+        phase = _mm256_blendv_ps(phase, wrapped,
+            _mm256_cmp_ps(phase, loopEndF, _CMP_GE_OQ));
+        alignas(32) float phases[8], gains[8];
+        _mm256_store_ps(phases, phase);
+        _mm256_store_ps(gains, gain);
+        for (uint32_t lane = 0u; lane < 8u; ++lane) {
+            const uint32_t handle = hs[lane];
+            v.phases[handle] = phases[lane];
+            v.currentGain[handle] = gains[lane];
+            if (v.releaseSamplesRemaining[handle] != UINT32_MAX)
+                v.releaseSamplesRemaining[handle] -= c.frameCount;
+        }
+    }
+    for (; position < handleCount; ++position) {
+        const uint32_t handle = handles[position];
+        const uint32_t retiredAt = RenderReleaseLoopScalar(c, handle);
+        if (retiredAt != UINT32_MAX)
+            RecordRetirement(c, handle, retiredAt);
+    }
+    for (uint32_t frame = 0u; frame < c.frameCount; ++frame) {
+        c.outputLeft[c.frameStart + frame] += HorizontalSum(sumsL[frame]);
+        c.outputRight[c.frameStart + frame] += HorizontalSum(sumsR[frame]);
+    }
+}
+
+bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
+                           const uint32_t* handles,
+                           uint32_t handleCount) {
+    if (context.frameCount == 0u || context.sampleData == nullptr) return true;
+    if (context.frameCount <= 4u) {
+        RenderReleaseLoopShortAVX2(context, handles, handleCount);
+        _mm256_zeroupper();
+        return true;
+    }
+    for (uint32_t position = 0u; position < handleCount; ++position) {
+        const uint32_t handle = handles[position];
+        const uint32_t retiredAt = RenderReleaseLoopFramesAVX2(
+            context, handle);
+        if (retiredAt != UINT32_MAX)
+            RecordRetirement(context, handle, retiredAt);
+    }
+    _mm256_zeroupper();
+    return true;
+}
+
 bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                              const uint32_t* handles,
                              uint32_t handleCount) {
@@ -183,9 +579,7 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     if (context.frameCount > 4u) {
         for (uint32_t i = 0; i < handleCount; ++i) {
-            ScalarRenderSustainedLoop(v, handles[i], context.sampleData,
-                context.sampleDataFrames, context.outputLeft,
-                context.outputRight, context.frameStart, context.frameCount);
+            RenderSustainedLoopFramesAVX2(context, handles[i]);
         }
         _mm256_zeroupper();
         return true;
@@ -333,6 +727,8 @@ const RenderKernelSet& GetAVX2RenderKernelSet() {
         RenderKernelSet result{};
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::SustainedLoop)] =
             RenderSustainedLoopAVX2;
+        result.kernels[static_cast<uint32_t>(VoiceRenderClass::ReleaseLoop)] =
+            RenderReleaseLoopAVX2;
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientLoop)] =
             ScalarRenderTransientLoopClass;
         result.backend = RenderBackend::AVX2;

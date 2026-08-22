@@ -172,12 +172,6 @@ using EventDispatcher = void(*)(const RenderEvent& event, uint32_t blockCursor,
 using EventBatchDispatcher = void(*)(const RenderEvent* events, uint32_t eventCount,
                                      uint32_t blockCursor, void* userData);
 
-struct SpanRetirement {
-    uint32_t handle;
-    uint32_t frameOffset;
-    uint32_t capturePosition;
-};
-
 constexpr uint32_t kDenseRenderChunkFrames = 128u;
 constexpr uint32_t kDenseRenderHandlesPerTile = 256u;
 constexpr uint32_t kDenseRenderMaximumVoices = 8192u;
@@ -2025,7 +2019,7 @@ inline void RenderScalar::RenderDenseVoiceTile(
             const RenderSpanContext context{
                 &v, denseSampleData_, denseSampleDataFrames_, outputLeft,
                 outputRight, cursor, spanFrames, v.GetCapacity(), nullptr,
-                nullptr};
+                nullptr, nullptr, nullptr, nullptr};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
             if (kernel && kernel(context, classHandles[classIndex], count))
                 continue;
@@ -2480,7 +2474,8 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             const RenderSpanContext context{
                 &v, sampleData, sampleDataFrames, outputLeft, outputRight,
                 cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
-                &classChangeCount};
+                &classChangeCount, voices.activePosition_, retirements_,
+                &retireCount};
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
             if (coverageProfilingEnabled_ &&
                 renderClass == VoiceRenderClass::SustainedLoop) {
