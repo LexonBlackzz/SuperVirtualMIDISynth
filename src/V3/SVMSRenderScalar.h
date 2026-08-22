@@ -1825,16 +1825,15 @@ inline bool RenderScalar::AdvanceDenseHandleTo(
 
 inline bool RenderScalar::AdvanceDenseReleaseStateTo(
     VoiceManager& voices, uint32_t handle, uint32_t frameOffset) {
-    if (handle >= voices.GetMaxVoices() ||
-        voices.v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) {
-        return false;
-    }
     VoiceSoA& v = voices.v;
-    if (v.state[handle] != static_cast<uint8_t>(VoiceState::Releasing) ||
-        v.loopEnabled[handle] == 0u ||
-        v.stealFadeInFramesRemaining[handle] != 0u) {
-        return AdvanceDenseHandleTo(voices, handle, frameOffset);
-    }
+    // This helper consumes a snapshot of the ReleaseLoop render class.  Its
+    // class invariants guarantee a live, looping release without a steal
+    // fade, so repeating those checks for every voice and event frame only
+    // bloats the hottest dense-launch loop.
+    assert(handle < voices.GetMaxVoices());
+    assert(v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing));
+    assert(v.loopEnabled[handle] != 0u);
+    assert(v.stealFadeInFramesRemaining[handle] == 0u);
     const uint32_t previous = denseLastAdvancedFrames_[handle];
     if (frameOffset <= previous) return true;
 
@@ -1843,7 +1842,21 @@ inline bool RenderScalar::AdvanceDenseReleaseStateTo(
     const float releaseDecay = v.releaseDecay[handle];
     const uint32_t frameCount = frameOffset - previous;
     uint32_t retiredAt = UINT32_MAX;
-    for (uint32_t n = 0u; n < frameCount; ++n) {
+    if (frameCount == 1u) {
+        bool releaseFinished = releaseRemaining == 0u;
+        if (!releaseFinished) {
+            gain *= releaseDecay;
+            if (releaseRemaining != UINT32_MAX) {
+                --releaseRemaining;
+                releaseFinished = releaseRemaining == 0u;
+            }
+        }
+        if (releaseFinished ||
+            (releaseRemaining == UINT32_MAX &&
+             gain < kVoiceRetireThreshold)) {
+            retiredAt = 0u;
+        }
+    } else for (uint32_t n = 0u; n < frameCount; ++n) {
         bool releaseFinished = false;
         if (releaseRemaining == 0u) {
             releaseFinished = true;
