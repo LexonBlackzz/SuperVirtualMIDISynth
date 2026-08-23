@@ -33,6 +33,8 @@
 #include "SVMSPostFilter.h"
 #include "SVMSLimiter.h"
 #include "SVMSRuntimeLink.h"
+#include "SVMSBuildInfo.h"
+#include "include/svmsapi.h"
 
 // ── Logging ────────────────────────────────────────────────────────────
 
@@ -1933,6 +1935,7 @@ public:
     const LegacyDriverDebugInfo* GetLegacyDebugInfo() const;
 
     void SubmitShortMsg(uint32_t msg);
+    void SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp);
     void SubmitSystemExclusive(const uint8_t* data, uint32_t size);
 
     bool initialized;
@@ -1963,7 +1966,6 @@ private:
                              uint32_t blockOffset);
     void HandleProgramChange(uint8_t channel, uint8_t program);
     void HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb);
-    void SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp);
     void EventCompilerLoop();
     uint32_t ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
                                 uint8_t velocity,
@@ -4969,6 +4971,10 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
 } // namespace svms
 
 static svms::Driver* g_driver = nullptr;
+static CRITICAL_SECTION g_frontendLock;
+static std::atomic<uint32_t> g_winmmOwners{0u};
+static std::atomic<uint32_t> g_nativeOwners{0u};
+static std::atomic<bool> g_kdmapiInitialized{false};
 static const HMIDIOUT kSVMSMidiOutHandle = reinterpret_cast<HMIDIOUT>(0x1234);
 static DWORD_PTR g_midiOutCallback = 0u;
 static DWORD_PTR g_midiOutInstance = 0u;
@@ -5025,6 +5031,9 @@ static bool IsSupportedMidiOutputDevice(UINT_PTR deviceId) {
 }
 
 extern "C" {
+
+static bool EnsureDriverInitialized();
+static void MaybeShutdownDriver();
 
 BOOL WINAPI PlaySoundA(LPCSTR pszSound, HMODULE hmod, DWORD fdwSound) {
     using Proc = BOOL (WINAPI*)(LPCSTR, HMODULE, DWORD);
@@ -5087,30 +5096,12 @@ MMRESULT WINAPI midiOutOpen(LPHMIDIOUT phmo, UINT uDeviceID,
     }
     if (!phmo) return MMSYSERR_INVALPARAM;
 
-    if (!g_driver || !g_driver->initialized) {
-        if (g_driver) { g_driver->Shutdown(); g_driver = nullptr; }
-        g_driver = &svms::Driver::Instance();
-        if (!g_driver->Initialize()) {
-            LOG("midiOutOpen: Initialize FAILED");
-            XPBootstrapTrace("[SVMS XP] engine initialization FAILED\r\n");
-#if !defined(SVMS_XP_COMPAT)
-            g_driver->Shutdown();
-            g_driver = nullptr;
-#endif
-            return MMSYSERR_NOMEM;
-        }
-    }
-
-    const bool loaded = g_driver->LoadConfiguredSoundFont();
-
-    LOG("midiOutOpen: SF loaded=%d", loaded);
-    if (!g_driver->StartAudio()) {
-        LOG("midiOutOpen: audio start FAILED");
-#if !defined(SVMS_XP_COMPAT)
-        g_driver->Shutdown();
-        g_driver = nullptr;
-#endif
-        return MMSYSERR_ERROR;
+    g_winmmOwners.fetch_add(1u, std::memory_order_acq_rel);
+    if (!EnsureDriverInitialized()) {
+        g_winmmOwners.fetch_sub(1u, std::memory_order_acq_rel);
+        LOG("midiOutOpen: engine start FAILED");
+        XPBootstrapTrace("[SVMS XP] engine initialization FAILED\r\n");
+        return MMSYSERR_NOMEM;
     }
 
     LOG("midiOutOpen: SUCCESS, returning handle");
@@ -5126,7 +5117,11 @@ MMRESULT WINAPI midiOutOpen(LPHMIDIOUT phmo, UINT uDeviceID,
 MMRESULT WINAPI midiOutClose(HMIDIOUT hmo) {
     if (hmo != kSVMSMidiOutHandle) return MMSYSERR_INVALHANDLE;
     XPBootstrapTrace("[SVMS XP] midiOutClose reached\r\n");
-    if (g_driver) { g_driver->Shutdown(); g_driver = nullptr; }
+    uint32_t owners = g_winmmOwners.load(std::memory_order_acquire);
+    while (owners != 0u && !g_winmmOwners.compare_exchange_weak(
+        owners, owners - 1u, std::memory_order_acq_rel,
+        std::memory_order_acquire)) {}
+    MaybeShutdownDriver();
     NotifyMidiOutClient(MOM_CLOSE);
     g_midiOutCallback = 0u;
     g_midiOutInstance = 0u;
@@ -5261,10 +5256,12 @@ MMRESULT WINAPI midiOutMessage(HMIDIOUT hmo, UINT uMsg, DWORD_PTR dw1, DWORD_PTR
 
 // ── KDMAPI / OmniMIDI extensions ──────────────────────────────────────
 
-static bool g_kdmapiInitialized = false;
-
 static bool EnsureDriverInitialized() {
-    if (g_driver && g_driver->initialized) return true;
+    EnterCriticalSection(&g_frontendLock);
+    if (g_driver && g_driver->initialized) {
+        LeaveCriticalSection(&g_frontendLock);
+        return true;
+    }
     if (g_driver) { g_driver->Shutdown(); g_driver = nullptr; }
     g_driver = &svms::Driver::Instance();
     if (!g_driver->Initialize()) {
@@ -5274,10 +5271,229 @@ static bool EnsureDriverInitialized() {
         g_driver->Shutdown();
         g_driver = nullptr;
 #endif
+        LeaveCriticalSection(&g_frontendLock);
         return false;
     }
     g_driver->LoadConfiguredSoundFont();
-    return g_driver->StartAudio();
+    const bool started = g_driver->StartAudio();
+    LeaveCriticalSection(&g_frontendLock);
+    return started;
+}
+
+static void MaybeShutdownDriver() {
+    if (g_winmmOwners.load(std::memory_order_acquire) != 0u ||
+        g_nativeOwners.load(std::memory_order_acquire) != 0u ||
+        g_kdmapiInitialized.load(std::memory_order_acquire))
+        return;
+    EnterCriticalSection(&g_frontendLock);
+    if (g_winmmOwners.load(std::memory_order_acquire) == 0u &&
+        g_nativeOwners.load(std::memory_order_acquire) == 0u &&
+        !g_kdmapiInitialized.load(std::memory_order_acquire) && g_driver) {
+        g_driver->Shutdown();
+        g_driver = nullptr;
+    }
+    LeaveCriticalSection(&g_frontendLock);
+}
+
+// â”€â”€ Native SVMS API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+static constexpr uint32_t kNativeSessionCapacity = 64u;
+static std::atomic<uint64_t> g_nativeSessions[kNativeSessionCapacity]{};
+static std::atomic<uint32_t> g_nativeSessionGeneration{1u};
+
+static bool NativeSessionIsValid(SVMS_Session session) {
+    const uint32_t encodedIndex = static_cast<uint32_t>(session);
+    if (encodedIndex == 0u || encodedIndex > kNativeSessionCapacity)
+        return false;
+    return g_nativeSessions[encodedIndex - 1u].load(
+        std::memory_order_acquire) == session;
+}
+
+static SVMS_Result SVMS_CALL NativeCreateSession(
+    const SVMS_SessionConfig* config, SVMS_Session* outSession) {
+    if (!outSession) return SVMS_RESULT_INVALID_ARGUMENT;
+    *outSession = 0u;
+    if (config) {
+        if (config->struct_size < 16u ||
+            config->struct_version != SVMS_STRUCT_VERSION_1 ||
+            config->flags != 0u)
+            return SVMS_RESULT_INVALID_ARGUMENT;
+    }
+
+    // Reserve engine ownership before initialization so another frontend
+    // cannot shut the shared runtime down between StartAudio and slot publish.
+    g_nativeOwners.fetch_add(1u, std::memory_order_acq_rel);
+    if (!EnsureDriverInitialized()) {
+        g_nativeOwners.fetch_sub(1u, std::memory_order_acq_rel);
+        return SVMS_RESULT_INTERNAL_ERROR;
+    }
+
+    uint32_t generation = g_nativeSessionGeneration.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    if (generation == 0u)
+        generation = g_nativeSessionGeneration.fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+    for (uint32_t i = 0u; i < kNativeSessionCapacity; ++i) {
+        const uint64_t token = (static_cast<uint64_t>(generation) << 32u) |
+                               static_cast<uint64_t>(i + 1u);
+        uint64_t empty = 0u;
+        if (g_nativeSessions[i].compare_exchange_strong(
+                empty, token, std::memory_order_release,
+                std::memory_order_relaxed)) {
+            *outSession = token;
+            return SVMS_RESULT_OK;
+        }
+    }
+    g_nativeOwners.fetch_sub(1u, std::memory_order_acq_rel);
+    MaybeShutdownDriver();
+    return SVMS_RESULT_NO_RESOURCES;
+}
+
+static SVMS_Result SVMS_CALL NativeDestroySession(SVMS_Session session) {
+    const uint32_t encodedIndex = static_cast<uint32_t>(session);
+    if (encodedIndex == 0u || encodedIndex > kNativeSessionCapacity)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    uint64_t expected = session;
+    if (!g_nativeSessions[encodedIndex - 1u].compare_exchange_strong(
+            expected, 0u, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    g_nativeOwners.fetch_sub(1u, std::memory_order_acq_rel);
+    MaybeShutdownDriver();
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeSendShort(SVMS_Session session,
+                                              uint32_t message) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    g_driver->SubmitShortMsg(message);
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeSendShortAtQpc(
+    SVMS_Session session, uint32_t message, uint64_t timestampQpc) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (timestampQpc == 0u) g_driver->SubmitShortMsg(message);
+    else g_driver->SubmitShortMsgAtQpc(message, timestampQpc);
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeSendShortBatch(
+    SVMS_Session session, const SVMS_ShortEvent* events,
+    uint32_t eventCount) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!events && eventCount != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        if (events[i].reserved != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
+        if (events[i].timestamp_qpc == 0u)
+            g_driver->SubmitShortMsg(events[i].packed_message);
+        else
+            g_driver->SubmitShortMsgAtQpc(events[i].packed_message,
+                                          events[i].timestamp_qpc);
+    }
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeSendSystemExclusive(
+    SVMS_Session session, const uint8_t* data, uint32_t size) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!data || size < 2u || data[0] != 0xf0u || data[size - 1u] != 0xf7u)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    g_driver->SubmitSystemExclusive(data, size);
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeReset(SVMS_Session session) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    g_driver->ResetAllVoices();
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeGetTelemetry(
+    SVMS_Session session, SVMS_TelemetryV1* telemetry) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!telemetry || telemetry->struct_size < sizeof(SVMS_TelemetryV1) ||
+        telemetry->struct_version != SVMS_STRUCT_VERSION_1)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    svms::DriverDebugInfo debug{};
+    svms::SnappyVoiceStatistics voices{};
+    g_driver->CopyDebugInfo(debug);
+    g_driver->CopyVoiceStatistics(voices);
+    SVMS_TelemetryV1 result{};
+    result.struct_size = sizeof(result);
+    result.struct_version = SVMS_STRUCT_VERSION_1;
+    result.callback_count = debug.callbackCount;
+    result.submitted_events = debug.submitted;
+    result.accepted_events = debug.accepted;
+    result.dispatched_events = debug.dispatched;
+    result.note_ons = debug.noteOns;
+    result.matched_regions = debug.matchedRegions;
+    result.configured_voices = debug.configuredVoices;
+    result.voice_steals = voices.voiceSteals;
+    result.active_voices = voices.activeVoices;
+    result.free_voices = voices.freeVoices;
+    result.sample_rate = g_driver->sampleRate;
+    result.buffer_frames = g_driver->bufferFrames;
+    result.soundfont_loaded = debug.soundFontLoaded;
+    result.audio_running = debug.audioRunning;
+    result.render_time_ms = g_driver->GetRenderingTimeMilliseconds();
+    result.render_peak = debug.renderPeak;
+    *telemetry = result;
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeGetRuntimeClock(
+    uint64_t* qpcNow, uint64_t* qpcFrequency) {
+    if (!qpcNow || !qpcFrequency) return SVMS_RESULT_INVALID_ARGUMENT;
+    LARGE_INTEGER now{}, frequency{};
+    if (!QueryPerformanceCounter(&now) || !QueryPerformanceFrequency(&frequency))
+        return SVMS_RESULT_INTERNAL_ERROR;
+    *qpcNow = static_cast<uint64_t>(now.QuadPart);
+    *qpcFrequency = static_cast<uint64_t>(frequency.QuadPart);
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result SVMS_CALL SVMS_GetInterface(
+    uint32_t requestedAbi, uint32_t callerTableSize,
+    SVMS_Interface* outInterface) {
+    constexpr uint32_t minimumSize = static_cast<uint32_t>(
+        offsetof(SVMS_Interface, get_runtime_clock) +
+        sizeof(SVMS_GetRuntimeClockFn));
+    if (!outInterface || callerTableSize < minimumSize)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    if (requestedAbi != SVMS_ABI_VERSION_1)
+        return SVMS_RESULT_UNSUPPORTED_ABI;
+
+    SVMS_Interface table{};
+    table.struct_size = sizeof(table);
+    table.struct_version = SVMS_STRUCT_VERSION_1;
+    table.abi_version = SVMS_ABI_VERSION_1;
+    table.capabilities = SVMS_CAP_EXACT_QPC_TIMESTAMPS |
+        SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_SYSTEM_EXCLUSIVE |
+        SVMS_CAP_TELEMETRY_V1 | SVMS_CAP_KDMAPI_FACADE;
+    table.product_major = svms::build::kProductMajor;
+    table.product_minor = svms::build::kProductMinor;
+    table.product_patch = svms::build::kProductPatch;
+    table.build_number = svms::build::kBuildNumber;
+    table.create_session = NativeCreateSession;
+    table.destroy_session = NativeDestroySession;
+    table.send_short = NativeSendShort;
+    table.send_short_at_qpc = NativeSendShortAtQpc;
+    table.send_short_batch = NativeSendShortBatch;
+    table.send_system_exclusive = NativeSendSystemExclusive;
+    table.reset = NativeReset;
+    table.get_telemetry = NativeGetTelemetry;
+    table.get_runtime_clock = NativeGetRuntimeClock;
+    std::memcpy(outInterface, &table,
+                (std::min)(callerTableSize,
+                           static_cast<uint32_t>(sizeof(table))));
+    return SVMS_RESULT_OK;
 }
 
 BOOL WINAPI IsKDMAPIAvailable(void) {
@@ -5286,14 +5502,19 @@ BOOL WINAPI IsKDMAPIAvailable(void) {
 }
 
 LPVOID WINAPI InitializeKDMAPIStream(void) {
-    if (!EnsureDriverInitialized()) return nullptr;
-    g_kdmapiInitialized = true;
+    const bool wasInitialized = g_kdmapiInitialized.exchange(
+        true, std::memory_order_acq_rel);
+    if (!EnsureDriverInitialized()) {
+        if (!wasInitialized)
+            g_kdmapiInitialized.store(false, std::memory_order_release);
+        return nullptr;
+    }
     return reinterpret_cast<LPVOID>(1);
 }
 
 void WINAPI TerminateKDMAPIStream(void) {
-    if (g_driver) { g_driver->Shutdown(); g_driver = nullptr; }
-    g_kdmapiInitialized = false;
+    g_kdmapiInitialized.store(false, std::memory_order_release);
+    MaybeShutdownDriver();
 }
 
 void WINAPI ResetKDMAPIStream(void) {
@@ -5309,7 +5530,7 @@ UINT WINAPI ReturnKDMAPIVer(LPDWORD pdwMajor, LPDWORD pdwMinor, LPDWORD pdwBuild
 }
 
 void WINAPI SendDirectData(DWORD dwMsg) {
-    if (!g_kdmapiInitialized) return;
+    if (!g_kdmapiInitialized.load(std::memory_order_acquire)) return;
     if (g_driver) g_driver->SubmitShortMsg(dwMsg);
 }
 
@@ -5319,13 +5540,13 @@ void WINAPI SendDirectDataNoBuf(DWORD dwMsg) {
 
 UINT WINAPI SendCustomEvent(DWORD dwEvent, LPVOID pData, DWORD dwSize) {
     (void)pData; (void)dwSize;
-    if (!g_kdmapiInitialized) return 0;
+    if (!g_kdmapiInitialized.load(std::memory_order_acquire)) return 0;
     if (g_driver) g_driver->SubmitShortMsg(static_cast<DWORD>(dwEvent));
     return 1;
 }
 
 UINT WINAPI SendDirectLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    if (!g_kdmapiInitialized || !g_driver ||
+    if (!g_kdmapiInitialized.load(std::memory_order_acquire) || !g_driver ||
         !HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr) ||
         (!lpMidiHdr->lpData && lpMidiHdr->dwBufferLength != 0u))
         return MMSYSERR_INVALPARAM;
@@ -5338,7 +5559,8 @@ UINT WINAPI SendDirectLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
 }
 
 UINT WINAPI SendDirectLongDataNoBuf(LPSTR data, DWORD size) {
-    if (!g_kdmapiInitialized || !g_driver || (!data && size != 0u))
+    if (!g_kdmapiInitialized.load(std::memory_order_acquire) || !g_driver ||
+        (!data && size != 0u))
         return MMSYSERR_INVALPARAM;
     g_driver->SubmitSystemExclusive(
         reinterpret_cast<const uint8_t*>(data), size);
@@ -5959,6 +6181,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)hinstDLL; (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
+        InitializeCriticalSection(&g_frontendLock);
         XPBootstrapTrace("[SVMS XP] V3 winmm.dll loaded\r\n");
         LogInit();
         LOG("DLL_PROCESS_ATTACH");

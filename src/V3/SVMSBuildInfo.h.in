@@ -49,7 +49,8 @@ enum Capability : std::uint64_t {
 inline constexpr std::uint64_t kDriverCapabilities =
     @SVMS_DRIVER_RUNTIME_CAPABILITIES@ | CapabilityLiveConfiguration |
     CapabilityTelemetry | CapabilitySafeVoiceLimit |
-    CapabilitySoundFontReload | CapabilityKdmapiFacade;
+    CapabilitySoundFontReload | CapabilityKdmapiFacade |
+    CapabilityNativeApiV1;
 
 inline constexpr std::uint64_t kConfiguratorCapabilities =
     CapabilityRuntimeLinkV2 | CapabilityLiveConfiguration |
