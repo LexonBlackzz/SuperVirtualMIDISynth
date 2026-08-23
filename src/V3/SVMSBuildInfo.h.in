@@ -1,0 +1,59 @@
+#ifndef SVMS_BUILD_INFO_H
+#define SVMS_BUILD_INFO_H
+
+#include <cstdint>
+
+#define SVMS_PRODUCT_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define SVMS_PRODUCT_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define SVMS_PRODUCT_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define SVMS_BUILD_NUMBER @SVMS_BUILD_NUMBER@u
+#define SVMS_PRODUCT_VERSION_STRING "@PROJECT_VERSION@"
+#define SVMS_PRODUCT_VERSION_WSTRING L"@PROJECT_VERSION@"
+#define SVMS_RELEASE_CHANNEL_STRING "@SVMS_RELEASE_CHANNEL@"
+#define SVMS_RELEASE_CHANNEL_WSTRING L"@SVMS_RELEASE_CHANNEL@"
+#define SVMS_GIT_COMMIT_STRING "@SVMS_GIT_COMMIT@"
+#define SVMS_GIT_COMMIT_WSTRING L"@SVMS_GIT_COMMIT@"
+
+namespace svms::build {
+
+inline constexpr std::uint32_t kProductMajor = SVMS_PRODUCT_VERSION_MAJOR;
+inline constexpr std::uint32_t kProductMinor = SVMS_PRODUCT_VERSION_MINOR;
+inline constexpr std::uint32_t kProductPatch = SVMS_PRODUCT_VERSION_PATCH;
+inline constexpr std::uint32_t kBuildNumber = SVMS_BUILD_NUMBER;
+inline constexpr const char* kProductVersion = SVMS_PRODUCT_VERSION_STRING;
+inline constexpr const wchar_t* kProductVersionWide =
+    SVMS_PRODUCT_VERSION_WSTRING;
+inline constexpr const char* kReleaseChannel = SVMS_RELEASE_CHANNEL_STRING;
+inline constexpr const char* kGitCommit = SVMS_GIT_COMMIT_STRING;
+
+inline constexpr std::uint32_t kRuntimeProtocolMin =
+    @SVMS_RUNTIME_PROTOCOL_MIN@u;
+inline constexpr std::uint32_t kRuntimeProtocolMax =
+    @SVMS_RUNTIME_PROTOCOL_MAX@u;
+inline constexpr std::uint32_t kNativeAbiMin = @SVMS_NATIVE_ABI_MIN@u;
+inline constexpr std::uint32_t kNativeAbiMax = @SVMS_NATIVE_ABI_MAX@u;
+
+enum Capability : std::uint64_t {
+    CapabilityRuntimeLinkV2      = 1ull << 0,
+    CapabilityLiveConfiguration = 1ull << 1,
+    CapabilityTelemetry         = 1ull << 2,
+    CapabilitySafeVoiceLimit    = 1ull << 3,
+    CapabilitySoundFontReload   = 1ull << 4,
+    CapabilityKdmapiFacade      = 1ull << 5,
+    CapabilityRuntimeLinkV3     = 1ull << 6,
+    CapabilityNativeApiV1       = 1ull << 7,
+};
+
+inline constexpr std::uint64_t kDriverCapabilities =
+    CapabilityRuntimeLinkV2 | CapabilityLiveConfiguration |
+    CapabilityTelemetry | CapabilitySafeVoiceLimit |
+    CapabilitySoundFontReload | CapabilityKdmapiFacade;
+
+inline constexpr std::uint64_t kConfiguratorCapabilities =
+    CapabilityRuntimeLinkV2 | CapabilityLiveConfiguration |
+    CapabilityTelemetry | CapabilitySafeVoiceLimit |
+    CapabilitySoundFontReload;
+
+} // namespace svms::build
+
+#endif

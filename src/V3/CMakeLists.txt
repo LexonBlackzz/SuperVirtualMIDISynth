@@ -1,7 +1,79 @@
 cmake_minimum_required(VERSION 3.20)
-project(SuperVirtualMIDISynthV3 LANGUAGES CXX)
+project(SuperVirtualMIDISynthV3 VERSION 0.7.0 LANGUAGES CXX)
 
 include(CTest)
+
+if(WIN32)
+    enable_language(RC)
+endif()
+
+# One generated identity is consumed by every V3 component. Official release
+# automation supplies SVMS_BUILD_NUMBER and SVMS_RELEASE_CHANNEL explicitly;
+# local builds remain recognizable without depending on mutable git history.
+set(SVMS_BUILD_NUMBER "$ENV{GITHUB_RUN_NUMBER}" CACHE STRING
+    "Monotonic official build number (0 for local builds)")
+if(SVMS_BUILD_NUMBER STREQUAL "")
+    set(SVMS_BUILD_NUMBER "0" CACHE STRING
+        "Monotonic official build number (0 for local builds)" FORCE)
+endif()
+if(NOT SVMS_BUILD_NUMBER MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "SVMS_BUILD_NUMBER must be an unsigned integer")
+endif()
+if(SVMS_BUILD_NUMBER GREATER 4294967295)
+    message(FATAL_ERROR "SVMS_BUILD_NUMBER must fit in an unsigned 32-bit integer")
+endif()
+
+set(SVMS_RELEASE_CHANNEL "" CACHE STRING
+    "Release channel: stable, prerelease, or local")
+if(SVMS_RELEASE_CHANNEL STREQUAL "")
+    if(SVMS_BUILD_NUMBER STREQUAL "0")
+        set(SVMS_RELEASE_CHANNEL "local")
+    else()
+        set(SVMS_RELEASE_CHANNEL "stable")
+    endif()
+endif()
+if(NOT SVMS_RELEASE_CHANNEL MATCHES "^(stable|prerelease|local)$")
+    message(FATAL_ERROR
+        "SVMS_RELEASE_CHANNEL must be stable, prerelease, or local")
+endif()
+
+execute_process(
+    COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    OUTPUT_VARIABLE SVMS_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE SVMS_GIT_RESULT)
+if(NOT SVMS_GIT_RESULT EQUAL 0 OR SVMS_GIT_COMMIT STREQUAL "")
+    set(SVMS_GIT_COMMIT "unknown")
+endif()
+
+set(SVMS_RUNTIME_PROTOCOL_MIN 2)
+set(SVMS_RUNTIME_PROTOCOL_MAX 2)
+set(SVMS_NATIVE_ABI_MIN 0)
+set(SVMS_NATIVE_ABI_MAX 0)
+set(SVMS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${SVMS_GENERATED_DIR}")
+configure_file(SVMSBuildInfo.h.in
+    "${SVMS_GENERATED_DIR}/SVMSBuildInfo.h" @ONLY)
+include_directories("${SVMS_GENERATED_DIR}")
+
+if(WIN32)
+    math(EXPR SVMS_RESOURCE_BUILD_NUMBER "${SVMS_BUILD_NUMBER} % 65536")
+    set(SVMS_RESOURCE_FILENAME "winmm.dll")
+    set(SVMS_RESOURCE_DESCRIPTION
+        "SuperVirtualMIDISynth V3 WinMM/KDMAPI Driver")
+    set(SVMS_RESOURCE_FILETYPE "VFT_DLL")
+    configure_file(SVMSVersion.rc.in
+        "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc" @ONLY)
+
+    set(SVMS_RESOURCE_FILENAME "SVMSConfigurator.exe")
+    set(SVMS_RESOURCE_DESCRIPTION
+        "SuperVirtualMIDISynth V3 Configurator")
+    set(SVMS_RESOURCE_FILETYPE "VFT_APP")
+    configure_file(SVMSVersion.rc.in
+        "${SVMS_GENERATED_DIR}/SVMSConfiguratorVersion.rc" @ONLY)
+endif()
 
 option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
 if(SVMS_XP_COMPAT AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -171,7 +243,8 @@ set(HEADERS
     SVMSLimiter.h
 )
 
-add_library(svmsynth SHARED ${SOURCES} ${HEADERS})
+add_library(svmsynth SHARED ${SOURCES} ${HEADERS}
+    "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc")
 
 if(MSVC)
     set_source_files_properties(SVMSRenderKernelsSSE2.cpp PROPERTIES
@@ -380,6 +453,7 @@ if(NOT SVMS_XP_COMPAT)
     add_executable(svms_v3_configurator WIN32
         ${IMGUI_SOURCES}
         ${CONFIGURATOR_SOURCES}
+        "${SVMS_GENERATED_DIR}/SVMSConfiguratorVersion.rc"
     )
     target_include_directories(svms_v3_configurator PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"

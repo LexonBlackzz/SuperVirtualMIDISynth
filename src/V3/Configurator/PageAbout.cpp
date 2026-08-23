@@ -1,6 +1,7 @@
 #include "PageAbout.h"
 #include "ConfigDocument.h"
 #include "Widgets.h"
+#include "SVMSBuildInfo.h"
 #include "imgui.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -34,6 +35,11 @@ void DrawAboutPage(ConfigDocument& doc) {
 #endif
 
     ImGui::Text("Config schema version: 1");
+    ImGui::Text("Version: %s (build %u, %s)",
+                svms::build::kProductVersion,
+                svms::build::kBuildNumber,
+                svms::build::kReleaseChannel);
+    ImGui::TextDisabled("Source: %s", svms::build::kGitCommit);
 
     auto path = doc.GetActivePath();
     if (!path.empty()) {

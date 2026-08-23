@@ -1,4 +1,5 @@
 #include "SVMSDiagWindow.h"
+#include "SVMSBuildInfo.h"
 #include <windows.h>
 #include <cstdio>
 #include <cwchar>
@@ -122,7 +123,12 @@ static void OnPaint(HWND hwnd) {
     SelectObject(memDC, g_fontTitle);
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, kTextTitle);
-    TextOutW(memDC, kPadX, kPadY, L"SuperVirtualMIDISynth V3", 25);
+    wchar_t title[160];
+    std::swprintf(title, sizeof(title) / sizeof(title[0]),
+                  L"SuperVirtualMIDISynth V3 %ls (build %u, %ls)",
+                  build::kProductVersionWide, build::kBuildNumber,
+                  SVMS_RELEASE_CHANNEL_WSTRING);
+    TextOutW(memDC, kPadX, kPadY, title, static_cast<int>(std::wcslen(title)));
 
     SelectObject(memDC, g_font);
     int y = kPadY + 28;

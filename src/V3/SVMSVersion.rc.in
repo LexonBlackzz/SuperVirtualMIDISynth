@@ -1,0 +1,35 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,@SVMS_RESOURCE_BUILD_NUMBER@
+ PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,@SVMS_RESOURCE_BUILD_NUMBER@
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE @SVMS_RESOURCE_FILETYPE@
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "SuperVirtualMIDISynth contributors\0"
+            VALUE "FileDescription", "@SVMS_RESOURCE_DESCRIPTION@\0"
+            VALUE "FileVersion", "@PROJECT_VERSION@ build @SVMS_BUILD_NUMBER@ (@SVMS_RELEASE_CHANNEL@)\0"
+            VALUE "InternalName", "@SVMS_RESOURCE_FILENAME@\0"
+            VALUE "LegalCopyright", "GPL-3.0\0"
+            VALUE "OriginalFilename", "@SVMS_RESOURCE_FILENAME@\0"
+            VALUE "ProductName", "SuperVirtualMIDISynth V3\0"
+            VALUE "ProductVersion", "@PROJECT_VERSION@ build @SVMS_BUILD_NUMBER@\0"
+            VALUE "SourceCommit", "@SVMS_GIT_COMMIT@\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
