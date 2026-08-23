@@ -50,7 +50,8 @@ enum {
     SVMS_CAP_MIXED_TIMESTAMP_BATCH = UINT64_C(1) << 9,
     SVMS_CAP_ISOLATED_OFFLINE_SESSIONS = UINT64_C(1) << 10,
     SVMS_CAP_CONFIG_JSON = UINT64_C(1) << 11,
-    SVMS_CAP_CANCELLABLE_SUBMISSION = UINT64_C(1) << 12
+    SVMS_CAP_CANCELLABLE_SUBMISSION = UINT64_C(1) << 12,
+    SVMS_CAP_ISOLATED_REALTIME_SESSIONS = UINT64_C(1) << 13
 };
 
 enum {
@@ -80,6 +81,12 @@ enum {
 enum {
     SVMS_LIMITER_CLASSIC = 0u,
     SVMS_LIMITER_ADAPTIVE = 1u
+};
+
+enum {
+    SVMS_AUDIO_BACKEND_AUTO = 0u,
+    SVMS_AUDIO_BACKEND_WASAPI_SHARED = 1u,
+    SVMS_AUDIO_BACKEND_DIRECTSOUND = 2u
 };
 
 typedef struct SVMS_SessionConfig {
@@ -172,6 +179,32 @@ typedef struct SVMS_OfflineTelemetry {
     uint32_t reserved[2];
 } SVMS_OfflineTelemetry;
 
+// Isolated real-time session configuration. SoundFont and audio-device names
+// are separate UTF-8 arguments to keep this layout pointer-size independent.
+// Creation initializes resources in a stopped state; start_session_audio is
+// explicit unless start_immediately is nonzero.
+typedef struct SVMS_RealtimeSessionConfig {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint32_t flags;
+    uint32_t audio_backend;
+    uint32_t sample_rate;
+    uint32_t buffer_frames;
+    uint32_t max_voices;
+    uint32_t render_threads;
+    uint32_t render_backend;
+    uint32_t event_capacity;
+    uint32_t start_immediately;
+    uint32_t limiter_enabled;
+    uint32_t limiter_algorithm;
+    float master_volume;
+    float limiter_threshold;
+    float limiter_lookahead_ms;
+    float limiter_attack_ms;
+    float limiter_release_ms;
+    uint32_t reserved[6];
+} SVMS_RealtimeSessionConfig;
+
 typedef struct SVMS_TelemetryV1 {
     uint32_t struct_size;
     uint32_t struct_version;
@@ -246,6 +279,14 @@ typedef SVMS_Result (SVMS_CALL *SVMS_GetConfigPathUtf8Fn)(
     SVMS_Session session, char* buffer_utf8, uint32_t* inout_buffer_bytes);
 typedef SVMS_Result (SVMS_CALL *SVMS_CancelSessionSubmissionsFn)(
     SVMS_Session session);
+typedef SVMS_Result (SVMS_CALL *SVMS_CreateRealtimeSessionFn)(
+    const SVMS_RealtimeSessionConfig* config,
+    const char* soundfont_path_utf8, const char* audio_device_utf8,
+    SVMS_Session* out_session);
+typedef SVMS_Result (SVMS_CALL *SVMS_StartSessionAudioFn)(
+    SVMS_Session session);
+typedef SVMS_Result (SVMS_CALL *SVMS_StopSessionAudioFn)(
+    SVMS_Session session);
 
 typedef struct SVMS_Interface {
     uint32_t struct_size;
@@ -284,6 +325,9 @@ typedef struct SVMS_Interface {
     // Permanently fences event submission for this real-time session token and
     // wakes blocked lossless calls. Reset/telemetry/destroy remain valid.
     SVMS_CancelSessionSubmissionsFn cancel_session_submissions;
+    SVMS_CreateRealtimeSessionFn create_realtime_session;
+    SVMS_StartSessionAudioFn start_session_audio;
+    SVMS_StopSessionAudioFn stop_session_audio;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
@@ -310,6 +354,8 @@ static_assert(sizeof(SVMS_OfflineEvent) == 16,
               "SVMS_OfflineEvent ABI changed");
 static_assert(sizeof(SVMS_OfflineTelemetry) == 64,
               "SVMS_OfflineTelemetry ABI changed");
+static_assert(sizeof(SVMS_RealtimeSessionConfig) == 96,
+              "SVMS_RealtimeSessionConfig ABI changed");
 static_assert(sizeof(SVMS_TelemetryV1) == 128,
               "SVMS_TelemetryV1 ABI changed");
 #endif
