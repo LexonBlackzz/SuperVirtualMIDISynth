@@ -30,6 +30,9 @@ typedef char assert_offline_append_only_tail[
 typedef char assert_config_append_only_tail[
     offsetof(SVMS_Interface, get_config_json) >
         offsetof(SVMS_Interface, get_offline_telemetry) ? 1 : -1];
+typedef char assert_cancel_append_only_tail[
+    offsetof(SVMS_Interface, cancel_session_submissions) >
+        offsetof(SVMS_Interface, get_config_path_utf8) ? 1 : -1];
 
 int main(void) {
     SVMS_Interface api = {0};

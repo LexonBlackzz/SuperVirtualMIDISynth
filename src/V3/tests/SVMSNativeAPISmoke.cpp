@@ -72,13 +72,15 @@ int main(int argc, char** argv) {
                              SVMS_CAP_SOUNDFONT_RELOAD |
                              SVMS_CAP_MIXED_TIMESTAMP_BATCH |
                              SVMS_CAP_ISOLATED_OFFLINE_SESSIONS |
-                             SVMS_CAP_CONFIG_JSON)) !=
+                             SVMS_CAP_CONFIG_JSON |
+                             SVMS_CAP_CANCELLABLE_SUBMISSION)) !=
             (SVMS_CAP_EXACT_QPC_TIMESTAMPS |
              SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_SYSTEM_EXCLUSIVE |
              SVMS_CAP_TELEMETRY_V1 | SVMS_CAP_EXACT_MONOTONIC_NS |
              SVMS_CAP_EXACT_OUTPUT_FRAMES | SVMS_CAP_QUEUE_CONTROL |
              SVMS_CAP_SOUNDFONT_RELOAD | SVMS_CAP_MIXED_TIMESTAMP_BATCH |
-             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON) ||
+             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON |
+             SVMS_CAP_CANCELLABLE_SUBMISSION) ||
         !api.create_session || !api.destroy_session || !api.send_short ||
         !api.send_short_at_qpc || !api.send_short_batch ||
         !api.send_system_exclusive || !api.reset || !api.get_telemetry ||
@@ -88,7 +90,8 @@ int main(int argc, char** argv) {
         !api.load_soundfont_utf8 || !api.panic ||
         !api.create_offline_session || !api.render_offline ||
         !api.get_offline_telemetry || !api.get_config_json ||
-        !api.patch_config_json || !api.get_config_path_utf8) {
+        !api.patch_config_json || !api.get_config_path_utf8 ||
+        !api.cancel_session_submissions) {
         std::puts("FAIL: ABI V1 table is invalid");
         FreeLibrary(runtime);
         return 1;
@@ -305,6 +308,15 @@ int main(int argc, char** argv) {
         telemetry.struct_size != sizeof(telemetry) ||
         telemetry.sample_rate == 0u) {
         std::puts("FAIL: native telemetry is invalid");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    if (api.cancel_session_submissions(session) != SVMS_RESULT_OK ||
+        api.send_short(session, 0x00643c90u) != SVMS_RESULT_CANCELLED ||
+        api.send_system_exclusive(session, gmReset, sizeof(gmReset)) !=
+            SVMS_RESULT_CANCELLED) {
+        std::puts("FAIL: native session submission cancellation failed");
         api.destroy_session(session);
         FreeLibrary(runtime);
         return 1;

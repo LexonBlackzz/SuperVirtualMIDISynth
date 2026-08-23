@@ -1938,7 +1938,20 @@ public:
     void SubmitShortMsg(uint32_t msg);
     void SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp);
     void SubmitShortMsgAtFrame(uint32_t msg, uint64_t outputFrame);
+    bool SubmitShortMsgAtQpcCancellable(
+        uint32_t msg, uint64_t qpcTimestamp,
+        const std::atomic<uint64_t>* externalCancellation,
+        uint64_t cancellationToken);
+    bool SubmitShortMsgAtFrameCancellable(
+        uint32_t msg, uint64_t outputFrame,
+        const std::atomic<uint64_t>* externalCancellation,
+        uint64_t cancellationToken);
+    void WakeBlockedProducers();
     void SubmitSystemExclusive(const uint8_t* data, uint32_t size);
+    bool SubmitSystemExclusiveCancellable(
+        const uint8_t* data, uint32_t size,
+        const std::atomic<uint64_t>* externalCancellation,
+        uint64_t cancellationToken);
     void SetIngressMode(EventOverflowMode mode);
     void CopyNativeQueueInfo(SVMS_QueueInfo& out) const;
     uint64_t GetNextOutputFrame() const;
@@ -3200,9 +3213,22 @@ void Driver::SubmitShortMsg(uint32_t msg) {
 }
 
 void Driver::SubmitShortMsgAtFrame(uint32_t msg, uint64_t outputFrame) {
-    SubmitShortMsgAtQpc(
+    (void)SubmitShortMsgAtFrameCancellable(msg, outputFrame, nullptr, 0u);
+}
+
+bool Driver::SubmitShortMsgAtFrameCancellable(
+    uint32_t msg, uint64_t outputFrame,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
+    return SubmitShortMsgAtQpcCancellable(
         msg, kAbsoluteFrameTimestampTag |
-                 (outputFrame & kAbsoluteFrameTimestampMask));
+                 (outputFrame & kAbsoluteFrameTimestampMask),
+        externalCancellation, cancellationToken);
+}
+
+void Driver::WakeBlockedProducers() {
+    producerWakeEpoch_.fetch_add(1u, std::memory_order_release);
+    WakeAddressWaiters(producerWakeEpoch_);
 }
 
 void Driver::SetIngressMode(EventOverflowMode mode) {
@@ -3237,11 +3263,24 @@ uint64_t Driver::GetNextOutputFrame() const {
 }
 
 void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
+    (void)SubmitShortMsgAtQpcCancellable(msg, qpcTimestamp, nullptr, 0u);
+}
+
+bool Driver::SubmitShortMsgAtQpcCancellable(
+    uint32_t msg, uint64_t qpcTimestamp,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
     submittedAtomic_.fetch_add(1, std::memory_order_relaxed);
     TimestampedMidiEvent evt{};
     evt.message = msg;
     evt.sequence = nextEventSequence_.fetch_add(1, std::memory_order_relaxed);
     evt.qpcTimestamp = qpcTimestamp;
+
+    if (externalCancellation && externalCancellation->load(
+            std::memory_order_acquire) == cancellationToken) {
+        cancelledAtomic_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
     const uint8_t status = static_cast<uint8_t>(msg & 0xffu);
     const uint8_t data1 = static_cast<uint8_t>((msg >> 8) & 0x7fu);
@@ -3321,7 +3360,7 @@ void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
         overflowMode == EventOverflowMode::PriorityVelocity) {
         shedAtomic_.fetch_add(1, std::memory_order_relaxed);
         shedByVelocityAtomic_[velocity].fetch_add(1, std::memory_order_relaxed);
-        return;
+        return true;
     }
 
     const bool lossless = !noteOn || velocity >= highPriorityVelocity_ ||
@@ -3351,16 +3390,18 @@ void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
                 OutputDebugStringA(message);
             }
 #endif
-            return;
+            return true;
         }
         if (!lossless) {
             shedAtomic_.fetch_add(1, std::memory_order_relaxed);
             shedByVelocityAtomic_[velocity].fetch_add(1, std::memory_order_relaxed);
-            return;
+            return true;
         }
-        if (cancelProducers_.load(std::memory_order_acquire)) {
+        if (cancelProducers_.load(std::memory_order_acquire) ||
+            (externalCancellation && externalCancellation->load(
+                std::memory_order_acquire) == cancellationToken)) {
             cancelledAtomic_.fetch_add(1, std::memory_order_relaxed);
-            return;
+            return false;
         }
         uint32_t observed = producerWakeEpoch_.load(std::memory_order_acquire);
         WaitForAddressChange(producerWakeEpoch_, observed);
@@ -3368,13 +3409,26 @@ void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
 }
 
 void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
+    (void)SubmitSystemExclusiveCancellable(data, size, nullptr, 0u);
+}
+
+bool Driver::SubmitSystemExclusiveCancellable(
+    const uint8_t* data, uint32_t size,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
     if (!data || size < 2u || data[0] != 0xf0u ||
-        data[size - 1u] != 0xf7u) return;
+        data[size - 1u] != 0xf7u) return true;
 
     LARGE_INTEGER timestamp{};
     QueryPerformanceCounter(&timestamp);
     const uint64_t qpc = static_cast<uint64_t>(timestamp.QuadPart);
-    auto emit = [&](uint32_t message) { SubmitShortMsgAtQpc(message, qpc); };
+    bool accepted = true;
+    auto emit = [&](uint32_t message) {
+        if (accepted) {
+            accepted = SubmitShortMsgAtQpcCancellable(
+                message, qpc, externalCancellation, cancellationToken);
+        }
+    };
     auto emitCC = [&](uint8_t channel, uint8_t controller, uint8_t value) {
         emit(static_cast<uint32_t>(0xb0u | (channel & 0x0fu)) |
              (static_cast<uint32_t>(controller & 0x7fu) << 8u) |
@@ -3392,7 +3446,7 @@ void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
     if (size >= 6u && data[1] == 0x7eu && data[3] == 0x09u &&
         (data[4] == 0x01u || data[4] == 0x02u || data[4] == 0x03u)) {
         emit(kInternalResetMessage);
-        return;
+        return accepted;
     }
 
     // Universal realtime Master Volume (14-bit, LSB then MSB).
@@ -3401,7 +3455,7 @@ void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
         const uint16_t value = static_cast<uint16_t>(
             (data[5] & 0x7fu) | ((data[6] & 0x7fu) << 7u));
         emit(MakeInternalMasterVolumeMessage(value));
-        return;
+        return accepted;
     }
 
     // Roland GS Data Set 1 (DT1).  Verify the Roland checksum, then map the
@@ -3413,7 +3467,7 @@ void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
         uint32_t checksumSum = 0u;
         for (uint32_t i = 5u; i + 1u < size; ++i)
             checksumSum += data[i] & 0x7fu;
-        if ((checksumSum & 0x7fu) != 0u) return;
+        if ((checksumSum & 0x7fu) != 0u) return true;
 
         uint8_t address0 = data[5] & 0x7fu;
         uint8_t address1 = data[6] & 0x7fu;
@@ -3454,7 +3508,7 @@ void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
                 }
             }
         }
-        return;
+        return accepted;
     }
 
     // Yamaha XG System On and Master Volume are common in nominally-GM song
@@ -3468,6 +3522,7 @@ void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
             emit(MakeInternalMasterVolumeMessage(
                 static_cast<uint16_t>(data[7] & 0x7fu) * 129u));
     }
+    return accepted;
 }
 
 void Driver::EventCompilerLoop() {
@@ -5349,6 +5404,8 @@ static void MaybeShutdownDriver() {
 
 static constexpr uint32_t kNativeSessionCapacity = 64u;
 static std::atomic<uint64_t> g_nativeSessions[kNativeSessionCapacity]{};
+static std::atomic<uint64_t>
+    g_nativeSessionCancellation[kNativeSessionCapacity]{};
 static std::atomic<uint32_t> g_nativeSessionGeneration{1u};
 static svms::NativeOfflineSessions g_nativeOfflineSessions;
 
@@ -5358,6 +5415,16 @@ static bool NativeSessionIsValid(SVMS_Session session) {
         return false;
     return g_nativeSessions[encodedIndex - 1u].load(
         std::memory_order_acquire) == session;
+}
+
+static std::atomic<uint64_t>* NativeSessionCancellation(
+    SVMS_Session session) {
+    const uint32_t encodedIndex = static_cast<uint32_t>(session);
+    if (encodedIndex == 0u || encodedIndex > kNativeSessionCapacity ||
+        g_nativeSessions[encodedIndex - 1u].load(std::memory_order_acquire) !=
+            session)
+        return nullptr;
+    return &g_nativeSessionCancellation[encodedIndex - 1u];
 }
 
 static SVMS_Result SVMS_CALL NativeCreateSession(
@@ -5406,6 +5473,12 @@ static SVMS_Result SVMS_CALL NativeDestroySession(SVMS_Session session) {
     const uint32_t encodedIndex = static_cast<uint32_t>(session);
     if (encodedIndex == 0u || encodedIndex > kNativeSessionCapacity)
         return SVMS_RESULT_INVALID_ARGUMENT;
+    if (g_nativeSessions[encodedIndex - 1u].load(std::memory_order_acquire) !=
+        session)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    g_nativeSessionCancellation[encodedIndex - 1u].store(
+        session, std::memory_order_release);
+    if (g_driver) g_driver->WakeBlockedProducers();
     uint64_t expected = session;
     if (!g_nativeSessions[encodedIndex - 1u].compare_exchange_strong(
             expected, 0u, std::memory_order_acq_rel,
@@ -5418,46 +5491,69 @@ static SVMS_Result SVMS_CALL NativeDestroySession(SVMS_Session session) {
 
 static SVMS_Result SVMS_CALL NativeSendShort(SVMS_Session session,
                                               uint32_t message) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::atomic<uint64_t>* cancellation =
+        NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
     if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
-    g_driver->SubmitShortMsg(message);
-    return SVMS_RESULT_OK;
+    LARGE_INTEGER timestamp{};
+    QueryPerformanceCounter(&timestamp);
+    return g_driver->SubmitShortMsgAtQpcCancellable(
+               message, static_cast<uint64_t>(timestamp.QuadPart),
+               cancellation, session)
+        ? SVMS_RESULT_OK : SVMS_RESULT_CANCELLED;
 }
 
 static SVMS_Result SVMS_CALL NativeSendShortAtQpc(
     SVMS_Session session, uint32_t message, uint64_t timestampQpc) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::atomic<uint64_t>* cancellation =
+        NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
     if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
-    if (timestampQpc == 0u) g_driver->SubmitShortMsg(message);
-    else g_driver->SubmitShortMsgAtQpc(message, timestampQpc);
-    return SVMS_RESULT_OK;
+    if (timestampQpc == 0u) {
+        LARGE_INTEGER timestamp{};
+        QueryPerformanceCounter(&timestamp);
+        timestampQpc = static_cast<uint64_t>(timestamp.QuadPart);
+    }
+    return g_driver->SubmitShortMsgAtQpcCancellable(
+               message, timestampQpc, cancellation, session)
+        ? SVMS_RESULT_OK : SVMS_RESULT_CANCELLED;
 }
 
 static SVMS_Result SVMS_CALL NativeSendShortBatch(
     SVMS_Session session, const SVMS_ShortEvent* events,
     uint32_t eventCount) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::atomic<uint64_t>* cancellation =
+        NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
     if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
     if (!events && eventCount != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
     for (uint32_t i = 0u; i < eventCount; ++i) {
         if (events[i].reserved != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
-        if (events[i].timestamp_qpc == 0u)
-            g_driver->SubmitShortMsg(events[i].packed_message);
-        else
-            g_driver->SubmitShortMsgAtQpc(events[i].packed_message,
-                                          events[i].timestamp_qpc);
+        uint64_t timestampQpc = events[i].timestamp_qpc;
+        if (timestampQpc == 0u) {
+            LARGE_INTEGER timestamp{};
+            QueryPerformanceCounter(&timestamp);
+            timestampQpc = static_cast<uint64_t>(timestamp.QuadPart);
+        }
+        if (!g_driver->SubmitShortMsgAtQpcCancellable(
+                events[i].packed_message, timestampQpc, cancellation,
+                session))
+            return SVMS_RESULT_CANCELLED;
     }
     return SVMS_RESULT_OK;
 }
 
 static SVMS_Result SVMS_CALL NativeSendSystemExclusive(
     SVMS_Session session, const uint8_t* data, uint32_t size) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::atomic<uint64_t>* cancellation =
+        NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
     if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
     if (!data || size < 2u || data[0] != 0xf0u || data[size - 1u] != 0xf7u)
         return SVMS_RESULT_INVALID_ARGUMENT;
-    g_driver->SubmitSystemExclusive(data, size);
-    return SVMS_RESULT_OK;
+    return g_driver->SubmitSystemExclusiveCancellable(
+               data, size, cancellation, session)
+        ? SVMS_RESULT_OK : SVMS_RESULT_CANCELLED;
 }
 
 static SVMS_Result SVMS_CALL NativeReset(SVMS_Session session) {
@@ -5545,7 +5641,9 @@ static SVMS_Result SVMS_CALL NativeGetMonotonicClock(uint64_t* nanoseconds) {
 static SVMS_Result SVMS_CALL NativeSendTimedShortBatch(
     SVMS_Session session, const SVMS_TimedShortEvent* events,
     uint32_t eventCount) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::atomic<uint64_t>* cancellation =
+        NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
     if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
     if (!events && eventCount != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
     for (uint32_t i = 0u; i < eventCount; ++i) {
@@ -5567,21 +5665,29 @@ static SVMS_Result SVMS_CALL NativeSendTimedShortBatch(
         const SVMS_TimedShortEvent& event = events[i];
         switch (event.timestamp_domain) {
         case SVMS_TIMESTAMP_IMMEDIATE:
-            g_driver->SubmitShortMsgAtQpc(event.packed_message, immediateQpc);
+            if (!g_driver->SubmitShortMsgAtQpcCancellable(
+                    event.packed_message, immediateQpc, cancellation, session))
+                return SVMS_RESULT_CANCELLED;
             break;
         case SVMS_TIMESTAMP_OUTPUT_FRAME:
-            g_driver->SubmitShortMsgAtFrame(event.packed_message,
-                                            event.timestamp);
+            if (!g_driver->SubmitShortMsgAtFrameCancellable(
+                    event.packed_message, event.timestamp, cancellation,
+                    session))
+                return SVMS_RESULT_CANCELLED;
             break;
         case SVMS_TIMESTAMP_QPC:
-            g_driver->SubmitShortMsgAtQpc(event.packed_message,
-                                          event.timestamp);
+            if (!g_driver->SubmitShortMsgAtQpcCancellable(
+                    event.packed_message, event.timestamp, cancellation,
+                    session))
+                return SVMS_RESULT_CANCELLED;
             break;
         case SVMS_TIMESTAMP_MONOTONIC_NS:
-            g_driver->SubmitShortMsgAtQpc(
-                event.packed_message,
-                MonotonicNanosecondsToQpcTicks(event.timestamp,
-                                               qpcFrequency));
+            if (!g_driver->SubmitShortMsgAtQpcCancellable(
+                    event.packed_message,
+                    MonotonicNanosecondsToQpcTicks(event.timestamp,
+                                                   qpcFrequency),
+                    cancellation, session))
+                return SVMS_RESULT_CANCELLED;
             break;
         }
     }
@@ -5735,6 +5841,16 @@ static SVMS_Result SVMS_CALL NativeGetConfigPathUtf8(
     return NativeCopyUtf8(utf8, bufferUtf8, inoutBufferBytes);
 }
 
+static SVMS_Result SVMS_CALL NativeCancelSessionSubmissions(
+    SVMS_Session session) {
+    std::atomic<uint64_t>* cancellation =
+        NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
+    cancellation->store(session, std::memory_order_release);
+    if (g_driver) g_driver->WakeBlockedProducers();
+    return SVMS_RESULT_OK;
+}
+
 SVMS_Result SVMS_CALL SVMS_GetInterface(
     uint32_t requestedAbi, uint32_t callerTableSize,
     SVMS_Interface* outInterface) {
@@ -5756,7 +5872,8 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_EXACT_MONOTONIC_NS | SVMS_CAP_EXACT_OUTPUT_FRAMES |
         SVMS_CAP_QUEUE_CONTROL | SVMS_CAP_SOUNDFONT_RELOAD |
         SVMS_CAP_MIXED_TIMESTAMP_BATCH |
-        SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON;
+        SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON |
+        SVMS_CAP_CANCELLABLE_SUBMISSION;
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;
     table.product_patch = svms::build::kProductPatch;
@@ -5783,6 +5900,7 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.get_config_json = NativeGetConfigJson;
     table.patch_config_json = NativePatchConfigJson;
     table.get_config_path_utf8 = NativeGetConfigPathUtf8;
+    table.cancel_session_submissions = NativeCancelSessionSubmissions;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

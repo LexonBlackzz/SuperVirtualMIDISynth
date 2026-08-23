@@ -117,3 +117,17 @@ cross-process mutex as first-run creation, and atomically replaces the file.
 Malformed documents, unsupported schemas, schema changes, and invalid known
 values are rejected without modifying the original. Persisted changes require
 an engine restart; this function does not silently live-reconfigure playback.
+
+## Submission cancellation and SysEx ownership
+
+Runtimes advertising `SVMS_CAP_CANCELLABLE_SUBMISSION` expose
+`cancel_session_submissions`. It is a permanent submission fence for that
+real-time session token: blocked lossless producers are woken, pending API calls
+return `SVMS_RESULT_CANCELLED`, and later short, batch, and SysEx submissions
+are rejected the same way. Telemetry, reset/panic, and destruction remain
+available. Create a new session to resume submission.
+
+The runtime consumes and translates the complete SysEx byte array before
+`send_system_exclusive` returns. It never retains the caller's pointer, so the
+caller may immediately reuse or release that buffer. The generated ordered
+engine events may remain queued after the source bytes have been released.

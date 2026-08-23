@@ -397,6 +397,13 @@ public:
 
     bool SubmitAt(uint32_t message, uint64_t timestampNs,
                   EventKind kind = EventKind::Midi) {
+        return SubmitAtCancellable(message, timestampNs, kind, nullptr, 0u);
+    }
+
+    bool SubmitAtCancellable(
+        uint32_t message, uint64_t timestampNs, EventKind kind,
+        const std::atomic<uint64_t>* cancellation,
+        uint64_t cancellationToken) {
         if (!running_.load(std::memory_order_acquire)) return false;
         submittedEvents_.fetch_add(1u, std::memory_order_relaxed);
         QueuedEvent event{};
@@ -406,6 +413,9 @@ public:
         event.message = message;
         event.kind = kind;
         while (running_.load(std::memory_order_acquire)) {
+            if (cancellation && cancellation->load(
+                    std::memory_order_acquire) == cancellationToken)
+                return false;
             if (queue_.TryPush(event)) {
                 acceptedEvents_.fetch_add(1u, std::memory_order_relaxed);
                 return true;
@@ -417,6 +427,14 @@ public:
 
     bool SubmitAtFrame(uint32_t message, uint64_t outputFrame,
                        EventKind kind = EventKind::Midi) {
+        return SubmitAtFrameCancellable(message, outputFrame, kind, nullptr,
+                                        0u);
+    }
+
+    bool SubmitAtFrameCancellable(
+        uint32_t message, uint64_t outputFrame, EventKind kind,
+        const std::atomic<uint64_t>* cancellation,
+        uint64_t cancellationToken) {
         if (!running_.load(std::memory_order_acquire)) return false;
         submittedEvents_.fetch_add(1u, std::memory_order_relaxed);
         QueuedEvent event{};
@@ -427,6 +445,9 @@ public:
         event.kind = kind;
         event.absoluteFrame = true;
         while (running_.load(std::memory_order_acquire)) {
+            if (cancellation && cancellation->load(
+                    std::memory_order_acquire) == cancellationToken)
+                return false;
             if (queue_.TryPush(event)) {
                 acceptedEvents_.fetch_add(1u, std::memory_order_relaxed);
                 return true;
@@ -617,6 +638,7 @@ KdmapiRuntime& Runtime() {
 
 constexpr uint32_t kNativeSessionCapacity = 64u;
 std::atomic<uint64_t> gNativeSessions[kNativeSessionCapacity]{};
+std::atomic<uint64_t> gNativeSessionCancellation[kNativeSessionCapacity]{};
 std::atomic<uint32_t> gNativeSessionGeneration{1u};
 svms::NativeOfflineSessions gNativeOfflineSessions;
 std::atomic<bool> gKdmapiOwner{false};
@@ -627,6 +649,24 @@ bool NativeSessionIsValid(SVMS_Session session) {
     return encodedIndex != 0u && encodedIndex <= kNativeSessionCapacity &&
         gNativeSessions[encodedIndex - 1u].load(std::memory_order_acquire) ==
             session;
+}
+
+std::atomic<uint64_t>* NativeSessionCancellation(SVMS_Session session) {
+    const uint32_t encodedIndex = static_cast<uint32_t>(session);
+    if (!encodedIndex || encodedIndex > kNativeSessionCapacity ||
+        gNativeSessions[encodedIndex - 1u].load(std::memory_order_acquire) !=
+            session)
+        return nullptr;
+    return &gNativeSessionCancellation[encodedIndex - 1u];
+}
+
+SVMS_Result NativeSubmissionResult(bool accepted,
+                                   const std::atomic<uint64_t>* cancellation,
+                                   SVMS_Session session) {
+    if (accepted) return SVMS_RESULT_OK;
+    return cancellation && cancellation->load(std::memory_order_acquire) ==
+            session
+        ? SVMS_RESULT_CANCELLED : SVMS_RESULT_INTERNAL_ERROR;
 }
 
 bool AnyNativeSessions() {
@@ -675,6 +715,11 @@ SVMS_Result NativeDestroySession(SVMS_Session session) {
     if (!encodedIndex || encodedIndex > kNativeSessionCapacity)
         return SVMS_RESULT_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(gFrontendMutex);
+    if (gNativeSessions[encodedIndex - 1u].load(std::memory_order_acquire) !=
+        session)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    gNativeSessionCancellation[encodedIndex - 1u].store(
+        session, std::memory_order_release);
     uint64_t expected = session;
     if (!gNativeSessions[encodedIndex - 1u].compare_exchange_strong(
             expected, 0u, std::memory_order_acq_rel,
@@ -685,35 +730,42 @@ SVMS_Result NativeDestroySession(SVMS_Session session) {
 }
 
 SVMS_Result NativeSendShort(SVMS_Session session, uint32_t message) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
-    return Runtime().Submit(message) ? SVMS_RESULT_OK
-                                     : SVMS_RESULT_INTERNAL_ERROR;
+    std::atomic<uint64_t>* cancellation = NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
+    return NativeSubmissionResult(Runtime().SubmitAtCancellable(
+        message, MonotonicNanoseconds(), EventKind::Midi, cancellation,
+        session), cancellation, session);
 }
 
 SVMS_Result NativeSendShortAtClock(SVMS_Session session, uint32_t message,
                                    uint64_t timestampNs) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
-    return Runtime().SubmitAt(message, timestampNs) ? SVMS_RESULT_OK
-                                                    : SVMS_RESULT_INTERNAL_ERROR;
+    std::atomic<uint64_t>* cancellation = NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
+    return NativeSubmissionResult(Runtime().SubmitAtCancellable(
+        message, timestampNs, EventKind::Midi, cancellation, session),
+        cancellation, session);
 }
 
 SVMS_Result NativeSendShortBatch(SVMS_Session session,
                                  const SVMS_ShortEvent* events,
                                  uint32_t eventCount) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::atomic<uint64_t>* cancellation = NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
     if (!events && eventCount) return SVMS_RESULT_INVALID_ARGUMENT;
     for (uint32_t i = 0u; i < eventCount; ++i)
         if (events[i].reserved) return SVMS_RESULT_INVALID_ARGUMENT;
     for (uint32_t i = 0u; i < eventCount; ++i)
-        if (!Runtime().SubmitAt(events[i].packed_message,
-                                events[i].timestamp_qpc))
-            return SVMS_RESULT_INTERNAL_ERROR;
+        if (!Runtime().SubmitAtCancellable(
+                events[i].packed_message, events[i].timestamp_qpc,
+                EventKind::Midi, cancellation, session))
+            return NativeSubmissionResult(false, cancellation, session);
     return SVMS_RESULT_OK;
 }
 
 SVMS_Result NativeSendSystemExclusive(SVMS_Session session, const uint8_t*,
                                       uint32_t) {
-    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::atomic<uint64_t>* cancellation = NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
     return SVMS_RESULT_UNSUPPORTED;
 }
 
@@ -793,11 +845,15 @@ SVMS_Result NativeSendTimedShortBatch(SVMS_Session session,
         const SVMS_TimedShortEvent& event = events[i];
         const bool accepted = event.timestamp_domain ==
                 SVMS_TIMESTAMP_OUTPUT_FRAME
-            ? Runtime().SubmitAtFrame(event.packed_message, event.timestamp)
-            : Runtime().SubmitAt(event.packed_message,
+            ? Runtime().SubmitAtFrameCancellable(
+                event.packed_message, event.timestamp, EventKind::Midi,
+                cancellation, session)
+            : Runtime().SubmitAtCancellable(event.packed_message,
                 event.timestamp_domain == SVMS_TIMESTAMP_IMMEDIATE
-                    ? immediate : event.timestamp);
-        if (!accepted) return SVMS_RESULT_INTERNAL_ERROR;
+                    ? immediate : event.timestamp, EventKind::Midi,
+                cancellation, session);
+        if (!accepted)
+            return NativeSubmissionResult(false, cancellation, session);
     }
     return SVMS_RESULT_OK;
 }
@@ -851,6 +907,13 @@ SVMS_Result NativeRenderOffline(
 SVMS_Result NativeGetOfflineTelemetry(
     SVMS_Session session, SVMS_OfflineTelemetry* telemetry) {
     return gNativeOfflineSessions.GetTelemetry(session, telemetry);
+}
+
+SVMS_Result NativeCancelSessionSubmissions(SVMS_Session session) {
+    std::atomic<uint64_t>* cancellation = NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
+    cancellation->store(session, std::memory_order_release);
+    return SVMS_RESULT_OK;
 }
 
 } // namespace
@@ -932,7 +995,8 @@ SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_TELEMETRY_V1 |
         SVMS_CAP_KDMAPI_FACADE | SVMS_CAP_EXACT_OUTPUT_FRAMES |
         SVMS_CAP_MIXED_TIMESTAMP_BATCH |
-        SVMS_CAP_ISOLATED_OFFLINE_SESSIONS;
+        SVMS_CAP_ISOLATED_OFFLINE_SESSIONS |
+        SVMS_CAP_CANCELLABLE_SUBMISSION;
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;
     table.product_patch = svms::build::kProductPatch;
@@ -954,6 +1018,7 @@ SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.create_offline_session = NativeCreateOfflineSession;
     table.render_offline = NativeRenderOffline;
     table.get_offline_telemetry = NativeGetOfflineTelemetry;
+    table.cancel_session_submissions = NativeCancelSessionSubmissions;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

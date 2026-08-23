@@ -405,16 +405,20 @@ Current implementation status (2026-08-23):
 11. [x] Add native UTF-8 configuration/path queries and an atomic JSON merge
     patch that validates known values and preserves unknown fields. Applying a
     saved change still requires the documented engine restart.
-12. [ ] Add independent native real-time sessions with explicit audio-backend
+12. [x] Add per-session permanent submission cancellation that wakes blocked
+    lossless producers, returns a stable cancelled result, and leaves
+    telemetry/reset/destruction available. Document immediate SysEx input-buffer
+    consumption explicitly.
+13. [ ] Add independent native real-time sessions with explicit audio-backend
     selection and lifecycle. The original ABI-1 real-time handles still share
     one process engine and must not be documented as isolated instances.
-13. [x] Inventory and implement the KDMAPI-compatible export surface as a thin
+14. [x] Inventory and implement the KDMAPI-compatible export surface as a thin
     facade over a hidden native session.
-14. [x] Add C/C++ ABI checks and x86, x64, and XP x86 compatibility tests, and
+15. [x] Add C/C++ ABI checks and x86, x64, and XP x86 compatibility tests, and
     publish the same ABI as `libsvmsapi.so` on Linux.
-15. [x] Retain RuntimeLink V2, existing KDMAPI exports, and compatibility binary
+16. [x] Retain RuntimeLink V2, existing KDMAPI exports, and compatibility binary
     names in automated tests before expanding either API.
-16. [x] Publish the canonical `SVMSAPI.dll` name while retaining `SVMS.dll` as
+17. [x] Publish the canonical `SVMSAPI.dll` name while retaining `SVMS.dll` as
     a compatibility alias.
 
 These should land as independently testable commits. The versioning and

@@ -109,6 +109,12 @@ rules as Windows, but own separate SoundFonts, MIDI state, voices, and render
 state. They do not open ALSA devices; the application owns the planar float
 output buffers.
 
+Native lossless submissions are cancellable on Linux as well. Calling
+`cancel_session_submissions` permanently fences that session token and causes
+blocked or later event submissions to return `SVMS_RESULT_CANCELLED`; create a
+new session to resume. Linux SysEx remains unsupported, so no SysEx ownership
+capability is advertised there.
+
 `libOmniMIDI.so` is a symbolic compatibility name for the same shared object,
 not a second engine. Native and KDMAPI users in one process therefore share
 runtime ownership correctly. Linux SysEx is not advertised yet and returns

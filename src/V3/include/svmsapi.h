@@ -49,7 +49,8 @@ enum {
     SVMS_CAP_SOUNDFONT_RELOAD     = UINT64_C(1) << 8,
     SVMS_CAP_MIXED_TIMESTAMP_BATCH = UINT64_C(1) << 9,
     SVMS_CAP_ISOLATED_OFFLINE_SESSIONS = UINT64_C(1) << 10,
-    SVMS_CAP_CONFIG_JSON = UINT64_C(1) << 11
+    SVMS_CAP_CONFIG_JSON = UINT64_C(1) << 11,
+    SVMS_CAP_CANCELLABLE_SUBMISSION = UINT64_C(1) << 12
 };
 
 enum {
@@ -203,6 +204,8 @@ typedef SVMS_Result (SVMS_CALL *SVMS_SendShortAtQpcFn)(
 typedef SVMS_Result (SVMS_CALL *SVMS_SendShortBatchFn)(
     SVMS_Session session, const SVMS_ShortEvent* events,
     uint32_t event_count);
+// The runtime consumes/copies all required bytes before returning and never
+// retains data. The caller may immediately reuse or release the buffer.
 typedef SVMS_Result (SVMS_CALL *SVMS_SendSystemExclusiveFn)(
     SVMS_Session session, const uint8_t* data, uint32_t size);
 typedef SVMS_Result (SVMS_CALL *SVMS_ResetFn)(SVMS_Session session);
@@ -241,6 +244,8 @@ typedef SVMS_Result (SVMS_CALL *SVMS_PatchConfigJsonFn)(
     uint32_t merge_patch_bytes);
 typedef SVMS_Result (SVMS_CALL *SVMS_GetConfigPathUtf8Fn)(
     SVMS_Session session, char* buffer_utf8, uint32_t* inout_buffer_bytes);
+typedef SVMS_Result (SVMS_CALL *SVMS_CancelSessionSubmissionsFn)(
+    SVMS_Session session);
 
 typedef struct SVMS_Interface {
     uint32_t struct_size;
@@ -276,6 +281,9 @@ typedef struct SVMS_Interface {
     SVMS_GetConfigJsonFn get_config_json;
     SVMS_PatchConfigJsonFn patch_config_json;
     SVMS_GetConfigPathUtf8Fn get_config_path_utf8;
+    // Permanently fences event submission for this real-time session token and
+    // wakes blocked lossless calls. Reset/telemetry/destroy remain valid.
+    SVMS_CancelSessionSubmissionsFn cancel_session_submissions;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
