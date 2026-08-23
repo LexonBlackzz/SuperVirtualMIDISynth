@@ -40,7 +40,8 @@ enum {
     SVMS_CAP_SHORT_EVENT_BATCH    = UINT64_C(1) << 1,
     SVMS_CAP_SYSTEM_EXCLUSIVE     = UINT64_C(1) << 2,
     SVMS_CAP_TELEMETRY_V1         = UINT64_C(1) << 3,
-    SVMS_CAP_KDMAPI_FACADE        = UINT64_C(1) << 4
+    SVMS_CAP_KDMAPI_FACADE        = UINT64_C(1) << 4,
+    SVMS_CAP_EXACT_MONOTONIC_NS   = UINT64_C(1) << 5
 };
 
 typedef struct SVMS_SessionConfig {
@@ -52,8 +53,10 @@ typedef struct SVMS_SessionConfig {
 } SVMS_SessionConfig;
 
 // timestamp_qpc == 0 timestamps the event at submission. Otherwise it is an
-// absolute QueryPerformanceCounter tick in the runtime clock domain returned
-// by get_runtime_clock(). Equal timestamps retain array/ingress order.
+// absolute tick in the runtime clock domain returned by get_runtime_clock().
+// Windows uses QueryPerformanceCounter ticks. Portable runtimes may advertise
+// SVMS_CAP_EXACT_MONOTONIC_NS and use monotonic nanoseconds. Equal timestamps
+// retain array/ingress order. The field name is retained for ABI stability.
 typedef struct SVMS_ShortEvent {
     uint64_t timestamp_qpc;
     uint32_t packed_message;

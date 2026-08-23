@@ -1,5 +1,7 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSStandaloneSynth.h"
+#include "SVMSBuildInfo.h"
+#include "include/svmsapi.h"
 
 #include <alsa/asoundlib.h>
 #include <nlohmann/json.hpp>
@@ -360,6 +362,12 @@ public:
         activeVoices_.store(0u, std::memory_order_relaxed);
         freeVoices_.store(options_.synth.maxVoices, std::memory_order_relaxed);
         voiceSteals_.store(0u, std::memory_order_relaxed);
+        callbackCount_.store(0u, std::memory_order_relaxed);
+        submittedEvents_.store(0u, std::memory_order_relaxed);
+        acceptedEvents_.store(0u, std::memory_order_relaxed);
+        dispatchedEvents_.store(0u, std::memory_order_relaxed);
+        noteCalls_.store(0u, std::memory_order_relaxed);
+        matchedNotes_.store(0u, std::memory_order_relaxed);
         running_.store(true, std::memory_order_release);
         try {
             audioThread_ = std::thread(&KdmapiRuntime::AudioThread, this);
@@ -380,15 +388,24 @@ public:
     }
 
     bool Submit(uint32_t message, EventKind kind = EventKind::Midi) {
+        return SubmitAt(message, MonotonicNanoseconds(), kind);
+    }
+
+    bool SubmitAt(uint32_t message, uint64_t timestampNs,
+                  EventKind kind = EventKind::Midi) {
         if (!running_.load(std::memory_order_acquire)) return false;
+        submittedEvents_.fetch_add(1u, std::memory_order_relaxed);
         QueuedEvent event{};
-        event.timestampNs = MonotonicNanoseconds();
+        event.timestampNs = timestampNs ? timestampNs : MonotonicNanoseconds();
         event.sequence = ingressSequence_.fetch_add(
             1u, std::memory_order_relaxed);
         event.message = message;
         event.kind = kind;
         while (running_.load(std::memory_order_acquire)) {
-            if (queue_.TryPush(event)) return true;
+            if (queue_.TryPush(event)) {
+                acceptedEvents_.fetch_add(1u, std::memory_order_relaxed);
+                return true;
+            }
             sched_yield();
         }
         return false;
@@ -419,11 +436,35 @@ public:
         return value;
     }
 
+    bool Running() const { return running_.load(std::memory_order_acquire); }
+    uint32_t SampleRate() const { return options_.synth.sampleRate; }
+    uint32_t BufferFrames() const { return options_.bufferFrames; }
+    uint64_t CallbackCount() const {
+        return callbackCount_.load(std::memory_order_relaxed);
+    }
+    uint64_t SubmittedEvents() const {
+        return submittedEvents_.load(std::memory_order_relaxed);
+    }
+    uint64_t AcceptedEvents() const {
+        return acceptedEvents_.load(std::memory_order_relaxed);
+    }
+    uint64_t DispatchedEvents() const {
+        return dispatchedEvents_.load(std::memory_order_relaxed);
+    }
+    uint64_t NoteCalls() const {
+        return noteCalls_.load(std::memory_order_relaxed);
+    }
+    uint64_t MatchedNotes() const {
+        return matchedNotes_.load(std::memory_order_relaxed);
+    }
+
 private:
     void PublishStatistics(float milliseconds) {
         activeVoices_.store(synth_->Active(), std::memory_order_relaxed);
         freeVoices_.store(synth_->Free(), std::memory_order_relaxed);
         voiceSteals_.store(synth_->Steals(), std::memory_order_relaxed);
+        noteCalls_.store(synth_->NoteCalls(), std::memory_order_relaxed);
+        matchedNotes_.store(synth_->MatchedNotes(), std::memory_order_relaxed);
         uint32_t bits = 0u;
         std::memcpy(&bits, &milliseconds, sizeof(bits));
         renderingTimeBits_.store(bits, std::memory_order_relaxed);
@@ -479,6 +520,7 @@ private:
                     synth_->ResetAll(target);
                 else
                     synth_->Dispatch(due.message, target);
+                dispatchedEvents_.fetch_add(1u, std::memory_order_relaxed);
             }
             if (cursor < options_.bufferFrames) {
                 synth_->Render(left.data() + cursor, right.data() + cursor,
@@ -494,6 +536,7 @@ private:
                 std::chrono::duration<double, std::milli>(
                     renderEnd - renderStart).count());
             PublishStatistics(milliseconds);
+            callbackCount_.fetch_add(1u, std::memory_order_relaxed);
             if (!pcm_->Write(interleaved.data(), options_.bufferFrames,
                              running_)) {
                 std::fprintf(stderr, "[SVMS Linux] ALSA output stopped\n");
@@ -516,6 +559,12 @@ private:
     std::atomic<uint32_t> activeVoices_{0u};
     std::atomic<uint32_t> freeVoices_{0u};
     std::atomic<uint32_t> voiceSteals_{0u};
+    std::atomic<uint64_t> callbackCount_{0u};
+    std::atomic<uint64_t> submittedEvents_{0u};
+    std::atomic<uint64_t> acceptedEvents_{0u};
+    std::atomic<uint64_t> dispatchedEvents_{0u};
+    std::atomic<uint64_t> noteCalls_{0u};
+    std::atomic<uint64_t> matchedNotes_{0u};
     uint64_t epochNs_ = 0u;
     uint64_t leadFrames_ = 0u;
 };
@@ -525,6 +574,147 @@ KdmapiRuntime& Runtime() {
     return runtime;
 }
 
+constexpr uint32_t kNativeSessionCapacity = 64u;
+std::atomic<uint64_t> gNativeSessions[kNativeSessionCapacity]{};
+std::atomic<uint32_t> gNativeSessionGeneration{1u};
+std::atomic<bool> gKdmapiOwner{false};
+std::mutex gFrontendMutex;
+
+bool NativeSessionIsValid(SVMS_Session session) {
+    const uint32_t encodedIndex = static_cast<uint32_t>(session);
+    return encodedIndex != 0u && encodedIndex <= kNativeSessionCapacity &&
+        gNativeSessions[encodedIndex - 1u].load(std::memory_order_acquire) ==
+            session;
+}
+
+bool AnyNativeSessions() {
+    for (const auto& slot : gNativeSessions)
+        if (slot.load(std::memory_order_acquire) != 0u) return true;
+    return false;
+}
+
+void MaybeShutdownRuntime() {
+    if (!gKdmapiOwner.load(std::memory_order_acquire) && !AnyNativeSessions())
+        Runtime().Shutdown();
+}
+
+SVMS_Result NativeCreateSession(const SVMS_SessionConfig* config,
+                                SVMS_Session* outSession) {
+    if (!outSession) return SVMS_RESULT_INVALID_ARGUMENT;
+    *outSession = 0u;
+    if (config && (config->struct_size < 16u ||
+                   config->struct_version != SVMS_STRUCT_VERSION_1 ||
+                   config->flags != 0u))
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(gFrontendMutex);
+    if (!Runtime().Initialize()) return SVMS_RESULT_INTERNAL_ERROR;
+    uint32_t generation = gNativeSessionGeneration.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    if (!generation) generation = gNativeSessionGeneration.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    for (uint32_t i = 0u; i < kNativeSessionCapacity; ++i) {
+        const uint64_t token = (uint64_t(generation) << 32u) | uint64_t(i + 1u);
+        uint64_t empty = 0u;
+        if (gNativeSessions[i].compare_exchange_strong(
+                empty, token, std::memory_order_release,
+                std::memory_order_relaxed)) {
+            *outSession = token;
+            return SVMS_RESULT_OK;
+        }
+    }
+    MaybeShutdownRuntime();
+    return SVMS_RESULT_NO_RESOURCES;
+}
+
+SVMS_Result NativeDestroySession(SVMS_Session session) {
+    const uint32_t encodedIndex = static_cast<uint32_t>(session);
+    if (!encodedIndex || encodedIndex > kNativeSessionCapacity)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(gFrontendMutex);
+    uint64_t expected = session;
+    if (!gNativeSessions[encodedIndex - 1u].compare_exchange_strong(
+            expected, 0u, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    MaybeShutdownRuntime();
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result NativeSendShort(SVMS_Session session, uint32_t message) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    return Runtime().Submit(message) ? SVMS_RESULT_OK
+                                     : SVMS_RESULT_INTERNAL_ERROR;
+}
+
+SVMS_Result NativeSendShortAtClock(SVMS_Session session, uint32_t message,
+                                   uint64_t timestampNs) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    return Runtime().SubmitAt(message, timestampNs) ? SVMS_RESULT_OK
+                                                    : SVMS_RESULT_INTERNAL_ERROR;
+}
+
+SVMS_Result NativeSendShortBatch(SVMS_Session session,
+                                 const SVMS_ShortEvent* events,
+                                 uint32_t eventCount) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!events && eventCount) return SVMS_RESULT_INVALID_ARGUMENT;
+    for (uint32_t i = 0u; i < eventCount; ++i)
+        if (events[i].reserved) return SVMS_RESULT_INVALID_ARGUMENT;
+    for (uint32_t i = 0u; i < eventCount; ++i)
+        if (!Runtime().SubmitAt(events[i].packed_message,
+                                events[i].timestamp_qpc))
+            return SVMS_RESULT_INTERNAL_ERROR;
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result NativeSendSystemExclusive(SVMS_Session session, const uint8_t*,
+                                      uint32_t) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    return SVMS_RESULT_UNSUPPORTED;
+}
+
+SVMS_Result NativeReset(SVMS_Session session) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    return Runtime().Submit(0u, EventKind::Reset) ? SVMS_RESULT_OK
+                                                  : SVMS_RESULT_INTERNAL_ERROR;
+}
+
+SVMS_Result NativeGetTelemetry(SVMS_Session session,
+                               SVMS_TelemetryV1* telemetry) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!telemetry || telemetry->struct_size < sizeof(SVMS_TelemetryV1) ||
+        telemetry->struct_version != SVMS_STRUCT_VERSION_1)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    const svms::SnappyVoiceStatistics voices = Runtime().Statistics();
+    SVMS_TelemetryV1 result{};
+    result.struct_size = sizeof(result);
+    result.struct_version = SVMS_STRUCT_VERSION_1;
+    result.callback_count = Runtime().CallbackCount();
+    result.submitted_events = Runtime().SubmittedEvents();
+    result.accepted_events = Runtime().AcceptedEvents();
+    result.dispatched_events = Runtime().DispatchedEvents();
+    result.note_ons = Runtime().NoteCalls();
+    result.matched_regions = Runtime().MatchedNotes();
+    result.configured_voices = Runtime().MatchedNotes();
+    result.voice_steals = voices.voiceSteals;
+    result.active_voices = voices.activeVoices;
+    result.free_voices = voices.freeVoices;
+    result.sample_rate = Runtime().SampleRate();
+    result.buffer_frames = Runtime().BufferFrames();
+    result.soundfont_loaded = Runtime().Running() ? 1u : 0u;
+    result.audio_running = Runtime().Running() ? 1u : 0u;
+    result.render_time_ms = Runtime().RenderingTime();
+    *telemetry = result;
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result NativeGetRuntimeClock(uint64_t* ticks, uint64_t* frequency) {
+    if (!ticks || !frequency) return SVMS_RESULT_INVALID_ARGUMENT;
+    *ticks = MonotonicNanoseconds();
+    *frequency = 1000000000ull;
+    return SVMS_RESULT_OK;
+}
+
 } // namespace
 
 #define SVMS_LINUX_EXPORT extern "C" __attribute__((visibility("default")))
@@ -532,11 +722,18 @@ KdmapiRuntime& Runtime() {
 SVMS_LINUX_EXPORT int IsKDMAPIAvailable() { return 1; }
 
 SVMS_LINUX_EXPORT void* InitializeKDMAPIStream() {
-    return Runtime().Initialize() ? reinterpret_cast<void*>(1) : nullptr;
+    std::lock_guard<std::mutex> guard(gFrontendMutex);
+    if (gKdmapiOwner.load(std::memory_order_acquire))
+        return reinterpret_cast<void*>(1);
+    if (!Runtime().Initialize()) return nullptr;
+    gKdmapiOwner.store(true, std::memory_order_release);
+    return reinterpret_cast<void*>(1);
 }
 
 SVMS_LINUX_EXPORT int TerminateKDMAPIStream() {
-    Runtime().Shutdown();
+    std::lock_guard<std::mutex> guard(gFrontendMutex);
+    gKdmapiOwner.store(false, std::memory_order_release);
+    MaybeShutdownRuntime();
     return 1;
 }
 
@@ -577,4 +774,40 @@ SVMS_LINUX_EXPORT uint32_t GetVoiceCount() {
 // returns active/free in RAX and steals in RDX, exactly as its caller reads it.
 SVMS_LINUX_EXPORT svms::SnappyVoiceStatistics GetVoiceStatistics() {
     return Runtime().Statistics();
+}
+
+SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
+        uint32_t requestedAbi, uint32_t callerTableSize,
+        SVMS_Interface* outInterface) {
+    const uint32_t minimumSize = static_cast<uint32_t>(
+        offsetof(SVMS_Interface, get_runtime_clock) +
+        sizeof(SVMS_GetRuntimeClockFn));
+    if (!outInterface || callerTableSize < minimumSize)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    if (requestedAbi != SVMS_ABI_VERSION_1)
+        return SVMS_RESULT_UNSUPPORTED_ABI;
+    SVMS_Interface table{};
+    table.struct_size = sizeof(table);
+    table.struct_version = SVMS_STRUCT_VERSION_1;
+    table.abi_version = SVMS_ABI_VERSION_1;
+    table.capabilities = SVMS_CAP_EXACT_MONOTONIC_NS |
+        SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_TELEMETRY_V1 |
+        SVMS_CAP_KDMAPI_FACADE;
+    table.product_major = svms::build::kProductMajor;
+    table.product_minor = svms::build::kProductMinor;
+    table.product_patch = svms::build::kProductPatch;
+    table.build_number = svms::build::kBuildNumber;
+    table.create_session = NativeCreateSession;
+    table.destroy_session = NativeDestroySession;
+    table.send_short = NativeSendShort;
+    table.send_short_at_qpc = NativeSendShortAtClock;
+    table.send_short_batch = NativeSendShortBatch;
+    table.send_system_exclusive = NativeSendSystemExclusive;
+    table.reset = NativeReset;
+    table.get_telemetry = NativeGetTelemetry;
+    table.get_runtime_clock = NativeGetRuntimeClock;
+    std::memcpy(outInterface, &table,
+                (std::min)(callerTableSize,
+                           static_cast<uint32_t>(sizeof(table))));
+    return SVMS_RESULT_OK;
 }

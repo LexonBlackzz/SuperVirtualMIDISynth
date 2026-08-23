@@ -361,8 +361,8 @@ Current implementation status (2026-08-23):
    SysEx, and telemetry.
 10. [x] Inventory and implement the KDMAPI-compatible export surface as a thin
     facade over a hidden native session.
-11. [x] Add C/C++ ABI checks and x86, x64, and XP x86 compatibility tests.
-    Linux native-API publication remains future work.
+11. [x] Add C/C++ ABI checks and x86, x64, and XP x86 compatibility tests, and
+    publish the same ABI as `libsvmsapi.so` on Linux.
 12. [x] Retain RuntimeLink V2, existing KDMAPI exports, and compatibility binary
     names in automated tests before expanding either API.
 13. [x] Publish the canonical `SVMSAPI.dll` name while retaining `SVMS.dll` as

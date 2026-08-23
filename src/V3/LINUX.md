@@ -18,7 +18,8 @@ ctest --test-dir build/V3-linux --output-on-failure
 
 GitHub Actions also produces an Ubuntu 18.04-compatible archive containing
 `svmsd`, the offline `svms_v3_render` tool, and the native Ziggy-compatible
-`libOmniMIDI.so` KDMAPI library.
+`libOmniMIDI.so` KDMAPI library. The same shared object is published under its
+canonical native-API name, `libsvmsapi.so`.
 
 ## Run
 
@@ -84,3 +85,18 @@ Windows device setting:
 The compatibility exports include rendering time, active voices, free voices,
 and voice steals. Ziggy therefore recognizes this library as an SSV2-style
 provider and can show all four overlays.
+
+## Native SVMS API
+
+New Linux applications should load `libsvmsapi.so`, resolve
+`SVMS_GetInterface`, and include `include/svmsapi.h`. ABI 1 uses the same
+function table and fixed-width structures as Windows. The Linux runtime
+advertises `SVMS_CAP_EXACT_MONOTONIC_NS`; timestamps passed through
+`send_short_at_qpc` and `SVMS_ShortEvent.timestamp_qpc` are therefore absolute
+monotonic nanoseconds. The legacy field and function names remain unchanged so
+the ABI layout is identical on every platform.
+
+`libOmniMIDI.so` is a symbolic compatibility name for the same shared object,
+not a second engine. Native and KDMAPI users in one process therefore share
+runtime ownership correctly. Linux SysEx is not advertised yet and returns
+`SVMS_RESULT_UNSUPPORTED` through the native API.

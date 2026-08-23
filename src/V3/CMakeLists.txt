@@ -156,7 +156,14 @@ if(NOT WIN32)
         -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(omnimidi PRIVATE
         Threads::Threads ${ALSA_LIBRARIES} ${CMAKE_DL_LIBS})
-    set_target_properties(omnimidi PROPERTIES OUTPUT_NAME "OmniMIDI")
+    set_target_properties(omnimidi PROPERTIES OUTPUT_NAME "svmsapi")
+    add_custom_command(TARGET omnimidi POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f
+                "$<TARGET_FILE_DIR:omnimidi>/libOmniMIDI.so"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+                "$<TARGET_FILE_NAME:omnimidi>"
+                "$<TARGET_FILE_DIR:omnimidi>/libOmniMIDI.so"
+        VERBATIM)
 
     set_target_properties(svms_v3_render svmsd PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
@@ -199,11 +206,22 @@ if(NOT WIN32)
             ${CMAKE_DL_LIBS})
         add_test(NAME svms_v3_linux_kdmapi
             COMMAND svms_v3_linux_kdmapi_smoke $<TARGET_FILE:omnimidi>)
+
+        add_executable(svms_v3_linux_native_api_smoke
+            tests/SVMSLinuxNativeAPISmoke.cpp)
+        target_include_directories(svms_v3_linux_native_api_smoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(svms_v3_linux_native_api_smoke PRIVATE
+            ${CMAKE_DL_LIBS})
+        add_test(NAME svms_v3_linux_native_api
+            COMMAND svms_v3_linux_native_api_smoke $<TARGET_FILE:omnimidi>)
     endif()
 
     install(TARGETS svmsd svms_v3_render omnimidi
         RUNTIME DESTINATION bin
         LIBRARY DESTINATION lib)
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/libOmniMIDI.so"
+        DESTINATION lib)
     return()
 endif()
 

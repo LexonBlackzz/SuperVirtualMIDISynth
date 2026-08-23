@@ -39,6 +39,11 @@ through `send_short_at_qpc` or `send_short_batch`. Batching does not quantize
 timestamps: every event retains its own tick, and equal-tick events retain
 array/ingress order.
 
+On Linux, load `libsvmsapi.so`. The ABI is unchanged, but a runtime advertising
+`SVMS_CAP_EXACT_MONOTONIC_NS` returns a 1 GHz monotonic-nanosecond clock from
+`get_runtime_clock`; the legacy `qpc` field/function spelling is retained only
+to keep ABI 1 identical across platforms.
+
 All extensible structures carry `struct_size` and `struct_version`. Initialize
 reserved fields to zero. Do not copy internal C++ types or RuntimeLink shared
 memory layouts into applications.
