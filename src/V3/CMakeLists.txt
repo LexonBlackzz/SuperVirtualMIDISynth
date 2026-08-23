@@ -508,6 +508,16 @@ add_custom_target(svms_native_alias ALL
     DEPENDS svmsynth
     VERBATIM)
 
+# Legacy KDMAPI applications conventionally load OmniMIDI.dll directly.
+# Publish the same runtime under that name so the facade and native API share
+# scheduling, SoundFont state, telemetry, and ownership.
+add_custom_target(svms_kdmapi_alias ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:svmsynth>"
+            "$<TARGET_FILE_DIR:svmsynth>/OmniMIDI.dll"
+    DEPENDS svmsynth
+    VERBATIM)
+
 option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
 
 if(SVMS_BUILD_TESTS)

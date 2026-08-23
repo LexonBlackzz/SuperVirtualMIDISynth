@@ -6,6 +6,9 @@
 
 using GetInterfaceProc = SVMS_Result (SVMS_CALL *)(
     uint32_t, uint32_t, SVMS_Interface*);
+using InitializeKDMAPIProc = void* (WINAPI*)();
+using TerminateKDMAPIProc = void (WINAPI*)();
+using SendDirectDataProc = void (WINAPI*)(DWORD);
 
 int main(int argc, char** argv) {
     if (argc != 2) {
@@ -68,6 +71,30 @@ int main(int argc, char** argv) {
     }
     if (session == 0u) {
         std::puts("FAIL: session token is zero");
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // The legacy facade must coexist with a native session. Releasing KDMAPI
+    // ownership may not stop the engine while the native owner is still live.
+    const auto initializeKDMAPI = reinterpret_cast<InitializeKDMAPIProc>(
+        GetProcAddress(runtime, "InitializeKDMAPIStream"));
+    const auto terminateKDMAPI = reinterpret_cast<TerminateKDMAPIProc>(
+        GetProcAddress(runtime, "TerminateKDMAPIStream"));
+    const auto sendDirectData = reinterpret_cast<SendDirectDataProc>(
+        GetProcAddress(runtime, "SendDirectData"));
+    if (!initializeKDMAPI || !terminateKDMAPI || !sendDirectData ||
+        !initializeKDMAPI()) {
+        std::puts("FAIL: KDMAPI compatibility facade is unavailable");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    sendDirectData(0x00643c90u);
+    terminateKDMAPI();
+    if (api.send_short(session, 0x00003c80u) != SVMS_RESULT_OK) {
+        std::puts("FAIL: KDMAPI termination stopped an owned native session");
+        api.destroy_session(session);
         FreeLibrary(runtime);
         return 1;
     }
