@@ -505,10 +505,14 @@ add_custom_target(svms_ziggy_alias ALL
     DEPENDS svmsynth
     VERBATIM)
 
-# Native integrations load SVMS.dll. It is intentionally the same runtime as
-# winmm.dll so WinMM, KDMAPI, and SVMS API clients cannot drift into separate
-# engine implementations.
+# Native integrations load the canonical SVMSAPI.dll name. Keep the shorter
+# SVMS.dll spelling as a compatibility alias. Both are intentionally the same
+# runtime as winmm.dll so WinMM, KDMAPI, and SVMS API clients cannot drift into
+# separate engine implementations.
 add_custom_target(svms_native_alias ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:svmsynth>"
+            "$<TARGET_FILE_DIR:svmsynth>/SVMSAPI.dll"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:svmsynth>"
             "$<TARGET_FILE_DIR:svmsynth>/SVMS.dll"
@@ -559,7 +563,7 @@ if(SVMS_BUILD_TESTS)
     add_dependencies(svms_v3_native_api_smoke svms_native_alias)
     add_test(NAME svms_v3_native_api
              COMMAND svms_v3_native_api_smoke
-                     "$<TARGET_FILE_DIR:svmsynth>/SVMS.dll")
+                     "$<TARGET_FILE_DIR:svmsynth>/SVMSAPI.dll")
     set_tests_properties(svms_v3_native_api PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(svms_v3_tests

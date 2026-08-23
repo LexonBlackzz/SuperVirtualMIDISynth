@@ -365,6 +365,8 @@ Current implementation status (2026-08-23):
     Linux native-API publication remains future work.
 12. [x] Retain RuntimeLink V2, existing KDMAPI exports, and compatibility binary
     names in automated tests before expanding either API.
+13. [x] Publish the canonical `SVMSAPI.dll` name while retaining `SVMS.dll` as
+    a compatibility alias.
 
 These should land as independently testable commits. The versioning and
 discovery foundation should precede the updater and public ABI freeze.

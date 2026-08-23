@@ -1,7 +1,7 @@
 # SVMS native API v1
 
 `svmsapi.h` is the stable C interface for applications that want to talk to
-SuperVirtualMIDISynth directly. Load `SVMS.dll`, resolve the single permanent
+SuperVirtualMIDISynth directly. Load `SVMSAPI.dll`, resolve the single permanent
 `SVMS_GetInterface` export, request ABI 1, and use only capabilities and
 function pointers returned in that table.
 
@@ -12,7 +12,7 @@ function pointers returned in that table.
 typedef SVMS_Result (SVMS_CALL *GetInterfaceFn)(
     uint32_t, uint32_t, SVMS_Interface*);
 
-HMODULE dll = LoadLibraryW(L"SVMS.dll");
+HMODULE dll = LoadLibraryW(L"SVMSAPI.dll");
 GetInterfaceFn get_interface = (GetInterfaceFn)(void*)
     GetProcAddress(dll, "SVMS_GetInterface");
 
@@ -43,7 +43,8 @@ All extensible structures carry `struct_size` and `struct_version`. Initialize
 reserved fields to zero. Do not copy internal C++ types or RuntimeLink shared
 memory layouts into applications.
 
-`winmm.dll`, `SVMS.dll`, `OmniMIDI.dll`, and `SnappySynth.dll` are byte-identical
-names for one runtime in a given build. This is deliberate: WinMM, native API,
-KDMAPI, and Ziggy integrations share one scheduler, one synthesis engine, and
-one ownership model.
+`winmm.dll`, `SVMSAPI.dll`, `SVMS.dll`, `OmniMIDI.dll`, and
+`SnappySynth.dll` are byte-identical names for one runtime in a given build.
+`SVMSAPI.dll` is canonical; `SVMS.dll` is retained as a compatibility spelling.
+This is deliberate: WinMM, native API, KDMAPI, and Ziggy integrations share one
+scheduler, one synthesis engine, and one ownership model.
