@@ -298,6 +298,8 @@ int main(int argc, char** argv) {
     const svms::RuntimeLinkClientV3::PeerInfo peer = v3Client.GetPeerInfo();
     if (peer.protocolMin > 3u || peer.protocolMax < 3u ||
         (peer.capabilityFlags & svms::build::CapabilityRuntimeLinkV3) == 0u ||
+        (peer.capabilityFlags & svms::build::CapabilityNativeApiV1) == 0u ||
+        peer.nativeAbiMin > 1u || peer.nativeAbiMax < 1u ||
         peer.productMajor != svms::build::kProductMajor ||
         peer.buildNumber != svms::build::kBuildNumber) {
         std::puts("FAIL: RuntimeLink V3 discovery metadata is inconsistent");

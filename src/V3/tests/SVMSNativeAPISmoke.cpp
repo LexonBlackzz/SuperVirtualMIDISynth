@@ -90,8 +90,12 @@ int main(int argc, char** argv) {
         FreeLibrary(runtime);
         return 1;
     }
+    std::puts("INFO: KDMAPI facade initialized beside native session");
+    std::fflush(stdout);
     sendDirectData(0x00643c90u);
     terminateKDMAPI();
+    std::puts("INFO: KDMAPI facade released; native session retained");
+    std::fflush(stdout);
     if (api.send_short(session, 0x00003c80u) != SVMS_RESULT_OK) {
         std::puts("FAIL: KDMAPI termination stopped an owned native session");
         api.destroy_session(session);
@@ -125,6 +129,8 @@ int main(int argc, char** argv) {
         FreeLibrary(runtime);
         return 1;
     }
+    std::puts("INFO: destroying final native session");
+    std::fflush(stdout);
     if (api.destroy_session(session) != SVMS_RESULT_OK ||
         api.send_short(session, 0x00643c90u) !=
             SVMS_RESULT_NOT_INITIALIZED ||

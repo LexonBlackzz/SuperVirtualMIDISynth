@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SuperVirtualMIDISynthV3 VERSION 0.7.0 LANGUAGES CXX)
+project(SuperVirtualMIDISynthV3 VERSION 0.7.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -163,6 +163,13 @@ if(NOT WIN32)
 
     option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
     if(SVMS_BUILD_TESTS)
+        add_executable(svms_v3_native_header_c
+            tests/SVMSNativeHeaderCSmoke.c)
+        target_include_directories(svms_v3_native_header_c PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        add_test(NAME svms_v3_native_header_c
+            COMMAND svms_v3_native_header_c)
+
         add_executable(svms_v3_voice_growth_tests
             tests/SVMSVoiceGrowthRegression.cpp
             ${SVMS_PORTABLE_RENDER_SOURCES})
@@ -521,6 +528,13 @@ add_custom_target(svms_kdmapi_alias ALL
 option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
 
 if(SVMS_BUILD_TESTS)
+    add_executable(svms_v3_native_header_c
+        tests/SVMSNativeHeaderCSmoke.c)
+    target_include_directories(svms_v3_native_header_c PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME svms_v3_native_header_c
+        COMMAND svms_v3_native_header_c)
+
     add_executable(svms_v3_telemetry_abi_smoke
         tests/SVMSTelemetryABISmoke.cpp)
     target_compile_definitions(svms_v3_telemetry_abi_smoke PRIVATE
