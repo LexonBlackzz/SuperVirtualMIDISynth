@@ -367,6 +367,13 @@ void DrawAdvancedPage(ConfigDocument& doc) {
         ImGui::TextWrapped("Warning: %s", doc.ConfigWarning().c_str());
         ImGui::PopStyleColor();
     }
+    if (doc.IsReadOnly()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
+        ImGui::TextWrapped(
+            "This file is read-only in the configurator. Its unknown or "
+            "malformed data will not be overwritten.");
+        ImGui::PopStyleColor();
+    }
 }
 
 } // namespace svms::cfg

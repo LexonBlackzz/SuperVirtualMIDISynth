@@ -104,7 +104,7 @@ private:
     EasterEggState easterEggs_;
     bool showMegaFuckerPopup_ = false;
 
-    svms::RuntimeLinkClientV2 rlClient_;
+    svms::RuntimeLinkClient rlClient_;
     svms::RuntimeLinkTelemetryV2 rlTelemetry_{};
     bool rlConnected_ = false;
     float rlPollTimer_ = 0.0f;

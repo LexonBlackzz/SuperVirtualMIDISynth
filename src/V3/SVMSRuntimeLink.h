@@ -1387,6 +1387,148 @@ private:
     bool hasTelemetry_ = false;
 };
 
+// Negotiating client used by current tools.  V3 discovery is attempted first;
+// V2 remains a complete fallback so an updated configurator can still manage
+// older drivers.  Callers never need to select a wire layout themselves.
+class RuntimeLinkClient {
+public:
+    enum class Protocol : uint32_t { None = 0u, V2 = 2u, V3 = 3u };
+
+    struct HostInfo {
+        uint32_t pid = 0u;
+        uint32_t archClass = 0u;
+        uint32_t productMajor = 0u;
+        uint32_t productMinor = 0u;
+        uint32_t productPatch = 0u;
+        uint32_t buildNumber = 0u;
+        uint32_t releaseChannel = 0u;
+        uint32_t protocolMin = 0u;
+        uint32_t protocolMax = 0u;
+        uint64_t capabilityFlags = 0u;
+        uint64_t sessionId = 0u;
+        bool fresh = false;
+        bool hasVersionIdentity = false;
+    };
+
+    bool Open(uint32_t pid) {
+        Close();
+        if (v3_.Open(pid)) {
+            protocol_ = Protocol::V3;
+            peer_ = FromV3(v3_.GetPeerInfo());
+            return true;
+        }
+        if (v2_.Open(pid)) {
+            protocol_ = Protocol::V2;
+            peer_.pid = pid;
+            peer_.protocolMin = kRuntimeLinkVersion;
+            peer_.protocolMax = kRuntimeLinkVersion;
+            peer_.capabilityFlags = build::CapabilityRuntimeLinkV2 |
+                build::CapabilityLiveConfiguration |
+                build::CapabilityTelemetry;
+            peer_.fresh = true;
+            return true;
+        }
+        return false;
+    }
+
+    void Close() {
+        v3_.Close();
+        v2_.Close();
+        protocol_ = Protocol::None;
+        peer_ = HostInfo{};
+    }
+
+    bool IsOpen() const { return protocol_ != Protocol::None; }
+    uint32_t GetPID() const { return peer_.pid; }
+    Protocol GetProtocol() const { return protocol_; }
+    const HostInfo& GetPeerInfo() const { return peer_; }
+    bool HasCapability(uint64_t capability) const {
+        return (peer_.capabilityFlags & capability) == capability;
+    }
+
+    bool ReadTelemetry(RuntimeLinkTelemetryV2& out) {
+        return protocol_ == Protocol::V3 ? v3_.ReadTelemetry(out) :
+               protocol_ == Protocol::V2 ? v2_.ReadTelemetry(out) : false;
+    }
+
+    bool IsHostAlive(uint32_t timeoutMs) const {
+        return protocol_ == Protocol::V3 ? v3_.IsHostAlive(timeoutMs) :
+               protocol_ == Protocol::V2 ? v2_.IsHostAlive(timeoutMs) : false;
+    }
+
+    RLResult SendCommand(RLCommandType type, uint32_t groupMask,
+                         uint32_t param, const RuntimeLiveStateV2& live,
+                         uint32_t timeoutMs,
+                         char resultText[kRuntimeLinkResultTextCapacity] =
+                             nullptr) {
+        if (protocol_ == Protocol::V3)
+            return v3_.SendCommand(type, groupMask, param, live, timeoutMs,
+                                   resultText);
+        if (protocol_ == Protocol::V2)
+            return v2_.SendCommand(type, groupMask, param, live, timeoutMs,
+                                   resultText);
+        if (resultText) strncpy_s(resultText,
+            kRuntimeLinkResultTextCapacity, "not connected", _TRUNCATE);
+        return RLResult::InternalError;
+    }
+
+    static uint32_t EnumerateHosts(HostInfo* out, uint32_t maxCount) {
+        if (!out || maxCount == 0u) return 0u;
+        RuntimeLinkClientV3::PeerInfo modern[kRuntimeHostMaxCount]{};
+        const uint32_t modernCount = RuntimeLinkClientV3::EnumerateHosts(
+            modern, kRuntimeHostMaxCount);
+        uint32_t count = 0u;
+        for (uint32_t i = 0u; i < modernCount && count < maxCount; ++i)
+            out[count++] = FromV3(modern[i]);
+
+        RuntimeLinkClientV2::HostInfo legacy[kRuntimeHostMaxCount]{};
+        const uint32_t legacyCount = RuntimeLinkClientV2::EnumerateHosts(
+            legacy, kRuntimeHostMaxCount);
+        for (uint32_t i = 0u; i < legacyCount && count < maxCount; ++i) {
+            bool duplicate = false;
+            for (uint32_t j = 0u; j < count; ++j)
+                duplicate |= out[j].pid == legacy[i].pid;
+            if (duplicate) continue;
+            HostInfo info{};
+            info.pid = legacy[i].pid;
+            info.archClass = legacy[i].archClass;
+            info.protocolMin = kRuntimeLinkVersion;
+            info.protocolMax = kRuntimeLinkVersion;
+            info.capabilityFlags = build::CapabilityRuntimeLinkV2 |
+                build::CapabilityLiveConfiguration |
+                build::CapabilityTelemetry;
+            info.sessionId = legacy[i].sessionId;
+            info.fresh = legacy[i].fresh;
+            out[count++] = info;
+        }
+        return count;
+    }
+
+private:
+    static HostInfo FromV3(const RuntimeLinkClientV3::PeerInfo& source) {
+        HostInfo info{};
+        info.pid = source.pid;
+        info.archClass = source.archClass;
+        info.productMajor = source.productMajor;
+        info.productMinor = source.productMinor;
+        info.productPatch = source.productPatch;
+        info.buildNumber = source.buildNumber;
+        info.releaseChannel = source.releaseChannel;
+        info.protocolMin = source.protocolMin;
+        info.protocolMax = source.protocolMax;
+        info.capabilityFlags = source.capabilityFlags;
+        info.sessionId = source.sessionId;
+        info.fresh = source.fresh;
+        info.hasVersionIdentity = true;
+        return info;
+    }
+
+    RuntimeLinkClientV3 v3_{};
+    RuntimeLinkClientV2 v2_{};
+    Protocol protocol_ = Protocol::None;
+    HostInfo peer_{};
+};
+
 } // namespace svms
 
 #endif // !defined(SVMS_XP_COMPAT)

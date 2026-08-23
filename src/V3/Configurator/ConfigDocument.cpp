@@ -251,6 +251,8 @@ bool ConfigDocument::Load(const std::wstring& path) {
     parseError_.clear();
     configWarning_.clear();
     dirty_ = false;
+    readOnly_ = false;
+    loadedSchemaVersion_ = 0u;
     activePath_ = path;
 
     try {
@@ -262,10 +264,12 @@ bool ConfigDocument::Load(const std::wstring& path) {
         }
         input >> rawJson_;
         uint32_t version = rawJson_.value("schema_version", 0u);
+        loadedSchemaVersion_ = version;
         if (version == kConfigSchemaVersion) {
             FromJson(rawJson_);
         } else if (version > kConfigSchemaVersion) {
             configWarning_ = "config schema is newer than this build";
+            readOnly_ = true;
             FromJson(rawJson_);
         } else {
             configWarning_ = "unsupported or missing config schema version";
@@ -273,6 +277,7 @@ bool ConfigDocument::Load(const std::wstring& path) {
         }
     } catch (const std::exception& e) {
         parseError_ = std::string("malformed config.json: ") + e.what();
+        readOnly_ = true;
         working_ = Defaults();
     }
 
@@ -281,16 +286,21 @@ bool ConfigDocument::Load(const std::wstring& path) {
 }
 
 bool ConfigDocument::LoadDefaults() {
+    const bool preserveReadOnly = readOnly_ && !activePath_.empty();
+    const uint32_t previousSchemaVersion = loadedSchemaVersion_;
     working_ = Defaults();
     loaded_ = working_;
     rawJson_ = json::object();
     parseError_.clear();
     configWarning_.clear();
     dirty_ = false;
+    readOnly_ = preserveReadOnly;
+    loadedSchemaVersion_ = preserveReadOnly ? previousSchemaVersion : 0u;
     return true;
 }
 
 bool ConfigDocument::Save(const std::wstring& path) {
+    if (readOnly_) return false;
     ConfigValidation v = Validate();
     if (!v.valid) return false;
 
@@ -298,6 +308,7 @@ bool ConfigDocument::Save(const std::wstring& path) {
 }
 
 bool ConfigDocument::SaveAtomic(const std::wstring& path) {
+    if (readOnly_) return false;
     std::error_code ec;
     fs::create_directories(fs::path(path).parent_path(), ec);
 

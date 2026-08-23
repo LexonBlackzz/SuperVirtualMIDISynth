@@ -84,6 +84,8 @@ public:
     bool HasParseError() const { return !parseError_.empty(); }
     const std::string& ParseError() const { return parseError_; }
     const std::string& ConfigWarning() const { return configWarning_; }
+    bool IsReadOnly() const { return readOnly_; }
+    uint32_t LoadedSchemaVersion() const { return loadedSchemaVersion_; }
 
     std::wstring GetActivePath() const { return activePath_; }
     void SetActivePath(const std::wstring& path) { activePath_ = path; }
@@ -108,6 +110,8 @@ private:
     std::string parseError_;
     std::string configWarning_;
     bool dirty_ = false;
+    bool readOnly_ = false;
+    uint32_t loadedSchemaVersion_ = 0u;
 };
 
 } // namespace svms::cfg

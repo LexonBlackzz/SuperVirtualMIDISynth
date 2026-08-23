@@ -55,6 +55,17 @@ bool WaitForTelemetry(svms::RuntimeLinkClientV3& client,
     return false;
 }
 
+bool WaitForTelemetry(svms::RuntimeLinkClient& client,
+                      svms::RuntimeLinkTelemetryV2& out,
+                      unsigned int timeoutMs) {
+    const DWORD start = GetTickCount();
+    do {
+        if (client.ReadTelemetry(out) && out.timestampQpc != 0u) return true;
+        Sleep(25);
+    } while (static_cast<int>(GetTickCount() - start) < (int)timeoutMs);
+    return false;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -301,6 +312,26 @@ int main(int argc, char** argv) {
         reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
         return 1;
     }
+
+    // The configurator-facing negotiator must prefer V3 without callers
+    // knowing either mapped layout. V2 fallback is retained by the wrapper.
+    svms::RuntimeLinkClient negotiatedClient;
+    if (!negotiatedClient.Open(ownPid) ||
+        negotiatedClient.GetProtocol() !=
+            svms::RuntimeLinkClient::Protocol::V3 ||
+        !negotiatedClient.HasCapability(
+            svms::build::CapabilityLiveConfiguration)) {
+        std::puts("FAIL: negotiated client did not select RuntimeLink V3");
+        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
+        return 1;
+    }
+    svms::RuntimeLinkTelemetryV2 negotiatedTelemetry{};
+    if (!WaitForTelemetry(negotiatedClient, negotiatedTelemetry, 3000u)) {
+        std::puts("FAIL: negotiated client could not read telemetry");
+        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
+        return 1;
+    }
+    negotiatedClient.Close();
 
     // ── 3. Note through the real export; expect dispatch counters ───
     shortMsg(handle, 0x00643C90u);  // note 60, vel 100, channel 0

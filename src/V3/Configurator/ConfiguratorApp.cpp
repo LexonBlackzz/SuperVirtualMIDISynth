@@ -43,6 +43,31 @@ namespace svms::cfg {
 static const wchar_t* kWindowClass = L"SVMS_V3_Configurator";
 static const wchar_t* kWindowTitle = L"SuperVirtualMIDISynth V3";
 
+enum class VersionRelation { Unknown, Same, DriverOlder, DriverNewer };
+
+static VersionRelation CompareDriverVersion(
+    const svms::RuntimeLinkClient::HostInfo& peer) {
+    if (!peer.hasVersionIdentity) return VersionRelation::Unknown;
+    const uint32_t driver[3] = {
+        peer.productMajor, peer.productMinor, peer.productPatch };
+    const uint32_t tool[3] = {
+        svms::build::kProductMajor, svms::build::kProductMinor,
+        svms::build::kProductPatch };
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (driver[i] < tool[i]) return VersionRelation::DriverOlder;
+        if (driver[i] > tool[i]) return VersionRelation::DriverNewer;
+    }
+    // Build zero denotes a local/developer build and is deliberately not
+    // ordered relative to a numbered release of the same product version.
+    if (peer.buildNumber != 0u && svms::build::kBuildNumber != 0u) {
+        if (peer.buildNumber < svms::build::kBuildNumber)
+            return VersionRelation::DriverOlder;
+        if (peer.buildNumber > svms::build::kBuildNumber)
+            return VersionRelation::DriverNewer;
+    }
+    return VersionRelation::Same;
+}
+
 static void LogStartupFailure(const wchar_t* what) {
     wchar_t buf[1024];
     swprintf(buf, 1024, L"SVMS V3 Configurator failed to start: %s\n", what);
@@ -567,9 +592,37 @@ void ConfiguratorApp::DrawHeader() {
 
     ImGui::PushFont(nullptr);
     ImGui::PushStyleColor(ImGuiCol_Text, GetThemeSettings().text);
-    ImGui::Text("SuperVirtualMIDISynth V3");
+    ImGui::Text("SuperVirtualMIDISynth V3  %s", svms::build::kProductVersion);
     ImGui::PopStyleColor();
     ImGui::PopFont();
+
+    if (rlConnected_) {
+        const VersionRelation relation =
+            CompareDriverVersion(rlClient_.GetPeerInfo());
+        const char* message = nullptr;
+        ImVec4 color = GetMutedText();
+        if (relation == VersionRelation::DriverOlder) {
+            message = "Driver is older - some newer features may be unavailable";
+            color = GetWarning();
+        } else if (relation == VersionRelation::DriverNewer) {
+            message = "Configurator is older - compatibility mode active";
+            color = GetWarning();
+        } else if (rlClient_.GetProtocol() ==
+                   svms::RuntimeLinkClient::Protocol::V2) {
+            message = "Legacy RuntimeLink V2 compatibility";
+        }
+        if (message) {
+            ImGui::SameLine(0.0f, 24.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, color);
+            ImGui::TextUnformatted(message);
+            ImGui::PopStyleColor();
+        }
+    } else if (config_.IsReadOnly()) {
+        ImGui::SameLine(0.0f, 24.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
+        ImGui::TextUnformatted("Config opened read-only to preserve its data");
+        ImGui::PopStyleColor();
+    }
 
     float lineY = kHeaderHeight * dpiScale_ - 1.0f;
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -685,9 +738,11 @@ void ConfiguratorApp::DrawFooter() {
     if (rlConnected_) {
         ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
         if (compact || veryCompact) {
-            ImGui::Text("PID %u", rlClient_.GetPID());
+            ImGui::Text("PID %u / RL%u", rlClient_.GetPID(),
+                        static_cast<uint32_t>(rlClient_.GetProtocol()));
         } else {
-            ImGui::Text("Driver PID %u", rlClient_.GetPID());
+            ImGui::Text("Driver PID %u / RuntimeLink %u", rlClient_.GetPID(),
+                        static_cast<uint32_t>(rlClient_.GetProtocol()));
         }
         ImGui::PopStyleColor();
         ImGui::SameLine(0.0f, 6.0f);
@@ -724,7 +779,9 @@ void ConfiguratorApp::DrawFooter() {
 
     ImGui::SameLine(0.0f, kGap);
 
-    bool canAdopt = rlConnected_;
+    const bool liveSupported = rlConnected_ && rlClient_.HasCapability(
+        svms::build::CapabilityLiveConfiguration);
+    bool canAdopt = liveSupported;
     if (!canAdopt) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
     }
@@ -737,7 +794,7 @@ void ConfiguratorApp::DrawFooter() {
 
     ImGui::SameLine(0.0f, kGap);
 
-    bool canSave = config_.IsDirty();
+    bool canSave = config_.IsDirty() && !config_.IsReadOnly();
     if (!canSave) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
     }
@@ -782,9 +839,11 @@ void ConfiguratorApp::DrawFooter() {
 void ConfiguratorApp::DrawPageContent() {
     LiveLinkContext lc;
     lc.app = this;
-    lc.client = rlConnected_ ? &rlClient_ : nullptr;
+    const bool liveSupported = rlConnected_ && rlClient_.HasCapability(
+        svms::build::CapabilityLiveConfiguration);
+    lc.client = liveSupported ? &rlClient_ : nullptr;
     lc.telemetry = rlConnected_ ? &rlTelemetry_ : nullptr;
-    lc.connected = rlConnected_;
+    lc.connected = liveSupported;
     SetLiveLinkContext(lc);
 
     switch (currentPage_) {
@@ -845,7 +904,7 @@ void ConfiguratorApp::HandleKeyboardShortcuts() {
     ImGuiIO& io = ImGui::GetIO();
     bool ctrl = io.KeyCtrl;
 
-    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S) && !config_.IsReadOnly()) {
         auto path = config_.GetActivePath();
         ConfigValidation v = config_.Validate();
         if (v.valid) {
@@ -896,7 +955,9 @@ void ConfiguratorApp::PollRuntimeLink() {
 }
 
 void ConfiguratorApp::FlushLiveChanges() {
-    if (!rlConnected_ || pendingLiveMask_ == 0u) return;
+    if (!rlConnected_ || !rlClient_.HasCapability(
+            svms::build::CapabilityLiveConfiguration) ||
+        pendingLiveMask_ == 0u) return;
 
     ImGuiIO& io = ImGui::GetIO();
     if (rlRetryBackoff_ > 0.0f) {
@@ -1048,7 +1109,8 @@ void ConfiguratorApp::SeedWorkingLive() {
 }
 
 void ConfiguratorApp::PushAllLiveParams() {
-    if (!rlConnected_) return;
+    if (!rlConnected_ || !rlClient_.HasCapability(
+            svms::build::CapabilityLiveConfiguration)) return;
 
     workingLive_ = LiveStateFromConfig(config_.Working());
     pendingLiveMask_ |= svms::RLGroupAll;
@@ -1100,14 +1162,16 @@ void ConfiguratorApp::OnConnected() {
     rlRetryBackoff_ = 0.0f;
     rlFailedFlushes_ = 0u;
     statusMessage_ = "Connected to driver (PID " +
-                     std::to_string(rlLastKnownPid_) + ")";
+                     std::to_string(rlLastKnownPid_) + ", RuntimeLink " +
+                     std::to_string(static_cast<uint32_t>(
+                         rlClient_.GetProtocol())) + ")";
     toastTimer_ = 3.0f;
     toastMessage_ = statusMessage_;
 }
 
 bool ConfiguratorApp::TryAutoDiscoverDriver() {
-    svms::RuntimeLinkClientV2::HostInfo hosts[svms::kRuntimeHostMaxCount];
-    const uint32_t count = svms::RuntimeLinkClientV2::EnumerateHosts(
+    svms::RuntimeLinkClient::HostInfo hosts[svms::kRuntimeHostMaxCount];
+    const uint32_t count = svms::RuntimeLinkClient::EnumerateHosts(
         hosts, svms::kRuntimeHostMaxCount);
     if (count == 0u) return false;
 
