@@ -1936,7 +1936,11 @@ public:
 
     void SubmitShortMsg(uint32_t msg);
     void SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp);
+    void SubmitShortMsgAtFrame(uint32_t msg, uint64_t outputFrame);
     void SubmitSystemExclusive(const uint8_t* data, uint32_t size);
+    void SetIngressMode(EventOverflowMode mode);
+    void CopyNativeQueueInfo(SVMS_QueueInfo& out) const;
+    uint64_t GetNextOutputFrame() const;
 
     bool initialized;
     uint32_t sampleRate;
@@ -1977,7 +1981,7 @@ private:
     CompiledEventPagePool compiledPages_;
     PagedEventScheduler pagedScheduler_;
     EventScheduler eventScheduler_;
-    EventOverflowMode overflowMode_;
+    std::atomic<EventOverflowMode> overflowMode_;
     bool correctnessMode_;
     uint32_t highPriorityVelocity_;
     uint32_t shedStartPercent_;
@@ -2109,6 +2113,7 @@ private:
     // fixed epoch, so callback rounding cannot accumulate clock drift.
     uint64_t virtualRenderClockQPC;
     int64_t virtualRenderSample_;
+    std::atomic<uint64_t> outputFramePublished_{0u};
     bool clockInitialized;
     uint32_t nextPlayIndex_;
     EngineConfig engineConfig_;
@@ -2652,6 +2657,7 @@ bool Driver::Initialize() {
     for (auto& fence : channelTerminationFence_) fence.store(0, std::memory_order_relaxed);
     virtualRenderClockQPC = 0;
     virtualRenderSample_ = 0;
+    outputFramePublished_.store(0u, std::memory_order_relaxed);
     clockInitialized = false;
     callbackTiming_.Reset();
 
@@ -3192,6 +3198,43 @@ void Driver::SubmitShortMsg(uint32_t msg) {
     SubmitShortMsgAtQpc(msg, static_cast<uint64_t>(timestamp.QuadPart));
 }
 
+void Driver::SubmitShortMsgAtFrame(uint32_t msg, uint64_t outputFrame) {
+    SubmitShortMsgAtQpc(
+        msg, kAbsoluteFrameTimestampTag |
+                 (outputFrame & kAbsoluteFrameTimestampMask));
+}
+
+void Driver::SetIngressMode(EventOverflowMode mode) {
+    overflowMode_.store(mode, std::memory_order_release);
+}
+
+void Driver::CopyNativeQueueInfo(SVMS_QueueInfo& out) const {
+    out = {};
+    out.struct_size = sizeof(out);
+    out.struct_version = SVMS_STRUCT_VERSION_1;
+    out.ingress_mode = overflowMode_.load(std::memory_order_acquire) ==
+            EventOverflowMode::LosslessBackpressure
+        ? SVMS_INGRESS_LOSSLESS : SVMS_INGRESS_PRIORITY;
+    out.current_velocity_cutoff = currentVelocityCutoffAtomic_.load(
+        std::memory_order_relaxed);
+    out.queue_capacity = midiIngress_.TotalCapacity();
+    out.raw_ingress_count = midiIngress_.TotalSize();
+    out.compiled_count = compiledPages_.ReadyEventCount();
+    out.scheduled_count = scheduledSizePublished_.load(
+        std::memory_order_acquire);
+    out.max_events_per_callback = maxEventsPerBlock_;
+    out.submitted_events = submittedAtomic_.load(std::memory_order_relaxed);
+    out.accepted_events = acceptedAtomic_.load(std::memory_order_relaxed);
+    out.intentionally_shed_events = shedAtomic_.load(
+        std::memory_order_relaxed);
+    out.cancelled_submissions = cancelledAtomic_.load(
+        std::memory_order_relaxed);
+}
+
+uint64_t Driver::GetNextOutputFrame() const {
+    return outputFramePublished_.load(std::memory_order_acquire);
+}
+
 void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
     submittedAtomic_.fetch_add(1, std::memory_order_relaxed);
     TimestampedMidiEvent evt{};
@@ -3271,15 +3314,17 @@ void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
                                             std::memory_order_relaxed);
     }
 
+    const EventOverflowMode overflowMode =
+        overflowMode_.load(std::memory_order_relaxed);
     if (noteOn && velocity < cutoff &&
-        overflowMode_ == EventOverflowMode::PriorityVelocity) {
+        overflowMode == EventOverflowMode::PriorityVelocity) {
         shedAtomic_.fetch_add(1, std::memory_order_relaxed);
         shedByVelocityAtomic_[velocity].fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     const bool lossless = !noteOn || velocity >= highPriorityVelocity_ ||
-                          overflowMode_ == EventOverflowMode::LosslessBackpressure;
+                          overflowMode == EventOverflowMode::LosslessBackpressure;
     for (;;) {
         if (midiIngress_.TryPush(lane, evt)) {
             acceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
@@ -3855,7 +3900,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->eventBufferCapacity_;
     auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
         ++examinedCount;
-        if (self->overflowMode_ == EventOverflowMode::PriorityVelocity &&
+        if (self->overflowMode_.load(std::memory_order_relaxed) ==
+                EventOverflowMode::PriorityVelocity &&
             scheduledOut.type == RenderEventType::NoteOn &&
             IsObsoleteNoteOn(scheduledOut.targetFrame,
                              self->virtualRenderSample_, self->bufferFrames)) {
@@ -3934,6 +3980,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
 
     // ── Advance virtual render clock for the next callback ──────────
     self->virtualRenderSample_ += static_cast<int64_t>(numFrames);
+    self->outputFramePublished_.store(
+        static_cast<uint64_t>(self->virtualRenderSample_),
+        std::memory_order_release);
 
     // masterVolume is already included in ChannelCache's per-channel mix
     // gains. Applying it here again would attenuate the output twice.
@@ -4319,7 +4368,7 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
             // still combine an adjacent identical channel/key run into one
             // counted operation because no event can observe an intermediate
             // state, but it never reorders interleaved keys.
-            if (self->overflowMode_ !=
+            if (self->overflowMode_.load(std::memory_order_relaxed) !=
                 EventOverflowMode::PriorityVelocity) {
                 const uint8_t channel = events[index].channel;
                 const uint8_t note = events[index].data1;
@@ -5459,6 +5508,139 @@ static SVMS_Result SVMS_CALL NativeGetRuntimeClock(
     return SVMS_RESULT_OK;
 }
 
+static uint64_t QpcTicksToMonotonicNanoseconds(uint64_t ticks,
+                                               uint64_t frequency) {
+    if (!frequency) return 0u;
+    const uint64_t seconds = ticks / frequency;
+    const uint64_t remainder = ticks % frequency;
+    return seconds * 1000000000ull +
+        (remainder * 1000000000ull) / frequency;
+}
+
+static uint64_t MonotonicNanosecondsToQpcTicks(uint64_t nanoseconds,
+                                               uint64_t frequency) {
+    if (!frequency) return 0u;
+    const uint64_t seconds = nanoseconds / 1000000000ull;
+    const uint64_t remainder = nanoseconds % 1000000000ull;
+    return seconds * frequency + (remainder * frequency) / 1000000000ull;
+}
+
+static SVMS_Result SVMS_CALL NativeGetMonotonicClock(uint64_t* nanoseconds) {
+    if (!nanoseconds) return SVMS_RESULT_INVALID_ARGUMENT;
+    LARGE_INTEGER now{}, frequency{};
+    if (!QueryPerformanceCounter(&now) || !QueryPerformanceFrequency(&frequency))
+        return SVMS_RESULT_INTERNAL_ERROR;
+    *nanoseconds = QpcTicksToMonotonicNanoseconds(
+        static_cast<uint64_t>(now.QuadPart),
+        static_cast<uint64_t>(frequency.QuadPart));
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeSendTimedShortBatch(
+    SVMS_Session session, const SVMS_TimedShortEvent* events,
+    uint32_t eventCount) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!events && eventCount != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        if (events[i].reserved != 0u ||
+            events[i].timestamp_domain > SVMS_TIMESTAMP_MONOTONIC_NS ||
+            (events[i].timestamp_domain == SVMS_TIMESTAMP_OUTPUT_FRAME &&
+             events[i].timestamp > svms::kAbsoluteFrameTimestampMask) ||
+            (events[i].timestamp_domain == SVMS_TIMESTAMP_QPC &&
+             (events[i].timestamp & svms::kAbsoluteFrameTimestampTag) != 0u))
+            return SVMS_RESULT_INVALID_ARGUMENT;
+    }
+    LARGE_INTEGER immediate{}, frequency{};
+    if (!QueryPerformanceCounter(&immediate) ||
+        !QueryPerformanceFrequency(&frequency))
+        return SVMS_RESULT_INTERNAL_ERROR;
+    const uint64_t immediateQpc = static_cast<uint64_t>(immediate.QuadPart);
+    const uint64_t qpcFrequency = static_cast<uint64_t>(frequency.QuadPart);
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        const SVMS_TimedShortEvent& event = events[i];
+        switch (event.timestamp_domain) {
+        case SVMS_TIMESTAMP_IMMEDIATE:
+            g_driver->SubmitShortMsgAtQpc(event.packed_message, immediateQpc);
+            break;
+        case SVMS_TIMESTAMP_OUTPUT_FRAME:
+            g_driver->SubmitShortMsgAtFrame(event.packed_message,
+                                            event.timestamp);
+            break;
+        case SVMS_TIMESTAMP_QPC:
+            g_driver->SubmitShortMsgAtQpc(event.packed_message,
+                                          event.timestamp);
+            break;
+        case SVMS_TIMESTAMP_MONOTONIC_NS:
+            g_driver->SubmitShortMsgAtQpc(
+                event.packed_message,
+                MonotonicNanosecondsToQpcTicks(event.timestamp,
+                                               qpcFrequency));
+            break;
+        }
+    }
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeGetOutputClock(
+    SVMS_Session session, uint64_t* nextOutputFrame, uint32_t* sampleRate) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!nextOutputFrame || !sampleRate) return SVMS_RESULT_INVALID_ARGUMENT;
+    *nextOutputFrame = g_driver->GetNextOutputFrame();
+    *sampleRate = g_driver->sampleRate;
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeSetIngressMode(
+    SVMS_Session session, uint32_t ingressMode) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (ingressMode > SVMS_INGRESS_LOSSLESS)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    g_driver->SetIngressMode(ingressMode == SVMS_INGRESS_LOSSLESS
+        ? svms::EventOverflowMode::LosslessBackpressure
+        : svms::EventOverflowMode::PriorityVelocity);
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeGetQueueInfo(
+    SVMS_Session session, SVMS_QueueInfo* queueInfo) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!queueInfo || queueInfo->struct_size < 16u ||
+        queueInfo->struct_version != SVMS_STRUCT_VERSION_1)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    const uint32_t callerSize = queueInfo->struct_size;
+    SVMS_QueueInfo result{};
+    g_driver->CopyNativeQueueInfo(result);
+    std::memcpy(queueInfo, &result,
+                (std::min)(callerSize,
+                           static_cast<uint32_t>(sizeof(result))));
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeLoadSoundFontUtf8(
+    SVMS_Session session, const char* pathUtf8) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!pathUtf8 || !*pathUtf8) return SVMS_RESULT_INVALID_ARGUMENT;
+    const int required = MultiByteToWideChar(CP_UTF8, 0, pathUtf8, -1,
+                                              nullptr, 0);
+    if (required <= 1) return SVMS_RESULT_INVALID_ARGUMENT;
+    std::wstring path(static_cast<size_t>(required), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, 0, pathUtf8, -1, path.data(), required) ==
+        0)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    path.resize(static_cast<size_t>(required - 1));
+    return g_driver->LoadSoundFont(path.c_str()) ? SVMS_RESULT_OK
+                                                 : SVMS_RESULT_INTERNAL_ERROR;
+}
+
+static SVMS_Result SVMS_CALL NativePanic(SVMS_Session session) {
+    return NativeReset(session);
+}
+
 SVMS_Result SVMS_CALL SVMS_GetInterface(
     uint32_t requestedAbi, uint32_t callerTableSize,
     SVMS_Interface* outInterface) {
@@ -5476,7 +5658,10 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.abi_version = SVMS_ABI_VERSION_1;
     table.capabilities = SVMS_CAP_EXACT_QPC_TIMESTAMPS |
         SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_SYSTEM_EXCLUSIVE |
-        SVMS_CAP_TELEMETRY_V1 | SVMS_CAP_KDMAPI_FACADE;
+        SVMS_CAP_TELEMETRY_V1 | SVMS_CAP_KDMAPI_FACADE |
+        SVMS_CAP_EXACT_MONOTONIC_NS | SVMS_CAP_EXACT_OUTPUT_FRAMES |
+        SVMS_CAP_QUEUE_CONTROL | SVMS_CAP_SOUNDFONT_RELOAD |
+        SVMS_CAP_MIXED_TIMESTAMP_BATCH;
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;
     table.product_patch = svms::build::kProductPatch;
@@ -5490,6 +5675,13 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.reset = NativeReset;
     table.get_telemetry = NativeGetTelemetry;
     table.get_runtime_clock = NativeGetRuntimeClock;
+    table.send_timed_short_batch = NativeSendTimedShortBatch;
+    table.get_output_clock = NativeGetOutputClock;
+    table.get_monotonic_clock = NativeGetMonotonicClock;
+    table.set_ingress_mode = NativeSetIngressMode;
+    table.get_queue_info = NativeGetQueueInfo;
+    table.load_soundfont_utf8 = NativeLoadSoundFontUtf8;
+    table.panic = NativePanic;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

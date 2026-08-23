@@ -96,6 +96,13 @@ advertises `SVMS_CAP_EXACT_MONOTONIC_NS`; timestamps passed through
 monotonic nanoseconds. The legacy field and function names remain unchanged so
 the ABI layout is identical on every platform.
 
+The append-only ABI-1 tail also provides `get_output_clock`,
+`get_monotonic_clock`, `send_timed_short_batch`, `get_queue_info`, and ordered
+panic. Mixed batches accept immediate, absolute-output-frame, and monotonic
+nanosecond timestamps. `SVMS_TIMESTAMP_QPC` is Windows-specific and is rejected
+on Linux. The Linux ingress is currently fixed to lossless operation, so queue
+mode control is not advertised even though queue pressure can be queried.
+
 `libOmniMIDI.so` is a symbolic compatibility name for the same shared object,
 not a second engine. Native and KDMAPI users in one process therefore share
 runtime ownership correctly. Linux SysEx is not advertised yet and returns

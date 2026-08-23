@@ -2398,6 +2398,17 @@ void TestSixHourFrameClockDrift() {
     Check(svms::QpcDeltaToFrames(endQpc, qpcFrequency, sampleRate) == expectedFrames,
           "fixed-epoch QPC conversion has no six-hour accumulated drift");
 
+    svms::TimestampedMidiEvent frameTimed{};
+    frameTimed.qpcTimestamp = svms::kAbsoluteFrameTimestampTag | 1234567u;
+    frameTimed.message = 0x00643c90u;
+    frameTimed.sequence = 77u;
+    svms::ScheduledRenderEvent frameScheduled{};
+    Check(svms::CompileTimestampedEvent(
+              frameTimed, 999999u, qpcFrequency, sampleRate, 2048u,
+              frameScheduled) && frameScheduled.targetFrame == 1234567 &&
+              frameScheduled.sequence == 77u,
+          "absolute-frame API timestamps bypass QPC conversion exactly");
+
     // Exercise non-integral endpoints and every required WASAPI block size.
     static constexpr uint32_t blockSizes[] = {16, 32, 64, 128, 256, 512,
                                                1024, 2048, 4096, 8192};

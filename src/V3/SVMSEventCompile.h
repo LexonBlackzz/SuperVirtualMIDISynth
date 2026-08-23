@@ -11,6 +11,9 @@ namespace svms {
 inline constexpr uint32_t kInternalResetMessage = 0xFF000001u;
 inline constexpr uint32_t kInternalMasterVolumeTag = 0xFE000000u;
 inline constexpr uint32_t kInternalRhythmPartTag = 0xFD000000u;
+inline constexpr uint64_t kAbsoluteFrameTimestampTag = uint64_t{1} << 63u;
+inline constexpr uint64_t kAbsoluteFrameTimestampMask =
+    ~kAbsoluteFrameTimestampTag;
 
 inline constexpr uint32_t MakeInternalMasterVolumeMessage(
     uint16_t value14) noexcept {
@@ -67,10 +70,15 @@ inline bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
     scheduled.channel = channel;
     scheduled.data1 = data1;
     scheduled.data2 = data2;
-    scheduled.targetFrame = QpcDeltaToFrames(
-        static_cast<int64_t>(timed.qpcTimestamp) -
-            static_cast<int64_t>(epochQPC),
-        static_cast<int64_t>(qpcFrequency), sampleRate) + leadFrames;
+    if ((timed.qpcTimestamp & kAbsoluteFrameTimestampTag) != 0u) {
+        scheduled.targetFrame = static_cast<int64_t>(
+            timed.qpcTimestamp & kAbsoluteFrameTimestampMask);
+    } else {
+        scheduled.targetFrame = QpcDeltaToFrames(
+            static_cast<int64_t>(timed.qpcTimestamp) -
+                static_cast<int64_t>(epochQPC),
+            static_cast<int64_t>(qpcFrequency), sampleRate) + leadFrames;
+    }
     scheduled.sequence = timed.sequence;
     return true;
 }

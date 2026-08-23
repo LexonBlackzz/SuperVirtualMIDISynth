@@ -309,6 +309,7 @@ struct QueuedEvent {
     uint64_t targetFrame = 0u;
     uint32_t message = 0u;
     EventKind kind = EventKind::Midi;
+    bool absoluteFrame = false;
 };
 
 uint64_t TimestampToFrame(uint64_t timestamp, uint64_t epoch,
@@ -368,6 +369,8 @@ public:
         dispatchedEvents_.store(0u, std::memory_order_relaxed);
         noteCalls_.store(0u, std::memory_order_relaxed);
         matchedNotes_.store(0u, std::memory_order_relaxed);
+        outputFramePublished_.store(0u, std::memory_order_relaxed);
+        pendingCount_.store(0u, std::memory_order_relaxed);
         running_.store(true, std::memory_order_release);
         try {
             audioThread_ = std::thread(&KdmapiRuntime::AudioThread, this);
@@ -401,6 +404,27 @@ public:
             1u, std::memory_order_relaxed);
         event.message = message;
         event.kind = kind;
+        while (running_.load(std::memory_order_acquire)) {
+            if (queue_.TryPush(event)) {
+                acceptedEvents_.fetch_add(1u, std::memory_order_relaxed);
+                return true;
+            }
+            sched_yield();
+        }
+        return false;
+    }
+
+    bool SubmitAtFrame(uint32_t message, uint64_t outputFrame,
+                       EventKind kind = EventKind::Midi) {
+        if (!running_.load(std::memory_order_acquire)) return false;
+        submittedEvents_.fetch_add(1u, std::memory_order_relaxed);
+        QueuedEvent event{};
+        event.sequence = ingressSequence_.fetch_add(
+            1u, std::memory_order_relaxed);
+        event.targetFrame = outputFrame;
+        event.message = message;
+        event.kind = kind;
+        event.absoluteFrame = true;
         while (running_.load(std::memory_order_acquire)) {
             if (queue_.TryPush(event)) {
                 acceptedEvents_.fetch_add(1u, std::memory_order_relaxed);
@@ -457,6 +481,14 @@ public:
     uint64_t MatchedNotes() const {
         return matchedNotes_.load(std::memory_order_relaxed);
     }
+    uint64_t NextOutputFrame() const {
+        return outputFramePublished_.load(std::memory_order_acquire);
+    }
+    uint32_t QueueSize() const { return queue_.Size(); }
+    uint32_t QueueCapacity() const { return queue_.CapacityValue(); }
+    uint32_t PendingCount() const {
+        return pendingCount_.load(std::memory_order_relaxed);
+    }
 
 private:
     void PublishStatistics(float milliseconds) {
@@ -488,11 +520,15 @@ private:
             QueuedEvent event{};
             while (pending.size() - pendingHead < options_.eventCapacity &&
                    queue_.TryPop(event)) {
-                event.targetFrame = TimestampToFrame(
-                    event.timestampNs, epochNs_, options_.synth.sampleRate,
-                    leadFrames_);
+                if (!event.absoluteFrame) {
+                    event.targetFrame = TimestampToFrame(
+                        event.timestampNs, epochNs_, options_.synth.sampleRate,
+                        leadFrames_);
+                }
                 pending.push_back(event);
             }
+            pendingCount_.store(static_cast<uint32_t>(
+                pending.size() - pendingHead), std::memory_order_relaxed);
             if (pending.size() - pendingHead > 1u) {
                 std::sort(pending.begin() + pendingHead, pending.end(),
                     [](const QueuedEvent& leftEvent,
@@ -544,6 +580,8 @@ private:
                 break;
             }
             outputFrame = blockEnd;
+            outputFramePublished_.store(outputFrame,
+                                        std::memory_order_release);
         }
     }
 
@@ -565,6 +603,8 @@ private:
     std::atomic<uint64_t> dispatchedEvents_{0u};
     std::atomic<uint64_t> noteCalls_{0u};
     std::atomic<uint64_t> matchedNotes_{0u};
+    std::atomic<uint64_t> outputFramePublished_{0u};
+    std::atomic<uint32_t> pendingCount_{0u};
     uint64_t epochNs_ = 0u;
     uint64_t leadFrames_ = 0u;
 };
@@ -715,6 +755,71 @@ SVMS_Result NativeGetRuntimeClock(uint64_t* ticks, uint64_t* frequency) {
     return SVMS_RESULT_OK;
 }
 
+SVMS_Result NativeGetMonotonicClock(uint64_t* nanoseconds) {
+    if (!nanoseconds) return SVMS_RESULT_INVALID_ARGUMENT;
+    *nanoseconds = MonotonicNanoseconds();
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result NativeGetOutputClock(SVMS_Session session,
+                                 uint64_t* nextOutputFrame,
+                                 uint32_t* sampleRate) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!nextOutputFrame || !sampleRate) return SVMS_RESULT_INVALID_ARGUMENT;
+    *nextOutputFrame = Runtime().NextOutputFrame();
+    *sampleRate = Runtime().SampleRate();
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result NativeSendTimedShortBatch(SVMS_Session session,
+                                      const SVMS_TimedShortEvent* events,
+                                      uint32_t eventCount) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!events && eventCount) return SVMS_RESULT_INVALID_ARGUMENT;
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        if (events[i].reserved ||
+            events[i].timestamp_domain > SVMS_TIMESTAMP_MONOTONIC_NS ||
+            events[i].timestamp_domain == SVMS_TIMESTAMP_QPC)
+            return SVMS_RESULT_INVALID_ARGUMENT;
+    }
+    const uint64_t immediate = MonotonicNanoseconds();
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        const SVMS_TimedShortEvent& event = events[i];
+        const bool accepted = event.timestamp_domain ==
+                SVMS_TIMESTAMP_OUTPUT_FRAME
+            ? Runtime().SubmitAtFrame(event.packed_message, event.timestamp)
+            : Runtime().SubmitAt(event.packed_message,
+                event.timestamp_domain == SVMS_TIMESTAMP_IMMEDIATE
+                    ? immediate : event.timestamp);
+        if (!accepted) return SVMS_RESULT_INTERNAL_ERROR;
+    }
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result NativeGetQueueInfo(SVMS_Session session,
+                               SVMS_QueueInfo* queueInfo) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!queueInfo || queueInfo->struct_size < 16u ||
+        queueInfo->struct_version != SVMS_STRUCT_VERSION_1)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    const uint32_t callerSize = queueInfo->struct_size;
+    SVMS_QueueInfo result{};
+    result.struct_size = sizeof(result);
+    result.struct_version = SVMS_STRUCT_VERSION_1;
+    result.ingress_mode = SVMS_INGRESS_LOSSLESS;
+    result.current_velocity_cutoff = 1u;
+    result.queue_capacity = Runtime().QueueCapacity();
+    result.raw_ingress_count = Runtime().QueueSize();
+    result.scheduled_count = Runtime().PendingCount();
+    result.max_events_per_callback = UINT64_MAX;
+    result.submitted_events = Runtime().SubmittedEvents();
+    result.accepted_events = Runtime().AcceptedEvents();
+    std::memcpy(queueInfo, &result,
+                (std::min)(callerSize,
+                           static_cast<uint32_t>(sizeof(result))));
+    return SVMS_RESULT_OK;
+}
+
 } // namespace
 
 #define SVMS_LINUX_EXPORT extern "C" __attribute__((visibility("default")))
@@ -792,7 +897,8 @@ SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.abi_version = SVMS_ABI_VERSION_1;
     table.capabilities = SVMS_CAP_EXACT_MONOTONIC_NS |
         SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_TELEMETRY_V1 |
-        SVMS_CAP_KDMAPI_FACADE;
+        SVMS_CAP_KDMAPI_FACADE | SVMS_CAP_EXACT_OUTPUT_FRAMES |
+        SVMS_CAP_MIXED_TIMESTAMP_BATCH;
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;
     table.product_patch = svms::build::kProductPatch;
@@ -806,6 +912,11 @@ SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.reset = NativeReset;
     table.get_telemetry = NativeGetTelemetry;
     table.get_runtime_clock = NativeGetRuntimeClock;
+    table.send_timed_short_batch = NativeSendTimedShortBatch;
+    table.get_output_clock = NativeGetOutputClock;
+    table.get_monotonic_clock = NativeGetMonotonicClock;
+    table.get_queue_info = NativeGetQueueInfo;
+    table.panic = NativeReset;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

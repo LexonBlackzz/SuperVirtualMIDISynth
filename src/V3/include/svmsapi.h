@@ -41,7 +41,23 @@ enum {
     SVMS_CAP_SYSTEM_EXCLUSIVE     = UINT64_C(1) << 2,
     SVMS_CAP_TELEMETRY_V1         = UINT64_C(1) << 3,
     SVMS_CAP_KDMAPI_FACADE        = UINT64_C(1) << 4,
-    SVMS_CAP_EXACT_MONOTONIC_NS   = UINT64_C(1) << 5
+    SVMS_CAP_EXACT_MONOTONIC_NS   = UINT64_C(1) << 5,
+    SVMS_CAP_EXACT_OUTPUT_FRAMES  = UINT64_C(1) << 6,
+    SVMS_CAP_QUEUE_CONTROL        = UINT64_C(1) << 7,
+    SVMS_CAP_SOUNDFONT_RELOAD     = UINT64_C(1) << 8,
+    SVMS_CAP_MIXED_TIMESTAMP_BATCH = UINT64_C(1) << 9
+};
+
+enum {
+    SVMS_TIMESTAMP_IMMEDIATE = 0u,
+    SVMS_TIMESTAMP_OUTPUT_FRAME = 1u,
+    SVMS_TIMESTAMP_QPC = 2u,
+    SVMS_TIMESTAMP_MONOTONIC_NS = 3u
+};
+
+enum {
+    SVMS_INGRESS_PRIORITY = 0u,
+    SVMS_INGRESS_LOSSLESS = 1u
 };
 
 typedef struct SVMS_SessionConfig {
@@ -62,6 +78,31 @@ typedef struct SVMS_ShortEvent {
     uint32_t packed_message;
     uint32_t reserved;
 } SVMS_ShortEvent;
+
+// Mixed-domain batch record. Each event is converted independently to an
+// absolute output frame; batching never gives the array one shared timestamp.
+typedef struct SVMS_TimedShortEvent {
+    uint64_t timestamp;
+    uint32_t packed_message;
+    uint16_t timestamp_domain;
+    uint16_t reserved;
+} SVMS_TimedShortEvent;
+
+typedef struct SVMS_QueueInfo {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint32_t ingress_mode;
+    uint32_t current_velocity_cutoff;
+    uint64_t queue_capacity;
+    uint64_t raw_ingress_count;
+    uint64_t compiled_count;
+    uint64_t scheduled_count;
+    uint64_t max_events_per_callback;
+    uint64_t submitted_events;
+    uint64_t accepted_events;
+    uint64_t intentionally_shed_events;
+    uint64_t cancelled_submissions;
+} SVMS_QueueInfo;
 
 typedef struct SVMS_TelemetryV1 {
     uint32_t struct_size;
@@ -102,6 +143,21 @@ typedef SVMS_Result (SVMS_CALL *SVMS_GetTelemetryFn)(
     SVMS_Session session, SVMS_TelemetryV1* telemetry);
 typedef SVMS_Result (SVMS_CALL *SVMS_GetRuntimeClockFn)(
     uint64_t* qpc_now, uint64_t* qpc_frequency);
+typedef SVMS_Result (SVMS_CALL *SVMS_SendTimedShortBatchFn)(
+    SVMS_Session session, const SVMS_TimedShortEvent* events,
+    uint32_t event_count);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetOutputClockFn)(
+    SVMS_Session session, uint64_t* next_output_frame,
+    uint32_t* sample_rate);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetMonotonicClockFn)(
+    uint64_t* monotonic_nanoseconds);
+typedef SVMS_Result (SVMS_CALL *SVMS_SetIngressModeFn)(
+    SVMS_Session session, uint32_t ingress_mode);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetQueueInfoFn)(
+    SVMS_Session session, SVMS_QueueInfo* queue_info);
+typedef SVMS_Result (SVMS_CALL *SVMS_LoadSoundFontUtf8Fn)(
+    SVMS_Session session, const char* path_utf8);
+typedef SVMS_Result (SVMS_CALL *SVMS_PanicFn)(SVMS_Session session);
 
 typedef struct SVMS_Interface {
     uint32_t struct_size;
@@ -122,6 +178,15 @@ typedef struct SVMS_Interface {
     SVMS_ResetFn reset;
     SVMS_GetTelemetryFn get_telemetry;
     SVMS_GetRuntimeClockFn get_runtime_clock;
+    // Optional ABI-1 tail. Check both struct_size and the matching capability
+    // before calling when a newer application loads an older runtime.
+    SVMS_SendTimedShortBatchFn send_timed_short_batch;
+    SVMS_GetOutputClockFn get_output_clock;
+    SVMS_GetMonotonicClockFn get_monotonic_clock;
+    SVMS_SetIngressModeFn set_ingress_mode;
+    SVMS_GetQueueInfoFn get_queue_info;
+    SVMS_LoadSoundFontUtf8Fn load_soundfont_utf8;
+    SVMS_PanicFn panic;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
@@ -138,6 +203,10 @@ static_assert(sizeof(SVMS_SessionConfig) == 64,
               "SVMS_SessionConfig ABI changed");
 static_assert(sizeof(SVMS_ShortEvent) == 16,
               "SVMS_ShortEvent ABI changed");
+static_assert(sizeof(SVMS_TimedShortEvent) == 16,
+              "SVMS_TimedShortEvent ABI changed");
+static_assert(sizeof(SVMS_QueueInfo) == 88,
+              "SVMS_QueueInfo ABI changed");
 static_assert(sizeof(SVMS_TelemetryV1) == 128,
               "SVMS_TelemetryV1 ABI changed");
 #endif
