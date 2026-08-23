@@ -1,11 +1,49 @@
 # SVMS Versioning, Updates, Native API, and KDMAPI Compatibility
 
-Status: proposed design. The ABI described here is not frozen yet.
+Status: living design and implementation contract. Shipped ABI layouts are
+frozen; unchecked items in the implementation sequence remain future work.
 
 This document defines how the V3 driver, configurator, native SVMS API, and
 legacy KDMAPI compatibility layer should coexist. The goal is to let each
 component evolve independently without breaking old applications or making the
 configurator a runtime dependency.
+
+## Agreed Decisions
+
+- The public integration name is **SVMS API**. `SVMAPI` and `SMVS API` are
+  discarded working names.
+- The driver, configurator, native API, and KDMAPI facade are separate
+  components. None of the playback components depends on the configurator.
+- A shared build identity tells users whether components came from the same
+  release, but capability negotiation decides what they may safely do together.
+- Driver/configurator mismatches produce non-blocking notices. They never stop
+  compatible playback or force an update.
+- Update checks and installation live only in the configurator. Playback code
+  never contacts GitHub or replaces files.
+- New and maintained applications should use `SVMSAPI.dll` and submit timestamped
+  batches. Legacy KDMAPI applications may load an SVMS-built `OmniMIDI.dll`
+  facade without source changes.
+- The KDMAPI facade is a compatibility entry point into the same SVMS engine,
+  not a fork of the synthesizer and not a claim to be the OmniMIDI product.
+- API batching amortizes calls and queue operations only. It never rounds MIDI
+  events to a batch, callback, or block boundary.
+- Once an ABI or protocol layout ships, its existing fields and functions never
+  change meaning. New behavior is discovered through sized structures,
+  appended function pointers, and capability bits.
+
+## Compatibility Relationships
+
+These relationships are independent and must not be collapsed into one version
+comparison:
+
+| Relationship | Compatibility mechanism | User-visible behavior |
+| --- | --- | --- |
+| Configurator to driver | RuntimeLink protocol range plus capability bits | Use the newest common protocol; disable only unsupported controls |
+| Application to native API | Requested ABI, returned table size, and capability bits | Run on newer runtimes indefinitely; degrade cleanly on older runtimes |
+| Legacy application to KDMAPI facade | Exact exported names, calling conventions, widths, and observed behavior | Existing applications load the facade without recompilation |
+
+A build-number mismatch is informational. It is not evidence of incompatibility
+by itself and must never be used as a substitute for negotiation.
 
 ## Names and Components
 
