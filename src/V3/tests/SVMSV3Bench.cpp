@@ -95,6 +95,8 @@ struct Options {
     uint32_t eventStride = 1;
     uint32_t noteRate = 64000;
     uint32_t keyCount = 128;
+    uint32_t baseNote = 0;
+    uint32_t keyStride = 1;
     uint32_t attackFrames = 0;
     uint32_t noteLengthFrames = 1;
     uint32_t renderThreads = 1;
@@ -146,6 +148,12 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         } else if (std::strcmp(argv[i], "--key-count") == 0) {
             if (!nextNumber(options.keyCount) || options.keyCount == 0u ||
                 options.keyCount > 128u) return false;
+        } else if (std::strcmp(argv[i], "--base-note") == 0) {
+            if (!nextNumber(options.baseNote) || options.baseNote > 127u)
+                return false;
+        } else if (std::strcmp(argv[i], "--key-stride") == 0) {
+            if (!nextNumber(options.keyStride) || options.keyStride == 0u ||
+                options.keyStride > 127u) return false;
         } else if (std::strcmp(argv[i], "--attack-frames") == 0) {
             if (!nextNumber(options.attackFrames)) return false;
         } else if (std::strcmp(argv[i], "--note-length-frames") == 0) {
@@ -536,7 +544,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "usage: svms_v3_bench [--voices 1..524288] [--frames 16..8192] "
             "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst|chopped-notes] "
-            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--attack-frames N] [--note-length-frames N] [--soundfont PATH] "
+            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--base-note 0..127] [--key-stride 1..127] [--attack-frames N] [--note-length-frames N] [--soundfont PATH] "
             "[--render-threads 1..64] "
             "[--backend auto|scalar|sse2|avx2] "
             "[--launch-path legacy|transactional] "
@@ -647,7 +655,9 @@ int main(int argc, char** argv) {
                     noteOnCount);
                 const uint8_t channel = static_cast<uint8_t>(noteIndex & 15u);
                 const uint8_t note = static_cast<uint8_t>(
-                    noteIndex % options.keyCount);
+                    (options.baseNote +
+                     (noteIndex % options.keyCount) * options.keyStride) &
+                    127u);
                 svms::RenderEvent& on = events[noteIndex * 2u];
                 on.frameOffset = frame;
                 on.ingressSequence = noteIndex * 2u + 1u;
@@ -689,7 +699,9 @@ int main(int argc, char** argv) {
             }
             if (options.workload == Workload::NoteBurst) {
                 event.type = svms::RenderEventType::NoteOn;
-                event.data1 = static_cast<uint8_t>(index % options.keyCount);
+                event.data1 = static_cast<uint8_t>(
+                    (options.baseNote +
+                     (index % options.keyCount) * options.keyStride) & 127u);
                 event.data2 = 127u;
                 continue;
             }
@@ -934,7 +946,7 @@ int main(int argc, char** argv) {
 
     std::printf(
         "{\"renderer\":\"%s\",\"backend\":\"%s\",\"render_threads\":%u,\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"launch_churn_profile\":%s,\"volatile_selection\":\"%s\",\"voices\":%u,\"frames\":%u,"
-        "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"attack_frames\":%u,\"note_length_frames\":%u,\"noteoff_index\":\"%s\","
+        "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"base_note\":%u,\"key_stride\":%u,\"attack_frames\":%u,\"note_length_frames\":%u,\"noteoff_index\":\"%s\","
         "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
         "\"voice_soa_bytes\":%zu,\"voice_manager_bytes\":%zu,\"renderer_bytes\":%zu,"
         "\"voice_samples_per_second\":%.0f,"
@@ -982,6 +994,7 @@ int main(int argc, char** argv) {
         options.volatileFallbackScan ? "scan" : "heap",
         options.voices, options.frames,
         measuredCallbacks, options.eventStride, options.noteRate, options.keyCount,
+        options.baseNote, options.keyStride,
         options.attackFrames, options.noteLengthFrames,
         options.batchNoteOffIndex ? "batch" : "immediate",
         soundFont ? soundFont->regionCount : 0u,
