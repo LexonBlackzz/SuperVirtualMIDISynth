@@ -65,6 +65,14 @@ void TestPODLayout() {
              "mapping must be 1088 bytes");
     CHECK_EQ(sizeof(svms::RuntimeAudioSnapshot) % 64, 0u,
              "RuntimeAudioSnapshot must be a cache-line multiple");
+    CHECK_EQ(sizeof(svms::RuntimeDiscoveryHeaderV3), 192u,
+             "RuntimeLink V3 discovery header must remain 192 bytes");
+    CHECK_EQ(sizeof(svms::RuntimeLinkSharedMemoryV3), 1216u,
+             "RuntimeLink V3 mapping must remain 1216 bytes");
+    CHECK_EQ(sizeof(svms::RuntimeDiscoveryHostSlotV1), 64u,
+             "discovery host slot must remain one cache line");
+    CHECK_EQ(sizeof(svms::RuntimeDiscoveryHostsRegistryV1), 1088u,
+             "discovery hosts registry must remain 1088 bytes");
 
     CHECK_EQ(alignof(svms::RuntimeLinkHeaderV2) >= 64 ? size_t(1) : size_t(0), 1u,
              "RuntimeLinkHeaderV2 must be 64-aligned");
@@ -156,6 +164,16 @@ void TestMappingOffsets() {
     CHECK_EQ(svms::RLV2_CommandOffset(h), 576u, "RLV2_CommandOffset must be 576");
     CHECK_EQ(svms::RuntimeLinkMappingSizeV2(), 1088u,
              "mapping size must be 1088");
+
+    svms::RuntimeLinkSharedMemoryV3 v3{};
+    const size_t v3Telemetry = reinterpret_cast<const char*>(&v3.telemetry) -
+                               reinterpret_cast<const char*>(&v3);
+    const size_t v3Command = reinterpret_cast<const char*>(&v3.command) -
+                             reinterpret_cast<const char*>(&v3);
+    CHECK_EQ(v3Telemetry, 192u, "V3 telemetry must sit at offset 192");
+    CHECK_EQ(v3Command, 704u, "V3 command must sit at offset 704");
+    CHECK_EQ(svms::RuntimeLinkMappingSizeV3(), 1216u,
+             "V3 mapping size must be 1216");
 }
 
 void TestHeaderCrc() {
@@ -174,6 +192,25 @@ void TestHeaderCrc() {
     CHECK(svms::RLV2_HeaderCrc(h) == crc, "crc must be stable for identical header");
     h.version = 3;
     CHECK(svms::RLV2_HeaderCrc(h) != crc, "crc must change with version");
+
+    svms::RuntimeDiscoveryHeaderV3 v3{};
+    v3.totalSize = svms::RuntimeLinkMappingSizeV3();
+    v3.publisherPid = 12345u;
+    v3.telemetryOffset = 192u;
+    v3.telemetrySize = sizeof(svms::RuntimeLinkTelemetryV2);
+    v3.commandOffset = 704u;
+    v3.commandSize = sizeof(svms::RuntimeLinkCommandV2);
+    v3.accessFlags = svms::kRuntimeAccessTelemetryRead |
+                     svms::kRuntimeAccessCommandWrite;
+    const uint32_t v3Crc = svms::RLV3_HeaderCrc(v3);
+    CHECK(v3Crc != 0u, "V3 discovery CRC must be non-zero");
+    v3.heartbeatQpc = 99999u;
+    v3.telemetrySequence = 18u;
+    CHECK_EQ(svms::RLV3_HeaderCrc(v3), v3Crc,
+             "V3 liveness fields must not alter identity CRC");
+    v3.buildNumber += 1u;
+    CHECK(svms::RLV3_HeaderCrc(v3) != v3Crc,
+          "V3 build number must alter identity CRC");
 }
 
 void TestFloatBits() {
@@ -287,6 +324,18 @@ void TestNamingConventions() {
     svms::RLV2_HostsMutexName(buf, 128);
     CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeHostsMutex_v2") == 0,
           "hosts mutex name format must match");
+    svms::RLV3_SharedMemName(12345, buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_RuntimeDiscovery_v1_12345") == 0,
+          "V3 discovery mapping name must be version-neutral");
+    svms::RLV3_MutexName(12345, buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_RuntimeCommandMutex_v3_12345") == 0,
+          "V3 command mutex name must match");
+    svms::RLV3_CmdEventName(12345, buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_RuntimeCommandEvent_v3_12345") == 0,
+          "V3 command event name must match");
+    svms::RLV3_HostsRegName(buf, 128);
+    CHECK(wcscmp(buf, L"Local\\SVMS_RuntimeDiscoveryHosts_v1") == 0,
+          "discovery registry name must remain stable");
 }
 
 void TestHostsRegistry() {

@@ -57,6 +57,8 @@
 #include <cmath>
 #include <atomic>
 
+#include "SVMSBuildInfo.h"
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -107,6 +109,39 @@ inline const wchar_t* RLV2_HostsMutexName(wchar_t* buf, size_t bufLen) {
     _snwprintf_s(buf, bufLen, _TRUNCATE, L"Local\\SVMS_V3_RuntimeHostsMutex_v2");
     return buf;
 }
+
+inline const wchar_t* RLV3_SharedMemName(uint32_t pid, wchar_t* buf,
+                                         size_t bufLen) {
+    _snwprintf_s(buf, bufLen, _TRUNCATE,
+                 L"Local\\SVMS_RuntimeDiscovery_v1_%u", pid);
+    return buf;
+}
+
+inline const wchar_t* RLV3_MutexName(uint32_t pid, wchar_t* buf,
+                                     size_t bufLen) {
+    _snwprintf_s(buf, bufLen, _TRUNCATE,
+                 L"Local\\SVMS_RuntimeCommandMutex_v3_%u", pid);
+    return buf;
+}
+
+inline const wchar_t* RLV3_CmdEventName(uint32_t pid, wchar_t* buf,
+                                        size_t bufLen) {
+    _snwprintf_s(buf, bufLen, _TRUNCATE,
+                 L"Local\\SVMS_RuntimeCommandEvent_v3_%u", pid);
+    return buf;
+}
+
+inline const wchar_t* RLV3_HostsRegName(wchar_t* buf, size_t bufLen) {
+    _snwprintf_s(buf, bufLen, _TRUNCATE,
+                 L"Local\\SVMS_RuntimeDiscoveryHosts_v1");
+    return buf;
+}
+
+inline const wchar_t* RLV3_HostsMutexName(wchar_t* buf, size_t bufLen) {
+    _snwprintf_s(buf, bufLen, _TRUNCATE,
+                 L"Local\\SVMS_RuntimeDiscoveryHostsMutex_v1");
+    return buf;
+}
 #endif
 
 // ─── Protocol constants ─────────────────────────────────────────────────────
@@ -121,6 +156,14 @@ inline constexpr uint32_t kRuntimeLinkMutexTimeoutMs = 1000u;
 inline constexpr uint32_t kRuntimeLinkResultTextCapacity = 256;
 inline constexpr uint32_t kRuntimeLinkDefaultCommandTimeoutMs = 400u;
 inline constexpr uint32_t kRuntimeLinkPublishIntervalMs = 33u;  // ~30 Hz
+
+inline constexpr uint32_t kRuntimeDiscoveryMagic = 0x334C5253u; // "SRL3"
+inline constexpr uint32_t kRuntimeDiscoveryHeaderVersion = 1u;
+inline constexpr uint32_t kRuntimeLinkVersionV3 = 3u;
+inline constexpr uint32_t kRuntimeDiscoveryRegistryMagic = 0x31445253u; // "SRD1"
+inline constexpr uint32_t kRuntimeDiscoveryRegistryVersion = 1u;
+inline constexpr uint32_t kRuntimeAccessTelemetryRead = 1u << 0;
+inline constexpr uint32_t kRuntimeAccessCommandWrite = 1u << 1;
 
 inline constexpr uint32_t RLV2_PadTo64(uint32_t n) { return (n + 63u) & ~63u; }
 
@@ -496,6 +539,124 @@ inline uint32_t RLV2_HeaderCrc(const RuntimeLinkHeaderV2& h) {
     std::memcpy(raw + p, stable, sizeof(stable));
     p += sizeof(stable);
     return RLV2_Fnv1a32(raw, p);
+}
+
+// RuntimeLink V3 keeps the V2 telemetry and command payloads for this first
+// negotiated generation, but moves identity, capability, and section layout
+// into a permanent discovery header. Future protocols may replace either
+// section without changing the discovery mapping name or prefix.
+struct alignas(64) RuntimeDiscoveryHeaderV3 {
+    uint32_t magic = kRuntimeDiscoveryMagic;
+    uint32_t headerVersion = kRuntimeDiscoveryHeaderVersion;
+    uint32_t headerSize = sizeof(RuntimeDiscoveryHeaderV3);
+    uint32_t totalSize = 0;
+    uint32_t publisherPid = 0;
+    uint32_t archClass = 0;
+    uint32_t productMajor = build::kProductMajor;
+    uint32_t productMinor = build::kProductMinor;
+    uint32_t productPatch = build::kProductPatch;
+    uint32_t buildNumber = build::kBuildNumber;
+    uint32_t releaseChannel = build::kReleaseChannelId;
+    uint32_t protocolMin = build::kRuntimeProtocolMin;
+    uint32_t protocolMax = build::kRuntimeProtocolMax;
+    uint32_t nativeAbiMin = build::kNativeAbiMin;
+    uint32_t nativeAbiMax = build::kNativeAbiMax;
+    uint32_t telemetryOffset = 0;
+    uint32_t telemetrySize = 0;
+    uint32_t commandOffset = 0;
+    uint32_t commandSize = 0;
+    uint32_t accessFlags = 0;
+    uint64_t capabilityFlags = build::kDriverCapabilities;
+    uint32_t headerCrc = 0;
+    uint32_t reservedStable = 0;
+
+    uint64_t sessionId = 0;
+    uint64_t heartbeatQpc = 0;
+    uint32_t telemetrySequence = 0;
+    uint32_t commandRequestId = 0;
+    uint32_t commandRequestToken = 0;
+    uint32_t commandProcessedId = 0;
+    uint32_t commandProcessedToken = 0;
+    uint32_t commandResult = 0;
+    uint32_t reserved[14] = {};
+};
+
+static_assert(std::is_trivially_copyable<RuntimeDiscoveryHeaderV3>::value,
+              "RuntimeDiscoveryHeaderV3 must be trivially copyable");
+static_assert(sizeof(RuntimeDiscoveryHeaderV3) == 192u,
+              "RuntimeDiscoveryHeaderV3 must remain 192 bytes");
+
+struct RuntimeLinkSharedMemoryV3 {
+    RuntimeDiscoveryHeaderV3 header;
+    RuntimeLinkTelemetryV2 telemetry;
+    RuntimeLinkCommandV2 command;
+};
+
+static_assert(std::is_trivially_copyable<RuntimeLinkSharedMemoryV3>::value,
+              "RuntimeLinkSharedMemoryV3 must be trivially copyable");
+static_assert(offsetof(RuntimeLinkSharedMemoryV3, telemetry) == 192u,
+              "RuntimeLink V3 telemetry must be 64-byte aligned");
+static_assert(offsetof(RuntimeLinkSharedMemoryV3, command) == 704u,
+              "RuntimeLink V3 command must follow telemetry");
+static_assert(sizeof(RuntimeLinkSharedMemoryV3) == 1216u,
+              "RuntimeLink V3 mapping layout must remain deterministic");
+
+inline constexpr uint32_t RuntimeLinkMappingSizeV3() {
+    return sizeof(RuntimeLinkSharedMemoryV3);
+}
+
+inline uint32_t RLV3_HeaderCrc(const RuntimeDiscoveryHeaderV3& h) {
+    // The stable prefix ends immediately before headerCrc. Heartbeats and
+    // command/telemetry sequence words intentionally do not affect identity.
+    return RLV2_Fnv1a32(&h, offsetof(RuntimeDiscoveryHeaderV3, headerCrc));
+}
+
+struct alignas(64) RuntimeDiscoveryHostSlotV1 {
+    uint32_t magic = 0;
+    uint32_t pid = 0;
+    uint32_t archClass = 0;
+    uint32_t headerVersion = 0;
+    uint64_t sessionId = 0;
+    uint64_t lastHeartbeatQpc = 0;
+    uint64_t capabilityFlags = 0;
+    uint32_t productMajor = 0;
+    uint32_t productMinor = 0;
+    uint32_t productPatch = 0;
+    uint32_t buildNumber = 0;
+    uint32_t protocolMax = 0;
+    uint32_t nativeAbiMax = 0;
+};
+
+static_assert(sizeof(RuntimeDiscoveryHostSlotV1) == 64u,
+              "Runtime discovery host slot must remain one cache line");
+
+struct alignas(64) RuntimeDiscoveryHostsRegistryV1 {
+    uint32_t magic = kRuntimeDiscoveryRegistryMagic;
+    uint32_t version = kRuntimeDiscoveryRegistryVersion;
+    uint32_t totalSize = sizeof(RuntimeDiscoveryHostsRegistryV1);
+    uint32_t slotCapacity = kRuntimeHostMaxCount;
+    uint32_t slotSize = sizeof(RuntimeDiscoveryHostSlotV1);
+    uint32_t reserved[11] = {};
+    RuntimeDiscoveryHostSlotV1 slots[kRuntimeHostMaxCount];
+};
+
+static_assert(sizeof(RuntimeDiscoveryHostsRegistryV1) ==
+                  64u + 64u * kRuntimeHostMaxCount,
+              "Runtime discovery registry layout must remain deterministic");
+
+inline bool RLV3_HostsSlotIsEmpty(const RuntimeDiscoveryHostSlotV1& s) {
+    return s.magic != kRuntimeDiscoveryMagic || s.pid == 0u ||
+           s.sessionId == 0u;
+}
+
+inline bool RLV3_HostsSlotIsFresh(const RuntimeDiscoveryHostSlotV1& s,
+                                  uint64_t nowQpc, uint64_t qpcFreq,
+                                  uint32_t timeoutMs) {
+    if (RLV3_HostsSlotIsEmpty(s)) return false;
+    const uint64_t ageQpc = nowQpc > s.lastHeartbeatQpc
+        ? nowQpc - s.lastHeartbeatQpc : 0u;
+    if (qpcFreq == 0u) return ageQpc == 0u;
+    return (ageQpc * 1000u) / qpcFreq < timeoutMs;
 }
 
 // ─── Hosts registry ─────────────────────────────────────────────────────────

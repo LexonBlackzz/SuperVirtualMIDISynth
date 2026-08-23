@@ -44,6 +44,17 @@ bool WaitForTelemetry(svms::RuntimeLinkClientV2& client,
     return false;
 }
 
+bool WaitForTelemetry(svms::RuntimeLinkClientV3& client,
+                      svms::RuntimeLinkTelemetryV2& out,
+                      unsigned int timeoutMs) {
+    const DWORD start = GetTickCount();
+    do {
+        if (client.ReadTelemetry(out) && out.timestampQpc != 0u) return true;
+        Sleep(25);
+    } while (static_cast<int>(GetTickCount() - start) < (int)timeoutMs);
+    return false;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -247,6 +258,49 @@ int main(int argc, char** argv) {
     }
     std::printf("INFO: telemetry OK (sr=%u frames=%u master=%.2f)\n",
                 t.sampleRate, t.bufferFrames, t.live.masterVolume);
+
+    // RuntimeLink V3 is published beside, not instead of, V2. Its neutral
+    // discovery registry carries version/capability information while the
+    // section payload remains exactly compatible in this generation.
+    svms::RuntimeLinkClientV3::PeerInfo v3Hosts[4]{};
+    const uint32_t v3HostCount =
+        svms::RuntimeLinkClientV3::EnumerateHosts(v3Hosts, 4u);
+    bool foundV3Host = false;
+    for (uint32_t i = 0u; i < v3HostCount; ++i) {
+        if (v3Hosts[i].pid == ownPid && v3Hosts[i].fresh) {
+            foundV3Host = true;
+            break;
+        }
+    }
+    if (!foundV3Host) {
+        std::puts("FAIL: V3 discovery registry did not publish this driver");
+        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
+        return 1;
+    }
+
+    svms::RuntimeLinkClientV3 v3Client;
+    if (!v3Client.Open(ownPid)) {
+        std::puts("FAIL: could not negotiate RuntimeLink V3");
+        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
+        return 1;
+    }
+    const svms::RuntimeLinkClientV3::PeerInfo peer = v3Client.GetPeerInfo();
+    if (peer.protocolMin > 3u || peer.protocolMax < 3u ||
+        (peer.capabilityFlags & svms::build::CapabilityRuntimeLinkV3) == 0u ||
+        peer.productMajor != svms::build::kProductMajor ||
+        peer.buildNumber != svms::build::kBuildNumber) {
+        std::puts("FAIL: RuntimeLink V3 discovery metadata is inconsistent");
+        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
+        return 1;
+    }
+    svms::RuntimeLinkTelemetryV2 v3Telemetry{};
+    if (!WaitForTelemetry(v3Client, v3Telemetry, 3000u) ||
+        v3Telemetry.sampleRate != t.sampleRate ||
+        v3Client.SendPing(1000u) != svms::RLResult::Ok) {
+        std::puts("FAIL: RuntimeLink V3 telemetry/command path is not live");
+        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
+        return 1;
+    }
 
     // ── 3. Note through the real export; expect dispatch counters ───
     shortMsg(handle, 0x00643C90u);  // note 60, vel 100, channel 0

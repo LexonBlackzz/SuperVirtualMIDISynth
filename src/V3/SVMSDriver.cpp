@@ -2882,7 +2882,8 @@ bool Driver::Initialize() {
             [this](const svms::RuntimeLinkCommandV2& cmd, char* resultText) {
                 return HandleRuntimeLinkCommand(cmd, resultText);
             });
-        LOG("RuntimeLink V2 initialized: PID=%u session=%016llX",
+        LOG("RuntimeLink V2%s initialized: PID=%u session=%016llX",
+            g_rlDriver.IsV3Initialized() ? "/V3" : "",
             g_rlDriver.GetPID(),
             static_cast<unsigned long long>(g_rlDriver.GetSessionId()));
     } else {

@@ -3,6 +3,8 @@ project(SuperVirtualMIDISynthV3 VERSION 0.7.0 LANGUAGES CXX)
 
 include(CTest)
 
+option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
+
 if(WIN32)
     enable_language(RC)
 endif()
@@ -36,6 +38,13 @@ if(NOT SVMS_RELEASE_CHANNEL MATCHES "^(stable|prerelease|local)$")
     message(FATAL_ERROR
         "SVMS_RELEASE_CHANNEL must be stable, prerelease, or local")
 endif()
+if(SVMS_RELEASE_CHANNEL STREQUAL "stable")
+    set(SVMS_RELEASE_CHANNEL_ID 1)
+elseif(SVMS_RELEASE_CHANNEL STREQUAL "prerelease")
+    set(SVMS_RELEASE_CHANNEL_ID 2)
+else()
+    set(SVMS_RELEASE_CHANNEL_ID 0)
+endif()
 
 execute_process(
     COMMAND git rev-parse --short=12 HEAD
@@ -48,8 +57,16 @@ if(NOT SVMS_GIT_RESULT EQUAL 0 OR SVMS_GIT_COMMIT STREQUAL "")
     set(SVMS_GIT_COMMIT "unknown")
 endif()
 
-set(SVMS_RUNTIME_PROTOCOL_MIN 2)
-set(SVMS_RUNTIME_PROTOCOL_MAX 2)
+if(SVMS_XP_COMPAT)
+    set(SVMS_RUNTIME_PROTOCOL_MIN 0)
+    set(SVMS_RUNTIME_PROTOCOL_MAX 0)
+    set(SVMS_DRIVER_RUNTIME_CAPABILITIES "0ull")
+else()
+    set(SVMS_RUNTIME_PROTOCOL_MIN 2)
+    set(SVMS_RUNTIME_PROTOCOL_MAX 3)
+    set(SVMS_DRIVER_RUNTIME_CAPABILITIES
+        "CapabilityRuntimeLinkV2 | CapabilityRuntimeLinkV3")
+endif()
 set(SVMS_NATIVE_ABI_MIN 0)
 set(SVMS_NATIVE_ABI_MAX 0)
 set(SVMS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -75,7 +92,6 @@ if(WIN32)
         "${SVMS_GENERATED_DIR}/SVMSConfiguratorVersion.rc" @ONLY)
 endif()
 
-option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
 if(SVMS_XP_COMPAT AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR "SVMS_XP_COMPAT is a 32-bit-only target")
 endif()

@@ -25,6 +25,8 @@ inline constexpr const wchar_t* kProductVersionWide =
     SVMS_PRODUCT_VERSION_WSTRING;
 inline constexpr const char* kReleaseChannel = SVMS_RELEASE_CHANNEL_STRING;
 inline constexpr const char* kGitCommit = SVMS_GIT_COMMIT_STRING;
+inline constexpr std::uint32_t kReleaseChannelId =
+    @SVMS_RELEASE_CHANNEL_ID@u; // 0 local, 1 stable, 2 prerelease
 
 inline constexpr std::uint32_t kRuntimeProtocolMin =
     @SVMS_RUNTIME_PROTOCOL_MIN@u;
@@ -45,14 +47,14 @@ enum Capability : std::uint64_t {
 };
 
 inline constexpr std::uint64_t kDriverCapabilities =
-    CapabilityRuntimeLinkV2 | CapabilityLiveConfiguration |
+    @SVMS_DRIVER_RUNTIME_CAPABILITIES@ | CapabilityLiveConfiguration |
     CapabilityTelemetry | CapabilitySafeVoiceLimit |
     CapabilitySoundFontReload | CapabilityKdmapiFacade;
 
 inline constexpr std::uint64_t kConfiguratorCapabilities =
     CapabilityRuntimeLinkV2 | CapabilityLiveConfiguration |
     CapabilityTelemetry | CapabilitySafeVoiceLimit |
-    CapabilitySoundFontReload;
+    CapabilitySoundFontReload | CapabilityRuntimeLinkV3;
 
 } // namespace svms::build
 
