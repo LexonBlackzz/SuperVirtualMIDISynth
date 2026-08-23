@@ -34,6 +34,7 @@
 #include "SVMSLimiter.h"
 #include "SVMSRuntimeLink.h"
 #include "SVMSBuildInfo.h"
+#include "SVMSNativeOffline.h"
 #include "include/svmsapi.h"
 
 // ── Logging ────────────────────────────────────────────────────────────
@@ -5349,6 +5350,7 @@ static void MaybeShutdownDriver() {
 static constexpr uint32_t kNativeSessionCapacity = 64u;
 static std::atomic<uint64_t> g_nativeSessions[kNativeSessionCapacity]{};
 static std::atomic<uint32_t> g_nativeSessionGeneration{1u};
+static svms::NativeOfflineSessions g_nativeOfflineSessions;
 
 static bool NativeSessionIsValid(SVMS_Session session) {
     const uint32_t encodedIndex = static_cast<uint32_t>(session);
@@ -5399,6 +5401,8 @@ static SVMS_Result SVMS_CALL NativeCreateSession(
 }
 
 static SVMS_Result SVMS_CALL NativeDestroySession(SVMS_Session session) {
+    if (g_nativeOfflineSessions.IsToken(session))
+        return g_nativeOfflineSessions.Destroy(session);
     const uint32_t encodedIndex = static_cast<uint32_t>(session);
     if (encodedIndex == 0u || encodedIndex > kNativeSessionCapacity)
         return SVMS_RESULT_INVALID_ARGUMENT;
@@ -5457,6 +5461,8 @@ static SVMS_Result SVMS_CALL NativeSendSystemExclusive(
 }
 
 static SVMS_Result SVMS_CALL NativeReset(SVMS_Session session) {
+    if (g_nativeOfflineSessions.IsToken(session))
+        return g_nativeOfflineSessions.Reset(session);
     if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
     if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
     g_driver->ResetAllVoices();
@@ -5641,6 +5647,44 @@ static SVMS_Result SVMS_CALL NativePanic(SVMS_Session session) {
     return NativeReset(session);
 }
 
+static bool NativeUtf8ToWide(const char* pathUtf8, std::wstring& path) {
+    if (!pathUtf8 || !*pathUtf8) return false;
+    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                              pathUtf8, -1, nullptr, 0);
+    if (required <= 1) return false;
+    path.assign(static_cast<size_t>(required), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pathUtf8, -1,
+                            path.data(), required) == 0) {
+        path.clear();
+        return false;
+    }
+    path.resize(static_cast<size_t>(required - 1));
+    return true;
+}
+
+static SVMS_Result SVMS_CALL NativeCreateOfflineSession(
+    const SVMS_OfflineSessionConfig* config, const char* soundfontPathUtf8,
+    SVMS_Session* outSession) {
+    std::wstring soundfont;
+    if (!NativeUtf8ToWide(soundfontPathUtf8, soundfont))
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    return g_nativeOfflineSessions.Create(config, soundfont, outSession);
+}
+
+static SVMS_Result SVMS_CALL NativeRenderOffline(
+    SVMS_Session session, const SVMS_OfflineEvent* events,
+    uint32_t eventCount, float* outputLeft, float* outputRight,
+    uint32_t frameCount) {
+    return g_nativeOfflineSessions.Render(session, events, eventCount,
+                                           outputLeft, outputRight,
+                                           frameCount);
+}
+
+static SVMS_Result SVMS_CALL NativeGetOfflineTelemetry(
+    SVMS_Session session, SVMS_OfflineTelemetry* telemetry) {
+    return g_nativeOfflineSessions.GetTelemetry(session, telemetry);
+}
+
 SVMS_Result SVMS_CALL SVMS_GetInterface(
     uint32_t requestedAbi, uint32_t callerTableSize,
     SVMS_Interface* outInterface) {
@@ -5661,7 +5705,8 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_TELEMETRY_V1 | SVMS_CAP_KDMAPI_FACADE |
         SVMS_CAP_EXACT_MONOTONIC_NS | SVMS_CAP_EXACT_OUTPUT_FRAMES |
         SVMS_CAP_QUEUE_CONTROL | SVMS_CAP_SOUNDFONT_RELOAD |
-        SVMS_CAP_MIXED_TIMESTAMP_BATCH;
+        SVMS_CAP_MIXED_TIMESTAMP_BATCH |
+        SVMS_CAP_ISOLATED_OFFLINE_SESSIONS;
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;
     table.product_patch = svms::build::kProductPatch;
@@ -5682,6 +5727,9 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.get_queue_info = NativeGetQueueInfo;
     table.load_soundfont_utf8 = NativeLoadSoundFontUtf8;
     table.panic = NativePanic;
+    table.create_offline_session = NativeCreateOfflineSession;
+    table.render_offline = NativeRenderOffline;
+    table.get_offline_telemetry = NativeGetOfflineTelemetry;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

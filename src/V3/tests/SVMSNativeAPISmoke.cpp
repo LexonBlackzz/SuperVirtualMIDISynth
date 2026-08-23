@@ -13,8 +13,8 @@ using TerminateKDMAPIProc = void (WINAPI*)();
 using SendDirectDataProc = void (WINAPI*)(DWORD);
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::puts("FAIL: expected the path to SVMS.dll");
+    if (argc < 2 || argc > 3) {
+        std::puts("FAIL: expected SVMS.dll and optional SoundFont path");
         return 1;
     }
     HMODULE runtime = LoadLibraryA(argv[1]);
@@ -70,22 +70,98 @@ int main(int argc, char** argv) {
                              SVMS_CAP_EXACT_OUTPUT_FRAMES |
                              SVMS_CAP_QUEUE_CONTROL |
                              SVMS_CAP_SOUNDFONT_RELOAD |
-                             SVMS_CAP_MIXED_TIMESTAMP_BATCH)) !=
+                             SVMS_CAP_MIXED_TIMESTAMP_BATCH |
+                             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS)) !=
             (SVMS_CAP_EXACT_QPC_TIMESTAMPS |
              SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_SYSTEM_EXCLUSIVE |
              SVMS_CAP_TELEMETRY_V1 | SVMS_CAP_EXACT_MONOTONIC_NS |
              SVMS_CAP_EXACT_OUTPUT_FRAMES | SVMS_CAP_QUEUE_CONTROL |
-             SVMS_CAP_SOUNDFONT_RELOAD | SVMS_CAP_MIXED_TIMESTAMP_BATCH) ||
+             SVMS_CAP_SOUNDFONT_RELOAD | SVMS_CAP_MIXED_TIMESTAMP_BATCH |
+             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS) ||
         !api.create_session || !api.destroy_session || !api.send_short ||
         !api.send_short_at_qpc || !api.send_short_batch ||
         !api.send_system_exclusive || !api.reset || !api.get_telemetry ||
         !api.get_runtime_clock || !api.send_timed_short_batch ||
         !api.get_output_clock || !api.get_monotonic_clock ||
         !api.set_ingress_mode || !api.get_queue_info ||
-        !api.load_soundfont_utf8 || !api.panic) {
+        !api.load_soundfont_utf8 || !api.panic ||
+        !api.create_offline_session || !api.render_offline ||
+        !api.get_offline_telemetry) {
         std::puts("FAIL: ABI V1 table is invalid");
         FreeLibrary(runtime);
         return 1;
+    }
+
+    if (argc == 3) {
+        SVMS_OfflineSessionConfig offlineConfig{};
+        offlineConfig.struct_size = sizeof(offlineConfig);
+        offlineConfig.struct_version = SVMS_STRUCT_VERSION_1;
+        offlineConfig.session_kind = SVMS_SESSION_OFFLINE_RENDER;
+        offlineConfig.sample_rate = 44100u;
+        offlineConfig.max_voices = 64u;
+        offlineConfig.render_threads = 1u;
+        offlineConfig.max_block_frames = 64u;
+        offlineConfig.render_backend = SVMS_RENDER_BACKEND_SCALAR;
+        offlineConfig.limiter_enabled = 0u;
+        offlineConfig.limiter_algorithm = SVMS_LIMITER_CLASSIC;
+        offlineConfig.master_volume = 1.0f;
+        offlineConfig.limiter_threshold = 0.95f;
+        offlineConfig.limiter_lookahead_ms = 3.0f;
+        offlineConfig.limiter_attack_ms = 0.5f;
+        offlineConfig.limiter_release_ms = 100.0f;
+        SVMS_Session first = 0u, second = 0u;
+        if (api.create_offline_session(&offlineConfig, argv[2], &first) !=
+                SVMS_RESULT_OK || first == 0u) {
+            std::puts("FAIL: isolated offline session creation failed");
+            FreeLibrary(runtime);
+            return 1;
+        }
+        offlineConfig.session_kind = SVMS_SESSION_SILENT_ANALYSIS;
+        if (api.create_offline_session(&offlineConfig, argv[2], &second) !=
+                SVMS_RESULT_OK || second == 0u || second == first) {
+            std::puts("FAIL: isolated analysis session creation failed");
+            api.destroy_session(first);
+            FreeLibrary(runtime);
+            return 1;
+        }
+        SVMS_OfflineEvent offlineEvents[2]{};
+        offlineEvents[0].frame_offset = 0u;
+        offlineEvents[0].packed_message = 0x00643c90u;
+        offlineEvents[1].frame_offset = 32u;
+        offlineEvents[1].packed_message = 0x00003c80u;
+        float left[64]{}, right[64]{};
+        if (api.render_offline(first, offlineEvents, 2u, left, right, 64u) !=
+                SVMS_RESULT_OK ||
+            api.render_offline(second, nullptr, 0u, nullptr, nullptr, 64u) !=
+                SVMS_RESULT_OK) {
+            std::puts("FAIL: isolated exact-frame render failed");
+            api.destroy_session(second);
+            api.destroy_session(first);
+            FreeLibrary(runtime);
+            return 1;
+        }
+        SVMS_OfflineTelemetry firstInfo{}, secondInfo{};
+        firstInfo.struct_size = sizeof(firstInfo);
+        firstInfo.struct_version = SVMS_STRUCT_VERSION_1;
+        secondInfo.struct_size = sizeof(secondInfo);
+        secondInfo.struct_version = SVMS_STRUCT_VERSION_1;
+        if (api.get_offline_telemetry(first, &firstInfo) != SVMS_RESULT_OK ||
+            api.get_offline_telemetry(second, &secondInfo) != SVMS_RESULT_OK ||
+            firstInfo.output_frame != 64u || firstInfo.submitted_events != 2u ||
+            secondInfo.output_frame != 64u ||
+            secondInfo.submitted_events != 0u ||
+            api.reset(first) != SVMS_RESULT_OK ||
+            api.destroy_session(second) != SVMS_RESULT_OK ||
+            api.destroy_session(first) != SVMS_RESULT_OK ||
+            api.render_offline(first, nullptr, 0u, left, right, 1u) !=
+                SVMS_RESULT_NOT_INITIALIZED) {
+            std::puts("FAIL: isolated session state/ownership was not independent");
+            api.destroy_session(second);
+            api.destroy_session(first);
+            FreeLibrary(runtime);
+            return 1;
+        }
+        std::puts("INFO: isolated offline/analysis sessions passed");
     }
 
     uint64_t now = 0u, frequency = 0u;

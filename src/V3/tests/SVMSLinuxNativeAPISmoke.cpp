@@ -26,10 +26,13 @@ int main(int argc, char** argv) {
         (api.capabilities & SVMS_CAP_EXACT_MONOTONIC_NS) != 0u &&
         (api.capabilities & SVMS_CAP_EXACT_OUTPUT_FRAMES) != 0u &&
         (api.capabilities & SVMS_CAP_MIXED_TIMESTAMP_BATCH) != 0u &&
+        (api.capabilities & SVMS_CAP_ISOLATED_OFFLINE_SESSIONS) != 0u &&
         (api.capabilities & SVMS_CAP_SHORT_EVENT_BATCH) != 0u &&
         api.create_session && api.destroy_session && api.send_short_batch &&
         api.get_runtime_clock && api.send_timed_short_batch &&
-        api.get_output_clock && api.get_monotonic_clock;
+        api.get_output_clock && api.get_monotonic_clock &&
+        api.create_offline_session && api.render_offline &&
+        api.get_offline_telemetry;
     uint64_t now = 0u, frequency = 0u;
     const bool clockOkay = negotiated &&
         api.get_runtime_clock(&now, &frequency) == SVMS_RESULT_OK &&

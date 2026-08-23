@@ -1,5 +1,6 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSStandaloneSynth.h"
+#include "SVMSNativeOffline.h"
 #include "SVMSBuildInfo.h"
 #include "include/svmsapi.h"
 
@@ -617,6 +618,7 @@ KdmapiRuntime& Runtime() {
 constexpr uint32_t kNativeSessionCapacity = 64u;
 std::atomic<uint64_t> gNativeSessions[kNativeSessionCapacity]{};
 std::atomic<uint32_t> gNativeSessionGeneration{1u};
+svms::NativeOfflineSessions gNativeOfflineSessions;
 std::atomic<bool> gKdmapiOwner{false};
 std::mutex gFrontendMutex;
 
@@ -667,6 +669,8 @@ SVMS_Result NativeCreateSession(const SVMS_SessionConfig* config,
 }
 
 SVMS_Result NativeDestroySession(SVMS_Session session) {
+    if (gNativeOfflineSessions.IsToken(session))
+        return gNativeOfflineSessions.Destroy(session);
     const uint32_t encodedIndex = static_cast<uint32_t>(session);
     if (!encodedIndex || encodedIndex > kNativeSessionCapacity)
         return SVMS_RESULT_INVALID_ARGUMENT;
@@ -714,6 +718,8 @@ SVMS_Result NativeSendSystemExclusive(SVMS_Session session, const uint8_t*,
 }
 
 SVMS_Result NativeReset(SVMS_Session session) {
+    if (gNativeOfflineSessions.IsToken(session))
+        return gNativeOfflineSessions.Reset(session);
     if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
     return Runtime().Submit(0u, EventKind::Reset) ? SVMS_RESULT_OK
                                                   : SVMS_RESULT_INTERNAL_ERROR;
@@ -820,6 +826,33 @@ SVMS_Result NativeGetQueueInfo(SVMS_Session session,
     return SVMS_RESULT_OK;
 }
 
+SVMS_Result NativeCreateOfflineSession(
+    const SVMS_OfflineSessionConfig* config, const char* soundfontPathUtf8,
+    SVMS_Session* outSession) {
+    if (!soundfontPathUtf8 || !*soundfontPathUtf8)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    try {
+        return gNativeOfflineSessions.Create(
+            config, Utf8ToWide(soundfontPathUtf8), outSession);
+    } catch (...) {
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    }
+}
+
+SVMS_Result NativeRenderOffline(
+    SVMS_Session session, const SVMS_OfflineEvent* events,
+    uint32_t eventCount, float* outputLeft, float* outputRight,
+    uint32_t frameCount) {
+    return gNativeOfflineSessions.Render(session, events, eventCount,
+                                          outputLeft, outputRight,
+                                          frameCount);
+}
+
+SVMS_Result NativeGetOfflineTelemetry(
+    SVMS_Session session, SVMS_OfflineTelemetry* telemetry) {
+    return gNativeOfflineSessions.GetTelemetry(session, telemetry);
+}
+
 } // namespace
 
 #define SVMS_LINUX_EXPORT extern "C" __attribute__((visibility("default")))
@@ -898,7 +931,8 @@ SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.capabilities = SVMS_CAP_EXACT_MONOTONIC_NS |
         SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_TELEMETRY_V1 |
         SVMS_CAP_KDMAPI_FACADE | SVMS_CAP_EXACT_OUTPUT_FRAMES |
-        SVMS_CAP_MIXED_TIMESTAMP_BATCH;
+        SVMS_CAP_MIXED_TIMESTAMP_BATCH |
+        SVMS_CAP_ISOLATED_OFFLINE_SESSIONS;
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;
     table.product_patch = svms::build::kProductPatch;
@@ -917,6 +951,9 @@ SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.get_monotonic_clock = NativeGetMonotonicClock;
     table.get_queue_info = NativeGetQueueInfo;
     table.panic = NativeReset;
+    table.create_offline_session = NativeCreateOfflineSession;
+    table.render_offline = NativeRenderOffline;
+    table.get_offline_telemetry = NativeGetOfflineTelemetry;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

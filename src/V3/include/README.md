@@ -78,7 +78,28 @@ memory layouts into applications.
 This is deliberate: WinMM, native API, KDMAPI, and Ziggy integrations share one
 scheduler, one synthesis engine, and one ownership model.
 
-ABI-1 session handles currently provide reference-counted ownership of that
-single process engine. They are not yet independent synth instances with
-separate MIDI state or SoundFonts; applications must check future capabilities
-before assuming isolated real-time, offline, or analysis sessions.
+Handles returned by the original `create_session` function provide
+reference-counted ownership of that single process engine. They are not
+independent synth instances with separate MIDI state or SoundFonts. Isolated
+caller-driven sessions use the capability and functions below; independent
+native real-time audio sessions remain future work.
+
+## Isolated offline and analysis sessions
+
+Runtimes advertising `SVMS_CAP_ISOLATED_OFFLINE_SESSIONS` can create independent
+caller-driven synths through `create_offline_session`. Each has its own
+SoundFont, channel state, voice pool, renderer, limiter, and absolute output
+frame. These sessions never open or share an OS audio device.
+
+Fill `SVMS_OfflineSessionConfig`, pass a UTF-8 SoundFont path, then call
+`render_offline` with planar caller-owned float buffers. Each
+`SVMS_OfflineEvent.frame_offset` is exact within that call; offsets must be
+nondecreasing and equal-frame events retain array order. An event at
+`frame_offset == frame_count` changes state exactly at the boundary for the next
+call.
+
+`SVMS_SESSION_SILENT_ANALYSIS` runs the same synthesis and lifecycle state but
+allows null output buffers. Scratch storage is allocated at session creation up
+to `max_block_frames`, so rendering does not grow buffers. Use
+`get_offline_telemetry` for position, event, voice, and stealing counters, and
+destroy either kind with the original `destroy_session` function.

@@ -282,6 +282,7 @@ set(HEADERS
     SVMSFrameClock.h
     SVMSPostFilter.h
     SVMSLimiter.h
+    SVMSNativeOffline.h
     include/svmsapi.h
 )
 

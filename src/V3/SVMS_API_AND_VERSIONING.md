@@ -399,16 +399,19 @@ Current implementation status (2026-08-23):
    output-frame submission, mixed-clock bulk submission, SysEx, queue controls,
    SoundFont reload, reset/panic, clocks, and telemetry on Windows. Linux
    exposes the portable subset and rejects unsupported timestamp domains.
-10. [ ] Add genuinely independent real-time, offline-render, and analysis
-    sessions with separate SoundFonts and MIDI state. ABI-1 handles currently
-    share one process engine and must not be documented as isolated instances.
-11. [x] Inventory and implement the KDMAPI-compatible export surface as a thin
+10. [x] Add independent caller-driven offline-render and silent-analysis
+    sessions with separate SoundFonts, MIDI state, voice pools, render state,
+    exact within-call event frames, preallocated buffers, and telemetry.
+11. [ ] Add independent native real-time sessions with explicit audio-backend
+    selection and lifecycle. The original ABI-1 real-time handles still share
+    one process engine and must not be documented as isolated instances.
+12. [x] Inventory and implement the KDMAPI-compatible export surface as a thin
     facade over a hidden native session.
-12. [x] Add C/C++ ABI checks and x86, x64, and XP x86 compatibility tests, and
+13. [x] Add C/C++ ABI checks and x86, x64, and XP x86 compatibility tests, and
     publish the same ABI as `libsvmsapi.so` on Linux.
-13. [x] Retain RuntimeLink V2, existing KDMAPI exports, and compatibility binary
+14. [x] Retain RuntimeLink V2, existing KDMAPI exports, and compatibility binary
     names in automated tests before expanding either API.
-14. [x] Publish the canonical `SVMSAPI.dll` name while retaining `SVMS.dll` as
+15. [x] Publish the canonical `SVMSAPI.dll` name while retaining `SVMS.dll` as
     a compatibility alias.
 
 These should land as independently testable commits. The versioning and

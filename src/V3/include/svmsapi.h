@@ -45,7 +45,8 @@ enum {
     SVMS_CAP_EXACT_OUTPUT_FRAMES  = UINT64_C(1) << 6,
     SVMS_CAP_QUEUE_CONTROL        = UINT64_C(1) << 7,
     SVMS_CAP_SOUNDFONT_RELOAD     = UINT64_C(1) << 8,
-    SVMS_CAP_MIXED_TIMESTAMP_BATCH = UINT64_C(1) << 9
+    SVMS_CAP_MIXED_TIMESTAMP_BATCH = UINT64_C(1) << 9,
+    SVMS_CAP_ISOLATED_OFFLINE_SESSIONS = UINT64_C(1) << 10
 };
 
 enum {
@@ -58,6 +59,23 @@ enum {
 enum {
     SVMS_INGRESS_PRIORITY = 0u,
     SVMS_INGRESS_LOSSLESS = 1u
+};
+
+enum {
+    SVMS_SESSION_OFFLINE_RENDER = 1u,
+    SVMS_SESSION_SILENT_ANALYSIS = 2u
+};
+
+enum {
+    SVMS_RENDER_BACKEND_AUTO = 0u,
+    SVMS_RENDER_BACKEND_SCALAR = 1u,
+    SVMS_RENDER_BACKEND_SSE2 = 2u,
+    SVMS_RENDER_BACKEND_AVX2 = 3u
+};
+
+enum {
+    SVMS_LIMITER_CLASSIC = 0u,
+    SVMS_LIMITER_ADAPTIVE = 1u
 };
 
 typedef struct SVMS_SessionConfig {
@@ -103,6 +121,52 @@ typedef struct SVMS_QueueInfo {
     uint64_t intentionally_shed_events;
     uint64_t cancelled_submissions;
 } SVMS_QueueInfo;
+
+// Configuration for an isolated caller-driven session. The SoundFont path is
+// supplied separately as UTF-8 so this structure has the same layout on x86
+// and x64. max_block_frames is also the allocation ceiling for one render call.
+typedef struct SVMS_OfflineSessionConfig {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint32_t session_kind;
+    uint32_t flags;
+    uint32_t sample_rate;
+    uint32_t max_voices;
+    uint32_t render_threads;
+    uint32_t max_block_frames;
+    uint32_t render_backend;
+    uint32_t limiter_enabled;
+    uint32_t limiter_algorithm;
+    float master_volume;
+    float limiter_threshold;
+    float limiter_lookahead_ms;
+    float limiter_attack_ms;
+    float limiter_release_ms;
+    uint32_t reserved[4];
+} SVMS_OfflineSessionConfig;
+
+// frame_offset is exact within the current render call. Records must be
+// nondecreasing by frame_offset; equal-frame records retain array order.
+typedef struct SVMS_OfflineEvent {
+    uint32_t frame_offset;
+    uint32_t packed_message;
+    uint32_t reserved[2];
+} SVMS_OfflineEvent;
+
+typedef struct SVMS_OfflineTelemetry {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint64_t output_frame;
+    uint64_t rendered_frames;
+    uint64_t submitted_events;
+    uint32_t active_voices;
+    uint32_t free_voices;
+    uint32_t voice_steals;
+    uint32_t sample_rate;
+    uint32_t max_block_frames;
+    uint32_t session_kind;
+    uint32_t reserved[2];
+} SVMS_OfflineTelemetry;
 
 typedef struct SVMS_TelemetryV1 {
     uint32_t struct_size;
@@ -158,6 +222,15 @@ typedef SVMS_Result (SVMS_CALL *SVMS_GetQueueInfoFn)(
 typedef SVMS_Result (SVMS_CALL *SVMS_LoadSoundFontUtf8Fn)(
     SVMS_Session session, const char* path_utf8);
 typedef SVMS_Result (SVMS_CALL *SVMS_PanicFn)(SVMS_Session session);
+typedef SVMS_Result (SVMS_CALL *SVMS_CreateOfflineSessionFn)(
+    const SVMS_OfflineSessionConfig* config, const char* soundfont_path_utf8,
+    SVMS_Session* out_session);
+typedef SVMS_Result (SVMS_CALL *SVMS_RenderOfflineFn)(
+    SVMS_Session session, const SVMS_OfflineEvent* events,
+    uint32_t event_count, float* output_left, float* output_right,
+    uint32_t frame_count);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetOfflineTelemetryFn)(
+    SVMS_Session session, SVMS_OfflineTelemetry* telemetry);
 
 typedef struct SVMS_Interface {
     uint32_t struct_size;
@@ -187,6 +260,9 @@ typedef struct SVMS_Interface {
     SVMS_GetQueueInfoFn get_queue_info;
     SVMS_LoadSoundFontUtf8Fn load_soundfont_utf8;
     SVMS_PanicFn panic;
+    SVMS_CreateOfflineSessionFn create_offline_session;
+    SVMS_RenderOfflineFn render_offline;
+    SVMS_GetOfflineTelemetryFn get_offline_telemetry;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
@@ -207,6 +283,12 @@ static_assert(sizeof(SVMS_TimedShortEvent) == 16,
               "SVMS_TimedShortEvent ABI changed");
 static_assert(sizeof(SVMS_QueueInfo) == 88,
               "SVMS_QueueInfo ABI changed");
+static_assert(sizeof(SVMS_OfflineSessionConfig) == 80,
+              "SVMS_OfflineSessionConfig ABI changed");
+static_assert(sizeof(SVMS_OfflineEvent) == 16,
+              "SVMS_OfflineEvent ABI changed");
+static_assert(sizeof(SVMS_OfflineTelemetry) == 64,
+              "SVMS_OfflineTelemetry ABI changed");
 static_assert(sizeof(SVMS_TelemetryV1) == 128,
               "SVMS_TelemetryV1 ABI changed");
 #endif

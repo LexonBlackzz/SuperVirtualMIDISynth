@@ -103,6 +103,12 @@ nanosecond timestamps. `SVMS_TIMESTAMP_QPC` is Windows-specific and is rejected
 on Linux. The Linux ingress is currently fixed to lossless operation, so queue
 mode control is not advertised even though queue pressure can be queried.
 
+Linux also advertises `SVMS_CAP_ISOLATED_OFFLINE_SESSIONS`. Its caller-driven
+offline and silent-analysis sessions use the same API and exact frame-offset
+rules as Windows, but own separate SoundFonts, MIDI state, voices, and render
+state. They do not open ALSA devices; the application owns the planar float
+output buffers.
+
 `libOmniMIDI.so` is a symbolic compatibility name for the same shared object,
 not a second engine. Native and KDMAPI users in one process therefore share
 runtime ownership correctly. Linux SysEx is not advertised yet and returns
