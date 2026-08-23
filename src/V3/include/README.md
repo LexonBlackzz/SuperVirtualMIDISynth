@@ -103,3 +103,17 @@ allows null output buffers. Scratch storage is allocated at session creation up
 to `max_block_frames`, so rendering does not grow buffers. Use
 `get_offline_telemetry` for position, event, voice, and stealing counters, and
 destroy either kind with the original `destroy_session` function.
+
+## Configuration access
+
+Windows runtimes advertising `SVMS_CAP_CONFIG_JSON` expose the selected V3
+configuration through `get_config_json` and `get_config_path_utf8`. Both use a
+two-call buffer protocol: call with a null buffer to receive the required byte
+count (including the terminator), allocate it, then call again.
+
+`patch_config_json` accepts a UTF-8 JSON Merge Patch. It validates recognized
+values, preserves untouched and unknown fields, serializes with the same
+cross-process mutex as first-run creation, and atomically replaces the file.
+Malformed documents, unsupported schemas, schema changes, and invalid known
+values are rejected without modifying the original. Persisted changes require
+an engine restart; this function does not silently live-reconfigure playback.

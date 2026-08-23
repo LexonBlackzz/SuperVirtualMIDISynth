@@ -71,13 +71,14 @@ int main(int argc, char** argv) {
                              SVMS_CAP_QUEUE_CONTROL |
                              SVMS_CAP_SOUNDFONT_RELOAD |
                              SVMS_CAP_MIXED_TIMESTAMP_BATCH |
-                             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS)) !=
+                             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS |
+                             SVMS_CAP_CONFIG_JSON)) !=
             (SVMS_CAP_EXACT_QPC_TIMESTAMPS |
              SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_SYSTEM_EXCLUSIVE |
              SVMS_CAP_TELEMETRY_V1 | SVMS_CAP_EXACT_MONOTONIC_NS |
              SVMS_CAP_EXACT_OUTPUT_FRAMES | SVMS_CAP_QUEUE_CONTROL |
              SVMS_CAP_SOUNDFONT_RELOAD | SVMS_CAP_MIXED_TIMESTAMP_BATCH |
-             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS) ||
+             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON) ||
         !api.create_session || !api.destroy_session || !api.send_short ||
         !api.send_short_at_qpc || !api.send_short_batch ||
         !api.send_system_exclusive || !api.reset || !api.get_telemetry ||
@@ -86,7 +87,8 @@ int main(int argc, char** argv) {
         !api.set_ingress_mode || !api.get_queue_info ||
         !api.load_soundfont_utf8 || !api.panic ||
         !api.create_offline_session || !api.render_offline ||
-        !api.get_offline_telemetry) {
+        !api.get_offline_telemetry || !api.get_config_json ||
+        !api.patch_config_json || !api.get_config_path_utf8) {
         std::puts("FAIL: ABI V1 table is invalid");
         FreeLibrary(runtime);
         return 1;
@@ -185,6 +187,32 @@ int main(int argc, char** argv) {
     }
     if (session == 0u) {
         std::puts("FAIL: session token is zero");
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    uint32_t configBytes = 0u, configPathBytes = 0u;
+    if (api.get_config_json(session, nullptr, &configBytes) !=
+            SVMS_RESULT_BUFFER_TOO_SMALL || configBytes < 3u ||
+        api.get_config_path_utf8(session, nullptr, &configPathBytes) !=
+            SVMS_RESULT_BUFFER_TOO_SMALL || configPathBytes < 2u) {
+        std::puts("FAIL: native configuration sizing query failed");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    char* configJson = new char[configBytes];
+    char* configPath = new char[configPathBytes];
+    const bool configQueryOkay =
+        api.get_config_json(session, configJson, &configBytes) ==
+            SVMS_RESULT_OK &&
+        api.get_config_path_utf8(session, configPath, &configPathBytes) ==
+            SVMS_RESULT_OK && configJson[0] == '{' && configPath[0] != '\0';
+    delete[] configPath;
+    delete[] configJson;
+    if (!configQueryOkay) {
+        std::puts("FAIL: native configuration query failed");
+        api.destroy_session(session);
         FreeLibrary(runtime);
         return 1;
     }

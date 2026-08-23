@@ -5685,6 +5685,56 @@ static SVMS_Result SVMS_CALL NativeGetOfflineTelemetry(
     return g_nativeOfflineSessions.GetTelemetry(session, telemetry);
 }
 
+static SVMS_Result NativeCopyUtf8(const std::string& value, char* buffer,
+                                  uint32_t* inoutBytes) {
+    if (!inoutBytes || value.size() >= UINT32_MAX)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    const uint32_t required = static_cast<uint32_t>(value.size() + 1u);
+    const uint32_t supplied = *inoutBytes;
+    *inoutBytes = required;
+    if (!buffer || supplied < required) return SVMS_RESULT_BUFFER_TOO_SMALL;
+    std::memcpy(buffer, value.c_str(), required);
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeGetConfigJson(
+    SVMS_Session session, char* bufferUtf8, uint32_t* inoutBufferBytes) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::string document;
+    if (!svms::ReadV3ConfigJson(document)) return SVMS_RESULT_INTERNAL_ERROR;
+    return NativeCopyUtf8(document, bufferUtf8, inoutBufferBytes);
+}
+
+static SVMS_Result SVMS_CALL NativePatchConfigJson(
+    SVMS_Session session, const char* mergePatchUtf8,
+    uint32_t mergePatchBytes) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    std::string warning;
+    if (svms::PatchV3ConfigJson(mergePatchUtf8, mergePatchBytes, &warning))
+        return SVMS_RESULT_OK;
+    return warning.find("invalid") != std::string::npos ||
+           warning.find("schema") != std::string::npos ||
+           warning.find("must be") != std::string::npos
+        ? SVMS_RESULT_INVALID_ARGUMENT : SVMS_RESULT_INTERNAL_ERROR;
+}
+
+static SVMS_Result SVMS_CALL NativeGetConfigPathUtf8(
+    SVMS_Session session, char* bufferUtf8, uint32_t* inoutBufferBytes) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    const std::wstring path = svms::GetV3ConfigPath();
+    if (path.empty()) return SVMS_RESULT_INTERNAL_ERROR;
+    const int bytes = WideCharToMultiByte(
+        CP_UTF8, 0, path.data(), static_cast<int>(path.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return SVMS_RESULT_INTERNAL_ERROR;
+    std::string utf8(static_cast<size_t>(bytes), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, path.data(),
+                            static_cast<int>(path.size()), utf8.data(), bytes,
+                            nullptr, nullptr) == 0)
+        return SVMS_RESULT_INTERNAL_ERROR;
+    return NativeCopyUtf8(utf8, bufferUtf8, inoutBufferBytes);
+}
+
 SVMS_Result SVMS_CALL SVMS_GetInterface(
     uint32_t requestedAbi, uint32_t callerTableSize,
     SVMS_Interface* outInterface) {
@@ -5706,7 +5756,7 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_EXACT_MONOTONIC_NS | SVMS_CAP_EXACT_OUTPUT_FRAMES |
         SVMS_CAP_QUEUE_CONTROL | SVMS_CAP_SOUNDFONT_RELOAD |
         SVMS_CAP_MIXED_TIMESTAMP_BATCH |
-        SVMS_CAP_ISOLATED_OFFLINE_SESSIONS;
+        SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON;
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;
     table.product_patch = svms::build::kProductPatch;
@@ -5730,6 +5780,9 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.create_offline_session = NativeCreateOfflineSession;
     table.render_offline = NativeRenderOffline;
     table.get_offline_telemetry = NativeGetOfflineTelemetry;
+    table.get_config_json = NativeGetConfigJson;
+    table.patch_config_json = NativePatchConfigJson;
+    table.get_config_path_utf8 = NativeGetConfigPathUtf8;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

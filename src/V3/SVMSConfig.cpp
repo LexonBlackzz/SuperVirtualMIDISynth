@@ -26,6 +26,27 @@ namespace fs = std::filesystem;
 
 constexpr uint32_t kConfigSchemaVersion = 1;
 constexpr wchar_t kConfigMutexName[] = L"Local\\SuperVirtualMIDISynth_Config_v1";
+constexpr uint64_t kMaximumConfigDocumentBytes = 16u * 1024u * 1024u;
+
+class ScopedConfigMutex {
+public:
+    ScopedConfigMutex() : handle_(CreateMutexW(nullptr, FALSE,
+                                               kConfigMutexName)) {
+        if (handle_) {
+            const DWORD wait = WaitForSingleObject(handle_, INFINITE);
+            locked_ = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+        }
+    }
+    ~ScopedConfigMutex() {
+        if (locked_) ReleaseMutex(handle_);
+        if (handle_) CloseHandle(handle_);
+    }
+    bool Locked() const noexcept { return locked_; }
+
+private:
+    HANDLE handle_ = nullptr;
+    bool locked_ = false;
+};
 
 bool PathExists(const fs::path& path) noexcept {
     if (path.empty()) return false;
@@ -714,6 +735,116 @@ bool EngineConfig::Validate() const {
             highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
             shedStartPercent >= 1 && shedStartPercent < 100 &&
             maxEventsPerBlock > 0;
+}
+
+bool ReadV3ConfigJson(std::string& document, std::string* warning) {
+    document.clear();
+    if (warning) warning->clear();
+    // Ensure first-run creation has had a chance to materialize the selected
+    // document before taking the non-recursive cross-process lock below.
+    const fs::path selected(GetV3ConfigPath());
+    if (!PathExists(selected)) (void)EngineConfig::Load();
+
+    ScopedConfigMutex guard;
+    if (!guard.Locked()) {
+        if (warning) *warning = "could not acquire configuration mutex";
+        return false;
+    }
+    const fs::path path(GetV3ConfigPath());
+    std::error_code error;
+    const uint64_t bytes = fs::file_size(path, error);
+    if (error || bytes > kMaximumConfigDocumentBytes) {
+        if (warning) *warning = error ? "could not inspect config.json"
+                                      : "config.json is unexpectedly large";
+        return false;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        if (warning) *warning = "could not open config.json";
+        return false;
+    }
+    document.assign(std::istreambuf_iterator<char>(input), {});
+    if (!input.good() && !input.eof()) {
+        document.clear();
+        if (warning) *warning = "could not read config.json";
+        return false;
+    }
+    return true;
+}
+
+bool PatchV3ConfigJson(const char* mergePatch, size_t mergePatchBytes,
+                       std::string* warning) {
+    if (warning) warning->clear();
+    if (!mergePatch || mergePatchBytes == 0u ||
+        mergePatchBytes > kMaximumConfigDocumentBytes) {
+        if (warning) *warning = "invalid configuration merge patch";
+        return false;
+    }
+    const fs::path selected(GetV3ConfigPath());
+    if (!PathExists(selected)) (void)EngineConfig::Load();
+
+    ScopedConfigMutex guard;
+    if (!guard.Locked()) {
+        if (warning) *warning = "could not acquire configuration mutex";
+        return false;
+    }
+    const fs::path path(GetV3ConfigPath());
+    try {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            if (warning) *warning = "could not open config.json";
+            return false;
+        }
+        json root;
+        input >> root;
+        input.close();
+        if (!root.is_object() ||
+            root.value("schema_version", 0u) != kConfigSchemaVersion) {
+            if (warning) *warning =
+                "configuration schema is unsupported and was not changed";
+            return false;
+        }
+        json patch = json::parse(mergePatch, mergePatch + mergePatchBytes);
+        if (!patch.is_object()) {
+            if (warning) *warning = "configuration merge patch must be an object";
+            return false;
+        }
+        const auto schema = patch.find("schema_version");
+        if (schema != patch.end() &&
+            (!schema->is_number_unsigned() ||
+             schema->get<uint32_t>() != kConfigSchemaVersion)) {
+            if (warning) *warning = "configuration schema cannot be changed";
+            return false;
+        }
+
+        // Validate only recognized values supplied by this patch. Unknown
+        // fields are deliberately allowed so newer clients can round-trip
+        // extensions through older runtimes without losing them.
+        EngineConfig validation = EngineConfig::Default();
+        ApplyJson(patch, validation);
+        if (!validation.configWarning.empty() || !validation.Validate()) {
+            if (warning) *warning = validation.configWarning.empty()
+                ? "configuration merge patch contains an invalid value"
+                : validation.configWarning;
+            return false;
+        }
+
+        root.merge_patch(patch);
+        if (!root.is_object() ||
+            root.value("schema_version", 0u) != kConfigSchemaVersion) {
+            if (warning) *warning = "configuration schema cannot be removed";
+            return false;
+        }
+        if (!AtomicWriteJson(path, root)) {
+            if (warning) *warning = "atomic config.json replacement failed";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& error) {
+        if (warning) *warning = std::string(
+            "invalid configuration document or patch: ") + error.what();
+        return false;
+    }
 }
 
 std::wstring GetV3LocalConfigPath() {

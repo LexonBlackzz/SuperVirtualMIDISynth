@@ -101,8 +101,9 @@ larger phase containing that item is complete.
 - [x] Test first-run creation, concurrent creation, portable/AppData
   precedence and fallback, Unicode paths, INI import, invalid fields,
   malformed/newer schemas, and environment precedence
-- [ ] Add a settings-save/update API that round-trips unknown fields; V3
-  currently only writes during first creation/migration
+- [x] Add a native settings query/merge-patch API that validates recognized
+  values, round-trips unknown fields, uses the configuration mutex, and commits
+  through atomic replacement
 - [ ] Add live configuration reload; configuration changes currently require an
   engine restart
 

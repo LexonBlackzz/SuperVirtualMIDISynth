@@ -3,6 +3,7 @@
 
 #include "SVMSTypes.h"
 #include <atomic>
+#include <cstddef>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -90,6 +91,15 @@ std::wstring GetV3ModuleDirectory();
 // or missing, deterministically discover .sf2 files beside winmm.dll.
 std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
                                     std::string* warning = nullptr);
+
+// Control-thread JSON access used by the native API. Reads return the complete
+// selected document. Merge patches are serialized under the same cross-process
+// mutex as first-run creation, preserve untouched/unknown fields, reject a
+// malformed or unsupported schema, and use the existing atomic replace path.
+bool ReadV3ConfigJson(std::string& document,
+                      std::string* warning = nullptr);
+bool PatchV3ConfigJson(const char* mergePatch, size_t mergePatchBytes,
+                       std::string* warning = nullptr);
 
 struct RuntimeConfigSnapshot {
     float masterVolume;

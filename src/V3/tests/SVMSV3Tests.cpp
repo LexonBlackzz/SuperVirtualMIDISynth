@@ -2196,6 +2196,39 @@ void TestJsonConfigurationLifecycle() {
               "created JSON explicitly stores the discovered SoundFont");
     }
 
+    std::string queriedConfig;
+    std::string configEditWarning;
+    Check(svms::ReadV3ConfigJson(queriedConfig, &configEditWarning) &&
+              queriedConfig.find("\"schema_version\": 1") !=
+                  std::string::npos,
+          "native config reader returns the complete selected JSON document");
+    const std::string validPatch =
+        R"json({"synth":{"max_voices":321},"future_extension":{"kept":true}})json";
+    const bool validPatchApplied = svms::PatchV3ConfigJson(
+        validPatch.data(), validPatch.size(), &configEditWarning);
+    if (!validPatchApplied)
+        std::printf("INFO: config patch rejection: %s\n",
+                    configEditWarning.c_str());
+    Check(validPatchApplied,
+          "native config merge patch accepts valid known and unknown fields");
+    svms::EngineConfig patchedConfig = svms::EngineConfig::Load();
+    Check(patchedConfig.maxVoices == 321u,
+          "native config merge patch persists recognized values");
+    Check(svms::ReadV3ConfigJson(queriedConfig, &configEditWarning) &&
+              queriedConfig.find("future_extension") != std::string::npos &&
+              queriedConfig.find("Alpha Piano.SF2") != std::string::npos,
+          "native config merge patch preserves untouched and unknown fields");
+    const std::string beforeRejectedPatch = queriedConfig;
+    const std::string invalidPatch =
+        R"json({"audio":{"sample_rate":1}})json";
+    Check(!svms::PatchV3ConfigJson(invalidPatch.data(), invalidPatch.size(),
+                                   &configEditWarning) &&
+              !configEditWarning.empty(),
+          "native config merge patch rejects invalid recognized values");
+    Check(svms::ReadV3ConfigJson(queriedConfig, nullptr) &&
+              queriedConfig == beforeRejectedPatch,
+          "rejected native config patch leaves the document byte-unchanged");
+
     svms::EngineConfig explicitAbsolute = svms::EngineConfig::Default();
     explicitAbsolute.soundFontPath = betaSoundFont.wstring();
     Check(fs::path(svms::ResolveV3SoundFontPath(explicitAbsolute)) == betaSoundFont,

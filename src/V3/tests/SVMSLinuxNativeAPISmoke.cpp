@@ -32,7 +32,10 @@ int main(int argc, char** argv) {
         api.get_runtime_clock && api.send_timed_short_batch &&
         api.get_output_clock && api.get_monotonic_clock &&
         api.create_offline_session && api.render_offline &&
-        api.get_offline_telemetry;
+        api.get_offline_telemetry &&
+        (api.capabilities & SVMS_CAP_CONFIG_JSON) == 0u &&
+        !api.get_config_json && !api.patch_config_json &&
+        !api.get_config_path_utf8;
     uint64_t now = 0u, frequency = 0u;
     const bool clockOkay = negotiated &&
         api.get_runtime_clock(&now, &frequency) == SVMS_RESULT_OK &&

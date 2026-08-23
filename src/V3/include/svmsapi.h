@@ -32,7 +32,9 @@ typedef enum SVMS_Result {
     SVMS_RESULT_UNSUPPORTED = 3,
     SVMS_RESULT_NOT_INITIALIZED = 4,
     SVMS_RESULT_NO_RESOURCES = 5,
-    SVMS_RESULT_INTERNAL_ERROR = 6
+    SVMS_RESULT_INTERNAL_ERROR = 6,
+    SVMS_RESULT_BUFFER_TOO_SMALL = 7,
+    SVMS_RESULT_CANCELLED = 8
 } SVMS_Result;
 
 enum {
@@ -46,7 +48,8 @@ enum {
     SVMS_CAP_QUEUE_CONTROL        = UINT64_C(1) << 7,
     SVMS_CAP_SOUNDFONT_RELOAD     = UINT64_C(1) << 8,
     SVMS_CAP_MIXED_TIMESTAMP_BATCH = UINT64_C(1) << 9,
-    SVMS_CAP_ISOLATED_OFFLINE_SESSIONS = UINT64_C(1) << 10
+    SVMS_CAP_ISOLATED_OFFLINE_SESSIONS = UINT64_C(1) << 10,
+    SVMS_CAP_CONFIG_JSON = UINT64_C(1) << 11
 };
 
 enum {
@@ -231,6 +234,13 @@ typedef SVMS_Result (SVMS_CALL *SVMS_RenderOfflineFn)(
     uint32_t frame_count);
 typedef SVMS_Result (SVMS_CALL *SVMS_GetOfflineTelemetryFn)(
     SVMS_Session session, SVMS_OfflineTelemetry* telemetry);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetConfigJsonFn)(
+    SVMS_Session session, char* buffer_utf8, uint32_t* inout_buffer_bytes);
+typedef SVMS_Result (SVMS_CALL *SVMS_PatchConfigJsonFn)(
+    SVMS_Session session, const char* merge_patch_utf8,
+    uint32_t merge_patch_bytes);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetConfigPathUtf8Fn)(
+    SVMS_Session session, char* buffer_utf8, uint32_t* inout_buffer_bytes);
 
 typedef struct SVMS_Interface {
     uint32_t struct_size;
@@ -263,6 +273,9 @@ typedef struct SVMS_Interface {
     SVMS_CreateOfflineSessionFn create_offline_session;
     SVMS_RenderOfflineFn render_offline;
     SVMS_GetOfflineTelemetryFn get_offline_telemetry;
+    SVMS_GetConfigJsonFn get_config_json;
+    SVMS_PatchConfigJsonFn patch_config_json;
+    SVMS_GetConfigPathUtf8Fn get_config_path_utf8;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
