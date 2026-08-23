@@ -1577,12 +1577,45 @@ inline bool RenderScalar::CanUseDensePlan(
         return false;
 #endif
     }
+
+    // Planning must advance every time-varying voice on the coordinator so
+    // exact-frame stealing sees the same envelope state as the serial oracle.
+    // Workers then advance those voices again while producing their samples.
+    // In release-heavy chopped material this duplicated serial work costs
+    // more than the tile render saves (and adding workers makes it worse).
+    // Keep that regime on the short-span SIMD path, which is exact and already
+    // vectorizes across voices.  This is a workload gate only; event frames
+    // and ordering are unchanged.
+    const uint32_t activeVoices = voices.GetActiveCount();
+    const uint32_t sustainedVoices = voices.GetRenderClassCount(
+        VoiceRenderClass::SustainedLoop);
+    const uint32_t timeVaryingVoices = activeVoices > sustainedVoices
+        ? activeVoices - sustainedVoices : 0u;
+    uint32_t distinctEventFrames = 0u;
+    uint32_t previousEventFrame = UINT32_MAX;
+    for (uint32_t index = 0u; index < eventCount; ++index) {
+        const uint32_t eventFrame = events[index].frameOffset;
+        if (eventFrame >= numFrames || eventFrame == previousEventFrame)
+            continue;
+        previousEventFrame = eventFrame;
+        ++distinctEventFrames;
+    }
+    const uint64_t duplicatedStateWork =
+        static_cast<uint64_t>(timeVaryingVoices) * distinctEventFrames;
+    const uint64_t callbackVoiceSamples =
+        static_cast<uint64_t>(activeVoices) * numFrames;
+    if (callbackVoiceSamples != 0u &&
+        duplicatedStateWork >= callbackVoiceSamples / 2u) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        return reject(DensePlanRejectReason::EventDensity);
+#else
+        return false;
+#endif
+    }
     if (eventCount < numFrames) {
         // Sparse rendering already parallelizes profitable sustained spans.
         // Dense planning earns its setup cost only when event fragmentation
         // leaves substantial synthesis serial after those existing gates.
-        const uint32_t sustainedVoices = voices.GetRenderClassCount(
-            VoiceRenderClass::SustainedLoop);
         const uint32_t otherVoices = voices.GetActiveCount() > sustainedVoices
             ? voices.GetActiveCount() - sustainedVoices : 0u;
         uint64_t rejectedVoiceSamples =
@@ -1657,7 +1690,11 @@ inline bool RenderScalar::CanUseDensePlan(
     bool mayTouchFullPool = false;
     auto flushFrameEstimate = [&]() {
         if (frame == UINT32_MAX || frame >= numFrames) return;
-        uint64_t mutations = voices.GetActiveCount();
+        // A note-on can grow a partly empty pool before this chunk is
+        // planned, so the current active count is not an upper bound.  Using
+        // the configured capacity keeps the execution-time capacity check a
+        // true assertion instead of a destructive late fallback.
+        uint64_t mutations = voices.GetMaxVoices();
         if (!mayTouchFullPool) {
             mutations = 0u;
             for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {

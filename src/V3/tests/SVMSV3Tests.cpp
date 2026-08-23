@@ -3006,14 +3006,19 @@ void TestDensePlannerOracleDifferential() {
         return result;
     };
 
-    std::vector<svms::RenderEvent> events(frames);
+    constexpr uint32_t eventsPerFrame = 32u;
+    constexpr uint8_t notes[4] = {39u, 51u, 63u, 75u};
+    std::vector<svms::RenderEvent> events(frames * eventsPerFrame);
     for (uint32_t frame = 0u; frame < frames; ++frame) {
-        events[frame].type = svms::RenderEventType::NoteOn;
-        events[frame].channel = static_cast<uint8_t>(frame & 15u);
-        events[frame].data1 = static_cast<uint8_t>(24u + frame % 88u);
-        events[frame].data2 = 127u;
-        events[frame].frameOffset = frame;
-        events[frame].ingressSequence = frame;
+        for (uint32_t lane = 0u; lane < eventsPerFrame; ++lane) {
+            const uint32_t index = frame * eventsPerFrame + lane;
+            events[index].type = svms::RenderEventType::NoteOn;
+            events[index].channel = 0u;
+            events[index].data1 = notes[lane & 3u];
+            events[index].data2 = 127u;
+            events[index].frameOffset = frame;
+            events[index].ingressSequence = index;
+        }
     }
 
     auto oracleVoices = makeVoices();
@@ -3029,19 +3034,24 @@ void TestDensePlannerOracleDifferential() {
     DensePlannerDispatchContext plannedContext{plannedVoices.get(), &channels};
     oracle.SetEventBatchDispatcher(DensePlannerDispatch, &oracleContext);
     planned.SetEventBatchDispatcher(DensePlannerDispatch, &plannedContext);
+    planned.SetCoverageProfilingEnabledForTest(true);
     std::vector<float> oracleLeft(frames, 0.0f), oracleRight(frames, 0.0f);
     std::vector<float> plannedLeft(frames, 0.0f), plannedRight(frames, 0.0f);
     oracle.RenderBlock(*oracleVoices, channels, samples.data(),
         static_cast<uint32_t>(samples.size()), oracleLeft.data(),
-        oracleRight.data(), frames, cfg, events.data(), frames, true, 5000u);
+        oracleRight.data(), frames, cfg, events.data(),
+        static_cast<uint32_t>(events.size()), true, 5000u);
     g_realtimeAllocationCount.store(0u, std::memory_order_relaxed);
     g_trackRealtimeAllocations = true;
     planned.RenderBlock(*plannedVoices, channels, samples.data(),
         static_cast<uint32_t>(samples.size()), plannedLeft.data(),
-        plannedRight.data(), frames, cfg, events.data(), frames, true, 5000u);
+        plannedRight.data(), frames, cfg, events.data(),
+        static_cast<uint32_t>(events.size()), true, 5000u);
     g_trackRealtimeAllocations = false;
     Check(g_realtimeAllocationCount.load(std::memory_order_relaxed) == 0u,
           "dense planner performs no coordinator-side callback allocation");
+    Check(planned.GetCoverageStatsForTest().denseRendered == 1u,
+          "dense planner differential exercises the planned worker path");
 
     float maximumDifference = 0.0f;
     for (uint32_t frame = 0u; frame < frames; ++frame) {
@@ -3083,8 +3093,8 @@ void TestDensePlannerOracleDifferential() {
         std::vector<float> repeatRight(frames, 0.0f);
         repeat.RenderBlock(*repeatVoices, channels, samples.data(),
             static_cast<uint32_t>(samples.size()), repeatLeft.data(),
-            repeatRight.data(), frames, cfg, events.data(), frames, true,
-            5000u);
+            repeatRight.data(), frames, cfg, events.data(),
+            static_cast<uint32_t>(events.size()), true, 5000u);
         Check(repeatLeft == plannedLeft && repeatRight == plannedRight,
               "dense planner output is deterministic across worker counts");
     }
