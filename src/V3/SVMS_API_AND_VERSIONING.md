@@ -342,22 +342,29 @@ remain observable by future configurators.
 
 ## Implementation Sequence
 
-1. Generate shared product/build metadata for all binaries.
-2. Add correct Windows version resources and expose build information in the
+Current implementation status (2026-08-23):
+
+1. [x] Generate shared product/build metadata for all binaries.
+2. [x] Add correct Windows version resources and expose build information in the
    diagnostic UI.
-3. Define the stable discovery header and dual-publish RuntimeLink V2 and V3.
-4. Make configurator controls capability-driven and add mismatch notices.
-5. Add optional, read-only GitHub release checking.
-6. Add the verified transactional updater and rollback path.
-7. Extract or formalize `svms_core` so frontends share one engine.
-8. Freeze the first `svmsapi.h` ABI and implement `SVMS_GetInterface`.
-9. Implement native sessions, exact single-event submission, bulk submission,
+3. [x] Define the stable discovery header and dual-publish RuntimeLink V2 and V3.
+4. [x] Make configurator controls capability-driven and add mismatch notices.
+5. [x] Add optional, read-only GitHub release checking.
+6. [ ] Add the verified transactional updater and rollback path. This is
+   intentionally blocked until releases provide a pinned signing identity and
+   signed manifests; the unsigned replacement path was rejected.
+7. [x] Formalize the shared runtime: all Windows frontend names are
+   byte-identical aliases over one engine and ownership model. A deeper portable
+   core extraction remains useful, but is not required for frontend parity.
+8. [x] Freeze the first `svmsapi.h` ABI and implement `SVMS_GetInterface`.
+9. [x] Implement native sessions, exact single-event submission, bulk submission,
    SysEx, and telemetry.
-10. Inventory and implement the KDMAPI-compatible export surface as a thin
+10. [x] Inventory and implement the KDMAPI-compatible export surface as a thin
     facade over a hidden native session.
-11. Add x86, x64, XP x86, and eventually Linux ABI compatibility tests.
-12. Retain old interface tables and compatibility binaries in automated tests
-    before expanding either API.
+11. [x] Add C/C++ ABI checks and x86, x64, and XP x86 compatibility tests.
+    Linux native-API publication remains future work.
+12. [x] Retain RuntimeLink V2, existing KDMAPI exports, and compatibility binary
+    names in automated tests before expanding either API.
 
 These should land as independently testable commits. The versioning and
 discovery foundation should precede the updater and public ABI freeze.
