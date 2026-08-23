@@ -456,6 +456,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/Widgets.cpp
         Configurator/WasapiDevices.cpp
         Configurator/EasterEggs.cpp
+        Configurator/UpdateService.cpp
         Configurator/PageOverview.cpp
         Configurator/PageAudio.cpp
         Configurator/PagePerformance.cpp
@@ -480,7 +481,7 @@ if(NOT SVMS_XP_COMPAT)
     target_compile_definitions(svms_v3_configurator PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(svms_v3_configurator PRIVATE
-        d3d11 dxgi user32 gdi32 shell32 ole32 uuid comdlg32)
+        d3d11 dxgi user32 gdi32 shell32 ole32 uuid comdlg32 winhttp)
     set_target_properties(svms_v3_configurator PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()

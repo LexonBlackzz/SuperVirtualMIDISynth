@@ -1,6 +1,7 @@
 #include "PageAbout.h"
 #include "ConfigDocument.h"
 #include "Widgets.h"
+#include "UpdateService.h"
 #include "SVMSBuildInfo.h"
 #include "imgui.h"
 
@@ -8,10 +9,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <shellapi.h>
 
 namespace svms::cfg {
 
-void DrawAboutPage(ConfigDocument& doc) {
+void DrawAboutPage(ConfigDocument& doc, UpdateService& updates) {
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 20.0f);
 
     ImGui::PushFont(nullptr);
@@ -40,6 +42,50 @@ void DrawAboutPage(ConfigDocument& doc) {
                 svms::build::kBuildNumber,
                 svms::build::kReleaseChannel);
     ImGui::TextDisabled("Source: %s", svms::build::kGitCommit);
+
+    ImGui::Spacing();
+    SectionHeader("UPDATES");
+    const UpdateSnapshot update = updates.GetSnapshot();
+    if (update.status == UpdateStatus::Checking) {
+        ImGui::TextDisabled("Checking GitHub releases...");
+    } else {
+        const char* label = update.status == UpdateStatus::Idle
+            ? "Check for updates" : "Check again";
+        if (ImGui::Button(label))
+            updates.CheckAsync(update.status != UpdateStatus::Idle);
+    }
+    if (update.status == UpdateStatus::Available) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              ImVec4(0.35f, 0.85f, 0.50f, 1.0f));
+        ImGui::Text("%u.%u.%u is available%s", update.major, update.minor,
+                    update.patch, update.fromCache ? " (cached)" : "");
+        ImGui::PopStyleColor();
+        if (!update.releaseUrl.empty() && ImGui::Button("Open release page")) {
+            const int length = MultiByteToWideChar(
+                CP_UTF8, 0, update.releaseUrl.c_str(), -1, nullptr, 0);
+            if (length > 1) {
+                std::wstring url(static_cast<size_t>(length), L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, update.releaseUrl.c_str(), -1,
+                                    url.data(), length);
+                ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr,
+                              SW_SHOWNORMAL);
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            "Automatic install requires a configured signed manifest.");
+    } else if (update.status == UpdateStatus::UpToDate) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Up to date%s",
+                            update.fromCache ? " (cached)" : "");
+    } else if (update.status == UpdateStatus::Failed) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              ImVec4(0.92f, 0.48f, 0.35f, 1.0f));
+        ImGui::TextWrapped("%s", update.message.c_str());
+        ImGui::PopStyleColor();
+    }
 
     auto path = doc.GetActivePath();
     if (!path.empty()) {

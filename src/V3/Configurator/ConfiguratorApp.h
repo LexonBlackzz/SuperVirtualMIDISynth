@@ -4,6 +4,7 @@
 #include "ConfigDocument.h"
 #include "WasapiDevices.h"
 #include "EasterEggs.h"
+#include "UpdateService.h"
 #include "../SVMSRuntimeLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
@@ -102,6 +103,7 @@ private:
 
     ConfigDocument config_;
     EasterEggState easterEggs_;
+    UpdateService updateService_;
     bool showMegaFuckerPopup_ = false;
 
     svms::RuntimeLinkClient rlClient_;

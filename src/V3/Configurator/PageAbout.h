@@ -5,7 +5,9 @@ struct ConfigDocument;
 
 namespace svms::cfg {
 
-void DrawAboutPage(ConfigDocument& doc);
+class UpdateService;
+
+void DrawAboutPage(ConfigDocument& doc, UpdateService& updates);
 
 } // namespace svms::cfg
 

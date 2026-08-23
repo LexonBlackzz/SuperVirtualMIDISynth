@@ -855,7 +855,7 @@ void ConfiguratorApp::DrawPageContent() {
     case Page::Limiter:     DrawLimiterPage(config_); break;
     case Page::Diagnostics: DrawDiagnosticsPage(config_); break;
     case Page::Advanced:    DrawAdvancedPage(config_); break;
-    case Page::About:       DrawAboutPage(config_); break;
+    case Page::About:       DrawAboutPage(config_, updateService_); break;
     }
 }
 
