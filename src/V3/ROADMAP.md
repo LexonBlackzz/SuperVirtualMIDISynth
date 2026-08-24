@@ -622,6 +622,9 @@ larger phase containing that item is complete.
 - [x] Display paged-pipeline pressure and separate queue-capacity versus
   per-callback event-budget controls in the configurator
 - [x] Profile import/export
+- [x] Forward the complete WinMM `midiIn*` API to the absolute system DLL on
+  modern Windows and XP, preserving physical MIDI-input support for proxy hosts
+- [ ] Add Configurator-managed physical MIDI input-to-SVMS routing
 - [x] Record the live post-DSP stereo stream to float WAV/RF64 through an
   allocation-free audio-thread copy, an eight-second SPSC buffer, and a
   background file writer; expose start/stop, duration, file size, and dropped

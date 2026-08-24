@@ -223,8 +223,8 @@ void DrawMidiPage(ConfigDocument& doc) {
     ImGui::Spacing();
     SectionHeader("MIDI INPUT");
     ImGui::TextDisabled(
-        "MIDI In routing is not implemented yet. The winmm midiIn* compatibility entry points "
-        "currently return MMSYSERR_BADDEVICEID.");
+        "Physical MIDI inputs are forwarded transparently to the host. Direct input-to-SVMS "
+        "routing from the Configurator is not implemented yet.");
 }
 
 } // namespace svms::cfg

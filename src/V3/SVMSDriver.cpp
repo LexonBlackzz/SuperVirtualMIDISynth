@@ -6392,62 +6392,78 @@ ULONGLONG WINAPI timeGetTime64(void) {
 
 // ── MIDI Input ────────────────────────────────────────────────────────
 
-UINT WINAPI midiInGetNumDevs(void) { return 0; }
+UINT WINAPI midiInGetNumDevs(void) {
+    using Proc = UINT (WINAPI*)(void);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInGetNumDevs"));
+    return proc ? proc() : 0u;
+}
 
 MMRESULT WINAPI midiInGetDevCapsA(UINT_PTR uDeviceID, LPMIDIINCAPSA lpCaps, UINT cbCaps) {
-    (void)uDeviceID; (void)lpCaps; (void)cbCaps;
-    return MMSYSERR_BADDEVICEID;
+    using Proc = MMRESULT (WINAPI*)(UINT_PTR, LPMIDIINCAPSA, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInGetDevCapsA"));
+    return proc ? proc(uDeviceID, lpCaps, cbCaps) : MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI midiInGetDevCapsW(UINT_PTR uDeviceID, LPMIDIINCAPSW lpCaps, UINT cbCaps) {
-    (void)uDeviceID; (void)lpCaps; (void)cbCaps;
-    return MMSYSERR_BADDEVICEID;
+    using Proc = MMRESULT (WINAPI*)(UINT_PTR, LPMIDIINCAPSW, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInGetDevCapsW"));
+    return proc ? proc(uDeviceID, lpCaps, cbCaps) : MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI midiInOpen(LPHMIDIIN phmi, UINT uDeviceID, DWORD_PTR dwCallback,
                            DWORD_PTR dwInstance, DWORD fdwOpen) {
-    (void)phmi; (void)uDeviceID; (void)dwCallback; (void)dwInstance; (void)fdwOpen;
-    return MMSYSERR_BADDEVICEID;
+    using Proc = MMRESULT (WINAPI*)(LPHMIDIIN, UINT, DWORD_PTR, DWORD_PTR, DWORD);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInOpen"));
+    return proc ? proc(phmi, uDeviceID, dwCallback, dwInstance, fdwOpen)
+                : MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI midiInClose(HMIDIIN hmi) {
-    (void)hmi;
-    return MMSYSERR_BADDEVICEID;
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInClose"));
+    return proc ? proc(hmi) : MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI midiInPrepareHeader(HMIDIIN hmi, LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)hmi; (void)lpMidiHdr; (void)cbMidiHdr;
-    return MMSYSERR_ERROR;
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN, LPMIDIHDR, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInPrepareHeader"));
+    return proc ? proc(hmi, lpMidiHdr, cbMidiHdr) : MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI midiInUnprepareHeader(HMIDIIN hmi, LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)hmi; (void)lpMidiHdr; (void)cbMidiHdr;
-    return MMSYSERR_ERROR;
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN, LPMIDIHDR, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInUnprepareHeader"));
+    return proc ? proc(hmi, lpMidiHdr, cbMidiHdr) : MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI midiInAddBuffer(HMIDIIN hmi, LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
-    (void)hmi; (void)lpMidiHdr; (void)cbMidiHdr;
-    return MMSYSERR_ERROR;
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN, LPMIDIHDR, UINT);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInAddBuffer"));
+    return proc ? proc(hmi, lpMidiHdr, cbMidiHdr) : MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI midiInStart(HMIDIIN hmi) {
-    (void)hmi;
-    return MMSYSERR_BADDEVICEID;
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInStart"));
+    return proc ? proc(hmi) : MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI midiInStop(HMIDIIN hmi) {
-    (void)hmi;
-    return MMSYSERR_BADDEVICEID;
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInStop"));
+    return proc ? proc(hmi) : MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI midiInReset(HMIDIIN hmi) {
-    (void)hmi;
-    return MMSYSERR_BADDEVICEID;
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInReset"));
+    return proc ? proc(hmi) : MMSYSERR_BADDEVICEID;
 }
 
 MMRESULT WINAPI midiInMessage(HMIDIIN hmi, UINT uMsg, DWORD_PTR dw1, DWORD_PTR dw2) {
-    (void)hmi; (void)uMsg; (void)dw1; (void)dw2;
-    return MMSYSERR_ERROR;
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN, UINT, DWORD_PTR, DWORD_PTR);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInMessage"));
+    return proc ? proc(hmi, uMsg, dw1, dw2) : MMSYSERR_ERROR;
 }
 
 // ── Wave Input ─────────────────────────────────────────────────────────
