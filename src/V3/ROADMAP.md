@@ -419,6 +419,10 @@ larger phase containing that item is complete.
 - [x] Resolve the packed root's tail slot only after its level passes the
   strict-louder admission test; the common full-reserve rejection path gains
   another roughly 0.7-1.0% at 5.5M note-ons/s with identical output
+- [x] Stop cloning cold MIDI identity, channel/key linkage, pitch metadata,
+  and steal-only arrays into the dense worker shadow every callback. The
+  render-only snapshot copy is about 68-70% cheaper at the supported 8,192-
+  voice dense-planner ceiling, with differential render tests unchanged
 - [x] Size outgoing tail SoA, lifecycle lists, and renderer scratch to the
   fixed 50-tail reserve instead of maximum voice capacity; this removes about
   271 KiB at 4,096 voices and roughly 33.5 MB from a future 500K layout while

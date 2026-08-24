@@ -2117,7 +2117,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
     float* outputLeft, float* outputRight, uint32_t numFrames,
     const RenderEvent* events, uint32_t eventCount,
     uint64_t blockStartFrame) {
-    denseRenderState_ = voices.v;
+    denseRenderState_.CopyDenseRenderStateFrom(voices.v);
     denseSampleData_ = sampleData;
     denseSampleDataFrames_ = sampleDataFrames;
     denseKernelSet_ = kernelSet_;

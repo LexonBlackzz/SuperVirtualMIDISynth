@@ -2,6 +2,7 @@
 #define SVMS_TYPES_H
 
 #include "SVMSPlatform.h"
+#include <cassert>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -585,6 +586,56 @@ struct alignas(64) VoiceSoA {
             source.stealFadeInFramesRemaining[handle];
         destination.stealFadeInFramesTotal[handle] =
             source.stealFadeInFramesTotal[handle];
+    }
+
+    // Dense worker plans need a private render image, not a second copy of
+    // MIDI identity, channel/key links, stealing metadata, or immutable
+    // launch bookkeeping. Copy only the arrays workers read or mutate. This
+    // is the first concrete hot/cold split: at large capacities it avoids
+    // streaming dozens of cold bytes per slot at every dense callback.
+    void CopyDenseRenderStateFrom(const VoiceSoA& source) noexcept {
+        assert(capacity_ >= source.capacity_);
+        const size_t count = source.capacity_;
+#define SVMS_COPY_DENSE_FIELD(name) \
+        std::memcpy(name, source.name, \
+            count * sizeof(*name))
+        SVMS_COPY_DENSE_FIELD(state);
+        SVMS_COPY_DENSE_FIELD(envelopeStage);
+        SVMS_COPY_DENSE_FIELD(sampleBacked);
+        SVMS_COPY_DENSE_FIELD(renderClass);
+        SVMS_COPY_DENSE_FIELD(phases);
+        SVMS_COPY_DENSE_FIELD(phaseIncs);
+        SVMS_COPY_DENSE_FIELD(currentGain);
+        SVMS_COPY_DENSE_FIELD(targetGain);
+        SVMS_COPY_DENSE_FIELD(sustainLevel);
+        SVMS_COPY_DENSE_FIELD(attackGainStep);
+        SVMS_COPY_DENSE_FIELD(releaseDecay);
+        SVMS_COPY_DENSE_FIELD(mixGainL);
+        SVMS_COPY_DENSE_FIELD(mixGainR);
+        SVMS_COPY_DENSE_FIELD(renderGainL);
+        SVMS_COPY_DENSE_FIELD(renderGainR);
+        SVMS_COPY_DENSE_FIELD(sampleStart);
+        SVMS_COPY_DENSE_FIELD(loopEnabled);
+        SVMS_COPY_DENSE_FIELD(relEnd);
+        SVMS_COPY_DENSE_FIELD(relLoopS);
+        SVMS_COPY_DENSE_FIELD(relLoopE);
+        SVMS_COPY_DENSE_FIELD(relLoopSF);
+        SVMS_COPY_DENSE_FIELD(relLoopEF);
+        SVMS_COPY_DENSE_FIELD(holdSamplesRemaining);
+        SVMS_COPY_DENSE_FIELD(attackSamplesRemaining);
+        SVMS_COPY_DENSE_FIELD(decaySamplesRemaining);
+        SVMS_COPY_DENSE_FIELD(delaySamplesRemaining);
+        SVMS_COPY_DENSE_FIELD(releaseSamplesRemaining);
+        SVMS_COPY_DENSE_FIELD(decaySlope);
+        SVMS_COPY_DENSE_FIELD(stealFadeInFramesRemaining);
+        SVMS_COPY_DENSE_FIELD(stealFadeInFramesTotal);
+#undef SVMS_COPY_DENSE_FIELD
+        if (capacity_ > source.capacity_) {
+            std::memset(state + source.capacity_, 0,
+                static_cast<size_t>(capacity_ - source.capacity_) *
+                    sizeof(*state));
+        }
+        CopyFixedTailsFrom(source);
     }
 
     void CopyFixedTailsFrom(const VoiceSoA& source) noexcept {
