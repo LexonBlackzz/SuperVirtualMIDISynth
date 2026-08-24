@@ -407,6 +407,10 @@ larger phase containing that item is complete.
   compact-list positions instead of the generic remove/check/sift-up path.
   The pinned 6M-note workload gains another 2.7-3.4% in total cycles and about
   3% realized throughput with the same exhaustive-oracle victim sequence
+- [x] Replace an admitted full outgoing-tail reserve directly through its
+  already-proven minimum-heap root, avoiding redundant membership and root
+  validation. Pinned 6M-note trials are neutral to about 1.3% faster with the
+  same exact victim and 64-frame tail behavior
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact

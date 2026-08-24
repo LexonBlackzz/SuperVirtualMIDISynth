@@ -621,7 +621,8 @@ private:
     bool IsStableStealCandidate(VoiceHandle handle) const;
     float ComputeEffectiveStealLevel(VoiceHandle handle) const;
     float ComputeTailLevel(uint32_t tailSlot) const;
-    uint32_t SelectStealTailSlot(float outgoingLevel);
+    uint32_t SelectStealTailSlot(float outgoingLevel,
+                                 bool& replacingHeapRoot);
     void CaptureStealTail(VoiceHandle handle);
     bool ReuseMatchingStealGroup(uint8_t channel, uint8_t note,
                                  uint8_t velocity,
@@ -2183,7 +2184,9 @@ inline void VoiceManager::BuildStealTailMinHeap() {
     stealTailMinHeapValid_ = true;
 }
 
-inline uint32_t VoiceManager::SelectStealTailSlot(float outgoingLevel) {
+inline uint32_t VoiceManager::SelectStealTailSlot(
+    float outgoingLevel, bool& replacingHeapRoot) {
+    replacingHeapRoot = false;
     const uint32_t reserveLimit = (std::min)(maxVoices_, kStealTailReserve);
     if (reserveLimit == 0u || outgoingLevel <= 0.0f) return UINT32_MAX;
     if (stealTailCount_ < reserveLimit) {
@@ -2200,6 +2203,7 @@ inline uint32_t VoiceManager::SelectStealTailSlot(float outgoingLevel) {
     float quietestLevel = 0.0f;
     std::memcpy(&quietestLevel, &quietestBits, sizeof(quietestLevel));
     if (outgoingLevel <= quietestLevel) return UINT32_MAX;
+    replacingHeapRoot = true;
     return stealTailList_[static_cast<uint32_t>(quietestKey)];
 }
 
@@ -2226,7 +2230,9 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
 #endif
         return;
     }
-    const uint32_t tailSlot = SelectStealTailSlot(outgoingLevel);
+    bool replacingHeapRoot = false;
+    const uint32_t tailSlot = SelectStealTailSlot(
+        outgoingLevel, replacingHeapRoot);
     if (tailSlot == UINT32_MAX) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
         if (launchTestContext_.active)
@@ -2261,13 +2267,7 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     v.stealTailChannel[tailSlot] = v.channel[handle];
     v.stealTailFramesRemaining[tailSlot] = stealFadeFrames_;
     v.stealTailFramesTotal[tailSlot] = stealFadeFrames_;
-    const bool alreadyLinked = stealTailPosition_[tailSlot] < stealTailCount_;
-    LinkStealTail(static_cast<VoiceHandle>(tailSlot));
-    if (alreadyLinked && stealTailMinHeapValid_ &&
-        stealTailMinHeapFrame_ == currentFrame_ &&
-        stealTailMinHeapCount_ != 0u &&
-        stealTailList_[static_cast<uint32_t>(stealTailMinHeapKey_[0])] ==
-            tailSlot) {
+    if (replacingHeapRoot) {
         // SelectStealTailSlot accepts a replacement only when it is louder
         // than the current root, so the updated root can move only downward.
         uint32_t levelBits = 0u;
@@ -2276,6 +2276,8 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
             (static_cast<uint64_t>(levelBits) << 32u) |
             stealTailPosition_[tailSlot];
         StealTailHeapSiftDown(0u);
+    } else {
+        LinkStealTail(static_cast<VoiceHandle>(tailSlot));
     }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::TailCapture, tailBegin);
