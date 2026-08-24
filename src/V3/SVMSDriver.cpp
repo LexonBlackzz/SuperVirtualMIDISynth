@@ -297,6 +297,94 @@ static uint32_t SelectAutomaticRenderThreadCount() {
 #endif
 }
 
+static size_t EstimateRuntimeVoiceMemoryBytes(
+    uint32_t voiceCapacity, uint32_t renderThreads,
+    uint32_t maximumBlockFrames) noexcept {
+    const size_t manager = VoiceManager::EstimateAllocatedBytes(voiceCapacity);
+    const size_t renderer = RenderScalar::EstimateAllocatedBytes(
+        voiceCapacity, renderThreads, maximumBlockFrames);
+    if (manager == (std::numeric_limits<size_t>::max)() ||
+        renderer > (std::numeric_limits<size_t>::max)() - manager)
+        return (std::numeric_limits<size_t>::max)();
+    return manager + renderer;
+}
+
+static uint32_t LargestVoiceCapacityInRange(
+    uint64_t budgetBytes, uint32_t renderThreads, uint32_t blockFrames,
+    uint32_t first, uint32_t last) noexcept {
+    if (first > last ||
+        EstimateRuntimeVoiceMemoryBytes(first, renderThreads, blockFrames) >
+            budgetBytes)
+        return 0u;
+    uint32_t low = first;
+    uint32_t high = last;
+    while (low < high) {
+        const uint32_t middle = low + (high - low + 1u) / 2u;
+        if (EstimateRuntimeVoiceMemoryBytes(
+                middle, renderThreads, blockFrames) <= budgetBytes)
+            low = middle;
+        else
+            high = middle - 1u;
+    }
+    return low;
+}
+
+static uint32_t LargestInitialVoiceCapacityForBudget(
+    uint64_t budgetBytes, uint32_t renderThreads,
+    uint32_t blockFrames) noexcept {
+    // Dense-planner storage exists only through 8,192 voices, so the estimate
+    // has one intentional downward step at 8,193. Search both monotonic ranges
+    // instead of assuming a globally monotonic function.
+    const uint32_t highRange = LargestVoiceCapacityInRange(
+        budgetBytes, renderThreads, blockFrames,
+        kDenseRenderMaximumVoices + 1u, kMaxPolyphony);
+    if (highRange != 0u) return highRange;
+    return LargestVoiceCapacityInRange(
+        budgetBytes, renderThreads, blockFrames, 1u,
+        kDenseRenderMaximumVoices);
+}
+
+static size_t EstimateRuntimeVoiceMemoryAfterGrowth(
+    uint32_t initialCapacity, uint32_t grownCapacity,
+    uint32_t renderThreads, uint32_t maximumBlockFrames) noexcept {
+    if (grownCapacity < initialCapacity) grownCapacity = initialCapacity;
+    const size_t manager = VoiceManager::EstimateAllocatedBytes(grownCapacity);
+    const size_t initialRenderer = RenderScalar::EstimateAllocatedBytes(
+        initialCapacity, renderThreads, maximumBlockFrames);
+    const size_t initialSerialRenderer = RenderScalar::EstimateAllocatedBytes(
+        initialCapacity, 1u, maximumBlockFrames);
+    const size_t grownSerialRenderer = RenderScalar::EstimateAllocatedBytes(
+        grownCapacity, 1u, maximumBlockFrames);
+    const size_t scratchGrowth = grownSerialRenderer >= initialSerialRenderer
+        ? grownSerialRenderer - initialSerialRenderer : 0u;
+    if (initialRenderer > (std::numeric_limits<size_t>::max)() - manager ||
+        scratchGrowth > (std::numeric_limits<size_t>::max)() -
+                            manager - initialRenderer)
+        return (std::numeric_limits<size_t>::max)();
+    return manager + initialRenderer + scratchGrowth;
+}
+
+static uint32_t LargestGrowthCapacityForBudget(
+    uint64_t budgetBytes, uint32_t initialCapacity,
+    uint32_t renderThreads, uint32_t blockFrames) noexcept {
+    if (EstimateRuntimeVoiceMemoryAfterGrowth(
+            initialCapacity, initialCapacity, renderThreads, blockFrames) >
+        budgetBytes)
+        return 0u;
+    uint32_t low = initialCapacity;
+    uint32_t high = kMaxPolyphony;
+    while (low < high) {
+        const uint32_t middle = low + (high - low + 1u) / 2u;
+        if (EstimateRuntimeVoiceMemoryAfterGrowth(
+                initialCapacity, middle, renderThreads, blockFrames) <=
+            budgetBytes)
+            low = middle;
+        else
+            high = middle - 1u;
+    }
+    return low;
+}
+
 static bool UsesXPWaveOut(const AudioOutput* output) {
 #if defined(SVMS_XP_COMPAT)
     return output && output->IsWaveOutFallback();
@@ -3047,6 +3135,65 @@ bool Driver::Initialize() {
         return false;
     }
 
+    uint32_t renderThreads = cfg.renderThreads;
+    if (renderThreads == 0u)
+        renderThreads = SelectAutomaticRenderThreadCount();
+    uint32_t voiceGrowthCeiling = kMaxPolyphony;
+    if (cfg.voiceMemoryBudgetMB != 0u) {
+        const uint64_t budgetBytes =
+            static_cast<uint64_t>(cfg.voiceMemoryBudgetMB) << 20u;
+        if (renderThreads > 1u &&
+            cfg.maxVoices <= kDenseRenderMaximumVoices &&
+            EstimateRuntimeVoiceMemoryBytes(
+                cfg.maxVoices, renderThreads, bufferCapacity) > budgetBytes) {
+            LOG("Voice memory budget %u MiB cannot fit the dense %u-thread "
+                "renderer at %u voices; falling back to one render thread",
+                cfg.voiceMemoryBudgetMB, renderThreads, cfg.maxVoices);
+            renderThreads = 1u;
+        }
+        voiceGrowthCeiling = LargestInitialVoiceCapacityForBudget(
+            budgetBytes, renderThreads, bufferCapacity);
+        if (voiceGrowthCeiling == 0u && renderThreads > 1u) {
+            LOG("Voice memory budget %u MiB cannot fit %u-thread renderer; "
+                "falling back to one render thread",
+                cfg.voiceMemoryBudgetMB, renderThreads);
+            renderThreads = 1u;
+            voiceGrowthCeiling = LargestInitialVoiceCapacityForBudget(
+                budgetBytes, renderThreads, bufferCapacity);
+        }
+        if (voiceGrowthCeiling == 0u) {
+            LOG("FAILED: voice memory budget %u MiB is below minimum runtime "
+                "storage", cfg.voiceMemoryBudgetMB);
+            return false;
+        }
+        if (cfg.maxVoices > voiceGrowthCeiling) {
+            char warning[256]{};
+            std::snprintf(warning, sizeof(warning),
+                "[SVMS] configuration warning: synth.max_voices %u exceeds "
+                "the %u MiB voice-memory budget; using %u voices\n",
+                cfg.maxVoices, cfg.voiceMemoryBudgetMB, voiceGrowthCeiling);
+            OutputDebugStringA(warning);
+            LOG("Voice memory budget clamped maxVoices %u -> %u",
+                cfg.maxVoices, voiceGrowthCeiling);
+            cfg.maxVoices = voiceGrowthCeiling;
+        }
+        voiceGrowthCeiling = LargestGrowthCapacityForBudget(
+            budgetBytes, cfg.maxVoices, renderThreads, bufferCapacity);
+        if (voiceGrowthCeiling == 0u) {
+            LOG("FAILED: voice memory budget %u MiB cannot represent the "
+                "selected runtime layout", cfg.voiceMemoryBudgetMB);
+            return false;
+        }
+        const size_t startupBytes = EstimateRuntimeVoiceMemoryBytes(
+            cfg.maxVoices, renderThreads, bufferCapacity);
+        LOG("Voice memory budget %u MiB: startup %.2f MiB, live-growth "
+            "ceiling %u voices", cfg.voiceMemoryBudgetMB,
+            static_cast<double>(startupBytes) / (1024.0 * 1024.0),
+            voiceGrowthCeiling);
+    }
+    ConfigureRuntimeVoiceGrowthCeiling(voiceGrowthCeiling);
+    engineConfig_ = cfg;
+
     voiceManager = new VoiceManager();
     if (!voiceManager->Initialize(cfg.maxVoices, sampleRate)) {
         LOG("FAILED: Could not allocate voice storage maxVoices=%u",
@@ -3074,9 +3221,6 @@ bool Driver::Initialize() {
             cfg.maxVoices);
         return false;
     }
-    uint32_t renderThreads = cfg.renderThreads;
-    if (renderThreads == 0u)
-        renderThreads = SelectAutomaticRenderThreadCount();
     if (!renderScalar->ConfigureRenderThreads(renderThreads, bufferCapacity)) {
         LOG("Configuration warning: could not start %u render threads; "
             "using the audio thread only", renderThreads);
@@ -3221,6 +3365,7 @@ void Driver::Shutdown() {
     delete voiceManager; voiceManager = nullptr;
     delete channelCache; channelCache = nullptr;
     delete renderScalar; renderScalar = nullptr;
+    ConfigureRuntimeVoiceGrowthCeiling(kRuntimeVoiceGrowthCeiling);
     delete configSnapshot; configSnapshot = nullptr;
     _aligned_free(leftBuffer); leftBuffer = nullptr;
     _aligned_free(rightBuffer); rightBuffer = nullptr;

@@ -210,6 +210,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"soundfonts", std::move(soundFonts)},
             {"soundfont_routes", std::move(soundFontRoutes)},
             {"max_voices", cfg.maxVoices},
+            {"voice_memory_budget_mb", cfg.voiceMemoryBudgetMB},
             {"render_threads", cfg.renderThreads},
             {"master_volume", cfg.masterVolume},
             {"velocity_curve", cfg.velocityCurve},
@@ -414,6 +415,9 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("synth"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "max_voices", cfg.maxVoices, 1u, kMaxPolyphony))
             AppendWarning(cfg.configWarning, "synth.max_voices");
+        if (!ReadValue(*it, "voice_memory_budget_mb",
+                       cfg.voiceMemoryBudgetMB, 0u, 65536u))
+            AppendWarning(cfg.configWarning, "synth.voice_memory_budget_mb");
         if (!ReadValue(*it, "render_threads", cfg.renderThreads, 0u, 64u))
             AppendWarning(cfg.configWarning, "synth.render_threads");
         if (!ReadValue(*it, "master_volume", cfg.masterVolume, 0.0f, 4.0f))
@@ -670,6 +674,7 @@ EngineConfig EngineConfig::Default() {
     cfg.sampleRate = kDefaultSampleRate;
     cfg.bufferFrames = kDefaultBufferFrames;
     cfg.maxVoices = kMaxVoicesDefault;
+    cfg.voiceMemoryBudgetMB = 0u;
 #if defined(SVMS_XP_COMPAT)
     cfg.renderThreads = 1u;
 #else
@@ -820,6 +825,7 @@ bool EngineConfig::Validate() const {
     return sampleRate >= 8000 && sampleRate <= 384000 &&
             bufferFrames >= 16 && bufferFrames <= 8192 &&
             maxVoices >= 1 && maxVoices <= kMaxPolyphony &&
+            voiceMemoryBudgetMB <= 65536u &&
             renderThreads <= 64u &&
             masterVolume >= 0.0f && masterVolume <= 4.0f &&
             (limiterAlgorithm == LimiterAlgorithm::Classic ||

@@ -244,6 +244,7 @@ public:
         return sizeof(*this) + v.GetAllocatedBytes() - sizeof(v) +
                metadataBytes_;
     }
+    static size_t EstimateAllocatedBytes(uint32_t capacity) noexcept;
     // Apply a process-local live limit request only at a render-block
     // boundary, before dense plans or worker jobs can observe voice state.
     void ApplyRuntimeVoiceLimit(uint64_t frame);
@@ -731,6 +732,59 @@ inline VoiceManager::VoiceManager(const VoiceManager& other)
 
 inline VoiceManager::~VoiceManager() {
     _aligned_free(metadataStorage_);
+}
+
+inline size_t VoiceManager::EstimateAllocatedBytes(
+    uint32_t capacity) noexcept {
+    if (capacity == 0u || capacity > kMaxPolyphony) return 0u;
+    uint32_t treeLeaves = 1u;
+    while (treeLeaves < capacity) treeLeaves <<= 1u;
+    const uint32_t channelBlocks =
+        (capacity + kChannelIndexBlockSize - 1u) /
+            kChannelIndexBlockSize + kChannelCount;
+    const uint32_t renderBlocks =
+        (capacity + kRenderClassBlockSize - 1u) /
+            kRenderClassBlockSize + kVoiceRenderClassCount;
+    size_t metadataBytes = 0u;
+    auto add = [&](size_t elementSize, size_t count) {
+        metadataBytes = (metadataBytes + kMixBufferAlign - 1u) &
+                ~(static_cast<size_t>(kMixBufferAlign) - 1u);
+        if (count > ((std::numeric_limits<size_t>::max)() - metadataBytes) /
+                        elementSize) {
+            metadataBytes = (std::numeric_limits<size_t>::max)();
+            return;
+        }
+        metadataBytes += elementSize * count;
+    };
+    add(sizeof(uint32_t), capacity);
+    add(sizeof(uint32_t), capacity);
+    add(sizeof(int32_t), capacity);
+    add(sizeof(ChannelIndexBlock), channelBlocks);
+    add(sizeof(uint32_t), channelBlocks);
+    add(sizeof(uint32_t), capacity);
+    add(sizeof(uint8_t), capacity);
+    add(sizeof(RenderClassBlock), renderBlocks);
+    add(sizeof(uint32_t), renderBlocks);
+    add(sizeof(uint32_t), capacity);
+    add(sizeof(uint16_t), capacity);
+    add(sizeof(uint64_t), capacity);
+    add(sizeof(uint64_t), static_cast<size_t>(treeLeaves) * 2u);
+    add(sizeof(uint32_t), capacity);
+    add(sizeof(uint32_t), capacity);
+    add(sizeof(uint64_t), capacity);
+    add(sizeof(uint32_t), capacity);
+    add(sizeof(uint32_t), capacity);
+    add(sizeof(uint8_t), capacity);
+    add(sizeof(uint8_t), capacity);
+    add(sizeof(int32_t), capacity);
+    add(sizeof(int32_t), capacity);
+    if (metadataBytes == (std::numeric_limits<size_t>::max)())
+        return metadataBytes;
+    const size_t voiceBytes = VoiceSoA::EstimateStorageBytes(capacity);
+    if (voiceBytes > (std::numeric_limits<size_t>::max)() -
+                         sizeof(VoiceManager) - metadataBytes)
+        return (std::numeric_limits<size_t>::max)();
+    return sizeof(VoiceManager) + voiceBytes + metadataBytes;
 }
 
 inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
@@ -1549,6 +1603,10 @@ inline void VoiceManager::ApplyRuntimeVoiceLimit(uint64_t frame) {
     // method is called once before a render block is planned, never while
     // dense workers are consuming an immutable chunk plan.
     uint32_t requestedLimit = RequestedRuntimeVoiceLimit();
+    if (requestedLimit > RuntimeVoiceGrowthCeiling()) {
+        RequestRuntimeVoiceLimit(voiceLimit_);
+        requestedLimit = voiceLimit_;
+    }
     if (requestedLimit > maxVoices_ && requestedLimit <= kMaxPolyphony) {
         if (!GrowCapacity(requestedLimit)) {
             // Do not retry a failed large allocation every render boundary.

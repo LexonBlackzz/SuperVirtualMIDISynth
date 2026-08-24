@@ -53,6 +53,9 @@ int main() {
     svms::VoiceManager voices;
     Check(voices.Initialize(kOldCapacity, 44100u),
           "initial 1024-voice pool allocates");
+    Check(voices.GetAllocatedBytes() ==
+              svms::VoiceManager::EstimateAllocatedBytes(kOldCapacity),
+          "voice-manager memory estimate matches the reserved layout");
 
     for (uint32_t index = 0u; index < kOldCapacity; ++index) {
         const svms::VoiceHandle voice = voices.AllocateVoice(
@@ -77,6 +80,20 @@ int main() {
 
     Check(voices.GetActiveCount() == kOldCapacity,
           "initial pool is fully active before growth");
+
+    // A configured memory ceiling must reject an oversized live request at a
+    // render boundary without mutating the existing pool or voice limit.
+    svms::ConfigureRuntimeVoiceGrowthCeiling(1536u);
+    svms::RequestRuntimeVoiceLimit(kGrownCapacity);
+    voices.ApplyRuntimeVoiceLimit(99u);
+    Check(voices.GetMaxVoices() == kOldCapacity,
+          "memory ceiling prevents oversized physical growth");
+    Check(voices.GetVoiceLimit() == kOldCapacity,
+          "memory ceiling preserves the current logical voice limit");
+    Check(svms::RequestedRuntimeVoiceLimit() == kOldCapacity,
+          "rejected live growth snaps the requested limit back");
+    svms::ConfigureRuntimeVoiceGrowthCeiling(
+        svms::kRuntimeVoiceGrowthCeiling);
 
     struct SavedVoice {
         uint8_t state;
@@ -152,6 +169,10 @@ int main() {
     svms::RenderScalar renderer;
     Check(renderer.ReserveVoiceCapacity(kOldCapacity),
           "renderer starts with old-capacity scratch");
+    Check(renderer.GetAllocatedBytes() ==
+              svms::RenderScalar::EstimateAllocatedBytes(
+                  kOldCapacity, 1u, kFrames),
+          "serial-renderer memory estimate matches the reserved layout");
     std::vector<float> left(kFrames, 0.0f);
     std::vector<float> right(kFrames, 0.0f);
     const float phaseBeforeRender = voices.v.phases[0u];

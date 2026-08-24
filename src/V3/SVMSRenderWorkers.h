@@ -37,6 +37,9 @@ public:
     uint32_t GetThreadCount() const noexcept;
     float GetHelperJobPercent() const noexcept;
     size_t GetAllocatedBytes() const noexcept;
+    static size_t EstimateAllocatedBytes(uint32_t totalRenderThreads,
+                                         uint32_t maxFrames,
+                                         uint32_t voiceCapacity) noexcept;
     bool ShouldParallelize(uint32_t voiceCount, uint32_t frameCount) const noexcept;
     RenderParallelRejectReason ClassifyParallelization(
         uint32_t voiceCount, uint32_t frameCount) const noexcept;

@@ -15,6 +15,18 @@ inline constexpr uint32_t kRuntimeVoiceGrowthCeiling = 524288u;
 inline std::atomic<uint32_t> g_runtimeVoicePoolCapacity{0u};
 inline std::atomic<uint32_t> g_runtimeRequestedVoiceLimit{0u};
 inline std::atomic<uint32_t> g_runtimeAppliedVoiceLimit{0u};
+inline std::atomic<uint32_t> g_runtimeVoiceGrowthCeiling{
+    kRuntimeVoiceGrowthCeiling};
+
+inline void ConfigureRuntimeVoiceGrowthCeiling(uint32_t ceiling) noexcept {
+    if (ceiling == 0u || ceiling > kRuntimeVoiceGrowthCeiling)
+        ceiling = kRuntimeVoiceGrowthCeiling;
+    g_runtimeVoiceGrowthCeiling.store(ceiling, std::memory_order_release);
+}
+
+inline uint32_t RuntimeVoiceGrowthCeiling() noexcept {
+    return g_runtimeVoiceGrowthCeiling.load(std::memory_order_acquire);
+}
 
 inline void PublishRuntimeVoicePoolCapacity(uint32_t capacity) noexcept {
     g_runtimeVoicePoolCapacity.store(capacity, std::memory_order_release);
@@ -30,7 +42,7 @@ inline void PublishRuntimeVoicePoolCapacity(uint32_t capacity) noexcept {
 // physical allocation is intentionally NOT the limit for a live request.
 inline uint32_t RuntimeVoicePoolCapacity() noexcept {
     return g_runtimeVoicePoolCapacity.load(std::memory_order_acquire) == 0u
-        ? 0u : kRuntimeVoiceGrowthCeiling;
+        ? 0u : RuntimeVoiceGrowthCeiling();
 }
 
 // Actual allocation currently owned by the running VoiceManager. Telemetry

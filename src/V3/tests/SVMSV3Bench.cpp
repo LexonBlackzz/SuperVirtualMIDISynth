@@ -949,6 +949,7 @@ int main(int argc, char** argv) {
         "\"callbacks\":%u,\"event_stride\":%u,\"note_rate\":%u,\"key_count\":%u,\"base_note\":%u,\"key_stride\":%u,\"attack_frames\":%u,\"note_length_frames\":%u,\"noteoff_index\":\"%s\","
         "\"soundfont_regions\":%u,\"preset_regions\":%u,\"pinned_core\":%d,"
         "\"voice_soa_bytes\":%zu,\"voice_manager_bytes\":%zu,\"renderer_bytes\":%zu,"
+        "\"estimated_voice_manager_bytes\":%zu,\"estimated_renderer_bytes\":%zu,"
         "\"voice_samples_per_second\":%.0f,"
         "\"cycles_per_voice_sample\":%.3f,\"events_per_second\":%.0f,"
         "\"steals_per_second\":%.0f,\"matched_regions\":%llu,\"max_consecutive_overruns\":%u,"
@@ -1004,6 +1005,9 @@ int main(int argc, char** argv) {
         options.pinCore == UINT32_MAX ? -1 : static_cast<int>(options.pinCore),
         voices->v.GetAllocatedBytes(), voices->GetAllocatedBytes(),
         renderer->GetAllocatedBytes(),
+        svms::VoiceManager::EstimateAllocatedBytes(options.voices),
+        svms::RenderScalar::EstimateAllocatedBytes(
+            options.voices, renderer->GetRenderThreadCount(), options.frames),
         voiceSamplesPerSecond,
         cyclesPerVoiceSample, eventsPerSecond, stealsPerSecond,
         static_cast<unsigned long long>(gMatchedRegions), maximumConsecutiveOverruns,

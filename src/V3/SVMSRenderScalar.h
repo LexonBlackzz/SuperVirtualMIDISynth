@@ -385,15 +385,54 @@ public:
         return workerPool_ ? workerPool_->GetHelperJobPercent() : 0.0f;
     }
     uint32_t GetScratchCapacity() const { return scratchCapacity_; }
+    static size_t EstimateAllocatedBytes(uint32_t voiceCapacity,
+                                         uint32_t totalRenderThreads,
+                                         uint32_t maximumBlockFrames) noexcept {
+        if (voiceCapacity == 0u || voiceCapacity > kMaxPolyphony) return 0u;
+        // The constructor keeps the default 1,000-voice scratch reservation
+        // even when the configured logical/physical pool starts smaller.
+        voiceCapacity = (std::max)(voiceCapacity, kMaxVoicesDefault);
+        size_t bytes = sizeof(RenderScalar) +
+            static_cast<size_t>(voiceCapacity) *
+                (sizeof(uint32_t) * 5u + sizeof(SpanRetirement));
+        if (totalRenderThreads > 1u &&
+            voiceCapacity <= kDenseRenderMaximumVoices) {
+            const uint32_t tileCapacity =
+                (voiceCapacity + kDenseRenderHandlesPerTile - 1u) /
+                    kDenseRenderHandlesPerTile;
+            bytes += VoiceSoA::EstimateStorageBytes(voiceCapacity, true);
+            bytes += static_cast<size_t>(kDenseRenderMutationCapacity) * 2u *
+                (sizeof(DenseVoiceMutation) + sizeof(DenseVoiceSnapshot));
+            bytes += static_cast<size_t>(kDenseRenderChunkFrames) * 2u *
+                sizeof(DenseTailMutation);
+            bytes += static_cast<size_t>(tileCapacity) * 4u *
+                sizeof(uint32_t);
+        }
+        const size_t workerBytes = RenderWorkerPool::EstimateAllocatedBytes(
+            totalRenderThreads, maximumBlockFrames, voiceCapacity);
+        if (workerBytes > (std::numeric_limits<size_t>::max)() - bytes)
+            return (std::numeric_limits<size_t>::max)();
+        return bytes + workerBytes;
+    }
     size_t GetAllocatedBytes() const {
-        return sizeof(*this) +
+        size_t bytes = sizeof(*this) +
             static_cast<size_t>(scratchCapacity_) *
-                (sizeof(uint32_t) * 4u + sizeof(SpanRetirement)) +
+                (sizeof(uint32_t) * 5u + sizeof(SpanRetirement)) +
             static_cast<size_t>(denseMutationCapacity_) *
                 2u * (sizeof(DenseVoiceMutation) +
                       sizeof(DenseVoiceSnapshot)) +
-            denseRenderState_.GetAllocatedBytes() +
+            denseRenderState_.GetAllocatedBytes() - sizeof(VoiceSoA) +
             (workerPool_ ? workerPool_->GetAllocatedBytes() : 0u);
+        if (denseMutationCapacity_ != 0u) {
+            const uint32_t tileCapacity =
+                (scratchCapacity_ + kDenseRenderHandlesPerTile - 1u) /
+                    kDenseRenderHandlesPerTile;
+            bytes += static_cast<size_t>(kDenseRenderChunkFrames) * 2u *
+                sizeof(DenseTailMutation);
+            bytes += static_cast<size_t>(tileCapacity) * 4u *
+                sizeof(uint32_t);
+        }
+        return bytes;
     }
 
     void RenderBlock(VoiceManager& voices, const ChannelCache& channels,

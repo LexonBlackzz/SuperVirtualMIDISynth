@@ -144,6 +144,27 @@ void DrawPerformancePage(ConfigDocument& doc) {
         LiveVoiceCell();
 
         ImGui::TableNextRow();
+        LabelCell("Voice memory budget",
+                  "Upper bound for the primary voice pool, renderer scratch, dense-planner state, and worker mix buffers. Zero means unlimited. A restart recalculates the largest safe live-growth ceiling.");
+        ImGui::TableNextColumn();
+        int memoryBudget = static_cast<int>(w.voiceMemoryBudgetMB);
+        ImGui::SetNextItemWidth((std::min)(260.0f,
+                                           ImGui::GetContentRegionAvail().x));
+        if (ImGui::InputInt("##voicememorybudget", &memoryBudget, 0, 0)) {
+            memoryBudget = (std::max)(0, (std::min)(65536, memoryBudget));
+            w.voiceMemoryBudgetMB = static_cast<uint32_t>(memoryBudget);
+            doc.MarkDirty();
+        }
+        if (w.voiceMemoryBudgetMB == 0u) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Unlimited");
+        } else {
+            ImGui::SameLine();
+            ImGui::TextDisabled("MiB");
+        }
+        RestartCell();
+
+        ImGui::TableNextRow();
         LabelCell("Render threads",
                   "Total voice-render lanes. 1 keeps voice rendering on the audio thread. "
                   "0 selects V3's automatic thread count.");

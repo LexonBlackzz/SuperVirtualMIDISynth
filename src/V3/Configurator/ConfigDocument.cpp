@@ -133,6 +133,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.sampleRate = 44100;
     d.bufferFrames = 2048;
     d.maxVoices = 1000;
+    d.voiceMemoryBudgetMB = 0;
     d.renderThreads = 0;
     d.masterVolume = 1.0f;
     d.velocityCurve = 1.0f;
@@ -224,6 +225,8 @@ void ConfigDocument::FromJson(const json& root) {
             }
         }
         ReadNum(*it, "max_voices", working_.maxVoices, 1u, 524288u);
+        ReadNum(*it, "voice_memory_budget_mb", working_.voiceMemoryBudgetMB,
+                0u, 65536u);
         ReadNum(*it, "render_threads", working_.renderThreads, 0u, 64u);
         ReadNum(*it, "master_volume", working_.masterVolume, 0.0f, 4.0f);
         ReadNum(*it, "velocity_curve", working_.velocityCurve, 0.1f, 10.0f);
@@ -309,6 +312,8 @@ nlohmann::json ConfigDocument::ToJson() const {
     }
     root["synth"]["soundfont_routes"] = std::move(routes);
     root["synth"]["max_voices"] = working_.maxVoices;
+    root["synth"]["voice_memory_budget_mb"] =
+        working_.voiceMemoryBudgetMB;
     root["synth"]["render_threads"] = working_.renderThreads;
     root["synth"]["master_volume"] = working_.masterVolume;
     root["synth"]["velocity_curve"] = working_.velocityCurve;
@@ -506,6 +511,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
     return a.sampleRate == b.sampleRate
         && a.bufferFrames == b.bufferFrames
         && a.maxVoices == b.maxVoices
+        && a.voiceMemoryBudgetMB == b.voiceMemoryBudgetMB
         && a.renderThreads == b.renderThreads
         && AlmostEquals(a.masterVolume, b.masterVolume)
         && AlmostEquals(a.velocityCurve, b.velocityCurve)
@@ -582,6 +588,8 @@ ConfigValidation ConfigDocument::Validate() const {
         warn("audio.buffer_frames", "must be 16..8192");
     if (working_.maxVoices < 1 || working_.maxVoices > 524288)
         warn("synth.max_voices", "must be 1..524288");
+    if (working_.voiceMemoryBudgetMB > 65536)
+        warn("synth.voice_memory_budget_mb", "must be 0..65536");
     if (working_.renderThreads > 64)
         warn("synth.render_threads", "must be 0..64");
     if (working_.masterVolume < 0.0f || working_.masterVolume > 4.0f)

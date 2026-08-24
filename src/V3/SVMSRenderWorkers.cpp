@@ -330,6 +330,29 @@ size_t RenderWorkerPool::GetAllocatedBytes() const noexcept {
             sizeof(float);
 }
 
+size_t RenderWorkerPool::EstimateAllocatedBytes(
+    uint32_t totalRenderThreads, uint32_t maxFrames,
+    uint32_t voiceCapacity) noexcept {
+    if (totalRenderThreads <= 1u) return 0u;
+    totalRenderThreads = (std::min)(totalRenderThreads,
+                                    kMaximumRenderThreads);
+    if (maxFrames == 0u || voiceCapacity == 0u) return 0u;
+    const uint32_t helperCount = totalRenderThreads - 1u;
+    const uint32_t mixStride = (maxFrames + 15u) & ~15u;
+    const size_t jobMixStride = static_cast<size_t>(mixStride) * 2u;
+    const uint32_t jobCapacity =
+        (voiceCapacity + kHandlesPerJob - 1u) / kHandlesPerJob +
+        kVoiceRenderClassCount + totalRenderThreads;
+    const size_t mixFloats = static_cast<size_t>(jobCapacity) *
+        jobMixStride;
+    if (mixFloats > (std::numeric_limits<size_t>::max)() / sizeof(float))
+        return (std::numeric_limits<size_t>::max)();
+    return sizeof(Impl) +
+        static_cast<size_t>(helperCount) * sizeof(Impl::Worker) +
+        static_cast<size_t>(jobCapacity) * sizeof(RenderJob) +
+        mixFloats * sizeof(float);
+}
+
 bool RenderWorkerPool::ShouldParallelize(uint32_t voiceCount,
                                          uint32_t frameCount) const noexcept {
     return ClassifyParallelization(voiceCount, frameCount) ==

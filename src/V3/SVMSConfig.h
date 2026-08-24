@@ -34,6 +34,9 @@ struct EngineConfig {
     uint32_t sampleRate;
     uint32_t bufferFrames;
     uint32_t maxVoices;
+    // Upper bound for voice-pool, renderer scratch, and worker storage.
+    // Zero keeps legacy unlimited behavior.
+    uint32_t voiceMemoryBudgetMB;
     // Total voice-render threads. 1 preserves the original audio-thread-only
     // path; 0 selects a conservative automatic count.
     uint32_t renderThreads;

@@ -610,6 +610,21 @@ struct alignas(64) VoiceSoA {
     size_t GetAllocatedBytes() const noexcept {
         return sizeof(*this) + storageBytes_;
     }
+    static size_t EstimateStorageBytes(uint32_t capacity,
+                                       bool denseOnly = false) noexcept {
+        if (capacity == 0u) return 0u;
+        size_t bytes = 0u;
+#define SVMS_ESTIMATE_FIELD_SIZE(type, name) \
+        bytes = AlignUp(bytes); \
+        bytes += static_cast<size_t>(capacity) * sizeof(type);
+        if (denseOnly) {
+            SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_ESTIMATE_FIELD_SIZE)
+        } else {
+            SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ESTIMATE_FIELD_SIZE)
+        }
+#undef SVMS_ESTIMATE_FIELD_SIZE
+        return bytes;
+    }
 
     static void CopyVoice(VoiceSoA& destination, uint32_t destinationHandle,
                           const VoiceSoA& source,
