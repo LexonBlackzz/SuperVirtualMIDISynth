@@ -1,0 +1,30 @@
+name: One-shot RuntimeLink Windows syntax check
+
+on:
+  push:
+    branches:
+      - runtime-link-restart-fix-2
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile RuntimeLink header with MSVC
+        shell: pwsh
+        run: |
+          @'
+          #include "src/V3/SVMSRuntimeLink.h"
+          int main() { return 0; }
+          '@ | Set-Content -Encoding utf8 _runtime_link_compile_test.cpp
+          cl /nologo /std:c++17 /EHsc /c _runtime_link_compile_test.cpp /I src\V3
+
+      - name: Remove temporary branches
+        shell: bash
+        run: |
+          git push origin --delete runtime-link-restart-fix runtime-link-restart-fix-2
