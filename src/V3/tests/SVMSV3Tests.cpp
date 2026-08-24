@@ -2337,6 +2337,23 @@ void TestJsonConfigurationLifecycle() {
               queriedConfig == beforeRejectedPatch,
           "rejected native config patch leaves the document byte-unchanged");
 
+    {
+        std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
+        output << R"json({"schema_version":1,"synth":{"soundfont":"Alpha Piano.SF2","soundfonts":["Alpha Piano.SF2","beta.sf2"],"soundfont_routes":[{"soundfont":1,"bank":4,"preset":-1,"source_bank":0,"source_preset":-1,"percussion":false}]}})json";
+    }
+    svms::EngineConfig stacked = svms::EngineConfig::Load();
+    const std::vector<std::wstring> resolvedStack =
+        svms::ResolveV3SoundFontPaths(stacked);
+    Check(stacked.soundFontPaths.size() == 2u &&
+              stacked.soundFontRoutes.size() == 1u &&
+              stacked.soundFontRoutes[0].soundFontIndex == 1u &&
+              stacked.soundFontRoutes[0].targetBank == 4u,
+          "JSON loads priority SoundFont stack and explicit route");
+    Check(resolvedStack.size() == 2u &&
+              fs::path(resolvedStack[0]) == alphaSoundFont &&
+              fs::path(resolvedStack[1]) == betaSoundFont,
+          "SoundFont stack paths resolve in stable priority order");
+
     svms::EngineConfig explicitAbsolute = svms::EngineConfig::Default();
     explicitAbsolute.soundFontPath = betaSoundFont.wstring();
     Check(fs::path(svms::ResolveV3SoundFontPath(explicitAbsolute)) == betaSoundFont,

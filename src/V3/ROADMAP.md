@@ -633,6 +633,9 @@ larger phase containing that item is complete.
   absolute system WinMM bridge, timestamps short messages at callback arrival,
   and recycles four fixed SysEx buffers without affecting host `midiIn*`
   forwarding
+- [x] Add a priority-ordered immutable SoundFont stack with explicit melodic
+  or percussion bank/preset remapping, one concatenated render sample store,
+  backward-compatible `synth.soundfont`, and Configurator stack/route editing
 - [x] Record the live post-DSP stereo stream to float WAV/RF64 through an
   allocation-free audio-thread copy, an eight-second SPSC buffer, and a
   background file writer; expose start/stop, duration, file size, and dropped

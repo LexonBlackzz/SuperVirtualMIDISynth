@@ -2,10 +2,29 @@
 #define SVMS_CONFIGURATOR_CONFIGDOCUMENT_H
 
 #include <string>
+#include <vector>
 #include <cmath>
 #include <nlohmann/json.hpp>
 
 namespace svms::cfg {
+
+struct SoundFontRouteValue {
+    uint32_t soundFontIndex = 0u;
+    uint32_t targetBank = 0u;
+    int32_t targetPreset = -1;
+    uint32_t sourceBank = 0u;
+    int32_t sourcePreset = -1;
+    bool percussion = false;
+
+    bool operator==(const SoundFontRouteValue& other) const {
+        return soundFontIndex == other.soundFontIndex &&
+               targetBank == other.targetBank &&
+               targetPreset == other.targetPreset &&
+               sourceBank == other.sourceBank &&
+               sourcePreset == other.sourcePreset &&
+               percussion == other.percussion;
+    }
+};
 
 struct ConfigValues {
     uint32_t sampleRate = 44100;
@@ -55,6 +74,8 @@ struct ConfigValues {
 
     std::wstring audioDevice = L"default";
     std::wstring soundFontPath;
+    std::vector<std::wstring> soundFontPaths;
+    std::vector<SoundFontRouteValue> soundFontRoutes;
 };
 
 struct ConfigValidation {

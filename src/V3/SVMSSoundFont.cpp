@@ -1144,7 +1144,7 @@ uint32_t sf2_find_regions(const SF2Data* data, uint32_t presetIndex,
 }
 
 bool sf2_validate_region(const SF2Data* data, const SFSampleRegion* region) {
-    if (!data || !region || !data->sampleData ||
+    if (!data || !region ||
         region->sampleIndex >= data->sampleCount || data->sampleDataFrames < 2)
         return false;
 
@@ -1163,7 +1163,8 @@ bool sf2_validate_region(const SF2Data* data, const SFSampleRegion* region) {
 
 float sf2_region_initial_peak(const SF2Data* data, const SFSampleRegion* region,
                               uint32_t windowFrames) {
-    if (!sf2_validate_region(data, region) || windowFrames == 0) return 0.0f;
+    if (!sf2_validate_region(data, region) || !data->sampleData ||
+        windowFrames == 0) return 0.0f;
     const uint32_t start = static_cast<uint32_t>(region->startOffset);
     const uint32_t end = static_cast<uint32_t>(region->endOffset);
     const uint32_t count = (std::min)(windowFrames, end - start);

@@ -7,12 +7,27 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace svms {
 
 enum class LimiterAlgorithm : uint32_t {
     Classic = 0u,
     Adaptive = 1u,
+};
+
+static constexpr uint32_t kMaxSoundFontStackEntries = 16u;
+static constexpr uint32_t kMaxSoundFontRoutes = 256u;
+
+// Routes one incoming MIDI bank/program to a preset in a SoundFont from the
+// priority-ordered stack. A preset value of -1 preserves the incoming program.
+struct SoundFontRoute {
+    uint32_t soundFontIndex = 0u;
+    uint16_t targetBank = 0u;
+    int16_t targetPreset = -1;
+    uint16_t sourceBank = 0u;
+    int16_t sourcePreset = -1;
+    bool percussion = false;
 };
 
 struct EngineConfig {
@@ -77,6 +92,10 @@ struct EngineConfig {
     // endpoint friendly name.
     std::wstring audioDevice;
     std::wstring soundFontPath;
+    // Canonical priority order. soundFontPath mirrors entry zero for older
+    // configurations and APIs that only understand one bank.
+    std::vector<std::wstring> soundFontPaths;
+    std::vector<SoundFontRoute> soundFontRoutes;
     std::wstring configPath;
     std::string configWarning;
 
@@ -95,6 +114,8 @@ std::wstring GetV3ModuleDirectory();
 // or missing, deterministically discover .sf2 files beside winmm.dll.
 std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
                                     std::string* warning = nullptr);
+std::vector<std::wstring> ResolveV3SoundFontPaths(
+    const EngineConfig& cfg, std::string* warning = nullptr);
 
 // Control-thread JSON access used by the native API. Reads return the complete
 // selected document. Merge patches are serialized under the same cross-process

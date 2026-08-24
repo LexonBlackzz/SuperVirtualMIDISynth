@@ -75,6 +75,15 @@ int main() {
 
     document.Working().maxVoices = 222u;
     document.Working().midiInputEnabled = true;
+    document.Working().soundFontPath = L"Primary.sf2";
+    document.Working().soundFontPaths = {L"Primary.sf2", L"Layer.sf2"};
+    svms::cfg::SoundFontRouteValue route{};
+    route.soundFontIndex = 1u;
+    route.targetBank = 4u;
+    route.targetPreset = -1;
+    route.sourceBank = 0u;
+    route.sourcePreset = -1;
+    document.Working().soundFontRoutes = {route};
     document.Working().midiInputDevice = L"Unicode MIDI Ω";
     document.MarkDirty();
     std::string error;
@@ -90,6 +99,9 @@ int main() {
     ok &= Check(exportedJson["midi"]["input_enabled"] == true &&
                     exportedJson["midi"]["input_device"] == "Unicode MIDI Ω",
                 "export preserves physical MIDI input routing");
+    ok &= Check(exportedJson["synth"]["soundfonts"].size() == 2u &&
+                    exportedJson["synth"]["soundfont_routes"][0]["bank"] == 4u,
+                "export preserves SoundFont stack and routing");
     ok &= Check(exportedJson["active_unknown"]["keep"] == "active",
                 "export preserves unknown active fields");
 

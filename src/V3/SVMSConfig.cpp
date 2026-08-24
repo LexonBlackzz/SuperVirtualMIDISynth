@@ -179,6 +179,24 @@ json MakeDefaultJson(const EngineConfig& cfg) {
                             ? "directsound" : "wasapi-shared";
     const char* limiterAlgorithm = cfg.limiterAlgorithm == LimiterAlgorithm::Adaptive
                             ? "adaptive" : "classic";
+    json soundFonts = json::array();
+    if (!cfg.soundFontPaths.empty()) {
+        for (const std::wstring& path : cfg.soundFontPaths)
+            soundFonts.push_back(WideToUtf8(path));
+    } else if (!cfg.soundFontPath.empty()) {
+        soundFonts.push_back(WideToUtf8(cfg.soundFontPath));
+    }
+    json soundFontRoutes = json::array();
+    for (const SoundFontRoute& route : cfg.soundFontRoutes) {
+        soundFontRoutes.push_back({
+            {"soundfont", route.soundFontIndex},
+            {"bank", route.targetBank},
+            {"preset", route.targetPreset},
+            {"source_bank", route.sourceBank},
+            {"source_preset", route.sourcePreset},
+            {"percussion", route.percussion}
+        });
+    }
     return json{
         {"schema_version", kConfigSchemaVersion},
         {"audio", {
@@ -189,6 +207,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         }},
         {"synth", {
             {"soundfont", WideToUtf8(cfg.soundFontPath)},
+            {"soundfonts", std::move(soundFonts)},
+            {"soundfont_routes", std::move(soundFontRoutes)},
             {"max_voices", cfg.maxVoices},
             {"render_threads", cfg.renderThreads},
             {"master_volume", cfg.masterVolume},
@@ -270,8 +290,10 @@ void ImportLegacyIni(json& root, const fs::path& path) {
     importString("audio_backend", root["audio"]["backend"]);
     auto source = ini.find("soundfont");
     if (source == ini.end() || source->second.empty()) source = ini.find("sound_source");
-    if (source != ini.end() && !source->second.empty())
+    if (source != ini.end() && !source->second.empty()) {
         root["synth"]["soundfont"] = source->second;
+        root["synth"]["soundfonts"] = json::array({source->second});
+    }
 
     auto correctness = ini.find("correctness_mode");
     if (correctness != ini.end())
@@ -408,6 +430,71 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (sf != it->end()) {
             if (sf->is_string()) cfg.soundFontPath = Utf8ToWide(sf->get<std::string>());
             else AppendWarning(cfg.configWarning, "synth.soundfont");
+        }
+        auto stack = it->find("soundfonts");
+        if (stack != it->end()) {
+            if (!stack->is_array()) {
+                AppendWarning(cfg.configWarning, "synth.soundfonts");
+            } else {
+                cfg.soundFontPaths.clear();
+                for (const auto& value : *stack) {
+                    if (cfg.soundFontPaths.size() >= kMaxSoundFontStackEntries)
+                        break;
+                    if (!value.is_string()) {
+                        AppendWarning(cfg.configWarning, "synth.soundfonts[]");
+                        continue;
+                    }
+                    const std::wstring path = Utf8ToWide(value.get<std::string>());
+                    if (!path.empty()) cfg.soundFontPaths.push_back(path);
+                }
+            }
+        }
+        if (cfg.soundFontPaths.empty() && !cfg.soundFontPath.empty())
+            cfg.soundFontPaths.push_back(cfg.soundFontPath);
+        if (!cfg.soundFontPaths.empty())
+            cfg.soundFontPath = cfg.soundFontPaths.front();
+
+        auto routes = it->find("soundfont_routes");
+        if (routes != it->end()) {
+            if (!routes->is_array()) {
+                AppendWarning(cfg.configWarning, "synth.soundfont_routes");
+            } else {
+                cfg.soundFontRoutes.clear();
+                for (const auto& value : *routes) {
+                    if (cfg.soundFontRoutes.size() >= kMaxSoundFontRoutes) break;
+                    if (!value.is_object()) {
+                        AppendWarning(cfg.configWarning, "synth.soundfont_routes[]");
+                        continue;
+                    }
+                    SoundFontRoute route{};
+                    int32_t preset = -1;
+                    int32_t sourcePreset = -1;
+                    uint32_t soundFont = 0u;
+                    uint32_t bank = 0u;
+                    uint32_t sourceBank = 0u;
+                    bool percussion = false;
+                    const bool valid =
+                        ReadValue(value, "soundfont", soundFont, 0u,
+                                  kMaxSoundFontStackEntries - 1u) &&
+                        ReadValue(value, "bank", bank, 0u, 127u) &&
+                        ReadValue(value, "preset", preset, -1, 127) &&
+                        ReadValue(value, "source_bank", sourceBank, 0u, 65535u) &&
+                        ReadValue(value, "source_preset", sourcePreset, -1, 127) &&
+                        ReadBool(value, "percussion", percussion);
+                    if (!valid) {
+                        AppendWarning(cfg.configWarning,
+                                      "synth.soundfont_routes[]");
+                        continue;
+                    }
+                    route.soundFontIndex = soundFont;
+                    route.targetBank = static_cast<uint16_t>(bank);
+                    route.targetPreset = static_cast<int16_t>(preset);
+                    route.sourceBank = static_cast<uint16_t>(sourceBank);
+                    route.sourcePreset = static_cast<int16_t>(sourcePreset);
+                    route.percussion = percussion;
+                    cfg.soundFontRoutes.push_back(route);
+                }
+            }
         }
     }
     if (auto it = root.find("events"); it != root.end() && it->is_object()) {
@@ -652,6 +739,8 @@ EngineConfig EngineConfig::Default() {
     // user's current Windows default if that default changes later.
     cfg.audioDevice = L"default";
     cfg.soundFontPath.clear();
+    cfg.soundFontPaths.clear();
+    cfg.soundFontRoutes.clear();
     return cfg;
 }
 
@@ -676,6 +765,8 @@ EngineConfig EngineConfig::Load() {
         const auto localSoundFonts = DiscoverLocalSoundFonts();
         if (!localSoundFonts.empty())
             cfg.soundFontPath = localSoundFonts.front().filename().wstring();
+        if (!cfg.soundFontPath.empty())
+            cfg.soundFontPaths.push_back(cfg.soundFontPath);
         json root = MakeDefaultJson(cfg);
         const fs::path legacy = FindLegacyIni();
         if (!legacy.empty()) ImportLegacyIni(root, legacy);
@@ -718,6 +809,10 @@ EngineConfig EngineConfig::Load() {
     }
 
     ApplyEnvironment(cfg);
+    if (cfg.soundFontPaths.empty() && !cfg.soundFontPath.empty())
+        cfg.soundFontPaths.push_back(cfg.soundFontPath);
+    if (!cfg.soundFontPaths.empty())
+        cfg.soundFontPath = cfg.soundFontPaths.front();
     return cfg;
 }
 
@@ -953,6 +1048,39 @@ std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
             *warning += " (multiple .sf2 files found; set synth.soundfont explicitly)";
     }
     return localSoundFonts.front().wstring();
+}
+
+std::vector<std::wstring> ResolveV3SoundFontPaths(
+    const EngineConfig& cfg, std::string* warning) {
+    std::vector<std::wstring> resolved;
+    std::string primaryWarning;
+    const std::wstring primary = ResolveV3SoundFontPath(cfg, &primaryWarning);
+    if (!primary.empty()) resolved.push_back(primary);
+    if (warning) *warning = primaryWarning;
+
+    const fs::path directory = GetSoundFontSearchDirectory();
+    for (size_t i = 1u; i < cfg.soundFontPaths.size() &&
+                       resolved.size() < kMaxSoundFontStackEntries; ++i) {
+        fs::path requested(cfg.soundFontPaths[i]);
+        if (requested.is_relative()) requested = directory / requested;
+        if (!IsSoundFontFile(requested)) {
+            if (warning) {
+                if (!warning->empty()) *warning += "; ";
+                *warning += "stack SoundFont was not found: " +
+                            WideToUtf8(cfg.soundFontPaths[i]);
+            }
+            continue;
+        }
+        bool duplicate = false;
+        for (const std::wstring& existing : resolved) {
+            if (_wcsicmp(existing.c_str(), requested.wstring().c_str()) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) resolved.push_back(requested.wstring());
+    }
+    return resolved;
 }
 
 } // namespace svms

@@ -1915,11 +1915,12 @@ struct alignas(64) NoteLaunchPlanCacheEntry {
     uint32_t soundFontGeneration;
     uint32_t channelRevision;
     uint16_t presetIndex;
+    uint8_t soundFontIndex;
     uint8_t channel;
     uint8_t note;
     uint8_t velocity;
     uint8_t count;
-    uint16_t reserved;
+    uint8_t reserved;
     VoiceConfiguration setup[kNoteRegionCacheLayers];
 };
 
@@ -1998,6 +1999,10 @@ private:
     SoundFontBundle* BuildSoundFontBundle(const wchar_t* path,
                                           uint64_t requestId,
                                           std::string& error);
+    SoundFontBundle* BuildSoundFontStackBundle(
+        const std::vector<std::wstring>& paths,
+        const std::vector<SoundFontRoute>& routes,
+        uint64_t requestId, std::string& error);
     void PublishSoundFontBundle(SoundFontBundle* bundle) noexcept;
     void ActivatePendingSoundFontAtBlockBoundary() noexcept;
     void RetireSoundFontBundle(SoundFontBundle* bundle) noexcept;
@@ -2014,7 +2019,9 @@ private:
     bool QueueSoundFontLoad(const std::wstring& path, uint64_t& requestId);
     void SoundFontLoaderLoop();
 #endif
-    uint32_t ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
+    uint32_t ResolveNoteRegions(const SoundFontBundle* bank,
+                                uint8_t soundFontIndex,
+                                uint32_t presetIndex, uint8_t note,
                                 uint8_t velocity,
                                 const SFSampleRegion** outRegions,
                                 uint32_t outCapacity);
@@ -2077,6 +2084,7 @@ private:
     PreparedSF2Region* preparedRegions;
     uint32_t preparedRegionCount;
     uint32_t soundFontGeneration_;
+    SoundFontBundle* activeSoundFontStack_ = nullptr;
     std::atomic<SoundFontBundle*> activeSoundFontBundle_{nullptr};
     std::atomic<SoundFontBundle*> pendingSoundFontBundle_{nullptr};
     std::atomic<SoundFontBundle*> retiredSoundFontBundles_{nullptr};
@@ -2092,6 +2100,7 @@ private:
     std::string soundFontLoadError_;
 #endif
     uint32_t channelLaunchRevision_[kChannelCount];
+    uint8_t channelSoundFontIndex_[kChannelCount]{};
     NoteRegionCacheEntry noteRegionCache_[kNoteRegionCacheSize];
     NoteLaunchPlanCacheEntry noteLaunchPlanCache_[kNoteRegionCacheSize];
     NoteLaunchPlanCacheEntry*
@@ -2666,19 +2675,6 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
 }
 #endif // !defined(SVMS_XP_COMPAT)
 
-// Resolve a channel's active preset using GS/SF2 bank semantics: CC0 selects
-// the SF2 variation bank while CC32 remains tracked as MIDI state. Combining
-// them turns GS bank 1 into SF2 bank 128 and selects the wrong instruments.
-// Percussion parts search the percussion bank before melodic fallbacks. The
-// caller only commits a successful result, so an invalid
-// program change leaves the previously selected preset untouched.
-static bool ResolveChannelPreset(const SF2Data* data, const ChannelCache& cache,
-                                 uint8_t channel, uint32_t* outPresetIndex) {
-    if (!data || !outPresetIndex || channel >= kChannelCount) return false;
-    return sf2_resolve_preset(data, cache.GetBankMSB(channel), cache.GetProgram(channel),
-                              cache.IsPercussion(channel), outPresetIndex);
-}
-
 struct PreparedSF2Region {
     float basePhaseStep[kNoteCount];
     float bendScale;
@@ -2710,13 +2706,78 @@ struct SoundFontBundle {
     uint32_t sampleDataFrames = 0u;
     uint32_t regionInitialPeakCount = 0u;
     uint32_t preparedRegionCount = 0u;
+    uint32_t sampleBase = 0u;
     uint64_t requestId = 0u;
     std::wstring path;
+    SoundFontBundle* banks[kMaxSoundFontStackEntries]{};
+    uint32_t bankCount = 0u;
+    SoundFontRoute routes[kMaxSoundFontRoutes]{};
+    uint32_t routeCount = 0u;
     SoundFontBundle* retiredNext = nullptr;
 };
 
+static uint32_t SoundFontBankCount(const SoundFontBundle* bundle) noexcept {
+    if (!bundle) return 0u;
+    return bundle->bankCount != 0u ? bundle->bankCount : 1u;
+}
+
+static SoundFontBundle* SoundFontBankAt(const SoundFontBundle* bundle,
+                                        uint32_t index) noexcept {
+    if (!bundle) return nullptr;
+    if (bundle->bankCount == 0u)
+        return index == 0u ? const_cast<SoundFontBundle*>(bundle) : nullptr;
+    return index < bundle->bankCount ? bundle->banks[index] : nullptr;
+}
+
+// Resolve explicit routes first, then walk the immutable stack in priority
+// order. CC0 remains the SF2 bank selector; CC32 stays tracked MIDI state.
+static bool ResolveChannelPreset(const SoundFontBundle* bundle,
+                                 const ChannelCache& cache, uint8_t channel,
+                                 uint8_t* outSoundFontIndex,
+                                 uint32_t* outPresetIndex) {
+    if (!bundle || !outSoundFontIndex || !outPresetIndex ||
+        channel >= kChannelCount) return false;
+    const uint16_t bank = cache.GetBankMSB(channel);
+    const uint8_t program = cache.GetProgram(channel);
+    const bool percussion = cache.IsPercussion(channel);
+    for (uint32_t i = 0u; i < bundle->routeCount; ++i) {
+        const SoundFontRoute& route = bundle->routes[i];
+        if (route.targetBank != bank || route.percussion != percussion ||
+            (route.targetPreset >= 0 && route.targetPreset != program))
+            continue;
+        SoundFontBundle* selected = SoundFontBankAt(bundle,
+                                                     route.soundFontIndex);
+        if (!selected || !selected->data) continue;
+        const uint16_t sourcePreset = route.sourcePreset >= 0
+            ? static_cast<uint16_t>(route.sourcePreset) : program;
+        if (sf2_find_preset(selected->data, route.sourceBank, sourcePreset,
+                            outPresetIndex)) {
+            *outSoundFontIndex = static_cast<uint8_t>(route.soundFontIndex);
+            return true;
+        }
+    }
+    const uint32_t count = SoundFontBankCount(bundle);
+    for (uint32_t i = 0u; i < count; ++i) {
+        SoundFontBundle* selected = SoundFontBankAt(bundle, i);
+        if (selected && selected->data &&
+            sf2_resolve_preset(selected->data, bank, program, percussion,
+                               outPresetIndex)) {
+            *outSoundFontIndex = static_cast<uint8_t>(i);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void DestroySoundFontBundle(SoundFontBundle* bundle) noexcept {
     if (!bundle) return;
+    if (bundle->bankCount != 0u) {
+        for (uint32_t i = 0u; i < bundle->bankCount; ++i)
+            DestroySoundFontBundle(bundle->banks[i]);
+        free(bundle->sampleData);
+        delete bundle;
+        return;
+    }
     free(bundle->regionInitialPeaks);
     free(bundle->preparedRegions);
     free(bundle->sampleData);
@@ -3171,15 +3232,35 @@ void Driver::Shutdown() {
 
 bool Driver::LoadConfiguredSoundFont() {
     std::string resolutionWarning;
-    const std::wstring widePath =
-        ResolveV3SoundFontPath(engineConfig_, &resolutionWarning);
+    const std::vector<std::wstring> paths =
+        ResolveV3SoundFontPaths(engineConfig_, &resolutionWarning);
     if (!resolutionWarning.empty()) {
         const std::string message =
             "[SVMS] SoundFont configuration warning: " +
             resolutionWarning + "\n";
         OutputDebugStringA(message.c_str());
     }
-    const bool loaded = !widePath.empty() && LoadSoundFont(widePath.c_str());
+    bool loaded = false;
+    if (!paths.empty()) {
+        const uint64_t requestId = soundFontRequestId_.fetch_add(
+            1u, std::memory_order_acq_rel) + 1u;
+        std::string error;
+        EnterCriticalSection(&soundFontBuildCs_);
+        SoundFontBundle* bundle = BuildSoundFontStackBundle(
+            paths, engineConfig_.soundFontRoutes, requestId, error);
+        LeaveCriticalSection(&soundFontBuildCs_);
+        if (bundle) {
+            PublishSoundFontBundle(bundle);
+            if (!audioOutput || !audioOutput->IsRunning()) {
+                ActivatePendingSoundFontAtBlockBoundary();
+                ReclaimRetiredSoundFonts();
+            }
+            loaded = true;
+        } else if (!error.empty()) {
+            OutputDebugStringA(("[SVMS] SoundFont stack load failed: " +
+                                error + "\n").c_str());
+        }
+    }
     if (diagnosticsEnabled_ && (diagnosticsWindow_ || diagnosticsDebugOutput_)) {
         DiagWindow_UpdateStartup(audioOutput && audioOutput->IsRunning(),
                                  audioOutput
@@ -3302,8 +3383,81 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
         DestroySoundFontBundle(bundle);
         return nullptr;
     }
+    // Region compilation and diagnostic peaks are complete. Rendering uses
+    // the immutable float store, so retaining the original 16-bit RIFF blob
+    // would only duplicate every loaded bank for its entire lifetime.
+    free(sf2->sampleData);
+    sf2->sampleData = nullptr;
+    sf2->sampleDataSize = 0u;
     LOG("  SoundFont bundle ready: %u samples cached", sampCount);
     return bundle;
+}
+
+SoundFontBundle* Driver::BuildSoundFontStackBundle(
+    const std::vector<std::wstring>& paths,
+    const std::vector<SoundFontRoute>& routes,
+    uint64_t requestId, std::string& error) {
+    if (paths.empty()) {
+        error = "no SoundFont path supplied";
+        return nullptr;
+    }
+    if (paths.size() == 1u && routes.empty())
+        return BuildSoundFontBundle(paths.front().c_str(), requestId, error);
+
+    SoundFontBundle* stack = new (std::nothrow) SoundFontBundle();
+    if (!stack) {
+        error = "not enough memory to create SoundFont stack";
+        return nullptr;
+    }
+    stack->requestId = requestId;
+    stack->path = paths.front();
+    uint64_t totalFrames = 0u;
+    const uint32_t requestedCount = static_cast<uint32_t>((std::min)(
+        paths.size(), static_cast<size_t>(kMaxSoundFontStackEntries)));
+    for (uint32_t i = 0u; i < requestedCount; ++i) {
+        std::string bankError;
+        SoundFontBundle* bank = BuildSoundFontBundle(
+            paths[i].c_str(), requestId, bankError);
+        if (!bank) {
+            error = "SoundFont " + std::to_string(i + 1u) + " failed: " +
+                    (bankError.empty() ? "load failed" : bankError);
+            DestroySoundFontBundle(stack);
+            return nullptr;
+        }
+        if (totalFrames + bank->sampleDataFrames > UINT32_MAX) {
+            error = "combined SoundFont sample data exceeds 32-bit offsets";
+            DestroySoundFontBundle(bank);
+            DestroySoundFontBundle(stack);
+            return nullptr;
+        }
+        bank->sampleBase = static_cast<uint32_t>(totalFrames);
+        const uint64_t nextFrames = totalFrames + bank->sampleDataFrames;
+        float* grown = static_cast<float*>(realloc(
+            stack->sampleData,
+            static_cast<size_t>(nextFrames) * sizeof(float)));
+        if (!grown) {
+            error = "not enough memory to combine SoundFont samples";
+            DestroySoundFontBundle(bank);
+            DestroySoundFontBundle(stack);
+            return nullptr;
+        }
+        stack->sampleData = grown;
+        std::memcpy(stack->sampleData + bank->sampleBase, bank->sampleData,
+                    static_cast<size_t>(bank->sampleDataFrames) * sizeof(float));
+        free(bank->sampleData);
+        bank->sampleData = nullptr;
+        totalFrames = nextFrames;
+        stack->sampleDataFrames = static_cast<uint32_t>(totalFrames);
+        stack->banks[stack->bankCount++] = bank;
+    }
+    for (const SoundFontRoute& route : routes) {
+        if (stack->routeCount >= kMaxSoundFontRoutes) break;
+        if (route.soundFontIndex >= stack->bankCount) continue;
+        stack->routes[stack->routeCount++] = route;
+    }
+    LOG("  SoundFont stack ready: %u banks, %u routes, %u frames",
+        stack->bankCount, stack->routeCount, stack->sampleDataFrames);
+    return stack;
 }
 
 void Driver::RetireSoundFontBundle(SoundFontBundle* bundle) noexcept {
@@ -3350,15 +3504,17 @@ void Driver::ActivatePendingSoundFontAtBlockBoundary() noexcept {
     // remains intact and is remapped below.
     if (voiceManager) voiceManager->Reset();
 
-    soundFontData = next->data;
+    activeSoundFontStack_ = next;
+    SoundFontBundle* primary = SoundFontBankAt(next, 0u);
+    soundFontData = primary ? primary->data : nullptr;
     sampleDataStore = next->sampleData;
-    samplesStore = next->samples;
-    regionInitialPeaks = next->regionInitialPeaks;
-    preparedRegions = next->preparedRegions;
-    sampleStoreCount = next->sampleCount;
+    samplesStore = primary ? primary->samples : nullptr;
+    regionInitialPeaks = primary ? primary->regionInitialPeaks : nullptr;
+    preparedRegions = primary ? primary->preparedRegions : nullptr;
+    sampleStoreCount = primary ? primary->sampleCount : 0u;
     sampleDataFrames = next->sampleDataFrames;
-    regionInitialPeakCount = next->regionInitialPeakCount;
-    preparedRegionCount = next->preparedRegionCount;
+    regionInitialPeakCount = primary ? primary->regionInitialPeakCount : 0u;
+    preparedRegionCount = primary ? primary->preparedRegionCount : 0u;
 
     if (++soundFontGeneration_ == 0u) {
         soundFontGeneration_ = 1u;
@@ -3387,6 +3543,7 @@ void Driver::DestroyAllSoundFontBundles() noexcept {
         nullptr, std::memory_order_acq_rel));
     ReclaimRetiredSoundFonts();
     soundFontData = nullptr;
+    activeSoundFontStack_ = nullptr;
     sampleDataStore = nullptr;
     samplesStore = nullptr;
     regionInitialPeaks = nullptr;
@@ -5000,8 +5157,12 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
             if (self->channelCache && event.channel < kChannelCount) {
                 self->channelCache->SetRhythmPart(event.channel, event.data1);
                 uint32_t presetIndex = 0u;
-                if (ResolveChannelPreset(self->soundFontData,
-                        *self->channelCache, event.channel, &presetIndex)) {
+                uint8_t soundFontIndex = 0u;
+                if (ResolveChannelPreset(self->activeSoundFontStack_,
+                        *self->channelCache, event.channel,
+                        &soundFontIndex, &presetIndex)) {
+                    self->channelSoundFontIndex_[event.channel] =
+                        soundFontIndex;
                     self->channelCache->SetSelectedPreset(
                         event.channel, static_cast<uint16_t>(presetIndex));
                 } else {
@@ -5148,17 +5309,20 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
                 deferredMatches += static_cast<uint32_t>(delta);
                 deferredConfigured += static_cast<uint32_t>(delta >> 32u);
 
-                if (!exactFramePlan && self->soundFontData &&
+                if (!exactFramePlan && self->activeSoundFontStack_ &&
                     self->channelCache) {
                     const NoteLaunchPlanCacheEntry* candidate =
                         self->noteLaunchHotCache_[runChannel][runNote];
                     const uint32_t preset =
                         self->channelCache->GetSelectedPreset(runChannel);
+                    const uint8_t soundFontIndex =
+                        self->channelSoundFontIndex_[runChannel];
                     if (candidate && candidate->soundFontGeneration ==
                             self->soundFontGeneration_ &&
                         candidate->channelRevision ==
                             self->channelLaunchRevision_[runChannel] &&
                         candidate->presetIndex == preset &&
+                        candidate->soundFontIndex == soundFontIndex &&
                         candidate->channel == runChannel &&
                         candidate->note == runNote &&
                         candidate->velocity == (runVelocity & 0x7fu) &&
@@ -5177,14 +5341,18 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
         self->dispatchCyclesCurrent_ += __rdtsc() - profileBegin;
 }
 
-uint32_t Driver::ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
+uint32_t Driver::ResolveNoteRegions(const SoundFontBundle* bank,
+                                    uint8_t soundFontIndex,
+                                    uint32_t presetIndex, uint8_t note,
                                     uint8_t velocity,
                                     const SFSampleRegion** outRegions,
                                     uint32_t outCapacity) {
-    if (!soundFontData || !outRegions || presetIndex >= soundFontData->presetCount)
+    const SF2Data* data = bank ? bank->data : nullptr;
+    if (!data || !outRegions || presetIndex >= data->presetCount)
         return 0u;
 
-    const uint32_t tag = (presetIndex << 14u) |
+    const uint32_t tag = (static_cast<uint32_t>(soundFontIndex) << 23u) |
+        (presetIndex << 14u) |
         (static_cast<uint32_t>(note) << 7u) | velocity;
     uint32_t hash = tag;
     hash ^= hash >> 16u;
@@ -5197,12 +5365,12 @@ uint32_t Driver::ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
         const uint32_t count = cached.count;
         const uint32_t copied = (std::min)(count, outCapacity);
         for (uint32_t i = 0; i < copied; ++i)
-            outRegions[i] = &soundFontData->regions[cached.regionIndices[i]];
+            outRegions[i] = &data->regions[cached.regionIndices[i]];
         return count;
     }
 
     ++telemetry_.noteRegionCacheMisses;
-    const uint32_t count = sf2_find_regions(soundFontData, presetIndex, note,
+    const uint32_t count = sf2_find_regions(data, presetIndex, note,
                                             velocity, outRegions, outCapacity);
     if (count <= kNoteRegionCacheLayers && count <= outCapacity) {
         cached.tag = tag;
@@ -5210,21 +5378,24 @@ uint32_t Driver::ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
         cached.reserved = 0u;
         for (uint32_t i = 0; i < count; ++i) {
             cached.regionIndices[i] = static_cast<uint32_t>(
-                outRegions[i] - soundFontData->regions);
+                outRegions[i] - data->regions);
         }
     }
     return count;
 }
 
 void Driver::RefreshSelectedPresets() {
-    if (!channelCache || !soundFontData) return;
+    if (!channelCache || !activeSoundFontStack_) return;
     for (uint8_t channel = 0; channel < kChannelCount; ++channel) {
         uint32_t presetIndex = 0u;
-        if (ResolveChannelPreset(soundFontData, *channelCache, channel,
-                                 &presetIndex)) {
+        uint8_t soundFontIndex = 0u;
+        if (ResolveChannelPreset(activeSoundFontStack_, *channelCache, channel,
+                                 &soundFontIndex, &presetIndex)) {
+            channelSoundFontIndex_[channel] = soundFontIndex;
             channelCache->SetSelectedPreset(channel,
                 static_cast<uint16_t>(presetIndex));
         } else {
+            channelSoundFontIndex_[channel] = 0u;
             channelCache->SetSelectedPreset(channel, UINT16_MAX);
         }
     }
@@ -5245,22 +5416,30 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
 
     channelCache->NoteOn(channel, note, velocity);
 
-    if (!soundFontData || !samplesStore || !sampleDataStore) return 0u;
+    if (!activeSoundFontStack_ || !sampleDataStore) return 0u;
 
     // Bank/program handlers commit this cache at their exact event frame.
     // The fallback covers reset and SoundFont-swap boundaries only; the
     // multi-million-NPS path therefore avoids scanning the preset table for
     // every repeated note.
     uint32_t presetIndex = channelCache->GetSelectedPreset(channel);
-    if (presetIndex >= soundFontData->presetCount) {
-        if (!ResolveChannelPreset(soundFontData, *channelCache, channel,
-                                  &presetIndex)) {
+    uint8_t soundFontIndex = channelSoundFontIndex_[channel];
+    SoundFontBundle* bank = SoundFontBankAt(activeSoundFontStack_,
+                                            soundFontIndex);
+    if (!bank || !bank->data || !bank->samples ||
+        presetIndex >= bank->data->presetCount) {
+        if (!ResolveChannelPreset(activeSoundFontStack_, *channelCache, channel,
+                                  &soundFontIndex, &presetIndex)) {
             ++sf2Telemetry_.invalidPresets;
             return 0u;
         }
+        channelSoundFontIndex_[channel] = soundFontIndex;
         channelCache->SetSelectedPreset(channel,
                                         static_cast<uint16_t>(presetIndex));
+        bank = SoundFontBankAt(activeSoundFontStack_, soundFontIndex);
+        if (!bank || !bank->data || !bank->samples) return 0u;
     }
+    SF2Data* data = bank->data;
     // Probe the complete launch-plan cache before doing even the cached
     // region lookup.  The former ordering resolved/copied regions and
     // revalidated every layer before discovering that the fully prepared
@@ -5270,7 +5449,9 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
         return entry &&
             entry->soundFontGeneration == soundFontGeneration_ &&
             entry->channelRevision == channelLaunchRevision_[channel] &&
-            entry->presetIndex == presetIndex && entry->channel == channel &&
+            entry->presetIndex == presetIndex &&
+            entry->soundFontIndex == soundFontIndex &&
+            entry->channel == channel &&
             entry->note == note && entry->velocity == velocity &&
             entry->count != 0u &&
             entry->count <= kNoteRegionCacheLayers;
@@ -5286,6 +5467,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
         launchHash ^= static_cast<uint32_t>(note) * 0x85ebca6bu;
         launchHash ^= static_cast<uint32_t>(velocity) * 0xc2b2ae35u;
         launchHash ^= static_cast<uint32_t>(channel) * 0x27d4eb2fu;
+        launchHash ^= static_cast<uint32_t>(soundFontIndex) * 0xd3a2646cu;
         launchHash ^= channelLaunchRevision_[channel] * 0x165667b1u;
         launchHash ^= launchHash >> 16u;
         launchCache = &noteLaunchPlanCache_[
@@ -5295,7 +5477,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     }
 
     uint32_t matchCount = launchCacheHit ? launchCache->count
-        : ResolveNoteRegions(presetIndex, note, velocity,
+        : ResolveNoteRegions(bank, soundFontIndex, presetIndex, note, velocity,
                              noteRegionScratch_, kMaxMatchingRegions);
     if (matchCount > kMaxMatchingRegions) {
         ++telemetry_.allocationFailures;
@@ -5314,15 +5496,16 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     if (!launchCacheHit) {
         for (uint32_t mi = 0; mi < matchCount; ++mi) {
             const SFSampleRegion* region = noteRegionScratch_[mi];
-            if (!region || region->sampleIndex >= sampleStoreCount) {
+            if (!region || region->sampleIndex >= bank->sampleCount) {
                 ++sf2Telemetry_.invalidRegions;
                 return 0u;
             }
             const uint32_t regionIndex = static_cast<uint32_t>(
-                region - soundFontData->regions);
-            const bool valid = preparedRegions && regionIndex < preparedRegionCount
-                ? preparedRegions[regionIndex].valid != 0u
-                : sf2_validate_region(soundFontData, region);
+                region - data->regions);
+            const bool valid = bank->preparedRegions &&
+                    regionIndex < bank->preparedRegionCount
+                ? bank->preparedRegions[regionIndex].valid != 0u
+                : sf2_validate_region(data, region);
             if (!valid) {
                 ++sf2Telemetry_.invalidSampleRanges;
                 return 0u;
@@ -5353,12 +5536,13 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     } else for (uint32_t mi = 0; mi < matchCount; ++mi) {
         const SFSampleRegion* matchedRegion = noteRegionScratch_[mi];
         const uint32_t matchedRegionIndex = static_cast<uint32_t>(
-            matchedRegion - soundFontData->regions);
+            matchedRegion - data->regions);
         const PreparedSF2Region* prepared =
-            preparedRegions && matchedRegionIndex < preparedRegionCount
-                ? &preparedRegions[matchedRegionIndex] : nullptr;
+            bank->preparedRegions &&
+                    matchedRegionIndex < bank->preparedRegionCount
+                ? &bank->preparedRegions[matchedRegionIndex] : nullptr;
         uint32_t sampleIndex = matchedRegion->sampleIndex;
-        const SF2Sample& samp = samplesStore[sampleIndex];
+        const SF2Sample& samp = bank->samples[sampleIndex];
 
         const float bendScale = prepared ? prepared->bendScale
             : static_cast<float>(matchedRegion->scaleTuning != 0
@@ -5392,10 +5576,14 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
             phaseStep = 1.0f;
         }
 
-        uint32_t sStart = static_cast<uint32_t>(matchedRegion->startOffset);
-        uint32_t sEnd = static_cast<uint32_t>(matchedRegion->endOffset);
-        uint32_t sLoopStart = static_cast<uint32_t>(matchedRegion->loopStartOffset);
-        uint32_t sLoopEnd = static_cast<uint32_t>(matchedRegion->loopEndOffset);
+        uint32_t sStart = bank->sampleBase +
+            static_cast<uint32_t>(matchedRegion->startOffset);
+        uint32_t sEnd = bank->sampleBase +
+            static_cast<uint32_t>(matchedRegion->endOffset);
+        uint32_t sLoopStart = bank->sampleBase +
+            static_cast<uint32_t>(matchedRegion->loopStartOffset);
+        uint32_t sLoopEnd = bank->sampleBase +
+            static_cast<uint32_t>(matchedRegion->loopEndOffset);
         uint8_t loopMode = matchedRegion->loopMode;
 
         float initialGain;
@@ -5490,6 +5678,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
         launchCache->soundFontGeneration = soundFontGeneration_;
         launchCache->channelRevision = channelLaunchRevision_[channel];
         launchCache->presetIndex = static_cast<uint16_t>(presetIndex);
+        launchCache->soundFontIndex = soundFontIndex;
         launchCache->channel = channel;
         launchCache->note = note;
         launchCache->velocity = velocity;
@@ -5518,14 +5707,15 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration& lastSetup = launchSetups[last];
     const VoiceHandle lastVoice = noteLaunchHandles_[last];
     const SFSampleRegion* lastRegion =
-        &soundFontData->regions[lastSetup.regionIndex];
+        &data->regions[lastSetup.regionIndex];
     sf2Telemetry_.lastRegion = lastSetup.regionIndex;
     sf2Telemetry_.lastSample = static_cast<uint16_t>(lastRegion->sampleIndex);
     sf2Telemetry_.lastSampleStart = lastSetup.sampleStart;
     sf2Telemetry_.lastSampleEnd = lastSetup.sampleEnd;
     sf2Telemetry_.lastInitialPeak =
-        regionInitialPeaks && lastSetup.regionIndex < regionInitialPeakCount
-            ? regionInitialPeaks[lastSetup.regionIndex] : 0.0f;
+        bank->regionInitialPeaks &&
+                lastSetup.regionIndex < bank->regionInitialPeakCount
+            ? bank->regionInitialPeaks[lastSetup.regionIndex] : 0.0f;
     sf2Telemetry_.lastVoiceGain = lastSetup.initialGain;
     sf2Telemetry_.lastMixGainL = voiceManager->v.mixGainL[lastVoice];
     sf2Telemetry_.lastMixGainR = voiceManager->v.mixGainR[lastVoice];
@@ -5578,11 +5768,14 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
         ++channelLaunchRevision_[channel];
     }
 
-    if ((controller == 0 || controller == 32) && channelCache && soundFontData &&
+    if ((controller == 0 || controller == 32) && channelCache &&
+        activeSoundFontStack_ &&
         channel < kChannelCount) {
         uint32_t presetIndex = 0u;
-        if (ResolveChannelPreset(soundFontData, *channelCache, channel,
-                                 &presetIndex)) {
+        uint8_t soundFontIndex = 0u;
+        if (ResolveChannelPreset(activeSoundFontStack_, *channelCache, channel,
+                                 &soundFontIndex, &presetIndex)) {
+            channelSoundFontIndex_[channel] = soundFontIndex;
             channelCache->SetSelectedPreset(channel,
                                             static_cast<uint16_t>(presetIndex));
         } else {
@@ -5642,7 +5835,8 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
 }
 
 void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
-    if (!channelCache || !soundFontData || channel >= kChannelCount) return;
+    if (!channelCache || !activeSoundFontStack_ ||
+        channel >= kChannelCount) return;
 
     // Validate against the bank currently selected on this channel before
     // committing the new program. Existing voices retain their stored region.
@@ -5650,7 +5844,10 @@ void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
     channelCache->ProgramChange(channel, program);
 
     uint32_t presetIndex = 0;
-    if (ResolveChannelPreset(soundFontData, *channelCache, channel, &presetIndex)) {
+    uint8_t soundFontIndex = 0u;
+    if (ResolveChannelPreset(activeSoundFontStack_, *channelCache, channel,
+                             &soundFontIndex, &presetIndex)) {
+        channelSoundFontIndex_[channel] = soundFontIndex;
         channelCache->SetSelectedPreset(channel, static_cast<uint16_t>(presetIndex));
         ++channelLaunchRevision_[channel];
         return;

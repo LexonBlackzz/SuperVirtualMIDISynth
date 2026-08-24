@@ -24,6 +24,7 @@ publish official V3 DLL releases yet, but you can build and test it from source.
   offline renderer page
 - Live post-DSP recording to stereo 32-bit float WAV/RF64
 - Live SoundFont switching with off-thread preparation and block-boundary activation
+- Priority-ordered SoundFont stacks with explicit MIDI bank/preset routing
 - Native SVMS API and KDMAPI-compatible entry points
 - Windows x64, Windows x86, Windows XP x86, and Linux x86-64 targets
 
@@ -103,6 +104,13 @@ Parsing and sample preparation happen on a loader thread; the finished immutable
 bank activates at the next audio-block boundary without restarting WASAPI. Any
 voices using the previous bank are silenced at activation while MIDI channel
 state is retained. Save the configuration separately to reuse the bank later.
+
+The same page can build a priority-ordered stack of up to 16 SoundFonts.
+Explicit routes map an incoming MIDI bank/preset to a selected stack entry and
+source bank/preset; `-1` keeps the incoming program. Without a route, V3 walks
+the stack in order and uses the first bank containing a compatible preset.
+Stack changes are restart-applied; the single **Load Now** action remains the
+fast live replacement for the primary bank.
 
 ## Offline rendering
 

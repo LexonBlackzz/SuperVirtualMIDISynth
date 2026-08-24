@@ -171,6 +171,8 @@ ConfigValues ConfigDocument::Defaults() {
     d.midiInputDevice.clear();
     d.audioDevice = L"default";
     d.soundFontPath.clear();
+    d.soundFontPaths.clear();
+    d.soundFontRoutes.clear();
     return d;
 }
 
@@ -184,6 +186,43 @@ void ConfigDocument::FromJson(const json& root) {
     }
     if (auto it = root.find("synth"); it != root.end() && it->is_object()) {
         ReadString(*it, "soundfont", working_.soundFontPath);
+        if (auto stack = it->find("soundfonts");
+            stack != it->end() && stack->is_array()) {
+            working_.soundFontPaths.clear();
+            for (const auto& item : *stack) {
+                if (working_.soundFontPaths.size() >= 16u) break;
+                if (item.is_string()) {
+                    const std::wstring path = Utf8ToWide(item.get<std::string>());
+                    if (!path.empty()) working_.soundFontPaths.push_back(path);
+                }
+            }
+        }
+        if (working_.soundFontPaths.empty() && !working_.soundFontPath.empty())
+            working_.soundFontPaths.push_back(working_.soundFontPath);
+        if (!working_.soundFontPaths.empty())
+            working_.soundFontPath = working_.soundFontPaths.front();
+
+        if (auto routes = it->find("soundfont_routes");
+            routes != it->end() && routes->is_array()) {
+            working_.soundFontRoutes.clear();
+            for (const auto& item : *routes) {
+                if (working_.soundFontRoutes.size() >= 256u ||
+                    !item.is_object()) break;
+                SoundFontRouteValue route{};
+                route.soundFontIndex = item.value("soundfont", 0u);
+                route.targetBank = item.value("bank", 0u);
+                route.targetPreset = item.value("preset", -1);
+                route.sourceBank = item.value("source_bank", 0u);
+                route.sourcePreset = item.value("source_preset", -1);
+                route.percussion = item.value("percussion", false);
+                if (route.soundFontIndex < 16u && route.targetBank <= 127u &&
+                    route.targetPreset >= -1 && route.targetPreset <= 127 &&
+                    route.sourceBank <= 65535u && route.sourcePreset >= -1 &&
+                    route.sourcePreset <= 127) {
+                    working_.soundFontRoutes.push_back(route);
+                }
+            }
+        }
         ReadNum(*it, "max_voices", working_.maxVoices, 1u, 524288u);
         ReadNum(*it, "render_threads", working_.renderThreads, 0u, 64u);
         ReadNum(*it, "master_volume", working_.masterVolume, 0.0f, 4.0f);
@@ -249,6 +288,26 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["audio"]["buffer_frames"] = working_.bufferFrames;
 
     root["synth"]["soundfont"] = WideToUtf8(working_.soundFontPath);
+    json soundFonts = json::array();
+    if (!working_.soundFontPaths.empty()) {
+        for (const std::wstring& path : working_.soundFontPaths)
+            soundFonts.push_back(WideToUtf8(path));
+    } else if (!working_.soundFontPath.empty()) {
+        soundFonts.push_back(WideToUtf8(working_.soundFontPath));
+    }
+    root["synth"]["soundfonts"] = std::move(soundFonts);
+    json routes = json::array();
+    for (const SoundFontRouteValue& route : working_.soundFontRoutes) {
+        routes.push_back({
+            {"soundfont", route.soundFontIndex},
+            {"bank", route.targetBank},
+            {"preset", route.targetPreset},
+            {"source_bank", route.sourceBank},
+            {"source_preset", route.sourcePreset},
+            {"percussion", route.percussion}
+        });
+    }
+    root["synth"]["soundfont_routes"] = std::move(routes);
     root["synth"]["max_voices"] = working_.maxVoices;
     root["synth"]["render_threads"] = working_.renderThreads;
     root["synth"]["master_volume"] = working_.masterVolume;
@@ -484,7 +543,9 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.midiInputEnabled == b.midiInputEnabled
         && a.midiInputDevice == b.midiInputDevice
         && a.audioDevice == b.audioDevice
-        && a.soundFontPath == b.soundFontPath;
+        && a.soundFontPath == b.soundFontPath
+        && a.soundFontPaths == b.soundFontPaths
+        && a.soundFontRoutes == b.soundFontRoutes;
 }
 
 bool ConfigDocument::IsDirty() const {

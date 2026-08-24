@@ -47,6 +47,70 @@ bool EqualAsciiCI(const std::string& a, const std::string& b) {
     return true;
 }
 
+void SetPrimarySoundFont(ConfigValues& values, const std::wstring& path) {
+    values.soundFontPath = path;
+    if (path.empty()) {
+        if (!values.soundFontPaths.empty())
+            values.soundFontPaths.erase(values.soundFontPaths.begin());
+    } else if (values.soundFontPaths.empty()) {
+        values.soundFontPaths.push_back(path);
+    } else {
+        values.soundFontPaths.front() = path;
+    }
+    for (auto it = values.soundFontRoutes.begin();
+         it != values.soundFontRoutes.end();) {
+        if (it->soundFontIndex >= values.soundFontPaths.size())
+            it = values.soundFontRoutes.erase(it);
+        else
+            ++it;
+    }
+}
+
+bool BrowseSoundFont(std::wstring& path, std::wstring& lastDirectory,
+                     const wchar_t* title) {
+    wchar_t fileBuf[1024] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = L"SoundFont files (*.sf2)\0*.sf2\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileBuf;
+    ofn.nMaxFile = static_cast<DWORD>(_countof(fileBuf));
+    ofn.lpstrInitialDir = lastDirectory.empty() ? nullptr : lastDirectory.c_str();
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return false;
+    path = fileBuf;
+    lastDirectory = std::filesystem::path(path).parent_path().wstring();
+    return true;
+}
+
+void SwapSoundFonts(ConfigValues& values, uint32_t a, uint32_t b) {
+    if (a >= values.soundFontPaths.size() || b >= values.soundFontPaths.size())
+        return;
+    std::swap(values.soundFontPaths[a], values.soundFontPaths[b]);
+    for (SoundFontRouteValue& route : values.soundFontRoutes) {
+        if (route.soundFontIndex == a) route.soundFontIndex = b;
+        else if (route.soundFontIndex == b) route.soundFontIndex = a;
+    }
+    values.soundFontPath = values.soundFontPaths.empty()
+        ? std::wstring() : values.soundFontPaths.front();
+}
+
+void RemoveSoundFont(ConfigValues& values, uint32_t index) {
+    if (index >= values.soundFontPaths.size()) return;
+    values.soundFontPaths.erase(values.soundFontPaths.begin() + index);
+    for (auto it = values.soundFontRoutes.begin();
+         it != values.soundFontRoutes.end();) {
+        if (it->soundFontIndex == index) {
+            it = values.soundFontRoutes.erase(it);
+        } else {
+            if (it->soundFontIndex > index) --it->soundFontIndex;
+            ++it;
+        }
+    }
+    values.soundFontPath = values.soundFontPaths.empty()
+        ? std::wstring() : values.soundFontPaths.front();
+}
+
 struct SoundFontLiveStatus {
     uint32_t state = 0u;
     uint64_t requested = 0u;
@@ -394,29 +458,17 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         }
 
         if (ImGui::Button("Browse…", ImVec2(90, 0))) {
-            wchar_t fileBuf[1024] = {};
-            std::wstring initialDir = lastSoundFontDir;
-            OPENFILENAMEW ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrFilter =
-                L"SoundFont files (*.sf2;*.dls)\0*.sf2;*.dls\0"
-                L"All files (*.*)\0*.*\0";
-            ofn.lpstrFile = fileBuf;
-            ofn.nMaxFile = 1024;
-            ofn.lpstrInitialDir = initialDir.empty() ? nullptr : initialDir.c_str();
-            ofn.lpstrTitle = L"Select SoundFont";
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameW(&ofn)) {
-                w.soundFontPath = fileBuf;
-                lastSoundFontDir =
-                    std::filesystem::path(fileBuf).parent_path().wstring();
+            std::wstring selected;
+            if (BrowseSoundFont(selected, lastSoundFontDir,
+                                L"Select primary SoundFont")) {
+                SetPrimarySoundFont(w, selected);
                 doc.MarkDirty();
             }
         }
         ImGui::SameLine();
         if (!w.soundFontPath.empty()) {
             if (ImGui::Button("Clear", ImVec2(60, 0))) {
-                w.soundFontPath.clear();
+                SetPrimarySoundFont(w, {});
                 doc.MarkDirty();
             }
         }
@@ -495,11 +547,151 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 _wcsicmp(file.c_str(),
                          std::filesystem::path(w.soundFontPath).filename().c_str()) == 0;
             if (ImGui::Selectable(name.c_str(), selected)) {
-                w.soundFontPath = std::filesystem::path(scannedDir) / file;
+                SetPrimarySoundFont(
+                    w, (std::filesystem::path(scannedDir) / file).wstring());
                 doc.MarkDirty();
             }
         }
         ImGui::EndChild();
+
+        ImGui::Spacing();
+        ImGui::SeparatorText("PRIORITY STACK");
+        ImGui::TextDisabled(
+            "The first matching bank wins unless an explicit route below matches first.");
+        if (ImGui::Button("Add SoundFont...", ImVec2(130.0f, 0.0f))) {
+            std::wstring selected;
+            if (w.soundFontPaths.size() < 16u &&
+                BrowseSoundFont(selected, lastSoundFontDir,
+                                L"Add SoundFont to stack")) {
+                bool duplicate = false;
+                for (const std::wstring& existing : w.soundFontPaths)
+                    duplicate |= _wcsicmp(existing.c_str(), selected.c_str()) == 0;
+                if (!duplicate) {
+                    w.soundFontPaths.push_back(selected);
+                    if (w.soundFontPath.empty())
+                        w.soundFontPath = w.soundFontPaths.front();
+                    doc.MarkDirty();
+                }
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Up to 16 banks; stack changes activate after restart.");
+
+        for (uint32_t i = 0u; i < w.soundFontPaths.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            const std::string label = std::to_string(i) + ": " +
+                WideToUtf8Str(std::filesystem::path(w.soundFontPaths[i]).filename().wstring());
+            ImGui::TextUnformatted(label.c_str());
+            ImGui::SameLine();
+            if (i == 0u) ImGui::TextDisabled("(primary)");
+            if (ImGui::GetContentRegionAvail().x > 180.0f) {
+                ImGui::SameLine(ImGui::GetCursorPosX() +
+                                ImGui::GetContentRegionAvail().x - 170.0f);
+            }
+            if (i == 0u) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Up")) {
+                SwapSoundFonts(w, i, i - 1u);
+                doc.MarkDirty();
+                ImGui::PopID();
+                break;
+            }
+            if (i == 0u) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (i + 1u >= w.soundFontPaths.size()) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Down")) {
+                SwapSoundFonts(w, i, i + 1u);
+                doc.MarkDirty();
+                ImGui::PopID();
+                break;
+            }
+            if (i + 1u >= w.soundFontPaths.size()) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove")) {
+                RemoveSoundFont(w, i);
+                doc.MarkDirty();
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::Spacing();
+        ImGui::SeparatorText("BANK / PRESET ROUTES");
+        if (ImGui::Button("Add Route", ImVec2(100.0f, 0.0f)) &&
+            !w.soundFontPaths.empty() && w.soundFontRoutes.size() < 256u) {
+            SoundFontRouteValue route{};
+            route.soundFontIndex = static_cast<uint32_t>(
+                w.soundFontPaths.size() > 1u ? 1u : 0u);
+            w.soundFontRoutes.push_back(route);
+            doc.MarkDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Preset -1 means keep the incoming program.");
+
+        for (uint32_t i = 0u; i < w.soundFontRoutes.size(); ++i) {
+            SoundFontRouteValue& route = w.soundFontRoutes[i];
+            ImGui::PushID(static_cast<int>(0x4000u + i));
+            ImGui::Separator();
+            const char* preview = "(missing)";
+            std::string previewStorage;
+            if (route.soundFontIndex < w.soundFontPaths.size()) {
+                previewStorage = WideToUtf8Str(std::filesystem::path(
+                    w.soundFontPaths[route.soundFontIndex]).filename().wstring());
+                preview = previewStorage.c_str();
+            }
+            ImGui::SetNextItemWidth((std::min)(260.0f,
+                                               ImGui::GetContentRegionAvail().x));
+            if (ImGui::BeginCombo("SoundFont", preview)) {
+                for (uint32_t sf = 0u; sf < w.soundFontPaths.size(); ++sf) {
+                    const std::string name = WideToUtf8Str(std::filesystem::path(
+                        w.soundFontPaths[sf]).filename().wstring());
+                    if (ImGui::Selectable(name.c_str(),
+                                          route.soundFontIndex == sf)) {
+                        route.soundFontIndex = sf;
+                        doc.MarkDirty();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            int targetBank = static_cast<int>(route.targetBank);
+            int targetPreset = route.targetPreset;
+            int sourceBank = static_cast<int>(route.sourceBank);
+            int sourcePreset = route.sourcePreset;
+            ImGui::SetNextItemWidth(95.0f);
+            if (ImGui::InputInt("MIDI bank", &targetBank)) {
+                route.targetBank = static_cast<uint32_t>((std::clamp)(
+                    targetBank, 0, 127));
+                doc.MarkDirty();
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(95.0f);
+            if (ImGui::InputInt("MIDI preset", &targetPreset)) {
+                route.targetPreset = (std::clamp)(targetPreset, -1, 127);
+                doc.MarkDirty();
+            }
+            ImGui::SetNextItemWidth(95.0f);
+            if (ImGui::InputInt("Source bank", &sourceBank)) {
+                route.sourceBank = static_cast<uint32_t>((std::clamp)(
+                    sourceBank, 0, 65535));
+                doc.MarkDirty();
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(95.0f);
+            if (ImGui::InputInt("Source preset", &sourcePreset)) {
+                route.sourcePreset = (std::clamp)(sourcePreset, -1, 127);
+                doc.MarkDirty();
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Drums", &route.percussion)) doc.MarkDirty();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove route")) {
+                w.soundFontRoutes.erase(w.soundFontRoutes.begin() + i);
+                doc.MarkDirty();
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
     }
 }
 
