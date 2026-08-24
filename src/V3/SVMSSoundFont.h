@@ -150,11 +150,15 @@ enum SF2GeneratorType : uint16_t {
 };
 
 static constexpr uint16_t Gen_RootKey = 58;
-static constexpr uint32_t kMaxPresets = 256;
-static constexpr uint32_t kMaxInstruments = 512;
-static constexpr uint32_t kMaxSamples = 2048;
-static constexpr uint32_t kMaxZones = 4096;
-static constexpr uint32_t kMaxGenerators = 16384;
+// Bag and generator indices are 16-bit in SF2, and large General MIDI banks
+// routinely use substantially more than the original conservative limits.
+// Keep bounded, allocation-free metadata storage while covering the complete
+// representable generator/index space and practical large-bank header counts.
+static constexpr uint32_t kMaxPresets = 512;
+static constexpr uint32_t kMaxInstruments = 4096;
+static constexpr uint32_t kMaxSamples = 8192;
+static constexpr uint32_t kMaxZones = 65536;
+static constexpr uint32_t kMaxGenerators = 65536;
 
 struct SF2PresetHeader {
     char name[20];

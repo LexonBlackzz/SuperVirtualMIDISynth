@@ -60,7 +60,11 @@ static bool sf2_load_file(FILE* f, SF2Data* outData) {
         OutputDebugStringA(dbg);
         fclose(f); return false;
     }
-    if (read_u32(riffHeader + 8) != 0x6B626673) {  // "sfbk"
+    const uint32_t formType = read_u32(riffHeader + 8);
+    // A small set of older Creative-era banks uses "sfpk" despite carrying
+    // the ordinary uncompressed INFO/sdta/pdta SoundFont layout. Accept that
+    // legacy tag only here; the required chunks below still validate the bank.
+    if (formType != 0x6B626673 && formType != 0x6B706673) { // "sfbk", "sfpk"
         sprintf(dbg, "[SVMS-SF2] not an SF2 file (sfbk missing), tag=0x%08X\n", read_u32(riffHeader + 8));
         OutputDebugStringA(dbg);
         fclose(f); return false;
@@ -147,8 +151,7 @@ static bool sf2_load_file(FILE* f, SF2Data* outData) {
                         outData->instrumentCount = count;
                     } else if (subId == 0x67616269) {  // "ibag"
                         uint32_t count = subSize / 4;
-                        if (count + outData->presetZoneCount > kMaxZones)
-                            count = kMaxZones - outData->presetZoneCount;
+                        if (count > kMaxZones) count = kMaxZones;
                         uint16_t igenBase = static_cast<uint16_t>(outData->generatorCount);
                         for (uint32_t i = 0; i < count; ++i) {
                             uint8_t buf[4];
@@ -196,6 +199,14 @@ static bool sf2_load_file(FILE* f, SF2Data* outData) {
                         fseek(f, seek_pad(subSize), 1);
                         fseek(f, subEnd, 0);
                     }
+
+                    // Always land on the next chunk even when a malformed or
+                    // oversized table had to be capped. Previously the unread
+                    // tail was interpreted as a chunk header, which prevented
+                    // the later shdr table from ever being discovered.
+                    const uint32_t paddedSubEnd = subEnd + (subSize & 1u);
+                    if (fseek(f, static_cast<long>(paddedSubEnd), SEEK_SET) != 0)
+                        break;
                 }
             } else if (listType == 0x61746473) {  // "sdta"
                 uint32_t sdtaPos = static_cast<uint32_t>(ftell(f));

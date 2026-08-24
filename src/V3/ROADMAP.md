@@ -12,6 +12,9 @@ larger phase containing that item is complete.
 
 - [x] CMake/Ninja build, `build_v3.bat`, and release-build verification
 - [x] SF2 parser, preset/instrument region compilation, and resampled storage
+- [x] Load large legacy banks whose 16-bit bag/generator tables exceed the
+  original conservative parser limits, including otherwise-standard `sfpk`
+  tagged banks
 - [x] Preset/instrument global and local zone merging with layered key/velocity
   matching
 - [x] Index compiled SF2 regions by preset so dense note-ons never scan regions
@@ -591,7 +594,7 @@ larger phase containing that item is complete.
   backlog through its five reserved words
 - [x] Display paged-pipeline pressure and separate queue-capacity versus
   per-callback event-budget controls in the configurator
-- [ ] Profile import/export
+- [x] Profile import/export
 - [x] Record the live post-DSP stereo stream to float WAV/RF64 through an
   allocation-free audio-thread copy, an eight-second SPSC buffer, and a
   background file writer; expose start/stop, duration, file size, and dropped

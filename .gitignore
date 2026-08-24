@@ -67,7 +67,7 @@ config.ini
 /bassmidi_unpacked_code.bin
 /build_dumper.bat
 /dump_unpacked.cpp
-/gm.sf2
+/*.sf2
 /Krash Noets 6.7 million.mid
 /Paprika's Noise Challenge 2.mid
 /Paprika's Noise Challenge III - Return of the Death Swirls.mid
