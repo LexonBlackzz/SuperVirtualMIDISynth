@@ -11,7 +11,7 @@ jobs:
   configurator:
     name: MSVC ${{ matrix.toolset }}
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -22,48 +22,102 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Install MSVC 14.50 side-by-side
+        if: matrix.toolset == '14.50'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere was not found at $vswhere"
+          }
+
+          $vsPath = (& $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $vsPath) {
+            throw "Visual Studio with the C++ toolset was not found"
+          }
+
+          $toolsetRoot = Join-Path $vsPath "VC\Tools\MSVC"
+          $installed = Get-ChildItem $toolsetRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "14.50.*" }
+
+          if (-not $installed) {
+            $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+            if (-not (Test-Path $setup)) {
+              throw "Visual Studio Installer was not found at $setup"
+            }
+
+            Write-Host "Installing MSVC Build Tools v14.50 for x64/x86..."
+            $quotedVsPath = '"' + $vsPath + '"'
+            $arguments = @(
+              "modify",
+              "--installPath", $quotedVsPath,
+              "--add", "Microsoft.VisualStudio.Component.VC.14.50.18.0.x86.x64",
+              "--quiet",
+              "--norestart"
+            )
+            $process = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
+            if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+              throw "Visual Studio Installer failed with exit code $($process.ExitCode)"
+            }
+          }
+
+          Write-Host "Installed MSVC toolsets after setup:"
+          Get-ChildItem $toolsetRoot -Directory | ForEach-Object { Write-Host "  $($_.Name)" }
+          if (-not (Get-ChildItem $toolsetRoot -Directory | Where-Object { $_.Name -like "14.50.*" })) {
+            throw "MSVC 14.50 is still not installed"
+          }
+
       - name: Build Configurator with MSVC ${{ matrix.toolset }}
         shell: cmd
         run: |
+          setlocal EnableDelayedExpansion
           call find_vs.bat
-          if errorlevel 1 exit /b %errorlevel%
+          if errorlevel 1 exit /b !errorlevel!
 
-          echo Visual Studio: %VS_PATH%
+          echo Visual Studio: !VS_PATH!
           echo Installed MSVC toolsets:
-          dir /b "%VS_PATH%\VC\Tools\MSVC"
+          dir /b "!VS_PATH!\VC\Tools\MSVC"
 
-          call "%VS_VCVARSALL%" x64 -vcvars_ver=${{ matrix.toolset }}
-          if errorlevel 1 (
-            echo Failed to activate MSVC ${{ matrix.toolset }}.
+          call "!VS_VCVARSALL!" x64 -vcvars_ver=${{ matrix.toolset }}
+          if errorlevel 1 exit /b !errorlevel!
+          if not defined VCToolsVersion (
+            echo ERROR: vcvarsall did not select an MSVC toolset.
             exit /b 1
           )
 
-          echo Selected VCToolsVersion=%VCToolsVersion%
+          echo Selected VCToolsVersion=!VCToolsVersion!
+          echo !VCToolsVersion! | findstr /B /C:"${{ matrix.toolset }}." >nul
+          if errorlevel 1 (
+            echo ERROR: requested MSVC ${{ matrix.toolset }}, but vcvarsall selected !VCToolsVersion!.
+            exit /b 1
+          )
+
           where cl
-          cl /Bv 2>nul
+          if errorlevel 1 exit /b 1
+          cl /Bv
 
           set "BUILD_DIR=build\av-msvc-${{ matrix.toolset }}"
-          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B "%BUILD_DIR%"
-          if errorlevel 1 exit /b %errorlevel%
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B "!BUILD_DIR!"
+          if errorlevel 1 exit /b !errorlevel!
 
-          cmake --build "%BUILD_DIR%" --config Release --target svms_v3_configurator
-          if errorlevel 1 exit /b %errorlevel%
+          cmake --build "!BUILD_DIR!" --config Release --target svms_v3_configurator
+          if errorlevel 1 exit /b !errorlevel!
 
-          if not exist "%BUILD_DIR%\bin\svms_v3_configurator.exe" (
+          if not exist "!BUILD_DIR!\bin\svms_v3_configurator.exe" (
             echo Configurator output was not found.
             exit /b 1
           )
 
           mkdir "av-msvc-${{ matrix.toolset }}"
-          copy /y "%BUILD_DIR%\bin\svms_v3_configurator.exe" "av-msvc-${{ matrix.toolset }}\SVMSConfigurator-msvc-${{ matrix.toolset }}.exe" >nul
+          copy /y "!BUILD_DIR!\bin\svms_v3_configurator.exe" "av-msvc-${{ matrix.toolset }}\SVMSConfigurator-msvc-${{ matrix.toolset }}.exe" >nul
 
           (
             echo requested_toolset=${{ matrix.toolset }}
-            echo VCToolsVersion=%VCToolsVersion%
-            echo VisualStudioVersion=%VisualStudioVersion%
-            echo VSINSTALLDIR=%VSINSTALLDIR%
-            echo WindowsSdkDir=%WindowsSdkDir%
-            echo WindowsSDKVersion=%WindowsSDKVersion%
+            echo VCToolsVersion=!VCToolsVersion!
+            echo VisualStudioVersion=!VisualStudioVersion!
+            echo VSINSTALLDIR=!VSINSTALLDIR!
+            echo WindowsSdkDir=!WindowsSdkDir!
+            echo WindowsSDKVersion=!WindowsSDKVersion!
           ) > "av-msvc-${{ matrix.toolset }}\toolchain.txt"
 
       - name: Upload MSVC ${{ matrix.toolset }} sample
