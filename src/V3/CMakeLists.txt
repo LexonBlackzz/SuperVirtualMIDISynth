@@ -258,7 +258,7 @@ set(SOURCES
 )
 
 if(NOT SVMS_XP_COMPAT)
-    list(APPEND SOURCES SVMSRenderKernelsAVX2.cpp)
+    list(APPEND SOURCES SVMSRenderKernelsAVX2.cpp SVMSLiveRecorder.cpp)
 endif()
 
 set(HEADERS
@@ -283,6 +283,7 @@ set(HEADERS
     SVMSPostFilter.h
     SVMSLimiter.h
     SVMSNativeOffline.h
+    SVMSLiveRecorder.h
     include/svmsapi.h
 )
 
@@ -490,6 +491,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/PagePerformance.cpp
         Configurator/PageMidi.cpp
         Configurator/PageOffline.cpp
+        Configurator/PageLiveRecording.cpp
         Configurator/PageReverb.cpp
         Configurator/PageLimiter.cpp
         Configurator/PageDiagnostics.cpp
@@ -688,6 +690,17 @@ if(SVMS_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
         add_test(NAME svms_v3_config_profiles
             COMMAND svms_v3_config_profile_tests)
+
+        add_executable(svms_v3_live_recorder_tests
+            tests/SVMSLiveRecorderTests.cpp
+            SVMSLiveRecorder.cpp)
+        target_compile_definitions(svms_v3_live_recorder_tests PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+            _CRT_SECURE_NO_WARNINGS)
+        target_include_directories(svms_v3_live_recorder_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME svms_v3_live_recorder
+            COMMAND svms_v3_live_recorder_tests)
 
         add_executable(svms_v3_live_smoke tests/SVMSLiveSmoke.cpp)
         target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

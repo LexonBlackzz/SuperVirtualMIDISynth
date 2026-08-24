@@ -36,6 +36,9 @@
 #include "SVMSBuildInfo.h"
 #include "SVMSNativeOffline.h"
 #include "include/svmsapi.h"
+#if !defined(SVMS_XP_COMPAT)
+#include "SVMSLiveRecorder.h"
+#endif
 
 // ── Logging ────────────────────────────────────────────────────────────
 
@@ -2068,6 +2071,9 @@ private:
     PostHighPass3Hz postHighPass;
     ReverbState reverb;
     LimiterState limiter;
+#if !defined(SVMS_XP_COMPAT)
+    svms::LiveWaveRecorder liveRecorder_;
+#endif
 
     // ── Atomic live-config mailbox (seqlock) ─────────────────────────
     // The control thread is the ONLY writer.  It bumps liveMailboxSeq_
@@ -2378,6 +2384,64 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         // midiOutReset.
         ResetAllVoices();
         return svms::RLResult::Ok;
+
+    case RT::StartLiveRecording: {
+        const size_t length = strnlen_s(
+            cmd.resultText, svms::kRuntimeLinkCommandTextCapacity);
+        if (length == 0u ||
+            length >= svms::kRuntimeLinkCommandTextCapacity) {
+            strncpy_s(resultText, kText, "missing or invalid WAV path",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        const int wideLength = MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, cmd.resultText,
+            static_cast<int>(length), nullptr, 0);
+        if (wideLength <= 0) {
+            strncpy_s(resultText, kText, "WAV path is not valid UTF-8",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        std::wstring path(static_cast<size_t>(wideLength), L'\0');
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                cmd.resultText, static_cast<int>(length),
+                                path.data(), wideLength) != wideLength) {
+            strncpy_s(resultText, kText, "could not decode WAV path",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        const auto status = liveRecorder_.GetStatus();
+        if (status.state == svms::LiveWaveRecorder::State::Recording ||
+            status.state == svms::LiveWaveRecorder::State::Starting ||
+            status.state == svms::LiveWaveRecorder::State::Stopping) {
+            strncpy_s(resultText, kText, "a live recording is already active",
+                      _TRUNCATE);
+            return svms::RLResult::Busy;
+        }
+        std::string error;
+        if (!liveRecorder_.Start(path.c_str(), sampleRate, error)) {
+            strncpy_s(resultText, kText, error.c_str(), _TRUNCATE);
+            return svms::RLResult::LoadFailed;
+        }
+        strncpy_s(resultText, kText, "recording started", _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+
+    case RT::StopLiveRecording:
+        liveRecorder_.Stop();
+        strncpy_s(resultText, kText, "recording stopped and WAV finalized",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+
+    case RT::QueryLiveRecording: {
+        const auto status = liveRecorder_.GetStatus();
+        std::snprintf(resultText, kText, "%u\t%u\t%llu\t%llu\t%u",
+                      static_cast<unsigned>(status.state), status.sampleRate,
+                      static_cast<unsigned long long>(status.framesWritten),
+                      static_cast<unsigned long long>(status.droppedFrames),
+                      status.errorCode);
+        return svms::RLResult::Ok;
+    }
 
     case RT::RequestRestart:
         strncpy_s(resultText, kText,
@@ -2919,6 +2983,7 @@ bool Driver::Initialize() {
 void Driver::Shutdown() {
 #if !defined(SVMS_XP_COMPAT)
     g_rlDriver.Shutdown();
+    liveRecorder_.Stop();
 #endif
 
     cancelProducers_.store(true, std::memory_order_release);
@@ -4065,6 +4130,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // neither changes gain detection nor requires another memory pass.
     self->reverb.Process(output, numFrames, 2);
     self->limiter.Process(output, numFrames, 2, self->postHighPass);
+#if !defined(SVMS_XP_COMPAT)
+    self->liveRecorder_.Capture(output, numFrames);
+#endif
 
     const uint64_t profilePostEnd = profileCallback ? __rdtsc() : 0u;
 

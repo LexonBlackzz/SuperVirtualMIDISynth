@@ -590,7 +590,10 @@ larger phase containing that item is complete.
 - [x] Display paged-pipeline pressure and separate queue-capacity versus
   per-callback event-budget controls in the configurator
 - [ ] Profile import/export
-- [ ] Record-to-WAV support
+- [x] Record the live post-DSP stereo stream to float WAV/RF64 through an
+  allocation-free audio-thread copy, an eight-second SPSC buffer, and a
+  background file writer; expose start/stop, duration, file size, and dropped
+  frames in the Configurator
 - [ ] WASAPI exclusive and ASIO backends
 
 ## Non-Negotiable Constraints

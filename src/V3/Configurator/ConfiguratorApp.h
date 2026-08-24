@@ -6,6 +6,7 @@
 #include "EasterEggs.h"
 #include "UpdateService.h"
 #include "PageOffline.h"
+#include "PageLiveRecording.h"
 #include "../SVMSRuntimeLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
@@ -28,6 +29,7 @@ enum class Page {
     Performance,
     Midi,
     OfflineRenderer,
+    LiveRecording,
     Reverb,
     Limiter,
     Diagnostics,
@@ -107,6 +109,7 @@ private:
     EasterEggState easterEggs_;
     UpdateService updateService_;
     OfflineRendererPage offlineRendererPage_;
+    LiveRecordingPage liveRecordingPage_;
     bool showMegaFuckerPopup_ = false;
 
     svms::RuntimeLinkClient rlClient_;

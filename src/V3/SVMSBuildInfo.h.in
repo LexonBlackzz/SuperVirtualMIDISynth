@@ -44,18 +44,20 @@ enum Capability : std::uint64_t {
     CapabilityKdmapiFacade      = 1ull << 5,
     CapabilityRuntimeLinkV3     = 1ull << 6,
     CapabilityNativeApiV1       = 1ull << 7,
+    CapabilityLiveRecording     = 1ull << 8,
 };
 
 inline constexpr std::uint64_t kDriverCapabilities =
     @SVMS_DRIVER_RUNTIME_CAPABILITIES@ | CapabilityLiveConfiguration |
     CapabilityTelemetry | CapabilitySafeVoiceLimit |
     CapabilitySoundFontReload | CapabilityKdmapiFacade |
-    CapabilityNativeApiV1;
+    CapabilityNativeApiV1 | CapabilityLiveRecording;
 
 inline constexpr std::uint64_t kConfiguratorCapabilities =
     CapabilityRuntimeLinkV2 | CapabilityLiveConfiguration |
     CapabilityTelemetry | CapabilitySafeVoiceLimit |
-    CapabilitySoundFontReload | CapabilityRuntimeLinkV3;
+    CapabilitySoundFontReload | CapabilityRuntimeLinkV3 |
+    CapabilityLiveRecording;
 
 } // namespace svms::build
 

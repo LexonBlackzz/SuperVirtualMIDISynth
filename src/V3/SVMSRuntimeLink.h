@@ -860,13 +860,24 @@ public:
     RLResult SendCommand(RLCommandType type, uint32_t groupMask,
                          uint32_t param, const RuntimeLiveStateV2& live,
                          uint32_t timeoutMs, char resultText[
-                             kRuntimeLinkResultTextCapacity] = nullptr) {
+                             kRuntimeLinkResultTextCapacity] = nullptr,
+                         const char* requestText = nullptr) {
         if (!view_ || !hMutex_) {
             if (resultText) {
                 strncpy_s(resultText, kRuntimeLinkResultTextCapacity,
                           "not connected", _TRUNCATE);
             }
             return RLResult::InternalError;
+        }
+
+        const size_t requestLength = requestText
+            ? strnlen_s(requestText, kRuntimeLinkCommandTextCapacity) : 0u;
+        if (requestText && requestLength >= kRuntimeLinkCommandTextCapacity) {
+            if (resultText) {
+                strncpy_s(resultText, kRuntimeLinkResultTextCapacity,
+                          "command text is too long", _TRUNCATE);
+            }
+            return RLResult::InvalidArgument;
         }
 
         const uint32_t req = requestCounter_++;
@@ -885,6 +896,9 @@ public:
         slot.groupMask = groupMask;
         slot.param = param;
         slot.live = live;
+        std::memset(slot.resultText, 0, sizeof(slot.resultText));
+        if (requestLength != 0u)
+            std::memcpy(slot.resultText, requestText, requestLength);
         RLV2_MemBarrier();
         volatile RuntimeLinkHeaderV2* h = &view_->header;
         h->commandRequestToken = token_;
@@ -1166,11 +1180,20 @@ public:
                          uint32_t param, const RuntimeLiveStateV2& live,
                          uint32_t timeoutMs,
                          char resultText[kRuntimeLinkResultTextCapacity] =
-                             nullptr) {
+                             nullptr,
+                         const char* requestText = nullptr) {
         if (!header_ || !command_ || !hMutex_) {
             if (resultText) strncpy_s(resultText,
                 kRuntimeLinkResultTextCapacity, "not connected", _TRUNCATE);
             return RLResult::InternalError;
+        }
+        const size_t requestLength = requestText
+            ? strnlen_s(requestText, kRuntimeLinkCommandTextCapacity) : 0u;
+        if (requestText && requestLength >= kRuntimeLinkCommandTextCapacity) {
+            if (resultText) strncpy_s(resultText,
+                kRuntimeLinkResultTextCapacity, "command text is too long",
+                _TRUNCATE);
+            return RLResult::InvalidArgument;
         }
         const uint32_t request = requestCounter_++;
         if (WaitForSingleObject(hMutex_, kRuntimeLinkMutexTimeoutMs) !=
@@ -1185,6 +1208,9 @@ public:
         command_->groupMask = groupMask;
         command_->param = param;
         command_->live = live;
+        std::memset(command_->resultText, 0, sizeof(command_->resultText));
+        if (requestLength != 0u)
+            std::memcpy(command_->resultText, requestText, requestLength);
         RLV2_MemBarrier();
         volatile RuntimeDiscoveryHeaderV3* h = header_;
         h->commandRequestToken = token_;
@@ -1460,13 +1486,14 @@ public:
                          uint32_t param, const RuntimeLiveStateV2& live,
                          uint32_t timeoutMs,
                          char resultText[kRuntimeLinkResultTextCapacity] =
-                             nullptr) {
+                             nullptr,
+                         const char* requestText = nullptr) {
         if (protocol_ == Protocol::V3)
             return v3_.SendCommand(type, groupMask, param, live, timeoutMs,
-                                   resultText);
+                                   resultText, requestText);
         if (protocol_ == Protocol::V2)
             return v2_.SendCommand(type, groupMask, param, live, timeoutMs,
-                                   resultText);
+                                   resultText, requestText);
         if (resultText) strncpy_s(resultText,
             kRuntimeLinkResultTextCapacity, "not connected", _TRUNCATE);
         return RLResult::InternalError;

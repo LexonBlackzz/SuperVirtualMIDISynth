@@ -154,6 +154,9 @@ inline constexpr uint32_t kRuntimeHostMaxCount = 16;
 inline constexpr uint32_t kRuntimeHostTimeoutMs = 5000u;   // stale after 5 s
 inline constexpr uint32_t kRuntimeLinkMutexTimeoutMs = 1000u;
 inline constexpr uint32_t kRuntimeLinkResultTextCapacity = 256;
+// The command's former trailing reserve extends request text without changing
+// the 512-byte mailbox ABI. Results remain capped at the original 256 bytes.
+inline constexpr uint32_t kRuntimeLinkCommandTextCapacity = 348;
 inline constexpr uint32_t kRuntimeLinkDefaultCommandTimeoutMs = 400u;
 inline constexpr uint32_t kRuntimeLinkPublishIntervalMs = 33u;  // ~30 Hz
 
@@ -246,6 +249,9 @@ enum class RLCommandType : uint32_t {
     ApplyLiveConfig      = 0x00000100,
     ReloadSoundFont      = 0x00000101,
     ResetVoices          = 0x00000102,
+    StartLiveRecording   = 0x00000103,
+    StopLiveRecording    = 0x00000104,
+    QueryLiveRecording   = 0x00000105,
     RequestRestart       = 0x00000110,
 
     Invalid              = 0xFFFFFFFF,
@@ -437,9 +443,10 @@ struct alignas(64) RuntimeLinkCommandV2 {
 
     RuntimeLiveStateV2 live;        // ApplyLiveConfig payload
 
-    char resultText[kRuntimeLinkResultTextCapacity] = {};
-
-    uint32_t reserved1[23]  = {};
+    // Driver response text occupies the first 256 bytes. New commands may use
+    // the complete former result+reserve area as a UTF-8 request payload; the
+    // control thread copies the command before replacing it with the result.
+    char resultText[kRuntimeLinkCommandTextCapacity] = {};
 };
 
 static_assert(std::is_trivially_copyable<RuntimeLinkCommandV2>::value,

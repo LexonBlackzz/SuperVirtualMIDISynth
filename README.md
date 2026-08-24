@@ -22,6 +22,7 @@ publish official V3 DLL releases yet, but you can build and test it from source.
 - JSON configuration with local and Roaming AppData lookup
 - Configurator with live controls, diagnostics, profile import/export, and an
   offline renderer page
+- Live post-DSP recording to stereo 32-bit float WAV/RF64
 - Native SVMS API and KDMAPI-compatible entry points
 - Windows x64, Windows x86, Windows XP x86, and Linux x86-64 targets
 
@@ -86,6 +87,10 @@ DLL for a local `.sf2` file.
 The Configurator edits the same JSON file and can import or export complete JSON
 profiles from **Advanced > Configuration**. Import changes the working copy;
 press **Save Configuration** to write and apply it.
+
+The **Live Recording** page records the final stream after reverb, limiting,
+and post filtering. V3 writes the file on a background thread and reports any
+frames dropped because the disk could not keep up.
 
 ## Offline rendering
 

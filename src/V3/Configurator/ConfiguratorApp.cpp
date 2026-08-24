@@ -23,6 +23,7 @@
 #include "PagePerformance.h"
 #include "PageMidi.h"
 #include "PageOffline.h"
+#include "PageLiveRecording.h"
 #include "PageReverb.h"
 #include "PageLimiter.h"
 #include "PageDiagnostics.h"
@@ -698,6 +699,7 @@ void ConfiguratorApp::DrawSidebar() {
     drawNavItem("Performance", Page::Performance, nullptr);
     drawNavItem("MIDI / Events", Page::Midi, nullptr);
     drawNavItem("Offline Renderer", Page::OfflineRenderer, nullptr);
+    drawNavItem("Live Recording", Page::LiveRecording, nullptr);
 
     drawNavItem("Reverb", Page::Reverb, "EFFECTS");
     drawNavItem("Limiter", Page::Limiter, nullptr);
@@ -856,6 +858,10 @@ void ConfiguratorApp::DrawPageContent() {
     case Page::Midi:        DrawMidiPage(config_); break;
     case Page::OfflineRenderer:
         offlineRendererPage_.Draw(config_, hwnd_);
+        break;
+    case Page::LiveRecording:
+        liveRecordingPage_.Draw(rlConnected_ ? &rlClient_ : nullptr,
+                                rlConnected_, hwnd_);
         break;
     case Page::Reverb:      DrawReverbPage(config_); break;
     case Page::Limiter:     DrawLimiterPage(config_); break;

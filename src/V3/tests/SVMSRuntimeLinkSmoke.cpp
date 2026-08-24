@@ -17,6 +17,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace {
 
@@ -64,6 +65,19 @@ bool WaitForTelemetry(svms::RuntimeLinkClient& client,
         Sleep(25);
     } while (static_cast<int>(GetTickCount() - start) < (int)timeoutMs);
     return false;
+}
+
+std::string WideToUtf8(const wchar_t* value) {
+    const int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                           value, -1, nullptr, 0,
+                                           nullptr, nullptr);
+    if (count <= 1) return {};
+    std::string result(static_cast<size_t>(count), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1,
+                            result.data(), count, nullptr, nullptr) != count)
+        return {};
+    result.resize(static_cast<size_t>(count - 1));
+    return result;
 }
 
 } // namespace
@@ -299,6 +313,7 @@ int main(int argc, char** argv) {
     if (peer.protocolMin > 3u || peer.protocolMax < 3u ||
         (peer.capabilityFlags & svms::build::CapabilityRuntimeLinkV3) == 0u ||
         (peer.capabilityFlags & svms::build::CapabilityNativeApiV1) == 0u ||
+        (peer.capabilityFlags & svms::build::CapabilityLiveRecording) == 0u ||
         peer.nativeAbiMin > 1u || peer.nativeAbiMax < 1u ||
         peer.productMajor != svms::build::kProductMajor ||
         peer.buildNumber != svms::build::kBuildNumber) {
@@ -418,6 +433,72 @@ int main(int argc, char** argv) {
     }
     std::printf("INFO: live params applied and echoed (master=%.2f "
                 "limiter=%.2f)\n", t.live.masterVolume, t.live.limiterThreshold);
+
+    // Exercise UTF-8 request text and the real post-DSP recorder through the
+    // driver. Stop must drain its ring and leave a finalized RIFF file.
+    wchar_t recordingPath[MAX_PATH]{};
+    swprintf_s(recordingPath, L"%sSVMS_live_\x0442\x0435\x0441\x0442_%lu.wav",
+               tempDirectory, static_cast<unsigned long>(ownPid));
+    const std::string recordingUtf8 = WideToUtf8(recordingPath);
+    {
+        const svms::RLResult startResult = client.SendCommand(
+            svms::RLCommandType::StartLiveRecording, 0u, 0u,
+            svms::RuntimeLiveStateV2{}, 2000u, resultText,
+            recordingUtf8.c_str());
+        if (startResult != svms::RLResult::Ok) {
+            std::printf("FAIL: StartLiveRecording returned %d (%s)\n",
+                        static_cast<int>(startResult), resultText);
+            reset(handle); close(handle); FreeLibrary(module);
+            DeleteFileW(configPath); DeleteFileW(recordingPath);
+            return 1;
+        }
+        shortMsg(handle, 0x00643C90u);
+        Sleep(150u);
+        shortMsg(handle, 0x00003C80u);
+        Sleep(75u);
+        const svms::RLResult stopResult = client.SendCommand(
+            svms::RLCommandType::StopLiveRecording, 0u, 0u,
+            svms::RuntimeLiveStateV2{}, 3000u, resultText);
+        if (stopResult != svms::RLResult::Ok) {
+            std::printf("FAIL: StopLiveRecording returned %d (%s)\n",
+                        static_cast<int>(stopResult), resultText);
+            reset(handle); close(handle); FreeLibrary(module);
+            DeleteFileW(configPath); DeleteFileW(recordingPath);
+            return 1;
+        }
+        uint32_t recordState = 99u;
+        uint32_t recordRate = 0u;
+        unsigned long long recordFrames = 0u;
+        unsigned long long recordDrops = 0u;
+        uint32_t recordError = 99u;
+        const svms::RLResult queryResult = client.SendCommand(
+            svms::RLCommandType::QueryLiveRecording, 0u, 0u,
+            svms::RuntimeLiveStateV2{}, 2000u, resultText);
+        if (queryResult != svms::RLResult::Ok ||
+            std::sscanf(resultText, "%u\t%u\t%llu\t%llu\t%u",
+                        &recordState, &recordRate, &recordFrames,
+                        &recordDrops, &recordError) != 5 ||
+            recordState != 0u || recordRate != t.sampleRate ||
+            recordFrames == 0u || recordDrops != 0u || recordError != 0u) {
+            std::printf("FAIL: recording status malformed (%s)\n", resultText);
+            reset(handle); close(handle); FreeLibrary(module);
+            DeleteFileW(configPath); DeleteFileW(recordingPath);
+            return 1;
+        }
+        FILE* recording = _wfopen(recordingPath, L"rb");
+        char riff[4]{};
+        const bool validFile = recording &&
+            std::fread(riff, 1u, sizeof(riff), recording) == sizeof(riff) &&
+            std::memcmp(riff, "RIFF", sizeof(riff)) == 0;
+        if (recording) std::fclose(recording);
+        if (!validFile) {
+            std::puts("FAIL: live recording WAV was not finalized");
+            reset(handle); close(handle); FreeLibrary(module);
+            DeleteFileW(configPath); DeleteFileW(recordingPath);
+            return 1;
+        }
+    }
+    DeleteFileW(recordingPath);
 
     // ── 6. ResetVoices (routes through the SPSC ingress) ─────────────
     {

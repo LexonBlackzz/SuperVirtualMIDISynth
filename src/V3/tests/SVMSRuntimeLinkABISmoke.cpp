@@ -143,8 +143,8 @@ void TestCommandLayout() {
     svms::RuntimeLinkCommandV2 c{};
     CHECK_EQ(c.type, 0u, "default command type must be NoCommand (0)");
     CHECK_EQ(c.param, 0u, "default param must be 0");
-    CHECK_EQ(sizeof(c.resultText), svms::kRuntimeLinkResultTextCapacity,
-             "resultText capacity must match protocol constant");
+    CHECK_EQ(sizeof(c.resultText), svms::kRuntimeLinkCommandTextCapacity,
+             "command text must consume the former trailing reserve");
 }
 
 void TestMappingOffsets() {
