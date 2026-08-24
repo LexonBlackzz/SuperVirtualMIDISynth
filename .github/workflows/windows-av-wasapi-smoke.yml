@@ -65,7 +65,7 @@ jobs:
           if errorlevel 1 exit /b %errorlevel%
           copy /y build\av-no-wasapi\bin\svms_v3_configurator.exe av-wasapi\01-NO-WASAPI.exe >nul
 
-      - name: Also remove diagnostics discovery
+      - name: Replace diagnostics discovery with stub
         shell: pwsh
         run: |
           @'
@@ -84,9 +84,18 @@ jobs:
           } // namespace svms::cfg
           '@ | Set-Content -Encoding utf8 src/V3/Configurator/PageDiagnostics.cpp
 
-          cmd /c "call find_vs.bat && call \"%VS_VCVARSALL%\" x64 && cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B build\av-no-wasapi-diag && cmake --build build\av-no-wasapi-diag --config Release --target svms_v3_configurator"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Copy-Item build/av-no-wasapi-diag/bin/svms_v3_configurator.exe av-wasapi/02-NO-WASAPI-NO-DIAGNOSTICS.exe
+      - name: Build NO-WASAPI + NO-DIAGNOSTICS
+        shell: cmd
+        run: |
+          call find_vs.bat
+          if errorlevel 1 exit /b %errorlevel%
+          call "%VS_VCVARSALL%" x64
+          if errorlevel 1 exit /b %errorlevel%
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B build\av-no-wasapi-diag
+          if errorlevel 1 exit /b %errorlevel%
+          cmake --build build\av-no-wasapi-diag --config Release --target svms_v3_configurator
+          if errorlevel 1 exit /b %errorlevel%
+          copy /y build\av-no-wasapi-diag\bin\svms_v3_configurator.exe av-wasapi\02-NO-WASAPI-NO-DIAGNOSTICS.exe >nul
 
       - name: Upload samples
         uses: actions/upload-artifact@v4
