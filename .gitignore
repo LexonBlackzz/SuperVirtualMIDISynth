@@ -53,6 +53,7 @@ config.ini
 
 # Local development artifacts and analysis tools
 /.backup/
+/experiments/
 *.wav
 *.bak
 *.zip
