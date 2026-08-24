@@ -68,6 +68,10 @@ struct EngineConfig {
     bool diagnosticsEnabled;
     bool diagnosticsWindow;
     bool diagnosticsDebugOutput;
+    // Optional driver-owned physical MIDI input. The friendly name is
+    // resolved against the genuine system WinMM device list at startup.
+    bool midiInputEnabled;
+    std::wstring midiInputDevice;
     // "default" (and legacy empty values) select the current Windows default
     // render endpoint. Otherwise this is an exact (case-insensitive) WASAPI
     // endpoint friendly name.

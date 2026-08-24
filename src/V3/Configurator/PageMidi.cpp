@@ -4,9 +4,15 @@
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
+#include <mmeapi.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cwchar>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace svms::cfg {
 namespace {
@@ -63,6 +69,57 @@ bool InputU32(const char* id, uint32_t& value, uint32_t minValue, uint32_t maxVa
     temp = (std::max)(minValue, (std::min)(maxValue, temp));
     value = temp;
     return true;
+}
+
+struct MidiInputDevice {
+    UINT id = 0u;
+    std::wstring name;
+    std::string displayName;
+};
+
+std::string WideToUtf8Midi(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int bytes = WideCharToMultiByte(
+        CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return {};
+    std::string result(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(),
+                        static_cast<int>(value.size()), result.data(), bytes,
+                        nullptr, nullptr);
+    return result;
+}
+
+std::vector<MidiInputDevice> EnumerateMidiInputs() {
+    std::vector<MidiInputDevice> result;
+    wchar_t path[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(path, MAX_PATH);
+    if (length == 0u || length + 11u >= MAX_PATH) return result;
+    std::wcscat(path, L"\\winmm.dll");
+    HMODULE winmm = LoadLibraryW(path);
+    if (!winmm) return result;
+    using GetNumProc = UINT (WINAPI*)(void);
+    using GetCapsProc = MMRESULT (WINAPI*)(UINT_PTR, LPMIDIINCAPSW, UINT);
+    GetNumProc getNum = reinterpret_cast<GetNumProc>(
+        GetProcAddress(winmm, "midiInGetNumDevs"));
+    GetCapsProc getCaps = reinterpret_cast<GetCapsProc>(
+        GetProcAddress(winmm, "midiInGetDevCapsW"));
+    if (getNum && getCaps) {
+        const UINT count = getNum();
+        result.reserve(count);
+        for (UINT id = 0u; id < count; ++id) {
+            MIDIINCAPSW caps{};
+            if (getCaps(id, &caps, sizeof(caps)) != MMSYSERR_NOERROR)
+                continue;
+            MidiInputDevice device;
+            device.id = id;
+            device.name = caps.szPname;
+            device.displayName = WideToUtf8Midi(device.name);
+            result.push_back(std::move(device));
+        }
+    }
+    FreeLibrary(winmm);
+    return result;
 }
 
 } // namespace
@@ -222,9 +279,68 @@ void DrawMidiPage(ConfigDocument& doc) {
 
     ImGui::Spacing();
     SectionHeader("MIDI INPUT");
-    ImGui::TextDisabled(
-        "Physical MIDI inputs are forwarded transparently to the host. Direct input-to-SVMS "
-        "routing from the Configurator is not implemented yet.");
+    static std::vector<MidiInputDevice> inputDevices;
+    static bool inputsEnumerated = false;
+    if (!inputsEnumerated) {
+        inputDevices = EnumerateMidiInputs();
+        inputsEnumerated = true;
+    }
+
+    if (BeginSettingsTable("##midi_input_settings")) {
+        ImGui::TableNextRow();
+        LabelCell("Route physical input",
+                  "The driver opens the selected system MIDI input and sends it directly "
+                  "through SVMS with arrival-time QPC timestamps. Host midiIn APIs remain "
+                  "available independently.");
+        ImGui::TableNextColumn();
+        bool enabled = w.midiInputEnabled;
+        if (ImGui::Checkbox("##midiinputenabled", &enabled)) {
+            w.midiInputEnabled = enabled;
+            doc.MarkDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted(enabled ? "Enabled" : "Disabled");
+        RestartCell();
+
+        ImGui::TableNextRow();
+        LabelCell("Input device",
+                  "An empty selection follows the first available system MIDI input. "
+                  "A named selection is matched case-insensitively at driver startup.");
+        ImGui::TableNextColumn();
+        std::string preview = w.midiInputDevice.empty()
+            ? "First available input"
+            : WideToUtf8Midi(w.midiInputDevice);
+        ImGui::SetNextItemWidth((std::min)(420.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::BeginCombo("##midiinputdevice", preview.c_str())) {
+            const bool firstSelected = w.midiInputDevice.empty();
+            if (ImGui::Selectable("First available input", firstSelected)) {
+                w.midiInputDevice.clear();
+                doc.MarkDirty();
+            }
+            for (const MidiInputDevice& device : inputDevices) {
+                const bool selected = !w.midiInputDevice.empty() &&
+                    _wcsicmp(w.midiInputDevice.c_str(), device.name.c_str()) == 0;
+                if (ImGui::Selectable(device.displayName.c_str(), selected)) {
+                    w.midiInputDevice = device.name;
+                    doc.MarkDirty();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        RestartCell();
+        ImGui::EndTable();
+    }
+    if (ImGui::Button("Refresh MIDI inputs")) {
+        inputDevices = EnumerateMidiInputs();
+        inputsEnumerated = true;
+    }
+    ImGui::SameLine();
+    if (inputDevices.empty())
+        ImGui::TextDisabled("No system MIDI input devices found");
+    else
+        ImGui::TextDisabled("%u input%s found; short MIDI and SysEx are supported",
+                            static_cast<unsigned>(inputDevices.size()),
+                            inputDevices.size() == 1u ? "" : "s");
 }
 
 } // namespace svms::cfg

@@ -50,6 +50,9 @@ struct ConfigValues {
     bool diagnosticsWindow = false;
     bool diagnosticsDebugOutput = false;
 
+    bool midiInputEnabled = false;
+    std::wstring midiInputDevice;
+
     std::wstring audioDevice = L"default";
     std::wstring soundFontPath;
 };

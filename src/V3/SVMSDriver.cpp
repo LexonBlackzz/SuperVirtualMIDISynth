@@ -2004,6 +2004,12 @@ private:
     void ReclaimRetiredSoundFonts() noexcept;
     void DestroyAllSoundFontBundles() noexcept;
     std::wstring CopyActiveSoundFontPath() const;
+    bool StartConfiguredMidiInput();
+    void StopConfiguredMidiInput() noexcept;
+    static void CALLBACK MidiInputCallback(HMIDIIN input, UINT message,
+                                           DWORD_PTR instance,
+                                           DWORD_PTR parameter1,
+                                           DWORD_PTR parameter2);
 #if !defined(SVMS_XP_COMPAT)
     bool QueueSoundFontLoad(const std::wstring& path, uint64_t& requestId);
     void SoundFontLoaderLoop();
@@ -2098,6 +2104,14 @@ private:
     uint32_t sampleStoreCount;
     uint32_t sampleDataFrames;
     uint64_t qpcFreq;
+
+    static constexpr uint32_t kMidiInputBufferCount = 4u;
+    static constexpr uint32_t kMidiInputBufferBytes = 4096u;
+    HMIDIIN midiInput_ = nullptr;
+    MIDIHDR midiInputHeaders_[kMidiInputBufferCount]{};
+    alignas(64) char midiInputData_[kMidiInputBufferCount]
+                                  [kMidiInputBufferBytes]{};
+    std::atomic<bool> midiInputRunning_{false};
 
     float* leftBuffer;
     float* rightBuffer;
@@ -3121,6 +3135,7 @@ void Driver::Shutdown() {
     compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
     WakeAddressWaiters(compilerWakeEpoch_);
     compilerSleeping_.store(false, std::memory_order_release);
+    StopConfiguredMidiInput();
     if (audioOutput) {
         audioOutput->Stop();
         audioOutput->Shutdown();
@@ -3516,9 +3531,169 @@ bool Driver::StartAudio() {
                                      engineConfig_.masterVolume,
                                      UsesXPWaveOut(audioOutput));
         }
+        if (ok && engineConfig_.midiInputEnabled && !midiInput_)
+            (void)StartConfiguredMidiInput();
         return ok;
     }
-    return audioOutput && audioOutput->IsRunning();
+    const bool running = audioOutput && audioOutput->IsRunning();
+    if (running && engineConfig_.midiInputEnabled && !midiInput_)
+        (void)StartConfiguredMidiInput();
+    return running;
+}
+
+bool Driver::StartConfiguredMidiInput() {
+    StopConfiguredMidiInput();
+    if (!engineConfig_.midiInputEnabled) return true;
+
+    using GetNumProc = UINT (WINAPI*)(void);
+    using GetCapsProc = MMRESULT (WINAPI*)(UINT_PTR, LPMIDIINCAPSW, UINT);
+    using OpenProc = MMRESULT (WINAPI*)(LPHMIDIIN, UINT, DWORD_PTR,
+                                       DWORD_PTR, DWORD);
+    using HeaderProc = MMRESULT (WINAPI*)(HMIDIIN, LPMIDIHDR, UINT);
+    using StartProc = MMRESULT (WINAPI*)(HMIDIIN);
+    GetNumProc getNum = reinterpret_cast<GetNumProc>(
+        GetSystemWinmmProc("midiInGetNumDevs"));
+    GetCapsProc getCaps = reinterpret_cast<GetCapsProc>(
+        GetSystemWinmmProc("midiInGetDevCapsW"));
+    OpenProc open = reinterpret_cast<OpenProc>(
+        GetSystemWinmmProc("midiInOpen"));
+    HeaderProc prepare = reinterpret_cast<HeaderProc>(
+        GetSystemWinmmProc("midiInPrepareHeader"));
+    HeaderProc addBuffer = reinterpret_cast<HeaderProc>(
+        GetSystemWinmmProc("midiInAddBuffer"));
+    StartProc start = reinterpret_cast<StartProc>(
+        GetSystemWinmmProc("midiInStart"));
+    if (!getNum || !getCaps || !open || !prepare || !addBuffer || !start) {
+        OutputDebugStringA("[SVMS] MIDI input routing unavailable: system WinMM exports missing\n");
+        return false;
+    }
+
+    const UINT deviceCount = getNum();
+    if (deviceCount == 0u) {
+        OutputDebugStringA("[SVMS] MIDI input routing enabled but no physical input devices were found\n");
+        return false;
+    }
+
+    UINT selected = 0u;
+    const std::wstring& requested = engineConfig_.midiInputDevice;
+    if (!requested.empty() && _wcsicmp(requested.c_str(), L"default") != 0) {
+        bool found = false;
+        for (UINT index = 0u; index < deviceCount; ++index) {
+            MIDIINCAPSW caps{};
+            if (getCaps(index, &caps, sizeof(caps)) == MMSYSERR_NOERROR &&
+                _wcsicmp(caps.szPname, requested.c_str()) == 0) {
+                selected = index;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            const std::string requestedUtf8 = [&]() {
+                if (requested.empty()) return std::string{};
+                const int bytes = WideCharToMultiByte(
+                    CP_UTF8, 0, requested.data(), static_cast<int>(requested.size()),
+                    nullptr, 0, nullptr, nullptr);
+                std::string value(bytes > 0 ? static_cast<size_t>(bytes) : 0u, '\0');
+                if (bytes > 0) WideCharToMultiByte(
+                    CP_UTF8, 0, requested.data(), static_cast<int>(requested.size()),
+                    value.data(), bytes, nullptr, nullptr);
+                return value;
+            }();
+            std::string warning = "[SVMS] configured MIDI input was not found: " +
+                                  requestedUtf8 + "\n";
+            OutputDebugStringA(warning.c_str());
+            return false;
+        }
+    }
+
+    MMRESULT result = open(&midiInput_, selected,
+        reinterpret_cast<DWORD_PTR>(&Driver::MidiInputCallback),
+        reinterpret_cast<DWORD_PTR>(this), CALLBACK_FUNCTION);
+    if (result != MMSYSERR_NOERROR || !midiInput_) {
+        midiInput_ = nullptr;
+        OutputDebugStringA("[SVMS] configured MIDI input could not be opened\n");
+        return false;
+    }
+
+    uint32_t prepared = 0u;
+    for (; prepared < kMidiInputBufferCount; ++prepared) {
+        MIDIHDR& header = midiInputHeaders_[prepared];
+        std::memset(&header, 0, sizeof(header));
+        header.lpData = midiInputData_[prepared];
+        header.dwBufferLength = kMidiInputBufferBytes;
+        if (prepare(midiInput_, &header, sizeof(header)) != MMSYSERR_NOERROR ||
+            addBuffer(midiInput_, &header, sizeof(header)) != MMSYSERR_NOERROR) {
+            break;
+        }
+    }
+    midiInputRunning_.store(true, std::memory_order_release);
+    if (prepared != kMidiInputBufferCount ||
+        start(midiInput_) != MMSYSERR_NOERROR) {
+        StopConfiguredMidiInput();
+        OutputDebugStringA("[SVMS] configured MIDI input buffers could not be started\n");
+        return false;
+    }
+    OutputDebugStringA("[SVMS] configured physical MIDI input routing started\n");
+    return true;
+}
+
+void Driver::StopConfiguredMidiInput() noexcept {
+    midiInputRunning_.store(false, std::memory_order_release);
+    HMIDIIN input = midiInput_;
+    if (!input) return;
+
+    using SimpleProc = MMRESULT (WINAPI*)(HMIDIIN);
+    using HeaderProc = MMRESULT (WINAPI*)(HMIDIIN, LPMIDIHDR, UINT);
+    SimpleProc stop = reinterpret_cast<SimpleProc>(
+        GetSystemWinmmProc("midiInStop"));
+    SimpleProc reset = reinterpret_cast<SimpleProc>(
+        GetSystemWinmmProc("midiInReset"));
+    SimpleProc close = reinterpret_cast<SimpleProc>(
+        GetSystemWinmmProc("midiInClose"));
+    HeaderProc unprepare = reinterpret_cast<HeaderProc>(
+        GetSystemWinmmProc("midiInUnprepareHeader"));
+    if (stop) (void)stop(input);
+    if (reset) (void)reset(input);
+    if (unprepare) {
+        for (MIDIHDR& header : midiInputHeaders_) {
+            if ((header.dwFlags & MHDR_PREPARED) != 0u)
+                (void)unprepare(input, &header, sizeof(header));
+        }
+    }
+    if (close) (void)close(input);
+    midiInput_ = nullptr;
+    std::memset(midiInputHeaders_, 0, sizeof(midiInputHeaders_));
+}
+
+void CALLBACK Driver::MidiInputCallback(HMIDIIN input, UINT message,
+                                        DWORD_PTR instance,
+                                        DWORD_PTR parameter1,
+                                        DWORD_PTR) {
+    Driver* self = reinterpret_cast<Driver*>(instance);
+    if (!self || !self->midiInputRunning_.load(std::memory_order_acquire))
+        return;
+    if (message == MIM_DATA) {
+        LARGE_INTEGER timestamp{};
+        QueryPerformanceCounter(&timestamp);
+        self->SubmitShortMsgAtQpc(
+            static_cast<uint32_t>(parameter1),
+            static_cast<uint64_t>(timestamp.QuadPart));
+        return;
+    }
+    if (message != MIM_LONGDATA) return;
+
+    MIDIHDR* header = reinterpret_cast<MIDIHDR*>(parameter1);
+    if (!header) return;
+    if (header->dwBytesRecorded != 0u && header->lpData)
+        self->SubmitSystemExclusive(
+            reinterpret_cast<const uint8_t*>(header->lpData),
+            header->dwBytesRecorded);
+    header->dwBytesRecorded = 0u;
+    if (!self->midiInputRunning_.load(std::memory_order_acquire)) return;
+    using HeaderProc = MMRESULT (WINAPI*)(HMIDIIN, LPMIDIHDR, UINT);
+    HeaderProc addBuffer = reinterpret_cast<HeaderProc>(
+        GetSystemWinmmProc("midiInAddBuffer"));
+    if (addBuffer) (void)addBuffer(input, header, sizeof(*header));
 }
 
 void Driver::ResetAllVoices() {

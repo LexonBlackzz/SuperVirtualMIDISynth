@@ -89,6 +89,11 @@ The Configurator edits the same JSON file and can import or export complete JSON
 profiles from **Advanced > Configuration**. Import changes the working copy;
 press **Save Configuration** to write and apply it.
 
+The **MIDI** page can route a physical MIDI input directly into SVMS. Enable
+it, select the system input, save, and restart the host. Short messages retain
+their arrival timestamps and SysEx uses fixed reusable input buffers; normal
+host `midiIn*` forwarding remains independent.
+
 The **Live Recording** page records the final stream after reverb, limiting,
 and post filtering. V3 writes the file on a background thread and reports any
 frames dropped because the disk could not keep up.

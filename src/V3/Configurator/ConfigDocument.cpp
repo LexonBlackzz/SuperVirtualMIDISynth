@@ -167,6 +167,8 @@ ConfigValues ConfigDocument::Defaults() {
     d.diagnosticsEnabled = false;
     d.diagnosticsWindow = false;
     d.diagnosticsDebugOutput = false;
+    d.midiInputEnabled = false;
+    d.midiInputDevice.clear();
     d.audioDevice = L"default";
     d.soundFontPath.clear();
     return d;
@@ -230,6 +232,10 @@ void ConfigDocument::FromJson(const json& root) {
         ReadBool(*it, "window", working_.diagnosticsWindow);
         ReadBool(*it, "debug_output", working_.diagnosticsDebugOutput);
     }
+    if (auto it = root.find("midi"); it != root.end() && it->is_object()) {
+        ReadBool(*it, "input_enabled", working_.midiInputEnabled);
+        ReadString(*it, "input_device", working_.midiInputDevice);
+    }
 }
 
 nlohmann::json ConfigDocument::ToJson() const {
@@ -281,6 +287,9 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["reverb"]["mod_rate"] = working_.reverbModRate;
     root["reverb"]["low_cut_hz"] = working_.reverbLowCutHz;
     root["reverb"]["high_cut_hz"] = working_.reverbHighCutHz;
+
+    root["midi"]["input_enabled"] = working_.midiInputEnabled;
+    root["midi"]["input_device"] = WideToUtf8(working_.midiInputDevice);
 
     root["diagnostics"]["enabled"] = working_.diagnosticsEnabled;
     root["diagnostics"]["window"] = working_.diagnosticsWindow;
@@ -472,6 +481,8 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.diagnosticsEnabled == b.diagnosticsEnabled
         && a.diagnosticsWindow == b.diagnosticsWindow
         && a.diagnosticsDebugOutput == b.diagnosticsDebugOutput
+        && a.midiInputEnabled == b.midiInputEnabled
+        && a.midiInputDevice == b.midiInputDevice
         && a.audioDevice == b.audioDevice
         && a.soundFontPath == b.soundFontPath;
 }

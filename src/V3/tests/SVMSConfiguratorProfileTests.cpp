@@ -74,6 +74,8 @@ int main() {
     const std::wstring activePath = document.GetActivePath();
 
     document.Working().maxVoices = 222u;
+    document.Working().midiInputEnabled = true;
+    document.Working().midiInputDevice = L"Unicode MIDI Ω";
     document.MarkDirty();
     std::string error;
     ok &= Check(document.ExportProfile(exported.wstring(), &error),
@@ -85,6 +87,9 @@ int main() {
     ok &= Check(ReadJson(exported, exportedJson), "read exported profile");
     ok &= Check(exportedJson["synth"]["max_voices"] == 222u,
                 "export contains working value");
+    ok &= Check(exportedJson["midi"]["input_enabled"] == true &&
+                    exportedJson["midi"]["input_device"] == "Unicode MIDI Ω",
+                "export preserves physical MIDI input routing");
     ok &= Check(exportedJson["active_unknown"]["keep"] == "active",
                 "export preserves unknown active fields");
 
@@ -109,6 +114,9 @@ int main() {
     document.Revert();
     ok &= Check(document.Working().maxVoices == 111u,
                 "revert restores loaded values");
+    ok &= Check(!document.Working().midiInputEnabled &&
+                    document.Working().midiInputDevice.empty(),
+                "revert restores MIDI input routing");
     ok &= Check(!document.IsDirty(), "revert clears dirty state");
     ok &= Check(document.ExportProfile(revertedExport.wstring(), &error),
                 "export reverted document");

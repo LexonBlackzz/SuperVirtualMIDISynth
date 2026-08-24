@@ -2269,6 +2269,8 @@ void TestJsonConfigurationLifecycle() {
           "first-run JSON uses compiled audio defaults");
     Check(created.audioDevice == L"default",
           "first-run JSON selects the current Windows default audio output");
+    Check(!created.midiInputEnabled && created.midiInputDevice.empty(),
+          "first-run JSON keeps direct physical MIDI routing opt-in");
     Check(created.eventRingCapacity == 393216 && created.highPriorityVelocity == 96,
           "first-run JSON uses priority ingress defaults");
 #if defined(SVMS_XP_COMPAT)
@@ -2296,6 +2298,8 @@ void TestJsonConfigurationLifecycle() {
 #endif
         Check(text.find("\"device\": \"default\"") != std::string::npos,
               "created JSON immediately records the default audio output");
+        Check(text.find("\"input_enabled\": false") != std::string::npos,
+              "created JSON records disabled physical MIDI input routing");
         Check(text.find("Alpha Piano.SF2") != std::string::npos,
               "created JSON explicitly stores the discovered SoundFont");
     }
@@ -2394,12 +2398,15 @@ void TestJsonConfigurationLifecycle() {
 
     {
         std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
-        output << R"json({"schema_version":1,"synth":{"render_threads":8}})json";
+        output << R"json({"schema_version":1,"synth":{"render_threads":8},"midi":{"input_enabled":true,"input_device":"Unicode MIDI Ω"}})json";
     }
     svms::EngineConfig workerConfiguration = svms::EngineConfig::Load();
     Check(workerConfiguration.renderThreads == 8u &&
               workerConfiguration.Validate(),
           "JSON selects a fixed voice-render thread count");
+    Check(workerConfiguration.midiInputEnabled &&
+              workerConfiguration.midiInputDevice == L"Unicode MIDI Ω",
+          "JSON selects a named physical MIDI input");
 
     {
         std::ofstream output(configPath, std::ios::binary | std::ios::trunc);

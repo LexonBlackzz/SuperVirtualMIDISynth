@@ -238,6 +238,10 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"low_cut_hz", cfg.reverbLowCutHz},
             {"high_cut_hz", cfg.reverbHighCutHz}
         }},
+        {"midi", {
+            {"input_enabled", cfg.midiInputEnabled},
+            {"input_device", WideToUtf8(cfg.midiInputDevice)}
+        }},
         {"diagnostics", {
             {"enabled", cfg.diagnosticsEnabled},
             {"window", cfg.diagnosticsWindow},
@@ -524,6 +528,17 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadBool(*it, "debug_output", cfg.diagnosticsDebugOutput))
             AppendWarning(cfg.configWarning, "diagnostics.debug_output");
     }
+    if (auto it = root.find("midi"); it != root.end() && it->is_object()) {
+        if (!ReadBool(*it, "input_enabled", cfg.midiInputEnabled))
+            AppendWarning(cfg.configWarning, "midi.input_enabled");
+        auto device = it->find("input_device");
+        if (device != it->end()) {
+            if (device->is_string())
+                cfg.midiInputDevice = Utf8ToWide(device->get<std::string>());
+            else
+                AppendWarning(cfg.configWarning, "midi.input_device");
+        }
+    }
 }
 
 bool EnvironmentFlag(const wchar_t* name, bool current) {
@@ -631,6 +646,8 @@ EngineConfig EngineConfig::Default() {
     cfg.diagnosticsWindow = false;
 #endif
     cfg.diagnosticsDebugOutput = false;
+    cfg.midiInputEnabled = false;
+    cfg.midiInputDevice.clear();
     // Keep the first-run choice explicit in config.json while following the
     // user's current Windows default if that default changes later.
     cfg.audioDevice = L"default";
