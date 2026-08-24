@@ -258,7 +258,9 @@ larger phase containing that item is complete.
 - [x] Implement SF2 per-voice pan in the live mixer
 - [x] Remove DC and subsonic output with a stateful 3 Hz post-limiter
   high-pass, fused into the limiter loop and shared by live/offline output
-- [ ] Implement sostenuto, default modulators, filters, LFOs, chorus, and reverb
+- [x] Implement exact CC66 sostenuto capture/release semantics, including
+  sustain coexistence and CC121 reset behavior
+- [ ] Implement default modulators, filters, LFOs, chorus, and expanded reverb
 
 ### 4096-Voice Full-Quality Scalar Optimization
 

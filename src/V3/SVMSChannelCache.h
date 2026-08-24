@@ -40,6 +40,7 @@ public:
     bool IsPercussion(uint8_t channel) const;
     void SetRhythmPart(uint8_t channel, uint8_t map);
     bool IsSustainActive(uint8_t channel) const;
+    bool IsSostenutoActive(uint8_t channel) const;
     float GetPitchBendSemitones(uint8_t channel) const;
     uint16_t GetPitchBendValue(uint8_t channel) const;
 
@@ -62,6 +63,7 @@ private:
     uint16_t channelFineTune_[kChannelCount];
     uint8_t channelCoarseTune_[kChannelCount];
     uint8_t channelSustain_[kChannelCount];
+    uint8_t channelSostenuto_[kChannelCount];
     uint8_t channelProgram_[kChannelCount];
     uint8_t channelBankMSB_[kChannelCount];
     uint8_t channelBankLSB_[kChannelCount];
@@ -91,6 +93,7 @@ inline void ChannelCache::Reset() {
         channelFineTune_[ch] = 8192;
         channelCoarseTune_[ch] = 64;
         channelSustain_[ch] = 0;
+        channelSostenuto_[ch] = 0;
         channelProgram_[ch] = 0;
         channelBankMSB_[ch] = 0;
         channelBankLSB_[ch] = 0;
@@ -149,6 +152,9 @@ inline void ChannelCache::ControlChange(uint8_t channel, uint8_t controller, uin
         case 64:
             affectsCache = channelSustain_[channel] != value;
             channelSustain_[channel] = value;
+            break;
+        case 66:
+            channelSostenuto_[channel] = value;
             break;
         case 101: channelRpnMSB_[channel] = value; break;
         case 100: channelRpnLSB_[channel] = value; break;
@@ -253,6 +259,7 @@ inline void ChannelCache::ResetControllers(uint8_t channel) {
     channelFineTune_[channel] = 8192;
     channelCoarseTune_[channel] = 64;
     channelSustain_[channel] = 0;
+    channelSostenuto_[channel] = 0;
     dirtyMask_ |= static_cast<uint16_t>(1u << channel);
 }
 
@@ -355,6 +362,10 @@ inline uint8_t ChannelCache::GetProgram(uint8_t channel) const {
 
 inline bool ChannelCache::IsSustainActive(uint8_t channel) const {
     return (channel < kChannelCount) && channelSustain_[channel] >= 64;
+}
+
+inline bool ChannelCache::IsSostenutoActive(uint8_t channel) const {
+    return (channel < kChannelCount) && channelSostenuto_[channel] >= 64;
 }
 
 inline float ChannelCache::GetPitchBendSemitones(uint8_t channel) const {

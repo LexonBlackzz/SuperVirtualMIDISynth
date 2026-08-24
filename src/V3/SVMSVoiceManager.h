@@ -226,6 +226,9 @@ public:
     void EndVoicesForChannelKey(uint8_t channel, uint8_t note, uint32_t blockOffset);
     void SilenceChannelImmediate(uint8_t channel);
     void ReleaseChannel(uint8_t channel, uint32_t blockOffset);
+    void CaptureSostenuto(uint8_t channel);
+    void ReleaseSostenuto(uint8_t channel, uint32_t blockOffset);
+    void ReleaseSustain(uint8_t channel, uint32_t blockOffset);
 
     uint32_t GetActiveCount() const { return activeCount_; }
     // Physical allocation ceiling. It can grow at a render boundary; it is
@@ -1079,6 +1082,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(decaySlope);
     SVMS_COPY_GROWN_VOICE_FIELD(samplePageId);
     SVMS_COPY_GROWN_VOICE_FIELD(heldBySustain);
+    SVMS_COPY_GROWN_VOICE_FIELD(heldBySostenuto);
     SVMS_COPY_GROWN_VOICE_FIELD(releaseStartInBlock);
     SVMS_COPY_GROWN_VOICE_FIELD(nextChannelKeyVoice);
     SVMS_COPY_GROWN_VOICE_FIELD(prevChannelKeyVoice);
@@ -1320,6 +1324,7 @@ inline uint32_t VoiceManager::EnforceVoiceLimit(uint32_t maxReleases,
             continue;
 
         v.heldBySustain[victim] = 0u;
+        v.heldBySostenuto[victim] = 0u;
         v.releaseStartInBlock[victim] = 0u;
         v.releaseDecay[victim] = releaseDecay;
         v.releaseSamplesRemaining[victim] = releaseSamples;
@@ -1713,6 +1718,7 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.envelopeStage[handle]     = 0;
     v.renderClass[handle] = static_cast<uint8_t>(VoiceRenderClass::Generic);
     v.heldBySustain[handle]     = 0;
+    v.heldBySostenuto[handle]   = 0;
     v.releaseStartInBlock[handle] = 0;
     v.nextChannelKeyVoice[handle] = -1;
     v.prevChannelKeyVoice[handle] = -1;
@@ -1749,6 +1755,7 @@ inline void VoiceManager::InitializePreparedVoice(
     v.envelopeStage[handle] = 0u;
     v.renderClass[handle] = static_cast<uint8_t>(VoiceRenderClass::Generic);
     v.heldBySustain[handle] = 0u;
+    v.heldBySostenuto[handle] = 0u;
     v.releaseStartInBlock[handle] = 0u;
     v.nextChannelKeyVoice[handle] = -1;
     v.prevChannelKeyVoice[handle] = -1;
@@ -3053,6 +3060,8 @@ inline void VoiceManager::StartRelease(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active)) {
         UnlinkChannelKey(handle);
+        v.heldBySustain[handle] = 0u;
+        v.heldBySostenuto[handle] = 0u;
         v.state[handle] = static_cast<uint8_t>(VoiceState::Releasing);
         releasingCount_.fetch_add(1u, std::memory_order_relaxed);
         // SF2 sampleModes 3 = loop during key depression: stop looping so the
@@ -3335,6 +3344,7 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     v.note[handle] = note;
     v.velocity[handle] = velocity;
     v.heldBySustain[handle] = 0u;
+    v.heldBySostenuto[handle] = 0u;
     v.releaseStartInBlock[handle] = 0u;
     v.birthFrame[handle] = currentFrame_;
     v.stealFadeInFramesRemaining[handle] = 0u;
@@ -3794,11 +3804,11 @@ inline void VoiceManager::NoteOffPlayIndex(uint8_t channel, uint8_t note,
             const VoiceHandle handle = static_cast<VoiceHandle>(current);
             if (v.playIndex[handle] != playIndex) break;
             current = v.prevChannelKeyVoice[handle];
-            if (sustain) {
-                v.heldBySustain[handle] = 1u;
-                // A sustained generation has received its note-off and must
-                // not mask the next retrigger. Sustain release uses the
-                // channel-active index, so key-chain membership is unnecessary.
+            if (sustain || v.heldBySostenuto[handle]) {
+                if (sustain) v.heldBySustain[handle] = 1u;
+                // A pedal-held generation has received its note-off and must
+                // not mask the next retrigger. Pedal release uses the channel
+                // active index, so key-chain membership is unnecessary.
                 UnlinkChannelKey(handle);
             } else {
                 v.releaseStartInBlock[handle] = blockOffset;
@@ -3818,8 +3828,8 @@ inline void VoiceManager::NoteOffPlayIndex(uint8_t channel, uint8_t note,
             v.playIndex[handle] != playIndex) {
             continue;
         }
-        if (sustain) {
-            v.heldBySustain[handle] = 1u;
+        if (sustain || v.heldBySostenuto[handle]) {
+            if (sustain) v.heldBySustain[handle] = 1u;
             UnlinkChannelKey(handle);
         } else {
             v.releaseStartInBlock[handle] = blockOffset;
@@ -4002,8 +4012,53 @@ inline void VoiceManager::ReleaseChannel(uint8_t channel, uint32_t blockOffset) 
         const uint32_t idx = voice;
         if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) return;
         v.heldBySustain[idx] = 0;
+        v.heldBySostenuto[idx] = 0;
         v.releaseStartInBlock[idx] = blockOffset;
         StartRelease(static_cast<VoiceHandle>(idx));
+    });
+}
+
+inline void VoiceManager::CaptureSostenuto(uint8_t channel) {
+    if (channel >= kChannelCount) return;
+    ForEachChannelActive(channel, [&](VoiceHandle handle) {
+        if (v.state[handle] != static_cast<uint8_t>(VoiceState::Active)) return;
+        const uint8_t note = v.note[handle];
+        const bool awaitingNoteOff =
+            channelKeyVoiceHead_[channel][note] == static_cast<int32_t>(handle) ||
+            v.prevChannelKeyVoice[handle] >= 0 ||
+            v.nextChannelKeyVoice[handle] >= 0;
+        if (awaitingNoteOff) v.heldBySostenuto[handle] = 1u;
+    });
+}
+
+inline void VoiceManager::ReleaseSostenuto(uint8_t channel,
+                                            uint32_t blockOffset) {
+    if (channel >= kChannelCount) return;
+    ForEachChannelActive(channel, [&](VoiceHandle handle) {
+        if (!v.heldBySostenuto[handle]) return;
+        const uint8_t note = v.note[handle];
+        const bool awaitingNoteOff =
+            channelKeyVoiceHead_[channel][note] == static_cast<int32_t>(handle) ||
+            v.prevChannelKeyVoice[handle] >= 0 ||
+            v.nextChannelKeyVoice[handle] >= 0;
+        v.heldBySostenuto[handle] = 0u;
+        if (!awaitingNoteOff && !v.heldBySustain[handle]) {
+            v.releaseStartInBlock[handle] = blockOffset;
+            StartRelease(handle);
+        }
+    });
+}
+
+inline void VoiceManager::ReleaseSustain(uint8_t channel,
+                                         uint32_t blockOffset) {
+    if (channel >= kChannelCount) return;
+    ForEachChannelActive(channel, [&](VoiceHandle handle) {
+        if (!v.heldBySustain[handle]) return;
+        v.heldBySustain[handle] = 0u;
+        if (!v.heldBySostenuto[handle]) {
+            v.releaseStartInBlock[handle] = blockOffset;
+            StartRelease(handle);
+        }
     });
 }
 

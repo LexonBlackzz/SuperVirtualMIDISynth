@@ -5297,6 +5297,8 @@ void Driver::HandleStaleNoteOffBatch(uint8_t channel, uint8_t note,
 void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t value,
                                  uint32_t blockOffset) {
     const bool sustainWasActive = channelCache && channelCache->IsSustainActive(channel);
+    const bool sostenutoWasActive =
+        channelCache && channelCache->IsSostenutoActive(channel);
     if (channelCache) channelCache->ControlChange(channel, controller, value);
     if (channel < kChannelCount &&
         (controller == 0u || controller == 32u || controller == 6u ||
@@ -5318,29 +5320,24 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     }
 
     if (controller == 64) {
-        if (value < 64) {
-            voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
-                const uint32_t i = voice;
-                if (voiceManager->v.heldBySustain[i]) {
-                    voiceManager->v.heldBySustain[i] = 0;
-                    voiceManager->StartRelease(i);
-                }
-            });
-        }
+        if (value < 64) voiceManager->ReleaseSustain(channel, blockOffset);
+    } else if (controller == 66) {
+        const bool sostenutoIsActive = value >= 64;
+        if (!sostenutoWasActive && sostenutoIsActive)
+            voiceManager->CaptureSostenuto(channel);
+        else if (sostenutoWasActive && !sostenutoIsActive)
+            voiceManager->ReleaseSostenuto(channel, blockOffset);
     }
 
     if (controller == 120) {
         voiceManager->SilenceChannelImmediate(channel);
     } else if (controller == 123) {
         voiceManager->ReleaseChannel(channel, blockOffset);
-    } else if (controller == 121 && sustainWasActive) {
-        voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
-            const uint32_t i = voice;
-            if (voiceManager->v.heldBySustain[i]) {
-                voiceManager->v.heldBySustain[i] = 0;
-                voiceManager->StartRelease(i);
-            }
-        });
+    } else if (controller == 121) {
+        if (sustainWasActive)
+            voiceManager->ReleaseSustain(channel, blockOffset);
+        if (sostenutoWasActive)
+            voiceManager->ReleaseSostenuto(channel, blockOffset);
     }
 
     if (controller == 121) {

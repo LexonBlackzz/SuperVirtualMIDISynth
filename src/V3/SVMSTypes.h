@@ -440,6 +440,7 @@ struct SamplePage {
     X(float, decaySlope) \
     X(uint32_t, samplePageId) \
     X(uint8_t, heldBySustain) \
+    X(uint8_t, heldBySostenuto) \
     X(uint32_t, releaseStartInBlock) \
     X(int32_t, nextChannelKeyVoice) \
     X(int32_t, prevChannelKeyVoice) \

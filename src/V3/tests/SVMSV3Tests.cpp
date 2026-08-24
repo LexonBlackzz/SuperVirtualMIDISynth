@@ -1568,6 +1568,77 @@ void TestPagedChannelIndexFragmentation() {
 
 void TestChannelTerminationControllers() {
     {
+        svms::ChannelCache channels;
+        channels.ControlChange(3, 66, 127);
+        Check(channels.IsSostenutoActive(3),
+              "CC66 enables channel sostenuto state");
+        channels.ResetControllers(3);
+        Check(!channels.IsSostenutoActive(3),
+              "CC121 resets channel sostenuto state");
+    }
+
+    {
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(4, 44100);
+        const auto captured = voices->AllocateVoice(0, 60, 100);
+        voices->SetVoicePlayIndex(captured, 10u);
+        voices->CaptureSostenuto(0);
+
+        const auto launchedAfterPedal = voices->AllocateVoice(0, 64, 100);
+        voices->SetVoicePlayIndex(launchedAfterPedal, 11u);
+        voices->NoteOffPlayIndex(0, 60, 10u, false, 7u);
+        voices->NoteOffPlayIndex(0, 64, 11u, false, 8u);
+        Check(voices->v.state[captured] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active) &&
+                  voices->v.heldBySostenuto[captured] == 1u,
+              "sostenuto holds only notes captured at pedal-down");
+        Check(voices->v.state[launchedAfterPedal] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing),
+              "sostenuto does not capture notes launched after pedal-down");
+
+        voices->ReleaseSostenuto(0, 19u);
+        Check(voices->v.state[captured] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+                  voices->v.releaseStartInBlock[captured] == 19u,
+              "sostenuto pedal-up releases a captured key-up voice exactly");
+    }
+
+    {
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(3, 44100);
+        const auto keyStillDown = voices->AllocateVoice(2, 67, 100);
+        voices->SetVoicePlayIndex(keyStillDown, 20u);
+        voices->CaptureSostenuto(2);
+        voices->ReleaseSostenuto(2, 5u);
+        Check(voices->v.state[keyStillDown] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active) &&
+                  voices->v.heldBySostenuto[keyStillDown] == 0u,
+              "sostenuto pedal-up preserves a key that is still depressed");
+        voices->NoteOffPlayIndex(2, 67, 20u, false, 6u);
+        Check(voices->v.state[keyStillDown] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing),
+              "a later key-up releases a no-longer-captured voice");
+    }
+
+    {
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(2, 44100);
+        const auto heldByBoth = voices->AllocateVoice(4, 72, 100);
+        voices->SetVoicePlayIndex(heldByBoth, 30u);
+        voices->CaptureSostenuto(4);
+        voices->NoteOffPlayIndex(4, 72, 30u, true, 3u);
+        voices->ReleaseSustain(4, 4u);
+        Check(voices->v.state[heldByBoth] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active),
+              "releasing sustain preserves a voice still held by sostenuto");
+        voices->ReleaseSostenuto(4, 9u);
+        Check(voices->v.state[heldByBoth] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+                  voices->v.releaseStartInBlock[heldByBoth] == 9u,
+              "the final released pedal starts the SF2 release");
+    }
+
+    {
         auto voices = std::make_unique<svms::VoiceManager>();
         voices->Initialize(4, 44100);
         const svms::VoiceHandle first = voices->AllocateVoice(0, 60, 100);
