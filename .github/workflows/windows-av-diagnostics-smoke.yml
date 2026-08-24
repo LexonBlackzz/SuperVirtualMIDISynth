@@ -1,0 +1,59 @@
+name: Windows Configurator AV diagnostics smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v3]
+    paths:
+      - ".github/workflows/windows-av-diagnostics-smoke.yml"
+
+jobs:
+  build:
+    name: Build Configurator without diagnostics discovery
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Replace diagnostics page with UI-only stub
+        shell: pwsh
+        run: |
+          @'
+          #include "PageDiagnostics.h"
+          #include "ConfigDocument.h"
+          #include "Theme.h"
+          #include "imgui.h"
+
+          namespace svms::cfg {
+
+          void DrawDiagnosticsPage(ConfigDocument&) {
+              SectionHeader("DIAGNOSTICS");
+              ImGui::TextDisabled("System discovery disabled for AV smoke test.");
+          }
+
+          } // namespace svms::cfg
+          '@ | Set-Content -Encoding utf8 src/V3/Configurator/PageDiagnostics.cpp
+
+      - name: Build V3 Configurator
+        shell: cmd
+        run: |
+          call find_vs.bat
+          if errorlevel 1 exit /b %errorlevel%
+          call "%VS_VCVARSALL%" x64
+          if errorlevel 1 exit /b %errorlevel%
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B build\av-no-diagnostics
+          if errorlevel 1 exit /b %errorlevel%
+          cmake --build build\av-no-diagnostics --config Release --target svms_v3_configurator
+          if errorlevel 1 exit /b %errorlevel%
+          mkdir av-no-diagnostics
+          copy /y build\av-no-diagnostics\bin\svms_v3_configurator.exe av-no-diagnostics\SVMSConfigurator-NO-DIAGNOSTICS.exe >nul
+
+      - name: Upload sample
+        uses: actions/upload-artifact@v4
+        with:
+          name: SVMSConfigurator-NO-DIAGNOSTICS
+          path: av-no-diagnostics/
+          if-no-files-found: error
