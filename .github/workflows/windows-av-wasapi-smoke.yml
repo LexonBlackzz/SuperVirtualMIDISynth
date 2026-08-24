@@ -1,0 +1,96 @@
+name: Windows Configurator AV WASAPI smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v3]
+    paths:
+      - ".github/workflows/windows-av-wasapi-smoke.yml"
+
+jobs:
+  build:
+    name: Build WASAPI isolation samples
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up output
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force av-wasapi | Out-Null
+
+      - name: Replace WASAPI device enumeration with stub
+        shell: pwsh
+        run: |
+          @'
+          #include "WasapiDevices.h"
+
+          namespace svms::cfg {
+
+          WasapiDeviceList::WasapiDeviceList() = default;
+          WasapiDeviceList::~WasapiDeviceList() = default;
+
+          void WasapiDeviceList::Enumerate() {
+              devices_.clear();
+          }
+
+          std::vector<std::string> WasapiDeviceList::FriendlyNames() const {
+              return {"Default Windows Output Device"};
+          }
+
+          int WasapiDeviceList::FindByName(const std::wstring&) const {
+              return 0;
+          }
+
+          int WasapiDeviceList::DefaultIndex() const {
+              return 0;
+          }
+
+          } // namespace svms::cfg
+          '@ | Set-Content -Encoding utf8 src/V3/Configurator/WasapiDevices.cpp
+
+      - name: Build NO-WASAPI
+        shell: cmd
+        run: |
+          call find_vs.bat
+          if errorlevel 1 exit /b %errorlevel%
+          call "%VS_VCVARSALL%" x64
+          if errorlevel 1 exit /b %errorlevel%
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B build\av-no-wasapi
+          if errorlevel 1 exit /b %errorlevel%
+          cmake --build build\av-no-wasapi --config Release --target svms_v3_configurator
+          if errorlevel 1 exit /b %errorlevel%
+          copy /y build\av-no-wasapi\bin\svms_v3_configurator.exe av-wasapi\01-NO-WASAPI.exe >nul
+
+      - name: Also remove diagnostics discovery
+        shell: pwsh
+        run: |
+          @'
+          #include "PageDiagnostics.h"
+          #include "ConfigDocument.h"
+          #include "Widgets.h"
+          #include "imgui.h"
+
+          namespace svms::cfg {
+
+          void DrawDiagnosticsPage(ConfigDocument&) {
+              SectionHeader("DIAGNOSTICS");
+              ImGui::TextDisabled("Diagnostics and WASAPI discovery disabled for AV smoke test.");
+          }
+
+          } // namespace svms::cfg
+          '@ | Set-Content -Encoding utf8 src/V3/Configurator/PageDiagnostics.cpp
+
+          cmd /c "call find_vs.bat && call \"%VS_VCVARSALL%\" x64 && cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B build\av-no-wasapi-diag && cmake --build build\av-no-wasapi-diag --config Release --target svms_v3_configurator"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build/av-no-wasapi-diag/bin/svms_v3_configurator.exe av-wasapi/02-NO-WASAPI-NO-DIAGNOSTICS.exe
+
+      - name: Upload samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: SVMSConfigurator-AV-WASAPI-smoke
+          path: av-wasapi/
+          if-no-files-found: error
