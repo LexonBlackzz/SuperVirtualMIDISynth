@@ -677,6 +677,18 @@ if(SVMS_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_midi_stream COMMAND svms_v3_midi_stream_tests)
 
+        add_executable(svms_v3_config_profile_tests
+            tests/SVMSConfiguratorProfileTests.cpp
+            Configurator/ConfigDocument.cpp)
+        target_compile_definitions(svms_v3_config_profile_tests PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+            _CRT_SECURE_NO_WARNINGS)
+        target_include_directories(svms_v3_config_profile_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+        add_test(NAME svms_v3_config_profiles
+            COMMAND svms_v3_config_profile_tests)
+
         add_executable(svms_v3_live_smoke tests/SVMSLiveSmoke.cpp)
         target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

@@ -9,9 +9,12 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 namespace svms::cfg {
 namespace {
@@ -99,6 +102,50 @@ void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked,
 bool confirmReset = false;
 std::string themeStatus;
 bool themeStatusError = false;
+std::wstring lastProfileDirectory;
+std::string profileStatus;
+bool profileStatusError = false;
+
+bool SelectProfileFile(HWND owner, bool save, std::wstring& path) {
+    std::vector<wchar_t> buffer(32768u, L'\0');
+    if (save) {
+        const wchar_t* initialName = L"svms-profile.json";
+        wcsncpy_s(buffer.data(), buffer.size(), initialName, _TRUNCATE);
+    }
+    static const wchar_t filter[] =
+        L"SVMS JSON profiles (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = buffer.data();
+    ofn.nMaxFile = static_cast<DWORD>(buffer.size());
+    ofn.lpstrInitialDir = lastProfileDirectory.empty()
+        ? nullptr : lastProfileDirectory.c_str();
+    ofn.lpstrDefExt = L"json";
+    ofn.lpstrTitle = save ? L"Export SVMS profile" : L"Import SVMS profile";
+    ofn.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST |
+                (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    const BOOL selected = save ? GetSaveFileNameW(&ofn)
+                               : GetOpenFileNameW(&ofn);
+    if (!selected) return false;
+    path = buffer.data();
+    try {
+        lastProfileDirectory =
+            std::filesystem::path(path).parent_path().wstring();
+    } catch (const std::filesystem::filesystem_error&) {
+        lastProfileDirectory.clear();
+    }
+    return true;
+}
+
+HWND MainViewportWindow() {
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    if (!viewport) return nullptr;
+    void* handle = viewport->PlatformHandleRaw
+        ? viewport->PlatformHandleRaw : viewport->PlatformHandle;
+    return static_cast<HWND>(handle);
+}
 
 } // namespace
 
@@ -320,6 +367,50 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     if (ImGui::Button("Open config.json")) {
         ShellExecuteW(nullptr, L"open", path.c_str(),
                       nullptr, nullptr, SW_SHOWDEFAULT);
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled(
+        "Profiles are complete JSON working copies. Import does not overwrite config.json until you save.");
+    ImGui::BeginDisabled(doc.IsReadOnly());
+    if (ImGui::Button("Import Profile...")) {
+        std::wstring profilePath;
+        if (SelectProfileFile(MainViewportWindow(), false, profilePath)) {
+            std::string error;
+            if (doc.ImportProfile(profilePath, &error)) {
+                profileStatus =
+                    "Profile imported into the working copy. Save Configuration to apply it.";
+                profileStatusError = false;
+            } else {
+                profileStatus = "Profile import failed: " + error;
+                profileStatusError = true;
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export Profile...")) {
+        std::wstring profilePath;
+        if (SelectProfileFile(MainViewportWindow(), true, profilePath)) {
+            std::string error;
+            if (doc.ExportProfile(profilePath, &error)) {
+                profileStatus = "Profile exported successfully.";
+                profileStatusError = false;
+            } else {
+                profileStatus = "Profile export failed: " + error;
+                profileStatusError = true;
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    if (!profileStatus.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              profileStatusError ? GetError() : GetMutedText());
+        ImGui::TextWrapped("%s", profileStatus.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (doc.IsReadOnly()) {
+        ImGui::TextDisabled(
+            "Profile import/export is disabled while the active configuration is read-only.");
     }
 
     ImGui::Spacing();

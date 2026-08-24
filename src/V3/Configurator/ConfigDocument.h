@@ -75,6 +75,8 @@ public:
     bool LoadDefaults();
     bool Save(const std::wstring& path);
     bool SaveAtomic(const std::wstring& path);
+    bool ImportProfile(const std::wstring& path, std::string* error = nullptr);
+    bool ExportProfile(const std::wstring& path, std::string* error = nullptr) const;
 
     bool IsDirty() const;
     void MarkDirty();
@@ -106,6 +108,7 @@ private:
     ConfigValues loaded_;
     ConfigValues working_;
     nlohmann::json rawJson_;
+    nlohmann::json loadedRawJson_;
     std::wstring activePath_;
     std::string parseError_;
     std::string configWarning_;

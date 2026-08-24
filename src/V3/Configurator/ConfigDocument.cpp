@@ -42,6 +42,51 @@ std::wstring Utf8ToWide(const std::string& value) {
 }
 
 constexpr uint32_t kConfigSchemaVersion = 1;
+constexpr uint64_t kMaxProfileBytes = 16ull * 1024ull * 1024ull;
+
+bool WriteJsonAtomic(const fs::path& path, const json& root,
+                     bool preserveBackup, std::string* error) {
+    auto fail = [&](const char* message) {
+        if (error) *error = message;
+        return false;
+    };
+    std::error_code ec;
+    const fs::path parent = path.parent_path();
+    if (!parent.empty()) {
+        fs::create_directories(parent, ec);
+        if (ec) return fail("could not create the destination directory");
+    }
+
+    if (preserveBackup && fs::exists(path, ec)) {
+        fs::path backup = path.wstring() + L".bak";
+        fs::copy_file(path, backup, fs::copy_options::overwrite_existing, ec);
+        // A backup is best effort. Failure must not prevent the same atomic
+        // replacement behavior that existing config saves already provide.
+        ec.clear();
+    }
+
+    fs::path temp = path;
+    temp += L".tmp." + std::to_wstring(GetCurrentProcessId());
+    {
+        std::ofstream output(temp, std::ios::binary | std::ios::trunc);
+        if (!output) return fail("could not create the temporary file");
+        output << root.dump(2) << '\n';
+        output.flush();
+        if (!output) {
+            output.close();
+            DeleteFileW(temp.c_str());
+            return fail("could not write the complete profile");
+        }
+    }
+
+    if (!MoveFileExW(temp.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp.c_str());
+        return fail("could not atomically replace the destination file");
+    }
+    if (error) error->clear();
+    return true;
+}
 
 template <typename T>
 void ReadNum(const json& obj, const char* key, T& dest, T min, T max) {
@@ -248,6 +293,7 @@ bool ConfigDocument::Load(const std::wstring& path) {
     working_ = Defaults();
     defaults_ = Defaults();
     rawJson_ = json::object();
+    loadedRawJson_ = rawJson_;
     parseError_.clear();
     configWarning_.clear();
     dirty_ = false;
@@ -282,6 +328,7 @@ bool ConfigDocument::Load(const std::wstring& path) {
     }
 
     loaded_ = working_;
+    loadedRawJson_ = rawJson_;
     return true;
 }
 
@@ -291,6 +338,7 @@ bool ConfigDocument::LoadDefaults() {
     working_ = Defaults();
     loaded_ = working_;
     rawJson_ = json::object();
+    loadedRawJson_ = rawJson_;
     parseError_.clear();
     configWarning_.clear();
     dirty_ = false;
@@ -309,36 +357,81 @@ bool ConfigDocument::Save(const std::wstring& path) {
 
 bool ConfigDocument::SaveAtomic(const std::wstring& path) {
     if (readOnly_) return false;
-    std::error_code ec;
-    fs::create_directories(fs::path(path).parent_path(), ec);
-
-    fs::path backup = fs::path(path).wstring() + L".bak";
-    if (fs::exists(path, ec)) {
-        fs::copy_file(path, backup, fs::copy_options::overwrite_existing, ec);
-    }
-
-    fs::path temp = path;
-    temp += L".tmp." + std::to_wstring(GetCurrentProcessId());
-
     json root = ToJson();
-    {
-        std::ofstream output(temp, std::ios::binary | std::ios::trunc);
-        if (!output) return false;
-        output << root.dump(2) << '\n';
-        output.flush();
-        if (!output) return false;
-    }
-
-    if (!MoveFileExW(temp.c_str(), path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(temp.c_str());
-        return false;
-    }
+    if (!WriteJsonAtomic(fs::path(path), root, true, nullptr)) return false;
 
     loaded_ = working_;
     rawJson_ = root;
+    loadedRawJson_ = root;
     dirty_ = false;
     return true;
+}
+
+bool ConfigDocument::ImportProfile(const std::wstring& path,
+                                   std::string* error) {
+    auto fail = [&](const std::string& message) {
+        if (error) *error = message;
+        return false;
+    };
+    if (readOnly_)
+        return fail("the active configuration is read-only");
+
+    try {
+        std::error_code ec;
+        const uint64_t size = fs::file_size(path, ec);
+        if (ec) return fail("could not open the profile");
+        if (size == 0u) return fail("the profile is empty");
+        if (size > kMaxProfileBytes)
+            return fail("the profile exceeds the 16 MiB safety limit");
+
+        std::ifstream input(path, std::ios::binary);
+        if (!input) return fail("could not open the profile");
+        json profile;
+        input >> profile;
+        if (!profile.is_object())
+            return fail("the profile root must be a JSON object");
+        const auto schema = profile.find("schema_version");
+        if (schema == profile.end() || !schema->is_number_unsigned())
+            return fail("the profile has no valid schema_version");
+        const uint32_t version = schema->get<uint32_t>();
+        if (version > kConfigSchemaVersion)
+            return fail("the profile uses a newer unsupported schema");
+        if (version != kConfigSchemaVersion)
+            return fail("the profile schema is unsupported");
+
+        ConfigDocument candidate;
+        candidate.working_ = Defaults();
+        candidate.defaults_ = candidate.working_;
+        candidate.rawJson_ = profile;
+        candidate.FromJson(profile);
+        const ConfigValidation validation = candidate.Validate();
+        if (!validation.valid)
+            return fail("the profile contains invalid settings: " +
+                        validation.warnings);
+
+        working_ = candidate.working_;
+        rawJson_ = std::move(profile);
+        dirty_ = true;
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception& exception) {
+        return fail(std::string("malformed profile: ") + exception.what());
+    }
+}
+
+bool ConfigDocument::ExportProfile(const std::wstring& path,
+                                   std::string* error) const {
+    if (readOnly_) {
+        if (error) *error = "the active configuration is read-only";
+        return false;
+    }
+    const ConfigValidation validation = Validate();
+    if (!validation.valid) {
+        if (error)
+            *error = "current settings are invalid: " + validation.warnings;
+        return false;
+    }
+    return WriteJsonAtomic(fs::path(path), ToJson(), false, error);
 }
 
 bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
@@ -384,7 +477,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
 }
 
 bool ConfigDocument::IsDirty() const {
-    return !ConfigValuesEqual(working_, loaded_);
+    return dirty_ || !ConfigValuesEqual(working_, loaded_);
 }
 
 void ConfigDocument::MarkDirty() {
@@ -397,6 +490,7 @@ void ConfigDocument::ClearDirty() {
 
 void ConfigDocument::Revert() {
     working_ = loaded_;
+    rawJson_ = loadedRawJson_;
     dirty_ = false;
 }
 
