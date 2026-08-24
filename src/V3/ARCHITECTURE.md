@@ -1,187 +1,236 @@
 # SuperVirtualMIDISynth V3 Architecture
 
-## Goals
+## Contract
 
-V3 is a Windows `winmm.dll` replacement for extreme-density MIDI playback.
-The long-term modern-CPU stress target is approximately 500,000 simultaneously
-active voices while accepting bursts of tens of millions of MIDI note events
-per second, with an Intel i5-13600KF-class system representing the intended
-high-end benchmark tier. The scalar renderer is also a compatibility baseline
-that must remain useful on very old CPUs such as the Intel Celeron 420; SIMD
-and parallel backends are later accelerators, not prerequisites for
-correctness.
+V3 is a drop-in Windows `winmm.dll` synthesizer and a reusable native MIDI
+engine. Live WinMM, KDMAPI-compatible, SVMS API, Linux ALSA, and offline paths
+share the same scheduler, MIDI state, SoundFont launch, stealing, and synthesis
+semantics.
 
-The design therefore separates three problems:
+The non-negotiable timing contract is:
 
-1. MIDI ingestion and scheduling must absorb dense event bursts without taking
-   locks or allocating on the audio thread.
-2. Voice state must be compact and cheap to advance, even when most voices are
-   audibly culled under extreme pressure.
-3. Audio mixing must spend memory bandwidth and interpolation work primarily on
-   voices that contribute the most perceptual energy.
+- every admitted event is assigned an absolute integer output frame;
+- equal-frame events execute in global ingress-sequence order;
+- controller changes split rendering at their exact frame;
+- rendering work may be chunked or concurrent, but events are never quantized
+  to callback, worker, tile, or 128-frame planning boundaries; and
+- priority overload may shed documented note-ons, while lossless overload
+  retains every event and reports lateness if real time cannot be maintained.
+
+The selectable logical voice ceiling is 524,288. That is a storage ceiling,
+not a promise that every configuration can render 524,288 full-quality voices
+in real time.
 
 ## Runtime Pipeline
 
+```text
+WinMM / KDMAPI facade / SVMS API / ALSA / offline MIDI reader
+                         |
+                         v
+       runtime-sized sequence-numbered MPSC priority lanes
+        state | loud | upper-medium | medium | quiet
+                         |
+                         v
+                one compiler worker
+       QPC -> absolute frame, stable 8,192-event pages
+                         |
+                         v
+         page-head winner-tree scheduled backlog
+                         |
+                         v
+                   audio callback
+       extract bounded due set, preserve (frame, sequence)
+                         |
+                         v
+            exact-frame MIDI/voice dispatch
+                         |
+            +------------+-------------+
+            |                          |
+     event-free spans          128-frame dense plan
+     class kernels and         immutable mutations and
+     profitable workers        deterministic voice tiles
+            |                          |
+            +------------+-------------+
+                         v
+     planar mix -> reverb -> lookahead limiter/high-pass
+                         |
+             live recorder tap -> audio backend
 ```
-MIDI application
-    |
-    v
-winmm exports (midiOutShortMsg, KDMAPI, etc.)
-    |
-    v
-Timestamped SPSC queue, 16,384 entries
-    |
-    v
-WASAPI audio callback
-    |
-    +-- drain queue into persistent pending-event storage
-    +-- convert QPC timestamps using the virtual render clock
-    +-- sort events by fractional sample offset
-    +-- dispatch events at their exact frame boundary
-    |
-    v
-RenderScalar::RenderBlock
-    |
-    +-- refresh channel-dependent mix gains once per block
-    +-- sort active voices by velocity when decimation is active
-    +-- advance every voice's phase, envelope, and retirement state
-    +-- fetch/mix audio only for selected voices
-    +-- swap-remove retired voices from the active list
-    |
-    v
-planar stereo mix -> interleaved output -> limiter -> WASAPI
-```
 
-The audio thread performs MIDI dispatch and rendering directly. The current
-implementation is single-threaded to keep scheduling deterministic and avoid
-cross-worker synchronization overhead on low-end CPUs.
+## Ingress and Scheduling
 
-## Event Ingestion and Scheduling
+`PriorityEventIngress` contains five preallocated MPSC lanes sized from
+`events.ring_capacity`. State events and velocity 96-127 note-ons use
+cancellable backpressure. Lower-velocity lanes may be shed progressively in
+priority mode. Note-offs, controller/state events, panic, reset, and engine
+commands are never intentionally discarded.
 
-The producer-facing MIDI path uses a bounded lock-free SPSC queue. Events are
-timestamped with `QueryPerformanceCounter`; the audio thread converts them to
-fractional sample offsets against a monotonically advancing virtual render
-clock. This prevents callback timing and buffer boundaries from quantizing
-events into audible timing clusters.
+Producers receive a QPC timestamp and global sequence before waiting. The
+compiler worker drains the lane heads in sequence order, converts QPC time to
+absolute frames with remainder-preserving integer arithmetic, and fills
+immutable pages of 8,192 `ScheduledRenderEvent` records. A page is stably
+ordered by `(targetFrame, ingressSequence)` using merge/radix paths selected by
+its run shape.
 
-The audio thread maintains a persistent pending-event buffer. Future events
-remain queued across callbacks, while in-block events are sorted and dispatched
-inside the render loop. The current event capacity is 2,097,152 entries. The
-queue is bounded by design: if a producer outruns the consumer indefinitely,
-backpressure and eventual event dropping are preferable to unbounded memory
-growth or audio-thread allocation.
+The audio thread imports page descriptors into a fixed page-head winner tree.
+Advancing the next scheduled event is logarithmic in the number of live pages;
+event payloads are not merged, compacted, or recopied as backlog grows.
+Exhausted pages return to the compiler through a lock-free free-page queue.
 
-The tens-of-millions-of-events-per-second goal will require further work beyond
-the current insertion-sort and per-event dispatch path. Likely future work
-includes bulk MIDI packing, event coalescing for redundant controller changes,
-radix/bucket scheduling, and a separate overload policy for events versus
-voices.
+Only events due before the callback end are copied into the preallocated render
+event buffer. `events.max_events_per_block` bounds callback work independently
+of queue capacity. Excess due work remains ordered and is explicitly late; it
+is never rescaled onto a callback grid.
 
-## Voice Pool
+Priority mode may coalesce adjacent equal-frame writes only when the earlier
+write is provably stateless and completely overwritten by the later write.
+Lossless mode disables intentional coalescing and shedding.
 
-Voice state is stored in `VoiceSoA`. Its hot field arrays share one 64-byte-
-aligned allocation sized to the configured voice capacity, so the default
-1000-voice pool no longer pays for 4096 entries. The current hard ceiling is
-still 4096 because several lifecycle and stealing indices in `VoiceManager`
-remain fixed-capacity. Those indices must also become capacity-sized or paged
-before the pool can grow toward the 500K target.
+## MIDI and SoundFont State
 
-The renderer's class-transition and deferred-retirement scratch arrays are
-also allocated once at initialization for configured polyphony. They never
-grow, shrink, or allocate from the audio callback.
+The audio thread is the sole owner of channel state, note generations, voice
+allocation, and victim decisions. Per-channel active indices and per-channel/
+key generation queues make controller changes, bends, sustain/sostenuto, note
+offs, CC120, CC121, and CC123 local rather than full-pool scans.
 
-The current pool uses:
+SoundFonts load and resample off-thread into immutable bundles. The audio
+thread activates a completed bundle only at a block boundary; retired bundles
+are reclaimed on the control thread. A priority-ordered SoundFont stack and
+bank/preset routes are flattened into one render sample store. Cached launch
+plans resolve the common eight-or-fewer-layer case by SoundFont generation,
+preset, channel pitch revision, note, and velocity.
 
-- `activeList_[0..activeCount_)` for all active and releasing voices
-- a LIFO `freeStack_` for O(1) allocation
-- per-channel/key linked heads for note-off and panic operations
-- swap-remove retirement
-- score-based stealing when the configured pool is full
+Common XG reset, master tuning/volume, and multipart messages are translated to
+ordinary exact-frame engine commands. Unsupported SysEx remains observable but
+does not perturb scheduling.
 
-Every note-on gets a fresh voice. Same-note retriggers overlap naturally;
-voice pressure is handled by stealing rather than recycling an existing key.
+## Voice Pool and Exact Stealing
 
-The steal score favors removing releasing, quiet, and older voices while
-protecting attacks and louder voices.
+`VoiceManager` owns a capacity-sized `VoiceSoA`, lifecycle indices, render-class
+lists, channel indices, and note-generation queues. Allocation pops a free
+slot; retirement uses inverse active positions and swap removal. `activeList`
+exists for lifecycle and exact tie semantics, not render traversal.
 
-## Scalar Renderer
+Every MIDI note-on launches a fresh atomic play group. Mono notes occupy one
+physical voice; stereo or layered regions occupy multiple voices sharing one
+`playIndex`. Allocation and stealing replace the complete group so one stereo
+side cannot disappear independently.
 
-`RenderScalar::RenderBlock` uses a per-sample outer loop. At each sample it:
+Stable steal candidates live in a persistent winner tree keyed by the current
+BASS-like score and original active position. Attack/decay/release candidates
+whose scores vary with render progress live in a per-frame exact heap. The two
+winners are compared with the same tie rule as exhaustive selection. Matching
+groups can be rewritten in place while preserving active and channel slots.
 
-1. dispatches all events whose fractional offset falls at that frame;
-2. determines the current decimation step;
-3. advances every active voice;
-4. fetches and mixes samples only for the selected voices; and
-5. retires voices that reach the end of their sample or release tail.
+Audible victims may enter a fixed 50-entry, 64-frame outgoing-tail reserve.
+The reserve replaces its quietest existing tail when necessary; it does not
+allocate one tail record per configured voice.
 
-The fused per-voice body avoids a function call and argument marshaling in the
-hot loop. Sustained envelopes use an early fast path, releasing envelopes use
-one decay multiply, and sample-loop bounds are precomputed at note-on. Channel
-pan and volume are premultiplied into per-voice gains once per block.
+Primary voice arrays share a 64-byte-aligned allocation sized to configured
+polyphony. Write-only legacy fields have been removed. The dense multicore
+shadow reserves only audible/render state; cold MIDI identity, linkage, pitch,
+and stealing metadata remains solely in the authoritative pool.
 
-Voices that are not mixed still advance their phase and envelope. This avoids
-creating frozen voices that occupy the pool forever.
+## Rendering
 
-## Adaptive Decimation
+`RenderScalar::RenderBlock` is the shared live/offline entry point. Production
+rendering splits sparse blocks into exact event-free spans, dispatches the
+equal-frame event run at each boundary, and renders persistent class lists:
 
-The current thresholds are:
+- sustained looping;
+- sustained one-shot;
+- looping attack/decay;
+- looping release;
+- one-shot envelope/release;
+- rare generic voices; and
+- independent steal tails.
 
-| Active voices | Step | Selected mix voices |
-|---:|---:|---:|
-| `< 2,000` | 1 | 100% |
-| `< 50,000` | 2 | approximately 50% |
-| `< 150,000` | 4 | approximately 25% |
-| `< 500,000` | 8 | approximately 12.5% |
-| `>= 500,000` | 16 | approximately 6.25% |
+Scalar, SSE2, and AVX2 kernel sets share the same span interface. Backend
+selection happens once at initialization after CPUID/OSXSAVE/XCR0 validation.
+XP contains scalar/SSE2 paths only. Kernels preserve linear interpolation,
+multi-loop overshoot, exact envelope/release countdowns, phase state, and
+retirement frames.
 
-The active list is velocity-sorted when step is greater than one, so loud
-voices are retained ahead of quiet voices. Newborn voices are temporarily
-protected. These are the first density controls; reaching 500K voices will
-require a more scalable active-list representation and likely energy-based
-selection rather than a full sort.
+The old frame-major renderer is compiled only into reference builds and serves
+as the differential oracle.
 
-## CPU Tiers and Celeron 420 Constraints
+## Multicore Rendering
 
-The project has two distinct performance targets:
+`synth.render_threads = 1` selects serial rendering, an explicit larger value
+selects that total thread count, and `0` selects a topology-aware automatic
+count. Persistent workers use MMCSS and FTZ/DAZ. Modern Windows uses generation
+counters with dynamically resolved `WaitOnAddress`; XP retains event waits.
 
-- Modern multicore CPUs such as the i5-13600KF: the 500K-voice and
-  tens-of-millions-of-events stress target, using scalable storage, scheduling,
-  parallelism, and SIMD where available.
-- Legacy scalar CPUs such as the Celeron 420: compatibility and graceful
-  operation at practical voice counts, with the scalar renderer providing the
-  reference path.
+Long profitable spans become dynamically claimed logical voice-tile jobs.
+Each tile writes a private stereo scratch slice, and the audio thread reduces
+tiles in fixed logical order, so worker execution order cannot change output.
 
-The Celeron 420 is a single-core, in-order-era baseline with limited cache and
-memory bandwidth. Scalar performance priorities on that tier are therefore:
+Dense event blocks use a separate exact 128-frame planner for up to 8,192
+configured voices. The audio thread walks all events in exact order and records
+per-voice mutation snapshots at their true offsets. Workers render immutable
+256-handle tiles while the coordinator prepares the next chunk. The 128-frame
+unit packages work only; it does not delay events. Capacity checks use the
+actual union of affected voice populations. If a plan cannot be represented,
+that chunk falls back to the exact serial path without truncation or delay.
 
-- no per-sample heap work, locks, virtual calls, or division in the full-mix
-  path;
-- dense SoA arrays and predictable linear traversal;
-- precomputed sample-loop and gain values;
-- no work for voices that are below the selected mixing budget, except state
-  advancement required for correct retirement;
-- bounded event processing and explicit overload behavior; and
-- deterministic operation suitable for profiling without SIMD assumptions.
+## Audio and DSP
 
-The Celeron tier is not expected to render 500K voices in real time. The
-eventual modern-CPU design will still benefit from tiered state updates:
-audible voices at full rate, quiet voices at reduced control/audio rates, and
-dormant tails represented compactly until they become audible or retire.
+Modern Windows uses event-driven WASAPI shared mode with device-sized aligned
+buffers and automatic recovery after endpoint invalidation, service restart,
+or default-device change. Recovery retries the configured endpoint and then
+the current default endpoint without resetting MIDI/voice state. XP uses the
+DirectSound/waveOut compatibility path.
+
+Post processing consists of optional reverb, a configurable lookahead limiter,
+and a stateful 3 Hz DC/subsonic high-pass. Live parameter changes arrive through
+an atomic mailbox and glide where coefficient steps would click. Live WAV/RF64
+recording copies the post-DSP stereo stream into a bounded SPSC buffer and
+writes it on a background thread.
+
+The callback never allocates, takes a general-purpose lock, displays UI, or
+emits debug output. Diagnostics are published through atomic snapshots and the
+versioned runtime link.
+
+## Configuration and Compatibility
+
+V3 reads a DLL-local `config.json` first, then
+`%APPDATA%\\SuperVirtualMIDISynth\\config.json`, then environment overrides.
+The first writable configuration is created atomically and can import a legacy
+`config.ini` without modifying it. Relative SoundFont paths resolve against the
+driver directory. Unknown JSON fields survive saves; malformed or unsupported
+newer schemas are never overwritten.
+
+The Configurator is optional. Runtime-link structures are versioned,
+capability-gated, and fixed-size where published. Build-number mismatch is a
+user notification, not a protocol decision. The native SVMS API uses
+size/version negotiation, and the KDMAPI facade remains a compatibility layer.
+
+## Current Scaling Boundary
+
+The scheduler is no longer the primary Black MIDI bottleneck. At saturated
+polyphony, exact note launch, grouped victim replacement, tail capture,
+lifecycle maintenance, and synthesis dominate. The 524,288 ceiling is usable
+for storage experiments, but predictable 500K operation still requires paged
+SoA storage, compact inactive/tail representations, and an explicit memory
+budget. Those items remain tracked in `ROADMAP.md`.
 
 ## File Map
 
-```
-SVMSTypes.h          shared POD types, constants, voice arrays, decimation
-SVMSVoiceManager.h   allocation, stealing, active/free pools, retirement
-SVMSRenderScalar.h   fused scalar renderer and per-sample event dispatch
-SVMSDriver.h/cpp     winmm exports, event timing, MIDI dispatch, limiter
-SVMSPSCQueue.h       lock-free producer/consumer MIDI queue
-SVMSChannelCache.h   per-channel parameter snapshots
-SVMSSoundFont.*      SF2 parsing, regions, and sample data
-SVMSAudioOutput.h    WASAPI shared-mode output
-SVMSDiagWindow.*     runtime diagnostic window
-SVMSConfig.*         engine configuration and snapshots
-```
+| File | Responsibility |
+|---|---|
+| `SVMSDriver.cpp` | WinMM/native entry points, compiler worker, exact MIDI dispatch, bundle activation, audio callback and DSP |
+| `SVMSEventPages.h` | compiled page pool, stable page ordering, page-head winner tree |
+| `SVMSEventScheduler.h` | reference and small-batch scheduler machinery |
+| `SVMSMPSCQueue.h` | runtime-sized priority ingress lanes and cancellable waits |
+| `SVMSVoiceManager.h` | voice lifecycle, channel/key indices, launch transactions, exact grouped stealing |
+| `SVMSTypes.h` | shared POD types and primary/tail SoA storage |
+| `SVMSRenderScalar.h` | exact span dispatcher, dense planner, oracle boundary |
+| `SVMSRenderKernels*.cpp` | scalar, SSE2, and AVX2 class kernels |
+| `SVMSRenderWorkers.*` | persistent deterministic tile workers |
+| `SVMSSoundFont.*` | SF2 parsing, region compilation, validation, and resampling |
+| `SVMSAudioOutput.h` | WASAPI recovery and XP output compatibility |
+| `SVMSConfig.*` | JSON migration, validation, precedence, and atomic persistence |
+| `SVMSRuntimeLink*` | versioned diagnostics/control protocol |
 
-See `ROADMAP.md` for the path from the current 4K scalar baseline to the
-500K/event-flood target.
+See `ROADMAP.md` for accepted measurements, rejected directions, and the
+remaining path toward efficient 500K-voice operation.
