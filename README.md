@@ -23,6 +23,7 @@ publish official V3 DLL releases yet, but you can build and test it from source.
 - Configurator with live controls, diagnostics, profile import/export, and an
   offline renderer page
 - Live post-DSP recording to stereo 32-bit float WAV/RF64
+- Live SoundFont switching with off-thread preparation and block-boundary activation
 - Native SVMS API and KDMAPI-compatible entry points
 - Windows x64, Windows x86, Windows XP x86, and Linux x86-64 targets
 
@@ -91,6 +92,12 @@ press **Save Configuration** to write and apply it.
 The **Live Recording** page records the final stream after reverb, limiting,
 and post filtering. V3 writes the file on a background thread and reports any
 frames dropped because the disk could not keep up.
+
+The **Audio** page can load the selected SoundFont into the running driver.
+Parsing and sample preparation happen on a loader thread; the finished immutable
+bank activates at the next audio-block boundary without restarting WASAPI. Any
+voices using the previous bank are silenced at activation while MIDI channel
+state is retained. Save the configuration separately to reuse the bank later.
 
 ## Offline rendering
 

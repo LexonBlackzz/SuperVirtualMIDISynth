@@ -314,6 +314,7 @@ int main(int argc, char** argv) {
         (peer.capabilityFlags & svms::build::CapabilityRuntimeLinkV3) == 0u ||
         (peer.capabilityFlags & svms::build::CapabilityNativeApiV1) == 0u ||
         (peer.capabilityFlags & svms::build::CapabilityLiveRecording) == 0u ||
+        (peer.capabilityFlags & svms::build::CapabilitySoundFontReload) == 0u ||
         peer.nativeAbiMin > 1u || peer.nativeAbiMax < 1u ||
         peer.productMajor != svms::build::kProductMajor ||
         peer.buildNumber != svms::build::kBuildNumber) {
@@ -433,6 +434,54 @@ int main(int argc, char** argv) {
     }
     std::printf("INFO: live params applied and echoed (master=%.2f "
                 "limiter=%.2f)\n", t.live.masterVolume, t.live.limiterThreshold);
+
+    // Reload the currently active bank through the asynchronous bundle path.
+    // The command must ACK before parsing completes, audio must remain live,
+    // and QuerySoundFontLoad must observe block-boundary activation.
+    if (t.soundFontLoaded != 0u && t.soundFontName[0] != '\0') {
+        const svms::RLResult reloadResult = client.SendCommand(
+            svms::RLCommandType::ReloadSoundFont, 0u, 0u,
+            svms::RuntimeLiveStateV2{}, 2000u, resultText,
+            t.soundFontName);
+        if (reloadResult != svms::RLResult::Ok) {
+            std::printf("FAIL: ReloadSoundFont returned %d (%s)\n",
+                        static_cast<int>(reloadResult), resultText);
+            reset(handle); close(handle); FreeLibrary(module);
+            DeleteFileW(configPath);
+            return 1;
+        }
+        const DWORD reloadStart = GetTickCount();
+        bool activated = false;
+        do {
+            uint32_t state = 0u;
+            unsigned long long requested = 0u;
+            unsigned long long active = 0u;
+            resultText[0] = '\0';
+            if (client.SendCommand(
+                    svms::RLCommandType::QuerySoundFontLoad, 0u, 0u,
+                    svms::RuntimeLiveStateV2{}, 1000u, resultText) ==
+                    svms::RLResult::Ok &&
+                std::sscanf(resultText, "%u\t%llu\t%llu", &state,
+                            &requested, &active) == 3 &&
+                state == 3u && requested != 0u && active == requested) {
+                activated = true;
+                break;
+            }
+            Sleep(25u);
+        } while (static_cast<int>(GetTickCount() - reloadStart) < 15000);
+        if (!activated || !client.ReadTelemetry(t) || t.audioRunning == 0u ||
+            t.soundFontLoaded == 0u) {
+            std::printf("FAIL: live SoundFont activation did not settle (%s)\n",
+                        resultText);
+            reset(handle); close(handle); FreeLibrary(module);
+            DeleteFileW(configPath);
+            return 1;
+        }
+        shortMsg(handle, 0x00643C90u);
+        Sleep(75u);
+        shortMsg(handle, 0x00003C80u);
+        std::puts("INFO: live SoundFont bundle activated without restarting audio");
+    }
 
     // Exercise UTF-8 request text and the real post-DSP recorder through the
     // driver. Stop must drain its ring and leave a finalized RIFF file.

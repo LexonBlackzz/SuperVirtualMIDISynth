@@ -3,6 +3,8 @@
 #include "WasapiDevices.h"
 #include "EasterEggs.h"
 #include "Widgets.h"
+#include "SVMSBuildInfo.h"
+#include "../SVMSRuntimeLink.h"
 #include "imgui.h"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -16,6 +18,8 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <cerrno>
+#include <cstdlib>
 
 namespace svms::cfg {
 namespace {
@@ -41,6 +45,81 @@ bool EqualAsciiCI(const std::string& a, const std::string& b) {
         }
     }
     return true;
+}
+
+struct SoundFontLiveStatus {
+    uint32_t state = 0u;
+    uint64_t requested = 0u;
+    uint64_t activated = 0u;
+    float pollTimer = 0.25f;
+    std::string message = "Ready";
+    bool error = false;
+};
+
+bool ParseU64Field(char*& cursor, uint64_t& value) {
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(cursor, &end, 10);
+    if (errno != 0 || end == cursor || *end != '\t') return false;
+    value = static_cast<uint64_t>(parsed);
+    cursor = end + 1;
+    return true;
+}
+
+void PollSoundFontStatus(svms::RuntimeLinkClient& client,
+                         SoundFontLiveStatus& status, bool force = false) {
+    if (!force) {
+        status.pollTimer += ImGui::GetIO().DeltaTime;
+        if (status.pollTimer < 0.25f) return;
+    }
+    status.pollTimer = 0.0f;
+    char result[svms::kRuntimeLinkResultTextCapacity]{};
+    if (client.SendCommand(svms::RLCommandType::QuerySoundFontLoad,
+                           0u, 0u, svms::RuntimeLiveStateV2{}, 100u,
+                           result) != svms::RLResult::Ok) return;
+    char* cursor = result;
+    uint64_t state = 0u;
+    if (!ParseU64Field(cursor, state) ||
+        !ParseU64Field(cursor, status.requested)) return;
+    char* end = nullptr;
+    errno = 0;
+    status.activated = std::strtoull(cursor, &end, 10);
+    if (errno != 0 || end == cursor) return;
+    cursor = *end == '\t' ? end + 1 : end;
+    status.state = static_cast<uint32_t>(state);
+    status.error = status.state == 4u;
+    if (status.error) {
+        status.message = *cursor ? cursor : "SoundFont load failed";
+    } else if (status.state == 1u) {
+        status.message = "Loading and preparing SoundFont off-thread...";
+    } else if (status.state == 2u) {
+        status.message = "Prepared; waiting for the next audio block...";
+    } else if (status.state == 3u) {
+        status.message = "SoundFont activated";
+    } else {
+        status.message = "Ready";
+    }
+}
+
+void StartSoundFontLoad(svms::RuntimeLinkClient& client,
+                        const std::wstring& path,
+                        SoundFontLiveStatus& status) {
+    const std::string utf8 = WideToUtf8Str(path);
+    if (utf8.empty() || utf8.size() >= svms::kRuntimeLinkCommandTextCapacity) {
+        status.message = "The SoundFont path is too long for RuntimeLink.";
+        status.error = true;
+        return;
+    }
+    char result[svms::kRuntimeLinkResultTextCapacity]{};
+    const svms::RLResult code = client.SendCommand(
+        svms::RLCommandType::ReloadSoundFont, 0u, 0u,
+        svms::RuntimeLiveStateV2{}, 500u, result, utf8.c_str());
+    status.error = code != svms::RLResult::Ok;
+    status.message = result[0] ? result : svms::RLV2_ResultToString(code);
+    if (!status.error) {
+        status.state = 1u;
+        status.pollTimer = 0.25f;
+    }
 }
 
 bool BeginAudioSettingsTable(const char* id) {
@@ -109,6 +188,12 @@ void FixedCell() {
 
 void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
     auto& w = doc.Working();
+    const LiveLinkContext& live = GetLiveLinkContext();
+    const bool liveSoundFont = live.connected && live.client &&
+        live.client->HasCapability(svms::build::CapabilitySoundFontReload);
+    static SoundFontLiveStatus soundFontStatus;
+    if (liveSoundFont)
+        PollSoundFontStatus(*live.client, soundFontStatus);
 
     static WasapiDeviceList deviceList;
     static bool devicesEnumerated = false;
@@ -335,7 +420,32 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 doc.MarkDirty();
             }
         }
-        RestartRequiredBadge();
+        if (liveSoundFont) LiveBadge("Loads off-thread and activates at an audio-block boundary.");
+        else RestartRequiredBadge();
+
+        ImGui::Spacing();
+        const bool busy = soundFontStatus.state == 1u ||
+                          soundFontStatus.state == 2u;
+        const bool canLoad = liveSoundFont && !w.soundFontPath.empty() && !busy;
+        if (!canLoad) ImGui::BeginDisabled();
+        if (ImGui::Button("Load Now", ImVec2(110.0f, 0.0f)) && canLoad)
+            StartSoundFontLoad(*live.client, w.soundFontPath, soundFontStatus);
+        if (!canLoad) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (!liveSoundFont) {
+            ImGui::TextDisabled("Connect to a compatible running V3 driver to switch live.");
+        } else {
+            const ImVec4 color = soundFontStatus.error
+                ? ImVec4(0.95f, 0.35f, 0.30f, 1.0f)
+                : (busy ? ImVec4(0.95f, 0.75f, 0.20f, 1.0f)
+                        : ImVec4(0.35f, 0.90f, 0.55f, 1.0f));
+            ImGui::TextColored(color, "%s", soundFontStatus.message.c_str());
+        }
+        if (live.telemetry && live.telemetry->soundFontName[0] != '\0') {
+            ImGui::TextDisabled("Active: %s", live.telemetry->soundFontName);
+        }
+        ImGui::TextDisabled(
+            "Active voices are silenced at activation; MIDI state is retained. Save Configuration to keep the selection after restart.");
 
         static char searchBuf[128] = {};
         static std::vector<std::wstring> folderFonts;

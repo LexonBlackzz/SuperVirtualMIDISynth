@@ -3,6 +3,8 @@
 #include "Theme.h"
 #include "Widgets.h"
 #include "imgui.h"
+#include "SVMSBuildInfo.h"
+#include "../SVMSRuntimeLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -157,11 +159,18 @@ void DrawOverviewPage(ConfigDocument& doc) {
         }
     }
     ImGui::SameLine();
-    RestartRequiredBadge();
+    const LiveLinkContext& soundFontLive = GetLiveLinkContext();
+    if (soundFontLive.connected && soundFontLive.client &&
+        soundFontLive.client->HasCapability(
+            svms::build::CapabilitySoundFontReload)) {
+        LiveBadge("Use the Audio page to load this SoundFont immediately.");
+    } else {
+        RestartRequiredBadge();
+    }
 
     ImGui::Spacing();
     ImGui::TextDisabled(
-        "SoundFont changes are saved to the synth configuration and currently take effect after restart.");
+        "Save the selection for future starts, or use Load Now on the Audio page to switch the running synth.");
 
     ImGui::TableNextColumn();
     const float meterHeight = ImGui::GetContentRegionAvail().y;

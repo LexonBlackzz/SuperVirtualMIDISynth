@@ -277,6 +277,8 @@ void TestEnumCompleteness() {
              "ApplyLiveConfig must be 0x100");
     CHECK_EQ(svms::RLCommandType::ReloadSoundFont, 0x101u,
              "ReloadSoundFont must be 0x101");
+    CHECK_EQ(svms::RLCommandType::QuerySoundFontLoad, 0x106u,
+             "QuerySoundFontLoad must be 0x106");
     CHECK_EQ(svms::RLCommandType::ResetVoices, 0x102u, "ResetVoices must be 0x102");
     CHECK_EQ(svms::RLCommandType::RequestRestart, 0x110u,
              "RequestRestart must be 0x110");

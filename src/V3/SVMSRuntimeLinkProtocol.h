@@ -252,6 +252,7 @@ enum class RLCommandType : uint32_t {
     StartLiveRecording   = 0x00000103,
     StopLiveRecording    = 0x00000104,
     QueryLiveRecording   = 0x00000105,
+    QuerySoundFontLoad   = 0x00000106,
     RequestRestart       = 0x00000110,
 
     Invalid              = 0xFFFFFFFF,

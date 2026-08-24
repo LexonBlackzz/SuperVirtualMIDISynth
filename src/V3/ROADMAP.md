@@ -104,8 +104,9 @@ larger phase containing that item is complete.
 - [x] Add a native settings query/merge-patch API that validates recognized
   values, round-trips unknown fields, uses the configuration mutex, and commits
   through atomic replacement
-- [ ] Add live configuration reload; configuration changes currently require an
-  engine restart
+- [ ] Add general live configuration reload; SoundFonts and the existing live
+  DSP/voice controls are handled, while remaining restart-only fields still
+  require an engine restart
 
 ### Audio Thread and WASAPI
 
@@ -119,8 +120,9 @@ larger phase containing that item is complete.
   diagnostic window/debug display on its own thread
 - [ ] Extract a distinct audio-thread-owned `SynthCore` shared by live WASAPI
   and offline rendering
-- [ ] Load SoundFonts into immutable bundles off-thread, swap only at a block
-  boundary, and reclaim retired bundles off the audio thread
+- [x] Load SoundFonts into immutable bundles off-thread, swap only at a block
+  boundary, and reclaim retired bundles off the audio thread; RuntimeLink and
+  the Configurator expose non-blocking load/prepared/activated/error status
 - [x] Remove callback-side logging/critical-section paths and add allocation
   instrumentation plus a source audit rejecting lock, debug-output, and UI calls
 - [ ] Exercise live WASAPI device-buffer sizes from 16 through 8192 frames; the

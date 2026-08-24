@@ -1896,6 +1896,7 @@ struct CallbackTimingWindow {
 };
 
 struct PreparedSF2Region;
+struct SoundFontBundle;
 
 static constexpr uint32_t kNoteRegionCacheSize = 4096u;
 static constexpr uint32_t kNoteRegionCacheLayers = 8u;
@@ -1988,6 +1989,19 @@ private:
     void HandleProgramChange(uint8_t channel, uint8_t program);
     void HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb);
     void EventCompilerLoop();
+    SoundFontBundle* BuildSoundFontBundle(const wchar_t* path,
+                                          uint64_t requestId,
+                                          std::string& error);
+    void PublishSoundFontBundle(SoundFontBundle* bundle) noexcept;
+    void ActivatePendingSoundFontAtBlockBoundary() noexcept;
+    void RetireSoundFontBundle(SoundFontBundle* bundle) noexcept;
+    void ReclaimRetiredSoundFonts() noexcept;
+    void DestroyAllSoundFontBundles() noexcept;
+    std::wstring CopyActiveSoundFontPath() const;
+#if !defined(SVMS_XP_COMPAT)
+    bool QueueSoundFontLoad(const std::wstring& path, uint64_t& requestId);
+    void SoundFontLoaderLoop();
+#endif
     uint32_t ResolveNoteRegions(uint32_t presetIndex, uint8_t note,
                                 uint8_t velocity,
                                 const SFSampleRegion** outRegions,
@@ -2051,6 +2065,20 @@ private:
     PreparedSF2Region* preparedRegions;
     uint32_t preparedRegionCount;
     uint32_t soundFontGeneration_;
+    std::atomic<SoundFontBundle*> activeSoundFontBundle_{nullptr};
+    std::atomic<SoundFontBundle*> pendingSoundFontBundle_{nullptr};
+    std::atomic<SoundFontBundle*> retiredSoundFontBundles_{nullptr};
+    std::atomic<uint64_t> soundFontRequestId_{0u};
+    std::atomic<uint64_t> soundFontActivatedId_{0u};
+#if !defined(SVMS_XP_COMPAT)
+    std::thread soundFontLoaderThread_;
+    HANDLE soundFontLoadEvent_ = nullptr;
+    std::atomic<bool> soundFontLoaderStop_{false};
+    std::wstring requestedSoundFontPath_;
+    uint64_t requestedSoundFontId_ = 0u;
+    std::atomic<uint32_t> soundFontLoadState_{0u};
+    std::string soundFontLoadError_;
+#endif
     uint32_t channelLaunchRevision_[kChannelCount];
     NoteRegionCacheEntry noteRegionCache_[kNoteRegionCacheSize];
     NoteLaunchPlanCacheEntry noteLaunchPlanCache_[kNoteRegionCacheSize];
@@ -2144,11 +2172,6 @@ private:
     svms::RuntimeLinkTelemetryV2 BuildRuntimeLinkTelemetry();
 #endif
 
-    // Path of the last successfully loaded SoundFont.  Written by the
-    // host/control thread under LoadSoundFont(); read by the control
-    // thread for telemetry.  Never touched by the audio thread.
-    wchar_t loadedSoundFontPath_[MAX_PATH] = {};
-
     // Audio-thread record of the LAST live state it actually applied
     // (from the mailbox seqlock), plus the mailbox sequence that
     // produced it.  The control thread reads both for the telemetry
@@ -2174,6 +2197,7 @@ private:
 #endif
 
     CRITICAL_SECTION cs;
+    CRITICAL_SECTION soundFontBuildCs_;
 };
 
 static Driver* s_instance = nullptr;
@@ -2198,8 +2222,8 @@ static svms::RuntimeAudioSnapshot g_audioSnapshot;
 // and a groupMask; the handler validates the payload, writes only the
 // masked groups into the seqlock mailbox (odd sequence = in-progress,
 // even = published; the audio thread reads it once per block — no locks,
-// no torn reads).  Heavy commands (ReloadSoundFont) run here, never on
-// the audio thread; ResetVoices routes through the SPSC ingress exactly
+// no torn reads). ReloadSoundFont only queues the dedicated loader thread;
+// ResetVoices routes through the SPSC ingress exactly
 // like midiOutReset so the audio thread performs the release work.
 static uint32_t FloatToU32Bits(float value) noexcept {
     uint32_t bits = 0u;
@@ -2355,26 +2379,66 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
     }
 
     case RT::ReloadSoundFont: {
-        // Transactional reload: resolve the configured SoundFont, parse
-        // it (control thread — never the audio thread), and swap while
-        // the audio device is stopped.  A failed parse leaves the
-        // existing runtime untouched.
-        std::string resolutionWarning;
-        const std::wstring widePath =
-            ResolveV3SoundFontPath(engineConfig_, &resolutionWarning);
+        // Queue a transactional immutable-bundle load. The loader thread does
+        // all file, conversion, and preparation work; callback entry performs
+        // only the completed bundle activation.
+        std::wstring widePath;
+        const size_t length = strnlen_s(
+            cmd.resultText, svms::kRuntimeLinkCommandTextCapacity);
+        if (length != 0u && length < svms::kRuntimeLinkCommandTextCapacity) {
+            const int wideLength = MultiByteToWideChar(
+                CP_UTF8, MB_ERR_INVALID_CHARS, cmd.resultText,
+                static_cast<int>(length), nullptr, 0);
+            if (wideLength <= 0) {
+                strncpy_s(resultText, kText,
+                          "SoundFont path is not valid UTF-8", _TRUNCATE);
+                return svms::RLResult::InvalidArgument;
+            }
+            widePath.resize(static_cast<size_t>(wideLength));
+            if (MultiByteToWideChar(
+                    CP_UTF8, MB_ERR_INVALID_CHARS, cmd.resultText,
+                    static_cast<int>(length), widePath.data(), wideLength) !=
+                wideLength) {
+                strncpy_s(resultText, kText, "could not decode SoundFont path",
+                          _TRUNCATE);
+                return svms::RLResult::InvalidArgument;
+            }
+        } else {
+            std::string resolutionWarning;
+            widePath = ResolveV3SoundFontPath(engineConfig_, &resolutionWarning);
+            if (widePath.empty() && !resolutionWarning.empty())
+                strncpy_s(resultText, kText, resolutionWarning.c_str(), _TRUNCATE);
+        }
         if (widePath.empty()) {
             strncpy_s(resultText, kText, "no SoundFont configured", _TRUNCATE);
-            if (!resolutionWarning.empty()) {
-                strncpy_s(resultText, kText, resolutionWarning.c_str(), _TRUNCATE);
-            }
             return svms::RLResult::LoadFailed;
         }
-        if (!LoadSoundFont(widePath.c_str())) {
-            strncpy_s(resultText, kText,
-                      "SoundFont parse failed; previous SoundFont kept",
+        uint64_t requestId = 0u;
+        if (!QueueSoundFontLoad(widePath, requestId)) {
+            strncpy_s(resultText, kText, "SoundFont loader is unavailable",
                       _TRUNCATE);
             return svms::RLResult::LoadFailed;
         }
+        snprintf(resultText, kText, "loading request %llu",
+                 static_cast<unsigned long long>(requestId));
+        return svms::RLResult::Ok;
+    }
+
+    case RT::QuerySoundFontLoad: {
+        ReclaimRetiredSoundFonts();
+        const uint32_t state = soundFontLoadState_.load(
+            std::memory_order_acquire);
+        const uint64_t requested = soundFontRequestId_.load(
+            std::memory_order_acquire);
+        const uint64_t activated = soundFontActivatedId_.load(
+            std::memory_order_acquire);
+        std::string error;
+        EnterCriticalSection(&cs);
+        error = soundFontLoadError_;
+        LeaveCriticalSection(&cs);
+        snprintf(resultText, kText, "%u\t%llu\t%llu\t%s", state,
+                 static_cast<unsigned long long>(requested),
+                 static_cast<unsigned long long>(activated), error.c_str());
         return svms::RLResult::Ok;
     }
 
@@ -2464,6 +2528,10 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
 // are touched here: every per-block counter travels through the snapshot.
 #if !defined(SVMS_XP_COMPAT)
 svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
+    // This control thread is the sole reclaimer. Draining before reading the
+    // active pointer ensures a bundle retired concurrently after the load
+    // remains alive until the next telemetry pass.
+    ReclaimRetiredSoundFonts();
     // Wide→UTF-8 for the SoundFont name broadcast (local helper; the
     // SVMSConfig.cpp copy of WideToUtf8 is not exported via the header).
     auto wideToUtf8 = [](const std::wstring& value) -> std::string {
@@ -2567,8 +2635,9 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
     }
     snap.live = appliedLiveEcho_;
 
-    if (loadedSoundFontPath_[0] != L'\0') {
-        std::string narrow = wideToUtf8(loadedSoundFontPath_);
+    const std::wstring activePath = CopyActiveSoundFontPath();
+    if (!activePath.empty()) {
+        std::string narrow = wideToUtf8(activePath);
         strncpy_s(snap.soundFontName, sizeof(snap.soundFontName),
                   narrow.c_str(), _TRUNCATE);
     }
@@ -2606,6 +2675,38 @@ struct PreparedSF2Region {
     uint32_t releaseSamples;
     uint8_t valid;
 };
+
+// One SoundFont load produces one self-contained immutable bundle.  The
+// loader owns and fills every field before publication; after that only the
+// audio thread reads the payload.  retiredNext is lifecycle metadata used by
+// the lock-free audio->control retirement stack and is never render data.
+struct SoundFontBundle {
+    SF2Data* data = nullptr;
+    float* sampleData = nullptr;
+    SF2Sample* samples = nullptr;
+    float* regionInitialPeaks = nullptr;
+    PreparedSF2Region* preparedRegions = nullptr;
+    uint32_t sampleCount = 0u;
+    uint32_t sampleDataFrames = 0u;
+    uint32_t regionInitialPeakCount = 0u;
+    uint32_t preparedRegionCount = 0u;
+    uint64_t requestId = 0u;
+    std::wstring path;
+    SoundFontBundle* retiredNext = nullptr;
+};
+
+static void DestroySoundFontBundle(SoundFontBundle* bundle) noexcept {
+    if (!bundle) return;
+    free(bundle->regionInitialPeaks);
+    free(bundle->preparedRegions);
+    free(bundle->sampleData);
+    free(bundle->samples);
+    if (bundle->data) {
+        sf2_free(bundle->data);
+        delete bundle->data;
+    }
+    delete bundle;
+}
 
 static void PrepareSF2Region(const SF2Data* data, const SFSampleRegion& region,
                              uint32_t outputRate, ChannelCache* channelCache,
@@ -2716,11 +2817,13 @@ Driver::Driver()
     reverb.Reset();
     limiter.Reset();
     InitializeCriticalSection(&cs);
+    InitializeCriticalSection(&soundFontBuildCs_);
 }
 
 Driver::~Driver() {
     Shutdown();
     if (eventBuffer) { _aligned_free(eventBuffer); eventBuffer = nullptr; }
+    DeleteCriticalSection(&soundFontBuildCs_);
     DeleteCriticalSection(&cs);
 }
 
@@ -2954,6 +3057,19 @@ bool Driver::Initialize() {
             useEventCompiler_ = false;
         }
     }
+
+    soundFontLoaderStop_.store(false, std::memory_order_release);
+    soundFontLoadState_.store(0u, std::memory_order_relaxed);
+    soundFontLoadEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (soundFontLoadEvent_) {
+        try {
+            soundFontLoaderThread_ =
+                std::thread(&Driver::SoundFontLoaderLoop, this);
+        } catch (...) {
+            CloseHandle(soundFontLoadEvent_);
+            soundFontLoadEvent_ = nullptr;
+        }
+    }
 #endif
 
     initialized = true;
@@ -2984,6 +3100,13 @@ void Driver::Shutdown() {
 #if !defined(SVMS_XP_COMPAT)
     g_rlDriver.Shutdown();
     liveRecorder_.Stop();
+    soundFontLoaderStop_.store(true, std::memory_order_release);
+    if (soundFontLoadEvent_) SetEvent(soundFontLoadEvent_);
+    if (soundFontLoaderThread_.joinable()) soundFontLoaderThread_.join();
+    if (soundFontLoadEvent_) {
+        CloseHandle(soundFontLoadEvent_);
+        soundFontLoadEvent_ = nullptr;
+    }
 #endif
 
     cancelProducers_.store(true, std::memory_order_release);
@@ -3013,30 +3136,11 @@ void Driver::Shutdown() {
     delete channelCache; channelCache = nullptr;
     delete renderScalar; renderScalar = nullptr;
     delete configSnapshot; configSnapshot = nullptr;
-    free(regionInitialPeaks); regionInitialPeaks = nullptr;
-    regionInitialPeakCount = 0;
-    free(preparedRegions); preparedRegions = nullptr;
-    preparedRegionCount = 0;
     _aligned_free(leftBuffer); leftBuffer = nullptr;
     _aligned_free(rightBuffer); rightBuffer = nullptr;
     bufferCapacity = 0;
 
-    if (soundFontData) {
-        bool ownsResampled = (sampleDataStore == soundFontData->resampledData);
-        bool ownsRawSamples = (sampleDataStore && !ownsResampled);
-        if (ownsRawSamples && sampleDataStore != (void*)(soundFontData->sampleData)) {
-            free(sampleDataStore);
-        }
-        sampleDataStore = nullptr;
-        soundFontData->resampledData = nullptr;
-        free(samplesStore); samplesStore = nullptr;
-        sf2_free(soundFontData);
-        delete soundFontData;
-        soundFontData = nullptr;
-    } else {
-        free(sampleDataStore); sampleDataStore = nullptr;
-        free(samplesStore); samplesStore = nullptr;
-    }
+    DestroyAllSoundFontBundles();
 
     if (diagnosticsEnabled_ && (diagnosticsWindow_ || diagnosticsDebugOutput_))
         DiagWindow_Destroy();
@@ -3067,23 +3171,25 @@ bool Driver::LoadConfiguredSoundFont() {
     return loaded;
 }
 
-bool Driver::LoadSoundFont(const wchar_t* path) {
-    if (!path) return false;
-
-    // Parsing and sample conversion happen on the calling thread. If a host
-    // requests a reload while audio is active, stop and join first so the
-    // callback can never observe partially replaced SF2/sample storage.
-    const bool restartAudio = audioOutput && audioOutput->IsRunning();
-    if (restartAudio) audioOutput->Stop();
-    struct RestartAudioGuard {
-        AudioOutput* output;
-        bool restart;
-        ~RestartAudioGuard() { if (restart && output) output->Start(); }
-    } restartGuard{audioOutput, restartAudio};
-
-    EnterCriticalSection(&cs);
-
-    SF2Data* sf2 = new SF2Data();
+SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
+                                               uint64_t requestId,
+                                               std::string& error) {
+    error.clear();
+    if (!path || !*path) {
+        error = "no SoundFont path supplied";
+        return nullptr;
+    }
+    SoundFontBundle* bundle = new (std::nothrow) SoundFontBundle();
+    SF2Data* sf2 = new (std::nothrow) SF2Data();
+    if (!bundle || !sf2) {
+        delete bundle;
+        delete sf2;
+        error = "not enough memory to load SoundFont";
+        return nullptr;
+    }
+    bundle->data = sf2;
+    bundle->requestId = requestId;
+    bundle->path = path;
     if (!sf2_load(path, sf2)) {
         LOG("  sf2_load FAILED: presets=%u inst=%u samples=%u sampleData=%d frames=%u",
             sf2->presetCount, sf2->instrumentCount, sf2->sampleCount,
@@ -3097,9 +3203,9 @@ bool Driver::LoadSoundFont(const wchar_t* path) {
         } else {
             LOG("  File access error: %u", (unsigned)GetLastError());
         }
-        delete sf2;
-        LeaveCriticalSection(&cs);
-        return false;
+        error = "SoundFont parse failed";
+        DestroySoundFontBundle(bundle);
+        return nullptr;
     }
     LOG("  Parsed: %u presets, %u instruments, %u samples, %u frames",
         sf2->presetCount, sf2->instrumentCount, sf2->sampleCount, sf2->sampleDataFrames);
@@ -3108,96 +3214,256 @@ bool Driver::LoadSoundFont(const wchar_t* path) {
     LOG("  Built %u regions", sf2->regionCount);
     if (sf2->regionOverflow) {
         LOG("  FAILED: SoundFont compiled region capacity exceeded");
-        sf2_free(sf2);
-        delete sf2;
-        LeaveCriticalSection(&cs);
-        return false;
+        error = "SoundFont compiled region capacity exceeded";
+        DestroySoundFontBundle(bundle);
+        return nullptr;
     }
-
-    if (soundFontData) {
-        free(regionInitialPeaks); regionInitialPeaks = nullptr;
-        regionInitialPeakCount = 0;
-        free(preparedRegions); preparedRegions = nullptr;
-        preparedRegionCount = 0;
-        free(sampleDataStore); sampleDataStore = nullptr;
-        free(samplesStore); samplesStore = nullptr;
-        sf2_free(soundFontData);
-        delete soundFontData;
-    }
-    soundFontData = sf2;
-    if (++soundFontGeneration_ == 0u) {
-        soundFontGeneration_ = 1u;
-        std::memset(noteLaunchPlanCache_, 0,
-                    sizeof(noteLaunchPlanCache_));
-    }
-    // Region pointers are immutable for one SoundFont bundle.  Reset the
-    // direct-mapped note lookup cache at the swap boundary so callback-side
-    // note-ons can never observe indices from the retired bundle.
-    std::memset(noteRegionCache_, 0xff, sizeof(noteRegionCache_));
-
     // Diagnostic peak inspection walks up to 512 source samples.  Doing
     // that for every configured voice made diagnostics catastrophically
     // expensive in dense MIDI.  Compile the immutable values once while
     // loading off the audio thread; note-on becomes a single cached read.
     if (sf2->regionCount != 0u) {
-        regionInitialPeaks = static_cast<float*>(
+        bundle->regionInitialPeaks = static_cast<float*>(
             malloc(static_cast<size_t>(sf2->regionCount) * sizeof(float)));
-        if (regionInitialPeaks) {
-            regionInitialPeakCount = sf2->regionCount;
+        if (bundle->regionInitialPeaks) {
+            bundle->regionInitialPeakCount = sf2->regionCount;
             for (uint32_t region = 0; region < sf2->regionCount; ++region) {
-                regionInitialPeaks[region] =
+                bundle->regionInitialPeaks[region] =
                     sf2_region_initial_peak(sf2, &sf2->regions[region]);
             }
         }
-        preparedRegions = static_cast<PreparedSF2Region*>(malloc(
+        bundle->preparedRegions = static_cast<PreparedSF2Region*>(malloc(
             static_cast<size_t>(sf2->regionCount) * sizeof(PreparedSF2Region)));
-        if (preparedRegions) {
-            preparedRegionCount = sf2->regionCount;
+        if (bundle->preparedRegions) {
+            bundle->preparedRegionCount = sf2->regionCount;
             for (uint32_t region = 0; region < sf2->regionCount; ++region) {
                 PrepareSF2Region(sf2, sf2->regions[region], sampleRate,
-                                 channelCache, preparedRegions[region]);
+                                 channelCache, bundle->preparedRegions[region]);
             }
         }
-    }
-
-    // Establish the initial selected preset for every channel.  Future
-    // invalid program changes do not overwrite this committed selection.
-    if (channelCache) {
-        for (uint8_t ch = 0; ch < kChannelCount; ++ch) {
-            uint32_t presetIndex = 0;
-            if (ResolveChannelPreset(soundFontData, *channelCache, ch, &presetIndex)) {
-                channelCache->SetSelectedPreset(ch, static_cast<uint16_t>(presetIndex));
-            } else {
-                channelCache->SetSelectedPreset(ch, UINT16_MAX);
-            }
+        if (!bundle->preparedRegions) {
+            error = "not enough memory to prepare SoundFont regions";
+            DestroySoundFontBundle(bundle);
+            return nullptr;
         }
     }
 
     if (sf2->sampleData) {
-        uint32_t frames = sf2->sampleDataFrames;
+        const uint32_t frames = sf2->sampleDataFrames;
         float* fbuf = static_cast<float*>(malloc(frames * sizeof(float)));
-        if (fbuf) {
-            for (uint32_t i = 0; i < frames; ++i) {
-                fbuf[i] = sf2->sampleData[i] / 32768.0f;
-            }
-            sampleDataStore = fbuf;
+        if (!fbuf) {
+            error = "not enough memory to convert SoundFont samples";
+            DestroySoundFontBundle(bundle);
+            return nullptr;
         }
-        sampleDataFrames = frames;
+        for (uint32_t i = 0; i < frames; ++i)
+            fbuf[i] = sf2->sampleData[i] / 32768.0f;
+        bundle->sampleData = fbuf;
+        bundle->sampleDataFrames = frames;
     }
 
-    uint32_t sampCount = sf2->sampleCount;
-    SF2Sample* sampBuf = static_cast<SF2Sample*>(malloc(sampCount * sizeof(SF2Sample)));
-    if (sampBuf) {
-        std::memcpy(sampBuf, sf2->samples, sampCount * sizeof(SF2Sample));
+    const uint32_t sampCount = sf2->sampleCount;
+    if (sampCount != 0u) {
+        bundle->samples = static_cast<SF2Sample*>(
+            malloc(static_cast<size_t>(sampCount) * sizeof(SF2Sample)));
+        if (!bundle->samples) {
+            error = "not enough memory to cache SoundFont sample headers";
+            DestroySoundFontBundle(bundle);
+            return nullptr;
+        }
+        std::memcpy(bundle->samples, sf2->samples,
+                    static_cast<size_t>(sampCount) * sizeof(SF2Sample));
     }
-    samplesStore = sampBuf;
-    sampleStoreCount = sampCount;
+    bundle->sampleCount = sampCount;
+    if (!bundle->sampleData || bundle->sampleDataFrames == 0u ||
+        !bundle->samples || bundle->sampleCount == 0u) {
+        error = "SoundFont contains no usable sample data";
+        DestroySoundFontBundle(bundle);
+        return nullptr;
+    }
+    LOG("  SoundFont bundle ready: %u samples cached", sampCount);
+    return bundle;
+}
 
-    LOG("  LoadSoundFont SUCCESS: %u samples cached", sampCount);
-    wcsncpy_s(loadedSoundFontPath_, MAX_PATH, path, _TRUNCATE);
-    LeaveCriticalSection(&cs);
+void Driver::RetireSoundFontBundle(SoundFontBundle* bundle) noexcept {
+    if (!bundle) return;
+    SoundFontBundle* head = retiredSoundFontBundles_.load(
+        std::memory_order_relaxed);
+    do {
+        bundle->retiredNext = head;
+    } while (!retiredSoundFontBundles_.compare_exchange_weak(
+        head, bundle, std::memory_order_release, std::memory_order_relaxed));
+}
+
+void Driver::ReclaimRetiredSoundFonts() noexcept {
+    SoundFontBundle* bundle = retiredSoundFontBundles_.exchange(
+        nullptr, std::memory_order_acquire);
+    while (bundle) {
+        SoundFontBundle* next = bundle->retiredNext;
+        DestroySoundFontBundle(bundle);
+        bundle = next;
+    }
+}
+
+std::wstring Driver::CopyActiveSoundFontPath() const {
+    SoundFontBundle* bundle = activeSoundFontBundle_.load(
+        std::memory_order_acquire);
+    return bundle ? bundle->path : std::wstring();
+}
+
+void Driver::PublishSoundFontBundle(SoundFontBundle* bundle) noexcept {
+    SoundFontBundle* superseded = pendingSoundFontBundle_.exchange(
+        bundle, std::memory_order_acq_rel);
+    // Publication runs off the callback. A pending bundle that lost the race
+    // was never visible to rendering and can be reclaimed immediately here.
+    DestroySoundFontBundle(superseded);
+}
+
+void Driver::ActivatePendingSoundFontAtBlockBoundary() noexcept {
+    SoundFontBundle* next = pendingSoundFontBundle_.exchange(
+        nullptr, std::memory_order_acquire);
+    if (!next) return;
+
+    // Voice sample locations are offsets into one bundle. Old voices must not
+    // survive into the new sample bank; MIDI channel/program/controller state
+    // remains intact and is remapped below.
+    if (voiceManager) voiceManager->Reset();
+
+    soundFontData = next->data;
+    sampleDataStore = next->sampleData;
+    samplesStore = next->samples;
+    regionInitialPeaks = next->regionInitialPeaks;
+    preparedRegions = next->preparedRegions;
+    sampleStoreCount = next->sampleCount;
+    sampleDataFrames = next->sampleDataFrames;
+    regionInitialPeakCount = next->regionInitialPeakCount;
+    preparedRegionCount = next->preparedRegionCount;
+
+    if (++soundFontGeneration_ == 0u) {
+        soundFontGeneration_ = 1u;
+        std::memset(noteLaunchPlanCache_, 0, sizeof(noteLaunchPlanCache_));
+    }
+    std::memset(noteRegionCache_, 0xff, sizeof(noteRegionCache_));
+    RefreshSelectedPresets();
+    for (uint32_t channel = 0; channel < kChannelCount; ++channel)
+        ++channelLaunchRevision_[channel];
+    nextPlayIndex_ = 1u;
+
+    SoundFontBundle* old = activeSoundFontBundle_.exchange(
+        next, std::memory_order_release);
+    soundFontActivatedId_.store(next->requestId, std::memory_order_release);
+#if !defined(SVMS_XP_COMPAT)
+    if (soundFontRequestId_.load(std::memory_order_acquire) == next->requestId)
+        soundFontLoadState_.store(3u, std::memory_order_release);
+#endif
+    RetireSoundFontBundle(old);
+}
+
+void Driver::DestroyAllSoundFontBundles() noexcept {
+    DestroySoundFontBundle(pendingSoundFontBundle_.exchange(
+        nullptr, std::memory_order_acq_rel));
+    DestroySoundFontBundle(activeSoundFontBundle_.exchange(
+        nullptr, std::memory_order_acq_rel));
+    ReclaimRetiredSoundFonts();
+    soundFontData = nullptr;
+    sampleDataStore = nullptr;
+    samplesStore = nullptr;
+    regionInitialPeaks = nullptr;
+    preparedRegions = nullptr;
+    sampleStoreCount = sampleDataFrames = 0u;
+    regionInitialPeakCount = preparedRegionCount = 0u;
+}
+
+bool Driver::LoadSoundFont(const wchar_t* path) {
+    if (!path || !*path) return false;
+    const uint64_t requestId = soundFontRequestId_.fetch_add(
+        1u, std::memory_order_acq_rel) + 1u;
+    std::string error;
+    EnterCriticalSection(&soundFontBuildCs_);
+    SoundFontBundle* bundle = BuildSoundFontBundle(path, requestId, error);
+    LeaveCriticalSection(&soundFontBuildCs_);
+    if (!bundle) return false;
+#if !defined(SVMS_XP_COMPAT)
+    soundFontLoadState_.store(2u, std::memory_order_release);
+#endif
+    PublishSoundFontBundle(bundle);
+    if (!audioOutput || !audioOutput->IsRunning()) {
+        ActivatePendingSoundFontAtBlockBoundary();
+#if defined(SVMS_XP_COMPAT)
+        ReclaimRetiredSoundFonts();
+#endif
+    }
+
     return true;
 }
+
+#if !defined(SVMS_XP_COMPAT)
+bool Driver::QueueSoundFontLoad(const std::wstring& path,
+                                uint64_t& requestId) {
+    requestId = 0u;
+    if (path.empty() || !soundFontLoadEvent_ ||
+        soundFontLoaderStop_.load(std::memory_order_acquire)) return false;
+    requestId = soundFontRequestId_.fetch_add(
+        1u, std::memory_order_acq_rel) + 1u;
+    EnterCriticalSection(&cs);
+    requestedSoundFontPath_ = path;
+    requestedSoundFontId_ = requestId;
+    soundFontLoadError_.clear();
+    soundFontLoadState_.store(1u, std::memory_order_release);
+    LeaveCriticalSection(&cs);
+    SetEvent(soundFontLoadEvent_);
+    return true;
+}
+
+void Driver::SoundFontLoaderLoop() {
+    uint64_t handledId = 0u;
+    for (;;) {
+        WaitForSingleObject(soundFontLoadEvent_, INFINITE);
+        if (soundFontLoaderStop_.load(std::memory_order_acquire)) break;
+
+        for (;;) {
+            std::wstring path;
+            uint64_t requestId = 0u;
+            EnterCriticalSection(&cs);
+            requestId = requestedSoundFontId_;
+            path = requestedSoundFontPath_;
+            LeaveCriticalSection(&cs);
+            if (requestId == 0u || requestId == handledId) break;
+            handledId = requestId;
+
+            std::string error;
+            EnterCriticalSection(&soundFontBuildCs_);
+            SoundFontBundle* bundle = BuildSoundFontBundle(
+                path.c_str(), requestId, error);
+            LeaveCriticalSection(&soundFontBuildCs_);
+
+            if (soundFontLoaderStop_.load(std::memory_order_acquire)) {
+                DestroySoundFontBundle(bundle);
+                return;
+            }
+            if (soundFontRequestId_.load(std::memory_order_acquire) !=
+                    requestId) {
+                DestroySoundFontBundle(bundle);
+                continue;
+            }
+            if (!bundle) {
+                EnterCriticalSection(&cs);
+                soundFontLoadError_ = error.empty()
+                    ? "SoundFont load failed" : error;
+                LeaveCriticalSection(&cs);
+                soundFontLoadState_.store(4u, std::memory_order_release);
+                continue;
+            }
+
+            soundFontLoadState_.store(2u, std::memory_order_release);
+            PublishSoundFontBundle(bundle);
+            if (!audioOutput || !audioOutput->IsRunning()) {
+                ActivatePendingSoundFontAtBlockBoundary();
+            }
+        }
+    }
+}
+#endif
 
 bool Driver::IsInitialized() const {
     return initialized;
@@ -3684,6 +3950,11 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     Driver* self = static_cast<Driver*>(userData);
     if (!self || !self->initialized) return;
     ++self->callbackCount_;
+
+    // The immutable bundle was fully parsed and prepared by a non-audio
+    // thread.  Activation is one pointer handoff at the callback boundary;
+    // no allocation, file access, lock, or device restart occurs here.
+    self->ActivatePendingSoundFontAtBlockBoundary();
 
     VoiceManager* vm = self->voiceManager;
     ChannelCache* cc = self->channelCache;
