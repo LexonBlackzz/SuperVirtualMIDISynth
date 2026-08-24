@@ -1,0 +1,39 @@
+name: Windows AV smoke - no CreateProcess
+
+on:
+  push:
+    branches: [av-createprocess-smoke]
+  workflow_dispatch:
+
+jobs:
+  windows-x64-av-smoke:
+    name: Windows x64 AV smoke
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disable offline CreateProcessW call
+        shell: pwsh
+        run: |
+          $path = "src/V3/Configurator/PageOffline.cpp"
+          $content = Get-Content $path -Raw
+          $pattern = '(?s)    const BOOL created = CreateProcessW\(\s*renderer\.c_str\(\), mutableCommand\.data\(\), nullptr, nullptr, TRUE,\s*CREATE_NO_WINDOW, nullptr, ExecutableDirectory\(\)\.c_str\(\),\s*&startup, &processInfo\);'
+          $replacement = '    const BOOL created = FALSE; // AV smoke test: child process disabled'
+          $patched = [regex]::Replace($content, $pattern, $replacement, 1)
+          if ($patched -eq $content) {
+            throw "CreateProcessW block was not found; refusing to build an invalid smoke test."
+          }
+          Set-Content -Path $path -Value $patched -Encoding utf8NoBOM -NoNewline
+
+      - name: Build V3 x64 Release
+        shell: cmd
+        run: call build_v3.bat
+
+      - name: Upload AV smoke Configurator
+        uses: actions/upload-artifact@v4
+        with:
+          name: SVMS-V3-av-smoke-no-createprocess
+          path: build/V3/bin/SVMSConfigurator.exe
+          if-no-files-found: error
