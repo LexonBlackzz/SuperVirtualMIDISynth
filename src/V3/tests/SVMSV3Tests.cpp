@@ -2067,6 +2067,22 @@ void TestFairPriorityLaneDrain() {
               ingress.LaneCapacity(svms::EventLane::State) == 133334u &&
               ingress.LaneCapacity(svms::EventLane::Quiet) == 33335u,
           "priority ingress derives exact runtime lane capacities");
+    svms::TimestampedMidiEvent batch[17]{};
+    for (uint32_t i = 0u; i < 17u; ++i) {
+        batch[i].sequence = 1000u + i;
+        batch[i].message = 0x90u | ((40u + i) << 8u) | (127u << 16u);
+        batch[i].qpcTimestamp = 5000u + i;
+    }
+    Check(ingress.TryPushBatch(svms::EventLane::Medium, batch, 17u),
+          "MPSC lane reserves a contiguous producer batch");
+    for (uint32_t i = 0u; i < 17u; ++i) {
+        svms::TimestampedMidiEvent event{};
+        Check(ingress.TryPop(svms::EventLane::Medium, event) &&
+                  event.sequence == batch[i].sequence &&
+                  event.message == batch[i].message &&
+                  event.qpcTimestamp == batch[i].qpcTimestamp,
+              "MPSC batch publication preserves FIFO payload order");
+    }
     for (uint32_t i = 0u; i < 64u; ++i) {
         svms::TimestampedMidiEvent state{};
         state.sequence = i * 2u;
@@ -2174,12 +2190,25 @@ void TestFourProducerMPSCIntegrity() {
         producers.emplace_back([&, producer] {
             ready.fetch_add(1, std::memory_order_release);
             while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-            for (uint32_t i = 0; i < eventsPerProducer; ++i) {
-                svms::TimestampedMidiEvent event{};
-                event.sequence = producer * eventsPerProducer + i;
-                event.message = 0x90u | ((60u + producer) << 8) | (127u << 16);
-                event.qpcTimestamp = event.sequence * 17ull;
-                while (!queue.TryPush(event)) std::this_thread::yield();
+            for (uint32_t i = 0; i < eventsPerProducer;) {
+                constexpr uint32_t batchCount = 8u;
+                svms::TimestampedMidiEvent batch[batchCount]{};
+                const uint32_t count = (producer & 1u) != 0u
+                    ? (std::min)(batchCount, eventsPerProducer - i) : 1u;
+                for (uint32_t j = 0u; j < count; ++j) {
+                    auto& event = batch[j];
+                    event.sequence = producer * eventsPerProducer + i + j;
+                    event.message = 0x90u | ((60u + producer) << 8) |
+                        (127u << 16);
+                    event.qpcTimestamp = event.sequence * 17ull;
+                }
+                if (count > 1u) {
+                    while (!queue.TryPushBatch(batch, count))
+                        std::this_thread::yield();
+                } else {
+                    while (!queue.TryPush(batch[0])) std::this_thread::yield();
+                }
+                i += count;
             }
         });
     }

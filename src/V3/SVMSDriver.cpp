@@ -1946,6 +1946,11 @@ public:
         uint32_t msg, uint64_t qpcTimestamp,
         const std::atomic<uint64_t>* externalCancellation,
         uint64_t cancellationToken);
+    bool SubmitShortBatchAtQpcCancellable(
+        const SVMS_ShortEvent* events, uint32_t eventCount,
+        uint64_t immediateQpc,
+        const std::atomic<uint64_t>* externalCancellation,
+        uint64_t cancellationToken);
     bool SubmitShortMsgAtFrameCancellable(
         uint32_t msg, uint64_t outputFrame,
         const std::atomic<uint64_t>* externalCancellation,
@@ -1988,6 +1993,7 @@ private:
                              uint32_t blockOffset);
     void HandleProgramChange(uint8_t channel, uint8_t program);
     void HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb);
+    uint32_t RefreshVelocityCutoff(EventLane lane) noexcept;
     void EventCompilerLoop();
     SoundFontBundle* BuildSoundFontBundle(const wchar_t* path,
                                           uint64_t requestId,
@@ -3597,6 +3603,45 @@ void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
     (void)SubmitShortMsgAtQpcCancellable(msg, qpcTimestamp, nullptr, 0u);
 }
 
+uint32_t Driver::RefreshVelocityCutoff(EventLane lane) noexcept {
+    const uint32_t rawIngress = midiIngress_.TotalSize();
+    const uint32_t compiledIngress = compiledPages_.ReadyEventCount();
+    const uint32_t scheduled =
+        scheduledSizePublished_.load(std::memory_order_acquire);
+    const uint32_t rawIngressPressure = static_cast<uint32_t>(
+        static_cast<uint64_t>(rawIngress) * 100u /
+        midiIngress_.TotalCapacity());
+    const uint32_t compiledCapacity = pagedScheduler_.Capacity();
+    const uint32_t compiledIngressPressure = compiledCapacity != 0u
+        ? static_cast<uint32_t>(
+              static_cast<uint64_t>(compiledIngress) * 100u /
+              compiledCapacity)
+        : 100u;
+    const uint32_t laneCapacity = midiIngress_.LaneCapacity(lane);
+    const uint32_t lanePressure = static_cast<uint32_t>(
+        static_cast<uint64_t>(midiIngress_.LaneSize(lane)) * 100u /
+        laneCapacity);
+    const uint32_t scheduledCapacity = useEventCompiler_
+        ? pagedScheduler_.Capacity() : eventScheduler_.Capacity();
+    const uint32_t scheduledPressure = scheduledCapacity != 0u
+        ? static_cast<uint32_t>(
+              static_cast<uint64_t>(scheduled) * 100u /
+              scheduledCapacity)
+        : 100u;
+    const uint32_t pressure = (std::max)(
+        lanePressure,
+        (std::max)(rawIngressPressure,
+            (std::max)(compiledIngressPressure, scheduledPressure)));
+    uint32_t cutoff = 1u;
+    if (pressure > shedStartPercent_) {
+        const uint32_t range = 100u - shedStartPercent_;
+        cutoff = 1u +
+            ((std::min)(pressure - shedStartPercent_, range) * 94u) / range;
+    }
+    currentVelocityCutoffAtomic_.store(cutoff, std::memory_order_relaxed);
+    return cutoff;
+}
+
 bool Driver::SubmitShortMsgAtQpcCancellable(
     uint32_t msg, uint64_t qpcTimestamp,
     const std::atomic<uint64_t>* externalCancellation,
@@ -3644,45 +3689,7 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
     uint32_t cutoff = currentVelocityCutoffAtomic_.load(
         std::memory_order_relaxed);
     if ((evt.sequence & 0xffu) == 0u) {
-        const uint32_t rawIngress = midiIngress_.TotalSize();
-        const uint32_t compiledIngress = compiledPages_.ReadyEventCount();
-        const uint32_t scheduled =
-            scheduledSizePublished_.load(std::memory_order_acquire);
-        const uint32_t rawIngressPressure = static_cast<uint32_t>(
-            static_cast<uint64_t>(rawIngress) * 100u /
-            midiIngress_.TotalCapacity());
-        const uint32_t compiledCapacity = pagedScheduler_.Capacity();
-        const uint32_t compiledIngressPressure = compiledCapacity != 0u
-            ? static_cast<uint32_t>(
-                  static_cast<uint64_t>(compiledIngress) * 100u /
-                  compiledCapacity)
-            : 100u;
-        const uint32_t laneCapacity =
-            midiIngress_.LaneCapacity(lane);
-        const uint32_t lanePressure = static_cast<uint32_t>(
-            static_cast<uint64_t>(midiIngress_.LaneSize(lane)) * 100u /
-            laneCapacity);
-        const uint32_t scheduledCapacity = useEventCompiler_
-            ? pagedScheduler_.Capacity()
-            : eventScheduler_.Capacity();
-        const uint32_t scheduledPressure = scheduledCapacity != 0u
-            ? static_cast<uint32_t>(
-                  static_cast<uint64_t>(scheduled) * 100u /
-                  scheduledCapacity)
-            : 100u;
-        const uint32_t pressure = (std::max)(
-            lanePressure,
-            (std::max)(rawIngressPressure,
-                (std::max)(compiledIngressPressure, scheduledPressure)));
-        cutoff = 1u;
-        if (pressure > shedStartPercent_) {
-            const uint32_t range = 100u - shedStartPercent_;
-            cutoff = 1u +
-                ((std::min)(pressure - shedStartPercent_, range) * 94u) /
-                    range;
-        }
-        currentVelocityCutoffAtomic_.store(cutoff,
-                                            std::memory_order_relaxed);
+        cutoff = RefreshVelocityCutoff(lane);
     }
 
     const EventOverflowMode overflowMode =
@@ -3737,6 +3744,95 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
         uint32_t observed = producerWakeEpoch_.load(std::memory_order_acquire);
         WaitForAddressChange(producerWakeEpoch_, observed);
     }
+}
+
+bool Driver::SubmitShortBatchAtQpcCancellable(
+    const SVMS_ShortEvent* events, uint32_t eventCount,
+    uint64_t immediateQpc,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
+    if (!events && eventCount != 0u) return false;
+
+    // Full-velocity Black MIDI batches overwhelmingly occupy the loud lane.
+    // Keep mixed/state/priority-shedding batches on the established per-event
+    // path; homogeneous protected note-ons can reserve 256 lane cells with
+    // one producer CAS while retaining one global sequence per event.
+    bool homogeneousLoudNotes = eventCount != 0u;
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        const uint32_t message = events[i].packed_message;
+        const uint8_t status = static_cast<uint8_t>(message & 0xffu);
+        const uint8_t velocity = static_cast<uint8_t>(
+            (message >> 16u) & 0x7fu);
+        if ((status & 0xf0u) != 0x90u || velocity == 0u ||
+            velocity < highPriorityVelocity_) {
+            homogeneousLoudNotes = false;
+            break;
+        }
+    }
+    if (!homogeneousLoudNotes) {
+        for (uint32_t i = 0u; i < eventCount; ++i) {
+            const uint64_t timestamp = events[i].timestamp_qpc != 0u
+                ? events[i].timestamp_qpc : immediateQpc;
+            if (!SubmitShortMsgAtQpcCancellable(
+                    events[i].packed_message, timestamp,
+                    externalCancellation, cancellationToken)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    constexpr uint32_t kBatchReservation = 256u;
+    TimestampedMidiEvent prepared[kBatchReservation]{};
+    uint32_t cursor = 0u;
+    while (cursor < eventCount) {
+        if (cancelProducers_.load(std::memory_order_acquire) ||
+            (externalCancellation && externalCancellation->load(
+                std::memory_order_acquire) == cancellationToken)) {
+            cancelledAtomic_.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+        const uint32_t laneCapacity = midiIngress_.LaneCapacity(EventLane::Loud);
+        const uint32_t count = (std::min)(
+            eventCount - cursor,
+            (std::min)(kBatchReservation, laneCapacity));
+        submittedAtomic_.fetch_add(count, std::memory_order_relaxed);
+        const uint32_t firstSequence = nextEventSequence_.fetch_add(
+            count, std::memory_order_relaxed);
+        for (uint32_t i = 0u; i < count; ++i) {
+            const SVMS_ShortEvent& source = events[cursor + i];
+            prepared[i].message = source.packed_message;
+            prepared[i].sequence = firstSequence + i;
+            prepared[i].qpcTimestamp = source.timestamp_qpc != 0u
+                ? source.timestamp_qpc : immediateQpc;
+        }
+        // Maintain the same pressure-sampling cadence as individual pushes.
+        RefreshVelocityCutoff(EventLane::Loud);
+        for (;;) {
+            if (midiIngress_.TryPushBatch(
+                    EventLane::Loud, prepared, count)) {
+                acceptedAtomic_.fetch_add(count, std::memory_order_relaxed);
+                if (compilerSleeping_.exchange(
+                        false, std::memory_order_acq_rel)) {
+                    compilerWakeEpoch_.fetch_add(1u,
+                                                  std::memory_order_release);
+                    WakeAddressWaiters(compilerWakeEpoch_);
+                }
+                cursor += count;
+                break;
+            }
+            if (cancelProducers_.load(std::memory_order_acquire) ||
+                (externalCancellation && externalCancellation->load(
+                    std::memory_order_acquire) == cancellationToken)) {
+                cancelledAtomic_.fetch_add(1u, std::memory_order_relaxed);
+                return false;
+            }
+            const uint32_t observed = producerWakeEpoch_.load(
+                std::memory_order_acquire);
+            WaitForAddressChange(producerWakeEpoch_, observed);
+        }
+    }
+    return true;
 }
 
 void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
@@ -5874,15 +5970,9 @@ static SVMS_Result SVMS_CALL NativeSendShortBatch(
     if (eventCount != 0u && !QueryPerformanceCounter(&immediate))
         return SVMS_RESULT_INTERNAL_ERROR;
     const uint64_t immediateQpc = static_cast<uint64_t>(immediate.QuadPart);
-    for (uint32_t i = 0u; i < eventCount; ++i) {
-        uint64_t timestampQpc = events[i].timestamp_qpc;
-        if (timestampQpc == 0u) timestampQpc = immediateQpc;
-        if (!g_driver->SubmitShortMsgAtQpcCancellable(
-                events[i].packed_message, timestampQpc, cancellation,
-                session))
-            return SVMS_RESULT_CANCELLED;
-    }
-    return SVMS_RESULT_OK;
+    return g_driver->SubmitShortBatchAtQpcCancellable(
+               events, eventCount, immediateQpc, cancellation, session)
+        ? SVMS_RESULT_OK : SVMS_RESULT_CANCELLED;
 }
 
 static SVMS_Result SVMS_CALL NativeSendSystemExclusive(

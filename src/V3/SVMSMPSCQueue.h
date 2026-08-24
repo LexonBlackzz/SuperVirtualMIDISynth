@@ -60,6 +60,47 @@ public:
         }
     }
 
+    // Reserve one contiguous producer range with a single CAS, then publish
+    // each cell in FIFO order. This is all-or-nothing so callers can retain
+    // their existing lossless backpressure and priority-shedding decisions.
+    bool TryPushBatch(const T* values, uint32_t count) noexcept {
+        if (count == 0u) return true;
+        if (!values || count > Capacity) return false;
+        uint64_t position = enqueue_.load(std::memory_order_relaxed);
+        for (;;) {
+            bool retry = false;
+            for (uint32_t i = 0u; i < count; ++i) {
+                Cell& cell = cells_[static_cast<size_t>(
+                    (position + i) & (Capacity - 1u))];
+                const uint64_t sequence =
+                    cell.sequence.load(std::memory_order_acquire);
+                const intptr_t difference = static_cast<intptr_t>(
+                    sequence - (position + i));
+                if (difference < 0) return false;
+                if (difference > 0) {
+                    position = enqueue_.load(std::memory_order_relaxed);
+                    retry = true;
+                    break;
+                }
+            }
+            if (retry) continue;
+            if (!enqueue_.compare_exchange_weak(
+                    position, position + count,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                continue;
+            }
+            for (uint32_t i = 0u; i < count; ++i) {
+                Cell& cell = cells_[static_cast<size_t>(
+                    (position + i) & (Capacity - 1u))];
+                cell.value = values[i];
+                cell.sequence.store(position + i + 1u,
+                                    std::memory_order_release);
+            }
+            return true;
+        }
+    }
+
     bool TryPop(T& value) noexcept {
         const uint64_t position = dequeue_.load(std::memory_order_relaxed);
         Cell& cell = cells_[position & (Capacity - 1u)];
@@ -151,6 +192,44 @@ public:
         }
     }
 
+    bool TryPushBatch(const T* values, uint32_t count) noexcept {
+        if (count == 0u) return true;
+        if (!cells_ || !values || count > capacity_) return false;
+        uint64_t position = enqueue_.load(std::memory_order_relaxed);
+        for (;;) {
+            bool retry = false;
+            for (uint32_t i = 0u; i < count; ++i) {
+                Cell& cell = cells_[static_cast<size_t>(
+                    (position + i) % capacity_)];
+                const uint64_t sequence =
+                    cell.sequence.load(std::memory_order_acquire);
+                const intptr_t difference = static_cast<intptr_t>(
+                    sequence - (position + i));
+                if (difference < 0) return false;
+                if (difference > 0) {
+                    position = enqueue_.load(std::memory_order_relaxed);
+                    retry = true;
+                    break;
+                }
+            }
+            if (retry) continue;
+            if (!enqueue_.compare_exchange_weak(
+                    position, position + count,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                continue;
+            }
+            for (uint32_t i = 0u; i < count; ++i) {
+                Cell& cell = cells_[static_cast<size_t>(
+                    (position + i) % capacity_)];
+                cell.value = values[i];
+                cell.sequence.store(position + i + 1u,
+                                    std::memory_order_release);
+            }
+            return true;
+        }
+    }
+
     bool TryPop(T& value) noexcept {
         if (!cells_) return false;
         const uint64_t position = dequeue_.load(std::memory_order_relaxed);
@@ -236,6 +315,19 @@ public:
             case EventLane::UpperMedium: return upperMedium_.TryPush(event);
             case EventLane::Medium: return medium_.TryPush(event);
             case EventLane::Quiet: return quiet_.TryPush(event);
+        }
+        return false;
+    }
+
+    bool TryPushBatch(EventLane lane, const T* events,
+                      uint32_t count) noexcept {
+        switch (lane) {
+            case EventLane::State: return state_.TryPushBatch(events, count);
+            case EventLane::Loud: return loud_.TryPushBatch(events, count);
+            case EventLane::UpperMedium:
+                return upperMedium_.TryPushBatch(events, count);
+            case EventLane::Medium: return medium_.TryPushBatch(events, count);
+            case EventLane::Quiet: return quiet_.TryPushBatch(events, count);
         }
         return false;
     }
