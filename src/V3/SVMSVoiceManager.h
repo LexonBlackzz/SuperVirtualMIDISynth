@@ -617,6 +617,7 @@ private:
     void VolatileHeapSiftUp(uint32_t position);
     void VolatileHeapSiftDown(uint32_t position);
     void RemoveVolatileHeapCandidate(VoiceHandle handle);
+    void RemoveReservedVolatileRoot(VoiceHandle handle);
     bool IsStableStealCandidate(VoiceHandle handle) const;
     float ComputeEffectiveStealLevel(VoiceHandle handle) const;
     float ComputeTailLevel(uint32_t tailSlot) const;
@@ -2793,6 +2794,33 @@ inline void VoiceManager::RemoveVolatileHeapCandidate(VoiceHandle handle) {
     }
 }
 
+inline void VoiceManager::RemoveReservedVolatileRoot(VoiceHandle handle) {
+    assert(handle < maxVoices_ && stealVolatileHeapValid_ &&
+           stealVolatileHeapCount_ != 0u &&
+           stealVolatileHeapHandle_[0] == handle &&
+           stealVolatileHeapPosition_[handle] == 0u);
+
+    const uint32_t lastHeap = --stealVolatileHeapCount_;
+    stealVolatileHeapPosition_[handle] = UINT32_MAX;
+    if (lastHeap != 0u) {
+        stealVolatileHeapKey_[0] = stealVolatileHeapKey_[lastHeap];
+        const uint32_t moved = stealVolatileHeapHandle_[lastHeap];
+        stealVolatileHeapHandle_[0] = moved;
+        stealVolatileHeapPosition_[moved] = 0u;
+        VolatileHeapSiftDown(0u);
+    }
+
+    const uint32_t listPosition = stealVolatilePosition_[handle];
+    assert(listPosition < stealVolatileCount_);
+    const uint32_t lastList = --stealVolatileCount_;
+    if (listPosition != lastList) {
+        const uint32_t moved = stealVolatileList_[lastList];
+        stealVolatileList_[listPosition] = moved;
+        stealVolatilePosition_[moved] = listPosition;
+    }
+    stealVolatilePosition_[handle] = UINT32_MAX;
+}
+
 inline void VoiceManager::RemoveStealCandidate(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     UnlinkVolatileCandidate(handle);
@@ -3281,7 +3309,7 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     CaptureStealTail(handle);
     if (volatileVictim) {
         stealCandidateReserved_[handle] = 0u;
-        RemoveStealCandidate(handle);
+        RemoveReservedVolatileRoot(handle);
     }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
     const uint64_t profileAfterTail = profileLaunch ? __rdtsc() : 0u;

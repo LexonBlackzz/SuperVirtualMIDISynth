@@ -403,6 +403,10 @@ larger phase containing that item is complete.
   exact 32-bit age window and on SSE2/XP. Heap construction falls about 23%;
   pinned single-core 6M-note throughput rises 1.8-2.9% with oracle-identical
   victims
+- [x] Commit a reserved volatile root through its known max-heap root and
+  compact-list positions instead of the generic remove/check/sift-up path.
+  The pinned 6M-note workload gains another 2.7-3.4% in total cycles and about
+  3% realized throughput with the same exhaustive-oracle victim sequence
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact
