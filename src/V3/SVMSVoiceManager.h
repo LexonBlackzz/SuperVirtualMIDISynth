@@ -3499,8 +3499,16 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
         const uint64_t treeBegin = BeginLaunchStageForTest();
 #endif
+        const bool selectedVolatileRoot =
+            stealCandidateReserved_[selected] == 1u &&
+            stealVolatileHeapValid_ && stealVolatileHeapCount_ != 0u &&
+            stealVolatileHeapHandle_[0] == selected &&
+            stealVolatileHeapPosition_[selected] == 0u;
         stealCandidateReserved_[selected] = 0u;
-        RemoveStealCandidate(selected);
+        if (selectedVolatileRoot)
+            RemoveReservedVolatileRoot(selected);
+        else
+            RemoveStealCandidate(selected);
         for (uint32_t i = 1u; i < count; ++i)
             RemoveStealCandidate(outHandles[i]);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
@@ -3525,8 +3533,10 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
 #endif
     for (uint32_t i = 0u; i < count; ++i) {
         const VoiceHandle handle = outHandles[i];
-        const bool preserveChannelIndex = candidatesReservedInPlace &&
-            v.channel[handle] == channel;
+        // Steal-index reservation and channel-list membership are independent.
+        // Replacing a grouped voice on the same channel can retain its exact
+        // dense channel slot even when the victim came from the volatile heap.
+        const bool preserveChannelIndex = v.channel[handle] == channel;
         const VoiceRenderClass desiredClass =
             ClassifyConfiguration(setups[i]);
         const uint8_t configuredClass = static_cast<uint8_t>(desiredClass);

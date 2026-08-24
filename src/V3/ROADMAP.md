@@ -418,6 +418,10 @@ larger phase containing that item is complete.
   compact-list positions instead of the generic remove/check/sift-up path.
   The pinned 6M-note workload gains another 2.7-3.4% in total cycles and about
   3% realized throughput with the same exhaustive-oracle victim sequence
+- [x] Extend known-root removal and same-channel index retention to matching
+  layered volatile-group replacement. The 2,048-voice Morphine churn corpus
+  reduces total work about 3.1% and stealing/index work about 10.5%, while the
+  exhaustive victim and renderer correctness suites remain unchanged
 - [x] Replace an admitted full outgoing-tail reserve directly through its
   already-proven minimum-heap root, avoiding redundant membership and root
   validation. Pinned 6M-note trials are neutral to about 1.3% faster with the
