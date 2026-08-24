@@ -17,14 +17,15 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "SuperVirtualMIDISynth contributors\0"
+            VALUE "CompanyName", "SuperVirtualMIDISynth Project\0"
             VALUE "FileDescription", "@SVMS_RESOURCE_DESCRIPTION@\0"
-            VALUE "FileVersion", "@PROJECT_VERSION@ build @SVMS_BUILD_NUMBER@ (@SVMS_RELEASE_CHANNEL@)\0"
+            VALUE "FileVersion", "@PROJECT_VERSION@.@SVMS_BUILD_NUMBER@\0"
             VALUE "InternalName", "@SVMS_RESOURCE_FILENAME@\0"
-            VALUE "LegalCopyright", "GPL-3.0\0"
+            VALUE "LegalCopyright", "Copyright (c) 2026 SuperVirtualMIDISynth contributors\0"
             VALUE "OriginalFilename", "@SVMS_RESOURCE_FILENAME@\0"
-            VALUE "ProductName", "SuperVirtualMIDISynth V3\0"
-            VALUE "ProductVersion", "@PROJECT_VERSION@ build @SVMS_BUILD_NUMBER@\0"
+            VALUE "ProductName", "SuperVirtualMIDISynth\0"
+            VALUE "ProductVersion", "@PROJECT_VERSION@\0"
+            VALUE "Comments", "Open-source software licensed under GPL-3.0\0"
             VALUE "SourceCommit", "@SVMS_GIT_COMMIT@\0"
         END
     END

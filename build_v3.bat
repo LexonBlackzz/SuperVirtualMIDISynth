@@ -34,8 +34,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if exist "%BUILD_DIR%\bin\svms_v3_configurator.exe" (
+    move /y "%BUILD_DIR%\bin\svms_v3_configurator.exe" "%BUILD_DIR%\bin\SVMSConfigurator.exe" >nul
+)
+
 echo.
 echo Build succeeded: %BUILD_DIR%\bin\winmm.dll
+echo Configurator: %BUILD_DIR%\bin\SVMSConfigurator.exe
 echo.
 echo Copy this DLL next to your MIDI application to use SuperVirtualMIDISynth V3.
 exit /b 0

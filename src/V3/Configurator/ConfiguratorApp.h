@@ -52,6 +52,11 @@ public:
     bool IsMinimized() const {
         return hwnd_ != nullptr && IsIconic(hwnd_) != FALSE;
     }
+    void SetWindowTitle(const wchar_t* title) {
+        if (hwnd_ != nullptr && title != nullptr && title[0] != L'\0') {
+            SetWindowTextW(hwnd_, title);
+        }
+    }
 
     const wchar_t* LastInitError() const { return lastInitError_.c_str(); }
 

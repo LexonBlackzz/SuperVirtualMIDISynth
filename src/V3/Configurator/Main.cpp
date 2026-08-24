@@ -1,4 +1,5 @@
 #include "ConfiguratorApp.h"
+#include "SVMSBuildInfo.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -38,6 +39,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     MB_OK | MB_ICONERROR);
         return 1;
     }
+
+    std::wstring windowTitle = L"SuperVirtualMIDISynth V3 Configurator - ";
+    windowTitle += svms::build::kProductVersionWide;
+    if (svms::build::kBuildNumber != 0u) {
+        windowTitle += L" (build ";
+        windowTitle += std::to_wstring(svms::build::kBuildNumber);
+        windowTitle += L")";
+    }
+    app.SetWindowTitle(windowTitle.c_str());
 
     while (app.PumpMessages()) {
         // A minimized DXGI window is not guaranteed to block in Present().
