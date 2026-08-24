@@ -153,6 +153,8 @@ enum class RenderEventType : uint8_t {
     StaleNoteOffBatch = 8,
     MasterVolume = 9,
     RhythmPart = 10,
+    MasterFineTune = 11,
+    MasterTranspose = 12,
 };
 
 struct RenderEvent {
@@ -1717,6 +1719,8 @@ inline bool RenderScalar::CanUseDensePlan(
         switch (event.type) {
             case RenderEventType::Reset:
             case RenderEventType::MasterVolume:
+            case RenderEventType::MasterFineTune:
+            case RenderEventType::MasterTranspose:
             case RenderEventType::NoteOn:
                 mayTouchFullPool = true;
                 break;
@@ -2217,6 +2221,8 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                     switch (event.type) {
                         case RenderEventType::Reset:
                         case RenderEventType::MasterVolume:
+                        case RenderEventType::MasterFineTune:
+                        case RenderEventType::MasterTranspose:
                             affectAll = true;
                             break;
                         case RenderEventType::NoteOff:

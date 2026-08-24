@@ -4,6 +4,7 @@
 #include "SVMSChannelCache.h"
 #include "SVMSConfig.h"
 #include "SVMSEnvelope.h"
+#include "SVMSEventCompile.h"
 #include "SVMSLimiter.h"
 #include "SVMSPostFilter.h"
 #include "SVMSRenderScalar.h"
@@ -92,6 +93,9 @@ public:
             return false;
         }
         for (float& ratio : bendRatio_) ratio = 1.0f;
+        sysexMasterVolume_ = 1.0f;
+        sysexMasterFineTune_ = 0.0f;
+        sysexMasterTranspose_ = 0.0f;
         postHighPass_.Initialize(rate_);
         EngineConfig limiterConfig{};
         limiterConfig.limiterEnabled = config.limiterEnabled;
@@ -114,6 +118,10 @@ public:
 
     void Dispatch(uint32_t message, uint64_t frame) {
         voices_.SetCurrentFrame(frame);
+        if (IsInternalEngineMessage(message)) {
+            DispatchInternal(message, frame);
+            return;
+        }
         const uint8_t status = uint8_t(message);
         const uint8_t channel = status & 15u;
         const uint8_t first = uint8_t(message >> 8u);
@@ -153,6 +161,9 @@ public:
             voices_.SilenceChannelImmediate(channel);
         channels_.Reset();
         channels_.SetMasterVolume(master_);
+        sysexMasterVolume_ = 1.0f;
+        sysexMasterFineTune_ = 0.0f;
+        sysexMasterTranspose_ = 0.0f;
         channels_.RebuildCache(cfg_, static_cast<float>(rate_));
         for (uint8_t channel = 0; channel < kChannelCount; ++channel) {
             bendRatio_[channel] = 1.0f;
@@ -312,7 +323,8 @@ private:
         }
         const float velocityGain = float(velocity) * float(velocity) /
                                    (127.0f * 127.0f);
-        const float bend = channels_.GetPitchBendSemitones(channel);
+        const float bend = channels_.GetPitchBendSemitones(channel) +
+            sysexMasterFineTune_ + sysexMasterTranspose_;
         for (uint32_t i = 0; i < count; ++i) {
             const SFSampleRegion& region = *regions[i];
             const uint32_t regionIndex = uint32_t(regions[i] - sf2_->regions);
@@ -369,6 +381,9 @@ private:
         else if (controller == 123) voices_.ReleaseChannel(channel, 0);
         else if (controller == 121 && sustain) ReleaseSustain(channel);
         if (controller == 121) Bend(channel, 0, 64);
+        else if (controller == 6 || controller == 38 ||
+                 controller == 96 || controller == 97)
+            RefreshChannelPitch(channel);
         if (controller == 7 || controller == 10 || controller == 11 ||
             controller == 64 || controller == 121) {
             channels_.RebuildChannel(channel, cfg_, float(rate_));
@@ -400,7 +415,12 @@ private:
 
     void Bend(uint8_t channel, uint8_t low, uint8_t high) {
         channels_.PitchBend(channel, int16_t((high << 7u) | low));
-        const float semitones = channels_.GetPitchBendSemitones(channel);
+        RefreshChannelPitch(channel);
+    }
+
+    void RefreshChannelPitch(uint8_t channel) {
+        const float semitones = channels_.GetPitchBendSemitones(channel) +
+            sysexMasterFineTune_ + sysexMasterTranspose_;
         const float common = powf(2.0f, semitones / 12.0f);
         bendRatio_[channel] = common;
         voices_.ForEachChannelActive(channel, [&](VoiceHandle voice) {
@@ -410,10 +430,54 @@ private:
         });
     }
 
+    void RefreshAllPitch() {
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel)
+            RefreshChannelPitch(channel);
+    }
+
+    void DispatchInternal(uint32_t message, uint64_t frame) {
+        if (message == kInternalResetMessage) {
+            ResetAll(frame);
+            return;
+        }
+        if ((message & 0xffffc000u) == kInternalMasterVolumeTag) {
+            sysexMasterVolume_ = static_cast<float>(message & 0x3fffu) /
+                16383.0f;
+            channels_.SetMasterVolume(master_ * sysexMasterVolume_);
+            channels_.RebuildCache(cfg_, static_cast<float>(rate_));
+            for (uint8_t channel = 0; channel < kChannelCount; ++channel)
+                voices_.RefreshMixGainsForChannel(
+                    channel, channels_.GetParams()[channel]);
+            return;
+        }
+        if ((message & 0xffffc000u) == kInternalMasterFineTuneTag) {
+            sysexMasterFineTune_ = static_cast<float>(
+                static_cast<int32_t>(message & 0x3fffu) - 8192) / 8192.0f;
+            RefreshAllPitch();
+            return;
+        }
+        if ((message & 0xffffff80u) == kInternalMasterTransposeTag) {
+            sysexMasterTranspose_ = static_cast<float>(
+                static_cast<int32_t>(message & 0x7fu) - 64);
+            RefreshAllPitch();
+            return;
+        }
+        if ((message & 0xff000000u) == kInternalRhythmPartTag) {
+            const uint8_t channel = static_cast<uint8_t>(
+                (message >> 8u) & 0x0fu);
+            channels_.SetRhythmPart(
+                channel, static_cast<uint8_t>(message & 0x03u));
+            RefreshPreset(channel);
+        }
+    }
+
     uint32_t rate_ = 0;
     uint32_t maxVoices_ = 0;
     uint32_t playIndex_ = 0;
     float master_ = 0;
+    float sysexMasterVolume_ = 1.0f;
+    float sysexMasterFineTune_ = 0.0f;
+    float sysexMasterTranspose_ = 0.0f;
     float bendRatio_[kChannelCount]{};
     uint64_t notes_ = 0, noteCalls_ = 0, missingPresets_ = 0;
     uint64_t missingRegions_ = 0, invalidRegions_ = 0;

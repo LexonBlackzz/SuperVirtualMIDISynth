@@ -1,4 +1,5 @@
 #include "SVMSMidiStream.h"
+#include "SVMSSysEx.h"
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -36,7 +37,10 @@ struct RawEvent {
     uint32_t order = 0;
     uint32_t message = 0;
     uint32_t tempo = 0;
+    const uint8_t* sysexData = nullptr;
+    uint32_t sysexSize = 0;
     bool midi = false;
+    bool sysex = false;
     bool valid = false;
 };
 struct Track {
@@ -92,6 +96,9 @@ bool Next(Track& t, RawEvent& out, std::string& error) {
             if (!VLen(t.p, t.end, length) || uint64_t(t.end - t.p) < length) {
                 error = "truncated MIDI SysEx"; return false;
             }
+            out.sysexData = t.p;
+            out.sysexSize = length;
+            out.sysex = true;
             t.p += length;
             out.valid = true;
             return true;
@@ -226,6 +233,86 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
     };
     uint32_t tempo = 500000, sequence = 0;
     const uint64_t denom = uint64_t(info.division) * 1000000ull;
+    auto processMessage = [&](uint32_t message) {
+        const uint64_t second = rate ? frame / rate : 0;
+        if (second != bucketSecond) {
+            if (bucketEvents > info.peakEventsPerSecond) {
+                info.peakEventsPerSecond = bucketEvents;
+                info.peakEventSecond = bucketSecond;
+            }
+            if (bucketNotes > info.peakNoteOnsPerSecond) {
+                info.peakNoteOnsPerSecond = bucketNotes;
+                info.peakNoteOnSecond = bucketSecond;
+            }
+            bucketSecond = second; bucketEvents = 0; bucketNotes = 0;
+        }
+        if (frame != groupFrame) {
+            finishFrame();
+            groupFrame = frame;
+            groupEvents = 0;
+            groupNotes = 0;
+            groupExactDuplicates = 0;
+            groupKeyDuplicates = 0;
+            groupRunExactDuplicates = 0;
+            previousNoteMessage = UINT32_MAX;
+            if (collectFrameRepetition && ++groupGeneration == 0u) {
+                std::fill(exactSeen.begin(), exactSeen.end(), 0u);
+                std::fill(keySeen.begin(), keySeen.end(), 0u);
+                groupGeneration = 1u;
+            }
+            if (collectFrameRepetition && ++noteRunGeneration == 0u) {
+                std::fill(noteRunExactSeen.begin(),
+                          noteRunExactSeen.end(), 0u);
+                noteRunGeneration = 1u;
+            }
+        }
+        PackedMidiEvent packed{frame, sequence++, message};
+        if (sink && !sink(packed, user)) return false;
+        ++count;
+        ++bucketEvents; ++groupEvents;
+        if ((message & 0xf0u) == 0x90u &&
+            ((message >> 16) & 0x7fu) != 0u) {
+            ++noteOns; ++bucketNotes;
+            ++groupNotes;
+            if (collectFrameRepetition) {
+                const uint32_t channel = message & 0x0fu;
+                const uint32_t note = (message >> 8u) & 0x7fu;
+                const uint32_t velocity = (message >> 16u) & 0x7fu;
+                const uint32_t keyIdentity = (channel << 7u) | note;
+                const uint32_t exactIdentity =
+                    (keyIdentity << 7u) | velocity;
+                if (keySeen[keyIdentity] == groupGeneration) {
+                    ++groupKeyDuplicates;
+                    ++info.keyDuplicateNoteOnCount;
+                } else {
+                    keySeen[keyIdentity] = groupGeneration;
+                }
+                if (exactSeen[exactIdentity] == groupGeneration) {
+                    ++groupExactDuplicates;
+                    ++info.exactDuplicateNoteOnCount;
+                } else {
+                    exactSeen[exactIdentity] = groupGeneration;
+                }
+                if (noteRunExactSeen[exactIdentity] == noteRunGeneration) {
+                    ++groupRunExactDuplicates;
+                    ++info.noteRunExactDuplicateCount;
+                } else {
+                    noteRunExactSeen[exactIdentity] = noteRunGeneration;
+                }
+                if (previousNoteMessage == message)
+                    ++info.adjacentExactDuplicateNoteOnCount;
+                previousNoteMessage = message;
+            }
+        } else if (collectFrameRepetition) {
+            previousNoteMessage = UINT32_MAX;
+            if (++noteRunGeneration == 0u) {
+                std::fill(noteRunExactSeen.begin(),
+                          noteRunExactSeen.end(), 0u);
+                noteRunGeneration = 1u;
+            }
+        }
+        return true;
+    };
     while (!heap.empty()) {
         if (cancel && cancel->load(std::memory_order_relaxed)) return false;
         const HeapItem item = heap.top(); heap.pop();
@@ -246,86 +333,15 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
         tick = item.event.tick;
         if (item.event.tempo) tempo = item.event.tempo;
         else if (item.event.midi) {
-            const uint64_t second = rate ? frame / rate : 0;
-            if (second != bucketSecond) {
-                if (bucketEvents > info.peakEventsPerSecond) {
-                    info.peakEventsPerSecond = bucketEvents;
-                    info.peakEventSecond = bucketSecond;
-                }
-                if (bucketNotes > info.peakNoteOnsPerSecond) {
-                    info.peakNoteOnsPerSecond = bucketNotes;
-                    info.peakNoteOnSecond = bucketSecond;
-                }
-                bucketSecond = second; bucketEvents = 0; bucketNotes = 0;
-            }
-            if (frame != groupFrame) {
-                finishFrame();
-                groupFrame = frame;
-                groupEvents = 0;
-                groupNotes = 0;
-                groupExactDuplicates = 0;
-                groupKeyDuplicates = 0;
-                groupRunExactDuplicates = 0;
-                previousNoteMessage = UINT32_MAX;
-                if (collectFrameRepetition && ++groupGeneration == 0u) {
-                    std::fill(exactSeen.begin(), exactSeen.end(), 0u);
-                    std::fill(keySeen.begin(), keySeen.end(), 0u);
-                    groupGeneration = 1u;
-                }
-                if (collectFrameRepetition && ++noteRunGeneration == 0u) {
-                    std::fill(noteRunExactSeen.begin(),
-                              noteRunExactSeen.end(), 0u);
-                    noteRunGeneration = 1u;
-                }
-            }
-            PackedMidiEvent packed{frame, sequence++, item.event.message};
-            if (sink && !sink(packed, user)) return false;
-            ++count;
-            ++bucketEvents; ++groupEvents;
-            if ((item.event.message & 0xf0u) == 0x90u &&
-                ((item.event.message >> 16) & 0x7fu) != 0u) {
-                ++noteOns; ++bucketNotes;
-                ++groupNotes;
-                if (collectFrameRepetition) {
-                    const uint32_t channel = item.event.message & 0x0fu;
-                    const uint32_t note =
-                        (item.event.message >> 8u) & 0x7fu;
-                    const uint32_t velocity =
-                        (item.event.message >> 16u) & 0x7fu;
-                    const uint32_t keyIdentity = (channel << 7u) | note;
-                    const uint32_t exactIdentity =
-                        (keyIdentity << 7u) | velocity;
-                    if (keySeen[keyIdentity] == groupGeneration) {
-                        ++groupKeyDuplicates;
-                        ++info.keyDuplicateNoteOnCount;
-                    } else {
-                        keySeen[keyIdentity] = groupGeneration;
-                    }
-                    if (exactSeen[exactIdentity] == groupGeneration) {
-                        ++groupExactDuplicates;
-                        ++info.exactDuplicateNoteOnCount;
-                    } else {
-                        exactSeen[exactIdentity] = groupGeneration;
-                    }
-                    if (noteRunExactSeen[exactIdentity] ==
-                        noteRunGeneration) {
-                        ++groupRunExactDuplicates;
-                        ++info.noteRunExactDuplicateCount;
-                    } else {
-                        noteRunExactSeen[exactIdentity] = noteRunGeneration;
-                    }
-                    if (previousNoteMessage == item.event.message)
-                        ++info.adjacentExactDuplicateNoteOnCount;
-                    previousNoteMessage = item.event.message;
-                }
-            } else if (collectFrameRepetition) {
-                previousNoteMessage = UINT32_MAX;
-                if (++noteRunGeneration == 0u) {
-                    std::fill(noteRunExactSeen.begin(),
-                              noteRunExactSeen.end(), 0u);
-                    noteRunGeneration = 1u;
-                }
-            }
+            if (!processMessage(item.event.message)) return false;
+        } else if (item.event.sysex) {
+            bool accepted = true;
+            (void)TranslateXGSystemExclusivePayload(
+                item.event.sysexData, item.event.sysexSize,
+                [&](uint32_t message) {
+                    if (accepted) accepted = processMessage(message);
+                });
+            if (!accepted) return false;
         }
         RawEvent next;
         if (!nextEvent(item.track, next)) return false;

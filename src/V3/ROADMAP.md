@@ -636,6 +636,10 @@ larger phase containing that item is complete.
 - [x] Add a priority-ordered immutable SoundFont stack with explicit melodic
   or percussion bank/preset remapping, one concatenated render sample store,
   backward-compatible `synth.soundfont`, and Configurator stack/route editing
+- [x] Translate common XG system and multipart SysEx at the original event
+  frame: reset, master volume/tune/transpose, bank/program, part mode, note
+  shift, volume, and pan. Share the allocation-free translator with live and
+  offline playback so both paths retain identical command ordering
 - [x] Record the live post-DSP stereo stream to float WAV/RF64 through an
   allocation-free audio-thread copy, an eight-second SPSC buffer, and a
   background file writer; expose start/stop, duration, file size, and dropped

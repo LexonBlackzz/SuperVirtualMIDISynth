@@ -28,6 +28,7 @@
 #include "SVMSEventScheduler.h"
 #include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
+#include "SVMSSysEx.h"
 #include "SVMSFrameClock.h"
 #include "SVMSDiagWindow.h"
 #include "SVMSPostFilter.h"
@@ -1994,6 +1995,7 @@ private:
                              uint32_t blockOffset);
     void HandleProgramChange(uint8_t channel, uint8_t program);
     void HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb);
+    void RefreshAllPitchIncrements();
     uint32_t RefreshVelocityCutoff(EventLane lane) noexcept;
     void EventCompilerLoop();
     SoundFontBundle* BuildSoundFontBundle(const wchar_t* path,
@@ -2150,6 +2152,8 @@ private:
     // voices' mix gains.  Audio-thread only.
     float appliedMasterVolume_ = 1.0f;
     float sysexMasterVolume_ = 1.0f;
+    float sysexMasterFineTune_ = 0.0f;
+    float sysexMasterTranspose_ = 0.0f;
 
     // Per-block dispatch queue. Allocated once during initialization from the
     // smaller of max_events_per_block and the configured scheduler capacity.
@@ -3861,6 +3865,8 @@ void Driver::ResetAllVoices() {
     if (voiceManager) voiceManager->Reset();
     if (channelCache) channelCache->Reset();
     sysexMasterVolume_ = 1.0f;
+    sysexMasterFineTune_ = 0.0f;
+    sysexMasterTranspose_ = 0.0f;
     if (channelCache && configSnapshot)
         channelCache->SetMasterVolume(configSnapshot->masterVolume);
     RefreshSelectedPresets();
@@ -3993,7 +3999,7 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
     const uint8_t status = static_cast<uint8_t>(msg & 0xffu);
     const uint8_t data1 = static_cast<uint8_t>((msg >> 8) & 0x7fu);
     const uint8_t velocity = static_cast<uint8_t>((msg >> 16) & 0x7fu);
-    const bool noteOn = msg != kInternalResetMessage &&
+    const bool noteOn = !IsInternalEngineMessage(msg) &&
                         (status & 0xf0u) == 0x90u && velocity != 0;
 
     // Publish the cutoff before waiting on the lossless state lane.  If that
@@ -4216,6 +4222,21 @@ bool Driver::SubmitSystemExclusiveCancellable(
         emit(MakeInternalMasterVolumeMessage(value));
         return accepted;
     }
+    // Universal realtime Master Fine/Coarse Tuning. Fine tuning shares the
+    // MIDI Tuning Standard's centered 14-bit representation; coarse tuning
+    // shares XG's centered 7-bit semitone representation.
+    if (size >= 8u && data[1] == 0x7fu && data[3] == 0x04u &&
+        data[4] == 0x03u) {
+        const uint16_t value = static_cast<uint16_t>(
+            (data[5] & 0x7fu) | ((data[6] & 0x7fu) << 7u));
+        emit(MakeInternalMasterFineTuneMessage(value));
+        return accepted;
+    }
+    if (size >= 7u && data[1] == 0x7fu && data[3] == 0x04u &&
+        data[4] == 0x04u) {
+        emit(MakeInternalMasterTransposeMessage(data[5] & 0x7fu));
+        return accepted;
+    }
 
     // Roland GS Data Set 1 (DT1).  Verify the Roland checksum, then map the
     // MSGS-relevant system and part parameters onto exact-frame engine/MIDI
@@ -4270,17 +4291,10 @@ bool Driver::SubmitSystemExclusiveCancellable(
         return accepted;
     }
 
-    // Yamaha XG System On and Master Volume are common in nominally-GM song
-    // files. MSGS ignores most XG-specific parameters, but treating these two
-    // as their GM equivalents gives the same useful compatibility behavior.
-    if (size >= 9u && data[1] == 0x43u && data[3] == 0x4cu &&
-        data[4] == 0x00u && data[5] == 0x00u) {
-        if (data[6] == 0x7eu && data[7] == 0u)
-            emit(kInternalResetMessage);
-        else if (data[6] == 0x04u)
-            emit(MakeInternalMasterVolumeMessage(
-                static_cast<uint16_t>(data[7] & 0x7fu) * 129u));
-    }
+    // Translate the useful XG system and multi-part subset into the same
+    // timestamped command stream as ordinary MIDI. No parameter is applied
+    // on this producer thread, and bulk parameter packets preserve byte order.
+    (void)TranslateXGSystemExclusive(data, size, emit);
     return accepted;
 }
 
@@ -5112,6 +5126,8 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
             if (self->voiceManager) self->voiceManager->Reset();
             if (self->channelCache) self->channelCache->Reset();
             self->sysexMasterVolume_ = 1.0f;
+            self->sysexMasterFineTune_ = 0.0f;
+            self->sysexMasterTranspose_ = 0.0f;
             if (self->channelCache && self->configSnapshot) {
                 self->channelCache->SetMasterVolume(
                     self->configSnapshot->masterVolume);
@@ -5153,6 +5169,20 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
             }
             break;
         }
+        case RenderEventType::MasterFineTune: {
+            const uint16_t value = static_cast<uint16_t>(
+                event.data1 | (static_cast<uint16_t>(event.data2) << 7u));
+            self->sysexMasterFineTune_ =
+                static_cast<float>(static_cast<int32_t>(value) - 8192) /
+                8192.0f;
+            self->RefreshAllPitchIncrements();
+            break;
+        }
+        case RenderEventType::MasterTranspose:
+            self->sysexMasterTranspose_ = static_cast<float>(
+                static_cast<int32_t>(event.data1) - 64);
+            self->RefreshAllPitchIncrements();
+            break;
         case RenderEventType::RhythmPart:
             if (self->channelCache && event.channel < kChannelCount) {
                 self->channelCache->SetRhythmPart(event.channel, event.data1);
@@ -5525,7 +5555,8 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     const float sr = static_cast<float>(
         sampleRate > 0 ? sampleRate : 44100u);
     const float pitchBendSemitones =
-        channelCache->GetPitchBendSemitones(channel);
+        channelCache->GetPitchBendSemitones(channel) +
+        sysexMasterFineTune_ + sysexMasterTranspose_;
     const float commonBendRatio = channelPitchBendRatio_[channel];
     const VoiceConfiguration* launchSetups = noteLaunchScratch_;
     if (launchCacheHit) {
@@ -5865,7 +5896,8 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
     if (!voiceManager || !channelCache || channel >= kChannelCount) return;
     ++channelLaunchRevision_[channel];
 
-    const float bendSemitones = channelCache->GetPitchBendSemitones(channel);
+    const float bendSemitones = channelCache->GetPitchBendSemitones(channel) +
+        sysexMasterFineTune_ + sysexMasterTranspose_;
     const float commonRatio = powf(2.0f, bendSemitones / 12.0f);
     channelPitchBendRatio_[channel] = commonRatio;
     voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
@@ -5875,6 +5907,25 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
             ? commonRatio : powf(2.0f, bendSemitones * scale / 12.0f);
         voiceManager->v.phaseIncs[i] = voiceManager->v.basePhaseIncs[i] * ratio;
     });
+}
+
+void Driver::RefreshAllPitchIncrements() {
+    if (!voiceManager || !channelCache) return;
+    for (uint8_t channel = 0u; channel < kChannelCount; ++channel) {
+        ++channelLaunchRevision_[channel];
+        const float semitones = channelCache->GetPitchBendSemitones(channel) +
+            sysexMasterFineTune_ + sysexMasterTranspose_;
+        const float commonRatio = powf(2.0f, semitones / 12.0f);
+        channelPitchBendRatio_[channel] = commonRatio;
+        voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
+            const uint32_t handle = voice;
+            const float scale = voiceManager->v.pitchBendScales[handle];
+            const float ratio = scale == 1.0f
+                ? commonRatio : powf(2.0f, semitones * scale / 12.0f);
+            voiceManager->v.phaseIncs[handle] =
+                voiceManager->v.basePhaseIncs[handle] * ratio;
+        });
+    }
 }
 
 } // namespace svms

@@ -8,6 +8,7 @@
 #include "SVMSEventScheduler.h"
 #include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
+#include "SVMSSysEx.h"
 #include "SVMSConfig.h"
 #include "SVMSFrameClock.h"
 #include "SVMSPostFilter.h"
@@ -2583,6 +2584,78 @@ void TestSixHourFrameClockDrift() {
     }
 }
 
+void TestXGSystemExclusiveTranslation() {
+    std::vector<uint32_t> messages;
+    auto emit = [&](uint32_t message) { messages.push_back(message); };
+
+    const uint8_t masterTune[] = {
+        0xf0u, 0x43u, 0x10u, 0x4cu, 0x00u, 0x00u, 0x00u,
+        0x00u, 0x04u, 0x00u, 0x00u, 0xf7u};
+    Check(svms::TranslateXGSystemExclusive(
+              masterTune, static_cast<uint32_t>(sizeof(masterTune)), emit) &&
+              messages.size() == 1u && messages[0] ==
+                  svms::MakeInternalMasterFineTuneMessage(8192u),
+          "XG centered four-nibble master tuning remains unshifted");
+
+    messages.clear();
+    const uint8_t transpose[] = {
+        0xf0u, 0x43u, 0x10u, 0x4cu, 0x00u, 0x00u, 0x06u,
+        0x58u, 0xf7u};
+    Check(svms::TranslateXGSystemExclusive(
+              transpose, static_cast<uint32_t>(sizeof(transpose)), emit) &&
+              messages.size() == 1u && messages[0] ==
+                  svms::MakeInternalMasterTransposeMessage(88u),
+          "XG master transpose preserves its centered semitone value");
+
+    messages.clear();
+    const uint8_t partBankProgram[] = {
+        0xf0u, 0x43u, 0x10u, 0x4cu, 0x08u, 0x02u, 0x01u,
+        0x7fu, 0x05u, 0x28u, 0xf7u};
+    Check(svms::TranslateXGSystemExclusive(
+              partBankProgram,
+              static_cast<uint32_t>(sizeof(partBankProgram)), emit) &&
+              messages.size() == 3u &&
+              messages[0] == svms::MakeMidiControlChange(2u, 0u, 127u) &&
+              messages[1] == svms::MakeMidiControlChange(2u, 32u, 5u) &&
+              messages[2] == svms::MakeMidiProgramChange(2u, 40u),
+          "XG bulk part bank/program bytes retain parameter order");
+
+    messages.clear();
+    const uint8_t partMode[] = {
+        0xf0u, 0x43u, 0x10u, 0x4cu, 0x08u, 0x04u, 0x07u,
+        0x02u, 0xf7u};
+    Check(svms::TranslateXGSystemExclusive(
+              partMode, static_cast<uint32_t>(sizeof(partMode)), emit) &&
+              messages.size() == 1u && messages[0] ==
+                  svms::MakeInternalRhythmPartMessage(4u, 2u),
+          "XG part mode maps percussion state onto the exact-frame command");
+
+    messages.clear();
+    const uint8_t noteShift[] = {
+        0xf0u, 0x43u, 0x10u, 0x4cu, 0x08u, 0x03u, 0x08u,
+        0x46u, 0xf7u};
+    Check(svms::TranslateXGSystemExclusive(
+              noteShift, static_cast<uint32_t>(sizeof(noteShift)), emit) &&
+              messages.size() == 5u &&
+              messages[0] == svms::MakeMidiControlChange(3u, 101u, 0u) &&
+              messages[1] == svms::MakeMidiControlChange(3u, 100u, 2u) &&
+              messages[2] == svms::MakeMidiControlChange(3u, 6u, 70u) &&
+              messages[3] == svms::MakeMidiControlChange(3u, 101u, 127u) &&
+              messages[4] == svms::MakeMidiControlChange(3u, 100u, 127u),
+          "XG note shift translates to a bounded channel RPN transaction");
+
+    svms::TimestampedMidiEvent timed{};
+    timed.qpcTimestamp = svms::kAbsoluteFrameTimestampTag | 91u;
+    timed.sequence = 123u;
+    timed.message = svms::MakeInternalMasterTransposeMessage(52u);
+    svms::ScheduledRenderEvent scheduled{};
+    Check(svms::CompileTimestampedEvent(
+              timed, 0u, 10'000'000u, 44'100u, 0u, scheduled) &&
+              scheduled.type == svms::RenderEventType::MasterTranspose &&
+              scheduled.data1 == 52u && scheduled.targetFrame == 91,
+          "internal XG tuning commands retain exact output-frame placement");
+}
+
 void TestOverloadTimelineRecovery() {
     Check(svms::RecoverRealtimeRenderFrame(4096, 4120, 512) == 4096,
           "small QPC jitter does not move the render timeline");
@@ -3384,6 +3457,7 @@ int main() {
     TestFourProducerMPSCIntegrity();
     TestJsonConfigurationLifecycle();
     TestSixHourFrameClockDrift();
+    TestXGSystemExclusiveTranslation();
     TestOverloadTimelineRecovery();
     TestExpressionAgeRetirementAndLoopWrap();
     TestSpanRendererDifferential();
