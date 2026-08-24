@@ -278,9 +278,10 @@ int main(int argc, char** argv) {
     }
 
     SVMS_ShortEvent events[2]{};
-    events[0].timestamp_qpc = now;
+    // Zero-timestamp records share the batch's one immediate QPC sample.
+    events[0].timestamp_qpc = 0u;
     events[0].packed_message = 0x00643c90u;
-    events[1].timestamp_qpc = now;
+    events[1].timestamp_qpc = 0u;
     events[1].packed_message = 0x00003c80u;
     const uint8_t gmReset[] = {0xf0u, 0x7eu, 0x7fu, 0x09u, 0x01u, 0xf7u};
     SVMS_TimedShortEvent timed[2]{};

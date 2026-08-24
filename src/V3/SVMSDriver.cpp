@@ -5868,12 +5868,18 @@ static SVMS_Result SVMS_CALL NativeSendShortBatch(
     if (!events && eventCount != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
     for (uint32_t i = 0u; i < eventCount; ++i) {
         if (events[i].reserved != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
+    }
+    // A batch is one submission boundary. Timestamp its immediate records
+    // once, just like NativeSendTimedShortBatch, rather than crossing into
+    // QueryPerformanceCounter for every packed MIDI message. Explicit QPC
+    // timestamps remain untouched and equal-time records retain array order.
+    LARGE_INTEGER immediate{};
+    if (eventCount != 0u && !QueryPerformanceCounter(&immediate))
+        return SVMS_RESULT_INTERNAL_ERROR;
+    const uint64_t immediateQpc = static_cast<uint64_t>(immediate.QuadPart);
+    for (uint32_t i = 0u; i < eventCount; ++i) {
         uint64_t timestampQpc = events[i].timestamp_qpc;
-        if (timestampQpc == 0u) {
-            LARGE_INTEGER timestamp{};
-            QueryPerformanceCounter(&timestamp);
-            timestampQpc = static_cast<uint64_t>(timestamp.QuadPart);
-        }
+        if (timestampQpc == 0u) timestampQpc = immediateQpc;
         if (!g_driver->SubmitShortMsgAtQpcCancellable(
                 events[i].packed_message, timestampQpc, cancellation,
                 session))

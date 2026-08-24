@@ -172,7 +172,12 @@ larger phase containing that item is complete.
   without weakening cancellable lossless backpressure
 - [ ] Saturate every priority lane and test monotonic shedding, lossless-lane
   wakeup/backpressure, and shutdown cancellation
-- [ ] Add bulk-packed MIDI ingestion and safe redundant-controller coalescing
+- [x] Expose packed and mixed-timestamp batches through SVMAPI; immediate
+  records in one batch now share one QPC sample instead of one kernel clock
+  query per event (about 12.2 ns/event, or 7.3% of one core at 6M events/s,
+  removed on the development CPU)
+- [ ] Collapse per-event ingress reservations inside packed batches and add
+  safe redundant-controller coalescing without weakening multi-producer order
 - [x] Measure and optimize the tens-of-millions-events-per-second path: the
   accepted 12M-event/s fixture compiles around 126M events/s and performs
   callback ordering around 622-689M events/s (roughly 0.4-0.5% of a
