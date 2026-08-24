@@ -1,0 +1,74 @@
+name: Windows Configurator MSVC AV A/B
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v3]
+    paths:
+      - ".github/workflows/windows-msvc-av-ab.yml"
+
+jobs:
+  configurator:
+    name: MSVC ${{ matrix.toolset }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolset: ["14.50", "14.51"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Build Configurator with MSVC ${{ matrix.toolset }}
+        shell: cmd
+        run: |
+          call find_vs.bat
+          if errorlevel 1 exit /b %errorlevel%
+
+          echo Visual Studio: %VS_PATH%
+          echo Installed MSVC toolsets:
+          dir /b "%VS_PATH%\VC\Tools\MSVC"
+
+          call "%VS_VCVARSALL%" x64 -vcvars_ver=${{ matrix.toolset }}
+          if errorlevel 1 (
+            echo Failed to activate MSVC ${{ matrix.toolset }}.
+            exit /b 1
+          )
+
+          echo Selected VCToolsVersion=%VCToolsVersion%
+          where cl
+          cl /Bv 2>nul
+
+          set "BUILD_DIR=build\av-msvc-${{ matrix.toolset }}"
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B "%BUILD_DIR%"
+          if errorlevel 1 exit /b %errorlevel%
+
+          cmake --build "%BUILD_DIR%" --config Release --target svms_v3_configurator
+          if errorlevel 1 exit /b %errorlevel%
+
+          if not exist "%BUILD_DIR%\bin\svms_v3_configurator.exe" (
+            echo Configurator output was not found.
+            exit /b 1
+          )
+
+          mkdir "av-msvc-${{ matrix.toolset }}"
+          copy /y "%BUILD_DIR%\bin\svms_v3_configurator.exe" "av-msvc-${{ matrix.toolset }}\SVMSConfigurator-msvc-${{ matrix.toolset }}.exe" >nul
+
+          (
+            echo requested_toolset=${{ matrix.toolset }}
+            echo VCToolsVersion=%VCToolsVersion%
+            echo VisualStudioVersion=%VisualStudioVersion%
+            echo VSINSTALLDIR=%VSINSTALLDIR%
+            echo WindowsSdkDir=%WindowsSdkDir%
+            echo WindowsSDKVersion=%WindowsSDKVersion%
+          ) > "av-msvc-${{ matrix.toolset }}\toolchain.txt"
+
+      - name: Upload MSVC ${{ matrix.toolset }} sample
+        uses: actions/upload-artifact@v4
+        with:
+          name: SVMSConfigurator-msvc-${{ matrix.toolset }}
+          path: av-msvc-${{ matrix.toolset }}/
+          if-no-files-found: error
