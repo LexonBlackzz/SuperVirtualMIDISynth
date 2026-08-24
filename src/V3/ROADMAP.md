@@ -114,6 +114,9 @@ larger phase containing that item is complete.
 ### Audio Thread and WASAPI
 
 - [x] Use event-driven WASAPI shared mode
+- [x] Recover shared-mode output after endpoint removal, service/device
+  invalidation, default-device changes, and endpoint format/rate changes;
+  retry interruptibly and preserve the established synth frame clock
 - [x] Size render buffers from the actual device buffer
 - [x] Run the audio thread under MMCSS `Pro Audio` with FTZ/DAZ enabled
 - [x] Use aligned planar render buffers and preallocated callback storage
