@@ -55,10 +55,10 @@ public:
     using CommandHandler = std::function<RLResult(
         const RuntimeLinkCommandV2&, char* /*outResultText[256]*/)>;
 
-    // Creates the per-PID mapping/mutex/event and registers this
-    // process in the hosts registry.  Non-fatal: returns false without
-    // touching anything when the objects already exist (PID reuse) or
-    // a system call fails.
+    // Creates or reclaims the per-PID mapping/mutex/event and registers
+    // this process in the hosts registry. Other processes may keep the named
+    // objects alive across a transient MIDI-driver shutdown, so reopening an
+    // existing object is expected and the new session republishes its state.
     bool Initialize() {
         Shutdown();
 
@@ -85,24 +85,19 @@ public:
 
         hMap_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
                                    PAGE_READWRITE, 0, mapSize, memName);
-        if (!hMap_ || GetLastError() == ERROR_ALREADY_EXISTS) {
-            if (hMap_) { CloseHandle(hMap_); hMap_ = nullptr; }
-            return false;
-        }
+        if (!hMap_) return false;
         view_ = static_cast<RuntimeLinkSharedMemoryV2*>(
             MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, mapSize));
         if (!view_) { CloseHandle(hMap_); hMap_ = nullptr; return false; }
 
         hMutex_ = CreateMutexW(nullptr, FALSE, mutexName);
-        if (!hMutex_ || GetLastError() == ERROR_ALREADY_EXISTS) {
-            if (hMutex_) { CloseHandle(hMutex_); hMutex_ = nullptr; }
+        if (!hMutex_) {
             Shutdown();
             return false;
         }
         // Auto-reset command event (wakes the control thread early).
         hCmdEvent_ = CreateEventW(nullptr, FALSE, FALSE, evtName);
-        if (!hCmdEvent_ || GetLastError() == ERROR_ALREADY_EXISTS) {
-            if (hCmdEvent_) { CloseHandle(hCmdEvent_); hCmdEvent_ = nullptr; }
+        if (!hCmdEvent_) {
             Shutdown();
             return false;
         }
@@ -364,7 +359,7 @@ private:
         const uint32_t mapSize = RuntimeLinkMappingSizeV3();
         v3Map_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
                                     PAGE_READWRITE, 0, mapSize, memName);
-        if (!v3Map_ || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (!v3Map_) {
             ShutdownV3();
             return false;
         }
@@ -376,12 +371,12 @@ private:
         }
 
         v3Mutex_ = CreateMutexW(nullptr, FALSE, mutexName);
-        if (!v3Mutex_ || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (!v3Mutex_) {
             ShutdownV3();
             return false;
         }
         v3CmdEvent_ = CreateEventW(nullptr, FALSE, FALSE, evtName);
-        if (!v3CmdEvent_ || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (!v3CmdEvent_) {
             ShutdownV3();
             return false;
         }
