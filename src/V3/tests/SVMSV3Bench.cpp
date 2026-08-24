@@ -957,6 +957,8 @@ int main(int argc, char** argv) {
         "\"group_reuse\":{\"attempts\":%llu,\"matches\":%llu,\"reserved\":%llu,"
         "\"smaller\":%llu,\"larger\":%llu,\"grouped_voices\":%u},"
         "\"launch_profile\":{\"samples\":%llu,\"pop\":%llu,\"tail\":%llu,"
+        "\"volatile_heap_profile\":{\"builds\":%llu,\"samples\":%llu,"
+        "\"cycles\":%llu,\"candidates\":%llu},"
         "\"lifecycle\":%llu,\"configure\":%llu,\"tree\":%llu},"
         "\"launch_churn\":{\"logical_launches\":%llu,\"successful_launches\":%llu,"
         "\"failed_launches\":%llu,\"physical_requested\":%llu,"
@@ -1023,6 +1025,10 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(voices->GetLaunchProfileSamplesForTest()),
         static_cast<unsigned long long>(voices->GetLaunchProfilePopCyclesForTest()),
         static_cast<unsigned long long>(voices->GetLaunchProfileTailCyclesForTest()),
+        static_cast<unsigned long long>(voices->GetVolatileHeapProfileBuildsForTest()),
+        static_cast<unsigned long long>(voices->GetVolatileHeapProfileSamplesForTest()),
+        static_cast<unsigned long long>(voices->GetVolatileHeapProfileCyclesForTest()),
+        static_cast<unsigned long long>(voices->GetVolatileHeapProfileCandidatesForTest()),
         static_cast<unsigned long long>(voices->GetLaunchProfileLifecycleCyclesForTest()),
         static_cast<unsigned long long>(voices->GetLaunchProfileConfigureCyclesForTest()),
         static_cast<unsigned long long>(voices->GetLaunchProfileTreeCyclesForTest()),

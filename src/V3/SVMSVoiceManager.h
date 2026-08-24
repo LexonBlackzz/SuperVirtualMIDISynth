@@ -309,6 +309,18 @@ public:
     uint64_t GetLaunchProfileTreeCyclesForTest() const {
         return launchProfileTreeCycles_;
     }
+    uint64_t GetVolatileHeapProfileBuildsForTest() const {
+        return volatileHeapProfileBuilds_;
+    }
+    uint64_t GetVolatileHeapProfileSamplesForTest() const {
+        return volatileHeapProfileSamples_;
+    }
+    uint64_t GetVolatileHeapProfileCyclesForTest() const {
+        return volatileHeapProfileCycles_;
+    }
+    uint64_t GetVolatileHeapProfileCandidatesForTest() const {
+        return volatileHeapProfileCandidates_;
+    }
     const LaunchChurnStats& GetLaunchChurnStatsForTest() const {
         return launchChurnStats_;
     }
@@ -353,6 +365,11 @@ public:
         launchTestTrackedFrame_ = currentFrame_;
         launchTestProvisionalGroups_ = 0;
         launchTestProvisionalPhysicalVoices_ = 0;
+        volatileHeapProfileCounter_ = 0u;
+        volatileHeapProfileBuilds_ = 0u;
+        volatileHeapProfileSamples_ = 0u;
+        volatileHeapProfileCycles_ = 0u;
+        volatileHeapProfileCandidates_ = 0u;
     }
 #endif
 
@@ -524,6 +541,12 @@ private:
     uint64_t launchTestTrackedFrame_ = 0u;
     int64_t launchTestProvisionalGroups_ = 0;
     int64_t launchTestProvisionalPhysicalVoices_ = 0;
+    // Sampled cost of exact per-frame volatile heap key reconstruction.
+    uint64_t volatileHeapProfileCounter_ = 0u;
+    uint64_t volatileHeapProfileBuilds_ = 0u;
+    uint64_t volatileHeapProfileSamples_ = 0u;
+    uint64_t volatileHeapProfileCycles_ = 0u;
+    uint64_t volatileHeapProfileCandidates_ = 0u;
 #endif
 
     // Per-key tracking for EndVoicesForChannelKey
@@ -2680,6 +2703,12 @@ inline void VoiceManager::VolatileHeapSiftDown(uint32_t position) {
 }
 
 inline void VoiceManager::BuildVolatileStealHeap() {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    // Sampled rdtsc pair: measures this rebuild without distorting every call.
+    const bool profileThisBuild =
+        (++volatileHeapProfileCounter_ & 15u) == 0u;
+    const uint64_t profileBegin = profileThisBuild ? __rdtsc() : 0u;
+#endif
     // The linked volatile set and the previous heap contain the same handles;
     // removals update both structures immediately. Every surviving handle's
     // inverse position is overwritten below, so clearing the old heap first
@@ -2716,6 +2745,14 @@ inline void VoiceManager::BuildVolatileStealHeap() {
     }
     stealVolatileHeapFrame_ = currentFrame_;
     stealVolatileHeapValid_ = true;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    if (profileThisBuild) {
+        ++volatileHeapProfileBuilds_;
+        ++volatileHeapProfileSamples_;
+        volatileHeapProfileCycles_ += __rdtsc() - profileBegin;
+        volatileHeapProfileCandidates_ += stealVolatileHeapCount_;
+    }
+#endif
 }
 
 inline void VoiceManager::RemoveVolatileHeapCandidate(VoiceHandle handle) {
