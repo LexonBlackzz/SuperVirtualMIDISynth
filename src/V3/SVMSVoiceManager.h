@@ -1054,7 +1054,6 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(targetGain);
     SVMS_COPY_GROWN_VOICE_FIELD(sustainLevel);
     SVMS_COPY_GROWN_VOICE_FIELD(attackGainStep);
-    SVMS_COPY_GROWN_VOICE_FIELD(decayGainStep);
     SVMS_COPY_GROWN_VOICE_FIELD(releaseDecay);
     SVMS_COPY_GROWN_VOICE_FIELD(gainLeft);
     SVMS_COPY_GROWN_VOICE_FIELD(gainRight);
@@ -1064,9 +1063,6 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(renderGainR);
     SVMS_COPY_GROWN_VOICE_FIELD(stealOutputGain);
     SVMS_COPY_GROWN_VOICE_FIELD(sampleStart);
-    SVMS_COPY_GROWN_VOICE_FIELD(sampleEnd);
-    SVMS_COPY_GROWN_VOICE_FIELD(loopStart);
-    SVMS_COPY_GROWN_VOICE_FIELD(loopEnd);
     SVMS_COPY_GROWN_VOICE_FIELD(loopMode);
     SVMS_COPY_GROWN_VOICE_FIELD(loopEnabled);
     SVMS_COPY_GROWN_VOICE_FIELD(relEnd);
@@ -1080,7 +1076,6 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(delaySamplesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(releaseSamplesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(decaySlope);
-    SVMS_COPY_GROWN_VOICE_FIELD(samplePageId);
     SVMS_COPY_GROWN_VOICE_FIELD(heldBySustain);
     SVMS_COPY_GROWN_VOICE_FIELD(heldBySostenuto);
     SVMS_COPY_GROWN_VOICE_FIELD(releaseStartInBlock);
@@ -1695,14 +1690,10 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.targetGain[handle]   = 1.0f;
     v.sustainLevel[handle] = 0.7f;
     v.attackGainStep[handle] = 0.0f;
-    v.decayGainStep[handle]  = 0.0f;
     v.releaseDecay[handle]   = kDefaultReleaseDecay;
     v.gainLeft[handle]     = 1.0f;
     v.gainRight[handle]    = 1.0f;
     v.sampleStart[handle]  = 0;
-    v.sampleEnd[handle]    = 0;
-    v.loopStart[handle]    = 0;
-    v.loopEnd[handle]      = 0;
     v.loopMode[handle]     = 0;
     v.sampleBacked[handle] = 0;
     v.presetIndex[handle] = UINT16_MAX;
@@ -1714,7 +1705,6 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.delaySamplesRemaining[handle]  = 0;
     v.releaseSamplesRemaining[handle] = UINT32_MAX;
     v.decaySlope[handle]        = 1.0f;
-    v.samplePageId[handle]      = 0;
     v.envelopeStage[handle]     = 0;
     v.renderClass[handle] = static_cast<uint8_t>(VoiceRenderClass::Generic);
     v.heldBySustain[handle]     = 0;
@@ -3151,9 +3141,6 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     const ChannelParamsSnapshot& cp, VoiceRenderClass knownClass) {
 
     v.sampleStart[handle] = setup.sampleStart;
-    v.sampleEnd[handle] = setup.sampleEnd;
-    v.loopStart[handle] = setup.loopStart;
-    v.loopEnd[handle] = setup.loopEnd;
     v.loopMode[handle] = setup.loopMode;
     v.phaseIncs[handle] = setup.phaseStep;
     v.basePhaseIncs[handle] = setup.basePhaseStep;
@@ -3710,9 +3697,6 @@ inline void VoiceManager::SetVoiceSample(VoiceHandle handle, uint32_t start, uin
                                           float phaseStep, uint8_t sb) {
     if (handle >= maxVoices_) return;
     v.sampleStart[handle] = start;
-    v.sampleEnd[handle]   = end;
-    v.loopStart[handle]   = loopStart;
-    v.loopEnd[handle]     = loopEnd;
     v.loopMode[handle]    = loopMode;
     v.phaseIncs[handle]   = phaseStep;
     v.basePhaseIncs[handle] = phaseStep;

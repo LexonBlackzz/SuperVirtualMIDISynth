@@ -89,7 +89,6 @@ int main() {
         float mixGainL;
         float mixGainR;
         uint32_t sampleStart;
-        uint32_t sampleEnd;
         uint32_t activePosition;
     };
     std::vector<SavedVoice> saved(kOldCapacity);
@@ -105,7 +104,6 @@ int main() {
             voices.v.mixGainL[handle],
             voices.v.mixGainR[handle],
             voices.v.sampleStart[handle],
-            voices.v.sampleEnd[handle],
             voices.activePosition_[handle]
         };
     }
@@ -140,7 +138,6 @@ int main() {
             NearlyEqual(voices.v.mixGainL[handle], before.mixGainL) &&
             NearlyEqual(voices.v.mixGainR[handle], before.mixGainR) &&
             voices.v.sampleStart[handle] == before.sampleStart &&
-            voices.v.sampleEnd[handle] == before.sampleEnd &&
             voices.activePosition_[handle] == before.activePosition &&
             voices.activeList_[voices.activePosition_[handle]] == handle;
         if (!identical) break;

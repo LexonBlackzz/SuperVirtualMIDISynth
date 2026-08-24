@@ -577,6 +577,10 @@ larger phase containing that item is complete.
 - [x] Raise the selectable pool beyond 4096 with capacity-sized voice and
   lifecycle indices (524,288 logical ceiling; practical limits remain to be
   characterized)
+- [x] Remove five write-only `VoiceSoA` arrays (`sampleEnd`, absolute loop
+  bounds, `decayGainStep`, and `samplePageId`), saving 20 bytes per voice
+  (10 MiB at 524,288 voices) and three stores per prepared launch without
+  changing render or lifecycle state
 - [ ] Implement segmented/paged SoA storage with bounded memory locality
 - [ ] Separate hot audible state from cold metadata and release state
 - [ ] Replace full active-list sorting with bucketed velocity/energy classes or

@@ -412,7 +412,6 @@ struct SamplePage {
     X(float, targetGain) \
     X(float, sustainLevel) \
     X(float, attackGainStep) \
-    X(float, decayGainStep) \
     X(float, releaseDecay) \
     X(float, gainLeft) \
     X(float, gainRight) \
@@ -422,9 +421,6 @@ struct SamplePage {
     X(float, renderGainR) \
     X(float, stealOutputGain) \
     X(uint32_t, sampleStart) \
-    X(uint32_t, sampleEnd) \
-    X(uint32_t, loopStart) \
-    X(uint32_t, loopEnd) \
     X(uint8_t, loopMode) \
     X(uint8_t, loopEnabled) \
     X(uint32_t, relEnd) \
@@ -438,7 +434,6 @@ struct SamplePage {
     X(uint32_t, delaySamplesRemaining) \
     X(uint32_t, releaseSamplesRemaining) \
     X(float, decaySlope) \
-    X(uint32_t, samplePageId) \
     X(uint8_t, heldBySustain) \
     X(uint8_t, heldBySostenuto) \
     X(uint32_t, releaseStartInBlock) \
