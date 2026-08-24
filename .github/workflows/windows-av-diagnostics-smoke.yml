@@ -24,7 +24,7 @@ jobs:
           @'
           #include "PageDiagnostics.h"
           #include "ConfigDocument.h"
-          #include "Theme.h"
+          #include "Widgets.h"
           #include "imgui.h"
 
           namespace svms::cfg {
