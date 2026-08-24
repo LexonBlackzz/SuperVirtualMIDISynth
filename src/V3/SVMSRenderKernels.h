@@ -49,6 +49,18 @@ const RenderKernelSet& SelectBestRenderKernelSet();
 const RenderKernelSet* SelectRenderKernelSet(RenderBackend backend);
 bool IsRenderBackendSupported(RenderBackend backend);
 
+#if !defined(SVMS_XP_COMPAT)
+// Builds the exact packed keys used by the volatile steal heap. Returns false
+// when the absolute frame is outside the vector kernel's exact 32-bit age
+// range, allowing the caller to retain the scalar path.
+bool BuildVolatileStealKeysAVX2(
+    const uint32_t* handles, uint32_t handleCount,
+    const uint64_t* birthFrames, const float* currentGains,
+    const float* outputGains, const uint32_t* activePositions,
+    uint64_t currentFrame, float gainScale, uint64_t* outputKeys,
+    uint32_t* outputHandles, uint32_t* inverseHeapPositions);
+#endif
+
 uint32_t ScalarRenderSustainedLoop(
     VoiceSoA& voices, uint32_t handle, const float* sampleData,
     uint32_t sampleDataFrames, float* outputLeft, float* outputRight,

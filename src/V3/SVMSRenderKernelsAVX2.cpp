@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <immintrin.h>
 
 namespace svms {
@@ -721,6 +722,114 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
 }
 
 } // namespace
+
+bool BuildVolatileStealKeysAVX2(
+    const uint32_t* handles, uint32_t handleCount,
+    const uint64_t* birthFrames, const float* currentGains,
+    const float* outputGains, const uint32_t* activePositions,
+    uint64_t currentFrame, float gainScale, uint64_t* outputKeys,
+    uint32_t* outputHandles, uint32_t* inverseHeapPositions) {
+    if (!handles || !birthFrames || !currentGains || !outputGains ||
+        !activePositions || !outputKeys || !outputHandles ||
+        !inverseHeapPositions || currentFrame >
+            static_cast<uint64_t>(INT32_MAX)) {
+        return false;
+    }
+
+    const __m256i current = _mm256_set1_epi32(
+        static_cast<int32_t>(currentFrame));
+    const __m256 ageScale = _mm256_set1_ps(1.0f / 256.0f);
+    const __m256 commonAge = _mm256_set1_ps(
+        static_cast<float>(currentFrame) * (1.0f / 256.0f));
+    const __m256 gainScaleVector = _mm256_set1_ps(gainScale);
+    const __m256 signMask = _mm256_set1_ps(-0.0f);
+
+    auto encode = [](float score, uint32_t activePosition) {
+        if (score == 0.0f) score = 0.0f;
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &score, sizeof(bits));
+        const uint32_t ordered = (bits & 0x80000000u) != 0u
+            ? ~bits : bits ^ 0x80000000u;
+        return (static_cast<uint64_t>(ordered) << 32u) |
+            (UINT32_MAX - activePosition);
+    };
+
+    uint32_t position = 0u;
+    for (; position + 8u <= handleCount; position += 8u) {
+        const __m256i h = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(handles + position));
+        // currentFrame <= INT32_MAX and birthFrame <= currentFrame for every
+        // live voice, so gathering the low dword is an exact unsigned age in
+        // the range where cvtepi32_ps matches scalar uint32_t conversion.
+        const __m256i births = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(birthFrames), h, 8);
+        const __m256 ages = _mm256_cvtepi32_ps(
+            _mm256_sub_epi32(current, births));
+        const __m256 gains = _mm256_andnot_ps(
+            signMask, _mm256_i32gather_ps(currentGains, h, 4));
+        const __m256 levels = _mm256_mul_ps(
+            gains, _mm256_i32gather_ps(outputGains, h, 4));
+        const __m256 score = _mm256_sub_ps(
+            _mm256_sub_ps(_mm256_mul_ps(ages, ageScale),
+                          _mm256_mul_ps(levels, gainScaleVector)),
+            commonAge);
+        const __m256i active = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(activePositions), h, 4);
+
+        // Encode eight float priorities and active-position ties into the
+        // same monotonic uint64_t ordering used by the scalar tournament.
+        // Normalizing signed zero retains EncodeStableWinnerKey exactly.
+        const __m256 zeroMask = _mm256_cmp_ps(
+            score, _mm256_setzero_ps(), _CMP_EQ_OQ);
+        const __m256 normalizedScore = _mm256_andnot_ps(zeroMask, score);
+        const __m256i scoreBits = _mm256_castps_si256(normalizedScore);
+        const __m256i sign = _mm256_srai_epi32(scoreBits, 31);
+        const __m256i ordered = _mm256_xor_si256(
+            scoreBits, _mm256_or_si256(
+                sign, _mm256_set1_epi32(static_cast<int32_t>(0x80000000u))));
+        const __m256i inverseActive = _mm256_xor_si256(
+            active, _mm256_set1_epi32(-1));
+        const __m256i lowPairs = _mm256_unpacklo_epi32(
+            inverseActive, ordered);
+        const __m256i highPairs = _mm256_unpackhi_epi32(
+            inverseActive, ordered);
+        const __m256i keys0123 = _mm256_permute2x128_si256(
+            lowPairs, highPairs, 0x20);
+        const __m256i keys4567 = _mm256_permute2x128_si256(
+            lowPairs, highPairs, 0x31);
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i*>(outputKeys + position), keys0123);
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i*>(outputKeys + position + 4u), keys4567);
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i*>(outputHandles + position), h);
+        for (uint32_t lane = 0u; lane < 8u; ++lane) {
+            const uint32_t heapPosition = position + lane;
+            const uint32_t handle = handles[heapPosition];
+            inverseHeapPositions[handle] = heapPosition;
+        }
+    }
+
+    const float commonAgeScalar =
+        static_cast<float>(currentFrame) * (1.0f / 256.0f);
+    for (; position < handleCount; ++position) {
+        const uint32_t handle = handles[position];
+        const uint64_t rawAge = currentFrame > birthFrames[handle]
+            ? currentFrame - birthFrames[handle] : 0u;
+        const uint32_t age = rawAge > UINT32_MAX
+            ? UINT32_MAX : static_cast<uint32_t>(rawAge);
+        const float ageUnits = static_cast<float>(age) * (1.0f / 256.0f);
+        const float level = std::fabs(currentGains[handle]) *
+            outputGains[handle];
+        const float score = ageUnits - level * gainScale;
+        outputKeys[position] = encode(
+            score - commonAgeScalar, activePositions[handle]);
+        outputHandles[position] = handle;
+        inverseHeapPositions[handle] = position;
+    }
+    _mm256_zeroupper();
+    return true;
+}
 
 const RenderKernelSet& GetAVX2RenderKernelSet() {
     static const RenderKernelSet set = [] {

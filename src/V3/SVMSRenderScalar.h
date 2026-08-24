@@ -2393,6 +2393,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     if (coverageProfilingEnabled_) ++coverageStats_.callbacks;
 #endif
+    voices.SetStealKeyBackend(kernelSet_->backend);
     // Live pool-limit changes are callback-boundary commands.  Applying one
     // before dense eligibility/snapshotting prevents a mid-plan lifecycle
     // mutation from invalidating worker-visible voice state.

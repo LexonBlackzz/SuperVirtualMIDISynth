@@ -398,6 +398,11 @@ larger phase containing that item is complete.
   removing float decode and generic candidate reconstruction from every steal.
   The same corpus reaches 6.24-6.28M events/s at 150.45-151.40 cycles per
   voice-sample, another small 0.5-1% gain
+- [x] Build volatile release/decay steal keys eight at a time with AVX2
+  gathers and packed integer encoding, retaining scalar fallback after the
+  exact 32-bit age window and on SSE2/XP. Heap construction falls about 23%;
+  pinned single-core 6M-note throughput rises 1.8-2.9% with oracle-identical
+  victims
 - [x] Replace per-steal scans of the 50 outgoing fade tails with an exact
   once-per-frame minimum heap and cached tail levels
 - [x] Pack each outgoing-tail heap level and list-position tie into one exact

@@ -1239,6 +1239,10 @@ void TestPersistentStealIndexAgainstOracle() {
     }
 
     auto denseVoices = std::make_unique<svms::VoiceManager>(*voices);
+#if !defined(SVMS_XP_COMPAT)
+    if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
+        denseVoices->SetStealKeyBackend(svms::RenderBackend::AVX2);
+#endif
     uint64_t frame = 9000u;
     for (uint32_t iteration = 0; iteration < 512u; ++iteration) {
         frame += (iteration == 256u)

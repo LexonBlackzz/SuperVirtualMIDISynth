@@ -4,6 +4,7 @@
 #include "SVMSTypes.h"
 #include "SVMSEnvelope.h"
 #include "SVMSLiveControl.h"
+#include "SVMSRenderKernels.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -244,6 +245,9 @@ public:
     // boundary, before dense plans or worker jobs can observe voice state.
     void ApplyRuntimeVoiceLimit(uint64_t frame);
     void SetCurrentFrame(uint64_t frame);
+    void SetStealKeyBackend(RenderBackend backend) {
+        stealKeyBackend_ = backend;
+    }
     uint32_t GetVoiceAge(VoiceHandle handle) const;
     uint32_t GetChannelActiveCount(uint8_t channel) const;
     template <typename Consumer>
@@ -493,6 +497,7 @@ private:
     uint32_t stealVolatileHeapCount_;
     uint64_t stealVolatileHeapFrame_;
     bool stealVolatileHeapValid_;
+    RenderBackend stealKeyBackend_;
     uint8_t* stealCandidateDeferred_;
     // A deferred same-frame replacement may keep ownership of the volatile
     // heap root while its sample/envelope fields are configured.  The slot
@@ -689,7 +694,8 @@ inline VoiceManager::VoiceManager()
       stealVolatileCount_(0), stealVolatileHeapKey_(nullptr),
       stealVolatileHeapHandle_(nullptr),
       stealVolatileHeapPosition_(nullptr), stealVolatileHeapCount_(0),
-      stealVolatileHeapFrame_(UINT64_MAX), stealVolatileHeapValid_(false) {
+      stealVolatileHeapFrame_(UINT64_MAX), stealVolatileHeapValid_(false),
+      stealKeyBackend_(RenderBackend::Scalar) {
     stealCandidateDeferred_ = nullptr;
     stealCandidateReserved_ = nullptr;
     playGroupNext_ = nullptr;
@@ -873,6 +879,7 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     stealVolatileHeapCount_ = other.stealVolatileHeapCount_;
     stealVolatileHeapFrame_ = other.stealVolatileHeapFrame_;
     stealVolatileHeapValid_ = other.stealVolatileHeapValid_;
+    stealKeyBackend_ = other.stealKeyBackend_;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     groupReuseAttemptCount_ = other.groupReuseAttemptCount_;
     groupReuseMatchCount_ = other.groupReuseMatchCount_;
@@ -1142,6 +1149,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     grown.stealVolatileHeapCount_ = 0u;
     grown.stealVolatileHeapFrame_ = UINT64_MAX;
     grown.stealVolatileHeapValid_ = false;
+    grown.stealKeyBackend_ = stealKeyBackend_;
     std::memset(grown.stealWinnerTree_, 0,
                 sizeof(*grown.stealWinnerTree_) * grown.stealTreeLeafBase_ * 2u);
     std::memset(grown.stealStableKey_, 0,
@@ -1258,6 +1266,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     stealVolatileHeapCount_ = grown.stealVolatileHeapCount_;
     stealVolatileHeapFrame_ = grown.stealVolatileHeapFrame_;
     stealVolatileHeapValid_ = grown.stealVolatileHeapValid_;
+    stealKeyBackend_ = grown.stealKeyBackend_;
     std::memcpy(stealTailList_, grown.stealTailList_, sizeof(stealTailList_));
     std::memcpy(stealTailPosition_, grown.stealTailPosition_,
                 sizeof(stealTailPosition_));
@@ -2714,31 +2723,43 @@ inline void VoiceManager::BuildVolatileStealHeap() {
     // inverse position is overwritten below, so clearing the old heap first
     // was a redundant second pass over the hottest dense-stealing population.
     stealVolatileHeapCount_ = 0u;
-    const float commonAgeScore =
-        static_cast<float>(currentFrame_) * (1.0f / 256.0f);
-    for (uint32_t position = 0; position < stealVolatileCount_; ++position) {
-        const uint32_t handle = stealVolatileList_[position];
-        const uint32_t heapPosition = stealVolatileHeapCount_++;
-        // Volatile means active decay or releasing, so its effective level is
-        // always currentGain * outputGain. Hoist the shared frame term and
-        // avoid re-running the stable/pre-decay classification for every
-        // candidate on every event frame. Keep the original arithmetic order
-        // so winner ties and floating-point rounding remain unchanged.
-        const uint64_t rawAge = currentFrame_ > v.birthFrame[handle]
-            ? currentFrame_ - v.birthFrame[handle] : 0u;
-        const uint32_t age = rawAge > UINT32_MAX
-            ? UINT32_MAX : static_cast<uint32_t>(rawAge);
-        const float ageUnits = static_cast<float>(age) * (1.0f / 256.0f);
-        const float effectiveLevel =
-            std::fabs(v.currentGain[handle]) * v.stealOutputGain[handle];
-        const float score = ageUnits -
-            effectiveLevel * kBassMidiStealGainScale;
-        stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
-            score - commonAgeScore,
-            activePosition_[handle]);
-        stealVolatileHeapHandle_[heapPosition] = handle;
-        stealVolatileHeapPosition_[handle] = heapPosition;
+    bool vectorized = false;
+#if !defined(SVMS_XP_COMPAT)
+    if (stealKeyBackend_ == RenderBackend::AVX2 &&
+        stealVolatileCount_ >= 8u) {
+        vectorized = BuildVolatileStealKeysAVX2(
+            stealVolatileList_, stealVolatileCount_, v.birthFrame,
+            v.currentGain, v.stealOutputGain, activePosition_, currentFrame_,
+            kBassMidiStealGainScale, stealVolatileHeapKey_,
+            stealVolatileHeapHandle_, stealVolatileHeapPosition_);
     }
+#endif
+    if (!vectorized) {
+        const float commonAgeScore =
+            static_cast<float>(currentFrame_) * (1.0f / 256.0f);
+        for (uint32_t position = 0; position < stealVolatileCount_; ++position) {
+            const uint32_t handle = stealVolatileList_[position];
+            // Volatile means active decay or releasing, so its effective
+            // level is always currentGain * outputGain. Keep the original
+            // arithmetic order so ties and floating-point rounding remain
+            // unchanged.
+            const uint64_t rawAge = currentFrame_ > v.birthFrame[handle]
+                ? currentFrame_ - v.birthFrame[handle] : 0u;
+            const uint32_t age = rawAge > UINT32_MAX
+                ? UINT32_MAX : static_cast<uint32_t>(rawAge);
+            const float ageUnits =
+                static_cast<float>(age) * (1.0f / 256.0f);
+            const float effectiveLevel = std::fabs(v.currentGain[handle]) *
+                v.stealOutputGain[handle];
+            const float score = ageUnits -
+                effectiveLevel * kBassMidiStealGainScale;
+            stealVolatileHeapKey_[position] = EncodeStableWinnerKey(
+                score - commonAgeScore, activePosition_[handle]);
+            stealVolatileHeapHandle_[position] = handle;
+            stealVolatileHeapPosition_[handle] = position;
+        }
+    }
+    stealVolatileHeapCount_ = stealVolatileCount_;
     if (stealVolatileHeapCount_ > 1u) {
         for (uint32_t position = stealVolatileHeapCount_ / 2u;
              position-- > 0u;) VolatileHeapSiftDown(position);
