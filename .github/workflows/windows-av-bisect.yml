@@ -1,4 +1,4 @@
-name: Windows AV bisect 0.6.5 to 0.7
+name: Windows AV history smoke
 
 on:
   workflow_dispatch:
@@ -16,23 +16,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: 00-clean-v0.6.5
+          - label: pre-v0.6
+            ref: bc5592233b0a8048a17d9734d339bdf88ce829ff
+          - label: v0.6.5
             ref: e13bbb917793cff0a9d71e2300edc779927574fb
-          - label: 01-first-after-v0.6.5
+          - label: first-after-v0.6.5
             ref: b5ace69e70ed2e8f0a6055cae481c40516670bab
-          - label: 02-late-aug19
+          - label: late-aug19
             ref: f837e604e87ca9eb937a6453abe4319354f8e594
-          - label: 03-event-pages
+          - label: event-pages
             ref: e3bdd106125e169ad9132eea81f4d93131ea27ce
-          - label: 04-dense-pipeline
+          - label: dense-pipeline
             ref: da7f4966e51f7b6636cf659b62a3434d713dc6be
-          - label: 05-dense-dispatch
+          - label: dense-dispatch
             ref: 6fa3a8e763fb4c3d88abedca5ce1deb1f5892bb3
-          - label: 06-note-launch-batching
+          - label: note-launch-batching
             ref: 4d5777597399b77bd91f224d4e0860559e9bd29f
-          - label: 07-pre-release
+          - label: pre-v0.7
             ref: 079116de5e5a43c19a2982ddb66ce9cf4fc5d34c
-          - label: 08-bad-v0.7
+          - label: v0.7
             ref: a43c1797757f5bcf7ca15dd209634220700607bb
 
     steps:
