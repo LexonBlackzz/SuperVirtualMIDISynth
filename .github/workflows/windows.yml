@@ -1,0 +1,43 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v3, main]
+    paths:
+      - ".github/workflows/windows.yml"
+      - "build_v3.bat"
+      - "find_vs.bat"
+      - "src/V3/**"
+      - "third_party/**"
+  pull_request:
+    paths:
+      - ".github/workflows/windows.yml"
+      - "build_v3.bat"
+      - "find_vs.bat"
+      - "src/V3/**"
+      - "third_party/**"
+
+jobs:
+  windows-x64:
+    name: Windows x64 Release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build V3 x64 Release
+        shell: cmd
+        run: call build_v3.bat
+
+      - name: Run tests
+        shell: pwsh
+        run: ctest --test-dir build/V3 --output-on-failure
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: SVMS-V3-windows-x64
+          path: build/V3/bin/
+          if-no-files-found: error
