@@ -179,7 +179,9 @@ void PathRow(const char* label, const std::wstring& path,
         }
     }
     ImGui::TableNextColumn();
+    ImGui::PushID(label);
     if (ImGui::Button(buttonLabel, ImVec2(92.0f, 0.0f))) browse();
+    ImGui::PopID();
 }
 
 } // namespace
