@@ -604,7 +604,7 @@ inline bool RenderScalar::EnsureDenseStorage() {
         scratchCapacity_ > kDenseRenderMaximumVoices) {
         return true;
     }
-    if (!denseRenderState_.Reserve(scratchCapacity_)) return false;
+    if (!denseRenderState_.ReserveDenseRender(scratchCapacity_)) return false;
     if (denseMutationCapacity_ == 0u) {
         const uint32_t mutationCapacity = kDenseRenderMutationCapacity;
         const uint32_t tileCapacity =

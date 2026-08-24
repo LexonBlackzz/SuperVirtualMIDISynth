@@ -582,7 +582,10 @@ larger phase containing that item is complete.
   (10 MiB at 524,288 voices) and three stores per prepared launch without
   changing render or lifecycle state
 - [ ] Implement segmented/paged SoA storage with bounded memory locality
-- [ ] Separate hot audible state from cold metadata and release state
+- [x] Separate hot audible/render state from cold MIDI, linkage, and stealing
+  metadata. The dense multicore shadow now reserves only the arrays its
+  workers consume, removing another 54 bytes per configured voice (27 MiB at
+  524,288 voices) while the authoritative pool retains complete exact state
 - [ ] Replace full active-list sorting with bucketed velocity/energy classes or
   hierarchical active tiles
 - [ ] Add multi-rate advancement and compact scheduling for quiet/dormant tails

@@ -393,35 +393,23 @@ struct SamplePage {
 //
 // Removed: fractional phase offsets; event starts are integer output frames.
 // ════════════════════════════════════════════════════════════════════════
-#define SVMS_VOICE_SOA_DYNAMIC_FIELDS(X) \
-    X(uint8_t, channel) \
-    X(uint8_t, note) \
-    X(uint8_t, velocity) \
+#define SVMS_VOICE_SOA_DENSE_FIELDS(X) \
     X(uint8_t, state) \
     X(uint8_t, envelopeStage) \
     X(uint8_t, sampleBacked) \
     X(uint8_t, renderClass) \
-    X(uint16_t, presetIndex) \
-    X(uint16_t, regionIndex) \
-    X(uint32_t, playIndex) \
     X(float, phases) \
     X(float, phaseIncs) \
-    X(float, basePhaseIncs) \
-    X(float, pitchBendScales) \
     X(float, currentGain) \
     X(float, targetGain) \
     X(float, sustainLevel) \
     X(float, attackGainStep) \
     X(float, releaseDecay) \
-    X(float, gainLeft) \
-    X(float, gainRight) \
     X(float, mixGainL) \
     X(float, mixGainR) \
     X(float, renderGainL) \
     X(float, renderGainR) \
-    X(float, stealOutputGain) \
     X(uint32_t, sampleStart) \
-    X(uint8_t, loopMode) \
     X(uint8_t, loopEnabled) \
     X(uint32_t, relEnd) \
     X(uint32_t, relLoopS) \
@@ -434,14 +422,32 @@ struct SamplePage {
     X(uint32_t, delaySamplesRemaining) \
     X(uint32_t, releaseSamplesRemaining) \
     X(float, decaySlope) \
+    X(uint32_t, stealFadeInFramesRemaining) \
+    X(uint32_t, stealFadeInFramesTotal)
+
+#define SVMS_VOICE_SOA_COLD_FIELDS(X) \
+    X(uint8_t, channel) \
+    X(uint8_t, note) \
+    X(uint8_t, velocity) \
+    X(uint16_t, presetIndex) \
+    X(uint16_t, regionIndex) \
+    X(uint32_t, playIndex) \
+    X(float, basePhaseIncs) \
+    X(float, pitchBendScales) \
+    X(float, gainLeft) \
+    X(float, gainRight) \
+    X(float, stealOutputGain) \
+    X(uint8_t, loopMode) \
     X(uint8_t, heldBySustain) \
     X(uint8_t, heldBySostenuto) \
     X(uint32_t, releaseStartInBlock) \
     X(int32_t, nextChannelKeyVoice) \
     X(int32_t, prevChannelKeyVoice) \
-    X(uint64_t, birthFrame) \
-    X(uint32_t, stealFadeInFramesRemaining) \
-    X(uint32_t, stealFadeInFramesTotal)
+    X(uint64_t, birthFrame)
+
+#define SVMS_VOICE_SOA_DYNAMIC_FIELDS(X) \
+    SVMS_VOICE_SOA_DENSE_FIELDS(X) \
+    SVMS_VOICE_SOA_COLD_FIELDS(X)
 
 #define SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(X) \
     X(float, stealTailPhase, kStealTailReserve) \
@@ -488,13 +494,19 @@ struct alignas(64) VoiceSoA {
 
     VoiceSoA(const VoiceSoA& other) {
         ResetFixedTails();
-        if (!Reserve(other.capacity_)) throw std::bad_alloc();
+        const bool reserved = other.denseOnly_
+            ? ReserveDenseRender(other.capacity_)
+            : Reserve(other.capacity_);
+        if (!reserved) throw std::bad_alloc();
         CopyFrom(other);
     }
 
     VoiceSoA& operator=(const VoiceSoA& other) {
         if (this == &other) return *this;
-        if (!Reserve(other.capacity_)) throw std::bad_alloc();
+        const bool reserved = other.denseOnly_
+            ? ReserveDenseRender(other.capacity_)
+            : Reserve(other.capacity_);
+        if (!reserved) throw std::bad_alloc();
         CopyFrom(other);
         return *this;
     }
@@ -509,7 +521,7 @@ struct alignas(64) VoiceSoA {
     }
 
     bool Reserve(uint32_t capacity) noexcept {
-        if (capacity == capacity_) return true;
+        if (capacity == capacity_ && !denseOnly_) return true;
         if (capacity == 0u) {
             ReleaseStorage();
             return true;
@@ -528,6 +540,11 @@ struct alignas(64) VoiceSoA {
         storage_ = allocation;
         storageBytes_ = bytes;
         capacity_ = capacity;
+        denseOnly_ = false;
+
+#define SVMS_NULL_BEFORE_BIND(type, name) name = nullptr;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_BEFORE_BIND)
+#undef SVMS_NULL_BEFORE_BIND
 
         size_t offset = 0u;
         uint8_t* base = static_cast<uint8_t*>(storage_);
@@ -537,6 +554,46 @@ struct alignas(64) VoiceSoA {
         offset += static_cast<size_t>(capacity_) * sizeof(type);
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_BIND_DYNAMIC_FIELD)
 #undef SVMS_BIND_DYNAMIC_FIELD
+        return true;
+    }
+
+    // The dense multicore planner owns a private synthesis image. It never
+    // reads MIDI identity, channel/key links, pitch bookkeeping, or steal
+    // metadata, so do not reserve those cold arrays a second time.
+    bool ReserveDenseRender(uint32_t capacity) noexcept {
+        if (capacity == capacity_ && denseOnly_) return true;
+        if (capacity == 0u) {
+            ReleaseStorage();
+            return true;
+        }
+
+        size_t bytes = 0u;
+#define SVMS_ACCUMULATE_DENSE_FIELD_SIZE(type, name) \
+        bytes = AlignUp(bytes); \
+        bytes += static_cast<size_t>(capacity) * sizeof(type);
+        SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_ACCUMULATE_DENSE_FIELD_SIZE)
+#undef SVMS_ACCUMULATE_DENSE_FIELD_SIZE
+
+        void* allocation = _aligned_malloc(bytes, kMixBufferAlign);
+        if (!allocation) return false;
+        _aligned_free(storage_);
+        storage_ = allocation;
+        storageBytes_ = bytes;
+        capacity_ = capacity;
+        denseOnly_ = true;
+
+#define SVMS_NULL_BEFORE_DENSE_BIND(type, name) name = nullptr;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_BEFORE_DENSE_BIND)
+#undef SVMS_NULL_BEFORE_DENSE_BIND
+
+        size_t offset = 0u;
+        uint8_t* base = static_cast<uint8_t*>(storage_);
+#define SVMS_BIND_DENSE_FIELD(type, name) \
+        offset = AlignUp(offset); \
+        name = reinterpret_cast<type*>(base + offset); \
+        offset += static_cast<size_t>(capacity_) * sizeof(type);
+        SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_BIND_DENSE_FIELD)
+#undef SVMS_BIND_DENSE_FIELD
         return true;
     }
 
@@ -656,7 +713,7 @@ private:
 
     void CopyFrom(const VoiceSoA& other) noexcept {
 #define SVMS_COPY_DYNAMIC_FIELD(type, name) \
-        if (name) std::memcpy(name, other.name, \
+        if (name && other.name) std::memcpy(name, other.name, \
             static_cast<size_t>(capacity_) * sizeof(type));
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_DYNAMIC_FIELD)
 #undef SVMS_COPY_DYNAMIC_FIELD
@@ -671,6 +728,7 @@ private:
         storage_ = other.storage_;
         storageBytes_ = other.storageBytes_;
         capacity_ = other.capacity_;
+        denseOnly_ = other.denseOnly_;
 #define SVMS_MOVE_DYNAMIC_FIELD(type, name) \
         name = other.name; \
         other.name = nullptr;
@@ -684,6 +742,7 @@ private:
         other.storage_ = nullptr;
         other.storageBytes_ = 0u;
         other.capacity_ = 0u;
+        other.denseOnly_ = false;
         other.pad16 = 0u;
         other.ResetFixedTails();
     }
@@ -693,6 +752,7 @@ private:
         storage_ = nullptr;
         storageBytes_ = 0u;
         capacity_ = 0u;
+        denseOnly_ = false;
 #define SVMS_NULL_DYNAMIC_FIELD(type, name) name = nullptr;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_DYNAMIC_FIELD)
 #undef SVMS_NULL_DYNAMIC_FIELD
@@ -701,10 +761,13 @@ private:
     void* storage_ = nullptr;
     size_t storageBytes_ = 0u;
     uint32_t capacity_ = 0u;
+    bool denseOnly_ = false;
 };
 
 #undef SVMS_VOICE_SOA_FIXED_TAIL_FIELDS
 #undef SVMS_VOICE_SOA_DYNAMIC_FIELDS
+#undef SVMS_VOICE_SOA_COLD_FIELDS
+#undef SVMS_VOICE_SOA_DENSE_FIELDS
 
 } // namespace svms
 
