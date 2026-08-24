@@ -1,0 +1,328 @@
+name: Windows Configurator AV feature isolation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v3]
+    paths:
+      - ".github/workflows/windows-av-feature-isolation.yml"
+
+jobs:
+  isolate:
+    name: Build AV isolation samples
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create build helper
+        shell: pwsh
+        run: |
+          @'
+          @echo off
+          call find_vs.bat
+          if errorlevel 1 exit /b %errorlevel%
+          call "%VS_VCVARSALL%" x64
+          if errorlevel 1 exit /b %errorlevel%
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S src\V3 -B build\av-feature
+          if errorlevel 1 exit /b %errorlevel%
+          cmake --build build\av-feature --config Release --target svms_v3_configurator
+          exit /b %errorlevel%
+          '@ | Set-Content -Encoding ascii av-build.cmd
+          New-Item -ItemType Directory -Force av-feature-isolation | Out-Null
+
+      - name: Build FULL
+        shell: cmd
+        run: |
+          call av-build.cmd
+          if errorlevel 1 exit /b %errorlevel%
+          copy /y build\av-feature\bin\svms_v3_configurator.exe av-feature-isolation\01-FULL.exe >nul
+
+      - name: Build NO-UPDATE
+        shell: pwsh
+        run: |
+          @'
+          #include "UpdateService.h"
+          #include <mutex>
+
+          namespace svms::cfg {
+
+          UpdateService::~UpdateService() {
+              if (worker_.joinable()) worker_.join();
+          }
+
+          void UpdateService::CheckAsync(bool) {
+              UpdateSnapshot snapshot{};
+              snapshot.status = UpdateStatus::Failed;
+              snapshot.message = "Update service disabled for AV isolation build.";
+              Publish(snapshot);
+          }
+
+          UpdateSnapshot UpdateService::GetSnapshot() const {
+              std::lock_guard<std::mutex> lock(mutex_);
+              return snapshot_;
+          }
+
+          void UpdateService::CheckWorker(bool) {}
+
+          void UpdateService::Publish(const UpdateSnapshot& snapshot) {
+              std::lock_guard<std::mutex> lock(mutex_);
+              snapshot_ = snapshot;
+          }
+
+          } // namespace svms::cfg
+          '@ | Set-Content -Encoding utf8 src/V3/Configurator/UpdateService.cpp
+          cmd /c av-build.cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build/av-feature/bin/svms_v3_configurator.exe av-feature-isolation/02-NO-UPDATE.exe
+          git checkout -- src/V3/Configurator/UpdateService.cpp
+
+      - name: Build NO-OFFLINE
+        shell: pwsh
+        run: |
+          @'
+          #include "PageOffline.h"
+          #include "imgui.h"
+
+          namespace svms::cfg {
+
+          OfflineRendererPage::~OfflineRendererPage() { Shutdown(); }
+
+          void OfflineRendererPage::Draw(ConfigDocument&, HWND) {
+              ImGui::TextDisabled("Offline renderer disabled for AV isolation build.");
+          }
+
+          void OfflineRendererPage::Shutdown() {
+              shutdown_ = true;
+          }
+
+          } // namespace svms::cfg
+          '@ | Set-Content -Encoding utf8 src/V3/Configurator/PageOffline.cpp
+          cmd /c av-build.cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build/av-feature/bin/svms_v3_configurator.exe av-feature-isolation/03-NO-OFFLINE.exe
+          git checkout -- src/V3/Configurator/PageOffline.cpp
+
+      - name: Build NO-RUNTIMELINK
+        shell: pwsh
+        run: |
+          @'
+          #ifndef SVMS_RUNTIME_LINK_H
+          #define SVMS_RUNTIME_LINK_H
+
+          #include "SVMSRuntimeLinkProtocol.h"
+          #include "SVMSBuildInfo.h"
+          #include <cstdint>
+
+          namespace svms {
+
+          class RuntimeLinkClient {
+          public:
+              enum class Protocol : uint32_t { None = 0u, V2 = 2u, V3 = 3u };
+
+              struct HostInfo {
+                  uint32_t pid = 0u;
+                  uint32_t archClass = 0u;
+                  uint32_t productMajor = 0u;
+                  uint32_t productMinor = 0u;
+                  uint32_t productPatch = 0u;
+                  uint32_t buildNumber = 0u;
+                  uint32_t releaseChannel = 0u;
+                  uint32_t protocolMin = 0u;
+                  uint32_t protocolMax = 0u;
+                  uint64_t capabilityFlags = 0u;
+                  uint64_t sessionId = 0u;
+                  bool fresh = false;
+                  bool hasVersionIdentity = false;
+              };
+
+              bool Open(uint32_t) { return false; }
+              void Close() {}
+              bool IsOpen() const { return false; }
+              uint32_t GetPID() const { return 0u; }
+              Protocol GetProtocol() const { return Protocol::None; }
+              const HostInfo& GetPeerInfo() const { return peer_; }
+              bool HasCapability(uint64_t) const { return false; }
+              bool ReadTelemetry(RuntimeLinkTelemetryV2&) { return false; }
+              bool IsHostAlive(uint32_t) const { return false; }
+
+              RLResult SendCommand(
+                  RLCommandType, uint32_t, uint32_t,
+                  const RuntimeLiveStateV2&, uint32_t,
+                  char[kRuntimeLinkResultTextCapacity] = nullptr,
+                  const char* = nullptr) {
+                  return RLResult::InternalError;
+              }
+
+              static uint32_t EnumerateHosts(HostInfo*, uint32_t) { return 0u; }
+
+          private:
+              HostInfo peer_{};
+          };
+
+          } // namespace svms
+
+          #endif
+          '@ | Set-Content -Encoding utf8 src/V3/SVMSRuntimeLink.h
+          cmd /c av-build.cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build/av-feature/bin/svms_v3_configurator.exe av-feature-isolation/04-NO-RUNTIMELINK.exe
+          git checkout -- src/V3/SVMSRuntimeLink.h
+
+      - name: Build MINIMAL ImGui + D3D11 shell
+        shell: pwsh
+        run: |
+          @'
+          #ifndef WIN32_LEAN_AND_MEAN
+          #define WIN32_LEAN_AND_MEAN
+          #endif
+          #include <windows.h>
+          #include <d3d11.h>
+          #include "imgui.h"
+          #include "imgui_impl_win32.h"
+          #include "imgui_impl_dx11.h"
+
+          static ID3D11Device* gDevice = nullptr;
+          static ID3D11DeviceContext* gContext = nullptr;
+          static IDXGISwapChain* gSwapChain = nullptr;
+          static ID3D11RenderTargetView* gTarget = nullptr;
+
+          extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+              HWND, UINT, WPARAM, LPARAM);
+
+          static void CreateTarget() {
+              ID3D11Texture2D* backBuffer = nullptr;
+              if (SUCCEEDED(gSwapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
+                  gDevice->CreateRenderTargetView(backBuffer, nullptr, &gTarget);
+                  backBuffer->Release();
+              }
+          }
+
+          static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam,
+                                           LPARAM lParam) {
+              if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+                  return 1;
+              if (msg == WM_DESTROY) {
+                  PostQuitMessage(0);
+                  return 0;
+              }
+              return DefWindowProcW(hWnd, msg, wParam, lParam);
+          }
+
+          int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
+              WNDCLASSEXW wc{};
+              wc.cbSize = sizeof(wc);
+              wc.lpfnWndProc = WndProc;
+              wc.hInstance = instance;
+              wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+              wc.lpszClassName = L"SVMS_AV_Minimal";
+              if (!RegisterClassExW(&wc)) return 1;
+
+              HWND hwnd = CreateWindowExW(
+                  0, wc.lpszClassName,
+                  L"SuperVirtualMIDISynth AV Minimal",
+                  WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                  900, 600, nullptr, nullptr, instance, nullptr);
+              if (!hwnd) return 2;
+
+              DXGI_SWAP_CHAIN_DESC sd{};
+              sd.BufferCount = 2;
+              sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+              sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+              sd.OutputWindow = hwnd;
+              sd.SampleDesc.Count = 1;
+              sd.Windowed = TRUE;
+              sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+              D3D_FEATURE_LEVEL level{};
+              const D3D_FEATURE_LEVEL levels[] = {
+                  D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+              if (FAILED(D3D11CreateDeviceAndSwapChain(
+                      nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                      levels, 2, D3D11_SDK_VERSION, &sd, &gSwapChain,
+                      &gDevice, &level, &gContext))) return 3;
+              CreateTarget();
+
+              IMGUI_CHECKVERSION();
+              ImGui::CreateContext();
+              ImGui::StyleColorsDark();
+              ImGui_ImplWin32_Init(hwnd);
+              ImGui_ImplDX11_Init(gDevice, gContext);
+              ShowWindow(hwnd, SW_SHOWDEFAULT);
+              UpdateWindow(hwnd);
+
+              bool running = true;
+              while (running) {
+                  MSG msg{};
+                  while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                      TranslateMessage(&msg);
+                      DispatchMessageW(&msg);
+                      if (msg.message == WM_QUIT) running = false;
+                  }
+                  if (!running) break;
+                  ImGui_ImplDX11_NewFrame();
+                  ImGui_ImplWin32_NewFrame();
+                  ImGui::NewFrame();
+                  ImGui::Begin("SuperVirtualMIDISynth");
+                  ImGui::TextUnformatted("Minimal ImGui + D3D11 AV isolation build");
+                  ImGui::End();
+                  ImGui::Render();
+                  const float clear[4] = {0.08f, 0.08f, 0.08f, 1.0f};
+                  gContext->OMSetRenderTargets(1, &gTarget, nullptr);
+                  gContext->ClearRenderTargetView(gTarget, clear);
+                  ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+                  gSwapChain->Present(1, 0);
+              }
+
+              ImGui_ImplDX11_Shutdown();
+              ImGui_ImplWin32_Shutdown();
+              ImGui::DestroyContext();
+              if (gTarget) gTarget->Release();
+              if (gSwapChain) gSwapChain->Release();
+              if (gContext) gContext->Release();
+              if (gDevice) gDevice->Release();
+              DestroyWindow(hwnd);
+              UnregisterClassW(wc.lpszClassName, instance);
+              return 0;
+          }
+          '@ | Set-Content -Encoding utf8 src/V3/Configurator/AVMinimal.cpp
+
+          $cmakePath = 'src/V3/CMakeLists.txt'
+          $cmake = Get-Content $cmakePath -Raw
+          $replacement = @'
+          set(CONFIGURATOR_SOURCES
+              Configurator/AVMinimal.cpp
+          )
+          add_executable(svms_v3_configurator
+          '@
+          $pattern = '(?s)set\(CONFIGURATOR_SOURCES.*?\)\s*add_executable\(svms_v3_configurator'
+          $cmake = [regex]::Replace($cmake, $pattern, $replacement, 1)
+          Set-Content -Encoding utf8 $cmakePath $cmake
+
+          cmd /c av-build.cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build/av-feature/bin/svms_v3_configurator.exe av-feature-isolation/05-MINIMAL-IMGUI-D3D11.exe
+
+      - name: Write sample notes
+        shell: pwsh
+        run: |
+          @"
+          Built from commit $env:GITHUB_SHA
+
+          01-FULL.exe                 Normal current Configurator.
+          02-NO-UPDATE.exe            UpdateService replaced with a no-network stub.
+          03-NO-OFFLINE.exe           Offline renderer/process supervisor replaced with a UI stub.
+          04-NO-RUNTIMELINK.exe       RuntimeLink client replaced with a no-IPC stub.
+          05-MINIMAL-IMGUI-D3D11.exe  Only Win32 + Dear ImGui + D3D11 shell.
+
+          Upload these five EXEs to VirusTotal and compare Microsoft's label.
+          "@ | Set-Content -Encoding ascii av-feature-isolation/README.txt
+
+      - name: Upload all AV isolation samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: SVMSConfigurator-AV-feature-isolation
+          path: av-feature-isolation/
+          if-no-files-found: error
