@@ -489,6 +489,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/PageAudio.cpp
         Configurator/PagePerformance.cpp
         Configurator/PageMidi.cpp
+        Configurator/PageOffline.cpp
         Configurator/PageReverb.cpp
         Configurator/PageLimiter.cpp
         Configurator/PageDiagnostics.cpp

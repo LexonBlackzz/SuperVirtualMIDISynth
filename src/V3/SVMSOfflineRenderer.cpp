@@ -48,7 +48,120 @@ struct Options {
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
     bool quiet = false;
     bool scanOnly = false;
+    bool machineProgress = false;
+    std::wstring cancelEvent;
 };
+
+// The machine stream is deliberately tiny and line-oriented so the standalone
+// renderer remains easy to launch from non-SVMS frontends as well. Fields are
+// tab separated and every record is flushed immediately.
+void MachineStatus(const Options& o, const char* state,
+                   const std::string& message = {}) {
+    if (!o.machineProgress) return;
+    std::string clean = message;
+    for (char& c : clean) {
+        if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+    }
+    std::fprintf(stdout, "SVMS3\tSTATUS\t%s\t%s\n", state, clean.c_str());
+    std::fflush(stdout);
+}
+
+void MachineLoadProgress(const Options& o, double progress, double elapsed,
+                         double eta, uint64_t processed, uint64_t total) {
+    if (!o.machineProgress) return;
+    std::fprintf(stdout,
+                 "SVMS3\tLOAD\t%.9f\t%.6f\t%.6f\t%llu\t%llu\n",
+                 progress, elapsed, eta,
+                 static_cast<unsigned long long>(processed),
+                 static_cast<unsigned long long>(total));
+    std::fflush(stdout);
+}
+
+void MachineRenderProgress(const Options& o, double progress, double elapsed,
+                           double rendered, double total, double speed,
+                           double eta, uint32_t active, uint32_t peak,
+                           uint64_t steals, uint64_t events, bool tail) {
+    if (!o.machineProgress) return;
+    std::fprintf(stdout,
+                 "SVMS3\tRENDER\t%.9f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f"
+                 "\t%u\t%u\t%llu\t%llu\t%s\n",
+                 progress, elapsed, rendered, total, speed, eta,
+                 active, peak,
+                 static_cast<unsigned long long>(steals),
+                 static_cast<unsigned long long>(events),
+                 tail ? "tail" : "midi");
+    std::fflush(stdout);
+}
+
+class ExternalCancellation {
+public:
+    ~ExternalCancellation() {
+#if defined(_WIN32)
+        if (event_) CloseHandle(event_);
+#endif
+    }
+
+    bool Open(const std::wstring& name, std::string& error) {
+        if (name.empty()) return true;
+#if defined(_WIN32)
+        event_ = OpenEventW(SYNCHRONIZE, FALSE, name.c_str());
+        if (!event_) {
+            error = "cannot open cancellation event";
+            return false;
+        }
+        return true;
+#else
+        (void)name;
+        error = "external cancellation events are only supported on Windows";
+        return false;
+#endif
+    }
+
+    bool Requested() const {
+#if defined(_WIN32)
+        return event_ && WaitForSingleObject(event_, 0) == WAIT_OBJECT_0;
+#else
+        return false;
+#endif
+    }
+
+private:
+#if defined(_WIN32)
+    HANDLE event_ = nullptr;
+#endif
+};
+
+struct ScanProgressContext {
+    const Options* options = nullptr;
+    ExternalCancellation* externalCancel = nullptr;
+    std::atomic<bool>* cancel = nullptr;
+    std::chrono::steady_clock::time_point start{};
+    std::chrono::steady_clock::time_point last{};
+};
+
+bool ReportScanProgress(uint64_t processed, uint64_t total,
+                        uint64_t, void* user) {
+    auto& context = *static_cast<ScanProgressContext*>(user);
+    if (context.externalCancel->Requested())
+        context.cancel->store(true, std::memory_order_relaxed);
+    if (context.cancel->load(std::memory_order_relaxed)) return false;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (processed < total && now - context.last < std::chrono::milliseconds(100))
+        return true;
+    context.last = now;
+    const double elapsed = std::chrono::duration<double>(now - context.start).count();
+    const double fraction = total
+        ? (std::min)(1.0, static_cast<double>(processed) /
+                           static_cast<double>(total))
+        : 1.0;
+    const double eta = fraction > 0.0
+        ? (std::max)(0.0, elapsed * (1.0 - fraction) / fraction)
+        : 0.0;
+    MachineLoadProgress(*context.options, fraction, elapsed, eta,
+                        processed, total);
+    return true;
+}
 
 void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
     // The standalone renderer is still explicitly given a MIDI, SoundFont and
@@ -146,7 +259,8 @@ void Usage() {
            L"  --limiter-release-ms F    Override release, 1-5000 ms\n"
            L"  --backend auto|scalar|sse2|avx2\n"
            L"  --scan-only           Validate/count without loading SF2 or rendering\n"
-           L"  --quiet               Disable once-per-second telemetry\n", stderr);
+           L"  --quiet               Disable once-per-second telemetry\n"
+           L"  --machine-progress    Emit tab-separated progress records\n", stderr);
 }
 
 bool ParseOptions(int argc, wchar_t** argv, Options& o) {
@@ -161,6 +275,11 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
         const std::wstring arg = argv[i];
         auto value = [&]() -> const wchar_t* { return ++i < argc ? argv[i] : nullptr; };
         if (arg == L"--quiet") o.quiet = true;
+        else if (arg == L"--machine-progress") o.machineProgress = true;
+        else if (arg == L"--cancel-event") {
+            const auto p=value(); if (!p || !p[0]) return false;
+            o.cancelEvent = p;
+        }
         else if (arg == L"--scan-only") o.scanOnly = true;
         else if (arg == L"--no-limiter") o.limiterEnabled = false;
         else if (arg == L"--sample-rate") { const auto p=value(); if (!p || !ParseU32(p,8000,384000,o.sampleRate)) return false; }
@@ -387,10 +506,10 @@ bool RingSink(const PackedMidiEvent& e,void* p){auto& c=*static_cast<ProducerCon
 } // namespace
 } // namespace svms
 
-int RendererMain(int argc,wchar_t** argv) {
+int RendererMain(int argc, wchar_t** argv) {
     using namespace svms;
 #if defined(_WIN32)
-    const EngineConfig engineConfig=EngineConfig::Load();
+    const EngineConfig engineConfig = EngineConfig::Load();
 #else
     EngineConfig engineConfig{};
     engineConfig.sampleRate = kDefaultSampleRate;
@@ -404,12 +523,73 @@ int RendererMain(int argc,wchar_t** argv) {
     engineConfig.limiterAttackMs = 0.5f;
     engineConfig.limiterReleaseMs = 100.0f;
 #endif
-    Options o;ApplyConfigDefaults(engineConfig,o);if(!ParseOptions(argc,argv,o)){Usage();return 2;}
-    if(!o.quiet&&!engineConfig.configWarning.empty())fprintf(stderr,"config warning: %s\n",engineConfig.configWarning.c_str());
-    std::string error;MappedMidiFile midi;if(!midi.Open(o.midi.c_str(),error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
-    MidiStreamDecoder decoder;MidiStreamInfo info;if(!decoder.Scan(midi,o.sampleRate,info,error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
-    if(o.scanOnly){fwprintf(stdout,L"SMF %u, %u tracks, %llu channel events, %llu note-ons, %llu frames (%s at %u Hz)\nPeak 1s: %llu events at %s, %llu note-ons at %s; peak frame: %llu events (%llu note-ons) at frame %llu\nExact-frame repetition: %llu exact duplicates total (peak %llu/frame), %llu channel/key duplicates total (peak %llu/frame), across %llu note-on frames\nWithin uninterrupted note-on runs: %llu exact duplicates (peak %llu/frame), %llu immediately adjacent\n",info.format,info.tracks,info.eventCount,info.noteOnCount,info.totalFrames,FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),o.sampleRate,info.peakEventsPerSecond,FormatTime(double(info.peakEventSecond)).c_str(),info.peakNoteOnsPerSecond,FormatTime(double(info.peakNoteOnSecond)).c_str(),info.peakEventsAtFrame,info.peakNoteOnsAtFrame,info.peakFrame,info.exactDuplicateNoteOnCount,info.peakExactDuplicateNoteOnsAtFrame,info.keyDuplicateNoteOnCount,info.peakKeyDuplicateNoteOnsAtFrame,info.noteOnFrameCount,info.noteRunExactDuplicateCount,info.peakNoteRunExactDuplicatesAtFrame,info.adjacentExactDuplicateNoteOnCount);return 0;}
-    ParsedEventRing ring(o.eventBufferMB);if(!ring.IsValid()){fprintf(stderr,"error: cannot allocate parsed-event ring\n");return 1;}
+
+    Options o;
+    ApplyConfigDefaults(engineConfig, o);
+    if (!ParseOptions(argc, argv, o)) {
+        Usage();
+        return 2;
+    }
+
+    auto fail = [&](const std::string& message) {
+        MachineStatus(o, "ERROR", message);
+        std::fprintf(stderr, "error: %s\n", message.c_str());
+        return 1;
+    };
+
+    const bool humanProgress = !o.quiet && !o.machineProgress;
+    if (humanProgress && !engineConfig.configWarning.empty())
+        std::fprintf(stderr, "config warning: %s\n",
+                     engineConfig.configWarning.c_str());
+
+    std::string error;
+    ExternalCancellation externalCancel;
+    if (!externalCancel.Open(o.cancelEvent, error)) return fail(error);
+    std::atomic<bool> cancel{false};
+    auto pollCancel = [&]() {
+        if (externalCancel.Requested())
+            cancel.store(true, std::memory_order_relaxed);
+        return cancel.load(std::memory_order_relaxed);
+    };
+
+    MappedMidiFile midi;
+    if (!midi.Open(o.midi.c_str(), error)) return fail(error);
+
+    MachineStatus(o, "LOADING", "Scanning MIDI file");
+    MidiStreamDecoder decoder;
+    MidiStreamInfo info;
+    ScanProgressContext scanContext{
+        &o, &externalCancel, &cancel,
+        std::chrono::steady_clock::now(),
+        std::chrono::steady_clock::time_point{}};
+    if (!decoder.Scan(midi, o.sampleRate, info, error,
+                      (o.machineProgress || !o.cancelEvent.empty())
+                          ? ReportScanProgress : nullptr,
+                      &scanContext, &cancel)) {
+        if (pollCancel()) {
+            MachineStatus(o, "CANCELLED", "Cancelled while loading MIDI");
+            return 3;
+        }
+        return fail(error.empty() ? "MIDI scan failed" : error);
+    }
+
+    if (o.scanOnly) {
+        if (!o.machineProgress) {
+            fwprintf(stdout,L"SMF %u, %u tracks, %llu channel events, %llu note-ons, %llu frames (%s at %u Hz)\nPeak 1s: %llu events at %s, %llu note-ons at %s; peak frame: %llu events (%llu note-ons) at frame %llu\nExact-frame repetition: %llu exact duplicates total (peak %llu/frame), %llu channel/key duplicates total (peak %llu/frame), across %llu note-on frames\nWithin uninterrupted note-on runs: %llu exact duplicates (peak %llu/frame), %llu immediately adjacent\n",info.format,info.tracks,info.eventCount,info.noteOnCount,info.totalFrames,FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),o.sampleRate,info.peakEventsPerSecond,FormatTime(double(info.peakEventSecond)).c_str(),info.peakNoteOnsPerSecond,FormatTime(double(info.peakNoteOnSecond)).c_str(),info.peakEventsAtFrame,info.peakNoteOnsAtFrame,info.peakFrame,info.exactDuplicateNoteOnCount,info.peakExactDuplicateNoteOnsAtFrame,info.keyDuplicateNoteOnCount,info.peakKeyDuplicateNoteOnsAtFrame,info.noteOnFrameCount,info.noteRunExactDuplicateCount,info.peakNoteRunExactDuplicatesAtFrame,info.adjacentExactDuplicateNoteOnCount);
+        }
+        MachineStatus(o, "COMPLETE", "MIDI scan complete");
+        return 0;
+    }
+
+    if (pollCancel()) {
+        MachineStatus(o, "CANCELLED", "Cancelled before rendering");
+        return 3;
+    }
+
+    MachineStatus(o, "PREPARING", "Loading SoundFont and renderer");
+    ParsedEventRing ring(o.eventBufferMB);
+    if (!ring.IsValid()) return fail("cannot allocate parsed-event ring");
+
     StandaloneSynthConfig synthConfig{};
     synthConfig.soundfont = o.soundfont;
     synthConfig.sampleRate = o.sampleRate;
@@ -424,31 +604,173 @@ int RendererMain(int argc,wchar_t** argv) {
     synthConfig.limiterAttackMs = o.limiterAttackMs;
     synthConfig.limiterReleaseMs = o.limiterReleaseMs;
     synthConfig.backend = o.backend;
-    auto synth=std::make_unique<StandaloneSynth>();if(!synth->Initialize(synthConfig,error)){fprintf(stderr,"error: %s\n",error.c_str());return 1;}
-    WaveWriter wave;if(!wave.Open(o.output.c_str(),o.sampleRate,info.totalFrames+uint64_t(o.maxTailSeconds)*o.sampleRate)){fprintf(stderr,"error: cannot create output file\n");return 1;}
-    std::atomic<bool> cancel{false},done{false};std::atomic<uint64_t> decoded{0};std::string producerError;
-    ProducerContext context{&ring,&midi,o.sampleRate,&cancel,&done,&decoded,&producerError};
-    std::thread producer([&]{MidiStreamInfo ignored;decoder.Decode(midi,o.sampleRate,RingSink,&context,&cancel,&ignored,producerError);done.store(true,std::memory_order_release);});
-    std::vector<float> left(o.blockFrames),right(o.blockFrames);uint64_t frame=0,events=0,renderNs=0,lastRenderNs=0;bool ioOk=true;auto start=std::chrono::steady_clock::now(),last=start;uint64_t lastFrame=0;
-    if(!o.quiet){
+    auto synth = std::make_unique<StandaloneSynth>();
+    if (!synth->Initialize(synthConfig, error)) return fail(error);
+    if (pollCancel()) {
+        MachineStatus(o, "CANCELLED", "Cancelled while preparing renderer");
+        return 3;
+    }
+
+    WaveWriter wave;
+    if (!wave.Open(o.output.c_str(), o.sampleRate,
+                   info.totalFrames + uint64_t(o.maxTailSeconds) * o.sampleRate))
+        return fail("cannot create output file");
+
+    std::atomic<bool> done{false};
+    std::atomic<uint64_t> decoded{0};
+    std::string producerError;
+    ProducerContext context{
+        &ring, &midi, o.sampleRate, &cancel, &done, &decoded, &producerError};
+    std::thread producer([&] {
+        MidiStreamInfo ignored;
+        decoder.Decode(midi, o.sampleRate, RingSink, &context, &cancel,
+                       &ignored, producerError);
+        done.store(true, std::memory_order_release);
+    });
+
+    std::vector<float> left(o.blockFrames), right(o.blockFrames);
+    uint64_t frame = 0;
+    uint64_t events = 0;
+    uint64_t renderNs = 0;
+    uint64_t lastRenderNs = 0;
+    uint64_t lastFrame = 0;
+    uint32_t peakVoices = 0;
+    bool ioOk = true;
+    bool renderingTail = false;
+    const auto start = std::chrono::steady_clock::now();
+    auto lastHuman = start;
+    auto lastMachine = std::chrono::steady_clock::time_point{};
+
+    if (humanProgress) {
         fwprintf(stderr,L"SMF %u, %u tracks, %llu channel events (%llu note-ons) | %.2f min | %hs | ring %llu events\n",info.format,info.tracks,info.eventCount,info.noteOnCount,double(info.totalFrames)/o.sampleRate/60.0,synth->Backend(),ring.Capacity());
         fwprintf(stderr,L"Render config: %u Hz | voices %u | threads %u | master %.3f | limiter %ls [%ls]",o.sampleRate,o.maxVoices,o.renderThreads,o.masterVolume,o.limiterEnabled?L"ON":L"OFF",o.limiterAlgorithm==LimiterAlgorithm::Adaptive?L"Adaptive":L"Classic");
         if(o.limiterEnabled)fwprintf(stderr,L" (threshold %.3f, lookahead %.2f ms, attack %.2f ms, release %.1f ms)",o.limiterThreshold,o.limiterLookaheadMs,o.limiterAttackMs,o.limiterReleaseMs);
         fputws(L"\n",stderr);
     }
-    auto renderTo=[&](uint64_t target){while(frame<target&&ioOk){const uint32_t n=uint32_t((std::min<uint64_t>)(o.blockFrames,target-frame));const auto dspStart=std::chrono::steady_clock::now();synth->Render(left.data(),right.data(),n,frame);const auto dspEnd=std::chrono::steady_clock::now();renderNs+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(dspEnd-dspStart).count());ioOk=wave.Write(left.data(),right.data(),n);frame+=n;
-        const auto now=std::chrono::steady_clock::now();if(!o.quiet&&now-last>=std::chrono::seconds(1)){const double audioDelta=double(frame-lastFrame)/o.sampleRate;const double recent=audioDelta/std::chrono::duration<double>(now-last).count();const double dspMsPerAudioSecond=audioDelta>0?double(renderNs-lastRenderNs)/1000000.0/audioDelta:0.0;const double eta=recent>0?double(info.totalFrames>frame?info.totalFrames-frame:0)/o.sampleRate/recent:INFINITY;fwprintf(stderr,L"\r%s / %s  %6.2f%% | voices %u free %u steals %u | events %llu/%llu | %.2fx | DSP %.1f ms/audio-s | ETA %s   ",FormatTime(double(frame)/o.sampleRate).c_str(),FormatTime(double(info.totalFrames)/o.sampleRate).c_str(),info.totalFrames?100.0*frame/info.totalFrames:100.0,synth->Active(),synth->Free(),synth->Steals(),events,info.eventCount,recent,dspMsPerAudioSecond,FormatTime(eta).c_str());last=now;lastFrame=frame;lastRenderNs=renderNs;}}
+    MachineStatus(o, "RENDERING", "Rendering MIDI");
+
+    auto reportRender = [&](bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - start).count();
+        const double renderedSeconds = static_cast<double>(frame) / o.sampleRate;
+        const double totalSeconds = static_cast<double>(info.totalFrames) / o.sampleRate;
+        const double speed = elapsed > 0.0 ? renderedSeconds / elapsed : 0.0;
+        const double remaining = static_cast<double>(
+            info.totalFrames > frame ? info.totalFrames - frame : 0u) / o.sampleRate;
+        const double eta = speed > 0.0 ? remaining / speed : 0.0;
+        const double fraction = info.totalFrames
+            ? (std::min)(1.0, static_cast<double>(frame) /
+                               static_cast<double>(info.totalFrames))
+            : 1.0;
+
+        if (o.machineProgress &&
+            (force || now - lastMachine >= std::chrono::milliseconds(100))) {
+            MachineRenderProgress(o, fraction, elapsed, renderedSeconds,
+                                  totalSeconds, speed, eta, synth->Active(),
+                                  peakVoices, synth->Steals(), events,
+                                  renderingTail);
+            lastMachine = now;
+        }
+
+        if (humanProgress &&
+            (force || now - lastHuman >= std::chrono::seconds(1))) {
+            const double audioDelta = static_cast<double>(frame - lastFrame) /
+                                      o.sampleRate;
+            const double wallDelta =
+                std::chrono::duration<double>(now - lastHuman).count();
+            const double recent = wallDelta > 0.0 ? audioDelta / wallDelta : 0.0;
+            const double dspMsPerAudioSecond = audioDelta > 0.0
+                ? static_cast<double>(renderNs - lastRenderNs) /
+                      1000000.0 / audioDelta
+                : 0.0;
+            fwprintf(stderr,L"\r%s / %s  %6.2f%% | voices %u free %u peak %u steals %u | events %llu/%llu | %.2fx | DSP %.1f ms/audio-s | ETA %s   ",FormatTime(renderedSeconds).c_str(),FormatTime(totalSeconds).c_str(),fraction*100.0,synth->Active(),synth->Free(),peakVoices,synth->Steals(),events,info.eventCount,recent,dspMsPerAudioSecond,FormatTime(eta).c_str());
+            lastHuman = now;
+            lastFrame = frame;
+            lastRenderNs = renderNs;
+        }
     };
-    PackedMidiEvent event{};bool have=false;
-    while(ioOk){while(!(have=ring.Pop(event))&&!done.load(std::memory_order_acquire))std::this_thread::yield();if(!have)break;renderTo(event.outputFrame);synth->Dispatch(event.message,event.outputFrame);++events;
+
+    auto renderTo = [&](uint64_t target) {
+        while (frame < target && ioOk && !pollCancel()) {
+            const uint32_t n = static_cast<uint32_t>(
+                (std::min<uint64_t>)(o.blockFrames, target - frame));
+            const auto dspStart = std::chrono::steady_clock::now();
+            synth->Render(left.data(), right.data(), n, frame);
+            const auto dspEnd = std::chrono::steady_clock::now();
+            renderNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    dspEnd - dspStart).count());
+            ioOk = wave.Write(left.data(), right.data(), n);
+            frame += n;
+            peakVoices = (std::max)(peakVoices, synth->Active());
+            reportRender(false);
+        }
+    };
+
+    PackedMidiEvent event{};
+    while (ioOk && !pollCancel()) {
+        bool have = false;
+        while (!(have = ring.Pop(event)) &&
+               !done.load(std::memory_order_acquire) && !pollCancel()) {
+            std::this_thread::yield();
+        }
+        if (!have) break;
+        renderTo(event.outputFrame);
+        if (pollCancel()) break;
+        synth->Dispatch(event.message, event.outputFrame);
+        ++events;
+
         // Do not advance audio until the producer has exposed every possible
         // equal-frame successor; this preserves global sequence ordering.
-        for(;;){PackedMidiEvent next{};while(!ring.Peek(next)&&!done.load(std::memory_order_acquire))std::this_thread::yield();if(!ring.Peek(next)||next.outputFrame!=event.outputFrame)break;ring.Pop(event);synth->Dispatch(event.message,event.outputFrame);++events;}
+        for (;;) {
+            PackedMidiEvent next{};
+            while (!ring.Peek(next) &&
+                   !done.load(std::memory_order_acquire) && !pollCancel()) {
+                std::this_thread::yield();
+            }
+            if (pollCancel() || !ring.Peek(next) ||
+                next.outputFrame != event.outputFrame)
+                break;
+            ring.Pop(event);
+            synth->Dispatch(event.message, event.outputFrame);
+            ++events;
+        }
     }
-    if(ioOk){renderTo(info.totalFrames);synth->ReleaseAll();const uint64_t tailEnd=frame+uint64_t(o.maxTailSeconds)*o.sampleRate;while((synth->Active()||synth->Tails())&&frame<tailEnd)renderTo((std::min<uint64_t>)(tailEnd,frame+o.blockFrames));}
-    cancel.store(true);producer.join();if(!wave.Close())ioOk=false;
-    if(!o.quiet)fwprintf(stderr,L"\nRendered %s (%llu frames), %llu MIDI events, %u steals. Notes: %llu received, %llu matched; rejects preset=%llu region=%llu invalid=%llu.\n",FormatTime(double(wave.Frames())/o.sampleRate).c_str(),wave.Frames(),events,synth->Steals(),synth->NoteCalls(),synth->MatchedNotes(),synth->MissingPresets(),synth->MissingRegions(),synth->InvalidRegions());
-    if(!producerError.empty()&&events!=info.eventCount){fprintf(stderr,"decoder error: %s\n",producerError.c_str());return 1;}if(!ioOk){fprintf(stderr,"error: output write failed\n");return 1;}return 0;
+
+    if (ioOk && !pollCancel()) {
+        renderTo(info.totalFrames);
+        if (!pollCancel()) {
+            synth->ReleaseAll();
+            renderingTail = true;
+            MachineStatus(o, "TAIL", "Rendering natural release tail");
+            const uint64_t tailEnd = frame +
+                uint64_t(o.maxTailSeconds) * o.sampleRate;
+            while ((synth->Active() || synth->Tails()) && frame < tailEnd &&
+                   !pollCancel()) {
+                renderTo((std::min<uint64_t>)(
+                    tailEnd, frame + o.blockFrames));
+            }
+        }
+    }
+
+    const bool wasCancelled = pollCancel();
+    cancel.store(true, std::memory_order_relaxed);
+    producer.join();
+    if (!wave.Close()) ioOk = false;
+    reportRender(true);
+
+    if (humanProgress) {
+        fwprintf(stderr,L"\nRendered %s (%llu frames), %llu MIDI events, %u steals. Notes: %llu received, %llu matched; rejects preset=%llu region=%llu invalid=%llu.\n",FormatTime(double(wave.Frames())/o.sampleRate).c_str(),wave.Frames(),events,synth->Steals(),synth->NoteCalls(),synth->MatchedNotes(),synth->MissingPresets(),synth->MissingRegions(),synth->InvalidRegions());
+    }
+    if (wasCancelled) {
+        MachineStatus(o, "CANCELLED", "Render cancelled; partial WAV retained");
+        return 3;
+    }
+    if (!producerError.empty() && events != info.eventCount)
+        return fail("decoder error: " + producerError);
+    if (!ioOk) return fail("output write failed");
+    MachineStatus(o, "COMPLETE", "Render completed successfully");
+    return 0;
 }
 
 #if defined(_WIN32)

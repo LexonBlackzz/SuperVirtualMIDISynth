@@ -66,8 +66,14 @@ private:
 class MidiStreamDecoder {
 public:
     using Sink = bool (*)(const PackedMidiEvent&, void*);
+    using ScanProgress = bool (*)(uint64_t processedBytes,
+                                  uint64_t totalBytes,
+                                  uint64_t processedRecords,
+                                  void* user);
     bool Scan(const MappedMidiFile& file, uint32_t sampleRate,
-              MidiStreamInfo& info, std::string& error) const;
+              MidiStreamInfo& info, std::string& error,
+              ScanProgress progress = nullptr, void* progressUser = nullptr,
+              std::atomic<bool>* cancel = nullptr) const;
     bool Decode(const MappedMidiFile& file, uint32_t sampleRate,
                 Sink sink, void* user, std::atomic<bool>* cancel,
                 MidiStreamInfo* info, std::string& error) const;

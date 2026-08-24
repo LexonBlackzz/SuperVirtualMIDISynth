@@ -34,6 +34,21 @@ voices, exact voice steals, dispatched events, render speed, milliseconds per
 audio second, and ETA. `--scan-only` validates a MIDI and reports channel-event
 and note-on counts without loading the SoundFont or creating output.
 
+The V3 Configurator's **Offline Renderer** page is an optional graphical
+frontend for this same executable. It supervises `svms_v3_render.exe` as a
+separate process, so closing or cancelling a large job cannot stall the UI and
+the command-line renderer remains independently usable. The page defaults to
+the configured SoundFont, remembers its selected directories for the current
+Configurator session, and displays loading/render progress, elapsed time,
+speed, ETA, active/peak voices, event count, and voice steals.
+
+Frontends can request the same progress stream with `--machine-progress`.
+Records are ASCII, newline-delimited, and tab-separated with an `SVMS3`
+prefix. On Windows, `--cancel-event <name>` opens a caller-created manual-reset
+event. Signalling it stops scanning or rendering cooperatively, closes the WAV
+so its RIFF/RF64 header remains valid, retains the partial file, and exits with
+code 3. These integration switches do not alter event timing or audio output.
+
 It may also be used without dummy output arguments:
 
 ```bat

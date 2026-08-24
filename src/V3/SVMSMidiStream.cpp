@@ -158,13 +158,36 @@ struct Later {
     }
 };
 bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink,
-         void* user, std::atomic<bool>* cancel, MidiStreamInfo& info, std::string& error) {
+         void* user, std::atomic<bool>* cancel, MidiStreamInfo& info,
+         std::string& error,
+         MidiStreamDecoder::ScanProgress scanProgress = nullptr,
+         void* scanProgressUser = nullptr) {
     std::vector<Track> tracks;
     if (!Tracks(file, info, tracks, error)) return false;
+    uint64_t totalTrackBytes = 0;
+    for (const Track& track : tracks)
+        totalTrackBytes += static_cast<uint64_t>(track.end - track.p);
+    uint64_t processedTrackBytes = 0;
+    uint64_t processedRecords = 0;
+    auto nextEvent = [&](uint32_t trackIndex, RawEvent& event) {
+        Track& track = tracks[trackIndex];
+        if (!scanProgress) return Next(track, event, error);
+        const uint8_t* before = track.p;
+        const bool ok = Next(track, event, error);
+        processedTrackBytes += static_cast<uint64_t>(track.p - before);
+        return ok;
+    };
+    auto reportScanProgress = [&](bool force) {
+        if (!scanProgress) return true;
+        if (!force && (processedRecords & 0x3fffu) != 0u) return true;
+        return scanProgress(processedTrackBytes, totalTrackBytes,
+                            processedRecords, scanProgressUser);
+    };
+    if (!reportScanProgress(true)) return false;
     std::priority_queue<HeapItem, std::vector<HeapItem>, Later> heap;
     for (uint32_t i = 0; i < tracks.size(); ++i) {
         RawEvent event;
-        if (!Next(tracks[i], event, error)) return false;
+        if (!nextEvent(i, event)) return false;
         if (event.valid) heap.push({event, i});
     }
     uint64_t tick = 0, frame = 0, remainder = 0, count = 0, noteOns = 0;
@@ -206,6 +229,10 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
     while (!heap.empty()) {
         if (cancel && cancel->load(std::memory_order_relaxed)) return false;
         const HeapItem item = heap.top(); heap.pop();
+        if (scanProgress) {
+            ++processedRecords;
+            if (!reportScanProgress(false)) return false;
+        }
         const uint64_t delta = item.event.tick - tick;
         const uint64_t numerator = uint64_t(tempo) * rate;
         const uint64_t quotient = numerator / denom;
@@ -301,7 +328,7 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
             }
         }
         RawEvent next;
-        if (!Next(tracks[item.track], next, error)) return false;
+        if (!nextEvent(item.track, next)) return false;
         if (next.valid) heap.push({next, item.track});
     }
     if (bucketEvents > info.peakEventsPerSecond) {
@@ -314,6 +341,7 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
     info.eventCount = count;
     info.noteOnCount = noteOns;
     info.totalFrames = frame;
+    if (!reportScanProgress(true)) return false;
     return true;
 }
 } // namespace
@@ -373,8 +401,12 @@ void MappedMidiFile::Close() {
 #endif
 }
 bool MidiStreamDecoder::Scan(const MappedMidiFile& file, uint32_t rate,
-                             MidiStreamInfo& info, std::string& error) const {
-    info = {}; return Run(file, rate, nullptr, nullptr, nullptr, info, error);
+                             MidiStreamInfo& info, std::string& error,
+                             ScanProgress progress, void* progressUser,
+                             std::atomic<bool>* cancel) const {
+    info = {};
+    return Run(file, rate, nullptr, nullptr, cancel, info, error,
+               progress, progressUser);
 }
 bool MidiStreamDecoder::Decode(const MappedMidiFile& file, uint32_t rate, Sink sink,
                                void* user, std::atomic<bool>* cancel,

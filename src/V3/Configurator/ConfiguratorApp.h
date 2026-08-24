@@ -5,6 +5,7 @@
 #include "WasapiDevices.h"
 #include "EasterEggs.h"
 #include "UpdateService.h"
+#include "PageOffline.h"
 #include "../SVMSRuntimeLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
@@ -26,6 +27,7 @@ enum class Page {
     Audio,
     Performance,
     Midi,
+    OfflineRenderer,
     Reverb,
     Limiter,
     Diagnostics,
@@ -104,6 +106,7 @@ private:
     ConfigDocument config_;
     EasterEggState easterEggs_;
     UpdateService updateService_;
+    OfflineRendererPage offlineRendererPage_;
     bool showMegaFuckerPopup_ = false;
 
     svms::RuntimeLinkClient rlClient_;

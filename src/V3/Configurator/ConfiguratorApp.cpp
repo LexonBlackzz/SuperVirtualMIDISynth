@@ -22,6 +22,7 @@
 #include "PageAudio.h"
 #include "PagePerformance.h"
 #include "PageMidi.h"
+#include "PageOffline.h"
 #include "PageReverb.h"
 #include "PageLimiter.h"
 #include "PageDiagnostics.h"
@@ -231,6 +232,7 @@ void ConfiguratorApp::Shutdown() {
 
     rlClient_.Close();
     rlConnected_ = false;
+    offlineRendererPage_.Shutdown();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
@@ -695,6 +697,7 @@ void ConfiguratorApp::DrawSidebar() {
     drawNavItem("Audio", Page::Audio, nullptr);
     drawNavItem("Performance", Page::Performance, nullptr);
     drawNavItem("MIDI / Events", Page::Midi, nullptr);
+    drawNavItem("Offline Renderer", Page::OfflineRenderer, nullptr);
 
     drawNavItem("Reverb", Page::Reverb, "EFFECTS");
     drawNavItem("Limiter", Page::Limiter, nullptr);
@@ -851,6 +854,9 @@ void ConfiguratorApp::DrawPageContent() {
     case Page::Audio:       DrawAudioPage(config_, easterEggs_); break;
     case Page::Performance: DrawPerformancePage(config_); break;
     case Page::Midi:        DrawMidiPage(config_); break;
+    case Page::OfflineRenderer:
+        offlineRendererPage_.Draw(config_, hwnd_);
+        break;
     case Page::Reverb:      DrawReverbPage(config_); break;
     case Page::Limiter:     DrawLimiterPage(config_); break;
     case Page::Diagnostics: DrawDiagnosticsPage(config_); break;
