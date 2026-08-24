@@ -29,7 +29,9 @@ int main(int argc, char** argv) {
         (api.capabilities & SVMS_CAP_ISOLATED_OFFLINE_SESSIONS) != 0u &&
         (api.capabilities & SVMS_CAP_CANCELLABLE_SUBMISSION) != 0u &&
         (api.capabilities & SVMS_CAP_SHORT_EVENT_BATCH) != 0u &&
+        (api.capabilities & SVMS_CAP_SYSTEM_EXCLUSIVE) != 0u &&
         api.create_session && api.destroy_session && api.send_short_batch &&
+        api.send_system_exclusive &&
         api.get_runtime_clock && api.send_timed_short_batch &&
         api.get_output_clock && api.get_monotonic_clock &&
         api.create_offline_session && api.render_offline &&

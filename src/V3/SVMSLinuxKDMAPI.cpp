@@ -1,5 +1,6 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSStandaloneSynth.h"
+#include "SVMSSysEx.h"
 #include "SVMSNativeOffline.h"
 #include "SVMSBuildInfo.h"
 #include "include/svmsapi.h"
@@ -762,11 +763,25 @@ SVMS_Result NativeSendShortBatch(SVMS_Session session,
     return SVMS_RESULT_OK;
 }
 
-SVMS_Result NativeSendSystemExclusive(SVMS_Session session, const uint8_t*,
-                                      uint32_t) {
+SVMS_Result NativeSendSystemExclusive(SVMS_Session session,
+                                      const uint8_t* data, uint32_t size) {
     std::atomic<uint64_t>* cancellation = NativeSessionCancellation(session);
     if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
-    return SVMS_RESULT_UNSUPPORTED;
+    if (!data || size < 2u || data[0] != 0xf0u ||
+        data[size - 1u] != 0xf7u)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    const uint64_t timestamp = MonotonicNanoseconds();
+    bool accepted = true;
+    const bool translated = svms::TranslateXGSystemExclusive(
+        data, size, [&](uint32_t message) {
+            if (accepted) {
+                accepted = Runtime().SubmitAtCancellable(
+                    message, timestamp, EventKind::Midi, cancellation,
+                    session);
+            }
+        });
+    if (!translated) return SVMS_RESULT_UNSUPPORTED;
+    return NativeSubmissionResult(accepted, cancellation, session);
 }
 
 SVMS_Result NativeReset(SVMS_Session session) {
@@ -960,8 +975,27 @@ SVMS_LINUX_EXPORT void SendDirectDataNoBuf(uint32_t message) {
     Runtime().Submit(message);
 }
 
-SVMS_LINUX_EXPORT int SendDirectLongData(const void*, uint32_t) { return 0; }
-SVMS_LINUX_EXPORT int SendDirectLongDataNoBuf(const void*, uint32_t) { return 0; }
+static int SendDirectSystemExclusive(const void* bytes, uint32_t size) {
+    if (!bytes || size < 2u) return 1;
+    const uint8_t* data = static_cast<const uint8_t*>(bytes);
+    const uint64_t timestamp = MonotonicNanoseconds();
+    bool accepted = true;
+    (void)svms::TranslateXGSystemExclusive(
+        data, size, [&](uint32_t message) {
+            if (accepted)
+                accepted = Runtime().SubmitAt(message, timestamp,
+                                               EventKind::Midi);
+        });
+    return accepted ? 0 : 1;
+}
+
+SVMS_LINUX_EXPORT int SendDirectLongData(const void* data, uint32_t size) {
+    return SendDirectSystemExclusive(data, size);
+}
+SVMS_LINUX_EXPORT int SendDirectLongDataNoBuf(const void* data,
+                                               uint32_t size) {
+    return SendDirectSystemExclusive(data, size);
+}
 
 SVMS_LINUX_EXPORT float GetRenderingTime() {
     return Runtime().RenderingTime();
@@ -992,7 +1026,8 @@ SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.struct_version = SVMS_STRUCT_VERSION_1;
     table.abi_version = SVMS_ABI_VERSION_1;
     table.capabilities = SVMS_CAP_EXACT_MONOTONIC_NS |
-        SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_TELEMETRY_V1 |
+        SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_SYSTEM_EXCLUSIVE |
+        SVMS_CAP_TELEMETRY_V1 |
         SVMS_CAP_KDMAPI_FACADE | SVMS_CAP_EXACT_OUTPUT_FRAMES |
         SVMS_CAP_MIXED_TIMESTAMP_BATCH |
         SVMS_CAP_ISOLATED_OFFLINE_SESSIONS |

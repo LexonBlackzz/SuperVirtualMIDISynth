@@ -49,9 +49,10 @@ deterministic voice tiles. Incoming events are assigned absolute output frames
 from a monotonic-clock epoch plus the measured ALSA buffer lead. Events are not
 snapped to render-block boundaries.
 
-The daemon target accepts MIDI 1.0 channel voice messages through ALSA
-Sequencer. Native JACK/PipeWire MIDI, SysEx, service installation, and a GUI
-are later work.
+The daemon accepts MIDI 1.0 channel voice messages and common Yamaha XG SysEx
+through ALSA Sequencer. XG commands are translated immediately and retain one
+shared monotonic timestamp and their original command order. Native
+JACK/PipeWire MIDI, service installation, and a GUI are later work.
 
 ## Ziggy and KDMAPI
 
@@ -112,10 +113,10 @@ output buffers.
 Native lossless submissions are cancellable on Linux as well. Calling
 `cancel_session_submissions` permanently fences that session token and causes
 blocked or later event submissions to return `SVMS_RESULT_CANCELLED`; create a
-new session to resume. Linux SysEx remains unsupported, so no SysEx ownership
-capability is advertised there.
+new session to resume. `SVMS_CAP_SYSTEM_EXCLUSIVE` advertises immediate-copy
+translation of the common XG reset, tuning, bank, program, drum-part, volume,
+and pan subset shared with Windows and offline rendering.
 
 `libOmniMIDI.so` is a symbolic compatibility name for the same shared object,
 not a second engine. Native and KDMAPI users in one process therefore share
-runtime ownership correctly. Linux SysEx is not advertised yet and returns
-`SVMS_RESULT_UNSUPPORTED` through the native API.
+runtime ownership correctly.

@@ -1,5 +1,6 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSStandaloneSynth.h"
+#include "SVMSSysEx.h"
 
 #include <alsa/asoundlib.h>
 #include <algorithm>
@@ -244,13 +245,26 @@ public:
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
-            MidiEvent converted{};
-            converted.timestampNs = MonotonicNanoseconds();
-            converted.sequence = sequenceNumber.fetch_add(
-                1u, std::memory_order_relaxed);
-            if (event && ConvertEvent(*event, converted)) {
+            const uint64_t timestamp = MonotonicNanoseconds();
+            auto pushMessage = [&](uint32_t message) {
+                MidiEvent converted{};
+                converted.timestampNs = timestamp;
+                converted.sequence = sequenceNumber.fetch_add(
+                    1u, std::memory_order_relaxed);
+                converted.message = message;
                 while (!g_stop && !queue.TryPush(converted)) sched_yield();
-                received.fetch_add(1u, std::memory_order_relaxed);
+                if (!g_stop)
+                    received.fetch_add(1u, std::memory_order_relaxed);
+            };
+            if (event && event->type == SND_SEQ_EVENT_SYSEX &&
+                event->data.ext.ptr && event->data.ext.len != 0u) {
+                (void)svms::TranslateXGSystemExclusive(
+                    static_cast<const uint8_t*>(event->data.ext.ptr),
+                    static_cast<uint32_t>(event->data.ext.len), pushMessage);
+            } else if (event) {
+                MidiEvent converted{};
+                if (ConvertEvent(*event, converted))
+                    pushMessage(converted.message);
             }
             if (event) snd_seq_free_event(event);
         }
