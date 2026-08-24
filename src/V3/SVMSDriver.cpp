@@ -5219,6 +5219,48 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
     uint64_t deferredNoteOns = 0u;
     uint64_t deferredMatches = 0u;
     uint64_t deferredConfigured = 0u;
+    const bool allowStateCoalescing =
+        self->overflowMode_.load(std::memory_order_relaxed) ==
+        EventOverflowMode::PriorityVelocity;
+    const auto isCoalescibleStateWrite = [](const RenderEvent& event) {
+        switch (event.type) {
+            case RenderEventType::ControlChange:
+                // These controllers only replace channel state. Sustain,
+                // reset and termination controllers have lifecycle side
+                // effects and must always remain literal events.
+                return event.data1 == 0u || event.data1 == 7u ||
+                       event.data1 == 10u || event.data1 == 11u ||
+                       event.data1 == 32u;
+            case RenderEventType::ProgramChange:
+            case RenderEventType::PitchBend:
+            case RenderEventType::MasterVolume:
+            case RenderEventType::MasterFineTune:
+            case RenderEventType::MasterTranspose:
+            case RenderEventType::RhythmPart:
+                return true;
+            default:
+                return false;
+        }
+    };
+    const auto hasSameStateTarget = [](const RenderEvent& left,
+                                       const RenderEvent& right) {
+        if (left.type != right.type) return false;
+        switch (left.type) {
+            case RenderEventType::ControlChange:
+                return left.channel == right.channel &&
+                       left.data1 == right.data1;
+            case RenderEventType::ProgramChange:
+            case RenderEventType::PitchBend:
+            case RenderEventType::RhythmPart:
+                return left.channel == right.channel;
+            case RenderEventType::MasterVolume:
+            case RenderEventType::MasterFineTune:
+            case RenderEventType::MasterTranspose:
+                return true;
+            default:
+                return false;
+        }
+    };
     while (index < eventCount) {
         if (events[index].type == RenderEventType::NoteOff) {
             // Strict lossless mode retains literal ingress ordering. It may
@@ -5297,6 +5339,22 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
             continue;
         }
         if (events[index].type != RenderEventType::NoteOn) {
+            // This callback contains one exact output frame in established
+            // ingress order. Adjacent writes to the same stateless target
+            // have no observable intermediate sample, so priority mode can
+            // apply only the final value. Never cross another event, and keep
+            // strict-lossless mode completely literal.
+            if (allowStateCoalescing &&
+                isCoalescibleStateWrite(events[index])) {
+                uint32_t runEnd = index + 1u;
+                while (runEnd < eventCount &&
+                       hasSameStateTarget(events[index], events[runEnd])) {
+                    ++runEnd;
+                }
+                DispatchRenderEvent(events[runEnd - 1u], blockCursor, self);
+                index = runEnd;
+                continue;
+            }
             DispatchRenderEvent(events[index++], blockCursor, self);
             continue;
         }

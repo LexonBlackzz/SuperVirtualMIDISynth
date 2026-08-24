@@ -180,8 +180,10 @@ larger phase containing that item is complete.
   one MPSC producer CAS per 256 events; retain the established per-event path
   for mixed/state/sheddable traffic. The isolated queue cost falls by about
   55% (13.8 ns/event to 6.1 ns/event including the unchanged consumer pop)
-- [ ] Add safe redundant-controller coalescing without weakening
-  multi-producer order
+- [x] Coalesce only adjacent same-target stateless controller writes at one
+  exact output frame in priority mode (bank, volume, pan, expression, program,
+  bend, and XG master/part state). Notes, releases, resets, lifecycle controls,
+  strict-lossless mode, and established multi-producer order remain literal
 - [x] Measure and optimize the tens-of-millions-events-per-second path: the
   accepted 12M-event/s fixture compiles around 126M events/s and performs
   callback ordering around 622-689M events/s (roughly 0.4-0.5% of a
