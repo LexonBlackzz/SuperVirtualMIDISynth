@@ -1,0 +1,67 @@
+name: Windows AV bisect 0.6.5 to 0.7
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [av-bisect-065-070]
+    paths:
+      - ".github/workflows/windows-av-bisect.yml"
+
+jobs:
+  configurator:
+    name: ${{ matrix.label }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: 00-clean-v0.6.5
+            ref: e13bbb917793cff0a9d71e2300edc779927574fb
+          - label: 01-first-after-v0.6.5
+            ref: b5ace69e70ed2e8f0a6055cae481c40516670bab
+          - label: 02-late-aug19
+            ref: f837e604e87ca9eb937a6453abe4319354f8e594
+          - label: 03-event-pages
+            ref: e3bdd106125e169ad9132eea81f4d93131ea27ce
+          - label: 04-dense-pipeline
+            ref: da7f4966e51f7b6636cf659b62a3434d713dc6be
+          - label: 05-dense-dispatch
+            ref: 6fa3a8e763fb4c3d88abedca5ce1deb1f5892bb3
+          - label: 06-note-launch-batching
+            ref: 4d5777597399b77bd91f224d4e0860559e9bd29f
+          - label: 07-pre-release
+            ref: 079116de5e5a43c19a2982ddb66ce9cf4fc5d34c
+          - label: 08-bad-v0.7
+            ref: a43c1797757f5bcf7ca15dd209634220700607bb
+
+    steps:
+      - name: Check out historical revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 1
+
+      - name: Build V3 x64 Release
+        shell: cmd
+        run: call build_v3.bat
+
+      - name: Stage Configurator
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "build/V3/bin" -File |
+            Where-Object { $_.Name -match '(?i)configurator.*\.exe$' } |
+            Select-Object -First 1
+          if (-not $exe) {
+            throw "No Configurator executable found in build/V3/bin"
+          }
+          New-Item -ItemType Directory -Force -Path "av-bisect" | Out-Null
+          Copy-Item $exe.FullName "av-bisect/${{ matrix.label }}-SVMSConfigurator.exe"
+          Write-Host "Staged $($exe.Name) from ${{ matrix.ref }}"
+
+      - name: Upload Configurator sample
+        uses: actions/upload-artifact@v4
+        with:
+          name: av-bisect-${{ matrix.label }}
+          path: av-bisect/*.exe
+          if-no-files-found: error
