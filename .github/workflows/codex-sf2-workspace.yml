@@ -1,0 +1,22 @@
+name: SF2 workspace helper
+
+on:
+  push:
+    branches: [codex/sf2-correctness-work]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive workspace
+        run: tar --exclude=.git -czf svms-workspace.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: svms-workspace
+          path: svms-workspace.tar.gz
+          if-no-files-found: error
