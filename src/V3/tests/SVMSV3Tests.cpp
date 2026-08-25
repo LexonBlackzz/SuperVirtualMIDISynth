@@ -3426,6 +3426,108 @@ void TestLaunchChurnInstrumentation() {
           "launch churn accounts for every outgoing-tail decision");
 }
 
+void TestVibratoModulationAudible() {
+    {
+        // Regions compiled without any vibrato generator must still carry
+        // the SF2 built-in default modulator depth (50 cents) and the
+        // default 1 Hz LFO rate, or stock SoundFonts stay static.
+        auto data = std::make_unique<svms::SF2Data>();
+        std::memset(data.get(), 0, sizeof(svms::SF2Data));
+        data->presetCount = 1;
+        data->instrumentCount = 1;
+        data->sampleCount = 1;
+        data->sampleDataFrames = 256;
+        data->presets[0].zoneIndex = 0;
+        data->instruments[0].zoneIndex = 0;
+        data->samples[0].start = 0;
+        data->samples[0].end = 255;
+        data->samples[0].sampleRate = 44100;
+        data->samples[0].originalPitch = 60;
+        data->presetZones[0].generatorIndex = 0;
+        data->presetZones[1].generatorIndex = 1;
+        data->presetZoneCount = 2;
+        data->generators[0] = {svms::Gen_Instrument, 0};
+        data->pgenCount = 2;
+        data->instrumentZones[0].generatorIndex = 2;
+        data->instrumentZones[1].generatorIndex = 3;
+        data->instrumentZoneCount = 2;
+        data->generators[2] = {svms::Gen_SampleID, 0};
+        data->generatorCount = 4;
+        svms::sf2_build_regions(data.get());
+        Check(data->regionCount == 1 &&
+                  data->regions[0].vibLfoToPitch == 50 &&
+                  data->regions[0].freqVibLfo == 0,
+              "regions without vibrato generators use SF2 default modulator values");
+    }
+
+    constexpr uint32_t kSampleFrames = 64u;
+    float sampleBuf[kSampleFrames];
+    for (uint32_t i = 0; i < kSampleFrames; ++i) {
+        sampleBuf[i] = std::sin(static_cast<float>(i) *
+                                (6.283185307179586f / 64.0f)) * 0.5f;
+    }
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+
+    auto renderPass = [&](bool modulated, std::vector<float>& out) {
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(4, 44100);
+        const svms::VoiceHandle handle = voices->AllocateVoice(0, 60, 100);
+        voices->SetVoiceSample(handle, 0, kSampleFrames - 1u, 0,
+                               kSampleFrames - 1u, 1, 1.0f, 1);
+        voices->SetVoiceEnvelope(handle, 1.0f, 1.0f, 0, 0, 0, 0,
+                                 0.0f, 1.0f, 0.999f);
+        voices->SetVoiceGain(handle, 1.0f, 1.0f);
+        // The driver seeds these from the prepared region at note-on; the
+        // direct-launch fixture mirrors that with the resolved defaults.
+        voices->v.vibLfoToPitchCents[handle] = 50.0f;
+        voices->v.vibLfoSteps[handle] = 5.0f / 44100.0f;
+
+        svms::ChannelCache channels;
+        channels.SetMasterVolume(1.0f);
+        if (modulated)
+            channels.ControlChange(0, 1, 127);
+        channels.RebuildCache(cfg, 44100.0f);
+        voices->RefreshMixGain(handle, channels.GetParams()[0]);
+        if (modulated) {
+            Check(channels.GetParams()[0].modDepth > 0.99f,
+                  "diagnostic: CC1 reaches the channel modulation depth");
+        }
+
+        out.clear();
+        out.reserve(4096u);
+        svms::RenderScalar renderer;
+        float blockLeft[kSampleFrames]{}, blockRight[kSampleFrames]{};
+        for (uint32_t block = 0; block < 64u; ++block) {
+            renderer.RenderBlock(*voices, channels, sampleBuf, kSampleFrames,
+                                 blockLeft, blockRight, kSampleFrames, cfg);
+            if (modulated && block == 32u) {
+                Check(std::fabs(voices->v.phaseIncs[handle] -
+                                voices->v.basePhaseIncs[handle]) > 1.0e-9f,
+                      "diagnostic: modulated span rewrites the voice phase increment");
+            }
+            out.insert(out.end(), blockLeft, blockLeft + kSampleFrames);
+        }
+    };
+
+    std::vector<float> plain, plainAgain, modulated;
+    renderPass(false, plain);
+    renderPass(false, plainAgain);
+    Check(plain == plainAgain,
+          "unmodulated vibrato gating leaves output byte-identical");
+
+    renderPass(true, modulated);
+    float maxDiff = 0.0f;
+    for (size_t i = 0; i < plain.size(); ++i) {
+        maxDiff = (std::max)(maxDiff,
+                             std::fabs(plain[i] - modulated[i]));
+    }
+    Check(maxDiff > 0.01f,
+          "full-scale CC1 produces audible vibrato deviation");
+}
+
 } // namespace
 
 int main() {
@@ -3468,6 +3570,7 @@ int main() {
     TestLaunchChurnInstrumentation();
     TestRenderCallbackPurity();
     TestCallbackSourcePurity();
+    TestVibratoModulationAudible();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);
