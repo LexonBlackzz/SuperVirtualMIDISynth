@@ -2083,6 +2083,7 @@ private:
                              uint32_t blockOffset);
     void HandleProgramChange(uint8_t channel, uint8_t program);
     void HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb);
+    void HandleChannelPressure(uint8_t channel, uint8_t value);
     void RefreshAllPitchIncrements();
     uint32_t RefreshVelocityCutoff(EventLane lane) noexcept;
     void EventCompilerLoop();
@@ -2770,6 +2771,10 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
 struct PreparedSF2Region {
     float basePhaseStep[kNoteCount];
     float bendScale;
+    // SF2 vibrato LFO constants resolved once at load time.
+    float vibLfoToPitchCents;
+    float vibLfoPhaseStep;
+    uint32_t vibLfoDelaySamples;
     float attenuationGain;
     float sustainLevel;
     float decaySlope;
@@ -2939,6 +2944,12 @@ static void PrepareSF2Region(const SF2Data* data, const SFSampleRegion& region,
     }
     out.releaseDecay = MakeReleaseDecay(releaseSeconds, outputRate);
     out.releaseSamples = MakeReleaseSamples(releaseSeconds, outputRate);
+    out.vibLfoToPitchCents = static_cast<float>(region.vibLfoToPitch);
+    out.vibLfoPhaseStep =
+        powf(2.0f, static_cast<float>(region.freqVibLfo) / 1200.0f) / rate;
+    const float vibDelaySeconds = TimecentsToSeconds(region.delayVibLfo);
+    out.vibLfoDelaySamples = vibDelaySeconds > 0.0f
+        ? static_cast<uint32_t>(vibDelaySeconds * rate) : 0u;
     out.panLeft = 1.0f;
     out.panRight = 1.0f;
     if (channelCache)
@@ -5263,6 +5274,9 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
         case RenderEventType::PitchBend:
             self->HandlePitchBend(event.channel, event.data1, event.data2);
             break;
+        case RenderEventType::ChannelPressure:
+            self->HandleChannelPressure(event.channel, event.data1);
+            break;
         case RenderEventType::AllNotesOff:
         case RenderEventType::AllSoundOff:
             // [HOOK] Overload ladder: these can trigger hard/panic release.
@@ -5283,8 +5297,11 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
             self->RefreshSelectedPresets();
             std::fill(std::begin(self->channelPitchBendRatio_),
                       std::end(self->channelPitchBendRatio_), 1.0f);
-            for (uint32_t channel = 0; channel < kChannelCount; ++channel)
+            for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
+                self->channelCache->SetBendRatio(
+                    static_cast<uint8_t>(channel), 1.0f);
                 ++self->channelLaunchRevision_[channel];
+            }
             self->nextPlayIndex_ = 1;
             self->postHighPass.Reset();
             self->reverb.Reset();
@@ -5308,6 +5325,8 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                         self->voiceManager->RefreshMixGainsForChannel(
                             channel,
                             self->channelCache->GetParams()[channel]);
+                        self->channelCache->SetBendRatio(
+                            channel, self->channelPitchBendRatio_[channel]);
                     }
                 }
                 self->appliedMasterVolume_ = effective;
@@ -5905,6 +5924,21 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
         setup.regionIndex = static_cast<uint16_t>(matchedRegionIndex);
         setup.loopMode = loopMode;
         setup.sampleBacked = 1u;
+        if (prepared) {
+            setup.vibLfoToPitchCents = prepared->vibLfoToPitchCents;
+            setup.vibLfoPhaseStep = prepared->vibLfoPhaseStep;
+            setup.vibLfoDelaySamples = prepared->vibLfoDelaySamples;
+        } else {
+            const float vibDelaySeconds =
+                TimecentsToSeconds(matchedRegion->delayVibLfo);
+            setup.vibLfoToPitchCents =
+                static_cast<float>(matchedRegion->vibLfoToPitch);
+            setup.vibLfoPhaseStep =
+                powf(2.0f, static_cast<float>(
+                           matchedRegion->freqVibLfo) / 1200.0f) / sr;
+            setup.vibLfoDelaySamples = vibDelaySeconds > 0.0f
+                ? static_cast<uint32_t>(vibDelaySeconds * sr) : 0u;
+        }
         noteLaunchScratch_[mi] = setup;
     }
 
@@ -6057,15 +6091,28 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     if (channelCache && configSnapshot &&
         (controller == 7 || controller == 10 || controller == 11 ||
          controller == 64 || controller == 121 || controller == 6 ||
-         controller == 38 || controller == 96 || controller == 97)) {
+         controller == 38 || controller == 96 || controller == 97 ||
+         controller == 1)) {
         channelCache->RebuildChannel(channel, *configSnapshot,
                                      static_cast<float>(sampleRate));
+        // Keep the vibrato pass on the exact sysex-aware common ratio even
+        // when this rebuild recomputed the snapshot from channel cents.
+        channelCache->SetBendRatio(channel, channelPitchBendRatio_[channel]);
         if (controller == 7 || controller == 10 || controller == 11 ||
             controller == 121) {
             voiceManager->RefreshMixGainsForChannel(
                 channel, channelCache->GetParams()[channel]);
         }
     }
+}
+
+void Driver::HandleChannelPressure(uint8_t channel, uint8_t value) {
+    if (!channelCache || channel >= kChannelCount) return;
+    channelCache->ChannelPressure(channel, value);
+    if (!configSnapshot) return;
+    channelCache->RebuildChannel(channel, *configSnapshot,
+                                 static_cast<float>(sampleRate));
+    channelCache->SetBendRatio(channel, channelPitchBendRatio_[channel]);
 }
 
 void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
@@ -6103,6 +6150,7 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
         sysexMasterFineTune_ + sysexMasterTranspose_;
     const float commonRatio = powf(2.0f, bendSemitones / 12.0f);
     channelPitchBendRatio_[channel] = commonRatio;
+    channelCache->SetBendRatio(channel, commonRatio);
     voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
         const uint32_t i = voice;
         const float scale = voiceManager->v.pitchBendScales[i];
@@ -6120,6 +6168,7 @@ void Driver::RefreshAllPitchIncrements() {
             sysexMasterFineTune_ + sysexMasterTranspose_;
         const float commonRatio = powf(2.0f, semitones / 12.0f);
         channelPitchBendRatio_[channel] = commonRatio;
+        channelCache->SetBendRatio(channel, commonRatio);
         voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
             const uint32_t handle = voice;
             const float scale = voiceManager->v.pitchBendScales[handle];

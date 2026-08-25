@@ -78,6 +78,8 @@ struct SFSampleRegion {
     int16_t chorusSend;
     int16_t modLfoToPitch;
     int16_t vibLfoToPitch;
+    int16_t delayVibLfo;    // timecents
+    int16_t freqVibLfo;     // absolute cents: 2^(c/1200) Hz, 0 = 1 Hz
     int16_t modEnvToPitch;
     int16_t modLfoToFilterFc;
     int16_t modEnvToFilterFc;

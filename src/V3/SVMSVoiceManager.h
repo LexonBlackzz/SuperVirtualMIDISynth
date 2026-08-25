@@ -50,6 +50,9 @@ struct VoiceConfiguration {
     float releaseDecay = kDefaultReleaseDecay;
     float gainLeft = 1.0f;
     float gainRight = 1.0f;
+    float vibLfoToPitchCents = 0.0f;
+    float vibLfoPhaseStep = 0.0f;
+    uint32_t vibLfoDelaySamples = 0u;
     uint16_t presetIndex = UINT16_MAX;
     uint16_t regionIndex = UINT16_MAX;
     uint8_t loopMode = 0;
@@ -1116,6 +1119,11 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(renderGainL);
     SVMS_COPY_GROWN_VOICE_FIELD(renderGainR);
     SVMS_COPY_GROWN_VOICE_FIELD(stealOutputGain);
+    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoToPitchCents);
+    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoSteps);
+    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoPhases);
+    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoDelays);
+    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoModulated);
     SVMS_COPY_GROWN_VOICE_FIELD(sampleStart);
     SVMS_COPY_GROWN_VOICE_FIELD(loopMode);
     SVMS_COPY_GROWN_VOICE_FIELD(loopEnabled);
@@ -1777,6 +1785,11 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.renderGainL[handle]       = 0.0f;
     v.renderGainR[handle]       = 0.0f;
     v.stealOutputGain[handle]   = 0.0f;
+    v.vibLfoToPitchCents[handle] = 0.0f;
+    v.vibLfoSteps[handle]       = 0.0f;
+    v.vibLfoPhases[handle]      = 0.0f;
+    v.vibLfoDelays[handle]      = 0u;
+    v.vibLfoModulated[handle]   = 0u;
     v.relEnd[handle]            = 0;
     v.relLoopS[handle]          = 0;
     v.relLoopE[handle]          = 0;
@@ -3260,6 +3273,11 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
 
     v.gainLeft[handle] = setup.gainLeft;
     v.gainRight[handle] = setup.gainRight;
+    v.vibLfoToPitchCents[handle] = setup.vibLfoToPitchCents;
+    v.vibLfoSteps[handle] = setup.vibLfoPhaseStep;
+    v.vibLfoPhases[handle] = 0.0f;
+    v.vibLfoDelays[handle] = setup.vibLfoDelaySamples;
+    v.vibLfoModulated[handle] = 0u;
     v.mixGainL[handle] = setup.gainLeft * cp.mixScaleLeft;
     v.mixGainR[handle] = setup.gainRight * cp.mixScaleRight;
     v.stealOutputGain[handle] = std::sqrt(

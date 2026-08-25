@@ -435,6 +435,7 @@ struct ZoneGenState {
     int16_t initialAttenuation;
     int16_t initialFilterFc, initialFilterQ, pan, reverbSend, chorusSend;
     int16_t modLfoToPitch, vibLfoToPitch, modEnvToPitch;
+    int16_t delayVibLfo, freqVibLfo;
     int16_t modLfoToFilterFc, modEnvToFilterFc, modLfoToVolume;
     int16_t exclusiveClass;
     uint8_t keyLo, keyHi;
@@ -465,6 +466,8 @@ struct ZoneGenState {
     bool hasChorusSend;
     bool hasModLfoToPitch;
     bool hasVibLfoToPitch;
+    bool hasDelayVibLfo;
+    bool hasFreqVibLfo;
     bool hasModEnvToPitch;
     bool hasModLfoToFilterFc;
     bool hasModEnvToFilterFc;
@@ -482,6 +485,11 @@ struct ZoneGenState {
            sampleIndex(0), hasSample(false),
            initialAttenuation(0), initialFilterFc(0), initialFilterQ(0), pan(0),
            reverbSend(0), chorusSend(0), modLfoToPitch(0), vibLfoToPitch(0),
+           // delayVibLfo is timecents (-12000 = 0 s) but freqVibLfo is
+           // absolute cents where the SF2 default of 0 means 1 Hz. Treating
+           // an absent frequency as -12000 would freeze the LFO at ~0.001 Hz
+           // and silence vibrato entirely.
+           delayVibLfo(-12000), freqVibLfo(0),
            modEnvToPitch(0), modLfoToFilterFc(0), modEnvToFilterFc(0),
            modLfoToVolume(0), exclusiveClass(0),
            hasKeyRange(false), hasVelRange(false), hasRootKey(false),
@@ -492,6 +500,7 @@ struct ZoneGenState {
            hasInitialFilterFc(false), hasInitialFilterQ(false), hasPan(false),
            hasReverbSend(false), hasChorusSend(false),
            hasModLfoToPitch(false), hasVibLfoToPitch(false),
+           hasDelayVibLfo(false), hasFreqVibLfo(false),
            hasModEnvToPitch(false), hasModLfoToFilterFc(false),
            hasModEnvToFilterFc(false), hasModLfoToVolume(false),
            hasExclusiveClass(false) {}
@@ -607,6 +616,14 @@ static void applyGenSet(ZoneGenState& st, const SF2Generator& gen) {
             st.vibLfoToPitch = static_cast<int16_t>(gen.amount);
             st.hasVibLfoToPitch = true;
             break;
+        case Gen_DelayVibLFO:
+            st.delayVibLfo = static_cast<int16_t>(gen.amount);
+            st.hasDelayVibLfo = true;
+            break;
+        case Gen_FreqVibLFO:
+            st.freqVibLfo = static_cast<int16_t>(gen.amount);
+            st.hasFreqVibLfo = true;
+            break;
         case Gen_ModEnvToPitch:
             st.modEnvToPitch = static_cast<int16_t>(gen.amount);
             st.hasModEnvToPitch = true;
@@ -705,6 +722,8 @@ static void mergeZoneInto(ZoneGenState& dst, const ZoneGenState& src) {
     if (src.hasChorusSend) { dst.chorusSend = static_cast<int16_t>(dst.chorusSend + src.chorusSend); dst.hasChorusSend = true; }
     if (src.hasModLfoToPitch) { dst.modLfoToPitch = static_cast<int16_t>(dst.modLfoToPitch + src.modLfoToPitch); dst.hasModLfoToPitch = true; }
     if (src.hasVibLfoToPitch) { dst.vibLfoToPitch = static_cast<int16_t>(dst.vibLfoToPitch + src.vibLfoToPitch); dst.hasVibLfoToPitch = true; }
+    if (src.hasDelayVibLfo) { dst.delayVibLfo = dst.hasDelayVibLfo ? dst.delayVibLfo + src.delayVibLfo : src.delayVibLfo; dst.hasDelayVibLfo = true; }
+    if (src.hasFreqVibLfo) { dst.freqVibLfo = dst.hasFreqVibLfo ? dst.freqVibLfo + src.freqVibLfo : src.freqVibLfo; dst.hasFreqVibLfo = true; }
     if (src.hasModEnvToPitch) { dst.modEnvToPitch = static_cast<int16_t>(dst.modEnvToPitch + src.modEnvToPitch); dst.hasModEnvToPitch = true; }
     if (src.hasModLfoToFilterFc) { dst.modLfoToFilterFc = static_cast<int16_t>(dst.modLfoToFilterFc + src.modLfoToFilterFc); dst.hasModLfoToFilterFc = true; }
     if (src.hasModEnvToFilterFc) { dst.modEnvToFilterFc = static_cast<int16_t>(dst.modEnvToFilterFc + src.modEnvToFilterFc); dst.hasModEnvToFilterFc = true; }
@@ -885,7 +904,14 @@ static void AppendCompiledRegion(SF2Data* data, uint32_t presetIndex,
     region.reverbSend = merged.reverbSend;
     region.chorusSend = merged.chorusSend;
     region.modLfoToPitch = merged.modLfoToPitch;
-    region.vibLfoToPitch = merged.vibLfoToPitch;
+    // SF2's built-in default modulator ("vibrato LFO → initial pitch",
+    // ±50 cents driven by CC1/channel pressure) supplies the depth on
+    // virtually every SoundFont; the vibLfoToPitch generator itself
+    // defaults to zero and appears only when a font overrides it.
+    region.vibLfoToPitch = merged.hasVibLfoToPitch
+        ? merged.vibLfoToPitch : 50;
+    region.delayVibLfo = ClampEnvelopeTimecents(merged.delayVibLfo);
+    region.freqVibLfo = merged.freqVibLfo;
     region.modEnvToPitch = merged.modEnvToPitch;
     region.modLfoToFilterFc = merged.modLfoToFilterFc;
     region.modEnvToFilterFc = merged.modEnvToFilterFc;

@@ -97,6 +97,7 @@ inline bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
             case 0x80u: type = RenderEventType::NoteOff; break;
             case 0xb0u: type = RenderEventType::ControlChange; break;
             case 0xc0u: type = RenderEventType::ProgramChange; break;
+            case 0xd0u: type = RenderEventType::ChannelPressure; break;
             case 0xe0u: type = RenderEventType::PitchBend; break;
             default: return false;
         }

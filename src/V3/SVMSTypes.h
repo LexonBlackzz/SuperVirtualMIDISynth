@@ -331,9 +331,15 @@ struct ChannelParamsSnapshot {
     float pitchBendCents;
     float filterCutoff;
     float filterResonance;
+    // Combined normalized mod-wheel + channel-pressure source value (0..1).
+    // Scales each voice's SF2 vibrato LFO pitch depth.
     float modDepth;
     uint32_t sustainActive;
-    float dummy;
+    // Exact common pitch ratio for this channel including SysEx master
+    // tune/transpose, maintained by the driver at every bend event. The
+    // vibrato pass multiplies basePhaseInc * bendRatio * lfoRatio so an
+    // active LFO can never drop the master offset between bend events.
+    float bendRatio;
 };
 
 struct RenderStats {
@@ -437,6 +443,11 @@ struct SamplePage {
     X(float, gainLeft) \
     X(float, gainRight) \
     X(float, stealOutputGain) \
+    X(float, vibLfoToPitchCents) \
+    X(float, vibLfoSteps) \
+    X(float, vibLfoPhases) \
+    X(uint32_t, vibLfoDelays) \
+    X(uint8_t, vibLfoModulated) \
     X(uint8_t, loopMode) \
     X(uint8_t, heldBySustain) \
     X(uint8_t, heldBySostenuto) \

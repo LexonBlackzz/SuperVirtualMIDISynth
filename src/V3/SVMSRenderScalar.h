@@ -125,6 +125,71 @@ inline void AdvanceStealTailSpanExact(VoiceSoA& v, uint32_t idx,
     v.stealTailFramesRemaining[idx] = remaining;
 }
 
+// ── Vibrato LFO (SF2 default modulators) ────────────────────────────────
+// While any channel has an active modulation depth (mod wheel CC1 plus
+// channel pressure), render spans are subdivided to this length so each
+// voice's triangle LFO advances and its phase increment is refreshed at a
+// fixed deterministic cadence. When no channel is modulated the pass is
+// skipped entirely and output remains byte-identical to the unmodulated
+// engine.
+constexpr uint32_t kVibratoUpdateFrames = 64u;
+
+inline void AdvanceVibratoSpan(VoiceManager& voices,
+                               const ChannelParamsSnapshot* chParams,
+                               uint32_t frameCount) {
+    if (frameCount == 0u || !chParams) return;
+    VoiceSoA& v = voices.v;
+    for (uint32_t position = 0; position < voices.activeCount_; ++position) {
+        const uint32_t idx = voices.activeList_[position];
+        if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free)) continue;
+        const float step = v.vibLfoSteps[idx];
+        if (step == 0.0f) continue;
+        const float depthCents = v.vibLfoToPitchCents[idx];
+        uint32_t frames = frameCount;
+        const uint32_t delay = v.vibLfoDelays[idx];
+        if (delay > 0u) {
+            if (delay >= frames) {
+                // The LFO holds its zero start value through the delay.
+                v.vibLfoDelays[idx] = delay - frames;
+                continue;
+            }
+            frames -= delay;
+            v.vibLfoDelays[idx] = 0u;
+        }
+        float phase = v.vibLfoPhases[idx] +
+            step * static_cast<float>(frames);
+        phase -= floorf(phase);
+        v.vibLfoPhases[idx] = phase;
+
+        const ChannelParamsSnapshot& cp = chParams[v.channel[idx]];
+        const float scale = v.pitchBendScales[idx];
+        // scale == 1 uses the driver-maintained exact common ratio so an
+        // active vibrato can never drop SysEx master tune/transpose. The
+        // rare scaled-bend branch recomputes from channel cents without
+        // master offsets (documented limitation).
+        const float bendRatio = scale == 1.0f && cp.bendRatio > 0.0f
+            ? cp.bendRatio
+            : powf(2.0f, cp.pitchBendCents * scale / 1200.0f);
+        const float depth = cp.modDepth;
+        if (!(depth > 0.0f) || !(depthCents > 0.0f)) {
+            if (v.vibLfoModulated[idx]) {
+                // Modulation just ended: restore the exact unmodulated
+                // increment once instead of rewriting it every span.
+                v.vibLfoModulated[idx] = 0u;
+                v.phaseIncs[idx] = v.basePhaseIncs[idx] * bendRatio;
+            }
+            continue;
+        }
+        v.vibLfoModulated[idx] = 1u;
+        // SF2 LFOs are positive-going triangles starting at zero.
+        const float t = phase * 4.0f;
+        const float tri = t < 1.0f ? t : (t < 3.0f ? 2.0f - t : t - 4.0f);
+        const float cents = depthCents * depth * tri;
+        const float lfoRatio = powf(2.0f, cents / 1200.0f);
+        v.phaseIncs[idx] = v.basePhaseIncs[idx] * bendRatio * lfoRatio;
+    }
+}
+
 // ── Loop eligibility check ──────────────────────────────────────────────
 inline bool ShouldLoopSVMS(uint8_t loopMode, uint32_t loopStart, uint32_t loopEnd,
                             uint8_t state) {
@@ -155,6 +220,9 @@ enum class RenderEventType : uint8_t {
     RhythmPart = 10,
     MasterFineTune = 11,
     MasterTranspose = 12,
+    // Channel aftertouch (0xD0). Feeds the SF2 default channel-pressure
+    // modulator that scales per-voice vibrato LFO depth.
+    ChannelPressure = 13,
 };
 
 struct RenderEvent {
@@ -2446,7 +2514,19 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     if (voices.activeCount_ > scratchCapacity_ &&
         !ReserveVoiceCapacity(voices.activeCount_)) return;
     if (!classChanges_ || !retirements_) return;
-    const bool denseEligible = CanUseDensePlan(
+    // Vibrato modulation mutates phaseIncs between spans on the audio
+    // thread, which the dense planner's immutable chunk plans cannot model.
+    // Bypass dense planning while any channel carries a modulation depth;
+    // the serial path below handles every voice exactly as before.
+    const ChannelParamsSnapshot* channelParams = channels.GetParams();
+    bool vibratoActive = false;
+    for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+        if (channelParams[channel].modDepth > 0.0f) {
+            vibratoActive = true;
+            break;
+        }
+    }
+    const bool denseEligible = !vibratoActive && CanUseDensePlan(
         voices, events, eventCount, numFrames, correctnessMode);
     if (denseEligible) {
         if (RenderBlockDensePlanned(voices, sampleData, sampleDataFrames,
@@ -2463,7 +2543,6 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 #endif
     }
     (void)cfg;
-    (void)channels;
     VoiceSoA& v = voices.v;
     const RenderKernelSet& kernelSet = *kernelSet_;
     // Gain state is already current for this boundary; see the frame-major
@@ -2502,7 +2581,12 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         uint32_t spanEnd = numFrames;
         if (eventIndex < eventCount && events[eventIndex].frameOffset < spanEnd)
             spanEnd = events[eventIndex].frameOffset;
+        if (vibratoActive && spanEnd - cursor > kVibratoUpdateFrames)
+            spanEnd = cursor + kVibratoUpdateFrames;
         if (spanEnd <= cursor) continue;
+
+        if (vibratoActive)
+            AdvanceVibratoSpan(voices, channelParams, spanEnd - cursor);
 
         const uint32_t spanFrames = spanEnd - cursor;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)

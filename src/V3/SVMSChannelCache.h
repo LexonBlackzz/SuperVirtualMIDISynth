@@ -24,6 +24,13 @@ public:
     void SetSelectedPreset(uint8_t channel, uint16_t presetIndex);
     void ResetControllers(uint8_t channel);
     void PitchBend(uint8_t channel, int16_t value);
+    // Channel aftertouch (0xD0). Combined with the mod wheel it forms the
+    // normalized modulation source that scales SF2 vibrato LFO depth.
+    void ChannelPressure(uint8_t channel, uint8_t value);
+    // The driver maintains the exact common pitch ratio (including SysEx
+    // master tune/transpose) here so the render-side vibrato pass can
+    // recombine base phase increments without dropping the master offset.
+    void SetBendRatio(uint8_t channel, float ratio);
     void AllNotesOff(uint8_t channel);
     void AllSoundOff(uint8_t channel);
 
@@ -64,6 +71,8 @@ private:
     uint8_t channelCoarseTune_[kChannelCount];
     uint8_t channelSustain_[kChannelCount];
     uint8_t channelSostenuto_[kChannelCount];
+    uint8_t channelModWheel_[kChannelCount];
+    uint8_t channelPressure_[kChannelCount];
     uint8_t channelProgram_[kChannelCount];
     uint8_t channelBankMSB_[kChannelCount];
     uint8_t channelBankLSB_[kChannelCount];
@@ -94,6 +103,8 @@ inline void ChannelCache::Reset() {
         channelCoarseTune_[ch] = 64;
         channelSustain_[ch] = 0;
         channelSostenuto_[ch] = 0;
+        channelModWheel_[ch] = 0;
+        channelPressure_[ch] = 0;
         channelProgram_[ch] = 0;
         channelBankMSB_[ch] = 0;
         channelBankLSB_[ch] = 0;
@@ -152,6 +163,10 @@ inline void ChannelCache::ControlChange(uint8_t channel, uint8_t controller, uin
         case 64:
             affectsCache = channelSustain_[channel] != value;
             channelSustain_[channel] = value;
+            break;
+        case 1:
+            affectsCache = channelModWheel_[channel] != value;
+            channelModWheel_[channel] = value;
             break;
         case 66:
             channelSostenuto_[channel] = value;
@@ -260,6 +275,10 @@ inline void ChannelCache::ResetControllers(uint8_t channel) {
     channelCoarseTune_[channel] = 64;
     channelSustain_[channel] = 0;
     channelSostenuto_[channel] = 0;
+    // Reset All Controllers returns the mod wheel to zero per the MIDI
+    // specification; channel pressure is also a controller-domain source.
+    channelModWheel_[channel] = 0;
+    channelPressure_[channel] = 0;
     dirtyMask_ |= static_cast<uint16_t>(1u << channel);
 }
 
@@ -268,6 +287,18 @@ inline void ChannelCache::PitchBend(uint8_t channel, int16_t value) {
         channelPitchBend_[channel] = value;
         dirtyMask_ |= static_cast<uint16_t>(1u << channel);
     }
+}
+
+inline void ChannelCache::ChannelPressure(uint8_t channel, uint8_t value) {
+    if (channel < kChannelCount && channelPressure_[channel] != value) {
+        channelPressure_[channel] = value;
+        dirtyMask_ |= static_cast<uint16_t>(1u << channel);
+    }
+}
+
+inline void ChannelCache::SetBendRatio(uint8_t channel, float ratio) {
+    if (channel < kChannelCount)
+        channels_[channel].bendRatio = ratio;
 }
 
 inline void ChannelCache::AllNotesOff(uint8_t channel) {
@@ -321,7 +352,17 @@ inline void ChannelCache::RebuildChannel(uint8_t channel,
     channels_[ch].sustainActive = channelSustain_[ch] >= 64 ? 1u : 0u;
     channels_[ch].filterCutoff = 20000.0f;
     channels_[ch].filterResonance = 0.0f;
-    channels_[ch].modDepth = 0.0f;
+    // SF2's default modulators sum the mod-wheel and channel-pressure
+    // sources into one normalized depth that scales vibrato LFO pitch.
+    {
+        float mod = channelModWheel_[ch] / 127.0f +
+                    channelPressure_[ch] / 127.0f;
+        if (!(mod > 0.0f)) mod = 0.0f;
+        if (mod > 1.0f) mod = 1.0f;
+        channels_[ch].modDepth = mod;
+    }
+    channels_[ch].bendRatio =
+        powf(2.0f, channels_[ch].pitchBendCents / 1200.0f);
     dirtyMask_ &= static_cast<uint16_t>(~(1u << ch));
 }
 
