@@ -209,6 +209,16 @@ static FARPROC GetSystemWinmmProc(const char* name) {
 
 namespace svms {
 
+static uint32_t SelectRenderLanesForPhysicalCores(uint32_t cores) {
+    // Dense tile rendering streams sample data through the shared memory
+    // hierarchy from every lane; past roughly cores-2 lanes, SMT siblings
+    // and per-chunk join overhead cost more than they add (measured on an
+    // 8C/16T part: throughput peaks at 6 lanes and falls monotonically to
+    // 16). Reserving two physical lanes also leaves headroom for the
+    // audio/WASAPI thread and OS. SVMS_RENDER_THREADS overrides this.
+    return cores > 2u ? (std::min)(16u, cores - 2u) : 1u;
+}
+
 static uint32_t SelectAutomaticRenderThreadCount() {
 #if defined(SVMS_XP_COMPAT)
     return 1u;
@@ -260,8 +270,9 @@ static uint32_t SelectAutomaticRenderThreadCount() {
                 }
                 offset += info->Size;
             }
-            std::free(storage);
-            if (coreCount != 0u) return coreCount;
+        std::free(storage);
+        if (coreCount != 0u)
+            return SelectRenderLanesForPhysicalCores(coreCount);
         } else {
             std::free(storage);
         }
@@ -285,7 +296,9 @@ static uint32_t SelectAutomaticRenderThreadCount() {
             offset += info->Size;
         }
         std::free(topology);
-        if (cores != 0u) return (std::min)(16u, cores);
+        if (cores != 0u)
+            return SelectRenderLanesForPhysicalCores(
+                (std::min)(16u, cores));
     } else {
         std::free(topology);
     }

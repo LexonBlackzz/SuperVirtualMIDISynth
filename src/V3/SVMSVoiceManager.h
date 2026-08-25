@@ -234,6 +234,11 @@ public:
     void ReleaseSustain(uint8_t channel, uint32_t blockOffset);
 
     uint32_t GetActiveCount() const { return activeCount_; }
+    // Largest physical voice group ever created by one MIDI note-on. Every
+    // launch updates this in O(1); groups never outgrow their launch count,
+    // so it is a monotone upper bound for future victim/newborn group sizes.
+    // The dense planner uses it to bound per-launch steal mutations.
+    uint32_t GetMaxLaunchGroupSize() const { return maxLaunchGroupSize_; }
     // Physical allocation ceiling. It can grow at a render boundary; it is
     // never shrunk live so existing voice handles remain stable.
     uint32_t GetMaxVoices() const { return maxVoices_; }
@@ -574,6 +579,7 @@ private:
     int32_t* playGroupPrev_;
     uint32_t lastLinkedPlayIndex_;
     VoiceHandle lastLinkedPlayVoice_;
+    uint32_t maxLaunchGroupSize_ = 1u;
     void* metadataStorage_;
     size_t metadataBytes_;
 
@@ -970,6 +976,7 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
                 sizeof(channelKeyVoiceOldest_));
     lastLinkedPlayIndex_ = other.lastLinkedPlayIndex_;
     lastLinkedPlayVoice_ = other.lastLinkedPlayVoice_;
+    maxLaunchGroupSize_ = other.maxLaunchGroupSize_;
 }
 
 inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
@@ -1066,6 +1073,7 @@ inline void VoiceManager::Reset() {
     stealVolatileHeapValid_ = false;
     lastLinkedPlayIndex_ = UINT32_MAX;
     lastLinkedPlayVoice_ = kInvalidVoice;
+    maxLaunchGroupSize_ = 1u;
     freeTop_ = maxVoices_;
     releasingCount_.store(0u, std::memory_order_relaxed);
     for (uint32_t i = 0; i < maxVoices_; ++i) {
@@ -1197,6 +1205,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 static_cast<size_t>(oldCapacity) * sizeof(*playGroupPrev_));
     grown.lastLinkedPlayIndex_ = lastLinkedPlayIndex_;
     grown.lastLinkedPlayVoice_ = lastLinkedPlayVoice_;
+    grown.maxLaunchGroupSize_ = maxLaunchGroupSize_;
 
     // The dense channel/render indices depend on allocation capacity, so
     // rebuild them from the stable active list instead of copying pages whose
@@ -3712,6 +3721,7 @@ inline bool VoiceManager::LaunchVoiceGroup(
     if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
         count > voiceLimit_)
         return false;
+    if (count > maxLaunchGroupSize_) maxLaunchGroupSize_ = count;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     BeginLaunchTestProfile(channel, note, setups, count);
 #endif

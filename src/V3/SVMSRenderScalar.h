@@ -1787,33 +1787,42 @@ inline bool RenderScalar::CanUseDensePlan(
 #endif
     }
 
-    // Bound the handles that can actually mutate at each event frame. Global
-    // operations and note launches may touch the full active pool; channel
-    // and key operations cannot escape their affected channel populations.
-    // Repeated same-frame changes collapse to one final snapshot per handle.
+    // Bound the handles that can actually mutate in each chunk. Every event
+    // batch may advance and mark every time-varying voice; global operations
+    // refresh the full active pool; a note launch mutates only its own
+    // physical group plus the play groups its layers retire; channel and key
+    // operations cannot escape their affected channel populations. Repeated
+    // same-frame changes collapse to one final snapshot per handle.
     uint64_t estimatedMutationsPerChunk[
         (8192u + kDenseRenderChunkFrames - 1u) /
         kDenseRenderChunkFrames]{};
+    // One launch of L layers retires at most L play groups (one steal per
+    // layer) and configures at most L handles, all deduplicated per batch.
+    // Group sizes never exceed the largest group ever launched, which
+    // VoiceManager maintains in O(1). This keeps the execution-time capacity
+    // check a true assertion without charging every note-on the full pool.
+    const uint64_t launchMutationBound = [&voices]() {
+        const uint64_t groupSize = voices.GetMaxLaunchGroupSize();
+        return groupSize * (groupSize + 1u);
+    }();
     uint32_t frame = UINT32_MAX;
     uint16_t affectedChannels = 0u;
     bool mayTouchFullPool = false;
+    uint32_t noteOnCount = 0u;
     auto flushFrameEstimate = [&]() {
         if (frame == UINT32_MAX || frame >= numFrames) return;
-        // A note-on can grow a partly empty pool before this chunk is
-        // planned, so the current active count is not an upper bound.  Using
-        // the configured capacity keeps the execution-time capacity check a
-        // true assertion instead of a destructive late fallback.
-        uint64_t mutations = voices.GetMaxVoices();
-        if (!mayTouchFullPool) {
-            mutations = 0u;
-            for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
-                if ((affectedChannels & (1u << channel)) != 0u)
-                    mutations += voices.GetChannelActiveCount(
-                        static_cast<uint8_t>(channel));
-            }
+        uint64_t& slot = estimatedMutationsPerChunk[
+            frame / kDenseRenderChunkFrames];
+        // Each event batch advances/marks every time-varying decay/release
+        // voice so exact-frame stealing sees current envelope state.
+        slot += timeVaryingVoices;
+        if (mayTouchFullPool) slot += voices.GetMaxVoices();
+        slot += static_cast<uint64_t>(noteOnCount) * launchMutationBound;
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            if ((affectedChannels & (1u << channel)) != 0u)
+                slot += voices.GetChannelActiveCount(
+                    static_cast<uint8_t>(channel));
         }
-        estimatedMutationsPerChunk[
-            frame / kDenseRenderChunkFrames] += mutations;
     };
     for (uint32_t index = 0u; index < eventCount; ++index) {
         const RenderEvent& event = events[index];
@@ -1822,14 +1831,17 @@ inline bool RenderScalar::CanUseDensePlan(
             frame = event.frameOffset;
             affectedChannels = 0u;
             mayTouchFullPool = false;
+            noteOnCount = 0u;
         }
         switch (event.type) {
             case RenderEventType::Reset:
             case RenderEventType::MasterVolume:
             case RenderEventType::MasterFineTune:
             case RenderEventType::MasterTranspose:
-            case RenderEventType::NoteOn:
                 mayTouchFullPool = true;
+                break;
+            case RenderEventType::NoteOn:
+                ++noteOnCount;
                 break;
             case RenderEventType::NoteOff:
             case RenderEventType::StaleNoteOffBatch:
