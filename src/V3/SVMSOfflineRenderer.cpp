@@ -451,6 +451,7 @@ public:
     uint64_t MatchedNotes() const { return notes_; }
     uint64_t MissingPresets() const { return missingPresets_; }
     uint64_t MissingRegions() const { return missingRegions_; }
+    uint64_t FallbackRegions() const { return fallbackRegions_; }
     uint64_t InvalidRegions() const { return invalidRegions_; }
     const char* Backend() const { return renderer_.GetRenderBackendName(); }
 private:
@@ -477,7 +478,10 @@ private:
     void RefreshPreset(uint8_t ch) { uint32_t p=0;channels_.SetSelectedPreset(ch,Resolve(ch,p)?uint16_t(p):UINT16_MAX); }
     void NoteOn(uint8_t ch,uint8_t note,uint8_t vel) {
         ++noteCalls_;if(note>=128)return;channels_.NoteOn(ch,note,vel);uint32_t pi=channels_.GetSelectedPreset(ch);if(pi>=sf2_->presetCount){if(!Resolve(ch,pi)){++missingPresets_;return;}channels_.SetSelectedPreset(ch,uint16_t(pi));}
-        const SFSampleRegion* regions[512];const uint32_t count=ResolveRegions(pi,note,vel,regions,512);if(!count||count>512){++missingRegions_;return;}
+        const SFSampleRegion* regions[512];uint32_t count=ResolveRegions(pi,note,vel,regions,512);
+        if(!count||count>512){const uint16_t fb=sf2_->fallbackPresetIndex;
+            if(fb<sf2_->presetCount&&fb!=pi)count=ResolveRegions(fb,note,vel,regions,512);
+            if(!count||count>512){++missingRegions_;return;}++fallbackRegions_;}
         for(uint32_t i=0;i<count;++i){const uint32_t ri=uint32_t(regions[i]-sf2_->regions);if(ri>=prepared_.size()||!prepared_[ri].valid){++invalidRegions_;return;}}
         if(playIndex_==0||playIndex_>=UINT32_MAX-1)playIndex_=1;const uint32_t generation=playIndex_++; VoiceHandle handles[512];uint32_t made=0;
         for(;made<count;++made){handles[made]=voices_.AllocateVoiceOrSteal(ch,note,vel,nullptr,count==1);if(handles[made]==kInvalidVoice){for(uint32_t j=0;j<made;++j)voices_.RetireVoice(handles[j]);return;}}
@@ -493,7 +497,7 @@ private:
         if(cc==121)Bend(ch,0,64);if(cc==7||cc==10||cc==11||cc==64||cc==121){channels_.RebuildChannel(ch,cfg_,float(rate_));if(cc==7||cc==10||cc==11||cc==121)voices_.RefreshMixGainsForChannel(ch,channels_.GetParams()[ch]);}}
     void Program(uint8_t ch,uint8_t p){const uint8_t old=channels_.GetProgram(ch);channels_.ProgramChange(ch,p);uint32_t pi;if(Resolve(ch,pi))channels_.SetSelectedPreset(ch,uint16_t(pi));else channels_.ProgramChange(ch,old);}
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;voices_.ForEachChannelActive(ch,[&](VoiceHandle v){const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));});}
-    uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0;
+    uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0,fallbackRegions_=0;
     std::unique_ptr<SF2Data> sf2_;std::vector<float> sampleData_;std::vector<PreparedRegion> prepared_;
     VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};
 };
@@ -760,7 +764,7 @@ int RendererMain(int argc, wchar_t** argv) {
     reportRender(true);
 
     if (humanProgress) {
-        fwprintf(stderr,L"\nRendered %s (%llu frames), %llu MIDI events, %u steals. Notes: %llu received, %llu matched; rejects preset=%llu region=%llu invalid=%llu.\n",FormatTime(double(wave.Frames())/o.sampleRate).c_str(),wave.Frames(),events,synth->Steals(),synth->NoteCalls(),synth->MatchedNotes(),synth->MissingPresets(),synth->MissingRegions(),synth->InvalidRegions());
+        fwprintf(stderr,L"\nRendered %s (%llu frames), %llu MIDI events, %u steals. Notes: %llu received, %llu matched; rejects preset=%llu region=%llu invalid=%llu; region-fallback notes=%llu.\n",FormatTime(double(wave.Frames())/o.sampleRate).c_str(),wave.Frames(),events,synth->Steals(),synth->NoteCalls(),synth->MatchedNotes(),synth->MissingPresets(),synth->MissingRegions(),synth->InvalidRegions(),synth->FallbackRegions());
     }
     if (wasCancelled) {
         MachineStatus(o, "CANCELLED", "Render cancelled; partial WAV retained");

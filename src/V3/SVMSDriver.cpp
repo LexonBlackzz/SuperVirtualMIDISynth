@@ -5750,9 +5750,26 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     }
 
     if (matchCount == 0) {
-        ++telemetry_.zeroMatchedRegions;
-        ++sf2Telemetry_.zeroMatchedRegions;
-        return 0u;
+        // Region fallback: some SoundFont presets cover only part of the
+        // keyboard (or lack velocity layers at this spot). Resolve against
+        // the bank's widest-coverage preset so incomplete instruments stay
+        // audible instead of silently dropping notes. The launch-plan cache
+        // still stores the result under the original preset tag, so repeat
+        // note-ons pay no repeated lookup.
+        const uint16_t fallbackPreset = data->fallbackPresetIndex;
+        if (fallbackPreset < data->presetCount &&
+            fallbackPreset != presetIndex) {
+            matchCount = ResolveNoteRegions(bank, soundFontIndex,
+                fallbackPreset, note, velocity, noteRegionScratch_,
+                kMaxMatchingRegions);
+        }
+        if (matchCount == 0) {
+            ++telemetry_.zeroMatchedRegions;
+            ++sf2Telemetry_.zeroMatchedRegions;
+            return 0u;
+        }
+        if (!deferLifetimeCounters)
+            ++sf2Telemetry_.fallbackRegionMatches;
     }
 
     // Validate every layer before mutating the voice pool. A malformed

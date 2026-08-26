@@ -180,6 +180,7 @@ public:
     uint64_t MissingPresets() const { return missingPresets_; }
     uint64_t MissingRegions() const { return missingRegions_; }
     uint64_t InvalidRegions() const { return invalidRegions_; }
+    uint64_t FallbackRegions() const { return fallbackRegions_; }
     const char* Backend() const { return renderer_.GetRenderBackendName(); }
 
 private:
@@ -296,10 +297,18 @@ private:
             channels_.SetSelectedPreset(channel, uint16_t(preset));
         }
         const SFSampleRegion* regions[512];
-        const uint32_t count = ResolveRegions(preset, note, velocity, regions, 512);
+        uint32_t count = ResolveRegions(preset, note, velocity, regions, 512);
         if (!count || count > 512) {
-            ++missingRegions_;
-            return;
+            // Region fallback: resolve against the widest-coverage preset so
+            // incomplete instruments stay audible (see SF2Data docs).
+            const uint16_t fb = sf2_->fallbackPresetIndex;
+            if (fb < sf2_->presetCount && fb != preset)
+                count = ResolveRegions(fb, note, velocity, regions, 512);
+            if (!count || count > 512) {
+                ++missingRegions_;
+                return;
+            }
+            ++fallbackRegions_;
         }
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t regionIndex = uint32_t(regions[i] - sf2_->regions);
@@ -480,7 +489,7 @@ private:
     float sysexMasterTranspose_ = 0.0f;
     float bendRatio_[kChannelCount]{};
     uint64_t notes_ = 0, noteCalls_ = 0, missingPresets_ = 0;
-    uint64_t missingRegions_ = 0, invalidRegions_ = 0;
+    uint64_t missingRegions_ = 0, invalidRegions_ = 0, fallbackRegions_ = 0;
     std::unique_ptr<SF2Data> sf2_;
     std::vector<float> sampleData_;
     std::vector<PreparedRegion> prepared_;

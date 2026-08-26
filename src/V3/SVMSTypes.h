@@ -149,6 +149,7 @@ struct LiveSF2Telemetry {
     uint64_t noteOns = 0;
     uint64_t exactRegionMatches = 0;
     uint64_t zeroMatchedRegions = 0;
+    uint64_t fallbackRegionMatches = 0;
     uint64_t invalidPresets = 0;
     uint64_t invalidRegions = 0;
     uint64_t invalidSampleRanges = 0;

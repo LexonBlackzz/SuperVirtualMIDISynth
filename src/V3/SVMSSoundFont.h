@@ -205,6 +205,12 @@ struct SF2Data {
     uint32_t presetRegionCount[kMaxPresets];
     bool regionOverflow;
 
+    // Widest-keyboard-coverage preset, computed once after region build.
+    // Note-ons whose requested preset lacks a matching region resolve
+    // against this preset so incomplete instruments stay audible instead
+    // of silently dropping notes. UINT16_MAX when no preset has regions.
+    uint16_t fallbackPresetIndex;
+
     int16_t* sampleData;
     uint32_t sampleDataSize;
     uint32_t sampleDataFrames;
