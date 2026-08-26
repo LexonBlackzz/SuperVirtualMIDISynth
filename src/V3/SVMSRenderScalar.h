@@ -548,14 +548,31 @@ private:
                      const RenderEvent* events, uint32_t eventCount,
                      bool correctnessMode, uint64_t blockStartFrame);
     bool EnsureDenseStorage();
-    bool CanUseDensePlan(const VoiceManager& voices, const RenderEvent* events,
+    // Returns a bit per kDenseRenderChunkFrames chunk: 1 = execute that chunk
+    // through the dense parallel pipeline, 0 = leave it to the span renderer.
+    // Hard eligibility gates (correctness mode, workers, storage) clear every
+    // bit; workload gates (mutation capacity, duplicated planner state) clear
+    // only the offending chunks so mixed callbacks stay eligible.
+    uint64_t ComputeDenseChunkMask(const VoiceManager& voices,
+                         const RenderEvent* events,
                          uint32_t eventCount, uint32_t numFrames,
                          bool correctnessMode) const;
     bool RenderBlockDensePlanned(VoiceManager& voices,
                      const float* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
-                     uint32_t numFrames, const RenderEvent* events,
-                     uint32_t eventCount, uint64_t blockStartFrame);
+                     uint32_t rangeStart, uint32_t rangeEnd,
+                     const RenderEvent* events,
+                     uint32_t eventCount, uint32_t eventIndexBegin,
+                     uint64_t blockStartFrame, uint32_t* renderedTo);
+    void RenderBlockSparseRange(VoiceManager& voices,
+                     const ChannelCache& channels,
+                     const float* sampleData, uint32_t sampleDataFrames,
+                     float* outputLeft, float* outputRight,
+                     uint32_t rangeStart, uint32_t rangeEnd,
+                     const RenderEvent* events,
+                     uint32_t eventCount, uint32_t eventIndexBegin,
+                     bool vibratoActive, bool correctnessMode,
+                     uint64_t blockStartFrame);
     void AdvanceAuthoritativeSpan(VoiceManager& voices,
                      const float* sampleData, uint32_t sampleDataFrames,
                      uint32_t frameCount, uint64_t absoluteFrame);
@@ -1655,7 +1672,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
     return retiredAt;
 }
 
-inline bool RenderScalar::CanUseDensePlan(
+inline uint64_t RenderScalar::ComputeDenseChunkMask(
     const VoiceManager& voices, const RenderEvent* events,
     uint32_t eventCount, uint32_t numFrames, bool correctnessMode) const {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
@@ -1664,27 +1681,35 @@ inline bool RenderScalar::CanUseDensePlan(
             ++coverageStats_.denseRejected[static_cast<uint32_t>(reason)];
         return false;
     };
+    constexpr uint64_t kEmptyMask = 0ull;
+#else
+    constexpr uint64_t kEmptyMask = 0ull;
 #endif
     if (!correctnessMode) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        return reject(DensePlanRejectReason::CorrectnessDisabled);
-#else
-        return false;
+        reject(DensePlanRejectReason::CorrectnessDisabled);
 #endif
+        return kEmptyMask;
     }
     if (!events || numFrames == 0u) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        return reject(DensePlanRejectReason::MissingEvents);
-#else
-        return false;
+        reject(DensePlanRejectReason::MissingEvents);
 #endif
+        return kEmptyMask;
+    }
+    if (numFrames > 8192u) {
+        // The per-chunk estimate slots and the chunk mask both assume the
+        // documented maximum callback length; longer blocks stay sparse.
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        reject(DensePlanRejectReason::MissingEvents);
+#endif
+        return kEmptyMask;
     }
     if (!workerPool_ || workerPool_->GetThreadCount() <= 1u) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        return reject(DensePlanRejectReason::MissingWorkers);
-#else
-        return false;
+        reject(DensePlanRejectReason::MissingWorkers);
 #endif
+        return kEmptyMask;
     }
 
     // Planning must advance every time-varying voice on the coordinator so
@@ -1700,27 +1725,6 @@ inline bool RenderScalar::CanUseDensePlan(
         VoiceRenderClass::SustainedLoop);
     const uint32_t timeVaryingVoices = activeVoices > sustainedVoices
         ? activeVoices - sustainedVoices : 0u;
-    uint32_t distinctEventFrames = 0u;
-    uint32_t previousEventFrame = UINT32_MAX;
-    for (uint32_t index = 0u; index < eventCount; ++index) {
-        const uint32_t eventFrame = events[index].frameOffset;
-        if (eventFrame >= numFrames || eventFrame == previousEventFrame)
-            continue;
-        previousEventFrame = eventFrame;
-        ++distinctEventFrames;
-    }
-    const uint64_t duplicatedStateWork =
-        static_cast<uint64_t>(timeVaryingVoices) * distinctEventFrames;
-    const uint64_t callbackVoiceSamples =
-        static_cast<uint64_t>(activeVoices) * numFrames;
-    if (callbackVoiceSamples != 0u &&
-        duplicatedStateWork >= callbackVoiceSamples / 2u) {
-#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        return reject(DensePlanRejectReason::EventDensity);
-#else
-        return false;
-#endif
-    }
     if (eventCount < numFrames) {
         // Sparse rendering already parallelizes profitable sustained spans.
         // Dense planning earns its setup cost only when event fragmentation
@@ -1759,41 +1763,43 @@ inline bool RenderScalar::CanUseDensePlan(
         if (rejectedVoiceSamples <
             kDenseRenderMinimumRejectedVoiceSamples) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-            return reject(DensePlanRejectReason::EventDensity);
-#else
-            return false;
+            reject(DensePlanRejectReason::EventDensity);
 #endif
+            return kEmptyMask;
         }
     }
     if (!densePlans_[0].mutations || !densePlans_[1].mutations) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        return reject(DensePlanRejectReason::MissingStorage);
-#else
-        return false;
+        reject(DensePlanRejectReason::MissingStorage);
 #endif
+        return kEmptyMask;
     }
     if (voices.GetMaxVoices() > kDenseRenderMaximumVoices) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        return reject(DensePlanRejectReason::VoiceCapacity);
-#else
-        return false;
+        reject(DensePlanRejectReason::VoiceCapacity);
 #endif
+        return kEmptyMask;
     }
     if (denseRenderState_.GetCapacity() < voices.GetMaxVoices()) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        return reject(DensePlanRejectReason::ShadowCapacity);
-#else
-        return false;
+        reject(DensePlanRejectReason::ShadowCapacity);
 #endif
+        return kEmptyMask;
     }
 
     // Bound the handles that can actually mutate in each chunk. Every event
-    // batch may advance and mark every time-varying voice; global operations
+    // batch marks the voices inside its affected pools; global operations
     // refresh the full active pool; a note launch mutates only its own
     // physical group plus the play groups its layers retire; channel and key
     // operations cannot escape their affected channel populations. Repeated
     // same-frame changes collapse to one final snapshot per handle.
     uint64_t estimatedMutationsPerChunk[
+        (8192u + kDenseRenderChunkFrames - 1u) /
+        kDenseRenderChunkFrames]{};
+    // Distinct event frames per chunk drive the per-chunk form of the
+    // duplicated-planner-state gate: dense planning re-advances every
+    // time-varying voice once per event batch on the coordinator.
+    uint32_t distinctEventFramesPerChunk[
         (8192u + kDenseRenderChunkFrames - 1u) /
         kDenseRenderChunkFrames]{};
     // One launch of L layers retires at most L play groups (one steal per
@@ -1813,9 +1819,13 @@ inline bool RenderScalar::CanUseDensePlan(
         if (frame == UINT32_MAX || frame >= numFrames) return;
         uint64_t& slot = estimatedMutationsPerChunk[
             frame / kDenseRenderChunkFrames];
-        // Each event batch advances/marks every time-varying decay/release
-        // voice so exact-frame stealing sees current envelope state.
-        slot += timeVaryingVoices;
+        // Mutations are recorded only for marked handles: voices inside the
+        // batch's affected pools (channel/key populations, or the full pool
+        // for global ops) plus handles configured by note launches. The
+        // per-batch advance of every time-varying decay/release voice serves
+        // exact-frame stealing but records no snapshot, so it must not be
+        // charged here; that duplicated planner work is bounded separately by
+        // the per-chunk event-density gate below.
         if (mayTouchFullPool) slot += voices.GetMaxVoices();
         slot += static_cast<uint64_t>(noteOnCount) * launchMutationBound;
         for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
@@ -1832,6 +1842,9 @@ inline bool RenderScalar::CanUseDensePlan(
             affectedChannels = 0u;
             mayTouchFullPool = false;
             noteOnCount = 0u;
+            if (frame < numFrames)
+                ++distinctEventFramesPerChunk[
+                    frame / kDenseRenderChunkFrames];
         }
         switch (event.type) {
             case RenderEventType::Reset:
@@ -1861,16 +1874,39 @@ inline bool RenderScalar::CanUseDensePlan(
     const uint32_t chunks =
         (numFrames + kDenseRenderChunkFrames - 1u) /
         kDenseRenderChunkFrames;
+    uint64_t chunkMask = chunks >= 64u
+        ? ~0ull : ((1ull << chunks) - 1ull);
     for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
         if (estimatedMutationsPerChunk[chunk] > denseMutationCapacity_) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-            return reject(DensePlanRejectReason::MutationCapacity);
-#else
-            return false;
+            // Per-chunk accounting: a single hot chunk no longer disqualifies
+            // its neighbours, it only runs on the span renderer itself.
+            reject(DensePlanRejectReason::MutationCapacity);
 #endif
+            chunkMask &= ~(1ull << chunk);
+            continue;
+        }
+        // Per-chunk duplicated-state gate (see the whole-callback rationale
+        // above): planning that would re-advance every time-varying voice for
+        // more than half of the chunk's synthesis work costs more than the
+        // tile render saves. Keep such chunks on the vectorized span path.
+        const uint32_t chunkBegin = chunk * kDenseRenderChunkFrames;
+        const uint32_t chunkFrames = (std::min)(
+            numFrames - chunkBegin, kDenseRenderChunkFrames);
+        const uint64_t duplicatedStateWork =
+            static_cast<uint64_t>(timeVaryingVoices) *
+            distinctEventFramesPerChunk[chunk];
+        const uint64_t chunkVoiceSamples =
+            static_cast<uint64_t>(activeVoices) * chunkFrames;
+        if (chunkVoiceSamples != 0u &&
+            duplicatedStateWork >= chunkVoiceSamples / 2u) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+            reject(DensePlanRejectReason::EventDensity);
+#endif
+            chunkMask &= ~(1ull << chunk);
         }
     }
-    return true;
+    return chunkMask;
 }
 
 inline void RenderScalar::AdvanceAuthoritativeSpan(
@@ -2237,36 +2273,46 @@ inline void RenderScalar::DenseIndexedJob(
 
 inline bool RenderScalar::RenderBlockDensePlanned(
     VoiceManager& voices, const float* sampleData, uint32_t sampleDataFrames,
-    float* outputLeft, float* outputRight, uint32_t numFrames,
-    const RenderEvent* events, uint32_t eventCount,
-    uint64_t blockStartFrame) {
+    float* outputLeft, float* outputRight, uint32_t rangeStart,
+    uint32_t rangeEnd, const RenderEvent* events, uint32_t eventCount,
+    uint32_t eventIndexBegin, uint64_t blockStartFrame,
+    uint32_t* renderedTo) {
+    *renderedTo = rangeStart;
     denseRenderState_.CopyDenseRenderStateFrom(voices.v);
     denseSampleData_ = sampleData;
     denseSampleDataFrames_ = sampleDataFrames;
     denseKernelSet_ = kernelSet_;
     denseTileCount_ = (voices.GetMaxVoices() +
         kDenseRenderHandlesPerTile - 1u) / kDenseRenderHandlesPerTile;
+    // Advance-tracking arrays hold block-relative offsets. A segment may
+    // start mid-callback, so seed every active handle at the segment start
+    // instead of zero; inactive slots never influence planning.
     std::memset(denseLastAdvancedFrames_, 0,
                 static_cast<size_t>(voices.GetMaxVoices()) *
                     sizeof(uint32_t));
     std::memset(denseLastPhaseAdvancedFrames_, 0,
                 static_cast<size_t>(voices.GetMaxVoices()) *
                     sizeof(uint32_t));
+    for (uint32_t position = 0u; position < voices.activeCount_; ++position) {
+        const uint32_t handle = voices.activeList_[position];
+        denseLastAdvancedFrames_[handle] = rangeStart;
+        denseLastPhaseAdvancedFrames_[handle] = rangeStart;
+    }
     densePlannerVoices_ = &voices;
     densePlannerChunkFrame_ = blockStartFrame;
-    densePlannerCursor_ = 0u;
-    denseTailAdvancedFrame_ = 0u;
+    densePlannerCursor_ = rangeStart;
+    denseTailAdvancedFrame_ = rangeStart;
     voices.SetPreTailCaptureHook(DensePreTailCapture, this);
     voices.SetVoiceConfiguredHook(DenseVoiceConfigured, this);
 
-    uint32_t eventIndex = 0u;
+    uint32_t eventIndex = eventIndexBegin;
     bool renderInFlight = false;
     uint32_t chunkIndex = 0u;
-    for (uint32_t chunkStart = 0u; chunkStart < numFrames;
+    for (uint32_t chunkStart = rangeStart; chunkStart < rangeEnd;
          chunkStart += kDenseRenderChunkFrames, ++chunkIndex) {
         DenseChunkPlan& plan = densePlans_[chunkIndex & 1u];
         const uint32_t chunkEnd = (std::min)(
-            numFrames, chunkStart + kDenseRenderChunkFrames);
+            rangeEnd, chunkStart + kDenseRenderChunkFrames);
         const uint32_t chunkFrames = chunkEnd - chunkStart;
         plan.mutationCount = 0u;
         plan.tailMutationCount = 0u;
@@ -2408,6 +2454,9 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                     voices.SetVoiceConfiguredHook(nullptr, nullptr);
                     densePlannerVoices_ = nullptr;
                     if (renderInFlight) workerPool_->FinishIndexed();
+                    // Chunks before this one are fully rendered; the caller
+                    // recovers by sparse-rendering [chunkStart, rangeEnd).
+                    *renderedTo = chunkStart;
                     return false;
                 }
                 for (uint32_t marked = 0u; marked < denseMarkedCount_;
@@ -2474,7 +2523,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
         const uint32_t handle = voices.activeList_[position];
         if (denseRenderState_.state[handle] ==
             static_cast<uint8_t>(VoiceState::Free)) {
-            voices.SetCurrentFrame(blockStartFrame + numFrames);
+            voices.SetCurrentFrame(blockStartFrame + rangeEnd);
             voices.RetireVoice(static_cast<VoiceHandle>(handle));
             continue;
         }
@@ -2504,7 +2553,8 @@ inline bool RenderScalar::RenderBlockDensePlanned(
     voices.v.CopyFixedTailsFrom(denseRenderState_);
     for (uint32_t tail = 0u; tail < kStealTailReserve; ++tail)
         voices.RefreshStealTail(static_cast<VoiceHandle>(tail));
-    voices.SetCurrentFrame(blockStartFrame + numFrames);
+    voices.SetCurrentFrame(blockStartFrame + rangeEnd);
+    *renderedTo = rangeEnd;
     return true;
 }
 
@@ -2515,6 +2565,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       const RenderEvent* events, uint32_t eventCount,
                                       bool correctnessMode,
                                       uint64_t blockStartFrame) {
+    (void)cfg;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     if (coverageProfilingEnabled_) ++coverageStats_.callbacks;
 #endif
@@ -2538,25 +2589,81 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             break;
         }
     }
-    const bool denseEligible = !vibratoActive && CanUseDensePlan(
-        voices, events, eventCount, numFrames, correctnessMode);
-    if (denseEligible) {
-        if (RenderBlockDensePlanned(voices, sampleData, sampleDataFrames,
-                                    outputLeft, outputRight, numFrames, events,
-                                    eventCount, blockStartFrame)) {
+    // Chunk-granular mixed mode: dense-parallel chunks where planning is
+    // profitable, exact span rendering for the rest. Segments run strictly
+    // sequentially, so the dense pipeline's shadow state and the span
+    // renderer's authoritative state never interleave: each dense segment
+    // copies state in, renders, and commits before the next segment starts.
+    const bool denseGatesOpen = !vibratoActive && correctnessMode &&
+        events != nullptr && numFrames != 0u && workerPool_ != nullptr &&
+        workerPool_->GetThreadCount() > 1u;
+    const uint64_t denseChunkMask = denseGatesOpen
+        ? ComputeDenseChunkMask(voices, events, eventCount, numFrames,
+                                correctnessMode)
+        : 0ull;
+    const uint32_t chunkCount =
+        (numFrames + kDenseRenderChunkFrames - 1u) / kDenseRenderChunkFrames;
+    uint32_t segStart = 0u;
+    uint32_t eventCursor = 0u;
+    while (segStart < numFrames) {
+        const bool denseRun =
+            ((denseChunkMask >> (segStart / kDenseRenderChunkFrames)) & 1ull)
+                != 0ull;
+        uint32_t chunk = segStart / kDenseRenderChunkFrames;
+        while (chunk < chunkCount &&
+               (((denseChunkMask >> chunk) & 1ull) != 0ull) == denseRun)
+            ++chunk;
+        const uint32_t segEnd =
+            (std::min)(numFrames, chunk * kDenseRenderChunkFrames);
+        while (eventCursor < eventCount &&
+               events[eventCursor].frameOffset < segStart)
+            ++eventCursor;
+        bool needSparse = !denseRun;
+        if (denseRun) {
+            uint32_t renderedTo = segEnd;
+            if (RenderBlockDensePlanned(
+                    voices, sampleData, sampleDataFrames, outputLeft,
+                    outputRight, segStart, segEnd, events, eventCount,
+                    eventCursor, blockStartFrame, &renderedTo)) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-            if (coverageProfilingEnabled_) ++coverageStats_.denseRendered;
+                if (coverageProfilingEnabled_) ++coverageStats_.denseRendered;
 #endif
-            return;
+            } else {
+                // The chunk-mask estimator bounds mutations from above, so an
+                // execution overrun is assertion-grade. Recover exactly by
+                // span-rendering only the unrendered remainder.
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+                if (coverageProfilingEnabled_)
+                    ++coverageStats_.denseExecutionFallbacks;
+#endif
+                assert(renderedTo >= segStart && renderedTo <= segEnd);
+                needSparse = true;
+                segStart = renderedTo;
+                while (eventCursor < eventCount &&
+                       events[eventCursor].frameOffset < segStart)
+                    ++eventCursor;
+            }
         }
-#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        if (coverageProfilingEnabled_)
-            ++coverageStats_.denseExecutionFallbacks;
-#endif
+        if (needSparse) {
+            RenderBlockSparseRange(voices, channels, sampleData,
+                sampleDataFrames, outputLeft, outputRight, segStart, segEnd,
+                events, eventCount, eventCursor, vibratoActive,
+                correctnessMode, blockStartFrame);
+        }
+        segStart = segEnd;
     }
-    (void)cfg;
+}
+
+inline void RenderScalar::RenderBlockSparseRange(
+    VoiceManager& voices, const ChannelCache& channels,
+    const float* sampleData, uint32_t sampleDataFrames,
+    float* outputLeft, float* outputRight, uint32_t rangeStart,
+    uint32_t rangeEnd, const RenderEvent* events, uint32_t eventCount,
+    uint32_t eventIndexBegin, bool vibratoActive, bool correctnessMode,
+    uint64_t blockStartFrame) {
     VoiceSoA& v = voices.v;
     const RenderKernelSet& kernelSet = *kernelSet_;
+    const ChannelParamsSnapshot* channelParams = channels.GetParams();
     // Gain state is already current for this boundary; see the frame-major
     // oracle above and Driver::HandleControlChange.
 
@@ -2568,9 +2675,9 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         voices.RebuildActivePositions();
     }
 
-    uint32_t eventIndex = 0u;
-    uint32_t cursor = 0u;
-    while (cursor < numFrames) {
+    uint32_t eventIndex = eventIndexBegin;
+    uint32_t cursor = rangeStart;
+    while (cursor < rangeEnd) {
         voices.SetCurrentFrame(blockStartFrame + cursor);
 
         // State changes at this boundary are visible to the first rendered
@@ -2590,7 +2697,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         if (voices.activeCount_ > scratchCapacity_ &&
             !ReserveVoiceCapacity(voices.activeCount_)) return;
 
-        uint32_t spanEnd = numFrames;
+        uint32_t spanEnd = rangeEnd;
         if (eventIndex < eventCount && events[eventIndex].frameOffset < spanEnd)
             spanEnd = events[eventIndex].frameOffset;
         if (vibratoActive && spanEnd - cursor > kVibratoUpdateFrames)
@@ -2770,7 +2877,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         cursor = spanEnd;
     }
 
-    voices.SetCurrentFrame(blockStartFrame + numFrames);
+    voices.SetCurrentFrame(blockStartFrame + rangeEnd);
 }
 
 } // namespace svms
