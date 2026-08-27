@@ -465,18 +465,21 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         }
 
         if (ImGui::GetContentRegionAvail().x > 150.0f) {
-            ImGui::SameLine();
+            ImGui::SameLine(0.0f, 6.0f);
             static const char* modeHints[] = {
-                "exact, no extra cost",
-                "±0.25 Hz phase sweep",
-                "±0.25 Hz phase sweep + jittered coeffs",
-                "4-section random allpass cascade",
-                "full quadrature with jittered splitter"
+                "exact",
+                "random θ, quadrature",
+                "random θ + sweep (0.25 Hz)",
+                "random 4-section cascade",
+                "random θ + sweep + jittered splitter"
             };
             ImGui::TextDisabled("%s", modeHints[idx]);
         }
         ImGui::TableNextColumn();
-        if (live.connected) LiveBadge("Applied live via RuntimeLink");
+        if (live.connected) {
+            ImGui::AlignTextToFramePadding();
+            LiveBadge("Applied live via RuntimeLink");
+        }
 
         ImGui::EndTable();
     }
