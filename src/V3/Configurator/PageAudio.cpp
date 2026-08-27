@@ -428,10 +428,13 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
 
         ImGui::TableNextRow();
         AudioLabelCell("Phase rotation",
-                       "Scrambles the phase of each frequency band to remove the coherent "
-                       "black-MIDI hum. All modes are unity-gain (no loudness or EQ change) "
-                       "and never affect the limiter. Coherent (off) is the exact baseline "
-                       "renderer. Applies live to the running engine when connected.");
+                       "Rotates each voice by an independent random constant phase "
+                       "(Hilbert/quadrature form) at note-on, so the coherent "
+                       "black-MIDI hum no longer sums across voices. Per-frequency "
+                       "magnitude, loudness and sample-exact timing are untouched; "
+                       "Coherent (off) is the bit-exact baseline renderer. Analytic "
+                       "is the recommended mode; Sweep/Diffuse/Random are variants. "
+                       "Applies live to the running engine when connected.");
         ImGui::TableNextColumn();
         {
             static const char* phaseItems[] = {

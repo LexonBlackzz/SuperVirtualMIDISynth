@@ -461,6 +461,29 @@ struct SamplePage {
     SVMS_VOICE_SOA_DENSE_FIELDS(X) \
     SVMS_VOICE_SOA_COLD_FIELDS(X)
 
+// ════════════════════════════════════════════════════════════════════════
+// VoiceRotationState — per-voice phase rotation state (DSP in
+// SVMSPhaseRotation.h).  POD so it can live in the fixed steal-tail
+// reserve. 48 bytes.  A VoiceSoA owns a lazily allocated array of these
+// (VoiceSoA::rot) whenever a non-Coherent phase-rotation mode is active;
+// in Coherent mode the pointer is null and the render path is untouched.
+struct VoiceRotationState {
+    float c;        // current cos(theta)
+    float s;        // current sin(theta)
+    float dc;       // per-sample cos(theta increment); 1,0 = static angle
+    float ds;       // per-sample sin(theta increment)
+    float z0;       // allpass section 1 delay state
+    float z1;       // allpass section 2 delay state
+    float z2;       // allpass section 3 delay state
+    float z3;       // allpass section 4 delay state
+    float a0;       // allpass section 1 coefficient
+    float a1;       // allpass section 2 coefficient
+    float a2;       // allpass section 3 coefficient
+    float a3;       // allpass section 4 coefficient
+    uint32_t form;  // 0 = quadrature splitter, 1 = plain cascade
+    uint32_t pad;
+};
+
 #define SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(X) \
     X(float, stealTailPhase, kStealTailReserve) \
     X(float, stealTailPhaseInc, kStealTailReserve) \
@@ -477,12 +500,20 @@ struct SamplePage {
     X(uint32_t, stealTailFramesTotal, kStealTailReserve) \
     X(uint8_t, stealTailSampleBacked, kStealTailReserve) \
     X(uint8_t, stealTailLoopEnabled, kStealTailReserve) \
-    X(uint8_t, stealTailChannel, kStealTailReserve)
+    X(uint8_t, stealTailChannel, kStealTailReserve) \
+    X(VoiceRotationState, stealTailRot, kStealTailReserve)
 
 struct alignas(64) VoiceSoA {
 #define SVMS_DECLARE_DYNAMIC_FIELD(type, name) type* name = nullptr;
     SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_DECLARE_DYNAMIC_FIELD)
 #undef SVMS_DECLARE_DYNAMIC_FIELD
+
+    // Lazily allocated per-voice phase-rotation states (SVMSPhaseRotation.h).
+    // Null in Coherent mode — every render path checks this pointer and is
+    // bit-identical when it is null.  Not part of the field macros on
+    // purpose: it is manager-owned live state, never dense-copied.
+    VoiceRotationState* rot = nullptr;
+    uint32_t rotCapacity_ = 0;
 
     uint16_t pad16 = 0;
 
@@ -502,7 +533,10 @@ struct alignas(64) VoiceSoA {
 
     VoiceSoA() noexcept { ResetFixedTails(); }
 
-    ~VoiceSoA() { _aligned_free(storage_); }
+    ~VoiceSoA() {
+        _aligned_free(storage_);
+        _aligned_free(rot);
+    }
 
     VoiceSoA(const VoiceSoA& other) {
         ResetFixedTails();
@@ -511,6 +545,8 @@ struct alignas(64) VoiceSoA {
             : Reserve(other.capacity_);
         if (!reserved) throw std::bad_alloc();
         CopyFrom(other);
+        rot = nullptr;             // copies start rotation-inactive
+        rotCapacity_ = 0u;
     }
 
     VoiceSoA& operator=(const VoiceSoA& other) {
@@ -520,7 +556,39 @@ struct alignas(64) VoiceSoA {
             : Reserve(other.capacity_);
         if (!reserved) throw std::bad_alloc();
         CopyFrom(other);
+        _aligned_free(rot);        // copies start rotation-inactive
+        rot = nullptr;
+        rotCapacity_ = 0u;
         return *this;
+    }
+
+    // Lazily allocate (or grow) the per-voice rotation state array.
+    // Existing contents are preserved on growth so voices keep their angle
+    // and filter state across a live capacity change.
+    bool ReserveRotation(uint32_t capacity) noexcept {
+        if (capacity == 0u) return true;
+        if (rot && capacity <= rotCapacity_) return true;
+        void* allocation = _aligned_malloc(
+            static_cast<size_t>(capacity) * sizeof(VoiceRotationState),
+            kMixBufferAlign);
+        if (!allocation) return false;
+        auto* next = static_cast<VoiceRotationState*>(allocation);
+        std::memset(next, 0, static_cast<size_t>(capacity) *
+                                  sizeof(VoiceRotationState));
+        if (rot) {
+            std::memcpy(next, rot, static_cast<size_t>(rotCapacity_) *
+                                       sizeof(VoiceRotationState));
+        }
+        _aligned_free(rot);
+        rot = next;
+        rotCapacity_ = capacity;
+        return true;
+    }
+
+    void ReleaseRotation() noexcept {
+        _aligned_free(rot);
+        rot = nullptr;
+        rotCapacity_ = 0u;
     }
 
     VoiceSoA(VoiceSoA&& other) noexcept { MoveFrom(other); }
@@ -620,7 +688,8 @@ struct alignas(64) VoiceSoA {
 
     uint32_t GetCapacity() const noexcept { return capacity_; }
     size_t GetAllocatedBytes() const noexcept {
-        return sizeof(*this) + storageBytes_;
+        return sizeof(*this) + storageBytes_ +
+               static_cast<size_t>(rotCapacity_) * sizeof(VoiceRotationState);
     }
     static size_t EstimateStorageBytes(uint32_t capacity,
                                        bool denseOnly = false) noexcept {
@@ -756,6 +825,10 @@ private:
         storageBytes_ = other.storageBytes_;
         capacity_ = other.capacity_;
         denseOnly_ = other.denseOnly_;
+        rot = other.rot;
+        rotCapacity_ = other.rotCapacity_;
+        other.rot = nullptr;
+        other.rotCapacity_ = 0u;
 #define SVMS_MOVE_DYNAMIC_FIELD(type, name) \
         name = other.name; \
         other.name = nullptr;

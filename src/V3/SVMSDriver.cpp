@@ -2232,7 +2232,6 @@ private:
     PostHighPass3Hz postHighPass;
     ReverbState reverb;
     LimiterState limiter;
-    svms::PhaseRotator phaseRotator;
 #if !defined(SVMS_XP_COMPAT)
     svms::LiveWaveRecorder liveRecorder_;
 #endif
@@ -3244,7 +3243,11 @@ bool Driver::Initialize() {
             cfg.maxVoices);
         return false;
     }
-    phaseRotator.SetMode(cfg.phaseRotationMode);
+    // Per-voice phase rotation lives in the VoiceManager (SVMSPhaseRotation.h);
+    // mode 0 (Coherent) keeps the render path bit-exact.
+    if (!voiceManager->SetPhaseRotationMode(cfg.phaseRotationMode)) {
+        LOG("WARNING: Could not allocate phase rotation state; running Coherent");
+    }
 
     for (uint32_t index = 0; index < 2u; ++index) {
         voiceStatisticsSnapshots_[index] = SnappyVoiceStatistics{};
@@ -4653,7 +4656,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->limiter.attackCoeff       = mb.limiterAttackCoeff;
         self->limiter.releaseCoeff      = mb.limiterReleaseCoeff;
 
-        self->phaseRotator.SetMode(mb.phaseRotationMode);
+        // Per-voice phase rotation mode (0 = Coherent bit-exact bypass).
+        self->voiceManager->SetPhaseRotationMode(mb.phaseRotationMode);
 
         self->channelCache->SetMasterVolume(
             mb.masterVolume * self->sysexMasterVolume_);
@@ -5032,10 +5036,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             self->sf2Telemetry_.lastPhase = vm->v.phases[h];
         }
     }
-    // Phase rotation runs on the continuous mixed signal, before reverb and
-    // the limiter, so it never affects loudness/gain-reduction decisions and
-    // Coherent mode (bypassed inside Process()) stays bit-identical.
-    self->phaseRotator.Process(output, numFrames);
+    // Per-voice phase rotation is applied inside RenderBlock (per-voice, at
+    // each mix site), so Coherent mode (no state allocated) stays bit-exact
+    // and non-Coherent modes never touch loudness or gain-reduction inputs.
     // Filter the final limited samples in the same loop so the 3 Hz cutoff
     // neither changes gain detection nor requires another memory pass.
     self->reverb.Process(output, numFrames, 2);

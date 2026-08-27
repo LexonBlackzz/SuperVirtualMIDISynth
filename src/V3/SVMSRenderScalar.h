@@ -68,7 +68,8 @@ inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
     }
 
     const float frac = phase - static_cast<float>(baseOffset);
-    const float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+    float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+    if (v.rot) sample = RotateVoiceSample(v.stealTailRot[idx], sample);
     const uint32_t total = v.stealTailFramesTotal[idx];
     const float fade = total > 1u
         ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
@@ -539,8 +540,34 @@ public:
     bool SetRenderBackend(RenderBackend backend);
     RenderBackend GetRenderBackend() const { return kernelSet_->backend; }
     const char* GetRenderBackendName() const { return kernelSet_->name; }
+    // Per-voice phase rotation forces the scalar kernel set (the SIMD span
+    // kernels cannot carry per-voice filter state) and disables the dense
+    // snapshot pipeline.  Called with the VoiceManager's live flag each
+    // block; a no-op while the value is unchanged.  Coherent mode keeps the
+    // originally selected backend bit-for-bit.
+    void SyncPhaseRotation(bool active) {
+        if (rotationActive_ == active) return;
+        rotationActive_ = active;
+        ResolveKernelSet();
+    }
 
 private:
+private:
+    // Re-resolve the active kernel set from the backend request and the
+    // phase-rotation override.
+    void ResolveKernelSet() {
+        if (rotationActive_) {
+            kernelSet_ = &GetScalarRenderKernelSet();
+            return;
+        }
+        if (useBestBackend_) {
+            kernelSet_ = &SelectBestRenderKernelSet();
+            return;
+        }
+        const RenderKernelSet* selected =
+            SelectRenderKernelSet(requestedBackend_);
+        kernelSet_ = selected ? selected : &GetScalarRenderKernelSet();
+    }
     void RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
                      const float* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
@@ -596,6 +623,10 @@ private:
     EventBatchDispatcher batchDispatcher_;
     void* dispatcherUserData_;
     const RenderKernelSet* kernelSet_;
+    // Backend request bookkeeping for the phase-rotation override.
+    RenderBackend requestedBackend_ = RenderBackend::Scalar;
+    bool useBestBackend_ = true;   // ctor picks the best supported backend
+    bool rotationActive_ = false;  // per-voice rotation forces scalar kernels
     uint32_t* classChanges_;
     alignas(64) uint32_t tailFrameCounts_[kStealTailReserve];
     SpanRetirement* retirements_;
@@ -765,7 +796,9 @@ inline bool RenderScalar::EnsureDenseStorage() {
 inline bool RenderScalar::SetRenderBackend(RenderBackend backend) {
     const RenderKernelSet* selected = SelectRenderKernelSet(backend);
     if (selected == nullptr) return false;
-    kernelSet_ = selected;
+    requestedBackend_ = backend;
+    useBestBackend_ = false;
+    ResolveKernelSet();
     return true;
 }
 
@@ -1042,7 +1075,9 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
             }
 
             if (mixAudio) {
-                const float scaled = sample * gain * stealFadeIn;
+                float rotated = sample;
+                if (v.rot) rotated = RotateVoiceSample(v.rot[idx], rotated);
+                const float scaled = rotated * gain * stealFadeIn;
                 *outL += scaled * v.mixGainL[idx];
                 *outR += scaled * v.mixGainR[idx];
             }
@@ -1145,7 +1180,8 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
         }
 
         const float frac = phase - static_cast<float>(baseOffset);
-        const float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+        float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+        if (v.rot) sample = RotateVoiceSample(v.stealTailRot[idx], sample);
         const float fade = total > 1u
             ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
             : 0.0f;
@@ -1306,7 +1342,8 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 const uint32_t baseIndex = sampleStart + baseOffset;
                 const uint32_t nextIndex = sampleStart + nextRel;
                 const float frac = phase - static_cast<float>(baseOffset);
-                const float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+                float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+                if (v.rot) sample = RotateVoiceSample(v.rot[idx], sample);
                 const float scaled = sample * gain * fade;
                 outputLeft[frameStart + n] += scaled * mixL;
                 outputRight[frameStart + n] += scaled * mixR;
@@ -1461,7 +1498,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 if (decayRemaining == 0u) stage = 3u;
             }
 
-            const float scaled = sample * gain;
+            float sampleR = sample;
+            if (v.rot) sampleR = RotateVoiceSample(v.rot[idx], sampleR);
+            const float scaled = sampleR * gain;
             outL[n] += scaled * mixL;
             outR[n] += scaled * mixR;
             phase += phaseStep;
@@ -1514,7 +1553,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                     releaseFinished = releaseRemaining == 0u;
                 }
             }
-            const float scaled = sample * gain;
+            float sampleR = sample;
+            if (v.rot) sampleR = RotateVoiceSample(v.rot[idx], sampleR);
+            const float scaled = sampleR * gain;
             outL[n] += scaled * mixL;
             outR[n] += scaled * mixR;
 
@@ -1647,7 +1688,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
         }
 
         if (!sampleEnded && n < mixedFrameCount) {
-            const float scaled = sample * gain * fade;
+            float sampleR = sample;
+            if (v.rot) sampleR = RotateVoiceSample(v.rot[idx], sampleR);
+            const float scaled = sampleR * gain * fade;
             outputLeft[frameStart + n] += scaled * mixL;
             outputRight[frameStart + n] += scaled * mixR;
         }
@@ -1675,6 +1718,17 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
 inline uint64_t RenderScalar::ComputeDenseChunkMask(
     const VoiceManager& voices, const RenderEvent* events,
     uint32_t eventCount, uint32_t numFrames, bool correctnessMode) const {
+    // Per-voice phase rotation keeps its filter state in VoiceSoA, which the
+    // dense snapshot pipeline does not carry; rotation runs on the span
+    // renderer only.
+    if (voices.v.rot != nullptr) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (coverageProfilingEnabled_)
+            ++coverageStats_.denseRejected[
+                static_cast<uint32_t>(DensePlanRejectReason::MissingWorkers)];
+#endif
+        return 0ull;
+    }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     auto reject = [&](DensePlanRejectReason reason) {
         if (coverageProfilingEnabled_)
@@ -2574,6 +2628,9 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     if (coverageProfilingEnabled_) ++coverageStats_.callbacks;
 #endif
+    // Follow the VoiceManager's phase-rotation state (kernel-set override
+    // happens inside; no-op while unchanged).
+    SyncPhaseRotation(voices.v.rot != nullptr);
     voices.SetStealKeyBackend(kernelSet_->backend);
     // Live pool-limit changes are callback-boundary commands.  Applying one
     // before dense eligibility/snapshotting prevents a mid-plan lifecycle

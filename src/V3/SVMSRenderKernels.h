@@ -2,6 +2,7 @@
 #define SVMS_RENDER_KERNELS_H
 
 #include "SVMSTypes.h"
+#include "SVMSPhaseRotation.h"
 
 namespace svms {
 

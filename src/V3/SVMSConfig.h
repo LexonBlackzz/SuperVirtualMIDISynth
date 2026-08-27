@@ -72,11 +72,12 @@ struct EngineConfig {
     float reverbModRate;
     float reverbLowCutHz;
     float reverbHighCutHz;
-    // Post-mix frequency-dependent phase rotation. 0 = Coherent (bypass),
-    // 1 = Analytic, 2 = Sweep, 3 = Diffuse, 4 = Random. The mode is
-    // set on the VoiceManager and every newly allocated voice uses its
-    // initial phase offset so the coherent black-MIDI "hum" cannot sum
-    // constructively without changing spectral content or loudness.
+    // Per-voice phase rotation mode (SVMSPhaseRotation.h). 0 = Coherent
+    // (bit-exact bypass), 1 = Analytic, 2 = Sweep, 3 = Diffuse, 4 = Random.
+    // Every voice is rotated by an independent pseudo-random constant angle
+    // (Hilbert/quadrature form) at note-on, which decorrelates the coherent
+    // black-MIDI "hum" without changing spectral magnitude, loudness, or
+    // the sample-exact onset timing.
     uint32_t phaseRotationMode;
     bool enableChorus;
     bool enableFilter;

@@ -3,6 +3,7 @@
 
 #include "SVMSTypes.h"
 #include "SVMSEnvelope.h"
+#include "SVMSPhaseRotation.h"
 #include "SVMSLiveControl.h"
 #include "SVMSRenderKernels.h"
 #include <algorithm>
@@ -124,152 +125,16 @@ struct LaunchChurnStats {
 #endif
 
 // ════════════════════════════════════════════════════════════════════════
-// PhaseRotator — post-mix, signal-domain phase dispersion.
-//
-// Replaces the earlier per-voice note-onset delay hack. That approach
-// staggered when a voice's attack *started* (up to 360 samples / ~8ms),
-// which barely rotates phase for sub-100Hz content (a 30-50Hz fundamental
-// has a 20-33ms period, far longer than the jitter window) and staggers
-// dense onsets into audible smear/clicks.
-//
-// This instead cascades unity-gain first-order allpass sections
-// (H(z) = (a + z^-1) / (1 + a*z^-1), |H(z)| == 1 for all frequencies) over
-// the continuous mixed signal. Coefficients are spread log-ish across the
-// band so harmonics of a periodic/coherent waveform pick up different phase
-// shifts and stop summing constructively — the same principle a Hilbert
-// transform gives you, approximated cheaply with a fixed-point allpass
-// chain instead of an FIR/quadrature construction. Because it operates
-// continuously on the mix rather than at note-on, it does not touch timing,
-// loudness, or spectral magnitude, and it never introduces onset jitter.
-//
-// All coefficient changes (mode switches, Sweep/Diffuse/Random modulation)
-// are one-pole smoothed per-sample so they can never produce a sample-domain
-// discontinuity/click, which is the failure mode to watch for if this is
-// extended further.
-//
-// Coherent (mode 0) is an exact bypass — Process()/ProcessPlanar() return
-// immediately, so the sample-precise baseline renderer is untouched.
-//
-// This is a first pass, not a tuned final product: the coefficient sets,
-// sweep rate, and noise-wander depth below are reasonable starting points,
-// not measured/verified against your ears or your HZ Bass material. Expect
-// to retune kAnalyticCoeffs / the modulation depths after listening.
+// Phase rotation (black-MIDI hum removal) moved to per-voice processing —
+// see SVMSPhaseRotation.h.  The former post-mix allpass cascade was removed:
+// a fixed LTI filter on the mixed signal preserves the magnitude of every
+// Fourier component of a periodic signal, so the steady-state dispatch-rate
+// hum survived it untouched.  The replacement rotates each voice by an
+// independent random constant angle (Hilbert/quadrature form) at note-on,
+// which decorrelates the voices (hum sums as √N instead of N) while keeping
+// the magnitude spectrum and the sample-exact onset timing intact.
+// Coherent (mode 0) remains a bit-exact bypass.
 // ════════════════════════════════════════════════════════════════════════
-class PhaseRotator {
-public:
-    void SetMode(uint32_t mode) noexcept {
-        if (mode > 4u) mode = 0u;
-        if (mode == mode_) return;
-        mode_ = mode;
-        targetSet_ = BuildCoefficients(mode_);
-        // Zero all filter state on any mode change. aSmoothed then eases
-        // from 0 toward the new target over ~kSmoothingSamples, so switching
-        // modes fades the effect in/out instead of jumping coefficients.
-        stagesL_ = {};
-        stagesR_ = {};
-    }
-    uint32_t GetMode() const noexcept { return mode_; }
-
-    // Interleaved stereo buffer (2 floats/frame), applied post-mix.
-    void Process(float* interleaved, uint32_t numFrames) noexcept {
-        if (mode_ == 0u) return;
-        for (uint32_t i = 0; i < numFrames; ++i) {
-            Tick();
-            interleaved[i * 2u]      = ProcessSample(stagesL_, interleaved[i * 2u]);
-            interleaved[i * 2u + 1u] = ProcessSample(stagesR_, interleaved[i * 2u + 1u]);
-        }
-    }
-    // Planar stereo buffers, applied post-mix.
-    void ProcessPlanar(float* left, float* right, uint32_t numFrames) noexcept {
-        if (mode_ == 0u) return;
-        for (uint32_t i = 0; i < numFrames; ++i) {
-            Tick();
-            left[i]  = ProcessSample(stagesL_, left[i]);
-            right[i] = ProcessSample(stagesR_, right[i]);
-        }
-    }
-
-private:
-    static constexpr uint32_t kStages = 8u;
-    struct Stage {
-        float a = 0.0f;         // current target coefficient for this stage
-        float aSmoothed = 0.0f; // one-pole smoothed value actually applied
-        float z1 = 0.0f;        // allpass delay state
-    };
-
-    static std::array<float, kStages> BuildCoefficients(uint32_t mode) noexcept {
-        // Log-ish spread from ~30Hz to ~12kHz-equivalent allpass corners.
-        // Modes 2-4 modulate around this seed set at runtime; mode 1 is
-        // static.
-        static constexpr std::array<float, kStages> kAnalyticCoeffs = {
-            -0.90f, -0.75f, -0.55f, -0.30f, 0.05f, 0.35f, 0.60f, 0.80f
-        };
-        return (mode >= 1u && mode <= 4u) ? kAnalyticCoeffs
-                                           : std::array<float, kStages>{};
-    }
-
-    inline void Tick() noexcept {
-        switch (mode_) {
-        case 2u: { // Sweep: slow continuous LFO shared by both channels.
-            sweepPhase_ += kSweepStep;
-            if (sweepPhase_ >= 1.0f) sweepPhase_ -= 1.0f;
-            const float lfo = std::sin(6.28318530718f * sweepPhase_);
-            for (uint32_t i = 0; i < kStages; ++i) {
-                const float a = Clamp(targetSet_[i] + 0.15f * lfo, -0.98f, 0.98f);
-                stagesL_[i].a = a;
-                stagesR_[i].a = a;
-            }
-            break;
-        }
-        case 3u: // Diffuse
-        case 4u: { // Random: correlated slow wander, decorrelated L/R.
-            noiseL_ = noiseL_ * 1664525u + 1013904223u;
-            noiseR_ = noiseR_ * 1664525u + 1013904223u;
-            const float nL = static_cast<int32_t>(noiseL_ >> 8) * (1.0f / 8388608.0f);
-            const float nR = static_cast<int32_t>(noiseR_ >> 8) * (1.0f / 8388608.0f);
-            const float depth = (mode_ == 4u) ? 0.30f : 0.15f;
-            for (uint32_t i = 0; i < kStages; ++i) {
-                stagesL_[i].a = Clamp(targetSet_[i] + depth * nL, -0.98f, 0.98f);
-                stagesR_[i].a = Clamp(targetSet_[i] + depth * nR, -0.98f, 0.98f);
-            }
-            break;
-        }
-        default: // Analytic (1): fixed target, only initial smoothing moves.
-            for (uint32_t i = 0; i < kStages; ++i) {
-                stagesL_[i].a = targetSet_[i];
-                stagesR_[i].a = targetSet_[i];
-            }
-            break;
-        }
-    }
-
-    static inline float Clamp(float v, float lo, float hi) noexcept {
-        return v < lo ? lo : (v > hi ? hi : v);
-    }
-    static inline float ProcessSample(std::array<Stage, kStages>& stages,
-                                       float x) noexcept {
-        for (auto& s : stages) {
-            s.aSmoothed += kSmoothingCoeff * (s.a - s.aSmoothed);
-            const float y = s.aSmoothed * x + s.z1;
-            s.z1 = x - s.aSmoothed * y;
-            x = y;
-        }
-        return x;
-    }
-
-    // ~1/0.001 ≈ 1000-sample (≈23ms @44.1kHz) time constant for coefficient
-    // smoothing — slow enough that no coefficient step is audible as a click.
-    static constexpr float kSmoothingCoeff = 0.001f;
-    static constexpr float kSweepStep = 4.0e-6f; // sweep LFO increment/sample
-
-    std::array<Stage, kStages> stagesL_{};
-    std::array<Stage, kStages> stagesR_{};
-    std::array<float, kStages> targetSet_{};
-    uint32_t mode_ = 0u;
-    float sweepPhase_ = 0.0f;
-    uint32_t noiseL_ = 0x9e3779b9u;
-    uint32_t noiseR_ = 0x85ebca6bu;
-};
 
 // ════════════════════════════════════════════════════════════════════════
 // VoiceManager — flat-array voice pool with score-based stealing.
@@ -596,6 +461,22 @@ public:
         enableReleasingRing_ = enabled;
     }
 
+    // ── Per-voice phase rotation (SVMSPhaseRotation.h) ─────────────────
+    // Mode 0 (Coherent) frees the per-voice state and leaves the render
+    // path bit-identical.  Modes 1-4 allocate the state array and seed
+    // every currently live voice deterministically; new voices are seeded
+    // at allocation.  Returns false only when the state allocation fails
+    // (mode stays 0 in that case).
+    bool SetPhaseRotationMode(uint32_t mode);
+    uint32_t GetPhaseRotationMode() const noexcept {
+        return phaseRotationMode_;
+    }
+    // Rotation activity flag for the render paths (v.rot != nullptr).
+    bool PhaseRotationActive() const noexcept { return v.rot != nullptr; }
+    // Seed (or re-seed) one voice's rotation state deterministically from
+    // its MIDI identity, birth frame and a monotonic counter.
+    void SeedVoiceRotationForVoice(VoiceHandle handle);
+
 private:
     struct StealCandidate {
         float score;
@@ -605,6 +486,10 @@ private:
     uint32_t maxVoices_;
     uint32_t voiceLimit_;
     uint32_t sampleRate_;
+    // Per-voice phase rotation (SVMSPhaseRotation.h).  Audio-thread-only;
+    // 0 = Coherent (v.rot == nullptr, bit-exact render path).
+    uint32_t phaseRotationMode_ = 0u;
+    uint64_t rotationSeedCounter_ = 0u;
     uint32_t stealFadeFrames_;
     uint64_t currentFrame_;
     uint64_t lastVoiceLimitEnforceFrame_;
@@ -1388,8 +1273,20 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_TAIL_FIELD(stealTailSampleBacked);
     SVMS_COPY_GROWN_TAIL_FIELD(stealTailLoopEnabled);
     SVMS_COPY_GROWN_TAIL_FIELD(stealTailChannel);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailRot);
 #undef SVMS_COPY_GROWN_TAIL_FIELD
     grown.v.pad16 = v.pad16;
+
+    // Preserve per-voice rotation state across the growth (handles are
+    // stable, so a straight prefix copy is exact).
+    grown.phaseRotationMode_ = phaseRotationMode_;
+    grown.rotationSeedCounter_ = rotationSeedCounter_;
+    if (phaseRotationMode_ != 0u && v.rot &&
+        grown.v.ReserveRotation(oldCapacity)) {
+        std::memcpy(grown.v.rot, v.rot,
+                    static_cast<size_t>(oldCapacity) *
+                        sizeof(VoiceRotationState));
+    }
 
     grown.activeCount_ = activeCount_;
     if (activeCount_ != 0u)
@@ -2573,6 +2470,9 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     v.stealTailChannel[tailSlot] = v.channel[handle];
     v.stealTailFramesRemaining[tailSlot] = stealFadeFrames_;
     v.stealTailFramesTotal[tailSlot] = stealFadeFrames_;
+    // Carry the victim's rotation state over so the tail keeps the same
+    // phase profile — no spectral jump at the steal boundary.
+    if (v.rot) v.stealTailRot[tailSlot] = v.rot[handle];
     if (replacingHeapRoot) {
         // SelectStealTailSlot accepts a replacement only when it is louder
         // than the current root, so the updated root can move only downward.
@@ -3222,12 +3122,46 @@ inline VoiceHandle VoiceManager::PredictStealVictimForTest(
 #endif
 }
 
+inline bool VoiceManager::SetPhaseRotationMode(uint32_t mode) {
+    if (mode > 4u) mode = 0u;
+    if (mode == phaseRotationMode_) return true;
+    phaseRotationMode_ = mode;
+    if (mode == 0u) {
+        // Coherent: free the state entirely — every render path then takes
+        // its original bit-exact code path (v.rot == nullptr).
+        v.ReleaseRotation();
+        return true;
+    }
+    if (!v.ReserveRotation(maxVoices_)) {
+        phaseRotationMode_ = 0u;
+        return false;
+    }
+    // Seed every currently live voice so a mid-playback mode switch never
+    // produces unrotated (or zero-state) filter output.
+    for (uint32_t position = 0u; position < activeCount_; ++position)
+        SeedVoiceRotationForVoice(activeList_[position]);
+    return true;
+}
+
+inline void VoiceManager::SeedVoiceRotationForVoice(VoiceHandle handle) {
+    if (phaseRotationMode_ == 0u || v.rot == nullptr ||
+        handle >= maxVoices_) {
+        return;
+    }
+    const uint64_t seed = MakeVoiceRotationSeed(
+        v.channel[handle], v.note[handle], handle, v.birthFrame[handle],
+        ++rotationSeedCounter_);
+    SeedVoiceRotation(v.rot[handle], phaseRotationMode_, seed,
+                      static_cast<float>(sampleRate_));
+}
+
 inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (voiceLimit_ == 0u || activeCount_ >= voiceLimit_ || freeTop_ == 0u)
         return kInvalidVoice;
     uint32_t idx = freeStack_[--freeTop_];
 
     InitializeVoice(static_cast<VoiceHandle>(idx), channel, note, velocity);
+    SeedVoiceRotationForVoice(static_cast<VoiceHandle>(idx));
     LinkChannelKey(static_cast<VoiceHandle>(idx));
     LinkChannelActive(static_cast<VoiceHandle>(idx));
     LinkRenderClass(static_cast<VoiceHandle>(idx));
@@ -3263,6 +3197,7 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
         vh = static_cast<VoiceHandle>(idx);
         InitializePreparedVoice(vh, channel, note, velocity);
+        SeedVoiceRotationForVoice(vh);
         LinkChannelKey(vh);
         LinkChannelActive(vh);
         activeList_[activeCount_] = idx;
