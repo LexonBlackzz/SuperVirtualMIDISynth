@@ -389,6 +389,12 @@ public:
     }
 #endif
 
+    // Unit-test oracle: returns exactly the victim AllocateVoiceOrSteal's
+    // selection stage yields now — the oldest valid Releasing entry when the
+    // fast-path eligibility holds, otherwise (reference builds) the
+    // exhaustive winner.
+    VoiceHandle PredictStealVictimForTest(uint32_t& activePosition);
+
     // ── Public read-only access ────────────────────────────────────────
     VoiceSoA v;
 
@@ -419,6 +425,21 @@ public:
         return releasingCount_.load(std::memory_order_relaxed);
     }
 
+    // Diagnostic counter: steals served by the Releasing-ring fast path
+    // instead of the stable-tree/volatile-heap tiers.
+    uint64_t releasingRingHits_{0u};
+    uint32_t GetReleasingRingCountForTest() const {
+        return releasingRingCount_;
+    }
+
+    // Master switch for the Releasing-ring steal fast path. On by default;
+    // victim-exactness oracle tests opt out where the probed selection route
+    // (reserved in-place/group-reuse) intentionally keeps exact tier
+    // semantics.
+    void SetReleasingRingEnabled(const bool enabled) noexcept {
+        enableReleasingRing_ = enabled;
+    }
+
 private:
     struct StealCandidate {
         float score;
@@ -435,6 +456,18 @@ private:
 
     // LIFO free slot stack
     int32_t* freeStack_;
+
+    // Circular ring of voice handles believed to be Releasing. Pushed in
+    // StartRelease; consumed (and lazily validated) by the steal fast path.
+    // Stale entries are simply skipped at consumption time — never repaired
+    // mid-search — which keeps the audio-thread push/pop O(1) with no
+    // bookkeeping on retirement. Audio-thread-only.
+    uint32_t* releasingRing_;
+    uint32_t releasingRingCapacity_;  // power of two, >= 2 * capacity
+    uint32_t releasingRingMask_;
+    uint32_t releasingRingHead_;      // index of the oldest entry
+    uint32_t releasingRingCount_;
+    bool enableReleasingRing_ = true;
 
     // Dense per-channel indices make controller, sustain, pitch-bend and
     // channel termination work proportional to that channel's polyphony.
@@ -620,6 +653,13 @@ private:
     void RebuildStableWinnerTree();
     VoiceHandle PopStealCandidate(uint32_t& activePosition,
                                   bool reserveVolatileRoot);
+    // Releasing-ring fast path: consumes (or peeks, with consume=false) the
+    // oldest plausible Releasing entry, validating it against live pool
+    // state; returns kInvalidVoice when the ring runs dry or every remaining
+    // entry is stale.
+    VoiceHandle NextValidReleasingRingVictim(uint32_t& victimPosition,
+                                             bool consume);
+    bool ReleasingRingEligible() const;
     void PushStealCandidate(VoiceHandle handle, uint32_t activePosition);
     void UpdateStealCandidate(VoiceHandle handle);
     void RemoveStealCandidate(VoiceHandle handle);
@@ -768,6 +808,12 @@ inline size_t VoiceManager::EstimateAllocatedBytes(
     add(sizeof(uint32_t), capacity);
     add(sizeof(uint32_t), capacity);
     add(sizeof(int32_t), capacity);
+    {
+        uint32_t ringCapacity = 2u;
+        while (ringCapacity < static_cast<uint32_t>(capacity) * 2u)
+            ringCapacity <<= 1u;
+        add(sizeof(uint32_t), ringCapacity); // releasing ring
+    }
     add(sizeof(ChannelIndexBlock), channelBlocks);
     add(sizeof(uint32_t), channelBlocks);
     add(sizeof(uint32_t), capacity);
@@ -806,6 +852,9 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     const uint32_t renderBlocks =
         (capacity + kRenderClassBlockSize - 1u) /
             kRenderClassBlockSize + kVoiceRenderClassCount;
+    uint32_t ringCapacity = 2u;
+    while (ringCapacity < static_cast<uint32_t>(capacity) * 2u)
+        ringCapacity <<= 1u;
 
     size_t bytes = 0u;
     auto add = [&](size_t elementSize, size_t count) {
@@ -821,6 +870,7 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     add(sizeof(uint32_t), capacity); // activeList
     add(sizeof(uint32_t), capacity); // activePosition
     add(sizeof(int32_t), capacity);  // freeStack
+    add(sizeof(uint32_t), ringCapacity); // releasing ring
     add(sizeof(ChannelIndexBlock), channelBlocks);
     add(sizeof(uint32_t), channelBlocks);
     add(sizeof(uint32_t), capacity); // channelActiveBlock
@@ -850,6 +900,10 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     channelIndexBlockCount_ = channelBlocks;
     renderClassBlockCount_ = renderBlocks;
     stealTreeLeafBase_ = treeLeaves;
+    releasingRingCapacity_ = ringCapacity;
+    releasingRingMask_ = ringCapacity - 1u;
+    releasingRingHead_ = 0u;
+    releasingRingCount_ = 0u;
 
     size_t offset = 0u;
     uint8_t* base = static_cast<uint8_t*>(metadataStorage_);
@@ -863,6 +917,8 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     activeList_ = static_cast<uint32_t*>(take(sizeof(uint32_t), capacity));
     activePosition_ = static_cast<uint32_t*>(take(sizeof(uint32_t), capacity));
     freeStack_ = static_cast<int32_t*>(take(sizeof(int32_t), capacity));
+    releasingRing_ = static_cast<uint32_t*>(take(sizeof(uint32_t),
+                                                 releasingRingCapacity_));
     channelIndexBlocks_ = static_cast<ChannelIndexBlock*>(
         take(sizeof(ChannelIndexBlock), channelBlocks));
     channelIndexFreeStack_ = static_cast<uint32_t*>(
@@ -1076,6 +1132,9 @@ inline void VoiceManager::Reset() {
     maxLaunchGroupSize_ = 1u;
     freeTop_ = maxVoices_;
     releasingCount_.store(0u, std::memory_order_relaxed);
+    releasingRingHead_ = 0u;
+    releasingRingCount_ = 0u;
+    releasingRingHits_ = 0u;
     for (uint32_t i = 0; i < maxVoices_; ++i) {
         v.state[i] = static_cast<uint8_t>(VoiceState::Free);
         v.nextChannelKeyVoice[i] = -1;
@@ -1247,6 +1306,12 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     grown.retireImmediateCount_ = retireImmediateCount_;
     grown.stealCount_ = stealCount_;
     grown.releasingCount_.store(GetReleasingCount(), std::memory_order_relaxed);
+    grown.releasingRingHits_ = releasingRingHits_;
+    grown.releasingRingHead_ = 0u;
+    grown.releasingRingCount_ = releasingRingCount_;
+    for (uint32_t i = 0u; i < releasingRingCount_; ++i)
+        grown.releasingRing_[i & grown.releasingRingMask_] =
+            releasingRing_[(releasingRingHead_ + i) & releasingRingMask_];
     grown.voiceLimit_ = voiceLimit_;
     grown.currentFrame_ = currentFrame_;
     grown.lastVoiceLimitEnforceFrame_ = lastVoiceLimitEnforceFrame_;
@@ -1286,6 +1351,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     activeList_ = grown.activeList_;
     activePosition_ = grown.activePosition_;
     freeStack_ = grown.freeStack_;
+    releasingRing_ = grown.releasingRing_;
     channelIndexBlocks_ = grown.channelIndexBlocks_;
     channelIndexFreeStack_ = grown.channelIndexFreeStack_;
     channelActiveBlock_ = grown.channelActiveBlock_;
@@ -1354,6 +1420,14 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     retireImmediateCount_ = grown.retireImmediateCount_;
     stealCount_ = grown.stealCount_;
     releasingCount_.store(grown.GetReleasingCount(), std::memory_order_relaxed);
+    releasingRingHits_ = grown.releasingRingHits_;
+    releasingRingHead_ = 0u;
+    releasingRingCount_ = grown.releasingRingCount_;
+    releasingRingCapacity_ = grown.releasingRingCapacity_;
+    releasingRingMask_ = grown.releasingRingMask_;
+    for (uint32_t i = 0u; i < grown.releasingRingCount_; ++i)
+        releasingRing_[i & releasingRingMask_] =
+            grown.releasingRing_[i & grown.releasingRingMask_];
 
     _aligned_free(oldMetadataStorage);
     PublishRuntimeVoicePoolCapacity(capacity);
@@ -2521,6 +2595,28 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
                                                     bool reserveVolatileRoot) {
     if (!stealHeapValid_) BuildStealHeap();
 
+    // Releasing-ring fast path. Under saturated chopped-note churn the pool
+    // is dominated by end-of-life Releasing voices, so the exhaustive
+    // winner search adds nothing there: any Releasing voice sits at the
+    // bottom of BASSMIDI's effective-level ranking anyway (its envelope has
+    // left sustain). Engages only on a full free stack with the pool ≥85%
+    // occupied; every other case falls through to the exact existing tier
+    // selection unchanged, keeping sparse/mixed behavior byte-identical.
+    // Root-reserving probes keep their exact tier semantics.
+    if (!reserveVolatileRoot && ReleasingRingEligible()) {
+        uint32_t ringPosition = 0u;
+        const VoiceHandle ringVictim =
+            NextValidReleasingRingVictim(ringPosition, true);
+        if (ringVictim != kInvalidVoice) {
+            // Repair the incremental index: the victim is unlinked from
+            // whichever tier held it, mirroring tier-pop side effects.
+            RemoveStealCandidate(ringVictim);
+            ++releasingRingHits_;
+            activePosition = ringPosition;
+            return ringVictim;
+        }
+    }
+
     // Saturated sustained playback has no decay/release candidates. The
     // tournament root is already the exact exhaustive winner, including the
     // active-position tie, so avoid constructing/comparing generic candidate
@@ -2911,6 +3007,66 @@ inline void VoiceManager::RemoveStealCandidate(VoiceHandle handle) {
     RefreshStealWinnerPath(handle);
 }
 
+// Consume (or peek) the oldest plausible Releasing entry from the ring fast
+// path. Ring contents are hints: a voice may have been retired, re-stolen
+// through the normal tiers, or become a deferred replacement after its entry
+// was pushed. Stale entries are dropped (oldest-first) without repairing the
+// rest of the ring mid-search; live pool state is the only source of truth.
+// With consume=false nothing is mutated on success, so callers can predict
+// the fast-path outcome before committing to it.
+inline VoiceHandle VoiceManager::NextValidReleasingRingVictim(
+    uint32_t& victimPosition, const bool consume) {
+    if (releasingRingCapacity_ == 0u) return kInvalidVoice;
+    const auto releasingState = static_cast<uint8_t>(VoiceState::Releasing);
+    while (releasingRingCount_ != 0u) {
+        const uint32_t handle = releasingRing_[releasingRingHead_];
+        if (handle >= maxVoices_) {
+            // Stale entry: drop it and keep scanning.
+            releasingRingHead_ = (releasingRingHead_ + 1u) & releasingRingMask_;
+            --releasingRingCount_;
+            continue;
+        }
+        const uint32_t position = activePosition_[handle];
+        const bool valid = handle < maxVoices_ &&
+            v.state[handle] == releasingState &&
+            position < activeCount_ && activeList_[position] == handle &&
+            stealCandidateDeferred_[handle] == 0u &&
+            stealCandidateReserved_[handle] == 0u;
+        if (valid) {
+            if (!consume) return static_cast<VoiceHandle>(handle);
+            releasingRingHead_ = (releasingRingHead_ + 1u) & releasingRingMask_;
+            --releasingRingCount_;
+            victimPosition = position;
+            return static_cast<VoiceHandle>(handle);
+        }
+        // Stale entry: drop it and keep scanning.
+        releasingRingHead_ = (releasingRingHead_ + 1u) & releasingRingMask_;
+        --releasingRingCount_;
+    }
+    return kInvalidVoice;
+}
+
+inline bool VoiceManager::ReleasingRingEligible() const {
+    return enableReleasingRing_ && freeTop_ == 0u &&
+           releasingRingCapacity_ != 0u && releasingRingCount_ != 0u &&
+           activeCount_ * 20u >= voiceLimit_ * 17u;
+}
+
+// Unit-test oracle mirroring AllocateVoiceOrSteal's selection stage.
+inline VoiceHandle VoiceManager::PredictStealVictimForTest(
+    uint32_t& bestPos) {
+    if (ReleasingRingEligible()) {
+        const VoiceHandle ringVictim =
+            NextValidReleasingRingVictim(bestPos, false);
+        if (ringVictim != kInvalidVoice) return ringVictim;
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    return FindStealVictimExhaustiveForTest();
+#else
+    return kInvalidVoice;
+#endif
+}
+
 inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (voiceLimit_ == 0u || activeCount_ >= voiceLimit_ || freeTop_ == 0u)
         return kInvalidVoice;
@@ -3134,6 +3290,22 @@ inline void VoiceManager::StartRelease(VoiceHandle handle) {
         v.heldBySostenuto[handle] = 0u;
         v.state[handle] = static_cast<uint8_t>(VoiceState::Releasing);
         releasingCount_.fetch_add(1u, std::memory_order_relaxed);
+        // Track the voice in the Releasing-ring fast-path index. Entries are
+        // validated lazily when consumed; if a voice leaves Releasing by any
+        // other route its entry simply goes stale and is skipped later.
+        if (releasingRingCapacity_ != 0u) {
+            if (releasingRingCount_ == releasingRingCapacity_) {
+                // Overwrite the oldest entry on overflow; bounded memory,
+                // correctness never depends on ring contents.
+                releasingRingHead_ =
+                    (releasingRingHead_ + 1u) & releasingRingMask_;
+                --releasingRingCount_;
+            }
+            releasingRing_[(releasingRingHead_ + releasingRingCount_) &
+                           releasingRingMask_] =
+                static_cast<uint32_t>(handle);
+            ++releasingRingCount_;
+        }
         // SF2 sampleModes 3 = loop during key depression: stop looping so the
         // sample plays out to its end through the release tail.
         if (v.loopMode[handle] == 3) v.loopEnabled[handle] = 0;
@@ -3351,7 +3523,23 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t testSelectionBegin = BeginLaunchStageForTest();
 #endif
-    const VoiceHandle handle = PopStealCandidate(selectedPosition, true);
+    // Releasing-ring fast path: under release-storm churn the oldest
+    // releasing voice is an acceptable BASSMIDI-consistent victim, exactly
+    // like PopStealCandidate's fast path. Peek first so grouped voices are
+    // left untouched (they need the atomic group retirement path below).
+    uint32_t ringPeekPosition = 0u;
+    VoiceHandle ringPeek = kInvalidVoice;
+    if (ReleasingRingEligible())
+        ringPeek = NextValidReleasingRingVictim(ringPeekPosition, false);
+    const bool fromRing = ringPeek != kInvalidVoice &&
+        playGroupPrev_[ringPeek] < 0 && playGroupNext_[ringPeek] < 0;
+    VoiceHandle handle = kInvalidVoice;
+    if (fromRing) {
+        handle = NextValidReleasingRingVictim(selectedPosition, true);
+        ++releasingRingHits_;
+    } else {
+        handle = PopStealCandidate(selectedPosition, true);
+    }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
                           testSelectionBegin);
@@ -3361,19 +3549,16 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
 #endif
     if (handle == kInvalidVoice) return false;
 
-    // Mono replacements can retain the selected physical slot regardless of
-    // whether the exact victim came from the stable tree or volatile heap.
-    // Grouped victims still fall back to the complete atomic group path.
-    const uint8_t reservation = stealCandidateReserved_[handle];
-    const bool stableVictim = reservation == 2u &&
-        IsStableStealCandidate(handle) &&
-        stealWinnerTree_[stealTreeLeafBase_ + handle] ==
-            stealStableKey_[handle];
-    const bool volatileVictim = reservation == 1u &&
+    const bool volatileVictim = !fromRing &&
+        stealCandidateReserved_[handle] == 1u &&
         !IsStableStealCandidate(handle) &&
         stealVolatileHeapPosition_[handle] < stealVolatileHeapCount_;
-    const bool eligible = (stableVictim || volatileVictim) &&
-        playGroupPrev_[handle] < 0 && playGroupNext_[handle] < 0;
+    const bool eligible = fromRing ||
+        ((stealCandidateReserved_[handle] == 2u &&
+          IsStableStealCandidate(handle) &&
+          stealWinnerTree_[stealTreeLeafBase_ + handle] ==
+              stealStableKey_[handle]) ||
+         volatileVictim);
     if (!eligible) {
         stealCandidateReserved_[handle] = 0u;
         return false;
@@ -3390,7 +3575,11 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
         v.renderClass[handle] == desiredClassValue;
 
     CaptureStealTail(handle);
-    if (volatileVictim) {
+    if (fromRing) {
+        // Mirror tier-pop bookkeeping: unlink the victim from the volatile
+        // candidate index it still occupies.
+        RemoveStealCandidate(handle);
+    } else if (volatileVictim) {
         stealCandidateReserved_[handle] = 0u;
         RemoveReservedVolatileRoot(handle);
     }
@@ -3455,12 +3644,13 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
 
     // The stable replacement retains its leaf; a volatile victim vacated the
     // heap and inserts that same physical handle as a new stable leaf.
+    // Ring-served victims likewise occupied a volatile-tier slot before.
     stealCandidateReserved_[handle] = 0u;
     const float score = ComputeNewbornStableStealKey(handle);
     stealStableKey_[handle] = EncodeStableWinnerKey(
         score, activePosition_[handle]);
     stealWinnerTree_[stealTreeLeafBase_ + handle] = stealStableKey_[handle];
-    if (volatileVictim) ++stealHeapCount_;
+    if (volatileVictim || fromRing) ++stealHeapCount_;
     RefreshStealWinnerPath(handle);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance,

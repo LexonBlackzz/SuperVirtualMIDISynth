@@ -22,6 +22,13 @@ constexpr uint32_t kHandlesPerJob = 256u;
 constexpr uint32_t kMaximumRenderThreads = 64u;
 constexpr uint64_t kMinimumParallelVoiceSamples = 65'536u;
 constexpr uint32_t kMinimumParallelFrames = 8u;
+// At or above this pool occupancy, short event-fragmented spans still pay
+// for their fan-out handshake many times over.
+constexpr uint32_t kLargePoolShortSpanVoices = 1024u;
+// Spans shorter than kMinimumParallelFrames need an even larger voice pool
+// before the wake/sync handshake pays off (chopped buzz workloads where
+// event-fragmented per-class spans are 1-7 frames).
+constexpr uint32_t kMinimumVoicesShortSpan = 2048u;
 
 struct RenderJob {
     RenderClassKernel kernel = nullptr;
@@ -271,13 +278,22 @@ RenderParallelRejectReason RenderWorkerPool::ClassifyParallelization(
     uint32_t voices, uint32_t frames) const noexcept {
     if (!impl_ || impl_->totalThreads <= 1u)
         return RenderParallelRejectReason::Unavailable;
-    if (frames < kMinimumParallelFrames)
+    if (frames == 0u)
         return RenderParallelRejectReason::TooFewFrames;
-    if (voices < kHandlesPerJob * 2u)
+    if (voices < kHandlesPerJob)
         return RenderParallelRejectReason::TooFewVoices;
     if (static_cast<uint64_t>(voices) * frames <
-        kMinimumParallelVoiceSamples)
-        return RenderParallelRejectReason::TooFewVoiceSamples;
+        kMinimumParallelVoiceSamples) {
+        // Short spans (< kMinimumParallelFrames) need a very large voice
+        // pool to amortize wake/sync overhead (chopped buzz workloads).
+        if (frames < kMinimumParallelFrames) {
+            if (voices < kMinimumVoicesShortSpan)
+                return RenderParallelRejectReason::TooFewVoiceSamples;
+        } else {
+            if (voices < kLargePoolShortSpanVoices)
+                return RenderParallelRejectReason::TooFewVoiceSamples;
+        }
+    }
     return RenderParallelRejectReason::None;
 }
 

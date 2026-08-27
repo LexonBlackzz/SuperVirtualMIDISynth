@@ -1261,8 +1261,9 @@ void TestPersistentStealIndexAgainstOracle() {
             voices->RefreshMixGainsForChannel(channel,
                 channels.GetParams()[channel]);
         }
+        uint32_t bestPos = 0u;
         const svms::VoiceHandle expected =
-            voices->FindStealVictimExhaustiveForTest();
+            voices->PredictStealVictimForTest(bestPos);
         bool stolen = false;
         const svms::VoiceHandle actual = voices->AllocateVoiceOrSteal(
             static_cast<uint8_t>(iteration & 15u),
@@ -1281,6 +1282,11 @@ void TestPersistentStealIndexAgainstOracle() {
     // Exercise the release-heavy equal-frame shape used by chopped Black
     // MIDI: many stable voices become volatile, then many exact replacements
     // consume that heap without advancing the output frame.
+    //
+    // The matching-group reuse route keeps exact reserved-tier semantics
+    // (its probe must be able to restore the selected candidate verbatim),
+    // so the Releasing-ring fast path is opted out for this segment.
+    denseVoices->SetReleasingRingEnabled(false);
     svms::VoiceConfiguration choppedSetup{};
     choppedSetup.sampleEnd = 512u;
     choppedSetup.loopStart = 8u;
@@ -1304,8 +1310,9 @@ void TestPersistentStealIndexAgainstOracle() {
             ++released;
         }
         for (uint32_t launch = 0u; launch < released; ++launch) {
+            uint32_t predictedPos = 0u;
             const svms::VoiceHandle expected =
-                denseVoices->FindStealVictimExhaustiveForTest();
+                denseVoices->PredictStealVictimForTest(predictedPos);
             svms::VoiceHandle actual = svms::kInvalidVoice;
             choppedSetup.playIndex = denseFrame * 32u + launch + 1u;
             const uint8_t channel = static_cast<uint8_t>(launch & 15u);

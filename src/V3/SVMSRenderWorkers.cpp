@@ -22,6 +22,13 @@ constexpr uint32_t kHandlesPerJob = 256u;
 constexpr uint32_t kMaximumRenderThreads = 64u;
 constexpr uint64_t kMinimumParallelVoiceSamples = 65'536u;
 constexpr uint32_t kMinimumParallelFrames = 8u;
+// At or above this pool occupancy, short event-fragmented spans still pay
+// for their fan-out handshake many times over.
+constexpr uint32_t kLargePoolShortSpanVoices = 1024u;
+// Spans shorter than kMinimumParallelFrames need an even larger voice pool
+// before the wake/sync handshake pays off (chopped buzz workloads where
+// event-fragmented per-class spans are 1-7 frames).
+constexpr uint32_t kMinimumVoicesShortSpan = 2048u;
 
 struct RenderJob {
     RenderClassKernel kernel;
@@ -363,13 +370,27 @@ RenderParallelRejectReason RenderWorkerPool::ClassifyParallelization(
     uint32_t voiceCount, uint32_t frameCount) const noexcept {
     if (!impl_ || impl_->totalThreads <= 1u)
         return RenderParallelRejectReason::Unavailable;
-    if (frameCount < kMinimumParallelFrames)
+    if (frameCount == 0u)
         return RenderParallelRejectReason::TooFewFrames;
-    if (voiceCount < kHandlesPerJob * 2u)
+    if (voiceCount < kHandlesPerJob)
         return RenderParallelRejectReason::TooFewVoices;
+    // Small pools only earn the wake/join cost on substantial spans. A large
+    // pool makes even a short span worthwhile: the gather-heavy class kernels
+    // dwarf the roughly microsecond-scale WakeByAddress handshake, and dense
+    // chopped material produces event-fragmented spans as a rule rather than
+    // an exception.
     if (static_cast<uint64_t>(voiceCount) * frameCount <
-        kMinimumParallelVoiceSamples)
-        return RenderParallelRejectReason::TooFewVoiceSamples;
+        kMinimumParallelVoiceSamples) {
+        // Short spans (< kMinimumParallelFrames) need a very large voice
+        // pool to amortize wake/sync overhead (chopped buzz workloads).
+        if (frameCount < kMinimumParallelFrames) {
+            if (voiceCount < kMinimumVoicesShortSpan)
+                return RenderParallelRejectReason::TooFewVoiceSamples;
+        } else {
+            if (voiceCount < kLargePoolShortSpanVoices)
+                return RenderParallelRejectReason::TooFewVoiceSamples;
+        }
+    }
     return RenderParallelRejectReason::None;
 }
 
