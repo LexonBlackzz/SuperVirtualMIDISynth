@@ -475,7 +475,8 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
             };
             ImGui::TextDisabled("%s", modeHints[idx]);
         }
-        RestartCell();
+        ImGui::TableNextColumn();
+        if (live.connected) LiveBadge("Applied live via RuntimeLink");
 
         ImGui::EndTable();
     }
