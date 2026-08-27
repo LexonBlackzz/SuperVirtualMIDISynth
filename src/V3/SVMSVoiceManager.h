@@ -6,6 +6,7 @@
 #include "SVMSLiveControl.h"
 #include "SVMSRenderKernels.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -121,6 +122,154 @@ struct LaunchChurnStats {
     LaunchChurnBucketStats buckets[kClassificationBuckets]{};
 };
 #endif
+
+// ════════════════════════════════════════════════════════════════════════
+// PhaseRotator — post-mix, signal-domain phase dispersion.
+//
+// Replaces the earlier per-voice note-onset delay hack. That approach
+// staggered when a voice's attack *started* (up to 360 samples / ~8ms),
+// which barely rotates phase for sub-100Hz content (a 30-50Hz fundamental
+// has a 20-33ms period, far longer than the jitter window) and staggers
+// dense onsets into audible smear/clicks.
+//
+// This instead cascades unity-gain first-order allpass sections
+// (H(z) = (a + z^-1) / (1 + a*z^-1), |H(z)| == 1 for all frequencies) over
+// the continuous mixed signal. Coefficients are spread log-ish across the
+// band so harmonics of a periodic/coherent waveform pick up different phase
+// shifts and stop summing constructively — the same principle a Hilbert
+// transform gives you, approximated cheaply with a fixed-point allpass
+// chain instead of an FIR/quadrature construction. Because it operates
+// continuously on the mix rather than at note-on, it does not touch timing,
+// loudness, or spectral magnitude, and it never introduces onset jitter.
+//
+// All coefficient changes (mode switches, Sweep/Diffuse/Random modulation)
+// are one-pole smoothed per-sample so they can never produce a sample-domain
+// discontinuity/click, which is the failure mode to watch for if this is
+// extended further.
+//
+// Coherent (mode 0) is an exact bypass — Process()/ProcessPlanar() return
+// immediately, so the sample-precise baseline renderer is untouched.
+//
+// This is a first pass, not a tuned final product: the coefficient sets,
+// sweep rate, and noise-wander depth below are reasonable starting points,
+// not measured/verified against your ears or your HZ Bass material. Expect
+// to retune kAnalyticCoeffs / the modulation depths after listening.
+// ════════════════════════════════════════════════════════════════════════
+class PhaseRotator {
+public:
+    void SetMode(uint32_t mode) noexcept {
+        if (mode > 4u) mode = 0u;
+        if (mode == mode_) return;
+        mode_ = mode;
+        targetSet_ = BuildCoefficients(mode_);
+        // Zero all filter state on any mode change. aSmoothed then eases
+        // from 0 toward the new target over ~kSmoothingSamples, so switching
+        // modes fades the effect in/out instead of jumping coefficients.
+        stagesL_ = {};
+        stagesR_ = {};
+    }
+    uint32_t GetMode() const noexcept { return mode_; }
+
+    // Interleaved stereo buffer (2 floats/frame), applied post-mix.
+    void Process(float* interleaved, uint32_t numFrames) noexcept {
+        if (mode_ == 0u) return;
+        for (uint32_t i = 0; i < numFrames; ++i) {
+            Tick();
+            interleaved[i * 2u]      = ProcessSample(stagesL_, interleaved[i * 2u]);
+            interleaved[i * 2u + 1u] = ProcessSample(stagesR_, interleaved[i * 2u + 1u]);
+        }
+    }
+    // Planar stereo buffers, applied post-mix.
+    void ProcessPlanar(float* left, float* right, uint32_t numFrames) noexcept {
+        if (mode_ == 0u) return;
+        for (uint32_t i = 0; i < numFrames; ++i) {
+            Tick();
+            left[i]  = ProcessSample(stagesL_, left[i]);
+            right[i] = ProcessSample(stagesR_, right[i]);
+        }
+    }
+
+private:
+    static constexpr uint32_t kStages = 8u;
+    struct Stage {
+        float a = 0.0f;         // current target coefficient for this stage
+        float aSmoothed = 0.0f; // one-pole smoothed value actually applied
+        float z1 = 0.0f;        // allpass delay state
+    };
+
+    static std::array<float, kStages> BuildCoefficients(uint32_t mode) noexcept {
+        // Log-ish spread from ~30Hz to ~12kHz-equivalent allpass corners.
+        // Modes 2-4 modulate around this seed set at runtime; mode 1 is
+        // static.
+        static constexpr std::array<float, kStages> kAnalyticCoeffs = {
+            -0.90f, -0.75f, -0.55f, -0.30f, 0.05f, 0.35f, 0.60f, 0.80f
+        };
+        return (mode >= 1u && mode <= 4u) ? kAnalyticCoeffs
+                                           : std::array<float, kStages>{};
+    }
+
+    inline void Tick() noexcept {
+        switch (mode_) {
+        case 2u: { // Sweep: slow continuous LFO shared by both channels.
+            sweepPhase_ += kSweepStep;
+            if (sweepPhase_ >= 1.0f) sweepPhase_ -= 1.0f;
+            const float lfo = std::sin(6.28318530718f * sweepPhase_);
+            for (uint32_t i = 0; i < kStages; ++i) {
+                const float a = Clamp(targetSet_[i] + 0.15f * lfo, -0.98f, 0.98f);
+                stagesL_[i].a = a;
+                stagesR_[i].a = a;
+            }
+            break;
+        }
+        case 3u: // Diffuse
+        case 4u: { // Random: correlated slow wander, decorrelated L/R.
+            noiseL_ = noiseL_ * 1664525u + 1013904223u;
+            noiseR_ = noiseR_ * 1664525u + 1013904223u;
+            const float nL = static_cast<int32_t>(noiseL_ >> 8) * (1.0f / 8388608.0f);
+            const float nR = static_cast<int32_t>(noiseR_ >> 8) * (1.0f / 8388608.0f);
+            const float depth = (mode_ == 4u) ? 0.30f : 0.15f;
+            for (uint32_t i = 0; i < kStages; ++i) {
+                stagesL_[i].a = Clamp(targetSet_[i] + depth * nL, -0.98f, 0.98f);
+                stagesR_[i].a = Clamp(targetSet_[i] + depth * nR, -0.98f, 0.98f);
+            }
+            break;
+        }
+        default: // Analytic (1): fixed target, only initial smoothing moves.
+            for (uint32_t i = 0; i < kStages; ++i) {
+                stagesL_[i].a = targetSet_[i];
+                stagesR_[i].a = targetSet_[i];
+            }
+            break;
+        }
+    }
+
+    static inline float Clamp(float v, float lo, float hi) noexcept {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+    static inline float ProcessSample(std::array<Stage, kStages>& stages,
+                                       float x) noexcept {
+        for (auto& s : stages) {
+            s.aSmoothed += kSmoothingCoeff * (s.a - s.aSmoothed);
+            const float y = s.aSmoothed * x + s.z1;
+            s.z1 = x - s.aSmoothed * y;
+            x = y;
+        }
+        return x;
+    }
+
+    // ~1/0.001 ≈ 1000-sample (≈23ms @44.1kHz) time constant for coefficient
+    // smoothing — slow enough that no coefficient step is audible as a click.
+    static constexpr float kSmoothingCoeff = 0.001f;
+    static constexpr float kSweepStep = 4.0e-6f; // sweep LFO increment/sample
+
+    std::array<Stage, kStages> stagesL_{};
+    std::array<Stage, kStages> stagesR_{};
+    std::array<float, kStages> targetSet_{};
+    uint32_t mode_ = 0u;
+    float sweepPhase_ = 0.0f;
+    uint32_t noiseL_ = 0x9e3779b9u;
+    uint32_t noiseR_ = 0x85ebca6bu;
+};
 
 // ════════════════════════════════════════════════════════════════════════
 // VoiceManager — flat-array voice pool with score-based stealing.
@@ -245,16 +394,12 @@ public:
     // Logical live ceiling. It may move freely inside (or grow) the pool.
     uint32_t GetVoiceLimit() const { return voiceLimit_; }
     bool GrowCapacity(uint32_t capacity);
-    // Per-voice phase rotation. 0=Coherent(off), 1=Analytic, 2=Sweep, 3=Diffuse.
-    // The mode is set before rendering and affects the initial phase of every
-    // newly allocated voice so the coherent black-MIDI "hum" cannot sum
-    // constructively.  The limiter is never touched.
-    void SetPhaseRotationMode(uint32_t mode) noexcept {
-        if (mode > 4u) mode = 0u;
-        phaseRotationMode_ = mode;
-        phaseSweepPhase_ = 0.0f;
-    }
-    uint32_t GetPhaseRotationMode() const noexcept { return phaseRotationMode_; }
+    // NOTE: phase rotation is no longer applied per-voice at note-on (see
+    // PhaseRotator below). Delaying individual voice onsets only rotates
+    // phase relative to a note's own attack, which barely touches sub-100Hz
+    // hum and staggers dense onsets into audible smear/clicks. Real phase
+    // rotation is a signal-domain filter applied to the continuous mixed
+    // output; see PhaseRotator, owned by the render callback/offline synth.
 
     bool SetVoiceLimit(uint32_t limit);
     uint32_t EnforceVoiceLimit(uint32_t maxReleases = 8192u,
@@ -457,20 +602,12 @@ private:
         uint32_t handle;
         uint32_t activePosition;
     };
-    // Sweep-mode global phase counter (advances per voice birth, not per sample).
-    float phaseSweepPhase_ = 0.0f;
-
-
     uint32_t maxVoices_;
     uint32_t voiceLimit_;
     uint32_t sampleRate_;
     uint32_t stealFadeFrames_;
     uint64_t currentFrame_;
     uint64_t lastVoiceLimitEnforceFrame_;
-
-    // Per-voice phase rotation mode. 0 = Coherent (baseline), 1 = Analytic,
-    // 2 = Sweep, 3 = Diffuse.  Set by the driver before rendering.
-    uint32_t phaseRotationMode_ = 0u;
 
     // LIFO free slot stack
     int32_t* freeStack_;
@@ -3417,54 +3554,6 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.pitchBendScales[handle] = setup.pitchBendScale;
     v.sampleBacked[handle] = setup.sampleBacked;
 
-    // Phase-rotation jitter: add a delay before the voice begins its attack.
-    // This shifts the attack transient of each voice by a different amount,
-    // spreading the energy of thousands of
-    // note-ons across the sample grid instead of letting them all land on
-    // the exact same sample boundary where they sum coherently as a hum.
-    // The sample always plays from sample 0 with full attack intact.
-    // Mode 0 (Coherent) adds no delay (exact baseline behavior).
-    uint32_t phaseJitter = 0u;
-    {
-        uint32_t h;
-        float frac;
-        constexpr float kMaxJitterSamples = 360.0f;
-        switch (phaseRotationMode_) {
-        default: break;
-        case 1u: // Analytic: deterministic hash of voice identity.
-            h = static_cast<uint32_t>(handle) * 0x9e3779b9u
-              ^ static_cast<uint32_t>(v.note[handle]) * 0x85ebca6bu
-              ^ static_cast<uint32_t>(v.velocity[handle]) * 0xc2b2ae35u
-              ^ static_cast<uint32_t>(setup.sampleStart) * 0x165667b1u;
-            frac = static_cast<float>(h & 0x00FFFFFFu) / 16777216.0f;
-            phaseJitter = static_cast<uint32_t>(frac * kMaxJitterSamples);
-            break;
-        case 2u: // Sweep: advancing monotonic counter.
-            phaseSweepPhase_ += 0.137f;
-            if (phaseSweepPhase_ >= 1.0f) phaseSweepPhase_ -= 1.0f;
-            phaseJitter = static_cast<uint32_t>(phaseSweepPhase_ * kMaxJitterSamples);
-            break;
-        case 3u: // Diffuse: per-block seed × voice identity.
-            h = static_cast<uint32_t>(currentFrame_) * 0x7feb352du
-              ^ static_cast<uint32_t>(handle) * 0x846ca68bu
-              ^ static_cast<uint32_t>(v.note[handle]) * 0xd3a2646cu
-              ^ static_cast<uint32_t>(v.velocity[handle]) * 0x27d4eb2fu;
-            frac = static_cast<float>(h & 0x00FFFFFFu) / 16777216.0f;
-            phaseJitter = static_cast<uint32_t>(frac * kMaxJitterSamples);
-            break;
-        case 4u: // Random: deep multi-key hash for maximum decorrelation.
-            h = static_cast<uint32_t>(handle) * 0x9e3779b9u
-              ^ static_cast<uint32_t>(v.channel[handle]) * 0x85ebca6bu
-              ^ static_cast<uint32_t>(v.note[handle]) * 0xc2b2ae35u
-              ^ static_cast<uint32_t>(v.velocity[handle]) * 0x165667b1u
-              ^ static_cast<uint32_t>(setup.sampleStart) * 0x7feb352du
-              ^ static_cast<uint32_t>(currentFrame_) * 0x27d4eb2fu
-              ^ static_cast<uint32_t>(setup.loopMode) * 0xd3a2646cu;
-            frac = static_cast<float>(h & 0x00FFFFFFu) / 16777216.0f;
-            phaseJitter = static_cast<uint32_t>(frac * kMaxJitterSamples);
-            break;
-        }
-    }
     v.phases[handle] = 0.0f;
 
     const uint32_t relEnd = setup.sampleEnd > setup.sampleStart
@@ -3492,7 +3581,7 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.regionIndex[handle] = setup.regionIndex;
     v.targetGain[handle] = setup.initialGain;
     v.sustainLevel[handle] = setup.sustainLevel * setup.initialGain;
-    v.delaySamplesRemaining[handle] = setup.delaySamples + phaseJitter;
+    v.delaySamplesRemaining[handle] = setup.delaySamples;
     v.holdSamplesRemaining[handle] = setup.holdSamples;
     v.attackSamplesRemaining[handle] = setup.attackSamples;
     v.decaySamplesRemaining[handle] = setup.decaySamples;
@@ -3505,7 +3594,7 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     if (knownSustained) {
         v.envelopeStage[handle] = 3u;
         v.currentGain[handle] = setup.initialGain;
-    } else if (setup.delaySamples > 0u || phaseJitter > 0u) {
+    } else if (setup.delaySamples > 0u) {
         v.envelopeStage[handle] = 4u;
     } else if (setup.holdSamples > 0u) {
         v.envelopeStage[handle] = 0u;

@@ -430,7 +430,7 @@ public:
         }
         for (float& r:bendRatio_) r=1.0f;
         postHighPass_.Initialize(rate_);
-        voices_.SetPhaseRotationMode(o.phaseRotationMode);
+        phaseRotator_.SetMode(o.phaseRotationMode);
         EngineConfig limiterConfig{};
         limiterConfig.limiterEnabled = o.limiterEnabled;
         limiterConfig.limiterAlgorithm = o.limiterAlgorithm;
@@ -457,6 +457,7 @@ public:
     void Render(float* l,float* r,uint32_t n,uint64_t frame) {
         std::fill(l,l+n,0.0f); std::fill(r,r+n,0.0f);
         renderer_.RenderBlock(voices_,channels_,sampleData_.data(),uint32_t(sampleData_.size()),l,r,n,cfg_,nullptr,0,true,frame);
+        phaseRotator_.ProcessPlanar(l,r,n);
         limiter_.ProcessPlanar(l,r,n,postHighPass_);
     }
     void ReleaseAll() { for(uint8_t ch=0;ch<kChannelCount;++ch) voices_.ReleaseChannel(ch,0); }
@@ -516,7 +517,7 @@ private:
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;voices_.ForEachChannelActive(ch,[&](VoiceHandle v){const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));});}
     uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0,fallbackRegions_=0;
     std::unique_ptr<SF2Data> sf2_;std::vector<float> sampleData_;std::vector<PreparedRegion> prepared_;
-    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};
+    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};PhaseRotator phaseRotator_{};
 };
 
 #endif

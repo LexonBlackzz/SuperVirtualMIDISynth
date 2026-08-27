@@ -106,7 +106,7 @@ public:
         limiterConfig.limiterAttackMs = config.limiterAttackMs;
         limiterConfig.limiterReleaseMs = config.limiterReleaseMs;
         limiter_.Configure(rate_, limiterConfig);
-        voices_.SetPhaseRotationMode(config.phaseRotationMode);
+        phaseRotator_.SetMode(config.phaseRotationMode);
         return true;
     }
 
@@ -149,6 +149,7 @@ public:
                               uint32_t(sampleData_.size()), left, right,
                               frameCount, cfg_, nullptr, 0, true,
                               absoluteFrame);
+        phaseRotator_.ProcessPlanar(left, right, frameCount);
         limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
     }
 
@@ -496,6 +497,7 @@ private:
     std::vector<float> sampleData_;
     std::vector<PreparedRegion> prepared_;
     VoiceManager voices_;
+    PhaseRotator phaseRotator_;
     ChannelCache channels_;
     RenderScalar renderer_;
     RuntimeConfigSnapshot cfg_{};
