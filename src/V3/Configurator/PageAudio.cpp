@@ -432,42 +432,50 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                        "(Hilbert/quadrature form) at note-on, so the coherent "
                        "black-MIDI hum no longer sums across voices. Per-frequency "
                        "magnitude, loudness and sample-exact timing are untouched; "
-                       "Coherent (off) is the bit-exact baseline renderer. Analytic "
-                       "is the recommended mode; Sweep/Diffuse/Random are variants. "
-                       "Applies live to the running engine when connected.");
+                       "Coherent (off) is the bit-exact baseline renderer. "
+                       "2× more expensive than Coherent.");
         ImGui::TableNextColumn();
-        {
-            static const char* phaseItems[] = {
-                "Coherent (off)", "Analytic (Hilbert)", "Sweep", "Diffuse", "Random"
-            };
-            int idx = static_cast<int>(w.phaseRotationMode);
-            if (idx < 0 || idx > 4) idx = 0;
-            ImGui::SetNextItemWidth((std::min)(220.0f, ImGui::GetContentRegionAvail().x));
-            if (ImGui::BeginCombo("##phaserotation", phaseItems[idx])) {
-                for (int i = 0; i < 5; ++i) {
-                    const bool selected = idx == i;
-                    if (ImGui::Selectable(phaseItems[i], selected)) {
-                        w.phaseRotationMode = static_cast<uint32_t>(i);
-                        doc.MarkDirty();
-                        if (live.connected && live.client) {
-                            char phaseResult[svms::kRuntimeLinkResultTextCapacity]{};
-                            live.client->SendCommand(
-                                svms::RLCommandType::SetPhaseRotation, 0u,
-                                static_cast<uint32_t>(i),
-                                svms::RuntimeLiveStateV2{}, 100u, phaseResult);
-                        }
+
+        static const char* phaseItems[] = {
+            "Coherent (off)", "Analytic (Hilbert)", "Sweep", "Diffuse", "Random"
+        };
+
+        int idx = static_cast<int>(w.phaseRotationMode);
+        if (idx < 0 || idx > 4) idx = 0;
+
+        const float phaseComboWidth = (std::min)(220.0f, ImGui::GetContentRegionAvail().x);
+        ImGui::SetNextItemWidth(phaseComboWidth);
+        if (ImGui::BeginCombo("##phaserotation", phaseItems[idx])) {
+            for (int i = 0; i < 5; ++i) {
+                const bool selected = idx == i;
+                if (ImGui::Selectable(phaseItems[i], selected)) {
+                    w.phaseRotationMode = static_cast<uint32_t>(i);
+                    doc.MarkDirty();
+                    if (live.connected && live.client) {
+                        char phaseResult[svms::kRuntimeLinkResultTextCapacity]{};
+                        live.client->SendCommand(
+                            svms::RLCommandType::SetPhaseRotation, 0u,
+                            static_cast<uint32_t>(i),
+                            svms::RuntimeLiveStateV2{}, 100u, phaseResult);
                     }
-                    if (selected) ImGui::SetItemDefaultFocus();
                 }
-                ImGui::EndCombo();
+                if (selected) ImGui::SetItemDefaultFocus();
             }
+            ImGui::EndCombo();
         }
-        ImGui::TableNextColumn();
-        ImGui::AlignTextToFramePadding();
-        if (live.connected)
-            ImGui::TextDisabled("LIVE");
-        else
-            ImGui::TextDisabled("—");
+
+        if (ImGui::GetContentRegionAvail().x > 150.0f) {
+            ImGui::SameLine();
+            static const char* modeHints[] = {
+                "exact, no extra cost",
+                "±0.25 Hz phase sweep",
+                "±0.25 Hz phase sweep + jittered coeffs",
+                "4-section random allpass cascade",
+                "full quadrature with jittered splitter"
+            };
+            ImGui::TextDisabled("%s", modeHints[idx]);
+        }
+        RestartCell();
 
         ImGui::EndTable();
     }
