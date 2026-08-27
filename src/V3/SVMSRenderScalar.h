@@ -1972,6 +1972,17 @@ inline bool RenderScalar::AdvanceDenseHandleTo(
         const float loopStart = v.relLoopSF[handle];
         const float loopEnd = v.relLoopEF[handle];
         const float loopLength = loopEnd - loopStart;
+        const uint32_t relEnd = v.relEnd[handle];
+        // Mirror the per-sample loop's baseOffset+1 >= relEnd check
+        // (RenderPrimaryVoiceSpan lines 1229-1232): when the integer sample
+        // position reaches the end of the sample, the per-sample path wraps
+        // to loop start BEFORE adding phaseStep on that frame.  The bulk
+        // advance must account for this initial wrap, otherwise a voice at
+        // relEnd-1 gets an extra 0.5..1.0 loop-samples of phase advance
+        // compared to per-sample rendering, producing a sub-sample
+        // discontinuity at every mutation boundary in the dense planner.
+        if (relEnd > 0u && static_cast<uint32_t>(phase) + 1u >= relEnd)
+            phase = loopStart;
         const uint32_t advancedFrames = frameOffset - previous;
         phase += step * static_cast<float>(advancedFrames);
         // AVX2's 1-4-frame kernel wraps before sampling and intentionally
