@@ -426,6 +426,46 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         ImGui::TextDisabled("WASAPI Shared Mode");
         FixedCell();
 
+        ImGui::TableNextRow();
+        AudioLabelCell("Phase rotation",
+                       "Scrambles the phase of each frequency band to remove the coherent "
+                       "black-MIDI hum. All modes are unity-gain (no loudness or EQ change) "
+                       "and never affect the limiter. Coherent (off) is the exact baseline "
+                       "renderer. Applies live to the running engine when connected.");
+        ImGui::TableNextColumn();
+        {
+            static const char* phaseItems[] = {
+                "Coherent (off)", "Analytic (Hilbert)", "Sweep", "Diffuse", "Random"
+            };
+            int idx = static_cast<int>(w.phaseRotationMode);
+            if (idx < 0 || idx > 4) idx = 0;
+            ImGui::SetNextItemWidth((std::min)(220.0f, ImGui::GetContentRegionAvail().x));
+            if (ImGui::BeginCombo("##phaserotation", phaseItems[idx])) {
+                for (int i = 0; i < 5; ++i) {
+                    const bool selected = idx == i;
+                    if (ImGui::Selectable(phaseItems[i], selected)) {
+                        w.phaseRotationMode = static_cast<uint32_t>(i);
+                        doc.MarkDirty();
+                        if (live.connected && live.client) {
+                            char phaseResult[svms::kRuntimeLinkResultTextCapacity]{};
+                            live.client->SendCommand(
+                                svms::RLCommandType::SetPhaseRotation, 0u,
+                                static_cast<uint32_t>(i),
+                                svms::RuntimeLiveStateV2{}, 100u, phaseResult);
+                        }
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        }
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        if (live.connected)
+            ImGui::TextDisabled("LIVE");
+        else
+            ImGui::TextDisabled("—");
+
         ImGui::EndTable();
     }
 

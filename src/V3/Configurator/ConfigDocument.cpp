@@ -159,6 +159,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.reverbModRate = 0.35f;
     d.reverbLowCutHz = 70.0f;
     d.reverbHighCutHz = 16000.0f;
+    d.phaseRotationMode = 0u;
     d.eventRingCapacity = 393216;
     d.highPriorityVelocity = 96;
     d.shedStartPercent = 70;
@@ -269,6 +270,9 @@ void ConfigDocument::FromJson(const json& root) {
         ReadNum(*it, "low_cut_hz", working_.reverbLowCutHz, 0.0f, 2000.0f);
         ReadNum(*it, "high_cut_hz", working_.reverbHighCutHz, 1000.0f, 20000.0f);
     }
+    if (auto it = root.find("phase_rotation"); it != root.end() && it->is_object()) {
+        ReadNum(*it, "mode", working_.phaseRotationMode, 0u, 3u);
+    }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.diagnosticsEnabled);
         ReadBool(*it, "window", working_.diagnosticsWindow);
@@ -351,6 +355,9 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["reverb"]["mod_rate"] = working_.reverbModRate;
     root["reverb"]["low_cut_hz"] = working_.reverbLowCutHz;
     root["reverb"]["high_cut_hz"] = working_.reverbHighCutHz;
+
+
+    root["phase_rotation"]["mode"] = working_.phaseRotationMode;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
     root["midi"]["input_device"] = WideToUtf8(working_.midiInputDevice);
@@ -537,6 +544,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && AlmostEquals(a.reverbModRate, b.reverbModRate)
         && AlmostEquals(a.reverbLowCutHz, b.reverbLowCutHz)
         && AlmostEquals(a.reverbHighCutHz, b.reverbHighCutHz)
+        && a.phaseRotationMode == b.phaseRotationMode
         && a.eventRingCapacity == b.eventRingCapacity
         && a.highPriorityVelocity == b.highPriorityVelocity
         && a.shedStartPercent == b.shedStartPercent
@@ -636,6 +644,8 @@ ConfigValidation ConfigDocument::Validate() const {
         warn("reverb.low_cut_hz", "must be 0..2000");
     if (working_.reverbHighCutHz < 1000.0f || working_.reverbHighCutHz > 20000.0f)
         warn("reverb.high_cut_hz", "must be 1000..20000");
+    if (working_.phaseRotationMode > 4u)
+        warn("phase_rotation.mode", "must be 0..4");
     if (working_.eventRingCapacity < 4096)
         warn("events.ring_capacity", "must be >= 4096");
     if (working_.highPriorityVelocity < 1 || working_.highPriorityVelocity > 127)

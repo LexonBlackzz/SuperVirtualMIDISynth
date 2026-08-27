@@ -34,6 +34,7 @@ struct StandaloneSynthConfig {
     float limiterLookaheadMs = 3.0f;
     float limiterAttackMs = 0.5f;
     float limiterReleaseMs = 100.0f;
+    uint32_t phaseRotationMode = 0u;
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
 };
 
@@ -105,6 +106,7 @@ public:
         limiterConfig.limiterAttackMs = config.limiterAttackMs;
         limiterConfig.limiterReleaseMs = config.limiterReleaseMs;
         limiter_.Configure(rate_, limiterConfig);
+        voices_.SetPhaseRotationMode(config.phaseRotationMode);
         return true;
     }
 

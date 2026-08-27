@@ -72,6 +72,12 @@ struct EngineConfig {
     float reverbModRate;
     float reverbLowCutHz;
     float reverbHighCutHz;
+    // Post-mix frequency-dependent phase rotation. 0 = Coherent (bypass),
+    // 1 = Analytic, 2 = Sweep, 3 = Diffuse, 4 = Random. The mode is
+    // set on the VoiceManager and every newly allocated voice uses its
+    // initial phase offset so the coherent black-MIDI "hum" cannot sum
+    // constructively without changing spectral content or loudness.
+    uint32_t phaseRotationMode;
     bool enableChorus;
     bool enableFilter;
     bool enableModulators;
@@ -177,6 +183,7 @@ struct NonAtomicLiveConfigMailbox {
     float reverbModRate = 0.35f;
     float reverbLowCutHz = 70.0f;
     float reverbHighCutHz = 16000.0f;
+    uint32_t phaseRotationMode = 0u;
     bool  limiterEnabled = true;
     uint32_t limiterAlgorithm = static_cast<uint32_t>(LimiterAlgorithm::Classic);
     float limiterThreshold = 0.95f;
@@ -206,6 +213,7 @@ struct LiveConfigMailbox {
     std::atomic<float> reverbModRate{0.35f};
     std::atomic<float> reverbLowCutHz{70.0f};
     std::atomic<float> reverbHighCutHz{16000.0f};
+    std::atomic<uint32_t> phaseRotationMode{0u};
 
     // Limiter
     std::atomic<bool>     limiterEnabled{true};
@@ -234,6 +242,7 @@ struct LiveConfigMailbox {
         reverbModRate.store(cfg.reverbModRate, std::memory_order_relaxed);
         reverbLowCutHz.store(cfg.reverbLowCutHz, std::memory_order_relaxed);
         reverbHighCutHz.store(cfg.reverbHighCutHz, std::memory_order_relaxed);
+        phaseRotationMode.store(cfg.phaseRotationMode, std::memory_order_relaxed);
 
         limiterEnabled.store(cfg.limiterEnabled, std::memory_order_relaxed);
         limiterAlgorithm.store(static_cast<uint32_t>(cfg.limiterAlgorithm),
@@ -274,6 +283,7 @@ struct LiveConfigMailbox {
         out.reverbModRate = reverbModRate.load(std::memory_order_relaxed);
         out.reverbLowCutHz = reverbLowCutHz.load(std::memory_order_relaxed);
         out.reverbHighCutHz = reverbHighCutHz.load(std::memory_order_relaxed);
+        out.phaseRotationMode = phaseRotationMode.load(std::memory_order_relaxed);
         out.limiterEnabled = limiterEnabled.load(std::memory_order_relaxed);
         out.limiterAlgorithm = limiterAlgorithm.load(std::memory_order_relaxed);
         out.limiterThreshold = limiterThreshold.load(std::memory_order_relaxed);

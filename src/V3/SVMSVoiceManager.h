@@ -245,6 +245,17 @@ public:
     // Logical live ceiling. It may move freely inside (or grow) the pool.
     uint32_t GetVoiceLimit() const { return voiceLimit_; }
     bool GrowCapacity(uint32_t capacity);
+    // Per-voice phase rotation. 0=Coherent(off), 1=Analytic, 2=Sweep, 3=Diffuse.
+    // The mode is set before rendering and affects the initial phase of every
+    // newly allocated voice so the coherent black-MIDI "hum" cannot sum
+    // constructively.  The limiter is never touched.
+    void SetPhaseRotationMode(uint32_t mode) noexcept {
+        if (mode > 4u) mode = 0u;
+        phaseRotationMode_ = mode;
+        phaseSweepPhase_ = 0.0f;
+    }
+    uint32_t GetPhaseRotationMode() const noexcept { return phaseRotationMode_; }
+
     bool SetVoiceLimit(uint32_t limit);
     uint32_t EnforceVoiceLimit(uint32_t maxReleases = 8192u,
                                float releaseSeconds = 0.050f);
@@ -446,6 +457,9 @@ private:
         uint32_t handle;
         uint32_t activePosition;
     };
+    // Sweep-mode global phase counter (advances per voice birth, not per sample).
+    float phaseSweepPhase_ = 0.0f;
+
 
     uint32_t maxVoices_;
     uint32_t voiceLimit_;
@@ -453,6 +467,10 @@ private:
     uint32_t stealFadeFrames_;
     uint64_t currentFrame_;
     uint64_t lastVoiceLimitEnforceFrame_;
+
+    // Per-voice phase rotation mode. 0 = Coherent (baseline), 1 = Analytic,
+    // 2 = Sweep, 3 = Diffuse.  Set by the driver before rendering.
+    uint32_t phaseRotationMode_ = 0u;
 
     // LIFO free slot stack
     int32_t* freeStack_;
@@ -3398,6 +3416,55 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.basePhaseIncs[handle] = setup.basePhaseStep;
     v.pitchBendScales[handle] = setup.pitchBendScale;
     v.sampleBacked[handle] = setup.sampleBacked;
+
+    // Phase-rotation jitter: add a delay before the voice begins its attack.
+    // This shifts the attack transient of each voice by a different amount,
+    // spreading the energy of thousands of
+    // note-ons across the sample grid instead of letting them all land on
+    // the exact same sample boundary where they sum coherently as a hum.
+    // The sample always plays from sample 0 with full attack intact.
+    // Mode 0 (Coherent) adds no delay (exact baseline behavior).
+    uint32_t phaseJitter = 0u;
+    {
+        uint32_t h;
+        float frac;
+        constexpr float kMaxJitterSamples = 360.0f;
+        switch (phaseRotationMode_) {
+        default: break;
+        case 1u: // Analytic: deterministic hash of voice identity.
+            h = static_cast<uint32_t>(handle) * 0x9e3779b9u
+              ^ static_cast<uint32_t>(v.note[handle]) * 0x85ebca6bu
+              ^ static_cast<uint32_t>(v.velocity[handle]) * 0xc2b2ae35u
+              ^ static_cast<uint32_t>(setup.sampleStart) * 0x165667b1u;
+            frac = static_cast<float>(h & 0x00FFFFFFu) / 16777216.0f;
+            phaseJitter = static_cast<uint32_t>(frac * kMaxJitterSamples);
+            break;
+        case 2u: // Sweep: advancing monotonic counter.
+            phaseSweepPhase_ += 0.137f;
+            if (phaseSweepPhase_ >= 1.0f) phaseSweepPhase_ -= 1.0f;
+            phaseJitter = static_cast<uint32_t>(phaseSweepPhase_ * kMaxJitterSamples);
+            break;
+        case 3u: // Diffuse: per-block seed × voice identity.
+            h = static_cast<uint32_t>(currentFrame_) * 0x7feb352du
+              ^ static_cast<uint32_t>(handle) * 0x846ca68bu
+              ^ static_cast<uint32_t>(v.note[handle]) * 0xd3a2646cu
+              ^ static_cast<uint32_t>(v.velocity[handle]) * 0x27d4eb2fu;
+            frac = static_cast<float>(h & 0x00FFFFFFu) / 16777216.0f;
+            phaseJitter = static_cast<uint32_t>(frac * kMaxJitterSamples);
+            break;
+        case 4u: // Random: deep multi-key hash for maximum decorrelation.
+            h = static_cast<uint32_t>(handle) * 0x9e3779b9u
+              ^ static_cast<uint32_t>(v.channel[handle]) * 0x85ebca6bu
+              ^ static_cast<uint32_t>(v.note[handle]) * 0xc2b2ae35u
+              ^ static_cast<uint32_t>(v.velocity[handle]) * 0x165667b1u
+              ^ static_cast<uint32_t>(setup.sampleStart) * 0x7feb352du
+              ^ static_cast<uint32_t>(currentFrame_) * 0x27d4eb2fu
+              ^ static_cast<uint32_t>(setup.loopMode) * 0xd3a2646cu;
+            frac = static_cast<float>(h & 0x00FFFFFFu) / 16777216.0f;
+            phaseJitter = static_cast<uint32_t>(frac * kMaxJitterSamples);
+            break;
+        }
+    }
     v.phases[handle] = 0.0f;
 
     const uint32_t relEnd = setup.sampleEnd > setup.sampleStart
@@ -3425,7 +3492,7 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.regionIndex[handle] = setup.regionIndex;
     v.targetGain[handle] = setup.initialGain;
     v.sustainLevel[handle] = setup.sustainLevel * setup.initialGain;
-    v.delaySamplesRemaining[handle] = setup.delaySamples;
+    v.delaySamplesRemaining[handle] = setup.delaySamples + phaseJitter;
     v.holdSamplesRemaining[handle] = setup.holdSamples;
     v.attackSamplesRemaining[handle] = setup.attackSamples;
     v.decaySamplesRemaining[handle] = setup.decaySamples;
@@ -3438,7 +3505,7 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     if (knownSustained) {
         v.envelopeStage[handle] = 3u;
         v.currentGain[handle] = setup.initialGain;
-    } else if (setup.delaySamples > 0u) {
+    } else if (setup.delaySamples > 0u || phaseJitter > 0u) {
         v.envelopeStage[handle] = 4u;
     } else if (setup.holdSamples > 0u) {
         v.envelopeStage[handle] = 0u;

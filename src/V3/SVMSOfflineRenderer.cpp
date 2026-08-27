@@ -45,6 +45,7 @@ struct Options {
     float limiterLookaheadMs = 3.0f;
     float limiterAttackMs = 0.5f;
     float limiterReleaseMs = 100.0f;
+    uint32_t phaseRotationMode = 0u;
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
     bool quiet = false;
     bool scanOnly = false;
@@ -238,6 +239,18 @@ bool ParseLimiterAlgorithm(const wchar_t* s, LimiterAlgorithm& out) {
     return false;
 }
 
+bool ParsePhaseRotationMode(const wchar_t* s, uint32_t& out) {
+    if (!s) return false;
+    const std::wstring value = s;
+    if (value == L"coherent") { out = 0u; return true; }
+    if (value == L"analytic") { out = 1u; return true; }
+    if (value == L"sweep")    { out = 2u; return true; }
+    if (value == L"diffuse")  { out = 3u; return true; }
+    if (value == L"random")   { out = 4u; return true; }
+    return false;
+}
+
+
 void Usage() {
     fputws(L"SuperVirtualMIDISynth V3 offline renderer\n\n"
            L"svms_v3_render <input.mid> <soundfont.sf2> <output.wav> [options]\n\n"
@@ -257,6 +270,7 @@ void Usage() {
            L"  --limiter-lookahead-ms F  Override lookahead, 0-20 ms\n"
            L"  --limiter-attack-ms F     Override attack, 0.01-100 ms\n"
            L"  --limiter-release-ms F    Override release, 1-5000 ms\n"
+           L"  --phase-rotation coherent|analytic|sweep|diffuse|random  Post-mix hum-killing phase rotation (default coherent/off)\n"
            L"  --backend auto|scalar|sse2|avx2\n"
            L"  --scan-only           Validate/count without loading SF2 or rendering\n"
            L"  --quiet               Disable once-per-second telemetry\n"
@@ -302,6 +316,8 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             const auto p=value(); if (!p || !ParseFloat(p,0.01f,100.0f,o.limiterAttackMs)) return false;
         } else if (arg == L"--limiter-release-ms") {
             const auto p=value(); if (!p || !ParseFloat(p,1.0f,5000.0f,o.limiterReleaseMs)) return false;
+        } else if (arg == L"--phase-rotation") {
+            const auto p=value(); if (!p || !ParsePhaseRotationMode(p,o.phaseRotationMode)) return false;
         } else if (arg == L"--backend") {
             const auto p=value(); if (!p) return false; const std::wstring name=p;
             if (name == L"auto") o.backend=RenderBackend::AVX512;
@@ -414,6 +430,7 @@ public:
         }
         for (float& r:bendRatio_) r=1.0f;
         postHighPass_.Initialize(rate_);
+        voices_.SetPhaseRotationMode(o.phaseRotationMode);
         EngineConfig limiterConfig{};
         limiterConfig.limiterEnabled = o.limiterEnabled;
         limiterConfig.limiterAlgorithm = o.limiterAlgorithm;
@@ -608,6 +625,8 @@ int RendererMain(int argc, wchar_t** argv) {
     synthConfig.limiterAttackMs = o.limiterAttackMs;
     synthConfig.limiterReleaseMs = o.limiterReleaseMs;
     synthConfig.backend = o.backend;
+    synthConfig.backend = o.backend;
+    synthConfig.phaseRotationMode = o.phaseRotationMode;
     auto synth = std::make_unique<StandaloneSynth>();
     if (!synth->Initialize(synthConfig, error)) return fail(error);
     if (pollCancel()) {

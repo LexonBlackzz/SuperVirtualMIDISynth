@@ -2584,6 +2584,25 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         ResetAllVoices();
         return svms::RLResult::Ok;
 
+    case RT::SetPhaseRotation: {
+        const uint32_t mode = cmd.param;
+        if (mode > 4u) {
+            strncpy_s(resultText, kText,
+                      "phase rotation mode must be 0..4", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        LiveConfigMailbox* mb = &liveMailbox_;
+        const uint32_t even = liveMailboxSeq_.load(std::memory_order_relaxed);
+        liveMailboxSeq_.store(even | 1u, std::memory_order_relaxed);
+        RLV2_MemBarrier();
+        mb->phaseRotationMode.store(mode, std::memory_order_relaxed);
+        RLV2_MemBarrier();
+        liveMailboxSeq_.store(even + 2u, std::memory_order_release);
+        lastPublishedMailboxSeq_ = even + 2u;
+        strncpy_s(resultText, kText, "phase rotation mode set", _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
             cmd.resultText, svms::kRuntimeLinkCommandTextCapacity);
@@ -3224,6 +3243,8 @@ bool Driver::Initialize() {
             cfg.maxVoices);
         return false;
     }
+    voiceManager->SetPhaseRotationMode(cfg.phaseRotationMode);
+
     for (uint32_t index = 0; index < 2u; ++index) {
         voiceStatisticsSnapshots_[index] = SnappyVoiceStatistics{};
         voiceStatisticsSnapshots_[index].freeVoices = cfg.maxVoices;
@@ -4630,6 +4651,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->limiter.delayFramesTarget = mb.limiterDelayFrames;
         self->limiter.attackCoeff       = mb.limiterAttackCoeff;
         self->limiter.releaseCoeff      = mb.limiterReleaseCoeff;
+
+        if (vm) vm->SetPhaseRotationMode(mb.phaseRotationMode);
 
         self->channelCache->SetMasterVolume(
             mb.masterVolume * self->sysexMasterVolume_);

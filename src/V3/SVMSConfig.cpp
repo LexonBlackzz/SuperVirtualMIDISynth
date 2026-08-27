@@ -259,6 +259,10 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"low_cut_hz", cfg.reverbLowCutHz},
             {"high_cut_hz", cfg.reverbHighCutHz}
         }},
+        {"phase_rotation", {
+            {"mode", cfg.phaseRotationMode}
+        }},
+
         {"midi", {
             {"input_enabled", cfg.midiInputEnabled},
             {"input_device", WideToUtf8(cfg.midiInputDevice)}
@@ -611,6 +615,11 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             if (!ReadValue(*it, "high_cut_hz", cfg.reverbHighCutHz, 1000.0f, 20000.0f))
                 AppendWarning(cfg.configWarning, "reverb.high_cut_hz");
     }
+    if (auto it = root.find("phase_rotation"); it != root.end() && it->is_object()) {
+        if (!ReadValue(*it, "mode", cfg.phaseRotationMode, 0u, 4u))
+            AppendWarning(cfg.configWarning, "phase_rotation.mode");
+    }
+
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "enabled", cfg.diagnosticsEnabled))
             AppendWarning(cfg.configWarning, "diagnostics.enabled");
@@ -847,6 +856,7 @@ bool EngineConfig::Validate() const {
             reverbModRate >= 0.0f && reverbModRate <= 1.0f &&
             reverbLowCutHz >= 0.0f && reverbLowCutHz <= 2000.0f &&
             reverbHighCutHz >= 1000.0f && reverbHighCutHz <= 20000.0f &&
+            phaseRotationMode <= 4u &&
             velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
             velocityFloor >= 0.0f && velocityFloor < 1.0f &&
             eventRingCapacity >= 4096u &&

@@ -58,6 +58,8 @@ struct ConfigValues {
     float reverbModRate = 0.35f;
     float reverbLowCutHz = 70.0f;
     float reverbHighCutHz = 16000.0f;
+    // 0 = Coherent (off), 1 = Analytic, 2 = Sweep, 3 = Diffuse
+    uint32_t phaseRotationMode = 0u;
 
     uint32_t eventRingCapacity = 393216;
     uint32_t highPriorityVelocity = 96;
