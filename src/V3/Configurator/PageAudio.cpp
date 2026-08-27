@@ -464,17 +464,6 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
             ImGui::EndCombo();
         }
 
-        if (ImGui::GetContentRegionAvail().x > 150.0f) {
-            ImGui::SameLine(0.0f, 6.0f);
-            static const char* modeHints[] = {
-                "exact",
-                "random θ, quadrature",
-                "random θ + sweep (0.25 Hz)",
-                "random 4-section cascade",
-                "random θ + sweep + jittered splitter"
-            };
-            ImGui::TextDisabled("%s", modeHints[idx]);
-        }
         ImGui::TableNextColumn();
         if (live.connected) {
             ImGui::AlignTextToFramePadding();
