@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <immintrin.h>
 
@@ -557,6 +558,11 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
                            const uint32_t* handles,
                            uint32_t handleCount) {
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
+    // Per-voice phase rotation: release spans are a minority of the voice
+    // budget, so refuse and let the (rotation-hooked) scalar span kernels
+    // take over rather than carrying filter state through every release
+    // sub-path.
+    if (context.voices->rot != nullptr) return false;
     if (context.frameCount <= 4u) {
         RenderReleaseLoopShortAVX2(context, handles, handleCount);
         _mm256_zeroupper();
@@ -573,11 +579,238 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
     return true;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Rotation-aware sustained-loop kernel (SVMSPhaseRotation.h).
+//
+// The regular AVX2 path vectorizes across TIME for one voice, but the
+// per-voice phase-rotation filter is an IIR with a sequential time
+// dependency — it cannot ride those time lanes.  This kernel instead
+// vectorizes across VOICES: eight voices per batch, each lane carrying its
+// own rotation state (gather/scatter on the 48-byte VoiceRotationState
+// records; vgather's scale is capped at 8, so lane indices are pre-scaled
+// by 12 floats and gathered with scale 4).
+//
+// Bookkeeping (phase advance, loop wrap, interpolation, gain) is the same
+// arithmetic as the short-span batch above; the rotation filter is inserted
+// between interpolation and accumulation.
+// ════════════════════════════════════════════════════════════════════════
+void RenderSustainedLoopRotationAVX2(const RenderSpanContext& c,
+                                     const uint32_t* handles,
+                                     uint32_t handleCount) {
+    VoiceSoA& v = *c.voices;
+    VoiceRotationState* const rot = v.rot;
+    constexpr uint32_t kChunk = 32u;
+
+    alignas(32) __m256 sumsL[kChunk];
+    alignas(32) __m256 sumsR[kChunk];
+    const __m256 zero = _mm256_setzero_ps();
+
+    for (uint32_t chunkStart = 0u; chunkStart < c.frameCount;
+         chunkStart += kChunk) {
+        const uint32_t frames =
+            (std::min)(kChunk, c.frameCount - chunkStart);
+        for (uint32_t f = 0u; f < frames; ++f) {
+            sumsL[f] = zero;
+            sumsR[f] = zero;
+        }
+        float* const outL = c.outputLeft + c.frameStart + chunkStart;
+        float* const outR = c.outputRight + c.frameStart + chunkStart;
+
+        uint32_t position = 0u;
+        for (; position + 8u <= handleCount; position += 8u) {
+            const __m256i h = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(handles + position));
+            alignas(32) uint32_t hs[8];
+            alignas(32) float steps[8], lengths[8];
+            _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
+            const __m256 step = _mm256_i32gather_ps(v.phaseIncs, h, 4);
+            const __m256 loopStartF =
+                _mm256_i32gather_ps(v.relLoopSF, h, 4);
+            const __m256 loopEndF = _mm256_i32gather_ps(v.relLoopEF, h, 4);
+            const __m256 loopLength = _mm256_sub_ps(loopEndF, loopStartF);
+            _mm256_store_ps(steps, step);
+            _mm256_store_ps(lengths, loopLength);
+            bool valid = true;
+            for (uint32_t lane = 0; lane < 8u; ++lane) {
+                const uint32_t handle = hs[lane];
+                valid = valid && v.relEnd[handle] >= 2u &&
+                    v.relLoopS[handle] < v.relLoopE[handle] &&
+                    v.sampleStart[handle] < c.sampleDataFrames &&
+                    steps[lane] >= 0.0f && steps[lane] < lengths[lane];
+            }
+            if (!valid) {
+                for (uint32_t lane = 0; lane < 8u; ++lane) {
+                    ScalarRenderSustainedLoop(v, hs[lane], c.sampleData,
+                        c.sampleDataFrames, c.outputLeft, c.outputRight,
+                        c.frameStart + chunkStart, frames);
+                }
+                continue;
+            }
+            // Rotation form must be uniform across the batch (it always is —
+            // the mode is engine-global — but mixed lanes fall back to the
+            // scalar kernel rather than mixing filters).
+            const __m256i h12 = _mm256_add_epi32(
+                _mm256_slli_epi32(h, 3), _mm256_slli_epi32(h, 2));
+            const int* const formBase = reinterpret_cast<const int*>(
+                reinterpret_cast<const uint8_t*>(rot) +
+                offsetof(VoiceRotationState, form));
+            const __m256i formV = _mm256_i32gather_epi32(formBase, h12, 4);
+            const __m256i formEq = _mm256_cmpeq_epi32(
+                formV, _mm256_shuffle_epi32(formV, 0x00));
+            if (_mm256_movemask_ps(_mm256_castsi256_ps(formEq)) != 0xFF) {
+                for (uint32_t lane = 0; lane < 8u; ++lane) {
+                    ScalarRenderSustainedLoop(v, hs[lane], c.sampleData,
+                        c.sampleDataFrames, c.outputLeft, c.outputRight,
+                        c.frameStart + chunkStart, frames);
+                }
+                continue;
+            }
+            const bool quad = _mm_cvtsi128_si32(
+                _mm256_castsi256_si128(formV)) == 0;
+
+            float* const stateBase = reinterpret_cast<float*>(rot);
+#define SVMS_ROT_GATHER(field) _mm256_i32gather_ps(                        \
+            stateBase + (offsetof(VoiceRotationState, field) /             \
+                         sizeof(float)), h12, 4)
+            const __m256 a0 = SVMS_ROT_GATHER(a0);
+            const __m256 a1 = SVMS_ROT_GATHER(a1);
+            const __m256 a2 = SVMS_ROT_GATHER(a2);
+            const __m256 a3 = SVMS_ROT_GATHER(a3);
+            const __m256 dc = SVMS_ROT_GATHER(dc);
+            const __m256 ds = SVMS_ROT_GATHER(ds);
+            __m256 cs = SVMS_ROT_GATHER(c);
+            __m256 sn = SVMS_ROT_GATHER(s);
+            __m256 z0 = SVMS_ROT_GATHER(z0);
+            __m256 z1 = SVMS_ROT_GATHER(z1);
+            __m256 z2 = SVMS_ROT_GATHER(z2);
+            __m256 z3 = SVMS_ROT_GATHER(z3);
+#undef SVMS_ROT_GATHER
+
+            const __m256 gainL = _mm256_i32gather_ps(v.renderGainL, h, 4);
+            const __m256 gainR = _mm256_i32gather_ps(v.renderGainR, h, 4);
+            const __m256i sampleStart = _mm256_i32gather_epi32(
+                reinterpret_cast<const int*>(v.sampleStart), h, 4);
+            const __m256i loopStart = _mm256_i32gather_epi32(
+                reinterpret_cast<const int*>(v.relLoopS), h, 4);
+            const __m256i loopEnd = _mm256_i32gather_epi32(
+                reinterpret_cast<const int*>(v.relLoopE), h, 4);
+            __m256 phase = _mm256_max_ps(
+                _mm256_i32gather_ps(v.phases, h, 4), zero);
+            for (uint32_t f = 0u; f < frames; ++f) {
+                const __m256 pastLoop =
+                    _mm256_cmp_ps(phase, loopEndF, _CMP_GE_OQ);
+                phase = _mm256_blendv_ps(phase,
+                    _mm256_add_ps(loopStartF,
+                        _mm256_sub_ps(phase, loopEndF)),
+                    pastLoop);
+                const __m256i base = _mm256_cvttps_epi32(phase);
+                const __m256i nextRaw =
+                    _mm256_add_epi32(base, _mm256_set1_epi32(1));
+                const __m256i wrap = _mm256_cmpgt_epi32(nextRaw,
+                    _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
+                const __m256i next =
+                    _mm256_blendv_epi8(nextRaw, loopStart, wrap);
+                const __m256i baseIndex = _mm256_add_epi32(sampleStart, base);
+                const __m256i nextIndex = _mm256_add_epi32(sampleStart, next);
+                const __m256 first =
+                    _mm256_i32gather_ps(c.sampleData, baseIndex, 4);
+                const __m256 second =
+                    _mm256_i32gather_ps(c.sampleData, nextIndex, 4);
+                const __m256 fraction =
+                    _mm256_sub_ps(phase, _mm256_cvtepi32_ps(base));
+                __m256 sample = _mm256_add_ps(
+                    first, _mm256_mul_ps(_mm256_sub_ps(second, first),
+                                         fraction));
+
+                if (quad) {
+                    // Quadrature rotation, lane-parallel: advance θ, run
+                    // both allpass branches, then y = I·cosθ + Q·sinθ.
+                    const __m256 nc = _mm256_sub_ps(
+                        _mm256_mul_ps(cs, dc), _mm256_mul_ps(sn, ds));
+                    const __m256 ns = _mm256_add_ps(
+                        _mm256_mul_ps(sn, dc), _mm256_mul_ps(cs, ds));
+                    cs = nc;
+                    sn = ns;
+                    const __m256 tA = _mm256_add_ps(
+                        _mm256_mul_ps(a0, sample), z0);
+                    z0 = _mm256_sub_ps(sample, _mm256_mul_ps(a0, tA));
+                    const __m256 A = _mm256_add_ps(
+                        _mm256_mul_ps(a1, tA), z1);
+                    z1 = _mm256_sub_ps(tA, _mm256_mul_ps(a1, A));
+                    const __m256 tB = _mm256_add_ps(
+                        _mm256_mul_ps(a2, sample), z2);
+                    z2 = _mm256_sub_ps(sample, _mm256_mul_ps(a2, tB));
+                    const __m256 B = _mm256_add_ps(
+                        _mm256_mul_ps(a3, tB), z3);
+                    z3 = _mm256_sub_ps(tB, _mm256_mul_ps(a3, B));
+                    const __m256 I = _mm256_mul_ps(
+                        _mm256_add_ps(A, B), _mm256_set1_ps(0.5f));
+                    const __m256 Q = _mm256_mul_ps(
+                        _mm256_sub_ps(A, B), _mm256_set1_ps(0.5f));
+                    sample = _mm256_add_ps(_mm256_mul_ps(I, cs),
+                                           _mm256_mul_ps(Q, sn));
+                } else {
+                    // Cascade rotation: per-voice random unity-gain allpass.
+                    const __m256 t = _mm256_add_ps(
+                        _mm256_mul_ps(a0, sample), z0);
+                    z0 = _mm256_sub_ps(sample, _mm256_mul_ps(a0, t));
+                    __m256 y = _mm256_add_ps(_mm256_mul_ps(a1, t), z1);
+                    z1 = _mm256_sub_ps(t, _mm256_mul_ps(a1, y));
+                    const __m256 t2 = _mm256_add_ps(
+                        _mm256_mul_ps(a2, y), z2);
+                    z2 = _mm256_sub_ps(y, _mm256_mul_ps(a2, t2));
+                    y = _mm256_add_ps(_mm256_mul_ps(a3, t2), z3);
+                    z3 = _mm256_sub_ps(t2, _mm256_mul_ps(a3, y));
+                    sample = y;
+                }
+
+                sumsL[f] = _mm256_add_ps(sumsL[f],
+                    _mm256_mul_ps(sample, gainL));
+                sumsR[f] = _mm256_add_ps(sumsR[f],
+                    _mm256_mul_ps(sample, gainR));
+                phase = _mm256_add_ps(phase, step);
+            }
+
+#define SVMS_ROT_SCATTER(field, value) _mm256_i32scatter_ps(               \
+            stateBase + (offsetof(VoiceRotationState, field) /             \
+                         sizeof(float)), h12, value, 4)
+            SVMS_ROT_SCATTER(c, cs);
+            SVMS_ROT_SCATTER(s, sn);
+            SVMS_ROT_SCATTER(z0, z0);
+            SVMS_ROT_SCATTER(z1, z1);
+            SVMS_ROT_SCATTER(z2, z2);
+            SVMS_ROT_SCATTER(z3, z3);
+#undef SVMS_ROT_SCATTER
+            alignas(32) float phases[8];
+            _mm256_store_ps(phases, phase);
+            for (uint32_t lane = 0; lane < 8u; ++lane)
+                v.phases[hs[lane]] = phases[lane];
+        }
+        for (; position < handleCount; ++position) {
+            ScalarRenderSustainedLoop(v, handles[position], c.sampleData,
+                c.sampleDataFrames, c.outputLeft, c.outputRight,
+                c.frameStart + chunkStart, frames);
+        }
+        for (uint32_t f = 0u; f < frames; ++f) {
+            outL[f] += HorizontalSum(sumsL[f]);
+            outR[f] += HorizontalSum(sumsR[f]);
+        }
+    }
+    _mm256_zeroupper();
+}
+
 bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                              const uint32_t* handles,
                              uint32_t handleCount) {
     VoiceSoA& v = *context.voices;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
+    // Per-voice phase rotation: the IIR filter is sequential across time, so
+    // route through the voice-parallel kernel that applies it across lanes.
+    if (v.rot != nullptr) {
+        RenderSustainedLoopRotationAVX2(context, handles, handleCount);
+        _mm256_zeroupper();
+        return true;
+    }
     if (context.frameCount > 4u) {
         for (uint32_t i = 0; i < handleCount; ++i) {
             RenderSustainedLoopFramesAVX2(context, handles[i]);

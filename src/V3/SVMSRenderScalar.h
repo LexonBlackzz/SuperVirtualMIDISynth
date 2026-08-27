@@ -540,34 +540,9 @@ public:
     bool SetRenderBackend(RenderBackend backend);
     RenderBackend GetRenderBackend() const { return kernelSet_->backend; }
     const char* GetRenderBackendName() const { return kernelSet_->name; }
-    // Per-voice phase rotation forces the scalar kernel set (the SIMD span
-    // kernels cannot carry per-voice filter state) and disables the dense
-    // snapshot pipeline.  Called with the VoiceManager's live flag each
-    // block; a no-op while the value is unchanged.  Coherent mode keeps the
-    // originally selected backend bit-for-bit.
-    void SyncPhaseRotation(bool active) {
-        if (rotationActive_ == active) return;
-        rotationActive_ = active;
-        ResolveKernelSet();
-    }
 
 private:
 private:
-    // Re-resolve the active kernel set from the backend request and the
-    // phase-rotation override.
-    void ResolveKernelSet() {
-        if (rotationActive_) {
-            kernelSet_ = &GetScalarRenderKernelSet();
-            return;
-        }
-        if (useBestBackend_) {
-            kernelSet_ = &SelectBestRenderKernelSet();
-            return;
-        }
-        const RenderKernelSet* selected =
-            SelectRenderKernelSet(requestedBackend_);
-        kernelSet_ = selected ? selected : &GetScalarRenderKernelSet();
-    }
     void RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
                      const float* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
@@ -623,10 +598,6 @@ private:
     EventBatchDispatcher batchDispatcher_;
     void* dispatcherUserData_;
     const RenderKernelSet* kernelSet_;
-    // Backend request bookkeeping for the phase-rotation override.
-    RenderBackend requestedBackend_ = RenderBackend::Scalar;
-    bool useBestBackend_ = true;   // ctor picks the best supported backend
-    bool rotationActive_ = false;  // per-voice rotation forces scalar kernels
     uint32_t* classChanges_;
     alignas(64) uint32_t tailFrameCounts_[kStealTailReserve];
     SpanRetirement* retirements_;
@@ -796,9 +767,7 @@ inline bool RenderScalar::EnsureDenseStorage() {
 inline bool RenderScalar::SetRenderBackend(RenderBackend backend) {
     const RenderKernelSet* selected = SelectRenderKernelSet(backend);
     if (selected == nullptr) return false;
-    requestedBackend_ = backend;
-    useBestBackend_ = false;
-    ResolveKernelSet();
+    kernelSet_ = selected;
     return true;
 }
 
@@ -2628,9 +2597,6 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     if (coverageProfilingEnabled_) ++coverageStats_.callbacks;
 #endif
-    // Follow the VoiceManager's phase-rotation state (kernel-set override
-    // happens inside; no-op while unchanged).
-    SyncPhaseRotation(voices.v.rot != nullptr);
     voices.SetStealKeyBackend(kernelSet_->backend);
     // Live pool-limit changes are callback-boundary commands.  Applying one
     // before dense eligibility/snapshotting prevents a mid-plan lifecycle
