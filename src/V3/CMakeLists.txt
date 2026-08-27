@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SuperVirtualMIDISynthV3 VERSION 0.8.0 LANGUAGES C CXX)
+project(SuperVirtualMIDISynthV3 VERSION 0.8.1 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -189,6 +189,8 @@ if(NOT WIN32)
         target_include_directories(svms_v3_limiter_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
+
+
 
         add_executable(svms_v3_midi_stream_tests
             tests/SVMSMidiStreamTests.cpp
@@ -630,9 +632,10 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_limiter_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
-
     if(SVMS_XP_COMPAT)
         add_executable(svms_v3_xp_directsound_smoke
+
+
             tests/SVMSXPDirectSoundSmoke.cpp)
         target_compile_definitions(svms_v3_xp_directsound_smoke PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
