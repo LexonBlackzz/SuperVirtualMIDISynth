@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SuperVirtualMIDISynthV3 VERSION 0.8 LANGUAGES C CXX)
+project(SuperVirtualMIDISynthV3 VERSION 0.8.0 LANGUAGES C CXX)
 
 include(CTest)
 
