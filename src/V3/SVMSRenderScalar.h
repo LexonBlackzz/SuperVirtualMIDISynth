@@ -1685,12 +1685,6 @@ inline uint64_t RenderScalar::ComputeDenseChunkMask(
 #else
     constexpr uint64_t kEmptyMask = 0ull;
 #endif
-    if (!correctnessMode) {
-#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
-        reject(DensePlanRejectReason::CorrectnessDisabled);
-#endif
-        return kEmptyMask;
-    }
     if (!events || numFrames == 0u) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
         reject(DensePlanRejectReason::MissingEvents);
@@ -2594,7 +2588,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // sequentially, so the dense pipeline's shadow state and the span
     // renderer's authoritative state never interleave: each dense segment
     // copies state in, renders, and commits before the next segment starts.
-    const bool denseGatesOpen = !vibratoActive && correctnessMode &&
+    const bool denseGatesOpen = !vibratoActive &&
         events != nullptr && numFrames != 0u && workerPool_ != nullptr &&
         workerPool_->GetThreadCount() > 1u;
     const uint64_t denseChunkMask = denseGatesOpen
@@ -2782,8 +2776,14 @@ inline void RenderScalar::RenderBlockSparseRange(
                 }
             }
 #endif
-            if (renderClass == VoiceRenderClass::SustainedLoop &&
-                classKernel != nullptr && sampleData != nullptr &&
+            // Every class with a SIMD kernel is a fan-out candidate now that
+            // the pool carries per-job mutation-record buffers: retirement
+            // and class-change records land in job-private slots and are
+            // merged in fixed job order after the join, reproducing the
+            // serial record set exactly. Classes without kernels still take
+            // the scalar fallback below (their shared-scratch recording is
+            // audio-thread-only there).
+            if (classKernel != nullptr && sampleData != nullptr &&
                 workerPool_ && workerPool_->ShouldParallelize(
                     voices.GetRenderClassCount(renderClass), spanFrames)) {
                 workerPool_->BeginSpan(context);
