@@ -470,6 +470,22 @@ if(NOT SVMS_XP_COMPAT)
     set_target_properties(svms_v3_render PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+    # GPU synthesis proof spike (D3D11 compute). Offline-only, not XP. Proves
+    # compute-shader sample synthesis matches the CPU scalar reference to the
+    # agreed -85 dB gate before it is wired into RenderBlock.
+    add_executable(svms_v3_gpu_spike
+        SVMSGpuSpike.cpp
+        SVMSGpuDevice.cpp)
+    target_compile_definitions(svms_v3_gpu_spike PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_gpu_spike PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+    target_link_libraries(svms_v3_gpu_spike PRIVATE
+        d3d11 dxgi d3dcompiler)
+    set_target_properties(svms_v3_gpu_spike PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
     set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/imgui")
     set(IMGUI_SOURCES
         ${IMGUI_DIR}/imgui.cpp
