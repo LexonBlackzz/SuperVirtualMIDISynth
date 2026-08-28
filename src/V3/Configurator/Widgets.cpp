@@ -671,10 +671,12 @@ void AppliedStateBadge(bool connected,
 }
 
 void LiveBadge(const char* tooltip) {
-    ImGui::SameLine();
+    const char* label = "LIVE";
+
     ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
-    ImGui::TextDisabled("LIVE");
+    ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
+
     if (tooltip && ImGui::IsItemHovered()) {
         ImGui::BeginTooltip();
         ImGui::TextUnformatted(tooltip);
