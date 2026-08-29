@@ -2861,14 +2861,14 @@ inline void RenderScalar::RenderBlockSparseRange(
                 }
             }
 #endif
-            // Only SustainedLoop voices are safe to parallelize because they
-            // never retire or change class mid-span (stage-3 loop invariant).
-            // Other classes (SustainedOneShot, TransientLoop, ReleaseLoop)
-            // can reach sample-end and retire during the span — the worker
-            // pool's Execute() only merges per-job audio output, not retirement
-            // or class-change records, so concurrent retirement writes through
-            // shared retirements_/retireCount pointers would race.
-            if (renderClass == VoiceRenderClass::SustainedLoop &&
+            // TransientLoop voices never retire mid-span but can complete
+            // attack+decay (reported through per-job class-change scratch);
+            // ReleaseLoop voices retire mid-span (per-job retirement scratch).
+            // Both lifecycle records are merged deterministically by
+            // RenderWorkerPool::Execute, so these classes parallelize too.
+            if ((renderClass == VoiceRenderClass::SustainedLoop ||
+                 renderClass == VoiceRenderClass::TransientLoop ||
+                 renderClass == VoiceRenderClass::ReleaseLoop) &&
                 classKernel != nullptr && sampleData != nullptr &&
                 workerPool_ && workerPool_->ShouldParallelize(
                     voices.GetRenderClassCount(renderClass), spanFrames)) {

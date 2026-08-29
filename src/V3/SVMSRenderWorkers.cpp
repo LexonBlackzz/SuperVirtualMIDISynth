@@ -50,6 +50,14 @@ struct RenderWorkerPool::Impl {
     Worker* workers = nullptr;
     RenderJob* jobs = nullptr;
     float* mixStorage = nullptr;
+    // Per-job span lifecycle scratch: retirement and class-change records
+    // are written by the owning worker only and merged by the coordinator
+    // after Execute(), which lets TransientLoop and ReleaseLoop spans (whose
+    // voices can retire or change class mid-span) run on the pool.
+    SpanRetirement* jobRetirements = nullptr;
+    uint32_t* jobClassChanges = nullptr;
+    uint32_t* jobRetireCounts = nullptr;
+    uint32_t* jobClassChangeCounts = nullptr;
     HANDLE doneEvent = nullptr;
     using WaitOnAddressProc = BOOL (WINAPI*)(volatile VOID*, PVOID, SIZE_T, DWORD);
     using WakeByAddressAllProc = VOID (WINAPI*)(PVOID);
@@ -154,10 +162,16 @@ struct RenderWorkerPool::Impl {
             local.outputLeft = left;
             local.outputRight = right;
             local.frameStart = 0u;
-            // Parallel jobs currently contain only classes whose kernels do
-            // not retire or change render class during the span.
-            local.classChangeHandles = nullptr;
-            local.classChangeCount = nullptr;
+            // Each job records retirements/class changes into its own scratch;
+            // Execute() merges them into the caller's arrays afterwards.
+            local.retirements = jobRetirements +
+                static_cast<size_t>(index) * kHandlesPerJob;
+            local.retirementCount = &jobRetireCounts[index];
+            *local.retirementCount = 0u;
+            local.classChangeHandles = jobClassChanges +
+                static_cast<size_t>(index) * kHandlesPerJob;
+            local.classChangeCount = &jobClassChangeCounts[index];
+            *local.classChangeCount = 0u;
             if (indexedCallback) {
                 indexedCallback(index, left, right, context.frameCount,
                                 indexedUserData);
@@ -196,10 +210,18 @@ struct RenderWorkerPool::Impl {
         if (doneEvent) CloseHandle(doneEvent);
         _aligned_free(mixStorage);
         _aligned_free(jobs);
+        _aligned_free(jobRetirements);
+        _aligned_free(jobClassChanges);
+        _aligned_free(jobRetireCounts);
+        _aligned_free(jobClassChangeCounts);
         delete[] workers;
         workers = nullptr;
         jobs = nullptr;
         mixStorage = nullptr;
+        jobRetirements = nullptr;
+        jobClassChanges = nullptr;
+        jobRetireCounts = nullptr;
+        jobClassChangeCounts = nullptr;
         doneEvent = nullptr;
         totalThreads = 1u;
         helperCount = 0u;
@@ -250,6 +272,15 @@ bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
         static_cast<size_t>(impl->jobCapacity) * sizeof(RenderJob), 64u));
     impl->mixStorage = static_cast<float*>(_aligned_malloc(
         mixFloats * sizeof(float), 64u));
+    const size_t spanScratchEntries = static_cast<size_t>(impl->jobCapacity) * kHandlesPerJob;
+    impl->jobRetirements = static_cast<SpanRetirement*>(_aligned_malloc(
+        spanScratchEntries * sizeof(SpanRetirement), 64u));
+    impl->jobClassChanges = static_cast<uint32_t*>(_aligned_malloc(
+        spanScratchEntries * sizeof(uint32_t), 64u));
+    impl->jobRetireCounts = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(impl->jobCapacity) * sizeof(uint32_t), 64u));
+    impl->jobClassChangeCounts = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(impl->jobCapacity) * sizeof(uint32_t), 64u));
     impl->doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 #if !defined(SVMS_XP_COMPAT)
     if (HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll")) {
@@ -260,6 +291,8 @@ bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
     }
 #endif
     if (!impl->workers || !impl->jobs || !impl->mixStorage ||
+        !impl->jobRetirements || !impl->jobClassChanges ||
+        !impl->jobRetireCounts || !impl->jobClassChangeCounts ||
         !impl->doneEvent) {
         impl->stopping.store(true, std::memory_order_release);
         impl->ResetStorage();
@@ -357,6 +390,8 @@ size_t RenderWorkerPool::EstimateAllocatedBytes(
     return sizeof(Impl) +
         static_cast<size_t>(helperCount) * sizeof(Impl::Worker) +
         static_cast<size_t>(jobCapacity) * sizeof(RenderJob) +
+        static_cast<size_t>(jobCapacity) * kHandlesPerJob *
+            (sizeof(SpanRetirement) + 2u * sizeof(uint32_t)) +
         mixFloats * sizeof(float);
 }
 
@@ -444,19 +479,22 @@ bool RenderWorkerPool::Execute() noexcept {
     impl->coordinatorJobs.fetch_add(coordinatorClaimed,
                                     std::memory_order_relaxed);
     if (activeHelpers != 0u) {
+        for (;;) {
+            uint32_t completed =
+                impl->completedWorkers.load(std::memory_order_acquire);
+            if (completed >= activeHelpers) break;
+            // Pool shutdown can race an in-flight span (device removal,
+            // session destroy): helpers were woken and will never finish
+            // their jobs, so waiting for them would hang forever.
+            if (impl->stopping.load(std::memory_order_acquire)) break;
 #if !defined(SVMS_XP_COMPAT)
-        if (impl->waitOnAddress) {
-            for (;;) {
-                uint32_t completed =
-                    impl->completedWorkers.load(std::memory_order_acquire);
-                if (completed >= activeHelpers) break;
+            if (impl->waitOnAddress) {
                 impl->waitOnAddress(&impl->completedWorkers, &completed,
-                                    sizeof(completed), INFINITE);
+                                    sizeof(completed), 16);
+                continue;
             }
-        } else
 #endif
-        {
-            WaitForSingleObject(impl->doneEvent, INFINITE);
+            WaitForSingleObject(impl->doneEvent, 16);
         }
     }
 
@@ -472,6 +510,38 @@ bool RenderWorkerPool::Execute() noexcept {
             destinationLeft[frame] += left[frame];
             destinationRight[frame] += right[frame];
         }
+    }
+    // Merge per-job span lifecycle records. Retirement order is restored by
+    // the caller's (frameOffset, capturePosition) sort, which is unaffected
+    // by concatenation order; class-change refresh is order-independent.
+    if (impl->context.retirements != nullptr &&
+        impl->context.retirementCount != nullptr) {
+        const uint32_t written = *impl->context.retirementCount;
+        SpanRetirement* const base =
+            impl->context.retirements + written;
+        uint32_t total = 0u;
+        for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+            const uint32_t count = impl->jobRetireCounts[job];
+            std::memcpy(base + total, impl->jobRetirements +
+                static_cast<size_t>(job) * kHandlesPerJob,
+                static_cast<size_t>(count) * sizeof(SpanRetirement));
+            total += count;
+        }
+        *impl->context.retirementCount = written + total;
+    }
+    if (impl->context.classChangeHandles != nullptr &&
+        impl->context.classChangeCount != nullptr) {
+        const uint32_t written = *impl->context.classChangeCount;
+        uint32_t* const base = impl->context.classChangeHandles + written;
+        uint32_t total = 0u;
+        for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+            const uint32_t count = impl->jobClassChangeCounts[job];
+            std::memcpy(base + total, impl->jobClassChanges +
+                static_cast<size_t>(job) * kHandlesPerJob,
+                static_cast<size_t>(count) * sizeof(uint32_t));
+            total += count;
+        }
+        *impl->context.classChangeCount = written + total;
     }
     return true;
 }
