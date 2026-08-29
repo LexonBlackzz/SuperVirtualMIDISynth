@@ -294,6 +294,7 @@ enum class RenderBackend : uint8_t {
     CUDA = 4,
     Vulkan = 5,
     GPU = 6, // D3D11 compute (offline/realtime, non-XP only)
+    Auto = 255, // pick the best backend the CPU supports (default)
 };
 
 enum class PanLaw : uint8_t {

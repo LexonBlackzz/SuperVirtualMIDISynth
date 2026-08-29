@@ -704,7 +704,12 @@ EngineConfig EngineConfig::Default() {
 #else
     cfg.audioBackend = AudioBackend::WASAPIShared;
 #endif
-    cfg.renderBackend = RenderBackend::Scalar;
+    // Auto = best backend the CPU supports (AVX2 > SSE2 > scalar).
+    // Previously this defaulted to Scalar but was never consumed, so the
+    // engine silently used SelectBestRenderKernelSet() anyway. The value
+    // is now honored: forcing Scalar here is the fallback for CPUs without
+    // AVX2 support or for A/B testing.
+    cfg.renderBackend = RenderBackend::Auto;
     cfg.panLaw = PanLaw::ConstantPower;
     cfg.masterVolume = 1.0f;
     cfg.limiterEnabled = true;

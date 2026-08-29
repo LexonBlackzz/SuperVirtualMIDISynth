@@ -3321,6 +3321,16 @@ bool Driver::Initialize() {
     channelCache = new ChannelCache();
     channelCache->SetMasterVolume(cfg.masterVolume);
     renderScalar = new RenderScalar();
+    // Honor the configured render backend. The constructor already selects
+    // the best set (Auto behavior); an explicit non-Auto request overrides
+    // it, falling back to the best available set when unsupported.
+    if (cfg.renderBackend != RenderBackend::Auto) {
+        if (!renderScalar->SetRenderBackend(cfg.renderBackend)) {
+            LOG("Configuration warning: render backend %u not supported on "
+                "this CPU; using best available",
+                static_cast<uint32_t>(cfg.renderBackend));
+        }
+    }
     if (!renderScalar->ReserveVoiceCapacity(cfg.maxVoices)) {
         LOG("FAILED: Could not allocate renderer scratch maxVoices=%u",
             cfg.maxVoices);
