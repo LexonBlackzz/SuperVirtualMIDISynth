@@ -16,10 +16,10 @@
 namespace svms {
 
 // ── Linear interpolation between two sample frames ──────────────────────
-inline float InterpolateSample(const float* data, uint32_t baseIndex,
+inline float InterpolateSample(const int16_t* data, uint32_t baseIndex,
                                 uint32_t nextIndex, float frac) {
-    const float s0 = data[baseIndex];
-    const float s1 = data[nextIndex];
+    const float s0 = static_cast<float>(data[baseIndex]);
+    const float s1 = static_cast<float>(data[nextIndex]);
     return s0 + (s1 - s0) * frac;
 }
 
@@ -27,7 +27,7 @@ inline float InterpolateSample(const float* data, uint32_t baseIndex,
 // It follows the old sample cursor and loop for a fixed 64-frame linear ramp,
 // has no MIDI identity, and does not consume a primary voice slot.
 inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
-                                  const float* sampleData,
+                                  const int16_t* sampleData,
                                   uint32_t sampleDataFrames,
                                   float* outL, float* outR) {
     uint32_t remaining = v.stealTailFramesRemaining[idx];
@@ -505,7 +505,7 @@ public:
     }
 
     void RenderBlock(VoiceManager& voices, const ChannelCache& channels,
-                     const float* sampleData, uint32_t sampleDataFrames,
+                     const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                      const RenderEvent* events = nullptr,
@@ -519,7 +519,7 @@ public:
     // the span renderer, while differential tests can still prove state and
     // waveform equivalence.
     void RenderBlockReference(VoiceManager& voices, const ChannelCache& channels,
-                     const float* sampleData, uint32_t sampleDataFrames,
+                     const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                      const RenderEvent* events = nullptr,
@@ -544,7 +544,7 @@ public:
 private:
 private:
     void RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
-                     const float* sampleData, uint32_t sampleDataFrames,
+                     const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                      const RenderEvent* events, uint32_t eventCount,
@@ -560,7 +560,7 @@ private:
                          uint32_t eventCount, uint32_t numFrames,
                          bool correctnessMode) const;
     bool RenderBlockDensePlanned(VoiceManager& voices,
-                     const float* sampleData, uint32_t sampleDataFrames,
+                     const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t rangeStart, uint32_t rangeEnd,
                      const RenderEvent* events,
@@ -568,7 +568,7 @@ private:
                      uint64_t blockStartFrame, uint32_t* renderedTo);
     void RenderBlockSparseRange(VoiceManager& voices,
                      const ChannelCache& channels,
-                     const float* sampleData, uint32_t sampleDataFrames,
+                     const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t rangeStart, uint32_t rangeEnd,
                      const RenderEvent* events,
@@ -576,7 +576,7 @@ private:
                      bool vibratoActive, bool correctnessMode,
                      uint64_t blockStartFrame);
     void AdvanceAuthoritativeSpan(VoiceManager& voices,
-                     const float* sampleData, uint32_t sampleDataFrames,
+                     const int16_t* sampleData, uint32_t sampleDataFrames,
                      uint32_t frameCount, uint64_t absoluteFrame);
     bool AdvanceDenseHandleTo(VoiceManager& voices, uint32_t handle,
                      uint32_t frameOffset);
@@ -614,7 +614,7 @@ private:
     uint32_t denseMarkedCount_;
     uint32_t denseEpoch_;
     uint32_t denseTileCount_;
-    const float* denseSampleData_;
+    const int16_t* denseSampleData_;
     uint32_t denseSampleDataFrames_;
     const RenderKernelSet* denseKernelSet_;
     VoiceManager* densePlannerVoices_;
@@ -798,7 +798,7 @@ inline void RenderScalar::SetEventBatchDispatcher(EventBatchDispatcher dispatche
 // phase and retirement always advance so decimated voices don't freeze.
 // ════════════════════════════════════════════════════════════════════════
 inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
-                                        const float* sampleData, uint32_t sampleDataFrames,
+                                        const int16_t* sampleData, uint32_t sampleDataFrames,
                                         float* outputLeft, float* outputRight,
                                         uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                                         const RenderEvent* events, uint32_t eventCount,
@@ -1079,7 +1079,7 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
 inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
                                         const ChannelCache& channels,
-                                        const float* sampleData,
+                                        const int16_t* sampleData,
                                         uint32_t sampleDataFrames,
                                         float* outputLeft, float* outputRight,
                                         uint32_t numFrames,
@@ -1097,7 +1097,7 @@ inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
 // Render an independent stolen-voice continuation across an event-free span.
 // All state is held in locals and committed once.
 inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
-                                const float* sampleData,
+                                const int16_t* sampleData,
                                 uint32_t sampleDataFrames,
                                 float* outputLeft, float* outputRight,
                                 uint32_t frameStart, uint32_t frameCount) {
@@ -1177,7 +1177,7 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
 // frame inside the span on which the voice retires, or UINT32_MAX when it
 // remains active.  Event dispatch cannot mutate voice state inside a span.
 inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
-                                       const float* sampleData,
+                                       const int16_t* sampleData,
                                        uint32_t sampleDataFrames,
                                        float* outputLeft, float* outputRight,
                                        uint32_t frameStart, uint32_t frameCount,
@@ -1963,7 +1963,7 @@ inline uint64_t RenderScalar::ComputeDenseChunkMask(
 }
 
 inline void RenderScalar::AdvanceAuthoritativeSpan(
-    VoiceManager& voices, const float* sampleData, uint32_t sampleDataFrames,
+    VoiceManager& voices, const int16_t* sampleData, uint32_t sampleDataFrames,
     uint32_t frameCount, uint64_t absoluteFrame) {
     if (frameCount == 0u) return;
     VoiceSoA& v = voices.v;
@@ -2351,7 +2351,7 @@ inline void RenderScalar::DenseIndexedJob(
 }
 
 inline bool RenderScalar::RenderBlockDensePlanned(
-    VoiceManager& voices, const float* sampleData, uint32_t sampleDataFrames,
+    VoiceManager& voices, const int16_t* sampleData, uint32_t sampleDataFrames,
     float* outputLeft, float* outputRight, uint32_t rangeStart,
     uint32_t rangeEnd, const RenderEvent* events, uint32_t eventCount,
     uint32_t eventIndexBegin, uint64_t blockStartFrame,
@@ -2638,7 +2638,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
 }
 
 inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& channels,
-                                      const float* sampleData, uint32_t sampleDataFrames,
+                                      const int16_t* sampleData, uint32_t sampleDataFrames,
                                       float* outputLeft, float* outputRight,
                                       uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                                       const RenderEvent* events, uint32_t eventCount,
@@ -2735,7 +2735,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 
 inline void RenderScalar::RenderBlockSparseRange(
     VoiceManager& voices, const ChannelCache& channels,
-    const float* sampleData, uint32_t sampleDataFrames,
+    const int16_t* sampleData, uint32_t sampleDataFrames,
     float* outputLeft, float* outputRight, uint32_t rangeStart,
     uint32_t rangeEnd, const RenderEvent* events, uint32_t eventCount,
     uint32_t eventIndexBegin, bool vibratoActive, bool correctnessMode,

@@ -22,7 +22,7 @@ namespace svms {
 // no mid-block note-on splitting is needed.
 class GpuSynth {
 public:
-    bool Initialize(const float* sampleData, uint32_t sampleDataFrames,
+    bool Initialize(const int16_t* sampleData, uint32_t sampleDataFrames,
                     uint32_t maxVoices, uint32_t blockFrames,
                     std::string& error);
     void Destroy();

@@ -322,9 +322,11 @@ int main() {
     channels.SetMasterVolume(1.0f);
     channels.RebuildCache(cfg, 44100.0f);
 
-    std::vector<float> samples(kSampleFrames);
+    std::vector<int16_t> samples(kSampleFrames + 8u, 0);
     for (uint32_t i = 0u; i < kSampleFrames; ++i)
-        samples[i] = 0.25f + 0.20f * std::sin(static_cast<float>(i) * 0.031f);
+        samples[i] = static_cast<int16_t>(
+            (0.25f + 0.20f * std::sin(static_cast<float>(i) * 0.031f)) *
+            4.0f);
 
     svms::VoiceManager voices;
     Check(voices.Initialize(kOldCapacity, 44100u),

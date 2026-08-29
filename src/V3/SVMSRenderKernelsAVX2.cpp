@@ -17,6 +17,52 @@ float HorizontalSum(__m256 value) {
            ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// 16-bit sample-store gathers.
+//
+// The sample store holds raw SF2 int16 values (the previous float store
+// held exact float(int16) values, so converting on load is identical
+// math).  AVX2 gathers are 4-byte granular, so each 32-bit word covering
+// elements [2k, 2k+1] is gathered and the wanted half is extracted by
+// index parity.  Gathering the word for element e+1 can touch one int16
+// beyond the last validated frame; every store is therefore allocated
+// with eight zero elements of trailing padding.
+// ════════════════════════════════════════════════════════════════════════
+inline __m256 GatherSampleAVX2(const int16_t* data, __m256i elem) {
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i word = _mm256_srai_epi32(elem, 1);
+    const __m256i parity = _mm256_and_si256(elem, one);
+    const __m256i oddMask = _mm256_cmpeq_epi32(parity, one);
+    const __m256i w0 = _mm256_i32gather_epi32(
+        reinterpret_cast<const int*>(data), word, 4);
+    const __m256i w1 = _mm256_i32gather_epi32(
+        reinterpret_cast<const int*>(data), _mm256_add_epi32(word, one), 4);
+    // Little-endian words: low half = element 2k, high half = 2k + 1.
+    const __m256i low = _mm256_srai_epi32(_mm256_slli_epi32(w0, 16), 16);
+    const __m256i high = _mm256_srai_epi32(w0, 16);
+    return _mm256_cvtepi32_ps(_mm256_blendv_epi8(low, high, oddMask));
+}
+
+// Pair gather for the time-lane kernels where the right neighbour is
+// provably elem + 1 (chunk guards exclude loop wraps), sharing the two
+// word gathers between both lanes of the lerp.
+inline void GatherSamplePairAVX2(const int16_t* data, __m256i elem,
+                                 __m256& first, __m256& second) {
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i word = _mm256_srai_epi32(elem, 1);
+    const __m256i parity = _mm256_and_si256(elem, one);
+    const __m256i oddMask = _mm256_cmpeq_epi32(parity, one);
+    const __m256i w0 = _mm256_i32gather_epi32(
+        reinterpret_cast<const int*>(data), word, 4);
+    const __m256i w1 = _mm256_i32gather_epi32(
+        reinterpret_cast<const int*>(data), _mm256_add_epi32(word, one), 4);
+    const __m256i low = _mm256_srai_epi32(_mm256_slli_epi32(w0, 16), 16);
+    const __m256i high = _mm256_srai_epi32(w0, 16);
+    const __m256i lowNext = _mm256_srai_epi32(_mm256_slli_epi32(w1, 16), 16);
+    first = _mm256_cvtepi32_ps(_mm256_blendv_epi8(low, high, oddMask));
+    second = _mm256_cvtepi32_ps(_mm256_blendv_epi8(high, lowNext, oddMask));
+}
+
 void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
                       uint32_t frameCount) {
     VoiceSoA& v = *c.voices;
@@ -50,8 +96,8 @@ void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
             remaining = 0u;
             break;
         }
-        const float first = c.sampleData[firstIndex];
-        const float sample = first + (c.sampleData[nextIndex] - first) *
+        const float first = static_cast<float>(c.sampleData[firstIndex]);
+        const float sample = first + (static_cast<float>(c.sampleData[nextIndex]) - first) *
             (phase - static_cast<float>(base));
         const float fade = total > 1u
             ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
@@ -141,10 +187,10 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
             const __m256i wraps = _mm256_cmpgt_epi32(
                 nextRaw, _mm256_sub_epi32(loopE, _mm256_set1_epi32(1)));
             const __m256i next = _mm256_blendv_epi8(nextRaw, loopS, wraps);
-            const __m256 first = _mm256_i32gather_ps(c.sampleData,
-                _mm256_add_epi32(sampleStart, base), 4);
-            const __m256 second = _mm256_i32gather_ps(c.sampleData,
-                _mm256_add_epi32(sampleStart, next), 4);
+            const __m256 first = GatherSampleAVX2(c.sampleData,
+                _mm256_add_epi32(sampleStart, base));
+            const __m256 second = GatherSampleAVX2(c.sampleData,
+                _mm256_add_epi32(sampleStart, next));
             const __m256 fraction = _mm256_sub_ps(
                 phase, _mm256_cvtepi32_ps(base));
             const __m256 sample = _mm256_add_ps(first,
@@ -219,7 +265,7 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
     const float loopLength = loopEnd - loopStart;
     const float gainL = v.renderGainL[handle];
     const float gainR = v.renderGainR[handle];
-    const float* region = c.sampleData + v.sampleStart[handle];
+    const int16_t* region = c.sampleData + v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
@@ -242,9 +288,8 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
             const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
-            const __m256 first = _mm256_i32gather_ps(region, bases, 4);
-            const __m256 second = _mm256_i32gather_ps(
-                region, _mm256_add_epi32(bases, one), 4);
+            __m256 first, second;
+            GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
             const __m256 sample = _mm256_add_ps(first,
@@ -270,8 +315,8 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
         uint32_t next = base + 1u;
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phase - static_cast<float>(base);
-        const float first = region[base];
-        const float sample = first + (region[next] - first) * fraction;
+        const float first = static_cast<float>(region[base]);
+        const float sample = first + (static_cast<float>(region[next]) - first) * fraction;
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
         phase += step;
@@ -298,7 +343,7 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
     const float loopLength = loopEnd - loopStart;
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
-    const float* region = c.sampleData + v.sampleStart[handle];
+    const int16_t* region = c.sampleData + v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     uint32_t retiredAt = UINT32_MAX;
@@ -311,8 +356,8 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
         uint32_t next = base + 1u;
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phase - static_cast<float>(base);
-        const float first = region[base];
-        const float sample = first + (region[next] - first) * fraction;
+        const float first = static_cast<float>(region[base]);
+        const float sample = first + (static_cast<float>(region[next]) - first) * fraction;
         bool finished = remaining == 0u;
         if (!finished) {
             gain *= decay;
@@ -356,7 +401,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     const float loopLength = loopEnd - loopStart;
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
-    const float* region = c.sampleData + v.sampleStart[handle];
+    const int16_t* region = c.sampleData + v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
@@ -387,9 +432,8 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
             const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
-            const __m256 first = _mm256_i32gather_ps(region, bases, 4);
-            const __m256 second = _mm256_i32gather_ps(
-                region, _mm256_add_epi32(bases, one), 4);
+            __m256 first, second;
+            GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
             const __m256 sample = _mm256_add_ps(first,
@@ -417,8 +461,8 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         uint32_t next = base + 1u;
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phase - static_cast<float>(base);
-        const float first = region[base];
-        const float sample = first + (region[next] - first) * fraction;
+        const float first = static_cast<float>(region[base]);
+        const float sample = first + (static_cast<float>(region[next]) - first) * fraction;
         bool finished = remaining == 0u;
         if (!finished) {
             gain *= decay;
@@ -511,10 +555,10 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
             const __m256i wraps = _mm256_cmpgt_epi32(
                 nextRaw, _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
             const __m256i next = _mm256_blendv_epi8(nextRaw, loopStart, wraps);
-            const __m256 first = _mm256_i32gather_ps(c.sampleData,
-                _mm256_add_epi32(sampleStart, base), 4);
-            const __m256 second = _mm256_i32gather_ps(c.sampleData,
-                _mm256_add_epi32(sampleStart, next), 4);
+            const __m256 first = GatherSampleAVX2(c.sampleData,
+                _mm256_add_epi32(sampleStart, base));
+            const __m256 second = GatherSampleAVX2(c.sampleData,
+                _mm256_add_epi32(sampleStart, next));
             const __m256 fraction = _mm256_sub_ps(
                 phase, _mm256_cvtepi32_ps(base));
             const __m256 sample = _mm256_add_ps(first,
@@ -612,7 +656,7 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     const float loopLength = loopEnd - loopStart;
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
-    const float* region = c.sampleData + v.sampleStart[handle];
+    const int16_t* region = c.sampleData + v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
@@ -671,9 +715,8 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
             const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
-            const __m256 first = _mm256_i32gather_ps(region, bases, 4);
-            const __m256 second = _mm256_i32gather_ps(
-                region, _mm256_add_epi32(bases, one), 4);
+            __m256 first, second;
+            GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
             const __m256 sample = _mm256_add_ps(first,
@@ -705,8 +748,8 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         uint32_t next = base + 1u;
         if (next >= loopE) next = loopS;
         const float fraction = phase - static_cast<float>(base);
-        const float first = region[base];
-        const float sample = first + (region[next] - first) * fraction;
+        const float first = static_cast<float>(region[base]);
+        const float sample = first + (static_cast<float>(region[next]) - first) * fraction;
         if (stage == 1u) {
             if (attackRemaining > 0u) {
                 gain += attackStep;
@@ -913,10 +956,8 @@ void RenderSustainedLoopRotationAVX2(const RenderSpanContext& c,
                     _mm256_blendv_epi8(nextRaw, loopStart, wrap);
                 const __m256i baseIndex = _mm256_add_epi32(sampleStart, base);
                 const __m256i nextIndex = _mm256_add_epi32(sampleStart, next);
-                const __m256 first =
-                    _mm256_i32gather_ps(c.sampleData, baseIndex, 4);
-                const __m256 second =
-                    _mm256_i32gather_ps(c.sampleData, nextIndex, 4);
+                const __m256 first = GatherSampleAVX2(c.sampleData, baseIndex);
+                const __m256 second = GatherSampleAVX2(c.sampleData, nextIndex);
                 const __m256 fraction =
                     _mm256_sub_ps(phase, _mm256_cvtepi32_ps(base));
                 __m256 sample = _mm256_add_ps(
@@ -1120,8 +1161,8 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             const __m256i next = _mm256_blendv_epi8(nextRaw, loopStart, wrap);
             const __m256i baseIndex = _mm256_add_epi32(sampleStart, base);
             const __m256i nextIndex = _mm256_add_epi32(sampleStart, next);
-            const __m256 first = _mm256_i32gather_ps(context.sampleData, baseIndex, 4);
-            const __m256 second = _mm256_i32gather_ps(context.sampleData, nextIndex, 4);
+            const __m256 first = GatherSampleAVX2(context.sampleData, baseIndex);
+            const __m256 second = GatherSampleAVX2(context.sampleData, nextIndex);
             const __m256 fraction = _mm256_sub_ps(phase, _mm256_cvtepi32_ps(base));
             const __m256 sample = _mm256_add_ps(
                 first, _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));

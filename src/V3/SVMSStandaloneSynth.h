@@ -60,9 +60,13 @@ public:
             error = "SoundFont has no usable compiled regions";
             return false;
         }
-        sampleData_.resize(sf2_->sampleDataFrames);
-        for (uint32_t i = 0; i < sf2_->sampleDataFrames; ++i)
-            sampleData_[i] = sf2_->sampleData[i] / 32768.0f;
+        sampleData_.resize(sf2_->sampleDataFrames + 8u);
+        std::memcpy(sampleData_.data(), sf2_->sampleData,
+                    static_cast<size_t>(sf2_->sampleDataFrames) *
+                        sizeof(int16_t));
+        std::memset(sampleData_.data() + sf2_->sampleDataFrames, 0,
+                    8u * sizeof(int16_t));
+        sampleFrames_ = sf2_->sampleDataFrames;
         prepared_.resize(sf2_->regionCount);
         if (!voices_.Initialize(maxVoices_, rate_)) {
             error = "cannot allocate voice storage";
@@ -96,7 +100,7 @@ public:
         if (config.backend == RenderBackend::GPU) {
             std::string gpuError;
             if (!gpuSynth_.Initialize(sampleData_.data(),
-                                      uint32_t(sampleData_.size()),
+                                      sampleFrames_,
                                       config.maxVoices, config.maxBlockFrames,
                                       gpuError)) {
                 error = "GPU init failed: " + gpuError;
@@ -181,7 +185,7 @@ public:
                     const uint32_t slot = tailHandles[pos - 1u];
                     RenderStealTailSample(voices_.v, slot,
                                           sampleData_.data(),
-                                          uint32_t(sampleData_.size()),
+                                          sampleFrames_,
                                           oL, oR);
                     voices_.RefreshStealTail(
                         static_cast<VoiceHandle>(slot));
@@ -196,7 +200,7 @@ public:
 #endif
         {
             renderer_.RenderBlock(voices_, channels_, sampleData_.data(),
-                                  uint32_t(sampleData_.size()), left, right,
+                                  sampleFrames_, left, right,
                                   frameCount, cfg_, nullptr, 0, true,
                                   absoluteFrame);
             limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
@@ -565,7 +569,8 @@ private:
     uint64_t notes_ = 0, noteCalls_ = 0, missingPresets_ = 0;
     uint64_t missingRegions_ = 0, invalidRegions_ = 0, fallbackRegions_ = 0;
     std::unique_ptr<SF2Data> sf2_;
-    std::vector<float> sampleData_;
+    std::vector<int16_t> sampleData_;
+    uint32_t sampleFrames_ = 0;
     std::vector<PreparedRegion> prepared_;
     VoiceManager voices_;
     ChannelCache channels_;

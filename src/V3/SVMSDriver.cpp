@@ -2203,7 +2203,7 @@ private:
     RenderScalar* renderScalar;
     SF2Data* soundFontData;
     RuntimeConfigSnapshot* configSnapshot;
-    float* sampleDataStore;
+    int16_t* sampleDataStore;
     SF2Sample* samplesStore;
     float* regionInitialPeaks;
     uint32_t regionInitialPeakCount;
@@ -2873,7 +2873,7 @@ struct PreparedSF2Region {
 // the lock-free audio->control retirement stack and is never render data.
 struct SoundFontBundle {
     SF2Data* data = nullptr;
-    float* sampleData = nullptr;
+    int16_t* sampleData = nullptr;
     SF2Sample* samples = nullptr;
     float* regionInitialPeaks = nullptr;
     PreparedSF2Region* preparedRegions = nullptr;
@@ -3616,15 +3616,21 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
 
     if (sf2->sampleData) {
         const uint32_t frames = sf2->sampleDataFrames;
-        float* fbuf = static_cast<float*>(malloc(frames * sizeof(float)));
-        if (!fbuf) {
+        // 16-bit sample store.  The previous float store held exact
+        // float(int16) values, so rendering converts on load with identical
+        // math at half the cache footprint.  Eight zero elements of
+        // trailing padding keep the AVX2 pair-word gather in bounds.
+        int16_t* sbuf = static_cast<int16_t*>(malloc(
+            (static_cast<size_t>(frames) + 8u) * sizeof(int16_t)));
+        if (!sbuf) {
             error = "not enough memory to convert SoundFont samples";
             DestroySoundFontBundle(bundle);
             return nullptr;
         }
-        for (uint32_t i = 0; i < frames; ++i)
-            fbuf[i] = sf2->sampleData[i] / 32768.0f;
-        bundle->sampleData = fbuf;
+        std::memcpy(sbuf, sf2->sampleData,
+                    static_cast<size_t>(frames) * sizeof(int16_t));
+        std::memset(sbuf + frames, 0, 8u * sizeof(int16_t));
+        bundle->sampleData = sbuf;
         bundle->sampleDataFrames = frames;
     }
 
@@ -3648,7 +3654,7 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
         return nullptr;
     }
     // Region compilation and diagnostic peaks are complete. Rendering uses
-    // the immutable float store, so retaining the original 16-bit RIFF blob
+    // the immutable 16-bit store, so retaining the original 16-bit RIFF blob
     // would only duplicate every loaded bank for its entire lifetime.
     free(sf2->sampleData);
     sf2->sampleData = nullptr;
@@ -3696,9 +3702,9 @@ SoundFontBundle* Driver::BuildSoundFontStackBundle(
         }
         bank->sampleBase = static_cast<uint32_t>(totalFrames);
         const uint64_t nextFrames = totalFrames + bank->sampleDataFrames;
-        float* grown = static_cast<float*>(realloc(
+        int16_t* grown = static_cast<int16_t*>(realloc(
             stack->sampleData,
-            static_cast<size_t>(nextFrames) * sizeof(float)));
+            (static_cast<size_t>(nextFrames) + 8u) * sizeof(int16_t)));
         if (!grown) {
             error = "not enough memory to combine SoundFont samples";
             DestroySoundFontBundle(bank);
@@ -3707,7 +3713,8 @@ SoundFontBundle* Driver::BuildSoundFontStackBundle(
         }
         stack->sampleData = grown;
         std::memcpy(stack->sampleData + bank->sampleBase, bank->sampleData,
-                    static_cast<size_t>(bank->sampleDataFrames) * sizeof(float));
+                    static_cast<size_t>(bank->sampleDataFrames) * sizeof(int16_t));
+        std::memset(stack->sampleData + nextFrames, 0, 8u * sizeof(int16_t));
         free(bank->sampleData);
         bank->sampleData = nullptr;
         totalFrames = nextFrames;
@@ -4717,7 +4724,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     ChannelCache* cc = self->channelCache;
     RenderScalar* render = self->renderScalar;
     RuntimeConfigSnapshot* snap = self->configSnapshot;
-    const float* sd = self->sampleDataStore;
+    const int16_t* sd = self->sampleDataStore;
 
     if (!vm || !cc || !render || !snap) return;
 
@@ -6193,7 +6200,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     sf2Telemetry_.lastMixGainR = voiceManager->v.mixGainR[lastVoice];
     sf2Telemetry_.lastDelaySamples = lastSetup.delaySamples;
     sf2Telemetry_.lastAttackSamples = lastSetup.attackSamples;
-    sf2Telemetry_.lastFloatSample = sampleDataStore[lastSetup.sampleStart];
+    sf2Telemetry_.lastFloatSample = static_cast<float>(sampleDataStore[lastSetup.sampleStart]);
     sf2Telemetry_.lastPhaseStep = lastSetup.phaseStep;
     sf2Telemetry_.lastPhase = voiceManager->v.phases[lastVoice];
     sf2Telemetry_.lastRelativeEnd = voiceManager->v.relEnd[lastVoice];

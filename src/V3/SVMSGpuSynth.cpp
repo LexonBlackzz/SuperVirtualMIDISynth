@@ -284,13 +284,17 @@ void ReduceCS(uint3 id : SV_DispatchThreadID) {
 
 // â”€â”€ GpuSynth implementation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-bool GpuSynth::Initialize(const float* sampleData, uint32_t sampleDataFrames,
+bool GpuSynth::Initialize(const int16_t* sampleData, uint32_t sampleDataFrames,
                           uint32_t maxVoices, uint32_t blockFrames,
                           std::string& error) {
     Destroy();
     maxVoices_ = maxVoices;
     blockFrames_ = blockFrames;
-    sampleData_.assign(sampleData, sampleData + sampleDataFrames);
+    // GPU pool keeps the float representation; convert from the 16-bit
+    // host store once at initialization.
+    sampleData_.resize(sampleDataFrames);
+    for (uint32_t i = 0; i < sampleDataFrames; ++i)
+        sampleData_[i] = static_cast<float>(sampleData[i]);
 
     if (!device_.Create(error)) return false;
     if (!BuildShaders(error)) return false;

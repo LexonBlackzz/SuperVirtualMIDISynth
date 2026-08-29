@@ -417,8 +417,12 @@ public:
         if (sf2_->regionOverflow || sf2_->regionCount == 0) {
             error="SoundFont has no usable compiled regions"; return false;
         }
-        sampleData_.resize(sf2_->sampleDataFrames);
-        for (uint32_t i=0;i<sf2_->sampleDataFrames;++i) sampleData_[i]=sf2_->sampleData[i]/32768.0f;
+        sampleData_.resize(sf2_->sampleDataFrames + 8u);
+        std::memcpy(sampleData_.data(), sf2_->sampleData,
+                    static_cast<size_t>(sf2_->sampleDataFrames) * sizeof(int16_t));
+        std::memset(sampleData_.data() + sf2_->sampleDataFrames, 0,
+                    8u * sizeof(int16_t));
+        sampleFrames_ = sf2_->sampleDataFrames;
         prepared_.resize(sf2_->regionCount);
         if (!voices_.Initialize(maxVoices_,rate_)) { error="cannot allocate voice storage"; return false; }
         if (!renderer_.ReserveVoiceCapacity(maxVoices_)) { error="cannot allocate renderer scratch"; return false; }
@@ -435,7 +439,7 @@ public:
         if (o.backend == RenderBackend::GPU) {
             std::string gpuErr;
             if (!gpuSynth_.Initialize(sampleData_.data(),
-                                      static_cast<uint32_t>(sampleData_.size()),
+                                      sampleFrames_,
                                       o.maxVoices, o.blockFrames, gpuErr)) {
                 error="GPU init failed: " + gpuErr; return false;
             }
@@ -484,7 +488,7 @@ public:
 #endif
         {
             renderer_.RenderBlock(voices_,channels_,sampleData_.data(),
-                                  uint32_t(sampleData_.size()),l,r,n,cfg_,
+                                  sampleFrames_,l,r,n,cfg_,
                                   nullptr,0,true,frame);
         }
         limiter_.ProcessPlanar(l,r,n,postHighPass_);
@@ -550,7 +554,7 @@ private:
     void Program(uint8_t ch,uint8_t p){const uint8_t old=channels_.GetProgram(ch);channels_.ProgramChange(ch,p);uint32_t pi;if(Resolve(ch,pi))channels_.SetSelectedPreset(ch,uint16_t(pi));else channels_.ProgramChange(ch,old);}
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;voices_.ForEachChannelActive(ch,[&](VoiceHandle v){const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));});}
     uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};bool gpuEnabled_=false;uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0,fallbackRegions_=0;
-    std::unique_ptr<SF2Data> sf2_;std::vector<float> sampleData_;std::vector<PreparedRegion> prepared_;
+    std::unique_ptr<SF2Data> sf2_;std::vector<int16_t> sampleData_;uint32_t sampleFrames_ = 0;std::vector<PreparedRegion> prepared_;
     VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
     GpuSynth gpuSynth_;

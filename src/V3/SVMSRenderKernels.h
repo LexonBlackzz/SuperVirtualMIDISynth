@@ -16,7 +16,7 @@ struct SpanRetirement {
 // replace a class function without changing scheduling or voice ownership.
 struct RenderSpanContext {
     VoiceSoA* voices;
-    const float* sampleData;
+    const int16_t* sampleData;
     uint32_t sampleDataFrames;
     float* outputLeft;
     float* outputRight;
@@ -63,18 +63,18 @@ bool BuildVolatileStealKeysAVX2(
 #endif
 
 uint32_t ScalarRenderSustainedLoop(
-    VoiceSoA& voices, uint32_t handle, const float* sampleData,
+    VoiceSoA& voices, uint32_t handle, const int16_t* sampleData,
     uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount);
 
 uint32_t ScalarRenderSustainedOneShot(
-    VoiceSoA& voices, uint32_t handle, const float* sampleData,
+    VoiceSoA& voices, uint32_t handle, const int16_t* sampleData,
     uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount);
 
 void ScalarRenderSustainedLoopShortBatch(
     VoiceSoA& voices, const uint32_t* handles, uint32_t handleCount,
-    const float* sampleData, uint32_t sampleDataFrames, float* outputLeft,
+    const int16_t* sampleData, uint32_t sampleDataFrames, float* outputLeft,
     float* outputRight, uint32_t frameStart, uint32_t frameCount);
 
 bool ScalarRenderTransientLoopClass(const RenderSpanContext& context,

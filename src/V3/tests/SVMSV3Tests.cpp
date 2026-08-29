@@ -218,10 +218,10 @@ void TestRegionValidationAndLiveConfiguration() {
     auto data = std::make_unique<svms::SF2Data>();
     std::memset(data.get(), 0, sizeof(svms::SF2Data));
     int16_t rawSamples[64];
-    float renderSamples[64];
+    int16_t renderSamples[72]{};
     for (uint32_t i = 0; i < 64; ++i) {
         rawSamples[i] = static_cast<int16_t>((static_cast<int>(i) - 32) * 700);
-        renderSamples[i] = rawSamples[i] / 32768.0f;
+        renderSamples[i] = rawSamples[i];
     }
     data->sampleData = rawSamples;
     data->sampleDataFrames = 64;
@@ -469,7 +469,7 @@ void TestExactFrameBatchDispatch() {
         {svms::RenderEventType::NoteOn, 0, 61, 100, 1, 12},
         {svms::RenderEventType::NoteOff, 0, 60, 0, 3, 13},
     };
-    float samples[2]{0.0f, 0.0f};
+    int16_t samples[2]{0, 0};
     float left[4]{}, right[4]{};
     BatchDispatchContext context{};
     svms::RenderScalar renderer;
@@ -508,8 +508,9 @@ void TestExactReleaseDurationAcrossBlocks() {
     cfg.panLaw = svms::PanLaw::ConstantPower;
     channels.SetMasterVolume(1.0f);
     channels.RebuildCache(cfg, 1000.0f);
-    float samples[16];
-    std::fill(std::begin(samples), std::end(samples), 1.0f);
+    int16_t samples[18]{};
+    std::fill(std::begin(samples), std::begin(samples) + 16,
+              static_cast<int16_t>(1));
     svms::RenderScalar renderer;
     ReleaseDispatchContext context{voices.get(), loud, quiet};
     renderer.SetEventDispatcher(DispatchReleaseForTest, &context);
@@ -1053,8 +1054,9 @@ void TestPriorityAwareStealingAndFadeTail() {
         Check(voices->v.stealFadeInFramesTotal[replacement] == 0,
               "replacement attack is not blurred by the outgoing tail fade");
 
-        float samples[64];
-        std::fill(std::begin(samples), std::end(samples), 1.0f);
+        int16_t samples[72]{};
+        std::fill(std::begin(samples), std::begin(samples) + 64,
+                  static_cast<int16_t>(1));
         std::vector<float> left(fadeFrames, 0.0f);
         std::vector<float> right(fadeFrames, 0.0f);
         svms::ChannelCache channels;
@@ -1131,8 +1133,9 @@ void TestPriorityAwareStealingAndFadeTail() {
         Check(admittedLouderTail,
               "a louder outgoing victim replaces the quietest reserve tail");
 
-        float tailSamples[256];
-        std::fill(std::begin(tailSamples), std::end(tailSamples), 0.25f);
+        int16_t tailSamples[264]{};
+        std::fill(std::begin(tailSamples), std::begin(tailSamples) + 256,
+                  static_cast<int16_t>(1));
         float tailLeft[8]{};
         float tailRight[8]{};
         svms::ChannelCache tailChannels;
@@ -1776,9 +1779,9 @@ void RenderDeterministic(float* left, float* right, uint32_t frames) {
     cfg.panLaw = svms::PanLaw::ConstantPower;
     channels.RebuildCache(cfg, 44100.0f);
 
-    float samples[256];
+    int16_t samples[264]{};
     for (uint32_t i = 0; i < 256; ++i)
-        samples[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 8.0f;
+        samples[i] = static_cast<int16_t>((static_cast<int>(i % 17) - 8) * 4096);
 
     std::memset(left, 0, frames * sizeof(float));
     std::memset(right, 0, frames * sizeof(float));
@@ -2720,8 +2723,8 @@ void TestExpressionAgeRetirementAndLoopWrap() {
     Check(voices->GetVoiceAge(first) == 245,
           "voice age is derived from absolute birth frame");
 
-    float samples[16]{};
-    for (uint32_t i = 0; i < 16; ++i) samples[i] = 0.25f;
+    int16_t samples[18]{};
+    for (uint32_t i = 0; i < 16; ++i) samples[i] = 1;
     voices->SetVoiceSample(first, 0, 10, 2, 6, 1, 12.25f, 1);
     voices->v.phases[first] = 3.5f;
     voices->SetVoiceEnvelope(first, 1.0f, 1.0f, 0, 0, 0, 0,
@@ -2824,10 +2827,11 @@ void ConfigureDifferentialSeed(svms::VoiceManager& voices,
 
 void TestSpanRendererDifferential() {
     static constexpr uint32_t bufferSizes[] = {16, 64, 257, 2048, 8192};
-    std::vector<float> samples(4096);
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096 + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
-        samples[i] = 0.4f * std::sin(static_cast<float>(i) * 0.031f) +
-                     0.15f * std::cos(static_cast<float>(i) * 0.079f);
+        samples[i] = static_cast<int16_t>((0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+                      0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 2.0f);
 
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
@@ -2885,12 +2889,12 @@ void TestSpanRendererDifferential() {
 
         referenceRenderer->RenderBlockReference(
             *referenceVoices, referenceChannels, samples.data(),
-            static_cast<uint32_t>(samples.size()), referenceLeft.data(),
+            sampleCount, referenceLeft.data(),
             referenceRight.data(), frames, cfg, events.data(),
             static_cast<uint32_t>(events.size()), true, 10000);
         spanRenderer->RenderBlock(
             *spanVoices, spanChannels, samples.data(),
-            static_cast<uint32_t>(samples.size()), spanLeft.data(), spanRight.data(),
+            sampleCount, spanLeft.data(), spanRight.data(),
             frames, cfg, events.data(), static_cast<uint32_t>(events.size()), true, 10000);
 
         Check(referenceContext.orderCount == spanContext.orderCount &&
@@ -2947,9 +2951,10 @@ void TestSpanRendererDifferential() {
 void TestRenderBackendSelectionAndDenseEquivalence() {
     constexpr uint32_t voiceCount = 32u;
     constexpr uint32_t frames = 4u;
-    std::vector<float> samples(2048);
+    const uint32_t sampleCount = 2048u;
+    std::vector<int16_t> samples(2048 + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
-        samples[i] = std::sin(static_cast<float>(i) * 0.021f);
+        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.021f) * 2.0f);
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
     cfg.panLaw = svms::PanLaw::ConstantPower;
@@ -2983,10 +2988,10 @@ void TestRenderBackendSelectionAndDenseEquivalence() {
         float scalarLeft[frames]{}, scalarRight[frames]{};
         float acceleratedLeft[frames]{}, acceleratedRight[frames]{};
         scalar.RenderBlock(*scalarVoices, channels, samples.data(),
-            static_cast<uint32_t>(samples.size()), scalarLeft, scalarRight,
+            sampleCount, scalarLeft, scalarRight,
             frames, cfg, nullptr, 0, true, 1000u);
         accelerated.RenderBlock(*acceleratedVoices, channels, samples.data(),
-            static_cast<uint32_t>(samples.size()), acceleratedLeft,
+            sampleCount, acceleratedLeft,
             acceleratedRight, frames, cfg, nullptr, 0, true, 1000u);
         for (uint32_t frame = 0; frame < frames; ++frame) {
             Check(NearlyEqual(scalarLeft[frame], acceleratedLeft[frame], 2.0e-5f) &&
@@ -3002,9 +3007,10 @@ void TestRenderBackendSelectionAndDenseEquivalence() {
 
 void TestTransientClassKernelDifferential() {
     constexpr uint32_t voiceCount = 32u;
-    std::vector<float> samples(4096);
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096 + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
-        samples[i] = std::sin(static_cast<float>(i) * 0.017f);
+        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.017f) * 2.0f);
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
     cfg.panLaw = svms::PanLaw::ConstantPower;
@@ -3054,11 +3060,11 @@ void TestTransientClassKernelDifferential() {
             float referenceLeft[4]{}, referenceRight[4]{};
             float spanLeft[4]{}, spanRight[4]{};
             reference.RenderBlockReference(*referenceVoices, channels,
-                samples.data(), static_cast<uint32_t>(samples.size()),
+                samples.data(), sampleCount,
                 referenceLeft, referenceRight, frames, cfg, nullptr, 0, true,
                 4000u);
             span.RenderBlock(*spanVoices, channels, samples.data(),
-                static_cast<uint32_t>(samples.size()), spanLeft, spanRight,
+                sampleCount, spanLeft, spanRight,
                 frames, cfg, nullptr, 0, true, 4000u);
 
             for (uint32_t frame = 0; frame < frames; ++frame) {
@@ -3099,9 +3105,10 @@ void TestTransientAVX2LongSpanDifferential() {
     // mid-span stage transitions and loop wraps) against the per-sample
     // reference.
     constexpr uint32_t voiceCount = 32u;
-    std::vector<float> samples(4096);
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096 + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
-        samples[i] = std::sin(static_cast<float>(i) * 0.017f);
+        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.017f) * 2.0f);
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
     cfg.panLaw = svms::PanLaw::ConstantPower;
@@ -3157,11 +3164,11 @@ void TestTransientAVX2LongSpanDifferential() {
             std::vector<float> spanLeft(frames, 0.0f),
                 spanRight(frames, 0.0f);
             reference.RenderBlockReference(*referenceVoices, channels,
-                samples.data(), static_cast<uint32_t>(samples.size()),
+                samples.data(), sampleCount,
                 referenceLeft.data(), referenceRight.data(), frames, cfg,
                 nullptr, 0, true, 4000u);
             accelerated.RenderBlock(*spanVoices, channels, samples.data(),
-                static_cast<uint32_t>(samples.size()), spanLeft.data(),
+                sampleCount, spanLeft.data(),
                 spanRight.data(), frames, cfg, nullptr, 0, true, 4000u);
 
             for (uint32_t frame = 0; frame < frames; ++frame) {
@@ -3201,7 +3208,8 @@ void TestTransientAVX2LongSpanDifferential() {
 void TestRenderCallbackPurity() {
     constexpr uint32_t frames = 512;
     constexpr uint32_t voiceCount = 256;
-    std::vector<float> samples(4096, 0.25f);
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096 + 8u, 1);
     std::vector<float> left(frames, 0.0f), right(frames, 0.0f);
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
@@ -3225,7 +3233,7 @@ void TestRenderCallbackPurity() {
     g_realtimeAllocationCount.store(0, std::memory_order_relaxed);
     g_trackRealtimeAllocations = true;
     renderer->RenderBlock(*voices, channels, samples.data(),
-                          static_cast<uint32_t>(samples.size()), left.data(),
+                          sampleCount, left.data(),
                           right.data(), frames, cfg, nullptr, 0, true, 0);
     g_trackRealtimeAllocations = false;
     Check(g_realtimeAllocationCount.load(std::memory_order_relaxed) == 0,
@@ -3235,9 +3243,10 @@ void TestRenderCallbackPurity() {
 void TestParallelSustainedRenderDifferential() {
     constexpr uint32_t voiceCount = 1024u;
     constexpr uint32_t frames = 2048u;
-    std::vector<float> samples(8192u);
+    const uint32_t sampleCount = 8192u;
+    std::vector<int16_t> samples(8192u + 8u, 0);
     for (uint32_t index = 0u; index < samples.size(); ++index)
-        samples[index] = 0.4f * std::sin(static_cast<float>(index) * 0.037f);
+        samples[index] = static_cast<int16_t>(0.4f * std::sin(static_cast<float>(index) * 0.037f) * 2.0f);
 
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
@@ -3281,10 +3290,10 @@ void TestParallelSustainedRenderDifferential() {
     std::vector<float> serialLeft(frames, 0.0f), serialRight(frames, 0.0f);
     std::vector<float> parallelLeft(frames, 0.0f), parallelRight(frames, 0.0f);
     serial.RenderBlock(*serialVoices, channels, samples.data(),
-        static_cast<uint32_t>(samples.size()), serialLeft.data(),
+        sampleCount, serialLeft.data(),
         serialRight.data(), frames, cfg, nullptr, 0u, true, 1000u);
     parallel.RenderBlock(*parallelVoices, channels, samples.data(),
-        static_cast<uint32_t>(samples.size()), parallelLeft.data(),
+        sampleCount, parallelLeft.data(),
         parallelRight.data(), frames, cfg, nullptr, 0u, true, 1000u);
 
     for (uint32_t frame = 0u; frame < frames; ++frame) {
@@ -3340,9 +3349,10 @@ void DensePlannerDispatch(const svms::RenderEvent* events,
 void TestDensePlannerOracleDifferential() {
     constexpr uint32_t voiceCount = 512u;
     constexpr uint32_t frames = 256u;
-    std::vector<float> samples(4096u);
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
     for (uint32_t index = 0u; index < samples.size(); ++index)
-        samples[index] = 0.35f * std::sin(static_cast<float>(index) * 0.071f);
+        samples[index] = static_cast<int16_t>(0.35f * std::sin(static_cast<float>(index) * 0.071f) * 2.0f);
 
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
@@ -3407,13 +3417,13 @@ void TestDensePlannerOracleDifferential() {
     std::vector<float> oracleLeft(frames, 0.0f), oracleRight(frames, 0.0f);
     std::vector<float> plannedLeft(frames, 0.0f), plannedRight(frames, 0.0f);
     oracle.RenderBlock(*oracleVoices, channels, samples.data(),
-        static_cast<uint32_t>(samples.size()), oracleLeft.data(),
+        sampleCount, oracleLeft.data(),
         oracleRight.data(), frames, cfg, events.data(),
         static_cast<uint32_t>(events.size()), true, 5000u);
     g_realtimeAllocationCount.store(0u, std::memory_order_relaxed);
     g_trackRealtimeAllocations = true;
     planned.RenderBlock(*plannedVoices, channels, samples.data(),
-        static_cast<uint32_t>(samples.size()), plannedLeft.data(),
+        sampleCount, plannedLeft.data(),
         plannedRight.data(), frames, cfg, events.data(),
         static_cast<uint32_t>(events.size()), true, 5000u);
     g_trackRealtimeAllocations = false;
@@ -3461,7 +3471,7 @@ void TestDensePlannerOracleDifferential() {
         std::vector<float> repeatLeft(frames, 0.0f);
         std::vector<float> repeatRight(frames, 0.0f);
         repeat.RenderBlock(*repeatVoices, channels, samples.data(),
-            static_cast<uint32_t>(samples.size()), repeatLeft.data(),
+            sampleCount, repeatLeft.data(),
             repeatRight.data(), frames, cfg, events.data(),
             static_cast<uint32_t>(events.size()), true, 5000u);
         Check(repeatLeft == plannedLeft && repeatRight == plannedRight,
@@ -3585,10 +3595,10 @@ void TestVibratoModulationAudible() {
     }
 
     constexpr uint32_t kSampleFrames = 64u;
-    float sampleBuf[kSampleFrames];
+    int16_t sampleBuf[kSampleFrames + 8u]{};
     for (uint32_t i = 0; i < kSampleFrames; ++i) {
-        sampleBuf[i] = std::sin(static_cast<float>(i) *
-                                (6.283185307179586f / 64.0f)) * 0.5f;
+        sampleBuf[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) *
+            (6.283185307179586f / 64.0f)) * 0.5f * 2.0f);
     }
 
     svms::RuntimeConfigSnapshot cfg{};
