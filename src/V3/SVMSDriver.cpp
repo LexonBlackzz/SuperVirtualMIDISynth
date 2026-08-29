@@ -25,6 +25,7 @@
 #include "SVMSConfig.h"
 #include "SVMSMPSCQueue.h"
 #include "SVMSPSCQueue.h"
+#include "SVMSNoteOnCollapse.h"
 #include "SVMSEventScheduler.h"
 #include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
@@ -2065,6 +2066,9 @@ public:
         const std::atomic<uint64_t>* externalCancellation,
         uint64_t cancellationToken);
     void SetIngressMode(EventOverflowMode mode);
+    // Same-key note-on coalescing spawn interval (power-of-two rounded;
+    // values below 2 disable coalescing). Runtime-tunable.
+    void SetNoteOnCollapseThreshold(uint32_t threshold);
     void CopyNativeQueueInfo(SVMS_QueueInfo& out) const;
     uint64_t GetNextOutputFrame() const;
 
@@ -2156,6 +2160,10 @@ private:
     std::atomic<uint64_t> acceptedAtomic_;
     std::atomic<uint64_t> shedAtomic_;
     std::atomic<uint64_t> cancelledAtomic_;
+    // Same-key note-on coalescing (see SVMSNoteOnCollapse.h). Collapsed
+    // duplicates never reach the ingress queues, lanes, or audio thread.
+    NoteOnCollapseGate noteOnCollapse_;
+    std::atomic<uint64_t> coalescedAtomic_{0};
     std::atomic<uint32_t> currentVelocityCutoffAtomic_;
     std::atomic<uint64_t> compilerEpochQPC_;
     std::atomic<uint32_t> compilerWakeEpoch_;
@@ -4104,6 +4112,10 @@ void Driver::SetIngressMode(EventOverflowMode mode) {
     overflowMode_.store(mode, std::memory_order_release);
 }
 
+void Driver::SetNoteOnCollapseThreshold(uint32_t threshold) {
+    noteOnCollapse_.SetThreshold(threshold);
+}
+
 void Driver::CopyNativeQueueInfo(SVMS_QueueInfo& out) const {
     out = {};
     out.struct_size = sizeof(out);
@@ -4192,7 +4204,7 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
 
     const uint8_t status = static_cast<uint8_t>(msg & 0xffu);
     const uint8_t data1 = static_cast<uint8_t>((msg >> 8) & 0x7fu);
-    const uint8_t velocity = static_cast<uint8_t>((msg >> 16) & 0x7fu);
+    uint8_t velocity = static_cast<uint8_t>((msg >> 16) & 0x7fu);
     const bool noteOn = !IsInternalEngineMessage(msg) &&
                         (status & 0xf0u) == 0x90u && velocity != 0;
 
@@ -4204,6 +4216,52 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
     } else if ((status & 0xf0u) == 0xb0u &&
                (data1 == 120u || data1 == 123u)) {
         PublishTerminationFence(channelTerminationFence_[status & 0x0fu], evt.sequence);
+    }
+
+    // ── Same-key note-on coalescing ─────────────────────────────────────
+    // Runs after cancellation/fence bookkeeping and before lane selection:
+    // collapsed duplicates never touch the ingress queues, lanes, or the
+    // audio thread at all. See SVMSNoteOnCollapse.h for the rationale.
+    if (noteOn) {
+        const uint32_t keyIndex =
+            static_cast<uint32_t>(status & 0x0fu) * kNoteCount + data1;
+        uint32_t stack = 0u;
+        if (!noteOnCollapse_.OnNoteOn(keyIndex, stack)) {
+            coalescedAtomic_.fetch_add(1u, std::memory_order_relaxed);
+            return true;
+        }
+        // ── Velocity stacking ───────────────────────────────────────────
+        // The collapsed hits between two spawns are density, not silence.
+        // Feed the accumulated stack into the spawned event's velocity on
+        // a log2 curve (2 velocity units per doubling) so hammered keys
+        // read as louder, not quieter, matching SnappySynth's stack counter.
+        // Boosting here also lifts the event into a higher priority lane
+        // and above the velocity shed cutoff.
+        if (stack > 1u && velocity < 127u) {
+            uint32_t boost = 0u;
+            for (uint32_t s = stack; s >>= 1u;) ++boost;
+            boost *= 2u;
+            const uint32_t boosted =
+                velocity + boost > 127u ? 127u : velocity + boost;
+            if (boosted != velocity) {
+                velocity = static_cast<uint8_t>(boosted);
+                evt.message = (evt.message & ~0x007f0000u) |
+                              (static_cast<uint32_t>(velocity) << 16);
+            }
+        }
+    } else if (!IsInternalEngineMessage(msg)) {
+        const uint8_t statusType = status & 0xf0u;
+        // Note-offs intentionally do NOT reset the per-key accumulator:
+        // the collapse window is one render block (cleared by the audio
+        // thread), and clearing on every note-off would let interleaved
+        // on/off floods spawn a voice per event again.  Panic-style state
+        // messages still clear, matching their "start over" semantics.
+        if (statusType == 0xb0u &&
+            (data1 == 120u || data1 == 123u)) {
+            noteOnCollapse_.ResetChannel(status & 0x0fu);
+        }
+    } else if (msg == kInternalResetMessage) {
+        noteOnCollapse_.ResetAll();
     }
 
     EventLane lane = EventLane::State;
@@ -4599,6 +4657,14 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     const float* sd = self->sampleDataStore;
 
     if (!vm || !cc || !render || !snap) return;
+
+    // ── Same-key note-on collapse window ──────────────────────────────
+    // The per-key hit accumulators cover exactly one render block.  This
+    // bounds the per-block spawn cost of same-key floods (the Black-MIDI
+    // signature) while never carrying state across blocks, so any key hit
+    // in a new block always spawns immediately.  CC 120/123 and engine
+    // resets additionally clear the accumulators on the producer side.
+    self->noteOnCollapse_.ResetAll();
 
     // ── Mailbox sync: dirty-gated monotonic seqlock read ───────────
     // The control thread publishes only when the user actually moves a
@@ -5166,6 +5232,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                 DiagWindow_Update(vm->activeCount_, vm->GetMaxVoices(),
                                   releasingVoices, sustainHeldVoices,
                                   vm->stealCount_,
+                                  self->coalescedAtomic_.load(
+                                      std::memory_order_relaxed),
+                                  self->noteOnCollapse_.Threshold(),
                                   s_cpuSmoothed, self->correctnessMode_ ? 1u
                                       : ComputeDecimationStep(vm->activeCount_),
                                   self->telemetry_.callbackP95Percent,

@@ -25,6 +25,8 @@ struct DiagStats {
     uint32_t releasingVoices;
     uint32_t sustainHeldVoices;
     uint32_t voiceSteals;
+    uint64_t coalescedNoteOns;
+    uint32_t noteOnCollapseThreshold;
     float cpuPercent;
     float callbackP95;
     float callbackP99;
@@ -68,7 +70,7 @@ static HMODULE GetCurrentModule() {
 
 static const wchar_t* kWindowClass = L"SVMS V3 Diag";
 static const int kWindowWidth = 540;
-static const int kWindowHeight = 520;
+static const int kWindowHeight = 540;
 static const int kTimerId = 1;
 // Diagnostic-only refresh. Windows timers are scheduler-limited, but 1 ms
 // gives the monitor the fastest practical readout without touching audio.
@@ -172,6 +174,17 @@ static void OnPaint(HWND hwnd) {
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"release=%u sustain=%u steals=%u",
                s.releasingVoices, s.sustainHeldVoices, s.voiceSteals);
     DrawStat(memDC, kPadX, y, L"Voice states:     ", buf);
+    y += kLineH;
+
+    if (s.noteOnCollapseThreshold > 1u) {
+        std::swprintf(buf, sizeof(buf) / sizeof(buf[0]),
+                      L"%llu collapsed (1 voice per %u hits)",
+                      static_cast<unsigned long long>(s.coalescedNoteOns),
+                      s.noteOnCollapseThreshold);
+    } else {
+        std::wcscpy(buf, L"off (every note-on spawns)");
+    }
+    DrawStat(memDC, kPadX, y, L"Note-on collapse: ", buf);
     y += kLineH;
 
     const wchar_t* renderer = s.renderBackend == RenderBackend::AVX2 ? L"AVX2"
@@ -290,12 +303,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     const DiagStats stats = ReadPublishedStats();
                     char text[192];
                     std::snprintf(text, sizeof(text),
-                        "[SVMS] voices=%u/%u retire=%u immediate=%u step=%u cpu=%.1f%% p99=%.0f%% over=%llu\n",
+                        "[SVMS] voices=%u/%u retire=%u immediate=%u step=%u cpu=%.1f%% p99=%.0f%% over=%llu coalesced=%llu(1/%u)\n",
                         stats.activeVoices, stats.maxVoices, stats.retired,
                         stats.retiredImmediate, stats.decimationStep,
                         static_cast<double>(stats.cpuPercent),
                         static_cast<double>(stats.callbackP99),
-                        static_cast<unsigned long long>(stats.overBudgetCallbacks));
+                        static_cast<unsigned long long>(stats.overBudgetCallbacks),
+                        static_cast<unsigned long long>(stats.coalescedNoteOns),
+                        stats.noteOnCollapseThreshold);
                     OutputDebugStringA(text);
                 }
             }
@@ -408,6 +423,8 @@ void DiagWindow_UpdateStartup(bool audioRunning, int32_t audioError,
 void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         uint32_t releasingVoices, uint32_t sustainHeldVoices,
                         uint32_t voiceSteals,
+                        uint64_t coalescedNoteOns,
+                        uint32_t noteOnCollapseThreshold,
                         float cpuPercent, uint32_t decimationStep,
                         float callbackP95, float callbackP99,
                         float callbackP999, uint64_t overBudgetCallbacks,
@@ -443,6 +460,8 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     stats.releasingVoices = releasingVoices;
     stats.sustainHeldVoices = sustainHeldVoices;
     stats.voiceSteals = voiceSteals;
+    stats.coalescedNoteOns = coalescedNoteOns;
+    stats.noteOnCollapseThreshold = noteOnCollapseThreshold;
     stats.cpuPercent = cpuPercent;
     stats.callbackP95 = callbackP95;
     stats.callbackP99 = callbackP99;
