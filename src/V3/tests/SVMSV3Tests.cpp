@@ -3093,6 +3093,111 @@ void TestTransientClassKernelDifferential() {
     }
 }
 
+void TestTransientAVX2LongSpanDifferential() {
+    // The AVX2 transient-loop kernel's 8-frame vector chunks only engage for
+    // spans longer than 4 frames; this differential exercises them (including
+    // mid-span stage transitions and loop wraps) against the per-sample
+    // reference.
+    constexpr uint32_t voiceCount = 32u;
+    std::vector<float> samples(4096);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = std::sin(static_cast<float>(i) * 0.017f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+
+    struct Scenario {
+        uint32_t attack;
+        uint32_t decay;
+        float phase;
+        float phaseStep;
+    };
+    const Scenario scenarios[] = {
+        {64u, 64u, 20.25f, 0.75f},
+        {0u, 64u, 20.25f, 0.75f},
+        {2u, 2u, 20.25f, 0.75f},
+        {64u, 64u, 2030.75f, 3.25f},
+        {200u, 100u, 2028.5f, 0.4375f},
+    };
+    const uint32_t spanSizes[] = {7u, 8u, 9u, 64u, 257u};
+
+    if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    for (const uint32_t frames : spanSizes) {
+        for (const Scenario& scenario : scenarios) {
+            auto seed = std::make_unique<svms::VoiceManager>();
+            seed->Initialize(voiceCount, 44100);
+            for (uint32_t i = 0; i < voiceCount; ++i) {
+                const svms::VoiceHandle h = seed->AllocateVoice(0, 60, 100);
+                seed->SetVoiceSample(h, 0, 4096, 16, 2032, 1,
+                                     scenario.phaseStep, 1);
+                seed->SetVoiceEnvelope(h, 1.0f, 0.4f, 0, 0,
+                    scenario.attack, scenario.decay,
+                    scenario.attack != 0u
+                        ? 1.0f / static_cast<float>(scenario.attack)
+                        : 0.0f,
+                    0.97f, 0.9999f);
+                seed->SetVoiceGain(h, 0.01f, 0.012f);
+                seed->RefreshMixGain(h, channels.GetParams()[0]);
+                seed->v.phases[h] = scenario.phase +
+                    static_cast<float>(i & 3u) * 0.03125f;
+            }
+
+            auto referenceVoices = std::make_unique<svms::VoiceManager>(*seed);
+            auto spanVoices = std::make_unique<svms::VoiceManager>(*seed);
+            svms::RenderScalar reference;
+            svms::RenderScalar accelerated;
+            Check(accelerated.SetRenderBackend(svms::RenderBackend::AVX2),
+                  "AVX2 backend selectable for transient long-span test");
+            std::vector<float> referenceLeft(frames, 0.0f),
+                referenceRight(frames, 0.0f);
+            std::vector<float> spanLeft(frames, 0.0f),
+                spanRight(frames, 0.0f);
+            reference.RenderBlockReference(*referenceVoices, channels,
+                samples.data(), static_cast<uint32_t>(samples.size()),
+                referenceLeft.data(), referenceRight.data(), frames, cfg,
+                nullptr, 0, true, 4000u);
+            accelerated.RenderBlock(*spanVoices, channels, samples.data(),
+                static_cast<uint32_t>(samples.size()), spanLeft.data(),
+                spanRight.data(), frames, cfg, nullptr, 0, true, 4000u);
+
+            for (uint32_t frame = 0; frame < frames; ++frame) {
+                Check(NearlyEqual(referenceLeft[frame], spanLeft[frame],
+                                  2.0e-5f) &&
+                          NearlyEqual(referenceRight[frame], spanRight[frame],
+                                      2.0e-5f),
+                      "AVX2 transient long-span kernel matches oracle audio");
+            }
+            for (uint32_t h = 0; h < voiceCount; ++h) {
+                Check(NearlyEqual(referenceVoices->v.phases[h],
+                                  spanVoices->v.phases[h], 1.0e-5f) &&
+                          NearlyEqual(referenceVoices->v.currentGain[h],
+                                      spanVoices->v.currentGain[h], 1.0e-6f) &&
+                          referenceVoices->v.envelopeStage[h] ==
+                              spanVoices->v.envelopeStage[h] &&
+                          referenceVoices->v.attackSamplesRemaining[h] ==
+                              spanVoices->v.attackSamplesRemaining[h] &&
+                          referenceVoices->v.decaySamplesRemaining[h] ==
+                              spanVoices->v.decaySamplesRemaining[h],
+                      "AVX2 transient long-span kernel preserves envelope state");
+            }
+            for (uint32_t classIndex = 0;
+                 classIndex < svms::kVoiceRenderClassCount; ++classIndex) {
+                const auto renderClass =
+                    static_cast<svms::VoiceRenderClass>(classIndex);
+                Check(referenceVoices->GetRenderClassCount(renderClass) ==
+                          spanVoices->GetRenderClassCount(renderClass),
+                      "AVX2 transient long-span kernel preserves class transitions");
+            }
+        }
+    }
+}
+
+
+
 void TestRenderCallbackPurity() {
     constexpr uint32_t frames = 512;
     constexpr uint32_t voiceCount = 256;
@@ -3704,6 +3809,7 @@ int main() {
     TestSpanRendererDifferential();
     TestRenderBackendSelectionAndDenseEquivalence();
     TestTransientClassKernelDifferential();
+    TestTransientAVX2LongSpanDifferential();
     TestParallelSustainedRenderDifferential();
     TestDensePlannerOracleDifferential();
     TestLaunchChurnInstrumentation();
