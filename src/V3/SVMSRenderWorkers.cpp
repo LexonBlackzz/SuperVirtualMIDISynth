@@ -28,7 +28,7 @@ constexpr uint32_t kLargePoolShortSpanVoices = 1024u;
 // Spans shorter than kMinimumParallelFrames need an even larger voice pool
 // before the wake/sync handshake pays off (chopped buzz workloads where
 // event-fragmented per-class spans are 1-7 frames).
-constexpr uint32_t kMinimumVoicesShortSpan = 2048u;
+constexpr uint32_t kMinimumVoicesShortSpan = 1024u;
 
 struct RenderJob {
     RenderClassKernel kernel;
