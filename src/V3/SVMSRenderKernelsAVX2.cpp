@@ -578,6 +578,207 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
     _mm256_zeroupper();
     return true;
 }
+// ════════════════════════════════════════════════════════════════════════
+// Transient-loop kernel (looping attack/decay voices).
+//
+// Mirrors RenderReleaseLoopFramesAVX2: the envelope is advanced scalarly
+// eight steps ahead into gains[8] using the exact sequential scalar
+// recurrence (bit-exact by construction — no decay^8 power tricks), and
+// only the sample fetch / lerp / mix is vectorized across time.  Transient
+// voices never retire mid-span; when attack+decay completes (stage reaches
+// 3) the voice is reported through classChangeHandles instead of
+// retirements, matching the scalar class kernel.
+// ════════════════════════════════════════════════════════════════════════
+void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
+                                   uint32_t handle) {
+    VoiceSoA& v = *c.voices;
+    if (!ValidateLoopVoice(c, handle)) return;
+    float phase = (std::max)(0.0f, v.phases[handle]);
+    float gain = v.currentGain[handle];
+    uint8_t stage = v.envelopeStage[handle];
+    const uint8_t initialStage = stage;
+    uint32_t attackRemaining = v.attackSamplesRemaining[handle];
+    uint32_t decayRemaining = v.decaySamplesRemaining[handle];
+    const float step = v.phaseIncs[handle];
+    const float targetGain = v.targetGain[handle];
+    const float sustainLevel = v.sustainLevel[handle];
+    const float attackStep = v.attackGainStep[handle];
+    const float decaySlope = v.decaySlope[handle];
+    const uint32_t relEnd = v.relEnd[handle];
+    const uint32_t loopS = v.relLoopS[handle];
+    const uint32_t loopE = v.relLoopE[handle];
+    const float loopStart = v.relLoopSF[handle];
+    const float loopEnd = v.relLoopEF[handle];
+    const float loopLength = loopEnd - loopStart;
+    const float mixL = v.mixGainL[handle];
+    const float mixR = v.mixGainR[handle];
+    const float* region = c.sampleData + v.sampleStart[handle];
+    float* outL = c.outputLeft + c.frameStart;
+    float* outR = c.outputRight + c.frameStart;
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
+                                       4.0f, 5.0f, 6.0f, 7.0f);
+    const __m256 stepVector = _mm256_set1_ps(step);
+    const __m256i one = _mm256_set1_epi32(1);
+    uint32_t frame = 0u;
+    while (frame < c.frameCount) {
+        if (phase >= loopEnd) {
+            float overflow = phase - loopEnd;
+            if (overflow >= loopLength)
+                overflow -= std::floor(overflow / loopLength) * loopLength;
+            phase = loopStart + overflow;
+        }
+        // Simulate the exact scalar envelope recurrence eight steps ahead.
+        // The clamps are part of the simulated sequence, so gains[] is
+        // bit-exact regardless.  The chunk is only taken when the stage is
+        // still the same after all eight steps — no class change can land
+        // inside the vector body.
+        float futureGain = gain;
+        uint8_t futureStage = stage;
+        uint32_t futureAttack = attackRemaining;
+        uint32_t futureDecay = decayRemaining;
+        alignas(32) float gains[8];
+        for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
+            if (futureStage == 1u) {
+                if (futureAttack > 0u) {
+                    futureGain += attackStep;
+                    --futureAttack;
+                    if (futureGain > targetGain) futureGain = targetGain;
+                } else {
+                    futureGain = targetGain;
+                }
+                if (futureAttack == 0u)
+                    futureStage = futureDecay > 0u ? 2u : 3u;
+            }
+            if (futureStage == 2u) {
+                if (futureDecay > 0u) {
+                    futureGain *= decaySlope;
+                    --futureDecay;
+                    if (futureGain < sustainLevel) futureGain = sustainLevel;
+                } else {
+                    futureGain = sustainLevel;
+                }
+                if (futureDecay == 0u) futureStage = 3u;
+            }
+            gains[laneIndex] = futureGain;
+        }
+        // lastPhase < loopEnd - 1 proves every lane's base + 1 < relLoopE,
+        // so neither the sample end (base + 1 >= relEnd) nor the loop point
+        // (next >= relLoopE) can be crossed inside the chunk, and both
+        // gather indices stay inside the validated region.
+        const float lastPhase = phase + step * 7.0f;
+        if (frame + 8u <= c.frameCount && futureStage == stage &&
+            lastPhase < loopEnd - 1.0f) {
+            const __m256 phases = _mm256_add_ps(
+                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
+            const __m256i bases = _mm256_cvttps_epi32(phases);
+            const __m256 first = _mm256_i32gather_ps(region, bases, 4);
+            const __m256 second = _mm256_i32gather_ps(
+                region, _mm256_add_epi32(bases, one), 4);
+            const __m256 fraction = _mm256_sub_ps(
+                phases, _mm256_cvtepi32_ps(bases));
+            const __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
+            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outL + frame),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
+            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outR + frame),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+            gain = futureGain;
+            stage = futureStage;
+            attackRemaining = futureAttack;
+            decayRemaining = futureDecay;
+            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                phase += step;
+            frame += 8u;
+            continue;
+        }
+
+        // Scalar tail: the exact per-frame sequence from the reference
+        // path (SVMSRenderScalar.h full-quality looping attack/decay).
+        uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= relEnd) {
+            phase = loopStart;
+            base = loopS;
+        }
+        uint32_t next = base + 1u;
+        if (next >= loopE) next = loopS;
+        const float fraction = phase - static_cast<float>(base);
+        const float first = region[base];
+        const float sample = first + (region[next] - first) * fraction;
+        if (stage == 1u) {
+            if (attackRemaining > 0u) {
+                gain += attackStep;
+                --attackRemaining;
+                if (gain > targetGain) gain = targetGain;
+            } else {
+                gain = targetGain;
+            }
+            if (attackRemaining == 0u)
+                stage = decayRemaining > 0u ? 2u : 3u;
+        }
+        if (stage == 2u) {
+            if (decayRemaining > 0u) {
+                gain *= decaySlope;
+                --decayRemaining;
+                if (gain < sustainLevel) gain = sustainLevel;
+            } else {
+                gain = sustainLevel;
+            }
+            if (decayRemaining == 0u) stage = 3u;
+        }
+        outL[frame] += sample * gain * mixL;
+        outR[frame] += sample * gain * mixR;
+        phase += step;
+        if (phase >= loopEnd) {
+            float overflow = phase - loopEnd;
+            if (overflow >= loopLength)
+                overflow -= std::floor(overflow / loopLength) * loopLength;
+            phase = loopStart + overflow;
+        }
+        ++frame;
+    }
+    v.phases[handle] = phase;
+    v.currentGain[handle] = gain;
+    v.envelopeStage[handle] = stage;
+    v.attackSamplesRemaining[handle] = attackRemaining;
+    v.decaySamplesRemaining[handle] = decayRemaining;
+    if (stage != initialStage && c.classChangeHandles != nullptr &&
+        c.classChangeCount != nullptr) {
+        c.classChangeHandles[(*c.classChangeCount)++] = handle;
+    }
+}
+
+bool RenderTransientLoopAVX2(const RenderSpanContext& context,
+                             const uint32_t* handles,
+                             uint32_t handleCount) {
+    if (handleCount == 0u) return true;
+    if (context.frameCount == 0u || context.sampleData == nullptr) return false;
+    // Per-voice phase rotation: refuse and let the (rotation-hooked) scalar
+    // span kernels take over, same policy as the release kernel.
+    if (context.voices->rot != nullptr) return false;
+    VoiceSoA& v = *context.voices;
+    // Whole-batch eligibility: any ineligible voice falls back to the
+    // scalar path for the entire class.
+    for (uint32_t position = 0u; position < handleCount; ++position) {
+        const uint32_t handle = handles[position];
+        if (!ValidateLoopVoice(context, handle) ||
+            v.loopEnabled[handle] == 0u ||
+            v.stealFadeInFramesRemaining[handle] != 0u ||
+            (v.envelopeStage[handle] != 1u &&
+             v.envelopeStage[handle] != 2u) ||
+            v.releaseSamplesRemaining[handle] != UINT32_MAX) {
+            return false;
+        }
+    }
+    for (uint32_t position = 0u; position < handleCount; ++position)
+        RenderTransientLoopFramesAVX2(context, handles[position]);
+    _mm256_zeroupper();
+    return true;
+}
+
+
 
 // ════════════════════════════════════════════════════════════════════════
 // Rotation-aware sustained-loop kernel (SVMSPhaseRotation.h).
@@ -1072,7 +1273,7 @@ const RenderKernelSet& GetAVX2RenderKernelSet() {
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::ReleaseLoop)] =
             RenderReleaseLoopAVX2;
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientLoop)] =
-            ScalarRenderTransientLoopClass;
+            RenderTransientLoopAVX2;
         result.backend = RenderBackend::AVX2;
         result.name = "avx2";
         return result;
