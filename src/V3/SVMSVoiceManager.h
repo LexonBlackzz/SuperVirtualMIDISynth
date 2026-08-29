@@ -169,7 +169,9 @@ public:
     VoiceHandle AllocateVoiceOrSteal(uint8_t channel, uint8_t note, uint8_t velocity,
                                      bool* outStolen = nullptr,
                                      bool deferCandidate = false,
-                                     bool reserveCandidateInPlace = true);
+                                     bool reserveCandidateInPlace = true,
+                                     VoiceHandle preselectedVictim = kInvalidVoice,
+                                     uint32_t preselectedVictimPosition = 0u);
     // Complete a deferred note-on setup with one exact steal-index update.
     // This avoids repeatedly removing/reinserting the same newborn while its
     // sample, envelope and gains are filled in sequentially.
@@ -461,6 +463,34 @@ public:
         enableReleasingRing_ = enabled;
     }
 
+    // Batch steal-candidate pop: retrieves up to `count` victims in one call,
+    // selecting each victim with the exact PopStealCandidate(pos, false)
+    // tier logic (releasing-ring fast path → stable winner-tree root →
+    // general stable-vs-volatile comparison), fully repairing the
+    // ring/tree/heap after every individual pop. The resulting victim
+    // sequence is identical to `count` sequential single pops: pop 1, then
+    // pop 1 again from the updated structures, and so on. Returns the number
+    // of victims actually found (fewer than `count` when the candidate
+    // structures run dry; 0 when there is nothing to steal).
+    // This exists purely to amortize call overhead in same-frame batched
+    // note-on runs — it performs exactly the same tree operations as the
+    // equivalent sequential pops. (A genuine algorithmic batching that
+    // extracts N victims in fewer than N repair operations is out of scope.)
+    uint32_t PopStealCandidates(uint32_t count, VoiceHandle* outHandles,
+                                uint32_t* outActivePositions);
+
+    // Hot toggle for batched per-launch steal selection (driver; mirrored
+    // from the correctness-mode config bool every dispatch run). When false,
+    // every LaunchVoiceGroup layer takes the unchanged per-layer
+    // PopStealCandidate path.
+    void SetStealBatchingEnabled(const bool enabled) noexcept {
+        stealBatchingEnabled_ = enabled;
+    }
+
+    // Test-only access to the single-victim pop, so the batch wrapper can be
+    // proven victim-identical to sequential pops from the regression suite.
+    friend struct VoiceStealBatchTestAccess;
+
     // ── Per-voice phase rotation (SVMSPhaseRotation.h) ─────────────────
     // Mode 0 (Coherent) frees the per-voice state and leaves the render
     // path bit-identical.  Modes 1-4 allocate the state array and seed
@@ -508,6 +538,11 @@ private:
     uint32_t releasingRingHead_;      // index of the oldest entry
     uint32_t releasingRingCount_;
     bool enableReleasingRing_ = true;
+    // Hot toggle: batch the per-layer steal-victim selection of one
+    // LaunchVoiceGroup transaction into a single PopStealCandidates call.
+    // Mirrored from the driver's correctness-mode bool every dispatch run;
+    // false restores the unchanged per-layer PopStealCandidate path.
+    bool stealBatchingEnabled_ = false;
 
     // Dense per-channel indices make controller, sustain, pitch-bend and
     // channel termination work proportional to that channel's polyphony.
@@ -653,6 +688,9 @@ private:
     uint32_t lastLinkedPlayIndex_;
     VoiceHandle lastLinkedPlayVoice_;
     uint32_t maxLaunchGroupSize_ = 1u;
+    // Cap on the per-launch batched steal-victim selection (launch groups
+    // larger than this fall back to the per-layer pop path).
+    static constexpr uint32_t kStealBatchMaxLayers = 16u;
     void* metadataStorage_;
     size_t metadataBytes_;
 
@@ -693,6 +731,13 @@ private:
     void RebuildStableWinnerTree();
     VoiceHandle PopStealCandidate(uint32_t& activePosition,
                                   bool reserveVolatileRoot);
+    // Batched per-launch steal selection support. A batch-popped victim is
+    // fully removed from its tier; InsertPreselectedVictim restores exactly
+    // the entry the pop erased (used for victims a launch never consumed, so
+    // the post-launch index matches the per-layer path byte for byte).
+    void InsertPreselectedVictim(VoiceHandle victim);
+    void RearmLiveBatchVictims(const VoiceHandle* victims, uint32_t popped,
+                               const bool* consumed);
     // Releasing-ring fast path: consumes (or peeks, with consume=false) the
     // oldest plausible Releasing entry, validating it against live pool
     // state; returns kInvalidVoice when the ring runs dry or every remaining
@@ -2785,6 +2830,78 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
     return static_cast<VoiceHandle>(bestHandle);
 }
 
+// Thin batch wrapper over PopStealCandidate(pos, false). Deliberately NOT a
+// heap-algorithm optimization: every victim is produced by one complete
+// single-victim pop, including full tree/ring/heap repair, so victim k sees
+// exactly the structure state that the k-th of K sequential pops would see.
+// This guarantees the batch picks the same N voices, in the same priority
+// order, as K independent pops. The only saving is call-overhead amortization
+// for the caller (a same-frame run of K note-ons currently re-enters
+// LaunchVoiceGroup -> AllocateVoiceOrSteal -> PopStealCandidate per note).
+// Note: a true algorithmic batching (bulk-extracting the N smallest keys with
+// fewer than N repair operations) could exist in principle, but it would risk
+// changing selection order and is explicitly out of scope for this task.
+inline uint32_t VoiceManager::PopStealCandidates(uint32_t count,
+                                                 VoiceHandle* outHandles,
+                                                 uint32_t* outActivePositions) {
+    uint32_t found = 0u;
+    while (found < count) {
+        const VoiceHandle victim =
+            PopStealCandidate(outActivePositions[found], false);
+        if (victim == kInvalidVoice) break;
+        outHandles[found] = victim;
+        ++found;
+    }
+    return found;
+}
+
+// Restores exactly the tier-index entry a reserve=false steal pop erased.
+// Stable victims: rewrite the winner-tree leaf with the key the pop cleared,
+// restore the heap count and repair the winner path — the precise inverse of
+// the pop's `--stealHeapCount_; leaf = 0; RefreshStealWinnerPath` sequence.
+// Volatile victims: LinkVolatileCandidate re-inserts into the candidate list
+// and (same-frame valid) heap; the victim was the heap maximum when popped
+// and no candidate with a larger key can appear within one exact-frame launch
+// transaction (keys are frozen per frame and commits land only after the
+// allocation loop), so it sifts back to the root the pop assumed. Heap-array
+// order may differ from the pre-pop arrangement, but the heap is fully
+// ordered by unique keys, so every subsequent selection is identical.
+inline void VoiceManager::InsertPreselectedVictim(VoiceHandle victim) {
+    // The sequential path builds the volatile heap before any selection that
+    // can observe volatile candidates (tier c inside PopStealCandidate), so
+    // the re-arm must guarantee the same precondition before re-linking a
+    // volatile victim; otherwise a later probe's eligibility check would see
+    // a stale heap and take a different launch path than the sequential one.
+    if (!stealVolatileHeapValid_ || stealVolatileHeapFrame_ != currentFrame_)
+        BuildVolatileStealHeap();
+    if (IsStableStealCandidate(victim)) {
+        stealWinnerTree_[stealTreeLeafBase_ + victim] =
+            stealStableKey_[victim];
+        ++stealHeapCount_;
+        RefreshStealWinnerPath(victim);
+    } else {
+        LinkVolatileCandidate(victim);
+    }
+}
+
+// Re-inserts every batch-popped victim of one launch transaction that was
+// never consumed (fed to a layer) and is still live. Victims retired as
+// play-group siblings of an earlier layer's victim are Free and are skipped;
+// consumed victims were replaced in place and are skipped via `consumed`.
+inline void VoiceManager::RearmLiveBatchVictims(const VoiceHandle* victims,
+                                                uint32_t popped,
+                                                const bool* consumed) {
+    if (!victims || !consumed) return;
+    for (uint32_t i = 0u; i < popped; ++i) {
+        const VoiceHandle victim = victims[i];
+        if (victim == kInvalidVoice || consumed[i] ||
+            victim >= maxVoices_ ||
+            v.state[victim] != static_cast<uint8_t>(VoiceState::Active))
+            continue;
+        InsertPreselectedVictim(victim);
+    }
+}
+
 inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
                                               uint32_t activePosition) {
     if (!stealHeapValid_ || handle >= maxVoices_) return;
@@ -3062,17 +3179,92 @@ inline void VoiceManager::RemoveStealCandidate(VoiceHandle handle) {
     RefreshStealWinnerPath(handle);
 }
 
-// Consume (or peek) the oldest plausible Releasing entry from the ring fast
-// path. Ring contents are hints: a voice may have been retired, re-stolen
-// through the normal tiers, or become a deferred replacement after its entry
-// was pushed. Stale entries are dropped (oldest-first) without repairing the
-// rest of the ring mid-search; live pool state is the only source of truth.
-// With consume=false nothing is mutated on success, so callers can predict
-// the fast-path outcome before committing to it.
+// Consume (or peek) the best Releasing entry from the ring fast path.
+// Ring contents are hints: a voice may have been retired, re-stolen
+// through the normal tiers, or become a deferred replacement after its
+// entry was pushed. Stale entries are dropped (oldest-first) without
+// repairing the rest of the ring mid-search; live pool state is the only
+// source of truth. Instead of popping the head unconditionally (pure FIFO),
+// a bounded 12-entry window starting at the head is scanned and the single
+// best victim is selected with ComputeStableStealKey, compared exactly like
+// the winner-tree root (largest encoded key wins), so quality ranking
+// survives the O(1)-ish fast path. With consume=false nothing is mutated on
+// success, so callers can predict the fast-path outcome before committing
+// to it. If no valid entry exists in the entire ring, kInvalidVoice is
+// returned and callers fall through to the exact winner-tree path.
 inline VoiceHandle VoiceManager::NextValidReleasingRingVictim(
     uint32_t& victimPosition, const bool consume) {
     if (releasingRingCapacity_ == 0u) return kInvalidVoice;
     const auto releasingState = static_cast<uint8_t>(VoiceState::Releasing);
+
+    // Bounded quality window: up to 12 entries from the head, non-mutating.
+    VoiceHandle bestHandle = kInvalidVoice;
+    uint32_t bestPosition = 0u;
+    uint64_t bestKey = 0u;
+    uint32_t bestSlot = 0u;
+    {
+        const uint32_t window =
+            releasingRingCount_ < 12u ? releasingRingCount_ : 12u;
+        for (uint32_t i = 0u; i < window; ++i) {
+            const uint32_t slot =
+                (releasingRingHead_ + i) & releasingRingMask_;
+            const uint32_t handle = releasingRing_[slot];
+            if (handle >= maxVoices_) continue; // stale hint
+            const uint32_t position = activePosition_[handle];
+            const bool valid = handle < maxVoices_ &&
+                v.state[handle] == releasingState &&
+                position < activeCount_ && activeList_[position] == handle &&
+                stealCandidateDeferred_[handle] == 0u &&
+                stealCandidateReserved_[handle] == 0u;
+            if (!valid) continue; // stale: skipped, dropped below if at head
+            // Same comparison direction as the winner-tree combine and the
+            // volatile fallback scan: largest encoded key is the victim.
+            const uint64_t key = EncodeStableWinnerKey(
+                ComputeStableStealKey(static_cast<VoiceHandle>(handle)),
+                position);
+            if (bestHandle == kInvalidVoice || key > bestKey) {
+                bestHandle = static_cast<VoiceHandle>(handle);
+                bestPosition = position;
+                bestKey = key;
+                bestSlot = slot;
+            }
+        }
+    }
+    if (bestHandle != kInvalidVoice) {
+        if (!consume) {
+            victimPosition = bestPosition;
+            return bestHandle;
+        }
+        // Remove the winner: if it is not at the head, swap it with the
+        // head entry (avoids shifting the ring), then pop the head.
+        if (bestSlot != releasingRingHead_) {
+            releasingRing_[bestSlot] = releasingRing_[releasingRingHead_];
+        }
+        releasingRingHead_ = (releasingRingHead_ + 1u) & releasingRingMask_;
+        --releasingRingCount_;
+        victimPosition = bestPosition;
+        // Stale-drop: drain any stale entries the swap/win left at the head
+        // (mirrors the old search-time stale-drop; never drops a live voice).
+        while (releasingRingCount_ != 0u) {
+            const uint32_t head = releasingRing_[releasingRingHead_];
+            if (head < maxVoices_) {
+                const uint32_t position = activePosition_[head];
+                const bool valid = v.state[head] == releasingState &&
+                    position < activeCount_ &&
+                    activeList_[position] == head &&
+                    stealCandidateDeferred_[head] == 0u &&
+                    stealCandidateReserved_[head] == 0u;
+                if (valid) break;
+            }
+            releasingRingHead_ = (releasingRingHead_ + 1u) & releasingRingMask_;
+            --releasingRingCount_;
+        }
+        return bestHandle;
+    }
+
+    // Window (and possibly ring beyond it) holds no quality candidate:
+    // fall back to the original oldest-first drain so the caller falls
+    // through to the winner-tree path when the ring is fully stale.
     while (releasingRingCount_ != 0u) {
         const uint32_t handle = releasingRing_[releasingRingHead_];
         if (handle >= maxVoices_) {
@@ -3180,7 +3372,9 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
                                                         uint8_t velocity,
                                                         bool* outStolen,
                                                         bool deferCandidate,
-                                                        bool reserveCandidateInPlace) {
+                                                        bool reserveCandidateInPlace,
+                                                        VoiceHandle preselectedVictim,
+                                                        uint32_t preselectedVictimPosition) {
     // While a lowered cap is still draining its forced-release tails, do not
     // admit replacement notes that would turn those tails back into primaries.
     // The transition is bounded by the forced release (normally 50 ms).
@@ -3222,12 +3416,19 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     // Physical pool or logical live cap is full — find the lowest-priority
     // voice to steal. Replacement happens in-place, so the live cap cannot
     // grow past its configured value.
-    uint32_t bestPos = 0;
+    uint32_t bestPos = preselectedVictimPosition;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t selectionBegin = BeginLaunchStageForTest();
 #endif
-    const VoiceHandle bestHandle = PopStealCandidate(
-        bestPos, deferCandidate && reserveCandidateInPlace);
+    // A preselected victim (batched per-launch layer allocation) was produced
+    // by the caller's PopStealCandidates call — the exact reserve=false pop
+    // sequence this site would perform — with full ring/tree/heap repair, so
+    // only the redundant re-selection call is skipped here; the victim is
+    // identical and the post-selection logic below is untouched.
+    const VoiceHandle bestHandle = preselectedVictim != kInvalidVoice
+        ? preselectedVictim
+        : PopStealCandidate(bestPos,
+                            deferCandidate && reserveCandidateInPlace);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
                           selectionBegin);
@@ -3786,7 +3987,7 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t selectionBegin = BeginLaunchStageForTest();
 #endif
-    const VoiceHandle selected = PopStealCandidate(selectedPosition, true);
+    VoiceHandle selected = PopStealCandidate(selectedPosition, true);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
                           selectionBegin);
@@ -4020,11 +4221,63 @@ inline bool VoiceManager::LaunchVoiceGroup(
     bool candidatesReservedInPlace = false;
     if (!ReuseMatchingStealGroup(channel, note, velocity, setups, count,
                                  outHandles, candidatesReservedInPlace)) {
+        // ── FLAG (steal-batch scope) ─────────────────────────────────────
+        // The victim batching is deliberately scoped to ONE launch
+        // transaction: between the first and last layer selection no
+        // candidate insertion can occur (commits land only after this loop),
+        // so the descending victim order of PopStealCandidates is identical
+        // to the sequential per-layer PopStealCandidate pops — only the
+        // per-layer call overhead is saved. Prefetching victims ACROSS notes
+        // of a same-frame dispatch run is NOT exact: newborn commits of
+        // earlier notes re-key their slots and can outrank remaining
+        // prefetched victims, which changes WHICH voice is stolen (confirmed
+        // empirically during bring-up). Any future run-level scheme must
+        // solve that insertion race first.
+        VoiceHandle batchVictims[kStealBatchMaxLayers];
+        uint32_t batchPositions[kStealBatchMaxLayers];
+        bool consumed[kStealBatchMaxLayers] = {};
+        uint32_t popped = 0u;
+        const bool batchSteal = stealBatchingEnabled_ &&
+            count >= 2u && count <= kStealBatchMaxLayers &&
+            // Releasing-ring-ordered victims cannot be re-armed (the ring
+            // entry is consumed and there is no front-repush), so the batch
+            // only engages while the ring fast path is inactive; once
+            // inactive it stays inactive for the rest of the launch (sibling
+            // retirements only move freeTop_/activeCount_ further from
+            // eligibility and dispatch never pushes ring entries).
+            !ReleasingRingEligible();
+        if (batchSteal)
+            popped = PopStealCandidates(count, batchVictims, batchPositions);
         uint32_t allocated = 0u;
+        uint32_t cursor = 0u;
         for (; allocated < count; ++allocated) {
+            // Mirror AllocateVoiceOrSteal's free-stack-vs-steal decision:
+            // only hand a prefetched victim to a layer that is guaranteed to
+            // take the steal path (the free-slot branch cannot fire), and
+            // skip victims already retired as siblings of an earlier layer's
+            // victim (state Free).
+            while (cursor < popped &&
+                   v.state[batchVictims[cursor]] !=
+                       static_cast<uint8_t>(VoiceState::Active))
+                ++cursor;
+            VoiceHandle fed = kInvalidVoice;
+            uint32_t fedPosition = 0u;
+            uint32_t fedCursor = UINT32_MAX;
+            if (freeTop_ == 0u && activeCount_ >= voiceLimit_ &&
+                cursor < popped) {
+                fed = batchVictims[cursor];
+                fedPosition = batchPositions[cursor];
+                fedCursor = cursor;
+                ++cursor;
+            }
             outHandles[allocated] = AllocateVoiceOrSteal(
-                channel, note, velocity, nullptr, true, false);
+                channel, note, velocity, nullptr, true, false, fed,
+                fedPosition);
             if (outHandles[allocated] == kInvalidVoice) {
+                // Restore the unconsumed, still-live prefetched victims so
+                // the candidate index matches the per-layer path exactly,
+                // then roll the layers launched so far back.
+                RearmLiveBatchVictims(batchVictims, popped, consumed);
                 for (uint32_t rollback = 0u; rollback < allocated; ++rollback)
                     RetireVoice(outHandles[rollback]);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
@@ -4032,7 +4285,12 @@ inline bool VoiceManager::LaunchVoiceGroup(
 #endif
                 return false;
             }
+            if (fedCursor != UINT32_MAX) consumed[fedCursor] = true;
         }
+        // The launch consumed its fed victims; every other popped victim
+        // must rejoin the candidate index (the per-layer path would never
+        // have popped it).
+        RearmLiveBatchVictims(batchVictims, popped, consumed);
     }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t configureBegin = BeginLaunchStageForTest();

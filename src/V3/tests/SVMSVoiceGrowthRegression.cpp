@@ -25,6 +25,282 @@ bool NearlyEqual(float a, float b, float epsilon = 1.0e-6f) {
 
 } // namespace
 
+// ── Same-frame note-on burst: per-note vs batch-prefetch equivalence ─────
+// Mirrors the two DispatchRenderEventBatch paths from identical pool state:
+//   * "correctness mode ON"  — one LaunchVoiceGroup per note, no prefetch.
+//   * "correctness mode OFF" — the run's victims popped once up front via
+//     PopStealCandidates (under the same StealPoolSaturated /
+//     StealBatchPrefetchAllowed gates the driver uses), one victim handed to
+//     each launch, unconsumed victims re-armed via RearmBatchPoppedVictim.
+// Asserts every note lands on the identical physical voice slot(s) and both
+// managers end in identical state.
+void RunVoiceStealBatchLaunchEquivalenceChecks() {
+    constexpr uint32_t kPoolCapacity = 48u;
+    constexpr uint32_t kGroupCount = kPoolCapacity / 2u;
+    constexpr uint32_t kBurstNotes = 24u;
+
+    svms::ChannelParamsSnapshot channel{};
+    channel.volume = channel.expression = 1.0f;
+    channel.panLeft = channel.panRight = 0.70710678f;
+    channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
+
+    svms::VoiceConfiguration setups[2]{};
+    for (auto& setup : setups) {
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 128u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 120u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep = 1.0f;
+        setup.initialGain = setup.sustainLevel = 1.0f;
+        setup.releaseDecay = 0.999f;
+        setup.sampleBacked = 1u;
+    }
+
+    svms::VoiceManager baseSingleton;
+    Check(baseSingleton.Initialize(kPoolCapacity, 44100u),
+          "steal-batch singleton pool initializes");
+    for (uint32_t group = 0u; group < kPoolCapacity; ++group) {
+        setups[0].playIndex = group + 1u;
+        setups[0].gainLeft = setups[0].gainRight =
+            0.02f + 0.01f * static_cast<float>(group % 7u);
+        svms::VoiceHandle handles[1]{};
+        Check(baseSingleton.LaunchVoiceGroup(0u, 60u, 100u, setups, 1u,
+                                             channel, handles),
+              "steal-batch singleton fixture group launches");
+    }
+    Check(baseSingleton.GetActiveCount() == kPoolCapacity &&
+              baseSingleton.freeTop_ == 0u,
+          "steal-batch singleton fixture pool is saturated");
+
+    svms::VoiceManager baseStereo;
+    Check(baseStereo.Initialize(kPoolCapacity, 44100u),
+          "steal-batch stereo pool initializes");
+    for (uint32_t group = 0u; group < kGroupCount; ++group) {
+        setups[0].playIndex = setups[1].playIndex = group + 1u;
+        setups[0].gainLeft = setups[0].gainRight =
+            0.02f + 0.01f * static_cast<float>(group % 7u);
+        setups[1].gainLeft = setups[1].gainRight =
+            0.03f + 0.008f * static_cast<float>(group % 5u);
+        svms::VoiceHandle handles[2]{};
+        Check(baseStereo.LaunchVoiceGroup(0u, 60u, 100u, setups, 2u, channel,
+                                          handles),
+              "steal-batch stereo fixture group launches");
+    }
+    Check(baseStereo.GetActiveCount() == kPoolCapacity &&
+              baseStereo.freeTop_ == 0u,
+          "steal-batch stereo fixture pool is saturated");
+
+    const auto compareManagers = [&](svms::VoiceManager& seq,
+                                     svms::VoiceManager& batch,
+                                     const char* label) {
+        Check(seq.GetActiveCount() == batch.GetActiveCount() &&
+                  seq.freeTop_ == batch.freeTop_ &&
+                  seq.stealCount_ == batch.stealCount_,
+              label);
+        bool identical = true;
+        for (uint32_t position = 0u;
+             identical && position < seq.GetActiveCount(); ++position) {
+            const svms::VoiceHandle a = seq.activeList_[position];
+            const svms::VoiceHandle b = batch.activeList_[position];
+            identical = a == b &&
+                seq.v.state[a] == batch.v.state[b] &&
+                seq.v.note[a] == batch.v.note[b] &&
+                seq.v.channel[a] == batch.v.channel[b] &&
+                seq.v.playIndex[a] == batch.v.playIndex[b] &&
+                seq.v.renderClass[a] == batch.v.renderClass[b];
+        }
+        Check(identical, label);
+    };
+
+    const auto runBurst = [&](const svms::VoiceManager& basePool,
+                              uint32_t layers, bool releaseTailFirst) {
+        svms::VoiceManager sequential(basePool);
+        svms::VoiceManager batched(basePool);
+        if (releaseTailFirst) {
+            // Force releasing tails into the pool: the releasing-ring fast
+            // path becomes eligible, so the launch-internal gate falls back
+            // to the per-layer pop path — both managers must still agree
+            // byte for byte.
+            for (uint32_t handle = 0u; handle < kPoolCapacity; handle += 5u)
+                sequential.StartRelease(static_cast<svms::VoiceHandle>(handle));
+            for (uint32_t handle = 0u; handle < kPoolCapacity; handle += 5u)
+                batched.StartRelease(static_cast<svms::VoiceHandle>(handle));
+        }
+
+        // Mode A (correctness mode ON): batching disabled (default state).
+        // Mode B (correctness mode OFF): the driver mirrors the toggle, so
+        // each LaunchVoiceGroup batches its layer-victim selection.
+        batched.SetStealBatchingEnabled(true);
+
+        svms::VoiceHandle seqHandles[kBurstNotes][3]{};
+        svms::VoiceHandle batchHandles[kBurstNotes][3]{};
+        for (uint32_t noteIndex = 0u; noteIndex < kBurstNotes; ++noteIndex) {
+            setups[0].playIndex = setups[1].playIndex = 9000u + noteIndex;
+            Check(sequential.LaunchVoiceGroup(
+                      0u, 60u, 100u, setups, layers, channel,
+                      seqHandles[noteIndex]),
+                  "sequential burst launch succeeds");
+            Check(batched.LaunchVoiceGroup(
+                      0u, 60u, 100u, setups, layers, channel,
+                      batchHandles[noteIndex]),
+                  "batched burst launch succeeds");
+        }
+
+        bool identical = true;
+        for (uint32_t noteIndex = 0u;
+             identical && noteIndex < kBurstNotes; ++noteIndex) {
+            for (uint32_t layer = 0u; layer < layers; ++layer)
+                identical = seqHandles[noteIndex][layer] ==
+                            batchHandles[noteIndex][layer];
+        }
+        Check(identical,
+              "burst victims land on identical physical voice slots");
+        compareManagers(sequential, batched,
+                        "post-burst manager states are identical");
+    };
+
+    runBurst(baseSingleton, 1u, false); // mono control (Try path, no batch)
+    runBurst(baseSingleton, 2u, false); // stereo on singletons: batched loop
+    runBurst(baseSingleton, 3u, false); // 3 layers on singletons: batched loop
+    runBurst(baseStereo, 2u, false);    // stereo on stereo groups: reuse path
+    runBurst(baseSingleton, 3u, true);  // releasing tails: gated fallback
+    runBurst(baseStereo, 2u, true);     // releasing tails: gated fallback
+}
+
+// Test hook granted friend access to VoiceManager::PopStealCandidate so the
+// batch wrapper can be compared against genuine single-victim pops.
+namespace svms {
+struct VoiceStealBatchTestAccess {
+    static VoiceHandle PopOne(VoiceManager& vm, uint32_t& position) {
+        return vm.PopStealCandidate(position, false);
+    }
+};
+} // namespace svms
+
+namespace {
+
+// Builds a saturated pool (all slots active) with heterogeneous steal
+// priorities and a mix of sustained and Releasing states, then proves that
+// PopStealCandidates(count, ...) picks exactly the same handles, in exactly
+// the same order, as `count` sequential PopStealCandidate(pos, false) calls
+// on an identical clone of the pool state.
+void RunVoiceStealBatchEquivalenceChecks() {
+    constexpr uint32_t kPoolCapacity = 256u;
+
+    svms::VoiceManager voices;
+    Check(voices.Initialize(kPoolCapacity, 44100u),
+          "steal-batch pool initializes");
+    for (uint32_t index = 0u; index < kPoolCapacity; ++index) {
+        const svms::VoiceHandle voice = voices.AllocateVoice(
+            static_cast<uint8_t>(index & 15u),
+            static_cast<uint8_t>(24u + index % 88u),
+            static_cast<uint8_t>(1u + (index * 37u) % 127u));
+        Check(voice != svms::kInvalidVoice,
+              "steal-batch pool fills without stealing");
+        if (voice == svms::kInvalidVoice) continue;
+        voices.SetVoiceSample(voice, 0u, 4096u, 64u, 4096u - 64u, 1u,
+                              0.01f + static_cast<float>(index % 29u) * 0.01f,
+                              1u);
+        voices.SetVoiceEnvelope(voice, 0.8f, 0.7f, 0u, 0u, 0u, 0u,
+                                0.0f, 1.0f, 0.9995f);
+        voices.SetVoiceGain(voice, 0.0005f, 0.0005f);
+        if (index % 7u == 3u) voices.StartRelease(voice);
+    }
+    Check(voices.GetActiveCount() == kPoolCapacity,
+          "steal-batch pool is fully saturated");
+
+    // Case 1: batch fits comfortably within available candidates.
+    {
+        svms::VoiceManager sequential(voices);
+        svms::VoiceManager batched(voices);
+
+        constexpr uint32_t kBatch = 16u;
+        svms::VoiceHandle seqHandles[kBatch];
+        uint32_t seqPositions[kBatch];
+        uint32_t seqFound = 0u;
+        for (; seqFound < kBatch; ++seqFound) {
+            const svms::VoiceHandle victim =
+                svms::VoiceStealBatchTestAccess::PopOne(
+                    sequential, seqPositions[seqFound]);
+            if (victim == svms::kInvalidVoice) break;
+            seqHandles[seqFound] = victim;
+        }
+
+        svms::VoiceHandle batchHandles[kBatch];
+        uint32_t batchPositions[kBatch];
+        const uint32_t batchFound =
+            batched.PopStealCandidates(kBatch, batchHandles, batchPositions);
+
+        Check(batchFound == seqFound,
+              "batch pop finds the same victim count as sequential pops");
+        bool identical = batchFound == seqFound;
+        for (uint32_t i = 0u; identical && i < batchFound; ++i) {
+            identical = batchHandles[i] == seqHandles[i] &&
+                        batchPositions[i] == seqPositions[i];
+        }
+        Check(identical,
+              "batch victims match sequential pop victims exactly, in order");
+
+        // After the batch, both managers must still agree: one more pop from
+        // each must return the same victim (structures repaired identically).
+        uint32_t seqNextPos = 0u, batchNextPos = 0u;
+        const svms::VoiceHandle seqNext =
+            svms::VoiceStealBatchTestAccess::PopOne(sequential, seqNextPos);
+        const svms::VoiceHandle batchNext =
+            svms::VoiceStealBatchTestAccess::PopOne(batched, batchNextPos);
+        Check(seqNext == batchNext && seqNextPos == batchNextPos,
+              "post-batch structures agree with post-sequential structures");
+    }
+
+    // Case 2: batch larger than the available candidate population must
+    // return fewer victims and still match sequential pops one-for-one.
+    {
+        svms::VoiceManager sequential(voices);
+        svms::VoiceManager batched(voices);
+
+        constexpr uint32_t kOversized = kPoolCapacity * 4u;
+        std::vector<svms::VoiceHandle> seqHandles;
+        std::vector<uint32_t> seqPositions;
+        for (;;) {
+            uint32_t position = 0u;
+            const svms::VoiceHandle victim =
+                svms::VoiceStealBatchTestAccess::PopOne(sequential, position);
+            if (victim == svms::kInvalidVoice) break;
+            seqHandles.push_back(victim);
+            seqPositions.push_back(position);
+        }
+        Check(!seqHandles.empty(),
+              "oversized case has a non-empty sequential baseline");
+
+        std::vector<svms::VoiceHandle> batchHandles(kOversized,
+                                                    svms::kInvalidVoice);
+        std::vector<uint32_t> batchPositions(kOversized, 0u);
+        const uint32_t batchFound = batched.PopStealCandidates(
+            kOversized, batchHandles.data(), batchPositions.data());
+        Check(batchFound == seqHandles.size(),
+              "oversized batch drains exactly the same candidate population");
+        bool identical = batchFound == seqHandles.size();
+        for (uint32_t i = 0u; identical && i < batchFound; ++i) {
+            identical = batchHandles[i] == seqHandles[i] &&
+                        batchPositions[i] == seqPositions[i];
+        }
+        Check(identical,
+              "drained batch victims match sequential victims exactly");
+
+        // Both fully drained: one further pop must fail identically.
+        uint32_t dryPosSeq = 0u, dryPosBatch = 0u;
+        Check(svms::VoiceStealBatchTestAccess::PopOne(sequential, dryPosSeq) ==
+                  svms::kInvalidVoice &&
+                  svms::VoiceStealBatchTestAccess::PopOne(batched,
+                                                          dryPosBatch) ==
+                      svms::kInvalidVoice,
+              "both managers report no candidates after full drain");
+    }
+}
+
+} // namespace
+
 int main() {
     constexpr uint32_t kOldCapacity = 1024u;
     constexpr uint32_t kGrownCapacity = 2048u;
@@ -239,6 +515,9 @@ int main() {
           "re-raised logical cap is published");
     Check(voices.GetMaxVoices() == kGrownCapacity,
           "512 -> 2048 reuses the existing 2048 physical pool");
+
+    RunVoiceStealBatchEquivalenceChecks();
+    RunVoiceStealBatchLaunchEquivalenceChecks();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d live growth regression test(s) failed\n",

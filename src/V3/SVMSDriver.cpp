@@ -5587,6 +5587,25 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
             // plan once, then reuse it for the rest of this run. No event is
             // moved and a state event above remains a hard batch boundary.
             const NoteLaunchPlanCacheEntry* exactFramePlan = nullptr;
+
+            // ── Batched steal-candidate selection (hot-toggleable) ─────────
+            // correctnessMode_ is the established optimized-vs-exact toggle
+            // (plain audio-thread bool, read exactly like the render callback
+            // and telemetry paths do). When it is OFF, each note launch in
+            // this run is allowed to batch its steal-victim selection through
+            // VoiceManager::PopStealCandidates inside LaunchVoiceGroup —
+            // batched per launch transaction, where the victim order is
+            // provably identical to the sequential per-layer pops (no
+            // candidate insertions happen inside one launch; commits land
+            // only after the allocation loop). See the FLAG note in
+            // LaunchVoiceGroup for why the batching is deliberately scoped
+            // per launch instead of per run. With correctness mode ON the
+            // flag below is cleared and every selection takes the unchanged
+            // per-layer PopStealCandidate path — zero behavioral or
+            // performance difference.
+            if (self->voiceManager)
+                self->voiceManager->SetStealBatchingEnabled(
+                    !self->correctnessMode_);
             for (; index < runEnd; ++index) {
                 const RenderEvent& event = events[index];
                 const uint64_t channelFence = event.channel < kChannelCount
