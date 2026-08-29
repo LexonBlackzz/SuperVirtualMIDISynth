@@ -17,6 +17,10 @@
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
 #include <intrin.h>
 #endif
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>
+#define SVMS_VM_HAS_PREFETCH 1
+#endif
 
 #if defined(_MSC_VER)
 #define SVMS_VM_FORCEINLINE __forceinline
@@ -3087,6 +3091,17 @@ inline void VoiceManager::BuildVolatileStealHeap() {
             static_cast<float>(currentFrame_) * (1.0f / 256.0f);
         for (uint32_t position = 0; position < stealVolatileCount_; ++position) {
             const uint32_t handle = stealVolatileList_[position];
+#if defined(SVMS_VM_HAS_PREFETCH)
+            // Linear scan over stealVolatileList_: the next handle's voice
+            // data is knowable now. Prefetch the SoA lines the body reads.
+            if (position + 1u < stealVolatileCount_) {
+                const uint32_t next = stealVolatileList_[position + 1u];
+                _mm_prefetch(reinterpret_cast<const char*>(&v.birthFrame[next]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&v.currentGain[next]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&v.stealOutputGain[next]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&activePosition_[next]), _MM_HINT_T0);
+            }
+#endif
             // Volatile means active decay or releasing, so its effective
             // level is always currentGain * outputGain. Keep the original
             // arithmetic order so ties and floating-point rounding remain
@@ -4103,7 +4118,6 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         UnlinkPlayGroup(handle);
         if (!preserveChannelIndex) UnlinkChannelActive(handle);
         if (!preserveRenderIndex) UnlinkRenderClass(handle);
-        stealCandidateDeferred_[handle] = 1u;
         if (!candidatesReservedInPlace)
             stealCandidateReserved_[handle] = 0u;
         v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
