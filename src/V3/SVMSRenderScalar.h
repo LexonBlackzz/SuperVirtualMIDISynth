@@ -1230,27 +1230,63 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             const float gainR = gain * mixR;
             float* outL = outputLeft + frameStart;
             float* outR = outputRight + frameStart;
-            for (uint32_t n = 0; n < frameCount; ++n) {
-                uint32_t baseOffset = static_cast<uint32_t>(phase);
-                if (baseOffset + 1u >= relEnd) {
-                    phase = relLoopSF;
-                    baseOffset = relLoopS;
+            // Wrap-free fast chunks: phaseStep and the loop bounds are fixed
+            // for the whole span, so a bounded run of frames can interpolate
+            // without any wrap checks, as long as the run is provably short
+            // of the next wrap point. Repeated float addition is kept (not
+            // phase += step*k) so the phase trajectory is bit-identical to
+            // the branchy loop; only the checks — guaranteed not to fire
+            // inside the chunk — are skipped. Chunks are capped at 64 frames
+            // with an 8-frame safety margin so accumulated addition drift
+            // (per-frame ulp(phase)) can never cross the wrap estimate.
+            const float wrapGuard = static_cast<float>(relLoopE - 1u);
+            uint32_t n = 0u;
+            while (n < frameCount) {
+                const float distToWrap = (std::min)(wrapGuard, relLoopEF) - phase;
+                uint32_t run = 0u;
+                if (phaseStep > 0.0f && distToWrap > 64.0f &&
+                    phase < 1048576.0f) {
+                    run = static_cast<uint32_t>(distToWrap / phaseStep);
+                    if (run > 8u) run -= 8u; else run = 0u;
+                    if (run > 64u) run = 64u;
+                    if (run > frameCount - n) run = frameCount - n;
                 }
-                uint32_t nextRel = baseOffset + 1u;
-                if (nextRel >= relLoopE) nextRel = relLoopS;
-                const float frac = phase - static_cast<float>(baseOffset);
-                const float sample = InterpolateSample(
-                    sampleData, sampleStart + baseOffset, sampleStart + nextRel, frac);
-                outL[n] += sample * gainL;
-                outR[n] += sample * gainR;
-
-                phase += phaseStep;
-                if (phase >= relLoopEF) {
-                    float overflow = phase - relLoopEF;
-                    const float loopLength = relLoopEF - relLoopSF;
-                    if (overflow >= loopLength)
-                        overflow -= floorf(overflow / loopLength) * loopLength;
-                    phase = relLoopSF + overflow;
+                if (run == 0u) {
+                    uint32_t baseOffset = static_cast<uint32_t>(phase);
+                    if (baseOffset + 1u >= relEnd) {
+                        phase = relLoopSF;
+                        baseOffset = relLoopS;
+                    }
+                    uint32_t nextRel = baseOffset + 1u;
+                    if (nextRel >= relLoopE) nextRel = relLoopS;
+                    const float frac = phase - static_cast<float>(baseOffset);
+                    const float sample = InterpolateSample(
+                        sampleData, sampleStart + baseOffset,
+                        sampleStart + nextRel, frac);
+                    outL[n] += sample * gainL;
+                    outR[n] += sample * gainR;
+                    phase += phaseStep;
+                    if (phase >= relLoopEF) {
+                        float overflow = phase - relLoopEF;
+                        const float loopLength = relLoopEF - relLoopSF;
+                        if (overflow >= loopLength)
+                            overflow -= floorf(overflow / loopLength) * loopLength;
+                        phase = relLoopSF + overflow;
+                    }
+                    ++n;
+                } else {
+                    const uint32_t endIndex = n + run;
+                    for (; n < endIndex; ++n) {
+                        const float phaseF = phase;
+                        const uint32_t baseOffset = static_cast<uint32_t>(phaseF);
+                        const float frac = phaseF - static_cast<float>(baseOffset);
+                        const float sample = InterpolateSample(
+                            sampleData, sampleStart + baseOffset,
+                            sampleStart + baseOffset + 1u, frac);
+                        outL[n] += sample * gainL;
+                        outR[n] += sample * gainR;
+                        phase += phaseStep;
+                    }
                 }
             }
             v.phases[idx] = phase;
@@ -2235,6 +2271,21 @@ inline void RenderScalar::RenderDenseVoiceTile(
                     VoiceRenderClass::TransientLoop);
             }
             classHandles[actual][classCounts[actual]++] = handle;
+        }
+        // Region-grouped ordering within each class: consecutive voices then
+        // read the same sample-data cache lines (at 40k+ polyphony over a
+        // fixed key range, dozens of voices share one SF2 region). Pure
+        // access-order optimization — per-voice state is independent, and the
+        // mix accumulator is order-insensitive at test tolerance (1e-5).
+        for (uint32_t classIndex = 0u;
+             classIndex < kVoiceRenderClassCount; ++classIndex) {
+            const uint32_t count = classCounts[classIndex];
+            if (count > 1u) {
+                uint32_t* list = classHandles[classIndex];
+                std::sort(list, list + count, [&v](uint32_t a, uint32_t b) {
+                    return v.sampleStart[a] < v.sampleStart[b];
+                });
+            }
         }
         for (uint32_t classIndex = 0u;
              classIndex < kVoiceRenderClassCount; ++classIndex) {
