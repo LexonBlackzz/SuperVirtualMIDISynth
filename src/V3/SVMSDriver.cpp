@@ -2625,6 +2625,30 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         return svms::RLResult::Ok;
     }
 
+    case RT::SetNoteOnCollapse: {
+        // param = spawn interval; 0/1 disables coalescing (default state:
+        // every note-on spawns at its exact QPC timestamp). The gate
+        // rounds the value down to a power of two internally.
+        const uint32_t threshold = cmd.param;
+        if (threshold > 65536u) {
+            strncpy_s(resultText, kText,
+                      "note-on collapse threshold must be 0..65536",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        noteOnCollapse_.SetThreshold(threshold);
+        if (threshold <= 1u) {
+            strncpy_s(resultText, kText,
+                      "note-on coalescing disabled (every note-on spawns)",
+                      _TRUNCATE);
+        } else {
+            snprintf(resultText, kText,
+                     "note-on coalescing enabled, 1 voice per %u hits",
+                     noteOnCollapse_.Threshold());
+        }
+        return svms::RLResult::Ok;
+    }
+
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
             cmd.resultText, svms::kRuntimeLinkCommandTextCapacity);
@@ -3097,6 +3121,10 @@ bool Driver::Initialize() {
         OutputDebugStringA(warning.c_str());
     }
     if (!cfg.Validate()) { LOG("EngineConfig validation failed"); return false; }
+
+    // Threshold comes from config (default 1 = disabled). Applied before
+    // the audio thread starts, so no torn first-block state.
+    noteOnCollapse_.SetThreshold(cfg.noteOnCollapseThreshold);
 
     overflowMode_ = cfg.eventOverflowMode;
     correctnessMode_ = cfg.correctnessMode;

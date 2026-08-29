@@ -161,6 +161,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.reverbHighCutHz = 16000.0f;
     d.phaseRotationMode = 0u;
     d.eventRingCapacity = 393216;
+    d.noteOnCollapseThreshold = 1u;
     d.highPriorityVelocity = 96;
     d.shedStartPercent = 70;
     d.maxEventsPerBlock = 65536;
@@ -270,6 +271,10 @@ void ConfigDocument::FromJson(const json& root) {
         ReadNum(*it, "low_cut_hz", working_.reverbLowCutHz, 0.0f, 2000.0f);
         ReadNum(*it, "high_cut_hz", working_.reverbHighCutHz, 1000.0f, 20000.0f);
     }
+    if (auto it = root.find("event_queue"); it != root.end() && it->is_object()) {
+        ReadNum(*it, "note_on_collapse_threshold",
+                working_.noteOnCollapseThreshold, 1u, 65536u);
+    }
     if (auto it = root.find("phase_rotation"); it != root.end() && it->is_object()) {
         ReadNum(*it, "mode", working_.phaseRotationMode, 0u, 3u);
     }
@@ -358,6 +363,8 @@ nlohmann::json ConfigDocument::ToJson() const {
 
 
     root["phase_rotation"]["mode"] = working_.phaseRotationMode;
+    root["event_queue"]["note_on_collapse_threshold"] =
+        working_.noteOnCollapseThreshold;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
     root["midi"]["input_device"] = WideToUtf8(working_.midiInputDevice);
@@ -545,6 +552,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && AlmostEquals(a.reverbLowCutHz, b.reverbLowCutHz)
         && AlmostEquals(a.reverbHighCutHz, b.reverbHighCutHz)
         && a.phaseRotationMode == b.phaseRotationMode
+        && a.noteOnCollapseThreshold == b.noteOnCollapseThreshold
         && a.eventRingCapacity == b.eventRingCapacity
         && a.highPriorityVelocity == b.highPriorityVelocity
         && a.shedStartPercent == b.shedStartPercent
@@ -646,6 +654,11 @@ ConfigValidation ConfigDocument::Validate() const {
         warn("reverb.high_cut_hz", "must be 1000..20000");
     if (working_.phaseRotationMode > 4u)
         warn("phase_rotation.mode", "must be 0..4");
+    if (working_.noteOnCollapseThreshold < 1u ||
+        working_.noteOnCollapseThreshold > 65536u ||
+        (working_.noteOnCollapseThreshold & (working_.noteOnCollapseThreshold - 1u)) != 0u)
+        warn("event_queue.note_on_collapse_threshold",
+             "must be 1 (off) or a power of two");
     if (working_.eventRingCapacity < 4096)
         warn("events.ring_capacity", "must be >= 4096");
     if (working_.highPriorityVelocity < 1 || working_.highPriorityVelocity > 127)

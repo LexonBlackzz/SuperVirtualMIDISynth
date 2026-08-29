@@ -262,6 +262,9 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"phase_rotation", {
             {"mode", cfg.phaseRotationMode}
         }},
+        {"note_on_collapse", {
+            {"threshold", cfg.noteOnCollapseThreshold}
+        }},
 
         {"midi", {
             {"input_enabled", cfg.midiInputEnabled},
@@ -619,6 +622,10 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "mode", cfg.phaseRotationMode, 0u, 4u))
             AppendWarning(cfg.configWarning, "phase_rotation.mode");
     }
+    if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
+        if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
+            AppendWarning(cfg.configWarning, "note_on_collapse.threshold");
+    }
 
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "enabled", cfg.diagnosticsEnabled))
@@ -857,6 +864,7 @@ bool EngineConfig::Validate() const {
             reverbLowCutHz >= 0.0f && reverbLowCutHz <= 2000.0f &&
             reverbHighCutHz >= 1000.0f && reverbHighCutHz <= 20000.0f &&
             phaseRotationMode <= 4u &&
+            noteOnCollapseThreshold <= 65536u &&
             velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
             velocityFloor >= 0.0f && velocityFloor < 1.0f &&
             eventRingCapacity >= 4096u &&

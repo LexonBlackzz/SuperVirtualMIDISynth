@@ -3589,9 +3589,11 @@ void TestNoteOnCollapseGate() {
     }
     Check(spawns == 1u, "a key inside one window spawns once per threshold repeats");
 
-    // Frame-size independence: the window is pure time. Advancing past
-    // the window spawns immediately, no matter how "blocks" would fall.
-    Check(gate.OnNoteOn(0u, 1000u + kWin + 1u),
+    // Frame-size independence: the window is pure time. The crossing
+    // spawn at hit 128 re-anchored the window at qpc 1128, so expiry is
+    // 1128 + window. A hit past that spawns immediately, no matter how
+    // "blocks" would fall.
+    Check(gate.OnNoteOn(0u, 1128u + kWin + 1u),
           "a hit after the window expires spawns immediately");
 
     // A different key is independent and still spawns on its first hit.

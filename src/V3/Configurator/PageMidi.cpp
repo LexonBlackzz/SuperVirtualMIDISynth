@@ -3,6 +3,7 @@
 #include "Widgets.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
+#include "../SVMSRuntimeLink.h"
 
 #include <mmeapi.h>
 
@@ -254,6 +255,83 @@ void DrawMidiPage(ConfigDocument& doc) {
             doc.MarkDirty();
         }
         RestartCell();
+
+        ImGui::TableNextRow();
+        LabelCell("Note-on coalescing",
+                  "OFF by default: every note-on spawns a voice at its exact "
+                  "timestamp, preserving retrigger timing precision. When "
+                  "enabled, repeated hits of the same key within a fixed "
+                  "20 ms window spawn one voice per N hits (velocity stacking "
+                  "compensates loudness). Use only for extreme black-MIDI "
+                  "workloads that would otherwise starve the audio thread.");
+        ImGui::TableNextColumn();
+        bool collapseOn = w.noteOnCollapseThreshold > 1u;
+        if (ImGui::Checkbox("##noteoncollapse", &collapseOn)) {
+            if (!collapseOn) {
+                w.noteOnCollapseThreshold = 1u;
+            } else if (w.noteOnCollapseThreshold <= 1u) {
+                w.noteOnCollapseThreshold = 32u;
+            }
+            doc.MarkDirty();
+            if (lc.connected && lc.client) {
+                char collapseResult[svms::kRuntimeLinkResultTextCapacity]{};
+                lc.client->SendCommand(
+                    svms::RLCommandType::SetNoteOnCollapse, 0u,
+                    w.noteOnCollapseThreshold,
+                    svms::RuntimeLiveStateV2{}, 100u, collapseResult);
+            }
+        }
+        ImGui::SameLine();
+        if (collapseOn) {
+            static const uint32_t kThresholds[] = {
+                2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u,
+                1024u, 2048u, 4096u, 8192u, 16384u, 32768u, 65536u
+            };
+            static const char* kThresholdLabels[] = {
+                "1 voice per 2 hits", "1 voice per 4 hits",
+                "1 voice per 8 hits", "1 voice per 16 hits",
+                "1 voice per 32 hits", "1 voice per 64 hits",
+                "1 voice per 128 hits", "1 voice per 256 hits",
+                "1 voice per 512 hits", "1 voice per 1024 hits",
+                "1 voice per 2048 hits", "1 voice per 4096 hits",
+                "1 voice per 8192 hits", "1 voice per 16384 hits",
+                "1 voice per 32768 hits", "1 voice per 65536 hits"
+            };
+            int tIdx = 4; // default 32
+            for (int i = 0; i < 16; ++i) {
+                if (w.noteOnCollapseThreshold == kThresholds[i]) {
+                    tIdx = i;
+                    break;
+                }
+            }
+            ImGui::SetNextItemWidth((std::min)(220.0f,
+                ImGui::GetContentRegionAvail().x));
+            if (ImGui::BeginCombo("##noteoncollapsesethreshold",
+                                  kThresholdLabels[tIdx])) {
+                for (int i = 0; i < 16; ++i) {
+                    const bool selected = i == tIdx;
+                    if (ImGui::Selectable(kThresholdLabels[i], selected)) {
+                        w.noteOnCollapseThreshold = kThresholds[i];
+                        doc.MarkDirty();
+                        if (lc.connected && lc.client) {
+                            char collapseResult[
+                                svms::kRuntimeLinkResultTextCapacity]{};
+                            lc.client->SendCommand(
+                                svms::RLCommandType::SetNoteOnCollapse, 0u,
+                                kThresholds[i],
+                                svms::RuntimeLiveStateV2{}, 100u,
+                                collapseResult);
+                        }
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        } else {
+            ImGui::TextUnformatted("Disabled (exact retrigger timing)");
+        }
+        ImGui::TableNextColumn();
+        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
 
         ImGui::EndTable();
     }

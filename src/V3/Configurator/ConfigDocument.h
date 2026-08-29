@@ -62,6 +62,9 @@ struct ConfigValues {
     uint32_t phaseRotationMode = 0u;
 
     uint32_t eventRingCapacity = 393216;
+    // Same-key note-on coalescing spawn interval. 1 = disabled (default):
+    // every note-on spawns. Values >= 2 are rounded down to a power of two.
+    uint32_t noteOnCollapseThreshold = 1u;
     uint32_t highPriorityVelocity = 96;
     uint32_t shedStartPercent = 70;
     uint32_t maxEventsPerBlock = 65536;

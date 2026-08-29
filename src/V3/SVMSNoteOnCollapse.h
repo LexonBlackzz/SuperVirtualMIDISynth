@@ -92,7 +92,9 @@ public:
         const uint32_t idx = keyIndex & (kKeyCount - 1u);
         const uint64_t anchor = lastSpawnQpc_[idx].load(
             std::memory_order_relaxed);
-        if (qpc - anchor >= w) {
+        // anchor == 0 means "no window yet" (fresh or reset key): the
+        // first strike must always spawn immediately.
+        if (anchor == 0u || qpc - anchor >= w) {
             // New window: spawn immediately, re-anchor at this hit.
             lastSpawnQpc_[idx].store(qpc, std::memory_order_relaxed);
             windowHits_[idx].store(0u, std::memory_order_relaxed);

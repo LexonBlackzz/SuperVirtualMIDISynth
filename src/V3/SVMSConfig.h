@@ -79,6 +79,11 @@ struct EngineConfig {
     // black-MIDI "hum" without changing spectral magnitude, loudness, or
     // the sample-exact onset timing.
     uint32_t phaseRotationMode;
+    // Same-key note-on coalescing spawn interval. 1 (default) = disabled:
+    // every note-on spawns at its exact QPC timestamp. Higher values
+    // (power-of-two rounded) collapse same-key repeats inside a fixed
+    // 20 ms window into one voice per N hits.
+    uint32_t noteOnCollapseThreshold;
     bool enableChorus;
     bool enableFilter;
     bool enableModulators;

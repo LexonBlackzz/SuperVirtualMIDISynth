@@ -255,6 +255,7 @@ enum class RLCommandType : uint32_t {
     QuerySoundFontLoad   = 0x00000106,
     RequestRestart       = 0x00000110,
     SetPhaseRotation     = 0x00000111,
+    SetNoteOnCollapse    = 0x00000112,
 
 
     Invalid              = 0xFFFFFFFF,
