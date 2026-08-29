@@ -573,7 +573,7 @@ int main(int argc, char** argv) {
     std::vector<int16_t> samples(sampleFrames + 8u, 0);
     for (uint32_t i = 0; i < sampleFrames; ++i) {
         samples[i] = static_cast<int16_t>((0.45f * std::sin(static_cast<float>(i) * 0.017f) +
-                      0.2f * std::sin(static_cast<float>(i) * 0.071f)) * 2.0f);
+                      0.2f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
     }
 
     svms::RuntimeConfigSnapshot cfg{};

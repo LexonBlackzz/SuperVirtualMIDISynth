@@ -1,4 +1,4 @@
-﻿// V3 GPU synthesis stage. The host retains all scheduling and event-timing
+// V3 GPU synthesis stage. The host retains all scheduling and event-timing
 // semantics; the GPU is a pure per-voice sample-synthesis engine.
 
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
@@ -294,7 +294,7 @@ bool GpuSynth::Initialize(const int16_t* sampleData, uint32_t sampleDataFrames,
     // host store once at initialization.
     sampleData_.resize(sampleDataFrames);
     for (uint32_t i = 0; i < sampleDataFrames; ++i)
-        sampleData_[i] = static_cast<float>(sampleData[i]);
+        sampleData_[i] = static_cast<float>(sampleData[i]) / 32768.0f;
 
     if (!device_.Create(error)) return false;
     if (!BuildShaders(error)) return false;

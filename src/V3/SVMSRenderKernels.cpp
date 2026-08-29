@@ -51,9 +51,9 @@ uint32_t RenderSustainedLoopSpan(
                 for (; n < runEnd; ++n) {
                     const uint32_t baseOffset = static_cast<uint32_t>(phase);
                     const float fraction = phase - static_cast<float>(baseOffset);
-                    const float first = static_cast<float>(region[baseOffset]);
+                    const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
                     float sample =
-                        first + (static_cast<float>(region[baseOffset + 1u]) - first) * fraction;
+                        first + (static_cast<float>(region[baseOffset + 1u]) * (1.0f / 32768.0f) - first) * fraction;
                     if (rot) sample = RotateVoiceSample(rot[idx], sample);
                     outL[n] += sample * gainL;
                     outR[n] += sample * gainR;
@@ -65,8 +65,8 @@ uint32_t RenderSustainedLoopSpan(
             uint32_t baseOffset = static_cast<uint32_t>(phase);
             if (baseOffset >= relLoopE) baseOffset = relLoopE - 1u;
             const float fraction = phase - static_cast<float>(baseOffset);
-            const float first = static_cast<float>(region[baseOffset]);
-            float sample = first + (static_cast<float>(region[relLoopS]) - first) * fraction;
+            const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
+            float sample = first + (static_cast<float>(region[relLoopS]) * (1.0f / 32768.0f) - first) * fraction;
             if (rot) sample = RotateVoiceSample(rot[idx], sample);
             outL[n] += sample * gainL;
             outR[n] += sample * gainR;
@@ -83,8 +83,8 @@ uint32_t RenderSustainedLoopSpan(
             uint32_t nextOffset = baseOffset + 1u;
             if (nextOffset >= relLoopE) nextOffset = relLoopS;
             const float fraction = phase - static_cast<float>(baseOffset);
-            const float first = static_cast<float>(region[baseOffset]);
-            float sample = first + (static_cast<float>(region[nextOffset]) - first) * fraction;
+            const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
+            float sample = first + (static_cast<float>(region[nextOffset]) * (1.0f / 32768.0f) - first) * fraction;
             if (rot) sample = RotateVoiceSample(rot[idx], sample);
             outL[n] += sample * gainL;
             outR[n] += sample * gainR;
@@ -128,8 +128,8 @@ uint32_t RenderSustainedOneShotSpan(
             break;
         }
         const float fraction = phase - static_cast<float>(baseOffset);
-        const float first = static_cast<float>(region[baseOffset]);
-        float sample = first + (static_cast<float>(region[baseOffset + 1u]) - first) * fraction;
+        const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
+        float sample = first + (static_cast<float>(region[baseOffset + 1u]) * (1.0f / 32768.0f) - first) * fraction;
         if (rot) sample = RotateVoiceSample(rot[idx], sample);
         outL[n] += sample * gainL;
         outR[n] += sample * gainR;
@@ -166,8 +166,8 @@ void RenderSustainedLoopShortBatchFixed(
             uint32_t nextOffset = baseOffset + 1u;
             if (nextOffset >= loopEndOffset) nextOffset = loopStartOffset;
             const float fraction = phase - static_cast<float>(baseOffset);
-            const float first = static_cast<float>(region[baseOffset]);
-            float sample = first + (static_cast<float>(region[nextOffset]) - first) * fraction;
+            const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
+            float sample = first + (static_cast<float>(region[nextOffset]) * (1.0f / 32768.0f) - first) * fraction;
             if (rot) sample = RotateVoiceSample(rot[idx], sample);
             sumsLeft[frame] += sample * gainLeft;
             sumsRight[frame] += sample * gainRight;
@@ -275,9 +275,9 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
                 uint32_t nextRel = baseOffset + 1u;
                 if (nextRel >= relLoopE) nextRel = relLoopS;
                 const float fraction = phase - static_cast<float>(baseOffset);
-                const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]);
+                const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]) * (1.0f / 32768.0f);
                 float sample = first +
-                    (static_cast<float>(c.sampleData[sampleStart + nextRel]) - first) * fraction;
+                    (static_cast<float>(c.sampleData[sampleStart + nextRel]) * (1.0f / 32768.0f) - first) * fraction;
                 if (rot) sample = RotateVoiceSample(rot[idx], sample);
                 gain += attackStep;
                 if (gain > targetGain) gain = targetGain;
@@ -304,9 +304,9 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
                 uint32_t nextRel = baseOffset + 1u;
                 if (nextRel >= relLoopE) nextRel = relLoopS;
                 const float fraction = phase - static_cast<float>(baseOffset);
-                const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]);
+                const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]) * (1.0f / 32768.0f);
                 float sample = first +
-                    (static_cast<float>(c.sampleData[sampleStart + nextRel]) - first) * fraction;
+                    (static_cast<float>(c.sampleData[sampleStart + nextRel]) * (1.0f / 32768.0f) - first) * fraction;
                 if (rot) sample = RotateVoiceSample(rot[idx], sample);
                 gain *= decaySlope;
                 if (gain < sustainLevel) gain = sustainLevel;
@@ -336,9 +336,9 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
             uint32_t nextRel = baseOffset + 1u;
             if (nextRel >= relLoopE) nextRel = relLoopS;
             const float fraction = phase - static_cast<float>(baseOffset);
-            const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]);
+            const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]) * (1.0f / 32768.0f);
             float sample = first +
-                (static_cast<float>(c.sampleData[sampleStart + nextRel]) - first) * fraction;
+                (static_cast<float>(c.sampleData[sampleStart + nextRel]) * (1.0f / 32768.0f) - first) * fraction;
             if (rot) sample = RotateVoiceSample(rot[idx], sample);
 
             if (stage == 1u) {

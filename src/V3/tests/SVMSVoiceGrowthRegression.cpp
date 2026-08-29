@@ -326,7 +326,7 @@ int main() {
     for (uint32_t i = 0u; i < kSampleFrames; ++i)
         samples[i] = static_cast<int16_t>(
             (0.25f + 0.20f * std::sin(static_cast<float>(i) * 0.031f)) *
-            4.0f);
+            32767.0f);
 
     svms::VoiceManager voices;
     Check(voices.Initialize(kOldCapacity, 44100u),

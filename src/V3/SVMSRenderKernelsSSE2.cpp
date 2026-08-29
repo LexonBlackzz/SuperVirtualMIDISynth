@@ -76,8 +76,8 @@ bool RenderSustainedLoopSSE2(const RenderSpanContext& context,
                 uint32_t next = base + 1u;
                 if (next >= v.relLoopE[h]) next = v.relLoopS[h];
                 const uint32_t start = v.sampleStart[h];
-                first[lane] = static_cast<float>(context.sampleData[start + base]);
-                second[lane] = static_cast<float>(context.sampleData[start + next]);
+                first[lane] = static_cast<float>(context.sampleData[start + base]) * (1.0f / 32768.0f);
+                second[lane] = static_cast<float>(context.sampleData[start + next]) * (1.0f / 32768.0f);
                 fraction[lane] = phase[lane] - static_cast<float>(base);
             }
             const __m128 a = _mm_load_ps(first);

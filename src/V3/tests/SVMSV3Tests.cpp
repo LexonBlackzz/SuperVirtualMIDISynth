@@ -510,7 +510,7 @@ void TestExactReleaseDurationAcrossBlocks() {
     channels.RebuildCache(cfg, 1000.0f);
     int16_t samples[18]{};
     std::fill(std::begin(samples), std::begin(samples) + 16,
-              static_cast<int16_t>(1));
+              static_cast<int16_t>(32767));
     svms::RenderScalar renderer;
     ReleaseDispatchContext context{voices.get(), loud, quiet};
     renderer.SetEventDispatcher(DispatchReleaseForTest, &context);
@@ -1056,7 +1056,7 @@ void TestPriorityAwareStealingAndFadeTail() {
 
         int16_t samples[72]{};
         std::fill(std::begin(samples), std::begin(samples) + 64,
-                  static_cast<int16_t>(1));
+                  static_cast<int16_t>(32767));
         std::vector<float> left(fadeFrames, 0.0f);
         std::vector<float> right(fadeFrames, 0.0f);
         svms::ChannelCache channels;
@@ -1135,7 +1135,7 @@ void TestPriorityAwareStealingAndFadeTail() {
 
         int16_t tailSamples[264]{};
         std::fill(std::begin(tailSamples), std::begin(tailSamples) + 256,
-                  static_cast<int16_t>(1));
+                  static_cast<int16_t>(8192));
         float tailLeft[8]{};
         float tailRight[8]{};
         svms::ChannelCache tailChannels;
@@ -2724,7 +2724,7 @@ void TestExpressionAgeRetirementAndLoopWrap() {
           "voice age is derived from absolute birth frame");
 
     int16_t samples[18]{};
-    for (uint32_t i = 0; i < 16; ++i) samples[i] = 1;
+    for (uint32_t i = 0; i < 16; ++i) samples[i] = 8192;
     voices->SetVoiceSample(first, 0, 10, 2, 6, 1, 12.25f, 1);
     voices->v.phases[first] = 3.5f;
     voices->SetVoiceEnvelope(first, 1.0f, 1.0f, 0, 0, 0, 0,
@@ -2831,7 +2831,7 @@ void TestSpanRendererDifferential() {
     std::vector<int16_t> samples(4096 + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
         samples[i] = static_cast<int16_t>((0.4f * std::sin(static_cast<float>(i) * 0.031f) +
-                      0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 2.0f);
+                      0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 32767.0f);
 
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
@@ -2954,7 +2954,7 @@ void TestRenderBackendSelectionAndDenseEquivalence() {
     const uint32_t sampleCount = 2048u;
     std::vector<int16_t> samples(2048 + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
-        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.021f) * 2.0f);
+        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.021f) * 32767.0f);
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
     cfg.panLaw = svms::PanLaw::ConstantPower;
@@ -3010,7 +3010,7 @@ void TestTransientClassKernelDifferential() {
     const uint32_t sampleCount = 4096u;
     std::vector<int16_t> samples(4096 + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
-        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.017f) * 2.0f);
+        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.017f) * 32767.0f);
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
     cfg.panLaw = svms::PanLaw::ConstantPower;
@@ -3108,7 +3108,7 @@ void TestTransientAVX2LongSpanDifferential() {
     const uint32_t sampleCount = 4096u;
     std::vector<int16_t> samples(4096 + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
-        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.017f) * 2.0f);
+        samples[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) * 0.017f) * 32767.0f);
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
     cfg.panLaw = svms::PanLaw::ConstantPower;
@@ -3209,7 +3209,7 @@ void TestRenderCallbackPurity() {
     constexpr uint32_t frames = 512;
     constexpr uint32_t voiceCount = 256;
     const uint32_t sampleCount = 4096u;
-    std::vector<int16_t> samples(4096 + 8u, 1);
+    std::vector<int16_t> samples(4096 + 8u, 8192);
     std::vector<float> left(frames, 0.0f), right(frames, 0.0f);
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
@@ -3246,7 +3246,7 @@ void TestParallelSustainedRenderDifferential() {
     const uint32_t sampleCount = 8192u;
     std::vector<int16_t> samples(8192u + 8u, 0);
     for (uint32_t index = 0u; index < samples.size(); ++index)
-        samples[index] = static_cast<int16_t>(0.4f * std::sin(static_cast<float>(index) * 0.037f) * 2.0f);
+        samples[index] = static_cast<int16_t>(0.4f * std::sin(static_cast<float>(index) * 0.037f) * 32767.0f);
 
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
@@ -3352,7 +3352,7 @@ void TestDensePlannerOracleDifferential() {
     const uint32_t sampleCount = 4096u;
     std::vector<int16_t> samples(4096u + 8u, 0);
     for (uint32_t index = 0u; index < samples.size(); ++index)
-        samples[index] = static_cast<int16_t>(0.35f * std::sin(static_cast<float>(index) * 0.071f) * 2.0f);
+        samples[index] = static_cast<int16_t>(0.35f * std::sin(static_cast<float>(index) * 0.071f) * 32767.0f);
 
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
@@ -3598,7 +3598,7 @@ void TestVibratoModulationAudible() {
     int16_t sampleBuf[kSampleFrames + 8u]{};
     for (uint32_t i = 0; i < kSampleFrames; ++i) {
         sampleBuf[i] = static_cast<int16_t>(std::sin(static_cast<float>(i) *
-            (6.283185307179586f / 64.0f)) * 0.5f * 2.0f);
+            (6.283185307179586f / 64.0f)) * 0.5f * 32767.0f);
     }
 
     svms::RuntimeConfigSnapshot cfg{};

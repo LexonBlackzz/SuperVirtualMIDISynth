@@ -18,8 +18,8 @@ namespace svms {
 // ── Linear interpolation between two sample frames ──────────────────────
 inline float InterpolateSample(const int16_t* data, uint32_t baseIndex,
                                 uint32_t nextIndex, float frac) {
-    const float s0 = static_cast<float>(data[baseIndex]);
-    const float s1 = static_cast<float>(data[nextIndex]);
+    const float s0 = static_cast<float>(data[baseIndex]) * (1.0f / 32768.0f);
+    const float s1 = static_cast<float>(data[nextIndex]) * (1.0f / 32768.0f);
     return s0 + (s1 - s0) * frac;
 }
 

@@ -38,9 +38,13 @@ inline __m256 GatherSampleAVX2(const int16_t* data, __m256i elem) {
     const __m256i w1 = _mm256_i32gather_epi32(
         reinterpret_cast<const int*>(data), _mm256_add_epi32(word, one), 4);
     // Little-endian words: low half = element 2k, high half = 2k + 1.
+    // 1/32768 is a power of two, so the scale is exact and bit-identical to
+    // the previous float store's int16/32768 values.
+    const __m256 int16Scale = _mm256_set1_ps(1.0f / 32768.0f);
     const __m256i low = _mm256_srai_epi32(_mm256_slli_epi32(w0, 16), 16);
     const __m256i high = _mm256_srai_epi32(w0, 16);
-    return _mm256_cvtepi32_ps(_mm256_blendv_epi8(low, high, oddMask));
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(
+        _mm256_blendv_epi8(low, high, oddMask)), int16Scale);
 }
 
 // Pair gather for the time-lane kernels where the right neighbour is
@@ -59,8 +63,11 @@ inline void GatherSamplePairAVX2(const int16_t* data, __m256i elem,
     const __m256i low = _mm256_srai_epi32(_mm256_slli_epi32(w0, 16), 16);
     const __m256i high = _mm256_srai_epi32(w0, 16);
     const __m256i lowNext = _mm256_srai_epi32(_mm256_slli_epi32(w1, 16), 16);
-    first = _mm256_cvtepi32_ps(_mm256_blendv_epi8(low, high, oddMask));
-    second = _mm256_cvtepi32_ps(_mm256_blendv_epi8(high, lowNext, oddMask));
+    const __m256 int16Scale = _mm256_set1_ps(1.0f / 32768.0f);
+    first = _mm256_mul_ps(_mm256_cvtepi32_ps(
+        _mm256_blendv_epi8(low, high, oddMask)), int16Scale);
+    second = _mm256_mul_ps(_mm256_cvtepi32_ps(
+        _mm256_blendv_epi8(high, lowNext, oddMask)), int16Scale);
 }
 
 void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
@@ -96,8 +103,8 @@ void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
             remaining = 0u;
             break;
         }
-        const float first = static_cast<float>(c.sampleData[firstIndex]);
-        const float sample = first + (static_cast<float>(c.sampleData[nextIndex]) - first) *
+        const float first = static_cast<float>(c.sampleData[firstIndex]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(c.sampleData[nextIndex]) * (1.0f / 32768.0f) - first) *
             (phase - static_cast<float>(base));
         const float fade = total > 1u
             ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
@@ -315,8 +322,8 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
         uint32_t next = base + 1u;
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phase - static_cast<float>(base);
-        const float first = static_cast<float>(region[base]);
-        const float sample = first + (static_cast<float>(region[next]) - first) * fraction;
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
         phase += step;
@@ -356,8 +363,8 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
         uint32_t next = base + 1u;
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phase - static_cast<float>(base);
-        const float first = static_cast<float>(region[base]);
-        const float sample = first + (static_cast<float>(region[next]) - first) * fraction;
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         bool finished = remaining == 0u;
         if (!finished) {
             gain *= decay;
@@ -461,8 +468,8 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         uint32_t next = base + 1u;
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phase - static_cast<float>(base);
-        const float first = static_cast<float>(region[base]);
-        const float sample = first + (static_cast<float>(region[next]) - first) * fraction;
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         bool finished = remaining == 0u;
         if (!finished) {
             gain *= decay;
@@ -748,8 +755,8 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         uint32_t next = base + 1u;
         if (next >= loopE) next = loopS;
         const float fraction = phase - static_cast<float>(base);
-        const float first = static_cast<float>(region[base]);
-        const float sample = first + (static_cast<float>(region[next]) - first) * fraction;
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         if (stage == 1u) {
             if (attackRemaining > 0u) {
                 gain += attackStep;

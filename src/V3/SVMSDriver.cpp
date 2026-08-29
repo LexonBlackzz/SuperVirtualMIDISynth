@@ -6200,7 +6200,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     sf2Telemetry_.lastMixGainR = voiceManager->v.mixGainR[lastVoice];
     sf2Telemetry_.lastDelaySamples = lastSetup.delaySamples;
     sf2Telemetry_.lastAttackSamples = lastSetup.attackSamples;
-    sf2Telemetry_.lastFloatSample = static_cast<float>(sampleDataStore[lastSetup.sampleStart]);
+    sf2Telemetry_.lastFloatSample = static_cast<float>(sampleDataStore[lastSetup.sampleStart]) / 32768.0f;
     sf2Telemetry_.lastPhaseStep = lastSetup.phaseStep;
     sf2Telemetry_.lastPhase = voiceManager->v.phases[lastVoice];
     sf2Telemetry_.lastRelativeEnd = voiceManager->v.relEnd[lastVoice];
