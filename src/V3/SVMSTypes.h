@@ -72,10 +72,10 @@ inline bool SequenceAtOrBefore(uint32_t sequence, uint32_t fence) noexcept {
 // Correctness mode currently renders the complete configured pool at full
 // quality. The dormant tier constants are retained for a future explicitly
 // selectable overload policy; none are reached at the current hard ceiling.
-constexpr uint32_t kDecimationTier1 = kMaxPolyphony + 1; // full quality through configured ceiling
-constexpr uint32_t kDecimationTier2 = 50000;   // step 2
-constexpr uint32_t kDecimationTier3 = 150000;  // step 4
-constexpr uint32_t kDecimationTier4 = 500000;  // step 8
+constexpr uint32_t kDecimationTier1 = 2049;    // step 1 through 2048 voices
+constexpr uint32_t kDecimationTier2 = 8193;    // step 2 through 8192
+constexpr uint32_t kDecimationTier3 = 32769;   // step 4 through 32768
+constexpr uint32_t kDecimationTier4 = 131073;  // step 8 through 131072
                                                 // beyond: step 16
 
 inline uint32_t ComputeDecimationStep(uint32_t activeVoiceCount) {

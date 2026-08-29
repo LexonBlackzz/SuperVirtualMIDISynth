@@ -12,6 +12,7 @@
 #include "SVMSConfig.h"
 #include "SVMSFrameClock.h"
 #include "SVMSPostFilter.h"
+#include "SVMSNoteOnCollapse.h"
 
 #include <windows.h>
 
@@ -1870,8 +1871,19 @@ void TestConfiguredVelocityMapping() {
     Check(NearlyEqual(panLeft, ::sqrtf(2.0f)) && NearlyEqual(panRight, 0.0f),
           "hard-left SF2 pan preserves power and stereo placement");
 
-    Check(svms::ComputeDecimationStep(svms::kMaxPolyphony) == 1,
-          "the complete configured voice pool remains full quality");
+    Check(svms::ComputeDecimationStep(2048u) == 1,
+          "pools up to 2048 voices render at full quality");
+    Check(svms::ComputeDecimationStep(2049u) == 2 &&
+              svms::ComputeDecimationStep(8192u) == 2,
+          "2049-8192 active voices decimate every other voice");
+    Check(svms::ComputeDecimationStep(8193u) == 4 &&
+              svms::ComputeDecimationStep(32768u) == 4,
+          "8193-32768 active voices decimate to every fourth voice");
+    Check(svms::ComputeDecimationStep(32769u) == 8 &&
+              svms::ComputeDecimationStep(131072u) == 8,
+          "32769-131072 active voices decimate to every eighth voice");
+    Check(svms::ComputeDecimationStep(131073u) == 16,
+          "beyond 131072 active voices decimate to every sixteenth voice");
 }
 
 void TestEventRingWrapAndCapacity() {
@@ -3535,6 +3547,92 @@ void TestVibratoModulationAudible() {
           "full-scale CC1 produces audible vibrato deviation");
 }
 
+void TestNoteOnCollapseGate() {
+    svms::NoteOnCollapseGate gate;
+    gate.SetThreshold(128u);
+    const uint32_t threshold = gate.Threshold();
+    Check(threshold == 128u, "threshold setter accepts a power of two");
+
+    // Non-power-of-two requests round down; tiny requests disable.
+    gate.SetThreshold(100u);
+    Check(gate.Threshold() == 64u, "threshold rounds down to a power of two");
+    gate.SetThreshold(1u);
+    Check(gate.Threshold() == 1u && gate.OnNoteOn(7u) && gate.OnNoteOn(7u),
+          "threshold 1 disables coalescing");
+    gate.SetThreshold(threshold);
+
+    // First strike on a key always spawns (latency must be preserved).
+    Check(gate.OnNoteOn(0), "first note-on on a key spawns a voice");
+
+    // 200 further hits on the sustained key: exactly one more spawn at the
+    // threshold crossing (hit 128); everything else collapses.
+    uint32_t spawns = 0;
+    for (uint32_t i = 0; i < 200u; ++i) {
+        if (gate.OnNoteOn(0)) ++spawns;
+    }
+    Check(spawns == 1u, "a sustained key spawns exactly once per threshold repeats");
+
+    // A different key is independent and still spawns on its first hit.
+    Check(gate.OnNoteOn(1), "a different key spawns on its first hit");
+
+    // Note-off resets the key: the next hit spawns immediately again.
+    gate.ResetKey(0);
+    Check(gate.OnNoteOn(0), "note-off reset makes the next hit spawn");
+
+    // Channel reset clears the whole channel row.
+    gate.OnNoteOn(2 * 128u + 60u);
+    gate.OnNoteOn(2 * 128u + 61u);
+    gate.ResetChannel(2u);
+    Check(gate.OnNoteOn(2 * 128u + 60u) &&
+              gate.OnNoteOn(2 * 128u + 61u),
+          "channel reset makes every key on the channel spawn");
+
+    // Reset-all clears even the last key index.
+    gate.OnNoteOn(svms::NoteOnCollapseGate::kKeyCount - 1u);
+    gate.ResetAll();
+    Check(gate.OnNoteOn(svms::NoteOnCollapseGate::kKeyCount - 1u),
+          "reset-all makes any key spawn");
+
+    // Velocity stacking: hits between spawns accumulate per key and are
+    // reported to the caller so density can become loudness.
+    gate.ResetAll();
+    gate.SetThreshold(4u);
+    uint32_t stack = 0;
+    Check(gate.OnNoteOn(9u, stack) && stack == 1u,
+          "first hit spawns with stack 1");
+    Check(!gate.OnNoteOn(9u, stack) && stack == 1u,
+          "second hit collapses with running stack 1");
+    Check(!gate.OnNoteOn(9u, stack) && stack == 2u,
+          "third hit collapses with running stack 2");
+    Check(!gate.OnNoteOn(9u, stack) && stack == 3u,
+          "fourth hit collapses with running stack 3");
+    Check(gate.OnNoteOn(9u, stack) && stack == 4u,
+          "threshold crossing spawns with the accumulated stack");
+    Check(!gate.OnNoteOn(9u, stack) && stack == 1u,
+          "a new cycle starts right after a spawn");
+    // A different key's stack is untouched by the hammering above.
+    Check(gate.OnNoteOn(10u, stack) && stack == 1u,
+          "stacks are tracked per key");
+    // Reset clears the stack too.
+    gate.OnNoteOn(11u);
+    gate.OnNoteOn(11u, stack);
+    gate.ResetKey(11u);
+    Check(gate.OnNoteOn(11u, stack) && stack == 1u,
+          "note-off reset clears the accumulated stack");
+
+    // Sustained hammering over many thresholds keeps the 1-in-N ratio exact.
+    gate.ResetAll();
+    gate.SetThreshold(128u);
+    uint64_t totalSpawns = 0;
+    const uint32_t kHammerHits = threshold * 10u + 5u;
+    for (uint32_t i = 0; i < kHammerHits; ++i) {
+        if (gate.OnNoteOn(42u)) ++totalSpawns;
+    }
+    // hit 0 spawns, plus every threshold crossing in hits 1..N-1.
+    Check(totalSpawns == 1u + (kHammerHits - 1u) / threshold,
+          "spawn ratio over sustained hammering is 1 per threshold");
+}
+
 } // namespace
 
 int main() {
@@ -3578,6 +3676,7 @@ int main() {
     TestRenderCallbackPurity();
     TestCallbackSourcePurity();
     TestVibratoModulationAudible();
+    TestNoteOnCollapseGate();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);
