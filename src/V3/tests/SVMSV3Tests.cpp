@@ -3549,48 +3549,70 @@ void TestVibratoModulationAudible() {
 
 void TestNoteOnCollapseGate() {
     svms::NoteOnCollapseGate gate;
-    gate.SetThreshold(128u);
-    const uint32_t threshold = gate.Threshold();
-    Check(threshold == 128u, "threshold setter accepts a power of two");
+    // DEFAULT STATE: coalescing is OFF. Every hit spawns — retrigger
+    // timing/buzz precision is untouched unless explicitly enabled.
+    Check(!gate.Enabled(), "coalescing defaults to off");
+    {
+        uint32_t stack = 0;
+        bool allSpawn = true;
+        for (uint32_t i = 0; i < 1000u; ++i) {
+            allSpawn = allSpawn && gate.OnNoteOn(7u, 1000u + i, stack);
+        }
+        Check(allSpawn, "default gate spawns every note-on");
+    }
 
-    // Non-power-of-two requests round down; tiny requests disable.
+    // Threshold setter: power-of-two accept, round-down, disable.
+    gate.SetThreshold(128u);
+    Check(gate.Threshold() == 128u,
+          "threshold setter accepts a power of two");
     gate.SetThreshold(100u);
     Check(gate.Threshold() == 64u, "threshold rounds down to a power of two");
     gate.SetThreshold(1u);
-    Check(gate.Threshold() == 1u && gate.OnNoteOn(7u) && gate.OnNoteOn(7u),
-          "threshold 1 disables coalescing");
-    gate.SetThreshold(threshold);
+    Check(gate.Threshold() == 1u, "threshold 1 disables coalescing");
+
+    // Enable with a fixed QPC window (10 ms at 1 tick = 1 microsecond in
+    // this test's synthetic clock, i.e. windowTicks = 10000).
+    gate.SetThreshold(128u);
+    const uint64_t kWin = 10000u;
+    gate.SetWindowTicks(kWin);
+    Check(gate.Enabled(), "gate enables with threshold and window set");
 
     // First strike on a key always spawns (latency must be preserved).
-    Check(gate.OnNoteOn(0), "first note-on on a key spawns a voice");
+    Check(gate.OnNoteOn(0u, 1000u), "first note-on on a key spawns a voice");
 
-    // 200 further hits on the sustained key: exactly one more spawn at the
+    // Hits inside the same window: exactly one more spawn at the
     // threshold crossing (hit 128); everything else collapses.
     uint32_t spawns = 0;
-    for (uint32_t i = 0; i < 200u; ++i) {
-        if (gate.OnNoteOn(0)) ++spawns;
+    for (uint32_t i = 1u; i < 200u; ++i) {
+        // Timestamps inside the first window (anchor 1000, window 10000).
+        if (gate.OnNoteOn(0u, 1000u + i)) ++spawns;
     }
-    Check(spawns == 1u, "a sustained key spawns exactly once per threshold repeats");
+    Check(spawns == 1u, "a key inside one window spawns once per threshold repeats");
+
+    // Frame-size independence: the window is pure time. Advancing past
+    // the window spawns immediately, no matter how "blocks" would fall.
+    Check(gate.OnNoteOn(0u, 1000u + kWin + 1u),
+          "a hit after the window expires spawns immediately");
 
     // A different key is independent and still spawns on its first hit.
-    Check(gate.OnNoteOn(1), "a different key spawns on its first hit");
+    Check(gate.OnNoteOn(1u, 11000u), "a different key spawns on its first hit");
 
-    // Note-off resets the key: the next hit spawns immediately again.
-    gate.ResetKey(0);
-    Check(gate.OnNoteOn(0), "note-off reset makes the next hit spawn");
+    // Note-off reset clears the key: the next hit spawns immediately.
+    gate.ResetKey(0u);
+    Check(gate.OnNoteOn(0u, 11500u), "note-off reset makes the next hit spawn");
 
     // Channel reset clears the whole channel row.
-    gate.OnNoteOn(2 * 128u + 60u);
-    gate.OnNoteOn(2 * 128u + 61u);
+    gate.OnNoteOn(2u * 128u + 60u, 12000u);
+    gate.OnNoteOn(2u * 128u + 61u, 12001u);
     gate.ResetChannel(2u);
-    Check(gate.OnNoteOn(2 * 128u + 60u) &&
-              gate.OnNoteOn(2 * 128u + 61u),
+    Check(gate.OnNoteOn(2u * 128u + 60u, 12002u) &&
+              gate.OnNoteOn(2u * 128u + 61u, 12003u),
           "channel reset makes every key on the channel spawn");
 
     // Reset-all clears even the last key index.
-    gate.OnNoteOn(svms::NoteOnCollapseGate::kKeyCount - 1u);
+    gate.OnNoteOn(svms::NoteOnCollapseGate::kKeyCount - 1u, 13000u);
     gate.ResetAll();
-    Check(gate.OnNoteOn(svms::NoteOnCollapseGate::kKeyCount - 1u),
+    Check(gate.OnNoteOn(svms::NoteOnCollapseGate::kKeyCount - 1u, 13001u),
           "reset-all makes any key spawn");
 
     // Velocity stacking: hits between spawns accumulate per key and are
@@ -3598,39 +3620,49 @@ void TestNoteOnCollapseGate() {
     gate.ResetAll();
     gate.SetThreshold(4u);
     uint32_t stack = 0;
-    Check(gate.OnNoteOn(9u, stack) && stack == 1u,
+    Check(gate.OnNoteOn(9u, 20000u, stack) && stack == 1u,
           "first hit spawns with stack 1");
-    Check(!gate.OnNoteOn(9u, stack) && stack == 1u,
+    Check(!gate.OnNoteOn(9u, 20001u, stack) && stack == 1u,
           "second hit collapses with running stack 1");
-    Check(!gate.OnNoteOn(9u, stack) && stack == 2u,
+    Check(!gate.OnNoteOn(9u, 20002u, stack) && stack == 2u,
           "third hit collapses with running stack 2");
-    Check(!gate.OnNoteOn(9u, stack) && stack == 3u,
+    Check(!gate.OnNoteOn(9u, 20003u, stack) && stack == 3u,
           "fourth hit collapses with running stack 3");
-    Check(gate.OnNoteOn(9u, stack) && stack == 4u,
+    Check(gate.OnNoteOn(9u, 20004u, stack) && stack == 4u,
           "threshold crossing spawns with the accumulated stack");
-    Check(!gate.OnNoteOn(9u, stack) && stack == 1u,
+    Check(!gate.OnNoteOn(9u, 20005u, stack) && stack == 1u,
           "a new cycle starts right after a spawn");
     // A different key's stack is untouched by the hammering above.
-    Check(gate.OnNoteOn(10u, stack) && stack == 1u,
+    Check(gate.OnNoteOn(10u, 20006u, stack) && stack == 1u,
           "stacks are tracked per key");
     // Reset clears the stack too.
-    gate.OnNoteOn(11u);
-    gate.OnNoteOn(11u, stack);
+    gate.OnNoteOn(11u, 20007u);
+    gate.OnNoteOn(11u, 20008u, stack);
     gate.ResetKey(11u);
-    Check(gate.OnNoteOn(11u, stack) && stack == 1u,
+    Check(gate.OnNoteOn(11u, 20009u, stack) && stack == 1u,
           "note-off reset clears the accumulated stack");
 
-    // Sustained hammering over many thresholds keeps the 1-in-N ratio exact.
+    // Sustained hammering within a continuously re-anchored window keeps
+    // the 1-in-N ratio exact (each spawn re-anchors the window, so the
+    // rate is deterministic regardless of buffer size).
     gate.ResetAll();
     gate.SetThreshold(128u);
+    const uint32_t threshold = 128u;
     uint64_t totalSpawns = 0;
     const uint32_t kHammerHits = threshold * 10u + 5u;
     for (uint32_t i = 0; i < kHammerHits; ++i) {
-        if (gate.OnNoteOn(42u)) ++totalSpawns;
+        if (gate.OnNoteOn(42u, 30000u + i)) ++totalSpawns;
     }
-    // hit 0 spawns, plus every threshold crossing in hits 1..N-1.
+    // Hit 0 spawns (new window), plus every threshold crossing while the
+    // re-anchored window still covers the stream (10 crossings for 1285
+    // hits at threshold 128; the tail re-anchors keep counting).
     Check(totalSpawns == 1u + (kHammerHits - 1u) / threshold,
           "spawn ratio over sustained hammering is 1 per threshold");
+
+    // Window 0 disables collapsing even with a threshold set.
+    gate.SetWindowTicks(0u);
+    Check(gate.OnNoteOn(50u, 40000u) && gate.OnNoteOn(50u, 40001u),
+          "window 0 forces every hit to spawn");
 }
 
 } // namespace

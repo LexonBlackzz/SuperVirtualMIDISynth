@@ -26,6 +26,14 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSPSCQueue.h"
 #include "SVMSNoteOnCollapse.h"
+
+// Fixed QPC-time collapse window for same-key note-on coalescing.
+// Frame-size independent by construction: never derived from the WASAPI
+// buffer size. With the default threshold of 32 the sustained spawn rate
+// when enabled is 32 / 20 ms = 1600 Hz per key.
+constexpr uint32_t kNoteOnCollapseWindowMs = 20u;
+constexpr uint32_t kNoteOnCollapseDefaultThreshold = 32u;
+
 #include "SVMSEventScheduler.h"
 #include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
@@ -2067,8 +2075,14 @@ public:
         uint64_t cancellationToken);
     void SetIngressMode(EventOverflowMode mode);
     // Same-key note-on coalescing spawn interval (power-of-two rounded;
-    // values below 2 disable coalescing). Runtime-tunable.
+    // values below 2 disable coalescing, which is the default state).
+    // Runtime-tunable. The collapse window itself is a fixed QPC time
+    // span (kNoteOnCollapseWindowMs), never a render block, so collapsing
+    // behavior is identical at any WASAPI buffer size.
     void SetNoteOnCollapseThreshold(uint32_t threshold);
+    // Enables coalescing with the default threshold (32) or disables it
+    // entirely (default state: every note-on spawns).
+    void EnableNoteOnCollapse(bool enable);
     void CopyNativeQueueInfo(SVMS_QueueInfo& out) const;
     uint64_t GetNextOutputFrame() const;
 
@@ -3069,6 +3083,12 @@ bool Driver::Initialize() {
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     qpcFreq = freq.QuadPart;
+
+    // Note-on collapse window in QPC ticks (fixed 20 ms, frame-size
+    // independent). Coalescing itself defaults OFF; this only defines the
+    // window used once it is enabled at runtime.
+    noteOnCollapse_.SetWindowTicks(
+        freq.QuadPart * kNoteOnCollapseWindowMs / 1000u);
 
     EngineConfig cfg = EngineConfig::Load();
     if (!cfg.configWarning.empty()) {
@@ -4116,6 +4136,10 @@ void Driver::SetNoteOnCollapseThreshold(uint32_t threshold) {
     noteOnCollapse_.SetThreshold(threshold);
 }
 
+void Driver::EnableNoteOnCollapse(bool enable) {
+    noteOnCollapse_.SetThreshold(enable ? kNoteOnCollapseDefaultThreshold : 1u);
+}
+
 void Driver::CopyNativeQueueInfo(SVMS_QueueInfo& out) const {
     out = {};
     out.struct_size = sizeof(out);
@@ -4218,15 +4242,17 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
         PublishTerminationFence(channelTerminationFence_[status & 0x0fu], evt.sequence);
     }
 
-    // ── Same-key note-on coalescing ─────────────────────────────────────
+    // ── Same-key note-on coalescing (DEFAULT OFF) ────────────────────────
     // Runs after cancellation/fence bookkeeping and before lane selection:
     // collapsed duplicates never touch the ingress queues, lanes, or the
     // audio thread at all. See SVMSNoteOnCollapse.h for the rationale.
+    // When disabled (the default) every note-on spawns at its exact QPC
+    // timestamp — retrigger/buzz precision is untouched.
     if (noteOn) {
         const uint32_t keyIndex =
             static_cast<uint32_t>(status & 0x0fu) * kNoteCount + data1;
         uint32_t stack = 0u;
-        if (!noteOnCollapse_.OnNoteOn(keyIndex, stack)) {
+        if (!noteOnCollapse_.OnNoteOn(keyIndex, qpcTimestamp, stack)) {
             coalescedAtomic_.fetch_add(1u, std::memory_order_relaxed);
             return true;
         }
@@ -4251,11 +4277,10 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
         }
     } else if (!IsInternalEngineMessage(msg)) {
         const uint8_t statusType = status & 0xf0u;
-        // Note-offs intentionally do NOT reset the per-key accumulator:
-        // the collapse window is one render block (cleared by the audio
-        // thread), and clearing on every note-off would let interleaved
-        // on/off floods spawn a voice per event again.  Panic-style state
-        // messages still clear, matching their "start over" semantics.
+        // Note-offs intentionally do NOT reset the per-key window/stack:
+        // clearing on every note-off would let interleaved on/off floods
+        // spawn a voice per event again.  Panic-style state messages
+        // still clear, matching their "start over" semantics.
         if (statusType == 0xb0u &&
             (data1 == 120u || data1 == 123u)) {
             noteOnCollapse_.ResetChannel(status & 0x0fu);
@@ -4657,14 +4682,6 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     const float* sd = self->sampleDataStore;
 
     if (!vm || !cc || !render || !snap) return;
-
-    // ── Same-key note-on collapse window ──────────────────────────────
-    // The per-key hit accumulators cover exactly one render block.  This
-    // bounds the per-block spawn cost of same-key floods (the Black-MIDI
-    // signature) while never carrying state across blocks, so any key hit
-    // in a new block always spawns immediately.  CC 120/123 and engine
-    // resets additionally clear the accumulators on the producer side.
-    self->noteOnCollapse_.ResetAll();
 
     // ── Mailbox sync: dirty-gated monotonic seqlock read ───────────
     // The control thread publishes only when the user actually moves a
