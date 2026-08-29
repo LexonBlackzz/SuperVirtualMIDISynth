@@ -5,6 +5,7 @@
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <d3d11sdklayers.h>
 #include <wrl/client.h>
 #include <cstdint>
 #include <string>
@@ -49,9 +50,14 @@ public:
 
     const char* AdapterName() const { return adapterName_.c_str(); }
 
+    // Drain the D3D debug-layer message queue, printing any errors/corruption
+    // to stderr. No-op when the debug layer is unavailable.
+    void DumpErrors(const char* tag);
+
 private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
+    Microsoft::WRL::ComPtr<ID3D11InfoQueue> infoQueue_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> staging_;
     uint32_t stagingCap_ = 0;
     std::string adapterName_;

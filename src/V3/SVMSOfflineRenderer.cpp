@@ -14,6 +14,9 @@
 #include "SVMSEnvelope.h"
 #include "SVMSConfig.h"
 #include "SVMSStandaloneSynth.h"
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+#include "SVMSGpuSynth.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -271,7 +274,7 @@ void Usage() {
            L"  --limiter-attack-ms F     Override attack, 0.01-100 ms\n"
            L"  --limiter-release-ms F    Override release, 1-5000 ms\n"
            L"  --phase-rotation coherent|analytic|sweep|diffuse|random  Post-mix hum-killing phase rotation (default coherent/off)\n"
-           L"  --backend auto|scalar|sse2|avx2\n"
+                       L"  --backend auto|scalar|sse2|avx2|gpu\n"
            L"  --scan-only           Validate/count without loading SF2 or rendering\n"
            L"  --quiet               Disable once-per-second telemetry\n"
            L"  --machine-progress    Emit tab-separated progress records\n", stderr);
@@ -324,6 +327,9 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             else if (name == L"scalar") o.backend=RenderBackend::Scalar;
             else if (name == L"sse2") o.backend=RenderBackend::SSE2;
             else if (name == L"avx2") o.backend=RenderBackend::AVX2;
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+            else if (name == L"gpu") o.backend=RenderBackend::GPU;
+#endif
             else return false;
         } else return false;
     }
@@ -425,8 +431,22 @@ public:
         channels_.RebuildCache(cfg_,static_cast<float>(rate_));
         for (uint32_t i=0;i<sf2_->regionCount;++i) Prepare(sf2_->regions[i],prepared_[i]);
         for (uint8_t ch=0;ch<kChannelCount;++ch) RefreshPreset(ch);
-        if (o.backend != RenderBackend::AVX512 && !renderer_.SetRenderBackend(o.backend)) {
-            error="requested render backend is unsupported on this CPU"; return false;
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+        if (o.backend == RenderBackend::GPU) {
+            std::string gpuErr;
+            if (!gpuSynth_.Initialize(sampleData_.data(),
+                                      static_cast<uint32_t>(sampleData_.size()),
+                                      o.maxVoices, o.blockFrames, gpuErr)) {
+                error="GPU init failed: " + gpuErr; return false;
+            }
+            gpuEnabled_ = true;
+        } else
+#endif
+        {
+            if (o.backend != RenderBackend::AVX512 && !renderer_.SetRenderBackend(o.backend)) {
+                error="requested render backend is unsupported on this CPU"; return false;
+            }
+            gpuEnabled_ = false;
         }
         for (float& r:bendRatio_) r=1.0f;
         postHighPass_.Initialize(rate_);
@@ -456,7 +476,17 @@ public:
     }
     void Render(float* l,float* r,uint32_t n,uint64_t frame) {
         std::fill(l,l+n,0.0f); std::fill(r,r+n,0.0f);
-        renderer_.RenderBlock(voices_,channels_,sampleData_.data(),uint32_t(sampleData_.size()),l,r,n,cfg_,nullptr,0,true,frame);
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+        if (gpuEnabled_) {
+            voices_.SetCurrentFrame(frame);
+            gpuSynth_.RenderBlock(voices_, l, r, n, frame);
+        } else
+#endif
+        {
+            renderer_.RenderBlock(voices_,channels_,sampleData_.data(),
+                                  uint32_t(sampleData_.size()),l,r,n,cfg_,
+                                  nullptr,0,true,frame);
+        }
         limiter_.ProcessPlanar(l,r,n,postHighPass_);
     }
     void ReleaseAll() { for(uint8_t ch=0;ch<kChannelCount;++ch) voices_.ReleaseChannel(ch,0); }
@@ -470,7 +500,12 @@ public:
     uint64_t MissingRegions() const { return missingRegions_; }
     uint64_t FallbackRegions() const { return fallbackRegions_; }
     uint64_t InvalidRegions() const { return invalidRegions_; }
-    const char* Backend() const { return renderer_.GetRenderBackendName(); }
+    const char* Backend() const {
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+        if (gpuEnabled_) return "gpu (d3d11)";
+#endif
+        return renderer_.GetRenderBackendName();
+    }
 private:
     struct RegionCacheEntry { uint32_t tag=UINT32_MAX;uint16_t count=0;uint16_t reserved=0;uint32_t indices[8]{}; };
     uint32_t ResolveRegions(uint32_t preset,uint8_t note,uint8_t velocity,const SFSampleRegion** out,uint32_t capacity){const uint32_t tag=(preset<<14u)|(uint32_t(note)<<7u)|velocity;uint32_t hash=tag;hash^=hash>>16u;hash*=0x7feb352du;hash^=hash>>15u;RegionCacheEntry& cached=regionCache_[hash&4095u];if(cached.tag==tag&&cached.count<=8u){const uint32_t copied=(std::min)(uint32_t(cached.count),capacity);for(uint32_t i=0;i<copied;++i)out[i]=&sf2_->regions[cached.indices[i]];return cached.count;}const uint32_t count=sf2_find_regions(sf2_.get(),preset,note,velocity,out,capacity);if(count<=8u&&count<=capacity){cached.tag=tag;cached.count=uint16_t(count);for(uint32_t i=0;i<count;++i)cached.indices[i]=uint32_t(out[i]-sf2_->regions);}return count;}
@@ -514,9 +549,12 @@ private:
         if(cc==121)Bend(ch,0,64);if(cc==7||cc==10||cc==11||cc==64||cc==121){channels_.RebuildChannel(ch,cfg_,float(rate_));if(cc==7||cc==10||cc==11||cc==121)voices_.RefreshMixGainsForChannel(ch,channels_.GetParams()[ch]);}}
     void Program(uint8_t ch,uint8_t p){const uint8_t old=channels_.GetProgram(ch);channels_.ProgramChange(ch,p);uint32_t pi;if(Resolve(ch,pi))channels_.SetSelectedPreset(ch,uint16_t(pi));else channels_.ProgramChange(ch,old);}
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;voices_.ForEachChannelActive(ch,[&](VoiceHandle v){const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));});}
-    uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0,fallbackRegions_=0;
+    uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};bool gpuEnabled_=false;uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0,fallbackRegions_=0;
     std::unique_ptr<SF2Data> sf2_;std::vector<float> sampleData_;std::vector<PreparedRegion> prepared_;
     VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+    GpuSynth gpuSynth_;
+#endif
 };
 
 #endif
@@ -624,7 +662,6 @@ int RendererMain(int argc, wchar_t** argv) {
     synthConfig.limiterLookaheadMs = o.limiterLookaheadMs;
     synthConfig.limiterAttackMs = o.limiterAttackMs;
     synthConfig.limiterReleaseMs = o.limiterReleaseMs;
-    synthConfig.backend = o.backend;
     synthConfig.backend = o.backend;
     synthConfig.phaseRotationMode = o.phaseRotationMode;
     auto synth = std::make_unique<StandaloneSynth>();

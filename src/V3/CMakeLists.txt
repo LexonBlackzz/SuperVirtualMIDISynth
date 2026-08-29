@@ -232,7 +232,8 @@ if(MSVC)
     add_compile_options(/utf-8)
     add_definitions(-DUNICODE -D_UNICODE)
     if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-        add_compile_options(/O2 /Oi /Gy)
+        add_compile_options(/O2 /Oi /Gy /Zi /FS)
+        add_link_options(/DEBUG /OPT:REF /OPT:ICF)
     endif()
 endif()
 
@@ -260,7 +261,8 @@ set(SOURCES
 )
 
 if(NOT SVMS_XP_COMPAT)
-    list(APPEND SOURCES SVMSRenderKernelsAVX2.cpp SVMSLiveRecorder.cpp)
+    list(APPEND SOURCES SVMSRenderKernelsAVX2.cpp SVMSLiveRecorder.cpp
+         SVMSGpuSynth.cpp SVMSGpuDevice.cpp)
 endif()
 
 set(HEADERS
@@ -314,7 +316,8 @@ target_compile_definitions(svmsynth PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
 if(SVMS_XP_COMPAT)
     target_link_libraries(svmsynth PRIVATE dsound dxguid shell32 user32)
 else()
-    target_link_libraries(svmsynth PRIVATE winmm ole32 uuid avrt shell32)
+    target_link_libraries(svmsynth PRIVATE winmm ole32 uuid avrt shell32
+        d3d11 dxgi d3dcompiler)
 endif()
 
 # nlohmann/json is vendored under third_party and intentionally confined to
@@ -460,13 +463,15 @@ if(NOT SVMS_XP_COMPAT)
         SVMSRenderWorkers.cpp
         SVMSRenderDispatch.cpp
         SVMSRenderKernelsSSE2.cpp
-        SVMSRenderKernelsAVX2.cpp)
+        SVMSRenderKernelsAVX2.cpp
+        SVMSGpuSynth.cpp
+        SVMSGpuDevice.cpp)
     target_compile_definitions(svms_v3_render PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_render PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
-    target_link_libraries(svms_v3_render PRIVATE shell32)
+    target_link_libraries(svms_v3_render PRIVATE shell32 d3d11 dxgi d3dcompiler)
     set_target_properties(svms_v3_render PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 

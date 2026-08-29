@@ -11,6 +11,10 @@
 #include "SVMSSoundFont.h"
 #include "SVMSVoiceManager.h"
 
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+#include "SVMSGpuSynth.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -88,10 +92,26 @@ public:
             Prepare(sf2_->regions[i], prepared_[i]);
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             RefreshPreset(channel);
-        if (config.backend != RenderBackend::AVX512 &&
-            !renderer_.SetRenderBackend(config.backend)) {
-            error = "requested render backend is unsupported on this CPU";
-            return false;
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+        if (config.backend == RenderBackend::GPU) {
+            std::string gpuError;
+            if (!gpuSynth_.Initialize(sampleData_.data(),
+                                      uint32_t(sampleData_.size()),
+                                      config.maxVoices, config.maxBlockFrames,
+                                      gpuError)) {
+                error = "GPU init failed: " + gpuError;
+                return false;
+            }
+            gpuEnabled_ = true;
+        } else
+#endif
+        {
+            if (config.backend != RenderBackend::AVX512 &&
+                !renderer_.SetRenderBackend(config.backend)) {
+                error = "requested render backend is unsupported on this CPU";
+                return false;
+            }
+            gpuEnabled_ = false;
         }
         for (float& ratio : bendRatio_) ratio = 1.0f;
         sysexMasterVolume_ = 1.0f;
@@ -145,11 +165,42 @@ public:
                 uint64_t absoluteFrame) {
         std::fill(left, left + frameCount, 0.0f);
         std::fill(right, right + frameCount, 0.0f);
-        renderer_.RenderBlock(voices_, channels_, sampleData_.data(),
-                              uint32_t(sampleData_.size()), left, right,
-                              frameCount, cfg_, nullptr, 0, true,
-                              absoluteFrame);
-        limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+        if (gpuEnabled_ && !GpuFallbackNeeded()) {
+            // Same block-boundary housekeeping the CPU RenderBlock performs.
+            voices_.SetStealKeyBackend(renderer_.GetRenderBackend());
+            voices_.ApplyRuntimeVoiceLimit(absoluteFrame);
+            // Steal tails live in a separate reserve and keep running on the
+            // CPU per frame; the GPU then accumulates the primary voices on
+            // top, matching the CPU addition order (tails before voices).
+            for (uint32_t f = 0; f < frameCount; ++f) {
+                float* oL = left + f, * oR = right + f;
+                const uint32_t tailCount = voices_.GetStealTailCount();
+                const uint32_t* tailHandles = voices_.GetStealTailList();
+                for (uint32_t pos = tailCount; pos > 0u; --pos) {
+                    const uint32_t slot = tailHandles[pos - 1u];
+                    RenderStealTailSample(voices_.v, slot,
+                                          sampleData_.data(),
+                                          uint32_t(sampleData_.size()),
+                                          oL, oR);
+                    voices_.RefreshStealTail(
+                        static_cast<VoiceHandle>(slot));
+                }
+            }
+            voices_.SetCurrentFrame(absoluteFrame);
+            gpuSynth_.RenderBlock(voices_, left, right, frameCount,
+                                  absoluteFrame);
+            limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
+            return;
+        }
+#endif
+        {
+            renderer_.RenderBlock(voices_, channels_, sampleData_.data(),
+                                  uint32_t(sampleData_.size()), left, right,
+                                  frameCount, cfg_, nullptr, 0, true,
+                                  absoluteFrame);
+            limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
+        }
     }
 
     void ReleaseAll() {
@@ -183,7 +234,12 @@ public:
     uint64_t MissingRegions() const { return missingRegions_; }
     uint64_t InvalidRegions() const { return invalidRegions_; }
     uint64_t FallbackRegions() const { return fallbackRegions_; }
-    const char* Backend() const { return renderer_.GetRenderBackendName(); }
+    const char* Backend() const {
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+        if (gpuEnabled_) return "gpu (d3d11)";
+#endif
+        return renderer_.GetRenderBackendName();
+    }
 
 private:
     struct PreparedRegion {
@@ -482,6 +538,22 @@ private:
         }
     }
 
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+    // The GPU stage is a pure per-voice sample synthesizer.  Two CPU-only
+    // behaviors are not (yet) modeled there; the scalar path is bit-exact
+    // for both, so fall back instead of drift:
+    //   - phase rotation: stateful per-voice Hilbert DSP (voices_.v.rot);
+    //   - vibrato LFO: phaseIncs refreshed on a fixed 64-frame cadence
+    //     (AdvanceVibratoSpan) whenever any channel has mod depth.
+    bool GpuFallbackNeeded() const {
+        if (voices_.v.rot != nullptr) return true;
+        const ChannelParamsSnapshot* params = channels_.GetParams();
+        for (uint32_t channel = 0; channel < kChannelCount; ++channel)
+            if (params[channel].modDepth > 0.0f) return true;
+        return false;
+    }
+#endif
+
     uint32_t rate_ = 0;
     uint32_t maxVoices_ = 0;
     uint32_t playIndex_ = 0;
@@ -498,6 +570,10 @@ private:
     VoiceManager voices_;
     ChannelCache channels_;
     RenderScalar renderer_;
+    bool gpuEnabled_ = false;
+#if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
+    GpuSynth gpuSynth_;
+#endif
     RuntimeConfigSnapshot cfg_{};
     PostHighPass3Hz postHighPass_{};
     LimiterRouterState limiter_{};

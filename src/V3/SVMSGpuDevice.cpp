@@ -3,23 +3,56 @@
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
 
 #include <cstring>
+#include <cstdio>
+#include <vector>
 #include <windows.h>
 
 namespace svms {
 namespace gpu {
 
+void GpuDevice::DumpErrors(const char* tag) {
+    if (!infoQueue_) return;
+    UINT64 count = infoQueue_->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(infoQueue_->GetMessage(i, nullptr, &len)) || len == 0)
+            continue;
+        std::vector<uint8_t> buf(len);
+        D3D11_MESSAGE* msg = reinterpret_cast<D3D11_MESSAGE*>(buf.data());
+        if (SUCCEEDED(infoQueue_->GetMessage(i, msg, &len))) {
+            std::fprintf(stderr, "[D3D %s] %s\n", tag ? tag : "",
+                         msg->pDescription ? msg->pDescription : "");
+        }
+    }
+    infoQueue_->ClearStoredMessages();
+}
+
 bool GpuDevice::Create(std::string& error) {
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifdef _DEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;
+#else
+    // Opt-in debug layer (surfaces validation messages via DumpErrors) so it
+    // does not raise DBG_CONTROL_BREAK storms in normal builds.
+    if (::GetEnvironmentVariableA("SVMS_GPU_DEBUG_LAYER", nullptr, 0) > 0)
+        flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
                                   D3D_FEATURE_LEVEL_11_0};
+    // Try the requested flags; if the debug layer is unavailable the call
+    // fails, so retry without it rather than giving up entirely.
     HRESULT hr = D3D11CreateDevice(
         nullptr,                     // default adapter
         D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels,
         static_cast<UINT>(sizeof(levels) / sizeof(levels[0])),
         D3D11_SDK_VERSION, &device_, nullptr, &context_);
+    if (FAILED(hr)) {
+        flags &= ~D3D11_CREATE_DEVICE_DEBUG;
+        hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels,
+            static_cast<UINT>(sizeof(levels) / sizeof(levels[0])),
+            D3D11_SDK_VERSION, &device_, nullptr, &context_);
+    }
     if (FAILED(hr)) {
         // Fall back to WARP (software rasterizer) so the proof path can run on
         // machines without a usable D3D11 driver.
@@ -51,6 +84,11 @@ bool GpuDevice::Create(std::string& error) {
             }
         }
         if (adapterName_.empty()) adapterName_ = "hardware d3d11";
+    }
+    if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&infoQueue_)))) {
+        infoQueue_->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, FALSE);
+        infoQueue_->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+        infoQueue_->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_WARNING, FALSE);
     }
     return true;
 }
@@ -154,12 +192,20 @@ void GpuDevice::UpdateConstants(ID3D11Buffer* buf, const void* data,
 }
 
 bool GpuDevice::Readback(ID3D11Buffer* src, uint32_t bytes, void* dst,
-                         std::string& error) {
+                          std::string& error) {
     if (bytes == 0) return true;
-    if (stagingCap_ < bytes) {
+    // CopyResource requires src and dst to be EXACTLY the same size. The GPU
+    // buffers are allocated to the chunk's full capacity (e.g. activeCount
+    // voices), which is frequently larger than the bytes we actually want to
+    // read back (e.g. upCount <= activeCount). So size the staging buffer to
+    // the SOURCE's real size and only memcpy the requested bytes out.
+    D3D11_BUFFER_DESC srcDesc{};
+    src->GetDesc(&srcDesc);
+    const uint32_t srcBytes = srcDesc.ByteWidth;
+    if (stagingCap_ != srcBytes) {
         staging_.Reset();
         D3D11_BUFFER_DESC desc{};
-        desc.ByteWidth = bytes;
+        desc.ByteWidth = srcBytes;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         const HRESULT hr = device_->CreateBuffer(&desc, nullptr, &staging_);
@@ -168,7 +214,11 @@ bool GpuDevice::Readback(ID3D11Buffer* src, uint32_t bytes, void* dst,
                     std::to_string(static_cast<unsigned long>(hr));
             return false;
         }
-        stagingCap_ = bytes;
+        stagingCap_ = srcBytes;
+    }
+    if (bytes > srcBytes) {
+        error = "Readback requested more bytes than the source buffer holds";
+        return false;
     }
     context_->CopyResource(staging_.Get(), src);
     D3D11_MAPPED_SUBRESOURCE mapped{};
