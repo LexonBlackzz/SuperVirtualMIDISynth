@@ -800,7 +800,149 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     }
 }
 
+// Voice-batched short-span transient kernel.  Spans of 1-7 frames dominate
+// event-fragmented (buzz) workloads, where per-voice time-vectorization
+// cannot engage (the 8-frame chunk guard never fires).  Lanes carry eight
+// voices; the per-frame envelope recurrence runs scalarly per lane
+// (bit-exact by construction) and only the sample fetch / lerp / mix is
+// vectorized.  Callers must have validated every handle with
+// ValidateLoopVoice and the transient preconditions.
+void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
+                                  const uint32_t* handles,
+                                  uint32_t handleCount) {
+    VoiceSoA& v = *c.voices;
+    const uint32_t frames = c.frameCount;
+    const __m256 zero = _mm256_setzero_ps();
+    __m256 sumsL[8], sumsR[8];
+    for (uint32_t f = 0u; f < frames; ++f) {
+        sumsL[f] = zero;
+        sumsR[f] = zero;
+    }
+    uint32_t position = 0u;
+    for (; position + 8u <= handleCount; position += 8u) {
+        const __m256i h = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(handles + position));
+        alignas(32) uint32_t hs[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
+        __m256 phase = _mm256_max_ps(
+            _mm256_i32gather_ps(v.phases, h, 4), zero);
+        const __m256 step = _mm256_i32gather_ps(v.phaseIncs, h, 4);
+        __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
+        const __m256 mixL = _mm256_i32gather_ps(v.mixGainL, h, 4);
+        const __m256 mixR = _mm256_i32gather_ps(v.mixGainR, h, 4);
+        const __m256 loopStartF = _mm256_i32gather_ps(v.relLoopSF, h, 4);
+        const __m256 loopEndF = _mm256_i32gather_ps(v.relLoopEF, h, 4);
+        const __m256 targetGain = _mm256_i32gather_ps(v.targetGain, h, 4);
+        const __m256 sustainLevel = _mm256_i32gather_ps(v.sustainLevel, h, 4);
+        const __m256 attackStep = _mm256_i32gather_ps(v.attackGainStep, h, 4);
+        const __m256 decaySlope = _mm256_i32gather_ps(v.decaySlope, h, 4);
+        const __m256i sampleStart = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.sampleStart), h, 4);
+        const __m256i loopStart = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.relLoopS), h, 4);
+        const __m256i loopEnd = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.relLoopE), h, 4);
+        alignas(32) uint32_t attackR[8], decayR[8];
+        alignas(32) uint8_t stageV[8], initialStage[8];
+        for (uint32_t lane = 0u; lane < 8u; ++lane) {
+            const uint32_t handle = hs[lane];
+            attackR[lane] = v.attackSamplesRemaining[handle];
+            decayR[lane] = v.decaySamplesRemaining[handle];
+            stageV[lane] = v.envelopeStage[handle];
+            initialStage[lane] = stageV[lane];
+        }
+
+        for (uint32_t frame = 0u; frame < frames; ++frame) {
+            const __m256 pastLoop = _mm256_cmp_ps(
+                phase, loopEndF, _CMP_GE_OQ);
+            phase = _mm256_blendv_ps(phase,
+                _mm256_add_ps(loopStartF, _mm256_sub_ps(phase, loopEndF)),
+                pastLoop);
+            const __m256i base = _mm256_cvttps_epi32(phase);
+            const __m256i nextRaw = _mm256_add_epi32(
+                base, _mm256_set1_epi32(1));
+            const __m256i wrap = _mm256_cmpgt_epi32(
+                nextRaw, _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
+            const __m256i next = _mm256_blendv_epi8(nextRaw, loopStart, wrap);
+            const __m256 first = GatherSampleAVX2(c.sampleData,
+                _mm256_add_epi32(sampleStart, base));
+            const __m256 second = GatherSampleAVX2(c.sampleData,
+                _mm256_add_epi32(sampleStart, next));
+            const __m256 fraction = _mm256_sub_ps(
+                phase, _mm256_cvtepi32_ps(base));
+            const __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            // Exact scalar envelope recurrence per lane: gains are
+            // bit-identical to the per-voice scalar sequence.
+            alignas(32) float gains[8], targets[8], sustains[8];
+            alignas(32) float aSteps[8], dSlopes[8];
+            _mm256_store_ps(gains, gain);
+            _mm256_store_ps(targets, targetGain);
+            _mm256_store_ps(sustains, sustainLevel);
+            _mm256_store_ps(aSteps, attackStep);
+            _mm256_store_ps(dSlopes, decaySlope);
+            for (uint32_t lane = 0u; lane < 8u; ++lane) {
+                if (stageV[lane] == 1u) {
+                    if (attackR[lane] > 0u) {
+                        gains[lane] += aSteps[lane];
+                        --attackR[lane];
+                        if (gains[lane] > targets[lane])
+                            gains[lane] = targets[lane];
+                    } else {
+                        gains[lane] = targets[lane];
+                    }
+                    if (attackR[lane] == 0u)
+                        stageV[lane] = decayR[lane] > 0u ? 2u : 3u;
+                }
+                if (stageV[lane] == 2u) {
+                    if (decayR[lane] > 0u) {
+                        gains[lane] *= dSlopes[lane];
+                        --decayR[lane];
+                        if (gains[lane] < sustains[lane])
+                            gains[lane] = sustains[lane];
+                    } else {
+                        gains[lane] = sustains[lane];
+                    }
+                    if (decayR[lane] == 0u) stageV[lane] = 3u;
+                }
+            }
+            gain = _mm256_load_ps(gains);
+            const __m256 scaled = _mm256_mul_ps(sample, gain);
+            sumsL[frame] = _mm256_add_ps(sumsL[frame],
+                _mm256_mul_ps(scaled, mixL));
+            sumsR[frame] = _mm256_add_ps(sumsR[frame],
+                _mm256_mul_ps(scaled, mixR));
+            phase = _mm256_add_ps(phase, step);
+        }
+        alignas(32) float finalGains[8], finalPhases[8];
+        _mm256_store_ps(finalGains, gain);
+        _mm256_store_ps(finalPhases, phase);
+        for (uint32_t lane = 0u; lane < 8u; ++lane) {
+            const uint32_t handle = hs[lane];
+            const uint8_t finalStage = stageV[lane];
+            v.phases[handle] = finalPhases[lane];
+            v.currentGain[handle] = finalGains[lane];
+            v.envelopeStage[handle] = finalStage;
+            v.attackSamplesRemaining[handle] = attackR[lane];
+            v.decaySamplesRemaining[handle] = decayR[lane];
+            if (finalStage != initialStage[lane] &&
+                c.classChangeHandles != nullptr &&
+                c.classChangeCount != nullptr) {
+                c.classChangeHandles[(*c.classChangeCount)++] = handle;
+            }
+        }
+    }
+    for (; position < handleCount; ++position) {
+        RenderTransientLoopFramesAVX2(c, handles[position]);
+    }
+    for (uint32_t frame = 0u; frame < frames; ++frame) {
+        c.outputLeft[c.frameStart + frame] += HorizontalSum(sumsL[frame]);
+        c.outputRight[c.frameStart + frame] += HorizontalSum(sumsR[frame]);
+    }
+}
+
 bool RenderTransientLoopAVX2(const RenderSpanContext& context,
+
                              const uint32_t* handles,
                              uint32_t handleCount) {
     if (handleCount == 0u) return true;
@@ -821,6 +963,13 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
             v.releaseSamplesRemaining[handle] != UINT32_MAX) {
             return false;
         }
+    }
+    // Short event-fragmented spans: vectorize across voices (8 lanes) since
+    // the per-voice time-chunk guard (frame + 8 <= frameCount) cannot fire.
+    if (context.frameCount <= 7u) {
+        RenderTransientLoopShortAVX2(context, handles, handleCount);
+        _mm256_zeroupper();
+        return true;
     }
     for (uint32_t position = 0u; position < handleCount; ++position)
         RenderTransientLoopFramesAVX2(context, handles[position]);
@@ -1060,7 +1209,7 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         _mm256_zeroupper();
         return true;
     }
-    if (context.frameCount > 4u) {
+    if (context.frameCount > 7u) {
         for (uint32_t i = 0; i < handleCount; ++i) {
             RenderSustainedLoopFramesAVX2(context, handles[i]);
         }
@@ -1071,10 +1220,14 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
     const bool denseHandles = context.voiceCapacity >= 8u &&
         handleCount * 4u >= context.voiceCapacity * 3u;
     const uint32_t iterationCount = denseHandles ? context.voiceCapacity : handleCount;
-    __m256 accumulatedLeft[4] = {
+    __m256 accumulatedLeft[8] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
         _mm256_setzero_ps(), _mm256_setzero_ps(),
         _mm256_setzero_ps(), _mm256_setzero_ps()};
-    __m256 accumulatedRight[4] = {
+    __m256 accumulatedRight[8] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
         _mm256_setzero_ps(), _mm256_setzero_ps(),
         _mm256_setzero_ps(), _mm256_setzero_ps()};
     uint32_t position = 0u;
