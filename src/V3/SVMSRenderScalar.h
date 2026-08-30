@@ -2318,10 +2318,54 @@ inline void RenderScalar::RenderDenseVoiceTile(
         }
     }
 
-    // Pass 3: mutated voices, exact-frame segments.  Their count is a
-    // handful per tile even in event-dense material, so the scalar
-    // per-voice path here is cheap; everything else above stayed vector.
+    // Shared classification for the dense shadow state: renderClass as
+    // recorded by the VoiceManager, refined by live shadow envelope state
+    // (stage 3 -> sustained, stages 1/2 -> transient).
+    auto classifyDense = [&v](uint32_t handle) -> uint32_t {
+        uint32_t actual = v.renderClass[handle] < kVoiceRenderClassCount
+            ? v.renderClass[handle]
+            : static_cast<uint32_t>(VoiceRenderClass::Generic);
+        const bool clean = v.stealFadeInFramesRemaining[handle] == 0u;
+        const bool active = v.state[handle] ==
+            static_cast<uint8_t>(VoiceState::Active);
+        if (clean && active && v.loopEnabled[handle] != 0u &&
+            v.envelopeStage[handle] == 3u) {
+            actual = static_cast<uint32_t>(VoiceRenderClass::SustainedLoop);
+        } else if (clean && active && v.loopEnabled[handle] != 0u &&
+                   (v.envelopeStage[handle] == 1u ||
+                    v.envelopeStage[handle] == 2u)) {
+            actual = static_cast<uint32_t>(VoiceRenderClass::TransientLoop);
+        }
+        return actual;
+    };
+
+    // Pass 3: mutated voices, exact-frame segments, rendered through the
+    // class kernels over live per-segment buckets.  In chopped material
+    // most of the pool is touched every chunk, so these buckets — not
+    // pass 2 — carry the load; routing them through the class kernels keeps
+    // the voice-batched AVX2 short-span paths engaged instead of falling
+    // back to scalar per-voice rendering.  Bucket membership changes only
+    // at mutation frames (snapshot application) and at kernel-recorded
+    // class transitions / retirements, both applied at segment ends.
     uint32_t cursor = 0u;
+    uint32_t tileClassChanges[kDenseRenderHandlesPerTile];
+    uint32_t tileClassChangeCount = 0u;
+    uint8_t slotClass[kDenseRenderHandlesPerTile];
+    uint32_t touchedSlots[kDenseRenderHandlesPerTile];
+    uint32_t touchedSlotCount = 0u;
+    std::memset(classCounts, 0, sizeof(classCounts));
+    for (uint32_t slot = 0u; slot < kDenseRenderHandlesPerTile; ++slot) {
+        if (touched[slot] == 0u) continue;
+        touchedSlots[touchedSlotCount++] = slot;
+        const uint32_t handle = firstHandle + slot;
+        if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) {
+            slotClass[slot] = UINT8_MAX;
+            continue;
+        }
+        const uint32_t actual = classifyDense(handle);
+        classHandles[actual][classCounts[actual]++] = handle;
+        slotClass[slot] = static_cast<uint8_t>(actual);
+    }
     while (cursor < frameCount) {
         while (mutation != UINT32_MAX &&
                plan.mutations[mutation].frameOffset == cursor) {
@@ -2329,6 +2373,28 @@ inline void RenderScalar::RenderDenseVoiceTile(
             ApplyDenseVoiceSnapshot(v, change.handle,
                                     plan.mutationStates[mutation]);
             mutation = change.next;
+            const uint32_t slot = change.handle - firstHandle;
+            if (slot >= kDenseRenderHandlesPerTile) continue;
+            // Move the slot between buckets: out of its old class, and back
+            // in under its post-snapshot classification (unless freed).
+            const uint8_t oldClass = slotClass[slot];
+            const uint32_t handle = firstHandle + slot;
+            if (oldClass != UINT8_MAX) {
+                uint32_t* list = classHandles[oldClass];
+                uint32_t& count = classCounts[oldClass];
+                for (uint32_t index = 0u; index < count; ++index) {
+                    if (list[index] != handle) continue;
+                    list[index] = list[--count];
+                    break;
+                }
+            }
+            if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) {
+                slotClass[slot] = UINT8_MAX;
+            } else {
+                const uint32_t actual = classifyDense(handle);
+                classHandles[actual][classCounts[actual]++] = handle;
+                slotClass[slot] = static_cast<uint8_t>(actual);
+            }
         }
         uint32_t spanEnd = frameCount;
         if (mutation != UINT32_MAX)
@@ -2339,17 +2405,73 @@ inline void RenderScalar::RenderDenseVoiceTile(
             continue;
         }
         const uint32_t spanFrames = spanEnd - cursor;
-        for (uint32_t slot = 0u; slot < kDenseRenderHandlesPerTile; ++slot) {
-            if (touched[slot] == 0u) continue;
-            const uint32_t handle = firstHandle + slot;
-            if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
+        for (uint32_t classIndex = 0u;
+             classIndex < kVoiceRenderClassCount; ++classIndex) {
+            const uint32_t count = classCounts[classIndex];
+            if (count == 0u) continue;
+            uint32_t* list = classHandles[classIndex];
+            const RenderSpanContext context{
+                &v, denseSampleData_, denseSampleDataFrames_, outputLeft,
+                outputRight, cursor, spanFrames, v.GetCapacity(),
+                tileClassChanges, &tileClassChangeCount,
+                nullptr, nullptr, nullptr, 0u};
+            RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
+            if (kernel && kernel(context, list, count)) {
+                // Class transitions recorded by the kernel move voices
+                // between buckets (transient -> sustained on attack/decay
+                // completion).
+                for (uint32_t index = 0u; index < tileClassChangeCount;
+                     ++index) {
+                    const uint32_t handle = tileClassChanges[index];
+                    const uint32_t slot = handle - firstHandle;
+                    if (slot >= kDenseRenderHandlesPerTile) continue;
+                    const uint8_t oldClass = slotClass[slot];
+                    if (oldClass == UINT8_MAX) continue;
+                    uint32_t* oldList = classHandles[oldClass];
+                    uint32_t& oldCount = classCounts[oldClass];
+                    for (uint32_t pos = 0u; pos < oldCount; ++pos) {
+                        if (oldList[pos] != handle) continue;
+                        oldList[pos] = oldList[--oldCount];
+                        break;
+                    }
+                    const uint32_t actual = classifyDense(handle);
+                    classHandles[actual][classCounts[actual]++] = handle;
+                    slotClass[slot] = static_cast<uint8_t>(actual);
+                }
+                tileClassChangeCount = 0u;
                 continue;
-            const uint32_t retiredAt = RenderPrimaryVoiceSpan(
-                v, handle, denseSampleData_, denseSampleDataFrames_,
-                outputLeft, outputRight, cursor, spanFrames, spanFrames);
-            if (retiredAt != UINT32_MAX)
-                v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
+            }
+            for (uint32_t index = 0u; index < count; ++index) {
+                const uint32_t handle = list[index];
+                const uint32_t slot = handle - firstHandle;
+                const uint32_t retiredAt = RenderPrimaryVoiceSpan(
+                    v, handle, denseSampleData_, denseSampleDataFrames_,
+                    outputLeft, outputRight, cursor, spanFrames, spanFrames);
+                if (retiredAt != UINT32_MAX) {
+                    v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
+                    slotClass[slot] = UINT8_MAX;
+                }
+            }
         }
+        // Retiring kernels free slots without records (dense mode drops the
+        // retirement record); sweep the touched set for freed voices and
+        // drop them from their buckets.
+        for (uint32_t index = 0u; index < touchedSlotCount; ++index) {
+            const uint32_t slot = touchedSlots[index];
+            if (slotClass[slot] == UINT8_MAX) continue;
+            const uint32_t handle = firstHandle + slot;
+            if (v.state[handle] != static_cast<uint8_t>(VoiceState::Free))
+                continue;
+            uint32_t* freedList = classHandles[slotClass[slot]];
+            uint32_t& freedCount = classCounts[slotClass[slot]];
+            for (uint32_t pos = 0u; pos < freedCount; ++pos) {
+                if (freedList[pos] != handle) continue;
+                freedList[pos] = freedList[--freedCount];
+                break;
+            }
+            slotClass[slot] = UINT8_MAX;
+        }
+        tileClassChangeCount = 0u;
         cursor = spanEnd;
     }
 }
@@ -2614,6 +2736,11 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                     voices.SetVoiceConfiguredHook(nullptr, nullptr);
                     densePlannerVoices_ = nullptr;
                     if (renderInFlight) workerPool_->FinishIndexed();
+                    // Feed the adaptive gate: a capacity overrun means this
+                    // callback marked far too many handles for exact-frame
+                    // planning to pay off; without this the next callback
+                    // would repeat the same doomed planning attempt.
+                    denseLastCallbackMarked_ = denseCallbackMarked_;
                     // Chunks before this one are fully rendered; the caller
                     // recovers by sparse-rendering [chunkStart, rangeEnd).
                     *renderedTo = chunkStart;
