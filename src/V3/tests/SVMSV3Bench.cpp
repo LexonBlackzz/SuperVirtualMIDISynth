@@ -92,6 +92,7 @@ struct Options {
     bool batchNoteOffIndex = false;
     bool launchChurnProfile = false;
     bool volatileFallbackScan = false;
+    uint32_t genericVoices = 0;
     uint32_t eventStride = 1;
     uint32_t noteRate = 64000;
     uint32_t keyCount = 128;
@@ -139,6 +140,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             if (!nextNumber(options.warmupSeconds)) return false;
         } else if (std::strcmp(argv[i], "--workload") == 0) {
             if (i + 1 >= argc || !ParseWorkload(argv[++i], options.workload)) return false;
+        } else if (std::strcmp(argv[i], "--generic-voices") == 0) {
+            if (!nextNumber(options.genericVoices)) return false;
         } else if (std::strcmp(argv[i], "--event-stride") == 0) {
             if (!nextNumber(options.eventStride) || options.eventStride == 0u)
                 return false;
@@ -232,7 +235,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
 bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
                      const svms::RuntimeConfigSnapshot& cfg,
                      uint32_t voiceCount, Workload workload,
-                     uint32_t sampleFrames) {
+                     uint32_t sampleFrames, uint32_t genericVoices) {
     if (!voices.Initialize(voiceCount, 44100)) return false;
     channels.SetMasterVolume(1.0f);
     channels.RebuildCache(cfg, 44100.0f);
@@ -240,16 +243,37 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
     const uint32_t regionCount = sampleFrames / regionFrames;
 
     for (uint32_t i = 0; i < voiceCount; ++i) {
+        const bool genericVoice = genericVoices != 0u &&
+                                  (workload == Workload::Release ||
+                                   workload == Workload::ChoppedNotes) &&
+                                  i < genericVoices;
         const svms::VoiceHandle handle = voices.AllocateVoice(
-            static_cast<uint8_t>(i & 15u), static_cast<uint8_t>(24u + i % 88u),
+            static_cast<uint8_t>(i & 15u),
+            static_cast<uint8_t>(genericVoice ? 127u : 24u + i % 88u),
             static_cast<uint8_t>(64u + i % 64u));
         const uint32_t start = (i % regionCount) * regionFrames;
         const float phaseStep = 0.5f + static_cast<float>(i % 97u) / 64.0f;
-        voices.SetVoiceSample(handle, start, start + regionFrames,
-                              start + 16u, start + regionFrames - 16u,
-                              1u, phaseStep, 1u);
+        // Generic-class mimic: a sustaining, non-looping voice (like a bass
+        // hum whose SF2 region has no loop points).  Used to reproduce the
+        // live "one Generic voice correlates with a CPU jump" signature.
+        // Note 127 keeps it outside the chopped-notes key range so stray
+        // note-offs cannot release it.
+        if (genericVoice) {
+            voices.SetVoiceSample(handle, start, start + regionFrames,
+                                  start + 16u, start + regionFrames - 16u,
+                                  0u, 0.0005f, 1u);
+        } else {
+            voices.SetVoiceSample(handle, start, start + regionFrames,
+                                  start + 16u, start + regionFrames - 16u,
+                                  1u, phaseStep, 1u);
+        }
 
-        if (workload == Workload::Envelope) {
+        if (genericVoice) {
+            // Non-loop active voice in the decay stage -> ClassifyVoice
+            // returns Generic.  Slow decay so it survives the whole run.
+            voices.SetVoiceEnvelope(handle, 1.0f, 0.4f, 0u, 0u, 0u,
+                                    UINT32_MAX, 0.0f, 0.99999999f, 0.99999f);
+        } else if (workload == Workload::Envelope) {
             if ((i & 1u) == 0u) {
                 voices.SetVoiceEnvelope(handle, 1.0f, 0.4f, 0u, 0u,
                                         UINT32_MAX, 0u, 1.0e-9f, 1.0f, 0.99999f);
@@ -261,12 +285,14 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
             voices.SetVoiceEnvelope(handle, 1.0f, 0.7f, 0u, 0u, 0u, 0u,
                                     0.0f, 1.0f, 0.9999999f);
         }
-        voices.SetVoiceGain(handle, 0.001f, 0.001f);
+        voices.SetVoiceGain(handle, genericVoice ? 1.0f : 0.001f,
+                            genericVoice ? 1.0f : 0.001f);
         voices.SetVoiceSoundFontIdentity(
             handle, 0u, static_cast<uint16_t>(i & 0xffffu));
         voices.RefreshMixGain(handle, channels.GetParams()[i & 15u]);
 
-        if (workload == Workload::Release) voices.StartRelease(handle);
+        if (workload == Workload::Release && !genericVoice)
+            voices.StartRelease(handle);
     }
     return true;
 }
@@ -544,7 +570,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "usage: svms_v3_bench [--voices 1..524288] [--frames 16..8192] "
             "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst|chopped-notes] "
-            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--base-note 0..127] [--key-stride 1..127] [--attack-frames N] [--note-length-frames N] [--soundfont PATH] "
+            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--base-note 0..127] [--key-stride 1..127] [--attack-frames N] [--note-length-frames N] [--generic-voices N] [--soundfont PATH] "
             "[--render-threads 1..64] "
             "[--backend auto|scalar|sse2|avx2] "
             "[--launch-path legacy|transactional] "
@@ -586,9 +612,16 @@ int main(int argc, char** argv) {
     auto voices = std::make_unique<svms::VoiceManager>();
     svms::ChannelCache channels;
     if (!ConfigureVoices(*voices, channels, cfg, options.voices,
-                         options.workload, sampleFrames)) {
+                         options.workload, sampleFrames,
+                         options.genericVoices)) {
         std::fprintf(stderr, "cannot allocate voice storage\n");
         return 3;
+    }
+    if (options.genericVoices != 0u) {
+        std::fprintf(stderr, "[diag] after configure: active=%u generic=%u rloop=%u\n",
+                     voices->GetActiveCount(),
+                     voices->GetRenderClassCount(svms::VoiceRenderClass::Generic),
+                     voices->GetRenderClassCount(svms::VoiceRenderClass::ReleaseLoop));
     }
     voices->SetLaunchChurnProfilingEnabledForTest(
         options.launchChurnProfile);
