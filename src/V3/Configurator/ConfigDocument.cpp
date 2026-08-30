@@ -389,7 +389,7 @@ bool ConfigDocument::Load(const std::wstring& path) {
     activePath_ = path;
 
     try {
-        std::ifstream input(path, std::ios::binary);
+        std::ifstream input(fs::path(path), std::ios::binary);
         if (!input) {
             configWarning_ = "unable to open config file";
             loaded_ = working_;
@@ -471,7 +471,7 @@ bool ConfigDocument::ImportProfile(const std::wstring& path,
         if (size > kMaxProfileBytes)
             return fail("the profile exceeds the 16 MiB safety limit");
 
-        std::ifstream input(path, std::ios::binary);
+        std::ifstream input(fs::path(path), std::ios::binary);
         if (!input) return fail("could not open the profile");
         json profile;
         input >> profile;

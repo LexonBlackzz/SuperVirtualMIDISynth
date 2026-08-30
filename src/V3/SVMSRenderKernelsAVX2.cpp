@@ -10,6 +10,18 @@
 namespace svms {
 namespace {
 
+// GCC-target-compatible replacement for _mm256_i32scatter_ps (which is an
+// AVX512VL intrinsic). Performs the same lane-wise store using only AVX2:
+// dst[lane] = value[lane] where dst = base + index[lane] (unit stride, float).
+inline void SVMS_ScatterPs(float* base, __m256i index, __m256 value) {
+    alignas(32) float val[8];
+    alignas(32) int32_t idx[8];
+    _mm256_store_ps(val, value);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(idx), index);
+    for (uint32_t lane = 0; lane < 8u; ++lane)
+        base[idx[lane]] = val[lane];
+}
+
 float HorizontalSum(__m256 value) {
     alignas(32) float lanes[8];
     _mm256_store_ps(lanes, value);
@@ -1169,9 +1181,18 @@ void RenderSustainedLoopRotationAVX2(const RenderSpanContext& c,
                 phase = _mm256_add_ps(phase, step);
             }
 
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC exposes the AVX512VL scatter intrinsic under /arch:AVX2; GCC gates it
+// behind -mavx512f/-mavx512vl, so non-MSVC falls back to per-lane stores
+// (semantically identical, no AVX512 instruction emitted).
 #define SVMS_ROT_SCATTER(field, value) _mm256_i32scatter_ps(               \
             stateBase + (offsetof(VoiceRotationState, field) /             \
                          sizeof(float)), h12, value, 4)
+#else
+#define SVMS_ROT_SCATTER(field, value) SVMS_ScatterPs(                     \
+            stateBase + (offsetof(VoiceRotationState, field) /             \
+                         sizeof(float)), h12, value)
+#endif
             SVMS_ROT_SCATTER(c, cs);
             SVMS_ROT_SCATTER(s, sn);
             SVMS_ROT_SCATTER(z0, z0);

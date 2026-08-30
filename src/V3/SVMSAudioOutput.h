@@ -21,6 +21,16 @@
 #include <xmmintrin.h>
 #include <cstddef>
 
+#if defined(__MINGW32__)
+// MinGW's ksmedia.h only declares (never defines) the KS subtype GUIDs, and
+// some MinGW distributions (w64devkit) do not ship ksuser.lib to link them.
+// Provide the constant inline so both toolchains resolve the same value.
+static const GUID kKsSubTypeIeeeFloat = {
+    0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+#else
+static const GUID& kKsSubTypeIeeeFloat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+#endif
+
 // WAVEFORMATEX is a packed wire structure. Including mmeapi.h before
 // mmreg.h with some Windows SDKs defines it at the default packing (20 bytes),
 // which shifts WAVEFORMATEXTENSIBLE::SubFormat by two bytes and makes a float
@@ -320,7 +330,7 @@ inline bool AudioOutput::OpenEndpoint(bool preserveEngineRate,
     formatIsFloat_ = (clientFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
     if (clientFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
         const WAVEFORMATEXTENSIBLE* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(clientFormat);
-        formatIsFloat_ = IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) != FALSE;
+        formatIsFloat_ = IsEqualGUID(ext->SubFormat, kKsSubTypeIeeeFloat) != FALSE;
     }
     formatBitsPerSample_ = clientFormat->wBitsPerSample;
     formatChannels_ = clientFormat->nChannels;

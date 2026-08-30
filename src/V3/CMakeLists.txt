@@ -468,6 +468,11 @@ if(NOT SVMS_XP_COMPAT)
         SVMSGpuDevice.cpp)
     target_compile_definitions(svms_v3_render PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    if(MINGW)
+        # wmain entry point requires the unicode startup on MinGW.
+        target_compile_options(svms_v3_render PRIVATE -municode)
+        target_link_options(svms_v3_render PRIVATE -municode)
+    endif()
     target_include_directories(svms_v3_render PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
@@ -535,7 +540,7 @@ if(NOT SVMS_XP_COMPAT)
     target_compile_definitions(svms_v3_configurator PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(svms_v3_configurator PRIVATE
-        d3d11 dxgi user32 gdi32 shell32 ole32 uuid comdlg32 winhttp)
+        d3d11 dxgi d3dcompiler dwmapi user32 gdi32 shell32 ole32 uuid comdlg32 winhttp)
     set_target_properties(svms_v3_configurator PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
@@ -701,6 +706,11 @@ if(SVMS_BUILD_TESTS)
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_v3_midi_stream_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
+        if(MINGW)
+            # Windows entry point is wmain; MinGW needs the unicode startup.
+            target_compile_options(svms_v3_midi_stream_tests PRIVATE -municode)
+            target_link_options(svms_v3_midi_stream_tests PRIVATE -municode)
+        endif()
         add_test(NAME svms_v3_midi_stream COMMAND svms_v3_midi_stream_tests)
 
         add_executable(svms_v3_config_profile_tests
@@ -728,6 +738,11 @@ if(SVMS_BUILD_TESTS)
 
         add_executable(svms_v3_live_smoke tests/SVMSLiveSmoke.cpp)
         target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        if(MINGW)
+            # wmain entry point requires the unicode startup on MinGW.
+            target_compile_options(svms_v3_live_smoke PRIVATE -municode)
+            target_link_options(svms_v3_live_smoke PRIVATE -municode)
+        endif()
         target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
 

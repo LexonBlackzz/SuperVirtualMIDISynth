@@ -18,6 +18,18 @@
 
 #include "SVMSTypes.h"
 
+#if defined(__MINGW32__)
+// MinGW's ksmedia.h only declares (never defines) the KS subtype GUIDs; provide
+// the constant so the test links without ksuser.lib.
+static const GUID kKsSubTypeIeeeFloat = {
+    0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+static const GUID kKsSubTypePcm = {
+    0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+#else
+static const GUID& kKsSubTypeIeeeFloat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+static const GUID& kKsSubTypePcm = KSDATAFORMAT_SUBTYPE_PCM;
+#endif
+
 template <typename T>
 static void ReleaseCom(T*& value) {
     if (value) { value->Release(); value = nullptr; }
@@ -59,7 +71,7 @@ static HRESULT SelectRenderDevice(IMMDeviceEnumerator* enumerator,
 
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2 || argc > 5) {
-        std::fwprintf(stderr,
+        fwprintf(stderr,
             L"usage: svms_v3_live_smoke <winmm.dll> [repeat-count] [midi-note] [output-device]\n");
         return 2;
     }
@@ -123,8 +135,8 @@ int wmain(int argc, wchar_t** argv) {
                     ext->SubFormat.Data3, ext->SubFormat.Data4[0], ext->SubFormat.Data4[1],
                     ext->SubFormat.Data4[2], ext->SubFormat.Data4[3], ext->SubFormat.Data4[4],
                     ext->SubFormat.Data4[5], ext->SubFormat.Data4[6], ext->SubFormat.Data4[7],
-                    IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? 1u : 0u,
-                    IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_PCM) ? 1u : 0u,
+                    IsEqualGUID(ext->SubFormat, kKsSubTypeIeeeFloat) ? 1u : 0u,
+                    IsEqualGUID(ext->SubFormat, kKsSubTypePcm) ? 1u : 0u,
                     static_cast<unsigned long>(ext->dwChannelMask));
     }
     hr = captureClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
@@ -183,7 +195,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool isFloat = format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
         (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
          IsEqualGUID(reinterpret_cast<WAVEFORMATEXTENSIBLE*>(format)->SubFormat,
-                     KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
+                     kKsSubTypeIeeeFloat));
     float peak = 0.0f;
     uint64_t capturedFrames = 0;
     const ULONGLONG deadline = GetTickCount64() + 2500;
