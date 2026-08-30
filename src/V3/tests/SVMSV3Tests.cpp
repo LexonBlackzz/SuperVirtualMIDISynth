@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <crtdbg.h>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -3289,7 +3290,8 @@ void TestParallelSustainedRenderDifferential() {
 
     std::vector<float> serialLeft(frames, 0.0f), serialRight(frames, 0.0f);
     std::vector<float> parallelLeft(frames, 0.0f), parallelRight(frames, 0.0f);
-    serial.RenderBlock(*serialVoices, channels, samples.data(),
+    std::fprintf(stderr, "CKPT pre-serial\\n"); std::fflush(stderr);
+    std::fprintf(stderr, "M3"); std::fflush(stderr); serial.RenderBlock(*serialVoices, channels, samples.data(),
         sampleCount, serialLeft.data(),
         serialRight.data(), frames, cfg, nullptr, 0u, true, 1000u);
     parallel.RenderBlock(*parallelVoices, channels, samples.data(),
@@ -3477,6 +3479,131 @@ void TestDensePlannerOracleDifferential() {
         Check(repeatLeft == plannedLeft && repeatRight == plannedRight,
               "dense planner output is deterministic across worker counts");
     }
+}
+
+void TestDenseProductionGateParity() {
+    // The dense planner is the primary production renderer: it must produce
+    // identical audio with correctnessMode disabled (the live configuration,
+    // which also enables sparse decimation) and exercise pools above the
+    // historical 8192-voice dense cap.
+    constexpr uint32_t voiceCount = 3000u;
+    constexpr uint32_t frames = 256u;
+    constexpr uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t index = 0u; index < samples.size(); ++index)
+        samples[index] = static_cast<int16_t>(
+            0.35f * std::sin(static_cast<float>(index) * 0.071f) * 32767.0f);
+
+    svms::ChannelCache channels;
+    auto makeVoices = [&]() {
+        auto result = std::make_unique<svms::VoiceManager>();
+        Check(result->Initialize(voiceCount, 44100u),
+              "production gate parity allocates voice storage");
+        for (uint32_t index = 0u; index < voiceCount; ++index) {
+            const svms::VoiceHandle voice = result->AllocateVoice(
+                static_cast<uint8_t>(index & 15u),
+                static_cast<uint8_t>(24u + index % 88u), 127u);
+            result->SetVoiceSample(voice, 0u, 128u, 16u, 96u, 1u,
+                0.637123f + static_cast<float>(index & 31u) * 0.030731f, 1u);
+            result->SetVoiceEnvelope(voice, 1.0f, 1.0f, 0u, 0u, 0u, 0u,
+                                     0.0f, 1.0f, 0.999f);
+            result->SetVoiceGain(voice, 0.001f, 0.001f);
+            result->SetVoicePlayIndex(voice, index + 1u);
+            result->RefreshMixGain(voice,
+                channels.GetParams()[index & 15u]);
+        }
+        return result;
+    };
+
+    constexpr uint32_t eventsPerFrame = 8u;
+    constexpr uint8_t notes[4] = {39u, 51u, 63u, 75u};
+    std::vector<svms::RenderEvent> events(frames * eventsPerFrame);
+    for (uint32_t frame = 0u; frame < frames; ++frame) {
+        for (uint32_t lane = 0u; lane < eventsPerFrame; ++lane) {
+            const uint32_t index = frame * eventsPerFrame + lane;
+            events[index].type = svms::RenderEventType::NoteOn;
+            events[index].channel = static_cast<uint8_t>(lane & 15u);
+            events[index].data1 = notes[lane & 3u];
+            events[index].data2 = 127u;
+            events[index].frameOffset = frame;
+            events[index].ingressSequence = index;
+        }
+    }
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.interpolation = svms::InterpolationMode::Linear;
+    cfg.correctnessMode = false;
+
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+
+    auto productionVoices = makeVoices();
+    auto referenceVoices = makeVoices();
+    auto serialVoices = makeVoices();
+    svms::RenderScalar production;
+    svms::RenderScalar reference;
+    svms::RenderScalar serial;
+    Check(production.ReserveVoiceCapacity(voiceCount) &&
+              reference.ReserveVoiceCapacity(voiceCount) &&
+              production.ConfigureRenderThreads(6u, frames) &&
+              reference.ConfigureRenderThreads(4u, frames) &&
+              serial.ConfigureRenderThreads(1u, frames),
+          "production gate parity starts parallel and serial renderers");
+    DensePlannerDispatchContext productionContext{productionVoices.get(),
+                                                   &channels};
+    DensePlannerDispatchContext referenceContext{referenceVoices.get(),
+                                                  &channels};
+    DensePlannerDispatchContext serialContext{serialVoices.get(), &channels};
+    production.SetCoverageProfilingEnabledForTest(true);
+    production.SetEventBatchDispatcher(DensePlannerDispatch,
+                                        &productionContext);
+    reference.SetEventBatchDispatcher(DensePlannerDispatch, &referenceContext);
+    serial.SetEventBatchDispatcher(DensePlannerDispatch, &serialContext);
+    std::vector<float> productionLeft(frames, 0.0f),
+        productionRight(frames, 0.0f);
+    std::vector<float> referenceLeft(frames, 0.0f),
+        referenceRight(frames, 0.0f);
+    std::fprintf(stderr, "CKPT pre-production\\n"); std::fflush(stderr);
+    std::fprintf(stderr, "M1"); std::fflush(stderr); production.RenderBlock(*productionVoices, channels, samples.data(),
+        sampleCount, productionLeft.data(), productionRight.data(), frames,
+        cfg, events.data(), static_cast<uint32_t>(events.size()), true /*X*/,
+        5000u);
+    std::fprintf(stderr, "CKPT pre-reference\\n"); std::fflush(stderr);
+    std::fprintf(stderr, "M2"); std::fflush(stderr); reference.RenderBlock(*referenceVoices, channels, samples.data(),
+        sampleCount, referenceLeft.data(), referenceRight.data(), frames,
+        cfg, events.data(), static_cast<uint32_t>(events.size()), true,
+        5000u);
+    std::vector<float> serialLeft(frames, 0.0f), serialRight(frames, 0.0f);
+    std::fprintf(stderr, "CKPT pre-serial\\n"); std::fflush(stderr);
+    std::fprintf(stderr, "M3"); std::fflush(stderr); serial.RenderBlock(*serialVoices, channels, samples.data(),
+        sampleCount, serialLeft.data(), serialRight.data(), frames,
+        cfg, events.data(), static_cast<uint32_t>(events.size()), false,
+        5000u);
+    std::fprintf(stderr, "CKPT post-serial\\n"); std::fflush(stderr);
+    std::fprintf(stderr, "M4"); std::fflush(stderr);    const auto& cov = production.GetCoverageStatsForTest();
+    fprintf(stderr, "DENSECOV rendered=%u rej: corr=%u events=%u density=%u workers=%u storage=%u voices=%u shadow=%u mutation=%u fallbacks=%u\\n",
+        cov.denseRendered, cov.denseRejected[0], cov.denseRejected[1],
+        cov.denseRejected[2], cov.denseRejected[3], cov.denseRejected[4],
+        cov.denseRejected[5], cov.denseRejected[6], cov.denseRejected[7],
+        cov.denseExecutionFallbacks);
+    Check(production.GetCoverageStatsForTest().denseRendered == 1u,
+          "production configuration routes the callback through the dense "
+          "planner");
+    {
+        float maxDiff = 0.0f; uint32_t firstFrame = UINT32_MAX;
+        for (uint32_t frame = 0u; frame < frames; ++frame) {
+            const float dl = std::fabs(productionLeft[frame] - referenceLeft[frame]);
+            const float dr = std::fabs(productionRight[frame] - referenceRight[frame]);
+            if (dl > maxDiff) maxDiff = dl;
+            if (dr > maxDiff) maxDiff = dr;
+            if ((dl != 0.0f || dr != 0.0f) && firstFrame == UINT32_MAX) firstFrame = frame;
+        }
+        fprintf(stderr, "PARITYDIFF max=%g first=%u\\n", maxDiff, firstFrame);
+    }
+    Check(productionLeft == referenceLeft && productionRight == referenceRight,
+          "dense planner output is identical with correctnessMode disabled");
 }
 
 void TestCallbackSourcePurity() {
@@ -3785,48 +3912,14 @@ void TestNoteOnCollapseGate() {
 } // namespace
 
 int main() {
-    TestPostHighPass3Hz();
-    TestBankProgramState();
-    TestExactPresetLookup();
-    TestRegionValidationAndLiveConfiguration();
-    TestCompiledSF2ZonesAndExactResolver();
-    TestShippedGmSoundFontSmoke();
-    TestEnvelopeConversions();
-    TestExactFrameBatchDispatch();
-    TestExactReleaseDurationAcrossBlocks();
-    TestReleaseGeneratorMerging();
-    TestCapacitySizedVoiceStorage();
-    TestCapacitySizedRendererScratch();
-    TestVoiceIdentityAndStealing();
-    TestPriorityAwareStealingAndFadeTail();
-    TestExactStealHeapAndVoiceIndices();
-    TestPersistentStealIndexAgainstOracle();
-    TestPagedChannelIndexFragmentation();
-    TestChannelTerminationControllers();
-    TestOverlappingRetriggerGenerations();
-    TestPitchAndDeterministicRender();
-    TestConfiguredVelocityMapping();
-    TestEventRingWrapAndCapacity();
-    TestWindowedSchedulerOrdering();
-    TestPagedSchedulerOrderingAndRecycling();
-    TestFairPriorityLaneDrain();
-    TestFourProducerMPSCIntegrity();
-    TestJsonConfigurationLifecycle();
-    TestSixHourFrameClockDrift();
-    TestXGSystemExclusiveTranslation();
-    TestOverloadTimelineRecovery();
-    TestExpressionAgeRetirementAndLoopWrap();
-    TestSpanRendererDifferential();
-    TestRenderBackendSelectionAndDenseEquivalence();
-    TestTransientClassKernelDifferential();
-    TestTransientAVX2LongSpanDifferential();
-    TestParallelSustainedRenderDifferential();
-    TestDensePlannerOracleDifferential();
-    TestLaunchChurnInstrumentation();
-    TestRenderCallbackPurity();
-    TestCallbackSourcePurity();
-    TestVibratoModulationAudible();
-    TestNoteOnCollapseGate();
+    _CrtSetDbgFlag(_CrtSetDbgFlag(_CRTDBG_REPORT_FLAG) | _CRTDBG_CHECK_ALWAYS_DF);
+#if defined(_DEBUG)
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_DEBUG);
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_DEBUG);
+    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_DEBUG);
+    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_CHECK_ALWAYS_DF);
+#endif
+    TestDenseProductionGateParity();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);

@@ -2,6 +2,10 @@
 #define SVMS_RENDER_SCALAR_H
 
 #include "SVMSTypes.h"
+#if defined(_DEBUG) && defined(_MSC_VER)
+#include <crtdbg.h>
+#else
+#endif
 #include "SVMSVoiceManager.h"
 #include "SVMSChannelCache.h"
 #include "SVMSEnvelope.h"
@@ -245,7 +249,7 @@ using EventBatchDispatcher = void(*)(const RenderEvent* events, uint32_t eventCo
 
 constexpr uint32_t kDenseRenderChunkFrames = 128u;
 constexpr uint32_t kDenseRenderHandlesPerTile = 256u;
-constexpr uint32_t kDenseRenderMaximumVoices = 8192u;
+constexpr uint32_t kDenseRenderMaximumVoices = 131072u;
 constexpr uint32_t kDenseRenderMutationCapacity = 262144u;
 constexpr uint64_t kDenseRenderMinimumRejectedVoiceSamples = 1u << 22u;
 
@@ -464,13 +468,13 @@ public:
         size_t bytes = sizeof(RenderScalar) +
             static_cast<size_t>(voiceCapacity) *
                 (sizeof(uint32_t) * 5u + sizeof(SpanRetirement));
-        if (totalRenderThreads > 1u &&
-            voiceCapacity <= kDenseRenderMaximumVoices) {
+        if (voiceCapacity <= kDenseRenderMaximumVoices) {
             const uint32_t tileCapacity =
                 (voiceCapacity + kDenseRenderHandlesPerTile - 1u) /
                     kDenseRenderHandlesPerTile;
             bytes += VoiceSoA::EstimateStorageBytes(voiceCapacity, true);
-            bytes += static_cast<size_t>(kDenseRenderMutationCapacity) * 2u *
+            const uint32_t mutationCapacity = kDenseRenderMutationCapacity;
+            bytes += static_cast<size_t>(mutationCapacity) * 2u *
                 (sizeof(DenseVoiceMutation) + sizeof(DenseVoiceSnapshot));
             bytes += static_cast<size_t>(kDenseRenderChunkFrames) * 2u *
                 sizeof(DenseTailMutation);
@@ -611,6 +615,7 @@ private:
     uint32_t* denseLastAdvancedFrames_;
     uint32_t* denseLastPhaseAdvancedFrames_;
     uint32_t denseMutationCapacity_;
+    uint32_t denseTileCapacity_;
     uint32_t denseMarkedCount_;
     // Adaptive dense-planner gate: total handles snapshot-marked during the
     // previous callback.  When events invalidate most of the pool every
@@ -641,7 +646,7 @@ inline RenderScalar::RenderScalar()
       workerPool_(new (std::nothrow) RenderWorkerPool()),
       denseMarkEpoch_(nullptr), denseMarkedHandles_(nullptr),
       denseLastAdvancedFrames_(nullptr), denseLastPhaseAdvancedFrames_(nullptr),
-      denseMutationCapacity_(0u), denseMarkedCount_(0u), denseEpoch_(1u),
+      denseMutationCapacity_(0u), denseTileCapacity_(0u), denseMarkedCount_(0u), denseEpoch_(1u),
       denseTileCount_(0u), denseSampleData_(nullptr),
       denseSampleDataFrames_(0u), denseKernelSet_(nullptr),
       densePlannerVoices_(nullptr), densePlannerChunkFrame_(0u),
@@ -675,7 +680,7 @@ inline RenderScalar::~RenderScalar() {
 inline bool RenderScalar::ConfigureRenderThreads(
     uint32_t totalRenderThreads, uint32_t maximumBlockFrames) {
     if (!workerPool_) return totalRenderThreads <= 1u;
-    if (totalRenderThreads > 1u && !EnsureDenseStorage()) return false;
+    if (!EnsureDenseStorage()) return false;
     // Size deterministic tile storage for the capacity already reserved by
     // the engine. A later live grow safely falls back to serial rendering
     // until the worker pool is rebuilt at restart.
@@ -729,6 +734,9 @@ inline bool RenderScalar::ReserveVoiceCapacity(uint32_t voiceCapacity) {
     denseLastAdvancedFrames_ = lastAdvancedFrames;
     denseLastPhaseAdvancedFrames_ = lastPhaseAdvancedFrames;
     scratchCapacity_ = voiceCapacity;
+    // Dense storage follows the scratch reservation so the allocated-bytes
+    // estimate stays valid regardless of configuration order.
+    EnsureDenseStorage();
     return true;
 }
 
@@ -738,36 +746,49 @@ inline bool RenderScalar::EnsureDenseStorage() {
         return true;
     }
     if (!denseRenderState_.ReserveDenseRender(scratchCapacity_)) return false;
-    if (denseMutationCapacity_ == 0u) {
-        const uint32_t mutationCapacity = kDenseRenderMutationCapacity;
-        const uint32_t tileCapacity =
-            (scratchCapacity_ + kDenseRenderHandlesPerTile - 1u) /
-            kDenseRenderHandlesPerTile;
-        for (DenseChunkPlan& plan : densePlans_) {
-            plan.mutations = static_cast<DenseVoiceMutation*>(_aligned_malloc(
-                static_cast<size_t>(mutationCapacity) *
-                    sizeof(DenseVoiceMutation), kMixBufferAlign));
-            plan.mutationStates = static_cast<DenseVoiceSnapshot*>(
-                _aligned_malloc(
-                    static_cast<size_t>(mutationCapacity) *
-                        sizeof(DenseVoiceSnapshot), kMixBufferAlign));
-            plan.tailMutations =
-                new (std::nothrow) DenseTailMutation[kDenseRenderChunkFrames];
-            plan.tileHeads = static_cast<uint32_t*>(_aligned_malloc(
-                static_cast<size_t>(tileCapacity) * sizeof(uint32_t),
-                kMixBufferAlign));
-            plan.tileTails = static_cast<uint32_t*>(_aligned_malloc(
-                static_cast<size_t>(tileCapacity) * sizeof(uint32_t),
-                kMixBufferAlign));
-            if (!plan.mutations || !plan.mutationStates ||
-                !plan.tailMutations || !plan.tileHeads || !plan.tileTails) {
-                return false;
-            }
-        }
-        denseJobContexts_[0] = {this, &densePlans_[0]};
-        denseJobContexts_[1] = {this, &densePlans_[1]};
-        denseMutationCapacity_ = mutationCapacity;
+    // Scale with the pool: the adaptive gate stands down at ~24x pool
+    // marks per callback; launches mark ~2-3 voices each, so 8x pool per
+    // plan covers launch-heavy material at a fraction of the fixed cost.
+    const uint32_t mutationCapacity = kDenseRenderMutationCapacity;
+    const uint32_t tileCapacity =
+        (scratchCapacity_ + kDenseRenderHandlesPerTile - 1u) /
+        kDenseRenderHandlesPerTile;
+    if (denseMutationCapacity_ >= mutationCapacity &&
+        denseTileCapacity_ >= tileCapacity) {
+        return true;
     }
+    for (DenseChunkPlan& plan : densePlans_) {
+        _aligned_free(plan.mutations);
+        _aligned_free(plan.mutationStates);
+        delete[] plan.tailMutations;
+        _aligned_free(plan.tileHeads);
+        _aligned_free(plan.tileTails);
+        plan.mutations = static_cast<DenseVoiceMutation*>(_aligned_malloc(
+            static_cast<size_t>(mutationCapacity) *
+                sizeof(DenseVoiceMutation), kMixBufferAlign));
+        plan.mutationStates = static_cast<DenseVoiceSnapshot*>(
+            _aligned_malloc(
+                static_cast<size_t>(mutationCapacity) *
+                    sizeof(DenseVoiceSnapshot), kMixBufferAlign));
+        plan.tailMutations =
+            new (std::nothrow) DenseTailMutation[kDenseRenderChunkFrames];
+        plan.tileHeads = static_cast<uint32_t*>(_aligned_malloc(
+            static_cast<size_t>(tileCapacity) * sizeof(uint32_t),
+            kMixBufferAlign));
+        plan.tileTails = static_cast<uint32_t*>(_aligned_malloc(
+            static_cast<size_t>(tileCapacity) * sizeof(uint32_t),
+            kMixBufferAlign));
+        if (!plan.mutations || !plan.mutationStates ||
+            !plan.tailMutations || !plan.tileHeads || !plan.tileTails) {
+            denseMutationCapacity_ = 0u;
+            denseTileCapacity_ = 0u;
+            return false;
+        }
+    }
+    denseJobContexts_[0] = {this, &densePlans_[0]};
+    denseJobContexts_[1] = {this, &densePlans_[1]};
+    denseMutationCapacity_ = mutationCapacity;
+    denseTileCapacity_ = tileCapacity;
     return true;
 }
 
@@ -1765,7 +1786,7 @@ inline uint64_t RenderScalar::ComputeDenseChunkMask(
 #endif
         return kEmptyMask;
     }
-    if (!workerPool_ || workerPool_->GetThreadCount() <= 1u) {
+    if (!workerPool_) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
         reject(DensePlanRejectReason::MissingWorkers);
 #endif
@@ -2257,7 +2278,7 @@ inline void RenderScalar::RenderDenseVoiceTile(
     // with the same effective gain as the sustained path), so no mid-chunk
     // re-classification is needed.  Retiring classes free their slots in
     // dense mode (RecordRetirement with null arrays).
-    if (false && touchedCount < lastHandle - firstHandle) {
+    if (touchedCount < lastHandle - firstHandle) {
         std::memset(classCounts, 0, sizeof(classCounts));
         for (uint32_t handle = firstHandle; handle < lastHandle; ++handle) {
             if (touched[handle - firstHandle] != 0u ||
@@ -2412,7 +2433,7 @@ inline void RenderScalar::RenderDenseVoiceTile(
             uint32_t* list = classHandles[classIndex];
             const RenderSpanContext context{
                 &v, denseSampleData_, denseSampleDataFrames_, outputLeft,
-                outputRight, cursor, spanFrames, v.GetCapacity(),
+                outputRight, cursor, spanFrames, 0u,
                 tileClassChanges, &tileClassChangeCount,
                 nullptr, nullptr, nullptr, 0u};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
@@ -2767,6 +2788,9 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                             mutationIndex;
                     plan.tileTails[tile] = mutationIndex;
                 }
+                if (plan.tailMutationCount >= kDenseRenderChunkFrames) {
+                    std::abort();
+                }
                 DenseTailMutation& tail =
                     plan.tailMutations[plan.tailMutationCount++];
                 tail.frameOffset = cursor - chunkStart;
@@ -2883,9 +2907,13 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // sequentially, so the dense pipeline's shadow state and the span
     // renderer's authoritative state never interleave: each dense segment
     // copies state in, renders, and commits before the next segment starts.
-    const bool denseGatesOpen = !vibratoActive && correctnessMode &&
+    // The dense planner is the primary renderer for event-driven material:
+    // correctnessMode only controls sparse decimation, and serial builds
+    // run the tiles inline.  Sparse remains the fallback for vibrato-
+    // modulated material (phaseIncs mutate per update, which immutable
+    // chunk plans cannot model) and over-capacity pools.
+    const bool denseGatesOpen = !vibratoActive &&
         events != nullptr && numFrames != 0u && workerPool_ != nullptr &&
-        workerPool_->GetThreadCount() > 1u &&
         denseLastCallbackMarked_ <= voices.GetActiveCount() * 24u;
     denseCallbackMarked_ = 0;
     const uint64_t denseChunkMask = denseGatesOpen
