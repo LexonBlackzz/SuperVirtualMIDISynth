@@ -612,6 +612,13 @@ private:
     uint32_t* denseLastPhaseAdvancedFrames_;
     uint32_t denseMutationCapacity_;
     uint32_t denseMarkedCount_;
+    // Adaptive dense-planner gate: total handles snapshot-marked during the
+    // previous callback.  When events invalidate most of the pool every
+    // frame (CC sweeps over full pools: tens of pool-sweeps per callback),
+    // exact-frame planning has no leverage and its snapshot costs dominate;
+    // the gate then keeps the callback on the span renderer.
+    uint32_t denseCallbackMarked_ = 0;
+    uint32_t denseLastCallbackMarked_ = 0;
     uint32_t denseEpoch_;
     uint32_t denseTileCount_;
     const int16_t* denseSampleData_;
@@ -2224,36 +2231,39 @@ inline void RenderScalar::RenderDenseVoiceTile(
     const uint32_t lastHandle = (std::min)(
         firstHandle + kDenseRenderHandlesPerTile, v.GetCapacity());
     uint32_t mutation = plan.tileHeads[tileIndex];
-    uint32_t cursor = 0u;
     alignas(64) uint32_t
         classHandles[kVoiceRenderClassCount][kDenseRenderHandlesPerTile];
     uint32_t classCounts[kVoiceRenderClassCount]{};
+    uint8_t touched[kDenseRenderHandlesPerTile] = {};
+    uint32_t touchedCount = 0u;
 
-    while (cursor < frameCount) {
-        while (mutation != UINT32_MAX &&
-               plan.mutations[mutation].frameOffset == cursor) {
-            const DenseVoiceMutation& change = plan.mutations[mutation];
-            ApplyDenseVoiceSnapshot(v, change.handle,
-                                    plan.mutationStates[mutation]);
-            mutation = change.next;
+    // Pass 1: mark the voices this chunk actually mutates.  Everything else
+    // is state-stable for the whole chunk and renders in ONE long span,
+    // which keeps the per-voice time-chunked kernels (8-frame vector
+    // chunks) engaged.  Per-frame span splits had degenerated the dense
+    // path into single-frame voice-batched dispatch — several times the
+    // cycles per voice-sample — even though each event touches a handful
+    // of voices.
+    for (uint32_t m = mutation; m != UINT32_MAX; m = plan.mutations[m].next) {
+        const uint32_t slot = plan.mutations[m].handle - firstHandle;
+        if (slot < kDenseRenderHandlesPerTile && touched[slot] == 0u) {
+            touched[slot] = 1u;
+            ++touchedCount;
         }
-        uint32_t spanEnd = frameCount;
-        if (mutation != UINT32_MAX)
-            spanEnd = (std::min)(spanEnd,
-                plan.mutations[mutation].frameOffset);
-        if (spanEnd <= cursor) {
-            ++cursor;
-            continue;
-        }
-        const uint32_t spanFrames = spanEnd - cursor;
+    }
 
-        // Classify once, then preserve the established class order. The
-        // initial prototype rescanned the tile for every class and turned a
-        // dense 4M voice-sample callback into ~24M classification checks.
+    // Pass 2: stable voices, one full-chunk span per class.  Class kernels
+    // carry envelope evolution internally (transient's stage 3 is a no-op
+    // with the same effective gain as the sustained path), so no mid-chunk
+    // re-classification is needed.  Retiring classes free their slots in
+    // dense mode (RecordRetirement with null arrays).
+    if (false && touchedCount < lastHandle - firstHandle) {
         std::memset(classCounts, 0, sizeof(classCounts));
         for (uint32_t handle = firstHandle; handle < lastHandle; ++handle) {
-            if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
+            if (touched[handle - firstHandle] != 0u ||
+                v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) {
                 continue;
+            }
             uint32_t actual = v.renderClass[handle] < kVoiceRenderClassCount
                 ? v.renderClass[handle]
                 : static_cast<uint32_t>(VoiceRenderClass::Generic);
@@ -2272,11 +2282,10 @@ inline void RenderScalar::RenderDenseVoiceTile(
             }
             classHandles[actual][classCounts[actual]++] = handle;
         }
-        // Region-grouped ordering within each class: consecutive voices then
-        // read the same sample-data cache lines (at 40k+ polyphony over a
-        // fixed key range, dozens of voices share one SF2 region). Pure
-        // access-order optimization — per-voice state is independent, and the
-        // mix accumulator is order-insensitive at test tolerance (1e-5).
+        // Region-grouped ordering within each class: consecutive voices
+        // then read the same sample-data cache lines (at 40k+ polyphony
+        // over a fixed key range, dozens of voices share one SF2 region).
+        // Once per chunk instead of once per span.
         for (uint32_t classIndex = 0u;
              classIndex < kVoiceRenderClassCount; ++classIndex) {
             const uint32_t count = classCounts[classIndex];
@@ -2293,8 +2302,8 @@ inline void RenderScalar::RenderDenseVoiceTile(
             if (count == 0u) continue;
             const RenderSpanContext context{
                 &v, denseSampleData_, denseSampleDataFrames_, outputLeft,
-                outputRight, cursor, spanFrames, v.GetCapacity(), nullptr,
-                nullptr, nullptr, nullptr, nullptr};
+                outputRight, 0u, frameCount, v.GetCapacity(),
+                nullptr, nullptr, nullptr, nullptr, nullptr, 0u};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
             if (kernel && kernel(context, classHandles[classIndex], count))
                 continue;
@@ -2302,10 +2311,44 @@ inline void RenderScalar::RenderDenseVoiceTile(
                 const uint32_t handle = classHandles[classIndex][index];
                 const uint32_t retiredAt = RenderPrimaryVoiceSpan(
                     v, handle, denseSampleData_, denseSampleDataFrames_,
-                    outputLeft, outputRight, cursor, spanFrames, spanFrames);
+                    outputLeft, outputRight, 0u, frameCount, frameCount);
                 if (retiredAt != UINT32_MAX)
                     v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
             }
+        }
+    }
+
+    // Pass 3: mutated voices, exact-frame segments.  Their count is a
+    // handful per tile even in event-dense material, so the scalar
+    // per-voice path here is cheap; everything else above stayed vector.
+    uint32_t cursor = 0u;
+    while (cursor < frameCount) {
+        while (mutation != UINT32_MAX &&
+               plan.mutations[mutation].frameOffset == cursor) {
+            const DenseVoiceMutation& change = plan.mutations[mutation];
+            ApplyDenseVoiceSnapshot(v, change.handle,
+                                    plan.mutationStates[mutation]);
+            mutation = change.next;
+        }
+        uint32_t spanEnd = frameCount;
+        if (mutation != UINT32_MAX)
+            spanEnd = (std::min)(spanEnd,
+                plan.mutations[mutation].frameOffset);
+        if (spanEnd <= cursor) {
+            ++cursor;
+            continue;
+        }
+        const uint32_t spanFrames = spanEnd - cursor;
+        for (uint32_t slot = 0u; slot < kDenseRenderHandlesPerTile; ++slot) {
+            if (touched[slot] == 0u) continue;
+            const uint32_t handle = firstHandle + slot;
+            if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
+                continue;
+            const uint32_t retiredAt = RenderPrimaryVoiceSpan(
+                v, handle, denseSampleData_, denseSampleDataFrames_,
+                outputLeft, outputRight, cursor, spanFrames, spanFrames);
+            if (retiredAt != UINT32_MAX)
+                v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
         }
         cursor = spanEnd;
     }
@@ -2494,24 +2537,62 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                     denseMarkEpoch_[handle] = denseEpoch_;
                     denseMarkedHandles_[denseMarkedCount_++] = handle;
                 };
-                if (affectAll || affectedChannels != 0u || hasAffectedKey) {
+                if (affectAll) {
+                    // Rare global operations keep the authoritative full-pool
+                    // scan.  Everything else resolves through the per-key and
+                    // per-channel voice indices — an O(voices-on-the-key)
+                    // walk instead of an O(activeCount) sweep per event
+                    // batch, which at full pools dominated event-dense
+                    // callbacks (712 batches x 8192 voices).
                     for (uint32_t position = 0u;
                          position < voices.activeCount_;) {
                         const uint32_t handle = voices.activeList_[position];
-                        const uint8_t channel = voices.v.channel[handle];
-                        const uint8_t note = voices.v.note[handle];
-                        if (affectAll ||
-                            (affectedChannels & (1u << channel)) != 0u ||
-                            affectedKeys[channel][note]) {
-                            if (AdvanceDenseHandleTo(
-                                    voices, handle, densePlannerCursor_)) {
-                                AdvanceDensePhaseTo(
-                                    voices, handle, densePlannerCursor_);
-                                mark(handle);
-                                ++position;
-                            }
-                        } else {
+                        if (AdvanceDenseHandleTo(
+                                voices, handle, densePlannerCursor_)) {
+                            AdvanceDensePhaseTo(
+                                voices, handle, densePlannerCursor_);
+                            mark(handle);
                             ++position;
+                        }
+                    }
+                } else {
+                    for (uint8_t channel = 0u;
+                         channel < kChannelCount; ++channel) {
+                        const bool channelHit =
+                            (affectedChannels & (1u << channel)) != 0u;
+                        if (!channelHit && !hasAffectedKey) continue;
+                        if (channelHit) {
+                            // CC/pitch/sustain-class events change every
+                            // voice on the channel, releasing ones included
+                            // (ForEachChannelActive covers both).
+                            voices.ForEachChannelActive(channel,
+                                [&](VoiceHandle handle) {
+                                    if (AdvanceDenseHandleTo(
+                                            voices, handle,
+                                            densePlannerCursor_)) {
+                                        AdvanceDensePhaseTo(
+                                            voices, handle,
+                                            densePlannerCursor_);
+                                        mark(handle);
+                                    }
+                                });
+                        } else {
+                            for (uint32_t note = 0u; note < kNoteCount;
+                                 ++note) {
+                                if (!affectedKeys[channel][note]) continue;
+                                voices.ForEachChannelKeyVoice(channel,
+                                    static_cast<uint8_t>(note),
+                                    [&](VoiceHandle handle) {
+                                        if (AdvanceDenseHandleTo(
+                                                voices, handle,
+                                                densePlannerCursor_)) {
+                                            AdvanceDensePhaseTo(
+                                                voices, handle,
+                                                densePlannerCursor_);
+                                            mark(handle);
+                                        }
+                                    });
+                            }
                         }
                     }
                 }
@@ -2538,6 +2619,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                     *renderedTo = chunkStart;
                     return false;
                 }
+                denseCallbackMarked_ += denseMarkedCount_;
                 for (uint32_t marked = 0u; marked < denseMarkedCount_;
                      ++marked) {
                     const uint32_t handle = denseMarkedHandles_[marked];
@@ -2633,6 +2715,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
     for (uint32_t tail = 0u; tail < kStealTailReserve; ++tail)
         voices.RefreshStealTail(static_cast<VoiceHandle>(tail));
     voices.SetCurrentFrame(blockStartFrame + rangeEnd);
+    denseLastCallbackMarked_ = denseCallbackMarked_;
     *renderedTo = rangeEnd;
     return true;
 }
@@ -2675,7 +2758,9 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // copies state in, renders, and commits before the next segment starts.
     const bool denseGatesOpen = !vibratoActive && correctnessMode &&
         events != nullptr && numFrames != 0u && workerPool_ != nullptr &&
-        workerPool_->GetThreadCount() > 1u;
+        workerPool_->GetThreadCount() > 1u &&
+        denseLastCallbackMarked_ <= voices.GetActiveCount() * 24u;
+    denseCallbackMarked_ = 0;
     const uint64_t denseChunkMask = denseGatesOpen
         ? ComputeDenseChunkMask(voices, events, eventCount, numFrames,
                                 correctnessMode)

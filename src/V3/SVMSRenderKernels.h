@@ -28,6 +28,10 @@ struct RenderSpanContext {
     const uint32_t* activePositions;
     SpanRetirement* retirements;
     uint32_t* retirementCount;
+    // Non-zero: handles are the contiguous identity range starting at this
+    // slot, letting kernels use aligned vector loads instead of gathers
+    // (dense-tile mode).  Zero: handles are arbitrary.
+    uint32_t handleBase;
 };
 
 // A backend returns false without mutating state when it cannot safely consume

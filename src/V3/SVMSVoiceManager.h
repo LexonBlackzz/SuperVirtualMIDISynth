@@ -291,6 +291,11 @@ public:
     uint32_t GetChannelActiveCount(uint8_t channel) const;
     template <typename Consumer>
     void ForEachChannelActive(uint8_t channel, Consumer&& consume) const noexcept;
+    // Visits every voice currently linked to (channel, note) through the
+    // per-key chain (active voices only — StartRelease unlinks).
+    template <typename Consumer>
+    void ForEachChannelKeyVoice(uint8_t channel, uint8_t note,
+                                Consumer&& consume) const noexcept;
     void InvalidateStealCandidates();
     void RefreshRenderClass(VoiceHandle handle);
     uint32_t GetRenderClassCount(VoiceRenderClass renderClass) const;
@@ -1874,6 +1879,18 @@ inline void VoiceManager::ForEachRenderClassBlock(
         const RenderClassBlock& page = renderClassBlocks_[block];
         consume(page.handles, page.count);
         block = page.next;
+    }
+}
+
+template <typename Consumer>
+inline void VoiceManager::ForEachChannelKeyVoice(
+    uint8_t channel, uint8_t note, Consumer&& consume) const noexcept {
+    if (channel >= kChannelCount || note >= kNoteCount) return;
+    int32_t link = channelKeyVoiceHead_[channel][note];
+    while (link != -1) {
+        const int32_t next = v.nextChannelKeyVoice[link];
+        consume(static_cast<VoiceHandle>(link));
+        link = next;
     }
 }
 

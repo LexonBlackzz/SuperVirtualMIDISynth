@@ -1217,9 +1217,14 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         return true;
     }
 
-    const bool denseHandles = context.voiceCapacity >= 8u &&
-        handleCount * 4u >= context.voiceCapacity * 3u;
-    const uint32_t iterationCount = denseHandles ? context.voiceCapacity : handleCount;
+    const bool tileContiguous = context.handleBase != 0u;
+    const bool denseHandles = tileContiguous ||
+        (context.voiceCapacity >= 8u &&
+         handleCount * 4u >= context.voiceCapacity * 3u);
+    const uint32_t handleBase = tileContiguous ? context.handleBase : 0u;
+    const uint32_t iterationCount = tileContiguous
+        ? handleCount
+        : (denseHandles ? context.voiceCapacity : handleCount);
     __m256 accumulatedLeft[8] = {
         _mm256_setzero_ps(), _mm256_setzero_ps(),
         _mm256_setzero_ps(), _mm256_setzero_ps(),
@@ -1244,12 +1249,12 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             bool allSustained = true;
             for (uint32_t lane = 0; lane < 8u; ++lane) {
                 allSustained = allSustained &&
-                    v.renderClass[position + lane] ==
+                    v.renderClass[handleBase + position + lane] ==
                         static_cast<uint8_t>(VoiceRenderClass::SustainedLoop);
             }
             if (!allSustained) {
                 for (uint32_t lane = 0; lane < 8u; ++lane) {
-                    const uint32_t handle = position + lane;
+                    const uint32_t handle = handleBase + position + lane;
                     if (v.renderClass[handle] ==
                         static_cast<uint8_t>(VoiceRenderClass::SustainedLoop)) {
                         ScalarRenderSustainedLoop(v, handle, context.sampleData,
@@ -1261,17 +1266,17 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                 continue;
             }
         }
-        __m256 phase = denseHandles ? _mm256_load_ps(v.phases + position)
+        __m256 phase = denseHandles ? _mm256_load_ps(v.phases + handleBase + position)
             : _mm256_i32gather_ps(v.phases, h, 4);
-        const __m256 step = denseHandles ? _mm256_load_ps(v.phaseIncs + position)
+        const __m256 step = denseHandles ? _mm256_load_ps(v.phaseIncs + handleBase + position)
             : _mm256_i32gather_ps(v.phaseIncs, h, 4);
-        const __m256 gainL = denseHandles ? _mm256_load_ps(v.renderGainL + position)
+        const __m256 gainL = denseHandles ? _mm256_load_ps(v.renderGainL + handleBase + position)
             : _mm256_i32gather_ps(v.renderGainL, h, 4);
-        const __m256 gainR = denseHandles ? _mm256_load_ps(v.renderGainR + position)
+        const __m256 gainR = denseHandles ? _mm256_load_ps(v.renderGainR + handleBase + position)
             : _mm256_i32gather_ps(v.renderGainR, h, 4);
-        const __m256 loopStartF = denseHandles ? _mm256_load_ps(v.relLoopSF + position)
+        const __m256 loopStartF = denseHandles ? _mm256_load_ps(v.relLoopSF + handleBase + position)
             : _mm256_i32gather_ps(v.relLoopSF, h, 4);
-        const __m256 loopEndF = denseHandles ? _mm256_load_ps(v.relLoopEF + position)
+        const __m256 loopEndF = denseHandles ? _mm256_load_ps(v.relLoopEF + handleBase + position)
             : _mm256_i32gather_ps(v.relLoopEF, h, 4);
         const __m256 loopLength = _mm256_sub_ps(loopEndF, loopStartF);
 
@@ -1298,13 +1303,13 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         }
 
         const __m256i sampleStart = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.sampleStart + position))
+            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.sampleStart + handleBase + position))
             : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.sampleStart), h, 4);
         const __m256i loopStart = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopS + position))
+            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopS + handleBase + position))
             : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.relLoopS), h, 4);
         const __m256i loopEnd = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopE + position))
+            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopE + handleBase + position))
             : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.relLoopE), h, 4);
         const __m256 zero = _mm256_setzero_ps();
         phase = _mm256_max_ps(phase, zero);
@@ -1334,11 +1339,11 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         }
         alignas(32) float phases[8];
         _mm256_store_ps(phases, phase);
-        if (denseHandles) _mm256_store_ps(v.phases + position, phase);
+        if (denseHandles) _mm256_store_ps(v.phases + handleBase + position, phase);
         else for (uint32_t lane = 0; lane < 8u; ++lane) v.phases[hs[lane]] = phases[lane];
     }
     for (; position < iterationCount; ++position) {
-        const uint32_t handle = denseHandles ? position : handles[position];
+        const uint32_t handle = denseHandles ? handleBase + position : handles[position];
         if (!denseHandles || v.renderClass[handle] ==
             static_cast<uint8_t>(VoiceRenderClass::SustainedLoop)) {
             ScalarRenderSustainedLoop(v, handle, context.sampleData,
