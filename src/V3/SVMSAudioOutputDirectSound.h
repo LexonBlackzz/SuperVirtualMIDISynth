@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <dsound.h>
+#include "SVMSThreadAffinity.h"
 #include <atomic>
 #include <algorithm>
 #include <cstddef>
@@ -507,6 +508,7 @@ inline bool AudioOutput::Start() {
     }
 
     threadHandle_ = CreateThread(nullptr, 0, AudioThreadProc, this, 0, nullptr);
+    svms::PinThreadToPerformanceCores(threadHandle_);
     if (!threadHandle_) {
         lastHResult_ = HRESULT_FROM_WIN32(GetLastError());
         if (streamBuffer_) streamBuffer_->Stop();

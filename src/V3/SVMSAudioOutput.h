@@ -11,6 +11,7 @@
 #include <propidl.h>
 #include <audiopolicy.h>
 #include <avrt.h>
+#include "SVMSThreadAffinity.h"
 #include <ksmedia.h>
 #include <atomic>
 #include <cstring>
@@ -425,6 +426,7 @@ inline bool AudioOutput::Start() {
 
     running_.store(true);
     threadHandle_ = CreateThread(nullptr, 0, AudioThreadProc, this, 0, nullptr);
+    svms::PinThreadToPerformanceCores(threadHandle_);
     if (!threadHandle_) {
         running_.store(false);
         CloseHandle(stopEvent_);

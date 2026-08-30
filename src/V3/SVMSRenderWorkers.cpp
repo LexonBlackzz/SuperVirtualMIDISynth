@@ -1,4 +1,5 @@
 #include "SVMSRenderWorkers.h"
+#include "SVMSThreadAffinity.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -309,17 +310,10 @@ bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
         if (worker.wakeEvent && worker.readyEvent) {
             worker.thread = CreateThread(nullptr, 0u, Impl::ThreadEntry,
                                          &worker, 0u, nullptr);
-#if !defined(SVMS_XP_COMPAT)
-            if (worker.thread) {
-                SYSTEM_INFO systemInfo{};
-                GetSystemInfo(&systemInfo);
-                if (systemInfo.dwNumberOfProcessors != 0u) {
-                    SetThreadIdealProcessor(
-                        worker.thread,
-                        (index + 1u) % systemInfo.dwNumberOfProcessors);
-                }
-            }
-#endif
+            // Pin to performance cores: the scheduler may otherwise place a
+            // helper on an E-core (~2x slower on the AVX2 kernels), which
+            // shows up as join-path jitter on every worker fan-out.
+            svms::PinThreadToPerformanceCores(worker.thread);
         }
         if (!worker.wakeEvent || !worker.readyEvent || !worker.thread) {
             impl->stopping.store(true, std::memory_order_release);

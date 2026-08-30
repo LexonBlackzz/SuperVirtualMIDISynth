@@ -45,10 +45,11 @@ inline __m256 GatherSampleAVX2(const int16_t* data, __m256i elem) {
     const __m256i word = _mm256_srai_epi32(elem, 1);
     const __m256i parity = _mm256_and_si256(elem, one);
     const __m256i oddMask = _mm256_cmpeq_epi32(parity, one);
+    // One word gather suffices: element e always lives in word e >> 1
+    // (low half when e is even, high half when e is odd).  The pair helper
+    // below needs the neighbouring word for its e+1 lane; this one does not.
     const __m256i w0 = _mm256_i32gather_epi32(
         reinterpret_cast<const int*>(data), word, 4);
-    const __m256i w1 = _mm256_i32gather_epi32(
-        reinterpret_cast<const int*>(data), _mm256_add_epi32(word, one), 4);
     // Little-endian words: low half = element 2k, high half = 2k + 1.
     // 1/32768 is a power of two, so the scale is exact and bit-identical to
     // the previous float store's int16/32768 values.
