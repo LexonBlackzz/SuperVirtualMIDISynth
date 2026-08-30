@@ -5164,6 +5164,20 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             self->sf2Telemetry_.lastPhase = vm->v.phases[h];
         }
     }
+    // Periodic pool census: what changed when CPU jumps. Every 64 blocks,
+    // only when diagnostics are on. DebugView: active total + per-class.
+    if (self->diagnosticsEnabled_ && (self->callbackCount_ & 63u) == 0u) {
+        char census[256];
+        std::snprintf(census, sizeof(census),
+            "[SVMS] pool active=%u sos=%u sloop=%u tloop=%u rloop=%u gen=%u\n",
+            (unsigned)vm->activeCount_,
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedOneShot),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedLoop),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::TransientLoop),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::ReleaseLoop),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::Generic));
+        OutputDebugStringA(census);
+    }
     // Per-voice phase rotation is applied inside RenderBlock (per-voice, at
     // each mix site), so Coherent mode (no state allocated) stays bit-exact
     // and non-Coherent modes never touch loudness or gain-reduction inputs.
