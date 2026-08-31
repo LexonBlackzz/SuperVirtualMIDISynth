@@ -3476,16 +3476,26 @@ void TestDensePlannerOracleDifferential() {
             sampleCount, repeatLeft.data(),
             repeatRight.data(), frames, cfg, events.data(),
             static_cast<uint32_t>(events.size()), true, 5000u);
-        Check(repeatLeft == plannedLeft && repeatRight == plannedRight,
-              "dense planner output is deterministic across worker counts");
+        float maxRepeatDifference = 0.0f;
+        for (uint32_t frame = 0u; frame < frames; ++frame) {
+            maxRepeatDifference = (std::max)(maxRepeatDifference,
+                std::fabs(repeatLeft[frame] - plannedLeft[frame]));
+            maxRepeatDifference = (std::max)(maxRepeatDifference,
+                std::fabs(repeatRight[frame] - plannedRight[frame]));
+        }
+        Check(maxRepeatDifference <= 2.0e-5f,
+              "whole-voice output is tolerance-equal across worker counts");
     }
 }
 
 void TestDenseProductionGateParity() {
-    // The dense planner is the primary production renderer: it must produce
-    // identical audio with correctnessMode disabled (the live configuration,
-    // which also enables sparse decimation) and exercise pools above the
-    // historical 8192-voice dense cap.
+    // The whole-voice whole-block renderer is the primary production
+    // renderer for note material: it must produce audio within the oracle
+    // tolerance with correctnessMode disabled (the live configuration) and
+    // exercise pools above the historical 8192-voice dense cap.  Audio is
+    // compared at the standard 2e-5 tolerance because per-voice whole-block
+    // jobs accumulate in worker-count-dependent order (and the accelerated
+    // backend is tolerance-equal, never bit-replacing, the scalar path).
     constexpr uint32_t voiceCount = 3000u;
     constexpr uint32_t frames = 256u;
     constexpr uint32_t sampleCount = 4096u;
@@ -3565,32 +3575,27 @@ void TestDenseProductionGateParity() {
         productionRight(frames, 0.0f);
     std::vector<float> referenceLeft(frames, 0.0f),
         referenceRight(frames, 0.0f);
-    std::fprintf(stderr, "CKPT pre-production\\n"); std::fflush(stderr);
-    std::fprintf(stderr, "M1"); std::fflush(stderr); production.RenderBlock(*productionVoices, channels, samples.data(),
+    production.RenderBlock(*productionVoices, channels, samples.data(),
         sampleCount, productionLeft.data(), productionRight.data(), frames,
-        cfg, events.data(), static_cast<uint32_t>(events.size()), true /*X*/,
+        cfg, events.data(), static_cast<uint32_t>(events.size()), true,
         5000u);
-    std::fprintf(stderr, "CKPT pre-reference\\n"); std::fflush(stderr);
-    std::fprintf(stderr, "M2"); std::fflush(stderr); reference.RenderBlock(*referenceVoices, channels, samples.data(),
+    reference.RenderBlock(*referenceVoices, channels, samples.data(),
         sampleCount, referenceLeft.data(), referenceRight.data(), frames,
         cfg, events.data(), static_cast<uint32_t>(events.size()), true,
         5000u);
     std::vector<float> serialLeft(frames, 0.0f), serialRight(frames, 0.0f);
-    std::fprintf(stderr, "CKPT pre-serial\\n"); std::fflush(stderr);
-    std::fprintf(stderr, "M3"); std::fflush(stderr); serial.RenderBlock(*serialVoices, channels, samples.data(),
+    serial.RenderBlock(*serialVoices, channels, samples.data(),
         sampleCount, serialLeft.data(), serialRight.data(), frames,
         cfg, events.data(), static_cast<uint32_t>(events.size()), false,
         5000u);
-    std::fprintf(stderr, "CKPT post-serial\\n"); std::fflush(stderr);
-    std::fprintf(stderr, "M4"); std::fflush(stderr);    const auto& cov = production.GetCoverageStatsForTest();
+    const auto& cov = production.GetCoverageStatsForTest();
     fprintf(stderr, "DENSECOV rendered=%u rej: corr=%u events=%u density=%u workers=%u storage=%u voices=%u shadow=%u mutation=%u fallbacks=%u\\n",
         cov.denseRendered, cov.denseRejected[0], cov.denseRejected[1],
         cov.denseRejected[2], cov.denseRejected[3], cov.denseRejected[4],
         cov.denseRejected[5], cov.denseRejected[6], cov.denseRejected[7],
         cov.denseExecutionFallbacks);
-    Check(production.GetCoverageStatsForTest().denseRendered == 1u,
-          "production configuration routes the callback through the dense "
-          "planner");
+    Check(production.GetWholeVoiceBlocksForTest() == 1u,
+          "production configuration routes the callback through the whole-voice renderer");
     {
         float maxDiff = 0.0f; uint32_t firstFrame = UINT32_MAX;
         for (uint32_t frame = 0u; frame < frames; ++frame) {
@@ -3602,8 +3607,15 @@ void TestDenseProductionGateParity() {
         }
         fprintf(stderr, "PARITYDIFF max=%g first=%u\\n", maxDiff, firstFrame);
     }
-    Check(productionLeft == referenceLeft && productionRight == referenceRight,
-          "dense planner output is identical with correctnessMode disabled");
+    float maxParityDifference = 0.0f;
+    for (uint32_t frame = 0u; frame < frames; ++frame) {
+        maxParityDifference = (std::max)(maxParityDifference,
+            std::fabs(productionLeft[frame] - referenceLeft[frame]));
+        maxParityDifference = (std::max)(maxParityDifference,
+            std::fabs(productionRight[frame] - referenceRight[frame]));
+    }
+    Check(maxParityDifference <= 2.0e-5f,
+          "whole-voice renderer matches the reference within oracle tolerance");
 }
 
 void TestCallbackSourcePurity() {
@@ -3909,6 +3921,541 @@ void TestNoteOnCollapseGate() {
           "window 0 forces every hit to spawn");
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Whole-voice whole-block renderer differentials
+//
+// The whole-voice renderer dispatches every event in ingress order during
+// a pre-pass (with the render clock at each event's exact frame) and then
+// renders each voice once for the whole block.  The oracle renders
+// frame-major, dispatching at the same exact frames mid-render.  Steal
+// victim choice therefore sees block-start gains in the pre-pass where
+// the oracle sees already-attacked gains after an in-block launch — an
+// accepted, documented semantic change (see the SVMSRenderScalar.h
+// header comment).  Both scenarios below keep victim choice drift-proof:
+// no candidate changes gain mid-block, so with one steal per block both
+// sides choose identical victims.
+//
+// Per-sample audio is compared at the standard 2e-5 oracle tolerance (the
+// whole-voice renderer accumulates per voice in worker-count-dependent
+// order; the accelerated backends are tolerance-equal, never
+// bit-replacing, the scalar path).
+// ═══════════════════════════════════════════════════════════════════════
+
+struct WholeVoiceRng {
+    uint32_t state = 0x9E3779B9u;
+    uint32_t Next() {
+        state = state * 1664525u + 1013904223u;
+        return state;
+    }
+};
+
+void ConfigureWholeVoiceSeedPool(svms::VoiceManager& voices,
+                                 const svms::ChannelCache& channels,
+                                 uint32_t poolSize, uint32_t seedCount) {
+    // Modeled on ConfigureDifferentialSeed but every seeded voice is Active
+    // and immortal: the whole-voice scenarios need a candidate pool whose
+    // state is identical at block start and mid-block.  ConfigureDifferentialSeed's
+    // releasing branch cannot be overridden back to Active (StartRelease has
+    // no public inverse), so the seed builds its own pool.  The gain ladder
+    // values are pairwise distinct (2x steps within each i%9 residue class,
+    // monotone across periods), so the level-based steal score always has
+    // an unambiguous quietest candidate.
+    Check(voices.Initialize(poolSize, 44100u),
+          "whole-voice seed pool allocates voice storage");
+    for (uint32_t i = 0; i < seedCount; ++i) {
+        const uint8_t channel = static_cast<uint8_t>(i & 3u);
+        const uint8_t note = static_cast<uint8_t>(48u + i % 24u);
+        const svms::VoiceHandle voice = voices.AllocateVoice(
+            channel, note, static_cast<uint8_t>(48u + i));
+        const bool loop = (i % 4u) != 1u;
+        // Non-loop (one-shot) seed voices get a crawl-speed phase step so
+        // none of them can reach relEnd and retire inside the scenario: a
+        // mid-block retirement would change the active set between the
+        // whole-voice pre-pass and the oracle's mid-block dispatch, which
+        // is the documented drift the scenarios must avoid.
+        voices.SetVoiceSample(voice, 0, 4096, 64, 4032, loop ? 1u : 0u,
+                              loop ? 0.4f + static_cast<float>(i % 17u) * 0.11f
+                                   : 0.05f,
+                              1);
+        voices.v.phases[voice] = static_cast<float>((i * 37u) % 1700u) + 0.375f;
+        const float gain =
+            0.004f * std::ldexp(1.0f, static_cast<int>(i % 9u)) *
+            (1.0f + 0.01f * static_cast<float>(i));
+        // Immortal envelope pinned to the ladder gain (sustain is stored as
+        // a fraction of the initial level, hence the 1.0f): stage 3 holds
+        // forever and releaseSamplesRemaining stays UINT32_MAX, so the pool
+        // never shrinks and no candidate ever retires mid-scenario.
+        voices.SetVoiceEnvelope(voice, gain, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f,
+                                0.999f);
+        voices.SetVoicePlayIndex(voice, i + 1u);
+        voices.SetVoiceGain(voice, 0.02f, 0.02f);
+        voices.RefreshMixGain(voice, channels.GetParams()[channel]);
+    }
+}
+
+void CheckWholeVoiceStateParity(const svms::VoiceManager& oracleVoices,
+                                const svms::VoiceManager& wholeVoices,
+                                const char* label) {
+    // Slot handles are internal bookkeeping: the whole-voice renderer applies
+    // its deferred retirements at block end (sorted by exact frame), so freed
+    // slots are recycled in a different order than the frame-major oracle,
+    // which frees them inline mid-block.  Voice identity is therefore the
+    // playIndex (unique per launch); the per-sample audio parity pins the
+    // audible behavior.
+    std::vector<uint32_t> oracleActive(
+        oracleVoices.activeList_,
+        oracleVoices.activeList_ + oracleVoices.activeCount_);
+    std::vector<uint32_t> wholeActive(
+        wholeVoices.activeList_,
+        wholeVoices.activeList_ + wholeVoices.activeCount_);
+    auto activePlayIndices = [](const svms::VoiceManager& vm,
+                                const std::vector<uint32_t>& active) {
+        std::vector<uint32_t> ids;
+        ids.reserve(active.size());
+        for (uint32_t voice : active) ids.push_back(vm.v.playIndex[voice]);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    const std::vector<uint32_t> oracleIds =
+        activePlayIndices(oracleVoices, oracleActive);
+    const std::vector<uint32_t> wholeIds =
+        activePlayIndices(wholeVoices, wholeActive);
+    if (oracleIds != wholeIds) {
+        std::fprintf(stderr,
+                     "[WVDIFFV] %s active mismatch: oracle=%zu whole=%zu\n",
+                     label, oracleIds.size(), wholeIds.size());
+        const size_t n = (std::min)(oracleIds.size(), wholeIds.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (oracleIds[i] != wholeIds[i]) {
+                std::fprintf(stderr,
+                    "[WVDIFFV] %s first playIndex divergence at %zu: oracle=%u whole=%u\n",
+                    label, i, oracleIds[i], wholeIds[i]);
+                break;
+            }
+        }
+    }
+    Check(oracleIds == wholeIds,
+          "whole-voice preserves active voice identity and retirement");
+    if (oracleIds == wholeIds) {
+        uint32_t dumped = 0u;
+        for (uint32_t voice : oracleActive) {
+            const uint32_t playIndex = oracleVoices.v.playIndex[voice];
+            uint32_t wholeVoice = UINT32_MAX;
+            for (uint32_t candidate : wholeActive) {
+                if (wholeVoices.v.playIndex[candidate] == playIndex) {
+                    wholeVoice = candidate;
+                    break;
+                }
+            }
+            if (wholeVoice == UINT32_MAX) continue;
+            const bool stateMatches =
+                oracleVoices.v.state[voice] == wholeVoices.v.state[wholeVoice] &&
+                NearlyEqual(oracleVoices.v.phases[voice],
+                            wholeVoices.v.phases[wholeVoice], 2.0e-3f) &&
+                NearlyEqual(oracleVoices.v.currentGain[voice],
+                            wholeVoices.v.currentGain[wholeVoice], 2.0e-5f) &&
+                oracleVoices.v.releaseSamplesRemaining[voice] ==
+                    wholeVoices.v.releaseSamplesRemaining[wholeVoice];
+            if (!stateMatches) {
+                if (dumped++ < 8u) {
+                    std::fprintf(stderr,
+                        "[WVDIFFV] %s playIndex=%u state=%u/%u phase=%g/%g gain=%g/%g release=%u/%u\n",
+                        label, playIndex,
+                        oracleVoices.v.state[voice],
+                        wholeVoices.v.state[wholeVoice],
+                        oracleVoices.v.phases[voice],
+                        wholeVoices.v.phases[wholeVoice],
+                        oracleVoices.v.currentGain[voice],
+                        wholeVoices.v.currentGain[wholeVoice],
+                        oracleVoices.v.releaseSamplesRemaining[voice],
+                        wholeVoices.v.releaseSamplesRemaining[wholeVoice]);
+                }
+                Check(false, "whole-voice preserves active voice state");
+            }
+        }
+    }
+    for (uint32_t renderClass = 0u;
+         renderClass < svms::kVoiceRenderClassCount; ++renderClass) {
+        const auto klass = static_cast<svms::VoiceRenderClass>(renderClass);
+        const uint32_t oracleCount = oracleVoices.GetRenderClassCount(klass);
+        const uint32_t wholeCount = wholeVoices.GetRenderClassCount(klass);
+        if (oracleCount != wholeCount) {
+            std::fprintf(stderr,
+                         "[WVDIFFV] %s class %u: oracle=%u whole=%u\n",
+                         label, renderClass, oracleCount, wholeCount);
+        }
+        Check(oracleCount == wholeCount,
+              "whole-voice preserves per-class render lists");
+    }
+    Check(oracleVoices.stealCount_ == wholeVoices.stealCount_,
+          "whole-voice preserves the steal counter");
+    Check(oracleVoices.GetStealTailCount() == wholeVoices.GetStealTailCount(),
+          "whole-voice preserves the steal-tail census");
+}
+
+struct WholeVoiceStealContext {
+    svms::VoiceManager* voices;
+    const svms::ChannelParamsSnapshot* channelParams;
+    uint32_t playIndex = 5000u;
+    uint32_t launches = 0u;
+};
+
+void DispatchWholeVoiceStealEvent(const svms::RenderEvent* events,
+                                  uint32_t eventCount, uint32_t,
+                                  void* userData) {
+    auto& context = *static_cast<WholeVoiceStealContext*>(userData);
+    for (uint32_t index = 0u; index < eventCount; ++index) {
+        const svms::RenderEvent& event = events[index];
+        if (event.type != svms::RenderEventType::NoteOn) continue;
+        // Production launch path (LaunchVoiceGroup -> ConfigureVoice): the
+        // whole-voice pre-pass derives each newborn's exact startFrame from
+        // the voice-configured hook, which only the configuration
+        // transaction fires.
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 4096u;
+        setup.loopStart = 64u;
+        setup.loopEnd = 4032u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep =
+            0.637f + event.data1 * 0.011f;
+        // Launched voices sustain far above every ladder gain so the
+        // level-based victim score can never select one of them.  Sustain
+        // is stored as a fraction of the initial level, hence the 1.0f.
+        setup.initialGain =
+            2.0f + 0.05f * static_cast<float>(context.launches + 1u);
+        setup.sustainLevel = 1.0f;
+        setup.attackGainStep = 0.0f;
+        setup.decaySlope = 1.0f;
+        setup.releaseDecay = 0.999f;
+        setup.gainLeft = setup.gainRight = 0.02f;
+        setup.sampleBacked = 1u;
+        setup.playIndex = context.playIndex++;
+        svms::VoiceHandle handle = svms::kInvalidVoice;
+        context.voices->LaunchVoiceGroup(
+            event.channel, event.data1, event.data2, &setup, 1u,
+            setup.playIndex,
+            context.channelParams[event.channel], &handle);
+        if (handle != svms::kInvalidVoice) ++context.launches;
+    }
+}
+
+void TestWholeVoiceStealDifferential() {
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 6u;
+    constexpr uint32_t kPool = 48u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+             0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 32767.0f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    for (int backendPass = 0; backendPass < 2; ++backendPass) {
+        const bool avx2Pass = backendPass == 1;
+        if (avx2Pass &&
+            !svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) {
+            break;
+        }
+        const char* backendName = avx2Pass ? "avx2" : "scalar";
+
+        svms::ChannelCache seedChannels;
+        seedChannels.SetMasterVolume(1.0f);
+        seedChannels.RebuildCache(cfg, 44100.0f);
+        auto seedVoices = std::make_unique<svms::VoiceManager>();
+        ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, kPool, kPool);
+        auto oracleVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+        auto wholeVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+        svms::ChannelCache oracleChannels = seedChannels;
+        svms::ChannelCache wholeChannels = seedChannels;
+
+        svms::RenderScalar oracle;
+        svms::RenderScalar whole;
+        Check(oracle.ReserveVoiceCapacity(kPool) &&
+                  whole.ReserveVoiceCapacity(kPool) &&
+                  oracle.ConfigureRenderThreads(1u, kFrames) &&
+                  whole.ConfigureRenderThreads(4u, kFrames),
+              "whole-voice steal differential starts serial and parallel "
+              "renderers");
+        Check(whole.SetRenderBackend(avx2Pass ? svms::RenderBackend::AVX2
+                                              : svms::RenderBackend::Scalar),
+              "whole-voice steal differential selects the requested backend");
+
+        WholeVoiceStealContext oracleContext{oracleVoices.get(),
+                                             oracleChannels.GetParams()};
+        WholeVoiceStealContext wholeContext{wholeVoices.get(),
+                                            wholeChannels.GetParams()};
+        oracle.SetEventBatchDispatcher(DispatchWholeVoiceStealEvent,
+                                       &oracleContext);
+        whole.SetEventBatchDispatcher(DispatchWholeVoiceStealEvent,
+                                      &wholeContext);
+
+        // Fresh PRNG per pass so both backends walk identical scenarios.
+        WholeVoiceRng rng;
+        float passMaxDiff = 0.0f;
+        for (uint32_t block = 0; block < kBlocks; ++block) {
+            const uint64_t blockStartFrame = 10000u + block * kFrames;
+            svms::RenderEvent event{};
+            event.type = svms::RenderEventType::NoteOn;
+            event.channel = static_cast<uint8_t>(rng.Next() % 4u);
+            event.data1 = static_cast<uint8_t>(36u + rng.Next() % 72u);
+            event.data2 = static_cast<uint8_t>(64u + rng.Next() % 64u);
+            // Mid-block steal frame.  Late frames push the 64-frame tail
+            // fade past the block boundary, exercising ghost-tail adoption
+            // into real steal-tail slots on the following block.
+            event.frameOffset = 32u + rng.Next() % 469u;
+            event.ingressSequence = block;
+
+            std::vector<float> oracleLeft(kFrames, 0.0f),
+                oracleRight(kFrames, 0.0f);
+            std::vector<float> wholeLeft(kFrames, 0.0f),
+                wholeRight(kFrames, 0.0f);
+            oracle.RenderBlockReference(
+                *oracleVoices, oracleChannels, samples.data(), sampleCount,
+                oracleLeft.data(), oracleRight.data(), kFrames, cfg, &event,
+                1u, true, blockStartFrame);
+            whole.RenderBlock(*wholeVoices, wholeChannels, samples.data(),
+                              sampleCount, wholeLeft.data(),
+                              wholeRight.data(), kFrames, cfg, &event, 1u,
+                              true, blockStartFrame);
+
+            float blockDiff = 0.0f;
+            for (uint32_t frame = 0; frame < kFrames; ++frame) {
+                blockDiff = (std::max)(blockDiff,
+                    std::fabs(oracleLeft[frame] - wholeLeft[frame]));
+                blockDiff = (std::max)(blockDiff,
+                    std::fabs(oracleRight[frame] - wholeRight[frame]));
+            }
+            std::fprintf(stderr,
+                         "[WVDIFF] backend=%s steal-block=%u max=%g\n",
+                         backendName, block, blockDiff);
+            passMaxDiff = (std::max)(passMaxDiff, blockDiff);
+        }
+        Check(passMaxDiff <= 2.0e-5f,
+              "whole-voice in-block stealing matches the oracle per sample");
+        CheckWholeVoiceStateParity(*oracleVoices, *wholeVoices, backendName);
+        Check(whole.GetWholeVoiceBlocksForTest() == kBlocks,
+              "steal scenario routes every block through the whole-voice "
+              "renderer");
+        Check(oracleVoices->stealCount_ == wholeVoices->stealCount_ &&
+                  wholeVoices->stealCount_ == kBlocks,
+              "every saturated-pool launch steals exactly one victim");
+    }
+}
+
+struct WholeVoiceLaunchContext {
+    svms::VoiceManager* voices;
+    const svms::ChannelParamsSnapshot* channelParams;
+    uint32_t playIndex = 9000u;
+    uint32_t launches = 0u;
+};
+
+void DispatchWholeVoiceLaunchEvent(const svms::RenderEvent* events,
+                                   uint32_t eventCount, uint32_t,
+                                   void* userData) {
+    auto& context = *static_cast<WholeVoiceLaunchContext*>(userData);
+    for (uint32_t index = 0u; index < eventCount; ++index) {
+        const svms::RenderEvent& event = events[index];
+        switch (event.type) {
+            case svms::RenderEventType::NoteOn: {
+                // Production launch path (LaunchVoiceGroup -> ConfigureVoice):
+                // the whole-voice pre-pass derives each newborn's exact
+                // startFrame from the voice-configured hook.  The pool is
+                // kept unsaturated so launches never steal.
+                const bool loop = (context.playIndex % 3u) != 0u;
+                svms::VoiceConfiguration setup{};
+                setup.sampleStart = 0u;
+                setup.sampleEnd = 4096u;
+                setup.loopStart = 64u;
+                setup.loopEnd = 4032u;
+                setup.loopMode = loop ? 1u : 0u;
+                setup.phaseStep = setup.basePhaseStep =
+                    0.637f + event.data1 * 0.011f;
+                // Attack+decay transient (~70 frames) into sustain, then a
+                // release capped at 400 samples: covers transient->sustained
+                // class changes, exact-frame deferred releases and
+                // counter-governed retirement.
+                setup.initialGain = 0.6f;
+                setup.sustainLevel = 0.5f;
+                setup.attackSamples = 17u;
+                setup.attackGainStep = 0.6f / 17.0f;
+                setup.decaySamples = 53u;
+                setup.decaySlope = 0.99f;
+                setup.releaseDecay = 0.9995f;
+                setup.releaseSamples = 400u;
+                setup.gainLeft = setup.gainRight = 0.02f;
+                setup.sampleBacked = 1u;
+                setup.playIndex = context.playIndex++;
+                svms::VoiceHandle handle = svms::kInvalidVoice;
+                context.voices->LaunchVoiceGroup(
+                    event.channel, event.data1, event.data2, &setup, 1u,
+                    setup.playIndex,
+                    context.channelParams[event.channel], &handle);
+                if (handle != svms::kInvalidVoice) ++context.launches;
+                break;
+            }
+            case svms::RenderEventType::NoteOff:
+                for (uint32_t i = 0; i < context.voices->activeCount_; ++i) {
+                    const uint32_t voice = context.voices->activeList_[i];
+                    if (context.voices->v.channel[voice] == event.channel &&
+                        context.voices->v.note[voice] == event.data1) {
+                        context.voices->StartRelease(voice);
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+void TestWholeVoiceLaunchDifferential() {
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 6u;
+    constexpr uint32_t kPool = 64u;
+    constexpr uint32_t kSeed = 16u;
+    constexpr uint32_t kLaunchesPerBlock = 5u;
+    constexpr uint32_t kNoteOffsPerBlock = 3u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.35f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    for (int backendPass = 0; backendPass < 2; ++backendPass) {
+        const bool avx2Pass = backendPass == 1;
+        if (avx2Pass &&
+            !svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) {
+            break;
+        }
+        const char* backendName = avx2Pass ? "avx2" : "scalar";
+
+        svms::ChannelCache seedChannels;
+        seedChannels.SetMasterVolume(1.0f);
+        seedChannels.RebuildCache(cfg, 44100.0f);
+        auto seedVoices = std::make_unique<svms::VoiceManager>();
+        ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, kPool, kSeed);
+        auto oracleVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+        auto wholeVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+        svms::ChannelCache oracleChannels = seedChannels;
+        svms::ChannelCache wholeChannels = seedChannels;
+
+        svms::RenderScalar oracle;
+        svms::RenderScalar whole;
+        Check(oracle.ReserveVoiceCapacity(kPool) &&
+                  whole.ReserveVoiceCapacity(kPool) &&
+                  oracle.ConfigureRenderThreads(1u, kFrames) &&
+                  whole.ConfigureRenderThreads(4u, kFrames),
+              "whole-voice launch differential starts serial and parallel "
+              "renderers");
+        Check(whole.SetRenderBackend(avx2Pass ? svms::RenderBackend::AVX2
+                                              : svms::RenderBackend::Scalar),
+              "whole-voice launch differential selects the requested backend");
+
+        WholeVoiceLaunchContext oracleContext{oracleVoices.get(),
+                                              oracleChannels.GetParams()};
+        WholeVoiceLaunchContext wholeContext{wholeVoices.get(),
+                                             wholeChannels.GetParams()};
+        oracle.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent,
+                                       &oracleContext);
+        whole.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent,
+                                      &wholeContext);
+
+        // Fresh PRNG per pass so both backends walk identical scenarios.
+        // (channel, note) pairs are never reused, so a block never re-attacks
+        // a key released earlier in the same block.
+        WholeVoiceRng rng;
+        std::vector<std::pair<uint8_t, uint8_t>> launchedPairs;
+        float passMaxDiff = 0.0f;
+        for (uint32_t block = 0; block < kBlocks; ++block) {
+            const uint64_t blockStartFrame = 10000u + block * kFrames;
+            const uint32_t noteOffCount =
+                launchedPairs.empty() ? 0u : kNoteOffsPerBlock;
+            std::vector<svms::RenderEvent> events(kLaunchesPerBlock +
+                                                  noteOffCount);
+            for (uint32_t j = 0; j < kLaunchesPerBlock; ++j) {
+                svms::RenderEvent& event = events[j];
+                event.type = svms::RenderEventType::NoteOn;
+                const uint32_t launch = block * kLaunchesPerBlock + j;
+                event.channel = static_cast<uint8_t>(launch % 4u);
+                event.data1 = static_cast<uint8_t>(72u + launch);
+                event.data2 = static_cast<uint8_t>(64u + rng.Next() % 64u);
+                event.frameOffset = rng.Next() % kFrames;
+                event.ingressSequence = j;
+            }
+            for (uint32_t j = 0; j < noteOffCount; ++j) {
+                svms::RenderEvent& event = events[kLaunchesPerBlock + j];
+                event.type = svms::RenderEventType::NoteOff;
+                // Release keys launched in earlier blocks only: the note-off
+                // scan is not frame-scoped inside the whole-voice pre-pass,
+                // so releasing a key that is re-attacked later in the same
+                // block would observe pre-pass state the oracle never sees.
+                const uint32_t pick = rng.Next() % launchedPairs.size();
+                event.channel = launchedPairs[pick].first;
+                event.data1 = launchedPairs[pick].second;
+                event.data2 = 0u;
+                event.frameOffset = rng.Next() % kFrames;
+                event.ingressSequence = kLaunchesPerBlock + j;
+            }
+            for (uint32_t j = 0; j < kLaunchesPerBlock; ++j)
+                launchedPairs.emplace_back(events[j].channel,
+                                           events[j].data1);
+            std::stable_sort(events.begin(), events.end(),
+                [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                    return a.frameOffset < b.frameOffset;
+                });
+
+            std::vector<float> oracleLeft(kFrames, 0.0f),
+                oracleRight(kFrames, 0.0f);
+            std::vector<float> wholeLeft(kFrames, 0.0f),
+                wholeRight(kFrames, 0.0f);
+            oracle.RenderBlockReference(
+                *oracleVoices, oracleChannels, samples.data(), sampleCount,
+                oracleLeft.data(), oracleRight.data(), kFrames, cfg,
+                events.data(), static_cast<uint32_t>(events.size()), true,
+                blockStartFrame);
+            whole.RenderBlock(*wholeVoices, wholeChannels, samples.data(),
+                              sampleCount, wholeLeft.data(),
+                              wholeRight.data(), kFrames, cfg, events.data(),
+                              static_cast<uint32_t>(events.size()), true,
+                              blockStartFrame);
+
+            float blockDiff = 0.0f;
+            for (uint32_t frame = 0; frame < kFrames; ++frame) {
+                blockDiff = (std::max)(blockDiff,
+                    std::fabs(oracleLeft[frame] - wholeLeft[frame]));
+                blockDiff = (std::max)(blockDiff,
+                    std::fabs(oracleRight[frame] - wholeRight[frame]));
+            }
+            passMaxDiff = (std::max)(passMaxDiff, blockDiff);
+        }
+        std::fprintf(stderr, "[WVDIFF] backend=%s launch max=%g\n",
+                     backendName, passMaxDiff);
+        Check(passMaxDiff <= 2.0e-5f,
+              "whole-voice launches, deferred releases and retirements "
+              "match the oracle per sample");
+        CheckWholeVoiceStateParity(*oracleVoices, *wholeVoices, backendName);
+        Check(whole.GetWholeVoiceBlocksForTest() == kBlocks,
+              "launch scenario routes every block through the whole-voice "
+              "renderer");
+        Check(oracleContext.launches == wholeContext.launches &&
+                  wholeContext.launches == kBlocks * kLaunchesPerBlock,
+              "launch scenario dispatches every note-on on both sides");
+        Check(oracleVoices->stealCount_ == 0u && wholeVoices->stealCount_ == 0u,
+              "launch scenario never exhausts the pool");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -3919,6 +4466,8 @@ int main() {
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_DEBUG);
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_CHECK_ALWAYS_DF);
 #endif
+    TestWholeVoiceStealDifferential();
+    TestWholeVoiceLaunchDifferential();
     TestDenseProductionGateParity();
 
     if (g_failures != 0) {
@@ -3929,3 +4478,4 @@ int main() {
     std::puts("SVMS V3 correctness tests passed");
     return 0;
 }
+

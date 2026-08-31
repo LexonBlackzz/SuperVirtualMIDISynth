@@ -316,6 +316,30 @@ public:
         voiceConfiguredHook_ = hook;
         voiceConfiguredUserData_ = userData;
     }
+    // Whole-voice renderer pre-pass: StartRelease keeps its lifecycle
+    // bookkeeping (chain unlink, held-flag clears) but defers the audible
+    // state flip to the exact event frame, reported through this hook.  The
+    // renderer applies the flip inside the owning worker between spans.
+    using DeferredReleaseHook = void (*)(VoiceHandle handle, void* userData);
+    void SetDeferredReleaseHook(DeferredReleaseHook hook,
+                                void* userData) noexcept {
+        deferredReleaseHook_ = hook;
+        deferredReleaseUserData_ = userData;
+    }
+    // Whole-voice renderer: stolen victims continue as renderer-owned ghost
+    // snapshots (pre-pass state + exact-frame retirement), so the in-band
+    // steal-tail capture — which would otherwise record block-start state —
+    // is suppressed while the pre-pass runs.
+    void SetStealTailCaptureSuppressed(bool suppressed) noexcept {
+        stealTailCaptureSuppressed_ = suppressed;
+    }
+    uint32_t GetStealFadeFrames() const noexcept { return stealFadeFrames_; }
+    // Post-render bookkeeping for a release whose state flip was applied by a
+    // worker at its exact frame (see SetDeferredReleaseHook).
+    void FinalizeDeferredRelease(VoiceHandle handle);
+    // Whole-voice renderer: install a fully-formed tail record (fields
+    // already written into v.stealTail*[slot]) into the live tail list.
+    void AdoptStealTailSlot(uint32_t slot);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     VoiceHandle FindStealVictimExhaustiveForTest() const;
     uint64_t GetStealHeapBuildCountForTest() const {
@@ -814,6 +838,9 @@ private:
     void* preTailCaptureUserData_ = nullptr;
     VoiceConfiguredHook voiceConfiguredHook_ = nullptr;
     void* voiceConfiguredUserData_ = nullptr;
+    DeferredReleaseHook deferredReleaseHook_ = nullptr;
+    void* deferredReleaseUserData_ = nullptr;
+    bool stealTailCaptureSuppressed_ = false;
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2485,6 +2512,18 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
 #endif
     if (preTailCaptureHook_)
         preTailCaptureHook_(handle, preTailCaptureUserData_);
+    if (stealTailCaptureSuppressed_) {
+        // Whole-voice renderer: the victim lives on as a ghost snapshot with
+        // exact-frame retirement; the tail fade is reproduced from the
+        // ghost's state at the steal frame.  Count the attempt so telemetry
+        // stays total.
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (launchTestContext_.active)
+            ++launchChurnStats_.tailCaptureRejected;
+        EndLaunchStageForTest(LaunchProfileStage::TailCapture, tailBegin);
+#endif
+        return;
+    }
     const float gain = v.currentGain[handle];
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
@@ -3608,6 +3647,16 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
 inline void VoiceManager::StartRelease(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active)) {
+        if (deferredReleaseHook_) {
+            // Whole-voice pre-pass: chain/held bookkeeping happens now (so
+            // later pre-pass queries observe it in ingress order); the
+            // audible state flip is deferred to the event frame.
+            UnlinkChannelKey(handle);
+            v.heldBySustain[handle] = 0u;
+            v.heldBySostenuto[handle] = 0u;
+            deferredReleaseHook_(handle, deferredReleaseUserData_);
+            return;
+        }
         UnlinkChannelKey(handle);
         v.heldBySustain[handle] = 0u;
         v.heldBySostenuto[handle] = 0u;
@@ -3634,6 +3683,35 @@ inline void VoiceManager::StartRelease(VoiceHandle handle) {
         if (v.loopMode[handle] == 3) v.loopEnabled[handle] = 0;
         RefreshRenderClass(handle);
     }
+}
+
+inline void VoiceManager::FinalizeDeferredRelease(VoiceHandle handle) {
+    if (handle >= maxVoices_ ||
+        v.state[handle] != static_cast<uint8_t>(VoiceState::Releasing))
+        return;
+    releasingCount_.fetch_add(1u, std::memory_order_relaxed);
+    if (releasingRingCapacity_ != 0u) {
+        if (releasingRingCount_ == releasingRingCapacity_) {
+            releasingRingHead_ =
+                (releasingRingHead_ + 1u) & releasingRingMask_;
+            --releasingRingCount_;
+        }
+        releasingRing_[(releasingRingHead_ + releasingRingCount_) &
+                       releasingRingMask_] = static_cast<uint32_t>(handle);
+        ++releasingRingCount_;
+    }
+    RefreshRenderClass(handle);
+}
+
+inline void VoiceManager::AdoptStealTailSlot(uint32_t slot) {
+    if (slot >= kStealTailReserve) return;
+    if (v.stealTailFramesRemaining[slot] == 0u) return;
+    if (stealTailPosition_[slot] < stealTailCount_) return;  // already live
+    if (stealTailCount_ >= kStealTailReserve) return;
+    const uint32_t position = stealTailCount_++;
+    stealTailList_[position] = slot;
+    stealTailPosition_[slot] = position;
+    stealTailMinHeapValid_ = false;
 }
 
 inline void VoiceManager::RetireVoice(VoiceHandle handle) {

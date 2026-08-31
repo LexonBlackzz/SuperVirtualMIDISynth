@@ -866,10 +866,14 @@ private:
     bool denseOnly_ = false;
 };
 
-#undef SVMS_VOICE_SOA_FIXED_TAIL_FIELDS
-#undef SVMS_VOICE_SOA_DYNAMIC_FIELDS
-#undef SVMS_VOICE_SOA_COLD_FIELDS
-#undef SVMS_VOICE_SOA_DENSE_FIELDS
+// The field-list macros stay defined: SVMSRenderScalar.h reuses them for
+// whole-voice row copies and tail adoption, so new SoA fields can never be
+// missed by those copies.
+// #undef SVMS_VOICE_SOA_FIXED_TAIL_FIELDS
+// #undef SVMS_VOICE_SOA_DYNAMIC_FIELDS
+// #undef SVMS_VOICE_SOA_COLD_FIELDS
+// #undef SVMS_VOICE_SOA_DENSE_FIELDS
+
 
 } // namespace svms
 

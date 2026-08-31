@@ -443,6 +443,82 @@ struct DenseJobContext {
 //
 // This is the same path for live WASAPI output and offline rendering.
 // ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════
+// Whole-voice whole-block renderer.
+//
+// One renderer for every voice: each active voice renders a single
+// contiguous timeline spanning the whole block, applying only its own
+// events at their exact frames.  There are no shared inter-event spans, no
+// class buckets, and no dense snapshots — the per-voice time-chunked
+// kernels engage for every voice, which is what event-dense Black MIDI
+// material needs (shared spans fragment to 1–3 frames there, even though
+// events are sparse per voice).
+//
+// Block structure:
+//   1. Pre-pass (coordinator, single-threaded): walks the event list in
+//      ingress order and dispatches every event through the normal driver
+//      dispatcher with the render clock set to the event's exact frame.
+//      All lifecycle bookkeeping (steal transactions, chain links, churn
+//      stats, play indices) therefore happens exactly as today and in the
+//      exact same order.  Three renderer hooks observe the pass:
+//        - VoiceConfigured: the configured voice begins sounding at this
+//          frame (startFrame).
+//        - PreTailCapture: the displaced victim's whole render row is
+//          snapshotted as a "ghost" that renders [its start, the steal
+//          frame) — exactly the samples the victim would have produced —
+//          and continues as a normal 64-frame steal tail.  The in-band
+//          tail capture is suppressed (its state would be block-start,
+//          not steal-frame); the ghost reproduces it from the exact
+//          steal-frame state instead.
+//        - DeferredRelease: StartRelease keeps its chain/held bookkeeping
+//          but defers the audible state flip to the owning worker at the
+//          event frame.
+//   2. Render (worker pool): disjoint slices of [active voices, ghosts]
+//      render whole-block timelines into per-job mix buffers; retirement
+//      is recorded per job and applied by the coordinator in exact
+//      (frame, capture-position) order — identical to the span renderer.
+//   3. Post-pass: deferred-release finalization, render-class refresh,
+//      pre-existing steal tails, and ghost tails that outlive the block
+//      are adopted into real tail slots.
+//
+// The legacy dense/sparse hybrid remains for blocks the whole-voice plan
+// cannot own yet: vibrato-modulated material and non-note events (CC,
+// pitch bend, program change, SysEx) — those need either per-voice param
+// buckets or the shared-span machinery.
+// ════════════════════════════════════════════════════════════════════════
+struct WholeVoiceJobContext {
+    RenderScalar* renderer;
+    VoiceManager* voices;
+    const int16_t* sampleData;
+    uint32_t sampleDataFrames;
+    uint32_t numFrames;
+    uint32_t voiceItemCount;
+    uint32_t ghostItemCount;
+    uint32_t jobCount;
+};
+
+// Steal-tail record captured from a ghost's exact steal-frame state.  The
+// VoiceSoA steal-tail arrays are fixed kStealTailReserve slots and must
+// never be indexed by ghost row, so ghosts carry their own records.
+struct WholeVoiceGhostTail {
+    float phase = 0.0f;
+    float phaseInc = 0.0f;
+    float gain = 0.0f;
+    float mixGainL = 0.0f;
+    float mixGainR = 0.0f;
+    uint32_t sampleStart = 0u;
+    uint32_t relEnd = 0u;
+    uint32_t relLoopS = 0u;
+    uint32_t relLoopE = 0u;
+    float relLoopSF = 0.0f;
+    float relLoopEF = 0.0f;
+    uint32_t framesRemaining = 0u;
+    uint32_t framesTotal = 0u;
+    uint8_t sampleBacked = 0u;
+    uint8_t loopEnabled = 0u;
+};
+
+
 class RenderScalar {
 public:
     RenderScalar();
@@ -517,6 +593,66 @@ public:
                      bool correctnessMode = false,
                      uint64_t blockStartFrame = 0);
 
+private:
+    // ── Whole-voice whole-block renderer ────────────────────────────────
+    bool PlanWholeVoiceBlock(VoiceManager& voices, const RenderEvent* events,
+                             uint32_t eventCount, uint64_t blockStartFrame);
+    void RenderWholeVoiceBlock(VoiceManager& voices,
+                               const int16_t* sampleData,
+                               uint32_t sampleDataFrames,
+                               float* outputLeft, float* outputRight,
+                               uint32_t numFrames, uint64_t blockStartFrame);
+    bool ReserveWholeVoiceStorage(uint32_t handleCapacity);
+    bool EnsureWholeVoiceJobScratch(uint32_t jobCount);
+    bool RenderWholeVoiceSegment(VoiceSoA& state, VoiceManager* voices,
+                                 uint32_t row, const int16_t* sampleData,
+                                 uint32_t sampleDataFrames, float* outL,
+                                 float* outR, uint32_t segStart,
+                                 uint32_t segFrames, bool isReal,
+                                 uint32_t jobIndex);
+    void CaptureGhostTail(uint32_t ghost);
+    void RenderGhostTailSpan(uint32_t ghost, VoiceSoA& scratch,
+                             const int16_t* sampleData,
+                             uint32_t sampleDataFrames, float* outL,
+                             float* outR, uint32_t frameStart,
+                             uint32_t frameCount);
+    static void WholeVoiceVoiceConfiguredHook(VoiceHandle handle,
+                                              void* userData);
+    static void WholeVoicePreTailCaptureHook(VoiceHandle handle,
+                                             void* userData);
+    static void WholeVoiceDeferredReleaseHook(VoiceHandle handle,
+                                              void* userData);
+    static void WholeVoiceJobThunk(uint32_t jobIndex, float* outputLeft,
+                                   float* outputRight, uint32_t frameCount,
+                                   void* userData);
+
+    VoiceSoA wvGhostState_;                  // displaced-voice snapshots
+    WholeVoiceGhostTail* wvGhostTails_ = nullptr;
+    VoiceSoA* wvTailScratch_ = nullptr;      // per-job single-row tail stage
+    uint32_t wvGhostCapacity_ = 0u;
+    uint32_t wvGhostCount_ = 0u;
+    uint32_t* wvGhostStartFrame_ = nullptr;
+    uint32_t* wvGhostDeathFrame_ = nullptr;
+    uint32_t* wvGhostReleaseFrame_ = nullptr;
+    uint32_t* wvStartFrame_ = nullptr;       // per handle; UINT32_MAX = from 0
+    uint32_t* wvReleaseFrame_ = nullptr;     // per handle; UINT32_MAX = none
+    uint32_t wvHandleCapacity_ = 0u;         // handle-range size of the above
+    uint32_t* wvOpHandles_ = nullptr;
+    uint32_t* wvOpFrames_ = nullptr;
+    uint32_t wvOpCapacity_ = 0u;
+    uint32_t wvOpCount_ = 0u;
+    uint32_t wvEventFrame_ = 0u;
+    VoiceManager* wvPlanVoices_ = nullptr;
+    uint32_t* wvSliceHandles_ = nullptr;
+    SpanRetirement* wvJobRetirements_ = nullptr;
+    uint32_t* wvJobRetireCounts_ = nullptr;
+    uint32_t wvJobCapacity_ = 0u;
+    uint32_t wvJobScratchCapacity_ = 0u;     // scratch stride wvJobRetirements_ was sized for
+    uint64_t wvGhostOverflowCount_ = 0u;
+    uint32_t wholeVoiceBlocks_ = 0u;
+
+public:
+
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     // Test-only oracle: the pre-optimization frame-major renderer.  It is
     // intentionally excluded from production builds so the DLL carries only
@@ -541,6 +677,7 @@ public:
 
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
     void SetEventBatchDispatcher(EventBatchDispatcher dispatcher, void* userData);
+    uint32_t GetWholeVoiceBlocksForTest() const { return wholeVoiceBlocks_; }
     bool SetRenderBackend(RenderBackend backend);
     RenderBackend GetRenderBackend() const { return kernelSet_->backend; }
     const char* GetRenderBackendName() const { return kernelSet_->name; }
@@ -675,6 +812,18 @@ inline RenderScalar::~RenderScalar() {
     _aligned_free(denseMarkedHandles_);
     _aligned_free(denseLastAdvancedFrames_);
     _aligned_free(denseLastPhaseAdvancedFrames_);
+    _aligned_free(wvStartFrame_);
+    _aligned_free(wvReleaseFrame_);
+    _aligned_free(wvSliceHandles_);
+    _aligned_free(wvOpHandles_);
+    _aligned_free(wvOpFrames_);
+    _aligned_free(wvGhostStartFrame_);
+    _aligned_free(wvGhostDeathFrame_);
+    _aligned_free(wvGhostReleaseFrame_);
+    _aligned_free(wvJobRetirements_);
+    _aligned_free(wvJobRetireCounts_);
+    delete[] wvGhostTails_;
+    delete[] wvTailScratch_;
 }
 
 inline bool RenderScalar::ConfigureRenderThreads(
@@ -2902,6 +3051,17 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             break;
         }
     }
+    // ── Whole-voice whole-block renderer ────────────────────────────────
+    // Single per-voice renderer: owns every note-only block (and blocks
+    // with no events at all).  Vibrato and non-note events keep the legacy
+    // hybrid below until per-voice param buckets land.
+    if (!vibratoActive &&
+        PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame)) {
+        RenderWholeVoiceBlock(voices, sampleData, sampleDataFrames,
+                              outputLeft, outputRight, numFrames,
+                              blockStartFrame);
+        return;
+    }
     // Chunk-granular mixed mode: dense-parallel chunks where planning is
     // profitable, exact span rendering for the rest. Segments run strictly
     // sequentially, so the dense pipeline's shadow state and the span
@@ -2971,6 +3131,585 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         }
         segStart = segEnd;
     }
+}
+
+// ── Whole-voice whole-block renderer ────────────────────────────────────
+
+// Copy one full render row (dense + cold fields) between VoiceSoA pools.
+// The macro keeps the copy complete when SoA fields are added.
+#define SVMS_COPY_VOICE_ROW_FIELD(type, name) \
+    destination.name[destinationRow] = source.name[sourceRow];
+inline void CopyVoiceRow(const VoiceSoA& source, VoiceSoA& destination,
+                         uint32_t sourceRow, uint32_t destinationRow) {
+    SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_VOICE_ROW_FIELD)
+}
+#undef SVMS_COPY_VOICE_ROW_FIELD
+
+// Classify from raw render state; independent of the render-class lists so
+// workers never touch shared scheduling metadata.
+inline VoiceRenderClass ClassifyWholeVoiceRow(const VoiceSoA& v,
+                                              uint32_t row) {
+    if (v.state[row] == static_cast<uint8_t>(VoiceState::Free) ||
+        v.sampleBacked[row] == 0u || v.relEnd[row] < 2u) {
+        return VoiceRenderClass::Generic;
+    }
+    if (v.stealFadeInFramesRemaining[row] != 0u)
+        return VoiceRenderClass::Generic;
+    const bool loop = v.loopEnabled[row] != 0u;
+    if (loop && (v.relLoopS[row] >= v.relLoopE[row] ||
+                 v.relLoopE[row] > v.relEnd[row])) {
+        return VoiceRenderClass::Generic;
+    }
+    if (v.state[row] == static_cast<uint8_t>(VoiceState::Releasing))
+        return loop ? VoiceRenderClass::ReleaseLoop
+                    : VoiceRenderClass::ReleaseOneShot;
+    if (v.envelopeStage[row] == 3u)
+        return loop ? VoiceRenderClass::SustainedLoop
+                    : VoiceRenderClass::SustainedOneShot;
+    if (loop && (v.envelopeStage[row] == 1u ||
+                 v.envelopeStage[row] == 2u)) {
+        return VoiceRenderClass::TransientLoop;
+    }
+    return VoiceRenderClass::Generic;
+}
+
+inline void RenderScalar::WholeVoiceVoiceConfiguredHook(
+    VoiceHandle handle, void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
+    renderer->wvStartFrame_[handle] = renderer->wvEventFrame_;
+}
+
+inline void RenderScalar::WholeVoicePreTailCaptureHook(
+    VoiceHandle handle, void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
+    if (renderer->wvGhostCount_ >= renderer->wvGhostCapacity_) {
+        // Pathological block (more steals than the pool).  The displaced
+        // voice's pre-steal samples are lost for this block; the launch
+        // itself stays exact.  Counted for telemetry.
+        ++renderer->wvGhostOverflowCount_;
+        return;
+    }
+    const uint32_t ghost = renderer->wvGhostCount_++;
+    CopyVoiceRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
+                 handle, ghost);
+    renderer->wvGhostStartFrame_[ghost] =
+        renderer->wvStartFrame_[handle] == UINT32_MAX
+            ? 0u : renderer->wvStartFrame_[handle];
+    renderer->wvGhostDeathFrame_[ghost] = renderer->wvEventFrame_;
+    if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) {
+        // A deferred release on the displaced voice transfers to the ghost.
+        renderer->wvGhostReleaseFrame_[ghost] =
+            renderer->wvReleaseFrame_[handle];
+        renderer->wvReleaseFrame_[handle] = UINT32_MAX;
+    } else {
+        renderer->wvGhostReleaseFrame_[ghost] = UINT32_MAX;
+    }
+}
+
+inline void RenderScalar::WholeVoiceDeferredReleaseHook(
+    VoiceHandle handle, void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
+    if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) return;
+    // One deferred flip per voice per block: releases never re-target an
+    // already-released generation because StartRelease unlinked its key
+    // chain before this hook ran.
+    renderer->wvReleaseFrame_[handle] = renderer->wvEventFrame_;
+    renderer->wvOpHandles_[renderer->wvOpCount_] = handle;
+    renderer->wvOpFrames_[renderer->wvOpCount_] = renderer->wvEventFrame_;
+    ++renderer->wvOpCount_;
+}
+
+inline bool RenderScalar::PlanWholeVoiceBlock(
+    VoiceManager& voices, const RenderEvent* events, uint32_t eventCount,
+    uint64_t blockStartFrame) {
+    if (voices.v.rot != nullptr) return false;  // ghosts carry no rotation
+    // Eligibility is decided before any state changes so a refusal can fall
+    // back to the legacy renderer cleanly.
+    bool hasEvents = false;
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        switch (events[i].type) {
+            case RenderEventType::NoteOn:
+            case RenderEventType::NoteOff:
+            case RenderEventType::StaleNoteOffBatch:
+                hasEvents = true;
+                break;
+            default:
+                return false;
+        }
+    }
+    if (hasEvents && dispatcher_ == nullptr && batchDispatcher_ == nullptr)
+        return false;
+    // Launches dispatched below can grow the active set into free pool slots
+    // (steals replace, free-slot launches add).  Worst case: one new voice per
+    // event.  Reserve up front so every active-count-sized structure
+    // (wvSliceHandles_, op/ghost arrays, retirement buffers) covers the
+    // post-dispatch population; on failure fall back to the legacy renderer
+    // cleanly (nothing has been dispatched yet).
+    const uint32_t worstCaseActive = voices.GetActiveCount() + eventCount;
+    if (worstCaseActive > scratchCapacity_ &&
+        !ReserveVoiceCapacity(worstCaseActive)) {
+        return false;
+    }
+    // Per-handle timeline arrays are indexed by raw voice handle, which in a
+    // grown or partially-filled pool can be far above the active count.
+    const uint32_t handleCapacity = voices.v.GetCapacity();
+    if (!ReserveWholeVoiceStorage(handleCapacity)) return false;
+    if (!EnsureWholeVoiceJobScratch(
+            workerPool_ ? workerPool_->GetThreadCount() : 1u)) {
+        return false;
+    }
+
+    std::fill(wvStartFrame_, wvStartFrame_ + handleCapacity, UINT32_MAX);
+    std::fill(wvReleaseFrame_, wvReleaseFrame_ + handleCapacity, UINT32_MAX);
+    wvOpCount_ = 0u;
+    wvGhostCount_ = 0u;
+    wvPlanVoices_ = &voices;
+
+    voices.SetDeferredReleaseHook(&WholeVoiceDeferredReleaseHook, this);
+    voices.SetVoiceConfiguredHook(&WholeVoiceVoiceConfiguredHook, this);
+    voices.SetPreTailCaptureHook(&WholeVoicePreTailCaptureHook, this);
+    voices.SetStealTailCaptureSuppressed(true);
+
+    // Ingress-order dispatch with the render clock at each event's exact
+    // frame: birth ages, steal scores and every driver-side decision see
+    // the same values they would see mid-block today.
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        const RenderEvent& event = events[i];
+        wvEventFrame_ = event.frameOffset;
+        voices.SetCurrentFrame(blockStartFrame + event.frameOffset);
+        if (batchDispatcher_ != nullptr) {
+            batchDispatcher_(&event, 1u, event.frameOffset,
+                             dispatcherUserData_);
+        } else {
+            dispatcher_(event, event.frameOffset, dispatcherUserData_);
+        }
+    }
+
+    voices.SetDeferredReleaseHook(nullptr, nullptr);
+    voices.SetVoiceConfiguredHook(nullptr, nullptr);
+    voices.SetPreTailCaptureHook(nullptr, nullptr);
+    voices.SetStealTailCaptureSuppressed(false);
+    wvPlanVoices_ = nullptr;
+    return true;
+}
+
+inline bool RenderScalar::RenderWholeVoiceSegment(
+    VoiceSoA& state, VoiceManager* voices, uint32_t row,
+    const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
+    float* outR, uint32_t segStart, uint32_t segFrames, bool isReal,
+    uint32_t jobIndex) {
+    SpanRetirement* retBuf = wvJobRetirements_ +
+        static_cast<size_t>(jobIndex) * scratchCapacity_;
+    const uint32_t retCountBefore = wvJobRetireCounts_[jobIndex];
+    const VoiceRenderClass renderClass = ClassifyWholeVoiceRow(state, row);
+    RenderClassKernel kernel = kernelSet_->kernels[
+        static_cast<uint32_t>(renderClass)];
+    if (segFrames >= 8u && kernel != nullptr && sampleData != nullptr) {
+        RenderSpanContext context{
+            &state, sampleData, sampleDataFrames, outL, outR,
+            segStart, segFrames, state.GetCapacity(),
+            nullptr, nullptr,
+            isReal ? voices->activePosition_ : nullptr,
+            isReal ? retBuf : nullptr,
+            isReal ? &wvJobRetireCounts_[jobIndex] : nullptr, 0u};
+        if (kernel(context, &row, 1u)) {
+            if (isReal) {
+                for (uint32_t i = retCountBefore;
+                     i < wvJobRetireCounts_[jobIndex]; ++i) {
+                    retBuf[i].frameOffset += segStart;
+                }
+                return wvJobRetireCounts_[jobIndex] > retCountBefore;
+            }
+            return false;
+        }
+    }
+    const uint32_t retiredAt = RenderPrimaryVoiceSpan(
+        state, row, sampleData, sampleDataFrames, outL, outR,
+        segStart, segFrames, segFrames);
+    if (retiredAt != UINT32_MAX) {
+        if (isReal) {
+            retBuf[wvJobRetireCounts_[jobIndex]++] = {
+                row, segStart + retiredAt, voices->activePosition_[row]};
+        }
+        return true;
+    }
+    return false;
+}
+
+// Reproduce CaptureStealTail's tail record from the ghost's exact
+// steal-frame state.  Stored per ghost: the VoiceSoA steal-tail arrays are
+// fixed kStealTailReserve slots, so ghost rows must never index them.
+inline void RenderScalar::CaptureGhostTail(uint32_t ghost) {
+    VoiceSoA& v = wvGhostState_;
+    WholeVoiceGhostTail& tail = wvGhostTails_[ghost];
+    tail.framesRemaining = 0u;
+    if (v.sampleBacked[ghost] == 0u || v.relEnd[ghost] <= 1u) return;
+    const float gain = v.currentGain[ghost];
+    const float mixL = v.mixGainL[ghost];
+    const float mixR = v.mixGainR[ghost];
+    const float outgoingLevel =
+        std::fabs(gain) * (std::fabs(mixL) + std::fabs(mixR));
+    if (outgoingLevel <= kVoiceRetireThreshold) return;
+    tail.phase = v.phases[ghost];
+    tail.phaseInc = v.phaseIncs[ghost];
+    tail.gain = gain;
+    tail.mixGainL = mixL;
+    tail.mixGainR = mixR;
+    tail.sampleStart = v.sampleStart[ghost];
+    tail.relEnd = v.relEnd[ghost];
+    tail.relLoopS = v.relLoopS[ghost];
+    tail.relLoopE = v.relLoopE[ghost];
+    tail.relLoopSF = v.relLoopSF[ghost];
+    tail.relLoopEF = v.relLoopEF[ghost];
+    tail.sampleBacked = v.sampleBacked[ghost];
+    tail.loopEnabled = v.loopEnabled[ghost];
+    tail.framesRemaining = kStealFadeFrames;
+    tail.framesTotal = kStealFadeFrames;
+}
+
+// Stage one ghost tail record into the job's single-row scratch pool and
+// render its fade through the shared RenderStealTailSpan math.
+inline void RenderScalar::RenderGhostTailSpan(uint32_t ghost, VoiceSoA& s,
+                                              const int16_t* sampleData,
+                                              uint32_t sampleDataFrames,
+                                              float* outL, float* outR,
+                                              uint32_t frameStart,
+                                              uint32_t frameCount) {
+    const WholeVoiceGhostTail& tail = wvGhostTails_[ghost];
+    if (tail.framesRemaining == 0u) return;
+    s.stealTailPhase[0] = tail.phase;
+    s.stealTailPhaseInc[0] = tail.phaseInc;
+    s.stealTailGain[0] = tail.gain;
+    s.stealTailMixGainL[0] = tail.mixGainL;
+    s.stealTailMixGainR[0] = tail.mixGainR;
+    s.stealTailSampleStart[0] = tail.sampleStart;
+    s.stealTailRelEnd[0] = tail.relEnd;
+    s.stealTailRelLoopS[0] = tail.relLoopS;
+    s.stealTailRelLoopE[0] = tail.relLoopE;
+    s.stealTailRelLoopSF[0] = tail.relLoopSF;
+    s.stealTailRelLoopEF[0] = tail.relLoopEF;
+    s.stealTailSampleBacked[0] = tail.sampleBacked;
+    s.stealTailLoopEnabled[0] = tail.loopEnabled;
+    s.stealTailFramesRemaining[0] = tail.framesRemaining;
+    s.stealTailFramesTotal[0] = tail.framesTotal;
+    RenderStealTailSpan(s, 0, sampleData, sampleDataFrames, outL, outR,
+                        frameStart, frameCount);
+    wvGhostTails_[ghost].framesRemaining = s.stealTailFramesRemaining[0];
+}
+
+inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
+                                             float* outputLeft,
+                                             float* outputRight,
+                                             uint32_t frameCount,
+                                             void* userData) {
+    WholeVoiceJobContext* ctx = static_cast<WholeVoiceJobContext*>(userData);
+    RenderScalar* renderer = ctx->renderer;
+    VoiceSoA& v = ctx->voices->v;
+    const uint32_t itemCount = ctx->voiceItemCount + ctx->ghostItemCount;
+    const uint32_t begin = itemCount * jobIndex / ctx->jobCount;
+    const uint32_t end = itemCount * (jobIndex + 1u) / ctx->jobCount;
+    renderer->wvJobRetireCounts_[jobIndex] = 0u;
+    for (uint32_t item = begin; item < end; ++item) {
+        if (item < ctx->voiceItemCount) {
+            const uint32_t handle = renderer->wvSliceHandles_[item];
+            if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
+                continue;
+            uint32_t start = renderer->wvStartFrame_[handle];
+            if (start == UINT32_MAX) start = 0u;
+            uint32_t releaseFrame = renderer->wvReleaseFrame_[handle];
+            uint32_t cursor = start;
+            while (cursor < frameCount) {
+                uint32_t stop = frameCount;
+                if (releaseFrame != UINT32_MAX && releaseFrame < stop)
+                    stop = releaseFrame;
+                if (stop > cursor) {
+                    if (renderer->RenderWholeVoiceSegment(
+                            v, ctx->voices, handle, ctx->sampleData,
+                            ctx->sampleDataFrames, outputLeft, outputRight,
+                            cursor, stop - cursor, true, jobIndex)) {
+                        break;  // retired; coordinator applies it
+                    }
+                    cursor = stop;
+                }
+                if (releaseFrame != UINT32_MAX && cursor == releaseFrame &&
+                    cursor < frameCount) {
+                    // Exact-frame deferred release flip.
+                    v.state[handle] =
+                        static_cast<uint8_t>(VoiceState::Releasing);
+                    if (v.loopMode[handle] == 3u)
+                        v.loopEnabled[handle] = 0u;
+                    releaseFrame = UINT32_MAX;
+                }
+            }
+        } else {
+            const uint32_t ghost = item - ctx->voiceItemCount;
+            if (ghost >= renderer->wvGhostCount_) continue;
+            const uint32_t start = renderer->wvGhostStartFrame_[ghost];
+            const uint32_t death = renderer->wvGhostDeathFrame_[ghost];
+            if (start >= frameCount) continue;
+            uint32_t releaseFrame = renderer->wvGhostReleaseFrame_[ghost];
+            VoiceSoA& g = renderer->wvGhostState_;
+            uint32_t cursor = start;
+            bool retired = false;
+            while (cursor < death && cursor < frameCount) {
+                uint32_t stop = death < frameCount ? death : frameCount;
+                if (releaseFrame != UINT32_MAX && releaseFrame < stop)
+                    stop = releaseFrame;
+                if (stop > cursor) {
+                    if (renderer->RenderWholeVoiceSegment(
+                            g, nullptr, ghost, ctx->sampleData,
+                            ctx->sampleDataFrames, outputLeft, outputRight,
+                            cursor, stop - cursor, false, jobIndex)) {
+                        retired = true;
+                        break;
+                    }
+                    cursor = stop;
+                }
+                if (releaseFrame != UINT32_MAX && cursor == releaseFrame) {
+                    g.state[ghost] =
+                        static_cast<uint8_t>(VoiceState::Releasing);
+                    if (g.loopMode[ghost] == 3u)
+                        g.loopEnabled[ghost] = 0u;
+                    releaseFrame = UINT32_MAX;
+                }
+            }
+            if (retired || cursor < death) continue;  // ghost ended early
+            // Steal frame reached: reproduce the 64-frame tail fade from
+            // the ghost's exact steal-frame state, then keep rendering it.
+            renderer->CaptureGhostTail(ghost);
+            renderer->RenderGhostTailSpan(ghost,
+                                          renderer->wvTailScratch_[jobIndex],
+                                          ctx->sampleData,
+                                          ctx->sampleDataFrames, outputLeft,
+                                          outputRight, death,
+                                          frameCount - death);
+        }
+    }
+}
+
+inline void RenderScalar::RenderWholeVoiceBlock(
+    VoiceManager& voices, const int16_t* sampleData,
+    uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
+    uint32_t numFrames, uint64_t blockStartFrame) {
+    const uint32_t activeCount = voices.GetActiveCount();
+    ++wholeVoiceBlocks_;
+    std::memcpy(wvSliceHandles_, voices.activeList_,
+                static_cast<size_t>(activeCount) * sizeof(uint32_t));
+    const uint32_t ghostCount = wvGhostCount_;
+    const uint32_t itemCount = activeCount + ghostCount;
+    WholeVoiceJobContext ctx{this, &voices, sampleData, sampleDataFrames,
+                             numFrames, activeCount, ghostCount, 1u};
+    // Retire-stage input must be zeroed for THIS block: empty blocks
+    // (itemCount == 0) dispatch no thunk, so every count slot they will read
+    // has to start at zero (thunks re-zero their own slot when they run).
+    if (wvJobRetireCounts_ != nullptr && wvJobCapacity_ != 0u)
+        std::fill(wvJobRetireCounts_, wvJobRetireCounts_ + wvJobCapacity_, 0u);
+    if (itemCount != 0u) {
+        uint32_t jobCount = workerPool_
+            ? (std::min)(workerPool_->GetThreadCount(), itemCount) : 1u;
+        if (jobCount < 2u) jobCount = 1u;
+        ctx.jobCount = jobCount;
+        bool dispatched = false;
+        if (jobCount >= 2u && workerPool_ != nullptr) {
+            dispatched = workerPool_->ExecuteIndexed(
+                jobCount, numFrames, outputLeft, outputRight,
+                &WholeVoiceJobThunk, &ctx);
+        }
+        if (!dispatched) {
+            // Serial: one job over every item, mixing directly.
+            ctx.jobCount = 1u;
+            WholeVoiceJobThunk(0u, outputLeft, outputRight, numFrames, &ctx);
+        }
+    }
+
+    // Retirement in exact (frame, capture-position) order — identical to
+    // the span renderer's deferred retirement.
+    uint32_t retireTotal = 0u;
+    for (uint32_t job = 0u; job < ctx.jobCount; ++job) {
+        const uint32_t count = wvJobRetireCounts_[job];
+        std::memcpy(retirements_ + retireTotal,
+                    wvJobRetirements_ + static_cast<size_t>(job) *
+                        scratchCapacity_,
+                    static_cast<size_t>(count) * sizeof(SpanRetirement));
+        retireTotal += count;
+    }
+    std::sort(retirements_, retirements_ + retireTotal,
+        [](const SpanRetirement& a, const SpanRetirement& b) {
+            if (a.frameOffset != b.frameOffset)
+                return a.frameOffset < b.frameOffset;
+            return a.capturePosition < b.capturePosition;
+        });
+    for (uint32_t i = 0u; i < retireTotal; ++i) {
+        voices.SetCurrentFrame(blockStartFrame + retirements_[i].frameOffset);
+        voices.RetireVoice(static_cast<VoiceHandle>(retirements_[i].handle));
+    }
+
+    // Deferred release flips: counters, Releasing-ring and class lists.
+    for (uint32_t i = 0u; i < wvOpCount_; ++i)
+        voices.FinalizeDeferredRelease(
+            static_cast<VoiceHandle>(wvOpHandles_[i]));
+
+    // Render-class lists track lifecycle exactly as the legacy renderer
+    // leaves them (transient→sustained crossings included).
+    for (uint32_t i = 0u; i < activeCount; ++i)
+        voices.RefreshRenderClass(static_cast<VoiceHandle>(wvSliceHandles_[i]));
+
+    // Pre-existing steal tails (born before this block) render exactly as
+    // the span renderer's tail section does.
+    const uint32_t voiceCapacity = voices.GetMaxVoices();
+    const uint32_t tailCapacity =
+        (std::min)(voiceCapacity, static_cast<uint32_t>(kStealTailReserve));
+    for (uint32_t slot = 0u; slot < tailCapacity; ++slot) {
+        if (voices.v.stealTailFramesRemaining[slot] == 0u) continue;
+        RenderStealTailSpan(voices.v, slot, sampleData, sampleDataFrames,
+                            outputLeft, outputRight, 0u, numFrames);
+        voices.RefreshStealTail(static_cast<VoiceHandle>(slot));
+    }
+
+    // Ghost tails that outlive the block are adopted into real tail slots
+    // so their fade continues into the next block exactly as an in-band
+    // capture would.
+    for (uint32_t ghost = 0u; ghost < ghostCount; ++ghost) {
+        const WholeVoiceGhostTail& tail = wvGhostTails_[ghost];
+        if (tail.framesRemaining == 0u) continue;
+        if (wvGhostDeathFrame_[ghost] >= numFrames) continue;
+        for (uint32_t slot = 0u; slot < tailCapacity; ++slot) {
+            if (voices.v.stealTailFramesRemaining[slot] != 0u) continue;
+            voices.v.stealTailPhase[slot] = tail.phase;
+            voices.v.stealTailPhaseInc[slot] = tail.phaseInc;
+            voices.v.stealTailGain[slot] = tail.gain;
+            voices.v.stealTailMixGainL[slot] = tail.mixGainL;
+            voices.v.stealTailMixGainR[slot] = tail.mixGainR;
+            voices.v.stealTailSampleStart[slot] = tail.sampleStart;
+            voices.v.stealTailRelEnd[slot] = tail.relEnd;
+            voices.v.stealTailRelLoopS[slot] = tail.relLoopS;
+            voices.v.stealTailRelLoopE[slot] = tail.relLoopE;
+            voices.v.stealTailRelLoopSF[slot] = tail.relLoopSF;
+            voices.v.stealTailRelLoopEF[slot] = tail.relLoopEF;
+            voices.v.stealTailSampleBacked[slot] = tail.sampleBacked;
+            voices.v.stealTailLoopEnabled[slot] = tail.loopEnabled;
+            voices.v.stealTailFramesRemaining[slot] = tail.framesRemaining;
+            voices.v.stealTailFramesTotal[slot] = tail.framesTotal;
+            voices.AdoptStealTailSlot(slot);
+            break;
+        }
+    }
+
+    voices.SetCurrentFrame(blockStartFrame + numFrames);
+}
+
+inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
+    const uint32_t cap = scratchCapacity_;
+    if (cap == 0u || handleCapacity == 0u) return false;
+    if (wvStartFrame_ != nullptr && wvGhostCapacity_ >= cap &&
+        wvOpCapacity_ >= cap && wvHandleCapacity_ >= handleCapacity) {
+        return true;
+    }
+    // Per-handle timeline arrays (wvStartFrame_/wvReleaseFrame_) are indexed
+    // by RAW voice handle (0..maxVoices-1), which can be far above the active
+    // count in a grown or partially-filled pool.  Everything else is indexed
+    // by active-count rows (0..scratchCapacity_-1).  Allocate all-or-nothing
+    // so a partial failure cannot leave mixed-size arrays behind.
+    auto allocU32 = [](uint32_t*& pointer, uint32_t count) {
+        return static_cast<uint32_t*>(_aligned_malloc(
+            static_cast<size_t>(count) * sizeof(uint32_t), kMixBufferAlign));
+    };
+    uint32_t* freshStart = allocU32(wvStartFrame_, handleCapacity);
+    uint32_t* freshRelease = allocU32(wvReleaseFrame_, handleCapacity);
+    uint32_t* freshSlice = allocU32(wvSliceHandles_, cap);
+    uint32_t* freshOpHandles = allocU32(wvOpHandles_, cap);
+    uint32_t* freshOpFrames = allocU32(wvOpFrames_, cap);
+    uint32_t* freshGhostStart = allocU32(wvGhostStartFrame_, cap);
+    uint32_t* freshGhostDeath = allocU32(wvGhostDeathFrame_, cap);
+    uint32_t* freshGhostRelease = allocU32(wvGhostReleaseFrame_, cap);
+    if (freshStart == nullptr || freshRelease == nullptr ||
+        freshSlice == nullptr || freshOpHandles == nullptr ||
+        freshOpFrames == nullptr || freshGhostStart == nullptr ||
+        freshGhostDeath == nullptr || freshGhostRelease == nullptr) {
+        _aligned_free(freshStart);
+        _aligned_free(freshRelease);
+        _aligned_free(freshSlice);
+        _aligned_free(freshOpHandles);
+        _aligned_free(freshOpFrames);
+        _aligned_free(freshGhostStart);
+        _aligned_free(freshGhostDeath);
+        _aligned_free(freshGhostRelease);
+        return false;
+    }
+    _aligned_free(wvStartFrame_);
+    _aligned_free(wvReleaseFrame_);
+    _aligned_free(wvSliceHandles_);
+    _aligned_free(wvOpHandles_);
+    _aligned_free(wvOpFrames_);
+    _aligned_free(wvGhostStartFrame_);
+    _aligned_free(wvGhostDeathFrame_);
+    _aligned_free(wvGhostReleaseFrame_);
+    wvStartFrame_ = freshStart;
+    wvReleaseFrame_ = freshRelease;
+    wvSliceHandles_ = freshSlice;
+    wvOpHandles_ = freshOpHandles;
+    wvOpFrames_ = freshOpFrames;
+    wvGhostStartFrame_ = freshGhostStart;
+    wvGhostDeathFrame_ = freshGhostDeath;
+    wvGhostReleaseFrame_ = freshGhostRelease;
+    wvHandleCapacity_ = handleCapacity;
+    if (wvGhostCapacity_ < cap) {
+        VoiceSoA grown;
+        if (!grown.Reserve(cap)) return false;
+        wvGhostState_ = grown;   // copy-assign steals the storage
+        wvGhostCapacity_ = cap;
+        delete[] wvGhostTails_;
+        wvGhostTails_ = new (std::nothrow) WholeVoiceGhostTail[cap];
+        if (wvGhostTails_ == nullptr) return false;
+    }
+    wvOpCapacity_ = cap;
+    return true;
+}
+
+inline bool RenderScalar::EnsureWholeVoiceJobScratch(uint32_t jobCount) {
+    if (jobCount == 0u) jobCount = 1u;
+    if (wvJobCapacity_ >= jobCount && wvJobScratchCapacity_ == scratchCapacity_ &&
+        wvJobRetirements_ != nullptr && wvTailScratch_ != nullptr) {
+        return true;
+    }
+    SpanRetirement* retirements = static_cast<SpanRetirement*>(_aligned_malloc(
+        static_cast<size_t>(jobCount) * scratchCapacity_ *
+            sizeof(SpanRetirement),
+        kMixBufferAlign));
+    uint32_t* counts = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(jobCount) * sizeof(uint32_t), kMixBufferAlign));
+    VoiceSoA* tailScratch = new (std::nothrow) VoiceSoA[jobCount];
+    if (retirements == nullptr || counts == nullptr ||
+        tailScratch == nullptr) {
+        _aligned_free(retirements);
+        _aligned_free(counts);
+        delete[] tailScratch;
+        return false;
+    }
+    for (uint32_t job = 0u; job < jobCount; ++job) {
+        if (!tailScratch[job].Reserve(1u)) {
+            _aligned_free(retirements);
+            _aligned_free(counts);
+            delete[] tailScratch;
+            return false;
+        }
+    }
+    // Counts MUST start zeroed: the thunks zero their own slot only when a
+    // block actually dispatches items, and the retire stage reads the counts
+    // of every empty block (active=0) too.
+    std::memset(counts, 0, static_cast<size_t>(jobCount) * sizeof(uint32_t));
+    _aligned_free(wvJobRetirements_);
+    _aligned_free(wvJobRetireCounts_);
+    delete[] wvTailScratch_;
+    wvJobRetirements_ = retirements;
+    wvJobRetireCounts_ = counts;
+    wvTailScratch_ = tailScratch;
+    wvJobCapacity_ = jobCount;
+    wvJobScratchCapacity_ = scratchCapacity_;
+    return true;
 }
 
 inline void RenderScalar::RenderBlockSparseRange(
