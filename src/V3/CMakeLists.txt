@@ -699,6 +699,29 @@ if(SVMS_BUILD_TESTS)
                          "$<TARGET_FILE:svmsynth>" --diag-window)
         set_tests_properties(svms_v3_xp_diag_window_smoke PROPERTIES
             SKIP_RETURN_CODE 77)
+
+        # XP gets the same offline MIDI-song regression gate (no GPU sources).
+        add_executable(svms_v3_midi_song
+            tests/SVMSV3MidiSong.cpp
+            SVMSConfig.cpp
+            SVMSMidiStream.cpp
+            SVMSSoundFont.cpp
+            SVMSRenderKernels.cpp
+            SVMSRenderWorkers.cpp
+            SVMSRenderDispatch.cpp
+            SVMSRenderKernelsSSE2.cpp
+            SVMSRenderKernelsAVX2.cpp)
+        target_compile_definitions(svms_v3_midi_song PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+            _CRT_SECURE_NO_WARNINGS)
+        target_include_directories(svms_v3_midi_song PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+        target_link_libraries(svms_v3_midi_song PRIVATE winmm shell32)
+        add_test(NAME svms_v3_midi_song
+                 COMMAND svms_v3_midi_song --quiet)
+        set_tests_properties(svms_v3_midi_song PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 600)
     else()
         add_executable(svms_v3_midi_stream_tests
             tests/SVMSMidiStreamTests.cpp SVMSMidiStream.cpp)
@@ -785,6 +808,39 @@ if(SVMS_BUILD_TESTS)
             SVMS_ENABLE_REFERENCE_RENDERER=1)
         target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_bench PRIVATE avrt)
+
+        # "Proper MIDI" playback test: offline render of a real SMF through the
+        # production synthesis chain (StandaloneSynth), silent by construction,
+        # plus an optional --realtime mode that drives the live winmm.dll
+        # (muted unless --audible).  Telemetry/verbose flags make it a
+        # performance-development harness as well as a regression gate.
+        set(SVMS_MIDI_SONG_SOURCES
+            tests/SVMSV3MidiSong.cpp
+            SVMSConfig.cpp
+            SVMSMidiStream.cpp
+            SVMSSoundFont.cpp
+            SVMSRenderKernels.cpp
+            SVMSRenderWorkers.cpp
+            SVMSRenderDispatch.cpp
+            SVMSRenderKernelsSSE2.cpp
+            SVMSRenderKernelsAVX2.cpp)
+        add_executable(svms_v3_midi_song ${SVMS_MIDI_SONG_SOURCES})
+        target_compile_definitions(svms_v3_midi_song PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+            _CRT_SECURE_NO_WARNINGS)
+        target_include_directories(svms_v3_midi_song PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+        target_link_libraries(svms_v3_midi_song PRIVATE winmm shell32)
+        if(NOT SVMS_XP_COMPAT)
+            target_sources(svms_v3_midi_song PRIVATE
+                SVMSGpuSynth.cpp SVMSGpuDevice.cpp)
+            target_link_libraries(svms_v3_midi_song PRIVATE d3d11 dxgi d3dcompiler)
+        endif()
+        add_test(NAME svms_v3_midi_song
+                 COMMAND svms_v3_midi_song --quiet)
+        set_tests_properties(svms_v3_midi_song PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 600)
 
         add_executable(svms_v3_event_bench tests/SVMSEventPipelineBench.cpp)
         target_compile_definitions(svms_v3_event_bench PRIVATE
