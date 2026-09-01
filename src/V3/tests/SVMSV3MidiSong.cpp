@@ -523,6 +523,8 @@ struct OfflineResult {
     uint64_t peakTails = 0u;
     uint32_t stealTotal = 0u;
     double cpvsP50 = 0.0, cpvsP95 = 0.0, cpvsP99 = 0.0;
+    double dispatchPerEventP50 = 0.0, dispatchPerEventP95 = 0.0;
+    double renderCpvsP50 = 0.0, renderCpvsP95 = 0.0;
     double budgetP50 = 0.0, budgetP95 = 0.0, budgetP99 = 0.0, budgetMax = 0.0;
     float audioPeak = 0.0f;
     uint64_t missingPresets = 0u, missingRegions = 0u;
@@ -576,6 +578,7 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     uint64_t frame = 0u, eventIndex = 0u, dispatched = 0u;
     uint64_t nextVerboseFrame = 44100u * 2u;
     std::vector<double> cpvsSamples, budgetSamples;
+    std::vector<double> dispatchPerEvent, renderOnlyCpvs;
     uint64_t peakActive = 0u, peakTails = 0u;
     float audioPeak = 0.0f;
 
@@ -585,16 +588,23 @@ bool RunOffline(const Options& options, const DecodedSong& song,
         LARGE_INTEGER qpcBegin{}, qpcEnd{};
         QueryPerformanceCounter(&qpcBegin);
         const uint64_t renderBegin = __rdtsc();
+        uint64_t blockEvents = 0u;
         while (eventIndex < eventCount &&
                song.events[eventIndex].outputFrame < frame + n) {
             synth.Dispatch(song.events[eventIndex].message,
                            song.events[eventIndex].outputFrame);
             ++eventIndex;
             ++dispatched;
+            ++blockEvents;
         }
+        const uint64_t dispatchEnd = __rdtsc();
         synth.Render(left.data(), right.data(), n, frame);
         const uint64_t renderEnd = __rdtsc();
         QueryPerformanceCounter(&qpcEnd);
+        if (blockEvents != 0u)
+            dispatchPerEvent.push_back(
+                static_cast<double>(dispatchEnd - renderBegin) /
+                static_cast<double>(blockEvents));
 
         const uint32_t active = synth.Active();
         peakActive = (std::max<uint64_t>)(peakActive, active);
@@ -607,6 +617,9 @@ bool RunOffline(const Options& options, const DecodedSong& song,
         if (active > 0u) {
             cpvsSamples.push_back(
                 static_cast<double>(renderEnd - renderBegin) /
+                (static_cast<double>(n) * static_cast<double>(active)));
+            renderOnlyCpvs.push_back(
+                static_cast<double>(renderEnd - dispatchEnd) /
                 (static_cast<double>(n) * static_cast<double>(active)));
         }
         for (uint32_t i = 0u; i < n; i += 16u) {
@@ -658,6 +671,10 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     out.cpvsP50 = Percentile(cpvsSamples, 0.50);
     out.cpvsP95 = Percentile(cpvsSamples, 0.95);
     out.cpvsP99 = Percentile(cpvsSamples, 0.99);
+    out.dispatchPerEventP50 = Percentile(dispatchPerEvent, 0.50);
+    out.dispatchPerEventP95 = Percentile(dispatchPerEvent, 0.95);
+    out.renderCpvsP50 = Percentile(renderOnlyCpvs, 0.50);
+    out.renderCpvsP95 = Percentile(renderOnlyCpvs, 0.95);
     out.budgetP50 = Percentile(budgetSamples, 0.50);
     out.budgetP95 = Percentile(budgetSamples, 0.95);
     out.budgetP99 = Percentile(budgetSamples, 0.99);
@@ -1115,6 +1132,8 @@ int main(int argc, char** argv) {
                     "cpvs p50=%.2f p95=%.2f p99=%.2f | "
                     "callback-budget p50=%.1f%% p95=%.1f%% p99=%.1f%% "
                     "max=%.1f%%\n"
+                    "dispatch/event p50=%.0f p95=%.0f cycles | "
+                    "render cpvs p50=%.2f p95=%.2f\n"
                     "audio peak=%.3f | missing presets=%llu regions=%llu "
                     "invalid=%llu fallback=%llu\n",
                     static_cast<unsigned long long>(result.dispatched),
@@ -1124,7 +1143,10 @@ int main(int argc, char** argv) {
                     result.backend.c_str(),
                     result.cpvsP50, result.cpvsP95, result.cpvsP99,
                     result.budgetP50, result.budgetP95, result.budgetP99,
-                    result.budgetMax, result.audioPeak,
+                    result.budgetMax,
+                    result.dispatchPerEventP50, result.dispatchPerEventP95,
+                    result.renderCpvsP50, result.renderCpvsP95,
+                    result.audioPeak,
                     static_cast<unsigned long long>(result.missingPresets),
                     static_cast<unsigned long long>(result.missingRegions),
                     static_cast<unsigned long long>(result.invalidRegions),
