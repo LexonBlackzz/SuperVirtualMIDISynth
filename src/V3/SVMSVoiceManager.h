@@ -297,6 +297,7 @@ public:
     void ForEachChannelKeyVoice(uint8_t channel, uint8_t note,
                                 Consumer&& consume) const noexcept;
     void InvalidateStealCandidates();
+    void MarkStealScoresDirty();
     void RefreshRenderClass(VoiceHandle handle);
     uint32_t GetRenderClassCount(VoiceRenderClass renderClass) const;
     template <typename Consumer>
@@ -1890,6 +1891,14 @@ inline void VoiceManager::InvalidateStealCandidates() {
     stealHeapValid_ = false;
 }
 
+// Gains evolve while samples render, which changes per-voice steal scores
+// outside the incremental index maintenance.  Call once per render pass
+// (RenderBlock start) so the volatile steal heap rebuilds on the next
+// block's first steal instead of on every event frame.
+inline void VoiceManager::MarkStealScoresDirty() {
+    stealVolatileHeapValid_ = false;
+}
+
 inline uint32_t VoiceManager::GetRenderClassCount(
     VoiceRenderClass renderClass) const {
     const uint32_t index = static_cast<uint32_t>(renderClass);
@@ -2800,10 +2809,15 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         return winner;
     }
 
-    // Transient gains change while samples render, not between equal-frame
-    // MIDI events. Rebuild once when the output frame advances and keep exact
-    // O(log N) replacement updates for the rest of that frame.
-    if (!stealVolatileHeapValid_ || stealVolatileHeapFrame_ != currentFrame_)
+    // Transient gains change while samples render — not between equal-frame
+    // MIDI events.  RenderBlock invalidates the heap once per block, so the
+    // first steal after a render rebuilds and the rest of that dispatch run
+    // reuses it.  The former per-frame stamp check rebuilt on EVERY event
+    // whose frame advanced (the whole-voice plan loop advances the frame per
+    // event), costing O(V log V) per note-on at saturated pools.  Steal keys
+    // are frame-free (ComputeStableStealKey's age term cancels), so keys
+    // inserted at any frame compare exactly against the heap's contents.
+    if (!stealVolatileHeapValid_)
         BuildVolatileStealHeap();
 
     uint64_t bestKey = 0u;
@@ -3058,7 +3072,7 @@ inline void VoiceManager::LinkVolatileCandidate(VoiceHandle handle) {
     const uint32_t position = stealVolatileCount_++;
     stealVolatileList_[position] = handle;
     stealVolatilePosition_[handle] = position;
-    if (stealVolatileHeapValid_ && stealVolatileHeapFrame_ == currentFrame_) {
+    if (stealVolatileHeapValid_) {
         const uint32_t heapPosition = stealVolatileHeapCount_++;
         stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
             ComputeStableStealKey(handle), activePosition_[handle]);

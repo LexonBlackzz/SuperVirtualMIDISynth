@@ -3032,6 +3032,10 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     if (coverageProfilingEnabled_) ++coverageStats_.callbacks;
 #endif
     voices.SetStealKeyBackend(kernelSet_->backend);
+    // Gains changed during the previous block's render; the volatile steal
+    // heap must rebuild at this block's first steal.  One rebuild per block
+    // (not per event frame — see PopStealCandidate).
+    voices.MarkStealScoresDirty();
     // Live pool-limit changes are callback-boundary commands.  Applying one
     // before dense eligibility/snapshotting prevents a mid-plan lifecycle
     // mutation from invalidating worker-visible voice state.
