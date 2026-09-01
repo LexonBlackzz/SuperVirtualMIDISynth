@@ -244,6 +244,10 @@ public:
 #endif
         return renderer_.GetRenderBackendName();
     }
+    // Test/diagnostic access to the render-path counters.
+    uint64_t WholeVoiceBlocksForTest() const {
+        return renderer_.GetWholeVoiceBlocksForTest();
+    }
 
 private:
     struct PreparedRegion {

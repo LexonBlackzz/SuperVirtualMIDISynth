@@ -57,12 +57,14 @@ struct Options {
     bool audible = false;
     bool verbose = false;
     bool quiet = false;
+    bool coverage = false;
     uint32_t frames = 2048u;
     uint32_t renderThreads = 0u;      // 0 = automatic
     uint32_t maxVoices = 4096u;
     uint32_t repeat = 1u;             // whole-piece repetitions
     uint32_t realtimeSecondsCap = 0u; // 0 = unlimited (piece + tail)
     uint32_t tailSeconds = 4u;
+    double startSeconds = 0.0;        // trim/shift: window starts at 0
     std::string backend = "auto";
 };
 
@@ -82,6 +84,8 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.audible = true;
         } else if (std::strcmp(arg, "--verbose") == 0) {
             options.verbose = true;
+        } else if (std::strcmp(arg, "--coverage") == 0) {
+            options.coverage = true;
         } else if (std::strcmp(arg, "--quiet") == 0) {
             options.quiet = true;
         } else if (std::strcmp(arg, "--midi") == 0 && hasValue) {
@@ -102,6 +106,9 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.repeat = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(arg, "--seconds") == 0 && hasValue) {
             options.realtimeSecondsCap = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(arg, "--start-seconds") == 0 && hasValue) {
+            options.startSeconds = std::atof(argv[++i]);
+            if (options.startSeconds < 0.0) options.startSeconds = 0.0;
         } else if (std::strcmp(arg, "--backend") == 0 && hasValue) {
             options.backend = argv[++i];
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
@@ -109,7 +116,8 @@ bool ParseArgs(int argc, char** argv, Options& options) {
                 "usage: svms_v3_midi_song [--midi PATH] [--soundfont PATH]\n"
                 "       [--realtime] [--audible] [--dll PATH] [--wav PATH]\n"
                 "       [--frames 16..8192] [--render-threads N] [--voices N]\n"
-                "       [--repeat N] [--seconds N] [--backend auto|scalar|sse2|avx2]\n"
+                "       [--repeat N] [--seconds N] [--start-seconds S]\n"
+                "       [--backend auto|scalar|sse2|avx2]\n"
                 "       [--verbose] [--quiet]\n"
                 "default: offline render of the built-in piece, silent, one JSON\n"
                 "summary line.  --realtime drives the live winmm.dll (muted unless\n"
@@ -363,10 +371,15 @@ bool LoadSongFile(const wchar_t* path, uint32_t repetitions,
     return true;
 }
 
+void TrimSongStart(double startSeconds, DecodedSong& song);
+
 bool LoadSong(const Options& options, DecodedSong& song, std::string& error) {
-    if (!options.midiPath.empty())
-        return LoadSongFile(options.midiPath.c_str(), options.repeat,
-                            song, error);
+    if (!options.midiPath.empty()) {
+        if (!LoadSongFile(options.midiPath.c_str(), options.repeat,
+                          song, error)) return false;
+        TrimSongStart(options.startSeconds, song);
+        return true;
+    }
     // Built-in piece: compose to a temp file so the real decoder parses it.
     std::vector<uint8_t> smf;
     BuildDefaultMidi(smf);
@@ -389,7 +402,40 @@ bool LoadSong(const Options& options, DecodedSong& song, std::string& error) {
     CloseHandle(handle);
     const bool loaded = LoadSongFile(tempFile, options.repeat, song, error);
     DeleteFileW(tempFile);
-    return loaded;
+    if (!loaded) return false;
+    TrimSongStart(options.startSeconds, song);
+    return true;
+}
+
+// Drop events before the requested start and shift the window to frame 0.
+// Notes already sounding at the cut keep their (now unmatched) note-offs,
+// which the engine treats as harmless stale releases — the saturation state
+// inside the window is unaffected.
+void TrimSongStart(double startSeconds, DecodedSong& song) {
+    if (startSeconds <= 0.0) return;
+    const uint64_t startFrame =
+        static_cast<uint64_t>(startSeconds * 44100.0 + 0.5);
+    if (startFrame >= song.pieceFrames) {
+        song.events.clear();
+        song.pieceFrames = 0u;
+        song.noteOns = 0u;
+        return;
+    }
+    size_t out = 0u;
+    uint64_t noteOns = 0u;
+    for (size_t i = 0; i < song.events.size(); ++i) {
+        if (song.events[i].outputFrame < startFrame) continue;
+        song.events[out] = song.events[i];
+        song.events[out].outputFrame -= startFrame;
+        const uint8_t status = static_cast<uint8_t>(song.events[out].message);
+        if ((status & 0xf0u) == 0x90u &&
+            static_cast<uint8_t>(song.events[out].message >> 16u) != 0u)
+            ++noteOns;
+        ++out;
+    }
+    song.events.resize(out);
+    song.pieceFrames -= startFrame;
+    song.noteOns = noteOns;
 }
 
 // ── WAV writer (streaming 16-bit PCM stereo) ────────────────────────────────
@@ -587,6 +633,12 @@ bool RunOffline(const Options& options, const DecodedSong& song,
             nextVerboseFrame += 44100u * 2u;
         }
         frame += n;
+    }
+
+    if (options.coverage) {
+        std::printf("[coverage] wholeVoiceBlocks=%llu\n",
+                    (unsigned long long)synth.WholeVoiceBlocksForTest());
+        std::fflush(stdout);
     }
 
     if (eventIndex != eventCount) {
@@ -965,6 +1017,21 @@ int main(int argc, char** argv) {
     if (song.events.empty() || song.pieceFrames == 0u) {
         std::fprintf(stderr, "FAIL: the MIDI file contains no playable data\n");
         return 1;
+    }
+    if (!options.realtime && options.realtimeSecondsCap != 0u) {
+        // Offline --seconds: hard window — drop events beyond the cap so the
+        // dispatch-complete assertion stays meaningful.
+        const uint64_t capFrames =
+            static_cast<uint64_t>(options.realtimeSecondsCap) * 44100u;
+        if (capFrames < song.pieceFrames) {
+            size_t out = 0u;
+            for (size_t i = 0; i < song.events.size(); ++i) {
+                if (song.events[i].outputFrame >= capFrames) continue;
+                song.events[out++] = song.events[i];
+            }
+            song.events.resize(out);
+            song.pieceFrames = capFrames;
+        }
     }
     if (!options.quiet) {
         std::fprintf(stderr,
