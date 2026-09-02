@@ -355,6 +355,22 @@ private:
                 OutputDebugStringA("[SVMS] ASIO: driver requested reset, reopening\n");
                 if (Reopen_(driver) && wasRunning)
                     Start();
+            } else if (running_.load(std::memory_order_acquire)) {
+                // Some drivers (notably hardware interfaces) change their
+                // buffer size silently — no reset message, the next
+                // bufferSwitch simply arrives at the new size. Poll the
+                // driver's size off the audio thread and reopen on drift.
+                long mn = 0, mx = 0, pref = 0, gran = 0;
+                if (ASIOGetBufferSize(&mn, &mx, &pref, &gran) == ASE_OK &&
+                    pref > 0 && static_cast<uint32_t>(pref) != bufferSize_) {
+                    OutputDebugStringA(
+                        "[SVMS] ASIO: buffer size drifted, reopening\n");
+                    char driver[32];
+                    strncpy(driver, activeDriverName_, sizeof(driver) - 1);
+                    driver[sizeof(driver) - 1] = 0;
+                    if (Reopen_(driver))
+                        Start();
+                }
             }
             Sleep(100);
         }
