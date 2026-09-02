@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,16 +96,16 @@ public:
             OutputDebugStringA("[SVMS] ASIO: fewer than 2 output channels\n");
             return false;
         }
-        return OpenStream(sampleRate, bufferFrames);
+        return OpenStream(sampleRate, bufferFrames, /*preferDriverSize=*/true);
     }
 
     // MARKER_OPEN_STREAM
 
 private:
-    // preferDriverSize: on a driver-requested reset reopen, the driver's
-    // (new) preferred buffer size wins — the control panel that fired the
-    // reset is the authority. Otherwise the caller's hint is honored when
-    // it fits the driver's min/max window.
+    // preferDriverSize: the driver's preferred buffer size (what its control
+    // panel is set to) wins — used for both the initial open and reset
+    // reopens, so the driver is always the latency authority. The caller's
+    // hint is only consulted when the driver refuses the preferred size.
     bool OpenStream(uint32_t sampleRate, uint32_t requestedFrames,
                     bool preferDriverSize = false) {
         // Buffer size: honor the request when it fits the driver's window,
@@ -210,6 +211,7 @@ private:
                 float* out = static_cast<float*>(dst);
                 for (uint32_t i = 0; i < frames; ++i)
                     out[i] = src[i * 2u + static_cast<unsigned>(ch)];
+                DebugCapture(out, frames * sizeof(float));
                 break;
             }
             case ASIOSTFloat64LSB: {
@@ -219,6 +221,7 @@ private:
                 for (uint32_t i = 0; i < frames; ++i)
                     out[i] = static_cast<double>(
                         src[i * 2u + static_cast<unsigned>(ch)]);
+                DebugCapture(out, frames * sizeof(double));
                 break;
             }
             case ASIOSTInt32LSB: {
@@ -228,6 +231,7 @@ private:
                     if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
                     out[i] = static_cast<int32_t>(s * 2147483647.0f);
                 }
+                DebugCapture(out, frames * sizeof(int32_t));
                 break;
             }
             case ASIOSTInt24LSB: {
@@ -240,6 +244,7 @@ private:
                     out[i * 3u + 1u] = static_cast<uint8_t>((v >> 8) & 0xFF);
                     out[i * 3u + 2u] = static_cast<uint8_t>((v >> 16) & 0xFF);
                 }
+                DebugCapture(out, frames * 3u);
                 break;
             }
             case ASIOSTInt16LSB: {
@@ -249,6 +254,7 @@ private:
                     if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
                     out[i] = static_cast<int16_t>(s * 32767.0f);
                 }
+                DebugCapture(out, frames * sizeof(int16_t));
                 break;
             }
             default:
@@ -266,6 +272,22 @@ private:
             case ASIOSTInt16LSB:   return "int16";
             default:               return "unsupported";
         }
+    }
+
+public:
+    const char* ChannelTypeName(int ch) const {
+        return SampleTypeName(ch == 0 ? sampleType_[0] : sampleType_[1]);
+    }
+
+    // Debug: when non-null, ConvertChannel appends the raw bytes it hands
+    // to the driver for channel 0 (probe/diagnostics only).
+    static std::FILE* debugCaptureFile_;
+
+private:
+
+    static void DebugCapture(const void* data, size_t bytes) {
+        std::FILE* f = debugCaptureFile_;
+        if (f) std::fwrite(data, 1, bytes, f);
     }
 
     static void BufferSwitchStatic(long bufferIndex,
@@ -474,6 +496,7 @@ public:
 // reopen — bufferSwitch then observes either the old or the new stream,
 // never a torn-down one (crackle-then-wedge bug).
 inline std::atomic<AudioOutputASIO*> AudioOutputASIO::g_instance = nullptr;
+inline std::FILE* AudioOutputASIO::debugCaptureFile_ = nullptr;
 
 } // namespace svms
 
