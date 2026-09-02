@@ -367,8 +367,14 @@ private:
                 strncpy(driver, activeDriverName_, sizeof(driver) - 1);
                 driver[sizeof(driver) - 1] = 0;
                 OutputDebugStringA("[SVMS] ASIO: driver requested reset, reopening\n");
-                if (Reopen_(driver) && wasRunning)
-                    Start();
+                if (Reopen_(driver)) {
+                    if (wasRunning) Start();
+                } else {
+                    // Keep trying — a failed reopen must not leave the
+                    // stream dead permanently (driver may still be busy).
+                    Sleep(500);
+                    resetRequested_.store(true, std::memory_order_release);
+                }
             } else if (running_.load(std::memory_order_acquire)) {
                 // Some drivers (notably hardware interfaces) change their
                 // buffer size silently — no reset message, the next
@@ -382,8 +388,12 @@ private:
                     char driver[32];
                     strncpy(driver, activeDriverName_, sizeof(driver) - 1);
                     driver[sizeof(driver) - 1] = 0;
-                    if (Reopen_(driver))
+                    if (Reopen_(driver)) {
                         Start();
+                    } else {
+                        Sleep(500);
+                        resetRequested_.store(true, std::memory_order_release);
+                    }
                 }
             }
             Sleep(100);
@@ -403,9 +413,26 @@ private:
         if (initialized_) { ASIOExit(); initialized_ = false; }
         if (asioDrivers) asioDrivers->removeCurrentDriver();
 
-        if (!::loadAsioDriver(const_cast<char*>(driverName))) {
+        // Hardware drivers (e.g. TOPPING) issue kAsioResetRequest while their
+        // own DLL is still tearing down; the close path does FreeLibrary +
+        // CoFreeUnusedLibraries and the driver's internal threads need a
+        // moment before a fresh CoCreateInstance/load succeeds. Retry with
+        // backoff — a single immediate load loses this race reliably.
+        bool loaded = false;
+        for (int attempt = 0; attempt < 20 && !loaded; ++attempt) {
+            if (::loadAsioDriver(const_cast<char*>(driverName))) {
+                loaded = true;
+                break;
+            }
+            Sleep(50);
+            // Nudge the loader between attempts: pending frees may only
+            // complete once CoFreeUnusedLibraries runs again.
+            CoFreeUnusedLibraries();
+        }
+        if (!loaded) {
             errorText_ = "ASIO reopen failed (driver load)";
-            OutputDebugStringA("[SVMS] ASIO: reopen loadAsioDriver failed\n");
+            OutputDebugStringA(
+                "[SVMS] ASIO: reopen loadAsioDriver failed after retries\n");
             return false;
         }
         ASIODriverInfo info;
