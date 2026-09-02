@@ -3252,9 +3252,15 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     // (wvSliceHandles_, op/ghost arrays, retirement buffers) covers the
     // post-dispatch population; on failure fall back to the legacy renderer
     // cleanly (nothing has been dispatched yet).
-    const uint32_t worstCaseActive = voices.GetActiveCount() + eventCount;
-    if (worstCaseActive > scratchCapacity_ &&
-        !ReserveVoiceCapacity(worstCaseActive)) {
+    //
+    // The post-dispatch population is bounded by the PHYSICAL pool (steals
+    // replace, free-slot launches cap out), never by activeCount + eventCount.
+    // Reserving the pool size once — instead of active + events per dense
+    // block — keeps every O(capacity) structure (ghost VoiceSoA, per-job
+    // retirement scratch, dense mutation state) at pool size and lets the
+    // early-out fire permanently after the first plan.
+    if (voices.GetMaxVoices() > scratchCapacity_ &&
+        !ReserveVoiceCapacity(voices.GetMaxVoices())) {
         return false;
     }
     // Per-handle timeline arrays are indexed by raw voice handle, which in a
