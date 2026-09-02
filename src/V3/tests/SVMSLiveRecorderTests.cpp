@@ -89,6 +89,7 @@ int main() {
                     "interleaved float samples preserved");
     }
 
+    input.close();          // release the sharing handle before unlinking
     DeleteFileW(path.c_str());
     if (!ok) return 1;
     std::cout << "Live recorder tests passed\n";
