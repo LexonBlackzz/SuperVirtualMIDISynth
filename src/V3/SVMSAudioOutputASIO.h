@@ -227,7 +227,10 @@ private:
     static void BufferSwitchStatic(long bufferIndex,
                                                    ASIOBool directProcess) {
         (void)directProcess;
-        if (g_instance) g_instance->RenderInto(bufferIndex);
+        // Single acquire-load: park-to-null during a reopen makes this a
+        // no-op; a torn-down instance can never be dereferenced here.
+        AudioOutputASIO* inst = g_instance.load(std::memory_order_acquire);
+        if (inst) inst->RenderInto(bufferIndex);
     }
 
     static ASIOTime* BufferSwitchTimeInfoStatic(
@@ -237,9 +240,10 @@ private:
     }
 
     static void SampleRateDidChangeStatic(ASIOSampleRate rate) {
-        if (g_instance) {
-            g_instance->sampleRate_ = static_cast<uint32_t>(rate);
-            g_instance->resetRequested_.store(true, std::memory_order_release);
+        AudioOutputASIO* inst = g_instance.load(std::memory_order_acquire);
+        if (inst) {
+            inst->sampleRate_ = static_cast<uint32_t>(rate);
+            inst->resetRequested_.store(true, std::memory_order_release);
         }
     }
 
@@ -256,15 +260,18 @@ private:
             case kAsioEngineVersion:
                 return 2;
             case kAsioResetRequest:
-            case kAsioBufferSizeChange:
+            case kAsioBufferSizeChange: {
                 // Driver wants a reopen (control-panel buffer/rate change).
                 // Deferred to the watcher thread — never re-enter the driver
                 // from inside its own callback.
-                if (g_instance)
-                    g_instance->resetRequested_.store(true, std::memory_order_release);
+                AudioOutputASIO* inst = g_instance.load(std::memory_order_acquire);
+                if (inst)
+                    inst->resetRequested_.store(true, std::memory_order_release);
                 return 1;
-            case kAsioResyncRequest:
+            }
+            case kAsioResyncRequest: {
                 return 0;   // nothing to resync; we render fresh every switch
+            }
             default:
                 return 0;
         }
@@ -291,6 +298,9 @@ private:
     // with the stream stopped.
     bool Reopen_(const char* driverName) {
         Stop();
+        // Park: any bufferSwitch that still races in becomes a no-op until
+        // OpenStream republishes the (new) stream at its end.
+        g_instance.store(nullptr, std::memory_order_release);
         if (buffersCreated_) { ASIODisposeBuffers(); buffersCreated_ = false; }
         if (initialized_) { ASIOExit(); initialized_ = false; }
         if (asioDrivers) asioDrivers->removeCurrentDriver();
@@ -332,7 +342,7 @@ private:
 
     static constexpr int kMaxDrivers_ = 8;
 
-    static AudioOutputASIO* g_instance;
+    static std::atomic<AudioOutputASIO*> g_instance;
 
     ASIOBufferInfo bufferInfos_[2];
     ASIOCallbacks callbacks_{};
@@ -387,7 +397,7 @@ public:
             watcherQuit_.store(true, std::memory_order_release);
             watcher_.join();
         }
-        if (g_instance == this) g_instance = nullptr;
+        g_instance.store(nullptr, std::memory_order_release);
         Stop();
         if (buffersCreated_) { ASIODisposeBuffers(); buffersCreated_ = false; }
         if (initialized_) { ASIOExit(); initialized_ = false; }
@@ -416,7 +426,10 @@ public:
 };
 
 // The SDK callbacks are plain C function pointers: single active instance.
-inline AudioOutputASIO* AudioOutputASIO::g_instance = nullptr;
+// Atomic so the watcher thread can park it to null across a driver
+// reopen — bufferSwitch then observes either the old or the new stream,
+// never a torn-down one (crackle-then-wedge bug).
+inline std::atomic<AudioOutputASIO*> AudioOutputASIO::g_instance = nullptr;
 
 } // namespace svms
 
