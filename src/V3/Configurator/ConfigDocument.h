@@ -78,6 +78,7 @@ struct ConfigValues {
     bool midiInputEnabled = false;
     std::wstring midiInputDevice;
 
+    std::wstring audioBackend = L"wasapi-shared";
     std::wstring audioDevice = L"default";
     std::wstring soundFontPath;
     std::vector<std::wstring> soundFontPaths;

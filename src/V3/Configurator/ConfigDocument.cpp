@@ -173,6 +173,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.midiInputEnabled = false;
     d.midiInputDevice.clear();
     d.audioDevice = L"default";
+    d.audioBackend = L"wasapi-shared";
     d.soundFontPath.clear();
     d.soundFontPaths.clear();
     d.soundFontRoutes.clear();
@@ -183,6 +184,7 @@ void ConfigDocument::FromJson(const json& root) {
     defaults_ = Defaults();
 
     if (auto it = root.find("audio"); it != root.end() && it->is_object()) {
+        ReadString(*it, "backend", working_.audioBackend);
         ReadString(*it, "device", working_.audioDevice);
         ReadNum(*it, "sample_rate", working_.sampleRate, 8000u, 384000u);
         ReadNum(*it, "buffer_frames", working_.bufferFrames, 16u, 8192u);
@@ -294,7 +296,7 @@ nlohmann::json ConfigDocument::ToJson() const {
 
     root["schema_version"] = kConfigSchemaVersion;
 
-    root["audio"]["backend"] = "wasapi-shared";
+    root["audio"]["backend"] = WideToUtf8(working_.audioBackend);
     root["audio"]["device"] = WideToUtf8(working_.audioDevice);
     root["audio"]["sample_rate"] = working_.sampleRate;
     root["audio"]["buffer_frames"] = working_.bufferFrames;
@@ -565,6 +567,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.midiInputEnabled == b.midiInputEnabled
         && a.midiInputDevice == b.midiInputDevice
         && a.audioDevice == b.audioDevice
+        && a.audioBackend == b.audioBackend
         && a.soundFontPath == b.soundFontPath
         && a.soundFontPaths == b.soundFontPaths
         && a.soundFontRoutes == b.soundFontRoutes;

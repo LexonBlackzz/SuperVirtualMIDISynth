@@ -230,24 +230,6 @@ void RestartCell() {
     }
 }
 
-void FixedCell() {
-    ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-
-    constexpr const char* label = "FIXED";
-    const float startX = ImGui::GetCursorPosX();
-    const float available = ImGui::GetContentRegionAvail().x;
-    const float labelWidth = ImGui::CalcTextSize(label).x;
-    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
-
-    ImGui::TextDisabled("%s", label);
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted("The audio backend is currently fixed to WASAPI Shared Mode.");
-        ImGui::EndTooltip();
-    }
-}
-
 } // namespace
 
 void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
@@ -420,11 +402,33 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
 
         ImGui::TableNextRow();
         AudioLabelCell("Audio backend",
-                       "V3 uses Windows Audio Session API in shared mode. This is the production backend on modern builds.");
+                       "WASAPI Shared Output is the production backend on modern "
+                       "builds. Audio Stream Input/Output (ASIO) bypasses the "
+                       "Windows audio mixer for lower latency; it requires an "
+                       "installed ASIO driver and falls back to WASAPI if none "
+                       "can be opened. Backend changes apply after restart.");
         ImGui::TableNextColumn();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("WASAPI Shared Mode");
-        FixedCell();
+
+        static const char* backendItems[] = {
+            "WASAPI Shared Output",
+            "Audio Stream Input/Output (ASIO)",
+        };
+        int backendIdx =
+            (EqualAsciiCI(WideToUtf8Str(w.audioBackend), "asio")) ? 1 : 0;
+        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::BeginCombo("##audiobackend", backendItems[backendIdx])) {
+            for (int i = 0; i < 2; ++i) {
+                const bool selected = i == backendIdx;
+                if (ImGui::Selectable(backendItems[i], selected)) {
+                    w.audioBackend = (i == 1) ? L"asio" : L"wasapi-shared";
+                    doc.MarkDirty();
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", "restart");
 
         ImGui::TableNextRow();
         AudioLabelCell("Phase rotation",
