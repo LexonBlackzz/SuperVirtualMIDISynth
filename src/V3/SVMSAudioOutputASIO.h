@@ -101,7 +101,12 @@ public:
     // MARKER_OPEN_STREAM
 
 private:
-    bool OpenStream(uint32_t sampleRate, uint32_t requestedFrames) {
+    // preferDriverSize: on a driver-requested reset reopen, the driver's
+    // (new) preferred buffer size wins — the control panel that fired the
+    // reset is the authority. Otherwise the caller's hint is honored when
+    // it fits the driver's min/max window.
+    bool OpenStream(uint32_t sampleRate, uint32_t requestedFrames,
+                    bool preferDriverSize = false) {
         // Buffer size: honor the request when it fits the driver's window,
         // otherwise take the driver's preferred size.
         long minSize = 0, maxSize = 0, prefSize = 0, granularity = 0;
@@ -110,7 +115,8 @@ private:
             return false;
         }
         long chosen = prefSize;
-        if (requestedFrames >= static_cast<uint32_t>(minSize) &&
+        if (!preferDriverSize &&
+            requestedFrames >= static_cast<uint32_t>(minSize) &&
             requestedFrames <= static_cast<uint32_t>(maxSize))
             chosen = static_cast<long>(requestedFrames);
         bufferSize_ = static_cast<uint32_t>(chosen);
@@ -143,6 +149,15 @@ private:
             return false;
         }
         buffersCreated_ = true;
+        // The driver may have adjusted the requested size (spec allows it);
+        // whatever it actually runs with is what the engine must see.
+        long actualMin = 0, actualMax = 0, actualPref = 0, actualGran = 0;
+        if (ASIOGetBufferSize(&actualMin, &actualMax, &actualPref,
+                              &actualGran) == ASE_OK &&
+            actualPref > 0) {
+            chosen = actualPref;
+        }
+        bufferSize_ = static_cast<uint32_t>(chosen);
 
         for (int i = 0; i < 2; ++i) {
             ASIOChannelInfo ci;
@@ -289,7 +304,11 @@ private:
         }
         const uint32_t oldRate = sampleRate_;
         const uint32_t oldFrames = bufferSize_;
-        if (!OpenStream(requestedRate_, requestedFrames_))
+        // The driver's control panel changed the format — its new preferred
+        // buffer size (and possibly rate) is the authority, not our stale
+        // config hint. Passing 0 + preferDriverSize makes OpenStream adopt
+        // the driver's current preferred size exactly.
+        if (!OpenStream(requestedRate_, 0, /*preferDriverSize=*/true))
             return false;
         if (formatChanged_ &&
             (sampleRate_ != oldRate || bufferSize_ != oldFrames)) {
