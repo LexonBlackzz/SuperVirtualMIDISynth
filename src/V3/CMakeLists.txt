@@ -736,6 +736,16 @@ if(SVMS_BUILD_TESTS)
         endif()
         add_test(NAME svms_v3_midi_stream COMMAND svms_v3_midi_stream_tests)
 
+        add_executable(svms_v3_unsafe_exit_tests
+            tests/SVMSUnsafeExitTests.cpp)
+        target_compile_definitions(svms_v3_unsafe_exit_tests PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(svms_v3_unsafe_exit_tests PRIVATE winmm)
+        add_test(NAME svms_v3_unsafe_exit
+                 COMMAND svms_v3_unsafe_exit_tests)
+        set_tests_properties(svms_v3_unsafe_exit PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 300)
+
         add_executable(svms_v3_config_profile_tests
             tests/SVMSConfiguratorProfileTests.cpp
             Configurator/ConfigDocument.cpp)
