@@ -272,6 +272,7 @@ set(SVMS_ASIO_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common/combase.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common/debugmessage.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/host/asiodrivers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/host/pc/asiolist.cpp"
 )
 set(SVMS_ASIO_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common")
 set(SVMS_ASIO_INCLUDE_HOST "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/host")
@@ -799,6 +800,24 @@ if(SVMS_BUILD_TESTS)
                  COMMAND svms_v3_unsafe_exit_tests)
         set_tests_properties(svms_v3_unsafe_exit PROPERTIES
             SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+        if(EXISTS "${SVMS_ASIO_INCLUDE}/asio.h")
+            add_executable(svms_v3_asio_stress_tests
+                tests/SVMSAsioStressTests.cpp SVMSAudioOutputASIO.h
+                ${SVMS_ASIO_SOURCES})
+            target_compile_definitions(svms_v3_asio_stress_tests PRIVATE
+                NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+                ${SVMS_WITH_ASIO_DEF})
+            target_include_directories(svms_v3_asio_stress_tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}"
+                "${SVMS_ASIO_INCLUDE}"
+                "${SVMS_ASIO_INCLUDE_HOST}"
+                "${SVMS_ASIO_INCLUDE_PC}")
+            add_test(NAME svms_v3_asio_stress
+                     COMMAND svms_v3_asio_stress_tests)
+            set_tests_properties(svms_v3_asio_stress PROPERTIES
+                SKIP_RETURN_CODE 77 TIMEOUT 180)
+        endif()
 
         add_executable(svms_v3_config_profile_tests
             tests/SVMSConfiguratorProfileTests.cpp

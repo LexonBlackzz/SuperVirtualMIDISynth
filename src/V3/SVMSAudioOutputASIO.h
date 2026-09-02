@@ -99,7 +99,21 @@ public:
         return OpenStream(sampleRate, bufferFrames, /*preferDriverSize=*/true);
     }
 
-    // MARKER_OPEN_STREAM
+    // TEST HOOK: exercises the exact park → teardown → driver reload →
+    // restart path the watcher thread uses for driver-initiated resets and
+    // silent buffer-size drift. `frames == 0` behaves identically to the
+    // drift path (driver's preferred size wins); nonzero requests that
+    // exact size (still subject to the driver's min/max window).
+    bool TestReopenWithBufferSize(uint32_t frames = 0) {
+        char driver[32];
+        strncpy(driver, activeDriverName_, sizeof(driver) - 1);
+        driver[sizeof(driver) - 1] = 0;
+        const bool wasRunning = running_.load(std::memory_order_acquire);
+        OutputDebugStringA("[SVMS] ASIO: test hook reopening with size hint\n");
+        if (Reopen_(driver, frames) && wasRunning)
+            return Start();
+        return false;
+    }
 
 private:
     // preferDriverSize: the driver's preferred buffer size (what its control
@@ -377,8 +391,10 @@ private:
     }
 
     // Full driver tear-down + reopen. Call only from the watcher thread
-    // with the stream stopped.
-    bool Reopen_(const char* driverName) {
+    // with the stream stopped. `frames == 0` adopts the driver's current
+    // preferred size (the normal reset/drift path); nonzero requests that
+    // exact size, still subject to the driver's min/max window.
+    bool Reopen_(const char* driverName, uint32_t frames = 0) {
         Stop();
         // Park: any bufferSwitch that still races in becomes a no-op until
         // OpenStream republishes the (new) stream at its end.
@@ -407,11 +423,10 @@ private:
         }
         const uint32_t oldRate = sampleRate_;
         const uint32_t oldFrames = bufferSize_;
-        // The driver's control panel changed the format — its new preferred
-        // buffer size (and possibly rate) is the authority, not our stale
-        // config hint. Passing 0 + preferDriverSize makes OpenStream adopt
-        // the driver's current preferred size exactly.
-        if (!OpenStream(requestedRate_, 0, /*preferDriverSize=*/true))
+        // frames==0 -> the driver's control panel changed the format — its
+        // new preferred buffer size (and possibly rate) is the authority,
+        // not our stale config hint. Nonzero -> caller's exact request.
+        if (!OpenStream(requestedRate_, frames, /*preferDriverSize=*/frames == 0))
             return false;
         if (formatChanged_ &&
             (sampleRate_ != oldRate || bufferSize_ != oldFrames)) {
