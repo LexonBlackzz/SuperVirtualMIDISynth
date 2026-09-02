@@ -91,24 +91,43 @@ private:
     HANDLE signal_;
 };
 
-class AudioOutput {
+// Backend-neutral surface shared by the WASAPI/DirectSound and ASIO
+// outputs. Construction/Initialize stay backend-specific (device argument
+// types differ); everything the render pipeline touches is here.
+class AudioOutputBase {
+public:
+    virtual ~AudioOutputBase() = default;
+    virtual bool Start() = 0;
+    virtual void Stop() = 0;
+    virtual void Shutdown() = 0;
+    virtual uint32_t GetSampleRate() const = 0;
+    virtual uint32_t GetBufferFrames() const = 0;
+    virtual bool IsRunning() const = 0;
+    virtual HRESULT GetLastError() const { return S_OK; }
+    virtual const char* GetLastErrorText() const { return ""; }
+    using RenderCallback = void(*)(float* output, uint32_t numFrames, void* userData);
+    virtual void SetRenderCallback(RenderCallback cb, void* userData) = 0;
+};
+
+class AudioOutput : public AudioOutputBase {
 public:
     AudioOutput();
-    ~AudioOutput();
+    ~AudioOutput() override;
 
     bool Initialize(uint32_t sampleRate, uint32_t bufferFrames,
                     const std::wstring& deviceName = {});
-    void Shutdown();
-    bool Start();
-    void Stop();
+    void Shutdown() override;
+    bool Start() override;
+    void Stop() override;
 
-    uint32_t GetSampleRate() const;
-    uint32_t GetBufferFrames() const;
-    bool IsRunning() const;
-    HRESULT GetLastError() const;
+    uint32_t GetSampleRate() const override;
+    uint32_t GetBufferFrames() const override;
+    bool IsRunning() const override;
+    HRESULT GetLastError() const override;
 
-    using RenderCallback = void(*)(float* output, uint32_t numFrames, void* userData);
-    void SetRenderCallback(RenderCallback cb, void* userData);
+    using AudioOutputBase::RenderCallback;
+    using AudioOutputBase::SetRenderCallback;
+    void SetRenderCallback(RenderCallback cb, void* userData) override;
 
 private:
     static DWORD WINAPI AudioThreadProc(LPVOID param);

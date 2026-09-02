@@ -176,7 +176,9 @@ void ImportNumber(const std::map<std::string, std::string>& ini,
 
 json MakeDefaultJson(const EngineConfig& cfg) {
     const char* backend = cfg.audioBackend == AudioBackend::DirectSound
-                            ? "directsound" : "wasapi-shared";
+                            ? "directsound"
+                            : cfg.audioBackend == AudioBackend::ASIO
+                            ? "asio" : "wasapi-shared";
     const char* limiterAlgorithm = cfg.limiterAlgorithm == LimiterAlgorithm::Adaptive
                             ? "adaptive" : "classic";
     json soundFonts = json::array();
@@ -409,6 +411,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
 #else
                 if (value == "wasapi-shared")
                     cfg.audioBackend = AudioBackend::WASAPIShared;
+                else if (value == "asio")
+                    cfg.audioBackend = AudioBackend::ASIO;
                 else
                     AppendWarning(cfg.configWarning, "audio.backend");
 #endif

@@ -1,0 +1,298 @@
+// ASIO playback backend for SVMS V3 (non-XP builds).
+//
+// Wraps the Steinberg ASIO SDK host facade. The SDK sources
+// (asio-main/common + asio-main/host) are compiled into svmsynth; the
+// actual ASIO drivers are vendor-provided COM DLLs on the machine and are
+// enumerated/opened through the SDK at Initialize time.
+//
+// Mirrors the AudioOutput (WASAPI) surface used by SVMSDriver:
+//   Initialize / Start / Stop / Shutdown / IsRunning
+//   GetSampleRate / GetBufferFrames / GetLastError / SetRenderCallback
+// The render callback is the same backend-agnostic float stereo filler.
+#ifndef SVMS_AUDIO_OUTPUT_ASIO_H
+#define SVMS_AUDIO_OUTPUT_ASIO_H
+
+#include <windows.h>
+#include <atomic>
+#include <cstring>
+#include <string>
+#include <vector>
+#include "SVMSAudioOutput.h"
+#include "asiosys.h"     // defines IEEE754_64FLOAT on Windows — must precede asio.h
+#include "asio.h"
+#include "asiodrivers.h"
+
+// The SDK declares these nowhere public: asiodrivers.cpp defines the global
+// and the loader free function (this SDK version has no header for them).
+extern AsioDrivers* asioDrivers;
+bool loadAsioDriver(char* name);
+
+namespace svms {
+
+class AudioOutputASIO : public AudioOutputBase {
+public:
+    AudioOutputASIO() = default;
+    ~AudioOutputASIO() { Shutdown(); }
+
+    // driverName: empty or "default" -> first enumerated ASIO driver.
+    bool Initialize(uint32_t sampleRate, uint32_t bufferFrames,
+                    const std::wstring& driverName = {}) {
+        Shutdown();
+        requestedRate_ = sampleRate;
+        requestedFrames_ = bufferFrames;
+        configuredDriver_ = driverName;
+
+        char names[kMaxDrivers_][32] = {};
+        char* namePtrs[kMaxDrivers_];
+        for (int i = 0; i < kMaxDrivers_; ++i) namePtrs[i] = names[i];
+        static AsioDrivers drivers;
+        ::asioDrivers = &drivers;   // the SDK's loader consumes this global
+        const long found = drivers.getDriverNames(namePtrs, kMaxDrivers_);
+        if (found <= 0) {
+            lastError_ = E_FAIL;
+            errorText_ = "no installed ASIO drivers found";
+            OutputDebugStringA("[SVMS] ASIO: no installed ASIO drivers found\n");
+            return false;
+        }
+        int pick = 0;
+        if (!driverName.empty() && _wcsicmp(driverName.c_str(), L"default") != 0) {
+            wchar_t wide[32];
+            for (long i = 0; i < found; ++i) {
+                MultiByteToWideChar(CP_UTF8, 0, names[i], -1, wide, 32);
+                if (!_wcsicmp(wide, driverName.c_str())) {
+                    pick = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        strncpy(activeDriverName_, names[pick], sizeof(activeDriverName_) - 1);
+        if (!::loadAsioDriver(activeDriverName_)) {
+            lastError_ = E_FAIL;
+            errorText_ = "ASIO init failed";
+            OutputDebugStringA("[SVMS] ASIO: loadAsioDriver failed\n");
+            return false;
+        }
+
+        ASIODriverInfo info;
+        info.asioVersion = 2;
+        info.sysRef = nullptr;
+        if (ASIOInit(&info) != ASE_OK) {
+            lastError_ = E_FAIL;
+            errorText_ = "ASIO init failed";
+            OutputDebugStringA("[SVMS] ASIO: ASIOInit failed\n");
+            return false;
+        }
+        initialized_ = true;
+
+        long inCh = 0, outCh = 0;
+        if (ASIOGetChannels(&inCh, &outCh) != ASE_OK || outCh < 2) {
+            lastError_ = E_FAIL;
+            errorText_ = "ASIO init failed";
+            OutputDebugStringA("[SVMS] ASIO: fewer than 2 output channels\n");
+            return false;
+        }
+        return OpenStream(sampleRate, bufferFrames);
+    }
+
+    // MARKER_OPEN_STREAM
+
+private:
+    bool OpenStream(uint32_t sampleRate, uint32_t requestedFrames) {
+        // Buffer size: honor the request when it fits the driver's window,
+        // otherwise take the driver's preferred size.
+        long minSize = 0, maxSize = 0, prefSize = 0, granularity = 0;
+        if (ASIOGetBufferSize(&minSize, &maxSize, &prefSize, &granularity) != ASE_OK) {
+            lastError_ = E_FAIL;
+            return false;
+        }
+        long chosen = prefSize;
+        if (requestedFrames >= static_cast<uint32_t>(minSize) &&
+            requestedFrames <= static_cast<uint32_t>(maxSize))
+            chosen = static_cast<long>(requestedFrames);
+        bufferSize_ = static_cast<uint32_t>(chosen);
+
+        // Sample rate: set ours; if the driver refuses, adopt its rate.
+        ASIOSampleRate rate = static_cast<ASIOSampleRate>(sampleRate);
+        if (ASIOSetSampleRate(rate) != ASE_OK &&
+            ASIOGetSampleRate(&rate) != ASE_OK) {
+            lastError_ = E_FAIL;
+            return false;
+        }
+        sampleRate_ = static_cast<uint32_t>(rate);
+
+        // Stereo output pair, channels 0/1.
+        memset(bufferInfos_, 0, sizeof(bufferInfos_));
+        bufferInfos_[0].isInput = ASIOFalse;
+        bufferInfos_[0].channelNum = 0;
+        bufferInfos_[1].isInput = ASIOFalse;
+        bufferInfos_[1].channelNum = 1;
+
+        callbacks_.bufferSwitch = &AudioOutputASIO::BufferSwitchStatic;
+        callbacks_.sampleRateDidChange = &AudioOutputASIO::SampleRateDidChangeStatic;
+        callbacks_.asioMessage = &AudioOutputASIO::AsioMessageStatic;
+        callbacks_.bufferSwitchTimeInfo = &AudioOutputASIO::BufferSwitchTimeInfoStatic;
+
+        if (ASIOCreateBuffers(bufferInfos_, 2, chosen, &callbacks_) != ASE_OK) {
+            lastError_ = E_FAIL;
+            errorText_ = "ASIO init failed";
+            OutputDebugStringA("[SVMS] ASIO: ASIOCreateBuffers failed\n");
+            return false;
+        }
+        buffersCreated_ = true;
+
+        for (int i = 0; i < 2; ++i) {
+            ASIOChannelInfo ci;
+            ci.channel = bufferInfos_[i].channelNum;
+            ci.isInput = ASIOFalse;
+            sampleType_[i] = ASIOGetChannelInfo(&ci) == ASE_OK
+                                 ? ci.type : ASIOSTFloat32LSB;
+        }
+        scratch_.assign(static_cast<size_t>(bufferSize_) * 2u, 0.0f);
+        g_instance = this;   // callbacks route to the active output
+        return true;
+    }
+
+    void RenderInto(long bufferIndex) {
+        float* out = scratch_.data();
+        const uint32_t frames = bufferSize_;
+        if (renderCallback_) {
+            renderCallback_(out, frames, userData_);
+        } else {
+            memset(out, 0, static_cast<size_t>(frames) * 2u * sizeof(float));
+        }
+        for (int ch = 0; ch < 2; ++ch) {
+            ConvertChannel(bufferInfos_[ch].buffers[bufferIndex],
+                           out + ch, frames, sampleType_[ch]);
+        }
+    }
+
+    static void ConvertChannel(void* dst, const float* src, uint32_t frames,
+                               long type) {
+        switch (type) {
+            case ASIOSTFloat32LSB:
+                memcpy(dst, src, static_cast<size_t>(frames) * sizeof(float));
+                break;
+            case ASIOSTInt32LSB: {
+                int32_t* out = static_cast<int32_t*>(dst);
+                for (uint32_t i = 0; i < frames; ++i) {
+                    float s = src[i * 2];
+                    if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
+                    out[i] = static_cast<int32_t>(s * 2147483647.0f);
+                }
+                break;
+            }
+            case ASIOSTInt16LSB: {
+                int16_t* out = static_cast<int16_t*>(dst);
+                for (uint32_t i = 0; i < frames; ++i) {
+                    float s = src[i * 2];
+                    if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
+                    out[i] = static_cast<int16_t>(s * 32767.0f);
+                }
+                break;
+            }
+            default:
+                memset(dst, 0, static_cast<size_t>(frames) * 4u);
+                break;
+        }
+    }
+
+    static void BufferSwitchStatic(long bufferIndex,
+                                                   ASIOBool directProcess) {
+        (void)directProcess;
+        if (g_instance) g_instance->RenderInto(bufferIndex);
+    }
+
+    static ASIOTime* BufferSwitchTimeInfoStatic(
+        ASIOTime* params, long bufferIndex, ASIOBool directProcess) {
+        BufferSwitchStatic(bufferIndex, directProcess);
+        return params;
+    }
+
+    static void SampleRateDidChangeStatic(ASIOSampleRate rate) {
+        if (g_instance) g_instance->sampleRate_ = static_cast<uint32_t>(rate);
+    }
+
+    static long AsioMessageStatic(long selector, long value,
+                                                  void* message, double* opt) {
+        (void)message; (void)opt;
+        switch (selector) {
+            case kAsioSelectorSupported:
+                return value == kAsioEngineVersion ? 1 : 0;
+            case kAsioEngineVersion:
+                return 2;
+            case kAsioResetRequest:
+            case kAsioBufferSizeChange:
+            case kAsioResyncRequest:
+                return 0;   // retry / unsupported; driver keeps current setup
+            default:
+                return 0;
+        }
+    }
+
+    static constexpr int kMaxDrivers_ = 8;
+
+    static AudioOutputASIO* g_instance;
+
+    ASIOBufferInfo bufferInfos_[2];
+    ASIOCallbacks callbacks_{};
+    long sampleType_[2] = {ASIOSTFloat32LSB, ASIOSTFloat32LSB};
+    RenderCallback renderCallback_ = nullptr;
+    void* userData_ = nullptr;
+    std::vector<float> scratch_;
+    std::atomic<bool> running_{false};
+    std::atomic<HRESULT> lastError_{S_OK};
+    uint32_t requestedRate_ = 0;
+    uint32_t requestedFrames_ = 0;
+    uint32_t sampleRate_ = 0;
+    uint32_t bufferSize_ = 0;
+    bool initialized_ = false;
+    bool buffersCreated_ = false;
+    char activeDriverName_[32] = {};
+    const char* errorText_ = "no ASIO driver";
+    std::wstring configuredDriver_;
+
+public:
+    bool Start() {
+        if (!initialized_ || !buffersCreated_ ||
+            running_.load(std::memory_order_acquire))
+            return initialized_ && buffersCreated_;
+        if (ASIOStart() != ASE_OK) {
+            lastError_ = E_FAIL;
+            return false;
+        }
+        running_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void Stop() {
+        if (running_.exchange(false, std::memory_order_acq_rel))
+            ASIOStop();
+    }
+
+    void Shutdown() {
+        if (g_instance == this) g_instance = nullptr;
+        Stop();
+        if (buffersCreated_) { ASIODisposeBuffers(); buffersCreated_ = false; }
+        if (initialized_) { ASIOExit(); initialized_ = false; }
+        std::vector<float>().swap(scratch_);
+    }
+
+    uint32_t GetSampleRate() const { return sampleRate_; }
+    uint32_t GetBufferFrames() const { return bufferSize_; }
+    bool IsRunning() const { return running_.load(std::memory_order_acquire); }
+    HRESULT GetLastError() const { return lastError_; }
+    const char* GetLastErrorText() const override { return errorText_; }
+
+    using RenderCallback = void (*)(float* output, uint32_t numFrames, void* userData);
+    void SetRenderCallback(RenderCallback cb, void* userData) {
+        renderCallback_ = cb;
+        userData_ = userData;
+    }
+};
+
+// The SDK callbacks are plain C function pointers: single active instance.
+inline AudioOutputASIO* AudioOutputASIO::g_instance = nullptr;
+
+} // namespace svms
+
+#endif // SVMS_AUDIO_OUTPUT_ASIO_H

@@ -265,6 +265,29 @@ if(NOT SVMS_XP_COMPAT)
          SVMSGpuSynth.cpp SVMSGpuDevice.cpp)
 endif()
 
+# Steinberg ASIO SDK host-side glue (GPLv3 — see asio-main/). Compiled into
+# svmsynth only for non-XP builds; the actual drivers are vendor COM DLLs.
+set(SVMS_ASIO_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common/asio.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common/combase.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common/debugmessage.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/host/asiodrivers.cpp"
+)
+set(SVMS_ASIO_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common")
+set(SVMS_ASIO_INCLUDE_HOST "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/host")
+set(SVMS_ASIO_INCLUDE_PC "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/host/pc")
+if(NOT SVMS_XP_COMPAT AND EXISTS "${SVMS_ASIO_INCLUDE}/asio.h")
+    list(APPEND SOURCES ${SVMS_ASIO_SOURCES})
+    set(SVMS_WITH_ASIO_DEF SVMS_WITH_ASIO=1)
+    if(MSVC)
+        set_source_files_properties(${SVMS_ASIO_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "/FI${CMAKE_CURRENT_SOURCE_DIR}/ASIOForceIncludes.h")
+    else()
+        set_source_files_properties(${SVMS_ASIO_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/ASIOForceIncludes.h")
+    endif()
+endif()
+
 set(HEADERS
     SVMSTypes.h
     SVMSConfig.h
@@ -311,18 +334,49 @@ elseif(MINGW)
 endif()
 
 target_compile_definitions(svmsynth PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
-    UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS ${SVMS_WITH_ASIO_DEF})
 
 if(SVMS_XP_COMPAT)
     target_link_libraries(svmsynth PRIVATE dsound dxguid shell32 user32)
 else()
+    option(SVMS_ASIO "Build the ASIO output backend (requires the ASIO SDK)" ON)
+    if(SVMS_ASIO AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common/asio.h")
+        set(ASIO_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main")
+        target_sources(svmsynth PRIVATE
+            "${ASIO_SDK_DIR}/common/asio.cpp"
+            "${ASIO_SDK_DIR}/common/combase.cpp"
+            "${ASIO_SDK_DIR}/common/debugmessage.cpp"
+            "${ASIO_SDK_DIR}/host/asiodrivers.cpp"
+            "${ASIO_SDK_DIR}/host/pc/asiolist.cpp")
+        target_compile_definitions(svmsynth PRIVATE SVMS_WITH_ASIO)
+        target_include_directories(svmsynth PRIVATE
+            "${ASIO_SDK_DIR}/common" "${ASIO_SDK_DIR}/host")
+        # The SDK is not warning-clean under /W3; it is vendor code.
+        if(MSVC)
+            set(ASIO_SDK_SOURCES
+                "${ASIO_SDK_DIR}/common/asio.cpp"
+                "${ASIO_SDK_DIR}/common/combase.cpp"
+                "${ASIO_SDK_DIR}/common/debugmessage.cpp"
+                "${ASIO_SDK_DIR}/host/asiodrivers.cpp"
+                "${ASIO_SDK_DIR}/host/pc/asiolist.cpp")
+            set_source_files_properties(${ASIO_SDK_SOURCES} PROPERTIES
+                COMPILE_OPTIONS "/w;/FI${CMAKE_CURRENT_SOURCE_DIR}/SVMSAsioSdkPrefix.h")
+        endif()
+        message(STATUS "SVMS: ASIO backend enabled (${ASIO_SDK_DIR})")
+    else()
+        message(STATUS "SVMS: ASIO backend disabled (set SVMS_ASIO=ON with the SDK at asio-main/)")
+    endif()
     target_link_libraries(svmsynth PRIVATE winmm ole32 uuid avrt shell32
         d3d11 dxgi d3dcompiler)
 endif()
 
 # nlohmann/json is vendored under third_party and intentionally confined to
 # the configuration translation unit.
-target_include_directories(svmsynth PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+target_include_directories(svmsynth PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+if(NOT SVMS_XP_COMPAT)
+    target_include_directories(svmsynth PRIVATE "${SVMS_ASIO_INCLUDE}" "${SVMS_ASIO_INCLUDE_HOST}" "${SVMS_ASIO_INCLUDE_PC}")
+endif()
 
 set(EXPORTS
         PlaySoundA

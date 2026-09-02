@@ -20,6 +20,9 @@
 #include "SVMSAudioOutputDirectSound.h"
 #else
 #include "SVMSAudioOutput.h"
+#if defined(SVMS_WITH_ASIO)
+#include "SVMSAudioOutputASIO.h"
+#endif
 #endif
 #include "SVMSVoiceManager.h"
 #include "SVMSChannelCache.h"
@@ -410,14 +413,16 @@ static uint32_t LargestGrowthCapacityForBudget(
     return low;
 }
 
-static bool UsesXPWaveOut(const AudioOutput* output) {
-#if defined(SVMS_XP_COMPAT)
-    return output && output->IsWaveOutFallback();
-#else
+#if !defined(SVMS_XP_COMPAT)
+static bool UsesXPWaveOut(const AudioOutputBase* output) {
     (void)output;
     return false;
-#endif
 }
+#else
+static bool UsesXPWaveOut(const void* output) {
+    return output && static_cast<const AudioOutput*>(output)->IsWaveOutFallback();
+}
+#endif
 
 // WaitOnAddress is available on Windows 8 and newer, but some older Windows
 // SDK import libraries do not expose the API-set forwarding symbols. Resolve
@@ -2200,7 +2205,11 @@ private:
     uint64_t dispatchCyclesCurrent_ = 0u;
     bool captureSf2Detail_ = false;
 
-    AudioOutput* audioOutput;
+#if defined(SVMS_XP_COMPAT)
+    class AudioOutput* audioOutput;   // XP: concrete DirectSound/waveOut class
+#else
+    AudioOutputBase* audioOutput;
+#endif
     VoiceManager* voiceManager;
     ChannelCache* channelCache;
     RenderScalar* renderScalar;
@@ -3204,23 +3213,39 @@ bool Driver::Initialize() {
                                  cfg.masterVolume);
     }
 
-    audioOutput = new AudioOutput();
+#if !defined(SVMS_XP_COMPAT) && defined(SVMS_WITH_ASIO)
+    if (cfg.audioBackend == AudioBackend::ASIO) {
+        AudioOutputASIO* asio = new AudioOutputASIO();
+        if (asio->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
+            audioOutput = asio;
+        } else {
+            LOG("ASIO backend init failed (%s), falling back to WASAPI shared",
+                asio->GetLastErrorText());
+            delete asio;
+        }
+    }
+    if (!audioOutput)
+#endif
+    {
+        AudioOutput* wasapi = new AudioOutput();
+        audioOutput = wasapi;
 #if defined(SVMS_XP_COMPAT)
-    if (!audioOutput->Initialize(sampleRate, bufferFrames)) {
+        if (!wasapi->Initialize(sampleRate, bufferFrames)) {
 #else
-    if (!audioOutput->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
+        if (!wasapi->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
 #endif
-        HRESULT hr = audioOutput->GetLastError();
-        LOG("FAILED: AudioOutput::Initialize hr=0x%08X", (unsigned)hr);
-        XPBootstrapTrace("[SVMS XP] DirectSound initialization FAILED\r\n");
-        DiagWindow_UpdateStartup(false, static_cast<int32_t>(hr), false,
-                                 sampleRate, bufferFrames, cfg.masterVolume,
-                                 UsesXPWaveOut(audioOutput));
+            HRESULT hr = wasapi->GetLastError();
+            LOG("FAILED: AudioOutput::Initialize hr=0x%08X", (unsigned)hr);
+            XPBootstrapTrace("[SVMS XP] DirectSound initialization FAILED\r\n");
+            DiagWindow_UpdateStartup(false, static_cast<int32_t>(hr), false,
+                                     sampleRate, bufferFrames, cfg.masterVolume,
+                                     UsesXPWaveOut(audioOutput));
 #if !defined(SVMS_XP_COMPAT)
-        delete audioOutput;
-        audioOutput = nullptr;
+            delete wasapi;
+            audioOutput = nullptr;
 #endif
-        return false;
+            return false;
+        }
     }
     bufferFrames = audioOutput->GetBufferFrames();
     sampleRate = audioOutput->GetSampleRate();
