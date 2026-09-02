@@ -523,7 +523,7 @@ private:
 #if defined(_MSC_VER)
                 const uint64_t mixBegin = __rdtsc();
 #endif
-                voices_.RefreshMixGainsForChannel(
+                voices_.MarkChannelMixStale(
                     channel, channels_.GetParams()[channel]);
 #if defined(_MSC_VER)
                 dispatchProfile.controlMix += __rdtsc() - mixBegin;
@@ -595,7 +595,7 @@ private:
             channels_.SetMasterVolume(master_ * sysexMasterVolume_);
             channels_.RebuildCache(cfg_, static_cast<float>(rate_));
             for (uint8_t channel = 0; channel < kChannelCount; ++channel)
-                voices_.RefreshMixGainsForChannel(
+                voices_.MarkChannelMixStale(
                     channel, channels_.GetParams()[channel]);
             return;
         }

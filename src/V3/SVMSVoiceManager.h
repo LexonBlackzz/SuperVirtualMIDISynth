@@ -242,6 +242,20 @@ public:
     void RefreshMixGainsForChannel(uint8_t channel,
                                    const ChannelParamsSnapshot& cp);
 
+    // ── Batched (option-B) mix-gain fold ────────────────────────────────
+    // O(1) CC-side mark: record the channel's mix scales and set its dirty
+    // bits. The per-voice fold runs once per exact-frame batch (vintage-exact
+    // boundary folds) instead of once per CC, plus a steal-only fold at
+    // launch entry so victim scores stay fresh.
+    void MarkChannelMixStale(uint8_t channel, const ChannelParamsSnapshot& cp);
+    // Full fold at vintage-exact boundaries (block top, exact-frame dispatch
+    // boundaries): mixGain, stealOutputGain, renderGain, steal candidates.
+    void FoldStaleChannelMixGains();
+    // Steal-only variant for launch entry: updates mixGain/stealOutputGain
+    // and the steal candidates but NOT renderGain — renderGainL/R embed a
+    // currentGain vintage that must only be rewritten at batch boundaries.
+    void FoldStaleChannelMixGainsForSteal();
+
     // ── Channel-key utilities ──────────────────────────────────────────
 
     // Release all voices on a (channel, note) with a fixed fast release.
@@ -709,6 +723,18 @@ private:
     uint64_t volatileHeapProfileCandidates_ = 0u;
 #endif
 
+    // Mirrored mix scales + pending-fold masks for the batched mix fold.
+    // Written by MarkChannelMixStale on the dispatch thread; folded on the
+    // same thread at the consumption points listed above. Scales are only
+    // ever read for channels whose bit is set, and marking always supplies
+    // fresh scales, so the mirror can never feed a stale value.
+    float channelMixScaleL_[kChannelCount];
+    float channelMixScaleR_[kChannelCount];
+    // Two pending-fold masks: the steal mask is consumed at launch entry
+    // (victim scores must see fresh levels), the render mask at vintage-exact
+    // batch boundaries (renderGain rewrites). Marking sets both.
+    uint64_t channelMixStealMask_;
+    uint64_t channelMixDirtyMask_;
     // Per-key tracking for EndVoicesForChannelKey
     int32_t channelKeyVoiceHead_[kChannelCount][kNoteCount];
     // Tail of the newest-to-oldest intrusive chain. Note-off can therefore
@@ -793,6 +819,12 @@ private:
     void RemoveReservedVolatileRoot(VoiceHandle handle);
     bool IsStableStealCandidate(VoiceHandle handle) const;
     float ComputeEffectiveStealLevel(VoiceHandle handle) const;
+    // Shared per-voice body of the mix-gain fold (eager refresh and batched
+    // folds — must stay bit-identical between them).
+    void FoldVoiceMixGains(VoiceHandle handle, float mixScaleLeft,
+                           float mixScaleRight, bool& stableTreeDirty,
+                           bool writeRenderGain);
+    void FoldMask(uint64_t mask, bool writeRenderGain);
     float ComputeTailLevel(uint32_t tailSlot) const;
     uint32_t SelectStealTailSlot(float outgoingLevel,
                                  bool& replacingHeapRoot);
@@ -893,6 +925,10 @@ inline VoiceManager::VoiceManager()
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
         for (uint32_t n = 0; n < kNoteCount; ++n)
             channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
+    std::memset(channelMixScaleL_, 0, sizeof(channelMixScaleL_));
+    std::memset(channelMixScaleR_, 0, sizeof(channelMixScaleR_));
+    channelMixStealMask_ = 0u;
+    channelMixDirtyMask_ = 0u;
 }
 
 inline VoiceManager::VoiceManager(const VoiceManager& other)
@@ -1153,6 +1189,12 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
                 sizeof(channelKeyVoiceHead_));
     std::memcpy(channelKeyVoiceOldest_, other.channelKeyVoiceOldest_,
                 sizeof(channelKeyVoiceOldest_));
+    std::memcpy(channelMixScaleL_, other.channelMixScaleL_,
+                sizeof(channelMixScaleL_));
+    std::memcpy(channelMixScaleR_, other.channelMixScaleR_,
+                sizeof(channelMixScaleR_));
+    channelMixStealMask_ = other.channelMixStealMask_;
+    channelMixDirtyMask_ = other.channelMixDirtyMask_;
     lastLinkedPlayIndex_ = other.lastLinkedPlayIndex_;
     lastLinkedPlayVoice_ = other.lastLinkedPlayVoice_;
     maxLaunchGroupSize_ = other.maxLaunchGroupSize_;
@@ -1393,6 +1435,12 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 sizeof(channelKeyVoiceHead_));
     std::memcpy(grown.channelKeyVoiceOldest_, channelKeyVoiceOldest_,
                 sizeof(channelKeyVoiceOldest_));
+    std::memcpy(grown.channelMixScaleL_, channelMixScaleL_,
+                sizeof(channelMixScaleL_));
+    std::memcpy(grown.channelMixScaleR_, channelMixScaleR_,
+                sizeof(channelMixScaleR_));
+    grown.channelMixStealMask_ = channelMixStealMask_;
+    grown.channelMixDirtyMask_ = channelMixDirtyMask_;
     std::memcpy(grown.playGroupNext_, playGroupNext_,
                 static_cast<size_t>(oldCapacity) * sizeof(*playGroupNext_));
     std::memcpy(grown.playGroupPrev_, playGroupPrev_,
@@ -3436,6 +3484,11 @@ inline void VoiceManager::SeedVoiceRotationForVoice(VoiceHandle handle) {
 inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (voiceLimit_ == 0u || activeCount_ >= voiceLimit_ || freeTop_ == 0u)
         return kInvalidVoice;
+    // Pending CC levels must land before any steal score or configure step
+    // can observe premultiplied gains (no-op when nothing is marked). This is
+    // the steal-only fold: renderGain rewrites stay with the vintage-exact
+    // batch-boundary folds.
+    FoldStaleChannelMixGainsForSteal();
     uint32_t idx = freeStack_[--freeTop_];
 
     InitializeVoice(static_cast<VoiceHandle>(idx), channel, note, velocity);
@@ -3468,6 +3521,10 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         if (outStolen) *outStolen = false;
         return kInvalidVoice;
     }
+    // Pending CC levels must land before victim selection so a launch after a
+    // same-batch CC scores victims exactly like the eager per-CC refresh did.
+    // Steal-only fold — see FoldStaleChannelMixGainsForSteal.
+    FoldStaleChannelMixGainsForSteal();
 
     VoiceHandle vh = kInvalidVoice;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
@@ -4647,56 +4704,98 @@ inline void VoiceManager::RefreshMixGains(const ChannelParamsSnapshot* chParams)
     for (uint32_t ai = 0; ai < activeCount_; ++ai) {
         uint32_t i = activeList_[ai];
         const ChannelParamsSnapshot& cp = chParams[v.channel[i]];
-        v.mixGainL[i] = v.gainLeft[i] * cp.mixScaleLeft;
-        v.mixGainR[i] = v.gainRight[i] * cp.mixScaleRight;
-        v.stealOutputGain[i] = std::sqrt(
-            v.mixGainL[i] * v.mixGainL[i] +
-            v.mixGainR[i] * v.mixGainR[i]);
-        v.renderGainL[i] = v.currentGain[i] * v.mixGainL[i];
-        v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
-        if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
-            IsStableStealCandidate(static_cast<VoiceHandle>(i)) &&
-            stealWinnerTree_[stealTreeLeafBase_ + i] ==
-                stealStableKey_[i]) {
-            const float score = ComputeStableStealKey(
-                static_cast<VoiceHandle>(i));
-            stealStableKey_[i] = EncodeStableWinnerKey(
-                score, activePosition_[i]);
-            stealWinnerTree_[stealTreeLeafBase_ + i] = stealStableKey_[i];
-            stableTreeDirty = true;
-        } else {
-            UpdateStealCandidate(static_cast<VoiceHandle>(i));
-        }
+        FoldVoiceMixGains(static_cast<VoiceHandle>(i), cp.mixScaleLeft,
+                          cp.mixScaleRight, stableTreeDirty, true);
     }
     if (stableTreeDirty) RebuildStableWinnerTree();
+    // This eager full refresh supersedes any pending batched-fold marks.
+    for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
+        channelMixScaleL_[channel] = chParams[channel].mixScaleLeft;
+        channelMixScaleR_[channel] = chParams[channel].mixScaleRight;
+    }
+    channelMixStealMask_ = 0u;
+    channelMixDirtyMask_ = 0u;
+}
+
+inline void VoiceManager::MarkChannelMixStale(
+    uint8_t channel, const ChannelParamsSnapshot& cp) {
+    if (channel >= kChannelCount) return;
+    channelMixScaleL_[channel] = cp.mixScaleLeft;
+    channelMixScaleR_[channel] = cp.mixScaleRight;
+    channelMixStealMask_ |= (uint64_t(1) << channel);
+    channelMixDirtyMask_ |= (uint64_t(1) << channel);
+}
+
+inline void VoiceManager::FoldVoiceMixGains(
+    VoiceHandle handle, float mixScaleLeft, float mixScaleRight,
+    bool& stableTreeDirty, bool writeRenderGain) {
+    const uint32_t i = handle;
+    v.mixGainL[i] = v.gainLeft[i] * mixScaleLeft;
+    v.mixGainR[i] = v.gainRight[i] * mixScaleRight;
+    v.stealOutputGain[i] = std::sqrt(
+        v.mixGainL[i] * v.mixGainL[i] +
+        v.mixGainR[i] * v.mixGainR[i]);
+    if (writeRenderGain) {
+        v.renderGainL[i] = v.currentGain[i] * v.mixGainL[i];
+        v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
+    }
+    if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
+        IsStableStealCandidate(static_cast<VoiceHandle>(i)) &&
+        stealWinnerTree_[stealTreeLeafBase_ + i] ==
+            stealStableKey_[i]) {
+        const float score = ComputeStableStealKey(
+            static_cast<VoiceHandle>(i));
+        stealStableKey_[i] = EncodeStableWinnerKey(
+            score, activePosition_[i]);
+        stealWinnerTree_[stealTreeLeafBase_ + i] = stealStableKey_[i];
+        stableTreeDirty = true;
+    } else {
+        UpdateStealCandidate(static_cast<VoiceHandle>(i));
+    }
+}
+
+inline void VoiceManager::FoldMask(uint64_t mask, bool writeRenderGain) {
+    for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
+        const uint64_t bit = uint64_t(1) << channel;
+        if ((mask & bit) == 0u) continue;
+        const float mixScaleLeft = channelMixScaleL_[channel];
+        const float mixScaleRight = channelMixScaleR_[channel];
+        bool stableTreeDirty = false;
+        ForEachChannelActive(static_cast<uint8_t>(channel),
+            [&](VoiceHandle voice) {
+                FoldVoiceMixGains(voice, mixScaleLeft, mixScaleRight,
+                                  stableTreeDirty, writeRenderGain);
+            });
+        if (stableTreeDirty) RebuildStableWinnerTree();
+    }
+}
+
+inline void VoiceManager::FoldStaleChannelMixGains() {
+    uint64_t pending = channelMixStealMask_ | channelMixDirtyMask_;
+    if (pending == 0u) return;
+    channelMixStealMask_ = 0u;
+    channelMixDirtyMask_ = 0u;
+    FoldMask(pending, true);
+}
+
+inline void VoiceManager::FoldStaleChannelMixGainsForSteal() {
+    uint64_t pending = channelMixStealMask_;
+    if (pending == 0u) return;
+    channelMixStealMask_ = 0u;
+    FoldMask(pending, false);
 }
 
 inline void VoiceManager::RefreshMixGainsForChannel(
     uint8_t channel, const ChannelParamsSnapshot& cp) {
     if (channel >= kChannelCount) return;
+    channelMixScaleL_[channel] = cp.mixScaleLeft;
+    channelMixScaleR_[channel] = cp.mixScaleRight;
+    channelMixStealMask_ &= ~(uint64_t(1) << channel);
+    channelMixDirtyMask_ &= ~(uint64_t(1) << channel);
     bool stableTreeDirty = false;
     ForEachChannelActive(channel, [&](VoiceHandle voice) {
-        const uint32_t i = voice;
-        v.mixGainL[i] = v.gainLeft[i] * cp.mixScaleLeft;
-        v.mixGainR[i] = v.gainRight[i] * cp.mixScaleRight;
-        v.stealOutputGain[i] = std::sqrt(
-            v.mixGainL[i] * v.mixGainL[i] +
-            v.mixGainR[i] * v.mixGainR[i]);
-        v.renderGainL[i] = v.currentGain[i] * v.mixGainL[i];
-        v.renderGainR[i] = v.currentGain[i] * v.mixGainR[i];
-        if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
-            IsStableStealCandidate(static_cast<VoiceHandle>(i)) &&
-            stealWinnerTree_[stealTreeLeafBase_ + i] ==
-                stealStableKey_[i]) {
-            const float score = ComputeStableStealKey(
-                static_cast<VoiceHandle>(i));
-            stealStableKey_[i] = EncodeStableWinnerKey(
-                score, activePosition_[i]);
-            stealWinnerTree_[stealTreeLeafBase_ + i] = stealStableKey_[i];
-            stableTreeDirty = true;
-        } else {
-            UpdateStealCandidate(static_cast<VoiceHandle>(i));
-        }
+        FoldVoiceMixGains(voice, cp.mixScaleLeft, cp.mixScaleRight,
+                          stableTreeDirty, true);
     });
     if (stableTreeDirty) RebuildStableWinnerTree();
 }

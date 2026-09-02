@@ -4815,7 +4815,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     if (self->appliedMasterVolume_ != effectiveMasterVolume) {
         self->appliedMasterVolume_ = effectiveMasterVolume;
         for (uint32_t ch = 0u; ch < kChannelCount; ++ch) {
-            vm->RefreshMixGainsForChannel(
+            vm->MarkChannelMixStale(
                 static_cast<uint8_t>(ch), cc->GetParams()[ch]);
         }
     }
@@ -5511,7 +5511,7 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                 if (self->voiceManager) {
                     for (uint8_t channel = 0u;
                          channel < kChannelCount; ++channel) {
-                        self->voiceManager->RefreshMixGainsForChannel(
+                        self->voiceManager->MarkChannelMixStale(
                             channel,
                             self->channelCache->GetParams()[channel]);
                         self->channelCache->SetBendRatio(
@@ -6325,7 +6325,9 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
         channelCache->SetBendRatio(channel, channelPitchBendRatio_[channel]);
         if (controller == 7 || controller == 10 || controller == 11 ||
             controller == 121) {
-            voiceManager->RefreshMixGainsForChannel(
+            // O(1): the per-voice fold is batched to the exact-frame
+            // boundaries and launch entries (see MarkChannelMixStale).
+            voiceManager->MarkChannelMixStale(
                 channel, channelCache->GetParams()[channel]);
         }
     }

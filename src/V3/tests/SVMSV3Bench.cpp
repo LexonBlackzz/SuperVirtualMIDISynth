@@ -516,7 +516,7 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
             channels.ControlChange(event.channel, event.data1, event.data2);
             channels.RebuildCache(*context->config, 44100.0f);
             if (event.data1 == 7u || event.data1 == 10u || event.data1 == 11u)
-                voices.RefreshMixGainsForChannel(
+                voices.MarkChannelMixStale(
                     event.channel, channels.GetParams()[event.channel]);
             break;
         case svms::RenderEventType::PitchBend: {

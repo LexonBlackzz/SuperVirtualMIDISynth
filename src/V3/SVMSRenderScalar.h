@@ -1033,6 +1033,9 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                 for (uint32_t i = batchBegin; i < eventIdx; ++i)
                     dispatcher_(events[i], f, dispatcherUserData_);
             }
+            // Exact-frame CC dispatch may have marked channels stale; fold
+            // before this frame's voices render (reference path).
+            voices.FoldStaleChannelMixGains();
         }
         if (voices.activeCount_ > scratchCapacity_ &&
             !ReserveVoiceCapacity(voices.activeCount_)) return;
@@ -2900,6 +2903,10 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                         dispatcher_(events[index], cursor, dispatcherUserData_);
                     }
                 }
+                // Exact-frame CC dispatch may have marked channels stale;
+                // fold before the marked-voice snapshots capture premultiplied
+                // gains at this cursor.
+                voices.FoldStaleChannelMixGains();
                 if (plan.mutationCount + denseMarkedCount_ >
                     denseMutationCapacity_) {
                     voices.SetPreTailCaptureHook(nullptr, nullptr);
@@ -3036,6 +3043,10 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // heap must rebuild at this block's first steal.  One rebuild per block
     // (not per event frame — see PopStealCandidate).
     voices.MarkStealScoresDirty();
+    // Batched CC mix folds (MarkChannelMixStale) land before whole-voice
+    // planning and before any voice renders this block. Mid-block CCs fold at
+    // their exact dispatch boundaries instead.
+    voices.FoldStaleChannelMixGains();
     // Live pool-limit changes are callback-boundary commands.  Applying one
     // before dense eligibility/snapshotting prevents a mid-plan lifecycle
     // mutation from invalidating worker-visible voice state.
@@ -3783,6 +3794,9 @@ inline void RenderScalar::RenderBlockSparseRange(
                 for (uint32_t i = batchBegin; i < eventIndex; ++i)
                     dispatcher_(events[i], cursor, dispatcherUserData_);
             }
+            // Exact-frame CC dispatch may have marked channels stale; fold
+            // before this span's voices render.
+            voices.FoldStaleChannelMixGains();
         }
         if (voices.activeCount_ > scratchCapacity_ &&
             !ReserveVoiceCapacity(voices.activeCount_)) return;
