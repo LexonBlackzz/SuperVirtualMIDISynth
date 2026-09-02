@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 #include "SVMSAudioOutput.h"
 #include "asiosys.h"     // defines IEEE754_64FLOAT on Windows — must precede asio.h
@@ -31,6 +32,9 @@ namespace svms {
 
 class AudioOutputASIO : public AudioOutputBase {
 public:
+    using FormatChangedCallback = void (*)(uint32_t sampleRate,
+                                           uint32_t bufferFrames, void* userData);
+
     AudioOutputASIO() = default;
     ~AudioOutputASIO() { Shutdown(); }
 
@@ -209,7 +213,10 @@ private:
     }
 
     static void SampleRateDidChangeStatic(ASIOSampleRate rate) {
-        if (g_instance) g_instance->sampleRate_ = static_cast<uint32_t>(rate);
+        if (g_instance) {
+            g_instance->sampleRate_ = static_cast<uint32_t>(rate);
+            g_instance->resetRequested_.store(true, std::memory_order_release);
+        }
     }
 
     static long AsioMessageStatic(long selector, long value,
@@ -217,16 +224,80 @@ private:
         (void)message; (void)opt;
         switch (selector) {
             case kAsioSelectorSupported:
-                return value == kAsioEngineVersion ? 1 : 0;
+                return (value == kAsioEngineVersion ||
+                        value == kAsioResetRequest ||
+                        value == kAsioBufferSizeChange) ? 1 : 0;
             case kAsioEngineVersion:
                 return 2;
             case kAsioResetRequest:
             case kAsioBufferSizeChange:
+                // Driver wants a reopen (control-panel buffer/rate change).
+                // Deferred to the watcher thread — never re-enter the driver
+                // from inside its own callback.
+                if (g_instance)
+                    g_instance->resetRequested_.store(true, std::memory_order_release);
+                return 1;
             case kAsioResyncRequest:
-                return 0;   // retry / unsupported; driver keeps current setup
+                return 0;   // nothing to resync; we render fresh every switch
             default:
                 return 0;
         }
+    }
+
+private:
+    void WatcherLoop() {
+        while (!watcherQuit_.load(std::memory_order_acquire)) {
+            if (resetRequested_.exchange(false, std::memory_order_acq_rel)) {
+                const bool wasRunning =
+                    running_.load(std::memory_order_acquire);
+                char driver[32];
+                strncpy(driver, activeDriverName_, sizeof(driver) - 1);
+                driver[sizeof(driver) - 1] = 0;
+                OutputDebugStringA("[SVMS] ASIO: driver requested reset, reopening\n");
+                if (Reopen_(driver) && wasRunning)
+                    Start();
+            }
+            Sleep(100);
+        }
+    }
+
+    // Full driver tear-down + reopen. Call only from the watcher thread
+    // with the stream stopped.
+    bool Reopen_(const char* driverName) {
+        Stop();
+        if (buffersCreated_) { ASIODisposeBuffers(); buffersCreated_ = false; }
+        if (initialized_) { ASIOExit(); initialized_ = false; }
+        if (asioDrivers) asioDrivers->removeCurrentDriver();
+
+        if (!::loadAsioDriver(const_cast<char*>(driverName))) {
+            errorText_ = "ASIO reopen failed (driver load)";
+            OutputDebugStringA("[SVMS] ASIO: reopen loadAsioDriver failed\n");
+            return false;
+        }
+        ASIODriverInfo info;
+        info.asioVersion = 2;
+        info.sysRef = nullptr;
+        if (ASIOInit(&info) != ASE_OK) {
+            errorText_ = "ASIO reopen failed (init)";
+            return false;
+        }
+        initialized_ = true;
+        long inCh = 0, outCh = 0;
+        if (ASIOGetChannels(&inCh, &outCh) != ASE_OK || outCh < 2) {
+            errorText_ = "ASIO reopen failed (channels)";
+            return false;
+        }
+        const uint32_t oldRate = sampleRate_;
+        const uint32_t oldFrames = bufferSize_;
+        if (!OpenStream(requestedRate_, requestedFrames_))
+            return false;
+        if (formatChanged_ &&
+            (sampleRate_ != oldRate || bufferSize_ != oldFrames)) {
+            OutputDebugStringA(
+                "[SVMS] ASIO: format changed on reset, notifying engine\n");
+            formatChanged_(sampleRate_, bufferSize_, formatChangedUser_);
+        }
+        return true;
     }
 
     static constexpr int kMaxDrivers_ = 8;
@@ -250,12 +321,22 @@ private:
     char activeDriverName_[32] = {};
     const char* errorText_ = "no ASIO driver";
     std::wstring configuredDriver_;
+    std::atomic<bool> resetRequested_{false};
+    std::atomic<bool> watcherQuit_{false};
+    std::thread watcher_;
+    FormatChangedCallback formatChanged_ = nullptr;
+    void* formatChangedUser_ = nullptr;
 
 public:
     bool Start() {
-        if (!initialized_ || !buffersCreated_ ||
-            running_.load(std::memory_order_acquire))
-            return initialized_ && buffersCreated_;
+        if (!initialized_ || !buffersCreated_)
+            return false;
+        if (!watcher_.joinable()) {
+            watcherQuit_.store(false, std::memory_order_release);
+            watcher_ = std::thread(&AudioOutputASIO::WatcherLoop, this);
+        }
+        if (running_.load(std::memory_order_acquire))
+            return true;
         if (ASIOStart() != ASE_OK) {
             lastError_ = E_FAIL;
             return false;
@@ -270,11 +351,23 @@ public:
     }
 
     void Shutdown() {
+        if (watcher_.joinable()) {
+            watcherQuit_.store(true, std::memory_order_release);
+            watcher_.join();
+        }
         if (g_instance == this) g_instance = nullptr;
         Stop();
         if (buffersCreated_) { ASIODisposeBuffers(); buffersCreated_ = false; }
         if (initialized_) { ASIOExit(); initialized_ = false; }
         std::vector<float>().swap(scratch_);
+    }
+
+    // Invoked (from the watcher thread, stream stopped) when the driver
+    // forced a reopen and the format (rate or buffer size) changed, so the
+    // engine can reallocate its mix buffers and reconfigure DSP.
+    void SetFormatChangedCallback(FormatChangedCallback cb, void* userData) {
+        formatChanged_ = cb;
+        formatChangedUser_ = userData;
     }
 
     uint32_t GetSampleRate() const { return sampleRate_; }

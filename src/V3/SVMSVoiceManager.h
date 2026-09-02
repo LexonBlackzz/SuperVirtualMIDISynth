@@ -162,6 +162,12 @@ public:
     ~VoiceManager();
     bool Initialize(uint32_t maxVoices, uint32_t sampleRate = 44100);
     void Reset();
+    // Live sample-rate change (ASIO driver rate switch). Affects only
+    // voices configured from now on; voices in flight keep the envelope
+    // units they were configured with and retire naturally.
+    void SetSampleRate(uint32_t sampleRate) {
+        if (sampleRate) sampleRate_ = sampleRate;
+    }
 
     // Allocate a fresh voice slot.  Returns kInvalidVoice when pool is full
     // (caller should then call AllocateVoiceOrSteal).

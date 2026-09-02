@@ -2098,11 +2098,21 @@ public:
     uint32_t sampleRate;
     uint32_t bufferFrames;
 
+    // ASIO format changes (driver-initiated buffer size / sample rate
+    // changes) are parked here by the notification callback and applied at
+    // the top of the next render callback — same thread that owns the mix
+    // buffers, so no reallocation races.
+    std::atomic<uint32_t> pendingFormatRate_{0};
+    std::atomic<uint32_t> pendingFormatFrames_{0};
+
 private:
     Driver();
     ~Driver();
 
     static void RenderCallback(float* output, uint32_t numFrames, void* userData);
+    static void OnAsioFormatChanged(uint32_t sampleRate, uint32_t bufferFrames,
+                                    void* userData);
+    void ApplyPendingAudioFormat();
 
     // EventDispatcher callback — invoked by RenderScalar at each event's
     // exact integer output frame during RenderBlock.
@@ -3216,6 +3226,7 @@ bool Driver::Initialize() {
 #if !defined(SVMS_XP_COMPAT) && defined(SVMS_WITH_ASIO)
     if (cfg.audioBackend == AudioBackend::ASIO) {
         AudioOutputASIO* asio = new AudioOutputASIO();
+        asio->SetFormatChangedCallback(&Driver::OnAsioFormatChanged, this);
         if (asio->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
             audioOutput = asio;
         } else {
@@ -3252,6 +3263,13 @@ bool Driver::Initialize() {
     postHighPass.Initialize(sampleRate);
     reverb.Configure(sampleRate, cfg);
     limiter.Configure(sampleRate, cfg);
+    {
+        bool isAsio = false;
+#if !defined(SVMS_XP_COMPAT)
+        isAsio = dynamic_cast<AudioOutputASIO*>(audioOutput) != nullptr;
+#endif
+        DiagWindow_SetBackendLabel(isAsio ? L"ASIO" : L"WASAPI shared");
+    }
     LOG("AudioOutput initialized, rate=%u bufferFrames=%u", sampleRate, bufferFrames);
 
     bufferCapacity = bufferFrames;
@@ -4738,10 +4756,66 @@ void Driver::EventCompilerLoop() {
     }
 }
 
+void Driver::OnAsioFormatChanged(uint32_t sampleRate, uint32_t bufferFrames,
+                                 void* userData) {
+    Driver* self = static_cast<Driver*>(userData);
+    if (!self) return;
+    self->pendingFormatRate_.store(sampleRate, std::memory_order_release);
+    self->pendingFormatFrames_.store(bufferFrames, std::memory_order_release);
+    LOG("ASIO format change requested: rate=%u frames=%u", sampleRate, bufferFrames);
+}
+
+// Runs on the audio thread only (dispatched from RenderCallback). The ASIO
+// driver has already stopped delivering buffers of the old size by the time
+// the notification arrives, and the ASIO output re-creates its buffers
+// before returning into bufferSwitch — so by the time we get here the
+// backend's GetBufferFrames/GetSampleRate report the new format and this
+// block's numFrames matches it. Everything downstream of the render callback
+// is per-block; only the persistent state below captures the format.
+void Driver::ApplyPendingAudioFormat() {
+    const uint32_t newRate =
+        pendingFormatRate_.exchange(0, std::memory_order_acq_rel);
+    const uint32_t newFrames =
+        pendingFormatFrames_.exchange(0, std::memory_order_acq_rel);
+
+    if (newFrames && newFrames != bufferFrames) {
+        bufferFrames = newFrames;
+        if (newFrames > bufferCapacity) {
+            _aligned_free(leftBuffer);
+            _aligned_free(rightBuffer);
+            bufferCapacity = newFrames;
+            leftBuffer = static_cast<float*>(
+                _aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
+            rightBuffer = static_cast<float*>(
+                _aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
+            LOG("ASIO buffer resized: capacity=%u", bufferCapacity);
+        }
+    }
+    if (newRate && newRate != sampleRate) {
+        sampleRate = newRate;
+        postHighPass.Initialize(sampleRate);
+        reverb.Configure(sampleRate, engineConfig_);
+        limiter.Configure(sampleRate, engineConfig_);
+        LOG("ASIO sample rate changed: %u", sampleRate);
+        // Active voices carry envelope/phase state in the old rate's units;
+        // they retire naturally within a second or two. New configuration
+        // uses the new rate from the next note-on (same trade-off every
+        // host makes on device rate changes).
+        if (voiceManager) voiceManager->SetSampleRate(sampleRate);
+    }
+}
+
 void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     Driver* self = static_cast<Driver*>(userData);
     if (!self || !self->initialized) return;
     ++self->callbackCount_;
+
+    // A driver-initiated format change (ASIO buffer size / sample rate) is
+    // applied here — the audio thread, which owns the mix buffers — before
+    // this block renders, so no span ever sees a stale capacity.
+    if (self->pendingFormatFrames_.load(std::memory_order_acquire) ||
+        self->pendingFormatRate_.load(std::memory_order_acquire))
+        self->ApplyPendingAudioFormat();
 
     // The immutable bundle was fully parsed and prepared by a non-audio
     // thread.  Activation is one pointer handoff at the callback boundary;
