@@ -33,6 +33,10 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <intrin.h>
+#include <dbghelp.h>
+#include <tlhelp32.h>
+
+#pragma comment(lib, "dbghelp.lib")
 
 #include <algorithm>
 #include <atomic>
@@ -746,6 +750,111 @@ typedef MMRESULT (WINAPI* MidiOutShortMsgProc)(HMIDIOUT, DWORD);
 typedef MMRESULT (WINAPI* MidiOutResetProc)(HMIDIOUT);
 typedef MMRESULT (WINAPI* MidiOutCloseProc)(HMIDIOUT);
 
+// ── Hang watchdog ───────────────────────────────────────────────────────────
+// The realtime pacer advances a heartbeat while it runs.  If the heartbeat
+// stalls (pacer blocked on a full SPSC ring, wedged dispatch, stuck telemetry
+// read...), dump every thread's stack with symbols and exit — a hung gate is
+// undiagnosable without this.
+std::atomic<uint64_t> g_rtHeartbeat{0};
+std::atomic<bool> g_rtFinished{false};
+
+void DumpThreadStacks() {
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,
+                                               GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    if (!Thread32First(snapshot, &entry)) {
+        CloseHandle(snapshot);
+        return;
+    }
+    do {
+        if (entry.th32OwnerProcessID != GetCurrentProcessId()) continue;
+        HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                       THREAD_QUERY_INFORMATION,
+                                   FALSE, entry.th32ThreadID);
+        if (thread == nullptr) continue;
+        if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+            CloseHandle(thread);
+            continue;
+        }
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(thread, &context)) {
+            std::printf("  --- thread %lu ---\n",
+                        static_cast<unsigned long>(entry.th32ThreadID));
+            STACKFRAME64 frame{};
+#if defined(_M_X64)
+            frame.AddrPC.Offset = context.Rip;
+            frame.AddrFrame.Offset = context.Rbp;
+            frame.AddrStack.Offset = context.Rsp;
+            const DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+#else
+            frame.AddrPC.Offset = context.Eip;
+            frame.AddrFrame.Offset = context.Ebp;
+            frame.AddrStack.Offset = context.Esp;
+            const DWORD machine = IMAGE_FILE_MACHINE_I386;
+#endif
+            frame.AddrPC.Mode = AddrModeFlat;
+            frame.AddrFrame.Mode = AddrModeFlat;
+            frame.AddrStack.Mode = AddrModeFlat;
+            for (int depth = 0; depth < 64; ++depth) {
+                if (!StackWalk64(machine, GetCurrentProcess(), thread,
+                                 &frame, &context, nullptr,
+                                 SymFunctionTableAccess64,
+                                 SymGetModuleBase64, nullptr)) break;
+                const DWORD64 pc = frame.AddrPC.Offset;
+                if (pc == 0) break;
+                alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256] = {};
+                SYMBOL_INFO* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                DWORD64 displacement = 0;
+                if (SymFromAddr(GetCurrentProcess(), pc, &displacement,
+                                symbol)) {
+                    std::printf("    %s+0x%llx\n", symbol->Name,
+                                static_cast<unsigned long long>(displacement));
+                } else {
+                    const DWORD64 base =
+                        SymGetModuleBase64(GetCurrentProcess(), pc);
+                    std::printf("    0x%llx (base 0x%llx)\n",
+                                static_cast<unsigned long long>(pc),
+                                static_cast<unsigned long long>(base));
+                }
+            }
+            std::fflush(stdout);
+        }
+        ResumeThread(thread);
+        CloseHandle(thread);
+    } while (Thread32Next(snapshot, &entry));
+    CloseHandle(snapshot);
+    std::fflush(stdout);
+}
+
+DWORD WINAPI HangWatchdog(void*) {
+    uint64_t last = 0;
+    int stalledSeconds = 0;
+    while (!g_rtFinished.load(std::memory_order_acquire)) {
+        Sleep(1000);
+        const uint64_t now = g_rtHeartbeat.load(std::memory_order_relaxed);
+        if (now != last) {
+            last = now;
+            stalledSeconds = 0;
+            continue;
+        }
+        if (++stalledSeconds >= 5) {
+            std::printf("\n[HANG-WATCHDOG] realtime pacer stalled for %d s; "
+                        "dumping all thread stacks\n", stalledSeconds);
+            std::fflush(stdout);
+            DumpThreadStacks();
+            ExitProcess(0xDEADBEEFu);
+        }
+    }
+    return 0;
+}
+
 // Wait until the QPC target, sampling telemetry on the way. Returns false
 // when telemetry sampling failed hard (link lost).
 void WaitWithTelemetry(HANDLE timer, LONGLONG targetQpc, LONGLONG qpf,
@@ -760,6 +869,7 @@ void WaitWithTelemetry(HANDLE timer, LONGLONG targetQpc, LONGLONG qpf,
                        DWORD* nextSampleTick, DWORD* nextVerboseTick,
                        bool verbose) {
     for (;;) {
+        ++g_rtHeartbeat;
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
         if (now.QuadPart >= targetQpc) return;
@@ -928,6 +1038,8 @@ bool RunRealtime(const Options& options, const DecodedSong& song,
 
     HANDLE timer = CreateWaitableTimer(nullptr, FALSE, nullptr);
     timeBeginPeriod(1u);
+    HANDLE watchdog = CreateThread(nullptr, 0, HangWatchdog, nullptr, 0, nullptr);
+    g_rtHeartbeat.store(1, std::memory_order_relaxed);
 
     std::vector<double> cpuSamples, cb95Samples, cb99Samples;
     uint32_t peakActive = 0u, peakReleasing = 0u;
@@ -968,6 +1080,8 @@ bool RunRealtime(const Options& options, const DecodedSong& song,
                           &limiterGrMax, &sampleCount, &nextSampleTick,
                           &nextVerboseTick, options.verbose);
     }
+    g_rtFinished.store(true, std::memory_order_release);
+    if (watchdog != nullptr) CloseHandle(watchdog);
 
     timeEndPeriod(1u);
     if (timer != nullptr) CloseHandle(timer);
