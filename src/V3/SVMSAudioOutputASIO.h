@@ -181,7 +181,14 @@ private:
         }
         for (int ch = 0; ch < 2; ++ch) {
             ConvertChannel(bufferInfos_[ch].buffers[bufferIndex],
-                           out + ch, frames, sampleType_[ch]);
+                           out, frames, sampleType_[ch], ch);
+        }
+        if (switchCount_ == 0) {
+            char msg[128];
+            wsprintfA(msg, "[SVMS] ASIO: stream live, %u Hz / %u frames, fmt=%s/%s\n",
+                      sampleRate_, bufferSize_,
+                      SampleTypeName(sampleType_[0]), SampleTypeName(sampleType_[1]));
+            OutputDebugStringA(msg);
         }
         // Post-output handshake: drivers we told we'd call this use it to
         // latch the buffers; skipping it leaves them consuming stale/silent
@@ -195,24 +202,50 @@ private:
     }
 
     static void ConvertChannel(void* dst, const float* src, uint32_t frames,
-                               long type) {
+                               long type, int ch) {
+        // src is the interleaved stereo render buffer (frame i -> src[2i+ch]).
+        // All samples are clamped to [-1, 1] before int conversion.
         switch (type) {
-            case ASIOSTFloat32LSB:
-                memcpy(dst, src, static_cast<size_t>(frames) * sizeof(float));
+            case ASIOSTFloat32LSB: {
+                float* out = static_cast<float*>(dst);
+                for (uint32_t i = 0; i < frames; ++i)
+                    out[i] = src[i * 2u + static_cast<unsigned>(ch)];
                 break;
+            }
+            case ASIOSTFloat64LSB: {
+                // FlexASIO and several interfaces negotiate 64-bit floats;
+                // previously unhandled -> memset(0) = silent output.
+                double* out = static_cast<double*>(dst);
+                for (uint32_t i = 0; i < frames; ++i)
+                    out[i] = static_cast<double>(
+                        src[i * 2u + static_cast<unsigned>(ch)]);
+                break;
+            }
             case ASIOSTInt32LSB: {
                 int32_t* out = static_cast<int32_t*>(dst);
                 for (uint32_t i = 0; i < frames; ++i) {
-                    float s = src[i * 2];
+                    float s = src[i * 2u + static_cast<unsigned>(ch)];
                     if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
                     out[i] = static_cast<int32_t>(s * 2147483647.0f);
+                }
+                break;
+            }
+            case ASIOSTInt24LSB: {
+                uint8_t* out = static_cast<uint8_t*>(dst);
+                for (uint32_t i = 0; i < frames; ++i) {
+                    float s = src[i * 2u + static_cast<unsigned>(ch)];
+                    if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
+                    const int32_t v = static_cast<int32_t>(s * 8388607.0f);
+                    out[i * 3u + 0u] = static_cast<uint8_t>(v & 0xFF);
+                    out[i * 3u + 1u] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                    out[i * 3u + 2u] = static_cast<uint8_t>((v >> 16) & 0xFF);
                 }
                 break;
             }
             case ASIOSTInt16LSB: {
                 int16_t* out = static_cast<int16_t*>(dst);
                 for (uint32_t i = 0; i < frames; ++i) {
-                    float s = src[i * 2];
+                    float s = src[i * 2u + static_cast<unsigned>(ch)];
                     if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
                     out[i] = static_cast<int16_t>(s * 32767.0f);
                 }
@@ -221,6 +254,17 @@ private:
             default:
                 memset(dst, 0, static_cast<size_t>(frames) * 4u);
                 break;
+        }
+    }
+
+    static const char* SampleTypeName(long type) {
+        switch (type) {
+            case ASIOSTFloat32LSB: return "float32";
+            case ASIOSTFloat64LSB: return "float64";
+            case ASIOSTInt32LSB:   return "int32";
+            case ASIOSTInt24LSB:   return "int24";
+            case ASIOSTInt16LSB:   return "int16";
+            default:               return "unsupported";
         }
     }
 
