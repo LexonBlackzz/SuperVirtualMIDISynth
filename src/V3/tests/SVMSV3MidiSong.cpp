@@ -654,6 +654,37 @@ bool RunOffline(const Options& options, const DecodedSong& song,
         std::fflush(stdout);
     }
 
+#if defined(_MSC_VER)
+    {
+        const auto& p = synth.dispatchProfile;
+        const double onCalls = p.noteOnCalls ? (double)p.noteOnCalls : 1.0;
+        const double offCalls = p.noteOffCalls ? (double)p.noteOffCalls : 1.0;
+        const double ctlCalls = p.controlCalls ? (double)p.controlCalls : 1.0;
+        const double bendCalls =
+            p.bendCalls ? (double)p.bendCalls : 1.0;
+        std::printf(
+            "[dispatch-phase] on=%llu (%.0f cy: resolve=%.0f alloc=%.0f "
+            "configure=%.0f) off=%llu (%.0f cy) ctl=%llu (%.0f cy: "
+            "rebuild=%.0f mixgains=%.0f) bend=%llu (%.0f cy) "
+            "heapBuilds=%llu\n",
+            (unsigned long long)p.noteOnCalls,
+            (double)p.noteOnTotal / onCalls,
+            (double)p.resolve / onCalls,
+            (double)p.alloc / onCalls,
+            (double)p.configure / onCalls,
+            (unsigned long long)p.noteOffCalls,
+            (double)p.noteOffTotal / offCalls,
+            (unsigned long long)p.controlCalls,
+            (double)p.controlTotal / ctlCalls,
+            (double)p.controlRebuild / ctlCalls,
+            (double)p.controlMix / ctlCalls,
+            (unsigned long long)p.bendCalls,
+            (double)p.bendTotal / bendCalls,
+            (unsigned long long)synth.StealHeapBuildCount());
+        std::fflush(stdout);
+    }
+#endif
+
     if (eventIndex != eventCount) {
         out.error = "not all MIDI events were dispatched";
         return false;

@@ -335,6 +335,7 @@ public:
         stealTailCaptureSuppressed_ = suppressed;
     }
     uint32_t GetStealFadeFrames() const noexcept { return stealFadeFrames_; }
+    uint64_t GetStealHeapBuildCount() const { return stealHeapBuildCount_; }
     // Post-render bookkeeping for a release whose state flip was applied by a
     // worker at its exact frame (see SetDeferredReleaseHook).
     void FinalizeDeferredRelease(VoiceHandle handle);

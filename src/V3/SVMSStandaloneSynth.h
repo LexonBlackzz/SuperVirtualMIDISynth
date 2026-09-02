@@ -22,6 +22,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace svms {
 
@@ -231,7 +234,21 @@ public:
     uint32_t Active() const { return voices_.GetActiveCount(); }
     uint32_t Tails() const { return voices_.GetStealTailCount(); }
     uint32_t Steals() const { return voices_.stealCount_; }
+    // ── Temporary dispatch-phase profiler (diagnostics only) ────────────
+    struct DispatchProfile {
+        uint64_t noteOnCalls = 0, noteOffCalls = 0;
+        uint64_t noteOnTotal = 0, noteOffTotal = 0;
+        uint64_t resolve = 0, alloc = 0, configure = 0;
+        uint64_t controlCalls = 0, controlTotal = 0;
+        uint64_t controlRebuild = 0, controlMix = 0;
+        uint64_t programCalls = 0, bendCalls = 0, bendTotal = 0;
+    };
+    DispatchProfile dispatchProfile;
+
     uint32_t Free() const { return maxVoices_ - voices_.GetActiveCount(); }
+    uint64_t StealHeapBuildCount() const {
+        return voices_.GetStealHeapBuildCount();
+    }
     uint64_t NoteCalls() const { return noteCalls_; }
     uint64_t MatchedNotes() const { return notes_; }
     uint64_t MissingPresets() const { return missingPresets_; }
@@ -351,6 +368,9 @@ private:
     }
 
     void NoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
+#if defined(_MSC_VER)
+        const uint64_t totalBegin = __rdtsc();
+#endif
         ++noteCalls_;
         if (note >= kNoteCount) return;
         channels_.NoteOn(channel, note, velocity);
@@ -362,8 +382,14 @@ private:
             }
             channels_.SetSelectedPreset(channel, uint16_t(preset));
         }
+#if defined(_MSC_VER)
+        const uint64_t resolveBegin = __rdtsc();
+#endif
         const SFSampleRegion* regions[512];
         uint32_t count = ResolveRegions(preset, note, velocity, regions, 512);
+#if defined(_MSC_VER)
+        dispatchProfile.resolve += __rdtsc() - resolveBegin;
+#endif
         if (!count || count > 512) {
             // Region fallback: resolve against the widest-coverage preset so
             // incomplete instruments stay audible (see SF2Data docs).
@@ -387,6 +413,9 @@ private:
         const uint32_t generation = playIndex_++;
         VoiceHandle handles[512];
         uint32_t made = 0;
+#if defined(_MSC_VER)
+        const uint64_t allocBegin = __rdtsc();
+#endif
         for (; made < count; ++made) {
             handles[made] = voices_.AllocateVoiceOrSteal(
                 channel, note, velocity, nullptr, count == 1);
@@ -396,10 +425,16 @@ private:
                 return;
             }
         }
+#if defined(_MSC_VER)
+        dispatchProfile.alloc += __rdtsc() - allocBegin;
+#endif
         const float velocityGain = float(velocity) * float(velocity) /
                                    (127.0f * 127.0f);
         const float bend = channels_.GetPitchBendSemitones(channel) +
             sysexMasterFineTune_ + sysexMasterTranspose_;
+#if defined(_MSC_VER)
+        const uint64_t configureBegin = __rdtsc();
+#endif
         for (uint32_t i = 0; i < count; ++i) {
             const SFSampleRegion& region = *regions[i];
             const uint32_t regionIndex = uint32_t(regions[i] - sf2_->regions);
@@ -436,18 +471,33 @@ private:
             voices_.ConfigureVoice(handles[i], voice,
                                    channels_.GetParams()[channel], count == 1);
         }
+#if defined(_MSC_VER)
+        dispatchProfile.configure += __rdtsc() - configureBegin;
+        dispatchProfile.noteOnTotal += __rdtsc() - totalBegin;
+        ++dispatchProfile.noteOnCalls;
+#endif
         ++notes_;
     }
 
     void NoteOff(uint8_t channel, uint8_t note) {
+#if defined(_MSC_VER)
+        const uint64_t offBegin = __rdtsc();
+#endif
         const bool sustain = channels_.IsSustainActive(channel);
         channels_.NoteOff(channel, note);
         const uint32_t playIndex = voices_.FindOldestPlayIndex(channel, note);
         if (playIndex != UINT32_MAX)
             voices_.NoteOffPlayIndex(channel, note, playIndex, sustain, 0);
+#if defined(_MSC_VER)
+        dispatchProfile.noteOffTotal += __rdtsc() - offBegin;
+        ++dispatchProfile.noteOffCalls;
+#endif
     }
 
     void Control(uint8_t channel, uint8_t controller, uint8_t value) {
+#if defined(_MSC_VER)
+        const uint64_t controlBegin = __rdtsc();
+#endif
         const bool sustain = channels_.IsSustainActive(channel);
         channels_.ControlChange(channel, controller, value);
         if (controller == 0 || controller == 32) RefreshPreset(channel);
@@ -459,14 +509,31 @@ private:
         else if (controller == 6 || controller == 38 ||
                  controller == 96 || controller == 97)
             RefreshChannelPitch(channel);
+#if defined(_MSC_VER)
+        const uint64_t rebuildBegin = __rdtsc();
+#endif
         if (controller == 7 || controller == 10 || controller == 11 ||
             controller == 64 || controller == 121) {
             channels_.RebuildChannel(channel, cfg_, float(rate_));
+#if defined(_MSC_VER)
+            dispatchProfile.controlRebuild += __rdtsc() - rebuildBegin;
+#endif
             if (controller == 7 || controller == 10 || controller == 11 ||
-                controller == 121)
+                controller == 121) {
+#if defined(_MSC_VER)
+                const uint64_t mixBegin = __rdtsc();
+#endif
                 voices_.RefreshMixGainsForChannel(
                     channel, channels_.GetParams()[channel]);
+#if defined(_MSC_VER)
+                dispatchProfile.controlMix += __rdtsc() - mixBegin;
+#endif
+            }
         }
+#if defined(_MSC_VER)
+        dispatchProfile.controlTotal += __rdtsc() - controlBegin;
+        ++dispatchProfile.controlCalls;
+#endif
     }
 
     void ReleaseSustain(uint8_t channel) {
@@ -489,8 +556,15 @@ private:
     }
 
     void Bend(uint8_t channel, uint8_t low, uint8_t high) {
+#if defined(_MSC_VER)
+        const uint64_t bendBegin = __rdtsc();
+#endif
         channels_.PitchBend(channel, int16_t((high << 7u) | low));
         RefreshChannelPitch(channel);
+#if defined(_MSC_VER)
+        dispatchProfile.bendTotal += __rdtsc() - bendBegin;
+        ++dispatchProfile.bendCalls;
+#endif
     }
 
     void RefreshChannelPitch(uint8_t channel) {
