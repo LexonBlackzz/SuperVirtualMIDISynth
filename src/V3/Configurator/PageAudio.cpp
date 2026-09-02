@@ -526,8 +526,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
             }
             ImGui::EndCombo();
         }
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("%s", "restart");
+        RestartCell();
 
         ImGui::TableNextRow();
         AudioLabelCell("Phase rotation",

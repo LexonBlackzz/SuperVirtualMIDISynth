@@ -7,6 +7,7 @@ namespace svms {
 
 void DiagWindow_Create(bool showWindow, bool debugOutput);
 void DiagWindow_Destroy();
+void DiagWindow_SetBackendLabel(const wchar_t* label);
 void DiagWindow_UpdateStartup(bool audioRunning, int32_t audioError,
                               bool soundFontLoaded, uint32_t sampleRate,
                               uint32_t bufferFrames, float masterVolume,

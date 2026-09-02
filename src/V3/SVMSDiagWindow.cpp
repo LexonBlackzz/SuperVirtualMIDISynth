@@ -9,6 +9,10 @@
 namespace svms {
 namespace {
 
+// Audio-backend label shown in the diag overlay; the driver overrides it
+// when it selects a non-default backend (e.g. ASIO).
+wchar_t g_backendLabel[32] = L"WASAPI shared";
+
 struct DiagStats {
     bool audioRunning;
     bool soundFontLoaded;
@@ -142,7 +146,7 @@ static void OnPaint(HWND hwnd) {
                                  ? L"waveOut fallback (XP x86)"
                                  : L"DirectSound (XP x86)";
 #else
-    const wchar_t* backend = L"WASAPI shared";
+    const wchar_t* backend = g_backendLabel;
 #endif
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]),
                   L"%ls: %ls, %u Hz / %u frames, hr=0x%08X", backend,
@@ -479,6 +483,13 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     stats.scheduledEvents = scheduledEvents;
     stats.sf2 = sf2;
     g_publishedStats.store(target, std::memory_order_release);
+}
+
+void DiagWindow_SetBackendLabel(const wchar_t* label) {
+    if (!label || !label[0]) return;
+    wcsncpy(g_backendLabel, label,
+            sizeof(g_backendLabel) / sizeof(g_backendLabel[0]) - 1);
+    g_backendLabel[sizeof(g_backendLabel) / sizeof(g_backendLabel[0]) - 1] = 0;
 }
 
 } // namespace svms
