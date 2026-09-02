@@ -3193,6 +3193,28 @@ inline void RenderScalar::WholeVoicePreTailCaptureHook(
         // voice's pre-steal samples are lost for this block; the launch
         // itself stays exact.  Counted for telemetry.
         ++renderer->wvGhostOverflowCount_;
+        // The displaced voice is destroyed without a ghost, so its pending
+        // deferred release must not survive the displacement.  The handle is
+        // immediately reused by the replacement launch, and a stale
+        // wvReleaseFrame_ below the new start frame leaves the item loop in
+        // WholeVoiceJobThunk unable to advance cursor (a release frame at or
+        // below the cursor renders nothing and flips nothing) — a permanent
+        // all-workers hang at saturated launch storms.  Drop the stale
+        // release and swap its op entry out so block-end finalization cannot
+        // observe the dead generation either.
+        if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) {
+            renderer->wvReleaseFrame_[handle] = UINT32_MAX;
+            for (uint32_t i = 0; i < renderer->wvOpCount_; ++i) {
+                if (renderer->wvOpHandles_[i] == handle) {
+                    renderer->wvOpHandles_[i] =
+                        renderer->wvOpHandles_[renderer->wvOpCount_ - 1];
+                    renderer->wvOpFrames_[i] =
+                        renderer->wvOpFrames_[renderer->wvOpCount_ - 1];
+                    --renderer->wvOpCount_;
+                    break;
+                }
+            }
+        }
         return;
     }
     const uint32_t ghost = renderer->wvGhostCount_++;
