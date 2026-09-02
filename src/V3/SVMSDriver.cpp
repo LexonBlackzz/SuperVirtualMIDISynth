@@ -12,6 +12,8 @@
 #include <cstdarg>
 #include <algorithm>
 #include <iterator>
+#include <mutex>
+#include <vector>
 #include <intrin.h>
 #include <limits>
 #include <thread>
@@ -2113,6 +2115,15 @@ private:
     static void OnAsioFormatChanged(uint32_t sampleRate, uint32_t bufferFrames,
                                     void* userData);
     void ApplyPendingAudioFormat();
+#if !defined(SVMS_XP_COMPAT) && defined(SVMS_WITH_ASIO)
+    // Object-level ASIO recovery: after repeated reopen failures the output
+    // object is retired (never deleted in-place — the parked instance may
+    // still have in-flight bufferSwitch) and a brand-new one is constructed
+    // on a dedicated thread: fresh COM load, fresh buffers, full reinit.
+    // Also the groundwork for live output device switching.
+    static void OnAsioRebuildRequested(void* userData);
+    void RebuildAudioOutput();
+#endif
 
     // EventDispatcher callback — invoked by RenderScalar at each event's
     // exact integer output frame during RenderBlock.
@@ -2219,6 +2230,16 @@ private:
     class AudioOutput* audioOutput;   // XP: concrete DirectSound/waveOut class
 #else
     AudioOutputBase* audioOutput;
+    // Object-level audio output rebuild (ASIO recovery / live switching).
+    // audioOutputMutex_ serializes rebuild vs shutdown; the rebuild itself
+    // happens on audioRebuildThread_ because the watcher thread that
+    // escalated must keep spinning (parked on rebuildRequested_) until the
+    // retired object is finally torn down in Shutdown().
+    std::mutex audioOutputMutex_;
+    std::vector<AudioOutputBase*> retiredOutputs_;
+    std::thread audioRebuildThread_;
+    std::atomic<bool> audioRebuildActive_{false};
+    std::atomic<bool> audioRebuildShutdown_{false};
 #endif
     VoiceManager* voiceManager;
     ChannelCache* channelCache;
@@ -3227,6 +3248,7 @@ bool Driver::Initialize() {
     if (cfg.audioBackend == AudioBackend::ASIO) {
         AudioOutputASIO* asio = new AudioOutputASIO();
         asio->SetFormatChangedCallback(&Driver::OnAsioFormatChanged, this);
+        asio->SetRebuildCallback(&Driver::OnAsioRebuildRequested, this);
         if (asio->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
             audioOutput = asio;
         } else {
@@ -3506,12 +3528,27 @@ void Driver::Shutdown() {
     WakeAddressWaiters(compilerWakeEpoch_);
     compilerSleeping_.store(false, std::memory_order_release);
     StopConfiguredMidiInput();
+#if !defined(SVMS_XP_COMPAT) && defined(SVMS_WITH_ASIO)
+    audioRebuildShutdown_.store(true, std::memory_order_release);
+    if (audioRebuildThread_.joinable()) audioRebuildThread_.join();
+#endif
     if (audioOutput) {
         audioOutput->Stop();
         audioOutput->Shutdown();
         delete audioOutput;
         audioOutput = nullptr;
     }
+#if !defined(SVMS_XP_COMPAT)
+    // Torn-down rebuild victims: their watcher threads were parked on
+    // rebuildRequested_ and are now joined by Shutdown() above the park.
+    for (AudioOutputBase* retired : retiredOutputs_) {
+        if (!retired) continue;
+        retired->Stop();
+        retired->Shutdown();
+        delete retired;
+    }
+    retiredOutputs_.clear();
+#endif
     if (eventCompilerThread_.joinable()) eventCompilerThread_.join();
     useEventCompiler_ = false;
     midiIngress_.DrainAvailable();
@@ -4764,6 +4801,132 @@ void Driver::OnAsioFormatChanged(uint32_t sampleRate, uint32_t bufferFrames,
     self->pendingFormatFrames_.store(bufferFrames, std::memory_order_release);
     LOG("ASIO format change requested: rate=%u frames=%u", sampleRate, bufferFrames);
 }
+
+#if !defined(SVMS_XP_COMPAT) && defined(SVMS_WITH_ASIO)
+// Escalation from AudioOutputASIO's watcher thread after repeated in-place
+// reopen failures. The failed instance is already parked (its g_instance is
+// null and its watcher spins on rebuildRequested_) — nothing to park here.
+// Hand the actual rebuild to a dedicated thread so the watcher is never
+// blocked behind teardown work and stays joinable for Shutdown().
+void Driver::OnAsioRebuildRequested(void* userData) {
+    Driver* self = static_cast<Driver*>(userData);
+    if (!self) return;
+    bool expected = false;
+    if (!self->audioRebuildActive_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        return;
+    if (self->audioRebuildThread_.joinable())
+        self->audioRebuildThread_.join();
+    try {
+        self->audioRebuildThread_ = std::thread(&Driver::RebuildAudioOutput, self);
+    } catch (...) {
+        LOG("FAILED: ASIO rebuild thread spawn failed");
+        self->audioRebuildActive_.store(false, std::memory_order_release);
+    }
+}
+
+// Object-level output rebuild: retire the dead output (never delete it
+// here — the parked ASIO instance may still have in-flight bufferSwitch on
+// its buffers; retired objects are torn down in Driver::Shutdown), then
+// construct, initialize, and start a brand-new one. Runs on the dedicated
+// rebuild thread; no output is delivering callbacks at this point (the old
+// one is parked, the new one is not started yet), so updating the mix
+// buffers / DSP configuration here is race-free.
+void Driver::RebuildAudioOutput() {
+    std::lock_guard<std::mutex> lock(audioOutputMutex_);
+    if (audioRebuildShutdown_.load(std::memory_order_acquire)) {
+        audioRebuildActive_.store(false, std::memory_order_release);
+        return;
+    }
+    const EngineConfig cfg = engineConfig_;
+    LOG("Audio output rebuild: retiring dead output, backend=%d",
+        static_cast<int>(cfg.audioBackend));
+
+    if (audioOutput) {
+        audioOutput->Stop();
+        retiredOutputs_.push_back(audioOutput);
+        audioOutput = nullptr;
+    }
+    pendingFormatRate_.store(0, std::memory_order_release);
+    pendingFormatFrames_.store(0, std::memory_order_release);
+
+    // Two ASIO attempts, then the same WASAPI-shared fallback the init
+    // path uses, so a wedged driver never leaves the engine without audio.
+    AudioOutputBase* replacement = nullptr;
+    bool replacementIsAsio = false;
+    for (int attempt = 0; attempt < 3 && !replacement; ++attempt) {
+        if (cfg.audioBackend == AudioBackend::ASIO && attempt < 2) {
+            AudioOutputASIO* asio = new AudioOutputASIO();
+            asio->SetFormatChangedCallback(&Driver::OnAsioFormatChanged, this);
+            asio->SetRebuildCallback(&Driver::OnAsioRebuildRequested, this);
+            asio->SetRenderCallback(RenderCallback, this);
+            if (asio->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
+                replacement = asio;
+                replacementIsAsio = true;
+            } else {
+                LOG("ASIO rebuild attempt %d failed (%s)", attempt + 1,
+                    asio->GetLastErrorText());
+                delete asio;
+            }
+        } else {
+            AudioOutput* wasapi = new AudioOutput();
+            wasapi->SetRenderCallback(RenderCallback, this);
+            if (wasapi->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
+                replacement = wasapi;
+            } else {
+                LOG("FAILED: WASAPI rebuild attempt %d hr=0x%08X", attempt + 1,
+                    static_cast<unsigned>(wasapi->GetLastError()));
+                delete wasapi;
+            }
+        }
+    }
+
+    if (!replacement) {
+        LOG("FAILED: audio output rebuild could not create any backend; "
+            "audio remains down");
+        audioRebuildActive_.store(false, std::memory_order_release);
+        return;
+    }
+    audioOutput = replacement;
+
+    // Mirror the init path: adopt the backend's actual format, grow the mix
+    // buffers if needed, reconfigure the per-rate DSP chain.
+    bufferFrames = replacement->GetBufferFrames();
+    sampleRate = replacement->GetSampleRate();
+    if (bufferFrames > bufferCapacity) {
+        _aligned_free(leftBuffer);
+        _aligned_free(rightBuffer);
+        bufferCapacity = bufferFrames;
+        leftBuffer = static_cast<float*>(
+            _aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
+        rightBuffer = static_cast<float*>(
+            _aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
+        LOG("Rebuild mix buffers resized: capacity=%u", bufferCapacity);
+    }
+    postHighPass.Initialize(sampleRate);
+    reverb.Configure(sampleRate, engineConfig_);
+    limiter.Configure(sampleRate, engineConfig_);
+    if (voiceManager) voiceManager->SetSampleRate(sampleRate);
+    {
+        bool isAsio = replacementIsAsio;
+#if !defined(SVMS_XP_COMPAT)
+        isAsio = dynamic_cast<AudioOutputASIO*>(replacement) != nullptr;
+#endif
+        DiagWindow_SetBackendLabel(isAsio ? L"ASIO" : L"WASAPI shared");
+    }
+
+    if (!replacement->Start()) {
+        LOG("FAILED: rebuilt audio output start failed (%s) hr=0x%08X",
+            replacement->GetLastErrorText(),
+            static_cast<unsigned>(replacement->GetLastError()));
+    } else {
+        LOG("[SVMS] audio output rebuilt: rate=%u bufferFrames=%u, stream live",
+            sampleRate, bufferFrames);
+    }
+    audioRebuildActive_.store(false, std::memory_order_release);
+}
+#endif
 
 // Runs on the audio thread only (dispatched from RenderCallback). The ASIO
 // driver has already stopped delivering buffers of the old size by the time

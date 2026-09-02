@@ -35,6 +35,7 @@ class AudioOutputASIO : public AudioOutputBase {
 public:
     using FormatChangedCallback = void (*)(uint32_t sampleRate,
                                            uint32_t bufferFrames, void* userData);
+    using RebuildCallback = void (*)(void* userData);
 
     AudioOutputASIO() = default;
     ~AudioOutputASIO() { Shutdown(); }
@@ -360,6 +361,13 @@ private:
 private:
     void WatcherLoop() {
         while (!watcherQuit_.load(std::memory_order_acquire)) {
+            // Once a full rebuild has been requested, this object is living
+            // on borrowed time — stop touching the driver so the rebuild
+            // thread's teardown cannot race us.
+            if (rebuildRequested_.load(std::memory_order_acquire)) {
+                Sleep(100);
+                continue;
+            }
             if (resetRequested_.exchange(false, std::memory_order_acq_rel)) {
                 const bool wasRunning =
                     running_.load(std::memory_order_acquire);
@@ -368,10 +376,10 @@ private:
                 driver[sizeof(driver) - 1] = 0;
                 OutputDebugStringA("[SVMS] ASIO: driver requested reset, reopening\n");
                 if (Reopen_(driver)) {
+                    reopenFailCount_ = 0;
                     if (wasRunning) Start();
                 } else {
-                    // Keep trying — a failed reopen must not leave the
-                    // stream dead permanently (driver may still be busy).
+                    if (++reopenFailCount_ >= 3) RequestRebuild_();
                     Sleep(500);
                     resetRequested_.store(true, std::memory_order_release);
                 }
@@ -389,8 +397,10 @@ private:
                     strncpy(driver, activeDriverName_, sizeof(driver) - 1);
                     driver[sizeof(driver) - 1] = 0;
                     if (Reopen_(driver)) {
+                        reopenFailCount_ = 0;
                         Start();
                     } else {
+                        if (++reopenFailCount_ >= 3) RequestRebuild_();
                         Sleep(500);
                         resetRequested_.store(true, std::memory_order_release);
                     }
@@ -464,6 +474,19 @@ private:
         return true;
     }
 
+    // Watcher thread, after repeated in-place reopen failures: hand the
+    // problem to the Driver, which destroys this whole output object and
+    // constructs a fresh one (fresh COM load, fresh buffers, fresh stream).
+    void RequestRebuild_() {
+        if (rebuild_ && !rebuildRequested_.exchange(true,
+                                                   std::memory_order_acq_rel)) {
+            OutputDebugStringA(
+                "[SVMS] ASIO: reopen failed repeatedly, requesting full "
+                "output rebuild\n");
+            rebuild_(rebuildUser_);
+        }
+    }
+
     static constexpr int kMaxDrivers_ = 8;
 
     static std::atomic<AudioOutputASIO*> g_instance;
@@ -486,6 +509,10 @@ private:
     const char* errorText_ = "no ASIO driver";
     std::wstring configuredDriver_;
     std::atomic<bool> resetRequested_{false};
+    std::atomic<bool> rebuildRequested_{false};
+    RebuildCallback rebuild_ = nullptr;
+    void* rebuildUser_ = nullptr;
+    int reopenFailCount_ = 0;   // watcher thread only
     std::atomic<bool> watcherQuit_{false};
     std::thread watcher_;
     FormatChangedCallback formatChanged_ = nullptr;
@@ -534,6 +561,14 @@ public:
     void SetFormatChangedCallback(FormatChangedCallback cb, void* userData) {
         formatChanged_ = cb;
         formatChangedUser_ = userData;
+    }
+
+    // Escalation path: the Driver registers this so that when in-place
+    // reopen keeps failing, the whole output object is torn down and
+    // rebuilt from scratch instead of leaving a dead stream.
+    void SetRebuildCallback(RebuildCallback cb, void* userData) {
+        rebuild_ = cb;
+        rebuildUser_ = userData;
     }
 
     uint32_t GetSampleRate() const { return sampleRate_; }
