@@ -183,6 +183,15 @@ private:
             ConvertChannel(bufferInfos_[ch].buffers[bufferIndex],
                            out + ch, frames, sampleType_[ch]);
         }
+        // Post-output handshake: drivers we told we'd call this use it to
+        // latch the buffers; skipping it leaves them consuming stale/silent
+        // data. Cheap call; latch off after the first rejection.
+        if (outputReadyEnabled_.load(std::memory_order_relaxed) &&
+            ASIOOutputReady() != ASE_OK)
+            outputReadyEnabled_.store(false, std::memory_order_relaxed);
+        // Heartbeat: proves callbacks fire when diagnosing silent output.
+        if ((++switchCount_ % 200) == 0)
+            OutputDebugStringA("[SVMS] ASIO: bufferSwitch alive (x200)\n");
     }
 
     static void ConvertChannel(void* dst, const float* src, uint32_t frames,
@@ -239,6 +248,8 @@ private:
         (void)message; (void)opt;
         switch (selector) {
             case kAsioSelectorSupported:
+                // Note: ASIOOutputReady support is signaled by answering
+                // kAsioEngineVersion >= 2 (below), not by a selector here.
                 return (value == kAsioEngineVersion ||
                         value == kAsioResetRequest ||
                         value == kAsioBufferSizeChange) ? 1 : 0;
@@ -345,6 +356,8 @@ private:
     std::thread watcher_;
     FormatChangedCallback formatChanged_ = nullptr;
     void* formatChangedUser_ = nullptr;
+    std::atomic<bool> outputReadyEnabled_{true};
+    uint32_t switchCount_ = 0;
 
 public:
     bool Start() {
