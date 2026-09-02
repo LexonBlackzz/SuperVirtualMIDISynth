@@ -36,6 +36,18 @@ std::string WideToUtf8Str(const std::wstring& ws) {
     return s;
 }
 
+std::wstring Utf8ToWideStr(const std::string& s) {
+    if (s.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(),
+                                  static_cast<int>(s.size()),
+                                  nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring ws(static_cast<size_t>(len), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                        ws.data(), len);
+    return ws;
+}
+
 bool EqualAsciiCI(const std::string& a, const std::string& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -232,6 +244,49 @@ void RestartCell() {
 
 } // namespace
 
+namespace {
+
+// Installed ASIO drivers register under HKLM\SOFTWARE\ASIO (and the WOW6432
+// view); each subkey's name is the driver's user-visible name. This matches
+// how the SDK's host `getDriverNames()` discovers drivers, without linking
+// the SDK into the configurator.
+std::vector<std::string> EnumerateAsioDrivers() {
+    std::vector<std::string> names;
+    static const wchar_t* kRoots[] = {
+        L"SOFTWARE\\ASIO", L"SOFTWARE\\WOW6432Node\\ASIO",
+    };
+    for (const wchar_t* root : kRoots) {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, root, 0, KEY_READ, &key)
+                != ERROR_SUCCESS)
+            continue;
+        DWORD index = 0;
+        wchar_t name[256];
+        DWORD nameLen = 256;
+        while (RegEnumKeyExW(key, index++, name, &nameLen, nullptr,
+                             nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+            // A valid ASIO registration carries the CLSID of its driver DLL.
+            DWORD type = 0;
+            wchar_t clsid[128] = {};
+            DWORD cb = sizeof(clsid);
+            if (RegGetValueW(key, name, L"CLSID", RRF_RT_REG_SZ,
+                             &type, clsid, &cb) == ERROR_SUCCESS && clsid[0]) {
+                std::string n = WideToUtf8Str(name);
+                if (!n.empty() &&
+                    std::find(names.begin(), names.end(), n) == names.end())
+                    names.push_back(std::move(n));
+            }
+            nameLen = 256;
+        }
+        RegCloseKey(key);
+    }
+    return names;
+}
+
+// ASIO_MARKER_DEVICE_COMBO
+
+} // namespace
+
 void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
     auto& w = doc.Working();
     const LiveLinkContext& live = GetLiveLinkContext();
@@ -250,20 +305,48 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
 
     SectionHeader("AUDIO OUTPUT");
 
-    auto names = deviceList.FriendlyNames();
+    const bool asioActive =
+        EqualAsciiCI(WideToUtf8Str(w.audioBackend), "asio");
+
+    // ASIO driver list: re-enumerate when the backend flips to ASIO or the
+    // user hits Refresh devices.
+    static std::vector<std::string> asioDrivers;
+    static bool asioEnumerated = false;
+    if (asioActive && !asioEnumerated) {
+        asioDrivers = EnumerateAsioDrivers();
+        asioEnumerated = true;
+    }
+    if (!asioActive) asioEnumerated = false;
+
     int currentDevice = -1;
     const std::string configuredUtf8 = WideToUtf8Str(w.audioDevice);
-
-    if (w.audioDevice.empty() || w.audioDevice == L"default") {
-        currentDevice = 0;
+    std::vector<std::string> names;
+    if (asioActive) {
+        names.push_back("Default (first installed ASIO driver)");
+        names.insert(names.end(), asioDrivers.begin(), asioDrivers.end());
+        if (w.audioDevice.empty() || w.audioDevice == L"default") {
+            currentDevice = 0;
+        } else {
+            for (size_t i = 0; i < asioDrivers.size(); ++i) {
+                if (asioDrivers[i] == configuredUtf8) {
+                    currentDevice = static_cast<int>(i + 1);
+                    break;
+                }
+            }
+        }
     } else {
-        for (size_t i = 0; i < deviceList.Devices().size(); ++i) {
-            const auto& dev = deviceList.Devices()[i];
-            const std::string devName = WideToUtf8Str(dev.friendlyName);
-            const std::string devId = WideToUtf8Str(dev.id);
-            if (EqualAsciiCI(devName, configuredUtf8) || devId == configuredUtf8) {
-                currentDevice = static_cast<int>(i + 1);
-                break;
+        names = deviceList.FriendlyNames();
+        if (w.audioDevice.empty() || w.audioDevice == L"default") {
+            currentDevice = 0;
+        } else {
+            for (size_t i = 0; i < deviceList.Devices().size(); ++i) {
+                const auto& dev = deviceList.Devices()[i];
+                const std::string devName = WideToUtf8Str(dev.friendlyName);
+                const std::string devId = WideToUtf8Str(dev.id);
+                if (EqualAsciiCI(devName, configuredUtf8) || devId == configuredUtf8) {
+                    currentDevice = static_cast<int>(i + 1);
+                    break;
+                }
             }
         }
     }
@@ -271,14 +354,22 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
     if (BeginAudioSettingsTable("##audio_output_settings")) {
         ImGui::TableNextRow();
         AudioLabelCell("Output device",
-                       "WASAPI output endpoint. 'Default Windows Output Device' follows the current Windows default endpoint.");
+                       asioActive
+                           ? "ASIO driver to open. 'Default' uses the first "
+                             "installed ASIO driver. The driver's own control "
+                             "panel sets its buffer size and channels."
+                           : "WASAPI output endpoint. 'Default Windows Output "
+                             "Device' follows the current Windows default "
+                             "endpoint.");
         ImGui::TableNextColumn();
 
         std::string devicePreview;
-        if (easterEggs.megaFuckerDac) {
+        if (easterEggs.megaFuckerDac && !asioActive) {
             devicePreview = "MegaFucker DAC Pro 9000";
         } else if (currentDevice >= 0 && currentDevice < static_cast<int>(names.size())) {
             devicePreview = names[static_cast<size_t>(currentDevice)];
+        } else if (asioActive) {
+            devicePreview = "Missing ASIO driver: " + configuredUtf8;
         } else {
             devicePreview = "Missing: " + configuredUtf8;
         }
@@ -292,6 +383,8 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                     currentDevice = i;
                     if (i == 0) {
                         w.audioDevice = L"default";
+                    } else if (asioActive) {
+                        w.audioDevice = Utf8ToWideStr(asioDrivers[static_cast<size_t>(i - 1)]);
                     } else {
                         w.audioDevice = deviceList.Devices()[static_cast<size_t>(i - 1)].friendlyName;
                     }
@@ -299,12 +392,18 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 }
                 if (selected) ImGui::SetItemDefaultFocus();
             }
+            if (asioActive && asioDrivers.empty()) {
+                ImGui::TextDisabled("No installed ASIO drivers found "
+                                    "(HKLM\\SOFTWARE\\ASIO)");
+            }
             ImGui::EndCombo();
         }
 
         ImGui::TableNextColumn();
         if (ImGui::SmallButton("Refresh devices")) {
             deviceList.Enumerate();
+            asioDrivers = EnumerateAsioDrivers();
+            asioEnumerated = true;
         }
 
         ImGui::TableNextRow();
