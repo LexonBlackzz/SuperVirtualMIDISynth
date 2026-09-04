@@ -90,6 +90,13 @@ if(WIN32)
     set(SVMS_RESOURCE_FILETYPE "VFT_APP")
     configure_file(SVMSVersion.rc.in
         "${SVMS_GENERATED_DIR}/SVMSConfiguratorVersion.rc" @ONLY)
+
+    set(SVMS_RESOURCE_FILENAME "SVMSAPI.dll")
+    set(SVMS_RESOURCE_DESCRIPTION
+        "SuperVirtualMIDISynth V3 Standalone Synthesizer API")
+    set(SVMS_RESOURCE_FILETYPE "VFT_DLL")
+    configure_file(SVMSVersion.rc.in
+        "${SVMS_GENERATED_DIR}/SVMSApiVersion.rc" @ONLY)
 endif()
 
 if(SVMS_XP_COMPAT AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -315,9 +322,9 @@ set(HEADERS
     include/svmsapi.h
 )
 
-add_library(svmsynth SHARED ${SOURCES} ${HEADERS}
-    "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc")
-
+# ISA selection must be applied before either engine target is created; source
+# properties are directory-scoped and consumed by every target built from
+# these files, so svmsynth and svmsapi cannot drift apart here.
 if(MSVC)
     set_source_files_properties(SVMSRenderKernelsSSE2.cpp PROPERTIES
         COMPILE_OPTIONS "$<$<EQUAL:${CMAKE_SIZEOF_VOID_P},4>:/arch:SSE2>")
@@ -334,24 +341,60 @@ elseif(MINGW)
     endif()
 endif()
 
-target_compile_definitions(svmsynth PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
-    UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS ${SVMS_WITH_ASIO_DEF})
+add_library(svmsynth SHARED ${SOURCES} ${HEADERS}
+    "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc")
 
-if(SVMS_XP_COMPAT)
-    target_link_libraries(svmsynth PRIVATE dsound dxguid shell32 user32)
-else()
+# Standalone native-API runtime. Built from the same engine sources as
+# winmm.dll (one implementation, two frontends), but with its own export
+# surface: the permanent SVMS_GetInterface bootstrap plus the KDMAPI facade.
+# Deliberately no WinMM shim exports - SVMSAPI.dll is not a midiOutOpen
+# drop-in. Players integrate via LoadLibrary + GetProcAddress only.
+add_library(svmsapi SHARED ${SOURCES} ${HEADERS}
+    "${SVMS_GENERATED_DIR}/SVMSApiVersion.rc")
+
+foreach(svms_engine_target svmsynth svmsapi)
+    target_compile_definitions(${svms_engine_target} PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+        _CRT_SECURE_NO_WARNINGS ${SVMS_WITH_ASIO_DEF})
+    if(svms_engine_target STREQUAL svmsapi)
+        # The system multimedia headers declare the WinMM shims dllimport
+        # (WINMMAPI = DECLSPEC_IMPORT in mmsyscom.h). The local shim
+        # definitions in SVMSDriver.cpp then conflict (C4273) and MSVC turns
+        # each one into a linker /EXPORT directive, re-exporting the whole
+        # WinMM surface. _WINMM_ is the SDK's official "building winmm"
+        # switch: it empties WINMMAPI, so no conflict and no phantom exports.
+        # The shims stay as private dead code (/OPT:REF strips them) and the
+        # export surface is exactly the SVMSAPI_EXPORTS list below. Only the
+        # standalone target gets this; winmm.dll keeps its exact export table.
+        target_compile_definitions(${svms_engine_target} PRIVATE _WINMM_)
+    endif()
+    target_include_directories(${svms_engine_target} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+    if(SVMS_XP_COMPAT)
+        target_link_libraries(${svms_engine_target} PRIVATE
+            dsound dxguid shell32 user32)
+    else()
+        target_link_libraries(${svms_engine_target} PRIVATE
+            winmm ole32 uuid avrt shell32 d3d11 dxgi d3dcompiler)
+    endif()
+endforeach()
+
+if(NOT SVMS_XP_COMPAT)
     option(SVMS_ASIO "Build the ASIO output backend (requires the ASIO SDK)" ON)
     if(SVMS_ASIO AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common/asio.h")
         set(ASIO_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main")
-        target_sources(svmsynth PRIVATE
-            "${ASIO_SDK_DIR}/common/asio.cpp"
-            "${ASIO_SDK_DIR}/common/combase.cpp"
-            "${ASIO_SDK_DIR}/common/debugmessage.cpp"
-            "${ASIO_SDK_DIR}/host/asiodrivers.cpp"
-            "${ASIO_SDK_DIR}/host/pc/asiolist.cpp")
-        target_compile_definitions(svmsynth PRIVATE SVMS_WITH_ASIO)
-        target_include_directories(svmsynth PRIVATE
-            "${ASIO_SDK_DIR}/common" "${ASIO_SDK_DIR}/host")
+        foreach(svms_engine_target svmsynth svmsapi)
+            target_sources(${svms_engine_target} PRIVATE
+                "${ASIO_SDK_DIR}/common/asio.cpp"
+                "${ASIO_SDK_DIR}/common/combase.cpp"
+                "${ASIO_SDK_DIR}/common/debugmessage.cpp"
+                "${ASIO_SDK_DIR}/host/asiodrivers.cpp"
+                "${ASIO_SDK_DIR}/host/pc/asiolist.cpp")
+            target_compile_definitions(${svms_engine_target} PRIVATE SVMS_WITH_ASIO)
+            target_include_directories(${svms_engine_target} PRIVATE
+                "${ASIO_SDK_DIR}/common" "${ASIO_SDK_DIR}/host"
+                "${ASIO_SDK_DIR}/host/pc")
+        endforeach()
         # The SDK is not warning-clean under /W3; it is vendor code.
         if(MSVC)
             set(ASIO_SDK_SOURCES
@@ -367,17 +410,10 @@ else()
     else()
         message(STATUS "SVMS: ASIO backend disabled (set SVMS_ASIO=ON with the SDK at asio-main/)")
     endif()
-    target_link_libraries(svmsynth PRIVATE winmm ole32 uuid avrt shell32
-        d3d11 dxgi d3dcompiler)
 endif()
 
 # nlohmann/json is vendored under third_party and intentionally confined to
-# the configuration translation unit.
-target_include_directories(svmsynth PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
-if(NOT SVMS_XP_COMPAT)
-    target_include_directories(svmsynth PRIVATE "${SVMS_ASIO_INCLUDE}" "${SVMS_ASIO_INCLUDE_HOST}" "${SVMS_ASIO_INCLUDE_PC}")
-endif()
+# the configuration translation unit (both engine targets inherit it above).
 
 set(EXPORTS
         PlaySoundA
@@ -508,6 +544,53 @@ set_target_properties(svmsynth PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# SVMSAPI.dll export surface: the permanent SVMS_GetInterface bootstrap plus
+# the KDMAPI facade (OmniMIDI-conventional entry points, which the native API
+# smoke test also verifies). No WinMM shims.
+set(SVMSAPI_EXPORTS
+        SVMS_GetInterface
+        IsKDMAPIAvailable
+        InitializeKDMAPIStream
+        TerminateKDMAPIStream
+        ResetKDMAPIStream
+        ReturnKDMAPIVer
+        SendDirectData
+        SendDirectDataNoBuf
+        SendCustomEvent
+        SendDirectLongData
+        SendDirectLongDataNoBuf
+        PrepareLongData
+        UnprepareLongData
+        DriverSettings
+        GetDriverDebugInfo
+        GetRenderingTime
+        GetVoiceCount
+        GetVoiceStatistics
+        SVMSGetDriverDebugInfoV1
+        LoadCustomSoundFontsList
+        timeGetTime64
+)
+if(MSVC)
+    foreach(exp ${SVMSAPI_EXPORTS})
+        target_link_options(svmsapi PRIVATE /EXPORT:${exp})
+    endforeach()
+elseif(MINGW)
+    set(SVMS_API_EXPORT_FILE "${CMAKE_CURRENT_BINARY_DIR}/SVMSApiExports.def")
+    file(WRITE "${SVMS_API_EXPORT_FILE}" "EXPORTS\n")
+    foreach(exp ${SVMSAPI_EXPORTS})
+        file(APPEND "${SVMS_API_EXPORT_FILE}" "    ${exp}\n")
+    endforeach()
+    target_sources(svmsapi PRIVATE "${SVMS_API_EXPORT_FILE}")
+    target_link_options(svmsapi PRIVATE -Wl,--kill-at)
+endif()
+
+set_target_properties(svmsapi PROPERTIES
+    OUTPUT_NAME "SVMSAPI"
+    PREFIX ""
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 if(NOT SVMS_XP_COMPAT)
     add_executable(svms_v3_render
         SVMSOfflineRenderer.cpp
@@ -610,14 +693,12 @@ add_custom_target(svms_ziggy_alias ALL
     DEPENDS svmsynth
     VERBATIM)
 
-# Native integrations load the canonical SVMSAPI.dll name. Keep the shorter
-# SVMS.dll spelling as a compatibility alias. Both are intentionally the same
-# runtime as winmm.dll so WinMM, KDMAPI, and SVMS API clients cannot drift into
-# separate engine implementations.
+# The standalone SVMSAPI.dll is a real target above (same engine sources, its
+# own export surface). Keep the shorter SVMS.dll spelling as a compatibility
+# alias of the winmm runtime. WinMM and native-API clients now intentionally
+# load different modules; the engine implementation is shared at the source
+# level and both export surfaces are exercised by the ctest suite.
 add_custom_target(svms_native_alias ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:svmsynth>"
-            "$<TARGET_FILE_DIR:svmsynth>/SVMSAPI.dll"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:svmsynth>"
             "$<TARGET_FILE_DIR:svmsynth>/SVMS.dll"
@@ -665,10 +746,10 @@ if(SVMS_BUILD_TESTS)
         tests/SVMSNativeAPISmoke.cpp)
     target_include_directories(svms_v3_native_api_smoke PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include")
-    add_dependencies(svms_v3_native_api_smoke svms_native_alias)
+    add_dependencies(svms_v3_native_api_smoke svmsapi)
     add_test(NAME svms_v3_native_api
              COMMAND svms_v3_native_api_smoke
-                     "$<TARGET_FILE_DIR:svmsynth>/SVMSAPI.dll")
+                     "$<TARGET_FILE:svmsapi>")
     set_tests_properties(svms_v3_native_api PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(svms_v3_tests

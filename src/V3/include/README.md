@@ -72,11 +72,14 @@ All extensible structures carry `struct_size` and `struct_version`. Initialize
 reserved fields to zero. Do not copy internal C++ types or RuntimeLink shared
 memory layouts into applications.
 
-`winmm.dll`, `SVMSAPI.dll`, `SVMS.dll`, `OmniMIDI.dll`, and
-`SnappySynth.dll` are byte-identical names for one runtime in a given build.
-`SVMSAPI.dll` is canonical; `SVMS.dll` is retained as a compatibility spelling.
-This is deliberate: WinMM, native API, KDMAPI, and Ziggy integrations share one
-scheduler, one synthesis engine, and one ownership model.
+`SVMSAPI.dll` is a dedicated build of the same engine sources as `winmm.dll`,
+with its own export surface: the single `SVMS_GetInterface` bootstrap plus the
+KDMAPI facade. It does not export the WinMM shim functions. `winmm.dll` (and
+its `SVMS.dll`, `OmniMIDI.dll`, and `SnappySynth.dll` aliases) remain the full
+drop-in shim runtime. WinMM and native-API clients therefore load different
+modules by design; the engine implementation is shared at the source level and
+both export surfaces are covered by the ctest suite. Note that loading two SVMS
+modules in one process creates two independent engine instances.
 
 Handles returned by the original `create_session` function provide
 reference-counted ownership of that single process engine. They are not

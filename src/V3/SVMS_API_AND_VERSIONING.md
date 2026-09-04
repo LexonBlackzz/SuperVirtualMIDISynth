@@ -394,6 +394,7 @@ Current implementation status (2026-08-23):
 7. [x] Formalize the shared runtime: all Windows frontend names are
    byte-identical aliases over one engine and ownership model. A deeper portable
    core extraction remains useful, but is not required for frontend parity.
+   (2026-09: `SVMSAPI.dll` stopped being an alias — see item 18.)
 8. [x] Freeze the first `svmsapi.h` ABI and implement `SVMS_GetInterface`.
 9. [x] Implement reference-counted native ownership sessions, exact QPC and
    output-frame submission, mixed-clock bulk submission, SysEx, queue controls,
@@ -420,6 +421,11 @@ Current implementation status (2026-08-23):
     names in automated tests before expanding either API.
 17. [x] Publish the canonical `SVMSAPI.dll` name while retaining `SVMS.dll` as
     a compatibility alias.
+18. [x] (2026-09) Split `SVMSAPI.dll` into its own build target: same engine
+    sources as `winmm.dll`, but exporting only `SVMS_GetInterface` plus the
+    KDMAPI facade — no WinMM shims. `_WINMM_` is defined for this target so
+    the shim definitions cannot leak back via dllimport-conflict `/EXPORT`
+    directives (C4273). `winmm.dll` and its aliases are unchanged.
 
 These should land as independently testable commits. The versioning and
 discovery foundation should precede the updater and public ABI freeze.
