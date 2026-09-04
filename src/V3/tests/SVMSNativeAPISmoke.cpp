@@ -277,6 +277,27 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ── KDMAPI facade contract checks (canonical OmniMIDI.h semantics) ──
+    // timeGetTime64: timeGetTime units (milliseconds), 64-bit, monotonic.
+    const auto timeGetTime64 = reinterpret_cast<DWORD64 (WINAPI*)()>(
+        GetProcAddress(runtime, "timeGetTime64"));
+    if (!timeGetTime64) {
+        std::puts("FAIL: timeGetTime64 export is missing");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    const DWORD64 kTime0 = timeGetTime64();
+    Sleep(30u);
+    const DWORD64 kTime1 = timeGetTime64();
+    if (kTime1 <= kTime0 || (kTime1 - kTime0) < 5u ||
+        (kTime1 - kTime0) > 2000u) {
+        std::puts("FAIL: timeGetTime64 is not millisecond-scaled/monotonic");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
     SVMS_ShortEvent events[2]{};
     // Zero-timestamp records share the batch's one immediate QPC sample.
     events[0].timestamp_qpc = 0u;
@@ -313,6 +334,51 @@ int main(int argc, char** argv) {
         FreeLibrary(runtime);
         return 1;
     }
+    // DriverSettings: OM_GET answers from live engine state; unknown
+    // settings and live sets report failure instead of pretending.
+    const auto driverSettings =
+        reinterpret_cast<BOOL (WINAPI*)(DWORD, DWORD, LPVOID, UINT)>(
+            GetProcAddress(runtime, "DriverSettings"));
+    DWORD settingValue = 0u;
+    if (!driverSettings ||
+        !driverSettings(0x10018u /*OM_AUDIOFREQ*/, 0x1u /*OM_GET*/,
+                        &settingValue, sizeof(settingValue)) ||
+        settingValue != telemetry.sample_rate ||
+        driverSettings(0xDEADBEEFu, 0x1u /*OM_GET*/, &settingValue,
+                       sizeof(settingValue)) ||
+        driverSettings(0x10018u /*OM_AUDIOFREQ*/, 0x0u /*OM_SET*/,
+                       &settingValue, sizeof(settingValue))) {
+        std::puts("FAIL: DriverSettings OM_GET contract violated");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // SendCustomEvent: canonical (eventtype, chan, param) signature. Unknown
+    // event types and out-of-range channels must be refused, never forwarded.
+    const auto sendCustomEvent =
+        reinterpret_cast<BOOL (WINAPI*)(DWORD, DWORD, DWORD)>(
+            GetProcAddress(runtime, "SendCustomEvent"));
+    if (!sendCustomEvent || sendCustomEvent(0xFFFFFFFFu, 0u, 0u) ||
+        sendCustomEvent(0x1u, 16u, 0u)) {
+        std::puts("FAIL: SendCustomEvent accepted invalid input");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // LoadCustomSoundFontsList: null path is a no-op, never a crash.
+    const auto loadCustomSoundFontsList =
+        reinterpret_cast<void (WINAPI*)(LPWSTR)>(
+            GetProcAddress(runtime, "LoadCustomSoundFontsList"));
+    if (!loadCustomSoundFontsList) {
+        std::puts("FAIL: LoadCustomSoundFontsList export is missing");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    loadCustomSoundFontsList(nullptr);
+
     if (api.cancel_session_submissions(session) != SVMS_RESULT_OK ||
         api.send_short(session, 0x00643c90u) != SVMS_RESULT_CANCELLED ||
         api.send_system_exclusive(session, gmReset, sizeof(gmReset)) !=
