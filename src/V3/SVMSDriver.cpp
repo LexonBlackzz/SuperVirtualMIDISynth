@@ -5320,6 +5320,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     RenderEvent* evtBuf = self->eventBuffer;
     uint32_t evCount = 0;
     uint32_t examinedCount = 0;
+    // Events clamped to frame 0 in this block (lateClamped telemetry input).
+    uint32_t clampedThisBlock = 0;
     const uint32_t eventBudget =
         self->eventBufferCapacity_;
     auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
@@ -5334,7 +5336,17 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             return;
         }
         int64_t offset = scheduledOut.targetFrame - self->virtualRenderSample_;
-        if (offset < 0) { ++self->telemetry_.late; offset = 0; }
+        if (offset < 0) {
+            ++self->telemetry_.late;
+            ++self->telemetry_.lateClamped;
+            ++clampedThisBlock;
+            const int64_t lateness = -offset;
+            if (static_cast<uint64_t>(lateness) >
+                self->telemetry_.lateClampMaxLateness)
+                self->telemetry_.lateClampMaxLateness =
+                    static_cast<uint64_t>(lateness);
+            offset = 0;
+        }
         evtBuf[evCount++] = scheduledOut.ToRenderEvent(
             static_cast<uint32_t>(offset));
         ++self->telemetry_.dispatched;
@@ -5359,6 +5371,11 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             admitScheduled(scheduledOut);
         }
     }
+    // Worst same-sample pileup of frame-0-clamped events in one block. Every
+    // clamped event lands on the block-start sample, so this is the direct
+    // measure of the block-grid transient concentration.
+    if (clampedThisBlock > self->telemetry_.lateClampBlockPileupMax)
+        self->telemetry_.lateClampBlockPileupMax = clampedThisBlock;
     const uint32_t scheduledAfterDispatch = self->useEventCompiler_
         ? self->pagedScheduler_.Size()
         : self->eventScheduler_.Size();
@@ -5442,6 +5459,27 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::ReleaseLoop),
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::Generic));
         OutputDebugStringA(census);
+    }
+    // Scheduler-lateness census, same 64-block cadence. Deltas since the
+    // previous census keep the numbers readable while the stream runs.
+    if (self->diagnosticsEnabled_ && (self->callbackCount_ & 63u) == 0u) {
+        static uint64_t censusLastClamped = 0;
+        static uint64_t censusLastLate = 0;
+        static uint64_t censusLastDispatched = 0;
+        char schedCensus[192];
+        std::snprintf(schedCensus, sizeof(schedCensus),
+            "[SVMS] sched: clamped+%llu late+%llu disp+%llu "
+            "maxLate=%.2fms pileupMax=%u\n",
+            (unsigned long long)(self->telemetry_.lateClamped - censusLastClamped),
+            (unsigned long long)(self->telemetry_.late - censusLastLate),
+            (unsigned long long)(self->telemetry_.dispatched - censusLastDispatched),
+            (double)self->telemetry_.lateClampMaxLateness /
+                (double)(self->sampleRate > 0u ? self->sampleRate : 1u) * 1000.0,
+            (unsigned)self->telemetry_.lateClampBlockPileupMax);
+        OutputDebugStringA(schedCensus);
+        censusLastClamped = self->telemetry_.lateClamped;
+        censusLastLate = self->telemetry_.late;
+        censusLastDispatched = self->telemetry_.dispatched;
     }
     // Per-voice phase rotation is applied inside RenderBlock (per-voice, at
     // each mix site), so Coherent mode (no state allocated) stays bit-exact

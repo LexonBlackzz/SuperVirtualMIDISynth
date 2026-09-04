@@ -121,6 +121,17 @@ struct EventTelemetry {
     uint64_t scheduledHighWater = 0;
     uint64_t dispatched = 0;
     uint64_t late = 0;
+    // Events admitted with targetFrame already behind the render cursor:
+    // admission clamps their offset to frame 0, so every one of them lands on
+    // the block-start sample. This is the only block-grid-coupled timing
+    // distortion in the live chain and the suspected mechanism behind the
+    // load-dependent 100 Hz roughness. Kept separate from `late`, which also
+    // counts obsolete-event skips (stale note-ons, XP early-target clamps).
+    uint64_t lateClamped = 0;
+    // High-water of (renderCursor - targetFrame) at clamp time, in frames.
+    uint64_t lateClampMaxLateness = 0;
+    // High-water of clamped events piled into one callback block.
+    uint32_t lateClampBlockPileupMax = 0;
     uint64_t skippedOutputFrames = 0;
     uint64_t staleNoteOnsSkipped = 0;
     uint64_t staleNoteOffsCompacted = 0;
