@@ -76,3 +76,5 @@ config.ini
 /ziggy_config.json
 /ziggy
 *.local.md
+KDMAPI-Simulator-main/
+KDMAPI.md
