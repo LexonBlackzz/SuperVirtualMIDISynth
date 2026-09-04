@@ -622,6 +622,10 @@ private:
                                              void* userData);
     static void WholeVoiceDeferredReleaseHook(VoiceHandle handle,
                                               void* userData);
+    static void WholeVoiceSilenceVoiceHook(VoiceHandle handle,
+                                           void* userData);
+    static void WholeVoiceSilenceTailHook(uint32_t slot, void* userData);
+    void DropWholeVoiceReleaseOp(VoiceHandle handle);
     static void WholeVoiceJobThunk(uint32_t jobIndex, float* outputLeft,
                                    float* outputRight, uint32_t frameCount,
                                    void* userData);
@@ -634,6 +638,13 @@ private:
     uint32_t* wvGhostStartFrame_ = nullptr;
     uint32_t* wvGhostDeathFrame_ = nullptr;
     uint32_t* wvGhostReleaseFrame_ = nullptr;
+    // Per ghost: 1 = All-Sound-Off kill (renders to its death frame with no
+    // fade tail), 0 = steal victim (64-frame tail fade from death state).
+    uint8_t* wvGhostNoTail_ = nullptr;
+    // Per steal-tail slot: frame an in-block All Sound Off killed the tail
+    // (UINT32_MAX = alive or dead before this block).  kStealTailReserve is
+    // a small compile-time constant, so a fixed member array is fine.
+    uint32_t wvTailKillFrame_[kStealTailReserve];
     uint32_t* wvStartFrame_ = nullptr;       // per handle; UINT32_MAX = from 0
     uint32_t* wvReleaseFrame_ = nullptr;     // per handle; UINT32_MAX = none
     uint32_t wvHandleCapacity_ = 0u;         // handle-range size of the above
@@ -820,6 +831,7 @@ inline RenderScalar::~RenderScalar() {
     _aligned_free(wvGhostStartFrame_);
     _aligned_free(wvGhostDeathFrame_);
     _aligned_free(wvGhostReleaseFrame_);
+    _aligned_free(wvGhostNoTail_);
     _aligned_free(wvJobRetirements_);
     _aligned_free(wvJobRetireCounts_);
     delete[] wvGhostTails_;
@@ -3067,9 +3079,11 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         }
     }
     // ── Whole-voice whole-block renderer ────────────────────────────────
-    // Single per-voice renderer: owns every note-only block (and blocks
-    // with no events at all).  Vibrato and non-note events keep the legacy
-    // hybrid below until per-voice param buckets land.
+    // Single per-voice renderer: owns every note-only block, blocks with no
+    // events at all, and note blocks carrying the lifecycle controllers
+    // (sustain/sostenuto/all-notes-off/all-sound-off).  Vibrato and other
+    // mid-block row mutations keep the legacy hybrid below until per-voice
+    // param ops land.
     if (!vibratoActive &&
         PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame)) {
         RenderWholeVoiceBlock(voices, sampleData, sampleDataFrames,
@@ -3160,6 +3174,22 @@ inline void CopyVoiceRow(const VoiceSoA& source, VoiceSoA& destination,
 }
 #undef SVMS_COPY_VOICE_ROW_FIELD
 
+// Remove a pending deferred-release op entry for a handle whose generation
+// is dying (displacement overflow or an All Sound Off kill).  Block-end
+// finalization must not observe the dead generation: the handle may already
+// host a newer launch carrying its own release op, and a stale entry would
+// double-count releasingCount_ once the new voice's own release lands.
+inline void RenderScalar::DropWholeVoiceReleaseOp(VoiceHandle handle) {
+    for (uint32_t i = 0; i < wvOpCount_; ++i) {
+        if (wvOpHandles_[i] == handle) {
+            wvOpHandles_[i] = wvOpHandles_[wvOpCount_ - 1];
+            wvOpFrames_[i] = wvOpFrames_[wvOpCount_ - 1];
+            --wvOpCount_;
+            break;
+        }
+    }
+}
+
 // Classify from raw render state; independent of the render-class lists so
 // workers never touch shared scheduling metadata.
 inline VoiceRenderClass ClassifyWholeVoiceRow(const VoiceSoA& v,
@@ -3215,16 +3245,7 @@ inline void RenderScalar::WholeVoicePreTailCaptureHook(
         // observe the dead generation either.
         if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) {
             renderer->wvReleaseFrame_[handle] = UINT32_MAX;
-            for (uint32_t i = 0; i < renderer->wvOpCount_; ++i) {
-                if (renderer->wvOpHandles_[i] == handle) {
-                    renderer->wvOpHandles_[i] =
-                        renderer->wvOpHandles_[renderer->wvOpCount_ - 1];
-                    renderer->wvOpFrames_[i] =
-                        renderer->wvOpFrames_[renderer->wvOpCount_ - 1];
-                    --renderer->wvOpCount_;
-                    break;
-                }
-            }
+            renderer->DropWholeVoiceReleaseOp(handle);
         }
         return;
     }
@@ -3235,14 +3256,91 @@ inline void RenderScalar::WholeVoicePreTailCaptureHook(
         renderer->wvStartFrame_[handle] == UINT32_MAX
             ? 0u : renderer->wvStartFrame_[handle];
     renderer->wvGhostDeathFrame_[ghost] = renderer->wvEventFrame_;
+    renderer->wvGhostNoTail_[ghost] = 0u;
+    // Zero the tail record up front: if the ghost retires before its death
+    // frame (envelope end mid-span) no CaptureGhostTail runs, and a record
+    // left over from a previous use of this ghost slot must never be
+    // adopted at block end.
+    renderer->wvGhostTails_[ghost].framesRemaining = 0u;
     if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) {
         // A deferred release on the displaced voice transfers to the ghost.
+        // The victim's op entry is dropped with the transfer: the victim is
+        // dead, so block-end finalization has nothing left to observe, and
+        // a kept entry would double-count if the reused handle releases
+        // again later in the same block.
         renderer->wvGhostReleaseFrame_[ghost] =
             renderer->wvReleaseFrame_[handle];
         renderer->wvReleaseFrame_[handle] = UINT32_MAX;
+        renderer->DropWholeVoiceReleaseOp(handle);
     } else {
         renderer->wvGhostReleaseFrame_[ghost] = UINT32_MAX;
     }
+}
+
+// CC120 (All Sound Off) hook, fired by VoiceManager::SilenceChannelImmediate
+// for every channel voice just before the bookkeeping retires it.  The
+// pre-kill row state becomes a ghost that renders [start, killFrame) —
+// exactly the samples the frame-major renderers still hear — and then stops
+// dead: no envelope release, no steal-tail fade.  The kill itself stays in
+// VoiceManager, so the freed slot is reusable by later in-block launches
+// exactly as live dispatch leaves it.
+inline void RenderScalar::WholeVoiceSilenceVoiceHook(
+    VoiceHandle handle, void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
+    if (renderer->wvGhostCount_ >= renderer->wvGhostCapacity_) {
+        // Pathological block (more kills+steals than pool rows).  The killed
+        // voice's pre-kill samples are lost for this block; the kill itself
+        // stays exact.  Counted for telemetry.
+        ++renderer->wvGhostOverflowCount_;
+        if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) {
+            renderer->wvReleaseFrame_[handle] = UINT32_MAX;
+            renderer->DropWholeVoiceReleaseOp(handle);
+        }
+        return;
+    }
+    const uint32_t ghost = renderer->wvGhostCount_++;
+    CopyVoiceRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
+                 handle, ghost);
+    renderer->wvGhostStartFrame_[ghost] =
+        renderer->wvStartFrame_[handle] == UINT32_MAX
+            ? 0u : renderer->wvStartFrame_[handle];
+    renderer->wvGhostDeathFrame_[ghost] = renderer->wvEventFrame_;
+    // All Sound Off is an immediate stop: no fade tail after the kill frame.
+    renderer->wvGhostNoTail_[ghost] = 1u;
+    renderer->wvGhostTails_[ghost].framesRemaining = 0u;
+    if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) {
+        if (renderer->wvReleaseFrame_[handle] < renderer->wvEventFrame_) {
+            // The release flip lands before the kill frame; the ghost keeps
+            // rendering through it (sustained -> releasing) and dies on
+            // schedule at the kill frame.
+            renderer->wvGhostReleaseFrame_[ghost] =
+                renderer->wvReleaseFrame_[handle];
+        } else {
+            // Killed before (or on) its release frame: the flip never
+            // happens audibly.
+            renderer->wvGhostReleaseFrame_[ghost] = UINT32_MAX;
+        }
+        // The handle dies here either way: drop the pending flip so a
+        // reused handle cannot inherit it and block-end finalization cannot
+        // double-count (same reasoning as the steal-transfer drop above).
+        renderer->wvReleaseFrame_[handle] = UINT32_MAX;
+        renderer->DropWholeVoiceReleaseOp(handle);
+    } else {
+        renderer->wvGhostReleaseFrame_[ghost] = UINT32_MAX;
+    }
+}
+
+// CC120 hook for channel-owned steal tails, fired before the tail is
+// unlinked.  Only the kill frame is recorded: UnlinkStealTail preserves the
+// tail's fields, so RenderWholeVoiceBlock renders the tail's audio up to
+// that frame and then stops exactly where live dispatch would have.
+inline void RenderScalar::WholeVoiceSilenceTailHook(uint32_t slot,
+                                                    void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (renderer == nullptr || slot >= kStealTailReserve) return;
+    if (renderer->wvTailKillFrame_[slot] == UINT32_MAX)
+        renderer->wvTailKillFrame_[slot] = renderer->wvEventFrame_;
 }
 
 inline void RenderScalar::WholeVoiceDeferredReleaseHook(
@@ -3271,6 +3369,21 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
             case RenderEventType::NoteOn:
             case RenderEventType::NoteOff:
             case RenderEventType::StaleNoteOffBatch:
+                hasEvents = true;
+                break;
+            case RenderEventType::ControlChange:
+                // Lifecycle-only controllers take the whole-voice path:
+                // sustain (64), sostenuto (66) and all-notes-off (123)
+                // funnel through StartRelease's deferred-release hook
+                // exactly like note-offs, and all-sound-off (120) kills
+                // through the silence hooks as exact-frame ghosts.
+                // Every other controller mutates rendering rows mid-block
+                // and keeps the legacy hybrid until per-voice param ops
+                // land (stage 3).
+                if (events[i].data1 != 64u && events[i].data1 != 66u &&
+                    events[i].data1 != 120u && events[i].data1 != 123u) {
+                    return false;
+                }
                 hasEvents = true;
                 break;
             default:
@@ -3307,6 +3420,8 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
 
     std::fill(wvStartFrame_, wvStartFrame_ + handleCapacity, UINT32_MAX);
     std::fill(wvReleaseFrame_, wvReleaseFrame_ + handleCapacity, UINT32_MAX);
+    std::fill(wvTailKillFrame_, wvTailKillFrame_ + kStealTailReserve,
+              UINT32_MAX);
     wvOpCount_ = 0u;
     wvGhostCount_ = 0u;
     wvPlanVoices_ = &voices;
@@ -3314,6 +3429,8 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     voices.SetDeferredReleaseHook(&WholeVoiceDeferredReleaseHook, this);
     voices.SetVoiceConfiguredHook(&WholeVoiceVoiceConfiguredHook, this);
     voices.SetPreTailCaptureHook(&WholeVoicePreTailCaptureHook, this);
+    voices.SetSilenceChannelHooks(&WholeVoiceSilenceVoiceHook,
+                                  &WholeVoiceSilenceTailHook, this);
     voices.SetStealTailCaptureSuppressed(true);
 
     // Ingress-order dispatch with the render clock at each event's exact
@@ -3334,6 +3451,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     voices.SetDeferredReleaseHook(nullptr, nullptr);
     voices.SetVoiceConfiguredHook(nullptr, nullptr);
     voices.SetPreTailCaptureHook(nullptr, nullptr);
+    voices.SetSilenceChannelHooks(nullptr, nullptr, nullptr);
     voices.SetStealTailCaptureSuppressed(false);
     wvPlanVoices_ = nullptr;
     return true;
@@ -3520,6 +3638,11 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 }
             }
             if (retired || cursor < death) continue;  // ghost ended early
+            if (renderer->wvGhostNoTail_[ghost]) {
+                // All Sound Off kill reached: hard stop, no fade tail.
+                // (The tail record was zeroed at capture; nothing to adopt.)
+                continue;
+            }
             // Steal frame reached: reproduce the 64-frame tail fade from
             // the ghost's exact steal-frame state, then keep rendering it.
             renderer->CaptureGhostTail(ghost);
@@ -3601,14 +3724,27 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         voices.RefreshRenderClass(static_cast<VoiceHandle>(wvSliceHandles_[i]));
 
     // Pre-existing steal tails (born before this block) render exactly as
-    // the span renderer's tail section does.
+    // the span renderer's tail section does.  A tail killed by an in-block
+    // All Sound Off was unlinked during the pre-pass, but UnlinkStealTail
+    // preserves its fields: render the audio up to the recorded kill frame,
+    // then stop exactly where live dispatch would have stopped it.
     const uint32_t voiceCapacity = voices.GetMaxVoices();
     const uint32_t tailCapacity =
         (std::min)(voiceCapacity, static_cast<uint32_t>(kStealTailReserve));
     for (uint32_t slot = 0u; slot < tailCapacity; ++slot) {
-        if (voices.v.stealTailFramesRemaining[slot] == 0u) continue;
+        const uint32_t killFrame = wvTailKillFrame_[slot];
+        if (voices.v.stealTailFramesRemaining[slot] == 0u) {
+            if (killFrame == UINT32_MAX) continue;
+            RenderStealTailSpan(voices.v, slot, sampleData, sampleDataFrames,
+                                outputLeft, outputRight, 0u, killFrame);
+            continue;
+        }
+        // A live tail never carries a kill frame; the min() only defends
+        // against a plan/render mismatch.
+        const uint32_t tailFrames = killFrame == UINT32_MAX
+            ? numFrames : (std::min)(killFrame, numFrames);
         RenderStealTailSpan(voices.v, slot, sampleData, sampleDataFrames,
-                            outputLeft, outputRight, 0u, numFrames);
+                            outputLeft, outputRight, 0u, tailFrames);
         voices.RefreshStealTail(static_cast<VoiceHandle>(slot));
     }
 
@@ -3668,10 +3804,13 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     uint32_t* freshGhostStart = allocU32(wvGhostStartFrame_, cap);
     uint32_t* freshGhostDeath = allocU32(wvGhostDeathFrame_, cap);
     uint32_t* freshGhostRelease = allocU32(wvGhostReleaseFrame_, cap);
+    uint8_t* freshGhostNoTail = static_cast<uint8_t*>(_aligned_malloc(
+        static_cast<size_t>(cap) * sizeof(uint8_t), kMixBufferAlign));
     if (freshStart == nullptr || freshRelease == nullptr ||
         freshSlice == nullptr || freshOpHandles == nullptr ||
         freshOpFrames == nullptr || freshGhostStart == nullptr ||
-        freshGhostDeath == nullptr || freshGhostRelease == nullptr) {
+        freshGhostDeath == nullptr || freshGhostRelease == nullptr ||
+        freshGhostNoTail == nullptr) {
         _aligned_free(freshStart);
         _aligned_free(freshRelease);
         _aligned_free(freshSlice);
@@ -3680,6 +3819,7 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
         _aligned_free(freshGhostStart);
         _aligned_free(freshGhostDeath);
         _aligned_free(freshGhostRelease);
+        _aligned_free(freshGhostNoTail);
         return false;
     }
     _aligned_free(wvStartFrame_);
@@ -3690,6 +3830,7 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     _aligned_free(wvGhostStartFrame_);
     _aligned_free(wvGhostDeathFrame_);
     _aligned_free(wvGhostReleaseFrame_);
+    _aligned_free(wvGhostNoTail_);
     wvStartFrame_ = freshStart;
     wvReleaseFrame_ = freshRelease;
     wvSliceHandles_ = freshSlice;
@@ -3698,6 +3839,7 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     wvGhostStartFrame_ = freshGhostStart;
     wvGhostDeathFrame_ = freshGhostDeath;
     wvGhostReleaseFrame_ = freshGhostRelease;
+    wvGhostNoTail_ = freshGhostNoTail;
     wvHandleCapacity_ = handleCapacity;
     if (wvGhostCapacity_ < cap) {
         VoiceSoA grown;

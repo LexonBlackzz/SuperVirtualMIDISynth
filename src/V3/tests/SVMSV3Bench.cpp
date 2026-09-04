@@ -100,6 +100,8 @@ struct Options {
     uint32_t keyStride = 1;
     uint32_t attackFrames = 0;
     uint32_t noteLengthFrames = 1;
+    uint32_t ccRate = 0;
+    uint32_t ccController = 0;   // 0 = cycle 64/66/120/123
     uint32_t renderThreads = 1;
     std::string soundFontPath;
     uint32_t pinCore = UINT32_MAX;
@@ -162,6 +164,12 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         } else if (std::strcmp(argv[i], "--note-length-frames") == 0) {
             if (!nextNumber(options.noteLengthFrames) ||
                 options.noteLengthFrames > options.frames) return false;
+        } else if (std::strcmp(argv[i], "--cc-rate") == 0) {
+            if (!nextNumber(options.ccRate)) return false;
+        } else if (std::strcmp(argv[i], "--cc-controller") == 0) {
+            if (!nextNumber(options.ccController) ||
+                options.ccController > 127u)
+                return false;
         } else if (std::strcmp(argv[i], "--render-threads") == 0) {
             if (!nextNumber(options.renderThreads) ||
                 options.renderThreads < 1u || options.renderThreads > 64u)
@@ -508,8 +516,11 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
             break;
         }
         case svms::RenderEventType::NoteOff: {
+            // Production semantics: pedal-held keys defer their release.
+            const bool sustain =
+                channels.IsSustainActive(event.channel);
             voices.NoteOffOldestPlayIndices(
-                event.channel, event.data1, 1u, false, blockCursor);
+                event.channel, event.data1, 1u, sustain, blockCursor);
             break;
         }
         case svms::RenderEventType::ControlChange:
@@ -518,6 +529,22 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
             if (event.data1 == 7u || event.data1 == 10u || event.data1 == 11u)
                 voices.MarkChannelMixStale(
                     event.channel, channels.GetParams()[event.channel]);
+            else if (event.data1 == 64u) {
+                if (event.data2 < 64u)
+                    voices.ReleaseSustain(event.channel, blockCursor);
+            } else if (event.data1 == 66u) {
+                const bool wasActive =
+                    channels.IsSostenutoActive(event.channel);
+                const bool nowActive = event.data2 >= 64u;
+                if (!wasActive && nowActive)
+                    voices.CaptureSostenuto(event.channel);
+                else if (wasActive && !nowActive)
+                    voices.ReleaseSostenuto(event.channel, blockCursor);
+            } else if (event.data1 == 120u) {
+                voices.SilenceChannelImmediate(event.channel);
+            } else if (event.data1 == 123u) {
+                voices.ReleaseChannel(event.channel, blockCursor);
+            }
             break;
         case svms::RenderEventType::PitchBend: {
             const int32_t wheel = (static_cast<int32_t>(event.data2) << 7) |
@@ -570,7 +597,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "usage: svms_v3_bench [--voices 1..524288] [--frames 16..8192] "
             "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst|chopped-notes] "
-            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--base-note 0..127] [--key-stride 1..127] [--attack-frames N] [--note-length-frames N] [--generic-voices N] [--soundfont PATH] "
+            "[--event-stride N] [--note-rate N] [--key-count 1..128] [--base-note 0..127] [--key-stride 1..127] [--attack-frames N] [--note-length-frames N] [--cc-rate N] [--cc-controller 0..127] [--generic-voices N] [--soundfont PATH] "
             "[--render-threads 1..64] "
             "[--backend auto|scalar|sse2|avx2] "
             "[--launch-path legacy|transactional] "
@@ -705,6 +732,42 @@ int main(int argc, char** argv) {
                 off.type = svms::RenderEventType::NoteOff;
                 off.channel = channel;
                 off.data1 = note;
+            }
+            // Lifecycle-controller interleave (--cc-rate): appends ccRate
+            // CCs per second to the note churn.  Controllers 64/66/120/123
+            // (ccController 0 cycles them) are the set the whole-voice
+            // renderer accepts, so the same event volume with
+            // --cc-controller 11 A/Bs the fast path against the legacy
+            // fallback.
+            if (options.ccRate != 0u) {
+                const uint32_t ccCount = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(options.ccRate) * options.frames +
+                     44099u) / 44100u);
+                if (ccCount != 0u) {
+                    const size_t noteEventCount = events.size();
+                    events.resize(noteEventCount + ccCount);
+                    static const uint8_t kLifecycleControllers[4] = {
+                        64u, 66u, 120u, 123u};
+                    for (uint32_t index = 0u; index < ccCount; ++index) {
+                        svms::RenderEvent& event =
+                            events[noteEventCount + index];
+                        event.frameOffset = static_cast<uint32_t>(
+                            static_cast<uint64_t>(index) * options.frames /
+                            ccCount);
+                        event.ingressSequence =
+                            static_cast<uint32_t>(noteEventCount) + index;
+                        event.type = svms::RenderEventType::ControlChange;
+                        event.channel = static_cast<uint8_t>(index & 15u);
+                        event.data1 = options.ccController != 0u
+                            ? static_cast<uint8_t>(options.ccController)
+                            : kLifecycleControllers[index % 4u];
+                        event.data2 =
+                            (event.data1 == 64u || event.data1 == 66u) &&
+                                    (index % 2u) == 0u
+                                ? 127u
+                                : 0u;
+                    }
+                }
             }
             std::stable_sort(events.begin(), events.end(),
                 [](const svms::RenderEvent& a, const svms::RenderEvent& b) {

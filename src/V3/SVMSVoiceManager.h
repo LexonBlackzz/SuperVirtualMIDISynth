@@ -347,6 +347,22 @@ public:
         deferredReleaseHook_ = hook;
         deferredReleaseUserData_ = userData;
     }
+    // Whole-voice renderer pre-pass: CC120 (All Sound Off) kills every
+    // channel voice and channel-owned tail immediately.  While the pre-pass
+    // dispatch runs, the renderer captures each killed voice as a ghost
+    // (exact pre-kill state, death at the kill frame) BEFORE the bookkeeping
+    // below retires it, and records each channel tail's kill frame so the
+    // block render can emit the tail's audio up to that exact frame.  Null
+    // outside the pre-pass: the legacy renderers kill inline mid-block.
+    using SilenceVoiceHook = void (*)(VoiceHandle handle, void* userData);
+    using SilenceTailHook = void (*)(uint32_t slot, void* userData);
+    void SetSilenceChannelHooks(SilenceVoiceHook voiceHook,
+                                SilenceTailHook tailHook,
+                                void* userData) noexcept {
+        silenceVoiceHook_ = voiceHook;
+        silenceTailHook_ = tailHook;
+        silenceHookUserData_ = userData;
+    }
     // Whole-voice renderer: stolen victims continue as renderer-owned ghost
     // snapshots (pre-pass state + exact-frame retirement), so the in-band
     // steal-tail capture — which would otherwise record block-start state —
@@ -663,6 +679,9 @@ private:
     uint32_t stealHeapCount_;
     bool stealHeapValid_;
     uint64_t stealHeapBuildCount_;
+    // Times the winner-tree root failed its linkage validation and the index
+    // was rebuilt instead of faulting (steal-index invariant repairs).
+    uint64_t stealIndexRepairCount_;
     uint32_t* stealVolatileList_;
     uint32_t* stealVolatilePosition_;
     uint32_t stealVolatileCount_;
@@ -824,6 +843,7 @@ private:
     void RemoveVolatileHeapCandidate(VoiceHandle handle);
     void RemoveReservedVolatileRoot(VoiceHandle handle);
     bool IsStableStealCandidate(VoiceHandle handle) const;
+    SVMS_VM_FORCEINLINE bool IsLinkedActiveVoice(VoiceHandle handle) const;
     float ComputeEffectiveStealLevel(VoiceHandle handle) const;
     // Shared per-voice body of the mix-gain fold (eager refresh and batched
     // folds — must stay bit-identical between them).
@@ -880,6 +900,9 @@ private:
     void* voiceConfiguredUserData_ = nullptr;
     DeferredReleaseHook deferredReleaseHook_ = nullptr;
     void* deferredReleaseUserData_ = nullptr;
+    SilenceVoiceHook silenceVoiceHook_ = nullptr;
+    SilenceTailHook silenceTailHook_ = nullptr;
+    void* silenceHookUserData_ = nullptr;
     bool stealTailCaptureSuppressed_ = false;
 };
 
@@ -906,6 +929,7 @@ inline VoiceManager::VoiceManager()
       stealStableKey_(nullptr), stealWinnerTree_(nullptr),
       stealTreeLeafBase_(1u), stealHeapCount_(0), stealHeapValid_(false),
       stealHeapBuildCount_(0),
+      stealIndexRepairCount_(0),
       stealVolatileList_(nullptr), stealVolatilePosition_(nullptr),
       stealVolatileCount_(0), stealVolatileHeapKey_(nullptr),
       stealVolatileHeapHandle_(nullptr),
@@ -1164,6 +1188,7 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     stealHeapCount_ = other.stealHeapCount_;
     stealHeapValid_ = other.stealHeapValid_;
     stealHeapBuildCount_ = other.stealHeapBuildCount_;
+    stealIndexRepairCount_ = other.stealIndexRepairCount_;
     stealVolatileCount_ = other.stealVolatileCount_;
     stealVolatileHeapCount_ = other.stealVolatileHeapCount_;
     stealVolatileHeapFrame_ = other.stealVolatileHeapFrame_;
@@ -1294,6 +1319,7 @@ inline void VoiceManager::Reset() {
     stealHeapCount_ = 0;
     stealHeapValid_ = false;
     stealHeapBuildCount_ = 0;
+    stealIndexRepairCount_ = 0;
     stealVolatileCount_ = 0;
     stealVolatileHeapCount_ = 0;
     stealVolatileHeapFrame_ = UINT64_MAX;
@@ -1506,6 +1532,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     grown.lastVoiceLimitEnforceFrame_ = lastVoiceLimitEnforceFrame_;
     grown.stealFadeFrames_ = stealFadeFrames_;
     grown.stealHeapBuildCount_ = stealHeapBuildCount_;
+    grown.stealIndexRepairCount_ = stealIndexRepairCount_;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     grown.groupReuseAttemptCount_ = groupReuseAttemptCount_;
     grown.groupReuseMatchCount_ = groupReuseMatchCount_;
@@ -2849,19 +2876,32 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         const uint64_t rootKey = stealWinnerTree_[1];
         const uint32_t winnerPosition =
             UINT32_MAX - static_cast<uint32_t>(rootKey);
-        assert(rootKey != 0u && winnerPosition < activeCount_);
-        const VoiceHandle winner = static_cast<VoiceHandle>(
-            activeList_[winnerPosition]);
-        assert(stealStableKey_[winner] == rootKey);
-        activePosition = winnerPosition;
-        if (reserveVolatileRoot) {
-            stealCandidateReserved_[winner] = 2u;
+        if (rootKey == 0u || winnerPosition >= activeCount_) {
+            // Steal-index invariant violated: a stale or unlinked key reached
+            // the winner-tree root. Release builds compile the invariant
+            // asserts out, and the direct activeList_[winnerPosition] read
+            // below faults (observed as 0xC0000005 on the audio thread after
+            // CC120/123 kills or a live voice-limit reduction). Rebuild the
+            // index from live pool state and fall through to the general
+            // selection instead. Cheap bounds test only — the full linkage
+            // validation runs on the general path below.
+            stealHeapValid_ = false;
+            ++stealIndexRepairCount_;
+            BuildStealHeap();
         } else {
-            --stealHeapCount_;
-            stealWinnerTree_[stealTreeLeafBase_ + winner] = 0u;
-            RefreshStealWinnerPath(winner);
+            const VoiceHandle winner = static_cast<VoiceHandle>(
+                activeList_[winnerPosition]);
+            assert(stealStableKey_[winner] == rootKey);
+            activePosition = winnerPosition;
+            if (reserveVolatileRoot) {
+                stealCandidateReserved_[winner] = 2u;
+            } else {
+                --stealHeapCount_;
+                stealWinnerTree_[stealTreeLeafBase_ + winner] = 0u;
+                RefreshStealWinnerPath(winner);
+            }
+            return winner;
         }
-        return winner;
     }
 
     // Transient gains change while samples render — not between equal-frame
@@ -2884,25 +2924,50 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         const uint64_t rootKey = stealWinnerTree_[1];
         const uint32_t winnerPosition =
             UINT32_MAX - static_cast<uint32_t>(rootKey);
-        assert(rootKey != 0u && winnerPosition < activeCount_);
-        const VoiceHandle stableWinner = static_cast<VoiceHandle>(
-            activeList_[winnerPosition]);
-        assert(stealStableKey_[stableWinner] == rootKey);
-        bestKey = rootKey;
-        bestHandle = stableWinner;
-        bestPosition = winnerPosition;
-        haveBest = true;
+        if (rootKey == 0u || winnerPosition >= activeCount_ ||
+            activePosition_[activeList_[winnerPosition]] != winnerPosition) {
+            // Same invariant repair as the stable-heap fast path above.
+            // BuildStealHeap resets the volatile heap, so rebuild it here
+            // before the volatile candidate read below.
+            stealHeapValid_ = false;
+            ++stealIndexRepairCount_;
+            BuildStealHeap();
+            if (!stealVolatileHeapValid_) BuildVolatileStealHeap();
+        }
+        if (stealHeapCount_ > 0u) {
+            const uint64_t rootKey = stealWinnerTree_[1];
+            const uint32_t winnerPosition =
+                UINT32_MAX - static_cast<uint32_t>(rootKey);
+            assert(rootKey != 0u && winnerPosition < activeCount_);
+            const VoiceHandle stableWinner = static_cast<VoiceHandle>(
+                activeList_[winnerPosition]);
+            assert(stealStableKey_[stableWinner] == rootKey);
+            bestKey = rootKey;
+            bestHandle = stableWinner;
+            bestPosition = winnerPosition;
+            haveBest = true;
+        }
     }
     if (stealVolatileHeapCount_ > 0u) {
         const uint64_t candidateKey = stealVolatileHeapKey_[0];
         if (!haveBest || candidateKey > bestKey) {
             const uint32_t candidatePosition =
                 UINT32_MAX - static_cast<uint32_t>(candidateKey);
-            bestKey = candidateKey;
-            bestHandle = stealVolatileHeapHandle_[0];
-            bestPosition = candidatePosition;
-            haveBest = true;
-            bestIsVolatile = true;
+            const VoiceHandle candidateHandle =
+                stealVolatileHeapHandle_[0];
+            // Same linkage validation as the stable-tree root: a stale
+            // volatile entry must be dropped, not returned.
+            if (candidateKey != 0u && candidatePosition < activeCount_ &&
+                activePosition_[candidateHandle] == candidatePosition &&
+                activeList_[candidatePosition] == candidateHandle) {
+                bestKey = candidateKey;
+                bestHandle = candidateHandle;
+                bestPosition = candidatePosition;
+                haveBest = true;
+                bestIsVolatile = true;
+            } else {
+                UnlinkVolatileCandidate(candidateHandle);
+            }
         }
     }
     // A valid current-frame heap contains every linked volatile candidate.
@@ -3034,6 +3099,7 @@ inline void VoiceManager::RearmLiveBatchVictims(const VoiceHandle* victims,
 inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
                                               uint32_t activePosition) {
     if (!stealHeapValid_ || handle >= maxVoices_) return;
+    if (!IsLinkedActiveVoice(handle)) return;  // unlinked: not indexable yet
     if (!IsStableStealCandidate(handle)) {
         LinkVolatileCandidate(handle);
         return;
@@ -3056,7 +3122,12 @@ inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
         stealVolatilePosition_[handle] < stealVolatileCount_;
     const bool alive =
         v.state[handle] != static_cast<uint8_t>(VoiceState::Free);
-    const bool wantsStable = alive && IsStableStealCandidate(handle);
+    // A key embeds the active-list position, so only a linked voice may hold
+    // one. An Active-but-unlinked voice (launch-transaction interior, fence
+    // kill, or live voice-limit reduction) must leave the index until it is
+    // linked again; writing its key would encode position UINT32_MAX.
+    const bool linked = IsLinkedActiveVoice(handle);
+    const bool wantsStable = alive && linked && IsStableStealCandidate(handle);
 
     if (wantsStable) {
         if (indexedVolatile) UnlinkVolatileCandidate(handle);
@@ -3079,7 +3150,7 @@ inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
         --stealHeapCount_;
         RefreshStealWinnerPath(handle);
     }
-    if (!alive) {
+    if (!alive || !linked) {
         if (indexedVolatile) UnlinkVolatileCandidate(handle);
         return;
     }
@@ -3113,6 +3184,20 @@ inline bool VoiceManager::IsStableStealCandidate(VoiceHandle handle) const {
     // constant just like sustain. Decay is the only active stage whose
     // effective level changes every rendered frame.
     return v.envelopeStage[handle] != 2u;
+}
+
+// A steal-index key embeds the voice's active-list position, so a key may
+// only exist for a voice that is linked into that list. Writing a key for an
+// unlinked voice (activePosition_ == UINT32_MAX inside a launch transaction,
+// after a fence kill, or during a live voice-limit reduction) encodes
+// position UINT32_MAX, which later reaches PopStealCandidate as a
+// winner-tree root and faults at activeList_[UINT32_MAX] in release builds
+// (the invariant asserts there are compiled out).
+SVMS_VM_FORCEINLINE bool VoiceManager::IsLinkedActiveVoice(
+    VoiceHandle handle) const {
+    return handle < maxVoices_ &&
+        activePosition_[handle] < activeCount_ &&
+        activeList_[activePosition_[handle]] == handle;
 }
 
 inline float VoiceManager::ComputeStableStealKey(VoiceHandle handle) const {
@@ -3681,7 +3766,7 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
         const uint8_t reservation = stealCandidateReserved_[handle];
         stealCandidateReserved_[handle] = 0u;
         if (reservation == 2u) {
-            if (IsStableStealCandidate(handle)) {
+            if (IsStableStealCandidate(handle) && IsLinkedActiveVoice(handle)) {
                 const float score = ComputeStableStealKey(handle);
                 stealStableKey_[handle] = EncodeStableWinnerKey(
                     score, activePosition_[handle]);
@@ -3696,7 +3781,7 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
             return;
         }
         const uint32_t heapPosition = stealVolatileHeapPosition_[handle];
-        if (!IsStableStealCandidate(handle) &&
+        if (!IsStableStealCandidate(handle) && IsLinkedActiveVoice(handle) &&
             heapPosition < stealVolatileHeapCount_ &&
             stealVolatileHeapFrame_ == currentFrame_) {
             stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
@@ -4747,6 +4832,7 @@ inline void VoiceManager::FoldVoiceMixGains(
     }
     if (stealHeapValid_ && stealCandidateDeferred_[i] == 0u &&
         IsStableStealCandidate(static_cast<VoiceHandle>(i)) &&
+        IsLinkedActiveVoice(static_cast<VoiceHandle>(i)) &&
         stealWinnerTree_[stealTreeLeafBase_ + i] ==
             stealStableKey_[i]) {
         const float score = ComputeStableStealKey(
@@ -4838,6 +4924,11 @@ inline void VoiceManager::SilenceChannelImmediate(uint8_t channel) {
         const uint32_t idx = stealTailList_[tailPosition];
         if (v.stealTailFramesRemaining[idx] != 0 &&
             v.stealTailChannel[idx] == channel) {
+            // Whole-voice pre-pass: record the kill frame first — the tail's
+            // fields survive UnlinkStealTail so the block render can emit
+            // its audio up to that exact frame.
+            if (silenceTailHook_)
+                silenceTailHook_(idx, silenceHookUserData_);
             v.stealTailFramesRemaining[idx] = 0;
             UnlinkStealTail(static_cast<VoiceHandle>(idx));
             continue;
@@ -4849,6 +4940,11 @@ inline void VoiceManager::SilenceChannelImmediate(uint8_t channel) {
         assert(idx != kInvalidVoice);
         // Tail ownership is independent from the active slot and was handled
         // by channel identity above.
+        // Whole-voice pre-pass: capture the exact pre-kill state as a ghost
+        // BEFORE the bookkeeping retires the voice (hook is null otherwise).
+        if (silenceVoiceHook_)
+            silenceVoiceHook_(static_cast<VoiceHandle>(idx),
+                              silenceHookUserData_);
         v.stealFadeInFramesRemaining[idx] = 0;
         RetireVoice(static_cast<VoiceHandle>(idx));
     }
