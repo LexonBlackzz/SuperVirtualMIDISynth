@@ -285,6 +285,7 @@ struct Api {
             module = nullptr;
             return false;
         }
+        fn = SVMS_Interface{};  // a refused load must never leave a stale table
         fn.struct_size = sizeof(fn);
         if (getInterface(SVMS_ABI_VERSION_1, sizeof(fn), &fn) !=
                 SVMS_RESULT_OK ||
@@ -345,6 +346,7 @@ struct Api {
             FreeLibrary(module);
             module = nullptr;
         }
+        fn = SVMS_Interface{};  // no stale pointers after unload
     }
 };
 
@@ -1167,8 +1169,10 @@ std::string WideToUtf8(const std::wstring& wide);
 
 bool BringUpEngine(PlayerCore& core, const EngineSpec& spec,
                    uint32_t lookaheadMs, std::string& error) {
+    // The backend flag is only committed after the module is fully up —
+    // a failed bring-up must leave the previous backend in place so the
+    // UI state can never claim an engine that is not loaded.
     if (spec.svms) {
-        core.backend = kBackendSvms;
         if (!core.api.Load(spec.apiPath, error)) return false;
         if (core.api.fn.create_session(nullptr, &core.session) !=
                 SVMS_RESULT_OK ||
@@ -1201,10 +1205,8 @@ bool BringUpEngine(PlayerCore& core, const EngineSpec& spec,
             core.api.Unload();
             return false;
         }
+        core.backend = kBackendSvms;
     } else {
-        core.backend = spec.legacyKind == LegacySink::kKindKdapi
-                           ? kBackendKdapi
-                           : kBackendWinmm;
         if (!core.legacy.Load(spec.legacyKind, spec.legacyPath, error))
             return false;
         if (!core.legacy.Start(error)) {
@@ -1212,6 +1214,9 @@ bool BringUpEngine(PlayerCore& core, const EngineSpec& spec,
             return false;
         }
         core.sampleRate = 48000;  // decoder timebase (wall-clock paced)
+        core.backend = spec.legacyKind == LegacySink::kKindKdapi
+                           ? kBackendKdapi
+                           : kBackendWinmm;
         if (!spec.soundfont.empty()) {
             std::fwprintf(stderr,
                           L"note: --sf2 ignored with the legacy backend — "
@@ -1414,8 +1419,8 @@ void PlaybackEventsTick(PlayerCore& core, bool svmsBackend,
         if (loop) {
             SeekTo(&core, 0);
         } else {
-            if (svmsBackend) core.api.fn.reset(core.session);
-            else core.legacy.FullReset();
+            if (svmsBackend && core.session) core.api.fn.reset(core.session);
+            else if (core.legacy.started) core.legacy.FullReset();
             core.state.store(kStateIdle, std::memory_order_release);
             ui.songEnded = true;
             if (quitAtEnd) ui.running = false;
@@ -1768,15 +1773,14 @@ PlayerGuiHost* PlayerGuiHost::self_ = nullptr;
 // in-window, so the player is launchable with no CLI file argument.
 
 void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
-                uint32_t lookaheadMs, bool engineUpIn, double autoSeconds,
-                bool& loop, bool quitAtEnd, UiShared& ui) {
+                uint32_t lookaheadMs, double autoSeconds, bool& loop,
+                bool quitAtEnd, UiShared& ui) {
     PlayerGuiHost host;
     if (!host.Create(L"SVMS Player", 960, 640)) {
         ui.running = false;
         return;
     }
 
-    bool engineUp = engineUpIn;
     std::vector<svmscan::Entry> library;
     bool libraryScanned = false;
     std::string guiStatus;
@@ -1792,6 +1796,13 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
         const char* stateName = PlayerStateName(core, ui.songEnded);
         const uint32_t state = core.state.load(std::memory_order_relaxed);
         const bool svmsBackend = core.backend == kBackendSvms;
+        // Derived from the live engine state every frame — never a cached
+        // flag — so the UI can never call into an engine that is not loaded.
+        const bool engineUp =
+            core.backend == kBackendSvms
+                ? (core.session != 0 &&
+                   core.api.fn.get_telemetry != nullptr)
+                : core.legacy.started;
         const bool haveSong = engineUp && core.totalFrames > 0;
 
         char versionLabel[96];
@@ -2010,7 +2021,6 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
                                                  switchError)) {
                                     activeSpec = spec;
                                     activePath = entry.path;
-                                    engineUp = true;
                                     ui.songEnded = false;
                                     guiStatus = "loaded " +
                                                 WideToUtf8(entry.filename);
@@ -2373,8 +2383,8 @@ int wmain(int argc, wchar_t** argv) {
     HANDLE stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
 
     if (guiRequested) {
-        RunGuiMode(core, engine, lookaheadMs, engineUp, autoSeconds, loop,
-                   quitAtEnd, ui);
+        RunGuiMode(core, engine, lookaheadMs, autoSeconds, loop, quitAtEnd,
+                   ui);
     } else {
     while (ui.running && !core.quit.load(std::memory_order_relaxed)) {
         // ── Input (30 ms cadence drives the UI framerate too) ──────────
