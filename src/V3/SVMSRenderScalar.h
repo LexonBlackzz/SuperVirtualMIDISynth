@@ -4356,7 +4356,7 @@ inline void RenderScalar::RenderBlockSparseRange(
                 &v, sampleData, sampleDataFrames, outputLeft, outputRight,
                 cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
                 &classChangeCount, voices.activePosition_, retirements_,
-                &retireCount};
+                &retireCount, 0u};
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
             if (coverageProfilingEnabled_ &&
                 renderClass == VoiceRenderClass::SustainedLoop) {

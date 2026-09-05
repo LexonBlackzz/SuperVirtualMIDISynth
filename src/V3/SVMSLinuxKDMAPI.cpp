@@ -849,6 +849,8 @@ SVMS_Result NativeSendTimedShortBatch(SVMS_Session session,
                                       uint32_t eventCount) {
     if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
     if (!events && eventCount) return SVMS_RESULT_INVALID_ARGUMENT;
+    std::atomic<uint64_t>* cancellation = NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
     for (uint32_t i = 0u; i < eventCount; ++i) {
         if (events[i].reserved ||
             events[i].timestamp_domain > SVMS_TIMESTAMP_MONOTONIC_NS ||
