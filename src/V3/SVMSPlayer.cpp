@@ -1218,8 +1218,13 @@ bool SwitchEngine(PlayerCore& core, const EngineSpec& spec,
 }
 
 // Runtime song load: mirrors SeekTo's stop→drain→reset→restart chain, but
-// swaps the file first. Call only from the main/UI thread.
-void LoadSong(PlayerCore& core, const std::wstring& path) {
+// swaps the file first. Call only from the main/UI thread. Refuses when no
+// engine is up (engineless start) — calling fn.reset on a zeroed function
+// table would jump to null.
+bool LoadSong(PlayerCore& core, const std::wstring& path) {
+    if (core.backend == kBackendSvms ? core.session == 0
+                                     : !core.legacy.started)
+        return false;
     core.state.store(kStateSeeking, std::memory_order_release);
     StopDecoder();
     svms::PackedMidiEvent drainEvt{};
@@ -1238,6 +1243,7 @@ void LoadSong(PlayerCore& core, const std::wstring& path) {
     for (auto& channel : core.channels) channel = {};
     StartDecoder(&core, 0);
     StartPlayback(&core);
+    return true;
 }
 
 // ── Shared per-tick playback state (console and GUI loops) ─────────────
@@ -1702,7 +1708,7 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
         const char* stateName = PlayerStateName(core, ui.songEnded);
         const uint32_t state = core.state.load(std::memory_order_relaxed);
         const bool svmsBackend = core.backend == kBackendSvms;
-        const bool haveSong = core.totalFrames > 0;
+        const bool haveSong = engineUp && core.totalFrames > 0;
 
         char versionLabel[96];
         if (svmsBackend) {
@@ -1800,8 +1806,11 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
             else core.legacy.SendVolume(ui.volume);
         }
 
-        // ── Song open (works with no CLI argument too) ──────────────────
-        if (ImGui::Button("Open MIDI...")) {
+        // ── Song open (needs a synth — load one in the library first) ───
+        if (!engineUp) {
+            ImGui::TextDisabled("open a synth in the library panel first, "
+                                "then pick a song");
+        } else if (ImGui::Button("Open MIDI...")) {
             wchar_t midiPath[MAX_PATH] = {};
             OPENFILENAMEW ofn{};
             ofn.lStructSize = sizeof(ofn);
@@ -1822,9 +1831,8 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
                 } else if (!decoder.Scan(mapFile, core.sampleRate, info,
                                          guiStatus)) {
                     // scan error already in guiStatus
-                } else {
+                } else if (LoadSong(core, ofn.lpstrFile)) {
                     core.totalFrames = info.totalFrames;
-                    LoadSong(core, ofn.lpstrFile);
                     ui.songEnded = false;
                     char summary[128];
                     snprintf(summary, sizeof(summary),
@@ -1833,6 +1841,8 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
                              static_cast<double>(info.totalFrames) /
                                  core.sampleRate);
                     guiStatus = summary;
+                } else {
+                    guiStatus = "load failed: no synth is loaded";
                 }
             }
         }
