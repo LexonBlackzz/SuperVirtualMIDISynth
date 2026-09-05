@@ -607,6 +607,41 @@ struct PlayerCore {
     // seeks while the submit thread is parked in a non-playing state).
     std::atomic<uint64_t> lastSubmittedFrame{0};
 
+    // Held-note map for the MIDI-polyphony graph: per (channel, key), the
+    // frame the note was submitted at (0 = not held). Written by the submit
+    // threads under a lock, sampled by the UI once per tick.
+    SRWLOCK noteLock = SRWLOCK_INIT;
+    uint64_t noteStartFrames[16u * 128u] = {};
+
+    void ClearNotes() {
+        AcquireSRWLockExclusive(&noteLock);
+        memset(noteStartFrames, 0, sizeof(noteStartFrames));
+        ReleaseSRWLockExclusive(&noteLock);
+    }
+
+    void NoteOn(uint32_t channel, uint32_t key, uint64_t frame) {
+        AcquireSRWLockExclusive(&noteLock);
+        noteStartFrames[channel * 128u + key] = frame;
+        ReleaseSRWLockExclusive(&noteLock);
+    }
+
+    void NoteOff(uint32_t channel, uint32_t key) {
+        AcquireSRWLockExclusive(&noteLock);
+        noteStartFrames[channel * 128u + key] = 0;
+        ReleaseSRWLockExclusive(&noteLock);
+    }
+
+    // Notes the MIDI holds down at `playhead` (on-frame <= playhead, no
+    // note-off submitted yet).
+    uint32_t MidiPolyphony(uint64_t playhead) {
+        AcquireSRWLockShared(&noteLock);
+        uint32_t count = 0;
+        for (const uint64_t start : noteStartFrames)
+            if (start != 0u && start <= playhead) ++count;
+        ReleaseSRWLockShared(&noteLock);
+        return count;
+    }
+
     void ObserveChannelState(const svms::PackedMidiEvent& event) {
         const uint32_t msg = event.message;
         ChannelReplay& channel = channels[msg & 0x0fu];
@@ -731,6 +766,23 @@ inline bool IsNoteOn(uint32_t message) {
     return (message & 0xF0u) == 0x90u && ((message >> 16) & 0xFFu) != 0u;
 }
 
+// Track the event in the held-note map (MIDI-polyphony graph).
+inline void TrackNote(PlayerCore* core, uint32_t message, uint64_t frame) {
+    const uint32_t channel = message & 0x0Fu;
+    const uint32_t key = (message >> 8) & 0x7Fu;
+    switch (message & 0xF0u) {
+    case 0x90u:
+        if ((message >> 16) & 0xFFu) core->NoteOn(channel, key, frame);
+        else core->NoteOff(channel, key);  // velocity-0 note-off
+        break;
+    case 0x80u:
+        core->NoteOff(channel, key);
+        break;
+    default:
+        break;
+    }
+}
+
 // ── Submit thread: ring -> engine, output-frame stamped ───────────────
 
 // Legacy (KDMAPI / WinMM) submission: immediate sends paced by a QPC
@@ -817,6 +869,8 @@ void LegacySubmitThread(PlayerCore* core) {
         core->ring->Pop(event);
         sink.Send(event.message);
         core->submittedEvents.fetch_add(1u, std::memory_order_relaxed);
+        TrackNote(core, event.message,
+                  static_cast<uint64_t>(event.outputFrame));
         if (IsNoteOn(event.message))
             core->submittedNoteOns.fetch_add(1u, std::memory_order_relaxed);
     }
@@ -891,6 +945,7 @@ void SubmitThread(PlayerCore* core) {
         while (count < kSubmitBatchMax && core->ring->Peek(event) &&
                static_cast<int64_t>(event.outputFrame) <= horizon) {
             core->ring->Pop(event);
+            TrackNote(core, event.message, event.outputFrame);
             SVMS_TimedShortEvent out{};
             out.timestamp = static_cast<uint64_t>(
                 anchor + static_cast<int64_t>(event.outputFrame));
@@ -1143,6 +1198,7 @@ void SeekTo(PlayerCore* core, uint64_t target) {
     if (target > limit) target = limit;
     core->state.store(kStateSeeking, std::memory_order_release);
     StopDecoder();
+    core->ClearNotes();  // held notes re-register from the replay stream
     svms::PackedMidiEvent drain{};
     while (core->ring->Pop(drain)) {
     }
@@ -1332,6 +1388,7 @@ bool LoadSong(PlayerCore& core, const std::wstring& path) {
     core.decoderFailed.store(false, std::memory_order_relaxed);
     core.decoderError.clear();
     for (auto& channel : core.channels) channel = {};
+    core.ClearNotes();
     StartDecoder(&core, 0);
     StartPlayback(&core);
     return true;
@@ -1346,9 +1403,11 @@ struct UiShared {
     float voiceHistory[128] = {};
     float renderHistory[128] = {};
     float npsHistory[128] = {};
+    float polyHistory[128] = {};   // MIDI polyphony (player-side)
     uint32_t historyCount = 0;
     uint32_t historyIndex = 0;
     float currentNps = 0.0f;
+    float currentMidiPoly = 0.0f;
     uint64_t lastNoteOnSnapshot = 0;
     uint64_t lastFeedSnapshot = 0;
     uint64_t feedRatePerSecond = 0;
@@ -1388,6 +1447,9 @@ void SampleTelemetryTick(PlayerCore& core, bool svmsBackend, UiShared& ui) {
         StressConfigTick(core, &ui.stressRng, stressNow, ui.uiFrequency,
                          &ui.lastStressPatch, &ui.lastStressFont);
     }
+    const uint64_t tickPlayhead =
+        core.playhead.load(std::memory_order_relaxed);
+    ui.currentMidiPoly = static_cast<float>(core.MidiPolyphony(tickPlayhead));
     if (svmsBackend) {
         ui.telemetry.struct_size = sizeof(ui.telemetry);
         ui.telemetry.struct_version = SVMS_STRUCT_VERSION_1;
@@ -1397,6 +1459,7 @@ void SampleTelemetryTick(PlayerCore& core, bool svmsBackend, UiShared& ui) {
                 static_cast<float>(ui.telemetry.active_voices);
             ui.renderHistory[ui.historyIndex] = ui.telemetry.render_time_ms;
             ui.npsHistory[ui.historyIndex] = ui.currentNps;
+            ui.polyHistory[ui.historyIndex] = ui.currentMidiPoly;
             ui.historyIndex = (ui.historyIndex + 1u) % 128u;
             if (ui.historyCount < 128u) ++ui.historyCount;
         }
@@ -1411,6 +1474,7 @@ void SampleTelemetryTick(PlayerCore& core, bool svmsBackend, UiShared& ui) {
             static_cast<float>(ui.telemetry.active_voices);
         ui.renderHistory[ui.historyIndex] = 0.0f;
         ui.npsHistory[ui.historyIndex] = ui.currentNps;
+        ui.polyHistory[ui.historyIndex] = ui.currentMidiPoly;
         ui.historyIndex = (ui.historyIndex + 1u) % 128u;
         if (ui.historyCount < 128u) ++ui.historyCount;
     }
@@ -2072,47 +2136,48 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
             }
         }
         // ── Telemetry graphs ────────────────────────────────────────────
-        // Polyphony and NPS share a row (half width each, distinct colors);
-        // render load is shown as a percentage of the engine's frame budget.
-        float voiceMax = 1.0f, renderMax = 1.0f, npsMax = 1.0f;
+        // 2×2 grid: MIDI polyphony (player-side), synth voices, NPS, and
+        // render CPU load (percent of the engine's frame budget).
+        float voiceMax = 1.0f, renderMax = 1.0f, npsMax = 1.0f, polyMax = 1.0f;
         for (uint32_t i = 0; i < ui.historyCount; ++i) {
             if (ui.voiceHistory[i] > voiceMax) voiceMax = ui.voiceHistory[i];
             if (ui.renderHistory[i] > renderMax)
                 renderMax = ui.renderHistory[i];
             if (ui.npsHistory[i] > npsMax) npsMax = ui.npsHistory[i];
+            if (ui.polyHistory[i] > polyMax) polyMax = ui.polyHistory[i];
         }
-        const ImVec4 polyColor(0.35f, 0.75f, 1.0f, 1.0f);
-        const ImVec4 npsColor(0.45f, 1.0f, 0.55f, 1.0f);
+        const ImVec4 polyColor(1.0f, 0.7f, 0.25f, 1.0f);   // amber
+        const ImVec4 voiceColor(0.35f, 0.75f, 1.0f, 1.0f); // blue
+        const ImVec4 npsColor(0.45f, 1.0f, 0.55f, 1.0f);   // green
         const float colGap = 16.0f;
         const float colWidth =
             (ImGui::GetContentRegionAvail().x - colGap) * 0.5f;
 
-        ImGui::TextColored(polyColor, "POLYPHONY");
+        ImGui::TextColored(polyColor, "MIDI POLYPHONY");
         ImGui::SameLine(colWidth + colGap);
-        ImGui::TextColored(npsColor, "NPS — NOTES / SECOND");
+        ImGui::TextColored(voiceColor, "VOICES (synth)");
         ImGui::PushStyleColor(ImGuiCol_PlotLines, polyColor);
-        ImGui::PlotLines("##poly", ui.voiceHistory, 128, ui.historyIndex,
-                         nullptr, 0.0f, voiceMax, ImVec2(colWidth, 62));
+        ImGui::PlotLines("##midipoly", ui.polyHistory, 128, ui.historyIndex,
+                         nullptr, 0.0f, polyMax, ImVec2(colWidth, 58));
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_PlotLines, npsColor);
-        ImGui::PlotLines("##nps", ui.npsHistory, 128, ui.historyIndex,
-                         nullptr, 0.0f, npsMax, ImVec2(-1, 62));
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, voiceColor);
+        ImGui::PlotLines("##voices", ui.voiceHistory, 128, ui.historyIndex,
+                         nullptr, 0.0f, voiceMax, ImVec2(-1, 58));
         ImGui::PopStyleColor();
         ImGui::Spacing();
-        ImGui::TextColored(polyColor, "now %u", ui.telemetry.active_voices);
+        ImGui::TextColored(polyColor, "now %u", ui.currentMidiPoly);
+        ImGui::SameLine();
+        ImGui::TextDisabled("peak %.0f", static_cast<double>(polyMax));
+        ImGui::SameLine(colWidth + colGap);
+        ImGui::TextColored(voiceColor, "now %u", ui.telemetry.active_voices);
         ImGui::SameLine();
         ImGui::TextDisabled("peak %.0f", static_cast<double>(voiceMax));
+
+        ImGui::Spacing();
+
+        ImGui::TextColored(npsColor, "NPS — NOTES / SECOND");
         ImGui::SameLine(colWidth + colGap);
-        ImGui::TextColored(npsColor, "now %.0f",
-                           static_cast<double>(ui.currentNps));
-        ImGui::SameLine();
-        ImGui::TextDisabled("peak %.0f",
-                            static_cast<double>(npsMax));
-
-        ImGui::Spacing();
-        ImGui::Spacing();
-
         // Frame budget: buffer_frames / sample_rate. Render time as a
         // percentage of that budget is the engine's real-time CPU load.
         const float budgetMs = (ui.telemetry.buffer_frames &&
@@ -2127,21 +2192,13 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
             cpuNow < 50.0f ? ImVec4(0.45f, 1.0f, 0.55f, 1.0f)
             : cpuNow < 80.0f ? ImVec4(1.0f, 0.8f, 0.3f, 1.0f)
                              : ImVec4(1.0f, 0.35f, 0.35f, 1.0f);
-        char renderLabel[96];
-        if (svmsBackend && budgetMs > 0.0f) {
-            snprintf(renderLabel, sizeof(renderLabel),
-                     "RENDER — CPU of frame budget   now %.0f%% (%.2f ms)   "
-                     "peak %.0f%%",
-                     static_cast<double>(cpuNow),
-                     ui.telemetry.render_time_ms,
-                     static_cast<double>(cpuPeak));
-        } else {
-            snprintf(renderLabel, sizeof(renderLabel),
-                     "RENDER — engine timing is SVMS telemetry only");
-        }
-        ImGui::TextColored(svmsBackend ? renderColor
-                                       : ImVec4(0.55f, 0.55f, 0.55f, 1.0f),
-                           "%s", renderLabel);
+        ImGui::TextColored(renderColor, "RENDER — CPU of frame budget");
+
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, npsColor);
+        ImGui::PlotLines("##nps", ui.npsHistory, 128, ui.historyIndex,
+                         nullptr, 0.0f, npsMax, ImVec2(colWidth, 58));
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
         if (svmsBackend) {
             // Scale the history to percent so the plot IS the CPU load.
             float cpuHistory[128];
@@ -2151,8 +2208,26 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
             ImGui::PushStyleColor(ImGuiCol_PlotLines, renderColor);
             ImGui::PlotLines("##render", cpuHistory, 128, ui.historyIndex,
                              nullptr, 0.0f, cpuPeak > 0.0f ? cpuPeak : 1.0f,
-                             ImVec2(-1, 62));
+                             ImVec2(-1, 58));
             ImGui::PopStyleColor();
+        } else {
+            ImGui::Dummy(ImVec2(-1, 58));
+        }
+        ImGui::Spacing();
+        ImGui::TextColored(npsColor, "now %.0f",
+                           static_cast<double>(ui.currentNps));
+        ImGui::SameLine();
+        ImGui::TextDisabled("peak %.0f", static_cast<double>(npsMax));
+        ImGui::SameLine(colWidth + colGap);
+        if (svmsBackend) {
+            ImGui::TextColored(renderColor, "now %.0f%% (%.2f ms)",
+                               static_cast<double>(cpuNow),
+                               ui.telemetry.render_time_ms);
+            ImGui::SameLine();
+            ImGui::TextDisabled("peak %.0f%%",
+                                static_cast<double>(cpuPeak));
+        } else {
+            ImGui::TextDisabled("SVMS telemetry only");
         }
         ImGui::Spacing();
 
@@ -2550,12 +2625,13 @@ int wmain(int argc, wchar_t** argv) {
 
         const char* stateName = PlayerStateName(core, ui.songEnded);
 
-        char voiceSpark[512], renderSpark[512], npsSpark[512];
-        float voiceMax = 1.0f, renderMax = 1.0f, npsMax = 1.0f;
+        char voiceSpark[512], renderSpark[512], npsSpark[512], midiSpark[512];
+        float voiceMax = 1.0f, renderMax = 1.0f, npsMax = 1.0f, polyMax = 1.0f;
         for (uint32_t i = 0; i < ui.historyCount; ++i) {
             if (ui.voiceHistory[i] > voiceMax) voiceMax = ui.voiceHistory[i];
             if (ui.renderHistory[i] > renderMax) renderMax = ui.renderHistory[i];
             if (ui.npsHistory[i] > npsMax) npsMax = ui.npsHistory[i];
+            if (ui.polyHistory[i] > polyMax) polyMax = ui.polyHistory[i];
         }
         DrawSpark(voiceSpark, sizeof(voiceSpark), ui.voiceHistory,
                   ui.historyCount, 72u, voiceMax);
@@ -2563,6 +2639,8 @@ int wmain(int argc, wchar_t** argv) {
                   ui.historyCount, 72u, renderMax);
         DrawSpark(npsSpark, sizeof(npsSpark), ui.npsHistory,
                   ui.historyCount, 72u, npsMax);
+        DrawSpark(midiSpark, sizeof(midiSpark), ui.polyHistory,
+                  ui.historyCount, 72u, polyMax);
 
         double progress =
             core.totalFrames
@@ -2591,9 +2669,10 @@ int wmain(int argc, wchar_t** argv) {
             "SVMS Player %s  [%s]  volume %.0f%%  %s\n"
             "--------------------------------------------------------------------------\n"
             "  %s / %s   (%.1f%%)   events %llu   feed %llu evt/s\n"
-            "  poly   %s   now %u  peak %.0f\n"
-            "  nps    %s   now %.0f\n"
-            "  render %s   now %.2f ms (%.0f%% of frame)  peak %.2f ms%s\n"
+            "  midipoly %s  now %u  peak %.0f\n"
+            "  voices   %s  now %u  peak %.0f\n"
+            "  nps      %s  now %.0f\n"
+            "  render   %s  now %.2f ms (%.0f%% of frame)  peak %.2f ms%s\n"
             "  ring %u%%  steals %llu  audio %s  sf2 %s  rate %u\n"
             "  [space] pause  [s] stop  [left/right] seek  [up/down] volume  [l]oop  [q]uit\n",
             versionLabel, stateName, ui.volume * 100.0f,
@@ -2602,6 +2681,7 @@ int wmain(int argc, wchar_t** argv) {
             static_cast<unsigned long long>(core.submittedEvents.load(
                 std::memory_order_relaxed)),
             static_cast<unsigned long long>(ui.feedRatePerSecond),
+            midiSpark, ui.currentMidiPoly, static_cast<double>(polyMax),
             voiceSpark,
             ui.telemetry.active_voices, static_cast<double>(voiceMax),
             npsSpark, static_cast<double>(ui.currentNps),
