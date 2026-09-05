@@ -607,37 +607,48 @@ struct PlayerCore {
     // seeks while the submit thread is parked in a non-playing state).
     std::atomic<uint64_t> lastSubmittedFrame{0};
 
-    // Held-note map for the MIDI-polyphony graph: per (channel, key), the
-    // frame the note was submitted at (0 = not held). Written by the submit
-    // threads under a lock, sampled by the UI once per tick.
+    // Held-note spans for the MIDI-polyphony graph: per (channel, key), the
+    // frame the note was submitted at and the frame its note-off arrives.
+    // Note-offs are submitted LOOKAHEAD-ahead of the playhead, so the off
+    // frame must be kept: polyphony at the playhead is
+    //     on <= playhead < off
+    // (clearing eagerly undercounted every note ending inside the lookahead
+    // window — long-sustained channels only, which looked like "channel 1").
+    struct NoteSpan {
+        uint64_t on;
+        uint64_t off;
+    };
     SRWLOCK noteLock = SRWLOCK_INIT;
-    uint64_t noteStartFrames[16u * 128u] = {};
+    NoteSpan noteSpans[16u * 128u] = {};  // zero = silent (on=0)
 
     void ClearNotes() {
         AcquireSRWLockExclusive(&noteLock);
-        memset(noteStartFrames, 0, sizeof(noteStartFrames));
+        memset(noteSpans, 0, sizeof(noteSpans));
         ReleaseSRWLockExclusive(&noteLock);
     }
 
     void NoteOn(uint32_t channel, uint32_t key, uint64_t frame) {
         AcquireSRWLockExclusive(&noteLock);
-        noteStartFrames[channel * 128u + key] = frame;
+        NoteSpan& span = noteSpans[channel * 128u + key];
+        span.on = frame;
+        span.off = UINT64_MAX;  // until its note-off is submitted
         ReleaseSRWLockExclusive(&noteLock);
     }
 
-    void NoteOff(uint32_t channel, uint32_t key) {
+    void NoteOff(uint32_t channel, uint32_t key, uint64_t frame) {
         AcquireSRWLockExclusive(&noteLock);
-        noteStartFrames[channel * 128u + key] = 0;
+        NoteSpan& span = noteSpans[channel * 128u + key];
+        if (span.on != 0u) span.off = frame;
         ReleaseSRWLockExclusive(&noteLock);
     }
 
-    // Notes the MIDI holds down at `playhead` (on-frame <= playhead, no
-    // note-off submitted yet).
+    // Notes the MIDI holds down at `playhead`.
     uint32_t MidiPolyphony(uint64_t playhead) {
         AcquireSRWLockShared(&noteLock);
         uint32_t count = 0;
-        for (const uint64_t start : noteStartFrames)
-            if (start != 0u && start <= playhead) ++count;
+        for (const NoteSpan& span : noteSpans)
+            if (span.on != 0u && span.on <= playhead && playhead < span.off)
+                ++count;
         ReleaseSRWLockShared(&noteLock);
         return count;
     }
@@ -766,17 +777,17 @@ inline bool IsNoteOn(uint32_t message) {
     return (message & 0xF0u) == 0x90u && ((message >> 16) & 0xFFu) != 0u;
 }
 
-// Track the event in the held-note map (MIDI-polyphony graph).
+// Track the event in the held-note span map (MIDI-polyphony graph).
 inline void TrackNote(PlayerCore* core, uint32_t message, uint64_t frame) {
     const uint32_t channel = message & 0x0Fu;
     const uint32_t key = (message >> 8) & 0x7Fu;
     switch (message & 0xF0u) {
     case 0x90u:
         if ((message >> 16) & 0xFFu) core->NoteOn(channel, key, frame);
-        else core->NoteOff(channel, key);  // velocity-0 note-off
+        else core->NoteOff(channel, key, frame);  // velocity-0 note-off
         break;
     case 0x80u:
-        core->NoteOff(channel, key);
+        core->NoteOff(channel, key, frame);
         break;
     default:
         break;
@@ -1408,7 +1419,9 @@ struct UiShared {
     uint32_t historyIndex = 0;
     float currentNps = 0.0f;
     float currentMidiPoly = 0.0f;
-    uint64_t lastNoteOnSnapshot = 0;
+    uint64_t lastNoteOnSnapshot = 0;   // 0.5 s feed-rate window
+    LARGE_INTEGER lastTickQpc{};       // per-tick NPS (vsync cadence)
+    uint64_t lastTickNoteOns = 0;
     uint64_t lastFeedSnapshot = 0;
     uint64_t feedRatePerSecond = 0;
     LARGE_INTEGER lastFeedQpc{};
@@ -1450,6 +1463,27 @@ void SampleTelemetryTick(PlayerCore& core, bool svmsBackend, UiShared& ui) {
     const uint64_t tickPlayhead =
         core.playhead.load(std::memory_order_relaxed);
     ui.currentMidiPoly = static_cast<float>(core.MidiPolyphony(tickPlayhead));
+
+    // Per-tick NPS: instant rate over the elapsed frame, EMA-smoothed so a
+    // 60 Hz UI shows a live value instead of the old 0.5 s stair-step.
+    LARGE_INTEGER tickNow{};
+    QueryPerformanceCounter(&tickNow);
+    const uint64_t tickNoteOns =
+        core.submittedNoteOns.load(std::memory_order_relaxed);
+    if (ui.lastTickQpc.QuadPart != 0) {
+        const double dt = static_cast<double>(tickNow.QuadPart -
+                                              ui.lastTickQpc.QuadPart) /
+                          static_cast<double>(ui.uiFrequency.QuadPart);
+        if (dt > 0.0) {
+            const double instant =
+                static_cast<double>(tickNoteOns - ui.lastTickNoteOns) / dt;
+            ui.currentNps += static_cast<float>(
+                (instant - static_cast<double>(ui.currentNps)) * 0.18);
+        }
+    }
+    ui.lastTickQpc = tickNow;
+    ui.lastTickNoteOns = tickNoteOns;
+
     if (svmsBackend) {
         ui.telemetry.struct_size = sizeof(ui.telemetry);
         ui.telemetry.struct_version = SVMS_STRUCT_VERSION_1;
@@ -1518,8 +1552,6 @@ void PlaybackEventsTick(PlayerCore& core, bool svmsBackend,
 void FeedRateTick(PlayerCore& core, UiShared& ui) {
     const uint64_t submittedNow =
         core.submittedEvents.load(std::memory_order_relaxed);
-    const uint64_t noteOnsNow =
-        core.submittedNoteOns.load(std::memory_order_relaxed);
     LARGE_INTEGER feedNow{};
     QueryPerformanceCounter(&feedNow);
     if (ui.lastFeedQpc.QuadPart != 0) {
@@ -1531,17 +1563,11 @@ void FeedRateTick(PlayerCore& core, UiShared& ui) {
             ui.feedRatePerSecond = static_cast<uint64_t>(
                 static_cast<double>(submittedNow - ui.lastFeedSnapshot) /
                 elapsed);
-            // NPS window shares the feed-rate cadence; scaled to per-second.
-            ui.currentNps = static_cast<float>(
-                static_cast<double>(noteOnsNow - ui.lastNoteOnSnapshot) /
-                elapsed * 1.0);
             ui.lastFeedSnapshot = submittedNow;
-            ui.lastNoteOnSnapshot = noteOnsNow;
             ui.lastFeedQpc = feedNow;
         }
     } else {
         ui.lastFeedSnapshot = submittedNow;
-        ui.lastNoteOnSnapshot = noteOnsNow;
         ui.lastFeedQpc = feedNow;
     }
 }
