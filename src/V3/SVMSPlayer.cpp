@@ -23,6 +23,7 @@
 // (zero music loss); seek/stop fence the engine via reset() (instant).
 
 #include <windows.h>
+#include <mmsystem.h>
 
 #include <dbghelp.h>
 
@@ -287,6 +288,208 @@ struct Api {
     }
 };
 
+// ── Legacy backends: KDMAPI and WinMM synths ───────────────────────────
+// The player is API-agnostic at the process level: these sinks are resolved
+// with GetProcAddress exactly the way an external client would, so the same
+// player binary can drive SVMSAPI.dll, an SVMS-built OmniMIDI.dll/winmm.dll
+// facade, or a third-party synth exposing those surfaces. KDMAPI and WinMM
+// are immediate-submission APIs: the player owns the clock (QPC-paced
+// scheduling) instead of the engine's output-frame clock.
+
+enum Backend { kBackendSvms = 0, kBackendKdapi = 1, kBackendWinmm = 2 };
+
+struct KdapiProcs {
+    BOOL(__cdecl* available)() = nullptr;
+    BOOL(__cdecl* initStream)() = nullptr;
+    BOOL(__cdecl* termStream)() = nullptr;
+    VOID(__cdecl* resetStream)() = nullptr;
+    MMRESULT(__cdecl* sendDirect)(UINT) = nullptr;
+    DWORD(__cdecl* voiceCount)() = nullptr;
+};
+
+struct WinmmProcs {
+    UINT(WINAPI* numDevs)() = nullptr;
+    MMRESULT(WINAPI* outOpen)(HMIDIOUT*, UINT, DWORD_PTR, DWORD_PTR,
+                              DWORD) = nullptr;
+    MMRESULT(WINAPI* outClose)(HMIDIOUT) = nullptr;
+    MMRESULT(WINAPI* outShortMsg)(HMIDIOUT, DWORD) = nullptr;
+    MMRESULT(WINAPI* outReset)(HMIDIOUT) = nullptr;
+};
+
+struct LegacySink {
+    enum Kind { kKindKdapi, kKindWinmm };
+    Kind kind = kKindKdapi;
+    HMODULE module = nullptr;
+    HMODULE timeModule = nullptr;   // winmm (system or shim) for timers
+    KdapiProcs kd{};
+    WinmmProcs mm{};
+    HMIDIOUT out = nullptr;
+    bool started = false;
+    wchar_t moduleName[MAX_PATH] = {};
+
+    bool Load(Kind kind_, const std::wstring& explicitPath,
+              std::string& error) {
+        kind = kind_;
+        const wchar_t* defaultName =
+            kind == kKindKdapi ? L"OmniMIDI.dll" : L"winmm.dll";
+        if (!explicitPath.empty()) {
+            module = LoadLibraryW(explicitPath.c_str());
+        } else {
+            // Application directory first: a synth winmm.dll/OmniMIDI.dll
+            // placed next to the player shadows the system one — the exact
+            // drop-in scenario being tested.
+            wchar_t self[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, self, MAX_PATH);
+            std::wstring local(self);
+            const size_t slash = local.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) local.resize(slash + 1);
+            local += defaultName;
+            module = LoadLibraryW(local.c_str());
+            if (!module) module = LoadLibraryW(defaultName);
+        }
+        if (!module) {
+            error = "could not load the synth module";
+            return false;
+        }
+        GetModuleFileNameW(module, moduleName, MAX_PATH);
+        if (kind == kKindKdapi) {
+            kd.available = reinterpret_cast<BOOL(__cdecl*)()>(
+                GetProcAddress(module, "IsKDMAPIAvailable"));
+            kd.initStream = reinterpret_cast<BOOL(__cdecl*)()>(
+                GetProcAddress(module, "InitializeKDMAPIStream"));
+            kd.termStream = reinterpret_cast<BOOL(__cdecl*)()>(
+                GetProcAddress(module, "TerminateKDMAPIStream"));
+            kd.resetStream = reinterpret_cast<VOID(__cdecl*)()>(
+                GetProcAddress(module, "ResetKDMAPIStream"));
+            kd.sendDirect = reinterpret_cast<MMRESULT(__cdecl*)(UINT)>(
+                GetProcAddress(module, "SendDirectData"));
+            kd.voiceCount = reinterpret_cast<DWORD(__cdecl*)()>(
+                GetProcAddress(module, "GetVoiceCount"));
+            if (!kd.available || !kd.initStream || !kd.termStream ||
+                !kd.sendDirect) {
+                error = "module has no usable KDMAPI exports";
+                return false;
+            }
+        } else {
+            mm.numDevs = reinterpret_cast<UINT(WINAPI*)()>(
+                GetProcAddress(module, "midiOutGetNumDevs"));
+            mm.outOpen = reinterpret_cast<MMRESULT(WINAPI*)(
+                HMIDIOUT*, UINT, DWORD_PTR, DWORD_PTR, DWORD)>(
+                GetProcAddress(module, "midiOutOpen"));
+            mm.outClose = reinterpret_cast<MMRESULT(WINAPI*)(HMIDIOUT)>(
+                GetProcAddress(module, "midiOutClose"));
+            mm.outShortMsg =
+                reinterpret_cast<MMRESULT(WINAPI*)(HMIDIOUT, DWORD)>(
+                    GetProcAddress(module, "midiOutShortMsg"));
+            mm.outReset = reinterpret_cast<MMRESULT(WINAPI*)(HMIDIOUT)>(
+                GetProcAddress(module, "midiOutReset"));
+            if (!mm.numDevs || !mm.outOpen || !mm.outClose ||
+                !mm.outShortMsg || !mm.outReset) {
+                error = "module has no midiOut* exports";
+                return false;
+            }
+        }
+        // Coarse timers ruin the pacing; ask winmm (system or the loaded
+        // shim — both export it) for 1 ms scheduling granularity.
+        timeModule = LoadLibraryW(L"winmm.dll");
+        if (timeModule) {
+            const auto begin = reinterpret_cast<MMRESULT(WINAPI*)(UINT)>(
+                GetProcAddress(timeModule, "timeBeginPeriod"));
+            if (begin) begin(1u);
+        }
+        return true;
+    }
+
+    bool Start(std::string& error) {
+        if (kind == kKindKdapi) {
+            if (!kd.available()) {
+                error = "the KDMAPI synth reports itself unavailable";
+                return false;
+            }
+            if (!kd.initStream()) {
+                error = "InitializeKDMAPIStream failed";
+                return false;
+            }
+        } else {
+            if (mm.numDevs() == 0u) {
+                error = "the synth exposes no MIDI out devices";
+                return false;
+            }
+            // MIDI_MAPPER: route through the synth's own device mapping.
+            if (mm.outOpen(&out, MIDI_MAPPER, 0, 0, CALLBACK_NULL) !=
+                MMSYSERR_NOERROR) {
+                error = "midiOutOpen failed";
+                return false;
+            }
+        }
+        started = true;
+        return true;
+    }
+
+    void Send(uint32_t message) {
+        if (!started) return;
+        if (kind == kKindKdapi) kd.sendDirect(message);
+        else mm.outShortMsg(out, message);
+    }
+
+    void SendVolume(float volume) {
+        int value = static_cast<int>(volume * 100.0f + 0.5f);
+        if (value < 0) value = 0;
+        if (value > 127) value = 127;
+        for (uint32_t ch = 0; ch < 16u; ++ch)
+            Send(0xB0u | ch | (7u << 8) | (uint32_t(value) << 16));
+    }
+
+    void Silence() {
+        // All notes off + sustain off on every channel: the gentle pause.
+        for (uint32_t ch = 0; ch < 16u; ++ch) {
+            Send(0xB0u | ch | (123u << 8));
+            Send(0xB0u | ch | (64u << 8));
+        }
+    }
+
+    void FullReset() {
+        if (kind == kKindKdapi) {
+            if (kd.resetStream) kd.resetStream();
+            else Silence();
+        } else {
+            mm.outReset(out);
+        }
+    }
+
+    uint32_t VoiceCount() const {
+        return (kind == kKindKdapi && kd.voiceCount) ? kd.voiceCount() : 0u;
+    }
+
+    void Stop() {
+        if (!started) return;
+        if (kind == kKindKdapi) kd.termStream();
+        else {
+            mm.outReset(out);
+            mm.outClose(out);
+            out = nullptr;
+        }
+        started = false;
+        if (timeModule) {
+            const auto end = reinterpret_cast<MMRESULT(WINAPI*)(UINT)>(
+                GetProcAddress(timeModule, "timeEndPeriod"));
+            if (end) end(1u);
+        }
+    }
+
+    void Unload() {
+        Stop();
+        if (module) {
+            FreeLibrary(module);
+            module = nullptr;
+        }
+        if (timeModule) {
+            FreeLibrary(timeModule);
+            timeModule = nullptr;
+        }
+    }
+};
+
 // ── Shared player core ─────────────────────────────────────────────────
 
 struct ChannelReplay {
@@ -303,6 +506,12 @@ struct ChannelReplay {
 
 struct PlayerCore {
     Api api;
+    Backend backend = kBackendSvms;
+    LegacySink legacy;
+    // Legacy (kdapi/winmm) wall-clock scheduling anchor: file frame
+    // `legacyAnchorFrame` maps to QPC tick `legacyAnchorQpc`.
+    std::atomic<int64_t> legacyAnchorQpc{0};
+    std::atomic<int64_t> legacyAnchorFrame{0};
     SVMS_Session session = 0;
     svms::ParsedEventRing* ring = nullptr;  // owned by main
 
@@ -453,7 +662,98 @@ void DecoderThread(DecodeArgs* args) {
 
 // ── Submit thread: ring -> engine, output-frame stamped ───────────────
 
+// Legacy (KDMAPI / WinMM) submission: immediate sends paced by a QPC
+// wall-clock scheduler. The file-frame domain maps linearly onto QPC:
+// due(event) = anchorQpc + (frame - anchorFrame) * freq / sampleRate.
+// Pausing silences the synth immediately (no engine-side lookahead to
+// drain) and re-anchors on resume; held notes are lost — the SVMS path
+// is the exact-timing one, these backends measure the synth, not us.
+void LegacySubmitThread(PlayerCore* core) {
+    LegacySink& sink = core->legacy;
+    svms::PackedMidiEvent event;
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const double freq = static_cast<double>(frequency.QuadPart);
+    const double framesToQpc = freq / static_cast<double>(core->sampleRate);
+    LARGE_INTEGER now{};
+
+    while (!core->quit.load(std::memory_order_relaxed)) {
+        const uint32_t state = core->state.load(std::memory_order_relaxed);
+        if (state == kStatePausing) {
+            sink.Silence();
+            const int64_t playhead =
+                core->playhead.load(std::memory_order_relaxed);
+            core->cursorFrame.store(
+                playhead > 0 ? static_cast<uint64_t>(playhead) : 0u,
+                std::memory_order_relaxed);
+            QueryPerformanceCounter(&now);
+            core->legacyAnchorQpc.store(now.QuadPart,
+                                        std::memory_order_relaxed);
+            core->legacyAnchorFrame.store(
+                playhead - static_cast<int64_t>(core->delayFrames),
+                std::memory_order_relaxed);
+            core->state.store(kStatePaused, std::memory_order_release);
+            continue;
+        }
+        if (state != kStatePlaying) {
+            Sleep(2u);
+            continue;
+        }
+        if (core->reanchor.exchange(false, std::memory_order_acq_rel)) {
+            QueryPerformanceCounter(&now);
+            core->legacyAnchorQpc.store(now.QuadPart,
+                                        std::memory_order_relaxed);
+            core->legacyAnchorFrame.store(
+                static_cast<int64_t>(core->cursorFrame.load(
+                    std::memory_order_relaxed)) -
+                    static_cast<int64_t>(core->delayFrames),
+                std::memory_order_relaxed);
+        }
+
+        const int64_t anchorQpc = core->legacyAnchorQpc.load(
+            std::memory_order_relaxed);
+        const int64_t anchorFrame = core->legacyAnchorFrame.load(
+            std::memory_order_relaxed);
+        QueryPerformanceCounter(&now);
+        const int64_t playhead = anchorFrame + static_cast<int64_t>(
+            static_cast<double>(now.QuadPart - anchorQpc) / framesToQpc);
+        core->playhead.store(playhead, std::memory_order_relaxed);
+
+        if (core->ring->Size() == 0u && core->totalFrames != 0u &&
+            playhead >= static_cast<int64_t>(core->totalFrames)) {
+            core->endOfSong.store(true, std::memory_order_release);
+            Sleep(2u);
+            continue;
+        }
+        if (!core->ring->Peek(event)) {
+            Sleep(1u);
+            continue;
+        }
+
+        const int64_t dueQpc = anchorQpc + static_cast<int64_t>(
+            static_cast<double>(static_cast<int64_t>(event.outputFrame) -
+                                anchorFrame) * framesToQpc);
+        int64_t delta = dueQpc - now.QuadPart;
+        if (delta > static_cast<int64_t>(frequency.QuadPart / 500u)) {
+            Sleep(1u);   // more than 2 ms away
+            continue;
+        }
+        while (delta > 0) {
+            YieldProcessor();
+            QueryPerformanceCounter(&now);
+            delta = dueQpc - now.QuadPart;
+        }
+        core->ring->Pop(event);
+        sink.Send(event.message);
+        core->submittedEvents.fetch_add(1u, std::memory_order_relaxed);
+    }
+}
+
 void SubmitThread(PlayerCore* core) {
+    if (core->backend != kBackendSvms) {
+        LegacySubmitThread(core);
+        return;
+    }
     std::vector<SVMS_TimedShortEvent> batch;
     batch.reserve(kSubmitBatchMax);
     svms::PackedMidiEvent event;
@@ -757,7 +1057,8 @@ void SeekTo(PlayerCore* core, uint64_t target) {
     svms::PackedMidiEvent drain{};
     while (core->ring->Pop(drain)) {
     }
-    core->api.fn.reset(core->session);
+    if (core->backend == kBackendSvms) core->api.fn.reset(core->session);
+    else core->legacy.FullReset();
     core->cursorFrame.store(target, std::memory_order_relaxed);
     core->lastSubmittedFrame.store(target, std::memory_order_relaxed);
     core->endOfSong.store(false, std::memory_order_release);
@@ -772,9 +1073,13 @@ void PrintUsage() {
         "svms_player — console MIDI player for SuperVirtualMIDISynth\n"
         "\n"
         "usage: svms_player [options] <file.mid>\n"
-        "  --sf2 <path>        load this soundfont into the engine\n"
+        "  --backend <name>    svms (default) | kdapi | winmm\n"
+        "  --dll <path>        synth module for the kdapi/winmm backends\n"
+        "                      (default: OmniMIDI.dll / winmm.dll, app dir\n"
+        "                      first — drop a synth DLL next to the player)\n"
+        "  --sf2 <path>        load this soundfont into the engine (svms)\n"
         "  --ring-mb <n>       event ring budget in MB (default 64)\n"
-        "  --lookahead-ms <n>  submit-ahead horizon (default 150)\n"
+        "  --lookahead-ms <n>  submit-ahead horizon (default 150, svms)\n"
         "  --loop              restart when the song ends\n"
         "  --auto <seconds>    quit automatically after N seconds of play\n"
         "  --quit-at-end       exit when the song finishes\n"
@@ -805,6 +1110,8 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring file;
     std::wstring soundfont;
     std::wstring apiPath;
+    std::wstring backendName;
+    std::wstring legacyPath;
     uint32_t ringMegabytes = 64u;
     uint32_t lookaheadMs = 150u;
     double autoSeconds = 0.0;
@@ -823,6 +1130,10 @@ int wmain(int argc, wchar_t** argv) {
             soundfont = next();
         } else if (arg == L"--api" && i + 1 < argc) {
             apiPath = next();
+        } else if (arg == L"--backend" && i + 1 < argc) {
+            backendName = next();
+        } else if (arg == L"--dll" && i + 1 < argc) {
+            legacyPath = next();
         } else if (arg == L"--ring-mb" && i + 1 < argc) {
             ringMegabytes = static_cast<uint32_t>(wcstoul(next().c_str(),
                                                           nullptr, 10));
@@ -862,41 +1173,85 @@ int wmain(int argc, wchar_t** argv) {
     svms::ParsedEventRing ring(ringMegabytes);
     core.ring = &ring;
 
-    std::string error;
-    if (!core.api.Load(apiPath, error)) {
-        std::fprintf(stderr, "error: %s\n", error.c_str());
+    if (backendName.empty() || backendName == L"svms") {
+        core.backend = kBackendSvms;
+    } else if (backendName == L"kdapi") {
+        core.backend = kBackendKdapi;
+    } else if (backendName == L"winmm") {
+        core.backend = kBackendWinmm;
+    } else {
+        std::fwprintf(stderr, L"unknown backend: %ls\n", backendName.c_str());
         return 1;
     }
-
-    if (core.api.fn.create_session(nullptr, &core.session) !=
-            SVMS_RESULT_OK ||
-        core.api.fn.set_ingress_mode(core.session,
-                                     SVMS_INGRESS_LOSSLESS) !=
-            SVMS_RESULT_OK) {
-        std::fprintf(stderr, "error: could not create an SVMS session\n");
-        core.api.Unload();
-        return 1;
-    }
-
-    if (!soundfont.empty()) {
-        const std::string utf8 = WideToUtf8(soundfont);
-        core.soundfontUtf8 = utf8;
-        if (core.api.fn.load_soundfont_utf8(core.session, utf8.c_str()) !=
-            SVMS_RESULT_OK) {
-            std::fprintf(stderr, "warning: soundfont load failed (%ls)\n",
-                         soundfont.c_str());
+    const bool svmsBackend = core.backend == kBackendSvms;
+    // Early-exit cleanup shared by every startup failure below.
+    auto shutdownSink = [&core, svmsBackend]() {
+        if (svmsBackend) {
+            core.api.fn.destroy_session(core.session);
+            core.session = 0;
+            core.api.Unload();
+        } else {
+            core.legacy.Stop();
+            core.legacy.Unload();
         }
-    }
-    core.stressConfig = stressConfig;
+    };
 
-    // The decoder's frame domain is the engine's sample rate.
-    uint64_t deviceNext = 0;
-    if (core.api.fn.get_output_clock(core.session, &deviceNext,
-                                     &core.sampleRate) != SVMS_RESULT_OK) {
-        std::fprintf(stderr, "error: engine clock unavailable\n");
-        core.api.fn.destroy_session(core.session);
-        core.api.Unload();
-        return 1;
+    std::string error;
+    if (svmsBackend) {
+        if (!core.api.Load(apiPath, error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 1;
+        }
+
+        if (core.api.fn.create_session(nullptr, &core.session) !=
+                SVMS_RESULT_OK ||
+            core.api.fn.set_ingress_mode(core.session,
+                                         SVMS_INGRESS_LOSSLESS) !=
+                SVMS_RESULT_OK) {
+            std::fprintf(stderr, "error: could not create an SVMS session\n");
+            shutdownSink();
+            return 1;
+        }
+
+        if (!soundfont.empty()) {
+            const std::string utf8 = WideToUtf8(soundfont);
+            core.soundfontUtf8 = utf8;
+            if (core.api.fn.load_soundfont_utf8(core.session, utf8.c_str()) !=
+                SVMS_RESULT_OK) {
+                std::fprintf(stderr, "warning: soundfont load failed (%ls)\n",
+                             soundfont.c_str());
+            }
+        }
+        core.stressConfig = stressConfig;
+
+        // The decoder's frame domain is the engine's sample rate.
+        uint64_t deviceNext = 0;
+        if (core.api.fn.get_output_clock(core.session, &deviceNext,
+                                         &core.sampleRate) != SVMS_RESULT_OK) {
+            std::fprintf(stderr, "error: engine clock unavailable\n");
+            shutdownSink();
+            return 1;
+        }
+    } else {
+        const LegacySink::Kind kind = core.backend == kBackendKdapi
+                                          ? LegacySink::kKindKdapi
+                                          : LegacySink::kKindWinmm;
+        if (!core.legacy.Load(kind, legacyPath, error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 1;
+        }
+        if (!core.legacy.Start(error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            core.legacy.Unload();
+            return 1;
+        }
+        core.sampleRate = 48000;  // decoder timebase (wall-clock paced)
+        if (!soundfont.empty()) {
+            std::fwprintf(stderr,
+                          L"note: --sf2 ignored with the %ls backend — the "
+                          L"synth loads its own soundfonts\n",
+                          backendName.c_str());
+        }
     }
     core.lookaheadFrames =
         static_cast<uint64_t>(lookaheadMs) * core.sampleRate / 1000u;
@@ -906,8 +1261,7 @@ int wmain(int argc, wchar_t** argv) {
     svms::MappedMidiFile mapFile;
     if (!mapFile.Open(file.c_str(), error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
-        core.api.fn.destroy_session(core.session);
-        core.api.Unload();
+        shutdownSink();
         return 1;
     }
     svms::MidiStreamInfo info;
@@ -916,8 +1270,7 @@ int wmain(int argc, wchar_t** argv) {
     std::fflush(stdout);
     if (!decoder.Scan(mapFile, core.sampleRate, info, error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
-        core.api.fn.destroy_session(core.session);
-        core.api.Unload();
+        shutdownSink();
         return 1;
     }
     core.totalFrames = info.totalFrames;
@@ -926,10 +1279,21 @@ int wmain(int argc, wchar_t** argv) {
     const bool fancy = EnableConsoleFancy();
     if (fancy) std::printf("\x1b[2J\x1b[?25l");
 
-    std::printf("SVMS Player %u.%u.%u (API %u) — %ls\n",
-                core.api.fn.product_major, core.api.fn.product_minor,
-                core.api.fn.product_patch, core.api.fn.abi_version,
-                file.c_str());
+    char versionLabel[96];
+    if (svmsBackend) {
+        snprintf(versionLabel, sizeof(versionLabel), "%u.%u.%u (API %u)",
+                 core.api.fn.product_major, core.api.fn.product_minor,
+                 core.api.fn.product_patch, core.api.fn.abi_version);
+    } else {
+        char moduleAscii[MAX_PATH];
+        WideCharToMultiByte(CP_UTF8, 0, core.legacy.moduleName, -1,
+                            moduleAscii, sizeof(moduleAscii), nullptr,
+                            nullptr);
+        snprintf(versionLabel, sizeof(versionLabel), "%s backend — %.230s",
+                 core.backend == kBackendKdapi ? "KDMAPI" : "WinMM",
+                 moduleAscii);
+    }
+    std::printf("SVMS Player %s — %ls\n", versionLabel, file.c_str());
     std::printf("events %llu  notes %llu  duration %.1f s  peak %llu evt/s  "
                 "dup note-ons %llu\n\n",
                 static_cast<unsigned long long>(info.eventCount),
@@ -953,7 +1317,8 @@ int wmain(int argc, wchar_t** argv) {
     LARGE_INTEGER playingStart{}, uiFrequency{};
     QueryPerformanceFrequency(&uiFrequency);
     bool playingTimerStarted = false;
-    float volume = ReadMasterVolume(core);
+    float volume = 1.0f;
+    if (svmsBackend) volume = ReadMasterVolume(core);
     bool running = true;
     bool songEnded = false;
     SVMS_TelemetryV1 telemetry{};
@@ -1006,11 +1371,13 @@ int wmain(int argc, wchar_t** argv) {
                 break;
             case VK_UP:
                 volume += 0.1f;
-                PatchMasterVolume(core, volume);
+                if (svmsBackend) PatchMasterVolume(core, volume);
+                else core.legacy.SendVolume(volume);
                 break;
             case VK_DOWN:
                 volume -= 0.1f;
-                PatchMasterVolume(core, volume);
+                if (svmsBackend) PatchMasterVolume(core, volume);
+                else core.legacy.SendVolume(volume);
                 break;
             case 'L':
                 loop = !loop;
@@ -1029,19 +1396,32 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         // ── Telemetry sampling ─────────────────────────────────────────
-        if (core.stressConfig) {
+        if (core.stressConfig && svmsBackend) {
             LARGE_INTEGER stressNow{};
             QueryPerformanceCounter(&stressNow);
             StressConfigTick(core, &stressRng, stressNow, uiFrequency,
                              &lastStressPatch, &lastStressFont);
         }
-        telemetry.struct_size = sizeof(telemetry);
-        telemetry.struct_version = SVMS_STRUCT_VERSION_1;
-        if (core.api.fn.get_telemetry(core.session, &telemetry) ==
-            SVMS_RESULT_OK) {
+        if (svmsBackend) {
+            telemetry.struct_size = sizeof(telemetry);
+            telemetry.struct_version = SVMS_STRUCT_VERSION_1;
+            if (core.api.fn.get_telemetry(core.session, &telemetry) ==
+                SVMS_RESULT_OK) {
+                voiceHistory[historyIndex] =
+                    static_cast<float>(telemetry.active_voices);
+                renderHistory[historyIndex] = telemetry.render_time_ms;
+                historyIndex = (historyIndex + 1u) % 128u;
+                if (historyCount < 128u) ++historyCount;
+            }
+        } else {
+            // Legacy synths expose (at most) a voice count; the render-time
+            // graph is SVMS telemetry and stays flat here.
+            telemetry.active_voices = core.legacy.VoiceCount();
+            telemetry.audio_running = 1u;
+            telemetry.sample_rate = core.sampleRate;
             voiceHistory[historyIndex] =
                 static_cast<float>(telemetry.active_voices);
-            renderHistory[historyIndex] = telemetry.render_time_ms;
+            renderHistory[historyIndex] = 0.0f;
             historyIndex = (historyIndex + 1u) % 128u;
             if (historyCount < 128u) ++historyCount;
         }
@@ -1063,7 +1443,8 @@ int wmain(int argc, wchar_t** argv) {
             if (loop) {
                 SeekTo(&core, 0);
             } else {
-                core.api.fn.reset(core.session);
+                if (svmsBackend) core.api.fn.reset(core.session);
+                else core.legacy.FullReset();
                 core.state.store(kStateIdle, std::memory_order_release);
                 songEnded = true;
                 if (quitAtEnd) running = false;
@@ -1147,15 +1528,14 @@ int wmain(int argc, wchar_t** argv) {
 
         std::printf(
             "\x1b[H"
-            "SVMS Player %u.%u.%u  [%s]  volume %.0f%%  %s\n"
+            "SVMS Player %s  [%s]  volume %.0f%%  %s\n"
             "--------------------------------------------------------------------------\n"
             "  %s / %s   (%.1f%%)   events %llu   feed %llu evt/s\n"
             "  voices %s   now %u  peak %.0f\n"
             "  render %s   now %.2f ms  peak %.2f ms\n"
             "  ring %u%%  steals %llu  audio %s  sf2 %s  rate %u\n"
             "  [space] pause  [s] stop  [left/right] seek  [up/down] volume  [l]oop  [q]uit\n",
-            core.api.fn.product_major, core.api.fn.product_minor,
-            core.api.fn.product_patch, stateName, volume * 100.0f,
+            versionLabel, stateName, volume * 100.0f,
             loop ? "loop" : "",
             played, total, progress,
             static_cast<unsigned long long>(submittedNow),
@@ -1178,15 +1558,20 @@ int wmain(int argc, wchar_t** argv) {
     // set_ingress_mode alone never reaches an already-blocked producer.
     core.quit.store(true, std::memory_order_release);
     core.state.store(kStateIdle, std::memory_order_release);
-    core.api.fn.cancel_session_submissions(core.session);
+    if (svmsBackend) core.api.fn.cancel_session_submissions(core.session);
     submit.join();
     StopDecoder();
-    core.api.fn.destroy_session(core.session);
-    core.session = 0;
+    if (svmsBackend) {
+        core.api.fn.destroy_session(core.session);
+        core.session = 0;
+    } else {
+        core.legacy.Stop();
+    }
     if (fancy) std::printf("\x1b[?25h\n");
     // core.ring points at the stack-local `ring` — it dies with the scope.
     core.ring = nullptr;
-    core.api.Unload();
+    if (svmsBackend) core.api.Unload();
+    else core.legacy.Unload();
     return 0;
 }
 
