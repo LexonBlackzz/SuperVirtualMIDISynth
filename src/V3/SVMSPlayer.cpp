@@ -32,6 +32,7 @@
 #include "SVMSPlayerScan.h"
 
 #include <d3d11.h>
+#include <commdlg.h>
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
@@ -1077,6 +1078,168 @@ void SeekTo(PlayerCore* core, uint64_t target) {
     StartPlayback(core);
 }
 
+// ── Engine management (startup, runtime synth switch, song load) ────────
+// The GUI can load a different synth DLL (or a different song) at runtime.
+// BringUpEngine/TearDownEngine mirror the proven startup/shutdown sequence
+// in wmain; SwitchEngine runs the full stop → load → restart chain on the
+// main thread while the submit thread is parked in a non-playing state.
+
+struct EngineSpec {
+    bool svms = true;
+    std::wstring apiPath;      // svms: explicit SVMSAPI.dll path ("" = search)
+    std::wstring legacyPath;   // kdapi/winmm: synth DLL ("" = defaults)
+    LegacySink::Kind legacyKind = LegacySink::kKindKdapi;
+    std::wstring soundfont;    // svms only
+};
+
+// Defined below (Entry section); declared here for BringUpEngine.
+std::string WideToUtf8(const std::wstring& wide);
+
+bool BringUpEngine(PlayerCore& core, const EngineSpec& spec,
+                   uint32_t lookaheadMs, std::string& error) {
+    if (spec.svms) {
+        core.backend = kBackendSvms;
+        if (!core.api.Load(spec.apiPath, error)) return false;
+        if (core.api.fn.create_session(nullptr, &core.session) !=
+                SVMS_RESULT_OK ||
+            core.api.fn.set_ingress_mode(core.session,
+                                         SVMS_INGRESS_LOSSLESS) !=
+                SVMS_RESULT_OK) {
+            error = "could not create an SVMS session";
+            core.api.Unload();
+            return false;
+        }
+        core.soundfontUtf8.clear();
+        if (!spec.soundfont.empty()) {
+            core.soundfontUtf8 = WideToUtf8(spec.soundfont);
+            if (core.api.fn.load_soundfont_utf8(
+                    core.session, core.soundfontUtf8.c_str()) !=
+                SVMS_RESULT_OK) {
+                std::fwprintf(stderr,
+                              L"warning: soundfont load failed (%ls)\n",
+                              spec.soundfont.c_str());
+            }
+        }
+        // The decoder's frame domain is the engine's sample rate.
+        uint64_t deviceNext = 0;
+        if (core.api.fn.get_output_clock(core.session, &deviceNext,
+                                         &core.sampleRate) !=
+            SVMS_RESULT_OK) {
+            error = "engine clock unavailable";
+            core.api.fn.destroy_session(core.session);
+            core.session = 0;
+            core.api.Unload();
+            return false;
+        }
+    } else {
+        core.backend = spec.legacyKind == LegacySink::kKindKdapi
+                           ? kBackendKdapi
+                           : kBackendWinmm;
+        if (!core.legacy.Load(spec.legacyKind, spec.legacyPath, error))
+            return false;
+        if (!core.legacy.Start(error)) {
+            core.legacy.Unload();
+            return false;
+        }
+        core.sampleRate = 48000;  // decoder timebase (wall-clock paced)
+        if (!spec.soundfont.empty()) {
+            std::fwprintf(stderr,
+                          L"note: --sf2 ignored with the legacy backend — "
+                          L"the synth loads its own soundfonts\n");
+        }
+    }
+    core.lookaheadFrames =
+        static_cast<uint64_t>(lookaheadMs) * core.sampleRate / 1000u;
+    core.delayFrames = core.sampleRate / 25u;  // 40 ms start offset
+    return true;
+}
+
+std::thread g_submitThread;
+
+void StartSubmitThread(PlayerCore* core) {
+    core->quit.store(false, std::memory_order_release);
+    g_submitThread = std::thread(core->backend == kBackendSvms
+                                     ? SubmitThread
+                                     : LegacySubmitThread,
+                                 core);
+}
+
+// Stops everything, in the order the shutdown path proved out: quit flag →
+// cancel (wakes a submit parked in a lossless wait; permanently fences the
+// session, which is fine because it is about to be destroyed) → join →
+// decoder join → drain → engine teardown.
+void TearDownEngine(PlayerCore& core) {
+    core.quit.store(true, std::memory_order_release);
+    core.state.store(kStateIdle, std::memory_order_release);
+    if (core.backend == kBackendSvms && core.session)
+        core.api.fn.cancel_session_submissions(core.session);
+    if (g_submitThread.joinable()) g_submitThread.join();
+    StopDecoder();
+    svms::PackedMidiEvent drainEvt{};
+    while (core.ring && core.ring->Pop(drainEvt)) {
+    }
+    if (core.backend == kBackendSvms) {
+        if (core.session) {
+            core.api.fn.destroy_session(core.session);
+            core.session = 0;
+        }
+        core.api.Unload();
+    } else {
+        core.legacy.Stop();
+        core.legacy.Unload();
+    }
+}
+
+// Runtime synth switch: full stop → fresh engine → song restarts from 0.
+bool SwitchEngine(PlayerCore& core, const EngineSpec& spec,
+                  uint32_t lookaheadMs, std::string& error) {
+    core.state.store(kStateSeeking, std::memory_order_release);
+    TearDownEngine(core);
+    core.playhead.store(0, std::memory_order_relaxed);
+    core.cursorFrame.store(0, std::memory_order_relaxed);
+    core.lastSubmittedFrame.store(0, std::memory_order_relaxed);
+    core.submittedEvents.store(0, std::memory_order_relaxed);
+    core.endOfSong.store(false, std::memory_order_release);
+    core.decoderFailed.store(false, std::memory_order_relaxed);
+    core.decoderError.clear();
+    for (auto& channel : core.channels) channel = {};
+    if (!BringUpEngine(core, spec, lookaheadMs, error)) {
+        core.quit.store(false, std::memory_order_release);
+        core.state.store(kStateIdle, std::memory_order_release);
+        return false;
+    }
+    core.state.store(kStateIdle, std::memory_order_release);
+    StartSubmitThread(&core);
+    if (core.totalFrames > 0) {
+        StartDecoder(&core, 0);
+        StartPlayback(&core);
+    }
+    return true;
+}
+
+// Runtime song load: mirrors SeekTo's stop→drain→reset→restart chain, but
+// swaps the file first. Call only from the main/UI thread.
+void LoadSong(PlayerCore& core, const std::wstring& path) {
+    core.state.store(kStateSeeking, std::memory_order_release);
+    StopDecoder();
+    svms::PackedMidiEvent drainEvt{};
+    while (core.ring->Pop(drainEvt)) {
+    }
+    if (core.backend == kBackendSvms) core.api.fn.reset(core.session);
+    else core.legacy.FullReset();
+    core.filePath = path;
+    core.cursorFrame.store(0, std::memory_order_relaxed);
+    core.lastSubmittedFrame.store(0, std::memory_order_relaxed);
+    core.playhead.store(0, std::memory_order_relaxed);
+    core.submittedEvents.store(0, std::memory_order_relaxed);
+    core.endOfSong.store(false, std::memory_order_release);
+    core.decoderFailed.store(false, std::memory_order_relaxed);
+    core.decoderError.clear();
+    for (auto& channel : core.channels) channel = {};
+    StartDecoder(&core, 0);
+    StartPlayback(&core);
+}
+
 // ── Shared per-tick playback state (console and GUI loops) ─────────────
 // One struct + three tick functions drive both front-ends, so the playback
 // state machine (telemetry sampling, auto-quit, end-of-song, feed rate)
@@ -1226,6 +1389,8 @@ void PrintUsage() {
         "  --auto <seconds>    quit automatically after N seconds of play\n"
         "  --quit-at-end       exit when the song finishes\n"
         "  --gui               ImGui window instead of the console UI\n"
+        "                      (may be launched with no MIDI file — pick\n"
+        "                      one, and a synth, inside the window)\n"
         "\n"
         "discovery (no MIDI file needed):\n"
         "  --scan [dir]        classify DLLs in dir (default: the player's\n"
@@ -1391,6 +1556,7 @@ public:
 
     void Close() { running_ = false; }
     bool IsRunning() const { return running_; }
+    HWND Hwnd() const { return hwnd_; }
 
 private:
     bool Fail(const char* what) {
@@ -1506,24 +1672,24 @@ PlayerGuiHost* PlayerGuiHost::self_ = nullptr;
 // ── GUI playback loop ───────────────────────────────────────────────────
 // Same shared ticks as the console loop (SampleTelemetryTick /
 // PlaybackEventsTick / FeedRateTick); only input and rendering differ.
+// The library panel switches synth DLLs at runtime; songs can be opened
+// in-window, so the player is launchable with no CLI file argument.
 
-void RunGuiMode(PlayerCore& core, bool svmsBackend, const char* versionLabel,
-                double autoSeconds, bool& loop, bool quitAtEnd,
-                UiShared& ui) {
+void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
+                uint32_t lookaheadMs, bool engineUpIn, double autoSeconds,
+                bool& loop, bool quitAtEnd, UiShared& ui) {
     PlayerGuiHost host;
-    char title[128];
-    snprintf(title, sizeof(title), "SVMS Player %s", versionLabel);
-    wchar_t titleWide[128] = {};
-    MultiByteToWideChar(CP_UTF8, 0, title, -1, titleWide, 128);
-    if (!host.Create(titleWide, 960, 640)) {
+    if (!host.Create(L"SVMS Player", 960, 640)) {
         ui.running = false;
         return;
     }
 
-    const std::string fileUtf8 = WideToUtf8(core.filePath);
-    const std::string backendLabel = svmsBackend
-        ? std::string("SVMSAPI ") + versionLabel
-        : std::string(versionLabel);
+    bool engineUp = engineUpIn;
+    std::vector<svmscan::Entry> library;
+    bool libraryScanned = false;
+    std::string guiStatus;
+    EngineSpec activeSpec = startupEngine;
+    std::wstring activePath;   // empty = default engine from the CLI
 
     while (ui.running && !core.quit.load(std::memory_order_relaxed) &&
            host.Pump()) {
@@ -1533,6 +1699,32 @@ void RunGuiMode(PlayerCore& core, bool svmsBackend, const char* versionLabel,
             core.playhead.load(std::memory_order_relaxed);
         const char* stateName = PlayerStateName(core, ui.songEnded);
         const uint32_t state = core.state.load(std::memory_order_relaxed);
+        const bool svmsBackend = core.backend == kBackendSvms;
+        const bool haveSong = core.totalFrames > 0;
+
+        char versionLabel[96];
+        if (svmsBackend) {
+            snprintf(versionLabel, sizeof(versionLabel),
+                     "SVMSAPI %u.%u.%u (API %u)",
+                     core.api.fn.product_major, core.api.fn.product_minor,
+                     core.api.fn.product_patch, core.api.fn.abi_version);
+        } else {
+            char moduleAscii[MAX_PATH];
+            WideCharToMultiByte(CP_UTF8, 0, core.legacy.moduleName, -1,
+                                moduleAscii, sizeof(moduleAscii), nullptr,
+                                nullptr);
+            snprintf(versionLabel, sizeof(versionLabel), "%s — %.60s",
+                     core.backend == kBackendKdapi ? "KDMAPI" : "WinMM",
+                     moduleAscii);
+        }
+        if (!engineUp) {
+            snprintf(versionLabel, sizeof(versionLabel),
+                     "<no synth loaded — pick one in the library>");
+        }
+        const std::string backendLabel(versionLabel);
+        const std::string fileUtf8 = WideToUtf8(
+            core.filePath.empty() ? std::wstring(L"<no song loaded>")
+                                  : core.filePath);
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
@@ -1546,7 +1738,8 @@ void RunGuiMode(PlayerCore& core, bool svmsBackend, const char* versionLabel,
         ImGui::TextDisabled("%s", fileUtf8.c_str());
         ImGui::Separator();
 
-        // ── Transport ───────────────────────────────────────────────────
+        // ── Transport (needs a loaded song) ─────────────────────────────
+        if (haveSong) {
         if (ImGui::Button(state == kStatePlaying ? "Pause" : "Play")) {
             if (state == kStatePlaying) {
                 core.state.store(kStatePausing, std::memory_order_release);
@@ -1589,14 +1782,162 @@ void RunGuiMode(PlayerCore& core, bool svmsBackend, const char* versionLabel,
                               seekSlider / 100.0f *
                               static_cast<double>(core.totalFrames)));
         }
+        } else {
+            ImGui::TextDisabled("no song loaded — open a MIDI file below");
+            ImGui::SameLine();
+            if (ImGui::Button("Quit")) ui.running = false;
+        }
 
         // ── Volume ──────────────────────────────────────────────────────
         const float volumeBefore = ui.volume;
-        if (ImGui::SliderFloat("Volume", &ui.volume, 0.0f, 1.0f, "%.0f%%") &&
+        if (engineUp &&
+            ImGui::SliderFloat("Volume", &ui.volume, 0.0f, 1.0f, "%.0f%%") &&
             ImGui::IsItemDeactivatedAfterEdit() &&
             ui.volume != volumeBefore) {
             if (svmsBackend) PatchMasterVolume(core, ui.volume);
             else core.legacy.SendVolume(ui.volume);
+        }
+
+        // ── Song open (works with no CLI argument too) ──────────────────
+        if (ImGui::Button("Open MIDI...")) {
+            wchar_t midiPath[MAX_PATH] = {};
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = host.Hwnd();
+            ofn.lpstrFilter =
+                L"MIDI files (*.mid;*.midi)\0*.mid;*.midi\0"
+                L"All files (*.*)\0*.*\0";
+            ofn.lpstrFile = midiPath;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            if (GetOpenFileNameW(&ofn)) {
+                // Scan first: validates + yields totalFrames for the seek bar.
+                svms::MappedMidiFile mapFile;
+                svms::MidiStreamDecoder decoder;
+                svms::MidiStreamInfo info{};
+                if (!mapFile.Open(ofn.lpstrFile, guiStatus)) {
+                    // guiStatus carries the error text
+                } else if (!decoder.Scan(mapFile, core.sampleRate, info,
+                                         guiStatus)) {
+                    // scan error already in guiStatus
+                } else {
+                    core.totalFrames = info.totalFrames;
+                    LoadSong(core, ofn.lpstrFile);
+                    ui.songEnded = false;
+                    char summary[128];
+                    snprintf(summary, sizeof(summary),
+                             "loaded: %llu events, %.1f s",
+                             static_cast<unsigned long long>(info.eventCount),
+                             static_cast<double>(info.totalFrames) /
+                                 core.sampleRate);
+                    guiStatus = summary;
+                }
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", guiStatus.c_str());
+        // ── Library: synth DLLs next to the player ──────────────────────
+        if (ImGui::CollapsingHeader("Synth library")) {
+            if (!libraryScanned) {
+                if (ImGui::Button("Scan")) {
+                    library = svmscan::ScanDirectory(ExeDirectory());
+                    libraryScanned = true;
+                    guiStatus = library.empty()
+                                    ? std::string("no DLLs found")
+                                    : std::to_string(library.size()) +
+                                          " DLLs found";
+                }
+            } else {
+                if (ImGui::Button("Rescan"))
+                    library = svmscan::ScanDirectory(ExeDirectory());
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "static export scan — nothing loads until you click Load");
+                if (ImGui::BeginTable("synths", 5,
+                                      ImGuiTableFlags_Borders |
+                                          ImGuiTableFlags_RowBg |
+                                          ImGuiTableFlags_Resizable)) {
+                    ImGui::TableSetupColumn("name");
+                    ImGui::TableSetupColumn("file");
+                    ImGui::TableSetupColumn("type");
+                    ImGui::TableSetupColumn("arch");
+                    ImGui::TableSetupColumn("action");
+                    ImGui::TableHeadersRow();
+                    for (const svmscan::Entry& entry : library) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(
+                            WideToUtf8(entry.displayName).c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::TextDisabled("%ls", entry.filename.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(entry.kind.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(entry.arch.c_str());
+                        ImGui::TableNextColumn();
+                        const bool active =
+                            !activePath.empty() &&
+                            _wcsicmp(activePath.c_str(),
+                                     entry.path.c_str()) == 0;
+                        if (active) {
+                            ImGui::TextColored(
+                                ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "<active>");
+                        } else if (!entry.loadable) {
+                            ImGui::TextDisabled("-");
+                        } else {
+                            ImGui::PushID(entry.filename.c_str());
+                            const bool clicked = ImGui::Button("Load");
+                            ImGui::PopID();
+                            if (clicked) {
+                                EngineSpec spec;
+                                if (entry.kind == "svms") {
+                                    spec.svms = true;
+                                    spec.apiPath = entry.path;
+                                } else if (entry.kind == "kdapi") {
+                                    spec.svms = false;
+                                    spec.legacyKind =
+                                        LegacySink::kKindKdapi;
+                                    spec.legacyPath = entry.path;
+                                } else {
+                                    spec.svms = false;
+                                    spec.legacyKind =
+                                        LegacySink::kKindWinmm;
+                                    spec.legacyPath = entry.path;
+                                }
+                                spec.soundfont = activeSpec.soundfont;
+                                const EngineSpec previous = activeSpec;
+                                std::string switchError;
+                                if (SwitchEngine(core, spec, lookaheadMs,
+                                                 switchError)) {
+                                    activeSpec = spec;
+                                    activePath = entry.path;
+                                    engineUp = true;
+                                    ui.songEnded = false;
+                                    guiStatus = "loaded " +
+                                                WideToUtf8(entry.filename);
+                                    if (core.backend == kBackendSvms)
+                                        ui.volume = ReadMasterVolume(core);
+                                    else
+                                        core.legacy.SendVolume(ui.volume);
+                                } else {
+                                    guiStatus = "load failed: " +
+                                                switchError +
+                                                " — restoring previous";
+                                    std::string restoreError;
+                                    if (SwitchEngine(core, previous,
+                                                     lookaheadMs,
+                                                     restoreError))
+                                        guiStatus += " (restored)";
+                                    else
+                                        guiStatus += " (RESTORE FAILED: " +
+                                                     restoreError + ")";
+                                }
+                            }
+                        }
+                    }
+                    ImGui::EndTable();
+                }
+            }
         }
         // ── Telemetry graphs ────────────────────────────────────────────
         float voiceMax = 1.0f, renderMax = 1.0f;
@@ -1639,7 +1980,7 @@ void RunGuiMode(PlayerCore& core, bool svmsBackend, const char* versionLabel,
         // ── Keyboard (mirrors the console keys) ─────────────────────────
         ImGuiIO& io = ImGui::GetIO();
         if (!io.WantTextInput) {
-            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+            if (haveSong && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
                 if (state == kStatePlaying)
                     core.state.store(kStatePausing,
                                      std::memory_order_release);
@@ -1648,23 +1989,23 @@ void RunGuiMode(PlayerCore& core, bool svmsBackend, const char* versionLabel,
                 else if (state == kStateIdle)
                     SeekTo(&core, 0);
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+            if (haveSong && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
                 SeekTo(&core, 0);
                 core.state.store(kStateIdle, std::memory_order_release);
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))
+            if (haveSong && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))
                 SeekTo(&core, static_cast<uint64_t>(
                                   playhead - 5i64 * core.sampleRate));
-            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true))
+            if (haveSong && ImGui::IsKeyPressed(ImGuiKey_RightArrow, true))
                 SeekTo(&core, static_cast<uint64_t>(
                                   playhead + 5i64 * core.sampleRate));
-            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
+            if (engineUp && ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
                 ui.volume += 0.1f;
                 if (ui.volume > 1.0f) ui.volume = 1.0f;
                 if (svmsBackend) PatchMasterVolume(core, ui.volume);
                 else core.legacy.SendVolume(ui.volume);
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
+            if (engineUp && ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
                 ui.volume -= 0.1f;
                 if (ui.volume < 0.0f) ui.volume = 0.0f;
                 if (svmsBackend) PatchMasterVolume(core, ui.volume);
@@ -1679,7 +2020,7 @@ void RunGuiMode(PlayerCore& core, bool svmsBackend, const char* versionLabel,
         ImGui::End();
 
         host.FrameEnd();
-        SampleTelemetryTick(core, svmsBackend, ui);
+        if (engineUp) SampleTelemetryTick(core, svmsBackend, ui);
         PlaybackEventsTick(core, svmsBackend, autoSeconds, loop, quitAtEnd,
                            ui);
         FeedRateTick(core, ui);
@@ -1762,11 +2103,15 @@ int wmain(int argc, wchar_t** argv) {
     if (!probePath.empty()) return RunProbeMode(probePath);
     if (scanRequested) return RunScanMode(scanDir.empty() ? ExeDirectory()
                                                           : scanDir);
-    if (positional.empty()) {
+    if (positional.empty() && !guiRequested) {
         PrintUsage();
         return 1;
     }
-    file = positional.front();
+    if (!positional.empty()) {
+        file = positional.front();
+    } else {
+        file.clear();  // fileless GUI launch: pick a song inside the window
+    }
     if (ringMegabytes < 1u) ringMegabytes = 1u;
 
     PlayerCore core;
@@ -1785,96 +2130,52 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
     const bool svmsBackend = core.backend == kBackendSvms;
-    // Early-exit cleanup shared by every startup failure below.
-    auto shutdownSink = [&core, svmsBackend]() {
-        if (svmsBackend) {
-            core.api.fn.destroy_session(core.session);
-            core.session = 0;
-            core.api.Unload();
-        } else {
-            core.legacy.Stop();
-            core.legacy.Unload();
-        }
-    };
 
+    EngineSpec engine;
+    engine.svms = svmsBackend;
+    engine.apiPath = apiPath;
+    engine.legacyPath = legacyPath;
+    engine.legacyKind = core.backend == kBackendKdapi
+                            ? LegacySink::kKindKdapi
+                            : LegacySink::kKindWinmm;
+    engine.soundfont = soundfont;
+
+    core.stressConfig = stressConfig;
     std::string error;
-    if (svmsBackend) {
-        if (!core.api.Load(apiPath, error)) {
+    bool engineUp = true;
+    if (!BringUpEngine(core, engine, lookaheadMs, error)) {
+        if (!guiRequested) {
             std::fprintf(stderr, "error: %s\n", error.c_str());
             return 1;
         }
-
-        if (core.api.fn.create_session(nullptr, &core.session) !=
-                SVMS_RESULT_OK ||
-            core.api.fn.set_ingress_mode(core.session,
-                                         SVMS_INGRESS_LOSSLESS) !=
-                SVMS_RESULT_OK) {
-            std::fprintf(stderr, "error: could not create an SVMS session\n");
-            shutdownSink();
-            return 1;
-        }
-
-        if (!soundfont.empty()) {
-            const std::string utf8 = WideToUtf8(soundfont);
-            core.soundfontUtf8 = utf8;
-            if (core.api.fn.load_soundfont_utf8(core.session, utf8.c_str()) !=
-                SVMS_RESULT_OK) {
-                std::fprintf(stderr, "warning: soundfont load failed (%ls)\n",
-                             soundfont.c_str());
-            }
-        }
-        core.stressConfig = stressConfig;
-
-        // The decoder's frame domain is the engine's sample rate.
-        uint64_t deviceNext = 0;
-        if (core.api.fn.get_output_clock(core.session, &deviceNext,
-                                         &core.sampleRate) != SVMS_RESULT_OK) {
-            std::fprintf(stderr, "error: engine clock unavailable\n");
-            shutdownSink();
-            return 1;
-        }
-    } else {
-        const LegacySink::Kind kind = core.backend == kBackendKdapi
-                                          ? LegacySink::kKindKdapi
-                                          : LegacySink::kKindWinmm;
-        if (!core.legacy.Load(kind, legacyPath, error)) {
-            std::fprintf(stderr, "error: %s\n", error.c_str());
-            return 1;
-        }
-        if (!core.legacy.Start(error)) {
-            std::fprintf(stderr, "error: %s\n", error.c_str());
-            core.legacy.Unload();
-            return 1;
-        }
-        core.sampleRate = 48000;  // decoder timebase (wall-clock paced)
-        if (!soundfont.empty()) {
-            std::fwprintf(stderr,
-                          L"note: --sf2 ignored with the %ls backend — the "
-                          L"synth loads its own soundfonts\n",
-                          backendName.c_str());
-        }
+        // Engineless GUI start is fine: the library panel brings a synth up.
+        std::fprintf(stderr,
+                     "note: no synth loaded (%s) — pick one in the "
+                     "library panel\n",
+                     error.c_str());
+        engineUp = false;
     }
-    core.lookaheadFrames =
-        static_cast<uint64_t>(lookaheadMs) * core.sampleRate / 1000u;
-    core.delayFrames = core.sampleRate / 25u;  // 40 ms start offset
 
     // Scan first: validates the file and yields duration/peak statistics.
-    svms::MappedMidiFile mapFile;
-    if (!mapFile.Open(file.c_str(), error)) {
-        std::fprintf(stderr, "error: %s\n", error.c_str());
-        shutdownSink();
-        return 1;
+    // A fileless GUI launch skips this — the song is picked inside the window.
+    svms::MidiStreamInfo info{};
+    if (!file.empty()) {
+        svms::MappedMidiFile mapFile;
+        if (!mapFile.Open(file.c_str(), error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            TearDownEngine(core);
+            return 1;
+        }
+        svms::MidiStreamDecoder decoder;
+        std::printf("scanning...\r");
+        std::fflush(stdout);
+        if (!decoder.Scan(mapFile, core.sampleRate, info, error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            TearDownEngine(core);
+            return 1;
+        }
+        core.totalFrames = info.totalFrames;
     }
-    svms::MidiStreamInfo info;
-    svms::MidiStreamDecoder decoder;
-    std::printf("scanning...\r");
-    std::fflush(stdout);
-    if (!decoder.Scan(mapFile, core.sampleRate, info, error)) {
-        std::fprintf(stderr, "error: %s\n", error.c_str());
-        shutdownSink();
-        return 1;
-    }
-    core.totalFrames = info.totalFrames;
 
     // ── Launch threads and enter the console UI loop ────────────────────
     const bool fancy = EnableConsoleFancy();
@@ -1894,7 +2195,10 @@ int wmain(int argc, wchar_t** argv) {
                  core.backend == kBackendKdapi ? "KDMAPI" : "WinMM",
                  moduleAscii);
     }
-    std::printf("SVMS Player %s — %ls\n", versionLabel, file.c_str());
+    std::printf("SVMS Player %s — %ls\n", versionLabel,
+                file.empty() ? L"<no file — pick one in the window>"
+                             : file.c_str());
+    if (!file.empty()) {
     std::printf("events %llu  notes %llu  duration %.1f s  peak %llu evt/s  "
                 "dup note-ons %llu\n\n",
                 static_cast<unsigned long long>(info.eventCount),
@@ -1903,17 +2207,18 @@ int wmain(int argc, wchar_t** argv) {
                 static_cast<unsigned long long>(info.peakEventsPerSecond),
                 static_cast<unsigned long long>(
                     info.exactDuplicateNoteOnCount));
+    }
 
-    StartDecoder(&core, 0);
-    std::thread submit(SubmitThread, &core);
-    if (!idleMode) StartPlayback(&core);
+    if (engineUp && !file.empty()) StartDecoder(&core, 0);
+    if (engineUp) StartSubmitThread(&core);
+    if (engineUp && !idleMode && !file.empty()) StartPlayback(&core);
 
     UiShared ui;
-    if (svmsBackend) ui.volume = ReadMasterVolume(core);
+    if (svmsBackend && core.session) ui.volume = ReadMasterVolume(core);
     HANDLE stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
 
     if (guiRequested) {
-        RunGuiMode(core, svmsBackend, versionLabel, autoSeconds, loop,
+        RunGuiMode(core, engine, lookaheadMs, engineUp, autoSeconds, loop,
                    quitAtEnd, ui);
     } else {
     while (ui.running && !core.quit.load(std::memory_order_relaxed)) {
@@ -2058,22 +2363,10 @@ int wmain(int argc, wchar_t** argv) {
     // parked in a lossless wait can only be woken by
     // cancel_session_submissions (the API's designed shutdown path);
     // set_ingress_mode alone never reaches an already-blocked producer.
-    core.quit.store(true, std::memory_order_release);
-    core.state.store(kStateIdle, std::memory_order_release);
-    if (svmsBackend) core.api.fn.cancel_session_submissions(core.session);
-    submit.join();
-    StopDecoder();
-    if (svmsBackend) {
-        core.api.fn.destroy_session(core.session);
-        core.session = 0;
-    } else {
-        core.legacy.Stop();
-    }
+    TearDownEngine(core);
     if (fancy) std::printf("\x1b[?25h\n");
     // core.ring points at the stack-local `ring` — it dies with the scope.
     core.ring = nullptr;
-    if (svmsBackend) core.api.Unload();
-    else core.legacy.Unload();
     return 0;
 }
 
