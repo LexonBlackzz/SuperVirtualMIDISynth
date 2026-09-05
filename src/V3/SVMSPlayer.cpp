@@ -541,6 +541,9 @@ struct PlayerCore {
     std::atomic<int64_t> playhead{0};       // file-space playhead (submit)
     std::atomic<uint64_t> anchorFrame{0};
     std::atomic<uint64_t> submittedEvents{0};
+    // Player-side note-on count (both submit paths) — drives the NPS graph,
+    // which needs no engine telemetry and works on every backend.
+    std::atomic<uint64_t> submittedNoteOns{0};
     std::atomic<bool> decoderFailed{false};
     std::string decoderError;
     std::string soundfontUtf8;   // set when --sf2 was given (stress reloads)
@@ -672,6 +675,12 @@ void DecoderThread(DecodeArgs* args) {
     delete args;
 }
 
+// Player-side note-on classification for the NPS graph: note-on with a
+// nonzero velocity (0x9n with velocity 0 is the note-off form).
+inline bool IsNoteOn(uint32_t message) {
+    return (message & 0xF0u) == 0x90u && ((message >> 16) & 0xFFu) != 0u;
+}
+
 // ── Submit thread: ring -> engine, output-frame stamped ───────────────
 
 // Legacy (KDMAPI / WinMM) submission: immediate sends paced by a QPC
@@ -758,8 +767,12 @@ void LegacySubmitThread(PlayerCore* core) {
         core->ring->Pop(event);
         sink.Send(event.message);
         core->submittedEvents.fetch_add(1u, std::memory_order_relaxed);
+        if (IsNoteOn(event.message))
+            core->submittedNoteOns.fetch_add(1u, std::memory_order_relaxed);
     }
 }
+
+// (note-on classification helper IsNoteOn lives above LegacySubmitThread)
 
 void SubmitThread(PlayerCore* core) {
     if (core->backend != kBackendSvms) {
@@ -850,6 +863,12 @@ void SubmitThread(PlayerCore* core) {
         const SVMS_Result result = core->api.fn.send_timed_short_batch(
             core->session, batch.data(), count);
         core->submittedEvents.fetch_add(count, std::memory_order_relaxed);
+        uint64_t noteOns = 0;
+        for (uint32_t i = 0; i < count; ++i)
+            if (IsNoteOn(batch[i].packed_message)) ++noteOns;
+        if (noteOns)
+            core->submittedNoteOns.fetch_add(noteOns,
+                                             std::memory_order_relaxed);
         core->lastSubmittedFrame = static_cast<uint64_t>(
             static_cast<int64_t>(batch[count - 1u].timestamp) - anchor);
         batch.clear();
@@ -925,8 +944,11 @@ float ReadMasterVolume(PlayerCore& core) {
 bool PatchMasterVolume(PlayerCore& core, float value) {
     if (value < 0.0f) value = 0.0f;
     if (value > 2.0f) value = 2.0f;
-    char patch[64];
-    snprintf(patch, sizeof(patch), "{\"master_volume\":%.3f}", value);
+    // The key lives at synth.master_volume in the config schema — a
+    // top-level patch is silently ignored by the parser.
+    char patch[80];
+    snprintf(patch, sizeof(patch),
+             "{\"synth\":{\"master_volume\":%.3f}}", value);
     return core.api.fn.patch_config_json(
                core.session, patch,
                static_cast<uint32_t>(strlen(patch))) == SVMS_RESULT_OK;
@@ -1254,8 +1276,11 @@ bool LoadSong(PlayerCore& core, const std::wstring& path) {
 struct UiShared {
     float voiceHistory[128] = {};
     float renderHistory[128] = {};
+    float npsHistory[128] = {};
     uint32_t historyCount = 0;
     uint32_t historyIndex = 0;
+    float currentNps = 0.0f;
+    uint64_t lastNoteOnSnapshot = 0;
     uint64_t lastFeedSnapshot = 0;
     uint64_t feedRatePerSecond = 0;
     LARGE_INTEGER lastFeedQpc{};
@@ -1302,18 +1327,21 @@ void SampleTelemetryTick(PlayerCore& core, bool svmsBackend, UiShared& ui) {
             ui.voiceHistory[ui.historyIndex] =
                 static_cast<float>(ui.telemetry.active_voices);
             ui.renderHistory[ui.historyIndex] = ui.telemetry.render_time_ms;
+            ui.npsHistory[ui.historyIndex] = ui.currentNps;
             ui.historyIndex = (ui.historyIndex + 1u) % 128u;
             if (ui.historyCount < 128u) ++ui.historyCount;
         }
     } else {
         // Legacy synths expose (at most) a voice count; the render-time
-        // graph is SVMS telemetry and stays flat here.
+        // graph is SVMS telemetry and stays flat here. NPS is counted
+        // player-side, so it works on every backend.
         ui.telemetry.active_voices = core.legacy.VoiceCount();
         ui.telemetry.audio_running = 1u;
         ui.telemetry.sample_rate = core.sampleRate;
         ui.voiceHistory[ui.historyIndex] =
             static_cast<float>(ui.telemetry.active_voices);
         ui.renderHistory[ui.historyIndex] = 0.0f;
+        ui.npsHistory[ui.historyIndex] = ui.currentNps;
         ui.historyIndex = (ui.historyIndex + 1u) % 128u;
         if (ui.historyCount < 128u) ++ui.historyCount;
     }
@@ -1357,6 +1385,8 @@ void PlaybackEventsTick(PlayerCore& core, bool svmsBackend,
 void FeedRateTick(PlayerCore& core, UiShared& ui) {
     const uint64_t submittedNow =
         core.submittedEvents.load(std::memory_order_relaxed);
+    const uint64_t noteOnsNow =
+        core.submittedNoteOns.load(std::memory_order_relaxed);
     LARGE_INTEGER feedNow{};
     QueryPerformanceCounter(&feedNow);
     if (ui.lastFeedQpc.QuadPart != 0) {
@@ -1368,11 +1398,17 @@ void FeedRateTick(PlayerCore& core, UiShared& ui) {
             ui.feedRatePerSecond = static_cast<uint64_t>(
                 static_cast<double>(submittedNow - ui.lastFeedSnapshot) /
                 elapsed);
+            // NPS window shares the feed-rate cadence; scaled to per-second.
+            ui.currentNps = static_cast<float>(
+                static_cast<double>(noteOnsNow - ui.lastNoteOnSnapshot) /
+                elapsed * 1.0);
             ui.lastFeedSnapshot = submittedNow;
+            ui.lastNoteOnSnapshot = noteOnsNow;
             ui.lastFeedQpc = feedNow;
         }
     } else {
         ui.lastFeedSnapshot = submittedNow;
+        ui.lastNoteOnSnapshot = noteOnsNow;
         ui.lastFeedQpc = feedNow;
     }
 }
@@ -1797,11 +1833,14 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
         }
 
         // ── Volume ──────────────────────────────────────────────────────
-        const float volumeBefore = ui.volume;
+        // Slider works in 0..100% for display; ui.volume stays 0..1.
+        float volumePercent = ui.volume * 100.0f;
         if (engineUp &&
-            ImGui::SliderFloat("Volume", &ui.volume, 0.0f, 1.0f, "%.0f%%") &&
+            ImGui::SliderFloat("Volume", &volumePercent, 0.0f, 100.0f,
+                               "%.0f%%") &&
             ImGui::IsItemDeactivatedAfterEdit() &&
-            ui.volume != volumeBefore) {
+            volumePercent != ui.volume * 100.0f) {
+            ui.volume = volumePercent / 100.0f;
             if (svmsBackend) PatchMasterVolume(core, ui.volume);
             else core.legacy.SendVolume(ui.volume);
         }
@@ -1952,21 +1991,34 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
             }
         }
         // ── Telemetry graphs ────────────────────────────────────────────
-        float voiceMax = 1.0f, renderMax = 1.0f;
+        float voiceMax = 1.0f, renderMax = 1.0f, npsMax = 1.0f;
         for (uint32_t i = 0; i < ui.historyCount; ++i) {
             if (ui.voiceHistory[i] > voiceMax) voiceMax = ui.voiceHistory[i];
             if (ui.renderHistory[i] > renderMax)
                 renderMax = ui.renderHistory[i];
+            if (ui.npsHistory[i] > npsMax) npsMax = ui.npsHistory[i];
         }
-        char label[64];
-        snprintf(label, sizeof(label), "voices  now %u  peak %.0f",
+        char label[80];
+        snprintf(label, sizeof(label),
+                 "poly — active voices   now %u   peak %.0f",
                  ui.telemetry.active_voices, static_cast<double>(voiceMax));
         ImGui::PlotLines(label, ui.voiceHistory, 128, ui.historyIndex,
-                         nullptr, 0.0f, voiceMax, ImVec2(-1, 70));
-        snprintf(label, sizeof(label), "render  now %.2f ms  peak %.2f ms",
-                 ui.telemetry.render_time_ms, ui.telemetry.render_peak);
-        ImGui::PlotLines(label, ui.renderHistory, 128, ui.historyIndex,
-                         nullptr, 0.0f, renderMax, ImVec2(-1, 70));
+                         nullptr, 0.0f, voiceMax, ImVec2(-1, 64));
+        snprintf(label, sizeof(label),
+                 "nps — notes per second   now %.0f",
+                 static_cast<double>(ui.currentNps));
+        ImGui::PlotLines(label, ui.npsHistory, 128, ui.historyIndex,
+                         nullptr, 0.0f, npsMax, ImVec2(-1, 64));
+        if (svmsBackend) {
+            snprintf(label, sizeof(label),
+                     "render — engine ms/frame   now %.2f   peak %.2f",
+                     ui.telemetry.render_time_ms, ui.telemetry.render_peak);
+            ImGui::PlotLines(label, ui.renderHistory, 128, ui.historyIndex,
+                             nullptr, 0.0f, renderMax, ImVec2(-1, 64));
+        } else {
+            ImGui::TextDisabled(
+                "render graph: engine timing is SVMS telemetry only");
+        }
 
         ImGui::Separator();
         const uint64_t ringCapacity = core.ring->Capacity();
@@ -2318,16 +2370,19 @@ int wmain(int argc, wchar_t** argv) {
 
         const char* stateName = PlayerStateName(core, ui.songEnded);
 
-        char voiceSpark[512], renderSpark[512];
-        float voiceMax = 1.0f, renderMax = 1.0f;
+        char voiceSpark[512], renderSpark[512], npsSpark[512];
+        float voiceMax = 1.0f, renderMax = 1.0f, npsMax = 1.0f;
         for (uint32_t i = 0; i < ui.historyCount; ++i) {
             if (ui.voiceHistory[i] > voiceMax) voiceMax = ui.voiceHistory[i];
             if (ui.renderHistory[i] > renderMax) renderMax = ui.renderHistory[i];
+            if (ui.npsHistory[i] > npsMax) npsMax = ui.npsHistory[i];
         }
         DrawSpark(voiceSpark, sizeof(voiceSpark), ui.voiceHistory,
                   ui.historyCount, 72u, voiceMax);
         DrawSpark(renderSpark, sizeof(renderSpark), ui.renderHistory,
                   ui.historyCount, 72u, renderMax);
+        DrawSpark(npsSpark, sizeof(npsSpark), ui.npsHistory,
+                  ui.historyCount, 72u, npsMax);
 
         double progress =
             core.totalFrames
@@ -2347,8 +2402,9 @@ int wmain(int argc, wchar_t** argv) {
             "SVMS Player %s  [%s]  volume %.0f%%  %s\n"
             "--------------------------------------------------------------------------\n"
             "  %s / %s   (%.1f%%)   events %llu   feed %llu evt/s\n"
-            "  voices %s   now %u  peak %.0f\n"
-            "  render %s   now %.2f ms  peak %.2f ms\n"
+            "  poly   %s   now %u  peak %.0f\n"
+            "  nps    %s   now %.0f\n"
+            "  render %s   now %.2f ms  peak %.2f ms%s\n"
             "  ring %u%%  steals %llu  audio %s  sf2 %s  rate %u\n"
             "  [space] pause  [s] stop  [left/right] seek  [up/down] volume  [l]oop  [q]uit\n",
             versionLabel, stateName, ui.volume * 100.0f,
@@ -2359,7 +2415,9 @@ int wmain(int argc, wchar_t** argv) {
             static_cast<unsigned long long>(ui.feedRatePerSecond),
             voiceSpark,
             ui.telemetry.active_voices, static_cast<double>(voiceMax),
+            npsSpark, static_cast<double>(ui.currentNps),
             renderSpark, ui.telemetry.render_time_ms, ui.telemetry.render_peak,
+            svmsBackend ? "" : "   (SVMS telemetry only)",
             ringPercent,
             static_cast<unsigned long long>(ui.telemetry.voice_steals),
             ui.telemetry.audio_running ? "running" : "NOT RUNNING",
