@@ -4463,6 +4463,15 @@ struct WholeVoiceCCContext {
     const svms::RuntimeConfigSnapshot* config = nullptr;
     uint32_t playIndex = 12000u;
     uint32_t launches = 0u;
+    // SysEx master state, mirroring the driver's sysex terms.
+    float masterFineTune = 0.0f;
+    float masterTranspose = 0.0f;
+    float channelBendRatio[svms::kChannelCount] = {};
+    void ResetMasterState() {
+        masterFineTune = 0.0f;
+        masterTranspose = 0.0f;
+        for (float& ratio : channelBendRatio) ratio = 1.0f;
+    }
 };
 
 // Mirrors the production dispatch semantics (Driver::HandleControlChange and
@@ -4477,15 +4486,16 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
     for (uint32_t index = 0u; index < eventCount; ++index) {
         const svms::RenderEvent& event = events[index];
         const uint8_t channel = event.channel;
-        // Mirrors Driver::HandlePitchBend for the test's zero-master terms:
-        // channel wheel state, then the channel-wide ratio op (or inline
-        // rewrite on the oracle side — identical math either way).
+        // Mirrors Driver::HandlePitchBend: the sysex master terms ride on
+        // top of the channel wheel.
         const auto applyBend = [&context, channel](uint16_t wheel) {
             context.channels->PitchBend(
                 channel, static_cast<int16_t>(wheel));
             const float bendSemitones =
-                context.channels->GetPitchBendSemitones(channel);
+                context.channels->GetPitchBendSemitones(channel) +
+                context.masterFineTune + context.masterTranspose;
             const float commonRatio = std::pow(2.0f, bendSemitones / 12.0f);
+            context.channelBendRatio[channel] = commonRatio;
             context.channels->SetBendRatio(channel, commonRatio);
             context.voices->ApplyChannelBendRatio(channel, bendSemitones);
         };
@@ -4622,6 +4632,58 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
                         break;
                 }
                 break;
+            case svms::RenderEventType::ProgramChange:
+                // No soundfont stack in the harness: the driver handler
+                // early-outs before touching any state, so this is a
+                // dispatch-only event here (still exercises the whitelisting
+                // and the ingress ordering against same-frame launches).
+                break;
+            case svms::RenderEventType::RhythmPart:
+                if (channel < svms::kChannelCount)
+                    context.channels->SetRhythmPart(channel, event.data1);
+                break;
+            case svms::RenderEventType::MasterVolume: {
+                // Mirrors Driver::DispatchRenderEvent's MasterVolume handler:
+                // cache-wide rebuild, then a mix mark per channel.
+                const uint16_t value = static_cast<uint16_t>(
+                    event.data1 | (static_cast<uint16_t>(event.data2) << 7u));
+                const float effective = context.config->masterVolume *
+                    (static_cast<float>(value) / 16383.0f);
+                context.channels->SetMasterVolume(effective);
+                context.channels->RebuildCache(*context.config, 44100.0f);
+                for (uint8_t ch = 0; ch < svms::kChannelCount; ++ch) {
+                    context.voices->MarkChannelMixStale(
+                        ch, context.channels->GetParams()[ch]);
+                    context.channels->SetBendRatio(
+                        ch, context.channelBendRatio[ch]);
+                }
+                break;
+            }
+            case svms::RenderEventType::MasterFineTune:
+            case svms::RenderEventType::MasterTranspose:
+                // Mirrors Driver::RefreshAllPitchIncrements (minus the
+                // launch-revision bookkeeping the harness does not model).
+                if (event.type == svms::RenderEventType::MasterFineTune) {
+                    const uint16_t value = static_cast<uint16_t>(
+                        event.data1 |
+                        (static_cast<uint16_t>(event.data2) << 7u));
+                    context.masterFineTune = static_cast<float>(
+                        static_cast<int32_t>(value) - 8192) / 8192.0f;
+                } else {
+                    context.masterTranspose = static_cast<float>(
+                        static_cast<int32_t>(event.data1) - 64);
+                }
+                for (uint8_t ch = 0; ch < svms::kChannelCount; ++ch) {
+                    const float semitones =
+                        context.channels->GetPitchBendSemitones(ch) +
+                        context.masterFineTune + context.masterTranspose;
+                    const float commonRatio =
+                        std::pow(2.0f, semitones / 12.0f);
+                    context.channelBendRatio[ch] = commonRatio;
+                    context.channels->SetBendRatio(ch, commonRatio);
+                    context.voices->ApplyChannelBendRatio(ch, semitones);
+                }
+                break;
             case svms::RenderEventType::PitchBend:
                 applyBend(static_cast<uint16_t>((event.data2 << 7) |
                                                 event.data1));
@@ -4691,6 +4753,8 @@ void TestWholeVoiceCCDifferential() {
                                           oracleChannels.GetParams(), &cfg};
         WholeVoiceCCContext wholeContext{wholeVoices.get(), &wholeChannels,
                                          wholeChannels.GetParams(), &cfg};
+        oracleContext.ResetMasterState();
+        wholeContext.ResetMasterState();
         oracle.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent,
                                        &oracleContext);
         whole.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent,
@@ -4741,20 +4805,43 @@ void TestWholeVoiceCCDifferential() {
                     event.data1 = kMixControllers[rng.Next() % 3u];
                     event.data2 = static_cast<uint8_t>(rng.Next() % 128u);
                 } else {
-                    // Row-mutator variety: pitch bend, reset-all, RPN data.
-                    const uint32_t pick = rng.Next() % 4u;
+                    // Row-mutator variety: pitch bend, reset-all, RPN data,
+                    // SysEx master events, program/rhythm launch-time state.
+                    const uint32_t pick = rng.Next() % 9u;
                     if (pick == 0u) {
                         event.type = svms::RenderEventType::PitchBend;
                         event.data1 =
                             static_cast<uint8_t>(rng.Next() % 128u);
                         event.data2 =
                             static_cast<uint8_t>(rng.Next() % 128u);
-                    } else {
+                    } else if (pick <= 3u) {
                         static const uint8_t kRowControllers[3] = {
                             121u, 6u, 38u};
                         event.type = svms::RenderEventType::ControlChange;
                         event.data1 = kRowControllers[pick - 1u];
                         event.data2 = static_cast<uint8_t>(rng.Next() % 128u);
+                    } else if (pick == 4u) {
+                        event.type = svms::RenderEventType::MasterVolume;
+                        const uint32_t value = rng.Next() % 16384u;
+                        event.data1 = static_cast<uint8_t>(value & 0x7Fu);
+                        event.data2 = static_cast<uint8_t>(value >> 7u);
+                    } else if (pick == 5u) {
+                        event.type = svms::RenderEventType::MasterFineTune;
+                        const uint32_t value = rng.Next() % 16384u;
+                        event.data1 = static_cast<uint8_t>(value & 0x7Fu);
+                        event.data2 = static_cast<uint8_t>(value >> 7u);
+                    } else if (pick == 6u) {
+                        event.type = svms::RenderEventType::MasterTranspose;
+                        event.data1 =
+                            static_cast<uint8_t>(rng.Next() % 128u);
+                    } else if (pick == 7u) {
+                        event.type = svms::RenderEventType::ProgramChange;
+                        event.data1 =
+                            static_cast<uint8_t>(rng.Next() % 128u);
+                    } else {
+                        event.type = svms::RenderEventType::RhythmPart;
+                        event.data1 =
+                            static_cast<uint8_t>(rng.Next() % 2u);
                     }
                 }
                 events.push_back(event);

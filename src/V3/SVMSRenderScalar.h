@@ -3569,6 +3569,28 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
                 ++rowOpEstimate;
                 hasEvents = true;
                 break;
+            case RenderEventType::ProgramChange:
+            case RenderEventType::RhythmPart:
+                // Launch-time state only: preset/kit selection is captured at
+                // configure time and sounding voices are untouched (the same
+                // category as bank select above).
+                hasEvents = true;
+                break;
+            case RenderEventType::MasterVolume:
+                // SysEx master volume: the driver marks every channel's mix
+                // gains stale, which the pre-pass hooks turn into one
+                // mix-gain op per channel.
+                rowOpEstimate += kChannelCount;
+                hasEvents = true;
+                break;
+            case RenderEventType::MasterFineTune:
+            case RenderEventType::MasterTranspose:
+                // SysEx master tune/transpose: RefreshAllPitchIncrements
+                // rewrites every channel's phaseIncs, which the pre-pass
+                // hooks turn into one bend op per channel.
+                rowOpEstimate += kChannelCount;
+                hasEvents = true;
+                break;
             default:
                 return false;
         }
