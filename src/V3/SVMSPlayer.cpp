@@ -31,6 +31,16 @@
 #include "include/svmsapi.h"
 #include "SVMSPlayerScan.h"
 
+#include <d3d11.h>
+#include "imgui.h"
+#include "backends/imgui_impl_win32.h"
+#include "backends/imgui_impl_dx11.h"
+
+// Defined in imgui_impl_win32.cpp — must stay at global scope so the player's
+// WndProc references the same symbol the backend defines.
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+    HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -1067,6 +1077,137 @@ void SeekTo(PlayerCore* core, uint64_t target) {
     StartPlayback(core);
 }
 
+// ── Shared per-tick playback state (console and GUI loops) ─────────────
+// One struct + three tick functions drive both front-ends, so the playback
+// state machine (telemetry sampling, auto-quit, end-of-song, feed rate)
+// cannot drift between them.
+
+struct UiShared {
+    float voiceHistory[128] = {};
+    float renderHistory[128] = {};
+    uint32_t historyCount = 0;
+    uint32_t historyIndex = 0;
+    uint64_t lastFeedSnapshot = 0;
+    uint64_t feedRatePerSecond = 0;
+    LARGE_INTEGER lastFeedQpc{};
+    LARGE_INTEGER playingStart{};
+    LARGE_INTEGER uiFrequency{};
+    bool playingTimerStarted = false;
+    float volume = 1.0f;
+    bool running = true;
+    bool songEnded = false;
+    SVMS_TelemetryV1 telemetry{};
+    uint64_t stressRng = GetTickCount64() | 1u;
+    LARGE_INTEGER lastStressPatch{}, lastStressFont{};
+
+    UiShared() { QueryPerformanceFrequency(&uiFrequency); }
+};
+
+const char* PlayerStateName(const PlayerCore& core, bool songEnded) {
+    const char* stateName = "stopped";
+    switch (core.state.load(std::memory_order_relaxed)) {
+    case kStatePlaying: stateName = "PLAYING"; break;
+    case kStatePausing: stateName = "pausing"; break;
+    case kStatePaused:  stateName = "PAUSED"; break;
+    case kStateSeeking: stateName = "seeking"; break;
+    default: break;
+    }
+    if (songEnded &&
+        core.state.load(std::memory_order_relaxed) == kStateIdle)
+        stateName = "ENDED";
+    return stateName;
+}
+
+void SampleTelemetryTick(PlayerCore& core, bool svmsBackend, UiShared& ui) {
+    if (core.stressConfig && svmsBackend) {
+        LARGE_INTEGER stressNow{};
+        QueryPerformanceCounter(&stressNow);
+        StressConfigTick(core, &ui.stressRng, stressNow, ui.uiFrequency,
+                         &ui.lastStressPatch, &ui.lastStressFont);
+    }
+    if (svmsBackend) {
+        ui.telemetry.struct_size = sizeof(ui.telemetry);
+        ui.telemetry.struct_version = SVMS_STRUCT_VERSION_1;
+        if (core.api.fn.get_telemetry(core.session, &ui.telemetry) ==
+            SVMS_RESULT_OK) {
+            ui.voiceHistory[ui.historyIndex] =
+                static_cast<float>(ui.telemetry.active_voices);
+            ui.renderHistory[ui.historyIndex] = ui.telemetry.render_time_ms;
+            ui.historyIndex = (ui.historyIndex + 1u) % 128u;
+            if (ui.historyCount < 128u) ++ui.historyCount;
+        }
+    } else {
+        // Legacy synths expose (at most) a voice count; the render-time
+        // graph is SVMS telemetry and stays flat here.
+        ui.telemetry.active_voices = core.legacy.VoiceCount();
+        ui.telemetry.audio_running = 1u;
+        ui.telemetry.sample_rate = core.sampleRate;
+        ui.voiceHistory[ui.historyIndex] =
+            static_cast<float>(ui.telemetry.active_voices);
+        ui.renderHistory[ui.historyIndex] = 0.0f;
+        ui.historyIndex = (ui.historyIndex + 1u) % 128u;
+        if (ui.historyCount < 128u) ++ui.historyCount;
+    }
+}
+
+void PlaybackEventsTick(PlayerCore& core, bool svmsBackend,
+                        double autoSeconds, bool loop, bool quitAtEnd,
+                        UiShared& ui) {
+    if (!ui.playingTimerStarted && autoSeconds > 0.0) {
+        ui.playingTimerStarted = true;
+        QueryPerformanceCounter(&ui.playingStart);
+    }
+    if (ui.playingTimerStarted && autoSeconds > 0.0) {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        if (static_cast<double>(now.QuadPart - ui.playingStart.QuadPart) /
+                static_cast<double>(ui.uiFrequency.QuadPart) >=
+            autoSeconds)
+            ui.running = false;
+    }
+    if (core.endOfSong.exchange(false, std::memory_order_acq_rel)) {
+        if (loop) {
+            SeekTo(&core, 0);
+        } else {
+            if (svmsBackend) core.api.fn.reset(core.session);
+            else core.legacy.FullReset();
+            core.state.store(kStateIdle, std::memory_order_release);
+            ui.songEnded = true;
+            if (quitAtEnd) ui.running = false;
+        }
+    }
+    if (core.decoderFailed.load(std::memory_order_relaxed)) {
+        std::fprintf(stderr, "\ndecoder error: %s\n",
+                     core.decoderError.c_str());
+        ui.running = false;
+    }
+    if (core.state.load(std::memory_order_relaxed) == kStatePlaying)
+        ui.songEnded = false;
+}
+
+void FeedRateTick(PlayerCore& core, UiShared& ui) {
+    const uint64_t submittedNow =
+        core.submittedEvents.load(std::memory_order_relaxed);
+    LARGE_INTEGER feedNow{};
+    QueryPerformanceCounter(&feedNow);
+    if (ui.lastFeedQpc.QuadPart != 0) {
+        const double elapsed =
+            static_cast<double>(feedNow.QuadPart -
+                                ui.lastFeedQpc.QuadPart) /
+            static_cast<double>(ui.uiFrequency.QuadPart);
+        if (elapsed >= 0.5) {
+            ui.feedRatePerSecond = static_cast<uint64_t>(
+                static_cast<double>(submittedNow - ui.lastFeedSnapshot) /
+                elapsed);
+            ui.lastFeedSnapshot = submittedNow;
+            ui.lastFeedQpc = feedNow;
+        }
+    } else {
+        ui.lastFeedSnapshot = submittedNow;
+        ui.lastFeedQpc = feedNow;
+    }
+}
+
 // ── Entry ──────────────────────────────────────────────────────────────
 
 void PrintUsage() {
@@ -1084,6 +1225,7 @@ void PrintUsage() {
         "  --loop              restart when the song ends\n"
         "  --auto <seconds>    quit automatically after N seconds of play\n"
         "  --quit-at-end       exit when the song finishes\n"
+        "  --gui               ImGui window instead of the console UI\n"
         "\n"
         "discovery (no MIDI file needed):\n"
         "  --scan [dir]        classify DLLs in dir (default: the player's\n"
@@ -1177,6 +1319,374 @@ int RunProbeMode(const std::wstring& dllPath) {
     return r.ok ? 0 : 1;
 }
 
+// ── GUI host (Win32 + DX11 + ImGui) ─────────────────────────────────────
+// Same proven bootstrap the configurator uses: Win32 window -> D3D11 device
+// + swap chain (WARP fallback) -> ImGui with the win32/dx11 backends.
+
+class PlayerGuiHost {
+public:
+    bool Create(const wchar_t* title, int width, int height) {
+        self_ = this;
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = WndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
+        wc.lpszClassName = L"SVMSPlayerGui";
+        RegisterClassExW(&wc);
+
+        RECT rc{0, 0, width, height};
+        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+        hwnd_ = CreateWindowExW(
+            0, wc.lpszClassName, title, WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left,
+            rc.bottom - rc.top, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!hwnd_) return Fail("CreateWindowExW failed");
+
+        if (!CreateD3D()) { Destroy(); return false; }
+        if (!CreateImGui()) { Destroy(); return false; }
+        ShowWindow(hwnd_, SW_SHOWDEFAULT);
+        UpdateWindow(hwnd_);
+        return true;
+    }
+
+    void Destroy() {
+        DestroyImGui();
+        DestroyD3D();
+        if (hwnd_) {
+            DestroyWindow(hwnd_);
+            hwnd_ = nullptr;
+        }
+        if (self_ == this) self_ = nullptr;
+        UnregisterClassW(L"SVMSPlayerGui", GetModuleHandleW(nullptr));
+    }
+
+    bool Pump() {
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if (msg.message == WM_QUIT) running_ = false;
+        }
+        return running_;
+    }
+
+    void FrameBegin() {
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+    }
+
+    void FrameEnd() {
+        ImGui::Render();
+        if (target_) {
+            context_->OMSetRenderTargets(1, &target_, nullptr);
+            const float clear[4] = {0.06f, 0.06f, 0.08f, 1.0f};
+            context_->ClearRenderTargetView(target_, clear);
+        }
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        if (swapChain_) swapChain_->Present(1, 0);
+    }
+
+    void Close() { running_ = false; }
+    bool IsRunning() const { return running_; }
+
+private:
+    bool Fail(const char* what) {
+        std::fprintf(stderr, "error: %s (GetLastError=%lu)\n", what,
+                     static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam,
+                                    LPARAM lParam) {
+        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+            return true;
+        switch (msg) {
+        case WM_SIZE:
+            if (self_ && wParam != SIZE_MINIMIZED)
+                self_->Resize(LOWORD(lParam), HIWORD(lParam));
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+        default:
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
+        }
+    }
+
+    bool CreateD3D() {
+        DXGI_SWAP_CHAIN_DESC sd{};
+        sd.BufferCount = 2;
+        sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.BufferDesc.RefreshRate = {60, 1};
+        sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.OutputWindow = hwnd_;
+        sd.SampleDesc = {1, 0};
+        sd.Windowed = TRUE;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+        const D3D_FEATURE_LEVEL levels[2] = {D3D_FEATURE_LEVEL_11_0,
+                                             D3D_FEATURE_LEVEL_10_0};
+        HRESULT hr = D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2,
+            D3D11_SDK_VERSION, &sd, &swapChain_, &device_, nullptr,
+            &context_);
+        if (FAILED(hr))
+            hr = D3D11CreateDeviceAndSwapChain(
+                nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, levels, 2,
+                D3D11_SDK_VERSION, &sd, &swapChain_, &device_, nullptr,
+                &context_);
+        if (FAILED(hr)) {
+            std::fprintf(stderr,
+                         "error: D3D11CreateDeviceAndSwapChain failed "
+                         "(hr=0x%08lx)\n",
+                         static_cast<unsigned long>(hr));
+            return false;
+        }
+        return RecreateTarget();
+    }
+
+    bool RecreateTarget() {
+        ID3D11Texture2D* backBuffer = nullptr;
+        if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer))))
+            return false;
+        HRESULT hr = device_->CreateRenderTargetView(backBuffer, nullptr,
+                                                     &target_);
+        backBuffer->Release();
+        return SUCCEEDED(hr);
+    }
+
+    void Resize(int width, int height) {
+        if (!swapChain_ || width <= 0 || height <= 0) return;
+        if (target_) { target_->Release(); target_ = nullptr; }
+        swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+        RecreateTarget();
+    }
+
+    bool CreateImGui() {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ImGui::StyleColorsDark();
+        if (!ImGui_ImplWin32_Init(hwnd_)) return false;
+        if (!ImGui_ImplDX11_Init(device_, context_)) return false;
+        return true;
+    }
+
+    void DestroyImGui() {
+        if (ImGui::GetCurrentContext()) {
+            ImGui_ImplDX11_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+        }
+    }
+
+    void DestroyD3D() {
+        if (target_) { target_->Release(); target_ = nullptr; }
+        if (swapChain_) { swapChain_->Release(); swapChain_ = nullptr; }
+        if (context_) { context_->Release(); context_ = nullptr; }
+        if (device_) { device_->Release(); device_ = nullptr; }
+    }
+
+    HWND hwnd_ = nullptr;
+    bool running_ = true;
+    ID3D11Device* device_ = nullptr;
+    ID3D11DeviceContext* context_ = nullptr;
+    IDXGISwapChain* swapChain_ = nullptr;
+    ID3D11RenderTargetView* target_ = nullptr;
+    static PlayerGuiHost* self_;
+};
+
+PlayerGuiHost* PlayerGuiHost::self_ = nullptr;
+
+// ── GUI playback loop ───────────────────────────────────────────────────
+// Same shared ticks as the console loop (SampleTelemetryTick /
+// PlaybackEventsTick / FeedRateTick); only input and rendering differ.
+
+void RunGuiMode(PlayerCore& core, bool svmsBackend, const char* versionLabel,
+                double autoSeconds, bool& loop, bool quitAtEnd,
+                UiShared& ui) {
+    PlayerGuiHost host;
+    char title[128];
+    snprintf(title, sizeof(title), "SVMS Player %s", versionLabel);
+    wchar_t titleWide[128] = {};
+    MultiByteToWideChar(CP_UTF8, 0, title, -1, titleWide, 128);
+    if (!host.Create(titleWide, 960, 640)) {
+        ui.running = false;
+        return;
+    }
+
+    const std::string fileUtf8 = WideToUtf8(core.filePath);
+    const std::string backendLabel = svmsBackend
+        ? std::string("SVMSAPI ") + versionLabel
+        : std::string(versionLabel);
+
+    while (ui.running && !core.quit.load(std::memory_order_relaxed) &&
+           host.Pump()) {
+        host.FrameBegin();
+
+        const int64_t playhead =
+            core.playhead.load(std::memory_order_relaxed);
+        const char* stateName = PlayerStateName(core, ui.songEnded);
+        const uint32_t state = core.state.load(std::memory_order_relaxed);
+
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+        ImGui::Begin("##player", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoCollapse);
+
+        ImGui::Text("SVMS Player  [%s]  %s", stateName,
+                    backendLabel.c_str());
+        ImGui::TextDisabled("%s", fileUtf8.c_str());
+        ImGui::Separator();
+
+        // ── Transport ───────────────────────────────────────────────────
+        if (ImGui::Button(state == kStatePlaying ? "Pause" : "Play")) {
+            if (state == kStatePlaying) {
+                core.state.store(kStatePausing, std::memory_order_release);
+            } else if (state == kStatePaused) {
+                StartPlayback(&core);
+            } else if (state == kStateIdle) {
+                SeekTo(&core, 0);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Stop")) {
+            SeekTo(&core, 0);
+            core.state.store(kStateIdle, std::memory_order_release);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("-5s"))
+            SeekTo(&core, static_cast<uint64_t>(playhead -
+                                                5i64 * core.sampleRate));
+        ImGui::SameLine();
+        if (ImGui::Button("+5s"))
+            SeekTo(&core, static_cast<uint64_t>(playhead +
+                                                5i64 * core.sampleRate));
+        ImGui::SameLine();
+        ImGui::Checkbox("Loop", &loop);
+        ImGui::SameLine();
+        if (ImGui::Button("Quit")) ui.running = false;
+
+        // Seek slider commits on release (avoid seek storms while dragging).
+        float progress = core.totalFrames
+            ? static_cast<float>(static_cast<double>(playhead) /
+                                 static_cast<double>(core.totalFrames) *
+                                 100.0)
+            : 0.0f;
+        if (progress < 0.0f) progress = 0.0f;
+        if (progress > 100.0f) progress = 100.0f;
+        float seekSlider = progress;
+        if (ImGui::SliderFloat("##seek", &seekSlider, 0.0f, 100.0f, "%.1f%%") &&
+            ImGui::IsItemDeactivatedAfterEdit() && core.totalFrames) {
+            SeekTo(&core, static_cast<uint64_t>(
+                              seekSlider / 100.0f *
+                              static_cast<double>(core.totalFrames)));
+        }
+
+        // ── Volume ──────────────────────────────────────────────────────
+        const float volumeBefore = ui.volume;
+        if (ImGui::SliderFloat("Volume", &ui.volume, 0.0f, 1.0f, "%.0f%%") &&
+            ImGui::IsItemDeactivatedAfterEdit() &&
+            ui.volume != volumeBefore) {
+            if (svmsBackend) PatchMasterVolume(core, ui.volume);
+            else core.legacy.SendVolume(ui.volume);
+        }
+        // ── Telemetry graphs ────────────────────────────────────────────
+        float voiceMax = 1.0f, renderMax = 1.0f;
+        for (uint32_t i = 0; i < ui.historyCount; ++i) {
+            if (ui.voiceHistory[i] > voiceMax) voiceMax = ui.voiceHistory[i];
+            if (ui.renderHistory[i] > renderMax)
+                renderMax = ui.renderHistory[i];
+        }
+        char label[64];
+        snprintf(label, sizeof(label), "voices  now %u  peak %.0f",
+                 ui.telemetry.active_voices, static_cast<double>(voiceMax));
+        ImGui::PlotLines(label, ui.voiceHistory, 128, ui.historyIndex,
+                         nullptr, 0.0f, voiceMax, ImVec2(-1, 70));
+        snprintf(label, sizeof(label), "render  now %.2f ms  peak %.2f ms",
+                 ui.telemetry.render_time_ms, ui.telemetry.render_peak);
+        ImGui::PlotLines(label, ui.renderHistory, 128, ui.historyIndex,
+                         nullptr, 0.0f, renderMax, ImVec2(-1, 70));
+
+        ImGui::Separator();
+        const uint64_t ringCapacity = core.ring->Capacity();
+        const uint32_t ringPercent = static_cast<uint32_t>(
+            ringCapacity ? core.ring->Size() * 100u / ringCapacity : 0u);
+        ImGui::Text("events %llu   feed %llu evt/s   ring %u%%   steals %llu",
+                    static_cast<unsigned long long>(
+                        core.submittedEvents.load(
+                            std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(ui.feedRatePerSecond),
+                    ringPercent,
+                    static_cast<unsigned long long>(
+                        ui.telemetry.voice_steals));
+        ImGui::Text("audio %s   sf2 %s   rate %u   volume %.0f%%",
+                    ui.telemetry.audio_running ? "running" : "NOT RUNNING",
+                    ui.telemetry.soundfont_loaded ? "loaded" : "none",
+                    ui.telemetry.sample_rate, ui.volume * 100.0f);
+        if (!ui.telemetry.audio_running) {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                               "WARNING: engine audio is not running");
+        }
+
+        // ── Keyboard (mirrors the console keys) ─────────────────────────
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.WantTextInput) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+                if (state == kStatePlaying)
+                    core.state.store(kStatePausing,
+                                     std::memory_order_release);
+                else if (state == kStatePaused)
+                    StartPlayback(&core);
+                else if (state == kStateIdle)
+                    SeekTo(&core, 0);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+                SeekTo(&core, 0);
+                core.state.store(kStateIdle, std::memory_order_release);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))
+                SeekTo(&core, static_cast<uint64_t>(
+                                  playhead - 5i64 * core.sampleRate));
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true))
+                SeekTo(&core, static_cast<uint64_t>(
+                                  playhead + 5i64 * core.sampleRate));
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
+                ui.volume += 0.1f;
+                if (ui.volume > 1.0f) ui.volume = 1.0f;
+                if (svmsBackend) PatchMasterVolume(core, ui.volume);
+                else core.legacy.SendVolume(ui.volume);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
+                ui.volume -= 0.1f;
+                if (ui.volume < 0.0f) ui.volume = 0.0f;
+                if (svmsBackend) PatchMasterVolume(core, ui.volume);
+                else core.legacy.SendVolume(ui.volume);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_L, false)) loop = !loop;
+            if (ImGui::IsKeyPressed(ImGuiKey_Q, false) ||
+                ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+                ui.running = false;
+        }
+
+        ImGui::End();
+
+        host.FrameEnd();
+        SampleTelemetryTick(core, svmsBackend, ui);
+        PlaybackEventsTick(core, svmsBackend, autoSeconds, loop, quitAtEnd,
+                           ui);
+        FeedRateTick(core, ui);
+    }
+    host.Destroy();
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -1194,6 +1704,7 @@ int wmain(int argc, wchar_t** argv) {
     bool stressConfig = false;
     bool idleMode = false;
     bool quitAtEnd = false;
+    bool guiRequested = false;
     bool scanRequested = false;
     std::wstring scanDir;
     std::wstring probePath;
@@ -1228,6 +1739,8 @@ int wmain(int argc, wchar_t** argv) {
             idleMode = true;
         } else if (arg == L"--quit-at-end") {
             quitAtEnd = true;
+        } else if (arg == L"--gui") {
+            guiRequested = true;
         } else if (arg == L"--probe" && i + 1 < argc) {
             probePath = next();
         } else if (arg == L"--scan") {
@@ -1395,26 +1908,15 @@ int wmain(int argc, wchar_t** argv) {
     std::thread submit(SubmitThread, &core);
     if (!idleMode) StartPlayback(&core);
 
-    float voiceHistory[128] = {};
-    float renderHistory[128] = {};
-    uint32_t historyCount = 0;
-    uint32_t historyIndex = 0;
-    uint64_t lastFeedSnapshot = 0;
-    uint64_t feedRatePerSecond = 0;
-    LARGE_INTEGER lastFeedQpc{};
-    LARGE_INTEGER playingStart{}, uiFrequency{};
-    QueryPerformanceFrequency(&uiFrequency);
-    bool playingTimerStarted = false;
-    float volume = 1.0f;
-    if (svmsBackend) volume = ReadMasterVolume(core);
-    bool running = true;
-    bool songEnded = false;
-    SVMS_TelemetryV1 telemetry{};
+    UiShared ui;
+    if (svmsBackend) ui.volume = ReadMasterVolume(core);
     HANDLE stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
-    uint64_t stressRng = GetTickCount64() | 1u;
-    LARGE_INTEGER lastStressPatch{}, lastStressFont{};
 
-    while (running && !core.quit.load(std::memory_order_relaxed)) {
+    if (guiRequested) {
+        RunGuiMode(core, svmsBackend, versionLabel, autoSeconds, loop,
+                   quitAtEnd, ui);
+    } else {
+    while (ui.running && !core.quit.load(std::memory_order_relaxed)) {
         // ── Input (30 ms cadence drives the UI framerate too) ──────────
         DWORD wait = WaitForSingleObject(stdinHandle, 30u);
         while (wait == WAIT_OBJECT_0) {
@@ -1458,21 +1960,22 @@ int wmain(int argc, wchar_t** argv) {
                            playhead + 5i64 * core.sampleRate));
                 break;
             case VK_UP:
-                volume += 0.1f;
-                if (svmsBackend) PatchMasterVolume(core, volume);
-                else core.legacy.SendVolume(volume);
+                ui.volume += 0.1f;
+                if (ui.volume > 1.0f) ui.volume = 1.0f;
+                if (svmsBackend) PatchMasterVolume(core, ui.volume);
+                else core.legacy.SendVolume(ui.volume);
                 break;
             case VK_DOWN:
-                volume -= 0.1f;
-                if (svmsBackend) PatchMasterVolume(core, volume);
-                else core.legacy.SendVolume(volume);
+                ui.volume -= 0.1f;
+                if (svmsBackend) PatchMasterVolume(core, ui.volume);
+                else core.legacy.SendVolume(ui.volume);
                 break;
             case 'L':
                 loop = !loop;
                 break;
             case 'Q':
             case VK_ESCAPE:
-                running = false;
+                ui.running = false;
                 break;
             case VK_HOME:
                 SeekTo(&core, 0);
@@ -1483,90 +1986,11 @@ int wmain(int argc, wchar_t** argv) {
             wait = WaitForSingleObject(stdinHandle, 0u);
         }
 
-        // ── Telemetry sampling ─────────────────────────────────────────
-        if (core.stressConfig && svmsBackend) {
-            LARGE_INTEGER stressNow{};
-            QueryPerformanceCounter(&stressNow);
-            StressConfigTick(core, &stressRng, stressNow, uiFrequency,
-                             &lastStressPatch, &lastStressFont);
-        }
-        if (svmsBackend) {
-            telemetry.struct_size = sizeof(telemetry);
-            telemetry.struct_version = SVMS_STRUCT_VERSION_1;
-            if (core.api.fn.get_telemetry(core.session, &telemetry) ==
-                SVMS_RESULT_OK) {
-                voiceHistory[historyIndex] =
-                    static_cast<float>(telemetry.active_voices);
-                renderHistory[historyIndex] = telemetry.render_time_ms;
-                historyIndex = (historyIndex + 1u) % 128u;
-                if (historyCount < 128u) ++historyCount;
-            }
-        } else {
-            // Legacy synths expose (at most) a voice count; the render-time
-            // graph is SVMS telemetry and stays flat here.
-            telemetry.active_voices = core.legacy.VoiceCount();
-            telemetry.audio_running = 1u;
-            telemetry.sample_rate = core.sampleRate;
-            voiceHistory[historyIndex] =
-                static_cast<float>(telemetry.active_voices);
-            renderHistory[historyIndex] = 0.0f;
-            historyIndex = (historyIndex + 1u) % 128u;
-            if (historyCount < 128u) ++historyCount;
-        }
-
-        // ── Auto-quit / end-of-song handling ───────────────────────────
-        if (!playingTimerStarted && autoSeconds > 0.0) {
-            playingTimerStarted = true;
-            QueryPerformanceCounter(&playingStart);
-        }
-        if (playingTimerStarted && autoSeconds > 0.0) {
-            LARGE_INTEGER now{};
-            QueryPerformanceCounter(&now);
-            if (static_cast<double>(now.QuadPart - playingStart.QuadPart) /
-                    static_cast<double>(uiFrequency.QuadPart) >=
-                autoSeconds)
-                running = false;
-        }
-        if (core.endOfSong.exchange(false, std::memory_order_acq_rel)) {
-            if (loop) {
-                SeekTo(&core, 0);
-            } else {
-                if (svmsBackend) core.api.fn.reset(core.session);
-                else core.legacy.FullReset();
-                core.state.store(kStateIdle, std::memory_order_release);
-                songEnded = true;
-                if (quitAtEnd) running = false;
-            }
-        }
-        if (core.decoderFailed.load(std::memory_order_relaxed)) {
-            std::fprintf(stderr, "\ndecoder error: %s\n",
-                         core.decoderError.c_str());
-            running = false;
-        }
-
-        // ── Render ─────────────────────────────────────────────────────
-        const uint64_t submittedNow =
-            core.submittedEvents.load(std::memory_order_relaxed);
-        {
-            LARGE_INTEGER feedNow{};
-            QueryPerformanceCounter(&feedNow);
-            if (lastFeedQpc.QuadPart != 0) {
-                const double elapsed =
-                    static_cast<double>(feedNow.QuadPart -
-                                        lastFeedQpc.QuadPart) /
-                    static_cast<double>(uiFrequency.QuadPart);
-                if (elapsed >= 0.5) {
-                    feedRatePerSecond = static_cast<uint64_t>(
-                        static_cast<double>(submittedNow -
-                                            lastFeedSnapshot) / elapsed);
-                    lastFeedSnapshot = submittedNow;
-                    lastFeedQpc = feedNow;
-                }
-            } else {
-                lastFeedSnapshot = submittedNow;
-                lastFeedQpc = feedNow;
-            }
-        }
+        // ── Telemetry + auto-quit/end-of-song + feed rate (shared) ──────
+        SampleTelemetryTick(core, svmsBackend, ui);
+        PlaybackEventsTick(core, svmsBackend, autoSeconds, loop, quitAtEnd,
+                           ui);
+        FeedRateTick(core, ui);
         const int64_t playhead =
             core.playhead.load(std::memory_order_relaxed);
 
@@ -1576,30 +2000,18 @@ int wmain(int argc, wchar_t** argv) {
                    static_cast<int64_t>(core.totalFrames),
                    core.sampleRate);
 
-        const char* stateName = "stopped";
-        switch (core.state.load(std::memory_order_relaxed)) {
-        case kStatePlaying: stateName = "PLAYING"; break;
-        case kStatePausing: stateName = "pausing"; break;
-        case kStatePaused:  stateName = "PAUSED"; break;
-        case kStateSeeking: stateName = "seeking"; break;
-        default: break;
-        }
-        if (songEnded &&
-            core.state.load(std::memory_order_relaxed) == kStateIdle)
-            stateName = "ENDED";
-        if (core.state.load(std::memory_order_relaxed) == kStatePlaying)
-            songEnded = false;
+        const char* stateName = PlayerStateName(core, ui.songEnded);
 
         char voiceSpark[512], renderSpark[512];
         float voiceMax = 1.0f, renderMax = 1.0f;
-        for (uint32_t i = 0; i < historyCount; ++i) {
-            if (voiceHistory[i] > voiceMax) voiceMax = voiceHistory[i];
-            if (renderHistory[i] > renderMax) renderMax = renderHistory[i];
+        for (uint32_t i = 0; i < ui.historyCount; ++i) {
+            if (ui.voiceHistory[i] > voiceMax) voiceMax = ui.voiceHistory[i];
+            if (ui.renderHistory[i] > renderMax) renderMax = ui.renderHistory[i];
         }
-        DrawSpark(voiceSpark, sizeof(voiceSpark), voiceHistory,
-                  historyCount, 72u, voiceMax);
-        DrawSpark(renderSpark, sizeof(renderSpark), renderHistory,
-                  historyCount, 72u, renderMax);
+        DrawSpark(voiceSpark, sizeof(voiceSpark), ui.voiceHistory,
+                  ui.historyCount, 72u, voiceMax);
+        DrawSpark(renderSpark, sizeof(renderSpark), ui.renderHistory,
+                  ui.historyCount, 72u, renderMax);
 
         double progress =
             core.totalFrames
@@ -1623,19 +2035,21 @@ int wmain(int argc, wchar_t** argv) {
             "  render %s   now %.2f ms  peak %.2f ms\n"
             "  ring %u%%  steals %llu  audio %s  sf2 %s  rate %u\n"
             "  [space] pause  [s] stop  [left/right] seek  [up/down] volume  [l]oop  [q]uit\n",
-            versionLabel, stateName, volume * 100.0f,
+            versionLabel, stateName, ui.volume * 100.0f,
             loop ? "loop" : "",
             played, total, progress,
-            static_cast<unsigned long long>(submittedNow),
-            static_cast<unsigned long long>(feedRatePerSecond),
+            static_cast<unsigned long long>(core.submittedEvents.load(
+                std::memory_order_relaxed)),
+            static_cast<unsigned long long>(ui.feedRatePerSecond),
             voiceSpark,
-            telemetry.active_voices, static_cast<double>(voiceMax),
-            renderSpark, telemetry.render_time_ms, telemetry.render_peak,
+            ui.telemetry.active_voices, static_cast<double>(voiceMax),
+            renderSpark, ui.telemetry.render_time_ms, ui.telemetry.render_peak,
             ringPercent,
-            static_cast<unsigned long long>(telemetry.voice_steals),
-            telemetry.audio_running ? "running" : "NOT RUNNING",
-            telemetry.soundfont_loaded ? "loaded" : "none",
-            telemetry.sample_rate);
+            static_cast<unsigned long long>(ui.telemetry.voice_steals),
+            ui.telemetry.audio_running ? "running" : "NOT RUNNING",
+            ui.telemetry.soundfont_loaded ? "loaded" : "none",
+            ui.telemetry.sample_rate);
+    }
     }
 
     // ── Shutdown: every player thread must be out of the DLL before the
