@@ -2113,6 +2113,7 @@ int wmain(int argc, wchar_t** argv) {
     bool scanRequested = false;
     std::wstring scanDir;
     std::wstring probePath;
+    std::wstring switchPath;
 
     std::vector<std::wstring> positional;
     for (int i = 1; i < argc; ++i) {
@@ -2146,6 +2147,10 @@ int wmain(int argc, wchar_t** argv) {
             quitAtEnd = true;
         } else if (arg == L"--gui") {
             guiRequested = true;
+        } else if (arg == L"--switch" && i + 1 < argc) {
+            // Hidden dogfood path: run the GUI library Load click (full
+            // SwitchEngine sequence, starting from the engineless state).
+            switchPath = next();
         } else if (arg == L"--probe" && i + 1 < argc) {
             probePath = next();
         } else if (arg == L"--scan") {
@@ -2181,6 +2186,45 @@ int wmain(int argc, wchar_t** argv) {
     core.filePath = file;
     svms::ParsedEventRing ring(ringMegabytes);
     core.ring = &ring;
+
+    if (!switchPath.empty()) {
+        // Emulate the GUI library Load click: classify, build the spec from
+        // the static classification, run the full SwitchEngine sequence
+        // from the engineless state (no engine bring-up first).
+        svmscan::Entry entry;
+        entry.path = switchPath;
+        const size_t slash = switchPath.find_last_of(L"\\/");
+        entry.filename = (slash != std::wstring::npos)
+                             ? switchPath.substr(slash + 1)
+                             : switchPath;
+        const svmscan::PeExports pe = svmscan::ReadExports(entry.path);
+        entry.kind = svmscan::ClassifyKind(pe);
+        EngineSpec spec;
+        if (entry.kind == "svms") {
+            spec.svms = true;
+            spec.apiPath = entry.path;
+        } else if (entry.kind == "kdapi") {
+            spec.svms = false;
+            spec.legacyKind = LegacySink::kKindKdapi;
+            spec.legacyPath = entry.path;
+        } else if (entry.kind == "winmm") {
+            spec.svms = false;
+            spec.legacyKind = LegacySink::kKindWinmm;
+            spec.legacyPath = entry.path;
+        } else {
+            std::printf("switch: refusing \"%s\" (not a synth)\n",
+                        entry.kind.c_str());
+            return 1;
+        }
+        std::string switchError;
+        const bool ok =
+            SwitchEngine(core, spec, lookaheadMs, switchError);
+        std::printf("switch(kind=%s): %s%s\n", entry.kind.c_str(),
+                    ok ? "OK" : "FAILED",
+                    switchError.empty() ? "" : (" — " + switchError).c_str());
+        TearDownEngine(core);
+        return ok ? 0 : 1;
+    }
 
     if (backendName.empty() || backendName == L"svms") {
         core.backend = kBackendSvms;
