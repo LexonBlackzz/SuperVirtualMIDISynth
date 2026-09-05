@@ -29,6 +29,7 @@
 
 #include "SVMSMidiStream.h"
 #include "include/svmsapi.h"
+#include "SVMSPlayerScan.h"
 
 #include <atomic>
 #include <cstdint>
@@ -1084,6 +1085,12 @@ void PrintUsage() {
         "  --auto <seconds>    quit automatically after N seconds of play\n"
         "  --quit-at-end       exit when the song finishes\n"
         "\n"
+        "discovery (no MIDI file needed):\n"
+        "  --scan [dir]        classify DLLs in dir (default: the player's\n"
+        "                      own directory) — static export sniffing, no\n"
+        "                      module is loaded\n"
+        "  --probe <dll>       classify + handshake one module explicitly\n"
+        "\n"
         "keys: SPACE pause/resume  S stop  LEFT/RIGHT seek 5s  "
         "UP/DOWN volume  L loop  Q quit");
 }
@@ -1100,6 +1107,74 @@ std::string WideToUtf8(const std::wstring& wide) {
                             bytes, nullptr, nullptr);
     }
     return result;
+}
+
+// ── discovery modes (no MIDI file required) ─────────────────────────────
+
+std::wstring ExeDirectory() {
+    wchar_t buffer[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+    std::wstring dir(buffer, n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) dir.resize(slash);
+    return dir;
+}
+
+void PrintScanResults(const std::vector<svmscan::Entry>& entries,
+                      const std::wstring& dir) {
+    std::printf("scan: %s (%zu dll%s, none loaded)\n",
+                WideToUtf8(dir).c_str(), entries.size(),
+                entries.size() == 1 ? "" : "s");
+    for (const svmscan::Entry& e : entries) {
+        char sizeKb[32];
+        sprintf(sizeKb, "%5llu KB",
+                static_cast<unsigned long long>(e.fileSize / 1024));
+        std::printf("  %-7s %-5s %s  %-28ls %ls\n",
+                    e.loadable ? e.kind.c_str()
+                               : (e.kind == "runtime" ? "runtime" : "-"),
+                    e.arch.c_str(), sizeKb,
+                    e.displayName.c_str(), e.filename.c_str());
+    }
+    const int loadable = static_cast<int>(std::count_if(
+        entries.begin(), entries.end(),
+        [](const svmscan::Entry& e) { return e.loadable; }));
+    std::printf("  %d usable synth%s; probe one with: svms_player --probe <dll>\n",
+                loadable, loadable == 1 ? "" : "s");
+}
+
+int RunScanMode(const std::wstring& dir) {
+    PrintScanResults(svmscan::ScanDirectory(dir), dir);
+    return 0;
+}
+
+int RunProbeMode(const std::wstring& dllPath) {
+    // Build a synthetic entry so classification drives the probe choice.
+    svmscan::Entry entry;
+    entry.path = dllPath;
+    const size_t slash = dllPath.find_last_of(L"\\/");
+    entry.filename = (slash != std::wstring::npos)
+                         ? dllPath.substr(slash + 1)
+                         : dllPath;
+    entry.displayName = svmscan::ResolveDisplayName(entry.path,
+                                                    entry.filename);
+    if (svmscan::IsDenylisted(entry.filename)) {
+        entry.kind = "runtime";
+    } else {
+        const svmscan::PeExports pe = svmscan::ReadExports(entry.path);
+        entry.kind = svmscan::ClassifyKind(pe);
+        entry.arch = svmscan::ArchName(pe.machine);
+    }
+    std::printf("probe: %s\n  class=%s arch=%s name=\"%ls\"\n",
+                WideToUtf8(dllPath).c_str(), entry.kind.c_str(),
+                entry.arch.c_str(), entry.displayName.c_str());
+    if (entry.kind != "svms" && entry.kind != "kdapi" &&
+        entry.kind != "winmm") {
+        std::printf("  refusing to load: not a synth\n");
+        return 1;
+    }
+    const svmscan::ProbeResult r = svmscan::Probe(entry);
+    std::printf("  %s%s\n", r.ok ? "OK  " : "FAIL", r.detail.c_str());
+    return r.ok ? 0 : 1;
 }
 
 } // namespace
@@ -1119,6 +1194,9 @@ int wmain(int argc, wchar_t** argv) {
     bool stressConfig = false;
     bool idleMode = false;
     bool quitAtEnd = false;
+    bool scanRequested = false;
+    std::wstring scanDir;
+    std::wstring probePath;
 
     std::vector<std::wstring> positional;
     for (int i = 1; i < argc; ++i) {
@@ -1150,6 +1228,13 @@ int wmain(int argc, wchar_t** argv) {
             idleMode = true;
         } else if (arg == L"--quit-at-end") {
             quitAtEnd = true;
+        } else if (arg == L"--probe" && i + 1 < argc) {
+            probePath = next();
+        } else if (arg == L"--scan") {
+            scanRequested = true;
+            // Optional directory argument: consumed only if present and not
+            // another flag.
+            if (i + 1 < argc && argv[i + 1][0] != L'-') scanDir = next();
         } else if (arg == L"--help" || arg == L"-h") {
             PrintUsage();
             return 0;
@@ -1161,6 +1246,9 @@ int wmain(int argc, wchar_t** argv) {
             positional.push_back(arg);
         }
     }
+    if (!probePath.empty()) return RunProbeMode(probePath);
+    if (scanRequested) return RunScanMode(scanDir.empty() ? ExeDirectory()
+                                                          : scanDir);
     if (positional.empty()) {
         PrintUsage();
         return 1;
