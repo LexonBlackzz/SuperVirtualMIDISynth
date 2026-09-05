@@ -254,6 +254,11 @@ public:
     // boundary folds) instead of once per CC, plus a steal-only fold at
     // launch entry so victim scores stay fresh.
     void MarkChannelMixStale(uint8_t channel, const ChannelParamsSnapshot& cp);
+    // Reapply the channel's pitch-bend ratio to every sounding voice (and,
+    // under the whole-voice pre-pass, report it as a channel op instead —
+    // see SetRowOpHooks).  bendSemitones is the sysex-aware total; the
+    // per-voice ratio applies pitchBendScales for scaled regions.
+    void ApplyChannelBendRatio(uint8_t channel, float bendSemitones);
     // Full fold at vintage-exact boundaries (block top, exact-frame dispatch
     // boundaries): mixGain, stealOutputGain, renderGain, steal candidates.
     void FoldStaleChannelMixGains();
@@ -261,6 +266,11 @@ public:
     // and the steal candidates but NOT renderGain — renderGainL/R embed a
     // currentGain vintage that must only be rewritten at batch boundaries.
     void FoldStaleChannelMixGainsForSteal();
+    // Whole-voice renderer post-pass: refresh the steal candidates of the
+    // channels touched by row ops, using the scales the op hook recorded.
+    // Values are idempotent (the workers already wrote these rows at the op
+    // frames with identical scales); only the cached candidate keys move.
+    void FoldStealGainsForChannels(uint64_t channelMask);
 
     // ── Channel-key utilities ──────────────────────────────────────────
 
@@ -362,6 +372,25 @@ public:
         silenceVoiceHook_ = voiceHook;
         silenceTailHook_ = tailHook;
         silenceHookUserData_ = userData;
+    }
+    // Whole-voice renderer pre-pass: channel-wide row mutations must land at
+    // the event's exact frame DURING the render, not during the pre-pass
+    // dispatch (every voice would otherwise observe the new state for the
+    // whole block).  When these hooks are installed, the mutators report the
+    // channel and payload once per event instead of rewriting rows inline;
+    // the renderer records a channel op and the owning worker applies it
+    // between spans with row-local writes (thread-safe).  Null outside the
+    // pre-pass: the legacy renderers mutate inline at their exact-frame
+    // dispatch boundaries, exactly as before.
+    using ChannelMixOpHook = void (*)(uint8_t channel, float mixScaleLeft,
+                                      float mixScaleRight, void* userData);
+    using ChannelBendOpHook = void (*)(uint8_t channel, float bendSemitones,
+                                       float commonRatio, void* userData);
+    void SetRowOpHooks(ChannelMixOpHook mixHook, ChannelBendOpHook bendHook,
+                       void* userData) noexcept {
+        mixOpHook_ = mixHook;
+        bendOpHook_ = bendHook;
+        rowOpUserData_ = userData;
     }
     // Whole-voice renderer: stolen victims continue as renderer-owned ghost
     // snapshots (pre-pass state + exact-frame retirement), so the in-band
@@ -903,6 +932,9 @@ private:
     SilenceVoiceHook silenceVoiceHook_ = nullptr;
     SilenceTailHook silenceTailHook_ = nullptr;
     void* silenceHookUserData_ = nullptr;
+    ChannelMixOpHook mixOpHook_ = nullptr;
+    ChannelBendOpHook bendOpHook_ = nullptr;
+    void* rowOpUserData_ = nullptr;
     bool stealTailCaptureSuppressed_ = false;
 };
 
@@ -4813,8 +4845,36 @@ inline void VoiceManager::MarkChannelMixStale(
     if (channel >= kChannelCount) return;
     channelMixScaleL_[channel] = cp.mixScaleLeft;
     channelMixScaleR_[channel] = cp.mixScaleRight;
+    if (mixOpHook_) {
+        // Whole-voice pre-pass: the per-voice fold runs at the exact event
+        // frame inside the owning worker.  No masks are set here — a
+        // launch-entry steal fold would rewrite mixGain of pre-CC voices
+        // before the pre-pass captures them as ghosts, baking the new
+        // scales into their whole audible window.  The renderer refreshes
+        // the affected channels' steal candidates at block end instead
+        // (FoldStealGainsForChannels), after all ghost captures are done.
+        mixOpHook_(channel, cp.mixScaleLeft, cp.mixScaleRight,
+                   rowOpUserData_);
+        return;
+    }
     channelMixStealMask_ |= (uint64_t(1) << channel);
     channelMixDirtyMask_ |= (uint64_t(1) << channel);
+}
+
+inline void VoiceManager::ApplyChannelBendRatio(uint8_t channel,
+                                                float bendSemitones) {
+    if (channel >= kChannelCount) return;
+    const float commonRatio = powf(2.0f, bendSemitones / 12.0f);
+    if (bendOpHook_) {
+        bendOpHook_(channel, bendSemitones, commonRatio, rowOpUserData_);
+        return;
+    }
+    ForEachChannelActive(channel, [&](VoiceHandle handle) {
+        const float scale = v.pitchBendScales[handle];
+        const float ratio = scale == 1.0f
+            ? commonRatio : powf(2.0f, bendSemitones * scale / 12.0f);
+        v.phaseIncs[handle] = v.basePhaseIncs[handle] * ratio;
+    });
 }
 
 inline void VoiceManager::FoldVoiceMixGains(
@@ -4875,6 +4935,13 @@ inline void VoiceManager::FoldStaleChannelMixGainsForSteal() {
     if (pending == 0u) return;
     channelMixStealMask_ = 0u;
     FoldMask(pending, false);
+}
+
+inline void VoiceManager::FoldStealGainsForChannels(uint64_t channelMask) {
+    if (kChannelCount < 64u)
+        channelMask &= (uint64_t(1) << kChannelCount) - 1u;
+    if (channelMask == 0u) return;
+    FoldMask(channelMask, false);
 }
 
 inline void VoiceManager::RefreshMixGainsForChannel(

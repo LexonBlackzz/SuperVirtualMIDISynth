@@ -518,6 +518,29 @@ struct WholeVoiceGhostTail {
     uint8_t loopEnabled = 0u;
 };
 
+// Channel-wide row mutation recorded by the whole-voice pre-pass (pitch-bend
+// ratio or CC7/10/11 mix-gain fold).  The pre-pass appends one op per
+// mutator event in frame order; the plan then regroups them per channel so
+// each worker item walks its own row's window and applies the ops between
+// spans — exactly where the frame-major renderers fold/bend inline.  A
+// per-channel log (not per-voice) is what makes ghosts correct for free: a
+// killed or stolen voice's ghost walks the same channel ops inside its own
+// [start, death) window, no transfer bookkeeping needed.
+struct WholeVoiceChannelOp {
+    uint32_t frame;
+    // Dispatch ordinal (position in the block's event array).  Same-frame
+    // ops apply only to voices launched at a STRICTLY EARLIER ordinal: the
+    // frame-major renderers fold/bend exactly the voices that existed when
+    // the event dispatched, and a voice born later in the same frame (which
+    // reads the fresh channel state at configure time) must not be touched.
+    uint32_t ingress;
+    uint8_t channel;
+    uint8_t kind;   // 0 = bend (a = bendSemitones, b = commonRatio)
+                    // 1 = mix-gain (a = mixScaleLeft, b = mixScaleRight)
+    float a;
+    float b;
+};
+
 
 class RenderScalar {
 public:
@@ -625,7 +648,14 @@ private:
     static void WholeVoiceSilenceVoiceHook(VoiceHandle handle,
                                            void* userData);
     static void WholeVoiceSilenceTailHook(uint32_t slot, void* userData);
+    static void WholeVoiceMixOpHook(uint8_t channel, float mixScaleLeft,
+                                    float mixScaleRight, void* userData);
+    static void WholeVoiceBendOpHook(uint8_t channel, float bendSemitones,
+                                     float commonRatio, void* userData);
     void DropWholeVoiceReleaseOp(VoiceHandle handle);
+    bool EnsureWholeVoiceRowOpStorage(uint32_t opCount);
+    void ApplyWholeVoiceRowOp(VoiceSoA& state, uint32_t row,
+                              const WholeVoiceChannelOp& op);
     static void WholeVoiceJobThunk(uint32_t jobIndex, float* outputLeft,
                                    float* outputRight, uint32_t frameCount,
                                    void* userData);
@@ -641,12 +671,31 @@ private:
     // Per ghost: 1 = All-Sound-Off kill (renders to its death frame with no
     // fade tail), 0 = steal victim (64-frame tail fade from death state).
     uint8_t* wvGhostNoTail_ = nullptr;
+    // Per-channel exact-frame row ops (bend / mix-gain).  wvRowOps_ is the
+    // dispatch-order log; wvChanOps_ is the per-channel regrouped copy the
+    // worker items walk, bracketed by wvChanOpStart_ (CSR, frame-sorted
+    // within each channel).
+    WholeVoiceChannelOp* wvRowOps_ = nullptr;
+    WholeVoiceChannelOp* wvChanOps_ = nullptr;
+    uint32_t wvRowOpCapacity_ = 0u;
+    uint32_t wvRowOpCount_ = 0u;
+    uint64_t wvRowOpChannelMask_ = 0u;   // channels touched by this block's ops
+    uint32_t wvEventOrdinal_ = 0u;       // dispatch position of the current event
+    // CSR bracket for wvChanOps_; one extra slot so a defensive clamp of a
+    // corrupt channel to kChannelCount yields an empty (safe) op range.
+    uint32_t wvChanOpStart_[kChannelCount + 2];
     // Per steal-tail slot: frame an in-block All Sound Off killed the tail
     // (UINT32_MAX = alive or dead before this block).  kStealTailReserve is
     // a small compile-time constant, so a fixed member array is fine.
     uint32_t wvTailKillFrame_[kStealTailReserve];
     uint32_t* wvStartFrame_ = nullptr;       // per handle; UINT32_MAX = from 0
     uint32_t* wvReleaseFrame_ = nullptr;     // per handle; UINT32_MAX = none
+    // Dispatch ordinal of the launch that created each handle's current
+    // generation (UINT32_MAX = carried over from a previous block, so every
+    // op in the block applies).  Qualifies same-frame ops — see
+    // WholeVoiceChannelOp::ingress.
+    uint32_t* wvStartIngress_ = nullptr;
+    uint32_t* wvGhostStartIngress_ = nullptr;
     uint32_t wvHandleCapacity_ = 0u;         // handle-range size of the above
     uint32_t* wvOpHandles_ = nullptr;
     uint32_t* wvOpFrames_ = nullptr;
@@ -832,6 +881,8 @@ inline RenderScalar::~RenderScalar() {
     _aligned_free(wvGhostDeathFrame_);
     _aligned_free(wvGhostReleaseFrame_);
     _aligned_free(wvGhostNoTail_);
+    _aligned_free(wvRowOps_);
+    _aligned_free(wvChanOps_);
     _aligned_free(wvJobRetirements_);
     _aligned_free(wvJobRetireCounts_);
     delete[] wvGhostTails_;
@@ -3081,9 +3132,11 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // ── Whole-voice whole-block renderer ────────────────────────────────
     // Single per-voice renderer: owns every note-only block, blocks with no
     // events at all, and note blocks carrying the lifecycle controllers
-    // (sustain/sostenuto/all-notes-off/all-sound-off).  Vibrato and other
-    // mid-block row mutations keep the legacy hybrid below until per-voice
-    // param ops land.
+    // (sustain/sostenuto/all-notes-off/all-sound-off) plus the channel-wide
+    // row mutators (pitch bend and CC7/10/11 mix folds), which land as
+    // exact-frame channel ops applied inside the owning workers.  Vibrato
+    // (CC1) keeps the legacy hybrid below — its per-frame LFO cannot be
+    // modeled by a whole-block plan.
     if (!vibratoActive &&
         PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame)) {
         RenderWholeVoiceBlock(voices, sampleData, sampleDataFrames,
@@ -3223,6 +3276,7 @@ inline void RenderScalar::WholeVoiceVoiceConfiguredHook(
     RenderScalar* renderer = static_cast<RenderScalar*>(userData);
     if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
     renderer->wvStartFrame_[handle] = renderer->wvEventFrame_;
+    renderer->wvStartIngress_[handle] = renderer->wvEventOrdinal_;
 }
 
 inline void RenderScalar::WholeVoicePreTailCaptureHook(
@@ -3262,6 +3316,9 @@ inline void RenderScalar::WholeVoicePreTailCaptureHook(
     // left over from a previous use of this ghost slot must never be
     // adopted at block end.
     renderer->wvGhostTails_[ghost].framesRemaining = 0u;
+    // The ghost inherits the victim's launch ordinal so same-frame op
+    // qualification survives the displacement.
+    renderer->wvGhostStartIngress_[ghost] = renderer->wvStartIngress_[handle];
     if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) {
         // A deferred release on the displaced voice transfers to the ghost.
         // The victim's op entry is dropped with the transfer: the victim is
@@ -3309,6 +3366,9 @@ inline void RenderScalar::WholeVoiceSilenceVoiceHook(
     // All Sound Off is an immediate stop: no fade tail after the kill frame.
     renderer->wvGhostNoTail_[ghost] = 1u;
     renderer->wvGhostTails_[ghost].framesRemaining = 0u;
+    // The kill ghost inherits the victim's launch ordinal so same-frame op
+    // qualification survives the kill.
+    renderer->wvGhostStartIngress_[ghost] = renderer->wvStartIngress_[handle];
     if (renderer->wvReleaseFrame_[handle] != UINT32_MAX) {
         if (renderer->wvReleaseFrame_[handle] < renderer->wvEventFrame_) {
             // The release flip lands before the kill frame; the ghost keeps
@@ -3343,6 +3403,98 @@ inline void RenderScalar::WholeVoiceSilenceTailHook(uint32_t slot,
         renderer->wvTailKillFrame_[slot] = renderer->wvEventFrame_;
 }
 
+// CC7/10/11/121 mix-fold op: one log entry per marking event (per channel),
+// not per voice — the owning worker recomputes each row's gains from its own
+// per-voice gainLeft/gainRight at the op frame, with the exact
+// FoldVoiceMixGains expressions (renderGain vintage = currentGain at the op
+// frame, which the oracle's batch-boundary fold also observes).
+inline void RenderScalar::WholeVoiceMixOpHook(uint8_t channel,
+                                              float mixScaleLeft,
+                                              float mixScaleRight,
+                                              void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (renderer == nullptr) return;
+    assert(renderer->wvRowOpCount_ < renderer->wvRowOpCapacity_ &&
+           "row-op estimate undercounted a mix CC");
+    if (renderer->wvRowOpCount_ >= renderer->wvRowOpCapacity_) return;
+    WholeVoiceChannelOp& op = renderer->wvRowOps_[renderer->wvRowOpCount_++];
+    op.frame = renderer->wvEventFrame_;
+    op.ingress = renderer->wvEventOrdinal_;
+    op.channel = channel;
+    op.kind = 1u;
+    op.a = mixScaleLeft;
+    op.b = mixScaleRight;
+}
+
+// Pitch-bend op: the payload is the channel's sysex-aware semitone total
+// plus the common (unscaled) ratio; the worker reapplies each row's own
+// pitchBendScales exactly as VoiceManager::ApplyChannelBendRatio does
+// inline for the legacy paths.
+inline void RenderScalar::WholeVoiceBendOpHook(uint8_t channel,
+                                               float bendSemitones,
+                                               float commonRatio,
+                                               void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (renderer == nullptr) return;
+    assert(renderer->wvRowOpCount_ < renderer->wvRowOpCapacity_ &&
+           "row-op estimate undercounted a bend event");
+    if (renderer->wvRowOpCount_ >= renderer->wvRowOpCapacity_) return;
+    WholeVoiceChannelOp& op = renderer->wvRowOps_[renderer->wvRowOpCount_++];
+    op.frame = renderer->wvEventFrame_;
+    op.ingress = renderer->wvEventOrdinal_;
+    op.channel = channel;
+    op.kind = 0u;
+    op.a = bendSemitones;
+    op.b = commonRatio;
+}
+
+inline bool RenderScalar::EnsureWholeVoiceRowOpStorage(uint32_t opCount) {
+    if (opCount == 0u) return true;
+    if (wvRowOps_ != nullptr && wvChanOps_ != nullptr &&
+        wvRowOpCapacity_ >= opCount) {
+        return true;
+    }
+    auto* freshOps = static_cast<WholeVoiceChannelOp*>(_aligned_malloc(
+        static_cast<size_t>(opCount) * sizeof(WholeVoiceChannelOp),
+        kMixBufferAlign));
+    auto* freshChan = static_cast<WholeVoiceChannelOp*>(_aligned_malloc(
+        static_cast<size_t>(opCount) * sizeof(WholeVoiceChannelOp),
+        kMixBufferAlign));
+    if (freshOps == nullptr || freshChan == nullptr) {
+        _aligned_free(freshOps);
+        _aligned_free(freshChan);
+        return false;
+    }
+    _aligned_free(wvRowOps_);
+    _aligned_free(wvChanOps_);
+    wvRowOps_ = freshOps;
+    wvChanOps_ = freshChan;
+    wvRowOpCapacity_ = opCount;
+    return true;
+}
+
+// Apply one channel op to a single render row (real voice or ghost).
+// Row-local only, so any worker can execute it.  The gain expressions
+// mirror VoiceManager::FoldVoiceMixGains and the bend expression mirrors
+// VoiceManager::ApplyChannelBendRatio bit-for-bit.
+inline void RenderScalar::ApplyWholeVoiceRowOp(VoiceSoA& state, uint32_t row,
+                                               const WholeVoiceChannelOp& op) {
+    if (op.kind == 0u) {
+        const float scale = state.pitchBendScales[row];
+        const float ratio = scale == 1.0f
+            ? op.b : powf(2.0f, op.a * scale / 12.0f);
+        state.phaseIncs[row] = state.basePhaseIncs[row] * ratio;
+        return;
+    }
+    state.mixGainL[row] = state.gainLeft[row] * op.a;
+    state.mixGainR[row] = state.gainRight[row] * op.b;
+    state.stealOutputGain[row] = std::sqrt(
+        state.mixGainL[row] * state.mixGainL[row] +
+        state.mixGainR[row] * state.mixGainR[row]);
+    state.renderGainL[row] = state.currentGain[row] * state.mixGainL[row];
+    state.renderGainR[row] = state.currentGain[row] * state.mixGainR[row];
+}
+
 inline void RenderScalar::WholeVoiceDeferredReleaseHook(
     VoiceHandle handle, void* userData) {
     RenderScalar* renderer = static_cast<RenderScalar*>(userData);
@@ -3364,6 +3516,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     // Eligibility is decided before any state changes so a refusal can fall
     // back to the legacy renderer cleanly.
     bool hasEvents = false;
+    uint32_t rowOpEstimate = 0u;
     for (uint32_t i = 0u; i < eventCount; ++i) {
         switch (events[i].type) {
             case RenderEventType::NoteOn:
@@ -3371,19 +3524,49 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
             case RenderEventType::StaleNoteOffBatch:
                 hasEvents = true;
                 break;
-            case RenderEventType::ControlChange:
-                // Lifecycle-only controllers take the whole-voice path:
-                // sustain (64), sostenuto (66) and all-notes-off (123)
-                // funnel through StartRelease's deferred-release hook
-                // exactly like note-offs, and all-sound-off (120) kills
-                // through the silence hooks as exact-frame ghosts.
-                // Every other controller mutates rendering rows mid-block
-                // and keeps the legacy hybrid until per-voice param ops
-                // land (stage 3).
-                if (events[i].data1 != 64u && events[i].data1 != 66u &&
-                    events[i].data1 != 120u && events[i].data1 != 123u) {
-                    return false;
+            case RenderEventType::ControlChange: {
+                const uint8_t controller = events[i].data1;
+                switch (controller) {
+                    case 1u:
+                    default:
+                        // CC1 engages the per-frame vibrato LFO, which no
+                        // whole-block plan can model; unmapped controllers
+                        // stay on the legacy path until their dispatch
+                        // effects are audited.
+                        return false;
+                    case 0u:
+                    case 32u:
+                        // Bank select: launch-time state only.
+                        break;
+                    case 64u:
+                    case 66u:
+                    case 120u:
+                    case 123u:
+                        // Lifecycle: deferred-release / kill hooks.
+                        break;
+                    case 6u:
+                    case 38u:
+                    case 96u:
+                    case 97u:
+                        // RPN data wheel -> pitch-bend op.
+                        ++rowOpEstimate;
+                        break;
+                    case 7u:
+                    case 10u:
+                    case 11u:
+                        // Volume/pan/expression -> mix-gain fold op.
+                        ++rowOpEstimate;
+                        break;
+                    case 121u:
+                        // Reset All Controllers -> bend-center AND mix fold.
+                        rowOpEstimate += 2u;
+                        break;
                 }
+                hasEvents = true;
+                break;
+            }
+            case RenderEventType::PitchBend:
+                ++rowOpEstimate;
                 hasEvents = true;
                 break;
             default:
@@ -3417,13 +3600,16 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
             workerPool_ ? workerPool_->GetThreadCount() : 1u)) {
         return false;
     }
+    if (!EnsureWholeVoiceRowOpStorage(rowOpEstimate)) return false;
 
     std::fill(wvStartFrame_, wvStartFrame_ + handleCapacity, UINT32_MAX);
     std::fill(wvReleaseFrame_, wvReleaseFrame_ + handleCapacity, UINT32_MAX);
+    std::fill(wvStartIngress_, wvStartIngress_ + handleCapacity, UINT32_MAX);
     std::fill(wvTailKillFrame_, wvTailKillFrame_ + kStealTailReserve,
               UINT32_MAX);
     wvOpCount_ = 0u;
     wvGhostCount_ = 0u;
+    wvRowOpCount_ = 0u;
     wvPlanVoices_ = &voices;
 
     voices.SetDeferredReleaseHook(&WholeVoiceDeferredReleaseHook, this);
@@ -3431,6 +3617,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     voices.SetPreTailCaptureHook(&WholeVoicePreTailCaptureHook, this);
     voices.SetSilenceChannelHooks(&WholeVoiceSilenceVoiceHook,
                                   &WholeVoiceSilenceTailHook, this);
+    voices.SetRowOpHooks(&WholeVoiceMixOpHook, &WholeVoiceBendOpHook, this);
     voices.SetStealTailCaptureSuppressed(true);
 
     // Ingress-order dispatch with the render clock at each event's exact
@@ -3439,6 +3626,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     for (uint32_t i = 0u; i < eventCount; ++i) {
         const RenderEvent& event = events[i];
         wvEventFrame_ = event.frameOffset;
+        wvEventOrdinal_ = i;
         voices.SetCurrentFrame(blockStartFrame + event.frameOffset);
         if (batchDispatcher_ != nullptr) {
             batchDispatcher_(&event, 1u, event.frameOffset,
@@ -3452,8 +3640,41 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     voices.SetVoiceConfiguredHook(nullptr, nullptr);
     voices.SetPreTailCaptureHook(nullptr, nullptr);
     voices.SetSilenceChannelHooks(nullptr, nullptr, nullptr);
+    voices.SetRowOpHooks(nullptr, nullptr, nullptr);
     voices.SetStealTailCaptureSuppressed(false);
     wvPlanVoices_ = nullptr;
+
+    // Regroup the op log per channel (stable → frame-sorted within each
+    // channel) so worker items can binary-walk their own row's window.
+    wvRowOpChannelMask_ = 0u;
+    {
+        uint32_t chanCounts[kChannelCount] = {};
+        for (uint32_t i = 0u; i < wvRowOpCount_; ++i) {
+            ++chanCounts[wvRowOps_[i].channel];
+            // Only mix ops fold at block end: their per-channel scales live
+            // in the VoiceManager cache (refreshed by every mark).  Bend ops
+            // must NOT widen the fold mask — a channel whose cache was never
+            // marked still holds its construction-time zero, and folding it
+            // would zero every active row's mixGain with writeRenderGain
+            // disabled.
+            if (wvRowOps_[i].kind == 1u)
+                wvRowOpChannelMask_ |= uint64_t(1) << wvRowOps_[i].channel;
+        }
+        uint32_t running = 0u;
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            wvChanOpStart_[channel] = running;
+            running += chanCounts[channel];
+        }
+        wvChanOpStart_[kChannelCount] = running;
+        wvChanOpStart_[kChannelCount + 1] = running;
+        uint32_t writeCursor[kChannelCount];
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel)
+            writeCursor[channel] = wvChanOpStart_[channel];
+        for (uint32_t i = 0u; i < wvRowOpCount_; ++i) {
+            const WholeVoiceChannelOp& op = wvRowOps_[i];
+            wvChanOps_[writeCursor[op.channel]++] = op;
+        }
+    }
     return true;
 }
 
@@ -3465,9 +3686,11 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     SpanRetirement* retBuf = wvJobRetirements_ +
         static_cast<size_t>(jobIndex) * scratchCapacity_;
     const uint32_t retCountBefore = wvJobRetireCounts_[jobIndex];
-    const VoiceRenderClass renderClass = ClassifyWholeVoiceRow(state, row);
+    // Fresh class at the segment start: compared against the class after
+    // rendering to detect a lifecycle transition INSIDE this segment.
+    const VoiceRenderClass classBefore = ClassifyWholeVoiceRow(state, row);
     RenderClassKernel kernel = kernelSet_->kernels[
-        static_cast<uint32_t>(renderClass)];
+        static_cast<uint32_t>(classBefore)];
     if (segFrames >= 8u && kernel != nullptr && sampleData != nullptr) {
         RenderSpanContext context{
             &state, sampleData, sampleDataFrames, outL, outR,
@@ -3496,6 +3719,26 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
                 row, segStart + retiredAt, voices->activePosition_[row]};
         }
         return true;
+    }
+    // Post-segment class transition bake, replicating the frame-major
+    // oracle's per-frame envelope-stage check: when the lifecycle moved
+    // inside this segment (transient→sustained crossing above all), the
+    // oracle relinks the render class at the exact crossing frame and
+    // LinkRenderClass bakes renderGainL/R = currentGain x mixGain with the
+    // frozen sustain level — the value the sustained class kernels read.
+    // The whole-voice path advances the same state inside its segments but
+    // never relinks mid-block (the block-end RefreshRenderClass pass sees
+    // field == desired — the launch already configured a sustained class —
+    // and early-outs), so the bake must happen here at the crossing vintage.
+    // Row-local writes only, so any worker can execute them.
+    const VoiceRenderClass classAfter = ClassifyWholeVoiceRow(state, row);
+    if (classAfter != classBefore &&
+        (classAfter == VoiceRenderClass::SustainedLoop ||
+         classAfter == VoiceRenderClass::SustainedOneShot)) {
+        state.renderGainL[row] =
+            state.currentGain[row] * state.mixGainL[row];
+        state.renderGainR[row] =
+            state.currentGain[row] * state.mixGainR[row];
     }
     return false;
 }
@@ -3581,11 +3824,38 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             uint32_t start = renderer->wvStartFrame_[handle];
             if (start == UINT32_MAX) start = 0u;
             uint32_t releaseFrame = renderer->wvReleaseFrame_[handle];
+            // Channel row-op window: bend/mix ops at frames inside the
+            // voice's timeline split it exactly where the frame-major
+            // renderers fold/bend inline at their dispatch boundaries.
+            const uint8_t opChannelRaw = v.channel[handle];
+            const uint32_t opChannel =
+                opChannelRaw < kChannelCount ? opChannelRaw : kChannelCount;
+            uint32_t opIdx = renderer->wvChanOpStart_[opChannel];
+            const uint32_t opEnd = renderer->wvChanOpStart_[opChannel + 1];
+            while (opIdx < opEnd &&
+                   renderer->wvChanOps_[opIdx].frame < start) {
+                ++opIdx;
+            }
+            // Same-frame qualification: an op dispatched in the same frame
+            // BEFORE this voice's launch never observed it (the voice reads
+            // the fresh channel state at configure time instead).  Carried
+            // over voices (UINT32_MAX) hear every op in the block.
+            const uint32_t startIngress = renderer->wvStartIngress_[handle];
+            if (startIngress != UINT32_MAX) {
+                while (opIdx < opEnd &&
+                       renderer->wvChanOps_[opIdx].frame == start &&
+                       renderer->wvChanOps_[opIdx].ingress < startIngress) {
+                    ++opIdx;
+                }
+            }
             uint32_t cursor = start;
             while (cursor < frameCount) {
                 uint32_t stop = frameCount;
                 if (releaseFrame != UINT32_MAX && releaseFrame < stop)
                     stop = releaseFrame;
+                if (opIdx < opEnd &&
+                    renderer->wvChanOps_[opIdx].frame < stop)
+                    stop = renderer->wvChanOps_[opIdx].frame;
                 if (stop > cursor) {
                     if (renderer->RenderWholeVoiceSegment(
                             v, ctx->voices, handle, ctx->sampleData,
@@ -3604,6 +3874,13 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                         v.loopEnabled[handle] = 0u;
                     releaseFrame = UINT32_MAX;
                 }
+                // Apply every op landing on this frame (ingress order).
+                while (opIdx < opEnd &&
+                       renderer->wvChanOps_[opIdx].frame == cursor) {
+                    renderer->ApplyWholeVoiceRowOp(
+                        v, handle, renderer->wvChanOps_[opIdx]);
+                    ++opIdx;
+                }
             }
         } else {
             const uint32_t ghost = item - ctx->voiceItemCount;
@@ -3613,12 +3890,37 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             if (start >= frameCount) continue;
             uint32_t releaseFrame = renderer->wvGhostReleaseFrame_[ghost];
             VoiceSoA& g = renderer->wvGhostState_;
+            // Ghosts walk the same channel ops within their own window, so
+            // a displaced or killed voice hears the bend/fold events that
+            // fired while it was still sounding.  Ops at (or past) the
+            // death frame never apply — the voice is gone by then.
+            const uint8_t opChannelRaw = g.channel[ghost];
+            const uint32_t opChannel =
+                opChannelRaw < kChannelCount ? opChannelRaw : kChannelCount;
+            uint32_t opIdx = renderer->wvChanOpStart_[opChannel];
+            const uint32_t opEnd = renderer->wvChanOpStart_[opChannel + 1];
+            while (opIdx < opEnd &&
+                   renderer->wvChanOps_[opIdx].frame < start) {
+                ++opIdx;
+            }
+            const uint32_t startIngress =
+                renderer->wvGhostStartIngress_[ghost];
+            if (startIngress != UINT32_MAX) {
+                while (opIdx < opEnd &&
+                       renderer->wvChanOps_[opIdx].frame == start &&
+                       renderer->wvChanOps_[opIdx].ingress < startIngress) {
+                    ++opIdx;
+                }
+            }
             uint32_t cursor = start;
             bool retired = false;
             while (cursor < death && cursor < frameCount) {
                 uint32_t stop = death < frameCount ? death : frameCount;
                 if (releaseFrame != UINT32_MAX && releaseFrame < stop)
                     stop = releaseFrame;
+                if (opIdx < opEnd &&
+                    renderer->wvChanOps_[opIdx].frame < stop)
+                    stop = renderer->wvChanOps_[opIdx].frame;
                 if (stop > cursor) {
                     if (renderer->RenderWholeVoiceSegment(
                             g, nullptr, ghost, ctx->sampleData,
@@ -3635,6 +3937,13 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     if (g.loopMode[ghost] == 3u)
                         g.loopEnabled[ghost] = 0u;
                     releaseFrame = UINT32_MAX;
+                }
+                while (opIdx < opEnd &&
+                       renderer->wvChanOps_[opIdx].frame == cursor &&
+                       cursor < death) {
+                    renderer->ApplyWholeVoiceRowOp(
+                        g, ghost, renderer->wvChanOps_[opIdx]);
+                    ++opIdx;
                 }
             }
             if (retired || cursor < death) continue;  // ghost ended early
@@ -3723,6 +4032,15 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     for (uint32_t i = 0u; i < activeCount; ++i)
         voices.RefreshRenderClass(static_cast<VoiceHandle>(wvSliceHandles_[i]));
 
+    // Row-op channels had no masks set during the pre-pass (a launch-entry
+    // steal fold would have corrupted pre-CC ghost captures), so refresh
+    // their steal candidates here with writeRenderGain=false: the workers
+    // already wrote mixGain/renderGain at the op frames with the exact
+    // currentGain vintage the oracle's batch-boundary folds produce, and
+    // the scales have not moved since — the value writes are idempotent,
+    // only the cached candidate keys move.
+    voices.FoldStealGainsForChannels(wvRowOpChannelMask_);
+
     // Pre-existing steal tails (born before this block) render exactly as
     // the span renderer's tail section does.  A tail killed by an in-block
     // All Sound Off was unlinked during the pre-pass, but UnlinkStealTail
@@ -3798,47 +4116,56 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     };
     uint32_t* freshStart = allocU32(wvStartFrame_, handleCapacity);
     uint32_t* freshRelease = allocU32(wvReleaseFrame_, handleCapacity);
+    uint32_t* freshStartIngress = allocU32(wvStartIngress_, handleCapacity);
     uint32_t* freshSlice = allocU32(wvSliceHandles_, cap);
     uint32_t* freshOpHandles = allocU32(wvOpHandles_, cap);
     uint32_t* freshOpFrames = allocU32(wvOpFrames_, cap);
     uint32_t* freshGhostStart = allocU32(wvGhostStartFrame_, cap);
     uint32_t* freshGhostDeath = allocU32(wvGhostDeathFrame_, cap);
     uint32_t* freshGhostRelease = allocU32(wvGhostReleaseFrame_, cap);
+    uint32_t* freshGhostIngress = allocU32(wvGhostStartIngress_, cap);
     uint8_t* freshGhostNoTail = static_cast<uint8_t*>(_aligned_malloc(
         static_cast<size_t>(cap) * sizeof(uint8_t), kMixBufferAlign));
     if (freshStart == nullptr || freshRelease == nullptr ||
+        freshStartIngress == nullptr ||
         freshSlice == nullptr || freshOpHandles == nullptr ||
         freshOpFrames == nullptr || freshGhostStart == nullptr ||
         freshGhostDeath == nullptr || freshGhostRelease == nullptr ||
-        freshGhostNoTail == nullptr) {
+        freshGhostIngress == nullptr || freshGhostNoTail == nullptr) {
         _aligned_free(freshStart);
         _aligned_free(freshRelease);
+        _aligned_free(freshStartIngress);
         _aligned_free(freshSlice);
         _aligned_free(freshOpHandles);
         _aligned_free(freshOpFrames);
         _aligned_free(freshGhostStart);
         _aligned_free(freshGhostDeath);
         _aligned_free(freshGhostRelease);
+        _aligned_free(freshGhostIngress);
         _aligned_free(freshGhostNoTail);
         return false;
     }
     _aligned_free(wvStartFrame_);
     _aligned_free(wvReleaseFrame_);
+    _aligned_free(wvStartIngress_);
     _aligned_free(wvSliceHandles_);
     _aligned_free(wvOpHandles_);
     _aligned_free(wvOpFrames_);
     _aligned_free(wvGhostStartFrame_);
     _aligned_free(wvGhostDeathFrame_);
     _aligned_free(wvGhostReleaseFrame_);
+    _aligned_free(wvGhostStartIngress_);
     _aligned_free(wvGhostNoTail_);
     wvStartFrame_ = freshStart;
     wvReleaseFrame_ = freshRelease;
+    wvStartIngress_ = freshStartIngress;
     wvSliceHandles_ = freshSlice;
     wvOpHandles_ = freshOpHandles;
     wvOpFrames_ = freshOpFrames;
     wvGhostStartFrame_ = freshGhostStart;
     wvGhostDeathFrame_ = freshGhostDeath;
     wvGhostReleaseFrame_ = freshGhostRelease;
+    wvGhostStartIngress_ = freshGhostIngress;
     wvGhostNoTail_ = freshGhostNoTail;
     wvHandleCapacity_ = handleCapacity;
     if (wvGhostCapacity_ < cap) {

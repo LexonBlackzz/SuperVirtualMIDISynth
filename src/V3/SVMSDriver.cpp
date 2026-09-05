@@ -6681,13 +6681,10 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
     const float commonRatio = powf(2.0f, bendSemitones / 12.0f);
     channelPitchBendRatio_[channel] = commonRatio;
     channelCache->SetBendRatio(channel, commonRatio);
-    voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
-        const uint32_t i = voice;
-        const float scale = voiceManager->v.pitchBendScales[i];
-        const float ratio = scale == 1.0f
-            ? commonRatio : powf(2.0f, bendSemitones * scale / 12.0f);
-        voiceManager->v.phaseIncs[i] = voiceManager->v.basePhaseIncs[i] * ratio;
-    });
+    // Rewrites phaseIncs inline — or, under the whole-voice pre-pass,
+    // reports a channel op so the exact-frame application happens in the
+    // owning worker (see VoiceManager::SetRowOpHooks).
+    voiceManager->ApplyChannelBendRatio(channel, bendSemitones);
 }
 
 void Driver::RefreshAllPitchIncrements() {
@@ -6699,14 +6696,7 @@ void Driver::RefreshAllPitchIncrements() {
         const float commonRatio = powf(2.0f, semitones / 12.0f);
         channelPitchBendRatio_[channel] = commonRatio;
         channelCache->SetBendRatio(channel, commonRatio);
-        voiceManager->ForEachChannelActive(channel, [&](VoiceHandle voice) {
-            const uint32_t handle = voice;
-            const float scale = voiceManager->v.pitchBendScales[handle];
-            const float ratio = scale == 1.0f
-                ? commonRatio : powf(2.0f, semitones * scale / 12.0f);
-            voiceManager->v.phaseIncs[handle] =
-                voiceManager->v.basePhaseIncs[handle] * ratio;
-        });
+        voiceManager->ApplyChannelBendRatio(channel, semitones);
     }
 }
 

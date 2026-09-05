@@ -4460,6 +4460,7 @@ struct WholeVoiceCCContext {
     svms::VoiceManager* voices;
     svms::ChannelCache* channels;
     const svms::ChannelParamsSnapshot* channelParams;
+    const svms::RuntimeConfigSnapshot* config = nullptr;
     uint32_t playIndex = 12000u;
     uint32_t launches = 0u;
 };
@@ -4476,6 +4477,18 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
     for (uint32_t index = 0u; index < eventCount; ++index) {
         const svms::RenderEvent& event = events[index];
         const uint8_t channel = event.channel;
+        // Mirrors Driver::HandlePitchBend for the test's zero-master terms:
+        // channel wheel state, then the channel-wide ratio op (or inline
+        // rewrite on the oracle side — identical math either way).
+        const auto applyBend = [&context, channel](uint16_t wheel) {
+            context.channels->PitchBend(
+                channel, static_cast<int16_t>(wheel));
+            const float bendSemitones =
+                context.channels->GetPitchBendSemitones(channel);
+            const float commonRatio = std::pow(2.0f, bendSemitones / 12.0f);
+            context.channels->SetBendRatio(channel, commonRatio);
+            context.voices->ApplyChannelBendRatio(channel, bendSemitones);
+        };
         switch (event.type) {
             case svms::RenderEventType::NoteOn: {
                 // Production launch path (LaunchVoiceGroup -> ConfigureVoice),
@@ -4563,9 +4576,55 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
                     case 123u:
                         context.voices->ReleaseChannel(channel, blockCursor);
                         break;
+                    case 6u:
+                    case 38u:
+                        // RPN data entry mirrors HandleControlChange's wheel
+                        // re-application.
+                        context.channels->ControlChange(channel, event.data1,
+                                                        event.data2);
+                        applyBend(
+                            context.channels->GetPitchBendValue(channel));
+                        break;
+                    case 7u:
+                    case 10u:
+                    case 11u:
+                        context.channels->ControlChange(channel, event.data1,
+                                                        event.data2);
+                        context.channels->RebuildChannel(
+                            channel, *context.config, 44100.0f);
+                        context.voices->MarkChannelMixStale(
+                            channel,
+                            context.channels->GetParams()[channel]);
+                        break;
+                    case 121u: {
+                        const bool sustainWasActive =
+                            context.channels->IsSustainActive(channel);
+                        const bool sostenutoWasActive =
+                            context.channels->IsSostenutoActive(channel);
+                        context.channels->ControlChange(channel, 121u,
+                                                        event.data2);
+                        if (sustainWasActive)
+                            context.voices->ReleaseSustain(channel,
+                                                           blockCursor);
+                        if (sostenutoWasActive)
+                            context.voices->ReleaseSostenuto(channel,
+                                                             blockCursor);
+                        // Reset All Controllers also centers the wheel.
+                        applyBend(8192u);
+                        context.channels->RebuildChannel(
+                            channel, *context.config, 44100.0f);
+                        context.voices->MarkChannelMixStale(
+                            channel,
+                            context.channels->GetParams()[channel]);
+                        break;
+                    }
                     default:
                         break;
                 }
+                break;
+            case svms::RenderEventType::PitchBend:
+                applyBend(static_cast<uint16_t>((event.data2 << 7) |
+                                                event.data1));
                 break;
             default:
                 break;
@@ -4629,9 +4688,9 @@ void TestWholeVoiceCCDifferential() {
               "whole-voice CC differential selects the requested backend");
 
         WholeVoiceCCContext oracleContext{oracleVoices.get(), &oracleChannels,
-                                          oracleChannels.GetParams()};
+                                          oracleChannels.GetParams(), &cfg};
         WholeVoiceCCContext wholeContext{wholeVoices.get(), &wholeChannels,
-                                         wholeChannels.GetParams()};
+                                         wholeChannels.GetParams(), &cfg};
         oracle.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent,
                                        &oracleContext);
         whole.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent,
@@ -4648,7 +4707,7 @@ void TestWholeVoiceCCDifferential() {
                 event.channel = static_cast<uint8_t>(rng.Next() % 4u);
                 event.frameOffset = rng.Next() % kFrames;
                 event.ingressSequence = block * kEventsPerBlock + j;
-                const uint32_t roll = rng.Next() % 10u;
+                const uint32_t roll = rng.Next() % 12u;
                 if (roll < 4u) {
                     event.type = svms::RenderEventType::NoteOn;
                     event.data1 =
@@ -4659,22 +4718,44 @@ void TestWholeVoiceCCDifferential() {
                     event.type = svms::RenderEventType::NoteOff;
                     event.data1 =
                         static_cast<uint8_t>(36u + rng.Next() % 72u);
-                } else if (roll < 7u) {
+                } else if (roll == 6u) {
                     event.type = svms::RenderEventType::ControlChange;
                     event.data1 = 64u;
                     event.data2 = (rng.Next() % 2u) != 0u ? 127u : 0u;
-                } else if (roll < 8u) {
+                } else if (roll == 7u) {
                     event.type = svms::RenderEventType::ControlChange;
                     event.data1 = 66u;
                     event.data2 = (rng.Next() % 2u) != 0u ? 127u : 0u;
-                } else if (roll < 9u) {
+                } else if (roll == 8u) {
                     event.type = svms::RenderEventType::ControlChange;
                     event.data1 = 120u;
                     event.data2 = 0u;
-                } else {
+                } else if (roll == 9u) {
                     event.type = svms::RenderEventType::ControlChange;
                     event.data1 = 123u;
                     event.data2 = 0u;
+                } else if (roll == 10u) {
+                    // Mix-fold controllers: CC7/10/11 land as gain ops.
+                    static const uint8_t kMixControllers[3] = {7u, 10u, 11u};
+                    event.type = svms::RenderEventType::ControlChange;
+                    event.data1 = kMixControllers[rng.Next() % 3u];
+                    event.data2 = static_cast<uint8_t>(rng.Next() % 128u);
+                } else {
+                    // Row-mutator variety: pitch bend, reset-all, RPN data.
+                    const uint32_t pick = rng.Next() % 4u;
+                    if (pick == 0u) {
+                        event.type = svms::RenderEventType::PitchBend;
+                        event.data1 =
+                            static_cast<uint8_t>(rng.Next() % 128u);
+                        event.data2 =
+                            static_cast<uint8_t>(rng.Next() % 128u);
+                    } else {
+                        static const uint8_t kRowControllers[3] = {
+                            121u, 6u, 38u};
+                        event.type = svms::RenderEventType::ControlChange;
+                        event.data1 = kRowControllers[pick - 1u];
+                        event.data2 = static_cast<uint8_t>(rng.Next() % 128u);
+                    }
                 }
                 events.push_back(event);
             }
@@ -4704,6 +4785,26 @@ void TestWholeVoiceCCDifferential() {
                     std::fabs(oracleLeft[frame] - wholeLeft[frame]));
                 blockDiff = (std::max)(blockDiff,
                     std::fabs(oracleRight[frame] - wholeRight[frame]));
+            }
+            if (blockDiff > 2.0e-5f) {
+                for (uint32_t frame = 0; frame < kFrames; ++frame) {
+                    if (std::fabs(oracleLeft[frame] - wholeLeft[frame]) >
+                            2.0e-5f ||
+                        std::fabs(oracleRight[frame] - wholeRight[frame]) >
+                            2.0e-5f) {
+                        std::fprintf(stderr,
+                            "[WVDIFF] backend=%s cc-block=%u first-diff "
+                            "frame=%u\n",
+                            backendName, block, frame);
+                        break;
+                    }
+                }
+                for (const svms::RenderEvent& e : events) {
+                    std::fprintf(stderr,
+                        "[WVDIFFEV] blk=%u f=%u t=%d ch=%u d1=%u d2=%u\n",
+                        block, e.frameOffset, static_cast<int>(e.type),
+                        e.channel, e.data1, e.data2);
+                }
             }
             std::fprintf(stderr,
                          "[WVDIFF] backend=%s cc-block=%u max=%g\n",
