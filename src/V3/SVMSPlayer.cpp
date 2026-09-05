@@ -43,6 +43,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -280,6 +281,8 @@ struct Api {
             GetProcAddress(module, "SVMS_GetInterface"));
         if (!getInterface) {
             error = "SVMSAPI.dll has no SVMS_GetInterface export";
+            FreeLibrary(module);
+            module = nullptr;
             return false;
         }
         fn.struct_size = sizeof(fn);
@@ -287,7 +290,52 @@ struct Api {
                 SVMS_RESULT_OK ||
             fn.abi_version != SVMS_ABI_VERSION_1) {
             error = "SVMSAPI.dll does not support ABI 1";
+            FreeLibrary(module);
+            module = nullptr;
             return false;
+        }
+        // ABI contract: the runtime reports its real table size in
+        // struct_size and writes only that prefix. Zero everything beyond it
+        // (a foreign or partial runtime must never leave a hole the player
+        // would call — this was a real null-call crash with a wrapper that
+        // returned a sparse table), then require every function the player
+        // uses: a runtime that cannot fill the table cannot drive the
+        // player and is refused cleanly here instead of crashing later.
+        if (fn.struct_size < sizeof(fn)) {
+            memset(reinterpret_cast<uint8_t*>(&fn) + fn.struct_size, 0,
+                   sizeof(fn) - fn.struct_size);
+        } else if (fn.struct_size > sizeof(fn)) {
+            fn.struct_size = sizeof(fn);
+        }
+        static const struct { size_t offset; const char* name; } kRequired[] = {
+#define SVMS_REQUIRED_SLOT(member) \
+            { offsetof(SVMS_Interface, member), #member }
+            SVMS_REQUIRED_SLOT(create_session),
+            SVMS_REQUIRED_SLOT(destroy_session),
+            SVMS_REQUIRED_SLOT(send_short),
+            SVMS_REQUIRED_SLOT(reset),
+            SVMS_REQUIRED_SLOT(get_telemetry),
+            SVMS_REQUIRED_SLOT(send_timed_short_batch),
+            SVMS_REQUIRED_SLOT(get_output_clock),
+            SVMS_REQUIRED_SLOT(set_ingress_mode),
+            SVMS_REQUIRED_SLOT(load_soundfont_utf8),
+            SVMS_REQUIRED_SLOT(get_config_json),
+            SVMS_REQUIRED_SLOT(patch_config_json),
+            SVMS_REQUIRED_SLOT(cancel_session_submissions),
+#undef SVMS_REQUIRED_SLOT
+        };
+        const uint8_t* table = reinterpret_cast<const uint8_t*>(&fn);
+        for (const auto& slot : kRequired) {
+            const void* ptr = nullptr;
+            if (slot.offset + sizeof(ptr) <= fn.struct_size)
+                memcpy(&ptr, table + slot.offset, sizeof(ptr));
+            if (!ptr) {
+                error = std::string("runtime table is missing ") +
+                        slot.name + " — this module cannot drive the player";
+                FreeLibrary(module);
+                module = nullptr;
+                return false;
+            }
         }
         return true;
     }
