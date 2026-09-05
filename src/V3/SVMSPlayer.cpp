@@ -154,9 +154,10 @@ LONG WINAPI PlayerCrashFilter(EXCEPTION_POINTERS* ep) {
             if (file != INVALID_HANDLE_VALUE) {
                 MINIDUMP_EXCEPTION_INFORMATION mei{
                     GetCurrentThreadId(), ep, 0};
+                const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
+                    MiniDumpNormal | MiniDumpWithIndirectlyReferencedMemory);
                 MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
-                                  file, MiniDumpNormal, &mei, nullptr,
-                                  nullptr);
+                                  file, dumpType, &mei, nullptr, nullptr);
                 CloseHandle(file);
             }
         }
@@ -683,7 +684,7 @@ struct PlayerCore {
 
 struct DecodeArgs {
     PlayerCore* core = nullptr;
-    std::wstring path;
+    svms::MappedMidiFile* file = nullptr;  // shared persistent mapping
     uint64_t startFrame = 0;
     bool replayEmitted = false;
     std::atomic<bool> cancel{false};
@@ -706,16 +707,15 @@ bool DecodeSink(const svms::PackedMidiEvent& event, void* user) {
 
 void DecoderThread(DecodeArgs* args) {
     PlayerCore& core = *args->core;
-    svms::MappedMidiFile file;
     std::string error;
-    if (!file.Open(args->path.c_str(), error)) {
-        core.decoderError = error;
+    if (!args->file) {
+        core.decoderError = "no song mapping";
         core.decoderFailed.store(true, std::memory_order_release);
         delete args;
         return;
     }
     svms::MidiStreamDecoder decoder;
-    if (!decoder.Decode(file, core.sampleRate, DecodeSink, args,
+    if (!decoder.Decode(*args->file, core.sampleRate, DecodeSink, args,
                         &args->cancel, nullptr, error)) {
         if (!args->cancel.load(std::memory_order_relaxed)) {
             core.decoderError = error;
@@ -1112,6 +1112,11 @@ void StressConfigTick(PlayerCore& core, uint64_t* rng,
 DecodeArgs* g_decoderArgs = nullptr;
 std::thread g_decoderThread;
 
+// The song's file mapping persists across synth switches — switching only
+// swaps the engine and resumes decoding from the current position, it never
+// re-opens (or re-scans) the MIDI file.
+svms::MappedMidiFile g_songFile;
+
 void StopDecoder() {
     if (g_decoderArgs) g_decoderArgs->cancel.store(true);
     if (g_decoderThread.joinable()) g_decoderThread.join();
@@ -1120,7 +1125,7 @@ void StopDecoder() {
 
 void StartDecoder(PlayerCore* core, uint64_t startFrame) {
     StopDecoder();
-    g_decoderArgs = new DecodeArgs{core, core->filePath, startFrame};
+    g_decoderArgs = new DecodeArgs{core, &g_songFile, startFrame};
     g_decoderThread = std::thread(DecoderThread, g_decoderArgs);
 }
 
@@ -1265,19 +1270,30 @@ void TearDownEngine(PlayerCore& core) {
     }
 }
 
-// Runtime synth switch: full stop → fresh engine → song restarts from 0.
+// Runtime synth switch: swap ONLY the engine. The song stays loaded and
+// playback resumes at the current position (channel replay state is kept so
+// instruments come back correctly) — the MIDI file is never re-opened.
 bool SwitchEngine(PlayerCore& core, const EngineSpec& spec,
                   uint32_t lookaheadMs, std::string& error) {
+    uint64_t resumeFrame =
+        core.totalFrames
+            ? static_cast<uint64_t>(core.playhead.load(
+                  std::memory_order_relaxed))
+            : 0u;
+    if (resumeFrame > core.totalFrames) resumeFrame = core.totalFrames;
     core.state.store(kStateSeeking, std::memory_order_release);
     TearDownEngine(core);
-    core.playhead.store(0, std::memory_order_relaxed);
-    core.cursorFrame.store(0, std::memory_order_relaxed);
-    core.lastSubmittedFrame.store(0, std::memory_order_relaxed);
+    core.lastSubmittedFrame.store(resumeFrame, std::memory_order_relaxed);
+    core.cursorFrame.store(resumeFrame, std::memory_order_relaxed);
+    core.playhead.store(static_cast<int64_t>(resumeFrame),
+                        std::memory_order_relaxed);
     core.submittedEvents.store(0, std::memory_order_relaxed);
+    core.submittedNoteOns.store(0, std::memory_order_relaxed);
     core.endOfSong.store(false, std::memory_order_release);
     core.decoderFailed.store(false, std::memory_order_relaxed);
     core.decoderError.clear();
-    for (auto& channel : core.channels) channel = {};
+    // Channel replay state is deliberately KEPT: resuming mid-song needs it
+    // to restore programs/controllers at the new position.
     if (!BringUpEngine(core, spec, lookaheadMs, error)) {
         core.quit.store(false, std::memory_order_release);
         core.state.store(kStateIdle, std::memory_order_release);
@@ -1286,7 +1302,7 @@ bool SwitchEngine(PlayerCore& core, const EngineSpec& spec,
     core.state.store(kStateIdle, std::memory_order_release);
     StartSubmitThread(&core);
     if (core.totalFrames > 0) {
-        StartDecoder(&core, 0);
+        StartDecoder(&core, resumeFrame);
         StartPlayback(&core);
     }
     return true;
@@ -1920,27 +1936,34 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
             if (GetOpenFileNameW(&ofn)) {
-                // Scan first: validates + yields totalFrames for the seek bar.
-                svms::MappedMidiFile mapFile;
-                svms::MidiStreamDecoder decoder;
+                // Swap the persistent mapping: stop the decoder first (it
+                // reads g_songFile), then re-open, scan, and restart.
+                core.state.store(kStateSeeking, std::memory_order_release);
+                StopDecoder();
+                g_songFile.Close();
                 svms::MidiStreamInfo info{};
-                if (!mapFile.Open(ofn.lpstrFile, guiStatus)) {
-                    // guiStatus carries the error text
-                } else if (!decoder.Scan(mapFile, core.sampleRate, info,
-                                         guiStatus)) {
-                    // scan error already in guiStatus
-                } else if (LoadSong(core, ofn.lpstrFile)) {
-                    core.totalFrames = info.totalFrames;
-                    ui.songEnded = false;
-                    char summary[128];
-                    snprintf(summary, sizeof(summary),
-                             "loaded: %llu events, %.1f s",
-                             static_cast<unsigned long long>(info.eventCount),
-                             static_cast<double>(info.totalFrames) /
-                                 core.sampleRate);
-                    guiStatus = summary;
+                if (!g_songFile.Open(ofn.lpstrFile, guiStatus)) {
+                    core.totalFrames = 0;
+                    core.state.store(kStateIdle, std::memory_order_release);
+                } else if (!svms::MidiStreamDecoder{}.Scan(
+                               g_songFile, core.sampleRate, info, guiStatus)) {
+                    core.totalFrames = 0;
+                    core.state.store(kStateIdle, std::memory_order_release);
                 } else {
-                    guiStatus = "load failed: no synth is loaded";
+                    core.totalFrames = info.totalFrames;
+                    if (LoadSong(core, ofn.lpstrFile)) {
+                        ui.songEnded = false;
+                        char summary[128];
+                        snprintf(summary, sizeof(summary),
+                                 "loaded: %llu events, %.1f s",
+                                 static_cast<unsigned long long>(
+                                     info.eventCount),
+                                 static_cast<double>(info.totalFrames) /
+                                     core.sampleRate);
+                        guiStatus = summary;
+                    } else {
+                        guiStatus = "load failed: no synth is loaded";
+                    }
                 }
             }
         }
@@ -2049,6 +2072,8 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
             }
         }
         // ── Telemetry graphs ────────────────────────────────────────────
+        // Polyphony and NPS share a row (half width each, distinct colors);
+        // render load is shown as a percentage of the engine's frame budget.
         float voiceMax = 1.0f, renderMax = 1.0f, npsMax = 1.0f;
         for (uint32_t i = 0; i < ui.historyCount; ++i) {
             if (ui.voiceHistory[i] > voiceMax) voiceMax = ui.voiceHistory[i];
@@ -2056,27 +2081,80 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
                 renderMax = ui.renderHistory[i];
             if (ui.npsHistory[i] > npsMax) npsMax = ui.npsHistory[i];
         }
-        char label[80];
-        snprintf(label, sizeof(label),
-                 "poly — active voices   now %u   peak %.0f",
-                 ui.telemetry.active_voices, static_cast<double>(voiceMax));
-        ImGui::PlotLines(label, ui.voiceHistory, 128, ui.historyIndex,
-                         nullptr, 0.0f, voiceMax, ImVec2(-1, 64));
-        snprintf(label, sizeof(label),
-                 "nps — notes per second   now %.0f",
-                 static_cast<double>(ui.currentNps));
-        ImGui::PlotLines(label, ui.npsHistory, 128, ui.historyIndex,
-                         nullptr, 0.0f, npsMax, ImVec2(-1, 64));
-        if (svmsBackend) {
-            snprintf(label, sizeof(label),
-                     "render — engine ms/frame   now %.2f   peak %.2f",
-                     ui.telemetry.render_time_ms, ui.telemetry.render_peak);
-            ImGui::PlotLines(label, ui.renderHistory, 128, ui.historyIndex,
-                             nullptr, 0.0f, renderMax, ImVec2(-1, 64));
+        const ImVec4 polyColor(0.35f, 0.75f, 1.0f, 1.0f);
+        const ImVec4 npsColor(0.45f, 1.0f, 0.55f, 1.0f);
+        const float colGap = 16.0f;
+        const float colWidth =
+            (ImGui::GetContentRegionAvail().x - colGap) * 0.5f;
+
+        ImGui::TextColored(polyColor, "POLYPHONY");
+        ImGui::SameLine(colWidth + colGap);
+        ImGui::TextColored(npsColor, "NPS — NOTES / SECOND");
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, polyColor);
+        ImGui::PlotLines("##poly", ui.voiceHistory, 128, ui.historyIndex,
+                         nullptr, 0.0f, voiceMax, ImVec2(colWidth, 62));
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, npsColor);
+        ImGui::PlotLines("##nps", ui.npsHistory, 128, ui.historyIndex,
+                         nullptr, 0.0f, npsMax, ImVec2(-1, 62));
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        ImGui::TextColored(polyColor, "now %u", ui.telemetry.active_voices);
+        ImGui::SameLine();
+        ImGui::TextDisabled("peak %.0f", static_cast<double>(voiceMax));
+        ImGui::SameLine(colWidth + colGap);
+        ImGui::TextColored(npsColor, "now %.0f",
+                           static_cast<double>(ui.currentNps));
+        ImGui::SameLine();
+        ImGui::TextDisabled("peak %.0f",
+                            static_cast<double>(npsMax));
+
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        // Frame budget: buffer_frames / sample_rate. Render time as a
+        // percentage of that budget is the engine's real-time CPU load.
+        const float budgetMs = (ui.telemetry.buffer_frames &&
+                                ui.telemetry.sample_rate)
+            ? static_cast<float>(ui.telemetry.buffer_frames) * 1000.0f /
+                  static_cast<float>(ui.telemetry.sample_rate)
+            : 0.0f;
+        const float cpuNow =
+            budgetMs ? ui.telemetry.render_time_ms / budgetMs * 100.0f : 0.0f;
+        const float cpuPeak = budgetMs ? renderMax / budgetMs * 100.0f : 0.0f;
+        const ImVec4 renderColor =
+            cpuNow < 50.0f ? ImVec4(0.45f, 1.0f, 0.55f, 1.0f)
+            : cpuNow < 80.0f ? ImVec4(1.0f, 0.8f, 0.3f, 1.0f)
+                             : ImVec4(1.0f, 0.35f, 0.35f, 1.0f);
+        char renderLabel[96];
+        if (svmsBackend && budgetMs > 0.0f) {
+            snprintf(renderLabel, sizeof(renderLabel),
+                     "RENDER — CPU of frame budget   now %.0f%% (%.2f ms)   "
+                     "peak %.0f%%",
+                     static_cast<double>(cpuNow),
+                     ui.telemetry.render_time_ms,
+                     static_cast<double>(cpuPeak));
         } else {
-            ImGui::TextDisabled(
-                "render graph: engine timing is SVMS telemetry only");
+            snprintf(renderLabel, sizeof(renderLabel),
+                     "RENDER — engine timing is SVMS telemetry only");
         }
+        ImGui::TextColored(svmsBackend ? renderColor
+                                       : ImVec4(0.55f, 0.55f, 0.55f, 1.0f),
+                           "%s", renderLabel);
+        if (svmsBackend) {
+            // Scale the history to percent so the plot IS the CPU load.
+            float cpuHistory[128];
+            const float scale = budgetMs > 0.0f ? 100.0f / budgetMs : 0.0f;
+            for (uint32_t i = 0; i < 128; ++i)
+                cpuHistory[i] = ui.renderHistory[i] * scale;
+            ImGui::PushStyleColor(ImGuiCol_PlotLines, renderColor);
+            ImGui::PlotLines("##render", cpuHistory, 128, ui.historyIndex,
+                             nullptr, 0.0f, cpuPeak > 0.0f ? cpuPeak : 1.0f,
+                             ImVec2(-1, 62));
+            ImGui::PopStyleColor();
+        }
+        ImGui::Spacing();
 
         ImGui::Separator();
         const uint64_t ringCapacity = core.ring->Capacity();
@@ -2323,10 +2401,10 @@ int wmain(int argc, wchar_t** argv) {
 
     // Scan first: validates the file and yields duration/peak statistics.
     // A fileless GUI launch skips this — the song is picked inside the window.
+    // The mapping persists in g_songFile so synth switches never re-open it.
     svms::MidiStreamInfo info{};
     if (!file.empty()) {
-        svms::MappedMidiFile mapFile;
-        if (!mapFile.Open(file.c_str(), error)) {
+        if (!g_songFile.Open(file.c_str(), error)) {
             std::fprintf(stderr, "error: %s\n", error.c_str());
             TearDownEngine(core);
             return 1;
@@ -2334,7 +2412,7 @@ int wmain(int argc, wchar_t** argv) {
         svms::MidiStreamDecoder decoder;
         std::printf("scanning...\r");
         std::fflush(stdout);
-        if (!decoder.Scan(mapFile, core.sampleRate, info, error)) {
+        if (!decoder.Scan(g_songFile, core.sampleRate, info, error)) {
             std::fprintf(stderr, "error: %s\n", error.c_str());
             TearDownEngine(core);
             return 1;
@@ -2498,6 +2576,15 @@ int wmain(int argc, wchar_t** argv) {
         const uint64_t ringCapacity = core.ring->Capacity();
         const uint32_t ringPercent = static_cast<uint32_t>(
             ringCapacity ? ringSize * 100u / ringCapacity : 0u);
+        const float renderBudgetMs =
+            (ui.telemetry.buffer_frames && ui.telemetry.sample_rate)
+                ? static_cast<float>(ui.telemetry.buffer_frames) * 1000.0f /
+                      static_cast<float>(ui.telemetry.sample_rate)
+                : 0.0f;
+        const float renderCpu =
+            renderBudgetMs
+                ? ui.telemetry.render_time_ms / renderBudgetMs * 100.0f
+                : 0.0f;
 
         std::printf(
             "\x1b[H"
@@ -2506,7 +2593,7 @@ int wmain(int argc, wchar_t** argv) {
             "  %s / %s   (%.1f%%)   events %llu   feed %llu evt/s\n"
             "  poly   %s   now %u  peak %.0f\n"
             "  nps    %s   now %.0f\n"
-            "  render %s   now %.2f ms  peak %.2f ms%s\n"
+            "  render %s   now %.2f ms (%.0f%% of frame)  peak %.2f ms%s\n"
             "  ring %u%%  steals %llu  audio %s  sf2 %s  rate %u\n"
             "  [space] pause  [s] stop  [left/right] seek  [up/down] volume  [l]oop  [q]uit\n",
             versionLabel, stateName, ui.volume * 100.0f,
@@ -2518,7 +2605,8 @@ int wmain(int argc, wchar_t** argv) {
             voiceSpark,
             ui.telemetry.active_voices, static_cast<double>(voiceMax),
             npsSpark, static_cast<double>(ui.currentNps),
-            renderSpark, ui.telemetry.render_time_ms, ui.telemetry.render_peak,
+            renderSpark, ui.telemetry.render_time_ms, renderCpu,
+            ui.telemetry.render_peak,
             svmsBackend ? "" : "   (SVMS telemetry only)",
             ringPercent,
             static_cast<unsigned long long>(ui.telemetry.voice_steals),
