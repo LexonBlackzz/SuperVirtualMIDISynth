@@ -1377,7 +1377,9 @@ void PrintUsage() {
     std::puts(
         "svms_player — console MIDI player for SuperVirtualMIDISynth\n"
         "\n"
-        "usage: svms_player [options] <file.mid>\n"
+        "usage: svms_player [options] [file.mid]\n"
+        "  (launching with no file — or no arguments at all — opens the\n"
+        "   GUI window; pick the song and the synth inside it)\n"
         "  --backend <name>    svms (default) | kdapi | winmm\n"
         "  --dll <path>        synth module for the kdapi/winmm backends\n"
         "                      (default: OmniMIDI.dll / winmm.dll, app dir\n"
@@ -2103,14 +2105,13 @@ int wmain(int argc, wchar_t** argv) {
     if (!probePath.empty()) return RunProbeMode(probePath);
     if (scanRequested) return RunScanMode(scanDir.empty() ? ExeDirectory()
                                                           : scanDir);
-    if (positional.empty() && !guiRequested) {
-        PrintUsage();
-        return 1;
-    }
-    if (!positional.empty()) {
-        file = positional.front();
+    if (positional.empty()) {
+        // Plain launch (or --gui with no file): open the window and pick a
+        // song — and a synth — inside it.
+        guiRequested = true;
+        file.clear();
     } else {
-        file.clear();  // fileless GUI launch: pick a song inside the window
+        file = positional.front();
     }
     if (ringMegabytes < 1u) ringMegabytes = 1u;
 
