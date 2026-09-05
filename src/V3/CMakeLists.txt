@@ -590,6 +590,10 @@ set_target_properties(svmsapi PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+# Map file: lets crash-stack RVAs be resolved to static/internal functions
+# even when dbghelp's DIA refuses the newest toolset's PDB format.
+target_link_options(svmsapi PRIVATE
+    "/MAP:${CMAKE_BINARY_DIR}/bin/SVMSAPI.map")
 
 if(NOT SVMS_XP_COMPAT)
     add_executable(svms_v3_render
@@ -616,6 +620,27 @@ if(NOT SVMS_XP_COMPAT)
         "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
     target_link_libraries(svms_v3_render PRIVATE shell32 d3d11 dxgi d3dcompiler)
     set_target_properties(svms_v3_render PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    # Console MIDI player — a real LoadLibrary client of SVMSAPI.dll that
+    # exercises output-frame scheduling, lossless ingress, telemetry and
+    # config patching exactly the way an external player integrates.
+    add_executable(svms_v3_player
+        SVMSPlayer.cpp
+        SVMSMidiStream.cpp)
+    target_compile_definitions(svms_v3_player PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+        _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_player PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(svms_v3_player PRIVATE dbghelp)
+    add_dependencies(svms_v3_player svmsapi)
+    add_custom_command(TARGET svms_v3_player POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:svmsapi>"
+                "$<TARGET_FILE_DIR:svms_v3_player>/SVMSAPI.dll"
+        VERBATIM)
+    set_target_properties(svms_v3_player PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
     # GPU synthesis proof spike (D3D11 compute). Offline-only, not XP. Proves

@@ -26,6 +26,11 @@
 *.mod
 *.smod
 
+# Local WIP: player client + crash-dump tooling (not for distribution)
+src/V3/SVMSPlayer.cpp
+tools/DumpStacks.cpp
+tools/Rva2Sym.cpp
+
 # Compiled Static libraries
 *.lai
 *.la
