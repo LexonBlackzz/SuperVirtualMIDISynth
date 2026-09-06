@@ -464,6 +464,111 @@ static void WakeAddressWaiters(std::atomic<uint32_t>& address) noexcept {
     }
 }
 
+// ── TSC-anchored QPC clock ─────────────────────────────────────────────────
+// SendDirectData / MIDI-input stamp every event with a QPC timestamp, and
+// the QueryPerformanceCounter call is a measurable share of producer CPU at
+// multi-million-event rates (profiled ~7% of process total). On CPUs with
+// an invariant TSC, __rdtsc is a user-mode read of the SAME underlying
+// clock: qpc(t) ≈ qpcBase + (tsc - tscBase) * slope. The slope is
+// calibrated at startup over a real interval and continuously refreshed by
+// the audio callback, which already reads a true QPC once per block; the
+// base triple is published under a seqlock so producers read a consistent
+// snapshot. Non-invariant CPUs fall back to plain QPC forever.
+class TscQpcClock {
+public:
+    void Initialize() {
+        int regs[4]{};
+        __cpuid(regs, 0x80000000u);
+        if (static_cast<unsigned>(regs[0]) < 0x80000007u) return;
+        __cpuid(regs, 0x80000007u);
+        if (!(regs[3] & (1u << 8))) return;  // EDX[8]: invariant TSC
+
+        LARGE_INTEGER q0{}, q1{};
+        QueryPerformanceCounter(&q0);
+        const uint64_t t0 = __rdtsc();
+        Sleep(60);
+        QueryPerformanceCounter(&q1);
+        const uint64_t t1 = __rdtsc();
+        if (q1.QuadPart <= q0.QuadPart || t1 <= t0) return;
+        const double measured =
+            static_cast<double>(q1.QuadPart - q0.QuadPart) /
+            static_cast<double>(t1 - t0);
+        if (!(measured > 0.0)) return;
+        // Publish the first base pair with the measured slope. The sequence
+        // starts even, marking the snapshot valid for readers.
+        fields_.tscBase = t1;
+        fields_.qpcBase = static_cast<uint64_t>(q1.QuadPart);
+        fields_.slope = measured;
+        seq_.store(2u, std::memory_order_release);
+        available_.store(true, std::memory_order_release);
+    }
+
+    // Audio thread only: a true QPC was just read for this block; refresh
+    // the base pair and smooth the slope so session-long drift stays
+    // far below one audio frame.
+    void Refresh(uint64_t trueQpc, uint64_t tsc) noexcept {
+        if (!available_.load(std::memory_order_relaxed)) return;
+        const uint32_t seq = seq_.load(std::memory_order_relaxed);
+        const int64_t tscDelta =
+            static_cast<int64_t>(tsc) -
+            static_cast<int64_t>(fields_.tscBase);
+        const int64_t qpcDelta =
+            static_cast<int64_t>(trueQpc) -
+            static_cast<int64_t>(fields_.qpcBase);
+        double slope = fields_.slope;
+        if (tscDelta > 0 && qpcDelta > 0) {
+            const double instant =
+                static_cast<double>(qpcDelta) /
+                static_cast<double>(tscDelta);
+            if (instant > 0.0 && instant < 1.0) {
+                slope = slope * 0.9 + instant * 0.1;
+            }
+        }
+        seq_.store(seq + 1u, std::memory_order_relaxed);  // odd
+        fields_.tscBase = tsc;
+        fields_.qpcBase = trueQpc;
+        fields_.slope = slope;
+        seq_.store(seq + 2u, std::memory_order_release);  // even
+    }
+
+    // Producer threads. Returns false when unavailable (callers fall back
+    // to QueryPerformanceCounter).
+    bool Now(uint64_t& outQpc) const noexcept {
+        if (!available_.load(std::memory_order_acquire)) return false;
+        uint64_t tscBase, qpcBase;
+        double slope;
+        uint32_t before, after;
+        for (;;) {
+            before = seq_.load(std::memory_order_acquire);
+            if (before & 1u) continue;  // writer in progress
+            tscBase = fields_.tscBase;
+            qpcBase = fields_.qpcBase;
+            slope = fields_.slope;
+            after = seq_.load(std::memory_order_acquire);
+            if (after == before) break;
+        }
+        const uint64_t now = __rdtsc();
+        if (now <= tscBase) {
+            outQpc = qpcBase;
+            return true;
+        }
+        const double delta = static_cast<double>(now - tscBase);
+        const int64_t offset = static_cast<int64_t>(delta * slope);
+        outQpc = qpcBase + static_cast<uint64_t>(offset);
+        return true;
+    }
+
+private:
+    struct Fields {
+        uint64_t tscBase = 0u;
+        uint64_t qpcBase = 0u;
+        double slope = 0.0;
+    };
+    Fields fields_{};
+    std::atomic<uint32_t> seq_{1u};  // odd = never initialized
+    std::atomic<bool> available_{false};
+};
+
 static void PublishTerminationFence(std::atomic<uint64_t>& destination,
                                     uint32_t sequence) noexcept {
     const uint64_t encoded = static_cast<uint64_t>(sequence) + 1u;
@@ -2191,6 +2296,9 @@ private:
     bool diagnosticsWindow_;
     bool diagnosticsDebugOutput_;
     std::atomic<uint32_t> nextEventSequence_;
+    // Producer-side timestamp clock (invariant-TSC hosts; plain QPC
+    // otherwise). Refreshed by the audio callback each block.
+    TscQpcClock tscClock_;
     // A state event can overtake older note-ons held in another priority
     // lane.  These producer-published fences prevent those stale note-ons
     // from sounding after a reset or per-channel termination controller.
@@ -3178,6 +3286,7 @@ bool Driver::Initialize() {
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     qpcFreq = freq.QuadPart;
+    tscClock_.Initialize();
 
     // Note-on collapse window in QPC ticks (fixed 20 ms, frame-size
     // independent). Coalescing itself defaults OFF; this only defines the
@@ -4216,11 +4325,14 @@ void CALLBACK Driver::MidiInputCallback(HMIDIIN input, UINT message,
     if (!self || !self->midiInputRunning_.load(std::memory_order_acquire))
         return;
     if (message == MIM_DATA) {
-        LARGE_INTEGER timestamp{};
-        QueryPerformanceCounter(&timestamp);
+        uint64_t timestamp = 0u;
+        if (!self->tscClock_.Now(timestamp)) {
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            timestamp = static_cast<uint64_t>(qpc.QuadPart);
+        }
         self->SubmitShortMsgAtQpc(
-            static_cast<uint32_t>(parameter1),
-            static_cast<uint64_t>(timestamp.QuadPart));
+            static_cast<uint32_t>(parameter1), timestamp);
         return;
     }
     if (message != MIM_LONGDATA) return;
@@ -4264,9 +4376,13 @@ void Driver::ResetAllVoices() {
 }
 
 void Driver::SubmitShortMsg(uint32_t msg) {
-    LARGE_INTEGER timestamp{};
-    QueryPerformanceCounter(&timestamp);
-    SubmitShortMsgAtQpc(msg, static_cast<uint64_t>(timestamp.QuadPart));
+    uint64_t timestamp = 0u;
+    if (!tscClock_.Now(timestamp)) {
+        LARGE_INTEGER qpc{};
+        QueryPerformanceCounter(&qpc);
+        timestamp = static_cast<uint64_t>(qpc.QuadPart);
+    }
+    SubmitShortMsgAtQpc(msg, timestamp);
 }
 
 void Driver::SubmitShortMsgAtFrame(uint32_t msg, uint64_t outputFrame) {
@@ -5156,6 +5272,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     //      kMaxEventsPerBlock events regardless of input density.
     uint64_t blockStartQPC;
     QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&blockStartQPC));
+    self->tscClock_.Refresh(blockStartQPC, __rdtsc());
 
     // ── Virtual render clock ─────────────────────────────────────────
     // Monotonically advances by (numFrames * qpcFreq / sr) each callback
