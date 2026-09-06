@@ -256,6 +256,7 @@ enum class RLCommandType : uint32_t {
     RequestRestart       = 0x00000110,
     SetPhaseRotation     = 0x00000111,
     SetNoteOnCollapse    = 0x00000112,
+    SetVoiceRetireFloor  = 0x00000113,
 
 
     Invalid              = 0xFFFFFFFF,

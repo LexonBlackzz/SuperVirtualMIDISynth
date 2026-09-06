@@ -2696,6 +2696,30 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         return svms::RLResult::Ok;
     }
 
+    case RT::SetVoiceRetireFloor: {
+        // param = raw linear gain threshold bits (IEEE-754). Applies to
+        // newly started releases; sounding tails finish at their start
+        // floor, so live changes never truncate a fade mid-flight.
+        float threshold = 0.0f;
+        static_assert(sizeof(threshold) == sizeof(cmd.param),
+                      "retire floor rides the param word");
+        std::memcpy(&threshold, &cmd.param, sizeof(threshold));
+        if (!std::isfinite(threshold) || threshold <= 0.0f ||
+            threshold > 0.05f) {
+            strncpy_s(resultText, kText,
+                      "retire floor must be finite in (0, 0.05]",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        g_voiceRetireThreshold.store(threshold,
+                                     std::memory_order_relaxed);
+        engineConfig_.voiceRetireThreshold = threshold;
+        snprintf(resultText, kText,
+                 "voice retire floor set to %.6f (%.2f dB)",
+                 threshold, 20.0 * std::log10(static_cast<double>(threshold)));
+        return svms::RLResult::Ok;
+    }
+
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
             cmd.resultText, svms::kRuntimeLinkCommandTextCapacity);

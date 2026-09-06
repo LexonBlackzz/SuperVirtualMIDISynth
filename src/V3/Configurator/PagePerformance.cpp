@@ -4,8 +4,11 @@
 #include "Theme.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
+#include "../SVMSRuntimeLink.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 
 namespace svms::cfg {
@@ -63,7 +66,7 @@ void RestartCell() {
 void LiveVoiceCell() {
     CenteredStatusCell(
         "LIVE", GetSuccess(),
-        "Voice capacity changes apply live. Growing above the current physical pool allocates a larger pool at a render boundary while preserving sounding voices. Lowering the cap force-releases the least-important excess voices over about 50 ms.");
+        "Applies live. Voice capacity changes allocate or shed at a render boundary while preserving sounding voices; the retire floor applies to newly started releases without touching a sounding tail.");
 }
 
 float BlockBudgetMs(const svms::RuntimeLinkTelemetryV2& t) {
@@ -130,7 +133,18 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 std::pow(10.0f, static_cast<float>(retireDbInt) / 20.0f);
             doc.MarkDirty();
         }
-        RestartCell();
+        if (ImGui::IsItemDeactivatedAfterEdit() && lc.connected && lc.client) {
+            // Wire command carries the raw gain bits in param; applies to
+            // newly started releases without touching a sounding tail.
+            uint32_t floorBits = 0u;
+            std::memcpy(&floorBits, &w.voiceRetireThreshold,
+                        sizeof(floorBits));
+            char retireResult[svms::kRuntimeLinkResultTextCapacity]{};
+            lc.client->SendCommand(
+                svms::RLCommandType::SetVoiceRetireFloor, 0u, floorBits,
+                svms::RuntimeLiveStateV2{}, 100u, retireResult);
+        }
+        LiveVoiceCell();
         
         ImGui::TableNextRow();
         LabelCell("Voice presets");
