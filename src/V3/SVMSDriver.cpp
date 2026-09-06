@@ -5335,8 +5335,18 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     uint32_t examinedCount = 0;
     // Events clamped to frame 0 in this block (lateClamped telemetry input).
     uint32_t clampedThisBlock = 0;
-    const uint32_t eventBudget =
-        self->eventBufferCapacity_;
+    // Per-block dispatch admission cap. Hosts recovering from a seek or a
+    // stall burst-submit millions of events, every one of them already late
+    // (clamped to frame 0 or stale-dropped under PriorityVelocity). Admitting
+    // all of them into one render block explodes the whole-voice plan
+    // (per-event scratch, millions of launches) and forces the sparse
+    // fallback, at 3x+ over budget. Anything past this cap simply stays
+    // scheduled and is admitted over the following blocks — no loss, the
+    // clock-stretch machinery already treats them as late.
+    static constexpr uint32_t kBlockDispatchSoftCap = 1u << 17u;
+    const uint32_t eventBudget = (std::min)((std::min)(
+        self->eventBufferCapacity_, self->maxEventsPerBlock_),
+        kBlockDispatchSoftCap);
     auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
         ++examinedCount;
         if (self->overflowMode_.load(std::memory_order_relaxed) ==
@@ -5692,11 +5702,21 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     if (self->diagnosticsEnabled_ && (self->callbackCount_ & 63u) == 0u) {
         static uint64_t censusLastCoalesced = 0;
         char poolCensus[384];
+        const uint32_t renderPaths = render->GetLastRenderPaths();
+        char pathBuf[8];
+        {
+            char* p = pathBuf;
+            if (renderPaths & 0x1u) *p++ = 'w';
+            if (renderPaths & 0x2u) *p++ = 'd';
+            if (renderPaths & 0x4u) *p++ = 's';
+            if (p == pathBuf) *p++ = '-';
+            *p = '\0';
+        }
         std::snprintf(poolCensus, sizeof(poolCensus),
             "[SVMS] pool active=%u/%u retire=%u step=%u cpu=%.1f%% "
             "(disp=%.0f synth=%.0f sched=%.0f post=%.0f) p99=%.0f%% "
-            "over=%llu coalesced+%llu(1/%u) sos=%u sloop=%u tloop=%u "
-            "rloop=%u gen=%u\n",
+            "over=%llu coalesced+%llu(1/%u) path=%s vib=%u "
+            "sos=%u sloop=%u tloop=%u rloop=%u gen=%u\n",
             (unsigned)vm->activeCount_, (unsigned)vm->GetMaxVoices(),
             (unsigned)vm->retireCount_,
             (unsigned)(self->correctnessMode_ ? 1u
@@ -5711,6 +5731,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             (unsigned long long)(self->coalescedAtomic_.load(
                 std::memory_order_relaxed) - censusLastCoalesced),
             (unsigned)self->noteOnCollapse_.Threshold(),
+            pathBuf,
+            (unsigned)((renderPaths & 0x100u) != 0u),
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedOneShot),
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedLoop),
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::TransientLoop),

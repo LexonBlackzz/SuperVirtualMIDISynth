@@ -738,6 +738,10 @@ public:
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
     void SetEventBatchDispatcher(EventBatchDispatcher dispatcher, void* userData);
     uint32_t GetWholeVoiceBlocksForTest() const { return wholeVoiceBlocks_; }
+    // Path telemetry for the driver census: which renderer(s) the last block
+    // used. Bit0 whole-voice, bit1 dense, bit2 sparse; bit8 = the vibrato
+    // gate forced the legacy hybrid for this block.
+    uint32_t GetLastRenderPaths() const { return lastRenderPaths_; }
     bool SetRenderBackend(RenderBackend backend);
     RenderBackend GetRenderBackend() const { return kernelSet_->backend; }
     const char* GetRenderBackendName() const { return kernelSet_->name; }
@@ -821,6 +825,7 @@ private:
     // the gate then keeps the callback on the span renderer.
     uint32_t denseCallbackMarked_ = 0;
     uint32_t denseLastCallbackMarked_ = 0;
+    uint32_t lastRenderPaths_ = 0u;
     uint32_t denseEpoch_;
     uint32_t denseTileCount_;
     const int16_t* denseSampleData_;
@@ -3129,6 +3134,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             break;
         }
     }
+    lastRenderPaths_ = vibratoActive ? 0x100u : 0u;
     // ── Whole-voice whole-block renderer ────────────────────────────────
     // Single per-voice renderer: owns every note-only block, blocks with no
     // events at all, and note blocks carrying the lifecycle controllers
@@ -3139,6 +3145,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // modeled by a whole-block plan.
     if (!vibratoActive &&
         PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame)) {
+        lastRenderPaths_ |= 0x1u;
         RenderWholeVoiceBlock(voices, sampleData, sampleDataFrames,
                               outputLeft, outputRight, numFrames,
                               blockStartFrame);
@@ -3186,6 +3193,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                     voices, sampleData, sampleDataFrames, outputLeft,
                     outputRight, segStart, segEnd, events, eventCount,
                     eventCursor, blockStartFrame, &renderedTo)) {
+                lastRenderPaths_ |= 0x2u;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
                 if (coverageProfilingEnabled_) ++coverageStats_.denseRendered;
 #endif
@@ -3206,6 +3214,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             }
         }
         if (needSparse) {
+            lastRenderPaths_ |= 0x4u;
             RenderBlockSparseRange(voices, channels, sampleData,
                 sampleDataFrames, outputLeft, outputRight, segStart, segEnd,
                 events, eventCount, eventCursor, vibratoActive,
