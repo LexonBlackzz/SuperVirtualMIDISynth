@@ -187,6 +187,26 @@ void DrawPerformancePage(ConfigDocument& doc) {
         LiveVoiceCell();
 
         ImGui::TableNextRow();
+        LabelCell("Ghost budget",
+                  "Optional cap on displaced-voice ghosts rendered per block (0 = unbounded, default). Ghosts reproduce a stolen or killed voice's pre-steal samples anti-clicked; under extreme steal storms they double render cost. Lower values cut that cost at the price of clicks on the voices past the cap.");
+        ImGui::TableNextColumn();
+        int ghostBudget = static_cast<int>(w.ghostBudget);
+        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::SliderInt("##ghostbudget", &ghostBudget, 0, 4096,
+                             ghostBudget == 0 ? "Unbounded" : "%d ghosts")) {
+            w.ghostBudget = static_cast<uint32_t>(ghostBudget);
+            doc.MarkDirty();
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit() && lc.connected && lc.client) {
+            char gbResult[svms::kRuntimeLinkResultTextCapacity]{};
+            lc.client->SendCommand(
+                svms::RLCommandType::SetGhostBudget, 0u,
+                w.ghostBudget, svms::RuntimeLiveStateV2{}, 100u,
+                gbResult);
+        }
+        LiveVoiceCell();
+
+        ImGui::TableNextRow();
         LabelCell("Hybrid thread affinity",
                   "Opt-in. 1 pins every render thread (audio, event compiler, workers) to performance cores; 2 keeps audio + compiler on P-cores and parks render workers on efficiency cores so the P-cores stay free for real-time work (worker count is never reduced). No effect on non-hybrid CPUs.");
         ImGui::TableNextColumn();

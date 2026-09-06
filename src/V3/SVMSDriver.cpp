@@ -2947,6 +2947,25 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetGhostBudget: {
+        // param = max whole-voice ghosts captured per block; 0 = unbounded.
+        if (cmd.param > 65536u || !renderScalar) {
+            strncpy_s(resultText, kText,
+                      "ghost budget must be 0 (unbounded) or 1..65536",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        renderScalar->SetGhostBudget(cmd.param);
+        engineConfig_.ghostBudget = cmd.param;
+        if (cmd.param != 0u) {
+            snprintf(resultText, kText, "ghost budget: %u per block",
+                     cmd.param);
+        } else {
+            strncpy_s(resultText, kText, "ghost budget: unbounded",
+                      _TRUNCATE);
+        }
+        return svms::RLResult::Ok;
+    }
 
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
@@ -3660,6 +3679,7 @@ bool Driver::Initialize() {
     channelCache = new ChannelCache();
     channelCache->SetMasterVolume(cfg.masterVolume);
     renderScalar = new RenderScalar();
+    renderScalar->SetGhostBudget(cfg.ghostBudget);
     // Honor the configured render backend. The constructor already selects
     // the best set (Auto behavior); an explicit non-Auto request overrides
     // it, falling back to the best available set when unsupported.

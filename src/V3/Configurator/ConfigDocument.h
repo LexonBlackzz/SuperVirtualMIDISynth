@@ -78,6 +78,8 @@ struct ConfigValues {
     bool ccCollapse = false;
     // Opt-in block-granular dispatch (events fire at block start).
     bool blockTiming = false;
+    // Optional whole-voice ghost budget per block; 0 = unbounded.
+    uint32_t ghostBudget = 0u;
     int overflowMode = 0;
     bool correctnessMode = true;
 

@@ -262,6 +262,7 @@ enum class RLCommandType : uint32_t {
     SetThreadAffinityMode = 0x00000116,
     SetCcCollapse         = 0x00000117,
     SetBlockTiming        = 0x00000118,
+    SetGhostBudget        = 0x00000119,
 
 
     Invalid              = 0xFFFFFFFF,

@@ -648,6 +648,7 @@ private:
                              uint32_t frameCount);
     static void WholeVoiceVoiceConfiguredHook(VoiceHandle handle,
                                               void* userData);
+    uint32_t WholeVoiceGhostLimit() const;
     static void WholeVoicePreTailCaptureHook(VoiceHandle handle,
                                              void* userData);
     static void WholeVoiceDeferredReleaseHook(VoiceHandle handle,
@@ -716,6 +717,8 @@ private:
     uint32_t wvJobCapacity_ = 0u;
     uint32_t wvJobScratchCapacity_ = 0u;     // scratch stride wvJobRetirements_ was sized for
     uint64_t wvGhostOverflowCount_ = 0u;
+    // Optional per-block ghost budget; 0 = unbounded (default).
+    uint32_t ghostBudget_ = 0u;
     uint32_t wholeVoiceBlocks_ = 0u;
 
 public:
@@ -742,6 +745,10 @@ public:
     }
 #endif
 
+    // Optional ghost budget (0 = unbounded): caps ghosts captured per
+    // whole-voice block. Beyond the cap, displaced/killed voices die without
+    // their pre-steal render pass (same path as capacity overflow).
+    void SetGhostBudget(uint32_t budget) { ghostBudget_ = budget; }
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
     void SetEventBatchDispatcher(EventBatchDispatcher dispatcher, void* userData);
     uint32_t GetWholeVoiceBlocksForTest() const { return wholeVoiceBlocks_; }
@@ -3315,11 +3322,16 @@ inline void RenderScalar::WholeVoiceVoiceConfiguredHook(
     renderer->wvStartIngress_[handle] = renderer->wvEventOrdinal_;
 }
 
+inline uint32_t RenderScalar::WholeVoiceGhostLimit() const {
+    return ghostBudget_ != 0u && ghostBudget_ < wvGhostCapacity_
+        ? ghostBudget_ : wvGhostCapacity_;
+}
+
 inline void RenderScalar::WholeVoicePreTailCaptureHook(
     VoiceHandle handle, void* userData) {
     RenderScalar* renderer = static_cast<RenderScalar*>(userData);
     if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
-    if (renderer->wvGhostCount_ >= renderer->wvGhostCapacity_) {
+    if (renderer->wvGhostCount_ >= renderer->WholeVoiceGhostLimit()) {
         // Pathological block (more steals than the pool).  The displaced
         // voice's pre-steal samples are lost for this block; the launch
         // itself stays exact.  Counted for telemetry.
@@ -3381,7 +3393,7 @@ inline void RenderScalar::WholeVoiceSilenceVoiceHook(
     VoiceHandle handle, void* userData) {
     RenderScalar* renderer = static_cast<RenderScalar*>(userData);
     if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
-    if (renderer->wvGhostCount_ >= renderer->wvGhostCapacity_) {
+    if (renderer->wvGhostCount_ >= renderer->WholeVoiceGhostLimit()) {
         // Pathological block (more kills+steals than pool rows).  The killed
         // voice's pre-kill samples are lost for this block; the kill itself
         // stays exact.  Counted for telemetry.

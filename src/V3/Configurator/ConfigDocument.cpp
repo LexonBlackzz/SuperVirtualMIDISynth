@@ -171,6 +171,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.threadAffinityMode = 0u;
     d.ccCollapse = false;
     d.blockTiming = false;
+    d.ghostBudget = 0u;
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
     d.correctnessMode = true;
@@ -312,6 +313,7 @@ void ConfigDocument::FromJson(const json& root) {
     if (auto it = root.find("voices"); it != root.end() && it->is_object()) {
         ReadNum(*it, "steal_policy", working_.stealPolicy, 0u, 2u);
         ReadNum(*it, "per_key_voice_cap", working_.perKeyVoiceCap, 0u, 256u);
+        ReadNum(*it, "ghost_budget", working_.ghostBudget, 0u, 65536u);
     }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.diagnosticsEnabled);
@@ -401,6 +403,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["retire_threshold"] = working_.voiceRetireThreshold;
     root["voices"]["steal_policy"] = working_.stealPolicy;
     root["voices"]["per_key_voice_cap"] = working_.perKeyVoiceCap;
+    root["voices"]["ghost_budget"] = working_.ghostBudget;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
     root["synth"]["block_timing"] = working_.blockTiming;
@@ -599,6 +602,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.voiceRetireThreshold == b.voiceRetireThreshold
         && a.stealPolicy == b.stealPolicy
         && a.perKeyVoiceCap == b.perKeyVoiceCap
+        && a.ghostBudget == b.ghostBudget
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
         && a.blockTiming == b.blockTiming

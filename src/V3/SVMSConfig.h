@@ -96,6 +96,8 @@ struct EngineConfig {
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block offset. Off by default.
     bool blockTimingMode;
+    // Optional whole-voice ghost budget per block; 0 = unbounded (default).
+    uint32_t ghostBudget;
     EventOverflowMode eventOverflowMode;
     uint32_t highPriorityVelocity;
     uint32_t shedStartPercent;

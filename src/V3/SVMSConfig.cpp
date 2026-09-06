@@ -274,7 +274,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"voices", {
             {"retire_threshold", cfg.voiceRetireThreshold},
             {"steal_policy", cfg.stealPolicy},
-            {"per_key_voice_cap", cfg.perKeyVoiceCap}
+            {"per_key_voice_cap", cfg.perKeyVoiceCap},
+            {"ghost_budget", cfg.ghostBudget}
         }},
 
         {"midi", {
@@ -658,6 +659,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "voices.steal_policy");
         if (!ReadValue(*it, "per_key_voice_cap", cfg.perKeyVoiceCap, 0u, 256u))
             AppendWarning(cfg.configWarning, "voices.per_key_voice_cap");
+        if (!ReadValue(*it, "ghost_budget", cfg.ghostBudget, 0u, 65536u))
+            AppendWarning(cfg.configWarning, "voices.ghost_budget");
     }
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
@@ -797,6 +800,7 @@ EngineConfig EngineConfig::Default() {
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.blockTimingMode = false;  // opt-in: exact-frame dispatch by default
+    cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)
     // XP has no WASAPI status tooling and audio failures otherwise look like
@@ -929,6 +933,7 @@ bool EngineConfig::Validate() const {
             stealPolicy <= 2u &&
             perKeyVoiceCap <= 256u &&
             threadAffinityMode <= 2u &&
+            ghostBudget <= 65536u &&
             maxEventsPerBlock > 0;
 }
 
