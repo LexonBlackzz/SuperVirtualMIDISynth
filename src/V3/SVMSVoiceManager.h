@@ -2706,7 +2706,7 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     const float outgoingLevel = std::fabs(gain) *
         (std::fabs(mixL) + std::fabs(mixR));
     if (v.sampleBacked[handle] == 0u || v.relEnd[handle] <= 1u ||
-        outgoingLevel <= kVoiceRetireThreshold) {
+        outgoingLevel <= VoiceRetireThreshold()) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
         if (launchTestContext_.active)
             ++launchChurnStats_.tailCaptureIneligible;

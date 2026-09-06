@@ -2,11 +2,21 @@
 #define SVMS_ENVELOPE_H
 
 #include "SVMSTypes.h"
+#include <atomic>
 #include <cmath>
 
 namespace svms {
 
 constexpr float kVoiceRetireThreshold = 0.00015f;
+// Runtime-configurable retirement floor (raw linear gain). Hot render code
+// reads this relaxed atomic instead of the constexpr default so the tail
+// length can be tuned without rebuilding; the control thread stores it from
+// engine configuration (float store/load, never a torn value on any
+// supported target).
+inline std::atomic<float> g_voiceRetireThreshold{kVoiceRetireThreshold};
+inline float VoiceRetireThreshold() {
+    return g_voiceRetireThreshold.load(std::memory_order_relaxed);
+}
 constexpr float kDefaultReleaseDecay = 0.9985f;
 // Do not let a missing or ultra-short SF2 release collapse a chopped note
 // into a sub-millisecond click.  V3's intended floor is 10 ms: short enough

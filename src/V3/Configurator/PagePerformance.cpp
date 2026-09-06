@@ -118,6 +118,20 @@ void DrawPerformancePage(ConfigDocument& doc) {
         LiveVoiceCell();
 
         ImGui::TableNextRow();
+        LabelCell("Voice retire floor",
+                  "Release-tail loudness where finished voices are freed. Higher (less negative dB) frees quiet tails sooner and cuts release rendering cost on dense songs; lower keeps longer tails. Applies to newly started releases.");
+        ImGui::TableNextColumn();
+        const float retireDb = 20.0f * std::log10(w.voiceRetireThreshold);
+        int retireDbInt = static_cast<int>(retireDb + (retireDb >= 0.0f ? 0.5f : -0.5f));
+        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::SliderInt("##voiceretire", &retireDbInt, -100, -26, "%d dB")) {
+            retireDbInt = (std::max)(-100, (std::min)(-26, retireDbInt));
+            w.voiceRetireThreshold =
+                std::pow(10.0f, static_cast<float>(retireDbInt) / 20.0f);
+            doc.MarkDirty();
+        }
+
+        ImGui::TableNextRow();
         LabelCell("Voice presets");
         ImGui::TableNextColumn();
         static const int presetValues[] = {

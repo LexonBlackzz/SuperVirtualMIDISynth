@@ -1310,7 +1310,7 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
 
             const bool thresholdReleaseFinished = isReleased &&
                 v.releaseSamplesRemaining[idx] == UINT32_MAX &&
-                gain < kVoiceRetireThreshold;
+                gain < VoiceRetireThreshold();
             if (retireVoice || releaseFinished || thresholdReleaseFinished) {
                 voices.RetireVoice(static_cast<VoiceHandle>(idx));
                 // RetireVoice swap-removes: the voice at the end of
@@ -1662,7 +1662,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
 
             if (releaseFinished ||
                 (releaseRemaining == UINT32_MAX &&
-                 gain < kVoiceRetireThreshold)) {
+                 gain < VoiceRetireThreshold())) {
                 retiredAt = n;
                 break;
             }
@@ -1701,7 +1701,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
 
             if (releaseFinished ||
                 (releaseRemaining == UINT32_MAX &&
-                 gain < kVoiceRetireThreshold)) {
+                 gain < VoiceRetireThreshold())) {
                 retiredAt = n;
                 break;
             }
@@ -1830,7 +1830,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 phase = relLoopSF + overflow;
             }
             if (releaseFinished ||
-                (releaseRemaining == UINT32_MAX && gain < kVoiceRetireThreshold)) {
+                (releaseRemaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
                 retiredAt = n;
                 break;
             }
@@ -1958,7 +1958,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
         }
 
         const bool thresholdFinished = released && releaseRemaining == UINT32_MAX &&
-                                       gain < kVoiceRetireThreshold;
+                                       gain < VoiceRetireThreshold();
         if (sampleEnded || releaseFinished || thresholdFinished) {
             retiredAt = n;
             break;
@@ -2367,7 +2367,7 @@ inline bool RenderScalar::AdvanceDenseReleaseStateTo(
         }
         if (releaseFinished ||
             (releaseRemaining == UINT32_MAX &&
-             gain < kVoiceRetireThreshold)) {
+             gain < VoiceRetireThreshold())) {
             retiredAt = 0u;
         }
     } else for (uint32_t n = 0u; n < frameCount; ++n) {
@@ -2383,7 +2383,7 @@ inline bool RenderScalar::AdvanceDenseReleaseStateTo(
         }
         if (releaseFinished ||
             (releaseRemaining == UINT32_MAX &&
-             gain < kVoiceRetireThreshold)) {
+             gain < VoiceRetireThreshold())) {
             retiredAt = n;
             break;
         }
@@ -3800,7 +3800,7 @@ inline void RenderScalar::CaptureGhostTail(uint32_t ghost) {
     const float mixR = v.mixGainR[ghost];
     const float outgoingLevel =
         std::fabs(gain) * (std::fabs(mixL) + std::fabs(mixR));
-    if (outgoingLevel <= kVoiceRetireThreshold) return;
+    if (outgoingLevel <= VoiceRetireThreshold()) return;
     tail.phase = v.phases[ghost];
     tail.phaseInc = v.phaseIncs[ghost];
     tail.gain = gain;

@@ -396,7 +396,7 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
             phase = loopStart + overflow;
         }
         if (finished ||
-            (remaining == UINT32_MAX && gain < kVoiceRetireThreshold)) {
+            (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
             retiredAt = frame;
             break;
         }
@@ -445,7 +445,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         }
         const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
         const bool thresholdSafe = remaining != UINT32_MAX ||
-            gains[7] >= kVoiceRetireThreshold;
+            gains[7] >= VoiceRetireThreshold();
         const float lastPhase = phase + step * 7.0f;
         if (frame + 8u <= c.frameCount && countdownSafe && thresholdSafe &&
             lastPhase < loopEnd - 1.0f) {
@@ -501,7 +501,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
             phase = loopStart + overflow;
         }
         if (finished ||
-            (remaining == UINT32_MAX && gain < kVoiceRetireThreshold)) {
+            (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
             retiredAt = frame;
             break;
         }
@@ -537,7 +537,7 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
             valid = valid && ValidateLoopVoice(c, handle) &&
                 (remaining == UINT32_MAX || remaining > c.frameCount) &&
                 (remaining != UINT32_MAX ||
-                 finalGain >= kVoiceRetireThreshold);
+                 finalGain >= VoiceRetireThreshold());
         }
         if (!valid) {
             for (uint32_t lane = 0u; lane < 8u; ++lane) {

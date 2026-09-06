@@ -165,6 +165,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.highPriorityVelocity = 96;
     d.shedStartPercent = 70;
     d.maxEventsPerBlock = 65536;
+    d.voiceRetireThreshold = 0.00015f;
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
     d.correctnessMode = true;
@@ -289,6 +290,10 @@ void ConfigDocument::FromJson(const json& root) {
     if (auto it = root.find("phase_rotation"); it != root.end() && it->is_object()) {
         ReadNum(*it, "mode", working_.phaseRotationMode, 0u, 3u);
     }
+    if (auto it = root.find("voices"); it != root.end() && it->is_object()) {
+        ReadNum(*it, "retire_threshold", working_.voiceRetireThreshold,
+                1e-8f, 0.05f);
+    }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.diagnosticsEnabled);
         ReadBool(*it, "window", working_.diagnosticsWindow);
@@ -374,6 +379,7 @@ nlohmann::json ConfigDocument::ToJson() const {
 
 
     root["phase_rotation"]["mode"] = working_.phaseRotationMode;
+    root["voices"]["retire_threshold"] = working_.voiceRetireThreshold;
     root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
@@ -566,6 +572,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.eventRingCapacity == b.eventRingCapacity
         && a.highPriorityVelocity == b.highPriorityVelocity
         && a.shedStartPercent == b.shedStartPercent
+        && a.voiceRetireThreshold == b.voiceRetireThreshold
         && a.maxEventsPerBlock == b.maxEventsPerBlock
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode

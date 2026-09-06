@@ -94,6 +94,7 @@ struct EngineConfig {
     uint32_t highPriorityVelocity;
     uint32_t shedStartPercent;
     uint32_t maxEventsPerBlock;
+    float voiceRetireThreshold;
     bool correctnessMode;
     bool diagnosticsEnabled;
     bool diagnosticsWindow;

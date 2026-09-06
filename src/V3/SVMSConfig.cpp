@@ -1,4 +1,5 @@
 #include "SVMSConfig.h"
+#include "SVMSEnvelope.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -266,6 +267,9 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         }},
         {"note_on_collapse", {
             {"threshold", cfg.noteOnCollapseThreshold}
+        }},
+        {"voices", {
+            {"retire_threshold", cfg.voiceRetireThreshold}
         }},
 
         {"midi", {
@@ -626,6 +630,11 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "mode", cfg.phaseRotationMode, 0u, 4u))
             AppendWarning(cfg.configWarning, "phase_rotation.mode");
     }
+    if (auto it = root.find("voices"); it != root.end() && it->is_object()) {
+        if (!ReadValue(*it, "retire_threshold", cfg.voiceRetireThreshold,
+                       1e-8f, 0.05f))
+            AppendWarning(cfg.configWarning, "voices.retire_threshold");
+    }
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
             AppendWarning(cfg.configWarning, "note_on_collapse.threshold");
@@ -758,6 +767,7 @@ EngineConfig EngineConfig::Default() {
     cfg.highPriorityVelocity = 96;
     cfg.shedStartPercent = 70;
     cfg.maxEventsPerBlock = 65536;
+    cfg.voiceRetireThreshold = kVoiceRetireThreshold;
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)
     // XP has no WASAPI status tooling and audio failures otherwise look like
@@ -886,6 +896,7 @@ bool EngineConfig::Validate() const {
             eventRingCapacity >= 4096u &&
             highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
             shedStartPercent >= 1 && shedStartPercent < 100 &&
+            voiceRetireThreshold > 0.0f && voiceRetireThreshold <= 0.05f &&
             maxEventsPerBlock > 0;
 }
 

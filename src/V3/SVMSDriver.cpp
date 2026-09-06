@@ -3235,6 +3235,8 @@ bool Driver::Initialize() {
     }
     maxEventsPerBlock_ = cfg.maxEventsPerBlock;
     engineConfig_ = cfg;
+    svms::g_voiceRetireThreshold.store(
+        cfg.voiceRetireThreshold, std::memory_order_relaxed);
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -3364,6 +3366,8 @@ bool Driver::Initialize() {
     }
     ConfigureRuntimeVoiceGrowthCeiling(voiceGrowthCeiling);
     engineConfig_ = cfg;
+    svms::g_voiceRetireThreshold.store(
+        cfg.voiceRetireThreshold, std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
     if (!voiceManager->Initialize(cfg.maxVoices, sampleRate)) {
