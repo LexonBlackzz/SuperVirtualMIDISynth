@@ -5741,6 +5741,19 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         OutputDebugStringA(poolCensus);
         censusLastCoalesced = self->coalescedAtomic_.load(
             std::memory_order_relaxed);
+        // Sparse fallback without the whole-voice path: name the event that
+        // made the plan refuse (type value + data1/controller) so the
+        // whitelist can be extended for the material actually played.
+        if ((renderPaths & 0x4u) != 0u && (renderPaths & 0x1u) == 0u) {
+            uint8_t refuseType = 0u;
+            uint8_t refuseData1 = 0u;
+            render->GetLastPlanRefusal(refuseType, refuseData1);
+            char refuseCensus[96];
+            std::snprintf(refuseCensus, sizeof(refuseCensus),
+                "[SVMS] planRefuse: type=%u ctrl=%u\n",
+                (unsigned)refuseType, (unsigned)refuseData1);
+            OutputDebugStringA(refuseCensus);
+        }
     }
 
     if (self->diagnosticsEnabled_) {

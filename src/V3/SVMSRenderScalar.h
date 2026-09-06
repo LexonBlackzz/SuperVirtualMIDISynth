@@ -742,6 +742,10 @@ public:
     // used. Bit0 whole-voice, bit1 dense, bit2 sparse; bit8 = the vibrato
     // gate forced the legacy hybrid for this block.
     uint32_t GetLastRenderPaths() const { return lastRenderPaths_; }
+    void GetLastPlanRefusal(uint8_t& type, uint8_t& data1) const {
+        type = lastRefusalType_;
+        data1 = lastRefusalData1_;
+    }
     bool SetRenderBackend(RenderBackend backend);
     RenderBackend GetRenderBackend() const { return kernelSet_->backend; }
     const char* GetRenderBackendName() const { return kernelSet_->name; }
@@ -826,6 +830,11 @@ private:
     uint32_t denseCallbackMarked_ = 0;
     uint32_t denseLastCallbackMarked_ = 0;
     uint32_t lastRenderPaths_ = 0u;
+    // The event that made PlanWholeVoiceBlock refuse the last block that
+    // needed the legacy fallback: type value + data1 (controller number for
+    // CC events). Set on every refusing pre-pass path.
+    uint8_t lastRefusalType_ = 0u;
+    uint8_t lastRefusalData1_ = 0u;
     uint32_t denseEpoch_;
     uint32_t denseTileCount_;
     const int16_t* denseSampleData_;
@@ -3542,6 +3551,9 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
                         // whole-block plan can model; unmapped controllers
                         // stay on the legacy path until their dispatch
                         // effects are audited.
+                        lastRefusalType_ =
+                            static_cast<uint8_t>(RenderEventType::ControlChange);
+                        lastRefusalData1_ = controller;
                         return false;
                     case 0u:
                     case 32u:
@@ -3601,6 +3613,8 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
                 hasEvents = true;
                 break;
             default:
+                lastRefusalType_ = static_cast<uint8_t>(events[i].type);
+                lastRefusalData1_ = events[i].data1;
                 return false;
         }
     }
