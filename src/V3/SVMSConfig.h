@@ -100,6 +100,9 @@ struct EngineConfig {
     // already playing at the cap replaces the oldest key member instead of
     // growing the pileup. syndrv-style; release tails never count.
     uint32_t perKeyVoiceCap;
+    // Thread affinity policy: 0 off, 1 RT threads -> P-cores,
+    // 2 + workers -> E-cores. No-op on single-class CPUs and XP.
+    uint32_t threadAffinityMode;
     bool correctnessMode;
     bool diagnosticsEnabled;
     bool diagnosticsWindow;

@@ -37,6 +37,9 @@ public:
     uint32_t GetThreadCount() const noexcept;
     float GetHelperJobPercent() const noexcept;
     size_t GetAllocatedBytes() const noexcept;
+    // Re-applies the configured thread-affinity mode to the worker threads
+    // (no-op on XP/POSIX or when the pool is not running).
+    void ApplyAffinity() noexcept;
     static size_t EstimateAllocatedBytes(uint32_t totalRenderThreads,
                                          uint32_t maxFrames,
                                          uint32_t voiceCapacity) noexcept;

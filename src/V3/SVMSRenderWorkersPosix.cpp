@@ -249,6 +249,10 @@ uint32_t RenderWorkerPool::GetThreadCount() const noexcept {
     return impl_ ? impl_->totalThreads : 1u;
 }
 
+// Affinity policy is a Windows scheduling feature; POSIX keeps default
+// scheduler placement.
+void RenderWorkerPool::ApplyAffinity() noexcept {}
+
 float RenderWorkerPool::GetHelperJobPercent() const noexcept {
     if (!impl_) return 0.0f;
     const uint64_t helper = impl_->helperJobs.load(std::memory_order_relaxed);

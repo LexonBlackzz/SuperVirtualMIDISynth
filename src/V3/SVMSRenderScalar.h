@@ -760,6 +760,10 @@ public:
     bool SetRenderBackend(RenderBackend backend);
     RenderBackend GetRenderBackend() const { return kernelSet_->backend; }
     const char* GetRenderBackendName() const { return kernelSet_->name; }
+    // Re-applies the configured thread-affinity mode to the worker pool.
+    void ApplyWorkerAffinity() {
+        if (workerPool_) workerPool_->ApplyAffinity();
+    }
 
 private:
 private:

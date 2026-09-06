@@ -310,10 +310,12 @@ bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
         if (worker.wakeEvent && worker.readyEvent) {
             worker.thread = CreateThread(nullptr, 0u, Impl::ThreadEntry,
                                          &worker, 0u, nullptr);
-            // Pin to performance cores: the scheduler may otherwise place a
-            // helper on an E-core (~2x slower on the AVX2 kernels), which
-            // shows up as join-path jitter on every worker fan-out.
-            svms::PinThreadToPerformanceCores(worker.thread);
+            // Affinity policy (opt-in): mode 2 pins workers to efficiency
+            // cores so the scheduler keeps P-cores free for the RT threads.
+            // Otherwise the worker keeps its inherited placement — the
+            // configured worker count is never reduced.
+            svms::ApplyThreadAffinity(worker.thread,
+                                      svms::AffinityRole::Worker);
         }
         if (!worker.wakeEvent || !worker.readyEvent || !worker.thread) {
             impl->stopping.store(true, std::memory_order_release);
@@ -340,6 +342,14 @@ void RenderWorkerPool::Shutdown() noexcept {
 
 uint32_t RenderWorkerPool::GetThreadCount() const noexcept {
     return impl_ ? impl_->totalThreads : 1u;
+}
+
+void RenderWorkerPool::ApplyAffinity() noexcept {
+    Impl* impl = impl_;
+    if (!impl) return;
+    for (uint32_t index = 0u; index < impl->helperCount; ++index)
+        svms::ApplyThreadAffinity(impl->workers[index].thread,
+                                  svms::AffinityRole::Worker);
 }
 
 float RenderWorkerPool::GetHelperJobPercent() const noexcept {

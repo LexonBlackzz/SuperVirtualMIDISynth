@@ -187,6 +187,30 @@ void DrawPerformancePage(ConfigDocument& doc) {
         LiveVoiceCell();
 
         ImGui::TableNextRow();
+        LabelCell("Hybrid thread affinity",
+                  "Opt-in. 1 pins every render thread (audio, event compiler, workers) to performance cores; 2 keeps audio + compiler on P-cores and parks render workers on efficiency cores so the P-cores stay free for real-time work (worker count is never reduced). No effect on non-hybrid CPUs.");
+        ImGui::TableNextColumn();
+        static const char* affinityModes[] = {
+            "Off",
+            "All render threads on P-cores",
+            "RT on P-cores, workers on E-cores"
+        };
+        int affinityMode = static_cast<int>(w.threadAffinityMode);
+        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::Combo("##affinity", &affinityMode, affinityModes, 3)) {
+            w.threadAffinityMode = static_cast<uint32_t>(affinityMode);
+            doc.MarkDirty();
+            if (lc.connected && lc.client) {
+                char affinityResult[svms::kRuntimeLinkResultTextCapacity]{};
+                lc.client->SendCommand(
+                    svms::RLCommandType::SetThreadAffinityMode, 0u,
+                    w.threadAffinityMode, svms::RuntimeLiveStateV2{}, 100u,
+                    affinityResult);
+            }
+        }
+        LiveVoiceCell();
+
+        ImGui::TableNextRow();
         LabelCell("Voice presets");
         ImGui::TableNextColumn();
         static const int presetValues[] = {

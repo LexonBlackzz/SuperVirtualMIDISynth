@@ -259,6 +259,7 @@ enum class RLCommandType : uint32_t {
     SetVoiceRetireFloor  = 0x00000113,
     SetStealPolicy       = 0x00000114,
     SetPerKeyVoiceCap    = 0x00000115,
+    SetThreadAffinityMode = 0x00000116,
 
 
     Invalid              = 0xFFFFFFFF,

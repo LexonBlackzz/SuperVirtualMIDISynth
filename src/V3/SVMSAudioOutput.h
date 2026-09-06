@@ -107,6 +107,9 @@ public:
     virtual const char* GetLastErrorText() const { return ""; }
     using RenderCallback = void(*)(float* output, uint32_t numFrames, void* userData);
     virtual void SetRenderCallback(RenderCallback cb, void* userData) = 0;
+    // Re-applies the configured thread-affinity mode to the backend's RT
+    // thread. Base implementation covers backends that own no thread.
+    virtual void ApplyThreadAffinity() {}
 };
 
 class AudioOutput : public AudioOutputBase {
@@ -128,6 +131,9 @@ public:
     using AudioOutputBase::RenderCallback;
     using AudioOutputBase::SetRenderCallback;
     void SetRenderCallback(RenderCallback cb, void* userData) override;
+    void ApplyThreadAffinity() override {
+        svms::ApplyThreadAffinity(threadHandle_, svms::AffinityRole::Realtime);
+    }
 
 private:
     static DWORD WINAPI AudioThreadProc(LPVOID param);
@@ -445,7 +451,7 @@ inline bool AudioOutput::Start() {
 
     running_.store(true);
     threadHandle_ = CreateThread(nullptr, 0, AudioThreadProc, this, 0, nullptr);
-    svms::PinThreadToPerformanceCores(threadHandle_);
+    svms::ApplyThreadAffinity(threadHandle_, svms::AffinityRole::Realtime);
     if (!threadHandle_) {
         running_.store(false);
         CloseHandle(stopEvent_);

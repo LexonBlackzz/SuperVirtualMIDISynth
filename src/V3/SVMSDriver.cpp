@@ -2866,6 +2866,33 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         }
         return svms::RLResult::Ok;
     }
+    case RT::SetThreadAffinityMode: {
+        // param = 0 off, 1 all render threads on P-cores,
+        // 2 RT on P-cores + workers on E-cores.
+        // Re-applies to the live threads; threads created later pick the
+        // mode up at birth. No-op on single-class CPUs and XP.
+        if (cmd.param > 2u) {
+            strncpy_s(resultText, kText,
+                      "thread affinity mode must be 0, 1 or 2", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        svms::g_threadAffinityMode.store(cmd.param,
+                                         std::memory_order_relaxed);
+        engineConfig_.threadAffinityMode = cmd.param;
+        if (useEventCompiler_ && eventCompilerThread_.joinable()) {
+            svms::ApplyThreadAffinity(eventCompilerThread_.native_handle(),
+                                      svms::AffinityRole::Compiler);
+        }
+        if (renderScalar) renderScalar->ApplyWorkerAffinity();
+        if (audioOutput) audioOutput->ApplyThreadAffinity();
+        static const char* const affinityText[] = {
+            "thread affinity: off",
+            "thread affinity: all render threads on P-cores",
+            "thread affinity: RT on P-cores, workers on E-cores",
+        };
+        strncpy_s(resultText, kText, affinityText[cmd.param], _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
 
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
@@ -3409,6 +3436,8 @@ bool Driver::Initialize() {
     engineConfig_ = cfg;
     svms::g_voiceRetireThreshold.store(
         cfg.voiceRetireThreshold, std::memory_order_relaxed);
+    svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
+                                     std::memory_order_relaxed);
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -3540,6 +3569,8 @@ bool Driver::Initialize() {
     engineConfig_ = cfg;
     svms::g_voiceRetireThreshold.store(
         cfg.voiceRetireThreshold, std::memory_order_relaxed);
+    svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
+                                     std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
     voiceManager->SetStealPolicy(cfg.stealPolicy);
@@ -3647,6 +3678,11 @@ bool Driver::Initialize() {
     if (useEventCompiler_) {
         try {
             eventCompilerThread_ = std::thread(&Driver::EventCompilerLoop, this);
+            // MSVC's native_handle is the Win32 thread handle. Applied after
+            // creation; a same-instant race into the compiler loop is benign
+            // (the pin only changes scheduler placement).
+            svms::ApplyThreadAffinity(eventCompilerThread_.native_handle(),
+                                      svms::AffinityRole::Compiler);
         } catch (...) {
             useEventCompiler_ = false;
         }

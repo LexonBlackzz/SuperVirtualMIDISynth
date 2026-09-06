@@ -215,6 +215,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"max_voices", cfg.maxVoices},
             {"voice_memory_budget_mb", cfg.voiceMemoryBudgetMB},
             {"render_threads", cfg.renderThreads},
+            {"thread_affinity_mode", cfg.threadAffinityMode},
             {"master_volume", cfg.masterVolume},
             {"velocity_curve", cfg.velocityCurve},
             {"velocity_floor", cfg.velocityFloor},
@@ -437,6 +438,9 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "synth.voice_memory_budget_mb");
         if (!ReadValue(*it, "render_threads", cfg.renderThreads, 0u, 64u))
             AppendWarning(cfg.configWarning, "synth.render_threads");
+        if (!ReadValue(*it, "thread_affinity_mode", cfg.threadAffinityMode,
+                       0u, 2u))
+            AppendWarning(cfg.configWarning, "synth.thread_affinity_mode");
         if (!ReadValue(*it, "master_volume", cfg.masterVolume, 0.0f, 4.0f))
             AppendWarning(cfg.configWarning, "synth.master_volume");
         if (!ReadValue(*it, "velocity_curve", cfg.velocityCurve, 0.1f, 10.0f))
@@ -776,6 +780,7 @@ EngineConfig EngineConfig::Default() {
     cfg.voiceRetireThreshold = kVoiceRetireThreshold;
     cfg.stealPolicy = 0;
     cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
+    cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)
     // XP has no WASAPI status tooling and audio failures otherwise look like
@@ -907,6 +912,7 @@ bool EngineConfig::Validate() const {
             voiceRetireThreshold > 0.0f && voiceRetireThreshold <= 0.05f &&
             stealPolicy <= 2u &&
             perKeyVoiceCap <= 256u &&
+            threadAffinityMode <= 2u &&
             maxEventsPerBlock > 0;
 }
 

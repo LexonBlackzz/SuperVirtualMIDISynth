@@ -508,7 +508,7 @@ inline bool AudioOutput::Start() {
     }
 
     threadHandle_ = CreateThread(nullptr, 0, AudioThreadProc, this, 0, nullptr);
-    svms::PinThreadToPerformanceCores(threadHandle_);
+    svms::ApplyThreadAffinity(threadHandle_, svms::AffinityRole::Realtime);
     if (!threadHandle_) {
         lastHResult_ = HRESULT_FROM_WIN32(GetLastError());
         if (streamBuffer_) streamBuffer_->Stop();
