@@ -2946,6 +2946,7 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         if (ringVictim != kInvalidVoice) {
             // Repair the incremental index: the victim is unlinked from
             // whichever tier held it, mirroring tier-pop side effects.
+            PrefetchVoiceLines(ringVictim);
             RemoveStealCandidate(ringVictim);
             ++releasingRingHits_;
             activePosition = ringPosition;
@@ -2977,6 +2978,9 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
             const VoiceHandle winner = static_cast<VoiceHandle>(
                 activeList_[winnerPosition]);
             assert(stealStableKey_[winner] == rootKey);
+            // Fetch the victim's SoA lines while the winner-path repair
+            // below walks its ~log2(pool) scattered nodes.
+            PrefetchVoiceLines(winner);
             activePosition = winnerPosition;
             if (reserveVolatileRoot) {
                 stealCandidateReserved_[winner] = 2u;
@@ -3085,6 +3089,9 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
     }
 #endif
     if (!haveBest) return kInvalidVoice;
+    // Same overlap as the fast paths: the general tier-selection tail
+    // repairs the index before returning, so fetch the victim's lines now.
+    PrefetchVoiceLines(static_cast<VoiceHandle>(bestHandle));
     activePosition = bestPosition;
     if (bestIsVolatile) {
         const bool canReserve = reserveVolatileRoot &&
