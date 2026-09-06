@@ -74,6 +74,8 @@ struct ConfigValues {
     uint32_t perKeyVoiceCap = 0u;
     // 0 off, 1 RT threads -> P-cores, 2 + workers -> E-cores.
     uint32_t threadAffinityMode = 0u;
+    // Opt-in compiler-side CC collapse (superseded same-(channel,controller)).
+    bool ccCollapse = false;
     int overflowMode = 0;
     bool correctnessMode = true;
 

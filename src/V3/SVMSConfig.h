@@ -90,6 +90,9 @@ struct EngineConfig {
     uint32_t gpuDeviceIndex;
     bool enableGPU;
     uint32_t eventRingCapacity;
+    // Opt-in compiler-side CC collapse: superseded same-(channel,controller)
+    // state events are dropped upstream. Off by default.
+    bool ccCollapse;
     EventOverflowMode eventOverflowMode;
     uint32_t highPriorityVelocity;
     uint32_t shedStartPercent;

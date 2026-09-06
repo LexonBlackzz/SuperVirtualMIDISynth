@@ -223,6 +223,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         }},
         {"events", {
             {"overflow_mode", "priority"},
+            {"cc_collapse", cfg.ccCollapse},
             {"ring_capacity", cfg.eventRingCapacity},
             {"high_priority_velocity", cfg.highPriorityVelocity},
             {"shed_start_percent", cfg.shedStartPercent},
@@ -541,6 +542,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
                 cfg.eventOverflowMode = EventOverflowMode::PriorityVelocity;
             else AppendWarning(cfg.configWarning, "events.overflow_mode");
         }
+        if (auto collapse = it->find("cc_collapse"); collapse != it->end()) {
+            if (collapse->is_boolean())
+                cfg.ccCollapse = collapse->get<bool>();
+            else
+                AppendWarning(cfg.configWarning, "events.cc_collapse");
+        }
     }
     if (auto it = root.find("quality"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "correctness_mode", cfg.correctnessMode))
@@ -781,6 +788,7 @@ EngineConfig EngineConfig::Default() {
     cfg.stealPolicy = 0;
     cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
+    cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)
     // XP has no WASAPI status tooling and audio failures otherwise look like

@@ -53,6 +53,28 @@ inline constexpr bool IsInternalEngineMessage(uint32_t message) noexcept {
         tag == kInternalMasterTransposeTag;
 }
 
+// Controllers whose effect is pure channel state — a later value fully
+// replaces an earlier one. Eligible for the opt-in compiler-side collapse of
+// superseded same-(channel,controller) events (CC7/10/11 mix, CC0/32 bank
+// select, RPN data entry 6/38, filter/tone row CCs 71-74, FX sends 91/93).
+inline constexpr bool IsCollapsibleController(uint8_t controller) noexcept {
+    switch (controller) {
+        case 0: case 6: case 7: case 10: case 11: case 32: case 38:
+        case 71: case 72: case 73: case 74: case 91: case 93:
+            return true;
+        default: return false;
+    }
+}
+
+// Controllers that re-target controller state (RPN/NRPN selection) or reset
+// it wholesale. Any of these on a channel invalidates the channel's pending
+// collapse records: a dropped CC6 could otherwise belong to an RPN parameter
+// that the selection no longer points at.
+inline constexpr bool IsControllerStateReset(uint8_t controller) noexcept {
+    return (controller >= 98u && controller <= 101u) ||
+        controller == 120u || controller == 121u || controller == 123u;
+}
+
 inline bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
                                     uint64_t epochQPC,
                                     uint64_t qpcFrequency,

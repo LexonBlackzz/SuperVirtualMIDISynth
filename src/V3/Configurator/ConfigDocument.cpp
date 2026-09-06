@@ -169,6 +169,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.stealPolicy = 0u;
     d.perKeyVoiceCap = 0u;
     d.threadAffinityMode = 0u;
+    d.ccCollapse = false;
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
     d.correctnessMode = true;
@@ -213,6 +214,10 @@ void ConfigDocument::FromJson(const json& root) {
             working_.soundFontPath = working_.soundFontPaths.front();
         ReadNum(*it, "thread_affinity_mode", working_.threadAffinityMode,
                 0u, 2u);
+        if (auto collapse = it->find("cc_collapse"); collapse != it->end()) {
+            if (collapse->is_boolean())
+                working_.ccCollapse = collapse->get<bool>();
+        }
 
         if (auto routes = it->find("soundfont_routes");
             routes != it->end() && routes->is_array()) {
@@ -392,6 +397,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["steal_policy"] = working_.stealPolicy;
     root["voices"]["per_key_voice_cap"] = working_.perKeyVoiceCap;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
+    root["events"]["cc_collapse"] = working_.ccCollapse;
     root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
@@ -588,6 +594,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.stealPolicy == b.stealPolicy
         && a.perKeyVoiceCap == b.perKeyVoiceCap
         && a.threadAffinityMode == b.threadAffinityMode
+        && a.ccCollapse == b.ccCollapse
         && a.maxEventsPerBlock == b.maxEventsPerBlock
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode

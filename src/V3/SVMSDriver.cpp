@@ -2308,6 +2308,21 @@ private:
     // fence. Never counted before, which made fence-suppressed silence
     // indistinguishable from a dead event stream in telemetry.
     uint64_t fenceSuppressedNoteOns_ = 0u;
+    // Opt-in compiler-thread CC collapse: superseded same-(channel,controller)
+    // state events are dropped by overwriting the earlier one's slot in the
+    // page still being compiled. A published page can never be patched, so
+    // each record is tagged with the page-fill epoch it was created in and a
+    // record only survives while its page is the one in flight.
+    struct CcCollapseRecord {
+        uint32_t page = 0u;
+        uint32_t offset = 0u;
+        uint64_t pageEpoch = 0u;
+        bool valid = false;
+    };
+    std::atomic<bool> ccCollapseEnabled_{false};
+    CcCollapseRecord ccCollapseRecords_[kChannelCount][128]{};
+    uint64_t ccPageFillEpoch_ = 0u;   // compiler-thread owned
+    uint64_t ccCollapsedCount_ = 0u;  // compiler-thread owned, census only
     std::atomic<bool> cancelProducers_;
     std::atomic<uint32_t> producerWakeEpoch_;
     std::atomic<uint32_t> scheduledSizePublished_;
@@ -2893,6 +2908,24 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         strncpy_s(resultText, kText, affinityText[cmd.param], _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetCcCollapse: {
+        // param = opt-in compiler-side collapse of superseded
+        // same-(channel,controller) state CCs. The compiler thread reads the
+        // flag at page-fill time, so it applies to the next compiled page.
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "cc collapse must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        ccCollapseEnabled_.store(cmd.param != 0u,
+                                 std::memory_order_relaxed);
+        engineConfig_.ccCollapse = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "cc collapse: on (compiler-side)"
+                            : "cc collapse: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
 
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
@@ -3438,6 +3471,7 @@ bool Driver::Initialize() {
         cfg.voiceRetireThreshold, std::memory_order_relaxed);
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
+    ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -3571,6 +3605,7 @@ bool Driver::Initialize() {
         cfg.voiceRetireThreshold, std::memory_order_relaxed);
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
+    ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
     voiceManager->SetStealPolicy(cfg.stealPolicy);
@@ -4985,12 +5020,47 @@ void Driver::EventCompilerLoop() {
         CompiledEventPage& page = compiledPages_.Page(pageIndex);
         uint32_t compiledCount = 0u;
         uint32_t drained = 0u;
+        const bool collapseCc = ccCollapseEnabled_.load(std::memory_order_relaxed);
         auto compileOne = [&](const TimestampedMidiEvent& source) {
             ScheduledRenderEvent scheduled{};
-            if (CompileTimestampedEvent(source, epoch, qpcFreq, sampleRate,
+            if (!CompileTimestampedEvent(source, epoch, qpcFreq, sampleRate,
                                         bufferFrames, scheduled)) {
-                page.events[compiledCount++] = scheduled;
+                return;
             }
+            // Opt-in CC collapse: a collapsible controller supersedes the
+            // still-pending same-(channel,controller) event in this page by
+            // overwriting its slot (the page is sorted after compilation, so
+            // slot position is meaningless until publish). Channel-wide
+            // state resets re-target controller meaning and invalidate the
+            // channel's records instead.
+            if (collapseCc) {
+                if (scheduled.type == RenderEventType::ControlChange) {
+                    if (IsCollapsibleController(scheduled.data1)) {
+                        CcCollapseRecord& record =
+                            ccCollapseRecords_[scheduled.channel][scheduled.data1];
+                        if (record.valid && record.pageEpoch == ccPageFillEpoch_ &&
+                            record.page == pageIndex &&
+                            record.offset < compiledCount) {
+                            page.events[record.offset] = scheduled;
+                            ++ccCollapsedCount_;
+                            return;
+                        }
+                        record.page = pageIndex;
+                        record.pageEpoch = ccPageFillEpoch_;
+                        record.valid = true;
+                    } else if (IsControllerStateReset(scheduled.data1)) {
+                        for (auto& controllerRecords :
+                             ccCollapseRecords_[scheduled.channel]) {
+                            controllerRecords.valid = false;
+                        }
+                    }
+                } else if (scheduled.type == RenderEventType::Reset) {
+                    for (auto& channelRecords : ccCollapseRecords_) {
+                        for (auto& record : channelRecords) record.valid = false;
+                    }
+                }
+            }
+            page.events[compiledCount++] = scheduled;
         };
         compileOne(timed);
         ++drained;
@@ -5019,6 +5089,9 @@ void Driver::EventCompilerLoop() {
         } else {
             compiledPages_.ReturnUnusedFromCompiler(pageIndex);
         }
+        // The page is no longer patchable — collapse records pointing into
+        // it must never match a later page fill (indexes recycle).
+        ++ccPageFillEpoch_;
         if (drained != 0u) {
             publishProducerSpace();
         }
@@ -5784,6 +5857,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         static uint64_t censusLastFenceDrop = 0;
         static uint64_t censusLastStale = 0;
         static uint64_t censusLastShed = 0;
+        static uint64_t censusLastCc = 0;
         uint32_t fencedChannels = 0u;
         uint32_t maxChannelFence = 0u;
         for (auto& fence : self->channelTerminationFence_) {
@@ -5798,11 +5872,12 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         char flowCensus[224];
         std::snprintf(flowCensus, sizeof(flowCensus),
             "[SVMS] flow: on+%llu fenceDrop+%llu stale+%llu shed+%llu "
-            "seq=%u fenceG=%u fencedCh=%u maxChFence=%u q=%u blk=%u act=%u\n",
+            "cc+%llu seq=%u fenceG=%u fencedCh=%u maxChFence=%u q=%u blk=%u act=%u\n",
             (unsigned long long)(self->sf2Telemetry_.noteOns - censusLastNoteOns),
             (unsigned long long)(self->fenceSuppressedNoteOns_ - censusLastFenceDrop),
             (unsigned long long)(self->telemetry_.staleNoteOnsSkipped - censusLastStale),
             (unsigned long long)(self->shedAtomic_.load(std::memory_order_relaxed) - censusLastShed),
+            (unsigned long long)(self->ccCollapsedCount_ - censusLastCc),
             self->nextEventSequence_.load(std::memory_order_relaxed),
             (unsigned)(globalEncoded ? globalEncoded - 1u : 0u),
             fencedChannels, maxChannelFence,
@@ -5814,6 +5889,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         censusLastFenceDrop = self->fenceSuppressedNoteOns_;
         censusLastStale = self->telemetry_.staleNoteOnsSkipped;
         censusLastShed = self->shedAtomic_.load(std::memory_order_relaxed);
+        censusLastCc = self->ccCollapsedCount_;
     }
     // Per-voice phase rotation is applied inside RenderBlock (per-voice, at
     // each mix site), so Coherent mode (no state allocated) stays bit-exact

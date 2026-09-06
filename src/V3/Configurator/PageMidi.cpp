@@ -257,6 +257,27 @@ void DrawMidiPage(ConfigDocument& doc) {
         RestartCell();
 
         ImGui::TableNextRow();
+        LabelCell("CC collapse",
+                  "OFF by default: every control-change event dispatches. "
+                  "When enabled, the compiler thread drops superseded "
+                  "same-(channel,controller) state CCs (volume, pan, "
+                  "expression, bank, RPN data, tone rows) inside a page "
+                  "before they ever reach the audio thread. Saves dispatch "
+                  "on CC-automation-dense material.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("##cccollapse", &w.ccCollapse)) {
+            doc.MarkDirty();
+            if (lc.connected && lc.client) {
+                char ccResult[svms::kRuntimeLinkResultTextCapacity]{};
+                lc.client->SendCommand(
+                    svms::RLCommandType::SetCcCollapse, 0u,
+                    w.ccCollapse ? 1u : 0u,
+                    svms::RuntimeLiveStateV2{}, 100u, ccResult);
+            }
+        }
+        RestartCell();
+
+        ImGui::TableNextRow();
         LabelCell("Note-on coalescing",
                   "OFF by default: every note-on spawns a voice at its exact "
                   "timestamp, preserving retrigger timing precision. When "
