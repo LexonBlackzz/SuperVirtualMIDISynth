@@ -269,7 +269,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"threshold", cfg.noteOnCollapseThreshold}
         }},
         {"voices", {
-            {"retire_threshold", cfg.voiceRetireThreshold}
+            {"retire_threshold", cfg.voiceRetireThreshold},
+            {"steal_policy", cfg.stealPolicy}
         }},
 
         {"midi", {
@@ -634,6 +635,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "retire_threshold", cfg.voiceRetireThreshold,
                        1e-8f, 0.05f))
             AppendWarning(cfg.configWarning, "voices.retire_threshold");
+        if (!ReadValue(*it, "steal_policy", cfg.stealPolicy, 0u, 1u))
+            AppendWarning(cfg.configWarning, "voices.steal_policy");
     }
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
@@ -768,6 +771,7 @@ EngineConfig EngineConfig::Default() {
     cfg.shedStartPercent = 70;
     cfg.maxEventsPerBlock = 65536;
     cfg.voiceRetireThreshold = kVoiceRetireThreshold;
+    cfg.stealPolicy = 0;
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)
     // XP has no WASAPI status tooling and audio failures otherwise look like
@@ -897,6 +901,7 @@ bool EngineConfig::Validate() const {
             highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
             shedStartPercent >= 1 && shedStartPercent < 100 &&
             voiceRetireThreshold > 0.0f && voiceRetireThreshold <= 0.05f &&
+            stealPolicy <= 1u &&
             maxEventsPerBlock > 0;
 }
 

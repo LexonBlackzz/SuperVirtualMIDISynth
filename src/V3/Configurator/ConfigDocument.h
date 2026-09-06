@@ -69,6 +69,7 @@ struct ConfigValues {
     uint32_t shedStartPercent = 70;
     uint32_t maxEventsPerBlock = 65536;
     float voiceRetireThreshold = 0.00015f;
+    uint32_t stealPolicy = 0;
     int overflowMode = 0;
     bool correctnessMode = true;
 

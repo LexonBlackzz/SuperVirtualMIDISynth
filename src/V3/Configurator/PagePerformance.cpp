@@ -145,6 +145,26 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 svms::RuntimeLiveStateV2{}, 100u, retireResult);
         }
         LiveVoiceCell();
+
+        ImGui::TableNextRow();
+        LabelCell("Steal policy",
+                  "Quality: steals the quietest voice via an incremental priority index (original behavior). Fast cursor: O(1) round-robin slot takeover with no steal index at all (victim = oldest slot), not the quietest voice. Fast mode is close to free under dense churn; judge by ear on sparse sustained material.");
+        ImGui::TableNextColumn();
+        static const char* stealModes[] = { "Quality", "Fast cursor" };
+        int stealMode = static_cast<int>(w.stealPolicy);
+        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::Combo("##stealpolicy", &stealMode, stealModes, 2)) {
+            w.stealPolicy = static_cast<uint32_t>(stealMode);
+            doc.MarkDirty();
+            if (lc.connected && lc.client) {
+                char stealResult[svms::kRuntimeLinkResultTextCapacity]{};
+                lc.client->SendCommand(
+                    svms::RLCommandType::SetStealPolicy, 0u,
+                    w.stealPolicy, svms::RuntimeLiveStateV2{}, 100u,
+                    stealResult);
+            }
+        }
+        LiveVoiceCell();
         
         ImGui::TableNextRow();
         LabelCell("Voice presets");

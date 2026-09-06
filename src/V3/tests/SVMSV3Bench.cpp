@@ -103,6 +103,7 @@ struct Options {
     uint32_t ccRate = 0;
     uint32_t ccController = 0;   // 0 = cycle 64/66/120/123
     uint32_t renderThreads = 1;
+    uint32_t stealPolicy = 0u;
     std::string soundFontPath;
     uint32_t pinCore = UINT32_MAX;
     bool automaticBackend = true;
@@ -174,6 +175,9 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             if (!nextNumber(options.renderThreads) ||
                 options.renderThreads < 1u || options.renderThreads > 64u)
                 return false;
+        } else if (std::strcmp(argv[i], "--steal-policy") == 0) {
+            if (!nextNumber(options.stealPolicy) || options.stealPolicy > 1u)
+                return false;
         } else if (std::strcmp(argv[i], "--soundfont") == 0) {
             if (i + 1 >= argc) return false;
             options.soundFontPath = argv[++i];
@@ -243,8 +247,10 @@ bool ParseOptions(int argc, char** argv, Options& options) {
 bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
                      const svms::RuntimeConfigSnapshot& cfg,
                      uint32_t voiceCount, Workload workload,
-                     uint32_t sampleFrames, uint32_t genericVoices) {
+                     uint32_t sampleFrames, uint32_t genericVoices,
+                     uint32_t stealPolicy) {
     if (!voices.Initialize(voiceCount, 44100)) return false;
+    voices.SetStealPolicy(stealPolicy);
     channels.SetMasterVolume(1.0f);
     channels.RebuildCache(cfg, 44100.0f);
     constexpr uint32_t regionFrames = 2048;
@@ -640,7 +646,7 @@ int main(int argc, char** argv) {
     svms::ChannelCache channels;
     if (!ConfigureVoices(*voices, channels, cfg, options.voices,
                          options.workload, sampleFrames,
-                         options.genericVoices)) {
+                         options.genericVoices, options.stealPolicy)) {
         std::fprintf(stderr, "cannot allocate voice storage\n");
         return 3;
     }

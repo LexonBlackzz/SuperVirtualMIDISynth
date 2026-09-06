@@ -95,6 +95,7 @@ struct EngineConfig {
     uint32_t shedStartPercent;
     uint32_t maxEventsPerBlock;
     float voiceRetireThreshold;
+    uint32_t stealPolicy;  // 0 = quality (priority tree), 1 = fast cursor
     bool correctnessMode;
     bool diagnosticsEnabled;
     bool diagnosticsWindow;

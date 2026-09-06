@@ -154,6 +154,7 @@ struct LaunchChurnStats {
 // ════════════════════════════════════════════════════════════════════════
 class VoiceManager {
 public:
+    void SetStealPolicy(uint32_t policy);
     using PreTailCaptureHook = void(*)(VoiceHandle handle, void* userData);
     using VoiceConfiguredHook = void(*)(VoiceHandle handle, void* userData);
     VoiceManager();
@@ -721,6 +722,13 @@ private:
     uint64_t stealVolatileHeapFrame_;
     bool stealVolatileHeapValid_;
     RenderBackend stealKeyBackend_;
+    // Steal policy: 0 = Quality (incremental winner tree + volatile heap,
+    // quietest-victim semantics), 1 = FastCursor (O(1) round-robin slot
+    // takeover, no index structures; victim quality is "oldest slot"). The
+    // index is unmaintained under FastCursor and fully rebuilt from live
+    // pool state on a switch back to Quality.
+    uint32_t stealPolicy_ = 0u;
+    uint32_t stealCursor_ = 0u;
     uint8_t* stealCandidateDeferred_;
     // A deferred same-frame replacement may keep ownership of the volatile
     // heap root while its sample/envelope fields are configured.  The slot
@@ -861,6 +869,8 @@ private:
     VoiceHandle NextValidReleasingRingVictim(uint32_t& victimPosition,
                                              bool consume);
     bool ReleasingRingEligible() const;
+    bool FastSteal() const { return stealPolicy_ != 0u; }
+    VoiceHandle SelectCursorVictim();
     void PushStealCandidate(VoiceHandle handle, uint32_t activePosition);
     void UpdateStealCandidate(VoiceHandle handle);
     void RemoveStealCandidate(VoiceHandle handle);
@@ -2927,8 +2937,54 @@ inline void VoiceManager::BuildStealHeap() {
     stealHeapValid_ = true;
 }
 
+inline void VoiceManager::SetStealPolicy(uint32_t policy) {
+    if (stealPolicy_ == policy) return;
+    stealPolicy_ = policy;
+    if (policy == 0u) {
+        // Returning to Quality: rebuild every index structure from live
+        // pool state. BuildStealHeap resets the volatile list, tree, and
+        // heaps before rescanning, so nothing stale survives FastCursor.
+        BuildStealHeap();
+    } else {
+        stealHeapValid_ = false;
+        stealVolatileHeapValid_ = false;
+        stealHeapCount_ = 0u;
+        stealVolatileCount_ = 0u;
+        stealVolatileHeapCount_ = 0u;
+    }
+}
+
+// FastCursor victim: the next Active slot at the allocation cursor that is
+// not inside an uncommitted launch transaction. Everything downstream
+// (sibling group retirement, ghost capture, in-place reinit) runs exactly
+// as it does for a searched victim.
+inline VoiceHandle VoiceManager::SelectCursorVictim() {
+    const uint32_t capacity = maxVoices_;
+    for (uint32_t probes = 0u; probes < capacity; ++probes) {
+        const uint32_t idx = stealCursor_;
+        stealCursor_ = idx + 1u < capacity ? idx + 1u : 0u;
+        if (v.state[idx] != static_cast<uint8_t>(VoiceState::Active))
+            continue;
+        if (stealCandidateDeferred_[idx] != 0u ||
+            stealCandidateReserved_[idx] != 0u)
+            continue;  // inside an uncommitted launch transaction
+        return static_cast<VoiceHandle>(idx);
+    }
+    return kInvalidVoice;
+}
+
 inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
                                                     bool reserveVolatileRoot) {
+    if (FastSteal()) {
+        // (void)reserveVolatileRoot: FastCursor never reserves — the victim
+        // is consumed immediately by the launch transaction.
+        const VoiceHandle victim = SelectCursorVictim();
+        if (victim == kInvalidVoice) return kInvalidVoice;
+        PrefetchVoiceLines(victim);
+        const uint32_t position = activePosition_[victim];
+        activePosition = position < activeCount_ ? position : 0u;
+        return victim;
+    }
     if (!stealHeapValid_) BuildStealHeap();
 
     // Releasing-ring fast path. Under saturated chopped-note churn the pool
@@ -3153,6 +3209,7 @@ inline uint32_t VoiceManager::PopStealCandidates(uint32_t count,
 // order may differ from the pre-pop arrangement, but the heap is fully
 // ordered by unique keys, so every subsequent selection is identical.
 inline void VoiceManager::InsertPreselectedVictim(VoiceHandle victim) {
+    if (FastSteal()) return;
     // The sequential path builds the volatile heap before any selection that
     // can observe volatile candidates (tier c inside PopStealCandidate), so
     // the re-arm must guarantee the same precondition before re-linking a
@@ -3190,6 +3247,7 @@ inline void VoiceManager::RearmLiveBatchVictims(const VoiceHandle* victims,
 
 inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
                                               uint32_t activePosition) {
+    if (FastSteal()) return;
     if (!stealHeapValid_ || handle >= maxVoices_) return;
     if (!IsLinkedActiveVoice(handle)) return;  // unlinked: not indexable yet
     if (!IsStableStealCandidate(handle)) {
@@ -3205,6 +3263,7 @@ inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
 }
 
 inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
+    if (FastSteal()) return;
     if (!stealHeapValid_ || handle >= maxVoices_ ||
         stealCandidateDeferred_[handle] != 0u) return;
 
@@ -3752,10 +3811,22 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     // sequence this site would perform — with full ring/tree/heap repair, so
     // only the redundant re-selection call is skipped here; the victim is
     // identical and the post-selection logic below is untouched.
-    const VoiceHandle bestHandle = preselectedVictim != kInvalidVoice
-        ? preselectedVictim
-        : PopStealCandidate(bestPos,
-                            deferCandidate && reserveCandidateInPlace);
+    VoiceHandle bestHandle = kInvalidVoice;
+    if (FastSteal()) {
+        // FastCursor: consume the batch-provided victim when valid,
+        // otherwise take the next slot at the allocation cursor. No index
+        // search, no repair — downstream runs identically.
+        bestHandle = preselectedVictim;
+        if (bestHandle == kInvalidVoice ||
+            v.state[bestHandle] !=
+                static_cast<uint8_t>(VoiceState::Active))
+            bestHandle = SelectCursorVictim();
+    } else {
+        bestHandle = preselectedVictim != kInvalidVoice
+            ? preselectedVictim
+            : PopStealCandidate(bestPos,
+                                deferCandidate && reserveCandidateInPlace);
+    }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
                           selectionBegin);
@@ -3765,6 +3836,9 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     // retirement, tail capture, and index repair below still have work to
     // run before the first field write.
     PrefetchVoiceLines(bestHandle);
+    // Quality mode receives this from the pop; FastCursor derives it here
+    // (the batch path's positions are cursor positions either way).
+    bestPos = activePosition_[bestHandle];
     const uint32_t bestIdx = bestHandle;
 
     // Every SF2 region produced by one MIDI note-on shares playIndex. Stereo

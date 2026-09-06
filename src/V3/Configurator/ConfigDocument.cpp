@@ -166,6 +166,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.shedStartPercent = 70;
     d.maxEventsPerBlock = 65536;
     d.voiceRetireThreshold = 0.00015f;
+    d.stealPolicy = 0u;
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
     d.correctnessMode = true;
@@ -294,6 +295,9 @@ void ConfigDocument::FromJson(const json& root) {
         ReadNum(*it, "retire_threshold", working_.voiceRetireThreshold,
                 1e-8f, 0.05f);
     }
+    if (auto it = root.find("voices"); it != root.end() && it->is_object()) {
+        ReadNum(*it, "steal_policy", working_.stealPolicy, 0u, 1u);
+    }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.diagnosticsEnabled);
         ReadBool(*it, "window", working_.diagnosticsWindow);
@@ -380,6 +384,7 @@ nlohmann::json ConfigDocument::ToJson() const {
 
     root["phase_rotation"]["mode"] = working_.phaseRotationMode;
     root["voices"]["retire_threshold"] = working_.voiceRetireThreshold;
+    root["voices"]["steal_policy"] = working_.stealPolicy;
     root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
@@ -573,6 +578,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.highPriorityVelocity == b.highPriorityVelocity
         && a.shedStartPercent == b.shedStartPercent
         && a.voiceRetireThreshold == b.voiceRetireThreshold
+        && a.stealPolicy == b.stealPolicy
         && a.maxEventsPerBlock == b.maxEventsPerBlock
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode

@@ -2827,6 +2827,23 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                  threshold, 20.0 * std::log10(static_cast<double>(threshold)));
         return svms::RLResult::Ok;
     }
+    case RT::SetStealPolicy: {
+        // param = 0 (quality: incremental priority tree) or 1 (fast
+        // cursor: O(1) round-robin victim, no index structures). Live
+        // switches rebuild or drop the index as appropriate.
+        if (cmd.param > 1u || !voiceManager) {
+            strncpy_s(resultText, kText, "steal policy must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        voiceManager->SetStealPolicy(cmd.param);
+        engineConfig_.stealPolicy = cmd.param;
+        strncpy_s(resultText, kText,
+                  cmd.param != 0u ? "steal policy: fast cursor"
+                                  : "steal policy: quality (priority tree)",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
 
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
@@ -3503,6 +3520,7 @@ bool Driver::Initialize() {
         cfg.voiceRetireThreshold, std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
+    voiceManager->SetStealPolicy(cfg.stealPolicy);
     if (!voiceManager->Initialize(cfg.maxVoices, sampleRate)) {
         LOG("FAILED: Could not allocate voice storage maxVoices=%u",
             cfg.maxVoices);
