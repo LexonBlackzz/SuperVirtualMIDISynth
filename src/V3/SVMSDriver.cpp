@@ -2320,6 +2320,9 @@ private:
         bool valid = false;
     };
     std::atomic<bool> ccCollapseEnabled_{false};
+    // Opt-in block-granular dispatch: admitted events fire at block start
+    // instead of their exact intra-block sample offset.
+    std::atomic<bool> blockTimingEnabled_{false};
     CcCollapseRecord ccCollapseRecords_[kChannelCount][128]{};
     uint64_t ccPageFillEpoch_ = 0u;   // compiler-thread owned
     uint64_t ccCollapsedCount_ = 0u;  // compiler-thread owned, census only
@@ -2926,6 +2929,24 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetBlockTiming: {
+        // param = opt-in block-granular dispatch. Events still admitted in
+        // order; only their intra-block offset is relinquished (fires at
+        // block start).
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "block timing must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        blockTimingEnabled_.store(cmd.param != 0u,
+                                  std::memory_order_relaxed);
+        engineConfig_.blockTimingMode = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "block timing: on (events fire at block start)"
+                            : "block timing: off (exact-frame dispatch)",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
 
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
@@ -3472,6 +3493,7 @@ bool Driver::Initialize() {
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
+    blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -3606,6 +3628,7 @@ bool Driver::Initialize() {
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
+    blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
     voiceManager->SetStealPolicy(cfg.stealPolicy);
@@ -5654,8 +5677,13 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             return;
         }
         int64_t offset = scheduledOut.targetFrame - self->virtualRenderSample_;
-        if (offset < 0) {
-            ++self->telemetry_.late;
+        if (offset < 0) ++self->telemetry_.late;
+        if (self->blockTimingEnabled_.load(std::memory_order_relaxed)) {
+            // Block-granular dispatch (opt-in, syndrv-style): every event due
+            // in this block fires at block start. One launch burst, zero
+            // mid-block span splits; intra-block offsets are relinquished.
+            offset = 0;
+        } else if (offset < 0) {
             ++self->telemetry_.lateClamped;
             ++clampedThisBlock;
             const int64_t lateness = -offset;

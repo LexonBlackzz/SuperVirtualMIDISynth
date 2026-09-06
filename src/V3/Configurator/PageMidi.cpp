@@ -278,6 +278,27 @@ void DrawMidiPage(ConfigDocument& doc) {
         RestartCell();
 
         ImGui::TableNextRow();
+        LabelCell("Block timing mode",
+                  "OFF by default: events dispatch at their exact intra-block "
+                  "sample offset (keep this for latency-critical live play). "
+                  "When enabled, every event due in a callback fires at block "
+                  "start instead — syndrv-style. One launch burst per block "
+                  "and zero mid-block render splits; timing precision inside "
+                  "the block is relinquished.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("##blocktiming", &w.blockTiming)) {
+            doc.MarkDirty();
+            if (lc.connected && lc.client) {
+                char btResult[svms::kRuntimeLinkResultTextCapacity]{};
+                lc.client->SendCommand(
+                    svms::RLCommandType::SetBlockTiming, 0u,
+                    w.blockTiming ? 1u : 0u,
+                    svms::RuntimeLiveStateV2{}, 100u, btResult);
+            }
+        }
+        RestartCell();
+
+        ImGui::TableNextRow();
         LabelCell("Note-on coalescing",
                   "OFF by default: every note-on spawns a voice at its exact "
                   "timestamp, preserving retrigger timing precision. When "

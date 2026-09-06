@@ -93,6 +93,9 @@ struct EngineConfig {
     // Opt-in compiler-side CC collapse: superseded same-(channel,controller)
     // state events are dropped upstream. Off by default.
     bool ccCollapse;
+    // Opt-in block-granular dispatch: admitted events fire at block start
+    // instead of their exact intra-block offset. Off by default.
+    bool blockTimingMode;
     EventOverflowMode eventOverflowMode;
     uint32_t highPriorityVelocity;
     uint32_t shedStartPercent;

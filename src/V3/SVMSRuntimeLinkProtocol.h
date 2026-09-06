@@ -261,6 +261,7 @@ enum class RLCommandType : uint32_t {
     SetPerKeyVoiceCap    = 0x00000115,
     SetThreadAffinityMode = 0x00000116,
     SetCcCollapse         = 0x00000117,
+    SetBlockTiming        = 0x00000118,
 
 
     Invalid              = 0xFFFFFFFF,

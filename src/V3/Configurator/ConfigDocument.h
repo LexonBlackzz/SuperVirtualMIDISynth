@@ -76,6 +76,8 @@ struct ConfigValues {
     uint32_t threadAffinityMode = 0u;
     // Opt-in compiler-side CC collapse (superseded same-(channel,controller)).
     bool ccCollapse = false;
+    // Opt-in block-granular dispatch (events fire at block start).
+    bool blockTiming = false;
     int overflowMode = 0;
     bool correctnessMode = true;
 

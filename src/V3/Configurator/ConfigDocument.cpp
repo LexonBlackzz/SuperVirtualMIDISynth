@@ -170,6 +170,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.perKeyVoiceCap = 0u;
     d.threadAffinityMode = 0u;
     d.ccCollapse = false;
+    d.blockTiming = false;
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
     d.correctnessMode = true;
@@ -217,6 +218,10 @@ void ConfigDocument::FromJson(const json& root) {
         if (auto collapse = it->find("cc_collapse"); collapse != it->end()) {
             if (collapse->is_boolean())
                 working_.ccCollapse = collapse->get<bool>();
+        }
+        if (auto bt = it->find("block_timing"); bt != it->end()) {
+            if (bt->is_boolean())
+                working_.blockTiming = bt->get<bool>();
         }
 
         if (auto routes = it->find("soundfont_routes");
@@ -398,6 +403,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["per_key_voice_cap"] = working_.perKeyVoiceCap;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
+    root["synth"]["block_timing"] = working_.blockTiming;
     root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
@@ -595,6 +601,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.perKeyVoiceCap == b.perKeyVoiceCap
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
+        && a.blockTiming == b.blockTiming
         && a.maxEventsPerBlock == b.maxEventsPerBlock
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode
