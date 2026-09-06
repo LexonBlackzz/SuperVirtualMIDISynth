@@ -3546,15 +3546,14 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
                 const uint8_t controller = events[i].data1;
                 switch (controller) {
                     case 1u:
+                        // This plan only runs under the !vibratoActive gate
+                        // (every channel's mod depth is zero at block start),
+                        // so a CC1 inside the block cannot modulate anything:
+                        // a no-op here. Should dispatch ever raise a mod
+                        // depth, the next block's vibrato gate flips and the
+                        // legacy path takes over again.
+                        break;
                     default:
-                        // CC1 engages the per-frame vibrato LFO, which no
-                        // whole-block plan can model; unmapped controllers
-                        // stay on the legacy path until their dispatch
-                        // effects are audited.
-                        lastRefusalType_ =
-                            static_cast<uint8_t>(RenderEventType::ControlChange);
-                        lastRefusalData1_ = controller;
-                        return false;
                     case 0u:
                     case 32u:
                         // Bank select: launch-time state only.
