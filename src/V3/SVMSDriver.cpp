@@ -2196,6 +2196,10 @@ private:
     // from sounding after a reset or per-channel termination controller.
     std::atomic<uint64_t> globalTerminationFence_;
     std::atomic<uint64_t> channelTerminationFence_[kChannelCount];
+    // Audio-thread-only: note-ons rejected at dispatch by a termination
+    // fence. Never counted before, which made fence-suppressed silence
+    // indistinguishable from a dead event stream in telemetry.
+    uint64_t fenceSuppressedNoteOns_ = 0u;
     std::atomic<bool> cancelProducers_;
     std::atomic<uint32_t> producerWakeEpoch_;
     std::atomic<uint32_t> scheduledSizePublished_;
@@ -4447,16 +4451,21 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
     const bool lossless = !noteOn || velocity >= highPriorityVelocity_ ||
                           overflowMode == EventOverflowMode::LosslessBackpressure;
     for (;;) {
-        if (midiIngress_.TryPush(lane, evt)) {
-            acceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
-            // A running compiler will observe the queue without help. Only
-            // cross the kernel/API boundary when it explicitly published
-            // that it is asleep.
-            if (compilerSleeping_.exchange(false,
-                    std::memory_order_acq_rel)) {
-                compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
-                WakeAddressWaiters(compilerWakeEpoch_);
-            }
+            if (midiIngress_.TryPush(lane, evt)) {
+                acceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
+                // A running compiler will observe the queue without help. Only
+                // cross the kernel/API boundary when it explicitly published
+                // that it is asleep. The load keeps the ordinary (awake) case
+                // a plain read; the exchange only runs when a wake is real.
+                // No lost wakeup is possible: the compiler re-pops the queue
+                // after publishing sleeping=true, and this event's push
+                // already completed before the load below observed anything.
+                if (compilerSleeping_.load(std::memory_order_acquire) &&
+                    compilerSleeping_.exchange(false,
+                        std::memory_order_acq_rel)) {
+                    compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
+                    WakeAddressWaiters(compilerWakeEpoch_);
+                }
 #if defined(SVMS_XP_COMPAT)
             static LONG acceptedTraceCount = 0;
             const LONG acceptedIndex = InterlockedIncrement(&acceptedTraceCount);
@@ -4555,7 +4564,11 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
             if (midiIngress_.TryPushBatch(
                     EventLane::Loud, prepared, count)) {
                 acceptedAtomic_.fetch_add(count, std::memory_order_relaxed);
-                if (compilerSleeping_.exchange(
+                // Same guarded wake as the single-event path: the batch is
+                // already visible in the lane, so only a compiler that
+                // published sleeping=true after this push needs a wake.
+                if (compilerSleeping_.load(std::memory_order_acquire) &&
+                    compilerSleeping_.exchange(
                         false, std::memory_order_acq_rel)) {
                     compilerWakeEpoch_.fetch_add(1u,
                                                   std::memory_order_release);
@@ -5403,6 +5416,56 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // toward their firing time without frame-boundary re-quantization.
     // ── Step 5: Sort evtBuf by sampleOffset (defensive) ─────────────────
 
+    // ── Same-key same-frame note-off run compaction ─────────────────────
+    // The compiler path delivers one event per note-off. Black-MIDI note-off
+    // avalanches then cost twice: once as per-event dispatch, once as
+    // whole-voice render fragmentation, because every event splits the block
+    // at its exact frame. Consecutive NoteOff events with identical
+    // (channel, note, frameOffset) collapse into StaleNoteOffBatch events
+    // (255 offs each). Equivalence: HandleStaleNoteOffBatch performs the same
+    // idempotent channel-cache write once, then NoteOffOldestPlayIndices
+    // loops FindOldestPlayIndex/NoteOffPlayIndex exactly count times — the
+    // same state transitions as count sequential HandleNoteOff calls with no
+    // intervening event. A run never crosses a different event, so channel
+    // state (sustain/sostenuto) is constant inside it. Fences only suppress
+    // note-ons, so the batch's ingressSequence (last member of the run) is
+    // not consulted for note-offs.
+    uint32_t compactedWrite = 0u;
+    for (uint32_t readIndex = 0u; readIndex < evCount;) {
+        const RenderEvent& head = evtBuf[readIndex];
+        if (head.type != RenderEventType::NoteOff) {
+            evtBuf[compactedWrite++] = head;
+            ++readIndex;
+            continue;
+        }
+        uint32_t runEnd = readIndex + 1u;
+        while (runEnd < evCount &&
+               evtBuf[runEnd].type == RenderEventType::NoteOff &&
+               evtBuf[runEnd].channel == head.channel &&
+               evtBuf[runEnd].data1 == head.data1 &&
+               evtBuf[runEnd].frameOffset == head.frameOffset) {
+            ++runEnd;
+        }
+        const uint32_t runCount = runEnd - readIndex;
+        if (runCount == 1u) {
+            evtBuf[compactedWrite++] = head;
+            ++readIndex;
+            continue;
+        }
+        uint32_t remaining = runCount;
+        while (remaining != 0u) {
+            const uint8_t batch = static_cast<uint8_t>(
+                (std::min)(remaining, 255u));
+            RenderEvent batchEvent = evtBuf[runEnd - 1u];
+            batchEvent.type = RenderEventType::StaleNoteOffBatch;
+            batchEvent.data2 = batch;
+            evtBuf[compactedWrite++] = batchEvent;
+            remaining -= batch;
+        }
+        readIndex = runEnd;
+    }
+    evCount = compactedWrite;
+
     // ── Step 6: Render with sub-sample event slicing ───────────────────
     // RenderBlock will invoke DispatchRenderEvent at each event's exact
     // fractional sample offset.  All event handling (voice allocation,
@@ -5446,20 +5509,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             self->sf2Telemetry_.lastPhase = vm->v.phases[h];
         }
     }
-    // Periodic pool census: what changed when CPU jumps. Every 64 blocks,
-    // only when diagnostics are on. DebugView: active total + per-class.
-    if (self->diagnosticsEnabled_ && (self->callbackCount_ & 63u) == 0u) {
-        char census[256];
-        std::snprintf(census, sizeof(census),
-            "[SVMS] pool active=%u sos=%u sloop=%u tloop=%u rloop=%u gen=%u\n",
-            (unsigned)vm->activeCount_,
-            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedOneShot),
-            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedLoop),
-            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::TransientLoop),
-            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::ReleaseLoop),
-            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::Generic));
-        OutputDebugStringA(census);
-    }
+    // Periodic pool census moved below: it needs the block's cpu/percent
+    // fields, which are only known after the post-processing timing pass.
     // Scheduler-lateness census, same 64-block cadence. Deltas since the
     // previous census keep the numbers readable while the stream runs.
     if (self->diagnosticsEnabled_ && (self->callbackCount_ & 63u) == 0u) {
@@ -5480,6 +5531,47 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         censusLastClamped = self->telemetry_.lateClamped;
         censusLastLate = self->telemetry_.late;
         censusLastDispatched = self->telemetry_.dispatched;
+    }
+    // Note-on flow census, same 64-block cadence. Separates "events arrive
+    // but note-ons never spawn" causes: fence suppression (fence values
+    // pinned behind the ingress sequence), obsolete-note-on drops (stale+),
+    // velocity shedding (shed+), or genuinely no spawns (on+ frozen while
+    // nothing else climbs). This is the permanent-silence diagnostic.
+    if (self->diagnosticsEnabled_ && (self->callbackCount_ & 63u) == 0u) {
+        static uint64_t censusLastNoteOns = 0;
+        static uint64_t censusLastFenceDrop = 0;
+        static uint64_t censusLastStale = 0;
+        static uint64_t censusLastShed = 0;
+        uint32_t fencedChannels = 0u;
+        uint32_t maxChannelFence = 0u;
+        for (auto& fence : self->channelTerminationFence_) {
+            const uint64_t encoded = fence.load(std::memory_order_relaxed);
+            if (encoded == 0u) continue;
+            ++fencedChannels;
+            maxChannelFence = (std::max)(maxChannelFence,
+                static_cast<uint32_t>(encoded - 1u));
+        }
+        const uint64_t globalEncoded =
+            self->globalTerminationFence_.load(std::memory_order_relaxed);
+        char flowCensus[224];
+        std::snprintf(flowCensus, sizeof(flowCensus),
+            "[SVMS] flow: on+%llu fenceDrop+%llu stale+%llu shed+%llu "
+            "seq=%u fenceG=%u fencedCh=%u maxChFence=%u q=%u blk=%u act=%u\n",
+            (unsigned long long)(self->sf2Telemetry_.noteOns - censusLastNoteOns),
+            (unsigned long long)(self->fenceSuppressedNoteOns_ - censusLastFenceDrop),
+            (unsigned long long)(self->telemetry_.staleNoteOnsSkipped - censusLastStale),
+            (unsigned long long)(self->shedAtomic_.load(std::memory_order_relaxed) - censusLastShed),
+            self->nextEventSequence_.load(std::memory_order_relaxed),
+            (unsigned)(globalEncoded ? globalEncoded - 1u : 0u),
+            fencedChannels, maxChannelFence,
+            (unsigned)self->midiIngress_.TotalSize(),
+            (unsigned)self->scheduledSizePublished_.load(std::memory_order_relaxed),
+            (unsigned)vm->activeCount_);
+        OutputDebugStringA(flowCensus);
+        censusLastNoteOns = self->sf2Telemetry_.noteOns;
+        censusLastFenceDrop = self->fenceSuppressedNoteOns_;
+        censusLastStale = self->telemetry_.staleNoteOnsSkipped;
+        censusLastShed = self->shedAtomic_.load(std::memory_order_relaxed);
     }
     // Per-voice phase rotation is applied inside RenderBlock (per-voice, at
     // each mix site), so Coherent mode (no state allocated) stays bit-exact
@@ -5592,6 +5684,42 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     s_dispatchSmoothed += 0.1f * (dispatchPercent - s_dispatchSmoothed);
     s_synthesisSmoothed += 0.1f * (synthesisPercent - s_synthesisSmoothed);
     s_postSmoothed += 0.1f * (postPercent - s_postSmoothed);
+
+    // Merged pool/load census, same 64-block cadence as sched/flow. This is
+    // the only per-cadence load line: it folds the former diagnostics-window
+    // timer flood (voices=/retire=/cpu=/p99=/over=/coalesced=) into one
+    // census pinned to real audio callbacks.
+    if (self->diagnosticsEnabled_ && (self->callbackCount_ & 63u) == 0u) {
+        static uint64_t censusLastCoalesced = 0;
+        char poolCensus[384];
+        std::snprintf(poolCensus, sizeof(poolCensus),
+            "[SVMS] pool active=%u/%u retire=%u step=%u cpu=%.1f%% "
+            "(disp=%.0f synth=%.0f sched=%.0f post=%.0f) p99=%.0f%% "
+            "over=%llu coalesced+%llu(1/%u) sos=%u sloop=%u tloop=%u "
+            "rloop=%u gen=%u\n",
+            (unsigned)vm->activeCount_, (unsigned)vm->GetMaxVoices(),
+            (unsigned)vm->retireCount_,
+            (unsigned)(self->correctnessMode_ ? 1u
+                : ComputeDecimationStep(vm->activeCount_)),
+            static_cast<double>(s_cpuSmoothed),
+            static_cast<double>(s_dispatchSmoothed),
+            static_cast<double>(s_synthesisSmoothed),
+            static_cast<double>(s_schedulerSmoothed),
+            static_cast<double>(s_postSmoothed),
+            static_cast<double>(self->telemetry_.callbackP99Percent),
+            (unsigned long long)self->telemetry_.overBudgetCallbacks,
+            (unsigned long long)(self->coalescedAtomic_.load(
+                std::memory_order_relaxed) - censusLastCoalesced),
+            (unsigned)self->noteOnCollapse_.Threshold(),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedOneShot),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedLoop),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::TransientLoop),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::ReleaseLoop),
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::Generic));
+        OutputDebugStringA(poolCensus);
+        censusLastCoalesced = self->coalescedAtomic_.load(
+            std::memory_order_relaxed);
+    }
 
     if (self->diagnosticsEnabled_) {
         static int diagTick = 0;
@@ -5744,6 +5872,7 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                 : 0u;
             if (FenceSuppresses(event.ingressSequence, globalFence) ||
                 FenceSuppresses(event.ingressSequence, channelFence)) {
+                ++self->fenceSuppressedNoteOns_;
                 break;
             }
             self->HandleNoteOn(event.channel, event.data1, event.data2);
@@ -6063,6 +6192,10 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
                 if (FenceSuppresses(event.ingressSequence, globalFence) ||
                     FenceSuppresses(event.ingressSequence, channelFence) ||
                     event.channel >= kChannelCount || event.data1 >= kNoteCount) {
+                    if (FenceSuppresses(event.ingressSequence, globalFence) ||
+                        FenceSuppresses(event.ingressSequence, channelFence)) {
+                        ++self->fenceSuppressedNoteOns_;
+                    }
                     continue;
                 }
                 ++deferredNoteOns;

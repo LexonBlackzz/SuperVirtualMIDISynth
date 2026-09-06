@@ -302,21 +302,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMER:
             if (wp == kTimerId) {
+                // Window repaint only: the periodic DebugView census lives in
+                // the driver's 64-block cadence (pool/sched/flow lines), which
+                // is pinned to actual audio callbacks instead of a timer, and
+                // no longer floods DebugView between census samples.
                 if (g_showWindow) InvalidateRect(hwnd, nullptr, FALSE);
-                if (g_debugOutput) {
-                    const DiagStats stats = ReadPublishedStats();
-                    char text[192];
-                    std::snprintf(text, sizeof(text),
-                        "[SVMS] voices=%u/%u retire=%u immediate=%u step=%u cpu=%.1f%% p99=%.0f%% over=%llu coalesced=%llu(1/%u)\n",
-                        stats.activeVoices, stats.maxVoices, stats.retired,
-                        stats.retiredImmediate, stats.decimationStep,
-                        static_cast<double>(stats.cpuPercent),
-                        static_cast<double>(stats.callbackP99),
-                        static_cast<unsigned long long>(stats.overBudgetCallbacks),
-                        static_cast<unsigned long long>(stats.coalescedNoteOns),
-                        stats.noteOnCollapseThreshold);
-                    OutputDebugStringA(text);
-                }
             }
             return 0;
         case WM_PAINT:
