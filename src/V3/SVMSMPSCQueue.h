@@ -12,6 +12,19 @@
 
 namespace svms {
 
+// Consumer-side ring prefetch: on deep queues the next cells are cold, and
+// the single consumer knows exactly where the next pops will land. Depth 4
+// cells (96 B) reliably reaches the next cache line beyond the current one.
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>
+#define SVMS_MPSCQ_PREFETCH(addr) _mm_prefetch( \
+    reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#elif defined(__GNUC__)
+#define SVMS_MPSCQ_PREFETCH(addr) __builtin_prefetch(addr, 0, 3)
+#else
+#define SVMS_MPSCQ_PREFETCH(addr) ((void)0)
+#endif
+
 template <typename T, uint32_t Capacity>
 class MPSCQueue {
     static_assert(Capacity >= 2 && (Capacity & (Capacity - 1)) == 0,
@@ -127,8 +140,9 @@ private:
 
 // Runtime-sized bounded MPSC queue. Capacity is selected while the engine is
 // stopped; producers and the single consumer then use the same sequence-cell
-// algorithm as the fixed-size test queue. Modulo indexing permits the exact
-// configured lane proportions instead of rounding each lane up independently.
+// algorithm as the fixed-size test queue. The requested capacity is rounded
+// up to a power of two so indexing is a mask, never a 64-bit integer division
+// on the producer or compiler hot path.
 template <typename T>
 class DynamicMPSCQueue {
     static_assert(std::is_trivially_copyable_v<T>);
@@ -151,13 +165,16 @@ public:
                 (std::numeric_limits<size_t>::max)() / sizeof(Cell)) {
             return false;
         }
+        uint32_t rounded = 2u;
+        while (rounded < capacity) rounded <<= 1u;
         Cell* replacement = static_cast<Cell*>(::operator new[](
-            sizeof(Cell) * static_cast<size_t>(capacity),
+            sizeof(Cell) * static_cast<size_t>(rounded),
             std::align_val_t{64}, std::nothrow));
         if (!replacement) return false;
         Release();
         cells_ = replacement;
-        capacity_ = capacity;
+        capacity_ = rounded;
+        capacityMask_ = rounded - 1u;
         for (uint64_t i = 0u; i < capacity_; ++i)
             new (&cells_[i]) Cell{std::atomic<uint64_t>(i), T{}};
         enqueue_.store(0u, std::memory_order_relaxed);
@@ -169,7 +186,7 @@ public:
         if (!cells_) return false;
         uint64_t position = enqueue_.load(std::memory_order_relaxed);
         for (;;) {
-            Cell& cell = cells_[static_cast<size_t>(position % capacity_)];
+            Cell& cell = cells_[static_cast<size_t>(position & capacityMask_)];
             const uint64_t sequence =
                 cell.sequence.load(std::memory_order_acquire);
             const intptr_t difference =
@@ -200,7 +217,7 @@ public:
             bool retry = false;
             for (uint32_t i = 0u; i < count; ++i) {
                 Cell& cell = cells_[static_cast<size_t>(
-                    (position + i) % capacity_)];
+                    (position + i) & capacityMask_)];
                 const uint64_t sequence =
                     cell.sequence.load(std::memory_order_acquire);
                 const intptr_t difference = static_cast<intptr_t>(
@@ -221,7 +238,7 @@ public:
             }
             for (uint32_t i = 0u; i < count; ++i) {
                 Cell& cell = cells_[static_cast<size_t>(
-                    (position + i) % capacity_)];
+                    (position + i) & capacityMask_)];
                 cell.value = values[i];
                 cell.sequence.store(position + i + 1u,
                                     std::memory_order_release);
@@ -233,12 +250,14 @@ public:
     bool TryPop(T& value) noexcept {
         if (!cells_) return false;
         const uint64_t position = dequeue_.load(std::memory_order_relaxed);
-        Cell& cell = cells_[static_cast<size_t>(position % capacity_)];
+        Cell& cell = cells_[static_cast<size_t>(position & capacityMask_)];
         const uint64_t sequence =
             cell.sequence.load(std::memory_order_acquire);
         if (static_cast<intptr_t>(sequence - (position + 1u)) != 0)
             return false;
         value = cell.value;
+        SVMS_MPSCQ_PREFETCH(
+            &cells_[static_cast<size_t>((position + 4u) & capacityMask_)]);
         cell.sequence.store(position + capacity_, std::memory_order_release);
         dequeue_.store(position + 1u, std::memory_order_relaxed);
         return true;
@@ -265,6 +284,7 @@ private:
 
     Cell* cells_ = nullptr;
     uint32_t capacity_ = 0u;
+    uint32_t capacityMask_ = 0u;
     alignas(64) std::atomic<uint64_t> enqueue_{0u};
     alignas(64) std::atomic<uint64_t> dequeue_{0u};
 };
@@ -299,12 +319,15 @@ public:
             !quiet_.ConfigureCapacity(quiet)) {
             return false;
         }
-        laneCapacities_[0] = state;
-        laneCapacities_[1] = loud;
-        laneCapacities_[2] = upperMedium;
-        laneCapacities_[3] = medium;
-        laneCapacities_[4] = quiet;
-        totalCapacity_ = totalCapacity;
+        // Each lane rounds up to a power of two, so report the real
+        // post-rounding capacities rather than the requested proportions.
+        laneCapacities_[0] = state_.CapacityValue();
+        laneCapacities_[1] = loud_.CapacityValue();
+        laneCapacities_[2] = upperMedium_.CapacityValue();
+        laneCapacities_[3] = medium_.CapacityValue();
+        laneCapacities_[4] = quiet_.CapacityValue();
+        totalCapacity_ = laneCapacities_[0] + laneCapacities_[1] +
+            laneCapacities_[2] + laneCapacities_[3] + laneCapacities_[4];
         return true;
     }
 
