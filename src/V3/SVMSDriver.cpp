@@ -5599,10 +5599,20 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     if (self->useEventCompiler_) {
         for (;;) {
             const ScheduledRenderEvent* run = nullptr;
-            const uint32_t runCount = self->pagedScheduler_.PeekRunBefore(
-                self->virtualRenderSample_ + numFrames,
-                eventBudget - examinedCount, run);
-            if (runCount == 0u) break;
+            uint32_t runCount = 0u;
+            // Direct-dispatch fast path: when the merge root exclusively
+            // owns everything due before this block's end, read the events
+            // straight from the immutable payload — no tree walk and no
+            // cross-page comparisons. The merge loop below remains the
+            // exact fallback whenever another page interleaves.
+            if (!self->pagedScheduler_.ExclusiveRunBefore(
+                    self->virtualRenderSample_ + numFrames,
+                    eventBudget - examinedCount, run, runCount)) {
+                runCount = self->pagedScheduler_.PeekRunBefore(
+                    self->virtualRenderSample_ + numFrames,
+                    eventBudget - examinedCount, run);
+                if (runCount == 0u) break;
+            }
             for (uint32_t i = 0u; i < runCount; ++i)
                 admitScheduled(run[i]);
             self->pagedScheduler_.ConsumeRun(runCount);

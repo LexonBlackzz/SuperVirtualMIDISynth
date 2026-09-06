@@ -13,6 +13,10 @@
 #include <new>
 #include <vector>
 
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
+
 namespace svms {
 
 static constexpr uint32_t kCompiledEventPageCapacity = 8192u;
@@ -376,6 +380,10 @@ public:
         highWater_ = (std::max)(highWater_, size_);
         ++activePages_;
         UpdateLeaf(slot);
+        // The payload was written by the compiler moments ago and is still
+        // likely L3-resident; pull its head lines in while the tree update
+        // retires so the first dispatch scan does not stall.
+        PrefetchPageHead(pageIndex);
         return true;
     }
 
@@ -390,6 +398,45 @@ public:
         if (PeekRunBefore(endFrame, 1u, run) == 0u) return false;
         out = *run;
         ConsumeRun(1u);
+        return true;
+    }
+
+    // Direct-dispatch fast path for the common case: the tree root strictly
+    // owns every event before endFrame because every OTHER active page head
+    // already sits at or past endFrame. The whole block's events are then a
+    // contiguous slice of one immutable payload — no merge-tree traffic and
+    // no cross-page comparisons. Returns false (touching nothing) when
+    // another page interleaves into the block or no event is due; the caller
+    // then falls back to PeekRunBefore/ConsumeRun, which remain the exact
+    // semantic contract. Dispatch the returned slice, then ConsumeRun once.
+    bool ExclusiveRunBefore(int64_t endFrame, uint32_t maximumCount,
+                            const ScheduledRenderEvent*& events,
+                            uint32_t& runCount) noexcept {
+        events = nullptr;
+        runCount = 0u;
+        if (tree_.empty() || maximumCount == 0u) return false;
+        const uint32_t slot = tree_[1u];
+        if (slot == kInvalidEventPage) return false;
+        const PageCursor& cursor = cursors_[slot];
+        const CompiledEventPage& page = pool_->Page(cursor.pageIndex);
+        if (page.events[cursor.offset].targetFrame >= endFrame) return false;
+        for (uint32_t s = 0u; s < cursors_.size(); ++s) {
+            if (s == slot || !cursors_[s].active) continue;
+            const PageCursor& other = cursors_[s];
+            // Short-circuit on the first interleaving page head.
+            if (pool_->Page(other.pageIndex).events[other.offset]
+                    .targetFrame < endFrame) {
+                return false;
+            }
+        }
+        const uint32_t available = cursor.count - cursor.offset;
+        const uint32_t limit = (std::min)(available, maximumCount);
+        uint32_t count = 0u;
+        const ScheduledRenderEvent* begin = page.events + cursor.offset;
+        while (count < limit && begin[count].targetFrame < endFrame) ++count;
+        if (count == 0u) return false;
+        events = begin;
+        runCount = count;
         return true;
     }
 
@@ -487,6 +534,18 @@ private:
         uint32_t count = 0u;
         bool active = false;
     };
+
+#if defined(__SSE2__) || defined(_M_X64)
+    void PrefetchPageHead(uint32_t pageIndex) noexcept {
+        const CompiledEventPage& page = pool_->Page(pageIndex);
+        _mm_prefetch(reinterpret_cast<const char*>(&page.events[0]),
+                     _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(&page.events[0]) + 64,
+                     _MM_HINT_T0);
+    }
+#else
+    void PrefetchPageHead(uint32_t) noexcept {}
+#endif
 
     uint32_t BetterSlot(uint32_t a, uint32_t b) const noexcept {
         if (a == kInvalidEventPage) return b;
