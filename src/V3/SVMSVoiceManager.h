@@ -155,6 +155,13 @@ struct LaunchChurnStats {
 class VoiceManager {
 public:
     void SetStealPolicy(uint32_t policy);
+    void SetPerKeyVoiceCap(uint32_t cap) { perKeyVoiceCap_ = cap; }
+    // Live still-playing voice count for one (channel,note) — test and
+    // telemetry readout backing the per-key voice cap.
+    uint32_t GetChannelKeyVoiceCount(uint8_t channel, uint8_t note) const {
+        return channel < kChannelCount && note < kNoteCount
+            ? channelKeyVoiceCount_[channel][note] : 0u;
+    }
     using PreTailCaptureHook = void(*)(VoiceHandle handle, void* userData);
     using VoiceConfiguredHook = void(*)(VoiceHandle handle, void* userData);
     VoiceManager();
@@ -182,7 +189,8 @@ public:
                                      bool deferCandidate = false,
                                      bool reserveCandidateInPlace = true,
                                      VoiceHandle preselectedVictim = kInvalidVoice,
-                                     uint32_t preselectedVictimPosition = 0u);
+                                     uint32_t preselectedVictimPosition = 0u,
+                                     VoiceHandle forcedVictim = kInvalidVoice);
     // Complete a deferred note-on setup with one exact steal-index update.
     // This avoids repeatedly removing/reinserting the same newborn while its
     // sample, envelope and gains are filled in sequentially.
@@ -728,6 +736,7 @@ private:
     // index is unmaintained under FastCursor and fully rebuilt from live
     // pool state on a switch back to Quality.
     uint32_t stealPolicy_ = 0u;  // 0 quality, 1 cursor, 2 scan
+    uint32_t perKeyVoiceCap_ = 0u;  // 0 = off; else max playing voices per (channel,key)
     uint32_t stealScanCursor_ = 0u;  // rotating scan window (policy 2)
     uint32_t stealCursor_ = 0u;
     uint8_t* stealCandidateDeferred_;
@@ -804,6 +813,11 @@ private:
     // identify the oldest outstanding generation in O(1), then touch only
     // that generation's adjacent SF2 layers.
     int32_t channelKeyVoiceOldest_[kChannelCount][kNoteCount];
+    // Live chain length per (channel,note) — only still-playing voices are
+    // linked (StartRelease unlinks), so this is the per-key polyphony the
+    // optional per-key voice cap is measured against. Maintained by
+    // Link/UnlinkChannelKey; O(1) reads keep the cap off the launch hot path.
+    uint32_t channelKeyVoiceCount_[kChannelCount][kNoteCount];
     // Physical SF2 regions created by one MIDI note-on form one atomic steal
     // group. Dedicated links remain valid after note-off unlinks channel/key
     // tracking, so a releasing stereo pair cannot be split either.
@@ -862,7 +876,8 @@ private:
     // the post-launch index matches the per-layer path byte for byte).
     void InsertPreselectedVictim(VoiceHandle victim);
     void RearmLiveBatchVictims(const VoiceHandle* victims, uint32_t popped,
-                               const bool* consumed);
+                               const bool* consumed,
+                               VoiceHandle consumedByForcedSteal = kInvalidVoice);
     // Releasing-ring fast path: consumes (or peeks, with consume=false) the
     // oldest plausible Releasing entry, validating it against live pool
     // state; returns kInvalidVoice when the ring runs dry or every remaining
@@ -999,8 +1014,10 @@ inline VoiceManager::VoiceManager()
     lastLinkedPlayIndex_ = UINT32_MAX;
     lastLinkedPlayVoice_ = kInvalidVoice;
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
-        for (uint32_t n = 0; n < kNoteCount; ++n)
+        for (uint32_t n = 0; n < kNoteCount; ++n) {
             channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
+            channelKeyVoiceCount_[ch][n] = 0u;
+        }
     std::memset(channelMixScaleL_, 0, sizeof(channelMixScaleL_));
     std::memset(channelMixScaleR_, 0, sizeof(channelMixScaleR_));
     channelMixStealMask_ = 0u;
@@ -1266,6 +1283,8 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
                 sizeof(channelKeyVoiceHead_));
     std::memcpy(channelKeyVoiceOldest_, other.channelKeyVoiceOldest_,
                 sizeof(channelKeyVoiceOldest_));
+    std::memcpy(channelKeyVoiceCount_, other.channelKeyVoiceCount_,
+                sizeof(channelKeyVoiceCount_));
     std::memcpy(channelMixScaleL_, other.channelMixScaleL_,
                 sizeof(channelMixScaleL_));
     std::memcpy(channelMixScaleR_, other.channelMixScaleR_,
@@ -1385,8 +1404,10 @@ inline void VoiceManager::Reset() {
         freeStack_[i] = static_cast<int32_t>(i);
     }
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
-        for (uint32_t n = 0; n < kNoteCount; ++n)
+        for (uint32_t n = 0; n < kNoteCount; ++n) {
             channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
+            channelKeyVoiceCount_[ch][n] = 0u;
+        }
 }
 
 inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
@@ -2259,6 +2280,7 @@ inline void VoiceManager::LinkChannelKey(VoiceHandle handle) {
     else
         channelKeyVoiceOldest_[ch][nt] = static_cast<int32_t>(handle);
     channelKeyVoiceHead_[ch][nt] = static_cast<int32_t>(handle);
+    ++channelKeyVoiceCount_[ch][nt];
 }
 
 inline void VoiceManager::UnlinkChannelKey(VoiceHandle handle) {
@@ -2267,12 +2289,15 @@ inline void VoiceManager::UnlinkChannelKey(VoiceHandle handle) {
     const uint8_t nt = v.note[handle];
     const int32_t previous = v.prevChannelKeyVoice[handle];
     const int32_t next = v.nextChannelKeyVoice[handle];
-    if (previous >= 0)
+    if (previous >= 0) {
         v.nextChannelKeyVoice[static_cast<uint32_t>(previous)] = next;
-    else if (channelKeyVoiceHead_[ch][nt] == static_cast<int32_t>(handle))
+        --channelKeyVoiceCount_[ch][nt];
+    } else if (channelKeyVoiceHead_[ch][nt] == static_cast<int32_t>(handle)) {
         channelKeyVoiceHead_[ch][nt] = next;
-    else
-        return;
+        --channelKeyVoiceCount_[ch][nt];
+    } else {
+        return;  // not linked — nothing to count
+    }
     if (next >= 0)
         v.prevChannelKeyVoice[static_cast<uint32_t>(next)] = previous;
     else if (channelKeyVoiceOldest_[ch][nt] == static_cast<int32_t>(handle))
@@ -3314,13 +3339,18 @@ inline void VoiceManager::InsertPreselectedVictim(VoiceHandle victim) {
 // never consumed (fed to a layer) and is still live. Victims retired as
 // play-group siblings of an earlier layer's victim are Free and are skipped;
 // consumed victims were replaced in place and are skipped via `consumed`.
+// `consumedByForcedSteal` marks the keyed-cap victim the caller consumed
+// through a forced steal — the handle is live again but holds the launch's
+// own replacement, so it must never be re-armed as a stealable.
 inline void VoiceManager::RearmLiveBatchVictims(const VoiceHandle* victims,
                                                 uint32_t popped,
-                                                const bool* consumed) {
+                                                const bool* consumed,
+                                                VoiceHandle consumedByForcedSteal) {
     if (!victims || !consumed) return;
     for (uint32_t i = 0u; i < popped; ++i) {
         const VoiceHandle victim = victims[i];
         if (victim == kInvalidVoice || consumed[i] ||
+            victim == consumedByForcedSteal ||
             victim >= maxVoices_ ||
             v.state[victim] != static_cast<uint8_t>(VoiceState::Active))
             continue;
@@ -3838,7 +3868,8 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
                                                         bool deferCandidate,
                                                         bool reserveCandidateInPlace,
                                                         VoiceHandle preselectedVictim,
-                                                        uint32_t preselectedVictimPosition) {
+                                                        uint32_t preselectedVictimPosition,
+                                                        VoiceHandle forcedVictim) {
     // While a lowered cap is still draining its forced-release tails, do not
     // admit replacement notes that would turn those tails back into primaries.
     // The transition is bounded by the forced release (normally 50 ms).
@@ -3855,20 +3886,26 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t freeLifecycleBegin = BeginLaunchStageForTest();
 #endif
-    if (deferCandidate && freeTop_ != 0u && activeCount_ < voiceLimit_) {
-        const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
-        vh = static_cast<VoiceHandle>(idx);
-        PrefetchVoiceLines(vh);
-        InitializePreparedVoice(vh, channel, note, velocity);
-        SeedVoiceRotationForVoice(vh);
-        LinkChannelKey(vh);
-        LinkChannelActive(vh);
-        activeList_[activeCount_] = idx;
-        activePosition_[idx] = activeCount_++;
-        // A deferred voice is invisible to the steal index until its
-        // configuration transaction commits. Keep the existing heap valid.
-    } else {
-        vh = AllocateVoice(channel, note, velocity);
+    // A forced victim (per-key voice cap) must take the steal path: the key
+    // is already at its cap, so a fresh slot would grow the pileup instead of
+    // replacing the oldest key member. Skip both free-slot admission and the
+    // AllocateVoice fallback while one is pending.
+    if (forcedVictim == kInvalidVoice) {
+        if (deferCandidate && freeTop_ != 0u && activeCount_ < voiceLimit_) {
+            const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
+            vh = static_cast<VoiceHandle>(idx);
+            PrefetchVoiceLines(vh);
+            InitializePreparedVoice(vh, channel, note, velocity);
+            SeedVoiceRotationForVoice(vh);
+            LinkChannelKey(vh);
+            LinkChannelActive(vh);
+            activeList_[activeCount_] = idx;
+            activePosition_[idx] = activeCount_++;
+            // A deferred voice is invisible to the steal index until its
+            // configuration transaction commits. Keep the existing heap valid.
+        } else {
+            vh = AllocateVoice(channel, note, velocity);
+        }
     }
     if (vh != kInvalidVoice) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
@@ -3895,7 +3932,13 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     // only the redundant re-selection call is skipped here; the victim is
     // identical and the post-selection logic below is untouched.
     VoiceHandle bestHandle = kInvalidVoice;
-    if (FastSteal()) {
+    if (forcedVictim != kInvalidVoice) {
+        // Per-key cap victim chosen by the caller (oldest chain member of a
+        // key already at its cap). Unlike a popped candidate it is still in
+        // the steal index, so it is dropped from the index below; ring
+        // entries are self-invalidating hints and need no repair.
+        bestHandle = forcedVictim;
+    } else if (FastSteal()) {
         // FastCursor: consume the batch-provided victim when valid,
         // otherwise take the next slot at the allocation cursor. No index
         // search, no repair — downstream runs identically.
@@ -3924,6 +3967,13 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     // (the batch path's positions are cursor positions either way).
     bestPos = activePosition_[bestHandle];
     const uint32_t bestIdx = bestHandle;
+    if (forcedVictim != kInvalidVoice) {
+        // The forced victim was never popped: remove it from the index here.
+        // A reserved-root flag travels with it — the slot is being consumed
+        // by this replacement, not handed to a pending layer.
+        stealCandidateReserved_[bestIdx] = 0u;
+        RemoveStealCandidate(bestHandle);
+    }
 
     // Every SF2 region produced by one MIDI note-on shares playIndex. Stereo
     // SoundFonts commonly use one left and one right region; stealing just one
@@ -4334,6 +4384,13 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const VoiceConfiguration& setup, uint32_t playIndex,
     const ChannelParamsSnapshot& cp, VoiceHandle& outHandle) {
     if (freeTop_ != 0u || !IsStableConfiguration(setup)) return false;
+    // Per-key voice cap: when this key is at its cap the launch must replace
+    // the key's oldest member, not the globally best victim. Bail to the
+    // general path, which resolves the key-local victim once per transaction
+    // (kept out of this O(1) fast path's bookkeeping).
+    if (perKeyVoiceCap_ != 0u &&
+        channelKeyVoiceCount_[channel][note] >= perKeyVoiceCap_)
+        return false;
 
     uint32_t selectedPosition = 0u;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
@@ -4500,6 +4557,11 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     const VoiceConfiguration* setups, uint32_t count,
     VoiceHandle* outHandles, bool& candidatesReservedInPlace) {
     candidatesReservedInPlace = false;
+    // Per-key voice cap: a capped key must replace its own oldest member,
+    // not re-voice a globally selected group that may belong to another key.
+    if (perKeyVoiceCap_ != 0u &&
+        channelKeyVoiceCount_[channel][note] >= perKeyVoiceCap_)
+        return false;
     if (freeTop_ != 0u || count == 0u || count > maxVoices_ || !setups ||
         !outHandles)
         return false;
@@ -4760,6 +4822,23 @@ inline bool VoiceManager::LaunchVoiceGroup(
         // prefetched victims, which changes WHICH voice is stolen (confirmed
         // empirically during bring-up). Any future run-level scheme must
         // solve that insertion race first.
+        // Per-key voice cap (syndrv-style, opt-in; 0 = off): when this key
+        // already plays at its cap, the whole note-on replaces the oldest
+        // key member instead of growing the pileup. Resolved once per
+        // transaction so the layers of one physical note cannot steal each
+        // other: layer 0 is forced onto the oldest key voice — its sibling
+        // retirement frees slots that feed the remaining layers — while
+        // layers 1..N-1 run the normal free-slot/steal logic. The key chain
+        // holds only still-playing voices (StartRelease unlinks), so
+        // release tails never count against the cap.
+        VoiceHandle keyedVictim = kInvalidVoice;
+        if (perKeyVoiceCap_ != 0u &&
+            channelKeyVoiceCount_[channel][note] >= perKeyVoiceCap_) {
+            const int32_t oldest = channelKeyVoiceOldest_[channel][note];
+            if (oldest >= 0 &&
+                v.state[oldest] == static_cast<uint8_t>(VoiceState::Active))
+                keyedVictim = static_cast<VoiceHandle>(oldest);
+        }
         VoiceHandle batchVictims[kStealBatchMaxLayers];
         uint32_t batchPositions[kStealBatchMaxLayers];
         bool consumed[kStealBatchMaxLayers] = {};
@@ -4782,16 +4861,21 @@ inline bool VoiceManager::LaunchVoiceGroup(
             // only hand a prefetched victim to a layer that is guaranteed to
             // take the steal path (the free-slot branch cannot fire), and
             // skip victims already retired as siblings of an earlier layer's
-            // victim (state Free).
+            // victim (state Free). The keyed-cap victim is skipped in every
+            // pass — layer 0 consumes it through the forced steal, and it
+            // must never be fed to a later layer as a fresh victim (by then
+            // the handle holds this launch's own newborn).
             while (cursor < popped &&
-                   v.state[batchVictims[cursor]] !=
-                       static_cast<uint8_t>(VoiceState::Active))
+                   (v.state[batchVictims[cursor]] !=
+                        static_cast<uint8_t>(VoiceState::Active) ||
+                    batchVictims[cursor] == keyedVictim))
                 ++cursor;
             VoiceHandle fed = kInvalidVoice;
             uint32_t fedPosition = 0u;
             uint32_t fedCursor = UINT32_MAX;
             if (freeTop_ == 0u && activeCount_ >= voiceLimit_ &&
-                cursor < popped) {
+                cursor < popped &&
+                !(allocated == 0u && keyedVictim != kInvalidVoice)) {
                 fed = batchVictims[cursor];
                 fedPosition = batchPositions[cursor];
                 fedCursor = cursor;
@@ -4799,7 +4883,8 @@ inline bool VoiceManager::LaunchVoiceGroup(
             }
             outHandles[allocated] = AllocateVoiceOrSteal(
                 channel, note, velocity, nullptr, true, false, fed,
-                fedPosition);
+                fedPosition,
+                allocated == 0u ? keyedVictim : kInvalidVoice);
             if (outHandles[allocated] == kInvalidVoice) {
                 // Restore the unconsumed, still-live prefetched victims so
                 // the candidate index matches the per-layer path exactly,
@@ -4816,8 +4901,9 @@ inline bool VoiceManager::LaunchVoiceGroup(
         }
         // The launch consumed its fed victims; every other popped victim
         // must rejoin the candidate index (the per-layer path would never
-        // have popped it).
-        RearmLiveBatchVictims(batchVictims, popped, consumed);
+        // have popped it). The keyed-cap victim was consumed by the forced
+        // steal — its handle now holds the replacement, not a stealable.
+        RearmLiveBatchVictims(batchVictims, popped, consumed, keyedVictim);
     }
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t configureBegin = BeginLaunchStageForTest();

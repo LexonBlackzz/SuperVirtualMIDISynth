@@ -4914,6 +4914,129 @@ void TestWholeVoiceCCDifferential() {
 
 } // namespace
 
+void TestPerKeyVoiceCap() {
+    svms::ChannelParamsSnapshot channel{};
+    channel.volume = channel.expression = 1.0f;
+    channel.panLeft = channel.panRight = 0.70710678f;
+    channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
+    svms::VoiceConfiguration mono{};
+    mono.sampleStart = 0u;
+    mono.sampleEnd = 128u;
+    mono.loopStart = 8u;
+    mono.loopEnd = 120u;
+    mono.loopMode = 1u;
+    mono.phaseStep = mono.basePhaseStep = 1.0f;
+    mono.initialGain = mono.sustainLevel = 1.0f;
+    mono.gainLeft = mono.gainRight = 0.1f;
+
+    {
+        // Cap disabled (default): the same key piles up without limit.
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(8u, 44100u);
+        svms::VoiceHandle handle = svms::kInvalidVoice;
+        for (uint32_t i = 0u; i < 4u; ++i)
+            Check(voices->LaunchVoiceGroup(0u, 60u, 100u, &mono, 1u,
+                                           channel, &handle),
+                  "uncapped launch admits the note");
+        Check(voices->GetChannelKeyVoiceCount(0u, 60u) == 4u,
+              "cap 0 (off) leaves per-key polyphony unbounded");
+    }
+
+    {
+        // Cap = 2: the third note-on replaces the oldest key member in
+        // place instead of growing the pileup, and it never touches other
+        // keys even when the whole pool is full.
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(4u, 44100u);
+        voices->SetPerKeyVoiceCap(2u);
+        svms::VoiceHandle key60[2]{};
+        Check(voices->LaunchVoiceGroup(0u, 60u, 100u, &mono, 1u,
+                                       channel, &key60[0]) &&
+                  voices->LaunchVoiceGroup(0u, 60u, 100u, &mono, 1u,
+                                           channel, &key60[1]),
+              "launches under the cap take free slots");
+        svms::VoiceHandle key64[2]{};
+        Check(voices->LaunchVoiceGroup(0u, 64u, 100u, &mono, 1u,
+                                       channel, &key64[0]) &&
+                  voices->LaunchVoiceGroup(0u, 64u, 100u, &mono, 1u,
+                                           channel, &key64[1]),
+              "the pool fills with the other key");
+        Check(voices->GetActiveCount() == 4u, "pool is full");
+        svms::VoiceHandle replacement = svms::kInvalidVoice;
+        Check(voices->LaunchVoiceGroup(0u, 60u, 100u, &mono, 1u,
+                                       channel, &replacement),
+              "a capped key still accepts note-ons");
+        Check(voices->GetActiveCount() == 4u,
+              "capped retrigger replaces in place instead of growing");
+        Check(replacement == key60[0],
+              "the oldest key member is the victim");
+        Check(voices->IsActive(key64[0]) && voices->IsActive(key64[1]),
+              "the keyed steal never touches other keys");
+        Check(voices->GetChannelKeyVoiceCount(0u, 60u) == 2u,
+              "the cap bounds the key chain");
+    }
+
+    {
+        // Stereo note-on at cap 1: layer 0 replaces the whole play group,
+        // layer 1 lands on the freed sibling slot — the launch never steals
+        // its own newborn, and repeated retriggers stay stable.
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(8u, 44100u);
+        voices->SetPerKeyVoiceCap(1u);
+        svms::VoiceConfiguration stereo[2] = {mono, mono};
+        // The short overload takes the group identity from setups[0];
+        // UINT32_MAX means "no play group". Give each note-on its own.
+        uint32_t groupPlayIndex = 200u;
+        stereo[0].playIndex = stereo[1].playIndex = groupPlayIndex;
+        svms::VoiceHandle group[2]{};
+        Check(voices->LaunchVoiceGroup(0u, 60u, 100u, stereo, 2u,
+                                       channel, group),
+              "stereo launch under the cap succeeds");
+        Check(voices->GetChannelKeyVoiceCount(0u, 60u) == 2u,
+              "a stereo pair links two chain members");
+        for (uint32_t retrigger = 0u; retrigger < 3u; ++retrigger) {
+            svms::VoiceHandle replacement[2]{};
+            ++groupPlayIndex;
+            stereo[0].playIndex = stereo[1].playIndex = groupPlayIndex;
+            Check(voices->LaunchVoiceGroup(0u, 60u, 100u, stereo, 2u,
+                                           channel, replacement),
+                  "capped stereo retrigger succeeds");
+            Check(replacement[0] != replacement[1] &&
+                      voices->GetActiveCount() == 2u &&
+                      voices->GetChannelKeyVoiceCount(0u, 60u) == 2u,
+                  "retrigger replaces the group without self-stealing");
+            Check(voices->GetPlayGroupSizeForTest(replacement[0]) == 2u &&
+                      voices->GetPlayGroupSizeForTest(replacement[1]) == 2u,
+                  "the replacement layers form one play group");
+        }
+    }
+
+    {
+        // Note-offs unlink the key chain, so released keys admit fresh
+        // notes without consuming the cap.
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(8u, 44100u);
+        voices->SetPerKeyVoiceCap(2u);
+        svms::VoiceHandle first = svms::kInvalidVoice;
+        svms::VoiceHandle second = svms::kInvalidVoice;
+        Check(voices->LaunchVoiceGroup(0u, 60u, 100u, &mono, 1u,
+                                       channel, &first) &&
+                  voices->LaunchVoiceGroup(0u, 60u, 100u, &mono, 1u,
+                                           channel, &second),
+              "two key launches fill the cap");
+        voices->StartRelease(first);
+        voices->StartRelease(second);
+        Check(voices->GetChannelKeyVoiceCount(0u, 60u) == 0u,
+              "releasing the key unlinks its chain members");
+        svms::VoiceHandle relaunched = svms::kInvalidVoice;
+        Check(voices->LaunchVoiceGroup(0u, 60u, 100u, &mono, 1u,
+                                       channel, &relaunched),
+              "a released key admits fresh notes");
+        Check(voices->GetChannelKeyVoiceCount(0u, 60u) == 1u,
+              "fresh notes count against the cap again");
+    }
+}
+
 int main() {
     _CrtSetDbgFlag(_CrtSetDbgFlag(_CRTDBG_REPORT_FLAG) | _CRTDBG_CHECK_ALWAYS_DF);
 #if defined(_DEBUG)
@@ -4926,6 +5049,7 @@ int main() {
     TestWholeVoiceLaunchDifferential();
     TestWholeVoiceCCDifferential();
     TestDenseProductionGateParity();
+    TestPerKeyVoiceCap();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);

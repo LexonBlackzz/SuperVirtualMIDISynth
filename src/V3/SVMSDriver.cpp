@@ -2844,6 +2844,28 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetPerKeyVoiceCap: {
+        // param = max still-playing voices per (channel,note); 0 disables.
+        // At the cap a note-on replaces the oldest key member (syndrv-style
+        // per-key slots) instead of growing the pileup.
+        if (cmd.param > 256u || !voiceManager) {
+            strncpy_s(resultText, kText,
+                      "per-key voice cap must be 0 (off) or 1..256",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        voiceManager->SetPerKeyVoiceCap(cmd.param);
+        engineConfig_.perKeyVoiceCap = cmd.param;
+        if (cmd.param != 0u) {
+            snprintf(resultText, kText,
+                     "per-key voice cap: %u voice%s per key",
+                     cmd.param, cmd.param != 1u ? "s" : "");
+        } else {
+            strncpy_s(resultText, kText, "per-key voice cap: off",
+                      _TRUNCATE);
+        }
+        return svms::RLResult::Ok;
+    }
 
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
@@ -3521,6 +3543,7 @@ bool Driver::Initialize() {
 
     voiceManager = new VoiceManager();
     voiceManager->SetStealPolicy(cfg.stealPolicy);
+    voiceManager->SetPerKeyVoiceCap(cfg.perKeyVoiceCap);
     if (!voiceManager->Initialize(cfg.maxVoices, sampleRate)) {
         LOG("FAILED: Could not allocate voice storage maxVoices=%u",
             cfg.maxVoices);

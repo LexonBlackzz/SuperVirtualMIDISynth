@@ -270,7 +270,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         }},
         {"voices", {
             {"retire_threshold", cfg.voiceRetireThreshold},
-            {"steal_policy", cfg.stealPolicy}
+            {"steal_policy", cfg.stealPolicy},
+            {"per_key_voice_cap", cfg.perKeyVoiceCap}
         }},
 
         {"midi", {
@@ -637,6 +638,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "voices.retire_threshold");
         if (!ReadValue(*it, "steal_policy", cfg.stealPolicy, 0u, 2u))
             AppendWarning(cfg.configWarning, "voices.steal_policy");
+        if (!ReadValue(*it, "per_key_voice_cap", cfg.perKeyVoiceCap, 0u, 256u))
+            AppendWarning(cfg.configWarning, "voices.per_key_voice_cap");
     }
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
@@ -772,6 +775,7 @@ EngineConfig EngineConfig::Default() {
     cfg.maxEventsPerBlock = 65536;
     cfg.voiceRetireThreshold = kVoiceRetireThreshold;
     cfg.stealPolicy = 0;
+    cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)
     // XP has no WASAPI status tooling and audio failures otherwise look like
@@ -902,6 +906,7 @@ bool EngineConfig::Validate() const {
             shedStartPercent >= 1 && shedStartPercent < 100 &&
             voiceRetireThreshold > 0.0f && voiceRetireThreshold <= 0.05f &&
             stealPolicy <= 2u &&
+            perKeyVoiceCap <= 256u &&
             maxEventsPerBlock > 0;
 }
 

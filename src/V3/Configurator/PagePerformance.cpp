@@ -165,7 +165,27 @@ void DrawPerformancePage(ConfigDocument& doc) {
             }
         }
         LiveVoiceCell();
-        
+
+        ImGui::TableNextRow();
+        LabelCell("Per-key voice cap",
+                  "Opt-in. Limits how many still-playing voices one (channel,note) may hold; a note-on that hits the cap replaces the oldest voice of that key instead of piling up. 0 = off (default). Tames dense Black MIDI passages that hammer the same keys across channels. Release tails never count against the cap.");
+        ImGui::TableNextColumn();
+        int perKeyCap = static_cast<int>(w.perKeyVoiceCap);
+        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::SliderInt("##perkeycap", &perKeyCap, 0, 32,
+                             perKeyCap == 0 ? "Off" : "%d voices/key")) {
+            w.perKeyVoiceCap = static_cast<uint32_t>(perKeyCap);
+            doc.MarkDirty();
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit() && lc.connected && lc.client) {
+            char capResult[svms::kRuntimeLinkResultTextCapacity]{};
+            lc.client->SendCommand(
+                svms::RLCommandType::SetPerKeyVoiceCap, 0u,
+                w.perKeyVoiceCap, svms::RuntimeLiveStateV2{}, 100u,
+                capResult);
+        }
+        LiveVoiceCell();
+
         ImGui::TableNextRow();
         LabelCell("Voice presets");
         ImGui::TableNextColumn();
