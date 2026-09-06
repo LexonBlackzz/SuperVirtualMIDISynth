@@ -629,6 +629,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
             AppendWarning(cfg.configWarning, "note_on_collapse.threshold");
+    } else if (auto it2 = root.find("event_queue"); it2 != root.end() &&
+               it2->is_object()) {
+        // Back-compat: pre-2026-09 configurator builds wrote the threshold
+        // under event_queue with a flattened key, which nothing read.
+        (void)ReadValue(*it2, "note_on_collapse_threshold",
+                        cfg.noteOnCollapseThreshold, 0u, 65536u);
     }
 
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
@@ -747,7 +753,8 @@ EngineConfig EngineConfig::Default() {
     cfg.gpuDeviceIndex = 0;
     cfg.enableGPU = false;
     cfg.eventRingCapacity = kDefaultEventRingCapacity;
-    cfg.eventOverflowMode = EventOverflowMode::PriorityVelocity;
+    // Velocity shedding is opt-in: the default never culls note-ons.
+    cfg.eventOverflowMode = EventOverflowMode::LosslessBackpressure;
     cfg.highPriorityVelocity = 96;
     cfg.shedStartPercent = 70;
     cfg.maxEventsPerBlock = 65536;

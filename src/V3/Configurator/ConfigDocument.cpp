@@ -165,7 +165,8 @@ ConfigValues ConfigDocument::Defaults() {
     d.highPriorityVelocity = 96;
     d.shedStartPercent = 70;
     d.maxEventsPerBlock = 65536;
-    d.overflowMode = 0;
+    // Velocity shedding ("priority") is opt-in; the default never culls.
+    d.overflowMode = 1;
     d.correctnessMode = true;
     d.diagnosticsEnabled = false;
     d.diagnosticsWindow = false;
@@ -273,8 +274,16 @@ void ConfigDocument::FromJson(const json& root) {
         ReadNum(*it, "low_cut_hz", working_.reverbLowCutHz, 0.0f, 2000.0f);
         ReadNum(*it, "high_cut_hz", working_.reverbHighCutHz, 1000.0f, 20000.0f);
     }
-    if (auto it = root.find("event_queue"); it != root.end() && it->is_object()) {
-        ReadNum(*it, "note_on_collapse_threshold",
+    if (auto it = root.find("note_on_collapse"); it != root.end() &&
+        it->is_object()) {
+        // Canonical key (matches the engine's reader).
+        ReadNum(*it, "threshold", working_.noteOnCollapseThreshold, 1u, 65536u);
+    } else if (auto it2 = root.find("event_queue"); it2 != root.end() &&
+               it2->is_object()) {
+        // Back-compat: the pre-2026-09 configurator wrote the threshold
+        // under event_queue with a flattened key, which the engine never
+        // read — JSON edits silently did nothing.
+        ReadNum(*it2, "note_on_collapse_threshold",
                 working_.noteOnCollapseThreshold, 1u, 65536u);
     }
     if (auto it = root.find("phase_rotation"); it != root.end() && it->is_object()) {
@@ -365,8 +374,7 @@ nlohmann::json ConfigDocument::ToJson() const {
 
 
     root["phase_rotation"]["mode"] = working_.phaseRotationMode;
-    root["event_queue"]["note_on_collapse_threshold"] =
-        working_.noteOnCollapseThreshold;
+    root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
     root["midi"]["input_device"] = WideToUtf8(working_.midiInputDevice);
