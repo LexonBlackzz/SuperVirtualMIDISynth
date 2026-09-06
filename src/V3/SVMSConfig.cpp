@@ -635,7 +635,7 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "retire_threshold", cfg.voiceRetireThreshold,
                        1e-8f, 0.05f))
             AppendWarning(cfg.configWarning, "voices.retire_threshold");
-        if (!ReadValue(*it, "steal_policy", cfg.stealPolicy, 0u, 1u))
+        if (!ReadValue(*it, "steal_policy", cfg.stealPolicy, 0u, 2u))
             AppendWarning(cfg.configWarning, "voices.steal_policy");
     }
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
@@ -901,7 +901,7 @@ bool EngineConfig::Validate() const {
             highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
             shedStartPercent >= 1 && shedStartPercent < 100 &&
             voiceRetireThreshold > 0.0f && voiceRetireThreshold <= 0.05f &&
-            stealPolicy <= 1u &&
+            stealPolicy <= 2u &&
             maxEventsPerBlock > 0;
 }
 

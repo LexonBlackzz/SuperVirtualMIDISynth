@@ -2831,8 +2831,8 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         // param = 0 (quality: incremental priority tree) or 1 (fast
         // cursor: O(1) round-robin victim, no index structures). Live
         // switches rebuild or drop the index as appropriate.
-        if (cmd.param > 1u || !voiceManager) {
-            strncpy_s(resultText, kText, "steal policy must be 0 or 1",
+        if (cmd.param > 2u || !voiceManager) {
+            strncpy_s(resultText, kText, "steal policy must be 0, 1 or 2",
                       _TRUNCATE);
             return svms::RLResult::InvalidArgument;
         }

@@ -296,7 +296,7 @@ void ConfigDocument::FromJson(const json& root) {
                 1e-8f, 0.05f);
     }
     if (auto it = root.find("voices"); it != root.end() && it->is_object()) {
-        ReadNum(*it, "steal_policy", working_.stealPolicy, 0u, 1u);
+        ReadNum(*it, "steal_policy", working_.stealPolicy, 0u, 2u);
     }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.diagnosticsEnabled);

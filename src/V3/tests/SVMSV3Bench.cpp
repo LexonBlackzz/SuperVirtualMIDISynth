@@ -176,7 +176,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                 options.renderThreads < 1u || options.renderThreads > 64u)
                 return false;
         } else if (std::strcmp(argv[i], "--steal-policy") == 0) {
-            if (!nextNumber(options.stealPolicy) || options.stealPolicy > 1u)
+            if (!nextNumber(options.stealPolicy) || options.stealPolicy > 2u)
                 return false;
         } else if (std::strcmp(argv[i], "--soundfont") == 0) {
             if (i + 1 >= argc) return false;

@@ -727,7 +727,8 @@ private:
     // takeover, no index structures; victim quality is "oldest slot"). The
     // index is unmaintained under FastCursor and fully rebuilt from live
     // pool state on a switch back to Quality.
-    uint32_t stealPolicy_ = 0u;
+    uint32_t stealPolicy_ = 0u;  // 0 quality, 1 cursor, 2 scan
+    uint32_t stealScanCursor_ = 0u;  // rotating scan window (policy 2)
     uint32_t stealCursor_ = 0u;
     uint8_t* stealCandidateDeferred_;
     // A deferred same-frame replacement may keep ownership of the volatile
@@ -871,6 +872,8 @@ private:
     bool ReleasingRingEligible() const;
     bool FastSteal() const { return stealPolicy_ != 0u; }
     VoiceHandle SelectCursorVictim();
+    VoiceHandle SelectScanVictim();
+    bool ScanSteal() const { return stealPolicy_ == 2u; }
     void PushStealCandidate(VoiceHandle handle, uint32_t activePosition);
     void UpdateStealCandidate(VoiceHandle handle);
     void RemoveStealCandidate(VoiceHandle handle);
@@ -2973,12 +2976,92 @@ inline VoiceHandle VoiceManager::SelectCursorVictim() {
     return kInvalidVoice;
 }
 
+// ScanSteal victim: quietest effective level among the next
+// kStealScanWindow slots from a rotating cursor, masked to Active voices
+// outside an uncommitted launch transaction. The window is fully
+// prefetch-friendly (linear) and SIMD-reducible, so the whole search is a
+// handful of vector ops with no index structures anywhere. Falls back to a
+// full-pool scan when the window contains no eligible voice.
+inline VoiceHandle VoiceManager::SelectScanVictim() {
+    // Quietest effective level among the next kStealScanWindow Active
+    // slots from a rotating cursor. Linear, prefetch-friendly, SIMD
+    // reducible; falls back to a full-pool scan when the window holds no
+    // eligible voice. Assumes capacity is a power of two for the mask; the
+    // pool reserves capacities as powers of two.
+    const uint32_t capacity = maxVoices_;
+    constexpr uint32_t kStealScanWindow = 128u;
+    const uint32_t start = (capacity & (capacity - 1u)) == 0u
+        ? stealScanCursor_ & (capacity - 1u)
+        : stealScanCursor_ % capacity;
+    float bestLevel = 3.402823466e+38F;
+    uint32_t bestIdx = UINT32_MAX;
+    const __m256 signMask = _mm256_set1_ps(-0.0f);
+    for (uint32_t pass = 0u; pass < 2u && bestIdx == UINT32_MAX; ++pass) {
+        const uint32_t probes = pass == 0u
+            ? (capacity > kStealScanWindow ? kStealScanWindow : 0u)
+            : capacity;
+        uint32_t probe = 0u;
+        while (probe < probes) {
+            const uint32_t idx0 = start + probe;
+            if (idx0 + 8u <= capacity) {
+                // Vector path: 8 contiguous slots, entirely in range.
+                uint32_t valid = 0u;
+                for (uint32_t l = 0u; l < 8u; ++l) {
+                    const uint32_t idx = idx0 + l;
+                    valid |= (v.state[idx] == static_cast<uint8_t>(
+                                  VoiceState::Active) &&
+                              stealCandidateDeferred_[idx] == 0u &&
+                              stealCandidateReserved_[idx] == 0u)
+                        ? (1u << l) : 0u;
+                }
+                if (valid != 0u) {
+                    const __m256 level = _mm256_mul_ps(
+                        _mm256_andnot_ps(
+                            signMask, _mm256_loadu_ps(v.currentGain + idx0)),
+                        _mm256_loadu_ps(v.stealOutputGain + idx0));
+                    float lv[8];
+                    _mm256_storeu_ps(lv, level);
+                    for (uint32_t l = 0u; l < 8u; ++l) {
+                        if ((valid & (1u << l)) != 0u && lv[l] < bestLevel) {
+                            bestLevel = lv[l];
+                            bestIdx = idx0 + l;
+                        }
+                    }
+                }
+                probe += 8u;
+            } else {
+                // Tail (and the full-pool fallback path): scalar.
+                const uint32_t idx = idx0 < capacity ? idx0 : idx0 - capacity;
+                if (v.state[idx] == static_cast<uint8_t>(VoiceState::Active) &&
+                    stealCandidateDeferred_[idx] == 0u &&
+                    stealCandidateReserved_[idx] == 0u) {
+                    const float level = std::fabs(v.currentGain[idx]) *
+                        v.stealOutputGain[idx];
+                    if (level < bestLevel) {
+                        bestLevel = level;
+                        bestIdx = idx;
+                    }
+                }
+                ++probe;
+            }
+        }
+        if (bestIdx != UINT32_MAX) {
+            stealScanCursor_ = (capacity & (capacity - 1u)) == 0u
+                ? (bestIdx + kStealScanWindow) % capacity
+                : (bestIdx + kStealScanWindow) & (capacity - 1u);
+            return static_cast<VoiceHandle>(bestIdx);
+        }
+    }
+    return kInvalidVoice;
+}
+
 inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
                                                     bool reserveVolatileRoot) {
     if (FastSteal()) {
-        // (void)reserveVolatileRoot: FastCursor never reserves — the victim
-        // is consumed immediately by the launch transaction.
-        const VoiceHandle victim = SelectCursorVictim();
+        // (void)reserveVolatileRoot: index-free policies never reserve --
+        // the victim is consumed immediately by the launch transaction.
+        const VoiceHandle victim = ScanSteal() ? SelectScanVictim()
+                                               : SelectCursorVictim();
         if (victim == kInvalidVoice) return kInvalidVoice;
         PrefetchVoiceLines(victim);
         const uint32_t position = activePosition_[victim];
@@ -3820,7 +3903,8 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         if (bestHandle == kInvalidVoice ||
             v.state[bestHandle] !=
                 static_cast<uint8_t>(VoiceState::Active))
-            bestHandle = SelectCursorVictim();
+            bestHandle = ScanSteal() ? SelectScanVictim()
+                                     : SelectCursorVictim();
     } else {
         bestHandle = preselectedVictim != kInvalidVoice
             ? preselectedVictim
