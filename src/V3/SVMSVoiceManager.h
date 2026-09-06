@@ -813,6 +813,7 @@ private:
     void CopyFrom(const VoiceManager& other);
 
     void InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity);
+    void PrefetchVoiceLines(VoiceHandle handle);
     void InitializePreparedVoice(VoiceHandle handle, uint8_t channel,
                                  uint8_t note, uint8_t velocity);
     void ApplyVoiceConfigurationFields(
@@ -2092,6 +2093,58 @@ inline float VoiceManager::ComputeStealScore(uint32_t idx) const {
         static_cast<VoiceHandle>(idx))) * (1.0f / 256.0f);
     return ageUnits - ComputeEffectiveStealLevel(
         static_cast<VoiceHandle>(idx)) * kBassMidiStealGainScale;
+}
+
+// Pull the per-handle SoA lines a launch writes and the render kernels read
+// into cache while the caller still has transaction work (steal-tree repair,
+// sibling retirement, tail capture) to run. One line per array; the arrays
+// are capacity-scaled SoA, so each is a distinct cache line at any realistic
+// pool size.
+inline void VoiceManager::PrefetchVoiceLines(VoiceHandle handle) {
+#if defined(SVMS_VM_HAS_PREFETCH)
+    const char* base = reinterpret_cast<const char*>(&v.state[handle]);
+    // state/channel/note/velocity share neighborhood layout only per array;
+    // each SoA array is separately allocated, so prefetch each line.
+    _mm_prefetch(base, _MM_HINT_T0);
+#define SVMS_PREFETCH_FIELD(field) \
+    _mm_prefetch(reinterpret_cast<const char*>(&v.field[handle]), _MM_HINT_T0)
+    SVMS_PREFETCH_FIELD(phases);
+    SVMS_PREFETCH_FIELD(phaseIncs);
+    SVMS_PREFETCH_FIELD(currentGain);
+    SVMS_PREFETCH_FIELD(targetGain);
+    SVMS_PREFETCH_FIELD(sustainLevel);
+    SVMS_PREFETCH_FIELD(attackGainStep);
+    SVMS_PREFETCH_FIELD(releaseDecay);
+    SVMS_PREFETCH_FIELD(mixGainL);
+    SVMS_PREFETCH_FIELD(mixGainR);
+    SVMS_PREFETCH_FIELD(renderGainL);
+    SVMS_PREFETCH_FIELD(renderGainR);
+    SVMS_PREFETCH_FIELD(sampleStart);
+    SVMS_PREFETCH_FIELD(relEnd);
+    SVMS_PREFETCH_FIELD(relLoopS);
+    SVMS_PREFETCH_FIELD(relLoopE);
+    SVMS_PREFETCH_FIELD(holdSamplesRemaining);
+    SVMS_PREFETCH_FIELD(attackSamplesRemaining);
+    SVMS_PREFETCH_FIELD(decaySamplesRemaining);
+    SVMS_PREFETCH_FIELD(delaySamplesRemaining);
+    SVMS_PREFETCH_FIELD(releaseSamplesRemaining);
+    SVMS_PREFETCH_FIELD(decaySlope);
+    SVMS_PREFETCH_FIELD(envelopeStage);
+    SVMS_PREFETCH_FIELD(renderClass);
+    SVMS_PREFETCH_FIELD(playIndex);
+    SVMS_PREFETCH_FIELD(birthFrame);
+    SVMS_PREFETCH_FIELD(gainLeft);
+    SVMS_PREFETCH_FIELD(gainRight);
+    SVMS_PREFETCH_FIELD(stealOutputGain);
+    SVMS_PREFETCH_FIELD(loopEnabled);
+    SVMS_PREFETCH_FIELD(relLoopSF);
+    SVMS_PREFETCH_FIELD(relLoopEF);
+#undef SVMS_PREFETCH_FIELD
+    _mm_prefetch(reinterpret_cast<const char*>(&stealCandidateDeferred_[handle]),
+                 _MM_HINT_T0);
+#else
+    (void)handle;
+#endif
 }
 
 inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity) {
@@ -3656,6 +3709,7 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     if (deferCandidate && freeTop_ != 0u && activeCount_ < voiceLimit_) {
         const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
         vh = static_cast<VoiceHandle>(idx);
+        PrefetchVoiceLines(vh);
         InitializePreparedVoice(vh, channel, note, velocity);
         SeedVoiceRotationForVoice(vh);
         LinkChannelKey(vh);
@@ -3700,6 +3754,10 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
                           selectionBegin);
 #endif
     if (bestHandle == kInvalidVoice) return kInvalidVoice;
+    // The victim's SoA lines are cold; fetch them while the sibling-group
+    // retirement, tail capture, and index repair below still have work to
+    // run before the first field write.
+    PrefetchVoiceLines(bestHandle);
     const uint32_t bestIdx = bestHandle;
 
     // Every SF2 region produced by one MIDI note-on shares playIndex. Stereo

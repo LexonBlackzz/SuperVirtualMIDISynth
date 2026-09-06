@@ -6218,17 +6218,21 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
             if (self->voiceManager)
                 self->voiceManager->SetStealBatchingEnabled(
                     !self->correctnessMode_);
-            for (; index < runEnd; ++index) {
-                const RenderEvent& event = events[index];
-                const uint64_t channelFence = event.channel < kChannelCount
-                    ? self->channelTerminationFence_[event.channel].load(
+            // The fence cannot move inside a run: runs break on any
+            // non-NoteOn event, and only a dispatched CC120/CC123/reset can
+            // publish a fence — so one load covers the whole run.
+            const uint64_t runChannelFence =
+                runChannel < kChannelCount
+                    ? self->channelTerminationFence_[runChannel].load(
                         std::memory_order_acquire)
                     : 0u;
+            for (; index < runEnd; ++index) {
+                const RenderEvent& event = events[index];
                 if (FenceSuppresses(event.ingressSequence, globalFence) ||
-                    FenceSuppresses(event.ingressSequence, channelFence) ||
+                    FenceSuppresses(event.ingressSequence, runChannelFence) ||
                     event.channel >= kChannelCount || event.data1 >= kNoteCount) {
                     if (FenceSuppresses(event.ingressSequence, globalFence) ||
-                        FenceSuppresses(event.ingressSequence, channelFence)) {
+                        FenceSuppresses(event.ingressSequence, runChannelFence)) {
                         ++self->fenceSuppressedNoteOns_;
                     }
                     continue;
