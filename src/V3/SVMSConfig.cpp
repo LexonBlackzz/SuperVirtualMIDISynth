@@ -214,6 +214,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"soundfont_routes", std::move(soundFontRoutes)},
             {"max_voices", cfg.maxVoices},
             {"voice_memory_budget_mb", cfg.voiceMemoryBudgetMB},
+            {"large_pages", cfg.largePages},
             {"render_threads", cfg.renderThreads},
             {"thread_affinity_mode", cfg.threadAffinityMode},
             {"block_timing", cfg.blockTimingMode},
@@ -436,6 +437,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("synth"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "max_voices", cfg.maxVoices, 1u, kMaxPolyphony))
             AppendWarning(cfg.configWarning, "synth.max_voices");
+        if (auto lp = it->find("large_pages"); lp != it->end()) {
+            if (lp->is_boolean())
+                cfg.largePages = lp->get<bool>();
+            else
+                AppendWarning(cfg.configWarning, "synth.large_pages");
+        }
         if (!ReadValue(*it, "voice_memory_budget_mb",
                        cfg.voiceMemoryBudgetMB, 0u, 65536u))
             AppendWarning(cfg.configWarning, "synth.voice_memory_budget_mb");
@@ -801,6 +808,7 @@ EngineConfig EngineConfig::Default() {
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.blockTimingMode = false;  // opt-in: exact-frame dispatch by default
     cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default
+    cfg.largePages = false;       // opt-in: standard aligned allocation by default
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)
     // XP has no WASAPI status tooling and audio failures otherwise look like

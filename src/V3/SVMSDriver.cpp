@@ -3513,6 +3513,8 @@ bool Driver::Initialize() {
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
+    svms::g_largePagesEnabled.store(cfg.largePages,
+                                    std::memory_order_relaxed);
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -3648,6 +3650,8 @@ bool Driver::Initialize() {
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
+    svms::g_largePagesEnabled.store(cfg.largePages,
+                                    std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
     voiceManager->SetStealPolicy(cfg.stealPolicy);

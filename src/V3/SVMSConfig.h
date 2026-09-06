@@ -98,6 +98,10 @@ struct EngineConfig {
     bool blockTimingMode;
     // Optional whole-voice ghost budget per block; 0 = unbounded (default).
     uint32_t ghostBudget;
+    // Opt-in large-page backing for the biggest pools (voice SoA, dense
+    // shadow). Applied at engine init; silently falls back when the
+    // privilege is not held. Off by default.
+    bool largePages;
     EventOverflowMode eventOverflowMode;
     uint32_t highPriorityVelocity;
     uint32_t shedStartPercent;

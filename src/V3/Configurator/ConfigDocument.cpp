@@ -172,6 +172,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.ccCollapse = false;
     d.blockTiming = false;
     d.ghostBudget = 0u;
+    d.largePages = false;
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
     d.correctnessMode = true;
@@ -223,6 +224,10 @@ void ConfigDocument::FromJson(const json& root) {
         if (auto bt = it->find("block_timing"); bt != it->end()) {
             if (bt->is_boolean())
                 working_.blockTiming = bt->get<bool>();
+        }
+        if (auto lp = it->find("large_pages"); lp != it->end()) {
+            if (lp->is_boolean())
+                working_.largePages = lp->get<bool>();
         }
 
         if (auto routes = it->find("soundfont_routes");
@@ -407,6 +412,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
     root["synth"]["block_timing"] = working_.blockTiming;
+    root["synth"]["large_pages"] = working_.largePages;
     root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
@@ -606,6 +612,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
         && a.blockTiming == b.blockTiming
+        && a.largePages == b.largePages
         && a.maxEventsPerBlock == b.maxEventsPerBlock
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode

@@ -80,6 +80,8 @@ struct ConfigValues {
     bool blockTiming = false;
     // Optional whole-voice ghost budget per block; 0 = unbounded.
     uint32_t ghostBudget = 0u;
+    // Opt-in large-page backing for the biggest pools (needs restart).
+    bool largePages = false;
     int overflowMode = 0;
     bool correctnessMode = true;
 

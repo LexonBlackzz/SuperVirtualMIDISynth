@@ -2,6 +2,7 @@
 #define SVMS_TYPES_H
 
 #include "SVMSPlatform.h"
+#include "SVMSLargePages.h"
 #include <cassert>
 #include <cstdint>
 #include <cstddef>
@@ -547,7 +548,7 @@ struct alignas(64) VoiceSoA {
     VoiceSoA() noexcept { ResetFixedTails(); }
 
     ~VoiceSoA() {
-        _aligned_free(storage_);
+        FreeStorageBlock();
         _aligned_free(rot);
     }
 
@@ -608,7 +609,7 @@ struct alignas(64) VoiceSoA {
 
     VoiceSoA& operator=(VoiceSoA&& other) noexcept {
         if (this == &other) return *this;
-        _aligned_free(storage_);
+        FreeStorageBlock();
         MoveFrom(other);
         return *this;
     }
@@ -627,10 +628,13 @@ struct alignas(64) VoiceSoA {
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ACCUMULATE_FIELD_SIZE)
 #undef SVMS_ACCUMULATE_FIELD_SIZE
 
-        void* allocation = _aligned_malloc(bytes, kMixBufferAlign);
+        void* allocation = TryAllocateLargePages(bytes);
+        const bool largePages = allocation != nullptr;
+        if (!allocation) allocation = _aligned_malloc(bytes, kMixBufferAlign);
         if (!allocation) return false;
-        _aligned_free(storage_);
+        FreeStorageBlock();
         storage_ = allocation;
+        storageLargePages_ = largePages;
         storageBytes_ = bytes;
         capacity_ = capacity;
         denseOnly_ = false;
@@ -667,10 +671,13 @@ struct alignas(64) VoiceSoA {
         SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_ACCUMULATE_DENSE_FIELD_SIZE)
 #undef SVMS_ACCUMULATE_DENSE_FIELD_SIZE
 
-        void* allocation = _aligned_malloc(bytes, kMixBufferAlign);
+        void* allocation = TryAllocateLargePages(bytes);
+        const bool largePages = allocation != nullptr;
+        if (!allocation) allocation = _aligned_malloc(bytes, kMixBufferAlign);
         if (!allocation) return false;
-        _aligned_free(storage_);
+        FreeStorageBlock();
         storage_ = allocation;
+        storageLargePages_ = largePages;
         storageBytes_ = bytes;
         capacity_ = capacity;
         denseOnly_ = true;
@@ -838,6 +845,8 @@ private:
         storageBytes_ = other.storageBytes_;
         capacity_ = other.capacity_;
         denseOnly_ = other.denseOnly_;
+        storageLargePages_ = other.storageLargePages_;
+        other.storageLargePages_ = false;
         rot = other.rot;
         rotCapacity_ = other.rotCapacity_;
         other.rot = nullptr;
@@ -860,8 +869,21 @@ private:
         other.ResetFixedTails();
     }
 
+    // Frees storage_ with the allocator that produced it (large-page
+    // VirtualAlloc when the optional memory.large_pages backing engaged,
+    // otherwise the aligned allocator).
+    void FreeStorageBlock() noexcept {
+        if (storageLargePages_) {
+            FreeLargePages(storage_);
+            storageLargePages_ = false;
+        } else {
+            _aligned_free(storage_);
+        }
+        storage_ = nullptr;
+    }
+
     void ReleaseStorage() noexcept {
-        _aligned_free(storage_);
+        FreeStorageBlock();
         storage_ = nullptr;
         storageBytes_ = 0u;
         capacity_ = 0u;
@@ -875,6 +897,7 @@ private:
     size_t storageBytes_ = 0u;
     uint32_t capacity_ = 0u;
     bool denseOnly_ = false;
+    bool storageLargePages_ = false;
 };
 
 // The field-list macros stay defined: SVMSRenderScalar.h reuses them for

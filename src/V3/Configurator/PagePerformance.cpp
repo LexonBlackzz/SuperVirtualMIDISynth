@@ -207,6 +207,15 @@ void DrawPerformancePage(ConfigDocument& doc) {
         LiveVoiceCell();
 
         ImGui::TableNextRow();
+        LabelCell("Large pages",
+                  "Optional. Backs the voice pool and dense-render storage with 2 MB pages to reduce TLB pressure at very large pool sizes. Requires the Lock Pages In Memory privilege (granted via Local Security Policy); otherwise this silently falls back to standard allocation. Never prompts for elevation. Takes effect after a driver restart.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("##largepages", &w.largePages)) {
+            doc.MarkDirty();
+        }
+        RestartCell();
+
+        ImGui::TableNextRow();
         LabelCell("Hybrid thread affinity",
                   "Opt-in. 1 pins every render thread (audio, event compiler, workers) to performance cores; 2 keeps audio + compiler on P-cores and parks render workers on efficiency cores so the P-cores stay free for real-time work (worker count is never reduced). No effect on non-hybrid CPUs.");
         ImGui::TableNextColumn();
