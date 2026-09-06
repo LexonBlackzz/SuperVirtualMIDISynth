@@ -247,6 +247,13 @@ using EventDispatcher = void(*)(const RenderEvent& event, uint32_t blockCursor,
 using EventBatchDispatcher = void(*)(const RenderEvent* events, uint32_t eventCount,
                                      uint32_t blockCursor, void* userData);
 
+// Fallback-span telemetry: RenderPrimaryVoiceSpan is the scalar per-voice
+// renderer used wherever a vector class kernel refuses (short segments,
+// stage/loop guards). Worker threads increment these; the census reports
+// deltas so the scalar share can be quantified before optimizing it.
+inline std::atomic<uint64_t> g_primarySpanCalls{0};
+inline std::atomic<uint64_t> g_primarySpanFrames{0};
+
 constexpr uint32_t kDenseRenderChunkFrames = 128u;
 constexpr uint32_t kDenseRenderHandlesPerTile = 256u;
 constexpr uint32_t kDenseRenderMaximumVoices = 131072u;
@@ -742,6 +749,10 @@ public:
     // used. Bit0 whole-voice, bit1 dense, bit2 sparse; bit8 = the vibrato
     // gate forced the legacy hybrid for this block.
     uint32_t GetLastRenderPaths() const { return lastRenderPaths_; }
+    static void GetPrimarySpanTotals(uint64_t& calls, uint64_t& frames) {
+        calls = g_primarySpanCalls.load(std::memory_order_relaxed);
+        frames = g_primarySpanFrames.load(std::memory_order_relaxed);
+    }
     void GetLastPlanRefusal(uint8_t& type, uint8_t& data1) const {
         type = lastRefusalType_;
         data1 = lastRefusalData1_;
@@ -1440,6 +1451,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                                        uint32_t frameStart, uint32_t frameCount,
                                        uint32_t mixedFrameCount,
                                        bool exactSilentAdvance = false) {
+    g_primarySpanCalls.fetch_add(1, std::memory_order_relaxed);
+    g_primarySpanFrames.fetch_add(frameCount, std::memory_order_relaxed);
+
     if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free) || frameCount == 0u)
         return UINT32_MAX;
 
