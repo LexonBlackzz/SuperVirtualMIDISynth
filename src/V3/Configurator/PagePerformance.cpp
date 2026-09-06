@@ -130,7 +130,8 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 std::pow(10.0f, static_cast<float>(retireDbInt) / 20.0f);
             doc.MarkDirty();
         }
-
+        RestartCell();
+        
         ImGui::TableNextRow();
         LabelCell("Voice presets");
         ImGui::TableNextColumn();
