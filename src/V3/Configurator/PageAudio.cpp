@@ -543,12 +543,13 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
             "SVMS-API DLL",
             "KDMAPI DLL",
             "WinMM MIDI-out device",
+            "Auto-detect DLL",
         };
         int synthBackend = static_cast<int>(w.apiBackend);
-        if (synthBackend < 0 || synthBackend > 3) synthBackend = 0;
+        if (synthBackend < 0 || synthBackend > 4) synthBackend = 0;
         ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
         if (ImGui::BeginCombo("##synthbackend", synthBackendItems[synthBackend])) {
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 5; ++i) {
                 const bool selected = i == synthBackend;
                 if (ImGui::Selectable(synthBackendItems[i], selected)) {
                     w.apiBackend = static_cast<uint32_t>(i);
@@ -558,7 +559,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
             }
             ImGui::EndCombo();
         }
-        if (w.apiBackend == 1u || w.apiBackend == 2u) {
+        if (w.apiBackend == 1u || w.apiBackend == 2u || w.apiBackend == 4u) {
             char dllBuf[512]{};
             WideToUtf8Str(w.apiBackendDll).copy(dllBuf, sizeof(dllBuf) - 1u);
             ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
@@ -567,8 +568,8 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 doc.MarkDirty();
             }
             ImGui::SameLine();
-            ImGui::TextDisabled(w.apiBackend == 1u ? "synth DLL path"
-                                                   : "KDMAPI DLL path");
+            ImGui::TextDisabled(w.apiBackend == 2u ? "KDMAPI DLL path"
+                                                   : "synth DLL path");
         } else if (w.apiBackend == 3u) {
             int device = static_cast<int>(w.apiWinMmDevice);
             ImGui::SetNextItemWidth(120.0f);

@@ -231,7 +231,7 @@ void ConfigDocument::FromJson(const json& root) {
             if (lp->is_boolean())
                 working_.largePages = lp->get<bool>();
         }
-        ReadNum(*it, "backend", working_.apiBackend, 0u, 3u);
+        ReadNum(*it, "backend", working_.apiBackend, 0u, 4u);
         if (auto dll = it->find("backend_dll"); dll != it->end() &&
             dll->is_string()) {
             working_.apiBackendDll = Utf8ToWide(dll->get<std::string>());

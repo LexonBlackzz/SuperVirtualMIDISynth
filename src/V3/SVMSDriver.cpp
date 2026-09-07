@@ -2167,6 +2167,9 @@ public:
     // shutdown. A failure falls back to the in-process SVMS engine.
     bool InitializeExternalBackend();
     void ShutdownExternalBackend();
+    bool OpenSvmsApiBackend(HMODULE module);
+    bool OpenKdmapiBackend(HMODULE module);
+    bool OpenWinmmBackend(HMODULE module);
     void ExternalBackendReset();
     void ForwardBlockToBackend(const RenderEvent* events, uint32_t count);
     bool IsInitialized() const;
@@ -2350,6 +2353,7 @@ private:
     HMODULE kdmapiBackendModule_ = nullptr;
     bool kdmapiBackendOpen_ = false;
     HMIDIOUT winmmBackendOut_ = nullptr;
+    HMODULE winmmBackendModule_ = nullptr;  // set by auto-detected winmm dlls
     // System-winmm function pointers cached at backend load (kind 3).
     unsigned int (WINAPI* systemWinmmShortMsg_)(HMIDIOUT, DWORD) = nullptr;
     unsigned int (WINAPI* systemWinmmResetProc_)(HMIDIOUT) = nullptr;
@@ -4374,8 +4378,41 @@ const LegacyDriverDebugInfo* Driver::GetLegacyDebugInfo() const {
 bool Driver::InitializeExternalBackend() {
     const uint32_t kind = engineConfig_.apiBackend;
     if (kind == 0u) return true;
+    // Kind 4 auto-detects whatever the configured DLL answers with: the
+    // SVMS-API table getter, the KDMAPI export set, or WinMM midiOut
+    // exports — in that priority order. Kinds 1..3 demand a specific
+    // surface; auto is how "throw any synth DLL at it" works.
+    if (kind == 4u) {
+        if (engineConfig_.apiBackendDll.empty()) {
+            LOG("Backend 4 (auto) requested but api.backend_dll is empty");
+            return false;
+        }
+        const HMODULE module =
+            LoadLibraryW(engineConfig_.apiBackendDll.c_str());
+        if (!module) {
+            LOG("FAILED: LoadLibrary(backend dll) error=%lu", GetLastError());
+            return false;
+        }
+        if (OpenSvmsApiBackend(module)) {
+            externalBackendKind_.store(1u, std::memory_order_release);
+            LOG("External backend auto-detect: SVMS-API dll");
+            return true;
+        }
+        if (OpenKdmapiBackend(module)) {
+            externalBackendKind_.store(2u, std::memory_order_release);
+            LOG("External backend auto-detect: KDMAPI dll");
+            return true;
+        }
+        if (OpenWinmmBackend(module)) {
+            externalBackendKind_.store(3u, std::memory_order_release);
+            LOG("External backend auto-detect: WinMM dll");
+            return true;
+        }
+        FreeLibrary(module);
+        LOG("FAILED: backend dll answers with no known synth surface");
+        return false;
+    }
     if (kind == 1u) {
-        // SVMS-API backend: one exported table getter, full table required.
         if (engineConfig_.apiBackendDll.empty()) {
             LOG("Backend 1 (SVMS-API) requested but api.backend_dll is empty");
             return false;
@@ -4386,44 +4423,15 @@ bool Driver::InitializeExternalBackend() {
             LOG("FAILED: LoadLibrary(backend dll) error=%lu", GetLastError());
             return false;
         }
-        const auto getInterface =
-            reinterpret_cast<SVMSBackendGetInterfaceFn>(GetProcAddress(
-                module, SVMSBACKEND_GETINTERFACE_NAME));
-        if (!getInterface) {
-            FreeLibrary(module);
-            LOG("FAILED: backend dll lacks %s", SVMSBACKEND_GETINTERFACE_NAME);
-            return false;
+        if (OpenSvmsApiBackend(module)) {
+            externalBackendKind_.store(1u, std::memory_order_release);
+            LOG("External backend: SVMS-API dll active");
+            return true;
         }
-        SVMSBackendInterface table{};
-        table.struct_size = sizeof(table);
-        if (getInterface(&table) != 0u ||
-            table.struct_size < sizeof(table) ||
-            table.api_version != SVMSBACKEND_API_VERSION ||
-            !table.initialize || !table.shutdown || !table.reset ||
-            !table.send_short) {
-            FreeLibrary(module);
-            LOG("FAILED: backend interface invalid");
-            return false;
-        }
-        SVMSBackendOpenParams params{};
-        params.struct_size = sizeof(params);
-        params.sample_rate = sampleRate;
-        params.buffer_frames = bufferFrames;
-        params.voices_hint = engineConfig_.maxVoices;
-        if (table.initialize(table.user, &params) != 0) {
-            FreeLibrary(module);
-            LOG("FAILED: backend initialize refused");
-            return false;
-        }
-        externalBackend_ = table;
-        externalBackendModule_ = module;
-        externalBackendOpen_ = true;
-        externalBackendKind_.store(1u, std::memory_order_release);
-        LOG("External backend: SVMS-API dll active");
-        return true;
+        FreeLibrary(module);
+        return false;
     }
     if (kind == 2u) {
-        // KDMAPI backend: bind the standard OmniMIDI-compatible export set.
         if (engineConfig_.apiBackendDll.empty()) {
             LOG("Backend 2 (KDMAPI) requested but api.backend_dll is empty");
             return false;
@@ -4434,76 +4442,140 @@ bool Driver::InitializeExternalBackend() {
             LOG("FAILED: LoadLibrary(kdmapi dll) error=%lu", GetLastError());
             return false;
         }
-        using KdInitFn = int (WINAPI*)(void);
-        using KdTermFn = int (WINAPI*)(void);
-        using KdResetFn = void (WINAPI*)(void);
-        using KdSendFn = unsigned int (WINAPI*)(unsigned int);
-        kdmapiBackend_.initialize = reinterpret_cast<KdInitFn>(
-            GetProcAddress(module, "InitializeKDMAPIStream"));
-        kdmapiBackend_.terminate = reinterpret_cast<KdTermFn>(
-            GetProcAddress(module, "TerminateKDMAPIStream"));
-        kdmapiBackend_.reset = reinterpret_cast<KdResetFn>(
-            GetProcAddress(module, "ResetKDMAPIStream"));
-        kdmapiBackend_.sendNoBuf = reinterpret_cast<KdSendFn>(
-            GetProcAddress(module, "SendDirectDataNoBuf"));
-        kdmapiBackend_.send = reinterpret_cast<KdSendFn>(
-            GetProcAddress(module, "SendDirectData"));
-        if (!kdmapiBackend_.initialize || !kdmapiBackend_.terminate ||
-            !kdmapiBackend_.reset ||
-            (!kdmapiBackend_.sendNoBuf && !kdmapiBackend_.send)) {
-            FreeLibrary(module);
-            LOG("FAILED: kdmapi dll lacks the core KDMAPI exports");
-            return false;
+        if (OpenKdmapiBackend(module)) {
+            externalBackendKind_.store(2u, std::memory_order_release);
+            LOG("External backend: KDMAPI dll active");
+            return true;
         }
-        if (kdmapiBackend_.initialize() == 0) {
-            FreeLibrary(module);
-            LOG("FAILED: kdmapi InitializeKDMAPIStream refused");
-            return false;
-        }
-        kdmapiBackendModule_ = module;
-        kdmapiBackendOpen_ = true;
-        externalBackendKind_.store(2u, std::memory_order_release);
-        LOG("External backend: KDMAPI dll active");
-        return true;
+        FreeLibrary(module);
+        return false;
     }
     if (kind == 3u) {
         // WinMM MIDI-out device: resolve through the genuine system winmm
         // (absolute path) — our own shim exports these names when built as
         // winmm.dll, so the loader must not hand this proxy back to us.
-        using WmNumProc = UINT(WINAPI*)(void);
-        using WmOpenProc = MMRESULT(WINAPI*)(LPHMIDIOUT, UINT, DWORD_PTR,
-                                             DWORD_PTR, DWORD);
-        using WmShortProc = MMRESULT(WINAPI*)(HMIDIOUT, DWORD);
-        const auto getNum = reinterpret_cast<WmNumProc>(
-            GetSystemWinmmProc("midiOutGetNumDevs"));
-        const auto open = reinterpret_cast<WmOpenProc>(
-            GetSystemWinmmProc("midiOutOpen"));
-        const auto shortMsg = reinterpret_cast<WmShortProc>(
-            GetSystemWinmmProc("midiOutShortMsg"));
-        if (!getNum || !open || !shortMsg) {
-            LOG("FAILED: system winmm lacks midiOut exports");
-            return false;
-        }
-        if (engineConfig_.apiWinMmDevice >= getNum()) {
-            LOG("FAILED: api.winmm_device %u out of range (%u devices)",
-                engineConfig_.apiWinMmDevice, getNum());
-            return false;
-        }
-        HMIDIOUT out = nullptr;
-        if (open(&out, engineConfig_.apiWinMmDevice, 0, 0,
-                 CALLBACK_NULL) != MMSYSERR_NOERROR) {
-            LOG("FAILED: midiOutOpen device %u",
+        if (OpenWinmmBackend(nullptr)) {
+            externalBackendKind_.store(3u, std::memory_order_release);
+            LOG("External backend: WinMM device %u active",
                 engineConfig_.apiWinMmDevice);
-            return false;
+            return true;
         }
-        winmmBackendOut_ = out;
-        systemWinmmShortMsg_ = shortMsg;
-        externalBackendKind_.store(3u, std::memory_order_release);
-        LOG("External backend: WinMM device %u active",
-            engineConfig_.apiWinMmDevice);
-        return true;
+        return false;
     }
     return false;
+}
+
+// Shared openers used by the explicit kinds and by auto-detect. Each takes
+// ownership of the module only on success — on failure the caller frees it.
+
+bool Driver::OpenSvmsApiBackend(HMODULE module) {
+    const auto getInterface =
+        reinterpret_cast<SVMSBackendGetInterfaceFn>(GetProcAddress(
+            module, SVMSBACKEND_GETINTERFACE_NAME));
+    if (!getInterface) return false;
+    SVMSBackendInterface table{};
+    table.struct_size = sizeof(table);
+    if (getInterface(&table) != 0u ||
+        table.struct_size < sizeof(table) ||
+        table.api_version != SVMSBACKEND_API_VERSION ||
+        !table.initialize || !table.shutdown || !table.reset ||
+        !table.send_short) {
+        LOG("FAILED: backend interface invalid");
+        return false;
+    }
+    SVMSBackendOpenParams params{};
+    params.struct_size = sizeof(params);
+    params.sample_rate = sampleRate;
+    params.buffer_frames = bufferFrames;
+    params.voices_hint = engineConfig_.maxVoices;
+    if (table.initialize(table.user, &params) != 0) {
+        LOG("FAILED: backend initialize refused");
+        return false;
+    }
+    externalBackend_ = table;
+    externalBackendModule_ = module;
+    externalBackendOpen_ = true;
+    return true;
+}
+
+bool Driver::OpenKdmapiBackend(HMODULE module) {
+    using KdInitFn = int (WINAPI*)(void);
+    using KdTermFn = int (WINAPI*)(void);
+    using KdResetFn = void (WINAPI*)(void);
+    using KdSendFn = unsigned int (WINAPI*)(unsigned int);
+    kdmapiBackend_.initialize = reinterpret_cast<KdInitFn>(
+        GetProcAddress(module, "InitializeKDMAPIStream"));
+    kdmapiBackend_.terminate = reinterpret_cast<KdTermFn>(
+        GetProcAddress(module, "TerminateKDMAPIStream"));
+    kdmapiBackend_.reset = reinterpret_cast<KdResetFn>(
+        GetProcAddress(module, "ResetKDMAPIStream"));
+    kdmapiBackend_.sendNoBuf = reinterpret_cast<KdSendFn>(
+        GetProcAddress(module, "SendDirectDataNoBuf"));
+    kdmapiBackend_.send = reinterpret_cast<KdSendFn>(
+        GetProcAddress(module, "SendDirectData"));
+    if (!kdmapiBackend_.initialize || !kdmapiBackend_.terminate ||
+        !kdmapiBackend_.reset ||
+        (!kdmapiBackend_.sendNoBuf && !kdmapiBackend_.send)) {
+        return false;
+    }
+    if (kdmapiBackend_.initialize() == 0) {
+        LOG("FAILED: kdmapi InitializeKDMAPIStream refused");
+        return false;
+    }
+    kdmapiBackendModule_ = module;
+    kdmapiBackendOpen_ = true;
+    return true;
+}
+
+bool Driver::OpenWinmmBackend(HMODULE module) {
+    using WmNumProc = UINT(WINAPI*)(void);
+    using WmOpenProc = MMRESULT(WINAPI*)(LPHMIDIOUT, UINT, DWORD_PTR,
+                                         DWORD_PTR, DWORD);
+    using WmShortProc = MMRESULT(WINAPI*)(HMIDIOUT, DWORD);
+    using WmResetProc = MMRESULT(WINAPI*)(HMIDIOUT);
+    WmNumProc getNum = nullptr;
+    WmOpenProc open = nullptr;
+    WmShortProc shortMsg = nullptr;
+    if (module) {
+        // A WinMM-replacement DLL the caller pointed us at: use its exports.
+        getNum = reinterpret_cast<WmNumProc>(
+            GetProcAddress(module, "midiOutGetNumDevs"));
+        open = reinterpret_cast<WmOpenProc>(
+            GetProcAddress(module, "midiOutOpen"));
+        shortMsg = reinterpret_cast<WmShortProc>(
+            GetProcAddress(module, "midiOutShortMsg"));
+    } else {
+        // The genuine system winmm by absolute path — never our own shim.
+        getNum = reinterpret_cast<WmNumProc>(
+            GetSystemWinmmProc("midiOutGetNumDevs"));
+        open = reinterpret_cast<WmOpenProc>(
+            GetSystemWinmmProc("midiOutOpen"));
+        shortMsg = reinterpret_cast<WmShortProc>(
+            GetSystemWinmmProc("midiOutShortMsg"));
+    }
+    if (!getNum || !open || !shortMsg) {
+        LOG("FAILED: winmm surface lacks midiOut exports");
+        return false;
+    }
+    const UINT devices = getNum();
+    if (engineConfig_.apiWinMmDevice >= devices) {
+        LOG("FAILED: api.winmm_device %u out of range (%u devices)",
+            engineConfig_.apiWinMmDevice, devices);
+        return false;
+    }
+    HMIDIOUT out = nullptr;
+    if (open(&out, engineConfig_.apiWinMmDevice, 0, 0,
+             CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        LOG("FAILED: midiOutOpen device %u", engineConfig_.apiWinMmDevice);
+        return false;
+    }
+    winmmBackendOut_ = out;
+    winmmBackendModule_ = module;
+    systemWinmmShortMsg_ = shortMsg;
+    systemWinmmResetProc_ = reinterpret_cast<WmResetProc>(
+        module ? static_cast<void*>(GetProcAddress(module, "midiOutReset"))
+               : static_cast<void*>(GetSystemWinmmProc("midiOutReset")));
+    return true;
 }
 
 void Driver::ShutdownExternalBackend() {
@@ -4526,6 +4598,10 @@ void Driver::ShutdownExternalBackend() {
             close(winmmBackendOut_);
         winmmBackendOut_ = nullptr;
         systemWinmmShortMsg_ = nullptr;
+        if (winmmBackendModule_) {
+            FreeLibrary(winmmBackendModule_);
+            winmmBackendModule_ = nullptr;
+        }
     }
     if (kind == 1u && externalBackendModule_) {
         FreeLibrary(externalBackendModule_);

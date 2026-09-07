@@ -1,3 +1,31 @@
+# SVMSAPI — the synth-agnostic MIDI interface
+
+SVMSAPI speaks three client surfaces and loads three kinds of synth
+backends. Any player can drive any synth through it, and any synth can plug
+into it, using nothing but `LoadLibrary`/`GetProcAddress` — or the
+single-header integration in `src/V3/SVMSAPI.h`.
+
+| Client surface | What it is | Who uses it |
+|---|---|---|
+| **SVMS native API v1** (`svmsapi.h`, below) | A versioned function table with timed batches, offline sessions, telemetry and config access | Players that want the full pipeline: exact frames, lossless queues, cancellation |
+| **KDMAPI facade** | The OmniMIDI-compatible export set (`InitializeKDMAPIStream`, `SendDirectDataNoBuf`, …) | Players written against OmniMIDI.h/KDMAPI — drop-in |
+| **WinMM shim** | The full `midiOut*`/`midiIn*` surface exported by `winmm.dll` (and the `SVMS.dll` / `OmniMIDI.dll` / `SnappySynth.dll` aliases) | Any application that plays MIDI, with zero source changes |
+
+| Backend (synth side) | How it plugs in | Selected by |
+|---|---|---|
+| **SVMS engine** | Built into SVMSAPI.dll | `api.backend = 0` (default) |
+| **SVMS-API backend** | DLL exporting `SVMSBackend_GetInterface` (contract at the bottom of `src/V3/SVMSAPI.h`) | `api.backend = 1`, or auto-detect |
+| **KDMAPI synth** | DLL exporting the KDMAPI set (OmniMIDI, …) | `api.backend = 2`, or auto-detect |
+| **WinMM synth** | A MIDI-out device on the system winmm, or a WinMM-replacement DLL | `api.backend = 3`, or auto-detect |
+| **Any of the above** | One DLL, probed for whatever surface it answers with | `api.backend = 4` (auto-detect) |
+
+The router (SVMSAPI.dll / winmm.dll) owns the event pipeline — ordering,
+pacing to playback time, CC collapse, optional velocity shedding — and the
+backend owns synthesis and audio output. External backends therefore never
+see the pipeline cost, and slow backends never stall the caller.
+
+---
+
 # SVMS native API v1
 
 `svmsapi.h` is the stable C interface for applications that want to talk to
@@ -134,3 +162,128 @@ The runtime consumes and translates the complete SysEx byte array before
 `send_system_exclusive` returns. It never retains the caller's pointer, so the
 caller may immediately reuse or release that buffer. The generated ordered
 engine events may remain queued after the source bytes have been released.
+
+---
+
+# KDMAPI facade reference
+
+`SVMSAPI.dll` (and the `OmniMIDI.dll` alias) export the OmniMIDI KDMAPI
+surface. All functions are `WINAPI`. `src/V3/SVMSAPI.h` binds this whole set
+automatically; KDMAPI.md (repository root) keeps the original OmniMIDI
+documentation this table summarizes.
+
+| Export | Signature | Behavior |
+|---|---|---|
+| `ReturnKDMAPIVer` | `BOOL (LPDWORD major, LPDWORD minor, LPDWORD build, LPDWORD revision)` | Reports the emulated KDMAPI version (4.1). |
+| `IsKDMAPIAvailable` | `BOOL (void)` | Always TRUE — loading the module is the availability check. |
+| `InitializeKDMAPIStream` | `BOOL (void)` | Opens the engine (or starts routing to the selected backend). Returns FALSE on failure. |
+| `TerminateKDMAPIStream` | `BOOL (void)` | Closes the stream; releases the driver when the last front-end disconnects. |
+| `ResetKDMAPIStream` | `VOID (void)` | Hard all-notes-off: voices stop, channel controllers reset. |
+| `SendDirectData` | `VOID (DWORD msg)` | Queues one packed short message `0x00sskkvv` through the lossless pipeline. |
+| `SendDirectDataNoBuf` | `VOID (DWORD msg)` | Same contract; the no-buffer spelling submits without an intermediate batch. |
+| `SendCustomEvent` | `BOOL (DWORD eventtype, DWORD chan, DWORD param)` | BASSMIDI-style event triple. Mapped types are translated; unsupported types return FALSE (never garbage). |
+| `SendDirectLongData` | `UINT (MIDIHDR*, UINT)` | Submits a SysEx buffer prepared by `PrepareLongData`. |
+| `SendDirectLongDataNoBuf` | `UINT (LPSTR data, DWORD size)` | Submits raw SysEx bytes; consumed before returning. |
+| `PrepareLongData` / `UnprepareLongData` | `UINT (MIDIHDR*, UINT)` | WinMM-compatible header lifecycle (flag bookkeeping only). |
+| `DriverSettings` | `BOOL (DWORD setting, DWORD mode, LPVOID value, UINT cbValue)` | OM_GET answers from live engine state; unsupported ids return FALSE. |
+| `GetDriverDebugInfo` | `void* (void)` | Opaque pointer to implementation-specific debug info (layouts differ between synths). |
+| `LoadCustomSoundFontsList` | `VOID (LPWSTR)` | Accepted; SVMS loads SoundFonts through its own configuration. |
+| `timeGetTime64` | `DWORD64 (void)` | 64-bit millisecond clock (no 49-day wrap). |
+
+Short messages use the packed WinMM layout: `0x00sskkvv` — status byte in the
+low byte (event type + channel), then data1, data2. Batches of direct
+messages keep submission order; the pipeline preserves it into the engine.
+
+---
+
+# Finding synths: the discovery rules
+
+## Client side (players)
+
+`SVMSAPI.h` binds exactly one module. Resolution order:
+
+1. `SVMSAPI_MODULE_NAME` if defined at include time (e.g.
+   `L"OmniMIDI\\OmniMIDI.dll"` to drive OmniMIDI instead);
+2. otherwise `SVMSAPI.dll`, from the application directory first, then the
+   normal DLL search path.
+
+If `IsKDMAPIAvailable()` returns FALSE after `SVMSAPI_Load()`, no compatible
+synth module was found. `svms_player.exe` (the reference client, see below)
+implements the same order for all three surfaces and additionally probes a
+drop-in `winmm.dll`/`OmniMIDI.dll` placed next to the executable before
+falling back to the system module — the exact scenario an end user gets when
+they copy a synth next to a player.
+
+## Host side (the router inside SVMSAPI.dll / winmm.dll)
+
+`api.backend` picks the sink, applied at driver initialization:
+
+- **0 — SVMS engine.** In-process; the default and unchanged behavior.
+- **1 — SVMS-API DLL.** Loads `api.backend_dll`, requires the
+  `SVMSBackend_GetInterface` export, requests the full function table
+  (version + every core pointer validated before use), and calls
+  `initialize` with the host's sample rate/buffer size.
+- **2 — KDMAPI DLL.** Loads `api.backend_dll` and requires
+  `InitializeKDMAPIStream` + `TerminateKDMAPIStream` + `ResetKDMAPIStream`
+  + `SendDirectData` or `SendDirectDataNoBuf`. Calls `InitializeKDMAPIStream`
+  once at load.
+- **3 — WinMM device.** Opens MIDI-out device `api.winmm_device` through the
+  *genuine system* winmm (resolved by absolute path — a router built as
+  winmm.dll must never call its own exports). Devices are enumerated by
+  `midiOutGetNumDevs`; index 0 is typically the Microsoft GS Wavetable Synth.
+- **4 — Auto-detect DLL.** Loads `api.backend_dll` once and probes, in order:
+  1. `SVMSBackend_GetInterface` → SVMS-API backend;
+  2. the KDMAPI export set → KDMAPI backend;
+  3. `midiOutGetNumDevs` + `midiOutOpen` + `midiOutShortMsg` → treated as a
+     WinMM-replacement DLL (device `api.winmm_device` inside that module);
+  4. none matched → refuse and fall back to the SVMS engine with a log line.
+
+This is what makes "any synth that responds to any of the surfaces" work:
+drop OmniMIDI.dll, a third-party winmm replacement, or your own SVMS-API
+backend in, point `api.backend_dll` at it, select auto-detect. Whatever it
+answers with, that is the synth.
+
+A failed load of any kind always falls back to the in-process engine — the
+router never renders silence because a backend was missing.
+
+## Event delivery to backends
+
+The router forwards admitted events as packed short messages in ingress
+order, already throttled to playback time. Note-offs and controller
+lifecycle events are never dropped (CC collapse and the optional
+`PriorityVelocity` shedding happen upstream and obey the same rules for
+every backend). The v1 backend contract does not deliver SysEx or
+master-level controls (master volume/tune, rhythm part); resets become the
+backend's hard reset.
+
+---
+
+# The reference client
+
+`svms_player.exe` (`src/V3/SVMSPlayer.cpp`, built by `player_build.bat`)
+is the dogfood client for all of this: it drives the
+native table (`SVMS_GetInterface` with required-slot validation), a KDMAPI
+synth, or a WinMM device, chosen at startup, with the same GetProcAddress
+resolution an external integrator would use — including the drop-in
+app-directory module shadowing the system one. Reading its `Api::Load` and
+`LegacySink::Load` is the fastest way to see the discovery rules above
+implemented end to end.
+
+---
+
+# SVMS-API backend contract v1
+
+A synthesizer that implements this interface ships as a DLL exporting one
+symbol, `SVMSBackend_GetInterface`. The full contract — struct layouts,
+calling rules, and the capability flags — lives at the bottom of
+`src/V3/SVMSAPI.h`, so synth authors need exactly one file. Summary:
+
+- The host presets `out->struct_size` to `sizeof(SVMSBackendInterface)`; the
+  backend fills the table and returns 0, or non-zero to refuse.
+- `initialize(user, params)` runs once before any send and returns 0 on
+  success; `reset` is a hard all-notes-off; `shutdown` after the final send.
+- `send_short(user, msg)` consumes packed `0x00sskkvv` messages and must not
+  block — the host may deliver hundreds of thousands per second.
+- `send_short_batch` is optional; advertise `SVMSBACKEND_CAP_BATCH` and the
+  host will use it for ordered best-effort batches.
+- SysEx and master-level controls are not delivered in v1.

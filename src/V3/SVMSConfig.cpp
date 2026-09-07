@@ -694,7 +694,7 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "diagnostics.debug_output");
     }
     if (auto it = root.find("api"); it != root.end() && it->is_object()) {
-        if (!ReadValue(*it, "backend", cfg.apiBackend, 0u, 3u))
+        if (!ReadValue(*it, "backend", cfg.apiBackend, 0u, 4u))
             AppendWarning(cfg.configWarning, "api.backend");
         if (auto dll = it->find("backend_dll"); dll != it->end() &&
             dll->is_string()) {
@@ -959,7 +959,7 @@ bool EngineConfig::Validate() const {
             perKeyVoiceCap <= 256u &&
             threadAffinityMode <= 2u &&
             ghostBudget <= 65536u &&
-            apiBackend <= 3u &&
+            apiBackend <= 4u &&
             apiWinMmDevice <= 255u &&
             maxEventsPerBlock > 0;
 }
