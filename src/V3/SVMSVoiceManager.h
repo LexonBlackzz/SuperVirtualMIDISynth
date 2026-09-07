@@ -4071,7 +4071,13 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
         const uint8_t reservation = stealCandidateReserved_[handle];
         stealCandidateReserved_[handle] = 0u;
         if (reservation == 2u) {
-            if (IsStableStealCandidate(handle) && IsLinkedActiveVoice(handle)) {
+            // The refresh path sifts the winner tree, which only exists
+            // under Quality with a valid index. A policy switch that
+            // invalidated the index between the launch transaction's
+            // reservation and this commit must fall through to the
+            // guarded removal/re-push below.
+            if (stealHeapValid_ && !FastSteal() &&
+                IsStableStealCandidate(handle) && IsLinkedActiveVoice(handle)) {
                 const float score = ComputeStableStealKey(handle);
                 stealStableKey_[handle] = EncodeStableWinnerKey(
                     score, activePosition_[handle]);

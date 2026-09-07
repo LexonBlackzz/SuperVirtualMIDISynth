@@ -2343,6 +2343,13 @@ private:
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block sample offset.
     std::atomic<bool> blockTimingEnabled_{false};
+    // Pending steal-policy switch (UINT32_MAX = none). The policy is
+    // structural to the steal index, so the audio thread applies it at a
+    // block boundary instead of the config thread doing it mid-render,
+    // where it tore launch transactions apart (observed as a wild write in
+    // VolatileHeapSiftDown when a reserved-candidate commit raced the
+    // index teardown).
+    std::atomic<uint32_t> pendingStealPolicy_{UINT32_MAX};
     // External synth backend state (api.backend). externalBackendKind_ is
     // read by the audio thread every callback; the rest is only touched by
     // init/shutdown before audio starts.
@@ -2896,12 +2903,14 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                       _TRUNCATE);
             return svms::RLResult::InvalidArgument;
         }
-        voiceManager->SetStealPolicy(cmd.param);
+        // Applied by the audio thread at the next block boundary — never
+        // here, mid-block, where it would race a launch transaction.
+        pendingStealPolicy_.store(cmd.param, std::memory_order_release);
         engineConfig_.stealPolicy = cmd.param;
-        strncpy_s(resultText, kText,
-                  cmd.param != 0u ? "steal policy: fast cursor"
-                                  : "steal policy: quality (priority tree)",
-                  _TRUNCATE);
+        static const char* const policyNames[] = {
+            "quality (priority tree)", "fast cursor", "scan" };
+        snprintf(resultText, kText, "steal policy: %s (next block)",
+                 policyNames[cmd.param]);
         return svms::RLResult::Ok;
     }
     case RT::SetPerKeyVoiceCap: {
@@ -5945,7 +5954,17 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                 sizeof(self->staleRecoveryNoteOffValid_));
     std::memset(self->staleRecoveryNoteOffCount_, 0,
                 sizeof(self->staleRecoveryNoteOffCount_));
-    const uint32_t importedPages = self->useEventCompiler_
+        // Apply a parked steal-policy switch at the block boundary: launch
+    // transactions never span callbacks, so the index rebuild is atomic
+    // with respect to every reserved-candidate commit.
+    {
+        const uint32_t pendingPolicy =
+            self->pendingStealPolicy_.exchange(UINT32_MAX,
+                                               std::memory_order_acq_rel);
+        if (pendingPolicy != UINT32_MAX && self->voiceManager)
+            self->voiceManager->SetStealPolicy(pendingPolicy);
+    }
+const uint32_t importedPages = self->useEventCompiler_
         ? self->pagedScheduler_.ImportAllReady()
         : 0u;
     if (self->useEventCompiler_) {
