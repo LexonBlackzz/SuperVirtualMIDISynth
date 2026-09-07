@@ -135,6 +135,9 @@ static void SVMSAPI_Unload(void) {
     SVMSAPI_GetDebugInfoProc = NULL;
     SVMSAPI_LoadFontsListProc = NULL;
     SVMSAPI_TimeGetTime64Proc = NULL;
+    SVMSAPI_GetVoiceCountProc = NULL;
+    SVMSAPI_GetVoiceStatisticsProc = NULL;
+    SVMSAPI_GetRenderingTimeProc = NULL;
 }
 
 /* ── KDMAPI-compatible entry points (names match OmniMIDI.h) ───────── */

@@ -194,6 +194,14 @@ Short messages use the packed WinMM layout: `0x00sskkvv` — status byte in the
 low byte (event type + channel), then data1, data2. Batches of direct
 messages keep submission order; the pipeline preserves it into the engine.
 
+The facade also exports the telemetry trio players probe next to KDMAPI
+(ziggy-style loaders): `GetVoiceCount()` (`DWORD`), `GetVoiceStatistics()`
+(12-byte struct: `[0]` active, `[4]` free, `[8]` steals — SnappySynth v2
+layout), and `GetRenderingTime()` (synth render time in milliseconds,
+refreshed every audio callback). The single header `src/V3/SVMSAPI.h`
+binds all of it; a player integration walkthrough lives in
+`SVMSAPI-PLAYER-GUIDE.md` (repository root).
+
 ---
 
 # Finding synths: the discovery rules
