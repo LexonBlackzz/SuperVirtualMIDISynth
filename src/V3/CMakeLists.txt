@@ -418,6 +418,27 @@ endif()
 set(EXPORTS
         PlaySoundA
         PlaySoundW
+        BASS_Init
+        BASS_Free
+        BASS_SetConfig
+        BASS_GetConfig
+        BASS_ErrorGetCode
+        BASS_MIDI_FontInit
+        BASS_MIDI_FontFree
+        BASS_MIDI_StreamSetFonts
+        BASS_MIDI_StreamCreate
+        BASS_MIDI_StreamEvents
+        BASS_ChannelGetData
+        BASS_ChannelGetLength
+        BASS_ChannelGetPosition
+        BASS_ChannelSetPosition
+        BASS_ChannelIsActive
+        BASS_ChannelSeconds2Bytes
+        BASS_ChannelBytes2Seconds
+        BASS_ChannelSetAttribute
+        BASS_ChannelGetAttribute
+        BASS_ChannelGetInfo
+        BASS_StreamFree
         midiOutGetNumDevs
         midiOutGetDevCapsA
         midiOutGetDevCapsW
@@ -718,6 +739,38 @@ add_custom_target(svms_kdmapi_alias ALL
             "$<TARGET_FILE_DIR:svmsynth>/OmniMIDI.dll"
     DEPENDS svmsynth
     VERBATIM)
+
+# BASS compatibility: bass.dll is the hosting alias of the runtime (the
+# full BASS/BASSMIDI prerender surface lives in svmsynth); bassmidi.dll is
+# a thin forwarder to it so a player loading both module names sees one
+# engine instance.
+add_custom_target(svms_bass_alias ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:svmsynth>"
+            "$<TARGET_FILE_DIR:svmsynth>/bass.dll"
+    DEPENDS svmsynth
+    VERBATIM)
+
+add_library(svms_bassmidi_forwarder SHARED SVMSBassMidiForwarder.cpp)
+set_target_properties(svms_bassmidi_forwarder PROPERTIES
+    OUTPUT_NAME "bassmidi"
+    PREFIX ""
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+if(MSVC)
+    foreach(exp
+            BASS_Init BASS_Free BASS_SetConfig BASS_GetConfig
+            BASS_ErrorGetCode BASS_MIDI_FontInit BASS_MIDI_FontFree
+            BASS_MIDI_StreamSetFonts BASS_MIDI_StreamCreate
+            BASS_MIDI_StreamEvents BASS_ChannelGetData
+            BASS_ChannelGetLength BASS_ChannelGetPosition
+            BASS_ChannelSetPosition BASS_ChannelIsActive
+            BASS_ChannelSeconds2Bytes BASS_ChannelBytes2Seconds
+            BASS_ChannelSetAttribute BASS_ChannelGetAttribute
+            BASS_ChannelGetInfo BASS_StreamFree)
+        target_link_options(svms_bassmidi_forwarder PRIVATE /EXPORT:${exp})
+    endforeach()
+endif()
 
 option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
 
