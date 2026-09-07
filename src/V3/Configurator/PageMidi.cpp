@@ -278,7 +278,7 @@ void DrawMidiPage(ConfigDocument& doc) {
         if (lc.connected) LiveBadge("Applied live via RuntimeLink");
 
         ImGui::TableNextRow();
-        LabelCell("Block timing mode (\"OmniMIDI Mode\")",
+        LabelCell("OmniMIDI Mode",
                   "OFF by default: events dispatch at their exact intra-block "
                   "sample offset (keep this for latency-critical live play). "
                   "When enabled, every event due in a callback fires at block "
@@ -297,6 +297,30 @@ void DrawMidiPage(ConfigDocument& doc) {
                     svms::RLCommandType::SetBlockTiming, 0u,
                     w.blockTiming ? 1u : 0u,
                     svms::RuntimeLiveStateV2{}, 100u, btResult);
+            }
+        }
+        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
+
+        ImGui::TableNextRow();
+        LabelCell("Unbounded render",
+                  "OFF by default. When enabled, the two pressure safety "
+                  "nets are disabled: no wall-time recovery jump (the render "
+                  "clock stays on its own timeline, so events keep their "
+                  "exact frames and exact order at whatever speed the engine "
+                  "manages — the song slows down instead of breaking down) "
+                  "and no per-block admission cap (the scheduler admits up "
+                  "to max_events_per_block and rips through the backlog at "
+                  "full CPU). Audio glitches and slowed playback are the "
+                  "accepted trade.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("##unboundedrender", &w.unboundedRender)) {
+            doc.MarkDirty();
+            if (lc.connected && lc.client) {
+                char ubResult[svms::kRuntimeLinkResultTextCapacity]{};
+                lc.client->SendCommand(
+                    svms::RLCommandType::SetUnboundedRender, 0u,
+                    w.unboundedRender ? 1u : 0u,
+                    svms::RuntimeLiveStateV2{}, 100u, ubResult);
             }
         }
         if (lc.connected) LiveBadge("Applied live via RuntimeLink");

@@ -218,6 +218,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"render_threads", cfg.renderThreads},
             {"thread_affinity_mode", cfg.threadAffinityMode},
             {"block_timing", cfg.blockTimingMode},
+            {"unbounded_render", cfg.unboundedRender},
             {"master_volume", cfg.masterVolume},
             {"velocity_curve", cfg.velocityCurve},
             {"velocity_floor", cfg.velocityFloor},
@@ -461,6 +462,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
                 cfg.blockTimingMode = bt->get<bool>();
             else
                 AppendWarning(cfg.configWarning, "synth.block_timing");
+        }
+        if (auto ub = it->find("unbounded_render"); ub != it->end()) {
+            if (ub->is_boolean())
+                cfg.unboundedRender = ub->get<bool>();
+            else
+                AppendWarning(cfg.configWarning, "synth.unbounded_render");
         }
         if (!ReadValue(*it, "master_volume", cfg.masterVolume, 0.0f, 4.0f))
             AppendWarning(cfg.configWarning, "synth.master_volume");
@@ -822,6 +829,7 @@ EngineConfig EngineConfig::Default() {
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.blockTimingMode = false;  // opt-in: exact-frame dispatch by default
+    cfg.unboundedRender = false;  // opt-in: recovery + caps stay on by default
     cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default
     cfg.largePages = false;       // opt-in: standard aligned allocation by default
     cfg.apiBackend = 0;           // SVMS engine in-process by default

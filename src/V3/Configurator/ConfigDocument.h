@@ -78,6 +78,8 @@ struct ConfigValues {
     bool ccCollapse = false;
     // Opt-in block-granular dispatch (events fire at block start).
     bool blockTiming = false;
+    // Opt-in unbounded render (no recovery jump, no admission soft cap).
+    bool unboundedRender = false;
     // Optional whole-voice ghost budget per block; 0 = unbounded.
     uint32_t ghostBudget = 0u;
     // Opt-in large-page backing for the biggest pools (needs restart).

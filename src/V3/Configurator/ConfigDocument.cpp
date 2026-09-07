@@ -171,6 +171,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.threadAffinityMode = 0u;
     d.ccCollapse = false;
     d.blockTiming = false;
+    d.unboundedRender = false;
     d.ghostBudget = 0u;
     d.largePages = false;
     d.apiBackend = 0u;
@@ -222,6 +223,10 @@ void ConfigDocument::FromJson(const json& root) {
         if (auto bt = it->find("block_timing"); bt != it->end()) {
             if (bt->is_boolean())
                 working_.blockTiming = bt->get<bool>();
+        }
+        if (auto ub = it->find("unbounded_render"); ub != it->end()) {
+            if (ub->is_boolean())
+                working_.unboundedRender = ub->get<bool>();
         }
         if (auto lp = it->find("large_pages"); lp != it->end()) {
             if (lp->is_boolean())
@@ -420,6 +425,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
     root["synth"]["block_timing"] = working_.blockTiming;
+    root["synth"]["unbounded_render"] = working_.unboundedRender;
     root["synth"]["large_pages"] = working_.largePages;
     root["api"]["backend"] = working_.apiBackend;
     root["api"]["backend_dll"] = WideToUtf8(working_.apiBackendDll);
@@ -623,6 +629,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
         && a.blockTiming == b.blockTiming
+        && a.unboundedRender == b.unboundedRender
         && a.largePages == b.largePages
         && a.apiBackend == b.apiBackend
         && a.apiBackendDll == b.apiBackendDll

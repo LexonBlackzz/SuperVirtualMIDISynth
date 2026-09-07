@@ -96,6 +96,10 @@ struct EngineConfig {
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block offset. Off by default.
     bool blockTimingMode;
+    // Opt-in unbounded render: no wall-time recovery jump, no per-block
+    // admission soft cap. Exact schedule at whatever speed the engine
+    // manages; audio glitches are accepted. Off by default.
+    bool unboundedRender;
     // Optional whole-voice ghost budget per block; 0 = unbounded (default).
     uint32_t ghostBudget;
     // Opt-in large-page backing for the biggest pools (voice SoA, dense

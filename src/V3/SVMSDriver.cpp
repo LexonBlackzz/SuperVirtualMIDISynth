@@ -2350,6 +2350,10 @@ private:
     // VolatileHeapSiftDown when a reserved-candidate commit raced the
     // index teardown).
     std::atomic<uint32_t> pendingStealPolicy_{UINT32_MAX};
+    // Opt-in unbounded render: no wall-time recovery jump, no per-block
+    // admission soft cap. The schedule is rendered in exact order at
+    // whatever speed the engine manages; WASAPI glitches are accepted.
+    std::atomic<bool> unboundedRenderEnabled_{false};
     // External synth backend state (api.backend). externalBackendKind_ is
     // read by the audio thread every callback; the rest is only touched by
     // init/shutdown before audio starts.
@@ -3017,6 +3021,24 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         }
         return svms::RLResult::Ok;
     }
+    case RT::SetUnboundedRender: {
+        // param = opt-in unbounded render: no wall-time recovery jump, no
+        // per-block admission soft cap. The schedule renders in exact
+        // order at whatever speed the engine manages.
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "unbounded render must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        unboundedRenderEnabled_.store(cmd.param != 0u,
+                                      std::memory_order_relaxed);
+        engineConfig_.unboundedRender = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "unbounded render: on (schedule over realtime)"
+                            : "unbounded render: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
 
     case RT::StartLiveRecording: {
         const size_t length = strnlen_s(
@@ -3564,6 +3586,8 @@ bool Driver::Initialize() {
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
+    unboundedRenderEnabled_.store(cfg.unboundedRender,
+                                  std::memory_order_relaxed);
     svms::g_largePagesEnabled.store(cfg.largePages,
                                     std::memory_order_relaxed);
 
@@ -3701,6 +3725,8 @@ bool Driver::Initialize() {
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
+    unboundedRenderEnabled_.store(cfg.unboundedRender,
+                                  std::memory_order_relaxed);
     svms::g_largePagesEnabled.store(cfg.largePages,
                                     std::memory_order_relaxed);
 
@@ -5931,12 +5957,20 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         static_cast<int64_t>(blockStartQPC) -
             static_cast<int64_t>(self->virtualRenderClockQPC),
         static_cast<int64_t>(self->qpcFreq), self->sampleRate);
-    const int64_t recoveredRenderSample = RecoverRealtimeRenderFrame(
-        self->virtualRenderSample_, wallRenderSample, numFrames);
-    if (recoveredRenderSample > self->virtualRenderSample_) {
-        self->telemetry_.skippedOutputFrames += static_cast<uint64_t>(
-            recoveredRenderSample - self->virtualRenderSample_);
-        self->virtualRenderSample_ = recoveredRenderSample;
+    // Unbounded render (opt-in): the wall-time recovery jump is the
+    // "breaks down and loses all accuracy" cliff — it skips the schedule
+    // forward and clamps the backlog onto the block-start sample. With the
+    // toggle on, the render cursor stays on its own timeline: events keep
+    // their exact frames in exact order, playback runs at whatever speed
+    // the engine manages, and WASAPI glitches instead of the schedule.
+    if (!self->unboundedRenderEnabled_.load(std::memory_order_relaxed)) {
+        const int64_t recoveredRenderSample = RecoverRealtimeRenderFrame(
+            self->virtualRenderSample_, wallRenderSample, numFrames);
+        if (recoveredRenderSample > self->virtualRenderSample_) {
+            self->telemetry_.skippedOutputFrames += static_cast<uint64_t>(
+                recoveredRenderSample - self->virtualRenderSample_);
+            self->virtualRenderSample_ = recoveredRenderSample;
+        }
     }
 
     // ── Drift recovery ──────────────────────────────────────────────
@@ -6138,9 +6172,15 @@ const uint32_t importedPages = self->useEventCompiler_
     // scheduled and is admitted over the following blocks — no loss, the
     // clock-stretch machinery already treats them as late.
     static constexpr uint32_t kBlockDispatchSoftCap = 1u << 17u;
-    const uint32_t eventBudget = (std::min)((std::min)(
-        self->eventBufferCapacity_, self->maxEventsPerBlock_),
-        kBlockDispatchSoftCap);
+    // Unbounded render lifts the per-block admission cap as well: the
+    // scheduler admits up to the configured max_events_per_block and
+    // drains the backlog in strict order, whatever the callback costs.
+    const uint32_t eventBudget = self->unboundedRenderEnabled_.load(
+        std::memory_order_relaxed)
+        ? (std::min)(self->eventBufferCapacity_, self->maxEventsPerBlock_)
+        : (std::min)((std::min)(self->eventBufferCapacity_,
+                                self->maxEventsPerBlock_),
+                     kBlockDispatchSoftCap);
     auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
         ++examinedCount;
         if (self->overflowMode_.load(std::memory_order_relaxed) ==

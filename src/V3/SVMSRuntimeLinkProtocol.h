@@ -263,6 +263,7 @@ enum class RLCommandType : uint32_t {
     SetCcCollapse         = 0x00000117,
     SetBlockTiming        = 0x00000118,
     SetGhostBudget        = 0x00000119,
+    SetUnboundedRender    = 0x0000011A,
 
 
     Invalid              = 0xFFFFFFFF,
