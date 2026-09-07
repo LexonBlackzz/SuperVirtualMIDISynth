@@ -148,7 +148,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
 
         ImGui::TableNextRow();
         LabelCell("Steal policy",
-                  "Quality: steals the quietest voice via an incremental priority index (original behavior). Fast cursor: O(1) round-robin slot takeover with no steal index at all (victim = oldest slot), not the quietest voice. Fast mode is close to free under dense churn; judge by ear on sparse sustained material.");
+                  "Recommended: Quality (default) — steals the quietest voice via an incremental priority index; consistently the best-sounding option in listening tests. Fast cursor (O(1) round-robin, victim = oldest slot) and Scan (SIMD quiet-ish window) avoid the index but audibly degrade victim quality under dense churn — kept for experimentation only, not recommended.");
         ImGui::TableNextColumn();
         static const char* stealModes[] = { "Quality", "Fast cursor", "Scan (quiet-ish, SIMD)" };
         int stealMode = static_cast<int>(w.stealPolicy);
