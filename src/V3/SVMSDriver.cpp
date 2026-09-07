@@ -6152,6 +6152,22 @@ const uint32_t importedPages = self->useEventCompiler_
             ++self->telemetry_.staleNoteOnsSkipped;
             return;
         }
+        // External fire-now backends (WinMM devices, KDMAPI/SVMS-API synths)
+        // carry bounded internal voice pools — the GS wavetable holds 32 —
+        // and die outright when fed a stale backlog. Kiva keeps such synths
+        // alive with one rule, implemented here: a note-on more than ~one
+        // second behind playback is dropped unless it is high-priority
+        // velocity. Controls and note-offs always pass; the SVMS engine's
+        // own lossless admission default is untouched.
+        if (self->externalBackendKind_.load(std::memory_order_relaxed) != 0u &&
+            scheduledOut.type == RenderEventType::NoteOn &&
+            scheduledOut.data2 < self->engineConfig_.highPriorityVelocity &&
+            self->virtualRenderSample_ - scheduledOut.targetFrame >
+                static_cast<int64_t>(self->sampleRate)) {
+            ++self->telemetry_.shedNoteOns;
+            self->shedAtomic_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         int64_t offset = scheduledOut.targetFrame - self->virtualRenderSample_;
         if (offset < 0) ++self->telemetry_.late;
         if (self->blockTimingEnabled_.load(std::memory_order_relaxed)) {
