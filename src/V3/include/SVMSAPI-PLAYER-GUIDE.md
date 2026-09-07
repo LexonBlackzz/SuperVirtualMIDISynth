@@ -1,7 +1,7 @@
 # SVMS-API integration guide for players
 
 This guide is aimed at the author of a MIDI player — concretely, ziggy —
-who wants to support the SuperVirtualMIDISynth API (`SVMSAPI.dll`) as a
+who I want to support the SuperVirtualMIDISynth API (`SVMSAPI.dll`) as a
 first-class synth. It shows three levels of integration, from zero code to
 the full native surface, and what each level buys.
 
