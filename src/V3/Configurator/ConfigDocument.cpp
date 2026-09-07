@@ -219,10 +219,6 @@ void ConfigDocument::FromJson(const json& root) {
             working_.soundFontPath = working_.soundFontPaths.front();
         ReadNum(*it, "thread_affinity_mode", working_.threadAffinityMode,
                 0u, 2u);
-        if (auto collapse = it->find("cc_collapse"); collapse != it->end()) {
-            if (collapse->is_boolean())
-                working_.ccCollapse = collapse->get<bool>();
-        }
         if (auto bt = it->find("block_timing"); bt != it->end()) {
             if (bt->is_boolean())
                 working_.blockTiming = bt->get<bool>();
@@ -271,6 +267,10 @@ void ConfigDocument::FromJson(const json& root) {
         working_.velocityIgnoreBelow = vib;
     }
     if (auto it = root.find("events"); it != root.end() && it->is_object()) {
+        if (auto collapse = it->find("cc_collapse"); collapse != it->end() &&
+            collapse->is_boolean()) {
+            working_.ccCollapse = collapse->get<bool>();
+        }
         ReadNum(*it, "ring_capacity", working_.eventRingCapacity, 4096u, UINT32_MAX);
         ReadNum(*it, "high_priority_velocity", working_.highPriorityVelocity, 1u, 127u);
         ReadNum(*it, "shed_start_percent", working_.shedStartPercent, 1u, 99u);

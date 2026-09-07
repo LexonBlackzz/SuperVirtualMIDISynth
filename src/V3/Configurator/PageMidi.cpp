@@ -275,16 +275,19 @@ void DrawMidiPage(ConfigDocument& doc) {
                     svms::RuntimeLiveStateV2{}, 100u, ccResult);
             }
         }
-        RestartCell();
+        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
 
         ImGui::TableNextRow();
-        LabelCell("Block timing mode",
+        LabelCell("Block timing mode (\"OmniMIDI Mode\")",
                   "OFF by default: events dispatch at their exact intra-block "
                   "sample offset (keep this for latency-critical live play). "
                   "When enabled, every event due in a callback fires at block "
-                  "start instead — syndrv-style. One launch burst per block "
-                  "and zero mid-block render splits; timing precision inside "
-                  "the block is relinquished.");
+                  "start instead — the whole callback becomes one launch burst "
+                  "with zero mid-block render splits. That quantizes timing to "
+                  "the callback rate (~100 Hz at a 512-frame buffer), like a "
+                  "certain other driver — hence the nickname. Great for "
+                  "maximum throughput on dense files; do not use it when "
+                  "intra-block timing precision matters.");
         ImGui::TableNextColumn();
         if (ImGui::Checkbox("##blocktiming", &w.blockTiming)) {
             doc.MarkDirty();
@@ -296,7 +299,7 @@ void DrawMidiPage(ConfigDocument& doc) {
                     svms::RuntimeLiveStateV2{}, 100u, btResult);
             }
         }
-        RestartCell();
+        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
 
         ImGui::TableNextRow();
         LabelCell("Note-on coalescing",
