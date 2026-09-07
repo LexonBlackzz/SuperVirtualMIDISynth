@@ -51,7 +51,15 @@ enum {
     SVMS_CAP_ISOLATED_OFFLINE_SESSIONS = UINT64_C(1) << 10,
     SVMS_CAP_CONFIG_JSON = UINT64_C(1) << 11,
     SVMS_CAP_CANCELLABLE_SUBMISSION = UINT64_C(1) << 12,
-    SVMS_CAP_ISOLATED_REALTIME_SESSIONS = UINT64_C(1) << 13
+    SVMS_CAP_ISOLATED_REALTIME_SESSIONS = UINT64_C(1) << 13,
+    /* Engine live-control surface: send_runtime_command exposes the same
+     * command set the SVMS configurator drives over the runtime link
+     * (steal policy, per-key cap, retire floor, CC collapse, block timing,
+     * ghost budget, note-on collapse, phase rotation, affinity, restart). */
+    SVMS_CAP_RUNTIME_COMMANDS = UINT64_C(1) << 14,
+    /* SVMS_TelemetryV2: the full engine census (lateness, shedding,
+     * collapse, fences, render-path selection, callback budget stats). */
+    SVMS_CAP_TELEMETRY_V2 = UINT64_C(1) << 15
 };
 
 enum {
@@ -227,6 +235,78 @@ typedef struct SVMS_TelemetryV1 {
     uint32_t reserved[6];
 } SVMS_TelemetryV1;
 
+/* Complete engine census: every field of SVMS_TelemetryV1 plus the live
+ * counters the driver census prints. struct_version 1. */
+typedef struct SVMS_TelemetryV2 {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint64_t callback_count;
+    uint64_t submitted_events;
+    uint64_t accepted_events;
+    uint64_t dispatched_events;
+    uint64_t note_ons;
+    uint64_t matched_regions;
+    uint64_t configured_voices;
+    uint64_t voice_steals;
+    uint32_t active_voices;
+    uint32_t free_voices;
+    uint32_t sample_rate;
+    uint32_t buffer_frames;
+    uint32_t soundfont_loaded;
+    uint32_t audio_running;
+    float render_time_ms;
+    float render_peak;
+    /* Events admitted behind the render cursor. `late_events` also counts
+     * obsolete-event skips; `late_clamped_events` are the ones clamped onto
+     * the block-start sample (the block-grid timing distortion). */
+    uint64_t late_events;
+    uint64_t late_clamped_events;
+    uint64_t late_clamp_max_lateness_frames;
+    uint32_t late_clamp_block_pileup_max;
+    uint64_t stale_note_ons_skipped;
+    uint64_t stale_note_offs_compacted;
+    /* Note-ons suppressed by reset/termination fences. */
+    uint64_t fence_suppressed_note_ons;
+    /* Compiler-side CC collapse drops (opt-in, events.cc_collapse). */
+    uint64_t cc_collapsed_events;
+    /* Note-ons shed by the optional priority overflow mode. */
+    uint64_t shed_note_ons;
+    uint64_t sequence_gaps;
+    uint64_t dropped_events;
+    uint64_t cancelled_submissions;
+    uint32_t scheduled_events;      /* current paged-scheduler backlog */
+    /* Which renderer the last block used: bit0 whole-voice, bit1 dense,
+     * bit2 sparse, bit8 vibrato forced the legacy hybrid. */
+    uint32_t render_paths;
+    uint8_t plan_refusal_type;      /* why the legacy path was chosen */
+    uint8_t plan_refusal_data1;
+    uint16_t backend_kind;          /* selected api.backend (0..4) */
+    uint64_t primary_span_calls;    /* exact-frame scalar span fallback */
+    uint64_t primary_span_frames;
+    uint64_t over_budget_callbacks;
+    uint32_t max_consecutive_over_budget;
+    float callback_p95_percent;
+    float callback_p99_percent;
+    float callback_p999_percent;
+    uint32_t reserved[5];
+} SVMS_TelemetryV2;
+
+/* Live-control command ids. Values mirror the runtime-link wire protocol so
+ * a native caller and the configurator address the identical surface. */
+typedef enum SVMS_Command {
+    SVMS_COMMAND_PING                    = 0x00000020,
+    SVMS_COMMAND_REQUEST_RESTART         = 0x00000110,
+    SVMS_COMMAND_SET_PHASE_ROTATION      = 0x00000111,
+    SVMS_COMMAND_SET_NOTE_ON_COLLAPSE    = 0x00000112,
+    SVMS_COMMAND_SET_VOICE_RETIRE_FLOOR  = 0x00000113,
+    SVMS_COMMAND_SET_STEAL_POLICY        = 0x00000114,
+    SVMS_COMMAND_SET_PER_KEY_VOICE_CAP   = 0x00000115,
+    SVMS_COMMAND_SET_THREAD_AFFINITY_MODE = 0x00000116,
+    SVMS_COMMAND_SET_CC_COLLAPSE         = 0x00000117,
+    SVMS_COMMAND_SET_BLOCK_TIMING        = 0x00000118,
+    SVMS_COMMAND_SET_GHOST_BUDGET        = 0x00000119
+} SVMS_Command;
+
 typedef SVMS_Result (SVMS_CALL *SVMS_CreateSessionFn)(
     const SVMS_SessionConfig* config, SVMS_Session* out_session);
 typedef SVMS_Result (SVMS_CALL *SVMS_DestroySessionFn)(SVMS_Session session);
@@ -287,6 +367,13 @@ typedef SVMS_Result (SVMS_CALL *SVMS_StartSessionAudioFn)(
     SVMS_Session session);
 typedef SVMS_Result (SVMS_CALL *SVMS_StopSessionAudioFn)(
     SVMS_Session session);
+/* Applies one engine live-control command. `result_text_utf8` (optional)
+ * receives a truncated, NUL-terminated human-readable outcome. */
+typedef SVMS_Result (SVMS_CALL *SVMS_SendRuntimeCommandFn)(
+    SVMS_Session session, uint32_t command, uint32_t param,
+    char* result_text_utf8, uint32_t inout_text_bytes);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetTelemetryV2Fn)(
+    SVMS_Session session, SVMS_TelemetryV2* telemetry);
 
 typedef struct SVMS_Interface {
     uint32_t struct_size;
@@ -328,6 +415,8 @@ typedef struct SVMS_Interface {
     SVMS_CreateRealtimeSessionFn create_realtime_session;
     SVMS_StartSessionAudioFn start_session_audio;
     SVMS_StopSessionAudioFn stop_session_audio;
+    SVMS_SendRuntimeCommandFn send_runtime_command;
+    SVMS_GetTelemetryV2Fn get_telemetry_v2;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
@@ -358,6 +447,8 @@ static_assert(sizeof(SVMS_RealtimeSessionConfig) == 96,
               "SVMS_RealtimeSessionConfig ABI changed");
 static_assert(sizeof(SVMS_TelemetryV1) == 128,
               "SVMS_TelemetryV1 ABI changed");
+static_assert(sizeof(SVMS_TelemetryV2) == 280,
+              "SVMS_TelemetryV2 ABI changed");
 #endif
 
 #endif

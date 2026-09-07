@@ -258,6 +258,40 @@ backend's hard reset.
 
 ---
 
+# Engine live controls and telemetry (ABI-1 tail)
+
+Runtimes advertising `SVMS_CAP_RUNTIME_COMMANDS` expose `send_runtime_command`
+(non-XP builds). It drives the *same live-control surface the SVMS
+configurator uses* — one call, one command:
+
+```c
+char text[256];
+api.send_runtime_command(session, SVMS_COMMAND_SET_PER_KEY_VOICE_CAP, 4u,
+                         text, sizeof(text));   /* SVMS_RESULT_OK */
+```
+
+Commands mirror the runtime-link ids: `SVMS_COMMAND_SET_STEAL_POLICY`,
+`SET_PER_KEY_VOICE_CAP`, `SET_VOICE_RETIRE_FLOOR`, `SET_CC_COLLAPSE`,
+`SET_BLOCK_TIMING`, `SET_GHOST_BUDGET`, `SET_NOTE_ON_COLLAPSE`,
+`SET_PHASE_ROTATION`, `SET_THREAD_AFFINITY_MODE`, `REQUEST_RESTART`, and
+`PING`. `param` carries the command argument (a policy index, a voice count,
+raw IEEE-754 bits for the retire floor, 0/1 for toggles). The optional text
+buffer receives a truncated human-readable outcome; pass NULL/0 to skip it.
+Invalid arguments return `SVMS_RESULT_INVALID_ARGUMENT` without touching
+engine state. New commands are added as new ids — callers must treat
+unknown ids as `SVMS_RESULT_INVALID_ARGUMENT`, not as errors to retry.
+
+Runtimes advertising `SVMS_CAP_TELEMETRY_V2` expose `get_telemetry_v2`, the
+complete engine census: everything in `SVMS_TelemetryV1` plus lateness
+counters (`late_events`, `late_clamped_events`, max lateness, block pileup),
+shedding (`shed_note_ons`), compiler CC collapse drops, fence-suppressed
+note-ons, scheduler backlog (`scheduled_events`), the render path the last
+block used (`render_paths`: bit0 whole-voice, bit1 dense, bit2 sparse,
+bit8 vibrato-forced legacy), the plan-refusal reason, the exact-frame scalar
+span fallback totals, and callback budget statistics (p95/p99/p99.9 percent,
+over-budget callback counts). This is the same data the driver's DebugView
+census prints, in one struct.
+
 # The reference client
 
 `svms_player.exe` (`src/V3/SVMSPlayer.cpp`, built by `player_build.bat`)

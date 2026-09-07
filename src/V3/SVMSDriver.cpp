@@ -2162,6 +2162,14 @@ public:
     bool LoadConfiguredSoundFont();
     bool StartAudio();
     void ResetAllVoices();
+#if !defined(SVMS_XP_COMPAT)
+    // Public pass-through to the runtime-link command handler so the native
+    // API can drive the engine live-control surface (SVMS_CAP_RUNTIME_COMMANDS).
+    svms::RLResult ExecuteRuntimeCommand(const svms::RuntimeLinkCommandV2& cmd,
+                                         char* resultText);
+#endif
+    // Fills SVMS_TelemetryV2 from the live engine census (SVMS_CAP_TELEMETRY_V2).
+    void CopyTelemetryCensus(SVMS_TelemetryV2* out) const;
     // External synth backend (SVMS-API / KDMAPI / WinMM): load once at init,
     // forward admitted events from the render callback, tear down on
     // shutdown. A failure falls back to the in-process SVMS engine.
@@ -4691,6 +4699,68 @@ void Driver::ForwardBlockToBackend(const RenderEvent* events,
         }
     }
 }
+#if !defined(SVMS_XP_COMPAT)
+svms::RLResult Driver::ExecuteRuntimeCommand(
+    const svms::RuntimeLinkCommandV2& cmd, char* resultText) {
+    return HandleRuntimeLinkCommand(cmd, resultText);
+}
+#endif
+
+void Driver::CopyTelemetryCensus(SVMS_TelemetryV2* out) const {
+    if (!out) return;
+    DriverDebugInfo debug{};
+    SnappyVoiceStatistics voices{};
+    CopyDebugInfo(debug);
+    CopyVoiceStatistics(voices);
+    SVMS_TelemetryV2 r{};
+    r.struct_size = sizeof(r);
+    r.struct_version = SVMS_STRUCT_VERSION_1;
+    r.callback_count = debug.callbackCount;
+    r.submitted_events = debug.submitted;
+    r.accepted_events = debug.accepted;
+    r.dispatched_events = debug.dispatched;
+    r.note_ons = debug.noteOns;
+    r.matched_regions = debug.matchedRegions;
+    r.configured_voices = debug.configuredVoices;
+    r.voice_steals = voices.voiceSteals;
+    r.active_voices = voices.activeVoices;
+    r.free_voices = voices.freeVoices;
+    r.sample_rate = sampleRate;
+    r.buffer_frames = bufferFrames;
+    r.soundfont_loaded = debug.soundFontLoaded;
+    r.audio_running = debug.audioRunning;
+    r.render_time_ms = GetRenderingTimeMilliseconds();
+    r.render_peak = debug.renderPeak;
+    const EventTelemetry& t = telemetry_;
+    r.late_events = t.late;
+    r.late_clamped_events = t.lateClamped;
+    r.late_clamp_max_lateness_frames = t.lateClampMaxLateness;
+    r.late_clamp_block_pileup_max = t.lateClampBlockPileupMax;
+    r.stale_note_ons_skipped = t.staleNoteOnsSkipped;
+    r.stale_note_offs_compacted = t.staleNoteOffsCompacted;
+    r.fence_suppressed_note_ons = fenceSuppressedNoteOns_;
+    r.cc_collapsed_events = ccCollapsedCount_;
+    r.shed_note_ons = t.shedNoteOns;
+    r.sequence_gaps = t.sequenceGaps;
+    r.dropped_events = t.dropped;
+    r.cancelled_submissions = t.cancelledSubmissions;
+    r.scheduled_events = scheduledSizePublished_.load(std::memory_order_acquire);
+    r.render_paths = renderScalar ? renderScalar->GetLastRenderPaths() : 0u;
+    if (renderScalar)
+        renderScalar->GetLastPlanRefusal(r.plan_refusal_type,
+                                         r.plan_refusal_data1);
+    r.backend_kind =
+        static_cast<uint16_t>(externalBackendKind_.load(std::memory_order_relaxed));
+    RenderScalar::GetPrimarySpanTotals(r.primary_span_calls,
+                                       r.primary_span_frames);
+    r.over_budget_callbacks = t.overBudgetCallbacks;
+    r.max_consecutive_over_budget = t.maxConsecutiveOverBudget;
+    r.callback_p95_percent = t.callbackP95Percent;
+    r.callback_p99_percent = t.callbackP99Percent;
+    r.callback_p999_percent = t.callbackP999Percent;
+    *out = r;
+}
+
 bool Driver::StartAudio() {
     if (audioOutput && !audioOutput->IsRunning()) {
         LOG("StartAudio: starting audio stream...");
@@ -8130,6 +8200,46 @@ static SVMS_Result SVMS_CALL NativeGetTelemetry(
     return SVMS_RESULT_OK;
 }
 
+static SVMS_Result SVMS_CALL NativeSendRuntimeCommand(
+    SVMS_Session session, uint32_t command, uint32_t param,
+    char* result_text_utf8, uint32_t inout_text_bytes) {
+#if defined(SVMS_XP_COMPAT)
+    (void)session; (void)command; (void)param;
+    (void)result_text_utf8; (void)inout_text_bytes;
+    return SVMS_RESULT_NOT_INITIALIZED;
+#else
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (inout_text_bytes != 0u && !result_text_utf8)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    svms::RuntimeLinkCommandV2 cmd{};
+    cmd.type = command;
+    cmd.param = param;
+    char text[svms::kRuntimeLinkCommandTextCapacity]{};
+    const svms::RLResult rl = g_driver->ExecuteRuntimeCommand(cmd, text);
+    if (inout_text_bytes != 0u) {
+        strncpy_s(result_text_utf8, inout_text_bytes, text, _TRUNCATE);
+    }
+    switch (rl) {
+        case svms::RLResult::Ok: return SVMS_RESULT_OK;
+        case svms::RLResult::InvalidArgument:
+            return SVMS_RESULT_INVALID_ARGUMENT;
+        default: return SVMS_RESULT_INTERNAL_ERROR;
+    }
+#endif
+}
+
+static SVMS_Result SVMS_CALL NativeGetTelemetryV2(
+    SVMS_Session session, SVMS_TelemetryV2* telemetry) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!telemetry || telemetry->struct_size < sizeof(SVMS_TelemetryV2) ||
+        telemetry->struct_version != SVMS_STRUCT_VERSION_1)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    g_driver->CopyTelemetryCensus(telemetry);
+    return SVMS_RESULT_OK;
+}
+
 static SVMS_Result SVMS_CALL NativeGetRuntimeClock(
     uint64_t* qpcNow, uint64_t* qpcFrequency) {
     if (!qpcNow || !qpcFrequency) return SVMS_RESULT_INVALID_ARGUMENT;
@@ -8404,7 +8514,10 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_QUEUE_CONTROL | SVMS_CAP_SOUNDFONT_RELOAD |
         SVMS_CAP_MIXED_TIMESTAMP_BATCH |
         SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON |
-        SVMS_CAP_CANCELLABLE_SUBMISSION;
+        SVMS_CAP_CANCELLABLE_SUBMISSION | SVMS_CAP_TELEMETRY_V2;
+#if !defined(SVMS_XP_COMPAT)
+    table.capabilities |= SVMS_CAP_RUNTIME_COMMANDS;
+#endif
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;
     table.product_patch = svms::build::kProductPatch;
@@ -8432,6 +8545,8 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.patch_config_json = NativePatchConfigJson;
     table.get_config_path_utf8 = NativeGetConfigPathUtf8;
     table.cancel_session_submissions = NativeCancelSessionSubmissions;
+    table.send_runtime_command = NativeSendRuntimeCommand;
+    table.get_telemetry_v2 = NativeGetTelemetryV2;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

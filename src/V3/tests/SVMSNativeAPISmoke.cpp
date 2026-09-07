@@ -91,7 +91,17 @@ int main(int argc, char** argv) {
         !api.create_offline_session || !api.render_offline ||
         !api.get_offline_telemetry || !api.get_config_json ||
         !api.patch_config_json || !api.get_config_path_utf8 ||
-        !api.cancel_session_submissions) {
+        !api.cancel_session_submissions ||
+        (api.capabilities & SVMS_CAP_TELEMETRY_V2) != SVMS_CAP_TELEMETRY_V2 ||
+        !api.get_telemetry_v2 ||
+#if !defined(SVMS_XP_COMPAT)
+        /* The live-command surface rides the runtime-link handler, which
+         * does not exist in the XP build. */
+        (api.capabilities & SVMS_CAP_RUNTIME_COMMANDS) !=
+                SVMS_CAP_RUNTIME_COMMANDS ||
+        !api.send_runtime_command ||
+#endif
+        false) {
         std::puts("FAIL: ABI V1 table is invalid");
         FreeLibrary(runtime);
         return 1;
@@ -378,6 +388,43 @@ int main(int argc, char** argv) {
         return 1;
     }
     loadCustomSoundFontsList(nullptr);
+
+#if !defined(SVMS_XP_COMPAT)
+    // Runtime commands: a valid live command applies, an invalid argument
+    // is refused with the documented result, and a zero-length text buffer
+    // is accepted as "no text wanted".
+    char commandText[256]{};
+    if (api.send_runtime_command(session, SVMS_COMMAND_SET_STEAL_POLICY, 0u,
+                                 commandText, sizeof(commandText)) !=
+            SVMS_RESULT_OK ||
+        api.send_runtime_command(session, SVMS_COMMAND_SET_STEAL_POLICY, 99u,
+                                 commandText, sizeof(commandText)) !=
+            SVMS_RESULT_INVALID_ARGUMENT ||
+        api.send_runtime_command(session, SVMS_COMMAND_SET_STEAL_POLICY, 0u,
+                                 commandText, 0u) != SVMS_RESULT_OK ||
+        api.send_runtime_command(session, SVMS_COMMAND_SET_PER_KEY_VOICE_CAP,
+                                 0u, commandText, sizeof(commandText)) !=
+            SVMS_RESULT_OK) {
+        std::puts("FAIL: runtime command contract violated");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+#endif
+
+    // Telemetry V2: the complete census struct with live counters.
+    SVMS_TelemetryV2 telemetryV2{};
+    telemetryV2.struct_size = sizeof(telemetryV2);
+    telemetryV2.struct_version = SVMS_STRUCT_VERSION_1;
+    if (api.get_telemetry_v2(session, &telemetryV2) != SVMS_RESULT_OK ||
+        telemetryV2.struct_size != sizeof(telemetryV2) ||
+        telemetryV2.sample_rate != telemetry.sample_rate ||
+        telemetryV2.backend_kind != 0u) {
+        std::puts("FAIL: telemetry V2 census is invalid");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
 
     if (api.cancel_session_submissions(session) != SVMS_RESULT_OK ||
         api.send_short(session, 0x00643c90u) != SVMS_RESULT_CANCELLED ||
