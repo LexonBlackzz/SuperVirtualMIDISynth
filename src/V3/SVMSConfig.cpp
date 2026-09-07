@@ -283,6 +283,11 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"input_enabled", cfg.midiInputEnabled},
             {"input_device", WideToUtf8(cfg.midiInputDevice)}
         }},
+        {"api", {
+            {"backend", cfg.apiBackend},
+            {"backend_dll", WideToUtf8(cfg.apiBackendDll)},
+            {"winmm_device", cfg.apiWinMmDevice}
+        }},
         {"diagnostics", {
             {"enabled", cfg.diagnosticsEnabled},
             {"window", cfg.diagnosticsWindow},
@@ -688,6 +693,16 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadBool(*it, "debug_output", cfg.diagnosticsDebugOutput))
             AppendWarning(cfg.configWarning, "diagnostics.debug_output");
     }
+    if (auto it = root.find("api"); it != root.end() && it->is_object()) {
+        if (!ReadValue(*it, "backend", cfg.apiBackend, 0u, 3u))
+            AppendWarning(cfg.configWarning, "api.backend");
+        if (auto dll = it->find("backend_dll"); dll != it->end() &&
+            dll->is_string()) {
+            cfg.apiBackendDll = Utf8ToWide(dll->get<std::string>());
+        }
+        if (!ReadValue(*it, "winmm_device", cfg.apiWinMmDevice, 0u, 255u))
+            AppendWarning(cfg.configWarning, "api.winmm_device");
+    }
     if (auto it = root.find("midi"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "input_enabled", cfg.midiInputEnabled))
             AppendWarning(cfg.configWarning, "midi.input_enabled");
@@ -809,6 +824,8 @@ EngineConfig EngineConfig::Default() {
     cfg.blockTimingMode = false;  // opt-in: exact-frame dispatch by default
     cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default
     cfg.largePages = false;       // opt-in: standard aligned allocation by default
+    cfg.apiBackend = 0;           // SVMS engine in-process by default
+    cfg.apiWinMmDevice = 0;
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)
     // XP has no WASAPI status tooling and audio failures otherwise look like
@@ -942,6 +959,8 @@ bool EngineConfig::Validate() const {
             perKeyVoiceCap <= 256u &&
             threadAffinityMode <= 2u &&
             ghostBudget <= 65536u &&
+            apiBackend <= 3u &&
+            apiWinMmDevice <= 255u &&
             maxEventsPerBlock > 0;
 }
 

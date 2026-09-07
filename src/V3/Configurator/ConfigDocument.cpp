@@ -173,6 +173,8 @@ ConfigValues ConfigDocument::Defaults() {
     d.blockTiming = false;
     d.ghostBudget = 0u;
     d.largePages = false;
+    d.apiBackend = 0u;
+    d.apiWinMmDevice = 0u;
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
     d.correctnessMode = true;
@@ -229,6 +231,12 @@ void ConfigDocument::FromJson(const json& root) {
             if (lp->is_boolean())
                 working_.largePages = lp->get<bool>();
         }
+        ReadNum(*it, "backend", working_.apiBackend, 0u, 3u);
+        if (auto dll = it->find("backend_dll"); dll != it->end() &&
+            dll->is_string()) {
+            working_.apiBackendDll = Utf8ToWide(dll->get<std::string>());
+        }
+        ReadNum(*it, "winmm_device", working_.apiWinMmDevice, 0u, 255u);
 
         if (auto routes = it->find("soundfont_routes");
             routes != it->end() && routes->is_array()) {
@@ -413,6 +421,9 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["events"]["cc_collapse"] = working_.ccCollapse;
     root["synth"]["block_timing"] = working_.blockTiming;
     root["synth"]["large_pages"] = working_.largePages;
+    root["api"]["backend"] = working_.apiBackend;
+    root["api"]["backend_dll"] = WideToUtf8(working_.apiBackendDll);
+    root["api"]["winmm_device"] = working_.apiWinMmDevice;
     root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
@@ -613,6 +624,9 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.ccCollapse == b.ccCollapse
         && a.blockTiming == b.blockTiming
         && a.largePages == b.largePages
+        && a.apiBackend == b.apiBackend
+        && a.apiBackendDll == b.apiBackendDll
+        && a.apiWinMmDevice == b.apiWinMmDevice
         && a.maxEventsPerBlock == b.maxEventsPerBlock
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode

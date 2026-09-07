@@ -527,6 +527,60 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
             ImGui::EndCombo();
         }
         RestartCell();
+        ImGui::TableNextRow();
+        AudioLabelCell("Synth backend",
+                       "Where MIDI events are sent: the built-in SVMS engine "
+                       "(default), an external synth DLL speaking the SVMS-API "
+                       "backend interface, a KDMAPI-compatible synth DLL "
+                       "(OmniMIDI and friends), or a WinMM MIDI-out device "
+                       "such as the Microsoft GS Wavetable Synth. External "
+                       "backends own their audio output; the driver forwards "
+                       "events, sheds when behind (opt-in priority mode), and "
+                       "renders silence itself. Applies after restart.");
+        ImGui::TableNextColumn();
+        static const char* synthBackendItems[] = {
+            "SVMS engine (built-in)",
+            "SVMS-API DLL",
+            "KDMAPI DLL",
+            "WinMM MIDI-out device",
+        };
+        int synthBackend = static_cast<int>(w.apiBackend);
+        if (synthBackend < 0 || synthBackend > 3) synthBackend = 0;
+        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::BeginCombo("##synthbackend", synthBackendItems[synthBackend])) {
+            for (int i = 0; i < 4; ++i) {
+                const bool selected = i == synthBackend;
+                if (ImGui::Selectable(synthBackendItems[i], selected)) {
+                    w.apiBackend = static_cast<uint32_t>(i);
+                    doc.MarkDirty();
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (w.apiBackend == 1u || w.apiBackend == 2u) {
+            char dllBuf[512]{};
+            WideToUtf8Str(w.apiBackendDll).copy(dllBuf, sizeof(dllBuf) - 1u);
+            ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
+            if (ImGui::InputText("##backenddll", dllBuf, sizeof(dllBuf))) {
+                w.apiBackendDll = Utf8ToWideStr(dllBuf);
+                doc.MarkDirty();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled(w.apiBackend == 1u ? "synth DLL path"
+                                                   : "KDMAPI DLL path");
+        } else if (w.apiBackend == 3u) {
+            int device = static_cast<int>(w.apiWinMmDevice);
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::InputInt("##winmmdevice", &device)) {
+                device = (std::max)(0, (std::min)(255, device));
+                w.apiWinMmDevice = static_cast<uint32_t>(device);
+                doc.MarkDirty();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("MIDI-out device index");
+        }
+        RestartCell();
 
         ImGui::TableNextRow();
         AudioLabelCell("Phase rotation",

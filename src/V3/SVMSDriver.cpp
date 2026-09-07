@@ -43,6 +43,8 @@ constexpr uint32_t kNoteOnCollapseWindowMs = 20u;
 constexpr uint32_t kNoteOnCollapseDefaultThreshold = 32u;
 
 #include "SVMSEventScheduler.h"
+#define SVMSAPI_NO_CLIENT_BINDERS 1
+#include "SVMSAPI.h"
 #include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
 #include "SVMSSysEx.h"
@@ -2160,6 +2162,13 @@ public:
     bool LoadConfiguredSoundFont();
     bool StartAudio();
     void ResetAllVoices();
+    // External synth backend (SVMS-API / KDMAPI / WinMM): load once at init,
+    // forward admitted events from the render callback, tear down on
+    // shutdown. A failure falls back to the in-process SVMS engine.
+    bool InitializeExternalBackend();
+    void ShutdownExternalBackend();
+    void ExternalBackendReset();
+    void ForwardBlockToBackend(const RenderEvent* events, uint32_t count);
     bool IsInitialized() const;
     void CopyDebugInfo(DriverDebugInfo& out) const;
     void CopyVoiceStatistics(SnappyVoiceStatistics& out) const;
@@ -2323,6 +2332,27 @@ private:
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block sample offset.
     std::atomic<bool> blockTimingEnabled_{false};
+    // External synth backend state (api.backend). externalBackendKind_ is
+    // read by the audio thread every callback; the rest is only touched by
+    // init/shutdown before audio starts.
+    std::atomic<uint32_t> externalBackendKind_{0u};
+    SVMSBackendInterface externalBackend_{};
+    HMODULE externalBackendModule_ = nullptr;
+    bool externalBackendOpen_ = false;
+    struct KdmapiBackendFns {
+        int (WINAPI* initialize)(void);
+        int (WINAPI* terminate)(void);
+        void (WINAPI* reset)(void);
+        unsigned int (WINAPI* sendNoBuf)(unsigned int);
+        unsigned int (WINAPI* send)(unsigned int);
+    };
+    KdmapiBackendFns kdmapiBackend_{};
+    HMODULE kdmapiBackendModule_ = nullptr;
+    bool kdmapiBackendOpen_ = false;
+    HMIDIOUT winmmBackendOut_ = nullptr;
+    // System-winmm function pointers cached at backend load (kind 3).
+    unsigned int (WINAPI* systemWinmmShortMsg_)(HMIDIOUT, DWORD) = nullptr;
+    unsigned int (WINAPI* systemWinmmResetProc_)(HMIDIOUT) = nullptr;
     CcCollapseRecord ccCollapseRecords_[kChannelCount][128]{};
     uint64_t ccPageFillEpoch_ = 0u;   // compiler-thread owned
     uint64_t ccCollapsedCount_ = 0u;  // compiler-thread owned, census only
@@ -3787,6 +3817,11 @@ bool Driver::Initialize() {
     initialized = true;
     LOG("Initialize SUCCESS");
 
+    // External synth backend (api.backend): loaded once at init; on any
+    // failure the driver falls back to the in-process SVMS engine.
+    if (!InitializeExternalBackend())
+        LOG("External backend unavailable — using the in-process SVMS engine");
+
     // Start RuntimeLink V2 IPC so the V3 Configurator can connect.
     // Optional: failure must never break midiOutOpen/KDMAPI/audio.
 #if !defined(SVMS_XP_COMPAT)
@@ -3809,6 +3844,7 @@ bool Driver::Initialize() {
 }
 
 void Driver::Shutdown() {
+    ShutdownExternalBackend();
 #if !defined(SVMS_XP_COMPAT)
     g_rlDriver.Shutdown();
     liveRecorder_.Stop();
@@ -4328,6 +4364,257 @@ const LegacyDriverDebugInfo* Driver::GetLegacyDebugInfo() const {
     return &legacyDebugSnapshots_[index];
 }
 
+// ── External synth backend (SVMS-API / KDMAPI / WinMM) ───────────────
+// api.backend selects where admitted MIDI events go: the in-process SVMS
+// engine (0) or a loaded sink (1 SVMS-API DLL, 2 KDMAPI DLL, 3 WinMM
+// device). A sink owns its own audio output; the render callback forwards
+// events and outputs silence. The load happens once at driver init — a
+// failure logs and falls back to the engine, never to silence.
+
+bool Driver::InitializeExternalBackend() {
+    const uint32_t kind = engineConfig_.apiBackend;
+    if (kind == 0u) return true;
+    if (kind == 1u) {
+        // SVMS-API backend: one exported table getter, full table required.
+        if (engineConfig_.apiBackendDll.empty()) {
+            LOG("Backend 1 (SVMS-API) requested but api.backend_dll is empty");
+            return false;
+        }
+        const HMODULE module =
+            LoadLibraryW(engineConfig_.apiBackendDll.c_str());
+        if (!module) {
+            LOG("FAILED: LoadLibrary(backend dll) error=%lu", GetLastError());
+            return false;
+        }
+        const auto getInterface =
+            reinterpret_cast<SVMSBackendGetInterfaceFn>(GetProcAddress(
+                module, SVMSBACKEND_GETINTERFACE_NAME));
+        if (!getInterface) {
+            FreeLibrary(module);
+            LOG("FAILED: backend dll lacks %s", SVMSBACKEND_GETINTERFACE_NAME);
+            return false;
+        }
+        SVMSBackendInterface table{};
+        table.struct_size = sizeof(table);
+        if (getInterface(&table) != 0u ||
+            table.struct_size < sizeof(table) ||
+            table.api_version != SVMSBACKEND_API_VERSION ||
+            !table.initialize || !table.shutdown || !table.reset ||
+            !table.send_short) {
+            FreeLibrary(module);
+            LOG("FAILED: backend interface invalid");
+            return false;
+        }
+        SVMSBackendOpenParams params{};
+        params.struct_size = sizeof(params);
+        params.sample_rate = sampleRate;
+        params.buffer_frames = bufferFrames;
+        params.voices_hint = engineConfig_.maxVoices;
+        if (table.initialize(table.user, &params) != 0) {
+            FreeLibrary(module);
+            LOG("FAILED: backend initialize refused");
+            return false;
+        }
+        externalBackend_ = table;
+        externalBackendModule_ = module;
+        externalBackendOpen_ = true;
+        externalBackendKind_.store(1u, std::memory_order_release);
+        LOG("External backend: SVMS-API dll active");
+        return true;
+    }
+    if (kind == 2u) {
+        // KDMAPI backend: bind the standard OmniMIDI-compatible export set.
+        if (engineConfig_.apiBackendDll.empty()) {
+            LOG("Backend 2 (KDMAPI) requested but api.backend_dll is empty");
+            return false;
+        }
+        const HMODULE module =
+            LoadLibraryW(engineConfig_.apiBackendDll.c_str());
+        if (!module) {
+            LOG("FAILED: LoadLibrary(kdmapi dll) error=%lu", GetLastError());
+            return false;
+        }
+        using KdInitFn = int (WINAPI*)(void);
+        using KdTermFn = int (WINAPI*)(void);
+        using KdResetFn = void (WINAPI*)(void);
+        using KdSendFn = unsigned int (WINAPI*)(unsigned int);
+        kdmapiBackend_.initialize = reinterpret_cast<KdInitFn>(
+            GetProcAddress(module, "InitializeKDMAPIStream"));
+        kdmapiBackend_.terminate = reinterpret_cast<KdTermFn>(
+            GetProcAddress(module, "TerminateKDMAPIStream"));
+        kdmapiBackend_.reset = reinterpret_cast<KdResetFn>(
+            GetProcAddress(module, "ResetKDMAPIStream"));
+        kdmapiBackend_.sendNoBuf = reinterpret_cast<KdSendFn>(
+            GetProcAddress(module, "SendDirectDataNoBuf"));
+        kdmapiBackend_.send = reinterpret_cast<KdSendFn>(
+            GetProcAddress(module, "SendDirectData"));
+        if (!kdmapiBackend_.initialize || !kdmapiBackend_.terminate ||
+            !kdmapiBackend_.reset ||
+            (!kdmapiBackend_.sendNoBuf && !kdmapiBackend_.send)) {
+            FreeLibrary(module);
+            LOG("FAILED: kdmapi dll lacks the core KDMAPI exports");
+            return false;
+        }
+        if (kdmapiBackend_.initialize() == 0) {
+            FreeLibrary(module);
+            LOG("FAILED: kdmapi InitializeKDMAPIStream refused");
+            return false;
+        }
+        kdmapiBackendModule_ = module;
+        kdmapiBackendOpen_ = true;
+        externalBackendKind_.store(2u, std::memory_order_release);
+        LOG("External backend: KDMAPI dll active");
+        return true;
+    }
+    if (kind == 3u) {
+        // WinMM MIDI-out device: resolve through the genuine system winmm
+        // (absolute path) — our own shim exports these names when built as
+        // winmm.dll, so the loader must not hand this proxy back to us.
+        using WmNumProc = UINT(WINAPI*)(void);
+        using WmOpenProc = MMRESULT(WINAPI*)(LPHMIDIOUT, UINT, DWORD_PTR,
+                                             DWORD_PTR, DWORD);
+        using WmShortProc = MMRESULT(WINAPI*)(HMIDIOUT, DWORD);
+        const auto getNum = reinterpret_cast<WmNumProc>(
+            GetSystemWinmmProc("midiOutGetNumDevs"));
+        const auto open = reinterpret_cast<WmOpenProc>(
+            GetSystemWinmmProc("midiOutOpen"));
+        const auto shortMsg = reinterpret_cast<WmShortProc>(
+            GetSystemWinmmProc("midiOutShortMsg"));
+        if (!getNum || !open || !shortMsg) {
+            LOG("FAILED: system winmm lacks midiOut exports");
+            return false;
+        }
+        if (engineConfig_.apiWinMmDevice >= getNum()) {
+            LOG("FAILED: api.winmm_device %u out of range (%u devices)",
+                engineConfig_.apiWinMmDevice, getNum());
+            return false;
+        }
+        HMIDIOUT out = nullptr;
+        if (open(&out, engineConfig_.apiWinMmDevice, 0, 0,
+                 CALLBACK_NULL) != MMSYSERR_NOERROR) {
+            LOG("FAILED: midiOutOpen device %u",
+                engineConfig_.apiWinMmDevice);
+            return false;
+        }
+        winmmBackendOut_ = out;
+        systemWinmmShortMsg_ = shortMsg;
+        externalBackendKind_.store(3u, std::memory_order_release);
+        LOG("External backend: WinMM device %u active",
+            engineConfig_.apiWinMmDevice);
+        return true;
+    }
+    return false;
+}
+
+void Driver::ShutdownExternalBackend() {
+    const uint32_t kind =
+        externalBackendKind_.exchange(0u, std::memory_order_acq_rel);
+    if (kind == 1u && externalBackendOpen_) {
+        externalBackend_.shutdown(externalBackend_.user);
+        externalBackendOpen_ = false;
+    } else if (kind == 2u && kdmapiBackendOpen_) {
+        kdmapiBackend_.terminate();
+        kdmapiBackendOpen_ = false;
+    } else if (kind == 3u && winmmBackendOut_) {
+        using WmResetProc = MMRESULT(WINAPI*)(HMIDIOUT);
+        using WmCloseProc = MMRESULT(WINAPI*)(HMIDIOUT);
+        if (const auto reset = reinterpret_cast<WmResetProc>(
+                GetSystemWinmmProc("midiOutReset")))
+            reset(winmmBackendOut_);
+        if (const auto close = reinterpret_cast<WmCloseProc>(
+                GetSystemWinmmProc("midiOutClose")))
+            close(winmmBackendOut_);
+        winmmBackendOut_ = nullptr;
+        systemWinmmShortMsg_ = nullptr;
+    }
+    if (kind == 1u && externalBackendModule_) {
+        FreeLibrary(externalBackendModule_);
+        externalBackendModule_ = nullptr;
+    }
+    if (kind == 2u && kdmapiBackendModule_) {
+        FreeLibrary(kdmapiBackendModule_);
+        kdmapiBackendModule_ = nullptr;
+    }
+}
+
+void Driver::ExternalBackendReset() {
+    const uint32_t kind = externalBackendKind_.load(std::memory_order_relaxed);
+    if (kind == 1u && externalBackendOpen_) {
+        externalBackend_.reset(externalBackend_.user);
+    } else if (kind == 2u && kdmapiBackendOpen_) {
+        kdmapiBackend_.reset();
+    } else if (kind == 3u && winmmBackendOut_ && systemWinmmResetProc_) {
+        systemWinmmResetProc_(winmmBackendOut_);
+    }
+}
+
+// Translate one compiled render event back to its packed short MIDI message.
+// Internal engine-level events (master volume/tune, rhythm part) have no
+// per-message mapping in backend ABI v1 and are dropped; the Reset event
+// becomes the backend's hard reset.
+static bool TranslateRenderEventToShortMsg(const RenderEvent& ev,
+                                           uint32_t& out) {
+    const uint32_t ch = ev.channel & 0x0fu;
+    switch (ev.type) {
+        case RenderEventType::NoteOn:
+            out = 0x90u | ch | (static_cast<uint32_t>(ev.data1) << 8u) |
+                  (static_cast<uint32_t>(ev.data2) << 16u);
+            return ev.data2 != 0u;
+        case RenderEventType::NoteOff:
+        case RenderEventType::StaleNoteOffBatch:
+            out = 0x80u | ch | (static_cast<uint32_t>(ev.data1) << 8u);
+            return true;
+        case RenderEventType::ControlChange:
+            out = 0xB0u | ch | (static_cast<uint32_t>(ev.data1) << 8u) |
+                  (static_cast<uint32_t>(ev.data2) << 16u);
+            return true;
+        case RenderEventType::ProgramChange:
+            out = 0xC0u | ch | (static_cast<uint32_t>(ev.data1) << 8u);
+            return true;
+        case RenderEventType::PitchBend:
+            out = 0xE0u | ch | (static_cast<uint32_t>(ev.data1) << 8u) |
+                  (static_cast<uint32_t>(ev.data2) << 16u);
+            return true;
+        case RenderEventType::ChannelPressure:
+            out = 0xD0u | ch | (static_cast<uint32_t>(ev.data1) << 8u);
+            return true;
+        case RenderEventType::AllNotesOff:
+            out = 0xB0u | ch | (123u << 8u);
+            return true;
+        case RenderEventType::AllSoundOff:
+            out = 0xB0u | ch | (120u << 8u);
+            return true;
+        case RenderEventType::Reset:
+            out = 0u;
+            return false;  // handled by the caller as a backend reset
+        default:
+            return false;  // MasterVolume/RhythmPart/FineTune/Transpose: v2
+    }
+}
+
+void Driver::ForwardBlockToBackend(const RenderEvent* events,
+                                   uint32_t count) {
+    const uint32_t kind = externalBackendKind_.load(std::memory_order_relaxed);
+    if (kind == 0u) return;
+    for (uint32_t i = 0u; i < count; ++i) {
+        uint32_t msg = 0u;
+        if (!TranslateRenderEventToShortMsg(events[i], msg)) {
+            if (events[i].type == RenderEventType::Reset)
+                ExternalBackendReset();
+            continue;
+        }
+        if (kind == 1u) {
+            externalBackend_.send_short(externalBackend_.user, msg);
+        } else if (kind == 2u) {
+            if (kdmapiBackend_.sendNoBuf)
+                kdmapiBackend_.sendNoBuf(msg);
+            else if (kdmapiBackend_.send)
+                kdmapiBackend_.send(msg);
+        } else if (kind == 3u && winmmBackendOut_ && systemWinmmShortMsg_) {
+            systemWinmmShortMsg_(winmmBackendOut_, msg);
+        }
+    }
+}
 bool Driver::StartAudio() {
     if (audioOutput && !audioOutput->IsRunning()) {
         LOG("StartAudio: starting audio stream...");
@@ -5843,10 +6130,19 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // voice launch for its detailed SF2 probe instead of rewriting ~20 fields
     // for every dense note-on; lifetime counters remain exact below.
     self->captureSf2Detail_ = self->diagnosticsEnabled_;
-    render->RenderBlock(*vm, *cc, sd, self->sampleDataFrames,
-                        leftBuf, rightBuf, numFrames, *snap,
-                        evtBuf, evCount, self->correctnessMode_,
-                        static_cast<uint64_t>(self->virtualRenderSample_));
+    if (self->externalBackendKind_.load(std::memory_order_relaxed) != 0u) {
+        // External backend routing: forward the block's admitted events to
+        // the loaded sink in ingress order and render silence — the sink
+        // owns audio output. The in-process voice machinery stays idle.
+        self->ForwardBlockToBackend(evtBuf, evCount);
+        std::memset(leftBuf, 0, sizeof(float) * numFrames);
+        std::memset(rightBuf, 0, sizeof(float) * numFrames);
+    } else {
+        render->RenderBlock(*vm, *cc, sd, self->sampleDataFrames,
+                            leftBuf, rightBuf, numFrames, *snap,
+                            evtBuf, evCount, self->correctnessMode_,
+                            static_cast<uint64_t>(self->virtualRenderSample_));
+    }
     const uint64_t profileRenderEnd = profileCallback ? __rdtsc() : 0u;
 
     // ── Advance virtual render clock for the next callback ──────────

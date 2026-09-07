@@ -102,6 +102,14 @@ struct EngineConfig {
     // shadow). Applied at engine init; silently falls back when the
     // privilege is not held. Off by default.
     bool largePages;
+    // Synth backend routed by the event sink: 0 = SVMS engine (default,
+    // in-process), 1 = external SVMS-API DLL, 2 = external KDMAPI DLL,
+    // 3 = WinMM MIDI-out device. External backends own their own audio
+    // output; the driver forwards events and renders silence. Applied at
+    // driver init (restart to change).
+    uint32_t apiBackend;
+    std::wstring apiBackendDll;   // backend DLL path (kinds 1 and 2)
+    uint32_t apiWinMmDevice;      // WinMM MIDI-out device index (kind 3)
     EventOverflowMode eventOverflowMode;
     uint32_t highPriorityVelocity;
     uint32_t shedStartPercent;
