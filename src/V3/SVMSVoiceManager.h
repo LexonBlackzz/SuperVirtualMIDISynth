@@ -20,6 +20,8 @@
 #if defined(_MSC_VER) && defined(_M_X64)
 #include <intrin.h>
 #define SVMS_VM_HAS_PREFETCH 1
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <x86intrin.h>
 #endif
 
 #if defined(_MSC_VER)
@@ -3031,7 +3033,9 @@ inline VoiceHandle VoiceManager::SelectScanVictim() {
         : stealScanCursor_ % capacity;
     float bestLevel = 3.402823466e+38F;
     uint32_t bestIdx = UINT32_MAX;
+#if defined(_MSC_VER) || defined(__AVX2__)
     const __m256 signMask = _mm256_set1_ps(-0.0f);
+#endif
     for (uint32_t pass = 0u; pass < 2u && bestIdx == UINT32_MAX; ++pass) {
         const uint32_t probes = pass == 0u
             ? (capacity > kStealScanWindow ? kStealScanWindow : 0u)
@@ -3051,12 +3055,19 @@ inline VoiceHandle VoiceManager::SelectScanVictim() {
                         ? (1u << l) : 0u;
                 }
                 if (valid != 0u) {
+#if defined(_MSC_VER) || defined(__AVX2__)
                     const __m256 level = _mm256_mul_ps(
                         _mm256_andnot_ps(
                             signMask, _mm256_loadu_ps(v.currentGain + idx0)),
                         _mm256_loadu_ps(v.stealOutputGain + idx0));
                     float lv[8];
                     _mm256_storeu_ps(lv, level);
+#else
+                    float lv[8];
+                    for (uint32_t l = 0u; l < 8u; ++l)
+                        lv[l] = std::fabs(v.currentGain[idx0 + l]) *
+                                v.stealOutputGain[idx0 + l];
+#endif
                     for (uint32_t l = 0u; l < 8u; ++l) {
                         if ((valid & (1u << l)) != 0u && lv[l] < bestLevel) {
                             bestLevel = lv[l];
