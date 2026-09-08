@@ -8,6 +8,7 @@ namespace {
 
 uint32_t RenderSustainedLoopSpan(
     VoiceSoA& v, uint32_t idx, const int16_t* sampleData,
+    const int16_t* hilbertData,
     uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount) {
     const uint32_t sampleStart = v.sampleStart[idx];
@@ -28,6 +29,10 @@ uint32_t RenderSustainedLoopSpan(
     const float gainR = v.renderGainR[idx];
     const float loopLength = relLoopEF - relLoopSF;
     const int16_t* region = sampleData + sampleStart;
+    // Only dereferenced by form-2 rotation states, which exist only while a
+    // pair-bearing bundle is active; allpass states ignore it.
+    const int16_t* hilbertRegion = hilbertData ? hilbertData + sampleStart
+                                               : nullptr;
     float* outL = outputLeft + frameStart;
     float* outR = outputRight + frameStart;
     VoiceRotationState* const rot = v.rot;  // null in Coherent mode
@@ -54,7 +59,10 @@ uint32_t RenderSustainedLoopSpan(
                     const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
                     float sample =
                         first + (static_cast<float>(region[baseOffset + 1u]) * (1.0f / 32768.0f) - first) * fraction;
-                    if (rot) sample = RotateVoiceSample(rot[idx], sample);
+                    if (rot)
+                        sample = RotateVoiceSample(rot[idx], sample,
+                                                   hilbertRegion, baseOffset,
+                                                   baseOffset + 1u, fraction);
                     outL[n] += sample * gainL;
                     outR[n] += sample * gainR;
                     phase += phaseStep;
@@ -67,7 +75,9 @@ uint32_t RenderSustainedLoopSpan(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[relLoopS]) * (1.0f / 32768.0f) - first) * fraction;
-            if (rot) sample = RotateVoiceSample(rot[idx], sample);
+            if (rot)
+                sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
+                                           baseOffset, relLoopS, fraction);
             outL[n] += sample * gainL;
             outR[n] += sample * gainR;
             ++n;
@@ -85,7 +95,9 @@ uint32_t RenderSustainedLoopSpan(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[nextOffset]) * (1.0f / 32768.0f) - first) * fraction;
-            if (rot) sample = RotateVoiceSample(rot[idx], sample);
+            if (rot)
+                sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
+                                           baseOffset, nextOffset, fraction);
             outL[n] += sample * gainL;
             outR[n] += sample * gainR;
             phase += phaseStep;
@@ -103,6 +115,7 @@ uint32_t RenderSustainedLoopSpan(
 
 uint32_t RenderSustainedOneShotSpan(
     VoiceSoA& v, uint32_t idx, const int16_t* sampleData,
+    const int16_t* hilbertData,
     uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount) {
     const uint32_t sampleStart = v.sampleStart[idx];
@@ -116,6 +129,8 @@ uint32_t RenderSustainedOneShotSpan(
     const float gainL = v.renderGainL[idx];
     const float gainR = v.renderGainR[idx];
     const int16_t* region = sampleData + sampleStart;
+    const int16_t* hilbertRegion = hilbertData ? hilbertData + sampleStart
+                                               : nullptr;
     float* outL = outputLeft + frameStart;
     float* outR = outputRight + frameStart;
     uint32_t retiredAt = UINT32_MAX;
@@ -130,7 +145,9 @@ uint32_t RenderSustainedOneShotSpan(
         const float fraction = phase - static_cast<float>(baseOffset);
         const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[baseOffset + 1u]) * (1.0f / 32768.0f) - first) * fraction;
-        if (rot) sample = RotateVoiceSample(rot[idx], sample);
+        if (rot)
+            sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
+                                       baseOffset, baseOffset + 1u, fraction);
         outL[n] += sample * gainL;
         outR[n] += sample * gainR;
         phase += phaseStep;
@@ -142,7 +159,8 @@ uint32_t RenderSustainedOneShotSpan(
 template <uint32_t FrameCount>
 void RenderSustainedLoopShortBatchFixed(
     VoiceSoA& v, const uint32_t* handles, uint32_t handleCount,
-    const int16_t* sampleData, float* outputLeft, float* outputRight,
+    const int16_t* sampleData, const int16_t* hilbertData,
+    float* outputLeft, float* outputRight,
     uint32_t frameStart) {
     float sumsLeft[FrameCount]{};
     float sumsRight[FrameCount]{};
@@ -159,6 +177,8 @@ void RenderSustainedLoopShortBatchFixed(
         const float gainLeft = v.renderGainL[idx];
         const float gainRight = v.renderGainR[idx];
         const int16_t* region = sampleData + v.sampleStart[idx];
+        const int16_t* hilbertRegion = hilbertData
+            ? hilbertData + v.sampleStart[idx] : nullptr;
         VoiceRotationState* const rot = v.rot;  // null in Coherent mode
 
         for (uint32_t frame = 0; frame < FrameCount; ++frame) {
@@ -168,7 +188,9 @@ void RenderSustainedLoopShortBatchFixed(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[nextOffset]) * (1.0f / 32768.0f) - first) * fraction;
-            if (rot) sample = RotateVoiceSample(rot[idx], sample);
+            if (rot)
+                sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
+                                           baseOffset, nextOffset, fraction);
             sumsLeft[frame] += sample * gainLeft;
             sumsRight[frame] += sample * gainRight;
             phase += phaseStep;
@@ -190,28 +212,29 @@ void RenderSustainedLoopShortBatchFixed(
 
 void RenderSustainedLoopShortBatch(
     VoiceSoA& v, const uint32_t* handles, uint32_t handleCount,
-    const int16_t* sampleData, float* outputLeft, float* outputRight,
+    const int16_t* sampleData, const int16_t* hilbertData,
+    float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount) {
     switch (frameCount) {
         case 1u:
             RenderSustainedLoopShortBatchFixed<1u>(
-                v, handles, handleCount, sampleData, outputLeft, outputRight,
-                frameStart);
+                v, handles, handleCount, sampleData, hilbertData,
+                outputLeft, outputRight, frameStart);
             break;
         case 2u:
             RenderSustainedLoopShortBatchFixed<2u>(
-                v, handles, handleCount, sampleData, outputLeft, outputRight,
-                frameStart);
+                v, handles, handleCount, sampleData, hilbertData,
+                outputLeft, outputRight, frameStart);
             break;
         case 3u:
             RenderSustainedLoopShortBatchFixed<3u>(
-                v, handles, handleCount, sampleData, outputLeft, outputRight,
-                frameStart);
+                v, handles, handleCount, sampleData, hilbertData,
+                outputLeft, outputRight, frameStart);
             break;
         case 4u:
             RenderSustainedLoopShortBatchFixed<4u>(
-                v, handles, handleCount, sampleData, outputLeft, outputRight,
-                frameStart);
+                v, handles, handleCount, sampleData, hilbertData,
+                outputLeft, outputRight, frameStart);
             break;
         default:
             break;
@@ -225,6 +248,7 @@ bool RenderSustainedLoopClassKernel(const RenderSpanContext& context,
     if (context.frameCount <= 4u) {
         RenderSustainedLoopShortBatch(
             voices, handles, handleCount, context.sampleData,
+            context.hilbertData,
             context.outputLeft, context.outputRight, context.frameStart,
             context.frameCount);
         return true;
@@ -232,6 +256,7 @@ bool RenderSustainedLoopClassKernel(const RenderSpanContext& context,
     for (uint32_t position = 0; position < handleCount; ++position) {
         RenderSustainedLoopSpan(
             voices, handles[position], context.sampleData,
+            context.hilbertData,
             context.sampleDataFrames, context.outputLeft, context.outputRight,
             context.frameStart, context.frameCount);
     }
@@ -278,7 +303,12 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
                 const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]) * (1.0f / 32768.0f);
                 float sample = first +
                     (static_cast<float>(c.sampleData[sampleStart + nextRel]) * (1.0f / 32768.0f) - first) * fraction;
-                if (rot) sample = RotateVoiceSample(rot[idx], sample);
+                if (rot)
+                    sample = RotateVoiceSample(rot[idx], sample,
+                                               c.hilbertData,
+                                               sampleStart + baseOffset,
+                                               sampleStart + nextRel,
+                                               fraction);
                 gain += attackStep;
                 if (gain > targetGain) gain = targetGain;
                 const float scaled = sample * gain;
@@ -307,7 +337,12 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
                 const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]) * (1.0f / 32768.0f);
                 float sample = first +
                     (static_cast<float>(c.sampleData[sampleStart + nextRel]) * (1.0f / 32768.0f) - first) * fraction;
-                if (rot) sample = RotateVoiceSample(rot[idx], sample);
+                if (rot)
+                    sample = RotateVoiceSample(rot[idx], sample,
+                                               c.hilbertData,
+                                               sampleStart + baseOffset,
+                                               sampleStart + nextRel,
+                                               fraction);
                 gain *= decaySlope;
                 if (gain < sustainLevel) gain = sustainLevel;
                 const float scaled = sample * gain;
@@ -339,7 +374,10 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
             const float first = static_cast<float>(c.sampleData[sampleStart + baseOffset]) * (1.0f / 32768.0f);
             float sample = first +
                 (static_cast<float>(c.sampleData[sampleStart + nextRel]) * (1.0f / 32768.0f) - first) * fraction;
-            if (rot) sample = RotateVoiceSample(rot[idx], sample);
+            if (rot)
+                sample = RotateVoiceSample(rot[idx], sample, c.hilbertData,
+                                           sampleStart + baseOffset,
+                                           sampleStart + nextRel, fraction);
 
             if (stage == 1u) {
                 if (attackRemaining > 0u) {
@@ -405,30 +443,33 @@ const RenderKernelSet& GetScalarRenderKernelSet() {
 
 uint32_t ScalarRenderSustainedLoop(
     VoiceSoA& voices, uint32_t handle, const int16_t* sampleData,
+    const int16_t* hilbertData,
     uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount) {
     return RenderSustainedLoopSpan(
-        voices, handle, sampleData, sampleDataFrames, outputLeft, outputRight,
-        frameStart, frameCount);
+        voices, handle, sampleData, hilbertData, sampleDataFrames,
+        outputLeft, outputRight, frameStart, frameCount);
 }
 
 uint32_t ScalarRenderSustainedOneShot(
     VoiceSoA& voices, uint32_t handle, const int16_t* sampleData,
+    const int16_t* hilbertData,
     uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount) {
     return RenderSustainedOneShotSpan(
-        voices, handle, sampleData, sampleDataFrames, outputLeft, outputRight,
-        frameStart, frameCount);
+        voices, handle, sampleData, hilbertData, sampleDataFrames,
+        outputLeft, outputRight, frameStart, frameCount);
 }
 
 void ScalarRenderSustainedLoopShortBatch(
     VoiceSoA& voices, const uint32_t* handles, uint32_t handleCount,
-    const int16_t* sampleData, uint32_t sampleDataFrames, float* outputLeft,
+    const int16_t* sampleData, const int16_t* hilbertData,
+    uint32_t sampleDataFrames, float* outputLeft,
     float* outputRight, uint32_t frameStart, uint32_t frameCount) {
     (void)sampleDataFrames;
     RenderSustainedLoopShortBatch(
-        voices, handles, handleCount, sampleData, outputLeft,
-        outputRight, frameStart, frameCount);
+        voices, handles, handleCount, sampleData, hilbertData,
+        outputLeft, outputRight, frameStart, frameCount);
 }
 
 bool ScalarRenderTransientLoopClass(const RenderSpanContext& c,

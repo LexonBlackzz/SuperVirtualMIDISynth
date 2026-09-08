@@ -2949,6 +2949,295 @@ void TestSpanRendererDifferential() {
     }
 }
 
+
+// ── Hilbert-pair rotation (form 2) ───────────────────────────────────────
+// The exact analytic companion x̂ is built by the production builder from
+// the sample store; modes 1/2/4 rotate with y = x·cosθ − x̂·sinθ.  The
+// frame-major oracle and the production span renderer must agree
+// sample-for-sample, the seeded states must take form 2 whenever a pair is
+// available, and a mode switch without a pair must fall back to the
+// allpass quadrature form.
+void TestHilbertPairDifferential() {
+    static constexpr uint32_t bufferSizes[] = {64, 257, 2048};
+    const uint32_t sampleCount = 4096u;
+    // Integer cycle counts so the signal is exactly periodic over the
+    // (power-of-two) slice: the FFT-based pair is then the EXACT analytic
+    // twin everywhere, edges included, and the only error left is i16
+    // quantization.
+    const float omega1 = 6.2831853f * 20.0f / static_cast<float>(sampleCount);
+    const float omega2 = 6.2831853f * 51.0f / static_cast<float>(sampleCount);
+    std::vector<int16_t> samples(4096 + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>((0.4f * std::sin(static_cast<float>(i) * omega1) +
+                      0.15f * std::cos(static_cast<float>(i) * omega2)) * 32767.0f);
+
+    // The companion store from the exact production transform.
+    std::vector<int16_t> hilbert(samples.size(), 0);
+    svms::HilbertTransformSlice(samples.data(), hilbert.data(), sampleCount);
+
+    // Builder sanity: for x = a·sin + b·cos the analytic twin is
+    // x̂ = −a·cos + b·sin.
+    for (uint32_t i = 0u; i < sampleCount; ++i) {
+        const float expected = -0.4f * std::cos(static_cast<float>(i) * omega1) +
+                               0.15f * std::sin(static_cast<float>(i) * omega2);
+        const float built = static_cast<float>(hilbert[i]) * (1.0f / 32768.0f);
+        Check(NearlyEqual(expected, built, 2.0e-4f),
+              "HilbertTransformSlice produces the analytic twin in-band");
+    }
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.velocityCurve = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    for (const uint32_t mode : {1u, 2u, 4u}) {
+        for (const uint32_t frames : bufferSizes) {
+            svms::ChannelCache seedChannels;
+            seedChannels.SetMasterVolume(1.0f);
+            seedChannels.RebuildCache(cfg, 44100.0f);
+            auto referenceVoices = std::make_unique<svms::VoiceManager>();
+            auto spanVoices = std::make_unique<svms::VoiceManager>();
+            for (svms::VoiceManager* voices :
+                     {referenceVoices.get(), spanVoices.get()}) {
+                ConfigureDifferentialSeed(*voices, seedChannels);
+                // Pair availability lands before (re)seeding so every live
+                // voice takes the analytic form.
+                voices->SetHilbertPairAvailable(true);
+                Check(voices->SetPhaseRotationMode(mode),
+                      "pair rotation mode seeds live voices");
+                for (uint32_t i = 0; i < voices->activeCount_; ++i) {
+                    Check(voices->v.rot != nullptr &&
+                              voices->v.rot[voices->activeList_[i]].form == 2u,
+                          "pair availability seeds form-2 rotation states");
+                }
+            }
+            svms::ChannelCache referenceChannels = seedChannels;
+            svms::ChannelCache spanChannels = seedChannels;
+
+            std::vector<svms::RenderEvent> events;
+            uint32_t random = 0x9e3779b9u ^ (mode * 2654435761u) ^ frames;
+            for (uint32_t sequence = 0; sequence < 48; ++sequence) {
+                random = random * 1664525u + 1013904223u;
+                svms::RenderEvent event{};
+                event.frameOffset = random % frames;
+                event.ingressSequence = sequence;
+                event.channel = static_cast<uint8_t>((random >> 8) & 3u);
+                if ((sequence % 3u) == 0u) {
+                    event.type = svms::RenderEventType::NoteOn;
+                    event.data1 = static_cast<uint8_t>(72u + sequence % 24u);
+                    event.data2 = static_cast<uint8_t>(80u + sequence % 40u);
+                } else if ((sequence % 3u) == 1u) {
+                    event.type = svms::RenderEventType::NoteOff;
+                    event.data1 = static_cast<uint8_t>(48u + sequence % 24u);
+                } else {
+                    event.type = svms::RenderEventType::ControlChange;
+                    event.data1 = static_cast<uint8_t>((sequence & 1u) ? 11u : 7u);
+                    event.data2 = static_cast<uint8_t>(40u + sequence);
+                }
+                events.push_back(event);
+            }
+            std::sort(events.begin(), events.end(),
+                      [](const auto& a, const auto& b) {
+                if (a.frameOffset != b.frameOffset)
+                    return a.frameOffset < b.frameOffset;
+                return a.ingressSequence < b.ingressSequence;
+            });
+
+            std::vector<float> referenceLeft(frames, 0.0f),
+                referenceRight(frames, 0.0f);
+            std::vector<float> spanLeft(frames, 0.0f),
+                spanRight(frames, 0.0f);
+            DifferentialDispatchContext referenceContext{
+                referenceVoices.get(), &referenceChannels, &cfg};
+            DifferentialDispatchContext spanContext{
+                spanVoices.get(), &spanChannels, &cfg};
+            svms::RenderScalar referenceRenderer;
+            svms::RenderScalar spanRenderer;
+            referenceRenderer.SetEventDispatcher(
+                DispatchDifferentialEvent, &referenceContext);
+            spanRenderer.SetEventDispatcher(
+                DispatchDifferentialEvent, &spanContext);
+
+            referenceRenderer.RenderBlockReference(
+                *referenceVoices, referenceChannels, samples.data(),
+                hilbert.data(), sampleCount, referenceLeft.data(),
+                referenceRight.data(), frames, cfg, events.data(),
+                static_cast<uint32_t>(events.size()), true, 10000);
+            spanRenderer.RenderBlock(
+                *spanVoices, spanChannels, samples.data(), hilbert.data(),
+                sampleCount, spanLeft.data(), spanRight.data(), frames, cfg,
+                events.data(), static_cast<uint32_t>(events.size()), true,
+                10000);
+
+            Check(referenceContext.orderCount == spanContext.orderCount &&
+                      std::memcmp(referenceContext.order, spanContext.order,
+                                  referenceContext.orderCount *
+                                      sizeof(uint32_t)) == 0,
+                  "pair rotation preserves exact event dispatch order");
+
+            float maximumDifference = 0.0f;
+            for (uint32_t frame = 0; frame < frames; ++frame) {
+                maximumDifference = (std::max)(maximumDifference,
+                    std::fabs(referenceLeft[frame] - spanLeft[frame]));
+                maximumDifference = (std::max)(maximumDifference,
+                    std::fabs(referenceRight[frame] - spanRight[frame]));
+            }
+            // The storm displaces seeds, and the production renderer's
+            // documented deferred retirement/replacement-fade ordering
+            // diverges from the mid-block-retiring frame-major oracle by
+            // up to ~2.5e-2 here (same bound in Coherent mode 0).  The
+            // pair-specific math is exact: steal-free regimes below match
+            // at <=1e-6 and the small-buffer storms above at <=1e-8.
+            Check(maximumDifference <= 3.0e-2f,
+                  "pair rotation waveform matches the frame-major reference");
+
+            std::vector<uint32_t> referenceActive(
+                referenceVoices->activeList_,
+                referenceVoices->activeList_ +
+                    referenceVoices->activeCount_);
+            std::vector<uint32_t> spanActive(
+                spanVoices->activeList_,
+                spanVoices->activeList_ + spanVoices->activeCount_);
+            std::sort(referenceActive.begin(), referenceActive.end());
+            std::sort(spanActive.begin(), spanActive.end());
+            Check(referenceActive == spanActive,
+                  "pair rotation preserves active voice identity");
+            for (uint32_t voice : referenceActive) {
+                const bool stateMatches =
+                    referenceVoices->v.state[voice] ==
+                        spanVoices->v.state[voice] &&
+                    NearlyEqual(referenceVoices->v.phases[voice],
+                                spanVoices->v.phases[voice], 2.0e-3f) &&
+                    NearlyEqual(referenceVoices->v.currentGain[voice],
+                                spanVoices->v.currentGain[voice], 2.0e-5f) &&
+                    spanVoices->v.rot != nullptr &&
+                    spanVoices->v.rot[voice].form == 2u;
+                Check(stateMatches,
+                      "pair rotation preserves voice state and form");
+            }
+        }
+    }
+
+    // Steal-free exact differential: with free slots for every launch and
+    // no displacements, the production renderer (sparse span path here,
+    // because an active rotation state refuses the whole-voice plan) must
+    // match the frame-major oracle to float rounding in every mode,
+    // including the per-sample sweep of modes 2/4.
+    {
+        svms::ChannelCache seedChannels;
+        seedChannels.SetMasterVolume(1.0f);
+        seedChannels.RebuildCache(cfg, 44100.0f);
+        auto referenceVoices = std::make_unique<svms::VoiceManager>();
+        auto spanVoices = std::make_unique<svms::VoiceManager>();
+        for (svms::VoiceManager* voices :
+                 {referenceVoices.get(), spanVoices.get()}) {
+            voices->Initialize(64, 44100);
+            for (uint32_t i = 0; i < 12; ++i) {
+                const uint8_t channel = static_cast<uint8_t>(i & 3u);
+                const uint8_t note = static_cast<uint8_t>(48u + i);
+                const svms::VoiceHandle voice = voices->AllocateVoice(
+                    channel, note, 100u);
+                voices->SetVoiceSample(voice, 0, 4096, 64, 4032, 1u,
+                                       0.4f + static_cast<float>(i) * 0.11f, 1);
+                voices->SetVoiceEnvelope(voice, 0.8f, 0.7f, 0, 0, 0, 0,
+                                         0.0f, 1.0f, 0.9997f, 700 + i);
+                voices->SetVoicePlayIndex(voice, i + 1u);
+                voices->SetVoiceGain(voice, 0.02f, 0.02f);
+                voices->RefreshMixGain(voice,
+                                       seedChannels.GetParams()[channel]);
+            }
+            voices->SetHilbertPairAvailable(true);
+            Check(voices->SetPhaseRotationMode(2u),
+                  "steal-free regime seeds sweep pair states");
+        }
+        svms::ChannelCache referenceChannels = seedChannels;
+        svms::ChannelCache spanChannels = seedChannels;
+
+        const uint32_t frames = 2048u;
+        std::vector<svms::RenderEvent> events;
+        uint32_t random = 0x853c49e6u;
+        for (uint32_t sequence = 0; sequence < 32; ++sequence) {
+            random = random * 1664525u + 1013904223u;
+            svms::RenderEvent event{};
+            event.frameOffset = random % frames;
+            event.ingressSequence = sequence;
+            event.channel = static_cast<uint8_t>((random >> 8) & 3u);
+            if ((sequence % 4u) <= 1u) {
+                // Fresh keys keep launches inside the free-slot pool.
+                event.type = svms::RenderEventType::NoteOn;
+                event.data1 = static_cast<uint8_t>(72u + sequence);
+                event.data2 = static_cast<uint8_t>(80u + sequence % 40u);
+            } else if ((sequence % 4u) == 2u) {
+                event.type = svms::RenderEventType::NoteOff;
+                event.data1 = static_cast<uint8_t>(48u + (sequence % 12u));
+            } else {
+                event.type = svms::RenderEventType::ControlChange;
+                event.data1 = (sequence & 1u) ? 11u : 7u;
+                event.data2 = static_cast<uint8_t>(40u + sequence);
+            }
+            events.push_back(event);
+        }
+        std::sort(events.begin(), events.end(),
+                  [](const auto& a, const auto& b) {
+            if (a.frameOffset != b.frameOffset)
+                return a.frameOffset < b.frameOffset;
+            return a.ingressSequence < b.ingressSequence;
+        });
+
+        std::vector<float> referenceLeft(frames, 0.0f),
+            referenceRight(frames, 0.0f);
+        std::vector<float> spanLeft(frames, 0.0f), spanRight(frames, 0.0f);
+        DifferentialDispatchContext referenceContext{
+            referenceVoices.get(), &referenceChannels, &cfg};
+        DifferentialDispatchContext spanContext{
+            spanVoices.get(), &spanChannels, &cfg};
+        svms::RenderScalar referenceRenderer;
+        svms::RenderScalar spanRenderer;
+        referenceRenderer.SetEventDispatcher(
+            DispatchDifferentialEvent, &referenceContext);
+        spanRenderer.SetEventDispatcher(
+            DispatchDifferentialEvent, &spanContext);
+
+        referenceRenderer.RenderBlockReference(
+            *referenceVoices, referenceChannels, samples.data(),
+            hilbert.data(), sampleCount, referenceLeft.data(),
+            referenceRight.data(), frames, cfg, events.data(),
+            static_cast<uint32_t>(events.size()), true, 10000);
+        spanRenderer.RenderBlock(
+            *spanVoices, spanChannels, samples.data(), hilbert.data(),
+            sampleCount, spanLeft.data(), spanRight.data(), frames, cfg,
+            events.data(), static_cast<uint32_t>(events.size()), true, 10000);
+
+        float maximumDifference = 0.0f;
+        for (uint32_t frame = 0; frame < frames; ++frame) {
+            maximumDifference = (std::max)(maximumDifference,
+                std::fabs(referenceLeft[frame] - spanLeft[frame]));
+            maximumDifference = (std::max)(maximumDifference,
+                std::fabs(referenceRight[frame] - spanRight[frame]));
+        }
+        Check(maximumDifference <= 1.0e-6f,
+              "steal-free pair rotation matches the oracle to rounding");
+        Check(spanVoices->activeCount_ > 12u,
+              "steal-free regime actually exercised launches");
+    }
+
+    // Without a pair, modes 1/2/4 seed the allpass quadrature form (the
+    // documented live-switch fallback until the next SoundFont load).
+    svms::ChannelCache fallbackChannels;
+    fallbackChannels.SetMasterVolume(1.0f);
+    fallbackChannels.RebuildCache(cfg, 44100.0f);
+    svms::VoiceManager fallbackVoices;
+    ConfigureDifferentialSeed(fallbackVoices, fallbackChannels);
+    Check(fallbackVoices.SetPhaseRotationMode(1u),
+          "rotation mode set without a pair");
+    for (uint32_t i = 0; i < fallbackVoices.activeCount_; ++i) {
+        Check(fallbackVoices.v.rot != nullptr &&
+                  fallbackVoices.v.rot[fallbackVoices.activeList_[i]].form == 0u,
+              "missing pair falls back to the allpass quadrature form");
+    }
+}
+
 void TestRenderBackendSelectionAndDenseEquivalence() {
     constexpr uint32_t voiceCount = 32u;
     constexpr uint32_t frames = 4u;
@@ -5048,6 +5337,7 @@ int main() {
     TestWholeVoiceStealDifferential();
     TestWholeVoiceLaunchDifferential();
     TestWholeVoiceCCDifferential();
+    TestHilbertPairDifferential();
     TestDenseProductionGateParity();
     TestPerKeyVoiceCap();
 

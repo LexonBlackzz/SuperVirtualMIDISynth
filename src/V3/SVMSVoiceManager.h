@@ -612,6 +612,15 @@ public:
     }
     // Rotation activity flag for the render paths (v.rot != nullptr).
     bool PhaseRotationActive() const noexcept { return v.rot != nullptr; }
+    // Whether the active SoundFont bundle carries a precomputed analytic
+    // pair (Hilbert-pair form 2).  Set at the bundle-activation block
+    // boundary; seeding only then, so live state never mixes forms.
+    void SetHilbertPairAvailable(bool available) noexcept {
+        hilbertPairAvailable_ = available;
+    }
+    bool HilbertPairAvailable() const noexcept {
+        return hilbertPairAvailable_;
+    }
     // Seed (or re-seed) one voice's rotation state deterministically from
     // its MIDI identity, birth frame and a monotonic counter.
     void SeedVoiceRotationForVoice(VoiceHandle handle);
@@ -628,6 +637,7 @@ private:
     // Per-voice phase rotation (SVMSPhaseRotation.h).  Audio-thread-only;
     // 0 = Coherent (v.rot == nullptr, bit-exact render path).
     uint32_t phaseRotationMode_ = 0u;
+    bool hilbertPairAvailable_ = false;
     uint64_t rotationSeedCounter_ = 0u;
     uint32_t stealFadeFrames_;
     uint64_t currentFrame_;
@@ -1504,6 +1514,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     // Preserve per-voice rotation state across the growth (handles are
     // stable, so a straight prefix copy is exact).
     grown.phaseRotationMode_ = phaseRotationMode_;
+    grown.hilbertPairAvailable_ = hilbertPairAvailable_;
     grown.rotationSeedCounter_ = rotationSeedCounter_;
     if (phaseRotationMode_ != 0u && v.rot &&
         grown.v.ReserveRotation(oldCapacity)) {
@@ -3833,7 +3844,8 @@ inline void VoiceManager::SeedVoiceRotationForVoice(VoiceHandle handle) {
         v.channel[handle], v.note[handle], handle, v.birthFrame[handle],
         ++rotationSeedCounter_);
     SeedVoiceRotation(v.rot[handle], phaseRotationMode_, seed,
-                      static_cast<float>(sampleRate_));
+                      static_cast<float>(sampleRate_),
+                      hilbertPairAvailable_);
 }
 
 inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, uint8_t velocity) {

@@ -188,6 +188,7 @@ public:
                     const uint32_t slot = tailHandles[pos - 1u];
                     RenderStealTailSample(voices_.v, slot,
                                           sampleData_.data(),
+                                          nullptr,
                                           sampleFrames_,
                                           oL, oR);
                     voices_.RefreshStealTail(

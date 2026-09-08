@@ -32,6 +32,7 @@ inline float InterpolateSample(const int16_t* data, uint32_t baseIndex,
 // has no MIDI identity, and does not consume a primary voice slot.
 inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
                                   const int16_t* sampleData,
+                                  const int16_t* hilbertData,
                                   uint32_t sampleDataFrames,
                                   float* outL, float* outR) {
     uint32_t remaining = v.stealTailFramesRemaining[idx];
@@ -73,7 +74,9 @@ inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
 
     const float frac = phase - static_cast<float>(baseOffset);
     float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
-    if (v.rot) sample = RotateVoiceSample(v.stealTailRot[idx], sample);
+    if (v.rot)
+        sample = RotateVoiceSample(v.stealTailRot[idx], sample, hilbertData,
+                                   baseIndex, nextIndex, frac);
     const uint32_t total = v.stealTailFramesTotal[idx];
     const float fade = total > 1u
         ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
@@ -614,6 +617,19 @@ public:
         return bytes;
     }
 
+    // hilbertData: optional analytic companion store (Hilbert pair).
+    // Overload resolution on the 4th argument (pointer vs frame count)
+    // keeps every pre-pair call site source-compatible.
+    void RenderBlock(VoiceManager& voices, const ChannelCache& channels,
+                     const int16_t* sampleData,
+                     const int16_t* hilbertData,
+                     uint32_t sampleDataFrames,
+                     float* outputLeft, float* outputRight,
+                     uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
+                     const RenderEvent* events = nullptr,
+                     uint32_t eventCount = 0,
+                     bool correctnessMode = false,
+                     uint64_t blockStartFrame = 0);
     void RenderBlock(VoiceManager& voices, const ChannelCache& channels,
                      const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
@@ -729,6 +745,16 @@ public:
     // the span renderer, while differential tests can still prove state and
     // waveform equivalence.
     void RenderBlockReference(VoiceManager& voices, const ChannelCache& channels,
+                     const int16_t* sampleData,
+                     const int16_t* hilbertData,
+                     uint32_t sampleDataFrames,
+                     float* outputLeft, float* outputRight,
+                     uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
+                     const RenderEvent* events = nullptr,
+                     uint32_t eventCount = 0,
+                     bool correctnessMode = false,
+                     uint64_t blockStartFrame = 0);
+    void RenderBlockReference(VoiceManager& voices, const ChannelCache& channels,
                      const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
@@ -775,7 +801,8 @@ public:
 private:
 private:
     void RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
-                     const int16_t* sampleData, uint32_t sampleDataFrames,
+                     const int16_t* sampleData, const int16_t* hilbertData,
+                     uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                      const RenderEvent* events, uint32_t eventCount,
@@ -799,7 +826,8 @@ private:
                      uint64_t blockStartFrame, uint32_t* renderedTo);
     void RenderBlockSparseRange(VoiceManager& voices,
                      const ChannelCache& channels,
-                     const int16_t* sampleData, uint32_t sampleDataFrames,
+                     const int16_t* sampleData, const int16_t* hilbertData,
+                     uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
                      uint32_t rangeStart, uint32_t rangeEnd,
                      const RenderEvent* events,
@@ -1074,7 +1102,9 @@ inline void RenderScalar::SetEventBatchDispatcher(EventBatchDispatcher dispatche
 // phase and retirement always advance so decimated voices don't freeze.
 // ════════════════════════════════════════════════════════════════════════
 inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const ChannelCache& channels,
-                                        const int16_t* sampleData, uint32_t sampleDataFrames,
+                                        const int16_t* sampleData,
+                                        const int16_t* hilbertData,
+                                        uint32_t sampleDataFrames,
                                         float* outputLeft, float* outputRight,
                                         uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                                         const RenderEvent* events, uint32_t eventCount,
@@ -1159,8 +1189,8 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
         const uint32_t* tailHandles = voices.GetStealTailList();
         for (uint32_t position = tailCount; position > 0u; --position) {
             const uint32_t tailSlot = tailHandles[position - 1u];
-            RenderStealTailSample(v, tailSlot, sampleData, sampleDataFrames,
-                                  outL, outR);
+            RenderStealTailSample(v, tailSlot, sampleData, hilbertData,
+                                  sampleDataFrames, outL, outR);
             voices.RefreshStealTail(static_cast<VoiceHandle>(tailSlot));
         }
 
@@ -1200,6 +1230,13 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
             const bool loop = isSampleBacked && (v.loopEnabled[idx] != 0);
 
             float sample = 0.0f;
+            // Sample-fetch coordinates, captured where the fetch happens so
+            // the Hilbert companion can be read with identical index math at
+            // the mix site below (the goto skips the envelope, so locals
+            // from the fetch block are not in scope there).
+            uint32_t fetchBaseIndex = 0u;
+            uint32_t fetchNextIndex = 0u;
+            float fetchFrac = 0.0f;
             bool retireVoice = false;
             bool releaseFinished = false;
             bool sustain = false;
@@ -1231,6 +1268,9 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                     // retires correctly; only the audio output is skipped.
                     if (mixAudio) {
                         sample = InterpolateSample(sampleData, baseIdx, nextIdx, frac);
+                        fetchBaseIndex = baseIdx;
+                        fetchNextIndex = nextIdx;
+                        fetchFrac = frac;
                     }
                 }
 
@@ -1324,7 +1364,10 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
 
             if (mixAudio) {
                 float rotated = sample;
-                if (v.rot) rotated = RotateVoiceSample(v.rot[idx], rotated);
+                if (v.rot)
+                    rotated = RotateVoiceSample(v.rot[idx], rotated,
+                                                hilbertData, fetchBaseIndex,
+                                                fetchNextIndex, fetchFrac);
                 const float scaled = rotated * gain * stealFadeIn;
                 *outL += scaled * v.mixGainL[idx];
                 *outR += scaled * v.mixGainR[idx];
@@ -1367,7 +1410,26 @@ inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
                                         uint32_t eventCount,
                                         bool correctnessMode,
                                         uint64_t blockStartFrame) {
-    RenderBlockFrameMajor(voices, channels, sampleData, sampleDataFrames,
+    RenderBlockReference(voices, channels, sampleData, nullptr,
+                         sampleDataFrames, outputLeft, outputRight, numFrames,
+                         cfg, events, eventCount, correctnessMode,
+                         blockStartFrame);
+}
+
+inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
+                                        const ChannelCache& channels,
+                                        const int16_t* sampleData,
+                                        const int16_t* hilbertData,
+                                        uint32_t sampleDataFrames,
+                                        float* outputLeft, float* outputRight,
+                                        uint32_t numFrames,
+                                        const RuntimeConfigSnapshot& cfg,
+                                        const RenderEvent* events,
+                                        uint32_t eventCount,
+                                        bool correctnessMode,
+                                        uint64_t blockStartFrame) {
+    RenderBlockFrameMajor(voices, channels, sampleData, hilbertData,
+                          sampleDataFrames,
                           outputLeft, outputRight, numFrames, cfg, events,
                           eventCount, correctnessMode, blockStartFrame);
 }
@@ -1377,6 +1439,7 @@ inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
 // All state is held in locals and committed once.
 inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
                                 const int16_t* sampleData,
+                                const int16_t* hilbertData,
                                 uint32_t sampleDataFrames,
                                 float* outputLeft, float* outputRight,
                                 uint32_t frameStart, uint32_t frameCount) {
@@ -1429,7 +1492,10 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
 
         const float frac = phase - static_cast<float>(baseOffset);
         float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
-        if (v.rot) sample = RotateVoiceSample(v.stealTailRot[idx], sample);
+        if (v.rot)
+            sample = RotateVoiceSample(v.stealTailRot[idx], sample,
+                                       hilbertData, baseIndex, nextIndex,
+                                       frac);
         const float fade = total > 1u
             ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
             : 0.0f;
@@ -1457,6 +1523,7 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
 // remains active.  Event dispatch cannot mutate voice state inside a span.
 inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                                        const int16_t* sampleData,
+                                       const int16_t* hilbertData,
                                        uint32_t sampleDataFrames,
                                        float* outputLeft, float* outputRight,
                                        uint32_t frameStart, uint32_t frameCount,
@@ -1630,7 +1697,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 const uint32_t nextIndex = sampleStart + nextRel;
                 const float frac = phase - static_cast<float>(baseOffset);
                 float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
-                if (v.rot) sample = RotateVoiceSample(v.rot[idx], sample);
+                if (v.rot)
+                    sample = RotateVoiceSample(v.rot[idx], sample, hilbertData,
+                                               baseIndex, nextIndex, frac);
                 const float scaled = sample * gain * fade;
                 outputLeft[frameStart + n] += scaled * mixL;
                 outputRight[frameStart + n] += scaled * mixR;
@@ -1786,7 +1855,10 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             }
 
             float sampleR = sample;
-            if (v.rot) sampleR = RotateVoiceSample(v.rot[idx], sampleR);
+            if (v.rot)
+                sampleR = RotateVoiceSample(v.rot[idx], sampleR, hilbertData,
+                                            sampleStart + baseOffset,
+                                            sampleStart + nextRel, frac);
             const float scaled = sampleR * gain;
             outL[n] += scaled * mixL;
             outR[n] += scaled * mixR;
@@ -1841,7 +1913,10 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 }
             }
             float sampleR = sample;
-            if (v.rot) sampleR = RotateVoiceSample(v.rot[idx], sampleR);
+            if (v.rot)
+                sampleR = RotateVoiceSample(v.rot[idx], sampleR, hilbertData,
+                                            sampleStart + baseOffset,
+                                            sampleStart + nextRel, frac);
             const float scaled = sampleR * gain;
             outL[n] += scaled * mixL;
             outR[n] += scaled * mixR;
@@ -1881,6 +1956,11 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
 
     for (uint32_t n = 0; n < frameCount; ++n) {
         float sample = 0.0f;
+        // Fetch coordinates for the Hilbert companion (the mix block below
+        // runs after the phase advance, so the fetch locals are out of scope).
+        uint32_t fetchBaseIndex = 0u;
+        uint32_t fetchNextIndex = 0u;
+        float fetchFrac = 0.0f;
         bool sampleEnded = false;
         uint32_t baseOffset = static_cast<uint32_t>(phase);
         if (baseOffset + 1u >= relEnd) {
@@ -1900,6 +1980,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             const uint32_t nextIndex = sampleStart + nextRel;
             const float frac = phase - static_cast<float>(baseOffset);
             sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+            fetchBaseIndex = baseIndex;
+            fetchNextIndex = nextIndex;
+            fetchFrac = frac;
         }
 
         bool releaseFinished = false;
@@ -1976,7 +2059,10 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
 
         if (!sampleEnded && n < mixedFrameCount) {
             float sampleR = sample;
-            if (v.rot) sampleR = RotateVoiceSample(v.rot[idx], sampleR);
+            if (v.rot)
+                sampleR = RotateVoiceSample(v.rot[idx], sampleR, hilbertData,
+                                            fetchBaseIndex, fetchNextIndex,
+                                            fetchFrac);
             const float scaled = sampleR * gain * fade;
             outputLeft[frameStart + n] += scaled * mixL;
             outputRight[frameStart + n] += scaled * mixR;
@@ -2257,8 +2343,8 @@ inline void RenderScalar::AdvanceAuthoritativeSpan(
         const uint32_t handle = voices.activeList_[position];
         const uint8_t oldClass = v.renderClass[handle];
         const uint32_t retiredAt = RenderPrimaryVoiceSpan(
-            v, handle, sampleData, sampleDataFrames, nullptr, nullptr, 0u,
-            frameCount, 0u, true);
+            v, handle, sampleData, nullptr, sampleDataFrames, nullptr, nullptr,
+            0u, frameCount, 0u, true);
         if (retiredAt != UINT32_MAX) {
             retirements_[retireCount++] = {
                 handle, retiredAt, voices.activePosition_[handle]};
@@ -2351,7 +2437,7 @@ inline bool RenderScalar::AdvanceDenseHandleTo(
         return true;
     }
     const uint32_t retiredAt = RenderPrimaryVoiceSpan(
-        v, handle, denseSampleData_, denseSampleDataFrames_, nullptr,
+        v, handle, denseSampleData_, nullptr, denseSampleDataFrames_, nullptr,
         nullptr, 0u, frameOffset - previous, 0u, true);
     denseLastAdvancedFrames_[handle] = frameOffset;
     denseLastPhaseAdvancedFrames_[handle] = frameOffset;
@@ -2576,8 +2662,8 @@ inline void RenderScalar::RenderDenseVoiceTile(
             const uint32_t count = classCounts[classIndex];
             if (count == 0u) continue;
             const RenderSpanContext context{
-                &v, denseSampleData_, denseSampleDataFrames_, outputLeft,
-                outputRight, 0u, frameCount, v.GetCapacity(),
+                &v, denseSampleData_, nullptr, denseSampleDataFrames_,
+                outputLeft, outputRight, 0u, frameCount, v.GetCapacity(),
                 nullptr, nullptr, nullptr, nullptr, nullptr, 0u};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
             if (kernel && kernel(context, classHandles[classIndex], count))
@@ -2585,7 +2671,7 @@ inline void RenderScalar::RenderDenseVoiceTile(
             for (uint32_t index = 0u; index < count; ++index) {
                 const uint32_t handle = classHandles[classIndex][index];
                 const uint32_t retiredAt = RenderPrimaryVoiceSpan(
-                    v, handle, denseSampleData_, denseSampleDataFrames_,
+                    v, handle, denseSampleData_, nullptr, denseSampleDataFrames_,
                     outputLeft, outputRight, 0u, frameCount, frameCount);
                 if (retiredAt != UINT32_MAX)
                     v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
@@ -2686,8 +2772,8 @@ inline void RenderScalar::RenderDenseVoiceTile(
             if (count == 0u) continue;
             uint32_t* list = classHandles[classIndex];
             const RenderSpanContext context{
-                &v, denseSampleData_, denseSampleDataFrames_, outputLeft,
-                outputRight, cursor, spanFrames, 0u,
+                &v, denseSampleData_, nullptr, denseSampleDataFrames_,
+                outputLeft, outputRight, cursor, spanFrames, 0u,
                 tileClassChanges, &tileClassChangeCount,
                 nullptr, nullptr, nullptr, 0u};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
@@ -2720,7 +2806,7 @@ inline void RenderScalar::RenderDenseVoiceTile(
                 const uint32_t handle = list[index];
                 const uint32_t slot = handle - firstHandle;
                 const uint32_t retiredAt = RenderPrimaryVoiceSpan(
-                    v, handle, denseSampleData_, denseSampleDataFrames_,
+                    v, handle, denseSampleData_, nullptr, denseSampleDataFrames_,
                     outputLeft, outputRight, cursor, spanFrames, spanFrames);
                 if (retiredAt != UINT32_MAX) {
                     v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
@@ -2769,7 +2855,7 @@ inline void RenderScalar::RenderDenseTails(
         for (uint32_t handle = 0u; handle < kStealTailReserve; ++handle) {
             if (v.stealTailFramesRemaining[handle] == 0u) continue;
             RenderStealTailSpan(v, handle, denseSampleData_,
-                                denseSampleDataFrames_, outputLeft,
+                                nullptr, denseSampleDataFrames_, outputLeft,
                                 outputRight, cursor, spanEnd - cursor);
         }
         cursor = spanEnd;
@@ -3130,7 +3216,21 @@ inline bool RenderScalar::RenderBlockDensePlanned(
 }
 
 inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& channels,
-                                      const int16_t* sampleData, uint32_t sampleDataFrames,
+                                      const int16_t* sampleData,
+                                      uint32_t sampleDataFrames,
+                                      float* outputLeft, float* outputRight,
+                                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
+                                      const RenderEvent* events, uint32_t eventCount,
+                                      bool correctnessMode,
+                                      uint64_t blockStartFrame) {
+    RenderBlock(voices, channels, sampleData, nullptr, sampleDataFrames,
+                outputLeft, outputRight, numFrames, cfg, events, eventCount,
+                correctnessMode, blockStartFrame);
+}
+
+inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& channels,
+                                      const int16_t* sampleData, const int16_t* hilbertData,
+                                      uint32_t sampleDataFrames,
                                       float* outputLeft, float* outputRight,
                                       uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                                       const RenderEvent* events, uint32_t eventCount,
@@ -3249,7 +3349,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
         }
         if (needSparse) {
             lastRenderPaths_ |= 0x4u;
-            RenderBlockSparseRange(voices, channels, sampleData,
+            RenderBlockSparseRange(voices, channels, sampleData, hilbertData,
                 sampleDataFrames, outputLeft, outputRight, segStart, segEnd,
                 events, eventCount, eventCursor, vibratoActive,
                 correctnessMode, blockStartFrame);
@@ -3767,7 +3867,7 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
         static_cast<uint32_t>(classBefore)];
     if (segFrames >= 8u && kernel != nullptr && sampleData != nullptr) {
         RenderSpanContext context{
-            &state, sampleData, sampleDataFrames, outL, outR,
+            &state, sampleData, nullptr, sampleDataFrames, outL, outR,
             segStart, segFrames, state.GetCapacity(),
             nullptr, nullptr,
             isReal ? voices->activePosition_ : nullptr,
@@ -3785,7 +3885,7 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
         }
     }
     const uint32_t retiredAt = RenderPrimaryVoiceSpan(
-        state, row, sampleData, sampleDataFrames, outL, outR,
+        state, row, sampleData, nullptr, sampleDataFrames, outL, outR,
         segStart, segFrames, segFrames);
     if (retiredAt != UINT32_MAX) {
         if (isReal) {
@@ -3873,8 +3973,8 @@ inline void RenderScalar::RenderGhostTailSpan(uint32_t ghost, VoiceSoA& s,
     s.stealTailLoopEnabled[0] = tail.loopEnabled;
     s.stealTailFramesRemaining[0] = tail.framesRemaining;
     s.stealTailFramesTotal[0] = tail.framesTotal;
-    RenderStealTailSpan(s, 0, sampleData, sampleDataFrames, outL, outR,
-                        frameStart, frameCount);
+    RenderStealTailSpan(s, 0, sampleData, nullptr, sampleDataFrames, outL,
+                        outR, frameStart, frameCount);
     wvGhostTails_[ghost].framesRemaining = s.stealTailFramesRemaining[0];
 }
 
@@ -4127,7 +4227,8 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         const uint32_t killFrame = wvTailKillFrame_[slot];
         if (voices.v.stealTailFramesRemaining[slot] == 0u) {
             if (killFrame == UINT32_MAX) continue;
-            RenderStealTailSpan(voices.v, slot, sampleData, sampleDataFrames,
+            RenderStealTailSpan(voices.v, slot, sampleData, nullptr,
+                                sampleDataFrames,
                                 outputLeft, outputRight, 0u, killFrame);
             continue;
         }
@@ -4135,7 +4236,8 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         // against a plan/render mismatch.
         const uint32_t tailFrames = killFrame == UINT32_MAX
             ? numFrames : (std::min)(killFrame, numFrames);
-        RenderStealTailSpan(voices.v, slot, sampleData, sampleDataFrames,
+        RenderStealTailSpan(voices.v, slot, sampleData, nullptr,
+                            sampleDataFrames,
                             outputLeft, outputRight, 0u, tailFrames);
         voices.RefreshStealTail(static_cast<VoiceHandle>(slot));
     }
@@ -4300,7 +4402,8 @@ inline bool RenderScalar::EnsureWholeVoiceJobScratch(uint32_t jobCount) {
 
 inline void RenderScalar::RenderBlockSparseRange(
     VoiceManager& voices, const ChannelCache& channels,
-    const int16_t* sampleData, uint32_t sampleDataFrames,
+    const int16_t* sampleData, const int16_t* hilbertData,
+    uint32_t sampleDataFrames,
     float* outputLeft, float* outputRight, uint32_t rangeStart,
     uint32_t rangeEnd, const RenderEvent* events, uint32_t eventCount,
     uint32_t eventIndexBegin, bool vibratoActive, bool correctnessMode,
@@ -4405,7 +4508,8 @@ inline void RenderScalar::RenderBlockSparseRange(
                 static_cast<VoiceRenderClass>(classIndex);
             RenderClassKernel classKernel = kernelSet.kernels[classIndex];
             const RenderSpanContext context{
-                &v, sampleData, sampleDataFrames, outputLeft, outputRight,
+                &v, sampleData, hilbertData, sampleDataFrames, outputLeft,
+                outputRight,
                 cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
                 &classChangeCount, voices.activePosition_, retirements_,
                 &retireCount, 0u};
@@ -4467,16 +4571,16 @@ inline void RenderScalar::RenderBlockSparseRange(
                     if (cleanPrimary &&
                         renderClass == VoiceRenderClass::SustainedLoop) {
                         retiredAt = ScalarRenderSustainedLoop(
-                            v, idx, sampleData, sampleDataFrames, outputLeft,
-                            outputRight, cursor, spanFrames);
+                            v, idx, sampleData, hilbertData, sampleDataFrames,
+                            outputLeft, outputRight, cursor, spanFrames);
                     } else if (cleanPrimary &&
                                renderClass == VoiceRenderClass::SustainedOneShot) {
                         retiredAt = ScalarRenderSustainedOneShot(
-                            v, idx, sampleData, sampleDataFrames, outputLeft,
-                            outputRight, cursor, spanFrames);
+                            v, idx, sampleData, hilbertData, sampleDataFrames,
+                            outputLeft, outputRight, cursor, spanFrames);
                     } else {
                         retiredAt = RenderPrimaryVoiceSpan(
-                            v, idx, sampleData, sampleDataFrames, outputLeft,
+                            v, idx, sampleData, hilbertData, sampleDataFrames, outputLeft,
                             outputRight, cursor, spanFrames, spanFrames);
                     }
 
@@ -4498,7 +4602,8 @@ inline void RenderScalar::RenderBlockSparseRange(
         if (denseTails) {
             for (uint32_t idx = 0; idx < tailCapacity; ++idx) {
                 if (v.stealTailFramesRemaining[idx] == 0u) continue;
-                RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
+                RenderStealTailSpan(v, idx, sampleData, hilbertData,
+                                    sampleDataFrames,
                                     outputLeft, outputRight, cursor,
                                     tailFrameCounts_[idx]);
                 voices.RefreshStealTail(static_cast<VoiceHandle>(idx));
@@ -4506,7 +4611,8 @@ inline void RenderScalar::RenderBlockSparseRange(
         } else {
             for (uint32_t position = tailCount; position > 0u; --position) {
                 const uint32_t idx = tailHandles[position - 1u];
-                RenderStealTailSpan(v, idx, sampleData, sampleDataFrames,
+                RenderStealTailSpan(v, idx, sampleData, hilbertData,
+                                    sampleDataFrames,
                                     outputLeft, outputRight, cursor,
                                     tailFrameCounts_[idx]);
                 voices.RefreshStealTail(static_cast<VoiceHandle>(idx));

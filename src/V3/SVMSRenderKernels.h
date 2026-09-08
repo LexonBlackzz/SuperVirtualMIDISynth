@@ -17,6 +17,11 @@ struct SpanRetirement {
 struct RenderSpanContext {
     VoiceSoA* voices;
     const int16_t* sampleData;
+    // Optional analytic companion store (Hilbert pair, form-2 rotation).
+    // Null when the bundle carries no pair or rotation is off; kernels may
+    // forward it to the 6-arg RotateVoiceSample overload unconditionally —
+    // non-pair rotation states ignore it.
+    const int16_t* hilbertData;
     uint32_t sampleDataFrames;
     float* outputLeft;
     float* outputRight;
@@ -68,17 +73,20 @@ bool BuildVolatileStealKeysAVX2(
 
 uint32_t ScalarRenderSustainedLoop(
     VoiceSoA& voices, uint32_t handle, const int16_t* sampleData,
-    uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
+    const int16_t* hilbertData, uint32_t sampleDataFrames,
+    float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount);
 
 uint32_t ScalarRenderSustainedOneShot(
     VoiceSoA& voices, uint32_t handle, const int16_t* sampleData,
-    uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
+    const int16_t* hilbertData, uint32_t sampleDataFrames,
+    float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount);
 
 void ScalarRenderSustainedLoopShortBatch(
     VoiceSoA& voices, const uint32_t* handles, uint32_t handleCount,
-    const int16_t* sampleData, uint32_t sampleDataFrames, float* outputLeft,
+    const int16_t* sampleData, const int16_t* hilbertData,
+    uint32_t sampleDataFrames, float* outputLeft,
     float* outputRight, uint32_t frameStart, uint32_t frameCount);
 
 bool ScalarRenderTransientLoopClass(const RenderSpanContext& context,

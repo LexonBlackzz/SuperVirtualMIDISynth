@@ -24,14 +24,16 @@ bool RenderSustainedLoopSSE2(const RenderSpanContext& context,
     // backend boundary but deliberately select the faster scalar subkernel.
     if (context.frameCount <= 4u) {
         ScalarRenderSustainedLoopShortBatch(v, handles, handleCount,
-            context.sampleData, context.sampleDataFrames, context.outputLeft,
+            context.sampleData, context.hilbertData, context.sampleDataFrames,
+            context.outputLeft,
             context.outputRight, context.frameStart, context.frameCount);
         return true;
     }
     if (context.frameCount > 4u) {
         for (uint32_t i = 0; i < handleCount; ++i) {
             ScalarRenderSustainedLoop(v, handles[i], context.sampleData,
-                context.sampleDataFrames, context.outputLeft,
+                context.hilbertData, context.sampleDataFrames,
+                context.outputLeft,
                 context.outputRight, context.frameStart, context.frameCount);
         }
         return true;
@@ -60,7 +62,8 @@ bool RenderSustainedLoopSSE2(const RenderSpanContext& context,
         if (!valid) {
             for (uint32_t lane = 0; lane < 4u; ++lane) {
                 ScalarRenderSustainedLoop(v, handles[position + lane],
-                    context.sampleData, context.sampleDataFrames,
+                    context.sampleData, context.hilbertData,
+                    context.sampleDataFrames,
                     context.outputLeft, context.outputRight,
                     context.frameStart, context.frameCount);
             }
@@ -95,7 +98,8 @@ bool RenderSustainedLoopSSE2(const RenderSpanContext& context,
     }
     for (; position < handleCount; ++position) {
         ScalarRenderSustainedLoop(v, handles[position], context.sampleData,
-            context.sampleDataFrames, context.outputLeft, context.outputRight,
+            context.hilbertData, context.sampleDataFrames,
+            context.outputLeft, context.outputRight,
             context.frameStart, context.frameCount);
     }
     for (uint32_t frame = 0; frame < context.frameCount; ++frame) {

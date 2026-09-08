@@ -2430,6 +2430,7 @@ private:
     SF2Data* soundFontData;
     RuntimeConfigSnapshot* configSnapshot;
     int16_t* sampleDataStore;
+    int16_t* hilbertDataStore;
     SF2Sample* samplesStore;
     float* regionInitialPeaks;
     uint32_t regionInitialPeakCount;
@@ -3265,6 +3266,10 @@ struct PreparedSF2Region {
 struct SoundFontBundle {
     SF2Data* data = nullptr;
     int16_t* sampleData = nullptr;
+    // Optional analytic companion (Hilbert pair) over sampleData, same
+    // layout + 8-element trailing padding. Built at load when the phase-
+    // rotation mode can use it; null otherwise.
+    int16_t* hilbertData = nullptr;
     SF2Sample* samples = nullptr;
     float* regionInitialPeaks = nullptr;
     PreparedSF2Region* preparedRegions = nullptr;
@@ -3341,12 +3346,14 @@ static void DestroySoundFontBundle(SoundFontBundle* bundle) noexcept {
         for (uint32_t i = 0u; i < bundle->bankCount; ++i)
             DestroySoundFontBundle(bundle->banks[i]);
         free(bundle->sampleData);
+        free(bundle->hilbertData);
         delete bundle;
         return;
     }
     free(bundle->regionInitialPeaks);
     free(bundle->preparedRegions);
     free(bundle->sampleData);
+    free(bundle->hilbertData);
     free(bundle->samples);
     if (bundle->data) {
         sf2_free(bundle->data);
@@ -3437,7 +3444,7 @@ Driver::Driver()
     : initialized(false), sampleRate(44100), bufferFrames(512),
       audioOutput(nullptr), voiceManager(nullptr), channelCache(nullptr),
       renderScalar(nullptr), soundFontData(nullptr), configSnapshot(nullptr),
-      sampleDataStore(nullptr), samplesStore(nullptr), regionInitialPeaks(nullptr),
+      sampleDataStore(nullptr), hilbertDataStore(nullptr), samplesStore(nullptr), regionInitialPeaks(nullptr),
       regionInitialPeakCount(0), preparedRegions(nullptr), preparedRegionCount(0),
       soundFontGeneration_(1u),
       sampleStoreCount(0), sampleDataFrames(0),
@@ -4003,6 +4010,82 @@ bool Driver::LoadConfiguredSoundFont() {
     return loaded;
 }
 
+
+// ── Hilbert-pair store construction ─────────────────────────────────────
+// One slice transform task; SVMSPhaseRotation.h owns the math. Thread fan-
+// out is a plain CreateThread pool (XP-safe, no SRWLock/std::thread): each
+// slice is transformed by exactly one thread with the fixed-order double
+// FFT, so the store is bit-identical to a serial build regardless of the
+// thread count.
+namespace {
+struct HilbertSliceJob {
+    const int16_t* src;
+    int16_t* dst;
+    const uint32_t* starts;
+    const uint32_t* counts;
+    std::atomic<uint32_t>* next;
+    uint32_t taskCount;
+};
+
+DWORD WINAPI HilbertSliceWorker(LPVOID param) noexcept {
+    HilbertSliceJob* job = static_cast<HilbertSliceJob*>(param);
+    for (;;) {
+        const uint32_t task = job->next->fetch_add(1u,
+            std::memory_order_relaxed);
+        if (task >= job->taskCount) break;
+        svms::HilbertTransformSlice(job->src + job->starts[task],
+                                    job->dst + job->starts[task],
+                                    job->counts[task]);
+    }
+    return 0u;
+}
+}  // namespace
+
+static void BuildHilbertPairStore(const SF2Data* sf2, int16_t* hilbert) {
+    const uint32_t sampleCount = sf2->sampleCount;
+    std::vector<uint32_t> starts;
+    std::vector<uint32_t> counts;
+    starts.reserve(sampleCount);
+    counts.reserve(sampleCount);
+    for (uint32_t i = 0u; i < sampleCount; ++i) {
+        const SF2Sample& s = sf2->samples[i];
+        if (s.end > s.start && s.start < sf2->sampleDataFrames &&
+            s.end <= sf2->sampleDataFrames) {
+            starts.push_back(s.start);
+            counts.push_back(s.end - s.start);
+        }
+    }
+    const uint32_t taskCount = static_cast<uint32_t>(starts.size());
+    if (taskCount == 0u) return;
+
+    std::atomic<uint32_t> next{0u};
+    HilbertSliceJob job{sf2->sampleData, hilbert, starts.data(), counts.data(),
+                        &next, taskCount};
+
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    uint32_t threadCount = sysInfo.dwNumberOfProcessors;
+    if (threadCount > 16u) threadCount = 16u;
+    if (threadCount > taskCount) threadCount = taskCount;
+
+    if (threadCount <= 1u) {
+        HilbertSliceWorker(&job);
+        return;
+    }
+    // WaitForMultipleObjects caps at 64 handles; 16 threads + main is safe.
+    HANDLE handles[17];
+    uint32_t spawned = 0u;
+    for (; spawned + 1u < threadCount; ++spawned) {
+        handles[spawned] = CreateThread(nullptr, 0, HilbertSliceWorker,
+                                        &job, 0, nullptr);
+        if (!handles[spawned]) break;
+    }
+    HilbertSliceWorker(&job);
+    if (spawned != 0u)
+        WaitForMultipleObjects(spawned, handles, TRUE, INFINITE);
+    while (spawned != 0u) CloseHandle(handles[--spawned]);
+}
+
 SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
                                                uint64_t requestId,
                                                std::string& error) {
@@ -4098,6 +4181,27 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
         std::memset(sbuf + frames, 0, 8u * sizeof(int16_t));
         bundle->sampleData = sbuf;
         bundle->sampleDataFrames = frames;
+
+        // Analytic companion store (Hilbert pair) for the phase-rotation
+        // pair form. Built only when the live rotation mode can consume it
+        // (Analytic/Sweep/Random); a later mode switch without the pair
+        // falls back to the allpass forms until the next SoundFont load.
+        const uint32_t rotationMode =
+            liveMailbox_.phaseRotationMode.load(std::memory_order_relaxed);
+        if (rotationMode == 1u || rotationMode == 2u || rotationMode == 4u) {
+            int16_t* hbuf = static_cast<int16_t*>(malloc(
+                (static_cast<size_t>(frames) + 8u) * sizeof(int16_t)));
+            if (!hbuf) {
+                error = "not enough memory to build SoundFont Hilbert pair";
+                DestroySoundFontBundle(bundle);
+                return nullptr;
+            }
+            std::memset(hbuf, 0,
+                        (static_cast<size_t>(frames) + 8u) * sizeof(int16_t));
+            BuildHilbertPairStore(sf2, hbuf);
+            bundle->hilbertData = hbuf;
+            LOG("  Hilbert pair built: %u frames", frames);
+        }
     }
 
     const uint32_t sampCount = sf2->sampleCount;
@@ -4183,6 +4287,26 @@ SoundFontBundle* Driver::BuildSoundFontStackBundle(
         std::memset(stack->sampleData + nextFrames, 0, 8u * sizeof(int16_t));
         free(bank->sampleData);
         bank->sampleData = nullptr;
+        if (bank->hilbertData) {
+            int16_t* grownH = static_cast<int16_t*>(realloc(
+                stack->hilbertData,
+                (static_cast<size_t>(nextFrames) + 8u) * sizeof(int16_t)));
+            if (!grownH) {
+                error = "not enough memory to combine SoundFont Hilbert pairs";
+                DestroySoundFontBundle(bank);
+                DestroySoundFontBundle(stack);
+                return nullptr;
+            }
+            stack->hilbertData = grownH;
+            std::memcpy(stack->hilbertData + bank->sampleBase,
+                        bank->hilbertData,
+                        static_cast<size_t>(bank->sampleDataFrames) *
+                            sizeof(int16_t));
+            std::memset(stack->hilbertData + nextFrames, 0,
+                        8u * sizeof(int16_t));
+            free(bank->hilbertData);
+            bank->hilbertData = nullptr;
+        }
         totalFrames = nextFrames;
         stack->sampleDataFrames = static_cast<uint32_t>(totalFrames);
         stack->banks[stack->bankCount++] = bank;
@@ -4245,6 +4369,11 @@ void Driver::ActivatePendingSoundFontAtBlockBoundary() noexcept {
     SoundFontBundle* primary = SoundFontBankAt(next, 0u);
     soundFontData = primary ? primary->data : nullptr;
     sampleDataStore = next->sampleData;
+    hilbertDataStore = next->hilbertData;
+    // Voices were just reset; new launches seed from the pair availability
+    // of the bundle that is becoming active.
+    if (voiceManager)
+        voiceManager->SetHilbertPairAvailable(next->hilbertData != nullptr);
     samplesStore = primary ? primary->samples : nullptr;
     regionInitialPeaks = primary ? primary->regionInitialPeaks : nullptr;
     preparedRegions = primary ? primary->preparedRegions : nullptr;
@@ -4282,6 +4411,7 @@ void Driver::DestroyAllSoundFontBundles() noexcept {
     soundFontData = nullptr;
     activeSoundFontStack_ = nullptr;
     sampleDataStore = nullptr;
+    hilbertDataStore = nullptr;
     samplesStore = nullptr;
     regionInitialPeaks = nullptr;
     preparedRegions = nullptr;
@@ -5812,6 +5942,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     RenderScalar* render = self->renderScalar;
     RuntimeConfigSnapshot* snap = self->configSnapshot;
     const int16_t* sd = self->sampleDataStore;
+    const int16_t* hd = self->hilbertDataStore;
 
     if (!vm || !cc || !render || !snap) return;
 
@@ -6359,7 +6490,7 @@ const uint32_t importedPages = self->useEventCompiler_
         std::memset(leftBuf, 0, sizeof(float) * numFrames);
         std::memset(rightBuf, 0, sizeof(float) * numFrames);
     } else {
-        render->RenderBlock(*vm, *cc, sd, self->sampleDataFrames,
+        render->RenderBlock(*vm, *cc, sd, hd, self->sampleDataFrames,
                             leftBuf, rightBuf, numFrames, *snap,
                             evtBuf, evCount, self->correctnessMode_,
                             static_cast<uint64_t>(self->virtualRenderSample_));

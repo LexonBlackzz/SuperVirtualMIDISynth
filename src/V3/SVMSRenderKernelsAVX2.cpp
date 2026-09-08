@@ -274,7 +274,8 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
     VoiceSoA& v = *c.voices;
     if (!ValidateLoopVoice(c, handle)) {
         return ScalarRenderSustainedLoop(
-            v, handle, c.sampleData, c.sampleDataFrames, c.outputLeft,
+            v, handle, c.sampleData, c.hilbertData, c.sampleDataFrames,
+            c.outputLeft,
             c.outputRight, c.frameStart, c.frameCount);
     }
 
@@ -1042,7 +1043,8 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
     if (v.rot != nullptr) {
         for (uint32_t i = 0u; i < handleCount; ++i) {
             ScalarRenderSustainedLoop(v, handles[i], context.sampleData,
-                context.sampleDataFrames, context.outputLeft,
+                context.hilbertData, context.sampleDataFrames,
+                context.outputLeft,
                 context.outputRight, context.frameStart, context.frameCount);
         }
         _mm256_zeroupper();
@@ -1097,7 +1099,8 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                     if (v.renderClass[handle] ==
                         static_cast<uint8_t>(VoiceRenderClass::SustainedLoop)) {
                         ScalarRenderSustainedLoop(v, handle, context.sampleData,
-                            context.sampleDataFrames, context.outputLeft,
+                            context.hilbertData, context.sampleDataFrames,
+                            context.outputLeft,
                             context.outputRight, context.frameStart,
                             context.frameCount);
                     }
@@ -1135,7 +1138,8 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         if (!valid) {
             for (uint32_t lane = 0; lane < 8u; ++lane) {
                 ScalarRenderSustainedLoop(v, hs[lane], context.sampleData,
-                    context.sampleDataFrames, context.outputLeft,
+                    context.hilbertData, context.sampleDataFrames,
+                    context.outputLeft,
                     context.outputRight, context.frameStart, context.frameCount);
             }
             continue;
@@ -1186,7 +1190,8 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         if (!denseHandles || v.renderClass[handle] ==
             static_cast<uint8_t>(VoiceRenderClass::SustainedLoop)) {
             ScalarRenderSustainedLoop(v, handle, context.sampleData,
-                context.sampleDataFrames, context.outputLeft, context.outputRight,
+                context.hilbertData, context.sampleDataFrames,
+                context.outputLeft, context.outputRight,
                 context.frameStart, context.frameCount);
         }
     }
