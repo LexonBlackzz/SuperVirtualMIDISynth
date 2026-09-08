@@ -1,6 +1,8 @@
 #ifndef SVMS_LARGE_PAGES_H
 #define SVMS_LARGE_PAGES_H
 
+#if defined(_WIN32)
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -82,5 +84,25 @@ inline void FreeLargePages(void* block) noexcept {
 }
 
 } // namespace svms
+
+#else  // !_WIN32 — large pages are a Windows-only opt-in; every failure
+       // mode is a silent fallback to the aligned allocator anyway.
+
+#include <atomic>
+#include <cstddef>
+
+namespace svms {
+
+inline std::atomic<bool> g_largePagesEnabled{false};
+
+inline bool EnsureLockMemoryPrivilege() noexcept { return false; }
+
+inline void* TryAllocateLargePages(size_t) noexcept { return nullptr; }
+
+inline void FreeLargePages(void*) noexcept {}
+
+} // namespace svms
+
+#endif // _WIN32
 
 #endif // SVMS_LARGE_PAGES_H
