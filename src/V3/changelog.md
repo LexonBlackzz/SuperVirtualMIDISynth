@@ -10,6 +10,10 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-09 fix(v3): BASSMIDI StreamCreate first parameter is the MIDI
+  channel count, not output channels — Kiva's 16-channel request now passes
+  and streams always render the stereo pair (was rejected with a mislabeled
+  BUFLOST error code).
 - 2026-09-09 fix(v3): BASSMIDI shim surfaces Kiva — added BASS_MIDI_FontLoad,
   BASS_ChannelFlags and BASS_GetVersion exports (host + forwarder), and
   corrected BASS_MIDI_StreamEvents to the real 4-arg bassmidi ABI

@@ -9889,8 +9889,11 @@ BOOL WINAPI BASS_MIDI_StreamSetFonts(HSTREAM handle, const void* fonts,
 HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
                                       DWORD freq) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    if (channels == 0u || channels > 2u) {
-        g_bassLastError = 4;  // BASS_ERROR_FORMAT
+    // First parameter = the stream's MIDI channel count (Kiva passes 16 and
+    // then also sets BASS_ATTRIB_MIDI_CHANS); output is always the engine's
+    // stereo pair regardless.
+    if (channels == 0u || channels > 16u) {
+        g_bassLastError = 6;  // BASS_ERROR_FORMAT
         return 0u;
     }
     if (!g_bassFontValid) {
@@ -9901,7 +9904,7 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
     constexpr DWORD kBassStreamDecode = 0x200000u;
     auto stream = std::make_unique<BassStream>();
     stream->sampleRate = freq != 0u ? freq : g_bassInitRate;
-    stream->channels = channels;
+    stream->channels = 2u;
     stream->floating = (flags & kBassSampleFloat) != 0u;
     if ((flags & kBassStreamDecode) == 0u) {
         // BASS streams without the decode flag play through BASS's own
