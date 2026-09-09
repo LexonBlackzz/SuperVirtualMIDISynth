@@ -10059,14 +10059,30 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
     const uint32_t frames = length / bytesPerFrame;
     if (frames == 0u) return 0u;
 
+    // A BASSMIDI decode stream is FINITE: it ends past the last submitted
+    // event plus the same two-second tail ChannelIsActive reports. Pulls
+    // crossing the end return the remaining frames; pulls beyond it fail
+    // with BASS_ERROR_ENDED. Without this, a broken caller length (Kiva's
+    // generator wraps its ring count negative -> an Int32 length near
+    // UINT32_MAX) renders silence forever, straight past the caller's
+    // buffer, while real BASSMIDI stops at the song end.
+    const uint64_t streamEnd = stream->maxEventFrame +
+        static_cast<uint64_t>(stream->sampleRate) * 2u;
+    if (stream->renderedFrames >= streamEnd) {
+        g_bassLastError = 45;  // BASS_ERROR_ENDED
+        return static_cast<DWORD>(-1);
+    }
+    const uint32_t renderable = static_cast<uint32_t>(
+        (std::min<uint64_t>)(frames, streamEnd - stream->renderedFrames));
+
     // NativeRenderOffline caps frames per call at the session's
     // max_block_frames; pump the pull through bounded chunks. Each chunk
     // consumes the pending events whose absolute frames land inside it.
     float* const outFloat = static_cast<float*>(buffer);
     int16_t* const outShort = static_cast<int16_t*>(buffer);
-    for (uint32_t done = 0u; done < frames;) {
+    for (uint32_t done = 0u; done < renderable;) {
         const uint32_t chunk = (std::min)(stream->maxBlockFrames,
-                                          frames - done);
+                                          renderable - done);
         const uint64_t windowEnd = stream->renderedFrames + chunk;
         std::vector<SVMS_OfflineEvent> window;
         std::vector<SVMS_OfflineEvent> stillPending;
@@ -10123,7 +10139,7 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
         done += chunk;
     }
     g_bassLastError = 0;
-    return frames * bytesPerFrame;
+    return renderable * bytesPerFrame;
 }
 
 unsigned long long WINAPI BASS_ChannelGetLength(DWORD handle, DWORD mode) {

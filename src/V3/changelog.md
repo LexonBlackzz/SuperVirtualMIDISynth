@@ -10,6 +10,13 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-09 fix(v3): BASSMIDI decode streams are FINITE like real BASS —
+  GetData past the last event + 2 s tail returns -1/BASS_ERROR_ENDED (45),
+  crossing pulls return partial data. Without termination, a broken caller
+  length (Kiva Modded's generator wraps its ring count negative -> a
+  ~4 GB DWORD length) rendered silence forever past the caller's pinned
+  buffer: the Kiva AV in bass.dll. Verified by drain probe: full, full,
+  partial, -1/45.
 - 2026-09-09 fix(v3): BASS prerender pulls actually render — GetData pumps
   through max_block_frames-bounded chunks (NativeRenderOffline rejects
   frameCount > max_block_frames; the shim asked for unbounded pulls), the
