@@ -10,5 +10,9 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
-- 2026-09-09 chore(v3): version 0.10.0 (0.9 skipped), root CHANGELOG.md
-  added; this running log established.
+- 2026-09-09 fix(v3): BASSMIDI shim surfaces Kiva — added BASS_MIDI_FontLoad,
+  BASS_ChannelFlags and BASS_GetVersion exports (host + forwarder), and
+  corrected BASS_MIDI_StreamEvents to the real 4-arg bassmidi ABI
+  (handle, mode, events, length) with TIME/tick/RAW/CANCEL mode parsing;
+  render pulls now report BASS_ERROR_ENDED (45) past the event tail so
+  prerender pumps terminate.

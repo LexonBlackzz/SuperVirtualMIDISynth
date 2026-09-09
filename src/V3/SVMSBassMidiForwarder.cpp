@@ -67,6 +67,11 @@ BOOL WINAPI BASS_SetConfig(DWORD option, DWORD value) {
     return fn ? fn(option, value) : FALSE;
 }
 
+DWORD WINAPI BASS_GetVersion(void) {
+    const auto fn = reinterpret_cast<DWORD(WINAPI*)(void)>(Forward("BASS_GetVersion"));
+    return fn ? fn() : 0x02040400u;
+}
+
 DWORD WINAPI BASS_GetConfig(DWORD option) {
     const auto fn = reinterpret_cast<DWORD(WINAPI*)(DWORD)>(Forward("BASS_GetConfig"));
     return fn ? fn(option) : 0u;
@@ -75,6 +80,12 @@ DWORD WINAPI BASS_GetConfig(DWORD option) {
 int WINAPI BASS_ErrorGetCode(void) {
     const auto fn = reinterpret_cast<int(WINAPI*)(void)>(Forward("BASS_ErrorGetCode"));
     return fn ? fn() : 0;
+}
+
+BOOL WINAPI BASS_MIDI_FontLoad(HSOUNDFONT handle, int preset, int bank) {
+    using Fn = BOOL(WINAPI*)(HSOUNDFONT, int, int);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_FontLoad"));
+    return fn ? fn(handle, preset, bank) : FALSE;
 }
 
 HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
@@ -106,13 +117,13 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
     return fn ? fn(channels, flags, freq) : 0u;
 }
 
-DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle,
+DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
                                                const void* events,
-                                               DWORD count) {
-    using Fn = DWORD(WINAPI*)(HSTREAM, const void*, DWORD);
+                                               DWORD length) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, DWORD, const void*, DWORD);
     const auto fn =
         reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamEvents"));
-    return fn ? fn(handle, events, count) : 0u;
+    return fn ? fn(handle, mode, events, length) : 0u;
 }
 
 DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer,
@@ -186,6 +197,13 @@ BOOL WINAPI BASS_ChannelGetInfo(DWORD handle, void* info) {
     const auto fn =
         reinterpret_cast<Fn>(Forward("BASS_ChannelGetInfo"));
     return fn ? fn(handle, info) : FALSE;
+}
+
+DWORD WINAPI BASS_ChannelFlags(HSTREAM handle, DWORD flags, DWORD mask) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_ChannelFlags"));
+    return fn ? fn(handle, flags, mask) : 0u;
 }
 
 BOOL WINAPI BASS_StreamFree(DWORD handle) {

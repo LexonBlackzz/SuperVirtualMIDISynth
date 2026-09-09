@@ -422,8 +422,10 @@ set(EXPORTS
         BASS_Free
         BASS_SetConfig
         BASS_GetConfig
+        BASS_GetVersion
         BASS_ErrorGetCode
         BASS_MIDI_FontInit
+        BASS_MIDI_FontLoad
         BASS_MIDI_FontFree
         BASS_MIDI_StreamSetFonts
         BASS_MIDI_StreamCreate
@@ -437,6 +439,7 @@ set(EXPORTS
         BASS_ChannelBytes2Seconds
         BASS_ChannelSetAttribute
         BASS_ChannelGetAttribute
+        BASS_ChannelFlags
         BASS_ChannelGetInfo
         BASS_StreamFree
         midiOutGetNumDevs
@@ -760,14 +763,15 @@ set_target_properties(svms_bassmidi_forwarder PROPERTIES
 if(MSVC)
     foreach(exp
             BASS_Init BASS_Free BASS_SetConfig BASS_GetConfig
-            BASS_ErrorGetCode BASS_MIDI_FontInit BASS_MIDI_FontFree
+            BASS_GetVersion BASS_ErrorGetCode BASS_MIDI_FontInit
+            BASS_MIDI_FontLoad BASS_MIDI_FontFree
             BASS_MIDI_StreamSetFonts BASS_MIDI_StreamCreate
             BASS_MIDI_StreamEvents BASS_ChannelGetData
             BASS_ChannelGetLength BASS_ChannelGetPosition
             BASS_ChannelSetPosition BASS_ChannelIsActive
             BASS_ChannelSeconds2Bytes BASS_ChannelBytes2Seconds
             BASS_ChannelSetAttribute BASS_ChannelGetAttribute
-            BASS_ChannelGetInfo BASS_StreamFree)
+            BASS_ChannelFlags BASS_ChannelGetInfo BASS_StreamFree)
         target_link_options(svms_bassmidi_forwarder PRIVATE /EXPORT:${exp})
     endforeach()
 endif()

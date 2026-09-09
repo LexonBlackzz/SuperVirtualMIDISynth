@@ -9823,9 +9823,26 @@ DWORD WINAPI BASS_GetConfig(DWORD option) {
     return 0u;
 }
 
+DWORD WINAPI BASS_GetVersion(void) {
+    // 2.4.4 - .NET BASS wrappers version-check before their first call.
+    return 0x02040400u;
+}
+
 int WINAPI BASS_ErrorGetCode(void) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     return g_bassLastError;
+}
+
+BOOL WINAPI BASS_MIDI_FontLoad(HSOUNDFONT handle, int preset, int bank) {
+    (void)preset; (void)bank;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    if (handle == 0u) {
+        g_bassLastError = 5;  // BASS_ERROR_HANDLE
+        return FALSE;
+    }
+    // The full font materializes at stream creation (single-slot model);
+    // per-preset load accounting is not represented.
+    return TRUE;
 }
 
 HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
@@ -9930,63 +9947,69 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
     return static_cast<HSTREAM>(g_bassStreams.size());  // 1-based handle
 }
 
-DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, const void* events,
-                                    DWORD count) {
+DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
+                                    const void* events, DWORD length) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     BassStream* stream = BassStreamResolve(handle);
-    if (!stream || !events || count == 0u) {
+    if (!stream || !events || length == 0u) {
         g_bassLastError = 20;
         return 0u;
     }
+    // bassmidi.h event modes. For BASS_MIDI_EVENTS_RAW the event channel
+    // rides in the mode's high byte (the .NET wrapper folds it there).
     constexpr DWORD kBassMidiEventsRaw = 0x10000u;
-    constexpr DWORD kBassMidiEventsSync = 0x1000000u;
-    if ((count & kBassMidiEventsSync) != 0u) count &= ~kBassMidiEventsSync;
+    constexpr DWORD kBassMidiEventsTime = 0x1000000u;
+    constexpr DWORD kBassMidiEventsCancel = 0x8000000u;
 
-    // Synchronous BASSMIDI streams run 1 tick = 1 millisecond.
-    const double framesPerTick =
+    if ((mode & kBassMidiEventsCancel) != 0u) stream->pending.clear();
+
+    // Synchronous BASSMIDI streams run 1 tick = 1 millisecond; TIME mode
+    // positions by the struct's millisecond field instead of the tick.
+    const double framesPerMs =
         static_cast<double>(stream->sampleRate) / 1000.0;
+    const uint8_t* cursor = static_cast<const uint8_t*>(events);
     DWORD accepted = 0u;
-    if ((count & kBassMidiEventsRaw) != 0u) {
-        count &= ~kBassMidiEventsRaw;
+    if ((mode & kBassMidiEventsRaw) != 0u) {
         // Raw block: runs of (DWORD tick, DWORD length, MIDI bytes).
-        const uint8_t* cursor = static_cast<const uint8_t*>(events);
-        for (DWORD i = 0u; i < count;) {
-            if (i + 8u > count) break;
-            DWORD tick = 0u, length = 0u;
+        for (DWORD i = 0u; i + 8u <= length;) {
+            DWORD tick = 0u, block = 0u;
             std::memcpy(&tick, cursor + i, 4u);
-            std::memcpy(&length, cursor + i + 4u, 4u);
+            std::memcpy(&block, cursor + i + 4u, 4u);
             i += 8u;
-            if (i + length > count || length == 0u) break;
+            if (block == 0u || i + block > length) break;
             const uint8_t status = cursor[i] & 0xf0u;
-            if (cursor[i] >= 0x80u && length >= 2u + (status == 0xC0u || status == 0xD0u ? 0u : 1u)) {
+            if (cursor[i] >= 0x80u && block >= 2u + (status == 0xC0u || status == 0xD0u ? 0u : 1u)) {
                 const uint32_t message = static_cast<uint32_t>(cursor[i]) |
                     (static_cast<uint32_t>(cursor[i + 1]) << 8u) |
-                    (length > 2u ? static_cast<uint32_t>(cursor[i + 2]) << 16u : 0u);
+                    (block > 2u ? static_cast<uint32_t>(cursor[i + 2]) << 16u : 0u);
                 const uint64_t frame = static_cast<uint64_t>(
-                    static_cast<double>(tick) * framesPerTick);
+                    static_cast<double>(tick) * framesPerMs);
                 stream->pending.push_back(
                     BassPackEvent(static_cast<uint32_t>(
                         (std::min)(frame, static_cast<uint64_t>(UINT32_MAX))),
                         message));
                 stream->maxEventFrame = (std::max)(stream->maxEventFrame, frame);
             }
-            i += length;
+            i += block;
             ++accepted;
         }
     } else {
-        // BASS_MIDI_EVENT structures: {event, param, chan, tick, pos}.
+        // BASS_MIDI_EVENT structures: {event, param, chan, tick, time}.
         constexpr DWORD kEventStructSize = 20u;
-        const uint8_t* cursor = static_cast<const uint8_t*>(events);
-        for (DWORD i = 0u; i < count; ++i, cursor += kEventStructSize) {
-            DWORD type = 0u, param = 0u, chan = 0u, tick = 0u;
-            std::memcpy(&type, cursor, 4u);
-            std::memcpy(&param, cursor + 4u, 4u);
-            std::memcpy(&chan, cursor + 8u, 4u);
-            std::memcpy(&tick, cursor + 12u, 4u);
+        for (DWORD i = 0u; i + kEventStructSize <= length;
+             i += kEventStructSize) {
+            DWORD type = 0u, param = 0u, chan = 0u, tick = 0u, timeMs = 0u;
+            std::memcpy(&type, cursor + i, 4u);
+            std::memcpy(&param, cursor + i + 4u, 4u);
+            std::memcpy(&chan, cursor + i + 8u, 4u);
+            std::memcpy(&tick, cursor + i + 12u, 4u);
+            std::memcpy(&timeMs, cursor + i + 16u, 4u);
+            const DWORD position =
+                (mode & kBassMidiEventsTime) != 0u ? timeMs : tick;
             uint32_t message = 0u;
             if (!BassTranslateMidiEvent(type, param, chan, message)) continue;
             const uint64_t frame = static_cast<uint64_t>(
-                static_cast<double>(tick) * framesPerTick);
+                static_cast<double>(position) * framesPerMs);
             stream->pending.push_back(
                 BassPackEvent(static_cast<uint32_t>(
                     (std::min)(frame, static_cast<uint64_t>(UINT32_MAX))),
@@ -10163,6 +10186,13 @@ BOOL WINAPI BASS_ChannelGetInfo(DWORD handle, void* info) {
     out->flags = (stream->floating ? 0x100u : 0u) | 0x200000u;  // FLOAT|DECODE
     out->ctype = 0x10006u;  // BASS_CTYPE_STREAM_MIDI
     return TRUE;
+}
+
+DWORD WINAPI BASS_ChannelFlags(HSTREAM handle, DWORD flags, DWORD mask) {
+    (void)handle; (void)flags; (void)mask;
+    // Decode streams carry no mutable flags in this shim (no effect chain);
+    // report no previous flags.
+    return 0u;
 }
 
 BOOL WINAPI BASS_StreamFree(DWORD handle) {
