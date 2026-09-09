@@ -10,6 +10,14 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-09 fix(v3): VEH crash reporter scoped to faults inside our own
+  module. Under Kiva + OmniMIDI KDMAPI, OmniMIDI's engine AVs inside
+  USER32 wvsprintfA (its own debug formatting) and our first-chance VEH
+  walked that foreign stack — destabilizing DebugView (which itself AVs on
+  debug streams emitted in that state) and masking the real fault.
+- 2026-09-09 fix(v3): BASS shim gained a file diagnostic channel —
+  %TEMP%\svms_bass.log (FontInit/StreamCreate/StreamEvents/GetData/ENDED),
+  independent of OutputDebugString so it survives the DebugView crash.
 - 2026-09-09 fix(v3): BASS shim exports the BASS_FX surface (BASS_FXReset/
   Free/SetParameters/GetParameters/SetPriority/Version) as no-ops. OmniMIDI's
   KDMAPI loader binds its BuiltInEngine's BASS_FX imports to whatever module

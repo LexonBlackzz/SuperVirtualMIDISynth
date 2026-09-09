@@ -9549,6 +9549,32 @@ LONG WINAPI SvmsCrashFilter(EXCEPTION_POINTERS* ep) {
     __try {
         if (!ep || !ep->ExceptionRecord || ep->ExceptionRecord->ExceptionFlags != 0)
             __leave;
+        // Report only faults inside our own module. Drop-in aliases share
+        // processes with hosts and other synth engines (OmniMIDI's KDMAPI
+        // driver can crash inside wvsprintfA while probing our shim);
+        // walking foreign stacks from a VEH destabilizes the very tools
+        // (DebugView) used to diagnose them.
+        HMODULE selfModule = nullptr;
+        if (!GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(
+                    static_cast<uintptr_t>(
+                        reinterpret_cast<uintptr_t>(&SvmsCrashFilter))),
+                &selfModule) || !selfModule)
+            __leave;
+        const uintptr_t selfBase =
+            reinterpret_cast<uintptr_t>(selfModule);
+        const uintptr_t faultAddress = reinterpret_cast<uintptr_t>(
+            ep->ExceptionRecord->ExceptionAddress);
+        HMODULE faultModule = nullptr;
+        if (faultAddress < selfBase ||
+            !GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(faultAddress), &faultModule) ||
+            faultModule != selfModule)
+            __leave;
         const DWORD code = ep->ExceptionRecord->ExceptionCode;
         // Fatal hardware-style faults only; leave C++ EH / breakpoints alone.
         const bool fatal =
@@ -9743,6 +9769,39 @@ BassStream* BassStreamResolve(DWORD handle) {
     return g_bassStreams[handle - 1u].get();
 }
 
+// File-only diagnostic channel for the BASS shim. Deliberately independent
+// of OutputDebugString: DebugView dies on certain debug streams emitted in
+// OmniMIDI's presence, and this log must survive that. Appends to
+// %TEMP%\svms_bass.log; safe to leave enabled.
+void BassLog(const char* fmt, ...) {
+    char path[MAX_PATH];
+    const UINT n = GetTempPathA(MAX_PATH, path);
+    if (n == 0 || n + 16 >= MAX_PATH) return;
+    lstrcatA(path, "svms_bass.log");
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char line[512];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, args);
+    va_end(args);
+    const size_t len = strnlen(line, sizeof(line));
+    DWORD written = 0;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char stamp[40];
+    _snprintf_s(stamp, sizeof(stamp), _TRUNCATE,
+                "[%02u:%02u:%02u.%03u] ", st.wHour, st.wMinute, st.wSecond,
+                st.wMilliseconds);
+    WriteFile(f, stamp, lstrlenA(stamp), &written, nullptr);
+    WriteFile(f, line, static_cast<DWORD>(len), &written, nullptr);
+    WriteFile(f, "\r\n", 2, &written, nullptr);
+    CloseHandle(f);
+}
+
 SVMS_OfflineEvent BassPackEvent(uint32_t frame, uint32_t message) {
     SVMS_OfflineEvent ev{};
     ev.frame_offset = frame;
@@ -9872,9 +9931,9 @@ HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
         g_bassFontPath = wide;
     }
     g_bassFontValid = !g_bassFontPath.empty();
-    LOG("  BASS FontInit: %s path='%ls' flags=%#x -> %u",
-        wide ? "utf16" : "utf8", g_bassFontPath.c_str(), flags,
-        g_bassFontValid ? 1u : 0u);
+    BassLog("FontInit: %s path='%ls' flags=%#X -> %u",
+            wide ? "utf16" : "utf8", g_bassFontPath.c_str(), flags,
+            g_bassFontValid ? 1u : 0u);
     g_bassLastError = g_bassFontValid ? 0 : 2;  // BASS_ERROR_FILEOPEN
     return g_bassFontValid ? 1u : 0u;           // single font slot
 }
@@ -9958,6 +10017,9 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
     }
     stream->session = session;
     stream->maxBlockFrames = config.max_block_frames;
+    BassLog("StreamCreate: ch=%u flags=%#X freq=%u -> handle=%u",
+            channels, flags, stream->sampleRate,
+            static_cast<uint32_t>(g_bassStreams.size()));
     g_bassStreams.push_back(std::move(stream));
     g_bassLastError = 0;
     return static_cast<HSTREAM>(g_bassStreams.size());  // 1-based handle
@@ -10052,6 +10114,8 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
         }
     }
     g_bassLastError = 0;
+    BassLog("StreamEvents(handle=%u mode=%#X len=%u) -> %u accepted",
+            handle, mode, length, accepted);
     return accepted;
 }
 
@@ -10087,6 +10151,8 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
         static_cast<uint64_t>(stream->sampleRate) * 2u;
     if (stream->renderedFrames >= streamEnd) {
         g_bassLastError = 45;  // BASS_ERROR_ENDED
+        BassLog("GetData(handle=%u) -> ENDED at %llu", handle,
+                static_cast<unsigned long long>(stream->renderedFrames));
         return static_cast<DWORD>(-1);
     }
     const uint32_t renderable = static_cast<uint32_t>(
@@ -10155,6 +10221,12 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
         }
         done += chunk;
     }
+    static uint32_t pullCount = 0u;
+    if ((pullCount++ % 64u) == 0u)
+        BassLog("GetData(handle=%u len=%u) -> %u frames (pull %u, "
+                "cursor=%llu/%llu)", handle, length, renderable, pullCount,
+                static_cast<unsigned long long>(stream->renderedFrames),
+                static_cast<unsigned long long>(streamEnd));
     g_bassLastError = 0;
     return renderable * bytesPerFrame;
 }
