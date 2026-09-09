@@ -10,6 +10,12 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-09 fix(v3): BASS prerender pulls actually render — GetData pumps
+  through max_block_frames-bounded chunks (NativeRenderOffline rejects
+  frameCount > max_block_frames; the shim asked for unbounded pulls), the
+  session requests 64k-frame blocks, FontInit accepts UTF-16 paths with or
+  without the BASS_UNICODE flag (BASS.NET marshaling), and FontInit /
+  StreamCreate failures LOG their path and native result code.
 - 2026-09-09 fix(v3): BASSMIDI StreamCreate first parameter is the MIDI
   channel count, not output channels — Kiva's 16-channel request now passes
   and streams always render the stereo pair (was rejected with a mislabeled

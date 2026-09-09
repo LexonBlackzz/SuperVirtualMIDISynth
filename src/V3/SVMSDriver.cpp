@@ -9722,6 +9722,7 @@ struct BassStream {
     bool floating = true;      // BASS_SAMPLE_FLOAT output; else 16-bit
     uint64_t renderedFrames = 0u;
     uint64_t maxEventFrame = 0u;
+    uint32_t maxBlockFrames = 2048u;  // NativeRenderOffline per-call cap
     // Events accumulated from BASS_MIDI_StreamEvents, sorted by frame at
     // render time and consumed as the pull cursor passes them.
     std::vector<SVMS_OfflineEvent> pending;
@@ -9852,7 +9853,13 @@ HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
         return 0u;
     }
     constexpr DWORD kBassUnicode = 0x40000000u;
-    if (flags & kBassUnicode) {
+    const char* utf8 = reinterpret_cast<const char*>(file);
+    // Callers differ on pairing UTF-16 strings with the BASS_UNICODE flag
+    // (BASS.NET marshals .NET strings as UTF-16); an ASCII-shaped UTF-16
+    // buffer has a NUL in every second byte, so accept both conventions.
+    const bool wide =
+        (flags & kBassUnicode) != 0u || (utf8[0] != 0u && utf8[1] == 0u);
+    if (wide) {
         g_bassFontPath = reinterpret_cast<const wchar_t*>(file);
     } else {
         const char* utf8 = reinterpret_cast<const char*>(file);
@@ -9865,6 +9872,9 @@ HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
         g_bassFontPath = wide;
     }
     g_bassFontValid = !g_bassFontPath.empty();
+    LOG("  BASS FontInit: %s path='%ls' flags=%#x -> %u",
+        wide ? "utf16" : "utf8", g_bassFontPath.c_str(), flags,
+        g_bassFontValid ? 1u : 0u);
     g_bassLastError = g_bassFontValid ? 0 : 2;  // BASS_ERROR_FILEOPEN
     return g_bassFontValid ? 1u : 0u;           // single font slot
 }
@@ -9921,7 +9931,7 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
     config.sample_rate = stream->sampleRate;
     config.max_voices = 2048u;
     config.render_threads = 1u;
-    config.max_block_frames = 2048u;
+    config.max_block_frames = 65536u;
     config.render_backend = SVMS_RENDER_BACKEND_SCALAR;
     config.limiter_enabled = 1u;
     config.limiter_algorithm = SVMS_LIMITER_CLASSIC;
@@ -9938,13 +9948,16 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
         WideCharToMultiByte(CP_UTF8, 0, g_bassFontPath.c_str(), -1,
                             fontUtf8.data(), utf8Length, nullptr, nullptr);
     SVMS_Session session = 0u;
-    if (NativeCreateOfflineSession(&config, fontUtf8.c_str(), &session) !=
-            SVMS_RESULT_OK ||
-        session == 0u) {
+    const SVMS_Result created = NativeCreateOfflineSession(
+        &config, fontUtf8.c_str(), &session);
+    if (created != SVMS_RESULT_OK || session == 0u) {
+        LOG("  BASS StreamCreate: session failed (result=%d) font='%ls'",
+            static_cast<int>(created), g_bassFontPath.c_str());
         g_bassLastError = 2;  // BASS_ERROR_FILEOPEN / font load failed
         return 0u;
     }
     stream->session = session;
+    stream->maxBlockFrames = config.max_block_frames;
     g_bassStreams.push_back(std::move(stream));
     g_bassLastError = 0;
     return static_cast<HSTREAM>(g_bassStreams.size());  // 1-based handle
@@ -10040,68 +10053,74 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
     }
     const uint32_t bytesPerFrame =
         stream->channels * (stream->floating ? 4u : 2u);
-    const bool outputFloat = wantFloat && stream->floating;
     // BASS converts on request; honoring the stream's own format when the
     // caller's flag differs is a follow-up — today both default to float.
-    (void)outputFloat;
+    (void)wantFloat;
     const uint32_t frames = length / bytesPerFrame;
     if (frames == 0u) return 0u;
 
-    // Partition the pending events into this window.
-    std::vector<SVMS_OfflineEvent> window;
-    uint64_t windowEnd = stream->renderedFrames + frames;
-    std::vector<SVMS_OfflineEvent> stillPending;
-    stillPending.reserve(stream->pending.size());
-    for (const SVMS_OfflineEvent& ev : stream->pending) {
-        if (ev.frame_offset < windowEnd) {
-            window.push_back(BassPackEvent(
-                static_cast<uint32_t>(stream->renderedFrames == 0u
-                    ? ev.frame_offset
-                    : ev.frame_offset -
-                          static_cast<uint32_t>(stream->renderedFrames)),
-                ev.packed_message));
-        } else {
-            stillPending.push_back(ev);
+    // NativeRenderOffline caps frames per call at the session's
+    // max_block_frames; pump the pull through bounded chunks. Each chunk
+    // consumes the pending events whose absolute frames land inside it.
+    float* const outFloat = static_cast<float*>(buffer);
+    int16_t* const outShort = static_cast<int16_t*>(buffer);
+    for (uint32_t done = 0u; done < frames;) {
+        const uint32_t chunk = (std::min)(stream->maxBlockFrames,
+                                          frames - done);
+        const uint64_t windowEnd = stream->renderedFrames + chunk;
+        std::vector<SVMS_OfflineEvent> window;
+        std::vector<SVMS_OfflineEvent> stillPending;
+        stillPending.reserve(stream->pending.size());
+        for (const SVMS_OfflineEvent& ev : stream->pending) {
+            if (ev.frame_offset < windowEnd) {
+                window.push_back(BassPackEvent(
+                    static_cast<uint32_t>(
+                        stream->renderedFrames == 0u
+                            ? ev.frame_offset
+                            : ev.frame_offset -
+                                  static_cast<uint32_t>(
+                                      stream->renderedFrames)),
+                    ev.packed_message));
+            } else {
+                stillPending.push_back(ev);
+            }
         }
-    }
-    std::sort(window.begin(), window.end(),
-              [](const SVMS_OfflineEvent& a, const SVMS_OfflineEvent& b) {
-                  if (a.frame_offset != b.frame_offset)
-                      return a.frame_offset < b.frame_offset;
-                  return a.packed_message < b.packed_message;
-              });
-    stream->pending.swap(stillPending);
+        std::sort(window.begin(), window.end(),
+                  [](const SVMS_OfflineEvent& a, const SVMS_OfflineEvent& b) {
+                      if (a.frame_offset != b.frame_offset)
+                          return a.frame_offset < b.frame_offset;
+                      return a.packed_message < b.packed_message;
+                  });
+        stream->pending.swap(stillPending);
 
-    std::vector<float> left(frames), right(frames);
-    const SVMS_Result result = NativeRenderOffline(
-        stream->session, window.data(), static_cast<uint32_t>(window.size()),
-        left.data(), right.data(), frames);
-    if (result != SVMS_RESULT_OK) {
-        g_bassLastError = -1;
-        return static_cast<DWORD>(-1);
-    }
-    stream->renderedFrames = windowEnd;
+        std::vector<float> left(chunk), right(chunk);
+        if (NativeRenderOffline(stream->session, window.data(),
+                                static_cast<uint32_t>(window.size()),
+                                left.data(), right.data(),
+                                chunk) != SVMS_RESULT_OK) {
+            g_bassLastError = -1;
+            return static_cast<DWORD>(-1);
+        }
+        stream->renderedFrames = windowEnd;
 
-    // Interleave planar floats into the caller's format. The stream was
-    // created with BASS_SAMPLE_FLOAT by every known prerender flow; a
-    // 16-bit stream converts here.
-    if (stream->floating) {
-        float* out = static_cast<float*>(buffer);
-        for (uint32_t f = 0u; f < frames; ++f) {
-            out[f * stream->channels] = left[f];
-            if (stream->channels > 1u) out[f * stream->channels + 1u] = right[f];
+        for (uint32_t f = 0u; f < chunk; ++f) {
+            const uint32_t out = done + f;
+            if (stream->floating) {
+                outFloat[out * stream->channels] = left[f];
+                if (stream->channels > 1u)
+                    outFloat[out * stream->channels + 1u] = right[f];
+            } else {
+                auto clamp = [](float v) -> int16_t {
+                    const float s =
+                        v >= -1.0f ? (v <= 1.0f ? v : 1.0f) : -1.0f;
+                    return static_cast<int16_t>(s * 32767.0f);
+                };
+                outShort[out * stream->channels] = clamp(left[f]);
+                if (stream->channels > 1u)
+                    outShort[out * stream->channels + 1u] = clamp(right[f]);
+            }
         }
-    } else {
-        int16_t* out = static_cast<int16_t*>(buffer);
-        for (uint32_t f = 0u; f < frames; ++f) {
-            auto clamp = [](float v) -> int16_t {
-                const float s = v >= -1.0f ? (v <= 1.0f ? v : 1.0f) : -1.0f;
-                return static_cast<int16_t>(s * 32767.0f);
-            };
-            out[f * stream->channels] = clamp(left[f]);
-            if (stream->channels > 1u)
-                out[f * stream->channels + 1u] = clamp(right[f]);
-        }
+        done += chunk;
     }
     g_bassLastError = 0;
     return frames * bytesPerFrame;
