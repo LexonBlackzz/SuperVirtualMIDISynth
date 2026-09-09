@@ -442,6 +442,12 @@ set(EXPORTS
         BASS_ChannelFlags
         BASS_ChannelGetInfo
         BASS_StreamFree
+        BASS_FXReset
+        BASS_FXFree
+        BASS_FXSetParameters
+        BASS_FXGetParameters
+        BASS_FXSetPriority
+        BASS_FXVersion
         midiOutGetNumDevs
         midiOutGetDevCapsA
         midiOutGetDevCapsW
@@ -771,7 +777,9 @@ if(MSVC)
             BASS_ChannelSetPosition BASS_ChannelIsActive
             BASS_ChannelSeconds2Bytes BASS_ChannelBytes2Seconds
             BASS_ChannelSetAttribute BASS_ChannelGetAttribute
-            BASS_ChannelFlags BASS_ChannelGetInfo BASS_StreamFree)
+            BASS_ChannelFlags BASS_ChannelGetInfo BASS_StreamFree
+            BASS_FXReset BASS_FXFree BASS_FXSetParameters
+            BASS_FXGetParameters BASS_FXSetPriority BASS_FXVersion)
         target_link_options(svms_bassmidi_forwarder PRIVATE /EXPORT:${exp})
     endforeach()
 endif()

@@ -10243,6 +10243,42 @@ BOOL WINAPI BASS_ChannelGetInfo(DWORD handle, void* info) {
     return TRUE;
 }
 
+// ── BASS_FX surface ──────────────────────────────────────────────────────
+// OmniMIDI's KDMAPI loader binds its BuiltInEngine's BASS_FX imports to
+// whatever module is loaded as bassmidi/bass.dll (its own BASSMIDI build
+// merges BASS_FX). With our shim loaded under those names, the entry
+// points must exist. This engine has no effect chain, so every call is a
+// successful no-op.
+
+DWORD WINAPI BASS_FXReset(DWORD handle) {
+    (void)handle;
+    return TRUE;
+}
+
+DWORD WINAPI BASS_FXFree(DWORD handle) {
+    (void)handle;
+    return TRUE;
+}
+
+DWORD WINAPI BASS_FXSetParameters(DWORD handle, const void* params) {
+    (void)handle; (void)params;
+    return TRUE;
+}
+
+DWORD WINAPI BASS_FXGetParameters(DWORD handle, void* params) {
+    (void)handle; (void)params;
+    return TRUE;
+}
+
+DWORD WINAPI BASS_FXSetPriority(DWORD handle, int priority) {
+    (void)handle; (void)priority;
+    return TRUE;
+}
+
+DWORD WINAPI BASS_FXVersion(void) {
+    return 0x02040400u;
+}
+
 DWORD WINAPI BASS_ChannelFlags(HSTREAM handle, DWORD flags, DWORD mask) {
     (void)handle; (void)flags; (void)mask;
     // Decode streams carry no mutable flags in this shim (no effect chain);

@@ -10,6 +10,12 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-09 fix(v3): BASS shim exports the BASS_FX surface (BASS_FXReset/
+  Free/SetParameters/GetParameters/SetPriority/Version) as no-ops. OmniMIDI's
+  KDMAPI loader binds its BuiltInEngine's BASS_FX imports to whatever module
+  is loaded as bassmidi.dll (its own BASSMIDI build merges BASS_FX); a shim
+  without those entry points killed KDMAPI process-wide whenever our
+  bassmidi.dll was present alongside it.
 - 2026-09-09 fix(v3): BASSMIDI flagless StreamEvents = BASS_MIDI_EVENTS_SYNC
   — events apply at the CURRENT pull cursor instead of tick 0. Kiva's
   realtime generator drains up to the event time and then sends flagless

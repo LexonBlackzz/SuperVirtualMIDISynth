@@ -199,6 +199,39 @@ BOOL WINAPI BASS_ChannelGetInfo(DWORD handle, void* info) {
     return fn ? fn(handle, info) : FALSE;
 }
 
+DWORD WINAPI BASS_FXReset(DWORD handle) {
+    const auto fn = reinterpret_cast<DWORD(WINAPI*)(DWORD)>(Forward("BASS_FXReset"));
+    return fn ? fn(handle) : TRUE;
+}
+
+DWORD WINAPI BASS_FXFree(DWORD handle) {
+    const auto fn = reinterpret_cast<DWORD(WINAPI*)(DWORD)>(Forward("BASS_FXFree"));
+    return fn ? fn(handle) : TRUE;
+}
+
+DWORD WINAPI BASS_FXSetParameters(DWORD handle, const void* params) {
+    using Fn = DWORD(WINAPI*)(DWORD, const void*);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_FXSetParameters"));
+    return fn ? fn(handle, params) : TRUE;
+}
+
+DWORD WINAPI BASS_FXGetParameters(DWORD handle, void* params) {
+    using Fn = DWORD(WINAPI*)(DWORD, void*);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_FXGetParameters"));
+    return fn ? fn(handle, params) : TRUE;
+}
+
+DWORD WINAPI BASS_FXSetPriority(DWORD handle, int priority) {
+    using Fn = DWORD(WINAPI*)(DWORD, int);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_FXSetPriority"));
+    return fn ? fn(handle, priority) : TRUE;
+}
+
+DWORD WINAPI BASS_FXVersion(void) {
+    const auto fn = reinterpret_cast<DWORD(WINAPI*)(void)>(Forward("BASS_FXVersion"));
+    return fn ? fn() : 0x02040400u;
+}
+
 DWORD WINAPI BASS_ChannelFlags(HSTREAM handle, DWORD flags, DWORD mask) {
     using Fn = DWORD(WINAPI*)(HSTREAM, DWORD, DWORD);
     const auto fn =
