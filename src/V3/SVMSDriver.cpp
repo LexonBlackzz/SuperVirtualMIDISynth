@@ -10033,55 +10033,85 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
         g_bassLastError = 20;
         return 0u;
     }
-    // bassmidi.h event modes. Mode 0 = BASS_MIDI_EVENTS_SYNC: the event
-    // applies at the CURRENT pull position (realtime-style players send
-    // events flagless as they play). For BASS_MIDI_EVENTS_RAW the event
-    // channel rides in the mode's high byte (the .NET wrapper folds it
-    // there).
+    // bassmidi.h event modes — values verified by reflecting
+    // Bass.Net.dll's BASSMIDIEventMode (STRUCT=0, RAW=0x10000,
+    // SYNC=0x1000000, NORSTATUS=0x2000000, CANCEL=0x4000000,
+    // TIME=0x8000000). TIME = "delta-time info is present": the event
+    // carries its stream position (the RAW block header's tick field /
+    // the struct's pos field, both in stream BYTES — BASS_MIDI_EVENT.pos
+    // is documented as bytes). Without TIME, positions are ignored and
+    // the event applies at the CURRENT decode cursor — the realtime
+    // contract players like Kiva's generator rely on (pull up to the
+    // event time, then send the event raw).
     constexpr DWORD kBassMidiEventsRaw = 0x10000u;
-    constexpr DWORD kBassMidiEventsTime = 0x1000000u;
-    constexpr DWORD kBassMidiEventsCancel = 0x8000000u;
+    constexpr DWORD kBassMidiEventsSync = 0x1000000u;   // sync-callback flag
+    constexpr DWORD kBassMidiEventsNorStatus = 0x2000000u;
+    constexpr DWORD kBassMidiEventsCancel = 0x4000000u;
+    constexpr DWORD kBassMidiEventsTime = 0x8000000u;
+    (void)kBassMidiEventsSync;
+    (void)kBassMidiEventsNorStatus;
 
     if ((mode & kBassMidiEventsCancel) != 0u) stream->pending.clear();
 
-    // Synchronous BASSMIDI streams run 1 tick = 1 millisecond; TIME mode
-    // positions by the struct's millisecond field instead of the tick.
-    const double framesPerMs =
-        static_cast<double>(stream->sampleRate) / 1000.0;
-    (void)framesPerMs;
-    // SYNC positioning anchor: the pull cursor. Events sent between pulls
-    // land at the first frame of the NEXT pull — for Kiva's pump this is
-    // exactly the sample the event belongs to, because it drains up to the
-    // event time before sending.
+    const uint32_t bytesPerFrame =
+        stream->channels * (stream->floating ? 4u : 2u);
+    // Positioning anchor for position-less (realtime) events: the pull
+    // cursor. Events sent between pulls land at the first frame of the
+    // NEXT pull — for Kiva's pump this is exactly the sample the event
+    // belongs to, because it drains up to the event time before sending.
     const uint64_t syncFrame = stream->renderedFrames;
     const uint8_t* cursor = static_cast<const uint8_t*>(events);
     DWORD accepted = 0u;
     if ((mode & kBassMidiEventsRaw) != 0u) {
-        // Raw block: runs of (DWORD tick, DWORD length, MIDI bytes).
-        for (DWORD i = 0u; i + 8u <= length;) {
-            DWORD tick = 0u, block = 0u;
-            std::memcpy(&tick, cursor + i, 4u);
-            std::memcpy(&block, cursor + i + 4u, 4u);
-            i += 8u;
-            if (block == 0u || i + block > length) break;
-            const uint8_t status = cursor[i] & 0xf0u;
-            if (cursor[i] >= 0x80u && block >= 2u + (status == 0xC0u || status == 0xD0u ? 0u : 1u)) {
-                const uint32_t message = static_cast<uint32_t>(cursor[i]) |
-                    (static_cast<uint32_t>(cursor[i + 1]) << 8u) |
-                    (block > 2u ? static_cast<uint32_t>(cursor[i + 2]) << 16u : 0u);
-                const uint64_t frame =
-                    (mode & kBassMidiEventsTime) != 0u
-                        ? static_cast<uint64_t>(
-                              static_cast<double>(tick) * framesPerMs)
-                        : syncFrame;
+        if ((mode & kBassMidiEventsTime) != 0u) {
+            // Raw blocks: runs of (DWORD pos, DWORD length, MIDI bytes),
+            // pos = stream byte position of the event (prerender batch
+            // pumps such as BPFA submit absolute byte positions).
+            for (DWORD i = 0u; i + 8u <= length;) {
+                DWORD pos = 0u, block = 0u;
+                std::memcpy(&pos, cursor + i, 4u);
+                std::memcpy(&block, cursor + i + 4u, 4u);
+                i += 8u;
+                if (block == 0u || i + block > length) break;
+                const uint8_t status = cursor[i] & 0xf0u;
+                if (cursor[i] >= 0x80u && block >= 2u + (status == 0xC0u || status == 0xD0u ? 0u : 1u)) {
+                    const uint32_t message = static_cast<uint32_t>(cursor[i]) |
+                        (static_cast<uint32_t>(cursor[i + 1]) << 8u) |
+                        (block > 2u ? static_cast<uint32_t>(cursor[i + 2]) << 16u : 0u);
+                    const uint64_t frame = pos / bytesPerFrame;
+                    stream->pending.push_back(
+                        BassPackEvent(static_cast<uint32_t>(
+                            (std::min)(frame, static_cast<uint64_t>(UINT32_MAX))),
+                            message));
+                    stream->maxEventFrame = (std::max)(stream->maxEventFrame, frame);
+                }
+                i += block;
+                ++accepted;
+            }
+        } else {
+            // Plain raw MIDI byte stream (Bass.Net IntPtr overload: "the
+            // pointer to the event data, e.g. as received in a
+            // MIDIINPROC"): consecutive messages, no per-event headers.
+            // Realtime players (Kiva's SendEventRaw) submit exactly one
+            // 3-byte message per call between pulls.
+            for (DWORD i = 0u; i < length;) {
+                const uint8_t status = cursor[i];
+                if (status < 0x80u) break;  // running status unsupported here
+                const uint32_t message =
+                    static_cast<uint32_t>(status) |
+                    (i + 1u < length ? static_cast<uint32_t>(cursor[i + 1]) << 8u : 0u) |
+                    (i + 2u < length ? static_cast<uint32_t>(cursor[i + 2]) << 16u : 0u);
+                const DWORD consumed =
+                    2u + ((status & 0xf0u) == 0xC0u || (status & 0xf0u) == 0xD0u ? 0u : 1u);
+                if (i + consumed > length) break;
                 stream->pending.push_back(
                     BassPackEvent(static_cast<uint32_t>(
-                        (std::min)(frame, static_cast<uint64_t>(UINT32_MAX))),
+                        (std::min)(syncFrame, static_cast<uint64_t>(UINT32_MAX))),
                         message));
-                stream->maxEventFrame = (std::max)(stream->maxEventFrame, frame);
+                stream->maxEventFrame = (std::max)(stream->maxEventFrame, syncFrame);
+                i += consumed;
+                ++accepted;
             }
-            i += block;
-            ++accepted;
         }
     } else {
         // BASS_MIDI_EVENT structures: {event, param, chan, tick, time}.
@@ -10096,15 +10126,14 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
             std::memcpy(&timeMs, cursor + i + 16u, 4u);
             uint32_t message = 0u;
             if (!BassTranslateMidiEvent(type, param, chan, message)) continue;
-            // SYNC (flagless) ignores both struct position fields entirely.
+            // With TIME the struct's pos field carries the stream byte
+            // position (BASS_MIDI_EVENT.pos is documented as bytes);
+            // without TIME both position fields are ignored and the event
+            // applies at the current cursor.
             const uint64_t frame =
                 (mode & kBassMidiEventsTime) != 0u
-                    ? static_cast<uint64_t>(
-                          static_cast<double>(timeMs) * framesPerMs)
-                    : (mode & kBassMidiEventsRaw) != 0u
-                          ? static_cast<uint64_t>(
-                                static_cast<double>(tick) * framesPerMs)
-                          : syncFrame;
+                    ? timeMs / bytesPerFrame
+                    : syncFrame;
             stream->pending.push_back(
                 BassPackEvent(static_cast<uint32_t>(
                     (std::min)(frame, static_cast<uint64_t>(UINT32_MAX))),

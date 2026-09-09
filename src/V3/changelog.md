@@ -24,6 +24,13 @@ Format: newest first, one bullet per landed change, matching the commit's
   is loaded as bassmidi.dll (its own BASSMIDI build merges BASS_FX); a shim
   without those entry points killed KDMAPI process-wide whenever our
   bassmidi.dll was present alongside it.
+- 2026-09-09 fix(v3): BASSMIDI event modes corrected against the real ABI
+  (Bass.Net reflection): STRUCT=0, RAW=0x10000, SYNC=0x1000000,
+  NORSTATUS=0x2000000, CANCEL=0x4000000, TIME=0x8000000 (the shim had
+  SYNC/TIME/CANCEL values shifted). TIME positions by the stream BYTE
+  position (RAW block header / BASS_MIDI_EVENT.pos); position-less events
+  (RAW without TIME — Kiva's SendEventRaw plain 3-byte messages) anchor at
+  the pull cursor. Probe verifies all three realtime shapes + drain.
 - 2026-09-09 fix(v3): BASSMIDI flagless StreamEvents = BASS_MIDI_EVENTS_SYNC
   — events apply at the CURRENT pull cursor instead of tick 0. Kiva's
   realtime generator drains up to the event time and then sends flagless
