@@ -10,6 +10,13 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-09 fix(v3): BASSMIDI flagless StreamEvents = BASS_MIDI_EVENTS_SYNC
+  — events apply at the CURRENT pull cursor instead of tick 0. Kiva's
+  realtime generator drains up to the event time and then sends flagless
+  RAW blocks (RAW|NORSTATUS); anchoring them at the pull position makes the
+  shim match the realtime contract (was: every note landed at frame 0 ->
+  completely silent output). Probe: send-then-pull sounds, pull-then-send
+  leaves the earlier window silent.
 - 2026-09-09 fix(v3): BASSMIDI decode streams are FINITE like real BASS —
   GetData past the last event + 2 s tail returns -1/BASS_ERROR_ENDED (45),
   crossing pulls return partial data. Without termination, a broken caller

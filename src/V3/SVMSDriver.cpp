@@ -9971,8 +9971,11 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
         g_bassLastError = 20;
         return 0u;
     }
-    // bassmidi.h event modes. For BASS_MIDI_EVENTS_RAW the event channel
-    // rides in the mode's high byte (the .NET wrapper folds it there).
+    // bassmidi.h event modes. Mode 0 = BASS_MIDI_EVENTS_SYNC: the event
+    // applies at the CURRENT pull position (realtime-style players send
+    // events flagless as they play). For BASS_MIDI_EVENTS_RAW the event
+    // channel rides in the mode's high byte (the .NET wrapper folds it
+    // there).
     constexpr DWORD kBassMidiEventsRaw = 0x10000u;
     constexpr DWORD kBassMidiEventsTime = 0x1000000u;
     constexpr DWORD kBassMidiEventsCancel = 0x8000000u;
@@ -9983,6 +9986,12 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
     // positions by the struct's millisecond field instead of the tick.
     const double framesPerMs =
         static_cast<double>(stream->sampleRate) / 1000.0;
+    (void)framesPerMs;
+    // SYNC positioning anchor: the pull cursor. Events sent between pulls
+    // land at the first frame of the NEXT pull — for Kiva's pump this is
+    // exactly the sample the event belongs to, because it drains up to the
+    // event time before sending.
+    const uint64_t syncFrame = stream->renderedFrames;
     const uint8_t* cursor = static_cast<const uint8_t*>(events);
     DWORD accepted = 0u;
     if ((mode & kBassMidiEventsRaw) != 0u) {
@@ -9998,8 +10007,11 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
                 const uint32_t message = static_cast<uint32_t>(cursor[i]) |
                     (static_cast<uint32_t>(cursor[i + 1]) << 8u) |
                     (block > 2u ? static_cast<uint32_t>(cursor[i + 2]) << 16u : 0u);
-                const uint64_t frame = static_cast<uint64_t>(
-                    static_cast<double>(tick) * framesPerMs);
+                const uint64_t frame =
+                    (mode & kBassMidiEventsTime) != 0u
+                        ? static_cast<uint64_t>(
+                              static_cast<double>(tick) * framesPerMs)
+                        : syncFrame;
                 stream->pending.push_back(
                     BassPackEvent(static_cast<uint32_t>(
                         (std::min)(frame, static_cast<uint64_t>(UINT32_MAX))),
@@ -10020,12 +10032,17 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
             std::memcpy(&chan, cursor + i + 8u, 4u);
             std::memcpy(&tick, cursor + i + 12u, 4u);
             std::memcpy(&timeMs, cursor + i + 16u, 4u);
-            const DWORD position =
-                (mode & kBassMidiEventsTime) != 0u ? timeMs : tick;
             uint32_t message = 0u;
             if (!BassTranslateMidiEvent(type, param, chan, message)) continue;
-            const uint64_t frame = static_cast<uint64_t>(
-                static_cast<double>(position) * framesPerMs);
+            // SYNC (flagless) ignores both struct position fields entirely.
+            const uint64_t frame =
+                (mode & kBassMidiEventsTime) != 0u
+                    ? static_cast<uint64_t>(
+                          static_cast<double>(timeMs) * framesPerMs)
+                    : (mode & kBassMidiEventsRaw) != 0u
+                          ? static_cast<uint64_t>(
+                                static_cast<double>(tick) * framesPerMs)
+                          : syncFrame;
             stream->pending.push_back(
                 BassPackEvent(static_cast<uint32_t>(
                     (std::min)(frame, static_cast<uint64_t>(UINT32_MAX))),
