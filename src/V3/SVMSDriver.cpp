@@ -9741,6 +9741,15 @@ typedef DWORD HSOUNDFONT;
 
 namespace {
 
+struct BassFontMapEntry {
+    uint32_t font = 0u;      // BASS_MIDI_FontInit handle
+    int32_t spreset = -1;
+    int32_t sbank = -1;
+    int32_t dpreset = -1;
+    int32_t dbank = -1;
+    int32_t dbanklsb = -1;
+};
+
 struct BassStream {
     SVMS_Session session = 0;
     uint32_t sampleRate = 44100u;
@@ -9749,6 +9758,9 @@ struct BassStream {
     uint64_t renderedFrames = 0u;
     uint64_t maxEventFrame = 0u;
     uint32_t maxBlockFrames = 2048u;  // NativeRenderOffline per-call cap
+    uint32_t voiceLimit = 4096u;      // BASS_ATTRIB_MIDI_VOICES -> session pool
+    std::wstring fontPath;            // font materialized into the session
+    std::vector<BassFontMapEntry> fontConfig;  // per-stream FONTEX list
     // Events accumulated from BASS_MIDI_StreamEvents, sorted by frame at
     // render time and consumed as the pull cursor passes them.
     std::vector<SVMS_OfflineEvent> pending;
@@ -9757,12 +9769,94 @@ struct BassStream {
     // they are re-based at the next pull.
 };
 
+// Soundfont slots from BASS_MIDI_FontInit. Handles are 1-based indices into
+// this vector and are never reused (matching BASS's handle semantics).
+struct BassFont {
+    std::wstring path;
+    DWORD flags = 0u;      // BASS_MIDI_FONT_XGDRUMS etc.
+    bool freed = false;
+};
+
 std::mutex g_bassMutex;
 std::vector<std::unique_ptr<BassStream>> g_bassStreams;
+std::vector<BassFont> g_bassFonts;
+// Default soundfont configuration (BASS_MIDI_StreamSetFonts with handle 0):
+// applied by subsequently created streams. Earlier entries have priority
+// (BASSMIDI rule, Bass.Net.xml StreamSetFonts docs).
+std::vector<BassFontMapEntry> g_bassDefaultFonts;
 uint32_t g_bassInitRate = 44100u;
-std::wstring g_bassFontPath;
-bool g_bassFontValid = false;
 int g_bassLastError = 0;   // BASS_ERROR codes: 0 = BASS_OK
+
+const BassFont* BassFontResolve(uint32_t handle) {
+    if (handle == 0u || handle > g_bassFonts.size()) return nullptr;
+    const BassFont& font = g_bassFonts[handle - 1u];
+    if (font.freed || font.path.empty()) return nullptr;
+    return &font;
+}
+
+// The soundfont list's first valid entry provides the session's font: the
+// native offline-session API takes a single path, so stacked-font fallback
+// (later entries) is not represented — the priority rule (earlier wins) is.
+const wchar_t* BassResolveFontPath(
+    const std::vector<BassFontMapEntry>& config) {
+    for (const BassFontMapEntry& entry : config) {
+        const BassFont* font = BassFontResolve(entry.font);
+        if (font) return font->path.c_str();
+    }
+    return nullptr;
+}
+
+// Offline session configuration for BASSMIDI decode streams. Threads/backend
+// are engine defaults (0 = auto hardware-concurrency up to 16, AUTO backend),
+// and the limiter is OFF: real BASSMIDI hands raw float samples to the
+// player, and prerender hosts (Kiva) apply their own limiter on top —
+// double limiting produced pumping/"trash" output.
+void BassBuildOfflineConfig(SVMS_OfflineSessionConfig* config,
+                            const BassStream& stream, uint32_t maxVoices) {
+    config->struct_size = sizeof(*config);
+    config->struct_version = SVMS_STRUCT_VERSION_1;
+    config->session_kind = SVMS_SESSION_OFFLINE_RENDER;
+    config->sample_rate = stream.sampleRate;
+    config->max_voices = maxVoices;
+    config->render_threads = 0u;
+    config->max_block_frames = 65536u;
+    config->render_backend = SVMS_RENDER_BACKEND_AUTO;
+    config->limiter_enabled = 0u;
+    config->limiter_algorithm = SVMS_LIMITER_CLASSIC;
+    config->master_volume = 1.0f;
+    config->limiter_threshold = 0.95f;
+    config->limiter_lookahead_ms = 3.0f;
+    config->limiter_attack_ms = 0.5f;
+    config->limiter_release_ms = 100.0f;
+}
+
+// (Re)create the session behind a stream with the given font and voice
+// limit. Only valid while the pull cursor is still at frame 0; pending
+// events carry absolute frames and survive the swap. Returns false (stream
+// unchanged) if the new session cannot be created.
+bool BassApplyStreamFont(BassStream& stream, const std::wstring& fontPath,
+                         uint32_t maxVoices) {
+    SVMS_OfflineSessionConfig config{};
+    BassBuildOfflineConfig(&config, stream, maxVoices);
+    const int utf8Length = WideCharToMultiByte(
+        CP_UTF8, 0, fontPath.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string fontUtf8(utf8Length > 0 ? utf8Length - 1 : 0, '\0');
+    if (utf8Length > 1)
+        WideCharToMultiByte(CP_UTF8, 0, fontPath.c_str(), -1,
+                            fontUtf8.data(), utf8Length, nullptr, nullptr);
+    SVMS_Session session = 0u;
+    if (NativeCreateOfflineSession(&config, fontUtf8.c_str(), &session) !=
+            SVMS_RESULT_OK ||
+        session == 0u) {
+        return false;
+    }
+    if (stream.session) NativeDestroySession(stream.session);
+    stream.session = session;
+    stream.fontPath = fontPath;
+    stream.voiceLimit = maxVoices;
+    stream.maxBlockFrames = config.max_block_frames;
+    return true;
+}
 
 BassStream* BassStreamResolve(DWORD handle) {
     if (handle == 0u || handle > g_bassStreams.size()) return nullptr;
@@ -9809,9 +9903,21 @@ SVMS_OfflineEvent BassPackEvent(uint32_t frame, uint32_t message) {
     return ev;
 }
 
-// BASSMIDI event type → packed short message. Returns false for types the
+// BASSMIDI event type → packed short message(s). Returns false for types the
 // shim does not synthesize (they are counted as consumed, not errors —
 // BASSMIDI itself ignores unknown types).
+//
+// Type numbers verified by reflecting Bass.Net.dll's BASSMIDIEvent enum
+// (2026-09-11): NOTE=1, PROGRAM=2, CHANPRES=3, PITCH=4, PITCHRANGE=5,
+// DRUMS=6, FINETUNE=7, COARSETUNE=8, MASTERVOL=9, BANK=10, MODULATION=11,
+// VOLUME=12, PAN=13, EXPRESSION=14, SUSTAIN=15, SOUNDOFF=16, RESET=17,
+// NOTESOFF=18, PORTAMENTO=19, PORTATIME=20, ..., REVERB=23, CHORUS=24,
+// CUTOFF=25, RESONANCE=26, ..., DRUM_*=50..58, SYSTEM=61, TEMPO=62, ...,
+// BANK_LSB=70, KEYPRES=71, ..., SOSTENUTO=76, ... (the previous table mapped
+// 16/17 to CC91/CC93 — SOUNDOFF/RESET were being played as reverb/chorus).
+// Only engine-implemented messages are emitted; RPN types (5/7/8), reverb /
+// chorus sends (23/24), and per-note controllers have no SVMS channel
+// mapping (CC6/38/71/74/91/93 are unmapped) and are consumed as no-ops.
 bool BassTranslateMidiEvent(DWORD type, DWORD param, DWORD chan,
                             uint32_t& out) {
     if (chan >= 16u) return false;
@@ -9830,24 +9936,43 @@ bool BassTranslateMidiEvent(DWORD type, DWORD param, DWORD chan,
             out = 0xE0u | chan | ((param & 0x7fu) << 8u) |
                   (((param >> 7u) & 0x7fu) << 16u);
             return true;
+        case 10u:  // MIDI_EVENT_BANK → CC0 (bank select coarse)
+            out = 0xB0u | chan | (0u << 8u) | ((param & 0xffu) << 16u);
+            return true;
         case 11u:  // MIDI_EVENT_MODULATION → CC1
         case 12u:  // MIDI_EVENT_VOLUME → CC7
         case 13u:  // MIDI_EVENT_PAN → CC10
         case 14u:  // MIDI_EVENT_EXPRESSION → CC11
         case 15u:  // MIDI_EVENT_SUSTAIN → CC64
-        case 16u:  // MIDI_EVENT_REVERB → CC91
-        case 17u:  // MIDI_EVENT_CHORUS → CC93
         {
-            static const uint32_t kCcMap[] = {1u, 7u, 10u, 11u, 64u, 91u, 93u};
+            static const uint32_t kCcMap[] = {1u, 7u, 10u, 11u, 64u};
             out = 0xB0u | chan |
                   (kCcMap[type - 11u] << 8u) | ((param & 0xffu) << 16u);
             return true;
         }
-        case 10u:  // MIDI_EVENT_BANK → CC0 (bank select coarse)
-            out = 0xB0u | chan | (0u << 8u) | ((param & 0xffu) << 16u);
+        case 16u:  // MIDI_EVENT_SOUNDOFF → CC120 (all sound off)
+            out = 0xB0u | chan | (120u << 8u) | ((param & 0xffu) << 16u);
+            return true;
+        case 17u:  // MIDI_EVENT_RESET → CC121 (reset all controllers)
+            out = 0xB0u | chan | (121u << 8u) | ((param & 0xffu) << 16u);
+            return true;
+        case 18u:  // MIDI_EVENT_NOTESOFF → CC123 (all notes off)
+            out = 0xB0u | chan | (123u << 8u) | ((param & 0xffu) << 16u);
+            return true;
+        case 70u:  // MIDI_EVENT_BANK_LSB → CC32 (bank select fine)
+            out = 0xB0u | chan | (32u << 8u) | ((param & 0xffu) << 16u);
+            return true;
+        case 71u:  // MIDI_EVENT_KEYPRES → 0xA0 poly aftertouch:
+                   // param = (key << 16) | pressure (Bass.Net StreamGetEvent:
+                   // the key rides in the HIWORD for per-note events)
+            out = 0xA0u | chan | (((param >> 16u) & 0xffu) << 8u) |
+                  ((param & 0xffu) << 16u);
+            return true;
+        case 76u:  // MIDI_EVENT_SOSTENUTO → CC66
+            out = 0xB0u | chan | (66u << 8u) | ((param & 0xffu) << 16u);
             return true;
         default:
-            return false;  // per-note controllers, RPN, system: refine later
+            return false;  // RPN/reverb/chorus/per-note CCs: engine no-ops
     }
 }
 
@@ -9893,18 +10018,6 @@ int WINAPI BASS_ErrorGetCode(void) {
     return g_bassLastError;
 }
 
-BOOL WINAPI BASS_MIDI_FontLoad(HSOUNDFONT handle, int preset, int bank) {
-    (void)preset; (void)bank;
-    std::lock_guard<std::mutex> lock(g_bassMutex);
-    if (handle == 0u) {
-        g_bassLastError = 5;  // BASS_ERROR_HANDLE
-        return FALSE;
-    }
-    // The full font materializes at stream creation (single-slot model);
-    // per-preset load accounting is not represented.
-    return TRUE;
-}
-
 HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     if (!file) {
@@ -9918,40 +10031,132 @@ HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
     // buffer has a NUL in every second byte, so accept both conventions.
     const bool wide =
         (flags & kBassUnicode) != 0u || (utf8[0] != 0u && utf8[1] == 0u);
+    BassFont font;
+    font.flags = flags;
     if (wide) {
-        g_bassFontPath = reinterpret_cast<const wchar_t*>(file);
+        font.path = reinterpret_cast<const wchar_t*>(file);
     } else {
-        const char* utf8 = reinterpret_cast<const char*>(file);
         const int wideLength = MultiByteToWideChar(
             CP_UTF8, 0, utf8, -1, nullptr, 0);
-        std::wstring wide(wideLength > 0 ? wideLength - 1 : 0, L'\0');
+        std::wstring converted(wideLength > 0 ? wideLength - 1 : 0, L'\0');
         if (wideLength > 1)
-            MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide.data(),
+            MultiByteToWideChar(CP_UTF8, 0, utf8, -1, converted.data(),
                                 wideLength);
-        g_bassFontPath = wide;
+        font.path = converted;
     }
-    g_bassFontValid = !g_bassFontPath.empty();
-    BassLog("FontInit: %s path='%ls' flags=%#X -> %u",
-            wide ? "utf16" : "utf8", g_bassFontPath.c_str(), flags,
-            g_bassFontValid ? 1u : 0u);
-    g_bassLastError = g_bassFontValid ? 0 : 2;  // BASS_ERROR_FILEOPEN
-    return g_bassFontValid ? 1u : 0u;           // single font slot
+    const bool valid = !font.path.empty();
+    const uint32_t handle = valid ? static_cast<uint32_t>(g_bassFonts.size() + 1u) : 0u;
+    if (valid) {
+        BassLog("FontInit: %s path='%ls' flags=%#X -> handle=%u",
+                wide ? "utf16" : "utf8", font.path.c_str(), flags, handle);
+        g_bassFonts.push_back(std::move(font));
+    } else {
+        BassLog("FontInit: %s path=<empty> flags=%#X -> failed",
+                wide ? "utf16" : "utf8", flags);
+    }
+    g_bassLastError = valid ? 0 : 2;  // BASS_ERROR_FILEOPEN
+    return valid ? handle : 0u;
+}
+
+BOOL WINAPI BASS_MIDI_FontLoad(HSOUNDFONT handle, int preset, int bank) {
+    (void)preset; (void)bank;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    if (!BassFontResolve(handle)) {
+        g_bassLastError = 5;  // BASS_ERROR_HANDLE
+        return FALSE;
+    }
+    // The full font materializes when the session is created; per-preset
+    // load accounting is not represented.
+    return TRUE;
 }
 
 BOOL WINAPI BASS_MIDI_FontFree(HSOUNDFONT handle) {
-    (void)handle;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    // The font is materialized per stream; freeing the slot before a
-    // stream is created would strand it. BASSMIDI prerender flows init
-    // fonts once and keep them for the process lifetime.
+    if (handle == 0u || handle > g_bassFonts.size()) {
+        g_bassLastError = 5;  // BASS_ERROR_HANDLE
+        return FALSE;
+    }
+    g_bassFonts[handle - 1u].freed = true;
     return TRUE;
 }
 
 BOOL WINAPI BASS_MIDI_StreamSetFonts(HSTREAM handle, const void* fonts,
                                      DWORD count) {
-    (void)handle; (void)fonts; (void)count;
-    // v1: streams bind the FontInit path at creation; per-stream font
-    // lists are not represented yet.
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    if (!fonts && (count & 0xffffffu) != 0u) {
+        g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+        return FALSE;
+    }
+    // The count parameter doubles as the entry-format carrier (verified by
+    // disassembling BASS_MIDI_StreamSetFonts' copy helper and Bass.Net's
+    // wrapper IL, which ORs 0x1000000 into count for FONTEX arrays):
+    //   count & 0x1000000 -> BASS_MIDI_FONTEX  (6 x 32-bit, 24 bytes)
+    //   count & 0x2000000 -> FONTEX with a 64-bit font field (unsupported)
+    //   otherwise         -> BASS_MIDI_FONT    (font, preset, bank; 12 bytes)
+    const DWORD format = count & 0x3000000u;
+    const DWORD entries = count & 0xffffffu;
+    if (format == 0x2000000u) {
+        BassLog("StreamSetFonts(handle=%u): 64-bit-font variant unsupported",
+                handle);
+        g_bassLastError = 20;
+        return FALSE;
+    }
+    std::vector<BassFontMapEntry> list(entries);
+    for (DWORD i = 0u; i < entries; ++i) {
+        BassFontMapEntry& entry = list[i];
+        if (format == 0x1000000u) {
+            std::memcpy(&entry.font, static_cast<const uint8_t*>(fonts) +
+                                         i * 24u, 4u);
+            std::memcpy(&entry.spreset, static_cast<const uint8_t*>(fonts) +
+                                            i * 24u + 4u, 4u);
+            std::memcpy(&entry.sbank, static_cast<const uint8_t*>(fonts) +
+                                          i * 24u + 8u, 4u);
+            std::memcpy(&entry.dpreset, static_cast<const uint8_t*>(fonts) +
+                                            i * 24u + 12u, 4u);
+            std::memcpy(&entry.dbank, static_cast<const uint8_t*>(fonts) +
+                                          i * 24u + 16u, 4u);
+            std::memcpy(&entry.dbanklsb, static_cast<const uint8_t*>(fonts) +
+                                             i * 24u + 20u, 4u);
+        } else {
+            std::memcpy(&entry.font, static_cast<const uint8_t*>(fonts) +
+                                         i * 12u, 4u);
+            std::memcpy(&entry.spreset, static_cast<const uint8_t*>(fonts) +
+                                            i * 12u + 4u, 4u);
+            std::memcpy(&entry.sbank, static_cast<const uint8_t*>(fonts) +
+                                          i * 12u + 8u, 4u);
+        }
+        if (!BassFontResolve(entry.font)) {
+            g_bassLastError = 20;  // BASS_ERROR_ILLPARAM: bad font handle
+            BassLog("StreamSetFonts(handle=%u): entry %u has bad font %u",
+                    handle, i, entry.font);
+            return FALSE;
+        }
+    }
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream && handle != 0u) {
+        g_bassLastError = 5;  // BASS_ERROR_HANDLE
+        return FALSE;
+    }
+    if (handle == 0u) {
+        g_bassDefaultFonts = std::move(list);
+        BassLog("StreamSetFonts(handle=0): default config, %u entries",
+                entries);
+    } else {
+        stream->fontConfig = std::move(list);
+        // The session took its font at creation; if the stream's list picks
+        // a different (higher-priority) font, rebuild while untouched. The
+        // priority path of the per-stream list is authoritative.
+        const wchar_t* path = BassResolveFontPath(stream->fontConfig);
+        if (path && stream->renderedFrames == 0u &&
+            path != stream->fontPath) {
+            BassLog("StreamSetFonts(handle=%u): font switch '%ls' -> '%ls'",
+                    handle, stream->fontPath.c_str(), path);
+            BassApplyStreamFont(*stream, path, stream->voiceLimit);
+        } else {
+            BassLog("StreamSetFonts(handle=%u): %u entries (font unchanged)",
+                    handle, entries);
+        }
+    }
     return TRUE;
 }
 
@@ -9963,10 +10168,6 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
     // stereo pair regardless.
     if (channels == 0u || channels > 16u) {
         g_bassLastError = 6;  // BASS_ERROR_FORMAT
-        return 0u;
-    }
-    if (!g_bassFontValid) {
-        g_bassLastError = 21;  // BASS_ERROR_NOTAVAIL: no soundfont
         return 0u;
     }
     constexpr DWORD kBassSampleFloat = 0x100u;
@@ -9982,43 +10183,36 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
         g_bassLastError = 6;  // BASS_ERROR_NONET-ish: unsupported request
         return 0u;
     }
+    // Font selection: the stream-level config (rarely set pre-create) wins,
+    // then the default config, then the most recent FontInit slot — the
+    // single-slot behavior of the previous shim, kept as the fallback for
+    // hosts that never call StreamSetFonts(0, ...).
+    const std::vector<BassFontMapEntry>* config =
+        stream->fontConfig.empty() ? &g_bassDefaultFonts
+                                   : &stream->fontConfig;
+    const wchar_t* fontPath = BassResolveFontPath(*config);
+    if (!fontPath) {
+        for (auto it = g_bassFonts.rbegin(); it != g_bassFonts.rend(); ++it) {
+            if (!it->freed && !it->path.empty()) {
+                fontPath = it->path.c_str();
+                break;
+            }
+        }
+    }
+    if (!fontPath) {
+        g_bassLastError = 21;  // BASS_ERROR_NOTAVAIL: no soundfont
+        return 0u;
+    }
 
-    SVMS_OfflineSessionConfig config{};
-    config.struct_size = sizeof(config);
-    config.struct_version = SVMS_STRUCT_VERSION_1;
-    config.session_kind = SVMS_SESSION_OFFLINE_RENDER;
-    config.sample_rate = stream->sampleRate;
-    config.max_voices = 2048u;
-    config.render_threads = 1u;
-    config.max_block_frames = 65536u;
-    config.render_backend = SVMS_RENDER_BACKEND_SCALAR;
-    config.limiter_enabled = 1u;
-    config.limiter_algorithm = SVMS_LIMITER_CLASSIC;
-    config.master_volume = 1.0f;
-    config.limiter_threshold = 0.95f;
-    config.limiter_lookahead_ms = 3.0f;
-    config.limiter_attack_ms = 0.5f;
-    config.limiter_release_ms = 100.0f;
-
-    const int utf8Length = WideCharToMultiByte(
-        CP_UTF8, 0, g_bassFontPath.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string fontUtf8(utf8Length > 0 ? utf8Length - 1 : 0, '\0');
-    if (utf8Length > 1)
-        WideCharToMultiByte(CP_UTF8, 0, g_bassFontPath.c_str(), -1,
-                            fontUtf8.data(), utf8Length, nullptr, nullptr);
-    SVMS_Session session = 0u;
-    const SVMS_Result created = NativeCreateOfflineSession(
-        &config, fontUtf8.c_str(), &session);
-    if (created != SVMS_RESULT_OK || session == 0u) {
-        LOG("  BASS StreamCreate: session failed (result=%d) font='%ls'",
-            static_cast<int>(created), g_bassFontPath.c_str());
+    if (!BassApplyStreamFont(*stream, fontPath, stream->voiceLimit)) {
+        LOG("  BASS StreamCreate: session failed font='%ls'", fontPath);
         g_bassLastError = 2;  // BASS_ERROR_FILEOPEN / font load failed
         return 0u;
     }
-    stream->session = session;
-    stream->maxBlockFrames = config.max_block_frames;
-    BassLog("StreamCreate: ch=%u flags=%#X freq=%u -> handle=%u",
-            channels, flags, stream->sampleRate,
+    BassLog("StreamCreate: ch=%u flags=%#X freq=%u voices=%u font='%ls' "
+            "-> handle=%u",
+            channels, flags, stream->sampleRate, stream->voiceLimit,
+            stream->fontPath.c_str(),
             static_cast<uint32_t>(g_bassStreams.size()));
     g_bassStreams.push_back(std::move(stream));
     g_bassLastError = 0;
@@ -10061,6 +10255,12 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
     // belongs to, because it drains up to the event time before sending.
     const uint64_t syncFrame = stream->renderedFrames;
     const uint8_t* cursor = static_cast<const uint8_t*>(events);
+    // Channel override: mode's low 16 bits carry a 1-based channel number
+    // (0 = none); the override replaces each event's channel nibble/field.
+    const DWORD override = mode & 0xffffu;
+    const uint8_t overrideChan =
+        override != 0u && override <= 16u
+            ? static_cast<uint8_t>(override - 1u) : 0u;
     DWORD accepted = 0u;
     if ((mode & kBassMidiEventsRaw) != 0u) {
         if ((mode & kBassMidiEventsTime) != 0u) {
@@ -10075,7 +10275,10 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
                 if (block == 0u || i + block > length) break;
                 const uint8_t status = cursor[i] & 0xf0u;
                 if (cursor[i] >= 0x80u && block >= 2u + (status == 0xC0u || status == 0xD0u ? 0u : 1u)) {
-                    const uint32_t message = static_cast<uint32_t>(cursor[i]) |
+                    const uint32_t message =
+                        static_cast<uint32_t>(
+                            override != 0u ? status | overrideChan
+                                           : cursor[i]) |
                         (static_cast<uint32_t>(cursor[i + 1]) << 8u) |
                         (block > 2u ? static_cast<uint32_t>(cursor[i + 2]) << 16u : 0u);
                     const uint64_t frame = pos / bytesPerFrame;
@@ -10098,7 +10301,9 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
                 const uint8_t status = cursor[i];
                 if (status < 0x80u) break;  // running status unsupported here
                 const uint32_t message =
-                    static_cast<uint32_t>(status) |
+                    static_cast<uint32_t>(
+                        override != 0u ? (status & 0xf0u) | overrideChan
+                                       : status) |
                     (i + 1u < length ? static_cast<uint32_t>(cursor[i + 1]) << 8u : 0u) |
                     (i + 2u < length ? static_cast<uint32_t>(cursor[i + 2]) << 16u : 0u);
                 const DWORD consumed =
@@ -10124,6 +10329,7 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
             std::memcpy(&chan, cursor + i + 8u, 4u);
             std::memcpy(&tick, cursor + i + 12u, 4u);
             std::memcpy(&timeMs, cursor + i + 16u, 4u);
+            if (override != 0u && override <= 16u) chan = overrideChan;
             uint32_t message = 0u;
             if (!BassTranslateMidiEvent(type, param, chan, message)) continue;
             // With TIME the struct's pos field carries the stream byte
@@ -10149,15 +10355,37 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
 }
 
 DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
-    constexpr DWORD kBassDataFloat = 0x400u;
-    constexpr DWORD kBassDataAvailable = 0u;
-    if ((length & kBassDataAvailable) != 0u) return 0u;  // pull-driven
+    // Flag values reflected from Bass.Net (BASSData):
+    // BASS_DATA_FLOAT = 0x40000000, BASS_DATA_AVAILABLE = 0.
+    // (The previous shim used 0x400, so the float bit survived the strip and
+    // Kiva's 1 MB pulls were read as ~1 GB requests — frames beyond the
+    // caller's buffer were rendered and written: the "trash audio" overrun.)
+    constexpr DWORD kBassDataFloat = 0x40000000u;
+    constexpr DWORD kBassDataNoPos = 0x800000u;
+    // BASS_DATA_AVAILABLE == 0: an available-bytes query is the
+    // (nullptr, length=0) call shape.
+    const bool available = buffer == nullptr && length == 0u;
     const bool wantFloat = (length & kBassDataFloat) != 0u;
-    length &= ~(kBassDataFloat | 0x800000u);
+    length &= ~(kBassDataFloat | kBassDataNoPos);
 
     std::lock_guard<std::mutex> lock(g_bassMutex);
     BassStream* stream = BassStreamResolve(handle);
     if (!stream || !stream->session || !buffer || length == 0u) {
+        if (available && stream && stream->session) {
+            // Available-bytes query: everything up to the two-second tail.
+            const uint32_t bytesPerFrame =
+                stream->channels * (stream->floating ? 4u : 2u);
+            const uint64_t streamEnd = stream->maxEventFrame +
+                static_cast<uint64_t>(stream->sampleRate) * 2u;
+            const uint64_t frames =
+                streamEnd > stream->renderedFrames
+                    ? streamEnd - stream->renderedFrames
+                    : 0u;
+            g_bassLastError = 0;
+            return static_cast<DWORD>(
+                (std::min<uint64_t>)(frames, 0x7fffffffu / bytesPerFrame) *
+                bytesPerFrame);
+        }
         g_bassLastError = stream ? 20 : 5;  // 5 = BASS_ERROR_HANDLE
         return static_cast<DWORD>(-1);
     }
@@ -10213,12 +10441,15 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
                 stillPending.push_back(ev);
             }
         }
-        std::sort(window.begin(), window.end(),
-                  [](const SVMS_OfflineEvent& a, const SVMS_OfflineEvent& b) {
-                      if (a.frame_offset != b.frame_offset)
-                          return a.frame_offset < b.frame_offset;
-                      return a.packed_message < b.packed_message;
-                  });
+        // Non-decreasing frame order for NativeRenderOffline. Within one
+        // frame the SUBMISSION order is kept (stable sort): same-frame
+        // sequences such as RPN selects before their data entry are
+        // position-sensitive, so never reorder by packed message.
+        std::stable_sort(window.begin(), window.end(),
+                         [](const SVMS_OfflineEvent& a,
+                            const SVMS_OfflineEvent& b) {
+                             return a.frame_offset < b.frame_offset;
+                         });
         stream->pending.swap(stillPending);
 
         std::vector<float> left(chunk), right(chunk);
@@ -10314,14 +10545,87 @@ double WINAPI BASS_ChannelBytes2Seconds(DWORD handle, unsigned long long pos) {
 }
 
 BOOL WINAPI BASS_ChannelSetAttribute(DWORD handle, DWORD attrib, float value) {
-    (void)handle; (void)attrib; (void)value;
-    return TRUE;
+    // Attribute codes reflected from Bass.Net (BASSAttribute):
+    // MIDI_CHANS = 0x12002, MIDI_VOICES = 0x12003, MIDI_VOICES_ACTIVE =
+    // 0x12004, MIDI_STATE = 0x12005, SRC = 0x12006.
+    constexpr DWORD kBassAttribMidiChans = 0x12002u;
+    constexpr DWORD kBassAttribMidiVoices = 0x12003u;
+    constexpr DWORD kBassAttribMidiSrc = 0x12006u;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream) {
+        g_bassLastError = 5;  // BASS_ERROR_HANDLE
+        return FALSE;
+    }
+    if (attrib == kBassAttribMidiVoices) {
+        if (!std::isfinite(value) || value < 1.0f ||
+            value > static_cast<float>(svms::kMaxPolyphony)) {
+            g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+            return FALSE;
+        }
+        const uint32_t voices = static_cast<uint32_t>(value);
+        if (voices == stream->voiceLimit) return TRUE;
+        if (stream->renderedFrames == 0u && !stream->fontPath.empty()) {
+            // Prerender flows set attribs before the first pull; the
+            // session is rebuilt at frame 0 (pending events keep their
+            // absolute frames and survive the swap).
+            if (!BassApplyStreamFont(*stream, stream->fontPath, voices)) {
+                g_bassLastError = 2;
+                BassLog("ChannelSetAttribute(MIDI_VOICES=%u): rebuild FAILED",
+                        voices);
+                return FALSE;
+            }
+            BassLog("ChannelSetAttribute(MIDI_VOICES=%u): session rebuilt",
+                    voices);
+        } else {
+            // Mid-render resize is not supported forward-only; record the
+            // request so GetAttribute reports it, but keep rendering.
+            stream->voiceLimit = voices;
+            BassLog("ChannelSetAttribute(MIDI_VOICES=%u) mid-render: "
+                    "recorded only", voices);
+        }
+        return TRUE;
+    }
+    if (attrib == kBassAttribMidiChans || attrib == kBassAttribMidiSrc) {
+        // The engine renders a fixed 16-channel input with its own
+        // interpolation; both attribs are accepted as no-ops.
+        return TRUE;
+    }
+    return TRUE;  // permissive: unrecognized attribs succeed as no-ops
 }
 
-BOOL WINAPI BASS_ChannelGetAttribute(DWORD handle, DWORD attrib, float* value) {
-    (void)handle; (void)attrib;
-    if (value) *value = 1.0f;
-    return TRUE;
+BOOL WINAPI BASS_ChannelGetAttribute(DWORD handle, DWORD attrib,
+                                     float* value) {
+    constexpr DWORD kBassAttribMidiVoices = 0x12003u;
+    constexpr DWORD kBassAttribMidiVoicesActive = 0x12004u;
+    constexpr DWORD kBassAttribMidiSrc = 0x12006u;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream || !value) {
+        g_bassLastError = stream ? 20 : 5;
+        return FALSE;
+    }
+    if (attrib == kBassAttribMidiVoices) {
+        *value = static_cast<float>(stream->voiceLimit);
+        return TRUE;
+    }
+    if (attrib == kBassAttribMidiVoicesActive) {
+        SVMS_OfflineTelemetry telemetry{};
+        telemetry.struct_size = sizeof(telemetry);
+        telemetry.struct_version = SVMS_STRUCT_VERSION_1;
+        if (NativeGetOfflineTelemetry(stream->session, &telemetry) ==
+            SVMS_RESULT_OK)
+            *value = static_cast<float>(telemetry.active_voices);
+        else
+            *value = 0.0f;
+        return TRUE;
+    }
+    if (attrib == kBassAttribMidiSrc) {
+        *value = 0.0f;  // engine's linear interpolation is not BASS's SRC
+        return TRUE;
+    }
+    g_bassLastError = 20;
+    return FALSE;
 }
 
 BOOL WINAPI BASS_ChannelGetInfo(DWORD handle, void* info) {
