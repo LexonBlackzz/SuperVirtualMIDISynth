@@ -157,18 +157,65 @@ public:
             priorOffset = events[i].frame_offset;
         }
 
-        if (outputLeft) std::fill(outputLeft, outputLeft + frameCount, 0.0f);
-        if (outputRight) std::fill(outputRight, outputRight + frameCount, 0.0f);
-        uint32_t cursor = 0u;
+        float* const outL = outputLeft ? outputLeft
+                                       : state.scratchLeft.data();
+        float* const outR = outputRight ? outputRight
+                                        : state.scratchRight.data();
+        // Convert the caller's packed messages to RenderEvents and hand the
+        // WHOLE block to the production RenderBlock machinery: events
+        // dispatch at their exact frames inside the whole-voice/dense/sparse
+        // renderers with the worker pool. (The previous per-event
+        // Dispatch+span loop re-entered RenderBlock once per event — at
+        // Black MIDI event densities that is a RenderBlock call every few
+        // frames and rendered at a fraction of realtime.)
+        state.renderEvents.clear();
+        state.renderEvents.reserve(eventCount);
+        uint32_t applied = 0u;
         for (uint32_t i = 0u; i < eventCount; ++i) {
-            const uint32_t offset = events[i].frame_offset;
-            RenderSpan(state, outputLeft, outputRight, cursor, offset - cursor);
-            cursor = offset;
-            state.synth.Dispatch(events[i].packed_message,
-                                 state.outputFrame + cursor);
+            const uint32_t message = events[i].packed_message;
+            const uint8_t status = static_cast<uint8_t>(message & 0xffu);
+            RenderEventType type;
+            switch (status & 0xf0u) {
+            case 0x90u:
+                type = (message & 0xff0000u) != 0u
+                    ? RenderEventType::NoteOn : RenderEventType::NoteOff;
+                break;
+            case 0x80u: type = RenderEventType::NoteOff; break;
+            case 0xb0u: type = RenderEventType::ControlChange; break;
+            case 0xc0u: type = RenderEventType::ProgramChange; break;
+            case 0xd0u: type = RenderEventType::ChannelPressure; break;
+            case 0xe0u: type = RenderEventType::PitchBend; break;
+            default: continue;  // system/per-note: no standalone mapping
+            }
+            RenderEvent ev{};
+            ev.type = type;
+            ev.channel = status & 0x0fu;
+            ev.data1 = static_cast<uint8_t>((message >> 8u) & 0x7fu);
+            ev.data2 = static_cast<uint8_t>((message >> 16u) & 0x7fu);
+            ev.frameOffset = events[i].frame_offset;
+            // Monotonic across calls so later-call control fences dominate
+            // earlier-call note-ons, exactly like the realtime scheduler.
+            ev.ingressSequence = state.submittedEvents + applied;
+            if (ev.frameOffset < frameCount) {
+                state.renderEvents.push_back(ev);
+                ++applied;
+            } else {
+                // Event at the block's end: outside tested RenderBlock
+                // dispatch territory. Apply it directly after the block,
+                // preserving the previous call's dispatch order.
+                state.pendingTailEvents.push_back(ev);
+            }
         }
-        RenderSpan(state, outputLeft, outputRight, cursor,
-                   frameCount - cursor);
+        state.synth.RenderWithEvents(
+            state.renderEvents.data(),
+            static_cast<uint32_t>(state.renderEvents.size()),
+            outL, outR, frameCount, state.outputFrame);
+        if (!state.pendingTailEvents.empty()) {
+            state.synth.SetCursor(state.outputFrame + frameCount);
+            for (const RenderEvent& ev : state.pendingTailEvents)
+                state.synth.ApplyRenderEvent(ev);
+            state.pendingTailEvents.clear();
+        }
         state.outputFrame += frameCount;
         state.renderedFrames += frameCount;
         state.submittedEvents += eventCount;
@@ -212,6 +259,8 @@ private:
         StandaloneSynth synth;
         std::vector<float> scratchLeft;
         std::vector<float> scratchRight;
+        std::vector<RenderEvent> renderEvents;
+        std::vector<RenderEvent> pendingTailEvents;
         uint64_t outputFrame = 0u;
         uint64_t renderedFrames = 0u;
         uint64_t submittedEvents = 0u;
@@ -265,22 +314,6 @@ private:
         const uint32_t index =
             (static_cast<uint32_t>(session) & ~kTypeBit) - 1u;
         return &slots_[index];
-    }
-
-    static void RenderSpan(State& state, float* outputLeft,
-                           float* outputRight, uint32_t offset,
-                           uint32_t frameCount) {
-        if (frameCount == 0u) return;
-        state.synth.Render(state.scratchLeft.data(), state.scratchRight.data(),
-                           frameCount, state.outputFrame + offset);
-        if (outputLeft) {
-            std::copy_n(state.scratchLeft.data(), frameCount,
-                        outputLeft + offset);
-        }
-        if (outputRight) {
-            std::copy_n(state.scratchRight.data(), frameCount,
-                        outputRight + offset);
-        }
     }
 
     std::array<Slot, kCapacity> slots_{};

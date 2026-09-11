@@ -10,6 +10,30 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-12 perf(v3): BASSMIDI offline sessions render through the
+  production RenderBlock machinery. The native offline path dispatched each
+  event individually and rendered a span between events — at Black MIDI
+  densities a full RenderBlock call every few frames (0.08x realtime on a
+  chopped-notes load). Events now convert to RenderEvents and hand the whole
+  block to RenderBlock (whole-voice/dense/sparse + worker pool), via a
+  production EventDispatcher wired into StandaloneSynth whose bend routing
+  goes through VoiceManager::ApplyChannelBendRatio (pre-pass-aware).
+  Throughput: 0.08x -> ~10.4x realtime on chopped-notes @16k note rate;
+  sustained ~49x; probe peaks bit-identical to the old path.
+- 2026-09-12 perf(v3): BASS shim render-ahead cache — GetData refills in
+  max_block_frames engine chunks and serves pull-sized requests, so
+  small-pull callers (CSCore ISampleSource reads) match big-pull throughput.
+  Only streams proven batch (a TIME-anchored event seen, no positionless
+  event) render ahead; realtime pumps keep exact cursor anchoring — a deep
+  cache would anchor their positionless events in already-rendered audio
+  (caught by the send-after-pull probe). GetPosition/IsActive/available now
+  report the served cursor.
+- 2026-09-12 feat(v3): StandaloneSynth gained RenderWithEvents (event-batched
+  RenderBlock with correctnessMode=false, i.e. production decimation tiers)
+  plus a static DispatchRenderEvent; offline sessions hold back events at
+  frame_offset == frameCount and apply them after the block (outside tested
+  RenderBlock dispatch territory).
+
 - 2026-09-11 fix(v3): BASS shim GetData BASS_DATA_FLOAT corrected to
   0x40000000 (reflected Bass.Net) — the shim stripped 0x400, so Kiva's
   1 MB pulls arrived still flagged and were treated as ~1 GB requests,

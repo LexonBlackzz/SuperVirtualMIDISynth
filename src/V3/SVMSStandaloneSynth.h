@@ -134,6 +134,13 @@ public:
         limiterConfig.limiterReleaseMs = config.limiterReleaseMs;
         limiter_.Configure(rate_, limiterConfig);
         voices_.SetPhaseRotationMode(config.phaseRotationMode);
+        // Production event dispatch: RenderBlock walks its event array and
+        // calls this at each event's exact frame, so batched event blocks
+        // take the whole-voice/dense fast paths instead of per-event span
+        // rendering. The whole-voice pre-pass also routes bend ops through
+        // VoiceManager::ApplyChannelBendRatio's hook — see
+        // RefreshChannelPitch.
+        renderer_.SetEventDispatcher(&DispatchRenderEventStatic, this);
         return true;
     }
 
@@ -209,6 +216,64 @@ public:
                                   absoluteFrame);
             limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
         }
+    }
+
+    // Production EventDispatcher: applies one render event to the synth
+    // state at the caller's (renderer's) exact frame. Deliberately does NOT
+    // touch SetCurrentFrame — the renderer owns the render clock, matching
+    // Driver::DispatchRenderEvent. ChannelPressure has no standalone
+    // handler (parity with Dispatch()'s switch); it is consumed as a no-op.
+    static void DispatchRenderEventStatic(const RenderEvent& event,
+                                          uint32_t blockCursor,
+                                          void* userData) {
+        (void)blockCursor;
+        StandaloneSynth* self = static_cast<StandaloneSynth*>(userData);
+        if (!self) return;
+        switch (event.type) {
+        case RenderEventType::NoteOn:
+            self->NoteOn(event.channel, event.data1, event.data2);
+            break;
+        case RenderEventType::NoteOff:
+        case RenderEventType::StaleNoteOffBatch:
+            self->NoteOff(event.channel, event.data1);
+            break;
+        case RenderEventType::ControlChange:
+            self->Control(event.channel, event.data1, event.data2);
+            break;
+        case RenderEventType::ProgramChange:
+            self->Program(event.channel, event.data1);
+            break;
+        case RenderEventType::PitchBend:
+            self->Bend(event.channel, event.data1, event.data2);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Render one block with sub-block events dispatched at their exact
+    // frames through the production RenderBlock machinery (whole-voice /
+    // dense / sparse paths, worker pool). Events must be sorted by
+    // frameOffset and carry offsets relative to this block; events at
+    // frameOffset == frameCount must be held back by the caller and applied
+    // via ApplyRenderEvent (outside tested dispatch territory).
+    void RenderWithEvents(const RenderEvent* events, uint32_t eventCount,
+                          float* left, float* right, uint32_t frameCount,
+                          uint64_t absoluteFrame) {
+        std::fill(left, left + frameCount, 0.0f);
+        std::fill(right, right + frameCount, 0.0f);
+        renderer_.RenderBlock(voices_, channels_, sampleData_.data(),
+                              sampleFrames_, left, right, frameCount, cfg_,
+                              events, eventCount, false, absoluteFrame);
+        limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
+    }
+
+    void SetCursor(uint64_t absoluteFrame) {
+        voices_.SetCurrentFrame(absoluteFrame);
+    }
+
+    void ApplyRenderEvent(const RenderEvent& event) {
+        DispatchRenderEventStatic(event, 0u, this);
     }
 
     void ReleaseAll() {
@@ -571,13 +636,13 @@ private:
     void RefreshChannelPitch(uint8_t channel) {
         const float semitones = channels_.GetPitchBendSemitones(channel) +
             sysexMasterFineTune_ + sysexMasterTranspose_;
-        const float common = powf(2.0f, semitones / 12.0f);
-        bendRatio_[channel] = common;
-        voices_.ForEachChannelActive(channel, [&](VoiceHandle voice) {
-            const float scale = voices_.v.pitchBendScales[voice];
-            voices_.v.phaseIncs[voice] = voices_.v.basePhaseIncs[voice] *
-                (scale == 1 ? common : powf(2.0f, semitones * scale / 12.0f));
-        });
+        // Production route: the whole-voice pre-pass installs a bend-op hook
+        // on the VoiceManager, which turns this inline rewrite into a
+        // recorded channel op so batched bend events qualify for the
+        // whole-voice renderer. With no hook set this performs the exact
+        // same per-voice rewrite the inline loop did.
+        voices_.ApplyChannelBendRatio(channel, semitones);
+        bendRatio_[channel] = powf(2.0f, semitones / 12.0f);
     }
 
     void RefreshAllPitch() {

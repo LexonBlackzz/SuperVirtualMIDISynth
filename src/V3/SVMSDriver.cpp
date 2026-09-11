@@ -9755,12 +9755,28 @@ struct BassStream {
     uint32_t sampleRate = 44100u;
     uint32_t channels = 2u;
     bool floating = true;      // BASS_SAMPLE_FLOAT output; else 16-bit
-    uint64_t renderedFrames = 0u;
+    uint64_t renderedFrames = 0u;  // frames rendered into the cache
+    uint64_t servedFrames = 0u;    // frames handed to the caller
     uint64_t maxEventFrame = 0u;
     uint32_t maxBlockFrames = 2048u;  // NativeRenderOffline per-call cap
     uint32_t voiceLimit = 4096u;      // BASS_ATTRIB_MIDI_VOICES -> session pool
     std::wstring fontPath;            // font materialized into the session
     std::vector<BassFontMapEntry> fontConfig;  // per-stream FONTEX list
+    // A positionless (SYNC) event means the caller is a realtime pump:
+    // events must land at the consumption cursor, so the render-ahead
+    // cache is capped to the pull size for such streams.
+    bool syncAnchored = false;
+    // A TIME-anchored event marks the caller as a batch pumper: full
+    // render-ahead caching is safe from then on (see BASS_ChannelGetData).
+    bool sawTimeEvents = false;
+    // Render-ahead cache: interleaved frames in [cacheStart, cacheEnd),
+    // refilled in max_block_frames-bounded engine chunks and served to
+    // pull-sized requests (see BASS_ChannelGetData).
+    std::vector<float> cache;
+    uint32_t cacheStart = 0u;
+    uint32_t cacheEnd = 0u;
+    std::vector<float> scratchLeft;   // planar render targets, maxBlockFrames
+    std::vector<float> scratchRight;
     // Events accumulated from BASS_MIDI_StreamEvents, sorted by frame at
     // render time and consumed as the pull cursor passes them.
     std::vector<SVMS_OfflineEvent> pending;
@@ -9855,6 +9871,12 @@ bool BassApplyStreamFont(BassStream& stream, const std::wstring& fontPath,
     stream.fontPath = fontPath;
     stream.voiceLimit = maxVoices;
     stream.maxBlockFrames = config.max_block_frames;
+    stream.renderedFrames = 0u;
+    stream.servedFrames = 0u;
+    stream.cache.clear();
+    stream.cacheStart = stream.cacheEnd = 0u;
+    stream.scratchLeft.assign(config.max_block_frames, 0.0f);
+    stream.scratchRight.assign(config.max_block_frames, 0.0f);
     return true;
 }
 
@@ -10309,6 +10331,8 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
                 const DWORD consumed =
                     2u + ((status & 0xf0u) == 0xC0u || (status & 0xf0u) == 0xD0u ? 0u : 1u);
                 if (i + consumed > length) break;
+                // Positionless anchor: realtime pump (see syncAnchored).
+                stream->syncAnchored = true;
                 stream->pending.push_back(
                     BassPackEvent(static_cast<uint32_t>(
                         (std::min)(syncFrame, static_cast<uint64_t>(UINT32_MAX))),
@@ -10340,6 +10364,8 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
                 (mode & kBassMidiEventsTime) != 0u
                     ? timeMs / bytesPerFrame
                     : syncFrame;
+            if ((mode & kBassMidiEventsTime) == 0u)
+                stream->syncAnchored = true;  // realtime pump
             stream->pending.push_back(
                 BassPackEvent(static_cast<uint32_t>(
                     (std::min)(frame, static_cast<uint64_t>(UINT32_MAX))),
@@ -10349,6 +10375,7 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
         }
     }
     g_bassLastError = 0;
+    if ((mode & kBassMidiEventsTime) != 0u) stream->sawTimeEvents = true;
     BassLog("StreamEvents(handle=%u mode=%#X len=%u) -> %u accepted",
             handle, mode, length, accepted);
     return accepted;
@@ -10378,8 +10405,8 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
             const uint64_t streamEnd = stream->maxEventFrame +
                 static_cast<uint64_t>(stream->sampleRate) * 2u;
             const uint64_t frames =
-                streamEnd > stream->renderedFrames
-                    ? streamEnd - stream->renderedFrames
+                streamEnd > stream->servedFrames
+                    ? streamEnd - stream->servedFrames
                     : 0u;
             g_bassLastError = 0;
             return static_cast<DWORD>(
@@ -10406,23 +10433,36 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
     // buffer, while real BASSMIDI stops at the song end.
     const uint64_t streamEnd = stream->maxEventFrame +
         static_cast<uint64_t>(stream->sampleRate) * 2u;
-    if (stream->renderedFrames >= streamEnd) {
+    if (stream->servedFrames >= streamEnd) {
         g_bassLastError = 45;  // BASS_ERROR_ENDED
         BassLog("GetData(handle=%u) -> ENDED at %llu", handle,
-                static_cast<unsigned long long>(stream->renderedFrames));
+                static_cast<unsigned long long>(stream->servedFrames));
         return static_cast<DWORD>(-1);
     }
     const uint32_t renderable = static_cast<uint32_t>(
-        (std::min<uint64_t>)(frames, streamEnd - stream->renderedFrames));
+        (std::min<uint64_t>)(frames, streamEnd - stream->servedFrames));
 
-    // NativeRenderOffline caps frames per call at the session's
-    // max_block_frames; pump the pull through bounded chunks. Each chunk
-    // consumes the pending events whose absolute frames land inside it.
-    float* const outFloat = static_cast<float*>(buffer);
-    int16_t* const outShort = static_cast<int16_t*>(buffer);
-    for (uint32_t done = 0u; done < renderable;) {
-        const uint32_t chunk = (std::min)(stream->maxBlockFrames,
-                                          renderable - done);
+    // Render-ahead cache: refill in max_block_frames-bounded chunks and
+    // serve the caller from the cache, so small-pull callers (CSCore's
+    // ISampleSource reads of a few thousand frames) pay the engine's
+    // per-block planning once per 1.4 s of audio instead of once per pull.
+    // Policy: batch pumpers (TIME-anchored events seen, and no positionless
+    // event ever) refill a full engine chunk per call; everyone else —
+    // especially realtime pumps whose positionless events must land at the
+    // consumption cursor — refills exactly the outstanding request.
+    // (Render-ahead on a stream that later sends positionless events would
+    // anchor them in already-rendered audio: the send-after-pull probe
+    // regression.)
+    const bool renderAhead =
+        stream->sawTimeEvents && !stream->syncAnchored;
+    while (stream->cacheEnd - stream->cacheStart < renderable &&
+           stream->renderedFrames < streamEnd) {
+        const uint32_t want =
+            renderable - (stream->cacheEnd - stream->cacheStart);
+        const uint32_t chunk = (std::min<uint64_t>)(
+            renderAhead ? stream->maxBlockFrames : want,
+            streamEnd - stream->renderedFrames);
+        if (chunk == 0u) break;
         const uint64_t windowEnd = stream->renderedFrames + chunk;
         std::vector<SVMS_OfflineEvent> window;
         std::vector<SVMS_OfflineEvent> stillPending;
@@ -10452,40 +10492,66 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
                          });
         stream->pending.swap(stillPending);
 
-        std::vector<float> left(chunk), right(chunk);
         if (NativeRenderOffline(stream->session, window.data(),
                                 static_cast<uint32_t>(window.size()),
-                                left.data(), right.data(),
+                                stream->scratchLeft.data(),
+                                stream->scratchRight.data(),
                                 chunk) != SVMS_RESULT_OK) {
             g_bassLastError = -1;
             return static_cast<DWORD>(-1);
         }
         stream->renderedFrames = windowEnd;
 
-        for (uint32_t f = 0u; f < chunk; ++f) {
-            const uint32_t out = done + f;
-            if (stream->floating) {
-                outFloat[out * stream->channels] = left[f];
-                if (stream->channels > 1u)
-                    outFloat[out * stream->channels + 1u] = right[f];
-            } else {
-                auto clamp = [](float v) -> int16_t {
-                    const float s =
-                        v >= -1.0f ? (v <= 1.0f ? v : 1.0f) : -1.0f;
-                    return static_cast<int16_t>(s * 32767.0f);
-                };
-                outShort[out * stream->channels] = clamp(left[f]);
-                if (stream->channels > 1u)
-                    outShort[out * stream->channels + 1u] = clamp(right[f]);
-            }
+        // Compact consumed frames, then append this chunk interleaved.
+        if (stream->cacheStart > 0u) {
+            stream->cache.erase(
+                stream->cache.begin(),
+                stream->cache.begin() +
+                    static_cast<ptrdiff_t>(stream->cacheStart) *
+                        stream->channels);
+            stream->cacheEnd -= stream->cacheStart;
+            stream->cacheStart = 0u;
         }
-        done += chunk;
+        stream->cache.reserve(
+            static_cast<size_t>(stream->maxBlockFrames) * 2u);
+        for (uint32_t f = 0u; f < chunk; ++f) {
+            stream->cache.push_back(stream->scratchLeft[f]);
+            if (stream->channels > 1u)
+                stream->cache.push_back(stream->scratchRight[f]);
+        }
+        stream->cacheEnd += chunk;
     }
+
+    float* const outFloat = static_cast<float*>(buffer);
+    int16_t* const outShort = static_cast<int16_t*>(buffer);
+    for (uint32_t f = 0u; f < renderable; ++f) {
+        const float l =
+            stream->cache[(stream->cacheStart + f) * stream->channels];
+        const float r = stream->channels > 1u
+            ? stream->cache[(stream->cacheStart + f) * stream->channels + 1u]
+            : 0.0f;
+        if (stream->floating) {
+            outFloat[f * stream->channels] = l;
+            if (stream->channels > 1u)
+                outFloat[f * stream->channels + 1u] = r;
+        } else {
+            auto clamp = [](float v) -> int16_t {
+                const float s =
+                    v >= -1.0f ? (v <= 1.0f ? v : 1.0f) : -1.0f;
+                return static_cast<int16_t>(s * 32767.0f);
+            };
+            outShort[f * stream->channels] = clamp(l);
+            if (stream->channels > 1u)
+                outShort[f * stream->channels + 1u] = clamp(r);
+        }
+    }
+    stream->cacheStart += renderable;
+    stream->servedFrames += renderable;
     static uint32_t pullCount = 0u;
     if ((pullCount++ % 64u) == 0u)
         BassLog("GetData(handle=%u len=%u) -> %u frames (pull %u, "
                 "cursor=%llu/%llu)", handle, length, renderable, pullCount,
-                static_cast<unsigned long long>(stream->renderedFrames),
+                static_cast<unsigned long long>(stream->servedFrames),
                 static_cast<unsigned long long>(streamEnd));
     g_bassLastError = 0;
     return renderable * bytesPerFrame;
@@ -10507,7 +10573,7 @@ unsigned long long WINAPI BASS_ChannelGetPosition(DWORD handle, DWORD mode) {
     BassStream* stream = BassStreamResolve(handle);
     if (!stream) return 0u;
     const uint32_t bytesPerFrame = stream->channels * (stream->floating ? 4u : 2u);
-    return stream->renderedFrames * bytesPerFrame;
+    return stream->servedFrames * bytesPerFrame;
 }
 
 BOOL WINAPI BASS_ChannelSetPosition(DWORD handle, unsigned long long pos, DWORD mode) {
@@ -10520,9 +10586,9 @@ DWORD WINAPI BASS_ChannelIsActive(DWORD handle) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     BassStream* stream = BassStreamResolve(handle);
     if (!stream) return 0u;
-    // 1 = BASS_ACTIVE_PLAYING until the pull cursor passes the last event
-    // plus a two-second tail; 0 = BASS_ACTIVE_STOPPED afterwards.
-    return stream->renderedFrames <= stream->maxEventFrame +
+    // 1 = BASS_ACTIVE_PLAYING until the served cursor passes the last
+    // event plus a two-second tail; 0 = BASS_ACTIVE_STOPPED afterwards.
+    return stream->servedFrames <= stream->maxEventFrame +
         static_cast<uint64_t>(stream->sampleRate) * 2u ? 1u : 0u;
 }
 
