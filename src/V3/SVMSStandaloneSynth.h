@@ -141,6 +141,11 @@ public:
         // VoiceManager::ApplyChannelBendRatio's hook — see
         // RefreshChannelPitch.
         renderer_.SetEventDispatcher(&DispatchRenderEventStatic, this);
+        // Batched steal-victim selection inside LaunchVoiceGroup: provably
+        // identical victims to the sequential per-layer pops (no candidate
+        // insertion can occur inside one launch transaction), at a fraction
+        // of the cost under pool pressure.
+        voices_.SetStealBatchingEnabled(true);
         return true;
     }
 
@@ -262,11 +267,20 @@ public:
                           uint64_t absoluteFrame) {
         std::fill(left, left + frameCount, 0.0f);
         std::fill(right, right + frameCount, 0.0f);
+#if defined(_MSC_VER)
+        const uint64_t renderBegin = __rdtsc();
+#endif
         renderer_.RenderBlock(voices_, channels_, sampleData_.data(),
                               sampleFrames_, left, right, frameCount, cfg_,
                               events, eventCount, false, absoluteFrame);
+#if defined(_MSC_VER)
+        renderCycles_ += __rdtsc() - renderBegin;
+#endif
         limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
     }
+
+    uint32_t GetRenderPaths() const { return renderer_.GetLastRenderPaths(); }
+    uint64_t RenderCycles() const { return renderCycles_; }
 
     void SetCursor(uint64_t absoluteFrame) {
         voices_.SetCurrentFrame(absoluteFrame);
@@ -340,6 +354,11 @@ private:
         uint32_t delay, hold, attack, decay, release;
         bool valid;
     };
+
+    // Launch-transaction scratch: the region group's configurations are
+    // built up front so LaunchVoiceGroup can resolve the batched victim
+    // selection once for the whole note-on (production launch path).
+    VoiceConfiguration launchSetups_[512];
 
     struct RegionCacheEntry {
         uint32_t tag = UINT32_MAX;
@@ -477,23 +496,6 @@ private:
         }
         if (playIndex_ == 0 || playIndex_ >= UINT32_MAX - 1) playIndex_ = 1;
         const uint32_t generation = playIndex_++;
-        VoiceHandle handles[512];
-        uint32_t made = 0;
-#if defined(_MSC_VER)
-        const uint64_t allocBegin = __rdtsc();
-#endif
-        for (; made < count; ++made) {
-            handles[made] = voices_.AllocateVoiceOrSteal(
-                channel, note, velocity, nullptr, count == 1);
-            if (handles[made] == kInvalidVoice) {
-                for (uint32_t index = 0; index < made; ++index)
-                    voices_.RetireVoice(handles[index]);
-                return;
-            }
-        }
-#if defined(_MSC_VER)
-        dispatchProfile.alloc += __rdtsc() - allocBegin;
-#endif
         const float velocityGain = float(velocity) * float(velocity) /
                                    (127.0f * 127.0f);
         const float bend = channels_.GetPitchBendSemitones(channel) +
@@ -509,7 +511,8 @@ private:
                 ? bendRatio_[channel]
                 : powf(2.0f, bend * prepared.bendScale / 12.0f);
             const float gain = velocityGain * prepared.attenuation;
-            VoiceConfiguration voice{};
+            VoiceConfiguration& voice = launchSetups_[i];
+            voice = VoiceConfiguration{};
             voice.sampleStart = uint32_t(region.startOffset);
             voice.sampleEnd = uint32_t(region.endOffset);
             voice.loopStart = uint32_t(region.loopStartOffset);
@@ -534,10 +537,21 @@ private:
             voice.presetIndex = uint16_t(preset);
             voice.regionIndex = uint16_t(regionIndex);
             voice.sampleBacked = 1;
-            voices_.ConfigureVoice(handles[i], voice,
-                                   channels_.GetParams()[channel], count == 1);
         }
+        // Production launch path: one transaction resolves the batched
+        // victim selection once for the whole region group (layers feed on
+        // freed sibling slots), instead of one full steal-transaction per
+        // region. Same victims, same configuration, same commit semantics.
 #if defined(_MSC_VER)
+        const uint64_t allocBegin = __rdtsc();
+#endif
+        VoiceHandle handles[512];
+        const bool launched = voices_.LaunchVoiceGroup(
+            channel, note, velocity, launchSetups_, count, generation,
+            channels_.GetParams()[channel], handles);
+        (void)launched;
+#if defined(_MSC_VER)
+        dispatchProfile.alloc += __rdtsc() - allocBegin;
         dispatchProfile.configure += __rdtsc() - configureBegin;
         dispatchProfile.noteOnTotal += __rdtsc() - totalBegin;
         ++dispatchProfile.noteOnCalls;
@@ -705,6 +719,7 @@ private:
     uint32_t rate_ = 0;
     uint32_t maxVoices_ = 0;
     uint32_t playIndex_ = 0;
+    uint64_t renderCycles_ = 0;
     float master_ = 0;
     float sysexMasterVolume_ = 1.0f;
     float sysexMasterFineTune_ = 0.0f;

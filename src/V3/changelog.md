@@ -10,6 +10,20 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-12 perf(v3): StandaloneSynth note-ons go through the production
+  LaunchVoiceGroup transaction (setups built up front, batched victim
+  selection, sibling slots feed layers) with steal batching enabled, instead
+  of a per-region AllocateVoiceOrSteal + ConfigureVoice loop. Same victims
+  and configuration; sustained workload 50x -> 80x realtime, note-on
+  dispatch cheaper under pool pressure.
+- 2026-09-12 feat(v3): offline telemetry extended (struct_size-gated, 64 ->
+  128 bytes) with the render-path bitmask and the standalone synth's
+  dispatch-phase cycle profile (note-on/off, region resolve, alloc,
+  configure, control, render total); BASS shim logs it per stream (final)
+  and every 64th pull. SVMS_BASS_THREADS env var pins the offline render
+  thread count for parallel-scaling diagnostics (1 thread = 22.4Gcyc vs
+  auto 3.9Gcyc wall on the chopped load — the whole-voice render scales).
+
 - 2026-09-12 perf(v3): BASSMIDI offline sessions render through the
   production RenderBlock machinery. The native offline path dispatched each
   event individually and rendered a span between events — at Black MIDI

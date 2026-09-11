@@ -185,6 +185,18 @@ typedef struct SVMS_OfflineTelemetry {
     uint32_t max_block_frames;
     uint32_t session_kind;
     uint32_t reserved[2];
+    /* v1 extension (older callers sized with the shorter layout simply get
+       less): render-path bitmask (RenderScalar::GetLastRenderPaths) and the
+       dispatch-phase cycle profile of the standalone synth. */
+    uint32_t render_paths;
+    uint32_t dispatch_note_ons;
+    uint64_t dispatch_note_on_cycles;
+    uint64_t dispatch_note_off_cycles;
+    uint64_t dispatch_resolve_cycles;
+    uint64_t dispatch_alloc_cycles;
+    uint64_t dispatch_configure_cycles;
+    uint64_t dispatch_control_cycles;
+    uint64_t render_cycles;
 } SVMS_OfflineTelemetry;
 
 // Isolated real-time session configuration. SoundFont and audio-device names
@@ -441,7 +453,7 @@ static_assert(sizeof(SVMS_OfflineSessionConfig) == 80,
               "SVMS_OfflineSessionConfig ABI changed");
 static_assert(sizeof(SVMS_OfflineEvent) == 16,
               "SVMS_OfflineEvent ABI changed");
-static_assert(sizeof(SVMS_OfflineTelemetry) == 64,
+static_assert(sizeof(SVMS_OfflineTelemetry) == 128,
               "SVMS_OfflineTelemetry ABI changed");
 static_assert(sizeof(SVMS_RealtimeSessionConfig) == 96,
               "SVMS_RealtimeSessionConfig ABI changed");

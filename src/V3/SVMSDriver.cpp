@@ -9835,6 +9835,12 @@ void BassBuildOfflineConfig(SVMS_OfflineSessionConfig* config,
     config->sample_rate = stream.sampleRate;
     config->max_voices = maxVoices;
     config->render_threads = 0u;
+    // Diagnostic override: pin the offline render thread count to compare
+    // parallel scaling (e.g. SVMS_BASS_THREADS=1 vs auto).
+    if (const char* threads = std::getenv("SVMS_BASS_THREADS")) {
+        const int parsed = std::atoi(threads);
+        if (parsed > 0 && parsed <= 64) config->render_threads = (uint32_t)parsed;
+    }
     config->max_block_frames = 65536u;
     config->render_backend = SVMS_RENDER_BACKEND_AUTO;
     config->limiter_enabled = 0u;
@@ -10548,11 +10554,31 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
     stream->cacheStart += renderable;
     stream->servedFrames += renderable;
     static uint32_t pullCount = 0u;
-    if ((pullCount++ % 64u) == 0u)
+    if ((pullCount++ % 64u) == 0u) {
+        SVMS_OfflineTelemetry tel{};
+        tel.struct_size = sizeof(tel);
+        tel.struct_version = SVMS_STRUCT_VERSION_1;
+        if (NativeGetOfflineTelemetry(stream->session, &tel) ==
+            SVMS_RESULT_OK && tel.struct_size >= offsetof(SVMS_OfflineTelemetry, render_cycles) + 8u) {
+            BassLog("profile: paths=%#x render=%.1fMcyc noteon=%u(%.1fMcyc) "
+                    "res=%.1f alloc=%.1f cfg=%.1f noff=%.1f ctl=%.1f "
+                    "act=%u steals=%u",
+                    tel.render_paths,
+                    static_cast<double>(tel.render_cycles) / 1e6,
+                    tel.dispatch_note_ons,
+                    static_cast<double>(tel.dispatch_note_on_cycles) / 1e6,
+                    static_cast<double>(tel.dispatch_resolve_cycles) / 1e6,
+                    static_cast<double>(tel.dispatch_alloc_cycles) / 1e6,
+                    static_cast<double>(tel.dispatch_configure_cycles) / 1e6,
+                    static_cast<double>(tel.dispatch_note_off_cycles) / 1e6,
+                    static_cast<double>(tel.dispatch_control_cycles) / 1e6,
+                    tel.active_voices, tel.voice_steals);
+        }
         BassLog("GetData(handle=%u len=%u) -> %u frames (pull %u, "
                 "cursor=%llu/%llu)", handle, length, renderable, pullCount,
                 static_cast<unsigned long long>(stream->servedFrames),
                 static_cast<unsigned long long>(streamEnd));
+    }
     g_bassLastError = 0;
     return renderable * bytesPerFrame;
 }
@@ -10761,8 +10787,27 @@ BOOL WINAPI BASS_StreamFree(DWORD handle) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     if (handle == 0u || handle > g_bassStreams.size()) return FALSE;
     if (g_bassStreams[handle - 1u]) {
-        if (g_bassStreams[handle - 1u]->session)
-            NativeDestroySession(g_bassStreams[handle - 1u]->session);
+        BassStream* stream = g_bassStreams[handle - 1u].get();
+        if (stream->session) {
+            SVMS_OfflineTelemetry tel{};
+            tel.struct_size = sizeof(tel);
+            tel.struct_version = SVMS_STRUCT_VERSION_1;
+            if (NativeGetOfflineTelemetry(stream->session, &tel) ==
+                SVMS_RESULT_OK) {
+                BassLog("final(handle=%u): rendered=%llu events=%llu "
+                        "render=%.2fGcyc noteons=%u noteon=%.2fGcyc "
+                        "alloc=%.2fGcyc steals=%u act=%u",
+                        handle,
+                        static_cast<unsigned long long>(tel.rendered_frames),
+                        static_cast<unsigned long long>(tel.submitted_events),
+                        static_cast<double>(tel.render_cycles) / 1e9,
+                        tel.dispatch_note_ons,
+                        static_cast<double>(tel.dispatch_note_on_cycles) / 1e9,
+                        static_cast<double>(tel.dispatch_alloc_cycles) / 1e9,
+                        tel.voice_steals, tel.active_voices);
+            }
+            NativeDestroySession(stream->session);
+        }
         g_bassStreams[handle - 1u].reset();
     }
     g_bassLastError = 0;

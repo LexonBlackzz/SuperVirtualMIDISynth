@@ -246,6 +246,17 @@ public:
         result.sample_rate = state.sampleRate;
         result.max_block_frames = state.maxBlockFrames;
         result.session_kind = state.sessionKind;
+        result.render_paths = state.synth.GetRenderPaths();
+        const auto& profile = state.synth.dispatchProfile;
+        result.dispatch_note_ons = static_cast<uint32_t>(
+            (std::min<uint64_t>)(profile.noteOnCalls, UINT32_MAX));
+        result.dispatch_note_on_cycles = profile.noteOnTotal;
+        result.dispatch_note_off_cycles = profile.noteOffTotal;
+        result.dispatch_resolve_cycles = profile.resolve;
+        result.dispatch_alloc_cycles = profile.alloc;
+        result.dispatch_configure_cycles = profile.configure;
+        result.dispatch_control_cycles = profile.controlTotal;
+        result.render_cycles = state.synth.RenderCycles();
         std::memcpy(telemetry, &result,
                     (std::min)(callerSize,
                                static_cast<uint32_t>(sizeof(result))));
