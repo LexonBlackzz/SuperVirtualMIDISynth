@@ -1,4 +1,13 @@
 #include <windows.h>
+
+// Audio-callback census lines ([SVMS] sched/flow/pool/planRefuse): compile-
+// time default OFF. They were the only recurring debug-stream traffic and
+// destabilize DebugView in OmniMIDI's presence; the shim's file channel
+// (%TEMP%\svms_bass.log) carries prerender diagnostics instead. Define
+// SVMS_AUDIO_CENSUS=1 for a diagnostics build.
+#ifndef SVMS_AUDIO_CENSUS
+#define SVMS_AUDIO_CENSUS 0
+#endif
 #if !defined(SVMS_XP_COMPAT)
 #include <dbghelp.h>
 #endif
@@ -6542,7 +6551,9 @@ const uint32_t importedPages = self->useEventCompiler_
             (double)self->telemetry_.lateClampMaxLateness /
                 (double)(self->sampleRate > 0u ? self->sampleRate : 1u) * 1000.0,
             (unsigned)self->telemetry_.lateClampBlockPileupMax);
+#if SVMS_AUDIO_CENSUS
         OutputDebugStringA(schedCensus);
+#endif
         censusLastClamped = self->telemetry_.lateClamped;
         censusLastLate = self->telemetry_.late;
         censusLastDispatched = self->telemetry_.dispatched;
@@ -6584,7 +6595,9 @@ const uint32_t importedPages = self->useEventCompiler_
             (unsigned)self->midiIngress_.TotalSize(),
             (unsigned)self->scheduledSizePublished_.load(std::memory_order_relaxed),
             (unsigned)vm->activeCount_);
+#if SVMS_AUDIO_CENSUS
         OutputDebugStringA(flowCensus);
+#endif
         censusLastNoteOns = self->sf2Telemetry_.noteOns;
         censusLastFenceDrop = self->fenceSuppressedNoteOns_;
         censusLastStale = self->telemetry_.staleNoteOnsSkipped;
@@ -6746,7 +6759,9 @@ const uint32_t importedPages = self->useEventCompiler_
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::TransientLoop),
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::ReleaseLoop),
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::Generic));
+#if SVMS_AUDIO_CENSUS
         OutputDebugStringA(poolCensus);
+#endif
         censusLastCoalesced = self->coalescedAtomic_.load(
             std::memory_order_relaxed);
         // Sparse fallback without the whole-voice path: name the event that
@@ -6760,7 +6775,9 @@ const uint32_t importedPages = self->useEventCompiler_
             std::snprintf(refuseCensus, sizeof(refuseCensus),
                 "[SVMS] planRefuse: type=%u ctrl=%u\n",
                 (unsigned)refuseType, (unsigned)refuseData1);
-            OutputDebugStringA(refuseCensus);
+    #if SVMS_AUDIO_CENSUS
+        OutputDebugStringA(refuseCensus);
+#endif
         }
     }
 
@@ -9895,21 +9912,42 @@ BassStream* BassStreamResolve(DWORD handle) {
 // of OutputDebugString: DebugView dies on certain debug streams emitted in
 // OmniMIDI's presence, and this log must survive that. Appends to
 // %TEMP%\svms_bass.log; safe to leave enabled.
-void BassLog(const char* fmt, ...) {
-    char path[MAX_PATH];
-    const UINT n = GetTempPathA(MAX_PATH, path);
-    if (n == 0 || n + 16 >= MAX_PATH) return;
-    lstrcatA(path, "svms_bass.log");
-    HANDLE f = CreateFileA(path, FILE_APPEND_DATA,
+// File-only diagnostic channel for the BASS shim. Deliberately independent
+// of OutputDebugString: DebugView dies on certain debug streams emitted in
+// OmniMIDI's presence, and this log must survive that. Appends to
+// %TEMP%\svms_bass.log — RATE LIMITED: BassLog drops lines inside a 1 s
+// window, BassLogNow bypasses the throttle for rare lifecycle lines, and
+// the file self-truncates past 4 MB so a long session can never balloon it.
+void BassLogWrite(const char* fmt, va_list args) {
+    static char logPath[MAX_PATH];
+    static bool pathReady = false;
+    if (!pathReady) {
+        const UINT n = GetTempPathA(MAX_PATH, logPath);
+        if (n == 0 || n + 16 >= MAX_PATH) return;
+        lstrcatA(logPath, "svms_bass.log");
+        pathReady = true;
+    }
+    DWORD openFlags = FILE_APPEND_DATA;
+    // Cap the file: past 4 MB, start a fresh log.
+    HANDLE probe = CreateFileA(logPath, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+    if (probe != INVALID_HANDLE_VALUE) {
+        DWORD size = GetFileSize(probe, nullptr);
+        CloseHandle(probe);
+        if (size != INVALID_FILE_SIZE && size > 4u * 1024u * 1024u)
+            openFlags = GENERIC_WRITE;  // + CREATE_ALWAYS below: truncate
+    }
+    HANDLE f = CreateFileA(logPath, openFlags,
                            FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-                           nullptr);
+                           nullptr,
+                           openFlags == GENERIC_WRITE ? CREATE_ALWAYS
+                                                      : OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     char line[512];
-    va_list args;
-    va_start(args, fmt);
     _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, args);
-    va_end(args);
     const size_t len = strnlen(line, sizeof(line));
     DWORD written = 0;
     SYSTEMTIME st;
@@ -9922,6 +9960,30 @@ void BassLog(const char* fmt, ...) {
     WriteFile(f, line, static_cast<DWORD>(len), &written, nullptr);
     WriteFile(f, "\r\n", 2, &written, nullptr);
     CloseHandle(f);
+}
+
+void BassLogNow(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    BassLogWrite(fmt, args);
+    va_end(args);
+}
+
+void BassLog(const char* fmt, ...) {
+    // At most one line per second: diagnostics, not a firehose.
+    static LARGE_INTEGER lastEmit{};
+    static LARGE_INTEGER frequency{};
+    if (frequency.QuadPart == 0) QueryPerformanceFrequency(&frequency);
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    if (lastEmit.QuadPart != 0 &&
+        (now.QuadPart - lastEmit.QuadPart) * 1000 < frequency.QuadPart)
+        return;
+    lastEmit = now;
+    va_list args;
+    va_start(args, fmt);
+    BassLogWrite(fmt, args);
+    va_end(args);
 }
 
 SVMS_OfflineEvent BassPackEvent(uint32_t frame, uint32_t message) {
@@ -10075,11 +10137,11 @@ HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
     const bool valid = !font.path.empty();
     const uint32_t handle = valid ? static_cast<uint32_t>(g_bassFonts.size() + 1u) : 0u;
     if (valid) {
-        BassLog("FontInit: %s path='%ls' flags=%#X -> handle=%u",
+        BassLogNow("FontInit: %s path='%ls' flags=%#X -> handle=%u",
                 wide ? "utf16" : "utf8", font.path.c_str(), flags, handle);
         g_bassFonts.push_back(std::move(font));
     } else {
-        BassLog("FontInit: %s path=<empty> flags=%#X -> failed",
+        BassLogNow("FontInit: %s path=<empty> flags=%#X -> failed",
                 wide ? "utf16" : "utf8", flags);
     }
     g_bassLastError = valid ? 0 : 2;  // BASS_ERROR_FILEOPEN
@@ -10237,7 +10299,7 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
         g_bassLastError = 2;  // BASS_ERROR_FILEOPEN / font load failed
         return 0u;
     }
-    BassLog("StreamCreate: ch=%u flags=%#X freq=%u voices=%u font='%ls' "
+    BassLogNow("StreamCreate: ch=%u flags=%#X freq=%u voices=%u font='%ls' "
             "-> handle=%u",
             channels, flags, stream->sampleRate, stream->voiceLimit,
             stream->fontPath.c_str(),
@@ -10382,8 +10444,13 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
     }
     g_bassLastError = 0;
     if ((mode & kBassMidiEventsTime) != 0u) stream->sawTimeEvents = true;
-    BassLog("StreamEvents(handle=%u mode=%#X len=%u) -> %u accepted",
-            handle, mode, length, accepted);
+    // NO per-call logging here: realtime pumps submit one event per call at
+    // six-figure event rates, and each BassLog line is a file
+    // open/write/close (~30-60us) — pure I/O strangulation of the render.
+    // Failures only.
+    if (accepted == 0u && length != 0u)
+        BassLog("StreamEvents(handle=%u mode=%#X len=%u) accepted 0",
+                handle, mode, length);
     return accepted;
 }
 
@@ -10554,7 +10621,7 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
     stream->cacheStart += renderable;
     stream->servedFrames += renderable;
     static uint32_t pullCount = 0u;
-    if ((pullCount++ % 64u) == 0u) {
+    if ((pullCount++ % 1024u) == 0u) {
         SVMS_OfflineTelemetry tel{};
         tel.struct_size = sizeof(tel);
         tel.struct_version = SVMS_STRUCT_VERSION_1;
@@ -10663,17 +10730,17 @@ BOOL WINAPI BASS_ChannelSetAttribute(DWORD handle, DWORD attrib, float value) {
             // absolute frames and survive the swap).
             if (!BassApplyStreamFont(*stream, stream->fontPath, voices)) {
                 g_bassLastError = 2;
-                BassLog("ChannelSetAttribute(MIDI_VOICES=%u): rebuild FAILED",
+                BassLogNow("ChannelSetAttribute(MIDI_VOICES=%u): rebuild FAILED",
                         voices);
                 return FALSE;
             }
-            BassLog("ChannelSetAttribute(MIDI_VOICES=%u): session rebuilt",
+            BassLogNow("ChannelSetAttribute(MIDI_VOICES=%u): session rebuilt",
                     voices);
         } else {
             // Mid-render resize is not supported forward-only; record the
             // request so GetAttribute reports it, but keep rendering.
             stream->voiceLimit = voices;
-            BassLog("ChannelSetAttribute(MIDI_VOICES=%u) mid-render: "
+            BassLogNow("ChannelSetAttribute(MIDI_VOICES=%u) mid-render: "
                     "recorded only", voices);
         }
         return TRUE;
@@ -10794,7 +10861,7 @@ BOOL WINAPI BASS_StreamFree(DWORD handle) {
             tel.struct_version = SVMS_STRUCT_VERSION_1;
             if (NativeGetOfflineTelemetry(stream->session, &tel) ==
                 SVMS_RESULT_OK) {
-                BassLog("final(handle=%u): rendered=%llu events=%llu "
+                BassLogNow("final(handle=%u): rendered=%llu events=%llu "
                         "render=%.2fGcyc noteons=%u noteon=%.2fGcyc "
                         "alloc=%.2fGcyc steals=%u act=%u",
                         handle,

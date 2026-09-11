@@ -10,6 +10,22 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-12 fix(v3): BASS shim per-event log flood removed — StreamEvents
+  logged a full file open/write/close line per call, and realtime pumps
+  submit one call per MIDI event (the owner's %TEMP% log hit 160 MB /
+  2.4M lines from a single Kiva session). Per-event lines are gone
+  (failures only, rate-limited), GetData profile lines now every 1024th
+  pull, BassLog is throttled to ~1 line/second with a forced variant for
+  rare lifecycle lines (FontInit/StreamCreate/final stats), and the file
+  self-truncates past 4 MB. Live-pump bench (one StreamEvents call per
+  event, 10 ms pulls): 100k notes/s @ 200 poly = 4.6x realtime, 16k @ 88
+  keys = 8.4x.
+- 2026-09-12 fix(v3): realtime audio-callback census lines
+  ([SVMS] sched/flow/pool/planRefuse, every 64 callbacks) are compile-time
+  OFF by default (SVMS_AUDIO_CENSUS=1 to re-enable) — the only recurring
+  debug-stream traffic in the winmm path, and the DebugView destabilizer in
+  OmniMIDI's presence. One-time init/failure messages are unchanged.
+
 - 2026-09-12 perf(v3): StandaloneSynth note-ons go through the production
   LaunchVoiceGroup transaction (setups built up front, batched victim
   selection, sibling slots feed layers) with steal batching enabled, instead
