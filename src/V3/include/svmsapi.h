@@ -196,6 +196,7 @@ typedef struct SVMS_OfflineTelemetry {
     uint64_t dispatch_alloc_cycles;
     uint64_t dispatch_configure_cycles;
     uint64_t dispatch_control_cycles;
+    uint64_t dispatch_coalesced;
     uint64_t render_cycles;
 } SVMS_OfflineTelemetry;
 
@@ -453,7 +454,7 @@ static_assert(sizeof(SVMS_OfflineSessionConfig) == 80,
               "SVMS_OfflineSessionConfig ABI changed");
 static_assert(sizeof(SVMS_OfflineEvent) == 16,
               "SVMS_OfflineEvent ABI changed");
-static_assert(sizeof(SVMS_OfflineTelemetry) == 128,
+static_assert(sizeof(SVMS_OfflineTelemetry) == 136,
               "SVMS_OfflineTelemetry ABI changed");
 static_assert(sizeof(SVMS_RealtimeSessionConfig) == 96,
               "SVMS_RealtimeSessionConfig ABI changed");

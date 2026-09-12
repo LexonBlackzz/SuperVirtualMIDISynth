@@ -15,7 +15,7 @@ typedef char assert_offline_config_size[
 typedef char assert_offline_event_size[
     sizeof(SVMS_OfflineEvent) == 16 ? 1 : -1];
 typedef char assert_offline_telemetry_size[
-    sizeof(SVMS_OfflineTelemetry) == 128 ? 1 : -1];
+    sizeof(SVMS_OfflineTelemetry) == 136 ? 1 : -1];
 typedef char assert_telemetry_size[
     sizeof(SVMS_TelemetryV1) == 128 ? 1 : -1];
 typedef char assert_interface_order[

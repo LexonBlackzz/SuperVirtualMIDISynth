@@ -10629,7 +10629,7 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
             SVMS_RESULT_OK && tel.struct_size >= offsetof(SVMS_OfflineTelemetry, render_cycles) + 8u) {
             BassLog("profile: paths=%#x render=%.1fMcyc noteon=%u(%.1fMcyc) "
                     "res=%.1f alloc=%.1f cfg=%.1f noff=%.1f ctl=%.1f "
-                    "act=%u steals=%u",
+                    "coal=%llu act=%u steals=%u",
                     tel.render_paths,
                     static_cast<double>(tel.render_cycles) / 1e6,
                     tel.dispatch_note_ons,
@@ -10639,6 +10639,7 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
                     static_cast<double>(tel.dispatch_configure_cycles) / 1e6,
                     static_cast<double>(tel.dispatch_note_off_cycles) / 1e6,
                     static_cast<double>(tel.dispatch_control_cycles) / 1e6,
+                    static_cast<unsigned long long>(tel.dispatch_coalesced),
                     tel.active_voices, tel.voice_steals);
         }
         BassLog("GetData(handle=%u len=%u) -> %u frames (pull %u, "
@@ -10862,13 +10863,14 @@ BOOL WINAPI BASS_StreamFree(DWORD handle) {
             if (NativeGetOfflineTelemetry(stream->session, &tel) ==
                 SVMS_RESULT_OK) {
                 BassLogNow("final(handle=%u): rendered=%llu events=%llu "
-                        "render=%.2fGcyc noteons=%u noteon=%.2fGcyc "
-                        "alloc=%.2fGcyc steals=%u act=%u",
+                        "render=%.2fGcyc noteons=%u coal=%llu "
+                        "noteon=%.2fGcyc alloc=%.2fGcyc steals=%u act=%u",
                         handle,
                         static_cast<unsigned long long>(tel.rendered_frames),
                         static_cast<unsigned long long>(tel.submitted_events),
                         static_cast<double>(tel.render_cycles) / 1e9,
                         tel.dispatch_note_ons,
+                        static_cast<unsigned long long>(tel.dispatch_coalesced),
                         static_cast<double>(tel.dispatch_note_on_cycles) / 1e9,
                         static_cast<double>(tel.dispatch_alloc_cycles) / 1e9,
                         tel.voice_steals, tel.active_voices);

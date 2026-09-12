@@ -10,6 +10,20 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-12 feat(v3): offline/standalone synth mirrors the realtime
+  same-key note-on coalescing (SVMSNoteOnCollapse gate in the audio-frame
+  domain — same fixed 20 ms window, same note_on_collapse.threshold config
+  knob, same velocity stacking of collapsed hits, CC120/123 and reset clear
+  the gate). Optional by construction: threshold < 2 (the default) spawns
+  every note-on. Live-pump bench, 800k notes/s hammered on 4 keys: 0.29x
+  realtime with coalescing off (6.4M launches, 12.8M steals) vs 2.45x with
+  threshold 32 (208k launches, 411k steals) — 8.4x. This is the shape the
+  owner's realtime path already handles via coalescing; prerender now
+  matches it.
+- 2026-09-12 feat(v3): offline telemetry gained dispatch_coalesced (struct
+  128 -> 136 bytes, ABI asserts updated); the shim's profile/final log
+  lines report it.
+
 - 2026-09-12 fix(v3): BASS shim per-event log flood removed — StreamEvents
   logged a full file open/write/close line per call, and realtime pumps
   submit one call per MIDI event (the owner's %TEMP% log hit 160 MB /

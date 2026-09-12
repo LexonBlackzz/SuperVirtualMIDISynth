@@ -6,6 +6,7 @@
 #include "SVMSEnvelope.h"
 #include "SVMSEventCompile.h"
 #include "SVMSLimiter.h"
+#include "SVMSNoteOnCollapse.h"
 #include "SVMSPostFilter.h"
 #include "SVMSRenderScalar.h"
 #include "SVMSSoundFont.h"
@@ -27,6 +28,11 @@
 #endif
 
 namespace svms {
+
+// Same-key note-on collapse window, matching the realtime driver's fixed
+// 20 ms (SVMSDriver.cpp kNoteOnCollapseWindowMs) — expressed in AUDIO FRAMES
+// here (the driver uses QPC ticks; the gate is domain-agnostic).
+constexpr uint32_t kNoteOnCollapseWindowMs = 20u;
 
 struct StandaloneSynthConfig {
     std::wstring soundfont;
@@ -146,6 +152,17 @@ public:
         // insertion can occur inside one launch transaction), at a fraction
         // of the cost under pool pressure.
         voices_.SetStealBatchingEnabled(true);
+        // Same-key note-on coalescing, mirroring the realtime driver
+        // (SVMSNoteOnCollapse.h): the gate runs in the audio-FRAME domain
+        // with the same fixed 20 ms window and the same config threshold,
+        // so prerender reproduces realtime's event semantics exactly
+        // (including the velocity stacking of collapsed hits). Default
+        // threshold 1 = disabled, every note-on spawns.
+        static const EngineConfig collapseConfig = EngineConfig::Load();
+        noteOnCollapse_.SetWindowTicks(
+            static_cast<uint64_t>(config.sampleRate) *
+            kNoteOnCollapseWindowMs / 1000u);
+        noteOnCollapse_.SetThreshold(collapseConfig.noteOnCollapseThreshold);
         return true;
     }
 
@@ -231,18 +248,45 @@ public:
     static void DispatchRenderEventStatic(const RenderEvent& event,
                                           uint32_t blockCursor,
                                           void* userData) {
-        (void)blockCursor;
         StandaloneSynth* self = static_cast<StandaloneSynth*>(userData);
         if (!self) return;
         switch (event.type) {
-        case RenderEventType::NoteOn:
-            self->NoteOn(event.channel, event.data1, event.data2);
+        case RenderEventType::NoteOn: {
+            // Same-key coalescing in the audio-frame domain — the offline
+            // mirror of the realtime driver's QPC-domain gate: same 20 ms
+            // window, same config threshold, same velocity stacking of
+            // collapsed hits. Disabled (every note-on spawns) when the
+            // config threshold < 2.
+            const uint32_t keyIndex =
+                static_cast<uint32_t>(event.channel) * 128u + event.data1;
+            uint32_t stack = 0u;
+            if (!self->noteOnCollapse_.OnNoteOn(
+                    keyIndex, self->dispatchAbsoluteFrame_ + blockCursor,
+                    stack)) {
+                ++self->coalescedNoteOns_;
+                break;
+            }
+            uint8_t velocity = event.data2;
+            if (stack > 1u && velocity < 127u) {
+                // Collapsed hits are density, not silence: feed the
+                // accumulated stack into the spawned voice's velocity
+                // (+2 units per doubling), matching the realtime driver.
+                uint32_t boost = 0u;
+                for (uint32_t s = stack; s >>= 1u;) ++boost;
+                boost *= 2u;
+                velocity = static_cast<uint8_t>(
+                    velocity + boost > 127u ? 127u : velocity + boost);
+            }
+            self->NoteOn(event.channel, event.data1, velocity);
             break;
+        }
         case RenderEventType::NoteOff:
         case RenderEventType::StaleNoteOffBatch:
             self->NoteOff(event.channel, event.data1);
             break;
         case RenderEventType::ControlChange:
+            if (event.data1 == 120u || event.data1 == 123u)
+                self->noteOnCollapse_.ResetChannel(event.channel);
             self->Control(event.channel, event.data1, event.data2);
             break;
         case RenderEventType::ProgramChange:
@@ -267,6 +311,7 @@ public:
                           uint64_t absoluteFrame) {
         std::fill(left, left + frameCount, 0.0f);
         std::fill(right, right + frameCount, 0.0f);
+        dispatchAbsoluteFrame_ = absoluteFrame;
 #if defined(_MSC_VER)
         const uint64_t renderBegin = __rdtsc();
 #endif
@@ -281,8 +326,10 @@ public:
 
     uint32_t GetRenderPaths() const { return renderer_.GetLastRenderPaths(); }
     uint64_t RenderCycles() const { return renderCycles_; }
+    uint64_t CoalescedNoteOns() const { return coalescedNoteOns_; }
 
     void SetCursor(uint64_t absoluteFrame) {
+        dispatchAbsoluteFrame_ = absoluteFrame;
         voices_.SetCurrentFrame(absoluteFrame);
     }
 
@@ -296,6 +343,8 @@ public:
     }
 
     void ResetAll(uint64_t absoluteFrame) {
+        noteOnCollapse_.ResetAll();
+        coalescedNoteOns_ = 0;
         voices_.SetCurrentFrame(absoluteFrame);
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             voices_.SilenceChannelImmediate(channel);
@@ -359,6 +408,11 @@ private:
     // built up front so LaunchVoiceGroup can resolve the batched victim
     // selection once for the whole note-on (production launch path).
     VoiceConfiguration launchSetups_[512];
+    // Same-key note-on coalescing (audio-frame domain) + the absolute frame
+    // the dispatcher's blockCursor offsets from. See Initialize.
+    NoteOnCollapseGate noteOnCollapse_;
+    uint64_t coalescedNoteOns_ = 0;
+    uint64_t dispatchAbsoluteFrame_ = 0;
 
     struct RegionCacheEntry {
         uint32_t tag = UINT32_MAX;

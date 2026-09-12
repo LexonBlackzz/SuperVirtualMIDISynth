@@ -256,6 +256,7 @@ public:
         result.dispatch_alloc_cycles = profile.alloc;
         result.dispatch_configure_cycles = profile.configure;
         result.dispatch_control_cycles = profile.controlTotal;
+        result.dispatch_coalesced = state.synth.CoalescedNoteOns();
         result.render_cycles = state.synth.RenderCycles();
         std::memcpy(telemetry, &result,
                     (std::min)(callerSize,

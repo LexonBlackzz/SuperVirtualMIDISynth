@@ -200,6 +200,7 @@ static int RunLivePump(const char* sf2Path) {
     const Load loads[] = {
         { "livepump r16k len512 88keys",  16000.0,  512u,  88u, 8.0 },
         { "livepump r100k len96 127keys", 100000.0,  96u, 127u, 8.0 },
+        { "livepump r800k len96 buzz4",   800000.0,  96u,   4u, 8.0 },
     };
     const DWORD flags = 0x100u | 0x200000u;
     const uint32_t kRate = 48000u;
@@ -222,7 +223,10 @@ static int RunLivePump(const char* sf2Path) {
             const double horizon = (double)(pulled + window);
             while (noteOns * perNote < horizon && noteOns * perNote < totalFrames) {
                 const uint8_t note = (uint8_t)(36u + (noteOns % load.keys));
-                const uint8_t ch = (uint8_t)(noteOns & 15u);
+                // Buzz loads (few keys) pin channel 0 so same-key density
+                // actually concentrates; wide loads spread across all 16.
+                const uint8_t ch = load.keys <= 8u
+                    ? 0u : (uint8_t)(noteOns & 15u);
                 uint32_t msg = 0x90u | ch | ((uint32_t)note << 8u) | (100u << 16u);
                 sendRaw(s, 0x10000u | 0x2000000u, &msg, 3u);
                 ++sends;
@@ -244,6 +248,9 @@ static int RunLivePump(const char* sf2Path) {
                "(sends=%u)\n", load.name, (double)totalFrames / kRate, wall,
                ((double)totalFrames / kRate) / (wall > 0.0 ? wall : 1e-9),
                sends);
+        using FreeFn = BOOL(WINAPI*)(HSTREAM);
+        auto streamFree = (FreeFn)GetProcAddress(bass, "BASS_StreamFree");
+        if (streamFree) streamFree(s);
     }
     return 0;
 }
