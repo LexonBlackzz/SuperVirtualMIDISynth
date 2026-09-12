@@ -787,9 +787,24 @@ public:
     uint64_t wvPlanCycles_ = 0u;
     uint64_t wvJobCycles_ = 0u;
     uint64_t wvPostCycles_ = 0u;
+    // Segment-path diagnostics: calls into RenderWholeVoiceSegment, cycles
+    // inside it, how many took the batch-kernel fast path vs the scalar
+    // RenderPrimaryVoiceSpan fallback, and frames rendered per path.
+    uint64_t wvSegCalls_ = 0u;
+    uint64_t wvSegCycles_ = 0u;
+    uint64_t wvSegKernelOk_ = 0u;
+    uint64_t wvSegFallback_ = 0u;
+    uint64_t wvSegKernelFrames_ = 0u;
+    uint64_t wvSegFallbackFrames_ = 0u;
     uint64_t GetWvPlanCycles() const { return wvPlanCycles_; }
     uint64_t GetWvJobCycles() const { return wvJobCycles_; }
     uint64_t GetWvPostCycles() const { return wvPostCycles_; }
+    uint64_t GetWvSegCalls() const { return wvSegCalls_; }
+    uint64_t GetWvSegCycles() const { return wvSegCycles_; }
+    uint64_t GetWvSegKernelOk() const { return wvSegKernelOk_; }
+    uint64_t GetWvSegFallback() const { return wvSegFallback_; }
+    uint64_t GetWvSegKernelFrames() const { return wvSegKernelFrames_; }
+    uint64_t GetWvSegFallbackFrames() const { return wvSegFallbackFrames_; }
     static void GetPrimarySpanTotals(uint64_t& calls, uint64_t& frames) {
         calls = g_primarySpanCalls.load(std::memory_order_relaxed);
         frames = g_primarySpanFrames.load(std::memory_order_relaxed);
@@ -3874,6 +3889,10 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
     float* outR, uint32_t segStart, uint32_t segFrames, bool isReal,
     uint32_t jobIndex) {
+#if defined(_MSC_VER)
+    const uint64_t segBegin = __rdtsc();
+#endif
+    ++wvSegCalls_;
     SpanRetirement* retBuf = wvJobRetirements_ +
         static_cast<size_t>(jobIndex) * scratchCapacity_;
     const uint32_t retCountBefore = wvJobRetireCounts_[jobIndex];
@@ -3883,6 +3902,10 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     RenderClassKernel kernel = kernelSet_->kernels[
         static_cast<uint32_t>(classBefore)];
     if (segFrames >= 8u && kernel != nullptr && sampleData != nullptr) {
+#if defined(_MSC_VER)
+        ++wvSegKernelOk_;
+        wvSegKernelFrames_ += segFrames;
+#endif
         RenderSpanContext context{
             &state, sampleData, nullptr, sampleDataFrames, outL, outR,
             segStart, segFrames, state.GetCapacity(),
@@ -3896,11 +3919,21 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
                      i < wvJobRetireCounts_[jobIndex]; ++i) {
                     retBuf[i].frameOffset += segStart;
                 }
+#if defined(_MSC_VER)
+                wvSegCycles_ += __rdtsc() - segBegin;
+#endif
                 return wvJobRetireCounts_[jobIndex] > retCountBefore;
             }
+#if defined(_MSC_VER)
+            wvSegCycles_ += __rdtsc() - segBegin;
+#endif
             return false;
         }
     }
+#if defined(_MSC_VER)
+    ++wvSegFallback_;
+    wvSegFallbackFrames_ += segFrames;
+#endif
     const uint32_t retiredAt = RenderPrimaryVoiceSpan(
         state, row, sampleData, nullptr, sampleDataFrames, outL, outR,
         segStart, segFrames, segFrames);
@@ -3909,6 +3942,9 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
             retBuf[wvJobRetireCounts_[jobIndex]++] = {
                 row, segStart + retiredAt, voices->activePosition_[row]};
         }
+#if defined(_MSC_VER)
+        wvSegCycles_ += __rdtsc() - segBegin;
+#endif
         return true;
     }
     // Post-segment class transition bake, replicating the frame-major
@@ -3931,6 +3967,9 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
         state.renderGainR[row] =
             state.currentGain[row] * state.mixGainR[row];
     }
+#if defined(_MSC_VER)
+    wvSegCycles_ += __rdtsc() - segBegin;
+#endif
     return false;
 }
 

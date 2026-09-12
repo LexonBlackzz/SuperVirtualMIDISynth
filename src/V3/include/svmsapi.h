@@ -201,6 +201,12 @@ typedef struct SVMS_OfflineTelemetry {
     uint64_t wv_plan_cycles;
     uint64_t wv_job_cycles;
     uint64_t wv_post_cycles;
+    uint64_t wv_seg_calls;
+    uint64_t wv_seg_cycles;
+    uint64_t wv_seg_kernel_ok;
+    uint64_t wv_seg_fallback;
+    uint64_t wv_seg_kernel_frames;
+    uint64_t wv_seg_fallback_frames;
 } SVMS_OfflineTelemetry;
 
 // Isolated real-time session configuration. SoundFont and audio-device names
@@ -457,7 +463,7 @@ static_assert(sizeof(SVMS_OfflineSessionConfig) == 80,
               "SVMS_OfflineSessionConfig ABI changed");
 static_assert(sizeof(SVMS_OfflineEvent) == 16,
               "SVMS_OfflineEvent ABI changed");
-static_assert(sizeof(SVMS_OfflineTelemetry) == 160,
+static_assert(sizeof(SVMS_OfflineTelemetry) == 208,
               "SVMS_OfflineTelemetry ABI changed");
 static_assert(sizeof(SVMS_RealtimeSessionConfig) == 96,
               "SVMS_RealtimeSessionConfig ABI changed");

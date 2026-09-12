@@ -1315,13 +1315,268 @@ bool BuildVolatileStealKeysAVX2(
     return true;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// One-shot kernels (held and releasing non-looping voices).
+//
+// Every one-shot instrument (pianos, plucks, mallets — any SF2 region
+// without a loop) used to classify into SustainedOneShot/ReleaseOneShot
+// slots that had no AVX2 kernel, so their whole sustain and release
+// rendered on the scalar per-voice fallback at ~19 cycles per frame —
+// ~43x the vectorized rate, on both the realtime and prerender pipelines.
+// These kernels mirror RenderSustainedLoopFramesAVX2 /
+// RenderReleaseLoopFramesAVX2 with the loop-wrap math replaced by
+// end-of-sample retirement:
+//   - sustain: constant renderGain, phase walks toward relEnd, the voice
+//     retires at the first frame whose base+1 >= relEnd (the lerp partner
+//     would read past the sample);
+//   - release: the release envelope (gain *= decay, countdown, threshold)
+//     advances with the exact scalar recurrence into gains[8], the sample
+//     end retires before the envelope consumes a frame, and the retire
+//     conditions match the generic envelope state machine exactly.
+// Samples longer than 2^24 frames fall back to the scalar path: the
+// fast-chunk guard compares against a float-converted relEnd bound that
+// is only exact below that point.
+// ════════════════════════════════════════════════════════════════════════
+
+uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
+                                          uint32_t handle) {
+    VoiceSoA& v = *c.voices;
+    const uint32_t relEnd = v.relEnd[handle];
+    float phase = (std::max)(0.0f, v.phases[handle]);
+    const float step = v.phaseIncs[handle];
+    const float gainL = v.renderGainL[handle];
+    const float gainR = v.renderGainR[handle];
+    const int16_t* region = c.sampleData + v.sampleStart[handle];
+    float* outL = c.outputLeft + c.frameStart;
+    float* outR = c.outputRight + c.frameStart;
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
+                                       4.0f, 5.0f, 6.0f, 7.0f);
+    const __m256 stepVector = _mm256_set1_ps(step);
+    const __m256 gainLVector = _mm256_set1_ps(gainL);
+    const __m256 gainRVector = _mm256_set1_ps(gainR);
+    // The 8-frame fast chunk needs floor(phase + 7*step) + 1 < relEnd for
+    // every lane; comparing against the float-converted bound is exact
+    // while the sample fits in 24 bits of mantissa.
+    const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
+    const float lastSafePhase = fastGuardExact
+        ? static_cast<float>(relEnd - 1u) : -1.0f;
+    uint32_t frame = 0u;
+    while (frame < c.frameCount) {
+        const float lastPhase = phase + step * 7.0f;
+        if (fastGuardExact && frame + 8u <= c.frameCount &&
+            lastPhase < lastSafePhase) {
+            // Warm the next chunk's sample lines (sequential per voice).
+            _mm_prefetch(reinterpret_cast<const char*>(
+                             region +
+                             static_cast<uint32_t>(lastPhase + step)),
+                         _MM_HINT_T0);
+            const __m256 phases = _mm256_add_ps(
+                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
+            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256 first, second;
+            GatherSamplePairAVX2(region, bases, first, second);
+            const __m256 fraction = _mm256_sub_ps(
+                phases, _mm256_cvtepi32_ps(bases));
+            const __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outL + frame),
+                _mm256_mul_ps(sample, gainLVector)));
+            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outR + frame),
+                _mm256_mul_ps(sample, gainRVector)));
+            // Preserve the scalar cursor's repeated-add rounding.
+            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                phase += step;
+            frame += 8u;
+            continue;
+        }
+        const uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= relEnd) {
+            // Sample ended: the lerp partner would read past the region.
+            // Retire at this frame; the phase is not advanced.
+            v.phases[handle] = phase;
+            return frame;
+        }
+        const float fraction = phase - static_cast<float>(base);
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[base + 1u]) *
+            (1.0f / 32768.0f) - first) * fraction;
+        outL[frame] += sample * gainL;
+        outR[frame] += sample * gainR;
+        phase += step;
+        ++frame;
+    }
+    v.phases[handle] = phase;
+    return UINT32_MAX;
+}
+
+uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
+                                        uint32_t handle) {
+    VoiceSoA& v = *c.voices;
+    const uint32_t relEnd = v.relEnd[handle];
+    float phase = (std::max)(0.0f, v.phases[handle]);
+    float gain = v.currentGain[handle];
+    uint32_t remaining = v.releaseSamplesRemaining[handle];
+    const float decay = v.releaseDecay[handle];
+    const float step = v.phaseIncs[handle];
+    const float mixL = v.mixGainL[handle];
+    const float mixR = v.mixGainR[handle];
+    const int16_t* region = c.sampleData + v.sampleStart[handle];
+    float* outL = c.outputLeft + c.frameStart;
+    float* outR = c.outputRight + c.frameStart;
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
+                                       4.0f, 5.0f, 6.0f, 7.0f);
+    const __m256 stepVector = _mm256_set1_ps(step);
+    const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
+    const float lastSafePhase = fastGuardExact
+        ? static_cast<float>(relEnd - 1u) : -1.0f;
+    uint32_t frame = 0u;
+    while (frame < c.frameCount) {
+        float futureGain = gain;
+        alignas(32) float gains[8];
+        for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
+            futureGain *= decay;
+            gains[laneIndex] = futureGain;
+        }
+        const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
+        const bool thresholdSafe = remaining != UINT32_MAX ||
+            gains[7] >= VoiceRetireThreshold();
+        const float lastPhase = phase + step * 7.0f;
+        if (fastGuardExact && frame + 8u <= c.frameCount && countdownSafe &&
+            thresholdSafe && lastPhase < lastSafePhase) {
+            _mm_prefetch(reinterpret_cast<const char*>(
+                             region +
+                             static_cast<uint32_t>(lastPhase + step)),
+                         _MM_HINT_T0);
+            const __m256 phases = _mm256_add_ps(
+                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
+            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256 first, second;
+            GatherSamplePairAVX2(region, bases, first, second);
+            const __m256 fraction = _mm256_sub_ps(
+                phases, _mm256_cvtepi32_ps(bases));
+            const __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
+            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outL + frame),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
+            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outR + frame),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+            gain = futureGain;
+            if (remaining != UINT32_MAX) remaining -= 8u;
+            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                phase += step;
+            frame += 8u;
+            continue;
+        }
+        const uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= relEnd) {
+            // Sample ended: retire before the envelope consumes a frame
+            // (mirrors the generic state machine's sampleEnded branch).
+            v.phases[handle] = phase;
+            v.currentGain[handle] = gain;
+            v.releaseSamplesRemaining[handle] = remaining;
+            return frame;
+        }
+        bool finished = remaining == 0u;
+        if (!finished) {
+            gain *= decay;
+            if (remaining != UINT32_MAX) {
+                --remaining;
+                finished = remaining == 0u;
+            }
+        }
+        const float fraction = phase - static_cast<float>(base);
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[base + 1u]) *
+            (1.0f / 32768.0f) - first) * fraction;
+        outL[frame] += sample * gain * mixL;
+        outR[frame] += sample * gain * mixR;
+        phase += step;
+        ++frame;
+        if (finished ||
+            (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
+            v.phases[handle] = phase;
+            v.currentGain[handle] = gain;
+            v.releaseSamplesRemaining[handle] = remaining;
+            return frame - 1u;
+        }
+    }
+    v.phases[handle] = phase;
+    v.currentGain[handle] = gain;
+    v.releaseSamplesRemaining[handle] = remaining;
+    return UINT32_MAX;
+}
+
+bool RenderSustainedOneShotAVX2(const RenderSpanContext& context,
+                                const uint32_t* handles,
+                                uint32_t handleCount) {
+    if (context.frameCount == 0u || context.sampleData == nullptr) return true;
+    // Rotation voices render through the rotation-hooked scalar spans.
+    if (context.voices->rot != nullptr) return false;
+    if (context.frameCount <= 4u) return false;
+    const VoiceSoA& v = *context.voices;
+    // Validate the whole batch before mutating anything: a false return
+    // must leave zero state changes (kernel fallback contract).
+    for (uint32_t i = 0u; i < handleCount; ++i) {
+        const uint32_t h = handles[i];
+        if (v.relEnd[h] < 2u ||
+            v.sampleStart[h] >= context.sampleDataFrames ||
+            v.relEnd[h] > context.sampleDataFrames - v.sampleStart[h] ||
+            v.phaseIncs[h] < 0.0f || v.relEnd[h] > 0x1000000u) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0u; i < handleCount; ++i) {
+        const uint32_t retiredAt = RenderSustainedOneShotFramesAVX2(
+            context, handles[i]);
+        if (retiredAt != UINT32_MAX)
+            RecordRetirement(context, handles[i], retiredAt);
+    }
+    _mm256_zeroupper();
+    return true;
+}
+
+bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
+                              const uint32_t* handles,
+                              uint32_t handleCount) {
+    if (context.frameCount == 0u || context.sampleData == nullptr) return true;
+    if (context.voices->rot != nullptr) return false;
+    if (context.frameCount <= 4u) return false;
+    const VoiceSoA& v = *context.voices;
+    for (uint32_t i = 0u; i < handleCount; ++i) {
+        const uint32_t h = handles[i];
+        if (v.relEnd[h] < 2u ||
+            v.sampleStart[h] >= context.sampleDataFrames ||
+            v.relEnd[h] > context.sampleDataFrames - v.sampleStart[h] ||
+            v.phaseIncs[h] < 0.0f || v.relEnd[h] > 0x1000000u) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0u; i < handleCount; ++i) {
+        const uint32_t retiredAt = RenderReleaseOneShotFramesAVX2(
+            context, handles[i]);
+        if (retiredAt != UINT32_MAX)
+            RecordRetirement(context, handles[i], retiredAt);
+    }
+    _mm256_zeroupper();
+    return true;
+}
+
 const RenderKernelSet& GetAVX2RenderKernelSet() {
     static const RenderKernelSet set = [] {
         RenderKernelSet result{};
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::SustainedLoop)] =
             RenderSustainedLoopAVX2;
+        result.kernels[static_cast<uint32_t>(VoiceRenderClass::SustainedOneShot)] =
+            RenderSustainedOneShotAVX2;
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::ReleaseLoop)] =
             RenderReleaseLoopAVX2;
+        result.kernels[static_cast<uint32_t>(VoiceRenderClass::ReleaseOneShot)] =
+            RenderReleaseOneShotAVX2;
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientLoop)] =
             RenderTransientLoopAVX2;
         result.backend = RenderBackend::AVX2;

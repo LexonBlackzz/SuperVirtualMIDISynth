@@ -261,6 +261,12 @@ public:
         result.wv_plan_cycles = state.synth.WvPlanCycles();
         result.wv_job_cycles = state.synth.WvJobCycles();
         result.wv_post_cycles = state.synth.WvPostCycles();
+        result.wv_seg_calls = state.synth.WvSegCalls();
+        result.wv_seg_cycles = state.synth.WvSegCycles();
+        result.wv_seg_kernel_ok = state.synth.WvSegKernelOk();
+        result.wv_seg_fallback = state.synth.WvSegFallback();
+        result.wv_seg_kernel_frames = state.synth.WvSegKernelFrames();
+        result.wv_seg_fallback_frames = state.synth.WvSegFallbackFrames();
         std::memcpy(telemetry, &result,
                     (std::min)(callerSize,
                                static_cast<uint32_t>(sizeof(result))));

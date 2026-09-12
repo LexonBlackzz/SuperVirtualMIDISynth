@@ -330,6 +330,16 @@ public:
     uint64_t WvPlanCycles() const { return renderer_.GetWvPlanCycles(); }
     uint64_t WvJobCycles() const { return renderer_.GetWvJobCycles(); }
     uint64_t WvPostCycles() const { return renderer_.GetWvPostCycles(); }
+    uint64_t WvSegCalls() const { return renderer_.GetWvSegCalls(); }
+    uint64_t WvSegCycles() const { return renderer_.GetWvSegCycles(); }
+    uint64_t WvSegKernelOk() const { return renderer_.GetWvSegKernelOk(); }
+    uint64_t WvSegFallback() const { return renderer_.GetWvSegFallback(); }
+    uint64_t WvSegKernelFrames() const {
+        return renderer_.GetWvSegKernelFrames();
+    }
+    uint64_t WvSegFallbackFrames() const {
+        return renderer_.GetWvSegFallbackFrames();
+    }
 
     void SetCursor(uint64_t absoluteFrame) {
         dispatchAbsoluteFrame_ = absoluteFrame;
