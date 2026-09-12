@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <iterator>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <intrin.h>
 #include <limits>
@@ -9794,6 +9795,9 @@ struct BassStream {
     uint32_t cacheEnd = 0u;
     std::vector<float> scratchLeft;   // planar render targets, maxBlockFrames
     std::vector<float> scratchRight;
+    // Last-set parameter per (channel<<24 | type), for StreamGetEvent
+    // queries (set by StreamEvent and struct-mode StreamEvents).
+    std::unordered_map<uint32_t, uint32_t> eventState;
     // Events accumulated from BASS_MIDI_StreamEvents, sorted by frame at
     // render time and consumed as the pull cursor passes them.
     std::vector<SVMS_OfflineEvent> pending;
@@ -10452,6 +10456,295 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
         BassLog("StreamEvents(handle=%u mode=%#X len=%u) accepted 0",
                 handle, mode, length);
     return accepted;
+}
+
+DWORD WINAPI BASS_MIDI_StreamEvent(HSTREAM handle, DWORD chan, DWORD type,
+                                   DWORD param) {
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream || !stream->session || chan >= 16u) {
+        g_bassLastError = stream ? 20 : 5;  // BASS_ERROR_HANDLE
+        return static_cast<DWORD>(-1);
+    }
+    // Record the parameter even for types this shim does not synthesize
+    // (RPN/reverb/chorus/per-note CCs are consumed-as-skipped, matching
+    // StreamEvents struct mode) so StreamGetEvent round-trips them.
+    stream->eventState[(chan << 24u) | (type & 0xffffffu)] = param;
+    uint32_t message = 0u;
+    if (BassTranslateMidiEvent(type, param, chan, message)) {
+        const uint64_t syncFrame = stream->renderedFrames;
+        stream->syncAnchored = true;  // realtime single-event API
+        stream->pending.push_back(BassPackEvent(
+            static_cast<uint32_t>(
+                (std::min)(syncFrame, static_cast<uint64_t>(UINT32_MAX))),
+            message));
+        stream->maxEventFrame =
+            (std::max)(stream->maxEventFrame, syncFrame);
+    }
+    g_bassLastError = 0;
+    return param;
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetEvent(HSTREAM handle, DWORD chan, DWORD type) {
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream || chan >= 16u) {
+        g_bassLastError = stream ? 20 : 5;  // BASS_ERROR_HANDLE
+        return static_cast<DWORD>(-1);
+    }
+    // HIWORD of type can carry a per-note key (NOTE/KEYPRES/drum events);
+    // the base type is what the cache is keyed by.
+    const auto it = stream->eventState.find(
+        (chan << 24u) | (type & 0xffffffu));
+    g_bassLastError = 0;
+    return it != stream->eventState.end() ? it->second : 0u;
+}
+
+DWORD WINAPI BASS_MIDI_GetVersion(void) {
+    return 0x02040400u;
+}
+
+BOOL WINAPI BASS_MIDI_StreamLoadSamples(HSTREAM handle) {
+    (void)handle;
+    // Samples load on demand in this engine; nothing to preload.
+    return TRUE;
+}
+
+BOOL WINAPI BASS_MIDI_StreamSetFilter(HSTREAM handle, BOOL time,
+                                      float speed) {
+    (void)handle; (void)time; (void)speed;
+    // Decode streams render as fast as pulled; a playback filter does not
+    // apply.
+    return TRUE;
+}
+
+DWORD WINAPI BASS_MIDI_FontFlags(HSOUNDFONT handle, DWORD flags, DWORD mask) {
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    if (handle == 0u || handle > g_bassFonts.size()) {
+        g_bassLastError = 5;  // BASS_ERROR_HANDLE
+        return static_cast<DWORD>(-1);
+    }
+    BassFont& font = g_bassFonts[handle - 1u];
+    const DWORD prev = font.flags;
+    font.flags = (font.flags & ~mask) | (flags & mask);
+    return prev;
+}
+
+BOOL WINAPI BASS_MIDI_FontSetVolume(HSOUNDFONT handle, float volume) {
+    (void)handle; (void)volume;
+    // Per-font gain is not represented (master volume covers the session).
+    return TRUE;
+}
+
+float WINAPI BASS_MIDI_FontGetVolume(HSOUNDFONT handle) {
+    (void)handle;
+    return 1.0f;
+}
+
+BOOL WINAPI BASS_MIDI_FontCompact(HSOUNDFONT handle) {
+    (void)handle;
+    return TRUE;
+}
+
+BOOL WINAPI BASS_MIDI_FontUnload(HSOUNDFONT handle, int preset, int bank) {
+    (void)handle; (void)preset; (void)bank;
+    return TRUE;
+}
+
+// ── Unsupported BASSMIDI surface ─────────────────────────────────────────
+// These exist so statically-importing hosts load; this engine does not
+// implement them. File/URL/user-stream MIDI creation would need a MIDI
+// parser — prerender hosts of the BPFA/PGFA family use StreamCreate +
+// StreamEvents instead (verified against the decompiles).
+
+HSTREAM WINAPI BASS_MIDI_StreamCreateFile(BOOL mem, const void* file,
+                                          unsigned long long offset,
+                                          unsigned long long length,
+                                          DWORD flags, DWORD freq) {
+    (void)mem; (void)file; (void)offset; (void)length; (void)flags;
+    (void)freq;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 2;  // BASS_ERROR_FILEOPEN
+    return 0u;
+}
+
+HSTREAM WINAPI BASS_MIDI_StreamCreateURL(const char* url, DWORD offset,
+                                         DWORD flags, DWORD freq) {
+    (void)url; (void)offset; (void)flags; (void)freq;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 2;  // BASS_ERROR_FILEOPEN
+    return 0u;
+}
+
+HSTREAM WINAPI BASS_MIDI_StreamCreateFileUser(DWORD system, DWORD flags,
+                                              const void* procs,
+                                              void* user, DWORD freq) {
+    (void)system; (void)flags; (void)procs; (void)user; (void)freq;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+    return 0u;
+}
+
+HSTREAM WINAPI BASS_MIDI_StreamCreateEvents(const void* events, DWORD ppqn,
+                                            DWORD flags, DWORD freq) {
+    (void)events; (void)ppqn; (void)flags; (void)freq;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+    return 0u;
+}
+
+DWORD WINAPI BASS_MIDI_ConvertEvents(const void* src, DWORD count,
+                                     void* dest, DWORD mode) {
+    (void)src; (void)count; (void)dest; (void)mode;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return 0u;
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetEvents(HSTREAM handle, DWORD chan,
+                                       DWORD typefilter, void* events) {
+    (void)handle; (void)chan; (void)typefilter; (void)events;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return static_cast<DWORD>(-1);
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetEventsEx(HSTREAM handle, DWORD chan,
+                                         DWORD typefilter, void* events,
+                                         DWORD start, DWORD count) {
+    (void)handle; (void)chan; (void)typefilter; (void)events; (void)start;
+    (void)count;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return static_cast<DWORD>(-1);
+}
+
+const void* WINAPI BASS_MIDI_StreamGetMark(HSTREAM handle, DWORD chan,
+                                           DWORD type, DWORD index) {
+    (void)handle; (void)chan; (void)type; (void)index;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return nullptr;
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetMarks(HSTREAM handle, DWORD chan, DWORD type,
+                                      void* marks) {
+    (void)handle; (void)chan; (void)type; (void)marks;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 0;
+    return 0u;
+}
+
+BOOL WINAPI BASS_MIDI_StreamGetPreset(HSTREAM handle, DWORD chan,
+                                      void* preset) {
+    (void)handle; (void)chan; (void)preset;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetFonts(HSTREAM handle, void* fonts,
+                                      DWORD count) {
+    (void)handle; (void)fonts; (void)count;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 0;
+    return 0u;  // no per-stream font list is retained
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetChannel(HSTREAM handle, DWORD chan) {
+    (void)handle; (void)chan;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+    return 0u;
+}
+
+HSOUNDFONT WINAPI BASS_MIDI_FontInitUser(const void* procs, void* user,
+                                         DWORD flags) {
+    (void)procs; (void)user; (void)flags;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+    return 0u;
+}
+
+BOOL WINAPI BASS_MIDI_FontLoadEx(HSOUNDFONT handle, int preset, int bank,
+                                 DWORD length) {
+    (void)handle; (void)preset; (void)bank; (void)length;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
+}
+
+const char* WINAPI BASS_MIDI_FontPack(HSOUNDFONT handle, const char* outfile,
+                                      const char* encoder, DWORD flags) {
+    (void)handle; (void)outfile; (void)encoder; (void)flags;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return nullptr;
+}
+
+HSOUNDFONT WINAPI BASS_MIDI_FontUnpack(HSOUNDFONT handle, const char* name,
+                                       DWORD offset, DWORD length) {
+    (void)handle; (void)name; (void)offset; (void)length;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return 0u;
+}
+
+BOOL WINAPI BASS_MIDI_FontGetInfo(HSOUNDFONT handle, void* info) {
+    (void)handle; (void)info;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_FontGetPreset(HSOUNDFONT handle, int preset,
+                                    int bank) {
+    (void)handle; (void)preset; (void)bank;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
+}
+
+DWORD WINAPI BASS_MIDI_FontGetPresets(HSOUNDFONT handle) {
+    (void)handle;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 0;
+    return 0u;
+}
+
+BOOL WINAPI BASS_MIDI_InInit(DWORD device, const void* proc, void* user) {
+    (void)device; (void)proc; (void)user;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_InFree(DWORD device) {
+    (void)device;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_InStart(DWORD device) {
+    (void)device;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_InStop(DWORD device) {
+    (void)device;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_InGetDeviceInfo(DWORD device, void* info) {
+    (void)device; (void)info;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    g_bassLastError = 20;
+    return FALSE;
 }
 
 DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {

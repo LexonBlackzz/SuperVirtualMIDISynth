@@ -10,6 +10,19 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-12 feat(v3): BASS shim surface extended to the full genuine
+  BASSMIDI export list (40 names). BASS_MIDI_StreamEvent (singular — the
+  API PFA-1.1.0viz imports) is implemented for real: translates via the
+  verified type table, anchors at the consumption cursor, and round-trips
+  through a new per-stream (channel,type)->param cache that
+  BASS_MIDI_StreamGetEvent queries. FontFlags/SetVolume/GetVolume,
+  StreamLoadSamples, StreamSetFilter, FontCompact/Unload are functional
+  no-ops; file/URL/user-stream creation, event/mark/preset queries, and the
+  BASS_MIDI_In* surface are graceful-failure stubs so statically-importing
+  hosts load (file-based MIDI creation would need a parser — the BPFA/PGFA
+  family uses StreamCreate + StreamEvents per the decompiles). Forwarder
+  and both /EXPORT lists updated; probe gained singular-API tests.
+
 - 2026-09-12 feat(v3): offline/standalone synth mirrors the realtime
   same-key note-on coalescing (SVMSNoteOnCollapse gate in the audio-frame
   domain — same fixed 20 ms window, same note_on_collapse.threshold config

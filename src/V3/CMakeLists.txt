@@ -430,6 +430,40 @@ set(EXPORTS
         BASS_MIDI_StreamSetFonts
         BASS_MIDI_StreamCreate
         BASS_MIDI_StreamEvents
+        BASS_MIDI_StreamEvent
+        BASS_MIDI_StreamGetEvent
+        BASS_MIDI_GetVersion
+        BASS_MIDI_StreamLoadSamples
+        BASS_MIDI_StreamSetFilter
+        BASS_MIDI_FontFlags
+        BASS_MIDI_FontSetVolume
+        BASS_MIDI_FontGetVolume
+        BASS_MIDI_FontCompact
+        BASS_MIDI_FontUnload
+        BASS_MIDI_StreamCreateFile
+        BASS_MIDI_StreamCreateURL
+        BASS_MIDI_StreamCreateFileUser
+        BASS_MIDI_StreamCreateEvents
+        BASS_MIDI_ConvertEvents
+        BASS_MIDI_StreamGetEvents
+        BASS_MIDI_StreamGetEventsEx
+        BASS_MIDI_StreamGetMark
+        BASS_MIDI_StreamGetMarks
+        BASS_MIDI_StreamGetPreset
+        BASS_MIDI_StreamGetFonts
+        BASS_MIDI_StreamGetChannel
+        BASS_MIDI_FontInitUser
+        BASS_MIDI_FontLoadEx
+        BASS_MIDI_FontPack
+        BASS_MIDI_FontUnpack
+        BASS_MIDI_FontGetInfo
+        BASS_MIDI_FontGetPreset
+        BASS_MIDI_FontGetPresets
+        BASS_MIDI_InInit
+        BASS_MIDI_InFree
+        BASS_MIDI_InStart
+        BASS_MIDI_InStop
+        BASS_MIDI_InGetDeviceInfo
         BASS_ChannelGetData
         BASS_ChannelGetLength
         BASS_ChannelGetPosition
@@ -772,7 +806,23 @@ if(MSVC)
             BASS_GetVersion BASS_ErrorGetCode BASS_MIDI_FontInit
             BASS_MIDI_FontLoad BASS_MIDI_FontFree
             BASS_MIDI_StreamSetFonts BASS_MIDI_StreamCreate
-            BASS_MIDI_StreamEvents BASS_ChannelGetData
+            BASS_MIDI_StreamEvents BASS_MIDI_StreamEvent
+            BASS_MIDI_StreamGetEvent BASS_MIDI_GetVersion
+            BASS_MIDI_StreamLoadSamples BASS_MIDI_StreamSetFilter
+            BASS_MIDI_FontFlags BASS_MIDI_FontSetVolume
+            BASS_MIDI_FontGetVolume BASS_MIDI_FontCompact
+            BASS_MIDI_FontUnload BASS_MIDI_StreamCreateFile
+            BASS_MIDI_StreamCreateURL BASS_MIDI_StreamCreateFileUser
+            BASS_MIDI_StreamCreateEvents BASS_MIDI_ConvertEvents
+            BASS_MIDI_StreamGetEvents BASS_MIDI_StreamGetEventsEx
+            BASS_MIDI_StreamGetMark BASS_MIDI_StreamGetMarks
+            BASS_MIDI_StreamGetPreset BASS_MIDI_StreamGetFonts
+            BASS_MIDI_StreamGetChannel BASS_MIDI_FontInitUser
+            BASS_MIDI_FontLoadEx BASS_MIDI_FontPack BASS_MIDI_FontUnpack
+            BASS_MIDI_FontGetInfo BASS_MIDI_FontGetPreset
+            BASS_MIDI_FontGetPresets BASS_MIDI_InInit BASS_MIDI_InFree
+            BASS_MIDI_InStart BASS_MIDI_InStop BASS_MIDI_InGetDeviceInfo
+            BASS_ChannelGetData
             BASS_ChannelGetLength BASS_ChannelGetPosition
             BASS_ChannelSetPosition BASS_ChannelIsActive
             BASS_ChannelSeconds2Bytes BASS_ChannelBytes2Seconds

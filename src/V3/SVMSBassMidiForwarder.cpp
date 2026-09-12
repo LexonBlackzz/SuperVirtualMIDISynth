@@ -245,6 +245,260 @@ BOOL WINAPI BASS_StreamFree(DWORD handle) {
     return fn ? fn(handle) : FALSE;
 }
 
+
+// ── Extended BASSMIDI surface (StreamEvent singular + coverage) ─────────
+
+DWORD WINAPI BASS_MIDI_StreamEvent(HSTREAM handle, DWORD chan, DWORD type,
+                                   DWORD param) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, DWORD, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamEvent"));
+    return fn ? fn(handle, chan, type, param) : static_cast<DWORD>(-1);
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetEvent(HSTREAM handle, DWORD chan, DWORD type) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetEvent"));
+    return fn ? fn(handle, chan, type) : static_cast<DWORD>(-1);
+}
+
+DWORD WINAPI BASS_MIDI_GetVersion(void) {
+    const auto fn =
+        reinterpret_cast<DWORD(WINAPI*)(void)>(Forward("BASS_MIDI_GetVersion"));
+    return fn ? fn() : 0x02040400u;
+}
+
+BOOL WINAPI BASS_MIDI_StreamLoadSamples(HSTREAM handle) {
+    using Fn = BOOL(WINAPI*)(HSTREAM);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamLoadSamples"));
+    return fn ? fn(handle) : FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_StreamSetFilter(HSTREAM handle, BOOL time, float speed) {
+    using Fn = BOOL(WINAPI*)(HSTREAM, BOOL, float);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamSetFilter"));
+    return fn ? fn(handle, time, speed) : FALSE;
+}
+
+DWORD WINAPI BASS_MIDI_FontFlags(HSOUNDFONT handle, DWORD flags, DWORD mask) {
+    using Fn = DWORD(WINAPI*)(HSOUNDFONT, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_FontFlags"));
+    return fn ? fn(handle, flags, mask) : static_cast<DWORD>(-1);
+}
+
+BOOL WINAPI BASS_MIDI_FontSetVolume(HSOUNDFONT handle, float volume) {
+    using Fn = BOOL(WINAPI*)(HSOUNDFONT, float);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_FontSetVolume"));
+    return fn ? fn(handle, volume) : FALSE;
+}
+
+float WINAPI BASS_MIDI_FontGetVolume(HSOUNDFONT handle) {
+    using Fn = float(WINAPI*)(HSOUNDFONT);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_FontGetVolume"));
+    return fn ? fn(handle) : 0.0f;
+}
+
+BOOL WINAPI BASS_MIDI_FontCompact(HSOUNDFONT handle) {
+    using Fn = BOOL(WINAPI*)(HSOUNDFONT);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_FontCompact"));
+    return fn ? fn(handle) : FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_FontUnload(HSOUNDFONT handle, int preset, int bank) {
+    using Fn = BOOL(WINAPI*)(HSOUNDFONT, int, int);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_FontUnload"));
+    return fn ? fn(handle, preset, bank) : FALSE;
+}
+
+HSTREAM WINAPI BASS_MIDI_StreamCreateFile(BOOL mem, const void* file,
+                                          unsigned long long offset,
+                                          unsigned long long length,
+                                          DWORD flags, DWORD freq) {
+    using Fn = HSTREAM(WINAPI*)(BOOL, const void*, unsigned long long,
+                                unsigned long long, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamCreateFile"));
+    return fn ? fn(mem, file, offset, length, flags, freq) : 0u;
+}
+
+HSTREAM WINAPI BASS_MIDI_StreamCreateURL(const char* url, DWORD offset,
+                                         DWORD flags, DWORD freq) {
+    using Fn = HSTREAM(WINAPI*)(const char*, DWORD, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamCreateURL"));
+    return fn ? fn(url, offset, flags, freq) : 0u;
+}
+
+HSTREAM WINAPI BASS_MIDI_StreamCreateFileUser(DWORD system, DWORD flags,
+                                              const void* procs, void* user,
+                                              DWORD freq) {
+    using Fn = HSTREAM(WINAPI*)(DWORD, DWORD, const void*, void*, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamCreateFileUser"));
+    return fn ? fn(system, flags, procs, user, freq) : 0u;
+}
+
+HSTREAM WINAPI BASS_MIDI_StreamCreateEvents(const void* events, DWORD ppqn,
+                                            DWORD flags, DWORD freq) {
+    using Fn = HSTREAM(WINAPI*)(const void*, DWORD, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamCreateEvents"));
+    return fn ? fn(events, ppqn, flags, freq) : 0u;
+}
+
+DWORD WINAPI BASS_MIDI_ConvertEvents(const void* src, DWORD count, void* dest,
+                                     DWORD mode) {
+    using Fn = DWORD(WINAPI*)(const void*, DWORD, void*, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_ConvertEvents"));
+    return fn ? fn(src, count, dest, mode) : 0u;
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetEvents(HSTREAM handle, DWORD chan,
+                                       DWORD typefilter, void* events) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, DWORD, DWORD, void*);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetEvents"));
+    return fn ? fn(handle, chan, typefilter, events)
+              : static_cast<DWORD>(-1);
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetEventsEx(HSTREAM handle, DWORD chan,
+                                         DWORD typefilter, void* events,
+                                         DWORD start, DWORD count) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, DWORD, DWORD, void*, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetEventsEx"));
+    return fn ? fn(handle, chan, typefilter, events, start, count)
+              : static_cast<DWORD>(-1);
+}
+
+const void* WINAPI BASS_MIDI_StreamGetMark(HSTREAM handle, DWORD chan,
+                                           DWORD type, DWORD index) {
+    using Fn = const void*(WINAPI*)(HSTREAM, DWORD, DWORD, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetMark"));
+    return fn ? fn(handle, chan, type, index) : nullptr;
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetMarks(HSTREAM handle, DWORD chan, DWORD type,
+                                      void* marks) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, DWORD, DWORD, void*);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetMarks"));
+    return fn ? fn(handle, chan, type, marks) : 0u;
+}
+
+BOOL WINAPI BASS_MIDI_StreamGetPreset(HSTREAM handle, DWORD chan,
+                                      void* preset) {
+    using Fn = BOOL(WINAPI*)(HSTREAM, DWORD, void*);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetPreset"));
+    return fn ? fn(handle, chan, preset) : FALSE;
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetFonts(HSTREAM handle, void* fonts,
+                                      DWORD count) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, void*, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetFonts"));
+    return fn ? fn(handle, fonts, count) : 0u;
+}
+
+DWORD WINAPI BASS_MIDI_StreamGetChannel(HSTREAM handle, DWORD chan) {
+    using Fn = DWORD(WINAPI*)(HSTREAM, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetChannel"));
+    return fn ? fn(handle, chan) : 0u;
+}
+
+HSOUNDFONT WINAPI BASS_MIDI_FontInitUser(const void* procs, void* user,
+                                         DWORD flags) {
+    using Fn = HSOUNDFONT(WINAPI*)(const void*, void*, DWORD);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_FontInitUser"));
+    return fn ? fn(procs, user, flags) : 0u;
+}
+
+BOOL WINAPI BASS_MIDI_FontLoadEx(HSOUNDFONT handle, int preset, int bank,
+                                 DWORD length) {
+    using Fn = BOOL(WINAPI*)(HSOUNDFONT, int, int, DWORD);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_FontLoadEx"));
+    return fn ? fn(handle, preset, bank, length) : FALSE;
+}
+
+const char* WINAPI BASS_MIDI_FontPack(HSOUNDFONT handle, const char* outfile,
+                                      const char* encoder, DWORD flags) {
+    using Fn = const char*(WINAPI*)(HSOUNDFONT, const char*, const char*,
+                                    DWORD);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_FontPack"));
+    return fn ? fn(handle, outfile, encoder, flags) : nullptr;
+}
+
+HSOUNDFONT WINAPI BASS_MIDI_FontUnpack(HSOUNDFONT handle, const char* name,
+                                       DWORD offset, DWORD length) {
+    using Fn = HSOUNDFONT(WINAPI*)(HSOUNDFONT, const char*, DWORD, DWORD);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_FontUnpack"));
+    return fn ? fn(handle, name, offset, length) : 0u;
+}
+
+BOOL WINAPI BASS_MIDI_FontGetInfo(HSOUNDFONT handle, void* info) {
+    using Fn = BOOL(WINAPI*)(HSOUNDFONT, void*);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_FontGetInfo"));
+    return fn ? fn(handle, info) : FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_FontGetPreset(HSOUNDFONT handle, int preset, int bank) {
+    using Fn = BOOL(WINAPI*)(HSOUNDFONT, int, int);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_FontGetPreset"));
+    return fn ? fn(handle, preset, bank) : FALSE;
+}
+
+DWORD WINAPI BASS_MIDI_FontGetPresets(HSOUNDFONT handle) {
+    using Fn = DWORD(WINAPI*)(HSOUNDFONT);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_FontGetPresets"));
+    return fn ? fn(handle) : 0u;
+}
+
+BOOL WINAPI BASS_MIDI_InInit(DWORD device, const void* proc, void* user) {
+    using Fn = BOOL(WINAPI*)(DWORD, const void*, void*);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_InInit"));
+    return fn ? fn(device, proc, user) : FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_InFree(DWORD device) {
+    using Fn = BOOL(WINAPI*)(DWORD);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_InFree"));
+    return fn ? fn(device) : FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_InStart(DWORD device) {
+    using Fn = BOOL(WINAPI*)(DWORD);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_InStart"));
+    return fn ? fn(device) : FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_InStop(DWORD device) {
+    using Fn = BOOL(WINAPI*)(DWORD);
+    const auto fn = reinterpret_cast<Fn>(Forward("BASS_MIDI_InStop"));
+    return fn ? fn(device) : FALSE;
+}
+
+BOOL WINAPI BASS_MIDI_InGetDeviceInfo(DWORD device, void* info) {
+    using Fn = BOOL(WINAPI*)(DWORD, void*);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_InGetDeviceInfo"));
+    return fn ? fn(device, info) : FALSE;
+}
+
 } // extern "C"
 
 // The forwarder is linked with /EXPORT entries for every name above (see
