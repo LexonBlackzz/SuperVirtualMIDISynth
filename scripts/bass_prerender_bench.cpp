@@ -113,6 +113,21 @@ int main(int argc, char** argv) {
             }
             ++noteOns;
         }
+        if (argc > 2 && strcmp(argv[2], "--sparse") == 0) {
+            // One unmapped controller (CC74) at each chunk boundary forces
+            // the whole-voice planner to refuse, routing the whole block
+            // through the sparse span renderer instead. Measurement only.
+            for (uint32_t chunkStart = 0u; chunkStart < totalFrames;
+                 chunkStart += 65536u) {
+                const uint32_t pos = chunkStart * 8u;
+                uint8_t blk[11];
+                std::memcpy(blk, &pos, 4u);
+                const uint32_t len = 3u;
+                std::memcpy(blk + 4, &len, 4u);
+                blk[8] = 0xB0u; blk[9] = 74u; blk[10] = 64u;
+                raw.insert(raw.end(), blk, blk + 11);
+            }
+        }
         // note-offs past the last on may exceed totalFrames — the stream
         // end = maxEventFrame + 2s tail, so extend the drain target.
         const uint32_t streamEndFrames = totalFrames + 2u * kRate;
