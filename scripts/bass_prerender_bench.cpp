@@ -18,7 +18,7 @@ typedef DWORD HSOUNDFONT;
 
 static const DWORD kDataFloat = 0x40000000u;
 
-static int RunLivePump(const char* sf2Path);
+static int RunLivePump(const char* sf2Path, int argc, char** argv);
 
 int main(int argc, char** argv) {
     _putenv("SVMS_BASS_QUIET_MS=250");
@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
         ? argv[1]
         : "E:\\backup\\Misc\\Black MIDI\\omv2 with zmp PFAViz\\Morphine Piano.sf2";
     if (argc > 2 && strcmp(argv[2], "--livepump") == 0)
-        return RunLivePump(sf2Path);
+        return RunLivePump(sf2Path, argc, argv);
 
     char bassPath[MAX_PATH];
     GetModuleFileNameA(nullptr, bassPath, MAX_PATH);
@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
 // Events submitted ONE PER StreamEvents call (positionless RAW|NORSTATUS,
 // bare 3-byte messages, Kiva's SendEventRaw shape), pulls of ~10 ms between
 // event groups. This is the prerender-playback generator pattern.
-static int RunLivePump(const char* sf2Path) {
+static int RunLivePump(const char* sf2Path, int argc, char** argv) {
     char bassPath[MAX_PATH];
     GetModuleFileNameA(nullptr, bassPath, MAX_PATH);
     char* slash = strrchr(bassPath, '\\');
@@ -226,7 +226,11 @@ static int RunLivePump(const char* sf2Path) {
     for (const Load& load : loads) {
         HSTREAM s = streamCreate(16, flags, kRate);
         if (!s) { printf("StreamCreate failed\n"); return 1; }
-        setAttr(s, 0x12003u, 4096.0f);
+        // Pool size: argv[3] overrides the default 4096 (e.g. 100000 to
+        // reproduce PFA's MIDI_VOICES=100000 session).
+        uint32_t poolVoices = 4096u;
+        if (argc > 3) poolVoices = (uint32_t)atoi(argv[3]);
+        setAttr(s, 0x12003u, (float)poolVoices);
         std::vector<float> buf(window * 2u);
         const uint32_t totalFrames = (uint32_t)(load.seconds * kRate);
         const double perNote = kRate / load.noteRate;

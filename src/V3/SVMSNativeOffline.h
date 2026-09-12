@@ -258,6 +258,9 @@ public:
         result.dispatch_control_cycles = profile.controlTotal;
         result.dispatch_coalesced = state.synth.CoalescedNoteOns();
         result.render_cycles = state.synth.RenderCycles();
+        result.wv_plan_cycles = state.synth.WvPlanCycles();
+        result.wv_job_cycles = state.synth.WvJobCycles();
+        result.wv_post_cycles = state.synth.WvPostCycles();
         std::memcpy(telemetry, &result,
                     (std::min)(callerSize,
                                static_cast<uint32_t>(sizeof(result))));

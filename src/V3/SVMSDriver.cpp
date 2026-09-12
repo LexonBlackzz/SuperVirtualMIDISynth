@@ -11224,6 +11224,13 @@ BOOL WINAPI BASS_StreamFree(DWORD handle) {
                         static_cast<double>(tel.dispatch_note_on_cycles) / 1e9,
                         static_cast<double>(tel.dispatch_alloc_cycles) / 1e9,
                         tel.voice_steals, tel.active_voices);
+            if (tel.struct_size >= offsetof(SVMS_OfflineTelemetry, wv_post_cycles) + 8u)
+                BassLogNow("wv(handle=%u): plan=%.2fGcyc jobs=%.2fGcyc "
+                           "post=%.2fGcyc",
+                           handle,
+                           static_cast<double>(tel.wv_plan_cycles) / 1e9,
+                           static_cast<double>(tel.wv_job_cycles) / 1e9,
+                           static_cast<double>(tel.wv_post_cycles) / 1e9);
             }
             NativeDestroySession(stream->session);
         }

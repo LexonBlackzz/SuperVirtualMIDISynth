@@ -782,6 +782,14 @@ public:
     // used. Bit0 whole-voice, bit1 dense, bit2 sparse; bit8 = the vibrato
     // gate forced the legacy hybrid for this block.
     uint32_t GetLastRenderPaths() const { return lastRenderPaths_; }
+    // Diagnostics-only whole-voice phase accumulators (rdtsc, caller-thread
+    // wall cycles; read racily from telemetry — fine for profiling).
+    uint64_t wvPlanCycles_ = 0u;
+    uint64_t wvJobCycles_ = 0u;
+    uint64_t wvPostCycles_ = 0u;
+    uint64_t GetWvPlanCycles() const { return wvPlanCycles_; }
+    uint64_t GetWvJobCycles() const { return wvJobCycles_; }
+    uint64_t GetWvPostCycles() const { return wvPostCycles_; }
     static void GetPrimarySpanTotals(uint64_t& calls, uint64_t& frames) {
         calls = g_primarySpanCalls.load(std::memory_order_relaxed);
         frames = g_primarySpanFrames.load(std::memory_order_relaxed);
@@ -3277,13 +3285,22 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // exact-frame channel ops applied inside the owning workers.  Vibrato
     // (CC1) keeps the legacy hybrid below — its per-frame LFO cannot be
     // modeled by a whole-block plan.
-    if (!vibratoActive &&
-        PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame)) {
-        lastRenderPaths_ |= 0x1u;
-        RenderWholeVoiceBlock(voices, sampleData, sampleDataFrames,
-                              outputLeft, outputRight, numFrames,
-                              blockStartFrame);
-        return;
+    if (!vibratoActive) {
+#if defined(_MSC_VER)
+        const uint64_t wvPlanBegin = __rdtsc();
+#endif
+        const bool planned =
+            PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame);
+#if defined(_MSC_VER)
+        wvPlanCycles_ += __rdtsc() - wvPlanBegin;
+#endif
+        if (planned) {
+            lastRenderPaths_ |= 0x1u;
+            RenderWholeVoiceBlock(voices, sampleData, sampleDataFrames,
+                                  outputLeft, outputRight, numFrames,
+                                  blockStartFrame);
+            return;
+        }
     }
     // Chunk-granular mixed mode: dense-parallel chunks where planning is
     // profitable, exact span rendering for the rest. Segments run strictly
@@ -4161,6 +4178,9 @@ inline void RenderScalar::RenderWholeVoiceBlock(
             ? (std::min)(workerPool_->GetThreadCount(), itemCount) : 1u;
         if (jobCount < 2u) jobCount = 1u;
         ctx.jobCount = jobCount;
+#if defined(_MSC_VER)
+        const uint64_t wvJobBegin = __rdtsc();
+#endif
         bool dispatched = false;
         if (jobCount >= 2u && workerPool_ != nullptr) {
             dispatched = workerPool_->ExecuteIndexed(
@@ -4172,6 +4192,9 @@ inline void RenderScalar::RenderWholeVoiceBlock(
             ctx.jobCount = 1u;
             WholeVoiceJobThunk(0u, outputLeft, outputRight, numFrames, &ctx);
         }
+#if defined(_MSC_VER)
+        wvJobCycles_ += __rdtsc() - wvJobBegin;
+#endif
     }
 
     // Retirement in exact (frame, capture-position) order — identical to
@@ -4196,6 +4219,9 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         voices.RetireVoice(static_cast<VoiceHandle>(retirements_[i].handle));
     }
 
+#if defined(_MSC_VER)
+    const uint64_t wvPostBegin = __rdtsc();
+#endif
     // Deferred release flips: counters, Releasing-ring and class lists.
     for (uint32_t i = 0u; i < wvOpCount_; ++i)
         voices.FinalizeDeferredRelease(
@@ -4220,6 +4246,9 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     // All Sound Off was unlinked during the pre-pass, but UnlinkStealTail
     // preserves its fields: render the audio up to the recorded kill frame,
     // then stop exactly where live dispatch would have stopped it.
+#if defined(_MSC_VER)
+    wvPostCycles_ += __rdtsc() - wvPostBegin;
+#endif
     const uint32_t voiceCapacity = voices.GetMaxVoices();
     const uint32_t tailCapacity =
         (std::min)(voiceCapacity, static_cast<uint32_t>(kStealTailReserve));

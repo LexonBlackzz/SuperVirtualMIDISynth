@@ -327,6 +327,9 @@ public:
     uint32_t GetRenderPaths() const { return renderer_.GetLastRenderPaths(); }
     uint64_t RenderCycles() const { return renderCycles_; }
     uint64_t CoalescedNoteOns() const { return coalescedNoteOns_; }
+    uint64_t WvPlanCycles() const { return renderer_.GetWvPlanCycles(); }
+    uint64_t WvJobCycles() const { return renderer_.GetWvJobCycles(); }
+    uint64_t WvPostCycles() const { return renderer_.GetWvPostCycles(); }
 
     void SetCursor(uint64_t absoluteFrame) {
         dispatchAbsoluteFrame_ = absoluteFrame;
