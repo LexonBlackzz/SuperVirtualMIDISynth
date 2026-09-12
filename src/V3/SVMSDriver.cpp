@@ -9798,6 +9798,10 @@ struct BassStream {
     // Last-set parameter per (channel<<24 | type), for StreamGetEvent
     // queries (set by StreamEvent and struct-mode StreamEvents).
     std::unordered_map<uint32_t, uint32_t> eventState;
+    // Wall-clock tick of the last accepted event submission (GetTickCount64
+    // ms). A live pump keeps the stream alive even when the pull cursor
+    // reaches the submitted-events horizon; see BASS_ChannelGetData.
+    uint64_t lastSubmitTickMs = 0u;
     // Events accumulated from BASS_MIDI_StreamEvents, sorted by frame at
     // render time and consumed as the pull cursor passes them.
     std::vector<SVMS_OfflineEvent> pending;
@@ -10071,6 +10075,17 @@ bool BassTranslateMidiEvent(DWORD type, DWORD param, DWORD chan,
 }
 
 } // namespace
+
+// Wall-clock ms for the live-pump quiescence check. GetTickCount64 is
+// Vista+; XP falls back to the 32-bit tick (wraps at 49.7 days — harmless
+// for a recency comparison).
+uint64_t BassNowTickMs() {
+#if defined(SVMS_XP_COMPAT)
+    return static_cast<uint64_t>(GetTickCount());
+#else
+    return GetTickCount64();
+#endif
+}
 
 BOOL WINAPI BASS_Init(int device, DWORD freq, DWORD flags, HWND win,
                       const GUID* clsid) {
@@ -10447,6 +10462,7 @@ DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
         }
     }
     g_bassLastError = 0;
+    if (accepted != 0u) stream->lastSubmitTickMs = BassNowTickMs();
     if ((mode & kBassMidiEventsTime) != 0u) stream->sawTimeEvents = true;
     // NO per-call logging here: realtime pumps submit one event per call at
     // six-figure event rates, and each BassLog line is a file
@@ -10481,6 +10497,7 @@ DWORD WINAPI BASS_MIDI_StreamEvent(HSTREAM handle, DWORD chan, DWORD type,
         stream->maxEventFrame =
             (std::max)(stream->maxEventFrame, syncFrame);
     }
+    stream->lastSubmitTickMs = BassNowTickMs();
     g_bassLastError = 0;
     return param;
 }
@@ -10799,7 +10816,33 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
     // buffer, while real BASSMIDI stops at the song end.
     const uint64_t streamEnd = stream->maxEventFrame +
         static_cast<uint64_t>(stream->sampleRate) * 2u;
-    if (stream->servedFrames >= streamEnd) {
+    // The submitted-events horizon (last event + 2 s tail) is only a TRUE
+    // end when the pump has gone quiet: live pumps (PFA/Kiva playback)
+    // submit events just-in-time, and reporting ENDED whenever playback
+    // catches the horizon made the player believe the song was over and
+    // restart it — "old audio plays again". A pump that submitted anything
+    // within the quiescence window keeps the stream alive (partial/zero
+    // pulls instead). File-style pumps submit everything upfront and go
+    // quiescent long before the end, so their termination is unchanged.
+    // SVMS_BASS_QUIET_MS overrides the window (tests).
+    static uint32_t quietMs = 0u;
+    if (quietMs == 0u) {
+        // GetEnvironmentVariable (not getenv): hosts and test harnesses set
+        // this via _putenv in a different CRT instance.
+        char env[32] = {};
+        const DWORD n = GetEnvironmentVariableA("SVMS_BASS_QUIET_MS", env,
+                                                sizeof(env));
+        unsigned parsed = 5000u;
+        if (n > 0 && n < sizeof(env)) {
+            const int v = std::atoi(env);
+            if (v > 0) parsed = static_cast<unsigned>(v);
+        }
+        quietMs = parsed;
+    }
+    const uint64_t nowTick = BassNowTickMs();
+    const bool pumpAlive = stream->lastSubmitTickMs != 0u &&
+        nowTick - stream->lastSubmitTickMs < quietMs;
+    if (stream->servedFrames >= streamEnd && !pumpAlive) {
         g_bassLastError = 45;  // BASS_ERROR_ENDED
         BassLog("GetData(handle=%u) -> ENDED at %llu", handle,
                 static_cast<unsigned long long>(stream->servedFrames));
@@ -10807,6 +10850,12 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
     }
     const uint32_t renderable = static_cast<uint32_t>(
         (std::min<uint64_t>)(frames, streamEnd - stream->servedFrames));
+    if (renderable == 0u) {
+        // Caught up to the horizon while the pump is still alive: hand
+        // back an empty pull rather than ending the stream.
+        g_bassLastError = 0;
+        return 0u;
+    }
 
     // Render-ahead cache: refill in max_block_frames-bounded chunks and
     // serve the caller from the cache, so small-pull callers (CSCore's
@@ -10973,10 +11022,18 @@ DWORD WINAPI BASS_ChannelIsActive(DWORD handle) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     BassStream* stream = BassStreamResolve(handle);
     if (!stream) return 0u;
-    // 1 = BASS_ACTIVE_PLAYING until the served cursor passes the last
-    // event plus a two-second tail; 0 = BASS_ACTIVE_STOPPED afterwards.
-    return stream->servedFrames <= stream->maxEventFrame +
-        static_cast<uint64_t>(stream->sampleRate) * 2u ? 1u : 0u;
+    // 1 = BASS_ACTIVE_PLAYING while the served cursor is inside the
+    // submitted-events horizon OR the pump submitted something recently
+    // (live pump — see BASS_ChannelGetData's quiescence rule); 0 =
+    // BASS_ACTIVE_STOPPED only when both are past.
+    const uint64_t streamEnd = stream->maxEventFrame +
+        static_cast<uint64_t>(stream->sampleRate) * 2u;
+    if (stream->servedFrames < streamEnd) return 1u;
+    const uint64_t nowTick = BassNowTickMs();
+    return stream->lastSubmitTickMs != 0u &&
+                   nowTick - stream->lastSubmitTickMs < 5000u
+               ? 1u
+               : 0u;
 }
 
 unsigned long long WINAPI BASS_ChannelSeconds2Bytes(DWORD handle, double seconds) {

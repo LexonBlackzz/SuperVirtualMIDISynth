@@ -21,6 +21,7 @@ static const DWORD kDataFloat = 0x40000000u;
 static int RunLivePump(const char* sf2Path);
 
 int main(int argc, char** argv) {
+    _putenv("SVMS_BASS_QUIET_MS=250");
     const char* sf2Path = argc > 1
         ? argv[1]
         : "E:\\backup\\Misc\\Black MIDI\\omv2 with zmp PFAViz\\Morphine Piano.sf2";
@@ -160,6 +161,7 @@ int main(int argc, char** argv) {
                     }
                     break;
                 }
+                if (got == 0u) continue;  // quiescence window
                 rendered += got / 8u;
                 if (pulls > 1000000u) break;
             }

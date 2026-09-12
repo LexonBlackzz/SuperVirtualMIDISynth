@@ -16,6 +16,7 @@ typedef DWORD HSOUNDFONT;
 static const DWORD kDataFloat = 0x40000000u;  // BASS_DATA_FLOAT (reflected)
 
 int main(int argc, char** argv) {
+    _putenv("SVMS_BASS_QUIET_MS=250");
     const char* sf2Path = argc > 1
         ? argv[1]
         : "E:\\backup\\Misc\\Black MIDI\\omv2 with zmp PFAViz\\Morphine Piano.sf2";
@@ -119,8 +120,9 @@ int main(int argc, char** argv) {
             if (errCode() != 45) { printf("FAIL: expected ENDED 45\n"); return 1; }
             break;
         }
-        if (pulls > 30) { printf("FAIL: stream never ended\n"); return 1; }
-        if (got == 0) { printf("FAIL: ret 0 err=%d\n", errCode()); return 1; }
+        if (pulls > 4000) { printf("FAIL: stream never ended\n"); return 1; }
+        // 0-returns are legal inside the quiescence window (250 ms here).
+        if (got == 0) { Sleep(1); continue; }
     }
 
     // ── SYNC (flagless) events: realtime player contract ──────────────
