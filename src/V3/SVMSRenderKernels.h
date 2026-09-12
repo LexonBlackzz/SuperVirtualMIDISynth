@@ -77,6 +77,11 @@ uint32_t ScalarRenderSustainedLoop(
     float* outputLeft, float* outputRight,
     uint32_t frameStart, uint32_t frameCount);
 
+uint32_t RenderSustainedOneShotSpan(
+    VoiceSoA& v, uint32_t idx, const int16_t* sampleData,
+    const int16_t* hilbertData, uint32_t sampleDataFrames,
+    float* outputLeft, float* outputRight, uint32_t frameStart,
+    uint32_t frameCount);
 uint32_t ScalarRenderSustainedOneShot(
     VoiceSoA& voices, uint32_t handle, const int16_t* sampleData,
     const int16_t* hilbertData, uint32_t sampleDataFrames,

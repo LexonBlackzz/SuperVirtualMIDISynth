@@ -1315,6 +1315,167 @@ bool BuildVolatileStealKeysAVX2(
     return true;
 }
 
+// ── Scalar one-shot span helpers ────────────────────────────────────────
+// Exact mirrors of the generic envelope state machine's branches
+// (SVMSRenderScalar.h RenderPrimaryVoiceSpan) for spans too short to
+// vectorize and for states the batch validation refuses.  Used by the
+// batch entries below; no AVX2 is executed on these paths, so calling
+// them costs no AVX↔SSE transition.
+
+uint32_t RenderReleaseOneShotSpanScalar(
+    VoiceSoA& v, uint32_t idx, const int16_t* sampleData,
+    uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
+    uint32_t frameStart, uint32_t frameCount) {
+    const uint32_t relEnd = v.relEnd[idx];
+    if (sampleData == nullptr || relEnd < 2u ||
+        v.sampleStart[idx] >= sampleDataFrames ||
+        relEnd > sampleDataFrames - v.sampleStart[idx]) {
+        return 0u;
+    }
+    float phase = (std::max)(0.0f, v.phases[idx]);
+    float gain = v.currentGain[idx];
+    uint32_t remaining = v.releaseSamplesRemaining[idx];
+    const float decay = v.releaseDecay[idx];
+    const float step = v.phaseIncs[idx];
+    const float mixL = v.mixGainL[idx];
+    const float mixR = v.mixGainR[idx];
+    const int16_t* region = sampleData + v.sampleStart[idx];
+    float* outL = outputLeft + frameStart;
+    float* outR = outputRight + frameStart;
+    for (uint32_t frame = 0u; frame < frameCount; ++frame) {
+        const uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= relEnd) {
+            v.phases[idx] = phase;
+            v.currentGain[idx] = gain;
+            v.releaseSamplesRemaining[idx] = remaining;
+            return frame;
+        }
+        bool finished = remaining == 0u;
+        if (!finished) {
+            gain *= decay;
+            if (remaining != UINT32_MAX) {
+                --remaining;
+                finished = remaining == 0u;
+            }
+        }
+        const float fraction = phase - static_cast<float>(base);
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[base + 1u]) *
+            (1.0f / 32768.0f) - first) * fraction;
+        outL[frame] += sample * gain * mixL;
+        outR[frame] += sample * gain * mixR;
+        phase += step;
+        if (finished ||
+            (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
+            v.phases[idx] = phase;
+            v.currentGain[idx] = gain;
+            v.releaseSamplesRemaining[idx] = remaining;
+            return frame;
+        }
+    }
+    v.phases[idx] = phase;
+    v.currentGain[idx] = gain;
+    v.releaseSamplesRemaining[idx] = remaining;
+    return UINT32_MAX;
+}
+
+uint32_t RenderTransientOneShotSpanScalar(
+    VoiceSoA& v, uint32_t idx, const int16_t* sampleData,
+    uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
+    uint32_t frameStart, uint32_t frameCount) {
+    const uint32_t relEnd = v.relEnd[idx];
+    if (sampleData == nullptr || relEnd < 2u ||
+        v.sampleStart[idx] >= sampleDataFrames ||
+        relEnd > sampleDataFrames - v.sampleStart[idx]) {
+        return UINT32_MAX;
+    }
+    float phase = (std::max)(0.0f, v.phases[idx]);
+    float gain = v.currentGain[idx];
+    uint8_t stage = v.envelopeStage[idx];
+    uint32_t delayRemaining = v.delaySamplesRemaining[idx];
+    uint32_t holdRemaining = v.holdSamplesRemaining[idx];
+    uint32_t attackRemaining = v.attackSamplesRemaining[idx];
+    uint32_t decayRemaining = v.decaySamplesRemaining[idx];
+    const float step = v.phaseIncs[idx];
+    const float targetGain = v.targetGain[idx];
+    const float sustainLevel = v.sustainLevel[idx];
+    const float attackStep = v.attackGainStep[idx];
+    const float decaySlope = v.decaySlope[idx];
+    const float mixL = v.mixGainL[idx];
+    const float mixR = v.mixGainR[idx];
+    const int16_t* region = sampleData + v.sampleStart[idx];
+    float* outL = outputLeft + frameStart;
+    float* outR = outputRight + frameStart;
+    for (uint32_t frame = 0u; frame < frameCount; ++frame) {
+        const uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= relEnd) {
+            // One-shot sample ended: retire (no loop to wrap to).
+            v.phases[idx] = phase;
+            v.currentGain[idx] = gain;
+            v.envelopeStage[idx] = stage;
+            v.delaySamplesRemaining[idx] = delayRemaining;
+            v.holdSamplesRemaining[idx] = holdRemaining;
+            v.attackSamplesRemaining[idx] = attackRemaining;
+            v.decaySamplesRemaining[idx] = decayRemaining;
+            return frame;
+        }
+        // The exact envelope sequence from the generic state machine
+        // (unreleased branch).
+        if (stage == 4u) {
+            if (delayRemaining > 0u) {
+                --delayRemaining;
+                gain = 0.0f;
+            } else {
+                stage = 0u;
+            }
+        }
+        if (stage == 0u) {
+            if (holdRemaining > 0u) {
+                --holdRemaining;
+                gain = targetGain;
+            } else {
+                stage = 1u;
+            }
+        }
+        if (stage == 1u) {
+            if (attackRemaining > 0u) {
+                gain += attackStep;
+                --attackRemaining;
+                if (gain > targetGain) gain = targetGain;
+            } else {
+                gain = targetGain;
+            }
+            if (attackRemaining == 0u)
+                stage = decayRemaining > 0u ? 2u : 3u;
+        }
+        if (stage == 2u) {
+            if (decayRemaining > 0u) {
+                gain *= decaySlope;
+                --decayRemaining;
+                if (gain < sustainLevel) gain = sustainLevel;
+            } else {
+                gain = sustainLevel;
+            }
+            if (decayRemaining == 0u) stage = 3u;
+        }
+        const float fraction = phase - static_cast<float>(base);
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[base + 1u]) *
+            (1.0f / 32768.0f) - first) * fraction;
+        outL[frame] += sample * gain * mixL;
+        outR[frame] += sample * gain * mixR;
+        phase += step;
+    }
+    v.phases[idx] = phase;
+    v.currentGain[idx] = gain;
+    v.envelopeStage[idx] = stage;
+    v.delaySamplesRemaining[idx] = delayRemaining;
+    v.holdSamplesRemaining[idx] = holdRemaining;
+    v.attackSamplesRemaining[idx] = attackRemaining;
+    v.decaySamplesRemaining[idx] = decayRemaining;
+    return UINT32_MAX;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // One-shot kernels (held and releasing non-looping voices).
 //
@@ -1511,14 +1672,199 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
     return UINT32_MAX;
 }
 
+// Transient one-shot: non-looping attack/decay voices (the decay stage of
+// every piano/pluck note).  Mirrors RenderTransientLoopFramesAVX2 with the
+// loop-wrap math replaced by end-of-sample retirement; the envelope runs
+// with the exact scalar recurrence into gains[8], stage transitions fall to
+// the scalar tail so the class change is reported once.
+uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
+                                          uint32_t handle) {
+    VoiceSoA& v = *c.voices;
+    const uint32_t relEnd = v.relEnd[handle];
+    float phase = (std::max)(0.0f, v.phases[handle]);
+    float gain = v.currentGain[handle];
+    uint8_t stage = v.envelopeStage[handle];
+    const uint8_t initialStage = stage;
+    uint32_t attackRemaining = v.attackSamplesRemaining[handle];
+    uint32_t decayRemaining = v.decaySamplesRemaining[handle];
+    const float step = v.phaseIncs[handle];
+    const float targetGain = v.targetGain[handle];
+    const float sustainLevel = v.sustainLevel[handle];
+    const float attackStep = v.attackGainStep[handle];
+    const float decaySlope = v.decaySlope[handle];
+    const float mixL = v.mixGainL[handle];
+    const float mixR = v.mixGainR[handle];
+    const int16_t* region = c.sampleData + v.sampleStart[handle];
+    float* outL = c.outputLeft + c.frameStart;
+    float* outR = c.outputRight + c.frameStart;
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
+                                       4.0f, 5.0f, 6.0f, 7.0f);
+    const __m256 stepVector = _mm256_set1_ps(step);
+    const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
+    const float lastSafePhase = fastGuardExact
+        ? static_cast<float>(relEnd - 1u) : -1.0f;
+    uint32_t frame = 0u;
+    while (frame < c.frameCount) {
+        // Simulate the exact scalar envelope recurrence eight steps ahead;
+        // the chunk is only taken when the stage is unchanged after all
+        // eight steps and no lane can reach the sample end.
+        float futureGain = gain;
+        uint8_t futureStage = stage;
+        uint32_t futureAttack = attackRemaining;
+        uint32_t futureDecay = decayRemaining;
+        alignas(32) float gains[8];
+        for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
+            if (futureStage == 1u) {
+                if (futureAttack > 0u) {
+                    futureGain += attackStep;
+                    --futureAttack;
+                    if (futureGain > targetGain) futureGain = targetGain;
+                } else {
+                    futureGain = targetGain;
+                }
+                if (futureAttack == 0u)
+                    futureStage = futureDecay > 0u ? 2u : 3u;
+            }
+            if (futureStage == 2u) {
+                if (futureDecay > 0u) {
+                    futureGain *= decaySlope;
+                    --futureDecay;
+                    if (futureGain < sustainLevel) futureGain = sustainLevel;
+                } else {
+                    futureGain = sustainLevel;
+                }
+                if (futureDecay == 0u) futureStage = 3u;
+            }
+            gains[laneIndex] = futureGain;
+        }
+        const float lastPhase = phase + step * 7.0f;
+        if (fastGuardExact && frame + 8u <= c.frameCount &&
+            futureStage == stage && lastPhase < lastSafePhase) {
+            _mm_prefetch(reinterpret_cast<const char*>(
+                             region +
+                             static_cast<uint32_t>(lastPhase + step)),
+                         _MM_HINT_T0);
+            const __m256 phases = _mm256_add_ps(
+                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
+            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256 first, second;
+            GatherSamplePairAVX2(region, bases, first, second);
+            const __m256 fraction = _mm256_sub_ps(
+                phases, _mm256_cvtepi32_ps(bases));
+            const __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
+            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outL + frame),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
+            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
+                _mm256_loadu_ps(outR + frame),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+            gain = futureGain;
+            stage = futureStage;
+            attackRemaining = futureAttack;
+            decayRemaining = futureDecay;
+            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                phase += step;
+            frame += 8u;
+            continue;
+        }
+        const uint32_t base = static_cast<uint32_t>(phase);
+        if (base + 1u >= relEnd) {
+            // One-shot sample ended: retire.
+            v.phases[handle] = phase;
+            v.currentGain[handle] = gain;
+            v.envelopeStage[handle] = stage;
+            v.attackSamplesRemaining[handle] = attackRemaining;
+            v.decaySamplesRemaining[handle] = decayRemaining;
+            return frame;
+        }
+        if (stage == 1u) {
+            if (attackRemaining > 0u) {
+                gain += attackStep;
+                --attackRemaining;
+                if (gain > targetGain) gain = targetGain;
+            } else {
+                gain = targetGain;
+            }
+            if (attackRemaining == 0u)
+                stage = decayRemaining > 0u ? 2u : 3u;
+        }
+        if (stage == 2u) {
+            if (decayRemaining > 0u) {
+                gain *= decaySlope;
+                --decayRemaining;
+                if (gain < sustainLevel) gain = sustainLevel;
+            } else {
+                gain = sustainLevel;
+            }
+            if (decayRemaining == 0u) stage = 3u;
+        }
+        const float fraction = phase - static_cast<float>(base);
+        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
+        const float sample = first + (static_cast<float>(region[base + 1u]) *
+            (1.0f / 32768.0f) - first) * fraction;
+        outL[frame] += sample * gain * mixL;
+        outR[frame] += sample * gain * mixR;
+        phase += step;
+        ++frame;
+    }
+    v.phases[handle] = phase;
+    v.currentGain[handle] = gain;
+    v.envelopeStage[handle] = stage;
+    v.attackSamplesRemaining[handle] = attackRemaining;
+    v.decaySamplesRemaining[handle] = decayRemaining;
+    if (stage != initialStage && c.classChangeHandles != nullptr &&
+        c.classChangeCount != nullptr) {
+        c.classChangeHandles[(*c.classChangeCount)++] = handle;
+    }
+    return UINT32_MAX;
+}
+
+bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
+                                const uint32_t* handles,
+                                uint32_t handleCount) {
+    if (context.frameCount == 0u || context.sampleData == nullptr) return true;
+    if (context.voices->rot != nullptr) return false;
+    VoiceSoA& v = *context.voices;
+    for (uint32_t i = 0u; i < handleCount; ++i) {
+        const uint32_t h = handles[i];
+        if (v.state[h] == static_cast<uint8_t>(VoiceState::Releasing) ||
+            (v.envelopeStage[h] != 1u && v.envelopeStage[h] != 2u) ||
+            v.releaseSamplesRemaining[h] != UINT32_MAX ||
+            v.relEnd[h] < 2u ||
+            v.sampleStart[h] >= context.sampleDataFrames ||
+            v.relEnd[h] > context.sampleDataFrames - v.sampleStart[h] ||
+            v.phaseIncs[h] < 0.0f || v.relEnd[h] > 0x1000000u) {
+            return false;
+        }
+    }
+    if (context.frameCount < 8u) {
+        // Short event-fragmented spans: the 8-frame time chunk cannot fire,
+        // so run the exact scalar sequence per row — no AVX2 setup, no
+        // AVX↔SSE transitions.
+        for (uint32_t i = 0u; i < handleCount; ++i) {
+            RenderTransientOneShotSpanScalar(
+                v, handles[i], context.sampleData, context.sampleDataFrames,
+                context.outputLeft, context.outputRight, context.frameStart,
+                context.frameCount);
+        }
+        return true;
+    }
+    for (uint32_t i = 0u; i < handleCount; ++i) {
+        RenderTransientOneShotFramesAVX2(context, handles[i]);
+    }
+    _mm256_zeroupper();
+    return true;
+}
+
 bool RenderSustainedOneShotAVX2(const RenderSpanContext& context,
                                 const uint32_t* handles,
                                 uint32_t handleCount) {
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     // Rotation voices render through the rotation-hooked scalar spans.
     if (context.voices->rot != nullptr) return false;
-    if (context.frameCount <= 4u) return false;
-    const VoiceSoA& v = *context.voices;
+    VoiceSoA& v = *context.voices;
     // Validate the whole batch before mutating anything: a false return
     // must leave zero state changes (kernel fallback contract).
     for (uint32_t i = 0u; i < handleCount; ++i) {
@@ -1529,6 +1875,20 @@ bool RenderSustainedOneShotAVX2(const RenderSpanContext& context,
             v.phaseIncs[h] < 0.0f || v.relEnd[h] > 0x1000000u) {
             return false;
         }
+    }
+    if (context.frameCount < 8u) {
+        // Short event-fragmented spans: exact scalar per row — no AVX2
+        // setup, no AVX↔SSE transitions (the per-row entry overhead would
+        // exceed the render work at these lengths).
+        for (uint32_t i = 0u; i < handleCount; ++i) {
+            const uint32_t retiredAt = RenderSustainedOneShotSpan(
+                v, handles[i], context.sampleData, context.hilbertData,
+                context.sampleDataFrames, context.outputLeft,
+                context.outputRight, context.frameStart, context.frameCount);
+            if (retiredAt != UINT32_MAX)
+                RecordRetirement(context, handles[i], retiredAt);
+        }
+        return true;
     }
     for (uint32_t i = 0u; i < handleCount; ++i) {
         const uint32_t retiredAt = RenderSustainedOneShotFramesAVX2(
@@ -1545,8 +1905,7 @@ bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
                               uint32_t handleCount) {
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     if (context.voices->rot != nullptr) return false;
-    if (context.frameCount <= 4u) return false;
-    const VoiceSoA& v = *context.voices;
+    VoiceSoA& v = *context.voices;
     for (uint32_t i = 0u; i < handleCount; ++i) {
         const uint32_t h = handles[i];
         if (v.relEnd[h] < 2u ||
@@ -1555,6 +1914,17 @@ bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
             v.phaseIncs[h] < 0.0f || v.relEnd[h] > 0x1000000u) {
             return false;
         }
+    }
+    if (context.frameCount < 8u) {
+        for (uint32_t i = 0u; i < handleCount; ++i) {
+            const uint32_t retiredAt = RenderReleaseOneShotSpanScalar(
+                v, handles[i], context.sampleData, context.sampleDataFrames,
+                context.outputLeft, context.outputRight, context.frameStart,
+                context.frameCount);
+            if (retiredAt != UINT32_MAX)
+                RecordRetirement(context, handles[i], retiredAt);
+        }
+        return true;
     }
     for (uint32_t i = 0u; i < handleCount; ++i) {
         const uint32_t retiredAt = RenderReleaseOneShotFramesAVX2(
@@ -1579,6 +1949,8 @@ const RenderKernelSet& GetAVX2RenderKernelSet() {
             RenderReleaseOneShotAVX2;
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientLoop)] =
             RenderTransientLoopAVX2;
+        result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientOneShot)] =
+            RenderTransientOneShotAVX2;
         result.backend = RenderBackend::AVX2;
         result.name = "avx2";
         return result;

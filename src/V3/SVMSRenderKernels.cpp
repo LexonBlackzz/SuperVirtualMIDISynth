@@ -113,6 +113,8 @@ uint32_t RenderSustainedLoopSpan(
     return UINT32_MAX;
 }
 
+} // namespace
+
 uint32_t RenderSustainedOneShotSpan(
     VoiceSoA& v, uint32_t idx, const int16_t* sampleData,
     const int16_t* hilbertData,
@@ -155,6 +157,8 @@ uint32_t RenderSustainedOneShotSpan(
     v.phases[idx] = phase;
     return retiredAt;
 }
+
+namespace {
 
 template <uint32_t FrameCount>
 void RenderSustainedLoopShortBatchFixed(

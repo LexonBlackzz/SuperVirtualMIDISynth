@@ -263,6 +263,7 @@ enum class VoiceRenderClass : uint8_t {
     SustainedLoop = 0,
     SustainedOneShot,
     TransientLoop,
+    TransientOneShot,
     ReleaseLoop,
     ReleaseOneShot,
     Generic,

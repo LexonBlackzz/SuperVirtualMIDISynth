@@ -2501,9 +2501,9 @@ inline VoiceRenderClass VoiceManager::ClassifyVoice(VoiceHandle handle) const {
     if (v.envelopeStage[handle] == 3u)
         return loop ? VoiceRenderClass::SustainedLoop
                     : VoiceRenderClass::SustainedOneShot;
-    if (loop && (v.envelopeStage[handle] == 1u ||
-                 v.envelopeStage[handle] == 2u)) {
-        return VoiceRenderClass::TransientLoop;
+    if (v.envelopeStage[handle] == 1u || v.envelopeStage[handle] == 2u) {
+        return loop ? VoiceRenderClass::TransientLoop
+                    : VoiceRenderClass::TransientOneShot;
     }
     return VoiceRenderClass::Generic;
 }

@@ -3439,9 +3439,9 @@ inline VoiceRenderClass ClassifyWholeVoiceRow(const VoiceSoA& v,
     if (v.envelopeStage[row] == 3u)
         return loop ? VoiceRenderClass::SustainedLoop
                     : VoiceRenderClass::SustainedOneShot;
-    if (loop && (v.envelopeStage[row] == 1u ||
-                 v.envelopeStage[row] == 2u)) {
-        return VoiceRenderClass::TransientLoop;
+    if (v.envelopeStage[row] == 1u || v.envelopeStage[row] == 2u) {
+        return loop ? VoiceRenderClass::TransientLoop
+                    : VoiceRenderClass::TransientOneShot;
     }
     return VoiceRenderClass::Generic;
 }

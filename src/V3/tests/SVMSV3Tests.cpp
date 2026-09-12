@@ -4240,7 +4240,8 @@ struct WholeVoiceRng {
 
 void ConfigureWholeVoiceSeedPool(svms::VoiceManager& voices,
                                  const svms::ChannelCache& channels,
-                                 uint32_t poolSize, uint32_t seedCount) {
+                                 uint32_t poolSize, uint32_t seedCount,
+                                 bool transientSeeds = true) {
     // Modeled on ConfigureDifferentialSeed but every seeded voice is Active
     // and immortal: the whole-voice scenarios need a candidate pool whose
     // state is identical at block start and mid-block.  ConfigureDifferentialSeed's
@@ -4257,6 +4258,12 @@ void ConfigureWholeVoiceSeedPool(svms::VoiceManager& voices,
         const svms::VoiceHandle voice = voices.AllocateVoice(
             channel, note, static_cast<uint8_t>(48u + i));
         const bool loop = (i % 4u) != 1u;
+        // Every 8th seed (i % 8 == 5, always non-loop) runs a real
+        // attack/decay envelope: the transient one-shot state machine and
+        // its AVX2 kernel need stage-1/2 coverage against the oracle, and
+        // the decay settles at the sustain level well inside the scenario
+        // so the pool stays shrink-free afterwards.
+        const bool transientSeed = transientSeeds && (i % 8u) == 5u;
         // Non-loop (one-shot) seed voices get a crawl-speed phase step so
         // none of them can reach relEnd and retire inside the scenario: a
         // mid-block retirement would change the active set between the
@@ -4274,8 +4281,13 @@ void ConfigureWholeVoiceSeedPool(svms::VoiceManager& voices,
         // a fraction of the initial level, hence the 1.0f): stage 3 holds
         // forever and releaseSamplesRemaining stays UINT32_MAX, so the pool
         // never shrinks and no candidate ever retires mid-scenario.
-        voices.SetVoiceEnvelope(voice, gain, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f,
-                                0.999f);
+        if (transientSeed) {
+            voices.SetVoiceEnvelope(voice, gain, 0.35f, 0, 0, 64, 3000,
+                                    gain / 64.0f, 0.999f, 0.999f);
+        } else {
+            voices.SetVoiceEnvelope(voice, gain, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f,
+                                    0.999f);
+        }
         voices.SetVoicePlayIndex(voice, i + 1u);
         voices.SetVoiceGain(voice, 0.02f, 0.02f);
         voices.RefreshMixGain(voice, channels.GetParams()[channel]);
@@ -4433,6 +4445,13 @@ void TestWholeVoiceStealDifferential() {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 6u;
     constexpr uint32_t kPool = 48u;
+    // No transient seeds here: mid-block envelope decay changes steal
+    // scores between the whole-voice pre-pass (which scores launches
+    // against block-start state) and the oracle's per-frame dispatch —
+    // the documented whole-voice drift, amplified by evolving gains into
+    // observable victim divergence.  Transient rendering is
+    // oracle-verified by the launch/CC differentials, whose launches do
+    // not straddle mid-block score evolution.
     const uint32_t sampleCount = 4096u;
     std::vector<int16_t> samples(4096u + 8u, 0);
     for (uint32_t i = 0; i < samples.size(); ++i)
@@ -4457,7 +4476,8 @@ void TestWholeVoiceStealDifferential() {
         seedChannels.SetMasterVolume(1.0f);
         seedChannels.RebuildCache(cfg, 44100.0f);
         auto seedVoices = std::make_unique<svms::VoiceManager>();
-        ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, kPool, kPool);
+        ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, kPool, kPool,
+                                      false);
         auto oracleVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
         auto wholeVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
         svms::ChannelCache oracleChannels = seedChannels;
