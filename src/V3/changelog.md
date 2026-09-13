@@ -10,6 +10,18 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-13 fix(v3): per-segment rdtsc profiling in RenderWholeVoiceSegment
+  gated behind SVMS_WV_SEGMENT_PROFILE (default off). The six rdtsc per
+  segment added by the OneShot-kernel telemetry cost ~+8% on note-only
+  material and ~+25-35% on op-fragmented blocks (every CC/bend row-op splits
+  timelines into more segments). Bench dispatch fixes alongside: pitch bends
+  now route through ApplyChannelBendRatio like Driver::HandlePitchBend (the
+  old inline rewrite bypassed the whole-voice bend-op hook, so bend-heavy
+  bench numbers were fictional), and --cc-controller 1 emits nonzero values
+  so the vibrato-gate A/B is honest. Measured @5000 voices chopped-notes:
+  baseline 0.617 -> 0.570, +CC7 1.261 -> 0.816, mixed-events 4.156 -> 3.144;
+  the CC1 vibrato gate (legacy sparse fallback) measures 5.253 = the 9.2x
+  cliff the owner flagged.
 - 2026-09-12 feat(v3): BASS shim surface extended to the full genuine
   BASSMIDI export list (40 names). BASS_MIDI_StreamEvent (singular — the
   API PFA-1.1.0viz imports) is implemented for real: translates via the

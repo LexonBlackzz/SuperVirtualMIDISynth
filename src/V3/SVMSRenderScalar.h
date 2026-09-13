@@ -3889,7 +3889,11 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
     float* outR, uint32_t segStart, uint32_t segFrames, bool isReal,
     uint32_t jobIndex) {
-#if defined(_MSC_VER)
+    // Per-segment rdtsc profiling is opt-in: this function runs once per
+    // voice per op-split segment (tens of thousands of calls per block on
+    // op-dense material), and six rdtsc per call measured ~+25% on every
+    // whole-voice block. The cheap call/frame counters below stay on.
+#if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
     const uint64_t segBegin = __rdtsc();
 #endif
     ++wvSegCalls_;
@@ -3902,10 +3906,8 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     RenderClassKernel kernel = kernelSet_->kernels[
         static_cast<uint32_t>(classBefore)];
     if (segFrames >= 8u && kernel != nullptr && sampleData != nullptr) {
-#if defined(_MSC_VER)
         ++wvSegKernelOk_;
         wvSegKernelFrames_ += segFrames;
-#endif
         RenderSpanContext context{
             &state, sampleData, nullptr, sampleDataFrames, outL, outR,
             segStart, segFrames, state.GetCapacity(),
@@ -3919,21 +3921,19 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
                      i < wvJobRetireCounts_[jobIndex]; ++i) {
                     retBuf[i].frameOffset += segStart;
                 }
-#if defined(_MSC_VER)
+#if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
                 wvSegCycles_ += __rdtsc() - segBegin;
 #endif
                 return wvJobRetireCounts_[jobIndex] > retCountBefore;
             }
-#if defined(_MSC_VER)
+#if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
             wvSegCycles_ += __rdtsc() - segBegin;
 #endif
             return false;
         }
     }
-#if defined(_MSC_VER)
     ++wvSegFallback_;
     wvSegFallbackFrames_ += segFrames;
-#endif
     const uint32_t retiredAt = RenderPrimaryVoiceSpan(
         state, row, sampleData, nullptr, sampleDataFrames, outL, outR,
         segStart, segFrames, segFrames);
@@ -3942,7 +3942,7 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
             retBuf[wvJobRetireCounts_[jobIndex]++] = {
                 row, segStart + retiredAt, voices->activePosition_[row]};
         }
-#if defined(_MSC_VER)
+#if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
         wvSegCycles_ += __rdtsc() - segBegin;
 #endif
         return true;
@@ -3967,7 +3967,7 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
         state.renderGainR[row] =
             state.currentGain[row] * state.mixGainR[row];
     }
-#if defined(_MSC_VER)
+#if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
     wvSegCycles_ += __rdtsc() - segBegin;
 #endif
     return false;

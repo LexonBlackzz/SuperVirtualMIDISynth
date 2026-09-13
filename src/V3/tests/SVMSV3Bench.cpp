@@ -556,12 +556,12 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
             const int32_t wheel = (static_cast<int32_t>(event.data2) << 7) |
                                   event.data1;
             const float semitones = static_cast<float>(wheel - 8192) / 4096.0f;
-            const float ratio = std::pow(2.0f, semitones / 12.0f);
-            voices.ForEachChannelActive(event.channel,
-                [&](svms::VoiceHandle handle) {
-                voices.v.phaseIncs[handle] =
-                    voices.v.basePhaseIncs[handle] * ratio;
-            });
+            // Route through VoiceManager::ApplyChannelBendRatio exactly like
+            // Driver::HandlePitchBend: with the whole-voice pre-pass active
+            // this records a channel row-op (timeline split) instead of an
+            // inline rewrite, so bend-heavy measurements exercise the real
+            // production cost.
+            voices.ApplyChannelBendRatio(event.channel, semitones);
             break;
         }
         default:
@@ -768,8 +768,8 @@ int main(int argc, char** argv) {
                             ? static_cast<uint8_t>(options.ccController)
                             : kLifecycleControllers[index % 4u];
                         event.data2 =
-                            (event.data1 == 64u || event.data1 == 66u) &&
-                                    (index % 2u) == 0u
+                            (event.data1 == 64u || event.data1 == 66u ||
+                             event.data1 == 1u) && (index % 2u) == 0u
                                 ? 127u
                                 : 0u;
                     }
