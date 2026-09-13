@@ -10,6 +10,13 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-14 fix(v3): Per-Channel Limiter page cleanup from the owner's
+  screenshots — the enable toggle rendered its raw "##cl_enabled_switch"
+  ImGui id (ToggleSwitch draws its label; pass "ENABLED"), the channel
+  activity grid went from a sparse 4x4 vertical-bar table to a compact
+  2-column x 8-row layout with tight horizontal GR bars, and the topology
+  description paragraph is gone (release knob gains a tooltip instead).
+
 - 2026-09-13 feat(v3): per-MIDI-channel limiter (opt-in, default OFF) — 16
   stereo channel buses limited independently, then summed into the master
   chain. Purely POST: RenderBlock gains optional channelBusLeft/Right plane

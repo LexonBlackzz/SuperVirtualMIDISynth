@@ -25,93 +25,98 @@ float DbToLinear(float db) {
     return std::pow(10.0f, db / 20.0f);
 }
 
-// One vertical gain-reduction bar in the 4x4 channel grid, styled after the
-// limiter page's GR bar: fill grows downward from the top as the channel's
-// bus is pushed below its threshold.
-void DrawChannelGrBar(const char* id, float reductionDb, float peakLinear,
-                      bool engineActive, const ImVec2& size) {
-    ImGui::PushID(id);
+// One channel row in the 2x8 activity grid: channel number plus a compact
+// horizontal gain-reduction bar, styled after the limiter page's GR bar —
+// fill grows from the left as the channel's bus is pushed below its
+// threshold, with the pre-limit peak drawn faintly underneath so the user
+// can tell "quiet channel" from "channel riding its threshold".
+void DrawChannelGrRow(int index, float reductionDb, float peakLinear,
+                      bool engineActive) {
+    char label[8];
+    std::snprintf(label, sizeof(label), "%d", index + 1);
+    const ImU32 labelColor = ImGui::GetColorU32(
+        engineActive && reductionDb > 0.05f
+            ? ImVec4(0.94f, 0.68f, 0.16f, 1.0f)
+            : ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, labelColor);
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0.0f, 6.0f);
+
+    const float rowHeight = ImGui::GetTextLineHeight();
+    const float barHeight = rowHeight - 4.0f;
+    const float barYOffset = 2.0f;
     const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const float barW = ImGui::GetContentRegionAvail().x;
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 barPos(pos.x, pos.y + barYOffset);
+    const ImVec2 barEnd(pos.x + barW, pos.y + barYOffset + barHeight);
 
     const ImU32 bg = ImGui::GetColorU32(ImVec4(0.055f, 0.062f, 0.074f, 1.0f));
     const ImU32 border = ImGui::GetColorU32(
         engineActive ? ImVec4(0.16f, 0.18f, 0.22f, 1.0f)
                      : ImVec4(0.10f, 0.11f, 0.13f, 1.0f));
-    dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bg, 3.0f);
-    dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), border, 3.0f);
+    dl->AddRectFilled(barPos, barEnd, bg, 2.0f);
+    dl->AddRect(barPos, barEnd, border, 2.0f);
 
-    // Pre-limit peak, drawn faintly behind the reduction fill so the user
-    // can tell "quiet channel" from "channel riding its threshold".
-    const float peakDb = LinearToDb(peakLinear);
-    const float peakNorm =
-        ImClamp((peakDb - kMeterFloorDb) / -kMeterFloorDb, 0.0f, 1.0f);
-    if (engineActive && peakNorm > 0.0f) {
-        dl->AddRectFilled(
-            ImVec2(pos.x + 2.0f,
-                   pos.y + size.y * (1.0f - peakNorm)),
-            ImVec2(pos.x + size.x - 2.0f, pos.y + size.y - 2.0f),
-            ImGui::GetColorU32(ImVec4(0.25f, 0.76f, 0.43f, 0.30f)), 2.0f);
+    if (engineActive) {
+        const float peakDb = LinearToDb(peakLinear);
+        const float peakNorm =
+            ImClamp((peakDb - kMeterFloorDb) / -kMeterFloorDb, 0.0f, 1.0f);
+        if (peakNorm > 0.0f) {
+            dl->AddRectFilled(
+                ImVec2(barPos.x + 2.0f, barPos.y + 2.0f),
+                ImVec2(barPos.x + 2.0f +
+                           (barW - 4.0f) * peakNorm,
+                       barEnd.y - 2.0f),
+                ImGui::GetColorU32(ImVec4(0.25f, 0.76f, 0.43f, 0.30f)), 2.0f);
+        }
+
+        const float gr = ImClamp(reductionDb, 0.0f, kGrDisplayMaxDb);
+        const float norm = gr / kGrDisplayMaxDb;
+        if (norm > 0.0f) {
+            dl->AddRectFilled(
+                ImVec2(barPos.x + 2.0f, barPos.y + 2.0f),
+                ImVec2(barPos.x + 2.0f + (barW - 4.0f) * norm,
+                       barEnd.y - 2.0f),
+                ImGui::GetColorU32(ImVec4(0.94f, 0.68f, 0.16f, 0.95f)), 2.0f);
+        }
     }
 
-    const float gr = ImClamp(reductionDb, 0.0f, kGrDisplayMaxDb);
-    const float norm = gr / kGrDisplayMaxDb;
-    if (engineActive && norm > 0.0f) {
-        dl->AddRectFilled(
-            ImVec2(pos.x + 2.0f, pos.y + 2.0f),
-            ImVec2(pos.x + size.x - 2.0f,
-                   pos.y + 2.0f + (size.y - 4.0f) * norm),
-            ImGui::GetColorU32(ImVec4(0.94f, 0.68f, 0.16f, 0.95f)), 2.0f);
-    }
-
-    ImGui::Dummy(size);
-    ImGui::PopID();
+    ImGui::Dummy(ImVec2(barW, rowHeight));
 }
 
 void DrawChannelGrid(const svms::RuntimeLinkTelemetryV2* telemetry,
                      bool telemetryAvailable) {
     const bool engineActive = telemetryAvailable &&
                               telemetry->channelLimiterEnabled != 0u;
-    const float barW = 34.0f;
-    const float barH = 120.0f;
-    const float labelH = ImGui::GetFontSize() + 6.0f;
-
-    if (ImGui::BeginTable("##channel_grid", 4,
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 3.0f));
+    if (ImGui::BeginTable("##channel_grid", 2,
                           ImGuiTableFlags_SizingStretchSame)) {
-        for (int row = 0; row < 4; ++row) {
+        for (int row = 0; row < 8; ++row) {
             ImGui::TableNextRow();
-            for (int col = 0; col < 4; ++col) {
-                const int index = row * 4 + col;
-                if (index >= kChannelGrid) continue;
-                ImGui::TableNextColumn();
-                char id[16];
-                std::snprintf(id, sizeof(id), "##cl%d", index);
-                const float gr = telemetryAvailable
-                    ? telemetry->channelLimiterGainReductionDb[index]
-                    : 0.0f;
-                const float peak = telemetryAvailable
-                    ? telemetry->channelLimiterInputPeak[index]
-                    : 0.0f;
-                DrawChannelGrBar(id, gr, peak, engineActive,
-                                 ImVec2(barW, barH));
-
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                const ImVec2 pos = ImGui::GetItemRectMin();
-                char label[8];
-                std::snprintf(label, sizeof(label), "%d", index + 1);
-                const ImVec2 ts = ImGui::CalcTextSize(label);
-                dl->AddText(ImVec2(pos.x + (barW - ts.x) * 0.5f,
-                                   pos.y + barH + 3.0f),
-                            ImGui::GetColorU32(
-                                gr > 0.05f ? ImVec4(0.94f, 0.68f, 0.16f, 1.0f)
-                                           : ImVec4(0.56f, 0.59f, 0.62f, 1.0f)),
-                            label);
-                // Reserve row height including the label.
-                ImGui::Dummy(ImVec2(barW, labelH));
-            }
+            ImGui::TableNextColumn();
+            DrawChannelGrRow(row,
+                             telemetryAvailable
+                                 ? telemetry->channelLimiterGainReductionDb[row]
+                                 : 0.0f,
+                             telemetryAvailable
+                                 ? telemetry->channelLimiterInputPeak[row]
+                                 : 0.0f,
+                             engineActive);
+            ImGui::TableNextColumn();
+            DrawChannelGrRow(row + 8,
+                             telemetryAvailable
+                                 ? telemetry->channelLimiterGainReductionDb[row + 8]
+                                 : 0.0f,
+                             telemetryAvailable
+                                 ? telemetry->channelLimiterInputPeak[row + 8]
+                                 : 0.0f,
+                             engineActive);
         }
         ImGui::EndTable();
     }
+    ImGui::PopStyleVar();
 }
 
 } // namespace
@@ -145,15 +150,13 @@ void DrawChannelLimiterPage(ConfigDocument& doc) {
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
                              (headerRowHeight - 22.0f) * 0.5f);
         bool enabled = w.channelLimiterEnabled;
-        if (ToggleSwitch("##cl_enabled_switch", &enabled,
+        if (ToggleSwitch("ENABLED", &enabled,
                          "Limit each MIDI channel bus independently before "
                          "the master chain.")) {
             w.channelLimiterEnabled = enabled;
             doc.MarkDirty();
             pushAll();
         }
-        ImGui::SameLine();
-        ImGui::TextUnformatted("ENABLED");
 
         ImGui::TableNextColumn();
         const char* title = "PER-CHANNEL LIMITER";
@@ -203,7 +206,7 @@ void DrawChannelLimiterPage(ConfigDocument& doc) {
     ImGui::Spacing();
 
     const float availableWidth = ImGui::GetContentRegionAvail().x;
-    const float topHeight = 240.0f;
+    const float topHeight = 210.0f;
     if (ImGui::BeginTable("##cl_top", 2,
                           ImGuiTableFlags_SizingStretchProp |
                           ImGuiTableFlags_BordersInnerV)) {
@@ -266,20 +269,15 @@ void DrawChannelLimiterPage(ConfigDocument& doc) {
                     doc.MarkDirty();
                     pushAll();
                 }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::BeginTooltip();
+                    ImGui::TextUnformatted(
+                        "How fast a channel bus recovers after being pushed "
+                        "below its threshold.");
+                    ImGui::EndTooltip();
+                }
                 ImGui::EndTable();
             }
-
-            ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
-            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
-            ImGui::TextWrapped(
-                "Classic zero-latency topology: 16 stereo buses (one per "
-                "MIDI channel) are limited independently, then summed into "
-                "the master chain. Transients bite instantly and the master "
-                "limiter stays the final ceiling. Purely post-render - "
-                "disabled means bit-identical output.");
-            ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
         }
         ImGui::EndChild();
 
