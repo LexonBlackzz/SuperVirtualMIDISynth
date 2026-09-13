@@ -660,7 +660,7 @@ private:
         const uint64_t rebuildBegin = __rdtsc();
 #endif
         if (controller == 7 || controller == 10 || controller == 11 ||
-            controller == 64 || controller == 121) {
+            controller == 64 || controller == 121 || controller == 1) {
             channels_.RebuildChannel(channel, cfg_, float(rate_));
 #if defined(_MSC_VER)
             dispatchProfile.controlRebuild += __rdtsc() - rebuildBegin;
@@ -675,6 +675,12 @@ private:
 #if defined(_MSC_VER)
                 dispatchProfile.controlMix += __rdtsc() - mixBegin;
 #endif
+            }
+            if (controller == 1 || controller == 121) {
+                // Whole-voice pre-pass: report the post-rebuild modulation
+                // depth as a vibrato row-op (exact-frame LFO gating).
+                voices_.MarkChannelVibratoDepth(
+                    channel, channels_.GetParams()[channel].modDepth);
             }
         }
 #if defined(_MSC_VER)

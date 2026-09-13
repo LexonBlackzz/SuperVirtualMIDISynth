@@ -10,6 +10,24 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-13 perf(v3): CC1 vibrato joins the whole-voice fast path. The old
+  "any channel modDepth > 0 -> refuse whole-voice + dense, cap sparse spans
+  at 64 frames" gate cost 9.2x on modulated material (chopped-notes + CC1:
+  5.25 vs 0.57 cycles/voice-sample) because ONE mod-wheel touch poisoned
+  every subsequent block. Now the per-row AVX2 kernels rebuild the 64-frame
+  LFO control window internally (scalar advance-then-use triangle +
+  degree-5 exp2 Taylor instead of powf, windows never straddle a fast
+  chunk), and CC1/CC121/channel-pressure report post-rebuild depth through
+  a new vibrato row-op (kind 2) that the worker items track alongside bend
+  ratio cursors. Whole-voice takes vibrato only on the AVX2 backend —
+  scalar/SSE2 keep the legacy path bit-identical (boundary #2), and the
+  sparse path keeps AdvanceVibratoSpan as the reference. Whole-voice-vs-
+  sparse waveform parity carries the documented control-rate drift (window
+  boundaries differ): TestWholeVoiceVibratoDifferential measures 1.7e-2
+  saturating over 8 blocks, budget 3e-2. Bench: CC1 5.25 -> 0.97 (1.4x over
+  baseline). Also: per-channel vibrato relevance flags keep non-vibrato
+  blocks at their pre-change cost, and the whole-voice plan now accepts
+  unmapped CCs as audio-exact no-ops (they have no engine effect).
 - 2026-09-13 fix(v3): per-segment rdtsc profiling in RenderWholeVoiceSegment
   gated behind SVMS_WV_SEGMENT_PROFILE (default off). The six rdtsc per
   segment added by the OneShot-kernel telemetry cost ~+8% on note-only

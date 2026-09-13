@@ -7831,6 +7831,14 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
             voiceManager->MarkChannelMixStale(
                 channel, channelCache->GetParams()[channel]);
         }
+        if (controller == 1 || controller == 121) {
+            // Whole-voice pre-pass: report the post-rebuild modulation
+            // depth as a vibrato row-op so the LFO gates at the exact
+            // event frame inside the owning worker.  No-op elsewhere
+            // (AdvanceVibratoSpan reads the snapshot per span).
+            voiceManager->MarkChannelVibratoDepth(
+                channel, channelCache->GetParams()[channel].modDepth);
+        }
     }
 }
 
@@ -7841,6 +7849,9 @@ void Driver::HandleChannelPressure(uint8_t channel, uint8_t value) {
     channelCache->RebuildChannel(channel, *configSnapshot,
                                  static_cast<float>(sampleRate));
     channelCache->SetBendRatio(channel, channelPitchBendRatio_[channel]);
+    if (voiceManager)
+        voiceManager->MarkChannelVibratoDepth(
+            channel, channelCache->GetParams()[channel].modDepth);
 }
 
 void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {

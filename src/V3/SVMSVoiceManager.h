@@ -397,11 +397,28 @@ public:
                                       float mixScaleRight, void* userData);
     using ChannelBendOpHook = void (*)(uint8_t channel, float bendSemitones,
                                        float commonRatio, void* userData);
+    // Whole-voice pre-pass: reports the channel's post-rebuild modulation
+    // depth (CC1 mod wheel, CC121 reset, channel pressure) so the vibrato
+    // LFO can start/stop at the event's exact frame inside the owning
+    // worker.  Null outside the pre-pass — the sparse vibrato pass reads
+    // the live channel snapshot per span and needs no op.
+    using ChannelVibratoOpHook = void (*)(uint8_t channel, float modDepth,
+                                          void* userData);
     void SetRowOpHooks(ChannelMixOpHook mixHook, ChannelBendOpHook bendHook,
+                       ChannelVibratoOpHook vibratoHook,
                        void* userData) noexcept {
         mixOpHook_ = mixHook;
         bendOpHook_ = bendHook;
+        vibratoOpHook_ = vibratoHook;
         rowOpUserData_ = userData;
+    }
+    // Report a channel modulation-depth change (CC1 / CC121 / channel
+    // pressure, after the channel cache rebuilt).  Whole-voice pre-pass:
+    // records one vibrato op.  Otherwise a no-op — AdvanceVibratoSpan
+    // picks the depth up from the channel snapshot at the next span.
+    void MarkChannelVibratoDepth(uint8_t channel, float modDepth) noexcept {
+        if (vibratoOpHook_ != nullptr && channel < kChannelCount)
+            vibratoOpHook_(channel, modDepth, rowOpUserData_);
     }
     // Whole-voice renderer: stolen victims continue as renderer-owned ghost
     // snapshots (pre-pass state + exact-frame retirement), so the in-band
@@ -975,6 +992,7 @@ private:
     void* silenceHookUserData_ = nullptr;
     ChannelMixOpHook mixOpHook_ = nullptr;
     ChannelBendOpHook bendOpHook_ = nullptr;
+    ChannelVibratoOpHook vibratoOpHook_ = nullptr;
     void* rowOpUserData_ = nullptr;
     bool stealTailCaptureSuppressed_ = false;
 };

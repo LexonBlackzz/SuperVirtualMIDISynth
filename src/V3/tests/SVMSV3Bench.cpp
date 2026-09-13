@@ -304,6 +304,11 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
         voices.SetVoiceSoundFontIdentity(
             handle, 0u, static_cast<uint16_t>(i & 0xffffu));
         voices.RefreshMixGain(handle, channels.GetParams()[i & 15u]);
+        // SF2 default vibrato modulator on every seeded voice (5 Hz LFO,
+        // 50-cent depth): with --cc-controller 1 the modulation is real,
+        // so the vibrato path A/B exercises the LFO math, not just gates.
+        voices.v.vibLfoToPitchCents[handle] = 50.0f;
+        voices.v.vibLfoSteps[handle] = 5.0f / 44100.0f;
 
         if (workload == Workload::Release && !genericVoice)
             voices.StartRelease(handle);
@@ -535,6 +540,13 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
             if (event.data1 == 7u || event.data1 == 10u || event.data1 == 11u)
                 voices.MarkChannelMixStale(
                     event.channel, channels.GetParams()[event.channel]);
+            else if (event.data1 == 1u)
+                // Mirror Driver::HandleControlChange: report the rebuilt
+                // modulation depth so the whole-voice pre-pass records a
+                // vibrato op (kernel-internal 64-frame LFO windows).
+                voices.MarkChannelVibratoDepth(
+                    event.channel,
+                    channels.GetParams()[event.channel].modDepth);
             else if (event.data1 == 64u) {
                 if (event.data2 < 64u)
                     voices.ReleaseSustain(event.channel, blockCursor);

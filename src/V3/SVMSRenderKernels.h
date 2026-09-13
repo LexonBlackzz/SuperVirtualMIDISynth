@@ -37,7 +37,55 @@ struct RenderSpanContext {
     // slot, letting kernels use aligned vector loads instead of gathers
     // (dense-tile mode).  Zero: handles are arbitrary.
     uint32_t handleBase;
+    // Whole-voice vibrato (CC1 / channel pressure).  When lfoActive is
+    // non-zero the per-row kernels rebuild the voice's 64-frame LFO control
+    // window internally (scalar ratio refresh between vectorized chunks),
+    // so whole-voice blocks no longer refuse to the legacy 64-frame-capped
+    // sparse path.  lfoDepth/lfoBendRatio are the channel modulation depth
+    // and bend ratio at segment start — segment-constant because channel
+    // ops split timelines before segments render.  Sparse-path callers
+    // leave lfoActive zero: AdvanceVibratoSpan owns vibrato there and
+    // refreshes phaseIncs per span instead.
+    float lfoDepth;
+    float lfoBendRatio;
+    uint32_t lfoActive;
 };
+
+// exp2(cents / 1200) for vibrato ratios.  Degree-5 Taylor in
+// x = cents * ln2 / 1200: |x| <= 0.35 at +-600 cents keeps the truncation
+// below ~3e-7 relative — two orders under the 2e-5 AVX2 oracle tolerance
+// and far under the 64-frame control-rate drift this path already carries.
+// Replaces a ~30-50-cycle powf per voice per window at high polyphony.
+inline float Exp2CentsApprox(float cents) {
+    const float x = cents * 5.776226504666211e-4f;
+    return 1.0f + x * (0.6931471805599453f +
+        x * (0.2402265069591007f +
+        x * (0.05550410866482158f +
+        x * (0.009618129107628477f + x * 0.0013333558146428443f))));
+}
+
+// One whole-voice LFO control window for a single row: advance the voice's
+// free-running triangle LFO across `frames` (look-ahead — the same
+// advance-then-use semantics as AdvanceVibratoSpan), rebuild the pitch
+// ratio and return the segment phase increment.  Marks the row modulated
+// and stores phaseIncs so a mid-segment fallback, the next segment or the
+// next block observes a consistent row.
+inline float AdvanceVibratoLfoWindow(VoiceSoA& v, uint32_t row,
+                                     uint32_t frames, float depth,
+                                     float bendRatio) {
+    float lfoPhase = v.vibLfoPhases[row] +
+        v.vibLfoSteps[row] * static_cast<float>(frames);
+    lfoPhase -= std::floor(lfoPhase);
+    v.vibLfoPhases[row] = lfoPhase;
+    const float t = lfoPhase * 4.0f;
+    const float tri = t < 1.0f ? t : (t < 3.0f ? 2.0f - t : t - 4.0f);
+    const float cents = v.vibLfoToPitchCents[row] * depth * tri;
+    const float step = v.basePhaseIncs[row] * bendRatio *
+        Exp2CentsApprox(cents);
+    v.vibLfoModulated[row] = 1u;
+    v.phaseIncs[row] = step;
+    return step;
+}
 
 // A backend returns false without mutating state when it cannot safely consume
 // the complete class, allowing the established scalar voice path to take over.

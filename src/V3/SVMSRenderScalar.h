@@ -547,6 +547,7 @@ struct WholeVoiceChannelOp {
     uint8_t channel;
     uint8_t kind;   // 0 = bend (a = bendSemitones, b = commonRatio)
                     // 1 = mix-gain (a = mixScaleLeft, b = mixScaleRight)
+                    // 2 = vibrato depth (a = channel modDepth)
     float a;
     float b;
 };
@@ -642,7 +643,8 @@ public:
 private:
     // ── Whole-voice whole-block renderer ────────────────────────────────
     bool PlanWholeVoiceBlock(VoiceManager& voices, const RenderEvent* events,
-                             uint32_t eventCount, uint64_t blockStartFrame);
+                             uint32_t eventCount, uint64_t blockStartFrame,
+                             const ChannelParamsSnapshot* channelParams);
     void RenderWholeVoiceBlock(VoiceManager& voices,
                                const int16_t* sampleData,
                                uint32_t sampleDataFrames,
@@ -655,7 +657,8 @@ private:
                                  uint32_t sampleDataFrames, float* outL,
                                  float* outR, uint32_t segStart,
                                  uint32_t segFrames, bool isReal,
-                                 uint32_t jobIndex);
+                                 uint32_t jobIndex, float lfoDepth,
+                                 float lfoBendRatio, bool lfoActive);
     void CaptureGhostTail(uint32_t ghost);
     void RenderGhostTailSpan(uint32_t ghost, VoiceSoA& scratch,
                              const int16_t* sampleData,
@@ -676,6 +679,8 @@ private:
                                     float mixScaleRight, void* userData);
     static void WholeVoiceBendOpHook(uint8_t channel, float bendSemitones,
                                      float commonRatio, void* userData);
+    static void WholeVoiceVibratoOpHook(uint8_t channel, float modDepth,
+                                        void* userData);
     void DropWholeVoiceReleaseOp(VoiceHandle handle);
     bool EnsureWholeVoiceRowOpStorage(uint32_t opCount);
     void ApplyWholeVoiceRowOp(VoiceSoA& state, uint32_t row,
@@ -695,12 +700,24 @@ private:
     // Per ghost: 1 = All-Sound-Off kill (renders to its death frame with no
     // fade tail), 0 = steal victim (64-frame tail fade from death state).
     uint8_t* wvGhostNoTail_ = nullptr;
-    // Per-channel exact-frame row ops (bend / mix-gain).  wvRowOps_ is the
-    // dispatch-order log; wvChanOps_ is the per-channel regrouped copy the
-    // worker items walk, bracketed by wvChanOpStart_ (CSR, frame-sorted
-    // within each channel).
+    // Per-channel exact-frame row ops (bend / mix-gain / vibrato depth).
+    // wvRowOps_ is the dispatch-order log; wvChanOps_ is the per-channel
+    // regrouped copy the worker items walk, bracketed by wvChanOpStart_
+    // (CSR, frame-sorted within each channel).
     WholeVoiceChannelOp* wvRowOps_ = nullptr;
     WholeVoiceChannelOp* wvChanOps_ = nullptr;
+    // Per-channel channel state at block START, captured by the pre-pass
+    // before any event dispatches: the worker items' depth/bend cursors
+    // start here and track the op log.  (The live snapshot is block-FINAL
+    // state and would mislead rows whose ops land mid-block.)
+    float wvChanStartDepth_[kChannelCount] = {};
+    float wvChanStartBendRatio_[kChannelCount] = {};
+    float wvChanStartBendCents_[kChannelCount] = {};
+    // Per-channel vibrato relevance (block-start depth > 0 or a vibrato
+    // depth op lands mid-block): rows on irrelevant channels skip every
+    // LFO check in the item loop, keeping non-vibrato blocks at their
+    // pre-vibrato cost.
+    bool wvChanVibratoActive_[kChannelCount] = {};
     uint32_t wvRowOpCapacity_ = 0u;
     uint32_t wvRowOpCount_ = 0u;
     uint64_t wvRowOpChannelMask_ = 0u;   // channels touched by this block's ops
@@ -2687,7 +2704,8 @@ inline void RenderScalar::RenderDenseVoiceTile(
             const RenderSpanContext context{
                 &v, denseSampleData_, nullptr, denseSampleDataFrames_,
                 outputLeft, outputRight, 0u, frameCount, v.GetCapacity(),
-                nullptr, nullptr, nullptr, nullptr, nullptr, 0u};
+                nullptr, nullptr, nullptr, nullptr, nullptr, 0u,
+                0.0f, 0.0f, 0u};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
             if (kernel && kernel(context, classHandles[classIndex], count))
                 continue;
@@ -2798,7 +2816,7 @@ inline void RenderScalar::RenderDenseVoiceTile(
                 &v, denseSampleData_, nullptr, denseSampleDataFrames_,
                 outputLeft, outputRight, cursor, spanFrames, 0u,
                 tileClassChanges, &tileClassChangeCount,
-                nullptr, nullptr, nullptr, 0u};
+                nullptr, nullptr, nullptr, 0u, 0.0f, 0.0f, 0u};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
             if (kernel && kernel(context, list, count)) {
                 // Class transitions recorded by the kernel move voices
@@ -3281,8 +3299,10 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     if (!classChanges_ || !retirements_) return;
     // Vibrato modulation mutates phaseIncs between spans on the audio
     // thread, which the dense planner's immutable chunk plans cannot model.
-    // Bypass dense planning while any channel carries a modulation depth;
-    // the serial path below handles every voice exactly as before.
+    // Dense stays bypassed while any channel carries a modulation depth.
+    // The whole-voice renderer takes vibrato on AVX2 backends (kernels
+    // rebuild the 64-frame LFO windows internally); the sparse hybrid below
+    // remains the vibrato path for scalar/SSE2 backends and plan refusals.
     const ChannelParamsSnapshot* channelParams = channels.GetParams();
     bool vibratoActive = false;
     for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
@@ -3298,14 +3318,18 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // (sustain/sostenuto/all-notes-off/all-sound-off) plus the channel-wide
     // row mutators (pitch bend and CC7/10/11 mix folds), which land as
     // exact-frame channel ops applied inside the owning workers.  Vibrato
-    // (CC1) keeps the legacy hybrid below — its per-frame LFO cannot be
-    // modeled by a whole-block plan.
-    if (!vibratoActive) {
+    // (CC1/channel pressure) joins this path when the backend's per-row
+    // kernels can rebuild the 64-frame LFO windows themselves (AVX2);
+    // scalar/SSE2 builds keep the legacy hybrid below, preserving their
+    // bit-exact behavior.
+    if (!vibratoActive ||
+        kernelSet_->backend == RenderBackend::AVX2) {
 #if defined(_MSC_VER)
         const uint64_t wvPlanBegin = __rdtsc();
 #endif
         const bool planned =
-            PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame);
+            PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame,
+                                channelParams);
 #if defined(_MSC_VER)
         wvPlanCycles_ += __rdtsc() - wvPlanBegin;
 #endif
@@ -3628,6 +3652,29 @@ inline void RenderScalar::WholeVoiceBendOpHook(uint8_t channel,
     op.b = commonRatio;
 }
 
+// Vibrato depth op (CC1 mod wheel / CC121 reset / channel pressure): the
+// payload is the channel's post-rebuild modulation depth.  The worker
+// updates its row-local depth cursor and performs the modulated ->
+// unmodulated phaseIncs restore when the depth reaches zero; turning the
+// LFO on needs no row write (the next segment's LFO window rebuilds the
+// increment from base x bendRatio x lfoRatio).
+inline void RenderScalar::WholeVoiceVibratoOpHook(uint8_t channel,
+                                                  float modDepth,
+                                                  void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (renderer == nullptr) return;
+    assert(renderer->wvRowOpCount_ < renderer->wvRowOpCapacity_ &&
+           "row-op estimate undercounted a vibrato depth change");
+    if (renderer->wvRowOpCount_ >= renderer->wvRowOpCapacity_) return;
+    WholeVoiceChannelOp& op = renderer->wvRowOps_[renderer->wvRowOpCount_++];
+    op.frame = renderer->wvEventFrame_;
+    op.ingress = renderer->wvEventOrdinal_;
+    op.channel = channel;
+    op.kind = 2u;
+    op.a = modDepth;
+    op.b = 0.0f;
+}
+
 inline bool RenderScalar::EnsureWholeVoiceRowOpStorage(uint32_t opCount) {
     if (opCount == 0u) return true;
     if (wvRowOps_ != nullptr && wvChanOps_ != nullptr &&
@@ -3691,7 +3738,7 @@ inline void RenderScalar::WholeVoiceDeferredReleaseHook(
 
 inline bool RenderScalar::PlanWholeVoiceBlock(
     VoiceManager& voices, const RenderEvent* events, uint32_t eventCount,
-    uint64_t blockStartFrame) {
+    uint64_t blockStartFrame, const ChannelParamsSnapshot* channelParams) {
     if (voices.v.rot != nullptr) return false;  // ghosts carry no rotation
     // Eligibility is decided before any state changes so a refusal can fall
     // back to the legacy renderer cleanly.
@@ -3708,17 +3755,19 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
                 const uint8_t controller = events[i].data1;
                 switch (controller) {
                     case 1u:
-                        // This plan only runs under the !vibratoActive gate
-                        // (every channel's mod depth is zero at block start),
-                        // so a CC1 inside the block cannot modulate anything:
-                        // a no-op here. Should dispatch ever raise a mod
-                        // depth, the next block's vibrato gate flips and the
-                        // legacy path takes over again.
+                        // Mod wheel -> vibrato depth op (the driver reports
+                        // the post-rebuild depth through the vibrato hook).
+                        // The LFO itself advances inside the AVX2 kernels'
+                        // 64-frame windows; see RenderSpanContext::lfoActive.
+                        ++rowOpEstimate;
                         break;
                     default:
                     case 0u:
                     case 32u:
-                        // Bank select: launch-time state only.
+                        // Bank select: launch-time state only.  Unmapped
+                        // controllers share this: they have no engine
+                        // effect, so treating them as no-ops keeps CC-heavy
+                        // material on this path without audio change.
                         break;
                     case 64u:
                     case 66u:
@@ -3740,14 +3789,21 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
                         ++rowOpEstimate;
                         break;
                     case 121u:
-                        // Reset All Controllers -> bend-center AND mix fold.
-                        rowOpEstimate += 2u;
+                        // Reset All Controllers -> bend-center, mix fold AND
+                        // mod-depth reset (channelModWheel_ clears).
+                        rowOpEstimate += 3u;
                         break;
                 }
                 hasEvents = true;
                 break;
             }
             case RenderEventType::PitchBend:
+                ++rowOpEstimate;
+                hasEvents = true;
+                break;
+            case RenderEventType::ChannelPressure:
+                // Channel aftertouch scales the vibrato depth via the SF2
+                // default modulator -> vibrato depth op.
                 ++rowOpEstimate;
                 hasEvents = true;
                 break;
@@ -3817,13 +3873,34 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     wvGhostCount_ = 0u;
     wvRowOpCount_ = 0u;
     wvPlanVoices_ = &voices;
+    // Worker vibrato/bend cursors start from the block-START channel state
+    // (captured before any dispatch mutates the live snapshot) and follow
+    // the op log from there.
+    if (channelParams != nullptr) {
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            wvChanStartDepth_[channel] = channelParams[channel].modDepth;
+            wvChanStartBendRatio_[channel] = channelParams[channel].bendRatio;
+            wvChanStartBendCents_[channel] =
+                channelParams[channel].pitchBendCents;
+            wvChanVibratoActive_[channel] =
+                channelParams[channel].modDepth > 0.0f;
+        }
+    } else {
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            wvChanStartDepth_[channel] = 0.0f;
+            wvChanStartBendRatio_[channel] = 0.0f;
+            wvChanStartBendCents_[channel] = 0.0f;
+            wvChanVibratoActive_[channel] = false;
+        }
+    }
 
     voices.SetDeferredReleaseHook(&WholeVoiceDeferredReleaseHook, this);
     voices.SetVoiceConfiguredHook(&WholeVoiceVoiceConfiguredHook, this);
     voices.SetPreTailCaptureHook(&WholeVoicePreTailCaptureHook, this);
     voices.SetSilenceChannelHooks(&WholeVoiceSilenceVoiceHook,
                                   &WholeVoiceSilenceTailHook, this);
-    voices.SetRowOpHooks(&WholeVoiceMixOpHook, &WholeVoiceBendOpHook, this);
+    voices.SetRowOpHooks(&WholeVoiceMixOpHook, &WholeVoiceBendOpHook,
+                         &WholeVoiceVibratoOpHook, this);
     voices.SetStealTailCaptureSuppressed(true);
 
     // Ingress-order dispatch with the render clock at each event's exact
@@ -3846,7 +3923,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     voices.SetVoiceConfiguredHook(nullptr, nullptr);
     voices.SetPreTailCaptureHook(nullptr, nullptr);
     voices.SetSilenceChannelHooks(nullptr, nullptr, nullptr);
-    voices.SetRowOpHooks(nullptr, nullptr, nullptr);
+    voices.SetRowOpHooks(nullptr, nullptr, nullptr, nullptr);
     voices.SetStealTailCaptureSuppressed(false);
     wvPlanVoices_ = nullptr;
 
@@ -3865,6 +3942,8 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
             // disabled.
             if (wvRowOps_[i].kind == 1u)
                 wvRowOpChannelMask_ |= uint64_t(1) << wvRowOps_[i].channel;
+            else if (wvRowOps_[i].kind == 2u)
+                wvChanVibratoActive_[wvRowOps_[i].channel] = true;
         }
         uint32_t running = 0u;
         for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
@@ -3888,7 +3967,7 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     VoiceSoA& state, VoiceManager* voices, uint32_t row,
     const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
     float* outR, uint32_t segStart, uint32_t segFrames, bool isReal,
-    uint32_t jobIndex) {
+    uint32_t jobIndex, float lfoDepth, float lfoBendRatio, bool lfoActive) {
     // Per-segment rdtsc profiling is opt-in: this function runs once per
     // voice per op-split segment (tens of thousands of calls per block on
     // op-dense material), and six rdtsc per call measured ~+25% on every
@@ -3914,7 +3993,8 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
             nullptr, nullptr,
             isReal ? voices->activePosition_ : nullptr,
             isReal ? retBuf : nullptr,
-            isReal ? &wvJobRetireCounts_[jobIndex] : nullptr, 0u};
+            isReal ? &wvJobRetireCounts_[jobIndex] : nullptr, 0u,
+            lfoDepth, lfoBendRatio, lfoActive ? 1u : 0u};
         if (kernel(context, &row, 1u)) {
             if (isReal) {
                 for (uint32_t i = retCountBefore;
@@ -3934,6 +4014,13 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     }
     ++wvSegFallback_;
     wvSegFallbackFrames_ += segFrames;
+    if (lfoActive) {
+        // Scalar fallback segments still honor the LFO: one whole-segment
+        // window (advance-then-use + ratio rebuild) keeps the row's LFO
+        // phase and modulated flag consistent for the next segment.
+        AdvanceVibratoLfoWindow(state, row, segFrames, lfoDepth,
+                                lfoBendRatio);
+    }
     const uint32_t retiredAt = RenderPrimaryVoiceSpan(
         state, row, sampleData, nullptr, sampleDataFrames, outL, outR,
         segStart, segFrames, segFrames);
@@ -4054,16 +4141,42 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             uint32_t start = renderer->wvStartFrame_[handle];
             if (start == UINT32_MAX) start = 0u;
             uint32_t releaseFrame = renderer->wvReleaseFrame_[handle];
-            // Channel row-op window: bend/mix ops at frames inside the
-            // voice's timeline split it exactly where the frame-major
+            // Channel row-op window: bend/mix/vibrato ops at frames inside
+            // the voice's timeline split it exactly where the frame-major
             // renderers fold/bend inline at their dispatch boundaries.
             const uint8_t opChannelRaw = v.channel[handle];
             const uint32_t opChannel =
                 opChannelRaw < kChannelCount ? opChannelRaw : kChannelCount;
             uint32_t opIdx = renderer->wvChanOpStart_[opChannel];
             const uint32_t opEnd = renderer->wvChanOpStart_[opChannel + 1];
+            // Per-row vibrato/bend cursors: depth and bend ratio start from
+            // the block-start channel snapshot and follow the op log.  Ops
+            // skipped below (before the voice's window, or dispatched
+            // before its same-frame launch) are already baked into the
+            // row's configure-time state — tracking them keeps the cursors
+            // truthful for later LFO window rebuilds.
+            float vDepth = renderer->wvChanStartDepth_[opChannel];
+            float vRatio;
+            {
+                const float rowScale = v.pitchBendScales[handle];
+                const float startRatio =
+                    renderer->wvChanStartBendRatio_[opChannel];
+                vRatio = rowScale == 1.0f && startRatio > 0.0f
+                    ? startRatio
+                    : powf(2.0f, renderer->wvChanStartBendCents_[opChannel] *
+                                      rowScale / 1200.0f);
+            }
             while (opIdx < opEnd &&
                    renderer->wvChanOps_[opIdx].frame < start) {
+                const WholeVoiceChannelOp& op =
+                    renderer->wvChanOps_[opIdx];
+                if (op.kind == 2u) {
+                    vDepth = op.a;
+                } else if (op.kind == 0u) {
+                    const float scale = v.pitchBendScales[handle];
+                    vRatio = scale == 1.0f ? op.b
+                        : powf(2.0f, op.a * scale / 12.0f);
+                }
                 ++opIdx;
             }
             // Same-frame qualification: an op dispatched in the same frame
@@ -4075,6 +4188,15 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 while (opIdx < opEnd &&
                        renderer->wvChanOps_[opIdx].frame == start &&
                        renderer->wvChanOps_[opIdx].ingress < startIngress) {
+                    const WholeVoiceChannelOp& op =
+                        renderer->wvChanOps_[opIdx];
+                    if (op.kind == 2u) {
+                        vDepth = op.a;
+                    } else if (op.kind == 0u) {
+                        const float scale = v.pitchBendScales[handle];
+                        vRatio = scale == 1.0f ? op.b
+                            : powf(2.0f, op.a * scale / 12.0f);
+                    }
                     ++opIdx;
                 }
             }
@@ -4087,10 +4209,44 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     renderer->wvChanOps_[opIdx].frame < stop)
                     stop = renderer->wvChanOps_[opIdx].frame;
                 if (stop > cursor) {
+                    // Vibrato gating per segment (only on channels where a
+                    // depth exists at block start or arrives mid-block): an
+                    // LFO-bearing row renders with kernel-internal 64-frame
+                    // windows while its channel depth is positive (the
+                    // kernels advance the free-running LFO phase); while
+                    // delayed or unmodulated the phase free-runs linearly
+                    // here instead.  A delay that exhausts mid-segment
+                    // splits the segment so the modulation wakes at its
+                    // exact frame.
+                    bool lfoActive = false;
+                    uint32_t segFrames = stop - cursor;
+                    if (renderer->wvChanVibratoActive_[opChannel] &&
+                        v.vibLfoSteps[handle] != 0.0f &&
+                        v.vibLfoToPitchCents[handle] > 0.0f) {
+                        const uint32_t delay = v.vibLfoDelays[handle];
+                        if (delay != 0u) {
+                            if (delay >= segFrames) {
+                                v.vibLfoDelays[handle] = delay - segFrames;
+                            } else {
+                                v.vibLfoDelays[handle] = 0u;
+                                stop = cursor + delay;
+                                segFrames = delay;
+                            }
+                        } else if (vDepth > 0.0f) {
+                            lfoActive = true;
+                        } else {
+                            float lp = v.vibLfoPhases[handle] +
+                                v.vibLfoSteps[handle] *
+                                    static_cast<float>(segFrames);
+                            lp -= std::floor(lp);
+                            v.vibLfoPhases[handle] = lp;
+                        }
+                    }
                     if (renderer->RenderWholeVoiceSegment(
                             v, ctx->voices, handle, ctx->sampleData,
                             ctx->sampleDataFrames, outputLeft, outputRight,
-                            cursor, stop - cursor, true, jobIndex)) {
+                            cursor, stop - cursor, true, jobIndex,
+                            vDepth, vRatio, lfoActive)) {
                         break;  // retired; coordinator applies it
                     }
                     cursor = stop;
@@ -4107,8 +4263,26 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 // Apply every op landing on this frame (ingress order).
                 while (opIdx < opEnd &&
                        renderer->wvChanOps_[opIdx].frame == cursor) {
-                    renderer->ApplyWholeVoiceRowOp(
-                        v, handle, renderer->wvChanOps_[opIdx]);
+                    const WholeVoiceChannelOp& op =
+                        renderer->wvChanOps_[opIdx];
+                    if (op.kind == 2u) {
+                        vDepth = op.a;
+                        if (!(vDepth > 0.0f) &&
+                            v.vibLfoModulated[handle] != 0u) {
+                            // Modulation ended: restore the exact
+                            // unmodulated increment once.
+                            v.vibLfoModulated[handle] = 0u;
+                            v.phaseIncs[handle] =
+                                v.basePhaseIncs[handle] * vRatio;
+                        }
+                    } else {
+                        if (op.kind == 0u) {
+                            const float scale = v.pitchBendScales[handle];
+                            vRatio = scale == 1.0f ? op.b
+                                : powf(2.0f, op.a * scale / 12.0f);
+                        }
+                        renderer->ApplyWholeVoiceRowOp(v, handle, op);
+                    }
                     ++opIdx;
                 }
             }
@@ -4129,8 +4303,31 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 opChannelRaw < kChannelCount ? opChannelRaw : kChannelCount;
             uint32_t opIdx = renderer->wvChanOpStart_[opChannel];
             const uint32_t opEnd = renderer->wvChanOpStart_[opChannel + 1];
+            // Same per-row vibrato/bend cursors as real rows; skipped ops
+            // are baked into the ghost's captured state and only update the
+            // cursors.
+            float vDepth = renderer->wvChanStartDepth_[opChannel];
+            float vRatio;
+            {
+                const float rowScale = g.pitchBendScales[ghost];
+                const float startRatio =
+                    renderer->wvChanStartBendRatio_[opChannel];
+                vRatio = rowScale == 1.0f && startRatio > 0.0f
+                    ? startRatio
+                    : powf(2.0f, renderer->wvChanStartBendCents_[opChannel] *
+                                      rowScale / 1200.0f);
+            }
             while (opIdx < opEnd &&
                    renderer->wvChanOps_[opIdx].frame < start) {
+                const WholeVoiceChannelOp& op =
+                    renderer->wvChanOps_[opIdx];
+                if (op.kind == 2u) {
+                    vDepth = op.a;
+                } else if (op.kind == 0u) {
+                    const float scale = g.pitchBendScales[ghost];
+                    vRatio = scale == 1.0f ? op.b
+                        : powf(2.0f, op.a * scale / 12.0f);
+                }
                 ++opIdx;
             }
             const uint32_t startIngress =
@@ -4139,6 +4336,15 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 while (opIdx < opEnd &&
                        renderer->wvChanOps_[opIdx].frame == start &&
                        renderer->wvChanOps_[opIdx].ingress < startIngress) {
+                    const WholeVoiceChannelOp& op =
+                        renderer->wvChanOps_[opIdx];
+                    if (op.kind == 2u) {
+                        vDepth = op.a;
+                    } else if (op.kind == 0u) {
+                        const float scale = g.pitchBendScales[ghost];
+                        vRatio = scale == 1.0f ? op.b
+                            : powf(2.0f, op.a * scale / 12.0f);
+                    }
                     ++opIdx;
                 }
             }
@@ -4152,10 +4358,35 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     renderer->wvChanOps_[opIdx].frame < stop)
                     stop = renderer->wvChanOps_[opIdx].frame;
                 if (stop > cursor) {
+                    bool lfoActive = false;
+                    uint32_t segFrames = stop - cursor;
+                    if (renderer->wvChanVibratoActive_[opChannel] &&
+                        g.vibLfoSteps[ghost] != 0.0f &&
+                        g.vibLfoToPitchCents[ghost] > 0.0f) {
+                        const uint32_t delay = g.vibLfoDelays[ghost];
+                        if (delay != 0u) {
+                            if (delay >= segFrames) {
+                                g.vibLfoDelays[ghost] = delay - segFrames;
+                            } else {
+                                g.vibLfoDelays[ghost] = 0u;
+                                stop = cursor + delay;
+                                segFrames = delay;
+                            }
+                        } else if (vDepth > 0.0f) {
+                            lfoActive = true;
+                        } else {
+                            float lp = g.vibLfoPhases[ghost] +
+                                g.vibLfoSteps[ghost] *
+                                    static_cast<float>(segFrames);
+                            lp -= std::floor(lp);
+                            g.vibLfoPhases[ghost] = lp;
+                        }
+                    }
                     if (renderer->RenderWholeVoiceSegment(
                             g, nullptr, ghost, ctx->sampleData,
                             ctx->sampleDataFrames, outputLeft, outputRight,
-                            cursor, stop - cursor, false, jobIndex)) {
+                            cursor, stop - cursor, false, jobIndex,
+                            vDepth, vRatio, lfoActive)) {
                         retired = true;
                         break;
                     }
@@ -4171,8 +4402,24 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 while (opIdx < opEnd &&
                        renderer->wvChanOps_[opIdx].frame == cursor &&
                        cursor < death) {
-                    renderer->ApplyWholeVoiceRowOp(
-                        g, ghost, renderer->wvChanOps_[opIdx]);
+                    const WholeVoiceChannelOp& op =
+                        renderer->wvChanOps_[opIdx];
+                    if (op.kind == 2u) {
+                        vDepth = op.a;
+                        if (!(vDepth > 0.0f) &&
+                            g.vibLfoModulated[ghost] != 0u) {
+                            g.vibLfoModulated[ghost] = 0u;
+                            g.phaseIncs[ghost] =
+                                g.basePhaseIncs[ghost] * vRatio;
+                        }
+                    } else {
+                        if (op.kind == 0u) {
+                            const float scale = g.pitchBendScales[ghost];
+                            vRatio = scale == 1.0f ? op.b
+                                : powf(2.0f, op.a * scale / 12.0f);
+                        }
+                        renderer->ApplyWholeVoiceRowOp(g, ghost, op);
+                    }
                     ++opIdx;
                 }
             }
@@ -4580,7 +4827,7 @@ inline void RenderScalar::RenderBlockSparseRange(
                 outputRight,
                 cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
                 &classChangeCount, voices.activePosition_, retirements_,
-                &retireCount, 0u};
+                &retireCount, 0u, 0.0f, 0.0f, 0u};
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
             if (coverageProfilingEnabled_ &&
                 renderClass == VoiceRenderClass::SustainedLoop) {

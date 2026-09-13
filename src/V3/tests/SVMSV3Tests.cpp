@@ -4241,7 +4241,8 @@ struct WholeVoiceRng {
 void ConfigureWholeVoiceSeedPool(svms::VoiceManager& voices,
                                  const svms::ChannelCache& channels,
                                  uint32_t poolSize, uint32_t seedCount,
-                                 bool transientSeeds = true) {
+                                 bool transientSeeds = true,
+                                 bool vibratoSeeds = false) {
     // Modeled on ConfigureDifferentialSeed but every seeded voice is Active
     // and immortal: the whole-voice scenarios need a candidate pool whose
     // state is identical at block start and mid-block.  ConfigureDifferentialSeed's
@@ -4291,6 +4292,13 @@ void ConfigureWholeVoiceSeedPool(svms::VoiceManager& voices,
         voices.SetVoicePlayIndex(voice, i + 1u);
         voices.SetVoiceGain(voice, 0.02f, 0.02f);
         voices.RefreshMixGain(voice, channels.GetParams()[channel]);
+        if (vibratoSeeds) {
+            // SF2 default vibrato modulator (5 Hz triangle, 50 cents):
+            // gives the whole-voice LFO windows and the sparse vibrato
+            // reference real per-voice modulation to disagree about.
+            voices.v.vibLfoToPitchCents[voice] = 50.0f;
+            voices.v.vibLfoSteps[voice] = 5.0f / 44100.0f;
+        }
     }
 }
 
@@ -4772,6 +4780,9 @@ struct WholeVoiceCCContext {
     const svms::RuntimeConfigSnapshot* config = nullptr;
     uint32_t playIndex = 12000u;
     uint32_t launches = 0u;
+    // Vibrato scenario: launched voices carry the SF2 default vibrato
+    // modulator like production note-ons do.
+    bool vibratoLaunches = false;
     // SysEx master state, mirroring the driver's sysex terms.
     float masterFineTune = 0.0f;
     float masterTranspose = 0.0f;
@@ -4838,7 +4849,14 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
                     channel, event.data1, event.data2, &setup, 1u,
                     setup.playIndex,
                     context.channelParams[channel], &handle);
-                if (handle != svms::kInvalidVoice) ++context.launches;
+                if (handle != svms::kInvalidVoice) {
+                    ++context.launches;
+                    if (context.vibratoLaunches) {
+                        context.voices->v.vibLfoToPitchCents[handle] = 50.0f;
+                        context.voices->v.vibLfoSteps[handle] =
+                            5.0f / 44100.0f;
+                    }
+                }
                 break;
             }
             case svms::RenderEventType::NoteOff:
@@ -4904,6 +4922,20 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
                         applyBend(
                             context.channels->GetPitchBendValue(channel));
                         break;
+                    case 1u:
+                        // Mod wheel mirrors HandleControlChange: rebuild,
+                        // restore the sysex-aware bend ratio, report the
+                        // post-rebuild modulation depth as a vibrato op.
+                        context.channels->ControlChange(channel, 1u,
+                                                        event.data2);
+                        context.channels->RebuildChannel(
+                            channel, *context.config, 44100.0f);
+                        context.channels->SetBendRatio(
+                            channel, context.channelBendRatio[channel]);
+                        context.voices->MarkChannelVibratoDepth(
+                            channel,
+                            context.channels->GetParams()[channel].modDepth);
+                        break;
                     case 7u:
                     case 10u:
                     case 11u:
@@ -4932,9 +4964,14 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
                         applyBend(8192u);
                         context.channels->RebuildChannel(
                             channel, *context.config, 44100.0f);
+                        context.channels->SetBendRatio(
+                            channel, context.channelBendRatio[channel]);
                         context.voices->MarkChannelMixStale(
                             channel,
                             context.channels->GetParams()[channel]);
+                        context.voices->MarkChannelVibratoDepth(
+                            channel,
+                            context.channels->GetParams()[channel].modDepth);
                         break;
                     }
                     default:
@@ -4996,6 +5033,18 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
             case svms::RenderEventType::PitchBend:
                 applyBend(static_cast<uint16_t>((event.data2 << 7) |
                                                 event.data1));
+                break;
+            case svms::RenderEventType::ChannelPressure:
+                // Mirrors Driver::HandleChannelPressure: cache update,
+                // rebuild, sysex-aware ratio restore, vibrato depth report.
+                context.channels->ChannelPressure(channel, event.data1);
+                context.channels->RebuildChannel(channel, *context.config,
+                                                 44100.0f);
+                context.channels->SetBendRatio(
+                    channel, context.channelBendRatio[channel]);
+                context.voices->MarkChannelVibratoDepth(
+                    channel,
+                    context.channels->GetParams()[channel].modDepth);
                 break;
             default:
                 break;
@@ -5221,6 +5270,171 @@ void TestWholeVoiceCCDifferential() {
     }
 }
 
+void TestWholeVoiceVibratoDifferential() {
+    // CC1/channel-pressure vibrato joins the whole-voice path (AVX2 only):
+    // the per-row kernels rebuild the 64-frame LFO control windows
+    // internally while vibrato depth ops carry exact-frame mod-depth
+    // changes and bend ops keep their row-local ratio tracking.  The
+    // reference is the SAME scenario forced through the legacy sparse
+    // hybrid (the Scalar backend refuses the whole-voice plan while any
+    // channel is modulated) — AdvanceVibratoSpan's per-span refresh is the
+    // established vibrato semantics.  Both paths refresh the LFO ratio on
+    // a 64-frame control cadence but at different boundary sets, so the
+    // waveform parity carries the documented control-rate drift (~1.5
+    // cents of ratio mismatch per window at the SF2 default depth); the
+    // steal-storm drift tolerance covers it.  Channel 0 stays modulated
+    // from block 0, mid-block CC1 sweeps depth on/mid/off, and channels
+    // 1-3 exercise the per-channel gating with their own CC1/pressure
+    // events.
+    if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 8u;
+    constexpr uint32_t kPool = 48u;
+    constexpr uint32_t kSeedCount = 32u;
+    constexpr uint32_t kEventsPerBlock = 10u;
+    constexpr float kMaxWaveDiff = 3.0e-2f;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+             0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 32767.0f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.ControlChange(0, 1, 127);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+
+    auto seedVoices = std::make_unique<svms::VoiceManager>();
+    ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, kPool, kSeedCount,
+                                true, true);
+    auto wholeVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    auto sparseVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    svms::ChannelCache wholeChannels = seedChannels;
+    svms::ChannelCache sparseChannels = seedChannels;
+
+    svms::RenderScalar whole;
+    svms::RenderScalar sparse;
+    Check(whole.ReserveVoiceCapacity(kPool) &&
+              sparse.ReserveVoiceCapacity(kPool) &&
+              whole.ConfigureRenderThreads(4u, kFrames) &&
+              sparse.ConfigureRenderThreads(1u, kFrames),
+          "vibrato differential starts parallel and serial renderers");
+    Check(whole.SetRenderBackend(svms::RenderBackend::AVX2) &&
+              sparse.SetRenderBackend(svms::RenderBackend::Scalar),
+          "vibrato differential selects AVX2 fast path and scalar "
+          "reference");
+
+    WholeVoiceCCContext wholeContext{wholeVoices.get(), &wholeChannels,
+                                     wholeChannels.GetParams(), &cfg};
+    WholeVoiceCCContext sparseContext{sparseVoices.get(), &sparseChannels,
+                                      sparseChannels.GetParams(), &cfg};
+    wholeContext.ResetMasterState();
+    sparseContext.ResetMasterState();
+    wholeContext.vibratoLaunches = true;
+    sparseContext.vibratoLaunches = true;
+    whole.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent, &wholeContext);
+    sparse.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent, &sparseContext);
+
+    WholeVoiceRng rng;
+    float passMaxDiff = 0.0f;
+    for (uint32_t block = 0; block < kBlocks; ++block) {
+        const uint64_t blockStartFrame = 30000u + block * kFrames;
+        std::vector<svms::RenderEvent> events;
+        events.reserve(kEventsPerBlock);
+        for (uint32_t j = 0; j < kEventsPerBlock; ++j) {
+            svms::RenderEvent event{};
+            event.channel = (rng.Next() % 2u) != 0u
+                ? 0u : static_cast<uint8_t>(1u + rng.Next() % 3u);
+            event.frameOffset = rng.Next() % kFrames;
+            event.ingressSequence = block * kEventsPerBlock + j;
+            const uint32_t roll = rng.Next() % 6u;
+            if (roll < 2u) {
+                event.type = svms::RenderEventType::NoteOn;
+                event.data1 = static_cast<uint8_t>(36u + rng.Next() % 72u);
+                event.data2 = static_cast<uint8_t>(64u + rng.Next() % 64u);
+            } else if (roll == 2u) {
+                event.type = svms::RenderEventType::NoteOff;
+                event.data1 = static_cast<uint8_t>(36u + rng.Next() % 72u);
+            } else if (roll == 3u) {
+                event.type = svms::RenderEventType::ControlChange;
+                event.data1 = 1u;
+                static const uint8_t kModValues[3] = {127u, 64u, 0u};
+                event.data2 = kModValues[rng.Next() % 3u];
+            } else if (roll == 4u) {
+                event.type = svms::RenderEventType::PitchBend;
+                event.data1 = static_cast<uint8_t>(rng.Next() % 128u);
+                event.data2 = static_cast<uint8_t>(rng.Next() % 128u);
+            } else {
+                event.type = svms::RenderEventType::ChannelPressure;
+                event.data1 = static_cast<uint8_t>(rng.Next() % 128u);
+            }
+            events.push_back(event);
+        }
+        std::stable_sort(events.begin(), events.end(),
+            [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                return a.frameOffset < b.frameOffset;
+            });
+
+        std::vector<float> wholeLeft(kFrames, 0.0f),
+            wholeRight(kFrames, 0.0f);
+        std::vector<float> sparseLeft(kFrames, 0.0f),
+            sparseRight(kFrames, 0.0f);
+        whole.RenderBlock(*wholeVoices, wholeChannels, samples.data(),
+                          sampleCount, wholeLeft.data(), wholeRight.data(),
+                          kFrames, cfg, events.data(),
+                          static_cast<uint32_t>(events.size()), true,
+                          blockStartFrame);
+        sparse.RenderBlock(*sparseVoices, sparseChannels, samples.data(),
+                           sampleCount, sparseLeft.data(), sparseRight.data(),
+                           kFrames, cfg, events.data(),
+                           static_cast<uint32_t>(events.size()), true,
+                           blockStartFrame);
+
+        float blockDiff = 0.0f;
+        for (uint32_t frame = 0; frame < kFrames; ++frame) {
+            blockDiff = (std::max)(blockDiff,
+                std::fabs(sparseLeft[frame] - wholeLeft[frame]));
+            blockDiff = (std::max)(blockDiff,
+                std::fabs(sparseRight[frame] - wholeRight[frame]));
+        }
+        std::fprintf(stderr, "[WVDIFFV] blk=%u max=%g\n", block, blockDiff);
+        passMaxDiff = (std::max)(passMaxDiff, blockDiff);
+    }
+    std::fprintf(stderr, "[WVDIFFV] vibrato whole-voice vs sparse max=%g\n",
+                 passMaxDiff);
+    Check(passMaxDiff <= kMaxWaveDiff,
+          "whole-voice vibrato matches the sparse reference within the "
+          "control-rate drift budget");
+    Check(whole.GetWholeVoiceBlocksForTest() == kBlocks,
+          "vibrato scenario routes every block through the whole-voice "
+          "renderer");
+    Check(wholeContext.launches >= kBlocks,
+          "vibrato scenario exercised in-block launches");
+    // State parity: active identity and release bookkeeping must match
+    // exactly; sample phases carry the same control-rate drift as the
+    // waveform, so only divergence-scale differences fail here.
+    {
+        std::vector<uint32_t> sparseIds, wholeIds;
+        for (uint32_t i = 0; i < sparseVoices->activeCount_; ++i)
+            sparseIds.push_back(
+                sparseVoices->v.playIndex[sparseVoices->activeList_[i]]);
+        for (uint32_t i = 0; i < wholeVoices->activeCount_; ++i)
+            wholeIds.push_back(
+                wholeVoices->v.playIndex[wholeVoices->activeList_[i]]);
+        std::sort(sparseIds.begin(), sparseIds.end());
+        std::sort(wholeIds.begin(), wholeIds.end());
+        Check(sparseIds == wholeIds,
+              "vibrato scenario preserves active voice identity");
+    }
+}
+
 } // namespace
 
 void TestPerKeyVoiceCap() {
@@ -5357,6 +5571,7 @@ int main() {
     TestWholeVoiceStealDifferential();
     TestWholeVoiceLaunchDifferential();
     TestWholeVoiceCCDifferential();
+    TestWholeVoiceVibratoDifferential();
     TestHilbertPairDifferential();
     TestDenseProductionGateParity();
     TestPerKeyVoiceCap();

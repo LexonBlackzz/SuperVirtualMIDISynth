@@ -280,7 +280,7 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
     }
 
     float phase = (std::max)(0.0f, v.phases[handle]);
-    const float step = v.phaseIncs[handle];
+    float step = v.phaseIncs[handle];
     const float loopStart = v.relLoopSF[handle];
     const float loopEnd = v.relLoopEF[handle];
     const float loopLength = loopEnd - loopStart;
@@ -291,13 +291,33 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
                                        4.0f, 5.0f, 6.0f, 7.0f);
-    const __m256 stepVector = _mm256_set1_ps(step);
+    __m256 stepVector = _mm256_set1_ps(step);
     const __m256 gainLVector = _mm256_set1_ps(gainL);
     const __m256 gainRVector = _mm256_set1_ps(gainR);
     const __m256i one = _mm256_set1_epi32(1);
+    // Whole-voice vibrato: the 64-frame LFO control window is rebuilt at
+    // the loop top; the gate keeps fast chunks from straddling a window
+    // boundary.  UINT32_MAX = LFO off (sparse path owns vibrato there).
+    const bool lfoOn = c.lfoActive != 0u &&
+        v.vibLfoSteps[handle] != 0.0f &&
+        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
+    uint32_t windowRemaining = UINT32_MAX;
+    if (lfoOn) {
+        step = AdvanceVibratoLfoWindow(v, handle,
+            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
+        stepVector = _mm256_set1_ps(step);
+        windowRemaining = (std::min)(64u, c.frameCount);
+    }
     uint32_t frame = 0u;
 
     while (frame < c.frameCount) {
+        if (windowRemaining == 0u) {
+            const uint32_t win = (std::min)(64u, c.frameCount - frame);
+            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
+                                           c.lfoBendRatio);
+            stepVector = _mm256_set1_ps(step);
+            windowRemaining = win;
+        }
         if (phase >= loopEnd) {
             float overflow = phase - loopEnd;
             if (overflow >= loopLength)
@@ -305,7 +325,8 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
             phase = loopStart + overflow;
         }
         const float lastPhase = phase + step * 7.0f;
-        if (frame + 8u <= c.frameCount && lastPhase < loopEnd - 1.0f) {
+        if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
+            lastPhase < loopEnd - 1.0f) {
                         // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
@@ -332,6 +353,7 @@ const __m256 phases = _mm256_add_ps(
             for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
                 phase += step;
             frame += 8u;
+            windowRemaining -= 8u;
             continue;
         }
 
@@ -348,6 +370,7 @@ const __m256 phases = _mm256_add_ps(
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
         phase += step;
+        --windowRemaining;
         ++frame;
     }
     // Match the existing AVX2 short-span cursor contract: wrapping happens
@@ -423,7 +446,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     float gain = v.currentGain[handle];
     uint32_t remaining = v.releaseSamplesRemaining[handle];
     const float decay = v.releaseDecay[handle];
-    const float step = v.phaseIncs[handle];
+    float step = v.phaseIncs[handle];
     const float loopStart = v.relLoopSF[handle];
     const float loopEnd = v.relLoopEF[handle];
     const float loopLength = loopEnd - loopStart;
@@ -434,11 +457,29 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
                                        4.0f, 5.0f, 6.0f, 7.0f);
-    const __m256 stepVector = _mm256_set1_ps(step);
+    __m256 stepVector = _mm256_set1_ps(step);
     const __m256i one = _mm256_set1_epi32(1);
+    // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
+    const bool lfoOn = c.lfoActive != 0u &&
+        v.vibLfoSteps[handle] != 0.0f &&
+        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
+    uint32_t windowRemaining = UINT32_MAX;
+    if (lfoOn) {
+        step = AdvanceVibratoLfoWindow(v, handle,
+            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
+        stepVector = _mm256_set1_ps(step);
+        windowRemaining = (std::min)(64u, c.frameCount);
+    }
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
     while (frame < c.frameCount) {
+        if (windowRemaining == 0u) {
+            const uint32_t win = (std::min)(64u, c.frameCount - frame);
+            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
+                                           c.lfoBendRatio);
+            stepVector = _mm256_set1_ps(step);
+            windowRemaining = win;
+        }
         if (phase >= loopEnd) {
             float overflow = phase - loopEnd;
             if (overflow >= loopLength)
@@ -455,7 +496,8 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         const bool thresholdSafe = remaining != UINT32_MAX ||
             gains[7] >= VoiceRetireThreshold();
         const float lastPhase = phase + step * 7.0f;
-        if (frame + 8u <= c.frameCount && countdownSafe && thresholdSafe &&
+        if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
+            countdownSafe && thresholdSafe &&
             lastPhase < loopEnd - 1.0f) {
                         // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
@@ -485,6 +527,7 @@ const __m256 phases = _mm256_add_ps(
             for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
                 phase += step;
             frame += 8u;
+            windowRemaining -= 8u;
             continue;
         }
 
@@ -509,6 +552,7 @@ const __m256 phases = _mm256_add_ps(
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
+        --windowRemaining;
         if (phase >= loopEnd) {
             float overflow = phase - loopEnd;
             if (overflow >= loopLength)
@@ -678,7 +722,7 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     const uint8_t initialStage = stage;
     uint32_t attackRemaining = v.attackSamplesRemaining[handle];
     uint32_t decayRemaining = v.decaySamplesRemaining[handle];
-    const float step = v.phaseIncs[handle];
+    float step = v.phaseIncs[handle];
     const float targetGain = v.targetGain[handle];
     const float sustainLevel = v.sustainLevel[handle];
     const float attackStep = v.attackGainStep[handle];
@@ -696,10 +740,28 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
                                        4.0f, 5.0f, 6.0f, 7.0f);
-    const __m256 stepVector = _mm256_set1_ps(step);
+    __m256 stepVector = _mm256_set1_ps(step);
     const __m256i one = _mm256_set1_epi32(1);
+    // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
+    const bool lfoOn = c.lfoActive != 0u &&
+        v.vibLfoSteps[handle] != 0.0f &&
+        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
+    uint32_t windowRemaining = UINT32_MAX;
+    if (lfoOn) {
+        step = AdvanceVibratoLfoWindow(v, handle,
+            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
+        stepVector = _mm256_set1_ps(step);
+        windowRemaining = (std::min)(64u, c.frameCount);
+    }
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
+        if (windowRemaining == 0u) {
+            const uint32_t win = (std::min)(64u, c.frameCount - frame);
+            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
+                                           c.lfoBendRatio);
+            stepVector = _mm256_set1_ps(step);
+            windowRemaining = win;
+        }
         if (phase >= loopEnd) {
             float overflow = phase - loopEnd;
             if (overflow >= loopLength)
@@ -745,7 +807,8 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         // (next >= relLoopE) can be crossed inside the chunk, and both
         // gather indices stay inside the validated region.
         const float lastPhase = phase + step * 7.0f;
-        if (frame + 8u <= c.frameCount && futureStage == stage &&
+        if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
+            futureStage == stage &&
             lastPhase < loopEnd - 1.0f) {
                         // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
@@ -777,6 +840,7 @@ const __m256 phases = _mm256_add_ps(
             for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
                 phase += step;
             frame += 8u;
+            windowRemaining -= 8u;
             continue;
         }
 
@@ -816,6 +880,7 @@ const __m256 phases = _mm256_add_ps(
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
+        --windowRemaining;
         if (phase >= loopEnd) {
             float overflow = phase - loopEnd;
             if (overflow >= loopLength)
@@ -1504,7 +1569,7 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
     VoiceSoA& v = *c.voices;
     const uint32_t relEnd = v.relEnd[handle];
     float phase = (std::max)(0.0f, v.phases[handle]);
-    const float step = v.phaseIncs[handle];
+    float step = v.phaseIncs[handle];
     const float gainL = v.renderGainL[handle];
     const float gainR = v.renderGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
@@ -1512,7 +1577,7 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
                                        4.0f, 5.0f, 6.0f, 7.0f);
-    const __m256 stepVector = _mm256_set1_ps(step);
+    __m256 stepVector = _mm256_set1_ps(step);
     const __m256 gainLVector = _mm256_set1_ps(gainL);
     const __m256 gainRVector = _mm256_set1_ps(gainR);
     // The 8-frame fast chunk needs floor(phase + 7*step) + 1 < relEnd for
@@ -1521,11 +1586,29 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
     const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
     const float lastSafePhase = fastGuardExact
         ? static_cast<float>(relEnd - 1u) : -1.0f;
+    // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
+    const bool lfoOn = c.lfoActive != 0u &&
+        v.vibLfoSteps[handle] != 0.0f &&
+        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
+    uint32_t windowRemaining = UINT32_MAX;
+    if (lfoOn) {
+        step = AdvanceVibratoLfoWindow(v, handle,
+            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
+        stepVector = _mm256_set1_ps(step);
+        windowRemaining = (std::min)(64u, c.frameCount);
+    }
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
+        if (windowRemaining == 0u) {
+            const uint32_t win = (std::min)(64u, c.frameCount - frame);
+            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
+                                           c.lfoBendRatio);
+            stepVector = _mm256_set1_ps(step);
+            windowRemaining = win;
+        }
         const float lastPhase = phase + step * 7.0f;
         if (fastGuardExact && frame + 8u <= c.frameCount &&
-            lastPhase < lastSafePhase) {
+            windowRemaining >= 8u && lastPhase < lastSafePhase) {
             // Warm the next chunk's sample lines (sequential per voice).
             _mm_prefetch(reinterpret_cast<const char*>(
                              region +
@@ -1550,6 +1633,7 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
             for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
                 phase += step;
             frame += 8u;
+            windowRemaining -= 8u;
             continue;
         }
         const uint32_t base = static_cast<uint32_t>(phase);
@@ -1566,6 +1650,7 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
         phase += step;
+        --windowRemaining;
         ++frame;
     }
     v.phases[handle] = phase;
@@ -1580,7 +1665,7 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
     float gain = v.currentGain[handle];
     uint32_t remaining = v.releaseSamplesRemaining[handle];
     const float decay = v.releaseDecay[handle];
-    const float step = v.phaseIncs[handle];
+    float step = v.phaseIncs[handle];
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
@@ -1588,12 +1673,30 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
                                        4.0f, 5.0f, 6.0f, 7.0f);
-    const __m256 stepVector = _mm256_set1_ps(step);
+    __m256 stepVector = _mm256_set1_ps(step);
     const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
     const float lastSafePhase = fastGuardExact
         ? static_cast<float>(relEnd - 1u) : -1.0f;
+    // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
+    const bool lfoOn = c.lfoActive != 0u &&
+        v.vibLfoSteps[handle] != 0.0f &&
+        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
+    uint32_t windowRemaining = UINT32_MAX;
+    if (lfoOn) {
+        step = AdvanceVibratoLfoWindow(v, handle,
+            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
+        stepVector = _mm256_set1_ps(step);
+        windowRemaining = (std::min)(64u, c.frameCount);
+    }
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
+        if (windowRemaining == 0u) {
+            const uint32_t win = (std::min)(64u, c.frameCount - frame);
+            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
+                                           c.lfoBendRatio);
+            stepVector = _mm256_set1_ps(step);
+            windowRemaining = win;
+        }
         float futureGain = gain;
         alignas(32) float gains[8];
         for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
@@ -1604,7 +1707,8 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
         const bool thresholdSafe = remaining != UINT32_MAX ||
             gains[7] >= VoiceRetireThreshold();
         const float lastPhase = phase + step * 7.0f;
-        if (fastGuardExact && frame + 8u <= c.frameCount && countdownSafe &&
+        if (fastGuardExact && frame + 8u <= c.frameCount &&
+            windowRemaining >= 8u && countdownSafe &&
             thresholdSafe && lastPhase < lastSafePhase) {
             _mm_prefetch(reinterpret_cast<const char*>(
                              region +
@@ -1631,6 +1735,7 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
             for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
                 phase += step;
             frame += 8u;
+            windowRemaining -= 8u;
             continue;
         }
         const uint32_t base = static_cast<uint32_t>(phase);
@@ -1657,6 +1762,7 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
+        --windowRemaining;
         ++frame;
         if (finished ||
             (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
@@ -1687,7 +1793,7 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
     const uint8_t initialStage = stage;
     uint32_t attackRemaining = v.attackSamplesRemaining[handle];
     uint32_t decayRemaining = v.decaySamplesRemaining[handle];
-    const float step = v.phaseIncs[handle];
+    float step = v.phaseIncs[handle];
     const float targetGain = v.targetGain[handle];
     const float sustainLevel = v.sustainLevel[handle];
     const float attackStep = v.attackGainStep[handle];
@@ -1699,12 +1805,30 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
                                        4.0f, 5.0f, 6.0f, 7.0f);
-    const __m256 stepVector = _mm256_set1_ps(step);
+    __m256 stepVector = _mm256_set1_ps(step);
     const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
     const float lastSafePhase = fastGuardExact
         ? static_cast<float>(relEnd - 1u) : -1.0f;
+    // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
+    const bool lfoOn = c.lfoActive != 0u &&
+        v.vibLfoSteps[handle] != 0.0f &&
+        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
+    uint32_t windowRemaining = UINT32_MAX;
+    if (lfoOn) {
+        step = AdvanceVibratoLfoWindow(v, handle,
+            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
+        stepVector = _mm256_set1_ps(step);
+        windowRemaining = (std::min)(64u, c.frameCount);
+    }
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
+        if (windowRemaining == 0u) {
+            const uint32_t win = (std::min)(64u, c.frameCount - frame);
+            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
+                                           c.lfoBendRatio);
+            stepVector = _mm256_set1_ps(step);
+            windowRemaining = win;
+        }
         // Simulate the exact scalar envelope recurrence eight steps ahead;
         // the chunk is only taken when the stage is unchanged after all
         // eight steps and no lane can reach the sample end.
@@ -1739,6 +1863,7 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
         }
         const float lastPhase = phase + step * 7.0f;
         if (fastGuardExact && frame + 8u <= c.frameCount &&
+            windowRemaining >= 8u &&
             futureStage == stage && lastPhase < lastSafePhase) {
             _mm_prefetch(reinterpret_cast<const char*>(
                              region +
@@ -1767,6 +1892,7 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
             for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
                 phase += step;
             frame += 8u;
+            windowRemaining -= 8u;
             continue;
         }
         const uint32_t base = static_cast<uint32_t>(phase);
@@ -1807,6 +1933,7 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
+        --windowRemaining;
         ++frame;
     }
     v.phases[handle] = phase;
