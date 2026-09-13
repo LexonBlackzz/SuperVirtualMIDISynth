@@ -145,6 +145,9 @@ ConfigValues ConfigDocument::Defaults() {
     d.limiterLookaheadMs = 3.0f;
     d.limiterAttackMs = 0.5f;
     d.limiterReleaseMs = 100.0f;
+    d.channelLimiterEnabled = false;
+    d.channelLimiterThreshold = 0.5011872336272722f;
+    d.channelLimiterReleaseMs = 150.0f;
     d.enableReverb = false;
     d.reverbMix = 0.25f;
     d.reverbRoomSize = 0.60f;
@@ -293,6 +296,13 @@ void ConfigDocument::FromJson(const json& root) {
         ReadNum(*it, "attack_ms", working_.limiterAttackMs, 0.01f, 100.0f);
         ReadNum(*it, "release_ms", working_.limiterReleaseMs, 1.0f, 5000.0f);
     }
+    if (auto it = root.find("channel_limiter"); it != root.end() && it->is_object()) {
+        ReadBool(*it, "enabled", working_.channelLimiterEnabled);
+        ReadNum(*it, "threshold", working_.channelLimiterThreshold,
+                0.0316227766f, 1.0f);
+        ReadNum(*it, "release_ms", working_.channelLimiterReleaseMs,
+                20.0f, 1000.0f);
+    }
     if (auto it = root.find("reverb"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.enableReverb);
         ReadNum(*it, "mix", working_.reverbMix, 0.0f, 1.0f);
@@ -400,6 +410,9 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["limiter"]["lookahead_ms"] = working_.limiterLookaheadMs;
     root["limiter"]["attack_ms"] = working_.limiterAttackMs;
     root["limiter"]["release_ms"] = working_.limiterReleaseMs;
+    root["channel_limiter"]["enabled"] = working_.channelLimiterEnabled;
+    root["channel_limiter"]["threshold"] = working_.channelLimiterThreshold;
+    root["channel_limiter"]["release_ms"] = working_.channelLimiterReleaseMs;
 
     root["reverb"]["enabled"] = working_.enableReverb;
     root["reverb"]["mix"] = working_.reverbMix;
@@ -603,6 +616,9 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && AlmostEquals(a.limiterLookaheadMs, b.limiterLookaheadMs)
         && AlmostEquals(a.limiterAttackMs, b.limiterAttackMs)
         && AlmostEquals(a.limiterReleaseMs, b.limiterReleaseMs)
+        && a.channelLimiterEnabled == b.channelLimiterEnabled
+        && AlmostEquals(a.channelLimiterThreshold, b.channelLimiterThreshold)
+        && AlmostEquals(a.channelLimiterReleaseMs, b.channelLimiterReleaseMs)
         && a.enableReverb == b.enableReverb
         && AlmostEquals(a.reverbMix, b.reverbMix)
         && AlmostEquals(a.reverbRoomSize, b.reverbRoomSize)

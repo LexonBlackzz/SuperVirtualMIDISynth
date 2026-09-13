@@ -53,6 +53,12 @@ struct EngineConfig {
     float limiterLookaheadMs;
     float limiterAttackMs;
     float limiterReleaseMs;
+    // Opt-in per-MIDI-channel limiter (SVMSChannelLimiter.h): sixteen stereo
+    // buses limited independently, then summed into the master chain. Purely
+    // post-render; off = bit-identical output.
+    bool channelLimiterEnabled;
+    float channelLimiterThreshold;   // linear, 0.0316 (-30 dB) .. 1.0
+    float channelLimiterReleaseMs;   // 20 .. 1000
     float velocityCurve;
     float velocityFloor;
     uint8_t velocityIgnoreBelow;
@@ -229,6 +235,9 @@ struct NonAtomicLiveConfigMailbox {
     float limiterAttackCoeff = 0.25f;
     float limiterReleaseCoeff = 0.001f;
     uint32_t limiterDelayFrames = 128;
+    bool channelLimiterEnabled = false;
+    float channelLimiterThreshold = 0.5011872336272722f;
+    float channelLimiterReleaseMs = 150.0f;
 };
 
 struct LiveConfigMailbox {
@@ -261,6 +270,12 @@ struct LiveConfigMailbox {
     std::atomic<float>    limiterAttackCoeff{0.25f};
     std::atomic<float>    limiterReleaseCoeff{0.001f};
     std::atomic<uint32_t> limiterDelayFrames{128};
+
+    // Per-MIDI-channel limiter (release travels as milliseconds; the audio
+    // thread derives the one-pole coefficient from its known sample rate).
+    std::atomic<uint32_t> channelLimiterEnabled{0u};
+    std::atomic<float>    channelLimiterThreshold{0.5011872336272722f};
+    std::atomic<float>    channelLimiterReleaseMs{150.0f};
 
     void InitFromEngineConfig(const EngineConfig& cfg, uint32_t sampleRate) {
         masterVolume.store(cfg.masterVolume, std::memory_order_relaxed);
@@ -299,6 +314,12 @@ struct LiveConfigMailbox {
                                  std::memory_order_relaxed);
         limiterReleaseCoeff.store(1.0f - std::exp(-1.0f / releaseSamples),
                                   std::memory_order_relaxed);
+        channelLimiterEnabled.store(cfg.channelLimiterEnabled ? 1u : 0u,
+                                    std::memory_order_relaxed);
+        channelLimiterThreshold.store(cfg.channelLimiterThreshold,
+                                      std::memory_order_relaxed);
+        channelLimiterReleaseMs.store(cfg.channelLimiterReleaseMs,
+                                      std::memory_order_relaxed);
     }
 
     // Field-by-field copy (LiveConfigMailbox is not copy-assignable
@@ -329,6 +350,12 @@ struct LiveConfigMailbox {
         out.limiterAttackCoeff = limiterAttackCoeff.load(std::memory_order_relaxed);
         out.limiterReleaseCoeff = limiterReleaseCoeff.load(std::memory_order_relaxed);
         out.limiterDelayFrames = limiterDelayFrames.load(std::memory_order_relaxed);
+        out.channelLimiterEnabled =
+            channelLimiterEnabled.load(std::memory_order_relaxed) != 0u;
+        out.channelLimiterThreshold =
+            channelLimiterThreshold.load(std::memory_order_relaxed);
+        out.channelLimiterReleaseMs =
+            channelLimiterReleaseMs.load(std::memory_order_relaxed);
     }
 };
 

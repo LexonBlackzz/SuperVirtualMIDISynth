@@ -37,6 +37,11 @@ void PushLiveLimiterAlgorithm(uint32_t value) {
     if (g_liveLink.app) g_liveLink.app->SetLiveLimiterAlgorithm(value);
 }
 
+void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs) {
+    if (g_liveLink.app) g_liveLink.app->SetLiveChannelLimiter(
+        enabled, threshold, releaseMs);
+}
+
 static float g_toastTimer = 0.0f;
 static char g_toastText[512] = {};
 static bool g_toastActive = false;

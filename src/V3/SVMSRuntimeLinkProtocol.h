@@ -148,6 +148,7 @@ inline const wchar_t* RLV3_HostsMutexName(wchar_t* buf, size_t bufLen) {
 
 inline constexpr uint32_t kRuntimeLinkMagic    = 0x53524C32u;  // "SRL2"
 inline constexpr uint32_t kRuntimeLinkVersion  = 2;
+inline constexpr uint32_t kRLV2ChannelCount    = 16u;  // MIDI channels
 inline constexpr uint32_t kRuntimeLinkArchX86  = 0;
 inline constexpr uint32_t kRuntimeLinkArchX64  = 1;
 inline constexpr uint32_t kRuntimeHostMaxCount = 16;
@@ -264,6 +265,7 @@ enum class RLCommandType : uint32_t {
     SetBlockTiming        = 0x00000118,
     SetGhostBudget        = 0x00000119,
     SetUnboundedRender    = 0x0000011A,
+    SetChannelLimiter     = 0x0000011B,
 
 
     Invalid              = 0xFFFFFFFF,
@@ -275,6 +277,7 @@ inline constexpr uint32_t RLGroupCorrectness = 0x00000002u;
 inline constexpr uint32_t RLGroupReverb      = 0x00000004u;
 inline constexpr uint32_t RLGroupLimiter     = 0x00000008u;
 inline constexpr uint32_t RLGroupVoices      = 0x00000010u;
+inline constexpr uint32_t RLGroupChannelLimiter = 0x00000020u;
 inline constexpr uint32_t RLGroupAll =
     RLGroupMaster | RLGroupCorrectness | RLGroupReverb | RLGroupLimiter |
     RLGroupVoices;
@@ -304,6 +307,7 @@ inline uint32_t RLV2_GroupForType(RLCommandType type) {
         case RLCommandType::SetLimiterRelease:
         case RLCommandType::SetLimiterAlgorithm: return RLGroupLimiter;
         case RLCommandType::SetMaxVoices:        return RLGroupVoices;
+        case RLCommandType::SetChannelLimiter:   return RLGroupChannelLimiter;
         default:                                 return 0u;
     }
 }
@@ -430,14 +434,27 @@ struct alignas(64) RuntimeLinkTelemetryV2 {
     uint32_t rawIngressCount         = 0u;
     uint32_t compiledPagedCount      = 0u;
     uint32_t scheduledBacklogCount   = 0u;
+
+    // ── Per-MIDI-channel limiter meters (appended; growth anticipated by
+    // the header.structSize / command-offset design) ──────────────────────
+    // The original 512-byte layout above is a strict prefix of this struct,
+    // so an older configurator reading a newer driver (or vice versa, via
+    // the structSize check) simply sees zeros/legacy fields.
+    uint32_t channelLimiterEnabled   = 0u;
+    // Positive dB gain reduction per MIDI channel (0 = not limiting).
+    float    channelLimiterGainReductionDb[kRLV2ChannelCount] = {};
+    // Pre-limit bus peak per MIDI channel (linear).
+    float    channelLimiterInputPeak[kRLV2ChannelCount] = {};
+    uint32_t channelLimiterReserved[15] = {};
 };
 
 static_assert(std::is_trivially_copyable<RuntimeLinkTelemetryV2>::value,
               "RuntimeLinkTelemetryV2 must be trivially copyable");
 static_assert(sizeof(RuntimeLinkTelemetryV2) % 64 == 0,
               "RuntimeLinkTelemetryV2 must be a multiple of one cache line");
-static_assert(sizeof(RuntimeLinkTelemetryV2) == 512u,
-              "RuntimeLink V2 telemetry ABI must remain 512 bytes");
+static_assert(sizeof(RuntimeLinkTelemetryV2) == 704u,
+              "RuntimeLink V2 telemetry ABI (512-byte legacy prefix + "
+              "per-channel limiter meters) must remain 704 bytes");
 
 // ─── Command mailbox ────────────────────────────────────────────────────────
 //
@@ -615,9 +632,9 @@ static_assert(std::is_trivially_copyable<RuntimeLinkSharedMemoryV3>::value,
               "RuntimeLinkSharedMemoryV3 must be trivially copyable");
 static_assert(offsetof(RuntimeLinkSharedMemoryV3, telemetry) == 192u,
               "RuntimeLink V3 telemetry must be 64-byte aligned");
-static_assert(offsetof(RuntimeLinkSharedMemoryV3, command) == 704u,
+static_assert(offsetof(RuntimeLinkSharedMemoryV3, command) == 896u,
               "RuntimeLink V3 command must follow telemetry");
-static_assert(sizeof(RuntimeLinkSharedMemoryV3) == 1216u,
+static_assert(sizeof(RuntimeLinkSharedMemoryV3) == 1408u,
               "RuntimeLink V3 mapping layout must remain deterministic");
 
 inline constexpr uint32_t RuntimeLinkMappingSizeV3() {
@@ -794,6 +811,12 @@ struct alignas(64) RuntimeAudioSnapshot {
     std::atomic<uint32_t> rawIngressCount{0u};
     std::atomic<uint32_t> compiledPagedCount{0u};
     std::atomic<uint32_t> scheduledBacklogCount{0u};
+
+    // Per-MIDI-channel limiter (positive dB gain reduction + pre-limit
+    // peak, exact IEEE-754 bit patterns; kRLV2ChannelCount entries).
+    std::atomic<uint32_t> channelLimiterEnabled{0u};
+    std::atomic<uint32_t> channelLimiterGainReductionDbBits[kRLV2ChannelCount]{};
+    std::atomic<uint32_t> channelLimiterInputPeakBits[kRLV2ChannelCount]{};
 
     // 64-bit event/overload counters (each atomic on its own).
     std::atomic<uint64_t> overBudgetCallbacks{0u};

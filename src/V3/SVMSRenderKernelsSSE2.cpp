@@ -26,15 +26,18 @@ bool RenderSustainedLoopSSE2(const RenderSpanContext& context,
         ScalarRenderSustainedLoopShortBatch(v, handles, handleCount,
             context.sampleData, context.hilbertData, context.sampleDataFrames,
             context.outputLeft,
-            context.outputRight, context.frameStart, context.frameCount);
+            context.outputRight, context.frameStart, context.frameCount,
+            context.channelBusLeft, context.channelBusRight);
         return true;
     }
     if (context.frameCount > 4u) {
         for (uint32_t i = 0; i < handleCount; ++i) {
-            ScalarRenderSustainedLoop(v, handles[i], context.sampleData,
-                context.hilbertData, context.sampleDataFrames,
-                context.outputLeft,
-                context.outputRight, context.frameStart, context.frameCount);
+            const RenderSpanContext vc = SelectVoiceDestination(
+                context, v.channel[handles[i]]);
+            ScalarRenderSustainedLoop(v, handles[i], vc.sampleData,
+                vc.hilbertData, vc.sampleDataFrames,
+                vc.outputLeft,
+                vc.outputRight, vc.frameStart, vc.frameCount);
         }
         return true;
     }

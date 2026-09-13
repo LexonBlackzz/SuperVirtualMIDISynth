@@ -61,14 +61,14 @@ void TestPODLayout() {
              "RuntimeHostSlotV2 must be exactly one cache line");
     CHECK_EQ(sizeof(svms::RuntimeHostsRegistryV2), 64u + 64u * svms::kRuntimeHostMaxCount,
              "RuntimeHostsRegistryV2 must be 64 + 16 slots * 64");
-    CHECK_EQ(sizeof(svms::RuntimeLinkSharedMemoryV2), 1088u,
-             "mapping must be 1088 bytes");
+    CHECK_EQ(sizeof(svms::RuntimeLinkSharedMemoryV2), 1280u,
+             "mapping must be 1280 bytes (704 telemetry + 512 command)");
     CHECK_EQ(sizeof(svms::RuntimeAudioSnapshot) % 64, 0u,
              "RuntimeAudioSnapshot must be a cache-line multiple");
     CHECK_EQ(sizeof(svms::RuntimeDiscoveryHeaderV3), 192u,
              "RuntimeLink V3 discovery header must remain 192 bytes");
-    CHECK_EQ(sizeof(svms::RuntimeLinkSharedMemoryV3), 1216u,
-             "RuntimeLink V3 mapping must remain 1216 bytes");
+    CHECK_EQ(sizeof(svms::RuntimeLinkSharedMemoryV3), 1408u,
+             "RuntimeLink V3 mapping must remain 1408 bytes");
     CHECK_EQ(sizeof(svms::RuntimeDiscoveryHostSlotV1), 64u,
              "discovery host slot must remain one cache line");
     CHECK_EQ(sizeof(svms::RuntimeDiscoveryHostsRegistryV1), 1088u,
@@ -112,8 +112,9 @@ void TestLiveDefaults() {
 void TestTelemetryLayout() {
     CHECK_EQ(sizeof(svms::RuntimeLinkTelemetryV2) % 64, 0u,
              "RuntimeLinkTelemetryV2 must be a cache-line multiple");
-    CHECK_EQ(sizeof(svms::RuntimeLinkTelemetryV2), 512u,
-             "RuntimeLinkTelemetryV2 must be 512 bytes");
+    CHECK_EQ(sizeof(svms::RuntimeLinkTelemetryV2), 704u,
+             "RuntimeLinkTelemetryV2 must be 704 bytes (512 legacy prefix + "
+             "per-channel limiter meters)");
     CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, live), 144u,
              "telemetry.live must sit at byte 144");
     CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, soundFontName), 236u,
@@ -122,6 +123,14 @@ void TestTelemetryLayout() {
              "scheduler telemetry must consume reserved word zero");
     CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, scheduledBacklogCount), 508u,
              "scheduled backlog must consume the final reserved word");
+    // Per-channel limiter meters are a strict prefix-compatible append: the
+    // original 512 bytes keep byte-for-byte the same field offsets.
+    CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, channelLimiterEnabled), 512u,
+             "channel limiter flag must append at byte 512");
+    CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, channelLimiterGainReductionDb), 516u,
+             "channel limiter GR meters must append at byte 516");
+    CHECK_EQ(offsetof(svms::RuntimeLinkTelemetryV2, channelLimiterInputPeak), 580u,
+             "channel limiter peaks must append at byte 580");
 
     svms::RuntimeLinkTelemetryV2 t{};
     CHECK_EQ(t.activeVoices, 0u, "default activeVoices must be 0");
@@ -154,16 +163,16 @@ void TestMappingOffsets() {
     size_t offCmd  = reinterpret_cast<const char*>(&mem.command)
                    - reinterpret_cast<const char*>(&mem);
     CHECK_EQ(offTele, 64u, "telemetry must sit at offset 64");
-    CHECK_EQ(offCmd, 576u, "command must sit at offset 576");
+    CHECK_EQ(offCmd, 768u, "command must sit at offset 768");
     CHECK(offTele % 64 == 0 && offCmd % 64 == 0,
           "telemetry and command must be cache-line aligned in mapping");
 
     svms::RuntimeLinkHeaderV2 h{};
     h.structSize = static_cast<uint32_t>(sizeof(svms::RuntimeLinkTelemetryV2));
     CHECK_EQ(svms::RLV2_TelemetryOffset(h), 64u, "RLV2_TelemetryOffset must be 64");
-    CHECK_EQ(svms::RLV2_CommandOffset(h), 576u, "RLV2_CommandOffset must be 576");
-    CHECK_EQ(svms::RuntimeLinkMappingSizeV2(), 1088u,
-             "mapping size must be 1088");
+    CHECK_EQ(svms::RLV2_CommandOffset(h), 768u, "RLV2_CommandOffset must be 768");
+    CHECK_EQ(svms::RuntimeLinkMappingSizeV2(), 1280u,
+             "mapping size must be 1280");
 
     svms::RuntimeLinkSharedMemoryV3 v3{};
     const size_t v3Telemetry = reinterpret_cast<const char*>(&v3.telemetry) -
@@ -171,9 +180,9 @@ void TestMappingOffsets() {
     const size_t v3Command = reinterpret_cast<const char*>(&v3.command) -
                              reinterpret_cast<const char*>(&v3);
     CHECK_EQ(v3Telemetry, 192u, "V3 telemetry must sit at offset 192");
-    CHECK_EQ(v3Command, 704u, "V3 command must sit at offset 704");
-    CHECK_EQ(svms::RuntimeLinkMappingSizeV3(), 1216u,
-             "V3 mapping size must be 1216");
+    CHECK_EQ(v3Command, 896u, "V3 command must sit at offset 896");
+    CHECK_EQ(svms::RuntimeLinkMappingSizeV3(), 1408u,
+             "V3 mapping size must be 1408");
 }
 
 void TestHeaderCrc() {
@@ -198,7 +207,7 @@ void TestHeaderCrc() {
     v3.publisherPid = 12345u;
     v3.telemetryOffset = 192u;
     v3.telemetrySize = sizeof(svms::RuntimeLinkTelemetryV2);
-    v3.commandOffset = 704u;
+    v3.commandOffset = 896u;
     v3.commandSize = sizeof(svms::RuntimeLinkCommandV2);
     v3.accessFlags = svms::kRuntimeAccessTelemetryRead |
                      svms::kRuntimeAccessCommandWrite;
@@ -306,7 +315,11 @@ void TestGroups() {
              "wire commands must not map to a group");
     CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::ApplyLiveConfig), 0u,
              "ApplyLiveConfig must not map to a group");
-    CHECK_EQ(svms::RLGroupAll, 0x1Fu, "RLGroupAll must be the union of all groups");
+    CHECK_EQ(svms::RLV2_GroupForType(svms::RLCommandType::SetChannelLimiter),
+             svms::RLGroupChannelLimiter,
+             "channel limiter must map to its own group");
+    CHECK_EQ(svms::RLGroupAll, 0x1Fu,
+             "RLGroupAll must be the union of the ApplyLiveConfig groups");
 }
 
 void TestNamingConventions() {

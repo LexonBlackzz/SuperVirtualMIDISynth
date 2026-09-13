@@ -44,6 +44,11 @@ struct ConfigValues {
     float limiterAttackMs = 0.5f;
     float limiterReleaseMs = 100.0f;
 
+    // Opt-in per-MIDI-channel limiter (purely post-render; off = identical).
+    bool channelLimiterEnabled = false;
+    float channelLimiterThreshold = 0.5011872336272722f;  // -6 dBFS
+    float channelLimiterReleaseMs = 150.0f;
+
     bool enableReverb = false;
     float reverbMix = 0.25f;
     float reverbRoomSize = 0.60f;

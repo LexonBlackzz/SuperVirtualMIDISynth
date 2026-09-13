@@ -8,9 +8,19 @@
 
 namespace svms {
 
-using IndexedRenderJob = void(*)(uint32_t jobIndex, float* outputLeft,
-                                 float* outputRight, uint32_t frameCount,
-                                 void* userData);
+// Per-job mix destinations for indexed render jobs.  Legacy jobs write the
+// single stereo mix; bus-mode jobs (per-MIDI-channel limiter active) write
+// per-channel planes instead — the job's private planes from the pool, or
+// the block buses when the job runs serially on the calling thread.
+struct IndexedJobMix {
+    float* outputLeft;
+    float* outputRight;
+    float* const* busLeft;    // kChannelCount plane pointers; null = legacy
+    float* const* busRight;
+};
+
+using IndexedRenderJob = void(*)(uint32_t jobIndex, const IndexedJobMix& mix,
+                                 uint32_t frameCount, void* userData);
 
 enum class RenderParallelRejectReason : uint8_t {
     None,
@@ -56,12 +66,19 @@ public:
 
     // Execute fixed logical jobs with dynamic worker claiming. Each job gets
     // a deterministic private mix buffer; reduction is always job-index order.
+    // When channelBusLeft/Right are non-null, jobs additionally receive
+    // private per-channel bus planes (per-MIDI-channel limiter support) and
+    // the merge sums planes per channel.
     bool ExecuteIndexed(uint32_t jobCount, uint32_t frameCount,
                         float* outputLeft, float* outputRight,
-                        IndexedRenderJob callback, void* userData) noexcept;
+                        IndexedRenderJob callback, void* userData,
+                        float* const* channelBusLeft = nullptr,
+                        float* const* channelBusRight = nullptr) noexcept;
     bool BeginIndexed(uint32_t jobCount, uint32_t frameCount,
                       float* outputLeft, float* outputRight,
-                      IndexedRenderJob callback, void* userData) noexcept;
+                      IndexedRenderJob callback, void* userData,
+                      float* const* channelBusLeft = nullptr,
+                      float* const* channelBusRight = nullptr) noexcept;
     bool FinishIndexed() noexcept;
 
 private:

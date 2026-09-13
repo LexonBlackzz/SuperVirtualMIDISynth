@@ -26,6 +26,7 @@
 #include "PageLiveRecording.h"
 #include "PageReverb.h"
 #include "PageLimiter.h"
+#include "PageChannelLimiter.h"
 #include "PageDiagnostics.h"
 #include "PageAdvanced.h"
 #include "PageAbout.h"
@@ -703,6 +704,7 @@ void ConfiguratorApp::DrawSidebar() {
 
     drawNavItem("Reverb", Page::Reverb, "EFFECTS");
     drawNavItem("Limiter", Page::Limiter, nullptr);
+    drawNavItem("Per-Channel Limiter", Page::ChannelLimiter, nullptr);
 
     drawNavItem("Diagnostics", Page::Diagnostics, "SYSTEM");
     drawNavItem("Advanced", Page::Advanced, nullptr);
@@ -865,6 +867,7 @@ void ConfiguratorApp::DrawPageContent() {
         break;
     case Page::Reverb:      DrawReverbPage(config_); break;
     case Page::Limiter:     DrawLimiterPage(config_); break;
+    case Page::ChannelLimiter: DrawChannelLimiterPage(config_); break;
     case Page::Diagnostics: DrawDiagnosticsPage(config_); break;
     case Page::Advanced:    DrawAdvancedPage(config_); break;
     case Page::About:       DrawAboutPage(config_, updateService_); break;
@@ -969,7 +972,7 @@ void ConfiguratorApp::PollRuntimeLink() {
 void ConfiguratorApp::FlushLiveChanges() {
     if (!rlConnected_ || !rlClient_.HasCapability(
             svms::build::CapabilityLiveConfiguration) ||
-        pendingLiveMask_ == 0u) return;
+        (pendingLiveMask_ == 0u && !pendingChannelLimiter_)) return;
 
     ImGuiIO& io = ImGui::GetIO();
     if (rlRetryBackoff_ > 0.0f) {
@@ -990,12 +993,14 @@ void ConfiguratorApp::FlushLiveChanges() {
         pendingLiveMask_ &= ~submittedMask;
         rlFailedFlushes_ = 0u;
         rlRetryBackoff_ = 0.0f;
+        SendPendingChannelLimiter();
         return;
     }
 
     if (result == svms::RLResult::RestartRequired &&
         (submittedMask & svms::RLGroupVoices) != 0u) {
         pendingLiveMask_ &= ~svms::RLGroupVoices;
+        SendPendingChannelLimiter();
         statusMessage_ = "Voice cap exceeds the startup pool — restart required to grow it";
         if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
         toastTimer_ = 4.0f;
@@ -1073,6 +1078,45 @@ void ConfiguratorApp::SetLiveBool(svms::RLCommandType type, bool value) {
     }
     pendingLiveMask_ |= svms::RLV2_GroupForType(type);
     rlFlushTimer_ = kRlFlushInterval;
+}
+
+void ConfiguratorApp::SetLiveChannelLimiter(bool enabled, float threshold,
+                                            float releaseMs) {
+    if (!rlConnected_ || !rlClient_.HasCapability(
+            svms::build::CapabilityLiveConfiguration)) return;
+    pendingChannelLimiter_ = true;
+    pendingChannelLimiterValues_[0] = enabled ? 1.0f : 0.0f;
+    pendingChannelLimiterValues_[1] = threshold;
+    pendingChannelLimiterValues_[2] = releaseMs;
+    rlFlushTimer_ = kRlFlushInterval;
+}
+
+// The channel limiter rides a dedicated wire command because
+// RuntimeLiveStateV2 (ABI-pinned, echoed inside the 512-byte legacy
+// telemetry prefix) has no spare words for it. Payload travels in the
+// command text area: "enabled;threshold;releaseMs".
+void ConfiguratorApp::SendPendingChannelLimiter() {
+    if (!pendingChannelLimiter_) return;
+    char payload[64];
+    std::snprintf(payload, sizeof(payload), "%d;%.6f;%.1f",
+                  pendingChannelLimiterValues_[0] > 0.5f ? 1 : 0,
+                  pendingChannelLimiterValues_[1],
+                  pendingChannelLimiterValues_[2]);
+    char err[svms::kRuntimeLinkResultTextCapacity] = {};
+    const svms::RLResult result = rlClient_.SendCommand(
+        svms::RLCommandType::SetChannelLimiter,
+        svms::RLGroupChannelLimiter, 0u, workingLive_,
+        kRlLiveCommandTimeoutMs, err, payload);
+    if (result == svms::RLResult::Ok) {
+        pendingChannelLimiter_ = false;
+    } else if (result != svms::RLResult::Busy) {
+        pendingChannelLimiter_ = false;
+        statusMessage_ = "Per-channel limiter update failed: " +
+            std::string(svms::RLV2_ResultToString(result));
+        if (err[0] != 0) statusMessage_ += std::string(" - ") + err;
+        toastTimer_ = 3.0f;
+        toastMessage_ = statusMessage_;
+    }
 }
 
 void ConfiguratorApp::SetLiveMaxVoices(uint32_t value) {

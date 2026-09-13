@@ -419,6 +419,16 @@ struct DenseChunkPlan {
 struct DenseJobContext {
     class RenderScalar* renderer = nullptr;
     DenseChunkPlan* plan = nullptr;
+    // Bus mode (channel limiter on): tiles are re-batched so the per-job
+    // channel-plane scratch stays bounded.  Each indexed job owns a
+    // contiguous tile range; the trailing job renders tails.  Job-local
+    // bus planes arrive through the IndexedJobMix argument (pool mode) or
+    // the block buses arrive through it (serial mode).
+    uint32_t tileCount = 0u;        // total voice tiles in the plan
+    uint32_t tilesPerJob = 1u;      // tiles per indexed job (1 = legacy 1:1)
+    uint32_t blockFrameOffset = 0u; // chunk start within the block (planes
+                                    // are block-length, so bus writes use
+                                    // block-absolute frame indices)
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -621,6 +631,10 @@ public:
     // hilbertData: optional analytic companion store (Hilbert pair).
     // Overload resolution on the 4th argument (pointer vs frame count)
     // keeps every pre-pair call site source-compatible.
+    // channelBusLeft/Right: optional per-MIDI-channel bus planes
+    // (SVMSChannelLimiter.h).  Null (default) mixes straight into
+    // outputLeft/outputRight — bit-identical legacy behavior.  When set,
+    // voices mix into their channel's plane and the caller sums/limits.
     void RenderBlock(VoiceManager& voices, const ChannelCache& channels,
                      const int16_t* sampleData,
                      const int16_t* hilbertData,
@@ -630,7 +644,9 @@ public:
                      const RenderEvent* events = nullptr,
                      uint32_t eventCount = 0,
                      bool correctnessMode = false,
-                     uint64_t blockStartFrame = 0);
+                     uint64_t blockStartFrame = 0,
+                     float* const* channelBusLeft = nullptr,
+                     float* const* channelBusRight = nullptr);
     void RenderBlock(VoiceManager& voices, const ChannelCache& channels,
                      const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
@@ -638,7 +654,9 @@ public:
                      const RenderEvent* events = nullptr,
                      uint32_t eventCount = 0,
                      bool correctnessMode = false,
-                     uint64_t blockStartFrame = 0);
+                     uint64_t blockStartFrame = 0,
+                     float* const* channelBusLeft = nullptr,
+                     float* const* channelBusRight = nullptr);
 
 private:
     // ── Whole-voice whole-block renderer ────────────────────────────────
@@ -649,7 +667,9 @@ private:
                                const int16_t* sampleData,
                                uint32_t sampleDataFrames,
                                float* outputLeft, float* outputRight,
-                               uint32_t numFrames, uint64_t blockStartFrame);
+                               uint32_t numFrames, uint64_t blockStartFrame,
+                               float* const* channelBusLeft,
+                               float* const* channelBusRight);
     bool ReserveWholeVoiceStorage(uint32_t handleCapacity);
     bool EnsureWholeVoiceJobScratch(uint32_t jobCount);
     bool RenderWholeVoiceSegment(VoiceSoA& state, VoiceManager* voices,
@@ -685,9 +705,9 @@ private:
     bool EnsureWholeVoiceRowOpStorage(uint32_t opCount);
     void ApplyWholeVoiceRowOp(VoiceSoA& state, uint32_t row,
                               const WholeVoiceChannelOp& op);
-    static void WholeVoiceJobThunk(uint32_t jobIndex, float* outputLeft,
-                                   float* outputRight, uint32_t frameCount,
-                                   void* userData);
+    static void WholeVoiceJobThunk(uint32_t jobIndex,
+                                   const IndexedJobMix& mix,
+                                   uint32_t frameCount, void* userData);
 
     VoiceSoA wvGhostState_;                  // displaced-voice snapshots
     WholeVoiceGhostTail* wvGhostTails_ = nullptr;
@@ -770,7 +790,9 @@ public:
                      const RenderEvent* events = nullptr,
                      uint32_t eventCount = 0,
                      bool correctnessMode = false,
-                     uint64_t blockStartFrame = 0);
+                     uint64_t blockStartFrame = 0,
+                     float* const* channelBusLeft = nullptr,
+                     float* const* channelBusRight = nullptr);
     void RenderBlockReference(VoiceManager& voices, const ChannelCache& channels,
                      const int16_t* sampleData, uint32_t sampleDataFrames,
                      float* outputLeft, float* outputRight,
@@ -778,7 +800,9 @@ public:
                      const RenderEvent* events = nullptr,
                      uint32_t eventCount = 0,
                      bool correctnessMode = false,
-                     uint64_t blockStartFrame = 0);
+                     uint64_t blockStartFrame = 0,
+                     float* const* channelBusLeft = nullptr,
+                     float* const* channelBusRight = nullptr);
     void SetCoverageProfilingEnabledForTest(bool enabled) {
         coverageProfilingEnabled_ = enabled;
     }
@@ -846,7 +870,9 @@ private:
                      float* outputLeft, float* outputRight,
                      uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                      const RenderEvent* events, uint32_t eventCount,
-                     bool correctnessMode, uint64_t blockStartFrame);
+                     bool correctnessMode, uint64_t blockStartFrame,
+                     float* const* channelBusLeft = nullptr,
+                     float* const* channelBusRight = nullptr);
     bool EnsureDenseStorage();
     // Returns a bit per kDenseRenderChunkFrames chunk: 1 = execute that chunk
     // through the dense parallel pipeline, 0 = leave it to the span renderer.
@@ -863,7 +889,9 @@ private:
                      uint32_t rangeStart, uint32_t rangeEnd,
                      const RenderEvent* events,
                      uint32_t eventCount, uint32_t eventIndexBegin,
-                     uint64_t blockStartFrame, uint32_t* renderedTo);
+                     uint64_t blockStartFrame, uint32_t* renderedTo,
+                     float* const* channelBusLeft,
+                     float* const* channelBusRight);
     void RenderBlockSparseRange(VoiceManager& voices,
                      const ChannelCache& channels,
                      const int16_t* sampleData, const int16_t* hilbertData,
@@ -873,7 +901,9 @@ private:
                      const RenderEvent* events,
                      uint32_t eventCount, uint32_t eventIndexBegin,
                      bool vibratoActive, bool correctnessMode,
-                     uint64_t blockStartFrame);
+                     uint64_t blockStartFrame,
+                     float* const* channelBusLeft,
+                     float* const* channelBusRight);
     void AdvanceAuthoritativeSpan(VoiceManager& voices,
                      const int16_t* sampleData, uint32_t sampleDataFrames,
                      uint32_t frameCount, uint64_t absoluteFrame);
@@ -886,13 +916,18 @@ private:
     void AdvanceDenseTailsTo(VoiceManager& voices, uint32_t frameOffset);
     static void DensePreTailCapture(VoiceHandle handle, void* userData);
     static void DenseVoiceConfigured(VoiceHandle handle, void* userData);
-    static void DenseIndexedJob(uint32_t jobIndex, float* outputLeft,
-                     float* outputRight, uint32_t frameCount, void* userData);
+    static void DenseIndexedJob(uint32_t jobIndex, const IndexedJobMix& mix,
+                     uint32_t frameCount, void* userData);
     void RenderDenseVoiceTile(const DenseChunkPlan& plan, uint32_t tileIndex,
                      float* outputLeft, float* outputRight,
-                     uint32_t frameCount);
+                     uint32_t frameCount, uint32_t blockFrameOffset,
+                     float* const* channelBusLeft,
+                     float* const* channelBusRight);
     void RenderDenseTails(const DenseChunkPlan& plan, float* outputLeft,
-                     float* outputRight, uint32_t frameCount);
+                     float* outputRight, uint32_t frameCount,
+                     uint32_t blockFrameOffset,
+                     float* const* channelBusLeft,
+                     float* const* channelBusRight);
     EventDispatcher dispatcher_;
     EventBatchDispatcher batchDispatcher_;
     void* dispatcherUserData_;
@@ -1149,7 +1184,9 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                                         uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                                         const RenderEvent* events, uint32_t eventCount,
                                         bool correctnessMode,
-                                        uint64_t blockStartFrame) {
+                                        uint64_t blockStartFrame,
+                                        float* const* channelBusLeft,
+                                        float* const* channelBusRight) {
     voices.ApplyRuntimeVoiceLimit(blockStartFrame);
     // Scratch is indexed by the number of voices that can retire/reclassify in
     // one span, not by the physical handle ceiling. A live VoiceSoA grow may
@@ -1229,8 +1266,17 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
         const uint32_t* tailHandles = voices.GetStealTailList();
         for (uint32_t position = tailCount; position > 0u; --position) {
             const uint32_t tailSlot = tailHandles[position - 1u];
+            float* tailOutL = outL;
+            float* tailOutR = outR;
+            if (channelBusLeft != nullptr) {
+                const uint32_t channel = v.stealTailChannel[tailSlot];
+                const uint32_t safeChannel =
+                    channel < kChannelCount ? channel : 0u;
+                tailOutL = channelBusLeft[safeChannel] + f;
+                tailOutR = channelBusRight[safeChannel] + f;
+            }
             RenderStealTailSample(v, tailSlot, sampleData, hilbertData,
-                                  sampleDataFrames, outL, outR);
+                                  sampleDataFrames, tailOutL, tailOutR);
             voices.RefreshStealTail(static_cast<VoiceHandle>(tailSlot));
         }
 
@@ -1409,8 +1455,19 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                                                 hilbertData, fetchBaseIndex,
                                                 fetchNextIndex, fetchFrac);
                 const float scaled = rotated * gain * stealFadeIn;
-                *outL += scaled * v.mixGainL[idx];
-                *outR += scaled * v.mixGainR[idx];
+                if (channelBusLeft != nullptr) {
+                    // Bus mode: mix into this voice's channel plane.
+                    const uint32_t channel = v.channel[idx];
+                    const uint32_t safeChannel =
+                        channel < kChannelCount ? channel : 0u;
+                    channelBusLeft[safeChannel][f] +=
+                        scaled * v.mixGainL[idx];
+                    channelBusRight[safeChannel][f] +=
+                        scaled * v.mixGainR[idx];
+                } else {
+                    *outL += scaled * v.mixGainL[idx];
+                    *outR += scaled * v.mixGainR[idx];
+                }
             }
 
             const bool thresholdReleaseFinished = isReleased &&
@@ -1449,11 +1506,13 @@ inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
                                         const RenderEvent* events,
                                         uint32_t eventCount,
                                         bool correctnessMode,
-                                        uint64_t blockStartFrame) {
+                                        uint64_t blockStartFrame,
+                                        float* const* channelBusLeft,
+                                        float* const* channelBusRight) {
     RenderBlockReference(voices, channels, sampleData, nullptr,
                          sampleDataFrames, outputLeft, outputRight, numFrames,
                          cfg, events, eventCount, correctnessMode,
-                         blockStartFrame);
+                         blockStartFrame, channelBusLeft, channelBusRight);
 }
 
 inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
@@ -1467,11 +1526,14 @@ inline void RenderScalar::RenderBlockReference(VoiceManager& voices,
                                         const RenderEvent* events,
                                         uint32_t eventCount,
                                         bool correctnessMode,
-                                        uint64_t blockStartFrame) {
+                                        uint64_t blockStartFrame,
+                                        float* const* channelBusLeft,
+                                        float* const* channelBusRight) {
     RenderBlockFrameMajor(voices, channels, sampleData, hilbertData,
                           sampleDataFrames,
                           outputLeft, outputRight, numFrames, cfg, events,
-                          eventCount, correctnessMode, blockStartFrame);
+                          eventCount, correctnessMode, blockStartFrame,
+                          channelBusLeft, channelBusRight);
 }
 #endif
 
@@ -2626,7 +2688,8 @@ inline void RenderScalar::DenseVoiceConfigured(
 
 inline void RenderScalar::RenderDenseVoiceTile(
     const DenseChunkPlan& plan, uint32_t tileIndex, float* outputLeft,
-    float* outputRight, uint32_t frameCount) {
+    float* outputRight, uint32_t frameCount, uint32_t blockFrameOffset,
+    float* const* channelBusLeft, float* const* channelBusRight) {
     VoiceSoA& v = denseRenderState_;
     const uint32_t firstHandle = tileIndex * kDenseRenderHandlesPerTile;
     const uint32_t lastHandle = (std::min)(
@@ -2701,19 +2764,35 @@ inline void RenderScalar::RenderDenseVoiceTile(
              classIndex < kVoiceRenderClassCount; ++classIndex) {
             const uint32_t count = classCounts[classIndex];
             if (count == 0u) continue;
+            // Bus planes are block-length, so their frame base is the
+            // block-absolute chunk start; the legacy mix is chunk-offset
+            // with chunk-relative frame indices.
+            const uint32_t contextFrameStart =
+                channelBusLeft != nullptr ? blockFrameOffset : 0u;
             const RenderSpanContext context{
                 &v, denseSampleData_, nullptr, denseSampleDataFrames_,
-                outputLeft, outputRight, 0u, frameCount, v.GetCapacity(),
+                outputLeft, outputRight, contextFrameStart, frameCount, v.GetCapacity(),
                 nullptr, nullptr, nullptr, nullptr, nullptr, 0u,
-                0.0f, 0.0f, 0u};
+                0.0f, 0.0f, 0u, channelBusLeft, channelBusRight};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
             if (kernel && kernel(context, classHandles[classIndex], count))
                 continue;
             for (uint32_t index = 0u; index < count; ++index) {
                 const uint32_t handle = classHandles[classIndex][index];
+                float* voiceOutLeft = outputLeft;
+                float* voiceOutRight = outputRight;
+                uint32_t voiceFrameStart = 0u;
+                if (channelBusLeft != nullptr) {
+                    const uint32_t channel = v.channel[handle];
+                    const uint32_t safeChannel =
+                        channel < kChannelCount ? channel : 0u;
+                    voiceOutLeft = channelBusLeft[safeChannel];
+                    voiceOutRight = channelBusRight[safeChannel];
+                    voiceFrameStart = blockFrameOffset;
+                }
                 const uint32_t retiredAt = RenderPrimaryVoiceSpan(
                     v, handle, denseSampleData_, nullptr, denseSampleDataFrames_,
-                    outputLeft, outputRight, 0u, frameCount, frameCount);
+                    voiceOutLeft, voiceOutRight, voiceFrameStart, frameCount, frameCount);
                 if (retiredAt != UINT32_MAX)
                     v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
             }
@@ -2812,11 +2891,14 @@ inline void RenderScalar::RenderDenseVoiceTile(
             const uint32_t count = classCounts[classIndex];
             if (count == 0u) continue;
             uint32_t* list = classHandles[classIndex];
+            const uint32_t contextFrameStart = channelBusLeft != nullptr
+                ? blockFrameOffset + cursor : cursor;
             const RenderSpanContext context{
                 &v, denseSampleData_, nullptr, denseSampleDataFrames_,
-                outputLeft, outputRight, cursor, spanFrames, 0u,
+                outputLeft, outputRight, contextFrameStart, spanFrames, 0u,
                 tileClassChanges, &tileClassChangeCount,
-                nullptr, nullptr, nullptr, 0u, 0.0f, 0.0f, 0u};
+                nullptr, nullptr, nullptr, 0u, 0.0f, 0.0f, 0u,
+                channelBusLeft, channelBusRight};
             RenderClassKernel kernel = denseKernelSet_->kernels[classIndex];
             if (kernel && kernel(context, list, count)) {
                 // Class transitions recorded by the kernel move voices
@@ -2846,9 +2928,20 @@ inline void RenderScalar::RenderDenseVoiceTile(
             for (uint32_t index = 0u; index < count; ++index) {
                 const uint32_t handle = list[index];
                 const uint32_t slot = handle - firstHandle;
+                float* voiceOutLeft = outputLeft;
+                float* voiceOutRight = outputRight;
+                uint32_t voiceFrameStart = cursor;
+                if (channelBusLeft != nullptr) {
+                    const uint32_t channel = v.channel[handle];
+                    const uint32_t safeChannel =
+                        channel < kChannelCount ? channel : 0u;
+                    voiceOutLeft = channelBusLeft[safeChannel];
+                    voiceOutRight = channelBusRight[safeChannel];
+                    voiceFrameStart = blockFrameOffset + cursor;
+                }
                 const uint32_t retiredAt = RenderPrimaryVoiceSpan(
                     v, handle, denseSampleData_, nullptr, denseSampleDataFrames_,
-                    outputLeft, outputRight, cursor, spanFrames, spanFrames);
+                    voiceOutLeft, voiceOutRight, voiceFrameStart, spanFrames, spanFrames);
                 if (retiredAt != UINT32_MAX) {
                     v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
                     slotClass[slot] = UINT8_MAX;
@@ -2880,7 +2973,8 @@ inline void RenderScalar::RenderDenseVoiceTile(
 
 inline void RenderScalar::RenderDenseTails(
     const DenseChunkPlan& plan, float* outputLeft, float* outputRight,
-    uint32_t frameCount) {
+    uint32_t frameCount, uint32_t blockFrameOffset,
+    float* const* channelBusLeft, float* const* channelBusRight) {
     VoiceSoA& v = denseRenderState_;
     uint32_t mutation = 0u;
     uint32_t cursor = 0u;
@@ -2895,25 +2989,58 @@ inline void RenderScalar::RenderDenseTails(
             spanEnd = plan.tailMutations[mutation].frameOffset;
         for (uint32_t handle = 0u; handle < kStealTailReserve; ++handle) {
             if (v.stealTailFramesRemaining[handle] == 0u) continue;
+            float* tailOutLeft = outputLeft;
+            float* tailOutRight = outputRight;
+            uint32_t tailFrameStart = cursor;
+            if (channelBusLeft != nullptr) {
+                const uint32_t channel = v.stealTailChannel[handle];
+                const uint32_t safeChannel =
+                    channel < kChannelCount ? channel : 0u;
+                tailOutLeft = channelBusLeft[safeChannel];
+                tailOutRight = channelBusRight[safeChannel];
+                tailFrameStart = blockFrameOffset + cursor;
+            }
             RenderStealTailSpan(v, handle, denseSampleData_,
-                                nullptr, denseSampleDataFrames_, outputLeft,
-                                outputRight, cursor, spanEnd - cursor);
+                                nullptr, denseSampleDataFrames_, tailOutLeft,
+                                tailOutRight, tailFrameStart, spanEnd - cursor);
         }
         cursor = spanEnd;
     }
 }
 
 inline void RenderScalar::DenseIndexedJob(
-    uint32_t jobIndex, float* outputLeft, float* outputRight,
+    uint32_t jobIndex, const IndexedJobMix& mix,
     uint32_t frameCount, void* userData) {
     DenseJobContext* job = static_cast<DenseJobContext*>(userData);
     RenderScalar* renderer = job->renderer;
     const DenseChunkPlan& plan = *job->plan;
-    if (jobIndex < plan.tileCount) {
-        renderer->RenderDenseVoiceTile(plan, jobIndex, outputLeft,
-                                       outputRight, frameCount);
+    const uint32_t tileJobs =
+        job->tilesPerJob == 0u
+            ? job->tileCount
+            : (job->tileCount + job->tilesPerJob - 1u) / job->tilesPerJob;
+    if (jobIndex < tileJobs) {
+        // Bus mode re-batches several tiles per job; legacy mode is 1:1.
+        const uint32_t firstTile = jobIndex * job->tilesPerJob;
+        const uint32_t endTile = (std::min)(
+            job->tileCount, firstTile + job->tilesPerJob);
+        if (job->tilesPerJob == 1u) {
+            renderer->RenderDenseVoiceTile(plan, firstTile, mix.outputLeft,
+                                           mix.outputRight, frameCount,
+                                           job->blockFrameOffset,
+                                           mix.busLeft, mix.busRight);
+        } else {
+            for (uint32_t tile = firstTile; tile < endTile; ++tile) {
+                renderer->RenderDenseVoiceTile(plan, tile, mix.outputLeft,
+                                               mix.outputRight, frameCount,
+                                               job->blockFrameOffset,
+                                               mix.busLeft, mix.busRight);
+            }
+        }
     } else {
-        renderer->RenderDenseTails(plan, outputLeft, outputRight, frameCount);
+        renderer->RenderDenseTails(plan, mix.outputLeft,
+                                   mix.outputRight, frameCount,
+                                   job->blockFrameOffset,
+                                   mix.busLeft, mix.busRight);
     }
 }
 
@@ -2922,7 +3049,8 @@ inline bool RenderScalar::RenderBlockDensePlanned(
     float* outputLeft, float* outputRight, uint32_t rangeStart,
     uint32_t rangeEnd, const RenderEvent* events, uint32_t eventCount,
     uint32_t eventIndexBegin, uint64_t blockStartFrame,
-    uint32_t* renderedTo) {
+    uint32_t* renderedTo, float* const* channelBusLeft,
+    float* const* channelBusRight) {
     *renderedTo = rangeStart;
     denseRenderState_.CopyDenseRenderStateFrom(voices.v);
     denseSampleData_ = sampleData;
@@ -3197,16 +3325,37 @@ inline bool RenderScalar::RenderBlockDensePlanned(
             renderInFlight = false;
         }
         DenseJobContext& jobContext = denseJobContexts_[chunkIndex & 1u];
+        jobContext.tileCount = denseTileCount_;
+        jobContext.blockFrameOffset = chunkStart;
+        // Legacy dispatch: one job per tile plus the tails job.  Bus mode
+        // re-batches tiles per job so the pool's per-job channel-plane
+        // scratch stays bounded (a 100k pool would otherwise need ~390
+        // private 16-plane buffers per chunk); tiles in one job render
+        // sequentially, disjoint tiles never race.
+        jobContext.tilesPerJob = 1u;
+        uint32_t denseJobCount = denseTileCount_ + 1u;
+        if (channelBusLeft != nullptr) {
+            const uint32_t maxJobs = (std::max)(2u,
+                (std::min)(denseTileCount_,
+                           workerPool_->GetThreadCount() * 2u));
+            jobContext.tilesPerJob =
+                (denseTileCount_ + maxJobs - 1u) / maxJobs;
+            denseJobCount =
+                (denseTileCount_ + jobContext.tilesPerJob - 1u) /
+                    jobContext.tilesPerJob + 1u;
+        }
         if (workerPool_->BeginIndexed(
-                denseTileCount_ + 1u, chunkFrames,
+                denseJobCount, chunkFrames,
                 outputLeft + chunkStart, outputRight + chunkStart,
-                DenseIndexedJob, &jobContext)) {
+                DenseIndexedJob, &jobContext,
+                channelBusLeft, channelBusRight)) {
             renderInFlight = true;
         } else {
-            for (uint32_t job = 0u; job <= denseTileCount_; ++job)
-                DenseIndexedJob(job, outputLeft + chunkStart,
-                                outputRight + chunkStart, chunkFrames,
-                                &jobContext);
+            IndexedJobMix serialMix{outputLeft + chunkStart,
+                                    outputRight + chunkStart,
+                                    channelBusLeft, channelBusRight};
+            for (uint32_t job = 0u; job < denseJobCount; ++job)
+                DenseIndexedJob(job, serialMix, chunkFrames, &jobContext);
         }
     }
     if (renderInFlight) workerPool_->FinishIndexed();
@@ -3263,10 +3412,13 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                                       const RenderEvent* events, uint32_t eventCount,
                                       bool correctnessMode,
-                                      uint64_t blockStartFrame) {
+                                      uint64_t blockStartFrame,
+                                      float* const* channelBusLeft,
+                                      float* const* channelBusRight) {
     RenderBlock(voices, channels, sampleData, nullptr, sampleDataFrames,
                 outputLeft, outputRight, numFrames, cfg, events, eventCount,
-                correctnessMode, blockStartFrame);
+                correctnessMode, blockStartFrame, channelBusLeft,
+                channelBusRight);
 }
 
 inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& channels,
@@ -3276,7 +3428,9 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       uint32_t numFrames, const RuntimeConfigSnapshot& cfg,
                                       const RenderEvent* events, uint32_t eventCount,
                                       bool correctnessMode,
-                                      uint64_t blockStartFrame) {
+                                      uint64_t blockStartFrame,
+                                      float* const* channelBusLeft,
+                                      float* const* channelBusRight) {
     (void)cfg;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     if (coverageProfilingEnabled_) ++coverageStats_.callbacks;
@@ -3337,7 +3491,8 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             lastRenderPaths_ |= 0x1u;
             RenderWholeVoiceBlock(voices, sampleData, sampleDataFrames,
                                   outputLeft, outputRight, numFrames,
-                                  blockStartFrame);
+                                  blockStartFrame, channelBusLeft,
+                                  channelBusRight);
             return;
         }
     }
@@ -3382,7 +3537,8 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             if (RenderBlockDensePlanned(
                     voices, sampleData, sampleDataFrames, outputLeft,
                     outputRight, segStart, segEnd, events, eventCount,
-                    eventCursor, blockStartFrame, &renderedTo)) {
+                    eventCursor, blockStartFrame, &renderedTo,
+                    channelBusLeft, channelBusRight)) {
                 lastRenderPaths_ |= 0x2u;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
                 if (coverageProfilingEnabled_) ++coverageStats_.denseRendered;
@@ -3408,7 +3564,8 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
             RenderBlockSparseRange(voices, channels, sampleData, hilbertData,
                 sampleDataFrames, outputLeft, outputRight, segStart, segEnd,
                 events, eventCount, eventCursor, vibratoActive,
-                correctnessMode, blockStartFrame);
+                correctnessMode, blockStartFrame, channelBusLeft,
+                channelBusRight);
         }
         segStart = segEnd;
     }
@@ -4122,8 +4279,7 @@ inline void RenderScalar::RenderGhostTailSpan(uint32_t ghost, VoiceSoA& s,
 }
 
 inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
-                                             float* outputLeft,
-                                             float* outputRight,
+                                             const IndexedJobMix& mix,
                                              uint32_t frameCount,
                                              void* userData) {
     WholeVoiceJobContext* ctx = static_cast<WholeVoiceJobContext*>(userData);
@@ -4138,6 +4294,16 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             const uint32_t handle = renderer->wvSliceHandles_[item];
             if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
                 continue;
+            // Bus mode: this item's channel plane is its mix destination.
+            float* itemLeft = mix.outputLeft;
+            float* itemRight = mix.outputRight;
+            if (mix.busLeft != nullptr) {
+                const uint32_t channel = v.channel[handle];
+                const uint32_t safeChannel =
+                    channel < kChannelCount ? channel : 0u;
+                itemLeft = mix.busLeft[safeChannel];
+                itemRight = mix.busRight[safeChannel];
+            }
             uint32_t start = renderer->wvStartFrame_[handle];
             if (start == UINT32_MAX) start = 0u;
             uint32_t releaseFrame = renderer->wvReleaseFrame_[handle];
@@ -4244,7 +4410,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     }
                     if (renderer->RenderWholeVoiceSegment(
                             v, ctx->voices, handle, ctx->sampleData,
-                            ctx->sampleDataFrames, outputLeft, outputRight,
+                            ctx->sampleDataFrames, itemLeft, itemRight,
                             cursor, stop - cursor, true, jobIndex,
                             vDepth, vRatio, lfoActive)) {
                         break;  // retired; coordinator applies it
@@ -4294,6 +4460,16 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             if (start >= frameCount) continue;
             uint32_t releaseFrame = renderer->wvGhostReleaseFrame_[ghost];
             VoiceSoA& g = renderer->wvGhostState_;
+            // Bus mode: the ghost's snapshot row carries its channel.
+            float* itemLeft = mix.outputLeft;
+            float* itemRight = mix.outputRight;
+            if (mix.busLeft != nullptr) {
+                const uint32_t channel = g.channel[ghost];
+                const uint32_t safeChannel =
+                    channel < kChannelCount ? channel : 0u;
+                itemLeft = mix.busLeft[safeChannel];
+                itemRight = mix.busRight[safeChannel];
+            }
             // Ghosts walk the same channel ops within their own window, so
             // a displaced or killed voice hears the bend/fold events that
             // fired while it was still sounding.  Ops at (or past) the
@@ -4384,7 +4560,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     }
                     if (renderer->RenderWholeVoiceSegment(
                             g, nullptr, ghost, ctx->sampleData,
-                            ctx->sampleDataFrames, outputLeft, outputRight,
+                            ctx->sampleDataFrames, itemLeft, itemRight,
                             cursor, stop - cursor, false, jobIndex,
                             vDepth, vRatio, lfoActive)) {
                         retired = true;
@@ -4435,8 +4611,8 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             renderer->RenderGhostTailSpan(ghost,
                                           renderer->wvTailScratch_[jobIndex],
                                           ctx->sampleData,
-                                          ctx->sampleDataFrames, outputLeft,
-                                          outputRight, death,
+                                          ctx->sampleDataFrames, itemLeft,
+                                          itemRight, death,
                                           frameCount - death);
         }
     }
@@ -4445,7 +4621,8 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
 inline void RenderScalar::RenderWholeVoiceBlock(
     VoiceManager& voices, const int16_t* sampleData,
     uint32_t sampleDataFrames, float* outputLeft, float* outputRight,
-    uint32_t numFrames, uint64_t blockStartFrame) {
+    uint32_t numFrames, uint64_t blockStartFrame,
+    float* const* channelBusLeft, float* const* channelBusRight) {
     const uint32_t activeCount = voices.GetActiveCount();
     ++wholeVoiceBlocks_;
     std::memcpy(wvSliceHandles_, voices.activeList_,
@@ -4471,12 +4648,16 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         if (jobCount >= 2u && workerPool_ != nullptr) {
             dispatched = workerPool_->ExecuteIndexed(
                 jobCount, numFrames, outputLeft, outputRight,
-                &WholeVoiceJobThunk, &ctx);
+                &WholeVoiceJobThunk, &ctx, channelBusLeft, channelBusRight);
         }
         if (!dispatched) {
-            // Serial: one job over every item, mixing directly.
+            // Serial: one job over every item, mixing directly.  In bus
+            // mode the serial job writes the block buses (sequential, so
+            // no per-job planes are needed).
             ctx.jobCount = 1u;
-            WholeVoiceJobThunk(0u, outputLeft, outputRight, numFrames, &ctx);
+            IndexedJobMix serialMix{outputLeft, outputRight,
+                                    channelBusLeft, channelBusRight};
+            WholeVoiceJobThunk(0u, serialMix, numFrames, &ctx);
         }
 #if defined(_MSC_VER)
         wvJobCycles_ += __rdtsc() - wvJobBegin;
@@ -4540,11 +4721,20 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         (std::min)(voiceCapacity, static_cast<uint32_t>(kStealTailReserve));
     for (uint32_t slot = 0u; slot < tailCapacity; ++slot) {
         const uint32_t killFrame = wvTailKillFrame_[slot];
+        float* tailOutLeft = outputLeft;
+        float* tailOutRight = outputRight;
+        if (channelBusLeft != nullptr) {
+            const uint32_t channel = voices.v.stealTailChannel[slot];
+            const uint32_t safeChannel =
+                channel < kChannelCount ? channel : 0u;
+            tailOutLeft = channelBusLeft[safeChannel];
+            tailOutRight = channelBusRight[safeChannel];
+        }
         if (voices.v.stealTailFramesRemaining[slot] == 0u) {
             if (killFrame == UINT32_MAX) continue;
             RenderStealTailSpan(voices.v, slot, sampleData, nullptr,
                                 sampleDataFrames,
-                                outputLeft, outputRight, 0u, killFrame);
+                                tailOutLeft, tailOutRight, 0u, killFrame);
             continue;
         }
         // A live tail never carries a kill frame; the min() only defends
@@ -4553,7 +4743,7 @@ inline void RenderScalar::RenderWholeVoiceBlock(
             ? numFrames : (std::min)(killFrame, numFrames);
         RenderStealTailSpan(voices.v, slot, sampleData, nullptr,
                             sampleDataFrames,
-                            outputLeft, outputRight, 0u, tailFrames);
+                            tailOutLeft, tailOutRight, 0u, tailFrames);
         voices.RefreshStealTail(static_cast<VoiceHandle>(slot));
     }
 
@@ -4722,7 +4912,8 @@ inline void RenderScalar::RenderBlockSparseRange(
     float* outputLeft, float* outputRight, uint32_t rangeStart,
     uint32_t rangeEnd, const RenderEvent* events, uint32_t eventCount,
     uint32_t eventIndexBegin, bool vibratoActive, bool correctnessMode,
-    uint64_t blockStartFrame) {
+    uint64_t blockStartFrame, float* const* channelBusLeft,
+    float* const* channelBusRight) {
     VoiceSoA& v = voices.v;
     const RenderKernelSet& kernelSet = *kernelSet_;
     const ChannelParamsSnapshot* channelParams = channels.GetParams();
@@ -4827,7 +5018,8 @@ inline void RenderScalar::RenderBlockSparseRange(
                 outputRight,
                 cursor, spanFrames, voices.GetMaxVoices(), classChanges_,
                 &classChangeCount, voices.activePosition_, retirements_,
-                &retireCount, 0u, 0.0f, 0.0f, 0u};
+                &retireCount, 0u, 0.0f, 0.0f, 0u,
+                channelBusLeft, channelBusRight};
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
             if (coverageProfilingEnabled_ &&
                 renderClass == VoiceRenderClass::SustainedLoop) {
@@ -4880,6 +5072,19 @@ inline void RenderScalar::RenderBlockSparseRange(
                     if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free))
                         continue;
 
+                    // Bus mode: the voice's channel plane is its mix
+                    // destination (block-absolute cursor, block-length
+                    // planes).
+                    float* voiceOutLeft = outputLeft;
+                    float* voiceOutRight = outputRight;
+                    if (channelBusLeft != nullptr) {
+                        const uint32_t channel = v.channel[idx];
+                        const uint32_t safeChannel =
+                            channel < kChannelCount ? channel : 0u;
+                        voiceOutLeft = channelBusLeft[safeChannel];
+                        voiceOutRight = channelBusRight[safeChannel];
+                    }
+
                     uint32_t retiredAt = UINT32_MAX;
                     const bool cleanPrimary =
                         v.stealFadeInFramesRemaining[idx] == 0u;
@@ -4887,16 +5092,16 @@ inline void RenderScalar::RenderBlockSparseRange(
                         renderClass == VoiceRenderClass::SustainedLoop) {
                         retiredAt = ScalarRenderSustainedLoop(
                             v, idx, sampleData, hilbertData, sampleDataFrames,
-                            outputLeft, outputRight, cursor, spanFrames);
+                            voiceOutLeft, voiceOutRight, cursor, spanFrames);
                     } else if (cleanPrimary &&
                                renderClass == VoiceRenderClass::SustainedOneShot) {
                         retiredAt = ScalarRenderSustainedOneShot(
                             v, idx, sampleData, hilbertData, sampleDataFrames,
-                            outputLeft, outputRight, cursor, spanFrames);
+                            voiceOutLeft, voiceOutRight, cursor, spanFrames);
                     } else {
                         retiredAt = RenderPrimaryVoiceSpan(
-                            v, idx, sampleData, hilbertData, sampleDataFrames, outputLeft,
-                            outputRight, cursor, spanFrames, spanFrames);
+                            v, idx, sampleData, hilbertData, sampleDataFrames, voiceOutLeft,
+                            voiceOutRight, cursor, spanFrames, spanFrames);
                     }
 
                     if (retiredAt != UINT32_MAX) {
@@ -4917,18 +5122,36 @@ inline void RenderScalar::RenderBlockSparseRange(
         if (denseTails) {
             for (uint32_t idx = 0; idx < tailCapacity; ++idx) {
                 if (v.stealTailFramesRemaining[idx] == 0u) continue;
+                float* tailOutLeft = outputLeft;
+                float* tailOutRight = outputRight;
+                if (channelBusLeft != nullptr) {
+                    const uint32_t channel = v.stealTailChannel[idx];
+                    const uint32_t safeChannel =
+                        channel < kChannelCount ? channel : 0u;
+                    tailOutLeft = channelBusLeft[safeChannel];
+                    tailOutRight = channelBusRight[safeChannel];
+                }
                 RenderStealTailSpan(v, idx, sampleData, hilbertData,
                                     sampleDataFrames,
-                                    outputLeft, outputRight, cursor,
+                                    tailOutLeft, tailOutRight, cursor,
                                     tailFrameCounts_[idx]);
                 voices.RefreshStealTail(static_cast<VoiceHandle>(idx));
             }
         } else {
             for (uint32_t position = tailCount; position > 0u; --position) {
                 const uint32_t idx = tailHandles[position - 1u];
+                float* tailOutLeft = outputLeft;
+                float* tailOutRight = outputRight;
+                if (channelBusLeft != nullptr) {
+                    const uint32_t channel = v.stealTailChannel[idx];
+                    const uint32_t safeChannel =
+                        channel < kChannelCount ? channel : 0u;
+                    tailOutLeft = channelBusLeft[safeChannel];
+                    tailOutRight = channelBusRight[safeChannel];
+                }
                 RenderStealTailSpan(v, idx, sampleData, hilbertData,
                                     sampleDataFrames,
-                                    outputLeft, outputRight, cursor,
+                                    tailOutLeft, tailOutRight, cursor,
                                     tailFrameCounts_[idx]);
                 voices.RefreshStealTail(static_cast<VoiceHandle>(idx));
             }

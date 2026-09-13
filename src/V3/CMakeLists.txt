@@ -728,6 +728,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/PageLiveRecording.cpp
         Configurator/PageReverb.cpp
         Configurator/PageLimiter.cpp
+        Configurator/PageChannelLimiter.cpp
         Configurator/PageDiagnostics.cpp
         Configurator/PageAdvanced.cpp
         Configurator/PageAbout.cpp

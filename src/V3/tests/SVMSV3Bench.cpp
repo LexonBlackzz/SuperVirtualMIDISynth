@@ -1,5 +1,6 @@
 #include <cmath>
 #include "SVMSRenderScalar.h"
+#include "SVMSChannelLimiter.h"
 #include "SVMSSoundFont.h"
 
 #include <windows.h>
@@ -85,6 +86,7 @@ struct Options {
     Workload workload = Workload::Sustained;
     bool enforce = false;
     bool reference = false;
+    bool channelLimiter = false;  // route the block through 16 channel buses
     bool breakdown = false;
     bool coverageProfile = false;
     bool transactionalLaunch = true;
@@ -190,6 +192,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.enforce = true;
         } else if (std::strcmp(argv[i], "--reference") == 0) {
             options.reference = true;
+        } else if (std::strcmp(argv[i], "--channel-limiter") == 0) {
+            options.channelLimiter = true;
         } else if (std::strcmp(argv[i], "--breakdown") == 0) {
             options.breakdown = true;
         } else if (std::strcmp(argv[i], "--coverage") == 0) {
@@ -858,6 +862,27 @@ int main(int argc, char** argv) {
 
     std::vector<float> left(options.frames);
     std::vector<float> right(options.frames);
+    // Per-MIDI-channel bus mode (SVMSChannelLimiter.h): voices mix into 16
+    // channel planes, the limiter stages each bus, and the sum lands in the
+    // master mix.  Measures the feature's overhead end to end.
+    std::vector<float> channelBusPlanes;
+    float* channelBusLeft[16];
+    float* channelBusRight[16];
+    if (options.channelLimiter) {
+        channelBusPlanes.assign(
+            static_cast<size_t>(options.frames) * 16u * 2u, 0.0f);
+        for (uint32_t c = 0; c < 16u; ++c) {
+            channelBusLeft[c] =
+                channelBusPlanes.data() + static_cast<size_t>(c) * 2u *
+                                              options.frames;
+            channelBusRight[c] = channelBusLeft[c] + options.frames;
+        }
+    }
+    svms::ChannelLimiterState channelLimiter;
+    if (options.channelLimiter) {
+        channelLimiter.SetLiveTargets(true, 0.5011872336272722f, 150.0f,
+                                      44100u);
+    }
     LARGE_INTEGER frequency{};
     QueryPerformanceFrequency(&frequency);
     const uint32_t callbacksPerSecond =
@@ -880,12 +905,21 @@ int main(int argc, char** argv) {
                 *voices, channels, samples.data(), sampleFrames,
                 left.data(), right.data(), options.frames, cfg,
                 events.empty() ? nullptr : events.data(),
-                static_cast<uint32_t>(events.size()), true, absoluteFrame);
+                static_cast<uint32_t>(events.size()), true, absoluteFrame,
+                options.channelLimiter ? channelBusLeft : nullptr,
+                options.channelLimiter ? channelBusRight : nullptr);
         } else {
             renderer->RenderBlock(*voices, channels, samples.data(), sampleFrames,
                                   left.data(), right.data(), options.frames, cfg,
                                   events.empty() ? nullptr : events.data(),
-                                  static_cast<uint32_t>(events.size()), true, absoluteFrame);
+                                  static_cast<uint32_t>(events.size()), true, absoluteFrame,
+                                  options.channelLimiter ? channelBusLeft : nullptr,
+                                  options.channelLimiter ? channelBusRight : nullptr);
+        }
+        if (options.channelLimiter) {
+            channelLimiter.ProcessAndSum(channelBusLeft, channelBusRight,
+                                         left.data(), right.data(),
+                                         options.frames);
         }
         if (gCollectBreakdown) {
             const uint64_t renderEnd = __rdtsc();

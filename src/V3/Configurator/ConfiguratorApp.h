@@ -32,6 +32,7 @@ enum class Page {
     LiveRecording,
     Reverb,
     Limiter,
+    ChannelLimiter,
     Diagnostics,
     Advanced,
     About,
@@ -62,6 +63,8 @@ public:
 
     void SetLiveFloat(svms::RLCommandType type, float value);
     void SetLiveBool(svms::RLCommandType type, bool value);
+    void SetLiveChannelLimiter(bool enabled, float threshold, float releaseMs);
+    void SendPendingChannelLimiter();
     void SetLiveMaxVoices(uint32_t value);
     void SetLiveLimiterAlgorithm(uint32_t value);
 
@@ -125,6 +128,10 @@ private:
 
     svms::RuntimeLiveStateV2 workingLive_{};
     uint32_t pendingLiveMask_ = 0;
+    // Coalesced SetChannelLimiter command (dedicated wire command because
+    // RuntimeLiveStateV2 is ABI-pinned without channel limiter fields).
+    bool pendingChannelLimiter_ = false;
+    float pendingChannelLimiterValues_[3] = {};
     float rlFlushTimer_ = 0.0f;
     // Live controls are coalesced only across extremely fast UI frames. At
     // 60/120/144 Hz this means a change is eligible immediately on the frame

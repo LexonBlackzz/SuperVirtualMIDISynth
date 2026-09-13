@@ -62,6 +62,7 @@ constexpr uint32_t kNoteOnCollapseDefaultThreshold = 32u;
 #include "SVMSDiagWindow.h"
 #include "SVMSPostFilter.h"
 #include "SVMSLimiter.h"
+#include "SVMSChannelLimiter.h"
 #include "SVMSRuntimeLink.h"
 #include "SVMSBuildInfo.h"
 #include "SVMSNativeOffline.h"
@@ -2488,6 +2489,20 @@ private:
     float* leftBuffer;
     float* rightBuffer;
     uint32_t bufferCapacity;
+    // Per-MIDI-channel limiter (opt-in, default off): 16 stereo bus planes
+    // RenderBlock mixes into when enabled, then ChannelLimiterState limits
+    // each bus and sums them into leftBuffer/rightBuffer.  Allocated with
+    // the mix buffers so the audio thread never allocates.
+    float* channelBusPlanes;
+    float* channelBusLeftTable[kChannelCount];
+    float* channelBusRightTable[kChannelCount];
+    uint32_t channelBusCapacity;
+    ChannelLimiterState channelLimiter;
+    // Bus planes for the per-MIDI-channel limiter; sized to the mix-buffer
+    // capacity, allocated outside the audio callback alongside the mix
+    // buffers, and rebuilt wherever those are rebuilt.
+    bool AllocateChannelBuses(uint32_t capacity);
+    void FreeChannelBuses();
     PostHighPass3Hz postHighPass;
     ReverbState reverb;
     LimiterState limiter;
@@ -2766,6 +2781,48 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         }
 
         // Publish the completed copy (even sequence, release store).
+        RLV2_MemBarrier();
+        liveMailboxSeq_.store(even + 2u, std::memory_order_release);
+        lastPublishedMailboxSeq_ = even + 2u;
+        return svms::RLResult::Ok;
+    }
+
+    case RT::SetChannelLimiter: {
+        // Payload: "enabled;threshold;releaseMs" in the command text area
+        // (the documented extension area for new commands).  Values are
+        // clamped, then written to the mailbox under RLGroupChannelLimiter
+        // seqlock discipline; the audio thread adopts at the next block.
+        const char* payload = cmd.resultText;
+        if (!payload || !payload[0]) {
+            strncpy_s(resultText, kText, "empty channel limiter payload",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        unsigned enabledValue = 0u;
+        float thresholdValue = 0.0f;
+        float releaseValue = 0.0f;
+        if (sscanf_s(payload, "%u;%f;%f", &enabledValue, &thresholdValue,
+                     &releaseValue) != 3) {
+            strncpy_s(resultText, kText, "malformed channel limiter payload",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        if (thresholdValue <= 0.0f || !std::isfinite(thresholdValue) ||
+            !std::isfinite(releaseValue)) {
+            strncpy_s(resultText, kText, "non-finite parameter", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        thresholdValue = (std::max)(0.0316227766f,
+                                    (std::min)(1.0f, thresholdValue));
+        releaseValue = (std::max)(20.0f, (std::min)(1000.0f, releaseValue));
+
+        LiveConfigMailbox* mb = &liveMailbox_;
+        const uint32_t even = liveMailboxSeq_.load(std::memory_order_relaxed);
+        liveMailboxSeq_.store(even | 1u, std::memory_order_relaxed);
+        RLV2_MemBarrier();
+        mb->channelLimiterEnabled = enabledValue != 0u ? 1u : 0u;
+        mb->channelLimiterThreshold = thresholdValue;
+        mb->channelLimiterReleaseMs = releaseValue;
         RLV2_MemBarrier();
         liveMailboxSeq_.store(even + 2u, std::memory_order_release);
         lastPublishedMailboxSeq_ = even + 2u;
@@ -3199,6 +3256,17 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
             as.limiterOutputPeakRBits.load(std::memory_order_relaxed));
         snap.limiterGainReductionDb = U32BitsToFloat(
             as.limiterGainReductionDbBits.load(std::memory_order_relaxed));
+        snap.channelLimiterEnabled =
+            as.channelLimiterEnabled.load(std::memory_order_relaxed);
+        for (uint32_t clChannel = 0u; clChannel < kRLV2ChannelCount;
+             ++clChannel) {
+            snap.channelLimiterGainReductionDb[clChannel] = U32BitsToFloat(
+                as.channelLimiterGainReductionDbBits[clChannel].load(
+                    std::memory_order_relaxed));
+            snap.channelLimiterInputPeak[clChannel] = U32BitsToFloat(
+                as.channelLimiterInputPeakBits[clChannel].load(
+                    std::memory_order_relaxed));
+        }
         snap.schedulerPercent = U32BitsToFloat(
             as.schedulerPercentBits.load(std::memory_order_relaxed));
         snap.eventDispatchPercent = U32BitsToFloat(
@@ -3460,6 +3528,7 @@ Driver::Driver()
       sampleStoreCount(0), sampleDataFrames(0),
       qpcFreq(1),
       leftBuffer(nullptr), rightBuffer(nullptr), bufferCapacity(0),
+      channelBusPlanes(nullptr), channelBusCapacity(0),
       eventBuffer(nullptr), eventBufferCapacity_(0u),
       eventScheduler_(1u),
       overflowMode_(EventOverflowMode::PriorityVelocity), correctnessMode_(false),
@@ -3661,6 +3730,7 @@ bool Driver::Initialize() {
     postHighPass.Initialize(sampleRate);
     reverb.Configure(sampleRate, cfg);
     limiter.Configure(sampleRate, cfg);
+    channelLimiter.Configure(sampleRate, cfg);
     {
         bool isAsio = false;
 #if !defined(SVMS_XP_COMPAT)
@@ -3675,6 +3745,10 @@ bool Driver::Initialize() {
     rightBuffer = static_cast<float*>(_aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
     if (!leftBuffer || !rightBuffer) {
         LOG("FAILED: Could not allocate render buffers");
+        return false;
+    }
+    if (!AllocateChannelBuses(bufferCapacity)) {
+        LOG("FAILED: Could not allocate per-channel limiter buses");
         return false;
     }
 
@@ -3968,6 +4042,7 @@ void Driver::Shutdown() {
     _aligned_free(leftBuffer); leftBuffer = nullptr;
     _aligned_free(rightBuffer); rightBuffer = nullptr;
     bufferCapacity = 0;
+    FreeChannelBuses();
 
     DestroyAllSoundFontBundles();
 
@@ -3975,6 +4050,38 @@ void Driver::Shutdown() {
         DiagWindow_Destroy();
 
     initialized = false;
+}
+
+// ── Per-MIDI-channel limiter bus planes ──────────────────────────────────
+// 16 stereo planes sized to the mix-buffer capacity, plus two pointer
+// tables handed to RenderBlock/ChannelLimiterState.  Called from non-audio
+// init/rebuild paths only, so the callback never allocates.
+bool Driver::AllocateChannelBuses(uint32_t capacity) {
+    if (capacity == 0u) return false;
+    if (channelBusPlanes && channelBusCapacity >= capacity) return true;
+    FreeChannelBuses();
+    const size_t planeFloats =
+        static_cast<size_t>(capacity) * kChannelCount * 2u;
+    channelBusPlanes = static_cast<float*>(
+        _aligned_malloc(planeFloats * sizeof(float), kMixBufferAlign));
+    if (!channelBusPlanes) {
+        channelBusCapacity = 0u;
+        return false;
+    }
+    for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+        float* plane = channelBusPlanes +
+            static_cast<size_t>(channel) * 2u * capacity;
+        channelBusLeftTable[channel] = plane;
+        channelBusRightTable[channel] = plane + capacity;
+    }
+    channelBusCapacity = capacity;
+    return true;
+}
+
+void Driver::FreeChannelBuses() {
+    _aligned_free(channelBusPlanes);
+    channelBusPlanes = nullptr;
+    channelBusCapacity = 0u;
 }
 
 bool Driver::LoadConfiguredSoundFont() {
@@ -5864,11 +5971,13 @@ void Driver::RebuildAudioOutput() {
             _aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
         rightBuffer = static_cast<float*>(
             _aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
+        AllocateChannelBuses(bufferCapacity);
         LOG("Rebuild mix buffers resized: capacity=%u", bufferCapacity);
     }
     postHighPass.Initialize(sampleRate);
     reverb.Configure(sampleRate, engineConfig_);
     limiter.Configure(sampleRate, engineConfig_);
+    channelLimiter.Configure(sampleRate, engineConfig_);
     if (voiceManager) voiceManager->SetSampleRate(sampleRate);
     {
         bool isAsio = replacementIsAsio;
@@ -5913,6 +6022,7 @@ void Driver::ApplyPendingAudioFormat() {
                 _aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
             rightBuffer = static_cast<float*>(
                 _aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
+            AllocateChannelBuses(bufferCapacity);
             LOG("ASIO buffer resized: capacity=%u", bufferCapacity);
         }
     }
@@ -5921,6 +6031,7 @@ void Driver::ApplyPendingAudioFormat() {
         postHighPass.Initialize(sampleRate);
         reverb.Configure(sampleRate, engineConfig_);
         limiter.Configure(sampleRate, engineConfig_);
+    channelLimiter.Configure(sampleRate, engineConfig_);
         LOG("ASIO sample rate changed: %u", sampleRate);
         // Active voices carry envelope/phase state in the old rate's units;
         // they retire naturally within a second or two. New configuration
@@ -6012,6 +6123,18 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->limiter.attackCoeff       = mb.limiterAttackCoeff;
         self->limiter.releaseCoeff      = mb.limiterReleaseCoeff;
 
+        // Per-MIDI-channel limiter: glide targets only (threshold glides
+        // per frame inside ProcessAndSum).  Re-enable clears stale
+        // envelope state from a previous session.
+        {
+            const bool wasEnabled = self->channelLimiter.enabled;
+            self->channelLimiter.SetLiveTargets(
+                mb.channelLimiterEnabled, mb.channelLimiterThreshold,
+                mb.channelLimiterReleaseMs, self->sampleRate);
+            if (self->channelLimiter.enabled && !wasEnabled)
+                self->channelLimiter.Reset();
+        }
+
         // Per-voice phase rotation mode (0 = Coherent bit-exact bypass).
         self->voiceManager->SetPhaseRotationMode(mb.phaseRotationMode);
 
@@ -6056,6 +6179,19 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     float* rightBuf = self->rightBuffer;
     std::memset(leftBuf, 0, numFrames * sizeof(float));
     std::memset(rightBuf, 0, numFrames * sizeof(float));
+    // Per-MIDI-channel limiter (purely post-render): when enabled the block
+    // renders into the 16 channel buses, which the limiter then limits per
+    // channel and sums into the master mix.  Nothing upstream of the mix
+    // changes; disabled = the direct master-mix path, bit-identical.
+    const bool channelLimiterActive =
+        self->channelLimiter.enabled &&
+        self->channelBusPlanes != nullptr &&
+        self->channelBusCapacity >= numFrames;
+    if (channelLimiterActive) {
+        std::memset(self->channelBusPlanes, 0,
+            static_cast<size_t>(numFrames) * kChannelCount * 2u *
+                sizeof(float));
+    }
 
     // ── Diagnostic: voice retire stats ──────────────────────────────
 
@@ -6503,7 +6639,16 @@ const uint32_t importedPages = self->useEventCompiler_
         render->RenderBlock(*vm, *cc, sd, hd, self->sampleDataFrames,
                             leftBuf, rightBuf, numFrames, *snap,
                             evtBuf, evCount, self->correctnessMode_,
-                            static_cast<uint64_t>(self->virtualRenderSample_));
+                            static_cast<uint64_t>(self->virtualRenderSample_),
+                            channelLimiterActive
+                                ? self->channelBusLeftTable : nullptr,
+                            channelLimiterActive
+                                ? self->channelBusRightTable : nullptr);
+    }
+    if (channelLimiterActive) {
+        self->channelLimiter.ProcessAndSum(
+            self->channelBusLeftTable, self->channelBusRightTable,
+            leftBuf, rightBuf, numFrames);
     }
     const uint64_t profileRenderEnd = profileCallback ? __rdtsc() : 0u;
 
@@ -6899,6 +7044,18 @@ const uint32_t importedPages = self->useEventCompiler_
         as.limiterGainReductionDbBits.store(
             FloatToU32Bits(self->limiter.gainReductionDb),
             std::memory_order_relaxed);
+        as.channelLimiterEnabled.store(self->channelLimiter.enabled ? 1u : 0u,
+                                       std::memory_order_relaxed);
+        for (uint32_t clChannel = 0u; clChannel < kChannelCount; ++clChannel) {
+            as.channelLimiterGainReductionDbBits[clChannel].store(
+                FloatToU32Bits(
+                    self->channelLimiter.channel[clChannel].gainReductionDb),
+                std::memory_order_relaxed);
+            as.channelLimiterInputPeakBits[clChannel].store(
+                FloatToU32Bits(
+                    self->channelLimiter.channel[clChannel].inputPeak),
+                std::memory_order_relaxed);
+        }
         as.schedulerPercentBits.store(FloatToU32Bits(s_schedulerSmoothed),
                                       std::memory_order_relaxed);
         as.eventDispatchPercentBits.store(FloatToU32Bits(s_dispatchSmoothed),

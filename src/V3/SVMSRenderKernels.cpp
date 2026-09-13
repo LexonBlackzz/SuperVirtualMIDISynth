@@ -165,12 +165,25 @@ void RenderSustainedLoopShortBatchFixed(
     VoiceSoA& v, const uint32_t* handles, uint32_t handleCount,
     const int16_t* sampleData, const int16_t* hilbertData,
     float* outputLeft, float* outputRight,
+    float* const* channelBusLeft, float* const* channelBusRight,
     uint32_t frameStart) {
     float sumsLeft[FrameCount]{};
     float sumsRight[FrameCount]{};
+    // Bus mode writes each voice straight into its channel plane; the
+    // per-voice branch is loop-invariant, so the legacy sums path (bit-exact
+    // accumulation order) and the bus path share the sample math.
+    float* dstLeft = sumsLeft;
+    float* dstRight = sumsRight;
 
     for (uint32_t position = 0; position < handleCount; ++position) {
         const uint32_t idx = handles[position];
+        if (channelBusLeft != nullptr) {
+            const uint32_t channel = v.channel[idx];
+            const uint32_t safeChannel = channel < kChannelCount
+                                             ? channel : 0u;
+            dstLeft = channelBusLeft[safeChannel] + frameStart;
+            dstRight = channelBusRight[safeChannel] + frameStart;
+        }
         float phase = (std::max)(0.0f, v.phases[idx]);
         const float phaseStep = v.phaseIncs[idx];
         const uint32_t loopStartOffset = v.relLoopS[idx];
@@ -195,8 +208,8 @@ void RenderSustainedLoopShortBatchFixed(
             if (rot)
                 sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                            baseOffset, nextOffset, fraction);
-            sumsLeft[frame] += sample * gainLeft;
-            sumsRight[frame] += sample * gainRight;
+            dstLeft[frame] += sample * gainLeft;
+            dstRight[frame] += sample * gainRight;
             phase += phaseStep;
             if (phase >= loopEnd) {
                 float overflow = phase - loopEnd;
@@ -208,9 +221,11 @@ void RenderSustainedLoopShortBatchFixed(
         v.phases[idx] = phase;
     }
 
-    for (uint32_t frame = 0; frame < FrameCount; ++frame) {
-        outputLeft[frameStart + frame] += sumsLeft[frame];
-        outputRight[frameStart + frame] += sumsRight[frame];
+    if (channelBusLeft == nullptr) {
+        for (uint32_t frame = 0; frame < FrameCount; ++frame) {
+            outputLeft[frameStart + frame] += sumsLeft[frame];
+            outputRight[frameStart + frame] += sumsRight[frame];
+        }
     }
 }
 
@@ -218,27 +233,32 @@ void RenderSustainedLoopShortBatch(
     VoiceSoA& v, const uint32_t* handles, uint32_t handleCount,
     const int16_t* sampleData, const int16_t* hilbertData,
     float* outputLeft, float* outputRight,
+    float* const* channelBusLeft, float* const* channelBusRight,
     uint32_t frameStart, uint32_t frameCount) {
     switch (frameCount) {
         case 1u:
             RenderSustainedLoopShortBatchFixed<1u>(
                 v, handles, handleCount, sampleData, hilbertData,
-                outputLeft, outputRight, frameStart);
+                outputLeft, outputRight, channelBusLeft, channelBusRight,
+                frameStart);
             break;
         case 2u:
             RenderSustainedLoopShortBatchFixed<2u>(
                 v, handles, handleCount, sampleData, hilbertData,
-                outputLeft, outputRight, frameStart);
+                outputLeft, outputRight, channelBusLeft, channelBusRight,
+                frameStart);
             break;
         case 3u:
             RenderSustainedLoopShortBatchFixed<3u>(
                 v, handles, handleCount, sampleData, hilbertData,
-                outputLeft, outputRight, frameStart);
+                outputLeft, outputRight, channelBusLeft, channelBusRight,
+                frameStart);
             break;
         case 4u:
             RenderSustainedLoopShortBatchFixed<4u>(
                 v, handles, handleCount, sampleData, hilbertData,
-                outputLeft, outputRight, frameStart);
+                outputLeft, outputRight, channelBusLeft, channelBusRight,
+                frameStart);
             break;
         default:
             break;
@@ -253,16 +273,20 @@ bool RenderSustainedLoopClassKernel(const RenderSpanContext& context,
         RenderSustainedLoopShortBatch(
             voices, handles, handleCount, context.sampleData,
             context.hilbertData,
-            context.outputLeft, context.outputRight, context.frameStart,
-            context.frameCount);
+            context.outputLeft, context.outputRight,
+            context.channelBusLeft, context.channelBusRight,
+            context.frameStart, context.frameCount);
         return true;
     }
     for (uint32_t position = 0; position < handleCount; ++position) {
+        const uint32_t handle = handles[position];
+        const RenderSpanContext vc =
+            SelectVoiceDestination(context, voices.channel[handle]);
         RenderSustainedLoopSpan(
-            voices, handles[position], context.sampleData,
-            context.hilbertData,
-            context.sampleDataFrames, context.outputLeft, context.outputRight,
-            context.frameStart, context.frameCount);
+            voices, handle, vc.sampleData,
+            vc.hilbertData,
+            vc.sampleDataFrames, vc.outputLeft, vc.outputRight,
+            vc.frameStart, vc.frameCount);
     }
     return true;
 }
@@ -272,10 +296,24 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
                                    const uint32_t* handles,
                                    uint32_t handleCount) {
     VoiceSoA& v = *c.voices;
-    float* outL = c.outputLeft + c.frameStart;
-    float* outR = c.outputRight + c.frameStart;
+    float* const legacyOutL = c.outputLeft + c.frameStart;
+    float* const legacyOutR = c.outputRight + c.frameStart;
     for (uint32_t position = 0; position < handleCount; ++position) {
         const uint32_t idx = handles[position];
+        // Per-voice destination: channel bus plane in bus mode, shared mix
+        // otherwise (same pointer value the hoisted legacy code used).
+        float* outL;
+        float* outR;
+        if (c.channelBusLeft != nullptr) {
+            const uint32_t channel = v.channel[idx];
+            const uint32_t safeChannel = channel < kChannelCount
+                                             ? channel : 0u;
+            outL = c.channelBusLeft[safeChannel] + c.frameStart;
+            outR = c.channelBusRight[safeChannel] + c.frameStart;
+        } else {
+            outL = legacyOutL;
+            outR = legacyOutR;
+        }
         float phase = (std::max)(0.0f, v.phases[idx]);
         float gain = v.currentGain[idx];
         uint8_t stage = v.envelopeStage[idx];
@@ -469,11 +507,13 @@ void ScalarRenderSustainedLoopShortBatch(
     VoiceSoA& voices, const uint32_t* handles, uint32_t handleCount,
     const int16_t* sampleData, const int16_t* hilbertData,
     uint32_t sampleDataFrames, float* outputLeft,
-    float* outputRight, uint32_t frameStart, uint32_t frameCount) {
+    float* outputRight, uint32_t frameStart, uint32_t frameCount,
+    float* const* channelBusLeft, float* const* channelBusRight) {
     (void)sampleDataFrames;
     RenderSustainedLoopShortBatch(
         voices, handles, handleCount, sampleData, hilbertData,
-        outputLeft, outputRight, frameStart, frameCount);
+        outputLeft, outputRight, channelBusLeft, channelBusRight,
+        frameStart, frameCount);
 }
 
 bool ScalarRenderTransientLoopClass(const RenderSpanContext& c,

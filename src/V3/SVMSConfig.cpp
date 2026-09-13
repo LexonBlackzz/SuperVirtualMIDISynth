@@ -245,6 +245,11 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"attack_ms", cfg.limiterAttackMs},
             {"release_ms", cfg.limiterReleaseMs}
         }},
+        {"channel_limiter", {
+            {"enabled", cfg.channelLimiterEnabled},
+            {"threshold", cfg.channelLimiterThreshold},
+            {"release_ms", cfg.channelLimiterReleaseMs}
+        }},
         {"reverb", {
             {"enabled", cfg.enableReverb},
 
@@ -623,6 +628,16 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "release_ms", cfg.limiterReleaseMs, 1.0f, 5000.0f))
             AppendWarning(cfg.configWarning, "limiter.release_ms");
     }
+    if (auto it = root.find("channel_limiter"); it != root.end() && it->is_object()) {
+        if (!ReadBool(*it, "enabled", cfg.channelLimiterEnabled))
+            AppendWarning(cfg.configWarning, "channel_limiter.enabled");
+        if (!ReadValue(*it, "threshold", cfg.channelLimiterThreshold,
+                       0.0316227766f, 1.0f))
+            AppendWarning(cfg.configWarning, "channel_limiter.threshold");
+        if (!ReadValue(*it, "release_ms", cfg.channelLimiterReleaseMs,
+                       20.0f, 1000.0f))
+            AppendWarning(cfg.configWarning, "channel_limiter.release_ms");
+    }
     if (auto it = root.find("reverb"); it != root.end() && it->is_object()) {
             if (!ReadBool(*it, "enabled", cfg.enableReverb))
                 AppendWarning(cfg.configWarning, "reverb.enabled");
@@ -793,6 +808,9 @@ EngineConfig EngineConfig::Default() {
     cfg.limiterLookaheadMs = 3.0f;
     cfg.limiterAttackMs = 0.5f;
     cfg.limiterReleaseMs = 100.0f;
+    cfg.channelLimiterEnabled = false;  // opt-in: purely post-render stage
+    cfg.channelLimiterThreshold = 0.5011872336272722f;  // -6 dBFS
+    cfg.channelLimiterReleaseMs = 150.0f;
     cfg.velocityCurve = 1.0f;
     cfg.velocityFloor = 0.0f;
     cfg.velocityIgnoreBelow = 0;
@@ -942,6 +960,10 @@ bool EngineConfig::Validate() const {
             limiterLookaheadMs >= 0.0f && limiterLookaheadMs <= 20.0f &&
             limiterAttackMs >= 0.01f && limiterAttackMs <= 100.0f &&
             limiterReleaseMs >= 1.0f && limiterReleaseMs <= 5000.0f &&
+            channelLimiterThreshold >= 0.0316227766f &&
+            channelLimiterThreshold <= 1.0f &&
+            channelLimiterReleaseMs >= 20.0f &&
+            channelLimiterReleaseMs <= 1000.0f &&
             reverbMix >= 0.0f && reverbMix <= 1.0f &&
             reverbRoomSize >= 0.0f && reverbRoomSize <= 1.0f &&
             reverbDecay >= 0.0f && reverbDecay <= 1.0f &&

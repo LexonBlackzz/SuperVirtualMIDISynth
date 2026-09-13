@@ -143,6 +143,19 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
                           const uint32_t* handles, uint32_t handleCount,
                           const uint32_t* frameCounts) {
     if (c.frameCount == 0u || c.sampleData == nullptr) return;
+    // Channel buses: the voice-batched path below mixes eight lanes into
+    // one frame position and cannot scatter into per-channel planes; bus
+    // batches therefore take the per-voice scalar tail with per-voice
+    // plane selection.
+    if (c.channelBusLeft != nullptr) {
+        for (uint32_t i = 0; i < handleCount; ++i) {
+            const RenderSpanContext vc = SelectVoiceDestination(
+                c, c.voices->channel[handles[i]]);
+            RenderTailScalar(vc, handles[i], frameCounts[handles[i]]);
+        }
+        _mm256_zeroupper();
+        return;
+    }
     if (c.frameCount > 4u) {
         for (uint32_t i = 0; i < handleCount; ++i)
             RenderTailScalar(c, handles[i], frameCounts[handles[i]]);
@@ -686,6 +699,13 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
     // take over rather than carrying filter state through every release
     // sub-path.
     if (context.voices->rot != nullptr) return false;
+    // Channel buses: the voice-batched short kernel mixes eight voices (up
+    // to eight different MIDI channels) into the same frame position, which
+    // cannot scatter into per-channel planes. Refuse (no state mutated —
+    // validation has not run) and let the caller's per-voice scalar fallback
+    // select planes.
+    if (context.channelBusLeft != nullptr && context.frameCount <= 7u)
+        return false;
     if (context.frameCount <= 4u) {
         RenderReleaseLoopShortAVX2(context, handles, handleCount);
         _mm256_zeroupper();
@@ -693,8 +713,10 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
     }
     for (uint32_t position = 0u; position < handleCount; ++position) {
         const uint32_t handle = handles[position];
+        const RenderSpanContext vc = SelectVoiceDestination(
+            context, context.voices->channel[handle]);
         const uint32_t retiredAt = RenderReleaseLoopFramesAVX2(
-            context, handle);
+            vc, handle);
         if (retiredAt != UINT32_MAX)
             RecordRetirement(context, handle, retiredAt);
     }
@@ -1050,6 +1072,11 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
     // Per-voice phase rotation: refuse and let the (rotation-hooked) scalar
     // span kernels take over, same policy as the release kernel.
     if (context.voices->rot != nullptr) return false;
+    // Channel buses: the voice-batched short kernel cannot scatter into
+    // per-channel planes (see RenderReleaseLoopAVX2). Refuse before any
+    // validation side effect.
+    if (context.channelBusLeft != nullptr && context.frameCount <= 7u)
+        return false;
     VoiceSoA& v = *context.voices;
     // Whole-batch eligibility: any ineligible voice falls back to the
     // scalar path for the entire class.
@@ -1071,8 +1098,11 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
         _mm256_zeroupper();
         return true;
     }
-    for (uint32_t position = 0u; position < handleCount; ++position)
-        RenderTransientLoopFramesAVX2(context, handles[position]);
+    for (uint32_t position = 0u; position < handleCount; ++position) {
+        const RenderSpanContext vc = SelectVoiceDestination(
+            context, v.channel[handles[position]]);
+        RenderTransientLoopFramesAVX2(vc, handles[position]);
+    }
     _mm256_zeroupper();
     return true;
 }
@@ -1107,10 +1137,38 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
     // RenderSustainedLoopSpan applies rotation AND the exact envelope.
     if (v.rot != nullptr) {
         for (uint32_t i = 0u; i < handleCount; ++i) {
-            ScalarRenderSustainedLoop(v, handles[i], context.sampleData,
-                context.hilbertData, context.sampleDataFrames,
-                context.outputLeft,
-                context.outputRight, context.frameStart, context.frameCount);
+            const RenderSpanContext vc = SelectVoiceDestination(
+                context, v.channel[handles[i]]);
+            ScalarRenderSustainedLoop(v, handles[i], vc.sampleData,
+                vc.hilbertData, vc.sampleDataFrames,
+                vc.outputLeft,
+                vc.outputRight, vc.frameStart, vc.frameCount);
+        }
+        _mm256_zeroupper();
+        return true;
+    }
+    // Channel buses: short spans run per-voice scalar spans with per-voice
+    // plane selection (the voice-batched path below mixes eight channels
+    // into one frame position). Longer spans keep the time-chunked AVX2
+    // kernels — each processes one voice, so the per-voice context copy
+    // redirects the mix to the voice's channel plane.
+    if (context.channelBusLeft != nullptr) {
+        if (context.frameCount > 7u) {
+            for (uint32_t i = 0; i < handleCount; ++i) {
+                const RenderSpanContext vc = SelectVoiceDestination(
+                    context, v.channel[handles[i]]);
+                RenderSustainedLoopFramesAVX2(vc, handles[i]);
+            }
+            _mm256_zeroupper();
+            return true;
+        }
+        for (uint32_t i = 0u; i < handleCount; ++i) {
+            const RenderSpanContext vc = SelectVoiceDestination(
+                context, v.channel[handles[i]]);
+            ScalarRenderSustainedLoop(v, handles[i], vc.sampleData,
+                vc.hilbertData, vc.sampleDataFrames,
+                vc.outputLeft,
+                vc.outputRight, vc.frameStart, vc.frameCount);
         }
         _mm256_zeroupper();
         return true;
@@ -1971,15 +2029,19 @@ bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
         // so run the exact scalar sequence per row — no AVX2 setup, no
         // AVX↔SSE transitions.
         for (uint32_t i = 0u; i < handleCount; ++i) {
+            const RenderSpanContext vc = SelectVoiceDestination(
+                context, v.channel[handles[i]]);
             RenderTransientOneShotSpanScalar(
-                v, handles[i], context.sampleData, context.sampleDataFrames,
-                context.outputLeft, context.outputRight, context.frameStart,
-                context.frameCount);
+                v, handles[i], vc.sampleData, vc.sampleDataFrames,
+                vc.outputLeft, vc.outputRight, vc.frameStart,
+                vc.frameCount);
         }
         return true;
     }
     for (uint32_t i = 0u; i < handleCount; ++i) {
-        RenderTransientOneShotFramesAVX2(context, handles[i]);
+        const RenderSpanContext vc = SelectVoiceDestination(
+            context, v.channel[handles[i]]);
+        RenderTransientOneShotFramesAVX2(vc, handles[i]);
     }
     _mm256_zeroupper();
     return true;
@@ -2008,18 +2070,22 @@ bool RenderSustainedOneShotAVX2(const RenderSpanContext& context,
         // setup, no AVX↔SSE transitions (the per-row entry overhead would
         // exceed the render work at these lengths).
         for (uint32_t i = 0u; i < handleCount; ++i) {
+            const RenderSpanContext vc = SelectVoiceDestination(
+                context, v.channel[handles[i]]);
             const uint32_t retiredAt = RenderSustainedOneShotSpan(
-                v, handles[i], context.sampleData, context.hilbertData,
-                context.sampleDataFrames, context.outputLeft,
-                context.outputRight, context.frameStart, context.frameCount);
+                v, handles[i], vc.sampleData, vc.hilbertData,
+                vc.sampleDataFrames, vc.outputLeft,
+                vc.outputRight, vc.frameStart, vc.frameCount);
             if (retiredAt != UINT32_MAX)
                 RecordRetirement(context, handles[i], retiredAt);
         }
         return true;
     }
     for (uint32_t i = 0u; i < handleCount; ++i) {
+        const RenderSpanContext vc = SelectVoiceDestination(
+            context, v.channel[handles[i]]);
         const uint32_t retiredAt = RenderSustainedOneShotFramesAVX2(
-            context, handles[i]);
+            vc, handles[i]);
         if (retiredAt != UINT32_MAX)
             RecordRetirement(context, handles[i], retiredAt);
     }
@@ -2044,18 +2110,22 @@ bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
     }
     if (context.frameCount < 8u) {
         for (uint32_t i = 0u; i < handleCount; ++i) {
+            const RenderSpanContext vc = SelectVoiceDestination(
+                context, v.channel[handles[i]]);
             const uint32_t retiredAt = RenderReleaseOneShotSpanScalar(
-                v, handles[i], context.sampleData, context.sampleDataFrames,
-                context.outputLeft, context.outputRight, context.frameStart,
-                context.frameCount);
+                v, handles[i], vc.sampleData, vc.sampleDataFrames,
+                vc.outputLeft, vc.outputRight, vc.frameStart,
+                vc.frameCount);
             if (retiredAt != UINT32_MAX)
                 RecordRetirement(context, handles[i], retiredAt);
         }
         return true;
     }
     for (uint32_t i = 0u; i < handleCount; ++i) {
+        const RenderSpanContext vc = SelectVoiceDestination(
+            context, v.channel[handles[i]]);
         const uint32_t retiredAt = RenderReleaseOneShotFramesAVX2(
-            context, handles[i]);
+            vc, handles[i]);
         if (retiredAt != UINT32_MAX)
             RecordRetirement(context, handles[i], retiredAt);
     }

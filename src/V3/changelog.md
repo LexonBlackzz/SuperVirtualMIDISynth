@@ -10,6 +10,47 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-13 feat(v3): per-MIDI-channel limiter (opt-in, default OFF) — 16
+  stereo channel buses limited independently, then summed into the master
+  chain. Purely POST: RenderBlock gains optional channelBusLeft/Right plane
+  tables; when the feature is off nothing runs and output is bit-identical
+  (boundary #2 honoured by construction). The limiter itself is classic
+  zero-latency (SVMSChannelLimiter.h): per-channel peak envelope with
+  instant attack + one-pole release toward the running peak (mirror of the
+  master Classic detector), 4 dB soft knee, gain applied from the envelope
+  of the same sample — above the knee a bus never exceeds the threshold
+  exactly, inside the knee the worst case is threshold*knee. Deliberately
+  NOT predictive: 16 lookahead lines would add latency to guard transients
+  the master limiter already owns; this stage is about one runaway channel
+  eating everyone else's headroom. Plumbing: RenderSpanContext grew
+  channelBusLeft/Right (aggregate initialisers value-init them null, legacy
+  sites untouched); class kernels select the voice's plane per voice (a
+  voice's MIDI channel is fixed for life — one pointer select per span, no
+  per-frame scatter); worker pool gained lazy per-job bus planes with a
+  per-channel deterministic merge; dense tiles re-batch per job in bus mode
+  (390 private 16-plane buffers for a 100k pool would be absurd); the AVX2
+  voice-batched 1-7-frame short kernels refuse in bus mode (eight lanes =
+  eight channels into one frame position — boundary #7 refuse, scalar
+  per-voice fallback takes it); SSE2/scalar short batch write planes
+  directly. Driver allocates the buses alongside the mix buffers (never in
+  the callback), limits+sums after RenderBlock, before reverb/master
+  limiter. Live via a dedicated SetChannelLimiter wire command
+  ("enabled;threshold;releaseMs" in the command text area — the live-state
+  V2 struct is ABI-pinned) with block-boundary adoption and threshold
+  glide; telemetry grew prefix-compatibly 512 -> 704 bytes (per-channel GR
+  + pre-limit peak, structSize-driven offsets handle both sizes — the ABI
+  smoke test pins the append). Configurator: new Effects > Per-Channel
+  Limiter page (toggle, threshold/release knobs, 4x4 channel GR grid),
+  JSON section channel_limiter. Tests: TestPerChannelLimiterDifferential —
+  limiter unit properties (ceiling, exact quiet passthrough, step response,
+  release), engine-vs-oracle bus parity (scalar 3.7e-9; AVX2 worst 2.3e-3 =
+  the documented steal-storm victim-flip class, budget 1e-2), both bus
+  paths (whole-voice via even blocks, dense/sparse via AllSoundOff-refused
+  odd blocks), direct-mix continuity after bus blocks. ctest 15/15, XP
+  13/13. Bench (AVX2, 6 threads, 2048 frames): sustained @8192 0.493 ->
+  0.519, note-burst @5000 0.568 -> 0.623, chopped-notes @5000 0.605 ->
+  0.683 cycles/voice-sample with the feature ON; OFF matches baseline.
+
 - 2026-09-13 perf(v3): CC1 vibrato joins the whole-voice fast path. The old
   "any channel modDepth > 0 -> refuse whole-voice + dense, cap sparse spans
   at 64 frames" gate cost 9.2x on modulated material (chopped-notes + CC1:

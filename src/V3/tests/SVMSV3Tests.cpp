@@ -12,6 +12,7 @@
 #include "SVMSConfig.h"
 #include "SVMSFrameClock.h"
 #include "SVMSPostFilter.h"
+#include "SVMSChannelLimiter.h"
 #include "SVMSNoteOnCollapse.h"
 
 #include <windows.h>
@@ -5560,6 +5561,355 @@ void TestPerKeyVoiceCap() {
     }
 }
 
+// 16 stereo bus planes for one renderer; planes are exactly kFrames long so
+// a per-block zero-fill leaves no stale audio.
+struct ChannelBusSet {
+    std::vector<float> planes;
+    float* left[16];
+    float* right[16];
+
+    void Init(uint32_t frames) {
+        planes.assign(static_cast<size_t>(16u) * 2u * frames, 0.0f);
+        for (uint32_t c = 0; c < 16u; ++c) {
+            left[c] = planes.data() + static_cast<size_t>(c) * 2u * frames;
+            right[c] = left[c] + frames;
+        }
+    }
+    void Zero() { std::fill(planes.begin(), planes.end(), 0.0f); }
+};
+
+void TestPerChannelLimiterDifferential() {
+    // ── Unit: the classic per-channel limiter math (shared by driver and
+    // oracle paths) ──
+    {
+        svms::EngineConfig config = svms::EngineConfig::Default();
+        config.channelLimiterEnabled = true;
+        config.channelLimiterThreshold = 0.5f;  // -6 dBFS
+        config.channelLimiterReleaseMs = 150.0f;
+        svms::ChannelLimiterState limiter;
+        limiter.Configure(44100u, config);
+
+        constexpr uint32_t kFrames = 4096u;
+        ChannelBusSet buses;
+        buses.Init(kFrames);
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            buses.left[0][f] =
+                0.9f * std::sin(static_cast<float>(f) * 0.021f);
+            buses.right[0][f] =
+                0.7f * std::cos(static_cast<float>(f) * 0.017f);
+            // Quiet channel below the threshold must pass through exactly.
+            buses.left[1][f] = 0.1f * std::sin(static_cast<float>(f) * 0.033f);
+            buses.right[1][f] = 0.1f * std::cos(static_cast<float>(f) * 0.029f);
+        }
+        std::vector<float> masterL(kFrames, 0.0f), masterR(kFrames, 0.0f);
+        limiter.ProcessAndSum(buses.left, buses.right, masterL.data(),
+                              masterR.data(), kFrames);
+
+        // Ceiling property: the loud channel's post-limited peak never
+        // exceeds the threshold (knee only softens engagement, never lifts
+        // gain above threshold/envelope).
+        float loudPeak = 0.0f;
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            // Subtract the exact quiet-channel passthrough.
+            const float l = masterL[f] - buses.left[1][f];
+            const float r = masterR[f] - buses.right[1][f];
+            loudPeak = (std::max)(loudPeak, (std::max)(std::fabs(l),
+                                                       std::fabs(r)));
+        }
+        Check(loudPeak <= 0.5f *
+                  svms::ChannelLimiterState::kKneeRatio * (1.0f + 1.0e-4f),
+              "per-channel limiter keeps the loud bus within the soft-knee "
+              "ceiling (threshold above the knee, threshold*knee inside it)");
+
+        // Step response: a sample that lands above the knee is limited to
+        // exactly the threshold on the frame it arrives (zero overshoot).
+        {
+            ChannelBusSet stepBuses;
+            stepBuses.Init(4u);
+            stepBuses.left[0][0] = 0.9f;   // rho = 1.8 > knee
+            stepBuses.right[0][0] = 0.9f;
+            std::vector<float> stepL(4u, 0.0f), stepR(4u, 0.0f);
+            limiter.ProcessAndSum(stepBuses.left, stepBuses.right,
+                                  stepL.data(), stepR.data(), 4u);
+            Check(std::fabs(stepL[0]) <= 0.5f * (1.0f + 1.0e-6f) &&
+                      std::fabs(stepR[0]) <= 0.5f * (1.0f + 1.0e-6f),
+                  "above-knee transients are limited to exactly the "
+                  "threshold");
+        }
+        Check(limiter.channel[0].gainReductionDb > 1.0f,
+              "per-channel limiter reports gain reduction on the loud bus");
+        Check(limiter.channel[1].gainReductionDb == 0.0f,
+              "per-channel limiter leaves the quiet bus untouched");
+
+        // Quiet-channel-only input is an exact passthrough (gain == 1).
+        ChannelBusSet quietBuses;
+        quietBuses.Init(kFrames);
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            quietBuses.left[3][f] =
+                0.1f * std::sin(static_cast<float>(f) * 0.019f);
+            quietBuses.right[3][f] =
+                0.1f * std::cos(static_cast<float>(f) * 0.023f);
+        }
+        std::fill(masterL.begin(), masterL.end(), 0.0f);
+        std::fill(masterR.begin(), masterR.end(), 0.0f);
+        limiter.ProcessAndSum(quietBuses.left, quietBuses.right,
+                              masterL.data(), masterR.data(), kFrames);
+        bool quietExact = true;
+        for (uint32_t f = 0; f < kFrames && quietExact; ++f) {
+            quietExact = masterL[f] == quietBuses.left[3][f] &&
+                         masterR[f] == quietBuses.right[3][f];
+        }
+        Check(quietExact,
+              "below-threshold channels pass through bit-exactly");
+
+        // Release: silence decays the envelope toward zero (150 ms at
+        // 44.1 kHz needs ~10 blocks of 4096 frames to settle).
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            buses.left[0][f] = 0.0f;
+            buses.right[0][f] = 0.0f;
+            buses.left[1][f] = 0.0f;
+            buses.right[1][f] = 0.0f;
+        }
+        for (int pass = 0; pass < 12; ++pass) {
+            limiter.ProcessAndSum(buses.left, buses.right, masterL.data(),
+                                  masterR.data(), kFrames);
+        }
+        Check(limiter.channel[0].envelope < 1.0e-3f,
+              "per-channel limiter envelope releases during silence");
+    }
+
+    // ── Differential: engine vs frame-major oracle through the channel
+    // buses, plus the same shared limiter applied to both ──
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 6u;
+    constexpr uint32_t kPool = 48u;
+    constexpr uint32_t kSeedCount = 32u;
+    constexpr uint32_t kEventsPerBlock = 10u;
+    constexpr float kThreshold = 0.15f;
+    // Full-pool note churn forces steal storms: a tolerance-equal state
+    // drift can flip a steal victim selection, and the displaced ghost then
+    // renders different (bounded) content — the documented drift class the
+    // Hilbert storm differential carries at 3.0e-2 for the same regime.
+    // 1.0e-2 leaves generous margin under that while staying far above the
+    // observed ~2.3e-3 worst case; the scalar pass proves the bus math is
+    // exact (~4e-9).
+    constexpr float kMaxDiff = 1.0e-2f;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+             0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 32767.0f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    svms::EngineConfig limiterConfig = svms::EngineConfig::Default();
+    limiterConfig.channelLimiterEnabled = true;
+    limiterConfig.channelLimiterThreshold = kThreshold;
+    limiterConfig.channelLimiterReleaseMs = 150.0f;
+
+    for (int backendPass = 0; backendPass < 2; ++backendPass) {
+        const bool avx2Pass = backendPass == 1;
+        if (avx2Pass &&
+            !svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) {
+            break;
+        }
+        const char* backendName = avx2Pass ? "avx2" : "scalar";
+
+        svms::ChannelCache seedChannels;
+        seedChannels.SetMasterVolume(1.0f);
+        seedChannels.RebuildCache(cfg, 44100.0f);
+        auto seedVoices = std::make_unique<svms::VoiceManager>();
+        ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, kPool,
+                                    kSeedCount);
+        auto oracleVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+        auto engineVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+        svms::ChannelCache oracleChannels = seedChannels;
+        svms::ChannelCache engineChannels = seedChannels;
+
+        svms::RenderScalar oracle;
+        svms::RenderScalar engine;
+        Check(oracle.ReserveVoiceCapacity(kPool) &&
+                  engine.ReserveVoiceCapacity(kPool) &&
+                  oracle.ConfigureRenderThreads(1u, kFrames) &&
+                  engine.ConfigureRenderThreads(4u, kFrames),
+              "per-channel limiter differential starts serial and parallel "
+              "renderers");
+        Check(engine.SetRenderBackend(
+                  avx2Pass ? svms::RenderBackend::AVX2
+                           : svms::RenderBackend::Scalar),
+              "per-channel limiter differential selects the requested "
+              "backend");
+
+        WholeVoiceCCContext oracleContext{oracleVoices.get(), &oracleChannels,
+                                          oracleChannels.GetParams(), &cfg};
+        WholeVoiceCCContext engineContext{engineVoices.get(), &engineChannels,
+                                          engineChannels.GetParams(), &cfg};
+        oracleContext.ResetMasterState();
+        engineContext.ResetMasterState();
+        oracle.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent,
+                                       &oracleContext);
+        engine.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent,
+                                       &engineContext);
+
+        svms::ChannelLimiterState oracleLimiter;
+        svms::ChannelLimiterState engineLimiter;
+        oracleLimiter.Configure(44100u, limiterConfig);
+        engineLimiter.Configure(44100u, limiterConfig);
+
+        WholeVoiceRng rng;
+        ChannelBusSet oracleBuses;
+        ChannelBusSet engineBuses;
+        oracleBuses.Init(kFrames);
+        engineBuses.Init(kFrames);
+        std::vector<float> oracleMasterL(kFrames, 0.0f),
+            oracleMasterR(kFrames, 0.0f);
+        std::vector<float> engineMasterL(kFrames, 0.0f),
+            engineMasterR(kFrames, 0.0f);
+        float passMaxDiff = 0.0f;
+        for (uint32_t block = 0; block < kBlocks; ++block) {
+            const uint64_t blockStartFrame = 40000u + block * kFrames;
+            std::vector<svms::RenderEvent> events;
+            events.reserve(kEventsPerBlock);
+            // Odd blocks get a dedicated AllSoundOff event first: the
+            // whole-voice plan refuses it, forcing the dense/sparse bus
+            // paths.  Even blocks stay note-only so the whole-voice bus
+            // path is covered too.
+            if ((block & 1u) != 0u) {
+                svms::RenderEvent event{};
+                event.channel = 0u;
+                event.frameOffset = 0u;
+                event.ingressSequence = block * kEventsPerBlock;
+                event.type = svms::RenderEventType::AllSoundOff;
+                events.push_back(event);
+            }
+            for (uint32_t j = 0; j < kEventsPerBlock; ++j) {
+                svms::RenderEvent event{};
+                // Channel 0 carries most of the load (the hot bus); the
+                // rest spread over channels 1-3.
+                const uint32_t channelRoll = rng.Next() % 10u;
+                event.channel = channelRoll < 6u
+                    ? 0u
+                    : static_cast<uint8_t>(1u + rng.Next() % 3u);
+                event.frameOffset = rng.Next() % kFrames;
+                event.ingressSequence = block * kEventsPerBlock + j;
+                const uint32_t roll = rng.Next() % 3u;
+                if (roll == 0u) {
+                    event.type = svms::RenderEventType::NoteOn;
+                    event.data1 =
+                        static_cast<uint8_t>(36u + rng.Next() % 72u);
+                    event.data2 =
+                        static_cast<uint8_t>(64u + rng.Next() % 64u);
+                } else if (roll == 1u) {
+                    event.type = svms::RenderEventType::NoteOff;
+                    event.data1 =
+                        static_cast<uint8_t>(36u + rng.Next() % 72u);
+                } else {
+                    // Mix-fold controller: keeps the row-op machinery in
+                    // the scenario (whole-voice blocks fold it as an
+                    // exact-frame mix op; dense/sparse blocks fold it at
+                    // span boundaries).
+                    event.type = svms::RenderEventType::ControlChange;
+                    event.data1 = 7u;
+                    event.data2 = static_cast<uint8_t>(rng.Next() % 128u);
+                }
+                events.push_back(event);
+            }
+            std::stable_sort(events.begin(), events.end(),
+                [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                    return a.frameOffset < b.frameOffset;
+                });
+
+            oracleBuses.Zero();
+            engineBuses.Zero();
+            oracle.RenderBlockReference(
+                *oracleVoices, oracleChannels, samples.data(), sampleCount,
+                oracleMasterL.data(), oracleMasterR.data(), kFrames, cfg,
+                events.data(), static_cast<uint32_t>(events.size()), true,
+                blockStartFrame, oracleBuses.left, oracleBuses.right);
+            engine.RenderBlock(
+                *engineVoices, engineChannels, samples.data(), sampleCount,
+                engineMasterL.data(), engineMasterR.data(), kFrames, cfg,
+                events.data(), static_cast<uint32_t>(events.size()), true,
+                blockStartFrame, engineBuses.left, engineBuses.right);
+
+            // Buses must match before limiting.
+            float blockDiff = 0.0f;
+            for (uint32_t c = 0; c < 16u; ++c) {
+                for (uint32_t f = 0; f < kFrames; ++f) {
+                    blockDiff = (std::max)(blockDiff,
+                        std::fabs(oracleBuses.left[c][f] -
+                                  engineBuses.left[c][f]));
+                    blockDiff = (std::max)(blockDiff,
+                        std::fabs(oracleBuses.right[c][f] -
+                                  engineBuses.right[c][f]));
+                }
+            }
+            // The masters are empty here (buses mode bypasses the direct
+            // mix); apply the shared limiter to both bus sets and compare
+            // the summed outputs too.
+            std::fill(oracleMasterL.begin(), oracleMasterL.end(), 0.0f);
+            std::fill(oracleMasterR.begin(), oracleMasterR.end(), 0.0f);
+            std::fill(engineMasterL.begin(), engineMasterL.end(), 0.0f);
+            std::fill(engineMasterR.begin(), engineMasterR.end(), 0.0f);
+            oracleLimiter.ProcessAndSum(oracleBuses.left, oracleBuses.right,
+                                        oracleMasterL.data(),
+                                        oracleMasterR.data(), kFrames);
+            engineLimiter.ProcessAndSum(engineBuses.left, engineBuses.right,
+                                        engineMasterL.data(),
+                                        engineMasterR.data(), kFrames);
+            for (uint32_t f = 0; f < kFrames; ++f) {
+                blockDiff = (std::max)(blockDiff,
+                    std::fabs(oracleMasterL[f] - engineMasterL[f]));
+                blockDiff = (std::max)(blockDiff,
+                    std::fabs(oracleMasterR[f] - engineMasterR[f]));
+            }
+            if (blockDiff > kMaxDiff) {
+                std::fprintf(stderr,
+                    "[PCLDIFF] backend=%s block=%u max=%g\n",
+                    backendName, block, blockDiff);
+            }
+            passMaxDiff = (std::max)(passMaxDiff, blockDiff);
+        }
+        std::fprintf(stderr, "[PCLDIFF] backend=%s max=%g\n",
+                     backendName, passMaxDiff);
+        Check(passMaxDiff <= kMaxDiff,
+              "per-channel bus blocks match the oracle per sample");
+        Check(engine.GetWholeVoiceBlocksForTest() == kBlocks / 2u,
+              "scenario covers both whole-voice and dense/sparse bus "
+              "paths");
+
+        // Toggle continuity: a direct-mix block (buses off) between bus
+        // blocks must stay in parity too.
+        oracleBuses.Zero();
+        engineBuses.Zero();
+        std::fill(oracleMasterL.begin(), oracleMasterL.end(), 0.0f);
+        std::fill(oracleMasterR.begin(), oracleMasterR.end(), 0.0f);
+        std::fill(engineMasterL.begin(), engineMasterL.end(), 0.0f);
+        std::fill(engineMasterR.begin(), engineMasterR.end(), 0.0f);
+        oracle.RenderBlockReference(
+            *oracleVoices, oracleChannels, samples.data(), sampleCount,
+            oracleMasterL.data(), oracleMasterR.data(), kFrames, cfg,
+            nullptr, 0u, true, 40000u + kBlocks * kFrames);
+        engine.RenderBlock(
+            *engineVoices, engineChannels, samples.data(), sampleCount,
+            engineMasterL.data(), engineMasterR.data(), kFrames, cfg,
+            nullptr, 0u, true, 40000u + kBlocks * kFrames);
+        float offDiff = 0.0f;
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            offDiff = (std::max)(offDiff,
+                std::fabs(oracleMasterL[f] - engineMasterL[f]));
+            offDiff = (std::max)(offDiff,
+                std::fabs(oracleMasterR[f] - engineMasterR[f]));
+        }
+        Check(offDiff <= kMaxDiff,
+              "direct-mix blocks stay in parity after bus-mode blocks");
+    }
+}
+
 int main() {
     _CrtSetDbgFlag(_CrtSetDbgFlag(_CRTDBG_REPORT_FLAG) | _CRTDBG_CHECK_ALWAYS_DF);
 #if defined(_DEBUG)
@@ -5573,6 +5923,7 @@ int main() {
     TestWholeVoiceCCDifferential();
     TestWholeVoiceVibratoDifferential();
     TestHilbertPairDifferential();
+    TestPerChannelLimiterDifferential();
     TestDenseProductionGateParity();
     TestPerKeyVoiceCap();
 

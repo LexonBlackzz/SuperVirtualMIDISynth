@@ -49,7 +49,32 @@ struct RenderSpanContext {
     float lfoDepth;
     float lfoBendRatio;
     uint32_t lfoActive;
+    // Optional per-MIDI-channel bus planes (SVMSChannelLimiter.h).  Null in
+    // legacy mode: kernels mix into outputLeft/outputRight as before.  When
+    // set, each of the kChannelCount entries is a block-length (or job-length)
+    // planar buffer and the voice's destination is channelBusLeft[voice
+    // channel] — a voice's MIDI channel is fixed for its lifetime, so the
+    // plane is selected once per voice/span, never per frame.  frameStart
+    // stays relative to the plane exactly as it is relative to outputLeft.
+    // Aggregate initializers that omit these fields value-init them to null
+    // (legacy behavior), so existing construction sites stay untouched.
+    float* const* channelBusLeft;
+    float* const* channelBusRight;
 };
+
+// Per-voice destination resolution for class kernels: when the span carries
+// channel buses, the voice's plane replaces the shared mix.  Returns the
+// context unchanged (by value; cheap POD) in legacy mode.
+inline RenderSpanContext SelectVoiceDestination(const RenderSpanContext& c,
+                                                uint32_t channel) {
+    if (c.channelBusLeft == nullptr) return c;
+    RenderSpanContext vc = c;
+    const uint32_t safeChannel =
+        channel < kChannelCount ? channel : 0u;
+    vc.outputLeft = c.channelBusLeft[safeChannel];
+    vc.outputRight = c.channelBusRight[safeChannel];
+    return vc;
+}
 
 // exp2(cents / 1200) for vibrato ratios.  Degree-5 Taylor in
 // x = cents * ln2 / 1200: |x| <= 0.35 at +-600 cents keeps the truncation
@@ -140,7 +165,9 @@ void ScalarRenderSustainedLoopShortBatch(
     VoiceSoA& voices, const uint32_t* handles, uint32_t handleCount,
     const int16_t* sampleData, const int16_t* hilbertData,
     uint32_t sampleDataFrames, float* outputLeft,
-    float* outputRight, uint32_t frameStart, uint32_t frameCount);
+    float* outputRight, uint32_t frameStart, uint32_t frameCount,
+    float* const* channelBusLeft = nullptr,
+    float* const* channelBusRight = nullptr);
 
 bool ScalarRenderTransientLoopClass(const RenderSpanContext& context,
                                     const uint32_t* handles,
