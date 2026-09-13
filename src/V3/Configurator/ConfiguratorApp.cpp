@@ -986,9 +986,15 @@ void ConfiguratorApp::FlushLiveChanges() {
 
     const uint32_t submittedMask = pendingLiveMask_;
     char err[svms::kRuntimeLinkResultTextCapacity] = {};
-    const svms::RLResult result = rlClient_.SendCommand(
-        svms::RLCommandType::ApplyLiveConfig, submittedMask, 0u,
-        workingLive_, kRlLiveCommandTimeoutMs, err);
+    // ApplyLiveConfig rejects an empty group mask, so it is only sent when
+    // a grouped change is pending; channel-limiter-only changes skip
+    // straight to their dedicated command below.
+    svms::RLResult result = svms::RLResult::Ok;
+    if (submittedMask != 0u) {
+        result = rlClient_.SendCommand(
+            svms::RLCommandType::ApplyLiveConfig, submittedMask, 0u,
+            workingLive_, kRlLiveCommandTimeoutMs, err);
+    }
     if (result == svms::RLResult::Ok) {
         pendingLiveMask_ &= ~submittedMask;
         rlFailedFlushes_ = 0u;

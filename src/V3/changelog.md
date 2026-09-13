@@ -10,6 +10,17 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-14 fix(v3): channel-limiter live updates never reached the engine
+  when no grouped change was pending — FlushLiveChanges sent ApplyLiveConfig
+  with an empty group mask (driver rejected "Invalid argument - empty group
+  mask") and the dedicated SetChannelLimiter command only ran behind a
+  success return. ApplyLiveConfig is now skipped entirely when the grouped
+  mask is zero, so per-channel-limiter-only changes flush on their own
+  command. Same screenshots: the fixed 24 dB GR scale pegged half the
+  channel grid full — Black MIDI buses peak 20-40 dB above full scale, so
+  the grid now steps a shared display max (24/48/96/192) off the worst
+  channel with a scale caption, mirroring the limiter page.
+
 - 2026-09-14 fix(v3): Per-Channel Limiter page cleanup from the owner's
   screenshots — the enable toggle rendered its raw "##cl_enabled_switch"
   ImGui id (ToggleSwitch draws its label; pass "ENABLED"), the channel

@@ -13,12 +13,25 @@ namespace svms::cfg {
 namespace {
 
 constexpr float kMeterFloorDb = -60.0f;
-constexpr float kGrDisplayMaxDb = 24.0f;
+constexpr float kGrBaseMaxDb = 24.0f;
+constexpr float kGrHardMaxDb = 192.0f;
 constexpr int kChannelGrid = 16;  // MIDI channels 1..16 (internal 0..15)
 
 float LinearToDb(float linear) {
     if (!std::isfinite(linear) || linear <= 0.000001f) return kMeterFloorDb;
     return (std::max)(kMeterFloorDb, 20.0f * std::log10(linear));
+}
+
+// Black MIDI channel buses routinely peak 20-40 dB above full scale, so a
+// fixed 24 dB GR scale saturates half the grid.  Step the shared display
+// maximum above the worst channel, mirroring the limiter page's behaviour.
+float SelectGrDisplayMax(float observedDb) {
+    if (!std::isfinite(observedDb)) return kGrBaseMaxDb;
+    observedDb = ImClamp(observedDb, 0.0f, kGrHardMaxDb);
+    if (observedDb <= 24.0f) return 24.0f;
+    if (observedDb <= 48.0f) return 48.0f;
+    if (observedDb <= 96.0f) return 96.0f;
+    return kGrHardMaxDb;
 }
 
 float DbToLinear(float db) {
@@ -31,7 +44,7 @@ float DbToLinear(float db) {
 // threshold, with the pre-limit peak drawn faintly underneath so the user
 // can tell "quiet channel" from "channel riding its threshold".
 void DrawChannelGrRow(int index, float reductionDb, float peakLinear,
-                      bool engineActive) {
+                      bool engineActive, float grDisplayMaxDb) {
     char label[8];
     std::snprintf(label, sizeof(label), "%d", index + 1);
     const ImU32 labelColor = ImGui::GetColorU32(
@@ -72,8 +85,8 @@ void DrawChannelGrRow(int index, float reductionDb, float peakLinear,
                 ImGui::GetColorU32(ImVec4(0.25f, 0.76f, 0.43f, 0.30f)), 2.0f);
         }
 
-        const float gr = ImClamp(reductionDb, 0.0f, kGrDisplayMaxDb);
-        const float norm = gr / kGrDisplayMaxDb;
+        const float gr = ImClamp(reductionDb, 0.0f, grDisplayMaxDb);
+        const float norm = gr / grDisplayMaxDb;
         if (norm > 0.0f) {
             dl->AddRectFilled(
                 ImVec2(barPos.x + 2.0f, barPos.y + 2.0f),
@@ -90,6 +103,14 @@ void DrawChannelGrid(const svms::RuntimeLinkTelemetryV2* telemetry,
                      bool telemetryAvailable) {
     const bool engineActive = telemetryAvailable &&
                               telemetry->channelLimiterEnabled != 0u;
+    float worstGr = 0.0f;
+    if (engineActive) {
+        for (int i = 0; i < kChannelGrid; ++i) {
+            worstGr = (std::max)(worstGr,
+                                 telemetry->channelLimiterGainReductionDb[i]);
+        }
+    }
+    const float grDisplayMaxDb = SelectGrDisplayMax(worstGr);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 3.0f));
     if (ImGui::BeginTable("##channel_grid", 2,
                           ImGuiTableFlags_SizingStretchSame)) {
@@ -103,7 +124,7 @@ void DrawChannelGrid(const svms::RuntimeLinkTelemetryV2* telemetry,
                              telemetryAvailable
                                  ? telemetry->channelLimiterInputPeak[row]
                                  : 0.0f,
-                             engineActive);
+                             engineActive, grDisplayMaxDb);
             ImGui::TableNextColumn();
             DrawChannelGrRow(row + 8,
                              telemetryAvailable
@@ -112,11 +133,15 @@ void DrawChannelGrid(const svms::RuntimeLinkTelemetryV2* telemetry,
                              telemetryAvailable
                                  ? telemetry->channelLimiterInputPeak[row + 8]
                                  : 0.0f,
-                             engineActive);
+                             engineActive, grDisplayMaxDb);
         }
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
+
+    if (engineActive && grDisplayMaxDb > 24.0f) {
+        ImGui::TextDisabled("Scale: 0 - %.0f dB gain reduction", grDisplayMaxDb);
+    }
 }
 
 } // namespace
