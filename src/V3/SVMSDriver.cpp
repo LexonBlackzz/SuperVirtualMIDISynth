@@ -6188,9 +6188,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->channelBusPlanes != nullptr &&
         self->channelBusCapacity >= numFrames;
     if (channelLimiterActive) {
-        std::memset(self->channelBusPlanes, 0,
-            static_cast<size_t>(numFrames) * kChannelCount * 2u *
-                sizeof(float));
+        ChannelLimiterState::ClearBuses(self->channelBusLeftTable,
+                                        self->channelBusRightTable,
+                                        numFrames);
     }
 
     // ── Diagnostic: voice retire stats ──────────────────────────────

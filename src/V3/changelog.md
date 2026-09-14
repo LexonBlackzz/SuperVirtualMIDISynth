@@ -10,6 +10,20 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-14 fix(v3): restore the channel activity bars after the label-width
+  alignment fix pushed the right-column meters outside their table cells.
+  Per-channel gain reduction now ramps down over 0.5 ms instead of jumping
+  in one sample; the master limiter catches the brief attack overshoot, so
+  threshold crossings stop clicking without adding lookahead latency.
+
+- 2026-09-14 fix(v3): clear capacity-strided channel buses per plane
+  instead of as a packed active-frame prefix. Variable-size audio callbacks
+  could otherwise re-sum stale samples from earlier blocks, sounding like
+  stuck notes and compounding distortion. The live threshold glide now
+  advances once per frame and is shared consistently by all 16 channels;
+  channel 9's configurator meter reserves the same two-digit label width as
+  channels 10-16 so its bar aligns with the column.
+
 - 2026-09-14 fix(v3): channel-limiter live updates never reached the engine
   when no grouped change was pending — FlushLiveChanges sent ApplyLiveConfig
   with an empty group mask (driver rejected "Invalid argument - empty group

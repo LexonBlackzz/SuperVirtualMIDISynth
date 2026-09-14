@@ -5589,6 +5589,63 @@ void TestPerChannelLimiterDifferential() {
         svms::ChannelLimiterState limiter;
         limiter.Configure(44100u, config);
 
+        // Driver buses use the allocation capacity as their plane stride,
+        // while a callback may contain fewer frames. Clearing must follow
+        // the plane tables rather than treating the active prefixes as one
+        // packed allocation, or old audio reappears in later callbacks.
+        {
+            constexpr uint32_t kCapacity = 32u;
+            constexpr uint32_t kActiveFrames = 11u;
+            ChannelBusSet stridedBuses;
+            stridedBuses.Init(kCapacity);
+            std::fill(stridedBuses.planes.begin(),
+                      stridedBuses.planes.end(), 0.75f);
+            svms::ChannelLimiterState::ClearBuses(
+                stridedBuses.left, stridedBuses.right, kActiveFrames);
+            bool activePrefixesClear = true;
+            bool inactiveTailsUntouched = true;
+            for (uint32_t c = 0u; c < 16u; ++c) {
+                for (uint32_t f = 0u; f < kActiveFrames; ++f) {
+                    activePrefixesClear = activePrefixesClear &&
+                        stridedBuses.left[c][f] == 0.0f &&
+                        stridedBuses.right[c][f] == 0.0f;
+                }
+                inactiveTailsUntouched = inactiveTailsUntouched &&
+                    stridedBuses.left[c][kActiveFrames] == 0.75f &&
+                    stridedBuses.right[c][kActiveFrames] == 0.75f;
+            }
+            Check(activePrefixesClear && inactiveTailsUntouched,
+                  "variable-size callbacks clear every strided channel "
+                  "bus prefix without touching its inactive tail");
+        }
+
+        // A live threshold is shared by all buses. Identical simultaneous
+        // input must see the same threshold while it glides.
+        {
+            limiter.Reset();
+            limiter.SetLiveTargets(true, 1.0f, 150.0f, 44100u);
+            ChannelBusSet glideBuses;
+            glideBuses.Init(1u);
+            for (uint32_t c = 0u; c < 16u; ++c) {
+                glideBuses.left[c][0] = 0.7f;
+                glideBuses.right[c][0] = 0.7f;
+            }
+            float glideOutL = 0.0f;
+            float glideOutR = 0.0f;
+            limiter.ProcessAndSum(glideBuses.left, glideBuses.right,
+                                  &glideOutL, &glideOutR, 1u);
+            bool channelThresholdsMatch = true;
+            for (uint32_t c = 1u; c < 16u; ++c) {
+                channelThresholdsMatch = channelThresholdsMatch &&
+                    limiter.channel[c].gainReductionDb ==
+                        limiter.channel[0].gainReductionDb;
+            }
+            Check(channelThresholdsMatch,
+                  "live threshold glide advances once per frame and is "
+                  "identical across channels");
+            limiter.Configure(44100u, config);
+        }
+
         constexpr uint32_t kFrames = 4096u;
         ChannelBusSet buses;
         buses.Init(kFrames);
@@ -5605,11 +5662,12 @@ void TestPerChannelLimiterDifferential() {
         limiter.ProcessAndSum(buses.left, buses.right, masterL.data(),
                               masterR.data(), kFrames);
 
-        // Ceiling property: the loud channel's post-limited peak never
-        // exceeds the threshold (knee only softens engagement, never lifts
-        // gain above threshold/envelope).
+        // The channel stage uses a short gain ramp to avoid a discontinuity;
+        // after that attack settles, the loud bus stays within the soft-knee
+        // ceiling. The downstream master limiter owns the brief overshoot.
         float loudPeak = 0.0f;
-        for (uint32_t f = 0; f < kFrames; ++f) {
+        constexpr uint32_t kAttackSettleFrames = 256u;
+        for (uint32_t f = kAttackSettleFrames; f < kFrames; ++f) {
             // Subtract the exact quiet-channel passthrough.
             const float l = masterL[f] - buses.left[1][f];
             const float r = masterR[f] - buses.right[1][f];
@@ -5618,23 +5676,32 @@ void TestPerChannelLimiterDifferential() {
         }
         Check(loudPeak <= 0.5f *
                   svms::ChannelLimiterState::kKneeRatio * (1.0f + 1.0e-4f),
-              "per-channel limiter keeps the loud bus within the soft-knee "
-              "ceiling (threshold above the knee, threshold*knee inside it)");
+              "per-channel limiter settles within the soft-knee ceiling "
+              "after its click-free attack ramp");
 
-        // Step response: a sample that lands above the knee is limited to
-        // exactly the threshold on the frame it arrives (zero overshoot).
+        // Step response: reduction begins immediately but ramps rather than
+        // jumping straight to the target gain in one sample.
         {
             ChannelBusSet stepBuses;
-            stepBuses.Init(4u);
-            stepBuses.left[0][0] = 0.9f;   // rho = 1.8 > knee
-            stepBuses.right[0][0] = 0.9f;
-            std::vector<float> stepL(4u, 0.0f), stepR(4u, 0.0f);
+            constexpr uint32_t kStepFrames = 128u;
+            stepBuses.Init(kStepFrames);
+            for (uint32_t f = 0u; f < kStepFrames; ++f) {
+                stepBuses.left[0][f] = 0.9f;   // rho = 1.8 > knee
+                stepBuses.right[0][f] = 0.9f;
+            }
+            std::vector<float> stepL(kStepFrames, 0.0f),
+                stepR(kStepFrames, 0.0f);
+            limiter.Reset();
             limiter.ProcessAndSum(stepBuses.left, stepBuses.right,
-                                  stepL.data(), stepR.data(), 4u);
-            Check(std::fabs(stepL[0]) <= 0.5f * (1.0f + 1.0e-6f) &&
-                      std::fabs(stepR[0]) <= 0.5f * (1.0f + 1.0e-6f),
-                  "above-knee transients are limited to exactly the "
-                  "threshold");
+                                  stepL.data(), stepR.data(), kStepFrames);
+            bool monotonicAttack = stepL[0] < 0.9f && stepL[0] > 0.5f;
+            for (uint32_t f = 1u; f < kStepFrames; ++f)
+                monotonicAttack = monotonicAttack &&
+                    stepL[f] <= stepL[f - 1u];
+            Check(monotonicAttack && stepL[kStepFrames - 1u] < 0.51f &&
+                      stepR[kStepFrames - 1u] < 0.51f,
+                  "above-knee transients engage with a smooth monotonic "
+                  "gain ramp and settle at the threshold");
         }
         Check(limiter.channel[0].gainReductionDb > 1.0f,
               "per-channel limiter reports gain reduction on the loud bus");
@@ -5935,4 +6002,3 @@ int main() {
     std::puts("SVMS V3 correctness tests passed");
     return 0;
 }
-

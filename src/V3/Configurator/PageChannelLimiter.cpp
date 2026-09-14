@@ -51,10 +51,15 @@ void DrawChannelGrRow(int index, float reductionDb, float peakLinear,
         engineActive && reductionDb > 0.05f
             ? ImVec4(0.94f, 0.68f, 0.16f, 1.0f)
             : ImVec4(0.56f, 0.59f, 0.62f, 1.0f));
+    const float labelStartX = ImGui::GetCursorPosX();
+    const float labelWidth = ImGui::CalcTextSize("16").x;
     ImGui::PushStyleColor(ImGuiCol_Text, labelColor);
     ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
-    ImGui::SameLine(0.0f, 6.0f);
+    // Reserve two-digit label width for every row. Without this, channel 9
+    // was the only right-column meter starting one digit farther left.
+    ImGui::SameLine(0.0f, 0.0f);
+    ImGui::SetCursorPosX(labelStartX + labelWidth + 6.0f);
 
     const float rowHeight = ImGui::GetTextLineHeight();
     const float barHeight = rowHeight - 4.0f;
@@ -230,7 +235,6 @@ void DrawChannelLimiterPage(ConfigDocument& doc) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    const float availableWidth = ImGui::GetContentRegionAvail().x;
     const float topHeight = 210.0f;
     if (ImGui::BeginTable("##cl_top", 2,
                           ImGuiTableFlags_SizingStretchProp |

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace svms {
 
@@ -27,30 +28,34 @@ namespace svms {
 // Per channel and frame:
 //   peak = max(|L|, |R|)
 //   envelope: instant attack, one-pole release toward the current peak
-//   gain = knee(threshold / envelope), applied to the same sample
+//   target gain = knee(threshold / envelope)
+//   applied gain ramps down over 0.5 ms and follows release recovery
 //   bus  *= gain, and the gained bus accumulates into the master mix
 //
 // The envelope recurrence mirrors ClassicLimiterState's detector exactly
 // (instant attack, release-coefficient recovery toward the running peak).
-// Because the gain is computed from the envelope of the very sample it
-// scales and the 4 dB knee only softens how reduction engages (it never
-// lifts gain above the exact ratio), a channel's post-limited peak never
-// exceeds the threshold beyond float rounding. Transients bite instantly —
-// the classic tradeoff — while the master limiter stays the final ceiling.
+// The detector still catches peaks immediately, but the applied gain ramps
+// down over 0.5 ms instead of jumping in one sample. That removes the click
+// caused by a discontinuous channel gain change. The brief attack overshoot
+// is intentional and is caught by the downstream master limiter, which
+// remains the final ceiling; no per-channel lookahead latency is added.
 
 struct ChannelLimiterState {
     // Knee width over which reduction eases in, as a linear overshoot
     // ratio (4 dB). Below knee: gain 1 with zero slope; above: the exact
     // threshold/envelope ratio.
     static constexpr float kKneeRatio = 1.5848931924611136f;
+    static constexpr float kGainAttackMs = 0.5f;
 
     float threshold = 0.5011872336272722f;        // -6 dBFS default
     float thresholdTarget = 0.5011872336272722f;
     float envelopeReleaseCoeff = 0.0003f;         // from Release (~150 ms)
+    float gainAttackCoeff = 0.04f;                // 0.5 ms at ~44.1 kHz
     bool enabled = false;
 
     struct ChannelState {
         float envelope = 0.0f;
+        float appliedGain = 1.0f;
         // Per-block meters (ResetMeters at block start).
         float inputPeak = 0.0f;
         float gainReductionDb = 0.0f;
@@ -61,6 +66,7 @@ struct ChannelLimiterState {
     void Reset() noexcept {
         for (uint32_t i = 0u; i < kChannelCount; ++i) {
             channel[i].envelope = 0.0f;
+            channel[i].appliedGain = 1.0f;
         }
         threshold = ClampThreshold(thresholdTarget);
         ResetMeters();
@@ -86,6 +92,23 @@ struct ChannelLimiterState {
             (std::max)(1.0f, releaseMs) *
             static_cast<float>((std::max)(1u, sampleRate)) * 0.001f);
         envelopeReleaseCoeff = 1.0f - std::exp(-1.0f / samples);
+        const float attackSamples = (std::max)(1.0f,
+            kGainAttackMs *
+            static_cast<float>((std::max)(1u, sampleRate)) * 0.001f);
+        gainAttackCoeff = 1.0f - std::exp(-1.0f / attackSamples);
+    }
+
+    // Bus planes are capacity-strided, not packed by the current callback's
+    // frame count. Clear through the pointer tables so variable-size WASAPI
+    // callbacks cannot replay samples left in another channel's plane.
+    static void ClearBuses(float* const* busLeft, float* const* busRight,
+                           uint32_t numFrames) noexcept {
+        if (!busLeft || !busRight || numFrames == 0u) return;
+        const size_t bytes = static_cast<size_t>(numFrames) * sizeof(float);
+        for (uint32_t c = 0u; c < kChannelCount; ++c) {
+            std::memset(busLeft[c], 0, bytes);
+            std::memset(busRight[c], 0, bytes);
+        }
     }
 
     // Applies per-channel limiting to the bus planes and sums them into the
@@ -101,53 +124,69 @@ struct ChannelLimiterState {
             numFrames == 0u) {
             return;
         }
-        for (uint32_t c = 0u; c < kChannelCount; ++c) {
-            ChannelState& state = channel[c];
-            const float* busL = busLeft[c];
-            const float* busR = busRight[c];
-            float env = state.envelope;
-            float blockPeak = 0.0f;
-            float blockReduction = 0.0f;
-            for (uint32_t f = 0u; f < numFrames; ++f) {
-                if (threshold != thresholdTarget) {
-                    threshold = GlideF32(threshold, thresholdTarget, 0.0005f);
-                    threshold = ClampThreshold(threshold);
-                }
+        for (uint32_t f = 0u; f < numFrames; ++f) {
+            // The threshold is one shared control, so advance its live glide
+            // once per audio frame. Advancing it inside the channel loop made
+            // recovery 16x too fast and gave every channel a different
+            // threshold during the same callback.
+            if (threshold != thresholdTarget) {
+                threshold = GlideF32(threshold, thresholdTarget, 0.0005f);
+                threshold = ClampThreshold(threshold);
+            }
+            for (uint32_t c = 0u; c < kChannelCount; ++c) {
+                ChannelState& state = channel[c];
+                const float* busL = busLeft[c];
+                const float* busR = busRight[c];
                 const float inL = busL[f];
                 const float inR = busR[f];
                 const float absL = std::fabs(inL);
                 const float absR = std::fabs(inR);
                 const float peak = (std::max)(absL, absR);
-                blockPeak = (std::max)(blockPeak, peak);
+                state.inputPeak = (std::max)(state.inputPeak, peak);
 
-                if (peak > env) {
-                    env = peak;                      // instant attack
+                if (peak > state.envelope) {
+                    state.envelope = peak;           // instant attack
                 } else {
-                    env += envelopeReleaseCoeff * (peak - env);
-                    if (env < 1.0e-6f) env = 0.0f;   // denormal guard
+                    state.envelope += envelopeReleaseCoeff *
+                        (peak - state.envelope);
+                    if (state.envelope < 1.0e-6f)
+                        state.envelope = 0.0f;        // denormal guard
                 }
 
-                float gain = 1.0f;
-                if (env > threshold) {
-                    const float rho = env / threshold;
+                float targetGain = 1.0f;
+                if (state.envelope > threshold) {
+                    const float rho = state.envelope / threshold;
                     if (rho >= kKneeRatio) {
-                        gain = 1.0f / rho;
+                        targetGain = 1.0f / rho;
                     } else {
                         const float t = (rho - 1.0f) / (kKneeRatio - 1.0f);
                         const float eased = t * t;
-                        gain = 1.0f - eased * (1.0f - 1.0f / rho);
+                        targetGain =
+                            1.0f - eased * (1.0f - 1.0f / rho);
                     }
-                    blockReduction = (std::max)(blockReduction,
+                }
+                if (targetGain < state.appliedGain) {
+                    state.appliedGain += gainAttackCoeff *
+                        (targetGain - state.appliedGain);
+                } else {
+                    // Envelope release already makes upward gain movement
+                    // gradual; follow it directly instead of filtering it a
+                    // second time.
+                    state.appliedGain = targetGain;
+                }
+                const float gain = state.appliedGain;
+                if (gain < 1.0f) {
+                    state.gainReductionDb = (std::max)(
+                        state.gainReductionDb,
                         -20.0f * std::log10((std::max)(gain, 1.0e-12f)));
                 }
 
                 outputLeft[f] += inL * gain;
                 outputRight[f] += inR * gain;
             }
-            state.envelope = env;
-            state.inputPeak = blockPeak;
-            state.gainReductionDb = blockReduction;
-            state.limiting = blockReduction > 0.01f;
+        }
+        for (uint32_t c = 0u; c < kChannelCount; ++c) {
+            channel[c].limiting = channel[c].gainReductionDb > 0.01f;
         }
     }
 
