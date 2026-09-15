@@ -653,16 +653,27 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         ImGui::Spacing();
 
         static std::wstring lastSoundFontDir;
+        static std::wstring browserDir;
+        static std::wstring scannedDir;
+        static char searchBuf[128] = {};
+        static std::vector<std::wstring> folderDirs;
+        static std::vector<std::wstring> folderFonts;
+
         if (lastSoundFontDir.empty() && !w.soundFontPath.empty()) {
             lastSoundFontDir =
                 std::filesystem::path(w.soundFontPath).parent_path().wstring();
         }
+        if (browserDir.empty())
+            browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
 
         if (ImGui::Button("Browse…", ImVec2(90, 0))) {
             std::wstring selected;
             if (BrowseSoundFont(selected, lastSoundFontDir,
                                 L"Select primary SoundFont")) {
                 SetPrimarySoundFont(w, selected);
+                browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
+                scannedDir.clear();
+                searchBuf[0] = '\0';
                 doc.MarkDirty();
             }
         }
@@ -700,31 +711,42 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         ImGui::TextDisabled(
             "Active voices are silenced at activation; MIDI state is retained. Save Configuration to keep the selection after restart.");
 
-        static char searchBuf[128] = {};
-        static std::vector<std::wstring> folderFonts;
-        static std::wstring scannedDir;
         {
-            std::wstring scanDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
+            const std::wstring scanDir = browserDir.empty() ? L"." : browserDir;
             if (scannedDir != scanDir) {
                 scannedDir = scanDir;
+                folderDirs.clear();
                 folderFonts.clear();
                 std::error_code ec;
-                for (std::filesystem::recursive_directory_iterator it(
+                for (std::filesystem::directory_iterator it(
                          scanDir,
                          std::filesystem::directory_options::skip_permission_denied,
                          ec), end;
                      !ec && it != end; it.increment(ec)) {
                     if (ec) break;
+                    std::error_code typeEc;
+                    if (it->is_directory(typeEc) && !typeEc) {
+                        folderDirs.push_back(it->path().filename().wstring());
+                        continue;
+                    }
+                    if (typeEc) continue;
                     const std::wstring ext = it->path().extension().wstring();
                     if (_wcsicmp(ext.c_str(), L".sf2") == 0 ||
                         _wcsicmp(ext.c_str(), L".sfz") == 0) {
-                        folderFonts.push_back(
-                            it->path().lexically_relative(scanDir).wstring());
+                        folderFonts.push_back(it->path().filename().wstring());
                     }
                 }
+                std::sort(folderDirs.begin(), folderDirs.end());
                 std::sort(folderFonts.begin(), folderFonts.end());
             }
         }
+
+        std::string folderLabel = WideToUtf8Str(
+            std::filesystem::path(scannedDir.empty() ? L"." : scannedDir)
+                .lexically_normal().wstring());
+        if (folderLabel.size() > 72)
+            folderLabel = "…" + folderLabel.substr(folderLabel.size() - 72);
+        ImGui::TextDisabled("Folder: %s", folderLabel.c_str());
 
         const float sfWidth = (std::min)(420.0f, ImGui::GetContentRegionAvail().x);
         ImGui::SetNextItemWidth(sfWidth);
@@ -738,25 +760,56 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                        [](unsigned char c) -> char {
                            return static_cast<char>(std::tolower(c));
                        });
-        for (const auto& file : folderFonts) {
-            std::string name = WideToUtf8Str(file);
-            std::string lower = name;
-            std::transform(lower.begin(), lower.end(), lower.begin(),
-                           [](unsigned char c) -> char {
-                               return static_cast<char>(std::tolower(c));
-                           });
-            if (!filter.empty() && lower.find(filter) == std::string::npos) {
-                continue;
+
+        const std::filesystem::path currentDir =
+            std::filesystem::path(scannedDir.empty() ? L"." : scannedDir)
+                .lexically_normal();
+        const std::filesystem::path parentDir = currentDir.parent_path();
+        bool navigated = false;
+        if (!parentDir.empty() && parentDir != currentDir) {
+            if (ImGui::Selectable("[..]")) {
+                browserDir = parentDir.wstring();
+                scannedDir.clear();
+                searchBuf[0] = '\0';
+                navigated = true;
             }
-            const bool selected = !w.soundFontPath.empty() &&
-                _wcsicmp((std::filesystem::path(scannedDir) / file)
-                             .lexically_normal().c_str(),
-                         std::filesystem::path(w.soundFontPath)
-                             .lexically_normal().c_str()) == 0;
-            if (ImGui::Selectable(name.c_str(), selected)) {
-                SetPrimarySoundFont(
-                    w, (std::filesystem::path(scannedDir) / file).wstring());
-                doc.MarkDirty();
+        }
+
+        if (!navigated) {
+            for (const auto& folder : folderDirs) {
+                const std::string name = "[DIR] " + WideToUtf8Str(folder);
+                if (ImGui::Selectable(name.c_str())) {
+                    browserDir = (currentDir / folder).lexically_normal().wstring();
+                    scannedDir.clear();
+                    searchBuf[0] = '\0';
+                    navigated = true;
+                    break;
+                }
+            }
+        }
+
+        if (!navigated) {
+            for (const auto& file : folderFonts) {
+                std::string name = WideToUtf8Str(file);
+                std::string lower = name;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) -> char {
+                                   return static_cast<char>(std::tolower(c));
+                               });
+                if (!filter.empty() && lower.find(filter) == std::string::npos) {
+                    continue;
+                }
+                const std::filesystem::path candidate =
+                    (currentDir / file).lexically_normal();
+                const bool selected = !w.soundFontPath.empty() &&
+                    _wcsicmp(candidate.c_str(),
+                             std::filesystem::path(w.soundFontPath)
+                                 .lexically_normal().c_str()) == 0;
+                if (ImGui::Selectable(name.c_str(), selected)) {
+                    SetPrimarySoundFont(w, candidate.wstring());
+                    lastSoundFontDir = currentDir.wstring();
+                    doc.MarkDirty();
+                }
             }
         }
         ImGui::EndChild();
@@ -779,6 +832,9 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                         w.soundFontPath = w.soundFontPaths.front();
                     doc.MarkDirty();
                 }
+                browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
+                scannedDir.clear();
+                searchBuf[0] = '\0';
             }
         }
         ImGui::SameLine();
