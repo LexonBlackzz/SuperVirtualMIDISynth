@@ -6,6 +6,14 @@
 #include <locale>
 #endif
 #include <cstdio>
+#include <algorithm>
+#include <cctype>
+#include <cwctype>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -287,6 +295,672 @@ bool sf2_load(const wchar_t* path, SF2Data* outData) {
     return sf2_load_file(file, outData);
 }
 
+namespace {
+
+namespace fs = std::filesystem;
+
+struct SfzZone {
+    std::string sample;
+    int keyLo = 0;
+    int keyHi = 127;
+    int velLo = 0;
+    int velHi = 127;
+    int rootKey = -1;
+    int transpose = 0;
+    int tune = 0;
+    int keyTrack = 100;
+    double volumeDb = 0.0;
+    double pan = 0.0;
+    int64_t offset = 0;
+    int64_t end = -1;
+    int64_t loopStart = -1;
+    int64_t loopEnd = -1;
+    int loopMode = 0;
+    double ampDelay = 0.0;
+    double ampAttack = 0.0;
+    double ampHold = 0.0;
+    double ampDecay = 0.0;
+    double ampSustain = 100.0;
+    double ampRelease = 0.0;
+    int group = 0;
+    int offBy = 0;
+};
+
+struct SfzToken {
+    bool header = false;
+    std::string name;
+    std::string value;
+};
+
+static std::string LowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+static std::string TrimAscii(const std::string& value) {
+    size_t begin = 0;
+    while (begin < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[begin]))) ++begin;
+    size_t end = value.size();
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+    return value.substr(begin, end - begin);
+}
+
+static std::vector<SfzToken> TokenizeSfz(const std::string& source) {
+    std::vector<SfzToken> result;
+    size_t pos = 0;
+    const auto isName = [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '_' || ch == '$';
+    };
+    while (pos < source.size()) {
+        while (pos < source.size() &&
+               std::isspace(static_cast<unsigned char>(source[pos]))) ++pos;
+        if (pos >= source.size()) break;
+        if (source.compare(pos, 2, "//") == 0) {
+            pos = source.find('\n', pos + 2);
+            if (pos == std::string::npos) break;
+            continue;
+        }
+        if (source.compare(pos, 2, "/*") == 0) {
+            pos = source.find("*/", pos + 2);
+            if (pos == std::string::npos) break;
+            pos += 2;
+            continue;
+        }
+        if (source[pos] == '<') {
+            const size_t close = source.find('>', pos + 1);
+            if (close == std::string::npos) break;
+            result.push_back({true,
+                LowerAscii(TrimAscii(source.substr(pos + 1,
+                                                   close - pos - 1))), {}});
+            pos = close + 1;
+            continue;
+        }
+        const size_t nameBegin = pos;
+        while (pos < source.size() &&
+               isName(static_cast<unsigned char>(source[pos]))) ++pos;
+        const size_t nameEnd = pos;
+        while (pos < source.size() &&
+               std::isspace(static_cast<unsigned char>(source[pos]))) ++pos;
+        if (nameEnd == nameBegin || pos >= source.size() || source[pos] != '=') {
+            while (pos < source.size() &&
+                   !std::isspace(static_cast<unsigned char>(source[pos]))) ++pos;
+            continue;
+        }
+        ++pos;
+        while (pos < source.size() &&
+               std::isspace(static_cast<unsigned char>(source[pos]))) ++pos;
+        size_t valueBegin = pos;
+        size_t valueEnd = pos;
+        if (pos < source.size() && source[pos] == '"') {
+            valueBegin = ++pos;
+            valueEnd = source.find('"', pos);
+            if (valueEnd == std::string::npos) valueEnd = source.size();
+            pos = valueEnd < source.size() ? valueEnd + 1 : valueEnd;
+        } else {
+            valueEnd = source.size();
+            size_t scan = pos;
+            while (scan < source.size()) {
+                if (source[scan] == '<' || source.compare(scan, 2, "//") == 0 ||
+                    source.compare(scan, 2, "/*") == 0) {
+                    valueEnd = scan;
+                    break;
+                }
+                if (std::isspace(static_cast<unsigned char>(source[scan]))) {
+                    size_t next = scan;
+                    while (next < source.size() &&
+                           std::isspace(static_cast<unsigned char>(source[next]))) ++next;
+                    size_t candidate = next;
+                    while (candidate < source.size() &&
+                           isName(static_cast<unsigned char>(source[candidate]))) ++candidate;
+                    size_t equals = candidate;
+                    while (equals < source.size() &&
+                           std::isspace(static_cast<unsigned char>(source[equals]))) ++equals;
+                    if (candidate > next && equals < source.size() &&
+                        source[equals] == '=') {
+                        valueEnd = scan;
+                        break;
+                    }
+                }
+                ++scan;
+            }
+            pos = valueEnd;
+        }
+        result.push_back({false,
+            LowerAscii(source.substr(nameBegin, nameEnd - nameBegin)),
+            TrimAscii(source.substr(valueBegin, valueEnd - valueBegin))});
+    }
+    return result;
+}
+
+static bool ParseInteger(const std::string& text, int64_t& value) {
+    char* end = nullptr;
+    errno = 0;
+    const long long parsed = std::strtoll(text.c_str(), &end, 10);
+    if (end == text.c_str() || errno == ERANGE) return false;
+    while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end) return false;
+    value = static_cast<int64_t>(parsed);
+    return true;
+}
+
+static bool ParseNumber(const std::string& text, double& value) {
+    char* end = nullptr;
+    errno = 0;
+    const double parsed = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || errno == ERANGE || !std::isfinite(parsed))
+        return false;
+    while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end) return false;
+    value = parsed;
+    return true;
+}
+
+static bool ParseSfzKey(const std::string& text, int& value) {
+    int64_t numeric = 0;
+    if (ParseInteger(text, numeric)) {
+        value = static_cast<int>((std::max)(int64_t(0),
+                    (std::min)(int64_t(127), numeric)));
+        return true;
+    }
+    if (text.size() < 2) return false;
+    const std::string lower = LowerAscii(text);
+    static const int semitones[7] = {9, 11, 0, 2, 4, 5, 7}; // A..G
+    const char letter = lower[0];
+    if (letter < 'a' || letter > 'g') return false;
+    int semitone = semitones[letter - 'a'];
+    size_t at = 1;
+    if (at < lower.size() && (lower[at] == '#' || lower[at] == 'b'))
+        semitone += lower[at++] == '#' ? 1 : -1;
+    int64_t octave = 0;
+    if (!ParseInteger(lower.substr(at), octave)) return false;
+    // SFZ follows the common MIDI convention C4 = 60.
+    const int note = static_cast<int>((octave + 1) * 12 + semitone);
+    value = (std::max)(0, (std::min)(127, note));
+    return true;
+}
+
+static bool ApplySfzOpcode(SfzZone& zone, const SfzToken& token,
+                           std::unordered_set<std::string>& unsupported) {
+    const std::string& op = token.name;
+    int64_t integer = 0;
+    double number = 0.0;
+    if (op == "sample") { zone.sample = token.value; return true; }
+    if (op == "key") {
+        int key = 0; if (!ParseSfzKey(token.value, key)) return false;
+        zone.keyLo = zone.keyHi = zone.rootKey = key; return true;
+    }
+    if (op == "lokey" || op == "hikey" || op == "pitch_keycenter") {
+        int key = 0; if (!ParseSfzKey(token.value, key)) return false;
+        if (op == "lokey") zone.keyLo = key;
+        else if (op == "hikey") zone.keyHi = key;
+        else zone.rootKey = key;
+        return true;
+    }
+    if (op == "lovel" || op == "hivel" || op == "transpose" ||
+        op == "tune" || op == "pitch_keytrack" || op == "offset" ||
+        op == "end" || op == "loop_start" || op == "loop_end" ||
+        op == "group" || op == "off_by") {
+        if (!ParseInteger(token.value, integer)) return false;
+        if (op == "lovel") zone.velLo = static_cast<int>(integer);
+        else if (op == "hivel") zone.velHi = static_cast<int>(integer);
+        else if (op == "transpose") zone.transpose = static_cast<int>(integer);
+        else if (op == "tune") zone.tune = static_cast<int>(integer);
+        else if (op == "pitch_keytrack") zone.keyTrack = static_cast<int>(integer);
+        else if (op == "offset") zone.offset = integer;
+        else if (op == "end") zone.end = integer;
+        else if (op == "loop_start") zone.loopStart = integer;
+        else if (op == "loop_end") zone.loopEnd = integer;
+        else if (op == "group") zone.group = static_cast<int>(integer);
+        else zone.offBy = static_cast<int>(integer);
+        return true;
+    }
+    if (op == "volume" || op == "pan" || op == "ampeg_delay" ||
+        op == "ampeg_attack" || op == "ampeg_hold" ||
+        op == "ampeg_decay" || op == "ampeg_sustain" ||
+        op == "ampeg_release") {
+        if (!ParseNumber(token.value, number)) return false;
+        if (op == "volume") zone.volumeDb = number;
+        else if (op == "pan") zone.pan = number;
+        else if (op == "ampeg_delay") zone.ampDelay = number;
+        else if (op == "ampeg_attack") zone.ampAttack = number;
+        else if (op == "ampeg_hold") zone.ampHold = number;
+        else if (op == "ampeg_decay") zone.ampDecay = number;
+        else if (op == "ampeg_sustain") zone.ampSustain = number;
+        else zone.ampRelease = number;
+        return true;
+    }
+    if (op == "loop_mode") {
+        const std::string mode = LowerAscii(token.value);
+        if (mode == "loop_continuous") zone.loopMode = 1;
+        else if (mode == "loop_sustain") zone.loopMode = 3;
+        else if (mode == "no_loop" || mode == "one_shot") zone.loopMode = 0;
+        else return false;
+        return true;
+    }
+    unsupported.insert(op);
+    return true;
+}
+
+struct DecodedWave {
+    uint32_t sampleRate = 0;
+    uint16_t channels = 0;
+    uint32_t frames = 0;
+    int rootKey = 60;
+    int64_t loopStart = -1;
+    int64_t loopEnd = -1; // exclusive
+    std::vector<int16_t> planar;
+};
+
+static int32_t ReadSigned24(const uint8_t* p) {
+    int32_t value = static_cast<int32_t>(p[0]) |
+        (static_cast<int32_t>(p[1]) << 8) |
+        (static_cast<int32_t>(p[2]) << 16);
+    if ((value & 0x800000) != 0) value |= ~0xffffff;
+    return value;
+}
+
+static bool DecodeWave(const fs::path& path, DecodedWave& wave) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    file.seekg(0, std::ios::end);
+    const std::streamoff size = file.tellg();
+    if (size < 12 || size > static_cast<std::streamoff>(UINT32_MAX)) return false;
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) return false;
+    if (read_u32(bytes.data()) != 0x46464952u ||
+        read_u32(bytes.data() + 8) != 0x45564157u) return false; // RIFF/WAVE
+
+    uint16_t format = 0, channels = 0, bits = 0, blockAlign = 0;
+    uint32_t sampleRate = 0;
+    const uint8_t* sampleBytes = nullptr;
+    uint32_t sampleByteCount = 0;
+    for (size_t at = 12; at + 8 <= bytes.size();) {
+        const uint32_t id = read_u32(bytes.data() + at);
+        const uint32_t length = read_u32(bytes.data() + at + 4);
+        const size_t dataAt = at + 8;
+        if (dataAt + length > bytes.size()) return false;
+        const uint8_t* chunk = bytes.data() + dataAt;
+        if (id == 0x20746d66u && length >= 16u) { // fmt
+            format = read_u16(chunk);
+            channels = read_u16(chunk + 2);
+            sampleRate = read_u32(chunk + 4);
+            blockAlign = read_u16(chunk + 12);
+            bits = read_u16(chunk + 14);
+            if (format == 0xfffeu && length >= 40u) format = read_u16(chunk + 24);
+        } else if (id == 0x61746164u) { // data
+            sampleBytes = chunk;
+            sampleByteCount = length;
+        } else if (id == 0x6c706d73u && length >= 36u) { // smpl
+            const uint32_t unity = read_u32(chunk + 12);
+            if (unity <= 127u) wave.rootKey = static_cast<int>(unity);
+            const uint32_t loopCount = read_u32(chunk + 28);
+            if (loopCount != 0u && length >= 60u) {
+                wave.loopStart = read_u32(chunk + 44);
+                wave.loopEnd = static_cast<int64_t>(read_u32(chunk + 48)) + 1;
+            }
+        }
+        at = dataAt + length + (length & 1u);
+    }
+    if (!sampleBytes || sampleRate == 0u || channels == 0u || channels > 2u ||
+        blockAlign == 0u || ((format != 1u) && (format != 3u))) return false;
+    if ((format == 1u && bits != 8u && bits != 16u && bits != 24u && bits != 32u) ||
+        (format == 3u && bits != 32u)) return false;
+    const uint32_t frames = sampleByteCount / blockAlign;
+    if (frames < 2u) return false;
+    wave.sampleRate = sampleRate;
+    wave.channels = channels;
+    wave.frames = frames;
+    wave.planar.resize(static_cast<size_t>(frames) * channels);
+    const uint32_t bytesPerSample = bits / 8u;
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+        for (uint32_t channel = 0; channel < channels; ++channel) {
+            const uint8_t* source = sampleBytes +
+                static_cast<size_t>(frame) * blockAlign + channel * bytesPerSample;
+            int32_t value = 0;
+            if (format == 3u) {
+                float f = 0.0f;
+                std::memcpy(&f, source, sizeof(f));
+                if (!std::isfinite(f)) f = 0.0f;
+                f = (std::max)(-1.0f, (std::min)(1.0f, f));
+                value = static_cast<int32_t>(std::lrint(f * 32767.0f));
+            } else if (bits == 8u) {
+                value = (static_cast<int32_t>(*source) - 128) << 8;
+            } else if (bits == 16u) {
+                value = read_i16(source);
+            } else if (bits == 24u) {
+                value = ReadSigned24(source) >> 8;
+            } else {
+                value = static_cast<int32_t>(read_u32(source)) >> 16;
+            }
+            wave.planar[static_cast<size_t>(channel) * frames + frame] =
+                static_cast<int16_t>((std::max)(-32768, (std::min)(32767, value)));
+        }
+    }
+    return true;
+}
+
+static int16_t SecondsToTimecents(double seconds) {
+    if (!(seconds > 0.0)) return -12000;
+    const double value = 1200.0 * std::log2(seconds);
+    return static_cast<int16_t>((std::max)(-12000.0,
+        (std::min)(8000.0, std::round(value))));
+}
+
+static int16_t DbToCentibels(double db) {
+    return static_cast<int16_t>((std::max)(-1440.0,
+        (std::min)(1440.0, std::round(-db * 10.0))));
+}
+
+static int16_t SustainToCentibels(double percent) {
+    percent = (std::max)(0.0, (std::min)(100.0, percent));
+    if (percent >= 100.0) return 0;
+    if (percent <= 0.0) return 1440;
+    return static_cast<int16_t>((std::min)(1440.0,
+        std::round(-200.0 * std::log10(percent / 100.0))));
+}
+
+struct SfzCachedSample {
+    uint16_t indices[2]{};
+    uint16_t channels = 0;
+    uint32_t frames = 0;
+    int rootKey = 60;
+    int64_t loopStart = -1;
+    int64_t loopEnd = -1;
+};
+
+static std::wstring SampleCacheKey(const fs::path& path) {
+    std::wstring key = path.lexically_normal().wstring();
+#if defined(_WIN32)
+    std::transform(key.begin(), key.end(), key.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+#endif
+    return key;
+}
+
+static fs::path Utf8Path(const std::string& text) {
+#if defined(__cpp_char8_t)
+    std::u8string utf8(text.size(), u8'\0');
+    std::memcpy(utf8.data(), text.data(), text.size());
+    return fs::path(utf8);
+#else
+    return fs::u8path(text);
+#endif
+}
+
+static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
+    if (!outData) return false;
+    std::memset(outData, 0, sizeof(*outData));
+    try {
+        std::ifstream input(sfzPath, std::ios::binary);
+        if (!input) return false;
+        const std::string source((std::istreambuf_iterator<char>(input)),
+                                 std::istreambuf_iterator<char>());
+        const std::vector<SfzToken> tokens = TokenizeSfz(source);
+        SfzZone global;
+        SfzZone group = global;
+        SfzZone region;
+        bool inRegion = false;
+        std::string section;
+        std::string defaultPath;
+        std::vector<SfzZone> regions;
+        std::unordered_set<std::string> unsupported;
+        bool haveGroup = false;
+        auto finishRegion = [&]() {
+            if (inRegion && !region.sample.empty()) regions.push_back(region);
+            inRegion = false;
+        };
+        for (const SfzToken& token : tokens) {
+            if (token.header) {
+                finishRegion();
+                section = token.name;
+                if (section == "global") {
+                    global = SfzZone{};
+                    haveGroup = false;
+                } else if (section == "group") {
+                    group = global;
+                    haveGroup = true;
+                } else if (section == "region") {
+                    region = haveGroup ? group : global;
+                    inRegion = true;
+                }
+                continue;
+            }
+            if (section == "control" && token.name == "default_path") {
+                defaultPath = token.value;
+                continue;
+            }
+            SfzZone* target = nullptr;
+            if (section == "global") target = &global;
+            else if (section == "group") target = &group;
+            else if (section == "region" && inRegion) target = &region;
+            if (target && !ApplySfzOpcode(*target, token, unsupported)) {
+                char message[256];
+                std::snprintf(message, sizeof(message),
+                    "[SVMS-SFZ] ignoring invalid %s=%s\n",
+                    token.name.c_str(), token.value.c_str());
+                OutputDebugStringA(message);
+            }
+        }
+        finishRegion();
+        if (regions.empty()) return false;
+
+        std::vector<int16_t> sampleStore;
+        std::unordered_map<std::wstring, SfzCachedSample> cache;
+        std::unordered_map<int, int16_t> classMap;
+        int16_t nextClass = 1;
+        auto mapClass = [&](int raw) -> int16_t {
+            if (raw <= 0) return 0;
+            const auto found = classMap.find(raw);
+            if (found != classMap.end()) return found->second;
+            if (nextClass >= 128) return 0;
+            const int16_t mapped = nextClass++;
+            classMap.emplace(raw, mapped);
+            return mapped;
+        };
+
+        std::strncpy(outData->presets[0].name, "SFZ instrument", 19);
+        outData->presets[0].bank = 0;
+        outData->presets[0].preset = 0;
+        outData->presetCount = 1;
+        outData->presetRegionStart[0] = 0;
+
+        for (const SfzZone& zone : regions) {
+            if (zone.keyLo > zone.keyHi || zone.velLo > zone.velHi) continue;
+            std::string sampleText = zone.sample;
+            std::replace(sampleText.begin(), sampleText.end(), '\\', '/');
+            std::string defaultText = defaultPath;
+            std::replace(defaultText.begin(), defaultText.end(), '\\', '/');
+            fs::path samplePath = Utf8Path(sampleText);
+            if (samplePath.is_relative())
+                samplePath = sfzPath.parent_path() / Utf8Path(defaultText) /
+                             samplePath;
+            samplePath = samplePath.lexically_normal();
+            const std::wstring key = SampleCacheKey(samplePath);
+            SfzCachedSample cached{};
+            const auto found = cache.find(key);
+            if (found != cache.end()) {
+                cached = found->second;
+            } else {
+                DecodedWave wave;
+                if (!DecodeWave(samplePath, wave)) {
+                    char message[512];
+                    std::snprintf(message, sizeof(message),
+                        "[SVMS-SFZ] skipping unreadable WAV: %s\n",
+                        sampleText.c_str());
+                    OutputDebugStringA(message);
+                    continue;
+                }
+                if (outData->sampleCount + wave.channels > kMaxSamples)
+                    break;
+                cached.channels = wave.channels;
+                cached.frames = wave.frames;
+                cached.rootKey = wave.rootKey;
+                cached.loopStart = wave.loopStart;
+                cached.loopEnd = wave.loopEnd;
+                for (uint32_t channel = 0; channel < wave.channels; ++channel) {
+                    const uint16_t index = static_cast<uint16_t>(outData->sampleCount++);
+                    cached.indices[channel] = index;
+                    SF2Sample& sample = outData->samples[index];
+                    std::memset(&sample, 0, sizeof(sample));
+                    const std::string filename = samplePath.filename().string();
+                    std::strncpy(sample.name, filename.c_str(), 19);
+                    sample.start = static_cast<uint32_t>(sampleStore.size());
+                    sampleStore.insert(sampleStore.end(),
+                        wave.planar.begin() + static_cast<size_t>(channel) * wave.frames,
+                        wave.planar.begin() + static_cast<size_t>(channel + 1u) * wave.frames);
+                    sampleStore.push_back(0); // interpolation guard
+                    sample.end = sample.start + wave.frames;
+                    sample.loopStart = wave.loopStart >= 0
+                        ? sample.start + static_cast<uint32_t>(wave.loopStart) : 0u;
+                    sample.loopEnd = wave.loopEnd >= 0
+                        ? sample.start + static_cast<uint32_t>(wave.loopEnd) : 0u;
+                    sample.sampleRate = wave.sampleRate;
+                    sample.originalPitch = static_cast<uint8_t>(wave.rootKey);
+                    sample.sampleType = wave.channels == 1u ? 1u
+                        : static_cast<uint16_t>(channel == 0u ? 4u : 2u);
+                }
+                cache.emplace(key, cached);
+            }
+
+            const int16_t groupClass = mapClass(zone.group);
+            const int16_t offByClass = mapClass(zone.offBy);
+            for (uint32_t channel = 0; channel < cached.channels; ++channel) {
+                if (outData->regionCount >= SF2Data::kMaxCompiledRegions) {
+                    outData->regionOverflow = true;
+                    break;
+                }
+                const SF2Sample& sample = outData->samples[cached.indices[channel]];
+                const int64_t startRel = (std::max)(int64_t(0),
+                    (std::min)(static_cast<int64_t>(cached.frames - 1u), zone.offset));
+                int64_t endRel = zone.end >= 0 ? zone.end + 1
+                                               : cached.frames;
+                endRel = (std::max)(startRel + 1,
+                    (std::min)(static_cast<int64_t>(cached.frames), endRel));
+                int64_t loopStart = zone.loopStart >= 0
+                    ? zone.loopStart : cached.loopStart;
+                int64_t loopEnd = zone.loopEnd >= 0
+                    ? zone.loopEnd + 1 : cached.loopEnd;
+                loopStart = (std::max)(startRel, loopStart);
+                loopEnd = (std::min)(endRel, loopEnd);
+                uint8_t loopMode = static_cast<uint8_t>(zone.loopMode);
+                if (loopEnd <= loopStart + 1) loopMode = 0u;
+
+                SFSampleRegion& compiled = outData->regions[outData->regionCount++];
+                std::memset(&compiled, 0, sizeof(compiled));
+                compiled.sampleIndex = cached.indices[channel];
+                compiled.presetIndex = 0;
+                compiled.keyLo = static_cast<uint8_t>((std::max)(0, (std::min)(127, zone.keyLo)));
+                compiled.keyHi = static_cast<uint8_t>((std::max)(0, (std::min)(127, zone.keyHi)));
+                compiled.velLo = static_cast<uint8_t>((std::max)(0, (std::min)(127, zone.velLo)));
+                compiled.velHi = static_cast<uint8_t>((std::max)(0, (std::min)(127, zone.velHi)));
+                compiled.rootKey = static_cast<int8_t>(zone.rootKey >= 0
+                    ? zone.rootKey : cached.rootKey);
+                compiled.coarseTune = static_cast<int16_t>((std::max)(-127,
+                    (std::min)(127, zone.transpose)));
+                compiled.fineTune = static_cast<int16_t>((std::max)(-1200,
+                    (std::min)(1200, zone.tune)));
+                compiled.scaleTuning = static_cast<int16_t>((std::max)(0,
+                    (std::min)(1200, zone.keyTrack)));
+                compiled.startOffset = static_cast<int32_t>(sample.start + startRel);
+                compiled.endOffset = static_cast<int32_t>(sample.start + endRel);
+                compiled.loopStartOffset = loopMode != 0u
+                    ? static_cast<int32_t>(sample.start + loopStart) : 0;
+                compiled.loopEndOffset = loopMode != 0u
+                    ? static_cast<int32_t>(sample.start + loopEnd) : 0;
+                compiled.loopMode = loopMode;
+                compiled.delayVolEnv = SecondsToTimecents(zone.ampDelay);
+                compiled.attackVolEnv = SecondsToTimecents(zone.ampAttack);
+                compiled.holdVolEnv = SecondsToTimecents(zone.ampHold);
+                compiled.decayVolEnv = zone.ampSustain >= 100.0
+                    ? -12000 : SecondsToTimecents(zone.ampDecay);
+                compiled.sustainVolEnv = SustainToCentibels(zone.ampSustain);
+                compiled.releaseVolEnv = SecondsToTimecents(zone.ampRelease);
+                double channelDb = zone.volumeDb;
+                if (cached.channels == 2u) {
+                    const double normalizedPan = (std::max)(-1.0,
+                        (std::min)(1.0, zone.pan / 100.0));
+                    const double channelGain = channel == 0u
+                        ? std::sqrt(1.0 - (std::max)(0.0, normalizedPan))
+                        : std::sqrt(1.0 + (std::min)(0.0, normalizedPan));
+                    channelDb += channelGain > 0.0
+                        ? 20.0 * std::log10(channelGain) : -144.0;
+                    compiled.pan = channel == 0u ? -500 : 500;
+                } else {
+                    compiled.pan = static_cast<int16_t>(std::round(
+                        (std::max)(-100.0, (std::min)(100.0, zone.pan)) * 5.0));
+                }
+                compiled.initialAttenuation = DbToCentibels(channelDb);
+                compiled.exclusiveClass = groupClass;
+                // A negative value distinguishes an SFZ membership-only
+                // group from SF2's implicit exclusive-class self-choke.
+                compiled.offByClass = zone.offBy > 0 ? offByClass
+                    : (zone.group > 0 ? int16_t(-1) : int16_t(0));
+            }
+            if (outData->regionOverflow) break;
+        }
+        if (outData->regionCount == 0u || outData->sampleCount == 0u ||
+            sampleStore.empty()) return false;
+        sampleStore.insert(sampleStore.end(), 8u, 0);
+        outData->sampleDataFrames = static_cast<uint32_t>(sampleStore.size() - 8u);
+        outData->sampleDataSize = outData->sampleDataFrames * sizeof(int16_t);
+        outData->sampleData = static_cast<int16_t*>(std::malloc(
+            sampleStore.size() * sizeof(int16_t)));
+        if (!outData->sampleData) return false;
+        std::memcpy(outData->sampleData, sampleStore.data(),
+                    sampleStore.size() * sizeof(int16_t));
+        outData->presetRegionCount[0] = outData->regionCount;
+        outData->fallbackPresetIndex = 0;
+        outData->loaded = true;
+        outData->isSfz = true;
+        char message[256];
+        std::snprintf(message, sizeof(message),
+            "[SVMS-SFZ] compiled %u regions, %u samples, %u frames; %u unsupported opcodes ignored\n",
+            outData->regionCount, outData->sampleCount,
+            outData->sampleDataFrames,
+            static_cast<unsigned>(unsupported.size()));
+        OutputDebugStringA(message);
+        return true;
+    } catch (const std::exception&) {
+        sf2_free(outData);
+        return false;
+    }
+}
+
+static bool HasExtension(const fs::path& path, const wchar_t* extension) {
+    std::wstring actual = path.extension().wstring();
+    std::transform(actual.begin(), actual.end(), actual.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+    return actual == extension;
+}
+
+} // namespace
+
+bool sfz_load(const char* path, SF2Data* outData) {
+    if (!path || !outData) return false;
+    return LoadSfzPath(Utf8Path(path), outData);
+}
+
+bool sfz_load(const wchar_t* path, SF2Data* outData) {
+    if (!path || !outData) return false;
+    return LoadSfzPath(fs::path(path), outData);
+}
+
+bool soundfont_load(const char* path, SF2Data* outData) {
+    if (!path || !outData) return false;
+    return HasExtension(Utf8Path(path), L".sfz")
+        ? sfz_load(path, outData) : sf2_load(path, outData);
+}
+
+bool soundfont_load(const wchar_t* path, SF2Data* outData) {
+    if (!path || !outData) return false;
+    return HasExtension(fs::path(path), L".sfz")
+        ? sfz_load(path, outData) : sf2_load(path, outData);
+}
+
 void sf2_free(SF2Data* data) {
     free(data->sampleData);
     free(data->resampledData);
@@ -359,6 +1033,10 @@ static int16_t clamp_gen_value(SF2GeneratorType gen, int16_t amount) {
 bool sf2_find_preset(const SF2Data* data, uint16_t bank, uint16_t preset,
                      uint32_t* outPresetIndex) {
     if (!data || !outPresetIndex) return false;
+    if (data->isSfz && data->presetCount != 0u) {
+        *outPresetIndex = 0u;
+        return true;
+    }
     for (uint32_t i = 0; i < data->presetCount; ++i) {
         if (data->presets[i].bank == bank && data->presets[i].preset == preset) {
             *outPresetIndex = i;
@@ -371,6 +1049,11 @@ bool sf2_find_preset(const SF2Data* data, uint16_t bank, uint16_t preset,
 bool sf2_resolve_preset(const SF2Data* data, uint16_t bank, uint8_t program,
                         bool percussionChannel, uint32_t* outPresetIndex) {
     if (!data || !outPresetIndex) return false;
+
+    if (data->isSfz && data->presetCount != 0u) {
+        *outPresetIndex = 0u;
+        return true;
+    }
 
     if (percussionChannel) {
         if (sf2_find_preset(data, static_cast<uint16_t>(128u | bank), program,
@@ -917,9 +1600,13 @@ static void AppendCompiledRegion(SF2Data* data, uint32_t presetIndex,
     region.modEnvToFilterFc = merged.modEnvToFilterFc;
     region.modLfoToVolume = merged.modLfoToVolume;
     region.exclusiveClass = merged.exclusiveClass;
+    region.offByClass = merged.exclusiveClass;
 }
 
 void sf2_build_regions(SF2Data* data) {
+    // SFZ bypasses the SF2 bag/generator compiler but produces the identical
+    // final region tables. Keep those direct compiled regions intact.
+    if (data && data->isSfz) return;
     data->regionCount = 0;
     std::memset(data->presetRegionStart, 0, sizeof(data->presetRegionStart));
     std::memset(data->presetRegionCount, 0, sizeof(data->presetRegionCount));

@@ -63,7 +63,7 @@ public:
         maxVoices_ = config.maxVoices;
         master_ = config.masterVolume;
         sf2_.reset(new SF2Data{});
-        if (!sf2_load(config.soundfont.c_str(), sf2_.get())) {
+        if (!soundfont_load(config.soundfont.c_str(), sf2_.get())) {
             error = "failed to load SoundFont";
             return false;
         }
@@ -480,7 +480,8 @@ private:
                                     prepared.bendScale;
             prepared.baseStep[note] = sampleRatio * powf(2.0f, semitones / 12.0f);
         }
-        prepared.attenuation = region.initialAttenuation > 0
+        prepared.attenuation = (region.initialAttenuation > 0 ||
+                                (sf2_->isSfz && region.initialAttenuation != 0))
             ? InitialAttenuationToGain(float(region.initialAttenuation)) : 1.0f;
         prepared.sustain = (std::min)(
             1.0f, SustainAttenuationToGain(
@@ -611,6 +612,12 @@ private:
             voice.gainRight = prepared.panR;
             voice.presetIndex = uint16_t(preset);
             voice.regionIndex = uint16_t(regionIndex);
+            voice.exclusiveClass = region.exclusiveClass > 0
+                ? uint16_t(region.exclusiveClass) : 0u;
+            voice.offByClass = region.offByClass < 0
+                ? UINT16_MAX
+                : (region.offByClass > 0
+                    ? uint16_t(region.offByClass) : 0u);
             voice.sampleBacked = 1;
         }
         // Production launch path: one transaction resolves the batched

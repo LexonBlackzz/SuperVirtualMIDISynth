@@ -925,6 +925,7 @@ private:
     void AdvanceDenseTailsTo(VoiceManager& voices, uint32_t frameOffset);
     static void DensePreTailCapture(VoiceHandle handle, void* userData);
     static void DenseVoiceConfigured(VoiceHandle handle, void* userData);
+    static void DenseVoiceReleased(VoiceHandle handle, void* userData);
     static void DenseIndexedJob(uint32_t jobIndex, const IndexedJobMix& mix,
                      uint32_t frameCount, void* userData);
     void RenderDenseVoiceTile(const DenseChunkPlan& plan, uint32_t tileIndex,
@@ -2695,6 +2696,21 @@ inline void RenderScalar::DenseVoiceConfigured(
         renderer->densePlannerCursor_;
 }
 
+inline void RenderScalar::DenseVoiceReleased(
+    VoiceHandle handle, void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    if (!renderer || !renderer->densePlannerVoices_ ||
+        handle >= renderer->scratchCapacity_)
+        return;
+    renderer->AdvanceDenseHandleTo(*renderer->densePlannerVoices_, handle,
+                                   renderer->densePlannerCursor_);
+    renderer->AdvanceDensePhaseTo(*renderer->densePlannerVoices_, handle,
+                                  renderer->densePlannerCursor_);
+    if (renderer->denseMarkEpoch_[handle] == renderer->denseEpoch_) return;
+    renderer->denseMarkEpoch_[handle] = renderer->denseEpoch_;
+    renderer->denseMarkedHandles_[renderer->denseMarkedCount_++] = handle;
+}
+
 inline void RenderScalar::RenderDenseVoiceTile(
     const DenseChunkPlan& plan, uint32_t tileIndex, float* outputLeft,
     float* outputRight, uint32_t frameCount, uint32_t blockFrameOffset,
@@ -3087,6 +3103,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
     denseTailAdvancedFrame_ = rangeStart;
     voices.SetPreTailCaptureHook(DensePreTailCapture, this);
     voices.SetVoiceConfiguredHook(DenseVoiceConfigured, this);
+    voices.SetVoiceReleaseHook(DenseVoiceReleased, this);
 
     uint32_t eventIndex = eventIndexBegin;
     bool renderInFlight = false;
@@ -3277,6 +3294,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
                     denseMutationCapacity_) {
                     voices.SetPreTailCaptureHook(nullptr, nullptr);
                     voices.SetVoiceConfiguredHook(nullptr, nullptr);
+                    voices.SetVoiceReleaseHook(nullptr, nullptr);
                     densePlannerVoices_ = nullptr;
                     if (renderInFlight) workerPool_->FinishIndexed();
                     // Feed the adaptive gate: a capacity overrun means this
@@ -3370,6 +3388,7 @@ inline bool RenderScalar::RenderBlockDensePlanned(
     if (renderInFlight) workerPool_->FinishIndexed();
     voices.SetPreTailCaptureHook(nullptr, nullptr);
     voices.SetVoiceConfiguredHook(nullptr, nullptr);
+    voices.SetVoiceReleaseHook(nullptr, nullptr);
     densePlannerVoices_ = nullptr;
 
     // Worker shadow state is authoritative for render progress. MIDI/linkage

@@ -83,7 +83,7 @@ bool BrowseSoundFont(std::wstring& path, std::wstring& lastDirectory,
     wchar_t fileBuf[1024] = {};
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFilter = L"SoundFont files (*.sf2)\0*.sf2\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"SoundFont files (*.sf2;*.sfz)\0*.sf2;*.sfz\0All files (*.*)\0*.*\0";
     ofn.lpstrFile = fileBuf;
     ofn.nMaxFile = static_cast<DWORD>(_countof(fileBuf));
     ofn.lpstrInitialDir = lastDirectory.empty() ? nullptr : lastDirectory.c_str();
@@ -709,13 +709,17 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 scannedDir = scanDir;
                 folderFonts.clear();
                 std::error_code ec;
-                for (std::filesystem::directory_iterator it(scanDir, ec), end;
-                     it != end; ++it) {
+                for (std::filesystem::recursive_directory_iterator it(
+                         scanDir,
+                         std::filesystem::directory_options::skip_permission_denied,
+                         ec), end;
+                     !ec && it != end; it.increment(ec)) {
                     if (ec) break;
                     const std::wstring ext = it->path().extension().wstring();
                     if (_wcsicmp(ext.c_str(), L".sf2") == 0 ||
-                        _wcsicmp(ext.c_str(), L".dls") == 0) {
-                        folderFonts.push_back(it->path().filename().wstring());
+                        _wcsicmp(ext.c_str(), L".sfz") == 0) {
+                        folderFonts.push_back(
+                            it->path().lexically_relative(scanDir).wstring());
                     }
                 }
                 std::sort(folderFonts.begin(), folderFonts.end());
@@ -745,8 +749,10 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 continue;
             }
             const bool selected = !w.soundFontPath.empty() &&
-                _wcsicmp(file.c_str(),
-                         std::filesystem::path(w.soundFontPath).filename().c_str()) == 0;
+                _wcsicmp((std::filesystem::path(scannedDir) / file)
+                             .lexically_normal().c_str(),
+                         std::filesystem::path(w.soundFontPath)
+                             .lexically_normal().c_str()) == 0;
             if (ImGui::Selectable(name.c_str(), selected)) {
                 SetPrimarySoundFont(
                     w, (std::filesystem::path(scannedDir) / file).wstring());

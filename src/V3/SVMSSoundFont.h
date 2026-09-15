@@ -85,6 +85,10 @@ struct SFSampleRegion {
     int16_t modEnvToFilterFc;
     int16_t modLfoToVolume;
     int16_t exclusiveClass;
+    // Compiled SFZ group/off_by identifiers. SF2 exclusiveClass populates
+    // both fields with the same value. SFZ uses -1 for a group with no
+    // off_by so membership alone does not acquire SF2 self-choke semantics.
+    int16_t offByClass;
 };
 
 enum SF2GeneratorType : uint16_t {
@@ -220,6 +224,9 @@ struct SF2Data {
     uint32_t resampledSampleRate;
 
     bool loaded;
+    // SFZ is compiled directly into the same sample/header/region tables.
+    // Its single instrument intentionally resolves for every MIDI program.
+    bool isSfz;
 };
 
 struct InstrumentVoiceParams {
@@ -246,6 +253,12 @@ struct InstrumentVoiceParams {
 
 bool sf2_load(const char* path, SF2Data* outData);
 bool sf2_load(const wchar_t* path, SF2Data* outData);
+bool sfz_load(const char* path, SF2Data* outData);
+bool sfz_load(const wchar_t* path, SF2Data* outData);
+// Format-dispatching frontend used by V3 runtime/offline loaders. Existing
+// sf2_load callers retain strict SF2 behavior.
+bool soundfont_load(const char* path, SF2Data* outData);
+bool soundfont_load(const wchar_t* path, SF2Data* outData);
 void sf2_free(SF2Data* data);
 bool sf2_resample(SF2Data* data, uint32_t targetRate, InterpolationMode mode);
 

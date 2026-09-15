@@ -5562,6 +5562,264 @@ void TestPerKeyVoiceCap() {
     }
 }
 
+void TestExclusiveClassLifecycle() {
+    svms::ChannelParamsSnapshot channel{};
+    channel.volume = channel.expression = 1.0f;
+    channel.panLeft = channel.panRight = 0.70710678f;
+    channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
+
+    svms::VoiceConfiguration base{};
+    base.sampleStart = 0u;
+    base.sampleEnd = 128u;
+    base.loopStart = 8u;
+    base.loopEnd = 120u;
+    base.loopMode = 1u;
+    base.phaseStep = base.basePhaseStep = 1.0f;
+    base.initialGain = base.sustainLevel = 1.0f;
+    base.gainLeft = base.gainRight = 0.1f;
+
+    auto voices = std::make_unique<svms::VoiceManager>();
+    Check(voices->Initialize(16u, 44100u),
+          "exclusive-class pool initializes");
+
+    svms::VoiceConfiguration oldLayers[2] = {base, base};
+    oldLayers[0].exclusiveClass = oldLayers[1].exclusiveClass = 7u;
+    svms::VoiceHandle oldGroup[2]{};
+    Check(voices->LaunchVoiceGroup(0u, 42u, 100u, oldLayers, 2u, 100u,
+                                   channel, oldGroup),
+          "layered exclusive-class note launches");
+
+    svms::VoiceConfiguration other = base;
+    other.exclusiveClass = 9u;
+    svms::VoiceHandle otherClass = svms::kInvalidVoice;
+    Check(voices->LaunchVoiceGroup(0u, 44u, 100u, &other, 1u, 101u,
+                                   channel, &otherClass),
+          "different exclusive class launches");
+    other.exclusiveClass = 7u;
+    svms::VoiceHandle otherChannel = svms::kInvalidVoice;
+    Check(voices->LaunchVoiceGroup(1u, 46u, 100u, &other, 1u, 102u,
+                                   channel, &otherChannel),
+          "same exclusive class on another channel launches");
+    other.exclusiveClass = 0u;
+    svms::VoiceHandle unclassified = svms::kInvalidVoice;
+    Check(voices->LaunchVoiceGroup(0u, 48u, 100u, &other, 1u, 103u,
+                                   channel, &unclassified),
+          "class zero note launches");
+    Check(voices->GrowCapacity(24u),
+          "exclusive-class index survives voice-pool growth");
+
+    svms::VoiceConfiguration replacement[2] = {base, base};
+    replacement[0].exclusiveClass = replacement[1].exclusiveClass = 7u;
+    svms::VoiceHandle newGroup[2]{};
+    constexpr uint32_t kChokeFrame = 37u;
+    Check(voices->LaunchVoiceGroup(0u, 50u, 100u, replacement, 2u, 200u,
+                                   channel, newGroup, kChokeFrame),
+          "replacement exclusive-class note launches");
+
+    const uint32_t fastRelease = svms::MakeReleaseSamples(
+        svms::kMinReleaseSeconds, 44100u);
+    Check(voices->v.state[oldGroup[0]] ==
+              static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+          voices->v.state[oldGroup[1]] ==
+              static_cast<uint8_t>(svms::VoiceState::Releasing),
+          "exclusive class chokes the complete previous play group");
+    Check(voices->v.releaseStartInBlock[oldGroup[0]] == kChokeFrame &&
+          voices->v.releaseStartInBlock[oldGroup[1]] == kChokeFrame &&
+          voices->v.releaseSamplesRemaining[oldGroup[0]] == fastRelease &&
+          voices->v.releaseSamplesRemaining[oldGroup[1]] == fastRelease,
+          "exclusive choke starts an exact-frame minimum release");
+    Check(voices->v.state[newGroup[0]] ==
+              static_cast<uint8_t>(svms::VoiceState::Active) &&
+          voices->v.state[newGroup[1]] ==
+              static_cast<uint8_t>(svms::VoiceState::Active) &&
+          voices->v.playIndex[newGroup[0]] == 200u &&
+          voices->v.playIndex[newGroup[1]] == 200u,
+          "layers born by one note do not choke each other");
+    Check(voices->v.state[otherClass] ==
+              static_cast<uint8_t>(svms::VoiceState::Active) &&
+          voices->v.state[otherChannel] ==
+              static_cast<uint8_t>(svms::VoiceState::Active) &&
+          voices->v.state[unclassified] ==
+              static_cast<uint8_t>(svms::VoiceState::Active),
+          "exclusive choke is isolated by class and MIDI channel");
+}
+
+void WriteTestWave(const std::filesystem::path& path) {
+    constexpr uint32_t kFrames = 96u;
+    constexpr uint32_t kDataBytes = kFrames * sizeof(int16_t);
+    auto put16 = [](std::ofstream& stream, uint16_t value) {
+        const char bytes[2] = {char(value), char(value >> 8u)};
+        stream.write(bytes, sizeof(bytes));
+    };
+    auto put32 = [](std::ofstream& stream, uint32_t value) {
+        const char bytes[4] = {char(value), char(value >> 8u),
+            char(value >> 16u), char(value >> 24u)};
+        stream.write(bytes, sizeof(bytes));
+    };
+    std::ofstream output(path, std::ios::binary);
+    output.write("RIFF", 4); put32(output, 36u + kDataBytes);
+    output.write("WAVEfmt ", 8); put32(output, 16u);
+    put16(output, 1u); put16(output, 1u); put32(output, 44100u);
+    put32(output, 88200u); put16(output, 2u); put16(output, 16u);
+    output.write("data", 4); put32(output, kDataBytes);
+    for (uint32_t frame = 0; frame < kFrames; ++frame) {
+        const int16_t value = static_cast<int16_t>(
+            std::sin(static_cast<double>(frame) * 0.31) * 24000.0);
+        put16(output, static_cast<uint16_t>(value));
+    }
+}
+
+void TestSfzParserAndPlayback() {
+    namespace fs = std::filesystem;
+    wchar_t tempRoot[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempRoot);
+    const fs::path directory = fs::path(tempRoot) /
+        (L"svms_sfz_test_" + std::to_wstring(GetCurrentProcessId()));
+    const fs::path samples = directory / L"Samples";
+    const fs::path instruments = directory / L"Instruments";
+    std::error_code ec;
+    fs::remove_all(directory, ec);
+    fs::create_directories(samples, ec);
+    fs::create_directories(instruments, ec);
+    const fs::path wavePath = samples / L"My Tone.wav";
+    const fs::path sfzPath = instruments / L"Mapped Instrument.sfz";
+    WriteTestWave(wavePath);
+    {
+        std::ofstream sfz(sfzPath, std::ios::binary);
+        sfz << "<control> default_path=../Samples/\n"
+               "<group> sample=My Tone.wav lovel=10 hivel=100 "
+               "pitch_keycenter=C3 transpose=2 tune=-7 pitch_keytrack=50 "
+               "volume=-6 pan=-20 offset=2 end=80 loop_mode=loop_sustain "
+               "loop_start=8 loop_end=40 ampeg_attack=0.01 "
+               "ampeg_decay=0.2 ampeg_sustain=50 ampeg_release=0.3 group=11\n"
+               "<region> lokey=C4 hikey=C4 cutoff=1200\n"
+               "<region> lokey=61 hikey=61 group=12 off_by=11 volume=3\n";
+    }
+
+    auto data = std::make_unique<svms::SF2Data>();
+    Check(svms::soundfont_load(sfzPath.c_str(), data.get()),
+          "SFZ frontend loads an external WAV with a relative spaced path");
+    if (!data->loaded) {
+        fs::remove_all(directory, ec);
+        return;
+    }
+    const uint32_t compiledCount = data->regionCount;
+    svms::sf2_build_regions(data.get());
+    Check(data->isSfz && data->regionCount == 2u &&
+              data->regionCount == compiledCount && data->sampleCount == 1u,
+          "SFZ compiles directly into stable shared sample/region tables");
+
+    SetEnvironmentVariableW(L"SVMS_TEST_SOUNDFONT_DIRECTORY",
+                            directory.c_str());
+    svms::EngineConfig discovered = svms::EngineConfig::Default();
+    discovered.soundFontPath.clear();
+    std::string discoveryWarning;
+    Check(fs::path(svms::ResolveV3SoundFontPath(
+              discovered, &discoveryWarning)).lexically_normal() ==
+              sfzPath.lexically_normal(),
+          "recursive local discovery finds SFZ instruments in subfolders");
+    discovered.soundFontPath = L"Instruments\\Mapped Instrument.sfz";
+    Check(fs::path(svms::ResolveV3SoundFontPath(discovered)).lexically_normal() ==
+              sfzPath.lexically_normal(),
+          "configured SFZ selection retains and resolves its relative subfolder path");
+    SetEnvironmentVariableW(L"SVMS_TEST_SOUNDFONT_DIRECTORY", nullptr);
+    Check(data->sampleDataFrames >= 97u &&
+              data->sampleData[data->sampleDataFrames + 7u] == 0,
+          "SFZ sample store carries the required eight-sample AVX2 padding");
+
+    uint32_t preset = UINT32_MAX;
+    Check(svms::sf2_resolve_preset(data.get(), 37u, 99u, false, &preset) &&
+              preset == 0u,
+          "single SFZ instrument remains selected across MIDI bank/program changes");
+    const svms::SFSampleRegion* matches[4]{};
+    Check(svms::sf2_find_regions(data.get(), preset, 60u, 9u,
+                                 matches, 4u) == 0u &&
+              svms::sf2_find_regions(data.get(), preset, 60u, 64u,
+                                     matches, 4u) == 1u,
+          "SFZ inherited key and velocity mapping selects exact regions");
+    const svms::SFSampleRegion& first = data->regions[0];
+    const svms::SFSampleRegion& second = data->regions[1];
+    Check(first.rootKey == 48 && first.coarseTune == 2 &&
+              first.fineTune == -7 && first.scaleTuning == 50,
+          "SFZ pitch center, transpose, tune, and key tracking compile");
+    Check(first.initialAttenuation == 60 && first.pan == -100 &&
+              first.startOffset == 2 && first.endOffset == 81,
+          "SFZ gain, pan, and sample bounds compile");
+    Check(first.loopMode == 3u && first.loopStartOffset == 8 &&
+              first.loopEndOffset == 41 && first.attackVolEnv < -7900 &&
+              first.sustainVolEnv == 60 && first.releaseVolEnv < -2000,
+          "SFZ loops and amp envelope compile into shared region units");
+    Check(first.exclusiveClass != 0 && first.offByClass == -1 &&
+              second.exclusiveClass != first.exclusiveClass &&
+              second.offByClass == first.exclusiveClass &&
+              second.initialAttenuation == -30,
+          "SFZ group/off_by compile as separate membership and choke classes");
+
+    auto voices = std::make_unique<svms::VoiceManager>();
+    Check(voices->Initialize(4u, 44100u), "SFZ playback voice pool initializes");
+    svms::ChannelCache channels;
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    channels.RebuildCache(cfg, 44100.0f);
+    svms::VoiceConfiguration setup{};
+    setup.sampleStart = static_cast<uint32_t>(first.startOffset);
+    setup.sampleEnd = static_cast<uint32_t>(first.endOffset);
+    setup.loopStart = static_cast<uint32_t>(first.loopStartOffset);
+    setup.loopEnd = static_cast<uint32_t>(first.loopEndOffset);
+    setup.loopMode = first.loopMode;
+    setup.phaseStep = setup.basePhaseStep = 1.0f;
+    setup.initialGain = svms::InitialAttenuationToGain(
+        static_cast<float>(first.initialAttenuation));
+    setup.sustainLevel = svms::SustainAttenuationToGain(
+        static_cast<float>(first.sustainVolEnv));
+    setup.releaseDecay = 0.999f;
+    setup.releaseSamples = 4410u;
+    channels.ComputeSoundFontPan(first.pan, setup.gainLeft, setup.gainRight);
+    setup.exclusiveClass = static_cast<uint16_t>(first.exclusiveClass);
+    setup.offByClass = first.offByClass < 0
+        ? UINT16_MAX : static_cast<uint16_t>(first.offByClass);
+    svms::VoiceHandle voice = svms::kInvalidVoice;
+    Check(voices->LaunchVoiceGroup(0u, 60u, 64u, &setup, 1u, 1u,
+                                   channels.GetParams()[0], &voice),
+          "compiled SFZ region launches through the normal voice transaction");
+    float left[48]{}, right[48]{};
+    svms::RenderScalar renderer;
+    renderer.RenderBlock(*voices, channels, data->sampleData,
+                         data->sampleDataFrames, left, right, 48u, cfg);
+    float peak = 0.0f;
+    for (float value : left) peak = (std::max)(peak, std::fabs(value));
+    Check(peak > 0.05f,
+          "compiled SFZ WAV renders through the existing scalar sample path");
+
+    svms::VoiceHandle sameGroupVoice = svms::kInvalidVoice;
+    Check(voices->LaunchVoiceGroup(0u, 60u, 64u, &setup, 1u, 3u,
+                                   channels.GetParams()[0], &sameGroupVoice,
+                                   19u) &&
+              voices->v.state[voice] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active),
+          "SFZ group membership alone does not self-choke");
+
+    svms::VoiceConfiguration choker = setup;
+    choker.exclusiveClass = static_cast<uint16_t>(second.exclusiveClass);
+    choker.offByClass = static_cast<uint16_t>(second.offByClass);
+    svms::VoiceHandle chokerVoice = svms::kInvalidVoice;
+    Check(voices->LaunchVoiceGroup(0u, 61u, 64u, &choker, 1u, 2u,
+                                   channels.GetParams()[0], &chokerVoice, 23u) &&
+              voices->v.state[voice] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+              voices->v.releaseStartInBlock[voice] == 23u &&
+              voices->v.state[sameGroupVoice] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+              voices->v.releaseStartInBlock[sameGroupVoice] == 23u &&
+              voices->v.state[chokerVoice] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active),
+          "SFZ off_by chokes its target group at the exact launch frame");
+
+    svms::sf2_free(data.get());
+    fs::remove_all(directory, ec);
+}
+
 // 16 stereo bus planes for one renderer; planes are exactly kFrames long so
 // a per-block zero-fill leaves no stale audio.
 struct ChannelBusSet {
@@ -6046,6 +6304,8 @@ int main() {
     TestPerChannelLimiterDifferential();
     TestDenseProductionGateParity();
     TestPerKeyVoiceCap();
+    TestExclusiveClassLifecycle();
+    TestSfzParserAndPlayback();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);

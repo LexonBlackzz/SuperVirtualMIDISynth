@@ -166,7 +166,8 @@ std::wstring GetV3LocalConfigPath();
 std::wstring GetV3AppDataConfigPath();
 std::wstring GetV3ModuleDirectory();
 // An explicit absolute or DLL-relative synth.soundfont wins. If it is absent
-// or missing, deterministically discover .sf2 files beside winmm.dll.
+// or missing, deterministically discover .sf2/.sfz files beneath winmm.dll's
+// directory. Relative subpaths are retained for SFZ-relative sample lookup.
 std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
                                     std::string* warning = nullptr);
 std::vector<std::wstring> ResolveV3SoundFontPaths(

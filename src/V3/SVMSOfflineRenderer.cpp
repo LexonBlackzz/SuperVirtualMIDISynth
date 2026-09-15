@@ -259,7 +259,7 @@ bool ParsePhaseRotationMode(const wchar_t* s, uint32_t& out) {
 
 void Usage() {
     fputws(L"SuperVirtualMIDISynth V3 offline renderer\n\n"
-           L"svms_v3_render <input.mid> <soundfont.sf2> <output.wav> [options]\n\n"
+           L"svms_v3_render <input.mid> <instrument.sf2|.sfz> <output.wav> [options]\n\n"
            L"svms_v3_render <input.mid> --scan-only\n\n"
            L"Engine-facing defaults are loaded from the active V3 config; CLI options override them.\n\n"
            L"  --sample-rate N       Output rate (default: V3 config)\n"
@@ -279,7 +279,7 @@ void Usage() {
            L"  --phase-rotation coherent|analytic|sweep|diffuse|random  Post-mix hum-killing phase rotation (default coherent/off)\n"
                        L"  --backend auto|scalar|sse2|avx2|gpu\n"
            L"  --tuning-edo 12|31    Melodic tuning (31EDO key 155 = middle C)\n"
-           L"  --scan-only           Validate/count without loading SF2 or rendering\n"
+           L"  --scan-only           Validate/count without loading an instrument or rendering\n"
            L"  --quiet               Disable once-per-second telemetry\n"
            L"  --machine-progress    Emit tab-separated progress records\n", stderr);
 }
@@ -417,7 +417,7 @@ public:
     bool Initialize(const Options& o, std::string& error) {
         rate_=o.sampleRate; maxVoices_=o.maxVoices; master_=o.masterVolume;
         sf2_.reset(new SF2Data{});
-        if (!sf2_load(o.soundfont.c_str(), sf2_.get())) { error="failed to load SoundFont"; return false; }
+        if (!soundfont_load(o.soundfont.c_str(), sf2_.get())) { error="failed to load SoundFont"; return false; }
         sf2_build_regions(sf2_.get());
         if (sf2_->regionOverflow || sf2_->regionCount == 0) {
             error="SoundFont has no usable compiled regions"; return false;
@@ -524,7 +524,7 @@ private:
         p.bendScale=(rg.scaleTuning?rg.scaleTuning:100)/100.0f;
         const float ratio=float(s.sampleRate?s.sampleRate:44100)/float(rate_);
         for(uint32_t n=0;n<kNoteCount;++n) p.baseStep[n]=ratio*powf(2.0f,((float(n)+rg.coarseTune+rg.fineTune/100.0f-root)*p.bendScale)/12.0f);
-        p.attenuation=rg.initialAttenuation>0?InitialAttenuationToGain(float(rg.initialAttenuation)):1.0f;
+        p.attenuation=(rg.initialAttenuation>0||(sf2_->isSfz&&rg.initialAttenuation!=0))?InitialAttenuationToGain(float(rg.initialAttenuation)):1.0f;
         p.sustain=(std::min)(1.0f,SustainAttenuationToGain((std::max)(0.0f,float(rg.sustainVolEnv))));
         auto samples=[&](int16_t tc){const float s=TimecentsToSeconds(tc);return s>0?uint32_t(s*rate_):0u;};
         p.delay=samples(rg.delayVolEnv);p.hold=samples(rg.holdVolEnv);
@@ -547,12 +547,12 @@ private:
             if(fb<sf2_->presetCount&&fb!=pi)count=ResolveRegions(fb,regionNote,vel,regions,512);
             if(!count||count>512){++missingRegions_;return;}++fallbackRegions_;}
         for(uint32_t i=0;i<count;++i){const uint32_t ri=uint32_t(regions[i]-sf2_->regions);if(ri>=prepared_.size()||!prepared_[ri].valid){++invalidRegions_;return;}}
-        if(playIndex_==0||playIndex_>=UINT32_MAX-1)playIndex_=1;const uint32_t generation=playIndex_++; VoiceHandle handles[512];uint32_t made=0;
-        for(;made<count;++made){handles[made]=voices_.AllocateVoiceOrSteal(ch,note,vel,nullptr,count==1);if(handles[made]==kInvalidVoice){for(uint32_t j=0;j<made;++j)voices_.RetireVoice(handles[j]);return;}}
+        if(playIndex_==0||playIndex_>=UINT32_MAX-1)playIndex_=1;const uint32_t generation=playIndex_++; VoiceHandle handles[512];
         const float velocityGain=float(vel)*float(vel)/(127.0f*127.0f);
         const float bend=channels_.GetPitchBendSemitones(ch);
         for(uint32_t i=0;i<count;++i){const auto& rg=*regions[i];const uint32_t ri=uint32_t(regions[i]-sf2_->regions);const auto& p=prepared_[ri];const float br=p.bendScale==1.0f?bendRatio_[ch]:powf(2.0f,bend*p.bendScale/12.0f);const float gain=velocityGain*p.attenuation;
-            VoiceConfiguration c{};c.sampleStart=uint32_t(rg.startOffset);c.sampleEnd=uint32_t(rg.endOffset);c.loopStart=uint32_t(rg.loopStartOffset);c.loopEnd=uint32_t(rg.loopEndOffset);c.loopMode=rg.loopMode;c.playIndex=generation;c.delaySamples=p.delay;c.holdSamples=p.hold;c.attackSamples=p.attack;c.decaySamples=p.decay;c.releaseSamples=p.release;c.basePhaseStep=RetunePhaseStep(p.baseStep[note],note,p.bendScale,edo31);c.phaseStep=c.basePhaseStep*br;c.pitchBendScale=p.bendScale;c.initialGain=gain;c.sustainLevel=p.sustain;c.attackGainStep=p.attack?gain/p.attack:0;c.decaySlope=p.decaySlope;c.releaseDecay=p.releaseDecay;c.gainLeft=p.panL;c.gainRight=p.panR;c.presetIndex=uint16_t(pi);c.regionIndex=uint16_t(ri);c.sampleBacked=1;voices_.ConfigureVoice(handles[i],c,channels_.GetParams()[ch],count==1);}
+            VoiceConfiguration& c=launchSetups_[i];c={};c.sampleStart=uint32_t(rg.startOffset);c.sampleEnd=uint32_t(rg.endOffset);c.loopStart=uint32_t(rg.loopStartOffset);c.loopEnd=uint32_t(rg.loopEndOffset);c.loopMode=rg.loopMode;c.playIndex=generation;c.delaySamples=p.delay;c.holdSamples=p.hold;c.attackSamples=p.attack;c.decaySamples=p.decay;c.releaseSamples=p.release;c.basePhaseStep=RetunePhaseStep(p.baseStep[note],note,p.bendScale,edo31);c.phaseStep=c.basePhaseStep*br;c.pitchBendScale=p.bendScale;c.initialGain=gain;c.sustainLevel=p.sustain;c.attackGainStep=p.attack?gain/p.attack:0;c.decaySlope=p.decaySlope;c.releaseDecay=p.releaseDecay;c.gainLeft=p.panL;c.gainRight=p.panR;c.presetIndex=uint16_t(pi);c.regionIndex=uint16_t(ri);c.exclusiveClass=rg.exclusiveClass>0?uint16_t(rg.exclusiveClass):0u;c.offByClass=rg.offByClass<0?UINT16_MAX:(rg.offByClass>0?uint16_t(rg.offByClass):0u);c.sampleBacked=1;}
+        if(!voices_.LaunchVoiceGroup(ch,note,vel,launchSetups_,count,generation,channels_.GetParams()[ch],handles))return;
         ++notes_;
     }
     void NoteOff(uint8_t ch,uint8_t note){const bool sustain=channels_.IsSustainActive(ch);channels_.NoteOff(ch,note);const uint32_t p=voices_.FindOldestPlayIndex(ch,note);if(p!=UINT32_MAX)voices_.NoteOffPlayIndex(ch,note,p,sustain,0);}
@@ -563,7 +563,7 @@ private:
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;voices_.ForEachChannelActive(ch,[&](VoiceHandle v){const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));});}
     uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};bool gpuEnabled_=false;uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0,fallbackRegions_=0;
     std::unique_ptr<SF2Data> sf2_;std::vector<int16_t> sampleData_;uint32_t sampleFrames_ = 0;std::vector<PreparedRegion> prepared_;
-    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};
+    VoiceManager voices_;ChannelCache channels_;RenderScalar renderer_;RuntimeConfigSnapshot cfg_{};PostHighPass3Hz postHighPass_{};LimiterRouterState limiter_{};RegionCacheEntry regionCache_[4096]{};VoiceConfiguration launchSetups_[512]{};
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
     GpuSynth gpuSynth_;
 #endif

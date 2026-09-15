@@ -138,7 +138,7 @@ void DrawOverviewPage(ConfigDocument& doc) {
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
         ofn.lpstrFilter =
-            L"SoundFont files (*.sf2;*.dls)\0*.sf2;*.dls\0"
+            L"SoundFont files (*.sf2;*.sfz)\0*.sf2;*.sfz\0"
             L"All files (*.*)\0*.*\0";
         ofn.lpstrFile = fileBuf;
         ofn.nMaxFile = static_cast<DWORD>(std::size(fileBuf));

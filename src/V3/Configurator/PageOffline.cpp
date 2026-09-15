@@ -253,7 +253,7 @@ void OfflineRendererPage::BrowseMidi(HWND owner) {
 
 void OfflineRendererPage::BrowseSoundFont(HWND owner) {
     static const wchar_t filter[] =
-        L"SoundFont 2 files (*.sf2)\0*.sf2\0All files (*.*)\0*.*\0\0";
+        L"SoundFont files (*.sf2;*.sfz)\0*.sf2;*.sfz\0All files (*.*)\0*.*\0\0";
     std::wstring selected = soundFontPath_;
     if (!BrowseOpenFile(owner, L"Select SoundFont", filter,
                         lastSoundFontDirectory_, selected)) return;

@@ -106,29 +106,31 @@ bool IsSoundFontFile(const fs::path& path) {
     std::wstring extension = path.extension().wstring();
     std::transform(extension.begin(), extension.end(), extension.begin(),
                    [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-    return extension == L".sf2";
+    return extension == L".sf2" || extension == L".sfz";
 }
 
 std::vector<fs::path> DiscoverLocalSoundFonts() {
     std::vector<fs::path> paths;
     std::error_code error;
     const fs::path directory = GetSoundFontSearchDirectory();
-    fs::directory_iterator iterator(directory, error);
-    const fs::directory_iterator end;
+    fs::recursive_directory_iterator iterator(
+        directory, fs::directory_options::skip_permission_denied, error);
+    const fs::recursive_directory_iterator end;
     while (!error && iterator != end) {
         if (IsSoundFontFile(iterator->path())) paths.push_back(iterator->path());
         iterator.increment(error);
     }
-    std::sort(paths.begin(), paths.end(), [](const fs::path& left,
-                                             const fs::path& right) {
-        std::wstring a = left.filename().wstring();
-        std::wstring b = right.filename().wstring();
+    std::sort(paths.begin(), paths.end(), [&directory](const fs::path& left,
+                                                       const fs::path& right) {
+        std::wstring a = left.lexically_relative(directory).wstring();
+        std::wstring b = right.lexically_relative(directory).wstring();
         std::transform(a.begin(), a.end(), a.begin(),
                        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
         std::transform(b.begin(), b.end(), b.begin(),
                        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
         if (a != b) return a < b;
-        return left.filename().wstring() < right.filename().wstring();
+        return left.lexically_relative(directory).wstring() <
+               right.lexically_relative(directory).wstring();
     });
     return paths;
 }
@@ -897,11 +899,13 @@ EngineConfig EngineConfig::Load() {
     cfg.configPath = path.wstring();
 
     if (!PathExists(path)) {
-        // A new configuration records an actually discovered DLL-local SF2
+        // A new configuration records an actually discovered DLL-local
+        // SF2/SFZ, retaining subfolder components needed by SFZ samples.
         // instead of baking a particular filename into every installation.
         const auto localSoundFonts = DiscoverLocalSoundFonts();
         if (!localSoundFonts.empty())
-            cfg.soundFontPath = localSoundFonts.front().filename().wstring();
+            cfg.soundFontPath = localSoundFonts.front()
+                .lexically_relative(GetSoundFontSearchDirectory()).wstring();
         if (!cfg.soundFontPath.empty())
             cfg.soundFontPaths.push_back(cfg.soundFontPath);
         json root = MakeDefaultJson(cfg);
@@ -1187,7 +1191,7 @@ std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
     if (localSoundFonts.empty()) {
         if (warning) {
             if (!warning->empty()) *warning += "; ";
-            *warning += "no .sf2 file found beside winmm.dll";
+            *warning += "no .sf2 or .sfz file found beside winmm.dll";
         }
         return {};
     }
@@ -1195,9 +1199,10 @@ std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
     if (warning && (cfg.soundFontPath.empty() || localSoundFonts.size() > 1u)) {
         if (!warning->empty()) *warning += "; ";
         *warning += "using DLL-local SoundFont " +
-                    WideToUtf8(localSoundFonts.front().filename().wstring());
+                    WideToUtf8(localSoundFonts.front()
+                        .lexically_relative(searchDirectory).wstring());
         if (localSoundFonts.size() > 1u)
-            *warning += " (multiple .sf2 files found; set synth.soundfont explicitly)";
+            *warning += " (multiple .sf2/.sfz files found; set synth.soundfont explicitly)";
     }
     return localSoundFonts.front().wstring();
 }

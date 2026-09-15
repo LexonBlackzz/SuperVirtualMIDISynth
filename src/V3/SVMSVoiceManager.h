@@ -63,6 +63,12 @@ struct VoiceConfiguration {
     uint32_t vibLfoDelaySamples = 0u;
     uint16_t presetIndex = UINT16_MAX;
     uint16_t regionIndex = UINT16_MAX;
+    // Membership class for SF2 exclusiveClass / SFZ group.
+    uint16_t exclusiveClass = 0;
+    // Class stopped by this note. Zero falls back to exclusiveClass so
+    // existing SF2/direct callers retain self-choke behavior; UINT16_MAX
+    // explicitly disables choking for SFZ group-only regions.
+    uint16_t offByClass = 0;
     uint8_t loopMode = 0;
     uint8_t sampleBacked = 1;
 };
@@ -207,12 +213,14 @@ public:
     bool LaunchVoiceGroup(uint8_t channel, uint8_t note, uint8_t velocity,
                           const VoiceConfiguration* setups, uint32_t count,
                           const ChannelParamsSnapshot& channelParams,
-                          VoiceHandle* outHandles);
+                          VoiceHandle* outHandles,
+                          uint32_t blockOffset = 0u);
     bool LaunchVoiceGroup(uint8_t channel, uint8_t note, uint8_t velocity,
                           const VoiceConfiguration* setups, uint32_t count,
                           uint32_t playIndex,
                           const ChannelParamsSnapshot& channelParams,
-                          VoiceHandle* outHandles);
+                          VoiceHandle* outHandles,
+                          uint32_t blockOffset = 0u);
 
     // Release a voice (transitions Active → Releasing).  Does NOT free the
     // slot — the voice continues rendering its release tail.
@@ -367,6 +375,14 @@ public:
                                 void* userData) noexcept {
         deferredReleaseHook_ = hook;
         deferredReleaseUserData_ = userData;
+    }
+    // Dense planning uses this notification to snapshot a voice whose
+    // lifecycle changes indirectly during note-on (SF2 exclusiveClass).
+    using VoiceReleaseHook = void (*)(VoiceHandle handle, void* userData);
+    void SetVoiceReleaseHook(VoiceReleaseHook hook,
+                             void* userData) noexcept {
+        voiceReleaseHook_ = hook;
+        voiceReleaseUserData_ = userData;
     }
     // Whole-voice renderer pre-pass: CC120 (All Sound Off) kills every
     // channel voice and channel-owned tail immediately.  While the pre-pass
@@ -852,6 +868,14 @@ private:
     // tracking, so a releasing stereo pair cannot be split either.
     int32_t* playGroupNext_;
     int32_t* playGroupPrev_;
+    // SF2 exclusiveClass is defined for values 1..127.  This intrusive
+    // active-voice index makes choking proportional to the affected groups,
+    // independent of total polyphony.
+    static constexpr uint32_t kExclusiveClassCount = 128u;
+    int32_t exclusiveClassHead_[kChannelCount][kExclusiveClassCount];
+    uint8_t* exclusiveClass_;
+    int32_t* exclusiveClassNext_;
+    int32_t* exclusiveClassPrev_;
     uint32_t lastLinkedPlayIndex_;
     VoiceHandle lastLinkedPlayVoice_;
     uint32_t maxLaunchGroupSize_ = 1u;
@@ -878,6 +902,11 @@ private:
     void LinkChannelKey(VoiceHandle handle);
     void UnlinkChannelKey(VoiceHandle handle);
     void UnlinkPlayGroup(VoiceHandle handle);
+    void LinkExclusiveClass(VoiceHandle handle);
+    void UnlinkExclusiveClass(VoiceHandle handle);
+    void ChokeExclusiveClasses(uint8_t channel,
+                               const VoiceConfiguration* setups,
+                               uint32_t count, uint32_t blockOffset);
     void LinkChannelActive(VoiceHandle handle);
     void UnlinkChannelActive(VoiceHandle handle);
     void MoveChannelActiveInPlace(VoiceHandle handle, uint8_t newChannel);
@@ -987,6 +1016,8 @@ private:
     void* voiceConfiguredUserData_ = nullptr;
     DeferredReleaseHook deferredReleaseHook_ = nullptr;
     void* deferredReleaseUserData_ = nullptr;
+    VoiceReleaseHook voiceReleaseHook_ = nullptr;
+    void* voiceReleaseUserData_ = nullptr;
     SilenceVoiceHook silenceVoiceHook_ = nullptr;
     SilenceTailHook silenceTailHook_ = nullptr;
     void* silenceHookUserData_ = nullptr;
@@ -1031,6 +1062,9 @@ inline VoiceManager::VoiceManager()
     stealCandidateReserved_ = nullptr;
     playGroupNext_ = nullptr;
     playGroupPrev_ = nullptr;
+    exclusiveClass_ = nullptr;
+    exclusiveClassNext_ = nullptr;
+    exclusiveClassPrev_ = nullptr;
     metadataStorage_ = nullptr;
     metadataBytes_ = 0u;
     v.Reset();
@@ -1041,6 +1075,7 @@ inline VoiceManager::VoiceManager()
     std::memset(renderClassHead_, 0xff, sizeof(renderClassHead_));
     std::memset(renderClassTail_, 0xff, sizeof(renderClassTail_));
     std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
+    std::memset(exclusiveClassHead_, 0xff, sizeof(exclusiveClassHead_));
     lastLinkedPlayIndex_ = UINT32_MAX;
     lastLinkedPlayVoice_ = kInvalidVoice;
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
@@ -1115,6 +1150,9 @@ inline size_t VoiceManager::EstimateAllocatedBytes(
     add(sizeof(uint8_t), capacity);
     add(sizeof(int32_t), capacity);
     add(sizeof(int32_t), capacity);
+    add(sizeof(uint8_t), capacity);
+    add(sizeof(int32_t), capacity);
+    add(sizeof(int32_t), capacity);
     if (metadataBytes == (std::numeric_limits<size_t>::max)())
         return metadataBytes;
     const size_t voiceBytes = VoiceSoA::EstimateStorageBytes(capacity);
@@ -1172,6 +1210,9 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     add(sizeof(uint8_t), capacity);  // reserved
     add(sizeof(int32_t), capacity);  // play next
     add(sizeof(int32_t), capacity);  // play previous
+    add(sizeof(uint8_t), capacity);  // exclusive class
+    add(sizeof(int32_t), capacity);  // exclusive class next
+    add(sizeof(int32_t), capacity);  // exclusive class previous
     if (bytes == (std::numeric_limits<size_t>::max)()) return false;
 
     void* allocation = _aligned_malloc(bytes, kMixBufferAlign);
@@ -1238,6 +1279,12 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     playGroupNext_ = static_cast<int32_t*>(
         take(sizeof(int32_t), capacity));
     playGroupPrev_ = static_cast<int32_t*>(
+        take(sizeof(int32_t), capacity));
+    exclusiveClass_ = static_cast<uint8_t*>(
+        take(sizeof(uint8_t), capacity));
+    exclusiveClassNext_ = static_cast<int32_t*>(
+        take(sizeof(int32_t), capacity));
+    exclusiveClassPrev_ = static_cast<int32_t*>(
         take(sizeof(int32_t), capacity));
     return offset <= metadataBytes_;
 }
@@ -1315,6 +1362,8 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
                 sizeof(channelKeyVoiceOldest_));
     std::memcpy(channelKeyVoiceCount_, other.channelKeyVoiceCount_,
                 sizeof(channelKeyVoiceCount_));
+    std::memcpy(exclusiveClassHead_, other.exclusiveClassHead_,
+                sizeof(exclusiveClassHead_));
     std::memcpy(channelMixScaleL_, other.channelMixScaleL_,
                 sizeof(channelMixScaleL_));
     std::memcpy(channelMixScaleR_, other.channelMixScaleR_,
@@ -1394,6 +1443,13 @@ inline void VoiceManager::Reset() {
                 sizeof(*playGroupNext_) * maxVoices_);
     std::memset(playGroupPrev_, 0xff,
                 sizeof(*playGroupPrev_) * maxVoices_);
+    std::memset(exclusiveClass_, 0,
+                sizeof(*exclusiveClass_) * maxVoices_);
+    std::memset(exclusiveClassNext_, 0xff,
+                sizeof(*exclusiveClassNext_) * maxVoices_);
+    std::memset(exclusiveClassPrev_, 0xff,
+                sizeof(*exclusiveClassPrev_) * maxVoices_);
+    std::memset(exclusiveClassHead_, 0xff, sizeof(exclusiveClassHead_));
     activeCount_ = 0;
     currentFrame_ = 0;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
@@ -1575,6 +1631,16 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 static_cast<size_t>(oldCapacity) * sizeof(*playGroupNext_));
     std::memcpy(grown.playGroupPrev_, playGroupPrev_,
                 static_cast<size_t>(oldCapacity) * sizeof(*playGroupPrev_));
+    std::memcpy(grown.exclusiveClass_, exclusiveClass_,
+                static_cast<size_t>(oldCapacity) * sizeof(*exclusiveClass_));
+    std::memcpy(grown.exclusiveClassNext_, exclusiveClassNext_,
+                static_cast<size_t>(oldCapacity) *
+                    sizeof(*exclusiveClassNext_));
+    std::memcpy(grown.exclusiveClassPrev_, exclusiveClassPrev_,
+                static_cast<size_t>(oldCapacity) *
+                    sizeof(*exclusiveClassPrev_));
+    std::memcpy(grown.exclusiveClassHead_, exclusiveClassHead_,
+                sizeof(exclusiveClassHead_));
     grown.lastLinkedPlayIndex_ = lastLinkedPlayIndex_;
     grown.lastLinkedPlayVoice_ = lastLinkedPlayVoice_;
     grown.maxLaunchGroupSize_ = maxLaunchGroupSize_;
@@ -1685,6 +1751,9 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     stealCandidateReserved_ = grown.stealCandidateReserved_;
     playGroupNext_ = grown.playGroupNext_;
     playGroupPrev_ = grown.playGroupPrev_;
+    exclusiveClass_ = grown.exclusiveClass_;
+    exclusiveClassNext_ = grown.exclusiveClassNext_;
+    exclusiveClassPrev_ = grown.exclusiveClassPrev_;
     metadataStorage_ = grown.metadataStorage_;
     metadataBytes_ = grown.metadataBytes_;
     grown.metadataStorage_ = nullptr;
@@ -1702,6 +1771,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 sizeof(channelActiveHead_));
     std::memcpy(channelActiveTail_, grown.channelActiveTail_,
                 sizeof(channelActiveTail_));
+    std::memcpy(exclusiveClassHead_, grown.exclusiveClassHead_,
+                sizeof(exclusiveClassHead_));
     renderClassBlockCount_ = grown.renderClassBlockCount_;
     renderClassFreeTop_ = grown.renderClassFreeTop_;
     renderClassMask_ = grown.renderClassMask_;
@@ -2234,6 +2305,9 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.presetIndex[handle] = UINT16_MAX;
     v.regionIndex[handle] = UINT16_MAX;
     v.playIndex[handle] = UINT32_MAX;
+    exclusiveClass_[handle] = 0u;
+    exclusiveClassNext_[handle] = -1;
+    exclusiveClassPrev_[handle] = -1;
     v.holdSamplesRemaining[handle]   = 0;
     v.attackSamplesRemaining[handle] = 0;
     v.decaySamplesRemaining[handle]  = 0;
@@ -2292,6 +2366,9 @@ inline void VoiceManager::InitializePreparedVoice(
     v.playIndex[handle] = UINT32_MAX;
     playGroupNext_[handle] = -1;
     playGroupPrev_[handle] = -1;
+    exclusiveClass_[handle] = 0u;
+    exclusiveClassNext_[handle] = -1;
+    exclusiveClassPrev_[handle] = -1;
     v.birthFrame[handle] = currentFrame_;
     v.stealFadeInFramesRemaining[handle] = 0u;
     v.stealFadeInFramesTotal[handle] = 0u;
@@ -2355,6 +2432,105 @@ inline void VoiceManager::UnlinkPlayGroup(VoiceHandle handle) {
     }
     playGroupPrev_[handle] = -1;
     playGroupNext_[handle] = -1;
+}
+
+inline void VoiceManager::LinkExclusiveClass(VoiceHandle handle) {
+    if (handle >= maxVoices_ ||
+        v.state[handle] != static_cast<uint8_t>(VoiceState::Active))
+        return;
+    const uint8_t exclusive = exclusiveClass_[handle];
+    if (exclusive == 0u || exclusive >= kExclusiveClassCount) return;
+    const uint8_t channel = v.channel[handle];
+    const int32_t previousHead = exclusiveClassHead_[channel][exclusive];
+    exclusiveClassPrev_[handle] = -1;
+    exclusiveClassNext_[handle] = previousHead;
+    if (previousHead >= 0)
+        exclusiveClassPrev_[static_cast<uint32_t>(previousHead)] =
+            static_cast<int32_t>(handle);
+    exclusiveClassHead_[channel][exclusive] = static_cast<int32_t>(handle);
+}
+
+inline void VoiceManager::UnlinkExclusiveClass(VoiceHandle handle) {
+    if (handle >= maxVoices_) return;
+    const uint8_t exclusive = exclusiveClass_[handle];
+    if (exclusive == 0u || exclusive >= kExclusiveClassCount) {
+        exclusiveClassNext_[handle] = -1;
+        exclusiveClassPrev_[handle] = -1;
+        return;
+    }
+    const uint8_t channel = v.channel[handle];
+    const int32_t previous = exclusiveClassPrev_[handle];
+    const int32_t next = exclusiveClassNext_[handle];
+    if (previous >= 0) {
+        exclusiveClassNext_[static_cast<uint32_t>(previous)] = next;
+    } else if (exclusiveClassHead_[channel][exclusive] ==
+               static_cast<int32_t>(handle)) {
+        exclusiveClassHead_[channel][exclusive] = next;
+    } else {
+        return;
+    }
+    if (next >= 0)
+        exclusiveClassPrev_[static_cast<uint32_t>(next)] = previous;
+    exclusiveClassNext_[handle] = -1;
+    exclusiveClassPrev_[handle] = -1;
+}
+
+inline void VoiceManager::ChokeExclusiveClasses(
+    uint8_t channel, const VoiceConfiguration* setups, uint32_t count,
+    uint32_t blockOffset) {
+    uint64_t incoming[2]{};
+    bool anyVictim = false;
+    for (uint32_t layer = 0u; layer < count; ++layer) {
+        const uint16_t value = setups[layer].offByClass != 0u
+            ? setups[layer].offByClass : setups[layer].exclusiveClass;
+        if (value == 0u || value >= kExclusiveClassCount)
+            continue;
+        const uint64_t bit = uint64_t(1) << (value & 63u);
+        uint64_t& word = incoming[value >> 6u];
+        if ((word & bit) != 0u) continue;
+        word |= bit;
+        anyVictim |= exclusiveClassHead_[channel][value] >= 0;
+    }
+    if (!anyVictim) return;
+
+    const float releaseDecay = MakeReleaseDecay(kMinReleaseSeconds,
+                                                 sampleRate_);
+    const uint32_t releaseSamples = MakeReleaseSamples(kMinReleaseSeconds,
+                                                       sampleRate_);
+    for (uint32_t exclusive = 1u; exclusive < kExclusiveClassCount;
+         ++exclusive) {
+        if ((incoming[exclusive >> 6u] &
+             (uint64_t(1) << (exclusive & 63u))) == 0u)
+            continue;
+        while (exclusiveClassHead_[channel][exclusive] >= 0) {
+            const VoiceHandle victim = static_cast<VoiceHandle>(
+                exclusiveClassHead_[channel][exclusive]);
+            VoiceHandle first = victim;
+            while (playGroupPrev_[first] >= 0)
+                first = static_cast<VoiceHandle>(playGroupPrev_[first]);
+
+            VoiceHandle current = first;
+            while (current != kInvalidVoice) {
+                const int32_t next = playGroupNext_[current];
+                if (v.state[current] ==
+                    static_cast<uint8_t>(VoiceState::Active)) {
+                    v.releaseDecay[current] = releaseDecay;
+                    v.releaseSamplesRemaining[current] = releaseSamples;
+                    v.releaseStartInBlock[current] = blockOffset;
+                    StartRelease(current);
+                } else {
+                    UnlinkExclusiveClass(current);
+                }
+                current = next >= 0
+                    ? static_cast<VoiceHandle>(next) : kInvalidVoice;
+            }
+            // A malformed/no-playIndex caller can leave a singleton outside
+            // a group. StartRelease above must still have removed the head.
+            if (exclusiveClassHead_[channel][exclusive] ==
+                static_cast<int32_t>(victim))
+                UnlinkExclusiveClass(victim);
+        }
+    }
 }
 
 inline uint32_t VoiceManager::AllocateChannelIndexBlock() {
@@ -2859,6 +3035,7 @@ inline void VoiceManager::RetireStolenSibling(VoiceHandle handle,
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
         releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
     UnlinkChannelKey(handle);
+    UnlinkExclusiveClass(handle);
     UnlinkPlayGroup(handle);
     UnlinkChannelActive(handle);
     UnlinkRenderClass(handle);
@@ -4060,6 +4237,7 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     if (v.state[bestIdx] == static_cast<uint8_t>(VoiceState::Releasing))
         releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
     UnlinkChannelKey(static_cast<VoiceHandle>(bestIdx));
+    UnlinkExclusiveClass(static_cast<VoiceHandle>(bestIdx));
     UnlinkPlayGroup(static_cast<VoiceHandle>(bestIdx));
     UnlinkChannelActive(static_cast<VoiceHandle>(bestIdx));
     UnlinkRenderClass(static_cast<VoiceHandle>(bestIdx));
@@ -4162,6 +4340,13 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
 inline void VoiceManager::StartRelease(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active)) {
+        if (voiceReleaseHook_)
+            voiceReleaseHook_(handle, voiceReleaseUserData_);
+        // A planner hook may advance this voice to the event frame and
+        // discover that it naturally retired before the requested release.
+        if (v.state[handle] != static_cast<uint8_t>(VoiceState::Active))
+            return;
+        UnlinkExclusiveClass(handle);
         if (deferredReleaseHook_) {
             // Whole-voice pre-pass: chain/held bookkeeping happens now (so
             // later pre-pass queries observe it in ingress order); the
@@ -4250,6 +4435,7 @@ inline void VoiceManager::RetireVoice(VoiceHandle handle) {
     if (maintainStealIndex)
         RemoveStealCandidate(handle);
     UnlinkChannelKey(handle);
+    UnlinkExclusiveClass(handle);
     UnlinkPlayGroup(handle);
     UnlinkChannelActive(handle);
     UnlinkRenderClass(handle);
@@ -4293,8 +4479,10 @@ inline void VoiceManager::ConfigureVoice(
     const ChannelParamsSnapshot& cp, bool commitDeferred) {
     if (handle >= maxVoices_) return;
 
+    UnlinkExclusiveClass(handle);
     SetVoicePlayIndex(handle, playIndex);
     ApplyVoiceConfigurationFields(handle, setup, cp);
+    LinkExclusiveClass(handle);
     RefreshRenderClass(handle);
     if (commitDeferred)
         CommitVoiceConfiguration(handle);
@@ -4340,6 +4528,8 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
 
     v.presetIndex[handle] = setup.presetIndex;
     v.regionIndex[handle] = setup.regionIndex;
+    exclusiveClass_[handle] = setup.exclusiveClass < kExclusiveClassCount
+        ? static_cast<uint8_t>(setup.exclusiveClass) : 0u;
     v.targetGain[handle] = setup.initialGain;
     v.sustainLevel[handle] = setup.sustainLevel * setup.initialGain;
     v.delaySamplesRemaining[handle] = setup.delaySamples;
@@ -4517,6 +4707,8 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
         releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
     UnlinkChannelKey(handle);
+    UnlinkExclusiveClass(handle);
+    UnlinkPlayGroup(handle);
     if (!preserveChannelIndex) MoveChannelActiveInPlace(handle, channel);
     if (!preserveRenderIndex) UnlinkRenderClass(handle);
 
@@ -4552,6 +4744,7 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
 #endif
 
     ApplyVoiceConfigurationFields(handle, setup, cp, desiredClass);
+    LinkExclusiveClass(handle);
     if (preserveRenderIndex) {
         v.renderClass[handle] = desiredClassValue;
     } else {
@@ -4737,6 +4930,7 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
             releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
         UnlinkChannelKey(handle);
+        UnlinkExclusiveClass(handle);
         UnlinkPlayGroup(handle);
         if (!preserveChannelIndex) UnlinkChannelActive(handle);
         if (!preserveRenderIndex) UnlinkRenderClass(handle);
@@ -4825,20 +5019,26 @@ inline void VoiceManager::CommitVoiceGroupConfigurations(
 inline bool VoiceManager::LaunchVoiceGroup(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count,
-    const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles) {
+    const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles,
+    uint32_t blockOffset) {
     const uint32_t playIndex = setups && count != 0u
         ? setups[0].playIndex : UINT32_MAX;
     return LaunchVoiceGroup(channel, note, velocity, setups, count, playIndex,
-                            channelParams, outHandles);
+                            channelParams, outHandles, blockOffset);
 }
 
 inline bool VoiceManager::LaunchVoiceGroup(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
-    const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles) {
+    const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles,
+    uint32_t blockOffset) {
     if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
         count > voiceLimit_)
         return false;
+    // Resolve every exclusive class once for the complete physical note.
+    // Doing this before any layer allocation/configuration prevents layered
+    // regions from choking siblings born by this same MIDI note-on.
+    ChokeExclusiveClasses(channel, setups, count, blockOffset);
     if (count > maxLaunchGroupSize_) maxLaunchGroupSize_ = count;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     BeginLaunchTestProfile(channel, note, setups, count);

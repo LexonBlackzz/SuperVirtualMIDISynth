@@ -2272,7 +2272,8 @@ private:
 
     uint64_t HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
                           bool deferLifetimeCounters = false,
-                          const NoteLaunchPlanCacheEntry* exactFramePlan = nullptr);
+                          const NoteLaunchPlanCacheEntry* exactFramePlan = nullptr,
+                          uint32_t blockOffset = 0u);
     void HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset);
     void HandleStaleNoteOffBatch(uint8_t channel, uint8_t note, uint8_t count,
                                  uint32_t blockOffset);
@@ -3469,7 +3470,8 @@ static void PrepareSF2Region(const SF2Data* data, const SFSampleRegion& region,
             rateRatio * powf(2.0f, semitones / 12.0f);
     }
 
-    out.attenuationGain = region.initialAttenuation > 0
+    out.attenuationGain = (region.initialAttenuation > 0 ||
+                           (data->isSfz && region.initialAttenuation != 0))
         ? InitialAttenuationToGain(static_cast<float>(region.initialAttenuation))
         : 1.0f;
     out.sustainLevel = SustainAttenuationToGain((std::max)(
@@ -4223,8 +4225,8 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
     bundle->data = sf2;
     bundle->requestId = requestId;
     bundle->path = path;
-    if (!sf2_load(path, sf2)) {
-        LOG("  sf2_load FAILED: presets=%u inst=%u samples=%u sampleData=%d frames=%u",
+    if (!soundfont_load(path, sf2)) {
+        LOG("  soundfont_load FAILED: presets=%u inst=%u samples=%u sampleData=%d frames=%u",
             sf2->presetCount, sf2->instrumentCount, sf2->sampleCount,
             sf2->sampleData ? 1 : 0, sf2->sampleDataFrames);
         HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -7106,7 +7108,8 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                 ++self->fenceSuppressedNoteOns_;
                 break;
             }
-            self->HandleNoteOn(event.channel, event.data1, event.data2);
+            self->HandleNoteOn(event.channel, event.data1, event.data2,
+                               false, nullptr, blockCursor);
             break;
         }
         case RenderEventType::NoteOff:
@@ -7436,7 +7439,7 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
                 ++deferredNoteOns;
                 const uint64_t delta = self->HandleNoteOn(
                     event.channel, event.data1, event.data2, true,
-                    exactFramePlan);
+                    exactFramePlan, blockCursor);
                 deferredMatches += static_cast<uint32_t>(delta);
                 deferredConfigured += static_cast<uint32_t>(delta >> 32u);
 
@@ -7534,7 +7537,8 @@ void Driver::RefreshSelectedPresets() {
 
 uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
                               bool deferLifetimeCounters,
-                              const NoteLaunchPlanCacheEntry* exactFramePlan) {
+                              const NoteLaunchPlanCacheEntry* exactFramePlan,
+                              uint32_t blockOffset) {
     if (!channelCache || !voiceManager) return 0u;
     if (channel >= kChannelCount || note >= kNoteCount) return 0u;
     velocity &= 0x7fu;
@@ -7763,7 +7767,8 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
             regionPanRight = prepared->panRight;
         } else {
             initialGain = velGain;
-            if (matchedRegion->initialAttenuation > 0)
+            if (matchedRegion->initialAttenuation > 0 ||
+                (data->isSfz && matchedRegion->initialAttenuation != 0))
                 initialGain *= InitialAttenuationToGain(
                     static_cast<float>(matchedRegion->initialAttenuation));
             sustainLevel = SustainAttenuationToGain((std::max)(
@@ -7821,6 +7826,12 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
         setup.gainRight = regionPanRight;
         setup.presetIndex = static_cast<uint16_t>(presetIndex);
         setup.regionIndex = static_cast<uint16_t>(matchedRegionIndex);
+        setup.exclusiveClass = matchedRegion->exclusiveClass > 0
+            ? static_cast<uint16_t>(matchedRegion->exclusiveClass) : 0u;
+        setup.offByClass = matchedRegion->offByClass < 0
+            ? UINT16_MAX
+            : (matchedRegion->offByClass > 0
+                ? static_cast<uint16_t>(matchedRegion->offByClass) : 0u);
         setup.loopMode = loopMode;
         setup.sampleBacked = 1u;
         if (prepared) {
@@ -7856,7 +7867,8 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
 
     if (!voiceManager->LaunchVoiceGroup(
             channel, note, velocity, launchSetups, matchCount, playIndex,
-            channelCache->GetParams()[channel], noteLaunchHandles_)) {
+            channelCache->GetParams()[channel], noteLaunchHandles_,
+            blockOffset)) {
         ++telemetry_.allocationFailures;
         return matchCount;
     }

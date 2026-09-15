@@ -696,7 +696,7 @@ int main(int argc, char** argv) {
     uint32_t soundFontPreset = UINT32_MAX;
     if (!options.soundFontPath.empty()) {
         soundFont = std::make_unique<svms::SF2Data>();
-        if (!svms::sf2_load(options.soundFontPath.c_str(), soundFont.get())) {
+        if (!svms::soundfont_load(options.soundFontPath.c_str(), soundFont.get())) {
             std::fprintf(stderr, "failed to load benchmark SoundFont: %s\n",
                          options.soundFontPath.c_str());
             return 4;

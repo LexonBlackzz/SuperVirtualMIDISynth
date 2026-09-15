@@ -10,6 +10,15 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-15 feat(v3): add initial SFZ instrument support
+  I compile external WAV-backed SFZ regions into the existing V3 sample and
+  region pipeline, including inheritance, mapping, tuning, gain/pan, loops,
+  amp envelopes, group/off_by, recursive configurator discovery, and tests.
+
+- 2026-09-15 feat(v3): honor SF2 exclusive classes on note launch
+  I track active exclusive-class voices by MIDI channel and choke the prior
+  complete play group at the exact note-on frame without self-choking layers.
+
 - 2026-09-15 perf(v3): batch matching whole-voice render segments
   I dispatch consecutive voices with the same exact start frame and render
   class through one class-kernel call when no release, row-op, or vibrato
