@@ -679,6 +679,15 @@ private:
                                  uint32_t segFrames, bool isReal,
                                  uint32_t jobIndex, float lfoDepth,
                                  float lfoBendRatio, bool lfoActive);
+    bool RenderWholeVoiceBatch(VoiceSoA& state, VoiceManager& voices,
+                               const uint32_t* handles,
+                               uint32_t handleCount,
+                               VoiceRenderClass renderClass,
+                               const int16_t* sampleData,
+                               uint32_t sampleDataFrames,
+                               const IndexedJobMix& mix,
+                               uint32_t segStart, uint32_t segFrames,
+                               uint32_t jobIndex);
     void CaptureGhostTail(uint32_t ghost);
     void RenderGhostTailSpan(uint32_t ghost, VoiceSoA& scratch,
                              const int16_t* sampleData,
@@ -4217,6 +4226,59 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     return false;
 }
 
+// Render a run of real voices that already proved they have one identical
+// segment for the rest of the block: same exact start frame and render class,
+// with no release, row-op, or vibrato boundary.  The class kernels retain the
+// input handle order, so scalar accumulation order and per-row state evolution
+// are unchanged; this only amortizes classification, context construction,
+// kernel dispatch, and retirement-offset fixup across the run.
+inline bool RenderScalar::RenderWholeVoiceBatch(
+    VoiceSoA& state, VoiceManager& voices, const uint32_t* handles,
+    uint32_t handleCount, VoiceRenderClass renderClass,
+    const int16_t* sampleData, uint32_t sampleDataFrames,
+    const IndexedJobMix& mix, uint32_t segStart, uint32_t segFrames,
+    uint32_t jobIndex) {
+    RenderClassKernel kernel =
+        kernelSet_->kernels[static_cast<uint32_t>(renderClass)];
+    if (handleCount < 2u || segFrames < 8u || kernel == nullptr ||
+        sampleData == nullptr) {
+        return false;
+    }
+    SpanRetirement* retBuf = wvJobRetirements_ +
+        static_cast<size_t>(jobIndex) * scratchCapacity_;
+    const uint32_t retCountBefore = wvJobRetireCounts_[jobIndex];
+    RenderSpanContext context{
+        &state, sampleData, nullptr, sampleDataFrames,
+        mix.outputLeft, mix.outputRight, segStart, segFrames,
+        state.GetCapacity(), nullptr, nullptr, voices.activePosition_,
+        retBuf, &wvJobRetireCounts_[jobIndex], 0u,
+        0.0f, 1.0f, 0u, mix.busLeft, mix.busRight};
+    if (!kernel(context, handles, handleCount)) return false;
+
+    wvSegCalls_ += handleCount;
+    wvSegKernelOk_ += handleCount;
+    wvSegKernelFrames_ +=
+        static_cast<uint64_t>(segFrames) * handleCount;
+    for (uint32_t i = retCountBefore;
+         i < wvJobRetireCounts_[jobIndex]; ++i) {
+        retBuf[i].frameOffset += segStart;
+    }
+    for (uint32_t i = 0u; i < handleCount; ++i) {
+        const uint32_t handle = handles[i];
+        const VoiceRenderClass classAfter =
+            ClassifyWholeVoiceRow(state, handle);
+        if (classAfter != renderClass &&
+            (classAfter == VoiceRenderClass::SustainedLoop ||
+             classAfter == VoiceRenderClass::SustainedOneShot)) {
+            state.renderGainL[handle] =
+                state.currentGain[handle] * state.mixGainL[handle];
+            state.renderGainR[handle] =
+                state.currentGain[handle] * state.mixGainR[handle];
+        }
+    }
+    return true;
+}
+
 // Reproduce CaptureStealTail's tail record from the ghost's exact
 // steal-frame state.  Stored per ghost: the VoiceSoA steal-tail arrays are
 // fixed kStealTailReserve slots, so ghost rows must never index them.
@@ -4294,6 +4356,62 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             const uint32_t handle = renderer->wvSliceHandles_[item];
             if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
                 continue;
+            // Common whole-block case: consecutive carried/new voices with
+            // the same single segment can share one class-kernel dispatch.
+            // Runs never cross a job boundary, and handles remain in active-
+            // list order to preserve scalar mixing exactly.
+            uint32_t batchStart = renderer->wvStartFrame_[handle];
+            if (batchStart == UINT32_MAX) batchStart = 0u;
+            const uint8_t batchChannelRaw = v.channel[handle];
+            const uint32_t batchChannel = batchChannelRaw < kChannelCount
+                ? batchChannelRaw : kChannelCount;
+            const VoiceRenderClass batchClass =
+                ClassifyWholeVoiceRow(v, handle);
+            const bool batchHeadEligible = batchStart < frameCount &&
+                frameCount - batchStart >= 8u &&
+                ctx->sampleData != nullptr &&
+                renderer->kernelSet_->kernels[
+                    static_cast<uint32_t>(batchClass)] != nullptr &&
+                renderer->wvReleaseFrame_[handle] == UINT32_MAX &&
+                renderer->wvChanOpStart_[batchChannel] ==
+                    renderer->wvChanOpStart_[batchChannel + 1u] &&
+                !renderer->wvChanVibratoActive_[batchChannel];
+            if (batchHeadEligible) {
+                uint32_t batchEnd = item + 1u;
+                while (batchEnd < end &&
+                       batchEnd < ctx->voiceItemCount &&
+                       batchEnd - item < 256u) {
+                    const uint32_t next =
+                        renderer->wvSliceHandles_[batchEnd];
+                    if (v.state[next] ==
+                        static_cast<uint8_t>(VoiceState::Free) ||
+                        renderer->wvReleaseFrame_[next] != UINT32_MAX)
+                        break;
+                    uint32_t nextStart = renderer->wvStartFrame_[next];
+                    if (nextStart == UINT32_MAX) nextStart = 0u;
+                    const uint8_t nextChannelRaw = v.channel[next];
+                    const uint32_t nextChannel =
+                        nextChannelRaw < kChannelCount
+                            ? nextChannelRaw : kChannelCount;
+                    if (nextStart != batchStart ||
+                        ClassifyWholeVoiceRow(v, next) != batchClass ||
+                        renderer->wvChanOpStart_[nextChannel] !=
+                            renderer->wvChanOpStart_[nextChannel + 1u] ||
+                        renderer->wvChanVibratoActive_[nextChannel])
+                        break;
+                    ++batchEnd;
+                }
+                const uint32_t batchCount = batchEnd - item;
+                if (renderer->RenderWholeVoiceBatch(
+                        v, *ctx->voices,
+                        renderer->wvSliceHandles_ + item, batchCount,
+                        batchClass, ctx->sampleData,
+                        ctx->sampleDataFrames, mix, batchStart,
+                        frameCount - batchStart, jobIndex)) {
+                    item = batchEnd - 1u;
+                    continue;
+                }
+            }
             // Bus mode: this item's channel plane is its mix destination.
             float* itemLeft = mix.outputLeft;
             float* itemRight = mix.outputRight;

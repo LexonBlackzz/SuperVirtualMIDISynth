@@ -10,6 +10,11 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-15 perf(v3): batch matching whole-voice render segments
+  I dispatch consecutive voices with the same exact start frame and render
+  class through one class-kernel call when no release, row-op, or vibrato
+  boundary splits them, preserving handle order and scalar mix order.
+
 - 2026-09-14 feat(v3): play extended 256-key MIDI and add selectable 31EDO tuning
   I preserve full-byte note identities through playback and offline decoding,
   extend top SoundFont zones, and keep normal tuning unchanged. 31EDO is
