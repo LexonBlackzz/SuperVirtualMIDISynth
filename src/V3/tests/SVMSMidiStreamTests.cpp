@@ -26,14 +26,14 @@ bool WriteFixture(const wchar_t* path) {
         0,0xff,0x51,3,7,0xa1,0x20,
         0x83,0x60,0xff,0x51,3,3,0xd0,0x90,
         0,0xff,0x2f,0,
-        'M','T','r','k',0,0,0,42,
+        'M','T','r','k',0,0,0,43,
         0,0xf0,8,0x43,0x10,0x4c,0x00,0x00,0x06,0x58,0xf7,
         0,0x90,60,100,
         0,60,100,
         0,0xb0,7,127,
         0,0x90,60,100,
         0,60,100,
-        0x83,0x60,64,100,
+        0x83,0x60,0x90,255,100,
         0x83,0x60,0x80,60,0,
         0,0xff,0x2f,0
     };
@@ -103,7 +103,7 @@ int main() {
     if(events[0].message!=svms::MakeInternalMasterTransposeMessage(0x58)||
        events[1].message!=0x00643c90||events[2].message!=0x00643c90||
        events[3].message!=0x007f07b0||events[4].message!=0x00643c90||
-       events[5].message!=0x00643c90||events[6].message!=0x00644090||
+       events[5].message!=0x00643c90||events[6].message!=0x0064ff90||
        events[7].message!=0x00003c80)return 8;
     svms::ParsedEventRing ring(1);if(!ring.IsValid()||ring.Capacity()!=65536)return 9;
     for(const auto& e:events)if(!ring.Push(e,cancel))return 10;

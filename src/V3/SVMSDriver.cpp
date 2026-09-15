@@ -1,3 +1,4 @@
+#include "SVMSTuning.h"
 #include <windows.h>
 
 // Audio-callback census lines ([SVMS] sched/flow/pool/planRefuse): compile-
@@ -5377,7 +5378,7 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
     }
 
     const uint8_t status = static_cast<uint8_t>(msg & 0xffu);
-    const uint8_t data1 = static_cast<uint8_t>((msg >> 8) & 0x7fu);
+    const uint8_t data1 = static_cast<uint8_t>((msg >> 8) & (((status & 0xe0u) == 0x80u) ? 0xffu : 0x7fu));
     uint8_t velocity = static_cast<uint8_t>((msg >> 16) & 0x7fu);
     const bool noteOn = !IsInternalEngineMessage(msg) &&
                         (status & 0xf0u) == 0x90u && velocity != 0;
@@ -5617,8 +5618,20 @@ bool Driver::SubmitSystemExclusiveCancellable(
     const uint8_t* data, uint32_t size,
     const std::atomic<uint64_t>* externalCancellation,
     uint64_t cancellationToken) {
-    if (!data || size < 2u || data[0] != 0xf0u ||
-        data[size - 1u] != 0xf7u) return true;
+    if (!data || size < 2u) return false;
+    uint8_t endpoint = 0;
+    SIZE_T checked = 0;
+    const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+    if (address > UINTPTR_MAX - (size - 1u) ||
+        !ReadProcessMemory(GetCurrentProcess(), data, &endpoint, 1u, &checked) ||
+        !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address + size - 1u), &endpoint, 1u, &checked)) return false;
+    std::vector<uint8_t> owned;
+    try { owned.resize(size); } catch (...) { return false; }
+    SIZE_T copied = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), data, owned.data(), size, &copied) ||
+        copied != size) return false;
+    data = owned.data();
+    if (data[0] != 0xf0u || data[size - 1u] != 0xf7u) return true;
 
     LARGE_INTEGER timestamp{};
     QueryPerformanceCounter(&timestamp);
@@ -7594,8 +7607,10 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
         noteLaunchHotCache_[channel][note] = launchCache;
     }
 
+    const bool edo31 = engineConfig_.tuningEdo == 31u && !channelCache->IsPercussion(channel);
+    const uint8_t regionNote = MidiRegionKey(note, edo31);
     uint32_t matchCount = launchCacheHit ? launchCache->count
-        : ResolveNoteRegions(bank, soundFontIndex, presetIndex, note, velocity,
+        : ResolveNoteRegions(bank, soundFontIndex, presetIndex, regionNote, velocity,
                              noteRegionScratch_, kMaxMatchingRegions);
     if (matchCount > kMaxMatchingRegions) {
         ++telemetry_.allocationFailures;
@@ -7613,7 +7628,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
         if (fallbackPreset < data->presetCount &&
             fallbackPreset != presetIndex) {
             matchCount = ResolveNoteRegions(bank, soundFontIndex,
-                fallbackPreset, note, velocity, noteRegionScratch_,
+                fallbackPreset, regionNote, velocity, noteRegionScratch_,
                 kMaxMatchingRegions);
         }
         if (matchCount == 0) {
@@ -7701,6 +7716,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
             basePhaseStep = sourceRate / outputRate *
                 powf(2.0f, semitones / 12.0f);
         }
+        basePhaseStep = RetunePhaseStep(basePhaseStep, note, bendScale, edo31);
         const float bendRatio = bendScale == 1.0f || pitchBendSemitones == 0.0f
             ? commonBendRatio
             : powf(2.0f, pitchBendSemitones * bendScale / 12.0f);
@@ -9012,9 +9028,9 @@ UINT WINAPI SendDirectLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
         !HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr) ||
         (!lpMidiHdr->lpData && lpMidiHdr->dwBufferLength != 0u))
         return MMSYSERR_INVALPARAM;
-    g_driver->SubmitSystemExclusive(
+    if (!g_driver->SubmitSystemExclusiveCancellable(
         reinterpret_cast<const uint8_t*>(lpMidiHdr->lpData),
-        lpMidiHdr->dwBufferLength);
+        lpMidiHdr->dwBufferLength, nullptr, 0u)) return MMSYSERR_INVALPARAM;
     lpMidiHdr->dwFlags |= MHDR_DONE;
     lpMidiHdr->dwFlags &= ~MHDR_INQUEUE;
     return MMSYSERR_NOERROR;
@@ -9024,9 +9040,9 @@ UINT WINAPI SendDirectLongDataNoBuf(LPSTR data, DWORD size) {
     if (!g_kdmapiInitialized.load(std::memory_order_acquire) || !g_driver ||
         (!data && size != 0u))
         return MMSYSERR_INVALPARAM;
-    g_driver->SubmitSystemExclusive(
-        reinterpret_cast<const uint8_t*>(data), size);
-    return MMSYSERR_NOERROR;
+    return g_driver->SubmitSystemExclusiveCancellable(
+        reinterpret_cast<const uint8_t*>(data), size, nullptr, 0u)
+        ? MMSYSERR_NOERROR : MMSYSERR_INVALPARAM;
 }
 
 MMRESULT WINAPI PrepareLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {

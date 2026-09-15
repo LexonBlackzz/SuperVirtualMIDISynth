@@ -65,6 +65,7 @@ struct ConfigValues {
     float reverbHighCutHz = 16000.0f;
     // 0 = Coherent (off), 1 = Analytic, 2 = Sweep, 3 = Diffuse
     uint32_t phaseRotationMode = 0u;
+    uint32_t tuningEdo = 12u;
 
     uint32_t eventRingCapacity = 393216;
     // Same-key note-on coalescing spawn interval. 1 = disabled (default):

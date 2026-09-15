@@ -274,6 +274,21 @@ int main(int argc, char** argv) {
         FreeLibrary(runtime);
         return 1;
     }
+    const auto sendLong = reinterpret_cast<UINT (WINAPI*)(LPSTR, DWORD)>(
+        GetProcAddress(runtime, "SendDirectLongDataNoBuf"));
+    const auto sendHeader = reinterpret_cast<UINT (WINAPI*)(LPMIDIHDR, UINT)>(
+        GetProcAddress(runtime, "SendDirectLongData"));
+    MIDIHDR invalidHeader{};
+    invalidHeader.lpData = reinterpret_cast<LPSTR>(~uintptr_t{0});
+    invalidHeader.dwBufferLength = 8;
+    if (!sendLong || !sendHeader ||
+        sendLong(invalidHeader.lpData, 8) != MMSYSERR_INVALPARAM ||
+        sendHeader(&invalidHeader, sizeof(invalidHeader)) != MMSYSERR_INVALPARAM) {
+        std::puts("FAIL: invalid SysEx pointers were not rejected");
+        return 1;
+    }
+    char reset[] = {char(0xf0),0x7e,0x7f,9,1,char(0xf7)};
+    if (sendLong(reset, sizeof(reset)) != MMSYSERR_NOERROR) return 1;
     std::puts("INFO: KDMAPI facade initialized beside native session");
     std::fflush(stdout);
     sendDirectData(0x00643c90u);

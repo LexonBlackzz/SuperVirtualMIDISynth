@@ -10,6 +10,15 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-14 feat(v3): play extended 256-key MIDI and add selectable 31EDO tuning
+  I preserve full-byte note identities through playback and offline decoding,
+  extend top SoundFont zones, and keep normal tuning unchanged. 31EDO is
+  restart-applied (key 155 = middle C); percussion keeps its instrument keys.
+- 2026-09-14 fix(v3): reject inaccessible SysEx buffers before parsing
+  I copy caller buffers safely so Ziggy cannot crash the DLL by passing -1
+  as a long-message data pointer; KDMAPI reports an invalid parameter.
+
+
 - 2026-09-14 fix(v3): restore the channel activity bars after the label-width
   alignment fix pushed the right-column meters outside their table cells.
   Per-channel gain reduction now ramps down over 0.5 ms instead of jumping

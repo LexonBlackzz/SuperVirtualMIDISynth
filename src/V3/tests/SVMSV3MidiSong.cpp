@@ -62,6 +62,7 @@ struct Options {
     bool verbose = false;
     bool quiet = false;
     bool coverage = false;
+    uint32_t tuningEdo = 12u;
     uint32_t frames = 2048u;
     uint32_t renderThreads = 0u;      // 0 = automatic
     uint32_t maxVoices = 4096u;
@@ -100,6 +101,9 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.dllPath = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--wav") == 0 && hasValue) {
             options.wavPath = WArg(argv[++i]);
+        } else if (std::strcmp(arg, "--tuning-edo") == 0 && hasValue) {
+            options.tuningEdo = static_cast<uint32_t>(std::atoi(argv[++i]));
+            if (options.tuningEdo != 12u && options.tuningEdo != 31u) return false;
         } else if (std::strcmp(arg, "--frames") == 0 && hasValue) {
             options.frames = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(arg, "--render-threads") == 0 && hasValue) {
@@ -121,7 +125,7 @@ bool ParseArgs(int argc, char** argv, Options& options) {
                 "       [--realtime] [--audible] [--dll PATH] [--wav PATH]\n"
                 "       [--frames 16..8192] [--render-threads N] [--voices N]\n"
                 "       [--repeat N] [--seconds N] [--start-seconds S]\n"
-                "       [--backend auto|scalar|sse2|avx2]\n"
+                "       [--backend auto|scalar|sse2|avx2] [--tuning-edo 12|31]\n"
                 "       [--verbose] [--quiet]\n"
                 "default: offline render of the built-in piece, silent, one JSON\n"
                 "summary line.  --realtime drives the live winmm.dll (muted unless\n"
@@ -549,6 +553,7 @@ bool RunOffline(const Options& options, const DecodedSong& song,
                 const std::wstring& soundfont, OfflineResult& out) {
     svms::StandaloneSynthConfig config{};
     config.soundfont = soundfont;
+    config.tuningEdo = options.tuningEdo;
     config.sampleRate = 44100u;
     config.maxVoices = options.maxVoices;
     config.renderThreads = options.renderThreads;

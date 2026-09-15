@@ -163,6 +163,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.reverbLowCutHz = 70.0f;
     d.reverbHighCutHz = 16000.0f;
     d.phaseRotationMode = 0u;
+    d.tuningEdo = 12u;
     d.eventRingCapacity = 393216;
     d.noteOnCollapseThreshold = 1u;
     d.highPriorityVelocity = 96;
@@ -221,6 +222,8 @@ void ConfigDocument::FromJson(const json& root) {
             working_.soundFontPaths.push_back(working_.soundFontPath);
         if (!working_.soundFontPaths.empty())
             working_.soundFontPath = working_.soundFontPaths.front();
+        ReadNum(*it, "tuning_edo", working_.tuningEdo, 12u, 31u);
+        if (working_.tuningEdo != 31u) working_.tuningEdo = 12u;
         ReadNum(*it, "thread_affinity_mode", working_.threadAffinityMode,
                 0u, 2u);
         if (auto bt = it->find("block_timing"); bt != it->end()) {
@@ -438,6 +441,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
     root["synth"]["block_timing"] = working_.blockTiming;
+    root["synth"]["tuning_edo"] = working_.tuningEdo;
     root["synth"]["unbounded_render"] = working_.unboundedRender;
     root["synth"]["large_pages"] = working_.largePages;
     root["api"]["backend"] = working_.apiBackend;
@@ -634,6 +638,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && AlmostEquals(a.reverbLowCutHz, b.reverbLowCutHz)
         && AlmostEquals(a.reverbHighCutHz, b.reverbHighCutHz)
         && a.phaseRotationMode == b.phaseRotationMode
+        && a.tuningEdo == b.tuningEdo
         && a.noteOnCollapseThreshold == b.noteOnCollapseThreshold
         && a.eventRingCapacity == b.eventRingCapacity
         && a.highPriorityVelocity == b.highPriorityVelocity

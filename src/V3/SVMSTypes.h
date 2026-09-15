@@ -12,7 +12,7 @@
 namespace svms {
 
 constexpr uint32_t kChannelCount = 16;
-constexpr uint32_t kNoteCount = 128;
+constexpr uint32_t kNoteCount = 256;
 // Logical hard ceiling. Storage is sized to the configured pool, so this does
 // not impose a 500K allocation on ordinary 1K/4K instances.
 constexpr uint32_t kMaxPolyphony = 524288;

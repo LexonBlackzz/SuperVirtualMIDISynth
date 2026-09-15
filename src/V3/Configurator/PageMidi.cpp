@@ -257,6 +257,15 @@ void DrawMidiPage(ConfigDocument& doc) {
         RestartCell();
 
         ImGui::TableNextRow();
+        LabelCell("Tuning", "Normal: 12 semitones per octave, keys 0-255. 31EDO: 31 steps per octave; key 155 is middle C. Percussion keeps its drum mapping.");
+        ImGui::TableNextColumn();
+        int tuning = w.tuningEdo == 31u ? 1 : 0;
+        if (ImGui::Combo("##tuning", &tuning, "Normal (12EDO)\0" "31EDO\0")) {
+            w.tuningEdo = tuning ? 31u : 12u;
+            doc.MarkDirty();
+        }
+        RestartCell();
+        ImGui::TableNextRow();
         LabelCell("CC collapse",
                   "OFF by default: every control-change event dispatches. "
                   "When enabled, the compiler thread drops superseded "

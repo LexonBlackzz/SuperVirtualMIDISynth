@@ -1,6 +1,7 @@
 #ifndef SVMS_STANDALONE_SYNTH_H
 #define SVMS_STANDALONE_SYNTH_H
 
+#include "SVMSTuning.h"
 #include "SVMSChannelCache.h"
 #include "SVMSConfig.h"
 #include "SVMSEnvelope.h"
@@ -48,6 +49,7 @@ struct StandaloneSynthConfig {
     float limiterAttackMs = 0.5f;
     float limiterReleaseMs = 100.0f;
     uint32_t phaseRotationMode = 0u;
+    uint32_t tuningEdo = 12u;
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
 };
 
@@ -56,6 +58,7 @@ struct StandaloneSynthConfig {
 class StandaloneSynth {
 public:
     bool Initialize(const StandaloneSynthConfig& config, std::string& error) {
+        tuningEdo_ = config.tuningEdo;
         rate_ = config.sampleRate;
         maxVoices_ = config.maxVoices;
         master_ = config.masterVolume;
@@ -258,7 +261,7 @@ public:
             // collapsed hits. Disabled (every note-on spawns) when the
             // config threshold < 2.
             const uint32_t keyIndex =
-                static_cast<uint32_t>(event.channel) * 128u + event.data1;
+                static_cast<uint32_t>(event.channel) * kNoteCount + event.data1;
             uint32_t stack = 0u;
             if (!self->noteOnCollapse_.OnNoteOn(
                     keyIndex, self->dispatchAbsoluteFrame_ + blockCursor,
@@ -434,9 +437,11 @@ private:
         uint32_t indices[8]{};
     };
 
+    uint32_t tuningEdo_ = 12u;
+
     uint32_t ResolveRegions(uint32_t preset, uint8_t note, uint8_t velocity,
                             const SFSampleRegion** out, uint32_t capacity) {
-        const uint32_t tag = (preset << 14u) | (uint32_t(note) << 7u) | velocity;
+        const uint32_t tag = (preset << 15u) | (uint32_t(note) << 7u) | velocity;
         uint32_t hash = tag;
         hash ^= hash >> 16u;
         hash *= 0x7feb352du;
@@ -538,7 +543,9 @@ private:
         const uint64_t resolveBegin = __rdtsc();
 #endif
         const SFSampleRegion* regions[512];
-        uint32_t count = ResolveRegions(preset, note, velocity, regions, 512);
+        const bool edo31 = tuningEdo_ == 31u && !channels_.IsPercussion(channel);
+        const uint8_t regionNote = MidiRegionKey(note, edo31);
+        uint32_t count = ResolveRegions(preset, regionNote, velocity, regions, 512);
 #if defined(_MSC_VER)
         dispatchProfile.resolve += __rdtsc() - resolveBegin;
 #endif
@@ -547,7 +554,7 @@ private:
             // incomplete instruments stay audible (see SF2Data docs).
             const uint16_t fb = sf2_->fallbackPresetIndex;
             if (fb < sf2_->presetCount && fb != preset)
-                count = ResolveRegions(fb, note, velocity, regions, 512);
+                count = ResolveRegions(fb, regionNote, velocity, regions, 512);
             if (!count || count > 512) {
                 ++missingRegions_;
                 return;
@@ -591,8 +598,9 @@ private:
             voice.attackSamples = prepared.attack;
             voice.decaySamples = prepared.decay;
             voice.releaseSamples = prepared.release;
-            voice.phaseStep = prepared.baseStep[note] * bendRatio;
-            voice.basePhaseStep = prepared.baseStep[note];
+            const float baseStep = RetunePhaseStep(prepared.baseStep[note], note, prepared.bendScale, edo31);
+            voice.phaseStep = baseStep * bendRatio;
+            voice.basePhaseStep = baseStep;
             voice.pitchBendScale = prepared.bendScale;
             voice.initialGain = gain;
             voice.sustainLevel = prepared.sustain;

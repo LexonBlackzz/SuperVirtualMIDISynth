@@ -1,3 +1,4 @@
+#include "SVMSTuning.h"
 #include "SVMSChannelCache.h"
 #include "SVMSRenderScalar.h"
 #include "SVMSSoundFont.h"
@@ -4148,11 +4149,11 @@ void TestNoteOnCollapseGate() {
     Check(gate.OnNoteOn(0u, 11500u), "note-off reset makes the next hit spawn");
 
     // Channel reset clears the whole channel row.
-    gate.OnNoteOn(2u * 128u + 60u, 12000u);
-    gate.OnNoteOn(2u * 128u + 61u, 12001u);
+    gate.OnNoteOn(2u * svms::kNoteCount + 60u, 12000u);
+    gate.OnNoteOn(2u * svms::kNoteCount + 61u, 12001u);
     gate.ResetChannel(2u);
-    Check(gate.OnNoteOn(2u * 128u + 60u, 12002u) &&
-              gate.OnNoteOn(2u * 128u + 61u, 12003u),
+    Check(gate.OnNoteOn(2u * svms::kNoteCount + 60u, 12002u) &&
+              gate.OnNoteOn(2u * svms::kNoteCount + 61u, 12003u),
           "channel reset makes every key on the channel spawn");
 
     // Reset-all clears even the last key index.
@@ -4706,7 +4707,7 @@ void TestWholeVoiceLaunchDifferential() {
                 event.type = svms::RenderEventType::NoteOn;
                 const uint32_t launch = block * kLaunchesPerBlock + j;
                 event.channel = static_cast<uint8_t>(launch % 4u);
-                event.data1 = static_cast<uint8_t>(72u + launch);
+                event.data1 = static_cast<uint8_t>(120u + launch);
                 event.data2 = static_cast<uint8_t>(64u + rng.Next() % 64u);
                 event.frameOffset = rng.Next() % kFrames;
                 event.ingressSequence = j;
@@ -5977,7 +5978,59 @@ void TestPerChannelLimiterDifferential() {
     }
 }
 
+
+void TestExtendedKeysAndTuning() {
+    for (uint32_t key = 0; key < 256; ++key) {
+        svms::TimestampedMidiEvent input{};
+        input.message = 0x90u | (key << 8u) | (100u << 16u);
+        input.sequence = 9;
+        input.qpcTimestamp = svms::kAbsoluteFrameTimestampTag | 17u;
+        svms::ScheduledRenderEvent event{};
+        Check(svms::CompileTimestampedEvent(input, 0, 1, 44100, 0, event),
+              "all 256 note-ons compile");
+        Check(event.data1 == key && event.targetFrame == 17 && event.sequence == 9,
+              "extended keys preserve identity and timing");
+        input.message = 0x80u | (key << 8u);
+        Check(svms::CompileTimestampedEvent(input, 0, 1, 44100, 0, event) &&
+              event.data1 == key && event.type == svms::RenderEventType::NoteOff,
+              "all 256 note-offs compile without wrapping");
+        Check(svms::RetunePhaseStep(0.1234567f, uint8_t(key), 1.0f, false) == 0.1234567f,
+              "normal tuning is an exact bypass");
+    }
+    Check(svms::MidiKeyPitch(155, true) == 60.0f &&
+          svms::MidiRegionKey(155, true) == 60,
+          "31EDO key 155 selects middle C");
+    const float low = svms::RetunePhaseStep(powf(2.0f, (155.0f-60)/12),155,1,true);
+    const float high = svms::RetunePhaseStep(powf(2.0f, (186.0f-60)/12),186,1,true);
+    Check(std::fabs(low - 1.0f) < 1e-6f && std::fabs(high / low - 2.0f) < 1e-6f,
+          "31 steps render one octave apart");
+    auto data = std::make_unique<svms::SF2Data>();
+    data->presetCount = 1; data->regionCount = 2;
+    data->presetRegionStart[0] = 0; data->presetRegionCount[0] = 2;
+    data->regions[0].keyLo = 0; data->regions[0].keyHi = 63;
+    data->regions[1].keyLo = 64; data->regions[1].keyHi = 127;
+    for (int i=0;i<2;++i) { data->regions[i].velLo=0; data->regions[i].velHi=127; }
+    const svms::SFSampleRegion* regions[2]{};
+    Check(svms::sf2_find_regions(data.get(),0,255,100,regions,2)==1 &&
+          regions[0]==&data->regions[1], "extended keys use the highest SoundFont zone");
+    auto voices = std::make_unique<svms::VoiceManager>();
+    Check(voices->Initialize(8,44100), "extended lifecycle pool initializes");
+    const auto lowVoice = voices->AllocateVoice(0,127,100);
+    const auto highVoice = voices->AllocateVoice(0,255,100);
+    const auto nextChannel = voices->AllocateVoice(1,127,100);
+    Check(lowVoice != svms::kInvalidVoice && highVoice != svms::kInvalidVoice &&
+          nextChannel != svms::kInvalidVoice, "extended voices allocate");
+    Check(voices->GetChannelKeyVoiceCount(0,127)==1 &&
+          voices->GetChannelKeyVoiceCount(0,255)==1 &&
+          voices->GetChannelKeyVoiceCount(1,127)==1, "extended key chains do not alias");
+    voices->StartRelease(highVoice);
+    Check(voices->GetChannelKeyVoiceCount(0,255)==0 &&
+          voices->GetChannelKeyVoiceCount(0,127)==1 &&
+          voices->GetChannelKeyVoiceCount(1,127)==1, "extended release leaves other keys intact");
+}
+
 int main() {
+    TestExtendedKeysAndTuning();
     _CrtSetDbgFlag(_CrtSetDbgFlag(_CRTDBG_REPORT_FLAG) | _CRTDBG_CHECK_ALWAYS_DF);
 #if defined(_DEBUG)
     _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_DEBUG);

@@ -59,6 +59,7 @@ struct EngineConfig {
     bool channelLimiterEnabled;
     float channelLimiterThreshold;   // linear, 0.0316 (-30 dB) .. 1.0
     float channelLimiterReleaseMs;   // 20 .. 1000
+    uint32_t tuningEdo = 12u; // 12 or 31; key 155 = middle C in 31EDO
     float velocityCurve;
     float velocityFloor;
     uint8_t velocityIgnoreBelow;

@@ -83,7 +83,7 @@ inline bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
                                     ScheduledRenderEvent& scheduled) noexcept {
     const uint32_t message = timed.message;
     const uint8_t status = static_cast<uint8_t>(message & 0xffu);
-    uint8_t data1 = static_cast<uint8_t>((message >> 8u) & 0x7fu);
+    uint8_t data1 = static_cast<uint8_t>((message >> 8u) & (((status & 0xe0u) == 0x80u) ? 0xffu : 0x7fu));
     uint8_t data2 = static_cast<uint8_t>((message >> 16u) & 0x7fu);
     uint8_t channel = status & 0x0fu;
     RenderEventType type;

@@ -218,6 +218,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"render_threads", cfg.renderThreads},
             {"thread_affinity_mode", cfg.threadAffinityMode},
             {"block_timing", cfg.blockTimingMode},
+            {"tuning_edo", cfg.tuningEdo},
             {"unbounded_render", cfg.unboundedRender},
             {"master_volume", cfg.masterVolume},
             {"velocity_curve", cfg.velocityCurve},
@@ -457,6 +458,11 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "voice_memory_budget_mb",
                        cfg.voiceMemoryBudgetMB, 0u, 65536u))
             AppendWarning(cfg.configWarning, "synth.voice_memory_budget_mb");
+        if (!ReadValue(*it, "tuning_edo", cfg.tuningEdo, 12u, 31u) ||
+            (cfg.tuningEdo != 12u && cfg.tuningEdo != 31u)) {
+            cfg.tuningEdo = 12u;
+            AppendWarning(cfg.configWarning, "synth.tuning_edo");
+        }
         if (!ReadValue(*it, "render_threads", cfg.renderThreads, 0u, 64u))
             AppendWarning(cfg.configWarning, "synth.render_threads");
         if (!ReadValue(*it, "thread_affinity_mode", cfg.threadAffinityMode,
@@ -978,6 +984,7 @@ bool EngineConfig::Validate() const {
             reverbLowCutHz >= 0.0f && reverbLowCutHz <= 2000.0f &&
             reverbHighCutHz >= 1000.0f && reverbHighCutHz <= 20000.0f &&
             phaseRotationMode <= 4u &&
+            (tuningEdo == 12u || tuningEdo == 31u) &&
             noteOnCollapseThreshold <= 65536u &&
             velocityCurve >= 0.1f && velocityCurve <= 10.0f &&
             velocityFloor >= 0.0f && velocityFloor < 1.0f &&

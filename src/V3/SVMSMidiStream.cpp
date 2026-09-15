@@ -116,7 +116,9 @@ bool Next(Track& t, RawEvent& out, std::string& error) {
         if (uint64_t(t.end - t.p) < bytes) { error = "truncated channel event"; return false; }
         const uint8_t d1 = *t.p++;
         const uint8_t d2 = bytes == 2 ? *t.p++ : 0;
-        if ((d1 | d2) & 0x80) { error = "invalid MIDI data byte"; return false; }
+        // Extended-key SMFs carry 0..255 keys after an explicit note status.
+        // Running status with a high key is inherently ambiguous.
+        if ((d2 & 0x80) || ((d1 & 0x80) && kind != 0x80 && kind != 0x90 && kind != 0xa0)) { error = "invalid MIDI data byte"; return false; }
         out.message = uint32_t(status) | (uint32_t(d1) << 8) | (uint32_t(d2) << 16);
         out.midi = true;
         out.valid = true;
@@ -210,9 +212,9 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
     std::vector<uint32_t> noteRunExactSeen;
     const bool collectFrameRepetition = sink == nullptr;
     if (collectFrameRepetition) {
-        exactSeen.resize(1u << 18u, 0u);
-        keySeen.resize(1u << 11u, 0u);
-        noteRunExactSeen.resize(1u << 18u, 0u);
+        exactSeen.resize(1u << 19u, 0u);
+        keySeen.resize(1u << 12u, 0u);
+        noteRunExactSeen.resize(1u << 19u, 0u);
     }
     auto finishFrame = [&]() {
         if (groupFrame == UINT64_MAX) return;
@@ -276,9 +278,9 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
             ++groupNotes;
             if (collectFrameRepetition) {
                 const uint32_t channel = message & 0x0fu;
-                const uint32_t note = (message >> 8u) & 0x7fu;
+                const uint32_t note = (message >> 8u) & 0xffu;
                 const uint32_t velocity = (message >> 16u) & 0x7fu;
-                const uint32_t keyIdentity = (channel << 7u) | note;
+                const uint32_t keyIdentity = (channel << 8u) | note;
                 const uint32_t exactIdentity =
                     (keyIdentity << 7u) | velocity;
                 if (keySeen[keyIdentity] == groupGeneration) {

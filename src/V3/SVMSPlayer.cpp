@@ -619,7 +619,7 @@ struct PlayerCore {
         uint64_t off;
     };
     SRWLOCK noteLock = SRWLOCK_INIT;
-    NoteSpan noteSpans[16u * 128u] = {};  // zero = silent (on=0)
+    NoteSpan noteSpans[16u * 256u] = {};  // zero = silent (on=0)
 
     void ClearNotes() {
         AcquireSRWLockExclusive(&noteLock);
@@ -629,7 +629,7 @@ struct PlayerCore {
 
     void NoteOn(uint32_t channel, uint32_t key, uint64_t frame) {
         AcquireSRWLockExclusive(&noteLock);
-        NoteSpan& span = noteSpans[channel * 128u + key];
+        NoteSpan& span = noteSpans[channel * 256u + key];
         span.on = frame;
         span.off = UINT64_MAX;  // until its note-off is submitted
         ReleaseSRWLockExclusive(&noteLock);
@@ -637,7 +637,7 @@ struct PlayerCore {
 
     void NoteOff(uint32_t channel, uint32_t key, uint64_t frame) {
         AcquireSRWLockExclusive(&noteLock);
-        NoteSpan& span = noteSpans[channel * 128u + key];
+        NoteSpan& span = noteSpans[channel * 256u + key];
         if (span.on != 0u) span.off = frame;
         ReleaseSRWLockExclusive(&noteLock);
     }
@@ -780,7 +780,7 @@ inline bool IsNoteOn(uint32_t message) {
 // Track the event in the held-note span map (MIDI-polyphony graph).
 inline void TrackNote(PlayerCore* core, uint32_t message, uint64_t frame) {
     const uint32_t channel = message & 0x0Fu;
-    const uint32_t key = (message >> 8) & 0x7Fu;
+    const uint32_t key = (message >> 8) & 0xFFu;
     switch (message & 0xF0u) {
     case 0x90u:
         if ((message >> 16) & 0xFFu) core->NoteOn(channel, key, frame);

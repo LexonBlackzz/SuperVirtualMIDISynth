@@ -50,6 +50,7 @@ public:
                 if (!state) return SVMS_RESULT_NO_RESOURCES;
                 StandaloneSynthConfig synthConfig{};
                 synthConfig.soundfont = soundfont;
+                synthConfig.tuningEdo = EngineConfig::Load().tuningEdo;
                 synthConfig.sampleRate = config->sample_rate;
                 synthConfig.maxVoices = config->max_voices;
                 synthConfig.renderThreads = config->render_threads;
@@ -190,7 +191,7 @@ public:
             RenderEvent ev{};
             ev.type = type;
             ev.channel = status & 0x0fu;
-            ev.data1 = static_cast<uint8_t>((message >> 8u) & 0x7fu);
+            ev.data1 = static_cast<uint8_t>((message >> 8u) & (((status & 0xe0u) == 0x80u) ? 0xffu : 0x7fu));
             ev.data2 = static_cast<uint8_t>((message >> 16u) & 0x7fu);
             ev.frameOffset = events[i].frame_offset;
             // Monotonic across calls so later-call control fences dominate

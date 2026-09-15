@@ -1,4 +1,5 @@
 #if defined(_WIN32)
+#include "SVMSTuning.h"
 #include <windows.h>
 #else
 #include <codecvt>
@@ -49,6 +50,7 @@ struct Options {
     float limiterAttackMs = 0.5f;
     float limiterReleaseMs = 100.0f;
     uint32_t phaseRotationMode = 0u;
+    uint32_t tuningEdo = 12u;
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
     bool quiet = false;
     bool scanOnly = false;
@@ -168,6 +170,7 @@ bool ReportScanProgress(uint64_t processed, uint64_t total,
 }
 
 void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
+    o.tuningEdo = cfg.tuningEdo;
     // The standalone renderer is still explicitly given a MIDI, SoundFont and
     // output path, but its engine-facing defaults should match the current V3
     // configuration. Command-line options below remain authoritative.
@@ -275,6 +278,7 @@ void Usage() {
            L"  --limiter-release-ms F    Override release, 1-5000 ms\n"
            L"  --phase-rotation coherent|analytic|sweep|diffuse|random  Post-mix hum-killing phase rotation (default coherent/off)\n"
                        L"  --backend auto|scalar|sse2|avx2|gpu\n"
+           L"  --tuning-edo 12|31    Melodic tuning (31EDO key 155 = middle C)\n"
            L"  --scan-only           Validate/count without loading SF2 or rendering\n"
            L"  --quiet               Disable once-per-second telemetry\n"
            L"  --machine-progress    Emit tab-separated progress records\n", stderr);
@@ -298,6 +302,7 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             o.cancelEvent = p;
         }
         else if (arg == L"--scan-only") o.scanOnly = true;
+        else if (arg == L"--tuning-edo") { const auto p=value(); if (!p || !ParseU32(p,12,31,o.tuningEdo) || (o.tuningEdo!=12 && o.tuningEdo!=31)) return false; }
         else if (arg == L"--no-limiter") o.limiterEnabled = false;
         else if (arg == L"--sample-rate") { const auto p=value(); if (!p || !ParseU32(p,8000,384000,o.sampleRate)) return false; }
         else if (arg == L"--max-voices") { const auto p=value(); if (!p || !ParseU32(p,1,kMaxPolyphony,o.maxVoices)) return false; }
@@ -512,7 +517,7 @@ public:
     }
 private:
     struct RegionCacheEntry { uint32_t tag=UINT32_MAX;uint16_t count=0;uint16_t reserved=0;uint32_t indices[8]{}; };
-    uint32_t ResolveRegions(uint32_t preset,uint8_t note,uint8_t velocity,const SFSampleRegion** out,uint32_t capacity){const uint32_t tag=(preset<<14u)|(uint32_t(note)<<7u)|velocity;uint32_t hash=tag;hash^=hash>>16u;hash*=0x7feb352du;hash^=hash>>15u;RegionCacheEntry& cached=regionCache_[hash&4095u];if(cached.tag==tag&&cached.count<=8u){const uint32_t copied=(std::min)(uint32_t(cached.count),capacity);for(uint32_t i=0;i<copied;++i)out[i]=&sf2_->regions[cached.indices[i]];return cached.count;}const uint32_t count=sf2_find_regions(sf2_.get(),preset,note,velocity,out,capacity);if(count<=8u&&count<=capacity){cached.tag=tag;cached.count=uint16_t(count);for(uint32_t i=0;i<count;++i)cached.indices[i]=uint32_t(out[i]-sf2_->regions);}return count;}
+    uint32_t ResolveRegions(uint32_t preset,uint8_t note,uint8_t velocity,const SFSampleRegion** out,uint32_t capacity){const uint32_t tag=(preset<<15u)|(uint32_t(note)<<7u)|velocity;uint32_t hash=tag;hash^=hash>>16u;hash*=0x7feb352du;hash^=hash>>15u;RegionCacheEntry& cached=regionCache_[hash&4095u];if(cached.tag==tag&&cached.count<=8u){const uint32_t copied=(std::min)(uint32_t(cached.count),capacity);for(uint32_t i=0;i<copied;++i)out[i]=&sf2_->regions[cached.indices[i]];return cached.count;}const uint32_t count=sf2_find_regions(sf2_.get(),preset,note,velocity,out,capacity);if(count<=8u&&count<=capacity){cached.tag=tag;cached.count=uint16_t(count);for(uint32_t i=0;i<count;++i)cached.indices[i]=uint32_t(out[i]-sf2_->regions);}return count;}
     void Prepare(const SFSampleRegion& rg, PreparedRegion& p) {
         p={}; if(!sf2_validate_region(sf2_.get(),&rg)||rg.sampleIndex>=sf2_->sampleCount)return;
         const SF2Sample& s=sf2_->samples[rg.sampleIndex]; const int root=rg.rootKey>=0?rg.rootKey:s.originalPitch;
@@ -532,11 +537,14 @@ private:
     }
     bool Resolve(uint8_t ch,uint32_t& preset) { return sf2_resolve_preset(sf2_.get(),channels_.GetBankMSB(ch),channels_.GetProgram(ch),channels_.IsPercussion(ch),&preset); }
     void RefreshPreset(uint8_t ch) { uint32_t p=0;channels_.SetSelectedPreset(ch,Resolve(ch,p)?uint16_t(p):UINT16_MAX); }
+    uint32_t tuningEdo_ = EngineConfig::Load().tuningEdo;
     void NoteOn(uint8_t ch,uint8_t note,uint8_t vel) {
-        ++noteCalls_;if(note>=128)return;channels_.NoteOn(ch,note,vel);uint32_t pi=channels_.GetSelectedPreset(ch);if(pi>=sf2_->presetCount){if(!Resolve(ch,pi)){++missingPresets_;return;}channels_.SetSelectedPreset(ch,uint16_t(pi));}
-        const SFSampleRegion* regions[512];uint32_t count=ResolveRegions(pi,note,vel,regions,512);
+        ++noteCalls_;if(ch>=kChannelCount)return;channels_.NoteOn(ch,note,vel);uint32_t pi=channels_.GetSelectedPreset(ch);if(pi>=sf2_->presetCount){if(!Resolve(ch,pi)){++missingPresets_;return;}channels_.SetSelectedPreset(ch,uint16_t(pi));}
+        const bool edo31=tuningEdo_==31u&&!channels_.IsPercussion(ch);
+        const uint8_t regionNote=MidiRegionKey(note,edo31);
+        const SFSampleRegion* regions[512];uint32_t count=ResolveRegions(pi,regionNote,vel,regions,512);
         if(!count||count>512){const uint16_t fb=sf2_->fallbackPresetIndex;
-            if(fb<sf2_->presetCount&&fb!=pi)count=ResolveRegions(fb,note,vel,regions,512);
+            if(fb<sf2_->presetCount&&fb!=pi)count=ResolveRegions(fb,regionNote,vel,regions,512);
             if(!count||count>512){++missingRegions_;return;}++fallbackRegions_;}
         for(uint32_t i=0;i<count;++i){const uint32_t ri=uint32_t(regions[i]-sf2_->regions);if(ri>=prepared_.size()||!prepared_[ri].valid){++invalidRegions_;return;}}
         if(playIndex_==0||playIndex_>=UINT32_MAX-1)playIndex_=1;const uint32_t generation=playIndex_++; VoiceHandle handles[512];uint32_t made=0;
@@ -544,7 +552,7 @@ private:
         const float velocityGain=float(vel)*float(vel)/(127.0f*127.0f);
         const float bend=channels_.GetPitchBendSemitones(ch);
         for(uint32_t i=0;i<count;++i){const auto& rg=*regions[i];const uint32_t ri=uint32_t(regions[i]-sf2_->regions);const auto& p=prepared_[ri];const float br=p.bendScale==1.0f?bendRatio_[ch]:powf(2.0f,bend*p.bendScale/12.0f);const float gain=velocityGain*p.attenuation;
-            VoiceConfiguration c{};c.sampleStart=uint32_t(rg.startOffset);c.sampleEnd=uint32_t(rg.endOffset);c.loopStart=uint32_t(rg.loopStartOffset);c.loopEnd=uint32_t(rg.loopEndOffset);c.loopMode=rg.loopMode;c.playIndex=generation;c.delaySamples=p.delay;c.holdSamples=p.hold;c.attackSamples=p.attack;c.decaySamples=p.decay;c.releaseSamples=p.release;c.phaseStep=p.baseStep[note]*br;c.basePhaseStep=p.baseStep[note];c.pitchBendScale=p.bendScale;c.initialGain=gain;c.sustainLevel=p.sustain;c.attackGainStep=p.attack?gain/p.attack:0;c.decaySlope=p.decaySlope;c.releaseDecay=p.releaseDecay;c.gainLeft=p.panL;c.gainRight=p.panR;c.presetIndex=uint16_t(pi);c.regionIndex=uint16_t(ri);c.sampleBacked=1;voices_.ConfigureVoice(handles[i],c,channels_.GetParams()[ch],count==1);}
+            VoiceConfiguration c{};c.sampleStart=uint32_t(rg.startOffset);c.sampleEnd=uint32_t(rg.endOffset);c.loopStart=uint32_t(rg.loopStartOffset);c.loopEnd=uint32_t(rg.loopEndOffset);c.loopMode=rg.loopMode;c.playIndex=generation;c.delaySamples=p.delay;c.holdSamples=p.hold;c.attackSamples=p.attack;c.decaySamples=p.decay;c.releaseSamples=p.release;c.basePhaseStep=RetunePhaseStep(p.baseStep[note],note,p.bendScale,edo31);c.phaseStep=c.basePhaseStep*br;c.pitchBendScale=p.bendScale;c.initialGain=gain;c.sustainLevel=p.sustain;c.attackGainStep=p.attack?gain/p.attack:0;c.decaySlope=p.decaySlope;c.releaseDecay=p.releaseDecay;c.gainLeft=p.panL;c.gainRight=p.panR;c.presetIndex=uint16_t(pi);c.regionIndex=uint16_t(ri);c.sampleBacked=1;voices_.ConfigureVoice(handles[i],c,channels_.GetParams()[ch],count==1);}
         ++notes_;
     }
     void NoteOff(uint8_t ch,uint8_t note){const bool sustain=channels_.IsSustainActive(ch);channels_.NoteOff(ch,note);const uint32_t p=voices_.FindOldestPlayIndex(ch,note);if(p!=UINT32_MAX)voices_.NoteOffPlayIndex(ch,note,p,sustain,0);}
@@ -668,6 +676,7 @@ int RendererMain(int argc, wchar_t** argv) {
     synthConfig.limiterReleaseMs = o.limiterReleaseMs;
     synthConfig.backend = o.backend;
     synthConfig.phaseRotationMode = o.phaseRotationMode;
+    synthConfig.tuningEdo = o.tuningEdo;
     auto synth = std::make_unique<StandaloneSynth>();
     if (!synth->Initialize(synthConfig, error)) return fail(error);
     if (pollCancel()) {

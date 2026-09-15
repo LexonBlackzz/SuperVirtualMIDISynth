@@ -329,3 +329,29 @@ calling rules, and the capability flags — lives at the bottom of
 - `send_short_batch` is optional; advertise `SVMSBACKEND_CAP_BATCH` and the
   host will use it for ordered best-effort batches.
 - SysEx and master-level controls are not delivered in v1.
+
+## Extended keys and 31EDO
+
+V3 accepts note-on and note-off keys 0?255 in packed short messages. This is
+a nonstandard MIDI 1.0 extension: velocity, controllers and other data
+remain seven-bit. The SMF decoder accepts full-byte keys following explicit
+note status bytes. Extended keys with running status are ambiguous; writers
+must emit an explicit status for them. Players or external routed backends
+that discard the eighth key bit cannot carry this extension.
+
+Normal tuning remains the default, with the ordinary semitone mapping.
+Keys beyond a preset's highest SoundFont zone use that top zone's velocity
+layers, pitched to the requested key. Supporting a key does not make
+frequencies above the output's Nyquist limit faithfully reproducible.
+
+Select **MIDI ? Tuning ? 31EDO** in the configurator, save, and restart the
+synth, or set synth.tuning_edo to 31 (default 12). This maps key zero
+to MIDI C?1, key 155 to middle C, and each 31-key interval to one octave.
+Sample regions are selected using the nearest conventional pitch; note-offs
+and per-key limits still use the original key. Percussion channels retain
+their drum keys and tuning. Pitch-bend ranges remain measured in semitones.
+
+31EDO is an explicit tuning choice, not inferred from a filename or tuning
+SysEx. General MIDI Tuning Standard SysEx is not implemented by this change.
+Native offline sessions read the selected tuning when created. The offline
+renderer accepts --tuning-edo 12|31 to override the saved setting.

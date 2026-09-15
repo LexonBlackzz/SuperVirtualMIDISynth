@@ -1192,6 +1192,12 @@ uint32_t sf2_find_regions(const SF2Data* data, uint32_t presetIndex,
     const uint32_t begin = data->presetRegionStart[presetIndex];
     const uint32_t end = begin + data->presetRegionCount[presetIndex];
     if (begin > data->regionCount || end > data->regionCount) return 0;
+    if (note > 127u) {
+        uint8_t highest = 0;
+        for (uint32_t i = begin; i < end; ++i)
+            highest = (std::max)(highest, data->regions[i].keyHi);
+        if (note > highest) note = highest;
+    }
     for (uint32_t i = begin; i < end; ++i) {
         const SFSampleRegion& region = data->regions[i];
         if (note < region.keyLo || note > region.keyHi ||
