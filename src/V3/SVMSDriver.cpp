@@ -38,6 +38,7 @@
 #endif
 #endif
 #include "SVMSVoiceManager.h"
+#include "SVMSVoiceFilter.h"
 #include "SVMSChannelCache.h"
 #include "SVMSRenderScalar.h"
 #include "SVMSSoundFont.h"
@@ -3325,6 +3326,7 @@ struct PreparedSF2Region {
     float vibLfoToPitchCents;
     float vibLfoPhaseStep;
     uint32_t vibLfoDelaySamples;
+    PreparedVoiceFilter filter;
     float attenuationGain;
     float sustainLevel;
     float decaySlope;
@@ -3507,6 +3509,9 @@ static void PrepareSF2Region(const SF2Data* data, const SFSampleRegion& region,
     const float vibDelaySeconds = TimecentsToSeconds(region.delayVibLfo);
     out.vibLfoDelaySamples = vibDelaySeconds > 0.0f
         ? static_cast<uint32_t>(vibDelaySeconds * rate) : 0u;
+    out.filter = PrepareVoiceLowPass(
+        region.filterType, region.initialFilterFc, region.initialFilterQ,
+        outputRate);
     out.panLeft = 1.0f;
     out.panRight = 1.0f;
     if (channelCache)
@@ -7838,6 +7843,10 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
             setup.vibLfoToPitchCents = prepared->vibLfoToPitchCents;
             setup.vibLfoPhaseStep = prepared->vibLfoPhaseStep;
             setup.vibLfoDelaySamples = prepared->vibLfoDelaySamples;
+            setup.filterA0 = prepared->filter.a0;
+            setup.filterB1 = prepared->filter.b1;
+            setup.filterB2 = prepared->filter.b2;
+            setup.filterEnabled = prepared->filter.enabled;
         } else {
             const float vibDelaySeconds =
                 TimecentsToSeconds(matchedRegion->delayVibLfo);
@@ -7848,6 +7857,14 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
                            matchedRegion->freqVibLfo) / 1200.0f) / sr;
             setup.vibLfoDelaySamples = vibDelaySeconds > 0.0f
                 ? static_cast<uint32_t>(vibDelaySeconds * sr) : 0u;
+            const PreparedVoiceFilter filter = PrepareVoiceLowPass(
+                matchedRegion->filterType, matchedRegion->initialFilterFc,
+                matchedRegion->initialFilterQ,
+                static_cast<uint32_t>(sr));
+            setup.filterA0 = filter.a0;
+            setup.filterB1 = filter.b1;
+            setup.filterB2 = filter.b2;
+            setup.filterEnabled = filter.enabled;
         }
         noteLaunchScratch_[mi] = setup;
     }

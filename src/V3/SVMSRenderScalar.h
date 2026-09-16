@@ -11,6 +11,7 @@
 #include "SVMSEnvelope.h"
 #include "SVMSPageAllocator.h"
 #include "SVMSRenderKernels.h"
+#include "SVMSVoiceFilter.h"
 #include "SVMSRenderWorkers.h"
 #include <algorithm>
 #include <cstdlib>
@@ -74,6 +75,7 @@ inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
 
     const float frac = phase - static_cast<float>(baseOffset);
     float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+    sample = ProcessStealTailFilterSample(v, idx, sample);
     if (v.rot)
         sample = RotateVoiceSample(v.stealTailRot[idx], sample, hilbertData,
                                    baseIndex, nextIndex, frac);
@@ -311,6 +313,12 @@ struct alignas(64) DenseVoiceSnapshot {
     float mixGainR;
     float renderGainL;
     float renderGainR;
+    float filterA0;
+    float filterB1;
+    float filterB2;
+    float filterZ1;
+    float filterZ2;
+    uint32_t filterEnabled;
     float relLoopSF;
     float relLoopEF;
     uint32_t sampleStart;
@@ -346,6 +354,12 @@ inline void CaptureDenseVoiceSnapshot(DenseVoiceSnapshot& out,
     out.mixGainR = v.mixGainR[h];
     out.renderGainL = v.renderGainL[h];
     out.renderGainR = v.renderGainR[h];
+    out.filterA0 = v.filterA0[h];
+    out.filterB1 = v.filterB1[h];
+    out.filterB2 = v.filterB2[h];
+    out.filterZ1 = v.filterZ1[h];
+    out.filterZ2 = v.filterZ2[h];
+    out.filterEnabled = v.filterEnabled[h];
     out.relLoopSF = v.relLoopSF[h];
     out.relLoopEF = v.relLoopEF[h];
     out.sampleStart = v.sampleStart[h];
@@ -380,6 +394,12 @@ inline void ApplyDenseVoiceSnapshot(VoiceSoA& v, uint32_t h,
     v.mixGainR[h] = in.mixGainR;
     v.renderGainL[h] = in.renderGainL;
     v.renderGainR[h] = in.renderGainR;
+    v.filterA0[h] = in.filterA0;
+    v.filterB1[h] = in.filterB1;
+    v.filterB2[h] = in.filterB2;
+    v.filterZ1[h] = in.filterZ1;
+    v.filterZ2[h] = in.filterZ2;
+    v.filterEnabled[h] = in.filterEnabled;
     v.relLoopSF[h] = in.relLoopSF;
     v.relLoopEF[h] = in.relLoopEF;
     v.sampleStart[h] = in.sampleStart;
@@ -526,6 +546,12 @@ struct WholeVoiceGhostTail {
     float gain = 0.0f;
     float mixGainL = 0.0f;
     float mixGainR = 0.0f;
+    float filterA0 = 0.0f;
+    float filterB1 = 0.0f;
+    float filterB2 = 0.0f;
+    float filterZ1 = 0.0f;
+    float filterZ2 = 0.0f;
+    uint8_t filterEnabled = 0u;
     uint32_t sampleStart = 0u;
     uint32_t relEnd = 0u;
     uint32_t relLoopS = 0u;
@@ -1364,7 +1390,8 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                     // retires correctly; only the audio output is skipped.
                     if (mixAudio) {
                         sample = InterpolateSample(sampleData, baseIdx, nextIdx, frac);
-                        fetchBaseIndex = baseIdx;
+                        sample = ProcessVoiceFilterSample(v, idx, sample);
+                                                fetchBaseIndex = baseIdx;
                         fetchNextIndex = nextIdx;
                         fetchFrac = frac;
                     }
@@ -1721,9 +1748,10 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                     uint32_t nextRel = baseOffset + 1u;
                     if (nextRel >= relLoopE) nextRel = relLoopS;
                     const float frac = phase - static_cast<float>(baseOffset);
-                    const float sample = InterpolateSample(
+                    float sample = InterpolateSample(
                         sampleData, sampleStart + baseOffset,
                         sampleStart + nextRel, frac);
+                    sample = ProcessVoiceFilterSample(v, idx, sample);
                     outL[n] += sample * gainL;
                     outR[n] += sample * gainR;
                     phase += phaseStep;
@@ -1741,9 +1769,10 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                         const float phaseF = phase;
                         const uint32_t baseOffset = static_cast<uint32_t>(phaseF);
                         const float frac = phaseF - static_cast<float>(baseOffset);
-                        const float sample = InterpolateSample(
+                        float sample = InterpolateSample(
                             sampleData, sampleStart + baseOffset,
                             sampleStart + baseOffset + 1u, frac);
+                        sample = ProcessVoiceFilterSample(v, idx, sample);
                         outL[n] += sample * gainL;
                         outR[n] += sample * gainR;
                         phase += phaseStep;
@@ -1809,6 +1838,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 const uint32_t nextIndex = sampleStart + nextRel;
                 const float frac = phase - static_cast<float>(baseOffset);
                 float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
+                sample = ProcessVoiceFilterSample(v, idx, sample);
                 if (v.rot)
                     sample = RotateVoiceSample(v.rot[idx], sample, hilbertData,
                                                baseIndex, nextIndex, frac);
@@ -1941,8 +1971,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             uint32_t nextRel = baseOffset + 1u;
             if (nextRel >= relLoopE) nextRel = relLoopS;
             const float frac = phase - static_cast<float>(baseOffset);
-            const float sample = InterpolateSample(
+            float sample = InterpolateSample(
                 sampleData, sampleStart + baseOffset, sampleStart + nextRel, frac);
+            sample = ProcessVoiceFilterSample(v, idx, sample);
 
             if (stage == 1u) {
                 if (attackRemaining > 0u) {
@@ -2011,8 +2042,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             uint32_t nextRel = baseOffset + 1u;
             if (nextRel >= relLoopE) nextRel = relLoopS;
             const float frac = phase - static_cast<float>(baseOffset);
-            const float sample = InterpolateSample(
+            float sample = InterpolateSample(
                 sampleData, sampleStart + baseOffset, sampleStart + nextRel, frac);
+            sample = ProcessVoiceFilterSample(v, idx, sample);
 
             bool releaseFinished = false;
             if (releaseRemaining == 0u) {
@@ -2092,7 +2124,8 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             const uint32_t nextIndex = sampleStart + nextRel;
             const float frac = phase - static_cast<float>(baseOffset);
             sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
-            fetchBaseIndex = baseIndex;
+            sample = ProcessVoiceFilterSample(v, idx, sample);
+                        fetchBaseIndex = baseIndex;
             fetchNextIndex = nextIndex;
             fetchFrac = frac;
         }
@@ -4317,6 +4350,12 @@ inline void RenderScalar::CaptureGhostTail(uint32_t ghost) {
     tail.gain = gain;
     tail.mixGainL = mixL;
     tail.mixGainR = mixR;
+    tail.filterA0 = v.filterA0[ghost];
+    tail.filterB1 = v.filterB1[ghost];
+    tail.filterB2 = v.filterB2[ghost];
+    tail.filterZ1 = v.filterZ1[ghost];
+    tail.filterZ2 = v.filterZ2[ghost];
+    tail.filterEnabled = static_cast<uint8_t>(v.filterEnabled[ghost] != 0u);
     tail.sampleStart = v.sampleStart[ghost];
     tail.relEnd = v.relEnd[ghost];
     tail.relLoopS = v.relLoopS[ghost];
@@ -4386,6 +4425,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 ? batchChannelRaw : kChannelCount;
             const VoiceRenderClass batchClass =
                 ClassifyWholeVoiceRow(v, handle);
+            const uint32_t batchFilterEnabled = v.filterEnabled[handle];
             const bool batchHeadEligible = batchStart < frameCount &&
                 frameCount - batchStart >= 8u &&
                 ctx->sampleData != nullptr &&
@@ -4414,6 +4454,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                             ? nextChannelRaw : kChannelCount;
                     if (nextStart != batchStart ||
                         ClassifyWholeVoiceRow(v, next) != batchClass ||
+                        v.filterEnabled[next] != batchFilterEnabled ||
                         renderer->wvChanOpStart_[nextChannel] !=
                             renderer->wvChanOpStart_[nextChannel + 1u] ||
                         renderer->wvChanVibratoActive_[nextChannel])
@@ -4898,6 +4939,12 @@ inline void RenderScalar::RenderWholeVoiceBlock(
             voices.v.stealTailGain[slot] = tail.gain;
             voices.v.stealTailMixGainL[slot] = tail.mixGainL;
             voices.v.stealTailMixGainR[slot] = tail.mixGainR;
+            voices.v.stealTailFilterA0[slot] = tail.filterA0;
+            voices.v.stealTailFilterB1[slot] = tail.filterB1;
+            voices.v.stealTailFilterB2[slot] = tail.filterB2;
+            voices.v.stealTailFilterZ1[slot] = tail.filterZ1;
+            voices.v.stealTailFilterZ2[slot] = tail.filterZ2;
+            voices.v.stealTailFilterEnabled[slot] = tail.filterEnabled;
             voices.v.stealTailSampleStart[slot] = tail.sampleStart;
             voices.v.stealTailRelEnd[slot] = tail.relEnd;
             voices.v.stealTailRelLoopS[slot] = tail.relLoopS;

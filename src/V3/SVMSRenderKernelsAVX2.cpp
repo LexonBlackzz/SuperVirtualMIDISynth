@@ -1,5 +1,6 @@
 #include "SVMSRenderKernels.h"
 #include "SVMSEnvelope.h"
+#include "SVMSVoiceFilter.h"
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +28,50 @@ float HorizontalSum(__m256 value) {
     _mm256_store_ps(lanes, value);
     return ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) +
            ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+}
+
+// Eight consecutive samples of one filtered voice. Interpolation stays
+// vectorized; recursive filter state is consumed in scalar-equivalent order.
+inline __m256 FilterTime8AVX2(VoiceSoA& v, uint32_t handle,
+                              __m256 input) {
+    if (v.filterEnabled[handle] == 0u) return input;
+
+    // Recursive IIR state must preserve scalar ordering exactly.
+    // Keep interpolation vectorized, then consume these 8 samples in-order.
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, input);
+    for (uint32_t lane = 0u; lane < 8u; ++lane)
+        lanes[lane] = ProcessVoiceFilterSample(v, handle, lanes[lane]);
+    return _mm256_load_ps(lanes);
+}
+
+// Eight independent voices for the short-span / event-fragmented kernels.
+inline __m256 FilterVoices8AVX2(VoiceSoA& v, __m256i handles,
+                                __m256 input, uint32_t handleBias = 0u) {
+    const __m256i h = handleBias != 0u
+        ? _mm256_add_epi32(handles,
+              _mm256_set1_epi32(static_cast<int>(handleBias)))
+        : handles;
+    const __m256i enabled = _mm256_i32gather_epi32(
+        reinterpret_cast<const int*>(v.filterEnabled), h, 4);
+    const __m256 mask = _mm256_castsi256_ps(_mm256_cmpgt_epi32(
+        enabled, _mm256_setzero_si256()));
+    if (_mm256_movemask_ps(mask) == 0) return input;
+
+    const __m256 a0 = _mm256_i32gather_ps(v.filterA0, h, 4);
+    const __m256 b1 = _mm256_i32gather_ps(v.filterB1, h, 4);
+    const __m256 b2 = _mm256_i32gather_ps(v.filterB2, h, 4);
+    const __m256 oldZ1 = _mm256_i32gather_ps(v.filterZ1, h, 4);
+    const __m256 oldZ2 = _mm256_i32gather_ps(v.filterZ2, h, 4);
+    const __m256 output = _mm256_add_ps(_mm256_mul_ps(input, a0), oldZ1);
+    const __m256 newZ1 = _mm256_sub_ps(
+        _mm256_add_ps(_mm256_mul_ps(input, _mm256_add_ps(a0, a0)), oldZ2),
+        _mm256_mul_ps(b1, output));
+    const __m256 newZ2 = _mm256_sub_ps(
+        _mm256_mul_ps(input, a0), _mm256_mul_ps(b2, output));
+    SVMS_ScatterPs(v.filterZ1, h, _mm256_blendv_ps(oldZ1, newZ1, mask));
+    SVMS_ScatterPs(v.filterZ2, h, _mm256_blendv_ps(oldZ2, newZ2, mask));
+    return _mm256_blendv_ps(input, output, mask);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -117,8 +162,9 @@ void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
             break;
         }
         const float first = static_cast<float>(c.sampleData[firstIndex]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(c.sampleData[nextIndex]) * (1.0f / 32768.0f) - first) *
+        float sample = first + (static_cast<float>(c.sampleData[nextIndex]) * (1.0f / 32768.0f) - first) *
             (phase - static_cast<float>(base));
+        sample = ProcessStealTailFilterSample(v, h, sample);
         const float fade = total > 1u
             ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
             : 0.0f;
@@ -182,6 +228,7 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
             valid = valid && frameCounts[x] == c.frameCount &&
                 v.stealTailFramesRemaining[x] >= c.frameCount &&
                 v.stealTailSampleBacked[x] != 0u &&
+                v.stealTailFilterEnabled[x] == 0u &&
                 v.stealTailLoopEnabled[x] != 0u &&
                 v.stealTailRelEnd[x] >= 2u &&
                 v.stealTailRelLoopS[x] < v.stealTailRelLoopE[x] &&
@@ -354,8 +401,9 @@ const __m256 phases = _mm256_add_ps(
             GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
-            const __m256 sample = _mm256_add_ps(first,
+            __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            sample = FilterTime8AVX2(v, handle, sample);
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
                 _mm256_mul_ps(sample, gainLVector)));
@@ -379,7 +427,8 @@ const __m256 phases = _mm256_add_ps(
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
+        float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
+        sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
         phase += step;
@@ -526,8 +575,9 @@ const __m256 phases = _mm256_add_ps(
             GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
-            const __m256 sample = _mm256_add_ps(first,
+            __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            sample = FilterTime8AVX2(v, handle, sample);
             const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
@@ -553,7 +603,7 @@ const __m256 phases = _mm256_add_ps(
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
+        float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         bool finished = remaining == 0u;
         if (!finished) {
             gain *= decay;
@@ -562,6 +612,7 @@ const __m256 phases = _mm256_add_ps(
                 finished = remaining == 0u;
             }
         }
+        sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
@@ -846,8 +897,9 @@ const __m256 phases = _mm256_add_ps(
             GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
-            const __m256 sample = _mm256_add_ps(first,
+            __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            sample = FilterTime8AVX2(v, handle, sample);
             const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
@@ -877,7 +929,7 @@ const __m256 phases = _mm256_add_ps(
         if (next >= loopE) next = loopS;
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
+        float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         if (stage == 1u) {
             if (attackRemaining > 0u) {
                 gain += attackStep;
@@ -899,6 +951,7 @@ const __m256 phases = _mm256_add_ps(
             }
             if (decayRemaining == 0u) stage = 3u;
         }
+        sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
@@ -992,8 +1045,9 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
                 _mm256_add_epi32(sampleStart, next));
             const __m256 fraction = _mm256_sub_ps(
                 phase, _mm256_cvtepi32_ps(base));
-            const __m256 sample = _mm256_add_ps(first,
+            __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            sample = FilterVoices8AVX2(v, h, sample);
             // Exact scalar envelope recurrence per lane: gains are
             // bit-identical to the per-voice scalar sequence.
             alignas(32) float gains[8], targets[8], sustains[8];
@@ -1295,8 +1349,9 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             const __m256 first = GatherSampleAVX2(context.sampleData, baseIndex);
             const __m256 second = GatherSampleAVX2(context.sampleData, nextIndex);
             const __m256 fraction = _mm256_sub_ps(phase, _mm256_cvtepi32_ps(base));
-            const __m256 sample = _mm256_add_ps(
-                first, _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            sample = FilterVoices8AVX2(v, h, sample, denseHandles ? handleBase : 0u);
             accumulatedLeft[frame] = _mm256_add_ps(
                 accumulatedLeft[frame], _mm256_mul_ps(sample, gainL));
             accumulatedRight[frame] = _mm256_add_ps(
@@ -1483,8 +1538,9 @@ uint32_t RenderReleaseOneShotSpanScalar(
         }
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[base + 1u]) *
+        float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
+        sample = ProcessVoiceFilterSample(v, idx, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
@@ -1583,8 +1639,9 @@ uint32_t RenderTransientOneShotSpanScalar(
         }
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[base + 1u]) *
+        float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
+        sample = ProcessVoiceFilterSample(v, idx, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
@@ -1679,8 +1736,9 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
             GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
-            const __m256 sample = _mm256_add_ps(first,
+            __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            sample = FilterTime8AVX2(v, handle, sample);
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
                 _mm256_mul_ps(sample, gainLVector)));
@@ -1703,8 +1761,9 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
         }
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[base + 1u]) *
+        float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
+        sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
         phase += step;
@@ -1779,8 +1838,9 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
             GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
-            const __m256 sample = _mm256_add_ps(first,
+            __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            sample = FilterTime8AVX2(v, handle, sample);
             const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
@@ -1815,8 +1875,9 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
         }
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[base + 1u]) *
+        float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
+        sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
@@ -1934,8 +1995,9 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
             GatherSamplePairAVX2(region, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
-            const __m256 sample = _mm256_add_ps(first,
+            __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            sample = FilterTime8AVX2(v, handle, sample);
             const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
@@ -1986,8 +2048,9 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
         }
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[base + 1u]) *
+        float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
+        sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;

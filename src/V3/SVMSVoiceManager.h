@@ -6,6 +6,7 @@
 #include "SVMSPhaseRotation.h"
 #include "SVMSLiveControl.h"
 #include "SVMSRenderKernels.h"
+#include "SVMSVoiceFilter.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -61,6 +62,10 @@ struct VoiceConfiguration {
     float vibLfoToPitchCents = 0.0f;
     float vibLfoPhaseStep = 0.0f;
     uint32_t vibLfoDelaySamples = 0u;
+    float filterA0 = 0.0f;
+    float filterB1 = 0.0f;
+    float filterB2 = 0.0f;
+    uint32_t filterEnabled = 0u;
     uint16_t presetIndex = UINT16_MAX;
     uint16_t regionIndex = UINT16_MAX;
     // Membership class for SF2 exclusiveClass / SFZ group.
@@ -1535,6 +1540,12 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(mixGainR);
     SVMS_COPY_GROWN_VOICE_FIELD(renderGainL);
     SVMS_COPY_GROWN_VOICE_FIELD(renderGainR);
+    SVMS_COPY_GROWN_VOICE_FIELD(filterA0);
+    SVMS_COPY_GROWN_VOICE_FIELD(filterB1);
+    SVMS_COPY_GROWN_VOICE_FIELD(filterB2);
+    SVMS_COPY_GROWN_VOICE_FIELD(filterZ1);
+    SVMS_COPY_GROWN_VOICE_FIELD(filterZ2);
+    SVMS_COPY_GROWN_VOICE_FIELD(filterEnabled);
     SVMS_COPY_GROWN_VOICE_FIELD(stealOutputGain);
     SVMS_COPY_GROWN_VOICE_FIELD(vibLfoToPitchCents);
     SVMS_COPY_GROWN_VOICE_FIELD(vibLfoSteps);
@@ -2333,6 +2344,12 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.vibLfoPhases[handle]      = 0.0f;
     v.vibLfoDelays[handle]      = 0u;
     v.vibLfoModulated[handle]   = 0u;
+    v.filterA0[handle]          = 0.0f;
+    v.filterB1[handle]          = 0.0f;
+    v.filterB2[handle]          = 0.0f;
+    v.filterZ1[handle]          = 0.0f;
+    v.filterZ2[handle]          = 0.0f;
+    v.filterEnabled[handle]     = 0u;
     v.relEnd[handle]            = 0;
     v.relLoopS[handle]          = 0;
     v.relLoopE[handle]          = 0;
@@ -2372,6 +2389,12 @@ inline void VoiceManager::InitializePreparedVoice(
     v.birthFrame[handle] = currentFrame_;
     v.stealFadeInFramesRemaining[handle] = 0u;
     v.stealFadeInFramesTotal[handle] = 0u;
+    v.filterA0[handle] = 0.0f;
+    v.filterB1[handle] = 0.0f;
+    v.filterB2[handle] = 0.0f;
+    v.filterZ1[handle] = 0.0f;
+    v.filterZ2[handle] = 0.0f;
+    v.filterEnabled[handle] = 0u;
     stealCandidateDeferred_[handle] = 0u;
 }
 
@@ -2985,6 +3008,13 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     v.stealTailGain[tailSlot] = gain;
     v.stealTailMixGainL[tailSlot] = mixL;
     v.stealTailMixGainR[tailSlot] = mixR;
+    v.stealTailFilterA0[tailSlot] = v.filterA0[handle];
+    v.stealTailFilterB1[tailSlot] = v.filterB1[handle];
+    v.stealTailFilterB2[tailSlot] = v.filterB2[handle];
+    v.stealTailFilterZ1[tailSlot] = v.filterZ1[handle];
+    v.stealTailFilterZ2[tailSlot] = v.filterZ2[handle];
+    v.stealTailFilterEnabled[tailSlot] =
+        static_cast<uint8_t>(v.filterEnabled[handle] != 0u);
     v.stealTailSampleStart[tailSlot] = v.sampleStart[handle];
     v.stealTailRelEnd[tailSlot] = v.relEnd[handle];
     v.stealTailRelLoopS[tailSlot] = v.relLoopS[handle];
@@ -4561,6 +4591,12 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
 
     v.gainLeft[handle] = setup.gainLeft;
     v.gainRight[handle] = setup.gainRight;
+    v.filterA0[handle] = setup.filterA0;
+    v.filterB1[handle] = setup.filterB1;
+    v.filterB2[handle] = setup.filterB2;
+    v.filterZ1[handle] = 0.0f;
+    v.filterZ2[handle] = 0.0f;
+    v.filterEnabled[handle] = setup.filterEnabled;
     v.vibLfoToPitchCents[handle] = setup.vibLfoToPitchCents;
     v.vibLfoSteps[handle] = setup.vibLfoPhaseStep;
     v.vibLfoPhases[handle] = 0.0f;

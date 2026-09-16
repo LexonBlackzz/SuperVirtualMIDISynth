@@ -431,6 +431,12 @@ struct SamplePage {
     X(float, mixGainR) \
     X(float, renderGainL) \
     X(float, renderGainR) \
+    X(float, filterA0) \
+    X(float, filterB1) \
+    X(float, filterB2) \
+    X(float, filterZ1) \
+    X(float, filterZ2) \
+    X(uint32_t, filterEnabled) \
     X(uint32_t, sampleStart) \
     X(uint8_t, loopEnabled) \
     X(uint32_t, relEnd) \
@@ -505,6 +511,12 @@ struct VoiceRotationState {
     X(float, stealTailGain, kStealTailReserve) \
     X(float, stealTailMixGainL, kStealTailReserve) \
     X(float, stealTailMixGainR, kStealTailReserve) \
+    X(float, stealTailFilterA0, kStealTailReserve) \
+    X(float, stealTailFilterB1, kStealTailReserve) \
+    X(float, stealTailFilterB2, kStealTailReserve) \
+    X(float, stealTailFilterZ1, kStealTailReserve) \
+    X(float, stealTailFilterZ2, kStealTailReserve) \
+    X(uint8_t, stealTailFilterEnabled, kStealTailReserve) \
     X(uint32_t, stealTailSampleStart, kStealTailReserve) \
     X(uint32_t, stealTailRelEnd, kStealTailReserve) \
     X(uint32_t, stealTailRelLoopS, kStealTailReserve) \
@@ -741,6 +753,12 @@ struct alignas(64) VoiceSoA {
                                    const VoiceSoA& source) noexcept {
         destination.phases[handle] = source.phases[handle];
         destination.currentGain[handle] = source.currentGain[handle];
+        destination.filterA0[handle] = source.filterA0[handle];
+        destination.filterB1[handle] = source.filterB1[handle];
+        destination.filterB2[handle] = source.filterB2[handle];
+        destination.filterZ1[handle] = source.filterZ1[handle];
+        destination.filterZ2[handle] = source.filterZ2[handle];
+        destination.filterEnabled[handle] = source.filterEnabled[handle];
         destination.envelopeStage[handle] = source.envelopeStage[handle];
         destination.delaySamplesRemaining[handle] =
             source.delaySamplesRemaining[handle];
@@ -784,6 +802,12 @@ struct alignas(64) VoiceSoA {
         SVMS_COPY_DENSE_FIELD(mixGainR);
         SVMS_COPY_DENSE_FIELD(renderGainL);
         SVMS_COPY_DENSE_FIELD(renderGainR);
+        SVMS_COPY_DENSE_FIELD(filterA0);
+        SVMS_COPY_DENSE_FIELD(filterB1);
+        SVMS_COPY_DENSE_FIELD(filterB2);
+        SVMS_COPY_DENSE_FIELD(filterZ1);
+        SVMS_COPY_DENSE_FIELD(filterZ2);
+        SVMS_COPY_DENSE_FIELD(filterEnabled);
         SVMS_COPY_DENSE_FIELD(sampleStart);
         SVMS_COPY_DENSE_FIELD(loopEnabled);
         SVMS_COPY_DENSE_FIELD(relEnd);

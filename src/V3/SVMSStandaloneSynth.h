@@ -12,6 +12,7 @@
 #include "SVMSRenderScalar.h"
 #include "SVMSSoundFont.h"
 #include "SVMSVoiceManager.h"
+#include "SVMSVoiceFilter.h"
 
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
 #include "SVMSGpuSynth.h"
@@ -415,6 +416,7 @@ private:
     struct PreparedRegion {
         float baseStep[kNoteCount];
         float bendScale, attenuation, sustain, decaySlope, releaseDecay;
+        PreparedVoiceFilter filter{};
         float panL, panR;
         uint32_t delay, hold, attack, decay, release;
         bool valid;
@@ -508,6 +510,9 @@ private:
         const float releaseSeconds = TimecentsToSeconds(region.releaseVolEnv);
         prepared.releaseDecay = MakeReleaseDecay(releaseSeconds, rate_);
         prepared.release = MakeReleaseSamples(releaseSeconds, rate_);
+        prepared.filter = PrepareVoiceLowPass(
+            region.filterType, region.initialFilterFc, region.initialFilterQ,
+            rate_);
         channels_.ComputeSoundFontPan(region.pan, prepared.panL, prepared.panR);
         prepared.valid = true;
     }
@@ -610,6 +615,10 @@ private:
             voice.releaseDecay = prepared.releaseDecay;
             voice.gainLeft = prepared.panL;
             voice.gainRight = prepared.panR;
+            voice.filterA0 = prepared.filter.a0;
+            voice.filterB1 = prepared.filter.b1;
+            voice.filterB2 = prepared.filter.b2;
+            voice.filterEnabled = prepared.filter.enabled;
             voice.presetIndex = uint16_t(preset);
             voice.regionIndex = uint16_t(regionIndex);
             voice.exclusiveClass = region.exclusiveClass > 0

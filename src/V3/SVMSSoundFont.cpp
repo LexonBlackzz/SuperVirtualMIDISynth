@@ -322,6 +322,12 @@ struct SfzZone {
     double ampDecay = 0.0;
     double ampSustain = 100.0;
     double ampRelease = 0.0;
+    double cutoffHz = 0.0;
+    double resonanceDb = 0.0;
+    uint8_t filterType = static_cast<uint8_t>(FilterType::None);
+    bool cutoffSet = false;
+    bool resonanceSet = false;
+    bool filterTypeExplicit = false;
     int group = 0;
     int offBy = 0;
 };
@@ -520,7 +526,7 @@ static bool ApplySfzOpcode(SfzZone& zone, const SfzToken& token,
     if (op == "volume" || op == "pan" || op == "ampeg_delay" ||
         op == "ampeg_attack" || op == "ampeg_hold" ||
         op == "ampeg_decay" || op == "ampeg_sustain" ||
-        op == "ampeg_release") {
+        op == "ampeg_release" || op == "cutoff" || op == "resonance") {
         if (!ParseNumber(token.value, number)) return false;
         if (op == "volume") zone.volumeDb = number;
         else if (op == "pan") zone.pan = number;
@@ -529,7 +535,30 @@ static bool ApplySfzOpcode(SfzZone& zone, const SfzToken& token,
         else if (op == "ampeg_hold") zone.ampHold = number;
         else if (op == "ampeg_decay") zone.ampDecay = number;
         else if (op == "ampeg_sustain") zone.ampSustain = number;
-        else zone.ampRelease = number;
+        else if (op == "ampeg_release") zone.ampRelease = number;
+        else if (op == "cutoff") {
+            zone.cutoffHz = number;
+            zone.cutoffSet = true;
+            if (!zone.filterTypeExplicit && zone.filterType == static_cast<uint8_t>(FilterType::None))
+                zone.filterType = static_cast<uint8_t>(FilterType::LowPass2Pole);
+        } else {
+            zone.resonanceDb = number;
+            zone.resonanceSet = true;
+            if (!zone.filterTypeExplicit && zone.filterType == static_cast<uint8_t>(FilterType::None))
+                zone.filterType = static_cast<uint8_t>(FilterType::LowPass2Pole);
+        }
+        return true;
+    }
+    if (op == "fil_type") {
+        const std::string type = LowerAscii(token.value);
+        zone.filterTypeExplicit = true;
+        if (type == "lpf_2p") {
+            zone.filterType = static_cast<uint8_t>(FilterType::LowPass2Pole);
+        } else if (type == "none" || type == "no_filter") {
+            zone.filterType = static_cast<uint8_t>(FilterType::None);
+        } else {
+            unsupported.insert(op + "=" + type);
+        }
         return true;
     }
     if (op == "loop_mode") {
@@ -641,6 +670,19 @@ static bool DecodeWave(const fs::path& path, DecodedWave& wave) {
         }
     }
     return true;
+}
+
+static int16_t HertzToAbsoluteCents(double hz) {
+    if (!(hz > 0.0) || !std::isfinite(hz)) return -12000;
+    const double cents = 1200.0 * std::log2(hz / 8.176);
+    return static_cast<int16_t>((std::max)(-12000.0,
+        (std::min)(13500.0, std::round(cents))));
+}
+
+static int16_t ResonanceDbToCentibels(double db) {
+    if (!std::isfinite(db)) return 0;
+    return static_cast<int16_t>(std::round((std::max)(
+        0.0, (std::min)(96.0, db)) * 10.0));
 }
 
 static int16_t SecondsToTimecents(double seconds) {
@@ -1055,6 +1097,17 @@ static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
                 compiled.loopEndOffset = loopMode != 0u
                     ? static_cast<int32_t>(sample.start + loopEnd) : 0;
                 compiled.loopMode = loopMode;
+                if (zone.filterType ==
+                    static_cast<uint8_t>(FilterType::LowPass2Pole)) {
+                    compiled.filterType =
+                        static_cast<uint8_t>(FilterType::LowPass2Pole);
+                    compiled.initialFilterFc = zone.cutoffSet
+                        ? HertzToAbsoluteCents(zone.cutoffHz)
+                        : int16_t(13500);
+                    compiled.initialFilterQ = zone.resonanceSet
+                        ? ResonanceDbToCentibels(zone.resonanceDb)
+                        : int16_t(0);
+                }
                 compiled.delayVolEnv = SecondsToTimecents(zone.ampDelay);
                 compiled.attackVolEnv = SecondsToTimecents(zone.ampAttack);
                 compiled.holdVolEnv = SecondsToTimecents(zone.ampHold);
@@ -1349,7 +1402,7 @@ struct ZoneGenState {
           loopStartOffset(0), loopEndOffset(0),
            startCoarseOffset(0), endCoarseOffset(0),
            sampleIndex(0), hasSample(false),
-           initialAttenuation(0), initialFilterFc(0), initialFilterQ(0), pan(0),
+           initialAttenuation(0), initialFilterFc(13500), initialFilterQ(0), pan(0),
            reverbSend(0), chorusSend(0), modLfoToPitch(0), vibLfoToPitch(0),
            // delayVibLfo is timecents (-12000 = 0 s) but freqVibLfo is
            // absolute cents where the SF2 default of 0 means 1 Hz. Treating
@@ -1764,6 +1817,11 @@ static void AppendCompiledRegion(SF2Data* data, uint32_t presetIndex,
     region.endOffset = static_cast<int32_t>(end);
     region.loopStartOffset = static_cast<int32_t>(loopStart);
     region.loopEndOffset = static_cast<int32_t>(loopEnd);
+    region.filterType =
+        (merged.hasInitialFilterFc || merged.hasInitialFilterQ ||
+         merged.hasModLfoToFilterFc || merged.hasModEnvToFilterFc)
+            ? static_cast<uint8_t>(FilterType::LowPass2Pole)
+            : static_cast<uint8_t>(FilterType::None);
     region.initialFilterFc = merged.initialFilterFc;
     region.initialFilterQ = merged.initialFilterQ;
     region.pan = merged.pan;

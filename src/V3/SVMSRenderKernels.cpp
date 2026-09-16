@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include "SVMSRenderKernels.h"
+#include "SVMSVoiceFilter.h"
 
 namespace svms {
 
@@ -59,6 +60,7 @@ uint32_t RenderSustainedLoopSpan(
                     const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
                     float sample =
                         first + (static_cast<float>(region[baseOffset + 1u]) * (1.0f / 32768.0f) - first) * fraction;
+                    sample = ProcessVoiceFilterSample(v, idx, sample);
                     if (rot)
                         sample = RotateVoiceSample(rot[idx], sample,
                                                    hilbertRegion, baseOffset,
@@ -75,6 +77,7 @@ uint32_t RenderSustainedLoopSpan(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[relLoopS]) * (1.0f / 32768.0f) - first) * fraction;
+            sample = ProcessVoiceFilterSample(v, idx, sample);
             if (rot)
                 sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                            baseOffset, relLoopS, fraction);
@@ -95,6 +98,7 @@ uint32_t RenderSustainedLoopSpan(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[nextOffset]) * (1.0f / 32768.0f) - first) * fraction;
+            sample = ProcessVoiceFilterSample(v, idx, sample);
             if (rot)
                 sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                            baseOffset, nextOffset, fraction);
@@ -147,6 +151,7 @@ uint32_t RenderSustainedOneShotSpan(
         const float fraction = phase - static_cast<float>(baseOffset);
         const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[baseOffset + 1u]) * (1.0f / 32768.0f) - first) * fraction;
+        sample = ProcessVoiceFilterSample(v, idx, sample);
         if (rot)
             sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                        baseOffset, baseOffset + 1u, fraction);
@@ -205,6 +210,7 @@ void RenderSustainedLoopShortBatchFixed(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[nextOffset]) * (1.0f / 32768.0f) - first) * fraction;
+            sample = ProcessVoiceFilterSample(v, idx, sample);
             if (rot)
                 sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                            baseOffset, nextOffset, fraction);
@@ -353,6 +359,7 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
                                                fraction);
                 gain += attackStep;
                 if (gain > targetGain) gain = targetGain;
+                sample = ProcessVoiceFilterSample(v, idx, sample);
                 const float scaled = sample * gain;
                 outL[n] += scaled * mixL;
                 outR[n] += scaled * mixR;
@@ -387,6 +394,7 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
                                                fraction);
                 gain *= decaySlope;
                 if (gain < sustainLevel) gain = sustainLevel;
+                sample = ProcessVoiceFilterSample(v, idx, sample);
                 const float scaled = sample * gain;
                 outL[n] += scaled * mixL;
                 outR[n] += scaled * mixR;
@@ -443,6 +451,7 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
                 if (decayRemaining == 0u) stage = 3u;
             }
 
+            sample = ProcessVoiceFilterSample(v, idx, sample);
             const float scaled = sample * gain;
             outL[n] += scaled * mixL;
             outR[n] += scaled * mixR;

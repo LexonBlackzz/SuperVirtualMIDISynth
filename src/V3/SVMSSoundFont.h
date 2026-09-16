@@ -55,6 +55,7 @@ struct SFSampleRegion {
     uint8_t velLo, velHi;
     int8_t  rootKey;
     uint8_t loopMode;       // SF2 sampleModes: 0=none, 1=continuous, 2=reserved, 3=until release
+    uint8_t filterType;     // svms::FilterType; orthogonal to render class
     int16_t coarseTune;
     int16_t fineTune;
     int16_t scaleTuning;
