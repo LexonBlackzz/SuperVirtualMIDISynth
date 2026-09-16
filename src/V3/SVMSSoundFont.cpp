@@ -691,14 +691,197 @@ static fs::path Utf8Path(const std::string& text) {
 #endif
 }
 
+static std::wstring SfzIncludePathKey(const fs::path& path) {
+    std::error_code error;
+    fs::path absolute = fs::absolute(path, error);
+    if (error) absolute = path;
+    std::wstring key = absolute.lexically_normal().wstring();
+#if defined(_WIN32)
+    std::transform(key.begin(), key.end(), key.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+#endif
+    return key;
+}
+
+// Return a same-sized view of a line with comments blanked out. This lets
+// #include detection ignore commented directives while preserving the original
+// source verbatim for ordinary SFZ parsing.
+static std::string SfzDirectiveView(const std::string& line,
+                                    bool& inBlockComment) {
+    std::string visible(line.size(), ' ');
+    for (size_t i = 0; i < line.size();) {
+        if (inBlockComment) {
+            if (i + 1 < line.size() &&
+                line[i] == '*' && line[i + 1] == '/') {
+                inBlockComment = false;
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
+        if (i + 1 < line.size() &&
+            line[i] == '/' && line[i + 1] == '*') {
+            inBlockComment = true;
+            i += 2;
+            continue;
+        }
+        if (i + 1 < line.size() &&
+            line[i] == '/' && line[i + 1] == '/')
+            break;
+        visible[i] = line[i];
+        ++i;
+    }
+    return visible;
+}
+
+static bool ParseSfzIncludeDirective(const std::string& visible,
+                                     bool& isInclude,
+                                     std::string& includePath) {
+    isInclude = false;
+    includePath.clear();
+
+    const std::string trimmed = TrimAscii(visible);
+    static const std::string directive = "#include";
+    if (trimmed.compare(0, directive.size(), directive) != 0)
+        return true;
+    if (trimmed.size() > directive.size() &&
+        !std::isspace(static_cast<unsigned char>(
+            trimmed[directive.size()])))
+        return true;
+
+    isInclude = true;
+    size_t at = directive.size();
+    while (at < trimmed.size() &&
+           std::isspace(static_cast<unsigned char>(trimmed[at]))) ++at;
+    if (at >= trimmed.size()) return false;
+
+    const char open = trimmed[at];
+    const char close = open == '"' ? '"' : (open == '<' ? '>' : '\0');
+    if (!close) return false;
+    const size_t end = trimmed.find(close, at + 1);
+    if (end == std::string::npos || end == at + 1) return false;
+    if (!TrimAscii(trimmed.substr(end + 1)).empty()) return false;
+
+    includePath = trimmed.substr(at + 1, end - at - 1);
+    return true;
+}
+
+static void LogSfzIncludeFailure(const char* reason,
+                                 const std::string& detail = {}) {
+    char message[768];
+    if (detail.empty()) {
+        std::snprintf(message, sizeof(message),
+                      "[SVMS-SFZ] %s\n", reason);
+    } else {
+        std::snprintf(message, sizeof(message),
+                      "[SVMS-SFZ] %s: %s\n", reason, detail.c_str());
+    }
+    OutputDebugStringA(message);
+}
+
+static bool ExpandSfzIncludes(
+    const fs::path& path, std::string& output,
+    std::unordered_set<std::wstring>& activePaths,
+    uint32_t depth, size_t& expandedBytes) {
+    constexpr uint32_t kMaxIncludeDepth = 32u;
+    constexpr size_t kMaxExpandedBytes = 64u * 1024u * 1024u;
+
+    if (depth > kMaxIncludeDepth) {
+        LogSfzIncludeFailure("include depth limit exceeded");
+        return false;
+    }
+
+    const std::wstring pathKey = SfzIncludePathKey(path);
+    if (!activePaths.insert(pathKey).second) {
+        LogSfzIncludeFailure("include cycle detected");
+        return false;
+    }
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        LogSfzIncludeFailure(depth == 0u
+            ? "unable to open SFZ"
+            : "unable to open included SFZ file");
+        activePaths.erase(pathKey);
+        return false;
+    }
+
+    std::string source((std::istreambuf_iterator<char>(input)),
+                       std::istreambuf_iterator<char>());
+    if (source.size() >= 3u &&
+        static_cast<unsigned char>(source[0]) == 0xefu &&
+        static_cast<unsigned char>(source[1]) == 0xbbu &&
+        static_cast<unsigned char>(source[2]) == 0xbfu) {
+        source.erase(0, 3);
+    }
+    if (source.size() > kMaxExpandedBytes - expandedBytes) {
+        LogSfzIncludeFailure("expanded include text exceeds 64 MiB");
+        activePaths.erase(pathKey);
+        return false;
+    }
+    expandedBytes += source.size();
+
+    bool inBlockComment = false;
+    size_t lineBegin = 0;
+    while (lineBegin < source.size()) {
+        const size_t newline = source.find('\n', lineBegin);
+        const bool hasNewline = newline != std::string::npos;
+        const size_t lineEnd = hasNewline ? newline : source.size();
+        const std::string line =
+            source.substr(lineBegin, lineEnd - lineBegin);
+        const std::string visible =
+            SfzDirectiveView(line, inBlockComment);
+
+        bool isInclude = false;
+        std::string includePath;
+        if (!ParseSfzIncludeDirective(visible, isInclude, includePath)) {
+            LogSfzIncludeFailure("malformed #include directive", line);
+            activePaths.erase(pathKey);
+            return false;
+        }
+
+        if (isInclude) {
+            std::replace(includePath.begin(), includePath.end(), '\\', '/');
+            fs::path child = Utf8Path(includePath);
+            if (child.is_relative())
+                child = path.parent_path() / child;
+            child = child.lexically_normal();
+
+            // Includes are textual. Do not de-duplicate them: SFZs such as
+            // CFaz deliberately include the same region map once per group.
+            if (!output.empty() && output.back() != '\n')
+                output.push_back('\n');
+            if (!ExpandSfzIncludes(child, output, activePaths,
+                                   depth + 1u, expandedBytes)) {
+                activePaths.erase(pathKey);
+                return false;
+            }
+            if (!output.empty() && output.back() != '\n')
+                output.push_back('\n');
+        } else {
+            output.append(line);
+            if (hasNewline) output.push_back('\n');
+        }
+
+        if (!hasNewline) break;
+        lineBegin = newline + 1;
+    }
+
+    activePaths.erase(pathKey);
+    return true;
+}
+
 static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
     if (!outData) return false;
     std::memset(outData, 0, sizeof(*outData));
     try {
-        std::ifstream input(sfzPath, std::ios::binary);
-        if (!input) return false;
-        const std::string source((std::istreambuf_iterator<char>(input)),
-                                 std::istreambuf_iterator<char>());
+        std::string source;
+        std::unordered_set<std::wstring> activeIncludes;
+        size_t expandedBytes = 0;
+        if (!ExpandSfzIncludes(sfzPath, source, activeIncludes,
+                               0u, expandedBytes))
+            return false;
         const std::vector<SfzToken> tokens = TokenizeSfz(source);
         SfzZone global;
         SfzZone group = global;
