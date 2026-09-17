@@ -1,0 +1,10 @@
+
+build/
+build-scalar/
+build-wav-verify/
+tools/
+AGENTS.md
+ARCHITECTURE.md
+BENCHMARKS.md
+VST3_PLAN.md
+*.zip
