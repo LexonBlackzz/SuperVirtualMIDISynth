@@ -161,9 +161,16 @@ void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
             remaining = 0u;
             break;
         }
-        const float first = static_cast<float>(c.sampleData[firstIndex]) * (1.0f / 32768.0f);
-        float sample = first + (static_cast<float>(c.sampleData[nextIndex]) * (1.0f / 32768.0f) - first) *
-            (phase - static_cast<float>(base));
+        const float fraction = phase - static_cast<float>(base);
+        const float first = static_cast<float>(c.sampleData[firstIndex]) *
+                            (1.0f / 32768.0f);
+        float sample =
+            first + (static_cast<float>(c.sampleData[nextIndex]) *
+                     (1.0f / 32768.0f) - first) * fraction;
+        if (v.rot)
+            sample = RotateVoiceSample(v.stealTailRot[h], sample,
+                                       c.hilbertData, firstIndex, nextIndex,
+                                       fraction);
         sample = ProcessStealTailFilterSample(v, h, sample);
         const float fade = total > 1u
             ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
@@ -189,6 +196,20 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
                           const uint32_t* handles, uint32_t handleCount,
                           const uint32_t* frameCounts) {
     if (c.frameCount == 0u || c.sampleData == nullptr) return;
+
+    // Phase-rotated tails own recursive per-tail state. Keep them on the
+    // exact per-tail Hilbert path instead of the non-rotation vector kernel.
+    if (c.voices->rot != nullptr) {
+        for (uint32_t i = 0u; i < handleCount; ++i) {
+            const uint32_t h = handles[i];
+            const RenderSpanContext vc = SelectVoiceDestination(
+                c, c.voices->stealTailChannel[h]);
+            RenderTailScalar(vc, h, frameCounts[h]);
+        }
+        _mm256_zeroupper();
+        return;
+    }
+
     // Channel buses: the voice-batched path below mixes eight lanes into
     // one frame position and cannot scatter into per-channel planes; bus
     // batches therefore take the per-voice scalar tail with per-voice

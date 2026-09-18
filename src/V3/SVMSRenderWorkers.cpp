@@ -33,9 +33,36 @@ constexpr uint32_t kMinimumVoicesShortSpan = 1024u;
 
 struct RenderJob {
     RenderClassKernel kernel;
+    RenderClassKernel fallback;
     const uint32_t* handles;
     uint32_t handleCount;
 };
+
+// Resolve the scalar sibling of a selected backend class kernel once on the
+// coordinator thread. Workers can then honor a backend refusal without
+// re-entering backend selection or touching shared scheduler state.
+RenderClassKernel ResolveScalarFallback(RenderClassKernel kernel) noexcept {
+    if (!kernel) return nullptr;
+
+    const RenderKernelSet& scalar = GetScalarRenderKernelSet();
+    for (uint32_t i = 0u; i < kVoiceRenderClassCount; ++i) {
+        if (scalar.kernels[i] == kernel) return scalar.kernels[i];
+    }
+
+    const RenderKernelSet& sse2 = GetSSE2RenderKernelSet();
+    for (uint32_t i = 0u; i < kVoiceRenderClassCount; ++i) {
+        if (sse2.kernels[i] == kernel) return scalar.kernels[i];
+    }
+
+#if !defined(SVMS_XP_COMPAT)
+    const RenderKernelSet& avx2 = GetAVX2RenderKernelSet();
+    for (uint32_t i = 0u; i < kVoiceRenderClassCount; ++i) {
+        if (avx2.kernels[i] == kernel) return scalar.kernels[i];
+    }
+#endif
+
+    return nullptr;
+}
 
 } // namespace
 
@@ -266,7 +293,16 @@ struct RenderWorkerPool::Impl {
                                 indexedUserData);
             } else {
                 const RenderJob& job = jobs[index];
-                job.kernel(local, job.handles, job.handleCount);
+                // False means "no mutation; use the scalar fallback". The
+                // old worker pool discarded this return value, so rotated
+                // transient/release jobs could render nothing and never
+                // advance their envelopes or retirement state.
+                const bool consumed =
+                    job.kernel(local, job.handles, job.handleCount);
+                if (!consumed && job.fallback != job.kernel) {
+                    (void)job.fallback(
+                        local, job.handles, job.handleCount);
+                }
             }
         }
         return claimed;
@@ -548,6 +584,14 @@ bool RenderWorkerPool::AddClassRange(RenderClassKernel kernel,
                                      const uint32_t* handles,
                                      uint32_t handleCount) noexcept {
     if (!impl_ || !impl_->queueValid || !kernel || !handles) return false;
+    const RenderClassKernel fallback = ResolveScalarFallback(kernel);
+    if (!fallback) {
+        // Unknown class kernels cannot safely be sent to workers because a
+        // false return would have no defined fallback. Refuse before any job
+        // runs; the caller's established serial path will consume the class.
+        impl_->queueValid = false;
+        return false;
+    }
     for (uint32_t offset = 0u; offset < handleCount;
          offset += kHandlesPerJob) {
         // Bus mode caps span fan-out: per-job channel planes are ~16x a
@@ -564,7 +608,8 @@ bool RenderWorkerPool::AddClassRange(RenderClassKernel kernel,
         }
         const uint32_t count =
             (std::min)(kHandlesPerJob, handleCount - offset);
-        impl_->jobs[impl_->jobCount++] = {kernel, handles + offset, count};
+        impl_->jobs[impl_->jobCount++] = {
+            kernel, fallback, handles + offset, count};
     }
     return true;
 }

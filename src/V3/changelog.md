@@ -10,6 +10,25 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-09-16 fix(v3): honor SIMD worker fallback for phase-rotated voices
+  The render worker pool now preserves the documented class-kernel contract:
+  when AVX2/SSE2 refuses a complete job without mutation, the matching scalar
+  class kernel consumes that same private worker slice immediately. This fixes
+  rotation-enabled transient/release batches being silently dropped, which
+  froze envelope/release progression and left voices stuck active. Random mode
+  also keeps its intended jittered allpass+sweep path instead of collapsing
+  into the same exact-Hilbert form as Sweep.
+
+
+- 2026-09-16 fix(v3): make Analytic phase rotation use the real Hilbert pair
+  I build the analytic companion with every realtime SoundFont bundle so live
+  mode switches cannot silently fall back to the quadrature approximation,
+  wire the same pair through standalone/offline rendering, and order filtered
+  rotated voices as Hilbert rotation -> low-pass so the unfiltered companion
+  is never combined with a differently filtered real component. Rotation still
+  refuses whole-voice/dense paths where their state model cannot represent it;
+  those paths fall back for correctness rather than approximating the DSP.
+
 - 2026-09-15 feat(v3): add initial SFZ instrument support
   I compile external WAV-backed SFZ regions into the existing V3 sample and
   region pipeline, including inheritance, mapping, tuning, gain/pan, loops,

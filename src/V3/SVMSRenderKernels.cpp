@@ -60,11 +60,11 @@ uint32_t RenderSustainedLoopSpan(
                     const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
                     float sample =
                         first + (static_cast<float>(region[baseOffset + 1u]) * (1.0f / 32768.0f) - first) * fraction;
-                    sample = ProcessVoiceFilterSample(v, idx, sample);
                     if (rot)
                         sample = RotateVoiceSample(rot[idx], sample,
                                                    hilbertRegion, baseOffset,
                                                    baseOffset + 1u, fraction);
+                    sample = ProcessVoiceFilterSample(v, idx, sample);
                     outL[n] += sample * gainL;
                     outR[n] += sample * gainR;
                     phase += phaseStep;
@@ -77,10 +77,10 @@ uint32_t RenderSustainedLoopSpan(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[relLoopS]) * (1.0f / 32768.0f) - first) * fraction;
-            sample = ProcessVoiceFilterSample(v, idx, sample);
             if (rot)
                 sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                            baseOffset, relLoopS, fraction);
+            sample = ProcessVoiceFilterSample(v, idx, sample);
             outL[n] += sample * gainL;
             outR[n] += sample * gainR;
             ++n;
@@ -98,10 +98,10 @@ uint32_t RenderSustainedLoopSpan(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[nextOffset]) * (1.0f / 32768.0f) - first) * fraction;
-            sample = ProcessVoiceFilterSample(v, idx, sample);
             if (rot)
                 sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                            baseOffset, nextOffset, fraction);
+            sample = ProcessVoiceFilterSample(v, idx, sample);
             outL[n] += sample * gainL;
             outR[n] += sample * gainR;
             phase += phaseStep;
@@ -151,10 +151,10 @@ uint32_t RenderSustainedOneShotSpan(
         const float fraction = phase - static_cast<float>(baseOffset);
         const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[baseOffset + 1u]) * (1.0f / 32768.0f) - first) * fraction;
-        sample = ProcessVoiceFilterSample(v, idx, sample);
         if (rot)
             sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                        baseOffset, baseOffset + 1u, fraction);
+        sample = ProcessVoiceFilterSample(v, idx, sample);
         outL[n] += sample * gainL;
         outR[n] += sample * gainR;
         phase += phaseStep;
@@ -210,10 +210,10 @@ void RenderSustainedLoopShortBatchFixed(
             const float fraction = phase - static_cast<float>(baseOffset);
             const float first = static_cast<float>(region[baseOffset]) * (1.0f / 32768.0f);
             float sample = first + (static_cast<float>(region[nextOffset]) * (1.0f / 32768.0f) - first) * fraction;
-            sample = ProcessVoiceFilterSample(v, idx, sample);
             if (rot)
                 sample = RotateVoiceSample(rot[idx], sample, hilbertRegion,
                                            baseOffset, nextOffset, fraction);
+            sample = ProcessVoiceFilterSample(v, idx, sample);
             dstLeft[frame] += sample * gainLeft;
             dstRight[frame] += sample * gainRight;
             phase += phaseStep;

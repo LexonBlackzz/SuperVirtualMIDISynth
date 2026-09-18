@@ -80,6 +80,36 @@ public:
         std::memset(sampleData_.data() + sf2_->sampleDataFrames, 0,
                     8u * sizeof(int16_t));
         sampleFrames_ = sf2_->sampleDataFrames;
+
+        // Standalone/offline must mean the same thing by "Analytic" as the
+        // realtime driver. Build the exact analytic companion before voice
+        // rotation is enabled; no allpass fallback for modes 1/2/4.
+        if (config.phaseRotationMode == 1u ||
+            config.phaseRotationMode == 2u ||
+            config.phaseRotationMode == 4u) {
+            try {
+                hilbertData_.assign(static_cast<size_t>(sampleFrames_) + 8u,
+                                    int16_t{0});
+            } catch (...) {
+                error = "cannot allocate SoundFont Hilbert companion";
+                return false;
+            }
+            for (uint32_t i = 0u; i < sf2_->sampleCount; ++i) {
+                const SF2Sample& sample = sf2_->samples[i];
+                if (sample.end <= sample.start ||
+                    sample.start >= sampleFrames_ ||
+                    sample.end > sampleFrames_) {
+                    continue;
+                }
+                HilbertTransformSlice(
+                    sampleData_.data() + sample.start,
+                    hilbertData_.data() + sample.start,
+                    sample.end - sample.start);
+            }
+        } else {
+            hilbertData_.clear();
+        }
+
         prepared_.resize(sf2_->regionCount);
         if (!voices_.Initialize(maxVoices_, rate_)) {
             error = "cannot allocate voice storage";
@@ -143,7 +173,11 @@ public:
         limiterConfig.limiterAttackMs = config.limiterAttackMs;
         limiterConfig.limiterReleaseMs = config.limiterReleaseMs;
         limiter_.Configure(rate_, limiterConfig);
-        voices_.SetPhaseRotationMode(config.phaseRotationMode);
+        voices_.SetHilbertPairAvailable(!hilbertData_.empty());
+        if (!voices_.SetPhaseRotationMode(config.phaseRotationMode)) {
+            error = "cannot allocate phase-rotation voice state";
+            return false;
+        }
         // Production event dispatch: RenderBlock walks its event array and
         // calls this at each event's exact frame, so batched event blocks
         // take the whole-voice/dense fast paths instead of per-event span
@@ -219,10 +253,10 @@ public:
                 const uint32_t* tailHandles = voices_.GetStealTailList();
                 for (uint32_t pos = tailCount; pos > 0u; --pos) {
                     const uint32_t slot = tailHandles[pos - 1u];
-                    RenderStealTailSample(voices_.v, slot,
-                                          sampleData_.data(),
-                                          nullptr,
-                                          sampleFrames_,
+                    RenderStealTailSample(
+                        voices_.v, slot, sampleData_.data(),
+                        hilbertData_.empty() ? nullptr : hilbertData_.data(),
+                        sampleFrames_,
                                           oL, oR);
                     voices_.RefreshStealTail(
                         static_cast<VoiceHandle>(slot));
@@ -236,7 +270,9 @@ public:
         }
 #endif
         {
-            renderer_.RenderBlock(voices_, channels_, sampleData_.data(),
+            renderer_.RenderBlock(
+                voices_, channels_, sampleData_.data(),
+                hilbertData_.empty() ? nullptr : hilbertData_.data(),
                                   sampleFrames_, left, right,
                                   frameCount, cfg_, nullptr, 0, true,
                                   absoluteFrame);
@@ -319,7 +355,9 @@ public:
 #if defined(_MSC_VER)
         const uint64_t renderBegin = __rdtsc();
 #endif
-        renderer_.RenderBlock(voices_, channels_, sampleData_.data(),
+        renderer_.RenderBlock(
+                voices_, channels_, sampleData_.data(),
+                hilbertData_.empty() ? nullptr : hilbertData_.data(),
                               sampleFrames_, left, right, frameCount, cfg_,
                               events, eventCount, false, absoluteFrame);
 #if defined(_MSC_VER)
@@ -826,6 +864,7 @@ private:
     uint64_t missingRegions_ = 0, invalidRegions_ = 0, fallbackRegions_ = 0;
     std::unique_ptr<SF2Data> sf2_;
     std::vector<int16_t> sampleData_;
+    std::vector<int16_t> hilbertData_;
     uint32_t sampleFrames_ = 0;
     std::vector<PreparedRegion> prepared_;
     VoiceManager voices_;

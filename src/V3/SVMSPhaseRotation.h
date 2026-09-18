@@ -329,10 +329,10 @@ inline void SeedVoiceRotation(VoiceRotationState& st, uint32_t mode,
         st.ds = std::sin(dTheta);
     }
 
-    if (mode != 3u && hilbertPairAvailable) {
-        // Exact analytic pair from the SoundFont's companion store.  Same
-        // angles/sweep as the allpass forms; only the quadrature source
-        // differs (x̂ from the store instead of the splitter's I and Q).
+    if ((mode == 1u || mode == 2u) && hilbertPairAvailable) {
+        // Analytic/Sweep use the exact SoundFont companion. Random remains
+        // on its intended jittered allpass splitter below so mode 4 stays
+        // distinct instead of collapsing into Sweep whenever a pair exists.
         st.form = 2u;
         return;
     }

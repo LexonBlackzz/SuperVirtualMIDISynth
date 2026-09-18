@@ -75,10 +75,10 @@ inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
 
     const float frac = phase - static_cast<float>(baseOffset);
     float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
-    sample = ProcessStealTailFilterSample(v, idx, sample);
     if (v.rot)
         sample = RotateVoiceSample(v.stealTailRot[idx], sample, hilbertData,
                                    baseIndex, nextIndex, frac);
+    sample = ProcessStealTailFilterSample(v, idx, sample);
     const uint32_t total = v.stealTailFramesTotal[idx];
     const float fade = total > 1u
         ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
@@ -1389,9 +1389,9 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                     // The voice still advances phase and envelope so it
                     // retires correctly; only the audio output is skipped.
                     if (mixAudio) {
-                        sample = InterpolateSample(sampleData, baseIdx, nextIdx, frac);
-                        sample = ProcessVoiceFilterSample(v, idx, sample);
-                                                fetchBaseIndex = baseIdx;
+                        sample = InterpolateSample(
+                            sampleData, baseIdx, nextIdx, frac);
+                        fetchBaseIndex = baseIdx;
                         fetchNextIndex = nextIdx;
                         fetchFrac = frac;
                     }
@@ -1491,6 +1491,7 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                     rotated = RotateVoiceSample(v.rot[idx], rotated,
                                                 hilbertData, fetchBaseIndex,
                                                 fetchNextIndex, fetchFrac);
+                rotated = ProcessVoiceFilterSample(v, idx, rotated);
                 const float scaled = rotated * gain * stealFadeIn;
                 if (channelBusLeft != nullptr) {
                     // Bus mode: mix into this voice's channel plane.
@@ -1635,6 +1636,7 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
             sample = RotateVoiceSample(v.stealTailRot[idx], sample,
                                        hilbertData, baseIndex, nextIndex,
                                        frac);
+        sample = ProcessStealTailFilterSample(v, idx, sample);
         const float fade = total > 1u
             ? static_cast<float>(remaining - 1u) / static_cast<float>(total - 1u)
             : 0.0f;
@@ -1710,7 +1712,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
 
     // The overwhelmingly common path: a held, sustained, looping SF2 voice.
     // Only phase/fade state is written back after the span.
-    if (!released && stage == 3u && loop) {
+    if (!released && stage == 3u && loop && v.rot == nullptr) {
         // Full-quality steady state: no decimation, no replacement fade, and
         // bounds already validated above.  This is the 4K acceptance kernel.
         if (mixedFrameCount == frameCount && fadeRemaining == 0u) {
@@ -1952,7 +1954,8 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
     // Full-quality looping attack/decay voices.  Envelope state remains local
     // while the sample cursor follows the same validated loop as steady state.
     if (!released && loop && fadeRemaining == 0u &&
-        mixedFrameCount == frameCount && (stage == 1u || stage == 2u)) {
+        mixedFrameCount == frameCount && (stage == 1u || stage == 2u) &&
+        v.rot == nullptr) {
         uint32_t attackRemaining = v.attackSamplesRemaining[idx];
         uint32_t decayRemaining = v.decaySamplesRemaining[idx];
         const float targetGain = v.targetGain[idx];
@@ -2026,7 +2029,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
     // Full-quality continuous-loop release. Mode-3 key-held loops are already
     // disabled by StartRelease and therefore remain on the generic path.
     if (released && loop && fadeRemaining == 0u &&
-        mixedFrameCount == frameCount) {
+        mixedFrameCount == frameCount && v.rot == nullptr) {
         uint32_t releaseRemaining = v.releaseSamplesRemaining[idx];
         const float releaseDecay = v.releaseDecay[idx];
         float* outL = outputLeft + frameStart;
@@ -2123,9 +2126,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             const uint32_t baseIndex = sampleStart + baseOffset;
             const uint32_t nextIndex = sampleStart + nextRel;
             const float frac = phase - static_cast<float>(baseOffset);
-            sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
-            sample = ProcessVoiceFilterSample(v, idx, sample);
-                        fetchBaseIndex = baseIndex;
+            sample = InterpolateSample(
+                sampleData, baseIndex, nextIndex, frac);
+            fetchBaseIndex = baseIndex;
             fetchNextIndex = nextIndex;
             fetchFrac = frac;
         }
@@ -2208,6 +2211,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 sampleR = RotateVoiceSample(v.rot[idx], sampleR, hilbertData,
                                             fetchBaseIndex, fetchNextIndex,
                                             fetchFrac);
+            sampleR = ProcessVoiceFilterSample(v, idx, sampleR);
             const float scaled = sampleR * gain * fade;
             outputLeft[frameStart + n] += scaled * mixL;
             outputRight[frameStart + n] += scaled * mixR;

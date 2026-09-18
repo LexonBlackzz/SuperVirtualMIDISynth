@@ -4307,26 +4307,23 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
         bundle->sampleData = sbuf;
         bundle->sampleDataFrames = frames;
 
-        // Analytic companion store (Hilbert pair) for the phase-rotation
-        // pair form. Built only when the live rotation mode can consume it
-        // (Analytic/Sweep/Random); a later mode switch without the pair
-        // falls back to the allpass forms until the next SoundFont load.
-        const uint32_t rotationMode =
-            liveMailbox_.phaseRotationMode.load(std::memory_order_relaxed);
-        if (rotationMode == 1u || rotationMode == 2u || rotationMode == 4u) {
-            int16_t* hbuf = static_cast<int16_t*>(malloc(
-                (static_cast<size_t>(frames) + 8u) * sizeof(int16_t)));
-            if (!hbuf) {
-                error = "not enough memory to build SoundFont Hilbert pair";
-                DestroySoundFontBundle(bundle);
-                return nullptr;
-            }
-            std::memset(hbuf, 0,
-                        (static_cast<size_t>(frames) + 8u) * sizeof(int16_t));
-            BuildHilbertPairStore(sf2, hbuf);
-            bundle->hilbertData = hbuf;
-            LOG("  Hilbert pair built: %u frames", frames);
+        // Exact analytic companion store for per-voice Hilbert rotation.
+        // Build it unconditionally at SoundFont load time so the live
+        // Coherent -> Analytic/Sweep/Random switch can NEVER silently
+        // downgrade to the quadrature-allpass approximation. The load is
+        // off the audio callback and the bundle publishes atomically.
+        int16_t* hbuf = static_cast<int16_t*>(malloc(
+            (static_cast<size_t>(frames) + 8u) * sizeof(int16_t)));
+        if (!hbuf) {
+            error = "not enough memory to build SoundFont Hilbert pair";
+            DestroySoundFontBundle(bundle);
+            return nullptr;
         }
+        std::memset(hbuf, 0,
+                    (static_cast<size_t>(frames) + 8u) * sizeof(int16_t));
+        BuildHilbertPairStore(sf2, hbuf);
+        bundle->hilbertData = hbuf;
+        LOG("  Hilbert pair built: %u frames", frames);
     }
 
     const uint32_t sampCount = sf2->sampleCount;
