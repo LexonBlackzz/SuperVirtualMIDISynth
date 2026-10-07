@@ -10,6 +10,12 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 build(v3): precompile SVMSDriverInternal.h for the driver sources
+  The 10 driver translation units each re-parsed the big engine headers
+  (~1.2 s apiece). A PCH (SVMS_DRIVER_PCH, driver files only; kernels/ASIO/etc.
+  skip it) brings a header touch to 5.7 s (was 10.5) and a single-file edit
+  to ~2 s. Under a compiler-cache launcher the PCH defaults off and /Zi becomes
+  /Z7, so sccache can cache everything in CI.
 - 2026-10-07 build(v3): compile the engine once for winmm.dll and SVMSAPI.dll
   Both DLLs used to compile every engine source separately. They now link one
   `svms_engine` OBJECT library; only SVMSFrontWinMM.cpp is still built per DLL,

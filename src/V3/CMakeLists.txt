@@ -239,7 +239,13 @@ if(MSVC)
     add_compile_options(/utf-8)
     add_definitions(-DUNICODE -D_UNICODE)
     if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-        add_compile_options(/O2 /Oi /Gy /Zi /FS)
+        if(CMAKE_CXX_COMPILER_LAUNCHER)
+            # Compiler caches (sccache in CI) can only cache objects that
+            # embed their debug info; /Z7 vs /Zi does not change codegen.
+            add_compile_options(/O2 /Oi /Gy /Z7)
+        else()
+            add_compile_options(/O2 /Oi /Gy /Zi /FS)
+        endif()
         add_link_options(/DEBUG /OPT:REF /OPT:ICF)
     endif()
 endif()
@@ -364,6 +370,24 @@ endif()
 # translation unit is the WinMM shim file, because svmsapi builds it with
 # _WINMM_ (see below); no other file defines a WinMM SDK function.
 add_library(svms_engine OBJECT ${SOURCES} ${HEADERS})
+
+# Precompile SVMSDriverInternal.h for the driver sources. Each of them includes
+# it first anyway, so this only removes the repeated parse of the big engine
+# headers. Off by default under a compiler cache, which cannot cache PCH users.
+if(CMAKE_CXX_COMPILER_LAUNCHER)
+    set(SVMS_DRIVER_PCH_DEFAULT OFF)
+else()
+    set(SVMS_DRIVER_PCH_DEFAULT ON)
+endif()
+option(SVMS_DRIVER_PCH "Precompile SVMSDriverInternal.h for the driver sources"
+    ${SVMS_DRIVER_PCH_DEFAULT})
+if(SVMS_DRIVER_PCH)
+    target_precompile_headers(svms_engine PRIVATE SVMSDriverInternal.h)
+    set(SVMS_ENGINE_NON_DRIVER_SOURCES ${SOURCES})
+    list(REMOVE_ITEM SVMS_ENGINE_NON_DRIVER_SOURCES ${SVMS_DRIVER_SOURCES})
+    set_source_files_properties(${SVMS_ENGINE_NON_DRIVER_SOURCES} PROPERTIES
+        SKIP_PRECOMPILE_HEADERS ON)
+endif()
 
 add_library(svmsynth SHARED SVMSFrontWinMM.cpp
     "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc")
