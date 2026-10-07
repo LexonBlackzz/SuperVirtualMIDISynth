@@ -416,7 +416,9 @@ class OfflineSynth {
 public:
     bool Initialize(const Options& o, std::string& error) {
         rate_=o.sampleRate; maxVoices_=o.maxVoices; master_=o.masterVolume;
-        sf2_.reset(new SF2Data{});
+        // () not {}: SF2Data holds 65536 SFSampleRegions with member initializers;
+        // brace-init costs cl.exe ~3 s and far more memory in every TU that sees it.
+        sf2_.reset(new SF2Data());
         if (!soundfont_load(o.soundfont.c_str(), sf2_.get())) { error="failed to load SoundFont"; return false; }
         sf2_build_regions(sf2_.get());
         if (sf2_->regionOverflow || sf2_->regionCount == 0) {

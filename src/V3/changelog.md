@@ -10,6 +10,11 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 fix(v3): value-initialize SF2Data with () instead of {}
+  `new SF2Data{}` aggregate-initializes 65536 SFSampleRegions that have member
+  initializers, and cl.exe pays ~3 s plus a lot of memory for it in every TU
+  that includes SVMSStandaloneSynth.h (it ran a full-parallel build out of
+  RAM). `new SF2Data()` gives the same zeros-plus-defaults object.
 - 2026-10-07 refactor(v3): split SVMSDriver.cpp by area
   The 10k-line driver is now SVMSDriverInternal.h (class Driver + shared
   helpers) plus SVMSDriver/RuntimeLink/SoundFont/Backend/Ingress/Render.cpp

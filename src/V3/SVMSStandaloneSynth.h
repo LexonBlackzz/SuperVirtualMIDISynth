@@ -63,7 +63,9 @@ public:
         rate_ = config.sampleRate;
         maxVoices_ = config.maxVoices;
         master_ = config.masterVolume;
-        sf2_.reset(new SF2Data{});
+        // () not {}: SF2Data holds 65536 SFSampleRegions with member initializers;
+        // brace-init costs cl.exe ~3 s and far more memory in every TU that sees it.
+        sf2_.reset(new SF2Data());
         if (!soundfont_load(config.soundfont.c_str(), sf2_.get())) {
             error = "failed to load SoundFont";
             return false;
