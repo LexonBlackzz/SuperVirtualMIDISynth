@@ -10,6 +10,17 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 perf(v3): trim whole-voice plan loop (O(1) release-op drop, slim ghost copy, same-frame note batching)
+  The serial plan is 93-100% of block time at multi-M NPS. I made the
+  deferred-release op drop O(1) (per-handle index), copy only the fields
+  ghosts actually read on each steal, and hand same-frame note runs to the
+  batch dispatcher in one call so the driver's exact-frame batching engages
+  (ordinal semantics unchanged). I also fixed a bench artifact
+  (8 VoiceConfiguration ctors per note-on) and added the wv_cycles split.
+  Whole-voice test output is byte-identical. p50 250v/15M 152 -> 118,
+  8192v/5M 124 -> 112; most of that is the bench fix. The remaining wall is
+  victim-row cache misses in LaunchVoiceGroup.
+
 - 2026-09-16 fix(v3): honor SIMD worker fallback for phase-rotated voices
   The render worker pool now preserves the documented class-kernel contract:
   when AVX2/SSE2 refuses a complete job without mutation, the matching scalar

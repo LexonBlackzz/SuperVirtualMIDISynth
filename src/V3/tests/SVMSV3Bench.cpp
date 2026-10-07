@@ -373,7 +373,11 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
             : static_cast<uint8_t>(24u + sequence % 88u);
         const uint8_t velocity = sourceEvent ? sourceEvent->data2
             : static_cast<uint8_t>(64u + sequence % 64u);
-        svms::VoiceConfiguration localSetups[8]{};
+        // Static scratch like the driver's noteLaunchScratch_: a local array
+        // re-ran 8 VoiceConfiguration constructors per note-on (~20% of
+        // the measured plan time at multi-M NPS) even when preparedSetups
+        // makes it unused.  The bench dispatches from one thread only.
+        static svms::VoiceConfiguration localSetups[8];
         svms::VoiceHandle handles[8]{};
         const svms::VoiceConfiguration* setups = preparedSetups;
         if (!setups) {
@@ -1230,6 +1234,12 @@ int main(int argc, char** argv) {
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::ReleaseOneShot)],
         classCounts[static_cast<uint32_t>(svms::VoiceRenderClass::Generic)],
         voices->GetStealTailCount(), p50, p95, p99, p999, maximum);
+    // Whole-voice phase split (includes warmup): plan is serial on the audio
+    // thread, jobs fan out to the workers.  stderr keeps the JSON line intact.
+    std::fprintf(stderr, "{\"wv_cycles\":{\"plan\":%llu,\"jobs\":%llu,\"post\":%llu}}\n",
+        static_cast<unsigned long long>(renderer->GetWvPlanCycles()),
+        static_cast<unsigned long long>(renderer->GetWvJobCycles()),
+        static_cast<unsigned long long>(renderer->GetWvPostCycles()));
 
     int result = 0;
     if (options.enforce && options.voices == 2000u &&

@@ -795,6 +795,9 @@ private:
     uint32_t wvHandleCapacity_ = 0u;         // handle-range size of the above
     uint32_t* wvOpHandles_ = nullptr;
     uint32_t* wvOpFrames_ = nullptr;
+    // Per handle: position of its entry in wvOpHandles_ (valid only while
+    // wvOpHandles_[pos] == handle && pos < wvOpCount_; never cleared).
+    uint32_t* wvOpIndex_ = nullptr;
     uint32_t wvOpCapacity_ = 0u;
     uint32_t wvOpCount_ = 0u;
     uint32_t wvEventFrame_ = 0u;
@@ -1049,10 +1052,13 @@ inline RenderScalar::~RenderScalar() {
     _aligned_free(denseLastPhaseAdvancedFrames_);
     _aligned_free(wvStartFrame_);
     _aligned_free(wvReleaseFrame_);
+    _aligned_free(wvStartIngress_);
     _aligned_free(wvSliceHandles_);
     _aligned_free(wvOpHandles_);
     _aligned_free(wvOpFrames_);
+    _aligned_free(wvOpIndex_);
     _aligned_free(wvGhostStartFrame_);
+    _aligned_free(wvGhostStartIngress_);
     _aligned_free(wvGhostDeathFrame_);
     _aligned_free(wvGhostReleaseFrame_);
     _aligned_free(wvGhostNoTail_);
@@ -3638,13 +3644,34 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 
 // ── Whole-voice whole-block renderer ────────────────────────────────────
 
-// Copy one full render row (dense + cold fields) between VoiceSoA pools.
-// The macro keeps the copy complete when SoA fields are added.
-#define SVMS_COPY_VOICE_ROW_FIELD(type, name) \
-    destination.name[destinationRow] = source.name[sourceRow];
-inline void CopyVoiceRow(const VoiceSoA& source, VoiceSoA& destination,
+// Copy the render state of a displaced/killed voice into a ghost row.  Every
+// dense field rides along (the macro keeps that set complete); of the cold
+// fields only the ones ghost rendering reads are copied: channel (bus mode +
+// op channel), loopMode (release flip), the row-op inputs (basePhaseIncs,
+// pitchBendScales, gainLeft/Right, stealOutputGain) and the vibrato LFO
+// state.  The rest (note/velocity/preset/region/playIndex, pedal holds,
+// key-chain links, birthFrame, releaseStartInBlock) is voice-manager
+// bookkeeping no ghost path touches; skipping it saves ~10 cold victim-row
+// cache misses per steal on the serial plan loop.  A new cold field that
+// the ghost render path reads must be added here.
+#define SVMS_COPY_VOICE_ROW_FIELD(type, name)     destination.name[destinationRow] = source.name[sourceRow];
+inline void CopyGhostRow(const VoiceSoA& source, VoiceSoA& destination,
                          uint32_t sourceRow, uint32_t destinationRow) {
-    SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_VOICE_ROW_FIELD)
+    SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_COPY_VOICE_ROW_FIELD)
+#define SVMS_COPY_FIELD(name) SVMS_COPY_VOICE_ROW_FIELD(_, name)
+    SVMS_COPY_FIELD(channel)
+    SVMS_COPY_FIELD(loopMode)
+    SVMS_COPY_FIELD(basePhaseIncs)
+    SVMS_COPY_FIELD(pitchBendScales)
+    SVMS_COPY_FIELD(gainLeft)
+    SVMS_COPY_FIELD(gainRight)
+    SVMS_COPY_FIELD(stealOutputGain)
+    SVMS_COPY_FIELD(vibLfoToPitchCents)
+    SVMS_COPY_FIELD(vibLfoSteps)
+    SVMS_COPY_FIELD(vibLfoPhases)
+    SVMS_COPY_FIELD(vibLfoDelays)
+    SVMS_COPY_FIELD(vibLfoModulated)
+#undef SVMS_COPY_FIELD
 }
 #undef SVMS_COPY_VOICE_ROW_FIELD
 
@@ -3653,14 +3680,18 @@ inline void CopyVoiceRow(const VoiceSoA& source, VoiceSoA& destination,
 // finalization must not observe the dead generation: the handle may already
 // host a newer launch carrying its own release op, and a stale entry would
 // double-count releasingCount_ once the new voice's own release lands.
+// O(1) via wvOpIndex_: a handle holds at most one entry (the hook guards on
+// wvReleaseFrame_), so this finds and swaps exactly the entry the former
+// linear scan did — finalization order is unchanged.  The scan was O(pending
+// releases) per steal, i.e. O(steals x pool) per block under chopped churn.
 inline void RenderScalar::DropWholeVoiceReleaseOp(VoiceHandle handle) {
-    for (uint32_t i = 0; i < wvOpCount_; ++i) {
-        if (wvOpHandles_[i] == handle) {
-            wvOpHandles_[i] = wvOpHandles_[wvOpCount_ - 1];
-            wvOpFrames_[i] = wvOpFrames_[wvOpCount_ - 1];
-            --wvOpCount_;
-            break;
-        }
+    const uint32_t i = wvOpIndex_[handle];
+    if (i >= wvOpCount_ || wvOpHandles_[i] != handle) return;
+    const uint32_t last = --wvOpCount_;
+    if (i != last) {
+        wvOpHandles_[i] = wvOpHandles_[last];
+        wvOpFrames_[i] = wvOpFrames_[last];
+        wvOpIndex_[wvOpHandles_[i]] = i;
     }
 }
 
@@ -3730,7 +3761,7 @@ inline void RenderScalar::WholeVoicePreTailCaptureHook(
         return;
     }
     const uint32_t ghost = renderer->wvGhostCount_++;
-    CopyVoiceRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
+    CopyGhostRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
                  handle, ghost);
     renderer->wvGhostStartFrame_[ghost] =
         renderer->wvStartFrame_[handle] == UINT32_MAX
@@ -3783,7 +3814,7 @@ inline void RenderScalar::WholeVoiceSilenceVoiceHook(
         return;
     }
     const uint32_t ghost = renderer->wvGhostCount_++;
-    CopyVoiceRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
+    CopyGhostRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
                  handle, ghost);
     renderer->wvGhostStartFrame_[ghost] =
         renderer->wvStartFrame_[handle] == UINT32_MAX
@@ -3953,6 +3984,7 @@ inline void RenderScalar::WholeVoiceDeferredReleaseHook(
     // already-released generation because StartRelease unlinked its key
     // chain before this hook ran.
     renderer->wvReleaseFrame_[handle] = renderer->wvEventFrame_;
+    renderer->wvOpIndex_[handle] = renderer->wvOpCount_;
     renderer->wvOpHandles_[renderer->wvOpCount_] = handle;
     renderer->wvOpFrames_[renderer->wvOpCount_] = renderer->wvEventFrame_;
     ++renderer->wvOpCount_;
@@ -4128,16 +4160,39 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     // Ingress-order dispatch with the render clock at each event's exact
     // frame: birth ages, steal scores and every driver-side decision see
     // the same values they would see mid-block today.
-    for (uint32_t i = 0u; i < eventCount; ++i) {
+    //
+    // A maximal same-frame run of note events goes to the batch dispatcher
+    // in one call, so the driver's exact-frame batching (launch-plan reuse,
+    // adjacent note-off aggregation) engages here as on the legacy path.
+    // Every launch in the run is stamped with the run's first ordinal.  That
+    // is exact for same-frame op qualification: ordinals are only ever
+    // compared against row-op ordinals, row-op events never join a run, so
+    // for any op ordinal o outside [begin, end) "o < i" == "o < begin".
+    const auto isNoteEvent = [](RenderEventType type) {
+        return type == RenderEventType::NoteOn ||
+               type == RenderEventType::NoteOff ||
+               type == RenderEventType::StaleNoteOffBatch;
+    };
+    for (uint32_t i = 0u; i < eventCount;) {
         const RenderEvent& event = events[i];
         wvEventFrame_ = event.frameOffset;
         wvEventOrdinal_ = i;
         voices.SetCurrentFrame(blockStartFrame + event.frameOffset);
         if (batchDispatcher_ != nullptr) {
-            batchDispatcher_(&event, 1u, event.frameOffset,
+            uint32_t end = i + 1u;
+            if (isNoteEvent(event.type)) {
+                while (end < eventCount &&
+                       events[end].frameOffset == event.frameOffset &&
+                       isNoteEvent(events[end].type)) {
+                    ++end;
+                }
+            }
+            batchDispatcher_(&event, end - i, event.frameOffset,
                              dispatcherUserData_);
+            i = end;
         } else {
             dispatcher_(event, event.frameOffset, dispatcherUserData_);
+            ++i;
         }
     }
 
@@ -4986,6 +5041,7 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     uint32_t* freshStart = allocU32(wvStartFrame_, handleCapacity);
     uint32_t* freshRelease = allocU32(wvReleaseFrame_, handleCapacity);
     uint32_t* freshStartIngress = allocU32(wvStartIngress_, handleCapacity);
+    uint32_t* freshOpIndex = allocU32(wvOpIndex_, handleCapacity);
     uint32_t* freshSlice = allocU32(wvSliceHandles_, cap);
     uint32_t* freshOpHandles = allocU32(wvOpHandles_, cap);
     uint32_t* freshOpFrames = allocU32(wvOpFrames_, cap);
@@ -4996,7 +5052,7 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     uint8_t* freshGhostNoTail = static_cast<uint8_t*>(_aligned_malloc(
         static_cast<size_t>(cap) * sizeof(uint8_t), kMixBufferAlign));
     if (freshStart == nullptr || freshRelease == nullptr ||
-        freshStartIngress == nullptr ||
+        freshStartIngress == nullptr || freshOpIndex == nullptr ||
         freshSlice == nullptr || freshOpHandles == nullptr ||
         freshOpFrames == nullptr || freshGhostStart == nullptr ||
         freshGhostDeath == nullptr || freshGhostRelease == nullptr ||
@@ -5004,6 +5060,7 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
         _aligned_free(freshStart);
         _aligned_free(freshRelease);
         _aligned_free(freshStartIngress);
+        _aligned_free(freshOpIndex);
         _aligned_free(freshSlice);
         _aligned_free(freshOpHandles);
         _aligned_free(freshOpFrames);
@@ -5028,6 +5085,8 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     wvStartFrame_ = freshStart;
     wvReleaseFrame_ = freshRelease;
     wvStartIngress_ = freshStartIngress;
+    _aligned_free(wvOpIndex_);
+    wvOpIndex_ = freshOpIndex;
     wvSliceHandles_ = freshSlice;
     wvOpHandles_ = freshOpHandles;
     wvOpFrames_ = freshOpFrames;
