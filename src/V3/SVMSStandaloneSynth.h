@@ -6,6 +6,7 @@
 #include "SVMSConfig.h"
 #include "SVMSEnvelope.h"
 #include "SVMSEventCompile.h"
+#include "SVMSHilbertPair.h"
 #include "SVMSLimiter.h"
 #include "SVMSNoteOnCollapse.h"
 #include "SVMSPostFilter.h"
@@ -96,18 +97,14 @@ public:
                 error = "cannot allocate SoundFont Hilbert companion";
                 return false;
             }
-            for (uint32_t i = 0u; i < sf2_->sampleCount; ++i) {
-                const SF2Sample& sample = sf2_->samples[i];
-                if (sample.end <= sample.start ||
-                    sample.start >= sampleFrames_ ||
-                    sample.end > sampleFrames_) {
-                    continue;
-                }
-                HilbertTransformSlice(
-                    sampleData_.data() + sample.start,
-                    hilbertData_.data() + sample.start,
-                    sample.end - sample.start);
-            }
+#if defined(SVMS_XP_COMPAT)
+            const uint32_t buildThreads = 1u;
+#else
+            const uint32_t buildThreads = (std::min)(
+                16u, (std::max)(1u, std::thread::hardware_concurrency()));
+#endif
+            BuildHilbertCompanion(*sf2_, sampleData_.data(),
+                                  hilbertData_.data(), buildThreads);
         } else {
             hilbertData_.clear();
         }
@@ -175,7 +172,6 @@ public:
         limiterConfig.limiterAttackMs = config.limiterAttackMs;
         limiterConfig.limiterReleaseMs = config.limiterReleaseMs;
         limiter_.Configure(rate_, limiterConfig);
-        voices_.SetHilbertPairAvailable(!hilbertData_.empty());
         if (!voices_.SetPhaseRotationMode(config.phaseRotationMode)) {
             error = "cannot allocate phase-rotation voice state";
             return false;

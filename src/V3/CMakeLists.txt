@@ -366,6 +366,7 @@ set(HEADERS
     SVMSRenderScalar.h
     SVMSRenderEvent.h
     SVMSDriverInternal.h
+    SVMSHilbertPair.h
     SVMSRenderKernels.h
     SVMSRenderWorkers.h
     SVMSAudioOutput.h

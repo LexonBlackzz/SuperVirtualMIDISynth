@@ -10,6 +10,17 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 fix(v3): make per-voice phase rotation exactly analytic
+  Two things kept rotation from being a pure phase shift. The allpass
+  "quadrature splitter" (still used by Random) was never in quadrature: its
+  branches were 7-170 degrees apart, so each voice got an angle-dependent
+  filter. And the Hilbert companion was built per whole sample slice, so over
+  a loop it stepped at every wrap (a click at the loop rate) and the voice's
+  level depended on the angle. The new SVMSHilbertPair.h builds the loop as a
+  periodic transform, crossfades attack/tail into it and guards one-shots;
+  modes 1/2/4 always use the exact pair (Random = per-voice sweep rate and
+  direction), and the splitter is gone. Correctness suite green again
+  (was red since ce65158); new loop tests fail on the old builder.
 - 2026-10-07 feat(v3): canonical engine phase 2 (WIP) + launch-hot VoiceRow
   Unfinished work pushed as-is. src/V3/Engine/ holds the canonical engine,
   wired only into svms_v3_render behind a legacy|canonical selector (see

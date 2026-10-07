@@ -1,6 +1,7 @@
 // SoundFont bundles: preparation, Hilbert pair store, loader thread, swap.
 
 #include "SVMSDriverInternal.h"
+#include "SVMSHilbertPair.h"
 
 namespace svms {
 
@@ -146,17 +147,15 @@ bool Driver::LoadConfiguredSoundFont() {
 
 
 // ── Hilbert-pair store construction ─────────────────────────────────────
-// One slice transform task; SVMSPhaseRotation.h owns the math. Thread fan-
-// out is a plain CreateThread pool (XP-safe, no SRWLock/std::thread): each
-// slice is transformed by exactly one thread with the fixed-order double
-// FFT, so the store is bit-identical to a serial build regardless of the
-// thread count.
+// One slice per task; SVMSHilbertPair.h owns the math. Thread fan-out is a
+// plain CreateThread pool (XP-safe, no SRWLock/std::thread): each slice is
+// transformed by exactly one thread with the fixed-order double FFT, so the
+// store is bit-identical to a serial build regardless of the thread count.
 namespace {
 struct HilbertSliceJob {
     const int16_t* src;
     int16_t* dst;
-    const uint32_t* starts;
-    const uint32_t* counts;
+    const svms::HilbertSliceSpec* specs;
     std::atomic<uint32_t>* next;
     uint32_t taskCount;
 };
@@ -167,34 +166,21 @@ DWORD WINAPI HilbertSliceWorker(LPVOID param) noexcept {
         const uint32_t task = job->next->fetch_add(1u,
             std::memory_order_relaxed);
         if (task >= job->taskCount) break;
-        svms::HilbertTransformSlice(job->src + job->starts[task],
-                                    job->dst + job->starts[task],
-                                    job->counts[task]);
+        svms::BuildHilbertSlice(job->src, job->dst, job->specs[task]);
     }
     return 0u;
 }
 }  // namespace
 
 static void BuildHilbertPairStore(const SF2Data* sf2, int16_t* hilbert) {
-    const uint32_t sampleCount = sf2->sampleCount;
-    std::vector<uint32_t> starts;
-    std::vector<uint32_t> counts;
-    starts.reserve(sampleCount);
-    counts.reserve(sampleCount);
-    for (uint32_t i = 0u; i < sampleCount; ++i) {
-        const SF2Sample& s = sf2->samples[i];
-        if (s.end > s.start && s.start < sf2->sampleDataFrames &&
-            s.end <= sf2->sampleDataFrames) {
-            starts.push_back(s.start);
-            counts.push_back(s.end - s.start);
-        }
-    }
-    const uint32_t taskCount = static_cast<uint32_t>(starts.size());
+    const std::vector<svms::HilbertSliceSpec> specs =
+        svms::PlanHilbertSlices(*sf2);
+    const uint32_t taskCount = static_cast<uint32_t>(specs.size());
     if (taskCount == 0u) return;
 
     std::atomic<uint32_t> next{0u};
-    HilbertSliceJob job{sf2->sampleData, hilbert, starts.data(), counts.data(),
-                        &next, taskCount};
+    HilbertSliceJob job{sf2->sampleData, hilbert, specs.data(), &next,
+                        taskCount};
 
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
@@ -501,10 +487,6 @@ void Driver::ActivatePendingSoundFontAtBlockBoundary() noexcept {
     soundFontData = primary ? primary->data : nullptr;
     sampleDataStore = next->sampleData;
     hilbertDataStore = next->hilbertData;
-    // Voices were just reset; new launches seed from the pair availability
-    // of the bundle that is becoming active.
-    if (voiceManager)
-        voiceManager->SetHilbertPairAvailable(next->hilbertData != nullptr);
     samplesStore = primary ? primary->samples : nullptr;
     regionInitialPeaks = primary ? primary->regionInitialPeaks : nullptr;
     preparedRegions = primary ? primary->preparedRegions : nullptr;

@@ -3,6 +3,7 @@
 #include "SVMSRenderScalar.h"
 #include "SVMSSoundFont.h"
 #include "SVMSVoiceManager.h"
+#include "SVMSHilbertPair.h"
 #include "SVMSEnvelope.h"
 #include "SVMSPSCQueue.h"
 #include "SVMSMPSCQueue.h"
@@ -2956,9 +2957,8 @@ void TestSpanRendererDifferential() {
 // The exact analytic companion x̂ is built by the production builder from
 // the sample store; modes 1/2/4 rotate with y = x·cosθ − x̂·sinθ.  The
 // frame-major oracle and the production span renderer must agree
-// sample-for-sample, the seeded states must take form 2 whenever a pair is
-// available, and a mode switch without a pair must fall back to the
-// allpass quadrature form.
+// sample-for-sample, and the seeded states must take form 2 (modes 1/2/4
+// always rotate with the exact pair; there is no approximate fallback).
 void TestHilbertPairDifferential() {
     static constexpr uint32_t bufferSizes[] = {64, 257, 2048};
     const uint32_t sampleCount = 4096u;
@@ -2973,9 +2973,11 @@ void TestHilbertPairDifferential() {
         samples[i] = static_cast<int16_t>((0.4f * std::sin(static_cast<float>(i) * omega1) +
                       0.15f * std::cos(static_cast<float>(i) * omega2)) * 32767.0f);
 
-    // The companion store from the exact production transform.
+    // The whole slice is played as one loop, so its companion is the
+    // periodic transform: the exact analytic twin everywhere, edges included.
     std::vector<int16_t> hilbert(samples.size(), 0);
-    svms::HilbertTransformSlice(samples.data(), hilbert.data(), sampleCount);
+    svms::BuildHilbertSlice(samples.data(), hilbert.data(),
+                            {0u, sampleCount, 0u, sampleCount});
 
     // Builder sanity: for x = a·sin + b·cos the analytic twin is
     // x̂ = −a·cos + b·sin.
@@ -2984,7 +2986,7 @@ void TestHilbertPairDifferential() {
                                0.15f * std::sin(static_cast<float>(i) * omega2);
         const float built = static_cast<float>(hilbert[i]) * (1.0f / 32768.0f);
         Check(NearlyEqual(expected, built, 2.0e-4f),
-              "HilbertTransformSlice produces the analytic twin in-band");
+              "periodic companion is the analytic twin");
     }
 
     svms::RuntimeConfigSnapshot cfg{};
@@ -3003,9 +3005,6 @@ void TestHilbertPairDifferential() {
             for (svms::VoiceManager* voices :
                      {referenceVoices.get(), spanVoices.get()}) {
                 ConfigureDifferentialSeed(*voices, seedChannels);
-                // Pair availability lands before (re)seeding so every live
-                // voice takes the analytic form.
-                voices->SetHilbertPairAvailable(true);
                 Check(voices->SetPhaseRotationMode(mode),
                       "pair rotation mode seeds live voices");
                 for (uint32_t i = 0; i < voices->activeCount_; ++i) {
@@ -3149,7 +3148,6 @@ void TestHilbertPairDifferential() {
                 voices->RefreshMixGain(voice,
                                        seedChannels.GetParams()[channel]);
             }
-            voices->SetHilbertPairAvailable(true);
             Check(voices->SetPhaseRotationMode(2u),
                   "steal-free regime seeds sweep pair states");
         }
@@ -3224,20 +3222,177 @@ void TestHilbertPairDifferential() {
               "steal-free regime actually exercised launches");
     }
 
-    // Without a pair, modes 1/2/4 seed the allpass quadrature form (the
-    // documented live-switch fallback until the next SoundFont load).
-    svms::ChannelCache fallbackChannels;
-    fallbackChannels.SetMasterVolume(1.0f);
-    fallbackChannels.RebuildCache(cfg, 44100.0f);
-    svms::VoiceManager fallbackVoices;
-    ConfigureDifferentialSeed(fallbackVoices, fallbackChannels);
-    Check(fallbackVoices.SetPhaseRotationMode(1u),
-          "rotation mode set without a pair");
-    for (uint32_t i = 0; i < fallbackVoices.activeCount_; ++i) {
-        Check(fallbackVoices.v.rot != nullptr &&
-                  fallbackVoices.v.rot[fallbackVoices.activeList_[i]].form == 0u,
-              "missing pair falls back to the allpass quadrature form");
+    // Without a companion store there is nothing exact to rotate with: the
+    // voice stays unrotated instead of falling back to an approximation.
+    svms::VoiceRotationState unpaired{};
+    svms::SeedVoiceRotation(unpaired, 1u, 12345u, 44100.0f);
+    Check(unpaired.form == 2u, "analytic mode always seeds the exact-pair form");
+    Check(svms::RotateVoiceSample(unpaired, 0.37f, nullptr, 0u, 1u, 0.5f) == 0.37f,
+          "without a companion store the voice stays unrotated");
+}
+
+// Loop-aware analytic companion. A rotated voice is a pure phase shift only
+// when x-hat is the Hilbert transform of what the voice actually plays: over
+// a loop that is the PERIODIC transform of one loop period. The old builder
+// transformed each sample slice as a whole, so x-hat stepped at every loop
+// wrap and a rotated sustained voice clicked at the loop rate (buzz) while
+// its level depended on the angle.
+void TestHilbertPairLoopAware() {
+    const double twoPi = 6.283185307179586;
+    // Odd (prime) loop length; the even case is checked right below.
+    const uint32_t attack = 1500u, loopLength = 347u, tail = 600u;
+    const uint32_t loopStart = attack, loopEnd = attack + loopLength;
+    const uint32_t frames = loopEnd + tail;
+    auto loopWave = [&](uint32_t n) {
+        const double p = twoPi * static_cast<double>(n % loopLength) / loopLength;
+        return 0.35 * std::sin(3.0 * p) + 0.2 * std::cos(10.0 * p);
+    };
+    auto loopTwin = [&](uint32_t n) {
+        const double p = twoPi * static_cast<double>(n % loopLength) / loopLength;
+        return -0.35 * std::cos(3.0 * p) + 0.2 * std::sin(10.0 * p);
+    };
+    std::vector<int16_t> samples(frames + 8u, 0);
+    for (uint32_t i = 0; i < frames; ++i) {
+        double x;
+        if (i < loopStart)
+            x = 0.25 * std::sin(i * 0.4113) + 0.15 * std::sin(i * 0.0731);
+        else if (i < loopEnd)
+            x = loopWave(i - loopStart);
+        else
+            x = loopWave(i - loopStart) * std::exp(-static_cast<double>(i - loopEnd) / 200.0);
+        samples[i] = static_cast<int16_t>(std::lrint(x * 32767.0));
     }
+    std::vector<int16_t> companion(samples.size(), 0);
+    svms::BuildHilbertSlice(samples.data(), companion.data(),
+                            {0u, frames, loopStart, loopEnd});
+    auto at = [&](uint32_t i) { return companion[i] / 32768.0; };
+
+    double loopError = 0.0;
+    for (uint32_t n = 0; n < loopLength; ++n)
+        loopError = (std::max)(loopError, std::fabs(at(loopStart + n) - loopTwin(n)));
+    Check(loopError <= 2.0e-4, "loop companion is the exact periodic analytic twin");
+    Check(std::fabs(at(loopEnd) - at(loopStart)) <= 2.0e-4,
+          "loop companion wraps seamlessly at the loop end");
+    Check(std::fabs(at(loopStart - 1u) - loopTwin(loopLength - 1u)) <= 5.0e-4,
+          "attack companion meets the loop companion at loop start");
+
+    // Even loop length (the periodic kernel drops the Nyquist bin).
+    {
+        const uint32_t evenLength = 348u;
+        std::vector<int16_t> evenLoop(evenLength + 8u, 0), evenHat(evenLoop.size(), 0);
+        auto phase = [&](uint32_t n) { return twoPi * n / evenLength; };
+        for (uint32_t n = 0; n < evenLength; ++n)
+            evenLoop[n] = static_cast<int16_t>(std::lrint(
+                (0.3 * std::sin(5.0 * phase(n)) + 0.2 * std::cos(17.0 * phase(n))) * 32767.0));
+        svms::BuildHilbertSlice(evenLoop.data(), evenHat.data(),
+                                {0u, evenLength, 0u, evenLength});
+        double evenError = 0.0;
+        for (uint32_t n = 0; n < evenLength; ++n) {
+            const double twin = -0.3 * std::cos(5.0 * phase(n)) + 0.2 * std::sin(17.0 * phase(n));
+            evenError = (std::max)(evenError, std::fabs(evenHat[n] / 32768.0 - twin));
+        }
+        Check(evenError <= 2.0e-4, "even-length loop companion is the exact analytic twin");
+    }
+
+    // One-shot: a burst at the very end of a power-of-two slice must not
+    // leak into the slice start (a plain circular FFT puts them side by side).
+    std::vector<int16_t> burst(4096u + 8u, 0), burstHat(burst.size(), 0);
+    for (uint32_t i = 4032u; i < 4096u; ++i)
+        burst[i] = static_cast<int16_t>(0.8 * 32767.0 * std::sin((i - 4032u) * 0.39));
+    svms::BuildHilbertSlice(burst.data(), burstHat.data(), {0u, 4096u, 0u, 0u});
+    double headLeak = 0.0;
+    for (uint32_t i = 0; i < 16u; ++i)
+        headLeak = (std::max)(headLeak, std::fabs(burstHat[i] / 32768.0));
+    Check(headLeak <= 1.0e-3,
+          "one-shot companion does not wrap the slice end into its start");
+
+    // Render-level, production span path: a rotated sustained looping voice
+    // keeps the coherent voice's energy at every angle and has no step at
+    // the loop wraps.
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.velocityCurve = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    const uint32_t renderFrames = loopStart + 24u * loopLength;
+    const uint32_t windowStart = renderFrames - 8u * loopLength;
+    auto render = [&](uint32_t mode, float theta) {
+        svms::VoiceManager voices;
+        voices.Initialize(4, 44100);
+        const svms::VoiceHandle h = voices.AllocateVoice(0, 60, 100);
+        voices.SetVoiceSample(h, 0, frames, loopStart, loopEnd, 1u, 1.0f, 1);
+        voices.SetVoiceEnvelope(h, 1.0f, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f, 0.9997f);
+        voices.SetVoiceGain(h, 0.5f, 0.5f);
+        voices.RefreshMixGain(h, channels.GetParams()[0]);
+        if (mode != 0u) {
+            Check(voices.SetPhaseRotationMode(mode), "loop render seeds rotation");
+            voices.v.rot[h].c = std::cos(theta);
+            voices.v.rot[h].s = std::sin(theta);
+        }
+        svms::RenderScalar renderer;
+        std::vector<float> left(renderFrames, 0.0f), right(renderFrames, 0.0f);
+        for (uint32_t done = 0; done < renderFrames;) {
+            const uint32_t n = (std::min)(1024u, renderFrames - done);
+            renderer.RenderBlock(voices, channels, samples.data(), companion.data(),
+                                 frames, left.data() + done, right.data() + done,
+                                 n, cfg, nullptr, 0u, true, 10000);
+            done += n;
+        }
+        return left;
+    };
+    auto energy = [&](const std::vector<float>& signal) {
+        double sum = 0.0;
+        for (uint32_t n = windowStart; n < renderFrames; ++n)
+            sum += static_cast<double>(signal[n]) * signal[n];
+        return sum;
+    };
+    const std::vector<float> coherent = render(0u, 0.0f);
+    const double coherentEnergy = energy(coherent);
+    Check(coherentEnergy > 1.0e-3, "coherent loop voice is audible");
+    for (const float theta : {0.4f, 1.2f, 2.0f, 2.9f, 3.9f, 5.1f}) {
+        const std::vector<float> rotated = render(1u, theta);
+        const double ratio = energy(rotated) / coherentEnergy;
+        if (std::fabs(ratio - 1.0) > 1.0e-3)
+            std::fprintf(stderr, "loop rotation energy ratio %.6f at theta %.2f\n", ratio, theta);
+        Check(std::fabs(ratio - 1.0) <= 1.0e-3,
+              "rotated looping voice keeps its energy at every angle");
+        float wrapStep = 0.0f, innerStep = 0.0f;
+        for (uint32_t n = windowStart; n < renderFrames; ++n) {
+            const float step = std::fabs(rotated[n] - rotated[n - 1u]);
+            if ((n - loopStart) % loopLength == 0u)
+                wrapStep = (std::max)(wrapStep, step);
+            else
+                innerStep = (std::max)(innerStep, step);
+        }
+        Check(wrapStep <= innerStep * 1.05f,
+              "rotated looping voice has no step at the loop wrap");
+    }
+
+    // Mode 4 (Random) is the exact pair too; it differs from Sweep by a
+    // per-voice sweep rate and direction.
+    bool sawUp = false, sawDown = false;
+    float slowest = 1.0e9f, fastest = 0.0f;
+    for (uint64_t seed = 1u; seed <= 64u; ++seed) {
+        svms::VoiceRotationState st{};
+        svms::SeedVoiceRotation(st, 4u, seed * 7919u, 44100.0f);
+        Check(st.form == 2u, "random mode seeds the exact-pair form");
+        const float hz = std::atan2(st.ds, st.dc) * 44100.0f / 6.2831853f;
+        sawUp = sawUp || hz > 0.0f;
+        sawDown = sawDown || hz < 0.0f;
+        slowest = (std::min)(slowest, std::fabs(hz));
+        fastest = (std::max)(fastest, std::fabs(hz));
+    }
+    Check(sawUp && sawDown && slowest >= 0.124f && fastest <= 0.376f &&
+              fastest - slowest > 0.1f,
+          "random mode sweeps each voice at its own rate and direction");
+    svms::VoiceRotationState sweep{};
+    svms::SeedVoiceRotation(sweep, 2u, 99u, 44100.0f);
+    Check(sweep.form == 2u &&
+              std::fabs(std::atan2(sweep.ds, sweep.dc) * 44100.0f / 6.2831853f - 0.25f) < 1.0e-4f,
+          "sweep mode keeps its fixed 0.25 Hz sweep");
 }
 
 void TestRenderBackendSelectionAndDenseEquivalence() {
@@ -6301,6 +6456,7 @@ int main() {
     TestWholeVoiceCCDifferential();
     TestWholeVoiceVibratoDifferential();
     TestHilbertPairDifferential();
+    TestHilbertPairLoopAware();
     TestPerChannelLimiterDifferential();
     TestDenseProductionGateParity();
     TestPerKeyVoiceCap();
