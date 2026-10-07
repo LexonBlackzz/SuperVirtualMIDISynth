@@ -437,6 +437,8 @@ public:
     }
     uint64_t NoteCalls() const { return noteCalls_; }
     uint64_t MatchedNotes() const { return notes_; }
+    uint64_t PhysicalLaunches() const { return physicalLaunches_; }
+    uint64_t RetiredVoices() const { return voices_.retireCount_; }
     uint64_t MissingPresets() const { return missingPresets_; }
     uint64_t MissingRegions() const { return missingRegions_; }
     uint64_t InvalidRegions() const { return invalidRegions_; }
@@ -680,7 +682,7 @@ private:
         const bool launched = voices_.LaunchVoiceGroup(
             channel, note, velocity, launchSetups_, count, generation,
             channels_.GetParams()[channel], handles);
-        (void)launched;
+        if (launched) physicalLaunches_ += count;
 #if defined(_MSC_VER)
         dispatchProfile.alloc += __rdtsc() - allocBegin;
         dispatchProfile.configure += __rdtsc() - configureBegin;
@@ -862,7 +864,8 @@ private:
     float sysexMasterFineTune_ = 0.0f;
     float sysexMasterTranspose_ = 0.0f;
     float bendRatio_[kChannelCount]{};
-    uint64_t notes_ = 0, noteCalls_ = 0, missingPresets_ = 0;
+    uint64_t notes_ = 0, noteCalls_ = 0, physicalLaunches_ = 0;
+    uint64_t missingPresets_ = 0;
     uint64_t missingRegions_ = 0, invalidRegions_ = 0, fallbackRegions_ = 0;
     std::unique_ptr<SF2Data> sf2_;
     std::vector<int16_t> sampleData_;

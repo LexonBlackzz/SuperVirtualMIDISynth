@@ -113,6 +113,44 @@ endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Phase-2 canonical synthesis module.  It is intentionally excluded from the
+# XP/realtime product for now: the only host integration in this phase is the
+# modern standalone offline renderer.
+if(NOT SVMS_XP_COMPAT)
+    add_library(svms_canonical_engine STATIC
+        Engine/CanonicalSampleBank.cpp
+        Engine/CanonicalSoundFont.cpp
+        Engine/CanonicalChannelInterpreter.cpp
+        Engine/CanonicalCore.cpp
+        Engine/CanonicalRenderAVX2.cpp
+        Engine/CanonicalEngine.cpp)
+    target_include_directories(svms_canonical_engine PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/Engine")
+    target_compile_features(svms_canonical_engine PUBLIC cxx_std_20)
+    target_compile_definitions(svms_canonical_engine PRIVATE
+        MIDISYNTH_HAS_AVX2=1)
+    if(MSVC)
+        set_source_files_properties(Engine/CanonicalRenderAVX2.cpp PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX2")
+    else()
+        set_source_files_properties(Engine/CanonicalRenderAVX2.cpp PROPERTIES
+            COMPILE_OPTIONS "-mavx2;-mno-fma")
+        target_link_libraries(svms_canonical_engine PUBLIC pthread)
+    endif()
+
+    add_executable(svms_canonical_engine_tests
+        tests/SVMSCanonicalEngineTests.cpp)
+    target_link_libraries(svms_canonical_engine_tests PRIVATE
+        svms_canonical_engine)
+    add_test(NAME svms_canonical_engine
+        COMMAND svms_canonical_engine_tests)
+
+    add_executable(svms_canonical_engine_bench
+        tests/SVMSCanonicalEngineBench.cpp)
+    target_link_libraries(svms_canonical_engine_bench PRIVATE
+        svms_canonical_engine)
+endif()
+
 if(NOT WIN32)
     find_package(Threads REQUIRED)
     find_package(ALSA REQUIRED)
@@ -140,6 +178,7 @@ if(NOT WIN32)
     target_compile_options(svms_v3_render PRIVATE
         -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(svms_v3_render PRIVATE Threads::Threads)
+    target_link_libraries(svms_v3_render PRIVATE svms_canonical_engine)
 
     add_executable(svmsd
         SVMSLinuxDaemon.cpp
@@ -736,6 +775,7 @@ if(NOT SVMS_XP_COMPAT)
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
     target_link_libraries(svms_v3_render PRIVATE shell32 d3d11 dxgi d3dcompiler)
+    target_link_libraries(svms_v3_render PRIVATE svms_canonical_engine)
     set_target_properties(svms_v3_render PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 

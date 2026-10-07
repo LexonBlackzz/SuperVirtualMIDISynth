@@ -10,6 +10,13 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 feat(v3): canonical engine phase 2 (WIP) + launch-hot VoiceRow
+  Unfinished work pushed as-is. src/V3/Engine/ holds the canonical engine,
+  wired only into svms_v3_render behind a legacy|canonical selector (see
+  CANONICAL_ENGINE_MIGRATION.md). Also in here: the V3 voice pool packs its
+  launch bookkeeping fields into one 64-byte VoiceRow per voice; ghost copies
+  copy the row. Correctness suite unchanged (only the known Hilbert failure);
+  not benchmarked yet.
 - 2026-10-07 ci(v3): warm compiler caches for the Windows and Linux builds
   Windows CI runs build_v3.bat under sccache (GitHub Actions cache backend);
   CMake sees the launcher and switches to /Z7 + no driver PCH so every object

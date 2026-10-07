@@ -453,34 +453,61 @@ struct SamplePage {
     X(uint32_t, stealFadeInFramesRemaining) \
     X(uint32_t, stealFadeInFramesTotal)
 
+// Cold fields that stay SoA: the steal scorers scan them across many voices
+// (contiguous AVX2 loads in SelectScanVictim, index gathers in
+// BuildVolatileStealKeysAVX2).
 #define SVMS_VOICE_SOA_COLD_FIELDS(X) \
-    X(uint8_t, channel) \
-    X(uint8_t, note) \
-    X(uint8_t, velocity) \
-    X(uint16_t, presetIndex) \
-    X(uint16_t, regionIndex) \
-    X(uint32_t, playIndex) \
-    X(float, basePhaseIncs) \
-    X(float, pitchBendScales) \
-    X(float, gainLeft) \
-    X(float, gainRight) \
     X(float, stealOutputGain) \
-    X(float, vibLfoToPitchCents) \
-    X(float, vibLfoSteps) \
-    X(float, vibLfoPhases) \
-    X(uint32_t, vibLfoDelays) \
-    X(uint8_t, vibLfoModulated) \
-    X(uint8_t, loopMode) \
-    X(uint8_t, heldBySustain) \
-    X(uint8_t, heldBySostenuto) \
-    X(uint32_t, releaseStartInBlock) \
-    X(int32_t, nextChannelKeyVoice) \
-    X(int32_t, prevChannelKeyVoice) \
     X(uint64_t, birthFrame)
 
 #define SVMS_VOICE_SOA_DYNAMIC_FIELDS(X) \
     SVMS_VOICE_SOA_DENSE_FIELDS(X) \
     SVMS_VOICE_SOA_COLD_FIELDS(X)
+
+// Launch-written per-voice bookkeeping, stored AoS: one 64-byte VoiceRow per
+// handle.  A steal+relaunch rewrites all of these, and as separate SoA arrays
+// each one was its own victim cache miss (~21 lines per steal); as a row they
+// are one line.  Accessed through RowColumn, so `v.note[h]` keeps its
+// SoA spelling; only pointer-style uses (memcpy, `v.note + i`) cannot exist.
+// Ordered largest-first so the row packs to 59 bytes without padding holes.
+#define SVMS_VOICE_ROW_FIELDS(X) \
+    X(uint32_t, playIndex) \
+    X(float, basePhaseIncs) \
+    X(float, pitchBendScales) \
+    X(float, gainLeft) \
+    X(float, gainRight) \
+    X(float, vibLfoToPitchCents) \
+    X(float, vibLfoSteps) \
+    X(float, vibLfoPhases) \
+    X(uint32_t, vibLfoDelays) \
+    X(uint32_t, releaseStartInBlock) \
+    X(int32_t, nextChannelKeyVoice) \
+    X(int32_t, prevChannelKeyVoice) \
+    X(uint16_t, presetIndex) \
+    X(uint16_t, regionIndex) \
+    X(uint8_t, channel) \
+    X(uint8_t, note) \
+    X(uint8_t, velocity) \
+    X(uint8_t, vibLfoModulated) \
+    X(uint8_t, loopMode) \
+    X(uint8_t, heldBySustain) \
+    X(uint8_t, heldBySostenuto)
+
+struct alignas(64) VoiceRow {
+#define SVMS_DECLARE_ROW_FIELD(type, name) type name;
+    SVMS_VOICE_ROW_FIELDS(SVMS_DECLARE_ROW_FIELD)
+#undef SVMS_DECLARE_ROW_FIELD
+};
+static_assert(sizeof(VoiceRow) == 64, "VoiceRow must stay one cache line");
+
+// `column[h]` = rows[h].*Member: SoA spelling over AoS row storage.
+template <typename Row, typename T, T Row::*Member>
+struct RowColumn {
+    Row* rows = nullptr;
+    T& operator[](size_t handle) const noexcept {
+        return rows[handle].*Member;
+    }
+};
 
 // ════════════════════════════════════════════════════════════════════════
 // VoiceRotationState — per-voice phase rotation state (DSP in
@@ -534,6 +561,14 @@ struct alignas(64) VoiceSoA {
 #define SVMS_DECLARE_DYNAMIC_FIELD(type, name) type* name = nullptr;
     SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_DECLARE_DYNAMIC_FIELD)
 #undef SVMS_DECLARE_DYNAMIC_FIELD
+
+    // AoS launch bookkeeping (see SVMS_VOICE_ROW_FIELDS); null in dense-only
+    // images.  Each column below aliases `rows`.
+    VoiceRow* rows = nullptr;
+#define SVMS_DECLARE_ROW_COLUMN(type, name) \
+    RowColumn<VoiceRow, type, &VoiceRow::name> name;
+    SVMS_VOICE_ROW_FIELDS(SVMS_DECLARE_ROW_COLUMN)
+#undef SVMS_DECLARE_ROW_COLUMN
 
     // Lazily allocated per-voice phase-rotation states (SVMSPhaseRotation.h).
     // Null in Coherent mode — every render path checks this pointer and is
@@ -640,6 +675,7 @@ struct alignas(64) VoiceSoA {
         bytes += static_cast<size_t>(capacity) * sizeof(type);
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ACCUMULATE_FIELD_SIZE)
 #undef SVMS_ACCUMULATE_FIELD_SIZE
+        bytes = AlignUp(bytes) + static_cast<size_t>(capacity) * sizeof(VoiceRow);
 
         void* allocation = TryAllocateLargePages(bytes);
         const bool largePages = allocation != nullptr;
@@ -664,6 +700,7 @@ struct alignas(64) VoiceSoA {
         offset += static_cast<size_t>(capacity_) * sizeof(type);
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_BIND_DYNAMIC_FIELD)
 #undef SVMS_BIND_DYNAMIC_FIELD
+        BindRows(reinterpret_cast<VoiceRow*>(base + AlignUp(offset)));
         return true;
     }
 
@@ -698,6 +735,7 @@ struct alignas(64) VoiceSoA {
 #define SVMS_NULL_BEFORE_DENSE_BIND(type, name) name = nullptr;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_BEFORE_DENSE_BIND)
 #undef SVMS_NULL_BEFORE_DENSE_BIND
+        BindRows(nullptr);
 
         size_t offset = 0u;
         uint8_t* base = static_cast<uint8_t*>(storage_);
@@ -715,6 +753,7 @@ struct alignas(64) VoiceSoA {
         if (name) std::memset(name, 0, static_cast<size_t>(capacity_) * sizeof(type));
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CLEAR_DYNAMIC_FIELD)
 #undef SVMS_CLEAR_DYNAMIC_FIELD
+        if (rows) std::memset(rows, 0, static_cast<size_t>(capacity_) * sizeof(VoiceRow));
         pad16 = 0u;
         ResetFixedTails();
     }
@@ -735,6 +774,7 @@ struct alignas(64) VoiceSoA {
             SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_ESTIMATE_FIELD_SIZE)
         } else {
             SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ESTIMATE_FIELD_SIZE)
+            bytes = AlignUp(bytes) + static_cast<size_t>(capacity) * sizeof(VoiceRow);
         }
 #undef SVMS_ESTIMATE_FIELD_SIZE
         return bytes;
@@ -747,6 +787,7 @@ struct alignas(64) VoiceSoA {
         destination.name[destinationHandle] = source.name[sourceHandle];
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_ONE_DYNAMIC_FIELD)
 #undef SVMS_COPY_ONE_DYNAMIC_FIELD
+        destination.rows[destinationHandle] = source.rows[sourceHandle];
     }
 
     static void CopyRenderProgress(VoiceSoA& destination, uint32_t handle,
@@ -858,6 +899,8 @@ private:
             static_cast<size_t>(capacity_) * sizeof(type));
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_DYNAMIC_FIELD)
 #undef SVMS_COPY_DYNAMIC_FIELD
+        if (rows && other.rows) std::memcpy(rows, other.rows,
+            static_cast<size_t>(capacity_) * sizeof(VoiceRow));
 #define SVMS_COPY_FIXED_TAIL_FIELD(type, name, count) \
         std::memcpy(name, other.name, sizeof(name));
         SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(SVMS_COPY_FIXED_TAIL_FIELD)
@@ -881,6 +924,8 @@ private:
         other.name = nullptr;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_MOVE_DYNAMIC_FIELD)
 #undef SVMS_MOVE_DYNAMIC_FIELD
+        BindRows(other.rows);
+        other.BindRows(nullptr);
 #define SVMS_MOVE_FIXED_TAIL_FIELD(type, name, count) \
         std::memcpy(name, other.name, sizeof(name));
         SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(SVMS_MOVE_FIXED_TAIL_FIELD)
@@ -916,6 +961,14 @@ private:
 #define SVMS_NULL_DYNAMIC_FIELD(type, name) name = nullptr;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_DYNAMIC_FIELD)
 #undef SVMS_NULL_DYNAMIC_FIELD
+        BindRows(nullptr);
+    }
+
+    void BindRows(VoiceRow* next) noexcept {
+        rows = next;
+#define SVMS_BIND_ROW_COLUMN(type, name) name.rows = next;
+        SVMS_VOICE_ROW_FIELDS(SVMS_BIND_ROW_COLUMN)
+#undef SVMS_BIND_ROW_COLUMN
     }
 
     void* storage_ = nullptr;

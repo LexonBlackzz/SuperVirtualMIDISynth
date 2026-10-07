@@ -619,7 +619,7 @@ void TestCapacitySizedVoiceStorage() {
     const auto aligned64 = [](const void* pointer) {
         return (reinterpret_cast<uintptr_t>(pointer) & 63u) == 0u;
     };
-    Check(aligned64(voices->v.channel) && aligned64(voices->v.phases) &&
+    Check(aligned64(voices->v.rows) && aligned64(voices->v.phases) &&
               aligned64(voices->v.currentGain) &&
               aligned64(voices->v.sampleStart) &&
               aligned64(voices->v.birthFrame),

@@ -15,6 +15,7 @@
 #include "SVMSEnvelope.h"
 #include "SVMSConfig.h"
 #include "SVMSStandaloneSynth.h"
+#include "Engine/CanonicalEngine.h"
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
 #include "SVMSGpuSynth.h"
 #endif
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <stdexcept>
@@ -55,6 +57,7 @@ struct Options {
     bool quiet = false;
     bool scanOnly = false;
     bool machineProgress = false;
+    bool canonicalSynth = false;
     std::wstring cancelEvent;
 };
 
@@ -265,6 +268,7 @@ void Usage() {
            L"  --sample-rate N       Output rate (default: V3 config)\n"
            L"  --max-voices N        Voice limit, 1-524288 (default: V3 config)\n"
            L"  --render-threads N     Total voice-render threads, 0-64 (default: V3 config)\n"
+           L"  --synth legacy|canonical  Temporary offline synthesis selector\n"
            L"  --event-buffer-mb N   Parsed-event ring (default 128 MiB)\n"
            L"  --block-frames N      Render block size (default 8192)\n"
            L"  --tail-seconds N      Maximum natural-release tail (default 30)\n"
@@ -302,6 +306,13 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             o.cancelEvent = p;
         }
         else if (arg == L"--scan-only") o.scanOnly = true;
+        else if (arg == L"--synth") {
+            const auto p=value(); if (!p) return false;
+            const std::wstring name=p;
+            if (name == L"legacy") o.canonicalSynth=false;
+            else if (name == L"canonical") o.canonicalSynth=true;
+            else return false;
+        }
         else if (arg == L"--tuning-edo") { const auto p=value(); if (!p || !ParseU32(p,12,31,o.tuningEdo) || (o.tuningEdo!=12 && o.tuningEdo!=31)) return false; }
         else if (arg == L"--no-limiter") o.limiterEnabled = false;
         else if (arg == L"--sample-rate") { const auto p=value(); if (!p || !ParseU32(p,8000,384000,o.sampleRate)) return false; }
@@ -573,6 +584,199 @@ private:
 
 #endif
 
+class OfflineSessionSynth {
+public:
+    virtual ~OfflineSessionSynth() = default;
+    virtual bool Initialize(const Options&, std::string&) = 0;
+    virtual void Dispatch(uint32_t message, uint64_t frame) = 0;
+    virtual void Render(float* left, float* right, uint32_t frames,
+                        uint64_t absoluteFrame) = 0;
+    virtual void ReleaseAll() = 0;
+    virtual uint32_t Active() const = 0;
+    virtual uint32_t Tails() const = 0;
+    virtual uint32_t Steals() const = 0;
+    virtual uint32_t Free() const = 0;
+    virtual uint64_t NoteCalls() const = 0;
+    virtual uint64_t MatchedNotes() const = 0;
+    virtual uint64_t PhysicalLaunches() const = 0;
+    virtual uint64_t RetiredVoices() const = 0;
+    virtual uint64_t DroppedVoices() const = 0;
+    virtual canonical::CanonicalTelemetry CanonicalDetails() const { return {}; }
+    virtual uint64_t MissingPresets() const = 0;
+    virtual uint64_t MissingRegions() const = 0;
+    virtual uint64_t InvalidRegions() const = 0;
+    virtual uint64_t FallbackRegions() const = 0;
+    virtual const char* Backend() const = 0;
+};
+
+class LegacyOfflineSession final : public OfflineSessionSynth {
+public:
+    bool Initialize(const Options& o, std::string& error) override {
+        StandaloneSynthConfig config{};
+        config.soundfont = o.soundfont;
+        config.sampleRate = o.sampleRate;
+        config.maxVoices = o.maxVoices;
+        config.renderThreads = o.renderThreads;
+        config.maxBlockFrames = o.blockFrames;
+        config.masterVolume = o.masterVolume;
+        config.limiterEnabled = o.limiterEnabled;
+        config.limiterAlgorithm = o.limiterAlgorithm;
+        config.limiterThreshold = o.limiterThreshold;
+        config.limiterLookaheadMs = o.limiterLookaheadMs;
+        config.limiterAttackMs = o.limiterAttackMs;
+        config.limiterReleaseMs = o.limiterReleaseMs;
+        config.backend = o.backend;
+        config.phaseRotationMode = o.phaseRotationMode;
+        config.tuningEdo = o.tuningEdo;
+        return synth_.Initialize(config, error);
+    }
+    void Dispatch(uint32_t message, uint64_t frame) override {
+        synth_.Dispatch(message, frame);
+    }
+    void Render(float* left, float* right, uint32_t frames,
+                uint64_t frame) override {
+        synth_.Render(left, right, frames, frame);
+    }
+    void ReleaseAll() override { synth_.ReleaseAll(); }
+    uint32_t Active() const override { return synth_.Active(); }
+    uint32_t Tails() const override { return synth_.Tails(); }
+    uint32_t Steals() const override { return synth_.Steals(); }
+    uint32_t Free() const override { return synth_.Free(); }
+    uint64_t NoteCalls() const override { return synth_.NoteCalls(); }
+    uint64_t MatchedNotes() const override { return synth_.MatchedNotes(); }
+    uint64_t PhysicalLaunches() const override { return synth_.PhysicalLaunches(); }
+    uint64_t RetiredVoices() const override { return synth_.RetiredVoices(); }
+    uint64_t DroppedVoices() const override { return 0; }
+    uint64_t MissingPresets() const override { return synth_.MissingPresets(); }
+    uint64_t MissingRegions() const override { return synth_.MissingRegions(); }
+    uint64_t InvalidRegions() const override { return synth_.InvalidRegions(); }
+    uint64_t FallbackRegions() const override { return synth_.FallbackRegions(); }
+    const char* Backend() const override { return synth_.Backend(); }
+private:
+    StandaloneSynth synth_;
+};
+
+class CanonicalOfflineSession final : public OfflineSessionSynth {
+public:
+    bool Initialize(const Options& o, std::string& error) override {
+        if (o.phaseRotationMode != 0u || o.tuningEdo != 12u) {
+            error = "canonical offline mode does not yet support phase rotation or 31-EDO";
+            return false;
+        }
+        canonical::CanonicalEngineConfig config{};
+        config.sampleRate = o.sampleRate;
+        config.voiceCapacity = o.maxVoices;
+        config.maxBlockFrames = o.blockFrames;
+        config.workerThreads = o.renderThreads;
+        if (config.workerThreads == 0u) {
+            config.workerThreads = (std::min)(16u,
+                (std::max)(1u, std::thread::hardware_concurrency()));
+        }
+        config.eventScratchCapacity = (std::max)(65536u, o.maxVoices * 4u);
+        if (o.backend == RenderBackend::Scalar) {
+            config.backend = canonical::CanonicalBackend::Scalar;
+        } else if (o.backend == RenderBackend::AVX2 ||
+                   o.backend == RenderBackend::AVX512) {
+            config.backend = canonical::CanonicalEngine::avx2Supported()
+                ? canonical::CanonicalBackend::Avx2
+                : canonical::CanonicalBackend::Scalar;
+        } else {
+            error = "canonical offline mode supports only scalar, AVX2, or auto";
+            return false;
+        }
+        try {
+            engine_ = std::make_unique<canonical::CanonicalEngine>(
+                std::filesystem::path(o.soundfont), config);
+        } catch (const std::exception& exception) {
+            error = exception.what();
+            return false;
+        }
+        maxVoices_ = o.maxVoices;
+        masterVolume_ = o.masterVolume;
+        EngineConfig limiterConfig{};
+        limiterConfig.limiterEnabled = o.limiterEnabled;
+        limiterConfig.limiterAlgorithm = o.limiterAlgorithm;
+        limiterConfig.limiterThreshold = o.limiterThreshold;
+        limiterConfig.limiterLookaheadMs = o.limiterLookaheadMs;
+        limiterConfig.limiterAttackMs = o.limiterAttackMs;
+        limiterConfig.limiterReleaseMs = o.limiterReleaseMs;
+        highPass_.Initialize(o.sampleRate);
+        limiter_.Configure(o.sampleRate, limiterConfig);
+        return true;
+    }
+
+    void Dispatch(uint32_t message, uint64_t frame) override {
+        const uint8_t status = static_cast<uint8_t>(message);
+        canonical::CanonicalEvent event{};
+        event.absoluteFrame = frame;
+        event.sequence = sequence_++;
+        event.channel = status & 15u;
+        event.data1 = static_cast<uint8_t>(message >> 8);
+        event.data2 = static_cast<uint8_t>(message >> 16);
+        switch (status & 0xf0u) {
+        case 0x80: event.type = canonical::CanonicalEventType::NoteOff; break;
+        case 0x90: event.type = event.data2
+            ? canonical::CanonicalEventType::NoteOn
+            : canonical::CanonicalEventType::NoteOff; break;
+        case 0xb0: event.type = canonical::CanonicalEventType::ControlChange; break;
+        case 0xc0: event.type = canonical::CanonicalEventType::ProgramChange; break;
+        case 0xe0: event.type = canonical::CanonicalEventType::PitchBend; break;
+        default: return;
+        }
+        engine_->dispatch(event);
+    }
+
+    void Render(float* left, float* right, uint32_t frames,
+                uint64_t frame) override {
+        engine_->renderBlock(frame, {left, frames}, {right, frames});
+        if (masterVolume_ != 1.0f) {
+            for (uint32_t i = 0; i < frames; ++i) {
+                left[i] *= masterVolume_;
+                right[i] *= masterVolume_;
+            }
+        }
+        limiter_.ProcessPlanar(left, right, frames, highPass_);
+        position_ = frame + frames;
+    }
+
+    void ReleaseAll() override { engine_->releaseAll(position_); }
+    uint32_t Active() const override { return engine_->telemetry().activeVoices; }
+    uint32_t Tails() const override { return 0; }
+    uint32_t Steals() const override {
+        return static_cast<uint32_t>((std::min<std::uint64_t>)(
+            engine_->telemetry().stolenVoices, UINT32_MAX));
+    }
+    uint32_t Free() const override { return maxVoices_ - Active(); }
+    uint64_t NoteCalls() const override { return engine_->telemetry().sourceNoteOns; }
+    uint64_t MatchedNotes() const override { return engine_->telemetry().sourceNoteOns; }
+    uint64_t PhysicalLaunches() const override {
+        return engine_->telemetry().launchedVoices;
+    }
+    uint64_t RetiredVoices() const override {
+        return engine_->telemetry().retiredVoices;
+    }
+    uint64_t DroppedVoices() const override {
+        const auto telemetry = engine_->telemetry();
+        return telemetry.droppedNoteOns + telemetry.rejectedEvents;
+    }
+    canonical::CanonicalTelemetry CanonicalDetails() const override {
+        return engine_->telemetry();
+    }
+    uint64_t MissingPresets() const override { return 0; }
+    uint64_t MissingRegions() const override { return 0; }
+    uint64_t InvalidRegions() const override { return 0; }
+    uint64_t FallbackRegions() const override { return 0; }
+    const char* Backend() const override { return engine_->backendName(); }
+private:
+    std::unique_ptr<canonical::CanonicalEngine> engine_;
+    LimiterRouterState limiter_{};
+    PostHighPass3Hz highPass_{};
+    uint64_t position_{};
+    uint32_t sequence_{};
+    uint32_t maxVoices_{};
+    float masterVolume_{1.0f};
+};
+
 struct ProducerContext { ParsedEventRing* ring; const MappedMidiFile* file; uint32_t rate; std::atomic<bool>* cancel; std::atomic<bool>* done; std::atomic<uint64_t>* decoded; std::string* error; };
 bool RingSink(const PackedMidiEvent& e,void* p){auto& c=*static_cast<ProducerContext*>(p);if(!c.ring->Push(e,*c.cancel))return false;c.decoded->fetch_add(1,std::memory_order_relaxed);return true;}
 
@@ -663,24 +867,12 @@ int RendererMain(int argc, wchar_t** argv) {
     ParsedEventRing ring(o.eventBufferMB);
     if (!ring.IsValid()) return fail("cannot allocate parsed-event ring");
 
-    StandaloneSynthConfig synthConfig{};
-    synthConfig.soundfont = o.soundfont;
-    synthConfig.sampleRate = o.sampleRate;
-    synthConfig.maxVoices = o.maxVoices;
-    synthConfig.renderThreads = o.renderThreads;
-    synthConfig.maxBlockFrames = o.blockFrames;
-    synthConfig.masterVolume = o.masterVolume;
-    synthConfig.limiterEnabled = o.limiterEnabled;
-    synthConfig.limiterAlgorithm = o.limiterAlgorithm;
-    synthConfig.limiterThreshold = o.limiterThreshold;
-    synthConfig.limiterLookaheadMs = o.limiterLookaheadMs;
-    synthConfig.limiterAttackMs = o.limiterAttackMs;
-    synthConfig.limiterReleaseMs = o.limiterReleaseMs;
-    synthConfig.backend = o.backend;
-    synthConfig.phaseRotationMode = o.phaseRotationMode;
-    synthConfig.tuningEdo = o.tuningEdo;
-    auto synth = std::make_unique<StandaloneSynth>();
-    if (!synth->Initialize(synthConfig, error)) return fail(error);
+    std::unique_ptr<OfflineSessionSynth> synth;
+    if (o.canonicalSynth)
+        synth = std::make_unique<CanonicalOfflineSession>();
+    else
+        synth = std::make_unique<LegacyOfflineSession>();
+    if (!synth->Initialize(o, error)) return fail(error);
     if (pollCancel()) {
         MachineStatus(o, "CANCELLED", "Cancelled while preparing renderer");
         return 3;
@@ -710,6 +902,11 @@ int RendererMain(int argc, wchar_t** argv) {
     uint64_t lastRenderNs = 0;
     uint64_t lastFrame = 0;
     uint32_t peakVoices = 0;
+    uint64_t sourceNoteOns = 0, sourceNoteOffs = 0;
+    uint64_t sourcePrograms = 0, sourceControls = 0, sourcePitchBends = 0;
+    uint64_t controllerCounts[128]{};
+    uint32_t activeAtMidiEnd = 0, activeAfterReleaseAll = 0;
+    uint64_t tailFrames = 0;
     bool ioOk = true;
     bool renderingTail = false;
     const auto start = std::chrono::steady_clock::now();
@@ -782,6 +979,23 @@ int RendererMain(int argc, wchar_t** argv) {
         }
     };
 
+    auto dispatchSourceEvent = [&](const PackedMidiEvent& source) {
+        const uint8_t status = static_cast<uint8_t>(source.message);
+        const uint8_t type = status & 0xf0u;
+        const uint8_t data1 = static_cast<uint8_t>(source.message >> 8u);
+        const uint8_t data2 = static_cast<uint8_t>(source.message >> 16u);
+        if (type == 0x90u && data2 != 0u) ++sourceNoteOns;
+        else if (type == 0x80u || (type == 0x90u && data2 == 0u)) ++sourceNoteOffs;
+        else if (type == 0xc0u) ++sourcePrograms;
+        else if (type == 0xe0u) ++sourcePitchBends;
+        else if (type == 0xb0u) {
+            ++sourceControls;
+            ++controllerCounts[data1];
+        }
+        synth->Dispatch(source.message, source.outputFrame);
+        ++events;
+    };
+
     PackedMidiEvent event{};
     while (ioOk && !pollCancel()) {
         bool have = false;
@@ -792,8 +1006,7 @@ int RendererMain(int argc, wchar_t** argv) {
         if (!have) break;
         renderTo(event.outputFrame);
         if (pollCancel()) break;
-        synth->Dispatch(event.message, event.outputFrame);
-        ++events;
+        dispatchSourceEvent(event);
 
         // Do not advance audio until the producer has exposed every possible
         // equal-frame successor; this preserves global sequence ordering.
@@ -807,15 +1020,16 @@ int RendererMain(int argc, wchar_t** argv) {
                 next.outputFrame != event.outputFrame)
                 break;
             ring.Pop(event);
-            synth->Dispatch(event.message, event.outputFrame);
-            ++events;
+            dispatchSourceEvent(event);
         }
     }
 
     if (ioOk && !pollCancel()) {
         renderTo(info.totalFrames);
         if (!pollCancel()) {
+            activeAtMidiEnd = synth->Active();
             synth->ReleaseAll();
+            activeAfterReleaseAll = synth->Active();
             renderingTail = true;
             MachineStatus(o, "TAIL", "Rendering natural release tail");
             const uint64_t tailEnd = frame +
@@ -825,6 +1039,8 @@ int RendererMain(int argc, wchar_t** argv) {
                 renderTo((std::min<uint64_t>)(
                     tailEnd, frame + o.blockFrames));
             }
+            tailFrames = frame > info.totalFrames
+                ? frame - info.totalFrames : 0u;
         }
     }
 
@@ -836,6 +1052,13 @@ int RendererMain(int argc, wchar_t** argv) {
 
     if (humanProgress) {
         fwprintf(stderr,L"\nRendered %s (%llu frames), %llu MIDI events, %u steals. Notes: %llu received, %llu matched; rejects preset=%llu region=%llu invalid=%llu; region-fallback notes=%llu.\n",FormatTime(double(wave.Frames())/o.sampleRate).c_str(),wave.Frames(),events,synth->Steals(),synth->NoteCalls(),synth->MatchedNotes(),synth->MissingPresets(),synth->MissingRegions(),synth->InvalidRegions(),synth->FallbackRegions());
+        fwprintf(stderr,L"Differential: note-on=%llu note-off=%llu program=%llu cc=%llu bend=%llu | regions/physical=%llu retired=%llu dropped=%llu peak=%u | active@end=%u active@release=%u tail=%llu frames | CC64=%llu CC120=%llu CC121=%llu CC123=%llu.\n",sourceNoteOns,sourceNoteOffs,sourcePrograms,sourceControls,sourcePitchBends,synth->PhysicalLaunches(),synth->RetiredVoices(),synth->DroppedVoices(),peakVoices,activeAtMidiEnd,activeAfterReleaseAll,tailFrames,controllerCounts[64],controllerCounts[120],controllerCounts[121],controllerCounts[123]);
+        const auto canonicalDetails = synth->CanonicalDetails();
+        if (canonicalDetails.rejectedEvents != 0) {
+            fwprintf(stderr, L"Canonical rejects: invalid=%llu order=%llu capacity=%llu interpreter=%llu.\n",
+                canonicalDetails.rejectedInvalidData, canonicalDetails.rejectedOrder,
+                canonicalDetails.rejectedCapacity, canonicalDetails.rejectedInterpreter);
+        }
     }
     if (wasCancelled) {
         MachineStatus(o, "CANCELLED", "Render cancelled; partial WAV retained");

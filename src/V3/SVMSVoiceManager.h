@@ -153,6 +153,31 @@ struct LaunchChurnStats {
 // Coherent (mode 0) remains a bit-exact bypass.
 // ════════════════════════════════════════════════════════════════════════
 
+// Per-handle index links the manager rewrites on every steal (play group,
+// exclusive class, channel/render index slots, volatile-list position),
+// stored AoS: 32 bytes, two voices per cache line, instead of eleven
+// separate SoA arrays = eleven victim misses.  Fields scanned or gathered
+// across many voices (activePosition_, stealCandidate*, stealStableKey_,
+// stealVolatileHeapPosition_) stay SoA.
+#define SVMS_VOICE_LINK_FIELDS(X) \
+    X(int32_t, playGroupNext_) \
+    X(int32_t, playGroupPrev_) \
+    X(int32_t, exclusiveClassNext_) \
+    X(int32_t, exclusiveClassPrev_) \
+    X(uint32_t, channelActiveBlock_) \
+    X(uint32_t, renderClassBlock_) \
+    X(uint32_t, stealVolatilePosition_) \
+    X(uint16_t, renderClassOffset_) \
+    X(uint8_t, channelActiveOffset_) \
+    X(uint8_t, exclusiveClass_)
+
+struct alignas(32) VoiceLinkRow {
+#define SVMS_DECLARE_LINK_FIELD(type, name) type name;
+    SVMS_VOICE_LINK_FIELDS(SVMS_DECLARE_LINK_FIELD)
+#undef SVMS_DECLARE_LINK_FIELD
+};
+static_assert(sizeof(VoiceLinkRow) == 32, "VoiceLinkRow must stay 32 bytes");
+
 // ════════════════════════════════════════════════════════════════════════
 // VoiceManager — flat-array voice pool with score-based stealing.
 //
@@ -719,8 +744,6 @@ private:
     uint32_t* channelIndexFreeStack_;
     uint32_t channelIndexBlockCount_;
     uint32_t channelIndexFreeTop_;
-    uint32_t* channelActiveBlock_;
-    uint8_t* channelActiveOffset_;
 
     alignas(64) uint32_t renderClassCount_[kVoiceRenderClassCount];
     uint32_t renderClassMask_;
@@ -737,8 +760,6 @@ private:
     uint32_t* renderClassFreeStack_;
     uint32_t renderClassBlockCount_;
     uint32_t renderClassFreeTop_;
-    uint32_t* renderClassBlock_;
-    uint16_t* renderClassOffset_;
 
     // Steal tails are rendered independently from primary render classes.
     // Keeping a dense list avoids probing all active voices in every short
@@ -771,7 +792,6 @@ private:
     // was rebuilt instead of faulting (steal-index invariant repairs).
     uint64_t stealIndexRepairCount_;
     uint32_t* stealVolatileList_;
-    uint32_t* stealVolatilePosition_;
     uint32_t stealVolatileCount_;
     uint64_t* stealVolatileHeapKey_;
     uint32_t* stealVolatileHeapHandle_;
@@ -871,16 +891,11 @@ private:
     // Physical SF2 regions created by one MIDI note-on form one atomic steal
     // group. Dedicated links remain valid after note-off unlinks channel/key
     // tracking, so a releasing stereo pair cannot be split either.
-    int32_t* playGroupNext_;
-    int32_t* playGroupPrev_;
     // SF2 exclusiveClass is defined for values 1..127.  This intrusive
     // active-voice index makes choking proportional to the affected groups,
     // independent of total polyphony.
     static constexpr uint32_t kExclusiveClassCount = 128u;
     int32_t exclusiveClassHead_[kChannelCount][kExclusiveClassCount];
-    uint8_t* exclusiveClass_;
-    int32_t* exclusiveClassNext_;
-    int32_t* exclusiveClassPrev_;
     uint32_t lastLinkedPlayIndex_;
     VoiceHandle lastLinkedPlayVoice_;
     uint32_t maxLaunchGroupSize_ = 1u;
@@ -889,6 +904,17 @@ private:
     static constexpr uint32_t kStealBatchMaxLayers = 16u;
     void* metadataStorage_;
     size_t metadataBytes_;
+    VoiceLinkRow* linkRows_ = nullptr;
+#define SVMS_DECLARE_LINK_COLUMN(type, name) \
+    RowColumn<VoiceLinkRow, type, &VoiceLinkRow::name> name;
+    SVMS_VOICE_LINK_FIELDS(SVMS_DECLARE_LINK_COLUMN)
+#undef SVMS_DECLARE_LINK_COLUMN
+    void BindLinkRows(VoiceLinkRow* rows) noexcept {
+        linkRows_ = rows;
+#define SVMS_BIND_LINK_COLUMN(type, name) name.rows = rows;
+        SVMS_VOICE_LINK_FIELDS(SVMS_BIND_LINK_COLUMN)
+#undef SVMS_BIND_LINK_COLUMN
+    }
 
     bool ReserveMetadata(uint32_t capacity);
     void CopyFrom(const VoiceManager& other);
@@ -1045,11 +1071,9 @@ inline VoiceManager::VoiceManager()
       freeStack_(nullptr),
       channelIndexBlocks_(nullptr), channelIndexFreeStack_(nullptr),
       channelIndexBlockCount_(0u), channelIndexFreeTop_(0u),
-      channelActiveBlock_(nullptr), channelActiveOffset_(nullptr),
       renderClassMask_(0u), renderClassBlocks_(nullptr),
       renderClassFreeStack_(nullptr), renderClassBlockCount_(0u),
-      renderClassFreeTop_(0u), renderClassBlock_(nullptr),
-      renderClassOffset_(nullptr),
+      renderClassFreeTop_(0u),
       retireCount_(0), retireImmediateCount_(0), stealCount_(0),
       stealTailCount_(0), stealTailMinHeapCount_(0),
       stealTailMinHeapFrame_(UINT64_MAX), stealTailMinHeapValid_(false),
@@ -1057,7 +1081,7 @@ inline VoiceManager::VoiceManager()
       stealTreeLeafBase_(1u), stealHeapCount_(0), stealHeapValid_(false),
       stealHeapBuildCount_(0),
       stealIndexRepairCount_(0),
-      stealVolatileList_(nullptr), stealVolatilePosition_(nullptr),
+      stealVolatileList_(nullptr),
       stealVolatileCount_(0), stealVolatileHeapKey_(nullptr),
       stealVolatileHeapHandle_(nullptr),
       stealVolatileHeapPosition_(nullptr), stealVolatileHeapCount_(0),
@@ -1065,11 +1089,6 @@ inline VoiceManager::VoiceManager()
       stealKeyBackend_(RenderBackend::Scalar) {
     stealCandidateDeferred_ = nullptr;
     stealCandidateReserved_ = nullptr;
-    playGroupNext_ = nullptr;
-    playGroupPrev_ = nullptr;
-    exclusiveClass_ = nullptr;
-    exclusiveClassNext_ = nullptr;
-    exclusiveClassPrev_ = nullptr;
     metadataStorage_ = nullptr;
     metadataBytes_ = 0u;
     v.Reset();
@@ -1198,26 +1217,17 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     add(sizeof(uint32_t), ringCapacity); // releasing ring
     add(sizeof(ChannelIndexBlock), channelBlocks);
     add(sizeof(uint32_t), channelBlocks);
-    add(sizeof(uint32_t), capacity); // channelActiveBlock
-    add(sizeof(uint8_t), capacity);  // channelActiveOffset
     add(sizeof(RenderClassBlock), renderBlocks);
     add(sizeof(uint32_t), renderBlocks);
-    add(sizeof(uint32_t), capacity); // renderClassBlock
-    add(sizeof(uint16_t), capacity); // renderClassOffset
     add(sizeof(uint64_t), capacity); // stealStableKey
     add(sizeof(uint64_t), static_cast<size_t>(treeLeaves) * 2u);
     add(sizeof(uint32_t), capacity); // volatile list
-    add(sizeof(uint32_t), capacity); // volatile position
     add(sizeof(uint64_t), capacity); // volatile heap ordered key
     add(sizeof(uint32_t), capacity); // volatile heap handle
     add(sizeof(uint32_t), capacity); // volatile heap position
     add(sizeof(uint8_t), capacity);  // deferred
     add(sizeof(uint8_t), capacity);  // reserved
-    add(sizeof(int32_t), capacity);  // play next
-    add(sizeof(int32_t), capacity);  // play previous
-    add(sizeof(uint8_t), capacity);  // exclusive class
-    add(sizeof(int32_t), capacity);  // exclusive class next
-    add(sizeof(int32_t), capacity);  // exclusive class previous
+    add(sizeof(VoiceLinkRow), capacity);
     if (bytes == (std::numeric_limits<size_t>::max)()) return false;
 
     void* allocation = _aligned_malloc(bytes, kMixBufferAlign);
@@ -1251,25 +1261,15 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
         take(sizeof(ChannelIndexBlock), channelBlocks));
     channelIndexFreeStack_ = static_cast<uint32_t*>(
         take(sizeof(uint32_t), channelBlocks));
-    channelActiveBlock_ = static_cast<uint32_t*>(
-        take(sizeof(uint32_t), capacity));
-    channelActiveOffset_ = static_cast<uint8_t*>(
-        take(sizeof(uint8_t), capacity));
     renderClassBlocks_ = static_cast<RenderClassBlock*>(
         take(sizeof(RenderClassBlock), renderBlocks));
     renderClassFreeStack_ = static_cast<uint32_t*>(
         take(sizeof(uint32_t), renderBlocks));
-    renderClassBlock_ = static_cast<uint32_t*>(
-        take(sizeof(uint32_t), capacity));
-    renderClassOffset_ = static_cast<uint16_t*>(
-        take(sizeof(uint16_t), capacity));
     stealStableKey_ = static_cast<uint64_t*>(
         take(sizeof(uint64_t), capacity));
     stealWinnerTree_ = static_cast<uint64_t*>(take(
         sizeof(uint64_t), static_cast<size_t>(treeLeaves) * 2u));
     stealVolatileList_ = static_cast<uint32_t*>(
-        take(sizeof(uint32_t), capacity));
-    stealVolatilePosition_ = static_cast<uint32_t*>(
         take(sizeof(uint32_t), capacity));
     stealVolatileHeapKey_ = static_cast<uint64_t*>(
         take(sizeof(uint64_t), capacity));
@@ -1281,16 +1281,8 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
         take(sizeof(uint8_t), capacity));
     stealCandidateReserved_ = static_cast<uint8_t*>(
         take(sizeof(uint8_t), capacity));
-    playGroupNext_ = static_cast<int32_t*>(
-        take(sizeof(int32_t), capacity));
-    playGroupPrev_ = static_cast<int32_t*>(
-        take(sizeof(int32_t), capacity));
-    exclusiveClass_ = static_cast<uint8_t*>(
-        take(sizeof(uint8_t), capacity));
-    exclusiveClassNext_ = static_cast<int32_t*>(
-        take(sizeof(int32_t), capacity));
-    exclusiveClassPrev_ = static_cast<int32_t*>(
-        take(sizeof(int32_t), capacity));
+    BindLinkRows(static_cast<VoiceLinkRow*>(
+        take(sizeof(VoiceLinkRow), capacity)));
     return offset <= metadataBytes_;
 }
 
@@ -1405,10 +1397,10 @@ inline void VoiceManager::Reset() {
     std::memset(channelActiveCount_, 0, sizeof(channelActiveCount_));
     std::memset(channelActiveHead_, 0xff, sizeof(channelActiveHead_));
     std::memset(channelActiveTail_, 0xff, sizeof(channelActiveTail_));
-    std::memset(channelActiveBlock_, 0xff,
-                sizeof(*channelActiveBlock_) * maxVoices_);
-    std::memset(channelActiveOffset_, 0xff,
-                sizeof(*channelActiveOffset_) * maxVoices_);
+    for (uint32_t i = 0u; i < maxVoices_; ++i) {
+        channelActiveBlock_[i] = UINT32_MAX;
+        channelActiveOffset_[i] = UINT8_MAX;
+    }
     channelIndexFreeTop_ = channelIndexBlockCount_;
     for (uint32_t block = 0u; block < channelIndexBlockCount_; ++block) {
         channelIndexFreeStack_[block] = channelIndexBlockCount_ - 1u - block;
@@ -1420,10 +1412,10 @@ inline void VoiceManager::Reset() {
     renderClassMask_ = 0u;
     std::memset(renderClassHead_, 0xff, sizeof(renderClassHead_));
     std::memset(renderClassTail_, 0xff, sizeof(renderClassTail_));
-    std::memset(renderClassBlock_, 0xff,
-                sizeof(*renderClassBlock_) * maxVoices_);
-    std::memset(renderClassOffset_, 0xff,
-                sizeof(*renderClassOffset_) * maxVoices_);
+    for (uint32_t i = 0u; i < maxVoices_; ++i) {
+        renderClassBlock_[i] = UINT32_MAX;
+        renderClassOffset_[i] = UINT16_MAX;
+    }
     renderClassFreeTop_ = renderClassBlockCount_;
     for (uint32_t block = 0u; block < renderClassBlockCount_; ++block) {
         renderClassFreeStack_[block] = renderClassBlockCount_ - 1u - block;
@@ -1436,24 +1428,21 @@ inline void VoiceManager::Reset() {
                 sizeof(*stealWinnerTree_) * stealTreeLeafBase_ * 2u);
     std::memset(stealStableKey_, 0,
                 sizeof(*stealStableKey_) * maxVoices_);
-    std::memset(stealVolatilePosition_, 0xff,
-                sizeof(*stealVolatilePosition_) * maxVoices_);
+    for (uint32_t i = 0u; i < maxVoices_; ++i)
+        stealVolatilePosition_[i] = UINT32_MAX;
     std::memset(stealVolatileHeapPosition_, 0xff,
                 sizeof(*stealVolatileHeapPosition_) * maxVoices_);
     std::memset(stealCandidateDeferred_, 0,
                 sizeof(*stealCandidateDeferred_) * maxVoices_);
     std::memset(stealCandidateReserved_, 0,
                 sizeof(*stealCandidateReserved_) * maxVoices_);
-    std::memset(playGroupNext_, 0xff,
-                sizeof(*playGroupNext_) * maxVoices_);
-    std::memset(playGroupPrev_, 0xff,
-                sizeof(*playGroupPrev_) * maxVoices_);
-    std::memset(exclusiveClass_, 0,
-                sizeof(*exclusiveClass_) * maxVoices_);
-    std::memset(exclusiveClassNext_, 0xff,
-                sizeof(*exclusiveClassNext_) * maxVoices_);
-    std::memset(exclusiveClassPrev_, 0xff,
-                sizeof(*exclusiveClassPrev_) * maxVoices_);
+    for (uint32_t i = 0u; i < maxVoices_; ++i) {
+        playGroupNext_[i] = -1;
+        playGroupPrev_[i] = -1;
+        exclusiveClass_[i] = 0u;
+        exclusiveClassNext_[i] = -1;
+        exclusiveClassPrev_[i] = -1;
+    }
     std::memset(exclusiveClassHead_, 0xff, sizeof(exclusiveClassHead_));
     activeCount_ = 0;
     currentFrame_ = 0;
@@ -1515,27 +1504,17 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
 #define SVMS_COPY_GROWN_VOICE_FIELD(name) \
     std::memcpy(grown.v.name, v.name, \
                 static_cast<size_t>(oldCapacity) * sizeof(*v.name))
-    SVMS_COPY_GROWN_VOICE_FIELD(channel);
-    SVMS_COPY_GROWN_VOICE_FIELD(note);
-    SVMS_COPY_GROWN_VOICE_FIELD(velocity);
     SVMS_COPY_GROWN_VOICE_FIELD(state);
     SVMS_COPY_GROWN_VOICE_FIELD(envelopeStage);
     SVMS_COPY_GROWN_VOICE_FIELD(sampleBacked);
     SVMS_COPY_GROWN_VOICE_FIELD(renderClass);
-    SVMS_COPY_GROWN_VOICE_FIELD(presetIndex);
-    SVMS_COPY_GROWN_VOICE_FIELD(regionIndex);
-    SVMS_COPY_GROWN_VOICE_FIELD(playIndex);
     SVMS_COPY_GROWN_VOICE_FIELD(phases);
     SVMS_COPY_GROWN_VOICE_FIELD(phaseIncs);
-    SVMS_COPY_GROWN_VOICE_FIELD(basePhaseIncs);
-    SVMS_COPY_GROWN_VOICE_FIELD(pitchBendScales);
     SVMS_COPY_GROWN_VOICE_FIELD(currentGain);
     SVMS_COPY_GROWN_VOICE_FIELD(targetGain);
     SVMS_COPY_GROWN_VOICE_FIELD(sustainLevel);
     SVMS_COPY_GROWN_VOICE_FIELD(attackGainStep);
     SVMS_COPY_GROWN_VOICE_FIELD(releaseDecay);
-    SVMS_COPY_GROWN_VOICE_FIELD(gainLeft);
-    SVMS_COPY_GROWN_VOICE_FIELD(gainRight);
     SVMS_COPY_GROWN_VOICE_FIELD(mixGainL);
     SVMS_COPY_GROWN_VOICE_FIELD(mixGainR);
     SVMS_COPY_GROWN_VOICE_FIELD(renderGainL);
@@ -1547,13 +1526,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(filterZ2);
     SVMS_COPY_GROWN_VOICE_FIELD(filterEnabled);
     SVMS_COPY_GROWN_VOICE_FIELD(stealOutputGain);
-    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoToPitchCents);
-    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoSteps);
-    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoPhases);
-    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoDelays);
-    SVMS_COPY_GROWN_VOICE_FIELD(vibLfoModulated);
     SVMS_COPY_GROWN_VOICE_FIELD(sampleStart);
-    SVMS_COPY_GROWN_VOICE_FIELD(loopMode);
     SVMS_COPY_GROWN_VOICE_FIELD(loopEnabled);
     SVMS_COPY_GROWN_VOICE_FIELD(relEnd);
     SVMS_COPY_GROWN_VOICE_FIELD(relLoopS);
@@ -1566,15 +1539,12 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(delaySamplesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(releaseSamplesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(decaySlope);
-    SVMS_COPY_GROWN_VOICE_FIELD(heldBySustain);
-    SVMS_COPY_GROWN_VOICE_FIELD(heldBySostenuto);
-    SVMS_COPY_GROWN_VOICE_FIELD(releaseStartInBlock);
-    SVMS_COPY_GROWN_VOICE_FIELD(nextChannelKeyVoice);
-    SVMS_COPY_GROWN_VOICE_FIELD(prevChannelKeyVoice);
     SVMS_COPY_GROWN_VOICE_FIELD(birthFrame);
     SVMS_COPY_GROWN_VOICE_FIELD(stealFadeInFramesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(stealFadeInFramesTotal);
 #undef SVMS_COPY_GROWN_VOICE_FIELD
+    std::memcpy(grown.v.rows, v.rows,
+                static_cast<size_t>(oldCapacity) * sizeof(VoiceRow));
 
 #define SVMS_COPY_GROWN_TAIL_FIELD(name) \
     std::memcpy(grown.v.name, v.name, sizeof(v.name))
@@ -1638,18 +1608,13 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 sizeof(channelMixScaleR_));
     grown.channelMixStealMask_ = channelMixStealMask_;
     grown.channelMixDirtyMask_ = channelMixDirtyMask_;
-    std::memcpy(grown.playGroupNext_, playGroupNext_,
-                static_cast<size_t>(oldCapacity) * sizeof(*playGroupNext_));
-    std::memcpy(grown.playGroupPrev_, playGroupPrev_,
-                static_cast<size_t>(oldCapacity) * sizeof(*playGroupPrev_));
-    std::memcpy(grown.exclusiveClass_, exclusiveClass_,
-                static_cast<size_t>(oldCapacity) * sizeof(*exclusiveClass_));
-    std::memcpy(grown.exclusiveClassNext_, exclusiveClassNext_,
-                static_cast<size_t>(oldCapacity) *
-                    sizeof(*exclusiveClassNext_));
-    std::memcpy(grown.exclusiveClassPrev_, exclusiveClassPrev_,
-                static_cast<size_t>(oldCapacity) *
-                    sizeof(*exclusiveClassPrev_));
+    for (uint32_t i = 0u; i < oldCapacity; ++i) {
+        grown.playGroupNext_[i] = playGroupNext_[i];
+        grown.playGroupPrev_[i] = playGroupPrev_[i];
+        grown.exclusiveClass_[i] = exclusiveClass_[i];
+        grown.exclusiveClassNext_[i] = exclusiveClassNext_[i];
+        grown.exclusiveClassPrev_[i] = exclusiveClassPrev_[i];
+    }
     std::memcpy(grown.exclusiveClassHead_, exclusiveClassHead_,
                 sizeof(exclusiveClassHead_));
     grown.lastLinkedPlayIndex_ = lastLinkedPlayIndex_;
@@ -1675,8 +1640,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 sizeof(*grown.stealWinnerTree_) * grown.stealTreeLeafBase_ * 2u);
     std::memset(grown.stealStableKey_, 0,
                 static_cast<size_t>(capacity) * sizeof(*grown.stealStableKey_));
-    std::memset(grown.stealVolatilePosition_, 0xff,
-                static_cast<size_t>(capacity) * sizeof(*grown.stealVolatilePosition_));
+    for (uint32_t i = 0u; i < capacity; ++i)
+        grown.stealVolatilePosition_[i] = UINT32_MAX;
     std::memset(grown.stealVolatileHeapPosition_, 0xff,
                 static_cast<size_t>(capacity) * sizeof(*grown.stealVolatileHeapPosition_));
     std::memset(grown.stealCandidateDeferred_, 0,
@@ -1745,26 +1710,17 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     releasingRing_ = grown.releasingRing_;
     channelIndexBlocks_ = grown.channelIndexBlocks_;
     channelIndexFreeStack_ = grown.channelIndexFreeStack_;
-    channelActiveBlock_ = grown.channelActiveBlock_;
-    channelActiveOffset_ = grown.channelActiveOffset_;
     renderClassBlocks_ = grown.renderClassBlocks_;
     renderClassFreeStack_ = grown.renderClassFreeStack_;
-    renderClassBlock_ = grown.renderClassBlock_;
-    renderClassOffset_ = grown.renderClassOffset_;
     stealStableKey_ = grown.stealStableKey_;
     stealWinnerTree_ = grown.stealWinnerTree_;
     stealVolatileList_ = grown.stealVolatileList_;
-    stealVolatilePosition_ = grown.stealVolatilePosition_;
     stealVolatileHeapKey_ = grown.stealVolatileHeapKey_;
     stealVolatileHeapHandle_ = grown.stealVolatileHeapHandle_;
     stealVolatileHeapPosition_ = grown.stealVolatileHeapPosition_;
     stealCandidateDeferred_ = grown.stealCandidateDeferred_;
     stealCandidateReserved_ = grown.stealCandidateReserved_;
-    playGroupNext_ = grown.playGroupNext_;
-    playGroupPrev_ = grown.playGroupPrev_;
-    exclusiveClass_ = grown.exclusiveClass_;
-    exclusiveClassNext_ = grown.exclusiveClassNext_;
-    exclusiveClassPrev_ = grown.exclusiveClassPrev_;
+    BindLinkRows(grown.linkRows_);
     metadataStorage_ = grown.metadataStorage_;
     metadataBytes_ = grown.metadataBytes_;
     grown.metadataStorage_ = nullptr;
@@ -2278,10 +2234,8 @@ inline void VoiceManager::PrefetchVoiceLines(VoiceHandle handle) {
     SVMS_PREFETCH_FIELD(decaySlope);
     SVMS_PREFETCH_FIELD(envelopeStage);
     SVMS_PREFETCH_FIELD(renderClass);
-    SVMS_PREFETCH_FIELD(playIndex);
+    _mm_prefetch(reinterpret_cast<const char*>(&v.rows[handle]), _MM_HINT_T0);
     SVMS_PREFETCH_FIELD(birthFrame);
-    SVMS_PREFETCH_FIELD(gainLeft);
-    SVMS_PREFETCH_FIELD(gainRight);
     SVMS_PREFETCH_FIELD(stealOutputGain);
     SVMS_PREFETCH_FIELD(loopEnabled);
     SVMS_PREFETCH_FIELD(relLoopSF);
@@ -3184,8 +3138,8 @@ inline void VoiceManager::BuildStealHeap() {
     stealVolatileHeapValid_ = false;
     std::memset(stealWinnerTree_, 0,
                 sizeof(*stealWinnerTree_) * stealTreeLeafBase_ * 2u);
-    std::memset(stealVolatilePosition_, 0xff,
-                sizeof(*stealVolatilePosition_) * maxVoices_);
+    for (uint32_t i = 0u; i < maxVoices_; ++i)
+        stealVolatilePosition_[i] = UINT32_MAX;
     for (uint32_t position = 0; position < activeCount_; ++position) {
         const uint32_t handle = activeList_[position];
         if (IsStableStealCandidate(handle)) {

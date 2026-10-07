@@ -3605,33 +3605,19 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 // ── Whole-voice whole-block renderer ────────────────────────────────────
 
 // Copy the render state of a displaced/killed voice into a ghost row.  Every
-// dense field rides along (the macro keeps that set complete); of the cold
-// fields only the ones ghost rendering reads are copied: channel (bus mode +
-// op channel), loopMode (release flip), the row-op inputs (basePhaseIncs,
-// pitchBendScales, gainLeft/Right, stealOutputGain) and the vibrato LFO
-// state.  The rest (note/velocity/preset/region/playIndex, pedal holds,
-// key-chain links, birthFrame, releaseStartInBlock) is voice-manager
-// bookkeeping no ghost path touches; skipping it saves ~10 cold victim-row
-// cache misses per steal on the serial plan loop.  A new cold field that
-// the ghost render path reads must be added here.
+// dense field rides along (the macro keeps that set complete), plus the
+// launch bookkeeping row (one cache line: channel, loopMode, the row-op
+// inputs and the vibrato LFO state are what ghost rendering reads) and
+// stealOutputGain.  birthFrame is voice-manager bookkeeping no ghost path
+// touches.  A new SoA cold field that the ghost render path reads must be
+// added here.
 #define SVMS_COPY_VOICE_ROW_FIELD(type, name)     destination.name[destinationRow] = source.name[sourceRow];
 inline void CopyGhostRow(const VoiceSoA& source, VoiceSoA& destination,
                          uint32_t sourceRow, uint32_t destinationRow) {
     SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_COPY_VOICE_ROW_FIELD)
-#define SVMS_COPY_FIELD(name) SVMS_COPY_VOICE_ROW_FIELD(_, name)
-    SVMS_COPY_FIELD(channel)
-    SVMS_COPY_FIELD(loopMode)
-    SVMS_COPY_FIELD(basePhaseIncs)
-    SVMS_COPY_FIELD(pitchBendScales)
-    SVMS_COPY_FIELD(gainLeft)
-    SVMS_COPY_FIELD(gainRight)
-    SVMS_COPY_FIELD(stealOutputGain)
-    SVMS_COPY_FIELD(vibLfoToPitchCents)
-    SVMS_COPY_FIELD(vibLfoSteps)
-    SVMS_COPY_FIELD(vibLfoPhases)
-    SVMS_COPY_FIELD(vibLfoDelays)
-    SVMS_COPY_FIELD(vibLfoModulated)
-#undef SVMS_COPY_FIELD
+    destination.rows[destinationRow] = source.rows[sourceRow];
+    destination.stealOutputGain[destinationRow] =
+        source.stealOutputGain[sourceRow];
 }
 #undef SVMS_COPY_VOICE_ROW_FIELD
 
