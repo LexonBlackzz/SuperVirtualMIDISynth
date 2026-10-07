@@ -256,20 +256,26 @@ if(MINGW)
     endif()
 endif()
 
-set(SOURCES
-    SVMSConfig.cpp
-    SVMSSoundFont.cpp
+# Driver translation units; each starts with SVMSDriverInternal.h.
+# SVMSFrontWinMM.cpp is deliberately absent: it is the one file compiled per
+# DLL (see svms_engine below).
+set(SVMS_DRIVER_SOURCES
     SVMSDriver.cpp
     SVMSDriverRuntimeLink.cpp
     SVMSDriverSoundFont.cpp
     SVMSDriverBackend.cpp
     SVMSDriverIngress.cpp
     SVMSDriverRender.cpp
-    SVMSFrontWinMM.cpp
     SVMSFrontNative.cpp
     SVMSFrontKDMAPI.cpp
     SVMSFrontBass.cpp
     SVMSDllMain.cpp
+)
+
+set(SOURCES
+    SVMSConfig.cpp
+    SVMSSoundFont.cpp
+    ${SVMS_DRIVER_SOURCES}
     SVMSDiagWindow.cpp
     SVMSRenderKernels.cpp
     SVMSRenderWorkers.cpp
@@ -354,7 +360,12 @@ elseif(MINGW)
     endif()
 endif()
 
-add_library(svmsynth SHARED ${SOURCES} ${HEADERS}
+# The engine is compiled once and linked into both DLLs. The only per-DLL
+# translation unit is the WinMM shim file, because svmsapi builds it with
+# _WINMM_ (see below); no other file defines a WinMM SDK function.
+add_library(svms_engine OBJECT ${SOURCES} ${HEADERS})
+
+add_library(svmsynth SHARED SVMSFrontWinMM.cpp
     "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc")
 
 # Standalone native-API runtime. Built from the same engine sources as
@@ -362,27 +373,32 @@ add_library(svmsynth SHARED ${SOURCES} ${HEADERS}
 # surface: the permanent SVMS_GetInterface bootstrap plus the KDMAPI facade.
 # Deliberately no WinMM shim exports - SVMSAPI.dll is not a midiOutOpen
 # drop-in. Players integrate via LoadLibrary + GetProcAddress only.
-add_library(svmsapi SHARED ${SOURCES} ${HEADERS}
+add_library(svmsapi SHARED SVMSFrontWinMM.cpp
     "${SVMS_GENERATED_DIR}/SVMSApiVersion.rc")
 
-foreach(svms_engine_target svmsynth svmsapi)
+foreach(svms_engine_target svms_engine svmsynth svmsapi)
     target_compile_definitions(${svms_engine_target} PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
         _CRT_SECURE_NO_WARNINGS ${SVMS_WITH_ASIO_DEF})
     if(svms_engine_target STREQUAL svmsapi)
         # The system multimedia headers declare the WinMM shims dllimport
         # (WINMMAPI = DECLSPEC_IMPORT in mmsyscom.h). The local shim
-        # definitions in SVMSDriver.cpp then conflict (C4273) and MSVC turns
+        # definitions in SVMSFrontWinMM.cpp then conflict (C4273) and MSVC turns
         # each one into a linker /EXPORT directive, re-exporting the whole
         # WinMM surface. _WINMM_ is the SDK's official "building winmm"
         # switch: it empties WINMMAPI, so no conflict and no phantom exports.
         # The shims stay as private dead code (/OPT:REF strips them) and the
         # export surface is exactly the SVMSAPI_EXPORTS list below. Only the
         # standalone target gets this; winmm.dll keeps its exact export table.
+        # It only reaches SVMSFrontWinMM.cpp: svms_engine never sees it.
         target_compile_definitions(${svms_engine_target} PRIVATE _WINMM_)
     endif()
     target_include_directories(${svms_engine_target} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+    if(svms_engine_target STREQUAL svms_engine)
+        continue()
+    endif()
+    target_link_libraries(${svms_engine_target} PRIVATE svms_engine)
     if(SVMS_XP_COMPAT)
         target_link_libraries(${svms_engine_target} PRIVATE
             dsound dxguid shell32 user32)
@@ -396,13 +412,13 @@ if(NOT SVMS_XP_COMPAT)
     option(SVMS_ASIO "Build the ASIO output backend (requires the ASIO SDK)" ON)
     if(SVMS_ASIO AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main/common/asio.h")
         set(ASIO_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../asio-main")
-        foreach(svms_engine_target svmsynth svmsapi)
-            target_sources(${svms_engine_target} PRIVATE
-                "${ASIO_SDK_DIR}/common/asio.cpp"
-                "${ASIO_SDK_DIR}/common/combase.cpp"
-                "${ASIO_SDK_DIR}/common/debugmessage.cpp"
-                "${ASIO_SDK_DIR}/host/asiodrivers.cpp"
-                "${ASIO_SDK_DIR}/host/pc/asiolist.cpp")
+        target_sources(svms_engine PRIVATE
+            "${ASIO_SDK_DIR}/common/asio.cpp"
+            "${ASIO_SDK_DIR}/common/combase.cpp"
+            "${ASIO_SDK_DIR}/common/debugmessage.cpp"
+            "${ASIO_SDK_DIR}/host/asiodrivers.cpp"
+            "${ASIO_SDK_DIR}/host/pc/asiolist.cpp")
+        foreach(svms_engine_target svms_engine svmsynth svmsapi)
             target_compile_definitions(${svms_engine_target} PRIVATE SVMS_WITH_ASIO)
             target_include_directories(${svms_engine_target} PRIVATE
                 "${ASIO_SDK_DIR}/common" "${ASIO_SDK_DIR}/host"

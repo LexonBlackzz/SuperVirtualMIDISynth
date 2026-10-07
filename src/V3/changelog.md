@@ -10,6 +10,11 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 build(v3): compile the engine once for winmm.dll and SVMSAPI.dll
+  Both DLLs used to compile every engine source separately. They now link one
+  `svms_engine` OBJECT library; only SVMSFrontWinMM.cpp is still built per DLL,
+  because svmsapi compiles it with _WINMM_. Export and import tables of both
+  DLLs are identical. Touching SVMSDriverInternal.h rebuilds in 10.5 s (was 23 s).
 - 2026-10-07 fix(v3): value-initialize SF2Data with () instead of {}
   `new SF2Data{}` aggregate-initializes 65536 SFSampleRegions that have member
   initializers, and cl.exe pays ~3 s plus a lot of memory for it in every TU
