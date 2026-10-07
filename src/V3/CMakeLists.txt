@@ -260,6 +260,16 @@ set(SOURCES
     SVMSConfig.cpp
     SVMSSoundFont.cpp
     SVMSDriver.cpp
+    SVMSDriverRuntimeLink.cpp
+    SVMSDriverSoundFont.cpp
+    SVMSDriverBackend.cpp
+    SVMSDriverIngress.cpp
+    SVMSDriverRender.cpp
+    SVMSFrontWinMM.cpp
+    SVMSFrontNative.cpp
+    SVMSFrontKDMAPI.cpp
+    SVMSFrontBass.cpp
+    SVMSDllMain.cpp
     SVMSDiagWindow.cpp
     SVMSRenderKernels.cpp
     SVMSRenderWorkers.cpp
@@ -304,6 +314,7 @@ set(HEADERS
     SVMSChannelCache.h
     SVMSRenderScalar.h
     SVMSRenderEvent.h
+    SVMSDriverInternal.h
     SVMSRenderKernels.h
     SVMSRenderWorkers.h
     SVMSAudioOutput.h

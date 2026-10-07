@@ -10,6 +10,17 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 refactor(v3): split SVMSDriver.cpp by area
+  The 10k-line driver is now SVMSDriverInternal.h (class Driver + shared
+  helpers) plus SVMSDriver/RuntimeLink/SoundFont/Backend/Ingress/Render.cpp
+  and the front ends SVMSFrontWinMM/Native/KDMAPI/Bass.cpp + SVMSDllMain.cpp.
+  Code moved verbatim; the only edits are linkage (shared file-scope statics
+  became inline, four native offline functions lost `static` because the BASS
+  shim calls them). Export tables and test output are identical. A one-area
+  edit rebuilds in ~3-4 s instead of ~11.5 s; touching the internal header
+  costs ~23 s at -j 2. SVMSNativeOffline.h is included only by the native
+  front end: its StandaloneSynth `new SF2Data{}` is expensive for cl.exe and
+  ran a full-parallel build out of memory when every file included it.
 - 2026-10-07 refactor(v3): split RenderEvent out of SVMSRenderScalar.h
   SVMSEventScheduler.h included the whole renderer (and with it the voice
   manager) just for `RenderEvent`. The event-pipeline headers now include the
