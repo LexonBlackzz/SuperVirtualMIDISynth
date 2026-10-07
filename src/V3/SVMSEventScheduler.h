@@ -1,7 +1,8 @@
 #ifndef SVMS_EVENT_SCHEDULER_H
 #define SVMS_EVENT_SCHEDULER_H
 
-#include "SVMSRenderScalar.h"
+#include "SVMSRenderEvent.h"
+#include "SVMSTypes.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>

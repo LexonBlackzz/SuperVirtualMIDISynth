@@ -10,6 +10,10 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 refactor(v3): split RenderEvent out of SVMSRenderScalar.h
+  SVMSEventScheduler.h included the whole renderer (and with it the voice
+  manager) just for `RenderEvent`. The event-pipeline headers now include the
+  40-line SVMSRenderEvent.h instead. No code changes.
 - 2026-10-07 refactor(v3): move the driver reverb into SVMSReverb.h
   First cut of the monolith split. `ReverbState` was 1,460 self-contained lines
   in the middle of SVMSDriver.cpp; it moved verbatim. The DLL export tables

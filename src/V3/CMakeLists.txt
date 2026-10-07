@@ -303,6 +303,7 @@ set(HEADERS
     SVMSEnvelope.h
     SVMSChannelCache.h
     SVMSRenderScalar.h
+    SVMSRenderEvent.h
     SVMSRenderKernels.h
     SVMSRenderWorkers.h
     SVMSAudioOutput.h
