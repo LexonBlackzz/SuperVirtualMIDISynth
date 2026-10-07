@@ -1,12 +1,12 @@
 #pragma once
 
+#include "CanonicalCompat.h"
+
 #include "CanonicalSampleBank.h"
 #include "CanonicalCore.h"
 
 #include <array>
 #include <cstdint>
-#include <filesystem>
-#include <span>
 #include <string>
 #include <vector>
 
@@ -86,11 +86,11 @@ public:
                               std::string name = {});
     void finalize();
     [[nodiscard]] const SampleBank& sampleBank() const noexcept { return samples_; }
-    [[nodiscard]] std::span<const PreparedPreset> presets() const noexcept { return presets_; }
-    [[nodiscard]] std::span<const std::string> warnings() const noexcept { return warnings_; }
+    [[nodiscard]] Span<const PreparedPreset> presets() const noexcept { return presets_; }
+    [[nodiscard]] Span<const std::string> warnings() const noexcept { return warnings_; }
     [[nodiscard]] const PreparedPreset* findPreset(std::uint16_t bank,
                                                    std::uint8_t program) const noexcept;
-    [[nodiscard]] std::span<const std::uint32_t> matchingRegions(
+    [[nodiscard]] Span<const std::uint32_t> matchingRegions(
         const PreparedPreset& preset, std::uint8_t key, std::uint8_t velocity) const;
 
 private:
@@ -100,11 +100,11 @@ private:
     bool finalized_{};
 
     friend PreparedSoundFont loadSoundFont(const std::string& path);
-    friend PreparedSoundFont loadSoundFont(const std::filesystem::path& path);
+    friend PreparedSoundFont loadSoundFont(const Path& path);
 };
 
 PreparedSoundFont loadSoundFont(const std::string& path);
-PreparedSoundFont loadSoundFont(const std::filesystem::path& path);
+PreparedSoundFont loadSoundFont(const Path& path);
 
 // Expands one already-selected musical note into ordinary format-agnostic core
 // events. No SF2 structures are consulted by Synth or its kernels.

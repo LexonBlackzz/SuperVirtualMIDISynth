@@ -1,11 +1,12 @@
 #pragma once
 
+#include "CanonicalCompat.h"
+
 #include "CanonicalSampleBank.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <vector>
 
 namespace svms::canonical {
@@ -148,9 +149,9 @@ public:
     Synth& operator=(const Synth&) = delete;
 
     void render(std::uint64_t startFrame,
-                std::span<const Event> events,
-                std::span<float> outputLeft,
-                std::span<float> outputRight);
+                Span<const Event> events,
+                Span<float> outputLeft,
+                Span<float> outputRight);
 
     void reset();
     [[nodiscard]] const RenderStats& stats() const noexcept;

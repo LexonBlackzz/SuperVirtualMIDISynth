@@ -1,17 +1,17 @@
 #pragma once
 
+#include "CanonicalCompat.h"
+
 #include "CanonicalEngineTypes.h"
 
 #include <memory>
-#include <filesystem>
-#include <span>
 #include <string>
 
 namespace svms::canonical {
 
 class CanonicalEngine {
 public:
-    CanonicalEngine(const std::filesystem::path& soundFontPath,
+    CanonicalEngine(const Path& soundFontPath,
                     const CanonicalEngineConfig& config);
     ~CanonicalEngine();
     CanonicalEngine(CanonicalEngine&&) noexcept;
@@ -22,8 +22,8 @@ public:
     void reset();
     bool dispatch(const CanonicalEvent& event) noexcept;
     void renderBlock(std::uint64_t absoluteFrame,
-                     std::span<float> outputLeft,
-                     std::span<float> outputRight);
+                     Span<float> outputLeft,
+                     Span<float> outputRight);
     void releaseAll(std::uint64_t absoluteFrame) noexcept;
 
     [[nodiscard]] CanonicalTelemetry telemetry() const noexcept;

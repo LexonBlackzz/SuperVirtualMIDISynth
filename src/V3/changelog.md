@@ -10,6 +10,9 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 fix(v3): build the canonical engine as C++17. Span/Path shims in
+  Engine/CanonicalCompat.h replace std::span and std::filesystem (GCC 7 has only
+  the Filesystem TS); atomic wait falls back to a mutex + condition variable.
 - 2026-10-07 ci(v3): save the Linux ccache even when the job fails; retry apt
   actions/cache only saves on success, so a red Linux job never warmed its
   cache. Restore and save are separate steps now (save runs always), the

@@ -36,6 +36,20 @@ void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); 
 namespace {
 namespace c = svms::canonical;
 
+// C++17 (no designated initializers): the Linux build floor is GCC 7.
+c::SynthConfig synthConfig(std::uint32_t voices, std::uint32_t maxBlockFrames,
+                           std::uint32_t tileSize = 512u,
+                           std::uint32_t workers = 0u,
+                           c::Backend backend = c::Backend::Scalar) {
+    c::SynthConfig config;
+    config.voiceCapacity = voices;
+    config.maxBlockFrames = maxBlockFrames;
+    config.tileSize = tileSize;
+    config.workerThreads = workers;
+    config.backend = backend;
+    return config;
+}
+
 void require(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
 }
@@ -70,7 +84,7 @@ c::PreparedSoundFont preparedFixture() {
 
 void exactFramesAndStableOrder() {
     auto bank = basicBank();
-    c::Synth synth(bank, {.voiceCapacity=8, .maxBlockFrames=16});
+    c::Synth synth(bank, synthConfig(8, 16));
     const std::vector events{c::Event::noteOn(3, 0, 60, 0, 0.5F)};
     std::vector<float> left(7), right(7);
     synth.render(0, events, left, right);
@@ -78,7 +92,7 @@ void exactFramesAndStableOrder() {
     near(left[3], 1.0F, "note-on missed exact frame");
     near(left[4], 0.75F, "phase/interpolation mismatch");
 
-    c::Synth ordered(bank, {.voiceCapacity=8, .maxBlockFrames=8});
+    c::Synth ordered(bank, synthConfig(8, 8));
     const std::vector orderedEvents{
         c::Event::noteOff(0, 1, 60), c::Event::noteOn(0, 2, 60, 1)};
     std::vector<float> ol(2), ort(2);
@@ -88,7 +102,7 @@ void exactFramesAndStableOrder() {
 
 void deterministicCapacitySteal() {
     auto bank = basicBank();
-    c::Synth synth(bank, {.voiceCapacity=1, .maxBlockFrames=8});
+    c::Synth synth(bank, synthConfig(1, 8));
     const std::vector events{
         c::Event::noteOn(0, 0, 60, 1),
         c::Event::noteOn(1, 1, 61, 1)};
@@ -263,7 +277,7 @@ void filterPreparationAndLifecycleFeatures() {
     replacement.exclusiveClass = 5;
     replacement.exclusiveMaskLow = std::uint64_t{1} << 5;
     replacement.exclusiveReleaseFrames = 32;
-    c::Synth chokeSynth(bank, {.voiceCapacity=8, .maxBlockFrames=8});
+    c::Synth chokeSynth(bank, synthConfig(8, 8));
     std::vector<float> left(2), right(2);
     const std::vector<c::Event> chokeEvents{oldA, oldLayer, otherChannel, replacement};
     chokeSynth.render(0, chokeEvents, left, right);
@@ -282,7 +296,7 @@ void filterPreparationAndLifecycleFeatures() {
 
     auto releaseLoop = c::Event::noteOn(0, 0, 60, 1, 1.0F, 1.0F, 1.0F, 0, 100);
     releaseLoop.sampleMode = 3;
-    c::Synth releaseLoopSynth(bank, {.voiceCapacity=4, .maxBlockFrames=16});
+    c::Synth releaseLoopSynth(bank, synthConfig(4, 16));
     std::vector<c::Event> releaseEvents{releaseLoop, c::Event::noteOff(2, 1, 60)};
     left.assign(8, 0.0F); right.assign(8, 0.0F);
     releaseLoopSynth.render(0, releaseEvents, left, right);
@@ -312,7 +326,7 @@ void filterPreparationAndLifecycleFeatures() {
     sustainProcess(2, c::MidiMessageType::NoteOff, 60, 0);
     sustainProcess(4, c::MidiMessageType::ControlChange, 64, 0);
     c::Synth sustainLoopSynth(sustainFont.sampleBank(),
-        {.voiceCapacity=4, .maxBlockFrames=16});
+        synthConfig(4, 16));
     left.assign(12, 0.0F); right.assign(12, 0.0F);
     sustainLoopSynth.render(0, sustainEvents, left, right);
     require(sustainLoopSynth.activeVoiceCount() == 0,
@@ -373,8 +387,7 @@ std::vector<c::Event> denseEvents() {
 std::pair<std::vector<float>, std::vector<float>> run(
     const c::SampleBank& bank, c::Backend backend, std::uint32_t workers,
     const std::vector<c::Event>& events) {
-    c::SynthConfig config{.voiceCapacity=384, .tileSize=37,
-        .maxBlockFrames=64, .workerThreads=workers, .backend=backend};
+    c::SynthConfig config = synthConfig(384, 64, 37, workers, backend);
     config.workerDispatchMinimumFrames = 0;
     c::Synth synth(bank, config);
     std::vector<float> left(64), right(64);
@@ -413,8 +426,7 @@ void scalarAvxAndThreadDifferentials() {
 void renderDoesNotAllocate() {
     auto bank = basicBank();
     const auto events = denseEvents();
-    c::Synth synth(bank, {.voiceCapacity=384, .tileSize=37,
-        .maxBlockFrames=64, .workerThreads=3, .backend=c::Backend::Scalar});
+    c::Synth synth(bank, synthConfig(384, 64, 37, 3, c::Backend::Scalar));
     std::vector<float> left(64), right(64);
     synth.render(0, events, left, right); // warm workers and caches
     synth.reset();

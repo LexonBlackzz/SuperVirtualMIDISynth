@@ -9,7 +9,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #if defined(_MSC_VER)
@@ -205,7 +207,7 @@ public:
     ~Impl() {
         stopping.store(true, std::memory_order_release);
         jobEpoch.fetch_add(1, std::memory_order_release);
-        jobEpoch.notify_all();
+        notifyAll(jobEpoch);
         for (auto& worker : workers) worker.join();
     }
 
@@ -434,7 +436,7 @@ public:
     }
 
     void validate(std::uint64_t start, std::uint64_t frameCount,
-                  std::span<const Event> events) const {
+                  Span<const Event> events) const {
         if (frameCount > cfg.maxBlockFrames) {
             throw std::invalid_argument("render block exceeds configured maximum");
         }
@@ -876,13 +878,41 @@ public:
         }
     }
 
+    // C++20 atomic wait/notify where the library has it; the C++17 floor
+    // (GCC 7) parks on one condition variable instead. waitChange returns
+    // once the value differs from `old` (callers re-check in a loop).
+    template <class T>
+    void waitChange(std::atomic<T>& value, T old) {
+#if defined(__cpp_lib_atomic_wait)
+        value.wait(old, std::memory_order_acquire);
+#else
+        std::unique_lock<std::mutex> lock(parkMutex);
+        parkSignal.wait(lock, [&] {
+            return value.load(std::memory_order_acquire) != old;
+        });
+#endif
+    }
+
+    template <class T>
+    void notifyAll(std::atomic<T>& value) {
+#if defined(__cpp_lib_atomic_wait)
+        value.notify_all();
+#else
+        (void)value;
+        // The store happened before this lock, so a waiter that checks its
+        // predicate under the lock either sees it or is already parked.
+        { std::lock_guard<std::mutex> lock(parkMutex); }
+        parkSignal.notify_all();
+#endif
+    }
+
     void executeAvailableTiles() {
         while (true) {
             const auto tile = nextTile.fetch_add(1, std::memory_order_relaxed);
             if (tile >= jobTileCount) return;
             renderTile(tile, jobFrameCount);
             if (remainingTiles.fetch_sub(1, std::memory_order_release) == 1) {
-                remainingTiles.notify_one();
+                notifyAll(remainingTiles);
             }
         }
     }
@@ -890,7 +920,7 @@ public:
     void workerLoop() {
         auto observed = jobEpoch.load(std::memory_order_acquire);
         while (!stopping.load(std::memory_order_acquire)) {
-            jobEpoch.wait(observed, std::memory_order_acquire);
+            waitChange(jobEpoch, observed);
             observed = jobEpoch.load(std::memory_order_acquire);
             if (stopping.load(std::memory_order_acquire)) return;
             executeAvailableTiles();
@@ -898,7 +928,7 @@ public:
     }
 
     void renderSpan(std::size_t outputOffset, std::size_t frameCount,
-                    std::span<float> left, std::span<float> right) {
+                    Span<float> left, Span<float> right) {
         const auto tileCount = (active.size() + cfg.tileSize - 1) / cfg.tileSize;
         if (tileCount == 0) return;
         const auto tileStart = cfg.collectDetailedTiming ? Clock::now() : Clock::time_point{};
@@ -909,12 +939,12 @@ public:
         if (!workers.empty() && tileCount > 1 &&
             frameCount >= cfg.workerDispatchMinimumFrames) {
             jobEpoch.fetch_add(1, std::memory_order_release);
-            jobEpoch.notify_all();
+            notifyAll(jobEpoch);
         }
         executeAvailableTiles();
         auto remaining = remainingTiles.load(std::memory_order_acquire);
         while (remaining != 0) {
-            remainingTiles.wait(remaining, std::memory_order_acquire);
+            waitChange(remainingTiles, remaining);
             remaining = remainingTiles.load(std::memory_order_acquire);
         }
         if (cfg.collectDetailedTiming) {
@@ -976,8 +1006,8 @@ public:
         pendingRetiredTileCount = 0;
     }
 
-    void render(std::uint64_t start, std::span<const Event> events,
-                std::span<float> left, std::span<float> right) {
+    void render(std::uint64_t start, Span<const Event> events,
+                Span<float> left, Span<float> right) {
         if (left.size() != right.size()) {
             throw std::invalid_argument("stereo output spans must have equal length");
         }
@@ -1063,6 +1093,10 @@ public:
     std::atomic<std::uint64_t> jobEpoch{0};
     std::atomic<std::size_t> nextTile{0};
     std::atomic<std::size_t> remainingTiles{0};
+#if !defined(__cpp_lib_atomic_wait)
+    std::mutex parkMutex;
+    std::condition_variable parkSignal;
+#endif
     std::size_t jobTileCount{};
     std::size_t jobFrameCount{};
     RenderStats renderStats{};
@@ -1074,8 +1108,8 @@ Synth::~Synth() = default;
 Synth::Synth(Synth&&) noexcept = default;
 Synth& Synth::operator=(Synth&&) noexcept = default;
 
-void Synth::render(std::uint64_t startFrame, std::span<const Event> events,
-                   std::span<float> outputLeft, std::span<float> outputRight) {
+void Synth::render(std::uint64_t startFrame, Span<const Event> events,
+                   Span<float> outputLeft, Span<float> outputRight) {
     impl_->render(startFrame, events, outputLeft, outputRight);
 }
 

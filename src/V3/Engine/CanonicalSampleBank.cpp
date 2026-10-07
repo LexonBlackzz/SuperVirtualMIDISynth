@@ -18,7 +18,7 @@ void validateSize(std::size_t size, std::size_t existing) {
 }
 } // namespace
 
-std::uint32_t SampleBank::appendSamples(std::span<const float> samples) {
+std::uint32_t SampleBank::appendSamples(Span<const float> samples) {
     validateSize(samples.size(), data_.size());
     const auto offset = static_cast<std::uint32_t>(data_.size());
     data_.reserve(data_.size() + samples.size());
@@ -31,7 +31,7 @@ std::uint32_t SampleBank::appendSamples(std::span<const float> samples) {
 }
 
 std::uint32_t SampleBank::appendPcm16(
-    std::span<const std::int16_t> samples) {
+    Span<const std::int16_t> samples) {
     validateSize(samples.size(), data_.size());
     const auto offset = static_cast<std::uint32_t>(data_.size());
     data_.insert(data_.end(), samples.begin(), samples.end());
@@ -58,12 +58,12 @@ SampleId SampleBank::addLoopView(std::uint32_t offset, std::uint32_t length,
     return id;
 }
 
-SampleId SampleBank::addOneShot(std::span<const float> samples) {
+SampleId SampleBank::addOneShot(Span<const float> samples) {
     const auto offset = appendSamples(samples);
     return addOneShotView(offset, static_cast<std::uint32_t>(samples.size()));
 }
 
-SampleId SampleBank::addLoop(std::span<const float> samples,
+SampleId SampleBank::addLoop(Span<const float> samples,
                              std::uint32_t loopStart,
                              std::uint32_t loopEnd) {
     if (loopStart >= loopEnd || loopEnd > samples.size()) {

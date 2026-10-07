@@ -42,7 +42,7 @@ MidiMessage translate(const CanonicalEvent& event) noexcept {
 
 class CanonicalEngine::Impl {
 public:
-    Impl(const std::filesystem::path& path,
+    Impl(const Path& path,
          const CanonicalEngineConfig& requested)
         : config(requested), font(loadSoundFont(path)),
           interpreter(font, requested.sampleRate,
@@ -106,8 +106,8 @@ public:
         return true;
     }
 
-    void render(std::uint64_t frame, std::span<float> left,
-                std::span<float> right) {
+    void render(std::uint64_t frame, Span<float> left,
+                Span<float> right) {
         synth.render(frame, expanded, left, right);
         expandedEventCount += expanded.size();
         expanded.clear();
@@ -180,7 +180,7 @@ public:
     std::uint64_t rejectedInterpreter{};
 };
 
-CanonicalEngine::CanonicalEngine(const std::filesystem::path& path,
+CanonicalEngine::CanonicalEngine(const Path& path,
                                  const CanonicalEngineConfig& config)
     : impl_(std::make_unique<Impl>(path, config)) {}
 CanonicalEngine::~CanonicalEngine() = default;
@@ -192,8 +192,8 @@ bool CanonicalEngine::dispatch(const CanonicalEvent& event) noexcept {
     return impl_->dispatch(event);
 }
 void CanonicalEngine::renderBlock(std::uint64_t frame,
-                                  std::span<float> left,
-                                  std::span<float> right) {
+                                  Span<float> left,
+                                  Span<float> right) {
     impl_->render(frame, left, right);
 }
 void CanonicalEngine::releaseAll(std::uint64_t frame) noexcept {

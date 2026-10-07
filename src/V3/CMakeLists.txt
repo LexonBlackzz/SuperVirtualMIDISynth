@@ -126,7 +126,12 @@ if(NOT SVMS_XP_COMPAT)
         Engine/CanonicalEngine.cpp)
     target_include_directories(svms_canonical_engine PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/Engine")
-    target_compile_features(svms_canonical_engine PUBLIC cxx_std_20)
+    # C++17-clean (Engine/CanonicalCompat.h) so the Linux build keeps its
+    # Ubuntu 18.04 / GCC 7 floor; GCC < 9 needs the separate filesystem lib.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+       CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+        target_link_libraries(svms_canonical_engine PUBLIC stdc++fs)
+    endif()
     target_compile_definitions(svms_canonical_engine PRIVATE
         MIDISYNTH_HAS_AVX2=1)
     if(MSVC)

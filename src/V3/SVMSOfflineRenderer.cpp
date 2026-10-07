@@ -26,7 +26,6 @@
 #include <cstdio>
 #include <cwchar>
 #include <cstring>
-#include <filesystem>
 #include <memory>
 #include <string>
 #include <stdexcept>
@@ -686,7 +685,7 @@ public:
         }
         try {
             engine_ = std::make_unique<canonical::CanonicalEngine>(
-                std::filesystem::path(o.soundfont), config);
+                canonical::Path(o.soundfont), config);
         } catch (const std::exception& exception) {
             error = exception.what();
             return false;

@@ -1,7 +1,8 @@
 #pragma once
 
+#include "CanonicalCompat.h"
+
 #include <cstdint>
-#include <span>
 #include <vector>
 
 namespace svms::canonical {
@@ -18,13 +19,13 @@ struct SampleDescriptor {
 
 class SampleBank {
 public:
-    std::uint32_t appendSamples(std::span<const float> samples);
-    std::uint32_t appendPcm16(std::span<const std::int16_t> samples);
+    std::uint32_t appendSamples(Span<const float> samples);
+    std::uint32_t appendPcm16(Span<const std::int16_t> samples);
     SampleId addOneShotView(std::uint32_t offset, std::uint32_t length);
     SampleId addLoopView(std::uint32_t offset, std::uint32_t length,
                          std::uint32_t loopStart, std::uint32_t loopEnd);
-    SampleId addOneShot(std::span<const float> samples);
-    SampleId addLoop(std::span<const float> samples,
+    SampleId addOneShot(Span<const float> samples);
+    SampleId addLoop(Span<const float> samples,
                      std::uint32_t loopStart,
                      std::uint32_t loopEnd);
 

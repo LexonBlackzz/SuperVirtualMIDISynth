@@ -6,13 +6,16 @@
 #include <fstream>
 #include <limits>
 #include <map>
-#include <numbers>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
 
 namespace svms::canonical {
+namespace {
+// std::numbers::pi_v<float> is C++20; this literal rounds to the same float.
+constexpr float kPi = 3.14159265358979323846F;
+} // namespace
 
 SampleBank& PreparedSoundFont::preparationSamples() {
     if (finalized_) throw std::logic_error("prepared SoundFont is immutable after finalize");
@@ -63,7 +66,7 @@ const PreparedPreset* PreparedSoundFont::findPreset(std::uint16_t bank,
     return it != presets_.end() && it->bank == bank && it->program == program ? &*it : nullptr;
 }
 
-std::span<const std::uint32_t> PreparedSoundFont::matchingRegions(
+Span<const std::uint32_t> PreparedSoundFont::matchingRegions(
     const PreparedPreset& preset, std::uint8_t key, std::uint8_t velocity) const {
     const auto cell = static_cast<std::size_t>(key) * 128 + velocity;
     const auto begin = preset.lookupOffsets[cell];
@@ -120,7 +123,7 @@ void appendPreparedNoteOn(std::vector<Event>& output, const PreparedPreset& pres
         const float increment = static_cast<float>(r.sampleRate / outputSampleRate *
             std::exp2(cents / 1200.0));
         const float pan = std::clamp(r.pan + modAdds[17] / 500.0F, -1.0F, 1.0F);
-        const float angle = (pan + 1.0F) * (std::numbers::pi_v<float> * 0.25F);
+        const float angle = (pan + 1.0F) * (kPi * 0.25F);
         const float normalizedVelocity = static_cast<float>(effectiveVelocity) / 127.0F;
         const float velocityGain = normalizedVelocity * normalizedVelocity;
         const auto frames = [&](double seconds) {
@@ -173,7 +176,7 @@ void appendPreparedNoteOn(std::vector<Event>& output, const PreparedPreset& pres
         if (normalizedCutoff > 0.0F && normalizedCutoff < 0.499F) {
             const float qDb = event.filterResonanceCentibels * 0.1F;
             const float qInv = 1.0F / std::pow(10.0F, qDb / 20.0F);
-            const float k = std::tan(std::numbers::pi_v<float> * normalizedCutoff);
+            const float k = std::tan(kPi * normalizedCutoff);
             const float kk = k * k;
             const float norm = 1.0F / (1.0F + k * qInv + kk);
             event.filterA0 = kk * norm;
@@ -423,8 +426,12 @@ double volumeTimecents(int value) {
 
 } // namespace
 
-PreparedSoundFont loadSoundFont(const std::filesystem::path& path) {
+PreparedSoundFont loadSoundFont(const Path& path) {
+#if SVMS_CANONICAL_FILESYSTEM_TS
+    std::ifstream file(path.c_str(), std::ios::binary);
+#else
     std::ifstream file(path, std::ios::binary);
+#endif
     if (!file) throw std::runtime_error("cannot open SoundFont: " + path.string());
     file.seekg(0, std::ios::end); const auto size = file.tellg(); file.seekg(0);
     if (size < 12) throw std::runtime_error("SoundFont is too small");
@@ -700,7 +707,7 @@ PreparedSoundFont loadSoundFont(const std::filesystem::path& path) {
 }
 
 PreparedSoundFont loadSoundFont(const std::string& path) {
-    return loadSoundFont(std::filesystem::path(path));
+    return loadSoundFont(Path(path));
 }
 
 } // namespace svms::canonical
