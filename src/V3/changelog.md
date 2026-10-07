@@ -10,6 +10,10 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 refactor(v3): move the driver reverb into SVMSReverb.h
+  First cut of the monolith split. `ReverbState` was 1,460 self-contained lines
+  in the middle of SVMSDriver.cpp; it moved verbatim. The DLL export tables
+  and test output are identical before and after.
 - 2026-10-07 perf(v3): trim whole-voice plan loop (O(1) release-op drop, slim ghost copy, same-frame note batching)
   The serial plan is 93-100% of block time at multi-M NPS. I made the
   deferred-release op drop O(1) (per-handle index), copy only the fields
