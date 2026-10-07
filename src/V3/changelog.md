@@ -10,6 +10,11 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 ci(v3): save the Linux ccache even when the job fails; retry apt
+  actions/cache only saves on success, so a red Linux job never warmed its
+  cache. Restore and save are separate steps now (save runs always), the
+  container makes its root-owned cache readable from an exit trap, and apt
+  retries downloads (the last run died on an archive.ubuntu.com timeout).
 - 2026-10-07 fix(v3): restore the Linux build (POSIX worker pool, GCC 7 filesystem)
   The POSIX worker pool had drifted from the Windows one: old indexed-job
   signature, no bus planes, kernel refusals silently dropped, and span jobs

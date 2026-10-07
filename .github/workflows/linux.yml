@@ -22,10 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ccache directory lives in the workspace so the container can use it;
-      # every run saves a new entry and restores the newest previous one.
+      # ccache directory lives in the workspace so the container can use it.
+      # Restore and save are separate steps so a failing build or test run
+      # still saves what it compiled (actions/cache saves only on success).
       - name: Restore ccache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: .ccache
           key: linux-bionic-ccache-${{ github.sha }}
@@ -42,8 +43,11 @@ jobs:
             -e CCACHE_MAXSIZE=500M \
             ubuntu:18.04 \
             bash -euxo pipefail -c '
-              apt-get update
-              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              # Root-owned cache files must stay readable for the host-side save,
+              # whether or not the build and tests pass.
+              trap "chmod -R a+rwX .ccache 2>/dev/null || true" EXIT
+              apt-get -o Acquire::Retries=5 update
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
                 build-essential ca-certificates ccache ninja-build libasound2-dev wget
               wget -q https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-linux-x86_64.tar.gz
               tar -xzf cmake-3.27.9-linux-x86_64.tar.gz -C /opt
@@ -55,7 +59,6 @@ jobs:
               ccache -z
               cmake --build build/V3-linux-bionic --parallel
               ccache -s
-              chmod -R a+rwX .ccache  # container runs as root; the host saves the cache
               ctest --test-dir build/V3-linux-bionic --output-on-failure
               build/V3-linux-bionic/bin/svmsd --help
               mkdir -p build/SVMS-V3-linux-x86_64
@@ -69,6 +72,13 @@ jobs:
               tar -C build -czf build/SVMS-V3-linux-x86_64-ubuntu18.04.tar.gz \
                 SVMS-V3-linux-x86_64
             '
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: .ccache
+          key: linux-bionic-ccache-${{ github.sha }}
 
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
