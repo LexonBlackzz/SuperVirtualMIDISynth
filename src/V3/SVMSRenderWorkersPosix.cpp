@@ -1,3 +1,9 @@
+// POSIX render worker pool. Job semantics mirror SVMSRenderWorkers.cpp (the
+// Windows pool) exactly: scalar fallback on a kernel refusal, per-job
+// retirement/class-change scratch merged after the jobs, per-channel bus
+// planes, fixed job-order reduction. Only the thread wake/wait primitives
+// differ (futex here). Keep the two files in step.
+
 #include "SVMSRenderWorkers.h"
 
 #include <algorithm>
@@ -28,13 +34,29 @@ constexpr uint32_t kLargePoolShortSpanVoices = 1024u;
 // Spans shorter than kMinimumParallelFrames need an even larger voice pool
 // before the wake/sync handshake pays off (chopped buzz workloads where
 // event-fragmented per-class spans are 1-7 frames).
-constexpr uint32_t kMinimumVoicesShortSpan = 2048u;
+constexpr uint32_t kMinimumVoicesShortSpan = 1024u;
 
 struct RenderJob {
-    RenderClassKernel kernel = nullptr;
-    const uint32_t* handles = nullptr;
-    uint32_t handleCount = 0u;
+    RenderClassKernel kernel;
+    RenderClassKernel fallback;
+    const uint32_t* handles;
+    uint32_t handleCount;
 };
+
+// Resolve the scalar sibling of a selected backend class kernel once on the
+// coordinator thread, so workers can honor a backend refusal.
+RenderClassKernel ResolveScalarFallback(RenderClassKernel kernel) noexcept {
+    if (!kernel) return nullptr;
+    const RenderKernelSet& scalar = GetScalarRenderKernelSet();
+    const RenderKernelSet* sets[] = {&scalar, &GetSSE2RenderKernelSet(),
+                                     &GetAVX2RenderKernelSet()};
+    for (const RenderKernelSet* set : sets) {
+        for (uint32_t i = 0u; i < kVoiceRenderClassCount; ++i) {
+            if (set->kernels[i] == kernel) return scalar.kernels[i];
+        }
+    }
+    return nullptr;
+}
 
 int FutexWait(std::atomic<uint32_t>& value, uint32_t expected) noexcept {
     return static_cast<int>(syscall(SYS_futex,
@@ -59,6 +81,19 @@ struct RenderWorkerPool::Impl {
     Worker* workers = nullptr;
     RenderJob* jobs = nullptr;
     float* mixStorage = nullptr;
+    // Bus-mode (per-MIDI-channel limiter) job planes, grown lazily on the
+    // coordinator thread. Layout: [job][channel][L,R][mixStride].
+    float* busStorage = nullptr;
+    float** jobBusLeftPtrs = nullptr;
+    float** jobBusRightPtrs = nullptr;
+    uint32_t busJobCapacity = 0u;
+    size_t jobBusStride = 0u;
+    bool busMode = false;
+    // Per-job span lifecycle scratch, merged by Execute().
+    SpanRetirement* jobRetirements = nullptr;
+    uint32_t* jobClassChanges = nullptr;
+    uint32_t* jobRetireCounts = nullptr;
+    uint32_t* jobClassChangeCounts = nullptr;
     std::atomic<bool> stopping{false};
     alignas(64) std::atomic<uint32_t> workGeneration{0u};
     alignas(64) std::atomic<uint32_t> readyWorkers{0u};
@@ -85,9 +120,68 @@ struct RenderWorkerPool::Impl {
         return mixStorage + static_cast<size_t>(job) * jobMixStride;
     }
     float* JobRight(uint32_t job) noexcept { return JobLeft(job) + mixStride; }
+    float* const* JobBusLeft(uint32_t job) noexcept {
+        return jobBusLeftPtrs + static_cast<size_t>(job) * kChannelCount;
+    }
+    float* const* JobBusRight(uint32_t job) noexcept {
+        return jobBusRightPtrs + static_cast<size_t>(job) * kChannelCount;
+    }
+
+    bool EnsureBusStorage(uint32_t neededJobs) noexcept {
+        if (neededJobs <= busJobCapacity) return true;
+        const uint32_t newCapacity =
+            (std::max)(neededJobs, static_cast<uint32_t>(16u));
+        const size_t floatsPerJob = static_cast<size_t>(kChannelCount) *
+            2u * mixStride;
+        if (floatsPerJob > (std::numeric_limits<size_t>::max)() /
+                               sizeof(float) / newCapacity) {
+            return false;
+        }
+        float* newPlanes = static_cast<float*>(_aligned_malloc(
+            floatsPerJob * newCapacity * sizeof(float), 64u));
+        float** newLeft = static_cast<float**>(_aligned_malloc(
+            static_cast<size_t>(newCapacity) * kChannelCount * sizeof(float*), 64u));
+        float** newRight = static_cast<float**>(_aligned_malloc(
+            static_cast<size_t>(newCapacity) * kChannelCount * sizeof(float*), 64u));
+        if (!newPlanes || !newLeft || !newRight) {
+            _aligned_free(newPlanes);
+            _aligned_free(newLeft);
+            _aligned_free(newRight);
+            return false;
+        }
+        for (uint32_t job = 0u; job < newCapacity; ++job) {
+            for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+                float* plane = newPlanes +
+                    (static_cast<size_t>(job) * kChannelCount + channel) *
+                        2u * mixStride;
+                newLeft[job * kChannelCount + channel] = plane;
+                newRight[job * kChannelCount + channel] = plane + mixStride;
+            }
+        }
+        _aligned_free(busStorage);
+        _aligned_free(jobBusLeftPtrs);
+        _aligned_free(jobBusRightPtrs);
+        busStorage = newPlanes;
+        jobBusLeftPtrs = newLeft;
+        jobBusRightPtrs = newRight;
+        busJobCapacity = newCapacity;
+        jobBusStride = floatsPerJob;
+        return true;
+    }
+
+    void ZeroJobBuses(uint32_t job, uint32_t frames) noexcept {
+        const size_t bytes = static_cast<size_t>(frames) * sizeof(float);
+        float* const* left = JobBusLeft(job);
+        float* const* right = JobBusRight(job);
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            std::memset(left[channel], 0, bytes);
+            std::memset(right[channel], 0, bytes);
+        }
+    }
 
     uint32_t ProcessJobs() noexcept {
         uint32_t claimed = 0u;
+        const bool jobsBusMode = busMode;
         for (;;) {
             const uint32_t index = nextJob.fetch_add(1u,
                 std::memory_order_relaxed);
@@ -99,18 +193,38 @@ struct RenderWorkerPool::Impl {
                                      sizeof(float));
             std::memset(right, 0, static_cast<size_t>(context.frameCount) *
                                       sizeof(float));
+            IndexedJobMix mix{left, right, nullptr, nullptr};
+            if (jobsBusMode) {
+                ZeroJobBuses(index, context.frameCount);
+                mix.busLeft = JobBusLeft(index);
+                mix.busRight = JobBusRight(index);
+            }
             RenderSpanContext local = context;
             local.outputLeft = left;
             local.outputRight = right;
+            if (jobsBusMode) {
+                local.channelBusLeft = mix.busLeft;
+                local.channelBusRight = mix.busRight;
+            }
             local.frameStart = 0u;
-            local.classChangeHandles = nullptr;
-            local.classChangeCount = nullptr;
+            local.retirements = jobRetirements +
+                static_cast<size_t>(index) * kHandlesPerJob;
+            local.retirementCount = &jobRetireCounts[index];
+            *local.retirementCount = 0u;
+            local.classChangeHandles = jobClassChanges +
+                static_cast<size_t>(index) * kHandlesPerJob;
+            local.classChangeCount = &jobClassChangeCounts[index];
+            *local.classChangeCount = 0u;
             if (indexedCallback) {
-                indexedCallback(index, left, right, context.frameCount,
+                indexedCallback(index, mix, context.frameCount,
                                 indexedUserData);
             } else {
                 const RenderJob& job = jobs[index];
-                job.kernel(local, job.handles, job.handleCount);
+                // False means "no mutation; use the scalar fallback".
+                const bool consumed =
+                    job.kernel(local, job.handles, job.handleCount);
+                if (!consumed && job.fallback != job.kernel)
+                    (void)job.fallback(local, job.handles, job.handleCount);
             }
         }
         return claimed;
@@ -151,11 +265,44 @@ struct RenderWorkerPool::Impl {
     }
 
     void WaitForHelpers() noexcept {
-        while (completedWorkers.load(std::memory_order_acquire) <
-               activeHelpers) {
-            const uint32_t completed = completedWorkers.load(
-                std::memory_order_relaxed);
+        for (;;) {
+            const uint32_t completed =
+                completedWorkers.load(std::memory_order_acquire);
+            if (completed >= activeHelpers) break;
+            // Shutdown can race an in-flight span: woken helpers then never
+            // finish, so waiting for them would hang forever.
+            if (stopping.load(std::memory_order_acquire)) break;
             FutexWait(completedWorkers, completed);
+        }
+    }
+
+    // Sums job mixes (or per-channel bus planes) in fixed job order.
+    void MergeMixes(uint32_t frameStart) noexcept {
+        const uint32_t frames = context.frameCount;
+        if (busMode) {
+            for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+                float* destLeft = context.channelBusLeft[channel] + frameStart;
+                float* destRight = context.channelBusRight[channel] + frameStart;
+                for (uint32_t job = 0u; job < jobCount; ++job) {
+                    const float* srcLeft = JobBusLeft(job)[channel];
+                    const float* srcRight = JobBusRight(job)[channel];
+                    for (uint32_t frame = 0u; frame < frames; ++frame) {
+                        destLeft[frame] += srcLeft[frame];
+                        destRight[frame] += srcRight[frame];
+                    }
+                }
+            }
+            return;
+        }
+        float* destLeft = context.outputLeft + frameStart;
+        float* destRight = context.outputRight + frameStart;
+        for (uint32_t job = 0u; job < jobCount; ++job) {
+            const float* left = JobLeft(job);
+            const float* right = JobRight(job);
+            for (uint32_t frame = 0u; frame < frames; ++frame) {
+                destLeft[frame] += left[frame];
+                destRight[frame] += right[frame];
+            }
         }
     }
 
@@ -163,15 +310,32 @@ struct RenderWorkerPool::Impl {
         stopping.store(true, std::memory_order_release);
         workGeneration.fetch_add(1u, std::memory_order_release);
         FutexWakeAll(workGeneration);
-        for (uint32_t i = 0u; i < helperCount; ++i) {
+        for (uint32_t i = 0u; workers && i < helperCount; ++i) {
             if (workers[i].thread.joinable()) workers[i].thread.join();
         }
         _aligned_free(mixStorage);
         _aligned_free(jobs);
+        _aligned_free(jobRetirements);
+        _aligned_free(jobClassChanges);
+        _aligned_free(jobRetireCounts);
+        _aligned_free(jobClassChangeCounts);
+        _aligned_free(busStorage);
+        _aligned_free(jobBusLeftPtrs);
+        _aligned_free(jobBusRightPtrs);
         delete[] workers;
         workers = nullptr;
         jobs = nullptr;
         mixStorage = nullptr;
+        jobRetirements = nullptr;
+        jobClassChanges = nullptr;
+        jobRetireCounts = nullptr;
+        jobClassChangeCounts = nullptr;
+        busStorage = nullptr;
+        jobBusLeftPtrs = nullptr;
+        jobBusRightPtrs = nullptr;
+        busJobCapacity = 0u;
+        jobBusStride = 0u;
+        busMode = false;
         totalThreads = 1u;
         helperCount = 0u;
         indexedInFlight = false;
@@ -210,7 +374,19 @@ bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
         static_cast<size_t>(impl->jobCapacity) * sizeof(RenderJob), 64u));
     impl->mixStorage = static_cast<float*>(_aligned_malloc(
         mixFloats * sizeof(float), 64u));
-    if (!impl->workers || !impl->jobs || !impl->mixStorage) {
+    const size_t scratchEntries =
+        static_cast<size_t>(impl->jobCapacity) * kHandlesPerJob;
+    impl->jobRetirements = static_cast<SpanRetirement*>(_aligned_malloc(
+        scratchEntries * sizeof(SpanRetirement), 64u));
+    impl->jobClassChanges = static_cast<uint32_t*>(_aligned_malloc(
+        scratchEntries * sizeof(uint32_t), 64u));
+    impl->jobRetireCounts = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(impl->jobCapacity) * sizeof(uint32_t), 64u));
+    impl->jobClassChangeCounts = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(impl->jobCapacity) * sizeof(uint32_t), 64u));
+    if (!impl->workers || !impl->jobs || !impl->mixStorage ||
+        !impl->jobRetirements || !impl->jobClassChanges ||
+        !impl->jobRetireCounts || !impl->jobClassChangeCounts) {
         impl->ResetStorage();
         delete impl;
         return false;
@@ -269,7 +445,11 @@ size_t RenderWorkerPool::GetAllocatedBytes() const noexcept {
         static_cast<size_t>(impl_->helperCount) * sizeof(Impl::Worker) +
         static_cast<size_t>(impl_->jobCapacity) * sizeof(RenderJob) +
         static_cast<size_t>(impl_->jobCapacity) * impl_->jobMixStride *
-            sizeof(float);
+            sizeof(float) +
+        static_cast<size_t>(impl_->busJobCapacity) * impl_->jobBusStride *
+            sizeof(float) +
+        2u * static_cast<size_t>(impl_->busJobCapacity) * kChannelCount *
+            sizeof(float*);
 }
 
 size_t RenderWorkerPool::EstimateAllocatedBytes(
@@ -332,6 +512,7 @@ void RenderWorkerPool::BeginSpan(const RenderSpanContext& context) noexcept {
     impl_->indexedCallback = nullptr;
     impl_->indexedUserData = nullptr;
     impl_->jobCount = 0u;
+    impl_->busMode = context.channelBusLeft != nullptr;
     impl_->queueValid = context.frameCount <= impl_->maxFrames;
 }
 
@@ -339,15 +520,26 @@ bool RenderWorkerPool::AddClassRange(RenderClassKernel kernel,
                                      const uint32_t* handles,
                                      uint32_t handleCount) noexcept {
     if (!impl_ || !impl_->queueValid || !kernel || !handles) return false;
+    const RenderClassKernel fallback = ResolveScalarFallback(kernel);
+    if (!fallback) {
+        // An unknown kernel has no defined fallback for a refusal: keep the
+        // class on the caller's serial path.
+        impl_->queueValid = false;
+        return false;
+    }
     for (uint32_t offset = 0u; offset < handleCount;
          offset += kHandlesPerJob) {
-        if (impl_->jobCount >= impl_->jobCapacity) {
+        // Bus mode caps fan-out: per-job channel planes are ~16x a legacy
+        // job mix, so beyond this the fan-out cannot pay for its scratch.
+        if ((impl_->busMode && impl_->jobCount >= 16u) ||
+            impl_->jobCount >= impl_->jobCapacity) {
             impl_->queueValid = false;
             return false;
         }
         const uint32_t count = (std::min)(kHandlesPerJob,
                                            handleCount - offset);
-        impl_->jobs[impl_->jobCount++] = {kernel, handles + offset, count};
+        impl_->jobs[impl_->jobCount++] = {kernel, fallback, handles + offset,
+                                          count};
     }
     return true;
 }
@@ -355,21 +547,46 @@ bool RenderWorkerPool::AddClassRange(RenderClassKernel kernel,
 bool RenderWorkerPool::Execute() noexcept {
     Impl* impl = impl_;
     if (!impl || !impl->queueValid || impl->jobCount < 2u) return false;
+    if (impl->busMode && !impl->EnsureBusStorage(impl->jobCount)) {
+        impl->queueValid = false;
+        return false;
+    }
     impl->dispatchThreads = (std::min)(impl->totalThreads, impl->jobCount);
     impl->StartWork(impl->dispatchThreads - 1u);
     const uint32_t claimed = impl->ProcessJobs();
     impl->coordinatorJobs.fetch_add(claimed, std::memory_order_relaxed);
     impl->WaitForHelpers();
-    const uint32_t frames = impl->context.frameCount;
-    float* destinationLeft = impl->context.outputLeft + impl->context.frameStart;
-    float* destinationRight = impl->context.outputRight + impl->context.frameStart;
-    for (uint32_t job = 0u; job < impl->jobCount; ++job) {
-        const float* left = impl->JobLeft(job);
-        const float* right = impl->JobRight(job);
-        for (uint32_t frame = 0u; frame < frames; ++frame) {
-            destinationLeft[frame] += left[frame];
-            destinationRight[frame] += right[frame];
+    impl->MergeMixes(impl->context.frameStart);
+    // Merge per-job lifecycle records. Retirement order is restored by the
+    // caller's (frameOffset, capturePosition) sort; class-change refresh is
+    // order-independent.
+    if (impl->context.retirements != nullptr &&
+        impl->context.retirementCount != nullptr) {
+        const uint32_t written = *impl->context.retirementCount;
+        SpanRetirement* const base = impl->context.retirements + written;
+        uint32_t total = 0u;
+        for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+            const uint32_t count = impl->jobRetireCounts[job];
+            std::memcpy(base + total, impl->jobRetirements +
+                static_cast<size_t>(job) * kHandlesPerJob,
+                static_cast<size_t>(count) * sizeof(SpanRetirement));
+            total += count;
         }
+        *impl->context.retirementCount = written + total;
+    }
+    if (impl->context.classChangeHandles != nullptr &&
+        impl->context.classChangeCount != nullptr) {
+        const uint32_t written = *impl->context.classChangeCount;
+        uint32_t* const base = impl->context.classChangeHandles + written;
+        uint32_t total = 0u;
+        for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+            const uint32_t count = impl->jobClassChangeCounts[job];
+            std::memcpy(base + total, impl->jobClassChanges +
+                static_cast<size_t>(job) * kHandlesPerJob,
+                static_cast<size_t>(count) * sizeof(uint32_t));
+            total += count;
+        }
+        *impl->context.classChangeCount = written + total;
     }
     return true;
 }
@@ -377,15 +594,20 @@ bool RenderWorkerPool::Execute() noexcept {
 bool RenderWorkerPool::ExecuteIndexed(uint32_t jobs, uint32_t frames,
                                       float* left, float* right,
                                       IndexedRenderJob callback,
-                                      void* userData) noexcept {
-    return BeginIndexed(jobs, frames, left, right, callback, userData) &&
+                                      void* userData,
+                                      float* const* channelBusLeft,
+                                      float* const* channelBusRight) noexcept {
+    return BeginIndexed(jobs, frames, left, right, callback, userData,
+                        channelBusLeft, channelBusRight) &&
            FinishIndexed();
 }
 
 bool RenderWorkerPool::BeginIndexed(uint32_t jobs, uint32_t frames,
                                     float* left, float* right,
                                     IndexedRenderJob callback,
-                                    void* userData) noexcept {
+                                    void* userData,
+                                    float* const* channelBusLeft,
+                                    float* const* channelBusRight) noexcept {
     Impl* impl = impl_;
     if (!impl || !callback || !left || !right || jobs < 2u ||
         jobs > impl->jobCapacity || frames == 0u ||
@@ -394,9 +616,14 @@ bool RenderWorkerPool::BeginIndexed(uint32_t jobs, uint32_t frames,
     impl->context.outputLeft = left;
     impl->context.outputRight = right;
     impl->context.frameCount = frames;
+    impl->context.channelBusLeft = channelBusLeft;
+    impl->context.channelBusRight = channelBusRight;
     impl->indexedCallback = callback;
     impl->indexedUserData = userData;
     impl->jobCount = jobs;
+    impl->busMode = channelBusLeft != nullptr;
+    if (impl->busMode && !impl->EnsureBusStorage(jobs)) return false;
+    impl->queueValid = true;
     impl->dispatchThreads = (std::min)(impl->totalThreads, jobs);
     impl->indexedInFlight = true;
     impl->StartWork(impl->dispatchThreads - 1u);
@@ -409,15 +636,7 @@ bool RenderWorkerPool::FinishIndexed() noexcept {
     const uint32_t claimed = impl->ProcessJobs();
     impl->coordinatorJobs.fetch_add(claimed, std::memory_order_relaxed);
     impl->WaitForHelpers();
-    const uint32_t frames = impl->context.frameCount;
-    for (uint32_t job = 0u; job < impl->jobCount; ++job) {
-        const float* left = impl->JobLeft(job);
-        const float* right = impl->JobRight(job);
-        for (uint32_t frame = 0u; frame < frames; ++frame) {
-            impl->context.outputLeft[frame] += left[frame];
-            impl->context.outputRight[frame] += right[frame];
-        }
-    }
+    impl->MergeMixes(0u);
     impl->indexedCallback = nullptr;
     impl->indexedUserData = nullptr;
     impl->indexedInFlight = false;

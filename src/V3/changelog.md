@@ -10,6 +10,12 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 fix(v3): restore the Linux build (POSIX worker pool, GCC 7 filesystem)
+  The POSIX worker pool had drifted from the Windows one: old indexed-job
+  signature, no bus planes, kernel refusals silently dropped, and span jobs
+  writing retirements into one shared array from every thread. It now mirrors
+  the Windows job semantics line for line (futex sync kept). SVMSSoundFont.cpp
+  falls back to the Filesystem TS on GCC 7 (Ubuntu 18.04 has no <filesystem>).
 - 2026-10-07 fix(v3): make per-voice phase rotation exactly analytic
   Two things kept rotation from being a pure phase shift. The allpass
   "quadrature splitter" (still used by Random) was never in quadrature: its

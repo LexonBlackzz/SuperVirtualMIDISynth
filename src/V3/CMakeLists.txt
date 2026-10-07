@@ -154,6 +154,12 @@ endif()
 if(NOT WIN32)
     find_package(Threads REQUIRED)
     find_package(ALSA REQUIRED)
+    # GCC < 9 keeps std::(experimental::)filesystem in a separate library;
+    # SVMSSoundFont.cpp falls back to the Filesystem TS on GCC 7.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+       CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+        link_libraries(stdc++fs)
+    endif()
 
     set(SVMS_PORTABLE_RENDER_SOURCES
         SVMSSoundFont.cpp

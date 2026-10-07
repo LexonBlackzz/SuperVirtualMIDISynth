@@ -9,7 +9,17 @@
 #include <algorithm>
 #include <cctype>
 #include <cwctype>
+#if __has_include(<filesystem>)
 #include <filesystem>
+namespace svms_fs = std::filesystem;
+#define SVMS_FILESYSTEM_TS 0
+#else
+// GCC 7 (the Ubuntu 18.04 Linux build floor) ships only the Filesystem TS,
+// which lacks lexically_normal() and the error_code absolute().
+#include <experimental/filesystem>
+namespace svms_fs = std::experimental::filesystem;
+#define SVMS_FILESYSTEM_TS 1
+#endif
 #include <fstream>
 #include <limits>
 #include <unordered_map>
@@ -297,7 +307,38 @@ bool sf2_load(const wchar_t* path, SF2Data* outData) {
 
 namespace {
 
-namespace fs = std::filesystem;
+namespace fs = svms_fs;
+
+fs::path LexicallyNormal(const fs::path& path) {
+#if SVMS_FILESYSTEM_TS
+    fs::path normal;
+    for (const fs::path& part : path) {
+        if (part == ".") continue;
+        if (part == ".." && !normal.empty() && normal.filename() != "..") {
+            normal = normal.parent_path();
+            continue;
+        }
+        normal /= part;
+    }
+    return normal;
+#else
+    return path.lexically_normal();
+#endif
+}
+
+fs::path AbsolutePath(const fs::path& path, std::error_code& error) {
+#if SVMS_FILESYSTEM_TS
+    error.clear();
+    try {
+        return fs::absolute(path);
+    } catch (...) {
+        error = std::make_error_code(std::errc::invalid_argument);
+        return path;
+    }
+#else
+    return fs::absolute(path, error);
+#endif
+}
 
 struct SfzZone {
     std::string sample;
@@ -715,7 +756,7 @@ struct SfzCachedSample {
 };
 
 static std::wstring SampleCacheKey(const fs::path& path) {
-    std::wstring key = path.lexically_normal().wstring();
+    std::wstring key = LexicallyNormal(path).wstring();
 #if defined(_WIN32)
     std::transform(key.begin(), key.end(), key.begin(),
         [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
@@ -735,9 +776,9 @@ static fs::path Utf8Path(const std::string& text) {
 
 static std::wstring SfzIncludePathKey(const fs::path& path) {
     std::error_code error;
-    fs::path absolute = fs::absolute(path, error);
+    fs::path absolute = AbsolutePath(path, error);
     if (error) absolute = path;
-    std::wstring key = absolute.lexically_normal().wstring();
+    std::wstring key = LexicallyNormal(absolute).wstring();
 #if defined(_WIN32)
     std::transform(key.begin(), key.end(), key.begin(),
         [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
@@ -888,7 +929,7 @@ static bool ExpandSfzIncludes(
             fs::path child = Utf8Path(includePath);
             if (child.is_relative())
                 child = path.parent_path() / child;
-            child = child.lexically_normal();
+            child = LexicallyNormal(child);
 
             // Includes are textual. Do not de-duplicate them: SFZs such as
             // CFaz deliberately include the same region map once per group.
@@ -1003,7 +1044,7 @@ static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
             if (samplePath.is_relative())
                 samplePath = sfzPath.parent_path() / Utf8Path(defaultText) /
                              samplePath;
-            samplePath = samplePath.lexically_normal();
+            samplePath = LexicallyNormal(samplePath);
             const std::wstring key = SampleCacheKey(samplePath);
             SfzCachedSample cached{};
             const auto found = cache.find(key);
