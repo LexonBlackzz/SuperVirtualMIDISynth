@@ -22,6 +22,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ccache directory lives in the workspace so the container can use it;
+      # every run saves a new entry and restores the newest previous one.
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: linux-bionic-ccache-${{ github.sha }}
+          restore-keys: linux-bionic-ccache-
+
       # Build inside Bionic so the artifact keeps its older glibc/libstdc++
       # floor. The Actions JavaScript runtime remains on the modern host.
       - name: Build and test in Ubuntu 18.04
@@ -29,17 +38,24 @@ jobs:
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/work" \
             -w /work \
+            -e CCACHE_DIR=/work/.ccache \
+            -e CCACHE_MAXSIZE=500M \
             ubuntu:18.04 \
             bash -euxo pipefail -c '
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                build-essential ca-certificates ninja-build libasound2-dev wget
+                build-essential ca-certificates ccache ninja-build libasound2-dev wget
               wget -q https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-linux-x86_64.tar.gz
               tar -xzf cmake-3.27.9-linux-x86_64.tar.gz -C /opt
               export PATH=/opt/cmake-3.27.9-linux-x86_64/bin:$PATH
               cmake -S src/V3 -B build/V3-linux-bionic -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release -DSVMS_BUILD_TESTS=ON
+                -DCMAKE_BUILD_TYPE=Release -DSVMS_BUILD_TESTS=ON \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+              ccache -z
               cmake --build build/V3-linux-bionic --parallel
+              ccache -s
+              chmod -R a+rwX .ccache  # container runs as root; the host saves the cache
               ctest --test-dir build/V3-linux-bionic --output-on-failure
               build/V3-linux-bionic/bin/svmsd --help
               mkdir -p build/SVMS-V3-linux-x86_64

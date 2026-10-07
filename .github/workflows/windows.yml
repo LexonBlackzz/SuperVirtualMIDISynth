@@ -27,8 +27,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Compiler cache backed by the GitHub Actions cache. With a launcher set,
+      # CMake switches Release to /Z7 and drops the driver PCH (both needed for
+      # sccache hits; see src/V3/CMakeLists.txt). Hit rate is in the job summary.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Build V3 x64 Release
         shell: cmd
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: call build_v3.bat
 
       - name: Run tests

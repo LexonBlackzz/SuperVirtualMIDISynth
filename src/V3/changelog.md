@@ -10,6 +10,11 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-07 ci(v3): warm compiler caches for the Windows and Linux builds
+  Windows CI runs build_v3.bat under sccache (GitHub Actions cache backend);
+  CMake sees the launcher and switches to /Z7 + no driver PCH so every object
+  is cacheable. The Linux (Ubuntu 18.04 container) job uses ccache with its
+  directory saved by actions/cache. The first run fills the caches.
 - 2026-10-07 build(v3): precompile SVMSDriverInternal.h for the driver sources
   The 10 driver translation units each re-parsed the big engine headers
   (~1.2 s apiece). A PCH (SVMS_DRIVER_PCH, driver files only; kernels/ASIO/etc.
