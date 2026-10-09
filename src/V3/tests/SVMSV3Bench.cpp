@@ -1266,6 +1266,18 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(renderer->GetWvPlanCycles()),
         static_cast<unsigned long long>(renderer->GetWvJobCycles()),
         static_cast<unsigned long long>(renderer->GetWvPostCycles()));
+    // Whole-voice per-voice segments (op/release splits): how many took a
+    // class kernel vs the scalar fallback. seg_cycles needs a build with
+    // SVMS_WV_SEGMENT_PROFILE (0 otherwise).
+    std::fprintf(stderr, "{\"wv_segments\":{\"calls\":%llu,\"kernel\":%llu,"
+        "\"fallback\":%llu,\"kernel_frames\":%llu,\"fallback_frames\":%llu,"
+        "\"cycles\":%llu}}\n",
+        static_cast<unsigned long long>(renderer->GetWvSegCalls()),
+        static_cast<unsigned long long>(renderer->GetWvSegKernelOk()),
+        static_cast<unsigned long long>(renderer->GetWvSegFallback()),
+        static_cast<unsigned long long>(renderer->GetWvSegKernelFrames()),
+        static_cast<unsigned long long>(renderer->GetWvSegFallbackFrames()),
+        static_cast<unsigned long long>(renderer->GetWvSegCycles()));
 
     int result = 0;
     if (options.enforce && options.voices == 2000u &&

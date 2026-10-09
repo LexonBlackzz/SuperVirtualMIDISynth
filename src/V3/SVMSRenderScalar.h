@@ -212,12 +212,47 @@ inline bool ShouldLoopSVMS(uint8_t loopMode, uint32_t loopStart, uint32_t loopEn
     return loopEnd > loopStart + 1u;
 }
 
+// Counters bumped from every render worker. A single shared word per
+// counter turned each bump into a cross-core cache-line transfer: under a
+// pitch-bend riser (every bend splits each voice of its channel into a new
+// whole-voice segment) that cost ~2000 cycles per segment and was most of
+// the render time (32k voices, 150k bends/s: 1470% -> 122% of budget once
+// removed). Each thread now bumps its own cache-line shard; readers sum.
+template <uint32_t N>
+struct ShardedCounters {
+    static constexpr uint32_t kShards = 64u;
+    struct alignas(64) Shard {
+        std::atomic<uint64_t> value[N];
+    };
+    Shard shards[kShards] = {};
+
+    // Thread stacks sit megabytes apart, so a stack address picks a stable
+    // per-thread shard with no TLS (unsafe in XP-loaded DLLs) or OS call.
+    // Two threads sharing a shard stay correct, only slower.
+    static uint32_t ShardIndex() noexcept {
+        volatile int probe = 0;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(&probe);
+        return static_cast<uint32_t>((address >> 20) ^ (address >> 26)) &
+               (kShards - 1u);
+    }
+    Shard& Mine() noexcept { return shards[ShardIndex()]; }
+    static void Add(Shard& shard, uint32_t counter, uint64_t amount) noexcept {
+        shard.value[counter].fetch_add(amount, std::memory_order_relaxed);
+    }
+    uint64_t Sum(uint32_t counter) const noexcept {
+        uint64_t total = 0u;
+        for (const Shard& shard : shards)
+            total += shard.value[counter].load(std::memory_order_relaxed);
+        return total;
+    }
+};
+
 // Fallback-span telemetry: RenderPrimaryVoiceSpan is the scalar per-voice
 // renderer used wherever a vector class kernel refuses (short segments,
 // stage/loop guards). Worker threads increment these; the census reports
 // deltas so the scalar share can be quantified before optimizing it.
-inline std::atomic<uint64_t> g_primarySpanCalls{0};
-inline std::atomic<uint64_t> g_primarySpanFrames{0};
+// Counters: 0 = calls, 1 = frames.
+inline ShardedCounters<2> g_primarySpans;
 
 constexpr uint32_t kDenseRenderChunkFrames = 128u;
 constexpr uint32_t kDenseRenderHandlesPerTile = 256u;
@@ -764,6 +799,9 @@ private:
     VoiceManager* wvPlanVoices_ = nullptr;
     uint32_t* wvSliceHandles_ = nullptr;
     SpanRetirement* wvJobRetirements_ = nullptr;
+    // Per-job retirement counts, one cache line apart: kernels bump them on
+    // every retirement from all workers at once.
+    static constexpr uint32_t kWvRetireCountStride = 16u;
     uint32_t* wvJobRetireCounts_ = nullptr;
     uint32_t wvJobCapacity_ = 0u;
     uint32_t wvJobScratchCapacity_ = 0u;     // scratch stride wvJobRetirements_ was sized for
@@ -831,12 +869,25 @@ public:
     // Segment-path diagnostics: calls into RenderWholeVoiceSegment, cycles
     // inside it, how many took the batch-kernel fast path vs the scalar
     // RenderPrimaryVoiceSpan fallback, and frames rendered per path.
-    uint64_t wvSegCalls_ = 0u;
-    uint64_t wvSegCycles_ = 0u;
-    uint64_t wvSegKernelOk_ = 0u;
-    uint64_t wvSegFallback_ = 0u;
-    uint64_t wvSegKernelFrames_ = 0u;
-    uint64_t wvSegFallbackFrames_ = 0u;
+    // Whole-voice segment stats. Bumped per segment by the job that owns
+    // them: one cache line per job, no atomics (a shared counter cost
+    // ~2000 cycles per segment under bend risers, see ShardedCounters).
+    // Read on the audio thread after the jobs finish.
+    enum WvSegCounter : uint32_t {
+        kWvSegCalls, kWvSegCycles, kWvSegKernelOk, kWvSegFallback,
+        kWvSegKernelFrames, kWvSegFallbackFrames, kWvSegCounterCount
+    };
+    struct alignas(64) WvJobSegStats {
+        uint64_t value[kWvSegCounterCount];
+    };
+    WvJobSegStats* wvJobSeg_ = nullptr;  // wvJobCapacity_ entries
+    uint64_t wvSegRetired_[kWvSegCounterCount] = {};  // from freed arrays
+    uint64_t WvSegSum(WvSegCounter counter) const {
+        uint64_t total = wvSegRetired_[counter];
+        for (uint32_t job = 0u; wvJobSeg_ && job < wvJobCapacity_; ++job)
+            total += wvJobSeg_[job].value[counter];
+        return total;
+    }
     uint64_t GetWvPlanCycles() const { return wvPlanCycles_; }
     // Whole-voice job stages that ran on the worker pool vs serially on the
     // audio thread (pool refused or single job).
@@ -844,15 +895,19 @@ public:
     uint64_t GetWvSerialJobs() const { return wvSerialJobs_; }
     uint64_t GetWvJobCycles() const { return wvJobCycles_; }
     uint64_t GetWvPostCycles() const { return wvPostCycles_; }
-    uint64_t GetWvSegCalls() const { return wvSegCalls_; }
-    uint64_t GetWvSegCycles() const { return wvSegCycles_; }
-    uint64_t GetWvSegKernelOk() const { return wvSegKernelOk_; }
-    uint64_t GetWvSegFallback() const { return wvSegFallback_; }
-    uint64_t GetWvSegKernelFrames() const { return wvSegKernelFrames_; }
-    uint64_t GetWvSegFallbackFrames() const { return wvSegFallbackFrames_; }
+    uint64_t GetWvSegCalls() const { return WvSegSum(kWvSegCalls); }
+    uint64_t GetWvSegCycles() const { return WvSegSum(kWvSegCycles); }
+    uint64_t GetWvSegKernelOk() const { return WvSegSum(kWvSegKernelOk); }
+    uint64_t GetWvSegFallback() const { return WvSegSum(kWvSegFallback); }
+    uint64_t GetWvSegKernelFrames() const {
+        return WvSegSum(kWvSegKernelFrames);
+    }
+    uint64_t GetWvSegFallbackFrames() const {
+        return WvSegSum(kWvSegFallbackFrames);
+    }
     static void GetPrimarySpanTotals(uint64_t& calls, uint64_t& frames) {
-        calls = g_primarySpanCalls.load(std::memory_order_relaxed);
-        frames = g_primarySpanFrames.load(std::memory_order_relaxed);
+        calls = g_primarySpans.Sum(0u);
+        frames = g_primarySpans.Sum(1u);
     }
     void GetLastPlanRefusal(uint8_t& type, uint8_t& data1) const {
         type = lastRefusalType_;
@@ -1032,6 +1087,7 @@ inline RenderScalar::~RenderScalar() {
     _aligned_free(wvChanOps_);
     _aligned_free(wvJobRetirements_);
     _aligned_free(wvJobRetireCounts_);
+    _aligned_free(wvJobSeg_);
     delete[] wvGhostTails_;
     delete[] wvTailScratch_;
 }
@@ -1642,8 +1698,11 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                                        uint32_t frameStart, uint32_t frameCount,
                                        uint32_t mixedFrameCount,
                                        bool exactSilentAdvance = false) {
-    g_primarySpanCalls.fetch_add(1, std::memory_order_relaxed);
-    g_primarySpanFrames.fetch_add(frameCount, std::memory_order_relaxed);
+    {
+        auto& shard = g_primarySpans.Mine();
+        g_primarySpans.Add(shard, 0u, 1u);
+        g_primarySpans.Add(shard, 1u, frameCount);
+    }
 
     if (v.state[idx] == static_cast<uint8_t>(VoiceState::Free) || frameCount == 0u)
         return UINT32_MAX;
@@ -4204,45 +4263,46 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
 #if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
     const uint64_t segBegin = __rdtsc();
 #endif
-    ++wvSegCalls_;
+    uint64_t* segStats = wvJobSeg_[jobIndex].value;
+    ++segStats[kWvSegCalls];
     SpanRetirement* retBuf = wvJobRetirements_ +
         static_cast<size_t>(jobIndex) * scratchCapacity_;
-    const uint32_t retCountBefore = wvJobRetireCounts_[jobIndex];
+    const uint32_t retCountBefore = wvJobRetireCounts_[jobIndex * kWvRetireCountStride];
     // Fresh class at the segment start: compared against the class after
     // rendering to detect a lifecycle transition INSIDE this segment.
     const VoiceRenderClass classBefore = ClassifyWholeVoiceRow(state, row);
     RenderClassKernel kernel = kernelSet_->kernels[
         static_cast<uint32_t>(classBefore)];
     if (segFrames >= 8u && kernel != nullptr && sampleData != nullptr) {
-        ++wvSegKernelOk_;
-        wvSegKernelFrames_ += segFrames;
+        ++segStats[kWvSegKernelOk];
+        segStats[kWvSegKernelFrames] += segFrames;
         RenderSpanContext context{
             &state, sampleData, nullptr, sampleDataFrames, outL, outR,
             segStart, segFrames, state.GetCapacity(),
             nullptr, nullptr,
             isReal ? voices->activePosition_ : nullptr,
             isReal ? retBuf : nullptr,
-            isReal ? &wvJobRetireCounts_[jobIndex] : nullptr, 0u,
+            isReal ? &wvJobRetireCounts_[jobIndex * kWvRetireCountStride] : nullptr, 0u,
             lfoDepth, lfoBendRatio, lfoActive ? 1u : 0u};
         if (kernel(context, &row, 1u)) {
             if (isReal) {
                 for (uint32_t i = retCountBefore;
-                     i < wvJobRetireCounts_[jobIndex]; ++i) {
+                     i < wvJobRetireCounts_[jobIndex * kWvRetireCountStride]; ++i) {
                     retBuf[i].frameOffset += segStart;
                 }
 #if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
-                wvSegCycles_ += __rdtsc() - segBegin;
+                segStats[kWvSegCycles] += __rdtsc() - segBegin;
 #endif
-                return wvJobRetireCounts_[jobIndex] > retCountBefore;
+                return wvJobRetireCounts_[jobIndex * kWvRetireCountStride] > retCountBefore;
             }
 #if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
-            wvSegCycles_ += __rdtsc() - segBegin;
+            segStats[kWvSegCycles] += __rdtsc() - segBegin;
 #endif
             return false;
         }
     }
-    ++wvSegFallback_;
-    wvSegFallbackFrames_ += segFrames;
+    ++segStats[kWvSegFallback];
+    segStats[kWvSegFallbackFrames] += segFrames;
     if (lfoActive) {
         // Scalar fallback segments still honor the LFO: one whole-segment
         // window (advance-then-use + ratio rebuild) keeps the row's LFO
@@ -4255,11 +4315,11 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
         segStart, segFrames, segFrames);
     if (retiredAt != UINT32_MAX) {
         if (isReal) {
-            retBuf[wvJobRetireCounts_[jobIndex]++] = {
+            retBuf[wvJobRetireCounts_[jobIndex * kWvRetireCountStride]++] = {
                 row, segStart + retiredAt, voices->activePosition_[row]};
         }
 #if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
-        wvSegCycles_ += __rdtsc() - segBegin;
+        segStats[kWvSegCycles] += __rdtsc() - segBegin;
 #endif
         return true;
     }
@@ -4284,7 +4344,7 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
             state.currentGain[row] * state.mixGainR[row];
     }
 #if defined(SVMS_WV_SEGMENT_PROFILE) && defined(_MSC_VER)
-    wvSegCycles_ += __rdtsc() - segBegin;
+    segStats[kWvSegCycles] += __rdtsc() - segBegin;
 #endif
     return false;
 }
@@ -4309,21 +4369,24 @@ inline bool RenderScalar::RenderWholeVoiceBatch(
     }
     SpanRetirement* retBuf = wvJobRetirements_ +
         static_cast<size_t>(jobIndex) * scratchCapacity_;
-    const uint32_t retCountBefore = wvJobRetireCounts_[jobIndex];
+    const uint32_t retCountBefore = wvJobRetireCounts_[jobIndex * kWvRetireCountStride];
     RenderSpanContext context{
         &state, sampleData, nullptr, sampleDataFrames,
         mix.outputLeft, mix.outputRight, segStart, segFrames,
         state.GetCapacity(), nullptr, nullptr, voices.activePosition_,
-        retBuf, &wvJobRetireCounts_[jobIndex], 0u,
+        retBuf, &wvJobRetireCounts_[jobIndex * kWvRetireCountStride], 0u,
         0.0f, 1.0f, 0u, mix.busLeft, mix.busRight};
     if (!kernel(context, handles, handleCount)) return false;
 
-    wvSegCalls_ += handleCount;
-    wvSegKernelOk_ += handleCount;
-    wvSegKernelFrames_ +=
-        static_cast<uint64_t>(segFrames) * handleCount;
+    {
+        uint64_t* stats = wvJobSeg_[jobIndex].value;
+        stats[kWvSegCalls] += handleCount;
+        stats[kWvSegKernelOk] += handleCount;
+        stats[kWvSegKernelFrames] +=
+            static_cast<uint64_t>(segFrames) * handleCount;
+    }
     for (uint32_t i = retCountBefore;
-         i < wvJobRetireCounts_[jobIndex]; ++i) {
+         i < wvJobRetireCounts_[jobIndex * kWvRetireCountStride]; ++i) {
         retBuf[i].frameOffset += segStart;
     }
     for (uint32_t i = 0u; i < handleCount; ++i) {
@@ -4419,7 +4482,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
     const uint32_t itemCount = ctx->voiceItemCount + ctx->ghostItemCount;
     const uint32_t begin = itemCount * jobIndex / ctx->jobCount;
     const uint32_t end = itemCount * (jobIndex + 1u) / ctx->jobCount;
-    renderer->wvJobRetireCounts_[jobIndex] = 0u;
+    renderer->wvJobRetireCounts_[jobIndex * kWvRetireCountStride] = 0u;
     for (uint32_t item = begin; item < end; ++item) {
         if (item < ctx->voiceItemCount) {
             const uint32_t handle = renderer->wvSliceHandles_[item];
@@ -4824,7 +4887,10 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     // (itemCount == 0) dispatch no thunk, so every count slot they will read
     // has to start at zero (thunks re-zero their own slot when they run).
     if (wvJobRetireCounts_ != nullptr && wvJobCapacity_ != 0u)
-        std::fill(wvJobRetireCounts_, wvJobRetireCounts_ + wvJobCapacity_, 0u);
+        std::fill(wvJobRetireCounts_,
+                  wvJobRetireCounts_ +
+                      static_cast<size_t>(wvJobCapacity_) * kWvRetireCountStride,
+                  0u);
     if (itemCount != 0u) {
         uint32_t jobCount = workerPool_
             ? (std::min)(workerPool_->GetThreadCount(), itemCount) : 1u;
@@ -4858,7 +4924,7 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     // the span renderer's deferred retirement.
     uint32_t retireTotal = 0u;
     for (uint32_t job = 0u; job < ctx.jobCount; ++job) {
-        const uint32_t count = wvJobRetireCounts_[job];
+        const uint32_t count = wvJobRetireCounts_[job * kWvRetireCountStride];
         std::memcpy(retirements_ + retireTotal,
                     wvJobRetirements_ + static_cast<size_t>(job) *
                         scratchCapacity_,
@@ -5073,19 +5139,26 @@ inline bool RenderScalar::EnsureWholeVoiceJobScratch(uint32_t jobCount) {
             sizeof(SpanRetirement),
         kMixBufferAlign));
     uint32_t* counts = static_cast<uint32_t*>(_aligned_malloc(
-        static_cast<size_t>(jobCount) * sizeof(uint32_t), kMixBufferAlign));
+        static_cast<size_t>(jobCount) * kWvRetireCountStride * sizeof(uint32_t),
+        kMixBufferAlign));
     VoiceSoA* tailScratch = new (std::nothrow) VoiceSoA[jobCount];
+    WvJobSegStats* segStats = static_cast<WvJobSegStats*>(_aligned_malloc(
+        static_cast<size_t>(jobCount) * sizeof(WvJobSegStats), 64u));
     if (retirements == nullptr || counts == nullptr ||
-        tailScratch == nullptr) {
+        tailScratch == nullptr || segStats == nullptr) {
         _aligned_free(retirements);
         _aligned_free(counts);
+        _aligned_free(segStats);
         delete[] tailScratch;
         return false;
     }
+    std::memset(segStats, 0, static_cast<size_t>(jobCount) *
+                                 sizeof(WvJobSegStats));
     for (uint32_t job = 0u; job < jobCount; ++job) {
         if (!tailScratch[job].Reserve(1u)) {
             _aligned_free(retirements);
             _aligned_free(counts);
+            _aligned_free(segStats);
             delete[] tailScratch;
             return false;
         }
@@ -5093,10 +5166,15 @@ inline bool RenderScalar::EnsureWholeVoiceJobScratch(uint32_t jobCount) {
     // Counts MUST start zeroed: the thunks zero their own slot only when a
     // block actually dispatches items, and the retire stage reads the counts
     // of every empty block (active=0) too.
-    std::memset(counts, 0, static_cast<size_t>(jobCount) * sizeof(uint32_t));
+    std::memset(counts, 0, static_cast<size_t>(jobCount) *
+                               kWvRetireCountStride * sizeof(uint32_t));
+    for (uint32_t counter = 0u; counter < kWvSegCounterCount; ++counter)
+        wvSegRetired_[counter] = WvSegSum(static_cast<WvSegCounter>(counter));
     _aligned_free(wvJobRetirements_);
     _aligned_free(wvJobRetireCounts_);
+    _aligned_free(wvJobSeg_);
     delete[] wvTailScratch_;
+    wvJobSeg_ = segStats;
     wvJobRetirements_ = retirements;
     wvJobRetireCounts_ = counts;
     wvTailScratch_ = tailScratch;

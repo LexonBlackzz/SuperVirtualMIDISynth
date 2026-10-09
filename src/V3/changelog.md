@@ -10,6 +10,16 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-10 perf(v3): stop render workers sharing hot counter cache lines
+  The whole-voice segment counters were plain members of the shared
+  RenderScalar, bumped by all 16 workers on every segment, and the job
+  retirement counts were packed uint32s. Under a bend riser (each bend splits
+  every voice of its channel into a new segment) the cache-line ping-pong
+  cost ~2000 cycles per segment and was most of the render. Segment stats are
+  now per job (own cache line, no atomics), retirement counts are 64 bytes
+  apart, and the global primary-span counters are sharded per thread.
+  chopped-notes 480 frames, p50: 32k voices @ 50k bends/s 499% -> 76%,
+  @ 150k 1470% -> 135%; 131k voices @ 50k 1935% -> 260%. No audio change.
 - 2026-10-10 test(v3): bench --bend-rate; trace render classes and wv jobs mode
   Pitch-bend risers are what blow up high-polyphony renders: every bend is an
   exact-frame op on each voice of its channel, so whole-voice job cost grows
