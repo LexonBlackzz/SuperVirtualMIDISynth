@@ -691,6 +691,52 @@ svms::RLResult Driver::ExecuteRuntimeCommand(
 }
 #endif
 
+bool Driver::EnableCallbackTrace(bool enable) {
+    if (enable && !callbackTrace_.load(std::memory_order_acquire)) {
+        CallbackTraceRing* ring = new (std::nothrow) CallbackTraceRing();
+        if (!ring) return false;
+        CallbackTraceRing* expected = nullptr;
+        if (!callbackTrace_.compare_exchange_strong(
+                expected, ring, std::memory_order_acq_rel))
+            delete ring;  // another caller won the race
+    }
+    callbackTraceEnabled_.store(enable, std::memory_order_release);
+    return true;
+}
+
+uint32_t Driver::ReadCallbackTrace(uint64_t& nextIndex,
+                                   SVMS_CallbackTrace* out,
+                                   uint32_t capacity) const {
+    const CallbackTraceRing* ring =
+        callbackTrace_.load(std::memory_order_acquire);
+    if (!ring || capacity == 0u) return 0u;
+    constexpr uint64_t kCapacity = CallbackTraceRing::kCapacity;
+    // The writer may be inside record `head`, whose slot holds record
+    // head - kCapacity: the oldest readable record is the one after it.
+    const auto oldestIntact = [](uint64_t head) {
+        return head >= kCapacity ? head - kCapacity + 1u : 0u;
+    };
+    const uint64_t head = ring->head.load(std::memory_order_acquire);
+    const uint64_t first = (std::max)(nextIndex, oldestIntact(head));
+    const uint64_t end = (std::min)(head, first + capacity);
+    if (end <= first) return 0u;
+    uint32_t count = static_cast<uint32_t>(end - first);
+    for (uint32_t i = 0u; i < count; ++i)
+        out[i] = ring->records[(first + i) & (kCapacity - 1u)];
+    // Seqlock-style validation: drop whatever the writer lapped meanwhile.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint64_t safe =
+        oldestIntact(ring->head.load(std::memory_order_acquire));
+    if (safe > first) {
+        const uint32_t lost =
+            static_cast<uint32_t>((std::min)(safe - first, uint64_t{count}));
+        std::memmove(out, out + lost, (count - lost) * sizeof(*out));
+        count -= lost;
+    }
+    nextIndex = end;
+    return count;
+}
+
 void Driver::CopyTelemetryCensus(SVMS_TelemetryV2* out) const {
     if (!out) return;
     DriverDebugInfo debug{};

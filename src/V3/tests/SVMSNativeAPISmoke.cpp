@@ -94,6 +94,9 @@ int main(int argc, char** argv) {
         !api.cancel_session_submissions ||
         (api.capabilities & SVMS_CAP_TELEMETRY_V2) != SVMS_CAP_TELEMETRY_V2 ||
         !api.get_telemetry_v2 ||
+        (api.capabilities & SVMS_CAP_CALLBACK_TRACE) !=
+            SVMS_CAP_CALLBACK_TRACE ||
+        !api.enable_callback_trace || !api.read_callback_trace ||
 #if !defined(SVMS_XP_COMPAT)
         /* The live-command surface rides the runtime-link handler, which
          * does not exist in the XP build. */
@@ -439,6 +442,62 @@ int main(int argc, char** argv) {
         api.destroy_session(session);
         FreeLibrary(runtime);
         return 1;
+    }
+
+    // Callback trace: argument contract always; record invariants only when
+    // the audio device actually runs callbacks (CI machines may have none).
+    {
+        uint64_t cursor = 0u;
+        uint32_t count = 0u;
+        static SVMS_CallbackTrace records[1024];
+        bool ok = api.enable_callback_trace(session, 1u) == SVMS_RESULT_OK &&
+            api.read_callback_trace(session, nullptr, records, 1024u, &count) ==
+                SVMS_RESULT_INVALID_ARGUMENT &&
+            api.read_callback_trace(session, &cursor, nullptr, 1u, &count) ==
+                SVMS_RESULT_INVALID_ARGUMENT;
+        uint32_t total = 0u;
+        for (int attempt = 0; ok && attempt < 100 && total < 8u; ++attempt) {
+            Sleep(10);
+            ok = api.read_callback_trace(session, &cursor, records + total,
+                                         1024u - total, &count) ==
+                SVMS_RESULT_OK;
+            total += count;
+        }
+        if (ok && telemetryV2.audio_running && total < 2u) ok = false;
+        for (uint32_t i = 0u; ok && i < total; ++i) {
+            const SVMS_CallbackTrace& r = records[i];
+            const uint64_t parts = uint64_t{r.schedule_ns} + r.render_ns +
+                r.post_ns;
+            ok = r.frames != 0u && parts <= r.total_ns &&
+                r.total_ns - parts <= 3u && r.render_events <= r.events;
+            if (ok && i != 0u) {
+                const SVMS_CallbackTrace& p = records[i - 1u];
+                ok = r.index == p.index + 1u && r.callback == p.callback + 1u &&
+                    r.start_qpc > p.start_qpc &&
+                    r.output_frame ==
+                        p.output_frame + p.frames + r.skipped_frames &&
+                    r.note_ons >= p.note_ons &&
+                    r.producer_waits >= p.producer_waits;
+            }
+        }
+        // Disabled: the ring stops growing.
+        if (ok) {
+            ok = api.enable_callback_trace(session, 0u) == SVMS_RESULT_OK;
+            Sleep(30);
+            (void)api.read_callback_trace(session, &cursor, records, 1024u,
+                                          &count);
+            Sleep(60);
+            ok = ok && api.read_callback_trace(session, &cursor, records,
+                                               1024u, &count) ==
+                    SVMS_RESULT_OK && count == 0u;
+        }
+        if (!ok) {
+            std::puts("FAIL: callback trace contract violated");
+            api.destroy_session(session);
+            FreeLibrary(runtime);
+            return 1;
+        }
+        std::printf("INFO: callback trace: %u records\n", total);
     }
 
     if (api.cancel_session_submissions(session) != SVMS_RESULT_OK ||

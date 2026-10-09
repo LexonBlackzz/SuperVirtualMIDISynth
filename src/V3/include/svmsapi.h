@@ -59,7 +59,9 @@ enum {
     SVMS_CAP_RUNTIME_COMMANDS = UINT64_C(1) << 14,
     /* SVMS_TelemetryV2: the full engine census (lateness, shedding,
      * collapse, fences, render-path selection, callback budget stats). */
-    SVMS_CAP_TELEMETRY_V2 = UINT64_C(1) << 15
+    SVMS_CAP_TELEMETRY_V2 = UINT64_C(1) << 15,
+    /* Per-callback trace: enable_callback_trace / read_callback_trace. */
+    SVMS_CAP_CALLBACK_TRACE = UINT64_C(1) << 16
 };
 
 enum {
@@ -313,6 +315,38 @@ typedef struct SVMS_TelemetryV2 {
     uint32_t reserved[5];
 } SVMS_TelemetryV2;
 
+/* One record per real-time audio callback (SVMS_CAP_CALLBACK_TRACE). The
+ * engine keeps the most recent 8192 in a ring while tracing is enabled;
+ * readers drain it with read_callback_trace. Durations are wall time in
+ * nanoseconds; the callback budget is frames / sample_rate. Cumulative
+ * fields count from engine start, so readers difference consecutive records. */
+typedef struct SVMS_CallbackTrace {
+    uint64_t index;               /* trace sequence number (the read cursor) */
+    uint64_t callback;            /* engine callback counter */
+    uint64_t start_qpc;           /* callback start, runtime clock */
+    uint64_t output_frame;        /* first output frame of this block */
+    uint32_t frames;              /* block length */
+    uint32_t total_ns;            /* whole callback */
+    uint32_t schedule_ns;         /* page import + admission of due events */
+    uint32_t render_ns;           /* exact-frame dispatch + synthesis */
+    uint32_t post_ns;             /* reverb, limiter, recorder */
+    uint32_t events;              /* events admitted into this block */
+    uint32_t render_events;       /* after same-key note-off compaction */
+    uint32_t late_events;         /* admitted behind the cursor (clamped) */
+    uint32_t max_lateness_frames; /* worst clamp in this block */
+    uint32_t skipped_frames;      /* output frames skipped by realtime recovery */
+    uint32_t scheduled_backlog;   /* scheduled events left after dispatch */
+    uint32_t ingress_backlog;     /* raw ingress events awaiting the compiler */
+    uint32_t compiled_backlog;    /* compiled events awaiting import */
+    uint32_t active_voices;
+    uint32_t releasing_voices;
+    uint32_t render_paths;        /* as SVMS_TelemetryV2.render_paths */
+    uint64_t note_ons;            /* cumulative */
+    uint64_t voice_steals;        /* cumulative */
+    uint64_t producer_waits;      /* cumulative lossless-backpressure waits */
+    uint64_t producer_wait_ns;    /* cumulative time submitters spent blocked */
+} SVMS_CallbackTrace;
+
 /* Live-control command ids. Values mirror the runtime-link wire protocol so
  * a native caller and the configurator address the identical surface. */
 typedef enum SVMS_Command {
@@ -396,6 +430,16 @@ typedef SVMS_Result (SVMS_CALL *SVMS_SendRuntimeCommandFn)(
     char* result_text_utf8, uint32_t inout_text_bytes);
 typedef SVMS_Result (SVMS_CALL *SVMS_GetTelemetryV2Fn)(
     SVMS_Session session, SVMS_TelemetryV2* telemetry);
+/* Starts (enable != 0) or stops recording SVMS_CallbackTrace records. The
+ * ring is engine-wide; records already in it stay readable after a stop. */
+typedef SVMS_Result (SVMS_CALL *SVMS_EnableCallbackTraceFn)(
+    SVMS_Session session, uint32_t enable);
+/* Copies up to `capacity` records with index >= *inout_next_index, oldest
+ * first, and advances *inout_next_index past them. Records overwritten before
+ * they were read are skipped: a jump in `index` means records were lost. */
+typedef SVMS_Result (SVMS_CALL *SVMS_ReadCallbackTraceFn)(
+    SVMS_Session session, uint64_t* inout_next_index,
+    SVMS_CallbackTrace* records, uint32_t capacity, uint32_t* out_count);
 
 typedef struct SVMS_Interface {
     uint32_t struct_size;
@@ -439,6 +483,8 @@ typedef struct SVMS_Interface {
     SVMS_StopSessionAudioFn stop_session_audio;
     SVMS_SendRuntimeCommandFn send_runtime_command;
     SVMS_GetTelemetryV2Fn get_telemetry_v2;
+    SVMS_EnableCallbackTraceFn enable_callback_trace;
+    SVMS_ReadCallbackTraceFn read_callback_trace;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
@@ -471,6 +517,8 @@ static_assert(sizeof(SVMS_TelemetryV1) == 128,
               "SVMS_TelemetryV1 ABI changed");
 static_assert(sizeof(SVMS_TelemetryV2) == 280,
               "SVMS_TelemetryV2 ABI changed");
+static_assert(sizeof(SVMS_CallbackTrace) == 128,
+              "SVMS_CallbackTrace ABI changed");
 #endif
 
 #endif

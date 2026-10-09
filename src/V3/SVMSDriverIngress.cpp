@@ -186,6 +186,17 @@ void Driver::ResetAllVoices() {
     limiter.Reset();
 }
 
+void Driver::WaitForProducerSlot(uint32_t observed) noexcept {
+    LARGE_INTEGER begin{}, end{};
+    QueryPerformanceCounter(&begin);
+    WaitForAddressChange(producerWakeEpoch_, observed);
+    QueryPerformanceCounter(&end);
+    producerWaits_.fetch_add(1u, std::memory_order_relaxed);
+    producerWaitQpc_.fetch_add(
+        static_cast<uint64_t>(end.QuadPart - begin.QuadPart),
+        std::memory_order_relaxed);
+}
+
 void Driver::SubmitShortMsg(uint32_t msg) {
     uint64_t timestamp = 0u;
     if (!tscClock_.Now(timestamp)) {
@@ -449,7 +460,7 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
             return false;
         }
         uint32_t observed = producerWakeEpoch_.load(std::memory_order_acquire);
-        WaitForAddressChange(producerWakeEpoch_, observed);
+        WaitForProducerSlot(observed);
     }
 }
 
@@ -540,7 +551,7 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
             }
             const uint32_t observed = producerWakeEpoch_.load(
                 std::memory_order_acquire);
-            WaitForAddressChange(producerWakeEpoch_, observed);
+            WaitForProducerSlot(observed);
         }
     }
     return true;

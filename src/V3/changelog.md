@@ -10,6 +10,13 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-09 feat(v3): per-callback trace ring on the native API
+  enable_callback_trace / read_callback_trace (SVMS_CAP_CALLBACK_TRACE) record
+  every audio callback: schedule/render/post time, events admitted, late
+  clamps and their worst lateness, recovery-skipped frames, ingress/compiled/
+  scheduled backlog, voices, render path, and cumulative note-ons, steals and
+  producer backpressure waits (now timed on the slow path). 8192-record ring,
+  allocated on first enable; off = two branch-not-taken loads per callback.
 - 2026-10-07 fix(v3): build the canonical engine as C++17. Span/Path shims in
   Engine/CanonicalCompat.h replace std::span and std::filesystem (GCC 7 has only
   the Filesystem TS); atomic wait falls back to a mutex + condition variable.

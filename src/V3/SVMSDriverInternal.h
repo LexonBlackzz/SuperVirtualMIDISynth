@@ -522,6 +522,23 @@ public:
 #endif
     // Fills SVMS_TelemetryV2 from the live engine census (SVMS_CAP_TELEMETRY_V2).
     void CopyTelemetryCensus(SVMS_TelemetryV2* out) const;
+    // Per-callback trace (SVMS_CAP_CALLBACK_TRACE). The ring is allocated on
+    // the first enable and lives as long as the driver; the audio thread
+    // writes one record per callback only while tracing is enabled.
+    struct CallbackTraceRing {
+        static constexpr uint32_t kCapacity = 8192u;  // power of two
+        std::atomic<uint64_t> head{0u};  // records written so far
+        SVMS_CallbackTrace records[kCapacity];
+    };
+    bool EnableCallbackTrace(bool enable);
+    uint32_t ReadCallbackTrace(uint64_t& nextIndex, SVMS_CallbackTrace* out,
+                               uint32_t capacity) const;
+    std::atomic<CallbackTraceRing*> callbackTrace_{nullptr};
+    std::atomic<bool> callbackTraceEnabled_{false};
+    // Lossless-backpressure waits by submitting threads (slow path only).
+    std::atomic<uint64_t> producerWaits_{0u};
+    std::atomic<uint64_t> producerWaitQpc_{0u};
+    void WaitForProducerSlot(uint32_t observed) noexcept;
     // External synth backend (SVMS-API / KDMAPI / WinMM): load once at init,
     // forward admitted events from the render callback, tear down on
     // shutdown. A failure falls back to the in-process SVMS engine.

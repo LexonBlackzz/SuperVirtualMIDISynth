@@ -117,6 +117,12 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     LARGE_INTEGER renderStartQPC;
     QueryPerformanceCounter(&renderStartQPC);
     const bool profileCallback = self->diagnosticsEnabled_;
+    // Per-callback trace (SVMS_CAP_CALLBACK_TRACE): two extra QPC reads and
+    // one record store per callback, only while a client has it enabled.
+    CallbackTraceRing* const traceRing =
+        self->callbackTraceEnabled_.load(std::memory_order_relaxed)
+            ? self->callbackTrace_.load(std::memory_order_acquire)
+            : nullptr;
     const uint64_t profileCycleStart = profileCallback ? __rdtsc() : 0u;
 
     cc->RebuildCache(*snap, static_cast<float>(self->sampleRate));
@@ -204,6 +210,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // toggle on, the render cursor stays on its own timeline: events keep
     // their exact frames in exact order, playback runs at whatever speed
     // the engine manages, and WASAPI glitches instead of the schedule.
+    const uint64_t skippedFramesBefore = self->telemetry_.skippedOutputFrames;
     if (!self->unboundedRenderEnabled_.load(std::memory_order_relaxed)) {
         const int64_t recoveredRenderSample = RecoverRealtimeRenderFrame(
             self->virtualRenderSample_, wallRenderSample, numFrames);
@@ -213,6 +220,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             self->virtualRenderSample_ = recoveredRenderSample;
         }
     }
+
+    // First frame this block actually renders (after any recovery jump).
+    const uint64_t traceOutputFrame =
+        static_cast<uint64_t>(self->virtualRenderSample_);
 
     // ── Drift recovery ──────────────────────────────────────────────
     // If the render takes >100% CPU, the virtual clock falls behind
@@ -404,6 +415,7 @@ const uint32_t importedPages = self->useEventCompiler_
     uint32_t examinedCount = 0;
     // Events clamped to frame 0 in this block (lateClamped telemetry input).
     uint32_t clampedThisBlock = 0;
+    uint64_t maxLatenessThisBlock = 0u;
     // Per-block dispatch admission cap. Hosts recovering from a seek or a
     // stall burst-submit millions of events, every one of them already late
     // (clamped to frame 0 or stale-dropped under PriorityVelocity). Admitting
@@ -460,6 +472,8 @@ const uint32_t importedPages = self->useEventCompiler_
             ++self->telemetry_.lateClamped;
             ++clampedThisBlock;
             const int64_t lateness = -offset;
+            maxLatenessThisBlock = (std::max)(
+                maxLatenessThisBlock, static_cast<uint64_t>(lateness));
             if (static_cast<uint64_t>(lateness) >
                 self->telemetry_.lateClampMaxLateness)
                 self->telemetry_.lateClampMaxLateness =
@@ -546,6 +560,7 @@ const uint32_t importedPages = self->useEventCompiler_
     // state (sustain/sostenuto) is constant inside it. Fences only suppress
     // note-ons, so the batch's ingressSequence (last member of the run) is
     // not consulted for note-offs.
+    const uint32_t admittedThisBlock = evCount;
     uint32_t compactedWrite = 0u;
     for (uint32_t readIndex = 0u; readIndex < evCount;) {
         const RenderEvent& head = evtBuf[readIndex];
@@ -587,6 +602,8 @@ const uint32_t importedPages = self->useEventCompiler_
     // fractional sample offset.  All event handling (voice allocation,
     // release, CC updates) happens inside the render loop via the callback.
     const uint64_t profileScheduleEnd = profileCallback ? __rdtsc() : 0u;
+    LARGE_INTEGER traceScheduleEndQPC{};
+    if (traceRing) QueryPerformanceCounter(&traceScheduleEndQPC);
     self->dispatchCyclesCurrent_ = 0u;
     // The diagnostic UI publishes once per callback. Capture one successful
     // voice launch for its detailed SF2 probe instead of rewriting ~20 fields
@@ -615,6 +632,8 @@ const uint32_t importedPages = self->useEventCompiler_
             leftBuf, rightBuf, numFrames);
     }
     const uint64_t profileRenderEnd = profileCallback ? __rdtsc() : 0u;
+    LARGE_INTEGER traceRenderEndQPC{};
+    if (traceRing) QueryPerformanceCounter(&traceRenderEndQPC);
 
     // ── Advance virtual render clock for the next callback ──────────
     self->virtualRenderSample_ += static_cast<int64_t>(numFrames);
@@ -751,6 +770,51 @@ const uint32_t importedPages = self->useEventCompiler_
         postPercent = static_cast<float>(profilePostEnd - profileRenderEnd) * scale;
     }
     self->callbackTiming_.Observe(cpuPct);
+    if (traceRing) {
+        const uint64_t freq = self->qpcFreq;
+        const auto ns = [freq](int64_t ticks) -> uint32_t {
+            if (ticks <= 0 || freq == 0u) return 0u;
+            const uint64_t value =
+                static_cast<uint64_t>(ticks) * 1000000000ull / freq;
+            return static_cast<uint32_t>((std::min)(value, uint64_t{UINT32_MAX}));
+        };
+        const uint64_t waitTicks =
+            self->producerWaitQpc_.load(std::memory_order_relaxed);
+        const uint64_t index = traceRing->head.load(std::memory_order_relaxed);
+        SVMS_CallbackTrace& r = traceRing->records[
+            index & (CallbackTraceRing::kCapacity - 1u)];
+        r.index = index;
+        r.callback = self->callbackCount_;
+        r.start_qpc = static_cast<uint64_t>(renderStartQPC.QuadPart);
+        r.output_frame = traceOutputFrame;
+        r.frames = numFrames;
+        r.total_ns = ns(renderEndQPC.QuadPart - renderStartQPC.QuadPart);
+        r.schedule_ns = ns(traceScheduleEndQPC.QuadPart - renderStartQPC.QuadPart);
+        r.render_ns = ns(traceRenderEndQPC.QuadPart - traceScheduleEndQPC.QuadPart);
+        r.post_ns = ns(renderEndQPC.QuadPart - traceRenderEndQPC.QuadPart);
+        r.events = admittedThisBlock;
+        r.render_events = evCount;
+        r.late_events = clampedThisBlock;
+        r.max_lateness_frames = static_cast<uint32_t>(
+            (std::min)(maxLatenessThisBlock, uint64_t{UINT32_MAX}));
+        r.skipped_frames = static_cast<uint32_t>(
+            self->telemetry_.skippedOutputFrames - skippedFramesBefore);
+        r.scheduled_backlog = scheduledAfterDispatch;
+        r.ingress_backlog = static_cast<uint32_t>(self->midiIngress_.TotalSize());
+        r.compiled_backlog =
+            static_cast<uint32_t>(self->compiledPages_.ReadyEventCount());
+        r.active_voices = vm->activeCount_;
+        r.releasing_voices = vm->GetReleasingCount();
+        r.render_paths = render->GetLastRenderPaths();
+        r.note_ons = self->sf2Telemetry_.noteOns;
+        r.voice_steals = vm->stealCount_;
+        r.producer_waits = self->producerWaits_.load(std::memory_order_relaxed);
+        r.producer_wait_ns = freq != 0u
+            ? waitTicks / freq * 1000000000ull +
+                  waitTicks % freq * 1000000000ull / freq
+            : 0u;
+        traceRing->head.store(index + 1u, std::memory_order_release);
+    }
     self->telemetry_.maxCallbackQPC = (std::max)(self->telemetry_.maxCallbackQPC,
         static_cast<uint64_t>(renderEndQPC.QuadPart - renderStartQPC.QuadPart));
     self->telemetry_.callbackP95Percent = self->callbackTiming_.Percentile(95u, 100u);

@@ -277,6 +277,7 @@ Driver::Driver()
 
 Driver::~Driver() {
     Shutdown();
+    delete callbackTrace_.exchange(nullptr, std::memory_order_acq_rel);
     if (eventBuffer) { _aligned_free(eventBuffer); eventBuffer = nullptr; }
     DeleteCriticalSection(&soundFontBuildCs_);
     DeleteCriticalSection(&cs);
