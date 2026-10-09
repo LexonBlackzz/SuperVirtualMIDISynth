@@ -127,6 +127,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     const uint64_t traceWvPlan = traceRing ? render->GetWvPlanCycles() : 0u;
     const uint64_t traceWvJobs = traceRing ? render->GetWvJobCycles() : 0u;
     const uint64_t traceWvPost = traceRing ? render->GetWvPostCycles() : 0u;
+    const uint64_t traceWvSerial = traceRing ? render->GetWvSerialJobs() : 0u;
     const uint64_t profileCycleStart = profileCallback ? __rdtsc() : 0u;
 
     cc->RebuildCache(*snap, static_cast<float>(self->sampleRate));
@@ -835,6 +836,13 @@ const uint32_t importedPages = self->useEventCompiler_
         r.wv_plan_cycles = render->GetWvPlanCycles() - traceWvPlan;
         r.wv_jobs_cycles = render->GetWvJobCycles() - traceWvJobs;
         r.wv_post_cycles = render->GetWvPostCycles() - traceWvPost;
+        for (uint32_t c = 0u; c < 7u; ++c)
+            r.class_voices[c] = vm->GetRenderClassCount(
+                static_cast<VoiceRenderClass>(c));
+        r.wv_serial_jobs =
+            static_cast<uint32_t>(render->GetWvSerialJobs() - traceWvSerial);
+        r.wv_kernel_frames = render->GetWvSegKernelFrames();
+        r.wv_fallback_frames = render->GetWvSegFallbackFrames();
         r.producer_wait_ns = freq != 0u
             ? waitTicks / freq * 1000000000ull +
                   waitTicks % freq * 1000000000ull / freq

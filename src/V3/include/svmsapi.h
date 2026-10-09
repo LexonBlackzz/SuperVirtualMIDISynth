@@ -352,6 +352,17 @@ typedef struct SVMS_CallbackTrace {
     uint64_t wv_plan_cycles;
     uint64_t wv_jobs_cycles;
     uint64_t wv_post_cycles;
+    /* Voices per render class at block end: sustained loop, sustained
+     * one-shot, transient loop, transient one-shot, release loop, release
+     * one-shot, generic. */
+    uint32_t class_voices[7];
+    /* Whole-voice job stages this block ran serially on the audio thread
+     * instead of on the worker pool. */
+    uint32_t wv_serial_jobs;
+    /* Cumulative whole-voice segment frames rendered by a SIMD/class kernel
+     * vs the scalar per-voice fallback (RenderPrimaryVoiceSpan). */
+    uint64_t wv_kernel_frames;
+    uint64_t wv_fallback_frames;
 } SVMS_CallbackTrace;
 
 /* Live-control command ids. Values mirror the runtime-link wire protocol so
@@ -524,7 +535,7 @@ static_assert(sizeof(SVMS_TelemetryV1) == 128,
               "SVMS_TelemetryV1 ABI changed");
 static_assert(sizeof(SVMS_TelemetryV2) == 280,
               "SVMS_TelemetryV2 ABI changed");
-static_assert(sizeof(SVMS_CallbackTrace) == 160,
+static_assert(sizeof(SVMS_CallbackTrace) == 208,
               "SVMS_CallbackTrace ABI changed");
 #endif
 

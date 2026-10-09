@@ -824,6 +824,8 @@ public:
     // Diagnostics-only whole-voice phase accumulators (rdtsc, caller-thread
     // wall cycles; read racily from telemetry — fine for profiling).
     uint64_t wvPlanCycles_ = 0u;
+    uint64_t wvParallelJobs_ = 0u;
+    uint64_t wvSerialJobs_ = 0u;
     uint64_t wvJobCycles_ = 0u;
     uint64_t wvPostCycles_ = 0u;
     // Segment-path diagnostics: calls into RenderWholeVoiceSegment, cycles
@@ -836,6 +838,10 @@ public:
     uint64_t wvSegKernelFrames_ = 0u;
     uint64_t wvSegFallbackFrames_ = 0u;
     uint64_t GetWvPlanCycles() const { return wvPlanCycles_; }
+    // Whole-voice job stages that ran on the worker pool vs serially on the
+    // audio thread (pool refused or single job).
+    uint64_t GetWvParallelJobs() const { return wvParallelJobs_; }
+    uint64_t GetWvSerialJobs() const { return wvSerialJobs_; }
     uint64_t GetWvJobCycles() const { return wvJobCycles_; }
     uint64_t GetWvPostCycles() const { return wvPostCycles_; }
     uint64_t GetWvSegCalls() const { return wvSegCalls_; }
@@ -4833,6 +4839,7 @@ inline void RenderScalar::RenderWholeVoiceBlock(
                 jobCount, numFrames, outputLeft, outputRight,
                 &WholeVoiceJobThunk, &ctx, channelBusLeft, channelBusRight);
         }
+        ++(dispatched ? wvParallelJobs_ : wvSerialJobs_);
         if (!dispatched) {
             // Serial: one job over every item, mixing directly.  In bus
             // mode the serial job writes the block buses (sequential, so

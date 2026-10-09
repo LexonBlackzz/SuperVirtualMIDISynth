@@ -10,6 +10,14 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-10 test(v3): bench --bend-rate; trace render classes and wv jobs mode
+  Pitch-bend risers are what blow up high-polyphony renders: every bend is an
+  exact-frame op on each voice of its channel, so whole-voice job cost grows
+  with voices x bends (chopped-notes, 32k voices, 480 frames: 35% p50 at 0
+  bends/s, 103% at 10k, 499% at 50k, 1470% at 150k; DYHTM Community Merge
+  4:13-4:24 runs 42k-188k bends/s). The callback trace now carries per-class
+  voice counts, whole-voice kernel vs scalar-fallback segment frames and
+  whether the jobs stage ran serially.
 - 2026-10-10 fix(v3): the 131072-event block cap only limits late events
   It counted every examined event, on-time ones included, so a sustained
   stream above ~13M events/s (10 ms callbacks) went late by design with the

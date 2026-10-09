@@ -103,6 +103,7 @@ struct Options {
     uint32_t attackFrames = 0;
     uint32_t noteLengthFrames = 1;
     uint32_t ccRate = 0;
+    uint32_t bendRate = 0;  // pitch bends per second (--bend-rate)
     uint32_t ccController = 0;   // 0 = cycle 64/66/120/123
     uint32_t renderThreads = 1;
     uint32_t stealPolicy = 0u;
@@ -169,6 +170,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                 options.noteLengthFrames > options.frames) return false;
         } else if (std::strcmp(argv[i], "--cc-rate") == 0) {
             if (!nextNumber(options.ccRate)) return false;
+        } else if (std::strcmp(argv[i], "--bend-rate") == 0) {
+            if (!nextNumber(options.bendRate)) return false;
         } else if (std::strcmp(argv[i], "--cc-controller") == 0) {
             if (!nextNumber(options.ccController) ||
                 options.ccController > 127u)
@@ -793,6 +796,29 @@ int main(int argc, char** argv) {
                                 ? 127u
                                 : 0u;
                     }
+                }
+            }
+            // Pitch-bend sweep interleave (--bend-rate): bendRate bends per
+            // second spread evenly over the block, rotating channels, the
+            // shape of a Black MIDI bend riser. Every bend is an exact-frame
+            // channel op for each voice on its channel.
+            if (options.bendRate != 0u) {
+                const uint32_t bendCount = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(options.bendRate) * options.frames +
+                     44099u) / 44100u);
+                const size_t base = events.size();
+                events.resize(base + bendCount);
+                for (uint32_t index = 0u; index < bendCount; ++index) {
+                    svms::RenderEvent& event = events[base + index];
+                    event.frameOffset = static_cast<uint32_t>(
+                        static_cast<uint64_t>(index) * options.frames /
+                        bendCount);
+                    event.ingressSequence =
+                        static_cast<uint32_t>(base) + index;
+                    event.type = svms::RenderEventType::PitchBend;
+                    event.channel = static_cast<uint8_t>(index & 15u);
+                    event.data1 = static_cast<uint8_t>((index * 37u) & 0x7fu);
+                    event.data2 = static_cast<uint8_t>(64u + (index >> 4u) % 32u);
                 }
             }
             std::stable_sort(events.begin(), events.end(),
