@@ -123,6 +123,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->callbackTraceEnabled_.load(std::memory_order_relaxed)
             ? self->callbackTrace_.load(std::memory_order_acquire)
             : nullptr;
+    const uint64_t traceCycleStart = traceRing ? __rdtsc() : 0u;
+    const uint64_t traceWvPlan = traceRing ? render->GetWvPlanCycles() : 0u;
+    const uint64_t traceWvJobs = traceRing ? render->GetWvJobCycles() : 0u;
+    const uint64_t traceWvPost = traceRing ? render->GetWvPostCycles() : 0u;
     const uint64_t profileCycleStart = profileCallback ? __rdtsc() : 0u;
 
     cc->RebuildCache(*snap, static_cast<float>(self->sampleRate));
@@ -416,24 +420,28 @@ const uint32_t importedPages = self->useEventCompiler_
     // Events clamped to frame 0 in this block (lateClamped telemetry input).
     uint32_t clampedThisBlock = 0;
     uint64_t maxLatenessThisBlock = 0u;
-    // Per-block dispatch admission cap. Hosts recovering from a seek or a
-    // stall burst-submit millions of events, every one of them already late
-    // (clamped to frame 0 or stale-dropped under PriorityVelocity). Admitting
-    // all of them into one render block explodes the whole-voice plan
-    // (per-event scratch, millions of launches) and forces the sparse
-    // fallback, at 3x+ over budget. Anything past this cap simply stays
-    // scheduled and is admitted over the following blocks — no loss, the
+    // Per-block admission cap for LATE events. Hosts recovering from a seek
+    // or a stall burst-submit millions of events, every one of them already
+    // late (clamped to frame 0 or stale-dropped under PriorityVelocity).
+    // Admitting all of them into one render block explodes the whole-voice
+    // plan (per-event scratch, millions of launches) and forces the sparse
+    // fallback, at 3x+ over budget. Late events past this cap simply stay
+    // scheduled and are admitted over the following blocks — no loss, the
     // clock-stretch machinery already treats them as late.
+    // Events still on time are not counted: capping them made a sustained
+    // stream above cap/callback (~13M events/s at 10 ms callbacks) go late
+    // by design, with the render thread mostly idle. They stay bounded by
+    // the configured max_events_per_block.
     static constexpr uint32_t kBlockDispatchSoftCap = 1u << 17u;
-    // Unbounded render lifts the per-block admission cap as well: the
-    // scheduler admits up to the configured max_events_per_block and
-    // drains the backlog in strict order, whatever the callback costs.
-    const uint32_t eventBudget = self->unboundedRenderEnabled_.load(
+    const uint32_t eventBudget =
+        (std::min)(self->eventBufferCapacity_, self->maxEventsPerBlock_);
+    // Unbounded render lifts the late cap as well: the scheduler drains the
+    // backlog in strict order, whatever the callback costs.
+    const uint32_t lateBudget = self->unboundedRenderEnabled_.load(
         std::memory_order_relaxed)
-        ? (std::min)(self->eventBufferCapacity_, self->maxEventsPerBlock_)
-        : (std::min)((std::min)(self->eventBufferCapacity_,
-                                self->maxEventsPerBlock_),
-                     kBlockDispatchSoftCap);
+        ? eventBudget
+        : (std::min)(eventBudget, kBlockDispatchSoftCap);
+    uint32_t lateDispatched = 0u;
     auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
         ++examinedCount;
         if (self->overflowMode_.load(std::memory_order_relaxed) ==
@@ -501,14 +509,28 @@ const uint32_t importedPages = self->useEventCompiler_
                     eventBudget - examinedCount, run);
                 if (runCount == 0u) break;
             }
-            for (uint32_t i = 0u; i < runCount; ++i)
-                admitScheduled(run[i]);
-            self->pagedScheduler_.ConsumeRun(runCount);
-            if (examinedCount == eventBudget) break;
+            // Runs are frame-ordered, so late events come first. Only late
+            // events that are actually dispatched count against the cap:
+            // obsolete note-ons skipped by admitScheduled cost nothing
+            // downstream, and counting them kept a backlog that was behind
+            // from draining faster than a dense stream refilled it.
+            uint32_t taken = 0u;
+            for (; taken < runCount; ++taken) {
+                if (run[taken].targetFrame < self->virtualRenderSample_) {
+                    if (lateDispatched >= lateBudget) break;
+                    const uint32_t before = evCount;
+                    admitScheduled(run[taken]);
+                    lateDispatched += evCount - before;
+                } else {
+                    admitScheduled(run[taken]);
+                }
+            }
+            self->pagedScheduler_.ConsumeRun(taken);
+            if (taken < runCount || examinedCount == eventBudget) break;
         }
     } else {
         ScheduledRenderEvent scheduledOut{};
-        while (examinedCount < eventBudget &&
+        while (examinedCount < lateBudget &&
                self->eventScheduler_.PopBefore(
                    self->virtualRenderSample_ + numFrames, scheduledOut)) {
             admitScheduled(scheduledOut);
@@ -809,6 +831,10 @@ const uint32_t importedPages = self->useEventCompiler_
         r.note_ons = self->sf2Telemetry_.noteOns;
         r.voice_steals = vm->stealCount_;
         r.producer_waits = self->producerWaits_.load(std::memory_order_relaxed);
+        r.cycles = __rdtsc() - traceCycleStart;
+        r.wv_plan_cycles = render->GetWvPlanCycles() - traceWvPlan;
+        r.wv_jobs_cycles = render->GetWvJobCycles() - traceWvJobs;
+        r.wv_post_cycles = render->GetWvPostCycles() - traceWvPost;
         r.producer_wait_ns = freq != 0u
             ? waitTicks / freq * 1000000000ull +
                   waitTicks % freq * 1000000000ull / freq

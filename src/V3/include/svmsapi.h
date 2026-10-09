@@ -345,6 +345,13 @@ typedef struct SVMS_CallbackTrace {
     uint64_t voice_steals;        /* cumulative */
     uint64_t producer_waits;      /* cumulative lossless-backpressure waits */
     uint64_t producer_wait_ns;    /* cumulative time submitters spent blocked */
+    /* TSC cycles of the whole callback, and of the whole-voice renderer's
+     * serial plan, worker jobs and serial post stages within it (0 when the
+     * block took another path). Shares of `cycles` convert them to time. */
+    uint64_t cycles;
+    uint64_t wv_plan_cycles;
+    uint64_t wv_jobs_cycles;
+    uint64_t wv_post_cycles;
 } SVMS_CallbackTrace;
 
 /* Live-control command ids. Values mirror the runtime-link wire protocol so
@@ -517,7 +524,7 @@ static_assert(sizeof(SVMS_TelemetryV1) == 128,
               "SVMS_TelemetryV1 ABI changed");
 static_assert(sizeof(SVMS_TelemetryV2) == 280,
               "SVMS_TelemetryV2 ABI changed");
-static_assert(sizeof(SVMS_CallbackTrace) == 128,
+static_assert(sizeof(SVMS_CallbackTrace) == 160,
               "SVMS_CallbackTrace ABI changed");
 #endif
 

@@ -10,6 +10,14 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-10 fix(v3): the 131072-event block cap only limits late events
+  It counted every examined event, on-time ones included, so a sustained
+  stream above ~13M events/s (10 ms callbacks) went late by design with the
+  render thread at 20-30%: DYHTM Community Merge 4:25-4:46 had 8-10M late
+  events/s and up to 90 ms lateness, now ~0. It now counts only late events
+  that are dispatched, so obsolete note-ons skipped during recovery no longer
+  hold a backlog behind. max_events_per_block still bounds the whole block.
+  The trace record gains callback and whole-voice plan/jobs/post TSC cycles.
 - 2026-10-09 feat(v3): per-callback trace ring on the native API
   enable_callback_trace / read_callback_trace (SVMS_CAP_CALLBACK_TRACE) record
   every audio callback: schedule/render/post time, events admitted, late
