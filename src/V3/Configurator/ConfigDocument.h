@@ -94,6 +94,7 @@ struct ConfigValues {
     // 3 WinMM device. Applied at driver init (restart).
     uint32_t apiBackend = 0u;
     std::wstring apiBackendDll;
+    bool apiAllowNested = false;
     uint32_t apiWinMmDevice = 0u;
     int overflowMode = 0;
     bool correctnessMode = true;

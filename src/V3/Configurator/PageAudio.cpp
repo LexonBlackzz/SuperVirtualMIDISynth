@@ -509,6 +509,13 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                 ImGui::SameLine();
                 ImGui::TextDisabled("MIDI-out device index");
             }
+            if (w.apiBackend != 0u) {
+                if (PanelLever("ALLOW NESTED", &w.apiAllowNested,
+                               "Synth-ception. By default an SVMS instance started inside another synth host (such as OmniMIDIv2 loading the SVMS plugin) ignores this backend setting, because the inner instance shares this config and would route events back out in a loop. Enable only if the inner instance uses a separate config.",
+                               true)) {
+                    doc.MarkDirty();
+                }
+            }
             ImGui::Spacing();
             ImGui::Spacing();
 

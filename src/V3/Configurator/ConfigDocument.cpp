@@ -179,6 +179,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.ghostBudget = 0u;
     d.largePages = false;
     d.apiBackend = 0u;
+    d.apiAllowNested = false;
     d.apiWinMmDevice = 0u;
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
@@ -243,6 +244,8 @@ void ConfigDocument::FromJson(const json& root) {
             dll->is_string()) {
             working_.apiBackendDll = Utf8ToWide(dll->get<std::string>());
         }
+        if (auto an = it->find("allow_nested"); an != it->end() && an->is_boolean())
+            working_.apiAllowNested = an->get<bool>();
         ReadNum(*it, "winmm_device", working_.apiWinMmDevice, 0u, 255u);
 
         if (auto routes = it->find("soundfont_routes");
@@ -446,6 +449,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["synth"]["large_pages"] = working_.largePages;
     root["api"]["backend"] = working_.apiBackend;
     root["api"]["backend_dll"] = WideToUtf8(working_.apiBackendDll);
+    root["api"]["allow_nested"] = working_.apiAllowNested;
     root["api"]["winmm_device"] = working_.apiWinMmDevice;
     root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
 
@@ -654,6 +658,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.largePages == b.largePages
         && a.apiBackend == b.apiBackend
         && a.apiBackendDll == b.apiBackendDll
+        && a.apiAllowNested == b.apiAllowNested
         && a.apiWinMmDevice == b.apiWinMmDevice
         && a.maxEventsPerBlock == b.maxEventsPerBlock
         && a.overflowMode == b.overflowMode

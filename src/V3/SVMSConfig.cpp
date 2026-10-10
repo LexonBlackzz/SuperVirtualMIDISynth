@@ -295,6 +295,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"api", {
             {"backend", cfg.apiBackend},
             {"backend_dll", WideToUtf8(cfg.apiBackendDll)},
+            {"allow_nested", cfg.apiAllowNested},
             {"winmm_device", cfg.apiWinMmDevice}
         }},
         {"diagnostics", {
@@ -730,6 +731,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             dll->is_string()) {
             cfg.apiBackendDll = Utf8ToWide(dll->get<std::string>());
         }
+        if (!ReadBool(*it, "allow_nested", cfg.apiAllowNested))
+            AppendWarning(cfg.configWarning, "api.allow_nested");
         if (!ReadValue(*it, "winmm_device", cfg.apiWinMmDevice, 0u, 255u))
             AppendWarning(cfg.configWarning, "api.winmm_device");
     }
@@ -859,6 +862,7 @@ EngineConfig EngineConfig::Default() {
     cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default
     cfg.largePages = false;       // opt-in: standard aligned allocation by default
     cfg.apiBackend = 0;           // SVMS engine in-process by default
+    cfg.apiAllowNested = false;   // nested-chain guard on by default
     cfg.apiWinMmDevice = 0;
     cfg.correctnessMode = true;
 #if defined(SVMS_XP_COMPAT)

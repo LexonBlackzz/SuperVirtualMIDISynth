@@ -120,6 +120,7 @@ struct EngineConfig {
     // driver init (restart to change).
     uint32_t apiBackend;
     std::wstring apiBackendDll;   // backend DLL path (kinds 1 and 2)
+    bool apiAllowNested;          // permit an external backend inside a nested SVMS plugin chain (default off)
     uint32_t apiWinMmDevice;      // WinMM MIDI-out device index (kind 3)
     EventOverflowMode eventOverflowMode;
     uint32_t highPriorityVelocity;

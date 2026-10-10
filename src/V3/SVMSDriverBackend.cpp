@@ -12,6 +12,18 @@ namespace svms {
 // failure logs and falls back to the engine, never to silence.
 
 bool Driver::InitializeExternalBackend() {
+    // Nested-chain guard: an SVMS plugin loaded inside another synth host (e.g.
+    // OmniMIDIv2) sets SVMS_NESTED=1 before starting its inner engine. The inner
+    // instance shares our config file, so an external backend here would route
+    // events straight back out and loop. Fall back to the in-process engine
+    // unless api.allow_nested is set.
+    if (engineConfig_.apiBackend != 0u && !engineConfig_.apiAllowNested) {
+        wchar_t nested[2] = {};
+        if (GetEnvironmentVariableW(L"SVMS_NESTED", nested, 2) && nested[0] == L'1') {
+            LOG("api.backend ignored: nested SVMS instance (set api.allow_nested to override)");
+            engineConfig_.apiBackend = 0u;
+        }
+    }
     const uint32_t kind = engineConfig_.apiBackend;
     if (kind == 0u) return true;
     // Kind 4 auto-detects whatever the configured DLL answers with: the
