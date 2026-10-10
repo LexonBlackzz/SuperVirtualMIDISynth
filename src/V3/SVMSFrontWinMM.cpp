@@ -266,6 +266,13 @@ MMRESULT WINAPI midiOutGetErrorTextW(MMRESULT mmrError, LPWSTR lpText, UINT cchT
     return MMSYSERR_NOERROR;
 }
 
+MMRESULT WINAPI midiOutGetID(HMIDIOUT hmo, LPUINT puDeviceID) {
+    if (hmo != kSVMSMidiOutHandle) return MMSYSERR_INVALHANDLE;
+    if (!puDeviceID) return MMSYSERR_INVALPARAM;
+    *puDeviceID = 0;
+    return MMSYSERR_NOERROR;
+}
+
 MMRESULT WINAPI midiOutMessage(HMIDIOUT hmo, UINT uMsg, DWORD_PTR dw1, DWORD_PTR dw2) {
     (void)hmo; (void)uMsg; (void)dw1; (void)dw2;
     return MMSYSERR_NOERROR;
@@ -339,6 +346,12 @@ MMRESULT WINAPI midiInReset(HMIDIIN hmi) {
     using Proc = MMRESULT (WINAPI*)(HMIDIIN);
     Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInReset"));
     return proc ? proc(hmi) : MMSYSERR_BADDEVICEID;
+}
+
+MMRESULT WINAPI midiInGetID(HMIDIIN hmi, LPUINT puDeviceID) {
+    using Proc = MMRESULT (WINAPI*)(HMIDIIN, LPUINT);
+    Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc("midiInGetID"));
+    return proc ? proc(hmi, puDeviceID) : MMSYSERR_ERROR;
 }
 
 MMRESULT WINAPI midiInMessage(HMIDIIN hmi, UINT uMsg, DWORD_PTR dw1, DWORD_PTR dw2) {

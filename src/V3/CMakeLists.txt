@@ -600,6 +600,7 @@ set(EXPORTS
         midiOutSetVolume
         midiOutGetErrorTextA
         midiOutGetErrorTextW
+        midiOutGetID
         midiOutMessage
         IsKDMAPIAvailable
         InitializeKDMAPIStream
@@ -633,6 +634,7 @@ set(EXPORTS
         midiInStart
         midiInStop
         midiInReset
+        midiInGetID
         midiInMessage
         waveInGetNumDevs
         waveInGetDevCapsA
