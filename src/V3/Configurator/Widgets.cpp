@@ -357,7 +357,7 @@ bool KeyGroup(const char* id, int* current, const char* const* labels,
 
     PushMono();
     const float lineH = ImGui::GetTextLineHeight();
-    const float keyH = lineH + 20.0f;
+    const float keyH = lineH + 22.0f;
     const float gap = 5.0f;
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     float x = origin.x;
@@ -381,9 +381,9 @@ bool KeyGroup(const char* id, int* current, const char* const* labels,
                           ImGui::GetColorU32(GetKeyEdge()), th.cornerRadius - 1.0f);
         dl->AddRectFilled(a, ImVec2(x + keyW, bottom - edgeH),
                           ImGui::GetColorU32(face), th.cornerRadius - 1.0f);
-        DrawLed(dl, ImVec2(x + keyW * 0.5f, a.y + 8.0f), 2.6f, on);
+        DrawLed(dl, ImVec2(x + keyW * 0.5f, a.y + 7.0f), 2.6f, on);
         const ImVec2 ts = ImGui::CalcTextSize(labels[i]);
-        dl->AddText(ImVec2(x + (keyW - ts.x) * 0.5f, a.y + 14.0f),
+        dl->AddText(ImVec2(x + (keyW - ts.x) * 0.5f, a.y + 13.0f),
                     ImGui::GetColorU32(on ? th.text : th.mutedText), labels[i]);
         x += keyW + gap;
     }

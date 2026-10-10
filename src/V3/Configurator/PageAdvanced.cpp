@@ -150,14 +150,14 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     ImGui::Spacing();
     ImGui::TextDisabled("Style");
     {
-        static const char* styleLabels[] = {"Rack", "Refined"};
+        static const char* styleLabels[] = {"Rack", "Boring"};
         int style = theme.style;
         if (KeyGroup("##theme_style", &style, styleLabels, 2)) {
             theme.style = style;
             themeChanged = true;
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("Rack: bevelled keys, lamps and screws. Refined: flat, sentence case.");
+        ImGui::TextDisabled("Rack: bevelled keys, lamps and screws. Boring: flat, sentence case.");
     }
 
     ImGui::Spacing();
