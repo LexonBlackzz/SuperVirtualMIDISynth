@@ -36,6 +36,7 @@ enum class Page {
     Diagnostics,
     Advanced,
     About,
+    Synth,
     PageCount
 };
 
@@ -70,6 +71,9 @@ public:
 
     void HandleDpiChange(float scale, const RECT* suggestedRect);
 
+    // Jump to a stage/page (used by the Home overview's OPEN keys).
+    void NavigateTo(Page page) { currentPage_ = page; }
+
 private:
     friend LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam,
                                     LPARAM lParam);
@@ -83,7 +87,8 @@ private:
     void ResizeSwapChain(int width, int height);
 
     void DrawHeader();
-    void DrawSidebar();
+    void DrawMasterStrip(float y);
+    void DrawChainStrip(float y);
     void DrawFooter();
     void DrawPageContent();
     void DrawToastOverlay();

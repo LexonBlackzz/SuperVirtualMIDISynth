@@ -273,7 +273,8 @@ std::vector<std::string> EnumerateAsioDrivers() {
 
 } // namespace
 
-void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
+void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
+                   AudioView view) {
     auto& w = doc.Working();
     const LiveLinkContext& live = GetLiveLinkContext();
     const bool liveSoundFont = live.connected && live.client &&
@@ -289,6 +290,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         devicesEnumerated = true;
     }
 
+    if (view != AudioView::SoundFont) {
     BeginRackPanel("AUDIO OUTPUT");
 
     const bool asioActive =
@@ -600,6 +602,9 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         ImGui::PopStyleColor();
     }
 
+    }  // output view
+
+    if (view != AudioView::Output) {
     ImGui::Spacing();
     BeginRackPanel("SOUND FONT");
 
@@ -920,6 +925,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         }
     }
     EndRackPanel();
+    }  // soundfont view
 }
 
 } // namespace svms::cfg

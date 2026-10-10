@@ -567,24 +567,17 @@ void ConfiguratorApp::RenderFrame() {
                  ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollWithMouse);
 
     DrawHeader();
+    const float headerH = kHeaderHeight * dpiScale_;
+    DrawMasterStrip(headerH);
+    DrawChainStrip(headerH + kMasterHeight * dpiScale_);
 
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
-    DrawSidebar();
-    ImGui::SameLine();
+    const float pageTop = headerH + (kMasterHeight + kChainHeight) * dpiScale_ + 2.0f;
+    const float footerH = kFooterHeight * dpiScale_;
+    const float pageW = static_cast<float>(windowWidth_);
+    const float pageH = static_cast<float>(windowHeight_) - pageTop - footerH - 4.0f;
 
-    float sidebarWidth = kSidebarWidth * dpiScale_;
-    ImGui::SetCursorPosX(sidebarWidth);
-    ImGui::SetCursorPosY(kHeaderHeight * dpiScale_ + 2.0f);
-
-    float pageW = static_cast<float>(windowWidth_) - sidebarWidth;
-    float footerH = kFooterHeight * dpiScale_;
-    float pageH = static_cast<float>(windowHeight_) -
-                  kHeaderHeight * dpiScale_ - footerH - 4.0f;
-
-    // The shell window deliberately has zero padding so the header/sidebar can
-    // meet the viewport edges. Give page content a small horizontal safe area,
-    // otherwise labels rendered at x=0 can lose their antialiased edge pixels.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f, 0.0f));
+    ImGui::SetCursorPos(ImVec2(0.0f, pageTop));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 6.0f));
     ImGui::BeginChild("##page", ImVec2(pageW, pageH),
                       ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoBackground);
@@ -592,8 +585,14 @@ void ConfiguratorApp::RenderFrame() {
     ImGui::EndChild();
     ImGui::PopStyleVar();
 
+    // Esc is "back to Home" unless something is being edited or a menu is open.
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive() &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        currentPage_ = Page::Overview;
+    }
+
     float footerY = static_cast<float>(windowHeight_) - footerH;
-    ImGui::SetCursorPos(ImVec2(sidebarWidth + 12.0f, footerY + 6.0f));
+    ImGui::SetCursorPos(ImVec2(16.0f, footerY + 6.0f));
     DrawFooter();
 
     ImGui::End();
@@ -661,7 +660,7 @@ void ConfiguratorApp::DrawHeader() {
                 ImGui::GetColorU32(th.mutedText), linkLabel);
 
     // LCD readout.
-    const float lcdX0 = origin.x + kSidebarWidth * dpiScale_ + 8.0f;
+    const float lcdX0 = origin.x + 170.0f * dpiScale_;
     const float lcdX1 = rightEdge - 14.0f - linkW - 14.0f;
     if (lcdX1 - lcdX0 > 120.0f) {
         dl->AddRectFilled(ImVec2(lcdX0, cy - 11.0f), ImVec2(lcdX1, cy + 11.0f),
@@ -706,150 +705,296 @@ void ConfiguratorApp::DrawHeader() {
     PopMono();
 }
 
-void ConfiguratorApp::DrawSidebar() {
-    float sidebarW = kSidebarWidth * dpiScale_;
-    float headerH = kHeaderHeight * dpiScale_ + 2.0f;
-    float footerH = kFooterHeight * dpiScale_;
-    float sidebarH = static_cast<float>(windowHeight_) - headerH - footerH;
+static float MasterVolumeDb(float v) {
+    return 20.0f * std::log10((std::max)(v, 0.001f));
+}
 
-    ImVec2 sidebarPos(0, headerH);
-    ImGui::SetCursorPos(sidebarPos);
+// Segmented horizontal bar (outputs, voices, CPU).
+static void DrawHSegBar(ImDrawList* dl, ImVec2 p, float width, float frac,
+                        bool accentOnly) {
+    const ThemeSettings& th = GetThemeSettings();
+    const float h = 14.0f;
+    dl->AddRectFilled(p, ImVec2(p.x + width, p.y + h),
+                      ImGui::GetColorU32(GetLcdBg()), 3.0f);
+    const float pitch = 6.0f;
+    const int n = (std::max)(1, static_cast<int>((width - 6.0f) / pitch));
+    const int lit = static_cast<int>(ImClamp(frac, 0.0f, 1.0f) * n + 0.5f);
+    for (int i = 0; i < n; ++i) {
+        const float f = static_cast<float>(i) / static_cast<float>(n);
+        const ImVec4 col = accentOnly ? th.accent
+            : (f < 0.65f ? th.success : (f < 0.85f ? th.warning : th.error));
+        const ImVec4 c = i < lit ? col : Alpha(col, 0.20f);
+        dl->AddRectFilled(ImVec2(p.x + 3.0f + i * pitch, p.y + 3.0f),
+                          ImVec2(p.x + 3.0f + i * pitch + 4.0f, p.y + h - 3.0f),
+                          ImGui::GetColorU32(c), 1.0f);
+    }
+    dl->AddRect(p, ImVec2(p.x + width, p.y + h), ImGui::GetColorU32(GetKeyEdge()), 3.0f);
+}
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, GetSidebarBg());
+void ConfiguratorApp::DrawMasterStrip(float y) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ThemeSettings& th = GetThemeSettings();
+    const float W = static_cast<float>(windowWidth_);
+    const float H = kMasterHeight * dpiScale_;
+    dl->AddRectFilled(ImVec2(0.0f, y), ImVec2(W, y + H), ImGui::GetColorU32(th.sidebar));
+    dl->AddRectFilled(ImVec2(0.0f, y + H - 2.0f), ImVec2(W, y + H),
+                      ImGui::GetColorU32(GetKeyEdge()));
 
-    ImGui::BeginChild("##sidebar", ImVec2(sidebarW, sidebarH),
-                      ImGuiChildFlags_None);
+    auto& w = config_.Working();
+    ImGui::SetCursorPos(ImVec2(22.0f, y + 4.0f));
+    KnobState knob = {w.masterVolume, 0.0f, 4.0f, 1.0f, "MASTER", nullptr, 44.0f,
+                      1.0f, MasterVolumeDb};
+    if (RotaryKnob(knob, "%.1f dB")) {
+        w.masterVolume = knob.value;
+        config_.MarkDirty();
+        SetLiveFloat(svms::RLCommandType::SetMasterVolume, knob.value);
+    }
 
-    ImGui::SetCursorPosY(8.0f);
+    const bool tel = rlConnected_;
+    static float outVis = 0.0f;
+    float outTarget = 0.0f;
+    if (tel) {
+        const float peak = (std::max)(rlTelemetry_.limiterOutputPeakL,
+                                      rlTelemetry_.limiterOutputPeakR);
+        if (peak > 0.000001f)
+            outTarget = ImClamp((20.0f * std::log10(peak) + 60.0f) / 60.0f, 0.0f, 1.0f);
+    }
+    const float dt = (std::max)(0.0f, ImGui::GetIO().DeltaTime);
+    outVis += (outTarget - outVis) * (1.0f - std::exp(-(outTarget > outVis ? 22.0f : 8.0f) * dt));
 
-    auto drawNavItem = [&](const char* label, Page page, const char* category) {
-        const ThemeSettings& th = GetThemeSettings();
-        if (category) {
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 8.0f);
-            PushMono();
-            ImGui::SetCursorPosX(14.0f);
-            ImGui::PushStyleColor(ImGuiCol_Text, Alpha(GetMutedText(), 0.75f));
-            ImGui::TextUnformatted(category);
-            ImGui::PopStyleColor();
-            PopMono();
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
+    const float x0 = 130.0f;
+    const float gap = 30.0f;
+    const float blockW = (std::max)(120.0f, (W - x0 - 24.0f - gap * 2.0f) / 3.0f);
+    PushMono(0.85f);
+    char buf[64];
+    auto block = [&](int i, const char* label, const char* value, float frac, bool accent) {
+        const float x = x0 + i * (blockW + gap);
+        dl->AddText(ImVec2(x, y + 20.0f), ImGui::GetColorU32(th.mutedText), label);
+        const ImVec2 vs = ImGui::CalcTextSize(value);
+        dl->AddText(ImVec2(x + blockW - vs.x, y + 20.0f), ImGui::GetColorU32(th.accent), value);
+        DrawHSegBar(dl, ImVec2(x, y + 44.0f), blockW, frac, accent);
+    };
+    if (tel) {
+        const float peak = (std::max)(rlTelemetry_.limiterOutputPeakL,
+                                      rlTelemetry_.limiterOutputPeakR);
+        std::snprintf(buf, sizeof(buf), "%.1f dB",
+                      peak > 0.000001f ? 20.0f * std::log10(peak) : -60.0f);
+    } else {
+        std::snprintf(buf, sizeof(buf), "--");
+    }
+    block(0, "OUTPUT", buf, outVis, false);
+    if (tel) {
+        std::snprintf(buf, sizeof(buf), "%u / %u", rlTelemetry_.activeVoices, w.maxVoices);
+    } else {
+        std::snprintf(buf, sizeof(buf), "-- / %u", w.maxVoices);
+    }
+    block(1, "VOICES", buf,
+          tel ? static_cast<float>(rlTelemetry_.activeVoices) /
+                    static_cast<float>((std::max)(1u, w.maxVoices))
+              : 0.0f, true);
+    if (tel) {
+        std::snprintf(buf, sizeof(buf), "%.0f%%", rlTelemetry_.cpuLoadPercent);
+    } else {
+        std::snprintf(buf, sizeof(buf), "--");
+    }
+    block(2, "CPU", buf, tel ? rlTelemetry_.cpuLoadPercent / 100.0f : 0.0f, false);
+    PopMono();
+}
+
+void ConfiguratorApp::DrawChainStrip(float y) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ThemeSettings& th = GetThemeSettings();
+    const float W = static_cast<float>(windowWidth_);
+    const float H = kChainHeight * dpiScale_;
+    dl->AddRectFilled(ImVec2(0.0f, y), ImVec2(W, y + H), ImGui::GetColorU32(th.panel));
+    dl->AddRectFilled(ImVec2(0.0f, y + H - 2.0f), ImVec2(W, y + H),
+                      ImGui::GetColorU32(GetKeyEdge()));
+
+    struct Stage { const char* label; Page page; };
+    static const Stage stages[] = {
+        {"HOME", Page::Overview}, {"MIDI", Page::Midi}, {"SYNTH", Page::Synth},
+        {"REVERB", Page::Reverb}, {"LIMITER", Page::Limiter}, {"OUT", Page::Audio}};
+    const auto& w = config_.Working();
+    auto lamp = [&](Page p) {
+        switch (p) {
+            case Page::Reverb:  return w.enableReverb;
+            case Page::Limiter: return w.limiterEnabled;
+            default:            return true;
         }
-
-        const bool selected = (currentPage_ == page);
-        const float keyH = 28.0f;
-        const float keyW = sidebarW - 20.0f;
-        ImGui::SetCursorPosX(10.0f);
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        ImGui::PushID(label);
-        if (ImGui::InvisibleButton("##nav", ImVec2(keyW, keyH))) {
-            currentPage_ = page;
-        }
-        const bool hov = ImGui::IsItemHovered();
-        ImGui::PopID();
-
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float drop = selected ? 2.0f : 0.0f;
-        const float edgeH = selected ? 1.0f : 3.0f;
-        const float bottom = p.y + keyH - (selected ? 2.0f : 0.0f);
-        const ImVec4 face = Mix(th.control, th.text,
-                                selected ? 0.07f : (hov ? 0.04f : 0.0f));
-        dl->AddRectFilled(ImVec2(p.x, p.y + drop), ImVec2(p.x + keyW, bottom),
-                          ImGui::GetColorU32(GetKeyEdge()), th.cornerRadius);
-        dl->AddRectFilled(ImVec2(p.x, p.y + drop),
-                          ImVec2(p.x + keyW, bottom - edgeH),
-                          ImGui::GetColorU32(face), th.cornerRadius);
-        DrawLed(dl, ImVec2(p.x + 12.0f, p.y + drop + (keyH - edgeH) * 0.5f),
-                3.0f, selected);
-        dl->AddText(ImVec2(p.x + 26.0f,
-                           p.y + drop + (keyH - edgeH - ImGui::GetTextLineHeight()) * 0.5f),
-                    ImGui::GetColorU32(selected ? th.text : th.mutedText), label);
-        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + keyH + 4.0f));
-        ImGui::Dummy(ImVec2(1.0f, 0.0f));
     };
 
-    drawNavItem("Overview", Page::Overview, "GENERAL");
-    drawNavItem("Audio", Page::Audio, nullptr);
-    drawNavItem("Performance", Page::Performance, nullptr);
-    drawNavItem("MIDI / Events", Page::Midi, nullptr);
-    drawNavItem("Offline Renderer", Page::OfflineRenderer, nullptr);
-    drawNavItem("Live Recording", Page::LiveRecording, nullptr);
+    auto drawKey = [&](const char* label, ImVec2 pos, float keyW, bool pressed,
+                       bool lampOn, bool hovered) {
+        const float keyH = 28.0f;
+        const float drop = pressed ? 2.0f : 0.0f;
+        const float edgeH = pressed ? 1.0f : 3.0f;
+        const float bottom = pos.y + keyH - (pressed ? 2.0f : 0.0f);
+        const ImVec4 face = Mix(th.control, th.text, pressed ? 0.07f : (hovered ? 0.04f : 0.0f));
+        dl->AddRectFilled(ImVec2(pos.x, pos.y + drop), ImVec2(pos.x + keyW, bottom),
+                          ImGui::GetColorU32(GetKeyEdge()), th.cornerRadius);
+        dl->AddRectFilled(ImVec2(pos.x, pos.y + drop), ImVec2(pos.x + keyW, bottom - edgeH),
+                          ImGui::GetColorU32(face), th.cornerRadius);
+        DrawLed(dl, ImVec2(pos.x + 13.0f, pos.y + drop + (keyH - edgeH) * 0.5f), 3.0f, lampOn);
+        dl->AddText(ImVec2(pos.x + 26.0f,
+                           pos.y + drop + (keyH - edgeH - ImGui::GetTextLineHeight()) * 0.5f),
+                    ImGui::GetColorU32(pressed ? th.text : th.mutedText), label);
+    };
 
-    drawNavItem("Reverb", Page::Reverb, "EFFECTS");
-    drawNavItem("Limiter", Page::Limiter, nullptr);
-    drawNavItem("Per-Channel Limiter", Page::ChannelLimiter, nullptr);
-
-    drawNavItem("Diagnostics", Page::Diagnostics, "SYSTEM");
-    drawNavItem("Advanced", Page::Advanced, nullptr);
-    drawNavItem("About", Page::About, nullptr);
-
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
-    {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 wp = ImGui::GetWindowPos();
-        dl->AddRectFilled(ImVec2(wp.x + sidebarW - 2.0f, wp.y + headerH),
-                          ImVec2(wp.x + sidebarW, wp.y + headerH + sidebarH),
-                          ImGui::GetColorU32(GetKeyEdge()));
+    PushMono(0.95f);
+    const float keyY = y + (H - 2.0f - 28.0f) * 0.5f;
+    float x = 16.0f;
+    const int count = static_cast<int>(sizeof(stages) / sizeof(stages[0]));
+    for (int i = 0; i < count; ++i) {
+        const Stage& s = stages[i];
+        const float keyW = ImGui::CalcTextSize(s.label).x + 40.0f;
+        ImGui::SetCursorPos(ImVec2(x, keyY));
+        ImGui::PushID(i);
+        if (ImGui::InvisibleButton("##stage", ImVec2(keyW, 28.0f))) currentPage_ = s.page;
+        const bool hov = ImGui::IsItemHovered();
+        ImGui::PopID();
+        const bool selected = currentPage_ == s.page;
+        drawKey(s.label, ImVec2(x, keyY), keyW, selected,
+                i == 0 ? selected : lamp(s.page), hov);
+        x += keyW;
+        if (i + 1 < count) {
+            const float cy = keyY + 14.0f;
+            if (i == 0) {
+                // Home is the hub, not a stage: a divider instead of a signal line.
+                dl->AddLine(ImVec2(x + 14.0f, cy - 10.0f), ImVec2(x + 14.0f, cy + 10.0f),
+                            ImGui::GetColorU32(GetPanelEdge()), 1.0f);
+                x += 28.0f;
+            } else {
+                dl->AddLine(ImVec2(x + 4.0f, cy), ImVec2(x + 26.0f, cy),
+                            ImGui::GetColorU32(GetPanelEdge()), 1.5f);
+                dl->AddTriangleFilled(ImVec2(x + 26.0f, cy - 4.0f), ImVec2(x + 26.0f, cy + 4.0f),
+                                      ImVec2(x + 32.0f, cy),
+                                      ImGui::GetColorU32(GetPanelEdge()));
+                x += 36.0f;
+            }
+        }
     }
+
+    // Tools: the pages you open occasionally.
+    struct Tool { const char* label; Page page; };
+    static const Tool tools[] = {
+        {"Per-channel limiter", Page::ChannelLimiter},
+        {"Offline renderer", Page::OfflineRenderer},
+        {"Live recording", Page::LiveRecording},
+        {"Diagnostics", Page::Diagnostics},
+        {"Advanced / theme", Page::Advanced},
+        {"About", Page::About}};
+    const char* toolLabel = "TOOLS";
+    bool toolActive = false;
+    for (const Tool& t : tools)
+        if (currentPage_ == t.page) { toolLabel = t.label; toolActive = true; }
+    const float toolW = ImGui::CalcTextSize(toolLabel).x + 52.0f;
+    const float toolX = W - toolW - 16.0f;
+    ImGui::SetCursorPos(ImVec2(toolX, keyY));
+    if (ImGui::InvisibleButton("##tools", ImVec2(toolW, 28.0f))) ImGui::OpenPopup("##tools_menu");
+    drawKey(toolLabel, ImVec2(toolX, keyY), toolW, toolActive, toolActive, ImGui::IsItemHovered());
+    dl->AddTriangleFilled(ImVec2(toolX + toolW - 20.0f, keyY + 11.0f),
+                          ImVec2(toolX + toolW - 10.0f, keyY + 11.0f),
+                          ImVec2(toolX + toolW - 15.0f, keyY + 17.0f),
+                          ImGui::GetColorU32(th.mutedText));
+    PopMono();
+
+    // Menu: same rack look as the rest of the app, right-aligned under the key.
+    const float menuW = 240.0f;
+    ImGui::SetNextWindowPos(ImVec2(W - menuW - 16.0f, keyY + 34.0f));
+    ImGui::SetNextWindowSize(ImVec2(menuW, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, th.panel);
+    ImGui::PushStyleColor(ImGuiCol_Border, GetPanelEdge());
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, th.cornerRadius + 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 4.0f));
+    if (ImGui::BeginPopup("##tools_menu")) {
+        ImDrawList* pdl = ImGui::GetWindowDrawList();
+        PushMono(0.95f);
+        for (const Tool& t : tools) {
+            const bool selected = currentPage_ == t.page;
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            const float itemW = ImGui::GetContentRegionAvail().x;
+            ImGui::PushID(t.label);
+            if (ImGui::InvisibleButton("##tool", ImVec2(itemW, 28.0f))) {
+                currentPage_ = t.page;
+                ImGui::CloseCurrentPopup();
+            }
+            const bool hov = ImGui::IsItemHovered();
+            ImGui::PopID();
+            if (selected || hov) {
+                pdl->AddRectFilled(p, ImVec2(p.x + itemW, p.y + 28.0f),
+                                   ImGui::GetColorU32(Mix(th.control, th.text, selected ? 0.07f : 0.03f)),
+                                   th.cornerRadius);
+            }
+            DrawLed(pdl, ImVec2(p.x + 14.0f, p.y + 14.0f), 3.0f, selected);
+            pdl->AddText(ImVec2(p.x + 30.0f, p.y + (28.0f - ImGui::GetTextLineHeight()) * 0.5f),
+                         ImGui::GetColorU32(selected ? th.text : th.mutedText), t.label);
+        }
+        PopMono();
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(2);
 }
 
 void ConfiguratorApp::DrawFooter() {
-    {
-        const ThemeSettings& th = GetThemeSettings();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float footerTop = static_cast<float>(windowHeight_) - kFooterHeight * dpiScale_;
-        const ImVec2 wp = ImGui::GetWindowPos();
-        dl->AddRectFilled(ImVec2(wp.x, wp.y + footerTop),
-                          ImVec2(wp.x + static_cast<float>(windowWidth_),
-                                 wp.y + static_cast<float>(windowHeight_)),
-                          ImGui::GetColorU32(th.panel));
-        dl->AddRectFilled(ImVec2(wp.x, wp.y + footerTop),
-                          ImVec2(wp.x + static_cast<float>(windowWidth_), wp.y + footerTop + 2.0f),
-                          ImGui::GetColorU32(GetKeyEdge()));
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        DrawLed(dl, ImVec2(p.x + 5.0f, p.y + ImGui::GetTextLineHeight() * 0.5f + 4.0f),
-                4.0f, config_.IsDirty());
-        ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + 18.0f, ImGui::GetCursorPosY() + 4.0f));
-    }
-    const float startX = ImGui::GetCursorPosX();
-    const float avail = ImGui::GetContentRegionAvail().x;
+    const ThemeSettings& th = GetThemeSettings();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float W = static_cast<float>(windowWidth_);
+    const float footerH = kFooterHeight * dpiScale_;
+    const float footerTop = static_cast<float>(windowHeight_) - footerH;
+    dl->AddRectFilled(ImVec2(0.0f, footerTop), ImVec2(W, static_cast<float>(windowHeight_)),
+                      ImGui::GetColorU32(th.panel));
+    dl->AddRectFilled(ImVec2(0.0f, footerTop), ImVec2(W, footerTop + 2.0f),
+                      ImGui::GetColorU32(GetKeyEdge()));
 
-    constexpr float kRevertW = 70.0f;
-    constexpr float kAdoptW = 108.0f;
-    constexpr float kSaveW = 160.0f;
+    // One row: every element is centred on the same line.
+    constexpr float kKeyH = 30.0f;
+    const float rowY = footerTop + (footerH - kKeyH) * 0.5f + 1.0f;
+    const float textY = rowY + (kKeyH - ImGui::GetTextLineHeight()) * 0.5f;
+
+    constexpr float kRevertW = 80.0f;
+    constexpr float kAdoptW = 116.0f;
+    constexpr float kSaveW = 170.0f;
     constexpr float kGap = 8.0f;
     constexpr float kButtonGroupW = kRevertW + kGap + kAdoptW + kGap + kSaveW;
+    const float buttonX = (std::max)(16.0f, W - 16.0f - kButtonGroupW);
 
-    const float buttonX = startX + (std::max)(0.0f, avail - kButtonGroupW);
-    const float leftBudget = (std::max)(0.0f, buttonX - startX - 12.0f);
+    float x = 16.0f;
+    DrawLed(dl, ImVec2(x + 4.0f, rowY + kKeyH * 0.5f), 4.0f, config_.IsDirty());
+    x += 20.0f;
+    const float leftBudget = (std::max)(0.0f, buttonX - x - 12.0f);
     const bool compact = leftBudget < 330.0f;
     const bool veryCompact = leftBudget < 230.0f;
 
+    auto text = [&](const char* s, const ImVec4& color) {
+        ImGui::SetCursorPos(ImVec2(x, textY));
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+        ImGui::TextUnformatted(s);
+        ImGui::PopStyleColor();
+        x += ImGui::CalcTextSize(s).x + 14.0f;
+    };
+
     if (!veryCompact) {
-        if (config_.IsDirty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
-            ImGui::TextUnformatted(compact ? "Modified" : "Configuration modified");
-            ImGui::PopStyleColor();
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
-            ImGui::TextUnformatted(compact ? "Saved" : "Configuration saved");
-            ImGui::PopStyleColor();
-        }
-        ImGui::SameLine(0.0f, 12.0f);
+        if (config_.IsDirty()) text(compact ? "Modified" : "Configuration modified", GetWarning());
+        else text(compact ? "Saved" : "Configuration saved", GetMutedText());
     }
 
+    constexpr float kSmallKeyH = 26.0f;
     if (rlConnected_) {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
+        char buf[96];
         if (compact || veryCompact) {
-            ImGui::Text("PID %u / RL%u", rlClient_.GetPID(),
-                        static_cast<uint32_t>(rlClient_.GetProtocol()));
+            std::snprintf(buf, sizeof(buf), "PID %u / RL%u", rlClient_.GetPID(),
+                          static_cast<uint32_t>(rlClient_.GetProtocol()));
         } else {
-            ImGui::Text("Driver PID %u / RuntimeLink %u", rlClient_.GetPID(),
-                        static_cast<uint32_t>(rlClient_.GetProtocol()));
+            std::snprintf(buf, sizeof(buf), "Driver PID %u / RuntimeLink %u",
+                          rlClient_.GetPID(),
+                          static_cast<uint32_t>(rlClient_.GetProtocol()));
         }
-        ImGui::PopStyleColor();
-        ImGui::SameLine(0.0f, 6.0f);
-        if (ImGui::SmallButton("Disconnect")) {
+        text(buf, GetSuccess());
+        ImGui::SetCursorPos(ImVec2(x, rowY + (kKeyH - kSmallKeyH) * 0.5f));
+        if (KeyButton("Disconnect", ImVec2(96.0f, kSmallKeyH))) {
             rlClient_.Close();
             rlConnected_ = false;
             statusMessage_ = "Disconnected from driver";
@@ -857,9 +1002,9 @@ void ConfiguratorApp::DrawFooter() {
             toastMessage_ = statusMessage_;
         }
     } else {
-        ImGui::TextDisabled(veryCompact ? "Offline" : "No driver");
-        ImGui::SameLine(0.0f, 6.0f);
-        if (ImGui::SmallButton("Connect")) {
+        text(veryCompact ? "Offline" : "No driver", GetMutedText());
+        ImGui::SetCursorPos(ImVec2(x, rowY + (kKeyH - kSmallKeyH) * 0.5f));
+        if (KeyButton("Connect", ImVec2(84.0f, kSmallKeyH))) {
             if (TryAutoDiscoverDriver()) {
                 OnConnected();
             } else {
@@ -870,10 +1015,9 @@ void ConfiguratorApp::DrawFooter() {
         }
     }
 
-    ImGui::SameLine(buttonX);
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 4.0f);
-    if (KeyButton("Revert", ImVec2(kRevertW, 30))) {
+    float bx = buttonX;
+    ImGui::SetCursorPos(ImVec2(bx, rowY));
+    if (KeyButton("Revert", ImVec2(kRevertW, kKeyH), false, config_.IsDirty())) {
         config_.Revert();
         PushAllLiveParams();
         statusMessage_ = "Configuration reverted";
@@ -881,36 +1025,18 @@ void ConfiguratorApp::DrawFooter() {
         toastMessage_ = "Configuration reverted";
     }
 
-    ImGui::SameLine(0.0f, kGap);
-
+    bx += kRevertW + kGap;
     const bool liveSupported = rlConnected_ && rlClient_.HasCapability(
         svms::build::CapabilityLiveConfiguration);
-    bool canAdopt = liveSupported;
-    if (!canAdopt) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-    }
-    if (KeyButton("Adopt Engine", ImVec2(kAdoptW, 30)) && canAdopt) {
+    ImGui::SetCursorPos(ImVec2(bx, rowY));
+    if (KeyButton("Adopt Engine", ImVec2(kAdoptW, kKeyH), false, liveSupported)) {
         AdoptEngineLiveState();
     }
-    if (!canAdopt) {
-        ImGui::PopStyleVar();
-    }
 
-    ImGui::SameLine(0.0f, kGap);
-
-    bool canSave = config_.IsDirty() && !config_.IsReadOnly();
-    if (!canSave) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-    }
-
-    ImVec4 saveButton = canSave ? GetAccent() : GetThemeSettings().control;
-    saveButton.w = canSave ? 0.60f : 1.0f;
-    ImVec4 saveHover = GetAccentHover();
-    saveHover.w = 0.82f;
-    ImGui::PushStyleColor(ImGuiCol_Button, saveButton);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, saveHover);
-
-    if (KeyButton("Save Configuration", ImVec2(kSaveW, 30), canSave) && canSave) {
+    bx += kAdoptW + kGap;
+    const bool canSave = config_.IsDirty() && !config_.IsReadOnly();
+    ImGui::SetCursorPos(ImVec2(bx, rowY));
+    if (KeyButton("Save Configuration", ImVec2(kSaveW, kKeyH), canSave, canSave)) {
         auto path = config_.GetActivePath();
         ConfigValidation v = config_.Validate();
         if (v.valid) {
@@ -927,11 +1053,6 @@ void ConfiguratorApp::DrawFooter() {
             toastTimer_ = 5.0f;
             toastMessage_ = "Validation failed: " + v.warnings;
         }
-    }
-
-    ImGui::PopStyleColor(2);
-    if (!canSave) {
-        ImGui::PopStyleVar();
     }
 
     if (toastTimer_ > 0.0f) {
@@ -953,7 +1074,11 @@ void ConfiguratorApp::DrawPageContent() {
     BeginAutoPanels();
     switch (currentPage_) {
     case Page::Overview:    DrawOverviewPage(config_); break;
-    case Page::Audio:       DrawAudioPage(config_, easterEggs_); break;
+    case Page::Audio:       DrawAudioPage(config_, easterEggs_, AudioView::Output); break;
+    case Page::Synth:
+        DrawPerformancePage(config_);
+        DrawAudioPage(config_, easterEggs_, AudioView::SoundFont);
+        break;
     case Page::Performance: DrawPerformancePage(config_); break;
     case Page::Midi:        DrawMidiPage(config_); break;
     case Page::OfflineRenderer:

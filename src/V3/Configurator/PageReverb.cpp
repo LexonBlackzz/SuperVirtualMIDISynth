@@ -242,6 +242,10 @@ void DrawTonePanel(ConfigDocument& doc, float knob) {
 
 } // namespace
 
+void DrawDecayTraceMini(const ImVec2& size, const ConfigValues& values) {
+    DrawDecayTrace(size, values);
+}
+
 void DrawReverbPage(ConfigDocument& doc) {
     PushEffectPageStyle();
 

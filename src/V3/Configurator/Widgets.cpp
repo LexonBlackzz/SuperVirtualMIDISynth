@@ -267,14 +267,27 @@ bool KeyGroup(const char* id, int* current, const char* const* labels,
     return changed;
 }
 
-bool KeyButton(const char* label, const ImVec2& size, bool primary) {
+bool KeyButton(const char* label, const ImVec2& size, bool primary, bool enabled) {
     const ThemeSettings& th = GetThemeSettings();
     ImGui::PushID(label);
     const ImVec2 p = ImGui::GetCursorScreenPos();
-    const bool clicked = ImGui::InvisibleButton("##key", size);
-    const bool hov = ImGui::IsItemHovered();
-    const bool down = ImGui::IsItemActive();
+    const bool clicked = ImGui::InvisibleButton("##key", size) && enabled;
+    const bool hov = ImGui::IsItemHovered() && enabled;
+    const bool down = ImGui::IsItemActive() && enabled;
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (!enabled) {
+        // Flat, recessed, dim: clearly not pressable.
+        dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y),
+                          ImGui::GetColorU32(Mix(th.control, th.background, 0.55f)),
+                          th.cornerRadius);
+        dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y),
+                    ImGui::GetColorU32(GetPanelEdge()), th.cornerRadius);
+        const ImVec2 dts = ImGui::CalcTextSize(label);
+        dl->AddText(ImVec2(p.x + (size.x - dts.x) * 0.5f, p.y + (size.y - dts.y) * 0.5f),
+                    ImGui::GetColorU32(Alpha(th.mutedText, 0.45f)), label);
+        ImGui::PopID();
+        return false;
+    }
     const float edgeH = down ? 1.0f : 3.0f;
     const float drop = down ? 2.0f : 0.0f;
     const ImVec4 face = primary

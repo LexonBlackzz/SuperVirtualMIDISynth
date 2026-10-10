@@ -6,7 +6,11 @@ struct EasterEggState;
 
 namespace svms::cfg {
 
-void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs);
+// Output = device/rate/buffer/backend; SoundFont = the SoundFont stack.
+enum class AudioView { Both, Output, SoundFont };
+
+void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
+                   AudioView view = AudioView::Both);
 
 } // namespace svms::cfg
 

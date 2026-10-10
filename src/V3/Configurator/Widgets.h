@@ -45,7 +45,9 @@ void EndRackPanel();
 bool KeyGroup(const char* id, int* current, const char* const* labels,
               int count);
 // Raised push key. `primary` fills with the accent colour.
-bool KeyButton(const char* label, const ImVec2& size, bool primary = false);
+// A disabled key is drawn flat and dim and never reports a click.
+bool KeyButton(const char* label, const ImVec2& size, bool primary = false,
+               bool enabled = true);
 // Small lamp; `on` lights it with the accent colour.
 void DrawLed(ImDrawList* dl, ImVec2 center, float radius, bool on,
              const ImVec4* color = nullptr);

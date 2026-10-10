@@ -10,6 +10,15 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-10 feat(v3): configurator is a signal chain, not a sidebar of pages
+  Someone said it looked like the Realtek console, and structurally it did: a
+  sidebar of pages full of label/control rows. The sidebar is gone. A master
+  strip (volume, output meter, voices, CPU) is always visible, and a clickable
+  chain HOME / MIDI -> SYNTH -> REVERB -> LIMITER -> OUT replaces it, with a
+  TOOLS menu for the pages you open rarely. Home is a four-module front panel
+  (live knobs, OPEN jumps to a stage); Esc goes back to Home. The footer is one
+  aligned row with flat disabled keys. No setting was removed.
+
 - 2026-10-10 feat(v3): rack-style configurator (theme, widgets, page layouts)
   People said the configurator was ugly, so I redid it as a hardware rack:
   warm chassis, raised keys with lamps, LCD readouts, screwed panels, mono

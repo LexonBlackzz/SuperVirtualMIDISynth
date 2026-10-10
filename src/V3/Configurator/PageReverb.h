@@ -12,6 +12,10 @@ namespace svms::cfg {
 
 void DrawReverbPage(ConfigDocument& doc);
 
+struct ConfigValues;
+// The LCD decay trace, sized by the caller (used by the Home overview).
+void DrawDecayTraceMini(const ImVec2& size, const ConfigValues& values);
+
 } // namespace svms::cfg
 
 #endif
