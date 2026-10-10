@@ -26,6 +26,8 @@ struct ThemeSettings {
     float colorStrength = 0.65f;
     float cornerRadius = 4.0f;
     float density = 1.0f;
+    // 0 = Rack (bevelled keys, lamps, screws, caps), 1 = Refined (flat).
+    int style = 0;
 };
 
 enum class ThemeStorage {

@@ -785,11 +785,11 @@ void ConfiguratorApp::DrawMasterStrip(float y) {
     const float x0 = 130.0f;
     const float gap = 30.0f;
     const float blockW = (std::max)(120.0f, (W - x0 - 24.0f - gap * 2.0f) / 3.0f);
-    PushMono(0.85f);
+    PushLabel(0.85f);
     char buf[64];
     auto block = [&](int i, const char* label, const char* value, float frac, bool accent) {
         const float x = x0 + i * (blockW + gap);
-        dl->AddText(ImVec2(x, y + 20.0f), ImGui::GetColorU32(th.mutedText), label);
+        dl->AddText(ImVec2(x, y + 20.0f), ImGui::GetColorU32(th.mutedText), StyleText(label).c_str());
         const ImVec2 vs = ImGui::CalcTextSize(value);
         dl->AddText(ImVec2(x + blockW - vs.x, y + 20.0f), ImGui::GetColorU32(th.accent), value);
         DrawHSegBar(dl, ImVec2(x, y + 44.0f), blockW, frac, accent);
@@ -818,7 +818,7 @@ void ConfiguratorApp::DrawMasterStrip(float y) {
         std::snprintf(buf, sizeof(buf), "--");
     }
     block(2, "CPU", buf, tel ? rlTelemetry_.cpuLoadPercent / 100.0f : 0.0f, false);
-    PopMono();
+    PopLabel();
 }
 
 void ConfiguratorApp::DrawChainStrip(float y) {
@@ -846,6 +846,20 @@ void ConfiguratorApp::DrawChainStrip(float y) {
     auto drawKey = [&](const char* label, ImVec2 pos, float keyW, bool pressed,
                        bool lampOn, bool hovered) {
         const float keyH = 28.0f;
+        if (th.style == 1) {
+            // Refined: flat pill; the current stage is filled.
+            const ImVec4 face = pressed ? Mix(th.control, th.text, 0.12f)
+                                        : Mix(th.panel, th.text, hovered ? 0.08f : 0.04f);
+            dl->AddRectFilled(pos, ImVec2(pos.x + keyW, pos.y + keyH),
+                              ImGui::GetColorU32(face), th.cornerRadius + 2.0f);
+            if (lampOn) {
+                dl->AddCircleFilled(ImVec2(pos.x + 13.0f, pos.y + keyH * 0.5f), 2.8f,
+                                    ImGui::GetColorU32(th.accent), 12);
+            }
+            dl->AddText(ImVec2(pos.x + 26.0f, pos.y + (keyH - ImGui::GetTextLineHeight()) * 0.5f),
+                        ImGui::GetColorU32(pressed ? th.text : th.mutedText), label);
+            return;
+        }
         const float drop = pressed ? 2.0f : 0.0f;
         const float edgeH = pressed ? 1.0f : 3.0f;
         const float bottom = pos.y + keyH - (pressed ? 2.0f : 0.0f);
@@ -860,20 +874,21 @@ void ConfiguratorApp::DrawChainStrip(float y) {
                     ImGui::GetColorU32(pressed ? th.text : th.mutedText), label);
     };
 
-    PushMono(0.95f);
+    PushLabel(0.95f);
     const float keyY = y + (H - 2.0f - 28.0f) * 0.5f;
     float x = 16.0f;
     const int count = static_cast<int>(sizeof(stages) / sizeof(stages[0]));
     for (int i = 0; i < count; ++i) {
         const Stage& s = stages[i];
-        const float keyW = ImGui::CalcTextSize(s.label).x + 40.0f;
+        const std::string stageLabel = StyleText(s.label);
+        const float keyW = ImGui::CalcTextSize(stageLabel.c_str()).x + 40.0f;
         ImGui::SetCursorPos(ImVec2(x, keyY));
         ImGui::PushID(i);
         if (ImGui::InvisibleButton("##stage", ImVec2(keyW, 28.0f))) currentPage_ = s.page;
         const bool hov = ImGui::IsItemHovered();
         ImGui::PopID();
         const bool selected = currentPage_ == s.page;
-        drawKey(s.label, ImVec2(x, keyY), keyW, selected,
+        drawKey(stageLabel.c_str(), ImVec2(x, keyY), keyW, selected,
                 i == 0 ? selected : lamp(s.page), hov);
         x += keyW;
         if (i + 1 < count) {
@@ -907,16 +922,17 @@ void ConfiguratorApp::DrawChainStrip(float y) {
     bool toolActive = false;
     for (const Tool& t : tools)
         if (currentPage_ == t.page) { toolLabel = t.label; toolActive = true; }
-    const float toolW = ImGui::CalcTextSize(toolLabel).x + 52.0f;
+    const std::string toolStr = StyleText(toolLabel);
+    const float toolW = ImGui::CalcTextSize(toolStr.c_str()).x + 52.0f;
     const float toolX = W - toolW - 16.0f;
     ImGui::SetCursorPos(ImVec2(toolX, keyY));
     if (ImGui::InvisibleButton("##tools", ImVec2(toolW, 28.0f))) ImGui::OpenPopup("##tools_menu");
-    drawKey(toolLabel, ImVec2(toolX, keyY), toolW, toolActive, toolActive, ImGui::IsItemHovered());
+    drawKey(toolStr.c_str(), ImVec2(toolX, keyY), toolW, toolActive, toolActive, ImGui::IsItemHovered());
     dl->AddTriangleFilled(ImVec2(toolX + toolW - 20.0f, keyY + 11.0f),
                           ImVec2(toolX + toolW - 10.0f, keyY + 11.0f),
                           ImVec2(toolX + toolW - 15.0f, keyY + 17.0f),
                           ImGui::GetColorU32(th.mutedText));
-    PopMono();
+    PopLabel();
 
     // Menu: same rack look as the rest of the app, right-aligned under the key.
     const float menuW = 240.0f;
@@ -930,7 +946,7 @@ void ConfiguratorApp::DrawChainStrip(float y) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 4.0f));
     if (ImGui::BeginPopup("##tools_menu")) {
         ImDrawList* pdl = ImGui::GetWindowDrawList();
-        PushMono(0.95f);
+        PushLabel(0.95f);
         for (const Tool& t : tools) {
             const bool selected = currentPage_ == t.page;
             const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -951,7 +967,7 @@ void ConfiguratorApp::DrawChainStrip(float y) {
             pdl->AddText(ImVec2(p.x + 30.0f, p.y + (28.0f - ImGui::GetTextLineHeight()) * 0.5f),
                          ImGui::GetColorU32(selected ? th.text : th.mutedText), t.label);
         }
-        PopMono();
+        PopLabel();
         ImGui::EndPopup();
     }
     ImGui::PopStyleVar(4);

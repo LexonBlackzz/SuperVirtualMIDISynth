@@ -10,6 +10,15 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-11 feat(v3): configurator Style option (Rack / Refined) and key spacing fix
+  Feedback was that the rack look reads like an old plugin, and that the key
+  labels had no room (lamp and text were stacked tight). Rack keys are now
+  taller and wider with the lamp clear of the label. New theme option Style:
+  Rack (unchanged look) or Refined (flat panels, segmented key tracks, pill
+  toggles, quiet restart chips, sentence-case sans labels via StyleText, no
+  screws or tick marks). Stored as "style" in the theme file; old themes load
+  as Rack. RESTART tags follow the accent instead of a fixed amber.
+
 - 2026-10-10 feat(v3): SoundFont panels, Ctrl+click knob entry, window minimum size
   SoundFont is now a current-font LCD with Browse/Clear/Load now keys, a folder
   browser beside it, a bank stack with Up/Down/Remove keys and a routes panel.

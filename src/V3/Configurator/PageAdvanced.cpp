@@ -148,6 +148,19 @@ void DrawAdvancedPage(ConfigDocument& doc) {
         ImGuiColorEditFlags_NoSmallPreview);
 
     ImGui::Spacing();
+    ImGui::TextDisabled("Style");
+    {
+        static const char* styleLabels[] = {"Rack", "Refined"};
+        int style = theme.style;
+        if (KeyGroup("##theme_style", &style, styleLabels, 2)) {
+            theme.style = style;
+            themeChanged = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Rack: bevelled keys, lamps and screws. Refined: flat, sentence case.");
+    }
+
+    ImGui::Spacing();
     ImGui::TextDisabled("Presets");
     {
         struct Preset { const char* name; ImVec4 accent; float strength; };

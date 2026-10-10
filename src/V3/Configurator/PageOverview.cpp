@@ -100,9 +100,7 @@ void SynthModule(ConfigDocument& doc) {
         ImGui::Dummy(ImVec2(width, height));
 
         ImGui::Spacing();
-        PushMono();
-        ImGui::TextDisabled("MAX VOICES");
-        PopMono();
+        PanelCaption("MAX VOICES", nullptr);
         static const uint32_t values[] = {1024, 2048, 4096, 8192, 16384, 65536};
         static const char* labels[] = {"1k", "2k", "4k", "8k", "16k", "64k"};
         int idx = -1;

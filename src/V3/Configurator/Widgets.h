@@ -35,6 +35,12 @@ void PushLiveLimiterAlgorithm(uint32_t value);
 void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs);
 
 // --- Rack-style primitives -------------------------------------------------
+// Text style for labels: Rack = mono caps as authored, Refined = UI font in
+// sentence case. StyleText converts at draw time (acronyms are kept).
+std::string StyleText(const char* text);
+void PushLabel(float scale = 0.9f);
+void PopLabel();
+bool IsRefinedStyle();
 // Monospace font for readouts; falls back to the UI font when unavailable.
 void PushMono(float scale = 0.9f);
 void PopMono();

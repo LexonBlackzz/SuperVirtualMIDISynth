@@ -188,6 +188,8 @@ bool LoadThemeFile(const std::filesystem::path& path,
             t.cornerRadius = root["cornerRadius"].get<float>();
         if (root.contains("density") && root["density"].is_number())
             t.density = root["density"].get<float>();
+        if (root.contains("style") && root["style"].is_number_integer())
+            t.style = (std::max)(0, (std::min)(1, root["style"].get<int>()));
 
         t.colorStrength = (std::max)(0.0f, (std::min)(1.0f, t.colorStrength));
         t.cornerRadius = (std::max)(0.0f, (std::min)(12.0f, t.cornerRadius));
@@ -216,6 +218,7 @@ nlohmann::json ThemeToJson(const ThemeSettings& t) {
         {"colorStrength", t.colorStrength},
         {"cornerRadius", t.cornerRadius},
         {"density", t.density},
+        {"style", t.style},
     };
 }
 
