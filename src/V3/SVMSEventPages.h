@@ -226,7 +226,10 @@ public:
         pageCount_ = pageCount;
         compilerFreeTop_ = pageCount;
         for (uint32_t i = 0u; i < pageCount; ++i) {
-            new (&pages_[i]) CompiledEventPage{};
+            // Header only: constructing the page would zero-fill its whole
+            // 128 KiB event array and make every page resident up front.
+            // Pages are fully written by the compiler before being read.
+            pages_[i].count = 0u;
             compilerFree_[i] = pageCount - 1u - i;
         }
         readyEventCount_.store(0u, std::memory_order_relaxed);

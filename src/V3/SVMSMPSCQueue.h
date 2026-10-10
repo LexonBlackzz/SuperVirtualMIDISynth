@@ -5,10 +5,20 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <type_traits>
 #include <utility>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace svms {
 
@@ -143,6 +153,12 @@ private:
 // algorithm as the fixed-size test queue. The requested capacity is rounded
 // up to a power of two so indexing is a mask, never a 64-bit integer division
 // on the producer or compiler hot path.
+//
+// Cell sequences are stored relative to the cell's own index
+// (stored = sequence - index), so all-zero memory is a valid empty ring.
+// The storage comes straight from the OS zero-page allocator and is never
+// touched at configure time: resident memory follows what has actually been
+// used, not the configured capacity.
 template <typename T>
 class DynamicMPSCQueue {
     static_assert(std::is_trivially_copyable_v<T>);
@@ -167,16 +183,24 @@ public:
         }
         uint32_t rounded = 2u;
         while (rounded < capacity) rounded <<= 1u;
-        Cell* replacement = static_cast<Cell*>(::operator new[](
-            sizeof(Cell) * static_cast<size_t>(rounded),
-            std::align_val_t{64}, std::nothrow));
-        if (!replacement) return false;
+        // Page-aligned OS blocks put every lane's cell[i] at the same offset
+        // modulo 4 KiB, so the producer's store into one lane falsely stalls
+        // its next load from another (4K aliasing, ~25% producer rate).
+        // Stagger each queue's base by a different multiple of 64 bytes.
+        static std::atomic<uint32_t> nextColor{0u};
+        const size_t color = static_cast<size_t>(
+            (nextColor.fetch_add(1u, std::memory_order_relaxed) * 17u) % 61u)
+            * 64u;
+        void* block = AllocateZeroed(
+            sizeof(Cell) * static_cast<size_t>(rounded) + 4096u);
+        if (!block) return false;
+        Cell* replacement = reinterpret_cast<Cell*>(
+            static_cast<unsigned char*>(block) + color);
         Release();
+        block_ = block;
         cells_ = replacement;
         capacity_ = rounded;
         capacityMask_ = rounded - 1u;
-        for (uint64_t i = 0u; i < capacity_; ++i)
-            new (&cells_[i]) Cell{std::atomic<uint64_t>(i), T{}};
         enqueue_.store(0u, std::memory_order_relaxed);
         dequeue_.store(0u, std::memory_order_relaxed);
         return true;
@@ -186,9 +210,10 @@ public:
         if (!cells_) return false;
         uint64_t position = enqueue_.load(std::memory_order_relaxed);
         for (;;) {
-            Cell& cell = cells_[static_cast<size_t>(position & capacityMask_)];
+            const uint64_t index = position & capacityMask_;
+            Cell& cell = cells_[static_cast<size_t>(index)];
             const uint64_t sequence =
-                cell.sequence.load(std::memory_order_acquire);
+                cell.sequence.load(std::memory_order_acquire) + index;
             const intptr_t difference =
                 static_cast<intptr_t>(sequence - position);
             if (difference == 0) {
@@ -197,7 +222,7 @@ public:
                         std::memory_order_relaxed,
                         std::memory_order_relaxed)) {
                     cell.value = value;
-                    cell.sequence.store(position + 1u,
+                    cell.sequence.store(position + 1u - index,
                                         std::memory_order_release);
                     return true;
                 }
@@ -216,10 +241,10 @@ public:
         for (;;) {
             bool retry = false;
             for (uint32_t i = 0u; i < count; ++i) {
-                Cell& cell = cells_[static_cast<size_t>(
-                    (position + i) & capacityMask_)];
+                const uint64_t index = (position + i) & capacityMask_;
+                Cell& cell = cells_[static_cast<size_t>(index)];
                 const uint64_t sequence =
-                    cell.sequence.load(std::memory_order_acquire);
+                    cell.sequence.load(std::memory_order_acquire) + index;
                 const intptr_t difference = static_cast<intptr_t>(
                     sequence - (position + i));
                 if (difference < 0) return false;
@@ -237,10 +262,10 @@ public:
                 continue;
             }
             for (uint32_t i = 0u; i < count; ++i) {
-                Cell& cell = cells_[static_cast<size_t>(
-                    (position + i) & capacityMask_)];
+                const uint64_t index = (position + i) & capacityMask_;
+                Cell& cell = cells_[static_cast<size_t>(index)];
                 cell.value = values[i];
-                cell.sequence.store(position + i + 1u,
+                cell.sequence.store(position + i + 1u - index,
                                     std::memory_order_release);
             }
             return true;
@@ -250,15 +275,17 @@ public:
     bool TryPop(T& value) noexcept {
         if (!cells_) return false;
         const uint64_t position = dequeue_.load(std::memory_order_relaxed);
-        Cell& cell = cells_[static_cast<size_t>(position & capacityMask_)];
+        const uint64_t index = position & capacityMask_;
+        Cell& cell = cells_[static_cast<size_t>(index)];
         const uint64_t sequence =
-            cell.sequence.load(std::memory_order_acquire);
+            cell.sequence.load(std::memory_order_acquire) + index;
         if (static_cast<intptr_t>(sequence - (position + 1u)) != 0)
             return false;
         value = cell.value;
         SVMS_MPSCQ_PREFETCH(
             &cells_[static_cast<size_t>((position + 4u) & capacityMask_)]);
-        cell.sequence.store(position + capacity_, std::memory_order_release);
+        cell.sequence.store(position + capacity_ - index,
+                            std::memory_order_release);
         dequeue_.store(position + 1u, std::memory_order_relaxed);
         return true;
     }
@@ -273,15 +300,32 @@ public:
     uint32_t CapacityValue() const noexcept { return capacity_; }
 
 private:
+    // Zero-filled, demand-paged, >= 64-byte aligned. Cell is trivially
+    // copyable with an all-zero valid state, so no construction is needed.
+    static void* AllocateZeroed(size_t bytes) noexcept {
+#ifdef _WIN32
+        return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT,
+                            PAGE_READWRITE);
+#else
+        return std::calloc(1u, bytes);
+#endif
+    }
+    static void FreeZeroed(void* p) noexcept {
+#ifdef _WIN32
+        if (p) VirtualFree(p, 0, MEM_RELEASE);
+#else
+        std::free(p);
+#endif
+    }
+
     void Release() noexcept {
-        if (cells_) {
-            for (uint32_t i = 0u; i < capacity_; ++i) cells_[i].~Cell();
-        }
-        ::operator delete[](cells_, std::align_val_t{64});
+        FreeZeroed(block_);
+        block_ = nullptr;
         cells_ = nullptr;
         capacity_ = 0u;
     }
 
+    void* block_ = nullptr;
     Cell* cells_ = nullptr;
     uint32_t capacity_ = 0u;
     uint32_t capacityMask_ = 0u;

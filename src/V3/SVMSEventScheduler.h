@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace svms {
@@ -45,17 +46,18 @@ public:
     explicit EventScheduler(uint32_t capacity = kDefaultEventRingCapacity)
         : capacity_(capacity) {
         events_.reserve(capacity_);
-        scratch_.resize(capacity_);
+        scratch_.reset(AllocateScratch(capacity_));
+
     }
 
     void ConfigureCapacity(uint32_t capacity) {
         if (capacity == 0u) capacity = 1u;
         std::vector<ScheduledRenderEvent> events;
-        std::vector<ScheduledRenderEvent> scratch;
+        ScratchPtr scratch(AllocateScratch(capacity));
         events.reserve(capacity);
-        scratch.resize(capacity);
+
         events_.swap(events);
-        scratch_.swap(scratch);
+        scratch_ = std::move(scratch);
         capacity_ = capacity;
         readIndex_ = 0u;
         highWater_ = 0u;
@@ -178,7 +180,7 @@ private:
         if (runCount == 1u) return true;
 
         ScheduledRenderEvent* source = events_.data();
-        ScheduledRenderEvent* destination = scratch_.data();
+        ScheduledRenderEvent* destination = scratch_.get();
         std::size_t* begins = beginsA;
         std::size_t* ends = endsA;
         std::size_t* nextBegins = beginsB;
@@ -246,7 +248,7 @@ private:
         const uint32_t passCount = compactFrame ? 8u : 12u;
 
         ScheduledRenderEvent* source = events_.data();
-        ScheduledRenderEvent* destination = scratch_.data();
+        ScheduledRenderEvent* destination = scratch_.get();
         for (uint32_t pass = 0u; pass < passCount; ++pass) {
             std::size_t offsets[256]{};
             auto byteFor = [pass, compactFrame, minimumFrame](
@@ -284,7 +286,19 @@ private:
     std::size_t readIndex_ = 0u;
     bool batchDirty_ = false;
     std::vector<ScheduledRenderEvent> events_;
-    std::vector<ScheduledRenderEvent> scratch_;
+    // Sort scratch: raw uninitialised storage, so only the part a sort
+    // actually touches ever becomes resident (capacity can be 10^7+).
+    struct ScratchFree {
+        void operator()(ScheduledRenderEvent* p) const noexcept {
+            ::operator delete(p);
+        }
+    };
+    using ScratchPtr = std::unique_ptr<ScheduledRenderEvent, ScratchFree>;
+    static ScheduledRenderEvent* AllocateScratch(uint32_t capacity) {
+        return static_cast<ScheduledRenderEvent*>(::operator new(
+            sizeof(ScheduledRenderEvent) * static_cast<size_t>(capacity)));
+    }
+    ScratchPtr scratch_;
 };
 
 } // namespace svms

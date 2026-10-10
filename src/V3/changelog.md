@@ -10,6 +10,16 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-10 perf(v3): make the event queue storage lazy
+  My config had ring_capacity 20M and the synth sat at 1.4 GB idle: the
+  ingress cells, compiled pages and legacy scheduler scratch were all
+  zero-filled at startup. Ingress cells now store sequence minus index so
+  zeroed OS pages are a valid empty ring, pages only init their header, and
+  the scheduler scratch is raw storage. Structures at 20M: 1192 MB -> 13 MB;
+  engine peak working set 75 MB. Lane bases are staggered by 64 B multiples
+  because page-aligned lanes 4K-alias in the producer (-25%); event bench
+  producer 218 -> 202 M/s, compiler and callback unchanged.
+
 - 2026-10-10 perf(v3): stop render workers sharing hot counter cache lines
   The whole-voice segment counters were plain members of the shared
   RenderScalar, bumped by all 16 workers on every segment, and the job
