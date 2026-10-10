@@ -161,6 +161,8 @@ if(NOT WIN32)
     find_package(ALSA REQUIRED)
     # nlohmann/json for SVMSConfig.cpp (compiled into every portable target).
     include_directories("${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+    # SVMSConfig.cpp uses dladdr (module directory); glibc < 2.34 keeps it in libdl.
+    link_libraries(${CMAKE_DL_LIBS})
     # GCC < 9 keeps std::(experimental::)filesystem in a separate library;
     # SVMSSoundFont.cpp falls back to the Filesystem TS on GCC 7.
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
