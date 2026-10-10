@@ -429,7 +429,8 @@ void RestartPill() {
     const ImVec2 size(ts.x + pad.x * 2.0f, ts.y + pad.y * 2.0f);
     ImGui::Dummy(size);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec4 c = GetWarning();
+    // A tag, not a warning: follows the theme accent so it never clashes.
+    const ImVec4 c = GetAccent();
     dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y),
                 ImGui::GetColorU32(Alpha(c, 0.55f)), 3.0f);
     dl->AddText(ImVec2(p.x + pad.x, p.y + pad.y), ImGui::GetColorU32(c), label);
