@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-11 fix(v3): Linux build: StandaloneSynth called EngineConfig::Load() (a7df65d) but Linux doesn't compile SVMSConfig.cpp, so svmsd/svms_v3_render failed to link and the Linux CI job had been red. Windows keeps reading the config; Linux uses the default (note-on collapse off). Proper fix is making SVMSConfig.cpp portable.
 - 2026-10-11 feat(v3): nested-backend guard (api.allow_nested). An SVMS instance started inside another synth host (the OmniMIDIv2 plugin sets SVMS_NESTED=1) now ignores api.backend instead of routing events back out and looping; ALLOW NESTED lever in the configurator overrides it. Found while running SVMS as an OMv2 plugin: with the override on, SVMS -> OMv2 -> SVMS hangs. ctest 16/16; XP build not run.
 - 2026-10-11 fix(v3): configurator alignment pass: RESTART tags and lever labels centred on their line, meter bars centred in their frame, master strip spacing.
 - 2026-10-11 fix(v3): configurator "Refined" style renamed "Boring"; rack key text/lamp vertically balanced.
