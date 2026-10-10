@@ -2,6 +2,7 @@
 #include "ConfigDocument.h"
 #include "WasapiDevices.h"
 #include "EasterEggs.h"
+#include "Theme.h"
 #include "Widgets.h"
 #include "SVMSBuildInfo.h"
 #include "../SVMSRuntimeLink.h"
@@ -291,7 +292,6 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
     }
 
     if (view != AudioView::SoundFont) {
-    BeginRackPanel("AUDIO OUTPUT");
 
     const bool asioActive =
         EqualAsciiCI(WideToUtf8Str(w.audioBackend), "asio");
@@ -339,261 +339,198 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
         }
     }
 
-    if (BeginAudioSettingsTable("##audio_output_settings")) {
+    if (ImGui::BeginTable("##out_top", 2,
+                          ImGuiTableFlags_SizingStretchProp |
+                          ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableSetupColumn("output", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+        ImGui::TableSetupColumn("synth", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableNextRow();
-        AudioLabelCell("Output device",
-                       asioActive
-                           ? "ASIO driver to open. 'Default' uses the first "
-                             "installed ASIO driver. The driver's own control "
-                             "panel sets its buffer size and channels."
-                           : "WASAPI output endpoint. 'Default Windows Output "
-                             "Device' follows the current Windows default "
-                             "endpoint.");
+
+        // ---------------------------------------------------- OUTPUT
         ImGui::TableNextColumn();
-
-        std::string devicePreview;
-        if (easterEggs.megaFuckerDac && !asioActive) {
-            devicePreview = "MegaFucker DAC Pro 9000";
-        } else if (currentDevice >= 0 && currentDevice < static_cast<int>(names.size())) {
-            devicePreview = names[static_cast<size_t>(currentDevice)];
-        } else if (asioActive) {
-            devicePreview = "Missing ASIO driver: " + configuredUtf8;
-        } else {
-            devicePreview = "Missing: " + configuredUtf8;
-        }
-
-        const float deviceWidth = (std::min)(360.0f, ImGui::GetContentRegionAvail().x);
-        ImGui::SetNextItemWidth((std::max)(180.0f, deviceWidth));
-        if (ImGui::BeginCombo("##device", devicePreview.c_str())) {
-            for (int i = 0; i < static_cast<int>(names.size()); ++i) {
-                const bool selected = i == currentDevice;
-                if (ImGui::Selectable(names[static_cast<size_t>(i)].c_str(), selected)) {
-                    currentDevice = i;
-                    if (i == 0) {
-                        w.audioDevice = L"default";
-                    } else if (asioActive) {
-                        w.audioDevice = Utf8ToWideStr(asioDrivers[static_cast<size_t>(i - 1)]);
-                    } else {
-                        w.audioDevice = deviceList.Devices()[static_cast<size_t>(i - 1)].friendlyName;
+        if (BeginRackPanel("OUTPUT")) {
+            PanelCaption("DEVICE",
+                         asioActive
+                             ? "ASIO driver to open. 'Default' uses the first installed ASIO driver. The driver's own control panel sets its buffer size and channels."
+                             : "WASAPI output endpoint. 'Default Windows Output Device' follows the current Windows default endpoint.",
+                         false);
+            std::string devicePreview;
+            if (easterEggs.megaFuckerDac && !asioActive) {
+                devicePreview = "MegaFucker DAC Pro 9000";
+            } else if (currentDevice >= 0 && currentDevice < static_cast<int>(names.size())) {
+                devicePreview = names[static_cast<size_t>(currentDevice)];
+            } else if (asioActive) {
+                devicePreview = "Missing ASIO driver: " + configuredUtf8;
+            } else {
+                devicePreview = "Missing: " + configuredUtf8;
+            }
+            ImGui::SetNextItemWidth((std::max)(180.0f, ImGui::GetContentRegionAvail().x - 110.0f));
+            PushMono();
+            ImGui::PushStyleColor(ImGuiCol_Text, GetAccent());
+            const bool comboOpen = ImGui::BeginCombo("##device", devicePreview.c_str());
+            ImGui::PopStyleColor();
+            PopMono();
+            if (comboOpen) {
+                for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+                    const bool selected = i == currentDevice;
+                    if (ImGui::Selectable(names[static_cast<size_t>(i)].c_str(), selected)) {
+                        currentDevice = i;
+                        if (i == 0) {
+                            w.audioDevice = L"default";
+                        } else if (asioActive) {
+                            w.audioDevice = Utf8ToWideStr(asioDrivers[static_cast<size_t>(i - 1)]);
+                        } else {
+                            w.audioDevice = deviceList.Devices()[static_cast<size_t>(i - 1)].friendlyName;
+                        }
+                        doc.MarkDirty();
                     }
-                    doc.MarkDirty();
+                    if (selected) ImGui::SetItemDefaultFocus();
                 }
-                if (selected) ImGui::SetItemDefaultFocus();
+                if (asioActive && asioDrivers.empty()) {
+                    ImGui::TextDisabled("No installed ASIO drivers found (HKLM\\SOFTWARE\\ASIO)");
+                }
+                ImGui::EndCombo();
             }
-            if (asioActive && asioDrivers.empty()) {
-                ImGui::TextDisabled("No installed ASIO drivers found "
-                                    "(HKLM\\SOFTWARE\\ASIO)");
-            }
-            ImGui::EndCombo();
-        }
-
-        ImGui::TableNextColumn();
-        if (ImGui::SmallButton("Refresh devices")) {
-            deviceList.Enumerate();
-            asioDrivers = EnumerateAsioDrivers();
-            asioEnumerated = true;
-        }
-
-        ImGui::TableNextRow();
-        AudioLabelCell("Sample rate",
-                       "Sample rate for audio output. Higher rates increase the amount of work per second.");
-        ImGui::TableNextColumn();
-
-        static const char* sampleRateItems[] = {
-            "44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz",
-            "176400 Hz", "192000 Hz"
-        };
-        static const uint32_t sampleRateValues[] = {
-            44100, 48000, 88200, 96000, 176400, 192000
-        };
-
-        int srIdx = -1;
-        for (int i = 0; i < 6; ++i) {
-            if (sampleRateValues[i] == w.sampleRate) {
-                srIdx = i;
-                break;
-            }
-        }
-        static const char* sampleRateKeys[] = {
-            "44.1k", "48k", "88.2k", "96k", "176k", "192k"
-        };
-        if (KeyGroup("##samplerate", &srIdx, sampleRateKeys, 6) && srIdx >= 0) {
-            w.sampleRate = sampleRateValues[srIdx];
-            doc.MarkDirty();
-        }
-        if (srIdx < 0) {
             ImGui::SameLine();
-            ImGui::TextDisabled("custom: %u Hz", w.sampleRate);
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        AudioLabelCell("Buffer frames",
-                       "Audio endpoint buffer size. Smaller buffers reduce latency but leave less time for each render callback.");
-        ImGui::TableNextColumn();
-
-        static const char* bufferItems[] = {
-            "64", "128", "256", "512", "1024", "2048", "4096", "8192"
-        };
-        static const uint32_t bufferValues[] = {
-            64, 128, 256, 512, 1024, 2048, 4096, 8192
-        };
-
-        int bufIdx = -1;
-        for (int i = 0; i < 8; ++i) {
-            if (bufferValues[i] == w.bufferFrames) {
-                bufIdx = i;
-                break;
+            if (KeyButton("Refresh", ImVec2(92.0f, 26.0f))) {
+                deviceList.Enumerate();
+                asioDrivers = EnumerateAsioDrivers();
+                asioEnumerated = true;
             }
-        }
-        static const char* bufferKeys[] = {
-            "64", "128", "256", "512", "1k", "2k", "4k", "8k"
-        };
-        if (KeyGroup("##buffer", &bufIdx, bufferKeys, 8) && bufIdx >= 0) {
-            w.bufferFrames = bufferValues[bufIdx];
-            doc.MarkDirty();
-        }
+            ImGui::Spacing();
+            ImGui::Spacing();
 
-        const float latencyMs = (static_cast<float>(w.bufferFrames) /
-                                 static_cast<float>(w.sampleRate)) * 1000.0f;
-        char latencyBuf[64];
-        std::snprintf(latencyBuf, sizeof(latencyBuf), "%.2f ms @ %u Hz",
-                      latencyMs, w.sampleRate);
-        ImGui::TextDisabled("%s%s", latencyBuf, bufIdx < 0 ? "  (custom size)" : "");
-        RestartCell();
-
-        ImGui::TableNextRow();
-        AudioLabelCell("Audio backend",
-                       "WASAPI Shared Output is the production backend on modern "
-                       "builds. Audio Stream Input/Output (ASIO) bypasses the "
-                       "Windows audio mixer for lower latency; it requires an "
-                       "installed ASIO driver and falls back to WASAPI if none "
-                       "can be opened. Backend changes apply after restart.");
-        ImGui::TableNextColumn();
-
-        static const char* backendItems[] = {
-            "WASAPI Shared Output",
-            "Audio Stream Input/Output (ASIO)",
-        };
-        int backendIdx =
-            (EqualAsciiCI(WideToUtf8Str(w.audioBackend), "asio")) ? 1 : 0;
-        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::BeginCombo("##audiobackend", backendItems[backendIdx])) {
-            for (int i = 0; i < 2; ++i) {
-                const bool selected = i == backendIdx;
-                if (ImGui::Selectable(backendItems[i], selected)) {
-                    w.audioBackend = (i == 1) ? L"asio" : L"wasapi-shared";
-                    doc.MarkDirty();
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-        RestartCell();
-        ImGui::TableNextRow();
-        AudioLabelCell("Synth backend",
-                       "Where MIDI events are sent: the built-in SVMS engine "
-                       "(default), an external synth DLL speaking the SVMS-API "
-                       "backend interface, a KDMAPI-compatible synth DLL "
-                       "(OmniMIDI and friends), or a WinMM MIDI-out device "
-                       "such as the Microsoft GS Wavetable Synth. External "
-                       "backends own their audio output; the driver forwards "
-                       "events, sheds when behind (opt-in priority mode), and "
-                       "renders silence itself. Applies after restart.");
-        ImGui::TableNextColumn();
-        static const char* synthBackendItems[] = {
-            "SVMS engine (built-in)",
-            "SVMS-API DLL",
-            "KDMAPI DLL",
-            "WinMM MIDI-out device",
-            "Auto-detect DLL",
-        };
-        int synthBackend = static_cast<int>(w.apiBackend);
-        if (synthBackend < 0 || synthBackend > 4) synthBackend = 0;
-        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::BeginCombo("##synthbackend", synthBackendItems[synthBackend])) {
-            for (int i = 0; i < 5; ++i) {
-                const bool selected = i == synthBackend;
-                if (ImGui::Selectable(synthBackendItems[i], selected)) {
-                    w.apiBackend = static_cast<uint32_t>(i);
-                    doc.MarkDirty();
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-        if (w.apiBackend == 1u || w.apiBackend == 2u || w.apiBackend == 4u) {
-            char dllBuf[512]{};
-            WideToUtf8Str(w.apiBackendDll).copy(dllBuf, sizeof(dllBuf) - 1u);
-            ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
-            if (ImGui::InputText("##backenddll", dllBuf, sizeof(dllBuf))) {
-                w.apiBackendDll = Utf8ToWideStr(dllBuf);
+            static const char* backendKeys[] = {"WASAPI", "ASIO"};
+            int backendIdx = asioActive ? 1 : 0;
+            if (PanelKeys("BACKEND", &backendIdx, backendKeys, 2,
+                          "WASAPI Shared Output is the production backend on modern builds. ASIO bypasses the Windows audio mixer for lower latency; it needs an installed ASIO driver and falls back to WASAPI if none can be opened.",
+                          true)) {
+                w.audioBackend = (backendIdx == 1) ? L"asio" : L"wasapi-shared";
                 doc.MarkDirty();
             }
-            ImGui::SameLine();
-            ImGui::TextDisabled(w.apiBackend == 2u ? "KDMAPI DLL path"
-                                                   : "synth DLL path");
-        } else if (w.apiBackend == 3u) {
-            int device = static_cast<int>(w.apiWinMmDevice);
-            ImGui::SetNextItemWidth(120.0f);
-            if (ImGui::InputInt("##winmmdevice", &device)) {
-                device = (std::max)(0, (std::min)(255, device));
-                w.apiWinMmDevice = static_cast<uint32_t>(device);
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            static const uint32_t sampleRateValues[] = {44100, 48000, 88200, 96000, 176400, 192000};
+            static const char* sampleRateKeys[] = {"44.1k", "48k", "88.2k", "96k", "176k", "192k"};
+            int srIdx = -1;
+            for (int i = 0; i < 6; ++i)
+                if (sampleRateValues[i] == w.sampleRate) srIdx = i;
+            if (PanelKeys("SAMPLE RATE", &srIdx, sampleRateKeys, 6,
+                          "Sample rate for audio output. Higher rates increase the amount of work per second.",
+                          true) && srIdx >= 0) {
+                w.sampleRate = sampleRateValues[srIdx];
                 doc.MarkDirty();
             }
-            ImGui::SameLine();
-            ImGui::TextDisabled("MIDI-out device index");
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        AudioLabelCell("Phase rotation",
-                       "Rotates each voice by an independent random constant phase "
-                       "(Hilbert/quadrature form) at note-on, so the coherent "
-                       "black-MIDI hum no longer sums across voices. Per-frequency "
-                       "magnitude, loudness and sample-exact timing are untouched; "
-                       "Coherent (off) is the bit-exact baseline renderer. "
-                       "2× more expensive than Coherent.");
-        ImGui::TableNextColumn();
-
-        static const char* phaseItems[] = {
-            "Coherent (off)", "Analytic (Hilbert)", "Sweep", "Diffuse", "Random"
-        };
-
-        int idx = static_cast<int>(w.phaseRotationMode);
-        if (idx < 0 || idx > 4) idx = 0;
-
-        const float phaseComboWidth = (std::min)(220.0f, ImGui::GetContentRegionAvail().x);
-        ImGui::SetNextItemWidth(phaseComboWidth);
-        if (ImGui::BeginCombo("##phaserotation", phaseItems[idx])) {
-            for (int i = 0; i < 5; ++i) {
-                const bool selected = idx == i;
-                if (ImGui::Selectable(phaseItems[i], selected)) {
-                    w.phaseRotationMode = static_cast<uint32_t>(i);
-                    doc.MarkDirty();
-                    if (live.connected && live.client) {
-                        char phaseResult[svms::kRuntimeLinkResultTextCapacity]{};
-                        live.client->SendCommand(
-                            svms::RLCommandType::SetPhaseRotation, 0u,
-                            static_cast<uint32_t>(i),
-                            svms::RuntimeLiveStateV2{}, 100u, phaseResult);
-                    }
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
+            if (srIdx < 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("custom: %u Hz", w.sampleRate);
             }
-            ImGui::EndCombo();
-        }
+            ImGui::Spacing();
+            ImGui::Spacing();
 
+            static const uint32_t bufferValues[] = {64, 128, 256, 512, 1024, 2048, 4096, 8192};
+            static const char* bufferKeys[] = {"64", "128", "256", "512", "1k", "2k", "4k", "8k"};
+            int bufIdx = -1;
+            for (int i = 0; i < 8; ++i)
+                if (bufferValues[i] == w.bufferFrames) bufIdx = i;
+            if (PanelKeys("BUFFER FRAMES", &bufIdx, bufferKeys, 8,
+                          "Audio endpoint buffer size. Smaller buffers reduce latency but leave less time for each render callback.",
+                          true) && bufIdx >= 0) {
+                w.bufferFrames = bufferValues[bufIdx];
+                doc.MarkDirty();
+            }
+            if (bufIdx < 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("custom: %u", w.bufferFrames);
+            }
+        }
+        EndRackPanel();
+
+        // ------------------------------------------- LATENCY / SYNTH
         ImGui::TableNextColumn();
-        if (live.connected) {
-            ImGui::AlignTextToFramePadding();
-            LiveBadge("Applied live via RuntimeLink");
-        }
+        if (BeginRackPanel("LATENCY / SYNTH")) {
+            const ThemeSettings& th = GetThemeSettings();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float latencyMs = (static_cast<float>(w.bufferFrames) /
+                                     static_cast<float>((std::max)(1u, w.sampleRate))) * 1000.0f;
+            {
+                const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                const float width = ImGui::GetContentRegionAvail().x;
+                const float height = 74.0f;
+                DrawLcdFrame(dl, p0, ImVec2(p0.x + width, p0.y + height));
+                PushMono(0.80f);
+                dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 6.0f),
+                            ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
+                            "OUTPUT LATENCY");
+                char sub[64];
+                std::snprintf(sub, sizeof(sub), "%u frames @ %u Hz", w.bufferFrames, w.sampleRate);
+                const ImVec2 ss = ImGui::CalcTextSize(sub);
+                dl->AddText(ImVec2(p0.x + width - ss.x - 10.0f, p0.y + height - ss.y - 6.0f),
+                            ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
+                            sub);
+                PopMono();
+                PushMono(2.1f);
+                char big[32];
+                std::snprintf(big, sizeof(big), "%.1f ms", latencyMs);
+                dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 22.0f), ImGui::GetColorU32(th.accent), big);
+                PopMono();
+                ImGui::Dummy(ImVec2(width, height));
+            }
+            ImGui::Spacing();
+            ImGui::Spacing();
 
+            static const char* synthKeys[] = {"SVMS", "API DLL", "KDMAPI", "WINMM", "AUTO"};
+            int synthBackend = static_cast<int>(w.apiBackend);
+            if (synthBackend < 0 || synthBackend > 4) synthBackend = 0;
+            if (PanelKeys("SYNTH BACKEND", &synthBackend, synthKeys, 5,
+                          "Where MIDI events are sent: the built-in SVMS engine (default), an external synth DLL speaking the SVMS-API backend interface, a KDMAPI-compatible synth DLL (OmniMIDI and friends), a WinMM MIDI-out device such as the Microsoft GS Wavetable Synth, or auto-detect. External backends own their audio output.",
+                          true)) {
+                w.apiBackend = static_cast<uint32_t>(synthBackend);
+                doc.MarkDirty();
+            }
+            if (w.apiBackend == 1u || w.apiBackend == 2u || w.apiBackend == 4u) {
+                char dllBuf[512]{};
+                WideToUtf8Str(w.apiBackendDll).copy(dllBuf, sizeof(dllBuf) - 1u);
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                if (ImGui::InputText("##backenddll", dllBuf, sizeof(dllBuf))) {
+                    w.apiBackendDll = Utf8ToWideStr(dllBuf);
+                    doc.MarkDirty();
+                }
+                ImGui::TextDisabled(w.apiBackend == 2u ? "KDMAPI DLL path" : "synth DLL path");
+            } else if (w.apiBackend == 3u) {
+                int device = static_cast<int>(w.apiWinMmDevice);
+                ImGui::SetNextItemWidth(120.0f);
+                if (ImGui::InputInt("##winmmdevice", &device)) {
+                    device = (std::max)(0, (std::min)(255, device));
+                    w.apiWinMmDevice = static_cast<uint32_t>(device);
+                    doc.MarkDirty();
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("MIDI-out device index");
+            }
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            static const char* phaseKeys[] = {"OFF", "ANALYTIC", "SWEEP", "DIFFUSE", "RANDOM"};
+            int phase = static_cast<int>(w.phaseRotationMode);
+            if (phase < 0 || phase > 4) phase = 0;
+            if (PanelKeys("PHASE ROTATION  (LIVE)", &phase, phaseKeys, 5,
+                          "Rotates each voice by an independent random constant phase (Hilbert/quadrature form) at note-on, so the coherent black-MIDI hum no longer sums across voices. Per-frequency magnitude, loudness and sample-exact timing are untouched; OFF is the bit-exact baseline renderer. Roughly 2x more expensive than OFF.")) {
+                w.phaseRotationMode = static_cast<uint32_t>(phase);
+                doc.MarkDirty();
+                if (live.connected && live.client) {
+                    char phaseResult[svms::kRuntimeLinkResultTextCapacity]{};
+                    live.client->SendCommand(
+                        svms::RLCommandType::SetPhaseRotation, 0u,
+                        static_cast<uint32_t>(phase),
+                        svms::RuntimeLiveStateV2{}, 100u, phaseResult);
+                }
+            }
+        }
+        EndRackPanel();
         ImGui::EndTable();
     }
-
-    EndRackPanel();
 
     if (easterEggs.megaFuckerDac) {
         ImGui::Spacing();

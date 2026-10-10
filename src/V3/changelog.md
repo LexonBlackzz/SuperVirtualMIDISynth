@@ -10,6 +10,15 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-10 feat(v3): synth, out and MIDI stages recomposed as panels
+  Even with the new chain the stage pages were still long label/control row
+  lists. SYNTH, OUT and MIDI are now rack panels: big LCD readouts (voice
+  ceiling, latency), key groups for choices, knobs for continuous values
+  (retire floor, per-key cap, ghost budget, velocity), levers for switches,
+  LCD number fields. New PanelKeys/PanelKnob/PanelLever/PanelLcdInt widgets;
+  RESTART tags sit next to the setting they apply to. The limiter gain
+  reduction bar is slim and reads empty at 0 dB. Same commands, nothing removed.
+
 - 2026-10-10 feat(v3): configurator is a signal chain, not a sidebar of pages
   Someone said it looked like the Realtek console, and structurally it did: a
   sidebar of pages full of label/control rows. The sidebar is gone. A master

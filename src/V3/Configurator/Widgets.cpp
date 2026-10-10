@@ -323,6 +323,97 @@ void DrawLcdFrame(ImDrawList* dl, ImVec2 min, ImVec2 max, int cols, int rows) {
     dl->AddRect(min, max, ImGui::GetColorU32(GetKeyEdge()), th.cornerRadius, 0, 1.5f);
 }
 
+void PanelCaption(const char* caption, const char* help, bool restart) {
+    PushMono(0.85f);
+    ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
+    ImGui::TextUnformatted(caption);
+    ImGui::PopStyleColor();
+    const bool hovered = ImGui::IsItemHovered();
+    PopMono();
+    if (restart) {
+        ImGui::SameLine(0.0f, 8.0f);
+        RestartPill();
+    }
+    if (hovered && help && *help) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+        ImGui::TextUnformatted(help);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+bool PanelKeys(const char* caption, int* current, const char* const* labels,
+               int count, const char* help, bool restart) {
+    ImGui::PushID(caption);
+    PanelCaption(caption, help, restart);
+    const bool changed = KeyGroup("##keys", current, labels, count);
+    ImGui::PopID();
+    return changed;
+}
+
+bool PanelLever(const char* caption, bool* value, const char* help, bool restart) {
+    const bool changed = ToggleSwitch(caption, value, help);
+    if (restart) {
+        ImGui::SameLine(0.0f, 10.0f);
+        RestartPill();
+    }
+    return changed;
+}
+
+bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
+               float defaultValue, const char* format, float size,
+               const char* help, bool* committed, float (*displayFn)(float)) {
+    const float startX = ImGui::GetCursorPosX();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (avail - size) * 0.5f));
+    KnobState ks = {*value, minValue, maxValue, defaultValue,
+                    label, nullptr, size, 1.0f, displayFn};
+    const bool changed = RotaryKnob(ks, format);
+    if (changed) *value = ks.value;
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    ImGuiStorage* st = ImGui::GetStateStorage();
+    const ImGuiID id = ImGui::GetID(label);
+    if (changed) st->SetInt(id, 1);
+    bool released = false;
+    if (!active && st->GetInt(id, 0) != 0) {
+        released = true;
+        st->SetInt(id, 0);
+    }
+    if (committed) *committed = released;
+    if (hovered && help && *help) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+        ImGui::TextUnformatted(help);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+    return changed;
+}
+
+bool PanelLcdInt(const char* caption, int* value, int minValue, int maxValue,
+                 const char* help, bool restart, bool* committed,
+                 const char* zeroText) {
+    ImGui::PushID(caption);
+    PanelCaption(caption, help, restart);
+    ImGui::SetNextItemWidth(130.0f);
+    PushMono();
+    ImGui::PushStyleColor(ImGuiCol_Text, GetAccent());
+    const bool edited = ImGui::InputInt("##lcdint", value, 0, 0);
+    const bool done = ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::PopStyleColor();
+    PopMono();
+    if (edited) *value = (std::max)(minValue, (std::min)(maxValue, *value));
+    if (zeroText && *value == 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", zeroText);
+    }
+    if (committed) *committed = done;
+    ImGui::PopID();
+    return edited;
+}
+
 void RestartPill() {
     PushMono(0.78f);
     const char* label = "RESTART";
@@ -782,7 +873,7 @@ void DrawLedLadder(ImDrawList* dl, ImVec2 pos, ImVec2 size, float value,
                             : (frac < 0.62f ? GetSuccess()
                                             : (frac < 0.82f ? GetWarning() : GetError()));
         const bool on = i < lit || i == pk - 0;
-        const ImVec4 c = on ? col : Alpha(col, 0.22f);
+        const ImVec4 c = on ? col : Alpha(col, single ? 0.07f : 0.16f);
         const float y = fromTop ? pos.y + 2.0f + i * pitch
                                 : pos.y + size.y - 2.0f - (i + 1) * pitch + (pitch - segH);
         dl->AddRectFilled(ImVec2(pos.x + 3.0f, y),

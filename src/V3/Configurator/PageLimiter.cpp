@@ -351,7 +351,8 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         const float nameWidth = ImGui::CalcTextSize("GAIN REDUCTION").x;
         const float maxBarW = (std::max)(44.0f,
             colAvail - scaleGap - scaleWidth - 12.0f);
-        const float desiredBarW = (std::max)(72.0f, nameWidth + 12.0f);
+        (void)nameWidth;
+        const float desiredBarW = 40.0f;
         const float barW = (std::min)(desiredBarW, maxBarW);
         const float visualWidth = barW + scaleGap + scaleWidth;
         const float groupX = colStart + (colAvail - visualWidth) * 0.5f;

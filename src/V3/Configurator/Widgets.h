@@ -53,6 +53,26 @@ void DrawLed(ImDrawList* dl, ImVec2 center, float radius, bool on,
              const ImVec4* color = nullptr);
 // Bordered RESTART tag, drawn at the cursor.
 void RestartPill();
+
+// --- Panel controls: captioned controls for hardware-style panels ----------
+// Small mono caption; hover shows `help`; optional RESTART tag after it.
+void PanelCaption(const char* caption, const char* help, bool restart = false);
+// Caption above a key group. Returns true when the selection changed.
+bool PanelKeys(const char* caption, int* current, const char* const* labels,
+               int count, const char* help, bool restart = false);
+// Lever with its caption beside it.
+bool PanelLever(const char* caption, bool* value, const char* help,
+                bool restart = false);
+// Knob centred in the available width. `committed` is set when the drag ends
+// (for settings that should be sent once, not on every frame).
+bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
+               float defaultValue, const char* format, float size,
+               const char* help, bool* committed = nullptr,
+               float (*displayFn)(float) = nullptr);
+// Number on an LCD-styled field. `committed` is set when editing finishes.
+bool PanelLcdInt(const char* caption, int* value, int minValue, int maxValue,
+                 const char* help, bool restart = false,
+                 bool* committed = nullptr, const char* zeroText = nullptr);
 // Inset display: dark background, rim, optional grid. Draws only; the caller
 // reserves layout space (e.g. with Dummy).
 void DrawLcdFrame(ImDrawList* dl, ImVec2 min, ImVec2 max, int gridCols = 0,

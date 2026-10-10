@@ -1,5 +1,6 @@
 #include "PageMidi.h"
 #include "ConfigDocument.h"
+#include "Theme.h"
 #include "Widgets.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
@@ -116,312 +117,13 @@ void DrawMidiPage(ConfigDocument& doc) {
     auto& w = doc.Working();
     const auto& lc = GetLiveLinkContext();
 
-    SectionHeader("SYNTH SETTINGS");
+    auto send = [&](svms::RLCommandType type, uint32_t param) {
+        if (!lc.connected || !lc.client) return;
+        char result[svms::kRuntimeLinkResultTextCapacity]{};
+        lc.client->SendCommand(type, 0u, param, svms::RuntimeLiveStateV2{}, 100u, result);
+    };
+    const ThemeSettings& th = GetThemeSettings();
 
-    if (BeginSettingsTable("##synth_settings")) {
-        ImGui::TableNextRow();
-        LabelCell("Master volume",
-                  "Master output volume multiplier. 1.0 is unity gain.");
-        ImGui::TableNextColumn();
-        float master = w.masterVolume;
-        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::SliderFloat("##mastervolume", &master, 0.0f, 4.0f, "%.2f")) {
-            w.masterVolume = master;
-            doc.MarkDirty();
-            PushLiveFloat(svms::RLCommandType::SetMasterVolume, master);
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%.1f dB",
-                            20.0f * std::log10((std::max)(master, 0.001f)));
-        ImGui::TableNextColumn();
-        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
-        AppliedStateBadge(lc.connected, lc.telemetry, w,
-                          "Master-volume applied state vs working copy");
-
-        ImGui::TableNextRow();
-        LabelCell("Velocity curve",
-                  "Exponent applied to MIDI velocity. Values above 1 emphasize loud notes; "
-                  "values below 1 lift quieter notes.");
-        ImGui::TableNextColumn();
-        float curve = w.velocityCurve;
-        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::SliderFloat("##velocitycurve", &curve, 0.1f, 10.0f, "%.2f")) {
-            w.velocityCurve = curve;
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Velocity floor",
-                  "Raises the minimum mapped loudness of notes that survive the ignore threshold. "
-                  "This is not the event-shedding threshold.");
-        ImGui::TableNextColumn();
-        float floor = w.velocityFloor;
-        ImGui::SetNextItemWidth((std::min)(360.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::SliderFloat("##velocityfloor", &floor, 0.0f, 0.99f, "%.2f")) {
-            w.velocityFloor = floor;
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Ignore velocity below",
-                  "MIDI note-ons with velocity strictly below this value are ignored. "
-                  "The threshold itself is still accepted.");
-        ImGui::TableNextColumn();
-        int ignore = static_cast<int>(w.velocityIgnoreBelow);
-        ImGui::SetNextItemWidth((std::min)(220.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::InputInt("##velocityignore", &ignore, 0, 0)) {
-            ignore = (std::max)(0, (std::min)(127, ignore));
-            w.velocityIgnoreBelow = static_cast<uint32_t>(ignore);
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::EndTable();
-    }
-
-    ImGui::Spacing();
-    SectionHeader("EVENT QUEUE");
-
-    if (BeginSettingsTable("##event_settings")) {
-        ImGui::TableNextRow();
-        LabelCell("Overflow mode",
-                  "Priority allows quiet note-ons to be shed under severe pressure. "
-                  "Lossless favors backpressure instead.");
-        ImGui::TableNextColumn();
-        static const char* modes[] = { "Priority", "Lossless" };
-        int mode = w.overflowMode;
-        ImGui::SetNextItemWidth((std::min)(300.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::Combo("##overflowmode", &mode, modes, 2)) {
-            w.overflowMode = mode;
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Queue capacity",
-                  "Total raw MIDI ingress capacity. Larger values absorb denser bursts but reserve more memory. This does not change callback work.");
-        ImGui::TableNextColumn();
-        uint32_t eventBuffer = w.eventRingCapacity;
-        if (InputU32("##evbuffer", eventBuffer, 4096u, UINT32_MAX)) {
-            w.eventRingCapacity = eventBuffer;
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Events per callback",
-                  "Maximum due MIDI events dispatched in one audio callback. Excess work remains ordered and becomes explicitly late; changing this does not resize the ingress queue.");
-        ImGui::TableNextColumn();
-        uint32_t callbackEvents = w.maxEventsPerBlock;
-        if (InputU32("##eventspercallback", callbackEvents, 1u, UINT32_MAX)) {
-            w.maxEventsPerBlock = callbackEvents;
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("High-priority velocity",
-                  "MIDI note-ons at or above this velocity are protected from priority shedding.");
-        ImGui::TableNextColumn();
-        uint32_t high = w.highPriorityVelocity;
-        if (InputU32("##highpriority", high, 1u, 127u)) {
-            w.highPriorityVelocity = high;
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Shed start percent",
-                  "Queue fill percentage where priority shedding begins.");
-        ImGui::TableNextColumn();
-        uint32_t shed = w.shedStartPercent;
-        if (InputU32("##shedstart", shed, 1u, 99u)) {
-            w.shedStartPercent = shed;
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Tuning", "Normal: 12 semitones per octave, keys 0-255. 31EDO: 31 steps per octave; key 155 is middle C. Percussion keeps its drum mapping.");
-        ImGui::TableNextColumn();
-        int tuning = w.tuningEdo == 31u ? 1 : 0;
-        if (ImGui::Combo("##tuning", &tuning, "Normal (12EDO)\0" "31EDO\0")) {
-            w.tuningEdo = tuning ? 31u : 12u;
-            doc.MarkDirty();
-        }
-        RestartCell();
-        ImGui::TableNextRow();
-        LabelCell("CC collapse",
-                  "OFF by default: every control-change event dispatches. "
-                  "When enabled, the compiler thread drops superseded "
-                  "same-(channel,controller) state CCs (volume, pan, "
-                  "expression, bank, RPN data, tone rows) inside a page "
-                  "before they ever reach the audio thread. Saves dispatch "
-                  "on CC-automation-dense material.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("##cccollapse", &w.ccCollapse)) {
-            doc.MarkDirty();
-            if (lc.connected && lc.client) {
-                char ccResult[svms::kRuntimeLinkResultTextCapacity]{};
-                lc.client->SendCommand(
-                    svms::RLCommandType::SetCcCollapse, 0u,
-                    w.ccCollapse ? 1u : 0u,
-                    svms::RuntimeLiveStateV2{}, 100u, ccResult);
-            }
-        }
-        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
-
-        ImGui::TableNextRow();
-        LabelCell("OmniMIDI Mode",
-                  "OFF by default: events dispatch at their exact intra-block "
-                  "sample offset (keep this for latency-critical live play). "
-                  "When enabled, every event due in a callback fires at block "
-                  "start instead — the whole callback becomes one launch burst "
-                  "with zero mid-block render splits. That quantizes timing to "
-                  "the callback rate (~100 Hz at a 512-frame buffer), like a "
-                  "certain other driver — hence the nickname. Great for "
-                  "maximum throughput on dense files; do not use it when "
-                  "intra-block timing precision matters.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("##blocktiming", &w.blockTiming)) {
-            doc.MarkDirty();
-            if (lc.connected && lc.client) {
-                char btResult[svms::kRuntimeLinkResultTextCapacity]{};
-                lc.client->SendCommand(
-                    svms::RLCommandType::SetBlockTiming, 0u,
-                    w.blockTiming ? 1u : 0u,
-                    svms::RuntimeLiveStateV2{}, 100u, btResult);
-            }
-        }
-        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
-
-        ImGui::TableNextRow();
-        LabelCell("Unbounded render",
-                  "OFF by default. When enabled, the two pressure safety "
-                  "nets are disabled: no wall-time recovery jump (the render "
-                  "clock stays on its own timeline, so events keep their "
-                  "exact frames and exact order at whatever speed the engine "
-                  "manages — the song slows down instead of breaking down) "
-                  "and no per-block admission cap (the scheduler admits up "
-                  "to max_events_per_block and rips through the backlog at "
-                  "full CPU). Audio glitches and slowed playback are the "
-                  "accepted trade.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("##unboundedrender", &w.unboundedRender)) {
-            doc.MarkDirty();
-            if (lc.connected && lc.client) {
-                char ubResult[svms::kRuntimeLinkResultTextCapacity]{};
-                lc.client->SendCommand(
-                    svms::RLCommandType::SetUnboundedRender, 0u,
-                    w.unboundedRender ? 1u : 0u,
-                    svms::RuntimeLiveStateV2{}, 100u, ubResult);
-            }
-        }
-        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
-
-        ImGui::TableNextRow();
-        LabelCell("Note-on coalescing",
-                  "OFF by default: every note-on spawns a voice at its exact "
-                  "timestamp, preserving retrigger timing precision. When "
-                  "enabled, repeated hits of the same key within a fixed "
-                  "20 ms window spawn one voice per N hits (velocity stacking "
-                  "compensates loudness). Use only for extreme black-MIDI "
-                  "workloads that would otherwise starve the audio thread.");
-        ImGui::TableNextColumn();
-        bool collapseOn = w.noteOnCollapseThreshold > 1u;
-        if (ImGui::Checkbox("##noteoncollapse", &collapseOn)) {
-            if (!collapseOn) {
-                w.noteOnCollapseThreshold = 1u;
-            } else if (w.noteOnCollapseThreshold <= 1u) {
-                w.noteOnCollapseThreshold = 32u;
-            }
-            doc.MarkDirty();
-            if (lc.connected && lc.client) {
-                char collapseResult[svms::kRuntimeLinkResultTextCapacity]{};
-                lc.client->SendCommand(
-                    svms::RLCommandType::SetNoteOnCollapse, 0u,
-                    w.noteOnCollapseThreshold,
-                    svms::RuntimeLiveStateV2{}, 100u, collapseResult);
-            }
-        }
-        ImGui::SameLine();
-        if (collapseOn) {
-            static const uint32_t kThresholds[] = {
-                2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u,
-                1024u, 2048u, 4096u, 8192u, 16384u, 32768u, 65536u
-            };
-            static const char* kThresholdLabels[] = {
-                "1 voice per 2 hits", "1 voice per 4 hits",
-                "1 voice per 8 hits", "1 voice per 16 hits",
-                "1 voice per 32 hits", "1 voice per 64 hits",
-                "1 voice per 128 hits", "1 voice per 256 hits",
-                "1 voice per 512 hits", "1 voice per 1024 hits",
-                "1 voice per 2048 hits", "1 voice per 4096 hits",
-                "1 voice per 8192 hits", "1 voice per 16384 hits",
-                "1 voice per 32768 hits", "1 voice per 65536 hits"
-            };
-            int tIdx = 4; // default 32
-            for (int i = 0; i < 16; ++i) {
-                if (w.noteOnCollapseThreshold == kThresholds[i]) {
-                    tIdx = i;
-                    break;
-                }
-            }
-            ImGui::SetNextItemWidth((std::min)(220.0f,
-                ImGui::GetContentRegionAvail().x));
-            if (ImGui::BeginCombo("##noteoncollapsesethreshold",
-                                  kThresholdLabels[tIdx])) {
-                for (int i = 0; i < 16; ++i) {
-                    const bool selected = i == tIdx;
-                    if (ImGui::Selectable(kThresholdLabels[i], selected)) {
-                        w.noteOnCollapseThreshold = kThresholds[i];
-                        doc.MarkDirty();
-                        if (lc.connected && lc.client) {
-                            char collapseResult[
-                                svms::kRuntimeLinkResultTextCapacity]{};
-                            lc.client->SendCommand(
-                                svms::RLCommandType::SetNoteOnCollapse, 0u,
-                                kThresholds[i],
-                                svms::RuntimeLiveStateV2{}, 100u,
-                                collapseResult);
-                        }
-                    }
-                    if (selected) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-        } else {
-            ImGui::TextUnformatted("Disabled (exact retrigger timing)");
-        }
-        ImGui::TableNextColumn();
-        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
-
-        ImGui::EndTable();
-    }
-
-    if (lc.connected && lc.telemetry) {
-        const auto& t = *lc.telemetry;
-        const uint64_t pagedPressureCount =
-            static_cast<uint64_t>(t.compiledPagedCount) +
-            t.scheduledBacklogCount;
-        const float pagePressure = w.eventRingCapacity != 0u
-            ? 100.0f * static_cast<float>(pagedPressureCount) /
-                  static_cast<float>(w.eventRingCapacity)
-            : 0.0f;
-        ImGui::Spacing();
-        SectionHeader("LIVE EVENT PIPELINE");
-        ImGui::Text("Raw ingress: %u", t.rawIngressCount);
-        ImGui::Text("Compiled pages: %u events", t.compiledPagedCount);
-        ImGui::Text("Scheduled backlog: %u events", t.scheduledBacklogCount);
-        ImGui::Text("Page-pool pressure: %.1f%%", pagePressure);
-        ImGui::Text("Scheduler / dispatch: %.2f%% / %.2f%%",
-                    t.schedulerPercent, t.eventDispatchPercent);
-    }
-
-    ImGui::Spacing();
-    SectionHeader("MIDI INPUT");
     static std::vector<MidiInputDevice> inputDevices;
     static bool inputsEnumerated = false;
     if (!inputsEnumerated) {
@@ -429,61 +131,262 @@ void DrawMidiPage(ConfigDocument& doc) {
         inputsEnumerated = true;
     }
 
-    if (BeginSettingsTable("##midi_input_settings")) {
+    if (ImGui::BeginTable("##midi_top", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableNextRow();
-        LabelCell("Route physical input",
-                  "The driver opens the selected system MIDI input and sends it directly "
-                  "through SVMS with arrival-time QPC timestamps. Host midiIn APIs remain "
-                  "available independently.");
-        ImGui::TableNextColumn();
-        bool enabled = w.midiInputEnabled;
-        if (ImGui::Checkbox("##midiinputenabled", &enabled)) {
-            w.midiInputEnabled = enabled;
-            doc.MarkDirty();
-        }
-        ImGui::SameLine();
-        ImGui::TextUnformatted(enabled ? "Enabled" : "Disabled");
-        RestartCell();
 
-        ImGui::TableNextRow();
-        LabelCell("Input device",
-                  "An empty selection follows the first available system MIDI input. "
-                  "A named selection is matched case-insensitively at driver startup.");
+        // ======================================================= left
         ImGui::TableNextColumn();
-        std::string preview = w.midiInputDevice.empty()
-            ? "First available input"
-            : WideToUtf8Midi(w.midiInputDevice);
-        ImGui::SetNextItemWidth((std::min)(420.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::BeginCombo("##midiinputdevice", preview.c_str())) {
-            const bool firstSelected = w.midiInputDevice.empty();
-            if (ImGui::Selectable("First available input", firstSelected)) {
-                w.midiInputDevice.clear();
-                doc.MarkDirty();
-            }
-            for (const MidiInputDevice& device : inputDevices) {
-                const bool selected = !w.midiInputDevice.empty() &&
-                    _wcsicmp(w.midiInputDevice.c_str(), device.name.c_str()) == 0;
-                if (ImGui::Selectable(device.displayName.c_str(), selected)) {
-                    w.midiInputDevice = device.name;
+        if (BeginRackPanel("VELOCITY")) {
+            RestartPill();
+            ImGui::SameLine();
+            ImGui::TextDisabled("applies after restart");
+            ImGui::Spacing();
+            if (ImGui::BeginTable("##vel_knobs", 3, ImGuiTableFlags_SizingStretchSame)) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                float curve = w.velocityCurve;
+                if (PanelKnob("CURVE", &curve, 0.1f, 10.0f, 1.0f, "%.2f", 60.0f,
+                              "Exponent applied to MIDI velocity. Values above 1 emphasize loud notes; values below 1 lift quieter notes.")) {
+                    w.velocityCurve = curve;
                     doc.MarkDirty();
                 }
+                ImGui::TableNextColumn();
+                float floor = w.velocityFloor;
+                if (PanelKnob("FLOOR", &floor, 0.0f, 0.99f, 0.0f, "%.2f", 60.0f,
+                              "Raises the minimum mapped loudness of notes that survive the ignore threshold. This is not the event-shedding threshold.")) {
+                    w.velocityFloor = floor;
+                    doc.MarkDirty();
+                }
+                ImGui::TableNextColumn();
+                float ignore = static_cast<float>(w.velocityIgnoreBelow);
+                if (PanelKnob("IGNORE BELOW", &ignore, 0.0f, 127.0f, 0.0f,
+                              ignore < 0.5f ? "OFF" : "%.0f", 60.0f,
+                              "MIDI note-ons with velocity strictly below this value are ignored. The threshold itself is still accepted.")) {
+                    w.velocityIgnoreBelow = static_cast<uint32_t>(ignore + 0.5f);
+                    doc.MarkDirty();
+                }
+                ImGui::EndTable();
             }
-            ImGui::EndCombo();
+            ImGui::Dummy(ImVec2(0.0f, 12.0f));
+            ImGui::TextDisabled("Master volume lives in the strip at the top.");
         }
-        RestartCell();
+        EndRackPanel();
+
+        if (BeginRackPanel("TIMING / THROUGHPUT  (LIVE)")) {
+            if (PanelLever("OMNIMIDI MODE", &w.blockTiming,
+                           "OFF by default: events dispatch at their exact intra-block sample offset (keep this for latency-critical live play). When enabled, every event due in a callback fires at block start instead: the whole callback becomes one launch burst with zero mid-block render splits. That quantizes timing to the callback rate. Great for throughput on dense files; do not use it when intra-block timing precision matters.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetBlockTiming, w.blockTiming ? 1u : 0u);
+            }
+            ImGui::Spacing();
+            if (PanelLever("CC COLLAPSE", &w.ccCollapse,
+                           "OFF by default: every control-change event dispatches. When enabled, the compiler thread drops superseded same-(channel, controller) state CCs inside a page before they reach the audio thread. Saves dispatch on CC-automation-dense material.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetCcCollapse, w.ccCollapse ? 1u : 0u);
+            }
+            ImGui::Spacing();
+            if (PanelLever("UNBOUNDED RENDER", &w.unboundedRender,
+                           "OFF by default. When enabled, the two pressure safety nets are disabled: no wall-time recovery jump (events keep their exact frames and order; the song slows down instead of breaking down) and no per-block admission cap. Audio glitches and slowed playback are the accepted trade.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetUnboundedRender, w.unboundedRender ? 1u : 0u);
+            }
+            ImGui::Spacing();
+            bool collapseOn = w.noteOnCollapseThreshold > 1u;
+            if (PanelLever("NOTE-ON COALESCING", &collapseOn,
+                           "OFF by default: every note-on spawns a voice at its exact timestamp, preserving retrigger timing precision. When enabled, repeated hits of the same key within a fixed 20 ms window spawn one voice per N hits (velocity stacking compensates loudness). Use only for extreme black-MIDI workloads that would otherwise starve the audio thread.")) {
+                w.noteOnCollapseThreshold = collapseOn ? 32u : 1u;
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetNoteOnCollapse, w.noteOnCollapseThreshold);
+            }
+            if (collapseOn) {
+                static const uint32_t thresholds[] = {2u, 8u, 32u, 128u, 512u, 2048u, 8192u, 65536u};
+                static const char* thresholdLabels[] = {"1:2", "1:8", "1:32", "1:128", "1:512", "1:2k", "1:8k", "1:64k"};
+                int idx = -1;
+                for (int i = 0; i < 8; ++i)
+                    if (thresholds[i] == w.noteOnCollapseThreshold) idx = i;
+                ImGui::Spacing();
+                if (PanelKeys("VOICE PER N HITS", &idx, thresholdLabels, 8,
+                              "How many hits of the same key within 20 ms share one voice.") && idx >= 0) {
+                    w.noteOnCollapseThreshold = thresholds[idx];
+                    doc.MarkDirty();
+                    send(svms::RLCommandType::SetNoteOnCollapse, w.noteOnCollapseThreshold);
+                }
+                if (idx < 0) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("custom: 1:%u", w.noteOnCollapseThreshold);
+                }
+            }
+        }
+        EndRackPanel();
+
+        // ======================================================= right
+        ImGui::TableNextColumn();
+        if (BeginRackPanel("EVENT QUEUE")) {
+            static const char* overflowKeys[] = {"PRIORITY", "LOSSLESS"};
+            int mode = w.overflowMode == 0 ? 0 : 1;
+            if (PanelKeys("OVERFLOW MODE", &mode, overflowKeys, 2,
+                          "Priority allows quiet note-ons to be shed under severe pressure. Lossless favors backpressure instead.",
+                          true)) {
+                w.overflowMode = mode;
+                doc.MarkDirty();
+            }
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            if (ImGui::BeginTable("##q_fields", 2, ImGuiTableFlags_SizingStretchSame)) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                int cap = static_cast<int>((std::min)(w.eventRingCapacity, 2000000000u));
+                if (PanelLcdInt("QUEUE CAPACITY", &cap, 4096, 2000000000,
+                                "Total raw MIDI ingress capacity. Larger values absorb denser bursts but reserve more address space. This does not change callback work.",
+                                true)) {
+                    w.eventRingCapacity = static_cast<uint32_t>(cap);
+                    doc.MarkDirty();
+                }
+                ImGui::TableNextColumn();
+                int perCb = static_cast<int>((std::min)(w.maxEventsPerBlock, 2000000000u));
+                if (PanelLcdInt("EVENTS / CALLBACK", &perCb, 1, 2000000000,
+                                "Maximum due MIDI events dispatched in one audio callback. Excess work remains ordered and becomes explicitly late; changing this does not resize the ingress queue.",
+                                true)) {
+                    w.maxEventsPerBlock = static_cast<uint32_t>(perCb);
+                    doc.MarkDirty();
+                }
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::Spacing();
+                int high = static_cast<int>(w.highPriorityVelocity);
+                if (PanelLcdInt("PROTECTED VELOCITY", &high, 1, 127,
+                                "MIDI note-ons at or above this velocity are protected from priority shedding.",
+                                true)) {
+                    w.highPriorityVelocity = static_cast<uint32_t>(high);
+                    doc.MarkDirty();
+                }
+                ImGui::TableNextColumn();
+                ImGui::Spacing();
+                int shed = static_cast<int>(w.shedStartPercent);
+                if (PanelLcdInt("SHED STARTS AT %", &shed, 1, 99,
+                                "Queue fill percentage where priority shedding begins.", true)) {
+                    w.shedStartPercent = static_cast<uint32_t>(shed);
+                    doc.MarkDirty();
+                }
+                ImGui::EndTable();
+            }
+            if (w.eventRingCapacity > 4000000u) {
+                ImGui::Spacing();
+                ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::Text("Large queue: up to ~%.1f GB of address space if it ever fills. Most Black MIDI plays fine at 2M.",
+                            w.eventRingCapacity * 74.0 / 1.0e9);
+                ImGui::PopTextWrapPos();
+                ImGui::PopStyleColor();
+            }
+            ImGui::Spacing();
+            ImGui::Spacing();
+            static const char* tuningKeys[] = {"12EDO", "31EDO"};
+            int tuning = w.tuningEdo == 31u ? 1 : 0;
+            if (PanelKeys("TUNING", &tuning, tuningKeys, 2,
+                          "Normal: 12 semitones per octave, keys 0-255. 31EDO: 31 steps per octave; key 155 is middle C. Percussion keeps its drum mapping.",
+                          true)) {
+                w.tuningEdo = tuning ? 31u : 12u;
+                doc.MarkDirty();
+            }
+        }
+        EndRackPanel();
+
+        if (BeginRackPanel("MIDI INPUT")) {
+            bool enabled = w.midiInputEnabled;
+            if (PanelLever("ROUTE PHYSICAL INPUT", &enabled,
+                           "The driver opens the selected system MIDI input and sends it directly through SVMS with arrival-time QPC timestamps. Host midiIn APIs remain available independently.",
+                           true)) {
+                w.midiInputEnabled = enabled;
+                doc.MarkDirty();
+            }
+            ImGui::Spacing();
+            PanelCaption("INPUT DEVICE",
+                         "An empty selection follows the first available system MIDI input. A named selection is matched case-insensitively at driver startup.",
+                         true);
+            std::string preview = w.midiInputDevice.empty()
+                ? "First available input" : WideToUtf8Midi(w.midiInputDevice);
+            ImGui::SetNextItemWidth((std::max)(160.0f, ImGui::GetContentRegionAvail().x - 110.0f));
+            PushMono();
+            ImGui::PushStyleColor(ImGuiCol_Text, th.accent);
+            const bool open = ImGui::BeginCombo("##midiinputdevice", preview.c_str());
+            ImGui::PopStyleColor();
+            PopMono();
+            if (open) {
+                if (ImGui::Selectable("First available input", w.midiInputDevice.empty())) {
+                    w.midiInputDevice.clear();
+                    doc.MarkDirty();
+                }
+                for (const MidiInputDevice& device : inputDevices) {
+                    const bool selected = !w.midiInputDevice.empty() &&
+                        _wcsicmp(w.midiInputDevice.c_str(), device.name.c_str()) == 0;
+                    if (ImGui::Selectable(device.displayName.c_str(), selected)) {
+                        w.midiInputDevice = device.name;
+                        doc.MarkDirty();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (KeyButton("Refresh", ImVec2(92.0f, 26.0f))) {
+                inputDevices = EnumerateMidiInputs();
+                inputsEnumerated = true;
+            }
+            if (inputDevices.empty())
+                ImGui::TextDisabled("No system MIDI input devices found");
+            else
+                ImGui::TextDisabled("%u input%s found; short MIDI and SysEx are supported",
+                                    static_cast<unsigned>(inputDevices.size()),
+                                    inputDevices.size() == 1u ? "" : "s");
+        }
+        EndRackPanel();
         ImGui::EndTable();
     }
-    if (ImGui::Button("Refresh MIDI inputs")) {
-        inputDevices = EnumerateMidiInputs();
-        inputsEnumerated = true;
+
+    // ------------------------------------------------- live event pipeline
+    if (lc.connected && lc.telemetry) {
+        const auto& t = *lc.telemetry;
+        const uint64_t pagedPressureCount =
+            static_cast<uint64_t>(t.compiledPagedCount) + t.scheduledBacklogCount;
+        const float pagePressure = w.eventRingCapacity != 0u
+            ? 100.0f * static_cast<float>(pagedPressureCount) /
+                  static_cast<float>(w.eventRingCapacity)
+            : 0.0f;
+        if (BeginRackPanel("LIVE EVENT PIPELINE")) {
+            struct Cell { const char* label; char value[48]; };
+            Cell cells[5];
+            auto set = [&](int i, const char* label, const char* fmt, auto... args) {
+                cells[i].label = label;
+                std::snprintf(cells[i].value, sizeof(cells[i].value), fmt, args...);
+            };
+            set(0, "RAW INGRESS", "%u", t.rawIngressCount);
+            set(1, "COMPILED PAGES", "%u", t.compiledPagedCount);
+            set(2, "SCHEDULED BACKLOG", "%u", t.scheduledBacklogCount);
+            set(3, "PAGE-POOL PRESSURE", "%.1f%%", pagePressure);
+            set(4, "SCHED / DISPATCH", "%.2f%% / %.2f%%", t.schedulerPercent, t.eventDispatchPercent);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const float width = ImGui::GetContentRegionAvail().x;
+            PushMono(0.95f);
+            const float lh = ImGui::GetTextLineHeight();
+            const float height = lh * 2.0f + 26.0f;
+            DrawLcdFrame(dl, p0, ImVec2(p0.x + width, p0.y + height));
+            for (int i = 0; i < 5; ++i) {
+                const float x = p0.x + 16.0f + i * (width - 32.0f) / 5.0f;
+                dl->AddText(ImVec2(x, p0.y + 10.0f),
+                            ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
+                            cells[i].label);
+                dl->AddText(ImVec2(x, p0.y + 10.0f + lh + 2.0f),
+                            ImGui::GetColorU32(th.accent), cells[i].value);
+            }
+            PopMono();
+            ImGui::Dummy(ImVec2(width, height));
+        }
+        EndRackPanel();
     }
-    ImGui::SameLine();
-    if (inputDevices.empty())
-        ImGui::TextDisabled("No system MIDI input devices found");
-    else
-        ImGui::TextDisabled("%u input%s found; short MIDI and SysEx are supported",
-                            static_cast<unsigned>(inputDevices.size()),
-                            inputDevices.size() == 1u ? "" : "s");
 }
 
 } // namespace svms::cfg

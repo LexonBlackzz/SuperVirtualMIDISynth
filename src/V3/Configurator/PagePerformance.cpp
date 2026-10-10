@@ -97,305 +97,264 @@ void DrawPerformancePage(ConfigDocument& doc) {
     const auto& lc = GetLiveLinkContext();
     const auto* t = lc.telemetry;
 
-    SectionHeader("PERFORMANCE");
+    auto send = [&](svms::RLCommandType type, uint32_t param) {
+        if (!lc.connected || !lc.client) return;
+        char result[svms::kRuntimeLinkResultTextCapacity]{};
+        lc.client->SendCommand(type, 0u, param, svms::RuntimeLiveStateV2{}, 100u, result);
+    };
 
-    if (BeginSettingsTable("##performance_settings")) {
+    if (ImGui::BeginTable("##synth_top", 2,
+                          ImGuiTableFlags_SizingStretchProp |
+                          ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableSetupColumn("voices", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableSetupColumn("engine", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableNextRow();
-        LabelCell("Maximum voices",
-                  "Live primary-voice ceiling. Growing the value expands the physical voice pool without restarting or resetting currently sounding voices. Lowering it sheds excess voices using the normal steal-priority policy and a short anti-click release.");
-        ImGui::TableNextColumn();
-        int maxVoices = static_cast<int>(w.maxVoices);
-        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
-        const bool editedMaxVoices = ImGui::InputInt("##maxvoices", &maxVoices, 0, 0);
-        if (editedMaxVoices) {
-            maxVoices = (std::max)(1, (std::min)(524288, maxVoices));
-            w.maxVoices = static_cast<uint32_t>(maxVoices);
-            doc.MarkDirty();
-        }
-        // Avoid shedding thousands of voices because the user temporarily
-        // deleted a digit while typing. Commit the text field when editing is
-        // finished; presets below are applied immediately on click.
-        if (editedMaxVoices && !ImGui::IsItemActive()) {
-            PushLiveMaxVoices(w.maxVoices);
-        } else if (ImGui::IsItemDeactivatedAfterEdit()) {
-            PushLiveMaxVoices(w.maxVoices);
-        }
-        LiveVoiceCell();
 
-        ImGui::TableNextRow();
-        LabelCell("Voice retire floor",
-                  "Release-tail loudness where finished voices are freed. Higher (less negative dB) frees quiet tails sooner and cuts release rendering cost on dense songs; lower keeps longer tails. Applies to newly started releases.");
+        // ------------------------------------------------------- VOICES
         ImGui::TableNextColumn();
-        const float retireDb = 20.0f * std::log10(w.voiceRetireThreshold);
-        int retireDbInt = static_cast<int>(retireDb + (retireDb >= 0.0f ? 0.5f : -0.5f));
-        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::SliderInt("##voiceretire", &retireDbInt, -100, -26, "%d dB")) {
-            retireDbInt = (std::max)(-100, (std::min)(-26, retireDbInt));
-            w.voiceRetireThreshold =
-                std::pow(10.0f, static_cast<float>(retireDbInt) / 20.0f);
-            doc.MarkDirty();
-        }
-        if (ImGui::IsItemDeactivatedAfterEdit() && lc.connected && lc.client) {
-            // Wire command carries the raw gain bits in param; applies to
-            // newly started releases without touching a sounding tail.
-            uint32_t floorBits = 0u;
-            std::memcpy(&floorBits, &w.voiceRetireThreshold,
-                        sizeof(floorBits));
-            char retireResult[svms::kRuntimeLinkResultTextCapacity]{};
-            lc.client->SendCommand(
-                svms::RLCommandType::SetVoiceRetireFloor, 0u, floorBits,
-                svms::RuntimeLiveStateV2{}, 100u, retireResult);
-        }
-        LiveVoiceCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Steal policy",
-                  "Recommended: Quality (default) — steals the quietest voice via an incremental priority index; consistently the best-sounding option in listening tests. Fast cursor (O(1) round-robin, victim = oldest slot) and Scan (SIMD quiet-ish window) avoid the index but audibly degrade victim quality under dense churn — kept for experimentation only, not recommended.");
-        ImGui::TableNextColumn();
-        static const char* stealModes[] = { "Quality", "Fast cursor", "Scan (quiet-ish, SIMD)" };
-        int stealMode = static_cast<int>(w.stealPolicy);
-        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::Combo("##stealpolicy", &stealMode, stealModes, 3)) {
-            w.stealPolicy = static_cast<uint32_t>(stealMode);
-            doc.MarkDirty();
-            if (lc.connected && lc.client) {
-                char stealResult[svms::kRuntimeLinkResultTextCapacity]{};
-                lc.client->SendCommand(
-                    svms::RLCommandType::SetStealPolicy, 0u,
-                    w.stealPolicy, svms::RuntimeLiveStateV2{}, 100u,
-                    stealResult);
+        if (BeginRackPanel("VOICES")) {
+            const ThemeSettings& th = GetThemeSettings();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            // Big readout of the live voice ceiling.
+            {
+                const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                const float width = (std::min)(260.0f, ImGui::GetContentRegionAvail().x * 0.5f);
+                const float height = 64.0f;
+                DrawLcdFrame(dl, p0, ImVec2(p0.x + width, p0.y + height));
+                PushMono(0.80f);
+                dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 6.0f),
+                            ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
+                            "MAX VOICES");
+                PopMono();
+                PushMono(2.1f);
+                char big[32];
+                std::snprintf(big, sizeof(big), "%u", w.maxVoices);
+                dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 20.0f),
+                            ImGui::GetColorU32(th.accent), big);
+                PopMono();
+                ImGui::Dummy(ImVec2(width, height));
+                if (t && lc.connected) {
+                    ImGui::SameLine(0.0f, 20.0f);
+                    ImGui::BeginGroup();
+                    PanelCaption("ACTIVE NOW", nullptr);
+                    PushMono(1.3f);
+                    ImGui::PushStyleColor(ImGuiCol_Text, th.accent);
+                    ImGui::Text("%u", t->activeVoices);
+                    ImGui::PopStyleColor();
+                    PopMono();
+                    ImGui::EndGroup();
+                }
             }
-        }
-        LiveVoiceCell();
+            ImGui::Spacing();
 
-        ImGui::TableNextRow();
-        LabelCell("Per-key voice cap",
-                  "Opt-in. Limits how many still-playing voices one (channel,note) may hold; a note-on that hits the cap replaces the oldest voice of that key instead of piling up. 0 = off (default). Tames dense Black MIDI passages that hammer the same keys across channels. Release tails never count against the cap.");
-        ImGui::TableNextColumn();
-        int perKeyCap = static_cast<int>(w.perKeyVoiceCap);
-        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::SliderInt("##perkeycap", &perKeyCap, 0, 32,
-                             perKeyCap == 0 ? "Off" : "%d voices/key")) {
-            w.perKeyVoiceCap = static_cast<uint32_t>(perKeyCap);
-            doc.MarkDirty();
-        }
-        if (ImGui::IsItemDeactivatedAfterEdit() && lc.connected && lc.client) {
-            char capResult[svms::kRuntimeLinkResultTextCapacity]{};
-            lc.client->SendCommand(
-                svms::RLCommandType::SetPerKeyVoiceCap, 0u,
-                w.perKeyVoiceCap, svms::RuntimeLiveStateV2{}, 100u,
-                capResult);
-        }
-        LiveVoiceCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Ghost budget",
-                  "Optional cap on displaced-voice ghosts rendered per block (0 = unbounded, default). Ghosts reproduce a stolen or killed voice's pre-steal samples anti-clicked; under extreme steal storms they double render cost. Lower values cut that cost at the price of clicks on the voices past the cap.");
-        ImGui::TableNextColumn();
-        int ghostBudget = static_cast<int>(w.ghostBudget);
-        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::SliderInt("##ghostbudget", &ghostBudget, 0, 4096,
-                             ghostBudget == 0 ? "Unbounded" : "%d ghosts")) {
-            w.ghostBudget = static_cast<uint32_t>(ghostBudget);
-            doc.MarkDirty();
-        }
-        if (ImGui::IsItemDeactivatedAfterEdit() && lc.connected && lc.client) {
-            char gbResult[svms::kRuntimeLinkResultTextCapacity]{};
-            lc.client->SendCommand(
-                svms::RLCommandType::SetGhostBudget, 0u,
-                w.ghostBudget, svms::RuntimeLiveStateV2{}, 100u,
-                gbResult);
-        }
-        LiveVoiceCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Large pages",
-                  "Optional. Backs the voice pool and dense-render storage with 2 MB pages to reduce TLB pressure at very large pool sizes. Requires the Lock Pages In Memory privilege (granted via Local Security Policy); otherwise this silently falls back to standard allocation. Never prompts for elevation. Takes effect after a driver restart.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("##largepages", &w.largePages)) {
-            doc.MarkDirty();
-        }
-        RestartCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Hybrid thread affinity",
-                  "Opt-in. 1 pins every render thread (audio, event compiler, workers) to performance cores; 2 keeps audio + compiler on P-cores and parks render workers on efficiency cores so the P-cores stay free for real-time work (worker count is never reduced). No effect on non-hybrid CPUs.");
-        ImGui::TableNextColumn();
-        static const char* affinityModes[] = {
-            "Off",
-            "All render threads on P-cores",
-            "RT on P-cores, workers on E-cores"
-        };
-        int affinityMode = static_cast<int>(w.threadAffinityMode);
-        ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::Combo("##affinity", &affinityMode, affinityModes, 3)) {
-            w.threadAffinityMode = static_cast<uint32_t>(affinityMode);
-            doc.MarkDirty();
-            if (lc.connected && lc.client) {
-                char affinityResult[svms::kRuntimeLinkResultTextCapacity]{};
-                lc.client->SendCommand(
-                    svms::RLCommandType::SetThreadAffinityMode, 0u,
-                    w.threadAffinityMode, svms::RuntimeLiveStateV2{}, 100u,
-                    affinityResult);
-            }
-        }
-        LiveVoiceCell();
-
-        ImGui::TableNextRow();
-        LabelCell("Voice presets");
-        ImGui::TableNextColumn();
-        static const int presetValues[] = {
-            1024, 2048, 4096, 8192, 16384, 32768,
-            65536, 131072, 262144, 524288
-        };
-        for (int i = 0; i < 10; ++i) {
-            if (i > 0) ImGui::SameLine();
-            char label[32];
-            std::snprintf(label, sizeof(label), "%d###voices_%d", presetValues[i], i);
-            const bool selected = static_cast<int>(w.maxVoices) == presetValues[i];
-            if (selected) {
-                ImVec4 selectedButton = GetAccent();
-                selectedButton.w = 0.35f;
-                ImGui::PushStyleColor(ImGuiCol_Button, selectedButton);
-            }
-            if (ImGui::SmallButton(label)) {
-                w.maxVoices = static_cast<uint32_t>(presetValues[i]);
+            static const int presetValues[] = {1024, 2048, 4096, 8192, 16384, 32768,
+                                               65536, 131072, 262144, 524288};
+            static const char* presetLabels[] = {"1k", "2k", "4k", "8k", "16k", "32k",
+                                                 "64k", "128k", "256k", "512k"};
+            int presetIdx = -1;
+            for (int i = 0; i < 10; ++i)
+                if (presetValues[i] == static_cast<int>(w.maxVoices)) presetIdx = i;
+            if (PanelKeys("VOICE CEILING  (LIVE)", &presetIdx, presetLabels, 10,
+                          "Live primary-voice ceiling. Growing the value expands the physical voice pool without restarting or resetting sounding voices. Lowering it sheds excess voices using the normal steal-priority policy and a short anti-click release.") &&
+                presetIdx >= 0) {
+                w.maxVoices = static_cast<uint32_t>(presetValues[presetIdx]);
                 doc.MarkDirty();
                 PushLiveMaxVoices(w.maxVoices);
             }
-            if (selected) ImGui::PopStyleColor();
-        }
-        LiveVoiceCell();
+            ImGui::Spacing();
 
-        ImGui::TableNextRow();
-        LabelCell("Voice memory budget",
-                  "Upper bound for the primary voice pool, renderer scratch, dense-planner state, and worker mix buffers. Zero means unlimited. A restart recalculates the largest safe live-growth ceiling.");
-        ImGui::TableNextColumn();
-        int memoryBudget = static_cast<int>(w.voiceMemoryBudgetMB);
-        ImGui::SetNextItemWidth((std::min)(260.0f,
-                                           ImGui::GetContentRegionAvail().x));
-        if (ImGui::InputInt("##voicememorybudget", &memoryBudget, 0, 0)) {
-            memoryBudget = (std::max)(0, (std::min)(65536, memoryBudget));
-            w.voiceMemoryBudgetMB = static_cast<uint32_t>(memoryBudget);
-            doc.MarkDirty();
-        }
-        if (w.voiceMemoryBudgetMB == 0u) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("Unlimited");
-        } else {
-            ImGui::SameLine();
-            ImGui::TextDisabled("MiB");
-        }
-        RestartCell();
+            ImGui::BeginGroup();
+            int custom = static_cast<int>(w.maxVoices);
+            bool done = false;
+            if (PanelLcdInt("CUSTOM CEILING", &custom, 1, 524288,
+                            "Type an exact voice count. Applied when you finish editing, so deleting a digit never sheds thousands of voices mid-edit.",
+                            false, &done)) {
+                w.maxVoices = static_cast<uint32_t>(custom);
+                doc.MarkDirty();
+            }
+            if (done) PushLiveMaxVoices(w.maxVoices);
+            ImGui::EndGroup();
+            ImGui::SameLine(0.0f, 28.0f);
+            ImGui::BeginGroup();
+            static const char* stealLabels[] = {"QUALITY", "FAST", "SCAN"};
+            int steal = static_cast<int>((std::min)(2u, w.stealPolicy));
+            if (PanelKeys("STEAL POLICY", &steal, stealLabels, 3,
+                          "Quality (recommended, and clearly best in listening tests) steals the quietest voice via an incremental priority index. Fast cursor and Scan avoid the index but audibly degrade victim quality under dense churn: kept for experimentation only.")) {
+                w.stealPolicy = static_cast<uint32_t>(steal);
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetStealPolicy, w.stealPolicy);
+            }
+            ImGui::EndGroup();
 
-        ImGui::TableNextRow();
-        LabelCell("Render threads",
-                  "Total voice-render lanes. 1 keeps voice rendering on the audio thread. "
-                  "0 selects V3's automatic thread count.");
-        ImGui::TableNextColumn();
-        static const char* threadItems[] = {
-            "Automatic", "1 (audio thread only)", "2", "3", "4", "6", "8",
-            "10", "12", "16", "24", "32", "48", "64"
-        };
-        static const int threadValues[] = {
-            0, 1, 2, 3, 4, 6, 8, 10, 12, 16, 24, 32, 48, 64
-        };
-        int threadIdx = 0;
-        for (int i = 0; i < 14; ++i) {
-            if (threadValues[i] == static_cast<int>(w.renderThreads)) {
-                threadIdx = i;
-                break;
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
+            if (ImGui::BeginTable("##synth_knobs", 3, ImGuiTableFlags_SizingStretchSame)) {
+                ImGui::TableNextRow();
+                bool committed = false;
+
+                ImGui::TableNextColumn();
+                float retireDb = 20.0f * std::log10(w.voiceRetireThreshold);
+                retireDb = (std::max)(-100.0f, (std::min)(-26.0f, retireDb));
+                if (PanelKnob("RETIRE FLOOR", &retireDb, -100.0f, -26.0f, -76.0f,
+                              "%.0f dB", 60.0f,
+                              "Release-tail loudness where finished voices are freed. Higher (less negative) frees quiet tails sooner and cuts release cost on dense songs; lower keeps longer tails. Applies to newly started releases.",
+                              &committed)) {
+                    w.voiceRetireThreshold = std::pow(10.0f, retireDb / 20.0f);
+                    doc.MarkDirty();
+                }
+                if (committed) {
+                    uint32_t bits = 0u;
+                    std::memcpy(&bits, &w.voiceRetireThreshold, sizeof(bits));
+                    send(svms::RLCommandType::SetVoiceRetireFloor, bits);
+                }
+
+                ImGui::TableNextColumn();
+                float cap = static_cast<float>(w.perKeyVoiceCap);
+                if (PanelKnob("PER-KEY CAP", &cap, 0.0f, 32.0f, 0.0f,
+                              cap < 0.5f ? "OFF" : "%.0f / key", 60.0f,
+                              "Opt-in. Limits how many still-playing voices one (channel, note) may hold; a note-on at the cap replaces the oldest voice of that key. Off by default. Tames dense Black MIDI that hammers the same keys across channels.",
+                              &committed)) {
+                    w.perKeyVoiceCap = static_cast<uint32_t>(cap + 0.5f);
+                    doc.MarkDirty();
+                }
+                if (committed) send(svms::RLCommandType::SetPerKeyVoiceCap, w.perKeyVoiceCap);
+
+                ImGui::TableNextColumn();
+                float ghosts = static_cast<float>(w.ghostBudget);
+                if (PanelKnob("GHOST BUDGET", &ghosts, 0.0f, 4096.0f, 0.0f,
+                              ghosts < 0.5f ? "OFF" : "%.0f", 60.0f,
+                              "Optional cap on displaced-voice ghosts rendered per block (off = unbounded). Lower values cut render cost in extreme steal storms at the price of clicks on voices past the cap.",
+                              &committed)) {
+                    w.ghostBudget = static_cast<uint32_t>(ghosts + 0.5f);
+                    doc.MarkDirty();
+                }
+                if (committed) send(svms::RLCommandType::SetGhostBudget, w.ghostBudget);
+                ImGui::EndTable();
             }
         }
-        ImGui::SetNextItemWidth((std::min)(300.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::Combo("##renderthreads", &threadIdx, threadItems, 14)) {
-            w.renderThreads = static_cast<uint32_t>(threadValues[threadIdx]);
-            doc.MarkDirty();
-        }
-        RestartCell();
+        EndRackPanel();
 
-        ImGui::TableNextRow();
-        LabelCell("Correctness mode",
-                  "Renders the complete configured pool at full quality. Disable only if "
-                  "you understand the quality tradeoff.");
+        // ------------------------------------------------------- ENGINE
         ImGui::TableNextColumn();
-        bool correctness = w.correctnessMode;
-        if (ToggleSwitch("Full correctness", &correctness)) {
-            w.correctnessMode = correctness;
-            doc.MarkDirty();
-            PushLiveBool(svms::RLCommandType::SetCorrectnessMode, correctness);
-        }
-        ImGui::TableNextColumn();
-        if (lc.connected) LiveBadge("Applied live via RuntimeLink");
-        AppliedStateBadge(lc.connected, lc.telemetry, w,
-                          "Correctness-mode applied state vs working copy");
+        if (BeginRackPanel("ENGINE")) {
+            static const int threadValues[] = {0, 1, 2, 4, 8, 12, 16, 24, 32, 64};
+            static const char* threadLabels[] = {"AUTO", "1", "2", "4", "8", "12", "16", "24", "32", "64"};
+            int threadIdx = -1;
+            for (int i = 0; i < 10; ++i)
+                if (threadValues[i] == static_cast<int>(w.renderThreads)) threadIdx = i;
+            if (PanelKeys("RENDER THREADS", &threadIdx, threadLabels, 10,
+                          "Total voice-render lanes. 1 keeps voice rendering on the audio thread; AUTO lets V3 pick.",
+                          true) && threadIdx >= 0) {
+                w.renderThreads = static_cast<uint32_t>(threadValues[threadIdx]);
+                doc.MarkDirty();
+            }
+            if (threadIdx < 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("custom: %u", w.renderThreads);
+            }
+            ImGui::Spacing();
 
+            static const char* affinityLabels[] = {"OFF", "ALL ON P", "RT ON P"};
+            int affinity = static_cast<int>((std::min)(2u, w.threadAffinityMode));
+            if (PanelKeys("THREAD AFFINITY  (LIVE)", &affinity, affinityLabels, 3,
+                          "Opt-in. ALL ON P pins every render thread to performance cores; RT ON P keeps audio and the compiler on P-cores and parks render workers on efficiency cores. No effect on non-hybrid CPUs.")) {
+                w.threadAffinityMode = static_cast<uint32_t>(affinity);
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetThreadAffinityMode, w.threadAffinityMode);
+            }
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            if (PanelLever("LARGE PAGES", &w.largePages,
+                           "Optional. Backs the voice pool and dense-render storage with 2 MB pages to reduce TLB pressure at very large pools. Needs the Lock Pages In Memory privilege; otherwise silently falls back to normal allocation.",
+                           true)) {
+                doc.MarkDirty();
+            }
+            ImGui::Spacing();
+            bool correctness = w.correctnessMode;
+            if (PanelLever("FULL CORRECTNESS", &correctness,
+                           "Renders the complete configured pool at full quality. Disable only if you understand the quality tradeoff.")) {
+                w.correctnessMode = correctness;
+                doc.MarkDirty();
+                PushLiveBool(svms::RLCommandType::SetCorrectnessMode, correctness);
+            }
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            int memory = static_cast<int>(w.voiceMemoryBudgetMB);
+            if (PanelLcdInt("VOICE MEMORY  (MIB)", &memory, 0, 65536,
+                            "Upper bound for the voice pool, renderer scratch, dense-planner state and worker mix buffers. Zero means unlimited. A restart recalculates the largest safe live-growth ceiling.",
+                            true, nullptr, "unlimited")) {
+                w.voiceMemoryBudgetMB = static_cast<uint32_t>(memory);
+                doc.MarkDirty();
+            }
+        }
+        EndRackPanel();
         ImGui::EndTable();
     }
 
-    ImGui::Spacing();
     if (w.maxVoices > 4096) {
         ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
         ImGui::TextWrapped("Extreme voice capacity. Actual realtime performance is workload and CPU dependent.");
         ImGui::PopStyleColor();
-    } else {
-        ImGui::TextDisabled("Capacity is not a realtime performance guarantee.");
     }
-    ImGui::TextDisabled("Multicore scaling is workload-dependent.");
 
-    if (lc.connected && t) {
-        ImGui::Spacing();
-        SectionHeader("LIVE RENDER BUDGET");
-
-        const float budgetMs = BlockBudgetMs(*t);
-        const float load = (std::max)(0.0f, t->cpuLoadPercent);
-        const float headroom = (std::max)(0.0f, 100.0f - load);
-        const float renderMs = PercentToMs(load, budgetMs);
-        const uint32_t appliedVoiceCap = t->live.maxVoices != 0u
-            ? t->live.maxVoices : t->maxVoices;
-
-        if (ImGui::BeginTable("##performance_live_primary", 4,
-                              ImGuiTableFlags_SizingStretchSame |
-                              ImGuiTableFlags_BordersInnerV)) {
-            ImGui::TableNextRow();
-            BudgetMetric("ACTIVE VOICES", "%u / %u", t->activeVoices, appliedVoiceCap);
-            BudgetMetric("RENDER / BUDGET", "%.2f / %.2f ms", renderMs, budgetMs);
-            BudgetMetric("RENDER LOAD", "%.1f%%", load);
-            BudgetMetric("HEADROOM", "%.1f%%", headroom);
-            ImGui::EndTable();
+    // ----------------------------------------------------- RENDER BUDGET
+    if (BeginRackPanel("LIVE RENDER BUDGET")) {
+        const ThemeSettings& th = GetThemeSettings();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const bool tel = lc.connected && t;
+        struct Cell { const char* label; char value[48]; };
+        Cell cells[8];
+        auto set = [&](int i, const char* label, const char* fmt, auto... args) {
+            cells[i].label = label;
+            std::snprintf(cells[i].value, sizeof(cells[i].value), fmt, args...);
+        };
+        if (tel) {
+            const float budgetMs = BlockBudgetMs(*t);
+            const float load = (std::max)(0.0f, t->cpuLoadPercent);
+            const uint32_t cap = t->live.maxVoices != 0u ? t->live.maxVoices : t->maxVoices;
+            set(0, "ACTIVE VOICES", "%u / %u", t->activeVoices, cap);
+            set(1, "RENDER / BUDGET", "%.2f / %.2f ms", PercentToMs(load, budgetMs), budgetMs);
+            set(2, "RENDER LOAD", "%.1f%%", load);
+            set(3, "HEADROOM", "%.1f%%", (std::max)(0.0f, 100.0f - load));
+            set(4, "P95", "%.2f ms", PercentToMs(t->callbackP95Percent, budgetMs));
+            set(5, "P99", "%.2f ms", PercentToMs(t->callbackP99Percent, budgetMs));
+            set(6, "P99.9", "%.2f ms", PercentToMs(t->callbackP999Percent, budgetMs));
+            set(7, "OVER BUDGET", "%llu  (streak %u)",
+                static_cast<unsigned long long>(t->overBudgetCallbacks),
+                t->maxConsecutiveOverBudget);
+        } else {
+            const char* labels[8] = {"ACTIVE VOICES", "RENDER / BUDGET", "RENDER LOAD", "HEADROOM",
+                                     "P95", "P99", "P99.9", "OVER BUDGET"};
+            for (int i = 0; i < 8; ++i) set(i, labels[i], "--");
         }
-
-        ImGui::Spacing();
-        if (ImGui::BeginTable("##performance_live_percentiles", 4,
-                              ImGuiTableFlags_SizingStretchSame |
-                              ImGuiTableFlags_BordersInnerV)) {
-            ImGui::TableNextRow();
-            BudgetMetric("P95", "%.2f ms  (%.0f%%)",
-                         PercentToMs(t->callbackP95Percent, budgetMs),
-                         t->callbackP95Percent);
-            BudgetMetric("P99", "%.2f ms  (%.0f%%)",
-                         PercentToMs(t->callbackP99Percent, budgetMs),
-                         t->callbackP99Percent);
-            BudgetMetric("P99.9", "%.2f ms  (%.0f%%)",
-                         PercentToMs(t->callbackP999Percent, budgetMs),
-                         t->callbackP999Percent);
-            BudgetMetric("OVER BUDGET", "%llu  |  streak %u",
-                         static_cast<unsigned long long>(t->overBudgetCallbacks),
-                         t->maxConsecutiveOverBudget);
-            ImGui::EndTable();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        PushMono(0.95f);
+        const float lh = ImGui::GetTextLineHeight();
+        const float height = lh * 4.0f + 44.0f;
+        DrawLcdFrame(dl, p0, ImVec2(p0.x + width, p0.y + height));
+        for (int i = 0; i < 8; ++i) {
+            const int col = i % 4;
+            const int row = i / 4;
+            const float x = p0.x + 16.0f + col * (width - 32.0f) / 4.0f;
+            const float y = p0.y + 12.0f + row * (lh * 2.0f + 14.0f);
+            dl->AddText(ImVec2(x, y),
+                        ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
+                        cells[i].label);
+            dl->AddText(ImVec2(x, y + lh + 2.0f), ImGui::GetColorU32(th.accent), cells[i].value);
         }
-
-        ImGui::Spacing();
-        ImGui::TextDisabled("Physical pool: %u voices   |   Buffer: %u frames @ %u Hz   |   Decimation: %ux",
-                            t->maxVoices, t->bufferFrames, t->sampleRate,
-                            (std::max)(1u, t->decimationStep));
-
-        if (w.maxVoices > t->maxVoices && t->maxVoices != 0u) {
-            ImGui::TextDisabled(
-                "Growing physical pool live: %u -> %u voices. Existing voices are preserved.",
-                t->maxVoices, w.maxVoices);
+        PopMono();
+        ImGui::Dummy(ImVec2(width, height));
+        if (tel) {
+            ImGui::TextDisabled("Physical pool %u voices  |  buffer %u frames @ %u Hz  |  decimation %ux",
+                                t->maxVoices, t->bufferFrames, t->sampleRate,
+                                (std::max)(1u, t->decimationStep));
+        } else {
+            ImGui::TextDisabled("Connect to a running driver to see live render load.");
         }
     }
+    EndRackPanel();
 }
 
 } // namespace svms::cfg
