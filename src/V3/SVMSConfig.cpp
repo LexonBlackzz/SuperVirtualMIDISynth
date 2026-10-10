@@ -1,11 +1,19 @@
 #include "SVMSConfig.h"
 #include "SVMSEnvelope.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <shlobj.h>
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#include <climits>
+#include <cstdlib>
+#include <mutex>
+#endif
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -17,7 +25,9 @@
 #include <sstream>
 #include <vector>
 
+#ifdef _WIN32
 extern "C" IMAGE_DOS_HEADER __ImageBase;
+#endif
 
 namespace svms {
 namespace {
@@ -29,6 +39,19 @@ constexpr uint32_t kConfigSchemaVersion = 1;
 constexpr wchar_t kConfigMutexName[] = L"Local\\SuperVirtualMIDISynth_Config_v1";
 constexpr uint64_t kMaximumConfigDocumentBytes = 16u * 1024u * 1024u;
 
+#ifndef _WIN32
+// In-process only for now; Windows additionally serialises across processes
+// with a named mutex. ponytail: add flock() on the config file if two SVMS
+// processes ever write the same config concurrently on Linux.
+class ScopedConfigMutex {
+public:
+    ScopedConfigMutex() : lock_(Mutex()) {}
+    bool Locked() const noexcept { return true; }
+private:
+    static std::mutex& Mutex() { static std::mutex m; return m; }
+    std::lock_guard<std::mutex> lock_;
+};
+#else
 class ScopedConfigMutex {
 public:
     ScopedConfigMutex() : handle_(CreateMutexW(nullptr, FALSE,
@@ -48,6 +71,7 @@ private:
     HANDLE handle_ = nullptr;
     bool locked_ = false;
 };
+#endif
 
 bool PathExists(const fs::path& path) noexcept {
     if (path.empty()) return false;
@@ -56,6 +80,7 @@ bool PathExists(const fs::path& path) noexcept {
     return !error && exists;
 }
 
+#ifdef _WIN32
 std::string WideToUtf8(const std::wstring& value) {
     if (value.empty()) return {};
     const int count = WideCharToMultiByte(CP_UTF8, 0, value.data(),
@@ -78,6 +103,71 @@ std::wstring Utf8ToWide(const std::string& value) {
     return result;
 }
 
+#else
+// wchar_t is UTF-32 on Linux; convert by hand (no locale dependence).
+std::string WideToUtf8(const std::wstring& value) {
+    std::string out;
+    for (const wchar_t wc : value) {
+        const uint32_t c = static_cast<uint32_t>(wc);
+        if (c < 0x80u) {
+            out += static_cast<char>(c);
+        } else if (c < 0x800u) {
+            out += static_cast<char>(0xC0u | (c >> 6));
+            out += static_cast<char>(0x80u | (c & 0x3Fu));
+        } else if (c < 0x10000u) {
+            out += static_cast<char>(0xE0u | (c >> 12));
+            out += static_cast<char>(0x80u | ((c >> 6) & 0x3Fu));
+            out += static_cast<char>(0x80u | (c & 0x3Fu));
+        } else {
+            out += static_cast<char>(0xF0u | (c >> 18));
+            out += static_cast<char>(0x80u | ((c >> 12) & 0x3Fu));
+            out += static_cast<char>(0x80u | ((c >> 6) & 0x3Fu));
+            out += static_cast<char>(0x80u | (c & 0x3Fu));
+        }
+    }
+    return out;
+}
+
+std::wstring Utf8ToWide(const std::string& value) {
+    std::wstring out;
+    for (size_t i = 0; i < value.size();) {
+        const unsigned char b = static_cast<unsigned char>(value[i]);
+        uint32_t c;
+        size_t extra;
+        if (b < 0x80u) { c = b; extra = 0; }
+        else if ((b & 0xE0u) == 0xC0u) { c = b & 0x1Fu; extra = 1; }
+        else if ((b & 0xF0u) == 0xE0u) { c = b & 0x0Fu; extra = 2; }
+        else if ((b & 0xF8u) == 0xF0u) { c = b & 0x07u; extra = 3; }
+        else return {};  // invalid UTF-8, same as MB_ERR_INVALID_CHARS
+        if (i + extra >= value.size() && extra != 0) return {};
+        for (size_t k = 1; k <= extra; ++k) {
+            const unsigned char t = static_cast<unsigned char>(value[i + k]);
+            if ((t & 0xC0u) != 0x80u) return {};
+            c = (c << 6) | (t & 0x3Fu);
+        }
+        out += static_cast<wchar_t>(c);
+        i += extra + 1;
+    }
+    return out;
+}
+
+using DWORD = uint32_t;
+#define _countof(a) (sizeof(a) / sizeof((a)[0]))
+
+// Win32-shaped getenv: returns chars copied (no NUL), or the required size
+// including the NUL when the buffer is too small, or 0 when unset.
+DWORD GetEnvironmentVariableW(const wchar_t* name, wchar_t* buffer, DWORD capacity) {
+    const char* raw = std::getenv(WideToUtf8(name).c_str());
+    if (!raw) return 0;
+    const std::wstring value = Utf8ToWide(raw);
+    if (value.size() >= capacity) return static_cast<DWORD>(value.size() + 1);
+    std::copy(value.begin(), value.end(), buffer);
+    buffer[value.size()] = L'\0';
+    return static_cast<DWORD>(value.size());
+}
+#endif
+
+#ifdef _WIN32
 std::wstring GetExecutableDirectory() {
     std::wstring path(32768, L'\0');
     DWORD length = GetModuleFileNameW(nullptr, path.data(),
@@ -86,6 +176,15 @@ std::wstring GetExecutableDirectory() {
     path.resize(length);
     return fs::path(path).parent_path().wstring();
 }
+
+#else
+std::wstring GetExecutableDirectory() {
+    char path[PATH_MAX] = {};
+    const ssize_t length = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (length <= 0) return {};
+    return fs::path(std::string(path, static_cast<size_t>(length))).parent_path().wstring();
+}
+#endif
 
 fs::path GetSoundFontSearchDirectory() {
     // Test-only override. Production always discovers beside winmm.dll.
@@ -355,7 +454,11 @@ bool AtomicWriteJson(const fs::path& target, const json& root) {
     if (ec) return false;
 
     fs::path temporary = target;
+#ifdef _WIN32
     temporary += L".tmp." + std::to_wstring(GetCurrentProcessId());
+#else
+    temporary += L".tmp." + std::to_wstring(static_cast<unsigned long>(getpid()));
+#endif
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output) return false;
@@ -364,11 +467,20 @@ bool AtomicWriteJson(const fs::path& target, const json& root) {
         if (!output) return false;
     }
 
+#ifdef _WIN32
     if (!MoveFileExW(temporary.c_str(), target.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileW(temporary.c_str());
         return false;
     }
+#else
+    std::error_code renameError;
+    fs::rename(temporary, target, renameError);  // atomic replace on POSIX
+    if (renameError) {
+        fs::remove(temporary, renameError);
+        return false;
+    }
+#endif
     return true;
 }
 
@@ -890,8 +1002,12 @@ EngineConfig EngineConfig::Default() {
 EngineConfig EngineConfig::Load() {
     EngineConfig cfg = Default();
 
+#ifdef _WIN32
     HANDLE mutex = CreateMutexW(nullptr, FALSE, kConfigMutexName);
     if (mutex) WaitForSingleObject(mutex, INFINITE);
+#else
+    ScopedConfigMutex configLock;
+#endif
 
     const fs::path localPath(GetV3LocalConfigPath());
     const fs::path appDataPath(GetV3AppDataConfigPath());
@@ -948,10 +1064,12 @@ EngineConfig EngineConfig::Load() {
         cfg.configWarning = std::string("malformed config.json: ") + error.what();
     }
 
+#ifdef _WIN32
     if (mutex) {
         ReleaseMutex(mutex);
         CloseHandle(mutex);
     }
+#endif
 
     ApplyEnvironment(cfg);
     if (cfg.soundFontPaths.empty() && !cfg.soundFontPath.empty())
@@ -1143,7 +1261,14 @@ std::wstring GetV3AppDataConfigPath() {
     }
 
     std::wstring result;
-#if defined(SVMS_XP_COMPAT)
+#if !defined(_WIN32)
+    // XDG: $XDG_CONFIG_HOME, else ~/.config
+    fs::path base;
+    if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg) base = xdg;
+    else if (const char* home = std::getenv("HOME"); home && *home) base = fs::path(home) / ".config";
+    if (!base.empty())
+        result = (base / "SuperVirtualMIDISynth" / "config.json").wstring();
+#elif defined(SVMS_XP_COMPAT)
     wchar_t roaming[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA | CSIDL_FLAG_CREATE,
                                    nullptr, SHGFP_TYPE_CURRENT, roaming))) {
@@ -1168,6 +1293,17 @@ std::wstring GetV3ConfigPath() {
     return local.wstring();
 }
 
+#ifndef _WIN32
+std::wstring GetV3ModuleDirectory() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&GetV3ModuleDirectory), &info) && info.dli_fname) {
+        std::error_code error;
+        const fs::path resolved = fs::canonical(fs::path(info.dli_fname), error);
+        return (error ? fs::path(info.dli_fname) : resolved).parent_path().wstring();
+    }
+    return GetExecutableDirectory();
+}
+#else
 std::wstring GetV3ModuleDirectory() {
     std::wstring path(32768, L'\0');
     HMODULE module = reinterpret_cast<HMODULE>(&__ImageBase);
@@ -1177,6 +1313,7 @@ std::wstring GetV3ModuleDirectory() {
     path.resize(length);
     return fs::path(path).parent_path().wstring();
 }
+#endif
 
 std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
                                     std::string* warning) {

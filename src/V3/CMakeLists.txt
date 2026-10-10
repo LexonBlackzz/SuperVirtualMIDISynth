@@ -167,6 +167,7 @@ if(NOT WIN32)
     endif()
 
     set(SVMS_PORTABLE_RENDER_SOURCES
+        SVMSConfig.cpp
         SVMSSoundFont.cpp
         SVMSRenderKernels.cpp
         SVMSRenderWorkersPosix.cpp

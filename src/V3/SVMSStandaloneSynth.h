@@ -194,18 +194,11 @@ public:
         // so prerender reproduces realtime's event semantics exactly
         // (including the velocity stacking of collapsed hits). Default
         // threshold 1 = disabled, every note-on spawns.
-#if defined(_WIN32)
         static const EngineConfig collapseConfig = EngineConfig::Load();
-        const uint32_t collapseThreshold = collapseConfig.noteOnCollapseThreshold;
-#else
-        // SVMSConfig.cpp is Windows-only for now (named mutex, AppData);
-        // Linux uses the config default: collapse disabled.
-        const uint32_t collapseThreshold = 1u;
-#endif
         noteOnCollapse_.SetWindowTicks(
             static_cast<uint64_t>(config.sampleRate) *
             kNoteOnCollapseWindowMs / 1000u);
-        noteOnCollapse_.SetThreshold(collapseThreshold);
+        noteOnCollapse_.SetThreshold(collapseConfig.noteOnCollapseThreshold);
         return true;
     }
 
