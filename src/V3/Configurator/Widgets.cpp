@@ -564,8 +564,14 @@ void RestartPill() {
     const std::string label = StyleText("RESTART");
     const ImVec2 ts = ImGui::CalcTextSize(label.c_str());
     const ImVec2 pad(refined ? 8.0f : 6.0f, 1.0f);
-    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImVec2 p = ImGui::GetCursorScreenPos();
     const ImVec2 size(ts.x + pad.x * 2.0f, ts.y + pad.y * 2.0f);
+    // Centre on the previous item when sharing its line (caption / lever label).
+    const float prevH = ImGui::GetItemRectSize().y;
+    if (std::fabs(ImGui::GetItemRectMin().y - p.y) < 3.0f && prevH > size.y) {
+        p.y += std::floor((prevH - size.y) * 0.5f);
+        ImGui::SetCursorScreenPos(p);
+    }
     ImGui::Dummy(size);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (refined) {
@@ -580,7 +586,7 @@ void RestartPill() {
         const ImVec4 c = GetAccent();
         dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y),
                     ImGui::GetColorU32(Alpha(c, 0.55f)), 3.0f);
-        dl->AddText(ImVec2(p.x + pad.x, p.y + pad.y), ImGui::GetColorU32(c), label.c_str());
+        dl->AddText(ImVec2(p.x + pad.x, p.y + pad.y + 1.0f), ImGui::GetColorU32(c), label.c_str());
     }
     PopLabel();
     if (ImGui::IsItemHovered()) {
@@ -649,6 +655,7 @@ bool ToggleSwitch(const char* label, bool* value, const char* tooltip) {
 
     ImGui::SameLine();
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (h - ImGui::GetTextLineHeight()) * 0.5f);
     ImGui::TextUnformatted(StyleText(label).c_str());
 
     if (tooltip && ImGui::IsItemHovered()) {

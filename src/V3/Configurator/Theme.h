@@ -82,7 +82,7 @@ void SetMonoFont(ImFont* font);
 inline constexpr float kSidebarWidth = 200.0f;
 inline constexpr float kFooterHeight = 48.0f;
 inline constexpr float kHeaderHeight = 34.0f;
-inline constexpr float kMasterHeight = 96.0f;
+inline constexpr float kMasterHeight = 100.0f;
 inline constexpr float kChainHeight = 46.0f;
 inline constexpr float kMinWindowWidth = 1100.0f;
 inline constexpr float kMinWindowHeight = 660.0f;

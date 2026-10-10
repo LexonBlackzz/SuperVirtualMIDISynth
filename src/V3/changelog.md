@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-11 fix(v3): configurator alignment pass: RESTART tags and lever labels centred on their line, meter bars centred in their frame, master strip spacing.
 - 2026-10-11 fix(v3): configurator "Refined" style renamed "Boring"; rack key text/lamp vertically balanced.
 - 2026-10-11 fix(v3): configurator master strip is taller so the MASTER knob label is no longer cut off by the chain strip.
 - 2026-10-11 feat(v3): configurator Style option (Rack / Refined) and key spacing fix

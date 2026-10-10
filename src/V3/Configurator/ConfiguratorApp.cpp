@@ -739,13 +739,14 @@ static void DrawHSegBar(ImDrawList* dl, ImVec2 p, float width, float frac,
     const float pitch = 6.0f;
     const int n = (std::max)(1, static_cast<int>((width - 6.0f) / pitch));
     const int lit = static_cast<int>(ImClamp(frac, 0.0f, 1.0f) * n + 0.5f);
+    const float x0 = p.x + (width - (n * pitch - 2.0f)) * 0.5f;
     for (int i = 0; i < n; ++i) {
         const float f = static_cast<float>(i) / static_cast<float>(n);
         const ImVec4 col = accentOnly ? th.accent
             : (f < 0.65f ? th.success : (f < 0.85f ? th.warning : th.error));
         const ImVec4 c = i < lit ? col : Alpha(col, 0.20f);
-        dl->AddRectFilled(ImVec2(p.x + 3.0f + i * pitch, p.y + 3.0f),
-                          ImVec2(p.x + 3.0f + i * pitch + 4.0f, p.y + h - 3.0f),
+        dl->AddRectFilled(ImVec2(x0 + i * pitch, p.y + 3.0f),
+                          ImVec2(x0 + i * pitch + 4.0f, p.y + h - 3.0f),
                           ImGui::GetColorU32(c), 1.0f);
     }
     dl->AddRect(p, ImVec2(p.x + width, p.y + h), ImGui::GetColorU32(GetKeyEdge()), 3.0f);
@@ -761,7 +762,7 @@ void ConfiguratorApp::DrawMasterStrip(float y) {
                       ImGui::GetColorU32(GetKeyEdge()));
 
     auto& w = config_.Working();
-    ImGui::SetCursorPos(ImVec2(22.0f, y + 4.0f));
+    ImGui::SetCursorPos(ImVec2(22.0f, y + 5.0f));
     KnobState knob = {w.masterVolume, 0.0f, 4.0f, 1.0f, "MASTER", nullptr, 44.0f,
                       1.0f, MasterVolumeDb, MasterVolumeFromDb};
     if (RotaryKnob(knob, "%.1f dB")) {
