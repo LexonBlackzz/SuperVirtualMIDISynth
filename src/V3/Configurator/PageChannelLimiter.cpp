@@ -216,7 +216,7 @@ void DrawChannelLimiterPage(ConfigDocument& doc) {
                 float threshold = w.channelLimiterThreshold;
                 KnobState ks = { threshold, 0.0316227766f, 1.0f, 0.5011872336272722f,
                                  "THRESHOLD", nullptr, knobSize, 1.0f,
-                                 LinearToDb };
+                                 LinearToDb, DbToLinear };
                 if (RotaryKnob(ks, "%.1f dB")) {
                     w.channelLimiterThreshold = ks.value;
                     doc.MarkDirty();

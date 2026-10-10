@@ -17,6 +17,10 @@ float HzToKHz(float hz) {
     return hz / 1000.0f;
 }
 
+float KHzToHz(float khz) {
+    return khz * 1000.0f;
+}
+
 ImVec4 WithAlpha(ImVec4 color, float alpha) {
     color.w = ImClamp(alpha, 0.0f, 1.0f);
     return color;
@@ -161,14 +165,15 @@ bool DrawLiveKnob(ConfigDocument& doc, float& value,
                   const char* label, float size, const char* format,
                   svms::RLCommandType command,
                   float displayScale = 1.0f,
-                  float (*displayFn)(float) = nullptr) {
+                  float (*displayFn)(float) = nullptr,
+                  float (*inverseFn)(float) = nullptr) {
     const float startX = ImGui::GetCursorPosX();
     const float available = ImGui::GetContentRegionAvail().x;
     ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - size) * 0.5f));
 
     KnobState knob = {
         value, minValue, maxValue, defaultValue,
-        label, nullptr, size, displayScale, displayFn
+        label, nullptr, size, displayScale, displayFn, inverseFn
     };
     if (!RotaryKnob(knob, format)) return false;
 
@@ -234,7 +239,7 @@ void DrawTonePanel(ConfigDocument& doc, float knob) {
         ImGui::TableNextColumn();
         DrawLiveKnob(doc, v.reverbHighCutHz, 1000.0f, 20000.0f, 16000.0f, "HIGH CUT",
                      knob, "%.1f kHz", svms::RLCommandType::SetReverbHighCutHz,
-                     1.0f, HzToKHz);
+                     1.0f, HzToKHz, KHzToHz);
         ImGui::EndTable();
     }
     EndRackPanel();

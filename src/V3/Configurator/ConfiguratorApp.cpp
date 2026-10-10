@@ -115,6 +115,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
         return TRUE;
     }
+    case WM_GETMINMAXINFO: {
+        ConfiguratorApp* app = appFromHwnd(hWnd);
+        if (app) {
+            RECT rc = {0, 0,
+                       static_cast<LONG>(kMinWindowWidth * app->dpiScale_),
+                       static_cast<LONG>(kMinWindowHeight * app->dpiScale_)};
+            AdjustWindowRectEx(
+                &rc, static_cast<DWORD>(GetWindowLongPtrW(hWnd, GWL_STYLE)), FALSE,
+                static_cast<DWORD>(GetWindowLongPtrW(hWnd, GWL_EXSTYLE)));
+            MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lParam);
+            info->ptMinTrackSize.x = rc.right - rc.left;
+            info->ptMinTrackSize.y = rc.bottom - rc.top;
+        }
+        return 0;
+    }
     case WM_SIZE: {
         ConfiguratorApp* app = appFromHwnd(hWnd);
         if (app && wParam != SIZE_MINIMIZED) {
@@ -587,6 +602,7 @@ void ConfiguratorApp::RenderFrame() {
 
     // Esc is "back to Home" unless something is being edited or a menu is open.
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive() &&
+        !ImGui::GetIO().WantTextInput &&
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
         currentPage_ = Page::Overview;
     }
@@ -709,6 +725,10 @@ static float MasterVolumeDb(float v) {
     return 20.0f * std::log10((std::max)(v, 0.001f));
 }
 
+static float MasterVolumeFromDb(float db) {
+    return std::pow(10.0f, db / 20.0f);
+}
+
 // Segmented horizontal bar (outputs, voices, CPU).
 static void DrawHSegBar(ImDrawList* dl, ImVec2 p, float width, float frac,
                         bool accentOnly) {
@@ -743,7 +763,7 @@ void ConfiguratorApp::DrawMasterStrip(float y) {
     auto& w = config_.Working();
     ImGui::SetCursorPos(ImVec2(22.0f, y + 4.0f));
     KnobState knob = {w.masterVolume, 0.0f, 4.0f, 1.0f, "MASTER", nullptr, 44.0f,
-                      1.0f, MasterVolumeDb};
+                      1.0f, MasterVolumeDb, MasterVolumeFromDb};
     if (RotaryKnob(knob, "%.1f dB")) {
         w.masterVolume = knob.value;
         config_.MarkDirty();

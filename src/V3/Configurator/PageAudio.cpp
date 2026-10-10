@@ -543,198 +543,207 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
 
     if (view != AudioView::Output) {
     ImGui::Spacing();
-    BeginRackPanel("SOUND FONT");
+    static std::wstring lastSoundFontDir;
+    static std::wstring browserDir;
+    static std::wstring scannedDir;
+    static char searchBuf[128] = {};
+    static std::vector<std::wstring> folderDirs;
+    static std::vector<std::wstring> folderFonts;
+    const ThemeSettings& th = GetThemeSettings();
+
+    if (lastSoundFontDir.empty() && !w.soundFontPath.empty()) {
+        lastSoundFontDir = std::filesystem::path(w.soundFontPath).parent_path().wstring();
+    }
+    if (browserDir.empty())
+        browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
 
     {
-        ImGui::TextUnformatted("Configured SoundFont:");
-        ImGui::SameLine();
-        if (w.soundFontPath.empty()) {
-            ImGui::TextDisabled("(none — engine uses the local fallback)");
-        } else {
-            std::string utf8 = WideToUtf8Str(w.soundFontPath);
-            if (utf8.size() > 72) utf8 = "…" + utf8.substr(utf8.size() - 72);
-            ImGui::TextDisabled("%s", utf8.c_str());
-        }
-        ImGui::Spacing();
-
-        static std::wstring lastSoundFontDir;
-        static std::wstring browserDir;
-        static std::wstring scannedDir;
-        static char searchBuf[128] = {};
-        static std::vector<std::wstring> folderDirs;
-        static std::vector<std::wstring> folderFonts;
-
-        if (lastSoundFontDir.empty() && !w.soundFontPath.empty()) {
-            lastSoundFontDir =
-                std::filesystem::path(w.soundFontPath).parent_path().wstring();
-        }
-        if (browserDir.empty())
-            browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
-
-        if (ImGui::Button("Browse…", ImVec2(90, 0))) {
-            std::wstring selected;
-            if (BrowseSoundFont(selected, lastSoundFontDir,
-                                L"Select primary SoundFont")) {
-                SetPrimarySoundFont(w, selected);
-                browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
-                scannedDir.clear();
-                searchBuf[0] = '\0';
-                doc.MarkDirty();
-            }
-        }
-        ImGui::SameLine();
-        if (!w.soundFontPath.empty()) {
-            if (ImGui::Button("Clear", ImVec2(60, 0))) {
-                SetPrimarySoundFont(w, {});
-                doc.MarkDirty();
-            }
-        }
-        if (liveSoundFont) LiveBadge("Loads off-thread and activates at an audio-block boundary.");
-        else RestartRequiredBadge();
-
-        ImGui::Spacing();
-        const bool busy = soundFontStatus.state == 1u ||
-                          soundFontStatus.state == 2u;
-        const bool canLoad = liveSoundFont && !w.soundFontPath.empty() && !busy;
-        if (!canLoad) ImGui::BeginDisabled();
-        if (ImGui::Button("Load Now", ImVec2(110.0f, 0.0f)) && canLoad)
-            StartSoundFontLoad(*live.client, w.soundFontPath, soundFontStatus);
-        if (!canLoad) ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (!liveSoundFont) {
-            ImGui::TextDisabled("Connect to a compatible running V3 driver to switch live.");
-        } else {
-            const ImVec4 color = soundFontStatus.error
-                ? ImVec4(0.95f, 0.35f, 0.30f, 1.0f)
-                : (busy ? ImVec4(0.95f, 0.75f, 0.20f, 1.0f)
-                        : ImVec4(0.35f, 0.90f, 0.55f, 1.0f));
-            ImGui::TextColored(color, "%s", soundFontStatus.message.c_str());
-        }
-        if (live.telemetry && live.telemetry->soundFontName[0] != '\0') {
-            ImGui::TextDisabled("Active: %s", live.telemetry->soundFontName);
-        }
-        ImGui::TextDisabled(
-            "Active voices are silenced at activation; MIDI state is retained. Save Configuration to keep the selection after restart.");
-
-        {
-            const std::wstring scanDir = browserDir.empty() ? L"." : browserDir;
-            if (scannedDir != scanDir) {
-                scannedDir = scanDir;
-                folderDirs.clear();
-                folderFonts.clear();
-                std::error_code ec;
-                for (std::filesystem::directory_iterator it(
-                         scanDir,
-                         std::filesystem::directory_options::skip_permission_denied,
-                         ec), end;
-                     !ec && it != end; it.increment(ec)) {
-                    if (ec) break;
-                    std::error_code typeEc;
-                    if (it->is_directory(typeEc) && !typeEc) {
-                        folderDirs.push_back(it->path().filename().wstring());
-                        continue;
-                    }
-                    if (typeEc) continue;
-                    const std::wstring ext = it->path().extension().wstring();
-                    if (_wcsicmp(ext.c_str(), L".sf2") == 0 ||
-                        _wcsicmp(ext.c_str(), L".sfz") == 0) {
-                        folderFonts.push_back(it->path().filename().wstring());
-                    }
-                }
-                std::sort(folderDirs.begin(), folderDirs.end());
-                std::sort(folderFonts.begin(), folderFonts.end());
-            }
-        }
-
-        std::string folderLabel = WideToUtf8Str(
-            std::filesystem::path(scannedDir.empty() ? L"." : scannedDir)
-                .lexically_normal().wstring());
-        if (folderLabel.size() > 72)
-            folderLabel = "…" + folderLabel.substr(folderLabel.size() - 72);
-        ImGui::TextDisabled("Folder: %s", folderLabel.c_str());
-
-        const float sfWidth = (std::min)(420.0f, ImGui::GetContentRegionAvail().x);
-        ImGui::SetNextItemWidth(sfWidth);
-        ImGui::InputTextWithHint("##sfsearch",
-                                 "Filter SoundFonts in folder…",
-                                 searchBuf, sizeof(searchBuf));
-
-        ImGui::BeginChild("sfList", ImVec2(sfWidth, 150.0f), true);
-        std::string filter = searchBuf;
-        std::transform(filter.begin(), filter.end(), filter.begin(),
-                       [](unsigned char c) -> char {
-                           return static_cast<char>(std::tolower(c));
-                       });
-
-        const std::filesystem::path currentDir =
-            std::filesystem::path(scannedDir.empty() ? L"." : scannedDir)
-                .lexically_normal();
-        const std::filesystem::path parentDir = currentDir.parent_path();
-        bool navigated = false;
-        if (!parentDir.empty() && parentDir != currentDir) {
-            if (ImGui::Selectable("[..]")) {
-                browserDir = parentDir.wstring();
-                scannedDir.clear();
-                searchBuf[0] = '\0';
-                navigated = true;
-            }
-        }
-
-        if (!navigated) {
-            for (const auto& folder : folderDirs) {
-                const std::string name = "[DIR] " + WideToUtf8Str(folder);
-                if (ImGui::Selectable(name.c_str())) {
-                    browserDir = (currentDir / folder).lexically_normal().wstring();
-                    scannedDir.clear();
-                    searchBuf[0] = '\0';
-                    navigated = true;
-                    break;
-                }
-            }
-        }
-
-        if (!navigated) {
-            for (const auto& file : folderFonts) {
-                std::string name = WideToUtf8Str(file);
-                std::string lower = name;
-                std::transform(lower.begin(), lower.end(), lower.begin(),
-                               [](unsigned char c) -> char {
-                                   return static_cast<char>(std::tolower(c));
-                               });
-                if (!filter.empty() && lower.find(filter) == std::string::npos) {
+        const std::wstring scanDir = browserDir.empty() ? L"." : browserDir;
+        if (scannedDir != scanDir) {
+            scannedDir = scanDir;
+            folderDirs.clear();
+            folderFonts.clear();
+            std::error_code ec;
+            for (std::filesystem::directory_iterator it(
+                     scanDir,
+                     std::filesystem::directory_options::skip_permission_denied, ec), end;
+                 !ec && it != end; it.increment(ec)) {
+                if (ec) break;
+                std::error_code typeEc;
+                if (it->is_directory(typeEc) && !typeEc) {
+                    folderDirs.push_back(it->path().filename().wstring());
                     continue;
                 }
-                const std::filesystem::path candidate =
-                    (currentDir / file).lexically_normal();
-                const bool selected = !w.soundFontPath.empty() &&
-                    _wcsicmp(candidate.c_str(),
-                             std::filesystem::path(w.soundFontPath)
-                                 .lexically_normal().c_str()) == 0;
-                if (ImGui::Selectable(name.c_str(), selected)) {
-                    SetPrimarySoundFont(w, candidate.wstring());
-                    lastSoundFontDir = currentDir.wstring();
+                if (typeEc) continue;
+                const std::wstring ext = it->path().extension().wstring();
+                if (_wcsicmp(ext.c_str(), L".sf2") == 0 || _wcsicmp(ext.c_str(), L".sfz") == 0)
+                    folderFonts.push_back(it->path().filename().wstring());
+            }
+            std::sort(folderDirs.begin(), folderDirs.end());
+            std::sort(folderFonts.begin(), folderFonts.end());
+        }
+    }
+
+    if (ImGui::BeginTable("##sf_top", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableNextRow();
+
+        // ------------------------------------------------ current font
+        ImGui::TableNextColumn();
+        if (BeginRackPanel("SOUNDFONT")) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const float width = ImGui::GetContentRegionAvail().x;
+            const float height = 78.0f;
+            DrawLcdFrame(dl, p0, ImVec2(p0.x + width, p0.y + height));
+            std::string name = "(none - engine uses the local fallback)";
+            std::string dir;
+            if (!w.soundFontPath.empty()) {
+                const std::filesystem::path sf(w.soundFontPath);
+                name = WideToUtf8Str(sf.filename().wstring());
+                dir = WideToUtf8Str(sf.parent_path().wstring());
+            }
+            dl->PushClipRect(p0, ImVec2(p0.x + width - 8.0f, p0.y + height), true);
+            PushMono(0.80f);
+            dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 6.0f),
+                        ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
+                        "CONFIGURED");
+            dl->AddText(ImVec2(p0.x + 10.0f, p0.y + height - ImGui::GetTextLineHeight() - 6.0f),
+                        ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
+                        dir.c_str());
+            PopMono();
+            PushMono(1.25f);
+            dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 22.0f), ImGui::GetColorU32(th.accent), name.c_str());
+            PopMono();
+            dl->PopClipRect();
+            ImGui::Dummy(ImVec2(width, height));
+            ImGui::Spacing();
+
+            if (KeyButton("Browse", ImVec2(88.0f, 28.0f))) {
+                std::wstring selected;
+                if (BrowseSoundFont(selected, lastSoundFontDir, L"Select primary SoundFont")) {
+                    SetPrimarySoundFont(w, selected);
+                    browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
+                    scannedDir.clear();
+                    searchBuf[0] = '\0';
                     doc.MarkDirty();
                 }
             }
-        }
-        ImGui::EndChild();
+            ImGui::SameLine();
+            if (KeyButton("Clear", ImVec2(72.0f, 28.0f), false, !w.soundFontPath.empty())) {
+                SetPrimarySoundFont(w, {});
+                doc.MarkDirty();
+            }
+            ImGui::SameLine();
+            const bool busy = soundFontStatus.state == 1u || soundFontStatus.state == 2u;
+            const bool canLoad = liveSoundFont && !w.soundFontPath.empty() && !busy;
+            if (KeyButton("Load now", ImVec2(100.0f, 28.0f), canLoad, canLoad))
+                StartSoundFontLoad(*live.client, w.soundFontPath, soundFontStatus);
 
-        ImGui::Spacing();
-        ImGui::SeparatorText("PRIORITY STACK");
-        ImGui::TextDisabled(
-            "The first matching bank wins unless an explicit route below matches first.");
-        if (ImGui::Button("Add SoundFont...", ImVec2(130.0f, 0.0f))) {
+            ImGui::Spacing();
+            if (liveSoundFont) {
+                const ImVec4 color = soundFontStatus.error
+                    ? th.error : (busy ? th.warning : th.success);
+                PushMono();
+                ImGui::TextColored(color, "%s", soundFontStatus.message.c_str());
+                PopMono();
+            } else {
+                ImGui::TextDisabled("Connect to a running V3 driver to switch live.");
+                ImGui::SameLine();
+                RestartPill();
+            }
+            if (live.telemetry && live.telemetry->soundFontName[0] != '\0')
+                ImGui::TextDisabled("Active: %s", live.telemetry->soundFontName);
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted("Loading silences active voices; MIDI state is kept. Save Configuration to keep the choice after a restart.");
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
+        EndRackPanel();
+
+        // ------------------------------------------------ folder browser
+        ImGui::TableNextColumn();
+        if (BeginRackPanel("FOLDER")) {
+            std::string folderLabel = WideToUtf8Str(
+                std::filesystem::path(scannedDir.empty() ? L"." : scannedDir)
+                    .lexically_normal().wstring());
+            if (folderLabel.size() > 56)
+                folderLabel = "..." + folderLabel.substr(folderLabel.size() - 56);
+            PushMono();
+            ImGui::PushStyleColor(ImGuiCol_Text, th.accent);
+            ImGui::TextUnformatted(folderLabel.c_str());
+            ImGui::PopStyleColor();
+            PopMono();
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+            ImGui::InputTextWithHint("##sfsearch", "Filter SoundFonts in folder...",
+                                     searchBuf, sizeof(searchBuf));
+            ImGui::BeginChild("sfList", ImVec2(0.0f, 168.0f), ImGuiChildFlags_Borders);
+            std::string filter = searchBuf;
+            std::transform(filter.begin(), filter.end(), filter.begin(),
+                           [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
+            const std::filesystem::path currentDir =
+                std::filesystem::path(scannedDir.empty() ? L"." : scannedDir).lexically_normal();
+            const std::filesystem::path parentDir = currentDir.parent_path();
+            bool navigated = false;
+            if (!parentDir.empty() && parentDir != currentDir) {
+                if (ImGui::Selectable("[..]")) {
+                    browserDir = parentDir.wstring();
+                    scannedDir.clear();
+                    searchBuf[0] = '\0';
+                    navigated = true;
+                }
+            }
+            if (!navigated) {
+                for (const auto& folder : folderDirs) {
+                    const std::string dname = "[DIR] " + WideToUtf8Str(folder);
+                    if (ImGui::Selectable(dname.c_str())) {
+                        browserDir = (currentDir / folder).lexically_normal().wstring();
+                        scannedDir.clear();
+                        searchBuf[0] = '\0';
+                        navigated = true;
+                        break;
+                    }
+                }
+            }
+            if (!navigated) {
+                for (const auto& file : folderFonts) {
+                    std::string fname = WideToUtf8Str(file);
+                    std::string lower = fname;
+                    std::transform(lower.begin(), lower.end(), lower.begin(),
+                                   [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
+                    if (!filter.empty() && lower.find(filter) == std::string::npos) continue;
+                    const std::filesystem::path candidate = (currentDir / file).lexically_normal();
+                    const bool selected = !w.soundFontPath.empty() &&
+                        _wcsicmp(candidate.c_str(),
+                                 std::filesystem::path(w.soundFontPath).lexically_normal().c_str()) == 0;
+                    if (ImGui::Selectable(fname.c_str(), selected)) {
+                        SetPrimarySoundFont(w, candidate.wstring());
+                        lastSoundFontDir = currentDir.wstring();
+                        doc.MarkDirty();
+                    }
+                }
+            }
+            ImGui::EndChild();
+        }
+        EndRackPanel();
+        ImGui::EndTable();
+    }
+
+    // ------------------------------------------------------ bank stack
+    if (BeginRackPanel("BANK STACK")) {
+        if (KeyButton("Add SoundFont", ImVec2(128.0f, 28.0f))) {
             std::wstring selected;
             if (w.soundFontPaths.size() < 16u &&
-                BrowseSoundFont(selected, lastSoundFontDir,
-                                L"Add SoundFont to stack")) {
+                BrowseSoundFont(selected, lastSoundFontDir, L"Add SoundFont to stack")) {
                 bool duplicate = false;
                 for (const std::wstring& existing : w.soundFontPaths)
                     duplicate |= _wcsicmp(existing.c_str(), selected.c_str()) == 0;
                 if (!duplicate) {
                     w.soundFontPaths.push_back(selected);
-                    if (w.soundFontPath.empty())
-                        w.soundFontPath = w.soundFontPaths.front();
+                    if (w.soundFontPath.empty()) w.soundFontPath = w.soundFontPaths.front();
                     doc.MarkDirty();
                 }
                 browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
@@ -743,58 +752,65 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             }
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("Up to 16 banks; stack changes activate after restart.");
+        RestartPill();
+        ImGui::SameLine();
+        ImGui::TextDisabled("Up to 16 banks. The first matching bank wins unless a route below matches first.");
+        ImGui::Spacing();
 
+        ImDrawList* dl = ImGui::GetWindowDrawList();
         for (uint32_t i = 0u; i < w.soundFontPaths.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
-            const std::string label = std::to_string(i) + ": " +
+            const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+            const float rowW = ImGui::GetContentRegionAvail().x;
+            const float rowX = ImGui::GetCursorPosX();
+            dl->AddRectFilled(rowStart, ImVec2(rowStart.x + rowW, rowStart.y + 32.0f),
+                              ImGui::GetColorU32(GetLcdBg()), th.cornerRadius);
+            DrawLed(dl, ImVec2(rowStart.x + 14.0f, rowStart.y + 16.0f), 3.5f, i == 0u);
+            std::string label = std::to_string(i) + "  " +
                 WideToUtf8Str(std::filesystem::path(w.soundFontPaths[i]).filename().wstring());
-            ImGui::TextUnformatted(label.c_str());
-            ImGui::SameLine();
-            if (i == 0u) ImGui::TextDisabled("(primary)");
-            if (ImGui::GetContentRegionAvail().x > 180.0f) {
-                ImGui::SameLine(ImGui::GetCursorPosX() +
-                                ImGui::GetContentRegionAvail().x - 170.0f);
-            }
-            if (i == 0u) ImGui::BeginDisabled();
-            if (ImGui::SmallButton("Up")) {
+            if (i == 0u) label += "   (PRIMARY)";
+            PushMono();
+            dl->AddText(ImVec2(rowStart.x + 30.0f, rowStart.y + (32.0f - ImGui::GetTextLineHeight()) * 0.5f),
+                        ImGui::GetColorU32(th.accent), label.c_str());
+            PopMono();
+            bool changed = false;
+            ImGui::SetCursorPos(ImVec2(rowX + rowW - 196.0f, ImGui::GetCursorPosY() + 3.0f));
+            if (KeyButton("Up", ImVec2(52.0f, 26.0f), false, i > 0u)) {
                 SwapSoundFonts(w, i, i - 1u);
                 doc.MarkDirty();
-                ImGui::PopID();
-                break;
+                changed = true;
             }
-            if (i == 0u) ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (i + 1u >= w.soundFontPaths.size()) ImGui::BeginDisabled();
-            if (ImGui::SmallButton("Down")) {
+            ImGui::SameLine(0.0f, 6.0f);
+            if (!changed && KeyButton("Down", ImVec2(60.0f, 26.0f), false, i + 1u < w.soundFontPaths.size())) {
                 SwapSoundFonts(w, i, i + 1u);
                 doc.MarkDirty();
-                ImGui::PopID();
-                break;
+                changed = true;
             }
-            if (i + 1u >= w.soundFontPaths.size()) ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Remove")) {
+            ImGui::SameLine(0.0f, 6.0f);
+            if (!changed && KeyButton("Remove", ImVec2(70.0f, 26.0f))) {
                 RemoveSoundFont(w, i);
                 doc.MarkDirty();
-                ImGui::PopID();
-                break;
+                changed = true;
             }
+            ImGui::SetCursorPos(ImVec2(rowX, ImGui::GetCursorPosY() + 6.0f));
+            ImGui::Dummy(ImVec2(0.0f, 0.0f));
             ImGui::PopID();
+            if (changed) break;
         }
+    }
+    EndRackPanel();
 
-        ImGui::Spacing();
-        ImGui::SeparatorText("BANK / PRESET ROUTES");
-        if (ImGui::Button("Add Route", ImVec2(100.0f, 0.0f)) &&
+    // --------------------------------------------------- routes
+    if (BeginRackPanel("BANK / PRESET ROUTES")) {
+        if (KeyButton("Add route", ImVec2(110.0f, 28.0f)) &&
             !w.soundFontPaths.empty() && w.soundFontRoutes.size() < 256u) {
             SoundFontRouteValue route{};
-            route.soundFontIndex = static_cast<uint32_t>(
-                w.soundFontPaths.size() > 1u ? 1u : 0u);
+            route.soundFontIndex = static_cast<uint32_t>(w.soundFontPaths.size() > 1u ? 1u : 0u);
             w.soundFontRoutes.push_back(route);
             doc.MarkDirty();
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("Preset -1 means keep the incoming program.");
+        ImGui::TextDisabled("Preset -1 keeps the incoming program.");
 
         for (uint32_t i = 0u; i < w.soundFontRoutes.size(); ++i) {
             SoundFontRouteValue& route = w.soundFontRoutes[i];
@@ -807,14 +823,12 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                     w.soundFontPaths[route.soundFontIndex]).filename().wstring());
                 preview = previewStorage.c_str();
             }
-            ImGui::SetNextItemWidth((std::min)(260.0f,
-                                               ImGui::GetContentRegionAvail().x));
+            ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
             if (ImGui::BeginCombo("SoundFont", preview)) {
                 for (uint32_t sf = 0u; sf < w.soundFontPaths.size(); ++sf) {
                     const std::string name = WideToUtf8Str(std::filesystem::path(
                         w.soundFontPaths[sf]).filename().wstring());
-                    if (ImGui::Selectable(name.c_str(),
-                                          route.soundFontIndex == sf)) {
+                    if (ImGui::Selectable(name.c_str(), route.soundFontIndex == sf)) {
                         route.soundFontIndex = sf;
                         doc.MarkDirty();
                     }
@@ -827,8 +841,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             int sourcePreset = route.sourcePreset;
             ImGui::SetNextItemWidth(95.0f);
             if (ImGui::InputInt("MIDI bank", &targetBank)) {
-                route.targetBank = static_cast<uint32_t>((std::clamp)(
-                    targetBank, 0, 127));
+                route.targetBank = static_cast<uint32_t>((std::clamp)(targetBank, 0, 127));
                 doc.MarkDirty();
             }
             ImGui::SameLine();
@@ -839,8 +852,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             }
             ImGui::SetNextItemWidth(95.0f);
             if (ImGui::InputInt("Source bank", &sourceBank)) {
-                route.sourceBank = static_cast<uint32_t>((std::clamp)(
-                    sourceBank, 0, 65535));
+                route.sourceBank = static_cast<uint32_t>((std::clamp)(sourceBank, 0, 65535));
                 doc.MarkDirty();
             }
             ImGui::SameLine();
@@ -852,13 +864,13 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             ImGui::SameLine();
             if (ImGui::Checkbox("Drums", &route.percussion)) doc.MarkDirty();
             ImGui::SameLine();
-            if (ImGui::SmallButton("Remove route")) {
+            const bool removeRoute = KeyButton("Remove", ImVec2(76.0f, 26.0f));
+            if (removeRoute) {
                 w.soundFontRoutes.erase(w.soundFontRoutes.begin() + i);
                 doc.MarkDirty();
-                ImGui::PopID();
-                break;
             }
             ImGui::PopID();
+            if (removeRoute) break;
         }
     }
     EndRackPanel();

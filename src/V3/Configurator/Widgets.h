@@ -68,7 +68,8 @@ bool PanelLever(const char* caption, bool* value, const char* help,
 bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
                float defaultValue, const char* format, float size,
                const char* help, bool* committed = nullptr,
-               float (*displayFn)(float) = nullptr);
+               float (*displayFn)(float) = nullptr,
+               float (*inverseFn)(float) = nullptr);
 // Number on an LCD-styled field. `committed` is set when editing finishes.
 bool PanelLcdInt(const char* caption, int* value, int minValue, int maxValue,
                  const char* help, bool restart = false,
@@ -122,6 +123,9 @@ struct KnobState {
     float size;
     float displayScale = 1.0f;
     float (*displayFn)(float) = nullptr;
+    // Maps a typed display value back to the stored value (needed for
+    // Ctrl+click entry whenever displayFn is not a plain scale).
+    float (*inverseFn)(float) = nullptr;
 };
 
 bool RotaryKnob(KnobState& state, const char* format = "%.2f");

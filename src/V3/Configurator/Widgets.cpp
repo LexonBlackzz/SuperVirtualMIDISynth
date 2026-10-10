@@ -8,6 +8,7 @@
 #include "../SVMSRuntimeLinkProtocol.h"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace svms::cfg {
@@ -363,12 +364,13 @@ bool PanelLever(const char* caption, bool* value, const char* help, bool restart
 
 bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
                float defaultValue, const char* format, float size,
-               const char* help, bool* committed, float (*displayFn)(float)) {
+               const char* help, bool* committed, float (*displayFn)(float),
+               float (*inverseFn)(float)) {
     const float startX = ImGui::GetCursorPosX();
     const float avail = ImGui::GetContentRegionAvail().x;
     ImGui::SetCursorPosX(startX + (std::max)(0.0f, (avail - size) * 0.5f));
     KnobState ks = {*value, minValue, maxValue, defaultValue,
-                    label, nullptr, size, 1.0f, displayFn};
+                    label, nullptr, size, 1.0f, displayFn, inverseFn};
     const bool changed = RotaryKnob(ks, format);
     if (changed) *value = ks.value;
     const bool hovered = ImGui::IsItemHovered();
@@ -382,10 +384,14 @@ bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
         st->SetInt(id, 0);
     }
     if (committed) *committed = released;
-    if (hovered && help && *help) {
+    if (hovered && !active) {
         ImGui::BeginTooltip();
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
-        ImGui::TextUnformatted(help);
+        if (help && *help) {
+            ImGui::TextUnformatted(help);
+            ImGui::Spacing();
+        }
+        ImGui::TextDisabled("Ctrl+click to type a value  |  double-click to reset");
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
@@ -762,6 +768,18 @@ bool RotaryKnob(KnobState& state, const char* format) {
     bool hovered = ImGui::IsItemHovered();
     bool active = ImGui::IsItemActive();
 
+    // Ctrl+click opens a typed-value field over the readout.
+    ImGuiStorage* knobStore = ImGui::GetStateStorage();
+    const ImGuiID editId = ImGui::GetID("##knob_edit");
+    const ImGuiID initId = ImGui::GetID("##knob_edit_init");
+    bool editing = knobStore->GetInt(editId, 0) != 0;
+    if (!editing && ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
+        ImGui::GetIO().KeyCtrl) {
+        editing = true;
+        knobStore->SetInt(editId, 1);
+        knobStore->SetInt(initId, 0);
+    }
+
     float t = (state.value - state.minValue) / (state.maxValue - state.minValue);
     t = ImClamp(t, 0.0f, 1.0f);
 
@@ -809,8 +827,10 @@ bool RotaryKnob(KnobState& state, const char* format) {
                                        : state.value * state.displayScale;
     snprintf(valueBuf, sizeof(valueBuf), format, displayVal);
     ImVec2 textSize = ImGui::CalcTextSize(valueBuf);
-    dl->AddText(ImVec2(center.x - textSize.x * 0.5f, center.y + radius + 7.0f),
-                ImGui::GetColorU32(theme.accent), valueBuf);
+    if (!editing) {
+        dl->AddText(ImVec2(center.x - textSize.x * 0.5f, center.y + radius + 7.0f),
+                    ImGui::GetColorU32(theme.accent), valueBuf);
+    }
 
     char labelBuf[128];
     snprintf(labelBuf, sizeof(labelBuf), "%s", state.label);
@@ -820,6 +840,52 @@ bool RotaryKnob(KnobState& state, const char* format) {
     dl->AddText(ImVec2(center.x - labelText.x * 0.5f, center.y + radius + 7.0f + textSize.y + 1.0f),
                 ImGui::GetColorU32(theme.mutedText), labelBuf);
     PopMono();
+
+    if (editing) {
+        static char editBuf[48];
+        static char editInit[48];
+        const bool first = knobStore->GetInt(initId, 0) == 0;
+        if (first) {
+            std::snprintf(editBuf, sizeof(editBuf), "%.4g", displayVal);
+            std::memcpy(editInit, editBuf, sizeof(editInit));
+        }
+        const ImVec2 saved = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(ImVec2(center.x - size * 0.5f - 8.0f,
+                                         center.y + radius + 4.0f));
+        ImGui::SetNextItemWidth(size + 16.0f);
+        if (first) {
+            ImGui::SetKeyboardFocusHere();
+            knobStore->SetInt(initId, 1);
+        }
+        PushMono();
+        ImGui::PushStyleColor(ImGuiCol_Text, theme.accent);
+        ImGui::InputText("##knob_edit_text", editBuf, sizeof(editBuf),
+                         ImGuiInputTextFlags_AutoSelectAll |
+                         ImGuiInputTextFlags_EnterReturnsTrue |
+                         ImGuiInputTextFlags_CharsDecimal);
+        const bool done = ImGui::IsItemDeactivated();
+        ImGui::PopStyleColor();
+        PopMono();
+        ImGui::SetCursorScreenPos(saved);
+        ImGui::Dummy(ImVec2(0.0f, 0.0f));
+        if (done) {
+            knobStore->SetInt(editId, 0);
+            knobStore->SetInt(initId, 0);
+            if (std::strcmp(editBuf, editInit) != 0) {
+                const float typed = static_cast<float>(std::atof(editBuf));
+                float v = state.inverseFn
+                    ? state.inverseFn(typed)
+                    : (state.displayFn ? typed
+                                       : typed / (state.displayScale != 0.0f
+                                                      ? state.displayScale : 1.0f));
+                v = ImClamp(v, state.minValue, state.maxValue);
+                if (v != state.value) {
+                    state.value = v;
+                    changed = true;
+                }
+            }
+        }
+    }
 
     if (active) {
         float delta = ImGui::GetIO().MouseDelta.y;
@@ -865,6 +931,8 @@ void DrawLedLadder(ImDrawList* dl, ImVec2 pos, ImVec2 size, float value,
     const float segH = 4.0f;
     const float pitch = 6.0f;
     const int n = static_cast<int>((size.y - 4.0f) / pitch);
+    const float used = n * pitch - (pitch - segH);
+    const float pad = (size.y - used) * 0.5f;
     const int lit = static_cast<int>(ImClamp(value, 0.0f, 1.0f) * n + 0.5f);
     const int pk = peak > 0.01f ? static_cast<int>(ImClamp(peak, 0.0f, 1.0f) * n) : -1;
     for (int i = 0; i < n; ++i) {
@@ -874,8 +942,8 @@ void DrawLedLadder(ImDrawList* dl, ImVec2 pos, ImVec2 size, float value,
                                             : (frac < 0.82f ? GetWarning() : GetError()));
         const bool on = i < lit || i == pk - 0;
         const ImVec4 c = on ? col : Alpha(col, single ? 0.07f : 0.16f);
-        const float y = fromTop ? pos.y + 2.0f + i * pitch
-                                : pos.y + size.y - 2.0f - (i + 1) * pitch + (pitch - segH);
+        const float y = fromTop ? pos.y + pad + i * pitch
+                                : pos.y + size.y - pad - segH - i * pitch;
         dl->AddRectFilled(ImVec2(pos.x + 3.0f, y),
                           ImVec2(pos.x + size.x - 3.0f, y + segH),
                           ImGui::GetColorU32(c), 1.0f);

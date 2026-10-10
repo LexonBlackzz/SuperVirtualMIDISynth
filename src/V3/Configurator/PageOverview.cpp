@@ -36,13 +36,14 @@ float Norm(float linear) {
 bool LiveKnob(ConfigDocument& doc, float& value, float minValue, float maxValue,
               float defaultValue, const char* label, const char* format,
               svms::RLCommandType command, float displayScale = 1.0f,
-              float (*displayFn)(float) = nullptr) {
+              float (*displayFn)(float) = nullptr,
+              float (*inverseFn)(float) = nullptr) {
     constexpr float size = 46.0f;
     const float startX = ImGui::GetCursorPosX();
     const float available = ImGui::GetContentRegionAvail().x;
     ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - size) * 0.5f));
     KnobState knob = {value, minValue, maxValue, defaultValue,
-                      label, nullptr, size, displayScale, displayFn};
+                      label, nullptr, size, displayScale, displayFn, inverseFn};
     if (!RotaryKnob(knob, format)) return false;
     value = knob.value;
     doc.MarkDirty();
@@ -151,6 +152,10 @@ void ReverbModule(ConfigDocument& doc) {
     EndRackPanel();
 }
 
+float DbToLinearHome(float db) {
+    return std::pow(10.0f, db / 20.0f);
+}
+
 float LinearToDbHome(float linear) {
     if (linear <= 0.000001f) return -60.0f;
     return (std::max)(-60.0f, (std::min)(0.0f, 20.0f * std::log10(linear)));
@@ -186,7 +191,8 @@ void LimiterModule(ConfigDocument& doc) {
             }
             ImGui::TableNextColumn();
             LiveKnob(doc, w.limiterThreshold, 0.1f, 1.0f, 0.95f, "THRESH", "%.1f dB",
-                     svms::RLCommandType::SetLimiterThreshold, 1.0f, LinearToDbHome);
+                     svms::RLCommandType::SetLimiterThreshold, 1.0f, LinearToDbHome,
+                     DbToLinearHome);
             ImGui::TableNextColumn();
             LiveKnob(doc, w.limiterReleaseMs, 1.0f, 5000.0f, 100.0f, "RELEASE", "%.0f ms",
                      svms::RLCommandType::SetLimiterRelease);

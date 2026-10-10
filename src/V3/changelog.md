@@ -10,6 +10,15 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-10 feat(v3): SoundFont panels, Ctrl+click knob entry, window minimum size
+  SoundFont is now a current-font LCD with Browse/Clear/Load now keys, a folder
+  browser beside it, a bank stack with Up/Down/Remove keys and a routes panel.
+  Knobs take a typed value on Ctrl+click (KnobState::inverseFn maps dB/kHz
+  displays back to the stored value; Enter commits, Esc cancels, one live push
+  on commit). WM_GETMINMAXINFO enforces 1100x660 client so layouts never clip.
+  LED ladders centre their leftover space so top and bottom padding match,
+  which fixes the gain reduction bar looking upside down.
+
 - 2026-10-10 feat(v3): synth, out and MIDI stages recomposed as panels
   Even with the new chain the stage pages were still long label/control row
   lists. SYNTH, OUT and MIDI are now rack panels: big LCD readouts (voice

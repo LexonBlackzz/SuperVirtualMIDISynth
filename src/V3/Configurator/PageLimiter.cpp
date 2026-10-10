@@ -22,6 +22,10 @@ float LinearToDb(float linear) {
     return (std::max)(kMeterFloorDb, 20.0f * std::log10(linear));
 }
 
+float DbToLinearKnob(float db) {
+    return std::pow(10.0f, db / 20.0f);
+}
+
 float MeterNorm(float linear) {
     const float db = LinearToDb(linear);
     return ImClamp((db - kMeterFloorDb) / -kMeterFloorDb, 0.0f, 1.0f);
@@ -352,7 +356,7 @@ void DrawMeterBank(float inL, float inR, float gr, float outL, float outR,
         const float maxBarW = (std::max)(44.0f,
             colAvail - scaleGap - scaleWidth - 12.0f);
         (void)nameWidth;
-        const float desiredBarW = 40.0f;
+        const float desiredBarW = 56.0f;
         const float barW = (std::min)(desiredBarW, maxBarW);
         const float visualWidth = barW + scaleGap + scaleWidth;
         const float groupX = colStart + (colAvail - visualWidth) * 0.5f;
@@ -532,7 +536,8 @@ void DrawControls(ConfigValues& w, ConfigDocument& doc,
             const float start = ImGui::GetCursorPosX();
             const float colAvail = ImGui::GetContentRegionAvail().x;
             ImGui::SetCursorPosX(start + (colAvail - knob) * 0.5f);
-            KnobState ks = {value, minV, maxV, defV, label, nullptr, knob, 1.0f, displayFn};
+            KnobState ks = {value, minV, maxV, defV, label, nullptr, knob, 1.0f, displayFn,
+                            displayFn ? DbToLinearKnob : nullptr};
             if (RotaryKnob(ks, fmt)) {
                 value = ks.value;
                 doc.MarkDirty();
