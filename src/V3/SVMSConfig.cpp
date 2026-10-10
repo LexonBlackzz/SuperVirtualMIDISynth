@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <climits>
 #include <cstdlib>
+#include <cwchar>
 #include <mutex>
 #endif
 #include <nlohmann/json.hpp>
@@ -88,6 +89,22 @@ bool PathExists(const fs::path& path) noexcept {
     return !error && exists;
 }
 
+// path::lexically_relative is missing from GCC 7's Filesystem TS.
+fs::path LexicallyRelative(const fs::path& path, const fs::path& base) {
+#if __has_include(<filesystem>)
+    return path.lexically_relative(base);
+#else
+    auto a = path.begin();
+    auto b = base.begin();
+    while (a != path.end() && b != base.end() && *a == *b) { ++a; ++b; }
+    if (a == path.begin()) return {};  // no common root
+    fs::path result;
+    for (; b != base.end(); ++b) result /= "..";
+    for (; a != path.end(); ++a) result /= *a;
+    return result.empty() ? fs::path(".") : result;
+#endif
+}
+
 #ifdef _WIN32
 std::string WideToUtf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -160,6 +177,8 @@ std::wstring Utf8ToWide(const std::string& value) {
 }
 
 using DWORD = uint32_t;
+// Linux paths are case-sensitive, so the "insensitive" compare is exact.
+inline int _wcsicmp(const wchar_t* a, const wchar_t* b) { return std::wcscmp(a, b); }
 #define _countof(a) (sizeof(a) / sizeof((a)[0]))
 
 // Win32-shaped getenv: returns chars copied (no NUL), or the required size
@@ -229,15 +248,15 @@ std::vector<fs::path> DiscoverLocalSoundFonts() {
     }
     std::sort(paths.begin(), paths.end(), [&directory](const fs::path& left,
                                                        const fs::path& right) {
-        std::wstring a = left.lexically_relative(directory).wstring();
-        std::wstring b = right.lexically_relative(directory).wstring();
+        std::wstring a = LexicallyRelative(left, directory).wstring();
+        std::wstring b = LexicallyRelative(right, directory).wstring();
         std::transform(a.begin(), a.end(), a.begin(),
                        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
         std::transform(b.begin(), b.end(), b.begin(),
                        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
         if (a != b) return a < b;
-        return left.lexically_relative(directory).wstring() <
-               right.lexically_relative(directory).wstring();
+        return LexicallyRelative(left, directory).wstring() <
+               LexicallyRelative(right, directory).wstring();
     });
     return paths;
 }
@@ -1032,8 +1051,8 @@ EngineConfig EngineConfig::Load() {
         // instead of baking a particular filename into every installation.
         const auto localSoundFonts = DiscoverLocalSoundFonts();
         if (!localSoundFonts.empty())
-            cfg.soundFontPath = localSoundFonts.front()
-                .lexically_relative(GetSoundFontSearchDirectory()).wstring();
+            cfg.soundFontPath = LexicallyRelative(localSoundFonts.front(),
+                GetSoundFontSearchDirectory()).wstring();
         if (!cfg.soundFontPath.empty())
             cfg.soundFontPaths.push_back(cfg.soundFontPath);
         json root = MakeDefaultJson(cfg);
@@ -1348,8 +1367,8 @@ std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
     if (warning && (cfg.soundFontPath.empty() || localSoundFonts.size() > 1u)) {
         if (!warning->empty()) *warning += "; ";
         *warning += "using DLL-local SoundFont " +
-                    WideToUtf8(localSoundFonts.front()
-                        .lexically_relative(searchDirectory).wstring());
+                    WideToUtf8(LexicallyRelative(localSoundFonts.front(),
+                        searchDirectory).wstring());
         if (localSoundFonts.size() > 1u)
             *warning += " (multiple .sf2/.sfz files found; set synth.soundfont explicitly)";
     }
