@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <string>
 
@@ -112,7 +113,7 @@ void DrawOverviewPage(ConfigDocument& doc) {
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
 
-    SectionHeader("SOUNDFONT");
+    BeginRackPanel("SOUNDFONT");
 
     if (w.soundFontPath.empty()) {
         ImGui::TextUnformatted("Automatic / local fallback");
@@ -171,6 +172,50 @@ void DrawOverviewPage(ConfigDocument& doc) {
     ImGui::Spacing();
     ImGui::TextDisabled(
         "Save the selection for future starts, or use Load Now on the Audio page to switch the running synth.");
+
+    EndRackPanel();
+
+    // System summary on an inset display: what the engine will start with.
+    if (BeginRackPanel("SYSTEM")) {
+        struct Cell { const char* label; char value[64]; };
+        Cell cells[6];
+        auto set = [&](int i, const char* label, const char* fmt, auto... args) {
+            cells[i].label = label;
+            std::snprintf(cells[i].value, sizeof(cells[i].value), fmt, args...);
+        };
+        const bool asio = w.audioBackend.size() >= 4 &&
+                          (w.audioBackend[0] == L'a' || w.audioBackend[0] == L'A');
+        set(0, "SAMPLE RATE", "%.1f kHz", w.sampleRate / 1000.0);
+        set(1, "BUFFER", "%u (%.1f ms)", w.bufferFrames,
+            1000.0 * w.bufferFrames / (std::max)(1u, w.sampleRate));
+        set(2, "BACKEND", "%s", asio ? "ASIO" : "WASAPI");
+        set(3, "MAX VOICES", "%u", w.maxVoices);
+        set(4, "REVERB", "%s", w.enableReverb ? "ON" : "OFF");
+        set(5, "LIMITER", "%s", w.limiterEnabled ? "ON" : "OFF");
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        PushMono(0.95f);
+        const float lineH = ImGui::GetTextLineHeight();
+        const float height = lineH * 2.0f * 2.0f + 40.0f;
+        DrawLcdFrame(dl, p, ImVec2(p.x + width, p.y + height));
+        const ThemeSettings& th = GetThemeSettings();
+        for (int i = 0; i < 6; ++i) {
+            const int col = i % 3;
+            const int row = i / 3;
+            const float x = p.x + 16.0f + col * (width - 32.0f) / 3.0f;
+            const float y = p.y + 12.0f + row * (lineH * 2.0f + 16.0f);
+            ImVec4 dim = th.accent;
+            dim.w = 0.50f;
+            dl->AddText(ImVec2(x, y), ImGui::GetColorU32(dim), cells[i].label);
+            dl->AddText(ImVec2(x, y + lineH + 2.0f),
+                        ImGui::GetColorU32(th.accent), cells[i].value);
+        }
+        PopMono();
+        ImGui::Dummy(ImVec2(width, height));
+    }
+    EndRackPanel();
 
     ImGui::TableNextColumn();
     const float meterHeight = ImGui::GetContentRegionAvail().y;

@@ -165,100 +165,45 @@ void DrawChannelLimiterPage(ConfigDocument& doc) {
                                w.channelLimiterReleaseMs);
     };
 
-    constexpr float headerSideWidth = 190.0f;
-    constexpr float headerRowHeight = 40.0f;
-    if (ImGui::BeginTable("##cl_header", 3,
-                          ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("enable", ImGuiTableColumnFlags_WidthFixed,
-                                headerSideWidth);
-        ImGui::TableSetupColumn("title", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthFixed,
-                                headerSideWidth);
-        ImGui::TableNextRow(ImGuiTableRowFlags_None, headerRowHeight);
-
-        ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
-                             (headerRowHeight - 22.0f) * 0.5f);
-        bool enabled = w.channelLimiterEnabled;
-        if (ToggleSwitch("ENABLED", &enabled,
-                         "Limit each MIDI channel bus independently before "
-                         "the master chain.")) {
-            w.channelLimiterEnabled = enabled;
-            doc.MarkDirty();
-            pushAll();
-        }
-
-        ImGui::TableNextColumn();
-        const char* title = "PER-CHANNEL LIMITER";
-        const ImVec2 titleSize = ImGui::CalcTextSize(title);
-        const float titleHeight = ImGui::GetTextLineHeight();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
-                             (headerRowHeight - titleHeight) * 0.5f);
-        const float start = ImGui::GetCursorPosX();
-        const float width = ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosX(start + (width - titleSize.x) * 0.5f);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.55f, 1.0f));
-        ImGui::TextUnformatted(title);
-        ImGui::PopStyleColor();
-
-        ImGui::TableNextColumn();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
-                             (headerRowHeight - titleHeight) * 0.5f);
-        const bool engineEcho = telemetryAvailable &&
-                                t->channelLimiterEnabled != 0u;
-        const bool synced = !telemetryAvailable ||
-                            engineEcho == w.channelLimiterEnabled;
-        const char* stateText = !telemetryAvailable
-            ? "OFFLINE" : (synced ? "APPLIED" : "PENDING");
-        const ImVec4 stateColor = !telemetryAvailable
-            ? GetMutedText()
-            : (synced ? GetSuccess() : GetWarning());
-        float totalWidth = ImGui::CalcTextSize(stateText).x;
-        if (telemetryAvailable)
-            totalWidth += ImGui::CalcTextSize("LIVE").x +
-                          ImGui::GetStyle().ItemSpacing.x;
-        const float startX = ImGui::GetCursorPosX();
-        const float avail = ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosX(startX + (std::max)(0.0f, avail - totalWidth));
-        if (telemetryAvailable) {
-            ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
-            ImGui::TextUnformatted("LIVE");
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-        }
-        ImGui::PushStyleColor(ImGuiCol_Text, stateColor);
-        ImGui::TextUnformatted(stateText);
-        ImGui::PopStyleColor();
-        ImGui::EndTable();
-    }
-
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    const float topHeight = 210.0f;
     if (ImGui::BeginTable("##cl_top", 2,
                           ImGuiTableFlags_SizingStretchProp |
-                          ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("controls", ImGuiTableColumnFlags_WidthStretch,
-                                0.85f);
-        ImGui::TableSetupColumn("meters", ImGuiTableColumnFlags_WidthStretch,
-                                1.15f);
-        ImGui::TableNextRow(ImGuiTableRowFlags_None, topHeight);
+                          ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableSetupColumn("controls", ImGuiTableColumnFlags_WidthStretch, 0.85f);
+        ImGui::TableSetupColumn("meters", ImGuiTableColumnFlags_WidthStretch, 1.15f);
+        ImGui::TableNextRow();
 
         ImGui::TableNextColumn();
-        ImGui::BeginChild("##cl_control_panel",
-                          ImVec2(0.0f, topHeight - 6.0f), false,
-                          ImGuiWindowFlags_NoScrollbar |
-                          ImGuiWindowFlags_NoScrollWithMouse);
-        {
-            const float avail = ImGui::GetContentRegionAvail().x;
-            const float knobSize = avail > 360.0f ? 92.0f : 78.0f;
-
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.68f, 0.71f, 0.76f, 1.0f));
-            ImGui::TextUnformatted("CONTROLS");
-            ImGui::PopStyleColor();
+        if (BeginRackPanel("PER-CHANNEL LIMITER")) {
+            bool enabled = w.channelLimiterEnabled;
+            if (ToggleSwitch("ENABLED", &enabled,
+                             "Limit each MIDI channel bus independently before "
+                             "the master chain.")) {
+                w.channelLimiterEnabled = enabled;
+                doc.MarkDirty();
+                pushAll();
+            }
+            ImGui::SameLine(0.0f, 24.0f);
+            {
+                const bool engineEcho = telemetryAvailable &&
+                                        t->channelLimiterEnabled != 0u;
+                const bool synced = !telemetryAvailable ||
+                                    engineEcho == w.channelLimiterEnabled;
+                const char* stateText = !telemetryAvailable
+                    ? "OFFLINE" : (synced ? "APPLIED" : "PENDING");
+                const ImVec4 stateColor = !telemetryAvailable
+                    ? GetMutedText()
+                    : (synced ? GetSuccess() : GetWarning());
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3.0f);
+                PushMono();
+                ImGui::PushStyleColor(ImGuiCol_Text, stateColor);
+                ImGui::TextUnformatted(stateText);
+                ImGui::PopStyleColor();
+                PopMono();
+            }
             ImGui::Spacing();
+
+            const float avail = ImGui::GetContentRegionAvail().x;
+            const float knobSize = avail > 360.0f ? 72.0f : 62.0f;
 
             // Classic zero-latency limiter per channel: threshold engages
             // the reduction, release shapes how the bus recovers.
@@ -308,17 +253,13 @@ void DrawChannelLimiterPage(ConfigDocument& doc) {
                 ImGui::EndTable();
             }
         }
-        ImGui::EndChild();
+        EndRackPanel();
 
         ImGui::TableNextColumn();
-        ImGui::BeginChild("##cl_meter_panel",
-                          ImVec2(0.0f, topHeight - 6.0f), false,
-                          ImGuiWindowFlags_NoScrollbar |
-                          ImGuiWindowFlags_NoScrollWithMouse);
-        ImGui::TextDisabled("CHANNEL ACTIVITY");
-        ImGui::Spacing();
-        DrawChannelGrid(t, telemetryAvailable);
-        ImGui::EndChild();
+        if (BeginRackPanel("CHANNEL ACTIVITY")) {
+            DrawChannelGrid(t, telemetryAvailable);
+        }
+        EndRackPanel();
         ImGui::EndTable();
     }
 

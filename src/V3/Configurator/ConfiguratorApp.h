@@ -110,6 +110,7 @@ private:
     bool shutdownDone_ = false;
     std::wstring lastInitError_;
     std::vector<unsigned char> fontData_;
+    std::vector<unsigned char> monoFontData_;
 
     Page currentPage_ = Page::Overview;
 

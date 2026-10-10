@@ -10,6 +10,16 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-10 feat(v3): rack-style configurator (theme, widgets, page layouts)
+  People said the configurator was ugly, so I redid it as a hardware rack:
+  warm chassis, raised keys with lamps, LCD readouts, screwed panels, mono
+  captions. The theme still comes from the one colour wheel + strength slider
+  (ApplyRackPalette derives every tone; saved theme files stay compatible) and
+  gained Amber/Phosphor/Ice/Magenta/Mono presets. SectionHeader now opens a
+  panel automatically and settings labels show a one-line description, so every
+  page picked it up; Audio, Reverb (LCD decay trace), Limiter (LED ladders,
+  LCD history) and Per-Channel Limiter got real layouts. No setting was removed.
+
 - 2026-10-10 perf(v3): make the event queue storage lazy
   My config had ring_capacity 20M and the synth sat at 1.4 GB idle: the
   ingress cells, compiled pages and legacy scheduler scratch were all

@@ -49,6 +49,11 @@ bool SaveTheme(ThemeStorage storage, std::string* error = nullptr);
 void ResetThemePreview();
 bool ReloadThemeFromDisk(std::string* error = nullptr);
 
+// Rack-style palette: derives chassis, nav, panel, key, and text tones from
+// one accent colour. `strength` (0..1) is how much of the accent hue tints
+// the dark surfaces; 0 gives neutral graphite with a coloured lamp.
+void ApplyRackPalette(ThemeSettings& theme, const ImVec4& accent, float strength);
+
 void PushEffectPageStyle();
 void PopEffectPageStyle();
 
@@ -63,6 +68,14 @@ ImVec4 GetDisabledText();
 const ImVec4& GetSidebarBg();
 const ImVec4& GetPanelBg();
 ImVec4 GetInputBorder();
+// Rack-look helpers, all derived from the current theme.
+ImVec4 GetLcdBg();       // inset display background
+ImVec4 GetKeyBg();       // raised key face
+ImVec4 GetKeyEdge();     // key underside / screw heads / slots
+ImVec4 GetPanelEdge();   // 1px panel outline
+ImVec4 GetLedOff();      // unlit lamp
+ImFont* GetMonoFont();   // nullptr until fonts are built
+void SetMonoFont(ImFont* font);
 
 inline constexpr float kSidebarWidth = 200.0f;
 inline constexpr float kFooterHeight = 48.0f;

@@ -38,6 +38,27 @@ ImVec4 Mix(const ImVec4& a, const ImVec4& b, float t) {
                   a.w + (b.w - a.w) * t);
 }
 
+ImVec4 HslToColor(float h, float s, float l) {
+    h = std::fmod(h, 1.0f);
+    if (h < 0.0f) h += 1.0f;
+    const float c = (1.0f - std::fabs(2.0f * l - 1.0f)) * s;
+    const float x = c * (1.0f - std::fabs(std::fmod(h * 6.0f, 2.0f) - 1.0f));
+    const float m = l - c * 0.5f;
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    const int sector = static_cast<int>(h * 6.0f);
+    switch (sector) {
+        case 0: r = c; g = x; break;
+        case 1: r = x; g = c; break;
+        case 2: g = c; b = x; break;
+        case 3: g = x; b = c; break;
+        case 4: r = x; b = c; break;
+        default: r = c; b = x; break;
+    }
+    return ImVec4(r + m, g + m, b + m, 1.0f);
+}
+
+ImFont* g_monoFont = nullptr;
+
 ImVec4 Alpha(const ImVec4& c, float a) {
     return ImVec4(c.x, c.y, c.z, a);
 }
@@ -297,11 +318,11 @@ void ApplyBaseColors() {
     s.WindowBorderSize = 0.0f;
     s.ChildBorderSize = 0.0f;
     s.PopupBorderSize = 1.0f;
-    s.FrameBorderSize = 0.0f;
+    s.FrameBorderSize = 1.0f;
     s.Alpha = 1.0f;
 
     ImVec4* colors = s.Colors;
-    const ImVec4 border = Mix(t.panel, t.text, 0.14f);
+    const ImVec4 border = Mix(t.panel, t.text, 0.11f);
     const ImVec4 controlHover = Mix(t.control, t.accent, 0.14f);
     const ImVec4 controlActive = Mix(t.control, t.accent, 0.25f);
     const ImVec4 accentHover = Mix(t.accent, t.text, 0.12f);
@@ -314,9 +335,11 @@ void ApplyBaseColors() {
     colors[ImGuiCol_PopupBg]               = Alpha(Mix(t.background, t.panel, 0.55f), 0.98f);
     colors[ImGuiCol_Border]                = border;
     colors[ImGuiCol_BorderShadow]          = ImVec4(0, 0, 0, 0);
-    colors[ImGuiCol_FrameBg]               = t.control;
-    colors[ImGuiCol_FrameBgHovered]        = controlHover;
-    colors[ImGuiCol_FrameBgActive]         = controlActive;
+    // Inset "display" look for text fields, combos and sliders.
+    const ImVec4 lcd = Mix(t.background, ImVec4(0, 0, 0, 1), 0.45f);
+    colors[ImGuiCol_FrameBg]               = lcd;
+    colors[ImGuiCol_FrameBgHovered]        = Mix(lcd, t.accent, 0.12f);
+    colors[ImGuiCol_FrameBgActive]         = Mix(lcd, t.accent, 0.20f);
     colors[ImGuiCol_TitleBg]               = Mix(t.background, t.sidebar, 0.35f);
     colors[ImGuiCol_TitleBgActive]         = Mix(t.background, t.sidebar, 0.35f);
     colors[ImGuiCol_TitleBgCollapsed]      = Alpha(Mix(t.background, t.sidebar, 0.35f), 0.55f);
@@ -328,7 +351,7 @@ void ApplyBaseColors() {
     colors[ImGuiCol_CheckMark]             = t.accent;
     colors[ImGuiCol_SliderGrab]            = Alpha(t.accent, 0.82f);
     colors[ImGuiCol_SliderGrabActive]      = accentHover;
-    colors[ImGuiCol_Button]                = controlHover;
+    colors[ImGuiCol_Button]                = t.control;
     colors[ImGuiCol_ButtonHovered]         = Mix(t.control, t.accent, 0.27f);
     colors[ImGuiCol_ButtonActive]          = Mix(t.control, t.accent, 0.40f);
     colors[ImGuiCol_Header]                = controlHover;
@@ -360,21 +383,35 @@ void ApplyBaseColors() {
 
 } // namespace
 
+void ApplyRackPalette(ThemeSettings& t, const ImVec4& accent, float strength) {
+    strength = (std::max)(0.0f, (std::min)(1.0f, strength));
+    float h = 0.0f, s = 0.0f, v = 0.0f;
+    ImGui::ColorConvertRGBtoHSV(accent.x, accent.y, accent.z, h, s, v);
+    // Near-grey picks (the "Mono" look) tint nothing: the lamp stays coloured
+    // but the chassis stays neutral graphite.
+    const float chroma = s < 0.10f ? 0.0f : 1.0f;
+    const float k = strength * chroma;
+
+    t.accent     = ImVec4(accent.x, accent.y, accent.z, 1.0f);
+    t.background = HslToColor(h, 0.18f * k, 0.090f);   // chassis
+    t.sidebar    = HslToColor(h, 0.15f * k, 0.115f);   // nav strip
+    t.panel      = HslToColor(h, 0.16f * k, 0.135f);   // rack panels
+    t.control    = HslToColor(h, 0.14f * k, 0.185f);   // key faces
+    t.text       = HslToColor(h, 0.20f * k, 0.91f);
+    t.mutedText  = HslToColor(h, 0.10f * k, 0.58f);
+
+    // Semantic colours never follow the accent.
+    t.warning = ImVec4(0.95f, 0.72f, 0.25f, 1.0f);
+    t.error   = ImVec4(1.00f, 0.36f, 0.29f, 1.0f);
+    t.success = ImVec4(0.44f, 0.86f, 0.55f, 1.0f);
+}
+
 ThemeSettings BuiltInTheme() {
     ThemeSettings t;
-    t.accent     = ImVec4(0.447f, 0.533f, 0.855f, 1.00f);
-    t.background = ImVec4(0.066f, 0.075f, 0.082f, 1.00f);
-    t.sidebar    = ImVec4(0.090f, 0.102f, 0.118f, 1.00f);
-    t.panel      = ImVec4(0.078f, 0.086f, 0.102f, 1.00f);
-    t.control    = ImVec4(0.125f, 0.141f, 0.165f, 1.00f);
-    t.text       = ImVec4(0.90f, 0.91f, 0.92f, 1.00f);
-    t.mutedText  = ImVec4(0.56f, 0.59f, 0.62f, 1.00f);
-    t.warning    = ImVec4(0.90f, 0.70f, 0.20f, 1.00f);
-    t.error      = ImVec4(0.85f, 0.30f, 0.30f, 1.00f);
-    t.success    = ImVec4(0.30f, 0.75f, 0.40f, 1.00f);
     t.colorStrength = 0.65f;
-    t.cornerRadius = 4.0f;
+    t.cornerRadius = 5.0f;
     t.density = 1.0f;
+    ApplyRackPalette(t, ImVec4(1.00f, 0.698f, 0.243f, 1.0f), t.colorStrength);
     return t;
 }
 
@@ -493,5 +530,12 @@ ImVec4 GetDisabledText()       { EnsureThemeLoaded(); return Mix(g_theme.mutedTe
 const ImVec4& GetSidebarBg()   { EnsureThemeLoaded(); return g_theme.sidebar; }
 const ImVec4& GetPanelBg()     { EnsureThemeLoaded(); return g_theme.panel; }
 ImVec4 GetInputBorder()        { EnsureThemeLoaded(); return Mix(g_theme.panel, g_theme.text, 0.14f); }
+ImVec4 GetLcdBg()              { EnsureThemeLoaded(); return Mix(g_theme.background, ImVec4(0, 0, 0, 1), 0.45f); }
+ImVec4 GetKeyBg()              { EnsureThemeLoaded(); return g_theme.control; }
+ImVec4 GetKeyEdge()            { EnsureThemeLoaded(); return Mix(g_theme.background, ImVec4(0, 0, 0, 1), 0.60f); }
+ImVec4 GetPanelEdge()          { EnsureThemeLoaded(); return Mix(g_theme.panel, g_theme.text, 0.11f); }
+ImVec4 GetLedOff()             { EnsureThemeLoaded(); return Mix(g_theme.accent, g_theme.background, 0.80f); }
+ImFont* GetMonoFont()          { return g_monoFont; }
+void SetMonoFont(ImFont* font) { g_monoFont = font; }
 
 } // namespace svms::cfg

@@ -25,7 +25,7 @@ bool BeginSettingsTable(const char* id) {
                            ImGuiTableFlags_RowBg)) {
         return false;
     }
-    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 185.0f);
+    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 250.0f);
     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 135.0f);
     return true;
@@ -33,32 +33,19 @@ bool BeginSettingsTable(const char* id) {
 
 void LabelCell(const char* label, const char* tooltip = nullptr) {
     ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    if (tooltip) {
-        ImGui::SameLine();
-        HelpMarker(tooltip);
-    }
+    SettingLabel(label, tooltip);
 }
 
 void RestartCell() {
     ImGui::TableNextColumn();
     ImGui::AlignTextToFramePadding();
-
-    constexpr const char* label = "RESTART";
+    PushMono(0.78f);
+    const float pillW = ImGui::CalcTextSize("RESTART").x + 12.0f;
+    PopMono();
     const float startX = ImGui::GetCursorPosX();
     const float available = ImGui::GetContentRegionAvail().x;
-    const float labelWidth = ImGui::CalcTextSize(label).x;
-    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted("Requires driver restart to take effect.");
-        ImGui::EndTooltip();
-    }
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - pillW) * 0.5f));
+    RestartPill();
 }
 
 bool InputU32(const char* id, uint32_t& value, uint32_t minValue, uint32_t maxValue) {

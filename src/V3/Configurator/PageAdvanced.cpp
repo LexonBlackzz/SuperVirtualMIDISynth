@@ -54,49 +54,9 @@ bool ThemeFloatRow(const char* label, const char* id, float& value,
     return ImGui::SliderFloat(id, &value, minValue, maxValue, format);
 }
 
-ImVec4 HsvColor(float h, float s, float v, float a = 1.0f) {
-    float r = 0.0f;
-    float g = 0.0f;
-    float b = 0.0f;
-    ImGui::ColorConvertHSVtoRGB(h, s, v, r, g, b);
-    return ImVec4(r, g, b, a);
-}
-
 void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked,
                                   float strength) {
-    float h = 0.0f;
-    float s = 0.0f;
-    float v = 0.0f;
-    ImGui::ColorConvertRGBtoHSV(picked.x, picked.y, picked.z, h, s, v);
-
-    strength = std::clamp(strength, 0.0f, 1.0f);
-    const float chroma = std::clamp(s, 0.0f, 1.0f);
-
-    // Strength controls both saturation and luminance of the generated dark
-    // surfaces. 0% is almost-neutral SVMS dark; 100% is intentionally bold,
-    // but still dark enough to preserve contrast and avoid paint-bucket mode.
-    const float surfaceSat = chroma * (0.06f + strength * 0.64f);
-
-    theme.accent = ImVec4(picked.x, picked.y, picked.z, 1.0f);
-    theme.background = HsvColor(h, surfaceSat * 0.78f,
-                                0.070f + strength * 0.072f);
-    theme.sidebar    = HsvColor(h, surfaceSat * 0.88f,
-                                0.095f + strength * 0.090f);
-    theme.panel      = HsvColor(h, surfaceSat * 0.84f,
-                                0.086f + strength * 0.082f);
-    theme.control    = HsvColor(h, surfaceSat,
-                                0.150f + strength * 0.125f);
-
-    // Keep text highly readable while letting stronger themes tint it just
-    // enough that the whole UI belongs to the same colour family.
-    theme.text      = HsvColor(h, chroma * (0.015f + strength * 0.040f), 0.925f);
-    theme.mutedText = HsvColor(h, 0.025f + chroma * strength * 0.115f,
-                               0.615f + strength * 0.025f);
-
-    // These remain semantic instead of changing meaning with the theme hue.
-    theme.warning = ImVec4(0.90f, 0.70f, 0.20f, 1.0f);
-    theme.error   = ImVec4(0.85f, 0.30f, 0.30f, 1.0f);
-    theme.success = ImVec4(0.30f, 0.75f, 0.40f, 1.0f);
+    ApplyRackPalette(theme, picked, strength);
 }
 
 bool confirmReset = false;
@@ -186,6 +146,27 @@ void DrawAdvancedPage(ConfigDocument& doc) {
         ImGuiColorEditFlags_DisplayHex |
         ImGuiColorEditFlags_NoPicker |
         ImGuiColorEditFlags_NoSmallPreview);
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Presets");
+    {
+        struct Preset { const char* name; ImVec4 accent; float strength; };
+        static const Preset presets[] = {
+            {"Amber",    ImVec4(1.000f, 0.698f, 0.243f, 1.0f), 0.65f},
+            {"Phosphor", ImVec4(0.435f, 0.863f, 0.549f, 1.0f), 0.65f},
+            {"Ice",      ImVec4(0.369f, 0.784f, 1.000f, 1.0f), 0.65f},
+            {"Magenta",  ImVec4(1.000f, 0.373f, 0.690f, 1.0f), 0.65f},
+            {"Mono",     ImVec4(0.910f, 0.910f, 0.910f, 1.0f), 0.00f},
+        };
+        for (size_t i = 0; i < std::size(presets); ++i) {
+            if (i) ImGui::SameLine();
+            if (KeyButton(presets[i].name, ImVec2(84.0f, 28.0f))) {
+                theme.accent = presets[i].accent;
+                theme.colorStrength = presets[i].strength;
+                themeColorChanged = true;
+            }
+        }
+    }
 
     ImGui::Spacing();
     ImGui::TextDisabled("Colour strength");

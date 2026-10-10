@@ -22,7 +22,7 @@ bool BeginSettingsTable(const char* id) {
                            ImVec2(0.0f, 0.0f))) {
         return false;
     }
-    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 250.0f);
     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 135.0f);
     return true;
@@ -30,12 +30,7 @@ bool BeginSettingsTable(const char* id) {
 
 void LabelCell(const char* label, const char* tooltip = nullptr) {
     ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    if (tooltip) {
-        ImGui::SameLine();
-        HelpMarker(tooltip);
-    }
+    SettingLabel(label, tooltip);
 }
 
 void CenteredStatusCell(const char* label, const ImVec4& color,
@@ -59,8 +54,15 @@ void CenteredStatusCell(const char* label, const ImVec4& color,
 }
 
 void RestartCell() {
-    CenteredStatusCell("RESTART", GetWarning(),
-                       "Requires driver restart to take effect.");
+    ImGui::TableNextColumn();
+    ImGui::AlignTextToFramePadding();
+    PushMono(0.78f);
+    const float pillW = ImGui::CalcTextSize("RESTART").x + 12.0f;
+    PopMono();
+    const float startX = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - pillW) * 0.5f));
+    RestartPill();
 }
 
 void LiveVoiceCell() {

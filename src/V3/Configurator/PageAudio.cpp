@@ -201,12 +201,11 @@ void StartSoundFontLoad(svms::RuntimeLinkClient& client,
 bool BeginAudioSettingsTable(const char* id) {
     if (!ImGui::BeginTable(id, 3,
                            ImGuiTableFlags_SizingStretchProp |
-                           ImGuiTableFlags_BordersInnerH |
-                           ImGuiTableFlags_RowBg,
+                           ImGuiTableFlags_BordersInnerH,
                            ImVec2(0.0f, 0.0f))) {
         return false;
     }
-    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 250.0f);
     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 135.0f);
     return true;
@@ -214,32 +213,19 @@ bool BeginAudioSettingsTable(const char* id) {
 
 void AudioLabelCell(const char* label, const char* tooltip = nullptr) {
     ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    if (tooltip) {
-        ImGui::SameLine();
-        HelpMarker(tooltip);
-    }
+    SettingLabel(label, tooltip);
 }
 
 void RestartCell() {
     ImGui::TableNextColumn();
     ImGui::AlignTextToFramePadding();
-
-    constexpr const char* label = "RESTART";
+    PushMono();
+    const float pillW = ImGui::CalcTextSize("RESTART").x + 12.0f;
+    PopMono();
     const float startX = ImGui::GetCursorPosX();
     const float available = ImGui::GetContentRegionAvail().x;
-    const float labelWidth = ImGui::CalcTextSize(label).x;
-    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.70f, 0.20f, 1.0f));
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted("Requires driver restart to take effect.");
-        ImGui::EndTooltip();
-    }
+    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - pillW) * 0.5f));
+    RestartPill();
 }
 
 } // namespace
@@ -303,7 +289,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         devicesEnumerated = true;
     }
 
-    SectionHeader("AUDIO OUTPUT");
+    BeginRackPanel("AUDIO OUTPUT");
 
     const bool asioActive =
         EqualAsciiCI(WideToUtf8Str(w.audioBackend), "asio");
@@ -426,23 +412,16 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 break;
             }
         }
-        char srPreview[48];
-        if (srIdx >= 0) {
-            std::snprintf(srPreview, sizeof(srPreview), "%u Hz", w.sampleRate);
-        } else {
-            std::snprintf(srPreview, sizeof(srPreview), "%u Hz (custom)", w.sampleRate);
+        static const char* sampleRateKeys[] = {
+            "44.1k", "48k", "88.2k", "96k", "176k", "192k"
+        };
+        if (KeyGroup("##samplerate", &srIdx, sampleRateKeys, 6) && srIdx >= 0) {
+            w.sampleRate = sampleRateValues[srIdx];
+            doc.MarkDirty();
         }
-        ImGui::SetNextItemWidth((std::min)(220.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::BeginCombo("##samplerate", srPreview)) {
-            for (int i = 0; i < 6; ++i) {
-                const bool selected = srIdx == i;
-                if (ImGui::Selectable(sampleRateItems[i], selected)) {
-                    w.sampleRate = sampleRateValues[i];
-                    doc.MarkDirty();
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+        if (srIdx < 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("custom: %u Hz", w.sampleRate);
         }
         RestartCell();
 
@@ -465,25 +444,12 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
                 break;
             }
         }
-        char bufferPreview[48];
-        if (bufIdx >= 0) {
-            std::snprintf(bufferPreview, sizeof(bufferPreview), "%u", w.bufferFrames);
-        } else {
-            std::snprintf(bufferPreview, sizeof(bufferPreview), "%u (custom)", w.bufferFrames);
-        }
-
-        const float comboWidth = (std::min)(220.0f, ImGui::GetContentRegionAvail().x);
-        ImGui::SetNextItemWidth(comboWidth);
-        if (ImGui::BeginCombo("##buffer", bufferPreview)) {
-            for (int i = 0; i < 8; ++i) {
-                const bool selected = bufIdx == i;
-                if (ImGui::Selectable(bufferItems[i], selected)) {
-                    w.bufferFrames = bufferValues[i];
-                    doc.MarkDirty();
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+        static const char* bufferKeys[] = {
+            "64", "128", "256", "512", "1k", "2k", "4k", "8k"
+        };
+        if (KeyGroup("##buffer", &bufIdx, bufferKeys, 8) && bufIdx >= 0) {
+            w.bufferFrames = bufferValues[bufIdx];
+            doc.MarkDirty();
         }
 
         const float latencyMs = (static_cast<float>(w.bufferFrames) /
@@ -491,12 +457,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         char latencyBuf[64];
         std::snprintf(latencyBuf, sizeof(latencyBuf), "%.2f ms @ %u Hz",
                       latencyMs, w.sampleRate);
-        if (ImGui::GetContentRegionAvail().x > 150.0f) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", latencyBuf);
-        } else {
-            ImGui::TextDisabled("%s", latencyBuf);
-        }
+        ImGui::TextDisabled("%s%s", latencyBuf, bufIdx < 0 ? "  (custom size)" : "");
         RestartCell();
 
         ImGui::TableNextRow();
@@ -630,6 +591,8 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
         ImGui::EndTable();
     }
 
+    EndRackPanel();
+
     if (easterEggs.megaFuckerDac) {
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.20f, 1.0f));
@@ -638,7 +601,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
     }
 
     ImGui::Spacing();
-    SectionHeader("SOUND FONT");
+    BeginRackPanel("SOUND FONT");
 
     {
         ImGui::TextUnformatted("Configured SoundFont:");
@@ -956,6 +919,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs) {
             ImGui::PopID();
         }
     }
+    EndRackPanel();
 }
 
 } // namespace svms::cfg

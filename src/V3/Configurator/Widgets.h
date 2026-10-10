@@ -34,6 +34,40 @@ void PushLiveLimiterAlgorithm(uint32_t value);
 // Coalesced per-MIDI-channel limiter update (dedicated wire command).
 void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs);
 
+// --- Rack-style primitives -------------------------------------------------
+// Monospace font for readouts; falls back to the UI font when unavailable.
+void PushMono(float scale = 0.9f);
+void PopMono();
+// Panel with an engraved title and corner screws. Always call EndRackPanel().
+bool BeginRackPanel(const char* title);
+void EndRackPanel();
+// Row of raised keys with a lamp; exactly one is lit. Returns true on change.
+bool KeyGroup(const char* id, int* current, const char* const* labels,
+              int count);
+// Raised push key. `primary` fills with the accent colour.
+bool KeyButton(const char* label, const ImVec2& size, bool primary = false);
+// Small lamp; `on` lights it with the accent colour.
+void DrawLed(ImDrawList* dl, ImVec2 center, float radius, bool on,
+             const ImVec4* color = nullptr);
+// Bordered RESTART tag, drawn at the cursor.
+void RestartPill();
+// Inset display: dark background, rim, optional grid. Draws only; the caller
+// reserves layout space (e.g. with Dummy).
+void DrawLcdFrame(ImDrawList* dl, ImVec2 min, ImVec2 max, int gridCols = 0,
+                  int gridRows = 0);
+// LED ladder meter (shared by the limiter page and DrawVerticalMeter).
+void DrawLedLadder(ImDrawList* dl, ImVec2 pos, ImVec2 size, float value,
+                   float peak, bool fromTop, const ImVec4* single);
+
+// Settings label with the first sentence of `help` as a dim description line
+// (clipped to the column); the full text shows on hover.
+void SettingLabel(const char* label, const char* help);
+// SectionHeader opens a rack panel (closing the previous one) while the page
+// is drawn between these two calls. Pages that never call SectionHeader, or
+// call it from a nested window, are unaffected.
+void BeginAutoPanels();
+void EndAutoPanels();
+
 void SectionHeader(const char* label);
 void HelpMarker(const char* desc);
 bool ToggleSwitch(const char* label, bool* value, const char* tooltip = nullptr);
