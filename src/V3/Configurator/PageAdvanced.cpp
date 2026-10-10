@@ -156,7 +156,9 @@ void DrawAdvancedPage(ConfigDocument& doc) {
             theme.style = style;
             themeChanged = true;
         }
+        const float keysH = ImGui::GetItemRectSize().y;
         ImGui::SameLine();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (keysH - ImGui::GetTextLineHeight()) * 0.5f);
         ImGui::TextDisabled("Rack: bevelled keys, lamps and screws. Boring: flat, sentence case.");
     }
 
