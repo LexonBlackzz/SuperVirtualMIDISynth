@@ -19,7 +19,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cwctype>
+#if __has_include(<filesystem>)
 #include <filesystem>
+namespace svms_fs_ns = std::filesystem;
+#else
+// GCC 7 (the Ubuntu 18.04 floor): Filesystem TS; LexicallyNormal/AbsolutePath
+// below cover what the TS lacks.
+#include <experimental/filesystem>
+namespace svms_fs_ns = std::experimental::filesystem;
+#endif
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -33,7 +41,7 @@ namespace svms {
 namespace {
 
 using json = nlohmann::json;
-namespace fs = std::filesystem;
+namespace fs = svms_fs_ns;
 
 constexpr uint32_t kConfigSchemaVersion = 1;
 constexpr wchar_t kConfigMutexName[] = L"Local\\SuperVirtualMIDISynth_Config_v1";
