@@ -194,7 +194,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 ImGui::TableNextColumn();
                 float retireDb = 20.0f * std::log10(w.voiceRetireThreshold);
                 retireDb = (std::max)(-100.0f, (std::min)(-26.0f, retireDb));
-                if (PanelKnob("RETIRE FLOOR", &retireDb, -100.0f, -26.0f, -76.0f,
+                if (PanelKnob("RETIRE FLOOR", &retireDb, -100.0f, -26.0f, -55.0f,
                               "%.0f dB", 60.0f,
                               "Release-tail loudness where finished voices are freed. Higher (less negative) frees quiet tails sooner and cuts release cost on dense songs; lower keeps longer tails. Applies to newly started releases.",
                               &committed)) {
@@ -368,9 +368,10 @@ void DrawPerformancePage(ConfigDocument& doc) {
         PopMono();
         ImGui::Dummy(ImVec2(width, height));
         if (tel) {
-            ImGui::TextDisabled("Physical pool %u voices  |  buffer %u frames @ %u Hz  |  decimation %ux",
+            const uint32_t decStep = (std::max)(1u, t->decimationStep);
+            ImGui::TextDisabled("Physical pool %u voices  |  buffer %u frames @ %u Hz  |  decimation %ux (~%u mixing of %u active)",
                                 t->maxVoices, t->bufferFrames, t->sampleRate,
-                                (std::max)(1u, t->decimationStep));
+                                decStep, t->activeVoices / decStep, t->activeVoices);
         } else {
             ImGui::TextDisabled("Connect to a running driver to see live render load.");
         }

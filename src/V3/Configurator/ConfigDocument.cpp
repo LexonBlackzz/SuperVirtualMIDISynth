@@ -169,7 +169,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.highPriorityVelocity = 96;
     d.shedStartPercent = 70;
     d.maxEventsPerBlock = 65536;
-    d.voiceRetireThreshold = 0.00015f;
+    d.voiceRetireThreshold = 0.00177828f;  // -55 dB
     d.stealPolicy = 0u;
     d.perKeyVoiceCap = 0u;
     d.threadAffinityMode = 0u;
@@ -187,7 +187,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.overflowMode = 1;
     d.correctnessMode = true;
     d.decimation = false;
-    d.decimationByLevel = false;
+    d.decimationByLevel = true;
     d.diagnosticsEnabled = false;
     d.diagnosticsWindow = false;
     d.diagnosticsDebugOutput = false;

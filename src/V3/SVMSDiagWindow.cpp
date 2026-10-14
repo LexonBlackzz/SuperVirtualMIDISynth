@@ -168,6 +168,15 @@ static void OnPaint(HWND hwnd) {
     DrawStat(memDC, kPadX, y, L"Active Voices:    ", buf);
     y += kLineH;
 
+    if (s.decimationStep > 1u) {
+        // Decimation keeps the loudest 1/step mixing; the rest still advance
+        // (they count as active) but add nothing to the mix.
+        std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"~%u (1/%u; the rest only advance)",
+                      s.activeVoices / s.decimationStep, s.decimationStep);
+        DrawStat(memDC, kPadX, y, L"Mixing Voices:    ", buf);
+        y += kLineH;
+    }
+
     if (s.effectiveVoices > s.activeVoices) {
         std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u (merge + coalescing)", s.effectiveVoices);
         DrawStat(memDC, kPadX, y, L"Effective Voices: ", buf);

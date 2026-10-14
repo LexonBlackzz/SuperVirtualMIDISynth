@@ -1010,11 +1010,11 @@ EngineConfig EngineConfig::Default() {
     cfg.highPriorityVelocity = 96;
     cfg.shedStartPercent = 70;
     cfg.maxEventsPerBlock = 65536;
-    cfg.voiceRetireThreshold = kVoiceRetireThreshold;
+    cfg.voiceRetireThreshold = 0.00177828f;  // -55 dB (owner-chosen default)
     cfg.stealPolicy = 0;
     cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
     cfg.decimation = false;  // opt-in: every voice mixes by default
-    cfg.decimationByLevel = false;
+    cfg.decimationByLevel = true;  // only matters once decimation is on
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.noteMerge = false;       // opt-in: every note-on launches its own voice

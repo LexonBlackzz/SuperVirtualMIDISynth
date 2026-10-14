@@ -74,7 +74,7 @@ struct ConfigValues {
     uint32_t highPriorityVelocity = 96;
     uint32_t shedStartPercent = 70;
     uint32_t maxEventsPerBlock = 65536;
-    float voiceRetireThreshold = 0.00015f;
+    float voiceRetireThreshold = 0.00177828f;
     uint32_t stealPolicy = 0;
     // Opt-in per-key voice cap; 0 = off (no per-key limit).
     uint32_t perKeyVoiceCap = 0u;
@@ -101,7 +101,7 @@ struct ConfigValues {
     int overflowMode = 0;
     bool correctnessMode = true;
     bool decimation = false;
-    bool decimationByLevel = false;
+    bool decimationByLevel = true;
 
     bool diagnosticsEnabled = false;
     bool diagnosticsWindow = false;
