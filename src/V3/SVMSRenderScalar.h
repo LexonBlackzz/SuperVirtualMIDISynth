@@ -1503,20 +1503,26 @@ inline uint32_t SilentReleaseAdvance(float& gain, uint32_t& remaining,
         return UINT32_MAX;
     }
     const float threshold = VoiceRetireThreshold();
+    // Survivors (the overwhelming case) cost one logf + one expf: the tail
+    // outlives the block exactly when gain * decay^frames is still at or
+    // above the floor; only a retiring tail needs the quotient.
+    const float logDecay = logf(decay);
+    const float survived = gain * expf(static_cast<float>(frames) * logDecay);
+    if (survived >= threshold) {
+        consumed = frames;
+        gain = survived;
+        return UINT32_MAX;
+    }
     uint32_t needed = 1u;
     if (gain * decay >= threshold) {
-        const float quotient = logf(threshold / gain) / logf(decay);
+        const float quotient = logf(threshold / gain) / logDecay;
         needed = quotient >= 4.0e9f ? UINT32_MAX
                                     : static_cast<uint32_t>(quotient) + 1u;
     }
-    if (needed <= frames) {
-        consumed = needed;
-        gain *= powf(decay, static_cast<float>(needed));
-        return needed - 1u;
-    }
-    consumed = frames;
-    gain *= powf(decay, static_cast<float>(frames));
-    return UINT32_MAX;
+    if (needed > frames) needed = frames;
+    consumed = needed;
+    gain *= expf(static_cast<float>(needed) * logDecay);
+    return needed - 1u;
 }
 
 inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
@@ -3390,6 +3396,33 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             const uint32_t handle = renderer->wvSliceHandles_[item];
             if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
                 continue;
+            // Muted (decimated) carried-over row with one plain whole-block
+            // segment: nothing mixes, no release/op/excite/vibrato boundary
+            // can split it, so skip the per-item timeline setup (op window,
+            // bend-ratio powf, excite walk, batch probing) and go straight
+            // to the closed-form advance.  Same call the general path ends
+            // in for this row, so state and retire frames are identical.
+            if (renderer->wvDecimating_ && renderer->wvMuted_[handle] != 0u &&
+                renderer->wvStartFrame_[handle] == UINT32_MAX &&
+                renderer->wvReleaseFrame_[handle] == UINT32_MAX &&
+                !renderer->wvScalarVibrato_) {
+                const uint8_t fastChannelRaw = v.channel[handle];
+                const uint32_t fastChannel = fastChannelRaw < kChannelCount
+                    ? fastChannelRaw : kChannelCount;
+                if (renderer->wvChanOpStart_[fastChannel] ==
+                        renderer->wvChanOpStart_[fastChannel + 1u] &&
+                    !renderer->wvChanVibratoActive_[fastChannel] &&
+                    (renderer->wvExciteHead_ == nullptr ||
+                     handle >= renderer->wvExciteCapacity_ ||
+                     renderer->wvExciteHead_[handle] == UINT32_MAX)) {
+                    renderer->RenderWholeVoiceSegment(
+                        v, ctx->voices, handle, ctx->sampleData,
+                        ctx->sampleDataFrames, mix.outputLeft,
+                        mix.outputRight, 0u, frameCount, true, jobIndex,
+                        0.0f, 1.0f, false);
+                    continue;
+                }
+            }
             // Common whole-block case: consecutive carried/new voices with
             // the same single segment can share one class-kernel dispatch.
             // Runs never cross a job boundary, and handles remain in active-
