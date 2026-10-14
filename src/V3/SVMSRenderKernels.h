@@ -123,6 +123,8 @@ const RenderKernelSet& GetScalarRenderKernelSet();
 const RenderKernelSet& GetSSE2RenderKernelSet();
 #if !defined(SVMS_XP_COMPAT)
 const RenderKernelSet& GetAVX2RenderKernelSet();
+// Test hook: route filtered sustained voices through the per-voice kernel only.
+void SetFilteredGroupKernelForTest(bool enabled);
 #endif
 const RenderKernelSet& SelectBestRenderKernelSet();
 const RenderKernelSet* SelectRenderKernelSet(RenderBackend backend);

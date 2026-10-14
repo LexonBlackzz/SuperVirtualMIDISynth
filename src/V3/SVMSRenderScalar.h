@@ -570,6 +570,13 @@ private:
     // allocated while v.rot exists, released when rotation is switched off
     // (a stale rot array on a ghost would rotate a coherent voice).
     bool SyncWholeVoiceRotationScratch(bool rotationActive);
+    // A row decimation skips this block (never one launched this block).
+    bool WholeVoiceRowMuted(uint32_t handle) const {
+        return wvDecimating_ && wvMuted_[handle] != 0u &&
+               wvStartFrame_[handle] == UINT32_MAX;
+    }
+    void PartitionMutedRows(uint32_t activeCount, uint32_t itemCount,
+                            uint32_t jobCount);
     bool RenderWholeVoiceSegment(VoiceSoA& state, VoiceManager* voices,
                                  uint32_t row, const int16_t* sampleData,
                                  uint32_t sampleDataFrames, float* outL,
@@ -926,6 +933,8 @@ private:
     bool wvDecimating_ = false;          // this block has muted rows
     bool wvMutedDirty_ = false;          // wvMuted_ holds stale flags
     std::vector<uint8_t> wvMuted_;       // per handle: 1 = skip mixing
+    std::vector<uint32_t> wvPartMixed_;   // decimation partition scratch
+    std::vector<uint32_t> wvPartMuted_;
     std::vector<uint8_t> wvDecimKey_;     // by-level rank key per active slot
     std::vector<uint32_t> wvDecimRank_;  // scratch for the velocity ranking
     // The event that made PlanWholeVoiceBlock refuse the last block: type
@@ -3129,6 +3138,47 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     return true;
 }
 
+// Decimation leaves the mixed rows scattered through the active list, so the
+// batch kernels (which need a run of consecutive rows) never fire and every
+// kept voice pays full per-voice setup.  Re-lay the slice so that inside each
+// job's range the mixed rows come first, in their original relative order,
+// then the muted ones.  Muted rows add nothing to the mix, so the order the
+// mixed rows accumulate in is unchanged (each job still mixes a contiguous
+// piece of the mixed sequence), and the job ranges keep their sizes.
+inline void RenderScalar::PartitionMutedRows(uint32_t activeCount,
+                                             uint32_t itemCount,
+                                             uint32_t jobCount) {
+    uint32_t mixedTotal = 0u, mutedTotal = 0u;
+    for (uint32_t i = 0u; i < activeCount; ++i) {
+        const uint32_t handle = wvSliceHandles_[i];
+        if (WholeVoiceRowMuted(handle))
+            wvPartMuted_[mutedTotal++] = handle;
+        else
+            wvPartMixed_[mixedTotal++] = handle;
+    }
+    uint32_t mixedUsed = 0u, mutedUsed = 0u, mixedGiven = 0u;
+    uint64_t voicesSoFar = 0u;
+    for (uint32_t job = 0u; job < jobCount; ++job) {
+        const uint32_t begin = static_cast<uint32_t>(
+            static_cast<uint64_t>(itemCount) * job / jobCount);
+        const uint32_t end = static_cast<uint32_t>(
+            static_cast<uint64_t>(itemCount) * (job + 1u) / jobCount);
+        const uint32_t vb = (std::min)(begin, activeCount);
+        const uint32_t ve = (std::min)(end, activeCount);
+        const uint32_t n = ve > vb ? ve - vb : 0u;
+        voicesSoFar += n;
+        const uint32_t target = static_cast<uint32_t>(
+            static_cast<uint64_t>(mixedTotal) * voicesSoFar / activeCount);
+        const uint32_t mixedHere = target - mixedGiven;
+        mixedGiven = target;
+        uint32_t pos = vb;
+        for (uint32_t k = 0u; k < mixedHere; ++k)
+            wvSliceHandles_[pos++] = wvPartMixed_[mixedUsed++];
+        for (uint32_t k = mixedHere; k < n; ++k)
+            wvSliceHandles_[pos++] = wvPartMuted_[mutedUsed++];
+    }
+}
+
 inline bool RenderScalar::RenderWholeVoiceSegment(
     VoiceSoA& state, VoiceManager* voices, uint32_t row,
     const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
@@ -3487,7 +3537,8 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                  renderer->wvExciteHead_[handle] == UINT32_MAX) &&
                 renderer->wvChanOpStart_[batchChannel] ==
                     renderer->wvChanOpStart_[batchChannel + 1u] &&
-                !renderer->wvScalarVibrato_ && !renderer->wvDecimating_ &&
+                !renderer->wvScalarVibrato_ &&
+                !renderer->WholeVoiceRowMuted(handle) &&
                 !renderer->wvChanVibratoActive_[batchChannel];
             if (batchHeadEligible) {
                 uint32_t batchEnd = item + 1u;
@@ -3498,6 +3549,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                         renderer->wvSliceHandles_[batchEnd];
                     if (v.state[next] ==
                         static_cast<uint8_t>(VoiceState::Free) ||
+                        renderer->WholeVoiceRowMuted(next) ||
                         renderer->wvReleaseFrame_[next] != UINT32_MAX ||
                         (renderer->wvExciteHead_ != nullptr &&
                          next < renderer->wvExciteCapacity_ &&
@@ -4093,6 +4145,9 @@ inline void RenderScalar::RenderWholeVoiceBlock(
             ? (std::min)(workerPool_->GetThreadCount(), itemCount) : 1u;
         if (jobCount < 2u) jobCount = 1u;
         ctx.jobCount = jobCount;
+        if (wvDecimating_ && activeCount > 1u &&
+            wvPartMixed_.size() >= activeCount)
+            PartitionMutedRows(activeCount, itemCount, jobCount);
 #if defined(_MSC_VER)
         const uint64_t wvJobBegin = __rdtsc();
 #endif
@@ -4340,6 +4395,8 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     wvHandleCapacity_ = handleCapacity;
     wvMuted_.assign(handleCapacity, uint8_t(0));
     wvMutedSince_.assign(handleCapacity, 0u);
+    wvPartMixed_.assign(handleCapacity, 0u);
+    wvPartMuted_.assign(handleCapacity, 0u);
     wvMutedLast_.assign(handleCapacity, 0u);
     if (wvGhostCapacity_ < cap) {
         VoiceSoA grown;

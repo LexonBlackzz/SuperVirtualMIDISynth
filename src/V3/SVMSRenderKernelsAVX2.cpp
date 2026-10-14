@@ -862,6 +862,9 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
     }
 }
 
+void RenderReleaseFramesGrouped(const RenderSpanContext& c,
+                                const uint32_t* handles, uint32_t count);
+
 bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
                            const uint32_t* handles,
                            uint32_t handleCount) {
@@ -885,6 +888,11 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
         return false;
     if (context.frameCount <= 4u) {
         RenderReleaseLoopShortAVX2(context, handles, handleCount);
+        _mm256_zeroupper();
+        return true;
+    }
+    if (context.frameCount >= 8u && context.voices->rot == nullptr) {
+        RenderReleaseFramesGrouped(context, handles, handleCount);
         _mm256_zeroupper();
         return true;
     }
@@ -1300,6 +1308,501 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
 
 
 // ════════════════════════════════════════════════════════════════════════
+// Filtered sustained loops, eight voices per vector.
+//
+// The per-voice time-chunk kernel interpolates eight frames at once but must
+// run the voice's recursive 2-pole low-pass one sample at a time (scalar
+// order, SoA load/store of z1/z2 each sample): about 62 of its 80 cycles per
+// chunk.  Eight DIFFERENT voices have independent filter states, so this
+// group kernel interpolates eight voices' chunks as before, transposes the
+// 8x8 block so that one vector holds the same time step of eight voices, runs
+// the biquad on all of them at once (the identical operations in the
+// identical order, hence bit-identical per-voice results), and transposes
+// back to mix.
+//
+// Each lane keeps its own frame cursor: a lane that straddles its loop end
+// steps scalar frames (exactly what the per-voice kernel does) while the
+// others wait on their next chunk.  When any lane has fewer than 8 frames
+// left, the group stops and every lane finishes through the per-voice kernel
+// on the remaining sub-span (all state lives in the SoA, so the hand-off is
+// exact).  Lanes mix in lane order, which is the handle order the sequential
+// path uses, so even the mix order is unchanged while lanes stay aligned.
+// ════════════════════════════════════════════════════════════════════════
+bool g_filteredGroupsEnabled = true;
+
+inline void Transpose8x8Ps(__m256* r) {
+    const __m256 t0 = _mm256_unpacklo_ps(r[0], r[1]);
+    const __m256 t1 = _mm256_unpackhi_ps(r[0], r[1]);
+    const __m256 t2 = _mm256_unpacklo_ps(r[2], r[3]);
+    const __m256 t3 = _mm256_unpackhi_ps(r[2], r[3]);
+    const __m256 t4 = _mm256_unpacklo_ps(r[4], r[5]);
+    const __m256 t5 = _mm256_unpackhi_ps(r[4], r[5]);
+    const __m256 t6 = _mm256_unpacklo_ps(r[6], r[7]);
+    const __m256 t7 = _mm256_unpackhi_ps(r[6], r[7]);
+    const __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    const __m256 u1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    const __m256 u2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    const __m256 u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    const __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    const __m256 u5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    const __m256 u6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    const __m256 u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+    r[0] = _mm256_permute2f128_ps(u0, u4, 0x20);
+    r[1] = _mm256_permute2f128_ps(u1, u5, 0x20);
+    r[2] = _mm256_permute2f128_ps(u2, u6, 0x20);
+    r[3] = _mm256_permute2f128_ps(u3, u7, 0x20);
+    r[4] = _mm256_permute2f128_ps(u0, u4, 0x31);
+    r[5] = _mm256_permute2f128_ps(u1, u5, 0x31);
+    r[6] = _mm256_permute2f128_ps(u2, u6, 0x31);
+    r[7] = _mm256_permute2f128_ps(u3, u7, 0x31);
+}
+
+// True when RenderSustainedLoopFramesAVX2 would run this voice through its
+// filtered time-chunk path (no rotation: the caller excludes v.rot).
+inline bool FilteredGroupEligible(const RenderSpanContext& c, uint32_t h) {
+    const VoiceSoA& v = *c.voices;
+    if (v.filterEnabled[h] == 0u || !ValidateLoopVoice(c, h)) return false;
+    const bool lfoOn = c.lfoActive != 0u &&
+        v.vibLfoSteps[h] != 0.0f && v.vibLfoToPitchCents[h] > 0.0f &&
+        c.lfoDepth > 0.0f;
+    return !lfoOn;
+}
+
+void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
+                                      const uint32_t* h) {
+    VoiceSoA& v = *c.voices;
+    RenderSpanContext dest[8];
+    float phase[8], step[8], loopStart[8], loopEnd[8], loopLength[8];
+    float gainL[8], gainR[8];
+    const int16_t* region[8];
+    float* outL[8];
+    float* outR[8];
+    uint32_t frame[8];
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        dest[i] = SelectVoiceDestination(c, v.channel[h[i]]);
+        phase[i] = (std::max)(0.0f, v.phases[h[i]]);
+        step[i] = v.phaseIncs[h[i]];
+        loopStart[i] = v.relLoopSF[h[i]];
+        loopEnd[i] = v.relLoopEF[h[i]];
+        loopLength[i] = loopEnd[i] - loopStart[i];
+        gainL[i] = v.renderGainL[h[i]];
+        gainR[i] = v.renderGainR[h[i]];
+        region[i] = c.sampleData + v.sampleStart[h[i]];
+        outL[i] = dest[i].outputLeft + c.frameStart;
+        outR[i] = dest[i].outputRight + c.frameStart;
+        frame[i] = 0u;
+    }
+    alignas(32) float a0a[8], b1a[8], b2a[8], z1a[8], z2a[8];
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        a0a[i] = v.filterA0[h[i]];
+        b1a[i] = v.filterB1[h[i]];
+        b2a[i] = v.filterB2[h[i]];
+    }
+    const __m256 a0v = _mm256_load_ps(a0a);
+    const __m256 a0x2v = _mm256_add_ps(a0v, a0v);  // == 2.0f * a0, exactly
+    const __m256 b1v = _mm256_load_ps(b1a);
+    const __m256 b2v = _mm256_load_ps(b2a);
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
+                                       4.0f, 5.0f, 6.0f, 7.0f);
+    __m256 z1, z2;
+    auto loadZ = [&]() {
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            z1a[i] = v.filterZ1[h[i]];
+            z2a[i] = v.filterZ2[h[i]];
+        }
+        z1 = _mm256_load_ps(z1a);
+        z2 = _mm256_load_ps(z2a);
+    };
+    auto spillZ = [&]() {
+        _mm256_store_ps(z1a, z1);
+        _mm256_store_ps(z2a, z2);
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            v.filterZ1[h[i]] = z1a[i];
+            v.filterZ2[h[i]] = z2a[i];
+        }
+    };
+    loadZ();
+
+    for (;;) {
+        bool done = false;
+        bool spilled = false;
+        for (uint32_t i = 0u; i < 8u && !done; ++i) {
+            for (;;) {
+                if (phase[i] >= loopEnd[i]) {
+                    float overflow = phase[i] - loopEnd[i];
+                    if (overflow >= loopLength[i])
+                        overflow -= std::floor(overflow / loopLength[i]) *
+                                    loopLength[i];
+                    phase[i] = loopStart[i] + overflow;
+                }
+                if (frame[i] + 8u > c.frameCount) { done = true; break; }
+                if (phase[i] + step[i] * 7.0f < loopEnd[i] - 1.0f) break;
+                // Straddling this lane's loop end: one scalar frame, exactly
+                // as the per-voice kernel steps it (filter state via the SoA).
+                if (!spilled) { spillZ(); spilled = true; }
+                const uint32_t hh = h[i];
+                uint32_t base = static_cast<uint32_t>(phase[i]);
+                if (base + 1u >= v.relEnd[hh]) {
+                    phase[i] = loopStart[i];
+                    base = v.relLoopS[hh];
+                }
+                uint32_t next = base + 1u;
+                if (next >= v.relLoopE[hh]) next = v.relLoopS[hh];
+                const float fraction = phase[i] - static_cast<float>(base);
+                const float first =
+                    static_cast<float>(region[i][base]) * (1.0f / 32768.0f);
+                float sample = first +
+                    (static_cast<float>(region[i][next]) * (1.0f / 32768.0f) -
+                     first) * fraction;
+                sample = ProcessVoiceFilterSample(v, hh, sample);
+                outL[i][frame[i]] += sample * gainL[i];
+                outR[i][frame[i]] += sample * gainR[i];
+                phase[i] += step[i];
+                ++frame[i];
+            }
+        }
+        if (done) {
+            if (!spilled) spillZ();
+            break;
+        }
+        if (spilled) loadZ();
+
+        __m256 rows[8];
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            const float lastPhase = phase[i] + step[i] * 7.0f;
+            _mm_prefetch(reinterpret_cast<const char*>(
+                             region[i] +
+                             static_cast<uint32_t>(lastPhase + step[i])),
+                         _MM_HINT_T0);
+            const __m256 phases = _mm256_add_ps(
+                _mm256_set1_ps(phase[i]),
+                _mm256_mul_ps(_mm256_set1_ps(step[i]), lane));
+            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256 first, second;
+            GatherSamplePairAVX2(region[i], bases, first, second);
+            const __m256 fraction = _mm256_sub_ps(
+                phases, _mm256_cvtepi32_ps(bases));
+            rows[i] = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+        }
+        Transpose8x8Ps(rows);  // rows[k] = time step k of all eight voices
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            const __m256 input = rows[k];
+            const __m256 output = _mm256_add_ps(
+                _mm256_mul_ps(input, a0v), z1);
+            z1 = _mm256_sub_ps(
+                _mm256_add_ps(_mm256_mul_ps(input, a0x2v), z2),
+                _mm256_mul_ps(b1v, output));
+            z2 = _mm256_sub_ps(
+                _mm256_mul_ps(input, a0v), _mm256_mul_ps(b2v, output));
+            rows[k] = output;
+        }
+        Transpose8x8Ps(rows);  // back to one voice per vector
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            _mm256_storeu_ps(outL[i] + frame[i], _mm256_add_ps(
+                _mm256_loadu_ps(outL[i] + frame[i]),
+                _mm256_mul_ps(rows[i], _mm256_set1_ps(gainL[i]))));
+            _mm256_storeu_ps(outR[i] + frame[i], _mm256_add_ps(
+                _mm256_loadu_ps(outR[i] + frame[i]),
+                _mm256_mul_ps(rows[i], _mm256_set1_ps(gainR[i]))));
+            for (uint32_t k = 0u; k < 8u; ++k) phase[i] += step[i];
+            frame[i] += 8u;
+        }
+    }
+
+    for (uint32_t i = 0u; i < 8u; ++i) v.phases[h[i]] = phase[i];
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        if (frame[i] >= c.frameCount) continue;
+        RenderSpanContext rest = dest[i];
+        rest.frameStart = c.frameStart + frame[i];
+        rest.frameCount = c.frameCount - frame[i];
+        RenderSustainedLoopFramesAVX2(rest, h[i]);
+    }
+}
+
+// Sustained-loop spans of 8+ frames, no rotation: eight consecutive eligible
+// filtered voices go through the group kernel, everything else through the
+// per-voice kernel, preserving the handle order.
+void RenderSustainedFramesGrouped(const RenderSpanContext& c,
+                                  const uint32_t* handles, uint32_t count) {
+    VoiceSoA& v = *c.voices;
+    uint32_t pending[8];
+    uint32_t pendingCount = 0u;
+    auto flush = [&]() {
+        if (pendingCount == 8u) {
+            RenderSustainedFilteredGroupAVX2(c, pending);
+        } else {
+            for (uint32_t k = 0u; k < pendingCount; ++k) {
+                const RenderSpanContext vc = SelectVoiceDestination(
+                    c, v.channel[pending[k]]);
+                RenderSustainedLoopFramesAVX2(vc, pending[k]);
+            }
+        }
+        pendingCount = 0u;
+    };
+    for (uint32_t i = 0u; i < count; ++i) {
+        const uint32_t handle = handles[i];
+        if (g_filteredGroupsEnabled && FilteredGroupEligible(c, handle)) {
+            pending[pendingCount++] = handle;
+            if (pendingCount == 8u) flush();
+            continue;
+        }
+        flush();
+        const RenderSpanContext vc = SelectVoiceDestination(
+            c, v.channel[handle]);
+        RenderSustainedLoopFramesAVX2(vc, handle);
+    }
+    flush();
+}
+
+// Release-loop twin of the sustained group kernel above: eight filtered
+// releasing voices in lockstep.  The envelope is the same exact sequential
+// recurrence the per-voice kernel simulates (gains[8] per lane, no powers);
+// a lane whose countdown or retire threshold is not safe for a whole chunk
+// ends the group, and every lane then finishes through the per-voice kernel
+// on the remaining sub-span (which owns retirement).  retiredAt[i] is the
+// span-relative frame the voice retires on, or UINT32_MAX.
+inline bool FilteredReleaseGroupEligible(const RenderSpanContext& c,
+                                         uint32_t h) {
+    return FilteredGroupEligible(c, h);
+}
+
+void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
+                                    const uint32_t* h, uint32_t* retiredAt) {
+    VoiceSoA& v = *c.voices;
+    RenderSpanContext dest[8];
+    float phase[8], step[8], loopStart[8], loopEnd[8], loopLength[8];
+    float gain[8], decay[8], mixL[8], mixR[8];
+    uint32_t remaining[8];
+    const int16_t* region[8];
+    float* outL[8];
+    float* outR[8];
+    uint32_t frame[8];
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        dest[i] = SelectVoiceDestination(c, v.channel[h[i]]);
+        phase[i] = (std::max)(0.0f, v.phases[h[i]]);
+        step[i] = v.phaseIncs[h[i]];
+        loopStart[i] = v.relLoopSF[h[i]];
+        loopEnd[i] = v.relLoopEF[h[i]];
+        loopLength[i] = loopEnd[i] - loopStart[i];
+        gain[i] = v.currentGain[h[i]];
+        remaining[i] = v.releaseSamplesRemaining[h[i]];
+        decay[i] = v.releaseDecay[h[i]];
+        mixL[i] = v.mixGainL[h[i]];
+        mixR[i] = v.mixGainR[h[i]];
+        region[i] = c.sampleData + v.sampleStart[h[i]];
+        outL[i] = dest[i].outputLeft + c.frameStart;
+        outR[i] = dest[i].outputRight + c.frameStart;
+        frame[i] = 0u;
+        retiredAt[i] = UINT32_MAX;
+    }
+    alignas(32) float a0a[8], b1a[8], b2a[8], z1a[8], z2a[8];
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        a0a[i] = v.filterA0[h[i]];
+        b1a[i] = v.filterB1[h[i]];
+        b2a[i] = v.filterB2[h[i]];
+    }
+    const __m256 a0v = _mm256_load_ps(a0a);
+    const __m256 a0x2v = _mm256_add_ps(a0v, a0v);
+    const __m256 b1v = _mm256_load_ps(b1a);
+    const __m256 b2v = _mm256_load_ps(b2a);
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
+                                       4.0f, 5.0f, 6.0f, 7.0f);
+    __m256 z1, z2;
+    auto loadZ = [&]() {
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            z1a[i] = v.filterZ1[h[i]];
+            z2a[i] = v.filterZ2[h[i]];
+        }
+        z1 = _mm256_load_ps(z1a);
+        z2 = _mm256_load_ps(z2a);
+    };
+    auto spillZ = [&]() {
+        _mm256_store_ps(z1a, z1);
+        _mm256_store_ps(z2a, z2);
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            v.filterZ1[h[i]] = z1a[i];
+            v.filterZ2[h[i]] = z2a[i];
+        }
+    };
+    loadZ();
+
+    alignas(32) float gains[8][8];
+    float futureGain[8];
+    for (;;) {
+        bool done = false;
+        bool spilled = false;
+        for (uint32_t i = 0u; i < 8u && !done; ++i) {
+            for (;;) {
+                if (phase[i] >= loopEnd[i]) {
+                    float overflow = phase[i] - loopEnd[i];
+                    if (overflow >= loopLength[i])
+                        overflow -= std::floor(overflow / loopLength[i]) *
+                                    loopLength[i];
+                    phase[i] = loopStart[i] + overflow;
+                }
+                if (frame[i] + 8u > c.frameCount) { done = true; break; }
+                float fg = gain[i];
+                for (uint32_t k = 0u; k < 8u; ++k) {
+                    fg *= decay[i];
+                    gains[i][k] = fg;
+                }
+                futureGain[i] = fg;
+                const bool countdownSafe =
+                    remaining[i] == UINT32_MAX || remaining[i] > 8u;
+                const bool thresholdSafe = remaining[i] != UINT32_MAX ||
+                    gains[i][7] >= VoiceRetireThreshold();
+                if (!countdownSafe || !thresholdSafe) { done = true; break; }
+                if (phase[i] + step[i] * 7.0f < loopEnd[i] - 1.0f) break;
+                // Loop-end straddle: one scalar frame exactly as the
+                // per-voice kernel steps it (safe: no retirement possible).
+                if (!spilled) { spillZ(); spilled = true; }
+                const uint32_t hh = h[i];
+                uint32_t base = static_cast<uint32_t>(phase[i]);
+                if (base + 1u >= v.relEnd[hh]) {
+                    phase[i] = loopStart[i];
+                    base = v.relLoopS[hh];
+                }
+                uint32_t next = base + 1u;
+                if (next >= v.relLoopE[hh]) next = v.relLoopS[hh];
+                const float fraction = phase[i] - static_cast<float>(base);
+                const float first =
+                    static_cast<float>(region[i][base]) * (1.0f / 32768.0f);
+                float sample = first +
+                    (static_cast<float>(region[i][next]) * (1.0f / 32768.0f) -
+                     first) * fraction;
+                bool finished = remaining[i] == 0u;
+                if (!finished) {
+                    gain[i] *= decay[i];
+                    if (remaining[i] != UINT32_MAX) {
+                        --remaining[i];
+                        finished = remaining[i] == 0u;
+                    }
+                }
+                sample = ProcessVoiceFilterSample(v, hh, sample);
+                outL[i][frame[i]] += sample * gain[i] * mixL[i];
+                outR[i][frame[i]] += sample * gain[i] * mixR[i];
+                phase[i] += step[i];
+                if (phase[i] >= loopEnd[i]) {
+                    float overflow = phase[i] - loopEnd[i];
+                    if (overflow >= loopLength[i])
+                        overflow -= std::floor(overflow / loopLength[i]) *
+                                    loopLength[i];
+                    phase[i] = loopStart[i] + overflow;
+                }
+                (void)finished;  // cannot be set: the chunk was proven safe
+                ++frame[i];
+            }
+        }
+        if (done) {
+            if (!spilled) spillZ();
+            break;
+        }
+        if (spilled) loadZ();
+
+        __m256 rows[8];
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            const float lastPhase = phase[i] + step[i] * 7.0f;
+            _mm_prefetch(reinterpret_cast<const char*>(
+                             region[i] +
+                             static_cast<uint32_t>(lastPhase + step[i])),
+                         _MM_HINT_T0);
+            const __m256 phases = _mm256_add_ps(
+                _mm256_set1_ps(phase[i]),
+                _mm256_mul_ps(_mm256_set1_ps(step[i]), lane));
+            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256 first, second;
+            GatherSamplePairAVX2(region[i], bases, first, second);
+            const __m256 fraction = _mm256_sub_ps(
+                phases, _mm256_cvtepi32_ps(bases));
+            rows[i] = _mm256_add_ps(first,
+                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+        }
+        Transpose8x8Ps(rows);
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            const __m256 input = rows[k];
+            const __m256 output = _mm256_add_ps(
+                _mm256_mul_ps(input, a0v), z1);
+            z1 = _mm256_sub_ps(
+                _mm256_add_ps(_mm256_mul_ps(input, a0x2v), z2),
+                _mm256_mul_ps(b1v, output));
+            z2 = _mm256_sub_ps(
+                _mm256_mul_ps(input, a0v), _mm256_mul_ps(b2v, output));
+            rows[k] = output;
+        }
+        Transpose8x8Ps(rows);
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            const __m256 scaled = _mm256_mul_ps(
+                rows[i], _mm256_load_ps(gains[i]));
+            _mm256_storeu_ps(outL[i] + frame[i], _mm256_add_ps(
+                _mm256_loadu_ps(outL[i] + frame[i]),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL[i]))));
+            _mm256_storeu_ps(outR[i] + frame[i], _mm256_add_ps(
+                _mm256_loadu_ps(outR[i] + frame[i]),
+                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR[i]))));
+            gain[i] = futureGain[i];
+            if (remaining[i] != UINT32_MAX) remaining[i] -= 8u;
+            for (uint32_t k = 0u; k < 8u; ++k) phase[i] += step[i];
+            frame[i] += 8u;
+        }
+    }
+
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        v.phases[h[i]] = phase[i];
+        v.currentGain[h[i]] = gain[i];
+        v.releaseSamplesRemaining[h[i]] = remaining[i];
+    }
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        if (frame[i] >= c.frameCount) continue;
+        RenderSpanContext rest = dest[i];
+        rest.frameStart = c.frameStart + frame[i];
+        rest.frameCount = c.frameCount - frame[i];
+        const uint32_t at = RenderReleaseLoopFramesAVX2(rest, h[i]);
+        if (at != UINT32_MAX) retiredAt[i] = frame[i] + at;
+    }
+}
+
+// Release-loop spans of 8+ frames, no rotation: group kernel for runs of
+// eight eligible filtered voices, per-voice kernel for the rest, handle order
+// (and therefore retirement recording order) preserved.
+void RenderReleaseFramesGrouped(const RenderSpanContext& c,
+                                const uint32_t* handles, uint32_t count) {
+    VoiceSoA& v = *c.voices;
+    uint32_t pending[8];
+    uint32_t pendingCount = 0u;
+    auto perVoice = [&](uint32_t handle) {
+        const RenderSpanContext vc = SelectVoiceDestination(
+            c, v.channel[handle]);
+        const uint32_t retiredAt = RenderReleaseLoopFramesAVX2(vc, handle);
+        if (retiredAt != UINT32_MAX) RecordRetirement(c, handle, retiredAt);
+    };
+    auto flush = [&]() {
+        if (pendingCount == 8u) {
+            uint32_t retiredAt[8];
+            RenderReleaseFilteredGroupAVX2(c, pending, retiredAt);
+            for (uint32_t k = 0u; k < 8u; ++k)
+                if (retiredAt[k] != UINT32_MAX)
+                    RecordRetirement(c, pending[k], retiredAt[k]);
+        } else {
+            for (uint32_t k = 0u; k < pendingCount; ++k) perVoice(pending[k]);
+        }
+        pendingCount = 0u;
+    };
+    for (uint32_t i = 0u; i < count; ++i) {
+        const uint32_t handle = handles[i];
+        if (g_filteredGroupsEnabled && c.frameCount >= 8u &&
+            FilteredReleaseGroupEligible(c, handle)) {
+            pending[pendingCount++] = handle;
+            if (pendingCount == 8u) flush();
+            continue;
+        }
+        flush();
+        perVoice(handle);
+    }
+    flush();
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // Rotation-aware sustained-loop kernel (SVMSPhaseRotation.h).
 //
 // The regular AVX2 path vectorizes across TIME for one voice, but the
@@ -1348,11 +1851,7 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
     // redirects the mix to the voice's channel plane.
     if (context.channelBusLeft != nullptr) {
         if (context.frameCount > 7u) {
-            for (uint32_t i = 0; i < handleCount; ++i) {
-                const RenderSpanContext vc = SelectVoiceDestination(
-                    context, v.channel[handles[i]]);
-                RenderSustainedLoopFramesAVX2(vc, handles[i]);
-            }
+            RenderSustainedFramesGrouped(context, handles, handleCount);
             _mm256_zeroupper();
             return true;
         }
@@ -1368,9 +1867,7 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         return true;
     }
     if (context.frameCount > 7u) {
-        for (uint32_t i = 0; i < handleCount; ++i) {
-            RenderSustainedLoopFramesAVX2(context, handles[i]);
-        }
+        RenderSustainedFramesGrouped(context, handles, handleCount);
         _mm256_zeroupper();
         return true;
     }
@@ -1520,6 +2017,10 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
 }
 
 } // namespace
+
+void SetFilteredGroupKernelForTest(bool enabled) {
+    g_filteredGroupsEnabled = enabled;
+}
 
 bool BuildVolatileStealKeysAVX2(
     const uint32_t* handles, uint32_t handleCount,

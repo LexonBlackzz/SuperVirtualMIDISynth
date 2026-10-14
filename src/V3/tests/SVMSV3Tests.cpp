@@ -4692,6 +4692,160 @@ void TestMutedTailCull() {
     }
 }
 
+// Filtered sustained loops through the 8-voices-per-vector biquad group
+// kernel must reproduce the per-voice kernel exactly: with each voice on its
+// own channel plane (bus mode) the planes and every voice's end state are
+// compared bitwise; on a single shared plane only the mix order of lanes that
+// drifted apart could differ, so that comparison is a tight tolerance.
+void RunFilteredGroupKernelTest(bool release) {
+    if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    constexpr uint32_t kVoices = 27u;  // three groups of eight + a remainder
+    constexpr uint32_t kRegion = 4096u;
+    std::vector<int16_t> samples(kRegion + 8u, 0);
+    uint32_t rng = 12345u;
+    for (uint32_t i = 0; i < kRegion; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        samples[i] = static_cast<int16_t>((rng >> 16) & 0x7FFF) - 16384;
+    }
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    auto seed = std::make_unique<svms::VoiceManager>();
+    Check(seed->Initialize(64u, 44100u), "filter group pool allocates");
+    const uint32_t loopLengths[] = {40u, 130u, 700u, 3000u};
+    std::vector<uint32_t> handles;
+    for (uint32_t i = 0; i < kVoices; ++i) {
+        const uint8_t channel = static_cast<uint8_t>(i % 16u);
+        const svms::VoiceHandle voice = seed->AllocateVoice(
+            channel, static_cast<uint8_t>(40u + i), 100);
+        const uint32_t loopLen = loopLengths[i % 4u];
+        seed->SetVoiceSample(voice, 0, kRegion, 16, 16 + loopLen, 1u,
+                             0.3f + 0.07f * static_cast<float>(i % 23u), 1);
+        seed->v.phases[voice] = static_cast<float>((i * 53u) % 900u) + 0.25f;
+        seed->SetVoiceEnvelope(voice, 0.5f, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f, 0.999f);
+        seed->SetVoicePlayIndex(voice, i + 1u);
+        seed->SetVoiceGain(voice, 0.3f + 0.01f * static_cast<float>(i),
+                           0.2f + 0.01f * static_cast<float>(i));
+        seed->RefreshMixGain(voice, channels.GetParams()[channel]);
+        seed->v.renderGainL[voice] = seed->v.currentGain[voice] * seed->v.mixGainL[voice];
+        seed->v.renderGainR[voice] = seed->v.currentGain[voice] * seed->v.mixGainR[voice];
+        const svms::PreparedVoiceFilter f = svms::PrepareVoiceLowPass(
+            static_cast<uint8_t>(svms::FilterType::LowPass2Pole),
+            static_cast<int16_t>(6000 + 250 * static_cast<int>(i % 28u)),
+            static_cast<int16_t>((i % 5u) * 60), 44100u);
+        seed->v.filterA0[voice] = f.a0;
+        seed->v.filterB1[voice] = f.b1;
+        seed->v.filterB2[voice] = f.b2;
+        seed->v.filterEnabled[voice] = f.enabled;
+        seed->v.filterZ1[voice] = 0.01f * static_cast<float>(i % 7u);
+        seed->v.filterZ2[voice] = -0.005f * static_cast<float>(i % 5u);
+        if (release) {
+            // Releasing tails: a mix of threshold-governed (UINT32_MAX) and
+            // counted ones, several of which retire inside the longer span.
+            seed->StartRelease(voice);
+            seed->v.currentGain[voice] = 0.4f + 0.01f * static_cast<float>(i);
+            seed->v.releaseDecay[voice] = 0.9990f - 0.0004f * static_cast<float>(i % 9u);
+            seed->v.releaseSamplesRemaining[voice] =
+                (i % 3u == 0u) ? UINT32_MAX : 200u + 150u * (i % 11u);
+        }
+        handles.push_back(voice);
+    }
+    // One unfiltered voice mid-list splits the pending group, as in a real mix.
+    seed->v.filterEnabled[handles[13]] = 0u;
+
+    const svms::RenderKernelSet& kernels = svms::GetAVX2RenderKernelSet();
+    const svms::RenderClassKernel kernel =
+        kernels.kernels[static_cast<uint32_t>(release
+            ? svms::VoiceRenderClass::ReleaseLoop
+            : svms::VoiceRenderClass::SustainedLoop)];
+    struct Span { uint32_t start, count; };
+    const Span spans[] = {{0u, 2048u}, {5u, 203u}, {0u, 64u}};
+    for (const Span& span : spans) {
+        for (int bus = 0; bus < 2; ++bus) {
+            std::vector<float> planes[2][2][16];  // [grouped][L/R][channel]
+            float* planePtr[2][2][16];
+            std::vector<float> mix[2][2];
+            std::unique_ptr<svms::VoiceManager> run[2];
+            std::vector<svms::SpanRetirement> retired[2];
+            std::vector<uint32_t> positions(64u);
+            for (uint32_t p = 0; p < 64u; ++p) positions[p] = p;
+            for (int grouped = 0; grouped < 2; ++grouped) {
+                run[grouped] = std::make_unique<svms::VoiceManager>(*seed);
+                for (int side = 0; side < 2; ++side) {
+                    for (uint32_t ch = 0; ch < 16u; ++ch) {
+                        planes[grouped][side][ch].assign(span.start + span.count + 16u, 0.0f);
+                        planePtr[grouped][side][ch] = planes[grouped][side][ch].data();
+                    }
+                    mix[grouped][side].assign(span.start + span.count + 16u, 0.0f);
+                }
+                svms::SetFilteredGroupKernelForTest(grouped != 0);
+                retired[grouped].assign(64u, svms::SpanRetirement{});
+                uint32_t retiredCount = 0u;
+                svms::RenderSpanContext ctx{
+                    &run[grouped]->v, samples.data(), nullptr, kRegion + 8u,
+                    mix[grouped][0].data(), mix[grouped][1].data(),
+                    span.start, span.count, 64u, nullptr, nullptr,
+                    positions.data(), retired[grouped].data(), &retiredCount,
+                    0.0f, 1.0f, 0u,
+                    bus ? planePtr[grouped][0] : nullptr,
+                    bus ? planePtr[grouped][1] : nullptr};
+                Check(kernel(ctx, handles.data(),
+                             static_cast<uint32_t>(handles.size())),
+                      "filter group kernel accepts the batch");
+                retired[grouped].resize(retiredCount);
+            }
+            const bool retiredSame =
+                retired[0].size() == retired[1].size() &&
+                (retired[0].empty() ||
+                 std::memcmp(retired[0].data(), retired[1].data(),
+                             retired[0].size() *
+                                 sizeof(svms::SpanRetirement)) == 0);
+            svms::SetFilteredGroupKernelForTest(true);
+            float maxDiff = 0.0f;
+            bool bitExact = true;
+            if (bus) {
+                for (int side = 0; side < 2; ++side)
+                    for (uint32_t ch = 0; ch < 16u; ++ch)
+                        bitExact = bitExact &&
+                            std::memcmp(planes[0][side][ch].data(), planes[1][side][ch].data(),
+                                        planes[0][side][ch].size() * sizeof(float)) == 0;
+            } else {
+                for (int side = 0; side < 2; ++side)
+                    for (size_t f = 0; f < mix[0][side].size(); ++f)
+                        maxDiff = (std::max)(maxDiff,
+                            std::fabs(mix[0][side][f] - mix[1][side][f]));
+            }
+            bool stateExact = true;
+            for (uint32_t handle : handles) {
+                stateExact = stateExact &&
+                    run[0]->v.phases[handle] == run[1]->v.phases[handle] &&
+                    run[0]->v.filterZ1[handle] == run[1]->v.filterZ1[handle] &&
+                    run[0]->v.filterZ2[handle] == run[1]->v.filterZ2[handle] &&
+                    run[0]->v.currentGain[handle] == run[1]->v.currentGain[handle] &&
+                    run[0]->v.releaseSamplesRemaining[handle] ==
+                        run[1]->v.releaseSamplesRemaining[handle];
+            }
+            std::fprintf(stderr,
+                "[FILTGRP] %s start=%u count=%u bus=%d planes-bit-exact=%d state-bit-exact=%d retire-same=%d(%zu) mix-maxdiff=%g\n",
+                release ? "release" : "sustained", span.start, span.count, bus,
+                bus ? (bitExact ? 1 : 0) : -1, stateExact ? 1 : 0,
+                retiredSame ? 1 : 0, retired[0].size(), maxDiff);
+            Check(retiredSame, "filter group retires the same voices on the same frames");
+            Check(stateExact, "filter group keeps per-voice phase and filter state bit-identical");
+            if (bus) Check(bitExact, "filter group planes are bit-identical to the per-voice kernel");
+            else Check(maxDiff <= 1.0e-6f, "filter group shared-plane mix matches within summation order");
+        }
+    }
+}
+
+void TestFilteredGroupKernel() {
+    RunFilteredGroupKernelTest(false);
+    RunFilteredGroupKernelTest(true);
+}
+
 void TestWholeVoiceResetBarrierDifferential() {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 8u;
@@ -7463,6 +7617,7 @@ int main() {
     TestWholeVoiceDecimation();
     TestWholeVoiceDecimationByLevel();
     TestMutedTailCull();
+    TestFilteredGroupKernel();
     TestWholeVoiceCCDifferential();
     TestWholeVoiceOpBudgetSplitDifferential();
     TestWholeVoiceVibratoDifferential();
