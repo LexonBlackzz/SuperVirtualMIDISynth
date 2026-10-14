@@ -80,6 +80,11 @@ bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
 bool PanelLcdInt(const char* caption, int* value, int minValue, int maxValue,
                  const char* help, bool restart = false,
                  bool* committed = nullptr, const char* zeroText = nullptr);
+// Captioned integer slider (ctrl+click to type). `zeroText` replaces the
+// value readout when it is 0 (e.g. "AUTO").
+bool PanelSliderInt(const char* caption, int* value, int minValue, int maxValue,
+                    const char* help, bool restart = false,
+                    const char* zeroText = nullptr);
 // Inset display: dark background, rim, optional grid. Draws only; the caller
 // reserves layout space (e.g. with Dummy).
 void DrawLcdFrame(ImDrawList* dl, ImVec2 min, ImVec2 max, int gridCols = 0,

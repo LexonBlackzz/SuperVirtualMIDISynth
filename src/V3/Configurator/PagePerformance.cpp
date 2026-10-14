@@ -255,20 +255,12 @@ void DrawPerformancePage(ConfigDocument& doc) {
         // ------------------------------------------------------- ENGINE
         ImGui::TableNextColumn();
         if (BeginRackPanel("ENGINE")) {
-            static const int threadValues[] = {0, 1, 2, 4, 8, 12, 16, 24, 32, 64};
-            static const char* threadLabels[] = {"AUTO", "1", "2", "4", "8", "12", "16", "24", "32", "64"};
-            int threadIdx = -1;
-            for (int i = 0; i < 10; ++i)
-                if (threadValues[i] == static_cast<int>(w.renderThreads)) threadIdx = i;
-            if (PanelKeys("RENDER THREADS", &threadIdx, threadLabels, 10,
-                          "Total voice-render lanes. 1 keeps voice rendering on the audio thread; AUTO lets V3 pick.",
-                          true) && threadIdx >= 0) {
-                w.renderThreads = static_cast<uint32_t>(threadValues[threadIdx]);
+            int threads = static_cast<int>(w.renderThreads);
+            if (PanelSliderInt("RENDER THREADS", &threads, 0, 64,
+                               "Total voice-render lanes. 0 = AUTO (V3 picks); 1 keeps voice rendering on the audio thread. Ctrl+click the slider to type a value.",
+                               true, "AUTO")) {
+                w.renderThreads = static_cast<uint32_t>(threads);
                 doc.MarkDirty();
-            }
-            if (threadIdx < 0) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("custom: %u", w.renderThreads);
             }
             ImGui::Spacing();
 

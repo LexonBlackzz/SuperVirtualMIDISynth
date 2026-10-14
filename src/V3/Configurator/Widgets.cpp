@@ -558,6 +558,22 @@ bool PanelLcdInt(const char* caption, int* value, int minValue, int maxValue,
     return edited;
 }
 
+bool PanelSliderInt(const char* caption, int* value, int minValue, int maxValue,
+                    const char* help, bool restart, const char* zeroText) {
+    ImGui::PushID(caption);
+    PanelCaption(caption, help, restart);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    PushMono();
+    ImGui::PushStyleColor(ImGuiCol_Text, GetAccent());
+    const bool changed = ImGui::SliderInt(
+        "##slider", value, minValue, maxValue,
+        (zeroText && *value == minValue) ? zeroText : "%d");
+    ImGui::PopStyleColor();
+    PopMono();
+    ImGui::PopID();
+    return changed;
+}
+
 void RestartPill() {
     PushLabel(0.78f);
     const bool refined = IsRefinedStyle();
