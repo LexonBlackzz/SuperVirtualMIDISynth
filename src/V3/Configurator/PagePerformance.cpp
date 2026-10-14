@@ -265,14 +265,20 @@ void DrawPerformancePage(ConfigDocument& doc) {
             ImGui::Spacing();
 
             if (PanelLever("LARGE PAGES", &w.largePages,
-                           "Optional. Backs the voice pool and dense-render storage with 2 MB pages to reduce TLB pressure at very large pools. Needs the Lock Pages In Memory privilege; otherwise silently falls back to normal allocation.",
+                           "Optional. Backs the voice pool and renderer storage with 2 MB pages to reduce TLB pressure at very large pools. Needs the Lock Pages In Memory privilege; otherwise silently falls back to normal allocation.",
                            true)) {
                 doc.MarkDirty();
             }
             ImGui::Spacing();
+            if (PanelLever("VOICE DECIMATION", &w.decimation,
+                           "OFF by default: every voice mixes. When enabled, above 10k / 25k / 50k / 150k active voices the quietest voices (by velocity, ranked each block) stop mixing for the block, keeping only the loudest 1/2, 1/4, 1/8 or 1/16. They still advance their phase and envelope, and voices launched in the block always sound. Big CPU saving on extreme Black MIDI; it audibly thins quiet layers.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetDecimation, w.decimation ? 1u : 0u);
+            }
+            ImGui::Spacing();
             bool correctness = w.correctnessMode;
             if (PanelLever("FULL CORRECTNESS", &correctness,
-                           "Renders the complete configured pool at full quality. Disable only if you understand the quality tradeoff.")) {
+                           "Reference-render switch kept for compatibility: it no longer changes live rendering (voice decimation is its own switch above).")) {
                 w.correctnessMode = correctness;
                 doc.MarkDirty();
                 PushLiveBool(svms::RLCommandType::SetCorrectnessMode, correctness);
@@ -282,7 +288,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
 
             int memory = static_cast<int>(w.voiceMemoryBudgetMB);
             if (PanelLcdInt("VOICE MEMORY  (MIB)", &memory, 0, 65536,
-                            "Upper bound for the voice pool, renderer scratch, dense-planner state and worker mix buffers. Zero means unlimited. A restart recalculates the largest safe live-growth ceiling.",
+                            "Upper bound for the voice pool, renderer scratch and worker mix buffers. Zero means unlimited. A restart recalculates the largest safe live-growth ceiling.",
                             true, nullptr, "unlimited")) {
                 w.voiceMemoryBudgetMB = static_cast<uint32_t>(memory);
                 doc.MarkDirty();
@@ -313,7 +319,14 @@ void DrawPerformancePage(ConfigDocument& doc) {
             const float budgetMs = BlockBudgetMs(*t);
             const float load = (std::max)(0.0f, t->cpuLoadPercent);
             const uint32_t cap = t->live.maxVoices != 0u ? t->live.maxVoices : t->maxVoices;
-            set(0, "ACTIVE VOICES", "%u / %u", t->activeVoices, cap);
+            if (t->effectiveVoices > t->activeVoices) {
+                // Note merging / coalescing is absorbing duplicates: show what
+                // the pool would hold without them next to what it holds.
+                set(0, "ACTIVE / EFFECTIVE", "%u / %u  (eff %u)",
+                    t->activeVoices, cap, t->effectiveVoices);
+            } else {
+                set(0, "ACTIVE VOICES", "%u / %u", t->activeVoices, cap);
+            }
             set(1, "RENDER / BUDGET", "%.2f / %.2f ms", PercentToMs(load, budgetMs), budgetMs);
             set(2, "RENDER LOAD", "%.1f%%", load);
             set(3, "HEADROOM", "%.1f%%", (std::max)(0.0f, 100.0f - load));

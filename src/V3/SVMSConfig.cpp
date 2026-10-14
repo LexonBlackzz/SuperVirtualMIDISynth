@@ -356,6 +356,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"events", {
             {"overflow_mode", "priority"},
             {"cc_collapse", cfg.ccCollapse},
+            {"note_merge", cfg.noteMerge},
             {"ring_capacity", cfg.eventRingCapacity},
             {"high_priority_velocity", cfg.highPriorityVelocity},
             {"shed_start_percent", cfg.shedStartPercent},
@@ -363,6 +364,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         }},
         {"quality", {
             {"correctness_mode", cfg.correctnessMode},
+            {"decimation", cfg.decimation},
             {"interpolation", "linear"},
             {"pan_law", "constant-power"}
         }},
@@ -405,7 +407,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"mode", cfg.phaseRotationMode}
         }},
         {"note_on_collapse", {
-            {"threshold", cfg.noteOnCollapseThreshold}
+            {"threshold", cfg.noteOnCollapseThreshold},
+            {"reexcite", cfg.noteOnReexcite}
         }},
         {"voices", {
             {"retire_threshold", cfg.voiceRetireThreshold},
@@ -728,10 +731,18 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             else
                 AppendWarning(cfg.configWarning, "events.cc_collapse");
         }
+        if (auto merge = it->find("note_merge"); merge != it->end()) {
+            if (merge->is_boolean())
+                cfg.noteMerge = merge->get<bool>();
+            else
+                AppendWarning(cfg.configWarning, "events.note_merge");
+        }
     }
     if (auto it = root.find("quality"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "correctness_mode", cfg.correctnessMode))
             AppendWarning(cfg.configWarning, "quality.correctness_mode");
+        if (!ReadBool(*it, "decimation", cfg.decimation))
+            AppendWarning(cfg.configWarning, "quality.decimation");
         auto interpolation = it->find("interpolation");
         if (interpolation != it->end()) {
             if (interpolation->is_string() && interpolation->get<std::string>() == "nearest")
@@ -847,6 +858,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
             AppendWarning(cfg.configWarning, "note_on_collapse.threshold");
+        if (!ReadBool(*it, "reexcite", cfg.noteOnReexcite))
+            AppendWarning(cfg.configWarning, "note_on_collapse.reexcite");
     } else if (auto it2 = root.find("event_queue"); it2 != root.end() &&
                it2->is_object()) {
         // Back-compat: pre-2026-09 configurator builds wrote the threshold
@@ -917,6 +930,9 @@ void ApplyEnvironment(EngineConfig& cfg) {
     }
     if (EnvironmentFlag(L"SVMS_NO_DROP_EVENTS", false))
         cfg.eventOverflowMode = EventOverflowMode::LosslessBackpressure;
+    // Handy for A/B renders of one file with the tools (svms_v3_midi_song).
+    cfg.noteMerge = EnvironmentFlag(L"SVMS_NOTE_MERGE", cfg.noteMerge);
+    cfg.noteOnReexcite = EnvironmentFlag(L"SVMS_NOTE_REEXCITE", cfg.noteOnReexcite);
     cfg.correctnessMode = EnvironmentFlag(L"SVMS_CORRECTNESS_MODE", cfg.correctnessMode);
     cfg.diagnosticsEnabled = EnvironmentFlag(L"SVMS_DIAGNOSTICS", cfg.diagnosticsEnabled);
     cfg.diagnosticsWindow = EnvironmentFlag(L"SVMS_DIAGNOSTICS_WINDOW", cfg.diagnosticsWindow);
@@ -994,8 +1010,11 @@ EngineConfig EngineConfig::Default() {
     cfg.voiceRetireThreshold = kVoiceRetireThreshold;
     cfg.stealPolicy = 0;
     cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
+    cfg.decimation = false;  // opt-in: every voice mixes by default
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
+    cfg.noteMerge = false;       // opt-in: every note-on launches its own voice
+    cfg.noteOnReexcite = false;  // opt-in: collapsed hits are dropped, not re-excited
     cfg.blockTimingMode = false;  // opt-in: exact-frame dispatch by default
     cfg.unboundedRender = false;  // opt-in: recovery + caps stay on by default
     cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default

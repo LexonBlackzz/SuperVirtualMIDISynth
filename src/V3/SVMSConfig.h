@@ -91,6 +91,10 @@ struct EngineConfig {
     // (power-of-two rounded) collapse same-key repeats inside a fixed
     // 20 ms window into one voice per N hits.
     uint32_t noteOnCollapseThreshold;
+    // With coalescing on: a collapsed repeat hit re-excites the key's live
+    // voices at its exact frame instead of being dropped (timing-preserving).
+    // Off by default.
+    bool noteOnReexcite;
     bool enableChorus;
     bool enableFilter;
     bool enableModulators;
@@ -100,6 +104,9 @@ struct EngineConfig {
     // Opt-in compiler-side CC collapse: superseded same-(channel,controller)
     // state events are dropped upstream. Off by default.
     bool ccCollapse;
+    // Opt-in exact note-on merging (SVMSNoteMerge.h): identical note-ons on
+    // one frame become one voice at N times the gain. Off by default.
+    bool noteMerge;
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block offset. Off by default.
     bool blockTimingMode;
@@ -136,6 +143,9 @@ struct EngineConfig {
     // 2 + workers -> E-cores. No-op on single-class CPUs and XP.
     uint32_t threadAffinityMode;
     bool correctnessMode;
+    // Voice decimation (opt-in, restart-applied): above the tier voice
+    // counts the quietest voices stop mixing (state still advances).
+    bool decimation;
     bool diagnosticsEnabled;
     bool diagnosticsWindow;
     bool diagnosticsDebugOutput;

@@ -174,6 +174,8 @@ ConfigValues ConfigDocument::Defaults() {
     d.perKeyVoiceCap = 0u;
     d.threadAffinityMode = 0u;
     d.ccCollapse = false;
+    d.noteMerge = false;
+    d.noteOnReexcite = false;
     d.blockTiming = false;
     d.unboundedRender = false;
     d.ghostBudget = 0u;
@@ -184,6 +186,7 @@ ConfigValues ConfigDocument::Defaults() {
     // Velocity shedding ("priority") is opt-in; the default never culls.
     d.overflowMode = 1;
     d.correctnessMode = true;
+    d.decimation = false;
     d.diagnosticsEnabled = false;
     d.diagnosticsWindow = false;
     d.diagnosticsDebugOutput = false;
@@ -285,6 +288,10 @@ void ConfigDocument::FromJson(const json& root) {
             collapse->is_boolean()) {
             working_.ccCollapse = collapse->get<bool>();
         }
+        if (auto merge = it->find("note_merge"); merge != it->end() &&
+            merge->is_boolean()) {
+            working_.noteMerge = merge->get<bool>();
+        }
         ReadNum(*it, "ring_capacity", working_.eventRingCapacity, 4096u, UINT32_MAX);
         ReadNum(*it, "high_priority_velocity", working_.highPriorityVelocity, 1u, 127u);
         ReadNum(*it, "shed_start_percent", working_.shedStartPercent, 1u, 99u);
@@ -293,6 +300,7 @@ void ConfigDocument::FromJson(const json& root) {
     }
     if (auto it = root.find("quality"); it != root.end() && it->is_object()) {
         ReadBool(*it, "correctness_mode", working_.correctnessMode);
+        ReadBool(*it, "decimation", working_.decimation);
     }
     if (auto it = root.find("limiter"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.limiterEnabled);
@@ -329,6 +337,7 @@ void ConfigDocument::FromJson(const json& root) {
         it->is_object()) {
         // Canonical key (matches the engine's reader).
         ReadNum(*it, "threshold", working_.noteOnCollapseThreshold, 1u, 65536u);
+        ReadBool(*it, "reexcite", working_.noteOnReexcite);
     } else if (auto it2 = root.find("event_queue"); it2 != root.end() &&
                it2->is_object()) {
         // Back-compat: the pre-2026-09 configurator wrote the threshold
@@ -407,6 +416,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["events"]["max_events_per_block"] = working_.maxEventsPerBlock;
 
     root["quality"]["correctness_mode"] = working_.correctnessMode;
+    root["quality"]["decimation"] = working_.decimation;
     root["quality"]["interpolation"] = "linear";
     root["quality"]["pan_law"] = "constant-power";
 
@@ -443,6 +453,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["ghost_budget"] = working_.ghostBudget;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
+    root["events"]["note_merge"] = working_.noteMerge;
     root["synth"]["block_timing"] = working_.blockTiming;
     root["synth"]["tuning_edo"] = working_.tuningEdo;
     root["synth"]["unbounded_render"] = working_.unboundedRender;
@@ -452,6 +463,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["api"]["allow_nested"] = working_.apiAllowNested;
     root["api"]["winmm_device"] = working_.apiWinMmDevice;
     root["note_on_collapse"]["threshold"] = working_.noteOnCollapseThreshold;
+    root["note_on_collapse"]["reexcite"] = working_.noteOnReexcite;
 
     root["midi"]["input_enabled"] = working_.midiInputEnabled;
     root["midi"]["input_device"] = WideToUtf8(working_.midiInputDevice);
@@ -653,6 +665,8 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.ghostBudget == b.ghostBudget
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
+        && a.noteMerge == b.noteMerge
+        && a.noteOnReexcite == b.noteOnReexcite
         && a.blockTiming == b.blockTiming
         && a.unboundedRender == b.unboundedRender
         && a.largePages == b.largePages
@@ -663,6 +677,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.maxEventsPerBlock == b.maxEventsPerBlock
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode
+        && a.decimation == b.decimation
         && a.diagnosticsEnabled == b.diagnosticsEnabled
         && a.diagnosticsWindow == b.diagnosticsWindow
         && a.diagnosticsDebugOutput == b.diagnosticsDebugOutput

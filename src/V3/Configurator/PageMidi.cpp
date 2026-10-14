@@ -187,6 +187,12 @@ void DrawMidiPage(ConfigDocument& doc) {
                 send(svms::RLCommandType::SetCcCollapse, w.ccCollapse ? 1u : 0u);
             }
             ImGui::Spacing();
+            if (PanelLever("EXACT NOTE MERGE", &w.noteMerge,
+                           "OFF by default. Identical note-ons (same channel, key, velocity and exact frame, from any track) become ONE voice at N times the gain. Identical voices sum linearly, so this sounds the same as playing all N, but costs one voice instead of N. Each note-off releases one copy; copies that end at different times are split off exactly. Nothing is dropped or re-timed, unlike NOTE-ON COALESCING. The effective-voice counter shows how many voices the pool would hold unmerged. Launch order inside one frame can change, which only matters if voices are stolen.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetNoteMerge, w.noteMerge ? 1u : 0u);
+            }
+            ImGui::Spacing();
             if (PanelLever("UNBOUNDED RENDER", &w.unboundedRender,
                            "OFF by default. When enabled, the two pressure safety nets are disabled: no wall-time recovery jump (events keep their exact frames and order; the song slows down instead of breaking down) and no per-block admission cap. Audio glitches and slowed playback are the accepted trade.")) {
                 doc.MarkDirty();
@@ -216,6 +222,12 @@ void DrawMidiPage(ConfigDocument& doc) {
                 if (idx < 0) {
                     ImGui::SameLine();
                     ImGui::TextDisabled("custom: 1:%u", w.noteOnCollapseThreshold);
+                }
+                ImGui::Spacing();
+                if (PanelLever("RE-EXCITE REPEATS", &w.noteOnReexcite,
+                               "OFF by default: repeat hits that coalescing collapses are dropped, so their retrigger rhythm is lost. When enabled, each one is kept at its exact frame and restarts the key's still-sounding voices instead (the level swells back to the peak and decays again, with no new voice and no stacked attack). Every onset keeps its exact timing. This is a different sound from true retriggers by design. Uses the exact span renderer, which is slower than the default whole-voice path on dense material; if nothing is sounding on the key the hit launches normally.")) {
+                    doc.MarkDirty();
+                    send(svms::RLCommandType::SetNoteOnReexcite, w.noteOnReexcite ? 1u : 0u);
                 }
             }
         }
@@ -384,6 +396,14 @@ void DrawMidiPage(ConfigDocument& doc) {
             }
             PopMono();
             ImGui::Dummy(ImVec2(width, height));
+            const uint64_t merged =
+                (static_cast<uint64_t>(t.noteMergedHigh) << 32u) | t.noteMergedLow;
+            if (w.noteMerge || merged != 0u || t.effectiveVoices > t.activeVoices) {
+                ImGui::TextDisabled(
+                    "note merge + coalescing: %u effective voices (peak %u) in %u live voices | %llu note-ons folded",
+                    t.effectiveVoices, t.effectiveVoicesPeak, t.activeVoices,
+                    static_cast<unsigned long long>(merged));
+            }
         }
         EndRackPanel();
     }

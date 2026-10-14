@@ -266,6 +266,9 @@ enum class RLCommandType : uint32_t {
     SetGhostBudget        = 0x00000119,
     SetUnboundedRender    = 0x0000011A,
     SetChannelLimiter     = 0x0000011B,
+    SetNoteMerge          = 0x0000011C,
+    SetNoteOnReexcite     = 0x0000011D,
+    SetDecimation         = 0x0000011E,
 
 
     Invalid              = 0xFFFFFFFF,
@@ -445,7 +448,15 @@ struct alignas(64) RuntimeLinkTelemetryV2 {
     float    channelLimiterGainReductionDb[kRLV2ChannelCount] = {};
     // Pre-limit bus peak per MIDI channel (linear).
     float    channelLimiterInputPeak[kRLV2ChannelCount] = {};
-    uint32_t channelLimiterReserved[15] = {};
+    // ── Exact note-on merging (carved from the reserved words, ABI size
+    // unchanged). effectiveVoices is what the pool would hold had no note-on
+    // been merged; noteMerged* is the cumulative count of note-ons folded
+    // away, as two halves of a 64-bit value.
+    uint32_t effectiveVoices         = 0u;
+    uint32_t effectiveVoicesPeak     = 0u;
+    uint32_t noteMergedLow           = 0u;
+    uint32_t noteMergedHigh          = 0u;
+    uint32_t channelLimiterReserved[11] = {};
 };
 
 static_assert(std::is_trivially_copyable<RuntimeLinkTelemetryV2>::value,
@@ -811,6 +822,12 @@ struct alignas(64) RuntimeAudioSnapshot {
     std::atomic<uint32_t> rawIngressCount{0u};
     std::atomic<uint32_t> compiledPagedCount{0u};
     std::atomic<uint32_t> scheduledBacklogCount{0u};
+
+    // Exact note-on merging census (see RuntimeLinkTelemetryV2).
+    std::atomic<uint32_t> effectiveVoices{0u};
+    std::atomic<uint32_t> effectiveVoicesPeak{0u};
+    std::atomic<uint32_t> noteMergedLow{0u};
+    std::atomic<uint32_t> noteMergedHigh{0u};
 
     // Per-MIDI-channel limiter (positive dB gain reduction + pre-limit
     // peak, exact IEEE-754 bit patterns; kRLV2ChannelCount entries).

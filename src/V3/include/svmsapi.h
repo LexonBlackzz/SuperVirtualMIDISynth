@@ -299,10 +299,11 @@ typedef struct SVMS_TelemetryV2 {
     uint64_t dropped_events;
     uint64_t cancelled_submissions;
     uint32_t scheduled_events;      /* current paged-scheduler backlog */
-    /* Which renderer the last block used: bit0 whole-voice, bit1 dense,
-     * bit2 sparse, bit8 vibrato forced the legacy hybrid. */
+    /* Which renderer the last block used: bit0 whole-voice, bit8 vibrato
+     * active, bit9 the block was split around a barrier event.  Bits 1 and 2
+     * (dense / sparse renderers) are retired and always 0. */
     uint32_t render_paths;
-    uint8_t plan_refusal_type;      /* why the legacy path was chosen */
+    uint8_t plan_refusal_type;      /* event type that last made the plan refuse (diagnostic) */
     uint8_t plan_refusal_data1;
     uint16_t backend_kind;          /* selected api.backend (0..4) */
     uint64_t primary_span_calls;    /* exact-frame scalar span fallback */
@@ -312,7 +313,18 @@ typedef struct SVMS_TelemetryV2 {
     float callback_p95_percent;
     float callback_p99_percent;
     float callback_p999_percent;
-    uint32_t reserved[5];
+    /* Exact note-on merging (opt-in, events.note_merge): identical
+     * same-frame note-ons folded into one voice. `effective_voices` is what
+     * the pool would hold had nothing been merged (the sum of multiplicities
+     * over live voices, sampled every 64 callbacks); the peak is its running
+     * maximum. `note_merged_events` is the cumulative number of note-ons
+     * folded away (low/high halves of a 64-bit count, as the struct has no
+     * spare 8-byte alignment). */
+    uint32_t effective_voices;
+    uint32_t effective_voices_peak;
+    uint32_t note_merged_events_low;
+    uint32_t note_merged_events_high;
+    uint32_t reserved[1];
 } SVMS_TelemetryV2;
 
 /* One record per real-time audio callback (SVMS_CAP_CALLBACK_TRACE). The
@@ -378,7 +390,9 @@ typedef enum SVMS_Command {
     SVMS_COMMAND_SET_THREAD_AFFINITY_MODE = 0x00000116,
     SVMS_COMMAND_SET_CC_COLLAPSE         = 0x00000117,
     SVMS_COMMAND_SET_BLOCK_TIMING        = 0x00000118,
-    SVMS_COMMAND_SET_GHOST_BUDGET        = 0x00000119
+    SVMS_COMMAND_SET_GHOST_BUDGET        = 0x00000119,
+    SVMS_COMMAND_SET_NOTE_MERGE          = 0x0000011C,
+    SVMS_COMMAND_SET_NOTE_ON_REEXCITE    = 0x0000011D
 } SVMS_Command;
 
 typedef SVMS_Result (SVMS_CALL *SVMS_CreateSessionFn)(

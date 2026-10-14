@@ -420,6 +420,58 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetNoteOnReexcite: {
+        // param = 1: coalescing keeps collapsed repeat hits as re-excite
+        // events (timing-exact); 0: it drops them.
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "note-on re-excite must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        noteOnReexcite_.store(cmd.param != 0u, std::memory_order_relaxed);
+        engineConfig_.noteOnReexcite = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "note-on re-excite: on (collapsed hits restart "
+                              "live voices at their exact frame)"
+                            : "note-on re-excite: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+    case RT::SetDecimation: {
+        // param = opt-in voice decimation: above the tier voice counts the
+        // quietest voices stop mixing (state still advances).  Read once per
+        // block by the renderer, so it lands at the next block boundary.
+        if (cmd.param > 1u || !renderScalar) {
+            strncpy_s(resultText, kText, "decimation must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        renderScalar->SetDecimationEnabled(cmd.param != 0u);
+        engineConfig_.decimation = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "decimation: on (quietest voices stop mixing above the tier counts)"
+                            : "decimation: off (every voice mixes)",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+    case RT::SetNoteMerge: {
+        // param = opt-in exact note-on merging. The compiler thread reads the
+        // flag per page, so it applies to the next compiled page; voices
+        // already merged keep playing and release normally.
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "note merge must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        noteMergeEnabled_.store(cmd.param != 0u, std::memory_order_relaxed);
+        engineConfig_.noteMerge = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "note merge: on (identical same-frame note-ons "
+                              "become one voice)"
+                            : "note merge: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
     case RT::SetBlockTiming: {
         // param = opt-in block-granular dispatch. Events still admitted in
         // order; only their intra-block offset is relinquished (fires at
@@ -645,6 +697,11 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
             as.compiledPagedCount.load(std::memory_order_relaxed);
         snap.scheduledBacklogCount =
             as.scheduledBacklogCount.load(std::memory_order_relaxed);
+        snap.effectiveVoices = as.effectiveVoices.load(std::memory_order_relaxed);
+        snap.effectiveVoicesPeak =
+            as.effectiveVoicesPeak.load(std::memory_order_relaxed);
+        snap.noteMergedLow = as.noteMergedLow.load(std::memory_order_relaxed);
+        snap.noteMergedHigh = as.noteMergedHigh.load(std::memory_order_relaxed);
 
         // Re-verify the settlement: a writer that started mid-copy means
         // this frame may be torn — reuse the last stable publish instead
@@ -789,6 +846,17 @@ void Driver::CopyTelemetryCensus(SVMS_TelemetryV2* out) const {
     r.callback_p95_percent = t.callbackP95Percent;
     r.callback_p99_percent = t.callbackP99Percent;
     r.callback_p999_percent = t.callbackP999Percent;
+    const uint64_t effective =
+        effectiveVoicesAtomic_.load(std::memory_order_relaxed);
+    const uint64_t effectivePeak =
+        effectiveVoicesPeakAtomic_.load(std::memory_order_relaxed);
+    const uint64_t merged = noteMergedAtomic_.load(std::memory_order_relaxed);
+    r.effective_voices = effective > UINT32_MAX
+        ? UINT32_MAX : static_cast<uint32_t>(effective);
+    r.effective_voices_peak = effectivePeak > UINT32_MAX
+        ? UINT32_MAX : static_cast<uint32_t>(effectivePeak);
+    r.note_merged_events_low = static_cast<uint32_t>(merged);
+    r.note_merged_events_high = static_cast<uint32_t>(merged >> 32u);
     *out = r;
 }
 
