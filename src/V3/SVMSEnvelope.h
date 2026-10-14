@@ -45,6 +45,25 @@ inline uint32_t MakeReleaseSamples(float releaseSeconds, uint32_t sampleRate) {
     return static_cast<uint32_t>(samples);
 }
 
+// Counted release tails (every live SF2 voice) retire by their sample count,
+// so the retire floor never governed them. When the floor is raised above the
+// default, shorten the count to the frame the tail decays from `peakGain` to
+// the floor (a conservative bound: a release that starts lower is cut later
+// than strictly needed, never above the floor). At or below the default
+// floor the count is returned untouched, so the default audio is unchanged.
+inline uint32_t FloorLimitedReleaseSamples(uint32_t samples, float releaseDecay,
+                                           float peakGain) {
+    const float floorGain = VoiceRetireThreshold();
+    if (samples <= 1u || samples == UINT32_MAX ||
+        floorGain <= kVoiceRetireThreshold * 1.0001f ||
+        !(releaseDecay > 0.0f && releaseDecay < 1.0f))
+        return samples;
+    if (!(peakGain > floorGain)) return 1u;
+    const float frames = ceilf(logf(floorGain / peakGain) / logf(releaseDecay));
+    if (!(frames < static_cast<float>(samples))) return samples;
+    return frames < 1.0f ? 1u : static_cast<uint32_t>(frames);
+}
+
 inline float MakeReleaseDecay(float releaseSeconds, uint32_t sampleRate) {
     const uint32_t releaseSamples = MakeReleaseSamples(releaseSeconds, sampleRate);
     if (releaseSamples <= 1u) return 0.0f;

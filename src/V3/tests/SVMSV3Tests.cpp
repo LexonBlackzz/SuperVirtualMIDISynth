@@ -4443,6 +4443,27 @@ void DispatchWholeVoiceLaunchEvent(const svms::RenderEvent* events,
 // whole-voice renderer must mute exactly the voices the frame-major oracle
 // leaves out (everything below the loudest activeCount/step by velocity),
 // keep their state advancing, and leave the audio untouched when disabled.
+// Retire floor on counted release tails: default floor leaves the count
+// alone; a raised floor cuts it to the frame the tail reaches the floor.
+void TestFloorLimitedReleaseSamples() {
+    const float decay = svms::MakeReleaseDecay(1.5f, 44100u);
+    const uint32_t samples = svms::MakeReleaseSamples(1.5f, 44100u);
+    const float saved = svms::VoiceRetireThreshold();
+    svms::g_voiceRetireThreshold.store(svms::kVoiceRetireThreshold);
+    Check(svms::FloorLimitedReleaseSamples(samples, decay, 1.0f) == samples,
+          "default floor changes the release count");
+    const float floorGain = std::pow(10.0f, -50.0f / 20.0f);
+    svms::g_voiceRetireThreshold.store(floorGain);
+    const uint32_t cut = svms::FloorLimitedReleaseSamples(samples, decay, 0.8f);
+    Check(cut < samples && cut > samples / 2u, "raised floor did not shorten the tail");
+    Check(0.8f * std::pow(decay, static_cast<float>(cut)) <= floorGain * 1.001f &&
+          0.8f * std::pow(decay, static_cast<float>(cut - 1u)) > floorGain * 0.999f,
+          "cut count is not the floor crossing frame");
+    Check(svms::FloorLimitedReleaseSamples(samples, decay, floorGain * 0.5f) == 1u,
+          "voice below the floor does not retire at once");
+    svms::g_voiceRetireThreshold.store(saved);
+}
+
 void TestWholeVoiceDecimation() {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 3u;
@@ -7316,6 +7337,7 @@ int main() {
     TestWholeVoiceLaunchDifferential();
     TestWholeVoiceRotationLaunchDifferential();
     TestWholeVoiceResetBarrierDifferential();
+    TestFloorLimitedReleaseSamples();
     TestWholeVoiceDecimation();
     TestWholeVoiceCCDifferential();
     TestWholeVoiceOpBudgetSplitDifferential();

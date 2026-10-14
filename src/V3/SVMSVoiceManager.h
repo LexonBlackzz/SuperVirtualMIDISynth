@@ -4498,7 +4498,9 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.decaySlope[handle] = setup.decaySlope;
     v.releaseDecay[handle] = setup.releaseDecay;
     v.releaseSamplesRemaining[handle] = setup.releaseSamples > 0u
-        ? setup.releaseSamples : UINT32_MAX;
+        ? FloorLimitedReleaseSamples(setup.releaseSamples, setup.releaseDecay,
+                                     setup.initialGain)
+        : UINT32_MAX;
     v.currentGain[handle] = 0.0f;
     if (knownSustained) {
         v.envelopeStage[handle] = 3u;
@@ -5324,7 +5326,8 @@ inline void VoiceManager::SetVoiceEnvelope(VoiceHandle handle, float initialGain
     // callers that provide only a multiplier.  Live SF2 voices always pass
     // the exact parsed segment length.
     v.releaseSamplesRemaining[handle] = releaseSamples > 0u
-        ? releaseSamples : UINT32_MAX;
+        ? FloorLimitedReleaseSamples(releaseSamples, releaseDecay, initialGain)
+        : UINT32_MAX;
     v.currentGain[handle]    = 0.0f;
 
     if (delaySamples > 0)

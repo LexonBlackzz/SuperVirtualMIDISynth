@@ -16,6 +16,9 @@
 #include <string>
 #include <vector>
 
+static float gBenchReleaseDecay = 0.9999999f;  // --release-ms
+static uint32_t gBenchReleaseSamples = 0u;      // counted tail (live SF2 semantics)
+
 namespace {
 
 enum class Workload {
@@ -232,6 +235,15 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.channelLimiter = true;
         } else if (std::strcmp(argv[i], "--breakdown") == 0) {
             options.breakdown = true;
+        } else if (std::strcmp(argv[i], "--release-ms") == 0 && i + 1 < argc) {
+            gBenchReleaseDecay = svms::MakeReleaseDecay(
+                static_cast<float>(std::atof(argv[i + 1])) / 1000.0f, 48000u);
+            gBenchReleaseSamples = svms::MakeReleaseSamples(
+                static_cast<float>(std::atof(argv[++i])) / 1000.0f, 48000u);
+        } else if (std::strcmp(argv[i], "--retire-db") == 0 && i + 1 < argc) {
+            svms::g_voiceRetireThreshold.store(
+                std::pow(10.0f, static_cast<float>(std::atof(argv[++i])) / 20.0f),
+                std::memory_order_relaxed);
         } else if (std::strcmp(argv[i], "--decimation") == 0) {
             options.decimation = true;
         } else if (std::strcmp(argv[i], "--vibrato-lfo") == 0) {
@@ -390,7 +402,8 @@ void PrepareSyntheticLaunchPlan(svms::VoiceConfiguration* setups,
         setup.attackGainStep = attackFrames > 0u
             ? setup.initialGain / static_cast<float>(attackFrames) : 0.0f;
         setup.sustainLevel = 0.7f;
-        setup.releaseDecay = 0.9999999f;
+        setup.releaseDecay = gBenchReleaseDecay;
+        setup.releaseSamples = gBenchReleaseSamples;
         setup.gainLeft = setup.gainRight = 0.001f;
         setup.presetIndex = 0u;
         setup.regionIndex = static_cast<uint16_t>(identity & 0xffffu);
@@ -493,7 +506,8 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
         setup.attackGainStep = attackFrames > 0u
             ? setup.initialGain / static_cast<float>(attackFrames) : 0.0f;
         setup.sustainLevel = 0.7f;
-        setup.releaseDecay = 0.9999999f;
+        setup.releaseDecay = gBenchReleaseDecay;
+        setup.releaseSamples = gBenchReleaseSamples;
         setup.gainLeft = 0.001f;
         setup.gainRight = 0.001f;
         voices.ConfigureVoice(handle, setup, channels.GetParams()[channel], true);
