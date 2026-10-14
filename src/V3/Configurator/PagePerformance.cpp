@@ -194,7 +194,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
             ImGui::EndGroup();
 
             ImGui::Dummy(ImVec2(0.0f, 8.0f));
-            if (ImGui::BeginTable("##synth_knobs", 3, ImGuiTableFlags_SizingStretchSame)) {
+            if (ImGui::BeginTable("##synth_knobs", 4, ImGuiTableFlags_SizingStretchSame)) {
                 ImGui::TableNextRow();
                 bool committed = false;
 
@@ -202,7 +202,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 float retireDb = 20.0f * std::log10(w.voiceRetireThreshold);
                 retireDb = (std::max)(-100.0f, (std::min)(-26.0f, retireDb));
                 if (PanelKnob("RETIRE FLOOR", &retireDb, -100.0f, -26.0f, -55.0f,
-                              "%.0f dB", 60.0f,
+                              "%.0f dB", 54.0f,
                               "Release-tail loudness where finished voices are freed. Higher (less negative) frees quiet tails sooner and cuts release cost on dense songs; lower keeps longer tails. Applies to newly started releases.",
                               &committed)) {
                     w.voiceRetireThreshold = std::pow(10.0f, retireDb / 20.0f);
@@ -217,7 +217,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 ImGui::TableNextColumn();
                 float cap = static_cast<float>(w.perKeyVoiceCap);
                 if (PanelKnob("PER-KEY CAP", &cap, 0.0f, 32.0f, 0.0f,
-                              cap < 0.5f ? "OFF" : "%.0f / key", 60.0f,
+                              cap < 0.5f ? "OFF" : "%.0f / key", 54.0f,
                               "Opt-in. Limits how many still-playing voices one (channel, note) may hold; a note-on at the cap replaces the oldest voice of that key. Off by default. Tames dense Black MIDI that hammers the same keys across channels.",
                               &committed)) {
                     w.perKeyVoiceCap = static_cast<uint32_t>(cap + 0.5f);
@@ -228,7 +228,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 ImGui::TableNextColumn();
                 float ghosts = static_cast<float>(w.ghostBudget);
                 if (PanelKnob("GHOST BUDGET", &ghosts, 0.0f, 4096.0f, 0.0f,
-                              ghosts < 0.5f ? "OFF" : "%.0f", 60.0f,
+                              ghosts < 0.5f ? "OFF" : "%.0f", 54.0f,
                               "Optional cap on displaced-voice ghosts rendered per block (off = unbounded). Lower values cut render cost in extreme steal storms at the price of clicks on voices past the cap.",
                               &committed)) {
                     w.ghostBudget = static_cast<uint32_t>(ghosts + 0.5f);
@@ -238,8 +238,8 @@ void DrawPerformancePage(ConfigDocument& doc) {
 
                 ImGui::TableNextColumn();
                 float cull = static_cast<float>(w.decimationCullBlocks);
-                if (PanelKnob("CULL MUTED TAILS", &cull, 0.0f, 120.0f, 0.0f,
-                              cull < 0.5f ? "OFF" : "%.0f blocks", 60.0f,
+                if (PanelKnob("CULL MUTED TAILS", &cull, 0.0f, 120.0f, 5.0f,
+                              cull < 0.5f ? "OFF" : "%.0f blocks", 54.0f,
                               "Opt-in; needs VOICE DECIMATION on. A releasing voice that has been muted for this many blocks in a row is retired instead of advancing silently forever. Frees pool slots and the per-block cost of the muted tails; audible only if the load later drops enough that such a tail would have been mixed again.",
                               &committed)) {
                     w.decimationCullBlocks = static_cast<uint32_t>(cull + 0.5f);

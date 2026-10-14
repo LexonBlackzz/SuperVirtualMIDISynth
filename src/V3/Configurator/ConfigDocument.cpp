@@ -188,7 +188,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.correctnessMode = true;
     d.decimation = false;
     d.decimationByLevel = true;
-    d.decimationCullBlocks = 0;
+    d.decimationCullBlocks = 5;
     d.diagnosticsEnabled = false;
     d.diagnosticsWindow = false;
     d.diagnosticsDebugOutput = false;
