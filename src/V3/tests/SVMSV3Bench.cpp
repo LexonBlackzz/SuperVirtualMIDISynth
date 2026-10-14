@@ -18,6 +18,7 @@
 
 static float gBenchReleaseDecay = 0.9999999f;  // --release-ms
 static bool gBenchVelocitySpread = false;      // --velocity-spread
+static int gBenchFilterCents = -1;             // --filter-cents: SF2 low-pass on every voice (-1 = none)
 static uint32_t gBenchReleaseSamples = 0u;      // counted tail (live SF2 semantics)
 
 namespace {
@@ -249,6 +250,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                 std::memory_order_relaxed);
         } else if (std::strcmp(argv[i], "--cull-muted") == 0 && i + 1 < argc) {
             options.cullMutedBlocks = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--filter-cents") == 0 && i + 1 < argc) {
+            gBenchFilterCents = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--velocity-spread") == 0) {
             gBenchVelocitySpread = true;
         } else if (std::strcmp(argv[i], "--decimation-by-level") == 0) {
@@ -373,6 +376,16 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
         voices.SetVoiceSoundFontIdentity(
             handle, 0u, static_cast<uint16_t>(i & 0xffffu));
         voices.RefreshMixGain(handle, channels.GetParams()[i & 15u]);
+        if (gBenchFilterCents >= 0) {
+            // Live SF2 voices carry the region's low-pass (even wide open).
+            const svms::PreparedVoiceFilter f = svms::PrepareVoiceLowPass(
+                static_cast<uint8_t>(svms::FilterType::LowPass2Pole),
+                static_cast<int16_t>(gBenchFilterCents), 0, 44100u);
+            voices.v.filterA0[handle] = f.a0;
+            voices.v.filterB1[handle] = f.b1;
+            voices.v.filterB2[handle] = f.b2;
+            voices.v.filterEnabled[handle] = f.enabled;
+        }
         if (gBenchVelocitySpread)  // scattered ranking keys, like real material
             voices.v.velocity[handle] =
                 static_cast<uint8_t>(1u + (i & 15u) * 8u);
