@@ -4636,6 +4636,62 @@ void TestWholeVoiceDecimationByLevel() {
           "ranking by level keeps the louder voices than ranking by velocity");
 }
 
+// Muted-tail cull: a releasing pool above the (shrunk) decimation tier keeps
+// only its loudest 1/step mixing; with the cull on, the muted rest is retired
+// after the configured run of muted blocks, with it off nothing is.
+void TestMutedTailCull() {
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kPool = 40u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.35f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    for (uint32_t cull : {0u, 2u}) {
+        svms::ChannelCache channels;
+        channels.SetMasterVolume(1.0f);
+        channels.RebuildCache(cfg, 44100.0f);
+        auto voices = std::make_unique<svms::VoiceManager>();
+        ConfigureWholeVoiceSeedPool(*voices, channels, kPool, kPool, false);
+        for (uint32_t h = 0; h < kPool; ++h) {
+            voices->v.velocity[h] = static_cast<uint8_t>(127u - h);
+            voices->StartRelease(static_cast<svms::VoiceHandle>(h));
+        }
+        svms::RenderScalar r;
+        Check(r.ReserveVoiceCapacity(kPool) &&
+                  r.ConfigureRenderThreads(2u, kFrames),
+              "cull test starts its renderer");
+        r.SetDecimationTiersForTest(16u, 32u, 48u, 64u);
+        r.SetDecimationEnabled(true);
+        r.SetMutedTailCullBlocks(cull);
+        std::vector<float> L(kFrames, 0.0f), R(kFrames, 0.0f);
+        uint32_t activeAfter[6] = {};
+        for (uint32_t block = 0; block < 6u; ++block) {
+            std::fill(L.begin(), L.end(), 0.0f);
+            std::fill(R.begin(), R.end(), 0.0f);
+            r.RenderBlock(*voices, channels, samples.data(), sampleCount,
+                          L.data(), R.data(), kFrames, cfg, nullptr, 0u, true,
+                          10000u + block * kFrames);
+            activeAfter[block] = voices->activeCount_;
+        }
+        std::fprintf(stderr, "[CULL] cull=%u active after blocks: %u %u %u %u %u %u\n",
+                     cull, activeAfter[0], activeAfter[1], activeAfter[2],
+                     activeAfter[3], activeAfter[4], activeAfter[5]);
+        if (cull == 0u) {
+            Check(activeAfter[5] == kPool, "no cull: muted tails stay in the pool");
+        } else {
+            Check(activeAfter[0] == kPool && activeAfter[1] == kPool,
+                  "cull waits for the muted run");
+            Check(activeAfter[5] == kPool / 4u,
+                  "cull retires the muted tails and keeps the loudest 1/step");
+        }
+    }
+}
+
 void TestWholeVoiceResetBarrierDifferential() {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 8u;
@@ -7394,6 +7450,7 @@ int main() {
     TestFloorLimitedReleaseSamples();
     TestWholeVoiceDecimation();
     TestWholeVoiceDecimationByLevel();
+    TestMutedTailCull();
     TestWholeVoiceCCDifferential();
     TestWholeVoiceOpBudgetSplitDifferential();
     TestWholeVoiceVibratoDifferential();

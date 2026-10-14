@@ -441,18 +441,23 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         // param = opt-in voice decimation: above the tier voice counts the
         // quietest voices stop mixing (state still advances).  Read once per
         // block by the renderer, so it lands at the next block boundary.
-        // param: 0 = off, 1 = on ranked by velocity, 2 = on ranked by level.
-        if (cmd.param > 2u || !renderScalar) {
-            strncpy_s(resultText, kText, "decimation must be 0, 1 or 2",
+        // param low byte: 0 = off, 1 = on ranked by velocity, 2 = on ranked by
+        // level; bits 8..15 = muted-tail cull blocks (0 = off).
+        if ((cmd.param & 0xFFu) > 2u || (cmd.param >> 16) != 0u ||
+            !renderScalar) {
+            strncpy_s(resultText, kText, "decimation must be 0, 1 or 2 (+ cull blocks << 8)",
                       _TRUNCATE);
             return svms::RLResult::InvalidArgument;
         }
-        renderScalar->SetDecimationEnabled(cmd.param != 0u);
-        renderScalar->SetDecimationByLevel(cmd.param == 2u);
-        engineConfig_.decimation = cmd.param != 0u;
-        engineConfig_.decimationByLevel = cmd.param == 2u;
+        const uint32_t decMode = cmd.param & 0xFFu;
+        renderScalar->SetDecimationEnabled(decMode != 0u);
+        renderScalar->SetDecimationByLevel(decMode == 2u);
+        renderScalar->SetMutedTailCullBlocks(cmd.param >> 8);
+        engineConfig_.decimation = decMode != 0u;
+        engineConfig_.decimationByLevel = decMode == 2u;
+        engineConfig_.decimationCullBlocks = cmd.param >> 8;
         strncpy_s(resultText, kText,
-                  cmd.param ? (cmd.param == 2u
+                  decMode ? (decMode == 2u
                                    ? "decimation: on, ranked by audibility"
                                    : "decimation: on (quietest voices stop mixing above the tier counts)")
                             : "decimation: off (every voice mixes)",

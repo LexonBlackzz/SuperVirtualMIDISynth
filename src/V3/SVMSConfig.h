@@ -149,6 +149,9 @@ struct EngineConfig {
     // With decimation on: rank by audibility (envelope level x output gain)
     // instead of velocity. Opt-in listening test, default off.
     bool decimationByLevel;
+    // With decimation on: retire releasing voices muted this many blocks in
+    // a row (0 = off). Opt-in listening test.
+    uint32_t decimationCullBlocks;
     bool diagnosticsEnabled;
     bool diagnosticsWindow;
     bool diagnosticsDebugOutput;

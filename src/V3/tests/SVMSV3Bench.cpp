@@ -102,6 +102,7 @@ struct Options {
     bool vibratoLfo = false;
     bool decimation = false;
     bool decimationByLevel = false;
+    uint32_t cullMutedBlocks = 0u;
     uint32_t rotationMode = 0u;  // 0 coherent, 1 analytic, 2 sweep, 3 diffuse, 4 random
     bool transactionalLaunch = true;
     bool copiedLaunchPlan = false;
@@ -246,6 +247,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             svms::g_voiceRetireThreshold.store(
                 std::pow(10.0f, static_cast<float>(std::atof(argv[++i])) / 20.0f),
                 std::memory_order_relaxed);
+        } else if (std::strcmp(argv[i], "--cull-muted") == 0 && i + 1 < argc) {
+            options.cullMutedBlocks = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--velocity-spread") == 0) {
             gBenchVelocitySpread = true;
         } else if (std::strcmp(argv[i], "--decimation-by-level") == 0) {
@@ -785,6 +788,7 @@ int main(int argc, char** argv) {
     }
     renderer->SetDecimationEnabled(options.decimation);
     renderer->SetDecimationByLevel(options.decimationByLevel);
+    renderer->SetMutedTailCullBlocks(options.cullMutedBlocks);
     gBenchVibratoLfo = options.vibratoLfo;
     if (options.vibratoLfo) {
         for (uint32_t a = 0; a < voices->activeCount_; ++a) {

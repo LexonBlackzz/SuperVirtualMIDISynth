@@ -807,6 +807,12 @@ public:
     void SetDecimationByLevel(bool enabled) {
         decimationByLevel_.store(enabled, std::memory_order_relaxed);
     }
+    // Opt-in (needs decimation on): a releasing voice that has been muted for
+    // this many consecutive blocks is retired instead of advancing forever.
+    // 0 = off.
+    void SetMutedTailCullBlocks(uint32_t blocks) {
+        mutedCullBlocks_.store(blocks, std::memory_order_relaxed);
+    }
     bool GetDecimationEnabled() const {
         return decimationEnabled_.load(std::memory_order_relaxed);
     }
@@ -911,6 +917,10 @@ private:
     uint64_t pathBlocks_[3] = {};
     std::atomic<bool> decimationEnabled_{false};
     std::atomic<bool> decimationByLevel_{false};
+    std::atomic<uint32_t> mutedCullBlocks_{0u};
+    uint32_t wvCullBlocks_ = 0u;         // mutedCullBlocks_ latched per block
+    std::vector<uint32_t> wvMutedSince_; // per handle: first block of the muted run
+    std::vector<uint32_t> wvMutedLast_;  // per handle: last block it was muted
     uint32_t decimationTiers_[4] = {kDecimationTier1, kDecimationTier2,
                                     kDecimationTier3, kDecimationTier4};
     bool wvDecimating_ = false;          // this block has muted rows
@@ -3422,6 +3432,30 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     (renderer->wvExciteHead_ == nullptr ||
                      handle >= renderer->wvExciteCapacity_ ||
                      renderer->wvExciteHead_[handle] == UINT32_MAX)) {
+                    if (renderer->wvCullBlocks_ != 0u &&
+                        v.state[handle] ==
+                            static_cast<uint8_t>(VoiceState::Releasing)) {
+                        // Muted-tail cull: a run of consecutive muted blocks
+                        // (block numbers start at 1, so 0 = never muted).
+                        const uint32_t blk = renderer->wholeVoiceBlocks_;
+                        const uint32_t lastMuted = renderer->wvMutedLast_[handle];
+                        if (lastMuted == 0u || lastMuted + 1u != blk)
+                            renderer->wvMutedSince_[handle] = blk;
+                        renderer->wvMutedLast_[handle] = blk;
+                        if (blk - renderer->wvMutedSince_[handle] >=
+                            renderer->wvCullBlocks_) {
+                            // Retire at frame 0 through the normal list; the
+                            // row was never going to mix again this block.
+                            renderer->wvJobRetirements_[
+                                static_cast<size_t>(jobIndex) *
+                                    renderer->scratchCapacity_ +
+                                renderer->wvJobRetireCounts_[
+                                    jobIndex * kWvRetireCountStride]++] = {
+                                handle, 0u,
+                                ctx->voices->activePosition_[handle]};
+                            continue;
+                        }
+                    }
                     renderer->RenderWholeVoiceSegment(
                         v, ctx->voices, handle, ctx->sampleData,
                         ctx->sampleDataFrames, mix.outputLeft,
@@ -3926,6 +3960,8 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     // their state advancing (scalar span with nothing mixed), so they retire
     // and resume exactly as they would unmuted.
     wvDecimating_ = false;
+    wvCullBlocks_ = mutedCullBlocks_.load(std::memory_order_relaxed);
+    if (wvMutedSince_.size() < wvMuted_.size()) wvCullBlocks_ = 0u;
     if (wvMutedDirty_) {
         std::fill(wvMuted_.begin(), wvMuted_.end(), uint8_t(0));
         wvMutedDirty_ = false;
@@ -4294,6 +4330,8 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     wvGhostNoTail_ = freshGhostNoTail;
     wvHandleCapacity_ = handleCapacity;
     wvMuted_.assign(handleCapacity, uint8_t(0));
+    wvMutedSince_.assign(handleCapacity, 0u);
+    wvMutedLast_.assign(handleCapacity, 0u);
     if (wvGhostCapacity_ < cap) {
         VoiceSoA grown;
         if (!grown.Reserve(cap)) return false;

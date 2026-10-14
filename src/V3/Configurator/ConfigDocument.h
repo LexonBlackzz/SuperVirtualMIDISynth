@@ -102,6 +102,7 @@ struct ConfigValues {
     bool correctnessMode = true;
     bool decimation = false;
     bool decimationByLevel = true;
+    uint32_t decimationCullBlocks = 0;
 
     bool diagnosticsEnabled = false;
     bool diagnosticsWindow = false;

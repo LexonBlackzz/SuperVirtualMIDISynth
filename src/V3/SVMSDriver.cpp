@@ -570,6 +570,7 @@ bool Driver::Initialize() {
     renderScalar->SetGhostBudget(cfg.ghostBudget);
     renderScalar->SetDecimationEnabled(cfg.decimation);
     renderScalar->SetDecimationByLevel(cfg.decimationByLevel);
+    renderScalar->SetMutedTailCullBlocks(cfg.decimationCullBlocks);
     // Honor the configured render backend. The constructor already selects
     // the best set (Auto behavior); an explicit non-Auto request overrides
     // it, falling back to the best available set when unsupported.

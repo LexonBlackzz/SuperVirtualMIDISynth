@@ -92,6 +92,13 @@ void BudgetMetric(const char* label, const char* format, ...) {
 
 } // namespace
 
+// SetDecimation param: mode in the low byte (0 off, 1 velocity, 2 level),
+// muted-tail cull blocks in bits 8..15.
+uint32_t DecimationParam(const ConfigValues& w) {
+    const uint32_t mode = w.decimation ? (w.decimationByLevel ? 2u : 1u) : 0u;
+    return mode | ((w.decimationCullBlocks & 0xFFu) << 8);
+}
+
 void DrawPerformancePage(ConfigDocument& doc) {
     auto& w = doc.Working();
     const auto& lc = GetLiveLinkContext();
@@ -273,15 +280,26 @@ void DrawPerformancePage(ConfigDocument& doc) {
             if (PanelLever("VOICE DECIMATION", &w.decimation,
                            "OFF by default: every voice mixes. When enabled, above 10k / 25k / 50k / 150k active voices the quietest voices (by velocity, ranked each block) stop mixing for the block, keeping only the loudest 1/2, 1/4, 1/8 or 1/16. They still advance their phase and envelope, and voices launched in the block always sound. Big CPU saving on extreme Black MIDI; it audibly thins quiet layers.")) {
                 doc.MarkDirty();
-                send(svms::RLCommandType::SetDecimation,
-                     w.decimation ? (w.decimationByLevel ? 2u : 1u) : 0u);
+                send(svms::RLCommandType::SetDecimation, DecimationParam(w));
             }
             if (PanelLever("DECIMATE BY LEVEL", &w.decimationByLevel,
                            "Listening test, OFF by default. With voice decimation on, mute the voices that are actually quietest (envelope level x gain, so fading release tails go first) instead of the lowest velocity. A loud note that has been ringing out is no longer protected by its velocity, and a soft fresh note is no longer sacrificed.")) {
                 doc.MarkDirty();
                 if (w.decimation)
-                    send(svms::RLCommandType::SetDecimation,
-                         w.decimationByLevel ? 2u : 1u);
+                    send(svms::RLCommandType::SetDecimation, DecimationParam(w));
+            }
+            {
+                bool cullCommitted = false;
+                float cull = static_cast<float>(w.decimationCullBlocks);
+                if (PanelKnob("CULL MUTED TAILS", &cull, 0.0f, 120.0f, 0.0f,
+                              cull < 0.5f ? "OFF" : "%.0f blocks", 60.0f,
+                              "Listening test, OFF by default. With voice decimation on, a releasing voice that has been muted for this many blocks in a row is retired instead of advancing silently forever. Frees pool slots and the per-block cost of the muted tails; audible only if the load later drops enough that such a tail would have been mixed again.",
+                              &cullCommitted)) {
+                    w.decimationCullBlocks = static_cast<uint32_t>(cull + 0.5f);
+                    doc.MarkDirty();
+                }
+                if (cullCommitted && w.decimation)
+                    send(svms::RLCommandType::SetDecimation, DecimationParam(w));
             }
             ImGui::Spacing();
             bool correctness = w.correctnessMode;
