@@ -4989,6 +4989,18 @@ void RunWholeVoiceLaunchDifferential(uint32_t rotationMode) {
                               static_cast<uint32_t>(events.size()), true,
                               blockStartFrame);
 
+            {
+                // The releasing counter must equal the number of rows in the
+                // Releasing state (a voice released and retired inside one
+                // block once underflowed it).
+                uint32_t releasingRows = 0u;
+                for (uint32_t i = 0u; i < wholeVoices->activeCount_; ++i)
+                    releasingRows += wholeVoices->v.state[
+                        wholeVoices->activeList_[i]] ==
+                        static_cast<uint8_t>(svms::VoiceState::Releasing);
+                Check(wholeVoices->GetReleasingCount() == releasingRows,
+                      "releasing-voice counter matches the Releasing rows");
+            }
             float blockDiff = 0.0f;
             for (uint32_t frame = 0; frame < kFrames; ++frame) {
                 blockDiff = (std::max)(blockDiff,

@@ -4136,7 +4136,16 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         });
     for (uint32_t i = 0u; i < retireTotal; ++i) {
         voices.SetCurrentFrame(blockStartFrame + retirements_[i].frameOffset);
-        voices.RetireVoice(static_cast<VoiceHandle>(retirements_[i].handle));
+        const VoiceHandle retiring =
+            static_cast<VoiceHandle>(retirements_[i].handle);
+        // A voice released and retired inside this block flipped to
+        // Releasing in the worker, but its releasing-counter increment is
+        // still pending in the deferred-release list.  Finalize it first so
+        // RetireVoice's decrement balances (else the counter underflows).
+        const uint32_t opSlot = wvOpIndex_[retiring];
+        if (opSlot < wvOpCount_ && wvOpHandles_[opSlot] == retiring)
+            voices.FinalizeDeferredRelease(retiring);
+        voices.RetireVoice(retiring);
     }
 
 #if defined(_MSC_VER)

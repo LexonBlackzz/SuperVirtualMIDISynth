@@ -235,6 +235,18 @@ void DrawPerformancePage(ConfigDocument& doc) {
                     doc.MarkDirty();
                 }
                 if (committed) send(svms::RLCommandType::SetGhostBudget, w.ghostBudget);
+
+                ImGui::TableNextColumn();
+                float cull = static_cast<float>(w.decimationCullBlocks);
+                if (PanelKnob("CULL MUTED TAILS", &cull, 0.0f, 120.0f, 0.0f,
+                              cull < 0.5f ? "OFF" : "%.0f blocks", 60.0f,
+                              "Opt-in; needs VOICE DECIMATION on. A releasing voice that has been muted for this many blocks in a row is retired instead of advancing silently forever. Frees pool slots and the per-block cost of the muted tails; audible only if the load later drops enough that such a tail would have been mixed again.",
+                              &committed)) {
+                    w.decimationCullBlocks = static_cast<uint32_t>(cull + 0.5f);
+                    doc.MarkDirty();
+                }
+                if (committed && w.decimation)
+                    send(svms::RLCommandType::SetDecimation, DecimationParam(w));
                 ImGui::EndTable();
             }
         }
@@ -286,19 +298,6 @@ void DrawPerformancePage(ConfigDocument& doc) {
                            "Listening test, OFF by default. With voice decimation on, mute the voices that are actually quietest (envelope level x gain, so fading release tails go first) instead of the lowest velocity. A loud note that has been ringing out is no longer protected by its velocity, and a soft fresh note is no longer sacrificed.")) {
                 doc.MarkDirty();
                 if (w.decimation)
-                    send(svms::RLCommandType::SetDecimation, DecimationParam(w));
-            }
-            {
-                bool cullCommitted = false;
-                float cull = static_cast<float>(w.decimationCullBlocks);
-                if (PanelKnob("CULL MUTED TAILS", &cull, 0.0f, 120.0f, 0.0f,
-                              cull < 0.5f ? "OFF" : "%.0f blocks", 60.0f,
-                              "Listening test, OFF by default. With voice decimation on, a releasing voice that has been muted for this many blocks in a row is retired instead of advancing silently forever. Frees pool slots and the per-block cost of the muted tails; audible only if the load later drops enough that such a tail would have been mixed again.",
-                              &cullCommitted)) {
-                    w.decimationCullBlocks = static_cast<uint32_t>(cull + 0.5f);
-                    doc.MarkDirty();
-                }
-                if (cullCommitted && w.decimation)
                     send(svms::RLCommandType::SetDecimation, DecimationParam(w));
             }
             ImGui::Spacing();
