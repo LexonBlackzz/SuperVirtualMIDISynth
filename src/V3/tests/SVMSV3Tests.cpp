@@ -4582,6 +4582,60 @@ void TestWholeVoiceDecimation() {
     }
 }
 
+// Decimation ranked by level: velocity falls with the handle while the
+// envelope level rises with it, so the two rankings keep opposite halves of
+// the pool.  Keeping the loud-by-level voices must leave more energy than
+// keeping the high-velocity (quiet) ones.
+void TestWholeVoiceDecimationByLevel() {
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kPool = 40u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.35f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    double energy[3] = {0.0, 0.0, 0.0};  // plain, by velocity, by level
+    for (int mode = 0; mode < 3; ++mode) {
+        svms::ChannelCache channels;
+        channels.SetMasterVolume(1.0f);
+        channels.RebuildCache(cfg, 44100.0f);
+        auto voices = std::make_unique<svms::VoiceManager>();
+        ConfigureWholeVoiceSeedPool(*voices, channels, kPool, kPool, false);
+        for (uint32_t h = 0; h < kPool; ++h) {
+            voices->v.velocity[h] = static_cast<uint8_t>(127u - h);
+            voices->v.stealOutputGain[h] = 1.0f;
+            voices->v.currentGain[h] = 0.02f + 0.02f * static_cast<float>(h);
+            voices->v.renderGainL[h] =
+                voices->v.currentGain[h] * voices->v.mixGainL[h];
+            voices->v.renderGainR[h] =
+                voices->v.currentGain[h] * voices->v.mixGainR[h];
+        }
+        svms::RenderScalar r;
+        Check(r.ReserveVoiceCapacity(kPool) &&
+                  r.ConfigureRenderThreads(2u, kFrames),
+              "by-level decimation test starts its renderer");
+        r.SetDecimationTiersForTest(16u, 32u, 48u, 64u);
+        r.SetDecimationEnabled(mode != 0);
+        r.SetDecimationByLevel(mode == 2);
+        std::vector<float> L(kFrames, 0.0f), R(kFrames, 0.0f);
+        r.RenderBlock(*voices, channels, samples.data(), sampleCount,
+                      L.data(), R.data(), kFrames, cfg, nullptr, 0u, true,
+                      10000u);
+        for (uint32_t f = 0; f < kFrames; ++f)
+            energy[mode] += double(L[f]) * L[f] + double(R[f]) * R[f];
+    }
+    std::fprintf(stderr, "[DECIM-LEVEL] plain=%g velocity=%g level=%g\n",
+                 energy[0], energy[1], energy[2]);
+    Check(energy[1] < energy[0] && energy[2] < energy[0],
+          "decimation by level mutes voices");
+    Check(energy[2] > 2.0 * energy[1],
+          "ranking by level keeps the louder voices than ranking by velocity");
+}
+
 void TestWholeVoiceResetBarrierDifferential() {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 8u;
@@ -7339,6 +7393,7 @@ int main() {
     TestWholeVoiceResetBarrierDifferential();
     TestFloorLimitedReleaseSamples();
     TestWholeVoiceDecimation();
+    TestWholeVoiceDecimationByLevel();
     TestWholeVoiceCCDifferential();
     TestWholeVoiceOpBudgetSplitDifferential();
     TestWholeVoiceVibratoDifferential();

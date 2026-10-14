@@ -273,7 +273,15 @@ void DrawPerformancePage(ConfigDocument& doc) {
             if (PanelLever("VOICE DECIMATION", &w.decimation,
                            "OFF by default: every voice mixes. When enabled, above 10k / 25k / 50k / 150k active voices the quietest voices (by velocity, ranked each block) stop mixing for the block, keeping only the loudest 1/2, 1/4, 1/8 or 1/16. They still advance their phase and envelope, and voices launched in the block always sound. Big CPU saving on extreme Black MIDI; it audibly thins quiet layers.")) {
                 doc.MarkDirty();
-                send(svms::RLCommandType::SetDecimation, w.decimation ? 1u : 0u);
+                send(svms::RLCommandType::SetDecimation,
+                     w.decimation ? (w.decimationByLevel ? 2u : 1u) : 0u);
+            }
+            if (PanelLever("DECIMATE BY LEVEL", &w.decimationByLevel,
+                           "Listening test, OFF by default. With voice decimation on, mute the voices that are actually quietest (envelope level x gain, so fading release tails go first) instead of the lowest velocity. A loud note that has been ringing out is no longer protected by its velocity, and a soft fresh note is no longer sacrificed.")) {
+                doc.MarkDirty();
+                if (w.decimation)
+                    send(svms::RLCommandType::SetDecimation,
+                         w.decimationByLevel ? 2u : 1u);
             }
             ImGui::Spacing();
             bool correctness = w.correctnessMode;

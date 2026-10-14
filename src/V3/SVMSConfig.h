@@ -146,6 +146,9 @@ struct EngineConfig {
     // Voice decimation (opt-in, restart-applied): above the tier voice
     // counts the quietest voices stop mixing (state still advances).
     bool decimation;
+    // With decimation on: rank by audibility (envelope level x output gain)
+    // instead of velocity. Opt-in listening test, default off.
+    bool decimationByLevel;
     bool diagnosticsEnabled;
     bool diagnosticsWindow;
     bool diagnosticsDebugOutput;

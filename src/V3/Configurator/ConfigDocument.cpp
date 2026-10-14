@@ -187,6 +187,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.overflowMode = 1;
     d.correctnessMode = true;
     d.decimation = false;
+    d.decimationByLevel = false;
     d.diagnosticsEnabled = false;
     d.diagnosticsWindow = false;
     d.diagnosticsDebugOutput = false;
@@ -301,6 +302,7 @@ void ConfigDocument::FromJson(const json& root) {
     if (auto it = root.find("quality"); it != root.end() && it->is_object()) {
         ReadBool(*it, "correctness_mode", working_.correctnessMode);
         ReadBool(*it, "decimation", working_.decimation);
+        ReadBool(*it, "decimation_by_level", working_.decimationByLevel);
     }
     if (auto it = root.find("limiter"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.limiterEnabled);
@@ -417,6 +419,7 @@ nlohmann::json ConfigDocument::ToJson() const {
 
     root["quality"]["correctness_mode"] = working_.correctnessMode;
     root["quality"]["decimation"] = working_.decimation;
+    root["quality"]["decimation_by_level"] = working_.decimationByLevel;
     root["quality"]["interpolation"] = "linear";
     root["quality"]["pan_law"] = "constant-power";
 
@@ -678,6 +681,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode
         && a.decimation == b.decimation
+        && a.decimationByLevel == b.decimationByLevel
         && a.diagnosticsEnabled == b.diagnosticsEnabled
         && a.diagnosticsWindow == b.diagnosticsWindow
         && a.diagnosticsDebugOutput == b.diagnosticsDebugOutput

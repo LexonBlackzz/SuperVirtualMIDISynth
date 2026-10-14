@@ -802,6 +802,11 @@ public:
     void SetDecimationEnabled(bool enabled) {
         decimationEnabled_.store(enabled, std::memory_order_relaxed);
     }
+    // Opt-in: rank by audibility (envelope level x output gain, the steal
+    // score's level term) instead of velocity.
+    void SetDecimationByLevel(bool enabled) {
+        decimationByLevel_.store(enabled, std::memory_order_relaxed);
+    }
     bool GetDecimationEnabled() const {
         return decimationEnabled_.load(std::memory_order_relaxed);
     }
@@ -905,11 +910,13 @@ private:
     uint64_t refusalCounts_[kRefuseReasonCount] = {};
     uint64_t pathBlocks_[3] = {};
     std::atomic<bool> decimationEnabled_{false};
+    std::atomic<bool> decimationByLevel_{false};
     uint32_t decimationTiers_[4] = {kDecimationTier1, kDecimationTier2,
                                     kDecimationTier3, kDecimationTier4};
     bool wvDecimating_ = false;          // this block has muted rows
     bool wvMutedDirty_ = false;          // wvMuted_ holds stale flags
     std::vector<uint8_t> wvMuted_;       // per handle: 1 = skip mixing
+    std::vector<uint8_t> wvDecimKey_;     // by-level rank key per active slot
     std::vector<uint32_t> wvDecimRank_;  // scratch for the velocity ranking
     // The event that made PlanWholeVoiceBlock refuse the last block: type
     // value + data1 (controller number for CC events). Diagnostic only; the
@@ -3934,9 +3941,58 @@ inline void RenderScalar::RenderWholeVoiceBlock(
             // pass; only the voices sitting exactly on it need an order. The
             // muted set is identical to a full nth_element ranking by
             // (velocity desc, handle asc), at about a quarter of the cost.
+            // Rank key, 0..255, larger = louder.  Velocity by default; with
+            // by-level ranking, the float bits of |envelope level| x output
+            // gain (monotone for positive floats) at 1/8-octave resolution
+            // over 2^-32..1.  Pre-decay voices rank by their target gain, as
+            // the steal score does.
+            const bool byLevel =
+                decimationByLevel_.load(std::memory_order_relaxed);
+            auto rankKey = [&](uint32_t handle) -> uint32_t {
+                if (!byLevel) return rows.velocity[handle];
+                const uint8_t stage = rows.envelopeStage[handle];
+                const bool preDecay =
+                    rows.state[handle] ==
+                        static_cast<uint8_t>(VoiceState::Active) &&
+                    (stage == 4u || stage == 0u || stage == 1u);
+                const float level =
+                    std::fabs(preDecay ? rows.targetGain[handle]
+                                       : rows.currentGain[handle]) *
+                    rows.stealOutputGain[handle];
+                uint32_t bits;
+                std::memcpy(&bits, &level, sizeof(bits));
+                const uint32_t key = bits >> 20;
+                return key <= 760u ? 0u : (key >= 1015u ? 255u : key - 760u);
+            };
             uint32_t histogram[256] = {};
-            for (uint32_t i = 0u; i < activeCount; ++i)
-                ++histogram[rows.velocity[wvSliceHandles_[i]]];
+            if (byLevel) {
+                // The key reads five scattered SoA arrays per voice: compute
+                // it once (prefetching ahead) and replay it sequentially.
+                wvDecimKey_.resize(activeCount);
+                for (uint32_t i = 0u; i < activeCount; ++i) {
+#if defined(SVMS_VM_HAS_PREFETCH)
+                    if (i + 16u < activeCount) {
+                        const uint32_t ahead = wvSliceHandles_[i + 16u];
+                        _mm_prefetch(reinterpret_cast<const char*>(
+                                         &rows.currentGain[ahead]), _MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char*>(
+                                         &rows.stealOutputGain[ahead]), _MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char*>(
+                                         &rows.targetGain[ahead]), _MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char*>(
+                                         &rows.envelopeStage[ahead]), _MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char*>(
+                                         &rows.state[ahead]), _MM_HINT_T0);
+                    }
+#endif
+                    wvDecimKey_[i] =
+                        static_cast<uint8_t>(rankKey(wvSliceHandles_[i]));
+                    ++histogram[wvDecimKey_[i]];
+                }
+            } else {
+                for (uint32_t i = 0u; i < activeCount; ++i)
+                    ++histogram[rows.velocity[wvSliceHandles_[i]]];
+            }
             uint32_t above = 0u;
             uint32_t threshold = 255u;
             for (;; --threshold) {
@@ -3946,13 +4002,32 @@ inline void RenderScalar::RenderWholeVoiceBlock(
             }
             const uint32_t tiesKept = keep - above;
             wvDecimRank_.clear();
+            // Even spread of the kept ties (Bresenham over the tie sequence):
+            // the render jobs split the active list into contiguous slices,
+            // so keeping the first N would pile all the work onto one job.
+            const uint32_t levelTieTotal = histogram[threshold];
+            uint64_t levelTieSeen = 0u;
             for (uint32_t i = 0u; i < activeCount; ++i) {
                 const uint32_t handle = wvSliceHandles_[i];
-                const uint32_t velocity = rows.velocity[handle];
+                const uint32_t velocity =
+                    byLevel ? wvDecimKey_[i] : rows.velocity[handle];
                 if (velocity < threshold)
                     wvMuted_[handle] = 1u;
-                else if (velocity == threshold)
-                    wvDecimRank_.push_back(handle);
+                else if (velocity == threshold) {
+                    // Level bins are coarse and real pools tie heavily, so
+                    // by-level ranking picks its kept ties by an even,
+                    // deterministic spread over the list (O(n)) instead of
+                    // ordering the tie bin by handle.
+                    if (!byLevel) {
+                        wvDecimRank_.push_back(handle);
+                    } else {
+                        const uint64_t before =
+                            levelTieSeen * tiesKept / levelTieTotal;
+                        ++levelTieSeen;
+                        if (levelTieSeen * tiesKept / levelTieTotal == before)
+                            wvMuted_[handle] = 1u;
+                    }
+                }
             }
             if (tiesKept < wvDecimRank_.size()) {
                 std::nth_element(wvDecimRank_.begin(),

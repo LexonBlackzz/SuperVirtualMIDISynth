@@ -441,15 +441,20 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         // param = opt-in voice decimation: above the tier voice counts the
         // quietest voices stop mixing (state still advances).  Read once per
         // block by the renderer, so it lands at the next block boundary.
-        if (cmd.param > 1u || !renderScalar) {
-            strncpy_s(resultText, kText, "decimation must be 0 or 1",
+        // param: 0 = off, 1 = on ranked by velocity, 2 = on ranked by level.
+        if (cmd.param > 2u || !renderScalar) {
+            strncpy_s(resultText, kText, "decimation must be 0, 1 or 2",
                       _TRUNCATE);
             return svms::RLResult::InvalidArgument;
         }
         renderScalar->SetDecimationEnabled(cmd.param != 0u);
+        renderScalar->SetDecimationByLevel(cmd.param == 2u);
         engineConfig_.decimation = cmd.param != 0u;
+        engineConfig_.decimationByLevel = cmd.param == 2u;
         strncpy_s(resultText, kText,
-                  cmd.param ? "decimation: on (quietest voices stop mixing above the tier counts)"
+                  cmd.param ? (cmd.param == 2u
+                                   ? "decimation: on, ranked by audibility"
+                                   : "decimation: on (quietest voices stop mixing above the tier counts)")
                             : "decimation: off (every voice mixes)",
                   _TRUNCATE);
         return svms::RLResult::Ok;

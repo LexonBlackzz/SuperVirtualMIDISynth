@@ -365,6 +365,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"quality", {
             {"correctness_mode", cfg.correctnessMode},
             {"decimation", cfg.decimation},
+            {"decimation_by_level", cfg.decimationByLevel},
             {"interpolation", "linear"},
             {"pan_law", "constant-power"}
         }},
@@ -743,6 +744,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "quality.correctness_mode");
         if (!ReadBool(*it, "decimation", cfg.decimation))
             AppendWarning(cfg.configWarning, "quality.decimation");
+        if (!ReadBool(*it, "decimation_by_level", cfg.decimationByLevel))
+            AppendWarning(cfg.configWarning, "quality.decimation_by_level");
         auto interpolation = it->find("interpolation");
         if (interpolation != it->end()) {
             if (interpolation->is_string() && interpolation->get<std::string>() == "nearest")
@@ -1011,6 +1014,7 @@ EngineConfig EngineConfig::Default() {
     cfg.stealPolicy = 0;
     cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
     cfg.decimation = false;  // opt-in: every voice mixes by default
+    cfg.decimationByLevel = false;
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.noteMerge = false;       // opt-in: every note-on launches its own voice

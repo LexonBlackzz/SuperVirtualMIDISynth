@@ -101,6 +101,7 @@ struct ConfigValues {
     int overflowMode = 0;
     bool correctnessMode = true;
     bool decimation = false;
+    bool decimationByLevel = false;
 
     bool diagnosticsEnabled = false;
     bool diagnosticsWindow = false;

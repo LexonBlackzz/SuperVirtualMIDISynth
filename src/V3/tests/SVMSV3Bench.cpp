@@ -17,6 +17,7 @@
 #include <vector>
 
 static float gBenchReleaseDecay = 0.9999999f;  // --release-ms
+static bool gBenchVelocitySpread = false;      // --velocity-spread
 static uint32_t gBenchReleaseSamples = 0u;      // counted tail (live SF2 semantics)
 
 namespace {
@@ -100,6 +101,7 @@ struct Options {
     bool coverageProfile = false;
     bool vibratoLfo = false;
     bool decimation = false;
+    bool decimationByLevel = false;
     uint32_t rotationMode = 0u;  // 0 coherent, 1 analytic, 2 sweep, 3 diffuse, 4 random
     bool transactionalLaunch = true;
     bool copiedLaunchPlan = false;
@@ -244,6 +246,11 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             svms::g_voiceRetireThreshold.store(
                 std::pow(10.0f, static_cast<float>(std::atof(argv[++i])) / 20.0f),
                 std::memory_order_relaxed);
+        } else if (std::strcmp(argv[i], "--velocity-spread") == 0) {
+            gBenchVelocitySpread = true;
+        } else if (std::strcmp(argv[i], "--decimation-by-level") == 0) {
+            options.decimation = true;
+            options.decimationByLevel = true;
         } else if (std::strcmp(argv[i], "--decimation") == 0) {
             options.decimation = true;
         } else if (std::strcmp(argv[i], "--vibrato-lfo") == 0) {
@@ -363,6 +370,9 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
         voices.SetVoiceSoundFontIdentity(
             handle, 0u, static_cast<uint16_t>(i & 0xffffu));
         voices.RefreshMixGain(handle, channels.GetParams()[i & 15u]);
+        if (gBenchVelocitySpread)  // scattered ranking keys, like real material
+            voices.v.velocity[handle] =
+                static_cast<uint8_t>(1u + (i & 15u) * 8u);
         // SF2 default vibrato modulator on every seeded voice (5 Hz LFO,
         // 50-cent depth): with --cc-controller 1 the modulation is real,
         // so the vibrato path A/B exercises the LFO math, not just gates.
@@ -774,6 +784,7 @@ int main(int argc, char** argv) {
         return 3;
     }
     renderer->SetDecimationEnabled(options.decimation);
+    renderer->SetDecimationByLevel(options.decimationByLevel);
     gBenchVibratoLfo = options.vibratoLfo;
     if (options.vibratoLfo) {
         for (uint32_t a = 0; a < voices->activeCount_; ++a) {
