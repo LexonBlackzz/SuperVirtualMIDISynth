@@ -8,6 +8,7 @@
 #include "SVMSEventCompile.h"
 #include "SVMSHilbertPair.h"
 #include "SVMSLimiter.h"
+#include "SVMSNoteMerge.h"
 #include "SVMSNoteOnCollapse.h"
 #include "SVMSPostFilter.h"
 #include "SVMSRenderScalar.h"
@@ -128,6 +129,10 @@ public:
             error = "cannot initialize render workers";
             return false;
         }
+        if (!renderer_.PrepareWholeVoice(voices_)) {
+            error = "cannot reserve whole-voice renderer storage";
+            return false;
+        }
         channels_.Reset();
         channels_.SetMasterVolume(master_);
         cfg_ = {master_, 1.0f, 0.0f, 0, false, false, false, false, false,
@@ -199,10 +204,47 @@ public:
             static_cast<uint64_t>(config.sampleRate) *
             kNoteOnCollapseWindowMs / 1000u);
         noteOnCollapse_.SetThreshold(collapseConfig.noteOnCollapseThreshold);
+        noteOnCollapse_.SetReExciteSpacing(
+            static_cast<uint64_t>(config.sampleRate) * kReExciteAttackMs /
+            1000u);
+        reExcite_ = collapseConfig.noteOnReexcite &&
+                    collapseConfig.noteOnCollapseThreshold > 1u;
+        renderer_.SetReExciteMode(reExcite_);
+        // Exact note-on merging (SVMSNoteMerge.h): the same opt-in the
+        // realtime driver reads. Offline renders have the whole event block
+        // up front, so the pass runs on each block just before RenderBlock.
+        // An exclusive-class SoundFont limits it to adjacent note-ons.
+        noteMerge_ = collapseConfig.noteMerge;
+        noteMergeHoist_ = true;
+        for (uint32_t i = 0; i < sf2_->regionCount; ++i) {
+            if (sf2_->regions[i].exclusiveClass != 0 ||
+                sf2_->regions[i].offByClass != 0) {
+                noteMergeHoist_ = false;
+                break;
+            }
+        }
         return true;
     }
 
     ~StandaloneSynth() {
+        // Opt-in end-of-session diagnostic: every plan refusal is a skipped
+        // stretch (silence), so a real file should report zero.
+        if (std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {
+            std::fprintf(stderr,
+                "[SVMS] whole-voice blocks=%llu refusals: rotation=%llu "
+                "event_type=%llu no_dispatcher=%llu reservation=%llu "
+                "scalar_vibrato=%llu forced=%llu seg_calls=%llu "
+                "seg_fallback=%llu\n",
+                (unsigned long long)renderer_.GetWholeVoiceBlocksForTest(),
+                (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseRotation),
+                (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseEventType),
+                (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseNoDispatcher),
+                (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseReservation),
+                (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseScalarVibrato),
+                (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseForced),
+                (unsigned long long)renderer_.GetWvSegCalls(),
+                (unsigned long long)renderer_.GetWvSegFallback());
+        }
         if (sf2_) sf2_free(sf2_.get());
     }
 
@@ -301,8 +343,26 @@ public:
             if (!self->noteOnCollapse_.OnNoteOn(
                     keyIndex, self->dispatchAbsoluteFrame_ + blockCursor,
                     stack)) {
-                ++self->coalescedNoteOns_;
-                break;
+                // Re-excite: the hit is not dropped, it restarts the key's
+                // live voices right here at its exact frame. With no live
+                // voice it launches normally, so no note is ever lost.
+                if (self->reExcite_) {
+                    if (!self->noteOnCollapse_.AllowReExcite(
+                            keyIndex,
+                            self->dispatchAbsoluteFrame_ + blockCursor)) {
+                        ++self->coalescedNoteOns_;
+                        break;
+                    }
+                    if (self->voices_.ReExciteKey(event.channel,
+                                                  event.data1) != 0u) {
+                        ++self->reExcitedNoteOns_;
+                        break;
+                    }
+                }
+                if (!self->reExcite_) {
+                    ++self->coalescedNoteOns_;
+                    break;
+                }
             }
             uint8_t velocity = event.data2;
             if (stack > 1u && velocity < 127u) {
@@ -315,7 +375,7 @@ public:
                 velocity = static_cast<uint8_t>(
                     velocity + boost > 127u ? 127u : velocity + boost);
             }
-            self->NoteOn(event.channel, event.data1, velocity);
+            self->NoteOn(event.channel, event.data1, velocity, event.count);
             break;
         }
         case RenderEventType::NoteOff:
@@ -339,8 +399,8 @@ public:
     }
 
     // Render one block with sub-block events dispatched at their exact
-    // frames through the production RenderBlock machinery (whole-voice /
-    // dense / sparse paths, worker pool). Events must be sorted by
+    // frames through the production RenderBlock machinery (whole-voice
+    // renderer, worker pool). Events must be sorted by
     // frameOffset and carry offsets relative to this block; events at
     // frameOffset == frameCount must be held back by the caller and applied
     // via ApplyRenderEvent (outside tested dispatch territory).
@@ -350,6 +410,14 @@ public:
         std::fill(left, left + frameCount, 0.0f);
         std::fill(right, right + frameCount, 0.0f);
         dispatchAbsoluteFrame_ = absoluteFrame;
+        if (noteMerge_ && eventCount > 1u) {
+            mergeScratch_.assign(events, events + eventCount);
+            uint64_t folded = 0u;
+            eventCount = noteMerger_.MergeEvents(
+                mergeScratch_.data(), eventCount, noteMergeHoist_, folded);
+            mergedNoteOns_ += folded;
+            events = mergeScratch_.data();
+        }
 #if defined(_MSC_VER)
         const uint64_t renderBegin = __rdtsc();
 #endif
@@ -367,6 +435,11 @@ public:
     uint32_t GetRenderPaths() const { return renderer_.GetLastRenderPaths(); }
     uint64_t RenderCycles() const { return renderCycles_; }
     uint64_t CoalescedNoteOns() const { return coalescedNoteOns_; }
+    uint64_t ReExcitedNoteOns() const { return reExcitedNoteOns_; }
+    // Note-ons folded into a neighbour by exact note merging, and the number
+    // of voices the pool would hold had nothing been merged.
+    uint64_t MergedNoteOns() const { return mergedNoteOns_; }
+    uint64_t EffectiveVoices() { return voices_.CountEffectiveVoices(); }
     uint64_t WvPlanCycles() const { return renderer_.GetWvPlanCycles(); }
     uint64_t WvJobCycles() const { return renderer_.GetWvJobCycles(); }
     uint64_t WvPostCycles() const { return renderer_.GetWvPostCycles(); }
@@ -398,6 +471,7 @@ public:
     void ResetAll(uint64_t absoluteFrame) {
         noteOnCollapse_.ResetAll();
         coalescedNoteOns_ = 0;
+        reExcitedNoteOns_ = 0;
         voices_.SetCurrentFrame(absoluteFrame);
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             voices_.SilenceChannelImmediate(channel);
@@ -468,7 +542,15 @@ private:
     // the dispatcher's blockCursor offsets from. See Initialize.
     NoteOnCollapseGate noteOnCollapse_;
     uint64_t coalescedNoteOns_ = 0;
+    uint64_t reExcitedNoteOns_ = 0;
+    bool reExcite_ = false;
     uint64_t dispatchAbsoluteFrame_ = 0;
+    // Exact note-on merging (see Initialize / RenderWithEvents).
+    bool noteMerge_ = false;
+    bool noteMergeHoist_ = true;
+    NoteMerger noteMerger_;
+    std::vector<RenderEvent> mergeScratch_;
+    uint64_t mergedNoteOns_ = 0;
 
     struct RegionCacheEntry {
         uint32_t tag = UINT32_MAX;
@@ -568,7 +650,16 @@ private:
             channel, Resolve(channel, preset) ? uint16_t(preset) : UINT16_MAX);
     }
 
-    void NoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
+    // `multiplicity` > 1 launches one voice standing for that many exact
+    // duplicates (SVMSNoteMerge.h). Rotating voices each own a random phase
+    // angle, so they launch one by one instead.
+    void NoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
+                uint32_t multiplicity = 1u) {
+        if (multiplicity > 1u && voices_.v.rot != nullptr) {
+            for (uint32_t unit = 0u; unit < multiplicity; ++unit)
+                NoteOn(channel, note, velocity, 1u);
+            return;
+        }
 #if defined(_MSC_VER)
         const uint64_t totalBegin = __rdtsc();
 #endif
@@ -677,7 +768,7 @@ private:
         VoiceHandle handles[512];
         const bool launched = voices_.LaunchVoiceGroup(
             channel, note, velocity, launchSetups_, count, generation,
-            channels_.GetParams()[channel], handles);
+            channels_.GetParams()[channel], handles, 0u, multiplicity);
         if (launched) physicalLaunches_ += count;
 #if defined(_MSC_VER)
         dispatchProfile.alloc += __rdtsc() - allocBegin;
@@ -694,9 +785,9 @@ private:
 #endif
         const bool sustain = channels_.IsSustainActive(channel);
         channels_.NoteOff(channel, note);
-        const uint32_t playIndex = voices_.FindOldestPlayIndex(channel, note);
-        if (playIndex != UINT32_MAX)
-            voices_.NoteOffPlayIndex(channel, note, playIndex, sustain, 0);
+        // One note-off releases one unit: the whole generation, or one copy
+        // of a merged voice.
+        voices_.NoteOffOldestPlayIndices(channel, note, 1u, sustain, 0u);
 #if defined(_MSC_VER)
         dispatchProfile.noteOffTotal += __rdtsc() - offBegin;
         ++dispatchProfile.noteOffCalls;

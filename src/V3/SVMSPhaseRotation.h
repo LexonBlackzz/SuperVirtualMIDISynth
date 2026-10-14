@@ -106,6 +106,33 @@ inline float RotateVoiceSample(VoiceRotationState& st, float x,
     return x * c - xhat * s;
 }
 
+// Advance a form-2 state by `steps` samples without rendering them: the
+// per-sample recurrence is multiplication by (dc + i·ds), so n steps is the
+// n-th power of that factor (square-and-multiply).  The whole-voice pre-pass
+// uses it to give an in-place steal successor the victim's angle AT the steal
+// frame (the voice inherits its slot's rotation state), while the worker
+// still renders the displaced voice itself from the block-start copy.
+inline void AdvanceVoiceRotation(VoiceRotationState& st,
+                                 uint32_t steps) noexcept {
+    if (st.form != 2u || steps == 0u) return;
+    if (st.dc == 1.0f && st.ds == 0.0f) return;
+    float pc = 1.0f, ps = 0.0f, bc = st.dc, bs = st.ds;
+    for (uint32_t n = steps; n != 0u; n >>= 1) {
+        if ((n & 1u) != 0u) {
+            const float t = pc * bc - ps * bs;
+            ps = pc * bs + ps * bc;
+            pc = t;
+        }
+        const float t = bc * bc - bs * bs;
+        bs = 2.0f * bc * bs;
+        bc = t;
+    }
+    const float c = st.c;
+    const float s = st.s;
+    st.c = c * pc - s * ps;
+    st.s = s * pc + c * ps;
+}
+
 // ── Deterministic seeding ────────────────────────────────────────────────
 // The same MIDI input always produces the same angles, so offline renders
 // are reproducible bit-for-bit in every rotation mode.

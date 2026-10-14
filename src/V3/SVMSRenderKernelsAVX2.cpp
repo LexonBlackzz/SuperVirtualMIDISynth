@@ -47,11 +47,8 @@ inline __m256 FilterTime8AVX2(VoiceSoA& v, uint32_t handle,
 
 // Eight independent voices for the short-span / event-fragmented kernels.
 inline __m256 FilterVoices8AVX2(VoiceSoA& v, __m256i handles,
-                                __m256 input, uint32_t handleBias = 0u) {
-    const __m256i h = handleBias != 0u
-        ? _mm256_add_epi32(handles,
-              _mm256_set1_epi32(static_cast<int>(handleBias)))
-        : handles;
+                                __m256 input) {
+    const __m256i h = handles;
     const __m256i enabled = _mm256_i32gather_epi32(
         reinterpret_cast<const int*>(v.filterEnabled), h, 4);
     const __m256 mask = _mm256_castsi256_ps(_mm256_cmpgt_epi32(
@@ -333,11 +330,96 @@ void RecordRetirement(const RenderSpanContext& c, uint32_t handle,
         c.retirements[(*c.retirementCount)++] = {
             handle, frameOffset, c.activePositions[handle]};
     } else {
-        // Dense tile state is a disposable render snapshot. Authoritative
-        // lifecycle was already committed by the exact-frame planner.
+        // Ghost rows are disposable render snapshots (no retirement
+        // buffer). The authoritative lifecycle was already committed by the
+        // whole-voice pre-pass.
         c.voices->state[handle] = static_cast<uint8_t>(VoiceState::Free);
     }
 }
+
+// Hilbert-pair (form 2) rotation for the time-chunked kernels. Init binds a
+// voice; Chunk rotates eight consecutive frames, Scalar rotates one (the
+// scalar tails), Store writes the angle back. Static angles (dc=1, ds=0) are
+// exact; sweeping angles use a closed-form (dc + i*ds)^k ladder per chunk
+// instead of eight serially dependent steps (tolerance-equal to the scalar
+// recurrence). Form 2 without a companion store is a pass-through that does
+// not advance the angle, exactly like RotateVoiceSample.
+struct ChunkRotation {
+    VoiceRotationState* rs = nullptr;
+    const int16_t* hregion = nullptr;
+    bool sweeping = false;
+    float curC = 1.0f, curS = 0.0f, chunkDc = 1.0f, chunkDs = 0.0f;
+    alignas(32) float ladderC[8];
+    alignas(32) float ladderS[8];
+
+    // False for the recursive diffuse allpass (form 1): the caller must use
+    // the scalar span for that voice.
+    bool Init(VoiceSoA& v, const int16_t* hilbertData, uint32_t handle) {
+        if (v.rot == nullptr) return true;
+        VoiceRotationState& st = v.rot[handle];
+        if (st.form == 1u) return false;
+        if (st.form != 2u || hilbertData == nullptr) return true;
+        rs = &st;
+        hregion = hilbertData + v.sampleStart[handle];
+        curC = st.c;
+        curS = st.s;
+        sweeping = st.dc != 1.0f || st.ds != 0.0f;
+        if (sweeping) {
+            ladderC[0] = 1.0f;
+            ladderS[0] = 0.0f;
+            for (uint32_t k = 1u; k < 8u; ++k) {
+                ladderC[k] = ladderC[k - 1u] * st.dc -
+                             ladderS[k - 1u] * st.ds;
+                ladderS[k] = ladderS[k - 1u] * st.dc +
+                             ladderC[k - 1u] * st.ds;
+            }
+            chunkDc = ladderC[7] * st.dc - ladderS[7] * st.ds;
+            chunkDs = ladderS[7] * st.dc + ladderC[7] * st.ds;
+        }
+        return true;
+    }
+    explicit operator bool() const { return rs != nullptr; }
+
+    __m256 Chunk(__m256 sample, __m256i bases, __m256 fraction) {
+        __m256 hFirst, hSecond;
+        GatherSamplePairAVX2(hregion, bases, hFirst, hSecond);
+        const __m256 xhat = _mm256_add_ps(hFirst,
+            _mm256_mul_ps(_mm256_sub_ps(hSecond, hFirst), fraction));
+        __m256 rotC, rotS;
+        if (sweeping) {
+            const __m256 c0 = _mm256_set1_ps(curC);
+            const __m256 s0 = _mm256_set1_ps(curS);
+            const __m256 lc = _mm256_load_ps(ladderC);
+            const __m256 ls = _mm256_load_ps(ladderS);
+            rotC = _mm256_sub_ps(_mm256_mul_ps(c0, lc),
+                                 _mm256_mul_ps(s0, ls));
+            rotS = _mm256_add_ps(_mm256_mul_ps(s0, lc),
+                                 _mm256_mul_ps(c0, ls));
+            const float nc = curC * chunkDc - curS * chunkDs;
+            const float ns = curS * chunkDc + curC * chunkDs;
+            curC = nc;
+            curS = ns;
+        } else {
+            rotC = _mm256_set1_ps(curC);
+            rotS = _mm256_set1_ps(curS);
+        }
+        return _mm256_sub_ps(_mm256_mul_ps(sample, rotC),
+                             _mm256_mul_ps(xhat, rotS));
+    }
+    float Scalar(float sample, uint32_t base, uint32_t next, float fraction) {
+        rs->c = curC;
+        rs->s = curS;
+        sample = RotateVoiceSample(*rs, sample, hregion, base, next, fraction);
+        curC = rs->c;
+        curS = rs->s;
+        return sample;
+    }
+    void Store() {
+        if (rs == nullptr) return;
+        rs->c = curC;
+        rs->s = curS;
+    }
+};
 
 bool ValidateLoopVoice(const RenderSpanContext& c, uint32_t handle) {
     const VoiceSoA& v = *c.voices;
@@ -360,6 +442,13 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
             c.outputRight, c.frameStart, c.frameCount);
     }
 
+    ChunkRotation rot;
+    if (!rot.Init(v, c.hilbertData, handle)) {
+        return ScalarRenderSustainedLoop(
+            v, handle, c.sampleData, c.hilbertData, c.sampleDataFrames,
+            c.outputLeft, c.outputRight, c.frameStart, c.frameCount);
+    }
+
     float phase = (std::max)(0.0f, v.phases[handle]);
     float step = v.phaseIncs[handle];
     const float loopStart = v.relLoopSF[handle];
@@ -378,7 +467,8 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
     const __m256i one = _mm256_set1_epi32(1);
     // Whole-voice vibrato: the 64-frame LFO control window is rebuilt at
     // the loop top; the gate keeps fast chunks from straddling a window
-    // boundary.  UINT32_MAX = LFO off (sparse path owns vibrato there).
+    // boundary.  UINT32_MAX = LFO off (scalar/SSE2 windows are handled by
+    // the renderer, not the kernel).
     const bool lfoOn = c.lfoActive != 0u &&
         v.vibLfoSteps[handle] != 0.0f &&
         v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
@@ -424,6 +514,7 @@ const __m256 phases = _mm256_add_ps(
                 phases, _mm256_cvtepi32_ps(bases));
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            if (rot) sample = rot.Chunk(sample, bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
@@ -449,6 +540,7 @@ const __m256 phases = _mm256_add_ps(
         const float fraction = phase - static_cast<float>(base);
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
+        if (rot) sample = rot.Scalar(sample, base, next, fraction);
         sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
@@ -460,6 +552,7 @@ const __m256 phases = _mm256_add_ps(
     // before the next rendered sample, so the final increment may remain
     // just past loopEnd in the stored snapshot.
     v.phases[handle] = phase;
+    rot.Store();
     return UINT32_MAX;
 }
 
@@ -525,6 +618,10 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
                                      uint32_t handle) {
     VoiceSoA& v = *c.voices;
     if (!ValidateLoopVoice(c, handle)) return 0u;
+    // Form-1 (diffuse) rotation never reaches here: the class kernel refuses
+    // before any state is touched.
+    ChunkRotation rot;
+    rot.Init(v, c.hilbertData, handle);
     float phase = (std::max)(0.0f, v.phases[handle]);
     float gain = v.currentGain[handle];
     uint32_t remaining = v.releaseSamplesRemaining[handle];
@@ -599,6 +696,7 @@ const __m256 phases = _mm256_add_ps(
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
+            if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
@@ -634,6 +732,7 @@ const __m256 phases = _mm256_add_ps(
             }
         }
         sample = ProcessVoiceFilterSample(v, handle, sample);
+        if (rot) sample = rot.Scalar(sample, base, next, fraction);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
@@ -654,6 +753,7 @@ const __m256 phases = _mm256_add_ps(
     v.phases[handle] = phase;
     v.currentGain[handle] = gain;
     v.releaseSamplesRemaining[handle] = remaining;
+    rot.Store();
     return retiredAt;
 }
 
@@ -766,11 +866,16 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
                            const uint32_t* handles,
                            uint32_t handleCount) {
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
-    // Per-voice phase rotation: release spans are a minority of the voice
-    // budget, so refuse and let the (rotation-hooked) scalar span kernels
-    // take over rather than carrying filter state through every release
-    // sub-path.
-    if (context.voices->rot != nullptr) return false;
+    // Per-voice phase rotation: Hilbert-pair (form 2) voices ride the
+    // time-chunked kernel below. Refuse (nothing mutated yet) for the
+    // voice-batched short kernel and for any diffuse (form 1) voice, and
+    // let the scalar span kernels take the whole batch.
+    if (context.voices->rot != nullptr) {
+        if (context.frameCount <= 4u) return false;
+        for (uint32_t position = 0u; position < handleCount; ++position)
+            if (context.voices->rot[handles[position]].form == 1u)
+                return false;
+    }
     // Channel buses: the voice-batched short kernel mixes eight voices (up
     // to eight different MIDI channels) into the same frame position, which
     // cannot scatter into per-channel planes. Refuse (no state mutated —
@@ -810,6 +915,8 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
                                    uint32_t handle) {
     VoiceSoA& v = *c.voices;
     if (!ValidateLoopVoice(c, handle)) return;
+    ChunkRotation rot;
+    rot.Init(v, c.hilbertData, handle);
     float phase = (std::max)(0.0f, v.phases[handle]);
     float gain = v.currentGain[handle];
     uint8_t stage = v.envelopeStage[handle];
@@ -921,6 +1028,7 @@ const __m256 phases = _mm256_add_ps(
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
+            if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
@@ -973,6 +1081,7 @@ const __m256 phases = _mm256_add_ps(
             if (decayRemaining == 0u) stage = 3u;
         }
         sample = ProcessVoiceFilterSample(v, handle, sample);
+        if (rot) sample = rot.Scalar(sample, base, next, fraction);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         phase += step;
@@ -990,6 +1099,7 @@ const __m256 phases = _mm256_add_ps(
     v.envelopeStage[handle] = stage;
     v.attackSamplesRemaining[handle] = attackRemaining;
     v.decaySamplesRemaining[handle] = decayRemaining;
+    rot.Store();
     if (stage != initialStage && c.classChangeHandles != nullptr &&
         c.classChangeCount != nullptr) {
         c.classChangeHandles[(*c.classChangeCount)++] = handle;
@@ -1144,9 +1254,14 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
                              uint32_t handleCount) {
     if (handleCount == 0u) return true;
     if (context.frameCount == 0u || context.sampleData == nullptr) return false;
-    // Per-voice phase rotation: refuse and let the (rotation-hooked) scalar
-    // span kernels take over, same policy as the release kernel.
-    if (context.voices->rot != nullptr) return false;
+    // Per-voice phase rotation: form-2 voices take the time-chunked kernel;
+    // short spans and diffuse (form 1) voices refuse like the release kernel.
+    if (context.voices->rot != nullptr) {
+        if (context.frameCount <= 7u) return false;
+        for (uint32_t position = 0u; position < handleCount; ++position)
+            if (context.voices->rot[handles[position]].form == 1u)
+                return false;
+    }
     // Channel buses: the voice-batched short kernel cannot scatter into
     // per-channel planes (see RenderReleaseLoopAVX2). Refuse before any
     // validation side effect.
@@ -1204,16 +1319,20 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                              uint32_t handleCount) {
     VoiceSoA& v = *context.voices;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
-    // Per-voice phase rotation: render through the scalar span path. The
-    // former voice-parallel rotation kernel skipped the per-sample envelope
-    // recurrence entirely — voices froze at launch gain (no attack ramp,
-    // no release shaping, never reaching the retire threshold; observed as
-    // tens of thousands of stuck active voices under rotation modes).
-    // RenderSustainedLoopSpan applies rotation AND the exact envelope.
+    // Per-voice phase rotation: spans of 8+ frames take the time-chunked
+    // kernel, which rotates form-2 (Hilbert-pair) voices in the lanes and
+    // hands any other form back to the scalar span (the diffuse allpass is
+    // recursive). Short spans stay scalar. Sustained gain is constant, so
+    // there is no envelope to simulate; the former voice-parallel rotation
+    // kernel that skipped the envelope for non-sustained classes is gone.
     if (v.rot != nullptr) {
         for (uint32_t i = 0u; i < handleCount; ++i) {
             const RenderSpanContext vc = SelectVoiceDestination(
                 context, v.channel[handles[i]]);
+            if (vc.frameCount > 7u) {
+                RenderSustainedLoopFramesAVX2(vc, handles[i]);
+                continue;
+            }
             ScalarRenderSustainedLoop(v, handles[i], vc.sampleData,
                 vc.hilbertData, vc.sampleDataFrames,
                 vc.outputLeft,
@@ -1256,14 +1375,10 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         return true;
     }
 
-    const bool tileContiguous = context.handleBase != 0u;
-    const bool denseHandles = tileContiguous ||
-        (context.voiceCapacity >= 8u &&
-         handleCount * 4u >= context.voiceCapacity * 3u);
-    const uint32_t handleBase = tileContiguous ? context.handleBase : 0u;
-    const uint32_t iterationCount = tileContiguous
-        ? handleCount
-        : (denseHandles ? context.voiceCapacity : handleCount);
+    const bool denseHandles = context.voiceCapacity >= 8u &&
+        handleCount * 4u >= context.voiceCapacity * 3u;
+    const uint32_t iterationCount =
+        denseHandles ? context.voiceCapacity : handleCount;
     __m256 accumulatedLeft[8] = {
         _mm256_setzero_ps(), _mm256_setzero_ps(),
         _mm256_setzero_ps(), _mm256_setzero_ps(),
@@ -1288,12 +1403,12 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             bool allSustained = true;
             for (uint32_t lane = 0; lane < 8u; ++lane) {
                 allSustained = allSustained &&
-                    v.renderClass[handleBase + position + lane] ==
+                    v.renderClass[position + lane] ==
                         static_cast<uint8_t>(VoiceRenderClass::SustainedLoop);
             }
             if (!allSustained) {
                 for (uint32_t lane = 0; lane < 8u; ++lane) {
-                    const uint32_t handle = handleBase + position + lane;
+                    const uint32_t handle = position + lane;
                     if (v.renderClass[handle] ==
                         static_cast<uint8_t>(VoiceRenderClass::SustainedLoop)) {
                         ScalarRenderSustainedLoop(v, handle, context.sampleData,
@@ -1306,17 +1421,17 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                 continue;
             }
         }
-        __m256 phase = denseHandles ? _mm256_load_ps(v.phases + handleBase + position)
+        __m256 phase = denseHandles ? _mm256_load_ps(v.phases + position)
             : _mm256_i32gather_ps(v.phases, h, 4);
-        const __m256 step = denseHandles ? _mm256_load_ps(v.phaseIncs + handleBase + position)
+        const __m256 step = denseHandles ? _mm256_load_ps(v.phaseIncs + position)
             : _mm256_i32gather_ps(v.phaseIncs, h, 4);
-        const __m256 gainL = denseHandles ? _mm256_load_ps(v.renderGainL + handleBase + position)
+        const __m256 gainL = denseHandles ? _mm256_load_ps(v.renderGainL + position)
             : _mm256_i32gather_ps(v.renderGainL, h, 4);
-        const __m256 gainR = denseHandles ? _mm256_load_ps(v.renderGainR + handleBase + position)
+        const __m256 gainR = denseHandles ? _mm256_load_ps(v.renderGainR + position)
             : _mm256_i32gather_ps(v.renderGainR, h, 4);
-        const __m256 loopStartF = denseHandles ? _mm256_load_ps(v.relLoopSF + handleBase + position)
+        const __m256 loopStartF = denseHandles ? _mm256_load_ps(v.relLoopSF + position)
             : _mm256_i32gather_ps(v.relLoopSF, h, 4);
-        const __m256 loopEndF = denseHandles ? _mm256_load_ps(v.relLoopEF + handleBase + position)
+        const __m256 loopEndF = denseHandles ? _mm256_load_ps(v.relLoopEF + position)
             : _mm256_i32gather_ps(v.relLoopEF, h, 4);
         const __m256 loopLength = _mm256_sub_ps(loopEndF, loopStartF);
 
@@ -1344,13 +1459,13 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         }
 
         const __m256i sampleStart = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.sampleStart + handleBase + position))
+            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.sampleStart + position))
             : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.sampleStart), h, 4);
         const __m256i loopStart = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopS + handleBase + position))
+            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopS + position))
             : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.relLoopS), h, 4);
         const __m256i loopEnd = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopE + handleBase + position))
+            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopE + position))
             : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.relLoopE), h, 4);
         const __m256 zero = _mm256_setzero_ps();
         phase = _mm256_max_ps(phase, zero);
@@ -1372,7 +1487,7 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             const __m256 fraction = _mm256_sub_ps(phase, _mm256_cvtepi32_ps(base));
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
-            sample = FilterVoices8AVX2(v, h, sample, denseHandles ? handleBase : 0u);
+            sample = FilterVoices8AVX2(v, h, sample);
             accumulatedLeft[frame] = _mm256_add_ps(
                 accumulatedLeft[frame], _mm256_mul_ps(sample, gainL));
             accumulatedRight[frame] = _mm256_add_ps(
@@ -1381,11 +1496,11 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         }
         alignas(32) float phases[8];
         _mm256_store_ps(phases, phase);
-        if (denseHandles) _mm256_store_ps(v.phases + handleBase + position, phase);
+        if (denseHandles) _mm256_store_ps(v.phases + position, phase);
         else for (uint32_t lane = 0; lane < 8u; ++lane) v.phases[hs[lane]] = phases[lane];
     }
     for (; position < iterationCount; ++position) {
-        const uint32_t handle = denseHandles ? handleBase + position : handles[position];
+        const uint32_t handle = denseHandles ? position : handles[position];
         if (!denseHandles || v.renderClass[handle] ==
             static_cast<uint8_t>(VoiceRenderClass::SustainedLoop)) {
             ScalarRenderSustainedLoop(v, handle, context.sampleData,

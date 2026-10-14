@@ -5,7 +5,7 @@
 namespace svms {
 
 static uint32_t SelectRenderLanesForPhysicalCores(uint32_t cores) {
-    // Dense tile rendering streams sample data through the shared memory
+    // Voice rendering streams sample data through the shared memory
     // hierarchy from every lane; past roughly cores-2 lanes, SMT siblings
     // and per-chunk join overhead cost more than they add (measured on an
     // 8C/16T part: throughput peaks at 6 lanes and falls monotonically to
@@ -140,16 +140,10 @@ static uint32_t LargestVoiceCapacityInRange(
 static uint32_t LargestInitialVoiceCapacityForBudget(
     uint64_t budgetBytes, uint32_t renderThreads,
     uint32_t blockFrames) noexcept {
-    // Dense-planner storage exists only through 8,192 voices, so the estimate
-    // has one intentional downward step at 8,193. Search both monotonic ranges
-    // instead of assuming a globally monotonic function.
-    const uint32_t highRange = LargestVoiceCapacityInRange(
-        budgetBytes, renderThreads, blockFrames,
-        kDenseRenderMaximumVoices + 1u, kMaxPolyphony);
-    if (highRange != 0u) return highRange;
+    // The estimate is monotonic in the voice count, so one search covers
+    // the whole range.
     return LargestVoiceCapacityInRange(
-        budgetBytes, renderThreads, blockFrames, 1u,
-        kDenseRenderMaximumVoices);
+        budgetBytes, renderThreads, blockFrames, 1u, kMaxPolyphony);
 }
 
 static size_t EstimateRuntimeVoiceMemoryAfterGrowth(
@@ -308,6 +302,8 @@ bool Driver::Initialize() {
     // window used once it is enabled at runtime.
     noteOnCollapse_.SetWindowTicks(
         freq.QuadPart * kNoteOnCollapseWindowMs / 1000u);
+    noteOnCollapse_.SetReExciteSpacing(
+        freq.QuadPart * kReExciteAttackMs / 1000u);
 
     EngineConfig cfg = EngineConfig::Load();
     if (!cfg.configWarning.empty()) {
@@ -388,6 +384,8 @@ bool Driver::Initialize() {
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
+    noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
+    noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
     unboundedRenderEnabled_.store(cfg.unboundedRender,
                                   std::memory_order_relaxed);
@@ -477,10 +475,9 @@ bool Driver::Initialize() {
         const uint64_t budgetBytes =
             static_cast<uint64_t>(cfg.voiceMemoryBudgetMB) << 20u;
         if (renderThreads > 1u &&
-            cfg.maxVoices <= kDenseRenderMaximumVoices &&
             EstimateRuntimeVoiceMemoryBytes(
                 cfg.maxVoices, renderThreads, bufferCapacity) > budgetBytes) {
-            LOG("Voice memory budget %u MiB cannot fit the dense %u-thread "
+            LOG("Voice memory budget %u MiB cannot fit the %u-thread "
                 "renderer at %u voices; falling back to one render thread",
                 cfg.voiceMemoryBudgetMB, renderThreads, cfg.maxVoices);
             renderThreads = 1u;
@@ -532,6 +529,8 @@ bool Driver::Initialize() {
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
+    noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
+    noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
     unboundedRenderEnabled_.store(cfg.unboundedRender,
                                   std::memory_order_relaxed);
@@ -569,6 +568,7 @@ bool Driver::Initialize() {
     channelCache->SetMasterVolume(cfg.masterVolume);
     renderScalar = new RenderScalar();
     renderScalar->SetGhostBudget(cfg.ghostBudget);
+    renderScalar->SetDecimationEnabled(cfg.decimation);
     // Honor the configured render backend. The constructor already selects
     // the best set (Auto behavior); an explicit non-Auto request overrides
     // it, falling back to the best available set when unsupported.
@@ -597,6 +597,11 @@ bool Driver::Initialize() {
     // MIDI events at their exact sub-sample positions during RenderBlock.
     renderScalar->SetEventDispatcher(DispatchRenderEvent, this);
     renderScalar->SetEventBatchDispatcher(DispatchRenderEventBatch, this);
+    if (!renderScalar->PrepareWholeVoice(*voiceManager)) {
+        LOG("FAILED: Could not reserve whole-voice renderer storage "
+            "maxVoices=%u", cfg.maxVoices);
+        return false;
+    }
 
     configSnapshot = new RuntimeConfigSnapshot();
     std::memset(configSnapshot, 0, sizeof(RuntimeConfigSnapshot));
@@ -753,6 +758,24 @@ void Driver::Shutdown() {
     }
     delete voiceManager; voiceManager = nullptr;
     delete channelCache; channelCache = nullptr;
+    if (renderScalar) {
+        // A plan refusal skips a stretch (silence); report only when one
+        // happened so a clean session adds no log noise.
+        uint64_t refused = 0u;
+        for (uint32_t reason = 0u; reason < RenderScalar::kRefuseReasonCount;
+             ++reason)
+            refused += renderScalar->GetRefusalCount(reason);
+        if (refused != 0u) {
+            LOG("whole-voice plan refusals=%llu (reservation=%llu "
+                "event_type=%llu) over %llu blocks",
+                (unsigned long long)refused,
+                (unsigned long long)renderScalar->GetRefusalCount(
+                    RenderScalar::kRefuseReservation),
+                (unsigned long long)renderScalar->GetRefusalCount(
+                    RenderScalar::kRefuseEventType),
+                (unsigned long long)renderScalar->GetWholeVoiceBlocksForTest());
+        }
+    }
     delete renderScalar; renderScalar = nullptr;
     ConfigureRuntimeVoiceGrowthCeiling(kRuntimeVoiceGrowthCeiling);
     delete configSnapshot; configSnapshot = nullptr;

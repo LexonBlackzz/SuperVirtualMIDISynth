@@ -164,8 +164,8 @@ public:
                                         : state.scratchRight.data();
         // Convert the caller's packed messages to RenderEvents and hand the
         // WHOLE block to the production RenderBlock machinery: events
-        // dispatch at their exact frames inside the whole-voice/dense/sparse
-        // renderers with the worker pool. (The previous per-event
+        // dispatch at their exact frames inside the whole-voice
+        // renderer with the worker pool. (The previous per-event
         // Dispatch+span loop re-entered RenderBlock once per event — at
         // Black MIDI event densities that is a RenderBlock call every few
         // frames and rendered at a fraction of realtime.)

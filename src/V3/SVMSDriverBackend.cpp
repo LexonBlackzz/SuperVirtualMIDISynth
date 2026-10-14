@@ -327,15 +327,21 @@ void Driver::ForwardBlockToBackend(const RenderEvent* events,
                 ExternalBackendReset();
             continue;
         }
-        if (kind == 1u) {
-            externalBackend_.send_short(externalBackend_.user, msg);
-        } else if (kind == 2u) {
-            if (kdmapiBackend_.sendNoBuf)
-                kdmapiBackend_.sendNoBuf(msg);
-            else if (kdmapiBackend_.send)
-                kdmapiBackend_.send(msg);
-        } else if (kind == 3u && winmmBackendOut_ && systemWinmmShortMsg_) {
-            systemWinmmShortMsg_(winmmBackendOut_, msg);
+        // A merged note-on stands for `count` identical note-ons, and an
+        // external synth knows nothing of merging: send each one.
+        const uint32_t repeats = events[i].type == RenderEventType::NoteOn &&
+                                 events[i].count > 1u ? events[i].count : 1u;
+        for (uint32_t repeat = 0u; repeat < repeats; ++repeat) {
+            if (kind == 1u) {
+                externalBackend_.send_short(externalBackend_.user, msg);
+            } else if (kind == 2u) {
+                if (kdmapiBackend_.sendNoBuf)
+                    kdmapiBackend_.sendNoBuf(msg);
+                else if (kdmapiBackend_.send)
+                    kdmapiBackend_.send(msg);
+            } else if (kind == 3u && winmmBackendOut_ && systemWinmmShortMsg_) {
+                systemWinmmShortMsg_(winmmBackendOut_, msg);
+            }
         }
     }
 }

@@ -445,9 +445,12 @@ const uint32_t importedPages = self->useEventCompiler_
     uint32_t lateDispatched = 0u;
     auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
         ++examinedCount;
+        // A merged note-on carries its count in the type byte; classify it
+        // as the NoteOn it is for every gate below.
+        const bool isNoteOn = scheduledOut.BaseType() == RenderEventType::NoteOn;
         if (self->overflowMode_.load(std::memory_order_relaxed) ==
                 EventOverflowMode::PriorityVelocity &&
-            scheduledOut.type == RenderEventType::NoteOn &&
+            isNoteOn &&
             IsObsoleteNoteOn(scheduledOut.targetFrame,
                              self->virtualRenderSample_, self->bufferFrames)) {
             ++self->telemetry_.late;
@@ -462,7 +465,7 @@ const uint32_t importedPages = self->useEventCompiler_
         // velocity. Controls and note-offs always pass; the SVMS engine's
         // own lossless admission default is untouched.
         if (self->externalBackendKind_.load(std::memory_order_relaxed) != 0u &&
-            scheduledOut.type == RenderEventType::NoteOn &&
+            isNoteOn &&
             scheduledOut.data2 < self->engineConfig_.highPriorityVelocity &&
             self->virtualRenderSample_ - scheduledOut.targetFrame >
                 static_cast<int64_t>(self->sampleRate)) {
@@ -756,6 +759,46 @@ const uint32_t importedPages = self->useEventCompiler_
         censusLastShed = self->shedAtomic_.load(std::memory_order_relaxed);
         censusLastCc = self->ccCollapsedCount_;
     }
+    // Effective-voice census: how many voices the pool would hold had no
+    // note-on been merged. Without merging it is just the live count; with
+    // merging it is a rolling slice scan (a few thousand voices per callback,
+    // so a half-million-voice pool never stalls one block). The merged-voice
+    // flag that marks merged voices as possibly alive is only cleared by an exact scan,
+    // and only on pools small enough to scan in one callback.
+    {
+        const bool collapse = self->noteOnCollapse_.Enabled();
+        const bool mergeActive =
+            self->noteMergeEnabled_.load(std::memory_order_relaxed) ||
+            vm->MergedVoicesMayExist() || collapse;
+        uint64_t effective = vm->activeCount_;
+        if (mergeActive) {
+            // Coalescing drops note-ons before they become voices, so each
+            // surviving voice is weighted by the note-ons it stands for.
+            const NoteOnCollapseGate* gate = &self->noteOnCollapse_;
+            vm->AdvanceEffectiveScan(
+                self->effectiveScan_, 4096u,
+                [gate, collapse](uint8_t ch, uint8_t note) noexcept {
+                    return collapse ? gate->SpawnWeight(
+                        static_cast<uint32_t>(ch) * kNoteCount + note) : 1u;
+                });
+            effective = self->effectiveScan_.published != 0u
+                ? self->effectiveScan_.published : vm->activeCount_;
+            if ((self->callbackCount_ & 63u) == 0u &&
+                vm->MergedVoicesMayExist() && vm->activeCount_ <= 16384u) {
+                // Exact scan (also refreshes the merged-voice gate); with
+                // coalescing on its unweighted total would undercount.
+                const uint64_t exact = vm->CountEffectiveVoices();
+                if (!collapse) effective = exact;
+            }
+        }
+        self->effectiveVoicesAtomic_.store(effective,
+                                           std::memory_order_relaxed);
+        if (effective > self->effectiveVoicesPeakAtomic_.load(
+                std::memory_order_relaxed)) {
+            self->effectiveVoicesPeakAtomic_.store(
+                effective, std::memory_order_relaxed);
+        }
+    }
     // Per-voice phase rotation is applied inside RenderBlock (per-voice, at
     // each mix site), so Coherent mode (no state allocated) stays bit-exact
     // and non-Coherent modes never touch loudness or gain-reduction inputs.
@@ -945,11 +988,10 @@ const uint32_t importedPages = self->useEventCompiler_
             "[SVMS] pool active=%u/%u retire=%u step=%u cpu=%.1f%% "
             "(disp=%.0f synth=%.0f sched=%.0f post=%.0f) p99=%.0f%% "
             "over=%llu coalesced+%llu(1/%u) path=%s vib=%u "
-            "sos=%u sloop=%u tloop=%u rloop=%u gen=%u\n",
+            "sos=%u sloop=%u tloop=%u rloop=%u gen=%u effv=%llu merged=%llu\n",
             (unsigned)vm->activeCount_, (unsigned)vm->GetMaxVoices(),
             (unsigned)vm->retireCount_,
-            (unsigned)(self->correctnessMode_ ? 1u
-                : ComputeDecimationStep(vm->activeCount_)),
+            (unsigned)render->DecimationStep(vm->activeCount_),
             static_cast<double>(s_cpuSmoothed),
             static_cast<double>(s_dispatchSmoothed),
             static_cast<double>(s_synthesisSmoothed),
@@ -966,7 +1008,11 @@ const uint32_t importedPages = self->useEventCompiler_
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::SustainedLoop),
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::TransientLoop),
             (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::ReleaseLoop),
-            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::Generic));
+            (unsigned)vm->GetRenderClassCount(svms::VoiceRenderClass::Generic),
+            (unsigned long long)self->effectiveVoicesAtomic_.load(
+                std::memory_order_relaxed),
+            (unsigned long long)self->noteMergedAtomic_.load(
+                std::memory_order_relaxed));
 #if SVMS_AUDIO_CENSUS
         OutputDebugStringA(poolCensus);
 #endif
@@ -1010,8 +1056,8 @@ const uint32_t importedPages = self->useEventCompiler_
                                   self->coalescedAtomic_.load(
                                       std::memory_order_relaxed),
                                   self->noteOnCollapse_.Threshold(),
-                                  s_cpuSmoothed, self->correctnessMode_ ? 1u
-                                      : ComputeDecimationStep(vm->activeCount_),
+                                  s_cpuSmoothed,
+                                  render->DecimationStep(vm->activeCount_),
                                   self->telemetry_.callbackP95Percent,
                                   self->telemetry_.callbackP99Percent,
                                   self->telemetry_.callbackP999Percent,
@@ -1032,7 +1078,12 @@ const uint32_t importedPages = self->useEventCompiler_
                                   s_schedulerSmoothed, s_dispatchSmoothed,
                                   s_synthesisSmoothed, s_postSmoothed,
                                   evCount, scheduledAfterDispatch,
-                                  self->sf2Telemetry_);
+                                  self->sf2Telemetry_,
+                                  static_cast<uint32_t>((std::min<uint64_t>)(
+                                      self->effectiveVoicesAtomic_.load(
+                                          std::memory_order_relaxed),
+                                      UINT32_MAX)),
+                                  render->GetTotalRefusals());
             }
         }
     }
@@ -1059,8 +1110,7 @@ const uint32_t importedPages = self->useEventCompiler_
         as.voiceSteals.store(vm->stealCount_, std::memory_order_relaxed);
         as.retiredCount.store(vm->retireCount_, std::memory_order_relaxed);
         as.retiredImmediateCount.store(vm->retireImmediateCount_, std::memory_order_relaxed);
-        as.decimationStep.store(self->correctnessMode_ ? 1u
-            : svms::ComputeDecimationStep(vm->activeCount_),
+        as.decimationStep.store(render->DecimationStep(vm->activeCount_),
             std::memory_order_relaxed);
         as.renderPeakBits.store(FloatToU32Bits(self->sf2Telemetry_.renderPeak),
                                 std::memory_order_relaxed);
@@ -1118,6 +1168,24 @@ const uint32_t importedPages = self->useEventCompiler_
                     self->channelLimiter.channel[clChannel].inputPeak),
                 std::memory_order_relaxed);
         }
+        {
+            const uint64_t effective = self->effectiveVoicesAtomic_.load(
+                std::memory_order_relaxed);
+            const uint64_t effectivePeak = self->effectiveVoicesPeakAtomic_.load(
+                std::memory_order_relaxed);
+            const uint64_t merged = self->noteMergedAtomic_.load(
+                std::memory_order_relaxed);
+            as.effectiveVoices.store(effective > UINT32_MAX
+                ? UINT32_MAX : static_cast<uint32_t>(effective),
+                std::memory_order_relaxed);
+            as.effectiveVoicesPeak.store(effectivePeak > UINT32_MAX
+                ? UINT32_MAX : static_cast<uint32_t>(effectivePeak),
+                std::memory_order_relaxed);
+            as.noteMergedLow.store(static_cast<uint32_t>(merged),
+                                   std::memory_order_relaxed);
+            as.noteMergedHigh.store(static_cast<uint32_t>(merged >> 32u),
+                                    std::memory_order_relaxed);
+        }
         as.schedulerPercentBits.store(FloatToU32Bits(s_schedulerSmoothed),
                                       std::memory_order_relaxed);
         as.eventDispatchPercentBits.store(FloatToU32Bits(s_dispatchSmoothed),
@@ -1156,7 +1224,30 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                 break;
             }
             self->HandleNoteOn(event.channel, event.data1, event.data2,
-                               false, nullptr, blockCursor);
+                               false, nullptr, blockCursor, event.count);
+            break;
+        }
+        case RenderEventType::NoteReExcite: {
+            // Same termination fences as a note-on: a hit queued before a
+            // later CC120/CC123/reset must not bring sound back.
+            const uint64_t globalFence =
+                self->globalTerminationFence_.load(std::memory_order_acquire);
+            const uint64_t channelFence = event.channel < kChannelCount
+                ? self->channelTerminationFence_[event.channel].load(std::memory_order_acquire)
+                : 0u;
+            if (FenceSuppresses(event.ingressSequence, globalFence) ||
+                FenceSuppresses(event.ingressSequence, channelFence)) {
+                ++self->fenceSuppressedNoteOns_;
+                break;
+            }
+            // Restart whatever still sounds on this key at this exact frame.
+            // Nothing sounding (released, stolen, never launched): launch
+            // normally so the hit is never lost.
+            if (!self->voiceManager ||
+                self->voiceManager->ReExciteKey(event.channel, event.data1) == 0u) {
+                self->HandleNoteOn(event.channel, event.data1, event.data2,
+                                   false, nullptr, blockCursor, 1u);
+            }
             break;
         }
         case RenderEventType::NoteOff:
@@ -1483,10 +1574,10 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
                     }
                     continue;
                 }
-                ++deferredNoteOns;
+                deferredNoteOns += event.count > 1u ? event.count : 1u;
                 const uint64_t delta = self->HandleNoteOn(
                     event.channel, event.data1, event.data2, true,
-                    exactFramePlan, blockCursor);
+                    exactFramePlan, blockCursor, event.count);
                 deferredMatches += static_cast<uint32_t>(delta);
                 deferredConfigured += static_cast<uint32_t>(delta >> 32u);
 
@@ -1585,10 +1676,22 @@ void Driver::RefreshSelectedPresets() {
 uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
                               bool deferLifetimeCounters,
                               const NoteLaunchPlanCacheEntry* exactFramePlan,
-                              uint32_t blockOffset) {
+                              uint32_t blockOffset, uint32_t multiplicity) {
     if (!channelCache || !voiceManager) return 0u;
     if (channel >= kChannelCount || note >= kNoteCount) return 0u;
     velocity &= 0x7fu;
+
+    if (multiplicity > 1u && voiceManager->v.rot != nullptr) {
+        // Each rotating voice owns a random phase angle; N of them do not sum
+        // to one voice at N times the gain. Launch them one by one.
+        uint64_t total = 0u;
+        for (uint32_t unit = 0u; unit < multiplicity; ++unit) {
+            total += HandleNoteOn(channel, note, velocity,
+                                  deferLifetimeCounters, exactFramePlan,
+                                  blockOffset, 1u);
+        }
+        return total;
+    }
 
     if (!deferLifetimeCounters) ++sf2Telemetry_.noteOns;
     const bool captureDetail = captureSf2Detail_;
@@ -1927,7 +2030,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     if (!voiceManager->LaunchVoiceGroup(
             channel, note, velocity, launchSetups, matchCount, playIndex,
             channelCache->GetParams()[channel], noteLaunchHandles_,
-            blockOffset)) {
+            blockOffset, multiplicity)) {
         ++telemetry_.allocationFailures;
         return matchCount;
     }
@@ -1978,9 +2081,10 @@ void Driver::HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset) 
     // pool pressure.  BASSMIDI and SnappySynth both use SF2-specified
     // release times; adaptive release causes audible inconsistency under
     // varying polyphony loads.
-    const uint32_t playIndex = voiceManager->FindOldestPlayIndex(channel, note);
-    if (playIndex == UINT32_MAX) return;
-    voiceManager->NoteOffPlayIndex(channel, note, playIndex, sustain, blockOffset);
+    // One note-off releases one unit of the oldest generation: the whole
+    // generation for an ordinary voice, one copy of a merged voice.
+    voiceManager->NoteOffOldestPlayIndices(channel, note, 1u, sustain,
+                                           blockOffset);
 }
 
 void Driver::HandleStaleNoteOffBatch(uint8_t channel, uint8_t note,

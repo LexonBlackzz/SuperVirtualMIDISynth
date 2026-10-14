@@ -31,7 +31,9 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         float schedulerPercent, float dispatchPercent,
                         float synthesisPercent, float postPercent,
                         uint32_t eventsThisBlock, uint32_t scheduledEvents,
-                        const LiveSF2Telemetry& sf2);
+                        const LiveSF2Telemetry& sf2,
+                        uint32_t effectiveVoices = 0,
+                        uint64_t planRefusals = 0);
 
 } // namespace svms
 

@@ -100,6 +100,7 @@ public:
             windowHits_[idx].store(0u, std::memory_order_relaxed);
             stacks_[idx].store(0u, std::memory_order_relaxed);
             outStack = 1u;
+            NoteSpawn(idx, 1u);
             return true;
         }
         // Inside the window: spawn on every `t`-th hit, re-anchoring the
@@ -112,6 +113,7 @@ public:
             windowHits_[idx].store(0u, std::memory_order_relaxed);
             outStack = stacks_[idx].exchange(0u,
                 std::memory_order_relaxed) + 1u;
+            NoteSpawn(idx, outStack);
             return true;
         }
         const uint32_t prev = stacks_[idx].fetch_add(
@@ -127,11 +129,45 @@ public:
         return OnNoteOn(keyIndex, qpc, ignoredStack);
     }
 
+    // Census only: average number of note-ons one spawned voice on this key
+    // stands for (>= 1), smoothed over recent spawns. Dropped hits never
+    // become voices, so the live count scales each surviving voice by this.
+    uint32_t SpawnWeight(uint32_t keyIndex) const noexcept {
+        const uint32_t w = spawnWeight16_[keyIndex & (kKeyCount - 1u)].load(
+            std::memory_order_relaxed);
+        return w > 24u ? (w + 8u) >> 4 : 1u;
+    }
+
+    // Re-excite thinning. A repeat hit that follows the key's last kept hit
+    // (spawn or re-excite) by less than the attack ramp finds every live voice
+    // still ramping, so it changes nothing audible: it is dropped here, before
+    // it costs an event. Caps a key at one kept hit per ramp (250 Hz at 4 ms).
+    // Same time domain as OnNoteOn's `qpc`.
+    void SetReExciteSpacing(uint64_t ticks) noexcept {
+        reExciteSpacing_.store(ticks, std::memory_order_relaxed);
+    }
+    bool AllowReExcite(uint32_t keyIndex, uint64_t qpc) noexcept {
+        const uint64_t spacing =
+            reExciteSpacing_.load(std::memory_order_relaxed);
+        if (spacing == 0u) return true;
+        const uint32_t idx = keyIndex & (kKeyCount - 1u);
+        const uint64_t spawned =
+            lastSpawnQpc_[idx].load(std::memory_order_relaxed);
+        const uint64_t excited =
+            lastExciteQpc_[idx].load(std::memory_order_relaxed);
+        const uint64_t last = spawned > excited ? spawned : excited;
+        if (last != 0u && qpc - last < spacing) return false;
+        lastExciteQpc_[idx].store(qpc, std::memory_order_relaxed);
+        return true;
+    }
+
     void ResetKey(uint32_t keyIndex) noexcept {
         const uint32_t idx = keyIndex & (kKeyCount - 1u);
+        lastExciteQpc_[idx].store(0u, std::memory_order_relaxed);
         lastSpawnQpc_[idx].store(0u, std::memory_order_relaxed);
         windowHits_[idx].store(0u, std::memory_order_relaxed);
         stacks_[idx].store(0u, std::memory_order_relaxed);
+        spawnWeight16_[idx].store(0u, std::memory_order_relaxed);
     }
 
     void ResetChannel(uint32_t channel) noexcept {
@@ -145,15 +181,26 @@ public:
     void ResetAll() noexcept {
         for (uint32_t k = 0; k < kKeyCount; ++k) {
             lastSpawnQpc_[k].store(0u, std::memory_order_relaxed);
+            lastExciteQpc_[k].store(0u, std::memory_order_relaxed);
             windowHits_[k].store(0u, std::memory_order_relaxed);
             stacks_[k].store(0u, std::memory_order_relaxed);
+            spawnWeight16_[k].store(0u, std::memory_order_relaxed);
         }
     }
 
 private:
+    // EWMA (x16 fixed point, alpha 1/4) of note-ons per spawned voice.
+    void NoteSpawn(uint32_t idx, uint32_t stack) noexcept {
+        const uint32_t old = spawnWeight16_[idx].load(std::memory_order_relaxed);
+        spawnWeight16_[idx].store((old * 3u + (stack << 4)) >> 2,
+                                  std::memory_order_relaxed);
+    }
+    std::atomic<uint32_t> spawnWeight16_[kKeyCount]{};
     std::atomic<uint32_t> threshold_{1u}; // default: OFF
     std::atomic<uint64_t> windowTicks_{0u}; // default: OFF
     std::atomic<uint64_t> lastSpawnQpc_[kKeyCount]{};
+    std::atomic<uint64_t> lastExciteQpc_[kKeyCount]{};
+    std::atomic<uint64_t> reExciteSpacing_{0u};
     std::atomic<uint32_t> windowHits_[kKeyCount]{};
     std::atomic<uint32_t> stacks_[kKeyCount]{};
 };

@@ -61,29 +61,20 @@ inline bool SequenceAtOrBefore(uint32_t sequence, uint32_t fence) noexcept {
     return static_cast<int32_t>(sequence - fence) <= 0;
 }
 
-// ── Adaptive decimation ─────────────────────────────────────────────────
-// SnappySynth-style step table.  Step is the stride through the active
-// voice list when rendering under polyphony pressure.  Step=1 means full
-// quality (all voices rendered every sample).
-// At step=8, every 8th voice is rendered — 87.5% voice cull.
-// Unrendered voices still hold their state but do not produce output
-// samples, effectively pausing their temporal resolution.
-// The step changes per-block based on active voice count.
-//
-// Correctness mode currently renders the complete configured pool at full
-// quality. The dormant tier constants are retained for a future explicitly
-// selectable overload policy; none are reached at the current hard ceiling.
-constexpr uint32_t kDecimationTier1 = 2049;    // step 1 through 2048 voices
-constexpr uint32_t kDecimationTier2 = 8193;    // step 2 through 8192
-constexpr uint32_t kDecimationTier3 = 32769;   // step 4 through 32768
-constexpr uint32_t kDecimationTier4 = 131073;  // step 8 through 131072
-                                                // beyond: step 16
+// Voice decimation tiers (opt-in, see RenderScalar::SetDecimationEnabled):
+// step 1 through 10,000 voices, 2 through 25,000, 4 through 50,000, 8
+// through 150,000, 16 beyond.  A step of N lets the loudest 1/N of the
+// voices (by velocity) keep mixing; the rest still advance their state.
+constexpr uint32_t kDecimationTier1 = 10000;
+constexpr uint32_t kDecimationTier2 = 25000;
+constexpr uint32_t kDecimationTier3 = 50000;
+constexpr uint32_t kDecimationTier4 = 150000;
 
 inline uint32_t ComputeDecimationStep(uint32_t activeVoiceCount) {
-    if (activeVoiceCount < kDecimationTier1) return 1;
-    if (activeVoiceCount < kDecimationTier2) return 2;
-    if (activeVoiceCount < kDecimationTier3) return 4;
-    if (activeVoiceCount < kDecimationTier4) return 8;
+    if (activeVoiceCount <= kDecimationTier1) return 1;
+    if (activeVoiceCount <= kDecimationTier2) return 2;
+    if (activeVoiceCount <= kDecimationTier3) return 4;
+    if (activeVoiceCount <= kDecimationTier4) return 8;
     return 16;
 }
 
@@ -469,9 +460,13 @@ struct SamplePage {
 // each one was its own victim cache miss (~21 lines per steal); as a row they
 // are one line.  Accessed through RowColumn, so `v.note[h]` keeps its
 // SoA spelling; only pointer-style uses (memcpy, `v.note + i`) cannot exist.
-// Ordered largest-first so the row packs to 59 bytes without padding holes.
+// Ordered largest-first so the row packs to 63 bytes without padding holes.
+// `mult` is the number of exact-duplicate note-ons (same channel, key,
+// velocity, frame) one voice stands for: its gains already carry the factor,
+// so 0 and 1 both mean an ordinary single voice.
 #define SVMS_VOICE_ROW_FIELDS(X) \
     X(uint32_t, playIndex) \
+    X(uint32_t, mult) \
     X(float, basePhaseIncs) \
     X(float, pitchBendScales) \
     X(float, gainLeft) \
@@ -602,9 +597,7 @@ struct alignas(64) VoiceSoA {
 
     VoiceSoA(const VoiceSoA& other) {
         ResetFixedTails();
-        const bool reserved = other.denseOnly_
-            ? ReserveDenseRender(other.capacity_)
-            : Reserve(other.capacity_);
+        const bool reserved = Reserve(other.capacity_);
         if (!reserved) throw std::bad_alloc();
         CopyFrom(other);
         rot = nullptr;             // copies start rotation-inactive
@@ -613,9 +606,7 @@ struct alignas(64) VoiceSoA {
 
     VoiceSoA& operator=(const VoiceSoA& other) {
         if (this == &other) return *this;
-        const bool reserved = other.denseOnly_
-            ? ReserveDenseRender(other.capacity_)
-            : Reserve(other.capacity_);
+        const bool reserved = Reserve(other.capacity_);
         if (!reserved) throw std::bad_alloc();
         CopyFrom(other);
         _aligned_free(rot);        // copies start rotation-inactive
@@ -663,7 +654,7 @@ struct alignas(64) VoiceSoA {
     }
 
     bool Reserve(uint32_t capacity) noexcept {
-        if (capacity == capacity_ && !denseOnly_) return true;
+        if (capacity == capacity_) return true;
         if (capacity == 0u) {
             ReleaseStorage();
             return true;
@@ -686,7 +677,6 @@ struct alignas(64) VoiceSoA {
         storageLargePages_ = largePages;
         storageBytes_ = bytes;
         capacity_ = capacity;
-        denseOnly_ = false;
 
 #define SVMS_NULL_BEFORE_BIND(type, name) name = nullptr;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_BEFORE_BIND)
@@ -701,50 +691,6 @@ struct alignas(64) VoiceSoA {
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_BIND_DYNAMIC_FIELD)
 #undef SVMS_BIND_DYNAMIC_FIELD
         BindRows(reinterpret_cast<VoiceRow*>(base + AlignUp(offset)));
-        return true;
-    }
-
-    // The dense multicore planner owns a private synthesis image. It never
-    // reads MIDI identity, channel/key links, pitch bookkeeping, or steal
-    // metadata, so do not reserve those cold arrays a second time.
-    bool ReserveDenseRender(uint32_t capacity) noexcept {
-        if (capacity == capacity_ && denseOnly_) return true;
-        if (capacity == 0u) {
-            ReleaseStorage();
-            return true;
-        }
-
-        size_t bytes = 0u;
-#define SVMS_ACCUMULATE_DENSE_FIELD_SIZE(type, name) \
-        bytes = AlignUp(bytes); \
-        bytes += static_cast<size_t>(capacity) * sizeof(type);
-        SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_ACCUMULATE_DENSE_FIELD_SIZE)
-#undef SVMS_ACCUMULATE_DENSE_FIELD_SIZE
-
-        void* allocation = TryAllocateLargePages(bytes);
-        const bool largePages = allocation != nullptr;
-        if (!allocation) allocation = _aligned_malloc(bytes, kMixBufferAlign);
-        if (!allocation) return false;
-        FreeStorageBlock();
-        storage_ = allocation;
-        storageLargePages_ = largePages;
-        storageBytes_ = bytes;
-        capacity_ = capacity;
-        denseOnly_ = true;
-
-#define SVMS_NULL_BEFORE_DENSE_BIND(type, name) name = nullptr;
-        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_BEFORE_DENSE_BIND)
-#undef SVMS_NULL_BEFORE_DENSE_BIND
-        BindRows(nullptr);
-
-        size_t offset = 0u;
-        uint8_t* base = static_cast<uint8_t*>(storage_);
-#define SVMS_BIND_DENSE_FIELD(type, name) \
-        offset = AlignUp(offset); \
-        name = reinterpret_cast<type*>(base + offset); \
-        offset += static_cast<size_t>(capacity_) * sizeof(type);
-        SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_BIND_DENSE_FIELD)
-#undef SVMS_BIND_DENSE_FIELD
         return true;
     }
 
@@ -763,19 +709,14 @@ struct alignas(64) VoiceSoA {
         return sizeof(*this) + storageBytes_ +
                static_cast<size_t>(rotCapacity_) * sizeof(VoiceRotationState);
     }
-    static size_t EstimateStorageBytes(uint32_t capacity,
-                                       bool denseOnly = false) noexcept {
+    static size_t EstimateStorageBytes(uint32_t capacity) noexcept {
         if (capacity == 0u) return 0u;
         size_t bytes = 0u;
 #define SVMS_ESTIMATE_FIELD_SIZE(type, name) \
         bytes = AlignUp(bytes); \
         bytes += static_cast<size_t>(capacity) * sizeof(type);
-        if (denseOnly) {
-            SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_ESTIMATE_FIELD_SIZE)
-        } else {
-            SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ESTIMATE_FIELD_SIZE)
-            bytes = AlignUp(bytes) + static_cast<size_t>(capacity) * sizeof(VoiceRow);
-        }
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ESTIMATE_FIELD_SIZE)
+        bytes = AlignUp(bytes) + static_cast<size_t>(capacity) * sizeof(VoiceRow);
 #undef SVMS_ESTIMATE_FIELD_SIZE
         return bytes;
     }
@@ -788,89 +729,6 @@ struct alignas(64) VoiceSoA {
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_ONE_DYNAMIC_FIELD)
 #undef SVMS_COPY_ONE_DYNAMIC_FIELD
         destination.rows[destinationHandle] = source.rows[sourceHandle];
-    }
-
-    static void CopyRenderProgress(VoiceSoA& destination, uint32_t handle,
-                                   const VoiceSoA& source) noexcept {
-        destination.phases[handle] = source.phases[handle];
-        destination.currentGain[handle] = source.currentGain[handle];
-        destination.filterA0[handle] = source.filterA0[handle];
-        destination.filterB1[handle] = source.filterB1[handle];
-        destination.filterB2[handle] = source.filterB2[handle];
-        destination.filterZ1[handle] = source.filterZ1[handle];
-        destination.filterZ2[handle] = source.filterZ2[handle];
-        destination.filterEnabled[handle] = source.filterEnabled[handle];
-        destination.envelopeStage[handle] = source.envelopeStage[handle];
-        destination.delaySamplesRemaining[handle] =
-            source.delaySamplesRemaining[handle];
-        destination.holdSamplesRemaining[handle] =
-            source.holdSamplesRemaining[handle];
-        destination.attackSamplesRemaining[handle] =
-            source.attackSamplesRemaining[handle];
-        destination.decaySamplesRemaining[handle] =
-            source.decaySamplesRemaining[handle];
-        destination.releaseSamplesRemaining[handle] =
-            source.releaseSamplesRemaining[handle];
-        destination.stealFadeInFramesRemaining[handle] =
-            source.stealFadeInFramesRemaining[handle];
-        destination.stealFadeInFramesTotal[handle] =
-            source.stealFadeInFramesTotal[handle];
-    }
-
-    // Dense worker plans need a private render image, not a second copy of
-    // MIDI identity, channel/key links, stealing metadata, or immutable
-    // launch bookkeeping. Copy only the arrays workers read or mutate. This
-    // is the first concrete hot/cold split: at large capacities it avoids
-    // streaming dozens of cold bytes per slot at every dense callback.
-    void CopyDenseRenderStateFrom(const VoiceSoA& source) noexcept {
-        assert(capacity_ >= source.capacity_);
-        const size_t count = source.capacity_;
-#define SVMS_COPY_DENSE_FIELD(name) \
-        std::memcpy(name, source.name, \
-            count * sizeof(*name))
-        SVMS_COPY_DENSE_FIELD(state);
-        SVMS_COPY_DENSE_FIELD(envelopeStage);
-        SVMS_COPY_DENSE_FIELD(sampleBacked);
-        SVMS_COPY_DENSE_FIELD(renderClass);
-        SVMS_COPY_DENSE_FIELD(phases);
-        SVMS_COPY_DENSE_FIELD(phaseIncs);
-        SVMS_COPY_DENSE_FIELD(currentGain);
-        SVMS_COPY_DENSE_FIELD(targetGain);
-        SVMS_COPY_DENSE_FIELD(sustainLevel);
-        SVMS_COPY_DENSE_FIELD(attackGainStep);
-        SVMS_COPY_DENSE_FIELD(releaseDecay);
-        SVMS_COPY_DENSE_FIELD(mixGainL);
-        SVMS_COPY_DENSE_FIELD(mixGainR);
-        SVMS_COPY_DENSE_FIELD(renderGainL);
-        SVMS_COPY_DENSE_FIELD(renderGainR);
-        SVMS_COPY_DENSE_FIELD(filterA0);
-        SVMS_COPY_DENSE_FIELD(filterB1);
-        SVMS_COPY_DENSE_FIELD(filterB2);
-        SVMS_COPY_DENSE_FIELD(filterZ1);
-        SVMS_COPY_DENSE_FIELD(filterZ2);
-        SVMS_COPY_DENSE_FIELD(filterEnabled);
-        SVMS_COPY_DENSE_FIELD(sampleStart);
-        SVMS_COPY_DENSE_FIELD(loopEnabled);
-        SVMS_COPY_DENSE_FIELD(relEnd);
-        SVMS_COPY_DENSE_FIELD(relLoopS);
-        SVMS_COPY_DENSE_FIELD(relLoopE);
-        SVMS_COPY_DENSE_FIELD(relLoopSF);
-        SVMS_COPY_DENSE_FIELD(relLoopEF);
-        SVMS_COPY_DENSE_FIELD(holdSamplesRemaining);
-        SVMS_COPY_DENSE_FIELD(attackSamplesRemaining);
-        SVMS_COPY_DENSE_FIELD(decaySamplesRemaining);
-        SVMS_COPY_DENSE_FIELD(delaySamplesRemaining);
-        SVMS_COPY_DENSE_FIELD(releaseSamplesRemaining);
-        SVMS_COPY_DENSE_FIELD(decaySlope);
-        SVMS_COPY_DENSE_FIELD(stealFadeInFramesRemaining);
-        SVMS_COPY_DENSE_FIELD(stealFadeInFramesTotal);
-#undef SVMS_COPY_DENSE_FIELD
-        if (capacity_ > source.capacity_) {
-            std::memset(state + source.capacity_, 0,
-                static_cast<size_t>(capacity_ - source.capacity_) *
-                    sizeof(*state));
-        }
-        CopyFixedTailsFrom(source);
     }
 
     void CopyFixedTailsFrom(const VoiceSoA& source) noexcept {
@@ -912,7 +770,6 @@ private:
         storage_ = other.storage_;
         storageBytes_ = other.storageBytes_;
         capacity_ = other.capacity_;
-        denseOnly_ = other.denseOnly_;
         storageLargePages_ = other.storageLargePages_;
         other.storageLargePages_ = false;
         rot = other.rot;
@@ -934,7 +791,6 @@ private:
         other.storage_ = nullptr;
         other.storageBytes_ = 0u;
         other.capacity_ = 0u;
-        other.denseOnly_ = false;
         other.pad16 = 0u;
         other.ResetFixedTails();
     }
@@ -957,7 +813,6 @@ private:
         storage_ = nullptr;
         storageBytes_ = 0u;
         capacity_ = 0u;
-        denseOnly_ = false;
 #define SVMS_NULL_DYNAMIC_FIELD(type, name) name = nullptr;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_DYNAMIC_FIELD)
 #undef SVMS_NULL_DYNAMIC_FIELD
@@ -974,7 +829,6 @@ private:
     void* storage_ = nullptr;
     size_t storageBytes_ = 0u;
     uint32_t capacity_ = 0u;
-    bool denseOnly_ = false;
     bool storageLargePages_ = false;
 };
 

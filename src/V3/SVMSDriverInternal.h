@@ -52,6 +52,7 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSPSCQueue.h"
 #include "SVMSNoteOnCollapse.h"
+#include "SVMSNoteMerge.h"
 
 // Fixed QPC-time collapse window for same-key note-on coalescing.
 // Frame-size independent by construction: never derived from the WASAPI
@@ -627,10 +628,15 @@ private:
                                          uint32_t eventCount,
                                          uint32_t blockCursor, void* userData);
 
+    // `multiplicity` > 1: one launch standing for that many exact-duplicate
+    // note-ons (see SVMSNoteMerge.h). Phase rotation gives every voice its own
+    // random angle, which a merged voice cannot reproduce, so a rotating pool
+    // expands the launch into `multiplicity` ordinary ones.
     uint64_t HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
                           bool deferLifetimeCounters = false,
                           const NoteLaunchPlanCacheEntry* exactFramePlan = nullptr,
-                          uint32_t blockOffset = 0u);
+                          uint32_t blockOffset = 0u,
+                          uint32_t multiplicity = 1u);
     void HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset);
     void HandleStaleNoteOffBatch(uint8_t channel, uint8_t note, uint8_t count,
                                  uint32_t blockOffset);
@@ -749,6 +755,21 @@ private:
     CcCollapseRecord ccCollapseRecords_[kChannelCount][128]{};
     uint64_t ccPageFillEpoch_ = 0u;   // compiler-thread owned
     uint64_t ccCollapsedCount_ = 0u;  // compiler-thread owned, census only
+    // Opt-in exact note-on merging (SVMSNoteMerge.h), run by the compiler
+    // thread on each sorted page. noteMergeHoist_ is false while a loaded
+    // SoundFont has exclusive classes (hi-hat chokes make launch order
+    // observable), which limits merging to adjacent note-ons.
+    std::atomic<bool> noteMergeEnabled_{false};
+    // Opt-in: coalescing keeps collapsed repeat hits as re-excite events.
+    std::atomic<bool> noteOnReexcite_{false};
+    std::atomic<bool> noteMergeHoist_{true};
+    NoteMerger noteMerger_;                         // compiler-thread owned
+    std::atomic<uint64_t> noteMergedAtomic_{0u};    // note-ons folded away
+    // Audio-thread census of the pool, refreshed on the 64-block cadence:
+    // how many voices the pool would hold had nothing been merged.
+    std::atomic<uint64_t> effectiveVoicesAtomic_{0u};
+    std::atomic<uint64_t> effectiveVoicesPeakAtomic_{0u};
+    VoiceManager::EffectiveScan effectiveScan_;     // audio-thread owned
     std::atomic<bool> cancelProducers_;
     std::atomic<uint32_t> producerWakeEpoch_;
     std::atomic<uint32_t> scheduledSizePublished_;

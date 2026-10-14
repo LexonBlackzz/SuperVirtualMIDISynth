@@ -352,7 +352,14 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
         uint32_t stack = 0u;
         if (!noteOnCollapse_.OnNoteOn(keyIndex, qpcTimestamp, stack)) {
             coalescedAtomic_.fetch_add(1u, std::memory_order_relaxed);
-            return true;
+            if (!noteOnReexcite_.load(std::memory_order_relaxed)) return true;
+            // Hits inside the previous kept hit's attack ramp change nothing.
+            if (!noteOnCollapse_.AllowReExcite(keyIndex, qpcTimestamp))
+                return true;
+            // Re-excite: keep the hit at its exact timestamp, tagged so the
+            // audio thread restarts the key's live voices instead of
+            // launching one. (No stack/velocity boost: nothing is dropped.)
+            evt.message |= kReExciteMessageTag;
         }
         // ── Velocity stacking ───────────────────────────────────────────
         // The collapsed hits between two spawns are density, not silence.
@@ -798,6 +805,18 @@ void Driver::EventCompilerLoop() {
         if (compiledCount != 0u) {
             SortCompiledEventPage(page.events, compiledPages_.SortScratch(),
                                   compiledCount);
+            // Opt-in exact note-on merging: runs on the sorted page, so the
+            // fold only ever sees events in their final dispatch order.
+            if (noteMergeEnabled_.load(std::memory_order_relaxed)) {
+                uint64_t folded = 0u;
+                compiledCount = noteMerger_.Merge(
+                    page.events, compiledCount,
+                    noteMergeHoist_.load(std::memory_order_relaxed), folded);
+                if (folded != 0u) {
+                    noteMergedAtomic_.fetch_add(folded,
+                                                std::memory_order_relaxed);
+                }
+            }
             while (!compiledPages_.PublishFromCompiler(pageIndex,
                                                         compiledCount)) {
                 if (cancelProducers_.load(std::memory_order_acquire)) {

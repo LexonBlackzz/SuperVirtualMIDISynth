@@ -1,6 +1,8 @@
 #include <cmath>
 #include "SVMSRenderScalar.h"
 #include "SVMSChannelLimiter.h"
+#include "SVMSNoteMerge.h"
+#include "SVMSHilbertPair.h"
 #include "SVMSSoundFont.h"
 
 #include <windows.h>
@@ -57,6 +59,10 @@ uint64_t gStealCycles = 0u;
 uint64_t gRegionResolveCycles = 0u;
 uint64_t gLaunchPrepareCycles = 0u;
 uint64_t gMatchedRegions = 0u;
+// --note-merge census: event-array sizes around the merge pass.
+uint64_t gMergeEventsIn = 0u;
+uint64_t gMergeEventsOut = 0u;
+uint64_t gMergeFolded = 0u;
 uint64_t gBreakdownSampleCounter = 0u;
 uint64_t gRdtscPairOverhead = 0u;
 constexpr uint32_t kBreakdownSampleInterval = 4096u;
@@ -89,6 +95,9 @@ struct Options {
     bool channelLimiter = false;  // route the block through 16 channel buses
     bool breakdown = false;
     bool coverageProfile = false;
+    bool vibratoLfo = false;
+    bool decimation = false;
+    uint32_t rotationMode = 0u;  // 0 coherent, 1 analytic, 2 sweep, 3 diffuse, 4 random
     bool transactionalLaunch = true;
     bool copiedLaunchPlan = false;
     bool batchNoteOffIndex = false;
@@ -103,7 +112,20 @@ struct Options {
     uint32_t attackFrames = 0;
     uint32_t noteLengthFrames = 1;
     uint32_t ccRate = 0;
+    uint32_t resetRate = 0;
     uint32_t bendRate = 0;  // pitch bends per second (--bend-rate)
+    // chopped-notes: NoteReExcite hits per second (--reexcite-rate) on keys
+    // that are sounding, the events note-on coalescing's re-excite mode keeps
+    // instead of dropping. The bench dispatch restarts live voices only.
+    uint32_t reexciteRate = 0;
+    // chopped-notes duplicates: every distinct note is emitted this many
+    // times on the same frame (a community-merge MIDI stacks the same note
+    // on several tracks). --note-rate stays the TOTAL note-on rate. Copy c
+    // ends --duplicate-jitter * c frames after copy 0, so a non-zero jitter
+    // makes the copies end at different times (forks under --note-merge).
+    uint32_t duplicateFactor = 1;
+    uint32_t duplicateJitter = 0;
+    bool noteMerge = false;  // --note-merge: fold the duplicates (SVMSNoteMerge.h)
     uint32_t ccController = 0;   // 0 = cycle 64/66/120/123
     uint32_t renderThreads = 1;
     uint32_t stealPolicy = 0u;
@@ -168,10 +190,21 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         } else if (std::strcmp(argv[i], "--note-length-frames") == 0) {
             if (!nextNumber(options.noteLengthFrames) ||
                 options.noteLengthFrames > options.frames) return false;
+        } else if (std::strcmp(argv[i], "--reset-rate") == 0) {
+            if (!nextNumber(options.resetRate)) return false;
         } else if (std::strcmp(argv[i], "--cc-rate") == 0) {
             if (!nextNumber(options.ccRate)) return false;
         } else if (std::strcmp(argv[i], "--bend-rate") == 0) {
             if (!nextNumber(options.bendRate)) return false;
+        } else if (std::strcmp(argv[i], "--reexcite-rate") == 0) {
+            if (!nextNumber(options.reexciteRate)) return false;
+        } else if (std::strcmp(argv[i], "--duplicate-factor") == 0) {
+            if (!nextNumber(options.duplicateFactor) ||
+                options.duplicateFactor == 0u) return false;
+        } else if (std::strcmp(argv[i], "--duplicate-jitter") == 0) {
+            if (!nextNumber(options.duplicateJitter)) return false;
+        } else if (std::strcmp(argv[i], "--note-merge") == 0) {
+            options.noteMerge = true;
         } else if (std::strcmp(argv[i], "--cc-controller") == 0) {
             if (!nextNumber(options.ccController) ||
                 options.ccController > 127u)
@@ -199,6 +232,13 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.channelLimiter = true;
         } else if (std::strcmp(argv[i], "--breakdown") == 0) {
             options.breakdown = true;
+        } else if (std::strcmp(argv[i], "--decimation") == 0) {
+            options.decimation = true;
+        } else if (std::strcmp(argv[i], "--vibrato-lfo") == 0) {
+            options.vibratoLfo = true;
+        } else if (std::strcmp(argv[i], "--rotation-mode") == 0) {
+            if (!nextNumber(options.rotationMode) || options.rotationMode > 4u)
+                return false;
         } else if (std::strcmp(argv[i], "--coverage") == 0) {
             options.coverageProfile = true;
         } else if (std::strcmp(argv[i], "--launch-churn") == 0) {
@@ -323,6 +363,10 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
     return true;
 }
 
+// --vibrato-lfo: every voice carries an SF2-default-like vibrato LFO
+// (50 cents, ~5 Hz, no delay) so CC1 actually modulates in the bench.
+static bool gBenchVibratoLfo = false;
+
 void PrepareSyntheticLaunchPlan(svms::VoiceConfiguration* setups,
                                 uint32_t count, uint32_t sampleFrames,
                                 uint8_t note, uint32_t attackFrames) {
@@ -350,6 +394,10 @@ void PrepareSyntheticLaunchPlan(svms::VoiceConfiguration* setups,
         setup.gainLeft = setup.gainRight = 0.001f;
         setup.presetIndex = 0u;
         setup.regionIndex = static_cast<uint16_t>(identity & 0xffffu);
+        if (gBenchVibratoLfo) {
+            setup.vibLfoToPitchCents = 50.0f;
+            setup.vibLfoPhaseStep = 5.0f / 44100.0f;
+        }
     }
 }
 
@@ -360,9 +408,20 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
                    bool transactional = false,
                    bool copiedLaunchPlan = false,
                    uint32_t profileScale = 0u,
-                   const svms::VoiceConfiguration* preparedSetups = nullptr) {
+                   const svms::VoiceConfiguration* preparedSetups = nullptr,
+                   uint32_t multiplicity = 1u) {
     constexpr uint32_t regionFrames = 2048;
     const uint32_t regionCount = sampleFrames / regionFrames;
+    if (multiplicity > 1u && !(transactional && count <= 8u)) {
+        // Only the transactional launch carries a multiplicity; the legacy
+        // per-layer path launches the copies one by one.
+        for (uint32_t unit = 0u; unit < multiplicity; ++unit) {
+            PerformSteals(voices, channels, sequence, count, sampleFrames,
+                          sourceEvent, attackFrames, transactional,
+                          copiedLaunchPlan, profileScale, preparedSetups, 1u);
+        }
+        return;
+    }
     // Every physical SF2 region produced by one MIDI note belongs to one
     // playIndex. This makes the synthetic layered benchmark exercise the
     // same atomic stereo-stealing path as the production driver.
@@ -399,11 +458,12 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
                 copied[layer].playIndex = playIndex;
             }
             voices.LaunchVoiceGroup(channel, note, velocity, copied, count,
-                                    channels.GetParams()[channel], handles);
+                                    playIndex, channels.GetParams()[channel],
+                                    handles, 0u, multiplicity);
         } else {
             voices.LaunchVoiceGroup(channel, note, velocity, setups, count,
                                     playIndex, channels.GetParams()[channel],
-                                    handles);
+                                    handles, 0u, multiplicity);
         }
         return;
     }
@@ -524,7 +584,7 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
                               context->attackFrames,
                               context->transactionalLaunch,
                               context->copiedLaunchPlan, 0u,
-                              plan.setups);
+                              plan.setups, event.count);
                 const uint64_t end = __rdtsc();
                 gStealCycles += ScaledProfileDelta(
                     begin, end, stealScale);
@@ -534,7 +594,8 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
                           context->sampleFrames, &event,
                           context->attackFrames,
                           context->transactionalLaunch,
-                          context->copiedLaunchPlan, 0u, plan.setups);
+                          context->copiedLaunchPlan, 0u, plan.setups,
+                          event.count);
             break;
         }
         case svms::RenderEventType::NoteOff: {
@@ -545,6 +606,12 @@ void MixedDispatch(const svms::RenderEvent& event, uint32_t blockCursor,
                 event.channel, event.data1, 1u, sustain, blockCursor);
             break;
         }
+        case svms::RenderEventType::NoteReExcite:
+            voices.ReExciteKey(event.channel, event.data1);
+            break;
+        case svms::RenderEventType::Reset:
+            voices.Reset();
+            break;
         case svms::RenderEventType::ControlChange:
             channels.ControlChange(event.channel, event.data1, event.data2);
             channels.RebuildCache(*context->config, 44100.0f);
@@ -629,7 +696,7 @@ int main(int argc, char** argv) {
             "[--event-stride N] [--note-rate N] [--key-count 1..128] [--base-note 0..127] [--key-stride 1..127] [--attack-frames N] [--note-length-frames N] [--cc-rate N] [--cc-controller 0..127] [--generic-voices N] [--soundfont PATH] "
             "[--render-threads 1..64] "
             "[--backend auto|scalar|sse2|avx2] "
-            "[--launch-path legacy|transactional] "
+            "[--rotation-mode 0..4] [--vibrato-lfo] [--decimation] [--reset-rate N] [--launch-path legacy|transactional] "
             "[--launch-plan direct|copy] "
             "[--noteoff-index immediate|batch] "
             "[--breakdown] [--coverage] [--launch-churn] [--volatile-selection heap|scan] "
@@ -692,7 +759,29 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot initialize render workers\n");
         return 3;
     }
-    renderer->SetCoverageProfilingEnabledForTest(options.coverageProfile);
+    renderer->SetDecimationEnabled(options.decimation);
+    gBenchVibratoLfo = options.vibratoLfo;
+    if (options.vibratoLfo) {
+        for (uint32_t a = 0; a < voices->activeCount_; ++a) {
+            const uint32_t h = voices->activeList_[a];
+            voices->v.vibLfoToPitchCents[h] = 50.0f;
+            voices->v.vibLfoSteps[h] = 5.0f / 44100.0f;
+        }
+    }
+    // Rotation modes need the exact analytic companion store (periodic
+    // transform of the whole bench slice, which plays as one loop).
+    std::vector<int16_t> hilbert;
+    const int16_t* hilbertPtr = nullptr;
+    if (options.rotationMode != 0u) {
+        hilbert.assign(samples.size(), 0);
+        svms::BuildHilbertSlice(samples.data(), hilbert.data(),
+                                {0u, sampleFrames, 0u, sampleFrames});
+        hilbertPtr = hilbert.data();
+        if (!voices->SetPhaseRotationMode(options.rotationMode)) {
+            std::fprintf(stderr, "cannot allocate rotation state\n");
+            return 3;
+        }
+    }
     if (!options.automaticBackend && !renderer->SetRenderBackend(options.backend)) {
         std::fprintf(stderr, "requested render backend is not supported by this CPU/build\n");
         return 3;
@@ -737,15 +826,21 @@ int main(int argc, char** argv) {
             ? noteOnCount * 2u : noteOnCount;
         events.resize(eventCount);
         if (options.workload == Workload::ChoppedNotes) {
+            // With --duplicate-factor N consecutive note indices are copies of
+            // one distinct note: same frame, channel, key and velocity.
+            const uint32_t factor = options.duplicateFactor;
+            const uint32_t distinctNotes = (noteOnCount + factor - 1u) / factor;
             for (uint32_t noteIndex = 0u; noteIndex < noteOnCount;
                  ++noteIndex) {
+                const uint32_t group = noteIndex / factor;
+                const uint32_t copy = noteIndex % factor;
                 const uint32_t frame = static_cast<uint32_t>(
-                    static_cast<uint64_t>(noteIndex) * options.frames /
-                    noteOnCount);
-                const uint8_t channel = static_cast<uint8_t>(noteIndex & 15u);
+                    static_cast<uint64_t>(group) * options.frames /
+                    distinctNotes);
+                const uint8_t channel = static_cast<uint8_t>(group & 15u);
                 const uint8_t note = static_cast<uint8_t>(
                     (options.baseNote +
-                     (noteIndex % options.keyCount) * options.keyStride) &
+                     (group % options.keyCount) * options.keyStride) &
                     127u);
                 svms::RenderEvent& on = events[noteIndex * 2u];
                 on.frameOffset = frame;
@@ -755,7 +850,8 @@ int main(int argc, char** argv) {
                 on.data1 = note;
                 on.data2 = 127u;
                 svms::RenderEvent& off = events[noteIndex * 2u + 1u];
-                off.frameOffset = (frame + options.noteLengthFrames) %
+                off.frameOffset = (frame + options.noteLengthFrames +
+                                   copy * options.duplicateJitter) %
                     options.frames;
                 off.ingressSequence = noteIndex * 2u;
                 off.type = svms::RenderEventType::NoteOff;
@@ -798,6 +894,25 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // Reset interleave (--reset-rate): GM-reset-style barrier events,
+            // spread evenly over the block.
+            if (options.resetRate != 0u) {
+                const uint32_t resetCount = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(options.resetRate) * options.frames +
+                     44099u) / 44100u);
+                const size_t base = events.size();
+                events.resize(base + resetCount);
+                for (uint32_t index = 0u; index < resetCount; ++index) {
+                    svms::RenderEvent& event = events[base + index];
+                    event.frameOffset = static_cast<uint32_t>(
+                        static_cast<uint64_t>(index) * options.frames /
+                        resetCount);
+                    event.ingressSequence = static_cast<uint32_t>(base) + index;
+                    event.type = svms::RenderEventType::Reset;
+                    event.channel = 0u;
+                    event.data1 = event.data2 = 0u;
+                }
+            }
             // Pitch-bend sweep interleave (--bend-rate): bendRate bends per
             // second spread evenly over the block, rotating channels, the
             // shape of a Black MIDI bend riser. Every bend is an exact-frame
@@ -821,6 +936,50 @@ int main(int argc, char** argv) {
                     event.data2 = static_cast<uint8_t>(64u + (index >> 4u) % 32u);
                 }
             }
+            // Re-excite hits (--reexcite-rate): repeat hits on the chopped
+            // notes' own channel/key set, spread evenly over the block, then
+            // thinned exactly like the ingress gate does (a hit within one
+            // attack ramp of the key's last kept hit is dropped), so the
+            // stream matches what the engine really receives.
+            if (options.reexciteRate != 0u) {
+                const uint32_t hitCount = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(options.reexciteRate) *
+                     options.frames + 44099u) / 44100u);
+                const uint32_t spacing = 44100u * svms::kReExciteAttackMs / 1000u;
+                static int64_t lastKept[16 * 128];
+                std::fill(std::begin(lastKept), std::end(lastKept),
+                          -(int64_t{1} << 40));
+                uint32_t kept = 0u;
+                for (uint32_t index = 0u; index < hitCount; ++index) {
+                    const uint32_t group = static_cast<uint32_t>(
+                        (static_cast<uint64_t>(index) * 7919u) % distinctNotes);
+                    svms::RenderEvent event{};
+                    event.frameOffset = static_cast<uint32_t>(
+                        static_cast<uint64_t>(index) * options.frames /
+                        hitCount);
+                    event.type = svms::RenderEventType::NoteReExcite;
+                    event.channel = static_cast<uint8_t>(group & 15u);
+                    event.data1 = static_cast<uint8_t>(
+                        (options.baseNote +
+                         (group % options.keyCount) * options.keyStride) &
+                        127u);
+                    event.data2 = 127u;
+                    int64_t& last =
+                        lastKept[event.channel * 128u + event.data1];
+                    if (static_cast<int64_t>(event.frameOffset) - last <
+                        static_cast<int64_t>(spacing)) {
+                        continue;
+                    }
+                    last = event.frameOffset;
+                    event.ingressSequence =
+                        static_cast<uint32_t>(events.size());
+                    events.push_back(event);
+                    ++kept;
+                }
+                std::fprintf(stderr,
+                             "{\"reexcite\":{\"generated\":%u,\"kept\":%u}}\n",
+                             hitCount, kept);
+            }
             std::stable_sort(events.begin(), events.end(),
                 [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
                     if (a.frameOffset != b.frameOffset)
@@ -832,6 +991,21 @@ int main(int argc, char** argv) {
                 });
             for (uint32_t index = 0u; index < eventCount; ++index)
                 events[index].ingressSequence = index;
+            if (options.noteMerge) {
+                // The pass the realtime compiler runs on every sorted page
+                // (hoisting on: the synthetic bank has no exclusive classes).
+                svms::NoteMerger merger;
+                uint64_t folded = 0u;
+                gMergeEventsIn = events.size();
+                const uint32_t kept = merger.MergeEvents(
+                    events.data(), static_cast<uint32_t>(events.size()), true,
+                    folded);
+                events.resize(kept);
+                for (uint32_t index = 0u; index < kept; ++index)
+                    events[index].ingressSequence = index;
+                gMergeEventsOut = events.size();
+                gMergeFolded = folded;
+            }
         } else for (uint32_t index = 0; index < eventCount; ++index) {
             const uint32_t frame = options.workload == Workload::NoteBurst
                 ? static_cast<uint32_t>(static_cast<uint64_t>(index) *
@@ -932,14 +1106,15 @@ int main(int argc, char** argv) {
         const uint64_t renderBegin = gCollectBreakdown ? __rdtsc() : 0u;
         if (options.reference) {
             renderer->RenderBlockReference(
-                *voices, channels, samples.data(), sampleFrames,
+                *voices, channels, samples.data(), hilbertPtr, sampleFrames,
                 left.data(), right.data(), options.frames, cfg,
                 events.empty() ? nullptr : events.data(),
                 static_cast<uint32_t>(events.size()), true, absoluteFrame,
                 options.channelLimiter ? channelBusLeft : nullptr,
                 options.channelLimiter ? channelBusRight : nullptr);
         } else {
-            renderer->RenderBlock(*voices, channels, samples.data(), sampleFrames,
+            renderer->RenderBlock(*voices, channels, samples.data(), hilbertPtr,
+                                  sampleFrames,
                                   left.data(), right.data(), options.frames, cfg,
                                   events.empty() ? nullptr : events.data(),
                                   static_cast<uint32_t>(events.size()), true, absoluteFrame,
@@ -965,7 +1140,6 @@ int main(int argc, char** argv) {
     gRegionResolveCycles = gLaunchPrepareCycles = 0u;
     gBreakdownSampleCounter = 0u;
     voices->ResetGroupReuseCountersForTest();
-    renderer->ResetCoverageStatsForTest();
     gCollectBreakdown = options.breakdown;
 
     std::vector<double> callbackPercent;
@@ -1071,56 +1245,9 @@ int main(int argc, char** argv) {
     }
     churnBuckets += "]";
 
-    const svms::RenderCoverageStats& coverage =
-        renderer->GetCoverageStatsForTest();
-    char coverageHead[1200]{};
-    std::snprintf(coverageHead, sizeof(coverageHead),
-        "{\"enabled\":%s,\"callbacks\":%llu,\"dense_rendered\":%llu,"
-        "\"dense_execution_fallbacks\":%llu,\"dense_rejected\":{"
-        "\"correctness\":%llu,\"missing_events\":%llu,"
-        "\"event_density\":%llu,\"workers\":%llu,\"storage\":%llu,"
-        "\"voice_capacity\":%llu,\"shadow_capacity\":%llu,"
-        "\"mutation_capacity\":%llu},\"spans\":%llu,"
-        "\"sparse_voice_samples\":%llu,"
-        "\"sustained_parallel_voice_samples\":%llu,"
-        "\"sustained_rejected_voice_samples\":{"
-        "\"unavailable\":%llu,\"frames\":%llu,\"voices\":%llu,"
-        "\"product\":%llu},\"span_counts\":[",
-        options.coverageProfile ? "true" : "false",
-        static_cast<unsigned long long>(coverage.callbacks),
-        static_cast<unsigned long long>(coverage.denseRendered),
-        static_cast<unsigned long long>(coverage.denseExecutionFallbacks),
-        static_cast<unsigned long long>(coverage.denseRejected[0]),
-        static_cast<unsigned long long>(coverage.denseRejected[1]),
-        static_cast<unsigned long long>(coverage.denseRejected[2]),
-        static_cast<unsigned long long>(coverage.denseRejected[3]),
-        static_cast<unsigned long long>(coverage.denseRejected[4]),
-        static_cast<unsigned long long>(coverage.denseRejected[5]),
-        static_cast<unsigned long long>(coverage.denseRejected[6]),
-        static_cast<unsigned long long>(coverage.denseRejected[7]),
-        static_cast<unsigned long long>(coverage.spans),
-        static_cast<unsigned long long>(coverage.sparseVoiceSamples),
-        static_cast<unsigned long long>(coverage.sustainedParallelVoiceSamples),
-        static_cast<unsigned long long>(coverage.sustainedRejectedVoiceSamples[1]),
-        static_cast<unsigned long long>(coverage.sustainedRejectedVoiceSamples[2]),
-        static_cast<unsigned long long>(coverage.sustainedRejectedVoiceSamples[3]),
-        static_cast<unsigned long long>(coverage.sustainedRejectedVoiceSamples[4]));
-    std::string coverageJson = coverageHead;
-    auto appendCoverageArray = [&](const uint64_t* values, uint32_t count) {
-        char number[48]{};
-        for (uint32_t index = 0u; index < count; ++index) {
-            std::snprintf(number, sizeof(number), "%s%llu",
-                index == 0u ? "" : ",",
-                static_cast<unsigned long long>(values[index]));
-            coverageJson += number;
-        }
-    };
-    appendCoverageArray(coverage.spanCounts,
-                        svms::RenderCoverageStats::kSpanBuckets);
-    coverageJson += "],\"span_voice_samples\":[";
-    appendCoverageArray(coverage.spanVoiceSamples,
-                        svms::RenderCoverageStats::kSpanBuckets);
-    coverageJson += "]}";
+    // The span renderer and its coverage counters are gone; the key stays so
+    // existing scripts that read it keep working.
+    const std::string coverageJson = "{\"enabled\":false}";
 
     std::printf(
         "{\"renderer\":\"%s\",\"backend\":\"%s\",\"render_threads\":%u,\"workload\":\"%s\",\"launch_path\":\"%s\",\"launch_plan\":\"%s\",\"launch_churn_profile\":%s,\"volatile_selection\":\"%s\",\"voices\":%u,\"frames\":%u,"
@@ -1266,6 +1393,44 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(renderer->GetWvPlanCycles()),
         static_cast<unsigned long long>(renderer->GetWvJobCycles()),
         static_cast<unsigned long long>(renderer->GetWvPostCycles()));
+    std::fprintf(stderr,
+        "{\"paths\":{\"wv\":%llu,\"dense\":%llu,\"sparse\":%llu},"
+        "\"refusals\":{\"rotation\":%llu,\"event_type\":%llu,"
+        "\"no_dispatcher\":%llu,\"reservation\":%llu,"
+        "\"scalar_vibrato\":%llu,\"forced\":%llu}}\n",
+        (unsigned long long)renderer->GetPathBlocks(0),
+        (unsigned long long)renderer->GetPathBlocks(1),
+        (unsigned long long)renderer->GetPathBlocks(2),
+        (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseRotation),
+        (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseEventType),
+        (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseNoDispatcher),
+        (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseReservation),
+        (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseScalarVibrato),
+        (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseForced));
+    // Duplicate/merge census: the block's event count before and after the
+    // merge pass, and what the pool holds against what it would hold
+    // unmerged (sum of multiplicities over live voices).
+    if (options.noteMerge || options.duplicateFactor > 1u) {
+        std::fprintf(stderr,
+            "{\"note_merge\":{\"enabled\":%s,\"duplicate_factor\":%u,"
+            "\"duplicate_jitter\":%u,\"events_in\":%llu,\"events_out\":%llu,"
+            "\"note_ons_folded\":%llu,\"active_voices\":%u,"
+            "\"effective_voices\":%llu,\"forks\":%u,\"fork_failures\":%u,"
+            "\"events_per_second_effective\":%.0f}}\n",
+            options.noteMerge ? "true" : "false", options.duplicateFactor,
+            options.duplicateJitter,
+            static_cast<unsigned long long>(gMergeEventsIn),
+            static_cast<unsigned long long>(gMergeEventsOut),
+            static_cast<unsigned long long>(gMergeFolded),
+            voices->GetActiveCount(),
+            static_cast<unsigned long long>(voices->CountEffectiveVoices()),
+            voices->GetForkCount(), voices->GetForkFailureCount(),
+            // Source note-ons per second, counting every folded duplicate.
+            elapsedTotal > 0.0
+                ? static_cast<double>(events.size() + gMergeFolded) *
+                      measuredCallbacks / elapsedTotal
+                : 0.0);
+    }
     // Whole-voice per-voice segments (op/release splits): how many took a
     // class kernel vs the scalar fallback. seg_cycles needs a build with
     // SVMS_WV_SEGMENT_PROFILE (0 otherwise).

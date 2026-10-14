@@ -17,6 +17,11 @@ inline std::atomic<float> g_voiceRetireThreshold{kVoiceRetireThreshold};
 inline float VoiceRetireThreshold() {
     return g_voiceRetireThreshold.load(std::memory_order_relaxed);
 }
+// Note-on re-excite: the attack ramp a repeat hit takes back up to the peak,
+// and so the spacing below which a further hit on the same key is redundant
+// (the voices are still ramping). Shared by the voice manager (ramp length)
+// and the coalescing gate (ingress thinning).
+inline constexpr uint32_t kReExciteAttackMs = 4u;
 constexpr float kDefaultReleaseDecay = 0.9985f;
 // Do not let a missing or ultra-short SF2 release collapse a chopped note
 // into a sub-millisecond click.  V3's intended floor is 10 ms: short enough

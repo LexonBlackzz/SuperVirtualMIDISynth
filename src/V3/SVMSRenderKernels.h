@@ -33,19 +33,15 @@ struct RenderSpanContext {
     const uint32_t* activePositions;
     SpanRetirement* retirements;
     uint32_t* retirementCount;
-    // Non-zero: handles are the contiguous identity range starting at this
-    // slot, letting kernels use aligned vector loads instead of gathers
-    // (dense-tile mode).  Zero: handles are arbitrary.
-    uint32_t handleBase;
     // Whole-voice vibrato (CC1 / channel pressure).  When lfoActive is
     // non-zero the per-row kernels rebuild the voice's 64-frame LFO control
     // window internally (scalar ratio refresh between vectorized chunks),
-    // so whole-voice blocks no longer refuse to the legacy 64-frame-capped
-    // sparse path.  lfoDepth/lfoBendRatio are the channel modulation depth
-    // and bend ratio at segment start — segment-constant because channel
-    // ops split timelines before segments render.  Sparse-path callers
-    // leave lfoActive zero: AdvanceVibratoSpan owns vibrato there and
-    // refreshes phaseIncs per span instead.
+    // so whole-voice blocks never refuse on vibrato.  lfoDepth/lfoBendRatio
+    // are the channel modulation depth and bend ratio at segment start —
+    // segment-constant because channel ops split timelines before segments
+    // render.  Scalar/SSE2 blocks leave lfoActive zero: the renderer splits
+    // their segments at the exact LFO window boundaries and refreshes
+    // phaseIncs itself (AdvanceVibratoSpanRow).
     float lfoDepth;
     float lfoBendRatio;
     uint32_t lfoActive;

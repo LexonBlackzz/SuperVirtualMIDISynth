@@ -20,8 +20,34 @@ struct ScheduledRenderEvent {
     uint8_t data1 = 0u;
     uint8_t data2 = 0u;
 
+    // A merged note-on stores its count in the type byte (see
+    // kMergedNoteOnTypeBase); everything else leaves the type untouched.
+    bool IsMergedNoteOn() const noexcept {
+        return static_cast<uint8_t>(type) >= kMergedNoteOnTypeBase;
+    }
+    uint32_t NoteCount() const noexcept {
+        return IsMergedNoteOn()
+            ? static_cast<uint32_t>(static_cast<uint8_t>(type)) -
+                  kMergedNoteOnTypeBase + kMergedNoteOnMinCount
+            : 1u;
+    }
+    // The type a consumer should classify this event as (NoteOn for a
+    // merged note-on).
+    RenderEventType BaseType() const noexcept {
+        return IsMergedNoteOn() ? RenderEventType::NoteOn : type;
+    }
+    void SetNoteCount(uint32_t count) noexcept {
+        type = count >= kMergedNoteOnMinCount
+            ? static_cast<RenderEventType>(
+                  kMergedNoteOnTypeBase + (count - kMergedNoteOnMinCount))
+            : RenderEventType::NoteOn;
+    }
+
     RenderEvent ToRenderEvent(uint32_t frameOffset = 0u) const noexcept {
-        return {type, channel, data1, data2, frameOffset, sequence};
+        RenderEvent event{BaseType(), channel, data1, data2, frameOffset,
+                          sequence};
+        event.count = NoteCount();
+        return event;
     }
 
     void SetRenderEvent(const RenderEvent& event) noexcept {
@@ -30,6 +56,11 @@ struct ScheduledRenderEvent {
         data1 = event.data1;
         data2 = event.data2;
         sequence = event.ingressSequence;
+        if (event.type == RenderEventType::NoteOn &&
+            event.count >= kMergedNoteOnMinCount &&
+            event.count <= kMergedNoteOnMaxCount) {
+            SetNoteCount(event.count);
+        }
     }
 };
 static_assert(sizeof(ScheduledRenderEvent) == 16u,

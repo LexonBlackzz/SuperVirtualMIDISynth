@@ -13,6 +13,9 @@ inline constexpr uint32_t kInternalMasterVolumeTag = 0xFE000000u;
 inline constexpr uint32_t kInternalRhythmPartTag = 0xFD000000u;
 inline constexpr uint32_t kInternalMasterFineTuneTag = 0xFC000000u;
 inline constexpr uint32_t kInternalMasterTransposeTag = 0xFB000000u;
+// Top byte of a note-on message that note-on coalescing kept as a re-excite
+// hit instead of dropping (ordinary short messages leave it zero).
+inline constexpr uint32_t kReExciteMessageTag = 0x01000000u;
 inline constexpr uint64_t kAbsoluteFrameTimestampTag = uint64_t{1} << 63u;
 inline constexpr uint64_t kAbsoluteFrameTimestampMask =
     ~kAbsoluteFrameTimestampTag;
@@ -113,8 +116,11 @@ inline bool CompileTimestampedEvent(const TimestampedMidiEvent& timed,
     } else {
         switch (status & 0xf0u) {
             case 0x90u:
-                type = data2 != 0u ? RenderEventType::NoteOn
-                                   : RenderEventType::NoteOff;
+                type = data2 != 0u
+                    ? ((message & 0xff000000u) == kReExciteMessageTag
+                           ? RenderEventType::NoteReExcite
+                           : RenderEventType::NoteOn)
+                    : RenderEventType::NoteOff;
                 break;
             case 0x80u: type = RenderEventType::NoteOff; break;
             case 0xb0u: type = RenderEventType::ControlChange; break;

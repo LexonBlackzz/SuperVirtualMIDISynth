@@ -25,6 +25,8 @@ struct DiagStats {
     uint32_t renderThreadCount;
     float multicoreEffectiveness;
     uint32_t activeVoices;
+    uint32_t effectiveVoices;
+    uint64_t planRefusals;
     uint32_t maxVoices;
     uint32_t releasingVoices;
     uint32_t sustainHeldVoices;
@@ -74,7 +76,7 @@ static HMODULE GetCurrentModule() {
 
 static const wchar_t* kWindowClass = L"SVMS V3 Diag";
 static const int kWindowWidth = 540;
-static const int kWindowHeight = 540;
+static const int kWindowHeight = 560;
 static const int kTimerId = 1;
 // Diagnostic-only refresh. Windows timers are scheduler-limited, but 1 ms
 // gives the monitor the fastest practical readout without touching audio.
@@ -166,6 +168,12 @@ static void OnPaint(HWND hwnd) {
     DrawStat(memDC, kPadX, y, L"Active Voices:    ", buf);
     y += kLineH;
 
+    if (s.effectiveVoices > s.activeVoices) {
+        std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u (merge + coalescing)", s.effectiveVoices);
+        DrawStat(memDC, kPadX, y, L"Effective Voices: ", buf);
+        y += kLineH;
+    }
+
     if (s.maxVoices > 0) {
         float pct = (float)s.activeVoices / (float)s.maxVoices * 100.0f;
         std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%.0f%%", pct);
@@ -234,6 +242,14 @@ static void OnPaint(HWND hwnd) {
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u (%u immediate)", s.retired, s.retiredImmediate);
     DrawStat(memDC, kPadX, y, L"Retired:          ", buf);
     y += kLineH;
+
+    // Shown only when it happens: a refused plan skips a stretch of audio.
+    if (s.planRefusals != 0u) {
+        std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%llu (audio stretches skipped)",
+                      static_cast<unsigned long long>(s.planRefusals));
+        DrawStat(memDC, kPadX, y, L"Plan refusals:    ", buf);
+        y += kLineH;
+    }
 
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%llu / %llu / %llu",
                static_cast<unsigned long long>(s.sf2.noteOns),
@@ -433,7 +449,9 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
                         float schedulerPercent, float dispatchPercent,
                         float synthesisPercent, float postPercent,
                         uint32_t eventsThisBlock, uint32_t scheduledEvents,
-                        const LiveSF2Telemetry& sf2) {
+                        const LiveSF2Telemetry& sf2,
+                        uint32_t effectiveVoices,
+                        uint64_t planRefusals) {
     if (!g_running.load(std::memory_order_acquire)) return;
     const uint32_t target = 1u - g_publishedStats.load(std::memory_order_relaxed);
     if (g_statsReader.load(std::memory_order_acquire) == target) return;
@@ -450,6 +468,8 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     stats.renderThreadCount = renderThreadCount;
     stats.multicoreEffectiveness = multicoreEffectiveness;
     stats.activeVoices = activeVoices;
+    stats.effectiveVoices = effectiveVoices;
+    stats.planRefusals = planRefusals;
     stats.maxVoices = maxVoices;
     stats.releasingVoices = releasingVoices;
     stats.sustainHeldVoices = sustainHeldVoices;

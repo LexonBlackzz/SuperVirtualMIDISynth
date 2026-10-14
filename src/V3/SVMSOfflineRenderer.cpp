@@ -446,6 +446,9 @@ public:
         if (!renderer_.ConfigureRenderThreads(o.renderThreads, o.blockFrames)) {
             error="cannot initialize render workers"; return false;
         }
+        if (!renderer_.PrepareWholeVoice(voices_)) {
+            error="cannot reserve whole-voice renderer storage"; return false;
+        }
         channels_.Reset(); channels_.SetMasterVolume(master_);
         cfg_={master_,1.0f,0.0f,0,false,false,false,false,false,false,
               InterpolationMode::Linear,FilterType::None,PanLaw::ConstantPower,true};
@@ -567,7 +570,7 @@ private:
         if(!voices_.LaunchVoiceGroup(ch,note,vel,launchSetups_,count,generation,channels_.GetParams()[ch],handles))return;
         ++notes_;
     }
-    void NoteOff(uint8_t ch,uint8_t note){const bool sustain=channels_.IsSustainActive(ch);channels_.NoteOff(ch,note);const uint32_t p=voices_.FindOldestPlayIndex(ch,note);if(p!=UINT32_MAX)voices_.NoteOffPlayIndex(ch,note,p,sustain,0);}
+    void NoteOff(uint8_t ch,uint8_t note){const bool sustain=channels_.IsSustainActive(ch);channels_.NoteOff(ch,note);voices_.NoteOffOldestPlayIndices(ch,note,1u,sustain,0u);}
     void Control(uint8_t ch,uint8_t cc,uint8_t value){const bool sustain=channels_.IsSustainActive(ch);channels_.ControlChange(ch,cc,value);if(cc==0||cc==32)RefreshPreset(ch);if(cc==64&&value<64){voices_.ForEachChannelActive(ch,[&](VoiceHandle h){if(voices_.v.heldBySustain[h]){voices_.v.heldBySustain[h]=0;voices_.StartRelease(h);}});}
         if(cc==120)voices_.SilenceChannelImmediate(ch);else if(cc==123)voices_.ReleaseChannel(ch,0);else if(cc==121&&sustain){voices_.ForEachChannelActive(ch,[&](VoiceHandle h){if(voices_.v.heldBySustain[h]){voices_.v.heldBySustain[h]=0;voices_.StartRelease(h);}});}
         if(cc==121)Bend(ch,0,64);if(cc==7||cc==10||cc==11||cc==64||cc==121){channels_.RebuildChannel(ch,cfg_,float(rate_));if(cc==7||cc==10||cc==11||cc==121)voices_.MarkChannelMixStale(ch,channels_.GetParams()[ch]);}}

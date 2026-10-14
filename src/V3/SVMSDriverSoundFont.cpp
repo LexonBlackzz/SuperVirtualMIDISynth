@@ -483,6 +483,27 @@ void Driver::ActivatePendingSoundFontAtBlockBoundary() noexcept {
     if (voiceManager) voiceManager->Reset();
 
     activeSoundFontStack_ = next;
+    // Note merging may reorder note-ons within one frame (SVMSNoteMerge.h);
+    // an exclusive class (hi-hat choke) makes launch order audible, so such
+    // a SoundFont limits merging to adjacent note-ons.
+    {
+        bool exclusiveClasses = false;
+        for (uint32_t bankIndex = 0u;
+             bankIndex < SoundFontBankCount(next) && !exclusiveClasses;
+             ++bankIndex) {
+            const SoundFontBundle* bank = SoundFontBankAt(next, bankIndex);
+            const SF2Data* data = bank ? bank->data : nullptr;
+            if (!data || !data->regions) continue;
+            for (uint32_t region = 0u; region < data->regionCount; ++region) {
+                if (data->regions[region].exclusiveClass != 0 ||
+                    data->regions[region].offByClass != 0) {
+                    exclusiveClasses = true;
+                    break;
+                }
+            }
+        }
+        noteMergeHoist_.store(!exclusiveClasses, std::memory_order_relaxed);
+    }
     SoundFontBundle* primary = SoundFontBankAt(next, 0u);
     soundFontData = primary ? primary->data : nullptr;
     sampleDataStore = next->sampleData;

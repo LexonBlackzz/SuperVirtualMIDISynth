@@ -38,6 +38,42 @@ namespace svms {
 // Fully prepared hot-path state for one SF2 layer.  Applying this as one
 // transaction avoids repeatedly reclassifying the newborn and repairing the
 // exact steal index while its fields are still only partially initialized.
+// Restart one row's envelope for a re-excite hit (see VoiceManager::ReExciteKey).
+// Row-local: the whole-voice workers run it on rows and ghosts at the hit's
+// exact frame, the oracle runs it at dispatch. Delay, hold and attack
+// are all "not yet at peak" and are left alone; a decaying or sustaining
+// voice ramps from its current level back to its peak over `attackFrames`
+// (no step) and the decay restarts. Sample phase is untouched.
+inline void ExciteVoiceRow(VoiceSoA& v, uint32_t h,
+                           uint32_t attackFrames) noexcept {
+    const uint8_t stage = v.envelopeStage[h];
+    if (stage != 2u && stage != 3u) return;
+    const float target = v.targetGain[h];
+    const float current = v.currentGain[h];
+    const float sustain = v.sustainLevel[h];
+    const float slope = v.decaySlope[h];
+    // Frames the decay needs to fall from peak back to the sustain level,
+    // from the same recurrence the kernels run (gain *= slope).
+    uint32_t decayFrames = 0u;
+    if (slope > 0.0f && slope < 1.0f && sustain > 0.0f && sustain < target) {
+        const float frames = std::log(sustain / target) / std::log(slope);
+        decayFrames = frames >= 1.0e9f ? 1000000000u
+            : static_cast<uint32_t>(frames) + 1u;
+    }
+    if (current < target * 0.999f && attackFrames > 0u) {
+        v.envelopeStage[h] = 1u;
+        v.attackSamplesRemaining[h] = attackFrames;
+        v.attackGainStep[h] = (target - current) /
+                              static_cast<float>(attackFrames);
+        v.decaySamplesRemaining[h] = decayFrames;
+    } else {
+        // At (or within 0.1% of) the peak: nothing to ramp, the decay just
+        // restarts. currentGain stays put, so no write can race a mix op.
+        v.decaySamplesRemaining[h] = decayFrames;
+        v.envelopeStage[h] = decayFrames > 0u ? 2u : 3u;
+    }
+}
+
 struct VoiceConfiguration {
     uint32_t sampleStart = 0;
     uint32_t sampleEnd = 0;
@@ -165,9 +201,8 @@ struct LaunchChurnStats {
     X(int32_t, exclusiveClassNext_) \
     X(int32_t, exclusiveClassPrev_) \
     X(uint32_t, channelActiveBlock_) \
-    X(uint32_t, renderClassBlock_) \
     X(uint32_t, stealVolatilePosition_) \
-    X(uint16_t, renderClassOffset_) \
+    X(uint8_t, renderClassLinked_) \
     X(uint8_t, channelActiveOffset_) \
     X(uint8_t, exclusiveClass_)
 
@@ -245,12 +280,97 @@ public:
                           const ChannelParamsSnapshot& channelParams,
                           VoiceHandle* outHandles,
                           uint32_t blockOffset = 0u);
+    // `multiplicity` > 1 launches ONE voice group that stands for that many
+    // exact-duplicate note-ons (same channel, key, velocity and frame): the
+    // per-voice gains carry the factor, which is exact because identical
+    // voices sum linearly. Each later note-off releases one unit (see
+    // NoteOffOldestPlayIndices); a partial release forks a twin.
     bool LaunchVoiceGroup(uint8_t channel, uint8_t note, uint8_t velocity,
                           const VoiceConfiguration* setups, uint32_t count,
                           uint32_t playIndex,
                           const ChannelParamsSnapshot& channelParams,
                           VoiceHandle* outHandles,
-                          uint32_t blockOffset = 0u);
+                          uint32_t blockOffset = 0u,
+                          uint32_t multiplicity = 1u);
+
+    // ── Merged-voice (multiplicity) support ────────────────────────────
+    // A partial release splits a merged voice into a releasing twin (the
+    // released units) and the remainder. The twin starts as an exact copy of
+    // the source row, so a renderer that only sees rows (the whole-voice
+    // pre-pass) can give it the source's start frame and op ingress.
+    using VoiceForkedHook = void (*)(VoiceHandle twin, VoiceHandle source,
+                                     void* userData);
+    void SetVoiceForkedHook(VoiceForkedHook hook, void* userData) noexcept {
+        voiceForkedHook_ = hook;
+        voiceForkedUserData_ = userData;
+    }
+    // Length of the re-excite attack ramp (kReExciteAttackMs at the pool's
+    // sample rate). Shorter ramps back up from a deep decay sound clicky.
+    uint32_t ReExciteAttackFrames() const noexcept {
+        const uint32_t frames = static_cast<uint32_t>(
+            static_cast<uint64_t>(sampleRate_) * kReExciteAttackMs / 1000u);
+        return frames != 0u ? frames : 1u;
+    }
+    // Note-on re-excite (the lossless-timing answer to note-on coalescing):
+    // a repeat hit on a key that still has live voices does not launch a new
+    // voice, it restarts those voices' envelopes at the caller's exact frame.
+    // The gain ramps from wherever it is back to the voice's peak over
+    // `attackFrames` (0 = ReExciteAttackFrames(); no step, so no click) and the
+    // decay restarts from there;
+    // the sample phase is untouched, so no new attack transient is stacked.
+    // Releasing voices are left alone. Returns the number of live voices
+    // found (0 = nothing to excite: the caller should launch normally).
+    uint32_t ReExciteKey(uint8_t channel, uint8_t note,
+                         uint32_t attackFrames = 0u) noexcept;
+    uint32_t GetVoiceMultiplicity(VoiceHandle handle) const noexcept {
+        return handle < maxVoices_ && v.mult[handle] > 1u ? v.mult[handle] : 1u;
+    }
+    // Releasing twins forked off merged voices since construction (wraps
+    // after 2^31; diagnostics and tests only).
+    uint32_t GetForkCount() const noexcept {
+        return nextForkPlayIndex_ - 0x80000000u;
+    }
+    // Partial releases that could not fork (the generation was released in
+    // full instead). Zero unless the pool is exhausted.
+    uint32_t GetForkFailureCount() const noexcept { return forkFailureCount_; }
+    // True once a merged voice has been launched and until a scan proves
+    // none remain.
+    bool MergedVoicesMayExist() const noexcept { return mergedVoicesMayExist_; }
+    // Sum of multiplicities over live voices: how many voices the pool would
+    // hold had nothing been merged. Also refreshes MergedVoicesMayExist().
+    uint64_t CountEffectiveVoices() noexcept;
+    // Rolling estimate of the same sum for big pools: each call visits at
+    // most `budget` voices of the active list and `published` holds the total
+    // of the last completed pass. Voices that launch or retire mid-pass can
+    // be missed or counted twice, so this is a statistic, never a gate.
+    struct EffectiveScan {
+        uint32_t cursor = 0u;
+        uint64_t total = 0u;
+        uint64_t published = 0u;
+    };
+    // `weight(channel, note)` scales each voice (note-on coalescing: how many
+    // note-ons the surviving voice stands for); the default weighs 1.
+    template <class Weight>
+    void AdvanceEffectiveScan(EffectiveScan& scan, uint32_t budget,
+                              Weight weight) const noexcept {
+        uint32_t end = scan.cursor + budget;
+        if (end > activeCount_) end = activeCount_;
+        for (uint32_t position = scan.cursor; position < end; ++position) {
+            const VoiceHandle h = activeList_[position];
+            scan.total += static_cast<uint64_t>(GetVoiceMultiplicity(h)) *
+                          weight(v.channel[h], v.note[h]);
+        }
+        scan.cursor = end;
+        if (scan.cursor >= activeCount_) {
+            scan.published = scan.total;
+            scan.cursor = 0u;
+            scan.total = 0u;
+        }
+    }
+    void AdvanceEffectiveScan(EffectiveScan& scan, uint32_t budget) const noexcept {
+        AdvanceEffectiveScan(scan, budget,
+                             [](uint8_t, uint8_t) noexcept { return 1u; });
+    }
 
     // Release a voice (transitions Active → Releasing).  Does NOT free the
     // slot — the voice continues rendering its release tail.
@@ -336,8 +456,7 @@ public:
     // Largest physical voice group ever created by one MIDI note-on. Every
     // launch updates this in O(1); groups never outgrow their launch count,
     // so it is a monotone upper bound for future victim/newborn group sizes.
-    // The dense planner uses it to bound per-launch steal mutations.
-    uint32_t GetMaxLaunchGroupSize() const { return maxLaunchGroupSize_; }
+    // Bounds per-launch steal group sizes.
     // Physical allocation ceiling. It can grow at a render boundary; it is
     // never shrunk live so existing voice handles remain stable.
     uint32_t GetMaxVoices() const { return maxVoices_; }
@@ -360,7 +479,7 @@ public:
     }
     static size_t EstimateAllocatedBytes(uint32_t capacity) noexcept;
     // Apply a process-local live limit request only at a render-block
-    // boundary, before dense plans or worker jobs can observe voice state.
+    // boundary, before worker jobs can observe voice state.
     void ApplyRuntimeVoiceLimit(uint64_t frame);
     void SetCurrentFrame(uint64_t frame);
     void SetStealKeyBackend(RenderBackend backend) {
@@ -379,10 +498,6 @@ public:
     void MarkStealScoresDirty();
     void RefreshRenderClass(VoiceHandle handle);
     uint32_t GetRenderClassCount(VoiceRenderClass renderClass) const;
-    template <typename Consumer>
-    void ForEachRenderClassBlock(VoiceRenderClass renderClass,
-                                 Consumer&& consume) const noexcept;
-    uint32_t GetNonemptyRenderClassMask() const { return renderClassMask_; }
     uint32_t GetStealTailCount() const { return stealTailCount_; }
     const uint32_t* GetStealTailList() const { return stealTailList_; }
     void RefreshStealTail(VoiceHandle handle);
@@ -401,18 +516,18 @@ public:
     // state flip to the exact event frame, reported through this hook.  The
     // renderer applies the flip inside the owning worker between spans.
     using DeferredReleaseHook = void (*)(VoiceHandle handle, void* userData);
+    // Whole-voice pre-pass: ReExciteKey reports each live voice it finds
+    // instead of restarting it, and the renderer restarts the row at the
+    // event's exact frame inside the owning worker.
+    using ReExciteHook = void (*)(VoiceHandle handle, void* userData);
+    void SetReExciteHook(ReExciteHook hook, void* userData) noexcept {
+        reExciteHook_ = hook;
+        reExciteUserData_ = userData;
+    }
     void SetDeferredReleaseHook(DeferredReleaseHook hook,
                                 void* userData) noexcept {
         deferredReleaseHook_ = hook;
         deferredReleaseUserData_ = userData;
-    }
-    // Dense planning uses this notification to snapshot a voice whose
-    // lifecycle changes indirectly during note-on (SF2 exclusiveClass).
-    using VoiceReleaseHook = void (*)(VoiceHandle handle, void* userData);
-    void SetVoiceReleaseHook(VoiceReleaseHook hook,
-                             void* userData) noexcept {
-        voiceReleaseHook_ = hook;
-        voiceReleaseUserData_ = userData;
     }
     // Whole-voice renderer pre-pass: CC120 (All Sound Off) kills every
     // channel voice and channel-owned tail immediately.  While the pre-pass
@@ -420,7 +535,7 @@ public:
     // (exact pre-kill state, death at the kill frame) BEFORE the bookkeeping
     // below retires it, and records each channel tail's kill frame so the
     // block render can emit the tail's audio up to that exact frame.  Null
-    // outside the pre-pass: the legacy renderers kill inline mid-block.
+    // outside the pre-pass: the oracle kills inline mid-block.
     using SilenceVoiceHook = void (*)(VoiceHandle handle, void* userData);
     using SilenceTailHook = void (*)(uint32_t slot, void* userData);
     void SetSilenceChannelHooks(SilenceVoiceHook voiceHook,
@@ -437,7 +552,7 @@ public:
     // channel and payload once per event instead of rewriting rows inline;
     // the renderer records a channel op and the owning worker applies it
     // between spans with row-local writes (thread-safe).  Null outside the
-    // pre-pass: the legacy renderers mutate inline at their exact-frame
+    // pre-pass: the oracle mutates inline at its exact-frame
     // dispatch boundaries, exactly as before.
     using ChannelMixOpHook = void (*)(uint8_t channel, float mixScaleLeft,
                                       float mixScaleRight, void* userData);
@@ -736,20 +851,6 @@ private:
     uint32_t channelIndexFreeTop_;
 
     alignas(64) uint32_t renderClassCount_[kVoiceRenderClassCount];
-    uint32_t renderClassMask_;
-    static constexpr uint32_t kRenderClassBlockSize = 1024u;
-    struct RenderClassBlock {
-        uint32_t handles[kRenderClassBlockSize];
-        uint32_t count;
-        uint32_t previous;
-        uint32_t next;
-    };
-    uint32_t renderClassHead_[kVoiceRenderClassCount];
-    uint32_t renderClassTail_[kVoiceRenderClassCount];
-    RenderClassBlock* renderClassBlocks_;
-    uint32_t* renderClassFreeStack_;
-    uint32_t renderClassBlockCount_;
-    uint32_t renderClassFreeTop_;
 
     // Steal tails are rendered independently from primary render classes.
     // Keeping a dense list avoids probing all active voices in every short
@@ -888,7 +989,6 @@ private:
     int32_t exclusiveClassHead_[kChannelCount][kExclusiveClassCount];
     uint32_t lastLinkedPlayIndex_;
     VoiceHandle lastLinkedPlayVoice_;
-    uint32_t maxLaunchGroupSize_ = 1u;
     // Cap on the per-launch batched steal-victim selection (launch groups
     // larger than this fall back to the per-layer pop path).
     static constexpr uint32_t kStealBatchMaxLayers = 16u;
@@ -937,8 +1037,6 @@ private:
     VoiceRenderClass ClassifyVoice(VoiceHandle handle) const;
     void LinkRenderClass(VoiceHandle handle);
     void UnlinkRenderClass(VoiceHandle handle);
-    uint32_t AllocateRenderClassBlock();
-    void FreeRenderClassBlock(uint32_t block);
     void LinkStealTail(VoiceHandle handle);
     void UnlinkStealTail(VoiceHandle handle);
     void BuildStealTailMinHeap();
@@ -1031,14 +1129,28 @@ private:
     // Effective control/envelope level protects audible voices; rendered age
     // is the only independent bias. Velocity is not a separate priority.
     float ComputeStealScore(uint32_t idx) const;
+    // Transient: the multiplicity of the launch in flight (1 outside a
+    // LaunchVoiceGroup call). ApplyVoiceConfigurationFields folds it into the
+    // voice's gains, so every launch path (in-place, reuse, general) agrees.
+    uint32_t launchMult_ = 1u;
+    bool mergedVoicesMayExist_ = false;
+    // Fork twins need a playIndex that cannot collide with the driver's
+    // counter (which counts up from 1). The twin is released at once and
+    // leaves the key chain, so this only has to be unique among live groups.
+    uint32_t nextForkPlayIndex_ = 0x80000000u;
+    uint32_t forkFailureCount_ = 0u;
+    VoiceForkedHook voiceForkedHook_ = nullptr;
+    void* voiceForkedUserData_ = nullptr;
+    bool ForkReleasedUnits(uint8_t channel, uint8_t note, uint32_t playIndex,
+                           uint32_t units, bool sustain, uint32_t blockOffset);
     PreTailCaptureHook preTailCaptureHook_ = nullptr;
     void* preTailCaptureUserData_ = nullptr;
     VoiceConfiguredHook voiceConfiguredHook_ = nullptr;
     void* voiceConfiguredUserData_ = nullptr;
     DeferredReleaseHook deferredReleaseHook_ = nullptr;
+    ReExciteHook reExciteHook_ = nullptr;
+    void* reExciteUserData_ = nullptr;
     void* deferredReleaseUserData_ = nullptr;
-    VoiceReleaseHook voiceReleaseHook_ = nullptr;
-    void* voiceReleaseUserData_ = nullptr;
     SilenceVoiceHook silenceVoiceHook_ = nullptr;
     SilenceTailHook silenceTailHook_ = nullptr;
     void* silenceHookUserData_ = nullptr;
@@ -1061,9 +1173,6 @@ inline VoiceManager::VoiceManager()
       freeStack_(nullptr),
       channelIndexBlocks_(nullptr), channelIndexFreeStack_(nullptr),
       channelIndexBlockCount_(0u), channelIndexFreeTop_(0u),
-      renderClassMask_(0u), renderClassBlocks_(nullptr),
-      renderClassFreeStack_(nullptr), renderClassBlockCount_(0u),
-      renderClassFreeTop_(0u),
       retireCount_(0), retireImmediateCount_(0), stealCount_(0),
       stealTailCount_(0), stealTailMinHeapCount_(0),
       stealTailMinHeapFrame_(UINT64_MAX), stealTailMinHeapValid_(false),
@@ -1086,8 +1195,6 @@ inline VoiceManager::VoiceManager()
     std::memset(channelActiveHead_, 0xff, sizeof(channelActiveHead_));
     std::memset(channelActiveTail_, 0xff, sizeof(channelActiveTail_));
     std::memset(renderClassCount_, 0, sizeof(renderClassCount_));
-    std::memset(renderClassHead_, 0xff, sizeof(renderClassHead_));
-    std::memset(renderClassTail_, 0xff, sizeof(renderClassTail_));
     std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
     std::memset(exclusiveClassHead_, 0xff, sizeof(exclusiveClassHead_));
     lastLinkedPlayIndex_ = UINT32_MAX;
@@ -1122,9 +1229,6 @@ inline size_t VoiceManager::EstimateAllocatedBytes(
     const uint32_t channelBlocks =
         (capacity + kChannelIndexBlockSize - 1u) /
             kChannelIndexBlockSize + kChannelCount;
-    const uint32_t renderBlocks =
-        (capacity + kRenderClassBlockSize - 1u) /
-            kRenderClassBlockSize + kVoiceRenderClassCount;
     size_t metadataBytes = 0u;
     auto add = [&](size_t elementSize, size_t count) {
         metadataBytes = (metadataBytes + kMixBufferAlign - 1u) &
@@ -1149,8 +1253,6 @@ inline size_t VoiceManager::EstimateAllocatedBytes(
     add(sizeof(uint32_t), channelBlocks);
     add(sizeof(uint32_t), capacity);
     add(sizeof(uint8_t), capacity);
-    add(sizeof(RenderClassBlock), renderBlocks);
-    add(sizeof(uint32_t), renderBlocks);
     add(sizeof(uint32_t), capacity);
     add(sizeof(uint16_t), capacity);
     add(sizeof(uint64_t), capacity);
@@ -1183,9 +1285,6 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     const uint32_t channelBlocks =
         (capacity + kChannelIndexBlockSize - 1u) /
             kChannelIndexBlockSize + kChannelCount;
-    const uint32_t renderBlocks =
-        (capacity + kRenderClassBlockSize - 1u) /
-            kRenderClassBlockSize + kVoiceRenderClassCount;
     uint32_t ringCapacity = 2u;
     while (ringCapacity < static_cast<uint32_t>(capacity) * 2u)
         ringCapacity <<= 1u;
@@ -1207,8 +1306,6 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     add(sizeof(uint32_t), ringCapacity); // releasing ring
     add(sizeof(ChannelIndexBlock), channelBlocks);
     add(sizeof(uint32_t), channelBlocks);
-    add(sizeof(RenderClassBlock), renderBlocks);
-    add(sizeof(uint32_t), renderBlocks);
     add(sizeof(uint64_t), capacity); // stealStableKey
     add(sizeof(uint64_t), static_cast<size_t>(treeLeaves) * 2u);
     add(sizeof(uint32_t), capacity); // volatile list
@@ -1226,7 +1323,6 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     metadataStorage_ = allocation;
     metadataBytes_ = bytes;
     channelIndexBlockCount_ = channelBlocks;
-    renderClassBlockCount_ = renderBlocks;
     stealTreeLeafBase_ = treeLeaves;
     releasingRingCapacity_ = ringCapacity;
     releasingRingMask_ = ringCapacity - 1u;
@@ -1251,10 +1347,6 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
         take(sizeof(ChannelIndexBlock), channelBlocks));
     channelIndexFreeStack_ = static_cast<uint32_t*>(
         take(sizeof(uint32_t), channelBlocks));
-    renderClassBlocks_ = static_cast<RenderClassBlock*>(
-        take(sizeof(RenderClassBlock), renderBlocks));
-    renderClassFreeStack_ = static_cast<uint32_t*>(
-        take(sizeof(uint32_t), renderBlocks));
     stealStableKey_ = static_cast<uint64_t*>(
         take(sizeof(uint64_t), capacity));
     stealWinnerTree_ = static_cast<uint64_t*>(take(
@@ -1297,12 +1389,6 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     channelIndexFreeTop_ = other.channelIndexFreeTop_;
     std::memcpy(renderClassCount_, other.renderClassCount_,
                 sizeof(renderClassCount_));
-    renderClassMask_ = other.renderClassMask_;
-    std::memcpy(renderClassHead_, other.renderClassHead_,
-                sizeof(renderClassHead_));
-    std::memcpy(renderClassTail_, other.renderClassTail_,
-                sizeof(renderClassTail_));
-    renderClassFreeTop_ = other.renderClassFreeTop_;
     std::memcpy(stealTailList_, other.stealTailList_, sizeof(stealTailList_));
     std::memcpy(stealTailPosition_, other.stealTailPosition_,
                 sizeof(stealTailPosition_));
@@ -1359,7 +1445,8 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     channelMixDirtyMask_ = other.channelMixDirtyMask_;
     lastLinkedPlayIndex_ = other.lastLinkedPlayIndex_;
     lastLinkedPlayVoice_ = other.lastLinkedPlayVoice_;
-    maxLaunchGroupSize_ = other.maxLaunchGroupSize_;
+    mergedVoicesMayExist_ = other.mergedVoicesMayExist_;
+    nextForkPlayIndex_ = other.nextForkPlayIndex_;
 }
 
 inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
@@ -1399,20 +1486,8 @@ inline void VoiceManager::Reset() {
         channelIndexBlocks_[block].next = UINT32_MAX;
     }
     std::memset(renderClassCount_, 0, sizeof(renderClassCount_));
-    renderClassMask_ = 0u;
-    std::memset(renderClassHead_, 0xff, sizeof(renderClassHead_));
-    std::memset(renderClassTail_, 0xff, sizeof(renderClassTail_));
-    for (uint32_t i = 0u; i < maxVoices_; ++i) {
-        renderClassBlock_[i] = UINT32_MAX;
-        renderClassOffset_[i] = UINT16_MAX;
-    }
-    renderClassFreeTop_ = renderClassBlockCount_;
-    for (uint32_t block = 0u; block < renderClassBlockCount_; ++block) {
-        renderClassFreeStack_[block] = renderClassBlockCount_ - 1u - block;
-        renderClassBlocks_[block].count = 0u;
-        renderClassBlocks_[block].previous = UINT32_MAX;
-        renderClassBlocks_[block].next = UINT32_MAX;
-    }
+    for (uint32_t i = 0u; i < maxVoices_; ++i)
+        renderClassLinked_[i] = 0u;
     std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
     std::memset(stealWinnerTree_, 0,
                 sizeof(*stealWinnerTree_) * stealTreeLeafBase_ * 2u);
@@ -1461,7 +1536,8 @@ inline void VoiceManager::Reset() {
     stealVolatileHeapValid_ = false;
     lastLinkedPlayIndex_ = UINT32_MAX;
     lastLinkedPlayVoice_ = kInvalidVoice;
-    maxLaunchGroupSize_ = 1u;
+    mergedVoicesMayExist_ = false;
+    launchMult_ = 1u;
     freeTop_ = maxVoices_;
     releasingCount_.store(0u, std::memory_order_relaxed);
     releasingRingHead_ = 0u;
@@ -1608,7 +1684,6 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 sizeof(exclusiveClassHead_));
     grown.lastLinkedPlayIndex_ = lastLinkedPlayIndex_;
     grown.lastLinkedPlayVoice_ = lastLinkedPlayVoice_;
-    grown.maxLaunchGroupSize_ = maxLaunchGroupSize_;
 
     // The dense channel/render indices depend on allocation capacity, so
     // rebuild them from the stable active list instead of copying pages whose
@@ -1699,8 +1774,6 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     releasingRing_ = grown.releasingRing_;
     channelIndexBlocks_ = grown.channelIndexBlocks_;
     channelIndexFreeStack_ = grown.channelIndexFreeStack_;
-    renderClassBlocks_ = grown.renderClassBlocks_;
-    renderClassFreeStack_ = grown.renderClassFreeStack_;
     stealStableKey_ = grown.stealStableKey_;
     stealWinnerTree_ = grown.stealWinnerTree_;
     stealVolatileList_ = grown.stealVolatileList_;
@@ -1729,15 +1802,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 sizeof(channelActiveTail_));
     std::memcpy(exclusiveClassHead_, grown.exclusiveClassHead_,
                 sizeof(exclusiveClassHead_));
-    renderClassBlockCount_ = grown.renderClassBlockCount_;
-    renderClassFreeTop_ = grown.renderClassFreeTop_;
-    renderClassMask_ = grown.renderClassMask_;
     std::memcpy(renderClassCount_, grown.renderClassCount_,
                 sizeof(renderClassCount_));
-    std::memcpy(renderClassHead_, grown.renderClassHead_,
-                sizeof(renderClassHead_));
-    std::memcpy(renderClassTail_, grown.renderClassTail_,
-                sizeof(renderClassTail_));
     stealTreeLeafBase_ = grown.stealTreeLeafBase_;
     stealHeapCount_ = grown.stealHeapCount_;
     stealHeapValid_ = grown.stealHeapValid_;
@@ -2033,7 +2099,7 @@ inline void VoiceManager::ApplyRuntimeVoiceLimit(uint64_t frame) {
     // RuntimeLink publishes only a process-local atomic request. Applying it
     // here keeps all VoiceManager mutation on the audio/render thread. This
     // method is called once before a render block is planned, never while
-    // dense workers are consuming an immutable chunk plan.
+    // render workers are consuming the block.
     uint32_t requestedLimit = RequestedRuntimeVoiceLimit();
     if (requestedLimit > RuntimeVoiceGrowthCeiling()) {
         RequestRuntimeVoiceLimit(voiceLimit_);
@@ -2110,19 +2176,6 @@ inline uint32_t VoiceManager::GetRenderClassCount(
     VoiceRenderClass renderClass) const {
     const uint32_t index = static_cast<uint32_t>(renderClass);
     return index < kVoiceRenderClassCount ? renderClassCount_[index] : 0u;
-}
-
-template <typename Consumer>
-inline void VoiceManager::ForEachRenderClassBlock(
-    VoiceRenderClass renderClass, Consumer&& consume) const noexcept {
-    const uint32_t index = static_cast<uint32_t>(renderClass);
-    if (index >= kVoiceRenderClassCount) return;
-    uint32_t block = renderClassHead_[index];
-    while (block != UINT32_MAX) {
-        const RenderClassBlock& page = renderClassBlocks_[block];
-        consume(page.handles, page.count);
-        block = page.next;
-    }
 }
 
 template <typename Consumer>
@@ -2259,6 +2312,7 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.presetIndex[handle] = UINT16_MAX;
     v.regionIndex[handle] = UINT16_MAX;
     v.playIndex[handle] = UINT32_MAX;
+    v.mult[handle] = 1u;
     exclusiveClass_[handle] = 0u;
     exclusiveClassNext_[handle] = -1;
     exclusiveClassPrev_[handle] = -1;
@@ -2324,6 +2378,7 @@ inline void VoiceManager::InitializePreparedVoice(
     v.nextChannelKeyVoice[handle] = -1;
     v.prevChannelKeyVoice[handle] = -1;
     v.playIndex[handle] = UINT32_MAX;
+    v.mult[handle] = 1u;
     playGroupNext_[handle] = -1;
     playGroupPrev_[handle] = -1;
     exclusiveClass_[handle] = 0u;
@@ -2668,50 +2723,12 @@ inline VoiceRenderClass VoiceManager::ClassifyVoice(VoiceHandle handle) const {
     return VoiceRenderClass::Generic;
 }
 
-inline uint32_t VoiceManager::AllocateRenderClassBlock() {
-    assert(renderClassFreeTop_ != 0u);
-    if (renderClassFreeTop_ == 0u) return UINT32_MAX;
-    const uint32_t block = renderClassFreeStack_[--renderClassFreeTop_];
-    renderClassBlocks_[block].count = 0u;
-    renderClassBlocks_[block].previous = UINT32_MAX;
-    renderClassBlocks_[block].next = UINT32_MAX;
-    return block;
-}
-
-inline void VoiceManager::FreeRenderClassBlock(uint32_t block) {
-    if (block >= renderClassBlockCount_) return;
-    renderClassBlocks_[block].count = 0u;
-    renderClassBlocks_[block].previous = UINT32_MAX;
-    renderClassBlocks_[block].next = UINT32_MAX;
-    assert(renderClassFreeTop_ < renderClassBlockCount_);
-    renderClassFreeStack_[renderClassFreeTop_++] = block;
-}
-
 inline void VoiceManager::LinkRenderClass(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     const VoiceRenderClass renderClass = ClassifyVoice(handle);
     const uint32_t classIndex = static_cast<uint32_t>(renderClass);
-    uint32_t tail = renderClassTail_[classIndex];
-    if (tail == UINT32_MAX ||
-        renderClassBlocks_[tail].count == kRenderClassBlockSize) {
-        const uint32_t block = AllocateRenderClassBlock();
-        assert(block != UINT32_MAX);
-        if (block == UINT32_MAX) return;
-        renderClassBlocks_[block].previous = tail;
-        if (tail != UINT32_MAX)
-            renderClassBlocks_[tail].next = block;
-        else
-            renderClassHead_[classIndex] = block;
-        renderClassTail_[classIndex] = block;
-        tail = block;
-    }
-    RenderClassBlock& page = renderClassBlocks_[tail];
-    const uint32_t offset = page.count++;
-    page.handles[offset] = handle;
-    renderClassBlock_[handle] = tail;
-    renderClassOffset_[handle] = static_cast<uint16_t>(offset);
     ++renderClassCount_[classIndex];
-    renderClassMask_ |= 1u << classIndex;
+    renderClassLinked_[handle] = 1u;
     v.renderClass[handle] = static_cast<uint8_t>(renderClass);
     if (renderClass == VoiceRenderClass::SustainedLoop ||
         renderClass == VoiceRenderClass::SustainedOneShot) {
@@ -2721,38 +2738,11 @@ inline void VoiceManager::LinkRenderClass(VoiceHandle handle) {
 }
 
 inline void VoiceManager::UnlinkRenderClass(VoiceHandle handle) {
-    if (handle >= maxVoices_) return;
+    if (handle >= maxVoices_ || renderClassLinked_[handle] == 0u) return;
     const uint32_t classIndex = v.renderClass[handle];
     if (classIndex >= kVoiceRenderClassCount) return;
-    const uint32_t block = renderClassBlock_[handle];
-    const uint32_t offset = renderClassOffset_[handle];
-    const uint32_t tail = renderClassTail_[classIndex];
-    if (block >= renderClassBlockCount_ || tail >= renderClassBlockCount_ ||
-        offset >= renderClassBlocks_[block].count) return;
-
-    RenderClassBlock& tailPage = renderClassBlocks_[tail];
-    const uint32_t lastOffset = tailPage.count - 1u;
-    const uint32_t moved = tailPage.handles[lastOffset];
-    if (block != tail || offset != lastOffset) {
-        renderClassBlocks_[block].handles[offset] = moved;
-        renderClassBlock_[moved] = block;
-        renderClassOffset_[moved] = static_cast<uint16_t>(offset);
-    }
-    --tailPage.count;
-    const uint32_t remaining = --renderClassCount_[classIndex];
-    renderClassBlock_[handle] = UINT32_MAX;
-    renderClassOffset_[handle] = UINT16_MAX;
-
-    if (tailPage.count == 0u) {
-        const uint32_t previous = tailPage.previous;
-        if (previous != UINT32_MAX)
-            renderClassBlocks_[previous].next = UINT32_MAX;
-        else
-            renderClassHead_[classIndex] = UINT32_MAX;
-        renderClassTail_[classIndex] = previous;
-        FreeRenderClassBlock(tail);
-    }
-    if (remaining == 0u) renderClassMask_ &= ~(1u << classIndex);
+    --renderClassCount_[classIndex];
+    renderClassLinked_[handle] = 0u;
 }
 
 inline void VoiceManager::RefreshRenderClass(VoiceHandle handle) {
@@ -2760,9 +2750,7 @@ inline void VoiceManager::RefreshRenderClass(VoiceHandle handle) {
         v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) return;
     const VoiceRenderClass desired = ClassifyVoice(handle);
     if (v.renderClass[handle] == static_cast<uint8_t>(desired) &&
-        renderClassBlock_[handle] < renderClassBlockCount_ &&
-        renderClassOffset_[handle] <
-            renderClassBlocks_[renderClassBlock_[handle]].count) {
+        renderClassLinked_[handle] != 0u) {
         // Attack and decay intentionally share the transient render class,
         // but only attack has a time-invariant protected steal level. Move
         // the candidate between the persistent tree and volatile heap even
@@ -4312,8 +4300,6 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
 inline void VoiceManager::StartRelease(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active)) {
-        if (voiceReleaseHook_)
-            voiceReleaseHook_(handle, voiceReleaseUserData_);
         // A planner hook may advance this voice to the event frame and
         // discover that it naturally retired before the requested release.
         if (v.state[handle] != static_cast<uint8_t>(VoiceState::Active))
@@ -4531,8 +4517,22 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
         v.currentGain[handle] = setup.initialGain;
     }
 
-    v.gainLeft[handle] = setup.gainLeft;
-    v.gainRight[handle] = setup.gainRight;
+    // A merged launch stands for `launchMult_` identical voices: the factor
+    // rides in the pan gains, so every later fold (CC7/10/11, steal scores,
+    // whole-voice ops, ghosts) carries it without knowing about merging. A
+    // single launch takes the unscaled branch and stays bit-identical.
+    float gainLeft = setup.gainLeft;
+    float gainRight = setup.gainRight;
+    if (launchMult_ > 1u) {
+        const float scale = static_cast<float>(launchMult_);
+        gainLeft *= scale;
+        gainRight *= scale;
+        v.mult[handle] = launchMult_;
+    } else {
+        v.mult[handle] = 1u;
+    }
+    v.gainLeft[handle] = gainLeft;
+    v.gainRight[handle] = gainRight;
     v.filterA0[handle] = setup.filterA0;
     v.filterB1[handle] = setup.filterB1;
     v.filterB2[handle] = setup.filterB2;
@@ -4544,8 +4544,8 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     v.vibLfoPhases[handle] = 0.0f;
     v.vibLfoDelays[handle] = setup.vibLfoDelaySamples;
     v.vibLfoModulated[handle] = 0u;
-    v.mixGainL[handle] = setup.gainLeft * cp.mixScaleLeft;
-    v.mixGainR[handle] = setup.gainRight * cp.mixScaleRight;
+    v.mixGainL[handle] = gainLeft * cp.mixScaleLeft;
+    v.mixGainR[handle] = gainRight * cp.mixScaleRight;
     v.stealOutputGain[handle] = std::sqrt(
         v.mixGainL[handle] * v.mixGainL[handle] +
         v.mixGainR[handle] * v.mixGainR[handle]);
@@ -5009,15 +5009,24 @@ inline bool VoiceManager::LaunchVoiceGroup(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
     const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles,
-    uint32_t blockOffset) {
+    uint32_t blockOffset, uint32_t multiplicity) {
     if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
         count > voiceLimit_)
         return false;
+    // Scope the multiplicity to this launch: ApplyVoiceConfigurationFields
+    // reads launchMult_, and every return path below must restore it.
+    struct MultiplicityScope {
+        uint32_t& slot;
+        MultiplicityScope(uint32_t& s, uint32_t m) : slot(s) {
+            slot = m > 1u ? m : 1u;
+        }
+        ~MultiplicityScope() { slot = 1u; }
+    } multiplicityScope(launchMult_, multiplicity);
+    if (multiplicity > 1u) mergedVoicesMayExist_ = true;
     // Resolve every exclusive class once for the complete physical note.
     // Doing this before any layer allocation/configuration prevents layered
     // regions from choking siblings born by this same MIDI note-on.
     ChokeExclusiveClasses(channel, setups, count, blockOffset);
-    if (count > maxLaunchGroupSize_) maxLaunchGroupSize_ = count;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     BeginLaunchTestProfile(channel, note, setups, count);
 #endif
@@ -5610,14 +5619,180 @@ inline void VoiceManager::ReleaseSustain(uint8_t channel,
 inline uint32_t VoiceManager::NoteOffOldestPlayIndices(
         uint8_t channel, uint8_t note, uint32_t count, bool sustain,
         uint32_t blockOffset) {
+    // `count` is a number of note-offs; the return value is how many of them
+    // found a unit to release. An ordinary generation is one unit. A merged
+    // generation of m units takes up to m offs: fewer than m releases only
+    // that many units, by forking them off into a releasing twin.
     uint32_t released = 0u;
     while (released < count) {
         const uint32_t playIndex = FindOldestPlayIndex(channel, note);
         if (playIndex == UINT32_MAX) break;
+        const uint32_t units = GetVoiceMultiplicity(static_cast<VoiceHandle>(
+            channelKeyVoiceOldest_[channel][note]));
+        const uint32_t remaining = count - released;
+        if (units > 1u && remaining < units) {
+            if (ForkReleasedUnits(channel, note, playIndex, remaining, sustain,
+                                  blockOffset)) {
+                released += remaining;
+                continue;
+            }
+            // No slot for the twin even after stealing: release the whole
+            // generation rather than leave the key hung.
+            ++forkFailureCount_;
+        }
         NoteOffPlayIndex(channel, note, playIndex, sustain, blockOffset);
-        ++released;
+        released += units < remaining ? units : remaining;
     }
     return released;
+}
+
+// Splits `units` of the oldest generation on (channel, note) off into a
+// twin that takes the note-off, leaving the rest sounding. Every layer of the
+// generation is cloned, so a stereo pair stays a pair.
+//
+// Exactness: before the split the m units are identical voices, so the twin
+// (k units) and the source (m-k units) are two copies of one trajectory whose
+// gains sum to the original; the twin then follows the release envelope from
+// its current gain. Nothing is audible at the split frame.
+inline bool VoiceManager::ForkReleasedUnits(
+    uint8_t channel, uint8_t note, uint32_t playIndex, uint32_t units,
+    bool sustain, uint32_t blockOffset) {
+    constexpr uint32_t kMaxForkLayers = 16u;
+    VoiceHandle source[kMaxForkLayers];
+    uint32_t layers = 0u;
+    // The oldest generation is the chain tail and its layers are adjacent.
+    int32_t cursor = channelKeyVoiceOldest_[channel][note];
+    while (cursor >= 0 && layers < kMaxForkLayers) {
+        const VoiceHandle handle = static_cast<VoiceHandle>(cursor);
+        if (v.playIndex[handle] != playIndex) break;
+        source[layers++] = handle;
+        cursor = v.prevChannelKeyVoice[handle];
+    }
+    if (layers == 0u) return false;
+    if (cursor >= 0 &&
+        v.playIndex[static_cast<uint32_t>(cursor)] == playIndex) {
+        return false;  // more layers than a fork tracks
+    }
+    const uint32_t mult = GetVoiceMultiplicity(source[0]);
+    if (units == 0u || units >= mult) return false;
+    if (v.rot != nullptr) return false;  // twins carry no rotation state
+
+    // A full pool makes AllocateVoiceOrSteal pick a victim, which could be
+    // the very voice being split. Make the sources unattractive for the
+    // duration of the allocation (steal scores are level-based).
+    const bool mayHitSource = freeTop_ < layers ||
+        activeCount_ + layers > voiceLimit_;
+    float savedOutputGain[kMaxForkLayers];
+    if (mayHitSource) {
+        for (uint32_t i = 0u; i < layers; ++i) {
+            savedOutputGain[i] = v.stealOutputGain[source[i]];
+            v.stealOutputGain[source[i]] = 1.0e9f;
+            UpdateStealCandidate(source[i]);
+        }
+    }
+    VoiceHandle twin[kMaxForkLayers];
+    uint32_t made = 0u;
+    bool allocated = true;
+    for (; made < layers; ++made) {
+        twin[made] = AllocateVoiceOrSteal(
+            channel, note, v.velocity[source[made]], nullptr, true, false,
+            kInvalidVoice, 0u, kInvalidVoice);
+        if (twin[made] == kInvalidVoice) {
+            allocated = false;
+            break;
+        }
+    }
+    if (mayHitSource) {
+        for (uint32_t i = 0u; i < layers; ++i) {
+            v.stealOutputGain[source[i]] = savedOutputGain[i];
+            UpdateStealCandidate(source[i]);
+        }
+    }
+    if (!allocated) {
+        for (uint32_t rollback = 0u; rollback < made; ++rollback)
+            RetireVoice(twin[rollback]);
+        return false;
+    }
+
+    uint32_t twinPlayIndex = nextForkPlayIndex_++;
+    if (nextForkPlayIndex_ == UINT32_MAX) nextForkPlayIndex_ = 0x80000000u;
+    mergedVoicesMayExist_ = true;
+    const float sourceShare = static_cast<float>(mult - units) /
+                              static_cast<float>(mult);
+    const float twinShare = static_cast<float>(units) /
+                            static_cast<float>(mult);
+    for (uint32_t i = 0u; i < layers; ++i) {
+        const VoiceHandle s = source[i];
+        const VoiceHandle t = twin[i];
+        // Keep what the allocation linked for the twin; take everything else
+        // from the source row.
+        const int32_t keyNext = v.nextChannelKeyVoice[t];
+        const int32_t keyPrev = v.prevChannelKeyVoice[t];
+        VoiceSoA::CopyVoice(v, t, v, s);
+        v.nextChannelKeyVoice[t] = keyNext;
+        v.prevChannelKeyVoice[t] = keyPrev;
+        v.state[t] = static_cast<uint8_t>(VoiceState::Active);
+        v.renderClass[t] = static_cast<uint8_t>(VoiceRenderClass::Generic);
+        v.heldBySustain[t] = 0u;
+        v.releaseStartInBlock[t] = 0u;
+        exclusiveClass_[t] = exclusiveClass_[s];
+        SetVoicePlayIndex(t, twinPlayIndex);
+        v.mult[t] = units;
+        v.mult[s] = mult - units;
+        const auto scale = [this](VoiceHandle h, float share) {
+            v.gainLeft[h] *= share;
+            v.gainRight[h] *= share;
+            v.mixGainL[h] *= share;
+            v.mixGainR[h] *= share;
+            v.renderGainL[h] *= share;
+            v.renderGainR[h] *= share;
+            v.stealOutputGain[h] *= share;
+        };
+        scale(t, twinShare);
+        scale(s, sourceShare);
+        LinkExclusiveClass(t);
+        RefreshRenderClass(t);
+    }
+    CommitVoiceGroupConfigurations(twin, layers, false);
+    for (uint32_t i = 0u; i < layers; ++i) {
+        UpdateStealCandidate(source[i]);
+        if (voiceForkedHook_)
+            voiceForkedHook_(twin[i], source[i], voiceForkedUserData_);
+    }
+    // The twin now plays exactly like the units that were released: the
+    // ordinary note-off logic handles pedal and sostenuto holds as well.
+    NoteOffPlayIndex(channel, note, twinPlayIndex, sustain, blockOffset);
+    return true;
+}
+
+inline uint32_t VoiceManager::ReExciteKey(uint8_t channel, uint8_t note,
+                                          uint32_t attackFrames) noexcept {
+    if (attackFrames == 0u) attackFrames = ReExciteAttackFrames();
+    uint32_t found = 0u;
+    ForEachChannelKeyVoice(channel, note, [&](VoiceHandle h) {
+        if (v.state[h] != static_cast<uint8_t>(VoiceState::Active)) return;
+        ++found;
+        if (reExciteHook_ != nullptr) {
+            reExciteHook_(h, reExciteUserData_);
+            return;
+        }
+        ExciteVoiceRow(v, h, attackFrames);
+        RefreshRenderClass(h);
+    });
+    return found;
+}
+
+inline uint64_t VoiceManager::CountEffectiveVoices() noexcept {
+    uint64_t total = 0u;
+    bool anyMerged = false;
+    for (uint32_t position = 0u; position < activeCount_; ++position) {
+        const VoiceHandle handle = activeList_[position];
+        const uint32_t mult = GetVoiceMultiplicity(handle);
+        total += mult;
+        anyMerged |= mult > 1u;
+    }
+    mergedVoicesMayExist_ = anyMerged;
+    return total;
 }
 
 } // namespace svms
