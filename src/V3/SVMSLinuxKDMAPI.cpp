@@ -3,12 +3,14 @@
 #include "SVMSSysEx.h"
 #include "SVMSNativeOffline.h"
 #include "SVMSBuildInfo.h"
+#include "SVMSControlServer.h"
 #include "include/svmsapi.h"
 
 #include <alsa/asoundlib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -96,6 +98,7 @@ struct RuntimeOptions {
     uint32_t bufferFrames = 2048u;
     uint32_t eventCapacity = kDefaultEventCapacity;
     std::string configPath;
+    std::string soundfontPath;
 };
 
 template <typename T>
@@ -233,6 +236,7 @@ bool LoadOptions(RuntimeOptions& options, std::string& error) {
     }
     try {
         options.synth.soundfont = Utf8ToWide(resolvedSoundfont);
+        options.soundfontPath = resolvedSoundfont;
     } catch (const std::range_error&) {
         error = "SoundFont path is not valid UTF-8";
         return false;
@@ -364,6 +368,7 @@ public:
         options_ = options;
         synth_ = std::move(synth);
         pcm_ = std::move(pcm);
+        InitializeLiveParams();
         epochNs_ = MonotonicNanoseconds();
         leadFrames_ = pcm_->LeadFrames(options_.bufferFrames);
         ingressSequence_.store(0u, std::memory_order_relaxed);
@@ -395,6 +400,7 @@ public:
             options_.synth.sampleRate, options_.bufferFrames,
             options_.synth.maxVoices, synth_->Backend(),
             options_.eventCapacity);
+        StartControlServer();
         return true;
     }
 
@@ -467,6 +473,7 @@ public:
     void Shutdown() {
         std::lock_guard<std::mutex> guard(controlMutex_);
         running_.store(false, std::memory_order_release);
+        controlServer_.reset();
         if (audioThread_.joinable()) audioThread_.join();
         pcm_.reset();
         synth_.reset();
@@ -520,6 +527,145 @@ public:
     }
 
 private:
+    // ── Control API (SVMSControlRegistry.h) ─────────────────────────────
+    // The control thread only writes these atomics and bumps liveSeq_; the
+    // audio thread applies them at the next block boundary.
+    struct LiveParams {
+        std::atomic<float> master{1.0f};
+        std::atomic<uint32_t> limiterEnabled{1u}, limiterAlgorithm{0u};
+        std::atomic<float> limiterThreshold{0.95f}, limiterLookahead{3.0f},
+            limiterAttack{0.5f}, limiterRelease{100.0f};
+    };
+
+    void InitializeLiveParams() {
+        const auto& s = options_.synth;
+        live_.master.store(s.masterVolume);
+        live_.limiterEnabled.store(s.limiterEnabled ? 1u : 0u);
+        live_.limiterAlgorithm.store(uint32_t(s.limiterAlgorithm));
+        live_.limiterThreshold.store(s.limiterThreshold);
+        live_.limiterLookahead.store(s.limiterLookaheadMs);
+        live_.limiterAttack.store(s.limiterAttackMs);
+        live_.limiterRelease.store(s.limiterReleaseMs);
+        liveSeq_.store(0u);
+        appliedMaster_ = s.masterVolume;
+        appliedLimiter_ = LimiterKey(live_);
+    }
+
+    using LimiterTuple = std::array<float, 6>;
+    static LimiterTuple LimiterKey(const LiveParams& p) {
+        return {float(p.limiterEnabled.load()), float(p.limiterAlgorithm.load()),
+                p.limiterThreshold.load(), p.limiterLookahead.load(),
+                p.limiterAttack.load(), p.limiterRelease.load()};
+    }
+
+    void ApplyLiveParams() {
+        const float master = live_.master.load();
+        if (master != appliedMaster_) {
+            appliedMaster_ = master;
+            synth_->SetMasterVolume(master);
+        }
+        const LimiterTuple limiter = LimiterKey(live_);
+        if (limiter != appliedLimiter_) {
+            appliedLimiter_ = limiter;
+            synth_->ConfigureLimiter(
+                limiter[0] != 0.0f,
+                limiter[1] != 0.0f ? svms::LimiterAlgorithm::Adaptive
+                                   : svms::LimiterAlgorithm::Classic,
+                limiter[2], limiter[3], limiter[4], limiter[5]);
+        }
+    }
+
+    void StartControlServer() {
+        using namespace svms::ctl;
+        registry_ = std::make_unique<Registry>();
+        Registry& r = *registry_;
+        auto floatParam = [&](const char* id, const char* label, const char* group,
+                              const char* unit, double lo, double hi, double def,
+                              std::atomic<float>& slot) {
+            Param p;
+            p.id = id; p.label = label; p.group = group; p.unit = unit;
+            p.type = ParamType::Float; p.min = lo; p.max = hi; p.def = def;
+            p.get = [&slot] { return double(slot.load()); };
+            p.set = [this, &slot](double v) {
+                slot.store(float(v));
+                liveSeq_.fetch_add(1u, std::memory_order_release);
+                return SetResult::Ok;
+            };
+            r.AddParam(std::move(p));
+        };
+        auto uintParam = [&](const char* id, const char* label, const char* group,
+                             ParamType type, double hi, double def,
+                             std::vector<std::string> options,
+                             std::atomic<uint32_t>& slot) {
+            Param p;
+            p.id = id; p.label = label; p.group = group;
+            p.type = type; p.min = 0.0; p.max = hi; p.def = def;
+            p.options = std::move(options);
+            p.get = [&slot] { return double(slot.load()); };
+            p.set = [this, &slot](double v) {
+                slot.store(uint32_t(v));
+                liveSeq_.fetch_add(1u, std::memory_order_release);
+                return SetResult::Ok;
+            };
+            r.AddParam(std::move(p));
+        };
+        floatParam("master_volume", "Master volume", "master", "x", 0.0, 4.0, 1.0,
+                   live_.master);
+        uintParam("limiter_enabled", "Limiter", "limiter", ParamType::Bool, 1.0, 1.0,
+                  {}, live_.limiterEnabled);
+        uintParam("limiter_algorithm", "Limiter algorithm", "limiter", ParamType::Enum,
+                  1.0, 0.0, {"Classic", "Adaptive"}, live_.limiterAlgorithm);
+        floatParam("limiter_threshold", "Threshold", "limiter", "", 0.1, 1.0, 0.95,
+                   live_.limiterThreshold);
+        floatParam("limiter_lookahead_ms", "Lookahead", "limiter", "ms", 0.0, 20.0, 3.0,
+                   live_.limiterLookahead);
+        floatParam("limiter_attack_ms", "Attack", "limiter", "ms", 0.01, 100.0, 0.5,
+                   live_.limiterAttack);
+        floatParam("limiter_release_ms", "Release", "limiter", "ms", 1.0, 5000.0, 100.0,
+                   live_.limiterRelease);
+
+        auto metric = [&](const char* id, const char* label, const char* unit,
+                          std::function<double()> get) {
+            r.AddMetric({id, label, unit, std::move(get)});
+        };
+        metric("active_voices", "Active voices", "", [this] { return double(Statistics().activeVoices); });
+        metric("free_voices", "Free voices", "", [this] { return double(Statistics().freeVoices); });
+        metric("voice_steals", "Voice steals", "", [this] { return double(Statistics().voiceSteals); });
+        metric("render_ms", "Render time", "ms", [this] { return double(RenderingTime()); });
+        metric("callbacks", "Audio blocks", "", [this] { return double(CallbackCount()); });
+        metric("events_submitted", "Events submitted", "", [this] { return double(SubmittedEvents()); });
+        metric("events_accepted", "Events accepted", "", [this] { return double(AcceptedEvents()); });
+        metric("events_dispatched", "Events dispatched", "", [this] { return double(DispatchedEvents()); });
+        metric("queue_size", "Ingress queue", "", [this] { return double(QueueSize()); });
+        metric("queue_capacity", "Ingress capacity", "", [this] { return double(QueueCapacity()); });
+        metric("pending_events", "Scheduled events", "", [this] { return double(PendingCount()); });
+        metric("sample_rate", "Sample rate", "Hz", [this] { return double(SampleRate()); });
+        metric("buffer_frames", "Buffer", "frames", [this] { return double(BufferFrames()); });
+        metric("max_voices", "Voice pool", "", [this] { return double(options_.synth.maxVoices); });
+
+        r.AddCommand({"reset_voices", "Reset all voices", [this] {
+            return Submit(0u, EventKind::Reset) ? SetResult::Ok : SetResult::Busy;
+        }});
+
+        r.SetInfo("soundfont", options_.soundfontPath);
+        r.SetInfo("audio_device", options_.pcmDevice);
+        r.SetInfo("backend", std::string(synth_->Backend()));
+        r.SetInfo("config_path", options_.configPath);
+
+        const std::string version = std::to_string(svms::build::kProductMajor) + "." +
+            std::to_string(svms::build::kProductMinor) + "." +
+            std::to_string(svms::build::kProductPatch);
+        controlServer_ = std::make_unique<ControlServer>(r, "SVMS", version);
+        std::string error;
+        if (!controlServer_->Start(error)) {
+            std::fprintf(stderr, "[SVMS Linux] control API disabled: %s\n", error.c_str());
+            controlServer_.reset();
+        } else {
+            std::fprintf(stderr, "[SVMS Linux] control API: %s\n",
+                         controlServer_->Path().c_str());
+        }
+    }
+
     void PublishStatistics(float milliseconds) {
         activeVoices_.store(synth_->Active(), std::memory_order_relaxed);
         freeVoices_.store(synth_->Free(), std::memory_order_relaxed);
@@ -539,7 +685,13 @@ private:
         std::vector<float> interleaved(size_t(options_.bufferFrames) * 2u);
         size_t pendingHead = 0u;
         uint64_t outputFrame = 0u;
+        uint32_t appliedLiveSeq = 0u;
         while (running_.load(std::memory_order_acquire)) {
+            const uint32_t liveSeq = liveSeq_.load(std::memory_order_acquire);
+            if (liveSeq != appliedLiveSeq) {
+                appliedLiveSeq = liveSeq;
+                ApplyLiveParams();
+            }
             const auto renderStart = std::chrono::steady_clock::now();
             if (pendingHead && (pendingHead == pending.size() ||
                                 pendingHead >= pending.size() / 2u)) {
@@ -613,6 +765,14 @@ private:
                                         std::memory_order_release);
         }
     }
+
+    LiveParams live_;
+    std::atomic<uint32_t> liveSeq_{0u};
+    float appliedMaster_ = 1.0f;
+    LimiterTuple appliedLimiter_{};
+    // Destroyed (server first) before the synth/PCM they report on.
+    std::unique_ptr<svms::ctl::Registry> registry_;
+    std::unique_ptr<svms::ctl::ControlServer> controlServer_;
 
     mutable std::mutex controlMutex_;
     svms::DynamicMPSCQueue<QueuedEvent> queue_;

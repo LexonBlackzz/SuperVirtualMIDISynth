@@ -120,3 +120,16 @@ and pan subset shared with Windows and offline rendering.
 `libOmniMIDI.so` is a symbolic compatibility name for the same shared object,
 not a second engine. Native and KDMAPI users in one process therefore share
 runtime ownership correctly.
+
+## Control API (live configuration)
+
+The library hosts a Unix socket at `$XDG_RUNTIME_DIR/svms/svms-<pid>.sock`
+(fallback `/tmp/svms-<uid>/`, mode 0600). It speaks newline-delimited JSON; the
+`hello` message carries every parameter, metric and command the driver offers,
+so configurators render what the driver advertises and show unknown entries
+generically. See `SVMSControlRegistry.h` for the message list. Quick check:
+
+```sh
+socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/svms/svms-PID.sock
+{"t":"set","id":"master_volume","v":0.5,"rid":1}
+```

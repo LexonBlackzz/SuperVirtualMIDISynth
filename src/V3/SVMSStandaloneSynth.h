@@ -487,6 +487,29 @@ public:
         }
     }
 
+    // Live parameter changes. Audio-thread only (call between blocks): the
+    // control thread parks the request and the render loop applies it.
+    void SetMasterVolume(float volume) {
+        master_ = volume;
+        channels_.SetMasterVolume(master_ * sysexMasterVolume_);
+        channels_.RebuildCache(cfg_, static_cast<float>(rate_));
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel)
+            voices_.MarkChannelMixStale(channel, channels_.GetParams()[channel]);
+    }
+
+    void ConfigureLimiter(bool enabled, LimiterAlgorithm algorithm,
+                          float threshold, float lookaheadMs, float attackMs,
+                          float releaseMs) {
+        EngineConfig limiterConfig{};
+        limiterConfig.limiterEnabled = enabled;
+        limiterConfig.limiterAlgorithm = algorithm;
+        limiterConfig.limiterThreshold = threshold;
+        limiterConfig.limiterLookaheadMs = lookaheadMs;
+        limiterConfig.limiterAttackMs = attackMs;
+        limiterConfig.limiterReleaseMs = releaseMs;
+        limiter_.Configure(rate_, limiterConfig);
+    }
+
     uint32_t Active() const { return voices_.GetActiveCount(); }
     uint32_t Tails() const { return voices_.GetStealTailCount(); }
     uint32_t Steals() const { return voices_.stealCount_; }

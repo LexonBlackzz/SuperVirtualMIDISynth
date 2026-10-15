@@ -158,6 +158,7 @@ endif()
 
 if(NOT WIN32)
     find_package(Threads REQUIRED)
+    set(SVMS_CONTROL_SERVER_SOURCES SVMSControlServer.cpp)
     find_package(ALSA REQUIRED)
     # nlohmann/json for SVMSConfig.cpp (compiled into every portable target).
     include_directories("${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
@@ -209,6 +210,7 @@ if(NOT WIN32)
 
     add_library(omnimidi SHARED
         SVMSLinuxKDMAPI.cpp
+        SVMSControlServer.cpp
         ${SVMS_PORTABLE_RENDER_SOURCES})
     target_include_directories(omnimidi PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -251,6 +253,16 @@ if(NOT WIN32)
         target_include_directories(svms_v3_limiter_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
+
+        add_executable(svms_v3_control_tests tests/SVMSControlRegistryTests.cpp
+            ${SVMS_CONTROL_SERVER_SOURCES})
+        target_include_directories(svms_v3_control_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+        if(UNIX)
+            target_link_libraries(svms_v3_control_tests PRIVATE Threads::Threads)
+        endif()
+        add_test(NAME svms_v3_control COMMAND svms_v3_control_tests)
 
 
 
@@ -1027,6 +1039,16 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_limiter_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
+
+        add_executable(svms_v3_control_tests tests/SVMSControlRegistryTests.cpp
+            ${SVMS_CONTROL_SERVER_SOURCES})
+        target_include_directories(svms_v3_control_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+        if(UNIX)
+            target_link_libraries(svms_v3_control_tests PRIVATE Threads::Threads)
+        endif()
+        add_test(NAME svms_v3_control COMMAND svms_v3_control_tests)
     if(SVMS_XP_COMPAT)
         add_executable(svms_v3_xp_directsound_smoke
 
