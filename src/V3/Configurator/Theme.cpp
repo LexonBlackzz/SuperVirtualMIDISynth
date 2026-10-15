@@ -258,8 +258,7 @@ bool WriteThemeFile(const fs::path& path,
             }
         }
 
-        if (!MoveFileExW(temp.c_str(), path.c_str(),
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (!util::ReplaceFile(temp, path)) {
             std::error_code ec;
             fs::remove(temp, ec);
             if (error) *error = "Could not replace the saved theme file.";

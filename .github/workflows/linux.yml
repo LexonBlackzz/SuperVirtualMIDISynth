@@ -58,7 +58,7 @@ jobs:
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
               ccache -z
-              cmake --build build/V3-linux-bionic --parallel
+              cmake --build build/V3-linux-bionic --parallel -- -k 0
               ccache -s
               ctest --test-dir build/V3-linux-bionic --output-on-failure
               build/V3-linux-bionic/bin/svmsd --help

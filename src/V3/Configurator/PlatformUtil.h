@@ -14,11 +14,21 @@
 #include <windows.h>
 #else
 #include <codecvt>
+#include <cwctype>
 #include <locale>
 // The page classes keep Windows handle types in their signatures; on Linux
 // they are opaque and unused.
 using HWND = void*;
 using HANDLE = void*;
+
+inline int _wcsicmp(const wchar_t* a, const wchar_t* b) {
+    for (;; ++a, ++b) {
+        const wint_t x = std::towlower(static_cast<wint_t>(*a));
+        const wint_t y = std::towlower(static_cast<wint_t>(*b));
+        if (x != y) return x < y ? -1 : 1;
+        if (*a == L'\0') return 0;
+    }
+}
 #endif
 
 // GCC < 9 (the Ubuntu 18.04 build floor) only ships the Filesystem TS.
@@ -72,9 +82,19 @@ inline std::wstring Utf8ToWide(const std::string& value) {
 #endif
 }
 
-} // namespace svms::cfg::util
-
+// Atomically replaces `to` with `from` (MoveFileEx write-through on Windows).
+inline bool ReplaceFile(const fs::path& from, const fs::path& to) {
+#ifdef _WIN32
+    return MoveFileExW(from.c_str(), to.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::error_code ec;
+    fs::rename(from, to, ec);
+    return !ec;
 #endif
+}
+
+} // namespace svms::cfg::util
 
 namespace svms::cfg::util {
 
@@ -92,3 +112,5 @@ bool HaveFilePicker();
 #endif
 
 } // namespace svms::cfg::util
+
+#endif
