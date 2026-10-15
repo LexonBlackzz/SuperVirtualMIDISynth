@@ -211,13 +211,19 @@ bool LoadOptions(RuntimeOptions& options, std::string& error) {
         soundfont = environmentSoundfont;
     if (const char* environmentDevice = std::getenv("SVMS_AUDIO_DEVICE"))
         options.pcmDevice = environmentDevice;
+    // The Windows configurator writes synth.soundfont = "" (use default) or a
+    // C:\ path; neither is usable here, so fall back to gm.sf2 / its basename.
+    if (soundfont.empty()) soundfont = "gm.sf2";
 
     const std::string configDirectory = options.configPath.empty()
         ? CurrentDirectory() : DirectoryName(options.configPath);
     std::string resolvedSoundfont = IsAbsolute(soundfont)
         ? soundfont : JoinPath(configDirectory, soundfont);
     if (!FileExists(resolvedSoundfont)) {
-        const std::string besideLibrary = JoinPath(libraryDirectory, soundfont);
+        const size_t separator = soundfont.find_last_of("/\\");
+        const std::string besideLibrary = JoinPath(
+            libraryDirectory, separator == std::string::npos
+                                  ? soundfont : soundfont.substr(separator + 1u));
         if (FileExists(besideLibrary)) resolvedSoundfont = besideLibrary;
     }
     if (!FileExists(resolvedSoundfont)) {
