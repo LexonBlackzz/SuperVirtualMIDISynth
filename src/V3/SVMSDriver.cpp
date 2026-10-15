@@ -246,7 +246,7 @@ Driver::Driver()
       diagnosticsEnabled_(false), diagnosticsWindow_(false), diagnosticsDebugOutput_(false),
       nextEventSequence_(0), globalTerminationFence_(0), cancelProducers_(false),
       producerWakeEpoch_(0),
-      scheduledSizePublished_(0), submittedAtomic_(0), acceptedAtomic_(0), shedAtomic_(0),
+      scheduledSizePublished_(0), notAcceptedAtomic_(0), shedAtomic_(0),
       cancelledAtomic_(0), currentVelocityCutoffAtomic_(1),
       compilerEpochQPC_(0), compilerWakeEpoch_(0), compilerSleeping_(false),
       useEventCompiler_(false),

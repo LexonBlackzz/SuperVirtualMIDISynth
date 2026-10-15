@@ -691,7 +691,10 @@ private:
     bool diagnosticsEnabled_;
     bool diagnosticsWindow_;
     bool diagnosticsDebugOutput_;
-    std::atomic<uint32_t> nextEventSequence_;
+    // Total events ever submitted (also the event sequence: low 32 bits).
+    // The ONLY shared RMW on the producer hot path; accepted = submitted -
+    // notAcceptedAtomic_ (cold-path counter) so no per-event accepted RMW.
+    std::atomic<uint64_t> nextEventSequence_;
     // Producer-side timestamp clock (invariant-TSC hosts; plain QPC
     // otherwise). Refreshed by the audio callback each block.
     TscQpcClock tscClock_;
@@ -773,8 +776,7 @@ private:
     std::atomic<bool> cancelProducers_;
     std::atomic<uint32_t> producerWakeEpoch_;
     std::atomic<uint32_t> scheduledSizePublished_;
-    std::atomic<uint64_t> submittedAtomic_;
-    std::atomic<uint64_t> acceptedAtomic_;
+    std::atomic<uint64_t> notAcceptedAtomic_;
     std::atomic<uint64_t> shedAtomic_;
     std::atomic<uint64_t> cancelledAtomic_;
     // Same-key note-on coalescing (see SVMSNoteOnCollapse.h). Collapsed

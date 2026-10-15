@@ -253,8 +253,10 @@ void Driver::CopyNativeQueueInfo(SVMS_QueueInfo& out) const {
     out.scheduled_count = scheduledSizePublished_.load(
         std::memory_order_acquire);
     out.max_events_per_callback = maxEventsPerBlock_;
-    out.submitted_events = submittedAtomic_.load(std::memory_order_relaxed);
-    out.accepted_events = acceptedAtomic_.load(std::memory_order_relaxed);
+    out.submitted_events = nextEventSequence_.load(std::memory_order_relaxed);
+    out.accepted_events = out.submitted_events -
+        (std::min)(out.submitted_events,
+                   notAcceptedAtomic_.load(std::memory_order_relaxed));
     out.intentionally_shed_events = shedAtomic_.load(
         std::memory_order_relaxed);
     out.cancelled_submissions = cancelledAtomic_.load(
@@ -312,15 +314,16 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
     uint32_t msg, uint64_t qpcTimestamp,
     const std::atomic<uint64_t>* externalCancellation,
     uint64_t cancellationToken) {
-    submittedAtomic_.fetch_add(1, std::memory_order_relaxed);
     TimestampedMidiEvent evt{};
     evt.message = msg;
-    evt.sequence = nextEventSequence_.fetch_add(1, std::memory_order_relaxed);
+    evt.sequence = static_cast<uint32_t>(
+        nextEventSequence_.fetch_add(1, std::memory_order_relaxed));
     evt.qpcTimestamp = qpcTimestamp;
 
     if (externalCancellation && externalCancellation->load(
             std::memory_order_acquire) == cancellationToken) {
         cancelledAtomic_.fetch_add(1, std::memory_order_relaxed);
+        notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -352,10 +355,15 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
         uint32_t stack = 0u;
         if (!noteOnCollapse_.OnNoteOn(keyIndex, qpcTimestamp, stack)) {
             coalescedAtomic_.fetch_add(1u, std::memory_order_relaxed);
-            if (!noteOnReexcite_.load(std::memory_order_relaxed)) return true;
-            // Hits inside the previous kept hit's attack ramp change nothing.
-            if (!noteOnCollapse_.AllowReExcite(keyIndex, qpcTimestamp))
+            if (!noteOnReexcite_.load(std::memory_order_relaxed)) {
+                notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
                 return true;
+            }
+            // Hits inside the previous kept hit's attack ramp change nothing.
+            if (!noteOnCollapse_.AllowReExcite(keyIndex, qpcTimestamp)) {
+                notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
             // Re-excite: keep the hit at its exact timestamp, tagged so the
             // audio thread restarts the key's live voices instead of
             // launching one. (No stack/velocity boost: nothing is dropped.)
@@ -418,6 +426,7 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
         overflowMode == EventOverflowMode::PriorityVelocity) {
         shedAtomic_.fetch_add(1, std::memory_order_relaxed);
         shedByVelocityAtomic_[velocity].fetch_add(1, std::memory_order_relaxed);
+        notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -425,7 +434,6 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
                           overflowMode == EventOverflowMode::LosslessBackpressure;
     for (;;) {
             if (midiIngress_.TryPush(lane, evt)) {
-                acceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
                 // A running compiler will observe the queue without help. Only
                 // cross the kernel/API boundary when it explicitly published
                 // that it is asleep. The load keeps the ordinary (awake) case
@@ -458,12 +466,14 @@ bool Driver::SubmitShortMsgAtQpcCancellable(
         if (!lossless) {
             shedAtomic_.fetch_add(1, std::memory_order_relaxed);
             shedByVelocityAtomic_[velocity].fetch_add(1, std::memory_order_relaxed);
+            notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         if (cancelProducers_.load(std::memory_order_acquire) ||
             (externalCancellation && externalCancellation->load(
                 std::memory_order_acquire) == cancellationToken)) {
             cancelledAtomic_.fetch_add(1, std::memory_order_relaxed);
+            notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         uint32_t observed = producerWakeEpoch_.load(std::memory_order_acquire);
@@ -521,9 +531,8 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
         const uint32_t count = (std::min)(
             eventCount - cursor,
             (std::min)(kBatchReservation, laneCapacity));
-        submittedAtomic_.fetch_add(count, std::memory_order_relaxed);
-        const uint32_t firstSequence = nextEventSequence_.fetch_add(
-            count, std::memory_order_relaxed);
+        const uint32_t firstSequence = static_cast<uint32_t>(
+            nextEventSequence_.fetch_add(count, std::memory_order_relaxed));
         for (uint32_t i = 0u; i < count; ++i) {
             const SVMS_ShortEvent& source = events[cursor + i];
             prepared[i].message = source.packed_message;
@@ -536,7 +545,6 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
         for (;;) {
             if (midiIngress_.TryPushBatch(
                     EventLane::Loud, prepared, count)) {
-                acceptedAtomic_.fetch_add(count, std::memory_order_relaxed);
                 // Same guarded wake as the single-event path: the batch is
                 // already visible in the lane, so only a compiler that
                 // published sleeping=true after this push needs a wake.
@@ -554,6 +562,7 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
                 (externalCancellation && externalCancellation->load(
                     std::memory_order_acquire) == cancellationToken)) {
                 cancelledAtomic_.fetch_add(1u, std::memory_order_relaxed);
+                notAcceptedAtomic_.fetch_add(count, std::memory_order_relaxed);
                 return false;
             }
             const uint32_t observed = producerWakeEpoch_.load(

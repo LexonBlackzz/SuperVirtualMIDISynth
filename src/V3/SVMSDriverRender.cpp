@@ -744,7 +744,7 @@ const uint32_t importedPages = self->useEventCompiler_
             (unsigned long long)(self->telemetry_.staleNoteOnsSkipped - censusLastStale),
             (unsigned long long)(self->shedAtomic_.load(std::memory_order_relaxed) - censusLastShed),
             (unsigned long long)(self->ccCollapsedCount_ - censusLastCc),
-            self->nextEventSequence_.load(std::memory_order_relaxed),
+            static_cast<uint32_t>(self->nextEventSequence_.load(std::memory_order_relaxed)),
             (unsigned)(globalEncoded ? globalEncoded - 1u : 0u),
             fencedChannels, maxChannelFence,
             (unsigned)self->midiIngress_.TotalSize(),
@@ -902,8 +902,10 @@ const uint32_t importedPages = self->useEventCompiler_
         self->callbackTiming_.maxConsecutiveOverBudget;
     self->telemetry_.immediateRetirements = vm->retireImmediateCount_;
     self->telemetry_.voiceSteals = vm->stealCount_;
-    self->telemetry_.submitted = self->submittedAtomic_.load(std::memory_order_relaxed);
-    self->telemetry_.accepted = self->acceptedAtomic_.load(std::memory_order_relaxed);
+    self->telemetry_.submitted = self->nextEventSequence_.load(std::memory_order_relaxed);
+    self->telemetry_.accepted = self->telemetry_.submitted -
+        (std::min)(self->telemetry_.submitted,
+                   self->notAcceptedAtomic_.load(std::memory_order_relaxed));
     self->telemetry_.dropped = self->shedAtomic_.load(std::memory_order_relaxed);
     self->telemetry_.shedNoteOns = self->telemetry_.dropped;
     self->telemetry_.cancelledSubmissions =
