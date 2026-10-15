@@ -133,3 +133,14 @@ generically. See `SVMSControlRegistry.h` for the message list. Quick check:
 socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/svms/svms-PID.sock
 {"t":"set","id":"master_volume","v":0.5,"rid":1}
 ```
+
+## Configurator
+
+`svms_configurator` (SDL2 + OpenGL 3, needs `libsdl2` and a GL driver at runtime)
+edits `config.json` and talks to a running driver over the Control API socket.
+Start it after Ziggy (or any KDMAPI/native client) has loaded the driver; it
+finds the driver by itself. Live today: master volume, limiter, the metrics
+strip. Anything else the driver advertises appears under Tools > Driver
+features. File pickers use `kdialog` or `zenity` when installed; otherwise type
+the path. The offline renderer, live recording and update check are Windows
+only (use `svms_v3_render` for offline work).

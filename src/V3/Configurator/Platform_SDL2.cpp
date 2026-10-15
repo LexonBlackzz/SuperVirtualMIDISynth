@@ -12,6 +12,7 @@
 #include <SDL_opengl.h>
 
 #include <algorithm>
+#include <cctype>
 #include <codecvt>
 #include <cstdio>
 #include <cstdlib>
@@ -174,8 +175,14 @@ public:
 
     bool LoadSystemFont(bool mono, std::vector<unsigned char>& out) override {
         out.clear();
+        // ImGui's stb_truetype reads TrueType outlines only: skip CFF .otf and
+        // collections that fontconfig may pick, and fall through to known TTFs.
         const std::string fromFontconfig = FontconfigFile(mono ? "monospace" : "sans");
-        if (!fromFontconfig.empty() && ReadWholeFile(fromFontconfig, out)) return true;
+        if (fromFontconfig.size() > 4) {
+            std::string extension = fromFontconfig.substr(fromFontconfig.size() - 4);
+            for (char& c : extension) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (extension == ".ttf" && ReadWholeFile(fromFontconfig, out)) return true;
+        }
         static const char* kUi[] = {
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
