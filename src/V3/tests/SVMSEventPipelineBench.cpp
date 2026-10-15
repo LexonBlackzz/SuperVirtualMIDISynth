@@ -73,7 +73,7 @@ double RunContended(uint32_t producers, double seconds, uint32_t counters,
                 for (uint32_t k = 0u; k < 256u; ++k, ++n) {
                     svms::TimestampedMidiEvent e{};
                     const uint32_t note = static_cast<uint32_t>(n) & 0x7fu;
-                    if (counters) {
+                    if (counters && counters != 3u) {
                         if (counters == 1u)
                             shared.submitted.fetch_add(1, std::memory_order_relaxed);
                         e.sequence = shared.sequence.fetch_add(
@@ -83,7 +83,9 @@ double RunContended(uint32_t producers, double seconds, uint32_t counters,
                     }
                     e.qpcTimestamp = __rdtsc();
                     e.message = 0x90u | (note << 8u) | (127u << 16u);
-                    while (!ingress->TryPush(svms::EventLane::Loud, e)) {
+                    while (!(counters == 3u
+                                 ? ingress->TryPushFast(e)
+                                 : ingress->TryPush(svms::EventLane::Loud, e))) {
                         ++stall;
                         if (stop.load(std::memory_order_relaxed)) break;
                     }
@@ -112,6 +114,11 @@ int RunContendedMode(uint32_t producers, double seconds) {
         const double b = RunContended<SharedPacked>(p, seconds, 1u, sb);
         const double c = RunContended<SharedPadded>(p, seconds, 1u, sc);
         const double d = RunContended<SharedPacked>(p, seconds, 2u, sd);
+        // E: single-producer ring (only meaningful for p == 1).
+        uint64_t se = 0;
+        const double e = p == 1u
+            ? RunContended<SharedPacked>(p, seconds, 3u, se) : 0.0;
+        std::printf("producers=%u  E(fast ring, no shared RMW)=%.1f Mev/s\n", p, e);
         std::printf("producers=%u  A(push only)=%.1f  B(+3 RMW packed)=%.1f  "
                     "C(+3 RMW padded)=%.1f  D(sequence RMW only)=%.1f  Mev/s  "
                     "stalls A/B/C=%llu/%llu/%llu\n",

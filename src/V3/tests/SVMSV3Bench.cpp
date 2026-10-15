@@ -9,6 +9,9 @@
 #include <avrt.h>
 #include <immintrin.h>
 #include <algorithm>
+#include <atomic>
+#include <barrier>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -64,12 +67,14 @@ uint64_t gDispatchCycles = 0u;
 uint64_t gStealCycles = 0u;
 uint64_t gRegionResolveCycles = 0u;
 uint64_t gLaunchPrepareCycles = 0u;
-uint64_t gMatchedRegions = 0u;
+// thread_local: the --shards prototype dispatches from several threads, and
+// a shared per-event counter would ping-pong one cache line between them.
+thread_local uint64_t gMatchedRegions = 0u;
 // --note-merge census: event-array sizes around the merge pass.
 uint64_t gMergeEventsIn = 0u;
 uint64_t gMergeEventsOut = 0u;
 uint64_t gMergeFolded = 0u;
-uint64_t gBreakdownSampleCounter = 0u;
+thread_local uint64_t gBreakdownSampleCounter = 0u;
 uint64_t gRdtscPairOverhead = 0u;
 constexpr uint32_t kBreakdownSampleInterval = 4096u;
 static_assert((kBreakdownSampleInterval &
@@ -105,6 +110,7 @@ struct Options {
     bool decimation = false;
     bool decimationByLevel = false;
     bool stealReject = false;
+    uint32_t shards = 1u;  // --shards N: key-sharded engine prototype
     uint32_t cullMutedBlocks = 0u;
     uint32_t rotationMode = 0u;  // 0 coherent, 1 analytic, 2 sweep, 3 diffuse, 4 random
     bool transactionalLaunch = true;
@@ -261,6 +267,10 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         } else if (std::strcmp(argv[i], "--decimation-by-level") == 0) {
             options.decimation = true;
             options.decimationByLevel = true;
+        } else if (std::strcmp(argv[i], "--shards") == 0) {
+            if (!nextNumber(options.shards) || options.shards < 1u ||
+                options.shards > 64u)
+                return false;
         } else if (std::strcmp(argv[i], "--steal-reject") == 0) {
             options.stealReject = true;
         } else if (std::strcmp(argv[i], "--velocity-gain") == 0) {
@@ -486,7 +496,7 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
         // re-ran 8 VoiceConfiguration constructors per note-on (~20% of
         // the measured plan time at multi-M NPS) even when preparedSetups
         // makes it unused.  The bench dispatches from one thread only.
-        static svms::VoiceConfiguration localSetups[8];
+        thread_local svms::VoiceConfiguration localSetups[8];
         svms::VoiceHandle handles[8]{};
         const svms::VoiceConfiguration* setups = preparedSetups;
         if (!setups) {
@@ -495,7 +505,7 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
             setups = localSetups;
         }
         if (gBenchVelocityGain) {
-            static svms::VoiceConfiguration velocityScaled[8];
+            thread_local svms::VoiceConfiguration velocityScaled[8];
             for (uint32_t layer = 0u; layer < count; ++layer) {
                 velocityScaled[layer] = setups[layer];
                 velocityScaled[layer].initialGain *=
@@ -775,6 +785,10 @@ int main(int argc, char** argv) {
         gRdtscPairOverhead = (std::min)(gRdtscPairOverhead, end - begin);
     }
 
+    // Sharded prototype: the pool is split across shards (each shard owns
+    // voices/N), the events are partitioned by (channel,key).
+    if (options.shards > 1u)
+        options.voices = (std::max)(1u, options.voices / options.shards);
     constexpr uint32_t sampleFrames = 64u * 2048u;
     std::vector<int16_t> samples(sampleFrames + 8u, 0);
     for (uint32_t i = 0; i < sampleFrames; ++i) {
@@ -1126,8 +1140,108 @@ int main(int argc, char** argv) {
             options.workload == Workload::Dense ? nullptr : &mixedContext);
     }
 
+    // ---- Key-sharded prototype (--shards N) --------------------------------
+    // Shard 0 is the engine built above; shards 1..N-1 are full copies (own
+    // voice pool, channel cache, renderer). Note events go to one shard by
+    // (channel,key); every other event is broadcast to all shards. Shard
+    // threads render their block in parallel; the "audio thread" (main) sums.
+    struct Shard {
+        std::unique_ptr<svms::VoiceManager> voices;
+        svms::ChannelCache channels;
+        std::unique_ptr<svms::RenderScalar> renderer;
+        std::unique_ptr<BenchLaunchPlanEntry[]> cache;
+        MixedDispatchContext ctx{};
+        std::vector<svms::RenderEvent> events;
+        std::vector<float> left, right;
+    };
+    std::vector<std::unique_ptr<Shard>> extraShards;
+    std::vector<svms::RenderEvent> shard0Events;
+    if (options.shards > 1u) {
+        std::vector<std::vector<svms::RenderEvent>> parts(options.shards);
+        for (const svms::RenderEvent& e : events) {
+            const bool noteLike = e.type == svms::RenderEventType::NoteOn ||
+                e.type == svms::RenderEventType::NoteOff ||
+                e.type == svms::RenderEventType::NoteReExcite ||
+                e.type == svms::RenderEventType::StaleNoteOffBatch;
+            if (noteLike) {
+                parts[(((e.channel * 128u + e.data1) * 2654435761u) >> 16u) %
+                      options.shards]
+                    .push_back(e);
+            } else {
+                for (auto& part : parts) part.push_back(e);
+            }
+        }
+        for (auto& part : parts)
+            for (uint32_t i = 0u; i < part.size(); ++i)
+                part[i].ingressSequence = i;
+        for (uint32_t i = 0u; i < options.shards; ++i)
+            std::fprintf(stderr, "[shard %u events %zu]\n", i, parts[i].size());
+        shard0Events = std::move(parts[0]);
+        for (uint32_t index = 1u; index < options.shards; ++index) {
+            auto sh = std::make_unique<Shard>();
+            sh->voices = std::make_unique<svms::VoiceManager>();
+            if (!ConfigureVoices(*sh->voices, sh->channels, cfg, options.voices,
+                                 options.workload, sampleFrames,
+                                 options.genericVoices, options.stealPolicy)) {
+                std::fprintf(stderr, "cannot allocate shard voice storage\n");
+                return 3;
+            }
+            sh->voices->SetStealReject(options.stealReject);
+            sh->renderer = std::make_unique<svms::RenderScalar>();
+            if (!sh->renderer->ReserveVoiceCapacity(options.voices) ||
+                !sh->renderer->ConfigureRenderThreads(options.renderThreads,
+                                                      options.frames) ||
+                (!options.automaticBackend &&
+                 !sh->renderer->SetRenderBackend(options.backend))) {
+                std::fprintf(stderr, "cannot initialize shard renderer\n");
+                return 3;
+            }
+            sh->cache = std::make_unique<BenchLaunchPlanEntry[]>(4096u);
+            sh->ctx = MixedDispatchContext{
+                sh->voices.get(), &sh->channels, &cfg, sampleFrames,
+                options.voices, soundFont.get(), soundFontPreset,
+                options.attackFrames, options.transactionalLaunch,
+                options.copiedLaunchPlan, options.batchNoteOffIndex,
+                sh->cache.get()};
+            sh->renderer->SetEventBatchDispatcher(MixedBatchDispatch,
+                                                  &sh->ctx);
+            sh->events = std::move(parts[index]);
+            sh->left.assign(options.frames, 0.0f);
+            sh->right.assign(options.frames, 0.0f);
+            extraShards.push_back(std::move(sh));
+        }
+    }
     std::vector<float> left(options.frames);
     std::vector<float> right(options.frames);
+    std::unique_ptr<std::barrier<>> shardBarrier;
+    std::vector<std::thread> shardThreads;
+    std::atomic<bool> shardStop{false};
+    std::atomic<uint64_t> shardFrame{0u};
+    auto renderShard = [&](Shard& sh, uint64_t frame) {
+        std::fill(sh.left.begin(), sh.left.end(), 0.0f);
+        std::fill(sh.right.begin(), sh.right.end(), 0.0f);
+        sh.renderer->RenderBlock(*sh.voices, sh.channels, samples.data(),
+                                 hilbertPtr, sampleFrames, sh.left.data(),
+                                 sh.right.data(), options.frames, cfg,
+                                 sh.events.empty() ? nullptr : sh.events.data(),
+                                 static_cast<uint32_t>(sh.events.size()), true,
+                                 frame, nullptr, nullptr);
+    };
+    if (options.shards > 1u) {
+        shardBarrier = std::make_unique<std::barrier<>>(options.shards);
+        for (auto& shp : extraShards) {
+            shardThreads.emplace_back([&, ptr = shp.get()] {
+                _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+                _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+                for (;;) {
+                    shardBarrier->arrive_and_wait();
+                    if (shardStop.load(std::memory_order_acquire)) break;
+                    renderShard(*ptr, shardFrame.load(std::memory_order_acquire));
+                    shardBarrier->arrive_and_wait();
+                }
+            });
+        }
+    }
     // Per-MIDI-channel bus mode (SVMSChannelLimiter.h): voices mix into 16
     // channel planes, the limiter stages each bus, and the sum lands in the
     // master mix.  Measures the feature's overhead end to end.
@@ -1159,6 +1273,28 @@ int main(int argc, char** argv) {
     uint32_t stealSequence = options.voices;
 
     auto renderOne = [&] {
+        if (options.shards > 1u) {
+            shardFrame.store(absoluteFrame, std::memory_order_release);
+            shardBarrier->arrive_and_wait();            // release the shards
+            std::fill(left.begin(), left.end(), 0.0f);
+            std::fill(right.begin(), right.end(), 0.0f);
+            renderer->RenderBlock(*voices, channels, samples.data(), hilbertPtr,
+                                  sampleFrames, left.data(), right.data(),
+                                  options.frames, cfg,
+                                  shard0Events.empty() ? nullptr
+                                                       : shard0Events.data(),
+                                  static_cast<uint32_t>(shard0Events.size()),
+                                  true, absoluteFrame, nullptr, nullptr);
+            shardBarrier->arrive_and_wait();            // wait for the shards
+            for (auto& shp : extraShards) {
+                for (uint32_t i = 0u; i < options.frames; ++i) {
+                    left[i] += shp->left[i];
+                    right[i] += shp->right[i];
+                }
+            }
+            absoluteFrame += options.frames;
+            return;
+        }
         if (options.workload == Workload::Steal)
             PerformSteals(*voices, channels, stealSequence, 16u, sampleFrames,
                           nullptr, 0u, options.transactionalLaunch, false,
@@ -1234,6 +1370,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (options.shards > 1u) {
+        shardStop.store(true, std::memory_order_release);
+        shardBarrier->arrive_and_wait();
+        for (auto& th : shardThreads) th.join();
+        std::fprintf(stderr, "{\"shards\":%u,\"voices_per_shard\":%u}\n",
+                     options.shards, options.voices);
+    }
     const double p50 = Percentile(callbackPercent, 0.50);
     const double p95 = Percentile(callbackPercent, 0.95);
     const double p99 = Percentile(callbackPercent, 0.99);

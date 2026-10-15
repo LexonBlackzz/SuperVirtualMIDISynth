@@ -40,6 +40,11 @@ struct EngineConfig {
     // Total voice-render threads. 1 preserves the original audio-thread-only
     // path; 0 selects a conservative automatic count.
     uint32_t renderThreads;
+    // Key-sharded engine (synth.shards, 0/1 = off): the voice pool and the
+    // event stream are split across N independent engine cores, each with its
+    // own ingest ring, compiler thread, voice pool and renderer. Notes go to
+    // one shard by (channel,key); every other event goes to all of them.
+    uint32_t shards;
     uint32_t maxSampleCacheMB;
     InterpolationMode interpolation;
     FilterType filterType;
@@ -104,6 +109,10 @@ struct EngineConfig {
     // Opt-in compiler-side CC collapse: superseded same-(channel,controller)
     // state events are dropped upstream. Off by default.
     bool ccCollapse;
+    // Opt-in single-producer ingress fast path (events.fast_producer): the
+    // thread that submits first feeds the compiler through a private ring
+    // with plain stores instead of the shared MPSC lanes. Off by default.
+    bool fastProducer;
     // Opt-in exact note-on merging (SVMSNoteMerge.h): identical note-ons on
     // one frame become one voice at N times the gain. Off by default.
     bool noteMerge;

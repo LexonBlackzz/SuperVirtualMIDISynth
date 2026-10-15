@@ -333,15 +333,135 @@ private:
     alignas(64) std::atomic<uint64_t> dequeue_{0u};
 };
 
+// Single-producer / single-consumer ring for the one thread that feeds the
+// driver almost all of the time (the MIDI player). The producer never does a
+// locked operation and never loads a line the consumer writes on the hot path:
+// it writes the cell and release-stores its tail (plain stores on x86, absorbed
+// by the store buffer); it re-reads the consumer's head only when the ring
+// looks full. The consumer mirrors that with a cached tail. Both sides keep
+// their private indices on their own cache lines.
+template <typename T>
+class FastProducerRing {
+    static_assert(std::is_trivially_copyable_v<T>);
+
+public:
+    FastProducerRing() = default;
+    ~FastProducerRing() { Release(); }
+    FastProducerRing(const FastProducerRing&) = delete;
+    FastProducerRing& operator=(const FastProducerRing&) = delete;
+
+    // Engine stopped only: not safe against a running producer/consumer.
+    bool ConfigureCapacity(uint32_t capacity) noexcept {
+        if (capacity < 2u) return false;
+        uint32_t rounded = 2u;
+        while (rounded < capacity) rounded <<= 1u;
+        Release();
+#ifdef _WIN32
+        cells_ = static_cast<T*>(VirtualAlloc(
+            nullptr, sizeof(T) * static_cast<size_t>(rounded),
+            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+        cells_ = static_cast<T*>(
+            std::calloc(static_cast<size_t>(rounded), sizeof(T)));
+#endif
+        if (!cells_) return false;
+        capacity_ = rounded;
+        mask_ = rounded - 1u;
+        producerTail_ = 0u;
+        producerCachedHead_ = 0u;
+        consumerHead_ = 0u;
+        consumerCachedTail_ = 0u;
+        tailPublished_.store(0u, std::memory_order_relaxed);
+        headPublished_.store(0u, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Producer thread only.
+    bool TryPush(const T& value) noexcept {
+        if (!cells_) return false;
+        const uint64_t tail = producerTail_;
+        if (tail - producerCachedHead_ >= capacity_) {
+            producerCachedHead_ =
+                headPublished_.load(std::memory_order_acquire);
+            if (tail - producerCachedHead_ >= capacity_) return false;
+        }
+        cells_[static_cast<size_t>(tail & mask_)] = value;
+        producerTail_ = tail + 1u;
+        tailPublished_.store(tail + 1u, std::memory_order_release);
+        return true;
+    }
+
+    // Producer thread only: all `count` events or none, one tail publish.
+    bool TryPushBatch(const T* values, uint32_t count) noexcept {
+        if (!cells_ || count > capacity_) return false;
+        const uint64_t tail = producerTail_;
+        if (tail + count - producerCachedHead_ > capacity_) {
+            producerCachedHead_ =
+                headPublished_.load(std::memory_order_acquire);
+            if (tail + count - producerCachedHead_ > capacity_) return false;
+        }
+        for (uint32_t i = 0u; i < count; ++i)
+            cells_[static_cast<size_t>((tail + i) & mask_)] = values[i];
+        producerTail_ = tail + count;
+        tailPublished_.store(tail + count, std::memory_order_release);
+        return true;
+    }
+
+    // Consumer thread only.
+    bool TryPop(T& value) noexcept {
+        if (!cells_) return false;
+        const uint64_t head = consumerHead_;
+        if (head == consumerCachedTail_) {
+            consumerCachedTail_ =
+                tailPublished_.load(std::memory_order_acquire);
+            if (head == consumerCachedTail_) return false;
+        }
+        value = cells_[static_cast<size_t>(head & mask_)];
+        consumerHead_ = head + 1u;
+        headPublished_.store(head + 1u, std::memory_order_release);
+        return true;
+    }
+
+    // Any thread (telemetry / pressure).
+    uint32_t Size() const noexcept {
+        const uint64_t tail = tailPublished_.load(std::memory_order_acquire);
+        const uint64_t head = headPublished_.load(std::memory_order_acquire);
+        const uint64_t size = tail - head;
+        return static_cast<uint32_t>(size > capacity_ ? capacity_ : size);
+    }
+    uint32_t CapacityValue() const noexcept { return capacity_; }
+
+private:
+    void Release() noexcept {
+#ifdef _WIN32
+        if (cells_) VirtualFree(cells_, 0, MEM_RELEASE);
+#else
+        std::free(cells_);
+#endif
+        cells_ = nullptr;
+        capacity_ = 0u;
+    }
+
+    T* cells_ = nullptr;
+    uint32_t capacity_ = 0u;
+    uint32_t mask_ = 0u;
+    alignas(64) uint64_t producerTail_ = 0u;
+    uint64_t producerCachedHead_ = 0u;
+    alignas(64) std::atomic<uint64_t> tailPublished_{0u};
+    alignas(64) uint64_t consumerHead_ = 0u;
+    uint64_t consumerCachedTail_ = 0u;
+    alignas(64) std::atomic<uint64_t> headPublished_{0u};
+};
+
 enum class EventLane : uint8_t { State, Loud, UpperMedium, Medium, Quiet };
 
 template <typename T>
 class PriorityEventIngress {
 public:
     struct OrderedMergeState {
-        T heads[5]{};
-        uint8_t heap[5]{};
-        uint8_t queued[5]{};
+        T heads[6]{};
+        uint8_t heap[6]{};
+        uint8_t queued[6]{};
         uint8_t heapCount = 0u;
         uint8_t pollCountdown = 0u;
     };
@@ -356,7 +476,10 @@ public:
         const uint32_t medium = totalCapacity / 12u;
         const uint32_t quiet =
             totalCapacity - state - loud - upperMedium - medium;
-        if (!state_.ConfigureCapacity(state) ||
+        // The single-producer ring carries the whole stream of the one
+        // thread that owns it, so it is sized like two lanes.
+        if (!fast_.ConfigureCapacity(totalCapacity / 2u) ||
+            !state_.ConfigureCapacity(state) ||
             !loud_.ConfigureCapacity(loud) ||
             !upperMedium_.ConfigureCapacity(upperMedium) ||
             !medium_.ConfigureCapacity(medium) ||
@@ -410,8 +533,16 @@ public:
         return false;
     }
 
+    // Producer side of the single-producer ring (owner thread only).
+    bool TryPushFast(const T& event) noexcept { return fast_.TryPush(event); }
+    bool TryPushFastBatch(const T* events, uint32_t count) noexcept {
+        return fast_.TryPushBatch(events, count);
+    }
+    uint32_t FastSize() const noexcept { return fast_.Size(); }
+    uint32_t FastCapacity() const noexcept { return fast_.CapacityValue(); }
+
     bool TryPop(T& event) noexcept {
-        return state_.TryPop(event) || loud_.TryPop(event) ||
+        return fast_.TryPop(event) || state_.TryPop(event) || loud_.TryPop(event) ||
                upperMedium_.TryPop(event) || medium_.TryPop(event) ||
                quiet_.TryPop(event);
     }
@@ -500,10 +631,9 @@ public:
         // rates while avoiding three failed atomic pops per event.
         if (state.heapCount == 0u || state.pollCountdown == 0u) {
             state.pollCountdown = 15u;
-            for (uint8_t lane = 0u; lane < 5u; ++lane) {
+            for (uint8_t lane = 0u; lane < 6u; ++lane) {
                 if (state.queued[lane]) continue;
-                if (!TryPop(static_cast<EventLane>(lane), state.heads[lane]))
-                    continue;
+                if (!PopSource(lane, state.heads[lane])) continue;
                 state.queued[lane] = 1u;
                 const uint32_t position = state.heapCount++;
                 state.heap[position] = lane;
@@ -516,7 +646,7 @@ public:
 
         const uint8_t winner = state.heap[0];
         event = state.heads[winner];
-        if (TryPop(static_cast<EventLane>(winner), state.heads[winner])) {
+        if (PopSource(winner, state.heads[winner])) {
             siftDown(0u);
         } else {
             state.queued[winner] = 0u;
@@ -559,8 +689,8 @@ public:
     }
 
     uint32_t TotalSize() const noexcept {
-        return state_.Size() + loud_.Size() + upperMedium_.Size() +
-               medium_.Size() + quiet_.Size();
+        return fast_.Size() + state_.Size() + loud_.Size() +
+               upperMedium_.Size() + medium_.Size() + quiet_.Size();
     }
 
     uint32_t LaneSize(EventLane lane) const noexcept {
@@ -589,6 +719,13 @@ public:
     uint32_t TotalCapacity() const noexcept { return totalCapacity_; }
 
 private:
+    // Merge sources 0..4 are the MPSC lanes, 5 is the single-producer ring.
+    bool PopSource(uint8_t source, T& event) noexcept {
+        return source < 5u ? TryPop(static_cast<EventLane>(source), event)
+                           : fast_.TryPop(event);
+    }
+
+    FastProducerRing<T> fast_;
     DynamicMPSCQueue<T> state_;
     DynamicMPSCQueue<T> loud_;
     DynamicMPSCQueue<T> upperMedium_;

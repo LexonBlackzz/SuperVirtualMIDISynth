@@ -408,6 +408,7 @@ set(SVMS_DRIVER_SOURCES
     SVMSDriverSoundFont.cpp
     SVMSDriverBackend.cpp
     SVMSDriverIngress.cpp
+    SVMSDriverShards.cpp
     SVMSDriverRender.cpp
     SVMSFrontNative.cpp
     SVMSFrontKDMAPI.cpp

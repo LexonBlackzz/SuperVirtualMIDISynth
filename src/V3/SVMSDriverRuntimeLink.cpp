@@ -417,6 +417,23 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         strncpy_s(resultText, kText, affinityText[cmd.param], _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetFastProducer: {
+        // param 0/1: the submitting thread feeds the compiler through a
+        // private single-producer ring (plain stores, leased sequence block)
+        // instead of the shared MPSC lanes. Same per-thread event order.
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "fast producer must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        SetFastProducer(cmd.param != 0u);
+        engineConfig_.fastProducer = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "fast producer: on (first submitting thread owns the ring)"
+                            : "fast producer: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
     case RT::SetCcCollapse: {
         // param = opt-in compiler-side collapse of superseded
         // same-(channel,controller) state CCs. The compiler thread reads the
@@ -825,6 +842,16 @@ void Driver::CopyTelemetryCensus(SVMS_TelemetryV2* out) const {
     SnappyVoiceStatistics voices{};
     CopyDebugInfo(debug);
     CopyVoiceStatistics(voices);
+    for (const Driver* shard : shards_) {
+        DriverDebugInfo other{};
+        shard->CopyDebugInfo(other);
+        debug.submitted += other.submitted;
+        debug.accepted += other.accepted;
+        debug.dispatched += other.dispatched;
+        debug.noteOns += other.noteOns;
+        debug.matchedRegions += other.matchedRegions;
+        debug.configuredVoices += other.configuredVoices;
+    }
     SVMS_TelemetryV2 r{};
     r.struct_size = sizeof(r);
     r.struct_version = SVMS_STRUCT_VERSION_1;

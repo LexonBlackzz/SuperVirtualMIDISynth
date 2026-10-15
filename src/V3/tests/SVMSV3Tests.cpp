@@ -5859,6 +5859,63 @@ void TestWholeVoiceScalarVibratoDifferential() {
 
 } // namespace
 
+void TestFastProducerRing() {
+    // One thread feeds the single-producer ring while another feeds the MPSC
+    // lanes; the merged stream must contain every event exactly once and keep
+    // the fast thread's own order strictly.
+    auto ingress = std::make_unique<
+        svms::PriorityEventIngress<svms::TimestampedMidiEvent>>();
+    constexpr uint32_t kFastEvents = 300000u;  // > ring capacity: exercises wrap + full
+    constexpr uint32_t kLaneEvents = 50000u;
+    std::atomic<uint32_t> laneSequence{0u};
+    std::thread fastProducer([&] {
+        for (uint32_t i = 0u; i < kFastEvents; ++i) {
+            svms::TimestampedMidiEvent e{};
+            e.message = 0x90u | (i & 0x7fu) << 8u;
+            e.qpcTimestamp = i;
+            e.sequence = i * 2u;  // even sequences = fast stream
+            while (!ingress->TryPushFast(e)) std::this_thread::yield();
+        }
+    });
+    std::thread laneProducer([&] {
+        for (uint32_t i = 0u; i < kLaneEvents; ++i) {
+            svms::TimestampedMidiEvent e{};
+            e.message = 0x80u;
+            e.qpcTimestamp = i;
+            e.sequence = i * 2u + 1u;  // odd sequences = lane stream
+            while (!ingress->TryPush(svms::EventLane::State, e))
+                std::this_thread::yield();
+            laneSequence.store(i, std::memory_order_relaxed);
+        }
+    });
+    svms::PriorityEventIngress<svms::TimestampedMidiEvent>::OrderedMergeState
+        merge{};
+    uint32_t fastSeen = 0u, laneSeen = 0u;
+    bool fastInOrder = true, laneInOrder = true;
+    svms::TimestampedMidiEvent e{};
+    while (fastSeen < kFastEvents || laneSeen < kLaneEvents) {
+        if (!ingress->TryPopSequenceOrdered(e, merge)) {
+            std::this_thread::yield();
+            continue;
+        }
+        if ((e.sequence & 1u) == 0u) {
+            fastInOrder = fastInOrder && e.qpcTimestamp == fastSeen;
+            ++fastSeen;
+        } else {
+            laneInOrder = laneInOrder && e.qpcTimestamp == laneSeen;
+            ++laneSeen;
+        }
+    }
+    fastProducer.join();
+    laneProducer.join();
+    Check(fastSeen == kFastEvents && laneSeen == kLaneEvents,
+          "fast ring + lanes deliver every event exactly once");
+    Check(fastInOrder && laneInOrder,
+          "each producer's stream stays in its own order through the merge");
+    Check(ingress->TotalSize() == 0u && !ingress->TryPop(e),
+          "the merged ingress is empty afterwards");
+}
+
 void TestStealReject() {
     svms::ChannelParamsSnapshot channel{};
     channel.volume = channel.expression = 1.0f;
@@ -7680,6 +7737,7 @@ int main() {
     TestWholeVoiceProductionGateParity();
     TestPerKeyVoiceCap();
     TestStealReject();
+    TestFastProducerRing();
     TestExclusiveClassLifecycle();
     TestSfzParserAndPlayback();
 

@@ -216,7 +216,11 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // their exact frames in exact order, playback runs at whatever speed
     // the engine manages, and WASAPI glitches instead of the schedule.
     const uint64_t skippedFramesBefore = self->telemetry_.skippedOutputFrames;
-    if (!self->unboundedRenderEnabled_.load(std::memory_order_relaxed)) {
+    if (self->shardMaster_) {
+        // Headless shard: lockstep with the master's (possibly recovered)
+        // render position so every core renders the same frames.
+        self->virtualRenderSample_ = self->shardMaster_->virtualRenderSample_;
+    } else if (!self->unboundedRenderEnabled_.load(std::memory_order_relaxed)) {
         const int64_t recoveredRenderSample = RecoverRealtimeRenderFrame(
             self->virtualRenderSample_, wallRenderSample, numFrames);
         if (recoveredRenderSample > self->virtualRenderSample_) {
@@ -225,6 +229,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             self->virtualRenderSample_ = recoveredRenderSample;
         }
     }
+
+    if (self->shardCount_ > 1u && !self->shardMaster_)
+        self->KickShards(numFrames);
 
     // First frame this block actually renders (after any recovery jump).
     const uint64_t traceOutputFrame =
@@ -433,7 +440,7 @@ const uint32_t importedPages = self->useEventCompiler_
     // stream above cap/callback (~13M events/s at 10 ms callbacks) go late
     // by design, with the render thread mostly idle. They stay bounded by
     // the configured max_events_per_block.
-    static constexpr uint32_t kBlockDispatchSoftCap = 1u << 17u;
+    static constexpr uint32_t kBlockDispatchSoftCap = 1u << 19u;
     const uint32_t eventBudget =
         (std::min)(self->eventBufferCapacity_, self->maxEventsPerBlock_);
     // Unbounded render lifts the late cap as well: the scheduler drains the
@@ -657,6 +664,8 @@ const uint32_t importedPages = self->useEventCompiler_
             self->channelBusLeftTable, self->channelBusRightTable,
             leftBuf, rightBuf, numFrames);
     }
+    if (self->shardCount_ > 1u && !self->shardMaster_)
+        self->JoinShardsAndMix(leftBuf, rightBuf, numFrames);
     const uint64_t profileRenderEnd = profileCallback ? __rdtsc() : 0u;
     LARGE_INTEGER traceRenderEndQPC{};
     if (traceRing) QueryPerformanceCounter(&traceRenderEndQPC);
@@ -744,7 +753,7 @@ const uint32_t importedPages = self->useEventCompiler_
             (unsigned long long)(self->telemetry_.staleNoteOnsSkipped - censusLastStale),
             (unsigned long long)(self->shedAtomic_.load(std::memory_order_relaxed) - censusLastShed),
             (unsigned long long)(self->ccCollapsedCount_ - censusLastCc),
-            static_cast<uint32_t>(self->nextEventSequence_.load(std::memory_order_relaxed)),
+            static_cast<uint32_t>(self->SubmittedEventCount()),
             (unsigned)(globalEncoded ? globalEncoded - 1u : 0u),
             fencedChannels, maxChannelFence,
             (unsigned)self->midiIngress_.TotalSize(),
@@ -804,11 +813,13 @@ const uint32_t importedPages = self->useEventCompiler_
     // and non-Coherent modes never touch loudness or gain-reduction inputs.
     // Filter the final limited samples in the same loop so the 3 Hz cutoff
     // neither changes gain detection nor requires another memory pass.
-    self->reverb.Process(output, numFrames, 2);
-    self->limiter.Process(output, numFrames, 2, self->postHighPass);
+    if (!self->shardMaster_) {
+        self->reverb.Process(output, numFrames, 2);
+        self->limiter.Process(output, numFrames, 2, self->postHighPass);
 #if !defined(SVMS_XP_COMPAT)
-    self->liveRecorder_.Capture(output, numFrames);
+        self->liveRecorder_.Capture(output, numFrames);
 #endif
+    }
 
     const uint64_t profilePostEnd = profileCallback ? __rdtsc() : 0u;
 
@@ -901,8 +912,8 @@ const uint32_t importedPages = self->useEventCompiler_
     self->telemetry_.maxConsecutiveOverBudget =
         self->callbackTiming_.maxConsecutiveOverBudget;
     self->telemetry_.immediateRetirements = vm->retireImmediateCount_;
-    self->telemetry_.voiceSteals = vm->stealCount_;
-    self->telemetry_.submitted = self->nextEventSequence_.load(std::memory_order_relaxed);
+    self->telemetry_.voiceSteals = vm->stealCount_ + self->ShardsSteals();
+    self->telemetry_.submitted = self->SubmittedEventCount();
     self->telemetry_.accepted = self->telemetry_.submitted -
         (std::min)(self->telemetry_.submitted,
                    self->notAcceptedAtomic_.load(std::memory_order_relaxed));
@@ -924,7 +935,7 @@ const uint32_t importedPages = self->useEventCompiler_
     debug.noteOns = self->sf2Telemetry_.noteOns;
     debug.matchedRegions = self->sf2Telemetry_.exactRegionMatches;
     debug.configuredVoices = self->sf2Telemetry_.configuredVoices;
-    debug.activeVoices = vm->activeCount_;
+    debug.activeVoices = vm->activeCount_ + self->ShardsActiveVoices();
     debug.sampleDataFrames = self->sampleDataFrames;
     debug.sampleCount = self->sampleStoreCount;
     debug.soundFontLoaded = self->soundFontData && self->sampleDataStore ? 1u : 0u;
@@ -935,9 +946,10 @@ const uint32_t importedPages = self->useEventCompiler_
 
     SnappyVoiceStatistics& voiceStats =
         self->voiceStatisticsSnapshots_[nextDebugIndex];
-    voiceStats.activeVoices = vm->activeCount_;
-    voiceStats.freeVoices = vm->GetMaxVoices() - vm->activeCount_;
-    voiceStats.voiceSteals = vm->stealCount_;
+    voiceStats.activeVoices = vm->activeCount_ + self->ShardsActiveVoices();
+    voiceStats.freeVoices = vm->GetMaxVoices() + self->ShardsMaxVoices() -
+                            voiceStats.activeVoices;
+    voiceStats.voiceSteals = vm->stealCount_ + self->ShardsSteals();
 
     LegacyDriverDebugInfo& legacy =
         self->legacyDebugSnapshots_[nextDebugIndex];
@@ -959,15 +971,18 @@ const uint32_t importedPages = self->useEventCompiler_
 
     // Smooth CPU reading with a simple low-pass
     static float s_cpuSmoothed = 0.0f;
+    if (!self->shardMaster_)
     s_cpuSmoothed += 0.1f * (cpuPct - s_cpuSmoothed);
     static float s_schedulerSmoothed = 0.0f;
     static float s_dispatchSmoothed = 0.0f;
     static float s_synthesisSmoothed = 0.0f;
     static float s_postSmoothed = 0.0f;
-    s_schedulerSmoothed += 0.1f * (schedulerPercent - s_schedulerSmoothed);
-    s_dispatchSmoothed += 0.1f * (dispatchPercent - s_dispatchSmoothed);
-    s_synthesisSmoothed += 0.1f * (synthesisPercent - s_synthesisSmoothed);
-    s_postSmoothed += 0.1f * (postPercent - s_postSmoothed);
+    if (!self->shardMaster_) {
+        s_schedulerSmoothed += 0.1f * (schedulerPercent - s_schedulerSmoothed);
+        s_dispatchSmoothed += 0.1f * (dispatchPercent - s_dispatchSmoothed);
+        s_synthesisSmoothed += 0.1f * (synthesisPercent - s_synthesisSmoothed);
+        s_postSmoothed += 0.1f * (postPercent - s_postSmoothed);
+    }
 
     // Merged pool/load census, same 64-block cadence as sched/flow. This is
     // the only per-cadence load line: it folds the former diagnostics-window
@@ -1046,15 +1061,18 @@ const uint32_t importedPages = self->useEventCompiler_
                 // diagnostics; the releasing count comes from the exact
                 // transition counter (VoiceManager::releasingCount_), so
                 // only the sustain-held tally still needs a walk.
-                const uint32_t releasingVoices = vm->GetReleasingCount();
+                const uint32_t releasingVoices = vm->GetReleasingCount() +
+                    static_cast<uint32_t>(self->SumShards([](const Driver& c) {
+                        return c.voiceManager->GetReleasingCount(); }));
                 uint32_t sustainHeldVoices = 0;
                 for (uint32_t position = 0; position < vm->activeCount_; ++position) {
                     const uint32_t voice = vm->activeList_[position];
                     sustainHeldVoices += vm->v.heldBySustain[voice] != 0;
                 }
-                DiagWindow_Update(vm->activeCount_, vm->GetMaxVoices(),
+                DiagWindow_Update(vm->activeCount_ + self->ShardsActiveVoices(),
+                                  vm->GetMaxVoices() + self->ShardsMaxVoices(),
                                   releasingVoices, sustainHeldVoices,
-                                  vm->stealCount_,
+                                  vm->stealCount_ + self->ShardsSteals(),
                                   self->coalescedAtomic_.load(
                                       std::memory_order_relaxed),
                                   self->noteOnCollapse_.Threshold(),
@@ -1065,7 +1083,12 @@ const uint32_t importedPages = self->useEventCompiler_
                                   self->telemetry_.callbackP999Percent,
                                   self->telemetry_.overBudgetCallbacks,
                                   self->telemetry_.maxConsecutiveOverBudget,
-                                  vm->retireCount_, vm->retireImmediateCount_,
+                                  vm->retireCount_ + static_cast<uint32_t>(
+                                      self->SumShards([](const Driver& c) {
+                                          return c.voiceManager->retireCount_; })),
+                                  vm->retireImmediateCount_ + static_cast<uint32_t>(
+                                      self->SumShards([](const Driver& c) {
+                                          return c.voiceManager->retireImmediateCount_; })),
                                   self->audioOutput && self->audioOutput->IsRunning(),
                                   self->audioOutput
                                       ? static_cast<int32_t>(self->audioOutput->GetLastError())
@@ -1079,7 +1102,12 @@ const uint32_t importedPages = self->useEventCompiler_
                                   render->GetMulticoreEffectiveness(),
                                   s_schedulerSmoothed, s_dispatchSmoothed,
                                   s_synthesisSmoothed, s_postSmoothed,
-                                  evCount, scheduledAfterDispatch,
+                                  evCount + static_cast<uint32_t>(
+                                      self->SumShards([](const Driver& c) {
+                                          return c.shardBlockEvents_; })),
+                                  scheduledAfterDispatch + static_cast<uint32_t>(
+                                      self->SumShards([](const Driver& c) {
+                                          return c.shardBlockScheduled_; })),
                                   self->sf2Telemetry_,
                                   static_cast<uint32_t>((std::min<uint64_t>)(
                                       self->effectiveVoicesAtomic_.load(
@@ -1090,6 +1118,9 @@ const uint32_t importedPages = self->useEventCompiler_
         }
     }
 
+    self->shardBlockEvents_ = evCount;
+    self->shardBlockScheduled_ = scheduledAfterDispatch;
+
     // ── Audio→control snapshot (RuntimeLink V2) ────────────────────
     // The control thread publishes at ~30 Hz from this process-local
     // snapshot; the audio thread never touches shared memory.  The
@@ -1099,19 +1130,36 @@ const uint32_t importedPages = self->useEventCompiler_
     // Writes are relaxed atomics wrapped in a monotonic odd/even
     // sequence (2, 4, 6, ...): odd = writer inside, even = settled.
 #if !defined(SVMS_XP_COMPAT)
-    {
+    if (!self->shardMaster_) {  // shards must not overwrite the master's view
         svms::RuntimeAudioSnapshot& as = g_audioSnapshot;
         const uint32_t odd = as.sequence.load(std::memory_order_relaxed) | 1u;
         as.sequence.store(odd, std::memory_order_relaxed);
         RLV2_MemBarrier();
         as.tickMs.store(static_cast<uint32_t>(GetTickCount()),
                         std::memory_order_relaxed);
-        as.activeVoices.store(vm->activeCount_, std::memory_order_relaxed);
-        as.releasingVoices.store(vm->GetReleasingCount(), std::memory_order_relaxed);
-        as.freeTop.store(vm->freeTop_, std::memory_order_relaxed);
-        as.voiceSteals.store(vm->stealCount_, std::memory_order_relaxed);
-        as.retiredCount.store(vm->retireCount_, std::memory_order_relaxed);
-        as.retiredImmediateCount.store(vm->retireImmediateCount_, std::memory_order_relaxed);
+        as.activeVoices.store(vm->activeCount_ + self->ShardsActiveVoices(),
+                              std::memory_order_relaxed);
+        as.releasingVoices.store(
+            vm->GetReleasingCount() +
+                static_cast<uint32_t>(self->SumShards([](const Driver& c) {
+                    return c.voiceManager->GetReleasingCount(); })),
+            std::memory_order_relaxed);
+        as.freeTop.store(vm->freeTop_ + static_cast<uint32_t>(
+                             self->SumShards([](const Driver& c) {
+                                 return c.voiceManager->freeTop_; })),
+                         std::memory_order_relaxed);
+        as.voiceSteals.store(vm->stealCount_ + self->ShardsSteals(),
+                             std::memory_order_relaxed);
+        as.retiredCount.store(
+            vm->retireCount_ + static_cast<uint32_t>(
+                self->SumShards([](const Driver& c) {
+                    return c.voiceManager->retireCount_; })),
+            std::memory_order_relaxed);
+        as.retiredImmediateCount.store(
+            vm->retireImmediateCount_ + static_cast<uint32_t>(
+                self->SumShards([](const Driver& c) {
+                    return c.voiceManager->retireImmediateCount_; })),
+            std::memory_order_relaxed);
         as.decimationStep.store(render->DecimationStep(vm->activeCount_),
             std::memory_order_relaxed);
         as.renderPeakBits.store(FloatToU32Bits(self->sf2Telemetry_.renderPeak),
@@ -1139,14 +1187,22 @@ const uint32_t importedPages = self->useEventCompiler_
             std::memory_order_relaxed);
         as.overBudgetCallbacks.store(self->telemetry_.overBudgetCallbacks,
                                      std::memory_order_relaxed);
-        as.eventsSubmitted.store(self->telemetry_.submitted,
-                                 std::memory_order_relaxed);
-        as.eventsAccepted.store(self->telemetry_.accepted,
-                                std::memory_order_relaxed);
-        as.eventsDropped.store(self->telemetry_.dropped,
-                               std::memory_order_relaxed);
-        as.eventsDispatched.store(self->telemetry_.dispatched,
-                                  std::memory_order_relaxed);
+        as.eventsSubmitted.store(
+            self->telemetry_.submitted + self->SumShards([](const Driver& c) {
+                return c.telemetry_.submitted; }),
+            std::memory_order_relaxed);
+        as.eventsAccepted.store(
+            self->telemetry_.accepted + self->SumShards([](const Driver& c) {
+                return c.telemetry_.accepted; }),
+            std::memory_order_relaxed);
+        as.eventsDropped.store(
+            self->telemetry_.dropped + self->SumShards([](const Driver& c) {
+                return c.telemetry_.dropped; }),
+            std::memory_order_relaxed);
+        as.eventsDispatched.store(
+            self->telemetry_.dispatched + self->SumShards([](const Driver& c) {
+                return c.telemetry_.dispatched; }),
+            std::memory_order_relaxed);
         as.limiterInputPeakLBits.store(FloatToU32Bits(self->limiter.inputPeakL),
                                        std::memory_order_relaxed);
         as.limiterInputPeakRBits.store(FloatToU32Bits(self->limiter.inputPeakR),

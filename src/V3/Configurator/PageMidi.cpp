@@ -179,6 +179,12 @@ void DrawMidiPage(ConfigDocument& doc) {
                 send(svms::RLCommandType::SetBlockTiming, w.blockTiming ? 1u : 0u);
             }
             ImGui::Spacing();
+            if (PanelLever("FAST PRODUCER  (LISTEN)", &w.fastProducer,
+                           "Listening test, OFF by default. The first thread that submits MIDI (the player) feeds the engine through a private ring with plain stores instead of the shared queue lanes, cutting the per-message cost seen in the player's ns/msg readout. Event order from that thread is identical; only the tie-break against events from OTHER threads (resets, controller commands) can differ by a few dozen events. Other threads keep the old path.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetFastProducer, w.fastProducer ? 1u : 0u);
+            }
+            ImGui::Spacing();
             if (PanelLever("CC COLLAPSE", &w.ccCollapse,
                            "OFF by default: every control-change event dispatches. When enabled, the compiler thread drops superseded same-(channel, controller) state CCs inside a page before they reach the audio thread. Saves dispatch on CC-automation-dense material.")) {
                 doc.MarkDirty();

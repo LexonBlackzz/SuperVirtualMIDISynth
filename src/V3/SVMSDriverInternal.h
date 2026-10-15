@@ -559,6 +559,7 @@ public:
     void SubmitShortMsg(uint32_t msg);
     void SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp);
     void SubmitShortMsgAtFrame(uint32_t msg, uint64_t outputFrame);
+    bool IsFastProducerThread() noexcept;
     bool SubmitShortMsgAtQpcCancellable(
         uint32_t msg, uint64_t qpcTimestamp,
         const std::atomic<uint64_t>* externalCancellation,
@@ -777,6 +778,28 @@ private:
     std::atomic<uint32_t> producerWakeEpoch_;
     std::atomic<uint32_t> scheduledSizePublished_;
     std::atomic<uint64_t> notAcceptedAtomic_;
+    // Single-producer fast path (opt-in, events.fast_producer). The first
+    // thread to submit claims the ring; its events take sequences from a
+    // leased block (one RMW per kFastSequenceLease events) and push with
+    // plain stores. Every other thread keeps the MPSC lanes + global sequence.
+    static constexpr uint32_t kFastSequenceLease = 256u;
+    std::atomic<bool> fastProducerEnabled_{false};
+    std::atomic<uint32_t> fastOwnerThreadId_{0u};
+    // Written only by the owner thread; read by telemetry.
+    alignas(64) uint64_t fastSequenceNext_ = 0u;
+    uint64_t fastSequenceEnd_ = 0u;
+    std::atomic<uint64_t> fastSubmitted_{0u};
+    std::atomic<uint64_t> fastLeased_{0u};
+public:
+    void SetFastProducer(bool on) {
+        fastProducerEnabled_.store(on, std::memory_order_relaxed);
+    }
+private:
+    uint64_t SubmittedEventCount() const noexcept {
+        return nextEventSequence_.load(std::memory_order_relaxed) -
+               fastLeased_.load(std::memory_order_relaxed) +
+               fastSubmitted_.load(std::memory_order_relaxed);
+    }
     std::atomic<uint64_t> shedAtomic_;
     std::atomic<uint64_t> cancelledAtomic_;
     // Same-key note-on coalescing (see SVMSNoteOnCollapse.h). Collapsed
@@ -986,6 +1009,50 @@ private:
     uint32_t lastPublishedMailboxSeq_ = 2u;
     svms::RuntimeLiveStateV2 appliedLiveEcho_{};
 #endif
+
+    // ── Key-sharded engine (synth.shards > 1) ───────────────────────────────
+    // The master (Driver::Instance) owns WASAPI, the live config, RuntimeLink
+    // and the SoundFont loader. Shards 1..N-1 are headless Driver instances:
+    // own ingest ring + compiler + scheduler + voice pool + renderer, no audio
+    // device. The master routes note events to one shard by (channel,key) and
+    // every other event to all of them, kicks the shard render threads at the
+    // top of each callback, and sums their raw mixes before its own
+    // reverb/limiter. See SVMSDriverShards.cpp.
+    uint32_t shardCount_ = 1u;
+    Driver* shardMaster_ = nullptr;     // non-null on a headless shard
+    uint32_t shardIndex_ = 0u;
+    std::vector<Driver*> shards_;       // master only: shards 1..N-1
+    HANDLE shardStartEvent_ = nullptr;
+    HANDLE shardDoneEvent_ = nullptr;
+    std::thread shardThread_;
+    std::atomic<bool> shardStop_{false};
+    float* shardOutput_ = nullptr;      // interleaved raw mix of this shard
+    uint32_t shardFrames_ = 0u;
+    uint32_t shardSyncedSeq_ = 0u;      // master mailbox seq last pushed here
+    uint32_t ShardFor(uint8_t channel, uint8_t note) const noexcept;
+    bool CreateShards();
+    void StopShards();
+    void KickShards(uint32_t numFrames);
+    void JoinShardsAndMix(float* left, float* right, uint32_t numFrames);
+    void ShardThreadLoop();
+    void ApplySoundFontStack(SoundFontBundle* next) noexcept;
+    bool SubmitShortMsgAtQpcCancellableCore(
+        uint32_t msg, uint64_t qpcTimestamp,
+        const std::atomic<uint64_t>* externalCancellation,
+        uint64_t cancellationToken);
+    // Per-block figures a shard publishes for the master's monitor sums.
+    uint32_t shardBlockEvents_ = 0u;
+    uint32_t shardBlockScheduled_ = 0u;
+    template <class F>
+    uint64_t SumShards(F&& f) const noexcept {
+        uint64_t total = 0u;
+        for (const Driver* core : shards_)
+            if (core->voiceManager) total += f(*core);
+        return total;
+    }
+    uint32_t ShardsActiveVoices() const noexcept;
+    uint32_t ShardsMaxVoices() const noexcept;
+    uint32_t ShardsSteals() const noexcept;
 
     CRITICAL_SECTION cs;
     CRITICAL_SECTION soundFontBuildCs_;

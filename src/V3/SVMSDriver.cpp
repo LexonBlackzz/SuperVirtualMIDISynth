@@ -280,6 +280,7 @@ Driver::~Driver() {
 bool Driver::Initialize() {
     if (initialized) return true;
 
+    const bool shard = shardMaster_ != nullptr;
     ResolveAddressWaitApi();
     midiIngress_.DrainAvailable();
     eventScheduler_.Reset();
@@ -295,7 +296,7 @@ bool Driver::Initialize() {
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     qpcFreq = freq.QuadPart;
-    tscClock_.Initialize();
+    if (!shard) tscClock_.Initialize();
 
     // Note-on collapse window in QPC ticks (fixed 20 ms, frame-size
     // independent). Coalescing itself defaults OFF; this only defines the
@@ -305,13 +306,36 @@ bool Driver::Initialize() {
     noteOnCollapse_.SetReExciteSpacing(
         freq.QuadPart * kReExciteAttackMs / 1000u);
 
-    EngineConfig cfg = EngineConfig::Load();
-    if (!cfg.configWarning.empty()) {
+    EngineConfig cfg = shard ? shardMaster_->engineConfig_ : EngineConfig::Load();
+    if (!shard && !cfg.configWarning.empty()) {
         std::string warning = "[SVMS] configuration warning: " +
                               cfg.configWarning + "\n";
         OutputDebugStringA(warning.c_str());
     }
     if (!cfg.Validate()) { LOG("EngineConfig validation failed"); return false; }
+    if (shard) {
+        // Headless shard: no device, UI, MIDI input, external backend or
+        // per-channel limiter; the master owns all of those.
+        cfg.diagnosticsEnabled = false;
+        cfg.midiInputEnabled = false;
+        cfg.channelLimiterEnabled = false;
+        cfg.apiBackend = 0u;
+    } else {
+        shardCount_ = cfg.shards > 1u ? cfg.shards : 1u;
+        if (shardCount_ > 1u) {
+            // Each core owns 1/N of the pool and renders its own voices on
+            // its own thread; N cores are the parallelism.
+            cfg.maxVoices = (std::max)(1u, cfg.maxVoices / shardCount_);
+            // Keep the total render lanes: each core gets its share (a core
+            // renders its own voices on its own lanes), never fewer than 1.
+            const uint32_t lanes = cfg.renderThreads != 0u
+                ? cfg.renderThreads : SelectAutomaticRenderThreadCount();
+            cfg.renderThreads = (std::max)(1u, lanes / shardCount_);
+            cfg.channelLimiterEnabled = false;
+            LOG("Sharded engine: %u cores, %u voices each", shardCount_,
+                cfg.maxVoices);
+        }
+    }
 
     // Threshold comes from config (default 1 = disabled). Applied before
     // the audio thread starts, so no torn first-block state.
@@ -384,6 +408,7 @@ bool Driver::Initialize() {
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
+    SetFastProducer(cfg.fastProducer);
     noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
     noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
@@ -404,6 +429,7 @@ bool Driver::Initialize() {
                                  cfg.masterVolume);
     }
 
+    if (!shard) {
 #if !defined(SVMS_XP_COMPAT) && defined(SVMS_WITH_ASIO)
     if (cfg.audioBackend == AudioBackend::ASIO) {
         AudioOutputASIO* asio = new AudioOutputASIO();
@@ -454,8 +480,12 @@ bool Driver::Initialize() {
         DiagWindow_SetBackendLabel(isAsio ? L"ASIO" : L"WASAPI shared");
     }
     LOG("AudioOutput initialized, rate=%u bufferFrames=%u", sampleRate, bufferFrames);
+    } else {
+        sampleRate = shardMaster_->sampleRate;
+        bufferFrames = shardMaster_->bufferFrames;
+    }
 
-    bufferCapacity = bufferFrames;
+    bufferCapacity = shard ? 8192u : bufferFrames;
     leftBuffer = static_cast<float*>(_aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
     rightBuffer = static_cast<float*>(_aligned_malloc(bufferCapacity * sizeof(float), kMixBufferAlign));
     if (!leftBuffer || !rightBuffer) {
@@ -529,6 +559,7 @@ bool Driver::Initialize() {
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
+    SetFastProducer(cfg.fastProducer);
     noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
     noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
@@ -646,7 +677,7 @@ bool Driver::Initialize() {
         configuredVelocityGain_[velocity] = g_velGainLUT[mappedIndex];
     }
 
-    audioOutput->SetRenderCallback(RenderCallback, this);
+    if (!shard) audioOutput->SetRenderCallback(RenderCallback, this);
 
 #if !defined(SVMS_XP_COMPAT)
     useEventCompiler_ = std::thread::hardware_concurrency() >= 2u;
@@ -665,7 +696,8 @@ bool Driver::Initialize() {
 
     soundFontLoaderStop_.store(false, std::memory_order_release);
     soundFontLoadState_.store(0u, std::memory_order_relaxed);
-    soundFontLoadEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    soundFontLoadEvent_ = shard ? nullptr
+                                : CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (soundFontLoadEvent_) {
         try {
             soundFontLoaderThread_ =
@@ -679,6 +711,7 @@ bool Driver::Initialize() {
 
     initialized = true;
     LOG("Initialize SUCCESS");
+    if (shard) return true;
 
     // External synth backend (api.backend): loaded once at init; on any
     // failure the driver falls back to the in-process SVMS engine.
@@ -703,13 +736,18 @@ bool Driver::Initialize() {
     }
 #endif
 
+    if (shardCount_ > 1u && !CreateShards()) {
+        LOG("Sharded engine setup failed; continuing with one core");
+        StopShards();
+        shardCount_ = 1u;
+    }
     return true;
 }
 
 void Driver::Shutdown() {
     ShutdownExternalBackend();
 #if !defined(SVMS_XP_COMPAT)
-    g_rlDriver.Shutdown();
+    if (!shardMaster_) g_rlDriver.Shutdown();
     liveRecorder_.Stop();
     soundFontLoaderStop_.store(true, std::memory_order_release);
     if (soundFontLoadEvent_) SetEvent(soundFontLoadEvent_);
@@ -748,9 +786,11 @@ void Driver::Shutdown() {
     }
     retiredOutputs_.clear();
 #endif
+    StopShards();  // audio is stopped: no callback can kick a shard any more
     if (eventCompilerThread_.joinable()) eventCompilerThread_.join();
     useEventCompiler_ = false;
     midiIngress_.DrainAvailable();
+    fastOwnerThreadId_.store(0u, std::memory_order_relaxed);
     pagedScheduler_.Reset();
     eventScheduler_.Reset();
     scheduledSizePublished_.store(0, std::memory_order_release);

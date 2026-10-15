@@ -477,6 +477,24 @@ void Driver::ActivatePendingSoundFontAtBlockBoundary() noexcept {
         nullptr, std::memory_order_acquire);
     if (!next) return;
 
+    ApplySoundFontStack(next);
+    // Headless shards render from the same immutable bundle; they adopt it
+    // here, before any shard renders another block.
+    for (Driver* shard : shards_) shard->ApplySoundFontStack(next);
+
+    SoundFontBundle* old = activeSoundFontBundle_.exchange(
+        next, std::memory_order_release);
+    soundFontActivatedId_.store(next->requestId, std::memory_order_release);
+#if !defined(SVMS_XP_COMPAT)
+    if (soundFontRequestId_.load(std::memory_order_acquire) == next->requestId)
+        soundFontLoadState_.store(3u, std::memory_order_release);
+#endif
+    RetireSoundFontBundle(old);
+}
+
+// Points this engine core at `next` (borrowed, not owned) and resets what
+// depends on the bank. Shared by master activation and shard adoption.
+void Driver::ApplySoundFontStack(SoundFontBundle* next) noexcept {
     // Voice sample locations are offsets into one bundle. Old voices must not
     // survive into the new sample bank; MIDI channel/program/controller state
     // remains intact and is remapped below.
@@ -525,15 +543,6 @@ void Driver::ActivatePendingSoundFontAtBlockBoundary() noexcept {
     for (uint32_t channel = 0; channel < kChannelCount; ++channel)
         ++channelLaunchRevision_[channel];
     nextPlayIndex_ = 1u;
-
-    SoundFontBundle* old = activeSoundFontBundle_.exchange(
-        next, std::memory_order_release);
-    soundFontActivatedId_.store(next->requestId, std::memory_order_release);
-#if !defined(SVMS_XP_COMPAT)
-    if (soundFontRequestId_.load(std::memory_order_acquire) == next->requestId)
-        soundFontLoadState_.store(3u, std::memory_order_release);
-#endif
-    RetireSoundFontBundle(old);
 }
 
 void Driver::DestroyAllSoundFontBundles() noexcept {

@@ -344,6 +344,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"voice_memory_budget_mb", cfg.voiceMemoryBudgetMB},
             {"large_pages", cfg.largePages},
             {"render_threads", cfg.renderThreads},
+            {"shards", cfg.shards},
             {"thread_affinity_mode", cfg.threadAffinityMode},
             {"block_timing", cfg.blockTimingMode},
             {"tuning_edo", cfg.tuningEdo},
@@ -356,6 +357,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"events", {
             {"overflow_mode", "priority"},
             {"cc_collapse", cfg.ccCollapse},
+            {"fast_producer", cfg.fastProducer},
             {"note_merge", cfg.noteMerge},
             {"ring_capacity", cfg.eventRingCapacity},
             {"high_priority_velocity", cfg.highPriorityVelocity},
@@ -611,6 +613,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             cfg.tuningEdo = 12u;
             AppendWarning(cfg.configWarning, "synth.tuning_edo");
         }
+        if (!ReadValue(*it, "shards", cfg.shards, 0u, 32u))
+            AppendWarning(cfg.configWarning, "synth.shards");
         if (!ReadValue(*it, "render_threads", cfg.renderThreads, 0u, 64u))
             AppendWarning(cfg.configWarning, "synth.render_threads");
         if (!ReadValue(*it, "thread_affinity_mode", cfg.threadAffinityMode,
@@ -733,6 +737,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
                 cfg.ccCollapse = collapse->get<bool>();
             else
                 AppendWarning(cfg.configWarning, "events.cc_collapse");
+        }
+        if (auto fast = it->find("fast_producer"); fast != it->end()) {
+            if (fast->is_boolean())
+                cfg.fastProducer = fast->get<bool>();
+            else
+                AppendWarning(cfg.configWarning, "events.fast_producer");
         }
         if (auto merge = it->find("note_merge"); merge != it->end()) {
             if (merge->is_boolean())
@@ -957,6 +967,7 @@ EngineConfig EngineConfig::Default() {
     cfg.bufferFrames = kDefaultBufferFrames;
     cfg.maxVoices = kMaxVoicesDefault;
     cfg.voiceMemoryBudgetMB = 0u;
+    cfg.shards = 1u;  // opt-in: one engine core by default
 #if defined(SVMS_XP_COMPAT)
     cfg.renderThreads = 1u;
 #else
@@ -1026,6 +1037,7 @@ EngineConfig EngineConfig::Default() {
     cfg.decimationCullBlocks = 5u;  // only matters once decimation is on
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
+    cfg.fastProducer = false;    // opt-in: shared MPSC lanes by default
     cfg.noteMerge = false;       // opt-in: every note-on launches its own voice
     cfg.noteOnReexcite = false;  // opt-in: collapsed hits are dropped, not re-excited
     cfg.blockTimingMode = false;  // opt-in: exact-frame dispatch by default
@@ -1144,6 +1156,7 @@ bool EngineConfig::Validate() const {
             maxVoices >= 1 && maxVoices <= kMaxPolyphony &&
             voiceMemoryBudgetMB <= 65536u &&
             renderThreads <= 64u &&
+            shards <= 32u &&
             masterVolume >= 0.0f && masterVolume <= 4.0f &&
             (limiterAlgorithm == LimiterAlgorithm::Classic ||
              limiterAlgorithm == LimiterAlgorithm::Adaptive) &&

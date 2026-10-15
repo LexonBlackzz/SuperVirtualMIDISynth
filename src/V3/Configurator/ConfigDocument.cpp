@@ -171,6 +171,8 @@ ConfigValues ConfigDocument::Defaults() {
     d.stealReject = false;
     d.threadAffinityMode = 0u;
     d.ccCollapse = false;
+    d.fastProducer = false;
+    d.shards = 1u;
     d.noteMerge = false;
     d.noteOnReexcite = false;
     d.blockTiming = false;
@@ -276,6 +278,7 @@ void ConfigDocument::FromJson(const json& root) {
         ReadNum(*it, "voice_memory_budget_mb", working_.voiceMemoryBudgetMB,
                 0u, 65536u);
         ReadNum(*it, "render_threads", working_.renderThreads, 0u, 64u);
+        ReadNum(*it, "shards", working_.shards, 0u, 32u);
         ReadNum(*it, "master_volume", working_.masterVolume, 0.0f, 4.0f);
         ReadNum(*it, "velocity_curve", working_.velocityCurve, 0.1f, 10.0f);
         ReadNum(*it, "velocity_floor", working_.velocityFloor, 0.0f, 0.99f);
@@ -287,6 +290,10 @@ void ConfigDocument::FromJson(const json& root) {
         if (auto collapse = it->find("cc_collapse"); collapse != it->end() &&
             collapse->is_boolean()) {
             working_.ccCollapse = collapse->get<bool>();
+        }
+        if (auto fast = it->find("fast_producer"); fast != it->end() &&
+            fast->is_boolean()) {
+            working_.fastProducer = fast->get<bool>();
         }
         if (auto merge = it->find("note_merge"); merge != it->end() &&
             merge->is_boolean()) {
@@ -409,6 +416,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["synth"]["voice_memory_budget_mb"] =
         working_.voiceMemoryBudgetMB;
     root["synth"]["render_threads"] = working_.renderThreads;
+    root["synth"]["shards"] = working_.shards;
     root["synth"]["master_volume"] = working_.masterVolume;
     root["synth"]["velocity_curve"] = working_.velocityCurve;
     root["synth"]["velocity_floor"] = working_.velocityFloor;
@@ -461,6 +469,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["ghost_budget"] = working_.ghostBudget;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
+    root["events"]["fast_producer"] = working_.fastProducer;
     root["events"]["note_merge"] = working_.noteMerge;
     root["synth"]["block_timing"] = working_.blockTiming;
     root["synth"]["tuning_edo"] = working_.tuningEdo;
@@ -674,6 +683,8 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.ghostBudget == b.ghostBudget
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
+        && a.fastProducer == b.fastProducer
+        && a.shards == b.shards
         && a.noteMerge == b.noteMerge
         && a.noteOnReexcite == b.noteOnReexcite
         && a.blockTiming == b.blockTiming
