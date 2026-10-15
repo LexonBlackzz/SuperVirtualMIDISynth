@@ -162,14 +162,27 @@ public:
         case RLCommandType::Ping:
             return RLResult::Ok;
         case RLCommandType::ApplyLiveConfig: {
-            bool any = false, failed = false;
+            bool failed = false;
+            uint32_t missing = 0u;
             for (const LiveField& f : LiveFields(live)) {
-                if (!(groupMask & f.group) || !HasParam(f.id)) continue;
-                any = true;
+                if (!(groupMask & f.group)) continue;
+                if (!HasParam(f.id)) { missing |= f.group; continue; }
                 if (SetParamBlocking(f.id, f.value, timeoutMs) != RLResult::Ok) failed = true;
             }
-            if (!any) { text("this driver does not offer those controls"); return RLResult::Unsupported; }
-            return failed ? RLResult::InternalError : RLResult::Ok;
+            if (failed) return RLResult::InternalError;
+            if (missing) {
+                // Supported groups were applied above; name what this driver cannot change live.
+                std::string names;
+                const auto add = [&](uint32_t g, const char* n) {
+                    if (missing & g) names += (names.empty() ? "" : ", ") + std::string(n);
+                };
+                add(RLGroupMaster, "master volume"); add(RLGroupCorrectness, "correctness");
+                add(RLGroupReverb, "reverb"); add(RLGroupLimiter, "limiter");
+                add(RLGroupVoices, "voice count");
+                text((names + " can't be changed live on this driver; save the configuration and restart it").c_str());
+                return RLResult::Unsupported;
+            }
+            return RLResult::Ok;
         }
         case RLCommandType::ResetVoices: {
             const bool ok = CommandBlocking("reset_voices", timeoutMs) == RLResult::Ok;

@@ -938,6 +938,17 @@ void ConfiguratorApp::FlushLiveChanges() {
         return;
     }
 
+    if (result == svms::RLResult::Unsupported) {
+        // Retrying cannot help; drop the change and say so once.
+        pendingLiveMask_ &= ~submittedMask;
+        SendPendingChannelLimiter();
+        statusMessage_ = err[0] != '\0' ? std::string(err) : "Not available live on this driver";
+        toastTimer_ = 4.0f;
+        toastMessage_ = statusMessage_;
+        rlFailedFlushes_ = 0u;
+        return;
+    }
+
     rlRetryBackoff_ = 0.15f;
     if (++rlFailedFlushes_ >= 3u) {
         rlFailedFlushes_ = 0u;
