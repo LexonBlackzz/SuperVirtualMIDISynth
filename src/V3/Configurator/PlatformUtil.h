@@ -82,6 +82,24 @@ inline std::wstring Utf8ToWide(const std::string& value) {
 #endif
 }
 
+// path::lexically_normal() is missing from the Filesystem TS (GCC 7).
+inline fs::path LexicallyNormal(const fs::path& path) {
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ < 9
+    fs::path normal;
+    for (const fs::path& part : path) {
+        if (part == ".") continue;
+        if (part == ".." && !normal.empty() && normal.filename() != "..") {
+            normal = normal.parent_path();
+            continue;
+        }
+        normal /= part;
+    }
+    return normal;
+#else
+    return path.lexically_normal();
+#endif
+}
+
 // Atomically replaces `to` with `from` (MoveFileEx write-through on Windows).
 inline bool ReplaceFile(const fs::path& from, const fs::path& to) {
 #ifdef _WIN32

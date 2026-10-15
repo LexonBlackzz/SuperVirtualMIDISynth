@@ -51,6 +51,7 @@
 //      the configurator can enumerate running drivers without scanning
 //      the process table.
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>

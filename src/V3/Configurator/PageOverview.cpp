@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <filesystem>
 #include <string>
 
 namespace svms::cfg {
@@ -82,7 +81,7 @@ void SynthModule(ConfigDocument& doc) {
         std::string name = "(none - local fallback)";
         std::string dir;
         if (!w.soundFontPath.empty()) {
-            const std::filesystem::path sf(w.soundFontPath);
+            const fs::path sf(w.soundFontPath);
             name = Utf8(sf.filename().wstring());
             dir = Utf8(sf.parent_path().wstring());
         }

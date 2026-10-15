@@ -643,7 +643,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                  !ec && it != end; it.increment(ec)) {
                 if (ec) break;
                 std::error_code typeEc;
-                if (it->is_directory(typeEc) && !typeEc) {
+                if (fs::is_directory(it->status(typeEc)) && !typeEc) {
                     folderDirs.push_back(it->path().filename().wstring());
                     continue;
                 }
@@ -741,8 +741,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
         ImGui::TableNextColumn();
         if (BeginRackPanel("FOLDER")) {
             std::string folderLabel = WideToUtf8Str(
-                fs::path(scannedDir.empty() ? L"." : scannedDir)
-                    .lexically_normal().wstring());
+                util::LexicallyNormal(fs::path(scannedDir.empty() ? L"." : scannedDir)).wstring());
             if (folderLabel.size() > 56)
                 folderLabel = "..." + folderLabel.substr(folderLabel.size() - 56);
             PushMono();
@@ -758,7 +757,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             std::transform(filter.begin(), filter.end(), filter.begin(),
                            [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
             const fs::path currentDir =
-                fs::path(scannedDir.empty() ? L"." : scannedDir).lexically_normal();
+                util::LexicallyNormal(fs::path(scannedDir.empty() ? L"." : scannedDir));
             const fs::path parentDir = currentDir.parent_path();
             bool navigated = false;
             if (!parentDir.empty() && parentDir != currentDir) {
@@ -773,7 +772,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                 for (const auto& folder : folderDirs) {
                     const std::string dname = "[DIR] " + WideToUtf8Str(folder);
                     if (ImGui::Selectable(dname.c_str())) {
-                        browserDir = (currentDir / folder).lexically_normal().wstring();
+                        browserDir = util::LexicallyNormal(currentDir / folder).wstring();
                         scannedDir.clear();
                         searchBuf[0] = '\0';
                         navigated = true;
@@ -788,10 +787,10 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                     std::transform(lower.begin(), lower.end(), lower.begin(),
                                    [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
                     if (!filter.empty() && lower.find(filter) == std::string::npos) continue;
-                    const fs::path candidate = (currentDir / file).lexically_normal();
+                    const fs::path candidate = util::LexicallyNormal(currentDir / file);
                     const bool selected = !w.soundFontPath.empty() &&
                         _wcsicmp(candidate.c_str(),
-                                 fs::path(w.soundFontPath).lexically_normal().c_str()) == 0;
+                                 util::LexicallyNormal(fs::path(w.soundFontPath)).c_str()) == 0;
                     if (ImGui::Selectable(fname.c_str(), selected)) {
                         SetPrimarySoundFont(w, candidate.wstring());
                         lastSoundFontDir = currentDir.wstring();
