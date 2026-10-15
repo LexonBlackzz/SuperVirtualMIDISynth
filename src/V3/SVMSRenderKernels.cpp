@@ -89,6 +89,14 @@ uint32_t RenderSustainedLoopSpan(
     } else {
         for (; n < frameCount; ++n) {
             uint32_t baseOffset = static_cast<uint32_t>(phase);
+            if (phase >= relLoopEF) {  // a long span may end with the wrap pending: carry the overflow
+                float wrapOverflow = phase - relLoopEF;
+                const float wrapLength = relLoopEF - relLoopSF;
+                if (wrapLength > 0.0f && wrapOverflow >= wrapLength)
+                    wrapOverflow -= floorf(wrapOverflow / wrapLength) * wrapLength;
+                phase = relLoopSF + wrapOverflow;
+                baseOffset = static_cast<uint32_t>(phase);
+            }
             if (baseOffset + 1u >= relEnd) {
                 phase = relLoopSF;
                 baseOffset = relLoopS;
@@ -414,6 +422,14 @@ void RenderTransientLoopBatchFixed(const RenderSpanContext& c,
 
         for (uint32_t n = 0; n < FrameCount; ++n) {
             uint32_t baseOffset = static_cast<uint32_t>(phase);
+            if (phase >= relLoopEF) {  // a long span may end with the wrap pending: carry the overflow
+                float wrapOverflow = phase - relLoopEF;
+                const float wrapLength = relLoopEF - relLoopSF;
+                if (wrapLength > 0.0f && wrapOverflow >= wrapLength)
+                    wrapOverflow -= floorf(wrapOverflow / wrapLength) * wrapLength;
+                phase = relLoopSF + wrapOverflow;
+                baseOffset = static_cast<uint32_t>(phase);
+            }
             if (baseOffset + 1u >= relEnd) {
                 phase = relLoopSF;
                 baseOffset = relLoopS;

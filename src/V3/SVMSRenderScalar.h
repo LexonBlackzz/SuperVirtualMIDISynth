@@ -1635,6 +1635,14 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 }
                 if (run == 0u) {
                     uint32_t baseOffset = static_cast<uint32_t>(phase);
+                    if (phase >= relLoopEF) {  // a long span may end with the wrap pending: carry the overflow
+                        float wrapOverflow = phase - relLoopEF;
+                        const float wrapLength = relLoopEF - relLoopSF;
+                        if (wrapLength > 0.0f && wrapOverflow >= wrapLength)
+                            wrapOverflow -= floorf(wrapOverflow / wrapLength) * wrapLength;
+                        phase = relLoopSF + wrapOverflow;
+                        baseOffset = static_cast<uint32_t>(phase);
+                    }
                     if (baseOffset + 1u >= relEnd) {
                         phase = relLoopSF;
                         baseOffset = relLoopS;

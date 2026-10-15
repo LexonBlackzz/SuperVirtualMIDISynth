@@ -145,6 +145,37 @@ static double Compare(const std::wstring& sf2, bool realPrograms, A renderA, B r
     return worst;
 }
 
+// Regression: a looping voice held across blocks, then a block whose events
+// cut it into a long span followed by a < 8 frame span. The long path leaves
+// the loop wrap pending (phase >= loopEnd); the short path used to clamp that
+// phase to loopStart and drop the fractional overflow (0.126 samples here).
+static bool TestShortSpanLoopWrap(const std::wstring& sf2) {
+    auto a = MakeSynth(sf2), b = MakeSynth(sf2);
+    RealtimeBlockRenderer renderer;
+    std::vector<float> al(kFrames), ar(kFrames), bl(kFrames), br(kFrames);
+    auto at = [](uint64_t frame, uint32_t message, uint64_t sequence) {
+        RealtimeEvent e; e.targetFrame = frame; e.message = message; e.sequence = sequence; return e;
+    };
+    double worst = 0.0;
+    for (uint32_t block = 0; block < 10; ++block) {
+        std::vector<RealtimeEvent> events;
+        if (block == 0) {
+            events.push_back(at(0, 0x05C0u, 0));                  // program 5 (gm.sf2 electric piano)
+            events.push_back(at(193, 0x665390u, 1));              // held high key, short loop
+        } else if (block == 7) {
+            events.push_back(at(7974, 0x532e90u, 2));
+            events.push_back(at(8004, 0x582f90u, 3));
+            events.push_back(at(8010, 0x295090u, 4));             // 6 frame span after 8004
+        }
+        const uint64_t start = uint64_t(block) * kFrames;
+        RenderPerEvent(*a, events, al.data(), ar.data(), start);
+        renderer.Render(*b, events.data(), events.size(), bl.data(), br.data(), kFrames, start);
+        worst = std::max({worst, MaxDiff(al, bl), MaxDiff(ar, br)});
+    }
+    std::printf("short-span loop wrap: max diff %.3g\n", worst);
+    return worst <= 2e-5;
+}
+
 int main() {
     // Hermetic: StandaloneSynth reads the engine config (note merge, collapse,
     // re-excite...), which the batched path honours. A developer's live config
@@ -155,6 +186,7 @@ int main() {
     if (sf2.empty()) { std::puts("no SoundFont; skipping"); return 77; }
 
     RealtimeBlockRenderer batchedRenderer;
+    if (!TestShortSpanLoopWrap(sf2)) { std::puts("FAIL: short-span loop wrap loses phase"); return 1; }
     int failures = 0;
     double energy = 0.0, msPerEvent = 0.0, msBatched = 0.0;
 
