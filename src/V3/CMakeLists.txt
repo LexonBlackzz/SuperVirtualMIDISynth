@@ -826,6 +826,7 @@ if(NOT SVMS_XP_COMPAT)
     set(CONFIGURATOR_SOURCES
         Configurator/Main.cpp
         Configurator/ConfiguratorApp.cpp
+        Configurator/Platform_Win32.cpp
         Configurator/ConfigDocument.cpp
         Configurator/Theme.cpp
         Configurator/Widgets.cpp

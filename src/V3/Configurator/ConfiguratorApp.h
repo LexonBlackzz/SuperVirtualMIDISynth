@@ -7,17 +7,15 @@
 #include "UpdateService.h"
 #include "PageOffline.h"
 #include "PageLiveRecording.h"
+#include "Platform.h"
 #include "../SVMSRuntimeLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
 #include <algorithm>
+#include <memory>
+#include <string>
 #include <vector>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <d3d11.h>
 
 struct ImGuiContext;
 
@@ -45,20 +43,15 @@ public:
     ConfiguratorApp() = default;
     ~ConfiguratorApp() = default;
 
-    bool Initialize(HINSTANCE hInstance, int argc, char** argv);
+    bool Initialize(int argc, char** argv);
     void Shutdown();
     bool PumpMessages();
+    bool IsMinimized() const;
+    void WaitForEvent();
+    void SetWindowTitle(const wchar_t* title);
     void RenderFrame();
 
     bool IsRunning() const { return running_; }
-    bool IsMinimized() const {
-        return hwnd_ != nullptr && IsIconic(hwnd_) != FALSE;
-    }
-    void SetWindowTitle(const wchar_t* title) {
-        if (hwnd_ != nullptr && title != nullptr && title[0] != L'\0') {
-            SetWindowTextW(hwnd_, title);
-        }
-    }
 
     const wchar_t* LastInitError() const { return lastInitError_.c_str(); }
 
@@ -69,22 +62,13 @@ public:
     void SetLiveMaxVoices(uint32_t value);
     void SetLiveLimiterAlgorithm(uint32_t value);
 
-    void HandleDpiChange(float scale, const RECT* suggestedRect);
-
     // Jump to a stage/page (used by the Home overview's OPEN keys).
     void NavigateTo(Page page) { currentPage_ = page; }
 
 private:
-    friend LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam,
-                                    LPARAM lParam);
 
-    bool CreateMainWindow(HINSTANCE hInstance);
-    bool CreateD3D11();
     bool CreateImGui();
     void RecreateFonts(float scale, bool rendererBackendInitialized);
-    void DestroyD3D11();
-    void DestroyMainWindow();
-    void ResizeSwapChain(int width, int height);
 
     void DrawHeader();
     void DrawMasterStrip(float y);
@@ -94,24 +78,15 @@ private:
     void DrawToastOverlay();
     void HandleKeyboardShortcuts();
 
+    std::unique_ptr<Platform> platform_;
     bool running_ = false;
     bool dirty_ = false;
 
-    HWND hwnd_ = nullptr;
-    ID3D11Device* d3dDevice_ = nullptr;
-    ID3D11DeviceContext* d3dContext_ = nullptr;
-    IDXGISwapChain* swapChain_ = nullptr;
-    ID3D11RenderTargetView* renderTarget_ = nullptr;
 
     int windowWidth_ = 1180;
     int windowHeight_ = 760;
     float dpiScale_ = 1.0f;
 
-    bool resizePending_ = false;
-    UINT pendingWidth_ = 0;
-    UINT pendingHeight_ = 0;
-    float pendingDpiScale_ = 1.0f;
-    bool dpiRebuildPending_ = false;
     bool shutdownDone_ = false;
     std::wstring lastInitError_;
     std::vector<unsigned char> fontData_;

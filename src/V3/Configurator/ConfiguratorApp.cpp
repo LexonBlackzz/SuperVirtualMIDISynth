@@ -1,22 +1,18 @@
 #include "ConfiguratorApp.h"
+#include "Platform.h"
 #include "Theme.h"
 #include "Widgets.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_dx11.h"
 
+#ifdef _WIN32
+// Offline/live-recording pages still take an HWND for native file dialogs.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include <tlhelp32.h>
-#include <shellscalingapi.h>
-#include <shlobj.h>
-#include <d3d11.h>
-#include <dxgi.h>
-#include <shellapi.h>
+#endif
 
 #include "PageOverview.h"
 #include "PageAudio.h"
@@ -34,17 +30,7 @@
 #include <cstdio>
 #include <vector>
 
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "shcore.lib")
-
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
-    HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-
 namespace svms::cfg {
-
-static const wchar_t* kWindowClass = L"SVMS_V3_Configurator";
-static const wchar_t* kWindowTitle = L"SuperVirtualMIDISynth V3";
 
 enum class VersionRelation { Unknown, Same, DriverOlder, DriverNewer };
 
@@ -71,122 +57,20 @@ static VersionRelation CompareDriverVersion(
     return VersionRelation::Same;
 }
 
-static void LogStartupFailure(const wchar_t* what) {
-    wchar_t buf[1024];
-    swprintf(buf, 1024, L"SVMS V3 Configurator failed to start: %s\n", what);
-    OutputDebugStringW(buf);
-}
-
-static void LogStartupFailure(const wchar_t* what, HRESULT hr) {
-    wchar_t buf[1024];
-    swprintf(buf, 1024,
-             L"SVMS V3 Configurator failed to start: %s (HRESULT 0x%08lX)\n",
-             what, static_cast<unsigned long>(hr));
-    OutputDebugStringW(buf);
-}
-
-static std::wstring StartupFailureText(const wchar_t* what) {
-    wchar_t buf[1024];
-    swprintf(buf, 1024, L"SVMS V3 Configurator failed to start: %s", what);
-    return std::wstring(buf);
-}
-
-static std::wstring StartupFailureText(const wchar_t* what, HRESULT hr) {
-    wchar_t buf[1024];
-    swprintf(buf, 1024,
-             L"SVMS V3 Configurator failed to start: %s (HRESULT 0x%08lX)",
-             what, static_cast<unsigned long>(hr));
-    return std::wstring(buf);
-}
-
-LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    auto appFromHwnd = [](HWND hWnd) -> ConfiguratorApp* {
-        return reinterpret_cast<ConfiguratorApp*>(
-            GetWindowLongPtrW(hWnd, GWLP_USERDATA));
-    };
-
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-        return 1;
-
-    switch (msg) {
-    case WM_NCCREATE: {
-        CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        SetWindowLongPtrW(hWnd, GWLP_USERDATA,
-                          reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
-        return TRUE;
-    }
-    case WM_GETMINMAXINFO: {
-        ConfiguratorApp* app = appFromHwnd(hWnd);
-        if (app) {
-            RECT rc = {0, 0,
-                       static_cast<LONG>(kMinWindowWidth * app->dpiScale_),
-                       static_cast<LONG>(kMinWindowHeight * app->dpiScale_)};
-            AdjustWindowRectEx(
-                &rc, static_cast<DWORD>(GetWindowLongPtrW(hWnd, GWL_STYLE)), FALSE,
-                static_cast<DWORD>(GetWindowLongPtrW(hWnd, GWL_EXSTYLE)));
-            MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lParam);
-            info->ptMinTrackSize.x = rc.right - rc.left;
-            info->ptMinTrackSize.y = rc.bottom - rc.top;
-        }
-        return 0;
-    }
-    case WM_SIZE: {
-        ConfiguratorApp* app = appFromHwnd(hWnd);
-        if (app && wParam != SIZE_MINIMIZED) {
-            app->pendingWidth_ = static_cast<UINT>(LOWORD(lParam));
-            app->pendingHeight_ = static_cast<UINT>(HIWORD(lParam));
-            app->resizePending_ = true;
-        }
-        return 0;
-    }
-    case WM_DPICHANGED: {
-        ConfiguratorApp* app = appFromHwnd(hWnd);
-        if (app) {
-            const float newScale =
-                static_cast<float>(HIWORD(wParam)) / 96.0f;
-            app->HandleDpiChange(newScale,
-                                 reinterpret_cast<const RECT*>(lParam));
-        }
-        return 0;
-    }
-    case WM_CLOSE: {
-        ConfiguratorApp* app = appFromHwnd(hWnd);
-        if (app && app->config_.IsDirty()) {
-            const int choice = MessageBoxW(
-                hWnd,
-                L"Configuration has unsaved changes.\nClose anyway?",
-                L"SuperVirtualMIDISynth V3",
-                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-            if (choice != IDYES) return 0;
-        }
-        DestroyWindow(hWnd);
-        return 0;
-    }
-    case WM_DESTROY:
-        if (appFromHwnd(hWnd)) {
-            appFromHwnd(hWnd)->hwnd_ = nullptr;
-        }
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProcW(hWnd, msg, wParam, lParam);
-}
-
-bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+bool ConfiguratorApp::Initialize(int argc, char** argv) {
+    platform_ = CreatePlatform();
 
     easterEggs_ = RollEasterEggs(argc, argv);
     showMegaFuckerPopup_ = easterEggs_.megaFuckerDac;
 
-    wchar_t configPath[MAX_PATH] = {};
+    std::wstring configPath;
     bool configPathSpecified = false;
     uint32_t runtimeLinkPid = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--config" && i + 1 < argc) {
-            int wLen = MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1,
-                                           configPath, MAX_PATH);
-            if (wLen > 0) configPathSpecified = true;
+            configPath = platform_->Utf8ToWide(argv[i + 1]);
+            if (!configPath.empty()) configPathSpecified = true;
         }
         if (std::string(argv[i]) == "--runtime-link" && i + 1 < argc) {
             runtimeLinkPid = static_cast<uint32_t>(std::atoi(argv[i + 1]));
@@ -195,16 +79,9 @@ bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
 
     if (!configPathSpecified) {
         config_.LoadDefaults();
-        std::wstring autoPath;
-        wchar_t appData[MAX_PATH];
-        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr,
-                                       SHGFP_TYPE_CURRENT, appData))) {
-            autoPath = std::wstring(appData) +
-                       L"\\SuperVirtualMIDISynth\\config.json";
-        }
+        const std::wstring autoPath = platform_->DefaultConfigPath();
         if (!autoPath.empty()) {
-            DWORD attr = GetFileAttributesW(autoPath.c_str());
-            if (attr != INVALID_FILE_ATTRIBUTES) {
+            if (platform_->FileExists(autoPath)) {
                 config_.Load(autoPath);
             } else {
                 config_.LoadDefaults();
@@ -216,8 +93,10 @@ bool ConfiguratorApp::Initialize(HINSTANCE hInstance, int argc, char** argv) {
     }
     SeedWorkingLive();
 
-    if (!CreateMainWindow(hInstance)) return false;
-    if (!CreateD3D11()) return false;
+    Platform::Hooks hooks;
+    hooks.hasUnsavedChanges = [this] { return config_.IsDirty(); };
+    if (!platform_->CreateWindowAndDevice(hooks, lastInitError_)) return false;
+    dpiScale_ = platform_->DpiScale();
     if (!CreateImGui()) return false;
     ApplyTheme();
 
@@ -251,136 +130,12 @@ void ConfiguratorApp::Shutdown() {
     rlConnected_ = false;
     offlineRendererPage_.Shutdown();
 
-    ImGui_ImplDX11_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
-
-    DestroyD3D11();
-    DestroyMainWindow();
+    if (platform_) {
+        platform_->ShutdownBackends();
+        ImGui::DestroyContext();
+        platform_->DestroyWindowAndDevice();
+    }
     running_ = false;
-}
-
-bool ConfiguratorApp::CreateMainWindow(HINSTANCE hInstance) {
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.lpszClassName = kWindowClass;
-    if (!RegisterClassExW(&wc)) {
-        lastInitError_ = StartupFailureText(
-            L"RegisterClassExW failed",
-            HRESULT_FROM_WIN32(GetLastError()));
-        LogStartupFailure(L"RegisterClassExW failed",
-                          HRESULT_FROM_WIN32(GetLastError()));
-        return false;
-    }
-
-    UINT dpi = GetDpiForSystem();
-    dpiScale_ = static_cast<float>(dpi) / 96.0f;
-
-    RECT rc = { 0, 0,
-                static_cast<LONG>(kDefaultWindowWidth * dpiScale_),
-                static_cast<LONG>(kDefaultWindowHeight * dpiScale_) };
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-
-    int scrW = GetSystemMetrics(SM_CXSCREEN);
-    int scrH = GetSystemMetrics(SM_CYSCREEN);
-    int x = (scrW - (rc.right - rc.left)) / 2;
-    int y = (scrH - (rc.bottom - rc.top)) / 2;
-
-    hwnd_ = CreateWindowExW(
-        0, kWindowClass, kWindowTitle,
-        WS_OVERLAPPEDWINDOW,
-        x, y, rc.right - rc.left, rc.bottom - rc.top,
-        nullptr, nullptr, hInstance, this);
-
-    if (!hwnd_) {
-        lastInitError_ = StartupFailureText(
-            L"CreateWindowExW failed",
-            HRESULT_FROM_WIN32(GetLastError()));
-        LogStartupFailure(L"CreateWindowExW failed",
-                          HRESULT_FROM_WIN32(GetLastError()));
-        return false;
-    }
-
-    dpiScale_ = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
-
-    ShowWindow(hwnd_, SW_SHOWDEFAULT);
-    UpdateWindow(hwnd_);
-    return true;
-}
-
-void ConfiguratorApp::DestroyMainWindow() {
-    if (hwnd_) {
-        DestroyWindow(hwnd_);
-        hwnd_ = nullptr;
-    }
-}
-
-bool ConfiguratorApp::CreateD3D11() {
-    DXGI_SWAP_CHAIN_DESC sd = {};
-    sd.BufferCount = 2;
-    sd.BufferDesc.Width = 0;
-    sd.BufferDesc.Height = 0;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = hwnd_;
-    sd.SampleDesc.Count = 1;
-    sd.SampleDesc.Quality = 0;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-    D3D_FEATURE_LEVEL featureLevel;
-    const D3D_FEATURE_LEVEL levels[2] = { D3D_FEATURE_LEVEL_11_0,
-                                          D3D_FEATURE_LEVEL_10_0 };
-
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        levels, 2, D3D11_SDK_VERSION,
-        &sd, &swapChain_, &d3dDevice_, &featureLevel, &d3dContext_);
-
-    if (FAILED(hr)) {
-        hr = D3D11CreateDeviceAndSwapChain(
-            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
-            levels, 2, D3D11_SDK_VERSION,
-            &sd, &swapChain_, &d3dDevice_, &featureLevel, &d3dContext_);
-    }
-
-    if (FAILED(hr)) {
-        lastInitError_ = StartupFailureText(L"D3D11CreateDeviceAndSwapChain failed", hr);
-        LogStartupFailure(L"D3D11CreateDeviceAndSwapChain failed", hr);
-        return false;
-    }
-
-    ID3D11Texture2D* backBuffer = nullptr;
-    hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-    if (FAILED(hr)) {
-        lastInitError_ = StartupFailureText(L"swap chain GetBuffer failed", hr);
-        LogStartupFailure(L"swap chain GetBuffer failed", hr);
-        return false;
-    }
-
-    hr = d3dDevice_->CreateRenderTargetView(backBuffer, nullptr, &renderTarget_);
-    backBuffer->Release();
-    if (FAILED(hr)) {
-        lastInitError_ = StartupFailureText(L"CreateRenderTargetView failed", hr);
-        LogStartupFailure(L"CreateRenderTargetView failed", hr);
-        return false;
-    }
-
-    return true;
-}
-
-void ConfiguratorApp::DestroyD3D11() {
-    if (renderTarget_) { renderTarget_->Release(); renderTarget_ = nullptr; }
-    if (swapChain_) { swapChain_->Release(); swapChain_ = nullptr; }
-    if (d3dContext_) { d3dContext_->Release(); d3dContext_ = nullptr; }
-    if (d3dDevice_) { d3dDevice_->Release(); d3dDevice_ = nullptr; }
 }
 
 bool ConfiguratorApp::CreateImGui() {
@@ -395,22 +150,12 @@ bool ConfiguratorApp::CreateImGui() {
 
     RecreateFonts(dpiScale_, false);
 
-    if (!ImGui_ImplWin32_Init(hwnd_)) {
-        lastInitError_ = StartupFailureText(L"ImGui_ImplWin32_Init failed");
-        LogStartupFailure(L"ImGui_ImplWin32_Init failed");
-        return false;
-    }
-    if (!ImGui_ImplDX11_Init(d3dDevice_, d3dContext_)) {
-        lastInitError_ = StartupFailureText(L"ImGui_ImplDX11_Init failed");
-        LogStartupFailure(L"ImGui_ImplDX11_Init failed");
-        return false;
-    }
-    return true;
+    return platform_->InitBackends(lastInitError_);
 }
 
 void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized) {
     if (rendererBackendInitialized) {
-        ImGui_ImplDX11_InvalidateDeviceObjects();
+        platform_->InvalidateFontObjects();
     }
 
     ImGuiIO& io = ImGui::GetIO();
@@ -422,27 +167,9 @@ void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized
     cfg.PixelSnapH = true;
     cfg.FontDataOwnedByAtlas = false;
 
-    wchar_t windowsDir[MAX_PATH] = {};
-    const UINT len = GetWindowsDirectoryW(windowsDir, MAX_PATH);
-    fontData_.clear();
-    if (len > 0u && len < MAX_PATH) {
-        FILE* f = _wfopen((std::wstring(windowsDir) + L"\\Fonts\\segoeui.ttf").c_str(),
-                          L"rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            const long size = ftell(f);
-            if (size > 0) {
-                fontData_.resize(static_cast<size_t>(size));
-                fseek(f, 0, SEEK_SET);
-                fread(fontData_.data(), 1, fontData_.size(), f);
-            }
-            fclose(f);
-        }
-    }
-
     const float fontSize = 16.0f * scale;
     ImFont* font = nullptr;
-    if (!fontData_.empty()) {
+    if (platform_->LoadSystemFont(false, fontData_)) {
         font = io.Fonts->AddFontFromMemoryTTF(
             fontData_.data(), static_cast<int>(fontData_.size()), fontSize, &cfg);
     }
@@ -453,25 +180,7 @@ void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized
 
     // Monospace face for LCD readouts, key caps and panel engravings.
     ImFont* mono = nullptr;
-    monoFontData_.clear();
-    if (len > 0u && len < MAX_PATH) {
-        static const wchar_t* kMonoFiles[] = {L"\\Fonts\\consola.ttf",
-                                              L"\\Fonts\\cour.ttf"};
-        for (const wchar_t* file : kMonoFiles) {
-            FILE* f = _wfopen((std::wstring(windowsDir) + file).c_str(), L"rb");
-            if (!f) continue;
-            fseek(f, 0, SEEK_END);
-            const long size = ftell(f);
-            if (size > 0) {
-                monoFontData_.resize(static_cast<size_t>(size));
-                fseek(f, 0, SEEK_SET);
-                fread(monoFontData_.data(), 1, monoFontData_.size(), f);
-            }
-            fclose(f);
-            if (!monoFontData_.empty()) break;
-        }
-    }
-    if (!monoFontData_.empty()) {
+    if (platform_->LoadSystemFont(true, monoFontData_)) {
         mono = io.Fonts->AddFontFromMemoryTTF(
             monoFontData_.data(), static_cast<int>(monoFontData_.size()),
             fontSize * 0.88f, &cfg);
@@ -481,91 +190,41 @@ void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized
     io.Fonts->Build();
 }
 
-void ConfiguratorApp::HandleDpiChange(float scale, const RECT* suggestedRect) {
-    if (!hwnd_) return;
-    dpiScale_ = scale;
-
-    if (suggestedRect) {
-        SetWindowPos(hwnd_, nullptr, suggestedRect->left, suggestedRect->top,
-                     suggestedRect->right - suggestedRect->left,
-                     suggestedRect->bottom - suggestedRect->top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-
-    pendingDpiScale_ = scale;
-    dpiRebuildPending_ = true;
-}
-
 bool ConfiguratorApp::PumpMessages() {
-    MSG msg = {};
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-        if (msg.message == WM_QUIT) {
-            running_ = false;
-            return false;
-        }
+    if (!platform_->PumpEvents()) {
+        running_ = false;
+        return false;
     }
     return running_;
 }
 
-void ConfiguratorApp::ResizeSwapChain(int width, int height) {
-    if (!swapChain_ || !d3dDevice_) return;
-    if (width <= 0 || height <= 0) return;
+bool ConfiguratorApp::IsMinimized() const {
+    return platform_ && platform_->IsMinimized();
+}
 
-    if (width == windowWidth_ && height == windowHeight_ && renderTarget_) {
-        return;
-    }
+void ConfiguratorApp::WaitForEvent() { platform_->WaitForEvent(); }
 
-    if (renderTarget_) { renderTarget_->Release(); renderTarget_ = nullptr; }
-
-    HRESULT hr = swapChain_->ResizeBuffers(
-        0, static_cast<UINT>(width), static_cast<UINT>(height),
-        DXGI_FORMAT_UNKNOWN, 0);
-    if (FAILED(hr)) {
-        LogStartupFailure(L"ResizeBuffers failed (retrying with the current back buffer)", hr);
-    }
-
-    ID3D11Texture2D* backBuffer = nullptr;
-    hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-    if (SUCCEEDED(hr) && backBuffer) {
-        hr = d3dDevice_->CreateRenderTargetView(backBuffer, nullptr,
-                                                &renderTarget_);
-        backBuffer->Release();
-    } else if (backBuffer) {
-        backBuffer->Release();
-    }
-
-    windowWidth_ = width;
-    windowHeight_ = height;
-
-    if (FAILED(hr) || !renderTarget_) {
-        resizePending_ = true;
-        if (FAILED(hr)) {
-            LogStartupFailure(L"GetBuffer/CreateRenderTargetView after resize failed", hr);
-        }
-    }
+void ConfiguratorApp::SetWindowTitle(const wchar_t* title) {
+    if (platform_) platform_->SetTitle(title);
 }
 
 void ConfiguratorApp::RenderFrame() {
-    if (resizePending_) {
-        resizePending_ = false;
-        ResizeSwapChain(static_cast<int>(pendingWidth_),
-                        static_cast<int>(pendingHeight_));
+    platform_->ApplyPendingResize();
+
+    float newScale = 0.0f;
+    if (platform_->TakeDpiChange(newScale)) {
+        RecreateFonts(newScale, true);
     }
 
-    if (dpiRebuildPending_) {
-        dpiRebuildPending_ = false;
-        RecreateFonts(pendingDpiScale_, true);
-    }
-
-    if (!renderTarget_) return;
+    if (!platform_->CanRender()) return;
+    windowWidth_ = platform_->Width();
+    windowHeight_ = platform_->Height();
+    dpiScale_ = platform_->DpiScale();
 
     HandleKeyboardShortcuts();
     PollRuntimeLink();
 
-    ImGui_ImplDX11_NewFrame();
-    ImGui_ImplWin32_NewFrame();
+    platform_->NewFrame();
     ImGui::NewFrame();
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -617,13 +276,11 @@ void ConfiguratorApp::RenderFrame() {
     ShowMegaFuckerNotification(easterEggs_, &showMegaFuckerPopup_);
     DrawToastOverlay();
 
+
     ImGui::Render();
     const ImVec4 clear = GetThemeSettings().background;
     const float clearColor[4] = { clear.x, clear.y, clear.z, clear.w };
-    d3dContext_->OMSetRenderTargets(1, &renderTarget_, nullptr);
-    d3dContext_->ClearRenderTargetView(renderTarget_, clearColor);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    swapChain_->Present(1, 0);
+    platform_->Present(clearColor);
 
     // Present the click/drag first, then perform the cross-process update.
     // This prevents a slow or temporarily busy driver from making the button
@@ -1119,11 +776,11 @@ void ConfiguratorApp::DrawPageContent() {
     case Page::Performance: DrawPerformancePage(config_); break;
     case Page::Midi:        DrawMidiPage(config_); break;
     case Page::OfflineRenderer:
-        offlineRendererPage_.Draw(config_, hwnd_);
+        offlineRendererPage_.Draw(config_, static_cast<HWND>(platform_->NativeWindow()));
         break;
     case Page::LiveRecording:
         liveRecordingPage_.Draw(rlConnected_ ? &rlClient_ : nullptr,
-                                rlConnected_, hwnd_);
+                                rlConnected_, static_cast<HWND>(platform_->NativeWindow()));
         break;
     case Page::Reverb:      DrawReverbPage(config_); break;
     case Page::Limiter:     DrawLimiterPage(config_); break;

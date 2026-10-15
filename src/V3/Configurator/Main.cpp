@@ -8,7 +8,7 @@
 #include <shellapi.h>
 #include <string>
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     svms::cfg::ConfiguratorApp app;
 
     int argc = 0;
@@ -30,7 +30,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
     }
 
-    if (!app.Initialize(hInstance, argc, argv)) {
+    if (!app.Initialize(argc, argv)) {
         const wchar_t* detail = app.LastInitError();
         std::wstring message = (detail && detail[0] != L'\0')
             ? std::wstring(detail)
@@ -56,7 +56,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         // transient WRITE_DISCARD backing allocations. Sleep on the Win32
         // message queue instead; the restore message wakes us immediately.
         if (app.IsMinimized()) {
-            WaitMessage();
+            app.WaitForEvent();
             continue;
         }
         app.RenderFrame();
