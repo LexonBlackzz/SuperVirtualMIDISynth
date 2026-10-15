@@ -1,5 +1,6 @@
 #include "SVMSMPSCQueue.h"
 #include "SVMSStandaloneSynth.h"
+#include "SVMSRealtimeBlock.h"
 #include "SVMSSysEx.h"
 #include "SVMSNativeOffline.h"
 #include "SVMSBuildInfo.h"
@@ -24,6 +25,10 @@
 #include <fstream>
 #include <locale>
 #include <mutex>
+#include <pthread.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <new>
 #include <sched.h>
 #include <stdexcept>
@@ -686,6 +691,18 @@ private:
         size_t pendingHead = 0u;
         uint64_t outputFrame = 0u;
         uint32_t appliedLiveSeq = 0u;
+#if defined(__SSE2__)
+        // The Windows audio thread runs with flush-to-zero (SVMSAudioOutput.h);
+        // without it release tails drown the limiter and serial mix in denormals.
+        _mm_setcsr(_mm_getcsr() | 0x8040u);
+#endif
+        svms::RealtimeBlockRenderer blockRenderer;
+        std::vector<svms::RealtimeEvent> due;
+        // Best effort: the audio thread should not queue behind other work.
+        // Fails quietly without RT privileges (rtkit/limits.conf).
+        sched_param realtime{};
+        realtime.sched_priority = 20;
+        (void)pthread_setschedparam(pthread_self(), SCHED_FIFO, &realtime);
         while (running_.load(std::memory_order_acquire)) {
             const uint32_t liveSeq = liveSeq_.load(std::memory_order_acquire);
             if (liveSeq != appliedLiveSeq) {
@@ -720,30 +737,24 @@ private:
                     });
             }
             const uint64_t blockEnd = outputFrame + options_.bufferFrames;
-            uint32_t cursor = 0u;
+            // Every due event goes to RenderBlock in one batched call (see
+            // SVMSRealtimeBlock.h); the old per-event render/dispatch loop
+            // re-entered RenderBlock for each event.
+            due.clear();
             while (pendingHead < pending.size() &&
                    pending[pendingHead].targetFrame < blockEnd) {
-                const QueuedEvent& due = pending[pendingHead++];
-                const uint64_t writableFrame = outputFrame + cursor;
-                const uint64_t target = (std::max)(due.targetFrame,
-                                                   writableFrame);
-                const uint32_t span = uint32_t(target - writableFrame);
-                if (span) {
-                    synth_->Render(left.data() + cursor, right.data() + cursor,
-                                   span, writableFrame);
-                    cursor += span;
-                }
-                if (due.kind == EventKind::Reset)
-                    synth_->ResetAll(target);
-                else
-                    synth_->Dispatch(due.message, target);
-                dispatchedEvents_.fetch_add(1u, std::memory_order_relaxed);
+                const QueuedEvent& queued = pending[pendingHead++];
+                svms::RealtimeEvent event;
+                event.targetFrame = queued.targetFrame;
+                event.sequence = queued.sequence;
+                event.message = queued.message;
+                event.reset = queued.kind == EventKind::Reset;
+                due.push_back(event);
             }
-            if (cursor < options_.bufferFrames) {
-                synth_->Render(left.data() + cursor, right.data() + cursor,
-                               options_.bufferFrames - cursor,
-                               outputFrame + cursor);
-            }
+            blockRenderer.Render(*synth_, due.data(), due.size(), left.data(),
+                                 right.data(), options_.bufferFrames,
+                                 outputFrame);
+            dispatchedEvents_.fetch_add(due.size(), std::memory_order_relaxed);
             for (uint32_t frame = 0u; frame < options_.bufferFrames; ++frame) {
                 interleaved[size_t(frame) * 2u] = left[frame];
                 interleaved[size_t(frame) * 2u + 1u] = right[frame];

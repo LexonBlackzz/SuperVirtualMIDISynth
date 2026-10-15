@@ -249,6 +249,15 @@ if(NOT WIN32)
         target_link_libraries(svms_v3_voice_growth_tests PRIVATE Threads::Threads)
         add_test(NAME svms_v3_voice_growth COMMAND svms_v3_voice_growth_tests)
 
+        add_executable(svms_v3_realtime_block_tests
+            tests/SVMSRealtimeBlockTests.cpp
+            ${SVMS_PORTABLE_RENDER_SOURCES})
+        target_include_directories(svms_v3_realtime_block_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(svms_v3_realtime_block_tests PRIVATE Threads::Threads)
+        add_test(NAME svms_v3_realtime_block COMMAND svms_v3_realtime_block_tests)
+        set_tests_properties(svms_v3_realtime_block PROPERTIES SKIP_RETURN_CODE 77)
+
         add_executable(svms_v3_limiter_tests tests/SVMSLimiterTests.cpp)
         target_include_directories(svms_v3_limiter_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -809,6 +818,27 @@ if(NOT SVMS_XP_COMPAT)
     target_link_libraries(svms_v3_render PRIVATE svms_canonical_engine)
     set_target_properties(svms_v3_render PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    add_executable(svms_v3_realtime_block_tests
+        tests/SVMSRealtimeBlockTests.cpp
+        SVMSConfig.cpp
+        SVMSSoundFont.cpp
+        SVMSRenderKernels.cpp
+        SVMSRenderWorkers.cpp
+        SVMSRenderDispatch.cpp
+        SVMSRenderKernelsSSE2.cpp
+        SVMSRenderKernelsAVX2.cpp
+        SVMSGpuSynth.cpp
+        SVMSGpuDevice.cpp)
+    target_compile_definitions(svms_v3_realtime_block_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_realtime_block_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+    target_link_libraries(svms_v3_realtime_block_tests PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME svms_v3_realtime_block COMMAND svms_v3_realtime_block_tests
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../..")
+    set_tests_properties(svms_v3_realtime_block PROPERTIES SKIP_RETURN_CODE 77)
 
     # GPU synthesis proof spike (D3D11 compute). Offline-only, not XP. Proves
     # compute-shader sample synthesis matches the CPU scalar reference to the
