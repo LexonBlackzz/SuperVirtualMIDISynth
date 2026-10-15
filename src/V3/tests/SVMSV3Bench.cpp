@@ -18,6 +18,7 @@
 
 static float gBenchReleaseDecay = 0.9999999f;  // --release-ms
 static bool gBenchVelocitySpread = false;      // --velocity-spread
+static bool gBenchVelocityGain = false;        // --velocity-gain: note velocity scales the launch gain + spreads chopped-notes velocities
 static int gBenchFilterCents = -1;             // --filter-cents: SF2 low-pass on every voice (-1 = none)
 static uint32_t gBenchReleaseSamples = 0u;      // counted tail (live SF2 semantics)
 
@@ -103,6 +104,7 @@ struct Options {
     bool vibratoLfo = false;
     bool decimation = false;
     bool decimationByLevel = false;
+    bool stealReject = false;
     uint32_t cullMutedBlocks = 0u;
     uint32_t rotationMode = 0u;  // 0 coherent, 1 analytic, 2 sweep, 3 diffuse, 4 random
     bool transactionalLaunch = true;
@@ -259,6 +261,10 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         } else if (std::strcmp(argv[i], "--decimation-by-level") == 0) {
             options.decimation = true;
             options.decimationByLevel = true;
+        } else if (std::strcmp(argv[i], "--steal-reject") == 0) {
+            options.stealReject = true;
+        } else if (std::strcmp(argv[i], "--velocity-gain") == 0) {
+            gBenchVelocityGain = true;
         } else if (std::strcmp(argv[i], "--decimation") == 0) {
             options.decimation = true;
         } else if (std::strcmp(argv[i], "--vibrato-lfo") == 0) {
@@ -487,6 +493,15 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
             PrepareSyntheticLaunchPlan(localSetups, count, sampleFrames, note,
                                        attackFrames);
             setups = localSetups;
+        }
+        if (gBenchVelocityGain) {
+            static svms::VoiceConfiguration velocityScaled[8];
+            for (uint32_t layer = 0u; layer < count; ++layer) {
+                velocityScaled[layer] = setups[layer];
+                velocityScaled[layer].initialGain *=
+                    static_cast<float>(velocity) * (1.0f / 127.0f);
+            }
+            setups = velocityScaled;
         }
         if (prepareBegin != 0u)
             gLaunchPrepareCycles += ScaledProfileDelta(
@@ -782,6 +797,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot allocate voice storage\n");
         return 3;
     }
+    voices->SetStealReject(options.stealReject);
     if (options.genericVoices != 0u) {
         std::fprintf(stderr, "[diag] after configure: active=%u generic=%u rloop=%u\n",
                      voices->GetActiveCount(),
@@ -892,7 +908,9 @@ int main(int argc, char** argv) {
                 on.type = svms::RenderEventType::NoteOn;
                 on.channel = channel;
                 on.data1 = note;
-                on.data2 = 127u;
+                on.data2 = gBenchVelocityGain
+                    ? static_cast<uint8_t>(1u + (noteIndex * 2654435761u >> 25u) % 127u)
+                    : 127u;
                 svms::RenderEvent& off = events[noteIndex * 2u + 1u];
                 off.frameOffset = (frame + options.noteLengthFrames +
                                    copy * options.duplicateJitter) %
@@ -1451,6 +1469,9 @@ int main(int argc, char** argv) {
         (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseReservation),
         (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseScalarVibrato),
         (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseForced));
+    std::fprintf(stderr, "{\"steal_reject\":{\"enabled\":%d,\"rejected\":%llu}}\n",
+                 options.stealReject ? 1 : 0,
+                 (unsigned long long)voices->StealRejectCount());
     // Duplicate/merge census: the block's event count before and after the
     // merge pass, and what the pool holds against what it would hold
     // unmerged (sum of multiplicities over live voices).

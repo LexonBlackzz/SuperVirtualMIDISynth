@@ -540,6 +540,7 @@ bool Driver::Initialize() {
     voiceManager = new VoiceManager();
     voiceManager->SetStealPolicy(cfg.stealPolicy);
     voiceManager->SetPerKeyVoiceCap(cfg.perKeyVoiceCap);
+    voiceManager->SetStealReject(cfg.stealReject);
     if (!voiceManager->Initialize(cfg.maxVoices, sampleRate)) {
         LOG("FAILED: Could not allocate voice storage maxVoices=%u",
             cfg.maxVoices);

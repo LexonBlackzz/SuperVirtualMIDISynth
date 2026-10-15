@@ -229,6 +229,15 @@ class VoiceManager {
 public:
     void SetStealPolicy(uint32_t policy);
     void SetPerKeyVoiceCap(uint32_t cap) { perKeyVoiceCap_ = cap; }
+    // Opt-in (default off) BASSMIDI-style victim-score reject: with a full
+    // pool, a single-layer note-on whose steal score is strictly worse than
+    // the voice it would replace never launches (no ghost, no configure, the
+    // victim keeps playing). Quality steal policy only.
+    void SetStealReject(bool on) { stealReject_ = on; }
+    uint64_t StealRejectCount() const { return stealRejectCount_; }
+    // True when the most recent LaunchVoiceGroup returned false because the
+    // reject fired (not an allocation failure).
+    bool LastLaunchRejected() const { return lastLaunchRejected_; }
     // Live still-playing voice count for one (channel,note) — test and
     // telemetry readout backing the per-key voice cap.
     uint32_t GetChannelKeyVoiceCount(uint8_t channel, uint8_t note) const {
@@ -898,6 +907,12 @@ private:
     // pool state on a switch back to Quality.
     uint32_t stealPolicy_ = 0u;  // 0 quality, 1 cursor, 2 scan
     uint32_t perKeyVoiceCap_ = 0u;  // 0 = off; else max playing voices per (channel,key)
+    bool stealReject_ = false;
+    bool lastLaunchRejected_ = false;
+    uint64_t stealRejectCount_ = 0u;
+    bool ShouldRejectNoteOn(const VoiceConfiguration& setup,
+                            const ChannelParamsSnapshot& cp,
+                            uint32_t multiplicity);
     uint32_t stealScanCursor_ = 0u;  // rotating scan window (policy 2)
     uint32_t stealCursor_ = 0u;
     uint8_t* stealCandidateDeferred_;
@@ -3494,6 +3509,51 @@ inline uint32_t VoiceManager::PopStealCandidates(uint32_t count,
 // allocation loop), so it sifts back to the root the pop assumed. Heap-array
 // order may differ from the pre-pop arrangement, but the heap is fully
 // ordered by unique keys, so every subsequent selection is identical.
+inline bool VoiceManager::ShouldRejectNoteOn(
+    const VoiceConfiguration& setup, const ChannelParamsSnapshot& cp,
+    uint32_t multiplicity) {
+    if (FastSteal() || perKeyVoiceCap_ != 0u || setup.exclusiveClass != 0u ||
+        freeTop_ != 0u || activeCount_ < voiceLimit_ || activeCount_ == 0u)
+        return false;
+    if (!stealHeapValid_) BuildStealHeap();
+    VoiceHandle victim = kInvalidVoice;
+    if (ReleasingRingEligible()) {
+        uint32_t position = 0u;
+        victim = NextValidReleasingRingVictim(position, false);
+    } else {
+        if (!stealVolatileHeapValid_) BuildVolatileStealHeap();
+        uint64_t bestKey = 0u;
+        if (stealHeapCount_ > 0u) {
+            const uint64_t rootKey = stealWinnerTree_[1];
+            const uint32_t position = UINT32_MAX - static_cast<uint32_t>(rootKey);
+            if (rootKey == 0u || position >= activeCount_) return false;
+            victim = static_cast<VoiceHandle>(activeList_[position]);
+            bestKey = rootKey;
+        }
+        if (stealVolatileHeapCount_ > 0u) {
+            const uint64_t key = stealVolatileHeapKey_[0];
+            if (victim == kInvalidVoice || key > bestKey) {
+                const uint32_t position = UINT32_MAX - static_cast<uint32_t>(key);
+                if (key == 0u || position >= activeCount_) return false;
+                victim = stealVolatileHeapHandle_[0];
+            }
+        }
+    }
+    if (victim == kInvalidVoice || victim >= maxVoices_ ||
+        v.state[victim] == static_cast<uint8_t>(VoiceState::Free))
+        return false;
+    // Newborn score: age 0, level = |initialGain| * stereo energy norm of the
+    // mix gains (what ApplyVoiceConfigurationFields caches as stealOutputGain,
+    // merged-launch multiplicity included).
+    const float scale = multiplicity > 1u ? static_cast<float>(multiplicity) : 1.0f;
+    const float mixL = setup.gainLeft * scale * cp.mixScaleLeft;
+    const float mixR = setup.gainRight * scale * cp.mixScaleRight;
+    const float level = std::fabs(setup.initialGain) *
+        std::sqrt(mixL * mixL + mixR * mixR);
+    const float newbornScore = 0.0f - level * kBassMidiStealGainScale;
+    return newbornScore > ComputeStealScore(victim);
+}
+
 inline void VoiceManager::InsertPreselectedVictim(VoiceHandle victim) {
     if (FastSteal()) return;
     // The sequential path builds the volatile heap before any selection that
@@ -5012,9 +5072,18 @@ inline bool VoiceManager::LaunchVoiceGroup(
     const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
     const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles,
     uint32_t blockOffset, uint32_t multiplicity) {
+    lastLaunchRejected_ = false;
     if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
         count > voiceLimit_)
         return false;
+    if (stealReject_ && count == 1u && ShouldRejectNoteOn(setups[0], channelParams,
+                                           multiplicity)) {
+        // Pairing note-offs sees no voice for this generation, exactly as if
+        // the note had been launched and stolen before it rendered.
+        lastLaunchRejected_ = true;
+        ++stealRejectCount_;
+        return false;
+    }
     // Scope the multiplicity to this launch: ApplyVoiceConfigurationFields
     // reads launchMult_, and every return path below must restore it.
     struct MultiplicityScope {

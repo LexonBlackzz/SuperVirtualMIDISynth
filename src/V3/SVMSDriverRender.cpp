@@ -2033,7 +2033,8 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
             channel, note, velocity, launchSetups, matchCount, playIndex,
             channelCache->GetParams()[channel], noteLaunchHandles_,
             blockOffset, multiplicity)) {
-        ++telemetry_.allocationFailures;
+        if (!voiceManager->LastLaunchRejected())
+            ++telemetry_.allocationFailures;
         return matchCount;
     }
 

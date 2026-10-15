@@ -5859,6 +5859,58 @@ void TestWholeVoiceScalarVibratoDifferential() {
 
 } // namespace
 
+void TestStealReject() {
+    svms::ChannelParamsSnapshot channel{};
+    channel.volume = channel.expression = 1.0f;
+    channel.panLeft = channel.panRight = 0.70710678f;
+    channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
+    auto makeSetup = [](float gain, uint32_t playIndex) {
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 128u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 120u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep = 1.0f;
+        setup.initialGain = setup.sustainLevel = gain;
+        setup.releaseDecay = 0.999f;
+        setup.gainLeft = setup.gainRight = 0.1f;
+        setup.playIndex = playIndex;
+        return setup;
+    };
+    for (const bool reject : {false, true}) {
+        auto voices = std::make_unique<svms::VoiceManager>();
+        Check(voices->Initialize(2u, 44100u), "steal reject fixture allocates two voices");
+        voices->SetStealReject(reject);
+        svms::VoiceHandle handles[1] = {svms::kInvalidVoice};
+        for (uint32_t i = 0u; i < 2u; ++i) {
+            const svms::VoiceConfiguration loud = makeSetup(1.0f, i + 1u);
+            Check(voices->LaunchVoiceGroup(0u, static_cast<uint8_t>(60u + i), 127u,
+                                           &loud, 1u, i + 1u, channel, handles),
+                  "steal reject fixture fills the pool with loud voices");
+        }
+        voices->SetCurrentFrame(64u);
+        const svms::VoiceConfiguration quiet = makeSetup(0.001f, 10u);
+        const bool quietLaunched = voices->LaunchVoiceGroup(
+            0u, 70u, 20u, &quiet, 1u, 10u, channel, handles);
+        Check(quietLaunched == !reject,
+              "a note quieter than every live voice is dropped only when the reject is on");
+        Check(voices->LastLaunchRejected() == reject &&
+                  voices->StealRejectCount() == (reject ? 1u : 0u),
+              "the reject is reported separately from an allocation failure");
+        Check(voices->GetActiveCount() == 2u &&
+                  voices->GetChannelKeyVoiceCount(0u, 60u) +
+                          voices->GetChannelKeyVoiceCount(0u, 61u) ==
+                      (reject ? 2u : 1u),
+              "a rejected note leaves the pool untouched; an accepted one steals");
+        const svms::VoiceConfiguration loudNew = makeSetup(1.0f, 11u);
+        Check(voices->LaunchVoiceGroup(0u, 72u, 127u, &loudNew, 1u, 11u,
+                                       channel, handles) &&
+                  !voices->LastLaunchRejected(),
+              "a loud note still steals with the reject on");
+    }
+}
+
 void TestPerKeyVoiceCap() {
     svms::ChannelParamsSnapshot channel{};
     channel.volume = channel.expression = 1.0f;
@@ -7627,6 +7679,7 @@ int main() {
     TestPerChannelLimiterDifferential();
     TestWholeVoiceProductionGateParity();
     TestPerKeyVoiceCap();
+    TestStealReject();
     TestExclusiveClassLifecycle();
     TestSfzParserAndPlayback();
 

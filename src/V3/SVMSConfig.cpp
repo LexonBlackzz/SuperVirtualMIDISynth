@@ -416,6 +416,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"retire_threshold", cfg.voiceRetireThreshold},
             {"steal_policy", cfg.stealPolicy},
             {"per_key_voice_cap", cfg.perKeyVoiceCap},
+            {"steal_reject", cfg.stealReject},
             {"ghost_budget", cfg.ghostBudget}
         }},
 
@@ -859,6 +860,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "voices.steal_policy");
         if (!ReadValue(*it, "per_key_voice_cap", cfg.perKeyVoiceCap, 0u, 256u))
             AppendWarning(cfg.configWarning, "voices.per_key_voice_cap");
+        if (!ReadBool(*it, "steal_reject", cfg.stealReject))
+            AppendWarning(cfg.configWarning, "voices.steal_reject");
         if (!ReadValue(*it, "ghost_budget", cfg.ghostBudget, 0u, 65536u))
             AppendWarning(cfg.configWarning, "voices.ghost_budget");
     }
@@ -1017,6 +1020,7 @@ EngineConfig EngineConfig::Default() {
     cfg.voiceRetireThreshold = 0.00177828f;  // -55 dB (owner-chosen default)
     cfg.stealPolicy = 0;
     cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
+    cfg.stealReject = false;  // opt-in: every note-on launches by default
     cfg.decimation = false;  // opt-in: every voice mixes by default
     cfg.decimationByLevel = true;  // only matters once decimation is on
     cfg.decimationCullBlocks = 5u;  // only matters once decimation is on

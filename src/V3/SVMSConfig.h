@@ -139,6 +139,10 @@ struct EngineConfig {
     // already playing at the cap replaces the oldest key member instead of
     // growing the pileup. syndrv-style; release tails never count.
     uint32_t perKeyVoiceCap;
+    // Opt-in (default off): drop a note-on that would be the first steal
+    // victim anyway (BASSMIDI-style) instead of launching it. Changes which
+    // notes sound under saturation; Quality steal policy only.
+    bool stealReject;
     // Thread affinity policy: 0 off, 1 RT threads -> P-cores,
     // 2 + workers -> E-cores. No-op on single-class CPUs and XP.
     uint32_t threadAffinityMode;
