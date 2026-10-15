@@ -1,15 +1,21 @@
 #include "PageDiagnostics.h"
+#include "PlatformUtil.h"
 #include "ConfigDocument.h"
 #include "Theme.h"
 #include "Widgets.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <dxgi.h>
+#else
+#include <fstream>
+#include <sys/sysinfo.h>
+#endif
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -20,21 +26,15 @@
 #include <string>
 #include <thread>
 
+#ifdef _WIN32
 #pragma comment(lib, "dxgi.lib")
+#endif
 
 namespace svms::cfg {
 namespace {
 
 std::string WideToUtf8Diag(const std::wstring& ws) {
-    if (ws.empty()) return {};
-    const int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(),
-                                        static_cast<int>(ws.size()),
-                                        nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
-    std::string result(static_cast<size_t>(len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()),
-                        result.data(), len, nullptr, nullptr);
-    return result;
+    return svms::cfg::util::WideToUtf8(ws);
 }
 
 std::string CpuName() {
@@ -55,13 +55,28 @@ std::string CpuName() {
             return s.substr(first, last - first + 1);
     }
 #endif
+#ifdef _WIN32
     SYSTEM_INFO si{};
     GetNativeSystemInfo(&si);
     return std::string("Windows CPU (") +
            std::to_string(si.dwNumberOfProcessors) + " logical processors)";
+#else
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    for (std::string line; std::getline(cpuinfo, line);) {
+        if (line.compare(0, 10, "model name") != 0) continue;
+        const auto colon = line.find(':');
+        if (colon != std::string::npos && colon + 2 <= line.size())
+            return line.substr(colon + 2);
+    }
+    return std::string("Linux CPU (") +
+           std::to_string(std::thread::hardware_concurrency()) + " logical processors)";
+#endif
 }
 
 std::string GpuName() {
+#ifndef _WIN32
+    return "Unavailable";
+#else
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),
                                   reinterpret_cast<void**>(&factory)))) {
@@ -85,9 +100,22 @@ std::string GpuName() {
     }
     factory->Release();
     return result;
+#endif
 }
 
 void MemoryText(char* out, size_t outSize) {
+#ifndef _WIN32
+    struct sysinfo si{};
+    if (sysinfo(&si) != 0) {
+        std::snprintf(out, outSize, "Unavailable");
+        return;
+    }
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    const double total = static_cast<double>(si.totalram) * si.mem_unit / kGiB;
+    const double freeRam = static_cast<double>(si.freeram + si.bufferram) * si.mem_unit / kGiB;
+    std::snprintf(out, outSize, "%.1f / %.1f GB used", total - freeRam, total);
+    return;
+#else
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof(ms);
     if (!GlobalMemoryStatusEx(&ms)) {
@@ -98,6 +126,7 @@ void MemoryText(char* out, size_t outSize) {
     const double total = static_cast<double>(ms.ullTotalPhys) / kGiB;
     const double used = static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / kGiB;
     std::snprintf(out, outSize, "%.1f / %.1f GB used", used, total);
+#endif
 }
 
 void KeyValue(const char* key, const char* value, bool wrap = false) {

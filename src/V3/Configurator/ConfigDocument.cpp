@@ -1,13 +1,12 @@
 #include "ConfigDocument.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#include "PlatformUtil.h"
+#ifndef _WIN32
+#include <unistd.h>
 #endif
-#include <windows.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -15,34 +14,23 @@ namespace svms::cfg {
 namespace {
 
 using json = nlohmann::json;
-namespace fs = std::filesystem;
 
 std::string WideToUtf8(const std::wstring& value) {
-    if (value.empty()) return {};
-    int count = WideCharToMultiByte(CP_UTF8, 0, value.data(),
-                                    static_cast<int>(value.size()),
-                                    nullptr, 0, nullptr, nullptr);
-    if (count <= 0) return {};
-    std::string result(static_cast<size_t>(count), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-                        result.data(), count, nullptr, nullptr);
-    return result;
+    return util::WideToUtf8(value);
 }
 
 std::wstring Utf8ToWide(const std::string& value) {
-    if (value.empty()) return {};
-    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                    value.data(), static_cast<int>(value.size()),
-                                    nullptr, 0);
-    if (count <= 0) return {};
-    std::wstring result(static_cast<size_t>(count), L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                        static_cast<int>(value.size()), result.data(), count);
-    return result;
+    return util::Utf8ToWide(value);
 }
 
 constexpr uint32_t kConfigSchemaVersion = 1;
 constexpr uint64_t kMaxProfileBytes = 16ull * 1024ull * 1024ull;
+
+#ifdef _WIN32
+unsigned long CurrentProcessId() { return GetCurrentProcessId(); }
+#else
+unsigned long CurrentProcessId() { return static_cast<unsigned long>(getpid()); }
+#endif
 
 bool WriteJsonAtomic(const fs::path& path, const json& root,
                      bool preserveBackup, std::string* error) {
@@ -66,7 +54,7 @@ bool WriteJsonAtomic(const fs::path& path, const json& root,
     }
 
     fs::path temp = path;
-    temp += L".tmp." + std::to_wstring(GetCurrentProcessId());
+    temp += L".tmp." + std::to_wstring(CurrentProcessId());
     {
         std::ofstream output(temp, std::ios::binary | std::ios::trunc);
         if (!output) return fail("could not create the temporary file");
@@ -74,16 +62,24 @@ bool WriteJsonAtomic(const fs::path& path, const json& root,
         output.flush();
         if (!output) {
             output.close();
-            DeleteFileW(temp.c_str());
+            fs::remove(temp, ec);
             return fail("could not write the complete profile");
         }
     }
 
+#ifdef _WIN32
     if (!MoveFileExW(temp.c_str(), path.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileW(temp.c_str());
         return fail("could not atomically replace the destination file");
     }
+#else
+    fs::rename(temp, path, ec);
+    if (ec) {
+        fs::remove(temp, ec);
+        return fail("could not atomically replace the destination file");
+    }
+#endif
     if (error) error->clear();
     return true;
 }
@@ -208,6 +204,7 @@ void ConfigDocument::FromJson(const json& root) {
     if (auto it = root.find("audio"); it != root.end() && it->is_object()) {
         ReadString(*it, "backend", working_.audioBackend);
         ReadString(*it, "device", working_.audioDevice);
+        ReadString(*it, "linux_device", working_.linuxDevice);
         ReadNum(*it, "sample_rate", working_.sampleRate, 8000u, 384000u);
         ReadNum(*it, "buffer_frames", working_.bufferFrames, 16u, 8192u);
     }
@@ -381,6 +378,7 @@ nlohmann::json ConfigDocument::ToJson() const {
 
     root["audio"]["backend"] = WideToUtf8(working_.audioBackend);
     root["audio"]["device"] = WideToUtf8(working_.audioDevice);
+    root["audio"]["linux_device"] = WideToUtf8(working_.linuxDevice);
     root["audio"]["sample_rate"] = working_.sampleRate;
     root["audio"]["buffer_frames"] = working_.bufferFrames;
 
@@ -693,6 +691,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.midiInputEnabled == b.midiInputEnabled
         && a.midiInputDevice == b.midiInputDevice
         && a.audioDevice == b.audioDevice
+        && a.linuxDevice == b.linuxDevice
         && a.audioBackend == b.audioBackend
         && a.soundFontPath == b.soundFontPath
         && a.soundFontPaths == b.soundFontPaths

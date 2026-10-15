@@ -8,7 +8,7 @@
 #include "PageOffline.h"
 #include "PageLiveRecording.h"
 #include "Platform.h"
-#include "../SVMSRuntimeLink.h"
+#include "DriverLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
 #include <algorithm>
@@ -35,6 +35,7 @@ enum class Page {
     Advanced,
     About,
     Synth,
+    DriverFeatures,  // Linux: schema-driven page for controls this build has no page for
     PageCount
 };
 

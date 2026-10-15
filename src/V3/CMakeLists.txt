@@ -302,6 +302,67 @@ if(NOT WIN32)
             COMMAND svms_v3_linux_native_api_smoke $<TARGET_FILE:omnimidi>)
     endif()
 
+    # ── Linux configurator (SDL2 + OpenGL3 + Dear ImGui) ──────────────────
+    # Needs SDL2 and OpenGL development files (libsdl2-dev, libgl1-mesa-dev,
+    # pkg-config); skipped with a notice when they are missing.
+    option(SVMS_BUILD_CONFIGURATOR "Build the Linux configurator" ON)
+    if(SVMS_BUILD_CONFIGURATOR)
+        find_package(PkgConfig QUIET)
+        if(PKG_CONFIG_FOUND)
+            pkg_check_modules(SVMS_SDL2 QUIET IMPORTED_TARGET sdl2)
+        endif()
+        find_package(OpenGL QUIET)
+        if(SVMS_SDL2_FOUND AND OPENGL_FOUND)
+            set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/imgui")
+            add_executable(svms_configurator
+                Configurator/Main_Linux.cpp
+                Configurator/ConfiguratorApp.cpp
+                Configurator/Platform_SDL2.cpp
+                Configurator/PlatformUtil.cpp
+                Configurator/ConfigDocument.cpp
+                Configurator/Theme.cpp
+                Configurator/Widgets.cpp
+                Configurator/EasterEggs.cpp
+                Configurator/UpdateService.cpp
+                Configurator/PageOverview.cpp
+                Configurator/PageAudio.cpp
+                Configurator/PagePerformance.cpp
+                Configurator/PageMidi.cpp
+                Configurator/PageOffline.cpp
+                Configurator/PageLiveRecording.cpp
+                Configurator/PageReverb.cpp
+                Configurator/PageLimiter.cpp
+                Configurator/PageChannelLimiter.cpp
+                Configurator/PageDiagnostics.cpp
+                Configurator/PageAdvanced.cpp
+                Configurator/PageAbout.cpp
+                Configurator/PageDriverFeatures.cpp
+                SVMSControlServer.cpp
+                ${IMGUI_DIR}/imgui.cpp
+                ${IMGUI_DIR}/imgui_draw.cpp
+                ${IMGUI_DIR}/imgui_tables.cpp
+                ${IMGUI_DIR}/imgui_widgets.cpp
+                ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
+                ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp)
+            target_include_directories(svms_configurator PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}"
+                "${IMGUI_DIR}"
+                "${IMGUI_DIR}/backends"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party")
+            target_compile_options(svms_configurator PRIVATE -Wall -Wno-unused-parameter)
+            target_link_libraries(svms_configurator PRIVATE
+                PkgConfig::SVMS_SDL2 OpenGL::GL Threads::Threads ${CMAKE_DL_LIBS})
+            set_target_properties(svms_configurator PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+            set(SVMS_CONFIGURATOR_TARGET svms_configurator)
+        else()
+            message(STATUS "SVMS: Linux configurator skipped (SDL2/OpenGL development files not found)")
+        endif()
+    endif()
+
+    if(TARGET svms_configurator)
+        install(TARGETS svms_configurator RUNTIME DESTINATION bin)
+    endif()
     install(TARGETS svmsd svms_v3_render omnimidi
         RUNTIME DESTINATION bin
         LIBRARY DESTINATION lib)
@@ -869,6 +930,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/Main.cpp
         Configurator/ConfiguratorApp.cpp
         Configurator/Platform_Win32.cpp
+        Configurator/PlatformUtil.cpp
         Configurator/ConfigDocument.cpp
         Configurator/Theme.cpp
         Configurator/Widgets.cpp

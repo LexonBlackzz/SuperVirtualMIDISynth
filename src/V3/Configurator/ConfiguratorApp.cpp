@@ -6,13 +6,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 
-#ifdef _WIN32
-// Offline/live-recording pages still take an HWND for native file dialogs.
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
+#include "PlatformUtil.h"  // HWND (opaque on Linux) for the page draw calls
 
 #include "PageOverview.h"
 #include "PageAudio.h"
@@ -26,6 +20,9 @@
 #include "PageDiagnostics.h"
 #include "PageAdvanced.h"
 #include "PageAbout.h"
+#ifndef _WIN32
+#include "PageDriverFeatures.h"
+#endif
 
 #include <cstdio>
 #include <vector>
@@ -574,6 +571,9 @@ void ConfiguratorApp::DrawChainStrip(float y) {
         {"Offline renderer", Page::OfflineRenderer},
         {"Live recording", Page::LiveRecording},
         {"Diagnostics", Page::Diagnostics},
+#ifndef _WIN32
+        {"Driver features", Page::DriverFeatures},
+#endif
         {"Advanced / theme", Page::Advanced},
         {"About", Page::About}};
     const char* toolLabel = "TOOLS";
@@ -788,6 +788,11 @@ void ConfiguratorApp::DrawPageContent() {
     case Page::Diagnostics: DrawDiagnosticsPage(config_); break;
     case Page::Advanced:    DrawAdvancedPage(config_); break;
     case Page::About:       DrawAboutPage(config_, updateService_); break;
+    case Page::DriverFeatures:
+#ifndef _WIN32
+        DrawDriverFeaturesPage(rlConnected_ ? &rlClient_ : nullptr);
+#endif
+        break;
     }
     EndAutoPanels();
 }

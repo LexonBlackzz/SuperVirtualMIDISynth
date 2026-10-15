@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "PageOffline.h"
 
 #include "ConfigDocument.h"
@@ -676,3 +677,26 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
 }
 
 } // namespace svms::cfg
+
+#else  // Linux
+#include "PageOffline.h"
+#include "ConfigDocument.h"
+#include "imgui.h"
+
+namespace svms::cfg {
+
+OfflineRendererPage::~OfflineRendererPage() = default;
+
+void OfflineRendererPage::Shutdown() {}
+
+void OfflineRendererPage::Draw(ConfigDocument&, HWND) {
+    ImGui::TextWrapped(
+        "Offline rendering on Linux uses the svms_v3_render command line tool "
+        "shipped beside this program:");
+    ImGui::Spacing();
+    ImGui::TextDisabled("svms_v3_render song.mid --soundfont gm.sf2 --output song.wav");
+}
+
+} // namespace svms::cfg
+
+#endif  // _WIN32

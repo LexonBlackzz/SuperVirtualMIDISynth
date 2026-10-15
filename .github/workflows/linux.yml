@@ -48,7 +48,8 @@ jobs:
               trap "chmod -R a+rwX .ccache 2>/dev/null || true" EXIT
               apt-get -o Acquire::Retries=5 update
               DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
-                build-essential ca-certificates ccache ninja-build libasound2-dev wget
+                build-essential ca-certificates ccache ninja-build libasound2-dev wget \
+                pkg-config libsdl2-dev libgl1-mesa-dev
               wget -q https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-linux-x86_64.tar.gz
               tar -xzf cmake-3.27.9-linux-x86_64.tar.gz -C /opt
               export PATH=/opt/cmake-3.27.9-linux-x86_64/bin:$PATH
@@ -61,9 +62,11 @@ jobs:
               ccache -s
               ctest --test-dir build/V3-linux-bionic --output-on-failure
               build/V3-linux-bionic/bin/svmsd --help
+              test -x build/V3-linux-bionic/bin/svms_configurator
               mkdir -p build/SVMS-V3-linux-x86_64
               cp build/V3-linux-bionic/bin/svmsd \
                  build/V3-linux-bionic/bin/svms_v3_render \
+                 build/V3-linux-bionic/bin/svms_configurator \
                  build/SVMS-V3-linux-x86_64/
               cp build/V3-linux-bionic/libOmniMIDI.so \
                  build/V3-linux-bionic/libsvmsapi.so \

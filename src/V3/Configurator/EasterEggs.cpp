@@ -4,10 +4,8 @@
 #include <string>
 #include <algorithm>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include <cctype>
+#include <cstdlib>
 
 namespace svms::cfg {
 
@@ -22,11 +20,11 @@ EasterEggState RollEasterEggs(int argc, char** argv) {
         }
     }
     if (!forceMegaFucker) {
-        wchar_t envVal[8]{};
-        if (GetEnvironmentVariableW(L"SVMS_FORCE_MEGAFUCKER", envVal, 8) > 0) {
-            std::wstring lower(envVal);
-            std::transform(lower.begin(), lower.end(), lower.begin(), towlower);
-            if (lower == L"1" || lower == L"true" || lower == L"yes")
+        if (const char* envVal = std::getenv("SVMS_FORCE_MEGAFUCKER")) {
+            std::string lower(envVal);
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lower == "1" || lower == "true" || lower == "yes")
                 forceMegaFucker = true;
         }
     }

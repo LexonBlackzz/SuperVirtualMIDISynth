@@ -1,10 +1,7 @@
 #ifndef SVMS_CONFIGURATOR_PAGE_LIVE_RECORDING_H
 #define SVMS_CONFIGURATOR_PAGE_LIVE_RECORDING_H
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "PlatformUtil.h"
 
 #include <cstdint>
 #include <string>

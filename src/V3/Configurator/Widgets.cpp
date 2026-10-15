@@ -4,7 +4,7 @@
 #include "Theme.h"
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "../SVMSRuntimeLink.h"
+#include "DriverLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 #include <cmath>
 #include <cctype>

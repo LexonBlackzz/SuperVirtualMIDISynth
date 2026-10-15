@@ -1,18 +1,15 @@
 #include "PageAdvanced.h"
+#include "PlatformUtil.h"
 #include "ConfigDocument.h"
 #include "Theme.h"
 #include "Widgets.h"
 #include "imgui.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <shellapi.h>
+#ifdef _WIN32
 #include <commdlg.h>
+#endif
 
 #include <algorithm>
-#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -20,15 +17,7 @@ namespace svms::cfg {
 namespace {
 
 std::string WideToUtf8Adv(const std::wstring& ws) {
-    if (ws.empty()) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(),
-                                  static_cast<int>(ws.size()),
-                                  nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
-    std::string s(static_cast<size_t>(len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()),
-                        s.data(), len, nullptr, nullptr);
-    return s;
+    return svms::cfg::util::WideToUtf8(ws);
 }
 
 bool ThemeColorRow(const char* label, const char* id, ImVec4& color) {
@@ -66,7 +55,21 @@ std::wstring lastProfileDirectory;
 std::string profileStatus;
 bool profileStatusError = false;
 
-bool SelectProfileFile(HWND owner, bool save, std::wstring& path) {
+bool SelectProfileFile(void* owner, bool save, std::wstring& path) {
+#ifndef _WIN32
+    (void)owner;
+    std::string chosen;
+    if (!util::PickFile(save, save ? "Export SVMS profile" : "Import SVMS profile",
+                        util::WideToUtf8(lastProfileDirectory), "*.json", chosen))
+        return false;
+    path = util::Utf8ToWide(chosen);
+    try {
+        lastProfileDirectory = fs::path(path).parent_path().wstring();
+    } catch (const fs::filesystem_error&) {
+        lastProfileDirectory.clear();
+    }
+    return true;
+#else
     std::vector<wchar_t> buffer(32768u, L'\0');
     if (save) {
         const wchar_t* initialName = L"svms-profile.json";
@@ -76,7 +79,7 @@ bool SelectProfileFile(HWND owner, bool save, std::wstring& path) {
         L"SVMS JSON profiles (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = owner;
+    ofn.hwndOwner = static_cast<HWND>(owner);
     ofn.lpstrFilter = filter;
     ofn.lpstrFile = buffer.data();
     ofn.nMaxFile = static_cast<DWORD>(buffer.size());
@@ -92,19 +95,20 @@ bool SelectProfileFile(HWND owner, bool save, std::wstring& path) {
     path = buffer.data();
     try {
         lastProfileDirectory =
-            std::filesystem::path(path).parent_path().wstring();
-    } catch (const std::filesystem::filesystem_error&) {
+            fs::path(path).parent_path().wstring();
+    } catch (const fs::filesystem_error&) {
         lastProfileDirectory.clear();
     }
     return true;
+#endif
 }
 
-HWND MainViewportWindow() {
+void* MainViewportWindow() {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     if (!viewport) return nullptr;
     void* handle = viewport->PlatformHandleRaw
         ? viewport->PlatformHandleRaw : viewport->PlatformHandle;
-    return static_cast<HWND>(handle);
+    return handle;
 }
 
 } // namespace
@@ -356,13 +360,11 @@ void DrawAdvancedPage(ConfigDocument& doc) {
         std::wstring folder = path;
         const auto pos = folder.find_last_of(L"\\/");
         if (pos != std::wstring::npos) folder.resize(pos);
-        ShellExecuteW(nullptr, L"open", folder.c_str(),
-                      nullptr, nullptr, SW_SHOWDEFAULT);
+        util::OpenExternal(WideToUtf8Adv(folder));
     }
     ImGui::SameLine();
     if (ImGui::Button("Open config.json")) {
-        ShellExecuteW(nullptr, L"open", path.c_str(),
-                      nullptr, nullptr, SW_SHOWDEFAULT);
+        util::OpenExternal(WideToUtf8Adv(path));
     }
 
     ImGui::Spacing();

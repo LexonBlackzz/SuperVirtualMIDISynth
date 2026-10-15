@@ -1,9 +1,11 @@
+#ifdef _WIN32
 #include "PageLiveRecording.h"
+#include "PlatformUtil.h"
 
 #include "Theme.h"
 #include "Widgets.h"
 #include "SVMSBuildInfo.h"
-#include "../SVMSRuntimeLink.h"
+#include "DriverLink.h"
 #include "imgui.h"
 
 #include <cerrno>
@@ -19,16 +21,7 @@ namespace svms::cfg {
 namespace {
 
 std::string WideToUtf8(const std::wstring& value) {
-    if (value.empty()) return {};
-    const int count = WideCharToMultiByte(
-        CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
-        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (count <= 0) return {};
-    std::string result(static_cast<size_t>(count), '\0');
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
-                            static_cast<int>(value.size()), result.data(),
-                            count, nullptr, nullptr) != count) return {};
-    return result;
+    return svms::cfg::util::WideToUtf8(value);
 }
 
 bool ParseU64(const char* begin, char** end, uint64_t& value) {
@@ -279,3 +272,17 @@ void LiveRecordingPage::Draw(svms::RuntimeLinkClient* client,
 }
 
 } // namespace svms::cfg
+
+#else  // Linux
+#include "PageLiveRecording.h"
+#include "imgui.h"
+
+namespace svms::cfg {
+
+void LiveRecordingPage::Draw(svms::RuntimeLinkClient*, bool, HWND) {
+    ImGui::TextWrapped("Live recording is not available for the Linux driver yet.");
+}
+
+} // namespace svms::cfg
+
+#endif  // _WIN32

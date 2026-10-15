@@ -5,11 +5,7 @@
 #include "SVMSBuildInfo.h"
 #include "imgui.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <shellapi.h>
+#include "PlatformUtil.h"
 
 namespace svms::cfg {
 
@@ -62,15 +58,7 @@ void DrawAboutPage(ConfigDocument& doc, UpdateService& updates) {
                     update.patch, update.fromCache ? " (cached)" : "");
         ImGui::PopStyleColor();
         if (!update.releaseUrl.empty() && ImGui::Button("Open release page")) {
-            const int length = MultiByteToWideChar(
-                CP_UTF8, 0, update.releaseUrl.c_str(), -1, nullptr, 0);
-            if (length > 1) {
-                std::wstring url(static_cast<size_t>(length), L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, update.releaseUrl.c_str(), -1,
-                                    url.data(), length);
-                ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr,
-                              SW_SHOWNORMAL);
-            }
+            util::OpenExternal(update.releaseUrl);
         }
         ImGui::SameLine();
         ImGui::TextDisabled(
@@ -89,16 +77,9 @@ void DrawAboutPage(ConfigDocument& doc, UpdateService& updates) {
 
     auto path = doc.GetActivePath();
     if (!path.empty()) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path.data(),
-                                      static_cast<int>(path.size()),
-                                      nullptr, 0, nullptr, nullptr);
-        if (len > 0) {
-            std::string pathStr(static_cast<size_t>(len), '\0');
-            WideCharToMultiByte(CP_UTF8, 0, path.data(),
-                                static_cast<int>(path.size()),
-                                pathStr.data(), len, nullptr, nullptr);
+        const std::string pathStr = util::WideToUtf8(path);
+        if (!pathStr.empty())
             ImGui::TextDisabled("Config: %s", pathStr.c_str());
-        }
     }
 
     ImGui::Spacing();

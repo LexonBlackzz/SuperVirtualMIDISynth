@@ -1,22 +1,26 @@
 #include "PageAudio.h"
+#include "PlatformUtil.h"
 #include "ConfigDocument.h"
+#ifdef _WIN32
 #include "WasapiDevices.h"
+#endif
 #include "EasterEggs.h"
 #include "Theme.h"
 #include "Widgets.h"
 #include "SVMSBuildInfo.h"
-#include "../SVMSRuntimeLink.h"
+#include "DriverLink.h"
 #include "imgui.h"
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#endif
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cwchar>
-#include <filesystem>
 #include <string>
 #include <vector>
 #include <cerrno>
@@ -26,27 +30,11 @@ namespace svms::cfg {
 namespace {
 
 std::string WideToUtf8Str(const std::wstring& ws) {
-    if (ws.empty()) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(),
-                                  static_cast<int>(ws.size()),
-                                  nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
-    std::string s(static_cast<size_t>(len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()),
-                        s.data(), len, nullptr, nullptr);
-    return s;
+    return svms::cfg::util::WideToUtf8(ws);
 }
 
 std::wstring Utf8ToWideStr(const std::string& s) {
-    if (s.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(),
-                                  static_cast<int>(s.size()),
-                                  nullptr, 0);
-    if (len <= 0) return {};
-    std::wstring ws(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
-                        ws.data(), len);
-    return ws;
+    return svms::cfg::util::Utf8ToWide(s);
 }
 
 bool EqualAsciiCI(const std::string& a, const std::string& b) {
@@ -81,6 +69,15 @@ void SetPrimarySoundFont(ConfigValues& values, const std::wstring& path) {
 
 bool BrowseSoundFont(std::wstring& path, std::wstring& lastDirectory,
                      const wchar_t* title) {
+#ifndef _WIN32
+    std::string chosen;
+    if (!util::PickFile(false, util::WideToUtf8(title), util::WideToUtf8(lastDirectory),
+                        "*.sf2 *.sfz", chosen))
+        return false;
+    path = util::Utf8ToWide(chosen);
+    lastDirectory = fs::path(path).parent_path().wstring();
+    return true;
+#else
     wchar_t fileBuf[1024] = {};
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
@@ -92,8 +89,9 @@ bool BrowseSoundFont(std::wstring& path, std::wstring& lastDirectory,
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) return false;
     path = fileBuf;
-    lastDirectory = std::filesystem::path(path).parent_path().wstring();
+    lastDirectory = fs::path(path).parent_path().wstring();
     return true;
+#endif
 }
 
 void SwapSoundFonts(ConfigValues& values, uint32_t a, uint32_t b) {
@@ -233,6 +231,7 @@ void RestartCell() {
 
 namespace {
 
+#ifdef _WIN32
 // Installed ASIO drivers register under HKLM\SOFTWARE\ASIO (and the WOW6432
 // view); each subkey's name is the driver's user-visible name. This matches
 // how the SDK's host `getDriverNames()` discovers drivers, without linking
@@ -269,8 +268,69 @@ std::vector<std::string> EnumerateAsioDrivers() {
     }
     return names;
 }
+#endif
 
 // ASIO_MARKER_DEVICE_COMBO
+
+#ifndef _WIN32
+// Linux output view: the driver renders to one ALSA PCM. Backend/endpoint
+// pickers (WASAPI, ASIO) do not exist here.
+void DrawLinuxOutputView(ConfigDocument& doc, ConfigValues& w) {
+    if (BeginRackPanel("OUTPUT (ALSA)")) {
+        PanelCaption("ALSA PCM DEVICE",
+                     "PCM the driver opens: 'default' follows PipeWire/PulseAudio, or name one (hw:0,0, plughw:1,0, ...). Also settable per run with SVMS_AUDIO_DEVICE.",
+                     true);
+        char device[128]{};
+        WideToUtf8Str(w.linuxDevice).copy(device, sizeof(device) - 1u);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        if (ImGui::InputText("##alsadevice", device, sizeof(device))) {
+            w.linuxDevice = Utf8ToWideStr(device);
+            doc.MarkDirty();
+        }
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        static const uint32_t sampleRateValues[] = {44100, 48000, 88200, 96000, 176400, 192000};
+        static const char* sampleRateKeys[] = {"44.1k", "48k", "88.2k", "96k", "176k", "192k"};
+        int srIdx = -1;
+        for (int i = 0; i < 6; ++i)
+            if (sampleRateValues[i] == w.sampleRate) srIdx = i;
+        if (PanelKeys("SAMPLE RATE", &srIdx, sampleRateKeys, 6,
+                      "Sample rate for audio output. Higher rates increase the amount of work per second.",
+                      true) && srIdx >= 0) {
+            w.sampleRate = sampleRateValues[srIdx];
+            doc.MarkDirty();
+        }
+        if (srIdx < 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("custom: %u Hz", w.sampleRate);
+        }
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        static const uint32_t bufferValues[] = {64, 128, 256, 512, 1024, 2048, 4096, 8192};
+        static const char* bufferKeys[] = {"64", "128", "256", "512", "1k", "2k", "4k", "8k"};
+        int bufIdx = -1;
+        for (int i = 0; i < 8; ++i)
+            if (bufferValues[i] == w.bufferFrames) bufIdx = i;
+        if (PanelKeys("BUFFER FRAMES", &bufIdx, bufferKeys, 8,
+                      "Frames rendered per audio block. Smaller buffers reduce latency but leave less time for each render.",
+                      true) && bufIdx >= 0) {
+            w.bufferFrames = bufferValues[bufIdx];
+            doc.MarkDirty();
+        }
+        if (bufIdx < 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("custom: %u", w.bufferFrames);
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("Latency about %.1f ms",
+                            1000.0f * static_cast<float>(w.bufferFrames) /
+                                static_cast<float>((std::max)(1u, w.sampleRate)));
+    }
+    EndRackPanel();
+}
+#endif
 
 } // namespace
 
@@ -284,13 +344,18 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
     if (liveSoundFont)
         PollSoundFontStatus(*live.client, soundFontStatus);
 
+#ifdef _WIN32
     static WasapiDeviceList deviceList;
     static bool devicesEnumerated = false;
     if (!devicesEnumerated) {
         deviceList.Enumerate();
         devicesEnumerated = true;
     }
+#endif
 
+#ifndef _WIN32
+    if (view != AudioView::SoundFont) DrawLinuxOutputView(doc, w);
+#else
     if (view != AudioView::SoundFont) {
 
     const bool asioActive =
@@ -547,6 +612,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
     }
 
     }  // output view
+#endif
 
     if (view != AudioView::Output) {
     ImGui::Spacing();
@@ -559,7 +625,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
     const ThemeSettings& th = GetThemeSettings();
 
     if (lastSoundFontDir.empty() && !w.soundFontPath.empty()) {
-        lastSoundFontDir = std::filesystem::path(w.soundFontPath).parent_path().wstring();
+        lastSoundFontDir = fs::path(w.soundFontPath).parent_path().wstring();
     }
     if (browserDir.empty())
         browserDir = lastSoundFontDir.empty() ? L"." : lastSoundFontDir;
@@ -571,9 +637,9 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             folderDirs.clear();
             folderFonts.clear();
             std::error_code ec;
-            for (std::filesystem::directory_iterator it(
+            for (fs::directory_iterator it(
                      scanDir,
-                     std::filesystem::directory_options::skip_permission_denied, ec), end;
+                     fs::directory_options::skip_permission_denied, ec), end;
                  !ec && it != end; it.increment(ec)) {
                 if (ec) break;
                 std::error_code typeEc;
@@ -607,7 +673,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             std::string name = "(none - engine uses the local fallback)";
             std::string dir;
             if (!w.soundFontPath.empty()) {
-                const std::filesystem::path sf(w.soundFontPath);
+                const fs::path sf(w.soundFontPath);
                 name = WideToUtf8Str(sf.filename().wstring());
                 dir = WideToUtf8Str(sf.parent_path().wstring());
             }
@@ -675,7 +741,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
         ImGui::TableNextColumn();
         if (BeginRackPanel("FOLDER")) {
             std::string folderLabel = WideToUtf8Str(
-                std::filesystem::path(scannedDir.empty() ? L"." : scannedDir)
+                fs::path(scannedDir.empty() ? L"." : scannedDir)
                     .lexically_normal().wstring());
             if (folderLabel.size() > 56)
                 folderLabel = "..." + folderLabel.substr(folderLabel.size() - 56);
@@ -691,9 +757,9 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             std::string filter = searchBuf;
             std::transform(filter.begin(), filter.end(), filter.begin(),
                            [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
-            const std::filesystem::path currentDir =
-                std::filesystem::path(scannedDir.empty() ? L"." : scannedDir).lexically_normal();
-            const std::filesystem::path parentDir = currentDir.parent_path();
+            const fs::path currentDir =
+                fs::path(scannedDir.empty() ? L"." : scannedDir).lexically_normal();
+            const fs::path parentDir = currentDir.parent_path();
             bool navigated = false;
             if (!parentDir.empty() && parentDir != currentDir) {
                 if (ImGui::Selectable("[..]")) {
@@ -722,10 +788,10 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                     std::transform(lower.begin(), lower.end(), lower.begin(),
                                    [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
                     if (!filter.empty() && lower.find(filter) == std::string::npos) continue;
-                    const std::filesystem::path candidate = (currentDir / file).lexically_normal();
+                    const fs::path candidate = (currentDir / file).lexically_normal();
                     const bool selected = !w.soundFontPath.empty() &&
                         _wcsicmp(candidate.c_str(),
-                                 std::filesystem::path(w.soundFontPath).lexically_normal().c_str()) == 0;
+                                 fs::path(w.soundFontPath).lexically_normal().c_str()) == 0;
                     if (ImGui::Selectable(fname.c_str(), selected)) {
                         SetPrimarySoundFont(w, candidate.wstring());
                         lastSoundFontDir = currentDir.wstring();
@@ -774,7 +840,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                               ImGui::GetColorU32(GetLcdBg()), th.cornerRadius);
             DrawLed(dl, ImVec2(rowStart.x + 14.0f, rowStart.y + 16.0f), 3.5f, i == 0u);
             std::string label = std::to_string(i) + "  " +
-                WideToUtf8Str(std::filesystem::path(w.soundFontPaths[i]).filename().wstring());
+                WideToUtf8Str(fs::path(w.soundFontPaths[i]).filename().wstring());
             if (i == 0u) label += "   (PRIMARY)";
             PushMono();
             dl->AddText(ImVec2(rowStart.x + 30.0f, rowStart.y + (32.0f - ImGui::GetTextLineHeight()) * 0.5f),
@@ -826,14 +892,14 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
             const char* preview = "(missing)";
             std::string previewStorage;
             if (route.soundFontIndex < w.soundFontPaths.size()) {
-                previewStorage = WideToUtf8Str(std::filesystem::path(
+                previewStorage = WideToUtf8Str(fs::path(
                     w.soundFontPaths[route.soundFontIndex]).filename().wstring());
                 preview = previewStorage.c_str();
             }
             ImGui::SetNextItemWidth((std::min)(260.0f, ImGui::GetContentRegionAvail().x));
             if (ImGui::BeginCombo("SoundFont", preview)) {
                 for (uint32_t sf = 0u; sf < w.soundFontPaths.size(); ++sf) {
-                    const std::string name = WideToUtf8Str(std::filesystem::path(
+                    const std::string name = WideToUtf8Str(fs::path(
                         w.soundFontPaths[sf]).filename().wstring());
                     if (ImGui::Selectable(name.c_str(), route.soundFontIndex == sf)) {
                         route.soundFontIndex = sf;

@@ -1,17 +1,20 @@
 #include "PageOverview.h"
+#include "PlatformUtil.h"
 #include "ConfigDocument.h"
 #include "ConfiguratorApp.h"
 #include "PageReverb.h"
 #include "Theme.h"
 #include "Widgets.h"
 #include "imgui.h"
-#include "../SVMSRuntimeLink.h"
+#include "DriverLink.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -63,15 +66,7 @@ void OpenKey(Page page) {
 }
 
 std::string Utf8(const std::wstring& ws) {
-    if (ws.empty()) return {};
-    const int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(),
-                                        static_cast<int>(ws.size()),
-                                        nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
-    std::string out(static_cast<size_t>(len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()),
-                        out.data(), len, nullptr, nullptr);
-    return out;
+    return svms::cfg::util::WideToUtf8(ws);
 }
 
 void SynthModule(ConfigDocument& doc) {

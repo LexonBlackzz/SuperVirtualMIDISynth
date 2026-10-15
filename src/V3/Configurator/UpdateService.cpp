@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "UpdateService.h"
 #include "SVMSBuildInfo.h"
 
@@ -260,3 +261,34 @@ void UpdateService::CheckWorker(bool ignoreCache) {
 }
 
 } // namespace svms::cfg
+
+#else  // Linux
+#include "UpdateService.h"
+
+namespace svms::cfg {
+
+UpdateService::~UpdateService() {
+    if (worker_.joinable()) worker_.join();
+}
+
+void UpdateService::CheckAsync(bool) {
+    UpdateSnapshot snapshot;
+    snapshot.status = UpdateStatus::Failed;
+    snapshot.message =
+        "Update checks are not available on Linux; see the GitHub releases page.";
+    Publish(snapshot);
+}
+
+UpdateSnapshot UpdateService::GetSnapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return snapshot_;
+}
+
+void UpdateService::Publish(const UpdateSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_ = snapshot;
+}
+
+} // namespace svms::cfg
+
+#endif  // _WIN32

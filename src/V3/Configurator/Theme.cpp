@@ -1,17 +1,18 @@
 #include "Theme.h"
 #include "imgui.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#include "PlatformUtil.h"
+#ifndef _WIN32
+#include <limits.h>
+#include <unistd.h>
 #endif
-#include <windows.h>
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
-#include <filesystem>
 #include <fstream>
 #include <string>
 
@@ -63,24 +64,38 @@ ImVec4 Alpha(const ImVec4& c, float a) {
     return ImVec4(c.x, c.y, c.z, a);
 }
 
-std::filesystem::path PortableThemePathImpl() {
+fs::path PortableThemePathImpl() {
+#ifdef _WIN32
     wchar_t exePath[32768] = {};
     const DWORD len = GetModuleFileNameW(nullptr, exePath,
                                          static_cast<DWORD>(std::size(exePath)));
     if (len == 0 || len >= std::size(exePath)) {
-        return std::filesystem::path(L"configurator_theme.json");
+        return fs::path(L"configurator_theme.json");
     }
-    return std::filesystem::path(exePath).parent_path() /
-           L"configurator_theme.json";
+    return fs::path(exePath).parent_path() / L"configurator_theme.json";
+#else
+    char exePath[PATH_MAX] = {};
+    const ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len <= 0) return fs::path("configurator_theme.json");
+    return fs::path(std::string(exePath, static_cast<size_t>(len))).parent_path() /
+           "configurator_theme.json";
+#endif
 }
 
-std::filesystem::path AppDataThemePathImpl() {
+fs::path AppDataThemePathImpl() {
+#ifdef _WIN32
     wchar_t appData[32768] = {};
     const DWORD len = GetEnvironmentVariableW(
         L"APPDATA", appData, static_cast<DWORD>(std::size(appData)));
     if (len == 0 || len >= std::size(appData)) return {};
-    return std::filesystem::path(appData) /
-           L"SuperVirtualMIDISynth" / L"configurator_theme.json";
+    return fs::path(appData) / L"SuperVirtualMIDISynth" / L"configurator_theme.json";
+#else
+    std::string base;
+    if (const char* xdg = std::getenv("XDG_CONFIG_HOME")) base = xdg;
+    else if (const char* home = std::getenv("HOME")) base = std::string(home) + "/.config";
+    if (base.empty()) return {};
+    return fs::path(base) / "SuperVirtualMIDISynth" / "configurator_theme.json";
+#endif
 }
 
 int HexNibble(char c) {
@@ -154,7 +169,7 @@ void ReadColor(const nlohmann::json& root, const char* key, ImVec4& value) {
     }
 }
 
-bool LoadThemeFile(const std::filesystem::path& path,
+bool LoadThemeFile(const fs::path& path,
                    ThemeSettings& out,
                    std::string* error) {
     try {
@@ -222,14 +237,14 @@ nlohmann::json ThemeToJson(const ThemeSettings& t) {
     };
 }
 
-bool WriteThemeFile(const std::filesystem::path& path,
+bool WriteThemeFile(const fs::path& path,
                     const ThemeSettings& theme,
                     std::string* error) {
     try {
         if (!path.parent_path().empty())
-            std::filesystem::create_directories(path.parent_path());
+            fs::create_directories(path.parent_path());
 
-        const std::filesystem::path temp = path.wstring() + L".tmp";
+        const fs::path temp = path.wstring() + L".tmp";
         {
             std::ofstream out(temp, std::ios::binary | std::ios::trunc);
             if (!out) {
@@ -246,7 +261,7 @@ bool WriteThemeFile(const std::filesystem::path& path,
         if (!MoveFileExW(temp.c_str(), path.c_str(),
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             std::error_code ec;
-            std::filesystem::remove(temp, ec);
+            fs::remove(temp, ec);
             if (error) *error = "Could not replace the saved theme file.";
             return false;
         }
@@ -270,7 +285,7 @@ void EnsureThemeLoaded(std::string* error = nullptr) {
     std::error_code ec;
     std::string localError;
 
-    if (!portable.empty() && std::filesystem::exists(portable, ec)) {
+    if (!portable.empty() && fs::exists(portable, ec)) {
         ThemeSettings loaded;
         if (LoadThemeFile(portable, loaded, &localError)) {
             g_theme = loaded;
@@ -282,7 +297,7 @@ void EnsureThemeLoaded(std::string* error = nullptr) {
     }
 
     ec.clear();
-    if (!appData.empty() && std::filesystem::exists(appData, ec)) {
+    if (!appData.empty() && fs::exists(appData, ec)) {
         ThemeSettings loaded;
         std::string appError;
         if (LoadThemeFile(appData, loaded, &appError)) {

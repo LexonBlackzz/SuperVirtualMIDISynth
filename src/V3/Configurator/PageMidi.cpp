@@ -1,12 +1,15 @@
 #include "PageMidi.h"
+#include "PlatformUtil.h"
 #include "ConfigDocument.h"
 #include "Theme.h"
 #include "Widgets.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
-#include "../SVMSRuntimeLink.h"
+#include "DriverLink.h"
 
+#ifdef _WIN32
 #include <mmeapi.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -61,26 +64,20 @@ bool InputU32(const char* id, uint32_t& value, uint32_t minValue, uint32_t maxVa
 }
 
 struct MidiInputDevice {
-    UINT id = 0u;
+    uint32_t id = 0u;
     std::wstring name;
     std::string displayName;
 };
 
 std::string WideToUtf8Midi(const std::wstring& value) {
-    if (value.empty()) return {};
-    const int bytes = WideCharToMultiByte(
-        CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-        nullptr, 0, nullptr, nullptr);
-    if (bytes <= 0) return {};
-    std::string result(static_cast<size_t>(bytes), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(),
-                        static_cast<int>(value.size()), result.data(), bytes,
-                        nullptr, nullptr);
-    return result;
+    return svms::cfg::util::WideToUtf8(value);
 }
 
 std::vector<MidiInputDevice> EnumerateMidiInputs() {
     std::vector<MidiInputDevice> result;
+#ifndef _WIN32
+    return result;  // Linux input routing is ALSA sequencer connections (aconnect), not a picker.
+#else
     wchar_t path[MAX_PATH]{};
     const UINT length = GetSystemDirectoryW(path, MAX_PATH);
     if (length == 0u || length + 11u >= MAX_PATH) return result;
@@ -109,6 +106,7 @@ std::vector<MidiInputDevice> EnumerateMidiInputs() {
     }
     FreeLibrary(winmm);
     return result;
+#endif
 }
 
 } // namespace

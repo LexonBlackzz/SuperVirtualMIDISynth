@@ -1,10 +1,7 @@
 #ifndef SVMS_CONFIGURATOR_PAGEOFFLINE_H
 #define SVMS_CONFIGURATOR_PAGEOFFLINE_H
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "PlatformUtil.h"
 
 #include <atomic>
 #include <cstdint>

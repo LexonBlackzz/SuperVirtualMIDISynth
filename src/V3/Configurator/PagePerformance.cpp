@@ -4,7 +4,7 @@
 #include "Theme.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
-#include "../SVMSRuntimeLink.h"
+#include "DriverLink.h"
 
 #include <algorithm>
 #include <cmath>
