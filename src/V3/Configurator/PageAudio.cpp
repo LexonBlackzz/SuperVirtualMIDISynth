@@ -789,8 +789,8 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                     if (!filter.empty() && lower.find(filter) == std::string::npos) continue;
                     const fs::path candidate = util::LexicallyNormal(currentDir / file);
                     const bool selected = !w.soundFontPath.empty() &&
-                        _wcsicmp(candidate.c_str(),
-                                 util::LexicallyNormal(fs::path(w.soundFontPath)).c_str()) == 0;
+                        _wcsicmp(candidate.wstring().c_str(),
+                                 util::LexicallyNormal(fs::path(w.soundFontPath)).wstring().c_str()) == 0;
                     if (ImGui::Selectable(fname.c_str(), selected)) {
                         SetPrimarySoundFont(w, candidate.wstring());
                         lastSoundFontDir = currentDir.wstring();
