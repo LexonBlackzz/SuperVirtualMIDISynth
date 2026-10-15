@@ -286,6 +286,11 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 doc.MarkDirty();
                 send(svms::RLCommandType::SetDecimation, DecimationParam(w));
             }
+            if (PanelLever("STEAL REJECT  (LISTEN)", &w.stealReject,
+                           "Listening test, OFF by default. With the pool full, a note-on that would be the very first voice stolen (quieter than the voice it would replace) is dropped instead of launched, like BASSMIDI. Big CPU saving on extreme Black MIDI with mixed velocities; quiet notes are audibly dropped. Quality steal policy only; no effect when all velocities are equal.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetStealReject, w.stealReject ? 1u : 0u);
+            }
             if (PanelLever("DECIMATE BY LEVEL", &w.decimationByLevel,
                            "Listening test, OFF by default. With voice decimation on, mute the voices that are actually quietest (envelope level x gain, so fading release tails go first) instead of the lowest velocity. A loud note that has been ringing out is no longer protected by its velocity, and a soft fresh note is no longer sacrificed.")) {
                 doc.MarkDirty();

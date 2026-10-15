@@ -375,6 +375,21 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         }
         return svms::RLResult::Ok;
     }
+    case RT::SetStealReject: {
+        // param 0/1: drop a note-on that would be the first steal victim
+        // anyway (opt-in, audible under saturation; Quality policy only).
+        if (cmd.param > 1u || !voiceManager) {
+            strncpy_s(resultText, kText, "steal reject must be 0 or 1", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        voiceManager->SetStealReject(cmd.param != 0u);
+        engineConfig_.stealReject = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "steal reject: on (notes that would be the first victim are dropped)"
+                            : "steal reject: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
     case RT::SetThreadAffinityMode: {
         // param = 0 off, 1 all render threads on P-cores,
         // 2 RT on P-cores + workers on E-cores.

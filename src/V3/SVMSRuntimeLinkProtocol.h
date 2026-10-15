@@ -270,6 +270,7 @@ enum class RLCommandType : uint32_t {
     SetNoteMerge          = 0x0000011C,
     SetNoteOnReexcite     = 0x0000011D,
     SetDecimation         = 0x0000011E,
+    SetStealReject        = 0x0000011F,
 
 
     Invalid              = 0xFFFFFFFF,

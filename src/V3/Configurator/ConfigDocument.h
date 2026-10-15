@@ -78,6 +78,8 @@ struct ConfigValues {
     uint32_t stealPolicy = 0;
     // Opt-in per-key voice cap; 0 = off (no per-key limit).
     uint32_t perKeyVoiceCap = 0u;
+    // Opt-in listening test: drop note-ons that would be the first steal victim.
+    bool stealReject = false;
     // 0 off, 1 RT threads -> P-cores, 2 + workers -> E-cores.
     uint32_t threadAffinityMode = 0u;
     // Opt-in compiler-side CC collapse (superseded same-(channel,controller)).

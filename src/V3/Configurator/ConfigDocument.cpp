@@ -168,6 +168,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.voiceRetireThreshold = 0.00177828f;  // -55 dB
     d.stealPolicy = 0u;
     d.perKeyVoiceCap = 0u;
+    d.stealReject = false;
     d.threadAffinityMode = 0u;
     d.ccCollapse = false;
     d.noteMerge = false;
@@ -358,6 +359,7 @@ void ConfigDocument::FromJson(const json& root) {
     if (auto it = root.find("voices"); it != root.end() && it->is_object()) {
         ReadNum(*it, "steal_policy", working_.stealPolicy, 0u, 2u);
         ReadNum(*it, "per_key_voice_cap", working_.perKeyVoiceCap, 0u, 256u);
+        ReadBool(*it, "steal_reject", working_.stealReject);
         ReadNum(*it, "ghost_budget", working_.ghostBudget, 0u, 65536u);
     }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
@@ -455,6 +457,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["retire_threshold"] = working_.voiceRetireThreshold;
     root["voices"]["steal_policy"] = working_.stealPolicy;
     root["voices"]["per_key_voice_cap"] = working_.perKeyVoiceCap;
+    root["voices"]["steal_reject"] = working_.stealReject;
     root["voices"]["ghost_budget"] = working_.ghostBudget;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
@@ -667,6 +670,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.voiceRetireThreshold == b.voiceRetireThreshold
         && a.stealPolicy == b.stealPolicy
         && a.perKeyVoiceCap == b.perKeyVoiceCap
+        && a.stealReject == b.stealReject
         && a.ghostBudget == b.ghostBudget
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse

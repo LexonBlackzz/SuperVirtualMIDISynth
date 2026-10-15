@@ -233,7 +233,9 @@ public:
     // pool, a single-layer note-on whose steal score is strictly worse than
     // the voice it would replace never launches (no ghost, no configure, the
     // victim keeps playing). Quality steal policy only.
-    void SetStealReject(bool on) { stealReject_ = on; }
+    void SetStealReject(bool on) {
+        stealReject_.store(on, std::memory_order_relaxed);
+    }
     uint64_t StealRejectCount() const { return stealRejectCount_; }
     // True when the most recent LaunchVoiceGroup returned false because the
     // reject fired (not an allocation failure).
@@ -907,7 +909,7 @@ private:
     // pool state on a switch back to Quality.
     uint32_t stealPolicy_ = 0u;  // 0 quality, 1 cursor, 2 scan
     uint32_t perKeyVoiceCap_ = 0u;  // 0 = off; else max playing voices per (channel,key)
-    bool stealReject_ = false;
+    std::atomic<bool> stealReject_{false};  // live-togglable from the link thread
     bool lastLaunchRejected_ = false;
     uint64_t stealRejectCount_ = 0u;
     bool ShouldRejectNoteOn(const VoiceConfiguration& setup,
@@ -5076,7 +5078,7 @@ inline bool VoiceManager::LaunchVoiceGroup(
     if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
         count > voiceLimit_)
         return false;
-    if (stealReject_ && count == 1u && ShouldRejectNoteOn(setups[0], channelParams,
+    if (stealReject_.load(std::memory_order_relaxed) && count == 1u && ShouldRejectNoteOn(setups[0], channelParams,
                                            multiplicity)) {
         // Pairing note-offs sees no voice for this generation, exactly as if
         // the note had been launched and stolen before it rendered.
