@@ -183,8 +183,7 @@ void ConfiguratorApp::RecreateFonts(float scale, bool rendererBackendInitialized
             fontSize * 0.88f, &cfg);
     }
     SetMonoFont(mono);
-
-    io.Fonts->Build();
+    // No Fonts->Build(): imgui 1.92+ (RendererHasTextures) builds the atlas on demand.
 }
 
 bool ConfiguratorApp::PumpMessages() {
