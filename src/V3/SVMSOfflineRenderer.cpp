@@ -176,6 +176,10 @@ bool ReportScanProgress(uint64_t processed, uint64_t total,
 void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
     o.tuningEdo = cfg.tuningEdo;
     o.phaseRotationMode = cfg.phaseRotationMode;
+    if (cfg.renderBackend == RenderBackend::Scalar ||
+        cfg.renderBackend == RenderBackend::SSE2 ||
+        cfg.renderBackend == RenderBackend::AVX2)
+        o.backend = cfg.renderBackend;  // else stays the automatic sentinel
     // The standalone renderer is still explicitly given a MIDI, SoundFont and
     // output path, but its engine-facing defaults should match the current V3
     // configuration. Command-line options below remain authoritative.
@@ -285,6 +289,7 @@ void Usage() {
            L"  --phase-rotation coherent|analytic|sweep|diffuse|random  Post-mix hum-killing phase rotation (default coherent/off)\n"
                        L"  --backend auto|scalar|sse2|avx2|gpu\n"
            L"  --tuning-edo 12|31    Melodic tuning (31EDO key 155 = middle C)\n"
+           L"  --config FILE         Use this V3 config JSON instead of the active one\n"
            L"  --scan-only           Validate/count without loading an instrument or rendering\n"
            L"  --quiet               Disable once-per-second telemetry\n"
            L"  --machine-progress    Emit tab-separated progress records\n", stderr);
@@ -302,6 +307,7 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
         const std::wstring arg = argv[i];
         auto value = [&]() -> const wchar_t* { return ++i < argc ? argv[i] : nullptr; };
         if (arg == L"--quiet") o.quiet = true;
+        else if (arg == L"--config") { if (!value()) return false; }  // handled before Load()
         else if (arg == L"--machine-progress") o.machineProgress = true;
         else if (arg == L"--cancel-event") {
             const auto p=value(); if (!p || !p[0]) return false;
@@ -609,6 +615,7 @@ public:
     virtual void PhaseCycles(uint64_t (&out)[3]) const { out[0] = out[1] = out[2] = 0; }
     // {note-on collapse coalesced, re-excited, exact-merge folded}
     virtual void CollapseCounts(uint64_t (&out)[3]) const { out[0] = out[1] = out[2] = 0; }
+    virtual bool ReverbActive() const { return false; }
     virtual uint32_t Active() const = 0;
     virtual uint32_t Tails() const = 0;
     virtual uint32_t Steals() const = 0;
@@ -669,6 +676,7 @@ public:
         out[0] = synth_.CoalescedNoteOns(); out[1] = synth_.ReExcitedNoteOns();
         out[2] = synth_.MergedNoteOns();
     }
+    bool ReverbActive() const override { return synth_.ReverbActive(); }
     uint32_t Active() const override { return synth_.Active(); }
     uint32_t Tails() const override { return synth_.Tails(); }
     uint32_t Steals() const override { return synth_.Steals(); }
@@ -818,6 +826,15 @@ bool RingSink(const PackedMidiEvent& e,void* p){auto& c=*static_cast<ProducerCon
 int RendererMain(int argc, wchar_t** argv) {
     using namespace svms;
 #if defined(_WIN32)
+    // --config <file>: render with that JSON instead of the on-disk config
+    // (the Configurator passes its unsaved working settings this way). Must
+    // be in the environment before EngineConfig::Load() resolves its path.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::wstring(argv[i]) == L"--config") {
+            SetEnvironmentVariableW(L"SVMS_TEST_LOCAL_CONFIG_PATH", argv[i + 1]);
+            break;
+        }
+    }
     const EngineConfig engineConfig = EngineConfig::Load();
 #else
     EngineConfig engineConfig{};
@@ -938,6 +955,7 @@ int RendererMain(int argc, wchar_t** argv) {
             MachineStatus(o, "CANCELLED", "Cancelled while loading MIDI");
             return 3;
         }
+        MachineLoadProgress(o, 1.0, measureSeconds, 0.0, midi.Size(), midi.Size());
     }
 
     std::atomic<bool> done{false};
@@ -1043,6 +1061,9 @@ int RendererMain(int argc, wchar_t** argv) {
         }
     };
 
+    // With reverb on, keep rendering the tail until it has faded (-100 dB).
+    const bool reverbRinging = synth->ReverbActive();
+    float lastPeak = 1.0f;
     auto renderTo = [&](uint64_t target) {
         while (frame < target && ioOk && !pollCancel()) {
             const uint32_t n = static_cast<uint32_t>(
@@ -1055,6 +1076,12 @@ int RendererMain(int argc, wchar_t** argv) {
                     dspEnd - dspStart).count());
             ioOk = wave.Write(left.data(), right.data(), n);
             frame += n;
+            if (reverbRinging) {
+                float peak = 0.0f;
+                for (uint32_t i = 0; i < n; ++i)
+                    peak = (std::max)(peak, (std::max)(std::fabs(left[i]), std::fabs(right[i])));
+                lastPeak = peak;
+            }
             peakVoices = (std::max)(peakVoices, synth->Active());
             reportRender(false);
         }
@@ -1167,7 +1194,8 @@ int RendererMain(int argc, wchar_t** argv) {
             MachineStatus(o, "TAIL", "Rendering natural release tail");
             const uint64_t tailEnd = frame +
                 uint64_t(o.maxTailSeconds) * o.sampleRate;
-            while ((synth->Active() || synth->Tails()) && frame < tailEnd &&
+            while ((synth->Active() || synth->Tails() ||
+                    (reverbRinging && lastPeak > 1e-5f)) && frame < tailEnd &&
                    !pollCancel()) {
                 renderTo((std::min<uint64_t>)(
                     tailEnd, frame + o.blockFrames));

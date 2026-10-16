@@ -10,6 +10,7 @@
 #include "SVMSLimiter.h"
 #include "SVMSNoteMerge.h"
 #include "SVMSNoteOnCollapse.h"
+#include "SVMSReverb.h"
 #include "SVMSThreadAffinity.h"
 #include "SVMSPostFilter.h"
 #include "SVMSRenderScalar.h"
@@ -159,7 +160,34 @@ public:
         cfg_ = {master_, 1.0f, 0.0f, 0, false, false, false, false, false,
                 false, InterpolationMode::Linear, FilterType::None,
                 PanLaw::ConstantPower, true};
+        if (const EngineConfig* t = config.tuning) {
+            // Same snapshot the driver builds, so velocity mapping, mono
+            // output, pan law and interpolation match the live synth.
+            cfg_ = {master_, t->velocityCurve, t->velocityFloor,
+                    t->velocityIgnoreBelow, t->ignoreVelocity, t->monoOutput,
+                    t->enableReverb, t->enableChorus, t->enableFilter,
+                    t->enableModulators, t->interpolation, t->filterType,
+                    t->panLaw, t->correctnessMode};
+            reverbOn_ = t->enableReverb;
+            if (reverbOn_) {
+                reverb_.reset(new ReverbState());
+                reverb_->Configure(rate_, *t);
+            }
+        }
         channels_.RebuildCache(cfg_, static_cast<float>(rate_));
+        for (uint32_t v = 0; v < 128u; ++v) {
+            if (!config.tuning) {
+                velGain_[v] = float(v) * float(v) / (127.0f * 127.0f);
+                continue;
+            }
+            // The driver's historical quantisation: map, round to a 0..127
+            // index, square (its LUT is idx^2/127^2).
+            const float mapped = channels_.ComputeVelocity(uint8_t(v), cfg_);
+            if (mapped <= 0.0f) { velGain_[v] = 0.0f; continue; }
+            uint32_t idx = static_cast<uint32_t>(mapped * 127.0f + 0.5f);
+            idx = (std::max)(1u, (std::min)(127u, idx));
+            velGain_[v] = float(idx) * float(idx) / (127.0f * 127.0f);
+        }
         for (uint32_t i = 0; i < sf2_->regionCount; ++i)
             Prepare(sf2_->regions[i], prepared_[i]);
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
@@ -326,6 +354,7 @@ public:
             voices_.SetCurrentFrame(absoluteFrame);
             gpuSynth_.RenderBlock(voices_, left, right, frameCount,
                                   absoluteFrame);
+            ApplyReverb(left, right, frameCount);
             limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
             return;
         }
@@ -337,6 +366,7 @@ public:
                                   sampleFrames_, left, right,
                                   frameCount, cfg_, nullptr, 0, true,
                                   absoluteFrame);
+            ApplyReverb(left, right, frameCount);
             limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
         }
     }
@@ -450,6 +480,7 @@ public:
 #if defined(_MSC_VER)
         renderCycles_ += __rdtsc() - renderBegin;
 #endif
+        ApplyReverb(left, right, frameCount);
         limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
     }
 
@@ -709,6 +740,7 @@ private:
 #endif
         ++noteCalls_;
         if (note >= kNoteCount) return;
+        if (velGain_[velocity & 127u] <= 0.0f) return;  // velocity ignore gate
         channels_.NoteOn(channel, note, velocity);
         uint32_t preset = channels_.GetSelectedPreset(channel);
         if (preset >= sf2_->presetCount) {
@@ -749,8 +781,7 @@ private:
         }
         if (playIndex_ == 0 || playIndex_ >= UINT32_MAX - 1) playIndex_ = 1;
         const uint32_t generation = playIndex_++;
-        const float velocityGain = float(velocity) * float(velocity) /
-                                   (127.0f * 127.0f);
+        const float velocityGain = velGain_[velocity & 127u];
         const float bend = channels_.GetPitchBendSemitones(channel) +
             sysexMasterFineTune_ + sysexMasterTranspose_;
 #if defined(_MSC_VER)
@@ -1011,6 +1042,24 @@ private:
     GpuSynth gpuSynth_;
 #endif
     RuntimeConfigSnapshot cfg_{};
+    float velGain_[128]{};
+    // Driver FDN reverb, applied before the limiter exactly like
+    // Driver::RenderCallback (interleaved scratch round trip).
+    std::unique_ptr<ReverbState> reverb_;  // large; heap, only when enabled
+    bool reverbOn_ = false;
+    std::vector<float> reverbScratch_;
+    void ApplyReverb(float* left, float* right, uint32_t frames) {
+        if (!reverbOn_ || frames == 0u) return;
+        if (reverbScratch_.size() < size_t(frames) * 2u)
+            reverbScratch_.resize(size_t(frames) * 2u);
+        float* s = reverbScratch_.data();
+        for (uint32_t i = 0; i < frames; ++i) { s[2u * i] = left[i]; s[2u * i + 1u] = right[i]; }
+        reverb_->Process(s, frames, 2u);
+        for (uint32_t i = 0; i < frames; ++i) { left[i] = s[2u * i]; right[i] = s[2u * i + 1u]; }
+    }
+public:
+    bool ReverbActive() const { return reverbOn_; }
+private:
     PostHighPass3Hz postHighPass_{};
     LimiterRouterState limiter_{};
     RegionCacheEntry regionCache_[4096]{};

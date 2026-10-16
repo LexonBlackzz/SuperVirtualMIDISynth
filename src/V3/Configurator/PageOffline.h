@@ -79,6 +79,7 @@ private:
     std::wstring lastMidiDirectory_;
     std::wstring lastSoundFontDirectory_;
     std::wstring lastOutputDirectory_;
+    std::wstring configTemp_;  // working settings handed to the renderer
     bool pathsInitialized_ = false;
     bool outputPathAutomatic_ = true;
 

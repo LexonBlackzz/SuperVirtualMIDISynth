@@ -271,8 +271,13 @@ void OfflineRendererPage::BrowseOutput(HWND owner) {
 }
 
 void OfflineRendererPage::JoinFinishedWorker() {
-    if (worker_.joinable() && !workerRunning_.load(std::memory_order_acquire))
+    if (worker_.joinable() && !workerRunning_.load(std::memory_order_acquire)) {
         worker_.join();
+        if (!configTemp_.empty()) {
+            DeleteFileW(configTemp_.c_str());
+            configTemp_.clear();
+        }
+    }
 }
 
 void OfflineRendererPage::Start(const ConfigDocument& document) {
@@ -342,7 +347,23 @@ void OfflineRendererPage::Start(const ConfigDocument& document) {
     append(L"--limiter-lookahead-ms"); append(number(values.limiterLookaheadMs));
     append(L"--limiter-attack-ms"); append(number(values.limiterAttackMs));
     append(L"--limiter-release-ms"); append(number(values.limiterReleaseMs));
-    append(L"--backend"); append(L"auto");
+    // Hand over the *working* settings (saved or not) so every engine option
+    // - decimation, reverb, velocity, collapse... - matches the live synth.
+    {
+        wchar_t tempDirectory[MAX_PATH]{};
+        const DWORD length = GetTempPathW(MAX_PATH, tempDirectory);
+        if (length > 0 && length < MAX_PATH) {
+            wchar_t name[96]{};
+            swprintf_s(name, L"svms_offline_%lu_%u.json",
+                       GetCurrentProcessId(), serial.load());
+            const std::wstring path = std::wstring(tempDirectory) + name;
+            std::string exportError;
+            if (document.ExportProfile(path, &exportError)) {
+                configTemp_ = path;
+                append(L"--config"); append(path);
+            }
+        }
+    }
     append(L"--machine-progress");
     append(L"--cancel-event"); append(eventName);
 
@@ -417,6 +438,10 @@ void OfflineRendererPage::Shutdown() {
         CloseHandle(processCopy);
     }
     if (worker_.joinable()) worker_.join();
+    if (!configTemp_.empty()) {
+        DeleteFileW(configTemp_.c_str());
+        configTemp_.clear();
+    }
 }
 
 void OfflineRendererPage::ReadProcessOutput(HANDLE readPipe, HANDLE process) {
@@ -600,6 +625,62 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
     if (!pathsReady) {
         ImGui::SameLine();
         ImGui::TextDisabled("Select all three paths to begin.");
+    }
+
+    ImGui::Spacing();
+    SectionHeader("ENGINE SETTINGS USED");
+    ImGui::TextDisabled(
+        "The render uses the current (even unsaved) settings from the other pages, "
+        "so it sounds like the live synth. Greyed rows are live-only for now.");
+    {
+        const ConfigValues& v = document.Working();
+        static const char* const rotation[] = {"Coherent", "Analytic", "Sweep",
+                                               "Diffuse", "Random"};
+        auto onOff = [](bool b) { return b ? "ON" : "off"; };
+        char text[96];
+        if (ImGui::BeginTable("##offline_settings", 4,
+                              ImGuiTableFlags_SizingStretchSame |
+                              ImGuiTableFlags_BordersInnerV |
+                              ImGuiTableFlags_RowBg)) {
+            auto cell = [&](const char* label, const char* value, bool applied) {
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", label);
+                if (applied) ImGui::TextUnformatted(value);
+                else ImGui::TextDisabled("%s (live only)", value);
+            };
+            ImGui::TableNextRow();
+            std::snprintf(text, sizeof(text), "%u", v.maxVoices);
+            cell("VOICE LIMIT", text, true);
+            std::snprintf(text, sizeof(text), "%s%s", onOff(v.decimation),
+                          v.decimation && v.decimationByLevel ? " (by level)" : "");
+            cell("DECIMATION", text, true);
+            std::snprintf(text, sizeof(text), "%u", v.perKeyVoiceCap);
+            cell("PER-KEY CAP", text, true);
+            std::snprintf(text, sizeof(text), "%u", v.ghostBudget);
+            cell("GHOST BUDGET", text, true);
+            ImGui::TableNextRow();
+            std::snprintf(text, sizeof(text), "%u", v.noteOnCollapseThreshold);
+            cell("NOTE-ON COLLAPSE", text, true);
+            cell("NOTE MERGE", onOff(v.noteMerge), true);
+            cell("RE-EXCITE", onOff(v.noteOnReexcite), true);
+            cell("FAST CHUNK MATH", onOff(v.fastChunkMath), true);
+            ImGui::TableNextRow();
+            cell("REVERB", onOff(v.enableReverb), true);
+            std::snprintf(text, sizeof(text), "%.2f / %.2f / %u", v.velocityCurve,
+                          v.velocityFloor, v.velocityIgnoreBelow);
+            cell("VEL CURVE/FLOOR/GATE", text, true);
+            cell("PHASE ROTATION",
+                 rotation[(std::min)(v.phaseRotationMode, 4u)], true);
+            std::snprintf(text, sizeof(text), "%u-EDO", v.tuningEdo);
+            cell("TUNING", text, true);
+            ImGui::TableNextRow();
+            cell("CHANNEL LIMITER", onOff(v.channelLimiterEnabled), false);
+            cell("CC COLLAPSE", onOff(v.ccCollapse), false);
+            cell("BEND COLLAPSE", onOff(v.bendCollapse), false);
+            std::snprintf(text, sizeof(text), "%u ms", v.minNoteMs);
+            cell("MIN NOTE LENGTH", text, false);
+            ImGui::EndTable();
+        }
     }
 
     ImGui::Spacing();
