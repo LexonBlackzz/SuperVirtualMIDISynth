@@ -88,6 +88,13 @@ public:
 // consumed for progress.
 class ParallelMidiDecoder {
 public:
+    // Exact output length in frames, without producing events: every track is
+    // walked in parallel by a minimal skipper that only sums deltas and picks
+    // out tempo changes. Equals the totalFrames Decode() ends with.
+    static bool MeasureDuration(const MappedMidiFile& file, uint32_t sampleRate,
+                                uint64_t& totalFrames, std::string& error,
+                                std::atomic<bool>* cancel = nullptr,
+                                uint32_t threads = 0);
     bool Decode(const MappedMidiFile& file, uint32_t sampleRate,
                 MidiStreamDecoder::Sink sink, void* user,
                 std::atomic<bool>* cancel, MidiStreamInfo* info,

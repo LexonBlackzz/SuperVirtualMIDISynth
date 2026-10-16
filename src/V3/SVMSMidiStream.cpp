@@ -489,6 +489,132 @@ void ParseWindow(std::vector<PTrack>& tracks, WinWorker& w, uint64_t a,
 }
 } // namespace
 
+namespace {
+struct TrackMeasure {
+    uint64_t endTick = 0;
+    std::vector<TempoEv> tempos;
+    bool ok = true;
+};
+
+// Same record grammar as Next(), minus event construction and data-byte
+// validation (Decode() reports those).
+bool MeasureTrack(const Track& tr, TrackMeasure& out) {
+    const uint8_t* p = tr.p;
+    const uint8_t* end = tr.end;
+    uint64_t tick = 0;
+    uint8_t running = 0;
+    while (p < end) {
+        uint32_t delta = 0;
+        if (!VLen(p, end, delta)) return false;
+        tick += delta;
+        if (p == end) return false;
+        uint8_t status = *p;
+        if (status < 0x80) {
+            if (running < 0x80 || running >= 0xf0) return false;
+            status = running;
+        } else {
+            ++p;
+            running = status < 0xf0 ? status : 0;
+        }
+        if (status == 0xff) {
+            if (p == end) return false;
+            const uint8_t type = *p++;
+            uint32_t length = 0;
+            if (!VLen(p, end, length) || uint64_t(end - p) < length) return false;
+            if (type == 0x51 && length == 3) {
+                const uint32_t tempo = (uint32_t(p[0]) << 16) |
+                                       (uint32_t(p[1]) << 8) | p[2];
+                if (tempo) out.tempos.push_back({tick, tempo});
+            }
+            p += length;
+            if (type == 0x2f) break;
+        } else if (status == 0xf0 || status == 0xf7) {
+            uint32_t length = 0;
+            if (!VLen(p, end, length) || uint64_t(end - p) < length) return false;
+            p += length;
+        } else if (status >= 0xf0) {
+            static const uint8_t lengths[16] = {0,1,2,1,0,0,0,0,0,0,0,0,0,0,0,0};
+            const uint8_t n = lengths[status & 15];
+            if (uint64_t(end - p) < n) return false;
+            p += n;
+        } else {
+            const uint8_t kind = status & 0xf0;
+            const uint8_t bytes = (kind == 0xc0 || kind == 0xd0) ? 1 : 2;
+            if (uint64_t(end - p) < bytes) return false;
+            p += bytes;
+        }
+    }
+    out.endTick = tick;
+    return true;
+}
+} // namespace
+
+bool ParallelMidiDecoder::MeasureDuration(const MappedMidiFile& file,
+                                          uint32_t rate, uint64_t& totalFrames,
+                                          std::string& error,
+                                          std::atomic<bool>* cancel,
+                                          uint32_t threads) {
+    MidiStreamInfo header{};
+    std::vector<Track> tracks;
+    if (!Tracks(file, header, tracks, error)) return false;
+    std::vector<TrackMeasure> measures(tracks.size());
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    size_t n = threads ? threads
+                       : (std::min)(32u, (std::max)(1u, std::thread::hardware_concurrency()));
+    n = (std::max<size_t>)(1, (std::min)(n, tracks.size()));
+    auto work = [&] {
+        for (;;) {
+            if (failed.load(std::memory_order_relaxed) ||
+                (cancel && cancel->load(std::memory_order_relaxed))) return;
+            const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= tracks.size()) return;
+            if (!MeasureTrack(tracks[i], measures[i]))
+                failed.store(true, std::memory_order_relaxed);
+        }
+    };
+    std::vector<std::thread> pool;
+    for (size_t k = 1; k < n; ++k) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+    if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+    if (failed.load()) { error = "cannot measure MIDI duration"; return false; }
+
+    uint64_t maxTick = 0;
+    std::vector<TempoEv> tempos;   // track order, then in-track order
+    for (const TrackMeasure& m : measures) {
+        maxTick = (std::max)(maxTick, m.endTick);
+        tempos.insert(tempos.end(), m.tempos.begin(), m.tempos.end());
+    }
+    std::stable_sort(tempos.begin(), tempos.end(),
+                     [](const TempoEv& x, const TempoEv& y) { return x.tick < y.tick; });
+
+    // Piecewise exact floor accumulation, in <=2^28-tick steps so every
+    // product stays inside uint64_t (same bound the VLQ cap gives Run()).
+    const uint64_t denom = uint64_t(header.division) * 1000000ull;
+    uint64_t tempo = 500000u, frame = 0, rem = 0, tick = 0;
+    auto advanceTo = [&](uint64_t target) {
+        const uint64_t num = tempo * rate;
+        const uint64_t q = num / denom, rest = num % denom;
+        while (tick < target) {
+            const uint64_t d = (std::min<uint64_t>)(target - tick, 0x0fffffffull);
+            frame += d * q;
+            const uint64_t fraction = rem + d * rest;
+            frame += fraction / denom;
+            rem = fraction % denom;
+            tick += d;
+        }
+    };
+    for (const TempoEv& t : tempos) {
+        if (t.tick > maxTick) break;
+        advanceTo(t.tick);
+        tempo = t.tempo;
+    }
+    advanceTo(maxTick);
+    totalFrames = frame;
+    return true;
+}
+
 bool ParallelMidiDecoder::Decode(const MappedMidiFile& file, uint32_t rate,
                                  MidiStreamDecoder::Sink sink, void* user,
                                  std::atomic<bool>* cancel,

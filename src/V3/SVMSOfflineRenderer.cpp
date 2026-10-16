@@ -175,6 +175,7 @@ bool ReportScanProgress(uint64_t processed, uint64_t total,
 
 void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
     o.tuningEdo = cfg.tuningEdo;
+    o.phaseRotationMode = cfg.phaseRotationMode;
     // The standalone renderer is still explicitly given a MIDI, SoundFont and
     // output path, but its engine-facing defaults should match the current V3
     // configuration. Command-line options below remain authoritative.
@@ -918,6 +919,27 @@ int RendererMain(int argc, wchar_t** argv) {
     if (!wave.Open(o.output.c_str(), o.sampleRate, 0))
         return fail("cannot create output file");
 
+    // Exact length up front (parallel skim of tempo + end ticks, like the
+    // player's parser) so progress and ETA are real; if it fails the decoder
+    // reports the problem itself.
+    uint64_t expectedFrames = 0;
+    double measureSeconds = 0.0;
+    {
+        MachineStatus(o, "LOADING", "Measuring MIDI duration");
+        const auto measureStart = std::chrono::steady_clock::now();
+        std::string measureError;
+        if (!ParallelMidiDecoder::MeasureDuration(midi, o.sampleRate,
+                                                  expectedFrames, measureError,
+                                                  &cancel))
+            expectedFrames = 0;
+        measureSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - measureStart).count();
+        if (pollCancel()) {
+            MachineStatus(o, "CANCELLED", "Cancelled while loading MIDI");
+            return 3;
+        }
+    }
+
     std::atomic<bool> done{false};
     std::atomic<uint64_t> decoded{0};
     std::atomic<uint64_t> bytesDone{0}, bytesTotal{0};
@@ -951,7 +973,7 @@ int RendererMain(int argc, wchar_t** argv) {
     auto lastMachine = std::chrono::steady_clock::time_point{};
 
     if (humanProgress) {
-        fwprintf(stderr,L"%.2f GB MIDI, single-pass parallel decode | %hs | ring %llu events\n",double(midi.Size())/1073741824.0,synth->Backend(),ring.Capacity());
+        fwprintf(stderr,L"%.2f GB MIDI, %ls long (measured in %.1f s), single-pass parallel decode | %hs | ring %llu events\n",double(midi.Size())/1073741824.0,FormatTime(double(expectedFrames)/o.sampleRate).c_str(),measureSeconds,synth->Backend(),ring.Capacity());
         fwprintf(stderr,L"Render config: %u Hz | voices %u | threads %u | master %.3f | limiter %ls [%ls]",o.sampleRate,o.maxVoices,o.renderThreads,o.masterVolume,o.limiterEnabled?L"ON":L"OFF",o.limiterAlgorithm==LimiterAlgorithm::Adaptive?L"Adaptive":L"Classic");
         if(o.limiterEnabled)fwprintf(stderr,L" (threshold %.3f, lookahead %.2f ms, attack %.2f ms, release %.1f ms)",o.limiterThreshold,o.limiterLookaheadMs,o.limiterAttackMs,o.limiterReleaseMs);
         fputws(L"\n",stderr);
@@ -974,7 +996,8 @@ int RendererMain(int argc, wchar_t** argv) {
             : 0.0;
         const double totalSeconds = known
             ? static_cast<double>(info.totalFrames) / o.sampleRate
-            : (byteFraction > 0.01 ? renderedSeconds / byteFraction : 0.0);
+            : (expectedFrames ? static_cast<double>(expectedFrames) / o.sampleRate
+               : (byteFraction > 0.01 ? renderedSeconds / byteFraction : 0.0));
         const double speed = elapsed > 0.0 ? renderedSeconds / elapsed : 0.0;
         const double remaining = totalSeconds > renderedSeconds
             ? totalSeconds - renderedSeconds : 0.0;
@@ -1174,6 +1197,10 @@ int RendererMain(int argc, wchar_t** argv) {
         MachineStatus(o, "CANCELLED", "Render cancelled; partial WAV retained");
         return 3;
     }
+    if (expectedFrames && !wasCancelled && info.totalFrames != expectedFrames)
+        std::fprintf(stderr, "warning: measured length %llu frames differs from decoded %llu\n",
+                     static_cast<unsigned long long>(expectedFrames),
+                     static_cast<unsigned long long>(info.totalFrames));
     if (!producerError.empty() && events != info.eventCount)
         return fail("decoder error: " + producerError);
     if (!ioOk) return fail("output write failed");
