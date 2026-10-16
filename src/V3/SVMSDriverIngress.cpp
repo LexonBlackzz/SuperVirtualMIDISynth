@@ -658,6 +658,49 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
     return true;
 }
 
+bool Driver::SubmitMidiStreamCancellable(
+    const uint8_t* data, uint32_t size,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
+    if (size == 0u) return true;
+    if (!data) return false;
+    // One guarded copy: the caller's buffer may be unmapped under us.
+    std::vector<uint8_t> owned;
+    try { owned.resize(size); } catch (...) { return false; }
+    SIZE_T copied = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), data, owned.data(), size,
+                           &copied) || copied != size) return false;
+
+    LARGE_INTEGER timestamp{};
+    QueryPerformanceCounter(&timestamp);
+    const uint64_t qpc = static_cast<uint64_t>(timestamp.QuadPart);
+    constexpr uint32_t kChunk = 256u;
+    SVMS_ShortEvent batch[kChunk];
+    uint32_t batched = 0u;
+    bool accepted = true;
+    auto flush = [&]() {
+        if (batched != 0u && accepted)
+            accepted = SubmitShortBatchAtQpcCancellable(
+                batch, batched, qpc, externalCancellation, cancellationToken);
+        batched = 0u;
+    };
+
+    std::lock_guard<std::mutex> lock(midiStreamMutex_);
+    midiStream_.Feed(owned.data(), size,
+        [&](uint32_t message) {
+            batch[batched++] = SVMS_ShortEvent{0u, message, 0u};
+            if (batched == kChunk) flush();
+        },
+        [&](const uint8_t* sysex, uint32_t sysexSize) {
+            flush();   // keep shorts ahead of the SysEx in stream order
+            if (accepted)
+                accepted = SubmitSystemExclusiveCancellable(
+                    sysex, sysexSize, externalCancellation, cancellationToken);
+        });
+    flush();
+    return accepted;
+}
+
 void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
     (void)SubmitSystemExclusiveCancellable(data, size, nullptr, 0u);
 }

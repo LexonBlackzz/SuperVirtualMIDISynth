@@ -162,6 +162,18 @@ static SVMS_Result SVMS_CALL NativeSendSystemExclusive(
         ? SVMS_RESULT_OK : SVMS_RESULT_CANCELLED;
 }
 
+static SVMS_Result SVMS_CALL NativeSendMidiStream(
+    SVMS_Session session, const uint8_t* data, uint32_t size) {
+    std::atomic<uint64_t>* cancellation =
+        NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!data && size != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
+    return g_driver->SubmitMidiStreamCancellable(
+               data, size, cancellation, session)
+        ? SVMS_RESULT_OK : SVMS_RESULT_CANCELLED;
+}
+
 static SVMS_Result SVMS_CALL NativeReset(SVMS_Session session) {
     if (g_nativeOfflineSessions.IsToken(session))
         return g_nativeOfflineSessions.Reset(session);
@@ -539,7 +551,7 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_MIXED_TIMESTAMP_BATCH |
         SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON |
         SVMS_CAP_CANCELLABLE_SUBMISSION | SVMS_CAP_TELEMETRY_V2 |
-        SVMS_CAP_CALLBACK_TRACE;
+        SVMS_CAP_CALLBACK_TRACE | SVMS_CAP_MIDI_STREAM;
 #if !defined(SVMS_XP_COMPAT)
     table.capabilities |= SVMS_CAP_RUNTIME_COMMANDS;
 #endif
@@ -574,6 +586,7 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.get_telemetry_v2 = NativeGetTelemetryV2;
     table.enable_callback_trace = NativeEnableCallbackTrace;
     table.read_callback_trace = NativeReadCallbackTrace;
+    table.send_midi_stream = NativeSendMidiStream;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

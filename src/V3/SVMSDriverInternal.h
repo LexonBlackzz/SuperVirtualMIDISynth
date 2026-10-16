@@ -67,6 +67,7 @@ constexpr uint32_t kNoteOnCollapseDefaultThreshold = 32u;
 #include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
 #include "SVMSSysEx.h"
+#include "SVMSMidiByteStream.h"
 #include "SVMSFrameClock.h"
 #include "SVMSDiagWindow.h"
 #include "SVMSPostFilter.h"
@@ -579,6 +580,14 @@ public:
         const uint8_t* data, uint32_t size,
         const std::atomic<uint64_t>* externalCancellation,
         uint64_t cancellationToken);
+    // Raw MIDI byte stream (running status, packed channel messages, split
+    // SysEx) delivered through any long-data entry point.
+    bool SubmitMidiStreamCancellable(
+        const uint8_t* data, uint32_t size,
+        const std::atomic<uint64_t>* externalCancellation,
+        uint64_t cancellationToken);
+    std::mutex midiStreamMutex_;
+    MidiByteStreamParser midiStream_;
     void SetIngressMode(EventOverflowMode mode);
     // Same-key note-on coalescing spawn interval (power-of-two rounded;
     // values below 2 disable coalescing, which is the default state).

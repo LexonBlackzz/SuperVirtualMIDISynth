@@ -23,9 +23,10 @@ LPVOID WINAPI InitializeKDMAPIStream(void) {
     return reinterpret_cast<LPVOID>(1);
 }
 
-void WINAPI TerminateKDMAPIStream(void) {
+BOOL WINAPI TerminateKDMAPIStream(void) {
     g_kdmapiInitialized.store(false, std::memory_order_release);
     MaybeShutdownDriver();
+    return TRUE;
 }
 
 void WINAPI ResetKDMAPIStream(void) {
@@ -74,7 +75,7 @@ UINT WINAPI SendDirectLongData(LPMIDIHDR lpMidiHdr, UINT cbMidiHdr) {
         !HasMidiOutHeaderFields(lpMidiHdr, cbMidiHdr) ||
         (!lpMidiHdr->lpData && lpMidiHdr->dwBufferLength != 0u))
         return MMSYSERR_INVALPARAM;
-    if (!g_driver->SubmitSystemExclusiveCancellable(
+    if (!g_driver->SubmitMidiStreamCancellable(
         reinterpret_cast<const uint8_t*>(lpMidiHdr->lpData),
         lpMidiHdr->dwBufferLength, nullptr, 0u)) return MMSYSERR_INVALPARAM;
     lpMidiHdr->dwFlags |= MHDR_DONE;
@@ -86,7 +87,7 @@ UINT WINAPI SendDirectLongDataNoBuf(LPSTR data, DWORD size) {
     if (!g_kdmapiInitialized.load(std::memory_order_acquire) || !g_driver ||
         (!data && size != 0u))
         return MMSYSERR_INVALPARAM;
-    return g_driver->SubmitSystemExclusiveCancellable(
+    return g_driver->SubmitMidiStreamCancellable(
         reinterpret_cast<const uint8_t*>(data), size, nullptr, 0u)
         ? MMSYSERR_NOERROR : MMSYSERR_INVALPARAM;
 }

@@ -183,9 +183,9 @@ MMRESULT WINAPI midiOutLongMsg(HMIDIOUT hmo, LPMIDIHDR lpMidiHdr, UINT cbMidiHdr
     lpMidiHdr->dwFlags &= ~MHDR_DONE;
     lpMidiHdr->dwFlags |= MHDR_INQUEUE;
     if (g_driver && lpMidiHdr->dwBufferLength != 0u) {
-        g_driver->SubmitSystemExclusive(
+        (void)g_driver->SubmitMidiStreamCancellable(
             reinterpret_cast<const uint8_t*>(lpMidiHdr->lpData),
-            lpMidiHdr->dwBufferLength);
+            lpMidiHdr->dwBufferLength, nullptr, 0u);
     }
     lpMidiHdr->dwFlags &= ~MHDR_INQUEUE;
     lpMidiHdr->dwFlags |= MHDR_DONE;

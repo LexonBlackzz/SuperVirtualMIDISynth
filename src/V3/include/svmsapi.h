@@ -61,7 +61,10 @@ enum {
      * collapse, fences, render-path selection, callback budget stats). */
     SVMS_CAP_TELEMETRY_V2 = UINT64_C(1) << 15,
     /* Per-callback trace: enable_callback_trace / read_callback_trace. */
-    SVMS_CAP_CALLBACK_TRACE = UINT64_C(1) << 16
+    SVMS_CAP_CALLBACK_TRACE = UINT64_C(1) << 16,
+    /* send_midi_stream: raw MIDI bytes (running status, packed channel
+     * messages, SysEx possibly split across calls). */
+    SVMS_CAP_MIDI_STREAM = UINT64_C(1) << 17
 };
 
 enum {
@@ -473,6 +476,13 @@ typedef SVMS_Result (SVMS_CALL *SVMS_ReadCallbackTraceFn)(
     SVMS_Session session, uint64_t* inout_next_index,
     SVMS_CallbackTrace* records, uint32_t capacity, uint32_t* out_count);
 
+/* Feeds raw MIDI bytes. Unlike send_system_exclusive the buffer need not be
+ * F0..F7 framed: channel messages may use running status (kept across calls)
+ * and a SysEx may span several calls. All events share one arrival time and
+ * keep byte order. The buffer is copied; the caller may reuse it at once. */
+typedef SVMS_Result (SVMS_CALL *SVMS_SendMidiStreamFn)(
+    SVMS_Session session, const uint8_t* data, uint32_t size);
+
 typedef struct SVMS_Interface {
     uint32_t struct_size;
     uint32_t struct_version;
@@ -517,6 +527,7 @@ typedef struct SVMS_Interface {
     SVMS_GetTelemetryV2Fn get_telemetry_v2;
     SVMS_EnableCallbackTraceFn enable_callback_trace;
     SVMS_ReadCallbackTraceFn read_callback_trace;
+    SVMS_SendMidiStreamFn send_midi_stream;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an

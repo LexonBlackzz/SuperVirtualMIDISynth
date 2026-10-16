@@ -12,6 +12,7 @@
 #include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
 #include "SVMSSysEx.h"
+#include "SVMSMidiByteStream.h"
 #include "SVMSConfig.h"
 #include "SVMSFrameClock.h"
 #include "SVMSPostFilter.h"
@@ -2599,6 +2600,39 @@ void TestSixHourFrameClockDrift() {
         Check(std::llabs(recovered - nearEndFrame) <= 1,
               "fixed-epoch frame conversion remains within one frame");
     }
+}
+
+void TestMidiByteStream() {
+    svms::MidiByteStreamParser parser;
+    std::vector<uint32_t> shorts;
+    std::vector<std::vector<uint8_t>> sysex;
+    auto feed = [&](std::initializer_list<uint8_t> bytes) {
+        std::vector<uint8_t> v(bytes);
+        parser.Feed(v.data(), v.size(),
+                    [&](uint32_t m) { shorts.push_back(m); },
+                    [&](const uint8_t* d, uint32_t n) {
+                        sysex.emplace_back(d, d + n);
+                    });
+    };
+    // Packed events + running status + realtime byte inside a message.
+    feed({0x90, 0x3c, 0x64, 0x3e, 0xf8, 0x65, 0xc1, 0x05, 0x07, 0xe0, 0x01, 0x02});
+    Check(shorts.size() == 5u && shorts[0] == 0x00643c90u &&
+              shorts[1] == 0x00653e90u && shorts[2] == 0x000005c1u &&
+              shorts[3] == 0x000007c1u && shorts[4] == 0x000201e0u,
+          "stream: packed events, running status, 1-byte programs, realtime skip");
+    // Running status survives a buffer boundary.
+    shorts.clear();
+    feed({0x91, 0x40}); feed({0x5a, 0x41, 0x5b});
+    Check(shorts.size() == 2u && shorts[0] == 0x005a4091u &&
+              shorts[1] == 0x005b4191u,
+          "stream: message and running status span buffers");
+    // SysEx split over three buffers keeps order; F7 clears running status.
+    shorts.clear();
+    feed({0xb0, 0x07, 0x64, 0xf0, 0x7e}); feed({0x7f, 0x09}); feed({0x01, 0xf7, 0x40, 0x01});
+    Check(sysex.size() == 1u && sysex[0].size() == 6u &&
+              sysex[0].front() == 0xf0u && sysex[0].back() == 0xf7u &&
+              shorts.size() == 1u && shorts[0] == 0x006407b0u,
+          "stream: fragmented SysEx reassembles; running status cleared by F7");
 }
 
 void TestXGSystemExclusiveTranslation() {
@@ -7702,6 +7736,7 @@ void TestReExciteRenderDifferential(uint32_t kPool, int scenario) {
 }
 
 int main() {
+    TestMidiByteStream();
     TestReExciteKey();
     TestReExciteRenderDifferential(128u, 0);
     TestReExciteRenderDifferential(2u, 1);

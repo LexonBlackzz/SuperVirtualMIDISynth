@@ -41,6 +41,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <mmsystem.h>  /* MIDIHDR, MMSYSERR_*; windows.h omits it under LEAN_AND_MEAN */
 
 #ifndef SVMSAPI_MODULE_NAME
 #define SVMSAPI_MODULE_NAME L"SVMSAPI.dll"
@@ -102,7 +103,7 @@ static BOOL SVMSAPI_Load(void) {
     SVMSAPI_ResetStreamProc = (SVMSAPI_ResetStreamFn)(void*)GetProcAddress(module, "ResetKDMAPIStream");
     SVMSAPI_SendCustomEventProc = (SVMSAPI_SendCustomEventFn)(void*)GetProcAddress(module, "SendCustomEvent");
     SVMSAPI_SendDirectDataProc = (SVMSAPI_SendDirectDataFn)(void*)GetProcAddress(module, "SendDirectData");
-    SVMSAPI_SendDirectDataNoBufProc = (SVMSAPI_SendDirectDataNoBufFn)(void*)GetProcAddress(module, "SendDirectDataNoBuf");
+    SVMSAPI_SendDirectDataNoBufProc = (SVMSAPI_SendDirectDataFn)(void*)GetProcAddress(module, "SendDirectDataNoBuf");
     SVMSAPI_SendDirectLongDataProc = (SVMSAPI_SendDirectLongDataFn)(void*)GetProcAddress(module, "SendDirectLongData");
     SVMSAPI_SendDirectLongDataNoBufProc = (SVMSAPI_SendDirectLongDataNoBufFn)(void*)GetProcAddress(module, "SendDirectLongDataNoBuf");
     SVMSAPI_PrepareLongDataProc = (SVMSAPI_PrepareLongDataFn)(void*)GetProcAddress(module, "PrepareLongData");
@@ -135,9 +136,6 @@ static void SVMSAPI_Unload(void) {
     SVMSAPI_GetDebugInfoProc = NULL;
     SVMSAPI_LoadFontsListProc = NULL;
     SVMSAPI_TimeGetTime64Proc = NULL;
-    SVMSAPI_GetVoiceCountProc = NULL;
-    SVMSAPI_GetVoiceStatisticsProc = NULL;
-    SVMSAPI_GetRenderingTimeProc = NULL;
 }
 
 /* ── KDMAPI-compatible entry points (names match OmniMIDI.h) ───────── */
@@ -153,16 +151,17 @@ static BOOL InitializeKDMAPIStream(void) {
 }
 
 static BOOL TerminateKDMAPIStream(void) {
-    return SVMSAPI_TermStreamProc ? SVMSAPI_TermStreamProc() : FALSE;
+    return SVMSAPI_Load() && SVMSAPI_TermStreamProc
+        ? SVMSAPI_TermStreamProc() : FALSE;
 }
 
 static VOID ResetKDMAPIStream(void) {
-    if (SVMSAPI_ResetStreamProc) SVMSAPI_ResetStreamProc();
+    if (SVMSAPI_Load() && SVMSAPI_ResetStreamProc) SVMSAPI_ResetStreamProc();
 }
 
 static BOOL ReturnKDMAPIVer(LPDWORD major, LPDWORD minor,
                             LPDWORD build, LPDWORD revision) {
-    return SVMSAPI_ReturnKDMAPIProc
+    return SVMSAPI_Load() && SVMSAPI_ReturnKDMAPIProc
         ? SVMSAPI_ReturnKDMAPIProc(major, minor, build, revision) : FALSE;
 }
 
@@ -177,52 +176,52 @@ static VOID SendDirectDataNoBuf(DWORD dwMsg) {
 }
 
 static BOOL SendCustomEvent(DWORD eventtype, DWORD chan, DWORD param) {
-    return SVMSAPI_SendCustomEventProc
+    return SVMSAPI_Load() && SVMSAPI_SendCustomEventProc
         ? SVMSAPI_SendCustomEventProc(eventtype, chan, param) : FALSE;
 }
 
 static UINT SendDirectLongData(MIDIHDR* header, UINT headerSize) {
-    return SVMSAPI_SendDirectLongDataProc
+    return SVMSAPI_Load() && SVMSAPI_SendDirectLongDataProc
         ? SVMSAPI_SendDirectLongDataProc(header, headerSize)
         : MMSYSERR_INVALPARAM;
 }
 
 static UINT SendDirectLongDataNoBuf(LPSTR data, DWORD size) {
-    return SVMSAPI_SendDirectLongDataNoBufProc
+    return SVMSAPI_Load() && SVMSAPI_SendDirectLongDataNoBufProc
         ? SVMSAPI_SendDirectLongDataNoBufProc(data, size)
         : MMSYSERR_INVALPARAM;
 }
 
 static UINT PrepareLongData(MIDIHDR* header, UINT headerSize) {
-    return SVMSAPI_PrepareLongDataProc
+    return SVMSAPI_Load() && SVMSAPI_PrepareLongDataProc
         ? SVMSAPI_PrepareLongDataProc(header, headerSize)
         : MMSYSERR_INVALPARAM;
 }
 
 static UINT UnprepareLongData(MIDIHDR* header, UINT headerSize) {
-    return SVMSAPI_UnprepareLongDataProc
+    return SVMSAPI_Load() && SVMSAPI_UnprepareLongDataProc
         ? SVMSAPI_UnprepareLongDataProc(header, headerSize)
         : MMSYSERR_INVALPARAM;
 }
 
 static BOOL DriverSettings(DWORD setting, DWORD mode, LPVOID value,
                            UINT cbValue) {
-    return SVMSAPI_DriverSettingsProc
+    return SVMSAPI_Load() && SVMSAPI_DriverSettingsProc
         ? SVMSAPI_DriverSettingsProc(setting, mode, value, cbValue) : FALSE;
 }
 
 /* Opaque handle: the debug-info layout is implementation specific
  * (OmniMIDI, SVMS and other KDMAPI synths differ). */
 static VOID* GetDriverDebugInfo(void) {
-    return SVMSAPI_GetDebugInfoProc ? SVMSAPI_GetDebugInfoProc() : nullptr;
+    return SVMSAPI_Load() && SVMSAPI_GetDebugInfoProc ? SVMSAPI_GetDebugInfoProc() : NULL;
 }
 
 static VOID LoadCustomSoundFontsList(LPWSTR directory) {
-    if (SVMSAPI_LoadFontsListProc) SVMSAPI_LoadFontsListProc(directory);
+    if (SVMSAPI_Load() && SVMSAPI_LoadFontsListProc) SVMSAPI_LoadFontsListProc(directory);
 }
 
 static DWORD64 timeGetTime64(void) {
-    return SVMSAPI_TimeGetTime64Proc ? SVMSAPI_TimeGetTime64Proc() : 0u;
+    return SVMSAPI_Load() && SVMSAPI_TimeGetTime64Proc ? SVMSAPI_TimeGetTime64Proc() : 0u;
 }
 
 #endif /* SVMSAPI_NO_CLIENT_BINDERS */
