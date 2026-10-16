@@ -114,6 +114,11 @@ struct EngineConfig {
     // material; bends reach the engine at most about once per page
     // (a few ms) per channel instead of at every source tick.
     bool bendCollapse;
+    // Opt-in (default 0 = off): a note-off that lands closer than this many
+    // milliseconds to its key's last note-on is moved to note-on + this
+    // length (compiler-side).  Notes shorter than the floor sound for the
+    // floor; lowers timing accuracy of note ends.
+    uint32_t minNoteMs;
     // Opt-in single-producer ingress fast path (events.fast_producer): the
     // thread that submits first feeds the compiler through a private ring
     // with plain stores instead of the shared MPSC lanes. Off by default.

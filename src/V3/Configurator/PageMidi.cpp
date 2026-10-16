@@ -197,6 +197,17 @@ void DrawMidiPage(ConfigDocument& doc) {
                 send(svms::RLCommandType::SetBendCollapse, w.bendCollapse ? 1u : 0u);
             }
             ImGui::Spacing();
+            {
+                int minNote = static_cast<int>(w.minNoteMs);
+                if (PanelSliderInt("MIN NOTE LENGTH  (LOWERS ACCURACY)", &minNote, 0, 100,
+                                   "OFF by default. DECREASES ACCURACY: a note-off that arrives sooner than this many milliseconds after its key's last note-on is moved out to that length, so every note sounds at least this long. Black MIDI whose notes are shorter than a render block normally launch and release inside one block and come out as near-silent clicks; this makes them audible as the dense wall of sound they stand for. Note ends are no longer exact and short staccato passages smear together. Note starts, pitch and sample data are not touched. Applies live.",
+                                   false, "OFF")) {
+                    w.minNoteMs = static_cast<uint32_t>(minNote);
+                    doc.MarkDirty();
+                    send(svms::RLCommandType::SetMinNoteLength, w.minNoteMs);
+                }
+            }
+            ImGui::Spacing();
             if (PanelLever("EXACT NOTE MERGE", &w.noteMerge,
                            "OFF by default. Identical note-ons (same channel, key, velocity and exact frame, from any track) become ONE voice at N times the gain. Identical voices sum linearly, so this sounds the same as playing all N, but costs one voice instead of N. Each note-off releases one copy; copies that end at different times are split off exactly. Nothing is dropped or re-timed, unlike NOTE-ON COALESCING. The effective-voice counter shows how many voices the pool would hold unmerged. Launch order inside one frame can change, which only matters if voices are stolen.")) {
                 doc.MarkDirty();

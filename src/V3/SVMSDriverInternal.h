@@ -734,6 +734,11 @@ private:
     // as the CC collapse). Black MIDI with tens of thousands of bends a second
     // otherwise splits every voice of the channel into 8-frame spans.
     std::atomic<bool> bendCollapseEnabled_{false};
+    // Opt-in minimum note length (events.min_note_ms, 0 = off).  The
+    // compiler thread keeps the last note-on target frame per key and moves
+    // an earlier note-off to note-on + the floor.
+    std::atomic<uint32_t> minNoteMs_{0u};
+    int64_t minNoteLastOnFrame_[kChannelCount * kNoteCount]{};
     CcCollapseRecord bendCollapseRecords_[kChannelCount]{};
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block sample offset.

@@ -1061,11 +1061,31 @@ void Driver::EventCompilerLoop() {
         const bool collapseCc = ccCollapseEnabled_.load(std::memory_order_relaxed);
         const bool collapseBend =
             bendCollapseEnabled_.load(std::memory_order_relaxed);
+        const int64_t minNoteFrames = static_cast<int64_t>(
+            minNoteMs_.load(std::memory_order_relaxed)) * sampleRate / 1000;
         auto compileOne = [&](const TimestampedMidiEvent& source) {
             ScheduledRenderEvent scheduled{};
             if (!CompileTimestampedEvent(source, epoch, qpcFreq, sampleRate,
                                         bufferFrames, scheduled)) {
                 return;
+            }
+            // Opt-in minimum note length: a note-off closer than the floor to
+            // its key's last note-on is moved out to note-on + floor.  The
+            // page is sorted after compilation, so the new target frame
+            // lands in order.
+            if (minNoteFrames != 0 && scheduled.data1 < kNoteCount &&
+                scheduled.channel < kChannelCount) {
+                int64_t& lastOn = minNoteLastOnFrame_[
+                    scheduled.channel * kNoteCount + scheduled.data1];
+                if (scheduled.BaseType() == RenderEventType::NoteOn) {
+                    lastOn = static_cast<int64_t>(scheduled.targetFrame);
+                } else if (scheduled.type == RenderEventType::NoteOff &&
+                           static_cast<int64_t>(scheduled.targetFrame) <
+                               lastOn + minNoteFrames) {
+                    scheduled.targetFrame =
+                        static_cast<decltype(scheduled.targetFrame)>(
+                            lastOn + minNoteFrames);
+                }
             }
             // Opt-in CC collapse: a collapsible controller supersedes the
             // still-pending same-(channel,controller) event in this page by

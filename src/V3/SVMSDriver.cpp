@@ -409,6 +409,7 @@ bool Driver::Initialize() {
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
     bendCollapseEnabled_.store(cfg.bendCollapse, std::memory_order_relaxed);
+    minNoteMs_.store(cfg.minNoteMs, std::memory_order_relaxed);
     SetFastProducer(cfg.fastProducer);
     noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
     noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
@@ -561,6 +562,7 @@ bool Driver::Initialize() {
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
     bendCollapseEnabled_.store(cfg.bendCollapse, std::memory_order_relaxed);
+    minNoteMs_.store(cfg.minNoteMs, std::memory_order_relaxed);
     SetFastProducer(cfg.fastProducer);
     noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
     noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);

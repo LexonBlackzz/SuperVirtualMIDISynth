@@ -85,6 +85,7 @@ struct ConfigValues {
     // Opt-in compiler-side CC collapse (superseded same-(channel,controller)).
     bool ccCollapse = false;
     bool bendCollapse = false;
+    uint32_t minNoteMs = 0u;
     bool fastProducer = false;
     // Key-sharded engine (JSON-only for now): 0/1 = off.
     uint32_t shards = 1u;

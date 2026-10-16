@@ -264,6 +264,15 @@ void DrawPerformancePage(ConfigDocument& doc) {
             }
             ImGui::Spacing();
 
+            int shardCount = static_cast<int>(w.shards);
+            if (PanelSliderInt("ENGINE SHARDS", &shardCount, 1, 16,
+                               "Splits the engine into this many independent cores, each with its own voice pool, event compiler and planning thread; notes are routed by key, everything else goes to every core. Planning (launches, steals) is single-threaded per core, so on very dense Black MIDI more shards means more of it in parallel. Render threads are divided between the shards, so keep render threads at least twice the shard count. 1 = a single core. Measured on a 20-thread CPU on a 124M-note MIDI: 6 shards with 20 render threads was best. Takes effect after a restart.",
+                               true)) {
+                w.shards = static_cast<uint32_t>(shardCount);
+                doc.MarkDirty();
+            }
+            ImGui::Spacing();
+
             static const char* affinityLabels[] = {"OFF", "ALL ON P", "RT ON P"};
             int affinity = static_cast<int>((std::min)(2u, w.threadAffinityMode));
             if (PanelKeys("THREAD AFFINITY  (LIVE)", &affinity, affinityLabels, 3,

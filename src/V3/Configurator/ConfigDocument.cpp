@@ -172,6 +172,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.threadAffinityMode = 0u;
     d.ccCollapse = false;
     d.bendCollapse = false;
+    d.minNoteMs = 0u;
     d.fastProducer = false;
     d.shards = 1u;
     d.noteMerge = false;
@@ -297,6 +298,7 @@ void ConfigDocument::FromJson(const json& root) {
             bend->is_boolean()) {
             working_.bendCollapse = bend->get<bool>();
         }
+        ReadNum(*it, "min_note_ms", working_.minNoteMs, 0u, 200u);
         if (auto fast = it->find("fast_producer"); fast != it->end() &&
             fast->is_boolean()) {
             working_.fastProducer = fast->get<bool>();
@@ -478,6 +480,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
     root["events"]["bend_collapse"] = working_.bendCollapse;
+    root["events"]["min_note_ms"] = working_.minNoteMs;
     root["events"]["fast_producer"] = working_.fastProducer;
     root["events"]["note_merge"] = working_.noteMerge;
     root["synth"]["block_timing"] = working_.blockTiming;
@@ -693,6 +696,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
         && a.bendCollapse == b.bendCollapse
+        && a.minNoteMs == b.minNoteMs
         && a.fastProducer == b.fastProducer
         && a.shards == b.shards
         && a.noteMerge == b.noteMerge

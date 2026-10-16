@@ -358,6 +358,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"overflow_mode", "priority"},
             {"cc_collapse", cfg.ccCollapse},
             {"bend_collapse", cfg.bendCollapse},
+            {"min_note_ms", cfg.minNoteMs},
             {"fast_producer", cfg.fastProducer},
             {"note_merge", cfg.noteMerge},
             {"ring_capacity", cfg.eventRingCapacity},
@@ -746,6 +747,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             else
                 AppendWarning(cfg.configWarning, "events.bend_collapse");
         }
+        if (!ReadValue(*it, "min_note_ms", cfg.minNoteMs, 0u, 200u))
+            AppendWarning(cfg.configWarning, "events.min_note_ms");
         if (auto fast = it->find("fast_producer"); fast != it->end()) {
             if (fast->is_boolean())
                 cfg.fastProducer = fast->get<bool>();
@@ -1048,6 +1051,7 @@ EngineConfig EngineConfig::Default() {
     cfg.decimationCullBlocks = 5u;  // only matters once decimation is on
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.bendCollapse = false;    // opt-in: every pitch bend dispatches by default
+    cfg.minNoteMs = 0u;          // opt-in: note ends at their exact time by default
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.fastProducer = false;    // opt-in: shared MPSC lanes by default
     cfg.noteMerge = false;       // opt-in: every note-on launches its own voice
@@ -1169,6 +1173,7 @@ bool EngineConfig::Validate() const {
             voiceMemoryBudgetMB <= 65536u &&
             renderThreads <= 64u &&
             shards <= 32u &&
+            minNoteMs <= 200u &&
             masterVolume >= 0.0f && masterVolume <= 4.0f &&
             (limiterAlgorithm == LimiterAlgorithm::Classic ||
              limiterAlgorithm == LimiterAlgorithm::Adaptive) &&

@@ -472,6 +472,24 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetMinNoteLength: {
+        // param = minimum note length in ms (0 = off).  Read per compiler
+        // page; shard cores follow.
+        if (cmd.param > 200u) {
+            strncpy_s(resultText, kText, "minimum note length must be 0..200 ms",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        minNoteMs_.store(cmd.param, std::memory_order_relaxed);
+        for (Driver* shard : shards_)
+            shard->minNoteMs_.store(cmd.param, std::memory_order_relaxed);
+        engineConfig_.minNoteMs = cmd.param;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "minimum note length: on (lowers accuracy)"
+                            : "minimum note length: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
     case RT::SetFastChunkMath: {
         // param = opt-in closed-form chunk math in the AVX2 release kernel.
         // Process-wide flag read per kernel call; not bit-exact vs scalar.
