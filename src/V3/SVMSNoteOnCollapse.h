@@ -77,8 +77,13 @@ public:
     // velocity-stacking state: the number of note-ons this spawned voice
     // represents (inclusive of the current hit) on spawn, or the running
     // collapsed count otherwise.
+    // `owner` = the caller is the only thread driving this gate (the fast
+    // producer): the per-key read-modify-writes then use plain relaxed
+    // load+store instead of locked RMWs.  The gate is already documented as
+    // race-tolerant (worst case one extra or missed spawn); this only drops
+    // the ~20-cycle bus lock per hit on the hot producer path.
     bool OnNoteOn(uint32_t keyIndex, uint64_t qpc,
-                  uint32_t& outStack) noexcept {
+                  uint32_t& outStack, bool owner = false) noexcept {
         const uint32_t t = threshold_.load(std::memory_order_relaxed);
         if (t <= 1u) {
             outStack = 1u; // disabled: every hit spawns on its own
@@ -106,18 +111,34 @@ public:
         // Inside the window: spawn on every `t`-th hit, re-anchoring the
         // window at each spawn so the sustained spawn rate is exactly
         // t / window, independent of buffer size or block boundaries.
-        const uint32_t hit = windowHits_[idx].fetch_add(
-            1u, std::memory_order_relaxed) + 1u;
+        uint32_t hit;
+        if (owner) {
+            hit = windowHits_[idx].load(std::memory_order_relaxed) + 1u;
+            windowHits_[idx].store(hit, std::memory_order_relaxed);
+        } else {
+            hit = windowHits_[idx].fetch_add(
+                1u, std::memory_order_relaxed) + 1u;
+        }
         if ((hit & (t - 1u)) == 0u) {
             lastSpawnQpc_[idx].store(qpc, std::memory_order_relaxed);
             windowHits_[idx].store(0u, std::memory_order_relaxed);
-            outStack = stacks_[idx].exchange(0u,
-                std::memory_order_relaxed) + 1u;
+            if (owner) {
+                outStack = stacks_[idx].load(std::memory_order_relaxed) + 1u;
+                stacks_[idx].store(0u, std::memory_order_relaxed);
+            } else {
+                outStack = stacks_[idx].exchange(
+                    0u, std::memory_order_relaxed) + 1u;
+            }
             NoteSpawn(idx, outStack);
             return true;
         }
-        const uint32_t prev = stacks_[idx].fetch_add(
-            1u, std::memory_order_relaxed);
+        uint32_t prev;
+        if (owner) {
+            prev = stacks_[idx].load(std::memory_order_relaxed);
+            stacks_[idx].store(prev + 1u, std::memory_order_relaxed);
+        } else {
+            prev = stacks_[idx].fetch_add(1u, std::memory_order_relaxed);
+        }
         outStack = prev + 1u < kStackCap ? prev + 1u : kStackCap;
         return false;
     }

@@ -1051,6 +1051,22 @@ private:
     void JoinShardsAndMix(float* left, float* right, uint32_t numFrames);
     void ShardThreadLoop();
     void ApplySoundFontStack(SoundFontBundle* next) noexcept;
+    bool PrepareShortEvent(uint32_t msg, uint64_t qpcTimestamp,
+                           uint64_t cadenceCounter, TimestampedMidiEvent& evt,
+                           EventLane& lane, bool& lossless,
+                           uint8_t& velocity, bool fastOwner);
+    bool SubmitShortBatchCore(const SVMS_ShortEvent* events,
+                              uint32_t eventCount, uint64_t immediateQpc,
+                              const std::atomic<uint64_t>* externalCancellation,
+                              uint64_t cancellationToken);
+    bool SubmitShardedBatch(const SVMS_ShortEvent* events,
+                            uint32_t eventCount, uint64_t immediateQpc,
+                            const std::atomic<uint64_t>* externalCancellation,
+                            uint64_t cancellationToken);
+    bool SubmitMixedBatchFast(const SVMS_ShortEvent* events,
+                              uint32_t eventCount, uint64_t immediateQpc,
+                              const std::atomic<uint64_t>* externalCancellation,
+                              uint64_t cancellationToken);
     bool SubmitShortMsgAtQpcCancellableCore(
         uint32_t msg, uint64_t qpcTimestamp,
         const std::atomic<uint64_t>* externalCancellation,

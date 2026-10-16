@@ -340,46 +340,31 @@ bool Driver::IsFastProducerThread() noexcept {
     return false;
 }
 
-bool Driver::SubmitShortMsgAtQpcCancellableCore(
-    uint32_t msg, uint64_t qpcTimestamp,
-    const std::atomic<uint64_t>* externalCancellation,
-    uint64_t cancellationToken) {
-    TimestampedMidiEvent evt{};
-    evt.message = msg;
-    const bool fastOwner = IsFastProducerThread();
-    uint64_t cadenceCounter;
-    if (fastOwner) {
-        // Owner thread: sequences come from a leased block, the submitted
-        // count is a plain store, and the push below is one ring store. The
-        // sequence stays strictly increasing within this thread's stream.
-        if (fastSequenceNext_ == fastSequenceEnd_) {
-            fastSequenceNext_ = nextEventSequence_.fetch_add(
-                kFastSequenceLease, std::memory_order_relaxed);
-            fastSequenceEnd_ = fastSequenceNext_ + kFastSequenceLease;
-            fastLeased_.store(fastLeased_.load(std::memory_order_relaxed) +
-                                  kFastSequenceLease,
-                              std::memory_order_relaxed);
-        }
-        evt.sequence = static_cast<uint32_t>(fastSequenceNext_++);
-        cadenceCounter = fastSubmitted_.load(std::memory_order_relaxed) + 1u;
-        fastSubmitted_.store(cadenceCounter, std::memory_order_relaxed);
+// Statistics counter bump.  The fast-producer thread is the only writer of
+// its core's counters in practice, so it skips the locked RMW (a lost update
+// under a rare second submitting thread only skews a census number).
+template <typename Counter>
+static inline void BumpStat(Counter& counter, bool owner) {
+    if (owner) {
+        counter.store(counter.load(std::memory_order_relaxed) + 1,
+                      std::memory_order_relaxed);
     } else {
-        evt.sequence = static_cast<uint32_t>(
-            nextEventSequence_.fetch_add(1, std::memory_order_relaxed));
-        cadenceCounter = evt.sequence;
+        counter.fetch_add(1, std::memory_order_relaxed);
     }
-    evt.qpcTimestamp = qpcTimestamp;
+}
 
-    if (externalCancellation && externalCancellation->load(
-            std::memory_order_acquire) == cancellationToken) {
-        cancelledAtomic_.fetch_add(1, std::memory_order_relaxed);
-        notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-
+// Everything between sequence assignment and the ring push: termination
+// fences, same-key coalescing, lane choice and the velocity shed.  Returns
+// false when the event is consumed here (coalesced or shed).  Shared by the
+// single-event path and the batch paths so they cannot drift apart.
+bool Driver::PrepareShortEvent(uint32_t msg, uint64_t qpcTimestamp,
+                               uint64_t cadenceCounter,
+                               TimestampedMidiEvent& evt, EventLane& lane,
+                               bool& lossless, uint8_t& velocity,
+                               bool fastOwner) {
     const uint8_t status = static_cast<uint8_t>(msg & 0xffu);
     const uint8_t data1 = static_cast<uint8_t>((msg >> 8) & (((status & 0xe0u) == 0x80u) ? 0xffu : 0x7fu));
-    uint8_t velocity = static_cast<uint8_t>((msg >> 16) & 0x7fu);
+    velocity = static_cast<uint8_t>((msg >> 16) & 0x7fu);
     const bool noteOn = !IsInternalEngineMessage(msg) &&
                         (status & 0xf0u) == 0x90u && velocity != 0;
 
@@ -403,16 +388,17 @@ bool Driver::SubmitShortMsgAtQpcCancellableCore(
         const uint32_t keyIndex =
             static_cast<uint32_t>(status & 0x0fu) * kNoteCount + data1;
         uint32_t stack = 0u;
-        if (!noteOnCollapse_.OnNoteOn(keyIndex, qpcTimestamp, stack)) {
-            coalescedAtomic_.fetch_add(1u, std::memory_order_relaxed);
+        if (!noteOnCollapse_.OnNoteOn(keyIndex, qpcTimestamp, stack,
+                                      fastOwner)) {
+            BumpStat(coalescedAtomic_, fastOwner);
             if (!noteOnReexcite_.load(std::memory_order_relaxed)) {
-                notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
-                return true;
+                BumpStat(notAcceptedAtomic_, fastOwner);
+                return false;
             }
             // Hits inside the previous kept hit's attack ramp change nothing.
             if (!noteOnCollapse_.AllowReExcite(keyIndex, qpcTimestamp)) {
-                notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
-                return true;
+                BumpStat(notAcceptedAtomic_, fastOwner);
+                return false;
             }
             // Re-excite: keep the hit at its exact timestamp, tagged so the
             // audio thread restarts the key's live voices instead of
@@ -452,7 +438,7 @@ bool Driver::SubmitShortMsgAtQpcCancellableCore(
         noteOnCollapse_.ResetAll();
     }
 
-    EventLane lane = EventLane::State;
+    lane = EventLane::State;
     if (noteOn) {
         if (velocity >= highPriorityVelocity_) lane = EventLane::Loud;
         else if (velocity >= 64) lane = EventLane::UpperMedium;
@@ -474,14 +460,60 @@ bool Driver::SubmitShortMsgAtQpcCancellableCore(
         overflowMode_.load(std::memory_order_relaxed);
     if (noteOn && velocity < cutoff &&
         overflowMode == EventOverflowMode::PriorityVelocity) {
-        shedAtomic_.fetch_add(1, std::memory_order_relaxed);
-        shedByVelocityAtomic_[velocity].fetch_add(1, std::memory_order_relaxed);
-        notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        BumpStat(shedAtomic_, fastOwner);
+        BumpStat(shedByVelocityAtomic_[velocity], fastOwner);
+        BumpStat(notAcceptedAtomic_, fastOwner);
+        return false;
     }
 
-    const bool lossless = !noteOn || velocity >= highPriorityVelocity_ ||
+    lossless = !noteOn || velocity >= highPriorityVelocity_ ||
                           overflowMode == EventOverflowMode::LosslessBackpressure;
+    return true;
+}
+
+bool Driver::SubmitShortMsgAtQpcCancellableCore(
+    uint32_t msg, uint64_t qpcTimestamp,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
+    TimestampedMidiEvent evt{};
+    evt.message = msg;
+    const bool fastOwner = IsFastProducerThread();
+    uint64_t cadenceCounter;
+    if (fastOwner) {
+        // Owner thread: sequences come from a leased block, the submitted
+        // count is a plain store, and the push below is one ring store. The
+        // sequence stays strictly increasing within this thread's stream.
+        if (fastSequenceNext_ == fastSequenceEnd_) {
+            fastSequenceNext_ = nextEventSequence_.fetch_add(
+                kFastSequenceLease, std::memory_order_relaxed);
+            fastSequenceEnd_ = fastSequenceNext_ + kFastSequenceLease;
+            fastLeased_.store(fastLeased_.load(std::memory_order_relaxed) +
+                                  kFastSequenceLease,
+                              std::memory_order_relaxed);
+        }
+        evt.sequence = static_cast<uint32_t>(fastSequenceNext_++);
+        cadenceCounter = fastSubmitted_.load(std::memory_order_relaxed) + 1u;
+        fastSubmitted_.store(cadenceCounter, std::memory_order_relaxed);
+    } else {
+        evt.sequence = static_cast<uint32_t>(
+            nextEventSequence_.fetch_add(1, std::memory_order_relaxed));
+        cadenceCounter = evt.sequence;
+    }
+    evt.qpcTimestamp = qpcTimestamp;
+
+    if (externalCancellation && externalCancellation->load(
+            std::memory_order_acquire) == cancellationToken) {
+        cancelledAtomic_.fetch_add(1, std::memory_order_relaxed);
+        notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    EventLane lane;
+    bool lossless;
+    uint8_t velocity;
+    if (!PrepareShortEvent(msg, qpcTimestamp, cadenceCounter, evt, lane,
+                           lossless, velocity, fastOwner))
+        return true;
     for (;;) {
             if (fastOwner ? midiIngress_.TryPushFast(evt)
                           : midiIngress_.TryPush(lane, evt)) {
@@ -532,7 +564,155 @@ bool Driver::SubmitShortMsgAtQpcCancellableCore(
     }
 }
 
+// Public entry: on a sharded master the batch is split per core (notes to
+// their shard, everything else to every core, each core's subsequence in the
+// original order); otherwise it goes straight to the core path.
 bool Driver::SubmitShortBatchAtQpcCancellable(
+    const SVMS_ShortEvent* events, uint32_t eventCount,
+    uint64_t immediateQpc,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
+    if (!events && eventCount != 0u) return false;
+    if (shardCount_ > 1u && !shardMaster_)
+        return SubmitShardedBatch(events, eventCount, immediateQpc,
+                                  externalCancellation, cancellationToken);
+    return SubmitShortBatchCore(events, eventCount, immediateQpc,
+                                externalCancellation, cancellationToken);
+}
+
+bool Driver::SubmitShardedBatch(
+    const SVMS_ShortEvent* events, uint32_t eventCount,
+    uint64_t immediateQpc,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
+    constexpr uint32_t kChunk = 4096u;
+    constexpr uint32_t kMaxCores = 32u;
+    static thread_local std::vector<SVMS_ShortEvent> perCore[kMaxCores];
+    const uint32_t cores = (std::min)(shardCount_, kMaxCores);
+    for (uint32_t base = 0u; base < eventCount; base += kChunk) {
+        const uint32_t count = (std::min)(kChunk, eventCount - base);
+        for (uint32_t core = 0u; core < cores; ++core) perCore[core].clear();
+        for (uint32_t i = 0u; i < count; ++i) {
+            const SVMS_ShortEvent& event = events[base + i];
+            const uint32_t msg = event.packed_message;
+            const uint8_t status = static_cast<uint8_t>(msg & 0xffu);
+            const uint8_t type = status & 0xf0u;
+            if (!IsInternalEngineMessage(msg) &&
+                (type == 0x80u || type == 0x90u)) {
+                perCore[ShardFor(status & 0x0fu,
+                                 static_cast<uint8_t>((msg >> 8u) & 0x7fu))]
+                    .push_back(event);
+            } else {
+                for (uint32_t core = 0u; core < cores; ++core)
+                    perCore[core].push_back(event);
+            }
+        }
+        for (uint32_t core = 0u; core < cores; ++core) {
+            if (perCore[core].empty()) continue;
+            Driver* target = core == 0u ? this : shards_[core - 1u];
+            if (!target->SubmitShortBatchCore(
+                    perCore[core].data(),
+                    static_cast<uint32_t>(perCore[core].size()),
+                    immediateQpc, externalCancellation, cancellationToken))
+                return false;
+        }
+    }
+    return true;
+}
+
+// Fast-owner batch of arbitrary events (note-offs, controllers, mixed
+// velocities).  Each event still goes through PrepareShortEvent, so fences,
+// coalescing and shedding are exactly the single-event behaviour; only the
+// ring push is amortised.  A chunk the ring cannot take whole falls back to
+// the single-event push/shed/wait rules.
+bool Driver::SubmitMixedBatchFast(
+    const SVMS_ShortEvent* events, uint32_t eventCount,
+    uint64_t immediateQpc,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
+    constexpr uint32_t kChunk = 256u;
+    TimestampedMidiEvent prepared[kChunk];
+    uint8_t lossless[kChunk];
+    uint8_t velocities[kChunk];
+    uint32_t cursor = 0u;
+    while (cursor < eventCount) {
+        if (cancelProducers_.load(std::memory_order_acquire) ||
+            (externalCancellation && externalCancellation->load(
+                std::memory_order_acquire) == cancellationToken)) {
+            cancelledAtomic_.fetch_add(1u, std::memory_order_relaxed);
+            notAcceptedAtomic_.fetch_add(eventCount - cursor,
+                                         std::memory_order_relaxed);
+            return false;
+        }
+        uint32_t prepCount = 0u;
+        for (; cursor < eventCount && prepCount < kChunk; ++cursor) {
+            const SVMS_ShortEvent& source = events[cursor];
+            TimestampedMidiEvent evt{};
+            evt.message = source.packed_message;
+            if (fastSequenceNext_ == fastSequenceEnd_) {
+                fastSequenceNext_ = nextEventSequence_.fetch_add(
+                    kFastSequenceLease, std::memory_order_relaxed);
+                fastSequenceEnd_ = fastSequenceNext_ + kFastSequenceLease;
+                fastLeased_.store(fastLeased_.load(std::memory_order_relaxed) +
+                                      kFastSequenceLease,
+                                  std::memory_order_relaxed);
+            }
+            evt.sequence = static_cast<uint32_t>(fastSequenceNext_++);
+            const uint64_t cadenceCounter =
+                fastSubmitted_.load(std::memory_order_relaxed) + 1u;
+            fastSubmitted_.store(cadenceCounter, std::memory_order_relaxed);
+            evt.qpcTimestamp = source.timestamp_qpc != 0u
+                ? source.timestamp_qpc : immediateQpc;
+            EventLane lane;
+            bool isLossless;
+            uint8_t velocity;
+            if (!PrepareShortEvent(source.packed_message, evt.qpcTimestamp,
+                                   cadenceCounter, evt, lane, isLossless,
+                                   velocity, true))
+                continue;
+            prepared[prepCount] = evt;
+            lossless[prepCount] = isLossless ? 1u : 0u;
+            velocities[prepCount] = velocity;
+            ++prepCount;
+        }
+        if (prepCount == 0u) continue;
+        if (!midiIngress_.TryPushFastBatch(prepared, prepCount)) {
+            for (uint32_t i = 0u; i < prepCount; ++i) {
+                for (;;) {
+                    if (midiIngress_.TryPushFast(prepared[i])) break;
+                    if (lossless[i] == 0u) {
+                        shedAtomic_.fetch_add(1, std::memory_order_relaxed);
+                        shedByVelocityAtomic_[velocities[i]].fetch_add(
+                            1, std::memory_order_relaxed);
+                        notAcceptedAtomic_.fetch_add(
+                            1, std::memory_order_relaxed);
+                        break;
+                    }
+                    if (cancelProducers_.load(std::memory_order_acquire) ||
+                        (externalCancellation && externalCancellation->load(
+                            std::memory_order_acquire) == cancellationToken)) {
+                        cancelledAtomic_.fetch_add(
+                            1, std::memory_order_relaxed);
+                        notAcceptedAtomic_.fetch_add(
+                            1, std::memory_order_relaxed);
+                        return false;
+                    }
+                    const uint32_t observed = producerWakeEpoch_.load(
+                        std::memory_order_acquire);
+                    WaitForProducerSlot(observed);
+                }
+            }
+        }
+        if (compilerSleeping_.load(std::memory_order_acquire) &&
+            compilerSleeping_.exchange(false, std::memory_order_acq_rel)) {
+            compilerWakeEpoch_.fetch_add(1u, std::memory_order_release);
+            WakeAddressWaiters(compilerWakeEpoch_);
+        }
+    }
+    return true;
+}
+
+bool Driver::SubmitShortBatchCore(
     const SVMS_ShortEvent* events, uint32_t eventCount,
     uint64_t immediateQpc,
     const std::atomic<uint64_t>* externalCancellation,
@@ -543,18 +723,6 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
     // Keep mixed/state/priority-shedding batches on the established per-event
     // path; homogeneous protected note-ons can reserve 256 lane cells with
     // one producer CAS while retaining one global sequence per event.
-    if (shardCount_ > 1u && !shardMaster_) {
-        // Sharded: every event is routed individually (note -> its shard).
-        for (uint32_t i = 0u; i < eventCount; ++i) {
-            const uint64_t timestamp = events[i].timestamp_qpc != 0u
-                ? events[i].timestamp_qpc : immediateQpc;
-            if (!SubmitShortMsgAtQpcCancellable(
-                    events[i].packed_message, timestamp,
-                    externalCancellation, cancellationToken))
-                return false;
-        }
-        return true;
-    }
     const bool fastOwner = IsFastProducerThread();
     bool homogeneousLoudNotes = eventCount != 0u;
     for (uint32_t i = 0u; i < eventCount; ++i) {
@@ -569,10 +737,14 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
         }
     }
     if (!homogeneousLoudNotes) {
+        if (fastOwner)
+            return SubmitMixedBatchFast(events, eventCount, immediateQpc,
+                                        externalCancellation,
+                                        cancellationToken);
         for (uint32_t i = 0u; i < eventCount; ++i) {
             const uint64_t timestamp = events[i].timestamp_qpc != 0u
                 ? events[i].timestamp_qpc : immediateQpc;
-            if (!SubmitShortMsgAtQpcCancellable(
+            if (!SubmitShortMsgAtQpcCancellableCore(
                     events[i].packed_message, timestamp,
                     externalCancellation, cancellationToken)) {
                 return false;
