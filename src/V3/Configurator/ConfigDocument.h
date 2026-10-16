@@ -84,6 +84,7 @@ struct ConfigValues {
     uint32_t threadAffinityMode = 0u;
     // Opt-in compiler-side CC collapse (superseded same-(channel,controller)).
     bool ccCollapse = false;
+    bool bendCollapse = false;
     bool fastProducer = false;
     // Key-sharded engine (JSON-only for now): 0/1 = off.
     uint32_t shards = 1u;
@@ -107,6 +108,7 @@ struct ConfigValues {
     bool correctnessMode = true;
     bool decimation = false;
     bool decimationByLevel = true;
+    bool fastChunkMath = false;
     uint32_t decimationCullBlocks = 5;
 
     bool diagnosticsEnabled = false;

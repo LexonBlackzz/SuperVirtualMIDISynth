@@ -45,6 +45,8 @@ public:
     void Shutdown() noexcept;
 
     uint32_t GetThreadCount() const noexcept;
+    // Most indexed jobs one ExecuteIndexed call accepts (larger = refused).
+    uint32_t GetJobCapacity() const noexcept;
     float GetHelperJobPercent() const noexcept;
     size_t GetAllocatedBytes() const noexcept;
     // Re-applies the configured thread-affinity mode to the worker threads

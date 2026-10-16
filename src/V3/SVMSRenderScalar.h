@@ -729,6 +729,8 @@ private:
     // every retirement from all workers at once.
     static constexpr uint32_t kWvRetireCountStride = 16u;
     uint32_t* wvJobRetireCounts_ = nullptr;
+    static constexpr uint32_t kWvJobsPerThread = 4u;
+    static constexpr uint32_t kWvMinItemsPerJob = 64u;
     uint32_t wvJobCapacity_ = 0u;
     uint32_t wvJobScratchCapacity_ = 0u;     // scratch stride wvJobRetirements_ was sized for
     uint64_t wvGhostOverflowCount_ = 0u;
@@ -2997,7 +2999,8 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
         return false;
     }
     if (!EnsureWholeVoiceJobScratch(
-            workerPool_ ? workerPool_->GetThreadCount() : 1u) ||
+            workerPool_ ? workerPool_->GetThreadCount() * kWvJobsPerThread
+                        : 1u) ||
         !SyncWholeVoiceRotationScratch(voices.v.rot != nullptr)) {
         ++refusalCounts_[kRefuseReservation];
         return false;
@@ -4149,8 +4152,20 @@ inline void RenderScalar::RenderWholeVoiceBlock(
                       static_cast<size_t>(wvJobCapacity_) * kWvRetireCountStride,
                   0u);
     if (itemCount != 0u) {
-        uint32_t jobCount = workerPool_
-            ? (std::min)(workerPool_->GetThreadCount(), itemCount) : 1u;
+        // Oversubscribe the pool (jobs are claimed from an atomic queue):
+        // one static slice per thread left the slowest core (E-core, noisy
+        // neighbour) as the critical path while fast cores idled.  Merge and
+        // retirement order are per-job-index, so assignment does not matter.
+        uint32_t jobCount = 1u;
+        if (workerPool_) {
+            const uint32_t threads = workerPool_->GetThreadCount();
+            jobCount = (std::min)(threads, itemCount);
+            const uint32_t fine = (std::min)(
+                (std::min)(threads * kWvJobsPerThread,
+                           workerPool_->GetJobCapacity()),
+                itemCount / kWvMinItemsPerJob);
+            if (fine > jobCount) jobCount = fine;
+        }
         if (jobCount < 2u) jobCount = 1u;
         ctx.jobCount = jobCount;
         if (wvDecimating_ && activeCount > 1u &&
@@ -4316,7 +4331,8 @@ inline bool RenderScalar::PrepareWholeVoice(VoiceManager& voices) {
     return ReserveVoiceCapacity(voices.GetMaxVoices()) &&
            ReserveWholeVoiceStorage(handleCapacity) &&
            EnsureWholeVoiceJobScratch(
-               workerPool_ ? workerPool_->GetThreadCount() : 1u) &&
+               workerPool_ ? workerPool_->GetThreadCount() * kWvJobsPerThread
+                           : 1u) &&
            EnsureWholeVoiceRowOpStorage(wvRowOpBudget_) &&
            EnsureWholeVoiceExciteStorage(handleCapacity) &&
            SyncWholeVoiceRotationScratch(voices.v.rot != nullptr);

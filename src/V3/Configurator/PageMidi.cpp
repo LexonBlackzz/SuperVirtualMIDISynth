@@ -191,6 +191,12 @@ void DrawMidiPage(ConfigDocument& doc) {
                 send(svms::RLCommandType::SetCcCollapse, w.ccCollapse ? 1u : 0u);
             }
             ImGui::Spacing();
+            if (PanelLever("BEND COLLAPSE  (LOWERS ACCURACY)", &w.bendCollapse,
+                           "OFF by default. DECREASES ACCURACY: inside one compiler page (a few milliseconds of dense material) a later pitch bend on a channel replaces the earlier ones, so bends reach the engine at most about once per page per channel instead of at every source tick, and pitch steps can arrive up to a page late. Huge CPU saving on Black MIDI that spams tens of thousands of pitch bends a second, because every bend splits all voices of that channel into tiny render spans. Sample data and interpolation are not touched; note timing is not touched.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetBendCollapse, w.bendCollapse ? 1u : 0u);
+            }
+            ImGui::Spacing();
             if (PanelLever("EXACT NOTE MERGE", &w.noteMerge,
                            "OFF by default. Identical note-ons (same channel, key, velocity and exact frame, from any track) become ONE voice at N times the gain. Identical voices sum linearly, so this sounds the same as playing all N, but costs one voice instead of N. Each note-off releases one copy; copies that end at different times are split off exactly. Nothing is dropped or re-timed, unlike NOTE-ON COALESCING. The effective-voice counter shows how many voices the pool would hold unmerged. Launch order inside one frame can change, which only matters if voices are stolen.")) {
                 doc.MarkDirty();

@@ -291,6 +291,11 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 doc.MarkDirty();
                 send(svms::RLCommandType::SetStealReject, w.stealReject ? 1u : 0u);
             }
+            if (PanelLever("FAST TAIL MATH  (LOWERS ACCURACY)", &w.fastChunkMath,
+                           "OFF by default. DECREASES ACCURACY: release tails (AVX2) advance their gain and sample position per 8-frame chunk with precomputed ladders instead of frame-by-frame, so output differs from the exact path by a few float rounding steps (about -140 dB, inaudible in testing) and no longer matches the scalar renderer bit for bit. Sample data and interpolation are NOT touched. Cuts CPU on release-heavy Black MIDI. Applies live.")) {
+                doc.MarkDirty();
+                send(svms::RLCommandType::SetFastChunkMath, w.fastChunkMath ? 1u : 0u);
+            }
             if (PanelLever("DECIMATE BY LEVEL", &w.decimationByLevel,
                            "Listening test, OFF by default. With voice decimation on, mute the voices that are actually quietest (envelope level x gain, so fading release tails go first) instead of the lowest velocity. A loud note that has been ringing out is no longer protected by its velocity, and a soft fresh note is no longer sacrificed.")) {
                 doc.MarkDirty();

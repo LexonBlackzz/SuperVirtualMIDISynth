@@ -272,6 +272,8 @@ enum class RLCommandType : uint32_t {
     SetDecimation         = 0x0000011E,
     SetStealReject        = 0x0000011F,
     SetFastProducer       = 0x00000120,
+    SetBendCollapse       = 0x00000121,
+    SetFastChunkMath      = 0x00000122,
 
 
     Invalid              = 0xFFFFFFFF,

@@ -109,6 +109,11 @@ struct EngineConfig {
     // Opt-in compiler-side CC collapse: superseded same-(channel,controller)
     // state events are dropped upstream. Off by default.
     bool ccCollapse;
+    // Opt-in (default off): inside one compiler page a later pitch bend on a
+    // channel replaces the earlier one. Cuts span splitting on bend-spam
+    // material; bends reach the engine at most about once per page
+    // (a few ms) per channel instead of at every source tick.
+    bool bendCollapse;
     // Opt-in single-producer ingress fast path (events.fast_producer): the
     // thread that submits first feeds the compiler through a private ring
     // with plain stores instead of the shared MPSC lanes. Off by default.
@@ -162,6 +167,11 @@ struct EngineConfig {
     // With decimation on: rank by audibility (envelope level x output gain)
     // instead of velocity. Opt-in listening test, default off.
     bool decimationByLevel;
+    // Opt-in (default off): AVX2 release tails advance gain and phase per
+    // 8-frame chunk in closed form instead of frame by frame. Faster tails;
+    // output differs from the exact path by a few float ulps (inaudible),
+    // sample data and interpolation are untouched.
+    bool fastChunkMath;
     // With decimation on: retire releasing voices muted this many blocks in
     // a row (0 = off). Opt-in listening test.
     uint32_t decimationCullBlocks;

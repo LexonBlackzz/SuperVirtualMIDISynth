@@ -408,6 +408,7 @@ bool Driver::Initialize() {
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
+    bendCollapseEnabled_.store(cfg.bendCollapse, std::memory_order_relaxed);
     SetFastProducer(cfg.fastProducer);
     noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
     noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
@@ -559,6 +560,7 @@ bool Driver::Initialize() {
     svms::g_threadAffinityMode.store(cfg.threadAffinityMode,
                                      std::memory_order_relaxed);
     ccCollapseEnabled_.store(cfg.ccCollapse, std::memory_order_relaxed);
+    bendCollapseEnabled_.store(cfg.bendCollapse, std::memory_order_relaxed);
     SetFastProducer(cfg.fastProducer);
     noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
     noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
@@ -602,6 +604,7 @@ bool Driver::Initialize() {
     renderScalar->SetGhostBudget(cfg.ghostBudget);
     renderScalar->SetDecimationEnabled(cfg.decimation);
     renderScalar->SetDecimationByLevel(cfg.decimationByLevel);
+    SetFastChunkMath(cfg.fastChunkMath);
     renderScalar->SetMutedTailCullBlocks(cfg.decimationCullBlocks);
     // Honor the configured render backend. The constructor already selects
     // the best set (Auto behavior); an explicit non-Auto request overrides

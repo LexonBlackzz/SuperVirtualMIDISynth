@@ -171,6 +171,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.stealReject = false;
     d.threadAffinityMode = 0u;
     d.ccCollapse = false;
+    d.bendCollapse = false;
     d.fastProducer = false;
     d.shards = 1u;
     d.noteMerge = false;
@@ -187,6 +188,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.correctnessMode = true;
     d.decimation = false;
     d.decimationByLevel = true;
+    d.fastChunkMath = false;
     d.decimationCullBlocks = 5;
     d.diagnosticsEnabled = false;
     d.diagnosticsWindow = false;
@@ -291,6 +293,10 @@ void ConfigDocument::FromJson(const json& root) {
             collapse->is_boolean()) {
             working_.ccCollapse = collapse->get<bool>();
         }
+        if (auto bend = it->find("bend_collapse"); bend != it->end() &&
+            bend->is_boolean()) {
+            working_.bendCollapse = bend->get<bool>();
+        }
         if (auto fast = it->find("fast_producer"); fast != it->end() &&
             fast->is_boolean()) {
             working_.fastProducer = fast->get<bool>();
@@ -309,6 +315,7 @@ void ConfigDocument::FromJson(const json& root) {
         ReadBool(*it, "correctness_mode", working_.correctnessMode);
         ReadBool(*it, "decimation", working_.decimation);
         ReadBool(*it, "decimation_by_level", working_.decimationByLevel);
+        ReadBool(*it, "fast_chunk_math", working_.fastChunkMath);
         ReadNum(*it, "decimation_cull_blocks", working_.decimationCullBlocks,
                 0u, 250u);
     }
@@ -431,6 +438,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["quality"]["correctness_mode"] = working_.correctnessMode;
     root["quality"]["decimation"] = working_.decimation;
     root["quality"]["decimation_by_level"] = working_.decimationByLevel;
+    root["quality"]["fast_chunk_math"] = working_.fastChunkMath;
     root["quality"]["decimation_cull_blocks"] = working_.decimationCullBlocks;
     root["quality"]["interpolation"] = "linear";
     root["quality"]["pan_law"] = "constant-power";
@@ -469,6 +477,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["ghost_budget"] = working_.ghostBudget;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
+    root["events"]["bend_collapse"] = working_.bendCollapse;
     root["events"]["fast_producer"] = working_.fastProducer;
     root["events"]["note_merge"] = working_.noteMerge;
     root["synth"]["block_timing"] = working_.blockTiming;
@@ -683,6 +692,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.ghostBudget == b.ghostBudget
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
+        && a.bendCollapse == b.bendCollapse
         && a.fastProducer == b.fastProducer
         && a.shards == b.shards
         && a.noteMerge == b.noteMerge
@@ -699,6 +709,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.correctnessMode == b.correctnessMode
         && a.decimation == b.decimation
         && a.decimationByLevel == b.decimationByLevel
+        && a.fastChunkMath == b.fastChunkMath
         && a.decimationCullBlocks == b.decimationCullBlocks
         && a.diagnosticsEnabled == b.diagnosticsEnabled
         && a.diagnosticsWindow == b.diagnosticsWindow

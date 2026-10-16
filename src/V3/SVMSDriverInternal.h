@@ -729,6 +729,12 @@ private:
         bool valid = false;
     };
     std::atomic<bool> ccCollapseEnabled_{false};
+    // Opt-in bend collapse (events.bend_collapse): within one compiler page a
+    // later pitch bend on a channel replaces the earlier one (same slot trick
+    // as the CC collapse). Black MIDI with tens of thousands of bends a second
+    // otherwise splits every voice of the channel into 8-frame spans.
+    std::atomic<bool> bendCollapseEnabled_{false};
+    CcCollapseRecord bendCollapseRecords_[kChannelCount]{};
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block sample offset.
     std::atomic<bool> blockTimingEnabled_{false};

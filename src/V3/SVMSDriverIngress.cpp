@@ -887,6 +887,8 @@ void Driver::EventCompilerLoop() {
         uint32_t compiledCount = 0u;
         uint32_t drained = 0u;
         const bool collapseCc = ccCollapseEnabled_.load(std::memory_order_relaxed);
+        const bool collapseBend =
+            bendCollapseEnabled_.load(std::memory_order_relaxed);
         auto compileOne = [&](const TimestampedMidiEvent& source) {
             ScheduledRenderEvent scheduled{};
             if (!CompileTimestampedEvent(source, epoch, qpcFreq, sampleRate,
@@ -912,6 +914,7 @@ void Driver::EventCompilerLoop() {
                             return;
                         }
                         record.page = pageIndex;
+                        record.offset = compiledCount;
                         record.pageEpoch = ccPageFillEpoch_;
                         record.valid = true;
                     } else if (IsControllerStateReset(scheduled.data1)) {
@@ -924,6 +927,27 @@ void Driver::EventCompilerLoop() {
                     for (auto& channelRecords : ccCollapseRecords_) {
                         for (auto& record : channelRecords) record.valid = false;
                     }
+                }
+            }
+            if (collapseBend) {
+                if (scheduled.type == RenderEventType::PitchBend &&
+                    scheduled.channel < kChannelCount) {
+                    CcCollapseRecord& record =
+                        bendCollapseRecords_[scheduled.channel];
+                    if (record.valid && record.pageEpoch == ccPageFillEpoch_ &&
+                        record.page == pageIndex &&
+                        record.offset < compiledCount) {
+                        page.events[record.offset] = scheduled;
+                        ++ccCollapsedCount_;
+                        return;
+                    }
+                    record.page = pageIndex;
+                    record.offset = compiledCount;
+                    record.pageEpoch = ccPageFillEpoch_;
+                    record.valid = true;
+                } else if (scheduled.type == RenderEventType::Reset) {
+                    for (auto& record : bendCollapseRecords_)
+                        record.valid = false;
                 }
             }
             page.events[compiledCount++] = scheduled;

@@ -8,8 +8,22 @@
 #include <cstring>
 #include <immintrin.h>
 
+#if defined(_MSC_VER)
+#define SVMS_K_FORCEINLINE __forceinline
+#define SVMS_K_NOINLINE __declspec(noinline)
+#else
+#define SVMS_K_FORCEINLINE inline __attribute__((always_inline))
+#define SVMS_K_NOINLINE __attribute__((noinline))
+#endif
+
 namespace svms {
 namespace {
+// Opt-in (quality.fast_chunk_math): release-loop 8-frame chunks take their gain
+// ladder and phase advance in closed form instead of 8 dependent multiplies and
+// adds.  Per-sample results move by a few float ulps; sample reads and
+// interpolation are untouched.  Default off keeps the exact sequential math.
+bool g_fastChunkMath = false;
+
 
 // GCC-target-compatible replacement for _mm256_i32scatter_ps (which is an
 // AVX512VL intrinsic). Performs the same lane-wise store using only AVX2:
@@ -32,10 +46,8 @@ float HorizontalSum(__m256 value) {
 
 // Eight consecutive samples of one filtered voice. Interpolation stays
 // vectorized; recursive filter state is consumed in scalar-equivalent order.
-inline __m256 FilterTime8AVX2(VoiceSoA& v, uint32_t handle,
-                              __m256 input) {
-    if (v.filterEnabled[handle] == 0u) return input;
-
+SVMS_K_NOINLINE __m256 FilterTime8EnabledAVX2(VoiceSoA& v, uint32_t handle,
+                                              __m256 input) {
     // Recursive IIR state must preserve scalar ordering exactly.
     // Keep interpolation vectorized, then consume these 8 samples in-order.
     alignas(32) float lanes[8];
@@ -43,6 +55,14 @@ inline __m256 FilterTime8AVX2(VoiceSoA& v, uint32_t handle,
     for (uint32_t lane = 0u; lane < 8u; ++lane)
         lanes[lane] = ProcessVoiceFilterSample(v, handle, lanes[lane]);
     return _mm256_load_ps(lanes);
+}
+
+// The unfiltered test stays inline: out of line, every 8-frame chunk of an
+// unfiltered voice paid a vzeroupper + call for nothing (profile, 2026-10-16).
+SVMS_K_FORCEINLINE __m256 FilterTime8AVX2(VoiceSoA& v, uint32_t handle,
+                                          __m256 input) {
+    if (v.filterEnabled[handle] == 0u) return input;
+    return FilterTime8EnabledAVX2(v, handle, input);
 }
 
 // Eight independent voices for the short-span / event-fragmented kernels.
@@ -124,6 +144,49 @@ inline void GatherSamplePairAVX2(const int16_t* data, __m256i elem,
     second = _mm256_mul_ps(_mm256_cvtepi32_ps(
         _mm256_blendv_epi8(high, lowNext, oddMask)), int16Scale);
 }
+
+// Contiguous variant of the pair gather for the time-lane kernels.  When the
+// eight lane positions span under 16 samples (pitch ratio below ~2) the same
+// elements are loaded as three contiguous vectors and picked per lane with
+// permutes: no gather (slow, latency-bound, microcoded on E-cores), identical
+// values and scale, so results are bit-exact vs GatherSamplePairAVX2.
+// `readable` = int16 elements readable from `data`; anything else falls back.
+inline void GatherSamplePairSeqAVX2(const int16_t* data, uint32_t readable,
+                                    __m256i bases, __m256& first,
+                                    __m256& second) {
+    const uint32_t lo = static_cast<uint32_t>(_mm256_cvtsi256_si32(bases));
+    const uint32_t hi = static_cast<uint32_t>(_mm256_extract_epi32(bases, 7));
+    if (hi - lo > 15u || lo + 24u > readable) {
+        GatherSamplePairAVX2(data, bases, first, second);
+        return;
+    }
+    const int16_t* p = data + lo;
+    const __m256i a = _mm256_cvtepi16_epi32(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    const __m256i b = _mm256_cvtepi16_epi32(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 8)));
+    const __m256i c = _mm256_cvtepi16_epi32(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16)));
+    const __m256i rel = _mm256_sub_epi32(bases, _mm256_set1_epi32(
+        static_cast<int>(lo)));
+    const __m256i rel1 = _mm256_add_epi32(rel, _mm256_set1_epi32(1));
+    const __m256i seven = _mm256_set1_epi32(7);
+    const __m256i fifteen = _mm256_set1_epi32(15);
+    const __m256i f = _mm256_blendv_epi8(
+        _mm256_permutevar8x32_epi32(a, rel),
+        _mm256_permutevar8x32_epi32(b, rel),
+        _mm256_cmpgt_epi32(rel, seven));
+    const __m256i sec = _mm256_blendv_epi8(
+        _mm256_blendv_epi8(_mm256_permutevar8x32_epi32(a, rel1),
+                           _mm256_permutevar8x32_epi32(b, rel1),
+                           _mm256_cmpgt_epi32(rel1, seven)),
+        _mm256_permutevar8x32_epi32(c, rel1),
+        _mm256_cmpgt_epi32(rel1, fifteen));
+    const __m256 int16Scale = _mm256_set1_ps(1.0f / 32768.0f);
+    first = _mm256_mul_ps(_mm256_cvtepi32_ps(f), int16Scale);
+    second = _mm256_mul_ps(_mm256_cvtepi32_ps(sec), int16Scale);
+}
+
 
 void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
                       uint32_t frameCount) {
@@ -457,6 +520,7 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
     const float gainL = v.renderGainL[handle];
     const float gainR = v.renderGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
+    const uint32_t readable = c.sampleDataFrames - v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
@@ -509,7 +573,7 @@ const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
             __m256 first, second;
-            GatherSamplePairAVX2(region, bases, first, second);
+            GatherSamplePairSeqAVX2(region, readable, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
             __m256 sample = _mm256_add_ps(first,
@@ -633,6 +697,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
+    const uint32_t readable = c.sampleDataFrames - v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
@@ -649,6 +714,27 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
             (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
         stepVector = _mm256_set1_ps(step);
         windowRemaining = (std::min)(64u, c.frameCount);
+    }
+    // quality.fast_chunk_math: gain ladder and phase advance in closed form.
+    const bool fastMath = g_fastChunkMath && !lfoOn;
+    __m256 decayLadder = _mm256_setzero_ps();
+    float decay8 = 1.0f, step8 = 0.0f;
+    alignas(32) float ladder[8] = {};
+    if (fastMath) {
+        // Powers by squaring in double: three dependent steps, and each float
+        // entry is correctly rounded (a float decay^8 carried a systematic
+        // relative bias that compounds once per chunk).
+        const double dd = decay, d2 = dd * dd, d4 = d2 * d2;
+        ladder[0] = decay; ladder[1] = static_cast<float>(d2);
+        ladder[2] = static_cast<float>(d2 * dd);
+        ladder[3] = static_cast<float>(d4);
+        ladder[4] = static_cast<float>(d4 * dd);
+        ladder[5] = static_cast<float>(d4 * d2);
+        ladder[6] = static_cast<float>(d4 * d2 * dd);
+        ladder[7] = static_cast<float>(d4 * d4);
+        decayLadder = _mm256_load_ps(ladder);
+        decay8 = ladder[7];
+        step8 = step * 8.0f;
     }
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
@@ -668,13 +754,17 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         }
         float futureGain = gain;
         alignas(32) float gains[8];
-        for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
-            futureGain *= decay;
-            gains[laneIndex] = futureGain;
+        if (fastMath) {
+            futureGain = gain * decay8;
+        } else {
+            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
+                futureGain *= decay;
+                gains[laneIndex] = futureGain;
+            }
         }
         const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
         const bool thresholdSafe = remaining != UINT32_MAX ||
-            gains[7] >= VoiceRetireThreshold();
+            (fastMath ? futureGain : gains[7]) >= VoiceRetireThreshold();
         const float lastPhase = phase + step * 7.0f;
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             countdownSafe && thresholdSafe &&
@@ -690,14 +780,17 @@ const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
             __m256 first, second;
-            GatherSamplePairAVX2(region, bases, first, second);
+            GatherSamplePairSeqAVX2(region, readable, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
             if (rot) sample = rot.Chunk(sample, bases, fraction);
-            const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
+            const __m256 gainVector = fastMath
+                ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
+                : _mm256_load_ps(gains);
+            const __m256 scaled = _mm256_mul_ps(sample, gainVector);
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
                 _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
@@ -706,11 +799,69 @@ const __m256 phases = _mm256_add_ps(
                 _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
             gain = futureGain;
             if (remaining != UINT32_MAX) remaining -= 8u;
-            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                phase += step;
+            if (fastMath) {
+                phase += step8;
+            } else {
+                for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                    phase += step;
+            }
             frame += 8u;
             windowRemaining -= 8u;
             continue;
+        }
+
+        // Masked tail chunk: the last 1..7 frames of a span ride the same
+        // vector code (only the live lanes are committed) instead of the slow
+        // per-frame path.  Spans are short when events split them, so most
+        // chunk-path misses were exactly this remainder.  Same guards as the
+        // full chunk, evaluated for the live lanes only.
+        // Rotation and filter state advance per lane in order, so voices that
+        // carry either keep the per-frame remainder.
+        if (!lfoOn && !rot && v.filterEnabled[handle] == 0u &&
+            c.frameCount - frame < 8u) {
+            const uint32_t rem = c.frameCount - frame;
+            const float lastLive = phase + step * static_cast<float>(rem - 1u);
+            const float tailGain = fastMath ? gain * ladder[rem - 1u]
+                                            : gains[rem - 1u];
+            if ((remaining == UINT32_MAX || remaining > rem) &&
+                (remaining != UINT32_MAX ||
+                 tailGain >= VoiceRetireThreshold()) &&
+                lastLive < loopEnd - 1.0f) {
+                const __m256i liveMask = _mm256_cmpgt_epi32(
+                    _mm256_set1_epi32(static_cast<int>(rem)),
+                    _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+                const __m256 phases = _mm256_min_ps(
+                    _mm256_add_ps(_mm256_set1_ps(phase),
+                                  _mm256_mul_ps(stepVector, lane)),
+                    _mm256_set1_ps(lastLive));
+                const __m256i bases = _mm256_cvttps_epi32(phases);
+                __m256 first, second;
+                GatherSamplePairSeqAVX2(region, readable, bases, first,
+                                        second);
+                const __m256 fraction = _mm256_sub_ps(
+                    phases, _mm256_cvtepi32_ps(bases));
+                __m256 sample = _mm256_add_ps(first,
+                    _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+                sample = FilterTime8AVX2(v, handle, sample);
+                if (rot) sample = rot.Chunk(sample, bases, fraction);
+                const __m256 gainVector = fastMath
+                    ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
+                    : _mm256_load_ps(gains);
+                const __m256 scaled = _mm256_mul_ps(sample, gainVector);
+                const __m256 maskPs = _mm256_castsi256_ps(liveMask);
+                _mm256_maskstore_ps(outL + frame, liveMask, _mm256_add_ps(
+                    _mm256_maskload_ps(outL + frame, liveMask),
+                    _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
+                _mm256_maskstore_ps(outR + frame, liveMask, _mm256_add_ps(
+                    _mm256_maskload_ps(outR + frame, liveMask),
+                    _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+                (void)maskPs;
+                gain = tailGain;
+                if (remaining != UINT32_MAX) remaining -= rem;
+                for (uint32_t k = 0u; k < rem; ++k) phase += step;
+                frame += rem;
+                continue;
+            }
         }
 
         uint32_t base = static_cast<uint32_t>(phase);
@@ -945,6 +1096,7 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
+    const uint32_t readable = c.sampleDataFrames - v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
@@ -1030,7 +1182,7 @@ const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
             __m256 first, second;
-            GatherSamplePairAVX2(region, bases, first, second);
+            GatherSamplePairSeqAVX2(region, readable, bases, first, second);
             const __m256 fraction = _mm256_sub_ps(
                 phases, _mm256_cvtepi32_ps(bases));
             __m256 sample = _mm256_add_ps(first,
@@ -1771,9 +1923,14 @@ void RenderReleaseFramesGrouped(const RenderSpanContext& c,
     uint32_t pending[8];
     uint32_t pendingCount = 0u;
     auto perVoice = [&](uint32_t handle) {
-        const RenderSpanContext vc = SelectVoiceDestination(
-            c, v.channel[handle]);
-        const uint32_t retiredAt = RenderReleaseLoopFramesAVX2(vc, handle);
+        uint32_t retiredAt;
+        if (c.channelBusLeft == nullptr) {
+            retiredAt = RenderReleaseLoopFramesAVX2(c, handle);  // no copy
+        } else {
+            const RenderSpanContext vc = SelectVoiceDestination(
+                c, v.channel[handle]);
+            retiredAt = RenderReleaseLoopFramesAVX2(vc, handle);
+        }
         if (retiredAt != UINT32_MAX) RecordRetirement(c, handle, retiredAt);
     };
     auto flush = [&]() {
@@ -2020,6 +2177,10 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
 
 void SetFilteredGroupKernelForTest(bool enabled) {
     g_filteredGroupsEnabled = enabled;
+}
+
+void SetFastChunkMath(bool enabled) {
+    g_fastChunkMath = enabled;
 }
 
 bool BuildVolatileStealKeysAVX2(

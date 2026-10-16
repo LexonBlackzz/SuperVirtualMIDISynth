@@ -477,6 +477,10 @@ uint32_t RenderWorkerPool::GetThreadCount() const noexcept {
     return impl_ ? impl_->totalThreads : 1u;
 }
 
+uint32_t RenderWorkerPool::GetJobCapacity() const noexcept {
+    return impl_ ? impl_->jobCapacity : 1u;
+}
+
 void RenderWorkerPool::ApplyAffinity() noexcept {
     Impl* impl = impl_;
     if (!impl) return;

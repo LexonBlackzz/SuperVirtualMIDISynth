@@ -125,6 +125,11 @@ const RenderKernelSet& GetSSE2RenderKernelSet();
 const RenderKernelSet& GetAVX2RenderKernelSet();
 // Test hook: route filtered sustained voices through the per-voice kernel only.
 void SetFilteredGroupKernelForTest(bool enabled);
+// quality.fast_chunk_math (AVX2 release loops): closed-form gain/phase per
+// 8-frame chunk. Not bit-exact vs scalar; default off.
+void SetFastChunkMath(bool enabled);
+#else
+inline void SetFastChunkMath(bool) {}  // no AVX2 kernels on the XP build
 #endif
 const RenderKernelSet& SelectBestRenderKernelSet();
 const RenderKernelSet* SelectRenderKernelSet(RenderBackend backend);

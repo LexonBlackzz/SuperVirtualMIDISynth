@@ -452,6 +452,42 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetBendCollapse: {
+        // param = opt-in compiler-side collapse of superseded pitch bends
+        // inside one page. Read at page-fill time; shard cores follow.
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "bend collapse must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        bendCollapseEnabled_.store(cmd.param != 0u,
+                                   std::memory_order_relaxed);
+        for (Driver* shard : shards_)
+            shard->bendCollapseEnabled_.store(cmd.param != 0u,
+                                              std::memory_order_relaxed);
+        engineConfig_.bendCollapse = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "bend collapse: on (compiler-side, lowers accuracy)"
+                            : "bend collapse: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+    case RT::SetFastChunkMath: {
+        // param = opt-in closed-form chunk math in the AVX2 release kernel.
+        // Process-wide flag read per kernel call; not bit-exact vs scalar.
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "fast chunk math must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        SetFastChunkMath(cmd.param != 0u);
+        engineConfig_.fastChunkMath = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "fast chunk math: on (lowers accuracy)"
+                            : "fast chunk math: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
     case RT::SetNoteOnReexcite: {
         // param = 1: coalescing keeps collapsed repeat hits as re-excite
         // events (timing-exact); 0: it drops them.

@@ -357,6 +357,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"events", {
             {"overflow_mode", "priority"},
             {"cc_collapse", cfg.ccCollapse},
+            {"bend_collapse", cfg.bendCollapse},
             {"fast_producer", cfg.fastProducer},
             {"note_merge", cfg.noteMerge},
             {"ring_capacity", cfg.eventRingCapacity},
@@ -368,6 +369,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"correctness_mode", cfg.correctnessMode},
             {"decimation", cfg.decimation},
             {"decimation_by_level", cfg.decimationByLevel},
+            {"fast_chunk_math", cfg.fastChunkMath},
             {"decimation_cull_blocks", cfg.decimationCullBlocks},
             {"interpolation", "linear"},
             {"pan_law", "constant-power"}
@@ -738,6 +740,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             else
                 AppendWarning(cfg.configWarning, "events.cc_collapse");
         }
+        if (auto bend = it->find("bend_collapse"); bend != it->end()) {
+            if (bend->is_boolean())
+                cfg.bendCollapse = bend->get<bool>();
+            else
+                AppendWarning(cfg.configWarning, "events.bend_collapse");
+        }
         if (auto fast = it->find("fast_producer"); fast != it->end()) {
             if (fast->is_boolean())
                 cfg.fastProducer = fast->get<bool>();
@@ -758,6 +766,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "quality.decimation");
         if (!ReadBool(*it, "decimation_by_level", cfg.decimationByLevel))
             AppendWarning(cfg.configWarning, "quality.decimation_by_level");
+        if (!ReadBool(*it, "fast_chunk_math", cfg.fastChunkMath))
+            AppendWarning(cfg.configWarning, "quality.fast_chunk_math");
         if (!ReadValue(*it, "decimation_cull_blocks", cfg.decimationCullBlocks,
                        0u, 250u))
             AppendWarning(cfg.configWarning, "quality.decimation_cull_blocks");
@@ -1034,8 +1044,10 @@ EngineConfig EngineConfig::Default() {
     cfg.stealReject = false;  // opt-in: every note-on launches by default
     cfg.decimation = false;  // opt-in: every voice mixes by default
     cfg.decimationByLevel = true;  // only matters once decimation is on
+    cfg.fastChunkMath = false;  // opt-in: exact sequential chunk math by default
     cfg.decimationCullBlocks = 5u;  // only matters once decimation is on
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
+    cfg.bendCollapse = false;    // opt-in: every pitch bend dispatches by default
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.fastProducer = false;    // opt-in: shared MPSC lanes by default
     cfg.noteMerge = false;       // opt-in: every note-on launches its own voice

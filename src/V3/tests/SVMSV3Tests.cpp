@@ -77,6 +77,12 @@ void operator delete[](void* memory, std::size_t, std::align_val_t) noexcept {
 namespace {
 
 int g_failures = 0;
+// Whole-voice differential tolerances.  Exact mode keeps the oracle numbers;
+// the quality.fast_chunk_math test widens both (closed-form phase/gain are
+// tolerance-equal and, being one rounding per chunk instead of eight, drift
+// from the sequentially-rounded oracle by a fraction of a frame).
+float g_waveTol = 2.0e-5f;
+float g_phaseTol = 2.0e-3f;
 
 void Check(bool condition, const char* message) {
     if (!condition) {
@@ -4168,7 +4174,7 @@ void CheckWholeVoiceStateParity(const svms::VoiceManager& oracleVoices,
             const bool stateMatches =
                 oracleVoices.v.state[voice] == wholeVoices.v.state[wholeVoice] &&
                 NearlyEqual(oracleVoices.v.phases[voice],
-                            wholeVoices.v.phases[wholeVoice], 2.0e-3f) &&
+                            wholeVoices.v.phases[wholeVoice], g_phaseTol) &&
                 NearlyEqual(oracleVoices.v.currentGain[voice],
                             wholeVoices.v.currentGain[wholeVoice], 2.0e-5f) &&
                 oracleVoices.v.releaseSamplesRemaining[voice] ==
@@ -4372,7 +4378,7 @@ void RunWholeVoiceStealDifferential(uint32_t rotationMode) {
                          backendName, rotationMode, block, blockDiff);
             passMaxDiff = (std::max)(passMaxDiff, blockDiff);
         }
-        Check(passMaxDiff <= 2.0e-5f,
+        Check(passMaxDiff <= g_waveTol,
               "whole-voice in-block stealing matches the oracle per sample");
         CheckWholeVoiceStateParity(*oracleVoices, *wholeVoices, backendName);
         if (rotationMode != 0u) {
@@ -5032,7 +5038,7 @@ void TestWholeVoiceResetBarrierDifferential() {
         }
         std::fprintf(stderr, "[WVDIFF] backend=%s reset-barrier max=%g\n",
                      backendName, passMaxDiff);
-        Check(passMaxDiff <= 2.0e-5f,
+        Check(passMaxDiff <= g_waveTol,
               "barrier-split blocks match the oracle per sample");
         Check(barrierBlocks == 5u, "five blocks were barrier-split");
         Check(whole.GetPathBlocks(1) == 0u && whole.GetPathBlocks(2) == 0u,
@@ -5200,7 +5206,7 @@ void RunWholeVoiceLaunchDifferential(uint32_t rotationMode) {
         }
         std::fprintf(stderr, "[WVDIFF] backend=%s rot=%u launch max=%g\n",
                      backendName, rotationMode, passMaxDiff);
-        Check(passMaxDiff <= 2.0e-5f,
+        Check(passMaxDiff <= g_waveTol,
               "whole-voice launches, deferred releases and retirements "
               "match the oracle per sample");
         CheckWholeVoiceStateParity(*oracleVoices, *wholeVoices, backendName);
@@ -5216,6 +5222,7 @@ void RunWholeVoiceLaunchDifferential(uint32_t rotationMode) {
 }
 
 void TestWholeVoiceLaunchDifferential() { RunWholeVoiceLaunchDifferential(0u); }
+
 
 // Rotated pools: free-slot launches seed their own state; deferred releases
 // and natural retirements keep rotating voices exact against the oracle.
@@ -5682,12 +5689,12 @@ void RunWholeVoiceCCDifferential(uint32_t rowOpBudget) {
                 blockDiff = (std::max)(blockDiff,
                     std::fabs(oracleRight[frame] - wholeRight[frame]));
             }
-            if (blockDiff > 2.0e-5f) {
+            if (blockDiff > g_waveTol) {
                 for (uint32_t frame = 0; frame < kFrames; ++frame) {
                     if (std::fabs(oracleLeft[frame] - wholeLeft[frame]) >
-                            2.0e-5f ||
+                            g_waveTol ||
                         std::fabs(oracleRight[frame] - wholeRight[frame]) >
-                            2.0e-5f) {
+                            g_waveTol) {
                         std::fprintf(stderr,
                             "[WVDIFF] backend=%s cc-block=%u first-diff "
                             "frame=%u\n",
@@ -5709,7 +5716,7 @@ void RunWholeVoiceCCDifferential(uint32_t rowOpBudget) {
         }
         std::fprintf(stderr, "[WVDIFF] backend=%s cc max=%g launches=%u\n",
                      backendName, passMaxDiff, wholeContext.launches);
-        Check(passMaxDiff <= 2.0e-5f,
+        Check(passMaxDiff <= g_waveTol,
               "whole-voice lifecycle-CC blocks match the oracle per sample");
         CheckWholeVoiceStateParity(*oracleVoices, *wholeVoices, backendName);
         if (rowOpBudget != 0u) {
@@ -5727,6 +5734,23 @@ void RunWholeVoiceCCDifferential(uint32_t rowOpBudget) {
 }
 
 void TestWholeVoiceCCDifferential() { RunWholeVoiceCCDifferential(0u); }
+
+// quality.fast_chunk_math: closed-form gain/phase per chunk is tolerance-equal
+// (not bit-equal) to the frame-major oracle.  Re-run the steal, launch and CC
+// differentials (their AVX2 passes carry release tails and note-off churn)
+// with the toggle on, at the same tolerances, then restore the exact default.
+void TestFastChunkMathDifferential() {
+    svms::SetFastChunkMath(true);
+    g_waveTol = 1.0e-4f;   // about -80 dBFS
+    g_phaseTol = 0.5f;     // frames, as for muted rows
+    RunWholeVoiceStealDifferential(0u);
+    RunWholeVoiceLaunchDifferential(0u);
+    RunWholeVoiceCCDifferential(0u);
+    g_waveTol = 2.0e-5f;
+    g_phaseTol = 2.0e-3f;
+    svms::SetFastChunkMath(false);
+}
+
 
 // A tiny op-log budget forces the block splitter to cut stretches between
 // event groups (no dispatch, same frames and order); the result must still
@@ -7763,6 +7787,7 @@ int main() {
     TestMutedTailCull();
     TestFilteredGroupKernel();
     TestWholeVoiceCCDifferential();
+    TestFastChunkMathDifferential();
     TestWholeVoiceOpBudgetSplitDifferential();
     TestWholeVoiceVibratoDifferential();
     TestWholeVoiceScalarVibratoDifferential();
