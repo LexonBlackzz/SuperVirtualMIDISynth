@@ -45,7 +45,9 @@ bool ThemeFloatRow(const char* label, const char* id, float& value,
 
 void RebuildPaletteFromThemeColor(ThemeSettings& theme, const ImVec4& picked,
                                   float strength) {
-    ApplyRackPalette(theme, picked, strength);
+    theme.accent = picked;
+    theme.colorStrength = strength;
+    RebuildPalette(theme);
 }
 
 bool confirmReset = false;
@@ -154,16 +156,17 @@ void DrawAdvancedPage(ConfigDocument& doc) {
     ImGui::Spacing();
     ImGui::TextDisabled("Style");
     {
-        static const char* styleLabels[] = {"Rack", "Boring"};
+        static const char* styleLabels[] = {"Rack", "Modern"};
         int style = theme.style;
         if (KeyGroup("##theme_style", &style, styleLabels, 2)) {
             theme.style = style;
+            RebuildPalette(theme);
             themeChanged = true;
         }
         const float keysH = ImGui::GetItemRectSize().y;
         ImGui::SameLine();
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (keysH - ImGui::GetTextLineHeight()) * 0.5f);
-        ImGui::TextDisabled("Rack: bevelled keys, lamps and screws. Boring: flat, sentence case.");
+        ImGui::TextDisabled("Modern: Rounded, calm, readable. The new default. Rack: Hardware-rack styling: bevels, screws, lamps.");
     }
 
     ImGui::Spacing();

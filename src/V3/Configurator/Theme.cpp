@@ -30,6 +30,7 @@ ThemeSource g_source = ThemeSource::BuiltIn;
 std::wstring g_sourcePath;
 bool g_loaded = false;
 bool g_dirty = false;
+UiFonts g_fonts;
 
 ImVec4 Mix(const ImVec4& a, const ImVec4& b, float t) {
     t = (std::max)(0.0f, (std::min)(1.0f, t));
@@ -171,7 +172,8 @@ void ReadColor(const nlohmann::json& root, const char* key, ImVec4& value) {
 
 bool LoadThemeFile(const fs::path& path,
                    ThemeSettings& out,
-                   std::string* error) {
+                   std::string* error,
+                   bool* forcedModern = nullptr) {
     try {
         std::ifstream in(path, std::ios::binary);
         if (!in) {
@@ -205,10 +207,22 @@ bool LoadThemeFile(const fs::path& path,
             t.density = root["density"].get<float>();
         if (root.contains("style") && root["style"].is_number_integer())
             t.style = (std::max)(0, (std::min)(1, root["style"].get<int>()));
+        if (root.contains("motion") && root["motion"].is_number_integer())
+            t.motion = (std::max)(0, (std::min)(2, root["motion"].get<int>()));
+        // Style 1 used to be Refined ("Boring"); it now means Modern. Files
+        // from before 0.11 land on Modern once, whatever they said.
+        const int uiVersion = root.contains("ui_version") && root["ui_version"].is_number_integer()
+            ? root["ui_version"].get<int>() : 0;
+        if (uiVersion < kThemeUiVersion) {
+            t.style = kStyleModern;
+            if (forcedModern) *forcedModern = true;
+        }
 
         t.colorStrength = (std::max)(0.0f, (std::min)(1.0f, t.colorStrength));
         t.cornerRadius = (std::max)(0.0f, (std::min)(12.0f, t.cornerRadius));
         t.density = (std::max)(0.75f, (std::min)(1.35f, t.density));
+        // Modern's surfaces are fixed design tokens; only the accent is kept.
+        if (t.style == kStyleModern) ApplyModernPalette(t, t.accent);
         out = t;
         return true;
     } catch (const std::exception& e) {
@@ -220,6 +234,7 @@ bool LoadThemeFile(const fs::path& path,
 nlohmann::json ThemeToJson(const ThemeSettings& t) {
     return {
         {"schema", 1},
+        {"ui_version", kThemeUiVersion},
         {"accent", ColorToHex(t.accent)},
         {"background", ColorToHex(t.background)},
         {"sidebar", ColorToHex(t.sidebar)},
@@ -234,6 +249,7 @@ nlohmann::json ThemeToJson(const ThemeSettings& t) {
         {"cornerRadius", t.cornerRadius},
         {"density", t.density},
         {"style", t.style},
+        {"motion", t.motion},
     };
 }
 
@@ -284,13 +300,15 @@ void EnsureThemeLoaded(std::string* error = nullptr) {
     std::error_code ec;
     std::string localError;
 
+    bool forced = false;
     if (!portable.empty() && fs::exists(portable, ec)) {
         ThemeSettings loaded;
-        if (LoadThemeFile(portable, loaded, &localError)) {
+        if (LoadThemeFile(portable, loaded, &localError, &forced)) {
             g_theme = loaded;
             g_source = ThemeSource::Portable;
             g_sourcePath = portable.wstring();
             g_loaded = true;
+            if (forced) WriteThemeFile(portable, g_theme, nullptr);
             return;
         }
     }
@@ -299,11 +317,12 @@ void EnsureThemeLoaded(std::string* error = nullptr) {
     if (!appData.empty() && fs::exists(appData, ec)) {
         ThemeSettings loaded;
         std::string appError;
-        if (LoadThemeFile(appData, loaded, &appError)) {
+        if (LoadThemeFile(appData, loaded, &appError, &forced)) {
             g_theme = loaded;
             g_source = ThemeSource::AppData;
             g_sourcePath = appData.wstring();
             g_loaded = true;
+            if (forced) WriteThemeFile(appData, g_theme, nullptr);
             return;
         }
         if (error) *error = appError;
@@ -352,8 +371,21 @@ void ApplyBaseColors() {
     colors[ImGuiCol_PopupBg]               = Alpha(Mix(t.background, t.panel, 0.55f), 0.98f);
     colors[ImGuiCol_Border]                = border;
     colors[ImGuiCol_BorderShadow]          = ImVec4(0, 0, 0, 0);
-    // Inset "display" look for text fields, combos and sliders.
-    const ImVec4 lcd = Mix(t.background, ImVec4(0, 0, 0, 1), 0.45f);
+    const bool modern = t.style == kStyleModern;
+    if (modern) {
+        s.FrameRounding = 10.0f;
+        s.GrabRounding = 9.0f;
+        s.ChildRounding = 14.0f;
+        s.PopupRounding = 12.0f;
+        s.ScrollbarRounding = 5.0f;
+        s.ScrollbarSize = 10.0f;
+        s.FramePadding = ImVec2(14.0f, 9.0f);
+        s.ItemSpacing = ImVec2(10.0f, 8.0f);
+        s.WindowPadding = ImVec2(14.0f, 14.0f);
+    }
+    // Rack: inset "display" look for text fields, combos and sliders.
+    // Modern: the card2 surface.
+    const ImVec4 lcd = modern ? t.control : Mix(t.background, ImVec4(0, 0, 0, 1), 0.45f);
     colors[ImGuiCol_FrameBg]               = lcd;
     colors[ImGuiCol_FrameBgHovered]        = Mix(lcd, t.accent, 0.12f);
     colors[ImGuiCol_FrameBgActive]         = Mix(lcd, t.accent, 0.20f);
@@ -396,6 +428,25 @@ void ApplyBaseColors() {
     colors[ImGuiCol_NavWindowingHighlight] = Alpha(t.text, 0.70f);
     colors[ImGuiCol_NavWindowingDimBg]     = Alpha(t.text, 0.20f);
     colors[ImGuiCol_ModalWindowDimBg]      = Alpha(t.background, 0.70f);
+    if (modern) {
+        const ImVec4 line2(0x3A / 255.0f, 0x3A / 255.0f, 0x44 / 255.0f, 1.0f);
+        const ImVec4 card3(0x2A / 255.0f, 0x2A / 255.0f, 0x33 / 255.0f, 1.0f);
+        colors[ImGuiCol_Border]               = line2;
+        colors[ImGuiCol_PopupBg]              = t.control;
+        colors[ImGuiCol_FrameBgHovered]       = Mix(t.control, card3, 0.7f);
+        colors[ImGuiCol_FrameBgActive]        = card3;
+        colors[ImGuiCol_Button]               = t.control;
+        colors[ImGuiCol_ButtonHovered]        = card3;
+        colors[ImGuiCol_ButtonActive]         = Mix(card3, t.accent, 0.18f);
+        colors[ImGuiCol_Header]               = Alpha(t.accent, 0.16f);
+        colors[ImGuiCol_HeaderHovered]        = Alpha(t.accent, 0.22f);
+        colors[ImGuiCol_HeaderActive]         = Alpha(t.accent, 0.30f);
+        colors[ImGuiCol_ScrollbarBg]          = ImVec4(0, 0, 0, 0);
+        colors[ImGuiCol_ScrollbarGrab]        = card3;
+        colors[ImGuiCol_ScrollbarGrabHovered] = line2;
+        colors[ImGuiCol_ScrollbarGrabActive]  = Mix(line2, t.text, 0.2f);
+        colors[ImGuiCol_SliderGrab]           = t.accent;
+    }
 }
 
 } // namespace
@@ -423,12 +474,39 @@ void ApplyRackPalette(ThemeSettings& t, const ImVec4& accent, float strength) {
     t.success = ImVec4(0.44f, 0.86f, 0.55f, 1.0f);
 }
 
+void ApplyModernPalette(ThemeSettings& t, const ImVec4& accent) {
+    auto hex = [](unsigned rgb) {
+        return ImVec4(((rgb >> 16) & 0xFF) / 255.0f, ((rgb >> 8) & 0xFF) / 255.0f,
+                      (rgb & 0xFF) / 255.0f, 1.0f);
+    };
+    t.accent     = ImVec4(accent.x, accent.y, accent.z, 1.0f);
+    t.background = hex(0x0E0E11);
+    t.sidebar    = hex(0x131317);
+    t.panel      = hex(0x19191E);   // card
+    t.control    = hex(0x222229);   // card2
+    t.text       = hex(0xECECF1);
+    t.mutedText  = hex(0xA3A3B0);
+    t.warning    = hex(0xFFB23E);
+    t.error      = hex(0xF58E99);
+    t.success    = hex(0x5BD69A);
+    t.cornerRadius = 10.0f;
+}
+
+void RebuildPalette(ThemeSettings& t) {
+    if (t.style == kStyleModern) ApplyModernPalette(t, t.accent);
+    else ApplyRackPalette(t, t.accent, t.colorStrength);
+}
+
+bool IsModernStyle() { return GetThemeSettings().style == kStyleModern; }
+UiFonts& Fonts() { return g_fonts; }
+
 ThemeSettings BuiltInTheme() {
     ThemeSettings t;
     t.colorStrength = 0.65f;
     t.cornerRadius = 5.0f;
     t.density = 1.0f;
-    ApplyRackPalette(t, ImVec4(1.00f, 0.698f, 0.243f, 1.0f), t.colorStrength);
+    t.style = kStyleModern;
+    ApplyModernPalette(t, ImVec4(1.00f, 0.698f, 0.243f, 1.0f));
     return t;
 }
 

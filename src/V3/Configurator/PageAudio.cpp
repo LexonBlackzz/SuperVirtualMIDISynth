@@ -597,6 +597,7 @@ void DrawAudioPage(ConfigDocument& doc, const EasterEggState& easterEggs,
                         svms::RLCommandType::SetPhaseRotation, 0u,
                         static_cast<uint32_t>(phase),
                         svms::RuntimeLiveStateV2{}, 100u, phaseResult);
+                    NoteLiveChange();
                 }
             }
         }

@@ -2,6 +2,7 @@
 #include "ConfiguratorApp.h"
 #include "ConfigDocument.h"
 #include "Theme.h"
+#include "ModernWidgets.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "DriverLink.h"
@@ -51,65 +52,17 @@ void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs) {
         enabled, threshold, releaseMs);
 }
 
+void NoteLiveChange() {
+    if (g_liveLink.app) g_liveLink.app->NoteLiveChange();
+}
+
 static float g_toastTimer = 0.0f;
 static char g_toastText[512] = {};
 static bool g_toastActive = false;
 
-bool IsRefinedStyle() { return GetThemeSettings().style == 1; }
+void PushLabel(float scale) { PushMono(scale); }
 
-std::string StyleText(const char* text) {
-    if (!text) return {};
-    if (!IsRefinedStyle()) return text;
-    static const char* kKeep[] = {"MIDI", "SVMS", "ASIO", "WASAPI", "CPU", "RT60",
-                                  "PID", "KDMAPI", "WINMM", "SF2", "API", "DLL",
-                                  "GB", "MIB", "RL", "EDO", "LCD", "CC"};
-    std::string out;
-    const size_t n = std::strlen(text);
-    size_t i = 0;
-    bool first = true;
-    while (i < n) {
-        const unsigned char ch = static_cast<unsigned char>(text[i]);
-        if (std::isalnum(ch)) {
-            size_t j = i;
-            bool hasDigit = false;
-            while (j < n && (std::isalnum(static_cast<unsigned char>(text[j])) || text[j] == '.')) {
-                if (std::isdigit(static_cast<unsigned char>(text[j]))) hasDigit = true;
-                ++j;
-            }
-            std::string tok(text + i, j - i);
-            std::string upper = tok;
-            for (char& u : upper) u = static_cast<char>(std::toupper(static_cast<unsigned char>(u)));
-            bool keep = hasDigit;
-            for (const char* k : kKeep) if (upper == k) keep = true;
-            if (upper == "OMNIMIDI") {
-                tok = "OmniMIDI";
-            } else if (!keep) {
-                for (char& l : tok) l = static_cast<char>(std::tolower(static_cast<unsigned char>(l)));
-                if (first) tok[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(tok[0])));
-            }
-            out += tok;
-            first = false;
-            i = j;
-        } else {
-            out += text[i];
-            ++i;
-        }
-    }
-    return out;
-}
-
-void PushLabel(float scale) {
-    if (IsRefinedStyle()) {
-        ImGui::PushFont(nullptr, ImGui::GetFontSize() * scale * 1.08f);
-    } else {
-        PushMono(scale);
-    }
-}
-
-void PopLabel() {
-    if (IsRefinedStyle()) ImGui::PopFont();
-    else PopMono();
-}
+void PopLabel() { PopMono(); }
 
 static int g_monoDepth = 0;
 static float g_monoBaseSize = 0.0f;
@@ -139,12 +92,6 @@ void DrawLed(ImDrawList* dl, ImVec2 c, float r, bool on, const ImVec4* color) {
 }
 
 static void PlainSectionHeader(const char* label) {
-    if (IsRefinedStyle()) {
-        ImGui::Spacing();
-        ImGui::TextUnformatted(StyleText(label).c_str());
-        ImGui::Spacing();
-        return;
-    }
     ImGui::Spacing();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     PushMono();
@@ -165,16 +112,20 @@ static void PlainSectionHeader(const char* label) {
     ImGui::Spacing();
 }
 
+// Titles of the open rack panels, for the search flash on legacy pages.
+static constexpr int kMaxPanelDepth = 8;
+static const char* g_panelTitles[kMaxPanelDepth] = {};
+static int g_panelDepth = 0;
+
 bool BeginRackPanel(const char* title) {
     const ThemeSettings& t = GetThemeSettings();
-    const bool refined = t.style == 1;
+    ui::BeginEntry();
     ImGui::PushStyleColor(ImGuiCol_ChildBg, GetPanelBg());
     ImGui::PushStyleColor(ImGuiCol_Border, GetPanelEdge());
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, t.cornerRadius + 2.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, refined ? 0.0f : 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        refined ? ImVec2(16.0f * t.density, 12.0f * t.density)
-                                : ImVec2(18.0f * t.density, 10.0f * t.density));
+                        ImVec2(18.0f * t.density, 10.0f * t.density));
     const bool open = ImGui::BeginChild(
         title, ImVec2(0.0f, 0.0f),
         ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY |
@@ -185,26 +136,20 @@ bool BeginRackPanel(const char* title) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const float width = ImGui::GetWindowWidth();
-    float titleH = 0.0f;
-    if (refined) {
-        const std::string text = StyleText(title);
-        titleH = ImGui::GetTextLineHeight();
-        dl->AddText(ImVec2(wp.x + 16.0f, wp.y + 12.0f), ImGui::GetColorU32(t.text), text.c_str());
-        ImGui::SetCursorPosY(12.0f + titleH + 10.0f);
-    } else {
-        PushMono();
-        const ImVec2 ts = ImGui::CalcTextSize(title);
-        dl->AddText(ImVec2(wp.x + (width - ts.x) * 0.5f, wp.y + 8.0f),
-                    ImGui::GetColorU32(GetMutedText()), title);
-        titleH = ImGui::GetTextLineHeight();
-        PopMono();
-        ImGui::SetCursorPosY(8.0f + titleH + 6.0f);
-    }
+    PushMono();
+    const ImVec2 ts = ImGui::CalcTextSize(title);
+    dl->AddText(ImVec2(wp.x + (width - ts.x) * 0.5f, wp.y + 8.0f),
+                ImGui::GetColorU32(GetMutedText()), title);
+    const float titleH = ImGui::GetTextLineHeight();
+    PopMono();
+    ImGui::SetCursorPosY(8.0f + titleH + 6.0f);
+    g_panelTitles[g_panelDepth < kMaxPanelDepth ? g_panelDepth : kMaxPanelDepth - 1] = title;
+    ++g_panelDepth;
     return open;
 }
 
 void EndRackPanel() {
-    if (!IsRefinedStyle()) {
+    {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 wp = ImGui::GetWindowPos();
         const ImVec2 ws = ImGui::GetWindowSize();
@@ -221,6 +166,10 @@ void EndRackPanel() {
         }
     }
     ImGui::EndChild();
+    if (g_panelDepth > 0) --g_panelDepth;
+    const char* title = g_panelTitles[g_panelDepth < kMaxPanelDepth ? g_panelDepth : kMaxPanelDepth - 1];
+    ui::LegacyAnchor(title, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ui::EndEntry();
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
 }
 
@@ -307,54 +256,6 @@ bool KeyGroup(const char* id, int* current, const char* const* labels,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ThemeSettings& th = GetThemeSettings();
 
-    if (th.style == 1) {
-        // Refined: one rounded track, the chosen segment lifted.
-        PushLabel(0.95f);
-        const float segH = ImGui::GetTextLineHeight() + 12.0f;
-        const float pad = 3.0f;
-        const ImVec2 origin = ImGui::GetCursorScreenPos();
-        float total = pad;
-        std::string texts[32];
-        float widths[32];
-        const int n = (std::min)(count, 32);
-        for (int i = 0; i < n; ++i) {
-            texts[i] = StyleText(labels[i]);
-            widths[i] = ImGui::CalcTextSize(texts[i].c_str()).x + 26.0f;
-            total += widths[i] + 2.0f;
-        }
-        total += pad - 2.0f;
-        dl->AddRectFilled(origin, ImVec2(origin.x + total, origin.y + segH + pad * 2.0f),
-                          ImGui::GetColorU32(GetLcdBg()), 9.0f);
-        float x = origin.x + pad;
-        for (int i = 0; i < n; ++i) {
-            ImGui::SetCursorScreenPos(ImVec2(x, origin.y + pad));
-            ImGui::PushID(i);
-            if (ImGui::InvisibleButton("seg", ImVec2(widths[i], segH)) && *current != i) {
-                *current = i;
-                changed = true;
-            }
-            const bool hov = ImGui::IsItemHovered();
-            ImGui::PopID();
-            const bool on = *current == i;
-            if (on || hov) {
-                dl->AddRectFilled(ImVec2(x, origin.y + pad),
-                                  ImVec2(x + widths[i], origin.y + pad + segH),
-                                  ImGui::GetColorU32(Mix(th.control, th.text, on ? 0.10f : 0.03f)),
-                                  7.0f);
-            }
-            const ImVec2 ts = ImGui::CalcTextSize(texts[i].c_str());
-            dl->AddText(ImVec2(x + (widths[i] - ts.x) * 0.5f,
-                               origin.y + pad + (segH - ts.y) * 0.5f),
-                        ImGui::GetColorU32(on ? th.text : th.mutedText), texts[i].c_str());
-            x += widths[i] + 2.0f;
-        }
-        ImGui::SetCursorScreenPos(origin);
-        ImGui::Dummy(ImVec2(total, segH + pad * 2.0f));
-        PopLabel();
-        ImGui::PopID();
-        return changed;
-    }
-
     PushMono();
     const float lineH = ImGui::GetTextLineHeight();
     const float keyH = lineH + 22.0f;
@@ -402,8 +303,7 @@ bool KeyButton(const char* label, const ImVec2& size, bool primary, bool enabled
     const bool hov = ImGui::IsItemHovered() && enabled;
     const bool down = ImGui::IsItemActive() && enabled;
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const std::string shown = StyleText(label);
-    const ImVec2 ts = ImGui::CalcTextSize(shown.c_str());
+    const ImVec2 ts = ImGui::CalcTextSize(label);
     if (!enabled) {
         // Flat, recessed, dim: clearly not pressable.
         dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y),
@@ -412,21 +312,9 @@ bool KeyButton(const char* label, const ImVec2& size, bool primary, bool enabled
         dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y),
                     ImGui::GetColorU32(GetPanelEdge()), th.cornerRadius);
         dl->AddText(ImVec2(p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f),
-                    ImGui::GetColorU32(Alpha(th.mutedText, 0.45f)), shown.c_str());
+                    ImGui::GetColorU32(Alpha(th.mutedText, 0.45f)), label);
         ImGui::PopID();
         return false;
-    }
-    if (th.style == 1) {
-        const ImVec4 face = primary
-            ? Mix(th.accent, th.background, down ? 0.25f : (hov ? 0.0f : 0.06f))
-            : Mix(th.control, th.text, down ? 0.12f : (hov ? 0.07f : 0.0f));
-        dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y),
-                          ImGui::GetColorU32(face), th.cornerRadius + 1.0f);
-        const ImVec4 ink = primary ? ImVec4(0.07f, 0.06f, 0.04f, 1.0f) : th.text;
-        dl->AddText(ImVec2(p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f),
-                    ImGui::GetColorU32(ink), shown.c_str());
-        ImGui::PopID();
-        return clicked;
     }
     const float edgeH = down ? 1.0f : 3.0f;
     const float drop = down ? 2.0f : 0.0f;
@@ -442,7 +330,7 @@ bool KeyButton(const char* label, const ImVec2& size, bool primary, bool enabled
     const ImVec4 ink = primary ? ImVec4(0.07f, 0.06f, 0.04f, 1.0f) : th.text;
     dl->AddText(ImVec2(p.x + (size.x - ts.x) * 0.5f,
                        p.y + drop + (size.y - edgeH - ts.y) * 0.5f),
-                ImGui::GetColorU32(ink), shown.c_str());
+                ImGui::GetColorU32(ink), label);
     ImGui::PopID();
     return clicked;
 }
@@ -465,9 +353,10 @@ void DrawLcdFrame(ImDrawList* dl, ImVec2 min, ImVec2 max, int cols, int rows) {
 void PanelCaption(const char* caption, const char* help, bool restart) {
     PushLabel(0.85f);
     ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
-    ImGui::TextUnformatted(StyleText(caption).c_str());
+    ImGui::TextUnformatted(caption);
     ImGui::PopStyleColor();
     const bool hovered = ImGui::IsItemHovered();
+    ui::LegacyAnchor(caption, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     PopLabel();
     if (restart) {
         ImGui::SameLine(0.0f, 8.0f);
@@ -510,6 +399,7 @@ bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
     KnobState ks = {*value, minValue, maxValue, defaultValue,
                     label, nullptr, size, 1.0f, displayFn, inverseFn};
     const bool changed = RotaryKnob(ks, format);
+    ui::LegacyAnchor(label, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (changed) *value = ks.value;
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
@@ -576,10 +466,9 @@ bool PanelSliderInt(const char* caption, int* value, int minValue, int maxValue,
 
 void RestartPill() {
     PushLabel(0.78f);
-    const bool refined = IsRefinedStyle();
-    const std::string label = StyleText("RESTART");
-    const ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-    const ImVec2 pad(refined ? 8.0f : 6.0f, 1.0f);
+    const char* label = "RESTART";
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    const ImVec2 pad(6.0f, 1.0f);
     ImVec2 p = ImGui::GetCursorScreenPos();
     const ImVec2 size(ts.x + pad.x * 2.0f, ts.y + pad.y * 2.0f);
     // Centre on the previous item when sharing its line (caption / lever label).
@@ -590,20 +479,11 @@ void RestartPill() {
     }
     ImGui::Dummy(size);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    if (refined) {
-        // A quiet chip: information, not a warning.
-        dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y),
-                          ImGui::GetColorU32(Alpha(GetThemeSettings().text, 0.07f)),
-                          size.y * 0.5f);
-        dl->AddText(ImVec2(p.x + pad.x, p.y + pad.y),
-                    ImGui::GetColorU32(GetMutedText()), label.c_str());
-    } else {
-        // A tag, not a warning: follows the theme accent so it never clashes.
-        const ImVec4 c = GetAccent();
-        dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y),
-                    ImGui::GetColorU32(Alpha(c, 0.55f)), 3.0f);
-        dl->AddText(ImVec2(p.x + pad.x, p.y + pad.y + 1.0f), ImGui::GetColorU32(c), label.c_str());
-    }
+    // A tag, not a warning: follows the theme accent so it never clashes.
+    const ImVec4 c = GetAccent();
+    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y),
+                ImGui::GetColorU32(Alpha(c, 0.55f)), 3.0f);
+    dl->AddText(ImVec2(p.x + pad.x, p.y + pad.y + 1.0f), ImGui::GetColorU32(c), label);
     PopLabel();
     if (ImGui::IsItemHovered()) {
         ImGui::BeginTooltip();
@@ -623,6 +503,21 @@ void HelpMarker(const char* desc) {
     }
 }
 
+void DrawRackLever(ImDrawList* dl, ImVec2 pos, ImVec2 size, bool on, bool hovered) {
+    // Slot with a sliding lever; the lever lights up when on.
+    const ThemeSettings& th = GetThemeSettings();
+    const float w = size.x, h = size.y;
+    dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h),
+                      ImGui::GetColorU32(GetKeyEdge()), 4.0f);
+    dl->AddRect(pos, ImVec2(pos.x + w, pos.y + h),
+                ImGui::GetColorU32(GetPanelEdge()), 4.0f);
+    const float leverW = w * 0.5f - 3.0f;
+    const float lx = on ? pos.x + w - leverW - 3.0f : pos.x + 3.0f;
+    const ImVec4 lever = on ? GetAccent() : Mix(th.control, th.text, hovered ? 0.12f : 0.04f);
+    dl->AddRectFilled(ImVec2(lx, pos.y + 3.0f), ImVec2(lx + leverW, pos.y + h - 3.0f),
+                      ImGui::GetColorU32(lever), 3.0f);
+}
+
 bool ToggleSwitch(const char* label, bool* value, const char* tooltip) {
     ImGui::PushID(label);
     bool changed = false;
@@ -639,40 +534,15 @@ bool ToggleSwitch(const char* label, bool* value, const char* tooltip) {
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ThemeSettings& th = GetThemeSettings();
     const bool hov = ImGui::IsItemHovered();
-    if (IsRefinedStyle()) {
-        // Flat pill toggle.
-        const float tw = 38.0f;
-        const float th2 = 20.0f;
-        const ImVec2 q(pos.x, pos.y + (h - th2) * 0.5f);
-        dl->AddRectFilled(q, ImVec2(q.x + tw, q.y + th2),
-                          ImGui::GetColorU32(*value ? GetAccent() : Mix(th.control, th.text, hov ? 0.10f : 0.04f)),
-                          th2 * 0.5f);
-        const float cx = *value ? q.x + tw - th2 * 0.5f : q.x + th2 * 0.5f;
-        dl->AddCircleFilled(ImVec2(cx, q.y + th2 * 0.5f), th2 * 0.5f - 3.0f,
-                            ImGui::GetColorU32(*value ? ImVec4(0.07f, 0.06f, 0.04f, 1.0f) : th.mutedText));
-    } else {
-    // Slot with a sliding lever; the lever lights up when on.
-    dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h),
-                      ImGui::GetColorU32(GetKeyEdge()), 4.0f);
-    dl->AddRect(pos, ImVec2(pos.x + w, pos.y + h),
-                ImGui::GetColorU32(GetPanelEdge()), 4.0f);
-    const float leverW = w * 0.5f - 3.0f;
-    const float lx = *value ? pos.x + w - leverW - 3.0f : pos.x + 3.0f;
-    const ImVec4 lever = *value
-        ? GetAccent()
-        : Mix(th.control, th.text, hov ? 0.12f : 0.04f);
-    dl->AddRectFilled(ImVec2(lx, pos.y + 3.0f),
-                      ImVec2(lx + leverW, pos.y + h - 3.0f),
-                      ImGui::GetColorU32(lever), 3.0f);
-    }
+    DrawRackLever(dl, pos, ImVec2(w, h), *value, hov);
     (void)radius;
 
     ImGui::SameLine();
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4.0f);
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (h - ImGui::GetTextLineHeight()) * 0.5f);
-    ImGui::TextUnformatted(StyleText(label).c_str());
+    ImGui::TextUnformatted(label);
+    ui::LegacyAnchor(label, pos, ImGui::GetItemRectMax());
 
     if (tooltip && ImGui::IsItemHovered()) {
         ImGui::BeginTooltip();
@@ -977,7 +847,7 @@ bool RotaryKnob(KnobState& state, const char* format) {
 
     // Scale ticks around the knob (Rack style only).
     const ImU32 tickCol = ImGui::GetColorU32(Alpha(theme.mutedText, 0.55f));
-    for (int i = 0; theme.style == 0 && i <= 10; ++i) {
+    for (int i = 0; theme.style == kStyleRack && i <= 10; ++i) {
         const float a = startAngle + sweep * (static_cast<float>(i) / 10.0f);
         dl->AddLine(ImVec2(center.x + std::cos(a) * (radius + 3.0f),
                            center.y + std::sin(a) * (radius + 3.0f)),
@@ -1019,13 +889,8 @@ bool RotaryKnob(KnobState& state, const char* format) {
 
     char labelBuf[128];
     snprintf(labelBuf, sizeof(labelBuf), "%s", state.label);
-    if (theme.style == 0) {
-        for (char* c = labelBuf; *c; ++c)
-            if (*c >= 'a' && *c <= 'z') *c = static_cast<char>(*c - 32);
-    } else {
-        const std::string styled = StyleText(labelBuf);
-        std::snprintf(labelBuf, sizeof(labelBuf), "%s", styled.c_str());
-    }
+    for (char* c = labelBuf; *c; ++c)
+        if (*c >= 'a' && *c <= 'z') *c = static_cast<char>(*c - 32);
     ImVec2 labelText = ImGui::CalcTextSize(labelBuf);
     dl->AddText(ImVec2(center.x - labelText.x * 0.5f, center.y + radius + 7.0f + textSize.y + 1.0f),
                 ImGui::GetColorU32(theme.mutedText), labelBuf);

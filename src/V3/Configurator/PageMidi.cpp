@@ -119,6 +119,7 @@ void DrawMidiPage(ConfigDocument& doc) {
         if (!lc.connected || !lc.client) return;
         char result[svms::kRuntimeLinkResultTextCapacity]{};
         lc.client->SendCommand(type, 0u, param, svms::RuntimeLiveStateV2{}, 100u, result);
+        NoteLiveChange();
     };
     const ThemeSettings& th = GetThemeSettings();
 

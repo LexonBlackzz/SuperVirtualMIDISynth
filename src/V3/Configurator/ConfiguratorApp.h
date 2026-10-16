@@ -9,6 +9,8 @@
 #include "PageLiveRecording.h"
 #include "Platform.h"
 #include "DriverLink.h"
+#include "SettingsRegistry.h"
+#include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
 
 #include <algorithm>
@@ -19,25 +21,8 @@
 
 struct ImGuiContext;
 
-namespace svms::cfg {
 
-enum class Page {
-    Overview,
-    Audio,
-    Performance,
-    Midi,
-    OfflineRenderer,
-    LiveRecording,
-    Reverb,
-    Limiter,
-    ChannelLimiter,
-    Diagnostics,
-    Advanced,
-    About,
-    Synth,
-    DriverFeatures,  // Linux: schema-driven page for controls this build has no page for
-    PageCount
-};
+namespace svms::cfg {
 
 class ConfiguratorApp {
 public:
@@ -63,21 +48,26 @@ public:
     void SetLiveMaxVoices(uint32_t value);
     void SetLiveLimiterAlgorithm(uint32_t value);
 
-    // Jump to a stage/page (used by the Home overview's OPEN keys).
-    void NavigateTo(Page page) { currentPage_ = page; }
+    // Starts the top bar's "Applied live" chip (any live send).
+    void NoteLiveChange();
+    void Navigate(NavPage page);
 
 private:
 
     bool CreateImGui();
     void RecreateFonts(float scale, bool rendererBackendInitialized);
 
-    void DrawHeader();
-    void DrawMasterStrip(float y);
-    void DrawChainStrip(float y);
-    void DrawFooter();
+    void DrawTopBar();
+    void DrawSidebar();
+    void DrawSearchResults();
+    void DrawSaveBar(ImVec2 areaMin, ImVec2 areaMax);
     void DrawPageContent();
-    void DrawToastOverlay();
+    void DrawToastOverlay(ImVec2 areaMin, ImVec2 areaMax);
     void HandleKeyboardShortcuts();
+    void JumpTo(const SettingDef& def);
+    void SaveConfig();
+    void ShowToast(const std::string& message, float seconds = 2.2f);
+    std::string ConnectedAppName();
 
     std::unique_ptr<Platform> platform_;
     bool running_ = false;
@@ -93,7 +83,20 @@ private:
     std::vector<unsigned char> fontData_;
     std::vector<unsigned char> monoFontData_;
 
-    Page currentPage_ = Page::Overview;
+    NavPage page_ = NavPage::Home;
+    bool pageEntered_ = true;
+    char search_[128] = {};
+    bool searchActive_ = false;
+    bool resultsHovered_ = false;
+    bool searchEscaped_ = false;
+    ImVec2 searchMin_{}, searchMax_{};
+    double liveChipTime_ = -10.0;
+    double toastStart_ = -10.0;
+    std::string toastShown_;
+    float outL_ = 0.0f, outR_ = 0.0f;
+    uint32_t appNamePid_ = 0;
+    std::string appName_;
+    std::string effectsPanel_ = "reverb";   // chain selection (Phase 3)
 
     ConfigDocument config_;
     EasterEggState easterEggs_;

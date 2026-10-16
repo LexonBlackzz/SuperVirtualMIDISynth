@@ -108,6 +108,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
         if (!lc.connected || !lc.client) return;
         char result[svms::kRuntimeLinkResultTextCapacity]{};
         lc.client->SendCommand(type, 0u, param, svms::RuntimeLiveStateV2{}, 100u, result);
+        NoteLiveChange();
     };
 
     if (ImGui::BeginTable("##synth_top", 2,

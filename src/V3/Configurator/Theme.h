@@ -26,9 +26,30 @@ struct ThemeSettings {
     float colorStrength = 0.65f;
     float cornerRadius = 4.0f;
     float density = 1.0f;
-    // 0 = Rack (bevelled keys, lamps, screws, caps), 1 = Refined (flat).
-    int style = 0;
+    // kStyleRack (bevelled keys, lamps, screws, caps) or kStyleModern.
+    int style = 1;
+    // Motion level: 0 Full, 1 Calm, 2 Off (see Anim.h).
+    int motion = 0;
 };
+
+inline constexpr int kStyleRack = 0;
+inline constexpr int kStyleModern = 1;
+// Theme files written before this get Modern forced once (owner decision for
+// the 0.11 redesign); after that the user's style choice sticks.
+inline constexpr int kThemeUiVersion = 11;
+
+bool IsModernStyle();
+
+// Embedded Geist / Geist Mono faces (system fonts when embedding failed).
+struct UiFonts {
+    ImFont* ui = nullptr;          // Geist Regular, 14 px base
+    ImFont* medium = nullptr;
+    ImFont* semibold = nullptr;
+    ImFont* bold = nullptr;
+    ImFont* mono = nullptr;        // Geist Mono Regular
+    ImFont* monoMedium = nullptr;
+};
+UiFonts& Fonts();
 
 enum class ThemeStorage {
     AppData,
@@ -55,6 +76,10 @@ bool ReloadThemeFromDisk(std::string* error = nullptr);
 // one accent colour. `strength` (0..1) is how much of the accent hue tints
 // the dark surfaces; 0 gives neutral graphite with a coloured lamp.
 void ApplyRackPalette(ThemeSettings& theme, const ImVec4& accent, float strength);
+// Modern: fixed neutral tokens from the approved design plus the accent.
+void ApplyModernPalette(ThemeSettings& theme, const ImVec4& accent);
+// Regenerates the palette for the theme's current style and accent.
+void RebuildPalette(ThemeSettings& theme);
 
 void PushEffectPageStyle();
 void PopEffectPageStyle();

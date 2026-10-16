@@ -33,14 +33,14 @@ void PushLiveMaxVoices(uint32_t value);
 void PushLiveLimiterAlgorithm(uint32_t value);
 // Coalesced per-MIDI-channel limiter update (dedicated wire command).
 void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs);
+// Pages that send a RuntimeLink command directly call this for the top bar's
+// "Applied live" chip.
+void NoteLiveChange();
 
 // --- Rack-style primitives -------------------------------------------------
-// Text style for labels: Rack = mono caps as authored, Refined = UI font in
-// sentence case. StyleText converts at draw time (acronyms are kept).
-std::string StyleText(const char* text);
+// Panel labels: mono caps as authored.
 void PushLabel(float scale = 0.9f);
 void PopLabel();
-bool IsRefinedStyle();
 // Monospace font for readouts; falls back to the UI font when unavailable.
 void PushMono(float scale = 0.9f);
 void PopMono();
@@ -54,6 +54,8 @@ bool KeyGroup(const char* id, int* current, const char* const* labels,
 // A disabled key is drawn flat and dim and never reports a click.
 bool KeyButton(const char* label, const ImVec2& size, bool primary = false,
                bool enabled = true);
+// Rack toggle: a slot with a sliding lever that lights when on (draw only).
+void DrawRackLever(ImDrawList* dl, ImVec2 pos, ImVec2 size, bool on, bool hovered);
 // Small lamp; `on` lights it with the accent colour.
 void DrawLed(ImDrawList* dl, ImVec2 center, float radius, bool on,
              const ImVec4* color = nullptr);

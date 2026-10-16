@@ -54,13 +54,13 @@ bool LiveKnob(ConfigDocument& doc, float& value, float minValue, float maxValue,
 }
 
 // Right-aligned key that jumps to a stage.
-void OpenKey(Page page) {
+void OpenKey(NavPage page) {
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
     const float w = 92.0f;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                          (std::max)(0.0f, ImGui::GetContentRegionAvail().x - w));
     if (KeyButton("OPEN  >", ImVec2(w, 26.0f))) {
-        if (ConfiguratorApp* app = GetLiveLinkContext().app) app->NavigateTo(page);
+        if (ConfiguratorApp* app = GetLiveLinkContext().app) app->Navigate(page);
     }
 }
 
@@ -109,7 +109,7 @@ void SynthModule(ConfigDocument& doc) {
             ImGui::SameLine();
             ImGui::TextDisabled("%u", w.maxVoices);
         }
-        OpenKey(Page::Synth);
+        OpenKey(NavPage::Performance);
     }
     EndRackPanel();
 }
@@ -139,7 +139,7 @@ void ReverbModule(ConfigDocument& doc) {
                      svms::RLCommandType::SetReverbDecay, 100.0f);
             ImGui::EndTable();
         }
-        OpenKey(Page::Reverb);
+        OpenKey(NavPage::Effects);
     }
     EndRackPanel();
 }
@@ -190,7 +190,7 @@ void LimiterModule(ConfigDocument& doc) {
                      svms::RLCommandType::SetLimiterRelease);
             ImGui::EndTable();
         }
-        OpenKey(Page::Limiter);
+        OpenKey(NavPage::Effects);
     }
     EndRackPanel();
 }
@@ -230,7 +230,7 @@ void MidiModule(ConfigDocument& doc) {
             ImGui::PopTextWrapPos();
             ImGui::PopStyleColor();
         }
-        OpenKey(Page::Midi);
+        OpenKey(NavPage::Midi);
     }
     EndRackPanel();
 }
