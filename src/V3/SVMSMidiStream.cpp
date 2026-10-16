@@ -12,8 +12,11 @@
 #include <unistd.h>
 #endif
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <queue>
+#include <thread>
 
 namespace svms {
 namespace {
@@ -434,6 +437,225 @@ bool MidiStreamDecoder::Decode(const MappedMidiFile& file, uint32_t rate, Sink s
     if (info) *info = local;
     return ok;
 }
+namespace {
+struct PTrack {
+    Track t;
+    const uint8_t* begin = nullptr;
+    RawEvent pending;
+    bool has = false;
+};
+struct WinEv { uint32_t off; uint32_t message; };
+struct TempoEv { uint64_t tick; uint32_t tempo; };
+struct WinWorker {
+    size_t first = 0, last = 0;
+    std::vector<WinEv> events;
+    std::vector<TempoEv> tempos;
+    uint64_t maxTick = 0;
+    bool sawRecord = false, allDone = true, ok = true;
+    std::string error;
+};
+
+// Consume every record with tick < b from the worker's tracks. Records are
+// not interpreted beyond tempo / channel messages / SysEx translation.
+void ParseWindow(std::vector<PTrack>& tracks, WinWorker& w, uint64_t a,
+                 uint64_t b) {
+    w.events.clear(); w.tempos.clear();
+    w.sawRecord = false; w.allDone = true; w.ok = true; w.maxTick = 0;
+    for (size_t i = w.first; i < w.last; ++i) {
+        PTrack& pt = tracks[i];
+        for (;;) {
+            if (!pt.has) {
+                if (pt.t.done) break;
+                if (!Next(pt.t, pt.pending, w.error)) { w.ok = false; return; }
+                if (!pt.pending.valid) break;  // track ended (done is set)
+                pt.has = true;
+            }
+            const RawEvent& e = pt.pending;
+            if (e.tick >= b) break;
+            pt.has = false;
+            w.sawRecord = true;
+            if (e.tick > w.maxTick) w.maxTick = e.tick;
+            const uint32_t off = static_cast<uint32_t>(e.tick - a);
+            if (e.tempo) w.tempos.push_back({e.tick, e.tempo});
+            else if (e.midi) w.events.push_back({off, e.message});
+            else if (e.sysex) {
+                (void)TranslateXGSystemExclusivePayload(
+                    e.sysexData, e.sysexSize,
+                    [&](uint32_t m) { w.events.push_back({off, m}); });
+            }
+        }
+        if (pt.has || !pt.t.done) w.allDone = false;
+    }
+}
+} // namespace
+
+bool ParallelMidiDecoder::Decode(const MappedMidiFile& file, uint32_t rate,
+                                 MidiStreamDecoder::Sink sink, void* user,
+                                 std::atomic<bool>* cancel,
+                                 MidiStreamInfo* info, std::string& error,
+                                 std::atomic<uint64_t>* bytesDone,
+                                 std::atomic<uint64_t>* totalBytes,
+                                 uint32_t threads) const {
+    MidiStreamInfo local{};
+    std::vector<Track> raw;
+    if (!Tracks(file, local, raw, error)) return false;
+    std::vector<PTrack> tracks(raw.size());
+    uint64_t total = 0;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        tracks[i].t = raw[i];
+        tracks[i].begin = raw[i].p;
+        total += static_cast<uint64_t>(raw[i].end - raw[i].p);
+    }
+    if (totalBytes) totalBytes->store(total, std::memory_order_relaxed);
+
+    size_t n = threads ? threads
+                       : (std::min)(8u, (std::max)(1u, std::thread::hardware_concurrency() / 2u));
+    n = (std::max<size_t>)(1, (std::min)(n, tracks.size()));
+    std::vector<WinWorker> workers(n);
+    {   // contiguous track ranges balanced by bytes keep (track, order) order
+        size_t idx = 0; uint64_t acc = 0;
+        for (size_t k = 0; k < n; ++k) {
+            workers[k].first = idx;
+            const uint64_t target = total / n * (k + 1);
+            while (idx < tracks.size() && (acc < target || k + 1 == n)) {
+                acc += static_cast<uint64_t>(tracks[idx].t.end - tracks[idx].t.p);
+                ++idx;
+            }
+            workers[k].last = idx;
+        }
+    }
+
+    std::mutex m;
+    std::condition_variable cvStart, cvDone;
+    uint64_t generation = 0, winA = 0, winB = 0;
+    size_t outstanding = 0;
+    bool quit = false;
+    std::vector<std::thread> pool;
+    struct Join {
+        std::mutex& m; std::condition_variable& cv; bool& quit;
+        std::vector<std::thread>& pool;
+        ~Join() {
+            { std::lock_guard<std::mutex> lk(m); quit = true; }
+            cv.notify_all();
+            for (auto& t : pool) t.join();
+        }
+    } join{m, cvStart, quit, pool};
+    for (size_t k = 1; k < n; ++k) {
+        pool.emplace_back([&, k] {
+            uint64_t seen = 0;
+            for (;;) {
+                uint64_t a, b;
+                {
+                    std::unique_lock<std::mutex> lk(m);
+                    cvStart.wait(lk, [&] { return quit || generation != seen; });
+                    if (quit) return;
+                    seen = generation; a = winA; b = winB;
+                }
+                ParseWindow(tracks, workers[k], a, b);
+                std::lock_guard<std::mutex> lk(m);
+                if (--outstanding == 0) cvDone.notify_one();
+            }
+        });
+    }
+    auto runWindow = [&](uint64_t a, uint64_t b) {
+        { std::lock_guard<std::mutex> lk(m);
+          winA = a; winB = b; outstanding = n - 1; ++generation; }
+        cvStart.notify_all();
+        ParseWindow(tracks, workers[0], a, b);
+        std::unique_lock<std::mutex> lk(m);
+        cvDone.wait(lk, [&] { return outstanding == 0; });
+    };
+
+    // Exact tick->frame recurrence of Run(): per-tick stepping is the same
+    // floor accumulation as the per-delta form.
+    const uint64_t denom = uint64_t(local.division) * 1000000ull;
+    uint64_t q = 0, rest = 0;
+    auto setTempo = [&](uint32_t t) {
+        const uint64_t num = uint64_t(t) * rate;
+        q = num / denom; rest = num % denom;
+    };
+    setTempo(500000u);
+    uint64_t frame = 0, rem = 0, count = 0, noteOns = 0, totalFrames = 0;
+    uint32_t sequence = 0;
+    const uint64_t kMaxWindow = 65536u;
+    uint64_t span = (std::min)(kMaxWindow,
+                               (std::max<uint64_t>)(64u, local.division / 2u));
+    std::vector<uint64_t> frames;
+    std::vector<uint32_t> cnt, sorted;
+    std::vector<TempoEv> tempos;
+    for (uint64_t a = 0, b = 0, windowIndex = 0;; a = b, ++windowIndex) {
+        if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+        b = a + span;
+        runWindow(a, b);
+        bool allDone = true, sawAny = false;
+        uint64_t wmax = 0, nev = 0;
+        tempos.clear();
+        for (WinWorker& w : workers) {
+            if (!w.ok) { error = w.error; return false; }
+            allDone = allDone && w.allDone;
+            nev += w.events.size();
+            if (w.sawRecord) { sawAny = true; wmax = (std::max)(wmax, w.maxTick); }
+            tempos.insert(tempos.end(), w.tempos.begin(), w.tempos.end());
+        }
+        std::stable_sort(tempos.begin(), tempos.end(),
+                         [](const TempoEv& x, const TempoEv& y) { return x.tick < y.tick; });
+
+        if (!sawAny) {
+            const uint64_t fraction = rem + span * rest;
+            frame += span * q + fraction / denom;
+            rem = fraction % denom;
+        } else {
+            frames.resize(span);
+            size_t tp = 0;
+            for (uint64_t i = 0; i < span; ++i) {
+                frames[i] = frame;
+                while (tp < tempos.size() && tempos[tp].tick == a + i)
+                    setTempo(tempos[tp++].tempo);
+                rem += rest; frame += q;
+                if (rem >= denom) { rem -= denom; ++frame; }
+            }
+            totalFrames = (std::max)(totalFrames, frames[wmax - a]);
+
+            cnt.assign(span + 1, 0u);
+            for (const WinWorker& w : workers)
+                for (const WinEv& e : w.events) ++cnt[e.off + 1];
+            for (uint64_t i = 0; i < span; ++i) cnt[i + 1] += cnt[i];
+            sorted.resize(nev);
+            for (const WinWorker& w : workers)
+                for (const WinEv& e : w.events) sorted[cnt[e.off]++] = e.message;
+            size_t pos = 0;
+            for (uint64_t off = 0; off < span; ++off) {
+                const size_t end = cnt[off];
+                for (; pos < end; ++pos) {
+                    const uint32_t message = sorted[pos];
+                    PackedMidiEvent packed{frames[off], sequence++, message};
+                    if (sink && !sink(packed, user)) return false;
+                    ++count;
+                    if ((message & 0xf0u) == 0x90u && ((message >> 16) & 0x7fu))
+                        ++noteOns;
+                }
+            }
+        }
+        // Keep windows around 2M events: big enough to amortise the barrier,
+        // small enough that the sort buffers stay modest.
+        if (nev > (4u << 20) && span > 64u) span >>= 1;
+        else if (nev < (1u << 19) && span < kMaxWindow) span <<= 1;
+        if (bytesDone && (windowIndex & 7u) == 0u) {
+            uint64_t done = 0;
+            for (const PTrack& pt : tracks)
+                done += static_cast<uint64_t>(pt.t.p - pt.begin);
+            bytesDone->store(done, std::memory_order_relaxed);
+        }
+        if (allDone) break;
+    }
+    if (bytesDone) bytesDone->store(total, std::memory_order_relaxed);
+    local.eventCount = count;
+    local.noteOnCount = noteOns;
+    local.totalFrames = totalFrames;
+    if (info) *info = local;
+    return true;
+}
+
 ParsedEventRing::ParsedEventRing(uint32_t mb) : events_(nullptr), capacity_(0), mask_(0), head_(0), tail_(0) {
     uint64_t slots = (uint64_t(mb ? mb : 1) << 20) / sizeof(PackedMidiEvent);
     uint64_t power = 1; while ((power << 1) <= slots) power <<= 1;

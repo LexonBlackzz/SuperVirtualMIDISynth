@@ -10,6 +10,7 @@
 #include "SVMSLimiter.h"
 #include "SVMSNoteMerge.h"
 #include "SVMSNoteOnCollapse.h"
+#include "SVMSThreadAffinity.h"
 #include "SVMSPostFilter.h"
 #include "SVMSRenderScalar.h"
 #include "SVMSSoundFont.h"
@@ -54,6 +55,12 @@ struct StandaloneSynthConfig {
     uint32_t phaseRotationMode = 0u;
     uint32_t tuningEdo = 12u;
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
+    // When set, the realtime driver's voice/render tuning is applied from this
+    // config (steal policy, per-key cap, ghost budget, decimation, retire
+    // floor, fast chunk math, affinity) so an offline render behaves like the
+    // live synth under the same settings. Null = engine defaults (BASS shim,
+    // Linux daemon, tests).
+    const EngineConfig* tuning = nullptr;
 };
 
 // Platform-neutral owner for the existing V3 synthesis core. Event ordering
@@ -111,6 +118,20 @@ public:
         }
 
         prepared_.resize(sf2_->regionCount);
+        if (const EngineConfig* t = config.tuning) {
+            voices_.SetStealPolicy(t->stealPolicy);
+            voices_.SetPerKeyVoiceCap(t->perKeyVoiceCap);
+            voices_.SetStealReject(t->stealReject);
+            g_voiceRetireThreshold.store(t->voiceRetireThreshold,
+                                         std::memory_order_relaxed);
+            g_threadAffinityMode.store(t->threadAffinityMode,
+                                       std::memory_order_relaxed);
+            renderer_.SetGhostBudget(t->ghostBudget);
+            renderer_.SetDecimationEnabled(t->decimation);
+            renderer_.SetDecimationByLevel(t->decimationByLevel);
+            renderer_.SetMutedTailCullBlocks(t->decimationCullBlocks);
+            SetFastChunkMath(t->fastChunkMath);
+        }
         if (!voices_.Initialize(maxVoices_, rate_)) {
             error = "cannot allocate voice storage";
             return false;

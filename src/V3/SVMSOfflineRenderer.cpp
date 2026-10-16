@@ -15,6 +15,7 @@
 #include "SVMSEnvelope.h"
 #include "SVMSConfig.h"
 #include "SVMSStandaloneSynth.h"
+#include "SVMSRealtimeBlock.h"
 #include "Engine/CanonicalEngine.h"
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
 #include "SVMSGpuSynth.h"
@@ -58,6 +59,7 @@ struct Options {
     bool machineProgress = false;
     bool canonicalSynth = false;
     std::wstring cancelEvent;
+    const EngineConfig* tuning = nullptr;  // live-synth tuning (shared config)
 };
 
 // The machine stream is deliberately tiny and line-oriented so the standalone
@@ -363,14 +365,15 @@ public:
         const std::string utf8 = converter.to_bytes(path);
         file_ = std::fopen(utf8.c_str(), "wb+"); if (!file_) return false;
 #endif
-        rf64_ = estimatedFrames > (0xffffffffull - 80ull) / 8ull;
-        if (rf64_) {
-            fwrite("RF64",1,4,file_); U32(0xffffffffu); fwrite("WAVE",1,4,file_);
-            fwrite("ds64",1,4,file_); U32(28); ds64Pos_=Tell();
-            U64(0); U64(0); U64(0); U32(0);
-        } else { fwrite("RIFF",1,4,file_); U32(0); fwrite("WAVE",1,4,file_); }
+        (void)estimatedFrames;
+        // The length is unknown while streaming, so reserve the ds64 slot as a
+        // JUNK chunk; Close() either leaves it (plain RIFF) or turns the file
+        // into RF64 when it outgrew 4 GB.
+        fwrite("RIFF",1,4,file_); U32(0); fwrite("WAVE",1,4,file_);
+        fwrite("JUNK",1,4,file_); U32(28); ds64Pos_=Tell();
+        U64(0); U64(0); U64(0); U32(0);
         fwrite("fmt ",1,4,file_); U32(16); U16(3); U16(2); U32(rate); U32(rate*8); U16(8); U16(32);
-        fwrite("data",1,4,file_); dataSizePos_=Tell(); U32(rf64_ ? 0xffffffffu : 0u);
+        fwrite("data",1,4,file_); dataSizePos_=Tell(); U32(0);
         return true;
     }
     bool Write(const float* left, const float* right, uint32_t frames) {
@@ -382,9 +385,11 @@ public:
     bool Close() {
         if (!file_) return true;
         const uint64_t bytes=frames_*8, end=Tell();
-        if (rf64_) {
-            Seek(ds64Pos_);
-            U64(end-8); U64(bytes); U64(frames_);
+        if (end - 8 > 0xffffffffull || bytes > 0xffffffffull) {
+            Seek(0); fwrite("RF64",1,4,file_); U32(0xffffffffu);
+            Seek(12); fwrite("ds64",1,4,file_);
+            Seek(ds64Pos_); U64(end-8); U64(bytes); U64(frames_);
+            Seek(dataSizePos_); U32(0xffffffffu);
         } else {
             Seek(4); U32(static_cast<uint32_t>(end-8));
             Seek(dataSizePos_); U32(static_cast<uint32_t>(bytes));
@@ -410,7 +415,7 @@ private:
     void U16(uint16_t v) { fwrite(&v,2,1,file_); }
     void U32(uint32_t v) { fwrite(&v,4,1,file_); }
     void U64(uint64_t v) { fwrite(&v,8,1,file_); }
-    FILE* file_=nullptr; uint32_t rate_=0; bool rf64_=false;
+    FILE* file_=nullptr; uint32_t rate_=0;
     uint64_t frames_=0, ds64Pos_=0, dataSizePos_=0; std::vector<float> scratch_;
 };
 
@@ -594,6 +599,15 @@ public:
     virtual void Render(float* left, float* right, uint32_t frames,
                         uint64_t absoluteFrame) = 0;
     virtual void ReleaseAll() = 0;
+    // Whole-block event rendering (one RenderBlock per block, events at their
+    // exact frames). Sessions that cannot do it return false and the caller
+    // uses the per-event Dispatch/Render loop.
+    virtual bool RenderEvents(const RealtimeEvent*, size_t, float*, float*,
+                              uint32_t, uint64_t) { return false; }
+    // Cumulative whole-voice phase cycles {plan, jobs, post}; zeros if unknown.
+    virtual void PhaseCycles(uint64_t (&out)[3]) const { out[0] = out[1] = out[2] = 0; }
+    // {note-on collapse coalesced, re-excited, exact-merge folded}
+    virtual void CollapseCounts(uint64_t (&out)[3]) const { out[0] = out[1] = out[2] = 0; }
     virtual uint32_t Active() const = 0;
     virtual uint32_t Tails() const = 0;
     virtual uint32_t Steals() const = 0;
@@ -630,6 +644,7 @@ public:
         config.backend = o.backend;
         config.phaseRotationMode = o.phaseRotationMode;
         config.tuningEdo = o.tuningEdo;
+        config.tuning = o.tuning;
         return synth_.Initialize(config, error);
     }
     void Dispatch(uint32_t message, uint64_t frame) override {
@@ -640,6 +655,19 @@ public:
         synth_.Render(left, right, frames, frame);
     }
     void ReleaseAll() override { synth_.ReleaseAll(); }
+    bool RenderEvents(const RealtimeEvent* events, size_t count, float* left,
+                      float* right, uint32_t frames, uint64_t frame) override {
+        block_.Render(synth_, events, count, left, right, frames, frame);
+        return true;
+    }
+    void PhaseCycles(uint64_t (&out)[3]) const override {
+        out[0] = synth_.WvPlanCycles(); out[1] = synth_.WvJobCycles();
+        out[2] = synth_.WvPostCycles();
+    }
+    void CollapseCounts(uint64_t (&out)[3]) const override {
+        out[0] = synth_.CoalescedNoteOns(); out[1] = synth_.ReExcitedNoteOns();
+        out[2] = synth_.MergedNoteOns();
+    }
     uint32_t Active() const override { return synth_.Active(); }
     uint32_t Tails() const override { return synth_.Tails(); }
     uint32_t Steals() const override { return synth_.Steals(); }
@@ -656,6 +684,7 @@ public:
     const char* Backend() const override { return synth_.Backend(); }
 private:
     StandaloneSynth synth_;
+    RealtimeBlockRenderer block_;
 };
 
 class CanonicalOfflineSession final : public OfflineSessionSynth {
@@ -805,6 +834,7 @@ int RendererMain(int argc, wchar_t** argv) {
 
     Options o;
     ApplyConfigDefaults(engineConfig, o);
+    o.tuning = &engineConfig;
     if (!ParseOptions(argc, argv, o)) {
         Usage();
         return 2;
@@ -834,22 +864,26 @@ int RendererMain(int argc, wchar_t** argv) {
     MappedMidiFile midi;
     if (!midi.Open(o.midi.c_str(), error)) return fail(error);
 
-    MachineStatus(o, "LOADING", "Scanning MIDI file");
     MidiStreamDecoder decoder;
     MidiStreamInfo info;
-    ScanProgressContext scanContext{
-        &o, &externalCancel, &cancel,
-        std::chrono::steady_clock::now(),
-        std::chrono::steady_clock::time_point{}};
-    if (!decoder.Scan(midi, o.sampleRate, info, error,
-                      (o.machineProgress || !o.cancelEvent.empty())
-                          ? ReportScanProgress : nullptr,
-                      &scanContext, &cancel)) {
-        if (pollCancel()) {
-            MachineStatus(o, "CANCELLED", "Cancelled while loading MIDI");
-            return 3;
+    // Rendering is single-pass: ParallelMidiDecoder streams events while the
+    // renderer consumes them, so only --scan-only walks the file up front.
+    if (o.scanOnly) {
+        MachineStatus(o, "LOADING", "Scanning MIDI file");
+        ScanProgressContext scanContext{
+            &o, &externalCancel, &cancel,
+            std::chrono::steady_clock::now(),
+            std::chrono::steady_clock::time_point{}};
+        if (!decoder.Scan(midi, o.sampleRate, info, error,
+                          (o.machineProgress || !o.cancelEvent.empty())
+                              ? ReportScanProgress : nullptr,
+                          &scanContext, &cancel)) {
+            if (pollCancel()) {
+                MachineStatus(o, "CANCELLED", "Cancelled while loading MIDI");
+                return 3;
+            }
+            return fail(error.empty() ? "MIDI scan failed" : error);
         }
-        return fail(error.empty() ? "MIDI scan failed" : error);
     }
 
     if (o.scanOnly) {
@@ -881,19 +915,20 @@ int RendererMain(int argc, wchar_t** argv) {
     }
 
     WaveWriter wave;
-    if (!wave.Open(o.output.c_str(), o.sampleRate,
-                   info.totalFrames + uint64_t(o.maxTailSeconds) * o.sampleRate))
+    if (!wave.Open(o.output.c_str(), o.sampleRate, 0))
         return fail("cannot create output file");
 
     std::atomic<bool> done{false};
     std::atomic<uint64_t> decoded{0};
+    std::atomic<uint64_t> bytesDone{0}, bytesTotal{0};
     std::string producerError;
     ProducerContext context{
         &ring, &midi, o.sampleRate, &cancel, &done, &decoded, &producerError};
+    ParallelMidiDecoder parallelDecoder;
     std::thread producer([&] {
-        MidiStreamInfo ignored;
-        decoder.Decode(midi, o.sampleRate, RingSink, &context, &cancel,
-                       &ignored, producerError);
+        // `info` is complete once `done` is published (release/acquire).
+        parallelDecoder.Decode(midi, o.sampleRate, RingSink, &context, &cancel,
+                               &info, producerError, &bytesDone, &bytesTotal);
         done.store(true, std::memory_order_release);
     });
 
@@ -916,10 +951,12 @@ int RendererMain(int argc, wchar_t** argv) {
     auto lastMachine = std::chrono::steady_clock::time_point{};
 
     if (humanProgress) {
-        fwprintf(stderr,L"SMF %u, %u tracks, %llu channel events (%llu note-ons) | %.2f min | %hs | ring %llu events\n",info.format,info.tracks,info.eventCount,info.noteOnCount,double(info.totalFrames)/o.sampleRate/60.0,synth->Backend(),ring.Capacity());
+        fwprintf(stderr,L"%.2f GB MIDI, single-pass parallel decode | %hs | ring %llu events\n",double(midi.Size())/1073741824.0,synth->Backend(),ring.Capacity());
         fwprintf(stderr,L"Render config: %u Hz | voices %u | threads %u | master %.3f | limiter %ls [%ls]",o.sampleRate,o.maxVoices,o.renderThreads,o.masterVolume,o.limiterEnabled?L"ON":L"OFF",o.limiterAlgorithm==LimiterAlgorithm::Adaptive?L"Adaptive":L"Classic");
         if(o.limiterEnabled)fwprintf(stderr,L" (threshold %.3f, lookahead %.2f ms, attack %.2f ms, release %.1f ms)",o.limiterThreshold,o.limiterLookaheadMs,o.limiterAttackMs,o.limiterReleaseMs);
         fputws(L"\n",stderr);
+        fwprintf(stderr,L"Live tuning: decimation %ls%ls | ghost budget %u | per-key cap %u | steal policy %u | min note %u ms | note merge %ls | fast chunk math %ls\n",engineConfig.decimation?L"ON":L"off",engineConfig.decimationByLevel?L" (by level)":L"",engineConfig.ghostBudget,engineConfig.perKeyVoiceCap,engineConfig.stealPolicy,engineConfig.minNoteMs,engineConfig.noteMerge?L"ON":L"off",engineConfig.fastChunkMath?L"ON":L"off");
+        fwprintf(stderr,L"Compiler-side (not yet in offline): cc collapse %ls | bend collapse %ls | note-on collapse threshold %u | block timing %ls | channel limiter %ls | reverb %ls\n",engineConfig.ccCollapse?L"ON":L"off",engineConfig.bendCollapse?L"ON":L"off",engineConfig.noteOnCollapseThreshold,engineConfig.blockTimingMode?L"ON":L"off",engineConfig.channelLimiterEnabled?L"ON":L"off",engineConfig.enableReverb?L"ON":L"off");
     }
     MachineStatus(o, "RENDERING", "Rendering MIDI");
 
@@ -927,15 +964,23 @@ int RendererMain(int argc, wchar_t** argv) {
         const auto now = std::chrono::steady_clock::now();
         const double elapsed = std::chrono::duration<double>(now - start).count();
         const double renderedSeconds = static_cast<double>(frame) / o.sampleRate;
-        const double totalSeconds = static_cast<double>(info.totalFrames) / o.sampleRate;
+        // The total is only exact once the decoder finishes; until then it is
+        // extrapolated from how far through the file's bytes the parse is.
+        const bool known = done.load(std::memory_order_acquire);
+        const uint64_t bt = bytesTotal.load(std::memory_order_relaxed);
+        const double byteFraction = bt
+            ? (std::min)(1.0, static_cast<double>(bytesDone.load(std::memory_order_relaxed)) /
+                               static_cast<double>(bt))
+            : 0.0;
+        const double totalSeconds = known
+            ? static_cast<double>(info.totalFrames) / o.sampleRate
+            : (byteFraction > 0.01 ? renderedSeconds / byteFraction : 0.0);
         const double speed = elapsed > 0.0 ? renderedSeconds / elapsed : 0.0;
-        const double remaining = static_cast<double>(
-            info.totalFrames > frame ? info.totalFrames - frame : 0u) / o.sampleRate;
+        const double remaining = totalSeconds > renderedSeconds
+            ? totalSeconds - renderedSeconds : 0.0;
         const double eta = speed > 0.0 ? remaining / speed : 0.0;
-        const double fraction = info.totalFrames
-            ? (std::min)(1.0, static_cast<double>(frame) /
-                               static_cast<double>(info.totalFrames))
-            : 1.0;
+        const double fraction = totalSeconds > 0.0
+            ? (std::min)(1.0, renderedSeconds / totalSeconds) : 0.0;
 
         if (o.machineProgress &&
             (force || now - lastMachine >= std::chrono::milliseconds(100))) {
@@ -957,7 +1002,18 @@ int RendererMain(int argc, wchar_t** argv) {
                 ? static_cast<double>(renderNs - lastRenderNs) /
                       1000000.0 / audioDelta
                 : 0.0;
-            fwprintf(stderr,L"\r%s / %s  %6.2f%% | voices %u free %u peak %u steals %u | events %llu/%llu | %.2fx | DSP %.1f ms/audio-s | ETA %s   ",FormatTime(renderedSeconds).c_str(),FormatTime(totalSeconds).c_str(),fraction*100.0,synth->Active(),synth->Free(),peakVoices,synth->Steals(),events,info.eventCount,recent,dspMsPerAudioSecond,FormatTime(eta).c_str());
+            fwprintf(stderr,L"\r%s / %s  %6.2f%% | voices %u free %u peak %u steals %u | events %llu/%llu | %.2fx | DSP %.1f ms/audio-s | ETA %s   ",FormatTime(renderedSeconds).c_str(),FormatTime(totalSeconds).c_str(),fraction*100.0,synth->Active(),synth->Free(),peakVoices,synth->Steals(),events,known?info.eventCount:events,recent,dspMsPerAudioSecond,FormatTime(eta).c_str());
+            if (std::getenv("SVMS_OFFLINE_PROFILE")) {
+                uint64_t k[3]; synth->CollapseCounts(k);
+                fwprintf(stderr, L"\n[collapse] coalesced %llu re-excited %llu merged %llu",
+                         (unsigned long long)k[0], (unsigned long long)k[1],
+                         (unsigned long long)k[2]);
+                uint64_t c[3]; synth->PhaseCycles(c);
+                const double sum = double(c[0] + c[1] + c[2]) + 1.0;
+                fwprintf(stderr, L"\n[profile] plan %.0f%% jobs %.0f%% post %.0f%% ring %llu\n",
+                         100.0 * c[0] / sum, 100.0 * c[1] / sum, 100.0 * c[2] / sum,
+                         (unsigned long long)ring.Size());
+            }
             lastHuman = now;
             lastFrame = frame;
             lastRenderNs = renderNs;
@@ -981,7 +1037,7 @@ int RendererMain(int argc, wchar_t** argv) {
         }
     };
 
-    auto dispatchSourceEvent = [&](const PackedMidiEvent& source) {
+    auto countSourceEvent = [&](const PackedMidiEvent& source) {
         const uint8_t status = static_cast<uint8_t>(source.message);
         const uint8_t type = status & 0xf0u;
         const uint8_t data1 = static_cast<uint8_t>(source.message >> 8u);
@@ -994,12 +1050,64 @@ int RendererMain(int argc, wchar_t** argv) {
             ++sourceControls;
             ++controllerCounts[data1];
         }
+    };
+    auto dispatchSourceEvent = [&](const PackedMidiEvent& source) {
+        countSourceEvent(source);
         synth->Dispatch(source.message, source.outputFrame);
         ++events;
     };
 
+    // Batched path: every event inside a block goes to ONE RenderBlock call at
+    // its exact frame (what the realtime driver does). The per-event loop
+    // below re-enters RenderBlock for every event, which at Black MIDI
+    // densities is a call every few frames.
+    const bool batched = std::getenv("SVMS_OFFLINE_PER_EVENT") == nullptr &&
+                         synth->RenderEvents(nullptr, 0, nullptr, nullptr, 0, 0);
     PackedMidiEvent event{};
-    while (ioOk && !pollCancel()) {
+    if (batched) {
+        std::vector<RealtimeEvent> block;
+        while (ioOk && !pollCancel()) {
+            uint32_t n = o.blockFrames;
+            const uint64_t limit = frame + n;
+            block.clear();
+            bool exhausted = false;
+            for (;;) {
+                PackedMidiEvent next{};
+                while (!ring.Peek(next) &&
+                       !done.load(std::memory_order_acquire) && !pollCancel())
+                    std::this_thread::yield();
+                if (pollCancel()) break;
+                if (!ring.Peek(next)) { exhausted = true; break; }
+                if (next.outputFrame >= limit) break;
+                ring.Pop(event);
+                countSourceEvent(event);
+                ++events;
+                block.push_back({event.outputFrame, event.sequence,
+                                 event.message, false});
+            }
+            if (pollCancel()) break;
+            if (exhausted) {
+                // Decoder finished: the total is now exact. Events sitting
+                // exactly on the final frame fall outside the last block.
+                if (frame >= info.totalFrames) break;
+                n = static_cast<uint32_t>(
+                    (std::min<uint64_t>)(n, info.totalFrames - frame));
+                while (!block.empty() && block.back().targetFrame >= frame + n)
+                    block.pop_back();
+            }
+            const auto dspStart = std::chrono::steady_clock::now();
+            synth->RenderEvents(block.data(), block.size(), left.data(),
+                                right.data(), n, frame);
+            renderNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - dspStart).count());
+            ioOk = wave.Write(left.data(), right.data(), n);
+            frame += n;
+            peakVoices = (std::max)(peakVoices, synth->Active());
+            reportRender(false);
+        }
+    }
+    while (!batched && ioOk && !pollCancel()) {
         bool have = false;
         while (!(have = ring.Pop(event)) &&
                !done.load(std::memory_order_acquire) && !pollCancel()) {

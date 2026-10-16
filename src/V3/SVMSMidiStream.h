@@ -79,6 +79,23 @@ public:
                 MidiStreamInfo* info, std::string& error) const;
 };
 
+// Single-pass streaming decoder for huge files. Tracks are parsed in parallel
+// one tick-window at a time; each window's events are put in the exact
+// (tick, track, in-track) order MidiStreamDecoder::Decode produces and handed
+// to the sink with identical frames and sequence numbers. Nothing is scanned
+// first: tempo changes are picked up as the windows reach them, so totals are
+// only known when Decode returns. `bytesDone` (optional) tracks track bytes
+// consumed for progress.
+class ParallelMidiDecoder {
+public:
+    bool Decode(const MappedMidiFile& file, uint32_t sampleRate,
+                MidiStreamDecoder::Sink sink, void* user,
+                std::atomic<bool>* cancel, MidiStreamInfo* info,
+                std::string& error, std::atomic<uint64_t>* bytesDone = nullptr,
+                std::atomic<uint64_t>* totalBytes = nullptr,
+                uint32_t threads = 0) const;
+};
+
 class ParsedEventRing {
 public:
     explicit ParsedEventRing(uint32_t megabytes);
