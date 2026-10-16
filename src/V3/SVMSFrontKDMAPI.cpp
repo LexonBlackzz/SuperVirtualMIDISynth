@@ -172,7 +172,7 @@ svms::LegacyDriverDebugInfo* WINAPI GetDriverDebugInfo(void) {
 }
 
 FLOAT WINAPI GetRenderingTime(void) {
-    return g_driver ? g_driver->GetRenderingTimeMilliseconds() : 0.0f;
+    return g_driver ? g_driver->GetLegacyDebugInfo()->renderingTime : 0.0f;  // percent
 }
 
 DWORD WINAPI GetVoiceCount(void) {

@@ -954,13 +954,15 @@ const uint32_t importedPages = self->useEventCompiler_
     LegacyDriverDebugInfo& legacy =
         self->legacyDebugSnapshots_[nextDebugIndex];
     legacy = LegacyDriverDebugInfo{};
-    legacy.renderingTime = static_cast<float>(elapsedUs / 1000.0);
+    // OmniMIDI-compatible: RenderingTime is a percent of the callback budget
+    // (players print it as "RT %"); the ms snapshot below feeds native/runtime link.
+    legacy.renderingTime = cpuPct;
     for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
         legacy.activeVoices[channel] = vm->GetChannelActiveCount(channel);
     }
     legacy.audioLatency = budgetUs / 1000.0;
     legacy.audioBufferSize = numFrames;
-    self->renderingTimeSnapshots_[nextDebugIndex] = legacy.renderingTime;
+    self->renderingTimeSnapshots_[nextDebugIndex] = static_cast<float>(elapsedUs / 1000.0);
     self->debugSnapshotIndex_.store(nextDebugIndex, std::memory_order_release);
     if (self->diagnosticsEnabled_) {
         for (uint32_t velocity = 0; velocity < 128; ++velocity) {

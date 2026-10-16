@@ -83,3 +83,13 @@ config.ini
 KDMAPI-Simulator-main/
 KDMAPI.md
 Kiva-master
+# scratch / one-off repair scripts and logs (not needed to build)
+/ab.log
+/build_mem.log
+/ctest_mem.log
+/polyr2.mid
+/X-Cool 3! 31edo F1.mid
+/apply_v3_filter.py
+/fix_phase_rotation_final.py
+/fix_v3_hilbert.py
+/repair_v3_filter*.py
