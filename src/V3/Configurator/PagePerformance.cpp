@@ -292,7 +292,7 @@ void DrawPerformancePage(ConfigDocument& doc) {
                 send(svms::RLCommandType::SetStealReject, w.stealReject ? 1u : 0u);
             }
             if (PanelLever("FAST TAIL MATH  (LOWERS ACCURACY)", &w.fastChunkMath,
-                           "OFF by default. DECREASES ACCURACY: release tails (AVX2) advance their gain and sample position per 8-frame chunk with precomputed ladders instead of frame-by-frame, so output differs from the exact path by a few float rounding steps (about -140 dB, inaudible in testing) and no longer matches the scalar renderer bit for bit. Sample data and interpolation are NOT touched. Cuts CPU on release-heavy Black MIDI. Applies live.")) {
+                           "OFF by default. DECREASES ACCURACY: sustained, attack/decay and release voices (AVX2) advance their gain and sample position per 8-frame chunk with closed-form ladders instead of frame by frame. Output no longer matches the exact path or the scalar renderer bit for bit: sample position differs by a fraction of a frame (the exact path's own float accumulation drifts more at large positions) and peaks differ by up to about -48 dB on steep waveforms. Sample data and interpolation are NOT touched. Cuts CPU on dense Black MIDI. Applies live.")) {
                 doc.MarkDirty();
                 send(svms::RLCommandType::SetFastChunkMath, w.fastChunkMath ? 1u : 0u);
             }

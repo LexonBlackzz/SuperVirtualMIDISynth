@@ -18,9 +18,9 @@
 
 namespace svms {
 namespace {
-// Opt-in (quality.fast_chunk_math): release-loop 8-frame chunks take their gain
-// ladder and phase advance in closed form instead of 8 dependent multiplies and
-// adds.  Per-sample results move by a few float ulps; sample reads and
+// Opt-in (quality.fast_chunk_math): sustained, transient and release-loop
+// 8-frame chunks take their gain ladder and phase advance in closed form
+// instead of 8 dependent multiplies and adds.  Per-sample results move by a few float ulps; sample reads and
 // interpolation are untouched.  Default off keeps the exact sequential math.
 bool g_fastChunkMath = false;
 
@@ -543,6 +543,9 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
         stepVector = _mm256_set1_ps(step);
         windowRemaining = (std::min)(64u, c.frameCount);
     }
+    // quality.fast_chunk_math: phase advances 8 frames in one multiply.
+    const bool fastMath = g_fastChunkMath && !lfoOn;
+    const float step8 = step * 8.0f;
     uint32_t frame = 0u;
 
     while (frame < c.frameCount) {
@@ -587,11 +590,49 @@ const __m256 phases = _mm256_add_ps(
                 _mm256_loadu_ps(outR + frame),
                 _mm256_mul_ps(sample, gainRVector)));
             // Preserve the scalar cursor's repeated-add rounding.
-            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                phase += step;
+            if (fastMath) {
+                phase += step8;
+            } else {
+                for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                    phase += step;
+            }
             frame += 8u;
             windowRemaining -= 8u;
             continue;
+        }
+
+        // Masked tail chunk (see RenderReleaseLoopFramesAVX2): plain voices
+        // only, since filter and rotation state advance per lane.
+        if (fastMath && !rot && v.filterEnabled[handle] == 0u &&
+            c.frameCount - frame < 8u) {
+            const uint32_t rem = c.frameCount - frame;
+            const float lastLive = phase + step * static_cast<float>(rem - 1u);
+            if (lastLive < loopEnd - 1.0f) {
+                const __m256i liveMask = _mm256_cmpgt_epi32(
+                    _mm256_set1_epi32(static_cast<int>(rem)),
+                    _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+                const __m256 phases = _mm256_min_ps(
+                    _mm256_add_ps(_mm256_set1_ps(phase),
+                                  _mm256_mul_ps(stepVector, lane)),
+                    _mm256_set1_ps(lastLive));
+                const __m256i bases = _mm256_cvttps_epi32(phases);
+                __m256 first, second;
+                GatherSamplePairSeqAVX2(region, readable, bases, first,
+                                        second);
+                const __m256 fraction = _mm256_sub_ps(
+                    phases, _mm256_cvtepi32_ps(bases));
+                const __m256 sample = _mm256_add_ps(first,
+                    _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+                _mm256_maskstore_ps(outL + frame, liveMask, _mm256_add_ps(
+                    _mm256_maskload_ps(outL + frame, liveMask),
+                    _mm256_mul_ps(sample, gainLVector)));
+                _mm256_maskstore_ps(outR + frame, liveMask, _mm256_add_ps(
+                    _mm256_maskload_ps(outR + frame, liveMask),
+                    _mm256_mul_ps(sample, gainRVector)));
+                phase += step * static_cast<float>(rem);
+                frame += rem;
+                continue;
+            }
         }
 
         uint32_t base = static_cast<uint32_t>(phase);
@@ -1114,6 +1155,7 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         stepVector = _mm256_set1_ps(step);
         windowRemaining = (std::min)(64u, c.frameCount);
     }
+    const bool fastMath = g_fastChunkMath && !lfoOn;
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
         if (windowRemaining == 0u) {
@@ -1139,7 +1181,39 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         uint32_t futureAttack = attackRemaining;
         uint32_t futureDecay = decayRemaining;
         alignas(32) float gains[8];
-        for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
+        // quality.fast_chunk_math: a chunk that stays in one stage and hits
+        // no clamp has a closed-form gain ladder (linear ramp in attack,
+        // geometric in decay); anything else runs the exact simulation.
+        bool closedForm = false;
+        if (fastMath) {
+            if (stage == 1u && attackRemaining >= 9u && attackStep >= 0.0f) {
+                for (uint32_t k = 0u; k < 8u; ++k)
+                    gains[k] = gain + attackStep * static_cast<float>(k + 1u);
+                if (gains[7] <= targetGain) {
+                    closedForm = true;
+                    futureGain = gains[7];
+                    futureAttack -= 8u;
+                }
+            } else if (stage == 2u && decayRemaining >= 9u && decaySlope > 0.0f) {
+                const double s1 = decaySlope, s2 = s1 * s1, s4 = s2 * s2;
+                const double g = gain;
+                gains[0] = static_cast<float>(g * s1);
+                gains[1] = static_cast<float>(g * s2);
+                gains[2] = static_cast<float>(g * s2 * s1);
+                gains[3] = static_cast<float>(g * s4);
+                gains[4] = static_cast<float>(g * s4 * s1);
+                gains[5] = static_cast<float>(g * s4 * s2);
+                gains[6] = static_cast<float>(g * s4 * s2 * s1);
+                gains[7] = static_cast<float>(g * s4 * s4);
+                if (gains[0] >= sustainLevel && gains[7] >= sustainLevel) {
+                    closedForm = true;
+                    futureGain = gains[7];
+                    futureDecay -= 8u;
+                }
+            }
+        }
+        for (uint32_t laneIndex = 0u; !closedForm && laneIndex < 8u;
+             ++laneIndex) {
             if (futureStage == 1u) {
                 if (futureAttack > 0u) {
                     futureGain += attackStep;
@@ -1200,8 +1274,12 @@ const __m256 phases = _mm256_add_ps(
             stage = futureStage;
             attackRemaining = futureAttack;
             decayRemaining = futureDecay;
-            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                phase += step;
+            if (fastMath) {
+                phase += step * 8.0f;
+            } else {
+                for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
+                    phase += step;
+            }
             frame += 8u;
             windowRemaining -= 8u;
             continue;

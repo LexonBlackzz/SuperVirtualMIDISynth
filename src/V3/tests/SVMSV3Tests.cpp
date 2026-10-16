@@ -5741,7 +5741,13 @@ void TestWholeVoiceCCDifferential() { RunWholeVoiceCCDifferential(0u); }
 // with the toggle on, at the same tolerances, then restore the exact default.
 void TestFastChunkMathDifferential() {
     svms::SetFastChunkMath(true);
-    g_waveTol = 1.0e-4f;   // about -80 dBFS
+    // The oracle advances phase with one float add per frame, which at large
+    // phases drifts whole frames over a block (8 adds round in one direction);
+    // the closed-form chunk advance is the closer one to the true phase
+    // (.perf/phasedrift.py: 0.1-0.7 frames vs 0.9-3.5 after 2048 frames).  The
+    // wave tolerance therefore has to cover the oracle's own drift on a
+    // steep waveform, not just float-ulp differences.
+    g_waveTol = 4.0e-3f;
     g_phaseTol = 0.5f;     // frames, as for muted rows
     RunWholeVoiceStealDifferential(0u);
     RunWholeVoiceLaunchDifferential(0u);

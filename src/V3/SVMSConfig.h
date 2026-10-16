@@ -167,10 +167,11 @@ struct EngineConfig {
     // With decimation on: rank by audibility (envelope level x output gain)
     // instead of velocity. Opt-in listening test, default off.
     bool decimationByLevel;
-    // Opt-in (default off): AVX2 release tails advance gain and phase per
-    // 8-frame chunk in closed form instead of frame by frame. Faster tails;
-    // output differs from the exact path by a few float ulps (inaudible),
-    // sample data and interpolation are untouched.
+    // Opt-in (default off): AVX2 release, sustain and attack/decay chunks
+    // advance gain and phase per 8 frames in closed form instead of frame by
+    // frame. Faster; output differs from the exact path by float rounding
+    // (the closed-form phase is the closer one to the true position at large
+    // offsets), sample data and interpolation are untouched.
     bool fastChunkMath;
     // With decimation on: retire releasing voices muted this many blocks in
     // a row (0 = off). Opt-in listening test.
