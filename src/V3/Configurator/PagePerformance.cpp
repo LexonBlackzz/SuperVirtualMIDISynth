@@ -180,6 +180,7 @@ struct Nested {
     ImVec2 origin;
     float x1, leftBottom, ctlY;
     ImVec2 ctl;
+    bool stacked;
 };
 
 Nested NestedBegin(const char* title, const char* hint, ImVec2 ctl, bool first) {
@@ -187,10 +188,14 @@ Nested NestedBegin(const char* title, const char* hint, ImVec2 ctl, bool first) 
     const float s = ui::Scale();
     if (!first) ImGui::Dummy(ImVec2(0.0f, 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
     Nested n{};
-    n.ctl = ctl;
     n.origin = ImGui::GetCursorScreenPos();
     n.x1 = n.origin.x + ImGui::GetContentRegionAvail().x;
-    const float leftW = (std::max)(80.0f * s, n.x1 - n.origin.x - ctl.x - 14.0f * s);
+    ctl.x = (std::min)(ctl.x, n.x1 - n.origin.x);   // never wider than the card
+    n.ctl = ctl;
+    // Too narrow to sit beside the text: the control drops under it instead.
+    n.stacked = n.x1 - n.origin.x - ctl.x < 80.0f * s + 14.0f * s;
+    const float leftW = n.stacked ? n.x1 - n.origin.x
+                                  : (std::max)(80.0f * s, n.x1 - n.origin.x - ctl.x - 14.0f * s);
     ImGui::BeginGroup();
     ui::PushText(0, 13.0f);
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + leftW);
@@ -209,7 +214,7 @@ Nested NestedBegin(const char* title, const char* hint, ImVec2 ctl, bool first) 
     ImGui::EndGroup();
     n.leftBottom = ImGui::GetItemRectMax().y;
     const float leftH = n.leftBottom - n.origin.y;
-    n.ctlY = n.origin.y + (std::max)(0.0f, (leftH - ctl.y) * 0.5f);
+    n.ctlY = n.stacked ? n.leftBottom + 6.0f * s : n.origin.y + (std::max)(0.0f, (leftH - ctl.y) * 0.5f);
     ImGui::SetCursorScreenPos(ImVec2(n.x1 - ctl.x, n.ctlY));
     return n;
 }
@@ -244,7 +249,7 @@ void GroupHeader(const char* title, const char* hint, bool first) {
     dl->AddText(p, k.text, ui::Caps(title));
     ui::PopFont();
     ui::PushText(0, 12.0f);
-    dl->AddText(ImVec2(p.x + tw + 12.0f * s, p.y + (th - ImGui::GetTextLineHeight()) - 1.0f * s), k.muted, hint);
+    dl->AddText(ImVec2(p.x + tw + 12.0f * s, p.y + (th - ImGui::GetTextLineHeight()) * 0.5f), k.muted, hint);
     ui::PopFont();
     ImGui::Dummy(ImVec2(1.0f, th));
     ImGui::Dummy(ImVec2(0.0f, 12.0f * s - ImGui::GetStyle().ItemSpacing.y));
@@ -368,7 +373,7 @@ void Shortcuts(ConfigDocument& doc) {
             for (int i = 0; i < 8; ++i)
                 if (values[i] == w.noteOnCollapseThreshold) idx = i;
             Nested n = NestedBegin("One voice per", nullptr, ui::SegmentedSize(labels, 8), true);
-            if (ui::Segmented("##coalN", &idx, labels, 8) && idx >= 0) {
+            if (ui::Segmented("##coalN", &idx, labels, 8, n.ctl.x) && idx >= 0) {
                 w.noteOnCollapseThreshold = values[idx];
                 doc.MarkDirty();
                 SendLiveCommand(C::SetNoteOnCollapse, w.noteOnCollapseThreshold);
@@ -660,6 +665,25 @@ void DrawPerformancePage(ConfigDocument& doc) {
             doc.MarkDirty();
             PushLiveMaxVoices(w.maxVoices);
         }
+    }
+    {
+        // Any value, typed. Applied live when the field is left, not on every keystroke.
+        ImGui::Dummy(ImVec2(0.0f, 10.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        ui::PushText(0, 13.0f);
+        const ImVec2 row = ImGui::GetCursorScreenPos();
+        const float lh = ImGui::GetTextLineHeight();
+        ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + (38.0f * s - lh) * 0.5f));   // centre on the 38px field
+        ImGui::TextUnformatted("Custom");
+        const float cw = ImGui::CalcTextSize("Custom").x;
+        ui::PopFont();
+        ImGui::SetCursorScreenPos(ImVec2(row.x + cw + 12.0f * s, row.y));
+        const int top = static_cast<int>(524288u * (w.shards > 1u ? w.shards : 1u));
+        int custom = static_cast<int>(w.maxVoices);
+        if (ui::NumberField("##voicescustom", &custom, 1, top, 150.0f)) {
+            w.maxVoices = static_cast<uint32_t>(custom);
+            doc.MarkDirty();
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) PushLiveMaxVoices(w.maxVoices);
     }
     if (w.maxVoices > 65536u) {
         ImGui::Dummy(ImVec2(0.0f, 10.0f * s - ImGui::GetStyle().ItemSpacing.y));

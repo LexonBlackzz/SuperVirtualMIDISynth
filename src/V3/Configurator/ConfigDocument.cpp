@@ -277,7 +277,7 @@ void ConfigDocument::FromJson(const json& root) {
                 }
             }
         }
-        ReadNum(*it, "max_voices", working_.maxVoices, 1u, 524288u);
+        ReadNum(*it, "max_voices", working_.maxVoices, 1u, 524288u * 32u);
         ReadNum(*it, "voice_memory_budget_mb", working_.voiceMemoryBudgetMB,
                 0u, 65536u);
         ReadNum(*it, "render_threads", working_.renderThreads, 0u, 64u);
@@ -760,8 +760,8 @@ ConfigValidation ConfigDocument::Validate() const {
         warn("audio.sample_rate", "must be 8000..384000");
     if (working_.bufferFrames < 16 || working_.bufferFrames > 8192)
         warn("audio.buffer_frames", "must be 16..8192");
-    if (working_.maxVoices < 1 || working_.maxVoices > 524288)
-        warn("synth.max_voices", "must be 1..524288");
+    if (working_.maxVoices < 1 || working_.maxVoices > 524288u * (working_.shards > 1u ? working_.shards : 1u))
+        warn("synth.max_voices", "must be 1..524288 (x shard count)");
     if (working_.voiceMemoryBudgetMB > 65536)
         warn("synth.voice_memory_budget_mb", "must be 0..65536");
     if (working_.renderThreads > 64)

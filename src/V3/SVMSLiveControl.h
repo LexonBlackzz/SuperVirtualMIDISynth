@@ -14,6 +14,8 @@ namespace svms {
 inline constexpr uint32_t kRuntimeVoiceGrowthCeiling = 524288u;
 inline std::atomic<uint32_t> g_runtimeVoicePoolCapacity{0u};
 inline std::atomic<uint32_t> g_runtimeRequestedVoiceLimit{0u};
+// Shard count: the live voice cap is a TOTAL; each core's pool gets 1/N of it.
+inline std::atomic<uint32_t> g_runtimeShardCount{1u};
 inline std::atomic<uint32_t> g_runtimeAppliedVoiceLimit{0u};
 inline std::atomic<uint32_t> g_runtimeVoiceGrowthCeiling{
     kRuntimeVoiceGrowthCeiling};

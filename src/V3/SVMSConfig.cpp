@@ -600,7 +600,7 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "audio.buffer_frames");
     }
     if (auto it = root.find("synth"); it != root.end() && it->is_object()) {
-        if (!ReadValue(*it, "max_voices", cfg.maxVoices, 1u, kMaxPolyphony))
+        if (!ReadValue(*it, "max_voices", cfg.maxVoices, 1u, kMaxPolyphony * 32u))   // total across shards; each core is split to <= kMaxPolyphony
             AppendWarning(cfg.configWarning, "synth.max_voices");
         if (auto lp = it->find("large_pages"); lp != it->end()) {
             if (lp->is_boolean())
@@ -1169,7 +1169,7 @@ EngineConfig EngineConfig::Load() {
 bool EngineConfig::Validate() const {
     return sampleRate >= 8000 && sampleRate <= 384000 &&
             bufferFrames >= 16 && bufferFrames <= 8192 &&
-            maxVoices >= 1 && maxVoices <= kMaxPolyphony &&
+            maxVoices >= 1 && maxVoices <= kMaxPolyphony * (shards > 1u ? shards : 1u) &&
             voiceMemoryBudgetMB <= 65536u &&
             renderThreads <= 64u &&
             shards <= 32u &&

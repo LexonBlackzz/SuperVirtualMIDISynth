@@ -813,6 +813,8 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
     }
 
     snap.maxVoices = voiceManager ? voiceManager->GetMaxVoices() : 0u;
+    for (const Driver* shard : shards_)  // the pool is split across shards; report the total
+        if (shard->voiceManager) snap.maxVoices += shard->voiceManager->GetMaxVoices();
     snap.sampleRate = sampleRate;
     snap.bufferFrames = bufferFrames;
 

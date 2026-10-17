@@ -27,6 +27,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <stdlib.h>
@@ -252,8 +253,9 @@ private:
             // VoiceManager observes at a render boundary.
             if (local.type == static_cast<uint32_t>(RLCommandType::ApplyLiveConfig) &&
                 (local.groupMask & RLGroupVoices) != 0u) {
+                const uint32_t shards = (std::max)(1u, g_runtimeShardCount.load(std::memory_order_relaxed));
                 const uint32_t requested = local.live.maxVoices;
-                const uint32_t capacity = RuntimeVoicePoolCapacity();
+                const uint32_t capacity = RuntimeVoicePoolCapacity() * shards;
                 if (requested == 0u) {
                     result = RLResult::InvalidArgument;
                     strncpy_s(resultText, kRuntimeLinkResultTextCapacity,
@@ -266,7 +268,7 @@ private:
                                   requested, capacity);
                     skipHandler = true;
                 } else {
-                    RequestRuntimeVoiceLimit(requested);
+                    RequestRuntimeVoiceLimit((std::max)(1u, requested / shards));
                 }
             }
 
@@ -307,7 +309,8 @@ private:
         // the physical startup pool so the Configurator can distinguish
         // "live now" from "restart required to grow".
         const uint32_t appliedVoiceLimit = AppliedRuntimeVoiceLimit();
-        if (appliedVoiceLimit != 0u) snap.live.maxVoices = appliedVoiceLimit;
+        if (appliedVoiceLimit != 0u)
+            snap.live.maxVoices = appliedVoiceLimit * (std::max)(1u, g_runtimeShardCount.load(std::memory_order_relaxed));
 
         LARGE_INTEGER qpc;
         QueryPerformanceCounter(&qpc);

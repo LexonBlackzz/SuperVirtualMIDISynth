@@ -322,6 +322,7 @@ bool Driver::Initialize() {
         cfg.apiBackend = 0u;
     } else {
         shardCount_ = cfg.shards > 1u ? cfg.shards : 1u;
+        g_runtimeShardCount.store(shardCount_, std::memory_order_relaxed);
         if (shardCount_ > 1u) {
             // Each core owns 1/N of the pool and renders its own voices on
             // its own thread; N cores are the parallelism.
@@ -745,6 +746,7 @@ bool Driver::Initialize() {
         LOG("Sharded engine setup failed; continuing with one core");
         StopShards();
         shardCount_ = 1u;
+        g_runtimeShardCount.store(1u, std::memory_order_relaxed);
     }
     return true;
 }
