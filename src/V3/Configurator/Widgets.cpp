@@ -115,9 +115,11 @@ bool BeginRackPanel(const char* title) {
     const ImVec2 wp = ImGui::GetWindowPos();
     const float width = ImGui::GetWindowWidth();
     PushMono();
-    const ImVec2 ts = ImGui::CalcTextSize(title);
+    // "##id" titles are ID-only: draw nothing after the hash marks.
+    const char* titleEnd = ImGui::FindRenderedTextEnd(title);
+    const ImVec2 ts = ImGui::CalcTextSize(title, titleEnd);
     dl->AddText(ImVec2(wp.x + (width - ts.x) * 0.5f, wp.y + 8.0f),
-                ImGui::GetColorU32(GetMutedText()), title);
+                ImGui::GetColorU32(GetMutedText()), title, titleEnd);
     const float titleH = ImGui::GetTextLineHeight();
     PopMono();
     ImGui::SetCursorPosY(8.0f + titleH + 6.0f);

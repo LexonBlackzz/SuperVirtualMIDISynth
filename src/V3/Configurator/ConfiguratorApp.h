@@ -78,6 +78,7 @@ private:
     int windowWidth_ = 1180;
     int windowHeight_ = 760;
     float dpiScale_ = 1.0f;
+    float appliedUiMul_ = 1.0f;
 
     bool shutdownDone_ = false;
     std::wstring lastInitError_;

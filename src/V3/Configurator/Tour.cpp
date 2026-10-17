@@ -273,10 +273,10 @@ void DrawSpot(ConfiguratorApp& app, ImDrawList* dl, float W, float H) {
     float cx, cy;
     if (tx + tw + 18.0f * s + cw <= W - 16.0f * s) {
         cx = tx + tw + 18.0f * s;
-        cy = ImClamp(ty, 16.0f * s, (std::max)(16.0f * s, H - ch - 16.0f * s));
+        cy = ImClamp(ty, 16.0f * s, (std::max)(16.0f * s, H - ch - 82.0f * s));
     } else {
         cx = ImClamp(tx + tw - cw, 16.0f * s, (std::max)(16.0f * s, W - cw - 16.0f * s));
-        cy = ImClamp(ty + th + 16.0f * s, 16.0f * s, (std::max)(16.0f * s, H - ch - 16.0f * s));
+        cy = ImClamp(ty + th + 16.0f * s, 16.0f * s, (std::max)(16.0f * s, H - ch - 82.0f * s));
     }
     const float px = AnimSpring(ImGui::GetID("##tipx"), cx), py = AnimSpring(ImGui::GetID("##tipy"), cy);
     const float a = AnimEase(ImGui::GetID("##tipa"), 1.0f, 0.35f);

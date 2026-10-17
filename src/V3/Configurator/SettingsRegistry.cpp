@@ -83,7 +83,11 @@ const SettingDef kSettings[] = {
     {"render", "Render a MIDI to WAV", R, "Tools", "offline renderer render export wav file", nullptr, nullptr, false, nullptr},
     {"record", "Record what you hear", RC, "Tools", "live recording record wav capture", nullptr, nullptr, false, nullptr},
     {"diag", "Diagnostics and system info", G, "Tools", "diagnostics bug report system", nullptr, nullptr, false, nullptr},
-    {"theme", "Theme (Modern / Rack), accent colour, motion", T, "Settings", "theme colour color custom rack dark animation motion fire", nullptr, nullptr, false, nullptr},
+    {"theme", "Theme (Modern / Rack), accent colour", T, "Settings", "theme colour color custom rack dark", nullptr, nullptr, false, nullptr},
+    {"motion", "Motion (animations)", T, "Settings", "animation animations motion calm bouncy springs reduce", nullptr, nullptr, false, nullptr},
+    {"uiscale", "UI size (scaling)", T, "Settings", "size scale scaling zoom bigger larger text dpi small", nullptr, nullptr, false, nullptr},
+    {"fire", "Load meter fire", T, "Settings", "fire flames load meter fun 500", nullptr, nullptr, false, nullptr},
+    {"tour", "Welcome tour", T, "Settings", "tour intro introduction replay welcome tutorial", nullptr, nullptr, false, nullptr},
     {"config", "Config file, import / export profile, reset", T, "Settings", "advanced config json open config folder profile import export reset defaults", nullptr, nullptr, false, nullptr},
     {"diagOn", "Driver logging", T, "Settings", "debug output logging monitor window", nullptr, nullptr, true, D(&V::diagnosticsEnabled)},
 

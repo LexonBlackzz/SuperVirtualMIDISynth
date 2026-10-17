@@ -30,6 +30,8 @@ struct ThemeSettings {
     int style = 1;
     // Motion level: 0 Full, 1 Calm, 2 Off (see Anim.h).
     int motion = 0;
+    // Settings > Look > Size: multiplies the OS DPI scale (default 1.25).
+    float uiScale = 1.25f;
     // Settings > Look. The load meter fire (session 4) and the welcome tour read these.
     bool fire = true;
     bool tourAtStart = true;

@@ -86,7 +86,15 @@ void PopOffset() {
     const OffsetFrame f = g_offsets.back();
     g_offsets.pop_back();
     if (f.pushedAlpha) ImGui::PopStyleVar();
-    if (f.offset != 0.0f) ImGui::SetCursorPosY(ImGui::GetCursorPosY() - f.offset);
+    if (f.offset != 0.0f) {
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - f.offset);
+        // Moving down past the content end is a boundary extension: ImGui wants
+        // an item there. The Dummy adds ItemSpacing.y, so pre-subtract it.
+        if (f.offset < 0.0f) {
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - ImGui::GetStyle().ItemSpacing.y);
+            ImGui::Dummy(ImVec2(0.0f, 0.0f));
+        }
+    }
 }
 
 // Flash ------------------------------------------------------------------------
@@ -463,6 +471,18 @@ void Anchor(const char* anchor, ImVec2 min, ImVec2 max) {
 
 // Cards ------------------------------------------------------------------------------
 
+static void DrawRackScrews(ImDrawList* dl, ImVec2 wp, ImVec2 ws) {
+    // Prototype .rack .card: top bevel, bottom shadow, two screws 6 px in.
+    dl->AddLine(ImVec2(wp.x + S(4.0f), wp.y + 1.0f), ImVec2(wp.x + ws.x - S(4.0f), wp.y + 1.0f), IM_COL32(255, 255, 255, 15));
+    dl->AddLine(ImVec2(wp.x + S(4.0f), wp.y + ws.y - 1.0f), ImVec2(wp.x + ws.x - S(4.0f), wp.y + ws.y - 1.0f), IM_COL32(0, 0, 0, 128));
+    for (float x : {wp.x + S(9.0f), wp.x + ws.x - S(9.0f)}) {
+        const ImVec2 c(x, wp.y + S(9.0f));
+        dl->AddCircleFilled(c, S(3.0f), IM_COL32(42, 41, 37, 255), 12);
+        dl->AddCircleFilled(ImVec2(c.x - S(0.8f), c.y - S(0.8f)), S(1.6f), IM_COL32(119, 115, 106, 255), 8);
+        dl->AddCircle(c, S(3.0f), IM_COL32(0, 0, 0, 128), 12);
+    }
+}
+
 static ImU32 g_nextCardBorder = 0;
 void SetNextCardBorder(ImU32 color) { g_nextCardBorder = color; }
 
@@ -473,9 +493,7 @@ void BeginCard(const char* id, const char* title, const char* subtitle,
     g_nextCardMinHeight = 0.0f;
     const ImU32 border = g_nextCardBorder ? g_nextCardBorder : k.line;
     g_nextCardBorder = 0;
-    if (k.rack) {
-        BeginRackPanel(title ? Caps(title) : id);
-    } else {
+    {
         BeginEntry();
         ImGui::PushStyleColor(ImGuiCol_ChildBg, k.card);
         ImGui::PushStyleColor(ImGuiCol_Border, border);
@@ -500,17 +518,17 @@ void BeginCard(const char* id, const char* title, const char* subtitle,
     PushText(2, 15.0f);
     const float titleDy = rightSlotW > 0.0f ? (std::max)(0.0f, (S(38.0f) - ImGui::GetTextLineHeight()) * 0.5f) : 0.0f;
     PopFont();
-    if (title && !k.rack) {
+    if (title) {
         PushText(2, 15.0f);
         ImGui::SetCursorPos(ImVec2(x, y0 + titleDy));
-        ImGui::TextUnformatted(title);
-        x += ImGui::CalcTextSize(title).x + S(10.0f);
+        ImGui::TextUnformatted(Caps(title));
+        x += ImGui::CalcTextSize(Caps(title)).x + S(10.0f);
         PopFont();
     }
     if (subtitle) {
         PushText(0, 13.0f);
         const float wrapX = right - (rightSlotW > 0.0f ? rightSlotW + S(10.0f) : 0.0f);
-        ImGui::SetCursorPos(ImVec2(k.rack ? x0 : x, y0 + (k.rack ? 0.0f : titleDy + S(1.5f))));
+        ImGui::SetCursorPos(ImVec2(x, y0 + titleDy + S(1.5f)));
         ImGui::BeginGroup();
         ImGui::PushTextWrapPos(wrapX);
         ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
@@ -558,7 +576,7 @@ void EndCard() {
     if (g_cards.empty()) return;
     const CardFrame card = g_cards.back();
     g_cards.pop_back();
-    if (!g_tok.rack) {
+    {
         // Content height so far, plus the padding, against the minimum.
         const float used = ImGui::GetCursorPosY() - card.topY + ImGui::GetCurrentWindow()->WindowPadding.y * 2.0f
                            - ImGui::GetStyle().ItemSpacing.y;
@@ -567,9 +585,8 @@ void EndCard() {
     }
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
-    if (g_tok.rack) {
-        EndRackPanel();
-    } else {
+    {
+        if (g_tok.rack) DrawRackScrews(ImGui::GetWindowDrawList(), wp, ws);
         ImGui::EndChild();
         EndEntry();
         ImGui::Dummy(ImVec2(0.0f, S(16.0f) - 2.0f * ImGui::GetStyle().ItemSpacing.y));
@@ -714,7 +731,7 @@ bool Disclosure(const char* key, const char* title, const char* hint) {
     const float h = lineH + S(30.0f);
     if (ImGui::InvisibleButton("##disc", ImVec2(w, h))) {
         open = !open;
-        if (open) AnimTrigger(ImGui::GetID("##reveal"));
+        AnimTrigger(ImGui::GetID(open ? "##reveal" : "##close"));
     }
     HandCursorIfHovered();
     const bool hov = ImGui::IsItemHovered();
@@ -737,14 +754,17 @@ bool Disclosure(const char* key, const char* title, const char* hint) {
         Text(dl, ImVec2(q.x - S(20.0f) - ts.x, p.y + (h - ts.y) * 0.5f), ink, hint);
         PopFont();
     }
+    // Keep the content alive while it fades out (BeginReveal runs the reverse).
+    const bool closing = !open && AnimPulseActive(ImGui::GetID("##close"), 0.25f);
     ImGui::PopID();
     ImGui::Dummy(ImVec2(0.0f, S(16.0f) - 2.0f * ImGui::GetStyle().ItemSpacing.y));
-    return open;
+    return open || closing;
 }
 
 void BeginReveal(const char* key) {
     ImGui::PushID(key);
-    const float t = AnimPulse(ImGui::GetID("##reveal"), 0.4f);
+    const float t = DisclosureState(key) ? AnimPulse(ImGui::GetID("##reveal"), 0.4f)
+                                         : 1.0f - AnimPulse(ImGui::GetID("##close"), 0.25f);
     ImGui::PopID();
     const float e = EaseOut(t);
     PushOffset(-S(8.0f) * (1.0f - e), t >= 1.0f ? 1.0f : e);
@@ -1040,6 +1060,9 @@ static ImGuiID g_knobKeys = 0;
 bool Knob(const char* id, float* value, const KnobSpec& spec, bool* committed) {
     if (committed) *committed = false;
     if (g_tok.rack) {
+        // PanelKnob centres in the whole remaining width; shift the cursor so
+        // it centres in this knob's own 96-px column like the Modern dial.
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + S(96.0f) - ImGui::GetContentRegionAvail().x);
         ImGui::BeginGroup();
         const bool zero = spec.zeroText && *value <= spec.min;
         bool done = false;
@@ -1456,8 +1479,15 @@ bool BeginTile(const char* anchor, const char* title, const char* desc, bool* on
         PopFont();
     }
     // Tags sit at the bottom of an equal-height row.
-    const float extra = height > 0.0f && natural > 0.0f ? (std::max)(0.0f, height - natural) : 0.0f;
-    if (extra > 0.0f) ImGui::Dummy(ImVec2(0.0f, extra - ImGui::GetStyle().ItemSpacing.y));
+    float extra = height > 0.0f && natural > 0.0f ? (std::max)(0.0f, height - natural) : 0.0f;
+    if (extra > 0.0f) {
+        // A Dummy always costs at least ItemSpacing.y, so a smaller extra would
+        // be over-applied and the measured natural height would flip each frame.
+        const float sp = ImGui::GetStyle().ItemSpacing.y;
+        if (extra >= sp) ImGui::Dummy(ImVec2(0.0f, extra - sp));
+        else if (tagCount > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + extra);   // tags follow: an item ends the move
+        else extra = 0.0f;
+    }
     if (tagCount > 0) {
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + S(6.0f));
         for (int i = 0; i < tagCount; ++i) {
@@ -1482,8 +1512,21 @@ void TileNested() {
 void EndTile() {
     const float contentBottom = ImGui::GetCursorPosY() - ImGui::GetStyle().ItemSpacing.y +
                                 ImGui::GetCurrentWindow()->WindowPadding.y;
-    const float natural = contentBottom - g_tile.extra;
-    g_tileNatural[g_tile.id] = natural;
+    // Latch to the larger height: a measurement that jumps between two values
+    // from frame to frame (fractional UI scales) would flip the whole row every
+    // frame. Growth is taken at once; shrinking only after the smaller value
+    // has held for kShrinkFrames, so a real change (nested options closing)
+    // still settles.
+    float& stored = g_tileNatural[g_tile.id];
+    if (!ImGui::GetCurrentWindow()->SkipItems) {
+        static std::unordered_map<ImGuiID, int> lowFrames;
+        const float measured = contentBottom - g_tile.extra;
+        int& low = lowFrames[g_tile.id];
+        constexpr int kShrinkFrames = 20;
+        if (measured >= stored - 0.5f) { stored = (std::max)(stored, measured); low = 0; }
+        else if (++low >= kShrinkFrames) { stored = measured; low = 0; }
+    }
+    const float natural = stored;
     const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
     ImGui::EndChild();
     (void)contentBottom;

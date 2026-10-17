@@ -210,6 +210,7 @@ void ChainCard(std::string& panel, const ConfigValues& w, bool connected) {
     const float s = S();
     const float avail = ImGui::GetContentRegionAvail().x;
     const float nodeH = 60.0f * s;
+    const float pad = 6.0f * s;   // room for the hover lift and selection ring
     float nodeW[5];
     float total = 0.0f;
     for (int i = 0; i < 5; ++i) {
@@ -222,8 +223,18 @@ void ChainCard(std::string& panel, const ConfigValues& w, bool connected) {
         nodeW[i] = (std::max)((std::max)(132.0f * s, nw), (std::min)(sw, 180.0f * s));
         total += nodeW[i];
     }
-    const float wireW = (std::max)(18.0f * s, (avail - total) / 4.0f);
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    // Too wide for the card (big UI sizes): scroll sideways instead of clipping.
+    const float need = total + 4.0f * 18.0f * s;
+    const bool scroll = need + 2.0f * pad > avail;
+    if (scroll) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
+        ImGui::BeginChild("##chainscroll", ImVec2(avail, nodeH + 2.0f * pad + 14.0f * s), 0,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        dl = ImGui::GetWindowDrawList();
+    }
+    const float wireW = scroll ? 18.0f * s : (std::max)(18.0f * s, (avail - total) / 4.0f);
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    if (scroll) { origin.x += pad; origin.y += pad; }
     float x = origin.x;
     for (int i = 0; i < 5; ++i) {
         if (i > 0) {
@@ -264,7 +275,11 @@ void ChainCard(std::string& panel, const ConfigValues& w, bool connected) {
         x += nodeW[i];
     }
     ImGui::SetCursorScreenPos(origin);
-    ImGui::Dummy(ImVec2(avail, nodeH));
+    ImGui::Dummy(ImVec2(scroll ? need + pad : avail, nodeH));
+    if (scroll) {
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+    }
     ui::EndCard();
 }
 

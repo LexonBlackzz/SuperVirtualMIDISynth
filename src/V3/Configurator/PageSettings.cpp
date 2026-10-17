@@ -420,6 +420,26 @@ void LookCard(ConfigDocument&) {
         }
         ui::EndRow();
     }
+    // Size: a slider that applies on release (rebuilding fonts mid-drag would
+    // move the slider out from under the mouse).
+    {
+        static float pending = 0.0f;   // 75..175: past that, long labels collide
+        static bool dragging = false;
+        if (!dragging) pending = theme.uiScale * 100.0f;
+        ImGui::Dummy(ImVec2(0.0f, 4.0f * s));
+        ui::BeginRow("uiscale", "Size", "Makes everything bigger, on top of Windows scaling. Applies when you let go.",
+                     ImVec2(260.0f * s, 28.0f * s));
+        bool committed = false;
+        if (ui::RangeSlider("##uiscale", &pending, 75.0f, 175.0f, 200.0f * s, &committed)) dragging = true;
+        ImGui::SameLine();
+        ImGui::Text("%d%%", static_cast<int>(pending + 0.5f));
+        if (committed) {
+            dragging = false;
+            theme.uiScale = std::round(pending / 5.0f) * 0.05f;
+            ThemeChanged();
+        }
+        ui::EndRow();
+    }
     // Fire.
     ui::BeginRow("fire", "Load meter catches fire past 500%",
                  "Purely for fun. Turn it off if the flames feel heavy on a slow PC.", ImVec2(46.0f * s, 28.0f * s));

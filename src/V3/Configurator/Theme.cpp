@@ -209,6 +209,8 @@ bool LoadThemeFile(const fs::path& path,
             t.style = (std::max)(0, (std::min)(1, root["style"].get<int>()));
         if (root.contains("motion") && root["motion"].is_number_integer())
             t.motion = (std::max)(0, (std::min)(2, root["motion"].get<int>()));
+        if (root.contains("ui_scale") && root["ui_scale"].is_number())
+            t.uiScale = (std::max)(0.75f, (std::min)(1.75f, root["ui_scale"].get<float>()));
         if (root.contains("fire") && root["fire"].is_boolean())
             t.fire = root["fire"].get<bool>();
         if (root.contains("tour_at_start") && root["tour_at_start"].is_boolean())
@@ -261,6 +263,7 @@ nlohmann::json ThemeToJson(const ThemeSettings& t) {
         {"density", t.density},
         {"style", t.style},
         {"motion", t.motion},
+        {"ui_scale", t.uiScale},
         {"fire", t.fire},
         {"tour_at_start", t.tourAtStart},
         {"custom_accent", t.hasCustomAccent ? ColorToHex(t.customAccent) : std::string()},

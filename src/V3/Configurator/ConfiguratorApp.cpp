@@ -98,7 +98,8 @@ bool ConfiguratorApp::Initialize(int argc, char** argv) {
     Platform::Hooks hooks;
     hooks.hasUnsavedChanges = [this] { return config_.IsDirty(); };
     if (!platform_->CreateWindowAndDevice(hooks, lastInitError_)) return false;
-    dpiScale_ = platform_->DpiScale();
+    appliedUiMul_ = GetThemeSettings().uiScale;
+    dpiScale_ = platform_->DpiScale() * appliedUiMul_;
     if (!CreateImGui()) return false;
     ApplyTheme();
 
@@ -363,15 +364,19 @@ std::string ConfiguratorApp::ConnectedAppName() {
 void ConfiguratorApp::RenderFrame() {
     platform_->ApplyPendingResize();
 
+    // Effective scale = OS DPI x the Settings size choice; fonts follow either.
+    const float uiMul = GetThemeSettings().uiScale;
     float newScale = 0.0f;
-    if (platform_->TakeDpiChange(newScale)) {
-        RecreateFonts(newScale, true);
+    const bool dpiChanged = platform_->TakeDpiChange(newScale);
+    if (dpiChanged || uiMul != appliedUiMul_) {
+        appliedUiMul_ = uiMul;
+        RecreateFonts(platform_->DpiScale() * uiMul, true);
     }
 
     if (!platform_->CanRender()) return;
     windowWidth_ = platform_->Width();
     windowHeight_ = platform_->Height();
-    dpiScale_ = platform_->DpiScale();
+    dpiScale_ = platform_->DpiScale() * uiMul;
 
     HandleKeyboardShortcuts();
     PollRuntimeLink();
@@ -379,6 +384,8 @@ void ConfiguratorApp::RenderFrame() {
     // Rack uses the mono face for its whole UI.
     ImGui::GetIO().FontDefault = IsModernStyle() || !Fonts().mono ? Fonts().ui : Fonts().mono;
 
+    // Rack primitives draw in the default font size: keep it on the UI scale.
+    ImGui::GetStyle().FontSizeBase = 14.0f * dpiScale_;
     platform_->NewFrame();
     ImGui::NewFrame();
     ui::BeginFrame(dpiScale_);
@@ -812,6 +819,17 @@ void ConfiguratorApp::DrawSidebar() {
         ImGui::PopID();
     };
 
+    // The nav list scrolls when it is taller than the window (large UI sizes).
+    static float navScroll = 0.0f, navMaxScroll = 0.0f;
+    const float navClipTop = y;
+    {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.MouseWheel != 0.0f && io.MousePos.x < W && io.MousePos.y > top)
+            navScroll -= io.MouseWheel * 48.0f * s;
+        navScroll = (std::max)(0.0f, (std::min)(navScroll, navMaxScroll));
+        y -= navScroll;
+        ImGui::PushClipRect(ImVec2(0.0f, navClipTop), ImVec2(W, H), true);
+    }
     // Spring indicator behind the active item (main list and tools).
     const float listTop = y;
     float indY = -1.0f;
@@ -859,6 +877,8 @@ void ConfiguratorApp::DrawSidebar() {
     }
     drawItem(kNavSettings, settingsY);
     tour::Register("t-settings", ImVec2(x0, settingsY), ImVec2(x0 + innerW, settingsY + itemH));
+    ImGui::PopClipRect();
+    navMaxScroll = (std::max)(0.0f, settingsY + itemH + 14.0f * s + navScroll - H);
 }
 
 void ConfiguratorApp::DrawSearchResults() {
