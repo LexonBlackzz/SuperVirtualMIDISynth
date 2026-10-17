@@ -664,7 +664,7 @@ void ConfiguratorApp::DrawTopBar() {
     mx += meterW + meterGap;
     // CPU
     char cpuText[32];
-    const float load = tel ? (std::max)(0.0f, rlTelemetry_.cpuLoadPercent) : 0.0f;
+    const float load = AnimEase(ImGui::GetID("##topload"), tel ? (std::max)(0.0f, rlTelemetry_.cpuLoadPercent) : 0.0f, 0.3f);
     if (tel) std::snprintf(cpuText, sizeof(cpuText), "%.0f%%", load);
     else std::snprintf(cpuText, sizeof(cpuText), "%s", dash);
     by = meterHead(mx, "CPU", cpuText);

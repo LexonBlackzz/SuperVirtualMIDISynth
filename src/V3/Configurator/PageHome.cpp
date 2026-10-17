@@ -177,7 +177,7 @@ void LoadTile(const svms::RuntimeLinkTelemetryV2* t, const ConfigValues& cfg) {
     const float gd = 84.0f * s;
     const ImVec2 c(q.x + gd * 0.5f, q.y + gd * 0.5f);
     const float r = 34.0f * s, sw = 8.0f * s;
-    const float glow = ui::LoadGlow(load) * s;
+    const float glow = AnimEase(ImGui::GetID("##loadglow"), ui::LoadGlow(load), 0.8f) * s;   // fades in, never snaps
     for (int i = 4; i >= 1 && glow > 0.1f; --i) {   // ring-shaped glow, strongest at the stroke
         const float f = static_cast<float>(i) / 4.0f;
         dl->AddCircle(c, r, ui::WithAlpha(col, 0.16f * (1.0f - f) + 0.02f), 64, sw + 2.0f * glow * f);
@@ -207,7 +207,7 @@ void LoadTile(const svms::RuntimeLinkTelemetryV2* t, const ConfigValues& cfg) {
     const float block = bigH + 10.0f * s + ssz.y;
     const float ty = q.y + (gd - block) * 0.5f;
     ui::PushNum(34.0f, true);
-    dl->AddText(ImVec2(tx, ty), load > 100.0f ? col : k.text, big);
+    dl->AddText(ImVec2(tx, ty), ui::MixU32(k.text, col, ImClamp((load - 100.0f) / 15.0f, 0.0f, 1.0f)), big);
     ui::PopFont();
     ui::PushText(0, 13.0f);
     dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(tx, ty + bigH + 10.0f * s), k.muted, sub, nullptr, subW);
