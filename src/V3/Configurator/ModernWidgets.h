@@ -143,6 +143,9 @@ struct KnobSpec {
 bool Knob(const char* id, float* value, const KnobSpec& spec,
           bool* committed = nullptr);
 
+// Footprint of a Knob (dial, readout and label); Rack knobs are laid out the same.
+ImVec2 KnobSize();
+
 enum class ButtonKind { Normal, Primary, Danger };
 bool Button(const char* label, ButtonKind kind = ButtonKind::Normal,
             ImVec2 size = ImVec2(0, 0), bool enabled = true);

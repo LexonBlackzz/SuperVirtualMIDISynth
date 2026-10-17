@@ -566,6 +566,7 @@ void Internals(ConfigDocument& doc) {
             std::memcpy(&bits, &w.voiceRetireThreshold, sizeof(bits));
             SendLiveCommand(C::SetVoiceRetireFloor, bits);
         }
+        ui::Anchor("retire", ImVec2(origin.x + free * 0.5f, y), ImVec2(origin.x + free * 0.5f + kw, y + ui::KnobSize().y));
         bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
 
         float cap = static_cast<float>(w.perKeyVoiceCap);
@@ -576,6 +577,7 @@ void Internals(ConfigDocument& doc) {
             doc.MarkDirty();
         }
         if (committed) SendLiveCommand(C::SetPerKeyVoiceCap, w.perKeyVoiceCap);
+        ui::Anchor("perKey", ImVec2(origin.x + free * 1.5f + kw, y), ImVec2(origin.x + free * 1.5f + 2.0f * kw, y + ui::KnobSize().y));
         bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
 
         float ghosts = static_cast<float>(w.ghostBudget);
@@ -586,6 +588,7 @@ void Internals(ConfigDocument& doc) {
             doc.MarkDirty();
         }
         if (committed) SendLiveCommand(C::SetGhostBudget, w.ghostBudget);
+        ui::Anchor("ghost", ImVec2(origin.x + free * 2.5f + 2.0f * kw, y), ImVec2(origin.x + free * 2.5f + 3.0f * kw, y + ui::KnobSize().y));
         bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
 
         ImGui::SetCursorScreenPos(ImVec2(origin.x, bottom + 4.0f * s - ImGui::GetStyle().ItemSpacing.y));

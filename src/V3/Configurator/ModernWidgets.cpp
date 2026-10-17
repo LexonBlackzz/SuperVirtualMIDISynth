@@ -1054,6 +1054,16 @@ bool Knob(const char* id, float* value, const KnobSpec& spec, bool* committed) {
     return changed;
 }
 
+ImVec2 KnobSize() {
+    PushNum(13.0f);
+    const float num = ImGui::GetTextLineHeight();
+    PopFont();
+    PushText(0, 12.0f);
+    const float lab = ImGui::GetTextLineHeight();
+    PopFont();
+    return ImVec2(S(96.0f), S(6.0f) + S(64.0f) + S(6.0f) + num + S(1.0f) + lab + S(6.0f));
+}
+
 // Buttons ------------------------------------------------------------------------------------
 
 ImVec2 ButtonSize(const char* label) {

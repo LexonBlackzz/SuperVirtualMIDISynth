@@ -351,6 +351,7 @@ if(NOT WIN32)
                 Configurator/UpdateService.cpp
                 Configurator/PageHome.cpp
                 Configurator/PageAudio.cpp
+                Configurator/PageSound.cpp
                 Configurator/PagePerformance.cpp
                 Configurator/PageMidi.cpp
                 Configurator/PageOffline.cpp
@@ -968,6 +969,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/UpdateService.cpp
         Configurator/PageHome.cpp
         Configurator/PageAudio.cpp
+        Configurator/PageSound.cpp
         Configurator/PagePerformance.cpp
         Configurator/PageMidi.cpp
         Configurator/PageOffline.cpp

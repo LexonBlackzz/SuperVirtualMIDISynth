@@ -12,6 +12,7 @@
 #include "PlatformUtil.h"  // HWND (opaque on Linux) for the page draw calls
 
 #include "PageHome.h"
+#include "PageSound.h"
 #include "PageAudio.h"
 #include "PagePerformance.h"
 #include "PageMidi.h"
@@ -1032,10 +1033,13 @@ void ConfiguratorApp::DrawPageContent() {
 
     // Phase 2: the old pages mounted in the new navigation until each page
     // is rewritten.
+    if (const int added = HandleDroppedSoundFonts(config_)) {
+        ShowToast(added == 1 ? "Added 1 SoundFont" : "Added " + std::to_string(added) + " SoundFonts");
+    }
     BeginAutoPanels();
     switch (page_) {
     case NavPage::Home:        DrawHomePage(config_); break;
-    case NavPage::Sound:       DrawAudioPage(config_, easterEggs_, AudioView::SoundFont); break;
+    case NavPage::Sound:       DrawSoundPage(config_); break;
     case NavPage::Effects:
         DrawReverbPage(config_);
         DrawLimiterPage(config_);

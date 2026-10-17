@@ -137,42 +137,6 @@ void DrawMidiPage(ConfigDocument& doc) {
 
         // ======================================================= left
         ImGui::TableNextColumn();
-        if (BeginRackPanel("VELOCITY")) {
-            RestartPill();
-            ImGui::SameLine();
-            ImGui::TextDisabled("applies after restart");
-            ImGui::Spacing();
-            if (ImGui::BeginTable("##vel_knobs", 3, ImGuiTableFlags_SizingStretchSame)) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                float curve = w.velocityCurve;
-                if (PanelKnob("CURVE", &curve, 0.1f, 10.0f, 1.0f, "%.2f", 60.0f,
-                              "Exponent applied to MIDI velocity. Values above 1 emphasize loud notes; values below 1 lift quieter notes.")) {
-                    w.velocityCurve = curve;
-                    doc.MarkDirty();
-                }
-                ImGui::TableNextColumn();
-                float floor = w.velocityFloor;
-                if (PanelKnob("FLOOR", &floor, 0.0f, 0.99f, 0.0f, "%.2f", 60.0f,
-                              "Raises the minimum mapped loudness of notes that survive the ignore threshold. This is not the event-shedding threshold.")) {
-                    w.velocityFloor = floor;
-                    doc.MarkDirty();
-                }
-                ImGui::TableNextColumn();
-                float ignore = static_cast<float>(w.velocityIgnoreBelow);
-                if (PanelKnob("IGNORE BELOW", &ignore, 0.0f, 127.0f, 0.0f,
-                              ignore < 0.5f ? "OFF" : "%.0f", 60.0f,
-                              "MIDI note-ons with velocity strictly below this value are ignored. The threshold itself is still accepted.")) {
-                    w.velocityIgnoreBelow = static_cast<uint32_t>(ignore + 0.5f);
-                    doc.MarkDirty();
-                }
-                ImGui::EndTable();
-            }
-            ImGui::Dummy(ImVec2(0.0f, 12.0f));
-            ImGui::TextDisabled("Master volume lives in the strip at the top.");
-        }
-        EndRackPanel();
-
         if (BeginRackPanel("TIMING / THROUGHPUT  (LIVE)")) {
             if (PanelLever("FAST PRODUCER  (LISTEN)", &w.fastProducer,
                            "Listening test, OFF by default. The first thread that submits MIDI (the player) feeds the engine through a private ring with plain stores instead of the shared queue lanes, cutting the per-message cost seen in the player's ns/msg readout. Event order from that thread is identical; only the tie-break against events from OTHER threads (resets, controller commands) can differ by a few dozen events. Other threads keep the old path.")) {
@@ -242,16 +206,6 @@ void DrawMidiPage(ConfigDocument& doc) {
                             w.eventRingCapacity * 74.0 / 1.0e9);
                 ImGui::PopTextWrapPos();
                 ImGui::PopStyleColor();
-            }
-            ImGui::Spacing();
-            ImGui::Spacing();
-            static const char* tuningKeys[] = {"12EDO", "31EDO"};
-            int tuning = w.tuningEdo == 31u ? 1 : 0;
-            if (PanelKeys("TUNING", &tuning, tuningKeys, 2,
-                          "Normal: 12 semitones per octave, keys 0-255. 31EDO: 31 steps per octave; key 155 is middle C. Percussion keeps its drum mapping.",
-                          true)) {
-                w.tuningEdo = tuning ? 31u : 12u;
-                doc.MarkDirty();
             }
         }
         EndRackPanel();
