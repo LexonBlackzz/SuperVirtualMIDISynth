@@ -174,83 +174,10 @@ void DrawMidiPage(ConfigDocument& doc) {
         EndRackPanel();
 
         if (BeginRackPanel("TIMING / THROUGHPUT  (LIVE)")) {
-            if (PanelLever("OMNIMIDI MODE", &w.blockTiming,
-                           "OFF by default: events dispatch at their exact intra-block sample offset (keep this for latency-critical live play). When enabled, every event due in a callback fires at block start instead: the whole callback becomes one launch burst with zero mid-block render splits. That quantizes timing to the callback rate. Great for throughput on dense files; do not use it when intra-block timing precision matters.")) {
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetBlockTiming, w.blockTiming ? 1u : 0u);
-            }
-            ImGui::Spacing();
             if (PanelLever("FAST PRODUCER  (LISTEN)", &w.fastProducer,
                            "Listening test, OFF by default. The first thread that submits MIDI (the player) feeds the engine through a private ring with plain stores instead of the shared queue lanes, cutting the per-message cost seen in the player's ns/msg readout. Event order from that thread is identical; only the tie-break against events from OTHER threads (resets, controller commands) can differ by a few dozen events. Other threads keep the old path.")) {
                 doc.MarkDirty();
                 send(svms::RLCommandType::SetFastProducer, w.fastProducer ? 1u : 0u);
-            }
-            ImGui::Spacing();
-            if (PanelLever("CC COLLAPSE", &w.ccCollapse,
-                           "OFF by default: every control-change event dispatches. When enabled, the compiler thread drops superseded same-(channel, controller) state CCs inside a page before they reach the audio thread. Saves dispatch on CC-automation-dense material.")) {
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetCcCollapse, w.ccCollapse ? 1u : 0u);
-            }
-            ImGui::Spacing();
-            if (PanelLever("BEND COLLAPSE  (LOWERS ACCURACY)", &w.bendCollapse,
-                           "OFF by default. DECREASES ACCURACY: inside one compiler page (a few milliseconds of dense material) a later pitch bend on a channel replaces the earlier ones, so bends reach the engine at most about once per page per channel instead of at every source tick, and pitch steps can arrive up to a page late. Huge CPU saving on Black MIDI that spams tens of thousands of pitch bends a second, because every bend splits all voices of that channel into tiny render spans. Sample data and interpolation are not touched; note timing is not touched.")) {
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetBendCollapse, w.bendCollapse ? 1u : 0u);
-            }
-            ImGui::Spacing();
-            {
-                int minNote = static_cast<int>(w.minNoteMs);
-                if (PanelSliderInt("MIN NOTE LENGTH  (LOWERS ACCURACY)", &minNote, 0, 100,
-                                   "OFF by default. DECREASES ACCURACY: a note-off that arrives sooner than this many milliseconds after its key's last note-on is moved out to that length, so every note sounds at least this long. Black MIDI whose notes are shorter than a render block normally launch and release inside one block and come out as near-silent clicks; this makes them audible as the dense wall of sound they stand for. Note ends are no longer exact and short staccato passages smear together. Note starts, pitch and sample data are not touched. Applies live.",
-                                   false, "OFF")) {
-                    w.minNoteMs = static_cast<uint32_t>(minNote);
-                    doc.MarkDirty();
-                    send(svms::RLCommandType::SetMinNoteLength, w.minNoteMs);
-                }
-            }
-            ImGui::Spacing();
-            if (PanelLever("EXACT NOTE MERGE", &w.noteMerge,
-                           "OFF by default. Identical note-ons (same channel, key, velocity and exact frame, from any track) become ONE voice at N times the gain. Identical voices sum linearly, so this sounds the same as playing all N, but costs one voice instead of N. Each note-off releases one copy; copies that end at different times are split off exactly. Nothing is dropped or re-timed, unlike NOTE-ON COALESCING. The effective-voice counter shows how many voices the pool would hold unmerged. Launch order inside one frame can change, which only matters if voices are stolen.")) {
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetNoteMerge, w.noteMerge ? 1u : 0u);
-            }
-            ImGui::Spacing();
-            if (PanelLever("UNBOUNDED RENDER", &w.unboundedRender,
-                           "OFF by default. When enabled, the two pressure safety nets are disabled: no wall-time recovery jump (events keep their exact frames and order; the song slows down instead of breaking down) and no per-block admission cap. Audio glitches and slowed playback are the accepted trade.")) {
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetUnboundedRender, w.unboundedRender ? 1u : 0u);
-            }
-            ImGui::Spacing();
-            bool collapseOn = w.noteOnCollapseThreshold > 1u;
-            if (PanelLever("NOTE-ON COALESCING", &collapseOn,
-                           "OFF by default: every note-on spawns a voice at its exact timestamp, preserving retrigger timing precision. When enabled, repeated hits of the same key within a fixed 20 ms window spawn one voice per N hits (velocity stacking compensates loudness). Use only for extreme black-MIDI workloads that would otherwise starve the audio thread.")) {
-                w.noteOnCollapseThreshold = collapseOn ? 32u : 1u;
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetNoteOnCollapse, w.noteOnCollapseThreshold);
-            }
-            if (collapseOn) {
-                static const uint32_t thresholds[] = {2u, 8u, 32u, 128u, 512u, 2048u, 8192u, 65536u};
-                static const char* thresholdLabels[] = {"1:2", "1:8", "1:32", "1:128", "1:512", "1:2k", "1:8k", "1:64k"};
-                int idx = -1;
-                for (int i = 0; i < 8; ++i)
-                    if (thresholds[i] == w.noteOnCollapseThreshold) idx = i;
-                ImGui::Spacing();
-                if (PanelKeys("VOICE PER N HITS", &idx, thresholdLabels, 8,
-                              "How many hits of the same key within 20 ms share one voice.") && idx >= 0) {
-                    w.noteOnCollapseThreshold = thresholds[idx];
-                    doc.MarkDirty();
-                    send(svms::RLCommandType::SetNoteOnCollapse, w.noteOnCollapseThreshold);
-                }
-                if (idx < 0) {
-                    ImGui::SameLine();
-                    ImGui::TextDisabled("custom: 1:%u", w.noteOnCollapseThreshold);
-                }
-                ImGui::Spacing();
-                if (PanelLever("RE-EXCITE REPEATS", &w.noteOnReexcite,
-                               "OFF by default: repeat hits that coalescing collapses are dropped, so their retrigger rhythm is lost. When enabled, each one is kept at its exact frame and restarts the key's still-sounding voices instead (the level swells back to the peak and decays again, with no new voice and no stacked attack). Every onset keeps its exact timing. This is a different sound from true retriggers by design. Uses the exact span renderer, which is slower than the default whole-voice path on dense material; if nothing is sounding on the key the hit launches normally.")) {
-                    doc.MarkDirty();
-                    send(svms::RLCommandType::SetNoteOnReexcite, w.noteOnReexcite ? 1u : 0u);
-                }
             }
         }
         EndRackPanel();

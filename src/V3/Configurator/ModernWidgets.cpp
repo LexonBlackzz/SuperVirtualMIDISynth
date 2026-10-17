@@ -1295,7 +1295,7 @@ void EndTileGrid() {
 }
 
 bool BeginTile(const char* anchor, const char* title, const char* desc, bool* on, bool* changed,
-               const ChipDef* tags, int tagCount, float toggleDelay) {
+               const ChipDef* tags, int tagCount, float toggleDelay, const char* readout, bool litFlag) {
     const int index = g_grid ? g_grid->index : 0;
     const int row = index / 2;
     const float colW = g_grid ? g_grid->colW : ImGui::GetContentRegionAvail().x;
@@ -1306,7 +1306,8 @@ bool BeginTile(const char* anchor, const char* title, const char* desc, bool* on
     float height = natural;
     if (g_grid && row < static_cast<int>(g_grid->rowMax.size()))
         height = (std::max)(height, g_grid->rowMax[row]);
-    const float lit = AnimEase(ImGui::GetID("##lit"), *on ? 1.0f : 0.0f, 0.3f);
+    const bool isOn = on ? *on : litFlag;
+    const float lit = AnimEase(ImGui::GetID("##lit"), isOn ? 1.0f : 0.0f, 0.3f);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, MixU32(g_tok.card2, g_tok.acc, 0.06f * lit));
     ImGui::PushStyleColor(ImGuiCol_Border, MixU32(g_tok.line2, g_tok.accLine, lit));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, S(g_tok.rack ? g_tok.rCtl : 12.0f));
@@ -1332,9 +1333,18 @@ bool BeginTile(const char* anchor, const char* title, const char* desc, bool* on
     ImGui::PopTextWrapPos();
     PopFont();
     const float titleBottom = ImGui::GetCursorPosY();
-    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - ImGui::GetCurrentWindow()->WindowPadding.x - S(46.0f), y0));
-    const bool flipped = Toggle("##on", on, toggleDelay);
-    if (changed) *changed = flipped;
+    if (on) {
+        ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - ImGui::GetCurrentWindow()->WindowPadding.x - S(46.0f), y0));
+        const bool flipped = Toggle("##on", on, toggleDelay);
+        if (changed) *changed = flipped;
+    } else if (readout) {
+        PushNum(13.0f);
+        const ImVec2 rs = ImGui::CalcTextSize(readout);
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2(wp.x + ImGui::GetWindowWidth() - ImGui::GetCurrentWindow()->WindowPadding.x - rs.x, wp.y + y0 + S(4.0f) - ImGui::GetScrollY()),
+            g_tok.acc, readout);
+        PopFont();
+    }
     ImGui::SetCursorPosY((std::max)(titleBottom, y0 + S(28.0f)) + S(8.0f) - ImGui::GetStyle().ItemSpacing.y);
     if (desc && *desc) {
         PushText(0, 13.0f);
@@ -1356,7 +1366,7 @@ bool BeginTile(const char* anchor, const char* title, const char* desc, bool* on
         }
     }
     g_tile = {tid, anchor, extra, wp, ImVec2(wp.x + colW, wp.y)};
-    return *on;
+    return isOn;
 }
 
 void TileNested() {

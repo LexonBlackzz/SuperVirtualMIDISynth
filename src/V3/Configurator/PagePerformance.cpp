@@ -1,97 +1,23 @@
 #include "PagePerformance.h"
+#include "Anim.h"
 #include "ConfigDocument.h"
-#include "Widgets.h"
-#include "Theme.h"
-#include "imgui.h"
-#include "../SVMSRuntimeLinkProtocol.h"
-#include "ModernWidgets.h"
+#include "ConfiguratorApp.h"
 #include "DriverLink.h"
+#include "ModernWidgets.h"
+#include "Theme.h"
+#include "Widgets.h"
+#include "imgui.h"
+#include "imgui_internal.h"
+#include "../SVMSRuntimeLinkProtocol.h"
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
+#include <string>
+#include <thread>
 
 namespace svms::cfg {
-namespace {
-
-bool BeginSettingsTable(const char* id) {
-    if (!ImGui::BeginTable(id, 3,
-                           ImGuiTableFlags_SizingStretchProp |
-                           ImGuiTableFlags_BordersInnerH |
-                           ImGuiTableFlags_RowBg,
-                           ImVec2(0.0f, 0.0f))) {
-        return false;
-    }
-    ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, 250.0f);
-    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 135.0f);
-    return true;
-}
-
-void LabelCell(const char* label, const char* tooltip = nullptr) {
-    ImGui::TableNextColumn();
-    SettingLabel(label, tooltip);
-}
-
-void CenteredStatusCell(const char* label, const ImVec4& color,
-                        const char* tooltip) {
-    ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-    const float startX = ImGui::GetCursorPosX();
-    const float available = ImGui::GetContentRegionAvail().x;
-    const float labelWidth = ImGui::CalcTextSize(label).x;
-    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - labelWidth) * 0.5f));
-    ImGui::PushStyleColor(ImGuiCol_Text, color);
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-    if (tooltip && ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.0f);
-        ImGui::TextUnformatted(tooltip);
-        ImGui::PopTextWrapPos();
-        ImGui::EndTooltip();
-    }
-}
-
-void RestartCell() {
-    ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-    PushMono(0.78f);
-    const float pillW = ImGui::CalcTextSize("RESTART").x + 12.0f;
-    PopMono();
-    const float startX = ImGui::GetCursorPosX();
-    const float available = ImGui::GetContentRegionAvail().x;
-    ImGui::SetCursorPosX(startX + (std::max)(0.0f, (available - pillW) * 0.5f));
-    RestartPill();
-}
-
-void LiveVoiceCell() {
-    CenteredStatusCell(
-        "LIVE", GetSuccess(),
-        "Applies live. Voice capacity changes allocate or shed at a render boundary while preserving sounding voices; the retire floor applies to newly started releases without touching a sounding tail.");
-}
-
-float BlockBudgetMs(const svms::RuntimeLinkTelemetryV2& t) {
-    if (t.sampleRate == 0u) return 0.0f;
-    return static_cast<float>(t.bufferFrames) * 1000.0f /
-           static_cast<float>(t.sampleRate);
-}
-
-float PercentToMs(float percent, float budgetMs) {
-    return budgetMs * percent * 0.01f;
-}
-
-void BudgetMetric(const char* label, const char* format, ...) {
-    ImGui::TableNextColumn();
-    ImGui::TextDisabled("%s", label);
-    va_list args;
-    va_start(args, format);
-    ImGui::TextV(format, args);
-    va_end(args);
-}
-
-} // namespace
 
 // SetDecimation param: mode in the low byte (0 off, 1 velocity, 2 level),
 // muted-tail cull blocks in bits 8..15.
@@ -158,313 +84,592 @@ void ApplyPerformanceProfile(ConfigDocument& doc, int profile) {
     if (w.unboundedRender != before.unboundedRender) SendLiveCommand(C::SetUnboundedRender, w.unboundedRender ? 1u : 0u);
 }
 
-void DrawPerformancePage(ConfigDocument& doc) {
-    auto& w = doc.Working();
-    const auto& lc = GetLiveLinkContext();
-    const auto* t = lc.telemetry;
+namespace {
 
-    auto send = [&](svms::RLCommandType type, uint32_t param) {
-        if (!lc.connected || !lc.client) return;
-        char result[svms::kRuntimeLinkResultTextCapacity]{};
-        lc.client->SendCommand(type, 0u, param, svms::RuntimeLiveStateV2{}, 100u, result);
-        NoteLiveChange();
-    };
+using C = svms::RLCommandType;
+constexpr float kDotW = 18.0f, kDotH = 5.0f;
 
-    if (ImGui::BeginTable("##synth_top", 2,
-                          ImGuiTableFlags_SizingStretchProp |
-                          ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("voices", ImGuiTableColumnFlags_WidthStretch, 1.35f);
-        ImGui::TableSetupColumn("engine", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableNextRow();
+std::string WithCommas(uint32_t v) {
+    std::string s = std::to_string(v);
+    for (int i = static_cast<int>(s.size()) - 3; i > 0; i -= 3) s.insert(static_cast<size_t>(i), ",");
+    return s;
+}
 
-        // ------------------------------------------------------- VOICES
-        ImGui::TableNextColumn();
-        if (BeginRackPanel("VOICES")) {
-            const ThemeSettings& th = GetThemeSettings();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            // Big readout of the live voice ceiling.
-            {
-                const ImVec2 p0 = ImGui::GetCursorScreenPos();
-                const float width = (std::min)(260.0f, ImGui::GetContentRegionAvail().x * 0.5f);
-                const float height = 64.0f;
-                DrawLcdFrame(dl, p0, ImVec2(p0.x + width, p0.y + height));
-                PushMono(0.80f);
-                dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 6.0f),
-                            ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
-                            "MAX VOICES");
-                PopMono();
-                PushMono(2.1f);
-                char big[32];
-                std::snprintf(big, sizeof(big), "%u", w.maxVoices);
-                dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 20.0f),
-                            ImGui::GetColorU32(th.accent), big);
-                PopMono();
-                ImGui::Dummy(ImVec2(width, height));
-                if (t && lc.connected) {
-                    ImGui::SameLine(0.0f, 20.0f);
-                    ImGui::BeginGroup();
-                    PanelCaption("ACTIVE NOW", nullptr);
-                    PushMono(1.3f);
-                    ImGui::PushStyleColor(ImGuiCol_Text, th.accent);
-                    ImGui::Text("%u", t->activeVoices);
-                    ImGui::PopStyleColor();
-                    PopMono();
-                    ImGui::EndGroup();
-                }
-            }
-            ImGui::Spacing();
+void Wrapped(const char* text, ImU32 col, float px) {
+    ui::PushText(0, px);
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+    ui::PopFont();
+}
 
-            static const int presetValues[] = {1024, 2048, 4096, 8192, 16384, 32768,
-                                               65536, 131072, 262144, 524288};
-            static const char* presetLabels[] = {"1k", "2k", "4k", "8k", "16k", "32k",
-                                                 "64k", "128k", "256k", "512k"};
-            int presetIdx = -1;
-            for (int i = 0; i < 10; ++i)
-                if (presetValues[i] == static_cast<int>(w.maxVoices)) presetIdx = i;
-            if (PanelKeys("VOICE CEILING  (LIVE)", &presetIdx, presetLabels, 10,
-                          "Live primary-voice ceiling. Growing the value expands the physical voice pool without restarting or resetting sounding voices. Lowering it sheds excess voices using the normal steal-priority policy and a short anti-click release.") &&
-                presetIdx >= 0) {
-                w.maxVoices = static_cast<uint32_t>(presetValues[presetIdx]);
-                doc.MarkDirty();
-                PushLiveMaxVoices(w.maxVoices);
-            }
-            ImGui::Spacing();
+// --- Profile cards -----------------------------------------------------------------
 
-            ImGui::BeginGroup();
-            int custom = static_cast<int>(w.maxVoices);
-            bool done = false;
-            if (PanelLcdInt("CUSTOM CEILING", &custom, 1, 524288,
-                            "Type an exact voice count. Applied when you finish editing, so deleting a digit never sheds thousands of voices mid-edit.",
-                            false, &done)) {
-                w.maxVoices = static_cast<uint32_t>(custom);
-                doc.MarkDirty();
-            }
-            if (done) PushLiveMaxVoices(w.maxVoices);
-            ImGui::EndGroup();
-            ImGui::SameLine(0.0f, 28.0f);
-            ImGui::BeginGroup();
-            static const char* stealLabels[] = {"QUALITY", "FAST", "SCAN"};
-            int steal = static_cast<int>((std::min)(2u, w.stealPolicy));
-            if (PanelKeys("STEAL POLICY", &steal, stealLabels, 3,
-                          "Quality (recommended, and clearly best in listening tests) steals the quietest voice via an incremental priority index. Fast cursor and Scan avoid the index but audibly degrade victim quality under dense churn: kept for experimentation only.")) {
-                w.stealPolicy = static_cast<uint32_t>(steal);
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetStealPolicy, w.stealPolicy);
-            }
-            ImGui::EndGroup();
+void ProfileCards(ConfigDocument& doc) {
+    const ui::Tokens& k = ui::Tok();
+    const float s = ui::Scale();
+    static const char* names[3] = {"Accurate", "Balanced", "Extreme"};
+    static const char* descs[3] = {
+        "Every note exactly as written. For normal MIDI and for recording.",
+        "Only the shortcuts that sound the same. A safe pick for dense files.",
+        "Every shortcut on. For million-note Black MIDI in realtime."};
+    const int match = MatchPerformanceProfile(doc.Working());
+    const float gap = 12.0f * s;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float cardW = (width - 2.0f * gap) / 3.0f;
+    const float pad = 20.0f * s;
+    ui::PushText(2, 15.0f);
+    const float nameH = ImGui::GetTextLineHeight();
+    ui::PopFont();
+    ui::PushText(0, 13.0f);
+    float descH = 0.0f;
+    for (int i = 0; i < 3; ++i)
+        descH = (std::max)(descH, ImGui::CalcTextSize(descs[i], nullptr, false, cardW - 2.0f * pad).y);
+    ui::PopFont();
+    const float height = pad + nameH + 6.0f * s + descH + 6.0f * s + 4.0f * s + kDotH * s + pad;
 
-            ImGui::Dummy(ImVec2(0.0f, 8.0f));
-            if (ImGui::BeginTable("##synth_knobs", 4, ImGuiTableFlags_SizingStretchSame)) {
-                ImGui::TableNextRow();
-                bool committed = false;
-
-                ImGui::TableNextColumn();
-                float retireDb = 20.0f * std::log10(w.voiceRetireThreshold);
-                retireDb = (std::max)(-100.0f, (std::min)(-26.0f, retireDb));
-                if (PanelKnob("RETIRE FLOOR", &retireDb, -100.0f, -26.0f, -55.0f,
-                              "%.0f dB", 54.0f,
-                              "Release-tail loudness where finished voices are freed. Higher (less negative) frees quiet tails sooner and cuts release cost on dense songs; lower keeps longer tails. Applies to newly started releases.",
-                              &committed)) {
-                    w.voiceRetireThreshold = std::pow(10.0f, retireDb / 20.0f);
-                    doc.MarkDirty();
-                }
-                if (committed) {
-                    uint32_t bits = 0u;
-                    std::memcpy(&bits, &w.voiceRetireThreshold, sizeof(bits));
-                    send(svms::RLCommandType::SetVoiceRetireFloor, bits);
-                }
-
-                ImGui::TableNextColumn();
-                float cap = static_cast<float>(w.perKeyVoiceCap);
-                if (PanelKnob("PER-KEY CAP", &cap, 0.0f, 32.0f, 0.0f,
-                              cap < 0.5f ? "OFF" : "%.0f / key", 54.0f,
-                              "Opt-in. Limits how many still-playing voices one (channel, note) may hold; a note-on at the cap replaces the oldest voice of that key. Off by default. Tames dense Black MIDI that hammers the same keys across channels.",
-                              &committed)) {
-                    w.perKeyVoiceCap = static_cast<uint32_t>(cap + 0.5f);
-                    doc.MarkDirty();
-                }
-                if (committed) send(svms::RLCommandType::SetPerKeyVoiceCap, w.perKeyVoiceCap);
-
-                ImGui::TableNextColumn();
-                float ghosts = static_cast<float>(w.ghostBudget);
-                if (PanelKnob("GHOST BUDGET", &ghosts, 0.0f, 4096.0f, 0.0f,
-                              ghosts < 0.5f ? "OFF" : "%.0f", 54.0f,
-                              "Optional cap on displaced-voice ghosts rendered per block (off = unbounded). Lower values cut render cost in extreme steal storms at the price of clicks on voices past the cap.",
-                              &committed)) {
-                    w.ghostBudget = static_cast<uint32_t>(ghosts + 0.5f);
-                    doc.MarkDirty();
-                }
-                if (committed) send(svms::RLCommandType::SetGhostBudget, w.ghostBudget);
-
-                ImGui::TableNextColumn();
-                float cull = static_cast<float>(w.decimationCullBlocks);
-                if (PanelKnob("CULL MUTED TAILS", &cull, 0.0f, 120.0f, 5.0f,
-                              cull < 0.5f ? "OFF" : "%.0f blocks", 54.0f,
-                              "Opt-in; needs VOICE DECIMATION on. A releasing voice that has been muted for this many blocks in a row is retired instead of advancing silently forever. Frees pool slots and the per-block cost of the muted tails; audible only if the load later drops enough that such a tail would have been mixed again.",
-                              &committed)) {
-                    w.decimationCullBlocks = static_cast<uint32_t>(cull + 0.5f);
-                    doc.MarkDirty();
-                }
-                if (committed && w.decimation)
-                    send(svms::RLCommandType::SetDecimation, DecimationParam(w));
-                ImGui::EndTable();
-            }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    for (int i = 0; i < 3; ++i) {
+        ImGui::PushID(i);
+        const ImVec2 base(origin.x + i * (cardW + gap), origin.y);
+        ImGui::SetCursorScreenPos(base);
+        const bool clicked = ImGui::InvisibleButton("##pc", ImVec2(cardW, height));
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        const bool hov = ImGui::IsItemHovered(), down = ImGui::IsItemActive();
+        const bool sel = match == i;
+        const float lift = AnimSpring(ImGui::GetID("##lift"), hov ? -3.0f * s : 0.0f);
+        const float press = AnimSpring(ImGui::GetID("##press"), down ? 0.97f : 1.0f);
+        const float lit = AnimEase(ImGui::GetID("##sel"), sel ? 1.0f : 0.0f, 0.3f);
+        const ImVec2 c(base.x + cardW * 0.5f, base.y + height * 0.5f + lift);
+        const ImVec2 a(c.x - cardW * 0.5f * press, c.y - height * 0.5f * press);
+        const ImVec2 b(c.x + cardW * 0.5f * press, c.y + height * 0.5f * press);
+        const float r = 12.0f * s;
+        if (lit > 0.01f)
+            ui::SoftShadow(dl, ImVec2(a.x, a.y + 8.0f * s), ImVec2(b.x, b.y + 8.0f * s), r, ui::WithAlpha(k.acc, 0.35f * lit), 18.0f * s, 6);
+        dl->AddRectFilled(a, b, ui::MixU32(k.card2, ui::MixU32(k.card2, k.acc, 0.16f), lit), r);
+        dl->AddRect(a, b, ui::MixU32(k.line2, k.acc, lit), r);
+        float y = a.y + pad * press;
+        const float x = a.x + pad * press;
+        ui::PushText(2, 15.0f * press);
+        dl->AddText(ImVec2(x, y), k.text, ui::Caps(names[i]));
+        ui::PopFont();
+        y += (nameH + 6.0f * s) * press;
+        ui::PushText(0, 13.0f * press);
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(x, y), k.muted, descs[i], nullptr,
+                    (cardW - 2.0f * pad) * press);
+        ui::PopFont();
+        const float dotsY = b.y - (pad + kDotH * s) * press;
+        for (int d = 0; d < 3; ++d) {
+            const float dx = x + d * (kDotW + 4.0f) * s * press;
+            dl->AddRectFilled(ImVec2(dx, dotsY), ImVec2(dx + kDotW * s * press, dotsY + kDotH * s * press),
+                              d <= i ? k.acc : k.card3, 3.0f * s);
         }
-        EndRackPanel();
-
-        // ------------------------------------------------------- ENGINE
-        ImGui::TableNextColumn();
-        if (BeginRackPanel("ENGINE")) {
-            int threads = static_cast<int>(w.renderThreads);
-            if (PanelSliderInt("RENDER THREADS", &threads, 0, 64,
-                               "Total voice-render lanes. 0 = AUTO (V3 picks); 1 keeps voice rendering on the audio thread. Ctrl+click the slider to type a value.",
-                               true, "AUTO")) {
-                w.renderThreads = static_cast<uint32_t>(threads);
-                doc.MarkDirty();
-            }
-            ImGui::Spacing();
-
-            int shardCount = static_cast<int>(w.shards);
-            if (PanelSliderInt("ENGINE SHARDS", &shardCount, 1, 16,
-                               "Splits the engine into this many independent cores, each with its own voice pool, event compiler and planning thread; notes are routed by key, everything else goes to every core. Planning (launches, steals) is single-threaded per core, so on very dense Black MIDI more shards means more of it in parallel. Render threads are divided between the shards, so keep render threads at least twice the shard count. 1 = a single core. Measured on a 20-thread CPU on a 124M-note MIDI: 6 shards with 20 render threads was best. Takes effect after a restart.",
-                               true)) {
-                w.shards = static_cast<uint32_t>(shardCount);
-                doc.MarkDirty();
-            }
-            ImGui::Spacing();
-
-            static const char* affinityLabels[] = {"OFF", "ALL ON P", "RT ON P"};
-            int affinity = static_cast<int>((std::min)(2u, w.threadAffinityMode));
-            if (PanelKeys("THREAD AFFINITY  (LIVE)", &affinity, affinityLabels, 3,
-                          "Opt-in. ALL ON P pins every render thread to performance cores; RT ON P keeps audio and the compiler on P-cores and parks render workers on efficiency cores. No effect on non-hybrid CPUs.")) {
-                w.threadAffinityMode = static_cast<uint32_t>(affinity);
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetThreadAffinityMode, w.threadAffinityMode);
-            }
-            ImGui::Spacing();
-            ImGui::Spacing();
-
-            if (PanelLever("LARGE PAGES", &w.largePages,
-                           "Optional. Backs the voice pool and renderer storage with 2 MB pages to reduce TLB pressure at very large pools. Needs the Lock Pages In Memory privilege; otherwise silently falls back to normal allocation.",
-                           true)) {
-                doc.MarkDirty();
-            }
-            ImGui::Spacing();
-            if (PanelLever("VOICE DECIMATION", &w.decimation,
-                           "OFF by default: every voice mixes. When enabled, above 10k / 25k / 50k / 150k active voices the quietest voices (by velocity, ranked each block) stop mixing for the block, keeping only the loudest 1/2, 1/4, 1/8 or 1/16. They still advance their phase and envelope, and voices launched in the block always sound. Big CPU saving on extreme Black MIDI; it audibly thins quiet layers.")) {
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetDecimation, DecimationParam(w));
-            }
-            if (PanelLever("STEAL REJECT  (LISTEN)", &w.stealReject,
-                           "Listening test, OFF by default. With the pool full, a note-on that would be the very first voice stolen (quieter than the voice it would replace) is dropped instead of launched, like BASSMIDI. Big CPU saving on extreme Black MIDI with mixed velocities; quiet notes are audibly dropped. Quality steal policy only; no effect when all velocities are equal.")) {
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetStealReject, w.stealReject ? 1u : 0u);
-            }
-            if (PanelLever("FAST TAIL MATH  (LOWERS ACCURACY)", &w.fastChunkMath,
-                           "OFF by default. DECREASES ACCURACY: sustained, attack/decay and release voices (AVX2) advance their gain and sample position per 8-frame chunk with closed-form ladders instead of frame by frame. Output no longer matches the exact path or the scalar renderer bit for bit: sample position differs by a fraction of a frame (the exact path's own float accumulation drifts more at large positions) and peaks differ by up to about -48 dB on steep waveforms. Sample data and interpolation are NOT touched. Cuts CPU on dense Black MIDI. Applies live.")) {
-                doc.MarkDirty();
-                send(svms::RLCommandType::SetFastChunkMath, w.fastChunkMath ? 1u : 0u);
-            }
-            if (PanelLever("DECIMATE BY LEVEL", &w.decimationByLevel,
-                           "Listening test, OFF by default. With voice decimation on, mute the voices that are actually quietest (envelope level x gain, so fading release tails go first) instead of the lowest velocity. A loud note that has been ringing out is no longer protected by its velocity, and a soft fresh note is no longer sacrificed.")) {
-                doc.MarkDirty();
-                if (w.decimation)
-                    send(svms::RLCommandType::SetDecimation, DecimationParam(w));
-            }
-            ImGui::Spacing();
-            bool correctness = w.correctnessMode;
-            if (PanelLever("FULL CORRECTNESS", &correctness,
-                           "Reference-render switch kept for compatibility: it no longer changes live rendering (voice decimation is its own switch above).")) {
-                w.correctnessMode = correctness;
-                doc.MarkDirty();
-                PushLiveBool(svms::RLCommandType::SetCorrectnessMode, correctness);
-            }
-            ImGui::Spacing();
-            ImGui::Spacing();
-
-            int memory = static_cast<int>(w.voiceMemoryBudgetMB);
-            if (PanelLcdInt("VOICE MEMORY  (MIB)", &memory, 0, 65536,
-                            "Upper bound for the voice pool, renderer scratch and worker mix buffers. Zero means unlimited. A restart recalculates the largest safe live-growth ceiling.",
-                            true, nullptr, "unlimited")) {
-                w.voiceMemoryBudgetMB = static_cast<uint32_t>(memory);
-                doc.MarkDirty();
-            }
-        }
-        EndRackPanel();
-        ImGui::EndTable();
+        if (clicked) ApplyPerformanceProfile(doc, i);
+        ImGui::PopID();
     }
+    ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + height));
+    ImGui::Dummy(ImVec2(width, 0.0f));
+}
 
-    if (w.maxVoices > 4096) {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
-        ImGui::TextWrapped("Extreme voice capacity. Actual realtime performance is workload and CPU dependent.");
+// --- Nested rows inside a tile -------------------------------------------------------
+
+struct Nested {
+    ImVec2 origin;
+    float x1, leftBottom, ctlY;
+    ImVec2 ctl;
+};
+
+Nested NestedBegin(const char* title, const char* hint, ImVec2 ctl, bool first) {
+    const ui::Tokens& k = ui::Tok();
+    const float s = ui::Scale();
+    if (!first) ImGui::Dummy(ImVec2(0.0f, 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
+    Nested n{};
+    n.ctl = ctl;
+    n.origin = ImGui::GetCursorScreenPos();
+    n.x1 = n.origin.x + ImGui::GetContentRegionAvail().x;
+    const float leftW = (std::max)(80.0f * s, n.x1 - n.origin.x - ctl.x - 14.0f * s);
+    ImGui::BeginGroup();
+    ui::PushText(0, 13.0f);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + leftW);
+    ImGui::TextUnformatted(title);
+    ImGui::PopTextWrapPos();
+    ui::PopFont();
+    if (hint && *hint) {
+        ui::PushText(0, 12.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + leftW);
+        ImGui::TextUnformatted(hint);
+        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
+        ui::PopFont();
     }
+    ImGui::EndGroup();
+    n.leftBottom = ImGui::GetItemRectMax().y;
+    const float leftH = n.leftBottom - n.origin.y;
+    n.ctlY = n.origin.y + (std::max)(0.0f, (leftH - ctl.y) * 0.5f);
+    ImGui::SetCursorScreenPos(ImVec2(n.x1 - ctl.x, n.ctlY));
+    return n;
+}
 
-    // ----------------------------------------------------- RENDER BUDGET
-    if (BeginRackPanel("LIVE RENDER BUDGET")) {
-        const ThemeSettings& th = GetThemeSettings();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const bool tel = lc.connected && t;
-        struct Cell { const char* label; char value[48]; };
-        Cell cells[8];
-        auto set = [&](int i, const char* label, const char* fmt, auto... args) {
-            cells[i].label = label;
-            std::snprintf(cells[i].value, sizeof(cells[i].value), fmt, args...);
-        };
-        if (tel) {
-            const float budgetMs = BlockBudgetMs(*t);
-            const float load = (std::max)(0.0f, t->cpuLoadPercent);
-            const uint32_t cap = t->live.maxVoices != 0u ? t->live.maxVoices : t->maxVoices;
-            if (t->effectiveVoices > t->activeVoices) {
-                // Note merging / coalescing is absorbing duplicates: show what
-                // the pool would hold without them next to what it holds.
-                set(0, "ACTIVE / EFFECTIVE", "%u / %u  (eff %u)",
-                    t->activeVoices, cap, t->effectiveVoices);
-            } else {
-                set(0, "ACTIVE VOICES", "%u / %u", t->activeVoices, cap);
+void NestedEnd(const Nested& n) {
+    const float bottom = (std::max)(n.leftBottom, n.ctlY + n.ctl.y);
+    ImGui::SetCursorScreenPos(ImVec2(n.origin.x, bottom - ImGui::GetStyle().ItemSpacing.y));
+    ImGui::Dummy(ImVec2(1.0f, 0.0f));
+}
+
+// Mono readout, right-aligned in `width`.
+void ReadoutRight(const char* text, float width, ImU32 col) {
+    ui::PushNum(13.0f);
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + width - ts.x, p.y + (ui::Scale() * 28.0f - ts.y) * 0.5f), col, text);
+    ui::PopFont();
+    ImGui::Dummy(ImVec2(width, ui::Scale() * 28.0f));
+}
+
+// --- Shortcuts ---------------------------------------------------------------------
+
+void GroupHeader(const char* title, const char* hint, bool first) {
+    const ui::Tokens& k = ui::Tok();
+    const float s = ui::Scale();
+    ImGui::Dummy(ImVec2(0.0f, (first ? 4.0f : 22.0f) * s - ImGui::GetStyle().ItemSpacing.y));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ui::PushText(2, 13.0f);
+    const float tw = ImGui::CalcTextSize(ui::Caps(title)).x;
+    const float th = ImGui::GetTextLineHeight();
+    dl->AddText(p, k.text, ui::Caps(title));
+    ui::PopFont();
+    ui::PushText(0, 12.0f);
+    dl->AddText(ImVec2(p.x + tw + 12.0f * s, p.y + (th - ImGui::GetTextLineHeight()) - 1.0f * s), k.muted, hint);
+    ui::PopFont();
+    ImGui::Dummy(ImVec2(1.0f, th));
+    ImGui::Dummy(ImVec2(0.0f, 12.0f * s - ImGui::GetStyle().ItemSpacing.y));
+}
+
+using ui::ChipDef;
+using ui::ChipKind;
+
+// One switch tile whose toggle just flips a bool and pushes a live command.
+bool SwitchTile(ConfigDocument& doc, const char* anchor, const char* title, const char* desc,
+                bool* value, C command, const ChipDef* tags, int tagCount, float delay) {
+    bool changed = false;
+    const bool on = ui::BeginTile(anchor, title, desc, value, &changed, tags, tagCount, delay);
+    if (changed) {
+        doc.MarkDirty();
+        SendLiveCommand(command, *value ? 1u : 0u);
+    }
+    return on;
+}
+
+void Shortcuts(ConfigDocument& doc) {
+    ConfigValues& w = doc.Working();
+    const float s = ui::Scale();
+    ui::BeginCard("##shortcuts", "Shortcuts",
+                  "Ways to save CPU, grouped by what they cost. The profile above sets these for you.", 0.0f, "tradeoffs");
+
+    // -------------------------------------------------------------- Free
+    GroupHeader("Free", "No audible difference in practice. Safe to leave on.", true);
+    ui::BeginTileGrid("##g_free");
+    {
+        const ChipDef tags[] = {{"Saves voices", ChipKind::Cpu}};
+        SwitchTile(doc, "noteMerge", "Merge identical notes",
+                   "The same key, velocity and exact time on several tracks becomes one voice at the combined volume. Nothing is dropped or moved.",
+                   &w.noteMerge, C::SetNoteMerge, tags, 1, 0.0f);
+        ui::EndTile();
+    }
+    {
+        const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}};
+        SwitchTile(doc, "ccCol", "Skip overwritten controller changes",
+                   "Drops volume, pan and similar changes that a later one on the same channel replaces within a few milliseconds.",
+                   &w.ccCollapse, C::SetCcCollapse, tags, 1, 0.04f);
+        ui::EndTile();
+    }
+    ui::EndTileGrid();
+
+    // ------------------------------------------------- Costs a little sound
+    GroupHeader("Costs a little sound", "Big savings on dense Black MIDI. Quiet details can thin out.", false);
+    ui::BeginTileGrid("##g_sound");
+    {
+        const ChipDef tags[] = {{"Saves a lot of CPU", ChipKind::Cpu}, {"Thins quiet layers", ChipKind::Bad}};
+        bool changed = false;
+        const bool on = ui::BeginTile("decim", "Voice decimation",
+                                      "Above 10k / 25k / 50k / 150k voices, only the loudest half / quarter / eighth / sixteenth are mixed. The rest keep running silently.",
+                                      &w.decimation, &changed, tags, 2, 0.08f);
+        if (changed) {
+            doc.MarkDirty();
+            SendLiveCommand(C::SetDecimation, DecimationParam(w));
+        }
+        if (on) {
+            ui::TileNested();
+            Nested n = NestedBegin("Mute by actual loudness", "Fading tails go first, not soft new notes.",
+                                   ImVec2(46.0f * s, 28.0f * s), true);
+            if (ui::Toggle("##bylevel", &w.decimationByLevel, 0.12f)) {
+                doc.MarkDirty();
+                SendLiveCommand(C::SetDecimation, DecimationParam(w));
             }
-            set(1, "RENDER / BUDGET", "%.2f / %.2f ms", PercentToMs(load, budgetMs), budgetMs);
-            set(2, "RENDER LOAD", "%.1f%%", load);
-            set(3, "HEADROOM", "%.1f%%", (std::max)(0.0f, 100.0f - load));
-            set(4, "P95", "%.2f ms", PercentToMs(t->callbackP95Percent, budgetMs));
-            set(5, "P99", "%.2f ms", PercentToMs(t->callbackP99Percent, budgetMs));
-            set(6, "P99.9", "%.2f ms", PercentToMs(t->callbackP999Percent, budgetMs));
-            set(7, "OVER BUDGET", "%llu  (streak %u)",
-                static_cast<unsigned long long>(t->overBudgetCallbacks),
-                t->maxConsecutiveOverBudget);
-        } else {
-            const char* labels[8] = {"ACTIVE VOICES", "RENDER / BUDGET", "RENDER LOAD", "HEADROOM",
-                                     "P95", "P99", "P99.9", "OVER BUDGET"};
-            for (int i = 0; i < 8; ++i) set(i, labels[i], "--");
+            NestedEnd(n);
+            ImGui::Dummy(ImVec2(0.0f, 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
+            const float avail = ImGui::GetContentRegionAvail().x;
+            ui::PushText(0, 13.0f);
+            const float lw = ImGui::CalcTextSize("Free muted tails after").x;
+            const float lh = ImGui::GetTextLineHeight();
+            ui::PopFont();
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            const float rw = 72.0f * s, g = 14.0f * s;
+            ui::PushText(0, 13.0f);
+            ImGui::GetWindowDrawList()->AddText(ImVec2(p.x, p.y + (28.0f * s - lh) * 0.5f), ui::Tok().text,
+                                                "Free muted tails after");
+            ui::PopFont();
+            ImGui::SetCursorScreenPos(ImVec2(p.x + lw + g, p.y + 3.0f * s));
+            float cull = static_cast<float>(w.decimationCullBlocks);
+            bool committed = false;
+            if (ui::RangeSlider("##cull", &cull, 0.0f, 120.0f, (std::max)(60.0f * s, avail - lw - rw - 2.0f * g), &committed)) {
+                const uint32_t v = static_cast<uint32_t>(cull + 0.5f);
+                if (v != w.decimationCullBlocks) {
+                    w.decimationCullBlocks = v;
+                    doc.MarkDirty();
+                }
+            }
+            if (committed && w.decimation) SendLiveCommand(C::SetDecimation, DecimationParam(w));
+            char txt[32];
+            if (w.decimationCullBlocks) std::snprintf(txt, sizeof(txt), "%u blocks", w.decimationCullBlocks);
+            else std::snprintf(txt, sizeof(txt), "Never");
+            ImGui::SetCursorScreenPos(ImVec2(p.x + avail - rw, p.y));
+            ReadoutRight(txt, rw, ui::Tok().text);
         }
-        const ImVec2 p0 = ImGui::GetCursorScreenPos();
-        const float width = ImGui::GetContentRegionAvail().x;
-        PushMono(0.95f);
-        const float lh = ImGui::GetTextLineHeight();
-        const float height = lh * 4.0f + 44.0f;
-        DrawLcdFrame(dl, p0, ImVec2(p0.x + width, p0.y + height));
-        for (int i = 0; i < 8; ++i) {
-            const int col = i % 4;
-            const int row = i / 4;
-            const float x = p0.x + 16.0f + col * (width - 32.0f) / 4.0f;
-            const float y = p0.y + 12.0f + row * (lh * 2.0f + 14.0f);
-            dl->AddText(ImVec2(x, y),
-                        ImGui::GetColorU32(ImVec4(th.accent.x, th.accent.y, th.accent.z, 0.5f)),
-                        cells[i].label);
-            dl->AddText(ImVec2(x, y + lh + 2.0f), ImGui::GetColorU32(th.accent), cells[i].value);
+        ui::EndTile();
+    }
+    {
+        const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}, {"Drops quiet notes", ChipKind::Bad}};
+        SwitchTile(doc, "stealReject", "Skip notes quieter than everything playing",
+                   "When the voice limit is full, a note that would be the first one replaced is not played at all, like BASSMIDI.",
+                   &w.stealReject, C::SetStealReject, tags, 2, 0.16f);
+        ui::EndTile();
+    }
+    {
+        const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}, {"Loses retrigger rhythm", ChipKind::Bad}};
+        bool on = w.noteOnCollapseThreshold > 1u, changed = false;
+        ui::BeginTile("coalesce", "Combine rapid repeats", "Repeated hits of the same key within 20 ms share one voice.",
+                      &on, &changed, tags, 2, 0.2f);
+        if (changed) {
+            w.noteOnCollapseThreshold = on ? 32u : 1u;
+            doc.MarkDirty();
+            SendLiveCommand(C::SetNoteOnCollapse, w.noteOnCollapseThreshold);
         }
-        PopMono();
-        ImGui::Dummy(ImVec2(width, height));
-        if (tel) {
-            const uint32_t decStep = (std::max)(1u, t->decimationStep);
-            ImGui::TextDisabled("Physical pool %u voices  |  buffer %u frames @ %u Hz  |  decimation %ux (~%u mixing of %u active)",
-                                t->maxVoices, t->bufferFrames, t->sampleRate,
-                                decStep, t->activeVoices / decStep, t->activeVoices);
-        } else {
-            ImGui::TextDisabled("Connect to a running driver to see live render load.");
+        if (on) {
+            ui::TileNested();
+            static const uint32_t values[8] = {2u, 8u, 32u, 128u, 512u, 2048u, 8192u, 65536u};
+            static const char* labels[8] = {"2", "8", "32", "128", "512", "2k", "8k", "64k"};
+            int idx = -1;
+            for (int i = 0; i < 8; ++i)
+                if (values[i] == w.noteOnCollapseThreshold) idx = i;
+            Nested n = NestedBegin("One voice per", nullptr, ui::SegmentedSize(labels, 8), true);
+            if (ui::Segmented("##coalN", &idx, labels, 8) && idx >= 0) {
+                w.noteOnCollapseThreshold = values[idx];
+                doc.MarkDirty();
+                SendLiveCommand(C::SetNoteOnCollapse, w.noteOnCollapseThreshold);
+            }
+            NestedEnd(n);
+            n = NestedBegin("Keep the rhythm as swells",
+                            "Each combined hit pushes the voice back to full level at its exact time. Slower.",
+                            ImVec2(46.0f * s, 28.0f * s), false);
+            if (ui::Toggle("##reexcite", &w.noteOnReexcite, 0.24f)) {
+                doc.MarkDirty();
+                SendLiveCommand(C::SetNoteOnReexcite, w.noteOnReexcite ? 1u : 0u);
+            }
+            NestedEnd(n);
+        }
+        ui::EndTile();
+    }
+    {
+        const ChipDef tags[] = {{"Note ends move", ChipKind::Bad}};
+        char readout[24];
+        if (w.minNoteMs) std::snprintf(readout, sizeof(readout), "%u ms", w.minNoteMs);
+        else std::snprintf(readout, sizeof(readout), "Off");
+        ui::BeginTile("minNote", "Minimum note length",
+                      "Stretches very short notes so they are heard instead of vanishing into clicks.", nullptr, nullptr,
+                      tags, 1, 0.0f, readout, w.minNoteMs > 0u);
+        float v = static_cast<float>(w.minNoteMs);
+        ui::RangeSlider("##minnote", &v, 0.0f, 100.0f, ImGui::GetContentRegionAvail().x);
+        const uint32_t nv = static_cast<uint32_t>(v + 0.5f);
+        if (nv != w.minNoteMs) {
+            w.minNoteMs = nv;
+            doc.MarkDirty();
+            SendLiveCommand(C::SetMinNoteLength, nv);
+        }
+        ui::EndTile();
+    }
+    ui::EndTileGrid();
+
+    // --------------------------------------------- Costs accuracy or timing
+    GroupHeader("Costs accuracy or timing", "Sounds the same to most ears, but no longer exact.", false);
+    ui::BeginTileGrid("##g_acc");
+    {
+        const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}, {"Not bit-exact", ChipKind::Bad}};
+        SwitchTile(doc, "fastTail", "Fast tail math",
+                   "Advances envelopes in 8-frame steps (AVX2). Peaks can differ from the exact path by up to \xE2\x88\x92" "48 dB.",
+                   &w.fastChunkMath, C::SetFastChunkMath, tags, 2, 0.28f);
+        ui::EndTile();
+    }
+    {
+        const ChipDef tags[] = {{"Saves a lot of CPU", ChipKind::Cpu}, {"Bends can land a few ms late", ChipKind::Bad}};
+        SwitchTile(doc, "bendCol", "Thin out pitch bends",
+                   "Keeps only the latest bend per channel every few milliseconds. Note timing is untouched.",
+                   &w.bendCollapse, C::SetBendCollapse, tags, 2, 0.32f);
+        ui::EndTile();
+    }
+    {
+        const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}, {"Timing snaps to the buffer", ChipKind::Bad}};
+        SwitchTile(doc, "omni", "Block timing (OmniMIDI style)",
+                   "Every event in an audio block fires at its start. Do not use for live playing.",
+                   &w.blockTiming, C::SetBlockTiming, tags, 2, 0.36f);
+        ui::EndTile();
+    }
+    {
+        const ChipDef tags[] = {{"Experimental", ChipKind::Exp}};
+        SwitchTile(doc, "unbounded", "Never skip ahead",
+                   "Under overload the song slows down instead of jumping forward. Glitches are expected.",
+                   &w.unboundedRender, C::SetUnboundedRender, tags, 1, 0.4f);
+        ui::EndTile();
+    }
+    ui::EndTileGrid();
+    ui::EndCard();
+}
+
+// --- CPU and threads ------------------------------------------------------------------
+
+// Slider + mono readout as a row control.
+bool SliderControl(const char* id, int* value, int minValue, int maxValue, const char* zeroText, ImVec2 size) {
+    const float s = ui::Scale();
+    const float rw = 48.0f * s;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + (size.y - 22.0f * s) * 0.5f));
+    float v = static_cast<float>(*value);
+    bool changed = false;
+    if (ui::RangeSlider(id, &v, static_cast<float>(minValue), static_cast<float>(maxValue), size.x - rw - 10.0f * s)) {
+        const int iv = static_cast<int>(v + 0.5f);
+        if (iv != *value) {
+            *value = iv;
+            changed = true;
         }
     }
-    EndRackPanel();
+    char txt[16];
+    if (*value == 0 && zeroText) std::snprintf(txt, sizeof(txt), "%s", zeroText);
+    else std::snprintf(txt, sizeof(txt), "%d", *value);
+    ImGui::SetCursorScreenPos(ImVec2(p.x + size.x - rw, p.y));
+    ui::PushNum(13.0f);
+    const ImVec2 ts = ImGui::CalcTextSize(txt);
+    ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + size.x - ts.x, p.y + (size.y - ts.y) * 0.5f), ui::Tok().text, txt);
+    ui::PopFont();
+    ImGui::Dummy(ImVec2(rw, size.y));
+    return changed;
+}
+
+void CpuCard(ConfigDocument& doc) {
+    ConfigValues& w = doc.Working();
+    const float s = ui::Scale();
+    ui::BeginCard("##cpu", "CPU and threads", nullptr, 0.0f, "threads");
+    {
+        char desc[160];
+        std::snprintf(desc, sizeof(desc), "How many CPU threads draw voices. Auto picks for you. This PC has %u.",
+                      (std::max)(1u, std::thread::hardware_concurrency()));
+        const ImVec2 size(258.0f * s, 28.0f * s);
+        ui::BeginRow("threads", "Render threads", desc, size);
+        int v = static_cast<int>(w.renderThreads);
+        if (SliderControl("##threads", &v, 0, 64, "Auto", size)) {
+            w.renderThreads = static_cast<uint32_t>(v);
+            doc.MarkDirty();
+        }
+        ui::EndRow();
+    }
+    {
+        const ImVec2 size(258.0f * s, 28.0f * s);
+        ui::BeginRow("shards", "Engine shards",
+                     "Splits the engine into independent parts by key. Helps very dense files. Keep threads at least twice the shard count.",
+                     size);
+        int v = static_cast<int>(w.shards);
+        if (SliderControl("##shards", &v, 1, 16, nullptr, size)) {
+            w.shards = static_cast<uint32_t>(v);
+            doc.MarkDirty();
+        }
+        ui::EndRow();
+        if (w.shards > 1u && w.renderThreads > 0u && w.renderThreads < w.shards * 2u)
+            Wrapped("Fewer than two render threads per shard. Raise threads or lower shards.", ui::Tok().acc, 13.0f);
+    }
+    {
+        static const char* labels[3] = {"Windows decides", "All on P-cores", "Audio on P-cores"};
+        int idx = static_cast<int>((std::min)(2u, w.threadAffinityMode));
+        ui::BeginRow("affinity", "Core placement", "For Intel CPUs with P- and E-cores. No effect on other CPUs.",
+                     ui::SegmentedSize(labels, 3));
+        if (ui::Segmented("##affinity", &idx, labels, 3)) {
+            w.threadAffinityMode = static_cast<uint32_t>(idx);
+            doc.MarkDirty();
+            SendLiveCommand(C::SetThreadAffinityMode, w.threadAffinityMode);
+        }
+        ui::EndRow();
+    }
+    {
+        ui::BeginRow("largePages", "Large memory pages",
+                     "Faster with huge voice limits. Needs the \xE2\x80\x9CLock pages in memory\xE2\x80\x9D Windows privilege; quietly does nothing without it.",
+                     ImVec2(46.0f * s, 28.0f * s));
+        if (ui::Toggle("##largepages", &w.largePages)) doc.MarkDirty();
+        ui::EndRow();
+    }
+    ui::EndCard();
+}
+
+// --- Engine internals ------------------------------------------------------------------
+
+void Internals(ConfigDocument& doc) {
+    ConfigValues& w = doc.Working();
+    const float s = ui::Scale();
+    ui::BeginReveal("perf");
+    ui::BeginCard("##internals");
+    {
+        static const char* labels[3] = {"Quality", "Fast", "Scan"};
+        static const char* descs[3] = {
+            "Quality replaces the quietest voice. Clearly the best by ear; keep this.",
+            "Fast skips the priority index. Audibly worse under heavy note churn; for experiments only.",
+            "Scan searches linearly. Audibly worse under heavy note churn; for experiments only."};
+        int idx = static_cast<int>((std::min)(2u, w.stealPolicy));
+        ui::BeginRow("steal", "Which voice gets replaced", descs[idx], ui::SegmentedSize(labels, 3));
+        if (ui::Segmented("##steal", &idx, labels, 3)) {
+            w.stealPolicy = static_cast<uint32_t>(idx);
+            doc.MarkDirty();
+            SendLiveCommand(C::SetStealPolicy, w.stealPolicy);
+        }
+        ui::EndRow();
+    }
+    {
+        const float width = ImGui::GetContentRegionAvail().x;
+        const float kw = 96.0f * s;
+        const float free = (std::max)(0.0f, width - 3.0f * kw) / 3.0f;
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const float y = origin.y + 10.0f * s;
+        float bottom = y;
+        bool committed = false;
+
+        float retireDb = 20.0f * std::log10((std::max)(1e-6f, w.voiceRetireThreshold));
+        retireDb = ImClamp(retireDb, -100.0f, -26.0f);
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + free * 0.5f, y));
+        const ui::KnobSpec retire = {"Retire floor", -100.0f, -26.0f, -55.0f, 1.0f, false, "%.0f dB"};
+        if (ui::Knob("##retire", &retireDb, retire, &committed)) {
+            w.voiceRetireThreshold = std::pow(10.0f, retireDb / 20.0f);
+            doc.MarkDirty();
+        }
+        if (committed) {
+            uint32_t bits = 0u;
+            std::memcpy(&bits, &w.voiceRetireThreshold, sizeof(bits));
+            SendLiveCommand(C::SetVoiceRetireFloor, bits);
+        }
+        bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
+
+        float cap = static_cast<float>(w.perKeyVoiceCap);
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + free * 1.5f + kw, y));
+        const ui::KnobSpec perKey = {"Per-key cap", 0.0f, 32.0f, 0.0f, 1.0f, false, "%.0f / key", nullptr, "Off"};
+        if (ui::Knob("##perkey", &cap, perKey, &committed)) {
+            w.perKeyVoiceCap = static_cast<uint32_t>(cap + 0.5f);
+            doc.MarkDirty();
+        }
+        if (committed) SendLiveCommand(C::SetPerKeyVoiceCap, w.perKeyVoiceCap);
+        bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
+
+        float ghosts = static_cast<float>(w.ghostBudget);
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + free * 2.5f + 2.0f * kw, y));
+        const ui::KnobSpec ghost = {"Ghost budget", 0.0f, 4096.0f, 0.0f, 1.0f, false, "%.0f", nullptr, "Off"};
+        if (ui::Knob("##ghost", &ghosts, ghost, &committed)) {
+            w.ghostBudget = static_cast<uint32_t>(ghosts + 0.5f);
+            doc.MarkDirty();
+        }
+        if (committed) SendLiveCommand(C::SetGhostBudget, w.ghostBudget);
+        bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
+
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, bottom + 4.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        ImGui::Dummy(ImVec2(width, 0.0f));
+        Wrapped("Retire floor: how quiet a release tail gets before it is freed. Per-key cap: max voices one key may hold. Ghost budget: cap on replaced voices finishing their fade per block.",
+                ui::Tok().muted, 13.0f);
+    }
+    {
+        ui::BeginRow("voiceMem", "Voice memory cap (MiB)", "Upper bound for voice storage. 0 = unlimited.",
+                     ImVec2(150.0f * s, 38.0f * s));
+        int v = static_cast<int>(w.voiceMemoryBudgetMB);
+        if (ui::NumberField("##voicemem", &v, 0, 65536, 150.0f)) {
+            w.voiceMemoryBudgetMB = static_cast<uint32_t>(v);
+            doc.MarkDirty();
+        }
+        ui::EndRow();
+    }
+    ui::EndCard();
+    ui::EndReveal();
+}
+
+} // namespace
+
+void DrawPerformancePage(ConfigDocument& doc) {
+    ConfigValues& w = doc.Working();
+    const float s = ui::Scale();
+
+    ui::BeginCard("##profile", "Profile", "Pick one. It sets the switches below for you.", 0.0f, "profile");
+    ProfileCards(doc);
+    if (MatchPerformanceProfile(w) < 0) {
+        ImGui::Dummy(ImVec2(0.0f, 12.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        ui::Chip("Custom", ui::ChipKind::Acc);
+        ImGui::SameLine(0.0f, 8.0f * s);
+        const float dy = (ui::ChipSize("Custom").y - ImGui::GetTextLineHeight()) * 0.5f;
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + dy);
+        ui::PushText(0, 13.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
+        ImGui::TextUnformatted("You changed individual switches below. Pick a profile to start over.");
+        ImGui::PopStyleColor();
+        ui::PopFont();
+    }
+    ui::EndCard();
+
+    // Voice limit
+    ui::BeginCard("##voicelimit", "Voice limit",
+                  "How many notes can sound at once. When it is full, the quietest note is replaced.", 0.0f, "voices");
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ui::PushNum(40.0f, true);
+        const std::string big = WithCommas(w.maxVoices);
+        const ImVec2 bs = ImGui::CalcTextSize(big.c_str());
+        dl->AddText(p, ui::Tok().text, big.c_str());
+        ui::PopFont();
+        ui::PushText(0, 13.0f);
+        const ImVec2 vs = ImGui::CalcTextSize("voices");
+        dl->AddText(ImVec2(p.x + bs.x + 10.0f * s, p.y + bs.y - vs.y - 4.0f * s), ui::Tok().muted, "voices");
+        ui::PopFont();
+        ImGui::Dummy(ImVec2(1.0f, bs.y + 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
+    }
+    {
+        static const int values[10] = {1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288};
+        static const char* labels[10] = {"1k", "2k", "4k", "8k", "16k", "32k", "64k", "128k", "256k", "512k"};
+        int idx = -1;
+        for (int i = 0; i < 10; ++i)
+            if (values[i] == static_cast<int>(w.maxVoices)) idx = i;
+        if (ui::Segmented("##voices", &idx, labels, 10, -1.0f) && idx >= 0) {
+            w.maxVoices = static_cast<uint32_t>(values[idx]);
+            doc.MarkDirty();
+            PushLiveMaxVoices(w.maxVoices);
+        }
+    }
+    if (w.maxVoices > 65536u) {
+        ImGui::Dummy(ImVec2(0.0f, 10.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        Wrapped("Very high limits only pay off on a strong CPU. If playback stutters, go one step down or pick the Extreme profile.",
+                ui::Tok().acc, 13.0f);
+    }
+    ui::EndCard();
+
+    Shortcuts(doc);
+    CpuCard(doc);
+
+    if (ui::Disclosure("perf", "Engine internals", "Steal policy, retire floor, per-key cap, ghosts, memory cap"))
+        Internals(doc);
 }
 
 } // namespace svms::cfg
