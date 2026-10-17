@@ -283,7 +283,7 @@ public:
                 "[SVMS] whole-voice blocks=%llu refusals: rotation=%llu "
                 "event_type=%llu no_dispatcher=%llu reservation=%llu "
                 "scalar_vibrato=%llu forced=%llu seg_calls=%llu "
-                "seg_fallback=%llu\n",
+                "seg_fallback=%llu ghost_overflow=%llu\n",
                 (unsigned long long)renderer_.GetWholeVoiceBlocksForTest(),
                 (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseRotation),
                 (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseEventType),
@@ -292,7 +292,8 @@ public:
                 (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseScalarVibrato),
                 (unsigned long long)renderer_.GetRefusalCount(RenderScalar::kRefuseForced),
                 (unsigned long long)renderer_.GetWvSegCalls(),
-                (unsigned long long)renderer_.GetWvSegFallback());
+                (unsigned long long)renderer_.GetWvSegFallback(),
+                (unsigned long long)renderer_.GetGhostOverflowCount());
         }
         if (sf2_) sf2_free(sf2_.get());
     }

@@ -782,6 +782,7 @@ public:
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
     void SetEventBatchDispatcher(EventBatchDispatcher dispatcher, void* userData);
     uint32_t GetWholeVoiceBlocksForTest() const { return wholeVoiceBlocks_; }
+    uint64_t GetGhostOverflowCount() const { return wvGhostOverflowCount_; }
     // Path telemetry for the driver census: which renderer(s) the last block
     // used. Bit0 whole-voice, bit8 = vibrato active, bit9 = the block was
     // split around a barrier/budget point. Bits 1/2 (dense/sparse) are retired.
@@ -2239,12 +2240,34 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     // stretches) or the op-log budget running out (no dispatch; the split
     // lands on the start of the offending frame's event group so same-frame
     // order is preserved).  kind: 0 none, 1 barrier, 2 budget.
+    // The ghost arrays hold wvGhostCapacity_ victims per stretch.  Every
+    // launch layer can displace one voice (a ghost) and CC120 kills every
+    // active voice, so a stretch is cut before the worst case would pass the
+    // capacity.  Without this a long block (offline renders use 8192 frames)
+    // of dense note-ons overflows and the displaced voices lose their
+    // pre-steal audio (a cut + release pump every block).
+    const uint64_t ghostCapacity = wvGhostCapacity_;
+    const uint32_t layersPerLaunch = voices.GetLaunchLayersHighWater();
+    const auto ghostCost = [&](const RenderEvent& event) -> uint32_t {
+        switch (event.type) {
+            case RenderEventType::NoteOn:
+            case RenderEventType::NoteReExcite:
+                return layersPerLaunch;
+            case RenderEventType::ControlChange:
+                return event.data1 == 120u ? voices.GetActiveCount() : 0u;
+            default:
+                return 0u;
+        }
+    };
     const auto findSplit = [&](uint32_t from, uint32_t& kind) -> uint32_t {
         uint32_t opSum = 0u;
+        uint64_t ghostSum = 0u;
         for (uint32_t i = from; i < eventCount; ++i) {
             if (IsBarrierEvent(events[i].type)) { kind = 1u; return i; }
             const uint32_t ops = WholeVoiceRowOpEstimate(events[i]);
-            if (opSum + ops > wvRowOpBudget_) {
+            const uint32_t ghosts = ghostCost(events[i]);
+            if (opSum + ops > wvRowOpBudget_ ||
+                (ghostCapacity != 0u && ghostSum + ghosts > ghostCapacity)) {
                 uint32_t group = i;
                 while (group > from &&
                        events[group - 1u].frameOffset == events[i].frameOffset)
@@ -2254,6 +2277,7 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                 // group together and let the log grow (pathological).
             }
             opSum += ops;
+            ghostSum += ghosts;
         }
         kind = 0u;
         return eventCount;

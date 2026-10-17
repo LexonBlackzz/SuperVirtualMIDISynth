@@ -471,6 +471,7 @@ public:
     // Physical allocation ceiling. It can grow at a render boundary; it is
     // never shrunk live so existing voice handles remain stable.
     uint32_t GetMaxVoices() const { return maxVoices_; }
+    uint32_t GetLaunchLayersHighWater() const { return launchLayersHighWater_; }
     // Logical live ceiling. It may move freely inside (or grow) the pool.
     uint32_t GetVoiceLimit() const { return voiceLimit_; }
     bool GrowCapacity(uint32_t capacity);
@@ -735,6 +736,10 @@ public:
     uint32_t retireCount_;
     uint32_t retireImmediateCount_;
     uint32_t stealCount_;
+    // Largest layer count any launch group has used.  The block splitter
+    // bounds ghosts per stretch with it (a launch steals at most one victim
+    // per layer).
+    uint32_t launchLayersHighWater_ = 1u;
 
     // Exact count of voices currently in the Releasing state, maintained
     // O(1) at every state transition.  Audio-thread-only writes; read by
@@ -5078,6 +5083,7 @@ inline bool VoiceManager::LaunchVoiceGroup(
     if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
         count > voiceLimit_)
         return false;
+    if (count > launchLayersHighWater_) launchLayersHighWater_ = count;
     if (stealReject_.load(std::memory_order_relaxed) && count == 1u && ShouldRejectNoteOn(setups[0], channelParams,
                                            multiplicity)) {
         // Pairing note-offs sees no voice for this generation, exactly as if
