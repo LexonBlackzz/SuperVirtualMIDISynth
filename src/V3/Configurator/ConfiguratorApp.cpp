@@ -13,7 +13,7 @@
 
 #include "PageHome.h"
 #include "PageSound.h"
-#include "PageAudio.h"
+#include "PageOutput.h"
 #include "PagePerformance.h"
 #include "PageMidi.h"
 #include "PageOffline.h"
@@ -1041,7 +1041,7 @@ void ConfiguratorApp::DrawPageContent() {
     case NavPage::Effects:
         DrawEffectsPage(config_, effectsPanel_);
         break;
-    case NavPage::Output:      DrawAudioPage(config_, easterEggs_, AudioView::Output); break;
+    case NavPage::Output:      DrawOutputPage(config_, easterEggs_); break;
     case NavPage::Performance: DrawPerformancePage(config_); break;
     case NavPage::Midi:        DrawMidiPage(config_); break;
     case NavPage::Render:

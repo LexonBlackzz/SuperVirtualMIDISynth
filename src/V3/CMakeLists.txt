@@ -350,7 +350,7 @@ if(NOT WIN32)
                 Configurator/EasterEggs.cpp
                 Configurator/UpdateService.cpp
                 Configurator/PageHome.cpp
-                Configurator/PageAudio.cpp
+                Configurator/PageOutput.cpp
                 Configurator/PageSound.cpp
                 Configurator/PagePerformance.cpp
                 Configurator/PageMidi.cpp
@@ -966,7 +966,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/EasterEggs.cpp
         Configurator/UpdateService.cpp
         Configurator/PageHome.cpp
-        Configurator/PageAudio.cpp
+        Configurator/PageOutput.cpp
         Configurator/PageSound.cpp
         Configurator/PagePerformance.cpp
         Configurator/PageMidi.cpp
