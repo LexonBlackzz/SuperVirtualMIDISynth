@@ -2,13 +2,14 @@
 #include "PageLiveRecording.h"
 #include "PlatformUtil.h"
 
-#include "Theme.h"
-#include "Widgets.h"
+#include "Anim.h"
+#include "ModernWidgets.h"
 #include "SVMSBuildInfo.h"
 #include "DriverLink.h"
 #include "imgui.h"
 
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -78,7 +79,7 @@ void LiveRecordingPage::EnsureDefaultPath() {
                                 SHGFP_TYPE_CURRENT, directory))) {
         GetCurrentDirectoryW(MAX_PATH, directory);
     }
-    lastDirectory_ = directory;
+    if (lastDirectory_.empty()) lastDirectory_ = directory;
     SYSTEMTIME time{};
     GetLocalTime(&time);
     wchar_t name[96]{};
@@ -108,6 +109,7 @@ void LiveRecordingPage::Browse(HWND owner) {
                 OFN_OVERWRITEPROMPT;
     if (!GetSaveFileNameW(&ofn)) return;
     outputPath_ = buffer.data();
+    pathAutomatic_ = false;
     if (std::filesystem::path(outputPath_).extension().empty())
         outputPath_ += L".wav";
     lastDirectory_ = std::filesystem::path(outputPath_).parent_path().wstring();
@@ -190,85 +192,120 @@ void LiveRecordingPage::Draw(svms::RuntimeLinkClient* client,
         svms::build::CapabilityLiveRecording);
     if (supported) Query(*client, false);
     const bool recording = state_ == 1u || state_ == 2u || state_ == 4u;
+    const ui::Tokens& k = ui::Tok();
+    const float s = ui::Scale();
 
-    SectionHeader("LIVE WAV RECORDING");
-    ImGui::TextDisabled(
-        "Records the final post-reverb, post-limiter stereo output from the running driver. "
-        "The audio callback copies into an eight-second lock-free buffer; disk writes happen on a worker thread.");
-    ImGui::Spacing();
+    ui::BeginCard("##record", nullptr, nullptr, 0.0f, "record");
+    {
+        // The big morphing button: a ring around a circle that becomes a square.
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float d = 88.0f * s;
+        ImGui::PushID("##recbtn");
+        ImGui::InvisibleButton("##rec", ImVec2(d, d));
+        const bool hov = ImGui::IsItemHovered();
+        const bool down = ImGui::IsItemActive();
+        if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        const bool enabled = supported && (recording || !outputPath_.empty());
+        if (ImGui::IsItemClicked() && enabled && client) {
+            if (recording) {
+                Stop(*client);
+            } else {
+                if (pathAutomatic_ && framesWritten_ > 0u) {
+                    pathInitialized_ = false;
+                    EnsureDefaultPath();
+                }
+                Start(*client);
+            }
+        }
+        const ImGuiID id = ImGui::GetID("##rec");
+        const float press = AnimSpring(id, down ? 0.92f : (hov ? 1.05f : 1.0f));
+        const float on = AnimSpring(ImGui::GetID("##recon"), recording ? 1.0f : 0.0f);
+        const ImVec2 c(p.x + d * 0.5f, p.y + d * 0.5f);
+        const float rr = d * 0.5f * press;
+        const float onE = (std::max)(0.0f, (std::min)(1.0f, on));
+        dl->AddCircle(c, rr - 1.5f * s * press, ui::MixU32(k.line2, k.bad, onE), 48, 3.0f * s * press);
+        const float half = (18.0f - 4.0f * on) * s * press;
+        const float round = (18.0f - 12.0f * on) * s * press;
+        dl->AddRectFilled(ImVec2(c.x - half, c.y - half), ImVec2(c.x + half, c.y + half),
+                          enabled ? k.bad : ui::WithAlpha(k.bad, 0.4f), round);
+        if (recording && GetMotion() != Motion::Off) {
+            const float t = std::fmod(static_cast<float>(ImGui::GetTime()) / 1.6f, 1.0f);
+            const float e = EaseOut(t);
+            dl->AddCircle(c, rr + 8.0f * s + e * 14.0f * s, ui::WithAlpha(k.bad, 0.8f * (1.0f - e)), 48, 2.0f * s);
+        }
+        ImGui::PopID();
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, GetPanelBg());
-    ImGui::BeginChild("##live_record_path", ImVec2(0.0f, 92.0f),
-                      ImGuiChildFlags_Borders |
-                      ImGuiChildFlags_AlwaysUseWindowPadding);
-    ImGui::TextDisabled("OUTPUT WAV");
+        // Timer and status to the right of the button.
+        const float tx = p.x + d + 26.0f * s;
+        const uint64_t secs = sampleRate_ == 0u ? 0u : framesWritten_ / sampleRate_;
+        char timer[24];
+        if (secs >= 3600u)
+            std::snprintf(timer, sizeof(timer), "%02llu:%02llu:%02llu", static_cast<unsigned long long>(secs / 3600u),
+                          static_cast<unsigned long long>((secs / 60u) % 60u), static_cast<unsigned long long>(secs % 60u));
+        else
+            std::snprintf(timer, sizeof(timer), "%02llu:%02llu", static_cast<unsigned long long>(secs / 60u),
+                          static_cast<unsigned long long>(secs % 60u));
+        ui::PushNum(44.0f);
+        const float th = ImGui::GetTextLineHeight();
+        ui::PopFont();
+        ui::PushText(0, 13.0f);
+        const float sh = ImGui::GetTextLineHeight();
+        ui::PopFont();
+        const float y0 = p.y + (d - th - sh - 4.0f * s) * 0.5f;
+        ui::PushNum(44.0f);
+        dl->AddText(ImVec2(tx, y0), k.text, timer);
+        ui::PopFont();
+        const char* status;
+        ImU32 statusColor = k.muted;
+        if (!connected) status = "Start playing something in a MIDI app first.";
+        else if (!supported) status = "The connected driver does not support live recording.";
+        else if (statusError_) { status = status_.c_str(); statusColor = k.bad; }
+        else if (recording) { status = "Recording\xE2\x80\xA6"; statusColor = k.bad; }
+        else if (framesWritten_ > 0u) status = "Saved. Press again for a new file.";
+        else status = "Ready.";
+        ui::PushText(0, 13.0f);
+        dl->AddText(ImVec2(tx, y0 + th + 4.0f * s), statusColor, status);
+        ui::PopFont();
+        ImGui::Dummy(ImVec2(1.0f, 0.0f));
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + d));
+        ImGui::Dummy(ImVec2(1.0f, 0.0f));
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 14.0f * s));
     const std::string path = WideToUtf8(outputPath_);
-    ImGui::TextWrapped("%s", path.empty() ? "No output selected" : path.c_str());
-    ImGui::BeginDisabled(recording);
-    if (ImGui::Button("Browse...", ImVec2(110.0f, 28.0f))) Browse(owner);
-    ImGui::EndDisabled();
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
+    ui::BeginRow("recordPath", "Save to", path.empty() ? "No output selected" : path.c_str(),
+                 ui::ButtonSize("Change\xE2\x80\xA6"));
+    if (ui::Button("Change\xE2\x80\xA6", ui::ButtonKind::Normal, ImVec2(0, 0), !recording)) Browse(owner);
+    ui::EndRow();
 
-    ImGui::Spacing();
-    ImGui::BeginDisabled(!supported || recording || outputPath_.empty());
-    ImGui::PushStyleColor(ImGuiCol_Button, GetAccentDim());
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GetAccentHover());
-    if (ImGui::Button("Start Recording", ImVec2(150.0f, 32.0f)) && client)
-        Start(*client);
-    ImGui::PopStyleColor(2);
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!supported || !recording);
-    if (ImGui::Button("Stop && Finalize", ImVec2(150.0f, 32.0f)) && client)
-        Stop(*client);
-    ImGui::EndDisabled();
+    char size[32], dropped[24], rate[24];
+    std::snprintf(size, sizeof(size), "%s", FormatBytes(framesWritten_ * 8u).c_str());
+    std::snprintf(dropped, sizeof(dropped), "%llu", static_cast<unsigned long long>(droppedFrames_));
+    if (sampleRate_) std::snprintf(rate, sizeof(rate), "%g kHz", sampleRate_ / 1000.0);
+    else std::snprintf(rate, sizeof(rate), "\xE2\x80\x94");
+    const char* labels[4] = {"File size", "Dropped frames", "Format", "Rate"};
+    const char* values[4] = {size, dropped, "32-bit float", rate};
+    ui::StatGrid(labels, values, 4);
 
-    if (!connected) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("No running V3 driver is connected.");
-    } else if (!supported) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("The connected driver does not support live recording.");
-    }
-
-    ImGui::Spacing();
-    SectionHeader("RECORDING STATUS");
-    if (ImGui::BeginTable("##live_record_metrics", 4,
-                          ImGuiTableFlags_SizingStretchSame |
-                          ImGuiTableFlags_BordersInnerV |
-                          ImGuiTableFlags_RowBg)) {
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("STATE");
-        ImGui::TextUnformatted(StateLabel(state_));
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("DURATION");
-        ImGui::TextUnformatted(FormatDuration(framesWritten_, sampleRate_).c_str());
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("FILE AUDIO");
-        ImGui::TextUnformatted(FormatBytes(framesWritten_ * 8u).c_str());
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("DROPPED FRAMES");
-        ImGui::Text("%llu", static_cast<unsigned long long>(droppedFrames_));
-        ImGui::EndTable();
-    }
-
-    ImGui::Spacing();
-    ImVec4 color = statusError_ ? GetError() :
-        (recording ? GetAccent() : GetMutedText());
-    ImGui::PushStyleColor(ImGuiCol_Text, color);
-    ImGui::TextWrapped("%s", status_.c_str());
-    ImGui::PopStyleColor();
     if (droppedFrames_ != 0u) {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
-        ImGui::TextWrapped(
-            "The disk writer fell behind. Playback stayed real-time, but the WAV has missing frames.");
+        ImGui::Dummy(ImVec2(0.0f, 12.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        ui::PushText(0, 13.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, k.exp);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted("The disk writer fell behind. Playback stayed real-time, but the WAV has missing frames.");
+        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
+        ui::PopFont();
     }
     if (errorCode_ != 0u) {
-        ImGui::TextDisabled("Recorder error code: %u", errorCode_);
+        ui::PushText(0, 13.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+        ImGui::Text("Recorder error code: %u", errorCode_);
+        ImGui::PopStyleColor();
+        ui::PopFont();
     }
+    ui::EndCard();
 }
 
 } // namespace svms::cfg

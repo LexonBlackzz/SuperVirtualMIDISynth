@@ -26,6 +26,7 @@ private:
     std::wstring outputPath_;
     std::wstring lastDirectory_;
     bool pathInitialized_ = false;
+    bool pathAutomatic_ = true;
     uint32_t state_ = 0u;
     uint32_t sampleRate_ = 0u;
     uint64_t framesWritten_ = 0u;
