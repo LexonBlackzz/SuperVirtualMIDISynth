@@ -86,6 +86,7 @@ private:
 
     NavPage page_ = NavPage::Home;
     bool pageEntered_ = true;
+    bool tourChecked_ = false;
     char search_[128] = {};
     bool searchActive_ = false;
     bool resultsHovered_ = false;

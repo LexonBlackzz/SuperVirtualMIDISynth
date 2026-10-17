@@ -6,6 +6,7 @@
 #include "PlatformUtil.h"
 #include "SVMSBuildInfo.h"
 #include "Theme.h"
+#include "Tour.h"
 #include "UpdateService.h"
 #include "Widgets.h"
 #include "imgui.h"
@@ -429,7 +430,7 @@ void LookCard(ConfigDocument&) {
         const float bw = ui::ButtonSize("Replay now").x;
         ui::BeginRow("tour", "Welcome tour", "Show the short introduction when the configurator opens.",
                      ImVec2(bw + 10.0f * s + 46.0f * s, 38.0f * s));
-        ui::Button("Replay now", ui::ButtonKind::Normal, ImVec2(0, 0), false);
+        if (ui::Button("Replay now")) tour::Start();
         ImGui::SameLine(0.0f, 10.0f * s);
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5.0f * s);
         if (ui::Toggle("##tour", &theme.tourAtStart)) ThemeChanged();

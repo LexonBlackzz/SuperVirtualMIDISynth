@@ -359,6 +359,7 @@ if(NOT WIN32)
                 Configurator/PageEffects.cpp
                 Configurator/PageDiagnostics.cpp
                 Configurator/PageSettings.cpp
+                Configurator/Tour.cpp
                 Configurator/PageDriverFeatures.cpp
                 SVMSControlServer.cpp
                 ${IMGUI_DIR}/imgui.cpp
@@ -974,6 +975,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/PageEffects.cpp
         Configurator/PageDiagnostics.cpp
         Configurator/PageSettings.cpp
+        Configurator/Tour.cpp
     )
     add_executable(svms_v3_configurator WIN32
         ${IMGUI_SOURCES}

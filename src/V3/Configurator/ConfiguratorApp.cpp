@@ -3,6 +3,7 @@
 #include "Theme.h"
 #include "Widgets.h"
 #include "ModernWidgets.h"
+#include "Tour.h"
 #include "Anim.h"
 #include "GeistFonts.h"
 
@@ -446,7 +447,7 @@ void ConfiguratorApp::RenderFrame() {
 
     // Esc is "back to Home" unless something is being edited or a menu is open.
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !searchEscaped_ && !ImGui::IsAnyItemActive() &&
-        !ImGui::GetIO().WantTextInput &&
+        !ImGui::GetIO().WantTextInput && !tour::Active() &&
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
         Navigate(NavPage::Home);
     }
@@ -459,6 +460,11 @@ void ConfiguratorApp::RenderFrame() {
     DrawSaveBar(areaMin, areaMax);
     ShowMegaFuckerNotification(easterEggs_, &showMegaFuckerPopup_);
     DrawToastOverlay(areaMin, areaMax);
+    if (!tourChecked_) {
+        tourChecked_ = true;
+        if (GetThemeSettings().tourAtStart) tour::Start();
+    }
+    tour::Draw(*this);
 
     ImGui::Render();
     const ImVec4 clear = GetThemeSettings().background;
@@ -634,6 +640,7 @@ void ConfiguratorApp::DrawTopBar() {
     const float meterW = (std::min)(150.0f * s, (meterAvail - 2.0f * meterGap) / 3.0f);
     if (meterW < 60.0f * s) return;
     float mx = masterX - meterGap - (3.0f * meterW + 2.0f * meterGap);
+    tour::Register("t-meters", ImVec2(mx - 10.0f * s, 8.0f * s), ImVec2(mx + 3.0f * meterW + 2.0f * meterGap + 10.0f * s, H - 8.0f * s));
     const bool tel = rlConnected_;
     const float dt = ImGui::GetIO().DeltaTime;
     auto follow = [&](float& v, float target) {
@@ -729,6 +736,7 @@ void ConfiguratorApp::DrawSidebar() {
         searchActive_ = ImGui::IsItemActive();
         searchMin_ = ImGui::GetItemRectMin();
         searchMax_ = ImGui::GetItemRectMax();
+        tour::Register("t-search", searchMin_, searchMax_);
         if ((searchActive_ || ImGui::IsItemDeactivated()) && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             search_[0] = '\0';
             searchEscaped_ = true;   // Esc here clears the search, not the page
@@ -826,10 +834,12 @@ void ConfiguratorApp::DrawSidebar() {
                     ui::WithAlpha(k.accLine, indAlpha), r);
     }
 
+    tour::Register("t-nav", ImVec2(x0, y), ImVec2(x0 + innerW, y + step * static_cast<float>(std::size(kNavMain)) - (step - itemH)));
     for (const NavItem& item : kNavMain) {
         drawItem(item, y);
         y += step;
     }
+    const float toolsTop = y;
     ui::PushText(0, 11.0f);
     const char* tools = "TOOLS";
     dl->AddText(ImVec2(x0 + 12.0f * s, y + groupH - 6.0f * s - ImGui::GetTextLineHeight()), k.muted, tools);
@@ -839,6 +849,7 @@ void ConfiguratorApp::DrawSidebar() {
         drawItem(item, y);
         y += step;
     }
+    tour::Register("t-tools", ImVec2(x0, toolsTop), ImVec2(x0 + innerW, y - (step - itemH)));
     // Settings, pinned to the bottom.
     const float settingsY = (std::max)(y + 8.0f * s, H - 14.0f * s - itemH);
     if (page_ == NavPage::Settings) {
@@ -847,6 +858,7 @@ void ConfiguratorApp::DrawSidebar() {
         dl->AddRect(ImVec2(x0, settingsY), ImVec2(x0 + innerW, settingsY + itemH), k.accLine, r);
     }
     drawItem(kNavSettings, settingsY);
+    tour::Register("t-settings", ImVec2(x0, settingsY), ImVec2(x0 + innerW, settingsY + itemH));
 }
 
 void ConfiguratorApp::DrawSearchResults() {

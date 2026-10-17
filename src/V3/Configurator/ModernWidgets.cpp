@@ -1,4 +1,5 @@
 #include "ModernWidgets.h"
+#include "Tour.h"
 
 #include "Anim.h"
 #include "SettingsRegistry.h"
@@ -454,7 +455,9 @@ const char* FlashTarget() { return FlashLive() ? g_flashAnchor.c_str() : ""; }
 void SetScrollHost() { g_scrollHost = ImGui::GetCurrentWindow(); }
 
 void Anchor(const char* anchor, ImVec2 min, ImVec2 max) {
-    if (!anchor || !FlashLive() || g_flashAnchor != anchor) return;
+    if (!anchor) return;
+    tour::Register(anchor, min, max);
+    if (!FlashLive() || g_flashAnchor != anchor) return;
     MatchFlash(min, max);
 }
 
