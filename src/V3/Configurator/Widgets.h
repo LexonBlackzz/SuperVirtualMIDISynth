@@ -101,13 +101,6 @@ void DrawLedLadder(ImDrawList* dl, ImVec2 pos, ImVec2 size, float value,
 // Settings label with the first sentence of `help` as a dim description line
 // (clipped to the column); the full text shows on hover.
 void SettingLabel(const char* label, const char* help);
-// SectionHeader opens a rack panel (closing the previous one) while the page
-// is drawn between these two calls. Pages that never call SectionHeader, or
-// call it from a nested window, are unaffected.
-void BeginAutoPanels();
-void EndAutoPanels();
-
-void SectionHeader(const char* label);
 void HelpMarker(const char* desc);
 bool ToggleSwitch(const char* label, bool* value, const char* tooltip = nullptr);
 bool LabeledFloat(const char* label, float* value, float min, float max,
@@ -161,10 +154,6 @@ void AppliedStateBadge(bool connected,
                        const char* scopeTooltip = nullptr);
 bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,
                         const ConfigValues& working);
-
-void DrawReverbVisualizer(ImDrawList* dl, ImVec2 center, float radius,
-                           float roomSize, float decay, float diffusion,
-                           float width, float modDepth, float time);
 
 bool BeginToastOverlay();
 void EndToastOverlay();

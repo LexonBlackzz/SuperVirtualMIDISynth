@@ -39,10 +39,6 @@ struct SettingDef {
     bool restart;
     // Working vs saved differ for this setting; nullptr = search-only entry.
     bool (*differs)(const ConfigValues& a, const ConfigValues& b);
-    // Phase 2 only: where the setting lives on the old pages mounted in the
-    // new shell (caption of its panel/control, and that page).
-    const char* legacyCaption;
-    NavPage legacyPage;
 };
 
 const SettingDef* AllSettings(size_t* count);

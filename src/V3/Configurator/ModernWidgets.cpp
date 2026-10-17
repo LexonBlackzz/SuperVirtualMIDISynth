@@ -91,7 +91,6 @@ void PopOffset() {
 // Flash ------------------------------------------------------------------------
 
 std::string g_flashAnchor;
-std::string g_flashLegacy;
 double g_flashStart = -10.0;
 bool g_flashPending = false;   // not yet scrolled into view
 int g_flashMatchFrame = -1;
@@ -444,9 +443,8 @@ void EndEntry() {
 
 // Flash ------------------------------------------------------------------------------
 
-void FlashAnchor(const char* anchor, const char* legacyCaption) {
+void FlashAnchor(const char* anchor) {
     g_flashAnchor = anchor ? anchor : "";
-    g_flashLegacy = legacyCaption ? legacyCaption : "";
     g_flashPending = true;
     g_flashStart = Now();
 }
@@ -457,11 +455,6 @@ void SetScrollHost() { g_scrollHost = ImGui::GetCurrentWindow(); }
 
 void Anchor(const char* anchor, ImVec2 min, ImVec2 max) {
     if (!anchor || !FlashLive() || g_flashAnchor != anchor) return;
-    MatchFlash(min, max);
-}
-
-void LegacyAnchor(const char* caption, ImVec2 min, ImVec2 max) {
-    if (!caption || g_flashLegacy.empty() || !FlashLive() || g_flashLegacy != caption) return;
     MatchFlash(min, max);
 }
 

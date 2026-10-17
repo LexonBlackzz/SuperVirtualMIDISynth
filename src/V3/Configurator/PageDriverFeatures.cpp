@@ -1,7 +1,6 @@
 #include "PageDriverFeatures.h"
 #include "DriverLink.h"
-#include "Theme.h"
-#include "Widgets.h"
+#include "ModernWidgets.h"
 #include "imgui.h"
 
 #include <cstdio>
@@ -17,10 +16,8 @@ void DrawDriverFeaturesPage(svms::RuntimeLinkClient* client) {
     }
     client->Poll();
 
-    SectionHeader("UNKNOWN BY THIS CONFIGURATOR VERSION");
-    ImGui::TextDisabled(
-        "The driver reports these controls, but this configurator has no dedicated page for them yet.");
-    ImGui::Spacing();
+    ui::BeginCard("##unknownparams", "Unknown by this configurator version",
+                  "The driver reports these controls, but this configurator has no dedicated page for them yet.");
 
     // Slider state while dragging: the driver echoes values back, which would
     // otherwise yank the handle to the previous value mid-drag.
@@ -75,8 +72,9 @@ void DrawDriverFeaturesPage(svms::RuntimeLinkClient* client) {
     if (shown == 0)
         ImGui::TextDisabled("Nothing: every control this driver offers has a page of its own.");
 
-    ImGui::Spacing();
-    SectionHeader("UNKNOWN METRICS");
+    ui::EndCard();
+
+    ui::BeginCard("##unknownmetrics", "Unknown metrics");
     int metrics = 0;
     for (const auto& metric : client->MetricSchema()) {
         if (svms::RuntimeLinkClient::IsKnownMetric(metric.id)) continue;
@@ -86,6 +84,7 @@ void DrawDriverFeaturesPage(svms::RuntimeLinkClient* client) {
         ImGui::TextDisabled("%.3f %s", client->MetricValue(metric.id), metric.unit.c_str());
     }
     if (metrics == 0) ImGui::TextDisabled("None.");
+    ui::EndCard();
 }
 
 } // namespace svms::cfg

@@ -175,7 +175,7 @@ void VelocityPointerCard() {
                  ui::ButtonSize("Go to Velocity"));
     if (ui::Button("Go to Velocity")) {
         if (ConfiguratorApp* app = GetLiveLinkContext().app) app->Navigate(NavPage::Sound);
-        ui::FlashAnchor("velIgnore", nullptr);
+        ui::FlashAnchor("velIgnore");
     }
     ui::EndRow();
     (void)s;

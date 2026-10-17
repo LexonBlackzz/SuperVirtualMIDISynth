@@ -98,32 +98,6 @@ void DrawLed(ImDrawList* dl, ImVec2 c, float r, bool on, const ImVec4* color) {
     dl->AddCircle(c, r, ImGui::GetColorU32(GetKeyEdge()), 16, 1.0f);
 }
 
-static void PlainSectionHeader(const char* label) {
-    ImGui::Spacing();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    PushMono();
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float h = ImGui::GetTextLineHeight();
-    DrawLed(dl, ImVec2(p.x + 5.0f, p.y + h * 0.5f), 3.0f, true);
-    dl->AddText(ImVec2(p.x + 16.0f, p.y),
-                ImGui::GetColorU32(GetMutedText()), label);
-    const float tw = ImGui::CalcTextSize(label).x;
-    const float x0 = p.x + 16.0f + tw + 10.0f;
-    const float x1 = p.x + ImGui::GetContentRegionAvail().x;
-    if (x1 > x0) {
-        dl->AddLine(ImVec2(x0, p.y + h * 0.5f), ImVec2(x1, p.y + h * 0.5f),
-                    ImGui::GetColorU32(GetPanelEdge()), 1.0f);
-    }
-    ImGui::Dummy(ImVec2(0.0f, h));
-    PopMono();
-    ImGui::Spacing();
-}
-
-// Titles of the open rack panels, for the search flash on legacy pages.
-static constexpr int kMaxPanelDepth = 8;
-static const char* g_panelTitles[kMaxPanelDepth] = {};
-static int g_panelDepth = 0;
-
 bool BeginRackPanel(const char* title) {
     const ThemeSettings& t = GetThemeSettings();
     ui::BeginEntry();
@@ -150,8 +124,6 @@ bool BeginRackPanel(const char* title) {
     const float titleH = ImGui::GetTextLineHeight();
     PopMono();
     ImGui::SetCursorPosY(8.0f + titleH + 6.0f);
-    g_panelTitles[g_panelDepth < kMaxPanelDepth ? g_panelDepth : kMaxPanelDepth - 1] = title;
-    ++g_panelDepth;
     return open;
 }
 
@@ -173,42 +145,8 @@ void EndRackPanel() {
         }
     }
     ImGui::EndChild();
-    if (g_panelDepth > 0) --g_panelDepth;
-    const char* title = g_panelTitles[g_panelDepth < kMaxPanelDepth ? g_panelDepth : kMaxPanelDepth - 1];
-    ui::LegacyAnchor(title, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     ui::EndEntry();
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
-}
-
-static ImGuiWindow* g_pageWindow = nullptr;
-static ImGuiWindow* g_autoPanelWindow = nullptr;
-
-void BeginAutoPanels() {
-    g_pageWindow = ImGui::GetCurrentWindow();
-    g_autoPanelWindow = nullptr;
-}
-
-void EndAutoPanels() {
-    if (g_autoPanelWindow && ImGui::GetCurrentWindow() == g_autoPanelWindow) {
-        EndRackPanel();
-    }
-    g_autoPanelWindow = nullptr;
-    g_pageWindow = nullptr;
-}
-
-void SectionHeader(const char* label) {
-    ImGuiWindow* cur = ImGui::GetCurrentWindow();
-    if (g_autoPanelWindow && cur == g_autoPanelWindow) {
-        EndRackPanel();
-        g_autoPanelWindow = nullptr;
-        cur = ImGui::GetCurrentWindow();
-    }
-    if (g_pageWindow && cur == g_pageWindow && ImGui::GetCurrentTable() == nullptr) {
-        BeginRackPanel(label);
-        g_autoPanelWindow = ImGui::GetCurrentWindow();
-        return;
-    }
-    PlainSectionHeader(label);
 }
 
 void SettingLabel(const char* label, const char* help) {
@@ -363,7 +301,6 @@ void PanelCaption(const char* caption, const char* help, bool restart) {
     ImGui::TextUnformatted(caption);
     ImGui::PopStyleColor();
     const bool hovered = ImGui::IsItemHovered();
-    ui::LegacyAnchor(caption, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     PopLabel();
     if (restart) {
         ImGui::SameLine(0.0f, 8.0f);
@@ -406,7 +343,6 @@ bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
     KnobState ks = {*value, minValue, maxValue, defaultValue,
                     label, nullptr, size, 1.0f, displayFn, inverseFn};
     const bool changed = RotaryKnob(ks, format);
-    ui::LegacyAnchor(label, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (changed) *value = ks.value;
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
@@ -549,7 +485,6 @@ bool ToggleSwitch(const char* label, bool* value, const char* tooltip) {
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4.0f);
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (h - ImGui::GetTextLineHeight()) * 0.5f);
     ImGui::TextUnformatted(label);
-    ui::LegacyAnchor(label, pos, ImGui::GetItemRectMax());
 
     if (tooltip && ImGui::IsItemHovered()) {
         ImGui::BeginTooltip();
@@ -1065,54 +1000,6 @@ void DrawGainReductionMeter(const char* /*id*/, float gr,
     PopMono();
 
     ImGui::Dummy(ImVec2(size.x + 34.0f, size.y + 18.0f));
-}
-
-void DrawReverbVisualizer(ImDrawList* dl, ImVec2 center, float radius,
-                           float roomSize, float decay, float diffusion,
-                           float width, float modDepth, float time) {
-    int ringCount = 6 + static_cast<int>(roomSize * 10.0f);
-    if (ringCount > 18) ringCount = 18;
-
-    for (int i = 0; i < ringCount; ++i) {
-        float t = static_cast<float>(i) / ringCount;
-        float r = radius * (0.15f + t * 0.85f) * roomSize;
-        float alpha = (1.0f - t * 0.7f) * decay;
-        float wobble = std::sin(time * 1.5f + i * 0.7f) * modDepth * 4.0f * t;
-
-        ImVec4 ring = GetAccent();
-        ring.w = alpha * 0.35f;
-        ImU32 col = ImGui::GetColorU32(ring);
-
-        int segments = 32;
-        for (int j = 0; j < segments; ++j) {
-            float a0 = (static_cast<float>(j) / segments) * 6.28318f;
-            float a1 = (static_cast<float>(j + 1) / segments) * 6.28318f;
-
-            float spread = 1.0f + std::sin(a0 * 2.0f) * (1.0f - diffusion) * 0.3f;
-            float spread2 = 1.0f + std::sin(a1 * 2.0f) * (1.0f - diffusion) * 0.3f;
-
-            float xw = width;
-            ImVec2 p0(center.x + std::cos(a0) * r * spread * xw + wobble,
-                      center.y + std::sin(a0) * r * spread + wobble * 0.5f);
-            ImVec2 p1(center.x + std::cos(a1) * r * spread2 * xw + wobble * 0.8f,
-                      center.y + std::sin(a1) * r * spread2 + wobble * 0.3f);
-            dl->AddLine(p0, p1, col, 1.0f);
-        }
-    }
-
-    int cloudPoints = static_cast<int>(diffusion * 60.0f) + 10;
-    for (int i = 0; i < cloudPoints; ++i) {
-        float angle = static_cast<float>(i) / cloudPoints * 6.28318f;
-        float dist = radius * (0.1f + fmodf(static_cast<float>(i * 7 + 3),
-                                             17.0f) / 17.0f * 0.6f * roomSize);
-        float modOffset = std::sin(time * 0.8f + angle * 3.0f) * modDepth * dist * 0.15f;
-        ImVec2 pt(center.x + std::cos(angle) * (dist + modOffset) * width,
-                  center.y + std::sin(angle) * (dist + modOffset));
-        ImVec4 dot = GetAccent();
-        dot.w = 0.15f + decay * 0.15f;
-        ImU32 dotCol = ImGui::GetColorU32(dot);
-        dl->AddCircleFilled(pt, 1.5f, dotCol, 6);
-    }
 }
 
 bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,

@@ -66,15 +66,12 @@ void EndEntry();
 // --- Search flash anchors ----------------------------------------------------
 // Set by the search jump. The item registering this anchor scrolls itself to
 // the centre once and flashes (accent outline + glow fading over 1.8 s).
-void FlashAnchor(const char* anchor, const char* legacyCaption);
+void FlashAnchor(const char* anchor);
 const char* FlashTarget();
 // The page's scrolling child calls this so jumps centre rows inside it.
 void SetScrollHost();
 // Rows and cards call this with their anchor id and rect.
 void Anchor(const char* anchor, ImVec2 min, ImVec2 max);
-// Temporary (Phase 2): the old pages' panels and captions register here by
-// caption so search jumps still land on them.
-void LegacyAnchor(const char* caption, ImVec2 min, ImVec2 max);
 
 // --- Containers --------------------------------------------------------------
 // Card: 14 px radius, padding 22x24. `anchor` (optional) makes the card a

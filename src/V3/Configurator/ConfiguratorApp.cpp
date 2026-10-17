@@ -326,12 +326,11 @@ void ConfiguratorApp::Navigate(NavPage page) {
 }
 
 void ConfiguratorApp::JumpTo(const SettingDef& def) {
-    // Phase 2: settings still live on the old pages mounted in the new nav.
-    Navigate(def.legacyPage);
+    Navigate(def.page);
     pageEntered_ = true;
     if (def.disclosure) ui::DisclosureState(def.disclosure) = true;
     if (def.fxPanel) effectsPanel_ = def.fxPanel;
-    ui::FlashAnchor(def.id, def.legacyCaption);
+    ui::FlashAnchor(def.id);
     search_[0] = '\0';
     searchActive_ = false;
     resultsHovered_ = false;
@@ -1028,12 +1027,9 @@ void ConfiguratorApp::DrawPageContent() {
     lc.connected = liveSupported;
     SetLiveLinkContext(lc);
 
-    // Phase 2: the old pages mounted in the new navigation until each page
-    // is rewritten.
     if (const int added = HandleDroppedSoundFonts(config_)) {
         ShowToast(added == 1 ? "Added 1 SoundFont" : "Added " + std::to_string(added) + " SoundFonts");
     }
-    BeginAutoPanels();
     switch (page_) {
     case NavPage::Home:        DrawHomePage(config_); break;
     case NavPage::Sound:       DrawSoundPage(config_); break;
@@ -1062,7 +1058,6 @@ void ConfiguratorApp::DrawPageContent() {
     default:
         break;
     }
-    EndAutoPanels();
 }
 
 void ConfiguratorApp::DrawToastOverlay(ImVec2 areaMin, ImVec2 areaMax) {
