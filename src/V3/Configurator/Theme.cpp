@@ -209,6 +209,17 @@ bool LoadThemeFile(const fs::path& path,
             t.style = (std::max)(0, (std::min)(1, root["style"].get<int>()));
         if (root.contains("motion") && root["motion"].is_number_integer())
             t.motion = (std::max)(0, (std::min)(2, root["motion"].get<int>()));
+        if (root.contains("fire") && root["fire"].is_boolean())
+            t.fire = root["fire"].get<bool>();
+        if (root.contains("tour_at_start") && root["tour_at_start"].is_boolean())
+            t.tourAtStart = root["tour_at_start"].get<bool>();
+        if (root.contains("custom_accent")) {
+            ImVec4 parsed = t.customAccent;
+            if (ParseColor(root["custom_accent"], parsed)) {
+                t.customAccent = parsed;
+                t.hasCustomAccent = true;
+            }
+        }
         // Style 1 used to be Refined ("Boring"); it now means Modern. Files
         // from before 0.11 land on Modern once, whatever they said.
         const int uiVersion = root.contains("ui_version") && root["ui_version"].is_number_integer()
@@ -250,6 +261,9 @@ nlohmann::json ThemeToJson(const ThemeSettings& t) {
         {"density", t.density},
         {"style", t.style},
         {"motion", t.motion},
+        {"fire", t.fire},
+        {"tour_at_start", t.tourAtStart},
+        {"custom_accent", t.hasCustomAccent ? ColorToHex(t.customAccent) : std::string()},
     };
 }
 

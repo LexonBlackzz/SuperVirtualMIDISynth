@@ -30,6 +30,12 @@ struct ThemeSettings {
     int style = 1;
     // Motion level: 0 Full, 1 Calm, 2 Off (see Anim.h).
     int motion = 0;
+    // Settings > Look. The load meter fire (session 4) and the welcome tour read these.
+    bool fire = true;
+    bool tourAtStart = true;
+    // The last colour picked with the Custom swatch, kept while a preset is active.
+    bool hasCustomAccent = false;
+    ImVec4 customAccent = ImVec4(1.0f, 0.698f, 0.243f, 1.0f);
 };
 
 inline constexpr int kStyleRack = 0;

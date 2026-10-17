@@ -20,8 +20,7 @@
 #include "PageLiveRecording.h"
 #include "PageEffects.h"
 #include "PageDiagnostics.h"
-#include "PageAdvanced.h"
-#include "PageAbout.h"
+#include "PageSettings.h"
 #ifndef _WIN32
 #include "PageDriverFeatures.h"
 #endif
@@ -1053,8 +1052,7 @@ void ConfiguratorApp::DrawPageContent() {
         break;
     case NavPage::Diagnostics: DrawDiagnosticsPage(config_); break;
     case NavPage::Settings:
-        DrawAdvancedPage(config_);
-        DrawAboutPage(config_, updateService_);
+        DrawSettingsPage(config_, updateService_);
         break;
     case NavPage::DriverFeatures:
 #ifndef _WIN32
