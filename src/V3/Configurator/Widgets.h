@@ -36,6 +36,9 @@ void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs);
 // Pages that send a RuntimeLink command directly call this for the top bar's
 // "Applied live" chip.
 void NoteLiveChange();
+// Sends one RuntimeLink command with a plain integer parameter (the live pushes
+// that are not part of the coalesced working state). No-op when offline.
+void SendLiveCommand(svms::RLCommandType type, uint32_t param);
 
 // --- Rack-style primitives -------------------------------------------------
 // Panel labels: mono caps as authored.

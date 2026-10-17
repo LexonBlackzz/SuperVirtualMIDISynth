@@ -349,7 +349,7 @@ if(NOT WIN32)
                 Configurator/SettingsRegistry.cpp
                 Configurator/EasterEggs.cpp
                 Configurator/UpdateService.cpp
-                Configurator/PageOverview.cpp
+                Configurator/PageHome.cpp
                 Configurator/PageAudio.cpp
                 Configurator/PagePerformance.cpp
                 Configurator/PageMidi.cpp
@@ -966,7 +966,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/WasapiDevices.cpp
         Configurator/EasterEggs.cpp
         Configurator/UpdateService.cpp
-        Configurator/PageOverview.cpp
+        Configurator/PageHome.cpp
         Configurator/PageAudio.cpp
         Configurator/PagePerformance.cpp
         Configurator/PageMidi.cpp

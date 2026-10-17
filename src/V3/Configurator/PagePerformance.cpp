@@ -4,6 +4,7 @@
 #include "Theme.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
+#include "ModernWidgets.h"
 #include "DriverLink.h"
 
 #include <algorithm>
@@ -97,6 +98,64 @@ void BudgetMetric(const char* label, const char* format, ...) {
 uint32_t DecimationParam(const ConfigValues& w) {
     const uint32_t mode = w.decimation ? (w.decimationByLevel ? 2u : 1u) : 0u;
     return mode | ((w.decimationCullBlocks & 0xFFu) << 8);
+}
+
+namespace {
+struct ProfileDef {
+    bool decim, fastTail, stealReject, coalesce, reexcite, ccCol, bendCol, omni, unbounded;
+};
+// Accurate: everything off. Balanced: only CC collapse. Extreme: decimation
+// (by level), fast tail math, steal reject, coalescing, CC and bend collapse;
+// block timing, never-skip-ahead and re-excite stay out.
+const ProfileDef kProfiles[3] = {
+    {false, false, false, false, false, false, false, false, false},
+    {false, false, false, false, false, true, false, false, false},
+    {true, true, true, true, false, true, true, false, false},
+};
+} // namespace
+
+int MatchPerformanceProfile(const ConfigValues& w) {
+    for (int i = 0; i < 3; ++i) {
+        const ProfileDef& p = kProfiles[i];
+        const bool coalesce = w.noteOnCollapseThreshold > 1u;
+        if (w.decimation == p.decim && (!p.decim || w.decimationByLevel) &&
+            w.fastChunkMath == p.fastTail && w.stealReject == p.stealReject &&
+            coalesce == p.coalesce && w.noteOnReexcite == p.reexcite &&
+            w.ccCollapse == p.ccCol && w.bendCollapse == p.bendCol &&
+            w.blockTiming == p.omni && w.unboundedRender == p.unbounded)
+            return i;
+    }
+    return -1;
+}
+
+void ApplyPerformanceProfile(ConfigDocument& doc, int profile) {
+    if (profile < 0 || profile > 2) return;
+    ConfigValues& w = doc.Working();
+    const ConfigValues before = w;
+    const ProfileDef& p = kProfiles[profile];
+    w.decimation = p.decim;
+    w.decimationByLevel = true;
+    w.fastChunkMath = p.fastTail;
+    w.stealReject = p.stealReject;
+    w.noteOnCollapseThreshold = p.coalesce ? (before.noteOnCollapseThreshold > 1u ? before.noteOnCollapseThreshold : 32u) : 1u;
+    w.noteOnReexcite = p.reexcite;
+    w.ccCollapse = p.ccCol;
+    w.bendCollapse = p.bendCol;
+    w.blockTiming = p.omni;
+    w.unboundedRender = p.unbounded;
+    doc.MarkDirty();
+    using C = svms::RLCommandType;
+    if (w.decimation != before.decimation || w.decimationByLevel != before.decimationByLevel)
+        SendLiveCommand(C::SetDecimation, DecimationParam(w));
+    if (w.fastChunkMath != before.fastChunkMath) SendLiveCommand(C::SetFastChunkMath, w.fastChunkMath ? 1u : 0u);
+    if (w.stealReject != before.stealReject) SendLiveCommand(C::SetStealReject, w.stealReject ? 1u : 0u);
+    if (w.noteOnCollapseThreshold != before.noteOnCollapseThreshold)
+        SendLiveCommand(C::SetNoteOnCollapse, w.noteOnCollapseThreshold);
+    if (w.noteOnReexcite != before.noteOnReexcite) SendLiveCommand(C::SetNoteOnReexcite, w.noteOnReexcite ? 1u : 0u);
+    if (w.ccCollapse != before.ccCollapse) SendLiveCommand(C::SetCcCollapse, w.ccCollapse ? 1u : 0u);
+    if (w.bendCollapse != before.bendCollapse) SendLiveCommand(C::SetBendCollapse, w.bendCollapse ? 1u : 0u);
+    if (w.blockTiming != before.blockTiming) SendLiveCommand(C::SetBlockTiming, w.blockTiming ? 1u : 0u);
+    if (w.unboundedRender != before.unboundedRender) SendLiveCommand(C::SetUnboundedRender, w.unboundedRender ? 1u : 0u);
 }
 
 void DrawPerformancePage(ConfigDocument& doc) {

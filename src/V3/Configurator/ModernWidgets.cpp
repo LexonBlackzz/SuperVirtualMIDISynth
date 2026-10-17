@@ -131,7 +131,14 @@ struct CardFrame {
     const char* anchor;
     bool headerPending;
     int rows;
+    float minHeight;   // px (scaled); 0 = none
+    float topY;        // cursor Y at the first line of content
 };
+float g_nextCardMinHeight = 0.0f;
+std::unordered_map<std::string, float> g_cardRowPrev;
+std::string g_cardRowId;
+float g_cardRowAccum = 0.0f;
+bool g_cardRowOn = false;
 std::vector<CardFrame> g_cards;
 
 struct RowFrame {
@@ -395,6 +402,21 @@ void StrokeIcon(ImDrawList* dl, const char* path, ImVec2 pos, float size, ImU32 
     flush(false);
 }
 
+ImU32 LoadColor(float c, ImU32 acc) {
+    if (c <= 100.0f) return acc;
+    if (c <= 200.0f) return MixU32(acc, Hex(0xFF3346), (c - 100.0f) / 100.0f);
+    if (c <= 350.0f) return MixU32(Hex(0xFF3346), Hex(0xFF8A1F), (c - 200.0f) / 150.0f);
+    if (c < 500.0f) return MixU32(Hex(0xFF8A1F), Hex(0x38F4FF), (c - 350.0f) / 150.0f);
+    return Hex(0x38F4FF);
+}
+
+float LoadGlow(float c) {
+    if (c <= 200.0f) return 0.0f;
+    if (c <= 350.0f) return (c - 200.0f) / 150.0f * 8.0f;
+    if (c < 500.0f) return 8.0f + (c - 350.0f) / 150.0f * 12.0f;
+    return 20.0f;
+}
+
 // Entry ----------------------------------------------------------------------------
 
 void PageEntered() { g_pageStart = Now(); }
@@ -447,7 +469,8 @@ void LegacyAnchor(const char* caption, ImVec2 min, ImVec2 max) {
 void BeginCard(const char* id, const char* title, const char* subtitle,
                float rightSlotW, const char* anchor) {
     const Tokens& k = g_tok;
-    g_cards.push_back({anchor, rightSlotW > 0.0f, 0});
+    g_cards.push_back({anchor, rightSlotW > 0.0f, 0, (std::max)(S(g_nextCardMinHeight), g_cardRowOn ? g_cardRowPrev[g_cardRowId] : 0.0f), 0.0f});
+    g_nextCardMinHeight = 0.0f;
     if (k.rack) {
         BeginRackPanel(title ? Caps(title) : id);
     } else {
@@ -464,6 +487,7 @@ void BeginCard(const char* id, const char* title, const char* subtitle,
         ImGui::PopStyleVar(3);
         ImGui::PopStyleColor(2);
     }
+    g_cards.back().topY = ImGui::GetCursorPosY();
     if (!title && !subtitle && rightSlotW <= 0.0f) return;
 
     const float x0 = ImGui::GetCursorPosX();
@@ -515,10 +539,30 @@ void CardHeaderEnd() {
                                bottom + S(14.0f) - ImGui::GetStyle().ItemSpacing.y));
 }
 
+void SetNextCardMinHeight(float px) { g_nextCardMinHeight = px; }
+
+void BeginCardRow(const char* id) {
+    g_cardRowId = id;
+    g_cardRowAccum = 0.0f;
+    g_cardRowOn = true;
+}
+
+void EndCardRow() {
+    g_cardRowPrev[g_cardRowId] = g_cardRowAccum;
+    g_cardRowOn = false;
+}
+
 void EndCard() {
     if (g_cards.empty()) return;
     const CardFrame card = g_cards.back();
     g_cards.pop_back();
+    if (!g_tok.rack) {
+        // Content height so far, plus the padding, against the minimum.
+        const float used = ImGui::GetCursorPosY() - card.topY + ImGui::GetCurrentWindow()->WindowPadding.y * 2.0f
+                           - ImGui::GetStyle().ItemSpacing.y;
+        if (g_cardRowOn) g_cardRowAccum = (std::max)(g_cardRowAccum, used);
+        if (card.minHeight > 0.0f && used < card.minHeight) ImGui::Dummy(ImVec2(1.0f, card.minHeight - used));
+    }
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
     if (g_tok.rack) {
@@ -543,7 +587,7 @@ static ImU32 ChipColor(ChipKind kind) {
     }
 }
 
-static ImVec2 ChipSize(const char* text) {
+ImVec2 ChipSize(const char* text) {
     PushText(1, 11.0f);
     const ImVec2 ts = ImGui::CalcTextSize(text);
     PopFont();
@@ -565,6 +609,13 @@ void Chip(const char* text, ChipKind kind) {
 }
 
 static const char* kRestartIcon = "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5";
+
+float RestartMarkWidth(bool withText) {
+    PushText(0, 11.0f);
+    const float w = S(12.0f) + (withText ? ImGui::CalcTextSize("Applies after restart").x + S(4.0f) : 0.0f);
+    PopFont();
+    return w;
+}
 
 void RestartMark(bool withText) {
     const char* label = "Applies after restart";
@@ -1121,6 +1172,33 @@ bool Field(const char* id, char* buf, size_t bufSize, float width, const char* h
     ImGui::SetNextItemWidth(width);
     const bool changed = ImGui::InputTextWithHint(id, hint ? hint : "", buf, bufSize);
     FocusRing();
+    PopFieldStyle();
+    PopFont();
+    return changed;
+}
+
+bool Select(const char* id, int* current, const char* const* items, int count, float width) {
+    PushText(0, 13.0f);
+    PushFieldStyle(S(38.0f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, g_tok.card2);
+    ImGui::PushStyleColor(ImGuiCol_Header, g_tok.accSoft);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, g_tok.card3);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, S(g_tok.rCtl));
+    ImGui::SetNextItemWidth(width);
+    bool changed = false;
+    const char* preview = *current >= 0 && *current < count ? items[*current] : "";
+    if (ImGui::BeginCombo(id, preview)) {
+        for (int i = 0; i < count; ++i) {
+            if (ImGui::Selectable(items[i], i == *current) && i != *current) {
+                *current = i;
+                changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    HandCursorIfHovered();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(3);
     PopFieldStyle();
     PopFont();
     return changed;

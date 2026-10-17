@@ -51,6 +51,9 @@ public:
     // Starts the top bar's "Applied live" chip (any live send).
     void NoteLiveChange();
     void Navigate(NavPage page);
+    // Name of the process using SVMS ("PID n" when it cannot be resolved).
+    std::string ConnectedAppName();
+    void ShowToast(const std::string& message, float seconds = 2.2f);
 
 private:
 
@@ -66,8 +69,6 @@ private:
     void HandleKeyboardShortcuts();
     void JumpTo(const SettingDef& def);
     void SaveConfig();
-    void ShowToast(const std::string& message, float seconds = 2.2f);
-    std::string ConnectedAppName();
 
     std::unique_ptr<Platform> platform_;
     bool running_ = false;

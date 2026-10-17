@@ -126,6 +126,10 @@ public:
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
+            if (event.type == SDL_DROPFILE && event.drop.file) {
+                DroppedFileQueue().push_back(event.drop.file);
+                SDL_free(event.drop.file);
+            }
             const bool closeRequested =
                 event.type == SDL_QUIT ||
                 (event.type == SDL_WINDOWEVENT &&

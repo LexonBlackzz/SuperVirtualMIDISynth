@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <shellscalingapi.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #include <d3d11.h>
 #include <dxgi.h>
 
@@ -244,6 +245,19 @@ private:
             }
             return 0;
         }
+        case WM_DROPFILES: {
+            HDROP drop = reinterpret_cast<HDROP>(wParam);
+            const UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, nullptr, 0);
+            for (UINT i = 0; i < count; ++i) {
+                wchar_t path[MAX_PATH * 2] = {};
+                if (!DragQueryFileW(drop, i, path, MAX_PATH * 2)) continue;
+                char utf8[MAX_PATH * 4] = {};
+                if (WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), nullptr, nullptr) > 0)
+                    DroppedFileQueue().push_back(utf8);
+            }
+            DragFinish(drop);
+            return 0;
+        }
         case WM_CLOSE: {
             Win32Platform* p = self(hWnd);
             if (p && p->hooks_.hasUnsavedChanges && p->hooks_.hasUnsavedChanges()) {
@@ -315,6 +329,7 @@ private:
             return false;
         }
 
+        DragAcceptFiles(hwnd_, TRUE);
         dpiScale_ = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
         ShowWindow(hwnd_, SW_SHOWDEFAULT);
         UpdateWindow(hwnd_);

@@ -11,7 +11,7 @@
 
 #include "PlatformUtil.h"  // HWND (opaque on Linux) for the page draw calls
 
-#include "PageOverview.h"
+#include "PageHome.h"
 #include "PageAudio.h"
 #include "PagePerformance.h"
 #include "PageMidi.h"
@@ -276,13 +276,7 @@ ImU32 HexU32(unsigned rgb) {
 
 // Render-load colour tiers: 0-100 accent, 100-200 to red, 200-350 to
 // orange, 350-500 to hot cyan, 500+ cyan (VISION §8).
-ImU32 LoadColor(float c, ImU32 acc) {
-    if (c <= 100.0f) return acc;
-    if (c <= 200.0f) return ui::MixU32(acc, HexU32(0xFF3346), (c - 100.0f) / 100.0f);
-    if (c <= 350.0f) return ui::MixU32(HexU32(0xFF3346), HexU32(0xFF8A1F), (c - 200.0f) / 150.0f);
-    if (c < 500.0f) return ui::MixU32(HexU32(0xFF8A1F), HexU32(0x38F4FF), (c - 350.0f) / 150.0f);
-    return HexU32(0x38F4FF);
-}
+ImU32 LoadColor(float c, ImU32 acc) { return ui::LoadColor(c, acc); }
 
 std::string WithCommas(uint32_t v) {
     std::string s = std::to_string(v);
@@ -1040,7 +1034,7 @@ void ConfiguratorApp::DrawPageContent() {
     // is rewritten.
     BeginAutoPanels();
     switch (page_) {
-    case NavPage::Home:        DrawOverviewPage(config_); break;
+    case NavPage::Home:        DrawHomePage(config_); break;
     case NavPage::Sound:       DrawAudioPage(config_, easterEggs_, AudioView::SoundFont); break;
     case NavPage::Effects:
         DrawReverbPage(config_);

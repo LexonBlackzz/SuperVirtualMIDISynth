@@ -56,6 +56,13 @@ void NoteLiveChange() {
     if (g_liveLink.app) g_liveLink.app->NoteLiveChange();
 }
 
+void SendLiveCommand(svms::RLCommandType type, uint32_t param) {
+    if (!g_liveLink.connected || !g_liveLink.client) return;
+    char result[svms::kRuntimeLinkResultTextCapacity]{};
+    g_liveLink.client->SendCommand(type, 0u, param, svms::RuntimeLiveStateV2{}, 100u, result);
+    NoteLiveChange();
+}
+
 static float g_toastTimer = 0.0f;
 static char g_toastText[512] = {};
 static bool g_toastActive = false;

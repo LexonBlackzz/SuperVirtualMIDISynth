@@ -14,6 +14,18 @@
 
 namespace svms::cfg {
 
+// Files dropped on the window (UTF-8 paths), queued by the platform layer and
+// drained by the page that wants them.
+inline std::vector<std::string>& DroppedFileQueue() {
+    static std::vector<std::string> queue;
+    return queue;
+}
+inline std::vector<std::string> TakeDroppedFiles() {
+    std::vector<std::string> out;
+    out.swap(DroppedFileQueue());
+    return out;
+}
+
 class Platform {
 public:
     struct Hooks {

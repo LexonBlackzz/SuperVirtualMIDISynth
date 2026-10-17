@@ -43,6 +43,10 @@ void SoftShadow(ImDrawList* dl, ImVec2 min, ImVec2 max, float rounding,
                 ImU32 color, float spread, int layers = 8);
 void Glow(ImDrawList* dl, ImVec2 center, float radius, ImU32 color,
           float spread, int layers = 8);
+// Render-load colour for a percent of the callback budget (one lap per 100%):
+// accent to red to orange to cyan, and the glow radius that goes with it.
+ImU32 LoadColor(float percent, ImU32 accent);
+float LoadGlow(float percent);
 // Dashed outline of a rounded rect.
 void DashedRect(ImDrawList* dl, ImVec2 min, ImVec2 max, float rounding,
                 ImU32 color, float dash = 5.0f, float gap = 4.0f);
@@ -80,6 +84,13 @@ void BeginCard(const char* id, const char* title = nullptr,
                const char* subtitle = nullptr, float rightSlotW = 0.0f,
                const char* anchor = nullptr);
 void CardHeaderEnd();
+// The next BeginCard is at least this tall (px, unscaled): tiles that sit in a
+// row stay equal without measuring each other.
+void SetNextCardMinHeight(float px);
+// Cards drawn between these (e.g. one table row) end up equally tall. The
+// height is measured on the previous frame, as the tile grid does.
+void BeginCardRow(const char* id);
+void EndCardRow();
 void EndCard();
 
 enum class ChipKind { Cpu, Bad, Ok, Exp, Acc };
@@ -88,8 +99,10 @@ struct ChipDef {
     ChipKind kind;
 };
 void Chip(const char* text, ChipKind kind);
+ImVec2 ChipSize(const char* text);
 // ↻ "Applies after restart" with a tooltip.
 void RestartMark(bool withText = true);
+float RestartMarkWidth(bool withText = true);
 
 // Setting row: title (+ chips, + ↻ when the registry says restart), a muted
 // one-line description, and a right-aligned control of `controlSize`.
@@ -137,6 +150,9 @@ ImVec2 ButtonSize(const char* label);
 // Two clicks: the first arms it ("Click again…", shake, disarms after 3 s).
 bool DangerButton(const char* id, const char* label, const char* armedLabel);
 
+// Dropdown styled like a field. Returns true when the selection changed.
+bool Select(const char* id, int* current, const char* const* items, int count,
+            float width);
 bool Field(const char* id, char* buf, size_t bufSize, float width,
            const char* hint = nullptr);
 bool NumberField(const char* id, int* value, int minValue, int maxValue,
