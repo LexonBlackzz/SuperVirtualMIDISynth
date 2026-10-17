@@ -460,17 +460,22 @@ void Anchor(const char* anchor, ImVec2 min, ImVec2 max) {
 
 // Cards ------------------------------------------------------------------------------
 
+static ImU32 g_nextCardBorder = 0;
+void SetNextCardBorder(ImU32 color) { g_nextCardBorder = color; }
+
 void BeginCard(const char* id, const char* title, const char* subtitle,
                float rightSlotW, const char* anchor) {
     const Tokens& k = g_tok;
     g_cards.push_back({anchor, rightSlotW > 0.0f, 0, (std::max)(S(g_nextCardMinHeight), g_cardRowOn ? g_cardRowPrev[g_cardRowId] : 0.0f), 0.0f});
     g_nextCardMinHeight = 0.0f;
+    const ImU32 border = g_nextCardBorder ? g_nextCardBorder : k.line;
+    g_nextCardBorder = 0;
     if (k.rack) {
         BeginRackPanel(title ? Caps(title) : id);
     } else {
         BeginEntry();
         ImGui::PushStyleColor(ImGuiCol_ChildBg, k.card);
-        ImGui::PushStyleColor(ImGuiCol_Border, k.line);
+        ImGui::PushStyleColor(ImGuiCol_Border, border);
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, S(k.rCard));
         ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(S(24.0f), S(22.0f)));

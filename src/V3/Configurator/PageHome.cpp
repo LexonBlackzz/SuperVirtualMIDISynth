@@ -154,10 +154,150 @@ void VoicesTile(const svms::RuntimeLinkTelemetryV2* t, uint32_t cap) {
     ui::EndCard();
 }
 
+// --- Campfire (past 500% load) -------------------------------------------------------------------
+// A particle sim in the foreground draw list, over the ring. Layout numbers are the prototype's
+// FIRE/mkP table. Ignition is staged: smoke 0 s, base glow 0.6 s, flames grow from the bottom
+// 0.9-1.35 s per layer, embers 1.9 s; 1.5 s fade-out when the load drops.
+struct FireLayer {
+    int n;
+    float size, spread, rise, period, seed;
+};
+
+float Frac(double v) { return static_cast<float>(v - std::floor(v)); }
+
+// Deterministic per-particle randoms, the prototype's sin hash.
+float Rnd(int i, float seed) { return Frac(std::sin((i + 1) * static_cast<double>(seed)) * 10000.0); }
+
+struct FireState {
+    float t = 0.0f;       // seconds since ignition
+    float alpha = 0.0f;   // 1 while burning, 1 -> 0 over 1.5 s afterwards
+};
+
+ImU32 FireCol(int r, int g, int b, float a) {
+    return IM_COL32(r, g, b, static_cast<int>(ImClamp(a, 0.0f, 1.0f) * 255.0f));
+}
+
+void DrawCampfire(const ImVec2& c, float s, bool burning, bool still) {
+    static FireState st;
+    const float dt = ImGui::GetIO().DeltaTime;
+    if (still) {                       // Motion Off: no animation, so no fade either; one calm frame
+        st.alpha = burning ? 1.0f : 0.0f;
+        st.t = 10.0f;
+    } else if (burning) {
+        st.alpha = (std::min)(1.0f, st.alpha + dt / 0.15f);
+        st.t += dt;
+    } else if (st.alpha > 0.0f) {
+        st.alpha -= dt / 1.5f;
+        st.t += dt;
+        if (st.alpha <= 0.0f) st = FireState();
+    }
+    if (st.alpha <= 0.0f) return;
+
+    const float master = st.alpha * (2.0f - st.alpha);   // ease-in fade-out
+    const double time = still ? 0.35 : ImGui::GetTime();
+    const float t = st.t;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ImVec2 o(c.x, c.y + (42.0f + 4.0f) * s);       // bottom centre of the prototype's fire box
+    auto col = [&](int r, int g, int b, float a) { return FireCol(r, g, b, a * master); };
+
+    // Smoke: puffs rise, grow and fade. Starts at once.
+    {
+        static const FireLayer sm{6, 0, 22, 0, 3.2f, 9.1f};
+        const float in = ImClamp(t / 1.2f, 0.0f, 1.0f);
+        for (int i = 0; i < sm.n; ++i) {
+            const float r = Rnd(i, sm.seed);
+            const float x = ((i / float(sm.n - 1)) - 0.5f) * 2.0f * sm.spread * (0.7f + 0.3f * r);
+            const float dx = (r - 0.5f) * 60.0f;
+            const float u = Frac(time / sm.period + ((i * 7 % sm.n) * sm.period / sm.n + r * 0.15f) / sm.period);
+            const float a = (u < 0.25f ? u / 0.25f * 0.6f : 0.6f * (1.0f - (u - 0.25f) / 0.75f)) * in;
+            const float rad = 19.0f * (0.5f + 2.3f * u) * s;
+            const ImVec2 p(o.x + (x + dx * u) * s, o.y - (129.0f + 150.0f * u) * s);
+            dl->AddCircleFilled(p, rad, col(110, 106, 116, a * 0.22f), 24);
+            dl->AddCircleFilled(p, rad * 0.75f, col(110, 106, 116, a * 0.3f), 24);
+            dl->AddCircleFilled(p, rad * 0.5f, col(110, 106, 116, a * 0.4f), 20);
+        }
+    }
+    // Base glow under the flames, pulsing once it is lit.
+    {
+        const float in = ImClamp((t - 0.6f) / 0.8f, 0.0f, 1.0f);
+        const float pulse = t > 1.4f ? 0.5f + 0.5f * std::sin((t - 1.4f) * 2.85f) : 0.0f;
+        const float a = in * (1.0f - 0.45f * pulse);
+        const float sc = 1.0f + 0.1f * pulse;
+        const ImVec2 gc(o.x, o.y - 35.0f * s);
+        for (int i = 0; i < 7; ++i) {
+            const float f = (7 - i) / 7.0f;
+            dl->AddEllipseFilled(gc, ImVec2(95.0f * 0.75f * f * sc * s, 45.0f * 0.75f * f * sc * s),
+                                 col(255, 120, 30, a * 0.07f), 0.0f, 32);
+        }
+    }
+    // Flame tongues: red, orange, yellow, white core. Each layer grows from the bottom of the box.
+    {
+        static const FireLayer layers[4] = {{22, 46, 44, -125, 1.15f, 12.9f},
+                                            {18, 34, 32, -105, 1.0f, 7.3f},
+                                            {14, 24, 20, -78, 0.85f, 3.1f},
+                                            {8, 14, 9, -46, 0.7f, 5.7f}};
+        static const int rgb[4][3] = {{229, 54, 27}, {255, 122, 26}, {255, 201, 60}, {255, 244, 204}};
+        static const float layerAlpha[4] = {0.7f, 0.7f, 0.8f, 0.9f};
+        for (int li = 0; li < 4; ++li) {
+            const FireLayer& L = layers[li];
+            const float g = ImClamp((t - (0.9f + 0.15f * li)) / 1.5f, 0.0f, 1.0f);
+            if (g <= 0.0f) continue;
+            const float e = EaseOut(g);
+            const float sx = 0.25f + 0.75f * e, sy = 0.04f + 0.96f * e;
+            const float la = ImClamp(e * 2.0f, 0.0f, 1.0f) * layerAlpha[li];
+            const ImU32 cc = col(rgb[li][0], rgb[li][1], rgb[li][2], la);
+            for (int i = 0; i < L.n; ++i) {
+                const float r = Rnd(i, L.seed);
+                const float x = (L.n > 1 ? (i / float(L.n - 1) - 0.5f) * 2.0f : 0.0f) * L.spread * (0.7f + 0.3f * r);
+                const float dx = -x * 0.5f, h = L.rise * (0.8f + 0.35f * r), size = L.size * (0.8f + 0.4f * r);
+                const float u = Frac(time / L.period + ((i * 7 % L.n) * L.period / L.n + r * 0.15f) / L.period);
+                const float k = std::pow(u, 1.25f);
+                // Position relative to the box bottom, scaled by the ignition transform.
+                const float px = (x + dx * k) * sx, py = (-14.0f + h * k) * sy;
+                const float rad = size * 0.5f * (1.0f - 0.95f * k) * sx * s;
+                const ImVec2 p(o.x + px * s, o.y + py * s);
+                if (li == 0) dl->AddCircleFilled(p, rad * 1.5f, col(255, 80, 20, la * 0.1f), 24);   // red rim glow
+                dl->AddCircleFilled(p, rad, cc, 24);
+            }
+        }
+    }
+    // Embers drifting up.
+    {
+        static const FireLayer em{12, 0, 50, 0, 1.9f, 4.4f};
+        const float in = ImClamp((t - 1.9f) / 1.0f, 0.0f, 1.0f);
+        if (in > 0.0f) {
+            for (int i = 0; i < em.n; ++i) {
+                const float r = Rnd(i, em.seed);
+                const float x = ((i / float(em.n - 1)) - 0.5f) * 2.0f * em.spread * (0.7f + 0.3f * r);
+                const float dx = (r - 0.5f) * 60.0f;
+                const float u = Frac(time / em.period + ((i * 7 % em.n) * em.period / em.n + r * 0.15f) / em.period);
+                const float a = (u < 0.12f ? u / 0.12f : 1.0f - (u - 0.12f) / 0.88f) * in;
+                const ImVec2 p(o.x + (x + dx * u) * s, o.y - (52.0f + 180.0f * u) * s);
+                dl->AddCircleFilled(p, 5.0f * s, col(255, 138, 31, a * 0.35f), 12);
+                dl->AddCircleFilled(p, 2.0f * s, col(255, 224, 154, a), 10);
+            }
+        }
+    }
+}
+
 void LoadTile(const svms::RuntimeLinkTelemetryV2* t, const ConfigValues& cfg) {
     const ui::Tokens& k = ui::Tok();
     const float s = ui::Scale();
+    // Warm tile glow while it burns, faded in and out over ~1.4 s.
+    const bool burning = GetThemeSettings().fire && t && t->cpuLoadPercent >= 500.0f;
+    static ImVec2 cardMin, cardMax;
+    const float heat = AnimEase(ImGui::GetID("##heat"), burning ? 1.0f : 0.0f, 1.4f);
+    if (heat > 0.01f && !k.rack && cardMax.x > cardMin.x) {
+        ImDrawList* wdl = ImGui::GetWindowDrawList();
+        wdl->PushClipRectFullScreen();
+        ui::SoftShadow(wdl, cardMin, cardMax, k.rCard * s, ui::WithAlpha(IM_COL32(255, 106, 26, 255), 0.5f * heat),
+                       26.0f * s, 8);
+        wdl->PopClipRect();
+        ui::SetNextCardBorder(ui::WithAlpha(IM_COL32(255, 106, 26, 255), 0.33f * heat));
+    }
     ui::BeginCard("##t_load");
+    cardMin = ImGui::GetWindowPos();
+    cardMax = ImVec2(cardMin.x + ImGui::GetWindowSize().x, cardMin.y + ImGui::GetWindowSize().y);
     const uint32_t sr = t && t->sampleRate ? t->sampleRate : cfg.sampleRate;
     const uint32_t frames = t && t->bufferFrames ? t->bufferFrames : cfg.bufferFrames;
     char budget[48];
@@ -212,6 +352,7 @@ void LoadTile(const svms::RuntimeLinkTelemetryV2* t, const ConfigValues& cfg) {
     ui::PushText(0, 13.0f);
     dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(tx, ty + bigH + 10.0f * s), k.muted, sub, nullptr, subW);
     ui::PopFont();
+    DrawCampfire(c, s, burning, GetMotion() == Motion::Off);
     ImGui::SetCursorScreenPos(q);
     ImGui::Dummy(ImVec2(w, gd));
     ui::EndCard();

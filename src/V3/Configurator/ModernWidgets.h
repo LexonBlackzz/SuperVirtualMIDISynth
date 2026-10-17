@@ -81,6 +81,8 @@ void BeginCard(const char* id, const char* title = nullptr,
                const char* subtitle = nullptr, float rightSlotW = 0.0f,
                const char* anchor = nullptr);
 void CardHeaderEnd();
+// The next BeginCard draws its border in this colour (Modern only; 0 = default).
+void SetNextCardBorder(ImU32 color);
 // The next BeginCard is at least this tall (px, unscaled): tiles that sit in a
 // row stay equal without measuring each other.
 void SetNextCardMinHeight(float px);
