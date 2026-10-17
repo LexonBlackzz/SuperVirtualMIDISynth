@@ -1,7 +1,9 @@
 #include "PageDiagnostics.h"
 #include "PlatformUtil.h"
 #include "ConfigDocument.h"
-#include "Theme.h"
+#include "ConfiguratorApp.h"
+#include "DriverLink.h"
+#include "ModernWidgets.h"
 #include "Widgets.h"
 #include "imgui.h"
 #include "../SVMSRuntimeLinkProtocol.h"
@@ -103,6 +105,18 @@ std::string GpuName() {
 #endif
 }
 
+// The backend the engine picks on this CPU when the config says Auto.
+const char* DetectedBackend() {
+#ifdef _WIN32
+    if (IsProcessorFeaturePresent(40 /* PF_AVX2_INSTRUCTIONS_AVAILABLE */)) return "AVX2";
+    return "SSE2";
+#elif defined(__GNUC__)
+    return __builtin_cpu_supports("avx2") ? "AVX2" : "SSE2";
+#else
+    return "SSE2";
+#endif
+}
+
 void MemoryText(char* out, size_t outSize) {
 #ifndef _WIN32
     struct sysinfo si{};
@@ -127,28 +141,6 @@ void MemoryText(char* out, size_t outSize) {
     const double used = static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / kGiB;
     std::snprintf(out, outSize, "%.1f / %.1f GB used", used, total);
 #endif
-}
-
-void KeyValue(const char* key, const char* value, bool wrap = false) {
-    ImGui::TableNextRow();
-    ImGui::TableNextColumn();
-    ImGui::TextDisabled("%s", key);
-    ImGui::TableNextColumn();
-    if (wrap) ImGui::TextWrapped("%s", value);
-    else ImGui::TextUnformatted(value);
-}
-
-bool BeginDetailsTable(const char* id) {
-    if (!ImGui::BeginTable(id, 2,
-                           ImGuiTableFlags_SizingStretchProp |
-                           ImGuiTableFlags_BordersInnerH |
-                           ImGuiTableFlags_RowBg,
-                           ImVec2(0.0f, 0.0f))) {
-        return false;
-    }
-    ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthFixed, 170.0f);
-    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    return true;
 }
 
 std::string AudioDeviceText(const ConfigValues& w) {
@@ -233,211 +225,70 @@ std::string BuildClipboardReport(const ConfigValues& w,
 void DrawDiagnosticsPage(ConfigDocument& doc) {
     const auto& w = doc.Working();
     const auto& lc = GetLiveLinkContext();
-    const auto* t = lc.telemetry;
+    const auto* t = lc.connected ? lc.telemetry : nullptr;
+    const float s = ui::Scale();
 
     static const std::string cpu = CpuName();
     static const std::string gpu = GpuName();
-    static bool showDetails = false;
-
     char memory[96] = {};
     MemoryText(memory, sizeof(memory));
 
-    SectionHeader("DIAGNOSTICS");
-
-    if (ImGui::BeginTable("##diag_essentials", 4,
-                          ImGuiTableFlags_SizingStretchProp,
-                          ImVec2(0.0f, 0.0f))) {
-        ImGui::TableSetupColumn("Voice label", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("Voice value", ImGuiTableColumnFlags_WidthStretch, 0.8f);
-        ImGui::TableSetupColumn("Render label", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("Render value", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-        ImGui::TableNextRow();
-
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("VOICES");
-        ImGui::TableNextColumn();
-        if (lc.connected && t) {
-            const uint32_t logicalCap = t->live.maxVoices != 0u
-                ? t->live.maxVoices : t->maxVoices;
-            ImGui::Text("%u / %u", t->activeVoices, logicalCap);
-        } else {
-            ImGui::TextDisabled("-- / %u", w.maxVoices);
-        }
-
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("RENDER");
-        ImGui::TableNextColumn();
-        if (lc.connected && t && t->sampleRate > 0u) {
-            const float renderMs = BudgetPercentMs(*t, t->cpuLoadPercent);
-            ImGui::Text("%.2f ms", renderMs);
-            ImGui::SameLine();
-            ImGui::TextDisabled("(%.1f%% of callback budget)", t->cpuLoadPercent);
-        } else {
-            ImGui::TextDisabled("--");
-        }
-        ImGui::EndTable();
+    // Render budget: one callback's worth of time.
+    char budget[48];
+    const float budgetMs = t ? BudgetMs(*t)
+        : 1000.0f * static_cast<float>(w.bufferFrames) / static_cast<float>((std::max)(1u, w.sampleRate));
+    std::snprintf(budget, sizeof(budget), "%.1f ms per block", budgetMs);
+    ui::PushText(0, 13.0f);
+    const float budgetW = ImGui::CalcTextSize(budget).x;
+    ui::PopFont();
+    ui::BeginCard("##budget", "Render budget", nullptr, budgetW, "diag");
+    ui::PushText(0, 13.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (38.0f * s - ImGui::GetTextLineHeight()) * 0.5f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
+    ImGui::TextUnformatted(budget);
+    ImGui::PopStyleColor();
+    ui::PopFont();
+    ui::CardHeaderEnd();
+    char load[24], head[24], p99[24], over[24];
+    const char* dash = "\xE2\x80\x94";
+    if (t) {
+        std::snprintf(load, sizeof(load), "%.0f%%", t->cpuLoadPercent);
+        std::snprintf(head, sizeof(head), "%.0f%%", (std::max)(0.0f, 100.0f - t->cpuLoadPercent));
+        std::snprintf(p99, sizeof(p99), "%.0f%%", t->callbackP99Percent);
+        std::snprintf(over, sizeof(over), "%llu", static_cast<unsigned long long>(t->overBudgetCallbacks));
+    } else {
+        std::snprintf(load, sizeof(load), "%s", dash);
+        std::snprintf(head, sizeof(head), "%s", dash);
+        std::snprintf(p99, sizeof(p99), "%s", dash);
+        std::snprintf(over, sizeof(over), "%s", dash);
     }
-
-    if (!lc.connected || !t) {
-        ImGui::Spacing();
-        ImGui::TextDisabled("RuntimeLink is offline. Live voice and render values are unavailable.");
+    const char* labels[4] = {"Render load", "Headroom", "P99", "Over budget"};
+    const char* values[4] = {load, head, p99, over};
+    ui::StatGrid(labels, values, 4, false);
+    if (!t) {
+        ImGui::Dummy(ImVec2(0.0f, 12.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        ui::PushText(0, 13.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
+        ImGui::TextUnformatted("No app is using SVMS right now, so live numbers are unavailable.");
+        ImGui::PopStyleColor();
+        ui::PopFont();
     }
+    ui::EndCard();
 
-    ImGui::Spacing();
-    SectionHeader("SYSTEM");
-    if (BeginDetailsTable("##diag_system")) {
-        KeyValue("CPU", cpu.c_str(), true);
-        KeyValue("Memory", memory);
-        KeyValue("GPU", gpu.c_str(), true);
-        const std::string logical = std::to_string(std::thread::hardware_concurrency()) +
-                                    " logical processors";
-        KeyValue("Processor count", logical.c_str());
-        ImGui::EndTable();
-    }
-
-    ImGui::Spacing();
-    if (ImGui::Button(showDetails ? "Hide details" : "More details")) {
-        showDetails = !showDetails;
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("Engine, render-budget, audio and event-pipeline details");
-
-    if (!showDetails) return;
-
-    if (lc.connected && t) {
-        ImGui::Spacing();
-        SectionHeader("RENDER BUDGET");
-        if (BeginDetailsTable("##diag_budget")) {
-            char value[160] = {};
-            const float budget = BudgetMs(*t);
-            std::snprintf(value, sizeof(value), "%.2f ms (%u frames @ %u Hz)",
-                          budget, t->bufferFrames, t->sampleRate);
-            KeyValue("Block budget", value);
-
-            std::snprintf(value, sizeof(value), "%.2f ms / %.1f%%",
-                          BudgetPercentMs(*t, t->cpuLoadPercent),
-                          t->cpuLoadPercent);
-            KeyValue("Current render", value);
-
-            std::snprintf(value, sizeof(value), "%.1f%%",
-                          (std::max)(0.0f, 100.0f - t->cpuLoadPercent));
-            KeyValue("Current headroom", value);
-
-            std::snprintf(value, sizeof(value), "%.2f ms / %.1f%%",
-                          BudgetPercentMs(*t, t->callbackP95Percent),
-                          t->callbackP95Percent);
-            KeyValue("P95", value);
-
-            std::snprintf(value, sizeof(value), "%.2f ms / %.1f%%",
-                          BudgetPercentMs(*t, t->callbackP99Percent),
-                          t->callbackP99Percent);
-            KeyValue("P99", value);
-
-            std::snprintf(value, sizeof(value), "%.2f ms / %.1f%%",
-                          BudgetPercentMs(*t, t->callbackP999Percent),
-                          t->callbackP999Percent);
-            KeyValue("P99.9", value);
-
-            std::snprintf(value, sizeof(value), "%llu total / %u max streak",
-                          static_cast<unsigned long long>(t->overBudgetCallbacks),
-                          t->maxConsecutiveOverBudget);
-            KeyValue("Over budget", value);
-            ImGui::EndTable();
-        }
-    }
-
-    ImGui::Spacing();
-    SectionHeader("ENGINE / AUDIO");
-    if (BeginDetailsTable("##diag_engine")) {
-        KeyValue("RuntimeLink", lc.connected ? "Connected" : "Offline");
-
-        char threads[64] = {};
-        if (w.renderThreads == 0)
-            std::snprintf(threads, sizeof(threads), "Auto (runtime count not exposed)");
-        else
-            std::snprintf(threads, sizeof(threads), "%u configured", w.renderThreads);
-        KeyValue("Render threads", threads);
-
-        const std::string device = AudioDeviceText(w);
-        KeyValue("Audio device", device.c_str(), true);
-
-        char format[96] = {};
-        const float configuredMs = w.sampleRate > 0u
-            ? 1000.0f * static_cast<float>(w.bufferFrames) /
-              static_cast<float>(w.sampleRate) : 0.0f;
-        std::snprintf(format, sizeof(format), "%u Hz / %u frames / %.2f ms",
-                      w.sampleRate, w.bufferFrames, configuredMs);
-        KeyValue("Configured format", format);
-
-        const std::string soundFont = SoundFontText(w);
-        KeyValue("SoundFont", soundFont.c_str(), true);
-
-        if (lc.connected && t) {
-            KeyValue("Audio state", t->audioRunning ? "Running" : "Stopped");
-            KeyValue("SoundFont state", t->soundFontLoaded ? "Loaded" : "Not loaded");
-
-            char voices[160] = {};
-            const uint32_t logicalCap = t->live.maxVoices != 0u
-                ? t->live.maxVoices : t->maxVoices;
-            std::snprintf(voices, sizeof(voices),
-                          "%u active / %u releasing / %u logical cap / %u physical pool",
-                          t->activeVoices, t->releasingVoices,
-                          logicalCap, t->maxVoices);
-            KeyValue("Voice state", voices);
-
-            char steals[64] = {};
-            std::snprintf(steals, sizeof(steals), "%u", t->voiceSteals);
-            KeyValue("Voice steals", steals);
-        }
-        ImGui::EndTable();
-    }
-
-    if (lc.connected && t) {
-        ImGui::Spacing();
-        SectionHeader("EVENT PIPELINE");
-        if (BeginDetailsTable("##diag_events")) {
-            char submitted[64] = {}, accepted[64] = {}, dropped[64] = {}, dispatched[64] = {};
-            std::snprintf(submitted, sizeof(submitted), "%llu",
-                          static_cast<unsigned long long>(t->eventsSubmitted));
-            std::snprintf(accepted, sizeof(accepted), "%llu",
-                          static_cast<unsigned long long>(t->eventsAccepted));
-            std::snprintf(dropped, sizeof(dropped), "%llu",
-                          static_cast<unsigned long long>(t->eventsDropped));
-            std::snprintf(dispatched, sizeof(dispatched), "%llu",
-                          static_cast<unsigned long long>(t->eventsDispatched));
-            KeyValue("Submitted", submitted);
-            KeyValue("Accepted", accepted);
-            KeyValue("Dropped", dropped);
-            KeyValue("Dispatched", dispatched);
-            char stages[96] = {}, queues[128] = {}, pressure[64] = {};
-            std::snprintf(stages, sizeof(stages),
-                          "%.2f%% scheduler / %.2f%% dispatch",
-                          t->schedulerPercent, t->eventDispatchPercent);
-            std::snprintf(queues, sizeof(queues),
-                          "%u raw / %u compiled / %u scheduled",
-                          t->rawIngressCount, t->compiledPagedCount,
-                          t->scheduledBacklogCount);
-            const uint64_t paged =
-                static_cast<uint64_t>(t->compiledPagedCount) +
-                t->scheduledBacklogCount;
-            const float pagePressure = w.eventRingCapacity != 0u
-                ? 100.0f * static_cast<float>(paged) /
-                      static_cast<float>(w.eventRingCapacity)
-                : 0.0f;
-            std::snprintf(pressure, sizeof(pressure), "%.1f%%", pagePressure);
-            KeyValue("Stage load", stages);
-            KeyValue("Queue depth", queues);
-            KeyValue("Page-pool pressure", pressure);
-            ImGui::EndTable();
-        }
-    }
-
-    ImGui::Spacing();
-    if (ImGui::Button("Copy diagnostics")) {
-        const std::string report = BuildClipboardReport(w, t, lc.connected,
-                                                        cpu, gpu, memory);
+    // This PC + the clipboard report.
+    ui::BeginCard("##thispc", "This PC", nullptr, ui::ButtonSize("Copy report").x);
+    if (ui::Button("Copy report")) {
+        const std::string report = BuildClipboardReport(w, t, lc.connected, cpu, gpu, memory);
         ImGui::SetClipboardText(report.c_str());
+        if (ConfiguratorApp* app = lc.app) app->ShowToast("Report copied");
     }
+    ui::CardHeaderEnd();
+    const std::string logical = std::to_string(std::thread::hardware_concurrency());
+    const std::string backend = std::string(DetectedBackend());
+    const char* keys[5] = {"CPU", "Logical processors", "Memory", "GPU", "Render backend"};
+    const char* vals[5] = {cpu.c_str(), logical.c_str(), memory, gpu.c_str(), backend.c_str()};
+    ui::KeyValueGrid(keys, vals, 5);
+    ui::EndCard();
 }
 
 } // namespace svms::cfg

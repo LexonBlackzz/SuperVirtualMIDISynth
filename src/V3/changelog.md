@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-17 feat(v3): configurator Diagnostics page rewrite. Render budget stats (load, headroom, P99, over budget) and a This PC card with the Copy report button. The clipboard report is unchanged, so the details that used to sit under "More details" are in it.
 - 2026-10-17 feat(v3): configurator Record page rewrite. One big record button that morphs from a circle into a square with a ping ring while recording, the timer, status line, Save to row and four stats. A new file name is picked for the next take when the path was automatic.
 - 2026-10-17 feat(v3): configurator Render to file page rewrite. Three numbered steps (MIDI file, SoundFont = the Sound page's first one, Save as), Start / Cancel, a striped progress bar and four stats. The renderer process logic and `--config` hand-off are unchanged; the "Engine settings used" table became one line naming what is still live-only.
 - 2026-10-17 feat(v3): configurator MIDI page rewrite. Keyboard input with the device list nested under it, overload behaviour (the two Priority-only numbers show only in Priority mode), a Go to Velocity pointer, and the Queue sizes disclosure with capacity, events per block and the fast player lane. The live event pipeline readout is gone (it is on the Diagnostics report).
