@@ -51,11 +51,12 @@ void TileHeader(const char* label, const char* value) {
     const float w = ImGui::GetContentRegionAvail().x;
     ui::PushText(0, 13.0f);
     const float h = ImGui::GetTextLineHeight();
+    const float lw = ImGui::CalcTextSize(ui::Caps(label)).x;
     dl->AddText(p, k.muted, ui::Caps(label));
     ui::PopFont();
     ui::PushNum(12.0f);
     const ImVec2 vs = ImGui::CalcTextSize(value);
-    dl->AddText(ImVec2(p.x + w - vs.x, p.y + (h - vs.y) * 0.5f), k.muted, value);
+    if (lw + vs.x + 12.0f < w) dl->AddText(ImVec2(p.x + w - vs.x, p.y + (h - vs.y) * 0.5f), k.muted, value);
     ui::PopFont();
     ImGui::Dummy(ImVec2(w, h));
 }

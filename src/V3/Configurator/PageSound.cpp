@@ -380,18 +380,19 @@ void VelocityCard(ConfigDocument& doc) {
 
     const float total = ImGui::GetContentRegionAvail().x;
     const float gap = 16.0f * s;
-    const float colW = (total - gap) * 0.5f;
+    const float leftW = 324.0f * s;   // three 96px knobs + gaps
+    const float colW = (std::max)(120.0f * s, total - gap - leftW);   // graph takes the rest
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const char* hint = "Drag up or down. Hold Shift for fine steps. Double-click to reset.";
     ui::PushText(0, 12.0f);
-    const float hintH = ImGui::CalcTextSize(hint, nullptr, false, colW).y;
+    const float hintH = ImGui::CalcTextSize(hint, nullptr, false, leftW).y;
     ui::PopFont();
     const float leftH = KnobBlockHeight() + 10.0f * s + hintH;
     const float rightH = 150.0f * s + 6.0f * s + 14.0f * s;
     const float rowH = (std::max)(leftH, rightH);
 
     // Right column: the response graph.
-    ImGui::SetCursorScreenPos(ImVec2(origin.x + colW + gap, origin.y + (rowH - rightH) * 0.5f));
+    ImGui::SetCursorScreenPos(ImVec2(origin.x + leftW + gap, origin.y + (rowH - rightH) * 0.5f));
     VelocityGraph(w, colW);
 
     // Left column: three knobs.
@@ -415,7 +416,7 @@ void VelocityCard(ConfigDocument& doc) {
     ImGui::SetCursorScreenPos(ImVec2(origin.x, y + KnobBlockHeight() + 10.0f * s));
     ui::PushText(0, 12.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + colW);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + leftW);
     ImGui::TextUnformatted(hint);
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
