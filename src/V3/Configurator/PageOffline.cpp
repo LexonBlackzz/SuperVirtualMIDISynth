@@ -2,7 +2,9 @@
 #include "PageOffline.h"
 
 #include "ConfigDocument.h"
-#include "Theme.h"
+#include "ConfiguratorApp.h"
+#include "DriverLink.h"
+#include "ModernWidgets.h"
 #include "Widgets.h"
 #include "imgui.h"
 
@@ -162,27 +164,63 @@ bool IsRunningState(OfflineRendererPage::State state) {
            state == OfflineRendererPage::State::Cancelling;
 }
 
-void PathRow(const char* label, const std::wstring& path,
-             const char* buttonLabel, const std::function<void()>& browse) {
-    ImGui::TableNextRow();
-    ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    ImGui::TableNextColumn();
-    const std::string utf8 = WideToUtf8(path);
-    if (utf8.empty()) ImGui::TextDisabled("Not selected");
-    else {
-        ImGui::TextWrapped("%s", utf8.c_str());
-        if (ImGui::IsItemHovered()) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted(utf8.c_str());
-            ImGui::EndTooltip();
-        }
-    }
-    ImGui::TableNextColumn();
-    ImGui::PushID(label);
-    if (ImGui::Button(buttonLabel, ImVec2(92.0f, 0.0f))) browse();
+// Cuts the front of a long path so it fits `maxWidth` (mono 12 px).
+std::string Elide(const std::string& text, float maxWidth) {
+    if (text.empty() || ImGui::CalcTextSize(text.c_str()).x <= maxWidth) return text;
+    size_t cut = 1;
+    while (cut < text.size() &&
+           ImGui::CalcTextSize(("\xE2\x80\xA6" + text.substr(cut)).c_str()).x > maxWidth) ++cut;
+    return "\xE2\x80\xA6" + text.substr(cut);
+}
+
+// One numbered step of the render card. Returns true when its button is clicked.
+bool Step(int number, bool done, const char* title, const std::string& sub,
+          const char* button, bool enabled) {
+    const ui::Tokens& k = ui::Tok();
+    const float s = ui::Scale();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::PushID(number);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    ui::PushText(1, 14.0f);
+    const float titleH = ImGui::GetTextLineHeight();
+    ui::PopFont();
+    ui::PushNum(12.0f);
+    const float subH = ImGui::GetTextLineHeight();
+    ui::PopFont();
+    const float h = (std::max)(28.0f * s, titleH + subH) + 28.0f * s;
+    const float r = k.rack ? 3.0f * s : 12.0f * s;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), k.card2, r);
+    dl->AddRect(p, ImVec2(p.x + w, p.y + h), k.line2, r);
+    const ImVec2 c(p.x + 18.0f * s + 14.0f * s, p.y + h * 0.5f);
+    dl->AddCircleFilled(c, 14.0f * s, done ? k.acc : k.card3);
+    char num[8];
+    std::snprintf(num, sizeof(num), "%d", number);
+    ui::PushNum(13.0f);
+    const ImVec2 ns = ImGui::CalcTextSize(num);
+    dl->AddText(ImVec2(c.x - ns.x * 0.5f, c.y - ns.y * 0.5f), done ? k.onAcc : k.text, num);
+    ui::PopFont();
+    const float textX = p.x + 18.0f * s + 28.0f * s + 14.0f * s;
+    const float bw = ui::ButtonSize(button).x;
+    const float textY = p.y + (h - titleH - subH) * 0.5f;
+    ui::PushText(1, 14.0f);
+    dl->AddText(ImVec2(textX, textY), k.text, title);
+    ui::PopFont();
+    ui::PushNum(12.0f);
+    const std::string shown = Elide(sub, p.x + w - 18.0f * s - bw - 14.0f * s - textX);
+    dl->AddText(ImVec2(textX, textY + titleH), k.muted, shown.c_str());
+    ui::PopFont();
+    ImGui::SetCursorScreenPos(ImVec2(p.x + w - 18.0f * s - bw, p.y + (h - 38.0f * s) * 0.5f));
+    const bool clicked = ui::Button(button, ui::ButtonKind::Normal, ImVec2(0, 0), enabled);
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
+    ImGui::Dummy(ImVec2(w, 10.0f * s - ImGui::GetStyle().ItemSpacing.y));
     ImGui::PopID();
+    return clicked;
+}
+
+std::string FileName(const std::wstring& path) {
+    if (path.empty()) return {};
+    return WideToUtf8(std::filesystem::path(path).filename().wstring());
 }
 
 } // namespace
@@ -250,16 +288,6 @@ void OfflineRendererPage::BrowseMidi(HWND owner) {
         lastOutputDirectory_ = output.parent_path().wstring();
         outputPathAutomatic_ = true;
     }
-}
-
-void OfflineRendererPage::BrowseSoundFont(HWND owner) {
-    static const wchar_t filter[] =
-        L"SoundFont files (*.sf2;*.sfz)\0*.sf2;*.sfz\0All files (*.*)\0*.*\0\0";
-    std::wstring selected = soundFontPath_;
-    if (!BrowseOpenFile(owner, L"Select SoundFont", filter,
-                        lastSoundFontDirectory_, selected)) return;
-    soundFontPath_ = selected;
-    lastSoundFontDirectory_ = ParentDirectory(selected);
 }
 
 void OfflineRendererPage::BrowseOutput(HWND owner) {
@@ -576,185 +604,122 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
         snapshot = snapshot_;
     }
     const bool running = IsRunningState(snapshot.state);
+    const ConfigValues& v = document.Working();
+    const float s = ui::Scale();
+    const ui::Tokens& k = ui::Tok();
 
-    SectionHeader("OFFLINE RENDERER");
-    ImGui::TextDisabled(
-        "Runs svms_v3_render.exe separately using the current working engine settings. "
-        "The same streaming MIDI parser and WAV/RF64 writer are used by the CLI.");
-    ImGui::Spacing();
-
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, GetPanelBg());
-    ImGui::BeginChild("##offline_paths", ImVec2(0.0f, 168.0f),
-                      ImGuiChildFlags_Borders |
-                      ImGuiChildFlags_AlwaysUseWindowPadding);
-    if (ImGui::BeginTable("##offline_path_table", 3,
-                          ImGuiTableFlags_SizingStretchProp |
-                          ImGuiTableFlags_BordersInnerH |
-                          ImGuiTableFlags_RowBg)) {
-        ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Browse", ImGuiTableColumnFlags_WidthFixed, 102.0f);
-        ImGui::BeginDisabled(running);
-        PathRow("MIDI file", midiPath_, "Browse...",
-                [&] { BrowseMidi(owner); });
-        PathRow("SoundFont", soundFontPath_, "Browse...",
-                [&] { BrowseSoundFont(owner); });
-        PathRow("Output WAV", outputPath_, "Browse...",
-                [&] { BrowseOutput(owner); });
-        ImGui::EndDisabled();
-        ImGui::EndTable();
-    }
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
-
-    ImGui::Spacing();
-    const bool pathsReady = !midiPath_.empty() && !soundFontPath_.empty() &&
-                            !outputPath_.empty();
-    ImGui::BeginDisabled(running || !pathsReady);
-    ImVec4 startColor = GetAccent();
-    startColor.w = 0.68f;
-    ImGui::PushStyleColor(ImGuiCol_Button, startColor);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GetAccentHover());
-    if (ImGui::Button("Start Render", ImVec2(140.0f, 32.0f))) Start(document);
-    ImGui::PopStyleColor(2);
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!running || snapshot.state == State::Cancelling);
-    if (ImGui::Button("Cancel Render", ImVec2(140.0f, 32.0f))) Cancel();
-    ImGui::EndDisabled();
-    if (!pathsReady) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("Select all three paths to begin.");
+    // Step 2 is the Sound page's first SoundFont.
+    if (!running && !v.soundFontPath.empty()) {
+        std::filesystem::path path(v.soundFontPath);
+        if (path.is_relative()) path = std::filesystem::path(ExecutableDirectory()) / path;
+        soundFontPath_ = path.lexically_normal().wstring();
     }
 
-    ImGui::Spacing();
-    SectionHeader("ENGINE SETTINGS USED");
-    ImGui::TextDisabled(
-        "The render uses the current (even unsaved) settings from the other pages, "
-        "so it sounds like the live synth. Greyed rows are live-only for now.");
+    ui::BeginCard("##render", nullptr, nullptr, 0.0f, "render");
+    if (Step(1, !midiPath_.empty(), "MIDI file", midiPath_.empty() ? "Not chosen yet" : FileName(midiPath_),
+             "Choose\xE2\x80\xA6", !running))
+        BrowseMidi(owner);
+    if (Step(2, !soundFontPath_.empty(), "SoundFont",
+             soundFontPath_.empty() ? "None. Pick one on the Sound page." : FileName(soundFontPath_) + " (same as Sound page)",
+             "Change", !running)) {
+        if (ConfiguratorApp* app = GetLiveLinkContext().app) app->Navigate(NavPage::Sound);
+    }
+    if (Step(3, !outputPath_.empty(), "Save as", outputPath_.empty() ? "Not chosen yet" : WideToUtf8(outputPath_),
+             "Choose\xE2\x80\xA6", !running))
+        BrowseOutput(owner);
+
+    const bool pathsReady = !midiPath_.empty() && !soundFontPath_.empty() && !outputPath_.empty();
+    ImGui::Dummy(ImVec2(0.0f, 6.0f * s));
+    const bool cancelling = snapshot.state == State::Cancelling;
+    if (ui::Button(running ? "Cancel render" : "Start render", ui::ButtonKind::Primary, ImVec2(0, 0),
+                   running ? !cancelling : pathsReady)) {
+        if (running) Cancel();
+        else Start(document);
+    }
+    ImGui::SameLine(0.0f, 10.0f * s);
     {
-        const ConfigValues& v = document.Working();
-        static const char* const rotation[] = {"Coherent", "Analytic", "Sweep",
-                                               "Diffuse", "Random"};
-        auto onOff = [](bool b) { return b ? "ON" : "off"; };
-        char text[96];
-        if (ImGui::BeginTable("##offline_settings", 4,
-                              ImGuiTableFlags_SizingStretchSame |
-                              ImGuiTableFlags_BordersInnerV |
-                              ImGuiTableFlags_RowBg)) {
-            auto cell = [&](const char* label, const char* value, bool applied) {
-                ImGui::TableNextColumn();
-                ImGui::TextDisabled("%s", label);
-                if (applied) ImGui::TextUnformatted(value);
-                else ImGui::TextDisabled("%s (live only)", value);
-            };
-            ImGui::TableNextRow();
-            std::snprintf(text, sizeof(text), "%u", v.maxVoices);
-            cell("VOICE LIMIT", text, true);
-            std::snprintf(text, sizeof(text), "%s%s", onOff(v.decimation),
-                          v.decimation && v.decimationByLevel ? " (by level)" : "");
-            cell("DECIMATION", text, true);
-            std::snprintf(text, sizeof(text), "%u", v.perKeyVoiceCap);
-            cell("PER-KEY CAP", text, true);
-            std::snprintf(text, sizeof(text), "%u", v.ghostBudget);
-            cell("GHOST BUDGET", text, true);
-            ImGui::TableNextRow();
-            std::snprintf(text, sizeof(text), "%u", v.noteOnCollapseThreshold);
-            cell("NOTE-ON COLLAPSE", text, true);
-            cell("NOTE MERGE", onOff(v.noteMerge), true);
-            cell("RE-EXCITE", onOff(v.noteOnReexcite), true);
-            cell("FAST CHUNK MATH", onOff(v.fastChunkMath), true);
-            ImGui::TableNextRow();
-            cell("REVERB", onOff(v.enableReverb), true);
-            std::snprintf(text, sizeof(text), "%.2f / %.2f / %u", v.velocityCurve,
-                          v.velocityFloor, v.velocityIgnoreBelow);
-            cell("VEL CURVE/FLOOR/GATE", text, true);
-            cell("PHASE ROTATION",
-                 rotation[(std::min)(v.phaseRotationMode, 4u)], true);
-            std::snprintf(text, sizeof(text), "%u-EDO", v.tuningEdo);
-            cell("TUNING", text, true);
-            ImGui::TableNextRow();
-            cell("CHANNEL LIMITER", onOff(v.channelLimiterEnabled), false);
-            cell("CC COLLAPSE", onOff(v.ccCollapse), false);
-            cell("BEND COLLAPSE", onOff(v.bendCollapse), false);
-            std::snprintf(text, sizeof(text), "%u ms", v.minNoteMs);
-            cell("MIN NOTE LENGTH", text, false);
-            ImGui::EndTable();
+        const char* hint = snapshot.state == State::Complete ? "Done. The WAV is ready."
+            : running ? StateLabel(snapshot.state)
+            : pathsReady ? "Ready." : "Pick the MIDI file and where to save.";
+        ui::PushText(0, 13.0f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (38.0f * s - ImGui::GetTextLineHeight()) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+        ImGui::TextUnformatted(hint);
+        ImGui::PopStyleColor();
+        ui::PopFont();
+    }
+    {
+        // What the renderer cannot apply yet (everything else rides --config).
+        std::string unapplied;
+        auto add = [&](bool on, const char* name) {
+            if (!on) return;
+            if (!unapplied.empty()) unapplied += ", ";
+            unapplied += name;
+        };
+        add(v.channelLimiterEnabled, "channel limiter");
+        add(v.ccCollapse, "skipping overwritten controller changes");
+        add(v.bendCollapse, "thinning pitch bends");
+        add(v.minNoteMs > 0u, "minimum note length");
+        if (!unapplied.empty()) {
+            const std::string note = "Uses your current settings, even unsaved ones. Live-only for now, so not in the file: " + unapplied + ".";
+            ImGui::Dummy(ImVec2(0.0f, 8.0f * s - ImGui::GetStyle().ItemSpacing.y));
+            ui::PushText(0, 13.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(note.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+            ui::PopFont();
         }
     }
+    ui::EndCard();
 
-    ImGui::Spacing();
-    SectionHeader("PROGRESS");
+    const bool loadingPhase = snapshot.state == State::Starting || snapshot.state == State::Loading ||
+                              snapshot.state == State::Preparing;
+    const double progress = loadingPhase ? snapshot.loadProgress : snapshot.renderProgress;
+    char pct[16];
+    std::snprintf(pct, sizeof(pct), "%.0f%%", progress * 100.0);
+    ui::PushNum(13.0f);
+    const float pctW = ImGui::CalcTextSize(pct).x;
+    ui::PopFont();
+    ui::BeginCard("##renderprogress", "Progress", nullptr, pctW);
+    ui::PushNum(13.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (38.0f * s - ImGui::GetTextLineHeight()) * 0.5f);
+    ImGui::TextUnformatted(pct);
+    ui::PopFont();
+    ui::CardHeaderEnd();
+    ui::StripedProgress(running || snapshot.state == State::Complete ? static_cast<float>(progress) : -1.0f);
+    char speed[24], eta[24], voices[24], peak[24];
+    if (snapshot.speed > 0.0) std::snprintf(speed, sizeof(speed), "%.1fx", snapshot.speed);
+    else std::snprintf(speed, sizeof(speed), "\xE2\x80\x94");
+    std::snprintf(eta, sizeof(eta), "%s", running && snapshot.eta > 0.0 ? FormatDuration(snapshot.eta).c_str() : "\xE2\x80\x94");
+    std::snprintf(voices, sizeof(voices), "%u", snapshot.activeVoices);
+    std::snprintf(peak, sizeof(peak), "%u", snapshot.peakVoices);
+    const char* labels[4] = {"Speed", "Time left", "Voices now", "Peak voices"};
+    const char* values[4] = {speed, eta, voices, peak};
+    ui::StatGrid(labels, values, 4);
 
-    char loadOverlay[96]{};
-    std::snprintf(loadOverlay, sizeof(loadOverlay), "MIDI loading  %.1f%%  |  ETA %s",
-                  snapshot.loadProgress * 100.0,
-                  FormatDuration(snapshot.loadEta).c_str());
-    ImGui::ProgressBar(static_cast<float>(snapshot.loadProgress),
-                       ImVec2(-1.0f, 24.0f), loadOverlay);
-
-    char renderOverlay[128]{};
-    std::snprintf(renderOverlay, sizeof(renderOverlay),
-                  "Render  %.1f%%  |  %s / %s",
-                  snapshot.renderProgress * 100.0,
-                  FormatDuration(snapshot.renderedSeconds).c_str(),
-                  FormatDuration(snapshot.totalSeconds).c_str());
-    ImGui::ProgressBar(static_cast<float>(snapshot.renderProgress),
-                       ImVec2(-1.0f, 24.0f), renderOverlay);
-
-    ImGui::Spacing();
-    if (ImGui::BeginTable("##offline_metrics", 4,
-                          ImGuiTableFlags_SizingStretchSame |
-                          ImGuiTableFlags_BordersInnerV |
-                          ImGuiTableFlags_RowBg)) {
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("ELAPSED");
-        ImGui::TextUnformatted(FormatDuration(snapshot.elapsed).c_str());
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("RENDER SPEED");
-        if (snapshot.speed > 0.0) ImGui::Text("%.2fx realtime", snapshot.speed);
-        else ImGui::TextDisabled("--");
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("ETA");
-        ImGui::TextUnformatted(FormatDuration(snapshot.eta).c_str());
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("MIDI EVENTS");
-        ImGui::Text("%llu", static_cast<unsigned long long>(snapshot.events));
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("CURRENT VOICES");
-        ImGui::Text("%u", snapshot.activeVoices);
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("PEAK VOICES");
-        ImGui::Text("%u", snapshot.peakVoices);
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("VOICE STEALS");
-        ImGui::Text("%llu", static_cast<unsigned long long>(snapshot.steals));
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("LOADING ELAPSED");
-        ImGui::TextUnformatted(FormatDuration(snapshot.loadElapsed).c_str());
-        ImGui::EndTable();
-    }
-
-    ImGui::Spacing();
-    ImVec4 stateColor = GetMutedText();
-    if (snapshot.state == State::Complete) stateColor = GetSuccess();
-    else if (snapshot.state == State::Error) stateColor = GetError();
-    else if (snapshot.state == State::Cancelled ||
-             snapshot.state == State::Cancelling) stateColor = GetWarning();
-    else if (running) stateColor = GetAccent();
+    ImGui::Dummy(ImVec2(0.0f, 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
+    ImU32 stateColor = k.muted;
+    if (snapshot.state == State::Complete) stateColor = k.ok;
+    else if (snapshot.state == State::Error) stateColor = k.bad;
+    else if (snapshot.state == State::Cancelled || snapshot.state == State::Cancelling) stateColor = k.exp;
+    else if (running) stateColor = k.acc;
+    ui::PushText(0, 13.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, stateColor);
-    ImGui::Text("%s", StateLabel(snapshot.state));
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::Text("%s  %s", StateLabel(snapshot.state), snapshot.message.c_str());
+    ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
-    ImGui::SameLine(0.0f, 14.0f);
-    ImGui::TextWrapped("%s", snapshot.message.c_str());
     if (!snapshot.detail.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
-        ImGui::TextWrapped("%s", snapshot.detail.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(snapshot.detail.c_str());
+        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
+    ui::PopFont();
+    ui::EndCard();
 }
 
 } // namespace svms::cfg

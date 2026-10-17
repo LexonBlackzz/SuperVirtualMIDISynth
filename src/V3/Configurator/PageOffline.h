@@ -62,7 +62,6 @@ private:
 
     void EnsureInitialPaths(const ConfigDocument& document);
     void BrowseMidi(HWND owner);
-    void BrowseSoundFont(HWND owner);
     void BrowseOutput(HWND owner);
     void Start(const ConfigDocument& document);
     void Cancel();
