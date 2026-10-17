@@ -9,6 +9,7 @@
 #include "UpdateService.h"
 #include "Widgets.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -170,6 +172,162 @@ bool SwatchButton(const char* id, ImVec2 center, ImU32 fill, bool selected, cons
     return clicked;
 }
 
+// --- Themed colour picker --------------------------------------------------------------------------
+// Replaces the OS picker: a popover under the Custom swatch with a saturation/value square, a hue
+// bar (ring handles that grow while dragged), a preview, a hex field and Done. Everything recolours
+// live: each change rebuilds the theme palette.
+
+// Paints the four corners outside a rounded rect with `bg`, so gradients (which have no rounding)
+// can sit on a rounded surface.
+void RoundCorners(ImDrawList* dl, ImVec2 a, ImVec2 b, float r, ImU32 bg) {
+    // A thick stroke just outside the rect: its inner edge is the rounded rect, the rest hides the corners.
+    const float t = r + 3.0f;
+    dl->AddRect(ImVec2(a.x - t * 0.5f, a.y - t * 0.5f), ImVec2(b.x + t * 0.5f, b.y + t * 0.5f), bg, r + t * 0.5f, 0, t);
+}
+
+// White ring handle, 18 px, growing to 1.25x while dragged.
+void RingHandle(ImDrawList* dl, ImVec2 c, ImU32 fill, bool active, ImGuiID id) {
+    const float s = S();
+    const float r = 9.0f * s * AnimSpring(id, active ? 1.25f : 1.0f);
+    dl->AddCircleFilled(ImVec2(c.x, c.y + 3.0f * s), r + 1.0f * s, IM_COL32(0, 0, 0, 70), 24);
+    dl->AddCircleFilled(c, r, fill, 28);
+    dl->AddCircle(c, r - 1.5f * s, IM_COL32(255, 255, 255, 255), 28, 3.0f * s);
+    dl->AddCircle(c, r + 0.5f, IM_COL32(0, 0, 0, 90), 28, 1.0f);
+}
+
+bool ParseHex6(const char* text, ImVec4& out) {
+    if (*text == '#') ++text;
+    if (std::strlen(text) != 6) return false;
+    unsigned v = 0;
+    for (int i = 0; i < 6; ++i) {
+        const char ch = text[i];
+        unsigned d;
+        if (ch >= '0' && ch <= '9') d = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') d = 10 + ch - 'a';
+        else if (ch >= 'A' && ch <= 'F') d = 10 + ch - 'A';
+        else return false;
+        v = v * 16 + d;
+    }
+    out = FromRgb(v);
+    return true;
+}
+
+struct PickerState {
+    float h = 0.0f, sat = 0.0f, val = 1.0f;
+    char hex[16] = {};
+    bool dirty = false;   // a change is waiting for the theme file save (on close)
+};
+PickerState g_picker;
+
+void PickerApply(ThemeSettings& theme, bool final) {
+    float r, g, b;
+    ImGui::ColorConvertHSVtoRGB(g_picker.h, g_picker.sat, g_picker.val, r, g, b);
+    const ImVec4 col(r, g, b, 1.0f);
+    theme.customAccent = col;
+    theme.hasCustomAccent = true;
+    theme.accent = col;
+    theme.colorStrength = 0.65f;
+    RebuildPalette(theme);
+    ThemeChanged(final);
+    std::snprintf(g_picker.hex, sizeof(g_picker.hex), "#%02X%02X%02X", static_cast<int>(r * 255.0f + 0.5f),
+                  static_cast<int>(g * 255.0f + 0.5f), static_cast<int>(b * 255.0f + 0.5f));
+    g_picker.dirty = !final;
+}
+
+// Called once when the popover opens: start from the Custom colour (or the prototype's violet) and apply it.
+void PickerOpen(ThemeSettings& theme) {
+    const ImVec4 start = theme.hasCustomAccent ? theme.customAccent : FromRgb(0x9B7BFF);
+    ImGui::ColorConvertRGBtoHSV(start.x, start.y, start.z, g_picker.h, g_picker.sat, g_picker.val);
+    PickerApply(theme, false);
+}
+
+void DrawPicker(ThemeSettings& theme, ImVec2 popupPos) {
+    const ui::Tokens& k = ui::Tok();
+    const float s = S();
+    ImGui::SetNextWindowPos(popupPos);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, k.card2);
+    ImGui::PushStyleColor(ImGuiCol_Border, k.line2);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 16.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f * s, 16.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
+    const bool open = ImGui::BeginPopup("##accentpicker");
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(2);
+    if (open) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float w = 258.0f * s;
+        float cr, cg, cb;
+        bool changed = false;
+
+        // Saturation / value square.
+        const ImVec2 a = ImGui::GetCursorScreenPos();
+        const ImVec2 b(a.x + w, a.y + 160.0f * s);
+        ImGui::InvisibleButton("##sv", ImVec2(w, 160.0f * s));
+        const bool svActive = ImGui::IsItemActive();
+        if (svActive) {
+            const ImVec2 m = ImGui::GetIO().MousePos;
+            g_picker.sat = ImClamp((m.x - a.x) / w, 0.0f, 1.0f);
+            g_picker.val = 1.0f - ImClamp((m.y - a.y) / (160.0f * s), 0.0f, 1.0f);
+            changed = true;
+        }
+        ImGui::ColorConvertHSVtoRGB(g_picker.h, 1.0f, 1.0f, cr, cg, cb);
+        const ImU32 hueCol = ImGui::ColorConvertFloat4ToU32(ImVec4(cr, cg, cb, 1.0f));
+        dl->AddRectFilledMultiColor(a, b, IM_COL32_WHITE, hueCol, hueCol, IM_COL32_WHITE);
+        dl->AddRectFilledMultiColor(a, b, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32_BLACK, IM_COL32_BLACK);
+        RoundCorners(dl, a, b, 12.0f * s, k.card2);
+        ImGui::ColorConvertHSVtoRGB(g_picker.h, g_picker.sat, g_picker.val, cr, cg, cb);
+        const ImU32 cur = ImGui::ColorConvertFloat4ToU32(ImVec4(cr, cg, cb, 1.0f));
+        RingHandle(dl, ImVec2(a.x + g_picker.sat * w, a.y + (1.0f - g_picker.val) * 160.0f * s), cur, svActive,
+                   ImGui::GetID("##svk"));
+
+        // Hue bar.
+        ImGui::Dummy(ImVec2(0.0f, 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        const ImVec2 ha = ImGui::GetCursorScreenPos();
+        const float hh = 14.0f * s;
+        const ImVec2 hb(ha.x + w, ha.y + hh);
+        ImGui::InvisibleButton("##hue", ImVec2(w, hh));
+        const bool hueActive = ImGui::IsItemActive();
+        if (hueActive) {
+            g_picker.h = ImClamp((ImGui::GetIO().MousePos.x - ha.x) / w, 0.0f, 0.9999f);
+            changed = true;
+        }
+        for (int i = 0; i < 6; ++i) {
+            float r0, g0, b0, r1, g1, b1;
+            ImGui::ColorConvertHSVtoRGB(i / 6.0f, 1.0f, 1.0f, r0, g0, b0);
+            ImGui::ColorConvertHSVtoRGB((i + 1) / 6.0f > 0.9999f ? 0.0f : (i + 1) / 6.0f, 1.0f, 1.0f, r1, g1, b1);
+            const ImU32 c0 = ImGui::ColorConvertFloat4ToU32(ImVec4(r0, g0, b0, 1.0f));
+            const ImU32 c1 = ImGui::ColorConvertFloat4ToU32(ImVec4(r1, g1, b1, 1.0f));
+            dl->AddRectFilledMultiColor(ImVec2(ha.x + w * i / 6.0f, ha.y), ImVec2(ha.x + w * (i + 1) / 6.0f, hb.y),
+                                        c0, c1, c1, c0);
+        }
+        RoundCorners(dl, ha, hb, hh * 0.5f, k.card2);
+        RingHandle(dl, ImVec2(ha.x + g_picker.h * w, ha.y + hh * 0.5f), hueCol, hueActive, ImGui::GetID("##huek"));
+
+        if (changed) PickerApply(theme, false);
+
+        // Preview, hex field, Done.
+        ImGui::Dummy(ImVec2(0.0f, 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        const ImVec2 rp = ImGui::GetCursorScreenPos();
+        const float bw = ui::ButtonSize("Done").x;
+        dl->AddRectFilled(rp, ImVec2(rp.x + 38.0f * s, rp.y + 38.0f * s), cur, 10.0f * s);
+        dl->AddRect(rp, ImVec2(rp.x + 38.0f * s, rp.y + 38.0f * s), IM_COL32(255, 255, 255, 38), 10.0f * s);
+        ImGui::SetCursorScreenPos(ImVec2(rp.x + 48.0f * s, rp.y));
+        if (ui::Field("##hex", g_picker.hex, sizeof(g_picker.hex), w - 48.0f * s - bw - 10.0f * s)) {
+            ImVec4 parsed;
+            if (ParseHex6(g_picker.hex, parsed)) {
+                ImGui::ColorConvertRGBtoHSV(parsed.x, parsed.y, parsed.z, g_picker.h, g_picker.sat, g_picker.val);
+                PickerApply(theme, false);
+            }
+        }
+        ImGui::SetCursorScreenPos(ImVec2(rp.x + w - bw, rp.y));
+        if (ui::Button("Done", ui::ButtonKind::Primary)) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    } else if (g_picker.dirty) {
+        g_picker.dirty = false;
+        PersistTheme();
+    }
+}
+
 void LookCard(ConfigDocument&) {
     const ui::Tokens& k = ui::Tok();
     const float s = S();
@@ -228,7 +386,10 @@ void LookCard(ConfigDocument&) {
     const bool customActive = !presetActive;
     if (SwatchButton("custom", custom, theme.hasCustomAccent ? U32(theme.customAccent) : 0u, customActive,
                      "Pick any colour", !theme.hasCustomAccent))
+    {
+        PickerOpen(theme);
         ImGui::OpenPopup("##accentpicker");
+    }
     {
         char hex[16];
         const ImVec4& shown = customActive ? theme.accent : theme.customAccent;
@@ -243,37 +404,7 @@ void LookCard(ConfigDocument&) {
     ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + 40.0f * s));
     ImGui::Dummy(ImVec2(0.0f, 0.0f));
 
-    // The placeholder picker (session 4 swaps it for the themed one).
-    static bool pending = false;
-    ImGui::SetNextWindowPos(ImVec2(custom.x - 17.0f * s, custom.y + 26.0f * s));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, k.card2);
-    ImGui::PushStyleColor(ImGuiCol_Border, k.line2);
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 16.0f * s);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f * s, 16.0f * s));
-    if (ImGui::BeginPopup("##accentpicker")) {
-        ImVec4 col = theme.hasCustomAccent ? theme.customAccent : theme.accent;
-        ImGui::SetNextItemWidth(258.0f * s);
-        if (ImGui::ColorPicker3("##picker", &col.x,
-                                ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview |
-                                    ImGuiColorEditFlags_PickerHueBar | ImGuiColorEditFlags_DisplayHex |
-                                    ImGuiColorEditFlags_NoLabel)) {
-            col.w = 1.0f;
-            theme.customAccent = col;
-            theme.hasCustomAccent = true;
-            theme.accent = col;
-            theme.colorStrength = 0.65f;
-            RebuildPalette(theme);
-            ThemeChanged(false);
-            pending = true;
-        }
-        ImGui::EndPopup();
-    }
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor(2);
-    if (pending && !ImGui::IsPopupOpen("##accentpicker")) {
-        pending = false;
-        PersistTheme();
-    }
+    DrawPicker(theme, ImVec2(row.x, row.y + 50.0f * s));
 
     // Motion.
     {
