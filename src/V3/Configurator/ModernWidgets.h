@@ -119,6 +119,21 @@ bool& DisclosureState(const char* key);
 void BeginReveal(const char* key);
 void EndReveal();
 
+// Nested settings (the prototype's .nest): indented 34 px with a 2 px accent
+// rule on the left. Rows drawn between keep their usual layout.
+void BeginNest();
+void EndNest();
+
+// Two-column key/value list (label column 160 px, values in mono).
+void KeyValueGrid(const char* const* keys, const char* const* values, int count);
+
+// Row of stat tiles (label over a mono value), four per row.
+void StatGrid(const char* const* labels, const char* const* values, int count,
+              bool topGap = true);
+
+// 12 px progress bar with moving stripes. fraction < 0 draws the empty track.
+void StripedProgress(float fraction);
+
 // --- Controls ----------------------------------------------------------------
 // 46x28 toggle. `delay` staggers the visual flip (profile apply, 40 ms steps).
 bool Toggle(const char* id, bool* value, float delay = 0.0f);

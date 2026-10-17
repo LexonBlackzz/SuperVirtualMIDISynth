@@ -68,6 +68,7 @@ struct OffsetFrame {
     bool pushedAlpha;
 };
 std::vector<OffsetFrame> g_offsets;
+std::vector<ImVec2> g_nests;
 double g_pageStart = -10.0;
 int g_entryIndex = 0;
 int g_entryDepth = 0;
@@ -748,7 +749,95 @@ void BeginReveal(const char* key) {
     PushOffset(-S(8.0f) * (1.0f - e), t >= 1.0f ? 1.0f : e);
 }
 
+void KeyValueGrid(const char* const* keys, const char* const* values, int count) {
+    const float x0 = ImGui::GetCursorScreenPos().x;
+    const float colW = S(160.0f), gap = S(16.0f);
+    const float wrap = (std::max)(S(80.0f), ImGui::GetContentRegionAvail().x - colW - gap);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    for (int i = 0; i < count; ++i) {
+        const float y = ImGui::GetCursorScreenPos().y;
+        PushText(0, 13.0f);
+        dl->AddText(ImVec2(x0, y), g_tok.muted, keys[i]);
+        PopFont();
+        PushNum(13.0f, true);
+        const ImVec2 ts = ImGui::CalcTextSize(values[i], nullptr, false, wrap);
+        dl->AddText(nullptr, 0.0f, ImVec2(x0 + colW + gap, y), g_tok.text, values[i], nullptr, wrap);
+        PopFont();
+        ImGui::Dummy(ImVec2(1.0f, (std::max)(ts.y, ImGui::GetTextLineHeight()) + S(8.0f) - ImGui::GetStyle().ItemSpacing.y));
+    }
+}
+
+void StatGrid(const char* const* labels, const char* const* values, int count, bool topGap) {
+    if (topGap) ImGui::Dummy(ImVec2(0.0f, S(16.0f) - ImGui::GetStyle().ItemSpacing.y));
+    const int cols = (std::min)(4, (std::max)(1, count));
+    const float gap = S(12.0f);
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float cw = (w - gap * (cols - 1)) / cols;
+    PushText(0, 12.0f);
+    const float labH = ImGui::GetTextLineHeight();
+    PopFont();
+    PushNum(16.0f, true);
+    const float valH = ImGui::GetTextLineHeight();
+    PopFont();
+    const float h = S(14.0f) * 2.0f + labH + valH;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const int rows = (count + cols - 1) / cols;
+    for (int i = 0; i < count; ++i) {
+        const ImVec2 a(origin.x + (i % cols) * (cw + gap), origin.y + (i / cols) * (h + gap));
+        dl->AddRectFilled(a, ImVec2(a.x + cw, a.y + h), g_tok.card2, g_tok.rack ? S(3.0f) : S(10.0f));
+        PushText(0, 12.0f);
+        dl->AddText(ImVec2(a.x + S(16.0f), a.y + S(14.0f)), g_tok.muted, Caps(labels[i]));
+        PopFont();
+        PushNum(16.0f, true);
+        dl->AddText(ImVec2(a.x + S(16.0f), a.y + S(14.0f) + labH), g_tok.text, values[i]);
+        PopFont();
+    }
+    ImGui::Dummy(ImVec2(w, rows * h + (rows - 1) * gap));
+}
+
+void StripedProgress(float fraction) {
+    const float h = S(12.0f);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), g_tok.card2, h * 0.5f);
+    const float f = (std::max)(0.0f, (std::min)(1.0f, fraction));
+    const float fw = (std::max)(f > 0.0f ? h : 0.0f, w * f);
+    if (fraction >= 0.0f && fw > 0.0f) {
+        const ImVec2 b(p.x + fw, p.y + h);
+        dl->AddRectFilled(p, b, g_tok.acc, h * 0.5f);
+        dl->PushClipRect(p, b, true);
+        const float period = S(20.0f);
+        const float phase = GetMotion() == Motion::Off ? 0.0f : std::fmod(static_cast<float>(Now()) / 0.6f, 1.0f) * period;
+        for (float x = p.x - period + phase; x < b.x + period; x += period) {
+            const ImVec2 q[4] = {ImVec2(x, b.y), ImVec2(x + S(8.0f), b.y), ImVec2(x + S(8.0f) + h, p.y), ImVec2(x + h, p.y)};
+            dl->AddConvexPolyFilled(q, 4, IM_COL32(255, 255, 255, 46));
+        }
+        dl->PopClipRect();
+    }
+    ImGui::Dummy(ImVec2(w, h));
+}
+
 void EndReveal() { PopOffset(); }
+
+void BeginNest() {
+    ImGui::Dummy(ImVec2(0.0f, S(4.0f) - ImGui::GetStyle().ItemSpacing.y));
+    g_nests.push_back(ImGui::GetCursorScreenPos());
+    ImGui::Indent(S(34.0f));
+}
+
+void EndNest() {
+    if (g_nests.empty()) return;
+    ImGui::Unindent(S(34.0f));
+    const ImVec2 start = g_nests.back();
+    g_nests.pop_back();
+    const float endY = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y;
+    ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(start.x + S(18.0f), start.y),
+                                              ImVec2(start.x + S(20.0f), endY), g_tok.accLine);
+    ImGui::Dummy(ImVec2(0.0f, S(4.0f) - ImGui::GetStyle().ItemSpacing.y));
+}
+
 
 // Toggle --------------------------------------------------------------------------------
 
