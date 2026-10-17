@@ -62,18 +62,7 @@ void DrawRackLever(ImDrawList* dl, ImVec2 pos, ImVec2 size, bool on, bool hovere
 // Small lamp; `on` lights it with the accent colour.
 void DrawLed(ImDrawList* dl, ImVec2 center, float radius, bool on,
              const ImVec4* color = nullptr);
-// Bordered RESTART tag, drawn at the cursor.
-void RestartPill();
 
-// --- Panel controls: captioned controls for hardware-style panels ----------
-// Small mono caption; hover shows `help`; optional RESTART tag after it.
-void PanelCaption(const char* caption, const char* help, bool restart = false);
-// Caption above a key group. Returns true when the selection changed.
-bool PanelKeys(const char* caption, int* current, const char* const* labels,
-               int count, const char* help, bool restart = false);
-// Lever with its caption beside it.
-bool PanelLever(const char* caption, bool* value, const char* help,
-                bool restart = false);
 // Knob centred in the available width. `committed` is set when the drag ends
 // (for settings that should be sent once, not on every frame).
 bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
@@ -81,46 +70,11 @@ bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
                const char* help, bool* committed = nullptr,
                float (*displayFn)(float) = nullptr,
                float (*inverseFn)(float) = nullptr);
-// Number on an LCD-styled field. `committed` is set when editing finishes.
-bool PanelLcdInt(const char* caption, int* value, int minValue, int maxValue,
-                 const char* help, bool restart = false,
-                 bool* committed = nullptr, const char* zeroText = nullptr);
-// Captioned integer slider (ctrl+click to type). `zeroText` replaces the
-// value readout when it is 0 (e.g. "AUTO").
-bool PanelSliderInt(const char* caption, int* value, int minValue, int maxValue,
-                    const char* help, bool restart = false,
-                    const char* zeroText = nullptr);
-// Inset display: dark background, rim, optional grid. Draws only; the caller
-// reserves layout space (e.g. with Dummy).
-void DrawLcdFrame(ImDrawList* dl, ImVec2 min, ImVec2 max, int gridCols = 0,
-                  int gridRows = 0);
-// LED ladder meter (shared by the limiter page and DrawVerticalMeter).
-void DrawLedLadder(ImDrawList* dl, ImVec2 pos, ImVec2 size, float value,
-                   float peak, bool fromTop, const ImVec4* single);
 
-// Settings label with the first sentence of `help` as a dim description line
-// (clipped to the column); the full text shows on hover.
-void SettingLabel(const char* label, const char* help);
-void HelpMarker(const char* desc);
-bool ToggleSwitch(const char* label, bool* value, const char* tooltip = nullptr);
-bool LabeledFloat(const char* label, float* value, float min, float max,
-                  const char* format = "%.2f", const char* tooltip = nullptr);
-bool LabeledInt(const char* label, int* value, int min, int max,
-                const char* tooltip = nullptr);
-bool LabeledUInt(const char* label, unsigned int* value, unsigned int min,
-                 unsigned int max, const char* tooltip = nullptr);
-bool LabeledCombo(const char* label, int* current, const char* const* items,
-                  int itemCount, const char* tooltip = nullptr);
 bool SliderFloat(const char* label, float* value, float min, float max,
                  const char* format = "%.2f", const char* tooltip = nullptr);
 bool SliderInt(const char* label, int* value, int min, int max,
                const char* tooltip = nullptr);
-void StatusBar(const char* text, bool modified);
-void ToastNotification(const char* message, float durationSeconds = 3.0f);
-void PushToastStyle();
-void PopToastStyle();
-bool BeginToast(const char* id);
-void EndToast();
 
 struct KnobState {
     float value;
@@ -139,27 +93,9 @@ struct KnobState {
 
 bool RotaryKnob(KnobState& state, const char* format = "%.2f");
 
-void DrawVerticalMeter(const char* id, float value, float peak,
-                       const ImVec2& size, bool showScale = true);
-void DrawGainReductionMeter(const char* id, float gr,
-                            const ImVec2& size);
 
-// Applied-echo badge: compares the WORKING copy against the live state
-// the engine echoes back in telemetry ("applied"), so the user sees the
-// RuntimeLink flush converge (or stall).  Green APPLIED when they match,
-// amber PENDING while a flush is in flight, grey OFFLINE when no host.
-void AppliedStateBadge(bool connected,
-                       const svms::RuntimeLinkTelemetryV2* telemetry,
-                       const ConfigValues& working,
-                       const char* scopeTooltip = nullptr);
-bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,
-                        const ConfigValues& working);
 
-bool BeginToastOverlay();
-void EndToastOverlay();
 
-void LiveBadge(const char* tooltip = nullptr);
-void RestartRequiredBadge();
 
 } // namespace svms::cfg
 

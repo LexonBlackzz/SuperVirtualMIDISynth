@@ -63,9 +63,6 @@ void SendLiveCommand(svms::RLCommandType type, uint32_t param) {
     NoteLiveChange();
 }
 
-static float g_toastTimer = 0.0f;
-static char g_toastText[512] = {};
-static bool g_toastActive = false;
 
 void PushLabel(float scale) { PushMono(scale); }
 
@@ -149,50 +146,6 @@ void EndRackPanel() {
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
 }
 
-void SettingLabel(const char* label, const char* help) {
-    ImGui::BeginGroup();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    if (help && *help) {
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 5.0f);
-        char sentence[160];
-        size_t n = 0;
-        for (; help[n] && n < sizeof(sentence) - 4; ++n) {
-            sentence[n] = help[n];
-            if (help[n] == '.' && (help[n + 1] == ' ' || help[n + 1] == '\0')) {
-                ++n;
-                break;
-            }
-        }
-        sentence[n] = '\0';
-        const float avail = ImGui::GetContentRegionAvail().x - 6.0f;
-        ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.84f);
-        bool cut = false;
-        while (n > 4 && ImGui::CalcTextSize(sentence).x > avail) {
-            sentence[--n] = '\0';
-            cut = true;
-        }
-        if (cut) {
-            while (n > 0 && sentence[n - 1] == ' ') sentence[--n] = '\0';
-            sentence[n++] = '.';
-            sentence[n++] = '.';
-            sentence[n++] = '.';
-            sentence[n] = '\0';
-        }
-        ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
-        ImGui::TextUnformatted(sentence);
-        ImGui::PopStyleColor();
-        ImGui::PopFont();
-    }
-    ImGui::EndGroup();
-    if (help && *help && ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
-        ImGui::TextUnformatted(help);
-        ImGui::PopTextWrapPos();
-        ImGui::EndTooltip();
-    }
-}
 
 bool KeyGroup(const char* id, int* current, const char* const* labels,
               int count) {
@@ -280,58 +233,9 @@ bool KeyButton(const char* label, const ImVec2& size, bool primary, bool enabled
     return clicked;
 }
 
-void DrawLcdFrame(ImDrawList* dl, ImVec2 min, ImVec2 max, int cols, int rows) {
-    const ThemeSettings& th = GetThemeSettings();
-    dl->AddRectFilled(min, max, ImGui::GetColorU32(GetLcdBg()), th.cornerRadius);
-    const ImU32 grid = ImGui::GetColorU32(Alpha(th.accent, 0.10f));
-    for (int i = 1; i < cols; ++i) {
-        const float x = min.x + (max.x - min.x) * static_cast<float>(i) / cols;
-        dl->AddLine(ImVec2(x, min.y + 2.0f), ImVec2(x, max.y - 2.0f), grid, 1.0f);
-    }
-    for (int i = 1; i < rows; ++i) {
-        const float y = min.y + (max.y - min.y) * static_cast<float>(i) / rows;
-        dl->AddLine(ImVec2(min.x + 2.0f, y), ImVec2(max.x - 2.0f, y), grid, 1.0f);
-    }
-    dl->AddRect(min, max, ImGui::GetColorU32(GetKeyEdge()), th.cornerRadius, 0, 1.5f);
-}
 
-void PanelCaption(const char* caption, const char* help, bool restart) {
-    PushLabel(0.85f);
-    ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
-    ImGui::TextUnformatted(caption);
-    ImGui::PopStyleColor();
-    const bool hovered = ImGui::IsItemHovered();
-    PopLabel();
-    if (restart) {
-        ImGui::SameLine(0.0f, 8.0f);
-        RestartPill();
-    }
-    if (hovered && help && *help) {
-        ImGui::BeginTooltip();
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
-        ImGui::TextUnformatted(help);
-        ImGui::PopTextWrapPos();
-        ImGui::EndTooltip();
-    }
-}
 
-bool PanelKeys(const char* caption, int* current, const char* const* labels,
-               int count, const char* help, bool restart) {
-    ImGui::PushID(caption);
-    PanelCaption(caption, help, restart);
-    const bool changed = KeyGroup("##keys", current, labels, count);
-    ImGui::PopID();
-    return changed;
-}
 
-bool PanelLever(const char* caption, bool* value, const char* help, bool restart) {
-    const bool changed = ToggleSwitch(caption, value, help);
-    if (restart) {
-        ImGui::SameLine(0.0f, 10.0f);
-        RestartPill();
-    }
-    return changed;
-}
 
 bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
                float defaultValue, const char* format, float size,
@@ -369,82 +273,9 @@ bool PanelKnob(const char* label, float* value, float minValue, float maxValue,
     return changed;
 }
 
-bool PanelLcdInt(const char* caption, int* value, int minValue, int maxValue,
-                 const char* help, bool restart, bool* committed,
-                 const char* zeroText) {
-    ImGui::PushID(caption);
-    PanelCaption(caption, help, restart);
-    ImGui::SetNextItemWidth(130.0f);
-    PushMono();
-    ImGui::PushStyleColor(ImGuiCol_Text, GetAccent());
-    const bool edited = ImGui::InputInt("##lcdint", value, 0, 0);
-    const bool done = ImGui::IsItemDeactivatedAfterEdit();
-    ImGui::PopStyleColor();
-    PopMono();
-    if (edited) *value = (std::max)(minValue, (std::min)(maxValue, *value));
-    if (zeroText && *value == 0) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", zeroText);
-    }
-    if (committed) *committed = done;
-    ImGui::PopID();
-    return edited;
-}
 
-bool PanelSliderInt(const char* caption, int* value, int minValue, int maxValue,
-                    const char* help, bool restart, const char* zeroText) {
-    ImGui::PushID(caption);
-    PanelCaption(caption, help, restart);
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    PushMono();
-    ImGui::PushStyleColor(ImGuiCol_Text, GetAccent());
-    const bool changed = ImGui::SliderInt(
-        "##slider", value, minValue, maxValue,
-        (zeroText && *value == minValue) ? zeroText : "%d");
-    ImGui::PopStyleColor();
-    PopMono();
-    ImGui::PopID();
-    return changed;
-}
 
-void RestartPill() {
-    PushLabel(0.78f);
-    const char* label = "RESTART";
-    const ImVec2 ts = ImGui::CalcTextSize(label);
-    const ImVec2 pad(6.0f, 1.0f);
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    const ImVec2 size(ts.x + pad.x * 2.0f, ts.y + pad.y * 2.0f);
-    // Centre on the previous item when sharing its line (caption / lever label).
-    const float prevH = ImGui::GetItemRectSize().y;
-    if (std::fabs(ImGui::GetItemRectMin().y - p.y) < 3.0f && prevH > size.y) {
-        p.y += std::floor((prevH - size.y) * 0.5f);
-        ImGui::SetCursorScreenPos(p);
-    }
-    ImGui::Dummy(size);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    // A tag, not a warning: follows the theme accent so it never clashes.
-    const ImVec4 c = GetAccent();
-    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y),
-                ImGui::GetColorU32(Alpha(c, 0.55f)), 3.0f);
-    dl->AddText(ImVec2(p.x + pad.x, p.y + pad.y + 1.0f), ImGui::GetColorU32(c), label);
-    PopLabel();
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted("Requires driver restart to take effect.");
-        ImGui::EndTooltip();
-    }
-}
 
-void HelpMarker(const char* desc) {
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
-        ImGui::TextUnformatted(desc);
-        ImGui::PopTextWrapPos();
-        ImGui::EndTooltip();
-    }
-}
 
 void DrawRackLever(ImDrawList* dl, ImVec2 pos, ImVec2 size, bool on, bool hovered) {
     // Slot with a sliding lever; the lever lights up when on.
@@ -461,143 +292,10 @@ void DrawRackLever(ImDrawList* dl, ImVec2 pos, ImVec2 size, bool on, bool hovere
                       ImGui::GetColorU32(lever), 3.0f);
 }
 
-bool ToggleSwitch(const char* label, bool* value, const char* tooltip) {
-    ImGui::PushID(label);
-    bool changed = false;
 
-    ImVec2 pos = ImGui::GetCursorScreenPos();
-    float w = 42.0f;
-    float h = 22.0f;
-    float radius = h * 0.5f;
 
-    ImGui::InvisibleButton("toggle", ImVec2(w, h));
-    if (ImGui::IsItemClicked()) {
-        *value = !*value;
-        changed = true;
-    }
 
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const bool hov = ImGui::IsItemHovered();
-    DrawRackLever(dl, pos, ImVec2(w, h), *value, hov);
-    (void)radius;
 
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4.0f);
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (h - ImGui::GetTextLineHeight()) * 0.5f);
-    ImGui::TextUnformatted(label);
-
-    if (tooltip && ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted(tooltip);
-        ImGui::EndTooltip();
-    }
-
-    ImGui::PopID();
-    return changed;
-}
-
-bool LabeledFloat(const char* label, float* value, float min, float max,
-                  const char* format, const char* tooltip) {
-    bool changed = false;
-    ImGui::PushID(label);
-
-    float labelWidth = ImGui::CalcTextSize(label).x + 8.0f;
-    float avail = ImGui::GetContentRegionAvail().x;
-    float inputWidth = ImMin(avail - labelWidth - 8.0f, 160.0f);
-
-    ImGui::PushItemWidth(inputWidth);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - labelWidth - inputWidth);
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() - avail + labelWidth + inputWidth);
-
-    if (ImGui::InputFloat("##val", value, 0.0f, 0.0f, format)) {
-        if (*value < min) *value = min;
-        if (*value > max) *value = max;
-        changed = true;
-    }
-    ImGui::PopItemWidth();
-
-    if (tooltip && ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted(tooltip);
-        ImGui::EndTooltip();
-    }
-
-    ImGui::PopID();
-    return changed;
-}
-
-bool LabeledInt(const char* label, int* value, int min, int max,
-                const char* tooltip) {
-    bool changed = false;
-    ImGui::PushID(label);
-
-    float labelWidth = ImGui::CalcTextSize(label).x + 8.0f;
-    float avail = ImGui::GetContentRegionAvail().x;
-    float inputWidth = ImMin(avail - labelWidth - 8.0f, 160.0f);
-
-    ImGui::PushItemWidth(inputWidth);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - labelWidth - inputWidth);
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() - avail + labelWidth + inputWidth);
-
-    if (ImGui::InputInt("##val", value, 0, 0)) {
-        if (*value < min) *value = min;
-        if (*value > max) *value = max;
-        changed = true;
-    }
-    ImGui::PopItemWidth();
-
-    if (tooltip && ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted(tooltip);
-        ImGui::EndTooltip();
-    }
-
-    ImGui::PopID();
-    return changed;
-}
-
-bool LabeledUInt(const char* label, unsigned int* value, unsigned int min,
-                 unsigned int max, const char* tooltip) {
-    int signedVal = static_cast<int>(*value);
-    bool changed = LabeledInt(label, &signedVal, static_cast<int>(min),
-                              static_cast<int>(max), tooltip);
-    if (changed) *value = static_cast<unsigned int>(signedVal);
-    return changed;
-}
-
-bool LabeledCombo(const char* label, int* current, const char* const* items,
-                  int itemCount, const char* tooltip) {
-    bool changed = false;
-    ImGui::PushID(label);
-
-    float labelWidth = ImGui::CalcTextSize(label).x + 8.0f;
-    float avail = ImGui::GetContentRegionAvail().x;
-    float comboWidth = ImMin(avail - labelWidth - 8.0f, 240.0f);
-
-    ImGui::PushItemWidth(comboWidth);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - labelWidth - comboWidth);
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() - avail + labelWidth + comboWidth);
-
-    if (ImGui::Combo("##val", current, items, itemCount)) {
-        changed = true;
-    }
-    ImGui::PopItemWidth();
-
-    if (tooltip && ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted(tooltip);
-        ImGui::EndTooltip();
-    }
-
-    ImGui::PopID();
-    return changed;
-}
 
 bool SliderFloat(const char* label, float* value, float min, float max,
                  const char* format, const char* tooltip) {
@@ -659,95 +357,13 @@ bool SliderInt(const char* label, int* value, int min, int max,
     return changed;
 }
 
-void StatusBar(const char* text, bool modified) {
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
 
-    if (modified) {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
-        ImGui::Text("Configuration modified");
-        ImGui::PopStyleColor();
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
-        ImGui::TextUnformatted(text);
-        ImGui::PopStyleColor();
-    }
-}
 
-void ToastNotification(const char* message, float durationSeconds) {
-    snprintf(g_toastText, sizeof(g_toastText), "%s", message);
-    g_toastTimer = durationSeconds;
-    g_toastActive = true;
-}
 
-void PushToastStyle() {
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,
-                        (std::max)(6.0f, GetThemeSettings().cornerRadius));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 10));
-    ImVec4 bg = GetPanelBg();
-    bg.w = 0.97f;
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
-    ImGui::PushStyleColor(ImGuiCol_Border, GetAccentDim());
-}
 
-void PopToastStyle() {
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar(2);
-}
 
-bool BeginToast(const char* id) {
-    if (!g_toastActive) return false;
 
-    ImGuiIO& io = ImGui::GetIO();
-    ImVec2 pos(io.DisplaySize.x - 20.0f, io.DisplaySize.y - 20.0f);
-    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-    ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.95f);
 
-    PushToastStyle();
-    bool visible = ImGui::Begin(id, nullptr,
-                                ImGuiWindowFlags_NoDecoration |
-                                ImGuiWindowFlags_NoMove |
-                                ImGuiWindowFlags_NoSavedSettings |
-                                ImGuiWindowFlags_NoNav |
-                                ImGuiWindowFlags_NoFocusOnAppearing);
-    return visible;
-}
-
-void EndToast() {
-    ImGui::End();
-    PopToastStyle();
-}
-
-bool BeginToastOverlay() {
-    if (!g_toastActive) return false;
-
-    ImGuiIO& io = ImGui::GetIO();
-    float dt = io.DeltaTime;
-    g_toastTimer -= dt;
-    if (g_toastTimer <= 0.0f) {
-        g_toastActive = false;
-        return false;
-    }
-
-    ImVec2 pos(io.DisplaySize.x - 20.0f, io.DisplaySize.y - 20.0f);
-    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-    ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.95f);
-
-    PushToastStyle();
-    bool visible = ImGui::Begin("##toast", nullptr,
-                                ImGuiWindowFlags_NoDecoration |
-                                ImGuiWindowFlags_NoMove |
-                                ImGuiWindowFlags_NoSavedSettings |
-                                ImGuiWindowFlags_NoNav |
-                                ImGuiWindowFlags_NoFocusOnAppearing);
-    return visible;
-}
-
-void EndToastOverlay() {
-    ImGui::End();
-    PopToastStyle();
-}
 
 bool RotaryKnob(KnobState& state, const char* format) {
     ImGui::PushID(state.label);
@@ -920,166 +536,11 @@ bool RotaryKnob(KnobState& state, const char* format) {
     return changed;
 }
 
-// LED ladder: lit segments green -> amber -> red, with a peak-hold segment.
-void DrawLedLadder(ImDrawList* dl, ImVec2 pos, ImVec2 size, float value,
-                   float peak, bool fromTop, const ImVec4* single) {
-    dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
-                      ImGui::GetColorU32(GetLcdBg()), 3.0f);
-    const float segH = 4.0f;
-    const float pitch = 6.0f;
-    const int n = static_cast<int>((size.y - 4.0f) / pitch);
-    const float used = n * pitch - (pitch - segH);
-    const float pad = (size.y - used) * 0.5f;
-    const int lit = static_cast<int>(ImClamp(value, 0.0f, 1.0f) * n + 0.5f);
-    const int pk = peak > 0.01f ? static_cast<int>(ImClamp(peak, 0.0f, 1.0f) * n) : -1;
-    for (int i = 0; i < n; ++i) {
-        const float frac = static_cast<float>(i) / static_cast<float>(n);
-        ImVec4 col = single ? *single
-                            : (frac < 0.62f ? GetSuccess()
-                                            : (frac < 0.82f ? GetWarning() : GetError()));
-        const bool on = i < lit || i == pk - 0;
-        const ImVec4 c = on ? col : Alpha(col, single ? 0.07f : 0.16f);
-        const float y = fromTop ? pos.y + pad + i * pitch
-                                : pos.y + size.y - pad - segH - i * pitch;
-        dl->AddRectFilled(ImVec2(pos.x + 3.0f, y),
-                          ImVec2(pos.x + size.x - 3.0f, y + segH),
-                          ImGui::GetColorU32(c), 1.0f);
-    }
-}
 
-void DrawVerticalMeter(const char* /*id*/, float value, float peak,
-                       const ImVec2& size, bool showScale) {
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 pos = ImGui::GetCursorScreenPos();
-    DrawLedLadder(dl, pos, size, value, peak, false, nullptr);
 
-    if (showScale) {
-        PushMono();
-        auto drawTick = [&](float db, const char* text) {
-            float frac = (db + 48.0f) / 48.0f;
-            float y = pos.y + size.y - size.y * frac;
-            dl->AddText(ImVec2(pos.x + size.x + 4.0f, y - 6.0f),
-                        ImGui::GetColorU32(Alpha(GetMutedText(), 0.85f)), text);
-        };
-        drawTick(0.0f, "0");
-        drawTick(-3.0f, "-3");
-        drawTick(-6.0f, "-6");
-        drawTick(-12.0f, "-12");
-        drawTick(-24.0f, "-24");
-        drawTick(-48.0f, "-48");
-        PopMono();
-    }
 
-    ImGui::Dummy(ImVec2(size.x + (showScale ? 34.0f : 0.0f), size.y));
-}
 
-void DrawGainReductionMeter(const char* /*id*/, float gr,
-                            const ImVec2& size) {
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 pos = ImGui::GetCursorScreenPos();
-    const ImVec4 amber = GetAccent();
-    DrawLedLadder(dl, pos, size, ImClamp(fabsf(gr) / 24.0f, 0.0f, 1.0f), 0.0f,
-                  true, &amber);
 
-    PushMono();
-    auto drawTick = [&](float db, const char* text) {
-        float y = pos.y + size.y * (db / 24.0f);
-        dl->AddText(ImVec2(pos.x + size.x + 4.0f, y - 6.0f),
-                    ImGui::GetColorU32(Alpha(GetMutedText(), 0.85f)), text);
-    };
-    drawTick(0.0f, "0");
-    drawTick(-3.0f, "-3");
-    drawTick(-6.0f, "-6");
-    drawTick(-12.0f, "-12");
-    drawTick(-24.0f, "-24");
 
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.1f dB", gr);
-    dl->AddText(ImVec2(pos.x + 2.0f, pos.y + size.y + 3.0f),
-                ImGui::GetColorU32(GetAccent()), buf);
-    PopMono();
-
-    ImGui::Dummy(ImVec2(size.x + 34.0f, size.y + 18.0f));
-}
-
-bool LiveAppliedMatches(const svms::RuntimeLinkTelemetryV2& telemetry,
-                        const ConfigValues& working) {
-    const svms::RuntimeLiveStateV2& e = telemetry.live;
-    const auto closeEnough = [](float a, float b) {
-        const float d = a - b;
-        return d > -1e-4f && d < 1e-4f;
-    };
-    if (e.correctnessMode != (working.correctnessMode ? 1u : 0u)) return false;
-    if (e.reverbEnabled != (working.enableReverb ? 1u : 0u)) return false;
-    if (e.limiterEnabled != (working.limiterEnabled ? 1u : 0u)) return false;
-    if (e.limiterAlgorithm != working.limiterAlgorithm) return false;
-    if (e.maxVoices != 0u && e.maxVoices != working.maxVoices) return false;
-    if (!closeEnough(e.masterVolume, working.masterVolume)) return false;
-    if (!closeEnough(e.reverbMix, working.reverbMix)) return false;
-    if (!closeEnough(e.reverbRoomSize, working.reverbRoomSize)) return false;
-    if (!closeEnough(e.reverbDecay, working.reverbDecay)) return false;
-    if (!closeEnough(e.reverbDamping, working.reverbDamping)) return false;
-    if (!closeEnough(e.reverbWidth, working.reverbWidth)) return false;
-    if (!closeEnough(e.reverbDiffusion, working.reverbDiffusion)) return false;
-    if (!closeEnough(e.reverbPreDelayMs, working.reverbPreDelayMs)) return false;
-    if (!closeEnough(e.reverbEarlyLevel, working.reverbEarlyLevel)) return false;
-    if (!closeEnough(e.reverbLateLevel, working.reverbLateLevel)) return false;
-    if (!closeEnough(e.reverbModDepth, working.reverbModDepth)) return false;
-    if (!closeEnough(e.reverbModRate, working.reverbModRate)) return false;
-    if (!closeEnough(e.reverbLowCutHz, working.reverbLowCutHz)) return false;
-    if (!closeEnough(e.reverbHighCutHz, working.reverbHighCutHz)) return false;
-    if (!closeEnough(e.limiterThreshold, working.limiterThreshold)) return false;
-    if (!closeEnough(e.limiterLookaheadMs, working.limiterLookaheadMs)) return false;
-    if (!closeEnough(e.limiterAttackMs, working.limiterAttackMs)) return false;
-    if (!closeEnough(e.limiterReleaseMs, working.limiterReleaseMs)) return false;
-    return true;
-}
-
-void AppliedStateBadge(bool connected,
-                       const svms::RuntimeLinkTelemetryV2* telemetry,
-                       const ConfigValues& working, const char* scopeTooltip) {
-    ImGui::SameLine();
-    bool synced = connected && telemetry && LiveAppliedMatches(*telemetry, working);
-    if (connected && telemetry && !synced) {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetWarning());
-        ImGui::TextDisabled("PENDING");
-    } else if (connected && telemetry) {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
-        ImGui::TextDisabled("APPLIED");
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, GetMutedText());
-        ImGui::TextDisabled("OFFLINE");
-    }
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted(scopeTooltip ? scopeTooltip
-            : "Engine applied state vs working copy");
-        if (connected && telemetry && !synced) {
-            ImGui::TextUnformatted("Working values differ from the engine's");
-            ImGui::TextUnformatted("applied echo — awaiting the next live flush.");
-        }
-        ImGui::EndTooltip();
-    }
-}
-
-void LiveBadge(const char* tooltip) {
-    const char* label = "LIVE";
-
-    ImGui::PushStyleColor(ImGuiCol_Text, GetSuccess());
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-
-    if (tooltip && ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted(tooltip);
-        ImGui::EndTooltip();
-    }
-}
-
-void RestartRequiredBadge() {
-    ImGui::SameLine();
-    RestartPill();
-}
 
 } // namespace svms::cfg
