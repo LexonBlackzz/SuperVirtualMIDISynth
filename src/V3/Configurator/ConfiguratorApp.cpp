@@ -18,9 +18,7 @@
 #include "PageMidi.h"
 #include "PageOffline.h"
 #include "PageLiveRecording.h"
-#include "PageReverb.h"
-#include "PageLimiter.h"
-#include "PageChannelLimiter.h"
+#include "PageEffects.h"
 #include "PageDiagnostics.h"
 #include "PageAdvanced.h"
 #include "PageAbout.h"
@@ -1041,9 +1039,7 @@ void ConfiguratorApp::DrawPageContent() {
     case NavPage::Home:        DrawHomePage(config_); break;
     case NavPage::Sound:       DrawSoundPage(config_); break;
     case NavPage::Effects:
-        DrawReverbPage(config_);
-        DrawLimiterPage(config_);
-        DrawChannelLimiterPage(config_);
+        DrawEffectsPage(config_, effectsPanel_);
         break;
     case NavPage::Output:      DrawAudioPage(config_, easterEggs_, AudioView::Output); break;
     case NavPage::Performance: DrawPerformancePage(config_); break;

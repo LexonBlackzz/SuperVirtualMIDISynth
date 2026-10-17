@@ -356,9 +356,7 @@ if(NOT WIN32)
                 Configurator/PageMidi.cpp
                 Configurator/PageOffline.cpp
                 Configurator/PageLiveRecording.cpp
-                Configurator/PageReverb.cpp
-                Configurator/PageLimiter.cpp
-                Configurator/PageChannelLimiter.cpp
+                Configurator/PageEffects.cpp
                 Configurator/PageDiagnostics.cpp
                 Configurator/PageAdvanced.cpp
                 Configurator/PageAbout.cpp
@@ -974,9 +972,7 @@ if(NOT SVMS_XP_COMPAT)
         Configurator/PageMidi.cpp
         Configurator/PageOffline.cpp
         Configurator/PageLiveRecording.cpp
-        Configurator/PageReverb.cpp
-        Configurator/PageLimiter.cpp
-        Configurator/PageChannelLimiter.cpp
+        Configurator/PageEffects.cpp
         Configurator/PageDiagnostics.cpp
         Configurator/PageAdvanced.cpp
         Configurator/PageAbout.cpp
