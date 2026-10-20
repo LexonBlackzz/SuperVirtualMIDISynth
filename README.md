@@ -145,9 +145,8 @@ The Linux build provides:
 - `libsvmsapi.so`, the native API runtime
 - `libOmniMIDI.so`, a compatibility name used by Linux Ziggy
 
-See [src/V3/LINUX.md](src/V3/LINUX.md) for setup, MIDI-port connection, and
-Ziggy instructions. GitHub Actions also builds and tests an Ubuntu 18.04
-compatible x86-64 archive.
+Connect a MIDI source to the `svmsd` ALSA port with `aconnect`. GitHub Actions
+also builds and tests an Ubuntu 18.04 compatible x86-64 archive.
 
 ## Native API
 
@@ -178,9 +177,14 @@ multi-process runtime use.
 | --- | --- |
 | `src/V3` | V3 driver, synth engine, Configurator, renderer, and tests |
 | `src/V3/include` | Public SVMS API header and integration guide |
-| `src` | Earlier SVMS implementations and supporting projects |
-| `third_party` | Vendored dependencies and their licenses |
+| `third_party` | Vendored Dear ImGui (used backends only) and nlohmann/json |
+| `asio-main` | Steinberg ASIO SDK sources (GPLv3 option), used by the optional ASIO output |
 | `.github/workflows` | Continuous-integration builds |
+
+## Earlier versions
+
+V1 (TinySoundFont) and V2 (BASSMIDI) live on the `v1` and `v2` branches. `main`
+is V3 only.
 
 ## License
 
