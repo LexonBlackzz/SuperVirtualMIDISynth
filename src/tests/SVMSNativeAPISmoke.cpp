@@ -1,0 +1,540 @@
+#include <windows.h>
+
+#include "include/svmsapi.h"
+
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+
+using GetInterfaceProc = SVMS_Result (SVMS_CALL *)(
+    uint32_t, uint32_t, SVMS_Interface*);
+using InitializeKDMAPIProc = void* (WINAPI*)();
+using TerminateKDMAPIProc = void (WINAPI*)();
+using SendDirectDataProc = void (WINAPI*)(DWORD);
+
+int main(int argc, char** argv) {
+    if (argc < 2 || argc > 3) {
+        std::puts("FAIL: expected SVMS.dll and optional SoundFont path");
+        return 1;
+    }
+    HMODULE runtime = LoadLibraryA(argv[1]);
+    if (!runtime) {
+        std::puts("FAIL: could not load the native runtime");
+        return 1;
+    }
+    const auto getInterface = reinterpret_cast<GetInterfaceProc>(
+        GetProcAddress(runtime, "SVMS_GetInterface"));
+    if (!getInterface) {
+        std::puts("FAIL: permanent bootstrap symbol is missing");
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // Simulate an ABI-1 caller compiled before the optional function-table
+    // tail existed. The runtime must report its newer size without writing a
+    // byte beyond the older caller's table.
+    constexpr uint32_t oldTableSize = static_cast<uint32_t>(
+        offsetof(SVMS_Interface, send_timed_short_batch));
+    alignas(SVMS_Interface) unsigned char oldStorage[oldTableSize + 16u];
+    std::memset(oldStorage, 0, oldTableSize);
+    std::memset(oldStorage + oldTableSize, 0xa5, 16u);
+    auto* oldTable = reinterpret_cast<SVMS_Interface*>(oldStorage);
+    if (getInterface(SVMS_ABI_VERSION_1, oldTableSize, oldTable) !=
+            SVMS_RESULT_OK || oldTable->struct_size != sizeof(SVMS_Interface)) {
+        std::puts("FAIL: older ABI-1 table negotiation failed");
+        FreeLibrary(runtime);
+        return 1;
+    }
+    for (uint32_t i = 0u; i < 16u; ++i) {
+        if (oldStorage[oldTableSize + i] != 0xa5u) {
+            std::puts("FAIL: ABI table write exceeded caller size");
+            FreeLibrary(runtime);
+            return 1;
+        }
+    }
+
+    SVMS_Interface api{};
+    if (getInterface(999u, sizeof(api), &api) !=
+            SVMS_RESULT_UNSUPPORTED_ABI ||
+        getInterface(SVMS_ABI_VERSION_1, 8u, &api) !=
+            SVMS_RESULT_INVALID_ARGUMENT ||
+        getInterface(SVMS_ABI_VERSION_1, sizeof(api), &api) !=
+            SVMS_RESULT_OK ||
+        api.abi_version != SVMS_ABI_VERSION_1 ||
+        api.struct_size != sizeof(api) ||
+        (api.capabilities & (SVMS_CAP_EXACT_QPC_TIMESTAMPS |
+                             SVMS_CAP_SHORT_EVENT_BATCH |
+                             SVMS_CAP_SYSTEM_EXCLUSIVE |
+                             SVMS_CAP_TELEMETRY_V1 |
+                             SVMS_CAP_EXACT_MONOTONIC_NS |
+                             SVMS_CAP_EXACT_OUTPUT_FRAMES |
+                             SVMS_CAP_QUEUE_CONTROL |
+                             SVMS_CAP_SOUNDFONT_RELOAD |
+                             SVMS_CAP_MIXED_TIMESTAMP_BATCH |
+                             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS |
+                             SVMS_CAP_CONFIG_JSON |
+                             SVMS_CAP_CANCELLABLE_SUBMISSION)) !=
+            (SVMS_CAP_EXACT_QPC_TIMESTAMPS |
+             SVMS_CAP_SHORT_EVENT_BATCH | SVMS_CAP_SYSTEM_EXCLUSIVE |
+             SVMS_CAP_TELEMETRY_V1 | SVMS_CAP_EXACT_MONOTONIC_NS |
+             SVMS_CAP_EXACT_OUTPUT_FRAMES | SVMS_CAP_QUEUE_CONTROL |
+             SVMS_CAP_SOUNDFONT_RELOAD | SVMS_CAP_MIXED_TIMESTAMP_BATCH |
+             SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON |
+             SVMS_CAP_CANCELLABLE_SUBMISSION) ||
+        !api.create_session || !api.destroy_session || !api.send_short ||
+        !api.send_short_at_qpc || !api.send_short_batch ||
+        !api.send_system_exclusive || !api.reset || !api.get_telemetry ||
+        !api.get_runtime_clock || !api.send_timed_short_batch ||
+        !api.get_output_clock || !api.get_monotonic_clock ||
+        !api.set_ingress_mode || !api.get_queue_info ||
+        !api.load_soundfont_utf8 || !api.panic ||
+        !api.create_offline_session || !api.render_offline ||
+        !api.get_offline_telemetry || !api.get_config_json ||
+        !api.patch_config_json || !api.get_config_path_utf8 ||
+        !api.cancel_session_submissions ||
+        (api.capabilities & SVMS_CAP_TELEMETRY_V2) != SVMS_CAP_TELEMETRY_V2 ||
+        !api.get_telemetry_v2 ||
+        (api.capabilities & SVMS_CAP_CALLBACK_TRACE) !=
+            SVMS_CAP_CALLBACK_TRACE ||
+        !api.enable_callback_trace || !api.read_callback_trace ||
+#if !defined(SVMS_XP_COMPAT)
+        /* The live-command surface rides the runtime-link handler, which
+         * does not exist in the XP build. */
+        (api.capabilities & SVMS_CAP_RUNTIME_COMMANDS) !=
+                SVMS_CAP_RUNTIME_COMMANDS ||
+        !api.send_runtime_command ||
+#endif
+        false) {
+        std::puts("FAIL: ABI V1 table is invalid");
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    if (argc == 3) {
+        SVMS_OfflineSessionConfig offlineConfig{};
+        offlineConfig.struct_size = sizeof(offlineConfig);
+        offlineConfig.struct_version = SVMS_STRUCT_VERSION_1;
+        offlineConfig.session_kind = SVMS_SESSION_OFFLINE_RENDER;
+        offlineConfig.sample_rate = 44100u;
+        offlineConfig.max_voices = 64u;
+        offlineConfig.render_threads = 1u;
+        offlineConfig.max_block_frames = 64u;
+        offlineConfig.render_backend = SVMS_RENDER_BACKEND_SCALAR;
+        offlineConfig.limiter_enabled = 0u;
+        offlineConfig.limiter_algorithm = SVMS_LIMITER_CLASSIC;
+        offlineConfig.master_volume = 1.0f;
+        offlineConfig.limiter_threshold = 0.95f;
+        offlineConfig.limiter_lookahead_ms = 3.0f;
+        offlineConfig.limiter_attack_ms = 0.5f;
+        offlineConfig.limiter_release_ms = 100.0f;
+        SVMS_Session first = 0u, second = 0u;
+        if (api.create_offline_session(&offlineConfig, argv[2], &first) !=
+                SVMS_RESULT_OK || first == 0u) {
+            std::puts("FAIL: isolated offline session creation failed");
+            FreeLibrary(runtime);
+            return 1;
+        }
+        offlineConfig.session_kind = SVMS_SESSION_SILENT_ANALYSIS;
+        if (api.create_offline_session(&offlineConfig, argv[2], &second) !=
+                SVMS_RESULT_OK || second == 0u || second == first) {
+            std::puts("FAIL: isolated analysis session creation failed");
+            api.destroy_session(first);
+            FreeLibrary(runtime);
+            return 1;
+        }
+        SVMS_OfflineEvent offlineEvents[2]{};
+        offlineEvents[0].frame_offset = 0u;
+        offlineEvents[0].packed_message = 0x00643c90u;
+        offlineEvents[1].frame_offset = 32u;
+        offlineEvents[1].packed_message = 0x00003c80u;
+        float left[64]{}, right[64]{};
+        if (api.render_offline(first, offlineEvents, 2u, left, right, 64u) !=
+                SVMS_RESULT_OK ||
+            api.render_offline(second, nullptr, 0u, nullptr, nullptr, 64u) !=
+                SVMS_RESULT_OK) {
+            std::puts("FAIL: isolated exact-frame render failed");
+            api.destroy_session(second);
+            api.destroy_session(first);
+            FreeLibrary(runtime);
+            return 1;
+        }
+        SVMS_OfflineTelemetry firstInfo{}, secondInfo{};
+        firstInfo.struct_size = sizeof(firstInfo);
+        firstInfo.struct_version = SVMS_STRUCT_VERSION_1;
+        secondInfo.struct_size = sizeof(secondInfo);
+        secondInfo.struct_version = SVMS_STRUCT_VERSION_1;
+        if (api.get_offline_telemetry(first, &firstInfo) != SVMS_RESULT_OK ||
+            api.get_offline_telemetry(second, &secondInfo) != SVMS_RESULT_OK ||
+            firstInfo.output_frame != 64u || firstInfo.submitted_events != 2u ||
+            secondInfo.output_frame != 64u ||
+            secondInfo.submitted_events != 0u ||
+            api.reset(first) != SVMS_RESULT_OK ||
+            api.destroy_session(second) != SVMS_RESULT_OK ||
+            api.destroy_session(first) != SVMS_RESULT_OK ||
+            api.render_offline(first, nullptr, 0u, left, right, 1u) !=
+                SVMS_RESULT_NOT_INITIALIZED) {
+            std::puts("FAIL: isolated session state/ownership was not independent");
+            api.destroy_session(second);
+            api.destroy_session(first);
+            FreeLibrary(runtime);
+            return 1;
+        }
+        std::puts("INFO: isolated offline/analysis sessions passed");
+    }
+
+    uint64_t now = 0u, frequency = 0u;
+    if (api.get_runtime_clock(&now, &frequency) != SVMS_RESULT_OK ||
+        now == 0u || frequency == 0u) {
+        std::puts("FAIL: runtime clock is unavailable");
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    SVMS_SessionConfig config{};
+    config.struct_size = sizeof(config);
+    config.struct_version = SVMS_STRUCT_VERSION_1;
+    SVMS_Session session = 0u;
+    const SVMS_Result create = api.create_session(&config, &session);
+    if (create != SVMS_RESULT_OK) {
+        std::printf("SKIP: native session could not start audio (%u)\n",
+                    static_cast<unsigned>(create));
+        FreeLibrary(runtime);
+        return 77;
+    }
+    if (session == 0u) {
+        std::puts("FAIL: session token is zero");
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    uint32_t configBytes = 0u, configPathBytes = 0u;
+    if (api.get_config_json(session, nullptr, &configBytes) !=
+            SVMS_RESULT_BUFFER_TOO_SMALL || configBytes < 3u ||
+        api.get_config_path_utf8(session, nullptr, &configPathBytes) !=
+            SVMS_RESULT_BUFFER_TOO_SMALL || configPathBytes < 2u) {
+        std::puts("FAIL: native configuration sizing query failed");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    char* configJson = new char[configBytes];
+    char* configPath = new char[configPathBytes];
+    const bool configQueryOkay =
+        api.get_config_json(session, configJson, &configBytes) ==
+            SVMS_RESULT_OK &&
+        api.get_config_path_utf8(session, configPath, &configPathBytes) ==
+            SVMS_RESULT_OK && configJson[0] == '{' && configPath[0] != '\0';
+    delete[] configPath;
+    delete[] configJson;
+    if (!configQueryOkay) {
+        std::puts("FAIL: native configuration query failed");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    uint64_t monotonicNs = 0u, outputFrame = 0u;
+    uint32_t outputRate = 0u;
+    if (api.get_monotonic_clock(&monotonicNs) != SVMS_RESULT_OK ||
+        monotonicNs == 0u ||
+        api.get_output_clock(session, &outputFrame, &outputRate) !=
+            SVMS_RESULT_OK || outputRate == 0u) {
+        std::puts("FAIL: portable/output clocks are unavailable");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    SVMS_QueueInfo queue{};
+    queue.struct_size = sizeof(queue);
+    queue.struct_version = SVMS_STRUCT_VERSION_1;
+    if (api.set_ingress_mode(session, SVMS_INGRESS_LOSSLESS) !=
+            SVMS_RESULT_OK ||
+        api.get_queue_info(session, &queue) != SVMS_RESULT_OK ||
+        queue.struct_size != sizeof(queue) ||
+        queue.ingress_mode != SVMS_INGRESS_LOSSLESS ||
+        queue.queue_capacity == 0u ||
+        api.set_ingress_mode(session, SVMS_INGRESS_PRIORITY) !=
+            SVMS_RESULT_OK) {
+        std::puts("FAIL: native queue negotiation failed");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // The legacy facade must coexist with a native session. Releasing KDMAPI
+    // ownership may not stop the engine while the native owner is still live.
+    const auto initializeKDMAPI = reinterpret_cast<InitializeKDMAPIProc>(
+        GetProcAddress(runtime, "InitializeKDMAPIStream"));
+    const auto terminateKDMAPI = reinterpret_cast<TerminateKDMAPIProc>(
+        GetProcAddress(runtime, "TerminateKDMAPIStream"));
+    const auto sendDirectData = reinterpret_cast<SendDirectDataProc>(
+        GetProcAddress(runtime, "SendDirectData"));
+    if (!initializeKDMAPI || !terminateKDMAPI || !sendDirectData ||
+        !initializeKDMAPI()) {
+        std::puts("FAIL: KDMAPI compatibility facade is unavailable");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    const auto sendLong = reinterpret_cast<UINT (WINAPI*)(LPSTR, DWORD)>(
+        GetProcAddress(runtime, "SendDirectLongDataNoBuf"));
+    const auto sendHeader = reinterpret_cast<UINT (WINAPI*)(LPMIDIHDR, UINT)>(
+        GetProcAddress(runtime, "SendDirectLongData"));
+    MIDIHDR invalidHeader{};
+    invalidHeader.lpData = reinterpret_cast<LPSTR>(~uintptr_t{0});
+    invalidHeader.dwBufferLength = 8;
+    if (!sendLong || !sendHeader ||
+        sendLong(invalidHeader.lpData, 8) != MMSYSERR_INVALPARAM ||
+        sendHeader(&invalidHeader, sizeof(invalidHeader)) != MMSYSERR_INVALPARAM) {
+        std::puts("FAIL: invalid SysEx pointers were not rejected");
+        return 1;
+    }
+    char reset[] = {char(0xf0),0x7e,0x7f,9,1,char(0xf7)};
+    if (sendLong(reset, sizeof(reset)) != MMSYSERR_NOERROR) return 1;
+    std::puts("INFO: KDMAPI facade initialized beside native session");
+    std::fflush(stdout);
+    sendDirectData(0x00643c90u);
+    terminateKDMAPI();
+    std::puts("INFO: KDMAPI facade released; native session retained");
+    std::fflush(stdout);
+    if (api.send_short(session, 0x00003c80u) != SVMS_RESULT_OK) {
+        std::puts("FAIL: KDMAPI termination stopped an owned native session");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // ── KDMAPI facade contract checks (canonical OmniMIDI.h semantics) ──
+    // timeGetTime64: timeGetTime units (milliseconds), 64-bit, monotonic.
+    const auto timeGetTime64 = reinterpret_cast<DWORD64 (WINAPI*)()>(
+        GetProcAddress(runtime, "timeGetTime64"));
+    if (!timeGetTime64) {
+        std::puts("FAIL: timeGetTime64 export is missing");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    const DWORD64 kTime0 = timeGetTime64();
+    Sleep(30u);
+    const DWORD64 kTime1 = timeGetTime64();
+    if (kTime1 <= kTime0 || (kTime1 - kTime0) < 5u ||
+        (kTime1 - kTime0) > 2000u) {
+        std::puts("FAIL: timeGetTime64 is not millisecond-scaled/monotonic");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    SVMS_ShortEvent events[2]{};
+    // Zero-timestamp records share the batch's one immediate QPC sample.
+    events[0].timestamp_qpc = 0u;
+    events[0].packed_message = 0x00643c90u;
+    events[1].timestamp_qpc = 0u;
+    events[1].packed_message = 0x00003c80u;
+    const uint8_t gmReset[] = {0xf0u, 0x7eu, 0x7fu, 0x09u, 0x01u, 0xf7u};
+    SVMS_TimedShortEvent timed[2]{};
+    timed[0].timestamp = outputFrame;
+    timed[0].timestamp_domain = SVMS_TIMESTAMP_OUTPUT_FRAME;
+    timed[0].packed_message = 0x00643c90u;
+    timed[1].timestamp = monotonicNs;
+    timed[1].timestamp_domain = SVMS_TIMESTAMP_MONOTONIC_NS;
+    timed[1].packed_message = 0x00003c80u;
+    // The direct page feed is optional: when advertised it must either take the
+    // batch or decline it (UNSUPPORTED) having consumed nothing, never reject it.
+    if ((api.capabilities & SVMS_CAP_DIRECT_PAGES) != 0u) {
+        const SVMS_Result direct =
+            api.send_short_batch_direct
+                ? api.send_short_batch_direct(session, events, 2u)
+                : SVMS_RESULT_INVALID_ARGUMENT;
+        if (direct != SVMS_RESULT_OK && direct != SVMS_RESULT_UNSUPPORTED) {
+            std::puts("FAIL: send_short_batch_direct neither accepted nor declined");
+            api.destroy_session(session);
+            FreeLibrary(runtime);
+            return 1;
+        }
+    }
+    if (api.send_short_batch(session, events, 2u) != SVMS_RESULT_OK ||
+        api.send_timed_short_batch(session, timed, 2u) != SVMS_RESULT_OK ||
+        api.send_system_exclusive(session, gmReset, sizeof(gmReset)) !=
+            SVMS_RESULT_OK || api.reset(session) != SVMS_RESULT_OK ||
+        api.panic(session) != SVMS_RESULT_OK) {
+        std::puts("FAIL: native event submission failed");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    SVMS_TelemetryV1 telemetry{};
+    telemetry.struct_size = sizeof(telemetry);
+    telemetry.struct_version = SVMS_STRUCT_VERSION_1;
+    if (api.get_telemetry(session, &telemetry) != SVMS_RESULT_OK ||
+        telemetry.struct_size != sizeof(telemetry) ||
+        telemetry.sample_rate == 0u) {
+        std::puts("FAIL: native telemetry is invalid");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    // DriverSettings: OM_GET answers from live engine state; unknown
+    // settings and live sets report failure instead of pretending.
+    const auto driverSettings =
+        reinterpret_cast<BOOL (WINAPI*)(DWORD, DWORD, LPVOID, UINT)>(
+            GetProcAddress(runtime, "DriverSettings"));
+    DWORD settingValue = 0u;
+    if (!driverSettings ||
+        !driverSettings(0x10018u /*OM_AUDIOFREQ*/, 0x1u /*OM_GET*/,
+                        &settingValue, sizeof(settingValue)) ||
+        settingValue != telemetry.sample_rate ||
+        driverSettings(0xDEADBEEFu, 0x1u /*OM_GET*/, &settingValue,
+                       sizeof(settingValue)) ||
+        driverSettings(0x10018u /*OM_AUDIOFREQ*/, 0x0u /*OM_SET*/,
+                       &settingValue, sizeof(settingValue))) {
+        std::puts("FAIL: DriverSettings OM_GET contract violated");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // SendCustomEvent: canonical (eventtype, chan, param) signature. Unknown
+    // event types and out-of-range channels must be refused, never forwarded.
+    const auto sendCustomEvent =
+        reinterpret_cast<BOOL (WINAPI*)(DWORD, DWORD, DWORD)>(
+            GetProcAddress(runtime, "SendCustomEvent"));
+    if (!sendCustomEvent || sendCustomEvent(0xFFFFFFFFu, 0u, 0u) ||
+        sendCustomEvent(0x1u, 16u, 0u)) {
+        std::puts("FAIL: SendCustomEvent accepted invalid input");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // LoadCustomSoundFontsList: null path is a no-op, never a crash.
+    const auto loadCustomSoundFontsList =
+        reinterpret_cast<void (WINAPI*)(LPWSTR)>(
+            GetProcAddress(runtime, "LoadCustomSoundFontsList"));
+    if (!loadCustomSoundFontsList) {
+        std::puts("FAIL: LoadCustomSoundFontsList export is missing");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    loadCustomSoundFontsList(nullptr);
+
+#if !defined(SVMS_XP_COMPAT)
+    // Runtime commands: a valid live command applies, an invalid argument
+    // is refused with the documented result, and a zero-length text buffer
+    // is accepted as "no text wanted".
+    char commandText[256]{};
+    if (api.send_runtime_command(session, SVMS_COMMAND_SET_STEAL_POLICY, 0u,
+                                 commandText, sizeof(commandText)) !=
+            SVMS_RESULT_OK ||
+        api.send_runtime_command(session, SVMS_COMMAND_SET_STEAL_POLICY, 99u,
+                                 commandText, sizeof(commandText)) !=
+            SVMS_RESULT_INVALID_ARGUMENT ||
+        api.send_runtime_command(session, SVMS_COMMAND_SET_STEAL_POLICY, 0u,
+                                 commandText, 0u) != SVMS_RESULT_OK ||
+        api.send_runtime_command(session, SVMS_COMMAND_SET_PER_KEY_VOICE_CAP,
+                                 0u, commandText, sizeof(commandText)) !=
+            SVMS_RESULT_OK) {
+        std::puts("FAIL: runtime command contract violated");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+#endif
+
+    // Telemetry V2: the complete census struct with live counters.
+    SVMS_TelemetryV2 telemetryV2{};
+    telemetryV2.struct_size = sizeof(telemetryV2);
+    telemetryV2.struct_version = SVMS_STRUCT_VERSION_1;
+    if (api.get_telemetry_v2(session, &telemetryV2) != SVMS_RESULT_OK ||
+        telemetryV2.struct_size != sizeof(telemetryV2) ||
+        telemetryV2.sample_rate != telemetry.sample_rate ||
+        telemetryV2.backend_kind != 0u) {
+        std::puts("FAIL: telemetry V2 census is invalid");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    // Callback trace: argument contract always; record invariants only when
+    // the audio device actually runs callbacks (CI machines may have none).
+    {
+        uint64_t cursor = 0u;
+        uint32_t count = 0u;
+        static SVMS_CallbackTrace records[1024];
+        bool ok = api.enable_callback_trace(session, 1u) == SVMS_RESULT_OK &&
+            api.read_callback_trace(session, nullptr, records, 1024u, &count) ==
+                SVMS_RESULT_INVALID_ARGUMENT &&
+            api.read_callback_trace(session, &cursor, nullptr, 1u, &count) ==
+                SVMS_RESULT_INVALID_ARGUMENT;
+        uint32_t total = 0u;
+        for (int attempt = 0; ok && attempt < 100 && total < 8u; ++attempt) {
+            Sleep(10);
+            ok = api.read_callback_trace(session, &cursor, records + total,
+                                         1024u - total, &count) ==
+                SVMS_RESULT_OK;
+            total += count;
+        }
+        if (ok && telemetryV2.audio_running && total < 2u) ok = false;
+        for (uint32_t i = 0u; ok && i < total; ++i) {
+            const SVMS_CallbackTrace& r = records[i];
+            const uint64_t parts = uint64_t{r.schedule_ns} + r.render_ns +
+                r.post_ns;
+            ok = r.frames != 0u && parts <= r.total_ns &&
+                r.total_ns - parts <= 3u && r.render_events <= r.events;
+            if (ok && i != 0u) {
+                const SVMS_CallbackTrace& p = records[i - 1u];
+                ok = r.index == p.index + 1u && r.callback == p.callback + 1u &&
+                    r.start_qpc > p.start_qpc &&
+                    r.output_frame ==
+                        p.output_frame + p.frames + r.skipped_frames &&
+                    r.note_ons >= p.note_ons &&
+                    r.producer_waits >= p.producer_waits;
+            }
+        }
+        // Disabled: the ring stops growing.
+        if (ok) {
+            ok = api.enable_callback_trace(session, 0u) == SVMS_RESULT_OK;
+            Sleep(30);
+            (void)api.read_callback_trace(session, &cursor, records, 1024u,
+                                          &count);
+            Sleep(60);
+            ok = ok && api.read_callback_trace(session, &cursor, records,
+                                               1024u, &count) ==
+                    SVMS_RESULT_OK && count == 0u;
+        }
+        if (!ok) {
+            std::puts("FAIL: callback trace contract violated");
+            api.destroy_session(session);
+            FreeLibrary(runtime);
+            return 1;
+        }
+        std::printf("INFO: callback trace: %u records\n", total);
+    }
+
+    if (api.cancel_session_submissions(session) != SVMS_RESULT_OK ||
+        api.send_short(session, 0x00643c90u) != SVMS_RESULT_CANCELLED ||
+        api.send_system_exclusive(session, gmReset, sizeof(gmReset)) !=
+            SVMS_RESULT_CANCELLED) {
+        std::puts("FAIL: native session submission cancellation failed");
+        api.destroy_session(session);
+        FreeLibrary(runtime);
+        return 1;
+    }
+    std::puts("INFO: destroying final native session");
+    std::fflush(stdout);
+    if (api.destroy_session(session) != SVMS_RESULT_OK ||
+        api.send_short(session, 0x00643c90u) !=
+            SVMS_RESULT_NOT_INITIALIZED ||
+        api.destroy_session(session) != SVMS_RESULT_INVALID_ARGUMENT) {
+        std::puts("FAIL: stale session was accepted");
+        FreeLibrary(runtime);
+        return 1;
+    }
+
+    FreeLibrary(runtime);
+    std::puts("PASS: native SVMS ABI V1 negotiation/session/event smoke");
+    return 0;
+}

@@ -1,0 +1,231 @@
+#ifndef SVMS_NOTE_ON_COLLAPSE_H
+#define SVMS_NOTE_ON_COLLAPSE_H
+
+#include <atomic>
+#include <cstdint>
+#include "synth/SVMSTypes.h"
+
+namespace svms {
+
+// Same-key note-on coalescing gate (SnappySynth stack-count pattern).
+//
+// Black-MIDI material hammers the same (channel, note) thousands of times
+// per second. Spawning one voice per event melts the audio thread in the
+// steal cascade and collapses effective polyphony to roughly "how many
+// steals fit in one block". When enabled, producers keep a per-key hit
+// accumulator anchored to a FIXED TIME WINDOW (QPC ticks): the first hit
+// outside the window spawns normally, then one hit per `threshold`
+// repeats inside the window spawns, each spawn re-anchoring the window.
+//
+// Frame-size independence is a hard requirement: the window is expressed
+// in QPC time, never in render blocks, so collapsing behavior is
+// IDENTICAL at 1024, 2048 or 16384 WASAPI frames. A collapsed stream of
+// retriggered notes still buzzes at a deterministic floor of
+// `threshold / window` Hz (e.g. 32 hits per 20 ms window = 1600 Hz).
+//
+// DEFAULT IS OFF (threshold 1 / window 0): every note-on spawns at its
+// exact QPC timestamp and every retrigger rate is reproduced faithfully.
+// Coalescing must be explicitly enabled at runtime.
+//
+// The threshold is rounded to a power of two so the hot path is a mask,
+// not a division, and is runtime-adjustable (SetThreshold) for live
+// tuning. Producers may call concurrently; all state is relaxed atomics
+// and races are benign (worst case one extra or one missed spawn).
+class NoteOnCollapseGate {
+public:
+    // Sets the spawn interval inside a window. The requested value is
+    // rounded down to a power of two (minimum 2); 0 or 1 disables
+    // coalescing so every hit spawns. Safe to call while running.
+    void SetThreshold(uint32_t requested) noexcept {
+        uint32_t t = requested;
+        if (t < 2u) {
+            threshold_.store(1u, std::memory_order_relaxed);
+            return;
+        }
+        while (t & (t - 1u)) t &= t - 1u; // round down to a power of two
+        threshold_.store(t, std::memory_order_relaxed);
+    }
+
+    uint32_t Threshold() const noexcept {
+        return threshold_.load(std::memory_order_relaxed);
+    }
+
+    // Sets the collapse window in QPC ticks (caller converts from
+    // milliseconds using the real QPC frequency; see kCollapseWindowMs in
+    // the driver). 0 disables coalescing regardless of threshold.
+    void SetWindowTicks(uint64_t ticks) noexcept {
+        windowTicks_.store(ticks, std::memory_order_relaxed);
+    }
+
+    uint64_t WindowTicks() const noexcept {
+        return windowTicks_.load(std::memory_order_relaxed);
+    }
+
+    bool Enabled() const noexcept {
+        return threshold_.load(std::memory_order_relaxed) > 1u &&
+               windowTicks_.load(std::memory_order_relaxed) != 0u;
+    }
+
+    static constexpr uint32_t kKeyCount = kChannelCount * kNoteCount;
+    // SnappySynth caps its stack counter at 30000; the spawned voice's
+    // velocity boost saturates long before this matters, but the cap
+    // keeps the counter meaningful for arbitrarily long floods.
+    static constexpr uint32_t kStackCap = 30000u;
+
+    // Returns true when the caller must push the event through ingress.
+    // `qpc` is the event's raw QPC timestamp. `outStack` reports
+    // velocity-stacking state: the number of note-ons this spawned voice
+    // represents (inclusive of the current hit) on spawn, or the running
+    // collapsed count otherwise.
+    // `owner` = the caller is the only thread driving this gate (the fast
+    // producer): the per-key read-modify-writes then use plain relaxed
+    // load+store instead of locked RMWs.  The gate is already documented as
+    // race-tolerant (worst case one extra or missed spawn); this only drops
+    // the ~20-cycle bus lock per hit on the hot producer path.
+    bool OnNoteOn(uint32_t keyIndex, uint64_t qpc,
+                  uint32_t& outStack, bool owner = false) noexcept {
+        const uint32_t t = threshold_.load(std::memory_order_relaxed);
+        if (t <= 1u) {
+            outStack = 1u; // disabled: every hit spawns on its own
+            return true;
+        }
+        const uint64_t w = windowTicks_.load(std::memory_order_relaxed);
+        if (w == 0u) {
+            outStack = 1u;
+            return true;
+        }
+        const uint32_t idx = keyIndex & (kKeyCount - 1u);
+        const uint64_t anchor = lastSpawnQpc_[idx].load(
+            std::memory_order_relaxed);
+        // anchor == 0 means "no window yet" (fresh or reset key): the
+        // first strike must always spawn immediately.
+        if (anchor == 0u || qpc - anchor >= w) {
+            // New window: spawn immediately, re-anchor at this hit.
+            lastSpawnQpc_[idx].store(qpc, std::memory_order_relaxed);
+            windowHits_[idx].store(0u, std::memory_order_relaxed);
+            stacks_[idx].store(0u, std::memory_order_relaxed);
+            outStack = 1u;
+            NoteSpawn(idx, 1u);
+            return true;
+        }
+        // Inside the window: spawn on every `t`-th hit, re-anchoring the
+        // window at each spawn so the sustained spawn rate is exactly
+        // t / window, independent of buffer size or block boundaries.
+        uint32_t hit;
+        if (owner) {
+            hit = windowHits_[idx].load(std::memory_order_relaxed) + 1u;
+            windowHits_[idx].store(hit, std::memory_order_relaxed);
+        } else {
+            hit = windowHits_[idx].fetch_add(
+                1u, std::memory_order_relaxed) + 1u;
+        }
+        if ((hit & (t - 1u)) == 0u) {
+            lastSpawnQpc_[idx].store(qpc, std::memory_order_relaxed);
+            windowHits_[idx].store(0u, std::memory_order_relaxed);
+            if (owner) {
+                outStack = stacks_[idx].load(std::memory_order_relaxed) + 1u;
+                stacks_[idx].store(0u, std::memory_order_relaxed);
+            } else {
+                outStack = stacks_[idx].exchange(
+                    0u, std::memory_order_relaxed) + 1u;
+            }
+            NoteSpawn(idx, outStack);
+            return true;
+        }
+        uint32_t prev;
+        if (owner) {
+            prev = stacks_[idx].load(std::memory_order_relaxed);
+            stacks_[idx].store(prev + 1u, std::memory_order_relaxed);
+        } else {
+            prev = stacks_[idx].fetch_add(1u, std::memory_order_relaxed);
+        }
+        outStack = prev + 1u < kStackCap ? prev + 1u : kStackCap;
+        return false;
+    }
+
+    // Timestamp-only form (no stack report) for callers that collapse
+    // without velocity stacking.
+    bool OnNoteOn(uint32_t keyIndex, uint64_t qpc) noexcept {
+        uint32_t ignoredStack = 0u;
+        return OnNoteOn(keyIndex, qpc, ignoredStack);
+    }
+
+    // Census only: average number of note-ons one spawned voice on this key
+    // stands for (>= 1), smoothed over recent spawns. Dropped hits never
+    // become voices, so the live count scales each surviving voice by this.
+    uint32_t SpawnWeight(uint32_t keyIndex) const noexcept {
+        const uint32_t w = spawnWeight16_[keyIndex & (kKeyCount - 1u)].load(
+            std::memory_order_relaxed);
+        return w > 24u ? (w + 8u) >> 4 : 1u;
+    }
+
+    // Re-excite thinning. A repeat hit that follows the key's last kept hit
+    // (spawn or re-excite) by less than the attack ramp finds every live voice
+    // still ramping, so it changes nothing audible: it is dropped here, before
+    // it costs an event. Caps a key at one kept hit per ramp (250 Hz at 4 ms).
+    // Same time domain as OnNoteOn's `qpc`.
+    void SetReExciteSpacing(uint64_t ticks) noexcept {
+        reExciteSpacing_.store(ticks, std::memory_order_relaxed);
+    }
+    bool AllowReExcite(uint32_t keyIndex, uint64_t qpc) noexcept {
+        const uint64_t spacing =
+            reExciteSpacing_.load(std::memory_order_relaxed);
+        if (spacing == 0u) return true;
+        const uint32_t idx = keyIndex & (kKeyCount - 1u);
+        const uint64_t spawned =
+            lastSpawnQpc_[idx].load(std::memory_order_relaxed);
+        const uint64_t excited =
+            lastExciteQpc_[idx].load(std::memory_order_relaxed);
+        const uint64_t last = spawned > excited ? spawned : excited;
+        if (last != 0u && qpc - last < spacing) return false;
+        lastExciteQpc_[idx].store(qpc, std::memory_order_relaxed);
+        return true;
+    }
+
+    void ResetKey(uint32_t keyIndex) noexcept {
+        const uint32_t idx = keyIndex & (kKeyCount - 1u);
+        lastExciteQpc_[idx].store(0u, std::memory_order_relaxed);
+        lastSpawnQpc_[idx].store(0u, std::memory_order_relaxed);
+        windowHits_[idx].store(0u, std::memory_order_relaxed);
+        stacks_[idx].store(0u, std::memory_order_relaxed);
+        spawnWeight16_[idx].store(0u, std::memory_order_relaxed);
+    }
+
+    void ResetChannel(uint32_t channel) noexcept {
+        const uint32_t base =
+            (channel & (kChannelCount - 1u)) * kNoteCount;
+        for (uint32_t n = 0; n < kNoteCount; ++n) {
+            ResetKey(base + n);
+        }
+    }
+
+    void ResetAll() noexcept {
+        for (uint32_t k = 0; k < kKeyCount; ++k) {
+            lastSpawnQpc_[k].store(0u, std::memory_order_relaxed);
+            lastExciteQpc_[k].store(0u, std::memory_order_relaxed);
+            windowHits_[k].store(0u, std::memory_order_relaxed);
+            stacks_[k].store(0u, std::memory_order_relaxed);
+            spawnWeight16_[k].store(0u, std::memory_order_relaxed);
+        }
+    }
+
+private:
+    // EWMA (x16 fixed point, alpha 1/4) of note-ons per spawned voice.
+    void NoteSpawn(uint32_t idx, uint32_t stack) noexcept {
+        const uint32_t old = spawnWeight16_[idx].load(std::memory_order_relaxed);
+        spawnWeight16_[idx].store((old * 3u + (stack << 4)) >> 2,
+                                  std::memory_order_relaxed);
+    }
+    std::atomic<uint32_t> spawnWeight16_[kKeyCount]{};
+    std::atomic<uint32_t> threshold_{1u}; // default: OFF
+    std::atomic<uint64_t> windowTicks_{0u}; // default: OFF
+    std::atomic<uint64_t> lastSpawnQpc_[kKeyCount]{};
+    std::atomic<uint64_t> lastExciteQpc_[kKeyCount]{};
+    std::atomic<uint64_t> reExciteSpacing_{0u};
+    std::atomic<uint32_t> windowHits_[kKeyCount]{};
+    std::atomic<uint32_t> stacks_[kKeyCount]{};
+};
+
+} // namespace svms
+
+#endif

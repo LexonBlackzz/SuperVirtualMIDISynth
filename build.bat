@@ -10,7 +10,7 @@ rem   clean      delete build\V3
 rem Cap build parallelism with: set CMAKE_BUILD_PARALLEL_LEVEL=2
 
 set "ROOT=%~dp0"
-set "V3_SRC=%ROOT%src\V3"
+set "V3_SRC=%ROOT%src"
 set "TARGET=%~1"
 if "%TARGET%"=="" set "TARGET=x64"
 
@@ -89,5 +89,5 @@ exit /b %errorlevel%
 :player
 cd /d "%ROOT%"
 if not exist build\player-local mkdir build\player-local
-cl /nologo /std:c++17 /EHsc /O2 /W3 /Zi /D_CRT_SECURE_NO_WARNINGS /I src\V3 /I third_party\imgui /Fe:build\player-local\svms_player.exe /Fo:build\player-local\ /Fd:build\player-local\ src\V3\SVMSPlayer.cpp src\V3\SVMSMidiStream.cpp third_party\imgui\imgui.cpp third_party\imgui\imgui_draw.cpp third_party\imgui\imgui_tables.cpp third_party\imgui\imgui_widgets.cpp third_party\imgui\backends\imgui_impl_win32.cpp third_party\imgui\backends\imgui_impl_dx11.cpp /link dbghelp.lib user32.lib winmm.lib version.lib d3d11.lib dxgi.lib comdlg32.lib
+cl /nologo /std:c++17 /EHsc /O2 /W3 /Zi /D_CRT_SECURE_NO_WARNINGS /I src /I third_party\imgui /Fe:build\player-local\svms_player.exe /Fo:build\player-local\ /Fd:build\player-local\ src\player\SVMSPlayer.cpp src\events\SVMSMidiStream.cpp third_party\imgui\imgui.cpp third_party\imgui\imgui_draw.cpp third_party\imgui\imgui_tables.cpp third_party\imgui\imgui_widgets.cpp third_party\imgui\backends\imgui_impl_win32.cpp third_party\imgui\backends\imgui_impl_dx11.cpp /link dbghelp.lib user32.lib winmm.lib version.lib d3d11.lib dxgi.lib comdlg32.lib
 exit /b %errorlevel%

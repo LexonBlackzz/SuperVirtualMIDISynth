@@ -1,0 +1,43 @@
+#ifndef SVMS_DIAG_WINDOW_H
+#define SVMS_DIAG_WINDOW_H
+
+#include "synth/SVMSTypes.h"
+
+namespace svms {
+
+void DiagWindow_Create(bool showWindow, bool debugOutput);
+void DiagWindow_Destroy();
+void DiagWindow_SetBackendLabel(const wchar_t* label);
+// Event-timing counters (late/clamped/obsolete/skipped output), shown by the monitor.
+void DiagWindow_SetTiming(uint64_t late, uint64_t clamped, uint64_t maxLateFrames,
+                          uint64_t staleSkipped, uint64_t skippedFrames);
+void DiagWindow_UpdateStartup(bool audioRunning, int32_t audioError,
+                              bool soundFontLoaded, uint32_t sampleRate,
+                              uint32_t bufferFrames, float masterVolume,
+                              bool waveOutFallback = false);
+void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
+                        uint32_t releasingVoices, uint32_t sustainHeldVoices,
+                        uint32_t voiceSteals,
+                        uint64_t coalescedNoteOns,
+                        uint32_t noteOnCollapseThreshold,
+                        float cpuPercent, uint32_t decimationStep,
+                        float callbackP95, float callbackP99,
+                        float callbackP999, uint64_t overBudgetCallbacks,
+                        uint32_t maxConsecutiveOverBudget,
+                        uint32_t retired, uint32_t retiredImmediate,
+                        bool audioRunning, int32_t audioError,
+                        bool soundFontLoaded, uint32_t sampleRate,
+                        uint32_t bufferFrames, float masterVolume,
+                        bool waveOutFallback, RenderBackend renderBackend,
+                        uint32_t renderThreadCount,
+                        float multicoreEffectiveness,
+                        float schedulerPercent, float dispatchPercent,
+                        float synthesisPercent, float postPercent,
+                        uint32_t eventsThisBlock, uint32_t scheduledEvents,
+                        const LiveSF2Telemetry& sf2,
+                        uint32_t effectiveVoices = 0,
+                        uint64_t planRefusals = 0);
+
+} // namespace svms
+
+#endif

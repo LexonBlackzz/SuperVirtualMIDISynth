@@ -7,12 +7,12 @@ on:
     paths:
       - ".github/workflows/linux.yml"
       - "build.sh"
-      - "src/V3/**"
+      - "src/**"
   pull_request:
     paths:
       - ".github/workflows/linux.yml"
       - "build.sh"
-      - "src/V3/**"
+      - "src/**"
 
 jobs:
   ubuntu-18-04:
@@ -53,7 +53,7 @@ jobs:
               wget -q https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-linux-x86_64.tar.gz
               tar -xzf cmake-3.27.9-linux-x86_64.tar.gz -C /opt
               export PATH=/opt/cmake-3.27.9-linux-x86_64/bin:$PATH
-              cmake -S src/V3 -B build/V3-linux-bionic -G Ninja \
+              cmake -S src -B build/V3-linux-bionic -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release -DSVMS_BUILD_TESTS=ON \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -71,7 +71,7 @@ jobs:
               cp build/V3-linux-bionic/libOmniMIDI.so \
                  build/V3-linux-bionic/libsvmsapi.so \
                  build/SVMS-V3-linux-x86_64/
-              cp src/V3/LINUX.md build/SVMS-V3-linux-x86_64/README.md
+              cp README.md build/SVMS-V3-linux-x86_64/README.md
               tar -C build -czf build/SVMS-V3-linux-x86_64-ubuntu18.04.tar.gz \
                 SVMS-V3-linux-x86_64
             '

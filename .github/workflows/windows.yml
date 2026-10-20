@@ -7,13 +7,13 @@ on:
     paths:
       - ".github/workflows/windows.yml"
       - "build.bat"
-      - "src/V3/**"
+      - "src/**"
       - "third_party/**"
   pull_request:
     paths:
       - ".github/workflows/windows.yml"
       - "build.bat"
-      - "src/V3/**"
+      - "src/**"
       - "third_party/**"
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
 
       # Compiler cache backed by the GitHub Actions cache. With a launcher set,
       # CMake switches Release to /Z7 and drops the driver PCH (both needed for
-      # sccache hits; see src/V3/CMakeLists.txt). Hit rate is in the job summary.
+      # sccache hits; see src/CMakeLists.txt). Hit rate is in the job summary.
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 

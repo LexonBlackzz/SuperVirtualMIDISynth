@@ -90,16 +90,16 @@ Configurator edits the same file; press **Save Configuration** to apply changes.
 Pick the surface that fits.
 
 - **Nothing to change.** Call the Windows MIDI API as usual and drop in `winmm.dll`.
-- **Native API.** Include `src/V3/include/svmsapi.h` and load `SVMSAPI.dll` (or
+- **Native API.** Include `src/include/svmsapi.h` and load `SVMSAPI.dll` (or
   `libsvmsapi.so`). It uses sized C structures, capability flags, timestamped
   batches, isolated offline sessions and caller-owned output buffers.
 - **KDMAPI.** `SVMSAPI.dll` and `OmniMIDI.dll` export the KDMAPI function set.
-- **Single header.** `src/V3/SVMSAPI.h` binds the KDMAPI-style exports through
+- **Single header.** `src/frontends/SVMSAPI.h` binds the KDMAPI-style exports through
   `LoadLibrary` and defines the contract for third-party synth backends.
 - **Router.** With `api.backend` set, SVMSAPI forwards events to another synth
   DLL (SVMS-API or KDMAPI) or a WinMM device instead of rendering them itself.
 
-Read [src/V3/include/README.md](src/V3/include/README.md) before integrating. It
+Read [src/include/README.md](src/include/README.md) before integrating. It
 documents every function, the capability negotiation and the discovery rules.
 
 ## Offline rendering
@@ -124,8 +124,16 @@ limiting, native-API ABI compatibility, configuration profiles and multi-process
 
 | Path | Contents |
 | --- | --- |
-| `src/V3` | Driver, synth engine, Configurator, offline renderer, tests |
-| `src/V3/include` | Public API header and integration guide |
+| `src/synth` | Core types, configuration, SoundFont parser, voice manager, offline renderer |
+| `src/render` | Render kernels (Scalar/SSE2/AVX2), worker pool, limiter, reverb, filters, GPU experiments |
+| `src/events` | MIDI ingress, event compiler, scheduler, queues, SysEx |
+| `src/driver` | Driver core, audio output (WASAPI/ASIO/DirectSound), runtime link, DLL entry |
+| `src/frontends` | WinMM, KDMAPI, native-API and BASS export surfaces, Linux daemon |
+| `src/configurator` | Configurator UI |
+| `src/canonical` | Canonical reference engine |
+| `src/player` | Reference MIDI player |
+| `src/include` | Public API header and integration guide |
+| `src/tests` | Correctness suite, benches and smoke tests |
 | `third_party` | Vendored Dear ImGui (used backends) and nlohmann/json |
 | `asio-main` | Steinberg ASIO SDK sources (GPLv3 option) for the optional ASIO output |
 | `.github/workflows` | Windows and Linux CI |
