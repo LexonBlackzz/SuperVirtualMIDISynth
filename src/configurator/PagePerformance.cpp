@@ -8,7 +8,7 @@
 #include "configurator/Widgets.h"
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "driver/SVMSRuntimeLinkProtocol.h"
+#include "driver/RuntimeLinkProtocol.h"
 
 #include <algorithm>
 #include <cmath>

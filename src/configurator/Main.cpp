@@ -1,5 +1,5 @@
 #include "configurator/ConfiguratorApp.h"
-#include "SVMSBuildInfo.h"
+#include "BuildInfo.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

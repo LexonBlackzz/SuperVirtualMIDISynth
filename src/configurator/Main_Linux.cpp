@@ -1,5 +1,5 @@
 #include "configurator/ConfiguratorApp.h"
-#include "SVMSBuildInfo.h"
+#include "BuildInfo.h"
 
 #include <cstdio>
 #include <string>

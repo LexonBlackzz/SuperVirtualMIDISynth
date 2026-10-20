@@ -4,7 +4,7 @@
 
 #include "configurator/Anim.h"
 #include "configurator/ModernWidgets.h"
-#include "SVMSBuildInfo.h"
+#include "BuildInfo.h"
 #include "configurator/DriverLink.h"
 #include "imgui.h"
 

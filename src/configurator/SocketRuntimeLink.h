@@ -1,9 +1,9 @@
 #ifndef SVMS_CONFIGURATOR_SOCKETRUNTIMELINK_H
 #define SVMS_CONFIGURATOR_SOCKETRUNTIMELINK_H
 
-// Linux stand-in for svms::RuntimeLinkClient (SVMSRuntimeLink.h is Win32
+// Linux stand-in for svms::RuntimeLinkClient (RuntimeLink.h is Win32
 // shared memory). Same public surface, so the configurator pages compile
-// unchanged, but it speaks the Control API (SVMSControlRegistry.h) over the
+// unchanged, but it speaks the Control API (ControlRegistry.h) over the
 // driver's Unix socket.
 //
 // The driver describes itself in its hello message. Anything the configurator
@@ -11,9 +11,9 @@
 // structs the pages already use; everything else is exposed through Params()
 // / SetParam() so the "unknown to this version" page can show it.
 
-#include "driver/SVMSRuntimeLinkProtocol.h"
-#include "driver/SVMSControlServer.h"
-#include "SVMSBuildInfo.h"
+#include "driver/RuntimeLinkProtocol.h"
+#include "driver/ControlServer.h"
+#include "BuildInfo.h"
 
 #include <nlohmann/json.hpp>
 

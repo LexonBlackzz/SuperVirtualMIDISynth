@@ -6,12 +6,12 @@
 #include "configurator/ModernWidgets.h"
 #include "configurator/Platform.h"
 #include "configurator/PlatformUtil.h"
-#include "SVMSBuildInfo.h"
+#include "BuildInfo.h"
 #include "configurator/Theme.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "driver/SVMSRuntimeLinkProtocol.h"
+#include "driver/RuntimeLinkProtocol.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN

@@ -4,7 +4,7 @@
 #include "configurator/ConfiguratorApp.h"
 #include "configurator/ModernWidgets.h"
 #include "configurator/PlatformUtil.h"
-#include "SVMSBuildInfo.h"
+#include "BuildInfo.h"
 #include "configurator/Theme.h"
 #include "configurator/Tour.h"
 #include "configurator/UpdateService.h"

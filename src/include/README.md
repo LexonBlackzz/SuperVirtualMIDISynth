@@ -313,7 +313,7 @@ census prints, in one struct.
 
 # The reference client
 
-`svms_player.exe` (`src/V3/SVMSPlayer.cpp`, built by ``build.bat player``)
+`svms_player.exe` (`src/V3/Player.cpp`, built by ``build.bat player``)
 is the dogfood client for all of this: it drives the
 native table (`SVMS_GetInterface` with required-slot validation), a KDMAPI
 synth, or a WinMM device, chosen at startup, with the same GetProcAddress

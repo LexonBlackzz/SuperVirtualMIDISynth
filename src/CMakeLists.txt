@@ -3,7 +3,7 @@ project(SuperVirtualMIDISynthV3 VERSION 0.11.0 LANGUAGES C CXX)
 
 include(CTest)
 
-# Sources include each other by path from src/ (e.g. "synth/SVMSTypes.h").
+# Sources include each other by path from src/ (e.g. "synth/Types.h").
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 
 option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
@@ -74,8 +74,8 @@ set(SVMS_NATIVE_ABI_MIN 1)
 set(SVMS_NATIVE_ABI_MAX 1)
 set(SVMS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${SVMS_GENERATED_DIR}")
-configure_file(synth/SVMSBuildInfo.h.in
-    "${SVMS_GENERATED_DIR}/SVMSBuildInfo.h" @ONLY)
+configure_file(synth/BuildInfo.h.in
+    "${SVMS_GENERATED_DIR}/BuildInfo.h" @ONLY)
 include_directories("${SVMS_GENERATED_DIR}")
 
 # Geist + Geist Mono (SIL OFL 1.1, configurator/fonts/OFL.txt) embedded in
@@ -106,21 +106,21 @@ if(WIN32)
     set(SVMS_RESOURCE_DESCRIPTION
         "SuperVirtualMIDISynth V3 WinMM/KDMAPI Driver")
     set(SVMS_RESOURCE_FILETYPE "VFT_DLL")
-    configure_file(synth/SVMSVersion.rc.in
+    configure_file(synth/Version.rc.in
         "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc" @ONLY)
 
     set(SVMS_RESOURCE_FILENAME "SVMSConfigurator.exe")
     set(SVMS_RESOURCE_DESCRIPTION
         "SuperVirtualMIDISynth V3 Configurator")
     set(SVMS_RESOURCE_FILETYPE "VFT_APP")
-    configure_file(synth/SVMSVersion.rc.in
+    configure_file(synth/Version.rc.in
         "${SVMS_GENERATED_DIR}/SVMSConfiguratorVersion.rc" @ONLY)
 
     set(SVMS_RESOURCE_FILENAME "SVMSAPI.dll")
     set(SVMS_RESOURCE_DESCRIPTION
         "SuperVirtualMIDISynth V3 Standalone Synthesizer API")
     set(SVMS_RESOURCE_FILETYPE "VFT_DLL")
-    configure_file(synth/SVMSVersion.rc.in
+    configure_file(synth/Version.rc.in
         "${SVMS_GENERATED_DIR}/SVMSApiVersion.rc" @ONLY)
 endif()
 
@@ -169,50 +169,50 @@ if(NOT SVMS_XP_COMPAT)
     endif()
 
     add_executable(svms_canonical_engine_tests
-        tests/SVMSCanonicalEngineTests.cpp)
+        tests/CanonicalEngineTests.cpp)
     target_link_libraries(svms_canonical_engine_tests PRIVATE
         svms_canonical_engine)
     add_test(NAME svms_canonical_engine
         COMMAND svms_canonical_engine_tests)
 
     add_executable(svms_canonical_engine_bench
-        tests/SVMSCanonicalEngineBench.cpp)
+        tests/CanonicalEngineBench.cpp)
     target_link_libraries(svms_canonical_engine_bench PRIVATE
         svms_canonical_engine)
 endif()
 
 if(NOT WIN32)
     find_package(Threads REQUIRED)
-    set(SVMS_CONTROL_SERVER_SOURCES driver/SVMSControlServer.cpp)
+    set(SVMS_CONTROL_SERVER_SOURCES driver/ControlServer.cpp)
     find_package(ALSA REQUIRED)
-    # nlohmann/json for synth/SVMSConfig.cpp (compiled into every portable target).
+    # nlohmann/json for synth/Config.cpp (compiled into every portable target).
     include_directories("${CMAKE_CURRENT_SOURCE_DIR}/../third_party")
-    # synth/SVMSConfig.cpp uses dladdr (module directory); glibc < 2.34 keeps it in libdl.
+    # synth/Config.cpp uses dladdr (module directory); glibc < 2.34 keeps it in libdl.
     link_libraries(${CMAKE_DL_LIBS})
     # GCC < 9 keeps std::(experimental::)filesystem in a separate library;
-    # synth/SVMSSoundFont.cpp falls back to the Filesystem TS on GCC 7.
+    # synth/SoundFont.cpp falls back to the Filesystem TS on GCC 7.
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
        CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
         link_libraries(stdc++fs)
     endif()
 
     set(SVMS_PORTABLE_RENDER_SOURCES
-        synth/SVMSConfig.cpp
-        synth/SVMSSoundFont.cpp
-        render/SVMSRenderKernels.cpp
-        render/SVMSRenderWorkersPosix.cpp
-        render/SVMSRenderDispatch.cpp
-        render/SVMSRenderKernelsSSE2.cpp
-        render/SVMSRenderKernelsAVX2.cpp)
+        synth/Config.cpp
+        synth/SoundFont.cpp
+        render/RenderKernels.cpp
+        render/RenderWorkersPosix.cpp
+        render/RenderDispatch.cpp
+        render/RenderKernelsSSE2.cpp
+        render/RenderKernelsAVX2.cpp)
 
-    set_source_files_properties(render/SVMSRenderKernelsSSE2.cpp PROPERTIES
+    set_source_files_properties(render/RenderKernelsSSE2.cpp PROPERTIES
         COMPILE_OPTIONS "-msse2;-mno-avx")
-    set_source_files_properties(render/SVMSRenderKernelsAVX2.cpp PROPERTIES
+    set_source_files_properties(render/RenderKernelsAVX2.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx2;-mno-fma")
 
     add_executable(svms_v3_render
-        synth/SVMSOfflineRenderer.cpp
-        events/SVMSMidiStream.cpp
+        synth/OfflineRenderer.cpp
+        events/MidiStream.cpp
         ${SVMS_PORTABLE_RENDER_SOURCES})
     target_include_directories(svms_v3_render PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -223,7 +223,7 @@ if(NOT WIN32)
     target_link_libraries(svms_v3_render PRIVATE svms_canonical_engine)
 
     add_executable(svmsd
-        frontends/SVMSLinuxDaemon.cpp
+        frontends/LinuxDaemon.cpp
         ${SVMS_PORTABLE_RENDER_SOURCES})
     target_include_directories(svmsd PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -234,8 +234,8 @@ if(NOT WIN32)
     target_link_libraries(svmsd PRIVATE Threads::Threads ${ALSA_LIBRARIES})
 
     add_library(omnimidi SHARED
-        frontends/SVMSLinuxKDMAPI.cpp
-        driver/SVMSControlServer.cpp
+        frontends/LinuxKDMAPI.cpp
+        driver/ControlServer.cpp
         ${SVMS_PORTABLE_RENDER_SOURCES})
     target_include_directories(omnimidi PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -260,14 +260,14 @@ if(NOT WIN32)
     option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
     if(SVMS_BUILD_TESTS)
         add_executable(svms_v3_native_header_c
-            tests/SVMSNativeHeaderCSmoke.c)
+            tests/NativeHeaderCSmoke.c)
         target_include_directories(svms_v3_native_header_c PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/include")
         add_test(NAME svms_v3_native_header_c
             COMMAND svms_v3_native_header_c)
 
         add_executable(svms_v3_voice_growth_tests
-            tests/SVMSVoiceGrowthRegression.cpp
+            tests/VoiceGrowthRegression.cpp
             ${SVMS_PORTABLE_RENDER_SOURCES})
         target_include_directories(svms_v3_voice_growth_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -275,7 +275,7 @@ if(NOT WIN32)
         add_test(NAME svms_v3_voice_growth COMMAND svms_v3_voice_growth_tests)
 
         add_executable(svms_v3_realtime_block_tests
-            tests/SVMSRealtimeBlockTests.cpp
+            tests/RealtimeBlockTests.cpp
             ${SVMS_PORTABLE_RENDER_SOURCES})
         target_include_directories(svms_v3_realtime_block_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -283,12 +283,12 @@ if(NOT WIN32)
         add_test(NAME svms_v3_realtime_block COMMAND svms_v3_realtime_block_tests)
         set_tests_properties(svms_v3_realtime_block PROPERTIES SKIP_RETURN_CODE 77)
 
-        add_executable(svms_v3_limiter_tests tests/SVMSLimiterTests.cpp)
+        add_executable(svms_v3_limiter_tests tests/LimiterTests.cpp)
         target_include_directories(svms_v3_limiter_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
 
-        add_executable(svms_v3_control_tests tests/SVMSControlRegistryTests.cpp
+        add_executable(svms_v3_control_tests tests/ControlRegistryTests.cpp
             ${SVMS_CONTROL_SERVER_SOURCES})
         target_include_directories(svms_v3_control_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -301,15 +301,15 @@ if(NOT WIN32)
 
 
         add_executable(svms_v3_midi_stream_tests
-            tests/SVMSMidiStreamTests.cpp
-            events/SVMSMidiStream.cpp)
+            tests/MidiStreamTests.cpp
+            events/MidiStream.cpp)
         target_include_directories(svms_v3_midi_stream_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_midi_stream_tests PRIVATE Threads::Threads)
         add_test(NAME svms_v3_midi_stream COMMAND svms_v3_midi_stream_tests)
 
         add_executable(svms_v3_linux_kdmapi_smoke
-            tests/SVMSLinuxKDMAPISmoke.cpp)
+            tests/LinuxKDMAPISmoke.cpp)
         target_include_directories(svms_v3_linux_kdmapi_smoke PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_linux_kdmapi_smoke PRIVATE
@@ -318,7 +318,7 @@ if(NOT WIN32)
             COMMAND svms_v3_linux_kdmapi_smoke $<TARGET_FILE:omnimidi>)
 
         add_executable(svms_v3_linux_native_api_smoke
-            tests/SVMSLinuxNativeAPISmoke.cpp)
+            tests/LinuxNativeAPISmoke.cpp)
         target_include_directories(svms_v3_linux_native_api_smoke PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_link_libraries(svms_v3_linux_native_api_smoke PRIVATE
@@ -364,7 +364,7 @@ if(NOT WIN32)
                 configurator/PageSettings.cpp
                 configurator/Tour.cpp
                 configurator/PageDriverFeatures.cpp
-                driver/SVMSControlServer.cpp
+                driver/ControlServer.cpp
                 ${IMGUI_DIR}/imgui.cpp
                 ${IMGUI_DIR}/imgui_draw.cpp
                 ${IMGUI_DIR}/imgui_tables.cpp
@@ -426,37 +426,37 @@ if(MINGW)
     endif()
 endif()
 
-# Driver translation units; each starts with driver/SVMSDriverInternal.h.
-# frontends/SVMSFrontWinMM.cpp is deliberately absent: it is the one file compiled per
+# Driver translation units; each starts with driver/DriverInternal.h.
+# frontends/FrontWinMM.cpp is deliberately absent: it is the one file compiled per
 # DLL (see svms_engine below).
 set(SVMS_DRIVER_SOURCES
-    driver/SVMSDriver.cpp
-    driver/SVMSDriverRuntimeLink.cpp
-    driver/SVMSDriverSoundFont.cpp
-    driver/SVMSDriverBackend.cpp
-    driver/SVMSDriverIngress.cpp
-    driver/SVMSDriverShards.cpp
-    driver/SVMSDriverRender.cpp
-    frontends/SVMSFrontNative.cpp
-    frontends/SVMSFrontKDMAPI.cpp
-    frontends/SVMSFrontBass.cpp
-    driver/SVMSDllMain.cpp
+    driver/Driver.cpp
+    driver/DriverRuntimeLink.cpp
+    driver/DriverSoundFont.cpp
+    driver/DriverBackend.cpp
+    driver/DriverIngress.cpp
+    driver/DriverShards.cpp
+    driver/DriverRender.cpp
+    frontends/FrontNative.cpp
+    frontends/FrontKDMAPI.cpp
+    frontends/FrontBass.cpp
+    driver/DllMain.cpp
 )
 
 set(SOURCES
-    synth/SVMSConfig.cpp
-    synth/SVMSSoundFont.cpp
+    synth/Config.cpp
+    synth/SoundFont.cpp
     ${SVMS_DRIVER_SOURCES}
-    driver/SVMSDiagWindow.cpp
-    render/SVMSRenderKernels.cpp
-    render/SVMSRenderWorkers.cpp
-    render/SVMSRenderDispatch.cpp
-    render/SVMSRenderKernelsSSE2.cpp
+    driver/DiagWindow.cpp
+    render/RenderKernels.cpp
+    render/RenderWorkers.cpp
+    render/RenderDispatch.cpp
+    render/RenderKernelsSSE2.cpp
 )
 
 if(NOT SVMS_XP_COMPAT)
-    list(APPEND SOURCES render/SVMSRenderKernelsAVX2.cpp synth/SVMSLiveRecorder.cpp
-         render/SVMSGpuSynth.cpp render/SVMSGpuDevice.cpp)
+    list(APPEND SOURCES render/RenderKernelsAVX2.cpp synth/LiveRecorder.cpp
+         render/GpuSynth.cpp render/GpuDevice.cpp)
 endif()
 
 # Steinberg ASIO SDK host-side glue (GPLv3 — see asio-main/). Compiled into
@@ -484,32 +484,32 @@ if(NOT SVMS_XP_COMPAT AND EXISTS "${SVMS_ASIO_INCLUDE}/asio.h")
 endif()
 
 set(HEADERS
-    synth/SVMSTypes.h
-    synth/SVMSConfig.h
-    synth/SVMSVoiceManager.h
-    render/SVMSEnvelope.h
-    synth/SVMSChannelCache.h
-    render/SVMSRenderScalar.h
-    render/SVMSRenderEvent.h
-    driver/SVMSDriverInternal.h
-    render/SVMSHilbertPair.h
-    render/SVMSRenderKernels.h
-    render/SVMSRenderWorkers.h
-    driver/SVMSAudioOutput.h
-    driver/SVMSAudioOutputDirectSound.h
-    synth/SVMSSoundFont.h
-    events/SVMSPageAllocator.h
-    driver/SVMSDiagWindow.h
-    events/SVMSMPSCQueue.h
-    events/SVMSEventCompile.h
-    events/SVMSEventScheduler.h
-    events/SVMSEventPages.h
-    events/SVMSFrameClock.h
-    render/SVMSPostFilter.h
-    render/SVMSLimiter.h
-    render/SVMSReverb.h
-    frontends/SVMSNativeOffline.h
-    synth/SVMSLiveRecorder.h
+    synth/Types.h
+    synth/Config.h
+    synth/VoiceManager.h
+    render/Envelope.h
+    synth/ChannelCache.h
+    render/RenderScalar.h
+    render/RenderEvent.h
+    driver/DriverInternal.h
+    render/HilbertPair.h
+    render/RenderKernels.h
+    render/RenderWorkers.h
+    driver/AudioOutput.h
+    driver/AudioOutputDirectSound.h
+    synth/SoundFont.h
+    events/PageAllocator.h
+    driver/DiagWindow.h
+    events/MPSCQueue.h
+    events/EventCompile.h
+    events/EventScheduler.h
+    events/EventPages.h
+    events/FrameClock.h
+    render/PostFilter.h
+    render/Limiter.h
+    render/Reverb.h
+    frontends/NativeOffline.h
+    synth/LiveRecorder.h
     include/svmsapi.h
 )
 
@@ -517,17 +517,17 @@ set(HEADERS
 # properties are directory-scoped and consumed by every target built from
 # these files, so svmsynth and svmsapi cannot drift apart here.
 if(MSVC)
-    set_source_files_properties(render/SVMSRenderKernelsSSE2.cpp PROPERTIES
+    set_source_files_properties(render/RenderKernelsSSE2.cpp PROPERTIES
         COMPILE_OPTIONS "$<$<EQUAL:${CMAKE_SIZEOF_VOID_P},4>:/arch:SSE2>")
     if(NOT SVMS_XP_COMPAT)
-        set_source_files_properties(render/SVMSRenderKernelsAVX2.cpp PROPERTIES
+        set_source_files_properties(render/RenderKernelsAVX2.cpp PROPERTIES
             COMPILE_OPTIONS "/arch:AVX2")
     endif()
 elseif(MINGW)
-    set_source_files_properties(render/SVMSRenderKernelsSSE2.cpp PROPERTIES
+    set_source_files_properties(render/RenderKernelsSSE2.cpp PROPERTIES
         COMPILE_OPTIONS "-msse2;-mno-avx")
     if(NOT SVMS_XP_COMPAT)
-        set_source_files_properties(render/SVMSRenderKernelsAVX2.cpp PROPERTIES
+        set_source_files_properties(render/RenderKernelsAVX2.cpp PROPERTIES
             COMPILE_OPTIONS "-mavx2;-mno-fma")
     endif()
 endif()
@@ -537,7 +537,7 @@ endif()
 # _WINMM_ (see below); no other file defines a WinMM SDK function.
 add_library(svms_engine OBJECT ${SOURCES} ${HEADERS})
 
-# Precompile driver/SVMSDriverInternal.h for the driver sources. Each of them includes
+# Precompile driver/DriverInternal.h for the driver sources. Each of them includes
 # it first anyway, so this only removes the repeated parse of the big engine
 # headers. Off by default under a compiler cache, which cannot cache PCH users.
 if(CMAKE_CXX_COMPILER_LAUNCHER)
@@ -545,17 +545,17 @@ if(CMAKE_CXX_COMPILER_LAUNCHER)
 else()
     set(SVMS_DRIVER_PCH_DEFAULT ON)
 endif()
-option(SVMS_DRIVER_PCH "Precompile driver/SVMSDriverInternal.h for the driver sources"
+option(SVMS_DRIVER_PCH "Precompile driver/DriverInternal.h for the driver sources"
     ${SVMS_DRIVER_PCH_DEFAULT})
 if(SVMS_DRIVER_PCH)
-    target_precompile_headers(svms_engine PRIVATE driver/SVMSDriverInternal.h)
+    target_precompile_headers(svms_engine PRIVATE driver/DriverInternal.h)
     set(SVMS_ENGINE_NON_DRIVER_SOURCES ${SOURCES})
     list(REMOVE_ITEM SVMS_ENGINE_NON_DRIVER_SOURCES ${SVMS_DRIVER_SOURCES})
     set_source_files_properties(${SVMS_ENGINE_NON_DRIVER_SOURCES} PROPERTIES
         SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
-add_library(svmsynth SHARED frontends/SVMSFrontWinMM.cpp
+add_library(svmsynth SHARED frontends/FrontWinMM.cpp
     "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc")
 
 # Standalone native-API runtime. Built from the same engine sources as
@@ -563,7 +563,7 @@ add_library(svmsynth SHARED frontends/SVMSFrontWinMM.cpp
 # surface: the permanent SVMS_GetInterface bootstrap plus the KDMAPI facade.
 # Deliberately no WinMM shim exports - SVMSAPI.dll is not a midiOutOpen
 # drop-in. Players integrate via LoadLibrary + GetProcAddress only.
-add_library(svmsapi SHARED frontends/SVMSFrontWinMM.cpp
+add_library(svmsapi SHARED frontends/FrontWinMM.cpp
     "${SVMS_GENERATED_DIR}/SVMSApiVersion.rc")
 
 foreach(svms_engine_target svms_engine svmsynth svmsapi)
@@ -573,14 +573,14 @@ foreach(svms_engine_target svms_engine svmsynth svmsapi)
     if(svms_engine_target STREQUAL svmsapi)
         # The system multimedia headers declare the WinMM shims dllimport
         # (WINMMAPI = DECLSPEC_IMPORT in mmsyscom.h). The local shim
-        # definitions in frontends/SVMSFrontWinMM.cpp then conflict (C4273) and MSVC turns
+        # definitions in frontends/FrontWinMM.cpp then conflict (C4273) and MSVC turns
         # each one into a linker /EXPORT directive, re-exporting the whole
         # WinMM surface. _WINMM_ is the SDK's official "building winmm"
         # switch: it empties WINMMAPI, so no conflict and no phantom exports.
         # The shims stay as private dead code (/OPT:REF strips them) and the
         # export surface is exactly the SVMSAPI_EXPORTS list below. Only the
         # standalone target gets this; winmm.dll keeps its exact export table.
-        # It only reaches frontends/SVMSFrontWinMM.cpp: svms_engine never sees it.
+        # It only reaches frontends/FrontWinMM.cpp: svms_engine never sees it.
         target_compile_definitions(${svms_engine_target} PRIVATE _WINMM_)
     endif()
     target_include_directories(${svms_engine_target} PRIVATE
@@ -623,7 +623,7 @@ if(NOT SVMS_XP_COMPAT)
                 "${ASIO_SDK_DIR}/host/asiodrivers.cpp"
                 "${ASIO_SDK_DIR}/host/pc/asiolist.cpp")
             set_source_files_properties(${ASIO_SDK_SOURCES} PROPERTIES
-                COMPILE_OPTIONS "/w;/FI${CMAKE_CURRENT_SOURCE_DIR}/driver/SVMSAsioSdkPrefix.h")
+                COMPILE_OPTIONS "/w;/FI${CMAKE_CURRENT_SOURCE_DIR}/driver/AsioSdkPrefix.h")
         endif()
         message(STATUS "SVMS: ASIO backend enabled (${ASIO_SDK_DIR})")
     else()
@@ -935,17 +935,17 @@ target_link_options(svmsapi PRIVATE
 
 if(NOT SVMS_XP_COMPAT)
     add_executable(svms_v3_render
-        synth/SVMSOfflineRenderer.cpp
-        synth/SVMSConfig.cpp
-        events/SVMSMidiStream.cpp
-        synth/SVMSSoundFont.cpp
-        render/SVMSRenderKernels.cpp
-        render/SVMSRenderWorkers.cpp
-        render/SVMSRenderDispatch.cpp
-        render/SVMSRenderKernelsSSE2.cpp
-        render/SVMSRenderKernelsAVX2.cpp
-        render/SVMSGpuSynth.cpp
-        render/SVMSGpuDevice.cpp)
+        synth/OfflineRenderer.cpp
+        synth/Config.cpp
+        events/MidiStream.cpp
+        synth/SoundFont.cpp
+        render/RenderKernels.cpp
+        render/RenderWorkers.cpp
+        render/RenderDispatch.cpp
+        render/RenderKernelsSSE2.cpp
+        render/RenderKernelsAVX2.cpp
+        render/GpuSynth.cpp
+        render/GpuDevice.cpp)
     target_compile_definitions(svms_v3_render PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     if(MINGW)
@@ -962,16 +962,16 @@ if(NOT SVMS_XP_COMPAT)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
     add_executable(svms_v3_realtime_block_tests
-        tests/SVMSRealtimeBlockTests.cpp
-        synth/SVMSConfig.cpp
-        synth/SVMSSoundFont.cpp
-        render/SVMSRenderKernels.cpp
-        render/SVMSRenderWorkers.cpp
-        render/SVMSRenderDispatch.cpp
-        render/SVMSRenderKernelsSSE2.cpp
-        render/SVMSRenderKernelsAVX2.cpp
-        render/SVMSGpuSynth.cpp
-        render/SVMSGpuDevice.cpp)
+        tests/RealtimeBlockTests.cpp
+        synth/Config.cpp
+        synth/SoundFont.cpp
+        render/RenderKernels.cpp
+        render/RenderWorkers.cpp
+        render/RenderDispatch.cpp
+        render/RenderKernelsSSE2.cpp
+        render/RenderKernelsAVX2.cpp
+        render/GpuSynth.cpp
+        render/GpuDevice.cpp)
     target_compile_definitions(svms_v3_realtime_block_tests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_realtime_block_tests PRIVATE
@@ -986,8 +986,8 @@ if(NOT SVMS_XP_COMPAT)
     # compute-shader sample synthesis matches the CPU scalar reference to the
     # agreed -85 dB gate before it is wired into RenderBlock.
     add_executable(svms_v3_gpu_spike
-        render/SVMSGpuSpike.cpp
-        render/SVMSGpuDevice.cpp)
+        render/GpuSpike.cpp
+        render/GpuDevice.cpp)
     target_compile_definitions(svms_v3_gpu_spike PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_gpu_spike PRIVATE
@@ -1095,7 +1095,7 @@ add_custom_target(svms_bass_alias ALL
     DEPENDS svmsynth
     VERBATIM)
 
-add_library(svms_bassmidi_forwarder SHARED frontends/SVMSBassMidiForwarder.cpp)
+add_library(svms_bassmidi_forwarder SHARED frontends/BassMidiForwarder.cpp)
 set_target_properties(svms_bassmidi_forwarder PROPERTIES
     OUTPUT_NAME "bassmidi"
     PREFIX ""
@@ -1139,14 +1139,14 @@ option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
 
 if(SVMS_BUILD_TESTS)
     add_executable(svms_v3_native_header_c
-        tests/SVMSNativeHeaderCSmoke.c)
+        tests/NativeHeaderCSmoke.c)
     target_include_directories(svms_v3_native_header_c PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME svms_v3_native_header_c
         COMMAND svms_v3_native_header_c)
 
     add_executable(svms_v3_telemetry_abi_smoke
-        tests/SVMSTelemetryABISmoke.cpp)
+        tests/TelemetryABISmoke.cpp)
     target_compile_definitions(svms_v3_telemetry_abi_smoke PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
     add_dependencies(svms_v3_telemetry_abi_smoke svmsynth)
@@ -1154,7 +1154,7 @@ if(SVMS_BUILD_TESTS)
              COMMAND svms_v3_telemetry_abi_smoke "$<TARGET_FILE:svmsynth>")
 
     add_executable(svms_v3_runtime_link_abi_smoke
-        tests/SVMSRuntimeLinkABISmoke.cpp)
+        tests/RuntimeLinkABISmoke.cpp)
     target_compile_definitions(svms_v3_runtime_link_abi_smoke PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
     target_include_directories(svms_v3_runtime_link_abi_smoke PRIVATE
@@ -1163,7 +1163,7 @@ if(SVMS_BUILD_TESTS)
              COMMAND svms_v3_runtime_link_abi_smoke)
 
     add_executable(svms_v3_native_api_smoke
-        tests/SVMSNativeAPISmoke.cpp)
+        tests/NativeAPISmoke.cpp)
     target_include_directories(svms_v3_native_api_smoke PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_dependencies(svms_v3_native_api_smoke svmsapi)
@@ -1173,16 +1173,16 @@ if(SVMS_BUILD_TESTS)
     set_tests_properties(svms_v3_native_api PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(svms_v3_tests
-        tests/SVMSV3Tests.cpp
-        synth/SVMSConfig.cpp
-        synth/SVMSSoundFont.cpp
-        render/SVMSRenderKernels.cpp
-        render/SVMSRenderWorkers.cpp
-        render/SVMSRenderDispatch.cpp
-        render/SVMSRenderKernelsSSE2.cpp
+        tests/V3Tests.cpp
+        synth/Config.cpp
+        synth/SoundFont.cpp
+        render/RenderKernels.cpp
+        render/RenderWorkers.cpp
+        render/RenderDispatch.cpp
+        render/RenderKernelsSSE2.cpp
     )
     if(NOT SVMS_XP_COMPAT)
-        target_sources(svms_v3_tests PRIVATE render/SVMSRenderKernelsAVX2.cpp)
+        target_sources(svms_v3_tests PRIVATE render/RenderKernelsAVX2.cpp)
     endif()
     target_compile_definitions(svms_v3_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS SVMS_ENABLE_REFERENCE_RENDERER=1)
@@ -1193,13 +1193,13 @@ if(SVMS_BUILD_TESTS)
     add_test(NAME svms_v3_correctness COMMAND svms_v3_tests)
 
     add_executable(svms_v3_voice_growth_tests
-        tests/SVMSVoiceGrowthRegression.cpp
-        render/SVMSRenderKernels.cpp
-        render/SVMSRenderWorkers.cpp
-        render/SVMSRenderDispatch.cpp
-        render/SVMSRenderKernelsSSE2.cpp)
+        tests/VoiceGrowthRegression.cpp
+        render/RenderKernels.cpp
+        render/RenderWorkers.cpp
+        render/RenderDispatch.cpp
+        render/RenderKernelsSSE2.cpp)
     if(NOT SVMS_XP_COMPAT)
-        target_sources(svms_v3_voice_growth_tests PRIVATE render/SVMSRenderKernelsAVX2.cpp)
+        target_sources(svms_v3_voice_growth_tests PRIVATE render/RenderKernelsAVX2.cpp)
     endif()
     target_compile_definitions(svms_v3_voice_growth_tests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
@@ -1208,14 +1208,14 @@ if(SVMS_BUILD_TESTS)
     add_test(NAME svms_v3_voice_growth COMMAND svms_v3_voice_growth_tests)
 
     add_executable(svms_v3_limiter_tests
-        tests/SVMSLimiterTests.cpp)
+        tests/LimiterTests.cpp)
     target_compile_definitions(svms_v3_limiter_tests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_limiter_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
 
-        add_executable(svms_v3_control_tests tests/SVMSControlRegistryTests.cpp
+        add_executable(svms_v3_control_tests tests/ControlRegistryTests.cpp
             ${SVMS_CONTROL_SERVER_SOURCES})
         target_include_directories(svms_v3_control_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -1228,7 +1228,7 @@ if(SVMS_BUILD_TESTS)
         add_executable(svms_v3_xp_directsound_smoke
 
 
-            tests/SVMSXPDirectSoundSmoke.cpp)
+            tests/XPDirectSoundSmoke.cpp)
         target_compile_definitions(svms_v3_xp_directsound_smoke PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
         target_include_directories(svms_v3_xp_directsound_smoke PRIVATE
@@ -1245,7 +1245,7 @@ if(SVMS_BUILD_TESTS)
             SKIP_RETURN_CODE 77)
 
         add_executable(svms_v3_xp_dll_smoke
-            tests/SVMSXPDllSmoke.cpp)
+            tests/XPDllSmoke.cpp)
         target_compile_definitions(svms_v3_xp_dll_smoke PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
         target_link_libraries(svms_v3_xp_dll_smoke PRIVATE user32)
@@ -1268,15 +1268,15 @@ if(SVMS_BUILD_TESTS)
 
         # XP gets the same offline MIDI-song regression gate (no GPU sources).
         add_executable(svms_v3_midi_song
-            tests/SVMSV3MidiSong.cpp
-            synth/SVMSConfig.cpp
-            events/SVMSMidiStream.cpp
-            synth/SVMSSoundFont.cpp
-            render/SVMSRenderKernels.cpp
-            render/SVMSRenderWorkers.cpp
-            render/SVMSRenderDispatch.cpp
-            render/SVMSRenderKernelsSSE2.cpp
-            render/SVMSRenderKernelsAVX2.cpp)
+            tests/V3MidiSong.cpp
+            synth/Config.cpp
+            events/MidiStream.cpp
+            synth/SoundFont.cpp
+            render/RenderKernels.cpp
+            render/RenderWorkers.cpp
+            render/RenderDispatch.cpp
+            render/RenderKernelsSSE2.cpp
+            render/RenderKernelsAVX2.cpp)
         target_compile_definitions(svms_v3_midi_song PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
             _CRT_SECURE_NO_WARNINGS)
@@ -1290,7 +1290,7 @@ if(SVMS_BUILD_TESTS)
             SKIP_RETURN_CODE 77 TIMEOUT 600)
     else()
         add_executable(svms_v3_midi_stream_tests
-            tests/SVMSMidiStreamTests.cpp events/SVMSMidiStream.cpp)
+            tests/MidiStreamTests.cpp events/MidiStream.cpp)
         target_compile_definitions(svms_v3_midi_stream_tests PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_v3_midi_stream_tests PRIVATE
@@ -1303,7 +1303,7 @@ if(SVMS_BUILD_TESTS)
         add_test(NAME svms_v3_midi_stream COMMAND svms_v3_midi_stream_tests)
 
         add_executable(svms_v3_unsafe_exit_tests
-            tests/SVMSUnsafeExitTests.cpp)
+            tests/UnsafeExitTests.cpp)
         target_compile_definitions(svms_v3_unsafe_exit_tests PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
         target_link_libraries(svms_v3_unsafe_exit_tests PRIVATE winmm)
@@ -1314,7 +1314,7 @@ if(SVMS_BUILD_TESTS)
 
         if(EXISTS "${SVMS_ASIO_INCLUDE}/asio.h")
             add_executable(svms_v3_asio_stress_tests
-                tests/SVMSAsioStressTests.cpp driver/SVMSAudioOutputASIO.h
+                tests/AsioStressTests.cpp driver/AudioOutputASIO.h
                 ${SVMS_ASIO_SOURCES})
             target_compile_definitions(svms_v3_asio_stress_tests PRIVATE
                 NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
@@ -1331,7 +1331,7 @@ if(SVMS_BUILD_TESTS)
         endif()
 
         add_executable(svms_v3_config_profile_tests
-            tests/SVMSConfiguratorProfileTests.cpp
+            tests/ConfiguratorProfileTests.cpp
             configurator/ConfigDocument.cpp)
         target_compile_definitions(svms_v3_config_profile_tests PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
@@ -1343,8 +1343,8 @@ if(SVMS_BUILD_TESTS)
             COMMAND svms_v3_config_profile_tests)
 
         add_executable(svms_v3_live_recorder_tests
-            tests/SVMSLiveRecorderTests.cpp
-            synth/SVMSLiveRecorder.cpp)
+            tests/LiveRecorderTests.cpp
+            synth/LiveRecorder.cpp)
         target_compile_definitions(svms_v3_live_recorder_tests PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
             _CRT_SECURE_NO_WARNINGS)
@@ -1353,7 +1353,7 @@ if(SVMS_BUILD_TESTS)
         add_test(NAME svms_v3_live_recorder
             COMMAND svms_v3_live_recorder_tests)
 
-        add_executable(svms_v3_live_smoke tests/SVMSLiveSmoke.cpp)
+        add_executable(svms_v3_live_smoke tests/LiveSmoke.cpp)
         target_compile_definitions(svms_v3_live_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         if(MINGW)
             # wmain entry point requires the unicode startup on MinGW.
@@ -1364,7 +1364,7 @@ if(SVMS_BUILD_TESTS)
         target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
 
         add_executable(svms_v3_runtime_link_smoke
-            tests/SVMSRuntimeLinkSmoke.cpp)
+            tests/RuntimeLinkSmoke.cpp)
         target_compile_definitions(svms_v3_runtime_link_smoke PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
         target_include_directories(svms_v3_runtime_link_smoke PRIVATE
@@ -1376,14 +1376,14 @@ if(SVMS_BUILD_TESTS)
             SKIP_RETURN_CODE 77)
 
         add_executable(svms_v3_runtime_link_probe
-            tests/SVMSRuntimeLinkProbe.cpp)
+            tests/RuntimeLinkProbe.cpp)
         target_compile_definitions(svms_v3_runtime_link_probe PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
         target_include_directories(svms_v3_runtime_link_probe PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
 
         add_executable(svms_v3_two_process_smoke
-            tests/SVMSTwoProcessSmoke.cpp)
+            tests/TwoProcessSmoke.cpp)
         target_compile_definitions(svms_v3_two_process_smoke PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
         target_include_directories(svms_v3_two_process_smoke PRIVATE
@@ -1396,8 +1396,8 @@ if(SVMS_BUILD_TESTS)
         set_tests_properties(svms_v3_two_process_smoke PROPERTIES
             SKIP_RETURN_CODE 77)
 
-        add_executable(svms_v3_bench tests/SVMSV3Bench.cpp synth/SVMSSoundFont.cpp render/SVMSRenderKernels.cpp render/SVMSRenderWorkers.cpp
-            render/SVMSRenderDispatch.cpp render/SVMSRenderKernelsSSE2.cpp render/SVMSRenderKernelsAVX2.cpp)
+        add_executable(svms_v3_bench tests/V3Bench.cpp synth/SoundFont.cpp render/RenderKernels.cpp render/RenderWorkers.cpp
+            render/RenderDispatch.cpp render/RenderKernelsSSE2.cpp render/RenderKernelsAVX2.cpp)
         target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
             SVMS_ENABLE_REFERENCE_RENDERER=1)
         target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -1409,15 +1409,15 @@ if(SVMS_BUILD_TESTS)
         # (muted unless --audible).  Telemetry/verbose flags make it a
         # performance-development harness as well as a regression gate.
         set(SVMS_MIDI_SONG_SOURCES
-            tests/SVMSV3MidiSong.cpp
-            synth/SVMSConfig.cpp
-            events/SVMSMidiStream.cpp
-            synth/SVMSSoundFont.cpp
-            render/SVMSRenderKernels.cpp
-            render/SVMSRenderWorkers.cpp
-            render/SVMSRenderDispatch.cpp
-            render/SVMSRenderKernelsSSE2.cpp
-            render/SVMSRenderKernelsAVX2.cpp)
+            tests/V3MidiSong.cpp
+            synth/Config.cpp
+            events/MidiStream.cpp
+            synth/SoundFont.cpp
+            render/RenderKernels.cpp
+            render/RenderWorkers.cpp
+            render/RenderDispatch.cpp
+            render/RenderKernelsSSE2.cpp
+            render/RenderKernelsAVX2.cpp)
         add_executable(svms_v3_midi_song ${SVMS_MIDI_SONG_SOURCES})
         target_compile_definitions(svms_v3_midi_song PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
@@ -1428,7 +1428,7 @@ if(SVMS_BUILD_TESTS)
         target_link_libraries(svms_v3_midi_song PRIVATE winmm shell32)
         if(NOT SVMS_XP_COMPAT)
             target_sources(svms_v3_midi_song PRIVATE
-                render/SVMSGpuSynth.cpp render/SVMSGpuDevice.cpp)
+                render/GpuSynth.cpp render/GpuDevice.cpp)
             target_link_libraries(svms_v3_midi_song PRIVATE d3d11 dxgi d3dcompiler)
         endif()
         add_test(NAME svms_v3_midi_song
@@ -1436,17 +1436,17 @@ if(SVMS_BUILD_TESTS)
         set_tests_properties(svms_v3_midi_song PROPERTIES
             SKIP_RETURN_CODE 77 TIMEOUT 600)
 
-        add_executable(svms_v3_direct_ingest_test tests/SVMSDirectIngestTest.cpp)
+        add_executable(svms_v3_direct_ingest_test tests/DirectIngestTest.cpp)
         target_compile_definitions(svms_v3_direct_ingest_test PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
         target_include_directories(svms_v3_direct_ingest_test PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_direct_ingest COMMAND svms_v3_direct_ingest_test)
         # Needs a live audio device (set SVMS_TEST_CONFIG_PATH to a master_volume 0 config); not a ctest.
-        add_executable(svms_v3_direct_e2e tests/SVMSDirectE2E.cpp)
+        add_executable(svms_v3_direct_e2e tests/DirectE2E.cpp)
         target_compile_definitions(svms_v3_direct_e2e PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
 
-        add_executable(svms_v3_event_bench tests/SVMSEventPipelineBench.cpp)
+        add_executable(svms_v3_event_bench tests/EventPipelineBench.cpp)
         target_compile_definitions(svms_v3_event_bench PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN)
         target_include_directories(svms_v3_event_bench PRIVATE

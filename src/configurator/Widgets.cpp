@@ -6,7 +6,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "configurator/DriverLink.h"
-#include "driver/SVMSRuntimeLinkProtocol.h"
+#include "driver/RuntimeLinkProtocol.h"
 #include <cmath>
 #include <cctype>
 #include <cstdio>

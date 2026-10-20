@@ -11,7 +11,7 @@
 #include "configurator/DriverLink.h"
 #include "configurator/SettingsRegistry.h"
 #include "imgui.h"
-#include "driver/SVMSRuntimeLinkProtocol.h"
+#include "driver/RuntimeLinkProtocol.h"
 
 #include <algorithm>
 #include <memory>

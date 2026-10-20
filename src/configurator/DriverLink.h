@@ -5,7 +5,7 @@
 // RuntimeLink on Windows, the Control API socket on Linux. Both provide
 // svms::RuntimeLinkClient with the same public surface.
 #ifdef _WIN32
-#include "driver/SVMSRuntimeLink.h"
+#include "driver/RuntimeLink.h"
 #else
 #include "configurator/SocketRuntimeLink.h"
 #endif

@@ -6,7 +6,7 @@
 #include "configurator/ModernWidgets.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
-#include "driver/SVMSRuntimeLinkProtocol.h"
+#include "driver/RuntimeLinkProtocol.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN

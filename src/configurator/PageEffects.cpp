@@ -7,7 +7,7 @@
 #include "configurator/PlatformUtil.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
-#include "driver/SVMSRuntimeLinkProtocol.h"
+#include "driver/RuntimeLinkProtocol.h"
 
 #include <algorithm>
 #include <cmath>

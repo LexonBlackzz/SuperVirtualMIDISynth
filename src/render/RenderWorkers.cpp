@@ -1,0 +1,852 @@
+#include "render/RenderWorkers.h"
+#include "synth/ThreadAffinity.h"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <limits>
+#include <malloc.h>
+#include <new>
+#include <xmmintrin.h>
+
+namespace svms {
+namespace {
+
+constexpr uint32_t kHandlesPerJob = 256u;
+constexpr uint32_t kMaximumRenderThreads = 64u;
+constexpr uint64_t kMinimumParallelVoiceSamples = 65'536u;
+constexpr uint32_t kMinimumParallelFrames = 8u;
+// At or above this pool occupancy, short event-fragmented spans still pay
+// for their fan-out handshake many times over.
+constexpr uint32_t kLargePoolShortSpanVoices = 1024u;
+// Spans shorter than kMinimumParallelFrames need an even larger voice pool
+// before the wake/sync handshake pays off (chopped buzz workloads where
+// event-fragmented per-class spans are 1-7 frames).
+constexpr uint32_t kMinimumVoicesShortSpan = 1024u;
+
+struct RenderJob {
+    RenderClassKernel kernel;
+    RenderClassKernel fallback;
+    const uint32_t* handles;
+    uint32_t handleCount;
+};
+
+// Resolve the scalar sibling of a selected backend class kernel once on the
+// coordinator thread. Workers can then honor a backend refusal without
+// re-entering backend selection or touching shared scheduler state.
+RenderClassKernel ResolveScalarFallback(RenderClassKernel kernel) noexcept {
+    if (!kernel) return nullptr;
+
+    const RenderKernelSet& scalar = GetScalarRenderKernelSet();
+    for (uint32_t i = 0u; i < kVoiceRenderClassCount; ++i) {
+        if (scalar.kernels[i] == kernel) return scalar.kernels[i];
+    }
+
+    const RenderKernelSet& sse2 = GetSSE2RenderKernelSet();
+    for (uint32_t i = 0u; i < kVoiceRenderClassCount; ++i) {
+        if (sse2.kernels[i] == kernel) return scalar.kernels[i];
+    }
+
+#if !defined(SVMS_XP_COMPAT)
+    const RenderKernelSet& avx2 = GetAVX2RenderKernelSet();
+    for (uint32_t i = 0u; i < kVoiceRenderClassCount; ++i) {
+        if (avx2.kernels[i] == kernel) return scalar.kernels[i];
+    }
+#endif
+
+    return nullptr;
+}
+
+} // namespace
+
+struct RenderWorkerPool::Impl {
+    struct Worker {
+        Impl* owner = nullptr;
+        uint32_t lane = 0u;
+        HANDLE wakeEvent = nullptr;
+        HANDLE readyEvent = nullptr;
+        HANDLE thread = nullptr;
+    };
+
+    Worker* workers = nullptr;
+    RenderJob* jobs = nullptr;
+    float* mixStorage = nullptr;
+    // Bus-mode (per-MIDI-channel limiter) job planes, allocated lazily the
+    // first time a bus-mode dispatch needs more than the current capacity.
+    // Layout: [job][channel][L,R][mixStride].  jobBusLeftPtrs/jobBusRightPtrs
+    // hold per-job arrays of kChannelCount plane pointers so jobs receive a
+    // plain float* const* like the block-level buses.
+    float* busStorage = nullptr;
+    float** jobBusLeftPtrs = nullptr;
+    float** jobBusRightPtrs = nullptr;
+    uint32_t busJobCapacity = 0u;
+    size_t jobBusStride = 0u;      // floats per job (kChannelCount * 2 * mixStride)
+    bool busMode = false;
+    // Per-job span lifecycle scratch: retirement and class-change records
+    // are written by the owning worker only and merged by the coordinator
+    // after Execute(), which lets TransientLoop and ReleaseLoop spans (whose
+    // voices can retire or change class mid-span) run on the pool.
+    SpanRetirement* jobRetirements = nullptr;
+    uint32_t* jobClassChanges = nullptr;
+    uint32_t* jobRetireCounts = nullptr;
+    uint32_t* jobClassChangeCounts = nullptr;
+    HANDLE doneEvent = nullptr;
+    using WaitOnAddressProc = BOOL (WINAPI*)(volatile VOID*, PVOID, SIZE_T, DWORD);
+    using WakeByAddressAllProc = VOID (WINAPI*)(PVOID);
+    WaitOnAddressProc waitOnAddress = nullptr;
+    WakeByAddressAllProc wakeByAddressAll = nullptr;
+    std::atomic<bool> stopping{false};
+    std::atomic<uint32_t> pendingWorkers{0u};
+    alignas(64) std::atomic<uint32_t> workGeneration{0u};
+    alignas(64) std::atomic<uint32_t> nextJob{0u};
+    alignas(64) std::atomic<uint32_t> completedWorkers{0u};
+    alignas(64) std::atomic<uint64_t> helperJobs{0u};
+    alignas(64) std::atomic<uint64_t> coordinatorJobs{0u};
+    RenderSpanContext context{};
+    IndexedRenderJob indexedCallback = nullptr;
+    void* indexedUserData = nullptr;
+    uint32_t totalThreads = 1u;
+    uint32_t helperCount = 0u;
+    uint32_t dispatchThreads = 1u;
+    uint32_t maxFrames = 0u;
+    uint32_t mixStride = 0u;
+    uint32_t jobCapacity = 0u;
+    uint32_t jobCount = 0u;
+    uint32_t activeHelpers = 0u;
+    size_t jobMixStride = 0u;
+    bool queueValid = true;
+    bool indexedInFlight = false;
+
+    static DWORD WINAPI ThreadEntry(void* parameter) noexcept {
+        Worker* worker = static_cast<Worker*>(parameter);
+        Impl* self = worker->owner;
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        _mm_setcsr(_mm_getcsr() | 0x8040u); // FTZ + DAZ
+        HMODULE avrt = LoadLibraryW(L"avrt.dll");
+        using SetMmcss = HANDLE (WINAPI*)(LPCWSTR, LPDWORD);
+        using RevertMmcss = BOOL (WINAPI*)(HANDLE);
+        SetMmcss setMmcss = avrt ? reinterpret_cast<SetMmcss>(
+            GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW")) : nullptr;
+        RevertMmcss revertMmcss = avrt ? reinterpret_cast<RevertMmcss>(
+            GetProcAddress(avrt, "AvRevertMmThreadCharacteristics")) : nullptr;
+        DWORD taskIndex = 0u;
+        HANDLE mmcss = setMmcss ? setMmcss(L"Pro Audio", &taskIndex) : nullptr;
+        SetEvent(worker->readyEvent);
+        uint32_t observedGeneration =
+            self->workGeneration.load(std::memory_order_acquire);
+        for (;;) {
+#if !defined(SVMS_XP_COMPAT)
+            if (self->waitOnAddress) {
+                while (!self->stopping.load(std::memory_order_acquire) &&
+                       self->workGeneration.load(std::memory_order_acquire) ==
+                           observedGeneration) {
+                    self->waitOnAddress(&self->workGeneration,
+                                        &observedGeneration,
+                                        sizeof(observedGeneration), INFINITE);
+                }
+            } else
+#endif
+            {
+                WaitForSingleObject(worker->wakeEvent, INFINITE);
+            }
+            if (self->stopping.load(std::memory_order_acquire)) break;
+            observedGeneration =
+                self->workGeneration.load(std::memory_order_acquire);
+            if (worker->lane >= self->dispatchThreads) continue;
+            const uint32_t claimed = self->ProcessJobs();
+            self->helperJobs.fetch_add(claimed, std::memory_order_relaxed);
+            self->completedWorkers.fetch_add(1u, std::memory_order_release);
+#if !defined(SVMS_XP_COMPAT)
+            if (self->wakeByAddressAll)
+                self->wakeByAddressAll(&self->completedWorkers);
+#endif
+            if (self->pendingWorkers.fetch_sub(1u,
+                                               std::memory_order_acq_rel) == 1u) {
+                SetEvent(self->doneEvent);
+            }
+        }
+        if (mmcss && revertMmcss) revertMmcss(mmcss);
+        if (avrt) FreeLibrary(avrt);
+        return 0u;
+    }
+
+    float* JobLeft(uint32_t job) noexcept {
+        return mixStorage + static_cast<size_t>(job) * jobMixStride;
+    }
+    float* JobRight(uint32_t job) noexcept {
+        return JobLeft(job) + mixStride;
+    }
+    // Bus plane pointers for one job: entry ch of the left array points at
+    // the channel's L plane, the right array at its R plane.
+    float* const* JobBusLeft(uint32_t job) noexcept {
+        return jobBusLeftPtrs + static_cast<size_t>(job) * kChannelCount;
+    }
+    float* const* JobBusRight(uint32_t job) noexcept {
+        return jobBusRightPtrs + static_cast<size_t>(job) * kChannelCount;
+    }
+
+    // Grows the per-job bus plane storage to cover `neededJobs` jobs. Runs
+    // on the dispatching (audio/render coordinator) thread before workers
+    // are woken, like every other scratch growth.
+    bool EnsureBusStorage(uint32_t neededJobs) noexcept {
+        if (neededJobs <= busJobCapacity) return true;
+        const uint32_t newCapacity =
+            (std::max)(neededJobs, static_cast<uint32_t>(16u));
+        const size_t floatsPerJob = static_cast<size_t>(kChannelCount) *
+            2u * mixStride;
+        if (floatsPerJob > (std::numeric_limits<size_t>::max)() /
+                               sizeof(float) / newCapacity) {
+            return false;
+        }
+        const size_t planeFloats = floatsPerJob * newCapacity;
+        float* newPlanes = static_cast<float*>(_aligned_malloc(
+            planeFloats * sizeof(float), 64u));
+        float** newLeft = static_cast<float**>(_aligned_malloc(
+            static_cast<size_t>(newCapacity) * kChannelCount * sizeof(float*),
+            64u));
+        float** newRight = static_cast<float**>(_aligned_malloc(
+            static_cast<size_t>(newCapacity) * kChannelCount * sizeof(float*),
+            64u));
+        if (!newPlanes || !newLeft || !newRight) {
+            _aligned_free(newPlanes);
+            _aligned_free(newLeft);
+            _aligned_free(newRight);
+            return false;
+        }
+        for (uint32_t job = 0u; job < newCapacity; ++job) {
+            for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+                float* plane = newPlanes +
+                    (static_cast<size_t>(job) * kChannelCount + channel) *
+                        2u * mixStride;
+                newLeft[job * kChannelCount + channel] = plane;
+                newRight[job * kChannelCount + channel] = plane + mixStride;
+            }
+        }
+        _aligned_free(busStorage);
+        _aligned_free(jobBusLeftPtrs);
+        _aligned_free(jobBusRightPtrs);
+        busStorage = newPlanes;
+        jobBusLeftPtrs = newLeft;
+        jobBusRightPtrs = newRight;
+        busJobCapacity = newCapacity;
+        jobBusStride = floatsPerJob;
+        return true;
+    }
+
+    void ZeroJobBuses(uint32_t job, uint32_t frames) noexcept {
+        const size_t bytes = static_cast<size_t>(frames) * sizeof(float);
+        float* const* left = JobBusLeft(job);
+        float* const* right = JobBusRight(job);
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            std::memset(left[channel], 0, bytes);
+            std::memset(right[channel], 0, bytes);
+        }
+    }
+
+    uint32_t ProcessJobs() noexcept {
+        uint32_t claimed = 0u;
+        const bool jobsBusMode = busMode;
+        for (;;) {
+            const uint32_t index =
+                nextJob.fetch_add(1u, std::memory_order_relaxed);
+            if (index >= jobCount) break;
+            ++claimed;
+            float* left = JobLeft(index);
+            float* right = JobRight(index);
+            std::memset(left, 0,
+                        static_cast<size_t>(context.frameCount) * sizeof(float));
+            std::memset(right, 0,
+                        static_cast<size_t>(context.frameCount) * sizeof(float));
+            IndexedJobMix mix{left, right, nullptr, nullptr};
+            if (jobsBusMode) {
+                ZeroJobBuses(index, context.frameCount);
+                mix.busLeft = JobBusLeft(index);
+                mix.busRight = JobBusRight(index);
+            }
+            RenderSpanContext local = context;
+            local.outputLeft = left;
+            local.outputRight = right;
+            if (jobsBusMode) {
+                local.channelBusLeft = mix.busLeft;
+                local.channelBusRight = mix.busRight;
+            }
+            local.frameStart = 0u;
+            // Each job records retirements/class changes into its own scratch;
+            // Execute() merges them into the caller's arrays afterwards.
+            local.retirements = jobRetirements +
+                static_cast<size_t>(index) * kHandlesPerJob;
+            local.retirementCount = &jobRetireCounts[index];
+            *local.retirementCount = 0u;
+            local.classChangeHandles = jobClassChanges +
+                static_cast<size_t>(index) * kHandlesPerJob;
+            local.classChangeCount = &jobClassChangeCounts[index];
+            *local.classChangeCount = 0u;
+            if (indexedCallback) {
+                indexedCallback(index, mix, context.frameCount,
+                                indexedUserData);
+            } else {
+                const RenderJob& job = jobs[index];
+                // False means "no mutation; use the scalar fallback". The
+                // old worker pool discarded this return value, so rotated
+                // transient/release jobs could render nothing and never
+                // advance their envelopes or retirement state.
+                const bool consumed =
+                    job.kernel(local, job.handles, job.handleCount);
+                if (!consumed && job.fallback != job.kernel) {
+                    (void)job.fallback(
+                        local, job.handles, job.handleCount);
+                }
+            }
+        }
+        return claimed;
+    }
+
+    void ResetStorage() noexcept {
+        if (workers) {
+#if !defined(SVMS_XP_COMPAT)
+            if (wakeByAddressAll) {
+                workGeneration.fetch_add(1u, std::memory_order_release);
+                wakeByAddressAll(&workGeneration);
+            }
+#endif
+            for (uint32_t index = 0u; index < helperCount; ++index) {
+                if (workers[index].wakeEvent) {
+                    SetEvent(workers[index].wakeEvent);
+                }
+            }
+            for (uint32_t index = 0u; index < helperCount; ++index) {
+                if (workers[index].thread) {
+                    WaitForSingleObject(workers[index].thread, INFINITE);
+                    CloseHandle(workers[index].thread);
+                }
+                if (workers[index].wakeEvent)
+                    CloseHandle(workers[index].wakeEvent);
+                if (workers[index].readyEvent)
+                    CloseHandle(workers[index].readyEvent);
+            }
+        }
+        if (doneEvent) CloseHandle(doneEvent);
+        _aligned_free(mixStorage);
+        _aligned_free(jobs);
+        _aligned_free(jobRetirements);
+        _aligned_free(jobClassChanges);
+        _aligned_free(jobRetireCounts);
+        _aligned_free(jobClassChangeCounts);
+        _aligned_free(busStorage);
+        _aligned_free(jobBusLeftPtrs);
+        _aligned_free(jobBusRightPtrs);
+        delete[] workers;
+        workers = nullptr;
+        jobs = nullptr;
+        mixStorage = nullptr;
+        jobRetirements = nullptr;
+        jobClassChanges = nullptr;
+        jobRetireCounts = nullptr;
+        jobClassChangeCounts = nullptr;
+        busStorage = nullptr;
+        jobBusLeftPtrs = nullptr;
+        jobBusRightPtrs = nullptr;
+        busJobCapacity = 0u;
+        jobBusStride = 0u;
+        busMode = false;
+        doneEvent = nullptr;
+        totalThreads = 1u;
+        helperCount = 0u;
+        dispatchThreads = 1u;
+        maxFrames = 0u;
+        mixStride = 0u;
+        jobCapacity = 0u;
+        jobCount = 0u;
+        activeHelpers = 0u;
+        jobMixStride = 0u;
+        indexedInFlight = false;
+    }
+};
+
+RenderWorkerPool::RenderWorkerPool() noexcept : impl_(nullptr) {}
+
+RenderWorkerPool::~RenderWorkerPool() {
+    Shutdown();
+}
+
+bool RenderWorkerPool::Initialize(uint32_t totalRenderThreads,
+                                  uint32_t maxFrames,
+                                  uint32_t voiceCapacity) {
+    Shutdown();
+    if (totalRenderThreads <= 1u) return true;
+    totalRenderThreads = (std::min)(totalRenderThreads, kMaximumRenderThreads);
+    if (maxFrames == 0u || voiceCapacity == 0u) return false;
+
+    Impl* impl = new (std::nothrow) Impl();
+    if (!impl) return false;
+    impl->totalThreads = totalRenderThreads;
+    impl->helperCount = totalRenderThreads - 1u;
+    impl->maxFrames = maxFrames;
+    impl->mixStride = (maxFrames + 15u) & ~15u;
+    impl->jobMixStride = static_cast<size_t>(impl->mixStride) * 2u;
+    impl->jobCapacity =
+        (voiceCapacity + kHandlesPerJob - 1u) / kHandlesPerJob +
+        kVoiceRenderClassCount + totalRenderThreads;
+
+    const size_t mixFloats = static_cast<size_t>(impl->jobCapacity) *
+        impl->jobMixStride;
+    if (mixFloats > (std::numeric_limits<size_t>::max)() / sizeof(float)) {
+        delete impl;
+        return false;
+    }
+    impl->workers = new (std::nothrow) Impl::Worker[impl->helperCount]{};
+    impl->jobs = static_cast<RenderJob*>(_aligned_malloc(
+        static_cast<size_t>(impl->jobCapacity) * sizeof(RenderJob), 64u));
+    impl->mixStorage = static_cast<float*>(_aligned_malloc(
+        mixFloats * sizeof(float), 64u));
+    const size_t spanScratchEntries = static_cast<size_t>(impl->jobCapacity) * kHandlesPerJob;
+    impl->jobRetirements = static_cast<SpanRetirement*>(_aligned_malloc(
+        spanScratchEntries * sizeof(SpanRetirement), 64u));
+    impl->jobClassChanges = static_cast<uint32_t*>(_aligned_malloc(
+        spanScratchEntries * sizeof(uint32_t), 64u));
+    impl->jobRetireCounts = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(impl->jobCapacity) * sizeof(uint32_t), 64u));
+    impl->jobClassChangeCounts = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(impl->jobCapacity) * sizeof(uint32_t), 64u));
+    impl->doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#if !defined(SVMS_XP_COMPAT)
+    if (HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll")) {
+        impl->waitOnAddress = reinterpret_cast<Impl::WaitOnAddressProc>(
+            GetProcAddress(kernel32, "WaitOnAddress"));
+        impl->wakeByAddressAll = reinterpret_cast<Impl::WakeByAddressAllProc>(
+            GetProcAddress(kernel32, "WakeByAddressAll"));
+    }
+#endif
+    if (!impl->workers || !impl->jobs || !impl->mixStorage ||
+        !impl->jobRetirements || !impl->jobClassChanges ||
+        !impl->jobRetireCounts || !impl->jobClassChangeCounts ||
+        !impl->doneEvent) {
+        impl->stopping.store(true, std::memory_order_release);
+        impl->ResetStorage();
+        delete impl;
+        return false;
+    }
+
+    for (uint32_t index = 0u; index < impl->helperCount; ++index) {
+        Impl::Worker& worker = impl->workers[index];
+        worker.owner = impl;
+        worker.lane = index + 1u;
+        worker.wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        worker.readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (worker.wakeEvent && worker.readyEvent) {
+            worker.thread = CreateThread(nullptr, 0u, Impl::ThreadEntry,
+                                         &worker, 0u, nullptr);
+            // Affinity policy (opt-in): mode 2 pins workers to efficiency
+            // cores so the scheduler keeps P-cores free for the RT threads.
+            // Otherwise the worker keeps its inherited placement — the
+            // configured worker count is never reduced.
+            svms::ApplyThreadAffinity(worker.thread,
+                                      svms::AffinityRole::Worker);
+        }
+        if (!worker.wakeEvent || !worker.readyEvent || !worker.thread) {
+            impl->stopping.store(true, std::memory_order_release);
+            impl->ResetStorage();
+            delete impl;
+            return false;
+        }
+        WaitForSingleObject(worker.readyEvent, INFINITE);
+        CloseHandle(worker.readyEvent);
+        worker.readyEvent = nullptr;
+    }
+    impl_ = impl;
+    return true;
+}
+
+void RenderWorkerPool::Shutdown() noexcept {
+    Impl* impl = impl_;
+    if (!impl) return;
+    impl_ = nullptr;
+    impl->stopping.store(true, std::memory_order_release);
+    impl->ResetStorage();
+    delete impl;
+}
+
+uint32_t RenderWorkerPool::GetThreadCount() const noexcept {
+    return impl_ ? impl_->totalThreads : 1u;
+}
+
+uint32_t RenderWorkerPool::GetJobCapacity() const noexcept {
+    return impl_ ? impl_->jobCapacity : 1u;
+}
+
+void RenderWorkerPool::ApplyAffinity() noexcept {
+    Impl* impl = impl_;
+    if (!impl) return;
+    for (uint32_t index = 0u; index < impl->helperCount; ++index)
+        svms::ApplyThreadAffinity(impl->workers[index].thread,
+                                  svms::AffinityRole::Worker);
+}
+
+float RenderWorkerPool::GetHelperJobPercent() const noexcept {
+    if (!impl_) return 0.0f;
+    const uint64_t helper =
+        impl_->helperJobs.load(std::memory_order_relaxed);
+    const uint64_t coordinator =
+        impl_->coordinatorJobs.load(std::memory_order_relaxed);
+    const uint64_t total = helper + coordinator;
+    return total != 0u
+        ? static_cast<float>(static_cast<double>(helper) * 100.0 /
+                             static_cast<double>(total))
+        : 0.0f;
+}
+
+size_t RenderWorkerPool::GetAllocatedBytes() const noexcept {
+    if (!impl_) return 0u;
+    return sizeof(Impl) +
+        static_cast<size_t>(impl_->helperCount) * sizeof(Impl::Worker) +
+        static_cast<size_t>(impl_->jobCapacity) * sizeof(RenderJob) +
+        static_cast<size_t>(impl_->jobCapacity) * impl_->jobMixStride *
+            sizeof(float) +
+        static_cast<size_t>(impl_->busJobCapacity) * impl_->jobBusStride *
+            sizeof(float) +
+        2u * static_cast<size_t>(impl_->busJobCapacity) * kChannelCount *
+            sizeof(float*);
+}
+
+size_t RenderWorkerPool::EstimateAllocatedBytes(
+    uint32_t totalRenderThreads, uint32_t maxFrames,
+    uint32_t voiceCapacity) noexcept {
+    if (totalRenderThreads <= 1u) return 0u;
+    totalRenderThreads = (std::min)(totalRenderThreads,
+                                    kMaximumRenderThreads);
+    if (maxFrames == 0u || voiceCapacity == 0u) return 0u;
+    const uint32_t helperCount = totalRenderThreads - 1u;
+    const uint32_t mixStride = (maxFrames + 15u) & ~15u;
+    const size_t jobMixStride = static_cast<size_t>(mixStride) * 2u;
+    const uint32_t jobCapacity =
+        (voiceCapacity + kHandlesPerJob - 1u) / kHandlesPerJob +
+        kVoiceRenderClassCount + totalRenderThreads;
+    const size_t mixFloats = static_cast<size_t>(jobCapacity) *
+        jobMixStride;
+    if (mixFloats > (std::numeric_limits<size_t>::max)() / sizeof(float))
+        return (std::numeric_limits<size_t>::max)();
+    return sizeof(Impl) +
+        static_cast<size_t>(helperCount) * sizeof(Impl::Worker) +
+        static_cast<size_t>(jobCapacity) * sizeof(RenderJob) +
+        static_cast<size_t>(jobCapacity) * kHandlesPerJob *
+            (sizeof(SpanRetirement) + 2u * sizeof(uint32_t)) +
+        mixFloats * sizeof(float);
+}
+
+bool RenderWorkerPool::ShouldParallelize(uint32_t voiceCount,
+                                         uint32_t frameCount) const noexcept {
+    return ClassifyParallelization(voiceCount, frameCount) ==
+        RenderParallelRejectReason::None;
+}
+
+RenderParallelRejectReason RenderWorkerPool::ClassifyParallelization(
+    uint32_t voiceCount, uint32_t frameCount) const noexcept {
+    if (!impl_ || impl_->totalThreads <= 1u)
+        return RenderParallelRejectReason::Unavailable;
+    if (frameCount == 0u)
+        return RenderParallelRejectReason::TooFewFrames;
+    if (voiceCount < kHandlesPerJob)
+        return RenderParallelRejectReason::TooFewVoices;
+    // Small pools only earn the wake/join cost on substantial spans. A large
+    // pool makes even a short span worthwhile: the gather-heavy class kernels
+    // dwarf the roughly microsecond-scale WakeByAddress handshake, and dense
+    // chopped material produces event-fragmented spans as a rule rather than
+    // an exception.
+    if (static_cast<uint64_t>(voiceCount) * frameCount <
+        kMinimumParallelVoiceSamples) {
+        // Short spans (< kMinimumParallelFrames) need a very large voice
+        // pool to amortize wake/sync overhead (chopped buzz workloads).
+        if (frameCount < kMinimumParallelFrames) {
+            if (voiceCount < kMinimumVoicesShortSpan)
+                return RenderParallelRejectReason::TooFewVoiceSamples;
+        } else {
+            if (voiceCount < kLargePoolShortSpanVoices)
+                return RenderParallelRejectReason::TooFewVoiceSamples;
+        }
+    }
+    return RenderParallelRejectReason::None;
+}
+
+void RenderWorkerPool::BeginSpan(const RenderSpanContext& context) noexcept {
+    if (!impl_) return;
+    impl_->context = context;
+    impl_->indexedCallback = nullptr;
+    impl_->indexedUserData = nullptr;
+    impl_->jobCount = 0u;
+    impl_->busMode = context.channelBusLeft != nullptr;
+    impl_->queueValid = context.frameCount <= impl_->maxFrames;
+}
+
+bool RenderWorkerPool::AddClassRange(RenderClassKernel kernel,
+                                     const uint32_t* handles,
+                                     uint32_t handleCount) noexcept {
+    if (!impl_ || !impl_->queueValid || !kernel || !handles) return false;
+    const RenderClassKernel fallback = ResolveScalarFallback(kernel);
+    if (!fallback) {
+        // Unknown class kernels cannot safely be sent to workers because a
+        // false return would have no defined fallback. Refuse before any job
+        // runs; the caller's established serial path will consume the class.
+        impl_->queueValid = false;
+        return false;
+    }
+    for (uint32_t offset = 0u; offset < handleCount;
+         offset += kHandlesPerJob) {
+        // Bus mode caps span fan-out: per-job channel planes are ~16x a
+        // legacy job mix, so beyond this bound the fan-out cannot pay for
+        // its own scratch. queueValid=false sends Execute() to false and the
+        // caller renders the span serially (its established fallback).
+        if (impl_->busMode && impl_->jobCount >= 16u) {
+            impl_->queueValid = false;
+            return false;
+        }
+        if (impl_->jobCount >= impl_->jobCapacity) {
+            impl_->queueValid = false;
+            return false;
+        }
+        const uint32_t count =
+            (std::min)(kHandlesPerJob, handleCount - offset);
+        impl_->jobs[impl_->jobCount++] = {
+            kernel, fallback, handles + offset, count};
+    }
+    return true;
+}
+
+bool RenderWorkerPool::Execute() noexcept {
+    Impl* impl = impl_;
+    if (!impl || !impl->queueValid || impl->jobCount < 2u) return false;
+    // Bus plane scratch must exist before any worker claims a job.
+    if (impl->busMode && !impl->EnsureBusStorage(impl->jobCount)) {
+        impl->queueValid = false;
+        return false;
+    }
+    impl->dispatchThreads = (std::min)(impl->totalThreads, impl->jobCount);
+    const uint32_t activeHelpers = impl->dispatchThreads - 1u;
+    ResetEvent(impl->doneEvent);
+    impl->nextJob.store(0u, std::memory_order_relaxed);
+    impl->completedWorkers.store(0u, std::memory_order_relaxed);
+    impl->pendingWorkers.store(activeHelpers, std::memory_order_release);
+    impl->workGeneration.fetch_add(1u, std::memory_order_release);
+#if !defined(SVMS_XP_COMPAT)
+    if (impl->wakeByAddressAll) {
+        impl->wakeByAddressAll(&impl->workGeneration);
+    } else
+#endif
+    {
+        for (uint32_t index = 0u; index < activeHelpers; ++index)
+            SetEvent(impl->workers[index].wakeEvent);
+    }
+
+    const uint32_t coordinatorClaimed = impl->ProcessJobs();
+    impl->coordinatorJobs.fetch_add(coordinatorClaimed,
+                                    std::memory_order_relaxed);
+    if (activeHelpers != 0u) {
+        for (;;) {
+            uint32_t completed =
+                impl->completedWorkers.load(std::memory_order_acquire);
+            if (completed >= activeHelpers) break;
+            // Pool shutdown can race an in-flight span (device removal,
+            // session destroy): helpers were woken and will never finish
+            // their jobs, so waiting for them would hang forever.
+            if (impl->stopping.load(std::memory_order_acquire)) break;
+#if !defined(SVMS_XP_COMPAT)
+            if (impl->waitOnAddress) {
+                impl->waitOnAddress(&impl->completedWorkers, &completed,
+                                    sizeof(completed), 16);
+                continue;
+            }
+#endif
+            WaitForSingleObject(impl->doneEvent, 16);
+        }
+    }
+
+    const uint32_t frames = impl->context.frameCount;
+    if (impl->busMode) {
+        // Per-channel merge in fixed job order: each channel plane sums
+        // every job's plane for that channel.
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            float* destLeft =
+                impl->context.channelBusLeft[channel] + impl->context.frameStart;
+            float* destRight =
+                impl->context.channelBusRight[channel] + impl->context.frameStart;
+            for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+                const float* srcLeft = impl->JobBusLeft(job)[channel];
+                const float* srcRight = impl->JobBusRight(job)[channel];
+                for (uint32_t frame = 0u; frame < frames; ++frame) {
+                    destLeft[frame] += srcLeft[frame];
+                    destRight[frame] += srcRight[frame];
+                }
+            }
+        }
+    } else {
+        float* destinationLeft = impl->context.outputLeft + impl->context.frameStart;
+        float* destinationRight = impl->context.outputRight + impl->context.frameStart;
+        // Fixed lane order makes each run deterministic even though worker wake
+        // and completion order are intentionally unconstrained.
+        for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+            const float* left = impl->JobLeft(job);
+            const float* right = impl->JobRight(job);
+            for (uint32_t frame = 0u; frame < frames; ++frame) {
+                destinationLeft[frame] += left[frame];
+                destinationRight[frame] += right[frame];
+            }
+        }
+    }
+    // Merge per-job span lifecycle records. Retirement order is restored by
+    // the caller's (frameOffset, capturePosition) sort, which is unaffected
+    // by concatenation order; class-change refresh is order-independent.
+    if (impl->context.retirements != nullptr &&
+        impl->context.retirementCount != nullptr) {
+        const uint32_t written = *impl->context.retirementCount;
+        SpanRetirement* const base =
+            impl->context.retirements + written;
+        uint32_t total = 0u;
+        for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+            const uint32_t count = impl->jobRetireCounts[job];
+            std::memcpy(base + total, impl->jobRetirements +
+                static_cast<size_t>(job) * kHandlesPerJob,
+                static_cast<size_t>(count) * sizeof(SpanRetirement));
+            total += count;
+        }
+        *impl->context.retirementCount = written + total;
+    }
+    if (impl->context.classChangeHandles != nullptr &&
+        impl->context.classChangeCount != nullptr) {
+        const uint32_t written = *impl->context.classChangeCount;
+        uint32_t* const base = impl->context.classChangeHandles + written;
+        uint32_t total = 0u;
+        for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+            const uint32_t count = impl->jobClassChangeCounts[job];
+            std::memcpy(base + total, impl->jobClassChanges +
+                static_cast<size_t>(job) * kHandlesPerJob,
+                static_cast<size_t>(count) * sizeof(uint32_t));
+            total += count;
+        }
+        *impl->context.classChangeCount = written + total;
+    }
+    return true;
+}
+
+bool RenderWorkerPool::ExecuteIndexed(uint32_t jobCount, uint32_t frameCount,
+                                      float* outputLeft, float* outputRight,
+                                      IndexedRenderJob callback,
+                                      void* userData,
+                                      float* const* channelBusLeft,
+                                      float* const* channelBusRight) noexcept {
+    if (!BeginIndexed(jobCount, frameCount, outputLeft, outputRight,
+                      callback, userData, channelBusLeft, channelBusRight)) {
+        return false;
+    }
+    return FinishIndexed();
+}
+
+bool RenderWorkerPool::BeginIndexed(uint32_t jobCount, uint32_t frameCount,
+                                    float* outputLeft, float* outputRight,
+                                    IndexedRenderJob callback,
+                                    void* userData,
+                                    float* const* channelBusLeft,
+                                    float* const* channelBusRight) noexcept {
+    Impl* impl = impl_;
+    if (!impl || !callback || !outputLeft || !outputRight || jobCount < 2u ||
+        jobCount > impl->jobCapacity || frameCount == 0u ||
+        frameCount > impl->maxFrames || impl->indexedInFlight) {
+        return false;
+    }
+    impl->context = {};
+    impl->context.outputLeft = outputLeft;
+    impl->context.outputRight = outputRight;
+    impl->context.frameCount = frameCount;
+    impl->context.channelBusLeft = channelBusLeft;
+    impl->context.channelBusRight = channelBusRight;
+    impl->indexedCallback = callback;
+    impl->indexedUserData = userData;
+    impl->jobCount = jobCount;
+    impl->busMode = channelBusLeft != nullptr;
+    // Bus plane scratch must exist before any worker claims a job.
+    if (impl->busMode && !impl->EnsureBusStorage(jobCount)) return false;
+    impl->queueValid = true;
+    impl->dispatchThreads = (std::min)(impl->totalThreads, jobCount);
+    impl->activeHelpers = impl->dispatchThreads - 1u;
+    ResetEvent(impl->doneEvent);
+    impl->nextJob.store(0u, std::memory_order_relaxed);
+    impl->completedWorkers.store(0u, std::memory_order_relaxed);
+    impl->pendingWorkers.store(impl->activeHelpers,
+                               std::memory_order_release);
+    impl->indexedInFlight = true;
+    impl->workGeneration.fetch_add(1u, std::memory_order_release);
+#if !defined(SVMS_XP_COMPAT)
+    if (impl->wakeByAddressAll) {
+        impl->wakeByAddressAll(&impl->workGeneration);
+    } else
+#endif
+    {
+        for (uint32_t index = 0u; index < impl->activeHelpers; ++index)
+            SetEvent(impl->workers[index].wakeEvent);
+    }
+    return true;
+}
+
+bool RenderWorkerPool::FinishIndexed() noexcept {
+    Impl* impl = impl_;
+    if (!impl || !impl->indexedInFlight) return false;
+
+    // Once planning is complete, the coordinator joins the same atomic job
+    // queue instead of waiting idle for helpers to drain it.
+    const uint32_t coordinatorClaimed = impl->ProcessJobs();
+    impl->coordinatorJobs.fetch_add(coordinatorClaimed,
+                                    std::memory_order_relaxed);
+    if (impl->activeHelpers != 0u) {
+#if !defined(SVMS_XP_COMPAT)
+        if (impl->waitOnAddress) {
+            for (;;) {
+                uint32_t completed =
+                    impl->completedWorkers.load(std::memory_order_acquire);
+                if (completed >= impl->activeHelpers) break;
+                impl->waitOnAddress(&impl->completedWorkers, &completed,
+                                    sizeof(completed), INFINITE);
+            }
+        } else
+#endif
+        {
+            WaitForSingleObject(impl->doneEvent, INFINITE);
+        }
+    }
+
+    const uint32_t frames = impl->context.frameCount;
+    if (impl->busMode) {
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            float* destLeft = impl->context.channelBusLeft[channel];
+            float* destRight = impl->context.channelBusRight[channel];
+            for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+                const float* srcLeft = impl->JobBusLeft(job)[channel];
+                const float* srcRight = impl->JobBusRight(job)[channel];
+                for (uint32_t frame = 0u; frame < frames; ++frame) {
+                    destLeft[frame] += srcLeft[frame];
+                    destRight[frame] += srcRight[frame];
+                }
+            }
+        }
+    } else {
+        for (uint32_t job = 0u; job < impl->jobCount; ++job) {
+            const float* left = impl->JobLeft(job);
+            const float* right = impl->JobRight(job);
+            for (uint32_t frame = 0u; frame < frames; ++frame) {
+                impl->context.outputLeft[frame] += left[frame];
+                impl->context.outputRight[frame] += right[frame];
+            }
+        }
+    }
+    impl->indexedCallback = nullptr;
+    impl->indexedUserData = nullptr;
+    impl->indexedInFlight = false;
+    impl->activeHelpers = 0u;
+    return true;
+}
+
+} // namespace svms
