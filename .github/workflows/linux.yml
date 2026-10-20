@@ -6,12 +6,12 @@ on:
     branches: [v3, main]
     paths:
       - ".github/workflows/linux.yml"
-      - "build_v3_linux.sh"
+      - "build.sh"
       - "src/V3/**"
   pull_request:
     paths:
       - ".github/workflows/linux.yml"
-      - "build_v3_linux.sh"
+      - "build.sh"
       - "src/V3/**"
 
 jobs:

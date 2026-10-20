@@ -1,192 +1,139 @@
 # SuperVirtualMIDISynth
 
-SuperVirtualMIDISynth V3 is an experimental SoundFont MIDI synthesizer built for
-sample-accurate playback, dense MIDI streams, and high polyphony. On Windows it
-can run as a drop-in `winmm.dll`, so applications can use it without adding a
-custom audio backend.
+A SoundFont MIDI synthesizer built for Black MIDI: sample-accurate event timing,
+dense note streams, and voice pools from a few hundred up to 524,288 voices.
 
-V3 remains under active development. Interfaces, configuration fields, and
-audio behavior may change before the first stable release. The project does not
-publish official V3 DLL releases yet, but you can build and test it from source.
+On Windows it ships as a drop-in `winmm.dll`. Any program that calls the normal
+Windows MIDI API (`midiOutOpen`, `midiOutShortMsg`, ...) uses SVMS instead of the
+built-in synth, with no code changes. Programs that want more control can use
+the native SVMS API, a KDMAPI-compatible facade, or a pluggable backend router.
 
-## Current V3 features
+V3 is under active development. Interfaces, configuration fields and audio
+behavior may change before the first stable release, and there are no official
+binary releases yet. Build it from source.
 
-- Exact output-frame event scheduling with stable equal-frame ordering
-- SF2 playback with scalar, SSE2, and AVX2 render backends
-- Optional multicore voice rendering with deterministic tile reduction
-- Configurable voice pools from small legacy-PC setups to a 524,288-voice ceiling
-- Priority and lossless event-ingress modes
-- Channel controllers, pitch bend and range changes, sustain, panic, and common
-  GM/GS/XG SysEx state
-- Configurable reverb, lookahead limiter, and post-output high-pass filtering
-- JSON configuration with local and Roaming AppData lookup
-- Configurator with live controls, diagnostics, profile import/export, and an
-  offline renderer page
-- Live post-DSP recording to stereo 32-bit float WAV/RF64
-- Live SoundFont switching with off-thread preparation and block-boundary activation
-- Priority-ordered SoundFont stacks with explicit MIDI bank/preset routing
-- Native SVMS API and KDMAPI-compatible entry points
-- Windows x64, Windows x86, Windows XP x86, and Linux x86-64 targets
+## Features
 
-The configured voice ceiling does not guarantee real-time playback at that
-voice count. SoundFont layering, event rate, CPU speed, audio buffer size, and
-voice stealing can change the cost by a large amount.
+- Exact output-frame event scheduling with stable ordering for equal-frame events
+- SF2 playback on Scalar, SSE2 and AVX2 render backends, with a multicore worker pool
+- Voice stealing, optional per-key voice caps and voice decimation for extreme loads
+- Priority and lossless MIDI-ingress modes
+- Controllers, pitch bend, sustain, panic and common GM/GS/XG SysEx
+- Reverb, lookahead limiter, optional per-channel limiters, post-output filtering
+- Live SoundFont switching and priority-ordered SoundFont stacks
+- Live post-DSP recording to 32-bit float WAV/RF64
+- Offline MIDI-to-WAV renderer (GUI page and command line)
+- Configurator with live controls, diagnostics and profile import/export
+- WASAPI output (ASIO optional), Windows x64/x86/XP and Linux x86-64
 
-## Build on Windows
+The voice ceiling is a limit, not a promise: SoundFont layering, event rate, CPU
+speed and buffer size decide how many voices play in real time.
 
-Install:
+## Build
 
-- Visual Studio 2022 or newer with Desktop development with C++
-- CMake 3.20 or newer
-- Ninja
+### Windows
 
-Run the build script from the repository root:
+Needs Visual Studio 2022 or newer (Desktop development with C++), CMake and Ninja.
 
 ```bat
-build_v3.bat
+build.bat
 ```
 
-The x64 build goes to `build\V3\bin`. Its main files are:
+| Command | Result |
+| --- | --- |
+| `build.bat` | x64 Release in `build\V3\bin` |
+| `build.bat x86` | 32-bit build for 32-bit MIDI applications |
+| `build.bat xp` | Windows XP-compatible x86 build, with tests |
+| `build.bat xp-mingw` | XP build with MinGW (`W64DEVKIT_X86`, default `.\w64devkit-x86`) |
+| `build.bat player` | Reference MIDI player |
+| `build.bat clean` | Delete `build\V3` |
+
+Set `CMAKE_BUILD_PARALLEL_LEVEL` to cap build parallelism on small machines.
+
+The x64 build produces:
 
 | File | Purpose |
 | --- | --- |
-| `winmm.dll` | Drop-in WinMM MIDI output driver |
-| `SVMSAPI.dll` | Native SVMS API runtime |
-| `OmniMIDI.dll` | KDMAPI-compatible runtime name |
-| `SnappySynth.dll` | Ziggy-compatible runtime name |
-| `svms_v3_configurator.exe` | Configuration, diagnostics, and offline-render UI |
-| `svms_v3_render.exe` | Standalone MIDI-to-WAV/RF64 renderer |
+| `winmm.dll` | Drop-in WinMM MIDI driver |
+| `SVMSAPI.dll` | Standalone native-API and KDMAPI-compatible runtime |
+| `OmniMIDI.dll`, `SnappySynth.dll`, `SVMS.dll` | The WinMM runtime under other names, for hosts that load those |
+| `SVMSConfigurator.exe` | Configuration, diagnostics and offline-render UI |
+| `svms_v3_render.exe` | Command-line MIDI-to-WAV/RF64 renderer |
 
-The DLL names above contain the same runtime. Each name exists so applications
-that expect a particular integration can load V3 without creating separate
-synth engines inside one process.
+### Linux
 
-### Other Windows targets
+Needs a C++ compiler, CMake, Ninja and the ALSA development package.
 
-```bat
-build_v3_x86.bat
-build_v3_xp_x86.bat
+```sh
+sudo apt-get install build-essential cmake ninja-build libasound2-dev
+./build.sh
 ```
 
-Use the x86 build with 32-bit MIDI applications. The XP script expects an x86
-MinGW toolchain at `w64devkit-x86`, excludes AVX2, and uses the legacy
-audio-output path. The modern Configurator and offline-render executable do not
-ship in the XP target.
+This builds and tests `svmsd` (an ALSA sequencer-to-PCM daemon), `svms_v3_render`,
+`libsvmsapi.so` and `libOmniMIDI.so`. Connect a MIDI source to the `svmsd` port
+with `aconnect`.
 
 ## Use the Windows driver
 
-1. Match the DLL architecture to the MIDI application.
-2. Copy `winmm.dll` beside the application's executable.
-3. Put an SF2 file beside the DLL or select one in the Configurator.
-4. Start the MIDI application.
+1. Pick the DLL that matches your MIDI program (32-bit or 64-bit).
+2. Copy `winmm.dll` next to the program's executable.
+3. Put an `.sf2` next to the DLL, or choose one in the Configurator.
+4. Start the program.
 
-V3 checks for `config.json` beside its DLL first. If that file does not exist,
-it uses `%APPDATA%\SuperVirtualMIDISynth\config.json` and creates a default
-configuration when possible. Relative SoundFont paths resolve from the selected
-configuration directory. With no configured SoundFont, V3 searches beside the
-DLL for a local `.sf2` file.
+The driver reads `config.json` next to its DLL, then
+`%APPDATA%\SuperVirtualMIDISynth\config.json`, and creates a default one if
+needed. Relative SoundFont paths resolve from the configuration directory. The
+Configurator edits the same file; press **Save Configuration** to apply changes.
 
-The Configurator edits the same JSON file and can import or export complete JSON
-profiles from **Advanced > Configuration**. Import changes the working copy;
-press **Save Configuration** to write and apply it.
+## Integrate with your own synth or player
 
-The **MIDI** page can route a physical MIDI input directly into SVMS. Enable
-it, select the system input, save, and restart the host. Short messages retain
-their arrival timestamps and SysEx uses fixed reusable input buffers; normal
-host `midiIn*` forwarding remains independent.
+Pick the surface that fits.
 
-The **Live Recording** page records the final stream after reverb, limiting,
-and post filtering. V3 writes the file on a background thread and reports any
-frames dropped because the disk could not keep up.
+- **Nothing to change.** Call the Windows MIDI API as usual and drop in `winmm.dll`.
+- **Native API.** Include `src/V3/include/svmsapi.h` and load `SVMSAPI.dll` (or
+  `libsvmsapi.so`). It uses sized C structures, capability flags, timestamped
+  batches, isolated offline sessions and caller-owned output buffers.
+- **KDMAPI.** `SVMSAPI.dll` and `OmniMIDI.dll` export the KDMAPI function set.
+- **Single header.** `src/V3/SVMSAPI.h` binds the KDMAPI-style exports through
+  `LoadLibrary` and defines the contract for third-party synth backends.
+- **Router.** With `api.backend` set, SVMSAPI forwards events to another synth
+  DLL (SVMS-API or KDMAPI) or a WinMM device instead of rendering them itself.
 
-The **Audio** page can load the selected SoundFont into the running driver.
-Parsing and sample preparation happen on a loader thread; the finished immutable
-bank activates at the next audio-block boundary without restarting WASAPI. Any
-voices using the previous bank are silenced at activation while MIDI channel
-state is retained. Save the configuration separately to reuse the bank later.
-
-The same page can build a priority-ordered stack of up to 16 SoundFonts.
-Explicit routes map an incoming MIDI bank/preset to a selected stack entry and
-source bank/preset; `-1` keeps the incoming program. Without a route, V3 walks
-the stack in order and uses the first bank containing a compatible preset.
-Stack changes are restart-applied; the single **Load Now** action remains the
-fast live replacement for the primary bank.
+Read [src/V3/include/README.md](src/V3/include/README.md) before integrating. It
+documents every function, the capability negotiation and the discovery rules.
 
 ## Offline rendering
-
-Open the Configurator's **Offline Renderer** page to select a MIDI file,
-SoundFont, and output WAV. The page shows load/render progress, speed, ETA,
-voice counts, and steals. You can cancel without freezing the Configurator.
-
-The command-line renderer exposes the same engine and WAV/RF64 writer:
 
 ```bat
 build\V3\bin\svms_v3_render.exe input.mid soundfont.sf2 output.wav
 ```
 
-Run it with no arguments to see options for sample rate, voice count, render
-threads, backend selection, limiter settings, event-buffer size, and scan-only
-MIDI validation.
-
-## Build on Linux
-
-Install a C++ compiler, CMake, Ninja, and the ALSA development package. On
-Ubuntu or Debian:
-
-```sh
-sudo apt-get install build-essential cmake ninja-build libasound2-dev
-./build_v3_linux.sh
-```
-
-The Linux build provides:
-
-- `svmsd`, an ALSA Sequencer to ALSA PCM real-time daemon
-- `svms_v3_render`, the offline renderer
-- `libsvmsapi.so`, the native API runtime
-- `libOmniMIDI.so`, a compatibility name used by Linux Ziggy
-
-Connect a MIDI source to the `svmsd` ALSA port with `aconnect`. GitHub Actions
-also builds and tests an Ubuntu 18.04 compatible x86-64 archive.
-
-## Native API
-
-New applications can include `src/V3/include/svmsapi.h` and load
-`SVMSAPI.dll` or `libsvmsapi.so`. ABI 1 uses sized C structures, capability
-flags, timestamped batches, isolated offline sessions, and caller-owned output
-buffers.
-
-Read [src/V3/include/README.md](src/V3/include/README.md) before integrating.
-Applications should request only the capabilities they use and accept a shorter
-function table from older runtimes.
+Run it with no arguments to list the sample-rate, voice-count, thread, backend and
+limiter options. The Configurator's **Offline Renderer** page uses the same engine.
 
 ## Tests
-
-The normal Windows and Linux builds enable tests. Run:
 
 ```bat
 ctest --test-dir build\V3 --output-on-failure
 ```
 
-The suite covers event timing and ordering, SF2 behavior, voice lifecycle,
-limiting, RuntimeLink/native ABI compatibility, configuration profiles, and
-multi-process runtime use.
+The suite covers event timing and ordering, SF2 behavior, the voice lifecycle,
+limiting, native-API ABI compatibility, configuration profiles and multi-process use.
 
-## Project layout
+## Layout
 
 | Path | Contents |
 | --- | --- |
-| `src/V3` | V3 driver, synth engine, Configurator, renderer, and tests |
-| `src/V3/include` | Public SVMS API header and integration guide |
-| `third_party` | Vendored Dear ImGui (used backends only) and nlohmann/json |
-| `asio-main` | Steinberg ASIO SDK sources (GPLv3 option), used by the optional ASIO output |
-| `.github/workflows` | Continuous-integration builds |
+| `src/V3` | Driver, synth engine, Configurator, offline renderer, tests |
+| `src/V3/include` | Public API header and integration guide |
+| `third_party` | Vendored Dear ImGui (used backends) and nlohmann/json |
+| `asio-main` | Steinberg ASIO SDK sources (GPLv3 option) for the optional ASIO output |
+| `.github/workflows` | Windows and Linux CI |
 
-## Earlier versions
-
-V1 (TinySoundFont) and V2 (BASSMIDI) live on the `v1` and `v2` branches. `main`
-is V3 only.
+Earlier generations live on separate branches: `v1` (TinySoundFont) and `v2`
+(BASSMIDI). `v3` is the current code.
 
 ## License
 
-SuperVirtualMIDISynth uses the [GNU General Public License v3](LICENSE).
-Vendored dependencies retain their own licenses.
+GNU General Public License v3, see [LICENSE](LICENSE). Vendored dependencies keep
+their own licenses.

@@ -6,15 +6,13 @@ on:
     branches: [v3, main]
     paths:
       - ".github/workflows/windows.yml"
-      - "build_v3.bat"
-      - "find_vs.bat"
+      - "build.bat"
       - "src/V3/**"
       - "third_party/**"
   pull_request:
     paths:
       - ".github/workflows/windows.yml"
-      - "build_v3.bat"
-      - "find_vs.bat"
+      - "build.bat"
       - "src/V3/**"
       - "third_party/**"
 
@@ -39,7 +37,7 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
-        run: call build_v3.bat
+        run: call build.bat
 
       - name: Run tests
         shell: pwsh
