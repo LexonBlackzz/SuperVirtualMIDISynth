@@ -64,7 +64,10 @@ enum {
     SVMS_CAP_CALLBACK_TRACE = UINT64_C(1) << 16,
     /* send_midi_stream: raw MIDI bytes (running status, packed channel
      * messages, SysEx possibly split across calls). */
-    SVMS_CAP_MIDI_STREAM = UINT64_C(1) << 17
+    SVMS_CAP_MIDI_STREAM = UINT64_C(1) << 17,
+    /* send_short_batch_direct: an ordered batch is compiled into the event
+     * pages on the caller's thread (no ingress ring, no compiler thread). */
+    SVMS_CAP_DIRECT_PAGES = UINT64_C(1) << 18
 };
 
 enum {
@@ -483,6 +486,21 @@ typedef SVMS_Result (SVMS_CALL *SVMS_ReadCallbackTraceFn)(
 typedef SVMS_Result (SVMS_CALL *SVMS_SendMidiStreamFn)(
     SVMS_Session session, const uint8_t* data, uint32_t size);
 
+/* Same arguments as send_short_batch, for batches the caller already holds in
+ * time order (nondecreasing timestamps; equal timestamps keep array order).
+ * The events reach the scheduler exactly as send_short_batch would deliver
+ * them, minus the ingress ring and compiler hand-off, so a dense player spends
+ * far less per event. Returns SVMS_RESULT_UNSUPPORTED, having consumed nothing,
+ * when the runtime cannot honour the batch this way (audio not started, CC /
+ * bend collapse, minimum note length or note-on coalescing enabled, sharded
+ * synth); the caller then sends the same batch with send_short_batch.
+ * Differences from send_short_batch: velocity shedding never applies (a full
+ * page pool blocks the caller, as lossless ingress does) and the batch is not
+ * split by lane. Nothing else about timing or order changes. */
+typedef SVMS_Result (SVMS_CALL *SVMS_SendShortBatchDirectFn)(
+    SVMS_Session session, const SVMS_ShortEvent* events,
+    uint32_t event_count);
+
 typedef struct SVMS_Interface {
     uint32_t struct_size;
     uint32_t struct_version;
@@ -528,6 +546,7 @@ typedef struct SVMS_Interface {
     SVMS_EnableCallbackTraceFn enable_callback_trace;
     SVMS_ReadCallbackTraceFn read_callback_trace;
     SVMS_SendMidiStreamFn send_midi_stream;
+    SVMS_SendShortBatchDirectFn send_short_batch_direct;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an

@@ -67,6 +67,17 @@ through `send_short_at_qpc` or `send_short_batch`. Batching does not quantize
 timestamps: every event retains its own tick, and equal-tick events retain
 array/ingress order.
 
+`send_short_batch_direct` (capability `SVMS_CAP_DIRECT_PAGES`, appended to the
+ABI 1 table) takes the same arguments as `send_short_batch` and compiles the
+batch into the engine's event pages on the caller's thread, skipping the
+ingress ring and the compiler thread. Events arrive with the same frames,
+order and termination fences. It returns `SVMS_RESULT_UNSUPPORTED`, having
+consumed nothing, when audio is not running or the engine is set to minimum
+note length, note-on coalescing or shards; send the batch with
+`send_short_batch` then. CC/bend collapse works within one batch, priority
+velocity shedding as usual; a full page pool blocks the caller. Check the
+capability bit, not the product version.
+
 Newer ABI-1 runtimes append an optional exact-timing/control tail to
 `SVMS_Interface`. Check `api.struct_size`, the relevant capability bit, and the
 function pointer before using it. This preserves binaries built against the
@@ -302,7 +313,7 @@ census prints, in one struct.
 
 # The reference client
 
-`svms_player.exe` (`src/V3/SVMSPlayer.cpp`, built by `player_build.bat`)
+`svms_player.exe` (`src/V3/SVMSPlayer.cpp`, built by ``build.bat player``)
 is the dogfood client for all of this: it drives the
 native table (`SVMS_GetInterface` with required-slot validation), a KDMAPI
 synth, or a WinMM device, chosen at startup, with the same GetProcAddress

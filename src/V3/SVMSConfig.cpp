@@ -355,7 +355,9 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"velocity_ignore_below", cfg.velocityIgnoreBelow}
         }},
         {"events", {
-            {"overflow_mode", "priority"},
+            {"overflow_mode",
+             cfg.eventOverflowMode == EventOverflowMode::PriorityVelocity
+                 ? "priority" : "lossless"},
             {"cc_collapse", cfg.ccCollapse},
             {"bend_collapse", cfg.bendCollapse},
             {"min_note_ms", cfg.minNoteMs},

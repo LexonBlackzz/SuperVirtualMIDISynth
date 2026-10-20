@@ -1010,6 +1010,253 @@ bool Driver::SubmitSystemExclusiveCancellable(
     return accepted;
 }
 
+namespace {
+struct PoolGuard {
+    std::atomic_flag& flag;
+    explicit PoolGuard(std::atomic_flag& f) noexcept : flag(f) {
+        while (flag.test_and_set(std::memory_order_acquire)) YieldProcessor();
+    }
+    ~PoolGuard() { flag.clear(std::memory_order_release); }
+};
+} // namespace
+
+bool Driver::AcquireCompilerPage(uint32_t& pageIndex) noexcept {
+    PoolGuard guard(compiledPoolLock_);
+    return compiledPages_.AcquireForCompiler(pageIndex);
+}
+
+bool Driver::PublishCompilerPage(uint32_t pageIndex, uint32_t count) noexcept {
+    PoolGuard guard(compiledPoolLock_);
+    return compiledPages_.PublishFromCompiler(pageIndex, count);
+}
+
+void Driver::ReturnCompilerPage(uint32_t pageIndex) noexcept {
+    PoolGuard guard(compiledPoolLock_);
+    compiledPages_.ReturnUnusedFromCompiler(pageIndex);
+}
+
+// Direct page feed. A batch that is already in time order gains nothing from
+// the ring, per-event sequencing and gating, or the compiler thread: compile it
+// here and append it to an open page. Players send small batches every
+// millisecond, so a page per batch would starve the pool; instead one page stays
+// open (directState_), is published when full, and the audio callback takes
+// whatever is in it right before it imports (FlushDirectPage), so no event waits
+// longer than it would behind the compiler thread.
+//
+// The handoff is lock-free so the audio thread never waits on the producer
+// (which runs at a lower priority and can be preempted): the producer writes
+// events past the published count, then CASes the count up; the audio thread
+// detaches the page with a CAS to 0. If that CAS beats the producer's, the
+// producer's write was not published and it simply appends to a fresh page.
+// CC / pitch-bend collapse works within a batch; priority-velocity shedding as
+// on the ring path. Minimum note length, note-on coalescing and a sharded master
+// make this decline, nothing consumed.
+Driver::DirectSubmit Driver::SubmitShortBatchDirect(
+    const SVMS_ShortEvent* events, uint32_t eventCount, uint64_t immediateQpc,
+    const std::atomic<uint64_t>* externalCancellation,
+    uint64_t cancellationToken) {
+    if (!events && eventCount != 0u) return DirectSubmit::Unsupported;
+    const uint64_t epoch = compilerEpochQPC_.load(std::memory_order_acquire);
+    if (!useEventCompiler_ || epoch == 0u || shardCount_ > 1u ||
+        minNoteMs_.load(std::memory_order_relaxed) != 0u ||
+        noteOnCollapse_.Enabled()) {
+        return DirectSubmit::Unsupported;
+    }
+    if (eventCount == 0u) return DirectSubmit::Done;
+
+    // One direct producer at a time (the stage buffer is theirs alone).
+    PoolGuard producer(directProducerLock_);
+    if (!directReady_.load(std::memory_order_relaxed)) {
+        directStage_.resize(kCompiledEventPageCapacity);
+        directScratch_.resize(kCompiledEventPageCapacity);
+        audioScratch_.resize(kCompiledEventPageCapacity);
+        directMerger_.reset(new NoteMerger());
+        audioMerger_.reset(new NoteMerger());
+        directReady_.store(true, std::memory_order_release);
+    }
+
+    const bool collapseCc = ccCollapseEnabled_.load(std::memory_order_relaxed);
+    const bool collapseBend = bendCollapseEnabled_.load(std::memory_order_relaxed);
+    const DirectCompileContext ctx{epoch, static_cast<int64_t>(qpcFreq),
+                                   sampleRate, bufferFrames};
+    const uint32_t seqBase = static_cast<uint32_t>(
+        nextEventSequence_.fetch_add(eventCount, std::memory_order_relaxed));
+    auto terminate = [this](bool global, uint8_t channel, uint32_t sequence) {
+        PublishTerminationFence(
+            global ? globalTerminationFence_ : channelTerminationFence_[channel],
+            sequence);
+    };
+    auto shed = [this](uint8_t velocity) {
+        shedAtomic_.fetch_add(1, std::memory_order_relaxed);
+        shedByVelocityAtomic_[velocity].fetch_add(1, std::memory_order_relaxed);
+        notAcceptedAtomic_.fetch_add(1, std::memory_order_relaxed);
+    };
+    auto cancelled = [&]() {
+        return cancelProducers_.load(std::memory_order_acquire) ||
+               (externalCancellation && externalCancellation->load(
+                    std::memory_order_acquire) == cancellationToken);
+    };
+    // Queue pressure is sampled once per batch (the ring path: per 256 events).
+    const uint32_t shedBelow =
+        overflowMode_.load(std::memory_order_relaxed) ==
+                EventOverflowMode::PriorityVelocity
+            ? RefreshVelocityCutoff(EventLane::Loud) : 0u;
+
+    for (uint32_t cursor = 0u; cursor < eventCount;) {
+        const uint32_t take = (std::min)(eventCount - cursor,
+                                         kCompiledEventPageCapacity);
+        uint32_t staged = CompileDirectRun(
+            events + cursor, take, immediateQpc, seqBase + cursor, ctx,
+            directStage_.data(), terminate, shedBelow, shed);
+        cursor += take;
+        if (collapseCc || collapseBend)
+            staged = CollapseDirectStage(staged, collapseCc, collapseBend);
+
+        for (uint32_t done = 0u; done < staged;) {
+            uint64_t state = directState_.load(std::memory_order_acquire);
+            if (state == 0u) {
+                uint32_t got = kInvalidEventPage;
+                if (!AcquireCompilerPage(got)) {
+                    if (cancelled()) {
+                        cancelledAtomic_.fetch_add(1u, std::memory_order_relaxed);
+                        notAcceptedAtomic_.fetch_add(
+                            (eventCount - cursor) + (staged - done),
+                            std::memory_order_relaxed);
+                        return DirectSubmit::Cancelled;
+                    }
+                    // The audio thread bumps this epoch when it recycles pages.
+                    const uint32_t observed =
+                        compilerWakeEpoch_.load(std::memory_order_acquire);
+                    if (!AcquireCompilerPage(got)) {
+                        WaitForAddressChange(compilerWakeEpoch_, observed);
+                        continue;
+                    }
+                }
+                state = static_cast<uint64_t>(got + 1u) << 32;
+                directState_.store(state, std::memory_order_release);
+            }
+            const uint32_t pageIndex = static_cast<uint32_t>(state >> 32) - 1u;
+            const uint32_t count = static_cast<uint32_t>(state);
+            const uint32_t n = (std::min)(staged - done,
+                                          kCompiledEventPageCapacity - count);
+            std::memcpy(compiledPages_.Page(pageIndex).events + count,
+                        directStage_.data() + done,
+                        static_cast<size_t>(n) * sizeof(ScheduledRenderEvent));
+            const uint64_t next = (state & ~uint64_t{0xffffffffu}) | (count + n);
+            uint64_t expected = state;
+            if (!directState_.compare_exchange_strong(
+                    expected, next, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                continue; // the audio thread took the page first: redo on a new one
+            }
+            done += n;
+            if (count + n == kCompiledEventPageCapacity) {
+                expected = next;
+                if (directState_.compare_exchange_strong(
+                        expected, 0u, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    PublishDirectPage(pageIndex, count + n);
+                }
+            }
+        }
+    }
+    return DirectSubmit::Done;
+}
+
+// The compiler thread's CC / bend collapse on a staged batch: a collapsible
+// controller (or a pitch bend) replaces the still-pending one of the same
+// channel. Compacts in place and returns the new count.
+uint32_t Driver::CollapseDirectStage(uint32_t count, bool collapseCc,
+                                     bool collapseBend) noexcept {
+    if (++directStageGen_ == 0u) {
+        std::memset(directCc_, 0, sizeof(directCc_));
+        std::memset(directBend_, 0, sizeof(directBend_));
+        directStageGen_ = 1u;
+    }
+    ScheduledRenderEvent* events = directStage_.data();
+    uint32_t w = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const ScheduledRenderEvent e = events[i];
+        if (collapseCc) {
+            if (e.type == RenderEventType::ControlChange) {
+                if (IsCollapsibleController(e.data1)) {
+                    DirectCollapseRecord& r = directCc_[e.channel][e.data1];
+                    if (r.gen == directStageGen_ && r.offset < w) {
+                        events[r.offset] = e;
+                        ++ccCollapsedCount_;
+                        continue;
+                    }
+                    r = {directStageGen_, w};
+                } else if (IsControllerStateReset(e.data1)) {
+                    std::memset(directCc_[e.channel], 0, sizeof(directCc_[e.channel]));
+                }
+            } else if (e.type == RenderEventType::Reset) {
+                std::memset(directCc_, 0, sizeof(directCc_));
+            }
+        }
+        if (collapseBend) {
+            if (e.type == RenderEventType::PitchBend && e.channel < kChannelCount) {
+                DirectCollapseRecord& r = directBend_[e.channel];
+                if (r.gen == directStageGen_ && r.offset < w) {
+                    events[r.offset] = e;
+                    ++ccCollapsedCount_;
+                    continue;
+                }
+                r = {directStageGen_, w};
+            } else if (e.type == RenderEventType::Reset) {
+                std::memset(directBend_, 0, sizeof(directBend_));
+            }
+        }
+        events[w++] = e;
+    }
+    return w;
+}
+
+// Producer: sort, merge and publish a full page through the ready queue.
+void Driver::PublishDirectPage(uint32_t pageIndex, uint32_t count) noexcept {
+    CompiledEventPage& page = compiledPages_.Page(pageIndex);
+    SortCompiledEventPage(page.events, directScratch_.data(), count);
+    if (noteMergeEnabled_.load(std::memory_order_relaxed)) {
+        uint64_t folded = 0u;
+        count = directMerger_->Merge(
+            page.events, count,
+            noteMergeHoist_.load(std::memory_order_relaxed), folded);
+        if (folded != 0u)
+            noteMergedAtomic_.fetch_add(folded, std::memory_order_relaxed);
+    }
+    // The ready queue holds as many pages as the pool owns, so this cannot
+    // fail; if it somehow does, the page goes back rather than blocking.
+    if (!PublishCompilerPage(pageIndex, count)) ReturnCompilerPage(pageIndex);
+}
+
+// Audio thread, once per callback right before the scheduler imports pages:
+// take the open page if it holds events, order it, and hand it straight to the
+// scheduler. Never waits for the producer. Returns pages imported (0 or 1).
+uint32_t Driver::FlushDirectPage() noexcept {
+    if (!directReady_.load(std::memory_order_acquire)) return 0u;
+    uint64_t state = directState_.load(std::memory_order_acquire);
+    for (;;) {
+        if (static_cast<uint32_t>(state) == 0u) return 0u; // none open, or empty
+        if (directState_.compare_exchange_weak(state, 0u,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+    }
+    const uint32_t pageIndex = static_cast<uint32_t>(state >> 32) - 1u;
+    uint32_t count = static_cast<uint32_t>(state);
+    CompiledEventPage& page = compiledPages_.Page(pageIndex);
+    SortCompiledEventPage(page.events, audioScratch_.data(), count);
+    if (noteMergeEnabled_.load(std::memory_order_relaxed)) {
+        uint64_t folded = 0u;
+        count = audioMerger_->Merge(
+            page.events, count,
+            noteMergeHoist_.load(std::memory_order_relaxed), folded);
+        if (folded != 0u)
+            noteMergedAtomic_.fetch_add(folded, std::memory_order_relaxed);
+    }
+    return pagedScheduler_.ImportPage(pageIndex, count) ? 1u : 0u;
+}
+
 void Driver::EventCompilerLoop() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     // Small enough to stay cache-friendly, large enough that one 2048-frame
@@ -1048,11 +1295,11 @@ void Driver::EventCompilerLoop() {
         }
 
         uint32_t pageIndex = kInvalidEventPage;
-        while (!compiledPages_.AcquireForCompiler(pageIndex)) {
+        while (!AcquireCompilerPage(pageIndex)) {
             if (cancelProducers_.load(std::memory_order_acquire)) return;
             const uint32_t observed =
                 compilerWakeEpoch_.load(std::memory_order_acquire);
-            if (compiledPages_.AcquireForCompiler(pageIndex)) break;
+            if (AcquireCompilerPage(pageIndex)) break;
             WaitForAddressChange(compilerWakeEpoch_, observed);
         }
         CompiledEventPage& page = compiledPages_.Page(pageIndex);
@@ -1170,10 +1417,9 @@ void Driver::EventCompilerLoop() {
                                                 std::memory_order_relaxed);
                 }
             }
-            while (!compiledPages_.PublishFromCompiler(pageIndex,
-                                                        compiledCount)) {
+            while (!PublishCompilerPage(pageIndex, compiledCount)) {
                 if (cancelProducers_.load(std::memory_order_acquire)) {
-                    compiledPages_.ReturnUnusedFromCompiler(pageIndex);
+                    ReturnCompilerPage(pageIndex);
                     return;
                 }
                 const uint32_t observed =
@@ -1181,7 +1427,7 @@ void Driver::EventCompilerLoop() {
                 WaitForAddressChange(compilerWakeEpoch_, observed);
             }
         } else {
-            compiledPages_.ReturnUnusedFromCompiler(pageIndex);
+            ReturnCompilerPage(pageIndex);
         }
         // The page is no longer patchable — collapse records pointing into
         // it must never match a later page fill (indexes recycle).

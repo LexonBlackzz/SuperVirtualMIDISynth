@@ -64,6 +64,65 @@ BOOL WINAPI PlaySoundW(LPCWSTR pszSound, HMODULE hmod, DWORD fdwSound) {
     return proc ? proc(pszSound, hmod, fdwSound) : FALSE;
 }
 
+// Pure forwarders to the system winmm for APIs hosts import from winmm.dll
+// but SVMS does not implement (FL Studio refuses to start without them).
+#define SVMS_FWD(ret, name, params, args, fail)                                      ret WINAPI name params {                                                             using Proc = ret (WINAPI*) params;                                               Proc proc = reinterpret_cast<Proc>(GetSystemWinmmProc(#name));                   return proc ? proc args : (fail);                                            }
+
+SVMS_FWD(MMRESULT, midiInGetErrorTextW, (MMRESULT e, LPWSTR t, UINT c), (e, t, c), MMSYSERR_NODRIVER)
+SVMS_FWD(BOOL, sndPlaySoundA, (LPCSTR s, UINT f), (s, f), FALSE)
+SVMS_FWD(UINT, joyGetNumDevs, (void), (), 0u)
+SVMS_FWD(MMRESULT, joyGetDevCapsA, (UINT_PTR id, LPJOYCAPSA c, UINT n), (id, c, n), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, joyGetPosEx, (UINT id, LPJOYINFOEX i), (id, i), MMSYSERR_NODRIVER)
+SVMS_FWD(HMMIO, mmioOpenA, (LPSTR n, LPMMIOINFO i, DWORD f), (n, i, f), nullptr)
+SVMS_FWD(MMRESULT, mmioClose, (HMMIO h, UINT f), (h, f), MMSYSERR_NODRIVER)
+SVMS_FWD(LONG, mmioRead, (HMMIO h, HPSTR b, LONG n), (h, b, n), -1)
+SVMS_FWD(LONG, mmioSeek, (HMMIO h, LONG o, int w), (h, o, w), -1)
+SVMS_FWD(MMRESULT, mmioDescend, (HMMIO h, LPMMCKINFO c, const MMCKINFO* p, UINT f), (h, c, p, f), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, mmioAscend, (HMMIO h, LPMMCKINFO c, UINT f), (h, c, f), MMSYSERR_NODRIVER)
+SVMS_FWD(FOURCC, mmioStringToFOURCCA, (LPCSTR s, UINT f), (s, f), 0)
+SVMS_FWD(MMRESULT, waveInGetErrorTextA, (MMRESULT e, LPSTR t, UINT c), (e, t, c), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, waveInGetErrorTextW, (MMRESULT e, LPWSTR t, UINT c), (e, t, c), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, waveInGetID, (HWAVEIN h, LPUINT id), (h, id), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, midiInGetErrorTextA, (MMRESULT e, LPSTR t, UINT c), (e, t, c), MMSYSERR_NODRIVER)
+SVMS_FWD(BOOL, sndPlaySoundW, (LPCWSTR s, UINT f), (s, f), FALSE)
+SVMS_FWD(MMRESULT, timeGetSystemTime, (LPMMTIME t, UINT n), (t, n), MMSYSERR_NODRIVER)
+SVMS_FWD(UINT, mmsystemGetVersion, (void), (), 0u)
+SVMS_FWD(HMMIO, mmioOpenW, (LPWSTR n, LPMMIOINFO i, DWORD f), (n, i, f), nullptr)
+SVMS_FWD(LONG, mmioWrite, (HMMIO h, const char* b, LONG n), (h, b, n), -1)
+SVMS_FWD(MMRESULT, mmioAdvance, (HMMIO h, LPMMIOINFO i, UINT f), (h, i, f), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, mmioFlush, (HMMIO h, UINT f), (h, f), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, mmioGetInfo, (HMMIO h, LPMMIOINFO i, UINT f), (h, i, f), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, mmioSetInfo, (HMMIO h, LPCMMIOINFO i, UINT f), (h, i, f), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, mmioSetBuffer, (HMMIO h, LPSTR b, LONG n, UINT f), (h, b, n, f), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, mmioCreateChunk, (HMMIO h, LPMMCKINFO c, UINT f), (h, c, f), MMSYSERR_NODRIVER)
+SVMS_FWD(FOURCC, mmioStringToFOURCCW, (LPCWSTR s, UINT f), (s, f), 0)
+SVMS_FWD(MMRESULT, mmioRenameA, (LPCSTR a, LPCSTR b, LPCMMIOINFO i, DWORD f), (a, b, i, f), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, mmioRenameW, (LPCWSTR a, LPCWSTR b, LPCMMIOINFO i, DWORD f), (a, b, i, f), MMSYSERR_NODRIVER)
+SVMS_FWD(LRESULT, mmioSendMessage, (HMMIO h, UINT m, LPARAM a, LPARAM b), (h, m, a, b), 0)
+SVMS_FWD(LPMMIOPROC, mmioInstallIOProcA, (FOURCC c, LPMMIOPROC p, DWORD f), (c, p, f), nullptr)
+SVMS_FWD(LPMMIOPROC, mmioInstallIOProcW, (FOURCC c, LPMMIOPROC p, DWORD f), (c, p, f), nullptr)
+SVMS_FWD(UINT, auxGetNumDevs, (void), (), 0u)
+SVMS_FWD(MMRESULT, auxGetDevCapsA, (UINT_PTR id, LPAUXCAPSA c, UINT n), (id, c, n), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, auxGetDevCapsW, (UINT_PTR id, LPAUXCAPSW c, UINT n), (id, c, n), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, auxGetVolume, (UINT id, LPDWORD v), (id, v), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, auxSetVolume, (UINT id, DWORD v), (id, v), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, auxOutMessage, (UINT id, UINT m, DWORD_PTR a, DWORD_PTR b), (id, m, a, b), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, joyGetPos, (UINT id, LPJOYINFO i), (id, i), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, joyGetDevCapsW, (UINT_PTR id, LPJOYCAPSW c, UINT n), (id, c, n), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, joyGetThreshold, (UINT id, LPUINT t), (id, t), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, joySetThreshold, (UINT id, UINT t), (id, t), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, joyReleaseCapture, (UINT id), (id), MMSYSERR_NODRIVER)
+SVMS_FWD(MMRESULT, joySetCapture, (HWND w, UINT id, UINT p, BOOL c), (w, id, p, c), MMSYSERR_NODRIVER)
+SVMS_FWD(MCIERROR, mciSendCommandA, (MCIDEVICEID d, UINT m, DWORD_PTR f, DWORD_PTR p), (d, m, f, p), MCIERR_DEVICE_NOT_INSTALLED)
+SVMS_FWD(MCIERROR, mciSendCommandW, (MCIDEVICEID d, UINT m, DWORD_PTR f, DWORD_PTR p), (d, m, f, p), MCIERR_DEVICE_NOT_INSTALLED)
+SVMS_FWD(MCIERROR, mciSendStringA, (LPCSTR c, LPSTR r, UINT n, HWND w), (c, r, n, w), MCIERR_DEVICE_NOT_INSTALLED)
+SVMS_FWD(MCIERROR, mciSendStringW, (LPCWSTR c, LPWSTR r, UINT n, HWND w), (c, r, n, w), MCIERR_DEVICE_NOT_INSTALLED)
+SVMS_FWD(BOOL, mciGetErrorStringA, (MCIERROR e, LPSTR t, UINT c), (e, t, c), FALSE)
+SVMS_FWD(BOOL, mciGetErrorStringW, (MCIERROR e, LPWSTR t, UINT c), (e, t, c), FALSE)
+SVMS_FWD(MCIDEVICEID, mciGetDeviceIDA, (LPCSTR n), (n), 0)
+SVMS_FWD(MCIDEVICEID, mciGetDeviceIDW, (LPCWSTR n), (n), 0)
+#undef SVMS_FWD
+
 UINT WINAPI midiOutGetNumDevs(void) {
     XPBootstrapTrace("[SVMS XP] midiOutGetNumDevs reached\r\n");
     LOG("midiOutGetNumDevs -> 1");

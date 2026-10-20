@@ -356,6 +356,7 @@ bool Driver::Initialize() {
                                         uint32_t blockCapacity) -> bool {
         if (!midiIngress_.ConfigureCapacity(ringCapacity)) return false;
         if (!compiledPages_.ConfigureCapacity(ringCapacity)) return false;
+        directState_.store(0u, std::memory_order_relaxed);
         if (!pagedScheduler_.Configure(&compiledPages_, ringCapacity))
             return false;
         try {
@@ -799,6 +800,7 @@ void Driver::Shutdown() {
     midiIngress_.DrainAvailable();
     fastOwnerThreadId_.store(0u, std::memory_order_relaxed);
     pagedScheduler_.Reset();
+    directState_.store(0u, std::memory_order_relaxed);
     eventScheduler_.Reset();
     scheduledSizePublished_.store(0, std::memory_order_release);
     if (eventBuffer) {

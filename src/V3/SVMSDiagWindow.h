@@ -8,6 +8,9 @@ namespace svms {
 void DiagWindow_Create(bool showWindow, bool debugOutput);
 void DiagWindow_Destroy();
 void DiagWindow_SetBackendLabel(const wchar_t* label);
+// Event-timing counters (late/clamped/obsolete/skipped output), shown by the monitor.
+void DiagWindow_SetTiming(uint64_t late, uint64_t clamped, uint64_t maxLateFrames,
+                          uint64_t staleSkipped, uint64_t skippedFrames);
 void DiagWindow_UpdateStartup(bool audioRunning, int32_t audioError,
                               bool soundFontLoaded, uint32_t sampleRate,
                               uint32_t bufferFrames, float masterVolume,

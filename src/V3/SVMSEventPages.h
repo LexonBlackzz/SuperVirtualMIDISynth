@@ -390,6 +390,26 @@ public:
         return true;
     }
 
+    // Audio thread: schedule a page the audio thread itself holds (sorted, its
+    // `count` events), without going through the ready queue. A page that does
+    // not fit is recycled, as ImportReadyPage does.
+    bool ImportPage(uint32_t pageIndex, uint32_t count) noexcept {
+        if (!pool_ || count == 0u || freeTop_ == 0u ||
+            size_ + count > capacity_) {
+            if (pool_) pool_->RecycleFromAudio(pageIndex);
+            return false;
+        }
+        pool_->Page(pageIndex).count = count;
+        const uint32_t slot = freeSlots_[--freeTop_];
+        cursors_[slot] = {pageIndex, 0u, count, true};
+        size_ += count;
+        highWater_ = (std::max)(highWater_, size_);
+        ++activePages_;
+        UpdateLeaf(slot);
+        PrefetchPageHead(pageIndex);
+        return true;
+    }
+
     uint32_t ImportAllReady() noexcept {
         uint32_t imported = 0u;
         while (ImportReadyPage()) ++imported;

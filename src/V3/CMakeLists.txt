@@ -634,6 +634,59 @@ endif()
 set(EXPORTS
         PlaySoundA
         PlaySoundW
+        midiInGetErrorTextW
+        sndPlaySoundA
+        joyGetNumDevs
+        joyGetDevCapsA
+        joyGetPosEx
+        mmioOpenA
+        mmioClose
+        mmioRead
+        mmioSeek
+        mmioDescend
+        mmioAscend
+        mmioStringToFOURCCA
+        waveInGetErrorTextA
+        waveInGetErrorTextW
+        waveInGetID
+        midiInGetErrorTextA
+        sndPlaySoundW
+        timeGetSystemTime
+        mmsystemGetVersion
+        mmioOpenW
+        mmioWrite
+        mmioAdvance
+        mmioFlush
+        mmioGetInfo
+        mmioSetInfo
+        mmioSetBuffer
+        mmioCreateChunk
+        mmioStringToFOURCCW
+        mmioRenameA
+        mmioRenameW
+        mmioSendMessage
+        mmioInstallIOProcA
+        mmioInstallIOProcW
+        auxGetNumDevs
+        auxGetDevCapsA
+        auxGetDevCapsW
+        auxGetVolume
+        auxSetVolume
+        auxOutMessage
+        joyGetPos
+        joyGetDevCapsW
+        joyGetThreshold
+        joySetThreshold
+        joyReleaseCapture
+        joySetCapture
+        mciSendCommandA
+        mciSendCommandW
+        mciSendStringA
+        mciSendStringW
+        mciGetErrorStringA
+        mciGetErrorStringW
+        mciGetDeviceIDA
+        mciGetDeviceIDW
         BASS_Init
         BASS_Free
         BASS_SetConfig
@@ -1379,6 +1432,16 @@ if(SVMS_BUILD_TESTS)
                  COMMAND svms_v3_midi_song --quiet)
         set_tests_properties(svms_v3_midi_song PROPERTIES
             SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+        add_executable(svms_v3_direct_ingest_test tests/SVMSDirectIngestTest.cpp)
+        target_compile_definitions(svms_v3_direct_ingest_test PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+        target_include_directories(svms_v3_direct_ingest_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME svms_v3_direct_ingest COMMAND svms_v3_direct_ingest_test)
+        # Needs a live audio device (set SVMS_TEST_CONFIG_PATH to a master_volume 0 config); not a ctest.
+        add_executable(svms_v3_direct_e2e tests/SVMSDirectE2E.cpp)
+        target_compile_definitions(svms_v3_direct_e2e PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
 
         add_executable(svms_v3_event_bench tests/SVMSEventPipelineBench.cpp)
         target_compile_definitions(svms_v3_event_bench PRIVATE

@@ -263,7 +263,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             self->voiceManager->SetStealPolicy(pendingPolicy);
     }
 const uint32_t importedPages = self->useEventCompiler_
-        ? self->pagedScheduler_.ImportAllReady()
+        ? self->FlushDirectPage() + self->pagedScheduler_.ImportAllReady()
         : 0u;
     if (self->useEventCompiler_) {
         self->telemetry_.scheduledHighWater = (std::max)(
@@ -1071,6 +1071,11 @@ const uint32_t importedPages = self->useEventCompiler_
                     const uint32_t voice = vm->activeList_[position];
                     sustainHeldVoices += vm->v.heldBySustain[voice] != 0;
                 }
+                DiagWindow_SetTiming(self->telemetry_.late,
+                                     self->telemetry_.lateClamped,
+                                     self->telemetry_.lateClampMaxLateness,
+                                     self->telemetry_.staleNoteOnsSkipped,
+                                     self->telemetry_.skippedOutputFrames);
                 DiagWindow_Update(vm->activeCount_ + self->ShardsActiveVoices(),
                                   vm->GetMaxVoices() + self->ShardsMaxVoices(),
                                   releasingVoices, sustainHeldVoices,

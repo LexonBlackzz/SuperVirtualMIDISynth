@@ -340,6 +340,20 @@ int main(int argc, char** argv) {
     timed[1].timestamp = monotonicNs;
     timed[1].timestamp_domain = SVMS_TIMESTAMP_MONOTONIC_NS;
     timed[1].packed_message = 0x00003c80u;
+    // The direct page feed is optional: when advertised it must either take the
+    // batch or decline it (UNSUPPORTED) having consumed nothing, never reject it.
+    if ((api.capabilities & SVMS_CAP_DIRECT_PAGES) != 0u) {
+        const SVMS_Result direct =
+            api.send_short_batch_direct
+                ? api.send_short_batch_direct(session, events, 2u)
+                : SVMS_RESULT_INVALID_ARGUMENT;
+        if (direct != SVMS_RESULT_OK && direct != SVMS_RESULT_UNSUPPORTED) {
+            std::puts("FAIL: send_short_batch_direct neither accepted nor declined");
+            api.destroy_session(session);
+            FreeLibrary(runtime);
+            return 1;
+        }
+    }
     if (api.send_short_batch(session, events, 2u) != SVMS_RESULT_OK ||
         api.send_timed_short_batch(session, timed, 2u) != SVMS_RESULT_OK ||
         api.send_system_exclusive(session, gmReset, sizeof(gmReset)) !=

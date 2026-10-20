@@ -54,6 +54,7 @@ struct DiagStats {
 static DiagStats g_stats[2] = {};
 static std::atomic<uint32_t> g_publishedStats{0};
 static std::atomic<uint32_t> g_statsReader{UINT32_MAX};
+static std::atomic<uint64_t> g_timing[5];
 
 static HWND g_hwnd = nullptr;
 static HFONT g_font = nullptr;
@@ -76,7 +77,7 @@ static HMODULE GetCurrentModule() {
 
 static const wchar_t* kWindowClass = L"SVMS V3 Diag";
 static const int kWindowWidth = 540;
-static const int kWindowHeight = 560;
+static const int kWindowHeight = 610;
 static const int kTimerId = 1;
 // Diagnostic-only refresh. Windows timers are scheduler-limited, but 1 ms
 // gives the monitor the fastest practical readout without touching audio.
@@ -250,6 +251,19 @@ static void OnPaint(HWND hwnd) {
 
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%u (%u immediate)", s.retired, s.retiredImmediate);
     DrawStat(memDC, kPadX, y, L"Retired:          ", buf);
+    y += kLineH;
+
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"late %llu clamped %llu (max %llu fr)",
+                  (unsigned long long)g_timing[0].load(std::memory_order_relaxed),
+                  (unsigned long long)g_timing[1].load(std::memory_order_relaxed),
+                  (unsigned long long)g_timing[2].load(std::memory_order_relaxed));
+    DrawStat(memDC, kPadX, y, L"Event lateness:   ", buf);
+    y += kLineH;
+
+    std::swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%llu note-ons / %llu frames",
+                  (unsigned long long)g_timing[3].load(std::memory_order_relaxed),
+                  (unsigned long long)g_timing[4].load(std::memory_order_relaxed));
+    DrawStat(memDC, kPadX, y, L"Skipped:          ", buf);
     y += kLineH;
 
     // Shown only when it happens: a refused plan skips a stretch of audio.
@@ -502,6 +516,15 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     stats.scheduledEvents = scheduledEvents;
     stats.sf2 = sf2;
     g_publishedStats.store(target, std::memory_order_release);
+}
+
+void DiagWindow_SetTiming(uint64_t late, uint64_t clamped, uint64_t maxLateFrames,
+                          uint64_t staleSkipped, uint64_t skippedFrames) {
+    g_timing[0].store(late, std::memory_order_relaxed);
+    g_timing[1].store(clamped, std::memory_order_relaxed);
+    g_timing[2].store(maxLateFrames, std::memory_order_relaxed);
+    g_timing[3].store(staleSkipped, std::memory_order_relaxed);
+    g_timing[4].store(skippedFrames, std::memory_order_relaxed);
 }
 
 void DiagWindow_SetBackendLabel(const wchar_t* label) {

@@ -149,6 +149,29 @@ static SVMS_Result SVMS_CALL NativeSendShortBatch(
         ? SVMS_RESULT_OK : SVMS_RESULT_CANCELLED;
 }
 
+static SVMS_Result SVMS_CALL NativeSendShortBatchDirect(
+    SVMS_Session session, const SVMS_ShortEvent* events,
+    uint32_t eventCount) {
+    std::atomic<uint64_t>* cancellation =
+        NativeSessionCancellation(session);
+    if (!cancellation) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!events && eventCount != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        if (events[i].reserved != 0u) return SVMS_RESULT_INVALID_ARGUMENT;
+    }
+    LARGE_INTEGER immediate{};
+    if (eventCount != 0u && !QueryPerformanceCounter(&immediate))
+        return SVMS_RESULT_INTERNAL_ERROR;
+    switch (g_driver->SubmitShortBatchDirect(
+        events, eventCount, static_cast<uint64_t>(immediate.QuadPart),
+        cancellation, session)) {
+    case svms::Driver::DirectSubmit::Done: return SVMS_RESULT_OK;
+    case svms::Driver::DirectSubmit::Cancelled: return SVMS_RESULT_CANCELLED;
+    default: return SVMS_RESULT_UNSUPPORTED;
+    }
+}
+
 static SVMS_Result SVMS_CALL NativeSendSystemExclusive(
     SVMS_Session session, const uint8_t* data, uint32_t size) {
     std::atomic<uint64_t>* cancellation =
@@ -551,7 +574,8 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_MIXED_TIMESTAMP_BATCH |
         SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON |
         SVMS_CAP_CANCELLABLE_SUBMISSION | SVMS_CAP_TELEMETRY_V2 |
-        SVMS_CAP_CALLBACK_TRACE | SVMS_CAP_MIDI_STREAM;
+        SVMS_CAP_CALLBACK_TRACE | SVMS_CAP_MIDI_STREAM |
+        SVMS_CAP_DIRECT_PAGES;
 #if !defined(SVMS_XP_COMPAT)
     table.capabilities |= SVMS_CAP_RUNTIME_COMMANDS;
 #endif
@@ -587,6 +611,7 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.enable_callback_trace = NativeEnableCallbackTrace;
     table.read_callback_trace = NativeReadCallbackTrace;
     table.send_midi_stream = NativeSendMidiStream;
+    table.send_short_batch_direct = NativeSendShortBatchDirect;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

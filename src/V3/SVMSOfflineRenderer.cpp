@@ -28,6 +28,8 @@
 #include <cwchar>
 #include <cstring>
 #include <memory>
+#include <queue>
+#include <cstdlib>
 #include <string>
 #include <stdexcept>
 #include <thread>
@@ -1116,12 +1118,49 @@ int RendererMain(int argc, wchar_t** argv) {
     PackedMidiEvent event{};
     if (batched) {
         std::vector<RealtimeEvent> block;
+        const uint32_t jitterFrames = [] {
+            const char* v = std::getenv("SVMS_OFFLINE_JITTER_FRAMES");
+            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+        }();
+        struct JitterEvent {
+            uint64_t frame, seq; uint32_t message;
+            bool operator<(const JitterEvent& o) const {
+                return frame != o.frame ? frame > o.frame : seq > o.seq;
+            }
+        };
+        std::priority_queue<JitterEvent> jitterHeap;
+        uint64_t jitterState = 88172645463325252ull;
         while (ioOk && !pollCancel()) {
             uint32_t n = o.blockFrames;
             const uint64_t limit = frame + n;
             block.clear();
             bool exhausted = false;
-            for (;;) {
+            if (jitterFrames != 0u) {
+                // Diagnostic: delay every event by 0..jitterFrames frames, as a
+                // realtime sender's arrival jitter would, then emit in order.
+                for (;;) {
+                    PackedMidiEvent next{};
+                    while (!ring.Peek(next) &&
+                           !done.load(std::memory_order_acquire) && !pollCancel())
+                        std::this_thread::yield();
+                    if (pollCancel() || !ring.Peek(next) ||
+                        next.outputFrame >= limit + jitterFrames) break;
+                    ring.Pop(event);
+                    countSourceEvent(event);
+                    ++events;
+                    jitterState ^= jitterState << 13u; jitterState ^= jitterState >> 7u;
+                    jitterState ^= jitterState << 17u;
+                    jitterHeap.push({event.outputFrame + jitterState % (jitterFrames + 1u),
+                                     event.sequence, event.message});
+                }
+                if (pollCancel()) break;
+                while (!jitterHeap.empty() && jitterHeap.top().frame < limit) {
+                    const auto top = jitterHeap.top(); jitterHeap.pop();
+                    block.push_back({top.frame, top.seq, top.message, false});
+                }
+                exhausted = jitterHeap.empty() && !ring.Peek(event) &&
+                            done.load(std::memory_order_acquire);
+            } else for (;;) {
                 PackedMidiEvent next{};
                 while (!ring.Peek(next) &&
                        !done.load(std::memory_order_acquire) && !pollCancel())

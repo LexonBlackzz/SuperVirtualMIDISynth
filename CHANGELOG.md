@@ -1,5 +1,108 @@
 # Changelog
 
+## 0.11.0 (2026-10-17) — 131 commits since v3-0.10 (2026-09-09)
+
+A new Configurator, a single renderer, and a lot of Black MIDI performance work.
+
+### Configurator, rewritten
+
+- **New look and shell.** Every page was rebuilt: Home, Performance, Sound,
+  Effects, Output, MIDI, Render to file, Record, Diagnostics and Settings.
+  Geist fonts are embedded, controls spring and ease (Motion: Full / Calm /
+  Off), and one settings table drives search, the restart marks (↻), the
+  save bar and the sidebar badges.
+- **Home**: a render-load gauge that changes colour by tier and catches fire
+  past 500 % (can be turned off), plus voice, MIDI and output tiles.
+- **Performance**: Accurate / Balanced / Extreme profile cards with Custom
+  detection, voice limit with a typed Custom field, shortcuts grouped as
+  Free / Costs a little sound / Costs accuracy or timing, an Engine internals
+  section, and a render-threads slider.
+- **Sound**: one SoundFont list (drop .sf2/.sfz on the window, drag to
+  reorder), a velocity curve with a live response graph, voice character with
+  a description per mode, tuning, and bank/preset routes.
+- **Settings**: UI size (75–175 %), themed colour picker, a welcome tour on
+  first launch, and the Rack look kept as an alternative theme.
+- **Render to file** now matches the live sound: reverb, velocity curve,
+  pan law, interpolation and render backend come from the shared config, and
+  the tab passes its unsaved settings to the renderer.
+- Controls a driver can't change live are named as such instead of retried.
+
+### Renderer / performance
+
+- **One renderer.** The dense planner and the span renderer are gone. The
+  whole-voice renderer is the only path and a plan can no longer refuse a
+  block. It now also covers vibrato, phase rotation, note merging and
+  decimation.
+- **Voice decimation** (opt-in): above 10k/25k/50k/150k active voices the
+  quietest voices stop mixing. It can rank by actual level instead of
+  velocity, and optionally cull tails that stay muted for 5 blocks.
+- **Eight-voices-per-vector filter**: the SF2 low-pass was about 75 % of a
+  live voice; the new kernel is bit-identical per voice.
+- **AVX2**: one-shot kernels (pianos, plucks) went from scalar fallback to
+  vectorized (prerender 10.6× → 21.3× realtime), exact kernel trims, an
+  opt-in fast chunk math mode, and exact phase rotation on the AVX2 chunk
+  kernels.
+- **Event pipeline**: opt-in single-producer ingest ring, batched ingress for
+  mixed events, bend collapse, lazy queue storage, and workers no longer share
+  hot counter cache lines.
+- **Plan loop** trims: O(1) release-op drop, slimmer ghost copies,
+  same-frame note batching, segment batching.
+- **Key-sharded engine** (opt-in, `synth.shards`): the voice pool and event
+  stream split across N independent cores. The voice limit is a total divided
+  across shards, and the cap scales to 524,288 × shards.
+
+### New options (all off unless noted)
+
+Exact note merge · note-on re-excite (keeps the rhythm of merged repeats) ·
+minimum note length · steal reject · bend collapse · fast chunk math ·
+decimation by level · cull muted tails · per-MIDI-channel limiter (16
+zero-latency buses).
+
+**Changed defaults:** the retire floor is now −55 dB and decimation (when on)
+ranks by level. A saved config keeps its own values. Both were chosen in
+listening tests.
+
+### Instruments and tuning
+
+- **SFZ instruments**, including `#include`, alongside SF2, with filtering for
+  both formats.
+- **256-key** and **31-EDO** support.
+- Retire floor now actually governs real SF2 release tails (it did nothing for
+  them before).
+
+### Linux
+
+- Linux **configurator** (SDL2 + OpenGL3) driving the driver over a new
+  **Control API v1** (self-describing NDJSON over a Unix socket).
+- The Linux realtime loop renders each block in one batched call, falls back
+  to `gm.sf2` when no SoundFont is configured, and the config module is
+  portable (XDG paths).
+
+### Integrations
+
+- **BASSMIDI shim** now serves Kiva: full BASS/BASSMIDI export surface, real
+  event-type table, partial-read decode streams, and offline sessions through
+  the production renderer (0.08× → 10× realtime on chopped-notes).
+- `midiOutGetID`/`midiInGetID` exported so Domino loads our winmm; a
+  nested-backend guard stops an SVMS plugin inside another host from looping.
+- Per-callback trace ring on the native API; Record and Render pages in the
+  configurator.
+
+### Fixes
+
+- Releasing-voice counter underflow when a voice released and retired in one
+  block; loop-wrap overflow into short spans; per-voice phase rotation made
+  exactly analytic; the 131072-event block cap only limits late events;
+  per-channel limiter clicks and a live-flush bug.
+- Configurator: velocity knobs overflowing at narrow widths, overlapping
+  render-time text, tile flicker at fractional scales, and the live voice
+  limit giving every shard the full count.
+
+### Build / tooling
+
+- The engine compiles once for winmm.dll and SVMSAPI.dll, with a precompiled
+  driver header and CI compiler caches. SVMSDriver.cpp was split by area.
+
 ## 0.10.0 (2026-09-09) — 127 commits since v3-0.8 (2026-08-27)
 
 0.9 skipped. Not 1.0 — the software isn't finished and never will be.

@@ -28,6 +28,7 @@
 #include <cstdarg>
 #include <algorithm>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -66,6 +67,7 @@ constexpr uint32_t kNoteOnCollapseDefaultThreshold = 32u;
 #include "SVMSAPI.h"
 #include "SVMSEventPages.h"
 #include "SVMSEventCompile.h"
+#include "SVMSDirectIngest.h"
 #include "SVMSSysEx.h"
 #include "SVMSMidiByteStream.h"
 #include "SVMSFrameClock.h"
@@ -570,6 +572,20 @@ public:
         uint64_t immediateQpc,
         const std::atomic<uint64_t>* externalCancellation,
         uint64_t cancellationToken);
+    // Direct page feed (SVMS_CAP_DIRECT_PAGES): compiles an ordered batch
+    // into a page on the caller's thread. Unsupported = nothing consumed, the
+    // caller uses SubmitShortBatchAtQpcCancellable instead.
+    enum class DirectSubmit { Done, Unsupported, Cancelled };
+    DirectSubmit SubmitShortBatchDirect(
+        const SVMS_ShortEvent* events, uint32_t eventCount,
+        uint64_t immediateQpc,
+        const std::atomic<uint64_t>* externalCancellation,
+        uint64_t cancellationToken);
+    void PublishDirectPage(uint32_t pageIndex, uint32_t count) noexcept;
+    uint32_t FlushDirectPage() noexcept;  // audio thread, before importing pages
+    bool AcquireCompilerPage(uint32_t& pageIndex) noexcept;
+    bool PublishCompilerPage(uint32_t pageIndex, uint32_t count) noexcept;
+    void ReturnCompilerPage(uint32_t pageIndex) noexcept;
     bool SubmitShortMsgAtFrameCancellable(
         uint32_t msg, uint64_t outputFrame,
         const std::atomic<uint64_t>* externalCancellation,
@@ -691,6 +707,28 @@ private:
 
     PriorityEventIngress<TimestampedMidiEvent> midiIngress_;
     CompiledEventPagePool compiledPages_;
+    // The pool's compiler side (free list, ready queue producer end) belongs to
+    // one thread at a time: the compiler thread, or a direct-feed caller. Held
+    // only around acquire / publish / return, never while filling a page.
+    std::atomic_flag compiledPoolLock_ = ATOMIC_FLAG_INIT;
+    // Direct feed. One producer at a time compiles into directStage_ and appends
+    // to the open page, whose state is (page index + 1) << 32 | published count
+    // (0 = none open); the audio thread detaches it with a CAS. The producer
+    // and the audio thread each have their own sort scratch and merger.
+    std::atomic_flag directProducerLock_ = ATOMIC_FLAG_INIT;
+    std::atomic<uint64_t> directState_{0u};
+    std::atomic<bool> directReady_{false};
+    std::unique_ptr<NoteMerger> directMerger_;
+    std::unique_ptr<NoteMerger> audioMerger_;
+    std::vector<ScheduledRenderEvent> directStage_;
+    std::vector<ScheduledRenderEvent> directScratch_;
+    std::vector<ScheduledRenderEvent> audioScratch_;
+    struct DirectCollapseRecord { uint32_t gen = 0u; uint32_t offset = 0u; };
+    DirectCollapseRecord directCc_[kChannelCount][128]{};
+    DirectCollapseRecord directBend_[kChannelCount]{};
+    uint32_t directStageGen_ = 0u;
+    uint32_t CollapseDirectStage(uint32_t count, bool collapseCc,
+                                 bool collapseBend) noexcept;
     PagedEventScheduler pagedScheduler_;
     EventScheduler eventScheduler_;
     std::atomic<EventOverflowMode> overflowMode_;
