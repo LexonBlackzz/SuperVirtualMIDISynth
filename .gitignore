@@ -1,95 +1,34 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Local WIP: crash-dump tooling (not for distribution)
-tools/DumpStacks.cpp
-tools/Rva2Sym.cpp
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# debug information files
-*.dwo
-
+# Build output
 /build/
-
-/.vscode
-/w64devkit-x86
-/.qwen
-/.ghidra
-/.ghidra_home\AppData
-/.ghidra_11.4_PUBLIC
-*ghidra*
-config.ini
-
-# Local development artifacts and analysis tools
-/.backup/
-/kestrel-midi-main
-/experiments/
-*.wav
-*.bak
-*.zip
+*.obj
+*.o
+*.pch
+*.ilk
+*.pdb
+*.exe
+*.dll
 *.dll.*
-*.dllold
+*.lib
+*.a
+*.so
+*.out
+
+# Local config / state
+config.ini
+imgui.ini
 /AGENTS.md
-/.freebuff/
-/imgui.ini
-/analyze_pitch*.py
-/parse_sf2.py
-/bassmidi_unpacked_code.bin
-/build_dumper.bat
-/dump_unpacked.cpp
-/*.sf2
-/Krash Noets 6.7 million.mid
-/Paprika's Noise Challenge 2.mid
-/Paprika's Noise Challenge III - Return of the Death Swirls.mid
-/Hypernova.mid
-/ziggy_config.json
-/ziggy
+/.vscode
+/.claude
 *.local.md
-KDMAPI-Simulator-main/
-KDMAPI.md
-Kiva-master
-# scratch / one-off repair scripts and logs (not needed to build)
-/ab.log
-/build_mem.log
-/ctest_mem.log
-/polyr2.mid
-/X-Cool 3! 31edo F1.mid
-/apply_v3_filter.py
-/fix_phase_rotation_final.py
-/fix_v3_hilbert.py
-/repair_v3_filter*.py
+
+# Large media and soundfonts
+*.sf2
+*.wav
+*.mid
+*.zip
+*.bak
+*.log
+
+# Local reference trees and tooling
+*ghidra*
+/w64devkit-x86
