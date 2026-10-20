@@ -36,7 +36,7 @@ inline bool EnsureLockMemoryPrivilege() noexcept {
                               TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
             return false;
         TOKEN_PRIVILEGES privileges{};
-        if (!LookupPrivilegeValueW(nullptr, SE_LOCK_MEMORY_NAME,
+        if (!LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege",
                                    &privileges.Privileges[0].Luid)) {
             CloseHandle(token);
             return false;

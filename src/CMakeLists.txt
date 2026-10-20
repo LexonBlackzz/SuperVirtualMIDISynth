@@ -199,6 +199,7 @@ if(NOT WIN32)
     set(SVMS_PORTABLE_RENDER_SOURCES
         synth/Config.cpp
         synth/SoundFont.cpp
+        synth/SfzLoader.cpp
         render/RenderKernels.cpp
         render/RenderWorkersPosix.cpp
         render/RenderDispatch.cpp
@@ -446,6 +447,7 @@ set(SVMS_DRIVER_SOURCES
 set(SOURCES
     synth/Config.cpp
     synth/SoundFont.cpp
+    synth/SfzLoader.cpp
     ${SVMS_DRIVER_SOURCES}
     driver/DiagWindow.cpp
     render/RenderKernels.cpp
@@ -939,6 +941,7 @@ if(NOT SVMS_XP_COMPAT)
         synth/Config.cpp
         events/MidiStream.cpp
         synth/SoundFont.cpp
+        synth/SfzLoader.cpp
         render/RenderKernels.cpp
         render/RenderWorkers.cpp
         render/RenderDispatch.cpp
@@ -965,6 +968,7 @@ if(NOT SVMS_XP_COMPAT)
         tests/RealtimeBlockTests.cpp
         synth/Config.cpp
         synth/SoundFont.cpp
+        synth/SfzLoader.cpp
         render/RenderKernels.cpp
         render/RenderWorkers.cpp
         render/RenderDispatch.cpp
@@ -1176,6 +1180,7 @@ if(SVMS_BUILD_TESTS)
         tests/V3Tests.cpp
         synth/Config.cpp
         synth/SoundFont.cpp
+        synth/SfzLoader.cpp
         render/RenderKernels.cpp
         render/RenderWorkers.cpp
         render/RenderDispatch.cpp
@@ -1272,6 +1277,7 @@ if(SVMS_BUILD_TESTS)
             synth/Config.cpp
             events/MidiStream.cpp
             synth/SoundFont.cpp
+            synth/SfzLoader.cpp
             render/RenderKernels.cpp
             render/RenderWorkers.cpp
             render/RenderDispatch.cpp
@@ -1396,7 +1402,7 @@ if(SVMS_BUILD_TESTS)
         set_tests_properties(svms_v3_two_process_smoke PROPERTIES
             SKIP_RETURN_CODE 77)
 
-        add_executable(svms_v3_bench tests/V3Bench.cpp synth/SoundFont.cpp render/RenderKernels.cpp render/RenderWorkers.cpp
+        add_executable(svms_v3_bench tests/V3Bench.cpp synth/SoundFont.cpp synth/SfzLoader.cpp render/RenderKernels.cpp render/RenderWorkers.cpp
             render/RenderDispatch.cpp render/RenderKernelsSSE2.cpp render/RenderKernelsAVX2.cpp)
         target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
             SVMS_ENABLE_REFERENCE_RENDERER=1)
@@ -1413,6 +1419,7 @@ if(SVMS_BUILD_TESTS)
             synth/Config.cpp
             events/MidiStream.cpp
             synth/SoundFont.cpp
+            synth/SfzLoader.cpp
             render/RenderKernels.cpp
             render/RenderWorkers.cpp
             render/RenderDispatch.cpp

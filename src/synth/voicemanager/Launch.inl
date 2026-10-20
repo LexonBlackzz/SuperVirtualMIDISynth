@@ -1,0 +1,1196 @@
+// Part of VoiceManager.h; included from there inside namespace svms. Not standalone.
+
+inline bool VoiceManager::SetPhaseRotationMode(uint32_t mode) {
+    if (mode > 4u) mode = 0u;
+    if (mode == phaseRotationMode_) return true;
+    phaseRotationMode_ = mode;
+    if (mode == 0u) {
+        // Coherent: free the state entirely — every render path then takes
+        // its original bit-exact code path (v.rot == nullptr).
+        v.ReleaseRotation();
+        return true;
+    }
+    if (!v.ReserveRotation(maxVoices_)) {
+        phaseRotationMode_ = 0u;
+        return false;
+    }
+    // Seed every currently live voice so a mid-playback mode switch never
+    // produces unrotated (or zero-state) filter output.
+    for (uint32_t position = 0u; position < activeCount_; ++position)
+        SeedVoiceRotationForVoice(activeList_[position]);
+    return true;
+}
+
+inline void VoiceManager::SeedVoiceRotationForVoice(VoiceHandle handle) {
+    if (phaseRotationMode_ == 0u || v.rot == nullptr ||
+        handle >= maxVoices_) {
+        return;
+    }
+    const uint64_t seed = MakeVoiceRotationSeed(
+        v.channel[handle], v.note[handle], handle, v.birthFrame[handle],
+        ++rotationSeedCounter_);
+    SeedVoiceRotation(v.rot[handle], phaseRotationMode_, seed,
+                      static_cast<float>(sampleRate_));
+}
+
+inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, uint8_t velocity) {
+    if (voiceLimit_ == 0u || activeCount_ >= voiceLimit_ || freeTop_ == 0u)
+        return kInvalidVoice;
+    // Pending CC levels must land before any steal score or configure step
+    // can observe premultiplied gains (no-op when nothing is marked). This is
+    // the steal-only fold: renderGain rewrites stay with the vintage-exact
+    // batch-boundary folds.
+    FoldStaleChannelMixGainsForSteal();
+    uint32_t idx = freeStack_[--freeTop_];
+
+    InitializeVoice(static_cast<VoiceHandle>(idx), channel, note, velocity);
+    SeedVoiceRotationForVoice(static_cast<VoiceHandle>(idx));
+    LinkChannelKey(static_cast<VoiceHandle>(idx));
+    LinkChannelActive(static_cast<VoiceHandle>(idx));
+    LinkRenderClass(static_cast<VoiceHandle>(idx));
+
+    activeList_[activeCount_] = idx;
+    activePosition_[idx] = activeCount_;
+    activeCount_++;
+    if (stealHeapValid_)
+        PushStealCandidate(static_cast<VoiceHandle>(idx),
+                           activePosition_[idx]);
+
+    return static_cast<VoiceHandle>(idx);
+}
+
+inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t note,
+                                                        uint8_t velocity,
+                                                        bool* outStolen,
+                                                        bool deferCandidate,
+                                                        bool reserveCandidateInPlace,
+                                                        VoiceHandle preselectedVictim,
+                                                        uint32_t preselectedVictimPosition,
+                                                        VoiceHandle forcedVictim) {
+    // While a lowered cap is still draining its forced-release tails, do not
+    // admit replacement notes that would turn those tails back into primaries.
+    // The transition is bounded by the forced release (normally 50 ms).
+    if (voiceLimit_ == 0u || activeCount_ > voiceLimit_) {
+        if (outStolen) *outStolen = false;
+        return kInvalidVoice;
+    }
+    // Pending CC levels must land before victim selection so a launch after a
+    // same-batch CC scores victims exactly like the eager per-CC refresh did.
+    // Steal-only fold — see FoldStaleChannelMixGainsForSteal.
+    FoldStaleChannelMixGainsForSteal();
+
+    VoiceHandle vh = kInvalidVoice;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t freeLifecycleBegin = BeginLaunchStageForTest();
+#endif
+    // A forced victim (per-key voice cap) must take the steal path: the key
+    // is already at its cap, so a fresh slot would grow the pileup instead of
+    // replacing the oldest key member. Skip both free-slot admission and the
+    // AllocateVoice fallback while one is pending.
+    if (forcedVictim == kInvalidVoice) {
+        if (deferCandidate && freeTop_ != 0u && activeCount_ < voiceLimit_) {
+            const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
+            vh = static_cast<VoiceHandle>(idx);
+            PrefetchVoiceLines(vh);
+            InitializePreparedVoice(vh, channel, note, velocity);
+            SeedVoiceRotationForVoice(vh);
+            LinkChannelKey(vh);
+            LinkChannelActive(vh);
+            activeList_[activeCount_] = idx;
+            activePosition_[idx] = activeCount_++;
+            // A deferred voice is invisible to the steal index until its
+            // configuration transaction commits. Keep the existing heap valid.
+        } else {
+            vh = AllocateVoice(channel, note, velocity);
+        }
+    }
+    if (vh != kInvalidVoice) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::Lifecycle,
+                              freeLifecycleBegin);
+        if (launchTestContext_.active)
+            ++launchChurnStats_.freeSlotAllocations;
+#endif
+        stealCandidateDeferred_[vh] = deferCandidate ? 1u : 0u;
+        if (outStolen) *outStolen = false;
+        return vh;
+    }
+
+    // Physical pool or logical live cap is full — find the lowest-priority
+    // voice to steal. Replacement happens in-place, so the live cap cannot
+    // grow past its configured value.
+    uint32_t bestPos = preselectedVictimPosition;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t selectionBegin = BeginLaunchStageForTest();
+#endif
+    // A preselected victim (batched per-launch layer allocation) was produced
+    // by the caller's PopStealCandidates call — the exact reserve=false pop
+    // sequence this site would perform — with full ring/tree/heap repair, so
+    // only the redundant re-selection call is skipped here; the victim is
+    // identical and the post-selection logic below is untouched.
+    VoiceHandle bestHandle = kInvalidVoice;
+    if (forcedVictim != kInvalidVoice) {
+        // Per-key cap victim chosen by the caller (oldest chain member of a
+        // key already at its cap). Unlike a popped candidate it is still in
+        // the steal index, so it is dropped from the index below; ring
+        // entries are self-invalidating hints and need no repair.
+        bestHandle = forcedVictim;
+    } else if (FastSteal()) {
+        // FastCursor: consume the batch-provided victim when valid,
+        // otherwise take the next slot at the allocation cursor. No index
+        // search, no repair — downstream runs identically.
+        bestHandle = preselectedVictim;
+        if (bestHandle == kInvalidVoice ||
+            v.state[bestHandle] !=
+                static_cast<uint8_t>(VoiceState::Active))
+            bestHandle = ScanSteal() ? SelectScanVictim()
+                                     : SelectCursorVictim();
+    } else {
+        bestHandle = preselectedVictim != kInvalidVoice
+            ? preselectedVictim
+            : PopStealCandidate(bestPos,
+                                deferCandidate && reserveCandidateInPlace);
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
+                          selectionBegin);
+#endif
+    if (bestHandle == kInvalidVoice) return kInvalidVoice;
+    // The victim's SoA lines are cold; fetch them while the sibling-group
+    // retirement, tail capture, and index repair below still have work to
+    // run before the first field write.
+    PrefetchVoiceLines(bestHandle);
+    // Quality mode receives this from the pop; FastCursor derives it here
+    // (the batch path's positions are cursor positions either way).
+    bestPos = activePosition_[bestHandle];
+    const uint32_t bestIdx = bestHandle;
+    if (forcedVictim != kInvalidVoice) {
+        // The forced victim was never popped: remove it from the index here.
+        // A reserved-root flag travels with it — the slot is being consumed
+        // by this replacement, not handed to a pending layer.
+        stealCandidateReserved_[bestIdx] = 0u;
+        RemoveStealCandidate(bestHandle);
+    }
+
+    // Every SF2 region produced by one MIDI note-on shares playIndex. Stereo
+    // SoundFonts commonly use one left and one right region; stealing just one
+    // side collapses the note into the opposite ear. Retire the whole physical
+    // voice group atomically, leaving the selected slot for this replacement
+    // and pushing its siblings onto the normal free stack for following layers.
+    const uint32_t victimPlayIndex = v.playIndex[bestIdx];
+    const bool hasSiblings = victimPlayIndex != UINT32_MAX &&
+        (playGroupPrev_[bestIdx] >= 0 || playGroupNext_[bestIdx] >= 0);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    RecordVictimGroupForTest(bestHandle, LaunchVictimPath::General, false);
+#endif
+    if (hasSiblings) {
+        // A reserved volatile root was intentionally left in the index for a
+        // single deferred replacement. Group retirement changes its active
+        // position, so remove it now and insert the configured replacement at
+        // commit instead of invalidating and rebuilding the complete heap.
+        if (stealCandidateReserved_[bestIdx] != 0u) {
+            stealCandidateReserved_[bestIdx] = 0u;
+            RemoveStealCandidate(static_cast<VoiceHandle>(bestIdx));
+        }
+        int32_t linked = playGroupPrev_[bestIdx];
+        while (linked >= 0) {
+            const VoiceHandle sibling = static_cast<VoiceHandle>(linked);
+            linked = playGroupPrev_[sibling];
+            RetireStolenSibling(sibling, bestHandle);
+        }
+        linked = playGroupNext_[bestIdx];
+        while (linked >= 0) {
+            const VoiceHandle sibling = static_cast<VoiceHandle>(linked);
+            linked = playGroupNext_[sibling];
+            RetireStolenSibling(sibling, bestHandle);
+        }
+        bestPos = activePosition_[bestIdx];
+    }
+    CaptureStealTail(bestHandle);
+
+    // Retire the victim.
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t lifecycleBegin = BeginLaunchStageForTest();
+#endif
+    ++stealCount_;
+    if (v.state[bestIdx] == static_cast<uint8_t>(VoiceState::Releasing))
+        releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
+    UnlinkChannelKey(static_cast<VoiceHandle>(bestIdx));
+    UnlinkExclusiveClass(static_cast<VoiceHandle>(bestIdx));
+    UnlinkPlayGroup(static_cast<VoiceHandle>(bestIdx));
+    UnlinkChannelActive(static_cast<VoiceHandle>(bestIdx));
+    UnlinkRenderClass(static_cast<VoiceHandle>(bestIdx));
+    v.state[bestIdx] = static_cast<uint8_t>(VoiceState::Free);
+
+    // Reinitialize in-place
+    if (deferCandidate)
+        InitializePreparedVoice(static_cast<VoiceHandle>(bestIdx), channel,
+                                note, velocity);
+    else
+        InitializeVoice(static_cast<VoiceHandle>(bestIdx), channel, note, velocity);
+    stealCandidateDeferred_[bestIdx] = deferCandidate ? 1u : 0u;
+    // The outgoing victim needs an anti-click tail. The replacement is a
+    // legitimate new attack and must start at its SF2 envelope level; fading
+    // every replacement in smears dense streams once stealing becomes steady.
+    v.stealFadeInFramesRemaining[bestIdx] = 0;
+    v.stealFadeInFramesTotal[bestIdx] = 0;
+    LinkChannelKey(static_cast<VoiceHandle>(bestIdx));
+    LinkChannelActive(static_cast<VoiceHandle>(bestIdx));
+    if (!deferCandidate)
+        LinkRenderClass(static_cast<VoiceHandle>(bestIdx));
+    activeList_[bestPos] = bestIdx;  // reuse the victim's position
+    activePosition_[bestIdx] = bestPos;
+    if (!deferCandidate) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::Lifecycle,
+                              lifecycleBegin);
+        const uint64_t treeBegin = BeginLaunchStageForTest();
+#endif
+        PushStealCandidate(static_cast<VoiceHandle>(bestIdx), bestPos);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance,
+                              treeBegin);
+#endif
+    } else {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::Lifecycle,
+                              lifecycleBegin);
+#endif
+    }
+
+    if (outStolen) *outStolen = true;
+    return static_cast<VoiceHandle>(bestIdx);
+}
+
+inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
+    if (handle >= maxVoices_ || stealCandidateDeferred_[handle] == 0u) return;
+    stealCandidateDeferred_[handle] = 0u;
+    if (stealCandidateReserved_[handle] != 0u) {
+        const uint8_t reservation = stealCandidateReserved_[handle];
+        stealCandidateReserved_[handle] = 0u;
+        if (reservation == 2u) {
+            // The refresh path sifts the winner tree, which only exists
+            // under Quality with a valid index. A policy switch that
+            // invalidated the index between the launch transaction's
+            // reservation and this commit must fall through to the
+            // guarded removal/re-push below.
+            if (stealHeapValid_ && !FastSteal() &&
+                IsStableStealCandidate(handle) && IsLinkedActiveVoice(handle)) {
+                const float score = ComputeStableStealKey(handle);
+                stealStableKey_[handle] = EncodeStableWinnerKey(
+                    score, activePosition_[handle]);
+                stealWinnerTree_[stealTreeLeafBase_ + handle] =
+                    stealStableKey_[handle];
+                RefreshStealWinnerPath(handle);
+            } else {
+                RemoveStealCandidate(handle);
+                if (stealHeapValid_)
+                    PushStealCandidate(handle, activePosition_[handle]);
+            }
+            return;
+        }
+        const uint32_t heapPosition = stealVolatileHeapPosition_[handle];
+        if (!IsStableStealCandidate(handle) && IsLinkedActiveVoice(handle) &&
+            heapPosition < stealVolatileHeapCount_ &&
+            stealVolatileHeapFrame_ == currentFrame_) {
+            stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
+                ComputeStableStealKey(handle), activePosition_[handle]);
+            stealVolatileHeapHandle_[heapPosition] = handle;
+            VolatileHeapSiftUp(heapPosition);
+            VolatileHeapSiftDown(stealVolatileHeapPosition_[handle]);
+            return;
+        }
+        // Attack/release replacements belong to the exact dynamic list,
+        // while a rare immediately-stable replacement belongs to the stable
+        // heap.  Reclassify those uncommon cases through the normal path.
+        RemoveStealCandidate(handle);
+        if (stealHeapValid_ &&
+            v.state[handle] != static_cast<uint8_t>(VoiceState::Free)) {
+            PushStealCandidate(handle, activePosition_[handle]);
+        }
+        return;
+    }
+    if (stealHeapValid_ &&
+        v.state[handle] != static_cast<uint8_t>(VoiceState::Free)) {
+        PushStealCandidate(handle, activePosition_[handle]);
+    }
+}
+
+inline void VoiceManager::StartRelease(VoiceHandle handle) {
+    if (handle >= maxVoices_) return;
+    if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active)) {
+        // A planner hook may advance this voice to the event frame and
+        // discover that it naturally retired before the requested release.
+        if (v.state[handle] != static_cast<uint8_t>(VoiceState::Active))
+            return;
+        UnlinkExclusiveClass(handle);
+        if (deferredReleaseHook_) {
+            // Whole-voice pre-pass: chain/held bookkeeping happens now (so
+            // later pre-pass queries observe it in ingress order); the
+            // audible state flip is deferred to the event frame.
+            UnlinkChannelKey(handle);
+            v.heldBySustain[handle] = 0u;
+            v.heldBySostenuto[handle] = 0u;
+            deferredReleaseHook_(handle, deferredReleaseUserData_);
+            return;
+        }
+        UnlinkChannelKey(handle);
+        v.heldBySustain[handle] = 0u;
+        v.heldBySostenuto[handle] = 0u;
+        v.state[handle] = static_cast<uint8_t>(VoiceState::Releasing);
+        releasingCount_.fetch_add(1u, std::memory_order_relaxed);
+        // Track the voice in the Releasing-ring fast-path index. Entries are
+        // validated lazily when consumed; if a voice leaves Releasing by any
+        // other route its entry simply goes stale and is skipped later.
+        if (releasingRingCapacity_ != 0u) {
+            if (releasingRingCount_ == releasingRingCapacity_) {
+                // Overwrite the oldest entry on overflow; bounded memory,
+                // correctness never depends on ring contents.
+                releasingRingHead_ =
+                    (releasingRingHead_ + 1u) & releasingRingMask_;
+                --releasingRingCount_;
+            }
+            releasingRing_[(releasingRingHead_ + releasingRingCount_) &
+                           releasingRingMask_] =
+                static_cast<uint32_t>(handle);
+            ++releasingRingCount_;
+        }
+        // SF2 sampleModes 3 = loop during key depression: stop looping so the
+        // sample plays out to its end through the release tail.
+        if (v.loopMode[handle] == 3) v.loopEnabled[handle] = 0;
+        RefreshRenderClass(handle);
+    }
+}
+
+inline void VoiceManager::FinalizeDeferredRelease(VoiceHandle handle) {
+    if (handle >= maxVoices_ ||
+        v.state[handle] != static_cast<uint8_t>(VoiceState::Releasing))
+        return;
+    releasingCount_.fetch_add(1u, std::memory_order_relaxed);
+    if (releasingRingCapacity_ != 0u) {
+        if (releasingRingCount_ == releasingRingCapacity_) {
+            releasingRingHead_ =
+                (releasingRingHead_ + 1u) & releasingRingMask_;
+            --releasingRingCount_;
+        }
+        releasingRing_[(releasingRingHead_ + releasingRingCount_) &
+                       releasingRingMask_] = static_cast<uint32_t>(handle);
+        ++releasingRingCount_;
+    }
+    RefreshRenderClass(handle);
+}
+
+inline void VoiceManager::AdoptStealTailSlot(uint32_t slot) {
+    if (slot >= kStealTailReserve) return;
+    if (v.stealTailFramesRemaining[slot] == 0u) return;
+    if (stealTailPosition_[slot] < stealTailCount_) return;  // already live
+    if (stealTailCount_ >= kStealTailReserve) return;
+    const uint32_t position = stealTailCount_++;
+    stealTailList_[position] = slot;
+    stealTailPosition_[slot] = position;
+    stealTailMinHeapValid_ = false;
+}
+
+inline void VoiceManager::RetireVoice(VoiceHandle handle) {
+    if (handle >= maxVoices_ || v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
+        return;
+
+    ++retireCount_;
+    if (GetVoiceAge(handle) < 2) ++retireImmediateCount_;
+
+    const bool wasReleasing =
+        v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing);
+    if (wasReleasing)
+        releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
+
+    // Dense chopped streams interleave volatile retirement with immediate
+    // full-pool launches. Invalidating here made the next steal rebuild the
+    // complete candidate index, turning ordinary churn into repeated O(V)
+    // spikes. Remove the retiring candidate and repair only the swapped
+    // handle's path; both stable and volatile indices support this exactly.
+    const bool maintainStealIndex = stealHeapValid_;
+    if (maintainStealIndex)
+        RemoveStealCandidate(handle);
+    UnlinkChannelKey(handle);
+    UnlinkExclusiveClass(handle);
+    UnlinkPlayGroup(handle);
+    UnlinkChannelActive(handle);
+    UnlinkRenderClass(handle);
+    v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
+    v.currentGain[handle] = 0.0f;
+    freeStack_[freeTop_++] = static_cast<int32_t>(handle);
+    assert(freeTop_ <= maxVoices_ && "freeStack_ overflow in RetireVoice");
+
+    const uint32_t position = activePosition_[handle];
+    assert(position < activeCount_ && activeList_[position] == handle);
+    const uint32_t lastPosition = activeCount_ - 1;
+    if (position != lastPosition) {
+        const uint32_t moved = activeList_[lastPosition];
+        activeList_[position] = moved;
+        activePosition_[moved] = position;
+        if (maintainStealIndex)
+            UpdateStealCandidate(static_cast<VoiceHandle>(moved));
+    }
+    --activeCount_;
+    activePosition_[handle] = UINT32_MAX;
+}
+
+inline void VoiceManager::RebuildActivePositions() {
+    for (uint32_t position = 0; position < activeCount_; ++position)
+        activePosition_[activeList_[position]] = position;
+    stealHeapValid_ = false;
+}
+
+inline bool VoiceManager::IsActive(VoiceHandle handle) const {
+    return handle < maxVoices_ && v.state[handle] != static_cast<uint8_t>(VoiceState::Free);
+}
+
+inline void VoiceManager::ConfigureVoice(
+    VoiceHandle handle, const VoiceConfiguration& setup,
+    const ChannelParamsSnapshot& cp, bool commitDeferred) {
+    ConfigureVoice(handle, setup, setup.playIndex, cp, commitDeferred);
+}
+
+inline void VoiceManager::ConfigureVoice(
+    VoiceHandle handle, const VoiceConfiguration& setup, uint32_t playIndex,
+    const ChannelParamsSnapshot& cp, bool commitDeferred) {
+    if (handle >= maxVoices_) return;
+
+    UnlinkExclusiveClass(handle);
+    SetVoicePlayIndex(handle, playIndex);
+    ApplyVoiceConfigurationFields(handle, setup, cp);
+    LinkExclusiveClass(handle);
+    RefreshRenderClass(handle);
+    if (commitDeferred)
+        CommitVoiceConfiguration(handle);
+    else
+        UpdateStealCandidate(handle);
+    if (voiceConfiguredHook_)
+        voiceConfiguredHook_(handle, voiceConfiguredUserData_);
+}
+
+inline void VoiceManager::ApplyVoiceConfigurationFields(
+    VoiceHandle handle, const VoiceConfiguration& setup,
+    const ChannelParamsSnapshot& cp, VoiceRenderClass knownClass) {
+
+    v.sampleStart[handle] = setup.sampleStart;
+    v.loopMode[handle] = setup.loopMode;
+    v.phaseIncs[handle] = setup.phaseStep;
+    v.basePhaseIncs[handle] = setup.basePhaseStep;
+    v.pitchBendScales[handle] = setup.pitchBendScale;
+    v.sampleBacked[handle] = setup.sampleBacked;
+
+    v.phases[handle] = 0.0f;
+
+    const uint32_t relEnd = setup.sampleEnd > setup.sampleStart
+        ? setup.sampleEnd - setup.sampleStart : 0u;
+    const uint32_t relLoopStart = setup.loopStart > setup.sampleStart
+        ? setup.loopStart - setup.sampleStart : 0u;
+    const uint32_t relLoopEnd = setup.loopEnd > setup.sampleStart
+        ? setup.loopEnd - setup.sampleStart : 0u;
+    v.relEnd[handle] = relEnd;
+    v.relLoopS[handle] = relLoopStart;
+    v.relLoopE[handle] = relLoopEnd;
+    v.relLoopSF[handle] = static_cast<float>(relLoopStart);
+    v.relLoopEF[handle] = static_cast<float>(relLoopEnd);
+    const bool knownSustained =
+        knownClass == VoiceRenderClass::SustainedLoop ||
+        knownClass == VoiceRenderClass::SustainedOneShot;
+    v.loopEnabled[handle] = knownSustained
+        ? static_cast<uint8_t>(
+            knownClass == VoiceRenderClass::SustainedLoop)
+        : static_cast<uint8_t>(
+            (setup.loopMode == 1u || setup.loopMode == 3u) &&
+            setup.loopEnd > setup.loopStart + 1u);
+
+    v.presetIndex[handle] = setup.presetIndex;
+    v.regionIndex[handle] = setup.regionIndex;
+    exclusiveClass_[handle] = setup.exclusiveClass < kExclusiveClassCount
+        ? static_cast<uint8_t>(setup.exclusiveClass) : 0u;
+    v.targetGain[handle] = setup.initialGain;
+    v.sustainLevel[handle] = setup.sustainLevel * setup.initialGain;
+    v.delaySamplesRemaining[handle] = setup.delaySamples;
+    v.holdSamplesRemaining[handle] = setup.holdSamples;
+    v.attackSamplesRemaining[handle] = setup.attackSamples;
+    v.decaySamplesRemaining[handle] = setup.decaySamples;
+    v.attackGainStep[handle] = setup.attackGainStep;
+    v.decaySlope[handle] = setup.decaySlope;
+    v.releaseDecay[handle] = setup.releaseDecay;
+    v.releaseSamplesRemaining[handle] = setup.releaseSamples > 0u
+        ? FloorLimitedReleaseSamples(setup.releaseSamples, setup.releaseDecay,
+                                     setup.initialGain)
+        : UINT32_MAX;
+    v.currentGain[handle] = 0.0f;
+    if (knownSustained) {
+        v.envelopeStage[handle] = 3u;
+        v.currentGain[handle] = setup.initialGain;
+    } else if (setup.delaySamples > 0u) {
+        v.envelopeStage[handle] = 4u;
+    } else if (setup.holdSamples > 0u) {
+        v.envelopeStage[handle] = 0u;
+    } else if (setup.attackSamples > 0u) {
+        v.envelopeStage[handle] = 1u;
+    } else if (setup.decaySamples > 0u) {
+        v.envelopeStage[handle] = 2u;
+        v.currentGain[handle] = setup.initialGain;
+    } else {
+        v.envelopeStage[handle] = 3u;
+        v.currentGain[handle] = setup.initialGain;
+    }
+
+    // A merged launch stands for `launchMult_` identical voices: the factor
+    // rides in the pan gains, so every later fold (CC7/10/11, steal scores,
+    // whole-voice ops, ghosts) carries it without knowing about merging. A
+    // single launch takes the unscaled branch and stays bit-identical.
+    float gainLeft = setup.gainLeft;
+    float gainRight = setup.gainRight;
+    if (launchMult_ > 1u) {
+        const float scale = static_cast<float>(launchMult_);
+        gainLeft *= scale;
+        gainRight *= scale;
+        v.mult[handle] = launchMult_;
+    } else {
+        v.mult[handle] = 1u;
+    }
+    v.gainLeft[handle] = gainLeft;
+    v.gainRight[handle] = gainRight;
+    v.filterA0[handle] = setup.filterA0;
+    v.filterB1[handle] = setup.filterB1;
+    v.filterB2[handle] = setup.filterB2;
+    v.filterZ1[handle] = 0.0f;
+    v.filterZ2[handle] = 0.0f;
+    v.filterEnabled[handle] = setup.filterEnabled;
+    v.vibLfoToPitchCents[handle] = setup.vibLfoToPitchCents;
+    v.vibLfoSteps[handle] = setup.vibLfoPhaseStep;
+    v.vibLfoPhases[handle] = 0.0f;
+    v.vibLfoDelays[handle] = setup.vibLfoDelaySamples;
+    v.vibLfoModulated[handle] = 0u;
+    v.mixGainL[handle] = gainLeft * cp.mixScaleLeft;
+    v.mixGainR[handle] = gainRight * cp.mixScaleRight;
+    v.stealOutputGain[handle] = std::sqrt(
+        v.mixGainL[handle] * v.mixGainL[handle] +
+        v.mixGainR[handle] * v.mixGainR[handle]);
+    v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
+    v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
+}
+
+inline VoiceRenderClass VoiceManager::ClassifyConfiguration(
+    const VoiceConfiguration& setup) {
+    if (setup.sampleBacked == 0u ||
+        setup.sampleEnd <= setup.sampleStart + 1u)
+        return VoiceRenderClass::Generic;
+    const bool loop =
+        (setup.loopMode == 1u || setup.loopMode == 3u) &&
+        setup.loopEnd > setup.loopStart + 1u;
+    uint8_t stage = 3u;
+    if (setup.delaySamples != 0u) stage = 4u;
+    else if (setup.holdSamples != 0u) stage = 0u;
+    else if (setup.attackSamples != 0u) stage = 1u;
+    else if (setup.decaySamples != 0u) stage = 2u;
+    if (stage == 3u)
+        return loop ? VoiceRenderClass::SustainedLoop
+                    : VoiceRenderClass::SustainedOneShot;
+    if (loop && (stage == 1u || stage == 2u))
+        return VoiceRenderClass::TransientLoop;
+    return VoiceRenderClass::Generic;
+}
+
+inline bool VoiceManager::IsStableConfiguration(
+    const VoiceConfiguration& setup) {
+    const bool preDecay = setup.delaySamples != 0u ||
+        setup.holdSamples != 0u || setup.attackSamples != 0u;
+    return setup.sampleBacked != 0u &&
+        setup.sampleEnd > setup.sampleStart + 1u &&
+        (preDecay || setup.decaySamples == 0u);
+}
+
+inline float VoiceManager::ComputeNewbornStableStealKey(
+    VoiceHandle handle) const {
+    const float outputGain = v.stealOutputGain[handle];
+    const float effectiveLevel =
+        std::fabs(v.targetGain[handle]) * outputGain;
+    const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
+    const float commonAgeScore =
+        static_cast<float>(currentFrame_) * (1.0f / 256.0f);
+    return score - commonAgeScore;
+}
+
+SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration& setup, uint32_t playIndex,
+    const ChannelParamsSnapshot& cp, VoiceHandle& outHandle) {
+    if (freeTop_ != 0u || !IsStableConfiguration(setup)) return false;
+    // Per-key voice cap: when this key is at its cap the launch must replace
+    // the key's oldest member, not the globally best victim. Bail to the
+    // general path, which resolves the key-local victim once per transaction
+    // (kept out of this O(1) fast path's bookkeeping).
+    if (perKeyVoiceCap_ != 0u &&
+        channelKeyVoiceCount_[channel][note] >= perKeyVoiceCap_)
+        return false;
+
+    uint32_t selectedPosition = 0u;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const bool profileLaunch = (++launchProfileCounter_ & 4095u) == 0u;
+    const uint64_t profileBegin = profileLaunch ? __rdtsc() : 0u;
+#endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t testSelectionBegin = BeginLaunchStageForTest();
+#endif
+    // Releasing-ring fast path: under release-storm churn the oldest
+    // releasing voice is an acceptable BASSMIDI-consistent victim, exactly
+    // like PopStealCandidate's fast path. Peek first so grouped voices are
+    // left untouched (they need the atomic group retirement path below).
+    uint32_t ringPeekPosition = 0u;
+    VoiceHandle ringPeek = kInvalidVoice;
+    if (ReleasingRingEligible())
+        ringPeek = NextValidReleasingRingVictim(ringPeekPosition, false);
+    const bool fromRing = ringPeek != kInvalidVoice &&
+        playGroupPrev_[ringPeek] < 0 && playGroupNext_[ringPeek] < 0;
+    VoiceHandle handle = kInvalidVoice;
+    if (fromRing) {
+        handle = NextValidReleasingRingVictim(selectedPosition, true);
+        ++releasingRingHits_;
+    } else {
+        handle = PopStealCandidate(selectedPosition, true);
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
+                          testSelectionBegin);
+#endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const uint64_t profileAfterPop = profileLaunch ? __rdtsc() : 0u;
+#endif
+    if (handle == kInvalidVoice) return false;
+
+    const bool volatileVictim = !fromRing &&
+        stealCandidateReserved_[handle] == 1u &&
+        !IsStableStealCandidate(handle) &&
+        stealVolatileHeapPosition_[handle] < stealVolatileHeapCount_;
+    const bool eligible = fromRing ||
+        ((stealCandidateReserved_[handle] == 2u &&
+          IsStableStealCandidate(handle) &&
+          stealWinnerTree_[stealTreeLeafBase_ + handle] ==
+              stealStableKey_[handle]) ||
+         volatileVictim);
+    if (!eligible) {
+        stealCandidateReserved_[handle] = 0u;
+        return false;
+    }
+
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    RecordVictimGroupForTest(handle, LaunchVictimPath::SingleInPlace, true);
+#endif
+
+    const VoiceRenderClass desiredClass = ClassifyConfiguration(setup);
+    const uint8_t desiredClassValue = static_cast<uint8_t>(desiredClass);
+    const bool preserveChannelIndex = v.channel[handle] == channel;
+    const bool preserveRenderIndex =
+        v.renderClass[handle] == desiredClassValue;
+
+    CaptureStealTail(handle);
+    if (fromRing) {
+        // Mirror tier-pop bookkeeping: unlink the victim from the volatile
+        // candidate index it still occupies.
+        RemoveStealCandidate(handle);
+    } else if (volatileVictim) {
+        stealCandidateReserved_[handle] = 0u;
+        RemoveReservedVolatileRoot(handle);
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const uint64_t profileAfterTail = profileLaunch ? __rdtsc() : 0u;
+#endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t testLifecycleBegin = BeginLaunchStageForTest();
+#endif
+    ++stealCount_;
+    if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
+        releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
+    UnlinkChannelKey(handle);
+    UnlinkExclusiveClass(handle);
+    UnlinkPlayGroup(handle);
+    if (!preserveChannelIndex) MoveChannelActiveInPlace(handle, channel);
+    if (!preserveRenderIndex) UnlinkRenderClass(handle);
+
+    // This atomic path has no observer between victim removal and complete
+    // configuration. Initialize only lifecycle fields that survive the
+    // transaction; the generic prepared initializer's placeholder sample,
+    // envelope, class, links, and gains would all be overwritten below.
+    v.state[handle] = static_cast<uint8_t>(VoiceState::Active);
+    if (preserveChannelIndex) v.channel[handle] = channel;
+    v.note[handle] = note;
+    v.velocity[handle] = velocity;
+    v.heldBySustain[handle] = 0u;
+    v.heldBySostenuto[handle] = 0u;
+    v.releaseStartInBlock[handle] = 0u;
+    v.birthFrame[handle] = currentFrame_;
+    v.stealFadeInFramesRemaining[handle] = 0u;
+    v.stealFadeInFramesTotal[handle] = 0u;
+    LinkChannelKey(handle);
+
+    // A playIndex is unique to this MIDI note-on. The old group has already
+    // been unlinked, so SetVoicePlayIndex's second unlink is unnecessary.
+    v.playIndex[handle] = playIndex;
+    lastLinkedPlayIndex_ = playIndex;
+    lastLinkedPlayVoice_ = handle;
+
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const uint64_t profileAfterLifecycle = profileLaunch ? __rdtsc() : 0u;
+#endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Lifecycle,
+                          testLifecycleBegin);
+    const uint64_t testConfigureBegin = BeginLaunchStageForTest();
+#endif
+
+    ApplyVoiceConfigurationFields(handle, setup, cp, desiredClass);
+    LinkExclusiveClass(handle);
+    if (preserveRenderIndex) {
+        v.renderClass[handle] = desiredClassValue;
+    } else {
+        LinkRenderClass(handle);
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    const uint64_t profileAfterConfigure = profileLaunch ? __rdtsc() : 0u;
+#endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Configuration,
+                          testConfigureBegin);
+    const uint64_t testTreeBegin = BeginLaunchStageForTest();
+#endif
+
+    // The stable replacement retains its leaf; a volatile victim vacated the
+    // heap and inserts that same physical handle as a new stable leaf.
+    // Ring-served victims likewise occupied a volatile-tier slot before.
+    stealCandidateReserved_[handle] = 0u;
+    const float score = ComputeNewbornStableStealKey(handle);
+    stealStableKey_[handle] = EncodeStableWinnerKey(
+        score, activePosition_[handle]);
+    stealWinnerTree_[stealTreeLeafBase_ + handle] = stealStableKey_[handle];
+    if (volatileVictim || fromRing) ++stealHeapCount_;
+    RefreshStealWinnerPath(handle);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance,
+                          testTreeBegin);
+#endif
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
+    if (profileLaunch) {
+        const uint64_t profileEnd = __rdtsc();
+        ++launchProfileSamples_;
+        launchProfilePopCycles_ += profileAfterPop - profileBegin;
+        launchProfileTailCycles_ += profileAfterTail - profileAfterPop;
+        launchProfileLifecycleCycles_ +=
+            profileAfterLifecycle - profileAfterTail;
+        launchProfileConfigureCycles_ +=
+            profileAfterConfigure - profileAfterLifecycle;
+        launchProfileTreeCycles_ += profileEnd - profileAfterConfigure;
+    }
+#endif
+    outHandle = handle;
+    if (voiceConfiguredHook_)
+        voiceConfiguredHook_(handle, voiceConfiguredUserData_);
+    return true;
+}
+
+inline bool VoiceManager::ReuseMatchingStealGroup(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count,
+    VoiceHandle* outHandles, bool& candidatesReservedInPlace) {
+    candidatesReservedInPlace = false;
+    // Per-key voice cap: a capped key must replace its own oldest member,
+    // not re-voice a globally selected group that may belong to another key.
+    if (perKeyVoiceCap_ != 0u &&
+        channelKeyVoiceCount_[channel][note] >= perKeyVoiceCap_)
+        return false;
+    if (freeTop_ != 0u || count == 0u || count > maxVoices_ || !setups ||
+        !outHandles)
+        return false;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    ++groupReuseAttemptCount_;
+#endif
+
+    uint32_t selectedPosition = 0u;
+    // Keep the selected leaf present until we know whether the complete
+    // physical group can be replaced in-place. No other selection occurs
+    // during this transaction, so the reservation is exact and private to
+    // the audio thread.
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t selectionBegin = BeginLaunchStageForTest();
+#endif
+    VoiceHandle selected = PopStealCandidate(selectedPosition, true);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::VictimSelection,
+                          selectionBegin);
+#endif
+    if (selected == kInvalidVoice) return false;
+
+    uint32_t groupCount = 1u;
+    outHandles[0] = selected;
+    bool tooMany = false;
+    int32_t linked = playGroupPrev_[selected];
+    while (linked >= 0) {
+        if (groupCount >= count) { tooMany = true; break; }
+        outHandles[groupCount++] = static_cast<VoiceHandle>(linked);
+        linked = playGroupPrev_[static_cast<uint32_t>(linked)];
+    }
+    if (!tooMany) {
+        linked = playGroupNext_[selected];
+        while (linked >= 0) {
+            if (groupCount >= count) { tooMany = true; break; }
+            outHandles[groupCount++] = static_cast<VoiceHandle>(linked);
+            linked = playGroupNext_[static_cast<uint32_t>(linked)];
+        }
+    }
+
+    if (groupCount != count || tooMany) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (tooMany || groupCount > count) ++groupReuseLargerCount_;
+        else ++groupReuseSmallerCount_;
+#endif
+        // The caller needs a different number of slots. Restore the exact
+        // candidate and use the general allocation path, which may retire a
+        // larger/smaller physical group according to the existing policy.
+        stealCandidateReserved_[selected] = 0u;
+        return false;
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    ++groupReuseMatchCount_;
+#endif
+
+    bool canReserveInPlace = count <= 8u;
+    for (uint32_t i = 0u; i < count && canReserveInPlace; ++i) {
+        const VoiceHandle handle = outHandles[i];
+        const VoiceConfiguration& setup = setups[i];
+        canReserveInPlace = IsStableConfiguration(setup) &&
+            IsStableStealCandidate(handle) &&
+            stealWinnerTree_[stealTreeLeafBase_ + handle] ==
+                stealStableKey_[handle];
+    }
+
+    if (canReserveInPlace) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        ++groupReuseReservedCount_;
+#endif
+        // The old and new voices occupy the same leaves. Preserve the leaves
+        // while lifecycle/sample state is rewritten, then refresh their
+        // cached scores and the union of both paths once at commit.
+        candidatesReservedInPlace = true;
+        for (uint32_t i = 0u; i < count; ++i) {
+            stealCandidateReserved_[outHandles[i]] = 2u;
+            stealCandidateDeferred_[outHandles[i]] = 1u;
+        }
+    } else {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        const uint64_t treeBegin = BeginLaunchStageForTest();
+#endif
+        const bool selectedVolatileRoot =
+            stealCandidateReserved_[selected] == 1u &&
+            stealVolatileHeapValid_ && stealVolatileHeapCount_ != 0u &&
+            stealVolatileHeapHandle_[0] == selected &&
+            stealVolatileHeapPosition_[selected] == 0u;
+        stealCandidateReserved_[selected] = 0u;
+        if (selectedVolatileRoot)
+            RemoveReservedVolatileRoot(selected);
+        else
+            RemoveStealCandidate(selected);
+        for (uint32_t i = 1u; i < count; ++i)
+            RemoveStealCandidate(outHandles[i]);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance,
+                              treeBegin);
+#endif
+    }
+
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    RecordVictimGroupForTest(selected, LaunchVictimPath::MatchingReuse,
+                             candidatesReservedInPlace);
+#endif
+
+    // Capture every old layer, then replace the complete physical note in
+    // place. The fast path keeps its winner-tree leaves reserved; the fallback
+    // removed them above. Active positions and the free stack never move.
+    for (uint32_t i = 0u; i < count; ++i)
+        CaptureStealTail(outHandles[i]);
+
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t lifecycleBegin = BeginLaunchStageForTest();
+#endif
+    for (uint32_t i = 0u; i < count; ++i) {
+        const VoiceHandle handle = outHandles[i];
+        // Steal-index reservation and channel-list membership are independent.
+        // Replacing a grouped voice on the same channel can retain its exact
+        // dense channel slot even when the victim came from the volatile heap.
+        const bool preserveChannelIndex = v.channel[handle] == channel;
+        const VoiceRenderClass desiredClass =
+            ClassifyConfiguration(setups[i]);
+        const uint8_t configuredClass = static_cast<uint8_t>(desiredClass);
+        const bool preserveRenderIndex = candidatesReservedInPlace &&
+            v.renderClass[handle] == configuredClass;
+        ++stealCount_;
+        if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
+            releasingCount_.fetch_sub(1u, std::memory_order_relaxed);
+        UnlinkChannelKey(handle);
+        UnlinkExclusiveClass(handle);
+        UnlinkPlayGroup(handle);
+        if (!preserveChannelIndex) UnlinkChannelActive(handle);
+        if (!preserveRenderIndex) UnlinkRenderClass(handle);
+        if (!candidatesReservedInPlace)
+            stealCandidateReserved_[handle] = 0u;
+        v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
+        v.currentGain[handle] = 0.0f;
+
+        InitializePreparedVoice(handle, channel, note, velocity);
+        if (preserveRenderIndex)
+            v.renderClass[handle] = configuredClass;
+        stealCandidateDeferred_[handle] = 1u;
+        LinkChannelKey(handle);
+        if (!preserveChannelIndex) LinkChannelActive(handle);
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Lifecycle, lifecycleBegin);
+#endif
+    return true;
+}
+
+inline void VoiceManager::CommitVoiceGroupConfigurations(
+    const VoiceHandle* handles, uint32_t count,
+    bool candidatesReservedInPlace) {
+    if (!candidatesReservedInPlace) {
+        // A prepared SF2 note becomes visible atomically. When every layer is
+        // a stable candidate, publish all leaves first and repair the union of
+        // their tree paths once. No event can observe an intermediate layer,
+        // and the resulting root is identical to individual commits.
+        bool canBatchStable = stealHeapValid_ && count <= 8u;
+        for (uint32_t layer = 0u; layer < count && canBatchStable; ++layer) {
+            const VoiceHandle handle = handles[layer];
+            canBatchStable = handle < maxVoices_ &&
+                stealCandidateDeferred_[handle] != 0u &&
+                stealCandidateReserved_[handle] == 0u &&
+                IsStableStealCandidate(handle);
+        }
+        if (canBatchStable) {
+            for (uint32_t layer = 0u; layer < count; ++layer) {
+                const VoiceHandle handle = handles[layer];
+                stealCandidateDeferred_[handle] = 0u;
+                ++stealHeapCount_;
+                const float score = ComputeStableStealKey(handle);
+                stealStableKey_[handle] = EncodeStableWinnerKey(
+                    score, activePosition_[handle]);
+                stealWinnerTree_[stealTreeLeafBase_ + handle] =
+                    stealStableKey_[handle];
+            }
+            RefreshStealWinnerPaths(handles, count);
+            return;
+        }
+        for (uint32_t layer = 0u; layer < count; ++layer)
+            CommitVoiceConfiguration(handles[layer]);
+        return;
+    }
+
+    bool stillStable = stealHeapValid_ && count <= 8u;
+    for (uint32_t layer = 0u; layer < count && stillStable; ++layer) {
+        const VoiceHandle handle = handles[layer];
+        stillStable = handle < maxVoices_ &&
+            stealCandidateDeferred_[handle] != 0u &&
+            stealCandidateReserved_[handle] == 2u &&
+            IsStableStealCandidate(handle) &&
+            stealWinnerTree_[stealTreeLeafBase_ + handle] ==
+                stealStableKey_[handle];
+    }
+    if (!stillStable) {
+        for (uint32_t layer = 0u; layer < count; ++layer)
+            CommitVoiceConfiguration(handles[layer]);
+        return;
+    }
+
+    for (uint32_t layer = 0u; layer < count; ++layer) {
+        const VoiceHandle handle = handles[layer];
+        stealCandidateDeferred_[handle] = 0u;
+        stealCandidateReserved_[handle] = 0u;
+        const float score = ComputeStableStealKey(handle);
+        stealStableKey_[handle] = EncodeStableWinnerKey(
+            score, activePosition_[handle]);
+        stealWinnerTree_[stealTreeLeafBase_ + handle] =
+            stealStableKey_[handle];
+    }
+    RefreshStealWinnerPaths(handles, count);
+}
+
+inline bool VoiceManager::LaunchVoiceGroup(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count,
+    const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles,
+    uint32_t blockOffset) {
+    const uint32_t playIndex = setups && count != 0u
+        ? setups[0].playIndex : UINT32_MAX;
+    return LaunchVoiceGroup(channel, note, velocity, setups, count, playIndex,
+                            channelParams, outHandles, blockOffset);
+}
+
+inline bool VoiceManager::LaunchVoiceGroup(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
+    const ChannelParamsSnapshot& channelParams, VoiceHandle* outHandles,
+    uint32_t blockOffset, uint32_t multiplicity) {
+    lastLaunchRejected_ = false;
+    if (!setups || !outHandles || count == 0u || count > maxVoices_ ||
+        count > voiceLimit_)
+        return false;
+    if (count > launchLayersHighWater_) launchLayersHighWater_ = count;
+    if (stealReject_.load(std::memory_order_relaxed) && count == 1u && ShouldRejectNoteOn(setups[0], channelParams,
+                                           multiplicity)) {
+        // Pairing note-offs sees no voice for this generation, exactly as if
+        // the note had been launched and stolen before it rendered.
+        lastLaunchRejected_ = true;
+        ++stealRejectCount_;
+        return false;
+    }
+    // Scope the multiplicity to this launch: ApplyVoiceConfigurationFields
+    // reads launchMult_, and every return path below must restore it.
+    struct MultiplicityScope {
+        uint32_t& slot;
+        MultiplicityScope(uint32_t& s, uint32_t m) : slot(s) {
+            slot = m > 1u ? m : 1u;
+        }
+        ~MultiplicityScope() { slot = 1u; }
+    } multiplicityScope(launchMult_, multiplicity);
+    if (multiplicity > 1u) mergedVoicesMayExist_ = true;
+    // Resolve every exclusive class once for the complete physical note.
+    // Doing this before any layer allocation/configuration prevents layered
+    // regions from choking siblings born by this same MIDI note-on.
+    ChokeExclusiveClasses(channel, setups, count, blockOffset);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    BeginLaunchTestProfile(channel, note, setups, count);
+#endif
+    if (count == 1u && TryLaunchSingleVoiceInPlace(
+            channel, note, velocity, setups[0], playIndex, channelParams,
+            outHandles[0])) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        ++groupReuseAttemptCount_;
+        ++groupReuseMatchCount_;
+        ++groupReuseReservedCount_;
+        FinishLaunchTestProfile(true);
+#endif
+        return true;
+    }
+    bool candidatesReservedInPlace = false;
+    if (!ReuseMatchingStealGroup(channel, note, velocity, setups, count,
+                                 outHandles, candidatesReservedInPlace)) {
+        // ── FLAG (steal-batch scope) ─────────────────────────────────────
+        // The victim batching is deliberately scoped to ONE launch
+        // transaction: between the first and last layer selection no
+        // candidate insertion can occur (commits land only after this loop),
+        // so the descending victim order of PopStealCandidates is identical
+        // to the sequential per-layer PopStealCandidate pops — only the
+        // per-layer call overhead is saved. Prefetching victims ACROSS notes
+        // of a same-frame dispatch run is NOT exact: newborn commits of
+        // earlier notes re-key their slots and can outrank remaining
+        // prefetched victims, which changes WHICH voice is stolen (confirmed
+        // empirically during bring-up). Any future run-level scheme must
+        // solve that insertion race first.
+        // Per-key voice cap (syndrv-style, opt-in; 0 = off): when this key
+        // already plays at its cap, the whole note-on replaces the oldest
+        // key member instead of growing the pileup. Resolved once per
+        // transaction so the layers of one physical note cannot steal each
+        // other: layer 0 is forced onto the oldest key voice — its sibling
+        // retirement frees slots that feed the remaining layers — while
+        // layers 1..N-1 run the normal free-slot/steal logic. The key chain
+        // holds only still-playing voices (StartRelease unlinks), so
+        // release tails never count against the cap.
+        VoiceHandle keyedVictim = kInvalidVoice;
+        if (perKeyVoiceCap_ != 0u &&
+            channelKeyVoiceCount_[channel][note] >= perKeyVoiceCap_) {
+            const int32_t oldest = channelKeyVoiceOldest_[channel][note];
+            if (oldest >= 0 &&
+                v.state[oldest] == static_cast<uint8_t>(VoiceState::Active))
+                keyedVictim = static_cast<VoiceHandle>(oldest);
+        }
+        VoiceHandle batchVictims[kStealBatchMaxLayers];
+        uint32_t batchPositions[kStealBatchMaxLayers];
+        bool consumed[kStealBatchMaxLayers] = {};
+        uint32_t popped = 0u;
+        const bool batchSteal = stealBatchingEnabled_ &&
+            count >= 2u && count <= kStealBatchMaxLayers &&
+            // Releasing-ring-ordered victims cannot be re-armed (the ring
+            // entry is consumed and there is no front-repush), so the batch
+            // only engages while the ring fast path is inactive; once
+            // inactive it stays inactive for the rest of the launch (sibling
+            // retirements only move freeTop_/activeCount_ further from
+            // eligibility and dispatch never pushes ring entries).
+            !ReleasingRingEligible();
+        if (batchSteal)
+            popped = PopStealCandidates(count, batchVictims, batchPositions);
+        uint32_t allocated = 0u;
+        uint32_t cursor = 0u;
+        for (; allocated < count; ++allocated) {
+            // Mirror AllocateVoiceOrSteal's free-stack-vs-steal decision:
+            // only hand a prefetched victim to a layer that is guaranteed to
+            // take the steal path (the free-slot branch cannot fire), and
+            // skip victims already retired as siblings of an earlier layer's
+            // victim (state Free). The keyed-cap victim is skipped in every
+            // pass — layer 0 consumes it through the forced steal, and it
+            // must never be fed to a later layer as a fresh victim (by then
+            // the handle holds this launch's own newborn).
+            while (cursor < popped &&
+                   (v.state[batchVictims[cursor]] !=
+                        static_cast<uint8_t>(VoiceState::Active) ||
+                    batchVictims[cursor] == keyedVictim))
+                ++cursor;
+            VoiceHandle fed = kInvalidVoice;
+            uint32_t fedPosition = 0u;
+            uint32_t fedCursor = UINT32_MAX;
+            if (freeTop_ == 0u && activeCount_ >= voiceLimit_ &&
+                cursor < popped &&
+                !(allocated == 0u && keyedVictim != kInvalidVoice)) {
+                fed = batchVictims[cursor];
+                fedPosition = batchPositions[cursor];
+                fedCursor = cursor;
+                ++cursor;
+            }
+            outHandles[allocated] = AllocateVoiceOrSteal(
+                channel, note, velocity, nullptr, true, false, fed,
+                fedPosition,
+                allocated == 0u ? keyedVictim : kInvalidVoice);
+            if (outHandles[allocated] == kInvalidVoice) {
+                // Restore the unconsumed, still-live prefetched victims so
+                // the candidate index matches the per-layer path exactly,
+                // then roll the layers launched so far back.
+                RearmLiveBatchVictims(batchVictims, popped, consumed);
+                for (uint32_t rollback = 0u; rollback < allocated; ++rollback)
+                    RetireVoice(outHandles[rollback]);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+                FinishLaunchTestProfile(false);
+#endif
+                return false;
+            }
+            if (fedCursor != UINT32_MAX) consumed[fedCursor] = true;
+        }
+        // The launch consumed its fed victims; every other popped victim
+        // must rejoin the candidate index (the per-layer path would never
+        // have popped it). The keyed-cap victim was consumed by the forced
+        // steal — its handle now holds the replacement, not a stealable.
+        RearmLiveBatchVictims(batchVictims, popped, consumed, keyedVictim);
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    const uint64_t configureBegin = BeginLaunchStageForTest();
+#endif
+    for (uint32_t layer = 0u; layer < count; ++layer) {
+        // Keep every layer invisible to the steal index until the complete
+        // physical note has been prepared.  The former layered path linked a
+        // Generic candidate, configured it, and reclassified it one layer at
+        // a time, multiplying tree/list work for stereo SoundFonts.
+        ConfigureVoice(outHandles[layer], setups[layer], playIndex,
+                       channelParams, false);
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::Configuration,
+                          configureBegin);
+    const uint64_t treeBegin = BeginLaunchStageForTest();
+#endif
+    CommitVoiceGroupConfigurations(outHandles, count,
+                                   candidatesReservedInPlace);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    EndLaunchStageForTest(LaunchProfileStage::TreeMaintenance, treeBegin);
+    FinishLaunchTestProfile(true);
+#endif
+    return true;
+}
