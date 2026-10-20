@@ -364,6 +364,11 @@ void OfflineRendererPage::Start(const ConfigDocument& document) {
     append(midiPath_);
     append(soundFontPath_);
     append(outputPath_);
+    if (stemMode_ > 0) {
+        static const wchar_t* const kModes[] = {L"", L"separate", L"merge", L"both"};
+        append(L"--stems"); append(kModes[stemMode_]);
+    }
+    if (stemTracks_[0]) { append(L"--tracks"); append(std::wstring(stemTracks_, stemTracks_ + std::strlen(stemTracks_))); }
     append(L"--sample-rate"); append(std::to_wstring(values.sampleRate));
     append(L"--max-voices"); append(std::to_wstring(values.maxVoices));
     append(L"--render-threads"); append(std::to_wstring(values.renderThreads));
@@ -630,6 +635,19 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
 
     const bool pathsReady = !midiPath_.empty() && !soundFontPath_.empty() && !outputPath_.empty();
     ImGui::Dummy(ImVec2(0.0f, 6.0f * s));
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(220.0f * s);
+    ImGui::Combo("Per-track render##stems", &stemMode_,
+                 "Off\0Separate WAV per track\0Merge into one WAV\0Both\0");
+    ImGui::SetNextItemWidth(220.0f * s);
+    ImGui::InputTextWithHint("Only tracks##stem", "all (or e.g. 1,3,5)", stemTracks_,
+                             sizeof(stemTracks_), ImGuiInputTextFlags_CharsNoBlank);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Per-track render runs one synth per track, as many at once as your render threads.\n"
+                          "Only tracks: limit to these 0-based MIDI tracks (one combined render if Per-track is Off).\n"
+                          "Same length as the full render, so stems line up in your DAW.");
+    ImGui::Dummy(ImVec2(0.0f, 4.0f * s));
     const bool cancelling = snapshot.state == State::Cancelling;
     if (ui::Button(running ? "Cancel render" : "Start render", ui::ButtonKind::Primary, ImVec2(0, 0),
                    running ? !cancelling : pathsReady)) {

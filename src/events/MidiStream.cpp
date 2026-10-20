@@ -443,6 +443,7 @@ struct PTrack {
     const uint8_t* begin = nullptr;
     RawEvent pending;
     bool has = false;
+    bool dropNotes = false;
 };
 struct WinEv { uint32_t off; uint32_t message; };
 struct TempoEv { uint64_t tick; uint32_t tempo; };
@@ -477,7 +478,11 @@ void ParseWindow(std::vector<PTrack>& tracks, WinWorker& w, uint64_t a,
             if (e.tick > w.maxTick) w.maxTick = e.tick;
             const uint32_t off = static_cast<uint32_t>(e.tick - a);
             if (e.tempo) w.tempos.push_back({e.tick, e.tempo});
-            else if (e.midi) w.events.push_back({off, e.message});
+            else if (e.midi) {
+                const uint32_t type = e.message & 0xf0u;
+                if (!(pt.dropNotes && (type == 0x80u || type == 0x90u)))
+                    w.events.push_back({off, e.message});
+            }
             else if (e.sysex) {
                 (void)TranslateXGSystemExclusivePayload(
                     e.sysexData, e.sysexSize,
@@ -615,6 +620,27 @@ bool ParallelMidiDecoder::MeasureDuration(const MappedMidiFile& file,
     return true;
 }
 
+bool ParallelMidiDecoder::NoteTracks(const MappedMidiFile& file,
+                                     std::vector<uint32_t>& out,
+                                     std::string& error) {
+    MidiStreamInfo header{};
+    std::vector<Track> tracks;
+    if (!Tracks(file, header, tracks, error)) return false;
+    out.clear();
+    for (uint32_t i = 0; i < tracks.size(); ++i) {
+        RawEvent e;
+        for (;;) {
+            if (!Next(tracks[i], e, error)) return false;
+            if (!e.valid) break;
+            if (e.midi && (e.message & 0xf0u) == 0x90u && ((e.message >> 16) & 0x7fu)) {
+                out.push_back(i);
+                break;
+            }
+        }
+    }
+    return true;
+}
+
 bool ParallelMidiDecoder::Decode(const MappedMidiFile& file, uint32_t rate,
                                  MidiStreamDecoder::Sink sink, void* user,
                                  std::atomic<bool>* cancel,
@@ -631,6 +657,11 @@ bool ParallelMidiDecoder::Decode(const MappedMidiFile& file, uint32_t rate,
         tracks[i].t = raw[i];
         tracks[i].begin = raw[i].p;
         total += static_cast<uint64_t>(raw[i].end - raw[i].p);
+    }
+    if (!keepNoteTracks.empty()) {
+        for (PTrack& pt : tracks) pt.dropNotes = true;
+        for (uint32_t k : keepNoteTracks)
+            if (k < tracks.size()) tracks[k].dropNotes = false;
     }
     if (totalBytes) totalBytes->store(total, std::memory_order_relaxed);
 

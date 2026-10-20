@@ -75,6 +75,8 @@ private:
     std::wstring midiPath_;
     std::wstring soundFontPath_;
     std::wstring outputPath_;
+    int stemMode_ = 0;  // 0 off, 1 separate, 2 merge, 3 both
+    char stemTracks_[64]{};  // "1,3,5": render only these MIDI tracks' notes (blank = all)
     std::wstring lastMidiDirectory_;
     std::wstring lastSoundFontDirectory_;
     std::wstring lastOutputDirectory_;

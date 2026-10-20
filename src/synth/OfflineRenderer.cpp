@@ -61,6 +61,8 @@ struct Options {
     bool machineProgress = false;
     bool canonicalSynth = false;
     std::wstring cancelEvent;
+    std::vector<uint32_t> stemTracks;  // --tracks: keep notes of these tracks only
+    std::wstring stems;                // --stems separate|merge|both: one instance per track
     const EngineConfig* tuning = nullptr;  // live-synth tuning (shared config)
 };
 
@@ -292,6 +294,9 @@ void Usage() {
                        L"  --backend auto|scalar|sse2|avx2|gpu\n"
            L"  --tuning-edo 12|31    Melodic tuning (31EDO key 155 = middle C)\n"
            L"  --config FILE         Use this V3 config JSON instead of the active one\n"
+           L"  --tracks A,B,...      Stem: keep notes of these 0-based MIDI tracks only (length unchanged)\n"
+           L"  --stems MODE          One synth instance per note-bearing track, up to --render-threads at\n"
+           L"                        once. separate: <out>_trackN.wav each; merge: summed into <out>; both\n"
            L"  --scan-only           Validate/count without loading an instrument or rendering\n"
            L"  --quiet               Disable once-per-second telemetry\n"
            L"  --machine-progress    Emit tab-separated progress records\n", stderr);
@@ -316,6 +321,24 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             o.cancelEvent = p;
         }
         else if (arg == L"--scan-only") o.scanOnly = true;
+        else if (arg == L"--stems") {
+            const auto p=value(); if (!p) return false;
+            o.stems = p;
+            if (o.stems != L"separate" && o.stems != L"merge" && o.stems != L"both") return false;
+        }
+        else if (arg == L"--tracks") {
+            const auto p=value(); if (!p) return false;
+            o.stemTracks.clear();
+            for (wchar_t* s = const_cast<wchar_t*>(p); *s;) {
+                wchar_t* end = nullptr;
+                const unsigned long v = wcstoul(s, &end, 10);
+                if (end == s) return false;
+                o.stemTracks.push_back(static_cast<uint32_t>(v));
+                s = (*end == L',') ? end + 1 : end;
+                if (s == end && *end) return false;
+            }
+            if (o.stemTracks.empty()) return false;
+        }
         else if (arg == L"--synth") {
             const auto p=value(); if (!p) return false;
             const std::wstring name=p;
@@ -825,6 +848,188 @@ bool RingSink(const PackedMidiEvent& e,void* p){auto& c=*static_cast<ProducerCon
 } // namespace
 } // namespace svms
 
+static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig);
+
+namespace {
+std::string NarrowPath(const std::wstring& path) {
+#if defined(_WIN32)
+    return std::string(path.begin(), path.end());  // unused on Windows
+#else
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    return converter.to_bytes(path);
+#endif
+}
+FILE* OpenPath(const std::wstring& path, const char* mode) {
+#if defined(_WIN32)
+    return _wfopen(path.c_str(), std::wstring(mode, mode + std::strlen(mode)).c_str());
+#else
+    return std::fopen(NarrowPath(path).c_str(), mode);
+#endif
+}
+void RemovePath(const std::wstring& path) {
+#if defined(_WIN32)
+    _wremove(path.c_str());
+#else
+    std::remove(NarrowPath(path).c_str());
+#endif
+}
+bool SeekEnd(FILE* f, uint64_t& size) {
+#if defined(_WIN32)
+    if (_fseeki64(f, 0, SEEK_END) != 0) return false;
+    size = static_cast<uint64_t>(_ftelli64(f));
+    return true;
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) return false;
+    size = static_cast<uint64_t>(ftello(f));
+    return true;
+#endif
+}
+bool SeekTo(FILE* f, uint64_t pos) {
+#if defined(_WIN32)
+    return _fseeki64(f, static_cast<__int64>(pos), SEEK_SET) == 0;
+#else
+    return fseeko(f, static_cast<off_t>(pos), SEEK_SET) == 0;
+#endif
+}
+
+std::wstring StemPath(const std::wstring& out, uint32_t track) {
+    std::wstring base = out;
+    const size_t dot = base.rfind(L'.');
+    const size_t sep = base.find_last_of(L"\\/");
+    if (dot != std::wstring::npos && (sep == std::wstring::npos || dot > sep))
+        base.resize(dot);
+    return base + L"_track" + std::to_wstring(track) + L".wav";
+}
+
+// Sum float32-stereo WAVs written by WaveWriter (fixed 80-byte header) into
+// `out`. Stems differ in length by their release tails; short ones are padded.
+bool MergeStems(const std::vector<std::wstring>& paths, const std::wstring& out,
+                uint32_t rate) {
+    using svms::WaveWriter;
+#if defined(_WIN32)
+    _setmaxstdio(8192);
+#endif
+    constexpr uint64_t kHeader = 80;
+    std::vector<FILE*> files;
+    uint64_t frames = 0;
+    bool ok = true;
+    for (const auto& p : paths) {
+        FILE* f = OpenPath(p, "rb");
+        uint64_t size = 0;
+        if (!f || !SeekEnd(f, size) || size < kHeader || !SeekTo(f, kHeader)) {
+            if (f) std::fclose(f);
+            ok = false; break;
+        }
+        files.push_back(f);
+        frames = (std::max)(frames, (size - kHeader) / 8u);
+    }
+    WaveWriter wave;
+    if (ok) ok = wave.Open(out.c_str(), rate, 0);
+    const uint32_t kBlock = 16384;
+    std::vector<float> in(size_t(kBlock) * 2), left(kBlock), right(kBlock);
+    for (uint64_t done = 0; ok && done < frames; done += kBlock) {
+        const uint32_t n = static_cast<uint32_t>((std::min<uint64_t>)(kBlock, frames - done));
+        std::fill(left.begin(), left.begin() + n, 0.0f);
+        std::fill(right.begin(), right.begin() + n, 0.0f);
+        for (FILE* f : files) {
+            const size_t got = std::fread(in.data(), sizeof(float) * 2, n, f);
+            for (size_t i = 0; i < got; ++i) {
+                left[i] += in[i * 2];
+                right[i] += in[i * 2 + 1];
+            }
+        }
+        ok = wave.Write(left.data(), right.data(), n);
+    }
+    for (FILE* f : files) std::fclose(f);
+    return wave.Close() && ok;
+}
+
+// ponytail: every instance loads its own SoundFont copy; share one bundle if RAM bites.
+int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
+    using namespace svms;
+    std::string error;
+    std::vector<uint32_t> tracks;
+    {
+        MappedMidiFile midi;
+        if (!midi.Open(o.midi.c_str(), error) ||
+            !ParallelMidiDecoder::NoteTracks(midi, tracks, error)) {
+            MachineStatus(o, "ERROR", error);
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 1;
+        }
+    }
+    if (tracks.empty()) {
+        MachineStatus(o, "ERROR", "no track contains notes");
+        std::fprintf(stderr, "error: no track contains notes\n");
+        return 1;
+    }
+    const uint32_t threads = o.renderThreads
+        ? o.renderThreads
+        : (std::min)(16u, (std::max)(1u, std::thread::hardware_concurrency()));
+    const uint32_t concurrent = static_cast<uint32_t>(
+        (std::min<size_t>)(threads, tracks.size()));
+    const uint32_t perInstance = (std::max)(1u, threads / concurrent);
+    const bool human = !o.quiet && !o.machineProgress;
+    if (human)
+        std::fprintf(stderr, "Stems: %zu tracks, %u at a time, %u render thread(s) each\n",
+                     tracks.size(), concurrent, perInstance);
+    MachineStatus(o, "RENDERING", "Rendering tracks");
+
+    const auto start = std::chrono::steady_clock::now();
+    std::atomic<size_t> next{0};
+    std::atomic<uint32_t> finished{0};
+    std::atomic<int> failure{0};
+    std::vector<std::thread> pool;
+    for (uint32_t w = 0; w < concurrent; ++w) {
+        pool.emplace_back([&] {
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= tracks.size() || failure.load() != 0) return;
+                Options c = o;
+                c.stems.clear();
+                c.stemTracks = {tracks[i]};
+                c.output = StemPath(o.output, tracks[i]);
+                c.quiet = true;
+                c.machineProgress = false;
+                c.renderThreads = perInstance;
+                c.eventBufferMB = (std::max)(8u, o.eventBufferMB / concurrent);
+                const int r = RenderOne(c, cfg);
+                if (r != 0) {
+                    int none = 0;
+                    failure.compare_exchange_strong(none, r);
+                    return;
+                }
+                const uint32_t d = finished.fetch_add(1) + 1;
+                if (human)
+                    std::fprintf(stderr, "track %u done (%u/%zu)\n", tracks[i], d, tracks.size());
+                MachineRenderProgress(
+                    o, double(d) / double(tracks.size()),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                    0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0, false);
+            }
+        });
+    }
+    for (auto& t : pool) t.join();
+
+    std::vector<std::wstring> paths;
+    for (uint32_t t : tracks) paths.push_back(StemPath(o.output, t));
+    int rc = failure.load();
+    if (rc == 0 && o.stems != L"separate") {
+        MachineStatus(o, "RENDERING", "Merging track stems");
+        if (!MergeStems(paths, o.output, o.sampleRate)) {
+            MachineStatus(o, "ERROR", "merging stems failed");
+            std::fprintf(stderr, "error: merging stems failed\n");
+            rc = 1;
+        }
+    }
+    if (rc == 0 && o.stems == L"merge")
+        for (const auto& p : paths) RemovePath(p);
+    if (rc == 0) MachineStatus(o, "COMPLETE", "Render completed successfully");
+    else if (rc == 3) MachineStatus(o, "CANCELLED", "Render cancelled; partial WAVs retained");
+    return rc;
+}
+} // namespace
+
 int RendererMain(int argc, wchar_t** argv) {
     using namespace svms;
 #if defined(_WIN32)
@@ -859,7 +1064,14 @@ int RendererMain(int argc, wchar_t** argv) {
         Usage();
         return 2;
     }
+    if (!o.stems.empty() && !o.scanOnly) return RunStems(o, engineConfig);
+    return RenderOne(o, engineConfig);
+}
 
+// One complete render (decode -> synth -> WAV) of `o`. Stem mode runs several
+// of these side by side, each with its own synth instance.
+static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
+    using namespace svms;
     auto fail = [&](const std::string& message) {
         MachineStatus(o, "ERROR", message);
         std::fprintf(stderr, "error: %s\n", message.c_str());
@@ -967,6 +1179,7 @@ int RendererMain(int argc, wchar_t** argv) {
     ProducerContext context{
         &ring, &midi, o.sampleRate, &cancel, &done, &decoded, &producerError};
     ParallelMidiDecoder parallelDecoder;
+    parallelDecoder.keepNoteTracks = o.stemTracks;
     std::thread producer([&] {
         // `info` is complete once `done` is published (release/acquire).
         parallelDecoder.Decode(midi, o.sampleRate, RingSink, &context, &cancel,

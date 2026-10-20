@@ -88,9 +88,16 @@ public:
 // consumed for progress.
 class ParallelMidiDecoder {
 public:
+    // Stem rendering: when non-empty, note on/off from tracks not listed here
+    // (0-based track chunk index) are dropped. Everything else (tempo, program,
+    // CC, bend, SysEx) is kept so the surviving notes sound as in the full mix.
+    std::vector<uint32_t> keepNoteTracks;
     // Exact output length in frames, without producing events: every track is
     // walked in parallel by a minimal skipper that only sums deltas and picks
     // out tempo changes. Equals the totalFrames Decode() ends with.
+    // 0-based indices of tracks holding at least one note-on (stem rendering).
+    static bool NoteTracks(const MappedMidiFile& file,
+                           std::vector<uint32_t>& out, std::string& error);
     static bool MeasureDuration(const MappedMidiFile& file, uint32_t sampleRate,
                                 uint64_t& totalFrames, std::string& error,
                                 std::atomic<bool>* cancel = nullptr,
