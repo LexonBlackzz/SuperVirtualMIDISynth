@@ -197,6 +197,9 @@ struct EngineConfig {
     // configurations and APIs that only understand one bank.
     std::vector<std::wstring> soundFontPaths;
     std::vector<SoundFontRoute> soundFontRoutes;
+    // Per-MIDI-channel SoundFont assignment: 0 = automatic (stack priority),
+    // N = the Nth stack entry (1-based) answers that channel first.
+    uint8_t soundFontChannels[16];
     std::wstring configPath;
     std::string configWarning;
 

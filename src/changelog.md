@@ -10,6 +10,9 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-21 `feat(v3): multi-SoundFont stack fixes, per-channel assignment, live entry edits` — an SFZ in a stack no longer answers every program (it claims Acoustic Grand and is the last resort otherwise), so a piano SFZ stops turning everything into piano. Channels can be pinned to a stack entry (`synth.soundfont_channels`, 0 = auto). New runtime commands `SetSoundFontEntry` / `SetChannelSoundFont` rebuild the stack reusing every unchanged entry (refcounted bank views). The native API now passes the command text in, so path commands work through it.
+- 2026-10-21 `perf(v3): build the Hilbert pair store only when rotation needs it` — it was the all-core FFT spike on every load (Arachno 4.2 s / 28 CPU-s to 0.07 s, CFaz SFZ 16 s / 212 CPU-s to 1 s). Switching to rotation mode 1/2/4 builds it in the background and the audio thread adopts it at a block boundary.
+
 - 2026-10-21 feat(v3): offline per-track render, `--stems separate|merge|both` (and a "Per-track render" dropdown on the Configurator's Offline page). Every note-bearing track gets its own synth instance, as many at once as render threads, then I either keep the per-track WAVs, sum them into one file, or both.
 
 - 2026-10-21 feat(v3): offline stem render, `--tracks A,B` (and an "Only tracks" box on the Configurator's Offline page). I wanted to mix tracks from one soundfont with another in post, so the decoder now drops note on/off from every other track while keeping tempo/program/CC/bend, and the WAV stays the same length so stems line up.

@@ -283,6 +283,7 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         RLV2_MemBarrier();
         liveMailboxSeq_.store(even + 2u, std::memory_order_release);
         lastPublishedMailboxSeq_ = even + 2u;
+        if (RotationNeedsHilbert()) EnsureHilbertStoreAsync();
         strncpy_s(resultText, kText, "phase rotation mode set", _TRUNCATE);
         return svms::RLResult::Ok;
     }
@@ -471,6 +472,36 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                             : "bend collapse: off",
                   _TRUNCATE);
         return svms::RLResult::Ok;
+    }
+    case RT::SetSoundFontEntry: {
+        std::wstring widePath;
+        const size_t length = strnlen_s(
+            cmd.resultText, svms::kRuntimeLinkCommandTextCapacity);
+        if (length != 0u && length < svms::kRuntimeLinkCommandTextCapacity) {
+            const int wideLength = MultiByteToWideChar(
+                CP_UTF8, MB_ERR_INVALID_CHARS, cmd.resultText,
+                static_cast<int>(length), nullptr, 0);
+            if (wideLength <= 0) {
+                strncpy_s(resultText, kText,
+                          "SoundFont path is not valid UTF-8", _TRUNCATE);
+                return svms::RLResult::InvalidArgument;
+            }
+            widePath.resize(static_cast<size_t>(wideLength));
+            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, cmd.resultText,
+                                static_cast<int>(length), widePath.data(),
+                                wideLength);
+        }
+        std::string text;
+        const bool ok = EditSoundFontEntry(cmd.param, widePath, text);
+        strncpy_s(resultText, kText, text.c_str(), _TRUNCATE);
+        return ok ? svms::RLResult::Ok : svms::RLResult::InvalidArgument;
+    }
+    case RT::SetChannelSoundFont: {
+        std::string text;
+        const bool ok = AssignChannelSoundFont(cmd.param & 0xffu,
+                                               cmd.param >> 8, text);
+        strncpy_s(resultText, kText, text.c_str(), _TRUNCATE);
+        return ok ? svms::RLResult::Ok : svms::RLResult::InvalidArgument;
     }
     case RT::SetMinNoteLength: {
         // param = minimum note length in ms (0 = off).  Read per compiler

@@ -50,6 +50,7 @@
 #include "render/RenderScalar.h"
 #include "synth/SoundFont.h"
 #include "synth/Config.h"
+#include "synth/PresetResolve.h"
 #include "events/MPSCQueue.h"
 #include "events/PSCQueue.h"
 #include "events/NoteOnCollapse.h"
@@ -680,7 +681,8 @@ private:
     SoundFontBundle* BuildSoundFontStackBundle(
         const std::vector<std::wstring>& paths,
         const std::vector<SoundFontRoute>& routes,
-        uint64_t requestId, std::string& error);
+        const uint8_t* channelFont, const SoundFontBundle* reuse,
+        int forceReload, uint64_t requestId, std::string& error);
     void PublishSoundFontBundle(SoundFontBundle* bundle) noexcept;
     void ActivatePendingSoundFontAtBlockBoundary() noexcept;
     void RetireSoundFontBundle(SoundFontBundle* bundle) noexcept;
@@ -696,6 +698,18 @@ private:
 #if !defined(SVMS_XP_COMPAT)
     bool QueueSoundFontLoad(const std::wstring& path, uint64_t& requestId);
     void SoundFontLoaderLoop();
+public:
+    // Live stack edits (runtime-link commands). They change the desired
+    // stack and queue a derived build that reuses every unchanged entry.
+    // entry >= size appends; an empty path removes. Returns false (text set)
+    // on a bad request.
+    bool EditSoundFontEntry(uint32_t entry, const std::wstring& path,
+                            std::string& text);
+    // channel 0..15; font 0 = automatic, N = stack entry N (1-based).
+    bool AssignChannelSoundFont(uint32_t channel, uint32_t font,
+                                std::string& text);
+private:
+    bool QueueSoundFontStack(uint64_t& requestId, int forceReload);
 #endif
     uint32_t ResolveNoteRegions(const SoundFontBundle* bank,
                                 uint8_t soundFontIndex,
@@ -923,6 +937,16 @@ private:
     std::atomic<bool> soundFontLoaderStop_{false};
     std::wstring requestedSoundFontPath_;
     uint64_t requestedSoundFontId_ = 0u;
+    // Desired stack (guarded by cs): what the next derived build realizes.
+    std::vector<std::wstring> desiredSoundFontPaths_;
+    uint8_t desiredChannelFont_[kChannelCount]{};
+    // The pending request is either a single path (requestedSoundFontPath_)
+    // or a stack snapshot; forceReload is the entry to rebuild even if its
+    // path is unchanged (-1 none).
+    bool requestedIsStack_ = false;
+    int requestedForceReload_ = -1;
+    std::vector<std::wstring> requestedStackPaths_;
+    uint8_t requestedChannelFont_[kChannelCount]{};
     std::atomic<uint32_t> soundFontLoadState_{0u};
     std::string soundFontLoadError_;
 #endif
@@ -1130,6 +1154,24 @@ private:
 
     CRITICAL_SECTION cs;
     CRITICAL_SECTION soundFontBuildCs_;
+    // Lazy Hilbert store: built only when a rotation mode that reads it is
+    // live (at load, or on demand by a background thread). The audio thread
+    // adopts the finished store at the next block boundary.
+public:
+    void EnsureHilbertStoreAsync();
+    void JoinHilbertBuilder() noexcept;
+    void BuildHilbertForActiveBundle();
+    void AdoptPendingHilbertAtBlockBoundary() noexcept;
+    bool RotationNeedsHilbert() const noexcept {
+        const uint32_t mode = liveMailbox_.phaseRotationMode.load(
+            std::memory_order_relaxed);
+        return mode == 1u || mode == 2u || mode == 4u;
+    }
+    std::atomic<int16_t*> pendingHilbertStore_{nullptr};
+    SoundFontBundle* pendingHilbertFor_ = nullptr;
+    std::atomic<int16_t*> discardedHilbertStore_{nullptr};
+    std::atomic<bool> hilbertBuildBusy_{false};
+    HANDLE hilbertThread_ = nullptr;
 };
 
 #if !defined(SVMS_XP_COMPAT)
@@ -1197,6 +1239,14 @@ struct SoundFontBundle {
     uint32_t bankCount = 0u;
     SoundFontRoute routes[kMaxSoundFontRoutes]{};
     uint32_t routeCount = 0u;
+    // Per-channel SoundFont assignment (stack bundles): 0 = automatic,
+    // N = banks[N-1] answers that channel first.
+    uint8_t channelFont[kChannelCount]{};
+    // A bank carried into a derived stack is a "view": it shares the
+    // original's parsed data (pointers owned by `viewOf`, refcounted) but has
+    // its own sampleBase in the new combined store.
+    std::atomic<uint32_t> refs{1u};
+    SoundFontBundle* viewOf = nullptr;
     SoundFontBundle* retiredNext = nullptr;
 };
 
@@ -1224,33 +1274,17 @@ inline bool ResolveChannelPreset(const SoundFontBundle* bundle,
     const uint16_t bank = cache.GetBankMSB(channel);
     const uint8_t program = cache.GetProgram(channel);
     const bool percussion = cache.IsPercussion(channel);
-    for (uint32_t i = 0u; i < bundle->routeCount; ++i) {
-        const SoundFontRoute& route = bundle->routes[i];
-        if (route.targetBank != bank || route.percussion != percussion ||
-            (route.targetPreset >= 0 && route.targetPreset != program))
-            continue;
-        SoundFontBundle* selected = SoundFontBankAt(bundle,
-                                                     route.soundFontIndex);
-        if (!selected || !selected->data) continue;
-        const uint16_t sourcePreset = route.sourcePreset >= 0
-            ? static_cast<uint16_t>(route.sourcePreset) : program;
-        if (sf2_find_preset(selected->data, route.sourceBank, sourcePreset,
-                            outPresetIndex)) {
-            *outSoundFontIndex = static_cast<uint8_t>(route.soundFontIndex);
-            return true;
-        }
-    }
     const uint32_t count = SoundFontBankCount(bundle);
-    for (uint32_t i = 0u; i < count; ++i) {
-        SoundFontBundle* selected = SoundFontBankAt(bundle, i);
-        if (selected && selected->data &&
-            sf2_resolve_preset(selected->data, bank, program, percussion,
-                               outPresetIndex)) {
-            *outSoundFontIndex = static_cast<uint8_t>(i);
-            return true;
-        }
+    const SF2Data* banks[kMaxSoundFontStackEntries]{};
+    for (uint32_t i = 0u; i < count && i < kMaxSoundFontStackEntries; ++i) {
+        const SoundFontBundle* selected = SoundFontBankAt(bundle, i);
+        banks[i] = selected ? selected->data : nullptr;
     }
-    return false;
+    return ResolveStackPreset(banks, count, bundle->routes,
+                              bundle->routeCount,
+                              static_cast<int>(bundle->channelFont[channel]) - 1,
+                              bank, program, percussion, outSoundFontIndex,
+                              outPresetIndex);
 }
 
 } // namespace svms

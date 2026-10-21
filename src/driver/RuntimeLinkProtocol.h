@@ -275,6 +275,11 @@ enum class RLCommandType : uint32_t {
     SetBendCollapse       = 0x00000121,
     SetFastChunkMath      = 0x00000122,
     SetMinNoteLength      = 0x00000123,
+    // param = stack entry index; text = UTF-8 path (empty removes the entry,
+    // index == current count appends). Unchanged entries are reused.
+    SetSoundFontEntry     = 0x00000124,
+    // param = channel | (font << 8); font 0 = automatic, N = stack entry N.
+    SetChannelSoundFont   = 0x00000125,
 
 
     Invalid              = 0xFFFFFFFF,

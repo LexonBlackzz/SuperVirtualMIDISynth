@@ -328,6 +328,9 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"percussion", route.percussion}
         });
     }
+    json soundFontChannels = json::array();
+    for (uint32_t i = 0u; i < 16u; ++i)
+        soundFontChannels.push_back(cfg.soundFontChannels[i]);
     return json{
         {"schema_version", kConfigSchemaVersion},
         {"audio", {
@@ -340,6 +343,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"soundfont", WideToUtf8(cfg.soundFontPath)},
             {"soundfonts", std::move(soundFonts)},
             {"soundfont_routes", std::move(soundFontRoutes)},
+            {"soundfont_channels", std::move(soundFontChannels)},
             {"max_voices", cfg.maxVoices},
             {"voice_memory_budget_mb", cfg.voiceMemoryBudgetMB},
             {"large_pages", cfg.largePages},
@@ -674,6 +678,24 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             cfg.soundFontPaths.push_back(cfg.soundFontPath);
         if (!cfg.soundFontPaths.empty())
             cfg.soundFontPath = cfg.soundFontPaths.front();
+
+        if (auto channels = it->find("soundfont_channels");
+            channels != it->end()) {
+            if (!channels->is_array()) {
+                AppendWarning(cfg.configWarning, "synth.soundfont_channels");
+            } else {
+                for (size_t i = 0; i < 16u && i < channels->size(); ++i) {
+                    const auto& value = (*channels)[i];
+                    if (value.is_number_integer() && value.get<int>() >= 0 &&
+                        value.get<int>() <= static_cast<int>(kMaxSoundFontStackEntries))
+                        cfg.soundFontChannels[i] =
+                            static_cast<uint8_t>(value.get<int>());
+                    else
+                        AppendWarning(cfg.configWarning,
+                                      "synth.soundfont_channels[]");
+                }
+            }
+        }
 
         auto routes = it->find("soundfont_routes");
         if (routes != it->end()) {

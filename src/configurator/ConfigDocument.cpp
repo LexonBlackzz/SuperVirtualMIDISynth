@@ -277,6 +277,16 @@ void ConfigDocument::FromJson(const json& root) {
                 }
             }
         }
+        if (auto channels = it->find("soundfont_channels");
+            channels != it->end() && channels->is_array()) {
+            for (size_t i = 0; i < 16u && i < channels->size(); ++i) {
+                const auto& item = (*channels)[i];
+                if (item.is_number_integer() && item.get<int>() >= 0 &&
+                    item.get<int>() <= 16)
+                    working_.soundFontChannels[i] =
+                        static_cast<uint8_t>(item.get<int>());
+            }
+        }
         ReadNum(*it, "max_voices", working_.maxVoices, 1u, 524288u * 32u);
         ReadNum(*it, "voice_memory_budget_mb", working_.voiceMemoryBudgetMB,
                 0u, 65536u);
@@ -421,6 +431,7 @@ nlohmann::json ConfigDocument::ToJson() const {
         });
     }
     root["synth"]["soundfont_routes"] = std::move(routes);
+    root["synth"]["soundfont_channels"] = working_.soundFontChannels;
     root["synth"]["max_voices"] = working_.maxVoices;
     root["synth"]["voice_memory_budget_mb"] =
         working_.voiceMemoryBudgetMB;
@@ -725,7 +736,8 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.audioBackend == b.audioBackend
         && a.soundFontPath == b.soundFontPath
         && a.soundFontPaths == b.soundFontPaths
-        && a.soundFontRoutes == b.soundFontRoutes;
+        && a.soundFontRoutes == b.soundFontRoutes
+        && a.soundFontChannels == b.soundFontChannels;
 }
 
 bool ConfigDocument::IsDirty() const {

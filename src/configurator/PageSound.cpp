@@ -40,6 +40,10 @@ using C = svms::RLCommandType;
 void SwapSoundFonts(ConfigValues& values, uint32_t a, uint32_t b) {
     if (a >= values.soundFontPaths.size() || b >= values.soundFontPaths.size()) return;
     std::swap(values.soundFontPaths[a], values.soundFontPaths[b]);
+    for (uint8_t& font : values.soundFontChannels) {
+        if (font == a + 1u) font = static_cast<uint8_t>(b + 1u);
+        else if (font == b + 1u) font = static_cast<uint8_t>(a + 1u);
+    }
     for (SoundFontRouteValue& route : values.soundFontRoutes) {
         if (route.soundFontIndex == a) route.soundFontIndex = b;
         else if (route.soundFontIndex == b) route.soundFontIndex = a;
@@ -50,6 +54,10 @@ void SwapSoundFonts(ConfigValues& values, uint32_t a, uint32_t b) {
 void RemoveSoundFont(ConfigValues& values, uint32_t index) {
     if (index >= values.soundFontPaths.size()) return;
     values.soundFontPaths.erase(values.soundFontPaths.begin() + index);
+    for (uint8_t& font : values.soundFontChannels) {
+        if (font == index + 1u) font = 0u;
+        else if (font > index + 1u) --font;
+    }
     for (auto it = values.soundFontRoutes.begin(); it != values.soundFontRoutes.end();) {
         if (it->soundFontIndex == index) {
             it = values.soundFontRoutes.erase(it);
@@ -589,6 +597,43 @@ void RoutesCard(ConfigDocument& doc) {
     ui::EndReveal();
 }
 
+// --- Per-channel SoundFont assignment --------------------------------------------------
+
+void ChannelFontsCard(ConfigDocument& doc) {
+    ConfigValues& w = doc.Working();
+    const float s = ui::Scale();
+    ui::BeginReveal("chfonts");
+    ui::BeginCard("##chfonts");
+    std::vector<std::string> names{"Automatic"};
+    for (size_t i = 0u; i < w.soundFontPaths.size(); ++i)
+        names.push_back(std::to_string(i + 1u) + ". " +
+                        util::WideToUtf8(fs::path(w.soundFontPaths[i]).filename().wstring()));
+    std::vector<const char*> items;
+    for (const std::string& n : names) items.push_back(n.c_str());
+    for (uint32_t ch = 0u; ch < 16u; ++ch) {
+        char anchor[16], title[32];
+        std::snprintf(anchor, sizeof(anchor), "chfont%u", ch);
+        std::snprintf(title, sizeof(title), ch == 9u ? "Channel 10 (drums)" : "Channel %u", ch + 1u);
+        ui::BeginRow(anchor, title,
+                     w.soundFontChannels[ch] == 0u
+                         ? "The first SoundFont in the list that has the instrument plays it."
+                         : "This SoundFont is tried first; the list order covers anything it lacks.",
+                     ImVec2(240.0f * s, 32.0f * s));
+        // A stale index (SoundFont removed elsewhere) reads as Automatic.
+        int sel = w.soundFontChannels[ch] < items.size() ? w.soundFontChannels[ch] : 0;
+        ImGui::PushID(static_cast<int>(ch));
+        if (ui::Select("##chsf", &sel, items.data(), static_cast<int>(items.size()), 240.0f * s) && sel >= 0) {
+            w.soundFontChannels[ch] = static_cast<uint8_t>(sel);
+            doc.MarkDirty();
+            SendLiveCommand(C::SetChannelSoundFont, ch | (static_cast<uint32_t>(sel) << 8));
+        }
+        ImGui::PopID();
+        ui::EndRow();
+    }
+    ui::EndCard();
+    ui::EndReveal();
+}
+
 } // namespace
 
 int HandleDroppedSoundFonts(ConfigDocument& doc) {
@@ -644,6 +689,9 @@ void DrawSoundPage(ConfigDocument& doc) {
 
     if (ui::Disclosure("routes", "Bank and preset routes", "Send a bank/preset to a specific SoundFont"))
         RoutesCard(doc);
+
+    if (ui::Disclosure("chfonts", "Channel SoundFonts", "Pin a MIDI channel to one SoundFont"))
+        ChannelFontsCard(doc);
 }
 
 } // namespace svms::cfg

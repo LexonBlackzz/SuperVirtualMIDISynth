@@ -14,6 +14,7 @@
 #include "events/SysEx.h"
 #include "events/MidiByteStream.h"
 #include "synth/Config.h"
+#include "synth/PresetResolve.h"
 #include "events/FrameClock.h"
 #include "render/PostFilter.h"
 #include "render/ChannelLimiter.h"
@@ -98,6 +99,7 @@ bool NearlyEqual(float a, float b, float epsilon = 1.0e-5f) {
 #include "tests/cases/Basics.inl"
 #include "tests/cases/VoiceLifecycle.inl"
 #include "tests/cases/Scheduler.inl"
+#include "tests/cases/SoundFontStack.inl"
 #include "tests/cases/RenderDifferentials.inl"
 #include "tests/cases/WholeVoice.inl"
 
@@ -146,6 +148,7 @@ int main() {
     TestFastProducerRing();
     TestExclusiveClassLifecycle();
     TestSfzParserAndPlayback();
+    TestSoundFontStackResolution();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);

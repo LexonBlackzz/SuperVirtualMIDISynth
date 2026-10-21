@@ -255,6 +255,13 @@ static SVMS_Result SVMS_CALL NativeSendRuntimeCommand(
     svms::RuntimeLinkCommandV2 cmd{};
     cmd.type = command;
     cmd.param = param;
+    // The text buffer is in/out: commands that take a payload (SoundFont
+    // path, limiter settings) read it from cmd.resultText.
+    if (inout_text_bytes != 0u) {
+        strncpy_s(cmd.resultText, result_text_utf8,
+                  (std::min)(static_cast<size_t>(inout_text_bytes),
+                             sizeof(cmd.resultText) - 1u));
+    }
     char text[svms::kRuntimeLinkCommandTextCapacity]{};
     const svms::RLResult rl = g_driver->ExecuteRuntimeCommand(cmd, text);
     if (inout_text_bytes != 0u) {

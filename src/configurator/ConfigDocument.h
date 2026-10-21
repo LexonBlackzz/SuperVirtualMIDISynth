@@ -1,6 +1,7 @@
 #ifndef SVMS_CONFIGURATOR_CONFIGDOCUMENT_H
 #define SVMS_CONFIGURATOR_CONFIGDOCUMENT_H
 
+#include <array>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -125,6 +126,8 @@ struct ConfigValues {
     std::wstring soundFontPath;
     std::vector<std::wstring> soundFontPaths;
     std::vector<SoundFontRouteValue> soundFontRoutes;
+    // 0 = automatic, N = Nth stack entry answers that channel first.
+    std::array<uint8_t, 16> soundFontChannels{};
 };
 
 struct ConfigValidation {

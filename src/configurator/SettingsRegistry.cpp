@@ -38,6 +38,7 @@ const SettingDef kSettings[] = {
     {"phase", "Voice character (phase rotation)", S, "Sound", "phase rotation coherent hum hilbert analytic sweep diffuse random", nullptr, nullptr, false, D(&V::phaseRotationMode)},
     {"tuning", "Tuning (12 / 31 EDO)", S, "Sound", "edo microtonal 31", nullptr, nullptr, true, D(&V::tuningEdo)},
     {"routes", "Bank and preset routes", S, "Sound \xE2\x80\xBA Routes", "bank preset route mapping", nullptr, "routes", true, D(&V::soundFontRoutes)},
+    {"chfonts", "Channel SoundFonts", S, "Sound \xE2\x80\xBA Channel SoundFonts", "channel soundfont pin assign port instrument piano drums", nullptr, "chfonts", false, D(&V::soundFontChannels)},
     {"revOn", "Reverb", E, "Effects \xE2\x80\xBA Reverb", "reverb room hall space wet", "reverb", nullptr, false, D(&V::enableReverb)},
     {"revMix", "Reverb mix", E, "Effects \xE2\x80\xBA Reverb", "wet dry amount", "reverb", nullptr, false, D(&V::reverbMix)},
     {"revDecay", "Reverb decay", E, "Effects \xE2\x80\xBA Reverb", "rt60 length tail", "reverb", nullptr, false, D(&V::reverbDecay)},

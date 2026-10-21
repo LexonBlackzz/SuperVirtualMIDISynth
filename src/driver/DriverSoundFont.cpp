@@ -5,8 +5,17 @@
 
 namespace svms {
 
+// Bundles are refcounted: a bank reused by a derived stack is a view holding
+// a reference on the original, so the parsed data outlives whichever stack
+// is retired first.
 static void DestroySoundFontBundle(SoundFontBundle* bundle) noexcept {
     if (!bundle) return;
+    if (bundle->refs.fetch_sub(1u, std::memory_order_acq_rel) != 1u) return;
+    if (bundle->viewOf) {
+        DestroySoundFontBundle(bundle->viewOf);
+        delete bundle;
+        return;
+    }
     if (bundle->bankCount != 0u) {
         for (uint32_t i = 0u; i < bundle->bankCount; ++i)
             DestroySoundFontBundle(bundle->banks[i]);
@@ -117,9 +126,17 @@ bool Driver::LoadConfiguredSoundFont() {
         const uint64_t requestId = soundFontRequestId_.fetch_add(
             1u, std::memory_order_acq_rel) + 1u;
         std::string error;
+#if !defined(SVMS_XP_COMPAT)
+        EnterCriticalSection(&cs);
+        desiredSoundFontPaths_ = paths;
+        std::memcpy(desiredChannelFont_, engineConfig_.soundFontChannels,
+                    sizeof(desiredChannelFont_));
+        LeaveCriticalSection(&cs);
+#endif
         EnterCriticalSection(&soundFontBuildCs_);
         SoundFontBundle* bundle = BuildSoundFontStackBundle(
-            paths, engineConfig_.soundFontRoutes, requestId, error);
+            paths, engineConfig_.soundFontRoutes,
+            engineConfig_.soundFontChannels, nullptr, -1, requestId, error);
         LeaveCriticalSection(&soundFontBuildCs_);
         if (bundle) {
             PublishSoundFontBundle(bundle);
@@ -172,15 +189,17 @@ DWORD WINAPI HilbertSliceWorker(LPVOID param) noexcept {
 }
 }  // namespace
 
-static void BuildHilbertPairStore(const SF2Data* sf2, int16_t* hilbert) {
+// `src`/`hilbert` point at this SoundFont's slice of the (possibly stacked)
+// sample store, so spec offsets stay bank-relative.
+static void BuildHilbertPairStore(const SF2Data* sf2, const int16_t* src,
+                                  int16_t* hilbert) {
     const std::vector<svms::HilbertSliceSpec> specs =
         svms::PlanHilbertSlices(*sf2);
     const uint32_t taskCount = static_cast<uint32_t>(specs.size());
     if (taskCount == 0u) return;
 
     std::atomic<uint32_t> next{0u};
-    HilbertSliceJob job{sf2->sampleData, hilbert, specs.data(), &next,
-                        taskCount};
+    HilbertSliceJob job{src, hilbert, specs.data(), &next, taskCount};
 
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
@@ -303,22 +322,25 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
         bundle->sampleDataFrames = frames;
 
         // Exact analytic companion store for per-voice Hilbert rotation.
-        // Build it unconditionally at SoundFont load time so the live
-        // Coherent -> Analytic/Sweep/Random switch can NEVER silently
-        // downgrade to the quadrature-allpass approximation. The load is
-        // off the audio callback and the bundle publishes atomically.
-        int16_t* hbuf = static_cast<int16_t*>(malloc(
-            (static_cast<size_t>(frames) + 8u) * sizeof(int16_t)));
-        if (!hbuf) {
-            error = "not enough memory to build SoundFont Hilbert pair";
-            DestroySoundFontBundle(bundle);
-            return nullptr;
+        // It is the most expensive part of a load (all-core FFTs), so it is
+        // built here only when a rotation mode that reads it is live.
+        // Switching to Analytic/Sweep/Random later builds it in the
+        // background (EnsureHilbertStoreAsync) and the audio thread adopts
+        // it at a block boundary.
+        if (RotationNeedsHilbert()) {
+            int16_t* hbuf = static_cast<int16_t*>(malloc(
+                (static_cast<size_t>(frames) + 8u) * sizeof(int16_t)));
+            if (!hbuf) {
+                error = "not enough memory to build SoundFont Hilbert pair";
+                DestroySoundFontBundle(bundle);
+                return nullptr;
+            }
+            std::memset(hbuf, 0,
+                        (static_cast<size_t>(frames) + 8u) * sizeof(int16_t));
+            BuildHilbertPairStore(sf2, sbuf, hbuf);
+            bundle->hilbertData = hbuf;
+            LOG("  Hilbert pair built: %u frames", frames);
         }
-        std::memset(hbuf, 0,
-                    (static_cast<size_t>(frames) + 8u) * sizeof(int16_t));
-        BuildHilbertPairStore(sf2, hbuf);
-        bundle->hilbertData = hbuf;
-        LOG("  Hilbert pair built: %u frames", frames);
     }
 
     const uint32_t sampCount = sf2->sampleCount;
@@ -350,15 +372,42 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
     return bundle;
 }
 
+static int16_t* BuildHilbertStoreFor(const SoundFontBundle* bundle);
+
+// A bank carried into a derived stack: shares the original's parsed data
+// (refcounted through `viewOf`) but takes its own sampleBase.
+static SoundFontBundle* MakeBankView(SoundFontBundle* source) {
+    SoundFontBundle* root = source->viewOf ? source->viewOf : source;
+    SoundFontBundle* view = new (std::nothrow) SoundFontBundle();
+    if (!view) return nullptr;
+    root->refs.fetch_add(1u, std::memory_order_relaxed);
+    view->viewOf = root;
+    view->data = source->data;
+    view->samples = source->samples;
+    view->regionInitialPeaks = source->regionInitialPeaks;
+    view->preparedRegions = source->preparedRegions;
+    view->sampleCount = source->sampleCount;
+    view->sampleDataFrames = source->sampleDataFrames;
+    view->regionInitialPeakCount = source->regionInitialPeakCount;
+    view->preparedRegionCount = source->preparedRegionCount;
+    view->requestId = source->requestId;
+    view->path = source->path;
+    return view;
+}
+
 SoundFontBundle* Driver::BuildSoundFontStackBundle(
     const std::vector<std::wstring>& paths,
     const std::vector<SoundFontRoute>& routes,
+    const uint8_t* channelFont, const SoundFontBundle* reuse, int forceReload,
     uint64_t requestId, std::string& error) {
     if (paths.empty()) {
         error = "no SoundFont path supplied";
         return nullptr;
     }
-    if (paths.size() == 1u && routes.empty())
+    bool anyChannelFont = false;
+    for (uint32_t c = 0u; channelFont && c < kChannelCount; ++c)
+        anyChannelFont = anyChannelFont || channelFont[c] != 0u;
+    if (paths.size() == 1u && routes.empty() && !anyChannelFont)
         return BuildSoundFontBundle(paths.front().c_str(), requestId, error);
 
     SoundFontBundle* stack = new (std::nothrow) SoundFontBundle();
@@ -369,18 +418,49 @@ SoundFontBundle* Driver::BuildSoundFontStackBundle(
     stack->requestId = requestId;
     stack->path = paths.front();
     uint64_t totalFrames = 0u;
+    bool allHilbert = true;
     const uint32_t requestedCount = static_cast<uint32_t>((std::min)(
         paths.size(), static_cast<size_t>(kMaxSoundFontStackEntries)));
     for (uint32_t i = 0u; i < requestedCount; ++i) {
-        std::string bankError;
-        SoundFontBundle* bank = BuildSoundFontBundle(
-            paths[i].c_str(), requestId, bankError);
+        // Entries already in the running stack are reused (no parse, no
+        // region preparation); only new or force-reloaded paths are built.
+        SoundFontBundle* reusable = nullptr;
+        for (uint32_t j = 0u; reuse && j < SoundFontBankCount(reuse) &&
+                              !reusable && static_cast<int>(i) != forceReload;
+             ++j) {
+            SoundFontBundle* old = SoundFontBankAt(reuse, j);
+            if (old && old->data && _wcsicmp(old->path.c_str(),
+                                             paths[i].c_str()) == 0)
+                reusable = old;
+        }
+        const int16_t* srcSamples = nullptr;
+        const int16_t* srcHilbert = nullptr;
+        SoundFontBundle* bank = nullptr;
+        if (reusable) {
+            bank = MakeBankView(reusable);
+            if (bank) {
+                srcSamples = reuse->sampleData + reusable->sampleBase;
+                srcHilbert = reuse->hilbertData
+                    ? reuse->hilbertData + reusable->sampleBase : nullptr;
+            }
+        } else {
+            std::string bankError;
+            bank = BuildSoundFontBundle(paths[i].c_str(), requestId, bankError);
+            if (!bank) {
+                error = "SoundFont " + std::to_string(i + 1u) + " failed: " +
+                        (bankError.empty() ? "load failed" : bankError);
+                DestroySoundFontBundle(stack);
+                return nullptr;
+            }
+            srcSamples = bank->sampleData;
+            srcHilbert = bank->hilbertData;
+        }
         if (!bank) {
-            error = "SoundFont " + std::to_string(i + 1u) + " failed: " +
-                    (bankError.empty() ? "load failed" : bankError);
+            error = "not enough memory to create SoundFont stack entry";
             DestroySoundFontBundle(stack);
             return nullptr;
         }
+        if (!srcHilbert) allHilbert = false;
         if (totalFrames + bank->sampleDataFrames > UINT32_MAX) {
             error = "combined SoundFont sample data exceeds 32-bit offsets";
             DestroySoundFontBundle(bank);
@@ -399,12 +479,14 @@ SoundFontBundle* Driver::BuildSoundFontStackBundle(
             return nullptr;
         }
         stack->sampleData = grown;
-        std::memcpy(stack->sampleData + bank->sampleBase, bank->sampleData,
+        std::memcpy(stack->sampleData + bank->sampleBase, srcSamples,
                     static_cast<size_t>(bank->sampleDataFrames) * sizeof(int16_t));
         std::memset(stack->sampleData + nextFrames, 0, 8u * sizeof(int16_t));
-        free(bank->sampleData);
-        bank->sampleData = nullptr;
-        if (bank->hilbertData) {
+        if (!reusable) {
+            free(bank->sampleData);
+            bank->sampleData = nullptr;
+        }
+        if (srcHilbert) {
             int16_t* grownH = static_cast<int16_t*>(realloc(
                 stack->hilbertData,
                 (static_cast<size_t>(nextFrames) + 8u) * sizeof(int16_t)));
@@ -415,24 +497,37 @@ SoundFontBundle* Driver::BuildSoundFontStackBundle(
                 return nullptr;
             }
             stack->hilbertData = grownH;
-            std::memcpy(stack->hilbertData + bank->sampleBase,
-                        bank->hilbertData,
+            std::memcpy(stack->hilbertData + bank->sampleBase, srcHilbert,
                         static_cast<size_t>(bank->sampleDataFrames) *
                             sizeof(int16_t));
             std::memset(stack->hilbertData + nextFrames, 0,
                         8u * sizeof(int16_t));
-            free(bank->hilbertData);
-            bank->hilbertData = nullptr;
+            if (!reusable) {
+                free(bank->hilbertData);
+                bank->hilbertData = nullptr;
+            }
         }
         totalFrames = nextFrames;
         stack->sampleDataFrames = static_cast<uint32_t>(totalFrames);
         stack->banks[stack->bankCount++] = bank;
+    }
+    // A companion store with a hole would attenuate that bank's rotated
+    // voices (x*cos with no x-hat term): keep it all-or-nothing and let the
+    // on-demand builder fill it in.
+    if (!allHilbert) {
+        free(stack->hilbertData);
+        stack->hilbertData = nullptr;
+        if (RotationNeedsHilbert())
+            stack->hilbertData = BuildHilbertStoreFor(stack);
     }
     for (const SoundFontRoute& route : routes) {
         if (stack->routeCount >= kMaxSoundFontRoutes) break;
         if (route.soundFontIndex >= stack->bankCount) continue;
         stack->routes[stack->routeCount++] = route;
     }
+    for (uint32_t c = 0u; channelFont && c < kChannelCount; ++c)
+        stack->channelFont[c] = channelFont[c] <= stack->bankCount
+            ? channelFont[c] : 0u;
     LOG("  SoundFont stack ready: %u banks, %u routes, %u frames",
         stack->bankCount, stack->routeCount, stack->sampleDataFrames);
     return stack;
@@ -448,7 +543,99 @@ void Driver::RetireSoundFontBundle(SoundFontBundle* bundle) noexcept {
         head, bundle, std::memory_order_release, std::memory_order_relaxed));
 }
 
+// ── Lazy Hilbert store ──────────────────────────────────────────────────
+// Builds the companion for the ACTIVE bundle on a background thread. Holding
+// soundFontBuildCs_ keeps loads and bundle reclamation (which takes the same
+// lock) from freeing the bundle mid-build.
+// Companion store (malloc'd, 8-element padded) for a plain or stack bundle.
+static int16_t* BuildHilbertStoreFor(const SoundFontBundle* bundle) {
+    const size_t padded = static_cast<size_t>(bundle->sampleDataFrames) + 8u;
+    int16_t* hbuf = static_cast<int16_t*>(malloc(padded * sizeof(int16_t)));
+    if (!hbuf) return nullptr;
+    std::memset(hbuf, 0, padded * sizeof(int16_t));
+    if (bundle->bankCount == 0u) {
+        BuildHilbertPairStore(bundle->data, bundle->sampleData, hbuf);
+    } else {
+        for (uint32_t i = 0u; i < bundle->bankCount; ++i) {
+            const SoundFontBundle* bank = bundle->banks[i];
+            if (!bank || !bank->data) continue;
+            BuildHilbertPairStore(bank->data,
+                                  bundle->sampleData + bank->sampleBase,
+                                  hbuf + bank->sampleBase);
+        }
+    }
+    return hbuf;
+}
+
+void Driver::BuildHilbertForActiveBundle() {
+    EnterCriticalSection(&soundFontBuildCs_);
+    SoundFontBundle* bundle = activeSoundFontBundle_.load(
+        std::memory_order_acquire);
+    if (bundle && !bundle->hilbertData && bundle->sampleData &&
+        bundle->sampleDataFrames != 0u) {
+        int16_t* hbuf = BuildHilbertStoreFor(bundle);
+        if (hbuf) {
+            free(discardedHilbertStore_.exchange(nullptr,
+                                                 std::memory_order_acq_rel));
+            free(pendingHilbertStore_.exchange(nullptr,
+                                               std::memory_order_acq_rel));
+            pendingHilbertFor_ = bundle;
+            pendingHilbertStore_.store(hbuf, std::memory_order_release);
+            LOG("  Hilbert pair built on demand: %u frames",
+                bundle->sampleDataFrames);
+        }
+    }
+    LeaveCriticalSection(&soundFontBuildCs_);
+}
+
+static DWORD WINAPI HilbertBuilderThread(LPVOID param) noexcept {
+    Driver* driver = static_cast<Driver*>(param);
+    driver->BuildHilbertForActiveBundle();
+    return 0u;
+}
+
+void Driver::JoinHilbertBuilder() noexcept {
+    if (!hilbertThread_) return;
+    WaitForSingleObject(hilbertThread_, INFINITE);
+    CloseHandle(hilbertThread_);
+    hilbertThread_ = nullptr;
+    hilbertBuildBusy_.store(false, std::memory_order_release);
+}
+
+// Control-thread call after a rotation mode that needs the store goes live.
+void Driver::EnsureHilbertStoreAsync() {
+    SoundFontBundle* bundle = activeSoundFontBundle_.load(
+        std::memory_order_acquire);
+    if (bundle && bundle->hilbertData) return;
+    if (hilbertThread_ && WaitForSingleObject(hilbertThread_, 0) ==
+            WAIT_OBJECT_0) {
+        CloseHandle(hilbertThread_);
+        hilbertThread_ = nullptr;
+    }
+    if (hilbertThread_) return;  // a build is already running
+    hilbertThread_ = CreateThread(nullptr, 0, HilbertBuilderThread, this, 0,
+                                  nullptr);
+}
+
+void Driver::AdoptPendingHilbertAtBlockBoundary() noexcept {
+    int16_t* store = pendingHilbertStore_.exchange(
+        nullptr, std::memory_order_acquire);
+    if (!store) return;
+    SoundFontBundle* bundle = activeSoundFontBundle_.load(
+        std::memory_order_acquire);
+    if (bundle != pendingHilbertFor_ || bundle->hilbertData) {
+        // The bank changed (or already has one) while this was building.
+        // Park it for the builder to free; no free() on the audio thread.
+        discardedHilbertStore_.store(store, std::memory_order_release);
+        return;
+    }
+    bundle->hilbertData = store;
+    hilbertDataStore = store;
+    for (Driver* shard : shards_) shard->hilbertDataStore = store;
+}
+
 void Driver::ReclaimRetiredSoundFonts() noexcept {
+    EnterCriticalSection(&soundFontBuildCs_);
     SoundFontBundle* bundle = retiredSoundFontBundles_.exchange(
         nullptr, std::memory_order_acquire);
     while (bundle) {
@@ -456,6 +643,7 @@ void Driver::ReclaimRetiredSoundFonts() noexcept {
         DestroySoundFontBundle(bundle);
         bundle = next;
     }
+    LeaveCriticalSection(&soundFontBuildCs_);
 }
 
 std::wstring Driver::CopyActiveSoundFontPath() const {
@@ -473,6 +661,7 @@ void Driver::PublishSoundFontBundle(SoundFontBundle* bundle) noexcept {
 }
 
 void Driver::ActivatePendingSoundFontAtBlockBoundary() noexcept {
+    AdoptPendingHilbertAtBlockBoundary();
     SoundFontBundle* next = pendingSoundFontBundle_.exchange(
         nullptr, std::memory_order_acquire);
     if (!next) return;
@@ -546,6 +735,9 @@ void Driver::ApplySoundFontStack(SoundFontBundle* next) noexcept {
 }
 
 void Driver::DestroyAllSoundFontBundles() noexcept {
+    JoinHilbertBuilder();
+    free(pendingHilbertStore_.exchange(nullptr));
+    free(discardedHilbertStore_.exchange(nullptr));
     DestroySoundFontBundle(pendingSoundFontBundle_.exchange(
         nullptr, std::memory_order_acq_rel));
     DestroySoundFontBundle(activeSoundFontBundle_.exchange(
@@ -572,6 +764,9 @@ bool Driver::LoadSoundFont(const wchar_t* path) {
     LeaveCriticalSection(&soundFontBuildCs_);
     if (!bundle) return false;
 #if !defined(SVMS_XP_COMPAT)
+    EnterCriticalSection(&cs);
+    desiredSoundFontPaths_.assign(1u, path);
+    LeaveCriticalSection(&cs);
     soundFontLoadState_.store(2u, std::memory_order_release);
 #endif
     PublishSoundFontBundle(bundle);
@@ -595,11 +790,96 @@ bool Driver::QueueSoundFontLoad(const std::wstring& path,
         1u, std::memory_order_acq_rel) + 1u;
     EnterCriticalSection(&cs);
     requestedSoundFontPath_ = path;
+    requestedIsStack_ = false;
+    requestedSoundFontId_ = requestId;
+    desiredSoundFontPaths_.assign(1u, path);
+    soundFontLoadError_.clear();
+    soundFontLoadState_.store(1u, std::memory_order_release);
+    LeaveCriticalSection(&cs);
+    SetEvent(soundFontLoadEvent_);
+    return true;
+}
+
+bool Driver::QueueSoundFontStack(uint64_t& requestId, int forceReload) {
+    requestId = 0u;
+    if (!soundFontLoadEvent_ ||
+        soundFontLoaderStop_.load(std::memory_order_acquire)) return false;
+    requestId = soundFontRequestId_.fetch_add(
+        1u, std::memory_order_acq_rel) + 1u;
+    EnterCriticalSection(&cs);
+    requestedIsStack_ = true;
+    requestedForceReload_ = forceReload;
+    requestedStackPaths_ = desiredSoundFontPaths_;
+    std::memcpy(requestedChannelFont_, desiredChannelFont_,
+                sizeof(requestedChannelFont_));
     requestedSoundFontId_ = requestId;
     soundFontLoadError_.clear();
     soundFontLoadState_.store(1u, std::memory_order_release);
     LeaveCriticalSection(&cs);
     SetEvent(soundFontLoadEvent_);
+    return true;
+}
+
+bool Driver::EditSoundFontEntry(uint32_t entry, const std::wstring& path,
+                                std::string& text) {
+    uint64_t requestId = 0u;
+    EnterCriticalSection(&cs);
+    const uint32_t count = static_cast<uint32_t>(
+        desiredSoundFontPaths_.size());
+    bool ok = true;
+    if (entry > count || entry >= kMaxSoundFontStackEntries) {
+        text = "SoundFont entry index out of range";
+        ok = false;
+    } else if (path.empty()) {
+        if (entry >= count || count == 1u) {
+            text = entry >= count ? "no such SoundFont entry"
+                                  : "cannot remove the only SoundFont";
+            ok = false;
+        } else {
+            desiredSoundFontPaths_.erase(desiredSoundFontPaths_.begin() + entry);
+            // Assignments to the removed entry go back to automatic; later
+            // entries shift down by one.
+            for (uint32_t c = 0u; c < kChannelCount; ++c) {
+                if (desiredChannelFont_[c] == entry + 1u) desiredChannelFont_[c] = 0u;
+                else if (desiredChannelFont_[c] > entry + 1u) --desiredChannelFont_[c];
+            }
+        }
+    } else if (entry == count) {
+        desiredSoundFontPaths_.push_back(path);
+    } else {
+        desiredSoundFontPaths_[entry] = path;
+    }
+    LeaveCriticalSection(&cs);
+    if (!ok) return false;
+    // A replace always rebuilds that entry, even for an unchanged path
+    // (re-read a file edited on disk).
+    const int force = (!path.empty() && entry < count)
+        ? static_cast<int>(entry) : -1;
+    if (!QueueSoundFontStack(requestId, force)) {
+        text = "SoundFont loader is unavailable";
+        return false;
+    }
+    text = "loading request " + std::to_string(requestId);
+    return true;
+}
+
+bool Driver::AssignChannelSoundFont(uint32_t channel, uint32_t font,
+                                    std::string& text) {
+    uint64_t requestId = 0u;
+    EnterCriticalSection(&cs);
+    bool ok = channel < kChannelCount &&
+              font <= desiredSoundFontPaths_.size();
+    if (ok) desiredChannelFont_[channel] = static_cast<uint8_t>(font);
+    LeaveCriticalSection(&cs);
+    if (!ok) {
+        text = "channel or SoundFont entry out of range";
+        return false;
+    }
+    if (!QueueSoundFontStack(requestId, -1)) {
+        text = "SoundFont loader is unavailable";
+        return false;
+    }
+    text = "loading request " + std::to_string(requestId);
     return true;
 }
 
@@ -612,17 +892,29 @@ void Driver::SoundFontLoaderLoop() {
         for (;;) {
             std::wstring path;
             uint64_t requestId = 0u;
+            bool isStack = false;
+            int forceReload = -1;
+            std::vector<std::wstring> stackPaths;
+            uint8_t channelFont[kChannelCount];
             EnterCriticalSection(&cs);
             requestId = requestedSoundFontId_;
             path = requestedSoundFontPath_;
+            isStack = requestedIsStack_;
+            forceReload = requestedForceReload_;
+            stackPaths = requestedStackPaths_;
+            std::memcpy(channelFont, requestedChannelFont_, sizeof(channelFont));
             LeaveCriticalSection(&cs);
             if (requestId == 0u || requestId == handledId) break;
             handledId = requestId;
 
             std::string error;
             EnterCriticalSection(&soundFontBuildCs_);
-            SoundFontBundle* bundle = BuildSoundFontBundle(
-                path.c_str(), requestId, error);
+            SoundFontBundle* bundle = isStack
+                ? BuildSoundFontStackBundle(
+                      stackPaths, engineConfig_.soundFontRoutes, channelFont,
+                      activeSoundFontBundle_.load(std::memory_order_acquire),
+                      forceReload, requestId, error)
+                : BuildSoundFontBundle(path.c_str(), requestId, error);
             LeaveCriticalSection(&soundFontBuildCs_);
 
             if (soundFontLoaderStop_.load(std::memory_order_acquire)) {
