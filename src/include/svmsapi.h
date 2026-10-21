@@ -422,7 +422,11 @@ typedef struct SVMS_TelemetryV3 {
     float channel_limiter_input_peak[16];   /* pre-limit, linear */
     SVMS_LiveParams live;             /* applied state */
     char soundfont_name[256];         /* UTF-8, active SoundFont path */
-    uint32_t reserved[8];
+    /* Clock tick (QPC on Windows) at which the engine published this frame;
+     * it advances while the engine runs, so a reader can tell a live frame
+     * from a stale one. 8-aligned: it follows the 256-byte name. */
+    uint64_t publish_timestamp;
+    uint32_t reserved[6];
 } SVMS_TelemetryV3;
 
 /* One record per real-time audio callback (SVMS_CAP_CALLBACK_TRACE). The

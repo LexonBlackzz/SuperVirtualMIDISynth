@@ -28,7 +28,7 @@ constexpr NavPage H = NavPage::Home, S = NavPage::Sound, E = NavPage::Effects,
 // Searchable rows are the prototype's IDX table (names, places and keywords
 // verbatim). Rows without a name cover the remaining settings so every
 // ConfigValues field counts toward the save bar and the badges.
-// restart: verified against the RLCommandType::Set* sends in the pages.
+// restart: verified against the SendLiveCommand / PushLive* sends in the pages.
 const SettingDef kSettings[] = {
     // id, name, page, where, keywords, fxPanel, disclosure, restart, differs
     {"sf", "SoundFont", S, "Sound", "sf2 sfz bank instrument soundfont load choose priority stack overview", nullptr, nullptr, false, D(&V::soundFontPath, &V::soundFontPaths)},

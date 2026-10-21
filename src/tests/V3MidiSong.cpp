@@ -864,7 +864,7 @@ DWORD WINAPI HangWatchdog(void*) {
 // when telemetry sampling failed hard (link lost).
 void WaitWithTelemetry(HANDLE timer, LONGLONG targetQpc, LONGLONG qpf,
                        svms::EngineLink* client,
-                       svms::RuntimeLinkTelemetryV2& telemetry,
+                       SVMS_TelemetryV3& telemetry,
                        std::vector<double>* cpuSamples,
                        std::vector<double>* cb95Samples,
                        std::vector<double>* cb99Samples,
@@ -882,24 +882,24 @@ void WaitWithTelemetry(HANDLE timer, LONGLONG targetQpc, LONGLONG qpf,
         const DWORD tick = GetTickCount();
         if (client != nullptr && tick >= *nextSampleTick) {
             *nextSampleTick = tick + 100u;
-            svms::RuntimeLinkTelemetryV2 sampled{};
+            SVMS_TelemetryV3 sampled{};
             if (client->ReadTelemetry(sampled) &&
-                sampled.timestampQpc != 0u) {
+                sampled.publish_timestamp != 0u) {
                 ++(*sampleCount);
-                const double cpu = sampled.cpuLoadPercent;
+                const double cpu = sampled.cpu_load_percent;
                 cpuSamples->push_back(cpu);
-                cb95Samples->push_back(sampled.callbackP95Percent);
-                cb99Samples->push_back(sampled.callbackP99Percent);
+                cb95Samples->push_back(sampled.census.callback_p95_percent);
+                cb99Samples->push_back(sampled.census.callback_p99_percent);
                 *peakActive = (std::max<uint32_t>)(*peakActive,
-                                                    sampled.activeVoices);
+                                                    sampled.census.active_voices);
                 *peakReleasing = (std::max<uint32_t>)(*peakReleasing,
-                                                      sampled.releasingVoices);
+                                                      sampled.releasing_voices);
                 *steals = (std::max)(*steals,
-                                     static_cast<uint64_t>(sampled.voiceSteals));
+                                     static_cast<uint64_t>(sampled.census.voice_steals));
                 *dropped = (std::max)(*dropped,
-                                      static_cast<uint64_t>(sampled.eventsDropped));
+                                      static_cast<uint64_t>(sampled.census.dropped_events));
                 *limiterGrMax = (std::max)(*limiterGrMax,
-                    static_cast<double>(sampled.limiterGainReductionDb));
+                    static_cast<double>(sampled.limiter_gain_reduction_db));
                 telemetry = sampled;
                 if (verbose && tick >= *nextVerboseTick) {
                     std::printf("[live] t=%6.2fs active=%4u rel=%3u "
@@ -907,13 +907,13 @@ void WaitWithTelemetry(HANDLE timer, LONGLONG targetQpc, LONGLONG qpf,
                                 "steals=%u drops=%llu\n",
                                 static_cast<double>(now.QuadPart) /
                                     static_cast<double>(qpf),
-                                sampled.activeVoices,
-                                sampled.releasingVoices, cpu,
-                                sampled.callbackP95Percent,
-                                sampled.callbackP99Percent,
-                                sampled.voiceSteals,
+                                sampled.census.active_voices,
+                                sampled.releasing_voices, cpu,
+                                sampled.census.callback_p95_percent,
+                                sampled.census.callback_p99_percent,
+                                sampled.census.voice_steals,
                                 static_cast<unsigned long long>(
-                                    sampled.eventsDropped));
+                                    sampled.census.dropped_events));
                     std::fflush(stdout);
                     *nextVerboseTick = tick + 1000u;
                 }
@@ -979,14 +979,14 @@ bool RunRealtime(const Options& options, const DecodedSong& song,
     // Live link: mute unless --audible, restore the original master volume
     // at exit.  The mute goes through the production ApplyLiveConfig path.
     svms::EngineLink client;
-    svms::RuntimeLiveStateV2 originalLive{};
+    SVMS_LiveParams originalLive{};  // filled from telemetry (struct_size comes with it)
     bool linked = false;
     if (client.Open(GetCurrentProcessId())) {
-        svms::RuntimeLinkTelemetryV2 t{};
+        SVMS_TelemetryV3 t{};
         const DWORD start = GetTickCount();
         do {
-            if (client.ReadTelemetry(t) && t.timestampQpc != 0u &&
-                t.audioRunning != 0u) {
+            if (client.ReadTelemetry(t) && t.publish_timestamp != 0u &&
+                t.census.audio_running != 0u) {
                 originalLive = t.live;
                 linked = true;
                 break;
@@ -1003,23 +1003,22 @@ bool RunRealtime(const Options& options, const DecodedSong& song,
         return false;
     }
     if (!options.audible) {
-        svms::RuntimeLiveStateV2 muted = originalLive;
-        muted.masterVolume = 0.0f;
-        char text[svms::kRuntimeLinkResultTextCapacity] = {};
-        const svms::RLResult result = client.SendCommand(
-            svms::RLCommandType::ApplyLiveConfig, svms::RLGroupMaster, 0u,
-            muted, 4000, text);
+        SVMS_LiveParams muted = originalLive;
+        muted.master_volume = 0.0f;
+        char text[svms::EngineLink::kResultTextBytes] = {};
+        const SVMS_Result result = client.SetLiveParams(
+            SVMS_LIVE_GROUP_MASTER, muted, 4000u, text);
         const DWORD start = GetTickCount();
         bool echoed = false;
         do {
-            svms::RuntimeLinkTelemetryV2 t{};
-            if (client.ReadTelemetry(t) && t.live.masterVolume < 0.001f) {
+            SVMS_TelemetryV3 t{};
+            if (client.ReadTelemetry(t) && t.live.master_volume < 0.001f) {
                 echoed = true;
                 break;
             }
             Sleep(25);
         } while (static_cast<int>(GetTickCount() - start) < 4000);
-        if (result != svms::RLResult::Ok || !echoed) {
+        if (result != SVMS_RESULT_OK || !echoed) {
             out.skipped = true;
             out.error = "cannot mute the driver (masterVolume=0 not echoed); "
                         "refusing to play aloud";
@@ -1051,7 +1050,7 @@ bool RunRealtime(const Options& options, const DecodedSong& song,
     uint64_t steals = 0u, dropped = 0u, sampleCount = 0u;
     double limiterGrMax = 0.0;
     DWORD nextSampleTick = 0u, nextVerboseTick = 1000u;
-    svms::RuntimeLinkTelemetryV2 last{};
+    SVMS_TelemetryV3 last{};
     uint64_t sent = 0u;
     bool truncated = false;
 
@@ -1092,9 +1091,8 @@ bool RunRealtime(const Options& options, const DecodedSong& song,
     if (timer != nullptr) CloseHandle(timer);
     reset(handle);
     if (!options.audible) {
-        char text[svms::kRuntimeLinkResultTextCapacity] = {};
-        client.SendCommand(svms::RLCommandType::ApplyLiveConfig,
-                           svms::RLGroupMaster, 0u, originalLive, 4000, text);
+        char text[svms::EngineLink::kResultTextBytes] = {};
+        client.SetLiveParams(SVMS_LIVE_GROUP_MASTER, originalLive, 4000u, text);
     }
     close(handle);
     FreeLibrary(module);

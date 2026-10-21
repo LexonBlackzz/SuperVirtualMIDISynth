@@ -122,13 +122,12 @@ void LiveRecordingPage::Start(svms::EngineLink& client) {
         statusError_ = true;
         return;
     }
-    char result[svms::kRuntimeLinkResultTextCapacity]{};
-    const svms::RLResult code = client.SendCommand(
-        svms::RLCommandType::StartLiveRecording, 0u, 0u,
-        svms::RuntimeLiveStateV2{}, 1000u, result, utf8.c_str());
-    status_ = result[0] ? result : svms::RLV2_ResultToString(code);
-    statusError_ = code != svms::RLResult::Ok;
-    if (code == svms::RLResult::Ok) {
+    char result[svms::EngineLink::kResultTextBytes]{};
+    const SVMS_Result code = client.SendCommand(
+        SVMS_COMMAND_START_LIVE_RECORDING, 0u, 1000u, result, utf8.c_str());
+    status_ = result[0] ? result : svms::EngineLink::ResultString(code);
+    statusError_ = code != SVMS_RESULT_OK;
+    if (code == SVMS_RESULT_OK) {
         state_ = 1u;
         framesWritten_ = 0u;
         droppedFrames_ = 0u;
@@ -138,12 +137,11 @@ void LiveRecordingPage::Start(svms::EngineLink& client) {
 }
 
 void LiveRecordingPage::Stop(svms::EngineLink& client) {
-    char result[svms::kRuntimeLinkResultTextCapacity]{};
-    const svms::RLResult code = client.SendCommand(
-        svms::RLCommandType::StopLiveRecording, 0u, 0u,
-        svms::RuntimeLiveStateV2{}, 3000u, result);
-    status_ = result[0] ? result : svms::RLV2_ResultToString(code);
-    statusError_ = code != svms::RLResult::Ok;
+    char result[svms::EngineLink::kResultTextBytes]{};
+    const SVMS_Result code = client.SendCommand(
+        SVMS_COMMAND_STOP_LIVE_RECORDING, 0u, 3000u, result);
+    status_ = result[0] ? result : svms::EngineLink::ResultString(code);
+    statusError_ = code != SVMS_RESULT_OK;
     Query(client, true);
 }
 
@@ -153,10 +151,9 @@ void LiveRecordingPage::Query(svms::EngineLink& client, bool force) {
         if (queryTimer_ < 0.25f) return;
     }
     queryTimer_ = 0.0f;
-    char result[svms::kRuntimeLinkResultTextCapacity]{};
-    if (client.SendCommand(svms::RLCommandType::QueryLiveRecording,
-                           0u, 0u, svms::RuntimeLiveStateV2{}, 100u,
-                           result) != svms::RLResult::Ok) return;
+    char result[svms::EngineLink::kResultTextBytes]{};
+    if (client.SendCommand(SVMS_COMMAND_QUERY_LIVE_RECORDING, 0u, 100u,
+                           result) != SVMS_RESULT_OK) return;
 
     char* cursor = result;
     char* end = nullptr;

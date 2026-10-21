@@ -6,7 +6,6 @@
 #include "configurator/ModernWidgets.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
-#include "driver/RuntimeLinkProtocol.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -154,19 +153,19 @@ std::string SoundFontText(const ConfigValues& w) {
     return WideToUtf8Diag(w.soundFontPath);
 }
 
-float BudgetMs(const svms::RuntimeLinkTelemetryV2& t) {
-    return t.sampleRate > 0u
-        ? 1000.0f * static_cast<float>(t.bufferFrames) /
-          static_cast<float>(t.sampleRate)
+float BudgetMs(const SVMS_TelemetryV3& t) {
+    return t.census.sample_rate > 0u
+        ? 1000.0f * static_cast<float>(t.census.buffer_frames) /
+          static_cast<float>(t.census.sample_rate)
         : 0.0f;
 }
 
-float BudgetPercentMs(const svms::RuntimeLinkTelemetryV2& t, float percent) {
+float BudgetPercentMs(const SVMS_TelemetryV3& t, float percent) {
     return BudgetMs(t) * percent * 0.01f;
 }
 
 std::string BuildClipboardReport(const ConfigValues& w,
-                                 const svms::RuntimeLinkTelemetryV2* t,
+                                 const SVMS_TelemetryV3* t,
                                  bool connected,
                                  const std::string& cpu,
                                  const std::string& gpu,
@@ -188,34 +187,34 @@ std::string BuildClipboardReport(const ConfigValues& w,
 
     if (connected && t) {
         const float budgetMs = BudgetMs(*t);
-        const float renderMs = BudgetPercentMs(*t, t->cpuLoadPercent);
-        const uint32_t logicalCap = t->live.maxVoices != 0u
-            ? t->live.maxVoices : t->maxVoices;
-        out << "Active voices: " << t->activeVoices << " / " << logicalCap << " logical\n";
-        out << "Physical voice pool: " << t->maxVoices << "\n";
-        out << "Releasing voices: " << t->releasingVoices << "\n";
-        out << "Voice steals: " << t->voiceSteals << "\n";
+        const float renderMs = BudgetPercentMs(*t, t->cpu_load_percent);
+        const uint32_t logicalCap = t->live.max_voices != 0u
+            ? t->live.max_voices : t->max_voices;
+        out << "Active voices: " << t->census.active_voices << " / " << logicalCap << " logical\n";
+        out << "Physical voice pool: " << t->max_voices << "\n";
+        out << "Releasing voices: " << t->releasing_voices << "\n";
+        out << "Voice steals: " << t->census.voice_steals << "\n";
         out << "Callback budget: " << budgetMs << " ms\n";
-        out << "Render load: " << t->cpuLoadPercent << "% (~" << renderMs << " ms)\n";
-        out << "Render headroom: " << (std::max)(0.0f, 100.0f - t->cpuLoadPercent) << "%\n";
-        out << "Callback P95: " << t->callbackP95Percent << "% (~"
-            << BudgetPercentMs(*t, t->callbackP95Percent) << " ms)\n";
-        out << "Callback P99: " << t->callbackP99Percent << "% (~"
-            << BudgetPercentMs(*t, t->callbackP99Percent) << " ms)\n";
-        out << "Callback P99.9: " << t->callbackP999Percent << "% (~"
-            << BudgetPercentMs(*t, t->callbackP999Percent) << " ms)\n";
-        out << "Over-budget callbacks: " << t->overBudgetCallbacks << "\n";
-        out << "Max consecutive over-budget: " << t->maxConsecutiveOverBudget << "\n";
+        out << "Render load: " << t->cpu_load_percent << "% (~" << renderMs << " ms)\n";
+        out << "Render headroom: " << (std::max)(0.0f, 100.0f - t->cpu_load_percent) << "%\n";
+        out << "Callback P95: " << t->census.callback_p95_percent << "% (~"
+            << BudgetPercentMs(*t, t->census.callback_p95_percent) << " ms)\n";
+        out << "Callback P99: " << t->census.callback_p99_percent << "% (~"
+            << BudgetPercentMs(*t, t->census.callback_p99_percent) << " ms)\n";
+        out << "Callback P99.9: " << t->census.callback_p999_percent << "% (~"
+            << BudgetPercentMs(*t, t->census.callback_p999_percent) << " ms)\n";
+        out << "Over-budget callbacks: " << t->census.over_budget_callbacks << "\n";
+        out << "Max consecutive over-budget: " << t->census.max_consecutive_over_budget << "\n";
         out << "Events submitted/accepted/dropped/dispatched: "
-            << t->eventsSubmitted << " / " << t->eventsAccepted << " / "
-            << t->eventsDropped << " / " << t->eventsDispatched << "\n";
-        out << "Scheduler / event dispatch: " << t->schedulerPercent
-            << "% / " << t->eventDispatchPercent << "%\n";
+            << t->census.submitted_events << " / " << t->census.accepted_events << " / "
+            << t->census.dropped_events << " / " << t->census.dispatched_events << "\n";
+        out << "Scheduler / event dispatch: " << t->scheduler_percent
+            << "% / " << t->event_dispatch_percent << "%\n";
         out << "Raw / compiled / scheduled events: "
-            << t->rawIngressCount << " / " << t->compiledPagedCount
-            << " / " << t->scheduledBacklogCount << "\n";
-        out << "Audio: " << (t->audioRunning ? "Running" : "Stopped") << "\n";
-        out << "SoundFont loaded: " << (t->soundFontLoaded ? "Yes" : "No") << "\n";
+            << t->raw_ingress_count << " / " << t->compiled_paged_count
+            << " / " << t->scheduled_backlog_count << "\n";
+        out << "Audio: " << (t->census.audio_running ? "Running" : "Stopped") << "\n";
+        out << "SoundFont loaded: " << (t->census.soundfont_loaded ? "Yes" : "No") << "\n";
     }
     return out.str();
 }
@@ -252,10 +251,10 @@ void DrawDiagnosticsPage(ConfigDocument& doc) {
     char load[24], head[24], p99[24], over[24];
     const char* dash = "\xE2\x80\x94";
     if (t) {
-        std::snprintf(load, sizeof(load), "%.0f%%", t->cpuLoadPercent);
-        std::snprintf(head, sizeof(head), "%.0f%%", (std::max)(0.0f, 100.0f - t->cpuLoadPercent));
-        std::snprintf(p99, sizeof(p99), "%.0f%%", t->callbackP99Percent);
-        std::snprintf(over, sizeof(over), "%llu", static_cast<unsigned long long>(t->overBudgetCallbacks));
+        std::snprintf(load, sizeof(load), "%.0f%%", t->cpu_load_percent);
+        std::snprintf(head, sizeof(head), "%.0f%%", (std::max)(0.0f, 100.0f - t->cpu_load_percent));
+        std::snprintf(p99, sizeof(p99), "%.0f%%", t->census.callback_p99_percent);
+        std::snprintf(over, sizeof(over), "%llu", static_cast<unsigned long long>(t->census.over_budget_callbacks));
     } else {
         std::snprintf(load, sizeof(load), "%s", dash);
         std::snprintf(head, sizeof(head), "%s", dash);

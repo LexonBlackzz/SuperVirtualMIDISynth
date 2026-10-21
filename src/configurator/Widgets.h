@@ -2,14 +2,17 @@
 #define SVMS_CONFIGURATOR_WIDGETS_H
 
 #include "imgui.h"
+#include "configurator/LiveParam.h"
 #include <cstdint>
 #include <string>
 #include <functional>
 
+struct SVMS_TelemetryV3;
+
 namespace svms {
 class EngineLink;
-struct RuntimeLinkTelemetryV2;
-enum class RLCommandType : uint32_t;
+
+
 }
 
 namespace svms::cfg {
@@ -20,15 +23,15 @@ struct ConfigValues;
 struct LiveLinkContext {
     ConfiguratorApp* app = nullptr;              // routing target for live changes
     svms::EngineLink* client = nullptr; // direct client access (reserved)
-    const svms::RuntimeLinkTelemetryV2* telemetry = nullptr;
+    const SVMS_TelemetryV3* telemetry = nullptr;
     bool connected = false;
 };
 
 void SetLiveLinkContext(const LiveLinkContext& ctx);
 const LiveLinkContext& GetLiveLinkContext();
 
-void PushLiveFloat(svms::RLCommandType type, float value);
-void PushLiveBool(svms::RLCommandType type, bool value);
+void PushLiveFloat(LiveParam type, float value);
+void PushLiveBool(LiveParam type, bool value);
 void PushLiveMaxVoices(uint32_t value);
 void PushLiveLimiterAlgorithm(uint32_t value);
 // Coalesced per-MIDI-channel limiter update (dedicated wire command).
@@ -38,7 +41,7 @@ void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs);
 void NoteLiveChange();
 // Sends one RuntimeLink command with a plain integer parameter (the live pushes
 // that are not part of the coalesced working state). No-op when offline.
-void SendLiveCommand(svms::RLCommandType type, uint32_t param);
+void SendLiveCommand(uint32_t command, uint32_t param);
 
 // --- Rack-style primitives -------------------------------------------------
 // Panel labels: mono caps as authored.

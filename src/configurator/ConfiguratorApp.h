@@ -11,7 +11,7 @@
 #include "configurator/DriverLink.h"
 #include "configurator/SettingsRegistry.h"
 #include "imgui.h"
-#include "driver/RuntimeLinkProtocol.h"
+#include "configurator/LiveParam.h"
 
 #include <algorithm>
 #include <memory>
@@ -41,8 +41,8 @@ public:
 
     const wchar_t* LastInitError() const { return lastInitError_.c_str(); }
 
-    void SetLiveFloat(svms::RLCommandType type, float value);
-    void SetLiveBool(svms::RLCommandType type, bool value);
+    void SetLiveFloat(LiveParam type, float value);
+    void SetLiveBool(LiveParam type, bool value);
     void SetLiveChannelLimiter(bool enabled, float threshold, float releaseMs);
     void SendPendingChannelLimiter();
     void SetLiveMaxVoices(uint32_t value);
@@ -109,15 +109,15 @@ private:
     bool showMegaFuckerPopup_ = false;
 
     svms::EngineLink rlClient_;
-    svms::RuntimeLinkTelemetryV2 rlTelemetry_{};
+    SVMS_TelemetryV3 rlTelemetry_{};
     bool rlConnected_ = false;
     float rlPollTimer_ = 0.0f;
     static constexpr float kRlPollInterval = 1.0f / 30.0f;
 
-    svms::RuntimeLiveStateV2 workingLive_{};
+    SVMS_LiveParams workingLive_{sizeof(SVMS_LiveParams), SVMS_STRUCT_VERSION_1};
     uint32_t pendingLiveMask_ = 0;
     // Coalesced SetChannelLimiter command (dedicated wire command because
-    // RuntimeLiveStateV2 is ABI-pinned without channel limiter fields).
+    // SVMS_LiveParams has no channel limiter fields).
     bool pendingChannelLimiter_ = false;
     float pendingChannelLimiterValues_[3] = {};
     float rlFlushTimer_ = 0.0f;

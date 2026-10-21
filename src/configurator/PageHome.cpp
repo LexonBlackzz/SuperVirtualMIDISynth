@@ -10,7 +10,6 @@
 #include "configurator/Widgets.h"
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "driver/RuntimeLinkProtocol.h"
 
 #include <algorithm>
 #include <cmath>
@@ -61,7 +60,7 @@ void TileHeader(const char* label, const char* value) {
     ImGui::Dummy(ImVec2(w, h));
 }
 
-void HeroCard(const ConfigValues& w, const svms::RuntimeLinkTelemetryV2* t, ConfiguratorApp* app) {
+void HeroCard(const ConfigValues& w, const SVMS_TelemetryV3* t, ConfiguratorApp* app) {
     const ui::Tokens& k = ui::Tok();
     const float s = ui::Scale();
     const bool on = t != nullptr;
@@ -69,8 +68,8 @@ void HeroCard(const ConfigValues& w, const svms::RuntimeLinkTelemetryV2* t, Conf
     if (on) {
         static const char* synths[] = {"SVMS engine", "SVMS-API DLL", "KDMAPI DLL", "WinMM device", "Auto"};
         const bool asio = w.audioBackend == L"asio";
-        const uint32_t sr = t->sampleRate ? t->sampleRate : w.sampleRate;
-        const float ms = 1000.0f * static_cast<float>(t->bufferFrames ? t->bufferFrames : w.bufferFrames) /
+        const uint32_t sr = t->census.sample_rate ? t->census.sample_rate : w.sampleRate;
+        const float ms = 1000.0f * static_cast<float>(t->census.buffer_frames ? t->census.buffer_frames : w.bufferFrames) /
                          static_cast<float>((std::max)(1u, sr));
         std::snprintf(desc, sizeof(desc), "%s \xC2\xB7 %s \xC2\xB7 %s \xC2\xB7 %g kHz \xC2\xB7 %.1f ms latency",
                       app ? app->ConnectedAppName().c_str() : "App",
@@ -132,7 +131,7 @@ void HeroCard(const ConfigValues& w, const svms::RuntimeLinkTelemetryV2* t, Conf
     ui::EndCard();
 }
 
-void VoicesTile(const svms::RuntimeLinkTelemetryV2* t, uint32_t cap) {
+void VoicesTile(const SVMS_TelemetryV3* t, uint32_t cap) {
     const ui::Tokens& k = ui::Tok();
     const float s = ui::Scale();
     ui::BeginCard("##t_voices");
@@ -143,12 +142,12 @@ void VoicesTile(const svms::RuntimeLinkTelemetryV2* t, uint32_t cap) {
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const float w = ImGui::GetContentRegionAvail().x;
     ui::PushNum(34.0f, true);
-    dl->AddText(ImVec2(p.x, p.y + 10.0f * s), k.text, t ? WithCommas(t->activeVoices).c_str() : "\xE2\x80\x94");
+    dl->AddText(ImVec2(p.x, p.y + 10.0f * s), k.text, t ? WithCommas(t->census.active_voices).c_str() : "\xE2\x80\x94");
     ui::PopFont();
     const float bh = 10.0f * s;
     const float by = p.y + (kTileContent - 19.0f) * s - bh;
     dl->AddRectFilled(ImVec2(p.x, by), ImVec2(p.x + w, by + bh), k.card2, bh * 0.5f);
-    const float f = t ? ImClamp(static_cast<float>(t->activeVoices) / static_cast<float>((std::max)(1u, cap)), 0.0f, 1.0f) : 0.0f;
+    const float f = t ? ImClamp(static_cast<float>(t->census.active_voices) / static_cast<float>((std::max)(1u, cap)), 0.0f, 1.0f) : 0.0f;
     const float shown = AnimEase(ImGui::GetID("##vf"), f, 0.15f);
     if (shown > 0.001f) dl->AddRectFilled(ImVec2(p.x, by), ImVec2(p.x + (std::max)(bh, w * shown), by + bh), k.acc, bh * 0.5f);
     ImGui::Dummy(ImVec2(w, (kTileContent - 19.0f) * s));
@@ -281,11 +280,11 @@ void DrawCampfire(const ImVec2& c, float s, bool burning, bool still) {
     }
 }
 
-void LoadTile(const svms::RuntimeLinkTelemetryV2* t, const ConfigValues& cfg) {
+void LoadTile(const SVMS_TelemetryV3* t, const ConfigValues& cfg) {
     const ui::Tokens& k = ui::Tok();
     const float s = ui::Scale();
     // Warm tile glow while it burns, faded in and out over ~1.4 s.
-    const bool burning = GetThemeSettings().fire && t && t->cpuLoadPercent >= 500.0f;
+    const bool burning = GetThemeSettings().fire && t && t->cpu_load_percent >= 500.0f;
     static ImVec2 cardMin, cardMax;
     const float heat = AnimEase(ImGui::GetID("##heat"), burning ? 1.0f : 0.0f, 1.4f);
     if (heat > 0.01f && !k.rack && cardMax.x > cardMin.x) {
@@ -299,8 +298,8 @@ void LoadTile(const svms::RuntimeLinkTelemetryV2* t, const ConfigValues& cfg) {
     ui::BeginCard("##t_load");
     cardMin = ImGui::GetWindowPos();
     cardMax = ImVec2(cardMin.x + ImGui::GetWindowSize().x, cardMin.y + ImGui::GetWindowSize().y);
-    const uint32_t sr = t && t->sampleRate ? t->sampleRate : cfg.sampleRate;
-    const uint32_t frames = t && t->bufferFrames ? t->bufferFrames : cfg.bufferFrames;
+    const uint32_t sr = t && t->census.sample_rate ? t->census.sample_rate : cfg.sampleRate;
+    const uint32_t frames = t && t->census.buffer_frames ? t->census.buffer_frames : cfg.bufferFrames;
     char budget[48];
     std::snprintf(budget, sizeof(budget), "%.1f ms per block", 1000.0f * frames / static_cast<float>((std::max)(1u, sr)));
     TileHeader("Render load", budget);
@@ -310,7 +309,7 @@ void LoadTile(const svms::RuntimeLinkTelemetryV2* t, const ConfigValues& cfg) {
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + 10.0f * s));
     const ImVec2 q = ImGui::GetCursorScreenPos();
 
-    const float load = AnimEase(ImGui::GetID("##load"), t ? (std::max)(0.0f, t->cpuLoadPercent) : 0.0f, 0.3f);
+    const float load = AnimEase(ImGui::GetID("##load"), t ? (std::max)(0.0f, t->cpu_load_percent) : 0.0f, 0.3f);
     const bool over = load >= 500.0f;
     const int lap = static_cast<int>((std::min)(load, 499.99f) / 100.0f);
     const float frac = over ? 1.0f : (load - lap * 100.0f) / 100.0f;
@@ -368,13 +367,13 @@ void Follow(float& v, float target, float dt) {
     v += (target - v) * (1.0f - std::exp(-(target > v ? 30.0f : 6.0f) * dt));
 }
 
-void OutputTile(const svms::RuntimeLinkTelemetryV2* t) {
+void OutputTile(const SVMS_TelemetryV3* t) {
     const ui::Tokens& k = ui::Tok();
     const float s = ui::Scale();
     static Peak ch[2];
     const float dt = ImGui::GetIO().DeltaTime;
     const double now = ImGui::GetTime();
-    const float target[2] = {t ? t->limiterOutputPeakL : 0.0f, t ? t->limiterOutputPeakR : 0.0f};
+    const float target[2] = {t ? t->limiter_output_peak_l : 0.0f, t ? t->limiter_output_peak_r : 0.0f};
     for (int i = 0; i < 2; ++i) {
         Follow(ch[i].level, target[i], dt);
         if (ch[i].level >= ch[i].hold) {
@@ -496,12 +495,12 @@ void ProfileCard(ConfigDocument& doc) {
 void DrawHomePage(ConfigDocument& doc) {
     ConfigValues& w = doc.Working();
     const LiveLinkContext& lc = GetLiveLinkContext();
-    const svms::RuntimeLinkTelemetryV2* t = lc.telemetry;
+    const SVMS_TelemetryV3* t = lc.telemetry;
     const float s = ui::Scale();
 
     HeroCard(w, t, lc.app);
 
-    const uint32_t cap = t && t->maxVoices ? t->maxVoices : (std::max)(1u, w.maxVoices);
+    const uint32_t cap = t && t->max_voices ? t->max_voices : (std::max)(1u, w.maxVoices);
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.0f * s, 0.0f));
     if (ImGui::BeginTable("##home_tiles", 3, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableNextRow();
@@ -533,7 +532,7 @@ void DrawHomePage(ConfigDocument& doc) {
         if (ui::Toggle("##rev", &v)) {
             w.enableReverb = v;
             doc.MarkDirty();
-            PushLiveBool(svms::RLCommandType::SetReverbEnabled, v);
+            PushLiveBool(LiveParam::SetReverbEnabled, v);
         }
         ui::EndRow();
     }
@@ -544,7 +543,7 @@ void DrawHomePage(ConfigDocument& doc) {
         if (ui::Toggle("##lim", &v)) {
             w.limiterEnabled = v;
             doc.MarkDirty();
-            PushLiveBool(svms::RLCommandType::SetLimiterEnabled, v);
+            PushLiveBool(LiveParam::SetLimiterEnabled, v);
         }
         ui::EndRow();
     }
@@ -557,7 +556,7 @@ void DrawHomePage(ConfigDocument& doc) {
         if (ui::Segmented("##phase", &phase, labels, 5)) {
             w.phaseRotationMode = static_cast<uint32_t>(phase);
             doc.MarkDirty();
-            SendLiveCommand(svms::RLCommandType::SetPhaseRotation, w.phaseRotationMode);
+            SendLiveCommand(SVMS_COMMAND_SET_PHASE_ROTATION, w.phaseRotationMode);
         }
         ui::EndRow();
     }

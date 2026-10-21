@@ -8,7 +8,6 @@
 #include "configurator/Widgets.h"
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "driver/RuntimeLinkProtocol.h"
 
 #include <algorithm>
 #include <cmath>
@@ -70,23 +69,22 @@ void ApplyPerformanceProfile(ConfigDocument& doc, int profile) {
     w.blockTiming = p.omni;
     w.unboundedRender = p.unbounded;
     doc.MarkDirty();
-    using C = svms::RLCommandType;
     if (w.decimation != before.decimation || w.decimationByLevel != before.decimationByLevel)
-        SendLiveCommand(C::SetDecimation, DecimationParam(w));
-    if (w.fastChunkMath != before.fastChunkMath) SendLiveCommand(C::SetFastChunkMath, w.fastChunkMath ? 1u : 0u);
-    if (w.stealReject != before.stealReject) SendLiveCommand(C::SetStealReject, w.stealReject ? 1u : 0u);
+        SendLiveCommand(SVMS_COMMAND_SET_DECIMATION, DecimationParam(w));
+    if (w.fastChunkMath != before.fastChunkMath) SendLiveCommand(SVMS_COMMAND_SET_FAST_CHUNK_MATH, w.fastChunkMath ? 1u : 0u);
+    if (w.stealReject != before.stealReject) SendLiveCommand(SVMS_COMMAND_SET_STEAL_REJECT, w.stealReject ? 1u : 0u);
     if (w.noteOnCollapseThreshold != before.noteOnCollapseThreshold)
-        SendLiveCommand(C::SetNoteOnCollapse, w.noteOnCollapseThreshold);
-    if (w.noteOnReexcite != before.noteOnReexcite) SendLiveCommand(C::SetNoteOnReexcite, w.noteOnReexcite ? 1u : 0u);
-    if (w.ccCollapse != before.ccCollapse) SendLiveCommand(C::SetCcCollapse, w.ccCollapse ? 1u : 0u);
-    if (w.bendCollapse != before.bendCollapse) SendLiveCommand(C::SetBendCollapse, w.bendCollapse ? 1u : 0u);
-    if (w.blockTiming != before.blockTiming) SendLiveCommand(C::SetBlockTiming, w.blockTiming ? 1u : 0u);
-    if (w.unboundedRender != before.unboundedRender) SendLiveCommand(C::SetUnboundedRender, w.unboundedRender ? 1u : 0u);
+        SendLiveCommand(SVMS_COMMAND_SET_NOTE_ON_COLLAPSE, w.noteOnCollapseThreshold);
+    if (w.noteOnReexcite != before.noteOnReexcite) SendLiveCommand(SVMS_COMMAND_SET_NOTE_ON_REEXCITE, w.noteOnReexcite ? 1u : 0u);
+    if (w.ccCollapse != before.ccCollapse) SendLiveCommand(SVMS_COMMAND_SET_CC_COLLAPSE, w.ccCollapse ? 1u : 0u);
+    if (w.bendCollapse != before.bendCollapse) SendLiveCommand(SVMS_COMMAND_SET_BEND_COLLAPSE, w.bendCollapse ? 1u : 0u);
+    if (w.blockTiming != before.blockTiming) SendLiveCommand(SVMS_COMMAND_SET_BLOCK_TIMING, w.blockTiming ? 1u : 0u);
+    if (w.unboundedRender != before.unboundedRender) SendLiveCommand(SVMS_COMMAND_SET_UNBOUNDED_RENDER, w.unboundedRender ? 1u : 0u);
 }
 
 namespace {
 
-using C = svms::RLCommandType;
+
 constexpr float kDotW = 18.0f, kDotH = 5.0f;
 
 std::string WithCommas(uint32_t v) {
@@ -260,7 +258,7 @@ using ui::ChipKind;
 
 // One switch tile whose toggle just flips a bool and pushes a live command.
 bool SwitchTile(ConfigDocument& doc, const char* anchor, const char* title, const char* desc,
-                bool* value, C command, const ChipDef* tags, int tagCount, float delay) {
+                bool* value, uint32_t command, const ChipDef* tags, int tagCount, float delay) {
     bool changed = false;
     const bool on = ui::BeginTile(anchor, title, desc, value, &changed, tags, tagCount, delay);
     if (changed) {
@@ -283,14 +281,14 @@ void Shortcuts(ConfigDocument& doc) {
         const ChipDef tags[] = {{"Saves voices", ChipKind::Cpu}};
         SwitchTile(doc, "noteMerge", "Merge identical notes",
                    "The same key, velocity and exact time on several tracks becomes one voice at the combined volume. Nothing is dropped or moved.",
-                   &w.noteMerge, C::SetNoteMerge, tags, 1, 0.0f);
+                   &w.noteMerge, SVMS_COMMAND_SET_NOTE_MERGE, tags, 1, 0.0f);
         ui::EndTile();
     }
     {
         const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}};
         SwitchTile(doc, "ccCol", "Skip overwritten controller changes",
                    "Drops volume, pan and similar changes that a later one on the same channel replaces within a few milliseconds.",
-                   &w.ccCollapse, C::SetCcCollapse, tags, 1, 0.04f);
+                   &w.ccCollapse, SVMS_COMMAND_SET_CC_COLLAPSE, tags, 1, 0.04f);
         ui::EndTile();
     }
     ui::EndTileGrid();
@@ -306,7 +304,7 @@ void Shortcuts(ConfigDocument& doc) {
                                       &w.decimation, &changed, tags, 2, 0.08f);
         if (changed) {
             doc.MarkDirty();
-            SendLiveCommand(C::SetDecimation, DecimationParam(w));
+            SendLiveCommand(SVMS_COMMAND_SET_DECIMATION, DecimationParam(w));
         }
         if (on) {
             ui::TileNested();
@@ -314,7 +312,7 @@ void Shortcuts(ConfigDocument& doc) {
                                    ImVec2(46.0f * s, 28.0f * s), true);
             if (ui::Toggle("##bylevel", &w.decimationByLevel, 0.12f)) {
                 doc.MarkDirty();
-                SendLiveCommand(C::SetDecimation, DecimationParam(w));
+                SendLiveCommand(SVMS_COMMAND_SET_DECIMATION, DecimationParam(w));
             }
             NestedEnd(n);
             ImGui::Dummy(ImVec2(0.0f, 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
@@ -339,7 +337,7 @@ void Shortcuts(ConfigDocument& doc) {
                     doc.MarkDirty();
                 }
             }
-            if (committed && w.decimation) SendLiveCommand(C::SetDecimation, DecimationParam(w));
+            if (committed && w.decimation) SendLiveCommand(SVMS_COMMAND_SET_DECIMATION, DecimationParam(w));
             char txt[32];
             if (w.decimationCullBlocks) std::snprintf(txt, sizeof(txt), "%u blocks", w.decimationCullBlocks);
             else std::snprintf(txt, sizeof(txt), "Never");
@@ -352,7 +350,7 @@ void Shortcuts(ConfigDocument& doc) {
         const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}, {"Drops quiet notes", ChipKind::Bad}};
         SwitchTile(doc, "stealReject", "Skip notes quieter than everything playing",
                    "When the voice limit is full, a note that would be the first one replaced is not played at all, like BASSMIDI.",
-                   &w.stealReject, C::SetStealReject, tags, 2, 0.16f);
+                   &w.stealReject, SVMS_COMMAND_SET_STEAL_REJECT, tags, 2, 0.16f);
         ui::EndTile();
     }
     {
@@ -363,7 +361,7 @@ void Shortcuts(ConfigDocument& doc) {
         if (changed) {
             w.noteOnCollapseThreshold = on ? 32u : 1u;
             doc.MarkDirty();
-            SendLiveCommand(C::SetNoteOnCollapse, w.noteOnCollapseThreshold);
+            SendLiveCommand(SVMS_COMMAND_SET_NOTE_ON_COLLAPSE, w.noteOnCollapseThreshold);
         }
         if (on) {
             ui::TileNested();
@@ -376,7 +374,7 @@ void Shortcuts(ConfigDocument& doc) {
             if (ui::Segmented("##coalN", &idx, labels, 8, n.ctl.x) && idx >= 0) {
                 w.noteOnCollapseThreshold = values[idx];
                 doc.MarkDirty();
-                SendLiveCommand(C::SetNoteOnCollapse, w.noteOnCollapseThreshold);
+                SendLiveCommand(SVMS_COMMAND_SET_NOTE_ON_COLLAPSE, w.noteOnCollapseThreshold);
             }
             NestedEnd(n);
             n = NestedBegin("Keep the rhythm as swells",
@@ -384,7 +382,7 @@ void Shortcuts(ConfigDocument& doc) {
                             ImVec2(46.0f * s, 28.0f * s), false);
             if (ui::Toggle("##reexcite", &w.noteOnReexcite, 0.24f)) {
                 doc.MarkDirty();
-                SendLiveCommand(C::SetNoteOnReexcite, w.noteOnReexcite ? 1u : 0u);
+                SendLiveCommand(SVMS_COMMAND_SET_NOTE_ON_REEXCITE, w.noteOnReexcite ? 1u : 0u);
             }
             NestedEnd(n);
         }
@@ -404,7 +402,7 @@ void Shortcuts(ConfigDocument& doc) {
         if (nv != w.minNoteMs) {
             w.minNoteMs = nv;
             doc.MarkDirty();
-            SendLiveCommand(C::SetMinNoteLength, nv);
+            SendLiveCommand(SVMS_COMMAND_SET_MIN_NOTE_LENGTH, nv);
         }
         ui::EndTile();
     }
@@ -417,28 +415,28 @@ void Shortcuts(ConfigDocument& doc) {
         const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}, {"Not bit-exact", ChipKind::Bad}};
         SwitchTile(doc, "fastTail", "Fast tail math",
                    "Advances envelopes in 8-frame steps (AVX2). Peaks can differ from the exact path by up to \xE2\x88\x92" "48 dB.",
-                   &w.fastChunkMath, C::SetFastChunkMath, tags, 2, 0.28f);
+                   &w.fastChunkMath, SVMS_COMMAND_SET_FAST_CHUNK_MATH, tags, 2, 0.28f);
         ui::EndTile();
     }
     {
         const ChipDef tags[] = {{"Saves a lot of CPU", ChipKind::Cpu}, {"Bends can land a few ms late", ChipKind::Bad}};
         SwitchTile(doc, "bendCol", "Thin out pitch bends",
                    "Keeps only the latest bend per channel every few milliseconds. Note timing is untouched.",
-                   &w.bendCollapse, C::SetBendCollapse, tags, 2, 0.32f);
+                   &w.bendCollapse, SVMS_COMMAND_SET_BEND_COLLAPSE, tags, 2, 0.32f);
         ui::EndTile();
     }
     {
         const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}, {"Timing snaps to the buffer", ChipKind::Bad}};
         SwitchTile(doc, "omni", "Block timing (OmniMIDI style)",
                    "Every event in an audio block fires at its start. Do not use for live playing.",
-                   &w.blockTiming, C::SetBlockTiming, tags, 2, 0.36f);
+                   &w.blockTiming, SVMS_COMMAND_SET_BLOCK_TIMING, tags, 2, 0.36f);
         ui::EndTile();
     }
     {
         const ChipDef tags[] = {{"Experimental", ChipKind::Exp}};
         SwitchTile(doc, "unbounded", "Never skip ahead",
                    "Under overload the song slows down instead of jumping forward. Glitches are expected.",
-                   &w.unboundedRender, C::SetUnboundedRender, tags, 1, 0.4f);
+                   &w.unboundedRender, SVMS_COMMAND_SET_UNBOUNDED_RENDER, tags, 1, 0.4f);
         ui::EndTile();
     }
     ui::EndTileGrid();
@@ -513,7 +511,7 @@ void CpuCard(ConfigDocument& doc) {
         if (ui::Segmented("##affinity", &idx, labels, 3)) {
             w.threadAffinityMode = static_cast<uint32_t>(idx);
             doc.MarkDirty();
-            SendLiveCommand(C::SetThreadAffinityMode, w.threadAffinityMode);
+            SendLiveCommand(SVMS_COMMAND_SET_THREAD_AFFINITY_MODE, w.threadAffinityMode);
         }
         ui::EndRow();
     }
@@ -545,7 +543,7 @@ void Internals(ConfigDocument& doc) {
         if (ui::Segmented("##steal", &idx, labels, 3)) {
             w.stealPolicy = static_cast<uint32_t>(idx);
             doc.MarkDirty();
-            SendLiveCommand(C::SetStealPolicy, w.stealPolicy);
+            SendLiveCommand(SVMS_COMMAND_SET_STEAL_POLICY, w.stealPolicy);
         }
         ui::EndRow();
     }
@@ -569,7 +567,7 @@ void Internals(ConfigDocument& doc) {
         if (committed) {
             uint32_t bits = 0u;
             std::memcpy(&bits, &w.voiceRetireThreshold, sizeof(bits));
-            SendLiveCommand(C::SetVoiceRetireFloor, bits);
+            SendLiveCommand(SVMS_COMMAND_SET_VOICE_RETIRE_FLOOR, bits);
         }
         ui::Anchor("retire", ImVec2(origin.x + free * 0.5f, y), ImVec2(origin.x + free * 0.5f + kw, y + ui::KnobSize().y));
         bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
@@ -581,7 +579,7 @@ void Internals(ConfigDocument& doc) {
             w.perKeyVoiceCap = static_cast<uint32_t>(cap + 0.5f);
             doc.MarkDirty();
         }
-        if (committed) SendLiveCommand(C::SetPerKeyVoiceCap, w.perKeyVoiceCap);
+        if (committed) SendLiveCommand(SVMS_COMMAND_SET_PER_KEY_VOICE_CAP, w.perKeyVoiceCap);
         ui::Anchor("perKey", ImVec2(origin.x + free * 1.5f + kw, y), ImVec2(origin.x + free * 1.5f + 2.0f * kw, y + ui::KnobSize().y));
         bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
 
@@ -592,7 +590,7 @@ void Internals(ConfigDocument& doc) {
             w.ghostBudget = static_cast<uint32_t>(ghosts + 0.5f);
             doc.MarkDirty();
         }
-        if (committed) SendLiveCommand(C::SetGhostBudget, w.ghostBudget);
+        if (committed) SendLiveCommand(SVMS_COMMAND_SET_GHOST_BUDGET, w.ghostBudget);
         ui::Anchor("ghost", ImVec2(origin.x + free * 2.5f + 2.0f * kw, y), ImVec2(origin.x + free * 2.5f + 3.0f * kw, y + ui::KnobSize().y));
         bottom = (std::max)(bottom, ImGui::GetCursorScreenPos().y);
 

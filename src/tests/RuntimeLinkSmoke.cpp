@@ -32,12 +32,12 @@ typedef MMRESULT (WINAPI* MidiOutResetProc)(HMIDIOUT);
 typedef MMRESULT (WINAPI* MidiOutCloseProc)(HMIDIOUT);
 
 bool WaitForTelemetry(svms::EngineLink& client,
-                      svms::RuntimeLinkTelemetryV2& out,
+                      SVMS_TelemetryV3& out,
                       unsigned int timeoutMs) {
     // A zero timestamp means the host has not published a frame yet.
     const DWORD start = GetTickCount();
     do {
-        if (client.ReadTelemetry(out) && out.timestampQpc != 0u) return true;
+        if (client.ReadTelemetry(out) && out.publish_timestamp != 0u) return true;
         Sleep(25);
     } while (static_cast<int>(GetTickCount() - start) < (int)timeoutMs);
     return false;
@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    svms::RuntimeLinkTelemetryV2 t{};
+    SVMS_TelemetryV3 t{};
     if (!WaitForTelemetry(client, t, 15000)) {
         std::puts("FAIL: no telemetry within 15 s (audio thread never published)");
         reset(handle);
@@ -233,7 +233,7 @@ int main(int argc, char** argv) {
         DeleteFileW(configPath);
         return 1;
     }
-    if (t.timestampQpc == 0u) {
+    if (t.publish_timestamp == 0u) {
         std::puts("FAIL: telemetry timestamp is zero");
         reset(handle);
         close(handle);
@@ -241,7 +241,7 @@ int main(int argc, char** argv) {
         DeleteFileW(configPath);
         return 1;
     }
-    if (t.sampleRate == 0u) {
+    if (t.census.sample_rate == 0u) {
         std::puts("FAIL: telemetry sampleRate is zero");
         reset(handle);
         close(handle);
@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
         DeleteFileW(configPath);
         return 1;
     }
-    if (t.live.masterVolume != 1.0f) {
+    if (t.live.master_volume != 1.0f) {
         std::puts("FAIL: default telemetry masterVolume is not 1.0");
         reset(handle);
         close(handle);
@@ -258,7 +258,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("INFO: telemetry OK (sr=%u frames=%u master=%.2f)\n",
-                t.sampleRate, t.bufferFrames, t.live.masterVolume);
+                t.census.sample_rate, t.census.buffer_frames, t.live.master_volume);
 
     // The link negotiates identity and capabilities; the engine must report
     // this build and everything the configurator relies on.
@@ -283,11 +283,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         svms::EngineLink second;  // a second attach to the same host works
-        svms::RuntimeLinkTelemetryV2 secondTelemetry{};
+        SVMS_TelemetryV3 secondTelemetry{};
         if (!second.Open(ownPid) ||
             !WaitForTelemetry(second, secondTelemetry, 3000u) ||
-            secondTelemetry.sampleRate != t.sampleRate ||
-            second.SendPing(1000u) != svms::RLResult::Ok) {
+            secondTelemetry.census.sample_rate != t.census.sample_rate ||
+            second.SendPing(1000u) != SVMS_RESULT_OK) {
             std::puts("FAIL: a second client could not attach and use the host");
             reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
             return 1;
@@ -302,7 +302,7 @@ int main(int argc, char** argv) {
         const DWORD start = GetTickCount();
         bool dispatched = false;
         do {
-            if (client.ReadTelemetry(t) && t.eventsDispatched > 0u) {
+            if (client.ReadTelemetry(t) && t.census.dispatched_events > 0u) {
                 dispatched = true;
                 break;
             }
@@ -318,13 +318,13 @@ int main(int argc, char** argv) {
         }
     }
     std::printf("INFO: note dispatched (submitted=%llu dispatched=%llu)\n",
-                static_cast<unsigned long long>(t.eventsSubmitted),
-                static_cast<unsigned long long>(t.eventsDispatched));
+                static_cast<unsigned long long>(t.census.submitted_events),
+                static_cast<unsigned long long>(t.census.dispatched_events));
 
     // ── 4. Ping ACK ──────────────────────────────────────────────────
-    char resultText[svms::kRuntimeLinkResultTextCapacity] = {};
-    const svms::RLResult pingResult = client.SendPing(2000, resultText);
-    if (pingResult != svms::RLResult::Ok) {
+    char resultText[svms::EngineLink::kResultTextBytes] = {};
+    const SVMS_Result pingResult = client.SendPing(2000, resultText);
+    if (pingResult != SVMS_RESULT_OK) {
         std::printf("FAIL: Ping returned %d (%s)\n", (int)pingResult, resultText);
         reset(handle);
         close(handle);
@@ -336,15 +336,14 @@ int main(int argc, char** argv) {
     // ── 5. Live ApplyLiveConfig: master 2.0 (past the old 1.0 clamp)
     //       + limiter threshold; verify the telemetry echo ──────────
     {
-        svms::RuntimeLiveStateV2 live{};
-        live.masterVolume = 2.0f;
-        live.limiterEnabled = 1u;
-        live.limiterThreshold = 0.90f;
-        const svms::RLResult r = client.SendCommand(
-            svms::RLCommandType::ApplyLiveConfig,
-            svms::RLGroupMaster | svms::RLGroupLimiter,
-            0u, live, 2000, resultText);
-        if (r != svms::RLResult::Ok) {
+        SVMS_LiveParams live = t.live;  // keep the engine's other limiter timings
+        live.master_volume = 2.0f;
+        live.limiter_enabled = 1u;
+        live.limiter_threshold = 0.90f;
+        const SVMS_Result r = client.SetLiveParams(
+            SVMS_LIVE_GROUP_MASTER | SVMS_LIVE_GROUP_LIMITER, live, 2000u,
+            resultText);
+        if (r != SVMS_RESULT_OK) {
             std::printf("FAIL: ApplyLiveConfig returned %d (%s)\n",
                         (int)r, resultText);
             reset(handle);
@@ -357,9 +356,9 @@ int main(int argc, char** argv) {
         bool echoed = false;
         do {
             if (client.ReadTelemetry(t) &&
-                t.live.masterVolume > 1.999f && t.live.masterVolume < 2.001f &&
-                t.live.limiterThreshold > 0.899f &&
-                t.live.limiterThreshold < 0.901f) {
+                t.live.master_volume > 1.999f && t.live.master_volume < 2.001f &&
+                t.live.limiter_threshold > 0.899f &&
+                t.live.limiter_threshold < 0.901f) {
                 echoed = true;
                 break;
             }
@@ -367,8 +366,8 @@ int main(int argc, char** argv) {
         } while (static_cast<int>(GetTickCount() - start) < 8000);
         if (!echoed) {
             std::printf("FAIL: telemetry never echoed live master=%.3f "
-                        "limit=%.3f\n", t.live.masterVolume,
-                        t.live.limiterThreshold);
+                        "limit=%.3f\n", t.live.master_volume,
+                        t.live.limiter_threshold);
             reset(handle);
             close(handle);
             FreeLibrary(module);
@@ -377,17 +376,15 @@ int main(int argc, char** argv) {
         }
     }
     std::printf("INFO: live params applied and echoed (master=%.2f "
-                "limiter=%.2f)\n", t.live.masterVolume, t.live.limiterThreshold);
+                "limiter=%.2f)\n", t.live.master_volume, t.live.limiter_threshold);
 
     // Reload the currently active bank through the asynchronous bundle path.
     // The command must ACK before parsing completes, audio must remain live,
     // and QuerySoundFontLoad must observe block-boundary activation.
-    if (t.soundFontLoaded != 0u && t.soundFontName[0] != '\0') {
-        const svms::RLResult reloadResult = client.SendCommand(
-            svms::RLCommandType::ReloadSoundFont, 0u, 0u,
-            svms::RuntimeLiveStateV2{}, 2000u, resultText,
-            t.soundFontName);
-        if (reloadResult != svms::RLResult::Ok) {
+    if (t.census.soundfont_loaded != 0u && t.soundfont_name[0] != '\0') {
+        const SVMS_Result reloadResult = client.SendCommand(SVMS_COMMAND_RELOAD_SOUNDFONT, 0u, 2000u, resultText,
+            t.soundfont_name);
+        if (reloadResult != SVMS_RESULT_OK) {
             std::printf("FAIL: ReloadSoundFont returned %d (%s)\n",
                         static_cast<int>(reloadResult), resultText);
             reset(handle); close(handle); FreeLibrary(module);
@@ -401,10 +398,8 @@ int main(int argc, char** argv) {
             unsigned long long requested = 0u;
             unsigned long long active = 0u;
             resultText[0] = '\0';
-            if (client.SendCommand(
-                    svms::RLCommandType::QuerySoundFontLoad, 0u, 0u,
-                    svms::RuntimeLiveStateV2{}, 1000u, resultText) ==
-                    svms::RLResult::Ok &&
+            if (client.SendCommand(SVMS_COMMAND_QUERY_SOUNDFONT_LOAD, 0u, 1000u, resultText) ==
+                    SVMS_RESULT_OK &&
                 std::sscanf(resultText, "%u\t%llu\t%llu", &state,
                             &requested, &active) == 3 &&
                 state == 3u && requested != 0u && active == requested) {
@@ -413,8 +408,8 @@ int main(int argc, char** argv) {
             }
             Sleep(25u);
         } while (static_cast<int>(GetTickCount() - reloadStart) < 15000);
-        if (!activated || !client.ReadTelemetry(t) || t.audioRunning == 0u ||
-            t.soundFontLoaded == 0u) {
+        if (!activated || !client.ReadTelemetry(t) || t.census.audio_running == 0u ||
+            t.census.soundfont_loaded == 0u) {
             std::printf("FAIL: live SoundFont activation did not settle (%s)\n",
                         resultText);
             reset(handle); close(handle); FreeLibrary(module);
@@ -434,11 +429,9 @@ int main(int argc, char** argv) {
                tempDirectory, static_cast<unsigned long>(ownPid));
     const std::string recordingUtf8 = WideToUtf8(recordingPath);
     {
-        const svms::RLResult startResult = client.SendCommand(
-            svms::RLCommandType::StartLiveRecording, 0u, 0u,
-            svms::RuntimeLiveStateV2{}, 2000u, resultText,
+        const SVMS_Result startResult = client.SendCommand(SVMS_COMMAND_START_LIVE_RECORDING, 0u, 2000u, resultText,
             recordingUtf8.c_str());
-        if (startResult != svms::RLResult::Ok) {
+        if (startResult != SVMS_RESULT_OK) {
             std::printf("FAIL: StartLiveRecording returned %d (%s)\n",
                         static_cast<int>(startResult), resultText);
             reset(handle); close(handle); FreeLibrary(module);
@@ -449,10 +442,8 @@ int main(int argc, char** argv) {
         Sleep(150u);
         shortMsg(handle, 0x00003C80u);
         Sleep(75u);
-        const svms::RLResult stopResult = client.SendCommand(
-            svms::RLCommandType::StopLiveRecording, 0u, 0u,
-            svms::RuntimeLiveStateV2{}, 3000u, resultText);
-        if (stopResult != svms::RLResult::Ok) {
+        const SVMS_Result stopResult = client.SendCommand(SVMS_COMMAND_STOP_LIVE_RECORDING, 0u, 3000u, resultText);
+        if (stopResult != SVMS_RESULT_OK) {
             std::printf("FAIL: StopLiveRecording returned %d (%s)\n",
                         static_cast<int>(stopResult), resultText);
             reset(handle); close(handle); FreeLibrary(module);
@@ -464,14 +455,12 @@ int main(int argc, char** argv) {
         unsigned long long recordFrames = 0u;
         unsigned long long recordDrops = 0u;
         uint32_t recordError = 99u;
-        const svms::RLResult queryResult = client.SendCommand(
-            svms::RLCommandType::QueryLiveRecording, 0u, 0u,
-            svms::RuntimeLiveStateV2{}, 2000u, resultText);
-        if (queryResult != svms::RLResult::Ok ||
+        const SVMS_Result queryResult = client.SendCommand(SVMS_COMMAND_QUERY_LIVE_RECORDING, 0u, 2000u, resultText);
+        if (queryResult != SVMS_RESULT_OK ||
             std::sscanf(resultText, "%u\t%u\t%llu\t%llu\t%u",
                         &recordState, &recordRate, &recordFrames,
                         &recordDrops, &recordError) != 5 ||
-            recordState != 0u || recordRate != t.sampleRate ||
+            recordState != 0u || recordRate != t.census.sample_rate ||
             recordFrames == 0u || recordDrops != 0u || recordError != 0u) {
             std::printf("FAIL: recording status malformed (%s)\n", resultText);
             reset(handle); close(handle); FreeLibrary(module);
@@ -495,10 +484,8 @@ int main(int argc, char** argv) {
 
     // ── 6. ResetVoices (routes through the SPSC ingress) ─────────────
     {
-        const svms::RLResult r = client.SendCommand(
-            svms::RLCommandType::ResetVoices, 0u, 0u,
-            svms::RuntimeLiveStateV2{}, 2000, resultText);
-        if (r != svms::RLResult::Ok) {
+        const SVMS_Result r = client.SendCommand(SVMS_COMMAND_RESET_VOICES, 0u, 2000, resultText);
+        if (r != SVMS_RESULT_OK) {
             std::printf("FAIL: ResetVoices returned %d (%s)\n",
                         (int)r, resultText);
             reset(handle);
@@ -511,8 +498,8 @@ int main(int argc, char** argv) {
 
     // ── 7. Post-ACK sanity: commands still work, telemetry flows ────
     {
-        const svms::RLResult r = client.SendPing(2000, resultText);
-        if (r != svms::RLResult::Ok) {
+        const SVMS_Result r = client.SendPing(2000, resultText);
+        if (r != SVMS_RESULT_OK) {
             std::printf("FAIL: Ping after ResetVoices returned %d (%s)\n",
                         (int)r, resultText);
             reset(handle);
@@ -529,11 +516,11 @@ int main(int argc, char** argv) {
             DeleteFileW(configPath);
             return 1;
         }
-        const uint64_t qpcBefore = t.timestampQpc;
+        const uint64_t qpcBefore = t.publish_timestamp;
         bool advanced = false;
         for (int i = 0; i < 40; ++i) {
             Sleep(50);
-            if (client.ReadTelemetry(t) && t.timestampQpc != qpcBefore) {
+            if (client.ReadTelemetry(t) && t.publish_timestamp != qpcBefore) {
                 advanced = true;
                 break;
             }

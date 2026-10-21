@@ -7,7 +7,6 @@
 #include "configurator/PlatformUtil.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
-#include "driver/RuntimeLinkProtocol.h"
 
 #include <algorithm>
 #include <cmath>
@@ -19,7 +18,7 @@
 namespace svms::cfg {
 namespace {
 
-using C = svms::RLCommandType;
+using C = LiveParam;
 constexpr const char* kMinus = "\xE2\x88\x92";
 
 float Clamp(float v, float lo, float hi) { return (std::max)(lo, (std::min)(hi, v)); }
@@ -459,7 +458,7 @@ void GrGraph(float dmax) {
     ui::PopFont();
 }
 
-void LimiterCard(ConfigDocument& doc, const svms::RuntimeLinkTelemetryV2* t) {
+void LimiterCard(ConfigDocument& doc, const SVMS_TelemetryV3* t) {
     ConfigValues& w = doc.Working();
     const ui::Tokens& k = ui::Tok();
     const float s = S();
@@ -513,7 +512,7 @@ void LimiterCard(ConfigDocument& doc, const svms::RuntimeLinkTelemetryV2* t) {
         });
     }
 
-    const float gr = t ? (std::max)(0.0f, std::isfinite(t->limiterGainReductionDb) ? t->limiterGainReductionDb : 0.0f) : 0.0f;
+    const float gr = t ? (std::max)(0.0f, std::isfinite(t->limiter_gain_reduction_db) ? t->limiter_gain_reduction_db : 0.0f) : 0.0f;
     const float dmax = GrDisplayMax(g_gr.Max());
     {
         ImGui::Dummy(ImVec2(0.0f, 16.0f * s - ImGui::GetStyle().ItemSpacing.y));
@@ -549,7 +548,7 @@ void LimiterCard(ConfigDocument& doc, const svms::RuntimeLinkTelemetryV2* t) {
 
 // --- Channel limiter -----------------------------------------------------------------------
 
-void ChannelLimiterCard(ConfigDocument& doc, const svms::RuntimeLinkTelemetryV2* t) {
+void ChannelLimiterCard(ConfigDocument& doc, const SVMS_TelemetryV3* t) {
     ConfigValues& w = doc.Working();
     const ui::Tokens& k = ui::Tok();
     const float s = S();
@@ -607,7 +606,7 @@ void ChannelLimiterCard(ConfigDocument& doc, const svms::RuntimeLinkTelemetryV2*
         const float colW = (half - 20.0f * s) * 0.5f;
         const float gx = origin.x + half + gap;
         const float gy = origin.y + (height - gridH) * 0.5f;
-        const bool active = t && t->channelLimiterEnabled != 0u;
+        const bool active = t && t->channel_limiter_enabled != 0u;
         for (int i = 0; i < 16; ++i) {
             const float cx = gx + (i % 2) * (colW + 20.0f * s);
             const float cy = gy + (i / 2) * (rowH + rowGap);
@@ -621,7 +620,7 @@ void ChannelLimiterCard(ConfigDocument& doc, const svms::RuntimeLinkTelemetryV2*
             const float by = cy + (rowH - bh) * 0.5f;
             dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), k.card2, bh * 0.5f);
             if (t && active) {
-                const float db = LinearToDb(t->channelLimiterInputPeak[i]);
+                const float db = LinearToDb(t->channel_limiter_input_peak[i]);
                 const float a = Clamp((db + 60.0f) / 60.0f, 0.0f, 1.0f);
                 if (a > 0.0f) dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw * a, by + bh), k.acc, bh * 0.5f);
             }
@@ -638,8 +637,8 @@ void ChannelLimiterCard(ConfigDocument& doc, const svms::RuntimeLinkTelemetryV2*
 
 void DrawEffectsPage(ConfigDocument& doc, std::string& panel) {
     const LiveLinkContext& live = GetLiveLinkContext();
-    const svms::RuntimeLinkTelemetryV2* t = live.connected ? live.telemetry : nullptr;
-    g_gr.Push(ImGui::GetTime(), t ? (std::max)(0.0f, std::isfinite(t->limiterGainReductionDb) ? t->limiterGainReductionDb : 0.0f) : 0.0f);
+    const SVMS_TelemetryV3* t = live.connected ? live.telemetry : nullptr;
+    g_gr.Push(ImGui::GetTime(), t ? (std::max)(0.0f, std::isfinite(t->limiter_gain_reduction_db) ? t->limiter_gain_reduction_db : 0.0f) : 0.0f);
 
     ChainCard(panel, doc.Working(), live.connected);
     if (panel == "limiter") LimiterCard(doc, t);

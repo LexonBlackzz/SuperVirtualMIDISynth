@@ -103,8 +103,8 @@ int main() {
     link.SetParam("master_volume", 3.0);
     Check(link.ParamValue("master_volume") == 3.0 &&
               link.MetricValue("cache_hits") == 99.0, "EngineLink values");
-    svms::RuntimeLinkTelemetryV2 t{};
-    Check(link.ReadTelemetry(t) && t.sampleRate == 48000u && t.activeVoices == 7u,
+    SVMS_TelemetryV3 t{};
+    Check(link.ReadTelemetry(t) && t.census.sample_rate == 48000u && t.census.active_voices == 7u,
           "telemetry maps through the fake client");
     link.Close();
     Check(link.Params().empty() && !link.IsOpen(), "Close clears the schema");

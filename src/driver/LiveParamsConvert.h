@@ -70,6 +70,7 @@ inline void LiveFromApi(const SVMS_LiveParams& p, RuntimeLiveStateV2& l) {
 // census, which the in-process driver fills from its own counters).
 inline void FillTelemetryV3Extension(const RuntimeLinkTelemetryV2& t,
                                      SVMS_TelemetryV3& r) {
+    r.publish_timestamp = t.timestampQpc;
     r.max_voices = t.maxVoices;
     r.releasing_voices = t.releasingVoices;
     r.free_top = t.freeTop;

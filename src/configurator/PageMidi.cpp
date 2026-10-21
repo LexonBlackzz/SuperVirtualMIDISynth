@@ -6,7 +6,6 @@
 #include "configurator/PlatformUtil.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
-#include "driver/RuntimeLinkProtocol.h"
 
 #ifdef _WIN32
 #include <mmeapi.h>
@@ -200,7 +199,7 @@ void QueueCard(ConfigDocument& doc) {
                  ImVec2(46.0f * s, 28.0f * s));
     if (ui::Toggle("##fastprod", &w.fastProducer)) {
         doc.MarkDirty();
-        SendLiveCommand(svms::RLCommandType::SetFastProducer, w.fastProducer ? 1u : 0u);
+        SendLiveCommand(SVMS_COMMAND_SET_FAST_PRODUCER, w.fastProducer ? 1u : 0u);
     }
     ui::EndRow();
     if (w.eventRingCapacity > 4000000u) {

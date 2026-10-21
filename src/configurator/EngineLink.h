@@ -12,8 +12,6 @@
 // "unknown to this version" page and are empty on drivers without one.
 
 #include "BuildInfo.h"
-#include "driver/LiveParamsConvert.h"
-#include "driver/RuntimeLinkProtocol.h"
 #include "include/svmsapi.h"
 
 #include <algorithm>
@@ -28,7 +26,11 @@ namespace svms {
 
 class EngineLink {
 public:
-    enum class Protocol : uint32_t { None = 0u, V2 = 2u, V3 = 3u };
+    // Sizes the pages need for command text, host tables and liveness.
+    static constexpr uint32_t kResultTextBytes = 256u;
+    static constexpr uint32_t kRequestTextBytes = 348u;
+    static constexpr uint32_t kMaxHosts = 16u;
+    static constexpr uint32_t kHostTimeoutMs = 5000u;
 
     struct HostInfo {
         uint32_t pid = 0u;
@@ -59,8 +61,8 @@ public:
         found.capabilityFlags = build::CapabilityRuntimeLinkV3 |
             build::CapabilityLiveConfiguration | build::CapabilityTelemetry;
         found.fresh = true;
-        HostInfo hosts[kRuntimeHostMaxCount];
-        const uint32_t count = EnumerateHosts(hosts, kRuntimeHostMaxCount);
+        HostInfo hosts[kMaxHosts];
+        const uint32_t count = EnumerateHosts(hosts, kMaxHosts);
         for (uint32_t i = 0u; i < count; ++i)
             if (hosts[i].pid == pid) found = hosts[i];
 
@@ -72,7 +74,6 @@ public:
         table_ = table;
         session_ = session;
         peer_ = found;
-        protocol_ = found.protocolMax == 2u ? Protocol::V2 : Protocol::V3;
         LoadSchema();
         return true;
     }
@@ -85,26 +86,24 @@ public:
         params_.clear();
         metricSchema_.clear();
         info_ = nlohmann::json::object();
-        protocol_ = Protocol::None;
         peer_ = HostInfo{};
     }
 
     bool IsOpen() const { return session_ != 0u; }
     uint32_t GetPID() const { return peer_.pid; }
-    Protocol GetProtocol() const { return protocol_; }
     const HostInfo& GetPeerInfo() const { return peer_; }
     bool HasCapability(uint64_t capability) const {
         return (peer_.capabilityFlags & capability) == capability;
     }
 
-    bool ReadTelemetry(RuntimeLinkTelemetryV2& out) {
+    bool ReadTelemetry(SVMS_TelemetryV3& out) {
         if (!IsOpen() || !table_.get_telemetry_v3) return false;
         SVMS_TelemetryV3 t{};
         t.struct_size = sizeof(t);
         t.struct_version = SVMS_STRUCT_VERSION_1;
         if (table_.get_telemetry_v3(session_, &t) != SVMS_RESULT_OK)
             return false;
-        out = FromApi(t);
+        out = t;
         return true;
     }
 
@@ -115,47 +114,57 @@ public:
                    SVMS_RESULT_OK && alive != 0u;
     }
 
-    RLResult SendCommand(RLCommandType type, uint32_t groupMask,
-                         uint32_t param, const RuntimeLiveStateV2& live,
-                         uint32_t timeoutMs,
-                         char resultText[kRuntimeLinkResultTextCapacity] =
-                             nullptr,
-                         const char* requestText = nullptr) {
-        auto text = [&](const char* message) {
-            if (!resultText) return;
-            const size_t n = (std::min)(std::strlen(message),
-                static_cast<size_t>(kRuntimeLinkResultTextCapacity) - 1u);
-            std::memcpy(resultText, message, n);
-            resultText[n] = '\0';
-        };
+    // One live-control command (an SVMS_COMMAND_* id). `requestText` is the
+    // payload for commands that take one (a path, "a;b;c" settings);
+    // `resultText` (kResultTextBytes, optional) receives the driver's note.
+    SVMS_Result SendCommand(uint32_t command, uint32_t param,
+                            uint32_t timeoutMs, char* resultText = nullptr,
+                            const char* requestText = nullptr) {
         if (resultText) resultText[0] = '\0';
         if (!IsOpen()) {
-            text("not connected");
-            return RLResult::InternalError;
+            CopyText(resultText, kResultTextBytes, "not connected");
+            return SVMS_RESULT_NOT_INITIALIZED;
         }
         SVMS_Remote_SetTimeout(session_, timeoutMs != 0u ? timeoutMs : 1500u);
+        char buffer[kRequestTextBytes]{};
+        if (requestText) CopyText(buffer, sizeof(buffer), requestText);
+        const SVMS_Result result = table_.send_runtime_command(
+            session_, command, param, buffer, sizeof(buffer));
+        CopyText(resultText, kResultTextBytes, buffer);
+        if (resultText && resultText[0] == '\0' && result != SVMS_RESULT_OK)
+            CopyText(resultText, kResultTextBytes, ResultString(result));
+        return result;
+    }
 
-        SVMS_Result result;
-        if (type == RLCommandType::ApplyLiveConfig) {
-            SVMS_LiveParams params{};
-            ApiFromLive(live, params);
-            result = table_.set_live_params(session_, groupMask, &params);
-        } else {
-            char buffer[kRuntimeLinkCommandTextCapacity]{};
-            if (requestText) {
-                const size_t n = (std::min)(std::strlen(requestText),
-                                            sizeof(buffer) - 1u);
-                std::memcpy(buffer, requestText, n);
-            }
-            result = table_.send_runtime_command(
-                session_, static_cast<uint32_t>(type), param, buffer,
-                sizeof(buffer));
-            text(buffer);
+    // Apply the live-state groups in `groupMask` (SVMS_LIVE_GROUP_*).
+    SVMS_Result SetLiveParams(uint32_t groupMask, const SVMS_LiveParams& live,
+                              uint32_t timeoutMs, char* resultText = nullptr) {
+        if (resultText) resultText[0] = '\0';
+        if (!IsOpen()) {
+            CopyText(resultText, kResultTextBytes, "not connected");
+            return SVMS_RESULT_NOT_INITIALIZED;
         }
-        const RLResult rl = RLFromApiResult(result);
-        if (resultText && resultText[0] == '\0' && rl != RLResult::Ok)
-            text(RLV2_ResultToString(rl));
-        return rl;
+        SVMS_Remote_SetTimeout(session_, timeoutMs != 0u ? timeoutMs : 1500u);
+        const SVMS_Result result =
+            table_.set_live_params(session_, groupMask, &live);
+        if (result != SVMS_RESULT_OK)
+            CopyText(resultText, kResultTextBytes, ResultString(result));
+        return result;
+    }
+
+    static const char* ResultString(SVMS_Result r) {
+        switch (r) {
+            case SVMS_RESULT_OK: return "OK";
+            case SVMS_RESULT_INVALID_ARGUMENT: return "Invalid argument";
+            case SVMS_RESULT_UNSUPPORTED:
+            case SVMS_RESULT_UNSUPPORTED_ABI: return "Unsupported";
+            case SVMS_RESULT_NOT_INITIALIZED: return "Not connected";
+            case SVMS_RESULT_NO_RESOURCES: return "No resources";
+            case SVMS_RESULT_BUSY: return "Busy";
+            case SVMS_RESULT_RESTART_REQUIRED: return "Restart required";
+            case SVMS_RESULT_LOAD_FAILED: return "Load failed";
+            default: return "Internal error";
+        }
     }
 
     // ── Driver schema (empty unless the host serves SVMS_CAP_SCHEMA) ──────
@@ -212,17 +221,15 @@ public:
             if (id == known) return true;
         return false;
     }
-    RLResult SendPing(uint32_t timeoutMs, char* resultText = nullptr) {
-        return SendCommand(RLCommandType::Ping, 0u, 0u, RuntimeLiveStateV2{},
-                           timeoutMs, resultText);
+    SVMS_Result SendPing(uint32_t timeoutMs, char* resultText = nullptr) {
+        return SendCommand(SVMS_COMMAND_PING, 0u, timeoutMs, resultText);
     }
-
 
     static uint32_t EnumerateHosts(HostInfo* out, uint32_t maxCount) {
         if (!out || maxCount == 0u) return 0u;
-        SVMS_HostInfo hosts[kRuntimeHostMaxCount]{};
+        SVMS_HostInfo hosts[kMaxHosts]{};
         const uint32_t count = SVMS_Remote_EnumerateHosts(
-            hosts, (std::min)(maxCount, kRuntimeHostMaxCount));
+            hosts, (std::min)(maxCount, kMaxHosts));
         for (uint32_t i = 0u; i < count; ++i) {
             const SVMS_HostInfo& h = hosts[i];
             HostInfo info{};
@@ -245,62 +252,11 @@ public:
     }
 
 private:
-    // SVMS_TelemetryV3 -> the struct the pages draw from. The link has no
-    // publish timestamp of its own; "now" is when this frame was read.
-    static RuntimeLinkTelemetryV2 FromApi(const SVMS_TelemetryV3& v) {
-        RuntimeLinkTelemetryV2 t{};
-        const SVMS_TelemetryV2& c = v.census;
-        t.timestampQpc = static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        t.overBudgetCallbacks = c.over_budget_callbacks;
-        t.eventsSubmitted = c.submitted_events;
-        t.eventsAccepted = c.accepted_events;
-        t.eventsDropped = c.dropped_events;
-        t.eventsDispatched = c.dispatched_events;
-        t.activeVoices = c.active_voices;
-        t.maxVoices = v.max_voices;
-        t.releasingVoices = v.releasing_voices;
-        t.freeTop = v.free_top;
-        t.voiceSteals = static_cast<uint32_t>(c.voice_steals);
-        t.retiredCount = v.retired_count;
-        t.retiredImmediateCount = v.retired_immediate_count;
-        t.decimationStep = v.decimation_step;
-        t.sampleRate = c.sample_rate;
-        t.bufferFrames = c.buffer_frames;
-        t.audioRunning = c.audio_running;
-        t.soundFontLoaded = c.soundfont_loaded;
-        t.audioHResult = v.audio_hresult;
-        t.renderPeak = c.render_peak;
-        t.cpuLoadPercent = v.cpu_load_percent;
-        t.callbackP95Percent = c.callback_p95_percent;
-        t.callbackP99Percent = c.callback_p99_percent;
-        t.callbackP999Percent = c.callback_p999_percent;
-        t.maxConsecutiveOverBudget = c.max_consecutive_over_budget;
-        t.limiterInputPeakL = v.limiter_input_peak_l;
-        t.limiterInputPeakR = v.limiter_input_peak_r;
-        t.limiterOutputPeakL = v.limiter_output_peak_l;
-        t.limiterOutputPeakR = v.limiter_output_peak_r;
-        t.limiterGainReductionDb = v.limiter_gain_reduction_db;
-        LiveFromApi(v.live, t.live);
-        t.live.maxVoices = v.max_voices;
-        std::memcpy(t.soundFontName, v.soundfont_name,
-                    sizeof(t.soundFontName));
-        t.schedulerPercent = v.scheduler_percent;
-        t.eventDispatchPercent = v.event_dispatch_percent;
-        t.rawIngressCount = v.raw_ingress_count;
-        t.compiledPagedCount = v.compiled_paged_count;
-        t.scheduledBacklogCount = v.scheduled_backlog_count;
-        t.channelLimiterEnabled = v.channel_limiter_enabled;
-        std::memcpy(t.channelLimiterGainReductionDb,
-                    v.channel_limiter_gain_reduction_db,
-                    sizeof(t.channelLimiterGainReductionDb));
-        std::memcpy(t.channelLimiterInputPeak, v.channel_limiter_input_peak,
-                    sizeof(t.channelLimiterInputPeak));
-        t.effectiveVoices = c.effective_voices;
-        t.effectiveVoicesPeak = c.effective_voices_peak;
-        t.noteMergedLow = c.note_merged_events_low;
-        t.noteMergedHigh = c.note_merged_events_high;
-        return t;
+    static void CopyText(char* dst, size_t capacity, const char* src) {
+        if (!dst || capacity == 0u) return;
+        const size_t n = (std::min)(std::strlen(src), capacity - 1u);
+        std::memcpy(dst, src, n);
+        dst[n] = 0;
     }
 
     void LoadSchema() {
@@ -344,7 +300,6 @@ private:
     std::vector<MetricInfo> metricSchema_;
     nlohmann::json info_ = nlohmann::json::object();
     SVMS_Session session_ = 0u;
-    Protocol protocol_ = Protocol::None;
     HostInfo peer_{};
 };
 

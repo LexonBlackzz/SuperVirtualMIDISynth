@@ -99,9 +99,9 @@ int main(int argc, char** argv) {
             std::puts("SKIP: host process could not start an engine");
             return finish(77);
         }
-        svms::EngineLink::HostInfo hosts[svms::kRuntimeHostMaxCount];
+        svms::EngineLink::HostInfo hosts[svms::EngineLink::kMaxHosts];
         const uint32_t count = svms::EngineLink::EnumerateHosts(
-            hosts, svms::kRuntimeHostMaxCount);
+            hosts, svms::EngineLink::kMaxHosts);
         for (uint32_t i = 0; i < count; ++i)
             if (hosts[i].pid == child.dwProcessId && hosts[i].fresh) {
                 host = hosts[i];
@@ -113,12 +113,10 @@ int main(int argc, char** argv) {
     svms::EngineLink link;
     if (link.IsOpen() || link.IsHostAlive(100u))
         return finish(Fail("a closed link claims to be open"));
-    svms::RuntimeLinkTelemetryV2 t{};
-    char text[svms::kRuntimeLinkResultTextCapacity] = {};
+    SVMS_TelemetryV3 t{};
+    char text[svms::EngineLink::kResultTextBytes] = {};
     if (link.ReadTelemetry(t) ||
-        link.SendCommand(svms::RLCommandType::Ping, 0u, 0u,
-                         svms::RuntimeLiveStateV2{}, 100u, text) ==
-            svms::RLResult::Ok)
+        link.SendCommand(SVMS_COMMAND_PING, 0u, 100u, text) == SVMS_RESULT_OK)
         return finish(Fail("a closed link accepted traffic"));
     if (!link.Open(child.dwProcessId) || !link.IsOpen() ||
         link.GetPID() != child.dwProcessId)
@@ -132,58 +130,50 @@ int main(int argc, char** argv) {
     for (DWORD start = GetTickCount(); !telemetry &&
                                        GetTickCount() - start < 10000;
          Sleep(50))
-        telemetry = link.ReadTelemetry(t) && t.sampleRate != 0u &&
-                    t.maxVoices != 0u;
+        telemetry = link.ReadTelemetry(t) && t.census.sample_rate != 0u &&
+                    t.max_voices != 0u;
     if (!telemetry) return finish(Fail("no telemetry from the host"));
-    if (t.live.maxVoices != t.maxVoices || t.bufferFrames == 0u)
+    if (t.live.max_voices != t.max_voices || t.census.buffer_frames == 0u)
         return finish(Fail("telemetry frame is inconsistent"));
 
-    // ApplyLiveConfig round trip, like ConfiguratorApp::FlushLiveChanges.
-    svms::RuntimeLiveStateV2 live = t.live;
-    live.masterVolume = 0.5f;
-    live.reverbEnabled = 1u;
-    live.reverbMix = 0.4f;
-    if (link.SendCommand(svms::RLCommandType::ApplyLiveConfig,
-                         svms::RLGroupMaster | svms::RLGroupReverb, 0u, live,
-                         500u, text) != svms::RLResult::Ok)
-        return finish(Fail("ApplyLiveConfig failed"));
+    // Live params round trip, like ConfiguratorApp::FlushLiveChanges.
+    SVMS_LiveParams live = t.live;
+    live.master_volume = 0.5f;
+    live.reverb_enabled = 1u;
+    live.reverb_mix = 0.4f;
+    if (link.SetLiveParams(SVMS_LIVE_GROUP_MASTER | SVMS_LIVE_GROUP_REVERB,
+                           live, 500u, text) != SVMS_RESULT_OK)
+        return finish(Fail("set live params failed"));
     bool echoed = false;
     for (DWORD start = GetTickCount(); !echoed && GetTickCount() - start < 5000;
          Sleep(50))
         echoed = link.ReadTelemetry(t) &&
-                 std::fabs(t.live.masterVolume - 0.5f) < 1e-4f &&
-                 std::fabs(t.live.reverbMix - 0.4f) < 1e-4f &&
-                 t.live.reverbEnabled == 1u;
+                 std::fabs(t.live.master_volume - 0.5f) < 1e-4f &&
+                 std::fabs(t.live.reverb_mix - 0.4f) < 1e-4f &&
+                 t.live.reverb_enabled == 1u;
     if (!echoed) return finish(Fail("host never echoed the applied state"));
-    live.masterVolume = std::nanf("");
-    if (link.SendCommand(svms::RLCommandType::ApplyLiveConfig,
-                         svms::RLGroupMaster, 0u, live, 500u, text) ==
-            svms::RLResult::Ok ||
+    live.master_volume = std::nanf("");
+    if (link.SetLiveParams(SVMS_LIVE_GROUP_MASTER, live, 500u, text) ==
+            SVMS_RESULT_OK ||
         text[0] == '\0')
         return finish(Fail("invalid live state was accepted or gave no text"));
 
     // Commands: plain parameter, rejected parameter, request text in and
     // result text out (the SoundFont path travels as request text).
-    if (link.SendCommand(svms::RLCommandType::Ping, 0u, 0u,
-                         svms::RuntimeLiveStateV2{}, 500u, text) !=
-            svms::RLResult::Ok ||
-        link.SendCommand(svms::RLCommandType::SetStealPolicy, 0u, 99u,
-                         svms::RuntimeLiveStateV2{}, 500u, text) ==
-            svms::RLResult::Ok)
+    if (link.SendCommand(SVMS_COMMAND_PING, 0u, 500u, text) != SVMS_RESULT_OK ||
+        link.SendCommand(SVMS_COMMAND_SET_STEAL_POLICY, 99u, 500u, text) ==
+            SVMS_RESULT_OK)
         return finish(Fail("plain command contract violated"));
     text[0] = '\0';
-    link.SendCommand(svms::RLCommandType::QuerySoundFontLoad, 0u, 0u,
-                     svms::RuntimeLiveStateV2{}, 100u, text);
+    link.SendCommand(SVMS_COMMAND_QUERY_SOUNDFONT_LOAD, 0u, 100u, text);
     if (text[0] == '\0') return finish(Fail("no result text from a query"));
-    if (link.SendCommand(svms::RLCommandType::ReloadSoundFont, 0u, 0u,
-                         svms::RuntimeLiveStateV2{}, 500u, text,
-                         "C:\\definitely\\not\\a\\soundfont.sf2") ==
-        svms::RLResult::Ok) {
+    if (link.SendCommand(SVMS_COMMAND_RELOAD_SOUNDFONT, 0u, 500u, text,
+                         "C:\definitely\not\a\soundfont.sf2") ==
+        SVMS_RESULT_OK) {
         // Accepted for queueing is fine; the load itself then fails.
         for (DWORD start = GetTickCount(); GetTickCount() - start < 3000;
              Sleep(50)) {
-            link.SendCommand(svms::RLCommandType::QuerySoundFontLoad, 0u, 0u,
-                             svms::RuntimeLiveStateV2{}, 100u, text);
+            link.SendCommand(SVMS_COMMAND_QUERY_SOUNDFONT_LOAD, 0u, 100u, text);
             if (std::strstr(text, "fail") || std::strstr(text, "Fail") ||
                 std::strstr(text, "error") || std::strstr(text, "4\t"))
                 break;

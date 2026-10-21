@@ -11,7 +11,6 @@
 #include "configurator/Widgets.h"
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "driver/RuntimeLinkProtocol.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -33,7 +32,7 @@
 namespace svms::cfg {
 namespace {
 
-using C = svms::RLCommandType;
+
 
 // --- SoundFont list model (moved from the old Audio page) ---------------------------
 
@@ -129,9 +128,9 @@ void PollSoundFontStatus(svms::EngineLink& client, SoundFontLiveStatus& status) 
     status.pollTimer += ImGui::GetIO().DeltaTime;
     if (status.pollTimer < 0.25f) return;
     status.pollTimer = 0.0f;
-    char result[svms::kRuntimeLinkResultTextCapacity]{};
-    if (client.SendCommand(C::QuerySoundFontLoad, 0u, 0u, svms::RuntimeLiveStateV2{}, 100u, result) !=
-        svms::RLResult::Ok)
+    char result[svms::EngineLink::kResultTextBytes]{};
+    if (client.SendCommand(SVMS_COMMAND_QUERY_SOUNDFONT_LOAD, 0u, 100u, result) !=
+        SVMS_RESULT_OK)
         return;
     char* cursor = result;
     uint64_t state = 0u;
@@ -152,16 +151,16 @@ void PollSoundFontStatus(svms::EngineLink& client, SoundFontLiveStatus& status) 
 
 void StartSoundFontLoad(svms::EngineLink& client, const std::wstring& path, SoundFontLiveStatus& status) {
     const std::string utf8 = util::WideToUtf8(path);
-    if (utf8.empty() || utf8.size() >= svms::kRuntimeLinkCommandTextCapacity) {
-        status.message = "The SoundFont path is too long for RuntimeLink.";
+    if (utf8.empty() || utf8.size() >= svms::EngineLink::kRequestTextBytes) {
+        status.message = "The SoundFont path is too long for the driver link.";
         status.error = true;
         return;
     }
-    char result[svms::kRuntimeLinkResultTextCapacity]{};
-    const svms::RLResult code = client.SendCommand(C::ReloadSoundFont, 0u, 0u, svms::RuntimeLiveStateV2{}, 500u,
-                                                   result, utf8.c_str());
-    status.error = code != svms::RLResult::Ok;
-    status.message = result[0] ? result : svms::RLV2_ResultToString(code);
+    char result[svms::EngineLink::kResultTextBytes]{};
+    const SVMS_Result code = client.SendCommand(SVMS_COMMAND_RELOAD_SOUNDFONT, 0u, 500u,
+                                                result, utf8.c_str());
+    status.error = code != SVMS_RESULT_OK;
+    status.message = result[0] ? result : svms::EngineLink::ResultString(code);
     if (!status.error) {
         status.state = 1u;
         status.pollTimer = 0.25f;
@@ -304,9 +303,9 @@ void SoundFontList(ConfigDocument& doc, bool liveSoundFont, SoundFontLiveStatus&
         ImGui::PushStyleColor(ImGuiCol_Text, status.error ? k.bad : (busy ? k.acc : k.ok));
         ImGui::TextUnformatted(status.message.c_str());
         ImGui::PopStyleColor();
-        if (live.telemetry && live.telemetry->soundFontName[0] != '\0') {
+        if (live.telemetry && live.telemetry->soundfont_name[0] != '\0') {
             ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
-            ImGui::Text("Active: %s", live.telemetry->soundFontName);
+            ImGui::Text("Active: %s", live.telemetry->soundfont_name);
             ImGui::PopStyleColor();
         }
         ui::PopFont();
@@ -456,7 +455,7 @@ void VoiceCharacterCard(ConfigDocument& doc) {
     if (ui::Segmented("##phaseseg", &phase, labels, 5, -1.0f)) {
         w.phaseRotationMode = static_cast<uint32_t>(phase);
         doc.MarkDirty();
-        SendLiveCommand(C::SetPhaseRotation, w.phaseRotationMode);
+        SendLiveCommand(SVMS_COMMAND_SET_PHASE_ROTATION, w.phaseRotationMode);
     }
     ImGui::Dummy(ImVec2(0.0f, 12.0f * s - ImGui::GetStyle().ItemSpacing.y));
 
@@ -625,7 +624,7 @@ void ChannelFontsCard(ConfigDocument& doc) {
         if (ui::Select("##chsf", &sel, items.data(), static_cast<int>(items.size()), 240.0f * s) && sel >= 0) {
             w.soundFontChannels[ch] = static_cast<uint8_t>(sel);
             doc.MarkDirty();
-            SendLiveCommand(C::SetChannelSoundFont, ch | (static_cast<uint32_t>(sel) << 8));
+            SendLiveCommand(SVMS_COMMAND_SET_CHANNEL_SOUNDFONT, ch | (static_cast<uint32_t>(sel) << 8));
         }
         ImGui::PopID();
         ui::EndRow();

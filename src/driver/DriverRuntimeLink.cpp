@@ -1043,6 +1043,11 @@ void Driver::CopyTelemetryV3(SVMS_TelemetryV3* out) {
     CopyTelemetryCensus(&r.census);
     const svms::RuntimeLinkTelemetryV2 t = BuildRuntimeLinkTelemetry();
     svms::FillTelemetryV3Extension(t, r);
+    if (r.publish_timestamp == 0u) {
+        LARGE_INTEGER qpc;
+        QueryPerformanceCounter(&qpc);
+        r.publish_timestamp = static_cast<uint64_t>(qpc.QuadPart);
+    }
     *out = r;
 }
 #endif // !defined(SVMS_XP_COMPAT)

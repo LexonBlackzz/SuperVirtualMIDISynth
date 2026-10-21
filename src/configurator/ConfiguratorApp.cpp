@@ -630,7 +630,7 @@ void ConfiguratorApp::DrawTopBar() {
         if (!AlmostEquals(lin, w.masterVolume)) {
             w.masterVolume = lin;
             config_.MarkDirty();
-            SetLiveFloat(svms::RLCommandType::SetMasterVolume, lin);
+            SetLiveFloat(LiveParam::SetMasterVolume, lin);
         }
     }
     char dbText[32];
@@ -653,8 +653,8 @@ void ConfiguratorApp::DrawTopBar() {
     auto follow = [&](float& v, float target) {
         v += (target - v) * (1.0f - std::exp(-(target > v ? 30.0f : 6.0f) * dt));
     };
-    follow(outL_, tel ? rlTelemetry_.limiterOutputPeakL : 0.0f);
-    follow(outR_, tel ? rlTelemetry_.limiterOutputPeakR : 0.0f);
+    follow(outL_, tel ? rlTelemetry_.limiter_output_peak_l : 0.0f);
+    follow(outR_, tel ? rlTelemetry_.limiter_output_peak_r : 0.0f);
 
     auto meterHead = [&](float mx0, const char* label, const char* value) {
         ui::PushText(0, 12.0f);
@@ -669,16 +669,16 @@ void ConfiguratorApp::DrawTopBar() {
     };
     const char* dash = "\xE2\x80\x94";
     // Voices
-    const uint32_t cap = tel && rlTelemetry_.maxVoices ? rlTelemetry_.maxVoices : (std::max)(1u, w.maxVoices);
-    std::string voices = tel ? WithCommas(rlTelemetry_.activeVoices) : dash;
+    const uint32_t cap = tel && rlTelemetry_.max_voices ? rlTelemetry_.max_voices : (std::max)(1u, w.maxVoices);
+    std::string voices = tel ? WithCommas(rlTelemetry_.census.active_voices) : dash;
     float by = meterHead(mx, "Voices", voices.c_str());
     dl->AddRectFilled(ImVec2(mx, by), ImVec2(mx + meterW, by + 6.0f * s), k.card2, 3.0f * s);
-    const float vf = tel ? (std::min)(1.0f, static_cast<float>(rlTelemetry_.activeVoices) / cap) : 0.0f;
+    const float vf = tel ? (std::min)(1.0f, static_cast<float>(rlTelemetry_.census.active_voices) / cap) : 0.0f;
     if (vf > 0.0f) dl->AddRectFilled(ImVec2(mx, by), ImVec2(mx + meterW * vf, by + 6.0f * s), k.acc, 3.0f * s);
     mx += meterW + meterGap;
     // CPU
     char cpuText[32];
-    const float load = AnimEase(ImGui::GetID("##topload"), tel ? (std::max)(0.0f, rlTelemetry_.cpuLoadPercent) : 0.0f, 0.3f);
+    const float load = AnimEase(ImGui::GetID("##topload"), tel ? (std::max)(0.0f, rlTelemetry_.cpu_load_percent) : 0.0f, 0.3f);
     if (tel) std::snprintf(cpuText, sizeof(cpuText), "%.0f%%", load);
     else std::snprintf(cpuText, sizeof(cpuText), "%s", dash);
     by = meterHead(mx, "CPU", cpuText);
@@ -1151,7 +1151,7 @@ void ConfiguratorApp::PollRuntimeLink() {
     if (rlPollTimer_ < kRlPollInterval) return;
     rlPollTimer_ = 0.0f;
 
-    if (!rlClient_.IsHostAlive(svms::kRuntimeHostTimeoutMs)) {
+    if (!rlClient_.IsHostAlive(svms::EngineLink::kHostTimeoutMs)) {
         rlConnected_ = false;
         rlReconnectTimer_ = 0.0f;
         statusMessage_ = "Driver disconnected — will attempt reconnect";
@@ -1179,17 +1179,16 @@ void ConfiguratorApp::FlushLiveChanges() {
     rlFlushTimer_ = 0.0f;
 
     const uint32_t submittedMask = pendingLiveMask_;
-    char err[svms::kRuntimeLinkResultTextCapacity] = {};
+    char err[svms::EngineLink::kResultTextBytes] = {};
     // ApplyLiveConfig rejects an empty group mask, so it is only sent when
     // a grouped change is pending; channel-limiter-only changes skip
     // straight to their dedicated command below.
-    svms::RLResult result = svms::RLResult::Ok;
+    SVMS_Result result = SVMS_RESULT_OK;
     if (submittedMask != 0u) {
-        result = rlClient_.SendCommand(
-            svms::RLCommandType::ApplyLiveConfig, submittedMask, 0u,
-            workingLive_, kRlLiveCommandTimeoutMs, err);
+        result = rlClient_.SetLiveParams(submittedMask, workingLive_,
+                                         kRlLiveCommandTimeoutMs, err);
     }
-    if (result == svms::RLResult::Ok) {
+    if (result == SVMS_RESULT_OK) {
         pendingLiveMask_ &= ~submittedMask;
         rlFailedFlushes_ = 0u;
         rlRetryBackoff_ = 0.0f;
@@ -1197,9 +1196,9 @@ void ConfiguratorApp::FlushLiveChanges() {
         return;
     }
 
-    if (result == svms::RLResult::RestartRequired &&
-        (submittedMask & svms::RLGroupVoices) != 0u) {
-        pendingLiveMask_ &= ~svms::RLGroupVoices;
+    if (result == SVMS_RESULT_RESTART_REQUIRED &&
+        (submittedMask & SVMS_LIVE_GROUP_VOICES) != 0u) {
+        pendingLiveMask_ &= ~SVMS_LIVE_GROUP_VOICES;
         SendPendingChannelLimiter();
         statusMessage_ = "Voice cap exceeds the startup pool — restart required to grow it";
         if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
@@ -1209,7 +1208,7 @@ void ConfiguratorApp::FlushLiveChanges() {
         return;
     }
 
-    if (result == svms::RLResult::Unsupported) {
+    if (result == SVMS_RESULT_UNSUPPORTED) {
         // Retrying cannot help; drop the change and say so once.
         pendingLiveMask_ &= ~submittedMask;
         SendPendingChannelLimiter();
@@ -1224,72 +1223,72 @@ void ConfiguratorApp::FlushLiveChanges() {
     if (++rlFailedFlushes_ >= 3u) {
         rlFailedFlushes_ = 0u;
         statusMessage_ = "Live update delayed: " +
-            std::string(svms::RLV2_ResultToString(result));
+            std::string(svms::EngineLink::ResultString(result));
         if (err[0] != '\0') statusMessage_ += std::string(" — ") + err;
         toastTimer_ = 3.0f;
         toastMessage_ = statusMessage_;
     }
 }
 
-void ConfiguratorApp::SetLiveFloat(svms::RLCommandType type, float value) {
+void ConfiguratorApp::SetLiveFloat(LiveParam type, float value) {
     NoteLiveChange();
     switch (type) {
-    case svms::RLCommandType::SetMasterVolume:
-        workingLive_.masterVolume = value; break;
-    case svms::RLCommandType::SetReverbMix:
-        workingLive_.reverbMix = value; break;
-    case svms::RLCommandType::SetReverbRoomSize:
-        workingLive_.reverbRoomSize = value; break;
-    case svms::RLCommandType::SetReverbDecay:
-        workingLive_.reverbDecay = value; break;
-    case svms::RLCommandType::SetReverbDamping:
-        workingLive_.reverbDamping = value; break;
-    case svms::RLCommandType::SetReverbWidth:
-        workingLive_.reverbWidth = value; break;
-    case svms::RLCommandType::SetReverbDiffusion:
-        workingLive_.reverbDiffusion = value; break;
-    case svms::RLCommandType::SetReverbPreDelayMs:
-        workingLive_.reverbPreDelayMs = value; break;
-    case svms::RLCommandType::SetReverbEarlyLevel:
-        workingLive_.reverbEarlyLevel = value; break;
-    case svms::RLCommandType::SetReverbLateLevel:
-        workingLive_.reverbLateLevel = value; break;
-    case svms::RLCommandType::SetReverbModDepth:
-        workingLive_.reverbModDepth = value; break;
-    case svms::RLCommandType::SetReverbModRate:
-        workingLive_.reverbModRate = value; break;
-    case svms::RLCommandType::SetReverbLowCutHz:
-        workingLive_.reverbLowCutHz = value; break;
-    case svms::RLCommandType::SetReverbHighCutHz:
-        workingLive_.reverbHighCutHz = value; break;
-    case svms::RLCommandType::SetLimiterThreshold:
-        workingLive_.limiterThreshold = value; break;
-    case svms::RLCommandType::SetLimiterLookahead:
-        workingLive_.limiterLookaheadMs = value; break;
-    case svms::RLCommandType::SetLimiterAttack:
-        workingLive_.limiterAttackMs = value; break;
-    case svms::RLCommandType::SetLimiterRelease:
-        workingLive_.limiterReleaseMs = value; break;
+    case LiveParam::SetMasterVolume:
+        workingLive_.master_volume = value; break;
+    case LiveParam::SetReverbMix:
+        workingLive_.reverb_mix = value; break;
+    case LiveParam::SetReverbRoomSize:
+        workingLive_.reverb_room_size = value; break;
+    case LiveParam::SetReverbDecay:
+        workingLive_.reverb_decay = value; break;
+    case LiveParam::SetReverbDamping:
+        workingLive_.reverb_damping = value; break;
+    case LiveParam::SetReverbWidth:
+        workingLive_.reverb_width = value; break;
+    case LiveParam::SetReverbDiffusion:
+        workingLive_.reverb_diffusion = value; break;
+    case LiveParam::SetReverbPreDelayMs:
+        workingLive_.reverb_pre_delay_ms = value; break;
+    case LiveParam::SetReverbEarlyLevel:
+        workingLive_.reverb_early_level = value; break;
+    case LiveParam::SetReverbLateLevel:
+        workingLive_.reverb_late_level = value; break;
+    case LiveParam::SetReverbModDepth:
+        workingLive_.reverb_mod_depth = value; break;
+    case LiveParam::SetReverbModRate:
+        workingLive_.reverb_mod_rate = value; break;
+    case LiveParam::SetReverbLowCutHz:
+        workingLive_.reverb_low_cut_hz = value; break;
+    case LiveParam::SetReverbHighCutHz:
+        workingLive_.reverb_high_cut_hz = value; break;
+    case LiveParam::SetLimiterThreshold:
+        workingLive_.limiter_threshold = value; break;
+    case LiveParam::SetLimiterLookahead:
+        workingLive_.limiter_lookahead_ms = value; break;
+    case LiveParam::SetLimiterAttack:
+        workingLive_.limiter_attack_ms = value; break;
+    case LiveParam::SetLimiterRelease:
+        workingLive_.limiter_release_ms = value; break;
     default:
         return;
     }
-    pendingLiveMask_ |= svms::RLV2_GroupForType(type);
+    pendingLiveMask_ |= LiveParamGroup(type);
     rlFlushTimer_ = kRlFlushInterval;
 }
 
-void ConfiguratorApp::SetLiveBool(svms::RLCommandType type, bool value) {
+void ConfiguratorApp::SetLiveBool(LiveParam type, bool value) {
     NoteLiveChange();
     switch (type) {
-    case svms::RLCommandType::SetReverbEnabled:
-        workingLive_.reverbEnabled = value ? 1u : 0u; break;
-    case svms::RLCommandType::SetLimiterEnabled:
-        workingLive_.limiterEnabled = value ? 1u : 0u; break;
-    case svms::RLCommandType::SetCorrectnessMode:
-        workingLive_.correctnessMode = value ? 1u : 0u; break;
+    case LiveParam::SetReverbEnabled:
+        workingLive_.reverb_enabled = value ? 1u : 0u; break;
+    case LiveParam::SetLimiterEnabled:
+        workingLive_.limiter_enabled = value ? 1u : 0u; break;
+    case LiveParam::SetCorrectnessMode:
+        workingLive_.correctness_mode = value ? 1u : 0u; break;
     default:
         return;
     }
-    pendingLiveMask_ |= svms::RLV2_GroupForType(type);
+    pendingLiveMask_ |= LiveParamGroup(type);
     rlFlushTimer_ = kRlFlushInterval;
 }
 
@@ -1305,10 +1304,9 @@ void ConfiguratorApp::SetLiveChannelLimiter(bool enabled, float threshold,
     rlFlushTimer_ = kRlFlushInterval;
 }
 
-// The channel limiter rides a dedicated wire command because
-// RuntimeLiveStateV2 (ABI-pinned, echoed inside the 512-byte legacy
-// telemetry prefix) has no spare words for it. Payload travels in the
-// command text area: "enabled;threshold;releaseMs".
+// The channel limiter rides a dedicated wire command because SVMS_LiveParams
+// has no fields for it. Payload travels in the command text area:
+// "enabled;threshold;releaseMs".
 void ConfiguratorApp::SendPendingChannelLimiter() {
     if (!pendingChannelLimiter_) return;
     char payload[64];
@@ -1316,17 +1314,16 @@ void ConfiguratorApp::SendPendingChannelLimiter() {
                   pendingChannelLimiterValues_[0] > 0.5f ? 1 : 0,
                   pendingChannelLimiterValues_[1],
                   pendingChannelLimiterValues_[2]);
-    char err[svms::kRuntimeLinkResultTextCapacity] = {};
-    const svms::RLResult result = rlClient_.SendCommand(
-        svms::RLCommandType::SetChannelLimiter,
-        svms::RLGroupChannelLimiter, 0u, workingLive_,
+    char err[svms::EngineLink::kResultTextBytes] = {};
+    const SVMS_Result result = rlClient_.SendCommand(
+        SVMS_COMMAND_SET_CHANNEL_LIMITER, 0u,
         kRlLiveCommandTimeoutMs, err, payload);
-    if (result == svms::RLResult::Ok) {
+    if (result == SVMS_RESULT_OK) {
         pendingChannelLimiter_ = false;
-    } else if (result != svms::RLResult::Busy) {
+    } else if (result != SVMS_RESULT_BUSY) {
         pendingChannelLimiter_ = false;
         statusMessage_ = "Per-channel limiter update failed: " +
-            std::string(svms::RLV2_ResultToString(result));
+            std::string(svms::EngineLink::ResultString(result));
         if (err[0] != 0) statusMessage_ += std::string(" - ") + err;
         toastTimer_ = 3.0f;
         toastMessage_ = statusMessage_;
@@ -1336,43 +1333,45 @@ void ConfiguratorApp::SendPendingChannelLimiter() {
 void ConfiguratorApp::SetLiveMaxVoices(uint32_t value) {
     NoteLiveChange();
     if (value == 0u) value = 1u;
-    workingLive_.maxVoices = value;
-    pendingLiveMask_ |= svms::RLGroupVoices;
+    workingLive_.max_voices = value;
+    pendingLiveMask_ |= SVMS_LIVE_GROUP_VOICES;
     rlFlushTimer_ = kRlFlushInterval;
 }
 
 void ConfiguratorApp::SetLiveLimiterAlgorithm(uint32_t value) {
     NoteLiveChange();
-    workingLive_.limiterAlgorithm = (std::min)(1u, value);
-    pendingLiveMask_ |= svms::RLGroupLimiter;
+    workingLive_.limiter_algorithm = (std::min)(1u, value);
+    pendingLiveMask_ |= SVMS_LIVE_GROUP_LIMITER;
     rlFlushTimer_ = kRlFlushInterval;
 }
 
-static svms::RuntimeLiveStateV2 LiveStateFromConfig(const ConfigValues& w) {
-    svms::RuntimeLiveStateV2 l{};
-    l.masterVolume = w.masterVolume;
-    l.correctnessMode = w.correctnessMode ? 1u : 0u;
-    l.maxVoices = w.maxVoices;
-    l.reverbEnabled = w.enableReverb ? 1u : 0u;
-    l.reverbMix = w.reverbMix;
-    l.reverbRoomSize = w.reverbRoomSize;
-    l.reverbDecay = w.reverbDecay;
-    l.reverbDamping = w.reverbDamping;
-    l.reverbWidth = w.reverbWidth;
-    l.reverbDiffusion = w.reverbDiffusion;
-    l.reverbPreDelayMs = w.reverbPreDelayMs;
-    l.reverbEarlyLevel = w.reverbEarlyLevel;
-    l.reverbLateLevel = w.reverbLateLevel;
-    l.reverbModDepth = w.reverbModDepth;
-    l.reverbModRate = w.reverbModRate;
-    l.reverbLowCutHz = w.reverbLowCutHz;
-    l.reverbHighCutHz = w.reverbHighCutHz;
-    l.limiterEnabled = w.limiterEnabled ? 1u : 0u;
-    l.limiterAlgorithm = (std::min)(1u, w.limiterAlgorithm);
-    l.limiterThreshold = w.limiterThreshold;
-    l.limiterLookaheadMs = w.limiterLookaheadMs;
-    l.limiterAttackMs = w.limiterAttackMs;
-    l.limiterReleaseMs = w.limiterReleaseMs;
+static SVMS_LiveParams LiveStateFromConfig(const ConfigValues& w) {
+    SVMS_LiveParams l{};
+    l.struct_size = sizeof(l);
+    l.struct_version = SVMS_STRUCT_VERSION_1;
+    l.master_volume = w.masterVolume;
+    l.correctness_mode = w.correctnessMode ? 1u : 0u;
+    l.max_voices = w.maxVoices;
+    l.reverb_enabled = w.enableReverb ? 1u : 0u;
+    l.reverb_mix = w.reverbMix;
+    l.reverb_room_size = w.reverbRoomSize;
+    l.reverb_decay = w.reverbDecay;
+    l.reverb_damping = w.reverbDamping;
+    l.reverb_width = w.reverbWidth;
+    l.reverb_diffusion = w.reverbDiffusion;
+    l.reverb_pre_delay_ms = w.reverbPreDelayMs;
+    l.reverb_early_level = w.reverbEarlyLevel;
+    l.reverb_late_level = w.reverbLateLevel;
+    l.reverb_mod_depth = w.reverbModDepth;
+    l.reverb_mod_rate = w.reverbModRate;
+    l.reverb_low_cut_hz = w.reverbLowCutHz;
+    l.reverb_high_cut_hz = w.reverbHighCutHz;
+    l.limiter_enabled = w.limiterEnabled ? 1u : 0u;
+    l.limiter_algorithm = (std::min)(1u, w.limiterAlgorithm);
+    l.limiter_threshold = w.limiterThreshold;
+    l.limiter_lookahead_ms = w.limiterLookaheadMs;
+    l.limiter_attack_ms = w.limiterAttackMs;
+    l.limiter_release_ms = w.limiterReleaseMs;
     return l;
 }
 
@@ -1385,7 +1384,7 @@ void ConfiguratorApp::PushAllLiveParams() {
             svms::build::CapabilityLiveConfiguration)) return;
 
     workingLive_ = LiveStateFromConfig(config_.Working());
-    pendingLiveMask_ |= svms::RLGroupAll;
+    pendingLiveMask_ |= SVMS_LIVE_GROUP_ALL;
     rlFlushTimer_ = kRlFlushInterval;
     rlRetryBackoff_ = 0.0f;
 }
@@ -1393,32 +1392,32 @@ void ConfiguratorApp::PushAllLiveParams() {
 void ConfiguratorApp::AdoptEngineLiveState() {
     if (!rlConnected_) return;
 
-    const svms::RuntimeLiveStateV2& e = rlTelemetry_.live;
+    const SVMS_LiveParams& e = rlTelemetry_.live;
     ConfigValues& w = config_.Working();
     const ConfigValues before = w;
-    w.masterVolume = e.masterVolume;
-    w.correctnessMode = e.correctnessMode != 0u;
-    if (e.maxVoices != 0u) w.maxVoices = e.maxVoices;
-    w.enableReverb = e.reverbEnabled != 0u;
-    w.reverbMix = e.reverbMix;
-    w.reverbRoomSize = e.reverbRoomSize;
-    w.reverbDecay = e.reverbDecay;
-    w.reverbDamping = e.reverbDamping;
-    w.reverbWidth = e.reverbWidth;
-    w.reverbDiffusion = e.reverbDiffusion;
-    w.reverbPreDelayMs = e.reverbPreDelayMs;
-    w.reverbEarlyLevel = e.reverbEarlyLevel;
-    w.reverbLateLevel = e.reverbLateLevel;
-    w.reverbModDepth = e.reverbModDepth;
-    w.reverbModRate = e.reverbModRate;
-    w.reverbLowCutHz = e.reverbLowCutHz;
-    w.reverbHighCutHz = e.reverbHighCutHz;
-    w.limiterEnabled = e.limiterEnabled != 0u;
-    w.limiterAlgorithm = (std::min)(1u, e.limiterAlgorithm);
-    w.limiterThreshold = e.limiterThreshold;
-    w.limiterLookaheadMs = e.limiterLookaheadMs;
-    w.limiterAttackMs = e.limiterAttackMs;
-    w.limiterReleaseMs = e.limiterReleaseMs;
+    w.masterVolume = e.master_volume;
+    w.correctnessMode = e.correctness_mode != 0u;
+    if (e.max_voices != 0u) w.maxVoices = e.max_voices;
+    w.enableReverb = e.reverb_enabled != 0u;
+    w.reverbMix = e.reverb_mix;
+    w.reverbRoomSize = e.reverb_room_size;
+    w.reverbDecay = e.reverb_decay;
+    w.reverbDamping = e.reverb_damping;
+    w.reverbWidth = e.reverb_width;
+    w.reverbDiffusion = e.reverb_diffusion;
+    w.reverbPreDelayMs = e.reverb_pre_delay_ms;
+    w.reverbEarlyLevel = e.reverb_early_level;
+    w.reverbLateLevel = e.reverb_late_level;
+    w.reverbModDepth = e.reverb_mod_depth;
+    w.reverbModRate = e.reverb_mod_rate;
+    w.reverbLowCutHz = e.reverb_low_cut_hz;
+    w.reverbHighCutHz = e.reverb_high_cut_hz;
+    w.limiterEnabled = e.limiter_enabled != 0u;
+    w.limiterAlgorithm = (std::min)(1u, e.limiter_algorithm);
+    w.limiterThreshold = e.limiter_threshold;
+    w.limiterLookaheadMs = e.limiter_lookahead_ms;
+    w.limiterAttackMs = e.limiter_attack_ms;
+    w.limiterReleaseMs = e.limiter_release_ms;
     SeedWorkingLive();
     if (ConfigValuesEqual(before, w)) return;
     config_.MarkDirty();
@@ -1435,9 +1434,8 @@ void ConfiguratorApp::OnConnected() {
     rlRetryBackoff_ = 0.0f;
     rlFailedFlushes_ = 0u;
     statusMessage_ = "Connected to driver (PID " +
-                     std::to_string(rlLastKnownPid_) + ", RuntimeLink " +
-                     std::to_string(static_cast<uint32_t>(
-                         rlClient_.GetProtocol())) + ")";
+                     std::to_string(rlLastKnownPid_) + ", link v" +
+                     std::to_string(rlClient_.GetPeerInfo().protocolMax) + ")";
     toastTimer_ = 3.0f;
     toastMessage_ = statusMessage_;
 
@@ -1445,15 +1443,15 @@ void ConfiguratorApp::OnConnected() {
     // whatever the running engine is actually playing with.
     if (!config_.IsDirty() &&
         rlClient_.HasCapability(svms::build::CapabilityLiveConfiguration) &&
-        rlClient_.ReadTelemetry(rlTelemetry_) && rlTelemetry_.live.maxVoices != 0u) {
+        rlClient_.ReadTelemetry(rlTelemetry_) && rlTelemetry_.live.max_voices != 0u) {
         AdoptEngineLiveState();
     }
 }
 
 bool ConfiguratorApp::TryAutoDiscoverDriver() {
-    svms::EngineLink::HostInfo hosts[svms::kRuntimeHostMaxCount];
+    svms::EngineLink::HostInfo hosts[svms::EngineLink::kMaxHosts];
     const uint32_t count = svms::EngineLink::EnumerateHosts(
-        hosts, svms::kRuntimeHostMaxCount);
+        hosts, svms::EngineLink::kMaxHosts);
     if (count == 0u) return false;
 
     for (uint32_t pass = 0; pass < 2u; ++pass) {

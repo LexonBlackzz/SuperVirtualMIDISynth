@@ -1,6 +1,10 @@
 #ifndef SVMS_RUNTIME_LINK_PROTOCOL_H
 #define SVMS_RUNTIME_LINK_PROTOCOL_H
 //
+// PRIVATE TO THE TRANSPORT: only the driver, frontends/RemoteClient.cpp and the
+// wire tests include this. Everything else (the Configurator, tools) talks to the
+// engine through svmsapi.h: SVMS_TelemetryV3, SVMS_LiveParams, SVMS_COMMAND_*.
+//
 // SVMS RuntimeLink Protocol — V2
 // =============================
 //

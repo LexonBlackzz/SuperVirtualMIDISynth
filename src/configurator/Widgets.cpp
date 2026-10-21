@@ -6,7 +6,6 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "configurator/DriverLink.h"
-#include "driver/RuntimeLinkProtocol.h"
 #include <cmath>
 #include <cctype>
 #include <cstdio>
@@ -31,11 +30,11 @@ const LiveLinkContext& GetLiveLinkContext() { return g_liveLink; }
 // talk to the driver directly: every knob/edit marks its group dirty on
 // the app's coalescing working live state, and the app sends one grouped
 // ApplyLiveConfig command as soon as the current UI frame finishes.
-void PushLiveFloat(svms::RLCommandType type, float value) {
+void PushLiveFloat(LiveParam type, float value) {
     if (g_liveLink.app) g_liveLink.app->SetLiveFloat(type, value);
 }
 
-void PushLiveBool(svms::RLCommandType type, bool value) {
+void PushLiveBool(LiveParam type, bool value) {
     if (g_liveLink.app) g_liveLink.app->SetLiveBool(type, value);
 }
 
@@ -56,10 +55,10 @@ void NoteLiveChange() {
     if (g_liveLink.app) g_liveLink.app->NoteLiveChange();
 }
 
-void SendLiveCommand(svms::RLCommandType type, uint32_t param) {
+void SendLiveCommand(uint32_t command, uint32_t param) {
     if (!g_liveLink.connected || !g_liveLink.client) return;
-    char result[svms::kRuntimeLinkResultTextCapacity]{};
-    g_liveLink.client->SendCommand(type, 0u, param, svms::RuntimeLiveStateV2{}, 100u, result);
+    char result[svms::EngineLink::kResultTextBytes]{};
+    g_liveLink.client->SendCommand(command, param, 100u, result);
     NoteLiveChange();
 }
 

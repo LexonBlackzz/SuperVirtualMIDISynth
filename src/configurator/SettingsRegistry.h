@@ -34,7 +34,7 @@ struct SettingDef {
     const char* fxPanel;     // Effects chain panel to select, or nullptr
     const char* disclosure;  // disclosure key to open, or nullptr
     // True when the configurator never sends this setting over RuntimeLink
-    // (checked against the RLCommandType::Set* sends): it applies at the
+    // (checked against the SendLiveCommand / PushLive* sends): it applies at the
     // next driver start.
     bool restart;
     // Working vs saved differ for this setting; nullptr = search-only entry.
