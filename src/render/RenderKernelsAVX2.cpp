@@ -154,7 +154,7 @@ inline void GatherSamplePairAVX2(const int16_t* data, __m256i elem,
 inline void GatherSamplePairSeqAVX2(const int16_t* data, uint32_t readable,
                                     __m256i bases, __m256& first,
                                     __m256& second) {
-    const uint32_t lo = static_cast<uint32_t>(_mm256_cvtsi256_si32(bases));
+    const uint32_t lo = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm256_castsi256_si128(bases)));
     const uint32_t hi = static_cast<uint32_t>(_mm256_extract_epi32(bases, 7));
     if (hi - lo > 15u || lo + 24u > readable) {
         GatherSamplePairAVX2(data, bases, first, second);

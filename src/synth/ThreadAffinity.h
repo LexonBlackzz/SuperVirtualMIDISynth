@@ -7,7 +7,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 
 #include <atomic>
 #include <vector>
@@ -32,6 +34,7 @@ inline std::atomic<uint32_t> g_threadAffinityMode{0u};
 
 enum class AffinityRole : uint32_t { Realtime, Compiler, Worker };
 
+#if defined(_WIN32)
 struct CoreClassMasks {
     ULONG_PTR performance = 0;
     ULONG_PTR efficiency = 0;  // 0 unless the CPU reports mixed classes
@@ -140,6 +143,8 @@ inline void ApplyThreadAffinity(HANDLE thread, AffinityRole role) {
         ResetThreadAffinity(thread);
     }
 }
+
+#endif // _WIN32 (the pinning helpers are Windows-only)
 
 } // namespace svms
 
