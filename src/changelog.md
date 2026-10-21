@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-21 perf(v3): Hilbert pair build is ~2-3x faster. Real-input FFTs through half-size complex transforms done in place, precomputed twiddle tables, per-worker reusable workspace and cache-blocked early stages. CFaz Keys III (223M frames) 16 threads 15.9 s -> 5.6 s, single thread 35 s -> 13 s; Arachno 2.6 s -> 0.7 s. Companion store is identical to the old builder except 1 LSB in a handful of samples out of hundreds of millions (rounding ties).
+
 - 2026-10-21 feat(v3): offline stack entries can be restricted to a bank/program (`set_offline_soundfont_entries`), for the Maestro wrapper's per-list restrictions.
 
 - 2026-10-21 feat(v3): offline sessions take a SoundFont stack. `set_offline_soundfonts` / `set_offline_channel_soundfont` (SVMS_CAP_OFFLINE_SOUNDFONT_STACK) so a host can give every port its own ordered list; StandaloneSynth now holds several banks in one sample store, same resolution rules as the driver. Written for the Maestro wrapper.

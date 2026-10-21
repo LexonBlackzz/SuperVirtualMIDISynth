@@ -179,11 +179,12 @@ struct HilbertSliceJob {
 
 DWORD WINAPI HilbertSliceWorker(LPVOID param) noexcept {
     HilbertSliceJob* job = static_cast<HilbertSliceJob*>(param);
+    svms::hilbert_detail::Scratch scratch;  // reused for every slice we build
     for (;;) {
         const uint32_t task = job->next->fetch_add(1u,
             std::memory_order_relaxed);
         if (task >= job->taskCount) break;
-        svms::BuildHilbertSlice(job->src, job->dst, job->specs[task]);
+        svms::BuildHilbertSlice(job->src, job->dst, job->specs[task], &scratch);
     }
     return 0u;
 }
@@ -193,6 +194,11 @@ DWORD WINAPI HilbertSliceWorker(LPVOID param) noexcept {
 // sample store, so spec offsets stay bank-relative.
 static void BuildHilbertPairStore(const SF2Data* sf2, const int16_t* src,
                                   int16_t* hilbert) {
+    // The shared FFT twiddle tables (tens of MB for long samples) only live
+    // for the duration of a build.
+    struct DropTables {
+        ~DropTables() { svms::hilbert_detail::ClearTwiddleCache(); }
+    } dropTables;
     const std::vector<svms::HilbertSliceSpec> specs =
         svms::PlanHilbertSlices(*sf2);
     const uint32_t taskCount = static_cast<uint32_t>(specs.size());
