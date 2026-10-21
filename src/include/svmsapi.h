@@ -72,7 +72,9 @@ enum {
      * state (master, reverb, limiter, voice cap) as one typed struct. */
     SVMS_CAP_LIVE_PARAMS = UINT64_C(1) << 19,
     /* get_telemetry_v3: SVMS_TelemetryV2 plus the runtime-link-only fields. */
-    SVMS_CAP_TELEMETRY_V3 = UINT64_C(1) << 20
+    SVMS_CAP_TELEMETRY_V3 = UINT64_C(1) << 20,
+    /* Set on tables returned by SVMS_Remote_Attach (cross-process session). */
+    SVMS_CAP_REMOTE = UINT64_C(1) << 21
 };
 
 enum {
@@ -667,6 +669,61 @@ typedef struct SVMS_Interface {
     SVMS_SetLiveParamsFn set_live_params;
     SVMS_GetLiveParamsFn get_live_params;
 } SVMS_Interface;
+
+/* ── Remote attach (SVMS_CAP_REMOTE) ──────────────────────────────────────
+ * Talk to an SVMS engine running in ANOTHER process (a MIDI app that loaded
+ * winmm.dll / SVMSAPI.dll / libsvmsapi.so) the way the SVMS configurator does.
+ * These are exported next to SVMS_GetInterface and need no local engine: load
+ * the module, enumerate, attach. The transport is private to the module
+ * (shared memory on Windows, a Unix socket on Linux); do not depend on it.
+ *
+ * An attached session is an SVMS_Interface whose capabilities are
+ * SVMS_CAP_REMOTE plus what the host can serve over the link: RUNTIME_COMMANDS,
+ * LIVE_PARAMS and TELEMETRY_V3. Everything else (MIDI events, offline
+ * sessions, config JSON, ...) is NULL: events belong to the host's own
+ * clients. Remote semantics differ from in-process ones in three ways:
+ *  - get_telemetry_v3 fills the fields the link carries. Census counters the
+ *    link does not carry (lateness, shedding, collapse, render paths, ...)
+ *    stay zero.
+ *  - get_live_params returns the state the host last APPLIED (as telemetry
+ *    reports it), not the requested one.
+ *  - send_runtime_command only reaches commands the host implements; a
+ *    command it does not know returns SVMS_RESULT_UNSUPPORTED.
+ * Calls are serialized per session; sessions are independent. */
+typedef struct SVMS_HostInfo {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint32_t pid;
+    uint32_t arch_class;
+    uint32_t product_major;
+    uint32_t product_minor;
+    uint32_t product_patch;
+    uint32_t build_number;
+    uint32_t release_channel;
+    uint32_t protocol_min;
+    uint32_t protocol_max;
+    uint32_t fresh;                 /* heartbeat is recent */
+    uint32_t has_version_identity;  /* product_* / build_number are valid */
+    uint32_t reserved0;
+    uint64_t capability_flags;      /* host link capabilities (not SVMS_CAP_*) */
+    uint64_t session_id;
+    uint32_t reserved[4];
+} SVMS_HostInfo;
+
+/* Fills up to `capacity` entries, returns the number written. */
+SVMS_PUBLIC uint32_t SVMS_CALL SVMS_Remote_EnumerateHosts(
+    SVMS_HostInfo* out_hosts, uint32_t capacity);
+
+/* Attach to the host with this pid. On success `out_table` holds the remote
+ * function table (struct_size set; at most out_table_size bytes written) and
+ * `out_session` the handle to pass to it. Release with out_table->destroy_session. */
+SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_Attach(
+    uint32_t pid, uint32_t out_table_size, SVMS_Interface* out_table,
+    SVMS_Session* out_session);
+
+/* *out_alive = 1 when the host answered within timeout_ms. */
+SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_IsAlive(
+    SVMS_Session session, uint32_t timeout_ms, uint32_t* out_alive);
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
 // ABI version. The runtime writes at most caller_table_size bytes and reports

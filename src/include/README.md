@@ -414,3 +414,48 @@ api.set_live_params(session, SVMS_LIVE_GROUP_MASTER, &p);
 SVMS_TelemetryV3 t = { sizeof t, SVMS_STRUCT_VERSION_1 };
 api.get_telemetry_v3(session, &t);
 ```
+
+## Remote attach: control an engine in another process
+
+`SVMSAPI.dll` (and `libsvmsapi.so`) also export three functions that need no
+local engine, so a tool can drive the engine inside a MIDI app the way the SVMS
+configurator does:
+
+```c
+SVMS_HostInfo hosts[16];
+uint32_t n = SVMS_Remote_EnumerateHosts(hosts, 16);      /* running SVMS hosts */
+
+SVMS_Interface remote; SVMS_Session session;
+SVMS_Remote_Attach(hosts[0].pid, sizeof remote, &remote, &session);
+/* remote.capabilities has SVMS_CAP_REMOTE | LIVE_PARAMS | TELEMETRY_V3 |
+ * RUNTIME_COMMANDS; every other function pointer is NULL. */
+
+SVMS_TelemetryV3 t = { sizeof t, SVMS_STRUCT_VERSION_1 };
+remote.get_telemetry_v3(session, &t);
+
+SVMS_LiveParams p = { sizeof p, SVMS_STRUCT_VERSION_1 };
+remote.get_live_params(session, &p);
+p.master_volume = 0.5f;
+remote.set_live_params(session, SVMS_LIVE_GROUP_MASTER, &p);
+
+remote.destroy_session(session);                          /* detach */
+```
+
+`SVMS_Remote_IsAlive(session, timeout_ms, &alive)` checks the host heartbeat.
+The table is the same `SVMS_Interface` as an in-process one, so code written
+against `get_telemetry_v3` / `set_live_params` / `send_runtime_command` works on
+either; check `SVMS_CAP_REMOTE` for the differences:
+
+- `get_telemetry_v3` fills the fields the link carries. Census counters it does
+  not carry (lateness, shedding, collapse, render paths, ...) stay zero.
+- `get_live_params` returns the state the host last *applied* (from telemetry),
+  not the requested state; poll it to confirm a `set_live_params`.
+- `send_runtime_command` reaches only commands the host implements; the text
+  buffer is in/out as usual. Unknown commands return `SVMS_RESULT_UNSUPPORTED`.
+- MIDI events, offline sessions and config JSON are not available remotely.
+
+The wire transport (Windows shared memory, Linux Unix socket) is private to the
+module and may change; only these functions are the contract. The Linux
+transport reports the subset of parameters the Linux daemon exposes, so on
+Linux a `set_live_params` for a group the daemon lacks returns
+`SVMS_RESULT_UNSUPPORTED` after applying the groups it has.

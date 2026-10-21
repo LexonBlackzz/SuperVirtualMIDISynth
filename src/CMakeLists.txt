@@ -236,6 +236,7 @@ if(NOT WIN32)
 
     add_library(omnimidi SHARED
         frontends/LinuxKDMAPI.cpp
+        frontends/RemoteClient.cpp
         driver/ControlServer.cpp
         ${SVMS_PORTABLE_RENDER_SOURCES})
     target_include_directories(omnimidi PRIVATE
@@ -565,7 +566,7 @@ add_library(svmsynth SHARED frontends/FrontWinMM.cpp
 # surface: the permanent SVMS_GetInterface bootstrap plus the KDMAPI facade.
 # Deliberately no WinMM shim exports - SVMSAPI.dll is not a midiOutOpen
 # drop-in. Players integrate via LoadLibrary + GetProcAddress only.
-add_library(svmsapi SHARED frontends/FrontWinMM.cpp
+add_library(svmsapi SHARED frontends/FrontWinMM.cpp frontends/RemoteClient.cpp
     "${SVMS_GENERATED_DIR}/SVMSApiVersion.rc")
 
 foreach(svms_engine_target svms_engine svmsynth svmsapi)
@@ -889,6 +890,9 @@ set_target_properties(svmsynth PROPERTIES
 # smoke test also verifies). No WinMM shims.
 set(SVMSAPI_EXPORTS
         SVMS_GetInterface
+        SVMS_Remote_EnumerateHosts
+        SVMS_Remote_Attach
+        SVMS_Remote_IsAlive
         IsKDMAPIAvailable
         InitializeKDMAPIStream
         TerminateKDMAPIStream
@@ -1175,6 +1179,21 @@ if(SVMS_BUILD_TESTS)
              COMMAND svms_v3_native_api_smoke
                      "$<TARGET_FILE:svmsapi>")
     set_tests_properties(svms_v3_native_api PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(svms_v3_remote_client_smoke
+        tests/RemoteClientSmoke.cpp)
+    target_compile_definitions(svms_v3_remote_client_smoke PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(svms_v3_remote_client_smoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(SVMS_XP_COMPAT)
+        target_compile_definitions(svms_v3_remote_client_smoke PRIVATE SVMS_XP_COMPAT)
+    endif()
+    add_dependencies(svms_v3_remote_client_smoke svmsapi)
+    add_test(NAME svms_v3_remote_client
+             COMMAND svms_v3_remote_client_smoke "$<TARGET_FILE:svmsapi>")
+    set_tests_properties(svms_v3_remote_client PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     add_executable(svms_v3_tests
         tests/V3Tests.cpp
