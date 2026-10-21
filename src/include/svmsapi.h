@@ -80,7 +80,10 @@ enum {
     /* Set on tables returned by SVMS_Remote_Attach (cross-process session). */
     SVMS_CAP_REMOTE = UINT64_C(1) << 21,
     /* get_schema_json / get/set_param_value / get_metric_value / run_command. */
-    SVMS_CAP_SCHEMA = UINT64_C(1) << 22
+    SVMS_CAP_SCHEMA = UINT64_C(1) << 22,
+    /* set_offline_soundfonts / set_offline_channel_soundfont: an offline
+     * session can hold a priority-ordered SoundFont stack. */
+    SVMS_CAP_OFFLINE_SOUNDFONT_STACK = UINT64_C(1) << 23
 };
 
 enum {
@@ -658,6 +661,24 @@ typedef SVMS_Result (SVMS_CALL *SVMS_GetMetricValueFn)(
 typedef SVMS_Result (SVMS_CALL *SVMS_RunCommandFn)(
     SVMS_Session session, const char* name_utf8);
 
+/* ── Offline SoundFont stack (SVMS_CAP_OFFLINE_SOUNDFONT_STACK) ───────────
+ * Replaces the SoundFont(s) of an offline session (call between renders).
+ * `paths_utf8` is a priority-ordered stack of 1..16 files: the first entry
+ * answers a bank/program first, later entries fill in what it lacks. An SFZ
+ * in a stack claims only program 0 (Acoustic Grand Piano) unless it is the
+ * only font, and is otherwise the last resort. The new stack is parsed first;
+ * if anything fails the old one keeps playing (SVMS_RESULT_INTERNAL_ERROR).
+ * Sounding voices are cut when the new stack takes over; per-channel
+ * assignments are kept (dropped if their entry no longer exists). The loading
+ * blocks the caller. */
+typedef SVMS_Result (SVMS_CALL *SVMS_SetOfflineSoundFontsFn)(
+    SVMS_Session session, const char* const* paths_utf8, uint32_t count);
+/* Pins a MIDI channel (0..15) to a stack entry: font 0 = automatic,
+ * N = entry N (1-based) answers that channel first and the rest of the stack
+ * fills in. SVMS_RESULT_INVALID_ARGUMENT when N exceeds the stack. */
+typedef SVMS_Result (SVMS_CALL *SVMS_SetOfflineChannelSoundFontFn)(
+    SVMS_Session session, uint32_t channel, uint32_t font);
+
 typedef struct SVMS_Interface {
     uint32_t struct_size;
     uint32_t struct_version;
@@ -712,6 +733,8 @@ typedef struct SVMS_Interface {
     SVMS_SetParamValueFn set_param_value;
     SVMS_GetMetricValueFn get_metric_value;
     SVMS_RunCommandFn run_command;
+    SVMS_SetOfflineSoundFontsFn set_offline_soundfonts;
+    SVMS_SetOfflineChannelSoundFontFn set_offline_channel_soundfont;
 } SVMS_Interface;
 
 /* ── Remote attach (SVMS_CAP_REMOTE) ──────────────────────────────────────

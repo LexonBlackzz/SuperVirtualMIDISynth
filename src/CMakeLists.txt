@@ -1183,6 +1183,16 @@ if(SVMS_BUILD_TESTS)
                      "$<TARGET_FILE:svmsapi>")
     set_tests_properties(svms_v3_native_api PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(svms_v3_offline_stack_smoke
+        tests/OfflineStackSmoke.cpp)
+    target_include_directories(svms_v3_offline_stack_smoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_dependencies(svms_v3_offline_stack_smoke svmsapi)
+    add_test(NAME svms_v3_offline_stack
+             COMMAND svms_v3_offline_stack_smoke
+                     "$<TARGET_FILE:svmsapi>")
+    set_tests_properties(svms_v3_offline_stack PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(svms_v3_remote_client_smoke
         tests/RemoteClientSmoke.cpp)
     target_compile_definitions(svms_v3_remote_client_smoke PRIVATE

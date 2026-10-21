@@ -530,6 +530,26 @@ SVMS_Result SVMS_CALL NativeGetOfflineTelemetry(
     return g_nativeOfflineSessions.GetTelemetry(session, telemetry);
 }
 
+static SVMS_Result SVMS_CALL NativeSetOfflineSoundFonts(
+    SVMS_Session session, const char* const* pathsUtf8, uint32_t count) {
+    if (!g_nativeOfflineSessions.IsToken(session))
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    if (!pathsUtf8 || count == 0u || count > svms::kMaxSoundFontStackEntries)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    std::vector<std::wstring> paths(count);
+    for (uint32_t i = 0u; i < count; ++i)
+        if (!NativeUtf8ToWide(pathsUtf8[i], paths[i]))
+            return SVMS_RESULT_INVALID_ARGUMENT;
+    return g_nativeOfflineSessions.SetSoundFonts(session, paths);
+}
+
+static SVMS_Result SVMS_CALL NativeSetOfflineChannelSoundFont(
+    SVMS_Session session, uint32_t channel, uint32_t font) {
+    if (!g_nativeOfflineSessions.IsToken(session))
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    return g_nativeOfflineSessions.SetChannelSoundFont(session, channel, font);
+}
+
 static SVMS_Result NativeCopyUtf8(const std::string& value, char* buffer,
                                   uint32_t* inoutBytes) {
     if (!inoutBytes || value.size() >= UINT32_MAX)
@@ -614,7 +634,7 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_ISOLATED_OFFLINE_SESSIONS | SVMS_CAP_CONFIG_JSON |
         SVMS_CAP_CANCELLABLE_SUBMISSION | SVMS_CAP_TELEMETRY_V2 |
         SVMS_CAP_CALLBACK_TRACE | SVMS_CAP_MIDI_STREAM |
-        SVMS_CAP_DIRECT_PAGES;
+        SVMS_CAP_DIRECT_PAGES | SVMS_CAP_OFFLINE_SOUNDFONT_STACK;
 #if !defined(SVMS_XP_COMPAT)
     table.capabilities |= SVMS_CAP_RUNTIME_COMMANDS | SVMS_CAP_LIVE_PARAMS |
         SVMS_CAP_TELEMETRY_V3;
@@ -655,6 +675,8 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.read_callback_trace = NativeReadCallbackTrace;
     table.send_midi_stream = NativeSendMidiStream;
     table.send_short_batch_direct = NativeSendShortBatchDirect;
+    table.set_offline_soundfonts = NativeSetOfflineSoundFonts;
+    table.set_offline_channel_soundfont = NativeSetOfflineChannelSoundFont;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

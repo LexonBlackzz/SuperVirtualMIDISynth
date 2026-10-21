@@ -4,6 +4,7 @@
 #include "synth/Tuning.h"
 #include "synth/ChannelCache.h"
 #include "synth/Config.h"
+#include "synth/PresetResolve.h"
 #include "render/Envelope.h"
 #include "events/EventCompile.h"
 #include "render/HilbertPair.h"
@@ -23,6 +24,8 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -42,6 +45,8 @@ constexpr uint32_t kNoteOnCollapseWindowMs = 20u;
 
 struct StandaloneSynthConfig {
     std::wstring soundfont;
+    // Priority-ordered stack (first answers first). Empty = just `soundfont`.
+    std::vector<std::wstring> soundfonts;
     uint32_t sampleRate = 44100;
     uint32_t maxVoices = 4096;
     uint32_t renderThreads = 1;
@@ -73,52 +78,12 @@ public:
         rate_ = config.sampleRate;
         maxVoices_ = config.maxVoices;
         master_ = config.masterVolume;
-        // () not {}: SF2Data holds 65536 SFSampleRegions with member initializers;
-        // brace-init costs cl.exe ~3 s and far more memory in every TU that sees it.
-        sf2_.reset(new SF2Data());
-        if (!soundfont_load(config.soundfont.c_str(), sf2_.get())) {
-            error = "failed to load SoundFont";
-            return false;
+        rotationMode_ = config.phaseRotationMode;
+        {
+            std::vector<std::wstring> paths = config.soundfonts;
+            if (paths.empty()) paths.push_back(config.soundfont);
+            if (!LoadBanks(paths, error)) return false;
         }
-        sf2_build_regions(sf2_.get());
-        if (sf2_->regionOverflow || sf2_->regionCount == 0) {
-            error = "SoundFont has no usable compiled regions";
-            return false;
-        }
-        sampleData_.resize(sf2_->sampleDataFrames + 8u);
-        std::memcpy(sampleData_.data(), sf2_->sampleData,
-                    static_cast<size_t>(sf2_->sampleDataFrames) *
-                        sizeof(int16_t));
-        std::memset(sampleData_.data() + sf2_->sampleDataFrames, 0,
-                    8u * sizeof(int16_t));
-        sampleFrames_ = sf2_->sampleDataFrames;
-
-        // Standalone/offline must mean the same thing by "Analytic" as the
-        // realtime driver. Build the exact analytic companion before voice
-        // rotation is enabled; no allpass fallback for modes 1/2/4.
-        if (config.phaseRotationMode == 1u ||
-            config.phaseRotationMode == 2u ||
-            config.phaseRotationMode == 4u) {
-            try {
-                hilbertData_.assign(static_cast<size_t>(sampleFrames_) + 8u,
-                                    int16_t{0});
-            } catch (...) {
-                error = "cannot allocate SoundFont Hilbert companion";
-                return false;
-            }
-#if defined(SVMS_XP_COMPAT)
-            const uint32_t buildThreads = 1u;
-#else
-            const uint32_t buildThreads = (std::min)(
-                16u, (std::max)(1u, std::thread::hardware_concurrency()));
-#endif
-            BuildHilbertCompanion(*sf2_, sampleData_.data(),
-                                  hilbertData_.data(), buildThreads);
-        } else {
-            hilbertData_.clear();
-        }
-
-        prepared_.resize(sf2_->regionCount);
         if (const EngineConfig* t = config.tuning) {
             voices_.SetStealPolicy(t->stealPolicy);
             voices_.SetPerKeyVoiceCap(t->perKeyVoiceCap);
@@ -188,8 +153,7 @@ public:
             idx = (std::max)(1u, (std::min)(127u, idx));
             velGain_[v] = float(idx) * float(idx) / (127.0f * 127.0f);
         }
-        for (uint32_t i = 0; i < sf2_->regionCount; ++i)
-            Prepare(sf2_->regions[i], prepared_[i]);
+        RebuildPrepared();
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             RefreshPreset(channel);
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
@@ -264,16 +228,38 @@ public:
         // up front, so the pass runs on each block just before RenderBlock.
         // An exclusive-class SoundFont limits it to adjacent note-ons.
         noteMerge_ = collapseConfig.noteMerge;
-        noteMergeHoist_ = true;
-        for (uint32_t i = 0; i < sf2_->regionCount; ++i) {
-            if (sf2_->regions[i].exclusiveClass != 0 ||
-                sf2_->regions[i].offByClass != 0) {
-                noteMergeHoist_ = false;
-                break;
-            }
-        }
+        UpdateNoteMergeHoist();
         return true;
     }
+
+    // Replaces the SoundFont stack of a running session (call between
+    // renders). All sounding voices are cut; per-channel assignments stay.
+    // On failure the old stack keeps playing.
+    bool SetSoundFonts(const std::vector<std::wstring>& paths,
+                       std::string& error) {
+        if (gpuEnabled_) {
+            error = "the GPU backend cannot change SoundFonts";
+            return false;
+        }
+        if (!LoadBanks(paths, error)) return false;
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel)
+            voices_.SilenceChannelImmediate(channel);
+        RebuildPrepared();
+        UpdateNoteMergeHoist();
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel)
+            RefreshPreset(channel);
+        return true;
+    }
+
+    // font 0 = automatic, N = stack entry N (1-based) answers the channel first.
+    bool SetChannelSoundFont(uint8_t channel, uint32_t font) {
+        if (channel >= kChannelCount || font > banks_.size()) return false;
+        channelFont_[channel] = uint8_t(font);
+        RefreshPreset(channel);
+        return true;
+    }
+
+    uint32_t SoundFontCount() const { return uint32_t(banks_.size()); }
 
     ~StandaloneSynth() {
         // Opt-in end-of-session diagnostic: every plan refusal is a skipped
@@ -295,7 +281,7 @@ public:
                 (unsigned long long)renderer_.GetWvSegFallback(),
                 (unsigned long long)renderer_.GetGhostOverflowCount());
         }
-        if (sf2_) sf2_free(sf2_.get());
+        for (Bank& bank : banks_) sf2_free(bank.data.get());
     }
 
     StandaloneSynth() = default;
@@ -629,7 +615,7 @@ private:
     uint64_t mergedNoteOns_ = 0;
 
     struct RegionCacheEntry {
-        uint32_t tag = UINT32_MAX;
+        uint64_t tag = UINT64_MAX;
         uint16_t count = 0;
         uint16_t reserved = 0;
         uint32_t indices[8]{};
@@ -637,10 +623,14 @@ private:
 
     uint32_t tuningEdo_ = 12u;
 
-    uint32_t ResolveRegions(uint32_t preset, uint8_t note, uint8_t velocity,
-                            const SFSampleRegion** out, uint32_t capacity) {
-        const uint32_t tag = (preset << 15u) | (uint32_t(note) << 7u) | velocity;
-        uint32_t hash = tag;
+    // Cached indices are LOCAL to the font's SF2Data.
+    uint32_t ResolveRegions(uint32_t font, uint32_t preset, uint8_t note,
+                            uint8_t velocity, const SFSampleRegion** out,
+                            uint32_t capacity) {
+        const Bank& bank = banks_[font];
+        const uint64_t tag = (uint64_t(font) << 32u) |
+                             (preset << 15u) | (uint32_t(note) << 7u) | velocity;
+        uint32_t hash = uint32_t(tag) ^ (uint32_t(font) * 0x9e3779b1u);
         hash ^= hash >> 16u;
         hash *= 0x7feb352du;
         hash ^= hash >> 15u;
@@ -648,25 +638,26 @@ private:
         if (cached.tag == tag && cached.count <= 8u) {
             const uint32_t copied = (std::min)(uint32_t(cached.count), capacity);
             for (uint32_t i = 0; i < copied; ++i)
-                out[i] = &sf2_->regions[cached.indices[i]];
+                out[i] = &bank.data->regions[cached.indices[i]];
             return cached.count;
         }
-        const uint32_t count = sf2_find_regions(sf2_.get(), preset, note,
+        const uint32_t count = sf2_find_regions(bank.data.get(), preset, note,
                                                 velocity, out, capacity);
         if (count <= 8u && count <= capacity) {
             cached.tag = tag;
             cached.count = uint16_t(count);
             for (uint32_t i = 0; i < count; ++i)
-                cached.indices[i] = uint32_t(out[i] - sf2_->regions);
+                cached.indices[i] = uint32_t(out[i] - bank.data->regions);
         }
         return count;
     }
 
-    void Prepare(const SFSampleRegion& region, PreparedRegion& prepared) {
+    void Prepare(const SF2Data* sf2, const SFSampleRegion& region,
+                 PreparedRegion& prepared) {
         prepared = {};
-        if (!sf2_validate_region(sf2_.get(), &region) ||
-            region.sampleIndex >= sf2_->sampleCount) return;
-        const SF2Sample& sample = sf2_->samples[region.sampleIndex];
+        if (!sf2_validate_region(sf2, &region) ||
+            region.sampleIndex >= sf2->sampleCount) return;
+        const SF2Sample& sample = sf2->samples[region.sampleIndex];
         const int root = region.rootKey >= 0 ? region.rootKey : sample.originalPitch;
         prepared.bendScale =
             (region.scaleTuning ? region.scaleTuning : 100) / 100.0f;
@@ -679,7 +670,7 @@ private:
             prepared.baseStep[note] = sampleRatio * powf(2.0f, semitones / 12.0f);
         }
         prepared.attenuation = (region.initialAttenuation > 0 ||
-                                (sf2_->isSfz && region.initialAttenuation != 0))
+                                (sf2->isSfz && region.initialAttenuation != 0))
             ? InitialAttenuationToGain(float(region.initialAttenuation)) : 1.0f;
         prepared.sustain = (std::min)(
             1.0f, SustainAttenuationToGain(
@@ -713,17 +704,127 @@ private:
         prepared.valid = true;
     }
 
-    bool Resolve(uint8_t channel, uint32_t& preset) {
-        return sf2_resolve_preset(sf2_.get(), channels_.GetBankMSB(channel),
-                                  channels_.GetProgram(channel),
-                                  channels_.IsPercussion(channel),
-                                  &preset);
+    bool Resolve(uint8_t channel, uint32_t& font, uint32_t& preset) {
+        std::array<const SF2Data*, kMaxSoundFontStackEntries> data{};
+        for (size_t i = 0; i < banks_.size(); ++i) data[i] = banks_[i].data.get();
+        uint8_t found = 0;
+        if (!ResolveStackPreset(data.data(), uint32_t(banks_.size()), nullptr, 0u,
+                                int(channelFont_[channel]) - 1,
+                                channels_.GetBankMSB(channel),
+                                channels_.GetProgram(channel),
+                                channels_.IsPercussion(channel), &found,
+                                &preset))
+            return false;
+        font = found;
+        return true;
     }
 
     void RefreshPreset(uint8_t channel) {
-        uint32_t preset = 0;
-        channels_.SetSelectedPreset(
-            channel, Resolve(channel, preset) ? uint16_t(preset) : UINT16_MAX);
+        uint32_t font = 0, preset = 0;
+        if (Resolve(channel, font, preset)) {
+            selFont_[channel] = uint8_t(font);
+            channels_.SetSelectedPreset(channel, uint16_t(preset));
+        } else {
+            channels_.SetSelectedPreset(channel, UINT16_MAX);
+        }
+    }
+
+    // Parses a whole stack, then swaps it in; the old one survives a failure.
+    bool LoadBanks(const std::vector<std::wstring>& paths, std::string& error) {
+        if (paths.empty() || paths.size() > kMaxSoundFontStackEntries) {
+            error = "SoundFont stack must hold 1..16 entries";
+            return false;
+        }
+        std::vector<Bank> banks;
+        const auto freeAll = [&] {
+            for (Bank& b : banks) sf2_free(b.data.get());
+        };
+        uint64_t frames = 0, regions = 0;
+        for (const std::wstring& path : paths) {
+            Bank bank;
+            // () not {}: SF2Data holds 65536 SFSampleRegions with member
+            // initializers; brace-init costs cl.exe ~3 s and far more memory
+            // in every TU that sees it.
+            bank.data.reset(new SF2Data());
+            if (!soundfont_load(path.c_str(), bank.data.get())) {
+                sf2_free(bank.data.get());
+                freeAll();
+                error = "failed to load SoundFont";
+                return false;
+            }
+            sf2_build_regions(bank.data.get());
+            if (bank.data->regionOverflow || bank.data->regionCount == 0) {
+                sf2_free(bank.data.get());
+                freeAll();
+                error = "SoundFont has no usable compiled regions";
+                return false;
+            }
+            bank.sampleBase = uint32_t(frames);
+            bank.regionBase = uint32_t(regions);
+            frames += bank.data->sampleDataFrames;
+            regions += bank.data->regionCount;
+            banks.push_back(std::move(bank));
+            if (frames >= UINT32_MAX - 8u) {
+                freeAll();
+                error = "SoundFont stack is too large";
+                return false;
+            }
+        }
+        std::vector<int16_t> samples, hilbert;
+        try {
+            samples.assign(size_t(frames) + 8u, int16_t{0});
+            for (const Bank& b : banks)
+                std::memcpy(samples.data() + b.sampleBase, b.data->sampleData,
+                            size_t(b.data->sampleDataFrames) * sizeof(int16_t));
+            // Standalone/offline must mean the same thing by "Analytic" as the
+            // realtime driver: build the exact companion before rotation is
+            // enabled; no allpass fallback for modes 1/2/4.
+            if (rotationMode_ == 1u || rotationMode_ == 2u || rotationMode_ == 4u) {
+                hilbert.assign(size_t(frames) + 8u, int16_t{0});
+#if defined(SVMS_XP_COMPAT)
+                const uint32_t buildThreads = 1u;
+#else
+                const uint32_t buildThreads = (std::min)(
+                    16u, (std::max)(1u, std::thread::hardware_concurrency()));
+#endif
+                for (const Bank& b : banks)
+                    BuildHilbertCompanion(*b.data, samples.data() + b.sampleBase,
+                                          hilbert.data() + b.sampleBase,
+                                          buildThreads);
+            }
+        } catch (...) {
+            freeAll();
+            error = "cannot allocate the SoundFont sample store";
+            return false;
+        }
+        for (Bank& b : banks_) sf2_free(b.data.get());
+        banks_ = std::move(banks);
+        sampleData_ = std::move(samples);
+        hilbertData_ = std::move(hilbert);
+        sampleFrames_ = uint32_t(frames);
+        prepared_.assign(size_t(regions), PreparedRegion{});
+        for (RegionCacheEntry& e : regionCache_) e = RegionCacheEntry{};
+        for (uint8_t& f : selFont_) f = 0;
+        for (uint8_t& f : channelFont_) if (f > banks_.size()) f = 0;
+        return true;
+    }
+
+    void RebuildPrepared() {
+        for (const Bank& b : banks_)
+            for (uint32_t i = 0; i < b.data->regionCount; ++i)
+                Prepare(b.data.get(), b.data->regions[i],
+                        prepared_[b.regionBase + i]);
+    }
+
+    void UpdateNoteMergeHoist() {
+        noteMergeHoist_ = true;
+        for (const Bank& b : banks_)
+            for (uint32_t i = 0; i < b.data->regionCount; ++i)
+                if (b.data->regions[i].exclusiveClass != 0 ||
+                    b.data->regions[i].offByClass != 0) {
+                    noteMergeHoist_ = false;
+                    return;
+                }
     }
 
     // `multiplicity` > 1 launches one voice standing for that many exact
@@ -744,29 +845,32 @@ private:
         if (velGain_[velocity & 127u] <= 0.0f) return;  // velocity ignore gate
         channels_.NoteOn(channel, note, velocity);
         uint32_t preset = channels_.GetSelectedPreset(channel);
-        if (preset >= sf2_->presetCount) {
-            if (!Resolve(channel, preset)) {
+        uint32_t font = selFont_[channel];
+        if (preset >= banks_[font].data->presetCount) {
+            if (!Resolve(channel, font, preset)) {
                 ++missingPresets_;
                 return;
             }
+            selFont_[channel] = uint8_t(font);
             channels_.SetSelectedPreset(channel, uint16_t(preset));
         }
+        const Bank& bank = banks_[font];
 #if defined(_MSC_VER)
         const uint64_t resolveBegin = __rdtsc();
 #endif
         const SFSampleRegion* regions[512];
         const bool edo31 = tuningEdo_ == 31u && !channels_.IsPercussion(channel);
         const uint8_t regionNote = MidiRegionKey(note, edo31);
-        uint32_t count = ResolveRegions(preset, regionNote, velocity, regions, 512);
+        uint32_t count = ResolveRegions(font, preset, regionNote, velocity, regions, 512);
 #if defined(_MSC_VER)
         dispatchProfile.resolve += __rdtsc() - resolveBegin;
 #endif
         if (!count || count > 512) {
             // Region fallback: resolve against the widest-coverage preset so
             // incomplete instruments stay audible (see SF2Data docs).
-            const uint16_t fb = sf2_->fallbackPresetIndex;
-            if (fb < sf2_->presetCount && fb != preset)
-                count = ResolveRegions(fb, regionNote, velocity, regions, 512);
+            const uint16_t fb = bank.data->fallbackPresetIndex;
+            if (fb < bank.data->presetCount && fb != preset)
+                count = ResolveRegions(font, fb, regionNote, velocity, regions, 512);
             if (!count || count > 512) {
                 ++missingRegions_;
                 return;
@@ -774,7 +878,8 @@ private:
             ++fallbackRegions_;
         }
         for (uint32_t i = 0; i < count; ++i) {
-            const uint32_t regionIndex = uint32_t(regions[i] - sf2_->regions);
+            const uint32_t regionIndex = bank.regionBase +
+                uint32_t(regions[i] - bank.data->regions);
             if (regionIndex >= prepared_.size() || !prepared_[regionIndex].valid) {
                 ++invalidRegions_;
                 return;
@@ -790,18 +895,18 @@ private:
 #endif
         for (uint32_t i = 0; i < count; ++i) {
             const SFSampleRegion& region = *regions[i];
-            const uint32_t regionIndex = uint32_t(regions[i] - sf2_->regions);
-            const PreparedRegion& prepared = prepared_[regionIndex];
+            const uint32_t localRegion = uint32_t(regions[i] - bank.data->regions);
+            const PreparedRegion& prepared = prepared_[bank.regionBase + localRegion];
             const float bendRatio = prepared.bendScale == 1.0f
                 ? bendRatio_[channel]
                 : powf(2.0f, bend * prepared.bendScale / 12.0f);
             const float gain = velocityGain * prepared.attenuation;
             VoiceConfiguration& voice = launchSetups_[i];
             voice = VoiceConfiguration{};
-            voice.sampleStart = uint32_t(region.startOffset);
-            voice.sampleEnd = uint32_t(region.endOffset);
-            voice.loopStart = uint32_t(region.loopStartOffset);
-            voice.loopEnd = uint32_t(region.loopEndOffset);
+            voice.sampleStart = bank.sampleBase + uint32_t(region.startOffset);
+            voice.sampleEnd = bank.sampleBase + uint32_t(region.endOffset);
+            voice.loopStart = bank.sampleBase + uint32_t(region.loopStartOffset);
+            voice.loopEnd = bank.sampleBase + uint32_t(region.loopEndOffset);
             voice.loopMode = region.loopMode;
             voice.playIndex = generation;
             voice.delaySamples = prepared.delay;
@@ -825,7 +930,7 @@ private:
             voice.filterB2 = prepared.filter.b2;
             voice.filterEnabled = prepared.filter.enabled;
             voice.presetIndex = uint16_t(preset);
-            voice.regionIndex = uint16_t(regionIndex);
+            voice.regionIndex = uint16_t(localRegion);
             voice.exclusiveClass = region.exclusiveClass > 0
                 ? uint16_t(region.exclusiveClass) : 0u;
             voice.offByClass = region.offByClass < 0
@@ -930,11 +1035,13 @@ private:
     void Program(uint8_t channel, uint8_t program) {
         const uint8_t oldProgram = channels_.GetProgram(channel);
         channels_.ProgramChange(channel, program);
-        uint32_t preset = 0;
-        if (Resolve(channel, preset))
+        uint32_t font = 0, preset = 0;
+        if (Resolve(channel, font, preset)) {
+            selFont_[channel] = uint8_t(font);
             channels_.SetSelectedPreset(channel, uint16_t(preset));
-        else
+        } else {
             channels_.ProgramChange(channel, oldProgram);
+        }
     }
 
     void Bend(uint8_t channel, uint8_t low, uint8_t high) {
@@ -1030,7 +1137,15 @@ private:
     uint64_t notes_ = 0, noteCalls_ = 0, physicalLaunches_ = 0;
     uint64_t missingPresets_ = 0;
     uint64_t missingRegions_ = 0, invalidRegions_ = 0, fallbackRegions_ = 0;
-    std::unique_ptr<SF2Data> sf2_;
+    struct Bank {
+        std::unique_ptr<SF2Data> data;
+        uint32_t sampleBase = 0;   // offset into the concatenated sample store
+        uint32_t regionBase = 0;   // offset into prepared_
+    };
+    std::vector<Bank> banks_;
+    uint8_t channelFont_[kChannelCount]{};  // 0 = automatic, N = banks_[N-1]
+    uint8_t selFont_[kChannelCount]{};      // bank the channel's preset is in
+    uint32_t rotationMode_ = 0;
     std::vector<int16_t> sampleData_;
     std::vector<int16_t> hilbertData_;
     uint32_t sampleFrames_ = 0;

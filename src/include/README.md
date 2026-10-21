@@ -146,6 +146,26 @@ to `max_block_frames`, so rendering does not grow buffers. Use
 `get_offline_telemetry` for position, event, voice, and stealing counters, and
 destroy either kind with the original `destroy_session` function.
 
+### SoundFont stacks in offline sessions
+
+Runtimes advertising `SVMS_CAP_OFFLINE_SOUNDFONT_STACK` let a host hand each
+offline session an ordered list of SoundFonts (this is how a multi-port host
+gives every port its own list):
+
+- `set_offline_soundfonts(session, paths_utf8, count)` installs 1..16 files,
+  first entry first. Call it between renders; it blocks while the files load.
+  Sounding voices are cut when the new stack takes over, and a stack that fails
+  to load leaves the old one playing.
+- `set_offline_channel_soundfont(session, channel, font)` pins a MIDI channel
+  to entry `font` (1-based; 0 = automatic). The pinned entry answers first and
+  the rest of the stack fills in what it lacks.
+- Resolution order: pinned entry, then stack order. An SFZ inside a stack only
+  claims program 0 (Acoustic Grand Piano) so it cannot swallow every other
+  program; it is still the last resort for anything nobody else has. A lone
+  SFZ answers everything.
+
+One offline session is one 16-channel port, so give each port its own session.
+
 ## Configuration access
 
 Windows runtimes advertising `SVMS_CAP_CONFIG_JSON` expose the selected V3
