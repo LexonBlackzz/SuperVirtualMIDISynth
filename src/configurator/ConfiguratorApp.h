@@ -108,7 +108,7 @@ private:
     LiveRecordingPage liveRecordingPage_;
     bool showMegaFuckerPopup_ = false;
 
-    svms::RuntimeLinkClient rlClient_;
+    svms::EngineLink rlClient_;
     svms::RuntimeLinkTelemetryV2 rlTelemetry_{};
     bool rlConnected_ = false;
     float rlPollTimer_ = 0.0f;

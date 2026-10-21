@@ -893,6 +893,7 @@ set(SVMSAPI_EXPORTS
         SVMS_Remote_EnumerateHosts
         SVMS_Remote_Attach
         SVMS_Remote_IsAlive
+        SVMS_Remote_SetTimeout
         IsKDMAPIAvailable
         InitializeKDMAPIStream
         TerminateKDMAPIStream
@@ -1017,6 +1018,7 @@ if(NOT SVMS_XP_COMPAT)
     )
     set(CONFIGURATOR_SOURCES
         configurator/Main.cpp
+        frontends/RemoteClient.cpp
         configurator/ConfiguratorApp.cpp
         configurator/Platform_Win32.cpp
         configurator/PlatformUtil.cpp
@@ -1193,6 +1195,22 @@ if(SVMS_BUILD_TESTS)
     add_test(NAME svms_v3_remote_client
              COMMAND svms_v3_remote_client_smoke "$<TARGET_FILE:svmsapi>")
     set_tests_properties(svms_v3_remote_client PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+    add_executable(svms_v3_engine_link_smoke
+        tests/EngineLinkSmoke.cpp
+        frontends/RemoteClient.cpp)
+    target_compile_definitions(svms_v3_engine_link_smoke PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_engine_link_smoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(SVMS_XP_COMPAT)
+        target_compile_definitions(svms_v3_engine_link_smoke PRIVATE SVMS_XP_COMPAT)
+    endif()
+    add_dependencies(svms_v3_engine_link_smoke svmsapi)
+    add_test(NAME svms_v3_engine_link
+             COMMAND svms_v3_engine_link_smoke "$<TARGET_FILE:svmsapi>")
+    set_tests_properties(svms_v3_engine_link PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     add_executable(svms_v3_tests

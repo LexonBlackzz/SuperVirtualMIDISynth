@@ -7,21 +7,21 @@
 #include <string>
 
 namespace svms {
-class RuntimeLinkClient;
+class EngineLink;
 }
 
 namespace svms::cfg {
 
 class LiveRecordingPage {
 public:
-    void Draw(svms::RuntimeLinkClient* client, bool connected, HWND owner);
+    void Draw(svms::EngineLink* client, bool connected, HWND owner);
 
 private:
     void EnsureDefaultPath();
     void Browse(HWND owner);
-    void Start(svms::RuntimeLinkClient& client);
-    void Stop(svms::RuntimeLinkClient& client);
-    void Query(svms::RuntimeLinkClient& client, bool force);
+    void Start(svms::EngineLink& client);
+    void Stop(svms::EngineLink& client);
+    void Query(svms::EngineLink& client, bool force);
 
     std::wstring outputPath_;
     std::wstring lastDirectory_;

@@ -125,7 +125,7 @@ bool ParseU64Field(char*& cursor, uint64_t& value) {
     return true;
 }
 
-void PollSoundFontStatus(svms::RuntimeLinkClient& client, SoundFontLiveStatus& status) {
+void PollSoundFontStatus(svms::EngineLink& client, SoundFontLiveStatus& status) {
     status.pollTimer += ImGui::GetIO().DeltaTime;
     if (status.pollTimer < 0.25f) return;
     status.pollTimer = 0.0f;
@@ -150,7 +150,7 @@ void PollSoundFontStatus(svms::RuntimeLinkClient& client, SoundFontLiveStatus& s
     else status.message = "Ready";
 }
 
-void StartSoundFontLoad(svms::RuntimeLinkClient& client, const std::wstring& path, SoundFontLiveStatus& status) {
+void StartSoundFontLoad(svms::EngineLink& client, const std::wstring& path, SoundFontLiveStatus& status) {
     const std::string utf8 = util::WideToUtf8(path);
     if (utf8.empty() || utf8.size() >= svms::kRuntimeLinkCommandTextCapacity) {
         status.message = "The SoundFont path is too long for RuntimeLink.";

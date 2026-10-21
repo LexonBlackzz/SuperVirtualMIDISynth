@@ -115,7 +115,7 @@ void LiveRecordingPage::Browse(HWND owner) {
     lastDirectory_ = std::filesystem::path(outputPath_).parent_path().wstring();
 }
 
-void LiveRecordingPage::Start(svms::RuntimeLinkClient& client) {
+void LiveRecordingPage::Start(svms::EngineLink& client) {
     const std::string utf8 = WideToUtf8(outputPath_);
     if (utf8.empty()) {
         status_ = "The output path could not be encoded as UTF-8.";
@@ -137,7 +137,7 @@ void LiveRecordingPage::Start(svms::RuntimeLinkClient& client) {
     }
 }
 
-void LiveRecordingPage::Stop(svms::RuntimeLinkClient& client) {
+void LiveRecordingPage::Stop(svms::EngineLink& client) {
     char result[svms::kRuntimeLinkResultTextCapacity]{};
     const svms::RLResult code = client.SendCommand(
         svms::RLCommandType::StopLiveRecording, 0u, 0u,
@@ -147,7 +147,7 @@ void LiveRecordingPage::Stop(svms::RuntimeLinkClient& client) {
     Query(client, true);
 }
 
-void LiveRecordingPage::Query(svms::RuntimeLinkClient& client, bool force) {
+void LiveRecordingPage::Query(svms::EngineLink& client, bool force) {
     if (!force) {
         queryTimer_ += ImGui::GetIO().DeltaTime;
         if (queryTimer_ < 0.25f) return;
@@ -185,7 +185,7 @@ void LiveRecordingPage::Query(svms::RuntimeLinkClient& client, bool force) {
     }
 }
 
-void LiveRecordingPage::Draw(svms::RuntimeLinkClient* client,
+void LiveRecordingPage::Draw(svms::EngineLink* client,
                              bool connected, HWND owner) {
     EnsureDefaultPath();
     const bool supported = connected && client && client->HasCapability(
@@ -316,7 +316,7 @@ void LiveRecordingPage::Draw(svms::RuntimeLinkClient* client,
 
 namespace svms::cfg {
 
-void LiveRecordingPage::Draw(svms::RuntimeLinkClient*, bool, HWND) {
+void LiveRecordingPage::Draw(svms::EngineLink*, bool, HWND) {
     ImGui::TextWrapped("Live recording is not available for the Linux driver yet.");
 }
 

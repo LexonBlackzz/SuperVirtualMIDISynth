@@ -7,7 +7,7 @@
 #include <functional>
 
 namespace svms {
-class RuntimeLinkClient;
+class EngineLink;
 struct RuntimeLinkTelemetryV2;
 enum class RLCommandType : uint32_t;
 }
@@ -19,7 +19,7 @@ struct ConfigValues;
 
 struct LiveLinkContext {
     ConfiguratorApp* app = nullptr;              // routing target for live changes
-    svms::RuntimeLinkClient* client = nullptr; // direct client access (reserved)
+    svms::EngineLink* client = nullptr; // direct client access (reserved)
     const svms::RuntimeLinkTelemetryV2* telemetry = nullptr;
     bool connected = false;
 };

@@ -34,7 +34,11 @@ typedef enum SVMS_Result {
     SVMS_RESULT_NO_RESOURCES = 5,
     SVMS_RESULT_INTERNAL_ERROR = 6,
     SVMS_RESULT_BUFFER_TOO_SMALL = 7,
-    SVMS_RESULT_CANCELLED = 8
+    SVMS_RESULT_CANCELLED = 8,
+    /* Live-control outcomes (send_runtime_command / set_live_params). */
+    SVMS_RESULT_RESTART_REQUIRED = 9,  /* valid request; applies after a restart */
+    SVMS_RESULT_LOAD_FAILED = 10,
+    SVMS_RESULT_BUSY = 11              /* try again shortly */
 } SVMS_Result;
 
 enum {
@@ -724,6 +728,11 @@ SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_Attach(
 /* *out_alive = 1 when the host answered within timeout_ms. */
 SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_IsAlive(
     SVMS_Session session, uint32_t timeout_ms, uint32_t* out_alive);
+
+/* Per-call timeout for a remote session's commands (default 1500 ms). The
+ * configurator polls with short timeouts from its UI thread. */
+SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_SetTimeout(
+    SVMS_Session session, uint32_t timeout_ms);
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
 // ABI version. The runtime writes at most caller_table_size bytes and reports

@@ -37,7 +37,7 @@ namespace svms::cfg {
 enum class VersionRelation { Unknown, Same, DriverOlder, DriverNewer };
 
 static VersionRelation CompareDriverVersion(
-    const svms::RuntimeLinkClient::HostInfo& peer) {
+    const svms::EngineLink::HostInfo& peer) {
     if (!peer.hasVersionIdentity) return VersionRelation::Unknown;
     const uint32_t driver[3] = {
         peer.productMajor, peer.productMinor, peer.productPatch };
@@ -1451,8 +1451,8 @@ void ConfiguratorApp::OnConnected() {
 }
 
 bool ConfiguratorApp::TryAutoDiscoverDriver() {
-    svms::RuntimeLinkClient::HostInfo hosts[svms::kRuntimeHostMaxCount];
-    const uint32_t count = svms::RuntimeLinkClient::EnumerateHosts(
+    svms::EngineLink::HostInfo hosts[svms::kRuntimeHostMaxCount];
+    const uint32_t count = svms::EngineLink::EnumerateHosts(
         hosts, svms::kRuntimeHostMaxCount);
     if (count == 0u) return false;
 

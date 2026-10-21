@@ -19,6 +19,10 @@ SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_Attach(uint32_t, uint32_t,
                                                      SVMS_Session*) {
     return SVMS_RESULT_UNSUPPORTED;
 }
+SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_SetTimeout(SVMS_Session,
+                                                         uint32_t) {
+    return SVMS_RESULT_UNSUPPORTED;
+}
 SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_IsAlive(SVMS_Session, uint32_t,
                                                       uint32_t*) {
     return SVMS_RESULT_UNSUPPORTED;
@@ -27,10 +31,15 @@ SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_IsAlive(SVMS_Session, uint32_t,
 
 #else
 
-#include "configurator/DriverLink.h"
+#ifdef _WIN32
+#include "driver/RuntimeLink.h"
+#else
+#include "configurator/SocketRuntimeLink.h"
+#endif
 #include "driver/LiveParamsConvert.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -52,6 +61,7 @@ void CopyText(char* dst, size_t capacity, const char* src) {
 struct Remote {
     std::mutex mutex;  // the link clients are single-threaded
     svms::RuntimeLinkClient client;
+    std::atomic<uint32_t> timeoutMs{kCommandTimeoutMs};
 };
 
 std::mutex g_remotesMutex;
@@ -64,16 +74,6 @@ std::shared_ptr<Remote> FindRemote(SVMS_Session session) {
     return it == g_remotes.end() ? nullptr : it->second;
 }
 
-SVMS_Result ToApiResult(svms::RLResult result) {
-    switch (result) {
-        case svms::RLResult::Ok: return SVMS_RESULT_OK;
-        case svms::RLResult::InvalidArgument: return SVMS_RESULT_INVALID_ARGUMENT;
-        case svms::RLResult::Unsupported:
-        case svms::RLResult::RestartRequired: return SVMS_RESULT_UNSUPPORTED;
-        case svms::RLResult::Busy: return SVMS_RESULT_NO_RESOURCES;
-        default: return SVMS_RESULT_INTERNAL_ERROR;
-    }
-}
 
 // What the link carries of the V2 census; the rest stays zero (documented in
 // svmsapi.h).
@@ -174,9 +174,9 @@ SVMS_Result SVMS_CALL RemoteSetLiveParams(SVMS_Session session,
     svms::LiveFromApi(*params, live);
     char text[svms::kRuntimeLinkResultTextCapacity]{};
     std::lock_guard<std::mutex> lock(remote->mutex);
-    return ToApiResult(remote->client.SendCommand(
+    return svms::ApiResultFromRL(remote->client.SendCommand(
         svms::RLCommandType::ApplyLiveConfig,
-        group_mask & SVMS_LIVE_GROUP_ALL, 0u, live, kCommandTimeoutMs, text));
+        group_mask & SVMS_LIVE_GROUP_ALL, 0u, live, remote->timeoutMs.load(), text));
 }
 
 // The text buffer is in/out, exactly as for an in-process session.
@@ -197,11 +197,11 @@ SVMS_Result SVMS_CALL RemoteSendRuntimeCommand(SVMS_Session session,
         std::lock_guard<std::mutex> lock(remote->mutex);
         rl = remote->client.SendCommand(
             static_cast<svms::RLCommandType>(command), 0u, param,
-            svms::RuntimeLiveStateV2{}, kCommandTimeoutMs, result,
+            svms::RuntimeLiveStateV2{}, remote->timeoutMs.load(), result,
             request[0] ? request : nullptr);
     }
     if (text_bytes != 0u) CopyText(text, text_bytes, result);
-    return ToApiResult(rl);
+    return svms::ApiResultFromRL(rl);
 }
 
 SVMS_Result SVMS_CALL RemoteReset(SVMS_Session session) {
@@ -279,6 +279,16 @@ SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_Attach(
     std::memcpy(out_table, &table, (std::min)(out_table_size,
                 static_cast<uint32_t>(sizeof(table))));
     *out_session = session;
+    return SVMS_RESULT_OK;
+}
+
+SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_SetTimeout(
+    SVMS_Session session, uint32_t timeout_ms) {
+    const std::shared_ptr<Remote> remote = FindRemote(session);
+    if (!remote) return SVMS_RESULT_NOT_INITIALIZED;
+    if (timeout_ms == 0u || timeout_ms > 60000u)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    remote->timeoutMs.store(timeout_ms);
     return SVMS_RESULT_OK;
 }
 

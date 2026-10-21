@@ -459,3 +459,9 @@ module and may change; only these functions are the contract. The Linux
 transport reports the subset of parameters the Linux daemon exposes, so on
 Linux a `set_live_params` for a group the daemon lacks returns
 `SVMS_RESULT_UNSUPPORTED` after applying the groups it has.
+
+`SVMS_Remote_SetTimeout(session, ms)` sets the per-command timeout of an
+attached session (default 1500 ms) for callers that poll from a UI thread. The
+live-control results `SVMS_RESULT_RESTART_REQUIRED`, `SVMS_RESULT_LOAD_FAILED`
+and `SVMS_RESULT_BUSY` are returned by `send_runtime_command` and
+`set_live_params` for in-process and remote sessions alike.

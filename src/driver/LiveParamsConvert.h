@@ -102,6 +102,34 @@ inline void FillTelemetryV3Extension(const RuntimeLinkTelemetryV2& t,
     std::memcpy(r.soundfont_name, t.soundFontName, sizeof(r.soundfont_name));
 }
 
+// RLResult <-> SVMS_Result: the native API now carries the live-control
+// outcomes (restart required, load failed, busy) the configurator relies on.
+inline SVMS_Result ApiResultFromRL(RLResult r) {
+    switch (r) {
+        case RLResult::Ok: return SVMS_RESULT_OK;
+        case RLResult::InvalidArgument: return SVMS_RESULT_INVALID_ARGUMENT;
+        case RLResult::Unsupported: return SVMS_RESULT_UNSUPPORTED;
+        case RLResult::Busy: return SVMS_RESULT_BUSY;
+        case RLResult::RestartRequired: return SVMS_RESULT_RESTART_REQUIRED;
+        case RLResult::LoadFailed: return SVMS_RESULT_LOAD_FAILED;
+        default: return SVMS_RESULT_INTERNAL_ERROR;
+    }
+}
+
+inline RLResult RLFromApiResult(SVMS_Result r) {
+    switch (r) {
+        case SVMS_RESULT_OK: return RLResult::Ok;
+        case SVMS_RESULT_INVALID_ARGUMENT: return RLResult::InvalidArgument;
+        case SVMS_RESULT_UNSUPPORTED:
+        case SVMS_RESULT_UNSUPPORTED_ABI: return RLResult::Unsupported;
+        case SVMS_RESULT_BUSY:
+        case SVMS_RESULT_NO_RESOURCES: return RLResult::Busy;
+        case SVMS_RESULT_RESTART_REQUIRED: return RLResult::RestartRequired;
+        case SVMS_RESULT_LOAD_FAILED: return RLResult::LoadFailed;
+        default: return RLResult::InternalError;
+    }
+}
+
 } // namespace svms
 
 #endif

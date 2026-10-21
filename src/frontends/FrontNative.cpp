@@ -1,6 +1,7 @@
 // Native SVMS API: SVMS_GetInterface and its session functions.
 
 #include "driver/DriverInternal.h"
+#include "driver/LiveParamsConvert.h"
 #include "frontends/NativeOffline.h"
 
 
@@ -267,12 +268,7 @@ static SVMS_Result SVMS_CALL NativeSendRuntimeCommand(
     if (inout_text_bytes != 0u) {
         strncpy_s(result_text_utf8, inout_text_bytes, text, _TRUNCATE);
     }
-    switch (rl) {
-        case svms::RLResult::Ok: return SVMS_RESULT_OK;
-        case svms::RLResult::InvalidArgument:
-            return SVMS_RESULT_INVALID_ARGUMENT;
-        default: return SVMS_RESULT_INTERNAL_ERROR;
-    }
+    return svms::ApiResultFromRL(rl);
 #endif
 }
 
@@ -308,9 +304,7 @@ static SVMS_Result SVMS_CALL NativeSetLiveParams(
         (group_mask & SVMS_LIVE_GROUP_ALL) == 0u)
         return SVMS_RESULT_INVALID_ARGUMENT;
     std::string text;
-    return g_driver->SetLiveParams(group_mask, *params, text) ==
-               svms::RLResult::Ok
-        ? SVMS_RESULT_OK : SVMS_RESULT_INVALID_ARGUMENT;
+    return svms::ApiResultFromRL(g_driver->SetLiveParams(group_mask, *params, text));
 }
 
 static SVMS_Result SVMS_CALL NativeGetLiveParams(

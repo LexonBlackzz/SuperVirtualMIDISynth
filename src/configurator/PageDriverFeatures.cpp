@@ -9,7 +9,7 @@
 
 namespace svms::cfg {
 
-void DrawDriverFeaturesPage(svms::RuntimeLinkClient* client) {
+void DrawDriverFeaturesPage(svms::EngineLink* client) {
     if (!client || !client->IsOpen()) {
         ImGui::TextDisabled("Connect to a running driver to see what it offers.");
         return;
@@ -24,7 +24,7 @@ void DrawDriverFeaturesPage(svms::RuntimeLinkClient* client) {
     static std::map<std::string, float> editing;
     int shown = 0;
     for (const auto& param : client->Params()) {
-        if (svms::RuntimeLinkClient::IsKnownParam(param.id)) continue;
+        if (svms::EngineLink::IsKnownParam(param.id)) continue;
         ++shown;
         ImGui::PushID(param.id.c_str());
         const float current = static_cast<float>(client->ParamValue(param.id));
@@ -77,7 +77,7 @@ void DrawDriverFeaturesPage(svms::RuntimeLinkClient* client) {
     ui::BeginCard("##unknownmetrics", "Unknown metrics");
     int metrics = 0;
     for (const auto& metric : client->MetricSchema()) {
-        if (svms::RuntimeLinkClient::IsKnownMetric(metric.id)) continue;
+        if (svms::EngineLink::IsKnownMetric(metric.id)) continue;
         ++metrics;
         ImGui::Text("%s", (metric.label.empty() ? metric.id : metric.label).c_str());
         ImGui::SameLine(280.0f);
