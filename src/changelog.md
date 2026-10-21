@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-21 feat(v3): offline stack entries can be restricted to a bank/program (`set_offline_soundfont_entries`), for the Maestro wrapper's per-list restrictions.
+
 - 2026-10-21 feat(v3): offline sessions take a SoundFont stack. `set_offline_soundfonts` / `set_offline_channel_soundfont` (SVMS_CAP_OFFLINE_SOUNDFONT_STACK) so a host can give every port its own ordered list; StandaloneSynth now holds several banks in one sample store, same resolution rules as the driver. Written for the Maestro wrapper.
 
 - 2026-10-21 `refactor(v3): the Configurator uses only the SVMSAPI structs` - pages, ConfiguratorApp, Widgets and the link tests now use `SVMS_TelemetryV3` / `SVMS_LiveParams` / `SVMS_COMMAND_*` / `SVMS_Result` instead of the RuntimeLink structs; widget routing ids became `cfg::LiveParam`. `EngineLink` has the SVMS-native API (`ReadTelemetry(SVMS_TelemetryV3&)`, `SendCommand(command, param, ...)`, `SetLiveParams(mask, ...)`). `SVMS_TelemetryV3` gained `publish_timestamp`. `RuntimeLinkProtocol.h` is now included only by the driver, `RemoteClient.cpp` and the wire tests.

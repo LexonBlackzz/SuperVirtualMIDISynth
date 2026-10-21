@@ -124,7 +124,9 @@ public:
     }
 
     SVMS_Result SetSoundFonts(SVMS_Session session,
-                              const std::vector<std::wstring>& paths) {
+                              const std::vector<std::wstring>& paths,
+                              const std::vector<std::pair<int32_t, int32_t>>*
+                                  filters = nullptr) {
         Slot* slot = FindSlot(session);
         if (!slot) return SVMS_RESULT_NOT_INITIALIZED;
         std::lock_guard<std::mutex> guard(slot->mutex);
@@ -134,7 +136,7 @@ public:
             return SVMS_RESULT_INVALID_ARGUMENT;
         try {
             std::string error;
-            return slot->state->synth.SetSoundFonts(paths, error)
+            return slot->state->synth.SetSoundFonts(paths, error, filters)
                 ? SVMS_RESULT_OK : SVMS_RESULT_INTERNAL_ERROR;
         } catch (const std::bad_alloc&) {
             return SVMS_RESULT_NO_RESOURCES;

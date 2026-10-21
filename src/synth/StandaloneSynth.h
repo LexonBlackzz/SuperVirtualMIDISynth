@@ -235,13 +235,17 @@ public:
     // Replaces the SoundFont stack of a running session (call between
     // renders). All sounding voices are cut; per-channel assignments stay.
     // On failure the old stack keeps playing.
+    // `filters` (optional, one per path) restricts an entry to one bank
+    // and/or program: {bank, program}, -1 = any; bank 128 = percussion.
     bool SetSoundFonts(const std::vector<std::wstring>& paths,
-                       std::string& error) {
+                       std::string& error,
+                       const std::vector<std::pair<int32_t, int32_t>>* filters =
+                           nullptr) {
         if (gpuEnabled_) {
             error = "the GPU backend cannot change SoundFonts";
             return false;
         }
-        if (!LoadBanks(paths, error)) return false;
+        if (!LoadBanks(paths, error, filters)) return false;
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             voices_.SilenceChannelImmediate(channel);
         RebuildPrepared();
@@ -706,7 +710,18 @@ private:
 
     bool Resolve(uint8_t channel, uint32_t& font, uint32_t& preset) {
         std::array<const SF2Data*, kMaxSoundFontStackEntries> data{};
-        for (size_t i = 0; i < banks_.size(); ++i) data[i] = banks_[i].data.get();
+        const uint16_t wantBank = channels_.GetBankMSB(channel);
+        const uint8_t wantProgram = channels_.GetProgram(channel);
+        const bool percussion = channels_.IsPercussion(channel);
+        const int32_t askBank = percussion ? 128 : int32_t(wantBank);
+        for (size_t i = 0; i < banks_.size(); ++i) {
+            const Bank& b = banks_[i];
+            // An entry restricted to a bank/program only answers those.
+            if ((b.filterBank >= 0 && b.filterBank != askBank) ||
+                (b.filterProgram >= 0 && b.filterProgram != wantProgram))
+                continue;
+            data[i] = b.data.get();
+        }
         uint8_t found = 0;
         if (!ResolveStackPreset(data.data(), uint32_t(banks_.size()), nullptr, 0u,
                                 int(channelFont_[channel]) - 1,
@@ -730,7 +745,9 @@ private:
     }
 
     // Parses a whole stack, then swaps it in; the old one survives a failure.
-    bool LoadBanks(const std::vector<std::wstring>& paths, std::string& error) {
+    bool LoadBanks(const std::vector<std::wstring>& paths, std::string& error,
+                   const std::vector<std::pair<int32_t, int32_t>>* filters =
+                       nullptr) {
         if (paths.empty() || paths.size() > kMaxSoundFontStackEntries) {
             error = "SoundFont stack must hold 1..16 entries";
             return false;
@@ -739,9 +756,18 @@ private:
         const auto freeAll = [&] {
             for (Bank& b : banks) sf2_free(b.data.get());
         };
+        if (filters && filters->size() != paths.size()) {
+            error = "one filter per SoundFont is required";
+            return false;
+        }
         uint64_t frames = 0, regions = 0;
-        for (const std::wstring& path : paths) {
+        for (size_t entry = 0; entry < paths.size(); ++entry) {
+            const std::wstring& path = paths[entry];
             Bank bank;
+            if (filters) {
+                bank.filterBank = (*filters)[entry].first;
+                bank.filterProgram = (*filters)[entry].second;
+            }
             // () not {}: SF2Data holds 65536 SFSampleRegions with member
             // initializers; brace-init costs cl.exe ~3 s and far more memory
             // in every TU that sees it.
@@ -1141,6 +1167,8 @@ private:
         std::unique_ptr<SF2Data> data;
         uint32_t sampleBase = 0;   // offset into the concatenated sample store
         uint32_t regionBase = 0;   // offset into prepared_
+        int32_t filterBank = -1;     // -1 = any, 128 = percussion
+        int32_t filterProgram = -1;  // -1 = any
     };
     std::vector<Bank> banks_;
     uint8_t channelFont_[kChannelCount]{};  // 0 = automatic, N = banks_[N-1]

@@ -49,7 +49,7 @@ void WriteSfz(const std::string& path, const std::string& wav) {
 
 // Plays A4 on `channel` for a few blocks, returns the left channel's peak.
 float PeakOf(const SVMS_Interface& api, SVMS_Session session, uint32_t channel,
-             bool program5 = false) {
+             int program = -1) {
     api.reset(session);
     float peak = 0.0f;
     float left[512], right[512];
@@ -57,8 +57,8 @@ float PeakOf(const SVMS_Interface& api, SVMS_Session session, uint32_t channel,
         SVMS_OfflineEvent events[2]{};
         uint32_t count = 0u;
         if (block == 0u) {
-            if (program5)
-                events[count++] = {0u, 0xC0u | channel | (5u << 8u), {0u, 0u}};
+            if (program >= 0)
+                events[count++] = {0u, 0xC0u | channel | (uint32_t(program) << 8u), {0u, 0u}};
             events[count++] = {0u, 0x90u | channel | (69u << 8u) | (100u << 16u), {0u, 0u}};
         }
         if (api.render_offline(session, events, count, left, right, 512u) !=
@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
               SVMS_RESULT_INVALID_ARGUMENT,
           "out-of-range pins are rejected");
 
-    Check(std::fabs(PeakOf(api, session, 1u, true) - quietPeak) < quietPeak * 0.01f,
+    Check(std::fabs(PeakOf(api, session, 1u, 5) - quietPeak) < quietPeak * 0.01f,
           "program 5: SFZs do not claim it, first SFZ is the last resort");
 
     const char* bad[2] = {quiet.c_str(), (dir + "missing.sfz").c_str()};
@@ -166,6 +166,29 @@ int main(int argc, char** argv) {
     Check(api.set_offline_soundfonts(session, nullptr, 0u) ==
               SVMS_RESULT_INVALID_ARGUMENT,
           "an empty stack is rejected");
+
+    // Restricted entries: quiet only answers program 7, loud answers the rest.
+    SVMS_OfflineSoundFontEntry entries[2]{};
+    for (auto& e : entries) {
+        e.struct_size = sizeof(e);
+        e.struct_version = SVMS_STRUCT_VERSION_1;
+        e.bank = -1;
+        e.program = -1;
+    }
+    entries[0].path_utf8 = quiet.c_str();
+    entries[0].program = 7;
+    entries[1].path_utf8 = loud.c_str();
+    Check(api.set_offline_soundfont_entries(session, entries, 2u) == SVMS_RESULT_OK,
+          "install restricted entries");
+    api.set_offline_channel_soundfont(session, 0u, 0u);
+    Check(std::fabs(PeakOf(api, session, 0u, 7) - quietPeak) < quietPeak * 0.01f,
+          "restricted entry answers its own program");
+    Check(std::fabs(PeakOf(api, session, 0u, 0) - loudPeak) < loudPeak * 0.01f,
+          "restricted entry stays out of other programs");
+    entries[0].bank = 200;
+    Check(api.set_offline_soundfont_entries(session, entries, 2u) ==
+              SVMS_RESULT_INVALID_ARGUMENT,
+          "an out-of-range restriction is rejected");
 
     api.destroy_session(session);
     FreeLibrary(module);

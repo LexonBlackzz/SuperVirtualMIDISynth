@@ -673,6 +673,23 @@ typedef SVMS_Result (SVMS_CALL *SVMS_RunCommandFn)(
  * blocks the caller. */
 typedef SVMS_Result (SVMS_CALL *SVMS_SetOfflineSoundFontsFn)(
     SVMS_Session session, const char* const* paths_utf8, uint32_t count);
+/* Same, with a per-entry restriction: an entry with bank >= 0 only answers
+ * that bank (128 = the percussion channel), and one with program >= 0 only
+ * that program; -1 = any. A restricted entry stays out of the way of the rest
+ * of the stack, so "this font for drums only" or "this font for program 0 of
+ * bank 0" are expressible. Everything else is as set_offline_soundfonts, which
+ * is this call with every restriction -1. */
+typedef struct SVMS_OfflineSoundFontEntry {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    const char* path_utf8;
+    int32_t bank;
+    int32_t program;
+    uint32_t reserved[4];
+} SVMS_OfflineSoundFontEntry;
+typedef SVMS_Result (SVMS_CALL *SVMS_SetOfflineSoundFontEntriesFn)(
+    SVMS_Session session, const SVMS_OfflineSoundFontEntry* entries,
+    uint32_t count);
 /* Pins a MIDI channel (0..15) to a stack entry: font 0 = automatic,
  * N = entry N (1-based) answers that channel first and the rest of the stack
  * fills in. SVMS_RESULT_INVALID_ARGUMENT when N exceeds the stack. */
@@ -735,6 +752,7 @@ typedef struct SVMS_Interface {
     SVMS_RunCommandFn run_command;
     SVMS_SetOfflineSoundFontsFn set_offline_soundfonts;
     SVMS_SetOfflineChannelSoundFontFn set_offline_channel_soundfont;
+    SVMS_SetOfflineSoundFontEntriesFn set_offline_soundfont_entries;
 } SVMS_Interface;
 
 /* ── Remote attach (SVMS_CAP_REMOTE) ──────────────────────────────────────

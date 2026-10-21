@@ -1107,6 +1107,31 @@ SVMS_Result NativeSetOfflineSoundFonts(
     }
 }
 
+SVMS_Result NativeSetOfflineSoundFontEntries(
+    SVMS_Session session, const SVMS_OfflineSoundFontEntry* entries,
+    uint32_t count) {
+    if (!gNativeOfflineSessions.IsToken(session) || !entries || count == 0u ||
+        count > svms::kMaxSoundFontStackEntries)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    try {
+        std::vector<std::wstring> paths;
+        std::vector<std::pair<int32_t, int32_t>> filters;
+        for (uint32_t i = 0u; i < count; ++i) {
+            if (entries[i].struct_size < sizeof(SVMS_OfflineSoundFontEntry) ||
+                entries[i].struct_version != SVMS_STRUCT_VERSION_1 ||
+                entries[i].bank < -1 || entries[i].bank > 128 ||
+                entries[i].program < -1 || entries[i].program > 127 ||
+                !entries[i].path_utf8 || !*entries[i].path_utf8)
+                return SVMS_RESULT_INVALID_ARGUMENT;
+            paths.push_back(Utf8ToWide(entries[i].path_utf8));
+            filters.emplace_back(entries[i].bank, entries[i].program);
+        }
+        return gNativeOfflineSessions.SetSoundFonts(session, paths, &filters);
+    } catch (...) {
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    }
+}
+
 SVMS_Result NativeSetOfflineChannelSoundFont(
     SVMS_Session session, uint32_t channel, uint32_t font) {
     if (!gNativeOfflineSessions.IsToken(session))
@@ -1261,6 +1286,7 @@ SVMS_LINUX_EXPORT SVMS_Result SVMS_CALL SVMS_GetInterface(
     table.cancel_session_submissions = NativeCancelSessionSubmissions;
     table.set_offline_soundfonts = NativeSetOfflineSoundFonts;
     table.set_offline_channel_soundfont = NativeSetOfflineChannelSoundFont;
+    table.set_offline_soundfont_entries = NativeSetOfflineSoundFontEntries;
     std::memcpy(outInterface, &table,
                 (std::min)(callerTableSize,
                            static_cast<uint32_t>(sizeof(table))));

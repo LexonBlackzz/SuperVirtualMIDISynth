@@ -159,6 +159,10 @@ gives every port its own list):
 - `set_offline_channel_soundfont(session, channel, font)` pins a MIDI channel
   to entry `font` (1-based; 0 = automatic). The pinned entry answers first and
   the rest of the stack fills in what it lacks.
+- `set_offline_soundfont_entries(session, entries, count)` is the same call
+  with a per-entry restriction (`bank`, `program`; -1 = any; bank 128 = the
+  percussion channel). A restricted entry only answers those requests, so
+  "this font for drums only" or "this font for bank 0 program 5" work.
 - Resolution order: pinned entry, then stack order. An SFZ inside a stack only
   claims program 0 (Acoustic Grand Piano) so it cannot swallow every other
   program; it is still the last resort for anything nobody else has. A lone
