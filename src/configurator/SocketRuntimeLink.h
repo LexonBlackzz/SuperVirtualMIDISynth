@@ -61,6 +61,7 @@ public:
         std::vector<std::string> options;
     };
     struct MetricInfo { std::string id, label, unit; };
+    struct CommandInfo { std::string name, label; };
 
     ~RuntimeLinkClient() { Close(); }
 
@@ -227,6 +228,19 @@ public:
         return it == metrics_.end() ? 0.0 : it->second;
     }
     const nlohmann::json& Info() const { return info_; }
+    const std::vector<CommandInfo>& Commands() const { return commands_; }
+    // Acknowledged variants for the native-API schema calls: they wait for
+    // the driver's verdict instead of firing and forgetting.
+    RLResult SetParamAck(const std::string& id, double value, uint32_t timeoutMs) {
+        if (!IsOpen()) return RLResult::InternalError;
+        return SetParamBlocking(id.c_str(), value, timeoutMs);
+    }
+    RLResult RunCommand(const std::string& name, uint32_t timeoutMs) {
+        if (!IsOpen()) return RLResult::InternalError;
+        return CommandBlocking(name.c_str(), timeoutMs);
+    }
+    bool HasParamId(const std::string& id) const { return HasParam(id.c_str()); }
+    bool HasMetricId(const std::string& id) const { return metrics_.count(id) != 0u; }
     // Fire and forget; the driver echoes the applied value back to everyone.
     void SetParam(const std::string& id, double value) {
         SendLine(nlohmann::json{{"t", "set"}, {"id", id}, {"v", value}}.dump());
@@ -415,6 +429,10 @@ private:
                 metricSchema_.push_back({m.value("id", std::string()),
                                          m.value("label", std::string()),
                                          m.value("unit", std::string())});
+            commands_.clear();
+            for (const auto& c : msg.value("commands", nlohmann::json::array()))
+                commands_.push_back({c.value("name", std::string()),
+                                     c.value("label", std::string())});
             info_ = msg.value("info", nlohmann::json::object());
             ApplyValues(msg.value("values", nlohmann::json::object()));
             unsigned a = 0, b = 0, c = 0;
@@ -478,7 +496,7 @@ private:
     std::string inbox_;
     std::vector<ParamInfo> params_;
     std::vector<MetricInfo> metricSchema_;
-    std::vector<std::string> commands_;
+    std::vector<CommandInfo> commands_;
     std::map<std::string, double> values_;
     std::map<std::string, double> metrics_;
     nlohmann::json info_ = nlohmann::json::object();

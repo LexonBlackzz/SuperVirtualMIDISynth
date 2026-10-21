@@ -1,17 +1,9 @@
 #ifndef SVMS_CONFIGURATOR_DRIVERLINK_H
 #define SVMS_CONFIGURATOR_DRIVERLINK_H
 
-// How the configurator talks to a running driver. Pages use svms::EngineLink.
-// Windows: the SVMSAPI remote client (EngineLink.h). Linux: the Control API
-// socket client, until the native API can describe a driver's parameters
-// (the "unknown to this version" page needs that schema).
-#ifdef _WIN32
+// How the configurator talks to a running driver, on every platform: the
+// SVMSAPI remote client (svms::EngineLink over SVMS_Remote_*). The transport
+// (Win32 shared memory, Unix socket) lives behind frontends/RemoteClient.cpp.
 #include "configurator/EngineLink.h"
-#else
-#include "configurator/SocketRuntimeLink.h"
-namespace svms {
-class EngineLink : public RuntimeLinkClient {};
-} // namespace svms
-#endif
 
 #endif

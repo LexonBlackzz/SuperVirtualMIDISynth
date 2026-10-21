@@ -7,8 +7,9 @@
 // against (Open, ReadTelemetry, SendCommand, ...), but nothing here knows the
 // transport; the shared-memory protocol is private to frontends/RemoteClient.cpp.
 //
-// Linux still uses the Control API socket client (see DriverLink.h) until the
-// native API can describe a driver's parameters.
+// Drivers that describe their own controls (the Linux daemon) also serve a
+// schema (SVMS_CAP_SCHEMA); Params()/MetricSchema()/Info() expose it for the
+// "unknown to this version" page and are empty on drivers without one.
 
 #include "BuildInfo.h"
 #include "driver/LiveParamsConvert.h"
@@ -17,6 +18,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
 #include <cstdint>
 #include <cstring>
 
@@ -69,6 +73,7 @@ public:
         session_ = session;
         peer_ = found;
         protocol_ = found.protocolMax == 2u ? Protocol::V2 : Protocol::V3;
+        LoadSchema();
         return true;
     }
 
@@ -77,6 +82,9 @@ public:
             table_.destroy_session(session_);
         session_ = 0u;
         table_ = SVMS_Interface{};
+        params_.clear();
+        metricSchema_.clear();
+        info_ = nlohmann::json::object();
         protocol_ = Protocol::None;
         peer_ = HostInfo{};
     }
@@ -148,6 +156,61 @@ public:
         if (resultText && resultText[0] == '\0' && rl != RLResult::Ok)
             text(RLV2_ResultToString(rl));
         return rl;
+    }
+
+    // ── Driver schema (empty unless the host serves SVMS_CAP_SCHEMA) ──────
+    struct ParamInfo {
+        std::string id, label, group, unit, type;  // type: bool|int|float|enum
+        double min = 0.0, max = 1.0, def = 0.0;
+        std::vector<std::string> options;
+    };
+    struct MetricInfo { std::string id, label, unit; };
+
+    const std::vector<ParamInfo>& Params() const { return params_; }
+    const std::vector<MetricInfo>& MetricSchema() const { return metricSchema_; }
+    const nlohmann::json& Info() const { return info_; }
+    double ParamValue(const std::string& id) const {
+        double v = 0.0;
+        if (IsOpen() && table_.get_param_value)
+            table_.get_param_value(session_, id.c_str(), &v);
+        return v;
+    }
+    double MetricValue(const std::string& id) const {
+        double v = 0.0;
+        if (IsOpen() && table_.get_metric_value)
+            table_.get_metric_value(session_, id.c_str(), &v);
+        return v;
+    }
+    // Fire and forget, like the pages expect; the driver echoes the value.
+    void SetParam(const std::string& id, double value) {
+        if (IsOpen() && table_.set_param_value)
+            table_.set_param_value(session_, id.c_str(), value);
+    }
+    void Poll() {}  // the remote client pumps inside every call
+    // Ids the configurator has dedicated widgets for (the live state and the
+    // metrics the pages draw); the rest go to the generic page.
+    static bool IsKnownParam(const std::string& id) {
+        static const char* const kKnown[] = {
+            "master_volume", "correctness_mode", "reverb_enabled", "reverb_mix",
+            "reverb_room_size", "reverb_decay", "reverb_damping", "reverb_width",
+            "reverb_diffusion", "reverb_predelay_ms", "reverb_early_level",
+            "reverb_late_level", "reverb_mod_depth", "reverb_mod_rate",
+            "reverb_lowcut_hz", "reverb_highcut_hz", "limiter_enabled",
+            "limiter_algorithm", "limiter_threshold", "limiter_lookahead_ms",
+            "limiter_attack_ms", "limiter_release_ms", "max_voices"};
+        for (const char* known : kKnown)
+            if (id == known) return true;
+        return false;
+    }
+    static bool IsKnownMetric(const std::string& id) {
+        static const char* const kKnown[] = {
+            "events_submitted", "events_accepted", "events_dispatched",
+            "active_voices", "max_voices", "free_voices", "voice_steals",
+            "sample_rate", "buffer_frames", "render_ms", "queue_size",
+            "pending_events"};
+        for (const char* known : kKnown)
+            if (id == known) return true;
+        return false;
     }
 
     static uint32_t EnumerateHosts(HostInfo* out, uint32_t maxCount) {
@@ -235,7 +298,46 @@ private:
         return t;
     }
 
+    void LoadSchema() {
+        params_.clear();
+        metricSchema_.clear();
+        info_ = nlohmann::json::object();
+        if (!table_.get_schema_json) return;
+        uint32_t bytes = 0u;
+        if (table_.get_schema_json(session_, nullptr, &bytes) !=
+                SVMS_RESULT_BUFFER_TOO_SMALL || bytes == 0u)
+            return;
+        std::string text(bytes, '\0');
+        if (table_.get_schema_json(session_, text.data(), &bytes) !=
+            SVMS_RESULT_OK)
+            return;
+        const nlohmann::json doc = nlohmann::json::parse(text.c_str(), nullptr, false);
+        if (!doc.is_object()) return;
+        for (const auto& p : doc.value("params", nlohmann::json::array())) {
+            ParamInfo info;
+            info.id = p.value("id", std::string());
+            info.label = p.value("label", info.id);
+            info.group = p.value("group", std::string());
+            info.unit = p.value("unit", std::string());
+            info.type = p.value("type", std::string("float"));
+            info.min = p.value("min", 0.0);
+            info.max = p.value("max", 1.0);
+            info.def = p.value("default", 0.0);
+            if (p.contains("options"))
+                info.options = p["options"].get<std::vector<std::string>>();
+            params_.push_back(std::move(info));
+        }
+        for (const auto& m : doc.value("metrics", nlohmann::json::array()))
+            metricSchema_.push_back({m.value("id", std::string()),
+                                     m.value("label", std::string()),
+                                     m.value("unit", std::string())});
+        info_ = doc.value("info", nlohmann::json::object());
+    }
+
     SVMS_Interface table_{};
+    std::vector<ParamInfo> params_;
+    std::vector<MetricInfo> metricSchema_;
+    nlohmann::json info_ = nlohmann::json::object();
     SVMS_Session session_ = 0u;
     Protocol protocol_ = Protocol::None;
     HostInfo peer_{};

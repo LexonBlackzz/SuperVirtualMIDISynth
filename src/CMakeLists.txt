@@ -343,6 +343,7 @@ if(NOT WIN32)
             set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/imgui")
             add_executable(svms_configurator
                 configurator/Main_Linux.cpp
+                frontends/RemoteClient.cpp
                 configurator/ConfiguratorApp.cpp
                 configurator/Platform_SDL2.cpp
                 configurator/PlatformUtil.cpp
@@ -1203,7 +1204,8 @@ if(SVMS_BUILD_TESTS)
     target_compile_definitions(svms_v3_engine_link_smoke PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_engine_link_smoke PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}")
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party")
     if(SVMS_XP_COMPAT)
         target_compile_definitions(svms_v3_engine_link_smoke PRIVATE SVMS_XP_COMPAT)
     endif()
@@ -1212,6 +1214,20 @@ if(SVMS_BUILD_TESTS)
              COMMAND svms_v3_engine_link_smoke "$<TARGET_FILE:svmsapi>")
     set_tests_properties(svms_v3_engine_link PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+    # The driver-schema code only builds against the Linux socket client; this
+    # test compiles it against an in-memory fake so every platform runs it.
+    add_executable(svms_v3_remote_schema_test
+        tests/RemoteSchemaTest.cpp
+        frontends/RemoteClient.cpp)
+    target_compile_definitions(svms_v3_remote_schema_test PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+        SVMS_REMOTE_USE_FAKE_CLIENT)
+    target_include_directories(svms_v3_remote_schema_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${SVMS_GENERATED_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party")
+    add_test(NAME svms_v3_remote_schema COMMAND svms_v3_remote_schema_test)
 
     add_executable(svms_v3_tests
         tests/V3Tests.cpp

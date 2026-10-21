@@ -78,7 +78,9 @@ enum {
     /* get_telemetry_v3: SVMS_TelemetryV2 plus the runtime-link-only fields. */
     SVMS_CAP_TELEMETRY_V3 = UINT64_C(1) << 20,
     /* Set on tables returned by SVMS_Remote_Attach (cross-process session). */
-    SVMS_CAP_REMOTE = UINT64_C(1) << 21
+    SVMS_CAP_REMOTE = UINT64_C(1) << 21,
+    /* get_schema_json / get/set_param_value / get_metric_value / run_command. */
+    SVMS_CAP_SCHEMA = UINT64_C(1) << 22
 };
 
 enum {
@@ -623,6 +625,35 @@ typedef SVMS_Result (SVMS_CALL *SVMS_SetLiveParamsFn)(
 typedef SVMS_Result (SVMS_CALL *SVMS_GetLiveParamsFn)(
     SVMS_Session session, SVMS_LiveParams* params);
 
+/* ── Driver schema (SVMS_CAP_SCHEMA) ──────────────────────────────────────
+ * A driver can describe its own controls instead of the caller knowing them in
+ * advance: parameters (settable), metrics (read-only numbers) and commands
+ * (named actions). Today the Linux daemon serves this on remote sessions; a
+ * session whose capabilities lack SVMS_CAP_SCHEMA leaves these pointers NULL.
+ *
+ * get_schema_json fills `out_utf8` with one JSON document:
+ *   {"params":  [{"id","label","group","unit","type":"bool|int|float|enum",
+ *                 "min","max","default","options":["..."]}],
+ *    "metrics": [{"id","label","unit"}],
+ *    "commands":[{"name","label"}],
+ *    "info":    {free-form driver facts: soundfont, backend, config_path...}}
+ * `*inout_bytes` is the buffer size on entry and the size needed (including
+ * the terminating NUL) on return; too small returns SVMS_RESULT_BUFFER_TOO_SMALL.
+ * Values and metrics change; the schema only changes on reconnect.
+ * Unknown ids return SVMS_RESULT_INVALID_ARGUMENT from the getters and
+ * SVMS_RESULT_UNSUPPORTED from the setters. set_param_value waits for the
+ * driver's verdict (INVALID_ARGUMENT, RESTART_REQUIRED, BUSY ...). */
+typedef SVMS_Result (SVMS_CALL *SVMS_GetSchemaJsonFn)(
+    SVMS_Session session, char* out_utf8, uint32_t* inout_bytes);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetParamValueFn)(
+    SVMS_Session session, const char* id_utf8, double* out_value);
+typedef SVMS_Result (SVMS_CALL *SVMS_SetParamValueFn)(
+    SVMS_Session session, const char* id_utf8, double value);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetMetricValueFn)(
+    SVMS_Session session, const char* id_utf8, double* out_value);
+typedef SVMS_Result (SVMS_CALL *SVMS_RunCommandFn)(
+    SVMS_Session session, const char* name_utf8);
+
 typedef struct SVMS_Interface {
     uint32_t struct_size;
     uint32_t struct_version;
@@ -672,6 +703,11 @@ typedef struct SVMS_Interface {
     SVMS_GetTelemetryV3Fn get_telemetry_v3;
     SVMS_SetLiveParamsFn set_live_params;
     SVMS_GetLiveParamsFn get_live_params;
+    SVMS_GetSchemaJsonFn get_schema_json;
+    SVMS_GetParamValueFn get_param_value;
+    SVMS_SetParamValueFn set_param_value;
+    SVMS_GetMetricValueFn get_metric_value;
+    SVMS_RunCommandFn run_command;
 } SVMS_Interface;
 
 /* ── Remote attach (SVMS_CAP_REMOTE) ──────────────────────────────────────

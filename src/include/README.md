@@ -465,3 +465,26 @@ attached session (default 1500 ms) for callers that poll from a UI thread. The
 live-control results `SVMS_RESULT_RESTART_REQUIRED`, `SVMS_RESULT_LOAD_FAILED`
 and `SVMS_RESULT_BUSY` are returned by `send_runtime_command` and
 `set_live_params` for in-process and remote sessions alike.
+
+## Driver schema
+
+Remote sessions of a driver that describes its own controls (today the Linux
+daemon) set `SVMS_CAP_SCHEMA` and fill five more table entries:
+
+- `get_schema_json(session, buf, &bytes)` returns one JSON document with
+  `params` (id, label, group, unit, `bool|int|float|enum`, min, max, default,
+  options), `metrics` (id, label, unit), `commands` (name, label) and a
+  free-form `info` object. `bytes` is the buffer size on entry and the size
+  needed (with the NUL) on return; a short buffer gives
+  `SVMS_RESULT_BUFFER_TOO_SMALL`, so call once with `NULL` to size it.
+- `get_param_value` / `get_metric_value` read a value by id;
+  `set_param_value` waits for the driver's verdict (`INVALID_ARGUMENT` for an
+  out-of-range value, `RESTART_REQUIRED`, `BUSY`, ...); `run_command` runs a
+  named action.
+
+The schema only changes when a client reconnects; values and metrics change
+continuously. A tool that knows nothing about a driver can therefore list and
+edit everything it offers, which is what the Linux configurator's "unknown to
+this version" page does. Drivers without a schema (the Windows engine) leave
+the pointers `NULL` and clear the capability; their controls are the typed
+`set_live_params` / `get_telemetry_v3` / `send_runtime_command` calls.

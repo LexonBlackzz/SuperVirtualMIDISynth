@@ -31,15 +31,26 @@ SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_IsAlive(SVMS_Session, uint32_t,
 
 #else
 
-#ifdef _WIN32
+#if defined(SVMS_REMOTE_USE_FAKE_CLIENT)
+// Test build: an in-memory stand-in for the Linux socket client, so the
+// schema code (which only exists for that client) is compiled and run on
+// every platform.
+#include "tests/FakeSocketClient.h"
+#define SVMS_REMOTE_SCHEMA 1
+#elif defined(_WIN32) && !defined(SVMS_REMOTE_FORCE_SOCKET_CLIENT)
 #include "driver/RuntimeLink.h"
 #else
 #include "configurator/SocketRuntimeLink.h"
+#define SVMS_REMOTE_SCHEMA 1
+#endif
+#ifdef SVMS_REMOTE_SCHEMA
+#include <nlohmann/json.hpp>
 #endif
 #include "driver/LiveParamsConvert.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -210,6 +221,90 @@ SVMS_Result SVMS_CALL RemoteReset(SVMS_Session session) {
                                     text, sizeof(text));
 }
 
+#ifdef SVMS_REMOTE_SCHEMA
+// ── Driver schema (the Control API's self-description) ──────────────────
+SVMS_Result SVMS_CALL RemoteGetSchemaJson(SVMS_Session session, char* out,
+                                          uint32_t* inout_bytes) {
+    const std::shared_ptr<Remote> remote = FindRemote(session);
+    if (!remote) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!inout_bytes) return SVMS_RESULT_INVALID_ARGUMENT;
+    nlohmann::json doc = nlohmann::json::object();
+    {
+        std::lock_guard<std::mutex> lock(remote->mutex);
+        remote->client.Poll();
+        nlohmann::json params = nlohmann::json::array();
+        for (const auto& p : remote->client.Params()) {
+            nlohmann::json d = {{"id", p.id}, {"label", p.label},
+                                {"group", p.group}, {"unit", p.unit},
+                                {"type", p.type}, {"min", p.min},
+                                {"max", p.max}, {"default", p.def}};
+            if (!p.options.empty()) d["options"] = p.options;
+            params.push_back(std::move(d));
+        }
+        nlohmann::json metrics = nlohmann::json::array();
+        for (const auto& m : remote->client.MetricSchema())
+            metrics.push_back({{"id", m.id}, {"label", m.label},
+                               {"unit", m.unit}});
+        nlohmann::json commands = nlohmann::json::array();
+        for (const auto& c : remote->client.Commands())
+            commands.push_back({{"name", c.name}, {"label", c.label}});
+        doc = {{"params", std::move(params)}, {"metrics", std::move(metrics)},
+               {"commands", std::move(commands)},
+               {"info", remote->client.Info()}};
+    }
+    const std::string text = doc.dump();
+    const uint32_t needed = static_cast<uint32_t>(text.size() + 1u);
+    const uint32_t capacity = *inout_bytes;
+    *inout_bytes = needed;
+    if (!out || capacity < needed) return SVMS_RESULT_BUFFER_TOO_SMALL;
+    std::memcpy(out, text.c_str(), needed);
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result SVMS_CALL RemoteGetParamValue(SVMS_Session session, const char* id,
+                                          double* out) {
+    const std::shared_ptr<Remote> remote = FindRemote(session);
+    if (!remote) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!id || !out) return SVMS_RESULT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(remote->mutex);
+    remote->client.Poll();
+    if (!remote->client.HasParamId(id)) return SVMS_RESULT_INVALID_ARGUMENT;
+    *out = remote->client.ParamValue(id);
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result SVMS_CALL RemoteSetParamValue(SVMS_Session session, const char* id,
+                                          double value) {
+    const std::shared_ptr<Remote> remote = FindRemote(session);
+    if (!remote) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!id || !std::isfinite(value)) return SVMS_RESULT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(remote->mutex);
+    return svms::ApiResultFromRL(
+        remote->client.SetParamAck(id, value, remote->timeoutMs.load()));
+}
+
+SVMS_Result SVMS_CALL RemoteGetMetricValue(SVMS_Session session,
+                                           const char* id, double* out) {
+    const std::shared_ptr<Remote> remote = FindRemote(session);
+    if (!remote) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!id || !out) return SVMS_RESULT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(remote->mutex);
+    remote->client.Poll();
+    if (!remote->client.HasMetricId(id)) return SVMS_RESULT_INVALID_ARGUMENT;
+    *out = remote->client.MetricValue(id);
+    return SVMS_RESULT_OK;
+}
+
+SVMS_Result SVMS_CALL RemoteRunCommand(SVMS_Session session, const char* name) {
+    const std::shared_ptr<Remote> remote = FindRemote(session);
+    if (!remote) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!name || !*name) return SVMS_RESULT_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(remote->mutex);
+    return svms::ApiResultFromRL(
+        remote->client.RunCommand(name, remote->timeoutMs.load()));
+}
+#endif // SVMS_REMOTE_SCHEMA
+
 void FillHostInfo(const svms::RuntimeLinkClient::HostInfo& h,
                   SVMS_HostInfo& out) {
     out = SVMS_HostInfo{};
@@ -269,6 +364,14 @@ SVMS_PUBLIC SVMS_Result SVMS_CALL SVMS_Remote_Attach(
     table.get_telemetry_v3 = RemoteGetTelemetryV3;
     table.get_live_params = RemoteGetLiveParams;
     table.set_live_params = RemoteSetLiveParams;
+#ifdef SVMS_REMOTE_SCHEMA
+    table.capabilities |= SVMS_CAP_SCHEMA;
+    table.get_schema_json = RemoteGetSchemaJson;
+    table.get_param_value = RemoteGetParamValue;
+    table.set_param_value = RemoteSetParamValue;
+    table.get_metric_value = RemoteGetMetricValue;
+    table.run_command = RemoteRunCommand;
+#endif
 
     SVMS_Session session;
     {
