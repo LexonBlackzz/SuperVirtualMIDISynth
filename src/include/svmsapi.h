@@ -67,7 +67,12 @@ enum {
     SVMS_CAP_MIDI_STREAM = UINT64_C(1) << 17,
     /* send_short_batch_direct: an ordered batch is compiled into the event
      * pages on the caller's thread (no ingress ring, no compiler thread). */
-    SVMS_CAP_DIRECT_PAGES = UINT64_C(1) << 18
+    SVMS_CAP_DIRECT_PAGES = UINT64_C(1) << 18,
+    /* set_live_params / get_live_params: the configurator's live mixing
+     * state (master, reverb, limiter, voice cap) as one typed struct. */
+    SVMS_CAP_LIVE_PARAMS = UINT64_C(1) << 19,
+    /* get_telemetry_v3: SVMS_TelemetryV2 plus the runtime-link-only fields. */
+    SVMS_CAP_TELEMETRY_V3 = UINT64_C(1) << 20
 };
 
 enum {
@@ -333,6 +338,85 @@ typedef struct SVMS_TelemetryV2 {
     uint32_t reserved[1];
 } SVMS_TelemetryV2;
 
+/* Live-parameter groups for set_live_params: only the groups named in the
+ * mask are applied. Values are clamped by the engine; non-finite floats are
+ * rejected (SVMS_RESULT_INVALID_ARGUMENT). */
+enum {
+    SVMS_LIVE_GROUP_MASTER      = 0x01u,  /* master_volume */
+    SVMS_LIVE_GROUP_CORRECTNESS = 0x02u,
+    SVMS_LIVE_GROUP_REVERB      = 0x04u,
+    SVMS_LIVE_GROUP_LIMITER     = 0x08u,
+    SVMS_LIVE_GROUP_VOICES      = 0x10u,  /* accepted; max_voices is restart-only today */
+    SVMS_LIVE_GROUP_ALL         = 0x1Fu
+};
+
+/* The engine's live mixing state (SVMS_CAP_LIVE_PARAMS). set_live_params
+ * applies the masked groups at the next audio block; get_live_params returns
+ * the requested state, and SVMS_TelemetryV3.live the state the audio thread
+ * last applied. limiter_algorithm: 0 classic, 1 adaptive. */
+typedef struct SVMS_LiveParams {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint32_t correctness_mode;
+    uint32_t reverb_enabled;
+    uint32_t limiter_enabled;
+    uint32_t max_voices;
+    uint32_t limiter_algorithm;
+    float master_volume;              /* 0..4 */
+    float reverb_mix;
+    float reverb_room_size;
+    float reverb_decay;
+    float reverb_damping;
+    float reverb_width;
+    float reverb_diffusion;
+    float reverb_pre_delay_ms;
+    float reverb_early_level;
+    float reverb_late_level;
+    float reverb_mod_depth;
+    float reverb_mod_rate;
+    float reverb_low_cut_hz;
+    float reverb_high_cut_hz;
+    float limiter_threshold;
+    float limiter_lookahead_ms;
+    float limiter_attack_ms;
+    float limiter_release_ms;
+    uint32_t reserved[4];
+} SVMS_LiveParams;
+
+/* Everything the configurator's runtime link reports, in one call
+ * (SVMS_CAP_TELEMETRY_V3): the full SVMS_TelemetryV2 census plus voice-pool
+ * detail, CPU load, limiter and per-channel limiter meters, the applied live
+ * state and the active SoundFont. Gain reduction is positive dB. */
+typedef struct SVMS_TelemetryV3 {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    SVMS_TelemetryV2 census;
+    uint32_t max_voices;
+    uint32_t releasing_voices;
+    uint32_t free_top;
+    uint32_t retired_count;
+    uint32_t retired_immediate_count;
+    uint32_t decimation_step;
+    int32_t audio_hresult;
+    uint32_t raw_ingress_count;
+    uint32_t compiled_paged_count;
+    uint32_t scheduled_backlog_count;
+    float cpu_load_percent;           /* smoothed */
+    float scheduler_percent;
+    float event_dispatch_percent;
+    float limiter_input_peak_l;
+    float limiter_input_peak_r;
+    float limiter_output_peak_l;
+    float limiter_output_peak_r;
+    float limiter_gain_reduction_db;
+    uint32_t channel_limiter_enabled;
+    float channel_limiter_gain_reduction_db[16];
+    float channel_limiter_input_peak[16];   /* pre-limit, linear */
+    SVMS_LiveParams live;             /* applied state */
+    char soundfont_name[256];         /* UTF-8, active SoundFont path */
+    uint32_t reserved[8];
+} SVMS_TelemetryV3;
+
 /* One record per real-time audio callback (SVMS_CAP_CALLBACK_TRACE). The
  * engine keeps the most recent 8192 in a ring while tracing is enabled;
  * readers drain it with read_callback_trace. Durations are wall time in
@@ -398,7 +482,33 @@ typedef enum SVMS_Command {
     SVMS_COMMAND_SET_BLOCK_TIMING        = 0x00000118,
     SVMS_COMMAND_SET_GHOST_BUDGET        = 0x00000119,
     SVMS_COMMAND_SET_NOTE_MERGE          = 0x0000011C,
-    SVMS_COMMAND_SET_NOTE_ON_REEXCITE    = 0x0000011D
+    SVMS_COMMAND_SET_NOTE_ON_REEXCITE    = 0x0000011D,
+    SVMS_COMMAND_QUERY_SOUNDFONT_LOAD    = 0x00000106,
+    SVMS_COMMAND_SET_UNBOUNDED_RENDER    = 0x0000011A,
+    /* text = "enabled;threshold;releaseMs" */
+    SVMS_COMMAND_SET_CHANNEL_LIMITER     = 0x0000011B,
+    SVMS_COMMAND_SET_DECIMATION          = 0x0000011E,
+    SVMS_COMMAND_SET_STEAL_REJECT        = 0x0000011F,
+    SVMS_COMMAND_SET_FAST_PRODUCER       = 0x00000120,
+    SVMS_COMMAND_SET_BEND_COLLAPSE       = 0x00000121,
+    SVMS_COMMAND_SET_FAST_CHUNK_MATH     = 0x00000122,
+    SVMS_COMMAND_SET_MIN_NOTE_LENGTH     = 0x00000123,
+    /* Live SoundFont stack edits. param = stack entry index; the text buffer
+     * carries the UTF-8 path on input (empty removes the entry, an index equal
+     * to the current count appends). Unchanged entries are reused, the build
+     * runs off the audio thread, and sounding voices are reset when it
+     * activates. Poll progress with QUERY_SOUNDFONT_LOAD. */
+    SVMS_COMMAND_SET_SOUNDFONT_ENTRY     = 0x00000124,
+    /* param = channel (0..15) | (font << 8); font 0 = automatic, N = stack
+     * entry N (1-based) answers that channel first. */
+    SVMS_COMMAND_SET_CHANNEL_SOUNDFONT   = 0x00000125,
+    /* Reload the configured SoundFont (text = optional UTF-8 path). */
+    SVMS_COMMAND_RELOAD_SOUNDFONT        = 0x00000101,
+    SVMS_COMMAND_RESET_VOICES            = 0x00000102,
+    /* Live recording: START text = UTF-8 WAV path; QUERY returns state. */
+    SVMS_COMMAND_START_LIVE_RECORDING    = 0x00000103,
+    SVMS_COMMAND_STOP_LIVE_RECORDING     = 0x00000104,
+    SVMS_COMMAND_QUERY_LIVE_RECORDING    = 0x00000105
 } SVMS_Command;
 
 typedef SVMS_Result (SVMS_CALL *SVMS_CreateSessionFn)(
@@ -500,6 +610,12 @@ typedef SVMS_Result (SVMS_CALL *SVMS_SendMidiStreamFn)(
 typedef SVMS_Result (SVMS_CALL *SVMS_SendShortBatchDirectFn)(
     SVMS_Session session, const SVMS_ShortEvent* events,
     uint32_t event_count);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetTelemetryV3Fn)(
+    SVMS_Session session, SVMS_TelemetryV3* telemetry);
+typedef SVMS_Result (SVMS_CALL *SVMS_SetLiveParamsFn)(
+    SVMS_Session session, uint32_t group_mask, const SVMS_LiveParams* params);
+typedef SVMS_Result (SVMS_CALL *SVMS_GetLiveParamsFn)(
+    SVMS_Session session, SVMS_LiveParams* params);
 
 typedef struct SVMS_Interface {
     uint32_t struct_size;
@@ -547,6 +663,9 @@ typedef struct SVMS_Interface {
     SVMS_ReadCallbackTraceFn read_callback_trace;
     SVMS_SendMidiStreamFn send_midi_stream;
     SVMS_SendShortBatchDirectFn send_short_batch_direct;
+    SVMS_GetTelemetryV3Fn get_telemetry_v3;
+    SVMS_SetLiveParamsFn set_live_params;
+    SVMS_GetLiveParamsFn get_live_params;
 } SVMS_Interface;
 
 // Permanent bootstrap symbol. Function-table fields are append-only within an
@@ -579,6 +698,8 @@ static_assert(sizeof(SVMS_TelemetryV1) == 128,
               "SVMS_TelemetryV1 ABI changed");
 static_assert(sizeof(SVMS_TelemetryV2) == 280,
               "SVMS_TelemetryV2 ABI changed");
+static_assert(sizeof(SVMS_LiveParams) == 116,
+              "SVMS_LiveParams ABI changed");
 static_assert(sizeof(SVMS_CallbackTrace) == 208,
               "SVMS_CallbackTrace ABI changed");
 #endif

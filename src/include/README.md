@@ -296,6 +296,26 @@ Commands mirror the runtime-link ids: `SVMS_COMMAND_SET_STEAL_POLICY`,
 `PING`. `param` carries the command argument (a policy index, a voice count,
 raw IEEE-754 bits for the retire floor, 0/1 for toggles). The optional text
 buffer receives a truncated human-readable outcome; pass NULL/0 to skip it.
+
+The text buffer is in/out: commands that take a payload read it on entry
+(`SVMS_COMMAND_SET_SOUNDFONT_ENTRY` takes a UTF-8 path, `SET_CHANNEL_LIMITER`
+takes `"enabled;threshold;releaseMs"`) and it receives the outcome on return.
+
+### Live SoundFont stack
+
+```c
+char text[512] = "C:\\fonts\\GM.sf2";
+api.send_runtime_command(session, SVMS_COMMAND_SET_SOUNDFONT_ENTRY, 1u,
+                         text, sizeof(text));      /* add/replace entry 1 */
+api.send_runtime_command(session, SVMS_COMMAND_SET_CHANNEL_SOUNDFONT,
+                         9u | (2u << 8), text, sizeof(text)); /* ch 10 -> entry 2 */
+```
+
+Entries already loaded are reused, so only the new file is read. The build runs
+off the audio thread; sounding voices are reset when it activates. An SFZ in a
+multi-entry stack claims only Acoustic Grand Piano (and is the last resort for
+programs nothing else has); pin it to a channel to use it elsewhere.
+
 Invalid arguments return `SVMS_RESULT_INVALID_ARGUMENT` without touching
 engine state. New commands are added as new ids — callers must treat
 unknown ids as `SVMS_RESULT_INVALID_ARGUMENT`, not as errors to retry.
@@ -366,3 +386,31 @@ their drum keys and tuning. Pitch-bend ranges remain measured in semitones.
 SysEx. General MIDI Tuning Standard SysEx is not implemented by this change.
 Native offline sessions read the selected tuning when created. The offline
 renderer accepts --tuning-edo 12|31 to override the saved setting.
+
+## Live parameters and telemetry V3
+
+`SVMS_CAP_LIVE_PARAMS` adds `get_live_params` / `set_live_params`, the
+configurator's live mixing state as one typed struct: master volume, the 13
+reverb values, the 4 limiter timings plus enable/algorithm, and the
+correctness flag. `set_live_params(session, group_mask, &params)` applies only
+the groups in the mask (`SVMS_LIVE_GROUP_MASTER|REVERB|LIMITER|CORRECTNESS`),
+clamps values, and rejects non-finite floats or an empty mask with
+`SVMS_RESULT_INVALID_ARGUMENT`. The audio thread picks the change up at the
+next block. `max_voices` is reported but stays restart-only.
+
+`SVMS_CAP_TELEMETRY_V3` adds `get_telemetry_v3`: the whole `SVMS_TelemetryV2`
+census plus everything the configurator's link showed — voice-pool detail
+(releasing, retired, decimation step), CPU load, scheduler/dispatch percent,
+limiter input/output peaks and gain reduction, the 16 per-channel limiter
+meters, the live state the audio thread last *applied* (compare with
+`get_live_params`, the requested state), and the active SoundFont path.
+
+```c
+SVMS_LiveParams p = { sizeof p, SVMS_STRUCT_VERSION_1 };
+api.get_live_params(session, &p);
+p.master_volume = 0.5f;
+api.set_live_params(session, SVMS_LIVE_GROUP_MASTER, &p);
+
+SVMS_TelemetryV3 t = { sizeof t, SVMS_STRUCT_VERSION_1 };
+api.get_telemetry_v3(session, &t);
+```

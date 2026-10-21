@@ -287,6 +287,44 @@ static SVMS_Result SVMS_CALL NativeGetTelemetryV2(
     return SVMS_RESULT_OK;
 }
 
+#if !defined(SVMS_XP_COMPAT)
+static SVMS_Result SVMS_CALL NativeGetTelemetryV3(
+    SVMS_Session session, SVMS_TelemetryV3* telemetry) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!telemetry || telemetry->struct_size < sizeof(SVMS_TelemetryV3) ||
+        telemetry->struct_version != SVMS_STRUCT_VERSION_1)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    g_driver->CopyTelemetryV3(telemetry);
+    return SVMS_RESULT_OK;
+}
+
+static SVMS_Result SVMS_CALL NativeSetLiveParams(
+    SVMS_Session session, uint32_t group_mask, const SVMS_LiveParams* params) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!params || params->struct_size < sizeof(SVMS_LiveParams) ||
+        params->struct_version != SVMS_STRUCT_VERSION_1 ||
+        (group_mask & SVMS_LIVE_GROUP_ALL) == 0u)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    std::string text;
+    return g_driver->SetLiveParams(group_mask, *params, text) ==
+               svms::RLResult::Ok
+        ? SVMS_RESULT_OK : SVMS_RESULT_INVALID_ARGUMENT;
+}
+
+static SVMS_Result SVMS_CALL NativeGetLiveParams(
+    SVMS_Session session, SVMS_LiveParams* params) {
+    if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!g_driver) return SVMS_RESULT_NOT_INITIALIZED;
+    if (!params || params->struct_size < sizeof(SVMS_LiveParams) ||
+        params->struct_version != SVMS_STRUCT_VERSION_1)
+        return SVMS_RESULT_INVALID_ARGUMENT;
+    g_driver->GetLiveParams(params);
+    return SVMS_RESULT_OK;
+}
+#endif
+
 static SVMS_Result SVMS_CALL NativeEnableCallbackTrace(
     SVMS_Session session, uint32_t enable) {
     if (!NativeSessionIsValid(session)) return SVMS_RESULT_NOT_INITIALIZED;
@@ -584,7 +622,11 @@ SVMS_Result SVMS_CALL SVMS_GetInterface(
         SVMS_CAP_CALLBACK_TRACE | SVMS_CAP_MIDI_STREAM |
         SVMS_CAP_DIRECT_PAGES;
 #if !defined(SVMS_XP_COMPAT)
-    table.capabilities |= SVMS_CAP_RUNTIME_COMMANDS;
+    table.capabilities |= SVMS_CAP_RUNTIME_COMMANDS | SVMS_CAP_LIVE_PARAMS |
+        SVMS_CAP_TELEMETRY_V3;
+    table.get_telemetry_v3 = NativeGetTelemetryV3;
+    table.set_live_params = NativeSetLiveParams;
+    table.get_live_params = NativeGetLiveParams;
 #endif
     table.product_major = svms::build::kProductMajor;
     table.product_minor = svms::build::kProductMinor;

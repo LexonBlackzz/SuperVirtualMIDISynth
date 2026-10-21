@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 using GetInterfaceProc = SVMS_Result (SVMS_CALL *)(
     uint32_t, uint32_t, SVMS_Interface*);
@@ -457,6 +458,50 @@ int main(int argc, char** argv) {
         FreeLibrary(runtime);
         return 1;
     }
+
+#if !defined(SVMS_XP_COMPAT)
+    // Live params + telemetry V3 (the runtime-link surface as typed calls).
+    {
+        SVMS_LiveParams live{};
+        live.struct_size = sizeof(live);
+        live.struct_version = SVMS_STRUCT_VERSION_1;
+        bool ok = (api.capabilities & SVMS_CAP_LIVE_PARAMS) != 0u &&
+                  (api.capabilities & SVMS_CAP_TELEMETRY_V3) != 0u &&
+                  api.get_live_params && api.set_live_params &&
+                  api.get_telemetry_v3 &&
+                  api.get_live_params(session, &live) == SVMS_RESULT_OK;
+        live.master_volume = 0.5f;
+        live.reverb_mix = 0.4f;
+        ok = ok && api.set_live_params(session, SVMS_LIVE_GROUP_MASTER |
+                                       SVMS_LIVE_GROUP_REVERB, &live) ==
+                       SVMS_RESULT_OK;
+        SVMS_LiveParams back{};
+        back.struct_size = sizeof(back);
+        back.struct_version = SVMS_STRUCT_VERSION_1;
+        ok = ok && api.get_live_params(session, &back) == SVMS_RESULT_OK &&
+             back.master_volume == 0.5f && back.reverb_mix == 0.4f;
+        live.master_volume = std::numeric_limits<float>::quiet_NaN();
+        ok = ok && api.set_live_params(session, SVMS_LIVE_GROUP_MASTER,
+                                       &live) == SVMS_RESULT_INVALID_ARGUMENT &&
+             api.set_live_params(session, 0u, &live) ==
+                 SVMS_RESULT_INVALID_ARGUMENT;
+        SVMS_TelemetryV3 v3{};
+        v3.struct_size = sizeof(v3);
+        v3.struct_version = SVMS_STRUCT_VERSION_1;
+        ok = ok && api.get_telemetry_v3(session, &v3) == SVMS_RESULT_OK &&
+             v3.census.sample_rate == telemetry.sample_rate &&
+             v3.max_voices != 0u;
+        v3.struct_size = 8u;
+        ok = ok && api.get_telemetry_v3(session, &v3) ==
+                       SVMS_RESULT_INVALID_ARGUMENT;
+        if (!ok) {
+            std::puts("FAIL: live params / telemetry V3 contract violated");
+            api.destroy_session(session);
+            FreeLibrary(runtime);
+            return 1;
+        }
+    }
+#endif
 
     // Callback trace: argument contract always; record invariants only when
     // the audio device actually runs callbacks (CI machines may have none).

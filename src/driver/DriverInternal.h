@@ -1066,6 +1066,16 @@ private:
     svms::RLResult HandleRuntimeLinkCommand(const svms::RuntimeLinkCommandV2& cmd,
                                   char* resultText);
     svms::RuntimeLinkTelemetryV2 BuildRuntimeLinkTelemetry();
+    // Serializes mailbox/command writers: the runtime-link thread and the
+    // native-API callers share one command handler.
+    std::mutex runtimeCommandMutex_;
+public:
+    void GetLiveParams(SVMS_LiveParams* out);
+    svms::RLResult SetLiveParams(uint32_t groupMask,
+                                 const SVMS_LiveParams& params,
+                                 std::string& text);
+    void CopyTelemetryV3(SVMS_TelemetryV3* out);
+private:
 #endif
 
     // Audio-thread record of the LAST live state it actually applied
