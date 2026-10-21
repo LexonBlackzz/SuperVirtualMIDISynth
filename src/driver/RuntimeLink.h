@@ -44,13 +44,13 @@ namespace svms {
 
 // ─── Driver side ------------------------------------------------------------
 
-class RuntimeLinkDriverV2 {
+class RuntimeLinkDriver {
 public:
-    RuntimeLinkDriverV2() = default;
-    ~RuntimeLinkDriverV2() { Shutdown(); }
+    RuntimeLinkDriver() = default;
+    ~RuntimeLinkDriver() { Shutdown(); }
 
-    RuntimeLinkDriverV2(const RuntimeLinkDriverV2&) = delete;
-    RuntimeLinkDriverV2& operator=(const RuntimeLinkDriverV2&) = delete;
+    RuntimeLinkDriver(const RuntimeLinkDriver&) = delete;
+    RuntimeLinkDriver& operator=(const RuntimeLinkDriver&) = delete;
 
     using TelemetryProvider = std::function<RuntimeLinkTelemetryV2()>;
     using CommandHandler = std::function<RLResult(
@@ -77,72 +77,19 @@ public:
             if (sessionId_ == 0u) sessionId_ = 1u;
         }
 
-        wchar_t memName[128], mutexName[128], evtName[128];
-        RLV2_SharedMemName(pid_, memName, 128);
-        RLV2_MutexName(pid_, mutexName, 128);
-        RLV2_CmdEventName(pid_, evtName, 128);
-
-        const uint32_t mapSize = RuntimeLinkMappingSizeV2();
-
-        hMap_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
-                                   PAGE_READWRITE, 0, mapSize, memName);
-        if (!hMap_) return false;
-        view_ = static_cast<RuntimeLinkSharedMemoryV2*>(
-            MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, mapSize));
-        if (!view_) { CloseHandle(hMap_); hMap_ = nullptr; return false; }
-
-        hMutex_ = CreateMutexW(nullptr, FALSE, mutexName);
-        if (!hMutex_) {
-            Shutdown();
+        // V3 is the only wire. A failure leaves the driver running without
+        // telemetry or live control; it never prevents MIDI/audio init.
+        if (!InitializeV3()) {
+            ShutdownV3();
             return false;
         }
-        // Auto-reset command event (wakes the control thread early).
-        hCmdEvent_ = CreateEventW(nullptr, FALSE, FALSE, evtName);
-        if (!hCmdEvent_) {
-            Shutdown();
-            return false;
-        }
-
-        std::memset(view_, 0, mapSize);
-
-        RuntimeLinkHeaderV2& h = view_->header;
-        h.magic = kRuntimeLinkMagic;
-        h.version = kRuntimeLinkVersion;
-        h.size = mapSize;
-        h.publisherPid = pid_;
-        h.structSize = sizeof(RuntimeLinkTelemetryV2);
-#ifdef _WIN64
-        h.archClass = kRuntimeLinkArchX64;
-#else
-        h.archClass = kRuntimeLinkArchX86;
-#endif
-        h.headerCrc = RLV2_HeaderCrc(h);
-        // telemetrySequence starts at 2 (settled, empty slot).
-
-        if (!EnsureHostsRegistry()) { Shutdown(); return false; }
-        RegisterHostSlot();
-
-        // V2 remains authoritative for already-shipped configurators. V3 is
-        // published in parallel and is deliberately non-fatal so telemetry
-        // can never prevent MIDI/audio initialization.
-        InitializeV3();
-
         initialized_ = true;
         return true;
     }
 
     void Shutdown() {
         StopControlThread();
-        if (initialized_ && hostsView_) UnregisterHostSlot();
         ShutdownV3();
-
-        if (view_) { UnmapViewOfFile(view_); view_ = nullptr; }
-        if (hMap_) { CloseHandle(hMap_); hMap_ = nullptr; }
-        if (hMutex_) { CloseHandle(hMutex_); hMutex_ = nullptr; }
-        if (hCmdEvent_) { CloseHandle(hCmdEvent_); hCmdEvent_ = nullptr; }
-        if (hostsView_) { UnmapViewOfFile(hostsView_); hostsView_ = nullptr; }
-        if (hostsMap_) { CloseHandle(hostsMap_); hostsMap_ = nullptr; }
-        if (hostsMutex_) { CloseHandle(hostsMutex_); hostsMutex_ = nullptr; }
         initialized_ = false;
     }
 
@@ -158,7 +105,7 @@ public:
         commandHandler_ = std::move(handler);
         controlThreadRunning_.store(true, std::memory_order_release);
         try {
-            controlThread_ = std::thread(&RuntimeLinkDriverV2::ControlThreadProc, this);
+            controlThread_ = std::thread(&RuntimeLinkDriver::ControlThreadProc, this);
         } catch (...) {
             controlThreadRunning_.store(false, std::memory_order_release);
             telemetryProvider_ = nullptr;
@@ -170,8 +117,7 @@ public:
 
     void StopControlThread() {
         controlThreadRunning_.store(false, std::memory_order_release);
-        if (hCmdEvent_) SetEvent(hCmdEvent_);  // wake the wait
-        if (v3CmdEvent_) SetEvent(v3CmdEvent_);
+        if (v3CmdEvent_) SetEvent(v3CmdEvent_);  // wake the wait
         if (controlThread_.joinable()) controlThread_.join();
         telemetryProvider_ = nullptr;
         commandHandler_ = nullptr;
@@ -181,18 +127,12 @@ private:
     void ControlThreadProc() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
         while (controlThreadRunning_.load(std::memory_order_acquire)) {
-            HANDLE waits[2] = { hCmdEvent_, v3CmdEvent_ };
-            const DWORD waitCount = v3CmdEvent_ ? 2u : 1u;
-            const DWORD wait = WaitForMultipleObjects(
-                waitCount, waits, FALSE, kRuntimeLinkPublishIntervalMs);
+            const DWORD wait = WaitForSingleObject(
+                v3CmdEvent_, kRuntimeLinkPublishIntervalMs);
             if (!controlThreadRunning_.load(std::memory_order_acquire)) break;
-            if ((wait >= WAIT_OBJECT_0 && wait < WAIT_OBJECT_0 + waitCount) ||
-                wait == WAIT_TIMEOUT) {
-                for (int i = 0; i < 4; ++i) {
-                    const bool v2 = ProcessPendingCommand();
-                    const bool v3 = ProcessPendingCommandV3();
-                    if (!v2 && !v3) break;
-                }
+            if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT) {
+                for (int i = 0; i < 4; ++i)
+                    if (!ProcessPendingCommandV3()) break;
                 PublishTelemetry();
             } else {
                 Sleep(5);
@@ -203,12 +143,6 @@ private:
     // Returns true when a new command was captured.  The payload copy
     // happens only after the (requestId, token) commit markers settle,
     // so a racing client write can never produce a torn payload.
-    bool ProcessPendingCommand() {
-        if (!view_) return false;
-        return ProcessPendingCommandSlot(&view_->header, view_->command,
-                                         processedId_, processedToken_,
-                                         hCmdEvent_);
-    }
 
     bool ProcessPendingCommandV3() {
         if (!v3View_) return false;
@@ -300,7 +234,7 @@ private:
     }
 
     void PublishTelemetry() {
-        if (!view_) return;
+        if (!v3View_) return;
 
         RuntimeLinkTelemetryV2 snap = telemetryProvider_
             ? telemetryProvider_() : RuntimeLinkTelemetryV2{};
@@ -316,22 +250,6 @@ private:
         QueryPerformanceCounter(&qpc);
         snap.timestampQpc = static_cast<uint64_t>(qpc.QuadPart);
 
-        volatile RuntimeLinkHeaderV2* h = &view_->header;
-        // Monotonic seqlock publish: odd = writer inside the slot, even =
-        // stable.  telemetrySeq_ only ever advances by 2 per publish, so a
-        // reader can never mistake two consecutive publishes for one (the
-        // old 1 -> 2 toggle repeated its values and could hide a torn
-        // mid-copy capture under ABA).
-        h->telemetrySequence = telemetrySeq_ | 1u;
-        RLV2_MemBarrier();
-        view_->telemetry = snap;
-        RLV2_MemBarrier();
-        telemetrySeq_ += 2u;
-        h->telemetrySequence = telemetrySeq_;
-        h->heartbeatQpc = snap.timestampQpc;
-        RLV2_MemBarrier();
-
-        UpdateHostsHeartbeat(snap.timestampQpc);
         PublishTelemetryV3(snap);
     }
 
@@ -571,150 +489,10 @@ private:
         v3HostRegistered_ = false;
     }
 
-    bool EnsureHostsRegistry() {
-        wchar_t regName[128], mtxName[128];
-        RLV2_HostsRegName(regName, 128);
-        RLV2_HostsMutexName(mtxName, 128);
-
-        const uint32_t regSize = sizeof(RuntimeHostsRegistryV2);
-        hostsMap_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
-                                       PAGE_READWRITE, 0, regSize, regName);
-        if (!hostsMap_) return false;
-        const bool created = GetLastError() != ERROR_ALREADY_EXISTS;
-        hostsView_ = static_cast<RuntimeHostsRegistryV2*>(
-            MapViewOfFile(hostsMap_, FILE_MAP_ALL_ACCESS, 0, 0, regSize));
-        if (!hostsView_) return false;
-        if (created) {
-            std::memset(hostsView_, 0, regSize);
-            hostsView_->magic = kRuntimeLinkMagic;
-            hostsView_->version = kRuntimeLinkVersion;
-            hostsView_->slotCapacity = kRuntimeHostMaxCount;
-            hostRegistryInitialized_ = true;
-        } else {
-            // Verify an already-created registry looks plausible.
-            volatile RuntimeHostsRegistryV2* r = hostsView_;
-            hostRegistryInitialized_ =
-                r->magic == kRuntimeLinkMagic &&
-                r->version == kRuntimeLinkVersion &&
-                r->slotCapacity == kRuntimeHostMaxCount;
-            if (!hostRegistryInitialized_ && r->magic == 0u && r->version == 0u) {
-                // Weird half-initialized state from a crashed creator:
-                // take ownership.
-                std::memset(hostsView_, 0, regSize);
-                hostRegistryInitialized_ = true;
-            }
-        }
-
-        hostsMutex_ = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mtxName);
-        if (!hostsMutex_) {
-            HANDLE createdMutex = CreateMutexW(nullptr, FALSE, mtxName);
-            if (createdMutex) {
-                if (GetLastError() == ERROR_ALREADY_EXISTS) {
-                    CloseHandle(createdMutex);
-                    hostsMutex_ = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE,
-                                             FALSE, mtxName);
-                } else {
-                    hostsMutex_ = createdMutex;
-                }
-            }
-        }
-        return hostsMutex_ != nullptr && hostRegistryInitialized_;
-    }
-
-    // Claims (or refreshes) this driver's registry slot under the hosts
-    // mutex.  Slot policy: same sessionId wins; otherwise an empty slot;
-    // otherwise the stalest slot.
-    void RegisterHostSlot() {
-        if (!hostsView_ || !hostsMutex_ || sessionId_ == 0u) return;
-
-        LARGE_INTEGER qpc;
-        QueryPerformanceCounter(&qpc);
-        const uint64_t now = static_cast<uint64_t>(qpc.QuadPart);
-
-        if (WaitForSingleObject(hostsMutex_, kRuntimeLinkMutexTimeoutMs)
-                != WAIT_OBJECT_0) {
-            return;
-        }
-        int own = -1, empty = -1, stale = -1;
-        uint64_t staleAge = 0;
-        for (int i = 0; i < kRuntimeHostMaxCount; ++i) {
-            const RuntimeHostSlotV2& s = hostsView_->slots[i];
-            if (s.pid == pid_ && s.sessionId == sessionId_) { own = i; break; }
-            if (RLV2_HostsSlotIsEmpty(s) && empty < 0) empty = i;
-            if (!RLV2_HostsSlotIsFresh(s, now, qpcFreq_, kRuntimeHostTimeoutMs)
-                && stale < 0) {
-                stale = i;
-                staleAge = 0;
-            }
-        }
-        int target = own;
-        if (target < 0) target = empty;
-        if (target < 0) target = stale;
-        if (target >= 0) {
-            RuntimeHostSlotV2& s = hostsView_->slots[target];
-            s.magic = kRuntimeLinkMagic;
-            s.pid = pid_;
-#ifdef _WIN64
-            s.archClass = kRuntimeLinkArchX64;
-#else
-            s.archClass = kRuntimeLinkArchX86;
-#endif
-            s.sessionId = sessionId_;
-            s.lastHeartbeatQpc = now;
-            hostRegistered_ = true;
-        } else {
-            // Table completely full of fresh entries — heartbeats no-op.
-            hostRegistered_ = false;
-        }
-        ReleaseMutex(hostsMutex_);
-    }
-
-    void UpdateHostsHeartbeat(uint64_t nowQpc) {
-        if (!hostsView_ || !hostsMutex_ || !hostRegistered_) return;
-        if (WaitForSingleObject(hostsMutex_, kRuntimeLinkMutexTimeoutMs)
-                != WAIT_OBJECT_0) {
-            return;
-        }
-        for (int i = 0; i < kRuntimeHostMaxCount; ++i) {
-            RuntimeHostSlotV2& s = hostsView_->slots[i];
-            if (s.pid == pid_ && s.sessionId == sessionId_) {
-                s.lastHeartbeatQpc = nowQpc;
-                break;
-            }
-        }
-        ReleaseMutex(hostsMutex_);
-    }
-
-    void UnregisterHostSlot() {
-        if (!hostsView_ || !hostsMutex_) return;
-        if (WaitForSingleObject(hostsMutex_, kRuntimeLinkMutexTimeoutMs)
-                != WAIT_OBJECT_0) {
-            return;
-        }
-        for (int i = 0; i < kRuntimeHostMaxCount; ++i) {
-            RuntimeHostSlotV2& s = hostsView_->slots[i];
-            if (s.pid == pid_ && s.sessionId == sessionId_) {
-                std::memset(&s, 0, sizeof(s));
-                break;
-            }
-        }
-        ReleaseMutex(hostsMutex_);
-    }
-
-    HANDLE hMap_       = nullptr;
-    HANDLE hMutex_     = nullptr;
-    HANDLE hCmdEvent_  = nullptr;
-    RuntimeLinkSharedMemoryV2* view_ = nullptr;
     uint32_t pid_      = 0;
     uint64_t sessionId_ = 0;
     uint64_t qpcFreq_  = 0;
     bool initialized_  = false;
-
-    HANDLE hostsMap_   = nullptr;
-    HANDLE hostsMutex_ = nullptr;
-    RuntimeHostsRegistryV2* hostsView_ = nullptr;
-    bool hostRegistryInitialized_ = false;
-    bool hostRegistered_ = false;
 
     HANDLE v3Map_ = nullptr;
     HANDLE v3Mutex_ = nullptr;
@@ -733,311 +511,10 @@ private:
     std::atomic<bool> controlThreadRunning_{false};
     TelemetryProvider telemetryProvider_;
     CommandHandler commandHandler_;
-    uint32_t processedId_      = 0;
-    uint32_t processedToken_   = 0;
-    // Monotonic telemetry seqlock word; starts settled (even) at 2 and
-    // advances by 2 per publish (see PublishTelemetry).
-    uint32_t telemetrySeq_     = 2u;
     bool busyWithReload_       = false;
 };
 
 // ─── Configurator side ------------------------------------------------------
-
-class RuntimeLinkClientV2 {
-public:
-    RuntimeLinkClientV2() = default;
-    ~RuntimeLinkClientV2() { Close(); }
-
-    RuntimeLinkClientV2(const RuntimeLinkClientV2&) = delete;
-    RuntimeLinkClientV2& operator=(const RuntimeLinkClientV2&) = delete;
-
-    struct HostInfo {
-        uint32_t pid       = 0;
-        uint32_t archClass = 0;
-        uint64_t sessionId = 0;
-        bool fresh         = false;
-    };
-
-    bool Open(uint32_t pid) {
-        Close();
-
-        wchar_t memName[128], mutexName[128], evtName[128];
-        RLV2_SharedMemName(pid, memName, 128);
-        RLV2_MutexName(pid, mutexName, 128);
-        RLV2_CmdEventName(pid, evtName, 128);
-
-        // Commands are written into the mapping, so the view needs
-        // read+write access (V1 wrongly opened FILE_MAP_READ and wrote
-        // through a const_cast).
-        hMap_ = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, memName);
-        if (!hMap_) return false;
-        // Map the whole file (dwBytesToMap == 0); size is validated via
-        // header.size after the header is visible.
-        view_ = static_cast<RuntimeLinkSharedMemoryV2*>(
-            MapViewOfFile(hMap_, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0));
-        if (!view_) { CloseHandle(hMap_); hMap_ = nullptr; return false; }
-
-        if (!ValidateHeader(pid)) { Close(); return false; }
-
-        // The client releases the mutex after writing a command, so it
-        // needs MUTEX_MODIFY_STATE in addition to SYNCHRONIZE (a mutex
-        // opened with SYNCHRONIZE alone makes ReleaseMutex fail).
-        hMutex_ = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mutexName);
-        if (!hMutex_) { Close(); return false; }
-        hCmdEvent_ = OpenEventW(EVENT_MODIFY_STATE, FALSE, evtName);  // optional
-
-        pid_ = pid;
-        QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(&qpcFreq_));
-
-        LARGE_INTEGER qpc;
-        QueryPerformanceCounter(&qpc);
-        uint32_t r0 = static_cast<uint32_t>(GetTickCount() ^ qpc.LowPart) ^ pid_
-                    ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(this));
-        token_ = r0 ? r0 : 1u;
-        requestCounter_ = 1;
-        hasTelemetry_ = false;
-        return true;
-    }
-
-    void Close() {
-        if (view_) { UnmapViewOfFile(view_); view_ = nullptr; }
-        if (hMap_) { CloseHandle(hMap_); hMap_ = nullptr; }
-        if (hMutex_) { CloseHandle(hMutex_); hMutex_ = nullptr; }
-        if (hCmdEvent_) { CloseHandle(hCmdEvent_); hCmdEvent_ = nullptr; }
-        pid_ = 0;
-        hasTelemetry_ = false;
-    }
-
-    bool IsOpen() const { return view_ != nullptr; }
-    uint32_t GetPID() const { return pid_; }
-
-    // ── Telemetry (skip-if-busy) ──────────────────────────────────────
-    //
-    // Returns false when the driver is mid-publish (odd sequence or the
-    // sequence changed during the copy); out is then left as the last
-    // successfully read snapshot.
-    bool ReadTelemetry(RuntimeLinkTelemetryV2& out) {
-        if (!view_) return false;
-        volatile RuntimeLinkHeaderV2* h = &view_->header;
-
-        const uint32_t seq = h->telemetrySequence;
-        if ((seq & 1u) != 0u) {            // writer inside the slot
-            if (hasTelemetry_) out = lastTelemetry_;
-            return false;
-        }
-        RuntimeLinkTelemetryV2 t = view_->telemetry;
-        RLV2_MemBarrier();
-        if (h->telemetrySequence != seq) { // changed mid-copy
-            if (hasTelemetry_) out = lastTelemetry_;
-            return false;
-        }
-        lastTelemetry_ = t;
-        hasTelemetry_ = true;
-        out = t;
-        return true;
-    }
-
-    // Heartbeat-based death detection (QPC deltas, system-wide clock).
-    bool IsHostAlive(uint32_t timeoutMs) const {
-        if (!view_ || qpcFreq_ == 0u) return false;
-        volatile RuntimeLinkHeaderV2* h = &view_->header;
-        const uint64_t hb = h->heartbeatQpc;
-        if (hb == 0u) return false;
-        LARGE_INTEGER qpc;
-        QueryPerformanceCounter(&qpc);
-        const uint64_t now = static_cast<uint64_t>(qpc.QuadPart);
-        const uint64_t ageQpc = now > hb ? now - hb : 0u;
-        return (ageQpc * 1000u) / qpcFreq_ < timeoutMs;
-    }
-
-    // ── Commands ──────────────────────────────────────────────────────
-    //
-    // Blocks up to timeoutMs waiting for the driver's ACK.  Returns
-    // the driver's result (RLResult) or Busy on timeout.  resultText
-    // is best-effort diagnostic text for the last ACKed command.
-    RLResult SendCommand(RLCommandType type, uint32_t groupMask,
-                         uint32_t param, const RuntimeLiveStateV2& live,
-                         uint32_t timeoutMs, char resultText[
-                             kRuntimeLinkResultTextCapacity] = nullptr,
-                         const char* requestText = nullptr) {
-        if (!view_ || !hMutex_) {
-            if (resultText) {
-                strncpy_s(resultText, kRuntimeLinkResultTextCapacity,
-                          "not connected", _TRUNCATE);
-            }
-            return RLResult::InternalError;
-        }
-
-        const size_t requestLength = requestText
-            ? strnlen_s(requestText, kRuntimeLinkCommandTextCapacity) : 0u;
-        if (requestText && requestLength >= kRuntimeLinkCommandTextCapacity) {
-            if (resultText) {
-                strncpy_s(resultText, kRuntimeLinkResultTextCapacity,
-                          "command text is too long", _TRUNCATE);
-            }
-            return RLResult::InvalidArgument;
-        }
-
-        const uint32_t req = requestCounter_++;
-        if (WaitForSingleObject(hMutex_, kRuntimeLinkMutexTimeoutMs)
-                != WAIT_OBJECT_0) {
-            if (resultText) {
-                strncpy_s(resultText, kRuntimeLinkResultTextCapacity,
-                          "command mutex timeout", _TRUNCATE);
-            }
-            return RLResult::Busy;
-        }
-
-        // Payload first, commit markers last.
-        RuntimeLinkCommandV2& slot = view_->command;
-        slot.type = static_cast<uint32_t>(type);
-        slot.groupMask = groupMask;
-        slot.param = param;
-        slot.live = live;
-        std::memset(slot.resultText, 0, sizeof(slot.resultText));
-        if (requestLength != 0u)
-            std::memcpy(slot.resultText, requestText, requestLength);
-        RLV2_MemBarrier();
-        volatile RuntimeLinkHeaderV2* h = &view_->header;
-        h->commandRequestToken = token_;
-        RLV2_MemBarrier();
-        h->commandRequestId = req;
-        RLV2_MemBarrier();
-        ReleaseMutex(hMutex_);
-        if (hCmdEvent_) SetEvent(hCmdEvent_);   // early wake for the driver
-
-        // Wait for the ACK (poll; the event keeps the driver waking early
-        // even if a second client pollutes the slot).
-        const uint32_t startTick = GetTickCount();
-        const int32_t timeoutDelta = static_cast<int32_t>(timeoutMs);
-        for (;;) {
-            const uint32_t proc = h->commandProcessedId;
-            const uint32_t procTok = h->commandProcessedToken;
-            if (proc == req && procTok == token_) {
-                const RLResult result = static_cast<RLResult>(h->commandResult);
-                if (resultText) {
-                    std::memcpy(resultText, view_->command.resultText,
-                                kRuntimeLinkResultTextCapacity);
-                }
-                return result;
-            }
-            const int32_t elapsed =
-                static_cast<int32_t>(GetTickCount() - startTick);
-            if (elapsed >= timeoutDelta) break;
-            Sleep(2);
-        }
-        if (resultText) {
-            strncpy_s(resultText, kRuntimeLinkResultTextCapacity,
-                      "no ACK within timeout", _TRUNCATE);
-        }
-        return RLResult::Busy;
-    }
-
-    RLResult SendPing(uint32_t timeoutMs,
-                      char resultText[kRuntimeLinkResultTextCapacity] = nullptr) {
-        return SendCommand(RLCommandType::Ping, 0u, 0u,
-                           RuntimeLiveStateV2{}, timeoutMs, resultText);
-    }
-
-    // ── Discovery ─────────────────────────────────────────────────────
-    //
-    // Enumerates live driver instances from the hosts registry.
-    // Returns the number of hosts written; entries with fresh == false
-    // are stale slots (crashed publishers) included for diagnostics.
-    static uint32_t EnumerateHosts(HostInfo* out, uint32_t maxCount) {
-        if (!out || maxCount == 0u) return 0u;
-
-        wchar_t regName[128], mtxName[128];
-        RLV2_HostsRegName(regName, 128);
-        RLV2_HostsMutexName(mtxName, 128);
-
-        HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, regName);
-        if (!hMap) return 0u;
-        RuntimeHostsRegistryV2* reg = static_cast<RuntimeHostsRegistryV2*>(
-            MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-        HANDLE hMtx = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mtxName);
-        uint32_t count = 0u;
-        if (reg && hMtx &&
-            WaitForSingleObject(hMtx, kRuntimeLinkMutexTimeoutMs)
-                == WAIT_OBJECT_0) {
-            volatile RuntimeHostsRegistryV2* r = reg;
-            if (r->magic == kRuntimeLinkMagic &&
-                r->version == kRuntimeLinkVersion &&
-                r->slotCapacity == kRuntimeHostMaxCount) {
-                LARGE_INTEGER qpc;
-                QueryPerformanceCounter(&qpc);
-                uint64_t freq = 0;
-                QueryPerformanceFrequency(
-                    reinterpret_cast<LARGE_INTEGER*>(&freq));
-                const uint64_t now = static_cast<uint64_t>(qpc.QuadPart);
-                for (uint32_t i = 0;
-                     i < kRuntimeHostMaxCount && count < maxCount; ++i) {
-                    const RuntimeHostSlotV2& s = reg->slots[i];
-                    if (RLV2_HostsSlotIsEmpty(s)) continue;
-                    HostInfo& info = out[count++];
-                    info.pid = s.pid;
-                    info.archClass = s.archClass;
-                    info.sessionId = s.sessionId;
-                    info.fresh = RLV2_HostsSlotIsFresh(
-                        s, now, freq, kRuntimeHostTimeoutMs);
-                }
-            }
-            ReleaseMutex(hMtx);
-        }
-        if (hMtx) CloseHandle(hMtx);
-        if (reg) UnmapViewOfFile(reg);
-        CloseHandle(hMap);
-        return count;
-    }
-
-private:
-    bool ValidateHeader(uint32_t pid) const {
-        // Field-by-field copy: volatile members cannot be passed to
-        // non-volatile helpers (RLV2_HeaderCrc takes a const&).
-        volatile RuntimeLinkHeaderV2* h = &view_->header;
-        RuntimeLinkHeaderV2 local{};
-        local.heartbeatQpc = h->heartbeatQpc;
-        local.magic = h->magic;
-        local.version = h->version;
-        local.size = h->size;
-        local.publisherPid = h->publisherPid;
-        local.structSize = h->structSize;
-        local.archClass = h->archClass;
-        local.headerCrc = h->headerCrc;
-        local.telemetrySequence = h->telemetrySequence;
-        local.commandRequestId = h->commandRequestId;
-        local.commandRequestToken = h->commandRequestToken;
-        local.commandProcessedId = h->commandProcessedId;
-        local.commandProcessedToken = h->commandProcessedToken;
-        local.commandResult = h->commandResult;
-
-        if (local.magic != kRuntimeLinkMagic) return false;
-        if (local.version != kRuntimeLinkVersion) return false;
-        if (local.publisherPid == 0u || local.publisherPid != pid) return false;
-#ifdef _WIN64
-        if (local.archClass != kRuntimeLinkArchX64) return false;
-#endif
-        if (local.structSize != sizeof(RuntimeLinkTelemetryV2)) return false;
-        const uint32_t required = RLV2_HeaderSize()
-                                + RLV2_PadTo64(local.structSize)
-                                + sizeof(RuntimeLinkCommandV2);
-        if (local.size < required) return false;
-        const uint32_t crc = RLV2_HeaderCrc(local);
-        return local.headerCrc == crc;
-    }
-
-    HANDLE hMap_      = nullptr;
-    HANDLE hMutex_    = nullptr;
-    HANDLE hCmdEvent_ = nullptr;
-    RuntimeLinkSharedMemoryV2* view_ = nullptr;
-    uint32_t pid_     = 0;
-    uint64_t qpcFreq_ = 0;
-    uint32_t token_   = 0;
-    uint32_t requestCounter_ = 0;
-    RuntimeLinkTelemetryV2 lastTelemetry_{};
-    bool hasTelemetry_ = false;
-};
-
 class RuntimeLinkClientV3 {
 public:
     struct PeerInfo {
@@ -1411,12 +888,11 @@ private:
     bool hasTelemetry_ = false;
 };
 
-// Negotiating client used by current tools.  V3 discovery is attempted first;
-// V2 remains a complete fallback so an updated configurator can still manage
-// older drivers.  Callers never need to select a wire layout themselves.
+// The client used by tools (the remote client in frontends/RemoteClient.cpp).
+// V3 is the only wire: discovery header, hosts registry, per-PID mapping.
 class RuntimeLinkClient {
 public:
-    enum class Protocol : uint32_t { None = 0u, V2 = 2u, V3 = 3u };
+    enum class Protocol : uint32_t { None = 0u, V3 = 3u };
 
     struct HostInfo {
         uint32_t pid = 0u;
@@ -1436,28 +912,14 @@ public:
 
     bool Open(uint32_t pid) {
         Close();
-        if (v3_.Open(pid)) {
-            protocol_ = Protocol::V3;
-            peer_ = FromV3(v3_.GetPeerInfo());
-            return true;
-        }
-        if (v2_.Open(pid)) {
-            protocol_ = Protocol::V2;
-            peer_.pid = pid;
-            peer_.protocolMin = kRuntimeLinkVersion;
-            peer_.protocolMax = kRuntimeLinkVersion;
-            peer_.capabilityFlags = build::CapabilityRuntimeLinkV2 |
-                build::CapabilityLiveConfiguration |
-                build::CapabilityTelemetry;
-            peer_.fresh = true;
-            return true;
-        }
-        return false;
+        if (!v3_.Open(pid)) return false;
+        protocol_ = Protocol::V3;
+        peer_ = FromV3(v3_.GetPeerInfo());
+        return true;
     }
 
     void Close() {
         v3_.Close();
-        v2_.Close();
         protocol_ = Protocol::None;
         peer_ = HostInfo{};
     }
@@ -1471,13 +933,11 @@ public:
     }
 
     bool ReadTelemetry(RuntimeLinkTelemetryV2& out) {
-        return protocol_ == Protocol::V3 ? v3_.ReadTelemetry(out) :
-               protocol_ == Protocol::V2 ? v2_.ReadTelemetry(out) : false;
+        return IsOpen() && v3_.ReadTelemetry(out);
     }
 
     bool IsHostAlive(uint32_t timeoutMs) const {
-        return protocol_ == Protocol::V3 ? v3_.IsHostAlive(timeoutMs) :
-               protocol_ == Protocol::V2 ? v2_.IsHostAlive(timeoutMs) : false;
+        return IsOpen() && v3_.IsHostAlive(timeoutMs);
     }
 
     RLResult SendCommand(RLCommandType type, uint32_t groupMask,
@@ -1486,11 +946,8 @@ public:
                          char resultText[kRuntimeLinkResultTextCapacity] =
                              nullptr,
                          const char* requestText = nullptr) {
-        if (protocol_ == Protocol::V3)
+        if (IsOpen())
             return v3_.SendCommand(type, groupMask, param, live, timeoutMs,
-                                   resultText, requestText);
-        if (protocol_ == Protocol::V2)
-            return v2_.SendCommand(type, groupMask, param, live, timeoutMs,
                                    resultText, requestText);
         if (resultText) strncpy_s(resultText,
             kRuntimeLinkResultTextCapacity, "not connected", _TRUNCATE);
@@ -1499,34 +956,13 @@ public:
 
     static uint32_t EnumerateHosts(HostInfo* out, uint32_t maxCount) {
         if (!out || maxCount == 0u) return 0u;
-        RuntimeLinkClientV3::PeerInfo modern[kRuntimeHostMaxCount]{};
-        const uint32_t modernCount = RuntimeLinkClientV3::EnumerateHosts(
-            modern, kRuntimeHostMaxCount);
-        uint32_t count = 0u;
-        for (uint32_t i = 0u; i < modernCount && count < maxCount; ++i)
-            out[count++] = FromV3(modern[i]);
-
-        RuntimeLinkClientV2::HostInfo legacy[kRuntimeHostMaxCount]{};
-        const uint32_t legacyCount = RuntimeLinkClientV2::EnumerateHosts(
-            legacy, kRuntimeHostMaxCount);
-        for (uint32_t i = 0u; i < legacyCount && count < maxCount; ++i) {
-            bool duplicate = false;
-            for (uint32_t j = 0u; j < count; ++j)
-                duplicate |= out[j].pid == legacy[i].pid;
-            if (duplicate) continue;
-            HostInfo info{};
-            info.pid = legacy[i].pid;
-            info.archClass = legacy[i].archClass;
-            info.protocolMin = kRuntimeLinkVersion;
-            info.protocolMax = kRuntimeLinkVersion;
-            info.capabilityFlags = build::CapabilityRuntimeLinkV2 |
-                build::CapabilityLiveConfiguration |
-                build::CapabilityTelemetry;
-            info.sessionId = legacy[i].sessionId;
-            info.fresh = legacy[i].fresh;
-            out[count++] = info;
-        }
-        return count;
+        RuntimeLinkClientV3::PeerInfo hosts[kRuntimeHostMaxCount]{};
+        const uint32_t count = RuntimeLinkClientV3::EnumerateHosts(
+            hosts, kRuntimeHostMaxCount);
+        uint32_t written = 0u;
+        for (uint32_t i = 0u; i < count && written < maxCount; ++i)
+            out[written++] = FromV3(hosts[i]);
+        return written;
     }
 
 private:
@@ -1549,7 +985,6 @@ private:
     }
 
     RuntimeLinkClientV3 v3_{};
-    RuntimeLinkClientV2 v2_{};
     Protocol protocol_ = Protocol::None;
     HostInfo peer_{};
 };

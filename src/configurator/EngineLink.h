@@ -212,6 +212,11 @@ public:
             if (id == known) return true;
         return false;
     }
+    RLResult SendPing(uint32_t timeoutMs, char* resultText = nullptr) {
+        return SendCommand(RLCommandType::Ping, 0u, 0u, RuntimeLiveStateV2{},
+                           timeoutMs, resultText);
+    }
+
 
     static uint32_t EnumerateHosts(HostInfo* out, uint32_t maxCount) {
         if (!out || maxCount == 0u) return 0u;

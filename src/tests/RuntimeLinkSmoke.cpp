@@ -1,5 +1,5 @@
-// RuntimeLinkSmoke.cpp — live smoke test for the RuntimeLink V2
-// driver (control thread + shared-memory IPC) inside the real winmm.dll.
+// RuntimeLinkSmoke.cpp - live smoke test of the engine link (EngineLink on
+// the SVMSAPI remote client) against the real winmm.dll driver in this process.
 //
 // Flow: load build/bin/winmm.dll → open MIDI_MAPPER → discover the
 // driver's host slot (same PID) → connect → wait for settled telemetry
@@ -13,7 +13,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 
-#include "driver/RuntimeLink.h"
+#include "configurator/EngineLink.h"
 
 #include <cstdio>
 #include <cstring>
@@ -31,34 +31,10 @@ typedef MMRESULT (WINAPI* MidiOutUnprepareHeaderProc)(HMIDIOUT, LPMIDIHDR, UINT)
 typedef MMRESULT (WINAPI* MidiOutResetProc)(HMIDIOUT);
 typedef MMRESULT (WINAPI* MidiOutCloseProc)(HMIDIOUT);
 
-bool WaitForTelemetry(svms::RuntimeLinkClientV2& client,
+bool WaitForTelemetry(svms::EngineLink& client,
                       svms::RuntimeLinkTelemetryV2& out,
                       unsigned int timeoutMs) {
-    // A zero slot is "settled" too (sequence starts even), so require a
-    // non-zero publish timestamp to avoid accepting the pre-publish
-    // zeroed mapping.
-    const DWORD start = GetTickCount();
-    do {
-        if (client.ReadTelemetry(out) && out.timestampQpc != 0u) return true;
-        Sleep(25);
-    } while (static_cast<int>(GetTickCount() - start) < (int)timeoutMs);
-    return false;
-}
-
-bool WaitForTelemetry(svms::RuntimeLinkClientV3& client,
-                      svms::RuntimeLinkTelemetryV2& out,
-                      unsigned int timeoutMs) {
-    const DWORD start = GetTickCount();
-    do {
-        if (client.ReadTelemetry(out) && out.timestampQpc != 0u) return true;
-        Sleep(25);
-    } while (static_cast<int>(GetTickCount() - start) < (int)timeoutMs);
-    return false;
-}
-
-bool WaitForTelemetry(svms::RuntimeLinkClient& client,
-                      svms::RuntimeLinkTelemetryV2& out,
-                      unsigned int timeoutMs) {
+    // A zero timestamp means the host has not published a frame yet.
     const DWORD start = GetTickCount();
     do {
         if (client.ReadTelemetry(out) && out.timestampQpc != 0u) return true;
@@ -203,12 +179,12 @@ int main(int argc, char** argv) {
     const DWORD ownPid = GetCurrentProcessId();
 
     // ── 1. Host discovery: the driver must register itself ──────────
-    svms::RuntimeLinkClientV2::HostInfo hosts[4];
+    svms::EngineLink::HostInfo hosts[4];
     uint32_t hostCount = 0;
     {
         const DWORD start = GetTickCount();
         do {
-            hostCount = svms::RuntimeLinkClientV2::EnumerateHosts(hosts, 4);
+            hostCount = svms::EngineLink::EnumerateHosts(hosts, 4);
             for (uint32_t i = 0; i < hostCount; ++i) {
                 if (hosts[i].pid == ownPid && hosts[i].fresh) break;
             }
@@ -238,7 +214,7 @@ int main(int argc, char** argv) {
     }
 
     // ── 2. Connect and wait for settled telemetry ───────────────────
-    svms::RuntimeLinkClientV2 client;
+    svms::EngineLink client;
     if (!client.Open(ownPid)) {
         std::puts("FAIL: could not open the driver mapping (ValidateHeader)");
         reset(handle);
@@ -284,72 +260,40 @@ int main(int argc, char** argv) {
     std::printf("INFO: telemetry OK (sr=%u frames=%u master=%.2f)\n",
                 t.sampleRate, t.bufferFrames, t.live.masterVolume);
 
-    // RuntimeLink V3 is published beside, not instead of, V2. Its neutral
-    // discovery registry carries version/capability information while the
-    // section payload remains exactly compatible in this generation.
-    svms::RuntimeLinkClientV3::PeerInfo v3Hosts[4]{};
-    const uint32_t v3HostCount =
-        svms::RuntimeLinkClientV3::EnumerateHosts(v3Hosts, 4u);
-    bool foundV3Host = false;
-    for (uint32_t i = 0u; i < v3HostCount; ++i) {
-        if (v3Hosts[i].pid == ownPid && v3Hosts[i].fresh) {
-            foundV3Host = true;
-            break;
+    // The link negotiates identity and capabilities; the engine must report
+    // this build and everything the configurator relies on.
+    {
+        svms::EngineLink::HostInfo hostsNow[4];
+        const uint32_t nowCount = svms::EngineLink::EnumerateHosts(hostsNow, 4u);
+        bool foundHost = false;
+        for (uint32_t i = 0u; i < nowCount; ++i)
+            foundHost = foundHost || (hostsNow[i].pid == ownPid && hostsNow[i].fresh);
+        const svms::EngineLink::HostInfo& peer = client.GetPeerInfo();
+        if (!foundHost || !peer.hasVersionIdentity || peer.protocolMin > 3u ||
+            peer.protocolMax < 3u ||
+            (peer.capabilityFlags & svms::build::CapabilityRuntimeLinkV3) == 0u ||
+            (peer.capabilityFlags & svms::build::CapabilityNativeApiV1) == 0u ||
+            (peer.capabilityFlags & svms::build::CapabilityLiveRecording) == 0u ||
+            (peer.capabilityFlags & svms::build::CapabilitySoundFontReload) == 0u ||
+            !client.HasCapability(svms::build::CapabilityLiveConfiguration) ||
+            peer.productMajor != svms::build::kProductMajor ||
+            peer.buildNumber != svms::build::kBuildNumber) {
+            std::puts("FAIL: driver discovery metadata is missing or inconsistent");
+            reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
+            return 1;
         }
+        svms::EngineLink second;  // a second attach to the same host works
+        svms::RuntimeLinkTelemetryV2 secondTelemetry{};
+        if (!second.Open(ownPid) ||
+            !WaitForTelemetry(second, secondTelemetry, 3000u) ||
+            secondTelemetry.sampleRate != t.sampleRate ||
+            second.SendPing(1000u) != svms::RLResult::Ok) {
+            std::puts("FAIL: a second client could not attach and use the host");
+            reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
+            return 1;
+        }
+        second.Close();
     }
-    if (!foundV3Host) {
-        std::puts("FAIL: V3 discovery registry did not publish this driver");
-        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
-        return 1;
-    }
-
-    svms::RuntimeLinkClientV3 v3Client;
-    if (!v3Client.Open(ownPid)) {
-        std::puts("FAIL: could not negotiate RuntimeLink V3");
-        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
-        return 1;
-    }
-    const svms::RuntimeLinkClientV3::PeerInfo peer = v3Client.GetPeerInfo();
-    if (peer.protocolMin > 3u || peer.protocolMax < 3u ||
-        (peer.capabilityFlags & svms::build::CapabilityRuntimeLinkV3) == 0u ||
-        (peer.capabilityFlags & svms::build::CapabilityNativeApiV1) == 0u ||
-        (peer.capabilityFlags & svms::build::CapabilityLiveRecording) == 0u ||
-        (peer.capabilityFlags & svms::build::CapabilitySoundFontReload) == 0u ||
-        peer.nativeAbiMin > 1u || peer.nativeAbiMax < 1u ||
-        peer.productMajor != svms::build::kProductMajor ||
-        peer.buildNumber != svms::build::kBuildNumber) {
-        std::puts("FAIL: RuntimeLink V3 discovery metadata is inconsistent");
-        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
-        return 1;
-    }
-    svms::RuntimeLinkTelemetryV2 v3Telemetry{};
-    if (!WaitForTelemetry(v3Client, v3Telemetry, 3000u) ||
-        v3Telemetry.sampleRate != t.sampleRate ||
-        v3Client.SendPing(1000u) != svms::RLResult::Ok) {
-        std::puts("FAIL: RuntimeLink V3 telemetry/command path is not live");
-        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
-        return 1;
-    }
-
-    // The configurator-facing negotiator must prefer V3 without callers
-    // knowing either mapped layout. V2 fallback is retained by the wrapper.
-    svms::RuntimeLinkClient negotiatedClient;
-    if (!negotiatedClient.Open(ownPid) ||
-        negotiatedClient.GetProtocol() !=
-            svms::RuntimeLinkClient::Protocol::V3 ||
-        !negotiatedClient.HasCapability(
-            svms::build::CapabilityLiveConfiguration)) {
-        std::puts("FAIL: negotiated client did not select RuntimeLink V3");
-        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
-        return 1;
-    }
-    svms::RuntimeLinkTelemetryV2 negotiatedTelemetry{};
-    if (!WaitForTelemetry(negotiatedClient, negotiatedTelemetry, 3000u)) {
-        std::puts("FAIL: negotiated client could not read telemetry");
-        reset(handle); close(handle); FreeLibrary(module); DeleteFileW(configPath);
-        return 1;
-    }
-    negotiatedClient.Close();
 
     // ── 3. Note through the real export; expect dispatch counters ───
     shortMsg(handle, 0x00643C90u);  // note 60, vel 100, channel 0

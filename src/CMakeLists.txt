@@ -1327,6 +1327,7 @@ if(SVMS_BUILD_TESTS)
         # XP gets the same offline MIDI-song regression gate (no GPU sources).
         add_executable(svms_v3_midi_song
             tests/V3MidiSong.cpp
+            frontends/RemoteClient.cpp
             synth/Config.cpp
             events/MidiStream.cpp
             synth/SoundFont.cpp
@@ -1422,38 +1423,32 @@ if(SVMS_BUILD_TESTS)
         target_include_directories(svms_v3_live_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_live_smoke PRIVATE ole32 uuid)
 
+        # Live smoke of the engine link (EngineLink = SVMSAPI remote client)
+        # against the real winmm.dll driver running inside this process.
         add_executable(svms_v3_runtime_link_smoke
-            tests/RuntimeLinkSmoke.cpp)
+            tests/RuntimeLinkSmoke.cpp
+            frontends/RemoteClient.cpp)
         target_compile_definitions(svms_v3_runtime_link_smoke PRIVATE
-            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+            _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_v3_runtime_link_smoke PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}")
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../third_party")
         add_dependencies(svms_v3_runtime_link_smoke svmsynth)
         add_test(NAME svms_v3_runtime_link_smoke
                  COMMAND svms_v3_runtime_link_smoke "$<TARGET_FILE:svmsynth>")
         set_tests_properties(svms_v3_runtime_link_smoke PROPERTIES
             SKIP_RETURN_CODE 77)
 
-        add_executable(svms_v3_runtime_link_probe
-            tests/RuntimeLinkProbe.cpp)
-        target_compile_definitions(svms_v3_runtime_link_probe PRIVATE
-            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
-        target_include_directories(svms_v3_runtime_link_probe PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}")
-
-        add_executable(svms_v3_two_process_smoke
-            tests/TwoProcessSmoke.cpp)
-        target_compile_definitions(svms_v3_two_process_smoke PRIVATE
-            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
-        target_include_directories(svms_v3_two_process_smoke PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}")
-        add_dependencies(svms_v3_two_process_smoke svmsynth)
+        # The two-process flow against the shipping winmm.dll as the host (the
+        # old TwoProcessSmoke + probe): same test as svms_v3_remote_client, with
+        # the host engine taken from winmm.dll instead of SVMSAPI.dll.
         add_test(NAME svms_v3_two_process_smoke
-                 COMMAND svms_v3_two_process_smoke
-                         "$<TARGET_FILE:svms_v3_runtime_link_probe>"
-                         "$<TARGET_FILE:svmsynth>")
+                 COMMAND svms_v3_remote_client_smoke
+                         "$<TARGET_FILE:svmsapi>" "$<TARGET_FILE:svmsynth>")
         set_tests_properties(svms_v3_two_process_smoke PROPERTIES
-            SKIP_RETURN_CODE 77)
+            SKIP_RETURN_CODE 77 TIMEOUT 120)
+        add_dependencies(svms_v3_remote_client_smoke svmsynth)
 
         add_executable(svms_v3_bench tests/V3Bench.cpp synth/SoundFont.cpp synth/SfzLoader.cpp render/RenderKernels.cpp render/RenderWorkers.cpp
             render/RenderDispatch.cpp render/RenderKernelsSSE2.cpp render/RenderKernelsAVX2.cpp)
@@ -1469,6 +1464,7 @@ if(SVMS_BUILD_TESTS)
         # performance-development harness as well as a regression gate.
         set(SVMS_MIDI_SONG_SOURCES
             tests/V3MidiSong.cpp
+            frontends/RemoteClient.cpp
             synth/Config.cpp
             events/MidiStream.cpp
             synth/SoundFont.cpp

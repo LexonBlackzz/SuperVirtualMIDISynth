@@ -27,7 +27,7 @@
 //
 #include "synth/Config.h"
 #include "events/MidiStream.h"
-#include "driver/RuntimeLink.h"
+#include "configurator/EngineLink.h"
 #include "synth/StandaloneSynth.h"
 
 #include <windows.h>
@@ -863,7 +863,7 @@ DWORD WINAPI HangWatchdog(void*) {
 // Wait until the QPC target, sampling telemetry on the way. Returns false
 // when telemetry sampling failed hard (link lost).
 void WaitWithTelemetry(HANDLE timer, LONGLONG targetQpc, LONGLONG qpf,
-                       svms::RuntimeLinkClientV2* client,
+                       svms::EngineLink* client,
                        svms::RuntimeLinkTelemetryV2& telemetry,
                        std::vector<double>* cpuSamples,
                        std::vector<double>* cb95Samples,
@@ -978,7 +978,7 @@ bool RunRealtime(const Options& options, const DecodedSong& song,
 
     // Live link: mute unless --audible, restore the original master volume
     // at exit.  The mute goes through the production ApplyLiveConfig path.
-    svms::RuntimeLinkClientV2 client;
+    svms::EngineLink client;
     svms::RuntimeLiveStateV2 originalLive{};
     bool linked = false;
     if (client.Open(GetCurrentProcessId())) {

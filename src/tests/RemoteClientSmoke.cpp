@@ -1,6 +1,7 @@
 // RemoteClientSmoke.cpp - REAL two-process test of the SVMSAPI remote client.
 //
-// Process 1 (this test) loads SVMSAPI.dll, spawns Process 2 (itself, --host),
+// Process 1 (this test) loads SVMSAPI.dll (the remote client), spawns Process 2
+// (itself, --host; its engine DLL is argv[2] when given, e.g. winmm.dll),
 // which loads the same DLL and creates a session (= a running SVMS engine).
 // Process 1 then uses ONLY the SVMS_Remote_* exports: enumerate hosts, attach,
 // read telemetry V3, apply live params, send a runtime command, detach.
@@ -85,7 +86,9 @@ int main(int argc, char** argv) {
 
     char self[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, self, MAX_PATH);
-    std::string commandLine = std::string("\"") + self + "\" \"" + argv[1] +
+    // argv[2] (optional) names a different host engine DLL, e.g. winmm.dll.
+    const char* hostDll = argc >= 3 ? argv[2] : argv[1];
+    std::string commandLine = std::string("\"") + self + "\" \"" + hostDll +
                               "\" --host";
     STARTUPINFOA startup{};
     startup.cb = sizeof(startup);

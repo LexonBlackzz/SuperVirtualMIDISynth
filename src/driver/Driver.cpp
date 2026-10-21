@@ -218,7 +218,7 @@ static Driver* s_instance = nullptr;
 // touches IPC; it only updates the process-local g_audioSnapshot, which
 // the control thread reads at publish time.
 #if !defined(SVMS_XP_COMPAT)
-static svms::RuntimeLinkDriverV2 g_rlDriver;
+static svms::RuntimeLinkDriver g_rlDriver;
 #endif
 
 Driver& Driver::Instance() {

@@ -26,8 +26,6 @@ int g_failures = 0;
 } while(0)
 
 void TestConstants() {
-    CHECK(svms::kRuntimeLinkMagic == 0x53524C32u, "magic must be 'SRL2'");
-    CHECK_EQ(svms::kRuntimeLinkVersion, 2u, "version must be 2");
     CHECK_EQ(svms::kRuntimeLinkArchX86, 0u, "arch X86 must be 0");
     CHECK_EQ(svms::kRuntimeLinkArchX64, 1u, "arch X64 must be 1");
     CHECK_EQ(svms::kRuntimeHostMaxCount, 16u, "hosts max count must be 16");
@@ -55,14 +53,6 @@ void TestPODLayout() {
              "RuntimeLiveStateV2.maxVoices must stay at byte 84");
     CHECK_EQ(offsetof(svms::RuntimeLiveStateV2, limiterAlgorithm), 88u,
              "limiter algorithm must reuse the former trailing reserved word");
-    CHECK_EQ(sizeof(svms::RuntimeLinkHeaderV2), 64u,
-             "RuntimeLinkHeaderV2 must be exactly one cache line");
-    CHECK_EQ(sizeof(svms::RuntimeHostSlotV2), 64u,
-             "RuntimeHostSlotV2 must be exactly one cache line");
-    CHECK_EQ(sizeof(svms::RuntimeHostsRegistryV2), 64u + 64u * svms::kRuntimeHostMaxCount,
-             "RuntimeHostsRegistryV2 must be 64 + 16 slots * 64");
-    CHECK_EQ(sizeof(svms::RuntimeLinkSharedMemoryV2), 1280u,
-             "mapping must be 1280 bytes (704 telemetry + 512 command)");
     CHECK_EQ(sizeof(svms::RuntimeAudioSnapshot) % 64, 0u,
              "RuntimeAudioSnapshot must be a cache-line multiple");
     CHECK_EQ(sizeof(svms::RuntimeDiscoveryHeaderV3), 192u,
@@ -74,8 +64,6 @@ void TestPODLayout() {
     CHECK_EQ(sizeof(svms::RuntimeDiscoveryHostsRegistryV1), 1088u,
              "discovery hosts registry must remain 1088 bytes");
 
-    CHECK_EQ(alignof(svms::RuntimeLinkHeaderV2) >= 64 ? size_t(1) : size_t(0), 1u,
-             "RuntimeLinkHeaderV2 must be 64-aligned");
     CHECK_EQ(alignof(svms::RuntimeLinkTelemetryV2) >= 64 ? size_t(1) : size_t(0), 1u,
              "RuntimeLinkTelemetryV2 must be 64-aligned");
     CHECK_EQ(alignof(svms::RuntimeLinkCommandV2) >= 64 ? size_t(1) : size_t(0), 1u,
@@ -157,23 +145,6 @@ void TestCommandLayout() {
 }
 
 void TestMappingOffsets() {
-    svms::RuntimeLinkSharedMemoryV2 mem{};
-    size_t offTele = reinterpret_cast<const char*>(&mem.telemetry)
-                   - reinterpret_cast<const char*>(&mem);
-    size_t offCmd  = reinterpret_cast<const char*>(&mem.command)
-                   - reinterpret_cast<const char*>(&mem);
-    CHECK_EQ(offTele, 64u, "telemetry must sit at offset 64");
-    CHECK_EQ(offCmd, 768u, "command must sit at offset 768");
-    CHECK(offTele % 64 == 0 && offCmd % 64 == 0,
-          "telemetry and command must be cache-line aligned in mapping");
-
-    svms::RuntimeLinkHeaderV2 h{};
-    h.structSize = static_cast<uint32_t>(sizeof(svms::RuntimeLinkTelemetryV2));
-    CHECK_EQ(svms::RLV2_TelemetryOffset(h), 64u, "RLV2_TelemetryOffset must be 64");
-    CHECK_EQ(svms::RLV2_CommandOffset(h), 768u, "RLV2_CommandOffset must be 768");
-    CHECK_EQ(svms::RuntimeLinkMappingSizeV2(), 1280u,
-             "mapping size must be 1280");
-
     svms::RuntimeLinkSharedMemoryV3 v3{};
     const size_t v3Telemetry = reinterpret_cast<const char*>(&v3.telemetry) -
                                reinterpret_cast<const char*>(&v3);
@@ -186,22 +157,6 @@ void TestMappingOffsets() {
 }
 
 void TestHeaderCrc() {
-    svms::RuntimeLinkHeaderV2 h{};
-    h.size = svms::RuntimeLinkMappingSizeV2();
-    h.publisherPid = 12345;
-    h.structSize = static_cast<uint32_t>(sizeof(svms::RuntimeLinkTelemetryV2));
-    h.archClass = svms::kRuntimeLinkArchX64;
-
-    const uint32_t crc = svms::RLV2_HeaderCrc(h);
-    CHECK(crc != 0, "header Crc must be non-zero");
-
-    h.publisherPid = 12346;
-    CHECK(svms::RLV2_HeaderCrc(h) != crc, "crc must change with publisherPid");
-    h.publisherPid = 12345;
-    CHECK(svms::RLV2_HeaderCrc(h) == crc, "crc must be stable for identical header");
-    h.version = 3;
-    CHECK(svms::RLV2_HeaderCrc(h) != crc, "crc must change with version");
-
     svms::RuntimeDiscoveryHeaderV3 v3{};
     v3.totalSize = svms::RuntimeLinkMappingSizeV3();
     v3.publisherPid = 12345u;
@@ -324,21 +279,6 @@ void TestGroups() {
 
 void TestNamingConventions() {
     wchar_t buf[128];
-    svms::RLV2_SharedMemName(12345, buf, 128);
-    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeLink_v2_12345") == 0,
-          "shared mem name format must match");
-    svms::RLV2_MutexName(12345, buf, 128);
-    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeMutex_v2_12345") == 0,
-          "mutex name format must match");
-    svms::RLV2_CmdEventName(12345, buf, 128);
-    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeCommand_v2_12345") == 0,
-          "command event name format must match");
-    svms::RLV2_HostsRegName(buf, 128);
-    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeHosts_v2") == 0,
-          "hosts registry name format must match");
-    svms::RLV2_HostsMutexName(buf, 128);
-    CHECK(wcscmp(buf, L"Local\\SVMS_V3_RuntimeHostsMutex_v2") == 0,
-          "hosts mutex name format must match");
     svms::RLV3_SharedMemName(12345, buf, 128);
     CHECK(wcscmp(buf, L"Local\\SVMS_RuntimeDiscovery_v1_12345") == 0,
           "V3 discovery mapping name must be version-neutral");
@@ -354,27 +294,29 @@ void TestNamingConventions() {
 }
 
 void TestHostsRegistry() {
-    svms::RuntimeHostsRegistryV2 reg{};
-    CHECK(reg.magic == svms::kRuntimeLinkMagic, "hosts registry magic must be set");
-    CHECK(reg.version == svms::kRuntimeLinkVersion, "hosts registry version must be 2");
+    svms::RuntimeDiscoveryHostsRegistryV1 reg{};
+    CHECK(reg.magic == svms::kRuntimeDiscoveryRegistryMagic,
+          "hosts registry magic must be set");
+    CHECK(reg.version == svms::kRuntimeDiscoveryRegistryVersion,
+          "hosts registry version must be 1");
     CHECK(reg.slotCapacity == svms::kRuntimeHostMaxCount,
           "hosts registry capacity must be 16");
 
-    const svms::RuntimeHostSlotV2& empty = reg.slots[0];
-    CHECK(svms::RLV2_HostsSlotIsEmpty(empty), "default slot must be empty");
-    CHECK(!svms::RLV2_HostsSlotIsFresh(empty, 1000u, 10000u,
+    const svms::RuntimeDiscoveryHostSlotV1& empty = reg.slots[0];
+    CHECK(svms::RLV3_HostsSlotIsEmpty(empty), "default slot must be empty");
+    CHECK(!svms::RLV3_HostsSlotIsFresh(empty, 1000u, 10000u,
                                        svms::kRuntimeHostTimeoutMs),
           "empty slot must never be fresh");
 
-    svms::RuntimeHostSlotV2 slot{};
-    slot.magic = svms::kRuntimeLinkMagic;
+    svms::RuntimeDiscoveryHostSlotV1 slot{};
+    slot.magic = svms::kRuntimeDiscoveryMagic;
     slot.pid = 7777;
     slot.sessionId = 42;
     slot.lastHeartbeatQpc = 5000u;
-    CHECK(!svms::RLV2_HostsSlotIsEmpty(slot), "populated slot must not be empty");
-    CHECK(svms::RLV2_HostsSlotIsFresh(slot, 6000u, 10000u, 1000u),
+    CHECK(!svms::RLV3_HostsSlotIsEmpty(slot), "populated slot must not be empty");
+    CHECK(svms::RLV3_HostsSlotIsFresh(slot, 6000u, 10000u, 1000u),
           "recent heartbeat must be fresh");
-    CHECK(!svms::RLV2_HostsSlotIsFresh(slot, 60000u, 10000u, 1000u),
+    CHECK(!svms::RLV3_HostsSlotIsFresh(slot, 60000u, 10000u, 1000u),
           "old heartbeat must be stale");
 }
 
@@ -438,7 +380,7 @@ void TestResultStrings() {
 } // anonymous namespace
 
 int main() {
-    std::puts("=== SVMS RuntimeLink V2 Protocol ABI Tests ===");
+    std::puts("=== SVMS RuntimeLink wire (V3) ABI Tests ===");
 
     TestConstants();
     TestPODLayout();
@@ -456,7 +398,7 @@ int main() {
     TestResultStrings();
 
     if (g_failures == 0) {
-        std::puts("PASS: all RuntimeLink V2 protocol ABI tests passed");
+        std::puts("PASS: all RuntimeLink wire ABI tests passed");
         return 0;
     } else {
         std::printf("FAIL: %d test(s) failed\n", g_failures);

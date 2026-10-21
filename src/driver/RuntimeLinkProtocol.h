@@ -75,42 +75,19 @@ namespace svms {
 
 // ─── Naming conventions ─────────────────────────────────────────────────────
 //
-//   Shared memory:  Local\SVMS_V3_RuntimeLink_v2_<PID>
-//   Mutex:          Local\SVMS_V3_RuntimeMutex_v2_<PID>
-//   Command event:  Local\SVMS_V3_RuntimeCommand_v2_<PID>   (auto-reset)
-//   Host registry:  Local\SVMS_V3_RuntimeHosts_v2
-//   Hosts mutex:    Local\SVMS_V3_RuntimeHostsMutex_v2
+//   Shared memory:  Local\SVMS_RuntimeDiscovery_v1_<PID>
+//   Mutex:          Local\SVMS_RuntimeCommandMutex_v3_<PID>
+//   Command event:  Local\SVMS_RuntimeCommandEvent_v3_<PID>   (auto-reset)
+//   Host registry:  Local\SVMS_RuntimeDiscoveryHosts_v1
+//   Hosts mutex:    Local\SVMS_RuntimeDiscoveryHostsMutex_v1
 //
-// The driver creates the per-PID objects on Initialize().  The
-// configurator discovers drivers via the hosts registry, then opens the
-// per-PID objects by process id (also passable via --runtime-link <PID>).
+// (The V2 per-PID objects and hosts registry were removed; V3 is the only
+// wire, and it is private to the remote client, frontends/RemoteClient.cpp.)
+//
+// The driver creates the per-PID objects on Initialize().  The remote client
+// discovers drivers via the hosts registry, then opens the per-PID objects.
 
 #ifdef _WIN32
-inline const wchar_t* RLV2_SharedMemName(uint32_t pid, wchar_t* buf, size_t bufLen) {
-    _snwprintf_s(buf, bufLen, _TRUNCATE, L"Local\\SVMS_V3_RuntimeLink_v2_%u", pid);
-    return buf;
-}
-
-inline const wchar_t* RLV2_MutexName(uint32_t pid, wchar_t* buf, size_t bufLen) {
-    _snwprintf_s(buf, bufLen, _TRUNCATE, L"Local\\SVMS_V3_RuntimeMutex_v2_%u", pid);
-    return buf;
-}
-
-inline const wchar_t* RLV2_CmdEventName(uint32_t pid, wchar_t* buf, size_t bufLen) {
-    _snwprintf_s(buf, bufLen, _TRUNCATE, L"Local\\SVMS_V3_RuntimeCommand_v2_%u", pid);
-    return buf;
-}
-
-inline const wchar_t* RLV2_HostsRegName(wchar_t* buf, size_t bufLen) {
-    _snwprintf_s(buf, bufLen, _TRUNCATE, L"Local\\SVMS_V3_RuntimeHosts_v2");
-    return buf;
-}
-
-inline const wchar_t* RLV2_HostsMutexName(wchar_t* buf, size_t bufLen) {
-    _snwprintf_s(buf, bufLen, _TRUNCATE, L"Local\\SVMS_V3_RuntimeHostsMutex_v2");
-    return buf;
-}
-
 inline const wchar_t* RLV3_SharedMemName(uint32_t pid, wchar_t* buf,
                                          size_t bufLen) {
     _snwprintf_s(buf, bufLen, _TRUNCATE,
@@ -147,8 +124,6 @@ inline const wchar_t* RLV3_HostsMutexName(wchar_t* buf, size_t bufLen) {
 
 // ─── Protocol constants ─────────────────────────────────────────────────────
 
-inline constexpr uint32_t kRuntimeLinkMagic    = 0x53524C32u;  // "SRL2"
-inline constexpr uint32_t kRuntimeLinkVersion  = 2;
 inline constexpr uint32_t kRLV2ChannelCount    = 16u;  // MIDI channels
 inline constexpr uint32_t kRuntimeLinkArchX86  = 0;
 inline constexpr uint32_t kRuntimeLinkArchX64  = 1;
@@ -505,78 +480,6 @@ static_assert(std::is_trivially_copyable<RuntimeLinkCommandV2>::value,
 static_assert(sizeof(RuntimeLinkCommandV2) % 64 == 0,
               "RuntimeLinkCommandV2 must be a multiple of one cache line");
 
-// ─── Header (one cache line) ────────────────────────────────────────────────
-//
-// All synchronization words are single 32-bit fields accessed through
-// volatile qualified pointers.  Stable identity fields (magic, version,
-// size, publisherPid, structSize, archClass) are covered by headerCrc.
-
-struct alignas(64) RuntimeLinkHeaderV2 {
-    // Liveness (must stay first: 8-byte field, keeps the struct to one
-    // 64-byte cache line)
-    uint64_t heartbeatQpc  = 0;    // updated every publish / command
-
-    // Stable identity (covered by headerCrc)
-    uint32_t magic          = kRuntimeLinkMagic;
-    uint32_t version        = kRuntimeLinkVersion;
-    uint32_t size           = 0;    // total mapping size, set at creation
-    uint32_t publisherPid   = 0;    // PID of the driver process
-    uint32_t structSize     = 0;    // sizeof(RuntimeLinkTelemetryV2)
-    uint32_t archClass      = 0;    // kRuntimeLinkArchX86 / X64
-    uint32_t headerCrc      = 0;    // FNV-1a over magic..archClass
-
-    // Telemetry publish guard: odd = writer inside the slot, even = stable
-    uint32_t telemetrySequence = 0;
-
-    // Command commit markers
-    uint32_t commandRequestId    = 0;  // client → driver (commit marker)
-    uint32_t commandRequestToken = 0;  // client → driver (per-client id)
-    uint32_t commandProcessedId  = 0;  // driver → client (ACK marker)
-    uint32_t commandProcessedToken = 0; // driver → client (token echo)
-    uint32_t commandResult       = 0;  // driver → client (RLResult)
-};
-
-static_assert(std::is_trivially_copyable<RuntimeLinkHeaderV2>::value,
-              "RuntimeLinkHeaderV2 must be trivially copyable");
-static_assert(sizeof(RuntimeLinkHeaderV2) == 64,
-              "RuntimeLinkHeaderV2 must be exactly one cache line");
-
-// ─── Mapping layout ─────────────────────────────────────────────────────────
-//
-//   offset 0       RuntimeLinkHeaderV2     (64 B)
-//   offset 64      RuntimeLinkTelemetryV2  (512 B, 64-aligned)
-//   offset 576     RuntimeLinkCommandV2    (512 B, 64-aligned)
-//   total          1088 B
-//
-// The command offset is derived from header.structSize so a future
-// telemetry growth does not silently break readers.
-
-struct RuntimeLinkSharedMemoryV2 {
-    RuntimeLinkHeaderV2    header;
-    RuntimeLinkTelemetryV2 telemetry;
-    RuntimeLinkCommandV2   command;
-};
-
-static_assert(std::is_trivially_copyable<RuntimeLinkSharedMemoryV2>::value,
-              "RuntimeLinkSharedMemoryV2 must be trivially copyable");
-
-inline constexpr uint32_t RLV2_HeaderSize() {
-    return sizeof(RuntimeLinkHeaderV2);
-}
-
-inline uint32_t RLV2_TelemetryOffset(const RuntimeLinkHeaderV2& h) {
-    (void)h;
-    return RLV2_HeaderSize();
-}
-
-inline uint32_t RLV2_CommandOffset(const RuntimeLinkHeaderV2& h) {
-    return RLV2_HeaderSize() + RLV2_PadTo64(h.structSize);
-}
-
-inline constexpr uint32_t RuntimeLinkMappingSizeV2() {
-    return sizeof(RuntimeLinkSharedMemoryV2);
-}
-
 inline uint32_t RLV2_Fnv1a32(const void* data, size_t len) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
     uint32_t hash = 2166136261u;
@@ -585,18 +488,6 @@ inline uint32_t RLV2_Fnv1a32(const void* data, size_t len) {
         hash *= 16777619u;
     }
     return hash;
-}
-
-// CRC over the stable identity prefix (magic..archClass).
-inline uint32_t RLV2_HeaderCrc(const RuntimeLinkHeaderV2& h) {
-    uint8_t raw[sizeof(h.magic) * 6];
-    size_t p = 0;
-    const uint32_t stable[6] = {
-        h.magic, h.version, h.size, h.publisherPid, h.structSize, h.archClass
-    };
-    std::memcpy(raw + p, stable, sizeof(stable));
-    p += sizeof(stable);
-    return RLV2_Fnv1a32(raw, p);
 }
 
 // RuntimeLink V3 keeps the V2 telemetry and command payloads for this first
@@ -715,60 +606,6 @@ inline bool RLV3_HostsSlotIsFresh(const RuntimeDiscoveryHostSlotV1& s,
         ? nowQpc - s.lastHeartbeatQpc : 0u;
     if (qpcFreq == 0u) return ageQpc == 0u;
     return (ageQpc * 1000u) / qpcFreq < timeoutMs;
-}
-
-// ─── Hosts registry ─────────────────────────────────────────────────────────
-//
-// A fixed, well-known mapping listing every live driver instance.  Each
-// slot carries pid/sessionId (identity) and lastHeartbeatQpc (liveness).
-// All writes happen under the hosts mutex and come from the driver's
-// control thread at ~30 Hz (or on shutdown, to unregister).  Stale slots
-// from crashed processes are ignored by freshness checking and
-// eventually reused.
-
-struct alignas(64) RuntimeHostSlotV2 {
-    uint32_t magic           = 0;   // kRuntimeLinkMagic or 0 (empty)
-    uint32_t pid             = 0;
-    uint32_t archClass       = 0;
-    uint32_t reserved0       = 0;
-    uint64_t sessionId       = 0;
-    uint64_t lastHeartbeatQpc = 0;
-    uint32_t reserved1[8]    = {};
-};
-
-static_assert(std::is_trivially_copyable<RuntimeHostSlotV2>::value,
-              "RuntimeHostSlotV2 must be trivially copyable");
-static_assert(sizeof(RuntimeHostSlotV2) == 64,
-              "RuntimeHostSlotV2 must be exactly one cache line");
-
-struct alignas(64) RuntimeHostsRegistryV2 {
-    uint32_t magic           = kRuntimeLinkMagic;
-    uint32_t version         = kRuntimeLinkVersion;
-    uint32_t slotCapacity    = kRuntimeHostMaxCount;
-    uint32_t reserved0[13]   = {};
-    RuntimeHostSlotV2 slots[kRuntimeHostMaxCount];
-};
-
-static_assert(std::is_trivially_copyable<RuntimeHostsRegistryV2>::value,
-              "RuntimeHostsRegistryV2 must be trivially copyable");
-static_assert(sizeof(RuntimeHostsRegistryV2) == 64 + 64 * kRuntimeHostMaxCount,
-              "RuntimeHostsRegistryV2 layout must be deterministic");
-
-inline bool RLV2_HostsSlotIsEmpty(const RuntimeHostSlotV2& s) {
-    return s.magic != kRuntimeLinkMagic || s.pid == 0 || s.sessionId == 0;
-}
-
-// Fresh when the heartbeat is younger than timeoutMs (QPC deltas are
-// comparable across processes — the frequency is system-wide).
-inline bool RLV2_HostsSlotIsFresh(const RuntimeHostSlotV2& s,
-                                  uint64_t nowQpc, uint64_t qpcFreq,
-                                  uint32_t timeoutMs) {
-    if (RLV2_HostsSlotIsEmpty(s)) return false;
-    const uint64_t ageQpc = nowQpc > s.lastHeartbeatQpc
-        ? nowQpc - s.lastHeartbeatQpc : 0u;
-    if (qpcFreq == 0u) return ageQpc == 0u;
-    const uint64_t ageMs = (ageQpc * 1000u) / qpcFreq;
-    return ageMs < timeoutMs;
 }
 
 // ─── Process-local audio snapshot ───────────────────────────────────────────
