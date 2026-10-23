@@ -132,6 +132,7 @@ int main() {
     TestWholeVoiceRotationStealDifferential();
     TestWholeVoiceLaunchDifferential();
     TestLaunchStagingIdentity();
+    TestLazyLaunchIdentity();
     TestWholeVoiceRotationLaunchDifferential();
     TestWholeVoiceResetBarrierDifferential();
     TestFloorLimitedReleaseSamples();

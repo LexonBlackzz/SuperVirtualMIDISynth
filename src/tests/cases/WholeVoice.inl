@@ -2326,3 +2326,216 @@ void TestLaunchStagingIdentity() {
             RunLaunchStagingIdentity(threads, true);
     }
 }
+
+// Lazy same-frame launch (DropZeroLifeVictimsEnabled): a launch whose victim
+// group was born on the same frame is parked as pending and committed through
+// the normal launch code later.  With zero-life tails dropped on BOTH sides, a
+// lazy pool and a normally-launching pool must stay BIT-identical: audio and
+// every dense/row array after every block.  The stream uses two-layer notes
+// (the shape that takes the group-reuse path), many notes per frame so chains
+// of same-frame steals form, and note-offs a few frames after the note-ons.
+struct LazyLaunchContext {
+    svms::VoiceManager* voices;
+    const svms::ChannelParamsSnapshot* channelParams;
+    bool lazy = false;
+    uint32_t playIndex = 7000u;
+    uint32_t launches = 0u;
+};
+
+void DispatchLazyLaunchEvents(const svms::RenderEvent* events,
+                              uint32_t eventCount, uint32_t, void* userData) {
+    auto& c = *static_cast<LazyLaunchContext*>(userData);
+    uint32_t i = 0u;
+    while (i < eventCount) {
+        if (events[i].type == svms::RenderEventType::NoteOn) {
+            const bool lazyRun = c.lazy && c.voices->BeginLazyLaunchRun();
+            while (i < eventCount &&
+                   events[i].type == svms::RenderEventType::NoteOn) {
+                const svms::RenderEvent& e = events[i++];
+                svms::VoiceConfiguration setups[2];
+                for (uint32_t layer = 0u; layer < 2u; ++layer) {
+                    svms::VoiceConfiguration& s = setups[layer];
+                    s.sampleStart = 0u;
+                    s.sampleEnd = 4096u;
+                    s.loopStart = 64u;
+                    s.loopEnd = 4032u;
+                    s.loopMode = 1u;
+                    s.phaseStep = s.basePhaseStep =
+                        (0.5f + 0.2f * static_cast<float>(layer)) +
+                        e.data1 * 0.009f;
+                    s.initialGain = e.data2 >= 100u ? 8.0f : 0.6f;
+                    s.sustainLevel = 0.5f;
+                    s.attackSamples = 17u;
+                    s.attackGainStep = s.initialGain / 17.0f;
+                    s.decaySamples = 53u;
+                    s.decaySlope = 0.99f;
+                    s.releaseDecay = 0.9995f;
+                    s.releaseSamples = 400u;
+                    s.gainLeft = 0.02f + 0.004f * static_cast<float>(layer);
+                    s.gainRight = 0.02f - 0.004f * static_cast<float>(layer);
+                    s.sampleBacked = 1u;
+                }
+                svms::VoiceHandle handles[2] = {svms::kInvalidVoice,
+                                                svms::kInvalidVoice};
+                const uint32_t playIndex = c.playIndex++;
+                setups[0].playIndex = setups[1].playIndex = playIndex;
+                if (c.voices->LaunchVoiceGroup(
+                        e.channel, e.data1, e.data2, setups, 2u, playIndex,
+                        c.channelParams[e.channel], handles))
+                    ++c.launches;
+            }
+            if (lazyRun) c.voices->EndLazyLaunchRun();
+            continue;
+        }
+        const svms::RenderEvent& e = events[i++];
+        if (e.type == svms::RenderEventType::NoteOff) {
+            for (uint32_t a = 0; a < c.voices->activeCount_; ++a) {
+                const uint32_t voice = c.voices->activeList_[a];
+                if (c.voices->v.channel[voice] == e.channel &&
+                    c.voices->v.note[voice] == e.data1)
+                    c.voices->StartRelease(voice);
+            }
+        }
+    }
+}
+
+void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass) {
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 12u;
+    constexpr uint32_t kPool = 32u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.35f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    const bool savedDrop = svms::g_dropZeroLifeVictims.load();
+    svms::g_dropZeroLifeVictims.store(true);
+
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+    auto normalVoices = std::make_unique<svms::VoiceManager>();
+    auto lazyVoices = std::make_unique<svms::VoiceManager>();
+    Check(normalVoices->Initialize(kPool, 44100u) &&
+              lazyVoices->Initialize(kPool, 44100u),
+          "lazy launch identity allocates both pools");
+    svms::ChannelCache normalChannels = seedChannels;
+    svms::ChannelCache lazyChannels = seedChannels;
+    svms::RenderScalar normal;
+    svms::RenderScalar lazy;
+    Check(normal.ReserveVoiceCapacity(kPool) &&
+              lazy.ReserveVoiceCapacity(kPool) &&
+              normal.ConfigureRenderThreads(renderThreads, kFrames) &&
+              lazy.ConfigureRenderThreads(renderThreads, kFrames),
+          "lazy launch identity starts both renderers");
+    const svms::RenderBackend backend = avx2Pass
+        ? svms::RenderBackend::AVX2 : svms::RenderBackend::Scalar;
+    Check(normal.SetRenderBackend(backend) && lazy.SetRenderBackend(backend),
+          "lazy launch identity selects the backend");
+
+    LazyLaunchContext normalContext{normalVoices.get(),
+                                    normalChannels.GetParams()};
+    LazyLaunchContext lazyContext{lazyVoices.get(), lazyChannels.GetParams()};
+    lazyContext.lazy = true;
+    normal.SetEventBatchDispatcher(DispatchLazyLaunchEvents, &normalContext);
+    lazy.SetEventBatchDispatcher(DispatchLazyLaunchEvents, &lazyContext);
+
+    WholeVoiceRng rng;
+    uint32_t mismatchedBlocks = 0u;
+    for (uint32_t block = 0; block < kBlocks; ++block) {
+        const uint64_t blockStartFrame = 30000u + block * kFrames;
+        std::vector<svms::RenderEvent> events;
+        uint32_t sequence = 0u;
+        const auto push = [&](svms::RenderEventType type, uint8_t channel,
+                              uint8_t data1, uint8_t data2, uint32_t frame) {
+            svms::RenderEvent event{};
+            event.type = type;
+            event.channel = channel;
+            event.data1 = data1;
+            event.data2 = data2;
+            event.frameOffset = frame;
+            event.ingressSequence = sequence++;
+            events.push_back(event);
+        };
+        if (block == 0u) {
+            // Fill the pool with loud two-layer groups (never the quietest).
+            for (uint32_t j = 0; j < kPool / 2u; ++j)
+                push(svms::RenderEventType::NoteOn,
+                     static_cast<uint8_t>(j & 3u),
+                     static_cast<uint8_t>(30u + j), 110u, 2u + j);
+        } else {
+            // 6 frames per block, 5 quiet note-ons each (same-frame chains),
+            // note-offs a few frames later.
+            for (uint32_t f = 0; f < 6u; ++f) {
+                const uint32_t frame = 20u + f * 70u + rng.Next() % 5u;
+                for (uint32_t j = 0; j < 5u; ++j) {
+                    const uint8_t channel = static_cast<uint8_t>(rng.Next() % 4u);
+                    const uint8_t key = static_cast<uint8_t>(50u + rng.Next() % 24u);
+                    push(svms::RenderEventType::NoteOn, channel, key,
+                         static_cast<uint8_t>(40u + rng.Next() % 50u), frame);
+                    if ((rng.Next() % 3u) != 0u)
+                        push(svms::RenderEventType::NoteOff, channel, key, 0u,
+                             frame + 1u + rng.Next() % 30u);
+                }
+            }
+        }
+        std::stable_sort(events.begin(), events.end(),
+            [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                return a.frameOffset < b.frameOffset;
+            });
+        std::vector<float> normalLeft(kFrames, 0.0f), normalRight(kFrames, 0.0f);
+        std::vector<float> lazyLeft(kFrames, 0.0f), lazyRight(kFrames, 0.0f);
+        normal.RenderBlock(*normalVoices, normalChannels, samples.data(),
+                           sampleCount, normalLeft.data(), normalRight.data(),
+                           kFrames, cfg, events.data(),
+                           static_cast<uint32_t>(events.size()), true,
+                           blockStartFrame);
+        lazy.RenderBlock(*lazyVoices, lazyChannels, samples.data(),
+                         sampleCount, lazyLeft.data(), lazyRight.data(),
+                         kFrames, cfg, events.data(),
+                         static_cast<uint32_t>(events.size()), true,
+                         blockStartFrame);
+        bool same =
+            std::memcmp(normalLeft.data(), lazyLeft.data(),
+                        kFrames * sizeof(float)) == 0 &&
+            std::memcmp(normalRight.data(), lazyRight.data(),
+                        kFrames * sizeof(float)) == 0 &&
+            normalVoices->GetActiveCount() == lazyVoices->GetActiveCount() &&
+            std::memcmp(normalVoices->activeList_, lazyVoices->activeList_,
+                        normalVoices->GetActiveCount() * sizeof(uint32_t)) == 0;
+#define SVMS_CMP_FIELD(type, name) \
+        same = same && std::memcmp(normalVoices->v.name, lazyVoices->v.name, \
+                                   kPool * sizeof(type)) == 0;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+#undef SVMS_CMP_FIELD
+        same = same && std::memcmp(normalVoices->v.rows, lazyVoices->v.rows,
+                                   kPool * sizeof(svms::VoiceRow)) == 0;
+        if (!same) ++mismatchedBlocks;
+    }
+    svms::g_dropZeroLifeVictims.store(savedDrop);
+    Check(mismatchedBlocks == 0u,
+          "lazy launch identity: lazy and normal pools render and store "
+          "bit-identical blocks");
+    Check(lazyVoices->GetLazyChainSteps() > 20u,
+          "lazy launch identity exercised chained lazy launches");
+    Check(lazyContext.launches == normalContext.launches &&
+              lazyContext.launches > 100u,
+          "lazy launch identity launches the same notes");
+    Check(svms::g_lazyKeyMismatches.load() == 0u,
+          "lazy launch identity: lazily written steal keys match the "
+          "committed keys");
+}
+
+void TestLazyLaunchIdentity() {
+    for (uint32_t threads : {1u, 4u}) {
+        RunLazyLaunchIdentity(threads, false);
+        if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
+            RunLazyLaunchIdentity(threads, true);
+    }
+}

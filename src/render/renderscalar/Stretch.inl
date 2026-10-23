@@ -444,9 +444,7 @@ inline void RenderScalar::WholeVoicePreTailCaptureHook(
     VoiceHandle handle, void* userData) {
     RenderScalar* renderer = static_cast<RenderScalar*>(userData);
     if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
-    static const bool envDrop = std::getenv("SVMS_DROP_ZERO_LIFE") != nullptr;
-    const bool zeroLife = (envDrop ||
-        g_dropZeroLifeVictims.load(std::memory_order_relaxed)) &&
+    const bool zeroLife = DropZeroLifeVictimsEnabled() &&
         renderer->wvStartFrame_[handle] == renderer->wvEventFrame_;
     if (zeroLife ||
         renderer->wvGhostCount_ >= renderer->WholeVoiceGhostLimit()) {

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -43,11 +44,19 @@ inline std::atomic<bool> g_launchStagingEnabled{false};
 // samples; skip its ghost, which only contributes the 64-frame steal-fade
 // tail of its first sample.  Default off = unchanged audio.
 inline std::atomic<bool> g_dropZeroLifeVictims{false};
+inline bool DropZeroLifeVictimsEnabled() noexcept {
+    static const bool env = std::getenv("SVMS_DROP_ZERO_LIFE") != nullptr;
+    return env || g_dropZeroLifeVictims.load(std::memory_order_relaxed);
+}
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
 // Test builds: staged launches issued, and blocks that ended with a row still
 // staged (must stay 0).
 inline std::atomic<uint64_t> g_launchStagingStaged{0};
 inline std::atomic<uint64_t> g_launchStagingLeaks{0};
+// Lazy same-frame launch: keys written lazily vs keys the commit recomputes
+// (must stay 0), and how many lazy steps ran.
+inline std::atomic<uint64_t> g_lazyKeyMismatches{0};
+inline std::atomic<uint64_t> g_lazyChainSteps{0};
 #endif
 
 // Fully prepared hot-path state for one SF2 layer.  Applying this as one
@@ -555,6 +564,27 @@ public:
     void SetLaunchStagingActive(bool active) noexcept {
         launchStagingActive_ = active && v.launch != nullptr;
     }
+    // Lazy same-frame launch (needs DropZeroLifeVictimsEnabled): inside a
+    // NoteOn run of the whole-voice plan, a launch whose victim group was
+    // itself born on this frame replaces nothing physical.  It is parked as a
+    // pending note (new steal keys written to the tree) and a following launch
+    // that again picks the same group simply overwrites it.  The pending note
+    // is committed through the normal launch code the moment anything else
+    // happens (see CommitPendingLaunch).
+    void SetPlanWindow(bool active) noexcept { planWindow_ = active; }
+    bool BeginLazyLaunchRun() noexcept {
+        lazyRunActive_ = planWindow_ && DropZeroLifeVictimsEnabled();
+        return lazyRunActive_;
+    }
+    void EndLazyLaunchRun() noexcept {
+        CommitPendingLaunch();
+        lazyRunActive_ = false;
+    }
+    void CommitPendingLaunch() {
+        if (pendingLaunch_.valid) CommitPendingLaunchImpl();
+    }
+    uint64_t GetLazyChainSteps() const noexcept { return lazyChainSteps_; }
+    uint64_t GetLazyStarts() const noexcept { return lazyStarts_; }
     bool StagedPending() const noexcept { return stagedPending_; }
     void ClearStagedPending() noexcept { stagedPending_ = false; }
     void EnsureMaterialized(VoiceHandle handle) noexcept {
@@ -1246,6 +1276,30 @@ private:
     void* rowOpUserData_ = nullptr;
     bool stealTailCaptureSuppressed_ = false;
     bool launchStagingActive_ = false;   // plan window: launches may stage
+    bool planWindow_ = false;            // inside PlanWholeVoiceBlock dispatch
+    bool lazyRunActive_ = false;         // inside a NoteOn run (lazy launches)
+    uint64_t lazyChainSteps_ = 0u;
+    uint64_t lazyStarts_ = 0u;
+    struct PendingLaunch {
+        bool valid = false;
+        uint32_t count = 0u;
+        VoiceHandle handles[8]{};
+        VoiceConfiguration setups[8];
+        uint8_t channel = 0u, note = 0u, velocity = 0u;
+        uint32_t playIndex = 0u;
+        uint32_t multiplicity = 1u;
+        const ChannelParamsSnapshot* params = nullptr;
+    } pendingLaunch_;
+    bool TryLazyGroupLaunch(uint8_t channel, uint8_t note, uint8_t velocity,
+                            const VoiceConfiguration* setups, uint32_t count,
+                            uint32_t playIndex,
+                            const ChannelParamsSnapshot& channelParams,
+                            VoiceHandle* outHandles);
+    void CommitPendingLaunchImpl();
+    void ReplaceGroupInPlace(uint8_t channel, uint8_t note, uint8_t velocity,
+                             const VoiceConfiguration* setups, uint32_t count,
+                             const VoiceHandle* handles,
+                             bool candidatesReservedInPlace);
     bool stagedPending_ = false;         // some row may still be staged
     int8_t launchStagingMode_ = -1;      // -1: follow g_launchStagingEnabled
 };

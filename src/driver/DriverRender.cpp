@@ -1582,6 +1582,10 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
         }
         const uint64_t globalFence =
             self->globalTerminationFence_.load(std::memory_order_acquire);
+        // Lazy same-frame launches (opt-in) live exactly as long as this run:
+        // whatever is still pending lands before any other event is handled.
+        const bool lazyRun = self->voiceManager &&
+            self->voiceManager->BeginLazyLaunchRun();
         while (index < eventCount &&
                events[index].type == RenderEventType::NoteOn) {
             const uint8_t runChannel = events[index].channel;
@@ -1670,6 +1674,7 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
                 }
             }
         }
+        if (lazyRun) self->voiceManager->EndLazyLaunchRun();
     }
     self->sf2Telemetry_.noteOns += deferredNoteOns;
     self->sf2Telemetry_.exactRegionMatches += deferredMatches;
@@ -2126,6 +2131,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     sf2Telemetry_.lastVoiceGain = lastSetup.initialGain;
     // Telemetry samples one launch per block: apply a staged record so it
     // reads the launched values (a no-op unless launch staging is on).
+    voiceManager->CommitPendingLaunch();
     voiceManager->EnsureMaterialized(lastVoice);
     sf2Telemetry_.lastMixGainL = voiceManager->v.mixGainL[lastVoice];
     sf2Telemetry_.lastMixGainR = voiceManager->v.mixGainR[lastVoice];

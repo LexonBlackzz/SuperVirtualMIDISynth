@@ -966,9 +966,19 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
                              candidatesReservedInPlace);
 #endif
 
-    // Capture every old layer, then replace the complete physical note in
-    // place. The fast path keeps its winner-tree leaves reserved; the fallback
-    // removed them above. Active positions and the free stack never move.
+    ReplaceGroupInPlace(channel, note, velocity, setups, count, outHandles,
+                        candidatesReservedInPlace);
+    return true;
+}
+
+// Capture every old layer, then replace the complete physical note in
+// place. The fast path keeps its winner-tree leaves reserved; the fallback
+// removed them above. Active positions and the free stack never move.
+// (Shared by ReuseMatchingStealGroup and CommitPendingLaunchImpl.)
+inline void VoiceManager::ReplaceGroupInPlace(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count,
+    const VoiceHandle* outHandles, bool candidatesReservedInPlace) {
     for (uint32_t i = 0u; i < count; ++i)
         CaptureStealTail(outHandles[i]);
 
@@ -1009,7 +1019,163 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::Lifecycle, lifecycleBegin);
 #endif
+}
+
+// ── Lazy same-frame launch ──────────────────────────────────────────────
+// See VoiceManager::BeginLazyLaunchRun.  Mirrors ReuseMatchingStealGroup's
+// success conditions exactly (stable tournament-tree winner, a play group of
+// the same size, every member an in-place stable candidate), then, when that
+// victim group was itself launched on this very frame, parks the new note as
+// pending instead of rewriting the pool.  The victim's steal-fade tail is the
+// one thing skipped (DropZeroLifeVictimsEnabled): the normal path skips it
+// too for these zero-life victims.
+inline bool VoiceManager::TryLazyGroupLaunch(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
+    const ChannelParamsSnapshot& cp, VoiceHandle* outHandles) {
+    if (count < 2u || count > 8u || perKeyVoiceCap_ != 0u || freeTop_ != 0u ||
+        FastSteal() || !stealHeapValid_ || stealHeapCount_ == 0u)
+        return false;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const VoiceConfiguration& s = setups[i];
+        if (!IsStableConfiguration(s) || s.exclusiveClass != 0u ||
+            s.offByClass != 0u)
+            return false;
+    }
+    // Victim selection exactly as PopStealCandidate(reserve = true) makes it
+    // when the stable tournament root wins: root of the winner tree, unless a
+    // volatile candidate outranks it (then the normal path decides).
+    const uint64_t rootKey = stealWinnerTree_[1];
+    if (rootKey == 0u) return false;
+    const uint32_t winnerPosition = UINT32_MAX - static_cast<uint32_t>(rootKey);
+    if (winnerPosition >= activeCount_) return false;
+    const VoiceHandle winner = static_cast<VoiceHandle>(
+        activeList_[winnerPosition]);
+    if (activePosition_[winner] != winnerPosition ||
+        stealStableKey_[winner] != rootKey)
+        return false;
+    if (stealVolatileCount_ != 0u) {
+        if (!stealVolatileHeapValid_ || stealVolatileHeapCount_ == 0u ||
+            stealVolatileHeapKey_[0] > rootKey)
+            return false;
+    }
+    VoiceHandle group[8];
+    uint32_t groupCount = 1u;
+    group[0] = winner;
+    int32_t linked = playGroupPrev_[winner];
+    while (linked >= 0) {
+        if (groupCount >= count) return false;
+        group[groupCount++] = static_cast<VoiceHandle>(linked);
+        linked = playGroupPrev_[static_cast<uint32_t>(linked)];
+    }
+    linked = playGroupNext_[winner];
+    while (linked >= 0) {
+        if (groupCount >= count) return false;
+        group[groupCount++] = static_cast<VoiceHandle>(linked);
+        linked = playGroupNext_[static_cast<uint32_t>(linked)];
+    }
+    if (groupCount != count) return false;
+    bool zeroLife = true;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const VoiceHandle h = group[i];
+        if (!IsStableStealCandidate(h) ||
+            stealWinnerTree_[stealTreeLeafBase_ + h] != stealStableKey_[h])
+            return false;
+        zeroLife = zeroLife && v.birthFrame[h] == currentFrame_;
+    }
+    bool samePending = false;
+    if (pendingLaunch_.valid && pendingLaunch_.count == count) {
+        for (uint32_t i = 0u; i < count; ++i)
+            samePending = samePending || pendingLaunch_.handles[i] == winner;
+    }
+    if (samePending) {
+        stealCount_ += count;          // the pending note it replaces
+        ++lazyChainSteps_;
+    } else {
+        // A different group: everything pending lands first, exactly as the
+        // sequential launches would have left it before this pop.
+        if (pendingLaunch_.valid) CommitPendingLaunchImpl();
+        if (!zeroLife) return false;
+        ++lazyStarts_;
+    }
+
+    PendingLaunch& p = pendingLaunch_;
+    p.valid = true;
+    p.count = count;
+    p.channel = channel;
+    p.note = note;
+    p.velocity = velocity;
+    p.playIndex = playIndex;
+    p.multiplicity = launchMult_;
+    p.params = &cp;
+    // The new keys, from the setup alone (no pool write): the same
+    // expressions ApplyVoiceConfigurationFields and
+    // ComputeNewbornStableStealKey evaluate for a freshly launched voice.
+    const float commonAgeScore =
+        static_cast<float>(currentFrame_) * stealAgeScale_;
+    float scale = 1.0f;
+    if (launchMult_ > 1u) scale = static_cast<float>(launchMult_);
+    for (uint32_t i = 0u; i < count; ++i) {
+        const VoiceHandle h = group[i];
+        p.handles[i] = h;
+        p.setups[i] = setups[i];
+        outHandles[i] = h;
+        float gainLeft = setups[i].gainLeft;
+        float gainRight = setups[i].gainRight;
+        if (launchMult_ > 1u) {
+            gainLeft *= scale;
+            gainRight *= scale;
+        }
+        const float mixGainL = gainLeft * cp.mixScaleLeft;
+        const float mixGainR = gainRight * cp.mixScaleRight;
+        const float outputGain = std::sqrt(
+            mixGainL * mixGainL + mixGainR * mixGainR);
+        const float effectiveLevel = std::fabs(setups[i].initialGain) *
+            outputGain;
+        const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
+        stealStableKey_[h] = EncodeStableWinnerKey(
+            score - commonAgeScore, activePosition_[h]);
+        stealWinnerTree_[stealTreeLeafBase_ + h] = stealStableKey_[h];
+    }
+    RefreshStealWinnerPaths(group, count);
     return true;
+}
+
+// Lands the pending note through the same code a normal group-reuse launch
+// runs: reserve the group's leaves, replace it in place (the victim here is
+// the zero-life group, whose tail the plan hook skips), configure, commit.
+inline void VoiceManager::CommitPendingLaunchImpl() {
+    PendingLaunch& p = pendingLaunch_;
+    p.valid = false;
+    for (uint32_t i = 0u; i < p.count; ++i) {
+        stealCandidateReserved_[p.handles[i]] = 2u;
+        stealCandidateDeferred_[p.handles[i]] = 1u;
+    }
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    uint64_t lazyKeys[8];
+    for (uint32_t i = 0u; i < p.count; ++i)
+        lazyKeys[i] = stealStableKey_[p.handles[i]];
+#endif
+    ReplaceGroupInPlace(p.channel, p.note, p.velocity, p.setups, p.count,
+                        p.handles, true);
+    struct MultiplicityRestore {
+        uint32_t& slot;
+        uint32_t saved;
+        ~MultiplicityRestore() { slot = saved; }
+    } multiplicityRestore{launchMult_, launchMult_};
+    launchMult_ = p.multiplicity > 1u ? p.multiplicity : 1u;
+    for (uint32_t layer = 0u; layer < p.count; ++layer) {
+        ConfigureVoice(p.handles[layer], p.setups[layer], p.playIndex,
+                       *p.params, false);
+    }
+    CommitVoiceGroupConfigurations(p.handles, p.count, true);
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+    for (uint32_t i = 0u; i < p.count; ++i) {
+        if (stealStableKey_[p.handles[i]] != lazyKeys[i])
+            g_lazyKeyMismatches.fetch_add(1u, std::memory_order_relaxed);
+    }
+    g_lazyChainSteps.store(lazyChainSteps_, std::memory_order_relaxed);
+#endif
 }
 
 inline void VoiceManager::CommitVoiceGroupConfigurations(
@@ -1115,6 +1281,12 @@ inline bool VoiceManager::LaunchVoiceGroup(
         ~MultiplicityScope() { slot = 1u; }
     } multiplicityScope(launchMult_, multiplicity);
     if (multiplicity > 1u) mergedVoicesMayExist_ = true;
+    if (lazyRunActive_) {
+        if (TryLazyGroupLaunch(channel, note, velocity, setups, count,
+                               playIndex, channelParams, outHandles))
+            return true;
+    }
+    if (pendingLaunch_.valid) CommitPendingLaunchImpl();
     // Resolve every exclusive class once for the complete physical note.
     // Doing this before any layer allocation/configuration prevents layered
     // regions from choking siblings born by this same MIDI note-on.
