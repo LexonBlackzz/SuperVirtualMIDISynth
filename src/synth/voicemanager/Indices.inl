@@ -152,6 +152,7 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.channel[handle]      = channel;
     v.note[handle]         = note;
     v.velocity[handle]     = velocity;
+    v.staged[handle]       = 0u;
     v.phases[handle]       = 0.0f;
     v.phaseIncs[handle]    = 0.0f;
     v.basePhaseIncs[handle] = 0.0f;
@@ -227,6 +228,7 @@ inline void VoiceManager::InitializePreparedVoice(
     v.velocity[handle] = velocity;
     v.sampleBacked[handle] = 0u;
     v.relEnd[handle] = 0u;
+    v.staged[handle] = 0u;
     v.envelopeStage[handle] = 0u;
     v.renderClass[handle] = static_cast<uint8_t>(VoiceRenderClass::Generic);
     v.heldBySustain[handle] = 0u;
@@ -392,6 +394,7 @@ inline void VoiceManager::ChokeExclusiveClasses(
                 const int32_t next = playGroupNext_[current];
                 if (v.state[current] ==
                     static_cast<uint8_t>(VoiceState::Active)) {
+                    EnsureMaterialized(current);
                     v.releaseDecay[current] = releaseDecay;
                     v.releaseSamplesRemaining[current] = releaseSamples;
                     v.releaseStartInBlock[current] = blockOffset;
@@ -556,15 +559,30 @@ inline void VoiceManager::MoveChannelActiveInPlace(VoiceHandle handle,
 
 inline VoiceRenderClass VoiceManager::ClassifyVoice(VoiceHandle handle) const {
     if (handle >= maxVoices_ ||
-        v.state[handle] == static_cast<uint8_t>(VoiceState::Free) ||
-        v.sampleBacked[handle] == 0u || v.relEnd[handle] < 2u) {
+        v.state[handle] == static_cast<uint8_t>(VoiceState::Free)) {
         return VoiceRenderClass::Generic;
     }
+    // A staged row's sample bounds live in its launch record.
+    uint8_t sampleBacked;
+    uint32_t relEnd, relLoopS, relLoopE;
+    if (stagedPending_ && v.staged[handle] != 0u) {
+        const VoiceLaunchRecord& rec = v.launch[handle];
+        sampleBacked = rec.sampleBacked;
+        relEnd = rec.relEnd;
+        relLoopS = rec.relLoopS;
+        relLoopE = rec.relLoopE;
+    } else {
+        sampleBacked = v.sampleBacked[handle];
+        relEnd = v.relEnd[handle];
+        relLoopS = v.relLoopS[handle];
+        relLoopE = v.relLoopE[handle];
+    }
+    if (sampleBacked == 0u || relEnd < 2u)
+        return VoiceRenderClass::Generic;
     if (v.stealFadeInFramesRemaining[handle] != 0u)
         return VoiceRenderClass::Generic;
     const bool loop = v.loopEnabled[handle] != 0u;
-    if (loop && (v.relLoopS[handle] >= v.relLoopE[handle] ||
-                 v.relLoopE[handle] > v.relEnd[handle])) {
+    if (loop && (relLoopS >= relLoopE || relLoopE > relEnd)) {
         return VoiceRenderClass::Generic;
     }
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
@@ -589,8 +607,14 @@ inline void VoiceManager::LinkRenderClass(VoiceHandle handle) {
     v.renderClass[handle] = static_cast<uint8_t>(renderClass);
     if (renderClass == VoiceRenderClass::SustainedLoop ||
         renderClass == VoiceRenderClass::SustainedOneShot) {
-        v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
-        v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
+        if (stagedPending_ && v.staged[handle] != 0u) {
+            VoiceLaunchRecord& rec = v.launch[handle];
+            rec.renderGainL = v.currentGain[handle] * rec.mixGainL;
+            rec.renderGainR = v.currentGain[handle] * rec.mixGainR;
+        } else {
+            v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
+            v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
+        }
     }
 }
 

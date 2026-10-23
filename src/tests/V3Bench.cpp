@@ -286,6 +286,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.coverageProfile = true;
         } else if (std::strcmp(argv[i], "--launch-churn") == 0) {
             options.launchChurnProfile = true;
+        } else if (std::strcmp(argv[i], "--launch-staging") == 0) {
+            svms::g_launchStagingEnabled.store(true);
         } else if (std::strcmp(argv[i], "--volatile-selection") == 0) {
             if (i + 1 >= argc) return false;
             const char* selection = argv[++i];
@@ -766,7 +768,7 @@ int main(int argc, char** argv) {
             "[--rotation-mode 0..4] [--vibrato-lfo] [--decimation] [--reset-rate N] [--launch-path legacy|transactional] "
             "[--launch-plan direct|copy] "
             "[--noteoff-index immediate|batch] "
-            "[--breakdown] [--coverage] [--launch-churn] [--volatile-selection heap|scan] "
+            "[--breakdown] [--coverage] [--launch-churn] [--launch-staging] [--volatile-selection heap|scan] "
             "[--pin-core 0..63] "
             "[--quick] [--reference] [--enforce]\n");
         return 1;

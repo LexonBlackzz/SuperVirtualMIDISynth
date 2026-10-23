@@ -4,6 +4,7 @@ inline void VoiceManager::SetVoiceSample(VoiceHandle handle, uint32_t start, uin
                                           uint32_t loopStart, uint32_t loopEnd, uint8_t loopMode,
                                           float phaseStep, uint8_t sb) {
     if (handle >= maxVoices_) return;
+    EnsureMaterialized(handle);
     v.sampleStart[handle] = start;
     v.loopMode[handle]    = loopMode;
     v.phaseIncs[handle]   = phaseStep;
@@ -147,6 +148,7 @@ inline void VoiceManager::SetVoiceEnvelope(VoiceHandle handle, float initialGain
                                             float decaySlope, float releaseDecay,
                                             uint32_t releaseSamples) {
     if (handle >= maxVoices_) return;
+    EnsureMaterialized(handle);
     v.targetGain[handle] = initialGain;
     v.sustainLevel[handle] = sustainLevel * initialGain;
     v.delaySamplesRemaining[handle]  = delaySamples;
@@ -192,6 +194,7 @@ inline void VoiceManager::SetVoiceGain(VoiceHandle handle, float left, float rig
 
 inline void VoiceManager::RefreshMixGain(VoiceHandle handle, const ChannelParamsSnapshot& cp) {
     if (handle >= maxVoices_) return;
+    EnsureMaterialized(handle);
     v.mixGainL[handle] = v.gainLeft[handle] * cp.mixScaleLeft;
     v.mixGainR[handle] = v.gainRight[handle] * cp.mixScaleRight;
     v.stealOutputGain[handle] = std::sqrt(
@@ -250,6 +253,7 @@ inline void VoiceManager::ApplyChannelBendRatio(uint8_t channel,
         return;
     }
     ForEachChannelActive(channel, [&](VoiceHandle handle) {
+        EnsureMaterialized(handle);
         const float scale = v.pitchBendScales[handle];
         const float ratio = scale == 1.0f
             ? commonRatio : powf(2.0f, bendSemitones * scale / 12.0f);
@@ -261,6 +265,7 @@ inline void VoiceManager::FoldVoiceMixGains(
     VoiceHandle handle, float mixScaleLeft, float mixScaleRight,
     bool& stableTreeDirty, bool writeRenderGain) {
     const uint32_t i = handle;
+    EnsureMaterialized(handle);
     v.mixGainL[i] = v.gainLeft[i] * mixScaleLeft;
     v.mixGainR[i] = v.gainRight[i] * mixScaleRight;
     v.stealOutputGain[i] = std::sqrt(
@@ -352,6 +357,7 @@ inline void VoiceManager::EndVoicesForChannelKey(uint8_t channel, uint8_t note,
         int32_t next = v.nextChannelKeyVoice[idx];
         if (v.state[idx] != static_cast<uint8_t>(VoiceState::Free)) {
             if (v.state[idx] == static_cast<uint8_t>(VoiceState::Active)) {
+                EnsureMaterialized(static_cast<VoiceHandle>(idx));
                 v.releaseDecay[idx] = releaseDecay;
                 v.releaseSamplesRemaining[idx] = releaseSamples;
                 v.releaseStartInBlock[idx] = blockOffset;
@@ -389,9 +395,11 @@ inline void VoiceManager::SilenceChannelImmediate(uint8_t channel) {
         // by channel identity above.
         // Whole-voice pre-pass: capture the exact pre-kill state as a ghost
         // BEFORE the bookkeeping retires the voice (hook is null otherwise).
-        if (silenceVoiceHook_)
+        if (silenceVoiceHook_) {
+            EnsureMaterialized(static_cast<VoiceHandle>(idx));
             silenceVoiceHook_(static_cast<VoiceHandle>(idx),
                               silenceHookUserData_);
+        }
         v.stealFadeInFramesRemaining[idx] = 0;
         RetireVoice(static_cast<VoiceHandle>(idx));
     }
@@ -510,6 +518,10 @@ inline bool VoiceManager::ForkReleasedUnits(
         v.playIndex[static_cast<uint32_t>(cursor)] == playIndex) {
         return false;  // more layers than a fork tracks
     }
+    // The twin is a dense copy of the source; a staged source would copy
+    // stale arrays (and the share scaling below writes mix gains).
+    for (uint32_t layer = 0u; layer < layers; ++layer)
+        EnsureMaterialized(source[layer]);
     const uint32_t mult = GetVoiceMultiplicity(source[0]);
     if (units == 0u || units >= mult) return false;
     if (v.rot != nullptr) return false;  // twins carry no rotation state

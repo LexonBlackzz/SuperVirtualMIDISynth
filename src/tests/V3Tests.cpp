@@ -108,6 +108,10 @@ bool NearlyEqual(float a, float b, float epsilon = 1.0e-5f) {
 #include "tests/cases/Features.inl"
 
 int main() {
+    // Run the whole suite with launch staging on: the same differentials, the
+    // same tolerances (SVMS_TEST_LAUNCH_STAGING=1).
+    const bool launchStaging = std::getenv("SVMS_TEST_LAUNCH_STAGING") != nullptr;
+    svms::g_launchStagingEnabled.store(launchStaging);
     TestMidiByteStream();
     TestReExciteKey();
     TestReExciteRenderDifferential(128u, 0);
@@ -127,6 +131,7 @@ int main() {
     TestWholeVoiceStealDifferential();
     TestWholeVoiceRotationStealDifferential();
     TestWholeVoiceLaunchDifferential();
+    TestLaunchStagingIdentity();
     TestWholeVoiceRotationLaunchDifferential();
     TestWholeVoiceResetBarrierDifferential();
     TestFloorLimitedReleaseSamples();
@@ -150,6 +155,17 @@ int main() {
     TestSfzParserAndPlayback();
     TestSoundFontStackResolution();
 
+    if (launchStaging) {
+        std::printf("launch staging: %llu staged launches, %llu leaked blocks\n",
+                    static_cast<unsigned long long>(
+                        svms::g_launchStagingStaged.load()),
+                    static_cast<unsigned long long>(
+                        svms::g_launchStagingLeaks.load()));
+        Check(svms::g_launchStagingStaged.load() > 0u,
+              "launch staging: no launch was staged (feature not exercised)");
+        Check(svms::g_launchStagingLeaks.load() == 0u,
+              "launch staging: a block ended with a staged row");
+    }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);
         return 1;

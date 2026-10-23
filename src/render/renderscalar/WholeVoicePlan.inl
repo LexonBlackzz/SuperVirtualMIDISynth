@@ -252,6 +252,10 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     voices.SetStealTailCaptureSuppressed(true);
     if (hasReExcite)
         voices.SetReExciteHook(&WholeVoiceReExciteHook, this);
+    // Launch staging (voices.launch_staging): in-place steal launches in this
+    // window write a record the owning render item applies; no-op when the
+    // pool was built without records.
+    voices.SetLaunchStagingActive(true);
 
     // Ingress-order dispatch with the render clock at each event's exact
     // frame: birth ages, steal scores and every driver-side decision see
@@ -293,6 +297,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
         }
     }
 
+    voices.SetLaunchStagingActive(false);
     voices.SetDeferredReleaseHook(nullptr, nullptr);
     voices.SetVoiceConfiguredHook(nullptr, nullptr);
     voices.SetVoiceForkedHook(nullptr, nullptr);

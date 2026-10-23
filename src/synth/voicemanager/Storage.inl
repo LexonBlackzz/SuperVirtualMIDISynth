@@ -106,7 +106,8 @@ inline size_t VoiceManager::EstimateAllocatedBytes(
     add(sizeof(int32_t), capacity);
     if (metadataBytes == (std::numeric_limits<size_t>::max)())
         return metadataBytes;
-    const size_t voiceBytes = VoiceSoA::EstimateStorageBytes(capacity);
+    const size_t voiceBytes = VoiceSoA::EstimateStorageBytes(
+        capacity, g_launchStagingEnabled.load(std::memory_order_relaxed));
     if (voiceBytes > (std::numeric_limits<size_t>::max)() -
                          sizeof(VoiceManager) - metadataBytes)
         return (std::numeric_limits<size_t>::max)();
@@ -282,11 +283,17 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     lastLinkedPlayVoice_ = other.lastLinkedPlayVoice_;
     mergedVoicesMayExist_ = other.mergedVoicesMayExist_;
     nextForkPlayIndex_ = other.nextForkPlayIndex_;
+    stagedPending_ = other.stagedPending_;
+    launchStagingMode_ = other.launchStagingMode_;
 }
 
 inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
     const uint32_t requested = maxVoices < kMaxPolyphony
         ? maxVoices : kMaxPolyphony;
+    if (launchStagingMode_ < 0)
+        launchStagingMode_ = g_launchStagingEnabled.load(
+            std::memory_order_relaxed) ? 1 : 0;
+    v.launchStaging = launchStagingMode_ != 0;
     if (requested == 0u || !v.Reserve(requested) ||
         !ReserveMetadata(requested)) {
         maxVoices_ = 0u;
@@ -396,7 +403,10 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     if (capacity == 0u || capacity > kMaxPolyphony) return false;
 
     const uint32_t oldCapacity = maxVoices_;
+    // Staged rows keep their records across the grow (copied below), but the
+    // grown manager must carry the same storage layout.
     VoiceManager grown;
+    grown.launchStagingMode_ = launchStagingMode_;
     if (!grown.Initialize(capacity, sampleRate_)) return false;
 
     // Preserve every render-visible per-voice field. Handles are stable: old
@@ -446,6 +456,10 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
 #undef SVMS_COPY_GROWN_VOICE_FIELD
     std::memcpy(grown.v.rows, v.rows,
                 static_cast<size_t>(oldCapacity) * sizeof(VoiceRow));
+    if (grown.v.launch != nullptr && v.launch != nullptr)
+        std::memcpy(grown.v.launch, v.launch,
+                    static_cast<size_t>(oldCapacity) *
+                        sizeof(VoiceLaunchRecord));
 
 #define SVMS_COPY_GROWN_TAIL_FIELD(name) \
     std::memcpy(grown.v.name, v.name, sizeof(v.name))
@@ -705,6 +719,7 @@ inline uint32_t VoiceManager::EnforceVoiceLimit(uint32_t maxReleases,
         if (v.state[victim] != static_cast<uint8_t>(VoiceState::Active))
             continue;
 
+        EnsureMaterialized(victim);
         v.heldBySustain[victim] = 0u;
         v.heldBySostenuto[victim] = 0u;
         v.releaseStartInBlock[victim] = 0u;

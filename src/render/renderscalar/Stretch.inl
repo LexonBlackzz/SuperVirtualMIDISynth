@@ -383,6 +383,7 @@ inline void RenderScalar::WholeVoiceReExciteHook(VoiceHandle handle,
         return;
     }
     VoiceManager& voices = *renderer->wvPlanVoices_;
+    voices.EnsureMaterialized(handle);
     VoiceSoA& rows = voices.v;
     const uint32_t slot = static_cast<uint32_t>(renderer->wvExcites_.size());
     renderer->wvExcites_.push_back(

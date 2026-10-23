@@ -2124,6 +2124,9 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
                 lastSetup.regionIndex < bank->regionInitialPeakCount
             ? bank->regionInitialPeaks[lastSetup.regionIndex] : 0.0f;
     sf2Telemetry_.lastVoiceGain = lastSetup.initialGain;
+    // Telemetry samples one launch per block: apply a staged record so it
+    // reads the launched values (a no-op unless launch staging is on).
+    voiceManager->EnsureMaterialized(lastVoice);
     sf2Telemetry_.lastMixGainL = voiceManager->v.mixGainL[lastVoice];
     sf2Telemetry_.lastMixGainR = voiceManager->v.mixGainR[lastVoice];
     sf2Telemetry_.lastDelaySamples = lastSetup.delaySamples;

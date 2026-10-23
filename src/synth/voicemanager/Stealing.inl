@@ -110,6 +110,10 @@ inline uint32_t VoiceManager::SelectStealTailSlot(
 
 inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
+    // The ghost copy (preTailCaptureHook_) and the tail capture both read the
+    // victim's dense arrays: a victim launched earlier in this plan must have
+    // its record applied first.
+    EnsureMaterialized(handle);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t tailBegin = BeginLaunchStageForTest();
     if (launchTestContext_.active)

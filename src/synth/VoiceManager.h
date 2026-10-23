@@ -35,6 +35,16 @@
 
 namespace svms {
 
+// voices.launch_staging, read when a VoiceManager initializes (restart-applied
+// like synth.large_pages).  Off = the production SoA launch path, unchanged.
+inline std::atomic<bool> g_launchStagingEnabled{false};
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+// Test builds: staged launches issued, and blocks that ended with a row still
+// staged (must stay 0).
+inline std::atomic<uint64_t> g_launchStagingStaged{0};
+inline std::atomic<uint64_t> g_launchStagingLeaks{0};
+#endif
+
 // Fully prepared hot-path state for one SF2 layer.  Applying this as one
 // transaction avoids repeatedly reclassifying the newborn and repairing the
 // exact steal index while its fields are still only partially initialized.
@@ -530,6 +540,25 @@ public:
     void InvalidateStealCandidates();
     void MarkStealScoresDirty();
     void RefreshRenderClass(VoiceHandle handle);
+    // Launch staging (voices.launch_staging, see VoiceLaunchRecord).  The
+    // whole-voice plan switches staging on around its dispatch loop; only the
+    // in-place single-voice steal launch stages.  Every plan-time reader or
+    // writer of a staged field calls EnsureMaterialized first; the render item
+    // that owns the row materializes it before its first kernel read, and
+    // RenderWholeVoiceBlock clears the pending flag once the jobs are done.
+    bool LaunchStagingStorage() const noexcept { return v.launch != nullptr; }
+    void SetLaunchStagingActive(bool active) noexcept {
+        launchStagingActive_ = active && v.launch != nullptr;
+    }
+    bool StagedPending() const noexcept { return stagedPending_; }
+    void ClearStagedPending() noexcept { stagedPending_ = false; }
+    void EnsureMaterialized(VoiceHandle handle) noexcept {
+        if (stagedPending_ && handle < maxVoices_ && v.staged[handle] != 0u)
+            MaterializeLaunch(handle);
+    }
+    void MaterializeLaunch(VoiceHandle handle) noexcept;
+    // Test/diagnostic: rows still carrying a staged record.
+    uint32_t CountStagedRows() const noexcept;
     uint32_t GetRenderClassCount(VoiceRenderClass renderClass) const;
     uint32_t GetStealTailCount() const { return stealTailCount_; }
     const uint32_t* GetStealTailList() const { return stealTailList_; }
@@ -1061,6 +1090,14 @@ private:
         VoiceHandle handle, const VoiceConfiguration& setup,
         const ChannelParamsSnapshot& channelParams,
         VoiceRenderClass knownClass = VoiceRenderClass::Generic);
+    // One body, two sinks: kStage = false writes the SoA arrays (the
+    // production path); kStage = true writes the VoiceLaunchRecord and sets
+    // VoiceRow::staged.  Same arithmetic either way.
+    template <bool kStage>
+    void ApplyVoiceConfigurationFieldsImpl(
+        VoiceHandle handle, const VoiceConfiguration& setup,
+        const ChannelParamsSnapshot& channelParams,
+        VoiceRenderClass knownClass);
     static VoiceRenderClass ClassifyConfiguration(
         const VoiceConfiguration& setup);
     static bool IsStableConfiguration(const VoiceConfiguration& setup);
@@ -1203,6 +1240,9 @@ private:
     ChannelVibratoOpHook vibratoOpHook_ = nullptr;
     void* rowOpUserData_ = nullptr;
     bool stealTailCaptureSuppressed_ = false;
+    bool launchStagingActive_ = false;   // plan window: launches may stage
+    bool stagedPending_ = false;         // some row may still be staged
+    int8_t launchStagingMode_ = -1;      // -1: follow g_launchStagingEnabled
 };
 
 // ════════════════════════════════════════════════════════════════════════

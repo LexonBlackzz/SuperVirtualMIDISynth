@@ -472,15 +472,43 @@ inline void VoiceManager::ConfigureVoice(
 inline void VoiceManager::ApplyVoiceConfigurationFields(
     VoiceHandle handle, const VoiceConfiguration& setup,
     const ChannelParamsSnapshot& cp, VoiceRenderClass knownClass) {
+    ApplyVoiceConfigurationFieldsImpl<false>(handle, setup, cp, knownClass);
+}
 
-    v.sampleStart[handle] = setup.sampleStart;
+// kStage = true (in-place steal launch inside the whole-voice plan, flag
+// `voices.launch_staging`): every launch-derived dense value that no launch-
+// time reader needs goes to the VoiceLaunchRecord instead of its SoA array;
+// MaterializeLaunch copies it over before the row's first render read.  The
+// arithmetic is shared with the SoA sink so both layouts hold identical bits.
+template <bool kStage>
+inline void VoiceManager::ApplyVoiceConfigurationFieldsImpl(
+    VoiceHandle handle, const VoiceConfiguration& setup,
+    const ChannelParamsSnapshot& cp, VoiceRenderClass knownClass) {
+#define SVMS_LAUNCH_SET(name, value) \
+    do { \
+        if constexpr (kStage) rec->name = (value); \
+        else v.name[handle] = (value); \
+    } while (0)
+    VoiceLaunchRecord* const rec = kStage ? v.launch + handle : nullptr;
+    if constexpr (kStage) {
+        v.staged[handle] = 1u;
+        stagedPending_ = true;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        g_launchStagingStaged.fetch_add(1u, std::memory_order_relaxed);
+#endif
+    } else if (stagedPending_) {
+        // Direct SoA writes below replace everything a stale record held.
+        v.staged[handle] = 0u;
+    }
+
+    SVMS_LAUNCH_SET(sampleStart, setup.sampleStart);
     v.loopMode[handle] = setup.loopMode;
-    v.phaseIncs[handle] = setup.phaseStep;
+    SVMS_LAUNCH_SET(phaseIncs, setup.phaseStep);
     v.basePhaseIncs[handle] = setup.basePhaseStep;
     v.pitchBendScales[handle] = setup.pitchBendScale;
-    v.sampleBacked[handle] = setup.sampleBacked;
+    SVMS_LAUNCH_SET(sampleBacked, setup.sampleBacked);
 
-    v.phases[handle] = 0.0f;
+    if constexpr (!kStage) v.phases[handle] = 0.0f;
 
     const uint32_t relEnd = setup.sampleEnd > setup.sampleStart
         ? setup.sampleEnd - setup.sampleStart : 0u;
@@ -488,11 +516,13 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
         ? setup.loopStart - setup.sampleStart : 0u;
     const uint32_t relLoopEnd = setup.loopEnd > setup.sampleStart
         ? setup.loopEnd - setup.sampleStart : 0u;
-    v.relEnd[handle] = relEnd;
-    v.relLoopS[handle] = relLoopStart;
-    v.relLoopE[handle] = relLoopEnd;
-    v.relLoopSF[handle] = static_cast<float>(relLoopStart);
-    v.relLoopEF[handle] = static_cast<float>(relLoopEnd);
+    SVMS_LAUNCH_SET(relEnd, relEnd);
+    SVMS_LAUNCH_SET(relLoopS, relLoopStart);
+    SVMS_LAUNCH_SET(relLoopE, relLoopEnd);
+    if constexpr (!kStage) {
+        v.relLoopSF[handle] = static_cast<float>(relLoopStart);
+        v.relLoopEF[handle] = static_cast<float>(relLoopEnd);
+    }
     const bool knownSustained =
         knownClass == VoiceRenderClass::SustainedLoop ||
         knownClass == VoiceRenderClass::SustainedOneShot;
@@ -508,18 +538,18 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     exclusiveClass_[handle] = setup.exclusiveClass < kExclusiveClassCount
         ? static_cast<uint8_t>(setup.exclusiveClass) : 0u;
     v.targetGain[handle] = setup.initialGain;
-    v.sustainLevel[handle] = setup.sustainLevel * setup.initialGain;
-    v.delaySamplesRemaining[handle] = setup.delaySamples;
-    v.holdSamplesRemaining[handle] = setup.holdSamples;
-    v.attackSamplesRemaining[handle] = setup.attackSamples;
-    v.decaySamplesRemaining[handle] = setup.decaySamples;
-    v.attackGainStep[handle] = setup.attackGainStep;
-    v.decaySlope[handle] = setup.decaySlope;
-    v.releaseDecay[handle] = setup.releaseDecay;
-    v.releaseSamplesRemaining[handle] = setup.releaseSamples > 0u
+    SVMS_LAUNCH_SET(sustainLevel, setup.sustainLevel * setup.initialGain);
+    SVMS_LAUNCH_SET(delaySamplesRemaining, setup.delaySamples);
+    SVMS_LAUNCH_SET(holdSamplesRemaining, setup.holdSamples);
+    SVMS_LAUNCH_SET(attackSamplesRemaining, setup.attackSamples);
+    SVMS_LAUNCH_SET(decaySamplesRemaining, setup.decaySamples);
+    SVMS_LAUNCH_SET(attackGainStep, setup.attackGainStep);
+    SVMS_LAUNCH_SET(decaySlope, setup.decaySlope);
+    SVMS_LAUNCH_SET(releaseDecay, setup.releaseDecay);
+    SVMS_LAUNCH_SET(releaseSamplesRemaining, setup.releaseSamples > 0u
         ? FloorLimitedReleaseSamples(setup.releaseSamples, setup.releaseDecay,
                                      setup.initialGain)
-        : UINT32_MAX;
+        : UINT32_MAX);
     v.currentGain[handle] = 0.0f;
     if (knownSustained) {
         v.envelopeStage[handle] = 3u;
@@ -554,24 +584,51 @@ inline void VoiceManager::ApplyVoiceConfigurationFields(
     }
     v.gainLeft[handle] = gainLeft;
     v.gainRight[handle] = gainRight;
-    v.filterA0[handle] = setup.filterA0;
-    v.filterB1[handle] = setup.filterB1;
-    v.filterB2[handle] = setup.filterB2;
-    v.filterZ1[handle] = 0.0f;
-    v.filterZ2[handle] = 0.0f;
-    v.filterEnabled[handle] = setup.filterEnabled;
+    SVMS_LAUNCH_SET(filterA0, setup.filterA0);
+    SVMS_LAUNCH_SET(filterB1, setup.filterB1);
+    SVMS_LAUNCH_SET(filterB2, setup.filterB2);
+    if constexpr (!kStage) {
+        v.filterZ1[handle] = 0.0f;
+        v.filterZ2[handle] = 0.0f;
+    }
+    SVMS_LAUNCH_SET(filterEnabled, setup.filterEnabled);
     v.vibLfoToPitchCents[handle] = setup.vibLfoToPitchCents;
     v.vibLfoSteps[handle] = setup.vibLfoPhaseStep;
     v.vibLfoPhases[handle] = 0.0f;
     v.vibLfoDelays[handle] = setup.vibLfoDelaySamples;
     v.vibLfoModulated[handle] = 0u;
-    v.mixGainL[handle] = gainLeft * cp.mixScaleLeft;
-    v.mixGainR[handle] = gainRight * cp.mixScaleRight;
+    const float mixGainL = gainLeft * cp.mixScaleLeft;
+    const float mixGainR = gainRight * cp.mixScaleRight;
+    SVMS_LAUNCH_SET(mixGainL, mixGainL);
+    SVMS_LAUNCH_SET(mixGainR, mixGainR);
     v.stealOutputGain[handle] = std::sqrt(
-        v.mixGainL[handle] * v.mixGainL[handle] +
-        v.mixGainR[handle] * v.mixGainR[handle]);
-    v.renderGainL[handle] = v.currentGain[handle] * v.mixGainL[handle];
-    v.renderGainR[handle] = v.currentGain[handle] * v.mixGainR[handle];
+        mixGainL * mixGainL + mixGainR * mixGainR);
+    SVMS_LAUNCH_SET(renderGainL, v.currentGain[handle] * mixGainL);
+    SVMS_LAUNCH_SET(renderGainR, v.currentGain[handle] * mixGainR);
+#undef SVMS_LAUNCH_SET
+}
+
+// Copy a staged launch record into the SoA arrays (see VoiceLaunchRecord).
+// Row-local: any worker may run it on a row it owns.
+inline void VoiceManager::MaterializeLaunch(VoiceHandle handle) noexcept {
+    const VoiceLaunchRecord& rec = v.launch[handle];
+#define SVMS_MATERIALIZE_FIELD(type, name) v.name[handle] = rec.name;
+    SVMS_VOICE_LAUNCH_FIELDS(SVMS_MATERIALIZE_FIELD)
+#undef SVMS_MATERIALIZE_FIELD
+    v.phases[handle] = 0.0f;
+    v.filterZ1[handle] = 0.0f;
+    v.filterZ2[handle] = 0.0f;
+    v.relLoopSF[handle] = static_cast<float>(rec.relLoopS);
+    v.relLoopEF[handle] = static_cast<float>(rec.relLoopE);
+    v.staged[handle] = 0u;
+}
+
+inline uint32_t VoiceManager::CountStagedRows() const noexcept {
+    uint32_t count = 0u;
+    if (v.launch == nullptr) return 0u;
+    for (uint32_t h = 0u; h < maxVoices_; ++h)
+        count += v.staged[h] != 0u ? 1u : 0u;
+    return count;
 }
 
 inline VoiceRenderClass VoiceManager::ClassifyConfiguration(
@@ -742,7 +799,11 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const uint64_t testConfigureBegin = BeginLaunchStageForTest();
 #endif
 
-    ApplyVoiceConfigurationFields(handle, setup, cp, desiredClass);
+    if (launchStagingActive_)
+        ApplyVoiceConfigurationFieldsImpl<true>(handle, setup, cp,
+                                                desiredClass);
+    else
+        ApplyVoiceConfigurationFields(handle, setup, cp, desiredClass);
     LinkExclusiveClass(handle);
     if (preserveRenderIndex) {
         v.renderClass[handle] = desiredClassValue;

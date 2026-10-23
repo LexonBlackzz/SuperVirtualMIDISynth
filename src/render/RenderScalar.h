@@ -741,6 +741,7 @@ private:
     uint32_t wvJobCapacity_ = 0u;
     uint32_t wvJobScratchCapacity_ = 0u;     // scratch stride wvJobRetirements_ was sized for
     uint64_t wvGhostOverflowCount_ = 0u;
+    uint64_t wvStagedLeaks_ = 0u;   // test builds: blocks that left a staged row
     // Optional per-block ghost budget; 0 = unbounded (default).
     uint32_t ghostBudget_ = 0u;
     uint32_t wholeVoiceBlocks_ = 0u;
@@ -790,6 +791,7 @@ public:
     void SetEventBatchDispatcher(EventBatchDispatcher dispatcher, void* userData);
     uint32_t GetWholeVoiceBlocksForTest() const { return wholeVoiceBlocks_; }
     uint64_t GetGhostOverflowCount() const { return wvGhostOverflowCount_; }
+    uint64_t GetStagedLeakCount() const { return wvStagedLeaks_; }
     // Path telemetry for the driver census: which renderer(s) the last block
     // used. Bit0 whole-voice, bit8 = vibrato active, bit9 = the block was
     // split around a barrier/budget point. Bits 1/2 (dense/sparse) are retired.

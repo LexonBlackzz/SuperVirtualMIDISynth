@@ -2179,3 +2179,150 @@ void TestWholeVoiceVibratoDifferential() {
 void TestWholeVoiceScalarVibratoDifferential() {
     RunWholeVoiceVibratoDifferential(true);
 }
+
+// Launch staging (voices.launch_staging) is a pure layout change: with the
+// same event stream a staged pool and a direct pool must produce BIT-identical
+// audio and identical dense arrays after every block.  The stream saturates a
+// small pool so in-place steals dominate, and note-offs target keys launched
+// earlier in the same block (release and steal of staged rows).
+void RunLaunchStagingIdentity(uint32_t renderThreads, bool avx2Pass) {
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 10u;
+    constexpr uint32_t kPool = 32u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.35f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    const bool savedFlag = svms::g_launchStagingEnabled.load();
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+
+    svms::g_launchStagingEnabled.store(false);
+    auto directVoices = std::make_unique<svms::VoiceManager>();
+    ConfigureWholeVoiceSeedPool(*directVoices, seedChannels, kPool, kPool);
+    svms::g_launchStagingEnabled.store(true);
+    auto stagedVoices = std::make_unique<svms::VoiceManager>();
+    ConfigureWholeVoiceSeedPool(*stagedVoices, seedChannels, kPool, kPool);
+    svms::g_launchStagingEnabled.store(savedFlag);
+    // Make every seed louder than any newborn (steal score is level based) so
+    // the quietest victims are voices launched earlier in the same block:
+    // staged rows get released, stolen and ghost-copied before any render.
+    for (svms::VoiceManager* pool : {directVoices.get(), stagedVoices.get()}) {
+        for (uint32_t h = 0; h < kPool; ++h) {
+            pool->SetVoiceEnvelope(h, 40.0f, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f,
+                                   0.999f);
+            pool->SetVoiceGain(h, 0.2f, 0.2f);
+            pool->RefreshMixGain(h, seedChannels.GetParams()[pool->v.channel[h]]);
+        }
+    }
+    Check(directVoices->v.launch == nullptr && stagedVoices->v.launch != nullptr,
+          "launch staging identity: only the staged pool owns records");
+
+    svms::ChannelCache directChannels = seedChannels;
+    svms::ChannelCache stagedChannels = seedChannels;
+    svms::RenderScalar direct;
+    svms::RenderScalar staged;
+    Check(direct.ReserveVoiceCapacity(kPool) &&
+              staged.ReserveVoiceCapacity(kPool) &&
+              direct.ConfigureRenderThreads(renderThreads, kFrames) &&
+              staged.ConfigureRenderThreads(renderThreads, kFrames),
+          "launch staging identity starts both renderers");
+    const svms::RenderBackend backend = avx2Pass
+        ? svms::RenderBackend::AVX2 : svms::RenderBackend::Scalar;
+    Check(direct.SetRenderBackend(backend) && staged.SetRenderBackend(backend),
+          "launch staging identity selects the backend");
+
+    WholeVoiceLaunchContext directContext{directVoices.get(),
+                                          directChannels.GetParams()};
+    WholeVoiceLaunchContext stagedContext{stagedVoices.get(),
+                                          stagedChannels.GetParams()};
+    direct.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent,
+                                   &directContext);
+    staged.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent,
+                                   &stagedContext);
+
+    WholeVoiceRng rng;
+    uint32_t mismatchedBlocks = 0u;
+    for (uint32_t block = 0; block < kBlocks; ++block) {
+        const uint64_t blockStartFrame = 20000u + block * kFrames;
+        std::vector<svms::RenderEvent> events;
+        uint32_t sequence = 0u;
+        const auto push = [&](svms::RenderEventType type, uint8_t channel,
+                              uint8_t data1, uint8_t data2, uint32_t frame) {
+            svms::RenderEvent event{};
+            event.type = type;
+            event.channel = channel;
+            event.data1 = data1;
+            event.data2 = data2;
+            event.frameOffset = frame;
+            event.ingressSequence = sequence++;
+            events.push_back(event);
+        };
+        // 24 note-ons (each steals), a note-off for most of them a few frames
+        // after launch, and a few repeated keys so same-key chains form.
+        for (uint32_t j = 0; j < 24u; ++j) {
+            const uint32_t frame = rng.Next() % (kFrames - 40u);
+            const uint8_t channel = static_cast<uint8_t>(rng.Next() % 4u);
+            const uint8_t key = static_cast<uint8_t>(40u + rng.Next() % 24u);
+            push(svms::RenderEventType::NoteOn, channel, key,
+                 static_cast<uint8_t>(40u + rng.Next() % 80u), frame);
+            if ((rng.Next() % 4u) != 0u)
+                push(svms::RenderEventType::NoteOff, channel, key, 0u,
+                     frame + 1u + rng.Next() % 38u);
+        }
+        std::stable_sort(events.begin(), events.end(),
+            [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                return a.frameOffset < b.frameOffset;
+            });
+        std::vector<float> directLeft(kFrames, 0.0f), directRight(kFrames, 0.0f);
+        std::vector<float> stagedLeft(kFrames, 0.0f), stagedRight(kFrames, 0.0f);
+        direct.RenderBlock(*directVoices, directChannels, samples.data(),
+                           sampleCount, directLeft.data(), directRight.data(),
+                           kFrames, cfg, events.data(),
+                           static_cast<uint32_t>(events.size()), true,
+                           blockStartFrame);
+        staged.RenderBlock(*stagedVoices, stagedChannels, samples.data(),
+                           sampleCount, stagedLeft.data(), stagedRight.data(),
+                           kFrames, cfg, events.data(),
+                           static_cast<uint32_t>(events.size()), true,
+                           blockStartFrame);
+        bool same =
+            std::memcmp(directLeft.data(), stagedLeft.data(),
+                        kFrames * sizeof(float)) == 0 &&
+            std::memcmp(directRight.data(), stagedRight.data(),
+                        kFrames * sizeof(float)) == 0;
+        same = same && directVoices->GetActiveCount() ==
+                           stagedVoices->GetActiveCount();
+        const uint32_t cap = (std::min)(directVoices->GetMaxVoices(),
+                                        stagedVoices->GetMaxVoices());
+#define SVMS_CMP_FIELD(type, name) \
+        same = same && std::memcmp(directVoices->v.name, stagedVoices->v.name, \
+                                   cap * sizeof(type)) == 0;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+#undef SVMS_CMP_FIELD
+        if (!same) ++mismatchedBlocks;
+        Check(stagedVoices->CountStagedRows() == 0u,
+              "launch staging identity: no row stays staged after a block");
+    }
+    Check(mismatchedBlocks == 0u,
+          "launch staging identity: staged and direct pools render and "
+          "store bit-identical blocks");
+    Check(stagedContext.launches > 100u,
+          "launch staging identity exercised the launch path");
+}
+
+void TestLaunchStagingIdentity() {
+    for (uint32_t threads : {1u, 4u}) {
+        RunLaunchStagingIdentity(threads, false);
+        if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
+            RunLaunchStagingIdentity(threads, true);
+    }
+}

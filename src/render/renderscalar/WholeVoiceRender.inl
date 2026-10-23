@@ -279,11 +279,17 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
     const uint32_t begin = itemCount * jobIndex / ctx->jobCount;
     const uint32_t end = itemCount * (jobIndex + 1u) / ctx->jobCount;
     renderer->wvJobRetireCounts_[jobIndex * kWvRetireCountStride] = 0u;
+    // Launch staging: this job owns its rows, so it applies their records
+    // before any dense-array read (including the batch look-ahead below).
+    VoiceManager& poolVoices = *ctx->voices;
+    const bool stagedPending = poolVoices.StagedPending();
     for (uint32_t item = begin; item < end; ++item) {
         if (item < ctx->voiceItemCount) {
             const uint32_t handle = renderer->wvSliceHandles_[item];
             if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
                 continue;
+            if (stagedPending && v.staged[handle] != 0u)
+                poolVoices.MaterializeLaunch(handle);
             // Muted (decimated) carried-over row with one plain whole-block
             // segment: nothing mixes, no release/op/excite/vibrato boundary
             // can split it, so skip the per-item timeline setup (op window,
@@ -368,6 +374,10 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                        batchEnd - item < 256u) {
                     const uint32_t next =
                         renderer->wvSliceHandles_[batchEnd];
+                    if (stagedPending && v.state[next] !=
+                            static_cast<uint8_t>(VoiceState::Free) &&
+                        v.staged[next] != 0u)
+                        poolVoices.MaterializeLaunch(next);
                     if (v.state[next] ==
                         static_cast<uint8_t>(VoiceState::Free) ||
                         renderer->WholeVoiceRowMuted(next) ||
@@ -1003,6 +1013,22 @@ inline void RenderScalar::RenderWholeVoiceBlock(
 #if defined(_MSC_VER)
         wvJobCycles_ += __rdtsc() - wvJobBegin;
 #endif
+    }
+
+    // Every active row went through a job item, so no launch record is left
+    // to apply.  Test builds verify that (and repair a leak so a bug shows as
+    // a counter, not as a stale row).
+    if (voices.StagedPending()) {
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        if (voices.CountStagedRows() != 0u) {
+            ++wvStagedLeaks_;
+            g_launchStagingLeaks.fetch_add(1u, std::memory_order_relaxed);
+            for (uint32_t i = 0u; i < activeCount; ++i)
+                voices.EnsureMaterialized(
+                    static_cast<VoiceHandle>(wvSliceHandles_[i]));
+        }
+#endif
+        voices.ClearStagedPending();
     }
 
     // Retirement in exact (frame, capture-position) order — identical to
