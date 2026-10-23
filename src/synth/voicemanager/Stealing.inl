@@ -783,9 +783,30 @@ inline bool VoiceManager::ShouldRejectNoteOn(
     // the quietest voice is dropped, so an equal level loses. The newborn level is
     // computed from the setup and the victim's from its cached envelope, so equal
     // notes differ by rounding; the tolerance keeps them equal.
+    // A victim that is the layer of a lazily pending launch has not been
+    // written to the pool yet: its row still holds the previous occupant, so
+    // its score comes from the pending setup (age 0, same expression as above).
+    float victimScore;
+    bool pendingVictim = false;
+    if (pendingLaunch_.valid) {
+        const PendingLaunch& p = pendingLaunch_;
+        const float pendingScale =
+            p.multiplicity > 1u ? static_cast<float>(p.multiplicity) : 1.0f;
+        for (uint32_t i = 0u; i < p.count && !pendingVictim; ++i) {
+            if (p.handles[i] != victim) continue;
+            const float mixL = p.setups[i].gainLeft * pendingScale *
+                p.params->mixScaleLeft;
+            const float mixR = p.setups[i].gainRight * pendingScale *
+                p.params->mixScaleRight;
+            victimScore = 0.0f - std::fabs(p.setups[i].initialGain) *
+                std::sqrt(mixL * mixL + mixR * mixR) * kBassMidiStealGainScale;
+            pendingVictim = true;
+        }
+    }
+    if (!pendingVictim) victimScore = ComputeStealScore(victim);
     if (stealAgeScale_ == 0.0f)
-        return newbornScore >= ComputeStealScore(victim) * (1.0f + 1e-5f);
-    return newbornScore > ComputeStealScore(victim);
+        return newbornScore >= victimScore * (1.0f + 1e-5f);
+    return newbornScore > victimScore;
 }
 
 inline void VoiceManager::InsertPreselectedVictim(VoiceHandle victim) {

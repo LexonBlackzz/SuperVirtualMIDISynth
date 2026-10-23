@@ -2338,6 +2338,7 @@ struct LazyLaunchContext {
     svms::VoiceManager* voices;
     const svms::ChannelParamsSnapshot* channelParams;
     bool lazy = false;
+    bool graded = false;   // level follows velocity (steal-reject runs)
     uint32_t playIndex = 7000u;
     uint32_t launches = 0u;
 };
@@ -2363,7 +2364,8 @@ void DispatchLazyLaunchEvents(const svms::RenderEvent* events,
                     s.phaseStep = s.basePhaseStep =
                         (0.5f + 0.2f * static_cast<float>(layer)) +
                         e.data1 * 0.009f;
-                    s.initialGain = e.data2 >= 100u ? 8.0f : 0.6f;
+                    s.initialGain = c.graded ? 0.05f * static_cast<float>(e.data2)
+                        : (e.data2 >= 100u ? 8.0f : 0.6f);
                     s.sustainLevel = 0.5f;
                     s.attackSamples = 17u;
                     s.attackGainStep = s.initialGain / 17.0f;
@@ -2399,7 +2401,8 @@ void DispatchLazyLaunchEvents(const svms::RenderEvent* events,
     }
 }
 
-void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass) {
+void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass,
+                           bool stealReject) {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 12u;
     constexpr uint32_t kPool = 32u;
@@ -2425,6 +2428,8 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass) {
     Check(normalVoices->Initialize(kPool, 44100u) &&
               lazyVoices->Initialize(kPool, 44100u),
           "lazy launch identity allocates both pools");
+    normalVoices->SetStealReject(stealReject);
+    lazyVoices->SetStealReject(stealReject);
     svms::ChannelCache normalChannels = seedChannels;
     svms::ChannelCache lazyChannels = seedChannels;
     svms::RenderScalar normal;
@@ -2443,6 +2448,7 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass) {
                                     normalChannels.GetParams()};
     LazyLaunchContext lazyContext{lazyVoices.get(), lazyChannels.GetParams()};
     lazyContext.lazy = true;
+    normalContext.graded = lazyContext.graded = stealReject;
     normal.SetEventBatchDispatcher(DispatchLazyLaunchEvents, &normalContext);
     lazy.SetEventBatchDispatcher(DispatchLazyLaunchEvents, &lazyContext);
 
@@ -2468,7 +2474,8 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass) {
             for (uint32_t j = 0; j < kPool / 2u; ++j)
                 push(svms::RenderEventType::NoteOn,
                      static_cast<uint8_t>(j & 3u),
-                     static_cast<uint8_t>(30u + j), 110u, 2u + j);
+                     static_cast<uint8_t>(30u + j),
+                     stealReject && j == 0u ? 20u : 110u, 2u + j);
         } else {
             // 6 frames per block, 5 quiet note-ons each (same-frame chains),
             // note-offs a few frames later.
@@ -2477,8 +2484,17 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass) {
                 for (uint32_t j = 0; j < 5u; ++j) {
                     const uint8_t channel = static_cast<uint8_t>(rng.Next() % 4u);
                     const uint8_t key = static_cast<uint8_t>(50u + rng.Next() % 24u);
+                    // Rising velocities inside a frame keep same-frame chains
+                    // alive under steal-reject (each newcomer beats the
+                    // pending note it replaces). A dip lands between the
+                    // pending note and the one before it: a stale-row score
+                    // admits it, the pending score rejects it.
+                    const uint32_t velocity = stealReject
+                        ? 20u + (block * 6u + f) + 6u * j -
+                              (j != 0u && rng.Next() % 4u == 0u ? 9u : 0u)
+                        : 40u + rng.Next() % 50u;
                     push(svms::RenderEventType::NoteOn, channel, key,
-                         static_cast<uint8_t>(40u + rng.Next() % 50u), frame);
+                         static_cast<uint8_t>(velocity), frame);
                     if ((rng.Next() % 3u) != 0u)
                         push(svms::RenderEventType::NoteOff, channel, key, 0u,
                              frame + 1u + rng.Next() % 30u);
@@ -2522,7 +2538,8 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass) {
     Check(mismatchedBlocks == 0u,
           "lazy launch identity: lazy and normal pools render and store "
           "bit-identical blocks");
-    Check(lazyVoices->GetLazyChainSteps() > 20u,
+    if (std::getenv("SVMS_LAZYDBG")) std::fprintf(stderr, "LAZYDBG reject=%d chain=%llu starts=%llu rej=%llu launches n=%u l=%u\n", int(stealReject), (unsigned long long)lazyVoices->GetLazyChainSteps(), (unsigned long long)lazyVoices->GetLazyStarts(), (unsigned long long)lazyVoices->StealRejectCount(), normalContext.launches, lazyContext.launches);
+    Check(lazyVoices->GetLazyChainSteps() > (stealReject ? 0u : 20u),
           "lazy launch identity exercised chained lazy launches");
     Check(lazyContext.launches == normalContext.launches &&
               lazyContext.launches > 100u,
@@ -2534,8 +2551,10 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass) {
 
 void TestLazyLaunchIdentity() {
     for (uint32_t threads : {1u, 4u}) {
-        RunLazyLaunchIdentity(threads, false);
-        if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
-            RunLazyLaunchIdentity(threads, true);
+        for (bool reject : {false, true}) {
+            RunLazyLaunchIdentity(threads, false, reject);
+            if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
+                RunLazyLaunchIdentity(threads, true, reject);
+        }
     }
 }
