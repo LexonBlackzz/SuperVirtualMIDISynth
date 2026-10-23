@@ -2,6 +2,7 @@
 #define SVMS_NATIVE_OFFLINE_H
 
 #include "synth/StandaloneSynth.h"
+#include "synth/ShardCores.h"
 #include "include/svmsapi.h"
 
 #include <algorithm>
@@ -81,7 +82,8 @@ public:
                     return SVMS_RESULT_INVALID_ARGUMENT;
                 }
                 std::string error;
-                if (!state->synth.Initialize(synthConfig, error))
+                if (!state->cores.Init(state->synth, synthConfig, config->shards,
+                                       config->max_block_frames, error))
                     return SVMS_RESULT_INTERNAL_ERROR;
                 state->scratchLeft.resize(config->max_block_frames);
                 state->scratchRight.resize(config->max_block_frames);
@@ -136,8 +138,12 @@ public:
             return SVMS_RESULT_INVALID_ARGUMENT;
         try {
             std::string error;
-            return slot->state->synth.SetSoundFonts(paths, error, filters)
-                ? SVMS_RESULT_OK : SVMS_RESULT_INTERNAL_ERROR;
+            bool ok = true;
+            slot->state->cores.ForEachCore(slot->state->synth,
+                [&](StandaloneSynth& core) {
+                    ok = core.SetSoundFonts(paths, error, filters) && ok;
+                });
+            return ok ? SVMS_RESULT_OK : SVMS_RESULT_INTERNAL_ERROR;
         } catch (const std::bad_alloc&) {
             return SVMS_RESULT_NO_RESOURCES;
         } catch (...) {
@@ -152,9 +158,13 @@ public:
         std::lock_guard<std::mutex> guard(slot->mutex);
         if (slot->token != session || !slot->state)
             return SVMS_RESULT_NOT_INITIALIZED;
-        return channel < 16u && slot->state->synth.SetChannelSoundFont(
-                   static_cast<uint8_t>(channel), font)
-            ? SVMS_RESULT_OK : SVMS_RESULT_INVALID_ARGUMENT;
+        if (channel >= 16u) return SVMS_RESULT_INVALID_ARGUMENT;
+        bool ok = true;
+        slot->state->cores.ForEachCore(slot->state->synth,
+            [&](StandaloneSynth& core) {
+                ok = core.SetChannelSoundFont(static_cast<uint8_t>(channel), font) && ok;
+            });
+        return ok ? SVMS_RESULT_OK : SVMS_RESULT_INVALID_ARGUMENT;
     }
 
     SVMS_Result Reset(SVMS_Session session) {
@@ -163,7 +173,8 @@ public:
         std::lock_guard<std::mutex> guard(slot->mutex);
         if (slot->token != session || !slot->state)
             return SVMS_RESULT_NOT_INITIALIZED;
-        slot->state->synth.ResetAll(slot->state->outputFrame);
+        slot->state->cores.ForEachCore(slot->state->synth,
+            [&](StandaloneSynth& core) { core.ResetAll(slot->state->outputFrame); });
         return SVMS_RESULT_OK;
     }
 
@@ -241,14 +252,24 @@ public:
                 state.pendingTailEvents.push_back(ev);
             }
         }
-        state.synth.RenderWithEvents(
-            state.renderEvents.data(),
-            static_cast<uint32_t>(state.renderEvents.size()),
-            outL, outR, frameCount, state.outputFrame);
+        if (state.cores.Active()) {
+            state.cores.RenderEvents(
+                state.synth, state.renderEvents.data(),
+                static_cast<uint32_t>(state.renderEvents.size()),
+                outL, outR, frameCount, state.outputFrame);
+        } else {
+            state.synth.RenderWithEvents(
+                state.renderEvents.data(),
+                static_cast<uint32_t>(state.renderEvents.size()),
+                outL, outR, frameCount, state.outputFrame);
+        }
         if (!state.pendingTailEvents.empty()) {
-            state.synth.SetCursor(state.outputFrame + frameCount);
-            for (const RenderEvent& ev : state.pendingTailEvents)
-                state.synth.ApplyRenderEvent(ev);
+            for (uint32_t core = 0u; core < state.cores.Count(); ++core) {
+                StandaloneSynth& synth = state.cores.At(state.synth, core);
+                synth.SetCursor(state.outputFrame + frameCount);
+                for (const RenderEvent& ev : state.pendingTailEvents)
+                    if (state.cores.Wants(core, ev)) synth.ApplyRenderEvent(ev);
+            }
             state.pendingTailEvents.clear();
         }
         state.outputFrame += frameCount;
@@ -275,9 +296,12 @@ public:
         result.output_frame = state.outputFrame;
         result.rendered_frames = state.renderedFrames;
         result.submitted_events = state.submittedEvents;
-        result.active_voices = state.synth.Active();
-        result.free_voices = state.synth.Free();
-        result.voice_steals = state.synth.Steals();
+        result.active_voices = static_cast<uint32_t>(state.cores.Sum(
+            state.synth, [](const StandaloneSynth& c) { return c.Active(); }));
+        result.free_voices = static_cast<uint32_t>(state.cores.Sum(
+            state.synth, [](const StandaloneSynth& c) { return c.Free(); }));
+        result.voice_steals = static_cast<uint32_t>(state.cores.Sum(
+            state.synth, [](const StandaloneSynth& c) { return c.Steals(); }));
         result.sample_rate = state.sampleRate;
         result.max_block_frames = state.maxBlockFrames;
         result.session_kind = state.sessionKind;
@@ -335,11 +359,12 @@ private:
     static bool ValidateConfig(const SVMS_OfflineSessionConfig& config) {
         if (config.struct_size < sizeof(SVMS_OfflineSessionConfig) ||
             config.struct_version != SVMS_STRUCT_VERSION_1 ||
+        ShardCores cores;
             (config.session_kind != SVMS_SESSION_OFFLINE_RENDER &&
              config.session_kind != SVMS_SESSION_SILENT_ANALYSIS) ||
             config.flags != 0u || config.sample_rate < 8000u ||
             config.sample_rate > 384000u || config.max_voices == 0u ||
-            config.max_voices > kMaxPolyphony || config.render_threads > 64u ||
+            config.max_voices > kMaxPolyphony || config.render_threads > 64u || config.shards > 64u ||
             config.max_block_frames < 16u ||
             config.max_block_frames > 1048576u ||
             config.render_backend > SVMS_RENDER_BACKEND_AVX2 ||

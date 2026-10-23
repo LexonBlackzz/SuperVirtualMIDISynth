@@ -10,6 +10,7 @@
 #include "events/FrameClock.h"
 #include "events/MPSCQueue.h"
 #include "synth/StandaloneSynth.h"
+#include "synth/ShardCores.h"
 #include "include/svmsapi.h"
 
 #include <algorithm>
@@ -264,6 +265,7 @@ private:
     struct State {
         AudioOutput audio;
         StandaloneSynth synth;
+        ShardCores cores;
         DynamicMPSCQueue<QueuedEvent> queue;
         std::vector<QueuedEvent> pending;
         std::vector<float> left;
@@ -348,7 +350,7 @@ private:
                 return SVMS_RESULT_INVALID_ARGUMENT;
             }
             std::string error;
-            if (!synth.Initialize(synthConfig, error))
+            if (!cores.Init(synth, synthConfig, config.shards, bufferFrames, error))
                 return SVMS_RESULT_INTERNAL_ERROR;
             LARGE_INTEGER frequency{};
             if (!QueryPerformanceFrequency(&frequency) ||
@@ -453,6 +455,46 @@ private:
             const uint64_t blockEnd = blockStart + frameCount;
             uint32_t cursor = 0u;
             size_t consumed = 0u;
+            if (cores.Active()) {
+                // Key shards: each core runs the same dispatch+span loop over its
+                // own events (notes it owns, everything else) into its own plane.
+                while (consumed < pending.size() &&
+                       pending[consumed].targetFrame < blockEnd)
+                    ++consumed;
+                cores.Run([&](uint32_t index) {
+                    StandaloneSynth& core = cores.At(synth, index);
+                    float* planeL = cores.PlaneL(index);
+                    float* planeR = cores.PlaneR(index);
+                    uint32_t at = 0u;
+                    auto span = [&](uint32_t offset, uint32_t frames) {
+                        if (frames != 0u)
+                            core.Render(planeL + offset, planeR + offset, frames,
+                                        blockStart + offset);
+                    };
+                    for (size_t i = 0u; i < consumed; ++i) {
+                        const QueuedEvent& event = pending[i];
+                        const bool reset = event.kind == QueuedKind::Reset;
+                        if (!reset && !cores.Wants(index, event.message)) continue;
+                        const uint32_t offset = event.targetFrame <= blockStart
+                            ? 0u : static_cast<uint32_t>(event.targetFrame - blockStart);
+                        span(at, offset - at);
+                        at = offset;
+                        if (reset) core.ResetAll(blockStart + at);
+                        else core.Dispatch(event.message, blockStart + at);
+                    }
+                    span(at, frameCount - at);
+                });
+                dispatched.fetch_add(static_cast<uint64_t>(consumed),
+                                     std::memory_order_relaxed);
+                cores.SumPlanes(cores.PlaneL(0), cores.PlaneR(0), frameCount);
+                synth.PostProcess(cores.PlaneL(0), cores.PlaneR(0), frameCount);
+                for (uint32_t frame = 0u; frame < frameCount; ++frame) {
+                    output[frame * 2u] = cores.PlaneL(0)[frame];
+                    output[frame * 2u + 1u] = cores.PlaneR(0)[frame];
+                }
+            } else {
+            uint32_t cursor = 0u;
+            size_t consumed = 0u;
             for (; consumed < pending.size(); ++consumed) {
                 const QueuedEvent& event = pending[consumed];
                 if (event.targetFrame >= blockEnd) break;
@@ -467,6 +509,7 @@ private:
                 dispatched.fetch_add(1u, std::memory_order_relaxed);
             }
             RenderSpan(output, cursor, frameCount - cursor, blockStart);
+            }
             if (consumed != 0u)
                 pending.erase(pending.begin(), pending.begin() + consumed);
             outputFrame = blockEnd;
@@ -474,11 +517,16 @@ private:
             pendingPublished.store(static_cast<uint32_t>(pending.size()),
                                    std::memory_order_release);
             callbackCount.fetch_add(1u, std::memory_order_relaxed);
-            noteCalls.store(synth.NoteCalls(), std::memory_order_relaxed);
-            matchedNotes.store(synth.MatchedNotes(), std::memory_order_relaxed);
-            voiceSteals.store(synth.Steals(), std::memory_order_relaxed);
-            activeVoices.store(synth.Active(), std::memory_order_relaxed);
-            freeVoices.store(synth.Free(), std::memory_order_relaxed);
+            noteCalls.store(cores.Sum(synth, [](const StandaloneSynth& c) { return c.NoteCalls(); }),
+                            std::memory_order_relaxed);
+            matchedNotes.store(cores.Sum(synth, [](const StandaloneSynth& c) { return c.MatchedNotes(); }),
+                               std::memory_order_relaxed);
+            voiceSteals.store(static_cast<uint32_t>(cores.Sum(synth, [](const StandaloneSynth& c) { return c.Steals(); })),
+                              std::memory_order_relaxed);
+            activeVoices.store(static_cast<uint32_t>(cores.Sum(synth, [](const StandaloneSynth& c) { return c.Active(); })),
+                               std::memory_order_relaxed);
+            freeVoices.store(static_cast<uint32_t>(cores.Sum(synth, [](const StandaloneSynth& c) { return c.Free(); })),
+                             std::memory_order_relaxed);
             QueryPerformanceCounter(&end);
             renderMilliseconds.store(static_cast<float>(
                 static_cast<double>(end.QuadPart - begin.QuadPart) * 1000.0 /
@@ -536,7 +584,7 @@ private:
             config.flags != 0u || config.sample_rate < 8000u ||
             config.sample_rate > 384000u || config.buffer_frames < 16u ||
             config.buffer_frames > 8192u || config.max_voices == 0u ||
-            config.max_voices > kMaxPolyphony || config.render_threads > 64u ||
+            config.max_voices > kMaxPolyphony || config.render_threads > 64u || config.shards > 64u ||
             config.render_backend > SVMS_RENDER_BACKEND_AVX2 ||
             config.event_capacity < 1024u ||
             config.start_immediately > 1u || config.limiter_enabled > 1u ||

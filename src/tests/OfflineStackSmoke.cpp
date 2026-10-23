@@ -190,6 +190,48 @@ int main(int argc, char** argv) {
               SVMS_RESULT_INVALID_ARGUMENT,
           "an out-of-range restriction is rejected");
 
+    // Key shards: a 3-core session must sound like the single-core one. A
+    // chord across channels lands on different cores and is summed.
+    {
+        SVMS_OfflineSessionConfig sharded = config;
+        sharded.shards = 3u;
+        sharded.max_voices = 96u;
+        SVMS_Session ssession = 0;
+        Check(api.create_offline_session(&sharded, quiet.c_str(), &ssession) ==
+                  SVMS_RESULT_OK, "create a 3-shard session");
+        const char* quietOnly[1] = {quiet.c_str()};
+        api.set_offline_soundfonts(session, quietOnly, 1u);
+        api.set_offline_channel_soundfont(session, 0u, 0u);
+        auto chordPeak = [&](SVMS_Session sid) {
+            api.reset(sid);
+            float peak = 0.0f, l[512], r[512];
+            for (uint32_t block = 0u; block < 6u; ++block) {
+                SVMS_OfflineEvent ev[16]{};
+                uint32_t n = 0u;
+                if (block == 0u)
+                    for (uint32_t c = 0u; c < 8u; ++c)
+                        ev[n++] = {0u, 0x90u | c | ((40u + c * 5u) << 8u) | (100u << 16u), {0u, 0u}};
+                if (api.render_offline(sid, ev, n, l, r, 512u) != SVMS_RESULT_OK)
+                    return -1.0f;
+                for (float v : l) peak = (std::max)(peak, std::fabs(v));
+            }
+            return peak;
+        };
+        const float single = chordPeak(session), shardPeak = chordPeak(ssession);
+        Check(single > 0.01f && std::fabs(single - shardPeak) < single * 1e-3f,
+              "sharded chord sums to the single-core mix");
+        SVMS_OfflineTelemetry t{};
+        t.struct_size = sizeof(t);
+        t.struct_version = SVMS_STRUCT_VERSION_1;
+        Check(api.get_offline_telemetry(ssession, &t) == SVMS_RESULT_OK &&
+                  t.active_voices == 8u, "sharded telemetry sums the cores");
+        api.destroy_session(ssession);
+        sharded.shards = 65u;
+        Check(api.create_offline_session(&sharded, quiet.c_str(), &ssession) ==
+                  SVMS_RESULT_INVALID_ARGUMENT, "shards above 64 are rejected");
+        api.destroy_session(ssession);
+    }
+
     api.destroy_session(session);
     FreeLibrary(module);
     for (const char* n : {"quiet.wav", "loud.wav", "quiet.sfz", "loud.sfz"})

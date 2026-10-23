@@ -185,7 +185,13 @@ typedef struct SVMS_OfflineSessionConfig {
     float limiter_lookahead_ms;
     float limiter_attack_ms;
     float limiter_release_ms;
-    uint32_t reserved[4];
+    /* Key shards: 0 or 1 = one engine core. N > 1 runs N cores that plan in
+       parallel (notes route by a hash of channel+key, everything else is
+       broadcast; max_voices and render_threads are split across the cores,
+       one reverb+limiter runs on the sum). Was reserved[0], so zeroed callers
+       are unchanged; an older runtime rejects a nonzero value. 0..64. */
+    uint32_t shards;
+    uint32_t reserved[3];
 } SVMS_OfflineSessionConfig;
 
 // frame_offset is exact within the current render call. Records must be
@@ -256,7 +262,10 @@ typedef struct SVMS_RealtimeSessionConfig {
     float limiter_lookahead_ms;
     float limiter_attack_ms;
     float limiter_release_ms;
-    uint32_t reserved[6];
+    /* Key shards, same meaning as SVMS_OfflineSessionConfig::shards (was
+       reserved[0]). */
+    uint32_t shards;
+    uint32_t reserved[5];
 } SVMS_RealtimeSessionConfig;
 
 typedef struct SVMS_TelemetryV1 {

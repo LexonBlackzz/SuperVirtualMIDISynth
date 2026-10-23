@@ -357,8 +357,7 @@ public:
                                   sampleFrames_, left, right,
                                   frameCount, cfg_, nullptr, 0, true,
                                   absoluteFrame);
-            ApplyReverb(left, right, frameCount);
-            limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
+            if (!rawMix_) PostProcess(left, right, frameCount);
         }
     }
 
@@ -498,6 +497,19 @@ public:
     }
 
     void SetCursor(uint64_t absoluteFrame) {
+        if (!rawMix_) PostProcess(left, right, frameCount);
+    }
+
+    // Key shards (offline --shards) render raw; the owner of the summed mix
+    // runs reverb + limiter once over it.
+    void SetRawMix(bool raw) { rawMix_ = raw; }
+    float StealLevel(uint8_t channel, uint8_t note) const {
+        return voices_.StealLevelOfKey(channel, note);
+    }
+    uint32_t VoiceCount(uint8_t channel, uint8_t note) const {
+        return voices_.VoiceCountOfKey(channel, note);
+    }
+    void PostProcess(float* left, float* right, uint32_t frameCount) {
         dispatchAbsoluteFrame_ = absoluteFrame;
         voices_.SetCurrentFrame(absoluteFrame);
     }
@@ -647,6 +659,8 @@ private:
         }
         const uint32_t count = sf2_find_regions(bank.data.get(), preset, note,
                                                 velocity, out, capacity);
+    bool rawMix_ = false;
+    uint32_t oversample_ = 1u;
         if (count <= 8u && count <= capacity) {
             cached.tag = tag;
             cached.count = uint16_t(count);
