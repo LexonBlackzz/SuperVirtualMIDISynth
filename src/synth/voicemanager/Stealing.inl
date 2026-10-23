@@ -749,7 +749,7 @@ inline bool VoiceManager::ShouldRejectNoteOn(
         if (!stealVolatileHeapValid_) BuildVolatileStealHeap();
         uint64_t bestKey = 0u;
         if (stealHeapCount_ > 0u) {
-            const uint64_t rootKey = stealWinnerTree_[1];
+            const uint64_t rootKey = StealRootKey();
             const uint32_t position = UINT32_MAX - static_cast<uint32_t>(rootKey);
             if (rootKey == 0u || position >= activeCount_) return false;
             victim = static_cast<VoiceHandle>(activeList_[position]);
@@ -786,20 +786,13 @@ inline bool VoiceManager::ShouldRejectNoteOn(
     // A victim that is the layer of a lazily pending launch has not been
     // written to the pool yet: its row still holds the previous occupant, so
     // its score comes from the pending setup (age 0, same expression as above).
-    float victimScore;
+    float victimScore = 0.0f;
     bool pendingVictim = false;
     if (pendingLaunch_.valid) {
         const PendingLaunch& p = pendingLaunch_;
-        const float pendingScale =
-            p.multiplicity > 1u ? static_cast<float>(p.multiplicity) : 1.0f;
         for (uint32_t i = 0u; i < p.count && !pendingVictim; ++i) {
             if (p.handles[i] != victim) continue;
-            const float mixL = p.setups[i].gainLeft * pendingScale *
-                p.params->mixScaleLeft;
-            const float mixR = p.setups[i].gainRight * pendingScale *
-                p.params->mixScaleRight;
-            victimScore = 0.0f - std::fabs(p.setups[i].initialGain) *
-                std::sqrt(mixL * mixL + mixR * mixR) * kBassMidiStealGainScale;
+            victimScore = p.scores[i];
             pendingVictim = true;
         }
     }

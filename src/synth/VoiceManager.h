@@ -585,6 +585,14 @@ public:
     }
     uint64_t GetLazyChainSteps() const noexcept { return lazyChainSteps_; }
     uint64_t GetLazyStarts() const noexcept { return lazyStarts_; }
+    // Test: the steal index (winner tree + stable keys) matches another pool's.
+    bool SameStealIndexAs(const VoiceManager& other) const noexcept {
+        return stealTreeLeafBase_ == other.stealTreeLeafBase_ &&
+            std::memcmp(stealWinnerTree_, other.stealWinnerTree_,
+                        stealTreeLeafBase_ * 2u * sizeof(uint64_t)) == 0 &&
+            std::memcmp(stealStableKey_, other.stealStableKey_,
+                        maxVoices_ * sizeof(uint64_t)) == 0;
+    }
     bool StagedPending() const noexcept { return stagedPending_; }
     void ClearStagedPending() noexcept { stagedPending_ = false; }
     void EnsureMaterialized(VoiceHandle handle) noexcept {
@@ -1289,7 +1297,23 @@ private:
         uint32_t playIndex = 0u;
         uint32_t multiplicity = 1u;
         const ChannelParamsSnapshot* params = nullptr;
+        // Steal score of each pending layer as a victim (age 0), for
+        // ShouldRejectNoteOn.
+        float scores[8]{};
+        // Chain mode: while the pending group stays the tournament root the
+        // winner tree is not refreshed per step. Its leaves and paths are
+        // stale until FlushPendingTree(); the root is maxKey (> runnerUp, the
+        // best key of every voice outside the group).
+        bool treeDirty = false;
+        uint32_t winnerIdx = 0u;   // layer of handles[] holding maxKey
+        uint64_t maxKey = 0u;
+        uint64_t runnerUp = 0u;
     } pendingLaunch_;
+    void FlushPendingTree();
+    uint64_t StealRootKey() const noexcept {
+        return pendingLaunch_.valid && pendingLaunch_.treeDirty
+            ? pendingLaunch_.maxKey : stealWinnerTree_[1];
+    }
     bool TryLazyGroupLaunch(uint8_t channel, uint8_t note, uint8_t velocity,
                             const VoiceConfiguration* setups, uint32_t count,
                             uint32_t playIndex,

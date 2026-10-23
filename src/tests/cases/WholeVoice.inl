@@ -2532,6 +2532,9 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass,
 #undef SVMS_CMP_FIELD
         same = same && std::memcmp(normalVoices->v.rows, lazyVoices->v.rows,
                                    kPool * sizeof(svms::VoiceRow)) == 0;
+        // The steal index too: chained lazy launches defer its repair to the
+        // commit and must leave exactly the tree a normal launch leaves.
+        same = same && normalVoices->SameStealIndexAs(*lazyVoices);
         if (!same) ++mismatchedBlocks;
     }
     svms::g_dropZeroLifeVictims.store(savedDrop);

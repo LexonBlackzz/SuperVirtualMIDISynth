@@ -1029,6 +1029,16 @@ inline void VoiceManager::ReplaceGroupInPlace(
 // pending instead of rewriting the pool.  The victim's steal-fade tail is the
 // one thing skipped (DropZeroLifeVictimsEnabled): the normal path skips it
 // too for these zero-life victims.
+inline void VoiceManager::FlushPendingTree() {
+    PendingLaunch& p = pendingLaunch_;
+    if (!p.treeDirty) return;
+    p.treeDirty = false;
+    for (uint32_t i = 0u; i < p.count; ++i)
+        stealWinnerTree_[stealTreeLeafBase_ + p.handles[i]] =
+            stealStableKey_[p.handles[i]];
+    RefreshStealWinnerPaths(p.handles, p.count);
+}
+
 inline bool VoiceManager::TryLazyGroupLaunch(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
@@ -1042,64 +1052,108 @@ inline bool VoiceManager::TryLazyGroupLaunch(
             s.offByClass != 0u)
             return false;
     }
-    // Victim selection exactly as PopStealCandidate(reserve = true) makes it
-    // when the stable tournament root wins: root of the winner tree, unless a
-    // volatile candidate outranks it (then the normal path decides).
-    const uint64_t rootKey = stealWinnerTree_[1];
-    if (rootKey == 0u) return false;
-    const uint32_t winnerPosition = UINT32_MAX - static_cast<uint32_t>(rootKey);
-    if (winnerPosition >= activeCount_) return false;
-    const VoiceHandle winner = static_cast<VoiceHandle>(
-        activeList_[winnerPosition]);
-    if (activePosition_[winner] != winnerPosition ||
-        stealStableKey_[winner] != rootKey)
-        return false;
-    if (stealVolatileCount_ != 0u) {
-        if (!stealVolatileHeapValid_ || stealVolatileHeapCount_ == 0u ||
-            stealVolatileHeapKey_[0] > rootKey)
-            return false;
-    }
+    PendingLaunch& p = pendingLaunch_;
     VoiceHandle group[8];
-    uint32_t groupCount = 1u;
-    group[0] = winner;
-    int32_t linked = playGroupPrev_[winner];
-    while (linked >= 0) {
-        if (groupCount >= count) return false;
-        group[groupCount++] = static_cast<VoiceHandle>(linked);
-        linked = playGroupPrev_[static_cast<uint32_t>(linked)];
-    }
-    linked = playGroupNext_[winner];
-    while (linked >= 0) {
-        if (groupCount >= count) return false;
-        group[groupCount++] = static_cast<VoiceHandle>(linked);
-        linked = playGroupNext_[static_cast<uint32_t>(linked)];
-    }
-    if (groupCount != count) return false;
-    bool zeroLife = true;
-    for (uint32_t i = 0u; i < count; ++i) {
-        const VoiceHandle h = group[i];
-        if (!IsStableStealCandidate(h) ||
-            stealWinnerTree_[stealTreeLeafBase_ + h] != stealStableKey_[h])
-            return false;
-        zeroLife = zeroLife && v.birthFrame[h] == currentFrame_;
-    }
-    bool samePending = false;
-    if (pendingLaunch_.valid && pendingLaunch_.count == count) {
-        for (uint32_t i = 0u; i < count; ++i)
-            samePending = samePending || pendingLaunch_.handles[i] == winner;
-    }
-    if (samePending) {
-        stealCount_ += count;          // the pending note it replaces
-        ++lazyChainSteps_;
-    } else {
-        // A different group: everything pending lands first, exactly as the
-        // sequential launches would have left it before this pop.
-        if (pendingLaunch_.valid) CommitPendingLaunchImpl();
-        if (!zeroLife) return false;
-        ++lazyStarts_;
+    uint32_t groupCount = 0u;
+    // Walks the play group of `winner`: winner first, then its prev chain,
+    // then its next chain (the order PopStealCandidate hands out).
+    const auto walkGroup = [&](VoiceHandle winner) {
+        groupCount = 1u;
+        group[0] = winner;
+        int32_t linked = playGroupPrev_[winner];
+        while (linked >= 0) {
+            if (groupCount >= count) return false;
+            group[groupCount++] = static_cast<VoiceHandle>(linked);
+            linked = playGroupPrev_[static_cast<uint32_t>(linked)];
+        }
+        linked = playGroupNext_[winner];
+        while (linked >= 0) {
+            if (groupCount >= count) return false;
+            group[groupCount++] = static_cast<VoiceHandle>(linked);
+            linked = playGroupNext_[static_cast<uint32_t>(linked)];
+        }
+        return groupCount == count;
+    };
+
+    bool chainStep = false;
+    if (p.valid && p.treeDirty && p.count != count) FlushPendingTree();
+    if (p.valid && p.treeDirty) {
+        // Chain mode: the pending group is the root (maxKey beats every other
+        // voice), its steal-candidate state was verified when the chain
+        // began and nothing has touched the pool since.
+        bool ok = true;
+        if (stealVolatileCount_ != 0u)
+            ok = stealVolatileHeapValid_ && stealVolatileHeapCount_ != 0u &&
+                 !(stealVolatileHeapKey_[0] > p.maxKey);
+        if (ok) ok = walkGroup(p.handles[p.winnerIdx]);
+        if (ok) {
+            stealCount_ += count;
+            ++lazyChainSteps_;
+            chainStep = true;
+        } else {
+            FlushPendingTree();
+        }
     }
 
-    PendingLaunch& p = pendingLaunch_;
+    bool samePending = chainStep;
+    if (!chainStep) {
+        // Victim selection exactly as PopStealCandidate(reserve = true) makes
+        // it when the stable tournament root wins: root of the winner tree,
+        // unless a volatile candidate outranks it (then the normal path
+        // decides).
+        const uint64_t rootKey = stealWinnerTree_[1];
+        if (rootKey == 0u) return false;
+        const uint32_t winnerPosition =
+            UINT32_MAX - static_cast<uint32_t>(rootKey);
+        if (winnerPosition >= activeCount_) return false;
+        const VoiceHandle winner = static_cast<VoiceHandle>(
+            activeList_[winnerPosition]);
+        if (activePosition_[winner] != winnerPosition ||
+            stealStableKey_[winner] != rootKey)
+            return false;
+        if (stealVolatileCount_ != 0u) {
+            if (!stealVolatileHeapValid_ || stealVolatileHeapCount_ == 0u ||
+                stealVolatileHeapKey_[0] > rootKey)
+                return false;
+        }
+        if (!walkGroup(winner)) return false;
+        bool zeroLife = true;
+        for (uint32_t i = 0u; i < count; ++i) {
+            const VoiceHandle h = group[i];
+            if (!IsStableStealCandidate(h) ||
+                stealWinnerTree_[stealTreeLeafBase_ + h] != stealStableKey_[h])
+                return false;
+            zeroLife = zeroLife && v.birthFrame[h] == currentFrame_;
+        }
+        if (p.valid && p.count == count) {
+            for (uint32_t i = 0u; i < count; ++i)
+                samePending = samePending || p.handles[i] == winner;
+        }
+        if (samePending) {
+            stealCount_ += count;          // the pending note it replaces
+            ++lazyChainSteps_;
+        } else {
+            // A different group: everything pending lands first, exactly as
+            // the sequential launches would have left it before this pop.
+            if (p.valid) CommitPendingLaunchImpl();
+            if (!zeroLife) return false;
+            ++lazyStarts_;
+        }
+    }
+
+    // Best key outside the pending group. A chain already in progress carries
+    // it; the first chain step finds it by taking the group out of the (still
+    // truthful) tree.
+    uint64_t runnerUp = 0u;
+    if (chainStep) {
+        runnerUp = p.runnerUp;
+    } else if (samePending) {
+        for (uint32_t i = 0u; i < count; ++i)
+            stealWinnerTree_[stealTreeLeafBase_ + group[i]] = 0u;
+        RefreshStealWinnerPaths(group, count);
+        runnerUp = stealWinnerTree_[1];
+    }
+
     p.valid = true;
     p.count = count;
     p.channel = channel;
@@ -1108,6 +1162,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
     p.playIndex = playIndex;
     p.multiplicity = launchMult_;
     p.params = &cp;
+
     // The new keys, from the setup alone (no pool write): the same
     // expressions ApplyVoiceConfigurationFields and
     // ComputeNewbornStableStealKey evaluate for a freshly launched voice.
@@ -1115,6 +1170,8 @@ inline bool VoiceManager::TryLazyGroupLaunch(
         static_cast<float>(currentFrame_) * stealAgeScale_;
     float scale = 1.0f;
     if (launchMult_ > 1u) scale = static_cast<float>(launchMult_);
+    uint64_t maxKey = 0u;
+    uint32_t winnerIdx = 0u;
     for (uint32_t i = 0u; i < count; ++i) {
         const VoiceHandle h = group[i];
         p.handles[i] = h;
@@ -1133,10 +1190,24 @@ inline bool VoiceManager::TryLazyGroupLaunch(
         const float effectiveLevel = std::fabs(setups[i].initialGain) *
             outputGain;
         const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
-        stealStableKey_[h] = EncodeStableWinnerKey(
+        p.scores[i] = score;
+        const uint64_t key = EncodeStableWinnerKey(
             score - commonAgeScore, activePosition_[h]);
-        stealWinnerTree_[stealTreeLeafBase_ + h] = stealStableKey_[h];
+        stealStableKey_[h] = key;
+        if (key > maxKey) { maxKey = key; winnerIdx = i; }
     }
+    if (samePending && maxKey > runnerUp) {
+        // Still the root: leave the tree stale until the commit.
+        p.treeDirty = true;
+        p.maxKey = maxKey;
+        p.runnerUp = runnerUp;
+        p.winnerIdx = winnerIdx;
+        return true;
+    }
+    p.treeDirty = false;
+    for (uint32_t i = 0u; i < count; ++i)
+        stealWinnerTree_[stealTreeLeafBase_ + group[i]] =
+            stealStableKey_[group[i]];
     RefreshStealWinnerPaths(group, count);
     return true;
 }
@@ -1145,6 +1216,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
 // runs: reserve the group's leaves, replace it in place (the victim here is
 // the zero-life group, whose tail the plan hook skips), configure, commit.
 inline void VoiceManager::CommitPendingLaunchImpl() {
+    FlushPendingTree();
     PendingLaunch& p = pendingLaunch_;
     p.valid = false;
     for (uint32_t i = 0u; i < p.count; ++i) {
