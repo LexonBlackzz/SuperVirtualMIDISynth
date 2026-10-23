@@ -139,6 +139,11 @@ struct EngineConfig {
     // shadow). Applied at engine init; silently falls back when the
     // privilege is not held. Off by default.
     bool largePages;
+    // Experimental: a voice stolen on the frame it was launched has played
+    // zero samples; skip the steal-fade tail it would leave, which also lets
+    // the whole-voice plan launch chains of such steals lazily. Applied at
+    // engine init. Off by default (audio unchanged).
+    bool dropZeroLifeVictims;
     // Synth backend routed by the event sink: 0 = SVMS engine (default,
     // in-process), 1 = external SVMS-API DLL, 2 = external KDMAPI DLL,
     // 3 = WinMM MIDI-out device. External backends own their own audio

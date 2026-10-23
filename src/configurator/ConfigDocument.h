@@ -100,6 +100,9 @@ struct ConfigValues {
     uint32_t ghostBudget = 0u;
     // Opt-in large-page backing for the biggest pools (needs restart).
     bool largePages = false;
+    // Experimental: skip the steal-fade tail of voices stolen on their birth
+    // frame and launch chains of such steals lazily (needs restart).
+    bool dropZeroLifeVictims = false;
     // Synth backend routing: 0 SVMS engine, 1 SVMS-API DLL, 2 KDMAPI DLL,
     // 3 WinMM device. Applied at driver init (restart).
     uint32_t apiBackend = 0u;

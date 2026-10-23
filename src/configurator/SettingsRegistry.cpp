@@ -68,6 +68,7 @@ const SettingDef kSettings[] = {
     {"shards", "Engine shards", P, "Performance \xE2\x80\xBA CPU", "shards split engine", nullptr, nullptr, true, D(&V::shards)},
     {"affinity", "Core placement (thread affinity)", P, "Performance \xE2\x80\xBA CPU", "hybrid thread affinity p-cores e-cores intel", nullptr, nullptr, false, D(&V::threadAffinityMode)},
     {"largePages", "Large memory pages", P, "Performance \xE2\x80\xBA CPU", "large pages tlb memory", nullptr, nullptr, true, D(&V::largePages)},
+    {"dropZeroLife", "Drop instant-steal blips (experimental)", P, "Performance \xE2\x80\xBA CPU", "drop zero life instant steal lazy launch black midi experimental", nullptr, nullptr, true, D(&V::dropZeroLifeVictims)},
     {"steal", "Steal policy", P, "Performance \xE2\x80\xBA Engine internals", "steal quality fast scan", nullptr, "perf", false, D(&V::stealPolicy)},
     {"retire", "Retire floor", P, "Performance \xE2\x80\xBA Engine internals", "voice retire floor release tail -76 db", nullptr, "perf", false, D(&V::voiceRetireThreshold)},
     {"perKey", "Per-key voice cap", P, "Performance \xE2\x80\xBA Engine internals", "per key cap", nullptr, "perf", false, D(&V::perKeyVoiceCap)},

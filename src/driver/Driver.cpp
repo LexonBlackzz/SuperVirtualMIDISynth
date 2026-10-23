@@ -420,6 +420,8 @@ bool Driver::Initialize() {
                                   std::memory_order_relaxed);
     svms::g_largePagesEnabled.store(cfg.largePages,
                                     std::memory_order_relaxed);
+    svms::g_dropZeroLifeVictims.store(cfg.dropZeroLifeVictims,
+                                      std::memory_order_relaxed);
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -573,6 +575,8 @@ bool Driver::Initialize() {
                                   std::memory_order_relaxed);
     svms::g_largePagesEnabled.store(cfg.largePages,
                                     std::memory_order_relaxed);
+    svms::g_dropZeroLifeVictims.store(cfg.dropZeroLifeVictims,
+                                      std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
     voiceManager->SetStealPolicy(cfg.stealPolicy);

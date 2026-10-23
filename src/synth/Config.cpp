@@ -428,7 +428,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"steal_policy", cfg.stealPolicy},
             {"per_key_voice_cap", cfg.perKeyVoiceCap},
             {"steal_reject", cfg.stealReject},
-            {"ghost_budget", cfg.ghostBudget}
+            {"ghost_budget", cfg.ghostBudget},
+            {"drop_zero_life_victims", cfg.dropZeroLifeVictims}
         }},
 
         {"midi", {
@@ -911,6 +912,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "voices.steal_reject");
         if (!ReadValue(*it, "ghost_budget", cfg.ghostBudget, 0u, 65536u))
             AppendWarning(cfg.configWarning, "voices.ghost_budget");
+        if (!ReadBool(*it, "drop_zero_life_victims", cfg.dropZeroLifeVictims))
+            AppendWarning(cfg.configWarning, "voices.drop_zero_life_victims");
     }
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
@@ -1084,6 +1087,7 @@ EngineConfig EngineConfig::Default() {
     cfg.unboundedRender = false;  // opt-in: recovery + caps stay on by default
     cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default
     cfg.largePages = false;       // opt-in: standard aligned allocation by default
+    cfg.dropZeroLifeVictims = false;  // opt-in: exact steal-fade tails by default
     cfg.apiBackend = 0;           // SVMS engine in-process by default
     cfg.apiAllowNested = false;   // nested-chain guard on by default
     cfg.apiWinMmDevice = 0;

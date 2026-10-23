@@ -181,6 +181,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.unboundedRender = false;
     d.ghostBudget = 0u;
     d.largePages = false;
+    d.dropZeroLifeVictims = false;
     d.apiBackend = 0u;
     d.apiAllowNested = false;
     d.apiWinMmDevice = 0u;
@@ -387,6 +388,7 @@ void ConfigDocument::FromJson(const json& root) {
         ReadNum(*it, "per_key_voice_cap", working_.perKeyVoiceCap, 0u, 256u);
         ReadBool(*it, "steal_reject", working_.stealReject);
         ReadNum(*it, "ghost_budget", working_.ghostBudget, 0u, 65536u);
+        ReadBool(*it, "drop_zero_life_victims", working_.dropZeroLifeVictims);
     }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.diagnosticsEnabled);
@@ -488,6 +490,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["per_key_voice_cap"] = working_.perKeyVoiceCap;
     root["voices"]["steal_reject"] = working_.stealReject;
     root["voices"]["ghost_budget"] = working_.ghostBudget;
+    root["voices"]["drop_zero_life_victims"] = working_.dropZeroLifeVictims;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["events"]["cc_collapse"] = working_.ccCollapse;
     root["events"]["bend_collapse"] = working_.bendCollapse;
@@ -704,6 +707,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.perKeyVoiceCap == b.perKeyVoiceCap
         && a.stealReject == b.stealReject
         && a.ghostBudget == b.ghostBudget
+        && a.dropZeroLifeVictims == b.dropZeroLifeVictims
         && a.threadAffinityMode == b.threadAffinityMode
         && a.ccCollapse == b.ccCollapse
         && a.bendCollapse == b.bendCollapse
