@@ -368,6 +368,9 @@ void OfflineRendererPage::Start(const ConfigDocument& document) {
         static const wchar_t* const kModes[] = {L"", L"separate", L"merge", L"both"};
         append(L"--stems"); append(kModes[stemMode_]);
     }
+    if (fullVelocity_) append(L"--full-velocity");
+    if (renderMode_ == 1) append(L"--bassmidi-mode");
+    if (shards_ > 1) { append(L"--shards"); append(std::to_wstring(shards_)); }
     if (stemTracks_[0]) { append(L"--tracks"); append(std::wstring(stemTracks_, stemTracks_ + std::strlen(stemTracks_))); }
     append(L"--sample-rate"); append(std::to_wstring(values.sampleRate));
     append(L"--max-voices"); append(std::to_wstring(values.maxVoices));
@@ -581,6 +584,16 @@ void OfflineRendererPage::HandleProtocolLine(const std::string& line) {
         return;
     }
 
+    if (fields[1] == "PHASE" && fields.size() >= 5u) {
+        uint64_t step = 0, steps = 0;
+        if (ParseU64(fields[2], step) && ParseU64(fields[3], steps)) {
+            snapshot_.phaseStep = static_cast<uint32_t>(step);
+            snapshot_.phaseSteps = static_cast<uint32_t>(steps);
+            snapshot_.phaseName = fields[4];
+        }
+        return;
+    }
+
     if (fields[1] == "STATUS" && fields.size() >= 3u) {
         const std::string message = fields.size() >= 4u ? fields[3] : std::string{};
         const bool cancelling = snapshot_.state == State::Cancelling;
@@ -642,6 +655,19 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
     ImGui::SetNextItemWidth(220.0f * s);
     ImGui::InputTextWithHint("Only tracks##stem", "all (or e.g. 1,3,5)", stemTracks_,
                              sizeof(stemTracks_), ImGuiInputTextFlags_CharsNoBlank);
+    ImGui::SetNextItemWidth(220.0f * s);
+    ImGui::Combo("Sound model##rmode", &renderMode_, "Exact engine\0BASSMIDI-style (KMC)\0");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Exact engine: every note as the synth plays it.\n"
+                          "BASSMIDI-style: imitates KMC/BASSMIDI on huge Black MIDI. Notes are held at least 4 ms, a full pool drops notes that are not louder than its quietest voice, DC offset is kept, and a program change to a preset the SoundFont lacks stays silent.\n"
+                          "Uses the voice limit from the Performance page. Renders the whole file plus a 3 s tail; a MIDI with too many notes for memory stops with a message.");
+    ImGui::Checkbox("Full velocity##fullvel", &fullVelocity_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Every note plays at velocity 127.");
+    ImGui::SetNextItemWidth(220.0f * s);
+    ImGui::SliderInt("Parallel shards##shards", &shards_, 1, 32);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Splits notes by key across this many synth cores that plan in parallel.\nFor huge Black MIDI. The voice limit is divided between them; each core loads its own SoundFont copy.");
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Per-track render runs one synth per track, as many at once as your render threads.\n"
@@ -658,7 +684,8 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
     {
         const char* hint = snapshot.state == State::Complete ? "Done. The WAV is ready."
             : running ? StateLabel(snapshot.state)
-            : pathsReady ? "Ready." : "Pick the MIDI file and where to save.";
+            : pathsReady ? "Ready."
+            : "Pick the MIDI file and where to save.";
         ui::PushText(0, 13.0f);
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (38.0f * s - ImGui::GetTextLineHeight()) * 0.5f);
         ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
@@ -677,7 +704,7 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
         add(v.channelLimiterEnabled, "channel limiter");
         add(v.ccCollapse, "skipping overwritten controller changes");
         add(v.bendCollapse, "thinning pitch bends");
-        add(v.minNoteMs > 0u, "minimum note length");
+        add(v.minNoteMs > 0u && renderMode_ == 0, "minimum note length");
         if (!unapplied.empty()) {
             const std::string note = "Uses your current settings, even unsaved ones. Live-only for now, so not in the file: " + unapplied + ".";
             ImGui::Dummy(ImVec2(0.0f, 8.0f * s - ImGui::GetStyle().ItemSpacing.y));
@@ -707,15 +734,26 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
     ui::PopFont();
     ui::CardHeaderEnd();
     ui::StripedProgress(running || snapshot.state == State::Complete ? static_cast<float>(progress) : -1.0f);
-    char speed[24], eta[24], voices[24], peak[24];
-    if (snapshot.speed > 0.0) std::snprintf(speed, sizeof(speed), "%.1fx", snapshot.speed);
+    char speed[24], eta[24], voices[24], peak[24], elapsed[24], done[48];
+    if (snapshot.speed > 0.0) std::snprintf(speed, sizeof(speed), "%.1fx realtime", snapshot.speed);
     else std::snprintf(speed, sizeof(speed), "\xE2\x80\x94");
-    std::snprintf(eta, sizeof(eta), "%s", running && snapshot.eta > 0.0 ? FormatDuration(snapshot.eta).c_str() : "\xE2\x80\x94");
+    const double etaShown = loadingPhase && snapshot.loadEta > 0.0 ? snapshot.loadEta : snapshot.eta;
+    std::snprintf(eta, sizeof(eta), "%s", running && etaShown > 0.0 ? FormatDuration(etaShown).c_str() : "\xE2\x80\x94");
+    std::snprintf(elapsed, sizeof(elapsed), "%s", running || snapshot.state == State::Complete ? FormatDuration(snapshot.elapsed).c_str() : "\xE2\x80\x94");
+    if (snapshot.totalSeconds > 0.0)
+        std::snprintf(done, sizeof(done), "%s / %s", FormatDuration(snapshot.renderedSeconds).c_str(), FormatDuration(snapshot.totalSeconds).c_str());
+    else std::snprintf(done, sizeof(done), "\xE2\x80\x94");
     std::snprintf(voices, sizeof(voices), "%u", snapshot.activeVoices);
     std::snprintf(peak, sizeof(peak), "%u", snapshot.peakVoices);
-    const char* labels[4] = {"Speed", "Time left", "Voices now", "Peak voices"};
-    const char* values[4] = {speed, eta, voices, peak};
-    ui::StatGrid(labels, values, 4);
+    if (renderMode_ == 1) {
+        const char* labels[4] = {"Speed", "Time left", "Elapsed", "Audio"};
+        const char* values[4] = {speed, eta, elapsed, done};
+        ui::StatGrid(labels, values, 4);
+    } else {
+        const char* labels[6] = {"Speed", "Time left", "Elapsed", "Audio", "Voices now", "Peak voices"};
+        const char* values[6] = {speed, eta, elapsed, done, voices, peak};
+        ui::StatGrid(labels, values, 6);
+    }
 
     ImGui::Dummy(ImVec2(0.0f, 14.0f * s - ImGui::GetStyle().ItemSpacing.y));
     ImU32 stateColor = k.muted;
@@ -726,7 +764,10 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
     ui::PushText(0, 13.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, stateColor);
     ImGui::PushTextWrapPos(0.0f);
-    ImGui::Text("%s  %s", StateLabel(snapshot.state), snapshot.message.c_str());
+    if (running && snapshot.phaseSteps > 0u)
+        ImGui::Text("%s  Step %u of %u: %s", StateLabel(snapshot.state), snapshot.phaseStep, snapshot.phaseSteps, snapshot.phaseName.c_str());
+    else
+        ImGui::Text("%s  %s", StateLabel(snapshot.state), snapshot.message.c_str());
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
     if (!snapshot.detail.empty()) {

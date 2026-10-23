@@ -2265,7 +2265,7 @@ bool BuildVolatileStealKeysAVX2(
     const uint32_t* handles, uint32_t handleCount,
     const uint64_t* birthFrames, const float* currentGains,
     const float* outputGains, const uint32_t* activePositions,
-    uint64_t currentFrame, float gainScale, uint64_t* outputKeys,
+    uint64_t currentFrame, float gainScale, float ageScaleValue, uint64_t* outputKeys,
     uint32_t* outputHandles, uint32_t* inverseHeapPositions) {
     if (!handles || !birthFrames || !currentGains || !outputGains ||
         !activePositions || !outputKeys || !outputHandles ||
@@ -2276,9 +2276,9 @@ bool BuildVolatileStealKeysAVX2(
 
     const __m256i current = _mm256_set1_epi32(
         static_cast<int32_t>(currentFrame));
-    const __m256 ageScale = _mm256_set1_ps(1.0f / 256.0f);
+    const __m256 ageScale = _mm256_set1_ps(ageScaleValue);
     const __m256 commonAge = _mm256_set1_ps(
-        static_cast<float>(currentFrame) * (1.0f / 256.0f));
+        static_cast<float>(currentFrame) * ageScaleValue);
     const __m256 gainScaleVector = _mm256_set1_ps(gainScale);
     const __m256 signMask = _mm256_set1_ps(-0.0f);
 
@@ -2349,14 +2349,14 @@ bool BuildVolatileStealKeysAVX2(
     }
 
     const float commonAgeScalar =
-        static_cast<float>(currentFrame) * (1.0f / 256.0f);
+        static_cast<float>(currentFrame) * ageScaleValue;
     for (; position < handleCount; ++position) {
         const uint32_t handle = handles[position];
         const uint64_t rawAge = currentFrame > birthFrames[handle]
             ? currentFrame - birthFrames[handle] : 0u;
         const uint32_t age = rawAge > UINT32_MAX
             ? UINT32_MAX : static_cast<uint32_t>(rawAge);
-        const float ageUnits = static_cast<float>(age) * (1.0f / 256.0f);
+        const float ageUnits = static_cast<float>(age) * ageScaleValue;
         const float level = std::fabs(currentGains[handle]) *
             outputGains[handle];
         const float score = ageUnits - level * gainScale;

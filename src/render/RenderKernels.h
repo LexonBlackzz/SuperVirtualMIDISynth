@@ -143,7 +143,7 @@ bool BuildVolatileStealKeysAVX2(
     const uint32_t* handles, uint32_t handleCount,
     const uint64_t* birthFrames, const float* currentGains,
     const float* outputGains, const uint32_t* activePositions,
-    uint64_t currentFrame, float gainScale, uint64_t* outputKeys,
+    uint64_t currentFrame, float gainScale, float ageScale, uint64_t* outputKeys,
     uint32_t* outputHandles, uint32_t* inverseHeapPositions);
 #endif
 

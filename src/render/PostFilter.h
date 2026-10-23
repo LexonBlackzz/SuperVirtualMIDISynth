@@ -9,6 +9,9 @@ namespace svms {
 // output so it removes subsonic energy without altering gain detection.
 // State is continuous across callback boundaries and all coefficient work is
 // performed during initialization, not on the audio thread.
+// Offline BASSMIDI mode: keep the DC offset (set before synths are created).
+inline bool g_keepDcOffset = false;
+
 class PostHighPass3Hz {
 public:
     void Initialize(uint32_t sampleRate) noexcept {
@@ -27,7 +30,7 @@ public:
     }
 
     void ProcessPlanar(float* left, float* right, uint32_t frames) noexcept {
-        if (!left || !right || frames == 0u) return;
+        if (!left || !right || frames == 0u || passThrough_) return;
         float x1L = previousInputL_;
         float x1R = previousInputR_;
         float y1L = previousOutputL_;
@@ -49,7 +52,7 @@ public:
     }
 
     void ProcessInterleavedStereo(float* samples, uint32_t frames) noexcept {
-        if (!samples || frames == 0u) return;
+        if (!samples || frames == 0u || passThrough_) return;
         float x1L = previousInputL_;
         float x1R = previousInputR_;
         float y1L = previousOutputL_;
@@ -72,6 +75,7 @@ public:
     }
 
     void ProcessStereoSample(float& left, float& right) noexcept {
+        if (passThrough_) return;
         const float inputL = left;
         const float inputR = right;
         left = inputL - previousInputL_ + pole_ * previousOutputL_;
@@ -88,6 +92,8 @@ public:
     }
 
     float GetPole() const noexcept { return pole_; }
+    // Keep DC (BASSMIDI-style output has a DC offset the 3 Hz filter would remove).
+    void SetPassThrough(bool on) noexcept { passThrough_ = on; }
 
 private:
     void Commit(float x1L, float x1R, float y1L, float y1R) noexcept {
@@ -100,6 +106,7 @@ private:
         previousOutputR_ = y1R;
     }
 
+    bool passThrough_ = false;
     float pole_ = 0.0f;
     float previousInputL_ = 0.0f;
     float previousInputR_ = 0.0f;

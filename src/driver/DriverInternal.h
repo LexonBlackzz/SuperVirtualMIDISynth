@@ -1333,4 +1333,5 @@ SVMS_Result SVMS_CALL NativeRenderOffline(
 SVMS_Result SVMS_CALL NativeGetOfflineTelemetry(
     SVMS_Session session, SVMS_OfflineTelemetry* telemetry);
 SVMS_Result SVMS_CALL NativeDestroySession(SVMS_Session session);
+bool NativeGetOfflineChannelVoices(SVMS_Session session, uint32_t (&out)[16]);
 } // extern "C"

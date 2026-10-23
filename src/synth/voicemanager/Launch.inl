@@ -611,7 +611,7 @@ inline float VoiceManager::ComputeNewbornStableStealKey(
         std::fabs(v.targetGain[handle]) * outputGain;
     const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
     const float commonAgeScore =
-        static_cast<float>(currentFrame_) * (1.0f / 256.0f);
+        static_cast<float>(currentFrame_) * stealAgeScale_;
     return score - commonAgeScore;
 }
 
@@ -1036,8 +1036,8 @@ inline bool VoiceManager::LaunchVoiceGroup(
         count > voiceLimit_)
         return false;
     if (count > launchLayersHighWater_) launchLayersHighWater_ = count;
-    if (stealReject_.load(std::memory_order_relaxed) && count == 1u && ShouldRejectNoteOn(setups[0], channelParams,
-                                           multiplicity)) {
+    if (stealReject_.load(std::memory_order_relaxed) &&
+        ShouldRejectNoteOn(setups, count, channelParams, multiplicity)) {
         // Pairing note-offs sees no voice for this generation, exactly as if
         // the note had been launched and stolen before it rendered.
         lastLaunchRejected_ = true;

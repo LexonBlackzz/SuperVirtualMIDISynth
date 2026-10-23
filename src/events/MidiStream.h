@@ -101,7 +101,8 @@ public:
     static bool MeasureDuration(const MappedMidiFile& file, uint32_t sampleRate,
                                 uint64_t& totalFrames, std::string& error,
                                 std::atomic<bool>* cancel = nullptr,
-                                uint32_t threads = 0);
+                                uint32_t threads = 0,
+                                std::vector<uint64_t>* noteOnsPerTrack = nullptr);
     bool Decode(const MappedMidiFile& file, uint32_t sampleRate,
                 MidiStreamDecoder::Sink sink, void* user,
                 std::atomic<bool>* cancel, MidiStreamInfo* info,

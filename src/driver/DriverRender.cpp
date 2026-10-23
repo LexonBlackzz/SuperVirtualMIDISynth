@@ -2287,9 +2287,11 @@ void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
         return;
     }
 
-    // Invalid selection: restore the prior program and leave the prior preset
-    // active, matching TSF's failed preset-selection behavior.
-    channelCache->ProgramChange(channel, oldProgram);
+    // No such preset: keep the new program and leave the channel silent instead of
+    // playing the previous instrument (BASSMIDI behaviour).
+    (void)oldProgram;
+    channelCache->SetSelectedPreset(channel, UINT16_MAX);
+    ++channelLaunchRevision_[channel];
 }
 
 void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {

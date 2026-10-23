@@ -404,6 +404,7 @@ bool sf2_resolve_preset(const SF2Data* data, uint16_t bank, uint8_t program,
                             outPresetIndex)) return true;
         if (sf2_find_preset(data, 128, program, outPresetIndex)) return true;
         if (sf2_find_preset(data, 128, 0, outPresetIndex)) return true;
+        return false;  // no drum kit in this SoundFont: the channel stays silent, never a melodic preset
     }
 
     if (sf2_find_preset(data, bank, program, outPresetIndex)) return true;
@@ -1176,38 +1177,9 @@ void sf2_build_regions(SF2Data* data) {
     if (data->regionOverflow)
         OutputDebugStringA("[SVMS-SF2] ERROR: compiled region capacity exceeded; SoundFont rejected partially\n");
 
-    // Pick the widest-keyboard-coverage preset for region fallback. Ties
-    // resolve to the lowest preset index so the choice is deterministic
-    // across loads of the same file.
-    {
-        uint32_t bestCoverage = 0u;
-        uint32_t keyCoverage[128];
-        data->fallbackPresetIndex = UINT16_MAX;
-        for (uint32_t pi = 0; pi < data->presetCount &&
-                 pi < kMaxPresets; ++pi) {
-            for (uint32_t k = 0; k < 128; ++k) keyCoverage[k] = 0u;
-            const uint32_t begin = data->presetRegionStart[pi];
-            const uint32_t end = begin + data->presetRegionCount[pi];
-            if (begin > data->regionCount || end > data->regionCount)
-                continue;
-            uint32_t covered = 0u;
-            for (uint32_t ri = begin; ri < end; ++ri) {
-                const SFSampleRegion& r = data->regions[ri];
-                const uint32_t lo = r.keyLo < 128u ? r.keyLo : 127u;
-                const uint32_t hi = r.keyHi < 128u ? r.keyHi : 127u;
-                for (uint32_t k = lo; k <= hi; ++k) {
-                    if (keyCoverage[k]++ == 0u) ++covered;
-                }
-            }
-            if (covered > bestCoverage) {
-                bestCoverage = covered;
-                data->fallbackPresetIndex = static_cast<uint16_t>(pi);
-            }
-        }
-        sprintf(dbg, "[SVMS-SF2] region fallback preset: %u (%u keys)\n",
-                data->fallbackPresetIndex, bestCoverage);
-        OutputDebugStringA(dbg);
-    }
+    // No region fallback: a preset that has no region for a key/velocity stays silent
+    // (BASSMIDI behaviour) instead of borrowing the widest preset (usually a piano).
+    data->fallbackPresetIndex = UINT16_MAX;
 
     for (uint32_t ri = 0; ri < data->regionCount && ri < 20; ++ri) {
         const SFSampleRegion& r = data->regions[ri];

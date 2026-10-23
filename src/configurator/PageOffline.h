@@ -56,6 +56,8 @@ private:
         uint32_t peakVoices = 0;
         uint64_t steals = 0;
         uint64_t events = 0;
+        uint32_t phaseStep = 0, phaseSteps = 0;  // note-table renderer: "step 2 of 6"
+        std::string phaseName;
         std::string message = "Select a MIDI file, SoundFont, and output WAV.";
         std::string detail;
     };
@@ -75,6 +77,9 @@ private:
     std::wstring midiPath_;
     std::wstring soundFontPath_;
     std::wstring outputPath_;
+    bool fullVelocity_ = false;  // --full-velocity
+    int shards_ = 1;             // --shards (1 = off)
+    int renderMode_ = 0;         // 0 exact engine, 1 BASSMIDI-style (--bassmidi-mode)
     int stemMode_ = 0;  // 0 off, 1 separate, 2 merge, 3 both
     char stemTracks_[64]{};  // "1,3,5": render only these MIDI tracks' notes (blank = all)
     std::wstring lastMidiDirectory_;

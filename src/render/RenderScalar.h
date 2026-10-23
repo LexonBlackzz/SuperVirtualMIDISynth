@@ -22,11 +22,18 @@
 namespace svms {
 
 // ── Linear interpolation between two sample frames ──────────────────────
+// EXPERIMENT: SVMS_INTERP=cubic switches the scalar path to 4-point Catmull-Rom.
+inline const bool g_interpCubic = std::getenv("SVMS_INTERP") != nullptr;
 inline float InterpolateSample(const int16_t* data, uint32_t baseIndex,
                                 uint32_t nextIndex, float frac) {
     const float s0 = static_cast<float>(data[baseIndex]) * (1.0f / 32768.0f);
     const float s1 = static_cast<float>(data[nextIndex]) * (1.0f / 32768.0f);
-    return s0 + (s1 - s0) * frac;
+    if (!g_interpCubic) return s0 + (s1 - s0) * frac;
+    const float sm = static_cast<float>(data[baseIndex ? baseIndex - 1u : 0u]) * (1.0f / 32768.0f);
+    const float s2 = static_cast<float>(data[nextIndex + 1u]) * (1.0f / 32768.0f);
+    const float c1 = 0.5f * (s1 - sm), c2 = 0.5f * (s2 - s0);
+    const float d = s1 - s0;
+    return s0 + frac * (c1 + frac * ((3.0f * d - 2.0f * c1 - c2) + frac * (c1 + c2 - 2.0f * d)));
 }
 
 // Render a compact continuation from the independent BASS-like tail reserve.

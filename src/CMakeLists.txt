@@ -443,6 +443,7 @@ set(SVMS_DRIVER_SOURCES
     frontends/FrontNative.cpp
     frontends/FrontKDMAPI.cpp
     frontends/FrontBass.cpp
+    events/MidiStream.cpp
     driver/DllMain.cpp
 )
 
@@ -570,7 +571,24 @@ add_library(svmsynth SHARED frontends/FrontWinMM.cpp
 add_library(svmsapi SHARED frontends/FrontWinMM.cpp frontends/RemoteClient.cpp
     "${SVMS_GENERATED_DIR}/SVMSApiVersion.rc")
 
-foreach(svms_engine_target svms_engine svmsynth svmsapi)
+set(SVMS_DLL_TARGETS svms_engine svmsynth svmsapi)
+if(NOT SVMS_XP_COMPAT)
+    # bass.dll: the winmm runtime (same exports) plus the offline note-table
+    # renderer, which the KMC/BASSMIDI imitation mode runs in process.
+    add_library(svms_offline_render OBJECT synth/OfflineRenderer.cpp)
+    target_compile_definitions(svms_offline_render PRIVATE
+        SVMS_OFFLINE_AS_LIBRARY NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+        _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_offline_render PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../third_party")
+    add_library(svmsbass SHARED frontends/FrontWinMM.cpp
+        $<TARGET_OBJECTS:svms_offline_render>
+        "${SVMS_GENERATED_DIR}/SVMSDriverVersion.rc")
+    target_link_libraries(svmsbass PRIVATE svms_canonical_engine)
+    list(APPEND SVMS_DLL_TARGETS svmsbass)
+endif()
+
+foreach(svms_engine_target ${SVMS_DLL_TARGETS})
     target_compile_definitions(${svms_engine_target} PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
         _CRT_SECURE_NO_WARNINGS ${SVMS_WITH_ASIO_DEF})
@@ -612,7 +630,7 @@ if(NOT SVMS_XP_COMPAT)
             "${ASIO_SDK_DIR}/common/debugmessage.cpp"
             "${ASIO_SDK_DIR}/host/asiodrivers.cpp"
             "${ASIO_SDK_DIR}/host/pc/asiolist.cpp")
-        foreach(svms_engine_target svms_engine svmsynth svmsapi)
+        foreach(svms_engine_target ${SVMS_DLL_TARGETS})
             target_compile_definitions(${svms_engine_target} PRIVATE SVMS_WITH_ASIO)
             target_include_directories(${svms_engine_target} PRIVATE
                 "${ASIO_SDK_DIR}/common" "${ASIO_SDK_DIR}/host"
@@ -758,6 +776,15 @@ set(EXPORTS
         BASS_FXGetParameters
         BASS_FXSetPriority
         BASS_FXVersion
+        BASS_ChannelSetSync
+        BASS_ChannelRemoveSync
+        BASS_ChannelSetDSP
+        BASS_ChannelRemoveDSP
+        BASS_ChannelSetFX
+        BASS_ChannelRemoveFX
+        BASS_GetConfigPtr
+        BASS_ChannelGetTags
+        BASS_MIDI_StreamGetTrackCount
         midiOutGetNumDevs
         midiOutGetDevCapsA
         midiOutGetDevCapsW
@@ -868,6 +895,9 @@ set(EXPORTS
 if(MSVC)
     foreach(exp ${EXPORTS})
         target_link_options(svmsynth PRIVATE /EXPORT:${exp})
+        if(TARGET svmsbass)
+            target_link_options(svmsbass PRIVATE /EXPORT:${exp})
+        endif()
     endforeach()
 elseif(MINGW)
     set(SVMS_EXPORT_FILE "${CMAKE_CURRENT_BINARY_DIR}/SVMSExports.def")
@@ -877,6 +907,14 @@ elseif(MINGW)
     endforeach()
     target_sources(svmsynth PRIVATE "${SVMS_EXPORT_FILE}")
     target_link_options(svmsynth PRIVATE -Wl,--kill-at)
+endif()
+
+if(TARGET svmsbass)
+    set_target_properties(svmsbass PROPERTIES
+        OUTPUT_NAME "bass"
+        PREFIX ""
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
 set_target_properties(svmsynth PROPERTIES
@@ -1099,12 +1137,14 @@ add_custom_target(svms_kdmapi_alias ALL
 # full BASS/BASSMIDI prerender surface lives in svmsynth); bassmidi.dll is
 # a thin forwarder to it so a player loading both module names sees one
 # engine instance.
-add_custom_target(svms_bass_alias ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:svmsynth>"
-            "$<TARGET_FILE_DIR:svmsynth>/bass.dll"
-    DEPENDS svmsynth
-    VERBATIM)
+if(NOT TARGET svmsbass)
+    add_custom_target(svms_bass_alias ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:svmsynth>"
+                "$<TARGET_FILE_DIR:svmsynth>/bass.dll"
+        DEPENDS svmsynth
+        VERBATIM)
+endif()
 
 add_library(svms_bassmidi_forwarder SHARED frontends/BassMidiForwarder.cpp)
 set_target_properties(svms_bassmidi_forwarder PROPERTIES
@@ -1141,10 +1181,46 @@ if(MSVC)
             BASS_ChannelSetAttribute BASS_ChannelGetAttribute
             BASS_ChannelFlags BASS_ChannelGetInfo BASS_StreamFree
             BASS_FXReset BASS_FXFree BASS_FXSetParameters
-            BASS_FXGetParameters BASS_FXSetPriority BASS_FXVersion)
+            BASS_FXGetParameters BASS_FXSetPriority BASS_FXVersion
+            BASS_MIDI_StreamGetTrackCount)
         target_link_options(svms_bassmidi_forwarder PRIVATE /EXPORT:${exp})
     endforeach()
 endif()
+
+# bassenc.dll replacement: real bassenc imports an undocumented table from the
+# real bass.dll, so conversions (KMC's WAV/OGG/MP3 export) get this small
+# shim that encodes from the SVMS bass.dll's channel DSP chain.
+add_library(svms_bassenc_shim SHARED frontends/BassEncShim.cpp)
+set_target_properties(svms_bassenc_shim PROPERTIES
+    OUTPUT_NAME "bassenc"
+    PREFIX ""
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+if(MSVC)
+    foreach(exp
+            BASS_Encode_GetVersion BASS_Encode_Start BASS_Encode_Stop
+            BASS_Encode_StopEx BASS_Encode_IsActive BASS_Encode_SetPaused
+            BASS_Encode_Write BASS_Encode_GetChannel BASS_Encode_GetCount
+            BASS_Encode_SetNotify)
+        target_link_options(svms_bassenc_shim PRIVATE /EXPORT:${exp})
+    endforeach()
+endif()
+
+# bass_vst.dll stand-in (see frontends/BassVstShim.cpp).
+add_library(svms_bassvst_shim SHARED frontends/BassVstShim.cpp)
+set_target_properties(svms_bassvst_shim PROPERTIES
+    OUTPUT_NAME "bass_vst"
+    PREFIX ""
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# basswasapi.dll stand-in (see frontends/BassWasapiShim.cpp).
+add_library(svms_basswasapi_shim SHARED frontends/BassWasapiShim.cpp)
+set_target_properties(svms_basswasapi_shim PROPERTIES
+    OUTPUT_NAME "basswasapi"
+    PREFIX ""
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
 

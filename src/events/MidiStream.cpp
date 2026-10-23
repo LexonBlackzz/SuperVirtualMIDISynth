@@ -497,6 +497,7 @@ void ParseWindow(std::vector<PTrack>& tracks, WinWorker& w, uint64_t a,
 namespace {
 struct TrackMeasure {
     uint64_t endTick = 0;
+    uint64_t noteOns = 0;
     std::vector<TempoEv> tempos;
     bool ok = true;
 };
@@ -546,6 +547,7 @@ bool MeasureTrack(const Track& tr, TrackMeasure& out) {
             const uint8_t kind = status & 0xf0;
             const uint8_t bytes = (kind == 0xc0 || kind == 0xd0) ? 1 : 2;
             if (uint64_t(end - p) < bytes) return false;
+            if (kind == 0x90 && p[1] != 0) ++out.noteOns;
             p += bytes;
         }
     }
@@ -558,7 +560,8 @@ bool ParallelMidiDecoder::MeasureDuration(const MappedMidiFile& file,
                                           uint32_t rate, uint64_t& totalFrames,
                                           std::string& error,
                                           std::atomic<bool>* cancel,
-                                          uint32_t threads) {
+                                          uint32_t threads,
+                                          std::vector<uint64_t>* noteOnsPerTrack) {
     MidiStreamInfo header{};
     std::vector<Track> tracks;
     if (!Tracks(file, header, tracks, error)) return false;
@@ -585,6 +588,10 @@ bool ParallelMidiDecoder::MeasureDuration(const MappedMidiFile& file,
     if (cancel && cancel->load(std::memory_order_relaxed)) return false;
     if (failed.load()) { error = "cannot measure MIDI duration"; return false; }
 
+    if (noteOnsPerTrack) {
+        noteOnsPerTrack->clear();
+        for (const TrackMeasure& m : measures) noteOnsPerTrack->push_back(m.noteOns);
+    }
     uint64_t maxTick = 0;
     std::vector<TempoEv> tempos;   // track order, then in-track order
     for (const TrackMeasure& m : measures) {

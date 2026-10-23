@@ -1,6 +1,14 @@
 // BASS/BASSMIDI prerender shim exports (C++ linkage, exported by name).
 
 #include "driver/DriverInternal.h"
+#include "events/MidiStream.h"
+#include "synth/BassKmcApi.h"
+#include "frontends/NativeOffline.h"
+#include <atomic>
+#include <future>
+#include <queue>
+#include <chrono>
+#include <thread>
 
 
 // ── BASS/BASSMIDI prerender shim ─────────────────────────────────────
@@ -30,6 +38,48 @@ struct BassFontMapEntry {
     int32_t dbanklsb = -1;
 };
 
+struct BassDspEntry {
+    DWORD handle;
+    void* proc;
+    void* user;
+    int priority;
+};
+
+struct BassFxEntry {
+    DWORD stream;
+    DWORD type;
+};
+
+// Very large SMFs (a 2.2-billion-note Black MIDI) cannot be held as an event
+// vector. Their events are produced on demand by the ParallelMidiDecoder
+// into a bounded ring and consumed in render order, like the offline renderer.
+struct BassFileFeed {
+    svms::MappedMidiFile file;
+    svms::ParsedEventRing ring;
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> done{false};
+    std::thread thread;
+    std::string error;
+    uint32_t sampleRate = 44100u;
+    svms::PackedMidiEvent head{};
+    bool hasHead = false;
+    explicit BassFileFeed(uint32_t megabytes) : ring(megabytes) {}
+    ~BassFileFeed() {
+        cancel.store(true);
+        if (thread.joinable()) thread.join();
+    }
+};
+
+// A file event waiting for its (possibly delayed) frame; seq keeps the original order.
+struct BassFileEv {
+    uint32_t frame;
+    uint64_t seq;
+    uint32_t message;
+    bool operator>(const BassFileEv& o) const {
+        return frame != o.frame ? frame > o.frame : seq > o.seq;
+    }
+};
+
 struct BassStream {
     SVMS_Session session = 0;
     uint32_t sampleRate = 44100u;
@@ -37,6 +87,7 @@ struct BassStream {
     bool floating = true;      // BASS_SAMPLE_FLOAT output; else 16-bit
     uint64_t renderedFrames = 0u;  // frames rendered into the cache
     uint64_t servedFrames = 0u;    // frames handed to the caller
+    float cpuLoad = 0.0f;          // BASS_ATTRIB_CPU: smoothed render time / audio time, %
     uint64_t maxEventFrame = 0u;
     uint32_t maxBlockFrames = 2048u;  // NativeRenderOffline per-call cap
     uint32_t voiceLimit = 4096u;      // BASS_ATTRIB_MIDI_VOICES -> session pool
@@ -67,6 +118,34 @@ struct BassStream {
     // Events accumulated from BASS_MIDI_StreamEvents, sorted by frame at
     // render time and consumed as the pull cursor passes them.
     std::vector<SVMS_OfflineEvent> pending;
+    std::vector<BassDspEntry> dsps;   // BASS_ChannelSetDSP chain (bassenc installs one)
+    float fxVolume = 1.0f;            // BASS_FX_VOLUME target (BASS_ChannelSetFX type 9)
+    uint32_t trackCount = 1u;         // SMF track count for file streams
+    std::vector<uint64_t> trackNotes;  // note-on count per SMF track (KMC lists these)
+    // File streams: the whole SMF as frame-sorted events consumed from
+    // fileHead (no per-pull rescans); `pending` still takes live events.
+    std::vector<SVMS_OfflineEvent> fileEvents;
+    std::unique_ptr<BassFileFeed> feed;  // set instead of fileEvents for huge files
+    size_t fileHead = 0u;
+    bool fileStream = false;
+    // KMC/BASSMIDI imitation: the in-process note-table renderer (bassmidi mode),
+    // created on the first pull and read forward in step with the stream.
+    bool kmcMode = false;
+    std::wstring midiPath;
+    void* kmc = nullptr;
+    // KMC 18.2.8's bassmidi.dll holds every note at least ~4 ms (measured). In hold
+    // mode a file note-off closer than that to its key's last note-on moves out to
+    // note-on + holdFrames, the same rule as events.min_note_ms in the realtime
+    // compiler. 0 = off (exact timing).
+    uint32_t holdFrames = 0u;
+    uint64_t fileSeq = 0u;
+    int64_t lastOn[16 * 128];
+    std::priority_queue<BassFileEv, std::vector<BassFileEv>, std::greater<BassFileEv>> heldOffs;
+    BassStream() { std::fill(std::begin(lastOn), std::end(lastOn), INT64_MIN / 4); }
+    BassStream(const BassStream&) = delete;
+    ~BassStream() {
+        if (kmc) SvmsBassKmcApi()->Close(kmc);
+    }
     // Per-stream pending events whose frame_offset landed beyond the
     // current render_offline call's window stay here with ABSOLUTE frames;
     // they are re-based at the next pull.
@@ -83,6 +162,7 @@ struct BassFont {
 std::mutex g_bassMutex;
 std::vector<std::unique_ptr<BassStream>> g_bassStreams;
 std::vector<BassFont> g_bassFonts;
+std::vector<BassFxEntry> g_bassFx;
 // Default soundfont configuration (BASS_MIDI_StreamSetFonts with handle 0):
 // applied by subsequently created streams. Earlier entries have priority
 // (BASSMIDI rule, Bass.Net.xml StreamSetFonts docs).
@@ -255,6 +335,7 @@ void BassLog(const char* fmt, ...) {
     BassLogWrite(fmt, args);
     va_end(args);
 }
+#define SVMS_ILLPARAM() (BassLogNow("BASS_ERROR_ILLPARAM set in %s:%d", __func__, __LINE__), 20)
 
 SVMS_OfflineEvent BassPackEvent(uint32_t frame, uint32_t message) {
     SVMS_OfflineEvent ev{};
@@ -336,6 +417,312 @@ bool BassTranslateMidiEvent(DWORD type, DWORD param, DWORD chan,
     }
 }
 
+// ── MIDI file loading for BASS_MIDI_StreamCreateFile ─────────────────────
+// BASSMIDI decode streams parse the MIDI file themselves; the shim does the
+// same with a streaming SMF reader and converts every channel event to its
+// exact output frame (tempo map included) so the engine sees what a BASSMIDI
+// file stream would feed it. Meta events other than tempo and all SysEx are
+// skipped. Memory guard: BASSMIDI keeps the whole file's events too, but a
+// shim holding 16-byte records must not eat the machine — refused past
+// kBassMaxFileEvents with BASS_ERROR_MEM.
+
+constexpr uint64_t kBassMaxFileEvents = 120000000ull;
+// Files at least this big (and read from a path) take the streaming feed.
+constexpr uint64_t kBassStreamFileBytes = 256ull << 20;
+
+// SVMS_BASS_STREAM_MB overrides the threshold (testing the feed on small files).
+uint64_t BassStreamFileBytes() {
+    char text[16] = {};
+    if (GetEnvironmentVariableA("SVMS_BASS_STREAM_MB", text, sizeof(text)) != 0u)
+        return static_cast<uint64_t>(std::strtoul(text, nullptr, 10)) << 20;
+    return kBassStreamFileBytes;
+}
+
+bool BassFeedSink(const svms::PackedMidiEvent& e, void* user) {
+    auto* f = static_cast<BassFileFeed*>(user);
+    return f->ring.Push(e, f->cancel);
+}
+bool BassCountSink(const svms::PackedMidiEvent&, void*) { return true; }
+
+// KMC opens a file once to parse it and again to convert it, and a re-run opens it a third time.
+// The scan (length + note-ons per track) only depends on the file and the rate, so it is kept in
+// %TEMP% keyed by path, size, write time and rate; a repeat open skips the 17 GB read entirely.
+struct BassMeasureKey {
+    std::wstring path; uint64_t size = 0, mtime = 0; uint32_t rate = 0;
+};
+bool BassMeasureKeyOf(const std::wstring& path, uint32_t rate, BassMeasureKey& k) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return false;
+    k.path = path; k.rate = rate;
+    k.size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+    k.mtime = (uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+std::wstring BassMeasureCachePath(const BassMeasureKey& k) {
+    uint64_t h = 1469598103934665603ull;  // FNV-1a over path, size, mtime, rate
+    auto mix = [&](const void* p, size_t n) {
+        for (size_t i = 0; i < n; ++i) { h ^= static_cast<const uint8_t*>(p)[i]; h *= 1099511628211ull; }
+    };
+    mix(k.path.data(), k.path.size() * sizeof(wchar_t)); mix(&k.size, 8); mix(&k.mtime, 8); mix(&k.rate, 4);
+    wchar_t tmp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmp);
+    wchar_t name[40];
+    swprintf(name, 40, L"svms_midi_%016llx.bin", static_cast<unsigned long long>(h));
+    return std::wstring(tmp) + name;
+}
+bool BassMeasureLoad(const BassMeasureKey& k, uint64_t& frames, std::vector<uint64_t>& notes) {
+    FILE* f = _wfopen(BassMeasureCachePath(k).c_str(), L"rb");
+    if (!f) return false;
+    uint64_t head[5] = {};
+    bool ok = std::fread(head, 8, 5, f) == 5 && head[0] == 0x31434d5653ull && head[1] == k.size &&
+              head[2] == k.mtime && head[3] == k.rate && head[4] < (1ull << 24);
+    if (ok) {
+        notes.resize(static_cast<size_t>(head[4]));
+        ok = std::fread(&frames, 8, 1, f) == 1 &&
+             (notes.empty() || std::fread(notes.data(), 8, notes.size(), f) == notes.size());
+    }
+    std::fclose(f);
+    return ok;
+}
+void BassMeasureStore(const BassMeasureKey& k, uint64_t frames, const std::vector<uint64_t>& notes) {
+    FILE* f = _wfopen(BassMeasureCachePath(k).c_str(), L"wb");
+    if (!f) return;
+    const uint64_t head[5] = {0x31434d5653ull, k.size, k.mtime, k.rate, notes.size()};
+    std::fwrite(head, 8, 5, f); std::fwrite(&frames, 8, 1, f);
+    if (!notes.empty()) std::fwrite(notes.data(), 8, notes.size(), f);
+    std::fclose(f);
+}
+
+void BassFeedStart(BassFileFeed& f) {
+    if (f.thread.joinable()) return;
+    f.thread = std::thread([&f] {
+        svms::ParallelMidiDecoder decoder;
+        svms::MidiStreamInfo info;
+        decoder.Decode(f.file, f.sampleRate, BassFeedSink, &f, &f.cancel, &info, f.error);
+        f.done.store(true, std::memory_order_release);
+    });
+}
+
+// Next file event (frame-sorted) without consuming it; false = none left.
+// A streamed file waits for the producer rather than reporting a false end.
+bool BassFilePeek(BassStream& s, uint32_t& frame, uint32_t& message) {
+    if (BassFileFeed* f = s.feed.get()) {
+        if (!f->hasHead) {
+            BassFeedStart(*f);
+            for (;;) {
+                if (f->ring.Pop(f->head)) { f->hasHead = true; break; }
+                if (f->done.load(std::memory_order_acquire)) {
+                    if (!f->ring.Pop(f->head)) return false;
+                    f->hasHead = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+        frame = static_cast<uint32_t>((std::min<uint64_t>)(f->head.outputFrame, UINT32_MAX));
+        message = f->head.message;
+        return true;
+    }
+    if (s.fileHead >= s.fileEvents.size()) return false;
+    frame = s.fileEvents[s.fileHead].frame_offset;
+    message = s.fileEvents[s.fileHead].packed_message;
+    return true;
+}
+void BassFilePop(BassStream& s) {
+    if (s.feed) s.feed->hasHead = false; else ++s.fileHead;
+}
+
+// Directory of this DLL (the shim, svms_v3_render.exe and the mode flag live there).
+std::wstring BassModuleDir() {
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&BassModuleDir), &module);
+    wchar_t buf[MAX_PATH * 2] = {};
+    GetModuleFileNameW(module, buf, static_cast<DWORD>(sizeof(buf) / sizeof(buf[0])));
+    std::wstring dir = buf;
+    const size_t slash = dir.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? L"." : dir.substr(0, slash);
+}
+
+// Mode: 0 exact engine (default), 1 exact engine + ~4 ms minimum note (the 2018 KMC
+// buzz), 2 the note-table imitation. Chosen by SVMS_BASS_MODE=exact|bassmidi|notetable,
+// or by an empty file next to this DLL: svms_bassmidi_mode (1) / svms_notetable_mode (2).
+int BassModeSelect() {
+    char text[16] = {};
+    if (GetEnvironmentVariableA("SVMS_BASS_MODE", text, sizeof(text)) != 0u)
+        return std::strcmp(text, "bassmidi") == 0 ? 1 : std::strcmp(text, "notetable") == 0 ? 2 : 0;
+    const std::wstring dir = BassModuleDir();
+    if (GetFileAttributesW((dir + L"\\svms_notetable_mode").c_str()) != INVALID_FILE_ATTRIBUTES) return 2;
+    if (GetFileAttributesW((dir + L"\\svms_bassmidi_mode").c_str()) != INVALID_FILE_ATTRIBUTES) return 1;
+    return 0;
+}
+
+// Hold mode: true when the note-off was queued for a later frame instead.
+bool BassHoldDelays(BassStream& s, uint32_t frame, uint32_t message, uint64_t seq) {
+    const uint32_t type = message & 0xf0u, key = (message >> 8) & 0xffu;
+    if (key >= 128u) return false;
+    int64_t& lastOn = s.lastOn[(message & 0x0fu) * 128u + key];
+    const bool noteOn = type == 0x90u && ((message >> 16) & 0x7fu) != 0u;
+    if (noteOn) { lastOn = frame; return false; }
+    if ((type == 0x80u || type == 0x90u) && static_cast<int64_t>(frame) < lastOn + s.holdFrames) {
+        s.heldOffs.push({static_cast<uint32_t>(lastOn + s.holdFrames), seq, message});
+        return true;
+    }
+    return false;
+}
+
+// Only the bass.dll build links the renderer; elsewhere the stub answers null
+// and a KMC-mode stream cannot be created.
+extern "C" const SvmsKmcApi* SvmsBassKmcApiStub() { return nullptr; }
+#if defined(_MSC_VER)
+#pragma comment(linker, "/alternatename:SvmsBassKmcApi=SvmsBassKmcApiStub")
+#endif
+
+// Fills scratchLeft/Right with the next `n` frames of the imitation (forward only).
+void BassKmcRead(BassStream& s, uint32_t n) {
+    if (!s.kmc) {
+        const SvmsKmcApi* api = SvmsBassKmcApi();
+        if (api) s.kmc = api->Open(s.midiPath.c_str(), s.fontPath.c_str(), s.sampleRate, s.voiceLimit);
+        BassLogNow("KMC mode: renderer %s ('%ls', %u voices)", s.kmc ? "started" : "unavailable",
+                   s.midiPath.c_str(), s.voiceLimit);
+    }
+    if (!s.kmc) {
+        std::fill(s.scratchLeft.begin(), s.scratchLeft.begin() + n, 0.0f);
+        std::fill(s.scratchRight.begin(), s.scratchRight.begin() + n, 0.0f);
+        return;
+    }
+    SvmsBassKmcApi()->Read(s.kmc, s.scratchLeft.data(), s.scratchRight.data(), n);
+}
+
+struct BassMidiReader {
+    HANDLE file = INVALID_HANDLE_VALUE;
+    const uint8_t* mem = nullptr;   // memory source (whole block)
+    size_t memLen = 0;
+    std::vector<uint8_t> window;    // file read window
+    size_t pos = 0, len = 0;
+    uint64_t trackLeft = 0;         // bytes left in the current track chunk
+
+    bool Refill() {
+        if (file == INVALID_HANDLE_VALUE) return false;
+        window.resize(1u << 18);
+        DWORD got = 0;
+        if (!ReadFile(file, window.data(), static_cast<DWORD>(window.size()), &got, nullptr) || got == 0u)
+            return false;
+        pos = 0; len = got;
+        return true;
+    }
+    int Raw() {
+        if (mem) return pos < memLen ? mem[pos++] : -1;
+        if (pos == len && !Refill()) return -1;
+        return window[pos++];
+    }
+    bool Read(void* out, size_t n) {
+        auto* o = static_cast<uint8_t*>(out);
+        for (size_t i = 0; i < n; ++i) { const int c = Raw(); if (c < 0) return false; o[i] = static_cast<uint8_t>(c); }
+        return true;
+    }
+    // Byte inside the current track chunk; -1 at the chunk end.
+    int Get() { if (trackLeft == 0u) return -1; const int c = Raw(); if (c >= 0) --trackLeft; return c; }
+    void SkipTrackRest() {
+        uint64_t n = trackLeft; trackLeft = 0;
+        if (mem) { pos = static_cast<size_t>((std::min<uint64_t>)(memLen, pos + n)); return; }
+        const uint64_t inWindow = len - pos;
+        if (n <= inWindow) { pos += static_cast<size_t>(n); return; }
+        n -= inWindow; pos = len = 0;
+        LARGE_INTEGER d; d.QuadPart = static_cast<LONGLONG>(n);
+        SetFilePointerEx(file, d, nullptr, FILE_CURRENT);
+    }
+};
+
+struct BassMidiEv { uint64_t tick; uint32_t msg; uint32_t track; };
+
+// Returns 0 on success, else a BASS error code (6 format, 1 memory, 2 file).
+int BassParseMidi(BassMidiReader& r, uint32_t sampleRate,
+                  std::vector<SVMS_OfflineEvent>& out, uint64_t& lastFrame,
+                  uint32_t& firstTempoUs, uint32_t& trackCount,
+                  std::vector<uint64_t>& trackNotes) {
+    uint8_t head[14];
+    if (!r.Read(head, 14) || std::memcmp(head, "MThd", 4) != 0) return 2;
+    const uint32_t ntrk = (head[10] << 8) | head[11];
+    const uint32_t div = (head[12] << 8) | head[13];
+    if (div == 0u || (div & 0x8000u) != 0u) return 6;  // SMPTE timing unsupported
+    trackCount = ntrk;
+    trackNotes.assign(ntrk, 0u);
+    std::vector<BassMidiEv> evs;
+    std::vector<std::pair<uint64_t, uint32_t>> tempos;  // (tick, us per quarter note)
+    for (uint32_t t = 0u; t < ntrk; ++t) {
+        uint8_t ch[8];
+        if (!r.Read(ch, 8)) break;
+        if (std::memcmp(ch, "MTrk", 4) != 0) return 2;
+        r.trackLeft = (static_cast<uint64_t>(ch[4]) << 24) | (ch[5] << 16) | (ch[6] << 8) | ch[7];
+        uint64_t tick = 0u; int status = 0;
+        auto vlq = [&](uint32_t& v) {
+            v = 0u;
+            for (int i = 0; i < 5; ++i) {
+                const int c = r.Get(); if (c < 0) return false;
+                v = (v << 7) | static_cast<uint32_t>(c & 0x7f);
+                if ((c & 0x80) == 0) return true;
+            }
+            return false;
+        };
+        for (;;) {
+            uint32_t d;
+            if (!vlq(d)) break;
+            tick += d;
+            const int s = r.Get(); if (s < 0) break;
+            if (s == 0xFF) {
+                const int ty = r.Get(); uint32_t l;
+                if (ty < 0 || !vlq(l)) break;
+                uint8_t data[3] = {};
+                for (uint32_t i = 0; i < l; ++i) { const int c = r.Get(); if (c < 0) break; if (i < 3u) data[i] = static_cast<uint8_t>(c); }
+                if (ty == 0x51 && l == 3u)
+                    tempos.push_back({tick, (static_cast<uint32_t>(data[0]) << 16) | (static_cast<uint32_t>(data[1]) << 8) | data[2]});
+                if (ty == 0x2F) break;
+                continue;
+            }
+            if (s == 0xF0 || s == 0xF7) {
+                uint32_t l; if (!vlq(l)) break;
+                for (uint32_t i = 0; i < l; ++i) if (r.Get() < 0) break;
+                continue;
+            }
+            int a;
+            if (s & 0x80) { status = s; a = r.Get(); } else a = s;  // running status
+            if (a < 0 || status == 0) break;
+            const int k = status & 0xF0;
+            int b = 0;
+            if (k != 0xC0 && k != 0xD0) { b = r.Get(); if (b < 0) break; }
+            if (evs.size() >= kBassMaxFileEvents) return 1;
+            if (k == 0x90 && b != 0) ++trackNotes[t];
+            evs.push_back({tick, static_cast<uint32_t>(status) | (static_cast<uint32_t>(a) << 8) | (static_cast<uint32_t>(b) << 16), t});
+        }
+        r.SkipTrackRest();
+    }
+    std::stable_sort(tempos.begin(), tempos.end(),
+                     [](const auto& x, const auto& y) { return x.first < y.first; });
+    firstTempoUs = tempos.empty() ? 500000u : tempos.front().second;
+    // Merge the tracks into one timeline; equal ticks keep track order.
+    std::stable_sort(evs.begin(), evs.end(),
+                     [](const BassMidiEv& x, const BassMidiEv& y) { return x.tick < y.tick; });
+    out.reserve(out.size() + evs.size());
+    size_t ti = 0; double secAtTempo = 0.0; uint64_t tickAtTempo = 0u; uint32_t usPerQn = 500000u;
+    lastFrame = 0u;
+    for (const BassMidiEv& e : evs) {
+        while (ti < tempos.size() && tempos[ti].first <= e.tick) {
+            secAtTempo += static_cast<double>(tempos[ti].first - tickAtTempo) * usPerQn / div / 1e6;
+            tickAtTempo = tempos[ti].first; usPerQn = tempos[ti].second; ++ti;
+        }
+        const double sec = secAtTempo + static_cast<double>(e.tick - tickAtTempo) * usPerQn / div / 1e6;
+        const uint64_t frame = static_cast<uint64_t>(sec * sampleRate);
+        const uint32_t f32 = static_cast<uint32_t>((std::min<uint64_t>)(frame, UINT32_MAX));
+        SVMS_OfflineEvent ev{};
+        ev.frame_offset = f32; ev.packed_message = e.msg;
+        out.push_back(ev);
+        lastFrame = (std::max<uint64_t>)(lastFrame, f32);
+    }
+    return 0;
+}
+
 } // namespace
 
 // Wall-clock ms for the live-pump quiescence check. GetTickCount64 is
@@ -380,8 +767,10 @@ DWORD WINAPI BASS_GetConfig(DWORD option) {
 }
 
 DWORD WINAPI BASS_GetVersion(void) {
-    // 2.4.4 - .NET BASS wrappers version-check before their first call.
-    return 0x02040400u;
+    // 2.4.14.0 - .NET BASS wrappers and add-ons (BASS_VST, bassenc) version-check
+    // before their first call; real bass.dll builds on KMC machines report
+    // 2.4.13.41 .. 2.4.17.4, so claim a value inside that range.
+    return 0x02040e00u;
 }
 
 int WINAPI BASS_ErrorGetCode(void) {
@@ -392,7 +781,7 @@ int WINAPI BASS_ErrorGetCode(void) {
 HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     if (!file) {
-        g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+        g_bassLastError = SVMS_ILLPARAM();  // BASS_ERROR_ILLPARAM
         return 0u;
     }
     constexpr DWORD kBassUnicode = 0x40000000u;
@@ -438,6 +827,7 @@ BOOL WINAPI BASS_MIDI_FontLoad(HSOUNDFONT handle, int preset, int bank) {
     }
     // The full font materializes when the session is created; per-preset
     // load accounting is not represented.
+    g_bassLastError = 0;
     return TRUE;
 }
 
@@ -454,8 +844,10 @@ BOOL WINAPI BASS_MIDI_FontFree(HSOUNDFONT handle) {
 BOOL WINAPI BASS_MIDI_StreamSetFonts(HSTREAM handle, const void* fonts,
                                      DWORD count) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassLogNow("StreamSetFonts: handle=%u fonts=%p count=%#X",
+            handle, fonts, count);
     if (!fonts && (count & 0xffffffu) != 0u) {
-        g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+        g_bassLastError = SVMS_ILLPARAM();  // BASS_ERROR_ILLPARAM
         return FALSE;
     }
     // The count parameter doubles as the entry-format carrier (verified by
@@ -467,9 +859,9 @@ BOOL WINAPI BASS_MIDI_StreamSetFonts(HSTREAM handle, const void* fonts,
     const DWORD format = count & 0x3000000u;
     const DWORD entries = count & 0xffffffu;
     if (format == 0x2000000u) {
-        BassLog("StreamSetFonts(handle=%u): 64-bit-font variant unsupported",
+        BassLogNow("StreamSetFonts(handle=%u): 64-bit-font variant unsupported",
                 handle);
-        g_bassLastError = 20;
+        g_bassLastError = SVMS_ILLPARAM();
         return FALSE;
     }
     std::vector<BassFontMapEntry> list(entries);
@@ -497,8 +889,8 @@ BOOL WINAPI BASS_MIDI_StreamSetFonts(HSTREAM handle, const void* fonts,
                                           i * 12u + 8u, 4u);
         }
         if (!BassFontResolve(entry.font)) {
-            g_bassLastError = 20;  // BASS_ERROR_ILLPARAM: bad font handle
-            BassLog("StreamSetFonts(handle=%u): entry %u has bad font %u",
+            g_bassLastError = SVMS_ILLPARAM();  // BASS_ERROR_ILLPARAM: bad font handle
+            BassLogNow("StreamSetFonts(handle=%u): entry %u has bad font %u",
                     handle, i, entry.font);
             return FALSE;
         }
@@ -510,7 +902,7 @@ BOOL WINAPI BASS_MIDI_StreamSetFonts(HSTREAM handle, const void* fonts,
     }
     if (handle == 0u) {
         g_bassDefaultFonts = std::move(list);
-        BassLog("StreamSetFonts(handle=0): default config, %u entries",
+        BassLogNow("StreamSetFonts(handle=0): default config, %u entries",
                 entries);
     } else {
         stream->fontConfig = std::move(list);
@@ -520,20 +912,20 @@ BOOL WINAPI BASS_MIDI_StreamSetFonts(HSTREAM handle, const void* fonts,
         const wchar_t* path = BassResolveFontPath(stream->fontConfig);
         if (path && stream->renderedFrames == 0u &&
             path != stream->fontPath) {
-            BassLog("StreamSetFonts(handle=%u): font switch '%ls' -> '%ls'",
+            BassLogNow("StreamSetFonts(handle=%u): font switch '%ls' -> '%ls'",
                     handle, stream->fontPath.c_str(), path);
             BassApplyStreamFont(*stream, path, stream->voiceLimit);
         } else {
-            BassLog("StreamSetFonts(handle=%u): %u entries (font unchanged)",
+            BassLogNow("StreamSetFonts(handle=%u): %u entries (font unchanged)",
                     handle, entries);
         }
     }
+    g_bassLastError = 0;
     return TRUE;
 }
 
-HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
-                                      DWORD freq) {
-    std::lock_guard<std::mutex> lock(g_bassMutex);
+static HSTREAM BassCreateStreamLocked(DWORD channels, DWORD flags,
+                                      DWORD freq, bool allowNoFont = false) {
     // First parameter = the stream's MIDI channel count (Kiva passes 16 and
     // then also sets BASS_ATTRIB_MIDI_CHANS); output is always the engine's
     // stereo pair regardless.
@@ -570,6 +962,16 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
             }
         }
     }
+    if (!fontPath && allowNoFont) {
+        // File streams are created before the host loads its fonts (KMC adds
+        // MIDIs, reads their length and note counts, and only then calls
+        // StreamSetFonts): the session is built when the font list arrives.
+        BassLogNow("StreamCreate: no soundfont yet (file stream), handle=%u",
+                   static_cast<uint32_t>(g_bassStreams.size() + 1u));
+        g_bassStreams.push_back(std::move(stream));
+        g_bassLastError = 0;
+        return static_cast<HSTREAM>(g_bassStreams.size());
+    }
     if (!fontPath) {
         g_bassLastError = 21;  // BASS_ERROR_NOTAVAIL: no soundfont
         return 0u;
@@ -590,12 +992,146 @@ HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
     return static_cast<HSTREAM>(g_bassStreams.size());  // 1-based handle
 }
 
+HSTREAM WINAPI BASS_MIDI_StreamCreate(DWORD channels, DWORD flags,
+                                      DWORD freq) {
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    return BassCreateStreamLocked(channels, flags, freq);
+}
+
+// BASSMIDI file stream: the shim parses the SMF itself (see BassParseMidi)
+// and queues every event at its exact frame, TIME-anchored like a batch
+// pump so the render-ahead cache applies. mem=TRUE reads from a memory block
+// of `length` bytes; otherwise `file` is a path (UTF-16 when BASS_UNICODE or
+// UTF-16-shaped, else UTF-8/ANSI), `offset` bytes into the file.
+HSTREAM WINAPI BASS_MIDI_StreamCreateFile(BOOL mem, const void* file,
+                                          unsigned long long offset,
+                                          unsigned long long length,
+                                          DWORD flags, DWORD freq) {
+    BassMidiReader reader;
+    std::wstring path;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    if (!file) {
+        std::lock_guard<std::mutex> lock(g_bassMutex);
+        g_bassLastError = SVMS_ILLPARAM();
+        return 0u;
+    }
+    if (mem) {
+        reader.mem = static_cast<const uint8_t*>(file) + static_cast<size_t>(offset);
+        reader.memLen = static_cast<size_t>(length);
+    } else {
+        const char* utf8 = static_cast<const char*>(file);
+        const bool wide = (flags & 0x80000000u) != 0u || (utf8[0] != 0 && utf8[1] == 0);
+        if (wide) {
+            path = static_cast<const wchar_t*>(file);
+        } else {
+            const int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+            path.assign(n > 0 ? n - 1 : 0, L'\0');
+            if (n > 1) MultiByteToWideChar(CP_UTF8, 0, utf8, -1, path.data(), n);
+        }
+        handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            std::lock_guard<std::mutex> lock(g_bassMutex);
+            g_bassLastError = 2;  // BASS_ERROR_FILEOPEN
+            return 0u;
+        }
+        if (offset != 0u) {
+            LARGE_INTEGER d; d.QuadPart = static_cast<LONGLONG>(offset);
+            SetFilePointerEx(handle, d, nullptr, FILE_BEGIN);
+        }
+        reader.file = handle;
+    }
+    const uint32_t rate = freq != 0u ? freq : g_bassInitRate;
+    std::vector<SVMS_OfflineEvent> events;
+    uint64_t lastFrame = 0u;
+    uint32_t tempoUs = 500000u, tracks = 0u;
+    std::vector<uint64_t> trackNotes;
+    std::unique_ptr<BassFileFeed> feed;
+    int rc = 0;
+    LARGE_INTEGER fileSize{};
+    const int bassMode = BassModeSelect();
+    {
+        // Hold mode also takes BASSMIDI's voice admission; SVMS_BASS_STEAL_REJECT=0/1 overrides.
+        char flag[8] = {};
+        const bool forced = GetEnvironmentVariableA("SVMS_BASS_STEAL_REJECT", flag, sizeof(flag)) != 0u;
+        svms::g_nativeOfflineStealReject.store(forced ? flag[0] == '1' : bassMode == 1);
+        char ageless[8] = {};
+        const bool agelessForced = GetEnvironmentVariableA("SVMS_BASS_AGELESS", ageless, sizeof(ageless)) != 0u;
+        svms::g_nativeOfflineStealAgeless.store(agelessForced ? ageless[0] == '1' : bassMode == 1);
+    }
+    const bool kmcMode = handle != INVALID_HANDLE_VALUE && offset == 0u && bassMode == 2;
+    if (handle != INVALID_HANDLE_VALUE && offset == 0u &&
+        (kmcMode || (GetFileSizeEx(handle, &fileSize) &&
+                     static_cast<uint64_t>(fileSize.QuadPart) >= BassStreamFileBytes()))) {
+        // One counting pass (parallel, nothing stored) gives the length and
+        // note total; the events are decoded again, lazily, while rendering.
+        // Per-track counts are not kept: the total is reported on track 0.
+        CloseHandle(handle);
+        handle = INVALID_HANDLE_VALUE;
+        feed = std::make_unique<BassFileFeed>(128u);
+        feed->sampleRate = rate;
+        svms::MidiStreamInfo info;
+        std::atomic<bool> noCancel{false};
+        std::string error;
+        if (!feed->ring.IsValid()) rc = 1;
+        else if (!feed->file.Open(path.c_str(), error)) rc = 2;
+        else {
+            BassMeasureKey key;
+            const bool keyed = BassMeasureKeyOf(path, rate, key);
+            const auto t0 = std::chrono::steady_clock::now();
+            if (keyed && BassMeasureLoad(key, lastFrame, trackNotes)) {
+                tracks = static_cast<uint32_t>(trackNotes.size());
+                BassLogNow("StreamCreateFile: scan cache hit");
+            } else if (!svms::ParallelMidiDecoder::MeasureDuration(feed->file, rate, lastFrame, error,
+                                                                   &noCancel, 0u, &trackNotes)) {
+                // The minimal skipper (deltas, tempo, note-on count per track) replaces a full
+                // decode pass: same length, per-track note counts, a fraction of the time.
+                BassLogNow("StreamCreateFile: stream measure failed: %s", error.c_str());
+                rc = 2;
+            } else {
+                tracks = static_cast<uint32_t>(trackNotes.size());
+                if (keyed) BassMeasureStore(key, lastFrame, trackNotes);
+                BassLogNow("StreamCreateFile: scanned in %.1f s",
+                           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+        }
+    } else {
+        rc = BassParseMidi(reader, rate, events, lastFrame, tempoUs, tracks, trackNotes);
+    }
+    if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    if (rc != 0) {
+        BassLogNow("StreamCreateFile: parse failed rc=%d", rc);
+        g_bassLastError = rc;
+        return 0u;
+    }
+    // MIDI streams are always 16 channels, float or 16-bit per the flags.
+    const HSTREAM stream = BassCreateStreamLocked(16u, flags, freq, true);
+    if (stream == 0u) return 0u;  // error code set by the creator
+    BassStream* s = BassStreamResolve(stream);
+    s->fileEvents = std::move(events);
+    s->feed = std::move(feed);
+    s->kmcMode = kmcMode;
+    if (bassMode == 1) s->holdFrames = rate * 4u / 1000u;
+    if (kmcMode) s->midiPath = path;
+    s->fileStream = true;
+    s->maxEventFrame = lastFrame;
+    s->sawTimeEvents = true;
+    s->trackCount = tracks;
+    s->trackNotes = std::move(trackNotes);
+    s->eventState[(0u << 24u) | 62u] = tempoUs;  // MIDI_EVENT_TEMPO (us per quarter note)
+    BassLogNow("StreamCreateFile: %s%zu events, last frame %llu, tempo %u us, tracks %u -> handle=%u",
+               s->feed ? "streamed, " : "", s->fileEvents.size(), static_cast<unsigned long long>(lastFrame), tempoUs, tracks, stream);
+    g_bassLastError = 0;
+    return stream;
+}
+
 DWORD WINAPI BASS_MIDI_StreamEvents(HSTREAM handle, DWORD mode,
                                     const void* events, DWORD length) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     BassStream* stream = BassStreamResolve(handle);
     if (!stream || !events || length == 0u) {
-        g_bassLastError = 20;
+        g_bassLastError = SVMS_ILLPARAM();
         return 0u;
     }
     // bassmidi.h event modes — values verified by reflecting
@@ -740,7 +1276,9 @@ DWORD WINAPI BASS_MIDI_StreamEvent(HSTREAM handle, DWORD chan, DWORD type,
                                    DWORD param) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     BassStream* stream = BassStreamResolve(handle);
-    if (!stream || !stream->session || chan >= 16u) {
+    // No session needed: file streams exist before the host loads its fonts, and
+    // KMC sets the tempo at that point; the event simply queues for frame 0.
+    if (!stream || chan >= 16u) {
         g_bassLastError = stream ? 20 : 5;  // BASS_ERROR_HANDLE
         return static_cast<DWORD>(-1);
     }
@@ -786,6 +1324,7 @@ DWORD WINAPI BASS_MIDI_GetVersion(void) {
 BOOL WINAPI BASS_MIDI_StreamLoadSamples(HSTREAM handle) {
     (void)handle;
     // Samples load on demand in this engine; nothing to preload.
+    g_bassLastError = 0;
     return TRUE;
 }
 
@@ -794,6 +1333,7 @@ BOOL WINAPI BASS_MIDI_StreamSetFilter(HSTREAM handle, BOOL time,
     (void)handle; (void)time; (void)speed;
     // Decode streams render as fast as pulled; a playback filter does not
     // apply.
+    g_bassLastError = 0;
     return TRUE;
 }
 
@@ -836,21 +1376,11 @@ BOOL WINAPI BASS_MIDI_FontUnload(HSOUNDFONT handle, int preset, int bank) {
 // parser — prerender hosts of the BPFA/PGFA family use StreamCreate +
 // StreamEvents instead (verified against the decompiles).
 
-HSTREAM WINAPI BASS_MIDI_StreamCreateFile(BOOL mem, const void* file,
-                                          unsigned long long offset,
-                                          unsigned long long length,
-                                          DWORD flags, DWORD freq) {
-    (void)mem; (void)file; (void)offset; (void)length; (void)flags;
-    (void)freq;
-    std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 2;  // BASS_ERROR_FILEOPEN
-    return 0u;
-}
-
 HSTREAM WINAPI BASS_MIDI_StreamCreateURL(const char* url, DWORD offset,
                                          DWORD flags, DWORD freq) {
     (void)url; (void)offset; (void)flags; (void)freq;
     std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassLogNow("stub called: BASS_MIDI_StreamCreateURL -> ILLPARAM/unsupported");
     g_bassLastError = 2;  // BASS_ERROR_FILEOPEN
     return 0u;
 }
@@ -860,7 +1390,8 @@ HSTREAM WINAPI BASS_MIDI_StreamCreateFileUser(DWORD system, DWORD flags,
                                               void* user, DWORD freq) {
     (void)system; (void)flags; (void)procs; (void)user; (void)freq;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+    BassLogNow("stub called: BASS_MIDI_StreamCreateFileUser -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();  // BASS_ERROR_ILLPARAM
     return 0u;
 }
 
@@ -868,7 +1399,8 @@ HSTREAM WINAPI BASS_MIDI_StreamCreateEvents(const void* events, DWORD ppqn,
                                             DWORD flags, DWORD freq) {
     (void)events; (void)ppqn; (void)flags; (void)freq;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+    BassLogNow("stub called: BASS_MIDI_StreamCreateEvents -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();  // BASS_ERROR_ILLPARAM
     return 0u;
 }
 
@@ -876,16 +1408,28 @@ DWORD WINAPI BASS_MIDI_ConvertEvents(const void* src, DWORD count,
                                      void* dest, DWORD mode) {
     (void)src; (void)count; (void)dest; (void)mode;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    g_bassLastError = SVMS_ILLPARAM();
     return 0u;
 }
 
 DWORD WINAPI BASS_MIDI_StreamGetEvents(HSTREAM handle, DWORD chan,
                                        DWORD typefilter, void* events) {
-    (void)handle; (void)chan; (void)typefilter; (void)events;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
-    return static_cast<DWORD>(-1);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream) { g_bassLastError = 5; return static_cast<DWORD>(-1); }
+    // Counting form only (events == NULL): MIDI_EVENT_NOTES (0x20000) = the
+    // note-on count of a track (-1 = all tracks), which is what KMC lists for
+    // each MIDI. Copying the events out is not supported.
+    if (events || !stream->fileStream) { g_bassLastError = SVMS_ILLPARAM(); return static_cast<DWORD>(-1); }
+    g_bassLastError = 0;
+    if ((typefilter & 0xffffu) != 0u && typefilter != 0x20000u) return 0u;
+    if (static_cast<int>(chan) == -1) {
+        uint64_t total = 0u;
+        for (uint64_t n : stream->trackNotes) total += n;
+        return static_cast<DWORD>((std::min<uint64_t>)(total, 0xffffffffu));
+    }
+    return chan < stream->trackNotes.size()
+               ? static_cast<DWORD>((std::min<uint64_t>)(stream->trackNotes[chan], 0xffffffffu)) : 0u;
 }
 
 DWORD WINAPI BASS_MIDI_StreamGetEventsEx(HSTREAM handle, DWORD chan,
@@ -894,7 +1438,7 @@ DWORD WINAPI BASS_MIDI_StreamGetEventsEx(HSTREAM handle, DWORD chan,
     (void)handle; (void)chan; (void)typefilter; (void)events; (void)start;
     (void)count;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    g_bassLastError = SVMS_ILLPARAM();
     return static_cast<DWORD>(-1);
 }
 
@@ -902,7 +1446,7 @@ const void* WINAPI BASS_MIDI_StreamGetMark(HSTREAM handle, DWORD chan,
                                            DWORD type, DWORD index) {
     (void)handle; (void)chan; (void)type; (void)index;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    g_bassLastError = SVMS_ILLPARAM();
     return nullptr;
 }
 
@@ -918,7 +1462,8 @@ BOOL WINAPI BASS_MIDI_StreamGetPreset(HSTREAM handle, DWORD chan,
                                       void* preset) {
     (void)handle; (void)chan; (void)preset;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    BassLogNow("stub called: BASS_MIDI_StreamGetPreset -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
@@ -926,22 +1471,29 @@ DWORD WINAPI BASS_MIDI_StreamGetFonts(HSTREAM handle, void* fonts,
                                       DWORD count) {
     (void)handle; (void)fonts; (void)count;
     std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassLogNow("stub called: BASS_MIDI_StreamGetFonts -> ILLPARAM/unsupported");
     g_bassLastError = 0;
     return 0u;  // no per-stream font list is retained
 }
 
+// A MIDI channel handle is 0x7e000000 | stream << 8 | channel. It only answers
+// attribute queries (the per-channel voice counts of a host's voice window).
 DWORD WINAPI BASS_MIDI_StreamGetChannel(HSTREAM handle, DWORD chan) {
-    (void)handle; (void)chan;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
-    return 0u;
+    if (!BassStreamResolve(handle) || chan >= 16u) {
+        g_bassLastError = SVMS_ILLPARAM();  // BASS_ERROR_ILLPARAM
+        return 0u;
+    }
+    g_bassLastError = 0;
+    return 0x7e000000u | ((handle & 0xffffu) << 8) | chan;
 }
 
 HSOUNDFONT WINAPI BASS_MIDI_FontInitUser(const void* procs, void* user,
                                          DWORD flags) {
     (void)procs; (void)user; (void)flags;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+    BassLogNow("stub called: BASS_MIDI_FontInitUser -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();  // BASS_ERROR_ILLPARAM
     return 0u;
 }
 
@@ -949,7 +1501,8 @@ BOOL WINAPI BASS_MIDI_FontLoadEx(HSOUNDFONT handle, int preset, int bank,
                                  DWORD length) {
     (void)handle; (void)preset; (void)bank; (void)length;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    BassLogNow("stub called: BASS_MIDI_FontLoadEx -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
@@ -957,7 +1510,8 @@ const char* WINAPI BASS_MIDI_FontPack(HSOUNDFONT handle, const char* outfile,
                                       const char* encoder, DWORD flags) {
     (void)handle; (void)outfile; (void)encoder; (void)flags;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    BassLogNow("stub called: BASS_MIDI_FontPack -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();
     return nullptr;
 }
 
@@ -965,14 +1519,16 @@ HSOUNDFONT WINAPI BASS_MIDI_FontUnpack(HSOUNDFONT handle, const char* name,
                                        DWORD offset, DWORD length) {
     (void)handle; (void)name; (void)offset; (void)length;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    BassLogNow("stub called: BASS_MIDI_FontUnpack -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();
     return 0u;
 }
 
 BOOL WINAPI BASS_MIDI_FontGetInfo(HSOUNDFONT handle, void* info) {
     (void)handle; (void)info;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    BassLogNow("stub called: BASS_MIDI_FontGetInfo -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
@@ -980,13 +1536,15 @@ BOOL WINAPI BASS_MIDI_FontGetPreset(HSOUNDFONT handle, int preset,
                                     int bank) {
     (void)handle; (void)preset; (void)bank;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    BassLogNow("stub called: BASS_MIDI_FontGetPreset -> ILLPARAM/unsupported");
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
 DWORD WINAPI BASS_MIDI_FontGetPresets(HSOUNDFONT handle) {
     (void)handle;
     std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassLogNow("stub called: BASS_MIDI_FontGetPresets -> ILLPARAM/unsupported");
     g_bassLastError = 0;
     return 0u;
 }
@@ -994,39 +1552,39 @@ DWORD WINAPI BASS_MIDI_FontGetPresets(HSOUNDFONT handle) {
 BOOL WINAPI BASS_MIDI_InInit(DWORD device, const void* proc, void* user) {
     (void)device; (void)proc; (void)user;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
 BOOL WINAPI BASS_MIDI_InFree(DWORD device) {
     (void)device;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
 BOOL WINAPI BASS_MIDI_InStart(DWORD device) {
     (void)device;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
 BOOL WINAPI BASS_MIDI_InStop(DWORD device) {
     (void)device;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
 BOOL WINAPI BASS_MIDI_InGetDeviceInfo(DWORD device, void* info) {
     (void)device; (void)info;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    g_bassLastError = 20;
+    g_bassLastError = SVMS_ILLPARAM();
     return FALSE;
 }
 
-DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
+static DWORD BassChannelGetDataCore(DWORD handle, void* buffer, DWORD length) {
     // Flag values reflected from Bass.Net (BASSData):
     // BASS_DATA_FLOAT = 0x40000000, BASS_DATA_AVAILABLE = 0.
     // (The previous shim used 0x400, so the float bit survived the strip and
@@ -1102,7 +1660,7 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
         quietMs = parsed;
     }
     const uint64_t nowTick = BassNowTickMs();
-    const bool pumpAlive = stream->lastSubmitTickMs != 0u &&
+    const bool pumpAlive = !stream->fileStream && stream->lastSubmitTickMs != 0u &&
         nowTick - stream->lastSubmitTickMs < quietMs;
     if (stream->servedFrames >= streamEnd && !pumpAlive) {
         g_bassLastError = 45;  // BASS_ERROR_ENDED
@@ -1140,6 +1698,8 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
             renderAhead ? stream->maxBlockFrames : want,
             streamEnd - stream->renderedFrames);
         if (chunk == 0u) break;
+        LARGE_INTEGER chunkStart{};
+        QueryPerformanceCounter(&chunkStart);
         const uint64_t windowEnd = stream->renderedFrames + chunk;
         std::vector<SVMS_OfflineEvent> window;
         std::vector<SVMS_OfflineEvent> stillPending;
@@ -1162,14 +1722,50 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
         // frame the SUBMISSION order is kept (stable sort): same-frame
         // sequences such as RPN selects before their data entry are
         // position-sensitive, so never reorder by packed message.
-        std::stable_sort(window.begin(), window.end(),
-                         [](const SVMS_OfflineEvent& a,
-                            const SVMS_OfflineEvent& b) {
-                             return a.frame_offset < b.frame_offset;
-                         });
+        const bool hadLive = !window.empty();
         stream->pending.swap(stillPending);
+        if (!stream->kmcMode) {
+            // File events (already frame-sorted) go first: ties keep file order.
+            std::vector<BassFileEv> batch;
+            uint32_t fileFrame = 0u, fileMessage = 0u;
+            bool more = BassFilePeek(*stream, fileFrame, fileMessage);
+            while (more && fileFrame < windowEnd) {
+                const uint64_t seq = stream->fileSeq++;
+                if (!stream->holdFrames || !BassHoldDelays(*stream, fileFrame, fileMessage, seq))
+                    batch.push_back({fileFrame, seq, fileMessage});
+                BassFilePop(*stream);
+                more = BassFilePeek(*stream, fileFrame, fileMessage);
+            }
+            bool delayed = false;
+            while (!stream->heldOffs.empty() && stream->heldOffs.top().frame < windowEnd) {
+                batch.push_back(stream->heldOffs.top());
+                stream->heldOffs.pop();
+                delayed = true;
+            }
+            if (delayed)
+                std::sort(batch.begin(), batch.end(),
+                          [](const BassFileEv& x, const BassFileEv& y) { return y > x; });
+            if (!batch.empty()) {
+                std::vector<SVMS_OfflineEvent> fromFile;
+                fromFile.reserve(batch.size() + window.size());
+                for (const BassFileEv& e : batch)
+                    fromFile.push_back(BassPackEvent(
+                        static_cast<uint32_t>(e.frame - static_cast<uint32_t>(stream->renderedFrames)),
+                        e.message));
+                fromFile.insert(fromFile.end(), window.begin(), window.end());
+                window.swap(fromFile);
+            }
+        }
+        if (hadLive)
+            std::stable_sort(window.begin(), window.end(),
+                             [](const SVMS_OfflineEvent& a,
+                                const SVMS_OfflineEvent& b) {
+                                 return a.frame_offset < b.frame_offset;
+                             });
 
-        if (NativeRenderOffline(stream->session, window.data(),
+        if (stream->kmcMode) BassKmcRead(*stream, chunk);
+        if (!stream->kmcMode &&
+            NativeRenderOffline(stream->session, window.data(),
                                 static_cast<uint32_t>(window.size()),
                                 stream->scratchLeft.data(),
                                 stream->scratchRight.data(),
@@ -1197,6 +1793,13 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
                 stream->cache.push_back(stream->scratchRight[f]);
         }
         stream->cacheEnd += chunk;
+        LARGE_INTEGER chunkEnd{}, freq{};
+        QueryPerformanceCounter(&chunkEnd);
+        QueryPerformanceFrequency(&freq);
+        const double load = 100.0 *
+            (double(chunkEnd.QuadPart - chunkStart.QuadPart) / double(freq.QuadPart)) /
+            (double(chunk) / double(stream->sampleRate));
+        stream->cpuLoad += 0.25f * (static_cast<float>(load) - stream->cpuLoad);
     }
 
     float* const outFloat = static_cast<float*>(buffer);
@@ -1255,6 +1858,219 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
     return renderable * bytesPerFrame;
 }
 
+// BASS_ChannelGetData as the host sees it: the core pull plus the stream's
+// FX volume and DSP chain. bassenc (BASS_Encode_Start) works by installing a
+// DSP that receives every pulled block, so KMC's WAV export runs through
+// here. DSP procs are called outside the shim lock (they may call back into
+// BASS). Higher priority runs first, like BASS.
+DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length) {
+    const DWORD got = BassChannelGetDataCore(handle, buffer, length);
+    if (got == 0u || got >= 0x80000000u || !buffer) return got;
+    std::vector<BassDspEntry> dsps;
+    float volume = 1.0f;
+    bool floating = true;
+    {
+        std::lock_guard<std::mutex> lock(g_bassMutex);
+        BassStream* stream = BassStreamResolve(handle);
+        if (!stream) return got;
+        dsps = stream->dsps;
+        volume = stream->fxVolume;
+        floating = stream->floating;
+    }
+    if (volume != 1.0f) {
+        if (floating) {
+            float* p = static_cast<float*>(buffer);
+            for (DWORD i = 0u; i < got / 4u; ++i) p[i] *= volume;
+        } else {
+            int16_t* p = static_cast<int16_t*>(buffer);
+            for (DWORD i = 0u; i < got / 2u; ++i) {
+                const float v = p[i] * volume;
+                p[i] = static_cast<int16_t>(v > 32767.0f ? 32767.0f : (v < -32768.0f ? -32768.0f : v));
+            }
+        }
+    }
+    std::stable_sort(dsps.begin(), dsps.end(),
+                     [](const BassDspEntry& a, const BassDspEntry& b) { return a.priority > b.priority; });
+    for (const BassDspEntry& d : dsps) {
+        using Proc = void(WINAPI*)(DWORD, DWORD, void*, DWORD, void*);
+        reinterpret_cast<Proc>(d.proc)(d.handle, handle, buffer, got, d.user);
+    }
+    return got;
+}
+
+DWORD WINAPI BASS_ChannelSetDSP(DWORD handle, void* proc, void* user, int priority) {
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream || !proc) { g_bassLastError = stream ? 20 : 5; return 0u; }
+    static DWORD nextDsp = 0x7d000000u;
+    BassDspEntry entry{++nextDsp, proc, user, priority};
+    stream->dsps.push_back(entry);
+    g_bassLastError = 0;
+    return entry.handle;
+}
+
+BOOL WINAPI BASS_ChannelRemoveDSP(DWORD handle, DWORD dsp) {
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream) { g_bassLastError = 5; return FALSE; }
+    const auto it = std::remove_if(stream->dsps.begin(), stream->dsps.end(),
+                                   [&](const BassDspEntry& e) { return e.handle == dsp; });
+    const bool found = it != stream->dsps.end();
+    stream->dsps.erase(it, stream->dsps.end());
+    g_bassLastError = found ? 0 : 5;
+    return found ? TRUE : FALSE;
+}
+
+// Syncs are accepted and never fire: decode pumps (KMC's tempo/end hooks)
+// only use them for display and statistics.
+DWORD WINAPI BASS_ChannelSetSync(DWORD handle, DWORD type, unsigned long long param,
+                                 void* proc, void* user) {
+    (void)type; (void)param; (void)proc; (void)user;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    if (!BassStreamResolve(handle)) { g_bassLastError = 5; return 0u; }
+    static DWORD nextSync = 0x7e000000u;
+    g_bassLastError = 0;
+    return ++nextSync;
+}
+
+BOOL WINAPI BASS_ChannelRemoveSync(DWORD handle, DWORD sync) {
+    (void)handle; (void)sync;
+    return TRUE;
+}
+
+// FX: only the volume effect (BASS_FX_VOLUME = 9) has an effect, applied to
+// the pulled samples in BASS_ChannelGetData. Other types are accepted.
+DWORD WINAPI BASS_ChannelSetFX(DWORD handle, DWORD type, int priority) {
+    (void)priority;
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    if (!BassStreamResolve(handle)) { g_bassLastError = 5; return 0u; }
+    g_bassFx.push_back({handle, type});
+    g_bassLastError = 0;
+    return 0x7f000000u + static_cast<DWORD>(g_bassFx.size());
+}
+
+BOOL WINAPI BASS_ChannelRemoveFX(DWORD handle, DWORD fx) {
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    const DWORD index = fx - 0x7f000000u;
+    if (stream && index >= 1u && index <= g_bassFx.size() && g_bassFx[index - 1u].type == 9u)
+        stream->fxVolume = 1.0f;
+    return TRUE;
+}
+
+// Tags: Bass.Net implements BASS_MIDI_StreamGetTrackCount by counting
+// BASS_TAG_MIDI_TRACK (0x11000 + track) entries until one is NULL, so every
+// real track of a file stream answers with an (empty) text entry.
+const void* WINAPI BASS_ChannelGetTags(DWORD handle, DWORD tags) {
+    static const char kEmpty[4] = {0, 0, 0, 0};
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream) { g_bassLastError = 5; return nullptr; }
+    g_bassLastError = 0;
+    if (stream->fileStream && tags >= 0x11000u && tags - 0x11000u < stream->trackCount) return kEmpty;
+    g_bassLastError = 23;  // BASS_ERROR_NOTAVAIL
+    return nullptr;
+}
+
+
+// ── Bass.Net surface stubs ────────────────────────────────────────────────
+// Bass.Net's managed wrappers touch more of bass.dll than a decode pump needs
+// (BASS_MIDI_StreamGetTrackCount alone calls BASS_GetCPU), and a missing
+// export is an EntryPointNotFoundException. These are no-op stubs for the
+// device, 3D, sample, music, plugin and record families: they report failure
+// (or success for the harmless "start/stop/update" ones) and never touch the
+// engine. x64 only: the generic zero-argument signature relies on the caller
+// owning the argument cleanup, which is not true for 32-bit stdcall.
+#if defined(_WIN64)
+extern "C" {
+__declspec(dllexport) float WINAPI BASS_GetCPU(void) { return 0.0f; }
+__declspec(dllexport) float WINAPI BASS_GetVolume(void) { return 1.0f; }
+__declspec(dllexport) DWORD WINAPI BASS_Apply3D(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelGet3DAttributes(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelGet3DPosition(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelGetAttributeEx(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelGetDevice(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelGetLevel(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelGetLevelEx(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelIsSliding(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelLock(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelPause(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelPlay(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelRemoveLink(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelSet3DAttributes(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelSet3DPosition(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelSetAttributeEx(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelSetDevice(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelSetLink(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelSlideAttribute(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelStop(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_ChannelUpdate(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_Get3DFactors(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_Get3DPosition(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_GetDSoundObject(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_GetDevice(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_GetDeviceInfo(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_GetEAXParameters(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_GetInfo(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_IsStarted(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_MusicFree(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_MusicLoad(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_Pause(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_PluginFree(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_PluginGetInfo(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_PluginLoad(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordFree(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordGetDevice(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordGetDeviceInfo(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordGetInfo(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordGetInput(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordGetInputName(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordInit(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordSetDevice(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordSetInput(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_RecordStart(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleCreate(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleFree(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleGetChannel(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleGetChannels(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleGetData(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleGetInfo(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleLoad(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleSetData(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleSetInfo(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SampleStop(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_Set3DFactors(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_Set3DPosition(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SetConfigPtr(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_SetDevice(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_SetEAXParameters(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_SetVolume(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_Start(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_Stop(void) { return 1u; }
+__declspec(dllexport) DWORD WINAPI BASS_StreamCreate(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_StreamCreateFile(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_StreamCreateFileUser(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_StreamCreateURL(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_StreamGetFilePosition(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_StreamPutData(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_StreamPutFileData(void) { return 0u; }
+__declspec(dllexport) DWORD WINAPI BASS_Update(void) { return 1u; }
+}  // extern "C"
+#endif
+
+const void* WINAPI BASS_GetConfigPtr(DWORD option) {
+    (void)option;
+    return nullptr;
+}
+
+int WINAPI BASS_MIDI_StreamGetTrackCount(HSTREAM handle) {
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    BassStream* stream = BassStreamResolve(handle);
+    if (!stream) { g_bassLastError = 5; return -1; }
+    g_bassLastError = 0;
+    return static_cast<int>(stream->trackCount);
+}
+
 unsigned long long WINAPI BASS_ChannelGetLength(DWORD handle, DWORD mode) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     BassStream* stream = BassStreamResolve(handle);
@@ -1292,7 +2108,7 @@ DWORD WINAPI BASS_ChannelIsActive(DWORD handle) {
         static_cast<uint64_t>(stream->sampleRate) * 2u;
     if (stream->servedFrames < streamEnd) return 1u;
     const uint64_t nowTick = BassNowTickMs();
-    return stream->lastSubmitTickMs != 0u &&
+    return !stream->fileStream && stream->lastSubmitTickMs != 0u &&
                    nowTick - stream->lastSubmitTickMs < 5000u
                ? 1u
                : 0u;
@@ -1332,10 +2148,11 @@ BOOL WINAPI BASS_ChannelSetAttribute(DWORD handle, DWORD attrib, float value) {
     if (attrib == kBassAttribMidiVoices) {
         if (!std::isfinite(value) || value < 1.0f ||
             value > static_cast<float>(svms::kMaxPolyphony)) {
-            g_bassLastError = 20;  // BASS_ERROR_ILLPARAM
+            g_bassLastError = SVMS_ILLPARAM();  // BASS_ERROR_ILLPARAM
             return FALSE;
         }
         const uint32_t voices = static_cast<uint32_t>(value);
+        g_bassLastError = 0;
         if (voices == stream->voiceLimit) return TRUE;
         if (stream->renderedFrames == 0u && !stream->fontPath.empty()) {
             // Prerender flows set attribs before the first pull; the
@@ -1361,8 +2178,10 @@ BOOL WINAPI BASS_ChannelSetAttribute(DWORD handle, DWORD attrib, float value) {
     if (attrib == kBassAttribMidiChans || attrib == kBassAttribMidiSrc) {
         // The engine renders a fixed 16-channel input with its own
         // interpolation; both attribs are accepted as no-ops.
+        g_bassLastError = 0;
         return TRUE;
     }
+    g_bassLastError = 0;
     return TRUE;  // permissive: unrecognized attribs succeed as no-ops
 }
 
@@ -1372,7 +2191,8 @@ BOOL WINAPI BASS_ChannelGetAttribute(DWORD handle, DWORD attrib,
     constexpr DWORD kBassAttribMidiVoicesActive = 0x12004u;
     constexpr DWORD kBassAttribMidiSrc = 0x12006u;
     std::lock_guard<std::mutex> lock(g_bassMutex);
-    BassStream* stream = BassStreamResolve(handle);
+    const bool isChannel = (handle & 0xff000000u) == 0x7e000000u;
+    BassStream* stream = BassStreamResolve(isChannel ? (handle >> 8) & 0xffffu : handle);
     if (!stream || !value) {
         g_bassLastError = stream ? 20 : 5;
         return FALSE;
@@ -1381,7 +2201,19 @@ BOOL WINAPI BASS_ChannelGetAttribute(DWORD handle, DWORD attrib,
         *value = static_cast<float>(stream->voiceLimit);
         return TRUE;
     }
+    if (isChannel && attrib == kBassAttribMidiVoicesActive) {
+        uint32_t perChannel[16] = {};
+        if (stream->kmc) SvmsBassKmcApi()->Channels(stream->kmc, perChannel);
+        else NativeGetOfflineChannelVoices(stream->session, perChannel);
+        *value = static_cast<float>(perChannel[handle & 15u]);
+        g_bassLastError = 0;
+        return TRUE;
+    }
     if (attrib == kBassAttribMidiVoicesActive) {
+        if (stream->kmc) {
+            *value = static_cast<float>(SvmsBassKmcApi()->Active(stream->kmc));
+            return TRUE;
+        }
         SVMS_OfflineTelemetry telemetry{};
         telemetry.struct_size = sizeof(telemetry);
         telemetry.struct_version = SVMS_STRUCT_VERSION_1;
@@ -1396,8 +2228,20 @@ BOOL WINAPI BASS_ChannelGetAttribute(DWORD handle, DWORD attrib,
         *value = 0.0f;  // engine's linear interpolation is not BASS's SRC
         return TRUE;
     }
-    g_bassLastError = 20;
-    return FALSE;
+    if (attrib == 7u) {  // BASS_ATTRIB_CPU
+        *value = stream->cpuLoad;
+        return TRUE;
+    }
+    // Hosts poll attribs (PPQN, STATE, SPEED, ...) from a UI
+    // thread while rendering; failing here left a stale ILLPARAM that the host
+    // then read as the error of its next, unrelated call. Report 0 and succeed.
+    static DWORD lastUnknown = 0u;
+    if (attrib != lastUnknown) {
+        lastUnknown = attrib;
+        BassLogNow("GetAttribute: unmodelled attrib %#X -> 0", attrib);
+    }
+    *value = 0.0f;
+    return TRUE;
 }
 
 BOOL WINAPI BASS_ChannelGetInfo(DWORD handle, void* info) {
@@ -1438,7 +2282,14 @@ DWORD WINAPI BASS_FXFree(DWORD handle) {
 }
 
 DWORD WINAPI BASS_FXSetParameters(DWORD handle, const void* params) {
-    (void)handle; (void)params;
+    // BASS_FX_VOLUME_PARAM { float fTarget; float fCurrent; float fTime; DWORD lCurve; }:
+    // applied instantly (fTime is ignored; KMC sets the target with time 0).
+    std::lock_guard<std::mutex> lock(g_bassMutex);
+    const DWORD index = handle - 0x7f000000u;
+    if (params && index >= 1u && index <= g_bassFx.size() && g_bassFx[index - 1u].type == 9u) {
+        BassStream* stream = BassStreamResolve(g_bassFx[index - 1u].stream);
+        if (stream) std::memcpy(&stream->fxVolume, params, sizeof(float));
+    }
     return TRUE;
 }
 
@@ -1464,6 +2315,11 @@ DWORD WINAPI BASS_ChannelFlags(HSTREAM handle, DWORD flags, DWORD mask) {
 }
 
 BOOL WINAPI BASS_StreamFree(DWORD handle) {
+    // BASS_ENCODE_AUTOFREE: an encoder dies (and a WAV gets its final sizes) with its channel.
+    // Called before the lock because stopping an encoder removes its DSP through this module.
+    if (HMODULE enc = GetModuleHandleW(L"bassenc.dll"))
+        if (auto stop = reinterpret_cast<BOOL(WINAPI*)(DWORD)>(GetProcAddress(enc, "BASS_Encode_Stop")))
+            stop(handle);
     std::lock_guard<std::mutex> lock(g_bassMutex);
     if (handle == 0u || handle > g_bassStreams.size()) return FALSE;
     if (g_bassStreams[handle - 1u]) {

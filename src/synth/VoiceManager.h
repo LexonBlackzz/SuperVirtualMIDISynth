@@ -237,6 +237,14 @@ public:
         stealReject_.store(on, std::memory_order_relaxed);
     }
     uint64_t StealRejectCount() const { return stealRejectCount_; }
+    // Opt-in (default off) BASSMIDI 2018 victim ranking: the steal score has no age
+    // term (KMC 18.2.8's bassmidi.dll ranks voices by level alone, and an equal-level
+    // newcomer loses). Pair with SetStealReject. Call before the pool is used.
+    void SetStealAgeless(bool on) {
+        stealAgeScale_ = on ? 0.0f : (1.0f / 256.0f);
+        stealHeapValid_ = false;
+        stealVolatileHeapValid_ = false;
+    }
     // True when the most recent LaunchVoiceGroup returned false because the
     // reject fired (not an allocation failure).
     bool LastLaunchRejected() const { return lastLaunchRejected_; }
@@ -498,6 +506,19 @@ public:
         stealKeyBackend_ = backend;
     }
     uint32_t GetVoiceAge(VoiceHandle handle) const;
+    // Sum of the BASS-style steal level of every active voice on (channel, note).
+    float StealLevelOfKey(uint8_t channel, uint8_t note) const {
+        float level = 0.0f;
+        ForEachChannelKeyVoice(channel, note, [&](VoiceHandle h) {
+            level += ComputeEffectiveStealLevel(h);
+        });
+        return level;
+    }
+    uint32_t VoiceCountOfKey(uint8_t channel, uint8_t note) const {
+        uint32_t n = 0;
+        ForEachChannelKeyVoice(channel, note, [&](VoiceHandle) { ++n; });
+        return n;
+    }
     uint32_t GetChannelActiveCount(uint8_t channel) const;
     template <typename Consumer>
     void ForEachChannelActive(uint8_t channel, Consumer&& consume) const noexcept;
@@ -915,9 +936,10 @@ private:
     uint32_t stealPolicy_ = 0u;  // 0 quality, 1 cursor, 2 scan
     uint32_t perKeyVoiceCap_ = 0u;  // 0 = off; else max playing voices per (channel,key)
     std::atomic<bool> stealReject_{false};  // live-togglable from the link thread
+    float stealAgeScale_ = 1.0f / 256.0f;   // score units per sample of age; 0 = ageless
     bool lastLaunchRejected_ = false;
     uint64_t stealRejectCount_ = 0u;
-    bool ShouldRejectNoteOn(const VoiceConfiguration& setup,
+    bool ShouldRejectNoteOn(const VoiceConfiguration* setups, uint32_t count,
                             const ChannelParamsSnapshot& cp,
                             uint32_t multiplicity);
     uint32_t stealScanCursor_ = 0u;  // rotating scan window (policy 2)

@@ -1,6 +1,7 @@
 #ifndef SVMS_STANDALONE_SYNTH_H
 #define SVMS_STANDALONE_SYNTH_H
 
+#include <deque>
 #include "synth/Tuning.h"
 #include "synth/ChannelCache.h"
 #include "synth/Config.h"
@@ -16,6 +17,7 @@
 #include "render/PostFilter.h"
 #include "render/RenderScalar.h"
 #include "synth/SoundFont.h"
+#include "synth/Oversample.h"
 #include "synth/VoiceManager.h"
 #include "render/VoiceFilter.h"
 
@@ -60,6 +62,7 @@ struct StandaloneSynthConfig {
     float limiterReleaseMs = 100.0f;
     uint32_t phaseRotationMode = 0u;
     uint32_t tuningEdo = 12u;
+    uint32_t oversample = 1u;  // sample-store oversampling factor (experimental)
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
     // When set, the realtime driver's voice/render tuning is applied from this
     // config (steal policy, per-key cap, ghost budget, decimation, retire
@@ -67,6 +70,10 @@ struct StandaloneSynthConfig {
     // live synth under the same settings. Null = engine defaults (BASS shim,
     // Linux daemon, tests).
     const EngineConfig* tuning = nullptr;
+    // BASSMIDI voice admission without the rest of the tuning: a full pool skips a
+    // note that is not louder than its quietest voice (VoiceManager::SetStealReject).
+    bool stealReject = false;
+    bool stealAgeless = false;  // with stealReject: BASSMIDI 2018 ranking, no age term
 };
 
 // Platform-neutral owner for the existing V3 synthesis core. Event ordering
@@ -79,6 +86,7 @@ public:
         maxVoices_ = config.maxVoices;
         master_ = config.masterVolume;
         rotationMode_ = config.phaseRotationMode;
+        oversample_ = config.oversample;
         {
             std::vector<std::wstring> paths = config.soundfonts;
             if (paths.empty()) paths.push_back(config.soundfont);
@@ -98,6 +106,12 @@ public:
             renderer_.SetMutedTailCullBlocks(t->decimationCullBlocks);
             SetFastChunkMath(t->fastChunkMath);
         }
+        if (config.stealReject) {
+            voices_.SetStealReject(true);
+            rejectPairing_ = true;
+            keyOutcome_.assign(size_t(kChannelCount) * kNoteCount, std::deque<uint8_t>());
+        }
+        if (config.stealAgeless) voices_.SetStealAgeless(true);
         if (!voices_.Initialize(maxVoices_, rate_)) {
             error = "cannot allocate voice storage";
             return false;
@@ -182,6 +196,7 @@ public:
         sysexMasterFineTune_ = 0.0f;
         sysexMasterTranspose_ = 0.0f;
         postHighPass_.Initialize(rate_);
+        postHighPass_.SetPassThrough(g_keepDcOffset || std::getenv("SVMS_NO_DCBLOCK") != nullptr);
         EngineConfig limiterConfig{};
         limiterConfig.limiterEnabled = config.limiterEnabled;
         limiterConfig.limiterAlgorithm = config.limiterAlgorithm;
@@ -228,6 +243,18 @@ public:
         // up front, so the pass runs on each block just before RenderBlock.
         // An exclusive-class SoundFont limits it to adjacent note-ons.
         noteMerge_ = collapseConfig.noteMerge;
+        if (config.stealAgeless) {
+            // BASSMIDI 2018 launches every note-on as its own voice: no merging
+            // or coalescing from the user's performance config.
+            releaseAll_ = std::getenv("SVMS_BASS_NOTEOFF_ALL") != nullptr;  // experiment only: it removes the buzz without BASSMIDI's tick-quantised release
+            holdOnset_ = 12u; holdGain_ = 0.8f;  // oracle: level and onset of the real 2018 voices
+            if (const char* v = std::getenv("SVMS_HOLD_ONSET")) holdOnset_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+            if (const char* v = std::getenv("SVMS_HOLD_GAIN")) holdGain_ = static_cast<float>(std::atof(v));
+            noteMerge_ = false;
+            noteOnCollapse_.SetThreshold(1u);
+            reExcite_ = false;
+            renderer_.SetReExciteMode(false);
+        }
         UpdateNoteMergeHoist();
         return true;
     }
@@ -470,6 +497,19 @@ public:
 #if defined(_MSC_VER)
         renderCycles_ += __rdtsc() - renderBegin;
 #endif
+        if (!rawMix_) PostProcess(left, right, frameCount);
+    }
+
+    // Key shards (offline --shards) render raw; the owner of the summed mix
+    // runs reverb + limiter once over it.
+    void SetRawMix(bool raw) { rawMix_ = raw; }
+    float StealLevel(uint8_t channel, uint8_t note) const {
+        return voices_.StealLevelOfKey(channel, note);
+    }
+    uint32_t VoiceCount(uint8_t channel, uint8_t note) const {
+        return voices_.VoiceCountOfKey(channel, note);
+    }
+    void PostProcess(float* left, float* right, uint32_t frameCount) {
         ApplyReverb(left, right, frameCount);
         limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
     }
@@ -497,19 +537,6 @@ public:
     }
 
     void SetCursor(uint64_t absoluteFrame) {
-        if (!rawMix_) PostProcess(left, right, frameCount);
-    }
-
-    // Key shards (offline --shards) render raw; the owner of the summed mix
-    // runs reverb + limiter once over it.
-    void SetRawMix(bool raw) { rawMix_ = raw; }
-    float StealLevel(uint8_t channel, uint8_t note) const {
-        return voices_.StealLevelOfKey(channel, note);
-    }
-    uint32_t VoiceCount(uint8_t channel, uint8_t note) const {
-        return voices_.VoiceCountOfKey(channel, note);
-    }
-    void PostProcess(float* left, float* right, uint32_t frameCount) {
         dispatchAbsoluteFrame_ = absoluteFrame;
         voices_.SetCurrentFrame(absoluteFrame);
     }
@@ -567,6 +594,13 @@ public:
 
     uint32_t Active() const { return voices_.GetActiveCount(); }
     uint32_t Tails() const { return voices_.GetStealTailCount(); }
+    void ChannelVoices(uint32_t (&out)[16]) const {
+        for (uint8_t c = 0; c < 16; ++c) {
+            uint32_t n = 0;
+            voices_.ForEachChannelActive(c, [&](VoiceHandle) { ++n; });
+            out[c] = n;
+        }
+    }
     uint32_t Steals() const { return voices_.stealCount_; }
     // ── Temporary dispatch-phase profiler (diagnostics only) ────────────
     struct DispatchProfile {
@@ -625,6 +659,8 @@ private:
     uint64_t dispatchAbsoluteFrame_ = 0;
     // Exact note-on merging (see Initialize / RenderWithEvents).
     bool noteMerge_ = false;
+    bool rawMix_ = false;
+    uint32_t oversample_ = 1u;
     bool noteMergeHoist_ = true;
     NoteMerger noteMerger_;
     std::vector<RenderEvent> mergeScratch_;
@@ -637,7 +673,13 @@ private:
         uint32_t indices[8]{};
     };
 
+    uint32_t holdOnset_ = 0;      // BASSMIDI-style onset ramp (frames) for hold mode, 0 = engine attack
+    float holdGain_ = 1.0f;       // level of a hold-mode voice during its first ms
     uint32_t tuningEdo_ = 12u;
+    bool releaseAll_ = false;     // BASSMIDI 2018: a note-off frees every generation on the key
+    bool rejectPairing_ = false;  // see OutcomeTrack in NoteOn
+    bool lastNoteLaunched_ = false;
+    std::vector<std::deque<uint8_t>> keyOutcome_;
 
     // Cached indices are LOCAL to the font's SF2Data.
     uint32_t ResolveRegions(uint32_t font, uint32_t preset, uint8_t note,
@@ -659,8 +701,6 @@ private:
         }
         const uint32_t count = sf2_find_regions(bank.data.get(), preset, note,
                                                 velocity, out, capacity);
-    bool rawMix_ = false;
-    uint32_t oversample_ = 1u;
         if (count <= 8u && count <= capacity) {
             cached.tag = tag;
             cached.count = uint16_t(count);
@@ -793,6 +833,14 @@ private:
                 return false;
             }
             sf2_build_regions(bank.data.get());
+            if (oversample_ > 1u && !bank.data->regionOverflow &&
+                !OversampleSF2(*bank.data, oversample_,
+                               (std::max)(1u, std::thread::hardware_concurrency()))) {
+                sf2_free(bank.data.get());
+                freeAll();
+                error = "cannot oversample the SoundFont";
+                return false;
+            }
             if (bank.data->regionOverflow || bank.data->regionCount == 0) {
                 sf2_free(bank.data.get());
                 freeAll();
@@ -880,6 +928,17 @@ private:
 #if defined(_MSC_VER)
         const uint64_t totalBegin = __rdtsc();
 #endif
+        // Steal-reject pairing: every note-on, launched or not, queues its outcome so
+        // the matching note-off releases a voice only when this note got one.
+        struct OutcomeTrack {
+            StandaloneSynth* self; uint8_t channel, note;
+            ~OutcomeTrack() {
+                if (self->rejectPairing_ && note < kNoteCount && channel < kChannelCount)
+                    self->keyOutcome_[channel * kNoteCount + note].push_back(
+                        self->lastNoteLaunched_ ? 1u : 0u);
+            }
+        } outcomeTrack{this, channel, note};
+        lastNoteLaunched_ = false;
         ++noteCalls_;
         if (note >= kNoteCount) return;
         if (velGain_[velocity & 127u] <= 0.0f) return;  // velocity ignore gate
@@ -940,7 +999,7 @@ private:
             const float bendRatio = prepared.bendScale == 1.0f
                 ? bendRatio_[channel]
                 : powf(2.0f, bend * prepared.bendScale / 12.0f);
-            const float gain = velocityGain * prepared.attenuation;
+            const float gain = velocityGain * prepared.attenuation * holdGain_;
             VoiceConfiguration& voice = launchSetups_[i];
             voice = VoiceConfiguration{};
             voice.sampleStart = bank.sampleBase + uint32_t(region.startOffset);
@@ -951,7 +1010,8 @@ private:
             voice.playIndex = generation;
             voice.delaySamples = prepared.delay;
             voice.holdSamples = prepared.hold;
-            voice.attackSamples = prepared.attack;
+            const uint32_t attackFrames = holdOnset_ ? holdOnset_ : prepared.attack;
+            voice.attackSamples = attackFrames;
             voice.decaySamples = prepared.decay;
             voice.releaseSamples = prepared.release;
             const float baseStep = RetunePhaseStep(prepared.baseStep[note], note, prepared.bendScale, edo31);
@@ -960,7 +1020,7 @@ private:
             voice.pitchBendScale = prepared.bendScale;
             voice.initialGain = gain;
             voice.sustainLevel = prepared.sustain;
-            voice.attackGainStep = prepared.attack ? gain / prepared.attack : 0;
+            voice.attackGainStep = attackFrames ? gain / attackFrames : 0;
             voice.decaySlope = prepared.decaySlope;
             voice.releaseDecay = prepared.releaseDecay;
             voice.gainLeft = prepared.panL;
@@ -990,7 +1050,7 @@ private:
         const bool launched = voices_.LaunchVoiceGroup(
             channel, note, velocity, launchSetups_, count, generation,
             channels_.GetParams()[channel], handles, 0u, multiplicity);
-        if (launched) physicalLaunches_ += count;
+        if (launched) { physicalLaunches_ += count; lastNoteLaunched_ = true; }
 #if defined(_MSC_VER)
         dispatchProfile.alloc += __rdtsc() - allocBegin;
         dispatchProfile.configure += __rdtsc() - configureBegin;
@@ -1006,9 +1066,17 @@ private:
 #endif
         const bool sustain = channels_.IsSustainActive(channel);
         channels_.NoteOff(channel, note);
+        if (rejectPairing_ && note < kNoteCount && channel < kChannelCount) {
+            std::deque<uint8_t>& outcomes = keyOutcome_[channel * kNoteCount + note];
+            if (!outcomes.empty()) {
+                const bool launched = outcomes.front() != 0u;
+                outcomes.pop_front();
+                if (!launched) return;  // that note was skipped: nothing to release
+            }
+        }
         // One note-off releases one unit: the whole generation, or one copy
         // of a merged voice.
-        voices_.NoteOffOldestPlayIndices(channel, note, 1u, sustain, 0u);
+        voices_.NoteOffOldestPlayIndices(channel, note, releaseAll_ ? UINT32_MAX : 1u, sustain, 0u);
 #if defined(_MSC_VER)
         dispatchProfile.noteOffTotal += __rdtsc() - offBegin;
         ++dispatchProfile.noteOffCalls;
@@ -1080,7 +1148,9 @@ private:
             selFont_[channel] = uint8_t(font);
             channels_.SetSelectedPreset(channel, uint16_t(preset));
         } else {
-            channels_.ProgramChange(channel, oldProgram);
+            // No such preset in the stack: the channel goes silent (no placeholder instrument).
+            (void)oldProgram;
+            channels_.SetSelectedPreset(channel, UINT16_MAX);
         }
     }
 

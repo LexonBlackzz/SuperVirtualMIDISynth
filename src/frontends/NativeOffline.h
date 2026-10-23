@@ -19,6 +19,11 @@
 
 namespace svms {
 
+// Set by the bass.dll shim before it creates a session: new offline sessions use
+// the BASSMIDI voice-admission rule (see StandaloneSynthConfig::stealReject).
+inline std::atomic<bool> g_nativeOfflineStealReject{false};
+inline std::atomic<bool> g_nativeOfflineStealAgeless{false};
+
 // Independent caller-driven sessions for native API users. These sessions do
 // not own an OS audio device and never share MIDI, SoundFont, voice, limiter,
 // or render state with the process-global real-time driver.
@@ -52,6 +57,8 @@ public:
                 StandaloneSynthConfig synthConfig{};
                 synthConfig.soundfont = soundfont;
                 synthConfig.tuningEdo = EngineConfig::Load().tuningEdo;
+                synthConfig.stealReject = g_nativeOfflineStealReject.load(std::memory_order_relaxed);
+                synthConfig.stealAgeless = g_nativeOfflineStealAgeless.load(std::memory_order_relaxed);
                 synthConfig.sampleRate = config->sample_rate;
                 synthConfig.maxVoices = config->max_voices;
                 synthConfig.renderThreads = config->render_threads;
@@ -278,6 +285,21 @@ public:
         return SVMS_RESULT_OK;
     }
 
+    bool GetChannelVoices(SVMS_Session session, uint32_t (&out)[16]) {
+        Slot* slot = FindSlot(session);
+        if (!slot) return false;
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (slot->token != session || !slot->state) return false;
+        std::fill(std::begin(out), std::end(out), 0u);
+        slot->state->cores.ForEachCore(slot->state->synth,
+            [&](StandaloneSynth& core) {
+                uint32_t part[16];
+                core.ChannelVoices(part);
+                for (uint32_t c = 0u; c < 16u; ++c) out[c] += part[c];
+            });
+        return true;
+    }
+
     SVMS_Result GetTelemetry(SVMS_Session session,
                              SVMS_OfflineTelemetry* telemetry) {
         Slot* slot = FindSlot(session);
@@ -337,6 +359,7 @@ private:
 
     struct State {
         StandaloneSynth synth;
+        ShardCores cores;
         std::vector<float> scratchLeft;
         std::vector<float> scratchRight;
         std::vector<RenderEvent> renderEvents;
@@ -359,7 +382,6 @@ private:
     static bool ValidateConfig(const SVMS_OfflineSessionConfig& config) {
         if (config.struct_size < sizeof(SVMS_OfflineSessionConfig) ||
             config.struct_version != SVMS_STRUCT_VERSION_1 ||
-        ShardCores cores;
             (config.session_kind != SVMS_SESSION_OFFLINE_RENDER &&
              config.session_kind != SVMS_SESSION_SILENT_ANALYSIS) ||
             config.flags != 0u || config.sample_rate < 8000u ||

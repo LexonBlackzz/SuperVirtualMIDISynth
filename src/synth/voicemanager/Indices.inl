@@ -92,7 +92,7 @@ inline float VoiceManager::ComputeStealScore(uint32_t idx) const {
     // A continuous /256 age term keeps the persistent heap invariant between
     // voice-state changes while preserving the same ordering and scale.
     const float ageUnits = static_cast<float>(GetVoiceAge(
-        static_cast<VoiceHandle>(idx))) * (1.0f / 256.0f);
+        static_cast<VoiceHandle>(idx))) * stealAgeScale_;
     return ageUnits - ComputeEffectiveStealLevel(
         static_cast<VoiceHandle>(idx)) * kBassMidiStealGainScale;
 }

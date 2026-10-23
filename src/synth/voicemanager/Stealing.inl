@@ -725,10 +725,16 @@ inline uint32_t VoiceManager::PopStealCandidates(uint32_t count,
 // order may differ from the pre-pop arrangement, but the heap is fully
 // ordered by unique keys, so every subsequent selection is identical.
 inline bool VoiceManager::ShouldRejectNoteOn(
-    const VoiceConfiguration& setup, const ChannelParamsSnapshot& cp,
-    uint32_t multiplicity) {
-    if (FastSteal() || perKeyVoiceCap_ != 0u || setup.exclusiveClass != 0u ||
-        freeTop_ != 0u || activeCount_ < voiceLimit_ || activeCount_ == 0u)
+    const VoiceConfiguration* setups, uint32_t count,
+    const ChannelParamsSnapshot& cp, uint32_t multiplicity) {
+    // A layered note is admitted or skipped as a whole, judged by its loudest
+    // layer (BASSMIDI judges each region voice alone; layers of one note share
+    // a level closely enough that the whole-note call is the same in practice).
+    for (uint32_t layer = 0u; layer < count; ++layer)
+        if (setups[layer].exclusiveClass != 0u) return false;
+    if (FastSteal() || perKeyVoiceCap_ != 0u ||
+        freeTop_ >= count || activeCount_ + count <= voiceLimit_ ||
+        activeCount_ == 0u)
         return false;
     if (!stealHeapValid_) BuildStealHeap();
     VoiceHandle victim = kInvalidVoice;
@@ -761,11 +767,20 @@ inline bool VoiceManager::ShouldRejectNoteOn(
     // mix gains (what ApplyVoiceConfigurationFields caches as stealOutputGain,
     // merged-launch multiplicity included).
     const float scale = multiplicity > 1u ? static_cast<float>(multiplicity) : 1.0f;
-    const float mixL = setup.gainLeft * scale * cp.mixScaleLeft;
-    const float mixR = setup.gainRight * scale * cp.mixScaleRight;
-    const float level = std::fabs(setup.initialGain) *
-        std::sqrt(mixL * mixL + mixR * mixR);
+    float level = 0.0f;
+    for (uint32_t layer = 0u; layer < count; ++layer) {
+        const float mixL = setups[layer].gainLeft * scale * cp.mixScaleLeft;
+        const float mixR = setups[layer].gainRight * scale * cp.mixScaleRight;
+        level = (std::max)(level, std::fabs(setups[layer].initialGain) *
+                                      std::sqrt(mixL * mixL + mixR * mixR));
+    }
     const float newbornScore = 0.0f - level * kBassMidiStealGainScale;
+    // BASSMIDI 2018 (ageless ranking): a newcomer that is not strictly louder than
+    // the quietest voice is dropped, so an equal level loses. The newborn level is
+    // computed from the setup and the victim's from its cached envelope, so equal
+    // notes differ by rounding; the tolerance keeps them equal.
+    if (stealAgeScale_ == 0.0f)
+        return newbornScore >= ComputeStealScore(victim) * (1.0f + 1e-5f);
     return newbornScore > ComputeStealScore(victim);
 }
 
@@ -919,7 +934,7 @@ SVMS_VM_FORCEINLINE bool VoiceManager::IsLinkedActiveVoice(
 
 inline float VoiceManager::ComputeStableStealKey(VoiceHandle handle) const {
     const float commonAgeScore =
-        static_cast<float>(currentFrame_) * (1.0f / 256.0f);
+        static_cast<float>(currentFrame_) * stealAgeScale_;
     return ComputeStealScore(handle) - commonAgeScore;
 }
 
@@ -1009,13 +1024,13 @@ inline void VoiceManager::BuildVolatileStealHeap() {
         vectorized = BuildVolatileStealKeysAVX2(
             stealVolatileList_, stealVolatileCount_, v.birthFrame,
             v.currentGain, v.stealOutputGain, activePosition_, currentFrame_,
-            kBassMidiStealGainScale, stealVolatileHeapKey_,
+            kBassMidiStealGainScale, stealAgeScale_, stealVolatileHeapKey_,
             stealVolatileHeapHandle_, stealVolatileHeapPosition_);
     }
 #endif
     if (!vectorized) {
         const float commonAgeScore =
-            static_cast<float>(currentFrame_) * (1.0f / 256.0f);
+            static_cast<float>(currentFrame_) * stealAgeScale_;
         for (uint32_t position = 0; position < stealVolatileCount_; ++position) {
             const uint32_t handle = stealVolatileList_[position];
 #if defined(SVMS_VM_HAS_PREFETCH)
@@ -1038,7 +1053,7 @@ inline void VoiceManager::BuildVolatileStealHeap() {
             const uint32_t age = rawAge > UINT32_MAX
                 ? UINT32_MAX : static_cast<uint32_t>(rawAge);
             const float ageUnits =
-                static_cast<float>(age) * (1.0f / 256.0f);
+                static_cast<float>(age) * stealAgeScale_;
             const float effectiveLevel = std::fabs(v.currentGain[handle]) *
                 v.stealOutputGain[handle];
             const float score = ageUnits -

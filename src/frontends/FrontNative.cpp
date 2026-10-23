@@ -530,6 +530,10 @@ SVMS_Result SVMS_CALL NativeGetOfflineTelemetry(
     return g_nativeOfflineSessions.GetTelemetry(session, telemetry);
 }
 
+bool NativeGetOfflineChannelVoices(SVMS_Session session, uint32_t (&out)[16]) {
+    return g_nativeOfflineSessions.GetChannelVoices(session, out);
+}
+
 static SVMS_Result SVMS_CALL NativeSetOfflineSoundFonts(
     SVMS_Session session, const char* const* pathsUtf8, uint32_t count) {
     if (!g_nativeOfflineSessions.IsToken(session))

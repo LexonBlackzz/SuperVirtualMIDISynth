@@ -3,6 +3,7 @@
 #include <windows.h>
 #else
 #include <codecvt>
+#include <sys/stat.h>
 #include <locale>
 #endif
 #include "events/MidiStream.h"
@@ -26,9 +27,15 @@
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
+#include <ctime>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <unordered_map>
 #include <queue>
+#include <functional>
 #include <cstdlib>
 #include <string>
 #include <stdexcept>
@@ -59,6 +66,15 @@ struct Options {
     bool quiet = false;
     bool scanOnly = false;
     bool machineProgress = false;
+    bool fullVelocity = false;         // --full-velocity: every note-on at velocity 127
+    int32_t minNoteMs = -1;            // --min-note-ms: minimum note length (-1 = engine config)
+    bool bassMode = false;             // --bassmidi-mode: KMC-style BASSMIDI behaviour (note-table renderer)
+    bool streamNoteTable = false;      // --bassmidi-stream: the windowed note-table renderer
+    bool noteTable = false;            // --note-table CAP: experimental note-table renderer
+    uint32_t noteTableCap = 0u;        //   voice limit for it (0 = unlimited)
+    uint32_t oversample = 1u;          // --oversample: sample-store oversampling (1 = off)
+    uint32_t shards = 1u;              // --shards: key-sharded parallel planning
+    uint32_t maxSeconds = 0u;          // --max-seconds: stop the MIDI after N s (0 = all)
     bool canonicalSynth = false;
     std::wstring cancelEvent;
     std::vector<uint32_t> stemTracks;  // --tracks: keep notes of these tracks only
@@ -77,6 +93,12 @@ void MachineStatus(const Options& o, const char* state,
         if (c == '\t' || c == '\r' || c == '\n') c = ' ';
     }
     std::fprintf(stdout, "SVMS3\tSTATUS\t%s\t%s\n", state, clean.c_str());
+    std::fflush(stdout);
+}
+
+void MachinePhase(const Options& o, int step, int steps, const char* name) {
+    if (!o.machineProgress) return;
+    std::fprintf(stdout, "SVMS3\tPHASE\t%d\t%d\t%s\n", step, steps, name);
     std::fflush(stdout);
 }
 
@@ -297,6 +319,13 @@ void Usage() {
            L"  --tracks A,B,...      Stem: keep notes of these 0-based MIDI tracks only (length unchanged)\n"
            L"  --stems MODE          One synth instance per note-bearing track, up to --render-threads at\n"
            L"                        once. separate: <out>_trackN.wav each; merge: summed into <out>; both\n"
+           L"  --full-velocity       Play every note at velocity 127 (also makes note merging fold more)\n"
+           L"  --min-note-ms N       Hold every note at least N ms (KMC 18.2.8 BASSMIDI does 4); note-table renderer only for now\n"
+           L"  --bassmidi-mode       Approximate KMC/BASSMIDI: 4 ms min note, voice limit drops notes that are not louder, DC kept; renders the MIDI length + 3 s unless --max-seconds is given\n"
+           L"  --note-table CAP      Experimental: render from a note table, not the live engine (MIDI length + 3 s unless --max-seconds)\n"
+           L"  --oversample N        Experimental: upsample every sample Nx (2/4/8) with a 16-point sinc at load\n"
+           L"  --shards N            Key-sharded render: N synth cores plan in parallel (voices split between them)\n"
+           L"  --max-seconds N       Render only the first N seconds of the MIDI (then the release tail)\n"
            L"  --scan-only           Validate/count without loading an instrument or rendering\n"
            L"  --quiet               Disable once-per-second telemetry\n"
            L"  --machine-progress    Emit tab-separated progress records\n", stderr);
@@ -321,6 +350,14 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             o.cancelEvent = p;
         }
         else if (arg == L"--scan-only") o.scanOnly = true;
+        else if (arg == L"--full-velocity") o.fullVelocity = true;
+        else if (arg == L"--min-note-ms") { uint32_t v = 0; const auto p=value(); if (!p || !ParseU32(p,0,200,v)) return false; o.minNoteMs = static_cast<int32_t>(v); }
+        else if (arg == L"--bassmidi-mode") { o.bassMode = true; o.noteTable = true; o.minNoteMs = 4; g_keepDcOffset = true; }
+        else if (arg == L"--bassmidi-stream") { o.bassMode = true; o.noteTable = true; o.streamNoteTable = true; o.minNoteMs = 4; g_keepDcOffset = true; }
+        else if (arg == L"--note-table") { const auto p=value(); if (!p || !ParseU32(p,0,4000000,o.noteTableCap)) return false; o.noteTable = true; }
+        else if (arg == L"--oversample") { const auto p=value(); if (!p || !ParseU32(p,1,8,o.oversample)) return false; }
+        else if (arg == L"--shards") { const auto p=value(); if (!p || !ParseU32(p,1,64,o.shards)) return false; }
+        else if (arg == L"--max-seconds") { const auto p=value(); if (!p || !ParseU32(p,1,86400,o.maxSeconds)) return false; }
         else if (arg == L"--stems") {
             const auto p=value(); if (!p) return false;
             o.stems = p;
@@ -511,6 +548,8 @@ public:
         }
         for (float& r:bendRatio_) r=1.0f;
         postHighPass_.Initialize(rate_);
+        postHighPass_.SetPassThrough(g_keepDcOffset || std::getenv("SVMS_NO_DCBLOCK") != nullptr);
+        postHighPass_.SetPassThrough(g_keepDcOffset || std::getenv("SVMS_NO_DCBLOCK") != nullptr);
         voices_.SetPhaseRotationMode(o.phaseRotationMode);
         EngineConfig limiterConfig{};
         limiterConfig.limiterEnabled = o.limiterEnabled;
@@ -611,7 +650,7 @@ private:
     void Control(uint8_t ch,uint8_t cc,uint8_t value){const bool sustain=channels_.IsSustainActive(ch);channels_.ControlChange(ch,cc,value);if(cc==0||cc==32)RefreshPreset(ch);if(cc==64&&value<64){voices_.ForEachChannelActive(ch,[&](VoiceHandle h){if(voices_.v.heldBySustain[h]){voices_.v.heldBySustain[h]=0;voices_.StartRelease(h);}});}
         if(cc==120)voices_.SilenceChannelImmediate(ch);else if(cc==123)voices_.ReleaseChannel(ch,0);else if(cc==121&&sustain){voices_.ForEachChannelActive(ch,[&](VoiceHandle h){if(voices_.v.heldBySustain[h]){voices_.v.heldBySustain[h]=0;voices_.StartRelease(h);}});}
         if(cc==121)Bend(ch,0,64);if(cc==7||cc==10||cc==11||cc==64||cc==121){channels_.RebuildChannel(ch,cfg_,float(rate_));if(cc==7||cc==10||cc==11||cc==121)voices_.MarkChannelMixStale(ch,channels_.GetParams()[ch]);}}
-    void Program(uint8_t ch,uint8_t p){const uint8_t old=channels_.GetProgram(ch);channels_.ProgramChange(ch,p);uint32_t pi;if(Resolve(ch,pi))channels_.SetSelectedPreset(ch,uint16_t(pi));else channels_.ProgramChange(ch,old);}
+    void Program(uint8_t ch,uint8_t p){const uint8_t old=channels_.GetProgram(ch);channels_.ProgramChange(ch,p);uint32_t pi;(void)old;if(Resolve(ch,pi))channels_.SetSelectedPreset(ch,uint16_t(pi));else channels_.SetSelectedPreset(ch,UINT16_MAX);}
     void Bend(uint8_t ch,uint8_t lo,uint8_t hi){channels_.PitchBend(ch,int16_t((hi<<7)|lo));const float semis=channels_.GetPitchBendSemitones(ch);const float common=powf(2.0f,semis/12.0f);bendRatio_[ch]=common;voices_.ForEachChannelActive(ch,[&](VoiceHandle v){const float scale=voices_.v.pitchBendScales[v];voices_.v.phaseIncs[v]=voices_.v.basePhaseIncs[v]*(scale==1?common:powf(2.0f,semis*scale/12.0f));});}
     uint32_t rate_=0,maxVoices_=0,playIndex_=0;float master_=0,bendRatio_[16]{};bool gpuEnabled_=false;uint64_t notes_=0,noteCalls_=0,missingPresets_=0,missingRegions_=0,invalidRegions_=0,fallbackRegions_=0;
     std::unique_ptr<SF2Data> sf2_;std::vector<int16_t> sampleData_;uint32_t sampleFrames_ = 0;std::vector<PreparedRegion> prepared_;
@@ -677,6 +716,7 @@ public:
         config.backend = o.backend;
         config.phaseRotationMode = o.phaseRotationMode;
         config.tuningEdo = o.tuningEdo;
+        config.oversample = o.oversample;
         config.tuning = o.tuning;
         return synth_.Initialize(config, error);
     }
@@ -688,6 +728,10 @@ public:
         synth_.Render(left, right, frames, frame);
     }
     void ReleaseAll() override { synth_.ReleaseAll(); }
+    void SetRawMix(bool raw) { synth_.SetRawMix(raw); }
+    float StealLevel(uint8_t ch, uint8_t key) const { return synth_.StealLevel(ch, key); }
+    uint32_t VoiceCount(uint8_t ch, uint8_t key) const { return synth_.VoiceCount(ch, key); }
+    void PostProcess(float* l, float* r, uint32_t n) { synth_.PostProcess(l, r, n); }
     bool RenderEvents(const RealtimeEvent* events, size_t count, float* left,
                       float* right, uint32_t frames, uint64_t frame) override {
         block_.Render(synth_, events, count, left, right, frames, frame);
@@ -719,6 +763,176 @@ public:
 private:
     StandaloneSynth synth_;
     RealtimeBlockRenderer block_;
+};
+
+// Key-sharded render (the offline twin of the driver's synth.shards): note
+// events go to the core that owns (channel,key), everything else to all
+// cores; cores render raw mixes in parallel, then the sum gets reverb and
+// the limiter once. The serial plan loop (note launch/steal) is what bounds
+// Black MIDI speed, and this splits it. Voices are divided between cores.
+// ponytail: each core loads its own SoundFont copy; share one bundle if RAM bites.
+class ShardedOfflineSession final : public OfflineSessionSynth {
+public:
+    ~ShardedOfflineSession() override {
+        StopWorkers();
+        if (std::getenv("SVMS_OFFLINE_PROFILE"))
+            for (size_t i = 0; i < filterNs_.size(); ++i)
+                std::fprintf(stderr, "\n[shard %zu] filter %.2fs render %.2fs events %llu",
+                             i, filterNs_[i] * 1e-9, renderNs_[i] * 1e-9,
+                             (unsigned long long)keptEvents_[i]);
+    }
+    bool Initialize(const Options& o, std::string& error) override {
+        const uint32_t n = o.shards;
+        Options c = o;
+        c.maxVoices = (std::max)(1u, (o.maxVoices + n - 1u) / n);
+        c.renderThreads = (std::max)(1u, (o.renderThreads
+            ? o.renderThreads
+            : (std::max)(1u, std::thread::hardware_concurrency())) / n);
+        shards_.resize(n);
+        std::vector<std::string> errors(n);
+        std::vector<char> ok(n, 0);
+        std::vector<std::thread> loaders;
+        for (uint32_t i = 0; i < n; ++i)
+            loaders.emplace_back([&, i] {
+                shards_[i] = std::make_unique<LegacyOfflineSession>();
+                ok[i] = shards_[i]->Initialize(c, errors[i]);
+            });
+        for (auto& t : loaders) t.join();
+        for (uint32_t i = 0; i < n; ++i)
+            if (!ok[i]) { error = errors[i]; return false; }
+        for (auto& s : shards_) s->SetRawMix(true);
+        mine_.resize(n);
+        filterNs_.assign(n, 0); renderNs_.assign(n, 0); keptEvents_.assign(n, 0);
+        planeL_.resize(n); planeR_.resize(n);
+        for (uint32_t i = 1; i < n; ++i) {
+            planeL_[i].resize(o.blockFrames); planeR_[i].resize(o.blockFrames);
+            workers_.emplace_back([this, i] { WorkerLoop(i); });
+        }
+        return true;
+    }
+    void Dispatch(uint32_t message, uint64_t frame) override {
+        for (auto& s : shards_) s->Dispatch(message, frame);
+    }
+    void Render(float* left, float* right, uint32_t frames,
+                uint64_t absoluteFrame) override {
+        RenderEvents(nullptr, 0, left, right, frames, absoluteFrame);
+    }
+    void ReleaseAll() override { for (auto& s : shards_) s->ReleaseAll(); }
+    bool RenderEvents(const RealtimeEvent* events, size_t count, float* left,
+                      float* right, uint32_t frames, uint64_t frame) override {
+        if (!left) return true;  // capability probe
+        job_ = {events, count, frames, frame};
+        outL_ = left; outR_ = right;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_ = static_cast<uint32_t>(workers_.size());
+            ++generation_;
+        }
+        wake_.notify_all();
+        RunShard(0);
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            done_.wait(lock, [&] { return pending_ == 0; });
+        }
+        for (size_t i = 1; i < shards_.size(); ++i)
+            for (uint32_t f = 0; f < frames; ++f) {
+                left[f] += planeL_[i][f];
+                right[f] += planeR_[i][f];
+            }
+        shards_[0]->PostProcess(left, right, frames);
+        return true;
+    }
+    void PhaseCycles(uint64_t (&out)[3]) const override {
+        out[0] = out[1] = out[2] = 0;
+        for (auto& s : shards_) {
+            uint64_t c[3]; s->PhaseCycles(c);
+            for (int k = 0; k < 3; ++k) out[k] += c[k];
+        }
+    }
+    void CollapseCounts(uint64_t (&out)[3]) const override {
+        out[0] = out[1] = out[2] = 0;
+        for (auto& s : shards_) {
+            uint64_t c[3]; s->CollapseCounts(c);
+            for (int k = 0; k < 3; ++k) out[k] += c[k];
+        }
+    }
+    bool ReverbActive() const override { return shards_[0]->ReverbActive(); }
+#define SVMS_SHARD_SUM(type, name) \
+    type name() const override { type t = 0; for (auto& s : shards_) t += s->name(); return t; }
+    SVMS_SHARD_SUM(uint32_t, Active) SVMS_SHARD_SUM(uint32_t, Tails)
+    SVMS_SHARD_SUM(uint32_t, Steals) SVMS_SHARD_SUM(uint32_t, Free)
+    SVMS_SHARD_SUM(uint64_t, NoteCalls) SVMS_SHARD_SUM(uint64_t, MatchedNotes)
+    SVMS_SHARD_SUM(uint64_t, PhysicalLaunches) SVMS_SHARD_SUM(uint64_t, RetiredVoices)
+    SVMS_SHARD_SUM(uint64_t, DroppedVoices) SVMS_SHARD_SUM(uint64_t, MissingPresets)
+    SVMS_SHARD_SUM(uint64_t, MissingRegions) SVMS_SHARD_SUM(uint64_t, InvalidRegions)
+    SVMS_SHARD_SUM(uint64_t, FallbackRegions)
+#undef SVMS_SHARD_SUM
+    const char* Backend() const override { return shards_[0]->Backend(); }
+private:
+    struct Job { const RealtimeEvent* events; size_t count; uint32_t frames; uint64_t frame; };
+
+    static uint32_t ShardFor(uint32_t channel, uint32_t note, uint32_t n) {
+        return (((channel * 128u + note) * 2654435761u) >> 16u) % n;
+    }
+    void RunShard(uint32_t index) {
+        const uint32_t n = static_cast<uint32_t>(shards_.size());
+        auto& mine = mine_[index];
+        const auto t0 = std::chrono::steady_clock::now();
+        mine.clear();
+        for (size_t i = 0; i < job_.count; ++i) {
+            const RealtimeEvent& e = job_.events[i];
+            const uint8_t status = static_cast<uint8_t>(e.message);
+            const uint8_t type = status & 0xf0u;
+            if (!e.reset && (type == 0x80u || type == 0x90u) &&
+                !IsInternalEngineMessage(e.message) &&
+                ShardFor(status & 0x0fu, (e.message >> 8u) & 0x7fu, n) != index)
+                continue;
+            mine.push_back(e);
+        }
+        float* l = index == 0 ? outL_ : planeL_[index].data();
+        float* r = index == 0 ? outR_ : planeR_[index].data();
+        const auto t1 = std::chrono::steady_clock::now();
+        shards_[index]->RenderEvents(mine.data(), mine.size(), l, r,
+                                     job_.frames, job_.frame);
+        const auto t2 = std::chrono::steady_clock::now();
+        filterNs_[index] += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        renderNs_[index] += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        keptEvents_[index] += mine.size();
+    }
+    void WorkerLoop(uint32_t index) {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock, [&] { return stop_ || generation_ != seen; });
+                if (stop_) return;
+                seen = generation_;
+            }
+            RunShard(index);
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (--pending_ == 0) done_.notify_one();
+        }
+    }
+    void StopWorkers() {
+        { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; }
+        wake_.notify_all();
+        for (auto& t : workers_) t.join();
+        workers_.clear();
+    }
+
+    std::vector<std::unique_ptr<LegacyOfflineSession>> shards_;
+    std::vector<std::vector<RealtimeEvent>> mine_;
+    std::vector<std::vector<float>> planeL_, planeR_;
+    std::vector<uint64_t> filterNs_, renderNs_, keptEvents_;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable wake_, done_;
+    uint64_t generation_ = 0;
+    uint32_t pending_ = 0;
+    bool stop_ = false;
+    Job job_{};
+    float* outL_ = nullptr;
+    float* outR_ = nullptr;
 };
 
 class CanonicalOfflineSession final : public OfflineSessionSynth {
@@ -766,6 +980,8 @@ public:
         limiterConfig.limiterAttackMs = o.limiterAttackMs;
         limiterConfig.limiterReleaseMs = o.limiterReleaseMs;
         highPass_.Initialize(o.sampleRate);
+        highPass_.SetPassThrough(g_keepDcOffset || std::getenv("SVMS_NO_DCBLOCK") != nullptr);
+        highPass_.SetPassThrough(g_keepDcOffset || std::getenv("SVMS_NO_DCBLOCK") != nullptr);
         limiter_.Configure(o.sampleRate, limiterConfig);
         return true;
     }
@@ -944,6 +1160,36 @@ bool MergeStems(const std::vector<std::wstring>& paths, const std::wstring& out,
     return wave.Close() && ok;
 }
 
+// Creates <output dir>/<midi name>/ for separate stems; if that already exists,
+// <output dir>/<YYYYMMDD_HHMMSS>_<midi name>/. Returns "" on failure.
+std::wstring MakeStemDir(const std::wstring& out, const std::wstring& midi) {
+    auto split = [](const std::wstring& p, std::wstring& dir, std::wstring& name) {
+        const size_t sep = p.find_last_of(L"\\/");
+        dir = sep == std::wstring::npos ? L"" : p.substr(0, sep + 1);
+        name = sep == std::wstring::npos ? p : p.substr(sep + 1);
+    };
+    std::wstring dir, name, d2, file;
+    split(out, dir, file);
+    split(midi, d2, name);
+    const size_t dot = name.rfind(L'.');
+    if (dot != std::wstring::npos && dot > 0) name.resize(dot);
+    if (name.empty()) name = L"render";
+    auto make = [](const std::wstring& p) {
+#if defined(_WIN32)
+        return CreateDirectoryW(p.c_str(), nullptr) != 0;
+#else
+        return mkdir(NarrowPath(p).c_str(), 0777) == 0;
+#endif
+    };
+    std::wstring path = dir + name;
+    if (make(path)) return path + L"/";
+    wchar_t stamp[32];
+    const std::time_t now = std::time(nullptr);
+    std::wcsftime(stamp, 32, L"%Y%m%d_%H%M%S_", std::localtime(&now));
+    path = dir + stamp + name;
+    return make(path) ? path + L"/" : L"";
+}
+
 // ponytail: every instance loads its own SoundFont copy; share one bundle if RAM bites.
 int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
     using namespace svms;
@@ -975,6 +1221,17 @@ int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
                      tracks.size(), concurrent, perInstance);
     MachineStatus(o, "RENDERING", "Rendering tracks");
 
+    // Merge-only stems are temporary: leave them beside the output. Otherwise
+    // they get their own folder, so repeated renders never overwrite each other.
+    std::wstring stemOut = o.output;
+    if (o.stems != L"merge") {
+        const std::wstring dir = MakeStemDir(o.output, o.midi);
+        if (!dir.empty()) {
+            const size_t sep = o.output.find_last_of(L"\\/");
+            stemOut = dir + (sep == std::wstring::npos ? o.output : o.output.substr(sep + 1));
+        }
+    }
+
     const auto start = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     std::atomic<uint32_t> finished{0};
@@ -988,7 +1245,7 @@ int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
                 Options c = o;
                 c.stems.clear();
                 c.stemTracks = {tracks[i]};
-                c.output = StemPath(o.output, tracks[i]);
+                c.output = StemPath(stemOut, tracks[i]);
                 c.quiet = true;
                 c.machineProgress = false;
                 c.renderThreads = perInstance;
@@ -1012,7 +1269,7 @@ int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
     for (auto& t : pool) t.join();
 
     std::vector<std::wstring> paths;
-    for (uint32_t t : tracks) paths.push_back(StemPath(o.output, t));
+    for (uint32_t t : tracks) paths.push_back(StemPath(stemOut, t));
     int rc = failure.load();
     if (rc == 0 && o.stems != L"separate") {
         MachineStatus(o, "RENDERING", "Merging track stems");
@@ -1028,6 +1285,8 @@ int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
     else if (rc == 3) MachineStatus(o, "CANCELLED", "Render cancelled; partial WAVs retained");
     return rc;
 }
+#include "synth/NoteTableRender.inl"
+#include "synth/NoteTableStream.inl"
 } // namespace
 
 int RendererMain(int argc, wchar_t** argv) {
@@ -1064,6 +1323,7 @@ int RendererMain(int argc, wchar_t** argv) {
         Usage();
         return 2;
     }
+    if (o.noteTable) return o.streamNoteTable ? RunNoteTableStream(o, engineConfig) : RunNoteTable(o, engineConfig);
     if (!o.stems.empty() && !o.scanOnly) return RunStems(o, engineConfig);
     return RenderOne(o, engineConfig);
 }
@@ -1139,7 +1399,8 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
     if (o.canonicalSynth)
         synth = std::make_unique<CanonicalOfflineSession>();
     else
-        synth = std::make_unique<LegacyOfflineSession>();
+        synth = o.shards > 1u ? std::unique_ptr<OfflineSessionSynth>(std::make_unique<ShardedOfflineSession>())
+                              : std::make_unique<LegacyOfflineSession>();
     if (!synth->Initialize(o, error)) return fail(error);
     if (pollCancel()) {
         MachineStatus(o, "CANCELLED", "Cancelled while preparing renderer");
@@ -1302,6 +1563,12 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
         }
     };
 
+    // --full-velocity: rewrite before counting/merging so equal-key note-ons fold.
+    auto fullVel = [&](PackedMidiEvent& source) {
+        if (o.fullVelocity && (source.message & 0xf0u) == 0x90u &&
+            (source.message & 0xff0000u) != 0u)
+            source.message |= 0x7f0000u;
+    };
     auto countSourceEvent = [&](const PackedMidiEvent& source) {
         const uint8_t status = static_cast<uint8_t>(source.message);
         const uint8_t type = status & 0xf0u;
@@ -1317,8 +1584,10 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
         }
     };
     auto dispatchSourceEvent = [&](const PackedMidiEvent& source) {
-        countSourceEvent(source);
-        synth->Dispatch(source.message, source.outputFrame);
+        PackedMidiEvent fv = source;
+        fullVel(fv);
+        countSourceEvent(fv);
+        synth->Dispatch(fv.message, fv.outputFrame);
         ++events;
     };
 
@@ -1328,6 +1597,9 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
     // densities is a call every few frames.
     const bool batched = std::getenv("SVMS_OFFLINE_PER_EVENT") == nullptr &&
                          synth->RenderEvents(nullptr, 0, nullptr, nullptr, 0, 0);
+    const uint64_t maxFrames = o.maxSeconds
+        ? uint64_t(o.maxSeconds) * o.sampleRate : ~0ull;
+    const bool truncated = o.maxSeconds && maxFrames < info.totalFrames;
     PackedMidiEvent event{};
     if (batched) {
         std::vector<RealtimeEvent> block;
@@ -1343,7 +1615,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
         };
         std::priority_queue<JitterEvent> jitterHeap;
         uint64_t jitterState = 88172645463325252ull;
-        while (ioOk && !pollCancel()) {
+        while (ioOk && !pollCancel() && frame < maxFrames) {
             uint32_t n = o.blockFrames;
             const uint64_t limit = frame + n;
             block.clear();
@@ -1359,6 +1631,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
                     if (pollCancel() || !ring.Peek(next) ||
                         next.outputFrame >= limit + jitterFrames) break;
                     ring.Pop(event);
+                    fullVel(event);
                     countSourceEvent(event);
                     ++events;
                     jitterState ^= jitterState << 13u; jitterState ^= jitterState >> 7u;
@@ -1382,6 +1655,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
                 if (!ring.Peek(next)) { exhausted = true; break; }
                 if (next.outputFrame >= limit) break;
                 ring.Pop(event);
+                fullVel(event);
                 countSourceEvent(event);
                 ++events;
                 block.push_back({event.outputFrame, event.sequence,
@@ -1437,7 +1711,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
     }
 
     if (ioOk && !pollCancel()) {
-        renderTo(info.totalFrames);
+        if (!truncated) renderTo(info.totalFrames);
         if (!pollCancel()) {
             activeAtMidiEnd = synth->Active();
             synth->ReleaseAll();
@@ -1477,18 +1751,24 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
         MachineStatus(o, "CANCELLED", "Render cancelled; partial WAV retained");
         return 3;
     }
-    if (expectedFrames && !wasCancelled && info.totalFrames != expectedFrames)
+    if (expectedFrames && !wasCancelled && !truncated && info.totalFrames != expectedFrames)
         std::fprintf(stderr, "warning: measured length %llu frames differs from decoded %llu\n",
                      static_cast<unsigned long long>(expectedFrames),
                      static_cast<unsigned long long>(info.totalFrames));
-    if (!producerError.empty() && events != info.eventCount)
+    if (!truncated && !producerError.empty() && events != info.eventCount)
         return fail("decoder error: " + producerError);
     if (!ioOk) return fail("output write failed");
     MachineStatus(o, "COMPLETE", "Render completed successfully");
     return 0;
 }
 
-#if defined(_WIN32)
+#if defined(SVMS_OFFLINE_AS_LIBRARY)
+// bass.dll build: the KMC/BASSMIDI imitation runs the renderer in process.
+extern "C" const SvmsKmcApi* SvmsBassKmcApi() {
+    static const SvmsKmcApi api{KmcOpen, KmcRead, KmcActive, KmcClose, KmcChannels};
+    return &api;
+}
+#elif defined(_WIN32)
 int wmain(int argc, wchar_t** argv) { return RendererMain(argc, argv); }
 #else
 int main(int argc, char** argv) {

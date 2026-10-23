@@ -327,6 +327,13 @@ HSTREAM WINAPI BASS_MIDI_StreamCreateFile(BOOL mem, const void* file,
     return fn ? fn(mem, file, offset, length, flags, freq) : 0u;
 }
 
+int WINAPI BASS_MIDI_StreamGetTrackCount(HSTREAM handle) {
+    using Fn = int(WINAPI*)(HSTREAM);
+    const auto fn =
+        reinterpret_cast<Fn>(Forward("BASS_MIDI_StreamGetTrackCount"));
+    return fn ? fn(handle) : -1;
+}
+
 HSTREAM WINAPI BASS_MIDI_StreamCreateURL(const char* url, DWORD offset,
                                          DWORD flags, DWORD freq) {
     using Fn = HSTREAM(WINAPI*)(const char*, DWORD, DWORD, DWORD);
