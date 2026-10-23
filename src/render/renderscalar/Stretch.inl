@@ -70,16 +70,19 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     const auto findSplit = [&](uint32_t from, uint32_t& kind) -> uint32_t {
         uint32_t opSum = 0u;
         uint64_t ghostSum = 0u;
+        // First event of the same-frame group `i` belongs to.  Tracked while
+        // scanning: re-walking it per event made a frame holding N events
+        // (a player catching up after a stall sends hundreds of thousands at
+        // one timestamp) cost O(N^2), seconds inside one audio callback.
+        uint32_t group = from;
         for (uint32_t i = from; i < eventCount; ++i) {
+            if (i != from && events[i].frameOffset != events[i - 1u].frameOffset)
+                group = i;
             if (IsBarrierEvent(events[i].type)) { kind = 1u; return i; }
             const uint32_t ops = WholeVoiceRowOpEstimate(events[i]);
             const uint32_t ghosts = ghostCost(events[i]);
             if (opSum + ops > wvRowOpBudget_ ||
                 (ghostCapacity != 0u && ghostSum + ghosts > ghostCapacity)) {
-                uint32_t group = i;
-                while (group > from &&
-                       events[group - 1u].frameOffset == events[i].frameOffset)
-                    --group;
                 if (group > from) { kind = 2u; return group; }
                 // One frame holds more than a whole budget of ops: keep the
                 // group together and let the log grow (pathological).
