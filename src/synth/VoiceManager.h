@@ -38,6 +38,11 @@ namespace svms {
 // voices.launch_staging, read when a VoiceManager initializes (restart-applied
 // like synth.large_pages).  Off = the production SoA launch path, unchanged.
 inline std::atomic<bool> g_launchStagingEnabled{false};
+// Experimental (voices.drop_zero_life_victims, env SVMS_DROP_ZERO_LIFE for
+// now): a voice stolen on the very frame it was launched has played zero
+// samples; skip its ghost, which only contributes the 64-frame steal-fade
+// tail of its first sample.  Default off = unchanged audio.
+inline std::atomic<bool> g_dropZeroLifeVictims{false};
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
 // Test builds: staged launches issued, and blocks that ended with a row still
 // staged (must stay 0).

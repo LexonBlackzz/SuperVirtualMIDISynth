@@ -444,11 +444,17 @@ inline void RenderScalar::WholeVoicePreTailCaptureHook(
     VoiceHandle handle, void* userData) {
     RenderScalar* renderer = static_cast<RenderScalar*>(userData);
     if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
-    if (renderer->wvGhostCount_ >= renderer->WholeVoiceGhostLimit()) {
-        // Pathological block (more steals than the pool).  The displaced
+    static const bool envDrop = std::getenv("SVMS_DROP_ZERO_LIFE") != nullptr;
+    const bool zeroLife = (envDrop ||
+        g_dropZeroLifeVictims.load(std::memory_order_relaxed)) &&
+        renderer->wvStartFrame_[handle] == renderer->wvEventFrame_;
+    if (zeroLife ||
+        renderer->wvGhostCount_ >= renderer->WholeVoiceGhostLimit()) {
+        // Zero-life victim (opt-in) or pathological block (more steals than
+        // the pool).  The displaced
         // voice's pre-steal samples are lost for this block; the launch
         // itself stays exact.  Counted for telemetry.
-        ++renderer->wvGhostOverflowCount_;
+        if (!zeroLife) ++renderer->wvGhostOverflowCount_;
         // The displaced voice is destroyed without a ghost, so its pending
         // deferred release must not survive the displacement.  The handle is
         // immediately reused by the replacement launch, and a stale
