@@ -671,6 +671,7 @@ struct WholeVoiceLaunchContext {
     uint32_t launches = 0u;
     uint32_t releaseSamples = 400u;
     bool allLoop = false;
+    uint32_t layers = 1u;   // voices per note-on (layered SoundFont regions)
 };
 
 void DispatchWholeVoiceLaunchEvent(const svms::RenderEvent* events,
@@ -709,12 +710,25 @@ void DispatchWholeVoiceLaunchEvent(const svms::RenderEvent* events,
                 setup.gainLeft = setup.gainRight = 0.02f;
                 setup.sampleBacked = 1u;
                 setup.playIndex = context.playIndex++;
-                svms::VoiceHandle handle = svms::kInvalidVoice;
+                svms::VoiceConfiguration layerSetups[4];
+                svms::VoiceHandle handles[4] = {
+                    svms::kInvalidVoice, svms::kInvalidVoice,
+                    svms::kInvalidVoice, svms::kInvalidVoice};
+                const uint32_t layers = (std::min)(context.layers, 4u);
+                for (uint32_t layer = 0u; layer < layers; ++layer) {
+                    layerSetups[layer] = setup;
+                    // Distinct layers: detuned, panned differently.
+                    layerSetups[layer].phaseStep =
+                        layerSetups[layer].basePhaseStep =
+                            setup.phaseStep * (1.0f + 0.013f * layer);
+                    layerSetups[layer].gainLeft = 0.02f * (1.0f + 0.3f * layer);
+                    layerSetups[layer].gainRight = 0.02f * (1.0f - 0.2f * layer);
+                }
                 context.voices->LaunchVoiceGroup(
-                    event.channel, event.data1, event.data2, &setup, 1u,
-                    setup.playIndex,
-                    context.channelParams[event.channel], &handle);
-                if (handle != svms::kInvalidVoice) ++context.launches;
+                    event.channel, event.data1, event.data2, layerSetups,
+                    layers, setup.playIndex,
+                    context.channelParams[event.channel], handles);
+                if (handles[0] != svms::kInvalidVoice) ++context.launches;
                 break;
             }
             case svms::RenderEventType::NoteOff:
@@ -2185,7 +2199,8 @@ void TestWholeVoiceScalarVibratoDifferential() {
 // audio and identical dense arrays after every block.  The stream saturates a
 // small pool so in-place steals dominate, and note-offs target keys launched
 // earlier in the same block (release and steal of staged rows).
-void RunLaunchStagingIdentity(uint32_t renderThreads, bool avx2Pass) {
+void RunLaunchStagingIdentity(uint32_t renderThreads, bool avx2Pass,
+                              uint32_t layers = 1u) {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 10u;
     constexpr uint32_t kPool = 32u;
@@ -2201,6 +2216,7 @@ void RunLaunchStagingIdentity(uint32_t renderThreads, bool avx2Pass) {
     cfg.correctnessMode = true;
 
     const bool savedFlag = svms::g_launchStagingEnabled.load();
+    const uint64_t deferredBefore = svms::g_ghostCopiesDeferred.load();
     svms::ChannelCache seedChannels;
     seedChannels.SetMasterVolume(1.0f);
     seedChannels.RebuildCache(cfg, 44100.0f);
@@ -2244,6 +2260,7 @@ void RunLaunchStagingIdentity(uint32_t renderThreads, bool avx2Pass) {
                                           directChannels.GetParams()};
     WholeVoiceLaunchContext stagedContext{stagedVoices.get(),
                                           stagedChannels.GetParams()};
+    directContext.layers = stagedContext.layers = layers;
     direct.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent,
                                    &directContext);
     staged.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent,
@@ -2317,15 +2334,17 @@ void RunLaunchStagingIdentity(uint32_t renderThreads, bool avx2Pass) {
           "store bit-identical blocks");
     Check(stagedContext.launches > 100u,
           "launch staging identity exercised the launch path");
-    Check(svms::g_ghostCopiesDeferred.load() > 0u,
+    Check(svms::g_ghostCopiesDeferred.load() > deferredBefore,
           "launch staging identity: no ghost copy was deferred");
 }
 
 void TestLaunchStagingIdentity() {
     for (uint32_t threads : {1u, 4u}) {
-        RunLaunchStagingIdentity(threads, false);
-        if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
-            RunLaunchStagingIdentity(threads, true);
+        for (uint32_t layers : {1u, 2u}) {
+            RunLaunchStagingIdentity(threads, false, layers);
+            if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
+                RunLaunchStagingIdentity(threads, true, layers);
+        }
     }
 }
 

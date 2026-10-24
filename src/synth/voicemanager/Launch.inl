@@ -458,7 +458,11 @@ inline void VoiceManager::ConfigureVoice(
 
     UnlinkExclusiveClass(handle);
     SetVoicePlayIndex(handle, playIndex);
-    ApplyVoiceConfigurationFields(handle, setup, cp);
+    if (groupStageNext_)
+        ApplyVoiceConfigurationFieldsImpl<true>(handle, setup, cp,
+                                                VoiceRenderClass::Generic);
+    else
+        ApplyVoiceConfigurationFields(handle, setup, cp);
     LinkExclusiveClass(handle);
     RefreshRenderClass(handle);
     if (commitDeferred)
@@ -987,8 +991,15 @@ inline void VoiceManager::ReplaceGroupInPlace(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count,
     const VoiceHandle* outHandles, bool candidatesReservedInPlace) {
+    // Staging: the group's successors are configured into launch records right
+    // after this (groupStageNext_), so the victims' staged-field arrays survive
+    // until the records are applied and their ghost copies can be deferred.
+    const bool stage = launchStagingActive_ && stealTailCaptureSuppressed_;
+    ghostCopyDeferrable_ = stage;
     for (uint32_t i = 0u; i < count; ++i)
         CaptureStealTail(outHandles[i]);
+    ghostCopyDeferrable_ = false;
+    groupStageNext_ = stage;
 
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t lifecycleBegin = BeginLaunchStageForTest();
@@ -1017,7 +1028,7 @@ inline void VoiceManager::ReplaceGroupInPlace(
         v.state[handle] = static_cast<uint8_t>(VoiceState::Free);
         v.currentGain[handle] = 0.0f;
 
-        InitializePreparedVoice(handle, channel, note, velocity);
+        InitializePreparedVoice(handle, channel, note, velocity, stage);
         if (preserveRenderIndex)
             v.renderClass[handle] = configuredClass;
         stealCandidateDeferred_[handle] = 1u;
@@ -1248,6 +1259,7 @@ inline void VoiceManager::CommitPendingLaunchImpl() {
         ConfigureVoice(p.handles[layer], p.setups[layer], p.playIndex,
                        *p.params, false);
     }
+    groupStageNext_ = false;
     CommitVoiceGroupConfigurations(p.handles, p.count, true);
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     for (uint32_t i = 0u; i < p.count; ++i) {
@@ -1494,6 +1506,7 @@ inline bool VoiceManager::LaunchVoiceGroup(
         ConfigureVoice(outHandles[layer], setups[layer], playIndex,
                        channelParams, false);
     }
+    groupStageNext_ = false;
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     EndLaunchStageForTest(LaunchProfileStage::Configuration,
                           configureBegin);

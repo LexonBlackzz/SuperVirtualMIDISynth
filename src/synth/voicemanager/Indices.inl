@@ -218,7 +218,8 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
 }
 
 inline void VoiceManager::InitializePreparedVoice(
-    VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity) {
+    VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity,
+    bool staged) {
     // ConfigureVoice immediately supplies every sample/envelope/gain field.
     // Initialize only state observed by lifecycle indices before that
     // transaction commits, avoiding dozens of default stores per SF2 note.
@@ -226,8 +227,10 @@ inline void VoiceManager::InitializePreparedVoice(
     v.channel[handle] = channel;
     v.note[handle] = note;
     v.velocity[handle] = velocity;
-    v.sampleBacked[handle] = 0u;
-    v.relEnd[handle] = 0u;
+    if (!staged) {
+        v.sampleBacked[handle] = 0u;
+        v.relEnd[handle] = 0u;
+    }
     v.staged[handle] = 0u;
     v.envelopeStage[handle] = 0u;
     v.renderClass[handle] = static_cast<uint8_t>(VoiceRenderClass::Generic);
@@ -246,12 +249,14 @@ inline void VoiceManager::InitializePreparedVoice(
     v.birthFrame[handle] = currentFrame_;
     v.stealFadeInFramesRemaining[handle] = 0u;
     v.stealFadeInFramesTotal[handle] = 0u;
-    v.filterA0[handle] = 0.0f;
-    v.filterB1[handle] = 0.0f;
-    v.filterB2[handle] = 0.0f;
-    v.filterZ1[handle] = 0.0f;
-    v.filterZ2[handle] = 0.0f;
-    v.filterEnabled[handle] = 0u;
+    if (!staged) {
+        v.filterA0[handle] = 0.0f;
+        v.filterB1[handle] = 0.0f;
+        v.filterB2[handle] = 0.0f;
+        v.filterZ1[handle] = 0.0f;
+        v.filterZ2[handle] = 0.0f;
+        v.filterEnabled[handle] = 0u;
+    }
     stealCandidateDeferred_[handle] = 0u;
 }
 

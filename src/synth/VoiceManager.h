@@ -1150,8 +1150,12 @@ private:
 
     void InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity);
     void PrefetchVoiceLines(VoiceHandle handle);
+    // staged = true leaves the launch-record fields (sampleBacked, relEnd,
+    // filter coefficients/state) alone: the staged configure that follows
+    // supplies them, and a deferred ghost copy may still need the old values.
     void InitializePreparedVoice(VoiceHandle handle, uint8_t channel,
-                                 uint8_t note, uint8_t velocity);
+                                 uint8_t note, uint8_t velocity,
+                                 bool staged = false);
     void ApplyVoiceConfigurationFields(
         VoiceHandle handle, const VoiceConfiguration& setup,
         const ChannelParamsSnapshot& channelParams,
@@ -1308,6 +1312,9 @@ private:
     bool stealTailCaptureSuppressed_ = false;
     bool launchStagingActive_ = false;   // plan window: launches may stage
     bool ghostCopyDeferrable_ = false;   // set around the in-place steal capture
+    // Set by a staged ReplaceGroupInPlace for the ConfigureVoice calls that
+    // complete the same group launch (they write launch records, not SoA).
+    bool groupStageNext_ = false;
     const uint32_t* deferredGhostPending_ = nullptr;
     DeferredGhostFlushHook deferredGhostFlush_ = nullptr;
     void* deferredGhostUserData_ = nullptr;
