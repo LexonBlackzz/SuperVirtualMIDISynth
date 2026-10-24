@@ -11,6 +11,9 @@ void DiagWindow_SetBackendLabel(const wchar_t* label);
 // Event-timing counters (late/clamped/obsolete/skipped output), shown by the monitor.
 void DiagWindow_SetTiming(uint64_t late, uint64_t clamped, uint64_t maxLateFrames,
                           uint64_t staleSkipped, uint64_t skippedFrames);
+// GPU render stage state for the Renderer line: mode 0 off, 1 requested but
+// unavailable, 2 active (share = percent of recent blocks it took).
+void DiagWindow_SetGpu(uint32_t mode, float sharePercent, uint32_t rows);
 void DiagWindow_UpdateStartup(bool audioRunning, int32_t audioError,
                               bool soundFontLoaded, uint32_t sampleRate,
                               uint32_t bufferFrames, float masterVolume,

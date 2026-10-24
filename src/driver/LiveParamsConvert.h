@@ -90,6 +90,10 @@ inline void FillTelemetryV3Extension(const RuntimeLinkTelemetryV2& t,
     r.limiter_output_peak_r = t.limiterOutputPeakR;
     r.limiter_gain_reduction_db = t.limiterGainReductionDb;
     r.channel_limiter_enabled = t.channelLimiterEnabled;
+    r.gpu_mode = t.gpuMode;
+    r.gpu_share_percent = t.gpuSharePercent;
+    r.gpu_rows = t.gpuRows;
+    r.gpu_late_blocks = t.gpuLateBlocks;
     static_assert(sizeof(r.channel_limiter_input_peak) ==
                       sizeof(t.channelLimiterInputPeak),
                   "per-channel meter count must match the runtime link");

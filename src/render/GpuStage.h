@@ -34,6 +34,13 @@ struct GpuStageStats {
     uint64_t packMicros = 0u;       // pass 2: list + row packing
     uint64_t uploadMicros = 0u;     // static rows to the GPU
     uint64_t scatterMicros = 0u;    // read-back state into the SoA
+    uint32_t lastBlockRows = 0u; // voices on the GPU in the latest GPU block
+    uint64_t considered = 0u;    // blocks the renderer offered to the stage
+    // Blocks the stage declined, by reason: 0 no store / short block, 1 channel
+    // buses, 2 phase rotation, 3 decimation or scalar vibrato, 4 fewer active
+    // rows than the minimum, 5 stage could not prepare, 6 too few GPU-eligible
+    // rows (the rest could not go to the GPU), 7 a submit failed.
+    uint64_t declined[8] = {};
     bool lost = false;           // device gone; the stage is disabled
 };
 
@@ -193,7 +200,11 @@ public:
             ++stats_.failed;
             return false;
         }
-        if (first) ++stats_.blocks;
+        if (first) {
+            ++stats_.blocks;
+            stats_.lastBlockRows = 0u;
+        }
+        stats_.lastBlockRows += listCount + envCount;
         stats_.rows += listCount;
         stats_.envRows += envCount;
         stats_.uploads += uploads;

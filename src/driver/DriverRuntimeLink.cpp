@@ -835,6 +835,11 @@ svms::RuntimeLinkTelemetryV2 Driver::BuildRuntimeLinkTelemetry() {
             as.effectiveVoicesPeak.load(std::memory_order_relaxed);
         snap.noteMergedLow = as.noteMergedLow.load(std::memory_order_relaxed);
         snap.noteMergedHigh = as.noteMergedHigh.load(std::memory_order_relaxed);
+        snap.gpuMode = as.gpuMode.load(std::memory_order_relaxed);
+        snap.gpuSharePercent = U32BitsToFloat(
+            as.gpuSharePercentBits.load(std::memory_order_relaxed));
+        snap.gpuRows = as.gpuRows.load(std::memory_order_relaxed);
+        snap.gpuLateBlocks = as.gpuLateBlocks.load(std::memory_order_relaxed);
 
         // Re-verify the settlement: a writer that started mid-copy means
         // this frame may be torn — reuse the last stable publish instead

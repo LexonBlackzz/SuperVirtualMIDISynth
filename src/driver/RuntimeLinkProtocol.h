@@ -446,7 +446,13 @@ struct alignas(64) RuntimeLinkTelemetryV2 {
     uint32_t effectiveVoicesPeak     = 0u;
     uint32_t noteMergedLow           = 0u;
     uint32_t noteMergedHigh          = 0u;
-    uint32_t channelLimiterReserved[11] = {};
+    // ── GPU render stage (carved from the reserved words, size unchanged) ──
+    // gpuMode: 0 off, 1 requested but unavailable, 2 active.
+    uint32_t gpuMode                 = 0u;
+    float    gpuSharePercent         = 0.0f;   // recent blocks taken by the GPU
+    uint32_t gpuRows                 = 0u;     // voices on the GPU, last GPU block
+    uint32_t gpuLateBlocks           = 0u;
+    uint32_t channelLimiterReserved[7] = {};
 };
 
 static_assert(std::is_trivially_copyable<RuntimeLinkTelemetryV2>::value,
@@ -680,6 +686,12 @@ struct alignas(64) RuntimeAudioSnapshot {
     std::atomic<uint32_t> effectiveVoicesPeak{0u};
     std::atomic<uint32_t> noteMergedLow{0u};
     std::atomic<uint32_t> noteMergedHigh{0u};
+
+    // GPU render stage census (see RuntimeLinkTelemetryV2).
+    std::atomic<uint32_t> gpuMode{0u};
+    std::atomic<uint32_t> gpuSharePercentBits{0u};
+    std::atomic<uint32_t> gpuRows{0u};
+    std::atomic<uint32_t> gpuLateBlocks{0u};
 
     // Per-MIDI-channel limiter (positive dB gain reduction + pre-limit
     // peak, exact IEEE-754 bit patterns; kRLV2ChannelCount entries).

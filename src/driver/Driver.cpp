@@ -652,6 +652,7 @@ bool Driver::Initialize() {
         return false;
     }
 #if defined(SVMS_GPU_STAGE)
+    gpuRequested = cfg.gpuApi != 0u && !shard;
     if (cfg.gpuApi != 0u && !shard) {
         // Opt-in GPU stage: a failure here is not an error, the CPU renders
         // everything exactly as it does without the stage.
@@ -664,9 +665,12 @@ bool Driver::Initialize() {
             gpuStage->SetMaxFramesHint(bufferCapacity);
             renderScalar->SetGpuStage(gpuStage.get());
             LOG("GPU render stage: %s", gpuStage->Name());
+            GpuLogLine("GPU render stage created: %s", gpuStage->Name());
         } else {
             LOG("GPU render stage unavailable (%s); rendering on the CPU",
                 gpuError.c_str());
+            GpuLogLine("GPU render stage unavailable (%s); rendering on the CPU",
+                       gpuError.c_str());
         }
     }
 #endif
@@ -857,6 +861,20 @@ void Driver::Shutdown() {
     }
 #if defined(SVMS_GPU_STAGE)
     if (renderScalar) renderScalar->SetGpuStage(nullptr);
+    if (gpuStage) {
+        const GpuStageStats& g = gpuStage->Stats();
+        GpuLogLine("GPU render stage summary: offered=%llu gpu_blocks=%llu "
+                   "sustained_rows=%llu env_rows=%llu late=%llu failed=%llu "
+                   "declined[short=%llu bus=%llu rot=%llu decim/vib=%llu "
+                   "few_voices=%llu prepare=%llu few_gpu_rows=%llu submit=%llu]",
+                   (unsigned long long)g.considered, (unsigned long long)g.blocks,
+                   (unsigned long long)g.rows, (unsigned long long)g.envRows,
+                   (unsigned long long)g.late, (unsigned long long)g.failed,
+                   (unsigned long long)g.declined[0], (unsigned long long)g.declined[1],
+                   (unsigned long long)g.declined[2], (unsigned long long)g.declined[3],
+                   (unsigned long long)g.declined[4], (unsigned long long)g.declined[5],
+                   (unsigned long long)g.declined[6], (unsigned long long)g.declined[7]);
+    }
     gpuStage.reset();
 #endif
     delete renderScalar; renderScalar = nullptr;

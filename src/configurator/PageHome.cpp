@@ -301,7 +301,13 @@ void LoadTile(const SVMS_TelemetryV3* t, const ConfigValues& cfg) {
     const uint32_t sr = t && t->census.sample_rate ? t->census.sample_rate : cfg.sampleRate;
     const uint32_t frames = t && t->census.buffer_frames ? t->census.buffer_frames : cfg.bufferFrames;
     char budget[48];
-    std::snprintf(budget, sizeof(budget), "%.1f ms per block", 1000.0f * frames / static_cast<float>((std::max)(1u, sr)));
+    const float blockMs = 1000.0f * frames / static_cast<float>((std::max)(1u, sr));
+    if (t && t->gpu_mode == 2u)
+        std::snprintf(budget, sizeof(budget), "%.1f ms per block \xC2\xB7 GPU %.0f%%", blockMs, t->gpu_share_percent);
+    else if (t && t->gpu_mode == 1u)
+        std::snprintf(budget, sizeof(budget), "%.1f ms per block \xC2\xB7 GPU unavailable", blockMs);
+    else
+        std::snprintf(budget, sizeof(budget), "%.1f ms per block", blockMs);
     TileHeader("Render load", budget);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p = ImGui::GetCursorScreenPos();

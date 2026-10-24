@@ -55,6 +55,9 @@ static DiagStats g_stats[2] = {};
 static std::atomic<uint32_t> g_publishedStats{0};
 static std::atomic<uint32_t> g_statsReader{UINT32_MAX};
 static std::atomic<uint64_t> g_timing[5];
+static std::atomic<uint32_t> g_gpuMode{0u};
+static std::atomic<float> g_gpuShare{0.0f};
+static std::atomic<uint32_t> g_gpuRows{0u};
 
 static HWND g_hwnd = nullptr;
 static HFONT g_font = nullptr;
@@ -211,9 +214,19 @@ static void OnPaint(HWND hwnd) {
 
     const wchar_t* renderer = s.renderBackend == RenderBackend::AVX2 ? L"AVX2"
         : s.renderBackend == RenderBackend::SSE2 ? L"SSE2" : L"scalar";
+    wchar_t gpuText[96] = L"";
+    const uint32_t gpuMode = g_gpuMode.load(std::memory_order_relaxed);
+    if (gpuMode == 2u) {
+        std::swprintf(gpuText, sizeof(gpuText) / sizeof(gpuText[0]),
+                      L" + GPU (%.0f%% of blocks, %u voices)",
+                      g_gpuShare.load(std::memory_order_relaxed),
+                      g_gpuRows.load(std::memory_order_relaxed));
+    } else if (gpuMode == 1u) {
+        std::wcscpy(gpuText, L" (GPU requested, unavailable)");
+    }
     std::swprintf(buf, sizeof(buf) / sizeof(buf[0]),
-                  L"%ls, %u thread%ls, helpers %.0f%%",
-                  renderer, s.renderThreadCount,
+                  L"%ls%ls, %u thread%ls, helpers %.0f%%",
+                  renderer, gpuText, s.renderThreadCount,
                   s.renderThreadCount == 1u ? L"" : L"s",
                   s.multicoreEffectiveness);
     DrawStat(memDC, kPadX, y, L"Renderer:         ", buf);
@@ -516,6 +529,12 @@ void DiagWindow_Update(uint32_t activeVoices, uint32_t maxVoices,
     stats.scheduledEvents = scheduledEvents;
     stats.sf2 = sf2;
     g_publishedStats.store(target, std::memory_order_release);
+}
+
+void DiagWindow_SetGpu(uint32_t mode, float sharePercent, uint32_t rows) {
+    g_gpuMode.store(mode, std::memory_order_relaxed);
+    g_gpuShare.store(sharePercent, std::memory_order_relaxed);
+    g_gpuRows.store(rows, std::memory_order_relaxed);
 }
 
 void DiagWindow_SetTiming(uint64_t late, uint64_t clamped, uint64_t maxLateFrames,

@@ -344,12 +344,19 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
         gpuVoiceEpoch_ = voices.StaticEpoch();
         stage.BumpEpoch();
     }
-    if (sampleData == nullptr || numFrames < 8u || channelBusLeft != nullptr ||
-        voices.v.rot != nullptr || wvDecimating_ || wvScalarVibrato_ ||
-        activeCount < stage.MinimumVoices() ||
-        !stage.Prepare(sampleData, sampleDataFrames, voices.v.GetCapacity(),
-                       numFrames)) {
+    GpuStageStats& counters = stage.MutableStats();
+    ++counters.considered;
+    uint32_t declineReason = 8u;
+    if (sampleData == nullptr || numFrames < 8u) declineReason = 0u;
+    else if (channelBusLeft != nullptr) declineReason = 1u;
+    else if (voices.v.rot != nullptr) declineReason = 2u;
+    else if (wvDecimating_ || wvScalarVibrato_) declineReason = 3u;
+    else if (activeCount < stage.MinimumVoices()) declineReason = 4u;
+    else if (!stage.Prepare(sampleData, sampleDataFrames,
+                            voices.v.GetCapacity(), numFrames)) declineReason = 5u;
+    if (declineReason != 8u) {
         // CPU-only block: rows may change under a resident copy.
+        ++counters.declined[declineReason];
         stage.BumpEpoch();
         return 0u;
     }
@@ -412,6 +419,7 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
             static_cast<uint64_t>(gpuRun + envRun) * activeCount / partRows <
                 stage.MinimumVoices()) {
             // Too little for the GPU to pay off: everything stays on the CPU.
+            ++counters.declined[6];
             stage.BumpEpoch();
             return 0u;
         }
@@ -443,6 +451,7 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
         if (!ok) {
             // Nothing has been folded into the SoA yet, so the whole block
             // simply stays on the CPU.
+            ++counters.declined[7];
             stage.Abandon();
             stage.BumpEpoch();
             return 0u;

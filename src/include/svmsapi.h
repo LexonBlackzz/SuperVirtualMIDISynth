@@ -438,7 +438,16 @@ typedef struct SVMS_TelemetryV3 {
      * it advances while the engine runs, so a reader can tell a live frame
      * from a stale one. 8-aligned: it follows the 256-byte name. */
     uint64_t publish_timestamp;
-    uint32_t reserved[6];
+    /* GPU render stage (synth.gpu_api): 0 = off, 1 = requested but not
+     * available (the CPU renders), 2 = active. gpu_share_percent is the share
+     * of recent audio blocks the stage took (it only takes blocks with enough
+     * active voices); gpu_rows is how many voices it rendered in the last such
+     * block, gpu_late_blocks how many blocks missed their deadline. */
+    uint32_t gpu_mode;
+    float gpu_share_percent;
+    uint32_t gpu_rows;
+    uint32_t gpu_late_blocks;
+    uint32_t reserved[2];
 } SVMS_TelemetryV3;
 
 /* One record per real-time audio callback (SVMS_CAP_CALLBACK_TRACE). The

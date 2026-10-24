@@ -138,6 +138,25 @@ inline void Log(const char* fmt, ...) {
 
 #define LOG(fmt, ...) Log("[SVMS] " fmt "\n", ##__VA_ARGS__)
 
+// One line appended to %TEMP%\svms_gpu.log whether or not verbose logging is
+// compiled in: the GPU stage is opt-in and silent when it falls back, so this
+// is how to see that it was created and how many blocks it really took.
+inline void GpuLogLine(const char* fmt, ...) {
+    char text[768];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(text, sizeof(text), _TRUNCATE, fmt, args);
+    va_end(args);
+    char path[MAX_PATH + 32];
+    const DWORD n = GetTempPathA(MAX_PATH, path);
+    if (n == 0u || n > MAX_PATH) return;
+    strcat_s(path, sizeof(path), "svms_gpu.log");
+    FILE* file = nullptr;
+    if (fopen_s(&file, path, "a") != 0 || !file) return;
+    std::fprintf(file, "[pid %lu] %s\n", static_cast<unsigned long>(GetCurrentProcessId()), text);
+    std::fclose(file);
+}
+
 #if defined(SVMS_XP_COMPAT)
 inline void XPBootstrapTrace(const char* message) {
     OutputDebugStringA(message);
@@ -917,6 +936,7 @@ private:
     RenderScalar* renderScalar;
 #if defined(SVMS_GPU_STAGE)
     std::unique_ptr<GpuStage> gpuStage;
+    bool gpuRequested = false;   // synth.gpu_api != 0 (stage may still be unavailable)
 #endif
     SF2Data* soundFontData;
     RuntimeConfigSnapshot* configSnapshot;

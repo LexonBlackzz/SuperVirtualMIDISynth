@@ -284,9 +284,17 @@ void DrawDiagnosticsPage(ConfigDocument& doc) {
     ui::CardHeaderEnd();
     const std::string logical = std::to_string(std::thread::hardware_concurrency());
     const std::string backend = std::string(DetectedBackend());
-    const char* keys[5] = {"CPU", "Logical processors", "Memory", "GPU", "Render backend"};
-    const char* vals[5] = {cpu.c_str(), logical.c_str(), memory, gpu.c_str(), backend.c_str()};
-    ui::KeyValueGrid(keys, vals, 5);
+    char gpuStage[96];
+    if (t && t->gpu_mode == 2u)
+        std::snprintf(gpuStage, sizeof(gpuStage), "On: %.0f%% of blocks, %u voices on the GPU, %u late",
+                      t->gpu_share_percent, t->gpu_rows, t->gpu_late_blocks);
+    else if (t && t->gpu_mode == 1u)
+        std::snprintf(gpuStage, sizeof(gpuStage), "Requested, but not available (the CPU renders)");
+    else
+        std::snprintf(gpuStage, sizeof(gpuStage), "Off");
+    const char* keys[6] = {"CPU", "Logical processors", "Memory", "GPU", "Render backend", "GPU rendering"};
+    const char* vals[6] = {cpu.c_str(), logical.c_str(), memory, gpu.c_str(), backend.c_str(), gpuStage};
+    ui::KeyValueGrid(keys, vals, 6);
     ui::EndCard();
 }
 

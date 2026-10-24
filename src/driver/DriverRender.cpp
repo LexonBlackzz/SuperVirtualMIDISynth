@@ -1071,6 +1071,17 @@ const uint32_t importedPages = self->useEventCompiler_
                     const uint32_t voice = vm->activeList_[position];
                     sustainHeldVoices += vm->v.heldBySustain[voice] != 0;
                 }
+#if defined(SVMS_GPU_STAGE)
+                if (self->gpuStage) {
+                    const GpuStageStats& g = self->gpuStage->Stats();
+                    DiagWindow_SetGpu(2u, g.considered != 0u
+                        ? 100.0f * static_cast<float>(g.blocks) /
+                              static_cast<float>(g.considered) : 0.0f,
+                        g.lastBlockRows);
+                } else {
+                    DiagWindow_SetGpu(self->gpuRequested ? 1u : 0u, 0.0f, 0u);
+                }
+#endif
                 DiagWindow_SetTiming(self->telemetry_.late,
                                      self->telemetry_.lateClamped,
                                      self->telemetry_.lateClampMaxLateness,
@@ -1251,6 +1262,34 @@ const uint32_t importedPages = self->useEventCompiler_
             as.noteMergedHigh.store(static_cast<uint32_t>(merged >> 32u),
                                     std::memory_order_relaxed);
         }
+#if defined(SVMS_GPU_STAGE)
+        {
+            // GPU stage census: share of the blocks offered since the last
+            // publish that the GPU took.
+            static uint64_t s_gpuPrevOffered = 0u;
+            static uint64_t s_gpuPrevBlocks = 0u;
+            static float s_gpuShare = 0.0f;
+            if (self->gpuStage) {
+                const GpuStageStats& g = self->gpuStage->Stats();
+                if (g.considered > s_gpuPrevOffered) {
+                    s_gpuShare = 100.0f *
+                        static_cast<float>(g.blocks - s_gpuPrevBlocks) /
+                        static_cast<float>(g.considered - s_gpuPrevOffered);
+                    s_gpuPrevOffered = g.considered;
+                    s_gpuPrevBlocks = g.blocks;
+                }
+                as.gpuMode.store(2u, std::memory_order_relaxed);
+                as.gpuSharePercentBits.store(FloatToU32Bits(s_gpuShare),
+                                             std::memory_order_relaxed);
+                as.gpuRows.store(g.lastBlockRows, std::memory_order_relaxed);
+                as.gpuLateBlocks.store(static_cast<uint32_t>(g.late),
+                                       std::memory_order_relaxed);
+            } else {
+                as.gpuMode.store(self->gpuRequested ? 1u : 0u,
+                                 std::memory_order_relaxed);
+            }
+        }
+#endif
         as.schedulerPercentBits.store(FloatToU32Bits(s_schedulerSmoothed),
                                       std::memory_order_relaxed);
         as.eventDispatchPercentBits.store(FloatToU32Bits(s_dispatchSmoothed),
