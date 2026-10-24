@@ -29,6 +29,9 @@ constexpr uint32_t kFilterFlag = 0x80000000u;
 // releasing, else the envelope stage), 5 attackRem, 6 decayRem, 7 releaseRem.
 constexpr uint32_t kDynWords = 8u;
 
+// A block is submitted in up to this many parts.
+constexpr uint32_t kMaxParts = 4u;
+
 // One row upload record (64 B): the handle, its static row words, and the
 // dynamic state it starts from (phase, filter delay line).
 struct UploadRecord {
@@ -124,20 +127,27 @@ public:
     virtual bool UploadEnvRows(const EnvUploadRecord* records,
                                uint32_t count) = 0;
 
-    // Start rendering `count` sustained-loop entries and `envCount` envelope
-    // entries over `frames` frames.  `retireThreshold` is the release gain
-    // floor (VoiceRetireThreshold()).
+    // Start rendering a part of a block: `count` sustained-loop entries and
+    // `envCount` envelope entries (this part's slice of the block's lists) over
+    // `frames` frames.  A block is submitted as one or two parts so the CPU can
+    // pack the second while the GPU runs the first; `last` ends the block.
+    // `retireThreshold` is the release gain floor (VoiceRetireThreshold()).
     virtual bool Submit(const uint32_t* list, uint32_t count,
                         const uint32_t* envList, uint32_t envCount,
-                        uint32_t frames, float retireThreshold) = 0;
+                        uint32_t frames, float retireThreshold, bool last) = 0;
 
-    // Poll until the block finishes or `timeoutMicros` elapse (0 = a single
-    // poll, ~0ull = wait forever).  On Ok, mixLR holds 2*frames floats
-    // (left, right per frame), dyn holds `count` entries and envDyn holds
-    // `envCount` entries.
-    // The result pointers stay valid until the next Submit.
+    // Waits for the oldest submitted part until it finishes or `timeoutMicros`
+    // elapse (0 = a single poll, ~0ull = wait forever).  On Ok, mixLR holds
+    // that part's 2*frames floats (left, right per frame) and dyn / envDyn the
+    // block's read-back arrays, indexed by position in the block's lists (this
+    // part's entries are valid).  The pointers stay valid until the next
+    // Submit that starts a block.
     virtual Result Collect(uint64_t timeoutMicros, const float** mixLR,
                            const DynOut** dyn, const EnvDynOut** envDyn) = 0;
+
+    // Drops every part still in flight (late or failed block); the GPU may
+    // finish them but nothing reads the results.
+    virtual void Abandon() = 0;
 
     // Accumulated GPU time of the voice and reduction passes (nanoseconds),
     // when the backend profiles (SVMS_GPU_PROFILE=1).

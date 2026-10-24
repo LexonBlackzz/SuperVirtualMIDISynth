@@ -1,8 +1,8 @@
 // Part of RenderScalar.h; included from there inside namespace svms. Not standalone.
 //
 // GPU render stage glue (see render/GpuStage.h).  A block that qualifies has
-// its eligible rows moved to the tail of wvSliceHandles_ -- [cpu][sustained]
-// [envelope] -- and rendered by the GPU while the worker pool renders
+// its eligible rows listed in the stage (sustained and envelope lists) and
+// rendered by the GPU while the worker pool renders
 // everything else.  Sustained-loop rows run the kernel of the scalar fast
 // branch; every other plain whole-block row (release tails, attack/decay,
 // one-shots) runs the scalar generic span machine, retire frames included.
@@ -18,7 +18,11 @@ struct RenderScalar::GpuPassContext {
     VoiceManager* voices;
     GpuStage* stage;
     uint32_t pass;          // 1 classify, 2 pack, 3 scatter results
-    uint32_t jobCount;
+    uint32_t jobCount;      // jobs the active list is split into
+    uint32_t jobFirst;      // pass 2: the jobs [jobFirst, jobEnd) of one part
+    uint32_t jobEnd;
+    uint32_t partSBase;     // pass 3: the part's slice of the two lists
+    uint32_t partEBase;
     uint32_t activeCount;
     uint32_t cpuCount;
     uint32_t sustainedCount;
@@ -74,17 +78,20 @@ inline uint8_t RenderScalar::GpuRowKind(const VoiceSoA& v, uint32_t h,
     return GpuStage::kKindEnvelope;
 }
 
-inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
+inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
                                        uint32_t, void* userData) {
     GpuPassContext& c = *static_cast<GpuPassContext*>(userData);
+    // Passes 1 and 2 split the active list into jobCount ranges (pass 2 runs
+    // them part by part); pass 3 splits one part's list slice.
+    const uint32_t job = c.pass == 3u ? localJob : c.jobFirst + localJob;
     RenderScalar* renderer = c.renderer;
     VoiceSoA& v = c.voices->v;
     GpuStage& stage = *c.stage;
     if (c.pass == 3u) {
         // Scatter the read-back dynamic state into the SoA.
         {
-            const uint32_t begin = c.sustainedCount * job / c.jobCount;
-            const uint32_t end = c.sustainedCount * (job + 1u) / c.jobCount;
+            const uint32_t begin = c.partSBase + c.sustainedCount * job / c.jobCount;
+            const uint32_t end = c.partSBase + c.sustainedCount * (job + 1u) / c.jobCount;
             const uint32_t* list = stage.List();
             const gpu::DynOut* dyn = stage.Dyn();
             for (uint32_t k = begin; k < end; ++k) {
@@ -96,8 +103,8 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
                 }
             }
         }
-        const uint32_t begin = c.envCount * job / c.jobCount;
-        const uint32_t end = c.envCount * (job + 1u) / c.jobCount;
+        const uint32_t begin = c.partEBase + c.envCount * job / c.jobCount;
+        const uint32_t end = c.partEBase + c.envCount * (job + 1u) / c.jobCount;
         const uint32_t* list = stage.EnvList();
         const gpu::EnvDynOut* dyn = stage.EnvDyn();
         GpuStage::RetireRec* retire = stage.RetireScratch() + begin;
@@ -195,10 +202,7 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
     uint32_t* envList = stage.EnvList();
     gpu::UploadRecord* scratch = stage.UploadScratch() + begin;
     gpu::EnvUploadRecord* envScratch = stage.EnvUploadScratch() + begin;
-    uint32_t* cpuOut = renderer->wvSliceHandles_ + c.cpuBase[job];
-    uint32_t* gpuOut = renderer->wvSliceHandles_ + c.cpuCount + c.gpuBase[job];
-    uint32_t* envOut = renderer->wvSliceHandles_ + c.cpuCount +
-                       c.sustainedCount + c.envBase[job];
+    uint32_t* cpuOut = stage.CpuRows() + c.cpuBase[job];
     uint32_t* listOut = list + c.gpuBase[job];
     uint32_t* envListOut = envList + c.envBase[job];
     uint32_t uploads = 0u;
@@ -213,10 +217,8 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
         if ((flags[i] & GpuStage::kNeedsCheck) == 0u) {
             // Resident and still valid: the list is all the GPU needs.
             if (kind == GpuStage::kKindSustained) {
-                *gpuOut++ = h;
                 *listOut++ = h;
             } else {
-                *envOut++ = h;
                 *envListOut++ = h;
             }
             continue;
@@ -227,7 +229,6 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
         // different statics under one play index.
         const uint32_t stamp = v.playIndex[h];
         if (kind == GpuStage::kKindSustained) {
-            *gpuOut++ = h;
             *listOut++ = h;
             if (stamp != UINT32_MAX && resident[h] == stamp &&
                 residentKind[h] == kind) {
@@ -258,7 +259,6 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
         const bool released =
             v.state[h] == static_cast<uint8_t>(VoiceState::Releasing);
         const uint32_t stage0 = released ? 0u : v.envelopeStage[h];
-        *envOut++ = h;
         *envListOut++ = h;
         const uint8_t envKind = released ? 3u : 2u;
         if (stamp != UINT32_MAX && resident[h] == stamp &&
@@ -307,19 +307,20 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
 inline void RenderScalar::RunGpuPass(GpuPassContext& ctx, float* outputLeft,
                                      float* outputRight) {
     bool dispatched = false;
-    if (ctx.jobCount >= 2u && workerPool_ != nullptr) {
+    const uint32_t jobs = ctx.jobEnd - ctx.jobFirst;
+    if (jobs >= 2u && workerPool_ != nullptr) {
         dispatched = workerPool_->ExecuteIndexed(
-            ctx.jobCount, 1u, outputLeft, outputRight, &GpuPassThunk, &ctx,
+            jobs, 1u, outputLeft, outputRight, &GpuPassThunk, &ctx,
             nullptr, nullptr);
     }
     if (!dispatched) {
-        for (uint32_t job = 0u; job < ctx.jobCount; ++job)
+        for (uint32_t job = 0u; job < jobs; ++job)
             GpuPassThunk(job, IndexedJobMix{}, 1u, &ctx);
     }
 }
 
-// Moves the block's GPU rows to the tail of wvSliceHandles_ and starts the
-// GPU.  Returns the number of rows the GPU owns this block (0 = CPU only).
+// Lists the block's GPU rows (the CPU keeps the rest in wvItemHandles_) and
+// starts the GPU.  Returns the number of rows the GPU owns this block (0 = CPU only).
 // `submitted` is false when rows were partitioned but the submit failed; the
 // caller then renders them on the CPU like a late block.
 inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
@@ -359,169 +360,217 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
     ctx.activeCount = activeCount;
     ctx.storeFrames = sampleDataFrames;
     ctx.stagedPending = voices.StagedPending();
-    uint32_t jobs = 1u;
+    // A big block is classified, packed and submitted part by part: the GPU
+    // starts on part 0 after a fraction of the CPU passes and the CPU keeps
+    // packing the next part (and scattering the previous one) while it runs.
+    // Part p owns the jobs [p * jobsPerPart, (p + 1) * jobsPerPart) of the
+    // active list; the jobs' outputs are contiguous in every list, so a part
+    // is a slice of each.
+    const uint32_t parts = activeCount >= stage.SplitMinRows() ? stage.Parts() : 1u;
+    uint32_t jobsPerPart = 1u;
     if (workerPool_ != nullptr) {
-        jobs = (std::min)((std::min)(workerPool_->GetThreadCount() * 2u,
-                                     workerPool_->GetJobCapacity()),
-                          GpuStage::kMaxJobs);
-        jobs = (std::min)(jobs, (std::max)(1u, activeCount / 2048u));
+        jobsPerPart = (std::min)(workerPool_->GetThreadCount() * 2u,
+                                 workerPool_->GetJobCapacity());
+        jobsPerPart = (std::min)(jobsPerPart,
+                                 (std::max)(1u, activeCount / parts / 2048u));
     }
-    ctx.jobCount = jobs < 2u ? 1u : jobs;
+    while (parts * jobsPerPart > GpuStage::kMaxJobs) --jobsPerPart;
+    ctx.jobCount = parts * jobsPerPart;
 
-    const uint64_t classifyStart = GpuStage::NowMicros();
-    ctx.pass = 1u;
-    RunGpuPass(ctx, outputLeft, outputRight);
-    stage.MutableStats().classifyMicros += GpuStage::NowMicros() - classifyStart;
-    uint32_t sustainedTotal = 0u;
-    uint32_t envTotal = 0u;
-    for (uint32_t job = 0u; job < ctx.jobCount; ++job) {
-        sustainedTotal += stage.JobGpuCount()[job];
-        envTotal += stage.JobEnvCount()[job];
-    }
-    const uint32_t gpuTotal = sustainedTotal + envTotal;
-    if (gpuTotal < stage.MinimumVoices()) {
-        stage.BumpEpoch();
-        return 0u;
-    }
-    ctx.cpuCount = activeCount - gpuTotal;
-    ctx.sustainedCount = sustainedTotal;
-    ctx.envCount = envTotal;
+    gpuPartCount_ = 0u;
+    gpuSubmittedParts_ = 0u;
     uint32_t cpuRun = 0u;
     uint32_t gpuRun = 0u;
     uint32_t envRun = 0u;
-    for (uint32_t job = 0u; job < ctx.jobCount; ++job) {
-        const uint32_t begin = activeCount * job / ctx.jobCount;
-        const uint32_t end = activeCount * (job + 1u) / ctx.jobCount;
-        ctx.cpuBase[job] = cpuRun;
-        ctx.gpuBase[job] = gpuRun;
-        ctx.envBase[job] = envRun;
-        cpuRun += (end - begin) - stage.JobGpuCount()[job] -
-                  stage.JobEnvCount()[job];
-        gpuRun += stage.JobGpuCount()[job];
-        envRun += stage.JobEnvCount()[job];
-    }
-    const uint64_t packStart = GpuStage::NowMicros();
-    ctx.pass = 2u;
-    RunGpuPass(ctx, outputLeft, outputRight);
-    stage.MutableStats().packMicros += GpuStage::NowMicros() - packStart;
+    for (uint32_t part = 0u; part < parts; ++part) {
+        const uint32_t j0 = part * jobsPerPart;
+        const uint32_t j1 = j0 + jobsPerPart;
+        const bool last = part + 1u == parts;
+        const uint64_t classifyStart = GpuStage::NowMicros();
+        ctx.pass = 1u;
+        ctx.jobFirst = j0;
+        ctx.jobEnd = j1;
+        RunGpuPass(ctx, outputLeft, outputRight);
+        stage.MutableStats().classifyMicros += GpuStage::NowMicros() - classifyStart;
+        const uint32_t sStart = gpuRun;
+        const uint32_t eStart = envRun;
+        for (uint32_t job = j0; job < j1; ++job) {
+            const uint32_t begin = activeCount * job / ctx.jobCount;
+            const uint32_t end = activeCount * (job + 1u) / ctx.jobCount;
+            ctx.cpuBase[job] = cpuRun;
+            ctx.gpuBase[job] = gpuRun;
+            ctx.envBase[job] = envRun;
+            cpuRun += (end - begin) - stage.JobGpuCount()[job] -
+                      stage.JobEnvCount()[job];
+            gpuRun += stage.JobGpuCount()[job];
+            envRun += stage.JobEnvCount()[job];
+        }
+        // The first part stands for the block: extrapolate its GPU share.
+        const uint32_t partRows = activeCount * j1 / ctx.jobCount -
+                                  activeCount * j0 / ctx.jobCount;
+        if (part == 0u && partRows != 0u &&
+            static_cast<uint64_t>(gpuRun + envRun) * activeCount / partRows <
+                stage.MinimumVoices()) {
+            // Too little for the GPU to pay off: everything stays on the CPU.
+            stage.BumpEpoch();
+            return 0u;
+        }
+        gpuPart_[part] = {sStart, gpuRun - sStart, eStart, envRun - eStart};
 
-    const uint64_t uploadStart = GpuStage::NowMicros();
-    uint32_t uploads = 0u;
-    uint32_t envUploads = 0u;
-    bool ok = true;
-    for (uint32_t job = 0u; job < ctx.jobCount && ok; ++job) {
-        const uint32_t begin = activeCount * job / ctx.jobCount;
-        const uint32_t count = stage.JobUploadCount()[job];
-        const uint32_t envCount = stage.JobEnvUploadCount()[job];
-        uploads += count;
-        envUploads += envCount;
-        ok = stage.UploadRows(stage.UploadScratch() + begin, count) &&
-             stage.UploadEnvRows(stage.EnvUploadScratch() + begin, envCount);
+        const uint64_t packStart = GpuStage::NowMicros();
+        ctx.pass = 2u;
+        RunGpuPass(ctx, outputLeft, outputRight);
+        stage.MutableStats().packMicros += GpuStage::NowMicros() - packStart;
+
+        const uint64_t uploadStart = GpuStage::NowMicros();
+        uint32_t uploads = 0u;
+        uint32_t envUploads = 0u;
+        bool ok = true;
+        for (uint32_t job = j0; job < j1 && ok; ++job) {
+            const uint32_t begin = activeCount * job / ctx.jobCount;
+            const uint32_t count = stage.JobUploadCount()[job];
+            const uint32_t envCount = stage.JobEnvUploadCount()[job];
+            uploads += count;
+            envUploads += envCount;
+            ok = stage.UploadRows(stage.UploadScratch() + begin, count) &&
+                 stage.UploadEnvRows(stage.EnvUploadScratch() + begin, envCount);
+        }
+        stage.MutableStats().uploadMicros += GpuStage::NowMicros() - uploadStart;
+        ok = ok && stage.SubmitPart(sStart, gpuRun - sStart, eStart,
+                                    envRun - eStart, numFrames, uploads,
+                                    envUploads, VoiceRetireThreshold(),
+                                    part == 0u, last);
+        if (!ok) {
+            // Nothing has been folded into the SoA yet, so the whole block
+            // simply stays on the CPU.
+            stage.Abandon();
+            stage.BumpEpoch();
+            return 0u;
+        }
+        ++gpuPartCount_;
+        ++gpuSubmittedParts_;
     }
-    stage.MutableStats().uploadMicros += GpuStage::NowMicros() - uploadStart;
-    submitted = ok && stage.Submit(sustainedTotal, envTotal, numFrames,
-                                   uploads, envUploads,
-                                   VoiceRetireThreshold());
-    if (!submitted) stage.BumpEpoch();
-    gpuSustainedRows_ = sustainedTotal;
-    gpuEnvRows_ = envTotal;
-    return gpuTotal;
+    submitted = true;
+    gpuSustainedRows_ = gpuRun;
+    gpuEnvRows_ = envRun;
+    wvItemHandles_ = stage.CpuRows();
+    return gpuRun + envRun;
 }
 
-// Waits for the GPU and folds its rows into the block, or renders them on the
-// CPU when it was late or failed.  `cpuCount` is where the GPU rows start in
-// wvSliceHandles_.
+// Waits for the GPU part by part and folds its rows into the block (scattering
+// one part while the GPU still runs the next), or renders the rows of a late,
+// lost or never-submitted part on the CPU.  `cpuCount` is where the GPU rows
+// start in wvSliceHandles_: all sustained rows, then all envelope rows.
 inline void RenderScalar::FinishGpuRows(VoiceManager& voices,
                                         const int16_t* sampleData,
                                         uint32_t sampleDataFrames,
                                         float* outputLeft, float* outputRight,
                                         uint32_t numFrames, uint32_t gpuCount,
                                         uint32_t cpuCount, bool submitted) {
+    (void)submitted;
+    (void)cpuCount;
     GpuStage& stage = *gpuStage_;
-    const uint32_t sustainedCount = gpuSustainedRows_;
-    const uint32_t envCount = gpuEnvRows_;
-    if (submitted && stage.Collect(numFrames) == gpu::Result::Ok) {
-        const float* mix = stage.Mix();
-        for (uint32_t frame = 0u; frame < numFrames; ++frame) {
-            outputLeft[frame] += mix[frame * 2u];
-            outputRight[frame] += mix[frame * 2u + 1u];
-        }
-        const uint64_t scatterStart = GpuStage::NowMicros();
-        GpuPassContext ctx{};
-        ctx.renderer = this;
-        ctx.voices = &voices;
-        ctx.stage = &stage;
-        ctx.pass = 3u;
-        ctx.activeCount = cpuCount + gpuCount;
-        ctx.cpuCount = cpuCount;
-        ctx.sustainedCount = sustainedCount;
-        ctx.envCount = envCount;
-        uint32_t jobs = 1u;
-        if (workerPool_ != nullptr) {
-            jobs = (std::min)((std::min)(workerPool_->GetThreadCount() * 2u,
-                                         workerPool_->GetJobCapacity()),
-                              GpuStage::kMaxJobs);
-            jobs = (std::min)(jobs, (std::max)(1u, gpuCount / 2048u));
-        }
-        ctx.jobCount = jobs < 2u ? 1u : jobs;
-        RunGpuPass(ctx, outputLeft, outputRight);
-        // Retire frames the envelope kernel found join the block's retirement
-        // list (job slot 0; the list is sorted by frame and active position
-        // afterwards, so the slot does not matter).
-        if (envCount != 0u) {
-            SpanRetirement* retBuf = wvJobRetirements_;
-            uint32_t& retCount = wvJobRetireCounts_[0];
-            for (uint32_t job = 0u; job < ctx.jobCount; ++job) {
-                const uint32_t begin = envCount * job / ctx.jobCount;
-                const GpuStage::RetireRec* recs =
-                    stage.RetireScratch() + begin;
-                const uint32_t n = stage.JobRetireCount()[job];
-                for (uint32_t i = 0u; i < n && retCount < scratchCapacity_;
-                     ++i) {
-                    retBuf[retCount++] = {recs[i].handle, recs[i].frame,
-                                          voices.activePosition_[recs[i].handle]};
+    VoiceSoA& v = voices.v;
+    bool failed = false;
+    for (uint32_t part = 0u; part < gpuPartCount_; ++part) {
+        const GpuPart& info = gpuPart_[part];
+        if (!failed && part < gpuSubmittedParts_ &&
+            stage.Collect(numFrames, part) == gpu::Result::Ok) {
+            const float* mix = stage.Mix();
+            for (uint32_t frame = 0u; frame < numFrames; ++frame) {
+                outputLeft[frame] += mix[frame * 2u];
+                outputRight[frame] += mix[frame * 2u + 1u];
+            }
+            const uint64_t scatterStart = GpuStage::NowMicros();
+            GpuPassContext ctx{};
+            ctx.renderer = this;
+            ctx.voices = &voices;
+            ctx.stage = &stage;
+            ctx.pass = 3u;
+            ctx.activeCount = cpuCount + gpuCount;
+            ctx.cpuCount = cpuCount;
+            ctx.sustainedCount = info.sCount;
+            ctx.envCount = info.eCount;
+            ctx.partSBase = info.sBase;
+            ctx.partEBase = info.eBase;
+            const uint32_t rows = info.sCount + info.eCount;
+            uint32_t jobs = 1u;
+            if (workerPool_ != nullptr) {
+                jobs = (std::min)((std::min)(workerPool_->GetThreadCount() * 2u,
+                                             workerPool_->GetJobCapacity()),
+                                  GpuStage::kMaxJobs);
+                jobs = (std::min)(jobs, (std::max)(1u, rows / 2048u));
+            }
+            ctx.jobCount = jobs < 2u ? 1u : jobs;
+            ctx.jobFirst = 0u;
+            ctx.jobEnd = ctx.jobCount;
+            RunGpuPass(ctx, outputLeft, outputRight);
+            // Retire frames the envelope kernel found join the block's
+            // retirement list (job slot 0; the list is sorted by frame and
+            // active position afterwards, so the slot does not matter).
+            if (info.eCount != 0u) {
+                SpanRetirement* retBuf = wvJobRetirements_;
+                uint32_t& retCount = wvJobRetireCounts_[0];
+                for (uint32_t job = 0u; job < ctx.jobCount; ++job) {
+                    const uint32_t begin =
+                        info.eBase + info.eCount * job / ctx.jobCount;
+                    const GpuStage::RetireRec* recs =
+                        stage.RetireScratch() + begin;
+                    const uint32_t n = stage.JobRetireCount()[job];
+                    for (uint32_t i = 0u; i < n && retCount < scratchCapacity_;
+                         ++i) {
+                        retBuf[retCount++] = {
+                            recs[i].handle, recs[i].frame,
+                            voices.activePosition_[recs[i].handle]};
+                    }
+                    const uint32_t* crossed = stage.CrossScratch() + begin;
+                    gpuRefreshHandles_.insert(gpuRefreshHandles_.end(), crossed,
+                                              crossed + stage.JobCrossCount()[job]);
                 }
             }
-        }
-        if (envCount != 0u) {
-            for (uint32_t job = 0u; job < ctx.jobCount; ++job) {
-                const uint32_t begin = envCount * job / ctx.jobCount;
-                const uint32_t* crossed = stage.CrossScratch() + begin;
-                gpuRefreshHandles_.insert(gpuRefreshHandles_.end(), crossed,
-                                          crossed + stage.JobCrossCount()[job]);
-            }
-        }
-        gpuSkipRefresh_ = gpuCount;
-        stage.MutableStats().scatterMicros +=
-            GpuStage::NowMicros() - scatterStart;
-        return;
-    }
-    // Late, lost or never submitted: the SoA still holds the pre-block state,
-    // so the CPU kernels reproduce the block exactly.  The GPU copy of every
-    // row's dynamic state is now one block ahead of (or unrelated to) the SoA,
-    // so nothing stays resident.
-    stage.BumpEpoch();
-    VoiceSoA& v = voices.v;
-    const IndexedJobMix mix{outputLeft, outputRight, nullptr, nullptr};
-    const uint32_t* gpuRows = wvSliceHandles_ + cpuCount;
-    for (uint32_t offset = 0u; offset < sustainedCount; offset += 256u) {
-        const uint32_t n = (std::min)(256u, sustainedCount - offset);
-        if (RenderWholeVoiceBatch(v, voices, gpuRows + offset, n,
-                                  VoiceRenderClass::SustainedLoop, sampleData,
-                                  sampleDataFrames, mix, 0u, numFrames, 0u)) {
+            stage.MutableStats().scatterMicros +=
+                GpuStage::NowMicros() - scatterStart;
             continue;
         }
-        for (uint32_t i = 0u; i < n; ++i) {
-            RenderWholeVoiceSegment(v, &voices, gpuRows[offset + i], sampleData,
+        if (!failed) {
+            // Late, lost or never submitted: parts already folded in stay (the
+            // SoA holds their new state); this part and every later one still
+            // hold the pre-block state, so the CPU kernels reproduce them
+            // exactly.  The GPU copy of every row is now one block ahead of
+            // (or unrelated to) the SoA, so nothing stays resident.
+            failed = true;
+            stage.Abandon();
+            stage.BumpEpoch();
+        }
+        const IndexedJobMix mix{outputLeft, outputRight, nullptr, nullptr};
+        const uint32_t* sRows = stage.List() + info.sBase;
+        for (uint32_t offset = 0u; offset < info.sCount; offset += 256u) {
+            const uint32_t n = (std::min)(256u, info.sCount - offset);
+            if (RenderWholeVoiceBatch(v, voices, sRows + offset, n,
+                                      VoiceRenderClass::SustainedLoop, sampleData,
+                                      sampleDataFrames, mix, 0u, numFrames, 0u)) {
+                continue;
+            }
+            for (uint32_t i = 0u; i < n; ++i) {
+                RenderWholeVoiceSegment(v, &voices, sRows[offset + i], sampleData,
+                                        sampleDataFrames, outputLeft, outputRight,
+                                        0u, numFrames, true, 0u, 0.0f, 1.0f, false);
+            }
+        }
+        const uint32_t* eRows = stage.EnvList() + info.eBase;
+        for (uint32_t i = 0u; i < info.eCount; ++i) {
+            RenderWholeVoiceSegment(v, &voices, eRows[i], sampleData,
                                     sampleDataFrames, outputLeft, outputRight,
                                     0u, numFrames, true, 0u, 0.0f, 1.0f, false);
         }
     }
-    for (uint32_t i = 0u; i < envCount; ++i) {
-        RenderWholeVoiceSegment(v, &voices, gpuRows[sustainedCount + i],
-                                sampleData, sampleDataFrames, outputLeft,
-                                outputRight, 0u, numFrames, true, 0u, 0.0f,
-                                1.0f, false);
+    if (failed) {
+        // Crossings of folded parts are covered by refreshing every row.
+        gpuRefreshHandles_.clear();
+        gpuSkipRefresh_ = 0u;
+        wvItemHandles_ = wvSliceHandles_;
+    } else {
+        gpuSkipRefresh_ = gpuCount;
     }
 }
 

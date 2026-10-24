@@ -669,6 +669,14 @@ private:
     // post loop skips the GPU tail of wvSliceHandles_ and refreshes only the
     // rows that crossed a stage (gpuRefreshHandles_).
     uint32_t gpuSkipRefresh_ = 0u;
+    // A block's GPU rows go out in one or two parts (slices of the sustained
+    // and envelope lists) so the second part is packed while the first runs.
+    struct GpuPart {
+        uint32_t sBase, sCount, eBase, eCount;
+    };
+    GpuPart gpuPart_[gpu::kMaxParts] = {};
+    uint32_t gpuPartCount_ = 0u;
+    uint32_t gpuSubmittedParts_ = 0u;
     std::vector<uint32_t> gpuRefreshHandles_;
     bool GpuRowBlockOk(const VoiceSoA& v, uint32_t handle,
                        bool stagedPending) const;
@@ -787,6 +795,9 @@ private:
     uint32_t wvEventFrame_ = 0u;
     VoiceManager* wvPlanVoices_ = nullptr;
     uint32_t* wvSliceHandles_ = nullptr;
+    // The rows the CPU job stage renders: wvSliceHandles_ (every active row)
+    // unless the GPU stage took some, then its list of the remaining ones.
+    const uint32_t* wvItemHandles_ = nullptr;
     SpanRetirement* wvJobRetirements_ = nullptr;
     // Per-job retirement counts, one cache line apart: kernels bump them on
     // every retirement from all workers at once.

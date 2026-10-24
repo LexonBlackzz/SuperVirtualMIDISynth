@@ -285,7 +285,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
     const bool stagedPending = poolVoices.StagedPending();
     for (uint32_t item = begin; item < end; ++item) {
         if (item < ctx->voiceItemCount) {
-            const uint32_t handle = renderer->wvSliceHandles_[item];
+            const uint32_t handle = renderer->wvItemHandles_[item];
             if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
                 continue;
             if (stagedPending && v.staged[handle] != 0u)
@@ -373,7 +373,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                        batchEnd < ctx->voiceItemCount &&
                        batchEnd - item < 256u) {
                     const uint32_t next =
-                        renderer->wvSliceHandles_[batchEnd];
+                        renderer->wvItemHandles_[batchEnd];
                     if (stagedPending && v.state[next] !=
                             static_cast<uint8_t>(VoiceState::Free) &&
                         v.staged[next] != 0u)
@@ -404,7 +404,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 const uint32_t batchCount = batchEnd - item;
                 if (renderer->RenderWholeVoiceBatch(
                         v, *ctx->voices,
-                        renderer->wvSliceHandles_ + item, batchCount,
+                        renderer->wvItemHandles_ + item, batchCount,
                         batchClass, ctx->sampleData,
                         ctx->sampleDataFrames, mix, batchStart,
                         frameCount - batchStart, jobIndex)) {
@@ -961,6 +961,7 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         }
     }
     const uint32_t ghostCount = wvGhostCount_;
+    wvItemHandles_ = wvSliceHandles_;   // the CPU job stage's rows (the GPU stage may substitute its CPU share)
     // GPU stage: eligible sustained rows move to the tail of wvSliceHandles_
     // and render on the GPU while the pool renders the rest.
     uint32_t gpuCount = 0u;
@@ -1098,14 +1099,16 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     // included).
 #if defined(SVMS_GPU_STAGE)
     // GPU rows keep their class unless the kernel moved them across a stage.
-    const uint32_t refreshCount = activeCount - gpuSkipRefresh_;
+    const uint32_t refreshCount = gpuSkipRefresh_ != 0u ? cpuVoiceCount : activeCount;
+    const uint32_t* refreshRows = gpuSkipRefresh_ != 0u ? wvItemHandles_ : wvSliceHandles_;
     for (uint32_t handle : gpuRefreshHandles_)
         voices.RefreshRenderClass(static_cast<VoiceHandle>(handle));
 #else
     const uint32_t refreshCount = activeCount;
+    const uint32_t* refreshRows = wvSliceHandles_;
 #endif
     for (uint32_t i = 0u; i < refreshCount; ++i)
-        voices.RefreshRenderClass(static_cast<VoiceHandle>(wvSliceHandles_[i]));
+        voices.RefreshRenderClass(static_cast<VoiceHandle>(refreshRows[i]));
 
     // Row-op channels had no masks set during the pre-pass (a launch-entry
     // steal fold would have corrupted pre-CC ghost captures), so refresh

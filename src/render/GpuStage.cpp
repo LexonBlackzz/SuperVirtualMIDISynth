@@ -1,5 +1,7 @@
 #include "render/GpuStage.h"
 
+#include <cstdlib>
+
 // Everything the renderer calls on GpuStage is inline in the header, so only
 // the code that creates a stage (driver, bench, tests) links this file and the
 // backends.
@@ -29,6 +31,11 @@ std::unique_ptr<GpuStage> GpuStage::Create(gpu::Api api, uint32_t deviceIndex,
     if (!backend->Init(deviceIndex, error)) return nullptr;
     std::unique_ptr<GpuStage> stage(new GpuStage());
     stage->backend_ = std::move(backend);
+    // Debug/bench override: SVMS_GPU_SPLIT_MIN=<rows> (huge = never split).
+    if (const char* parts = std::getenv("SVMS_GPU_PARTS"))
+        stage->SetParts(static_cast<uint32_t>(std::strtoul(parts, nullptr, 10)));
+    if (const char* split = std::getenv("SVMS_GPU_SPLIT_MIN"))
+        stage->SetSplitMinRows(static_cast<uint32_t>(std::strtoul(split, nullptr, 10)));
     return stage;
 }
 

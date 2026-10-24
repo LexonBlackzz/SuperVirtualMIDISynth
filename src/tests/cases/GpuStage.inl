@@ -50,6 +50,7 @@ bool CreateGpuStageForTest(std::unique_ptr<svms::GpuStage>& stage) {
         return false;
     }
     stage->SetMinimumVoices(1u);
+    stage->SetSplitMinRows(1u);     // any block with two jobs goes out in two parts
     stage->SetDeadlinePercent(0u);
     std::printf("GPU stage differential on: %s\n", stage->Name());
     return true;
@@ -429,6 +430,9 @@ void RunGpuStageEnvelopeDifferential(svms::GpuStage& stage, uint32_t poolSize,
     uint32_t listMismatch = 0u;
     for (uint32_t block = 0; block < blocks; ++block) {
         if (block == 3u) stage.ForceLateForTest(1u);
+        // Second part late (the first part was folded in, only the second is
+        // rendered by the CPU) - only blocks that really go out in two parts.
+        if (block == 4u && poolSize >= 6000u) stage.ForceLateSecondForTest(1u);
         if (block == 5u) stage.BumpEpoch();
         if (block == 7u) {
             // A 4-frame stretch (too short for the stage) renders every row on
@@ -494,6 +498,11 @@ void RunGpuStageEnvelopeDifferential(svms::GpuStage& stage, uint32_t poolSize,
     Check(envRows > 0u, "gpu envelope differential rendered rows on the GPU");
     Check(startActive > cpuVoices->activeCount_,
           "gpu envelope differential retired voices");
+    stage.ForceLateSecondForTest(0u);
+    if (poolSize >= 6000u) {
+        Check(stage.Stats().late - lateBefore == 2u,
+              "both a first-part and a second-part late block fell back");
+    }
     Check(maxDiff <= g_waveTol, "gpu envelope audio matches the scalar renderer");
     Check(stateMismatch == 0u, "gpu envelope state is bit-equal to scalar");
     Check(listMismatch == 0u, "gpu envelope retirements match the scalar renderer");
@@ -506,7 +515,7 @@ void TestGpuStageDifferential() {
     RunGpuStageSteadyDifferential(*stage, 6000u, 2048u, 6u, 4u);
     RunGpuStageSteadyDifferential(*stage, 3000u, 480u, 6u, 4u);
     RunGpuStageEnvelopeDifferential(*stage, 400u, 256u, 16u, 1u);
-    RunGpuStageEnvelopeDifferential(*stage, 4000u, 512u, 8u, 4u);
+    RunGpuStageEnvelopeDifferential(*stage, 20000u, 512u, 8u, 4u);
     RunGpuStageWrapSweep(*stage);
     RunGpuStageEventDifferential(*stage);
     Check(!stage->Stats().lost && stage->Stats().failed == 0u,

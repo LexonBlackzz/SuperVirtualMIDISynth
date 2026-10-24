@@ -54,6 +54,15 @@ public:
     // Tunables.  minimumVoices: below it the round trip costs more than AVX2.
     void SetMinimumVoices(uint32_t voices) { minimumVoices_ = voices; }
     uint32_t MinimumVoices() const { return minimumVoices_; }
+    // Blocks with at least this many GPU rows go out in two parts.
+    void SetSplitMinRows(uint32_t rows) { splitMinRows_ = rows; }
+    uint32_t SplitMinRows() const { return splitMinRows_; }
+    // Parts a split block goes out in (classify, pack and submit one part
+    // while the GPU runs the previous one).
+    void SetParts(uint32_t parts) {
+        parts_ = parts < 1u ? 1u : (parts > gpu::kMaxParts ? gpu::kMaxParts : parts);
+    }
+    uint32_t Parts() const { return parts_; }
     void SetSampleRate(uint32_t rate) { sampleRate_ = rate ? rate : 44100u; }
     // Fraction of a block period the GPU may take before the CPU falls back.
     // 0 = wait forever (tests, offline).
@@ -96,6 +105,7 @@ public:
                 envUpload_.assign(handleCapacity, gpu::EnvUploadRecord{});
                 retire_.assign(handleCapacity, RetireRec{});
                 cross_.assign(handleCapacity, 0u);
+                cpuRows_.assign(handleCapacity, 0u);
             } catch (...) {
                 enabled_ = false;
                 return false;
@@ -148,6 +158,8 @@ public:
     gpu::EnvUploadRecord* EnvUploadScratch() { return envUpload_.data(); }
     RetireRec* RetireScratch() { return retire_.data(); }
     uint32_t* CrossScratch() { return cross_.data(); }
+    // The CPU rows of a block that has GPU rows (the CPU job stage reads them).
+    uint32_t* CpuRows() { return cpuRows_.data(); }
     uint32_t* JobCrossCount() { return jobCross_; }
     uint32_t* JobGpuCount() { return jobGpu_; }
     uint32_t* JobEnvCount() { return jobEnv_; }
@@ -164,27 +176,41 @@ public:
     bool UploadEnvRows(const gpu::EnvUploadRecord* records, uint32_t count) {
         return backend_->UploadEnvRows(records, count);
     }
-    // Starts the block.  `uploads` / `envUploads` are the numbers of static
-    // records already sent for it (counters only).
-    bool Submit(uint32_t listCount, uint32_t envCount, uint32_t frames,
-                uint32_t uploads, uint32_t envUploads, float retireThreshold) {
-        submitStart_ = NowMicros();
-        if (!backend_->Submit(list_.data(), listCount, envList_.data(),
-                              envCount, frames, retireThreshold)) {
+    // Starts a part of the block: entries [listOffset, +listCount) of the
+    // sustained list and [envOffset, +envCount) of the envelope list.  A block
+    // is one or two parts (the second is packed while the GPU runs the first);
+    // `last` ends it.  `uploads` / `envUploads` are the numbers of static
+    // records already sent for the part (counters only).
+    bool SubmitPart(uint32_t listOffset, uint32_t listCount, uint32_t envOffset,
+                    uint32_t envCount, uint32_t frames, uint32_t uploads,
+                    uint32_t envUploads, float retireThreshold, bool first,
+                    bool last) {
+        const uint64_t start = NowMicros();
+        if (first) submitStart_ = start;
+        if (!backend_->Submit(list_.data() + listOffset, listCount,
+                              envList_.data() + envOffset, envCount, frames,
+                              retireThreshold, last)) {
             ++stats_.failed;
             return false;
         }
-        ++stats_.blocks;
+        if (first) ++stats_.blocks;
         stats_.rows += listCount;
         stats_.envRows += envCount;
         stats_.uploads += uploads;
         stats_.envUploads += envUploads;
-        stats_.submitMicros += NowMicros() - submitStart_;
+        stats_.submitMicros += NowMicros() - start;
         return true;
     }
-    // Waits for the block (deadline from the block period).  Ok = Mix()/Dyn()
-    // are valid for the submitted block.
-    gpu::Result Collect(uint32_t frames) {
+    // Drops the parts still in flight (the caller renders their rows on the
+    // CPU).
+    void Abandon() { backend_->Abandon(); }
+    // Test hooks: report the next `blocks` blocks late at their first / second
+    // part.
+    void ForceLateSecondForTest(uint32_t blocks) { forceLateSecond_ = blocks; }
+    // Waits for the oldest part (deadline from the block period, measured from
+    // the first submit).  Ok = Mix() is that part's mix and Dyn()/EnvDyn()
+    // hold its entries.
+    gpu::Result Collect(uint32_t frames, uint32_t part) {
         uint64_t timeout = ~0ull;
         if (deadlinePercent_ != 0u) {
             const uint64_t budget = static_cast<uint64_t>(frames) * 1000000ull *
@@ -192,9 +218,10 @@ public:
             const uint64_t spent = NowMicros() - submitStart_;
             timeout = budget > spent ? budget - spent : 0u;
         }
-        if (forceLate_ != 0u) {
-            // Drain the block so the buffers stay consistent, then report it late.
-            --forceLate_;
+        uint32_t& forced = part == 0u ? forceLate_ : forceLateSecond_;
+        if (forced != 0u) {
+            // Drain the part so the buffers stay consistent, then report it late.
+            --forced;
             backend_->Collect(~0ull, &mixOut_, &dynOut_, &envDynOut_);
             ++stats_.late;
             return gpu::Result::Late;
@@ -224,9 +251,12 @@ public:
     std::unique_ptr<gpu::Backend> backend_;
     bool enabled_ = true;
     uint32_t minimumVoices_ = 4096u;
+    uint32_t splitMinRows_ = 8192u;
+    uint32_t parts_ = 3u;
     uint32_t sampleRate_ = 44100u;
     uint32_t deadlinePercent_ = 0u;
     uint32_t forceLate_ = 0u;
+    uint32_t forceLateSecond_ = 0u;
     uint32_t maxFramesHint_ = 0u;
     std::atomic<uint32_t> epoch_{1u};
     uint32_t epochSeen_ = 0u;
@@ -246,6 +276,7 @@ public:
     const gpu::EnvDynOut* envDynOut_ = nullptr;
     std::vector<RetireRec> retire_;
     std::vector<uint32_t> cross_;
+    std::vector<uint32_t> cpuRows_;
     uint32_t jobGpu_[kMaxJobs] = {};
     uint32_t jobEnv_[kMaxJobs] = {};
     uint32_t jobUpload_[kMaxJobs] = {};

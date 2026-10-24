@@ -35,6 +35,11 @@ layout(std430, binding = 0) readonly buffer StoreBuf { uint store[]; };
 layout(std430, binding = 3) writeonly buffer PartialBuf { float partial[]; };
 uniform uint uCount;
 uniform uint uFrames;
+// A block is rendered in parts (the CPU packs the next part while the GPU runs
+// this one): the part's slice of the list starts at uListBase and its partial
+// sums start at group uGroupBase.
+uniform uint uListBase;
+uniform uint uGroupBase;
 
 // ROWS rows = TILE frames x (left, right); one column per voice of the group.
 shared float sh[ROWS * GROUP];
@@ -174,7 +179,7 @@ void main() {
     precise float b2 = 0.0;
     uint handle = 0u;
     if (live) {
-        handle = listv[idx];
+        handle = listv[uListBase + idx];
         uint sb = handle * 8u;
         uint b = handle * 12u;
         uint w0 = rows[b];
@@ -293,7 +298,7 @@ void main() {
             }
         }
 #if defined(SUBGROUP32)
-        ReduceTile(REDUCE_ARGS, tile, tiles, t, g);
+        ReduceTile(REDUCE_ARGS, tile, tiles, t, uGroupBase + g);
 #else
         barrier();
         {
@@ -309,12 +314,12 @@ void main() {
                 sum += sh2[row * LANES + j];
             uint n = tile * TILE + (row >> 1u);
             if (n < uFrames)
-                partial[(g * uFrames + n) * 2u + (row & 1u)] = sum;
+                partial[((uGroupBase + g) * uFrames + n) * 2u + (row & 1u)] = sum;
         }
 #endif
     }
     if (live) {
-        dynv[idx] = vec4(phase, z1, z2, 0.0);
+        dynv[uListBase + idx] = vec4(phase, z1, z2, 0.0);
         uint sb = handle * 8u;
         state[sb] = floatBitsToUint(phase);
         state[sb + 1u] = floatBitsToUint(z1);
@@ -331,7 +336,6 @@ layout(std430, binding = 7) readonly buffer EnvRowBuf { uint erows[]; };
 layout(std430, binding = 8) readonly buffer EnvListBuf { uint elist[]; };
 layout(std430, binding = 9) writeonly buffer EnvDynBuf { uvec4 edyn[]; };
 layout(std430, binding = 11) buffer StateBuf { uint state[]; };
-uniform uint uGroupBase;
 uniform uint uRetireBits;
 #define EMIT(K, L, R) STORE_OUT(K, L, R)
 
@@ -434,7 +438,7 @@ void main() {
     precise float b2 = 0.0;
     uint handle = 0u;
     if (live) {
-        handle = elist[idx];
+        handle = elist[uListBase + idx];
         uint sb = handle * 8u;
         uint r = handle * 20u;
         phase = max(0.0, uintBitsToFloat(state[sb]));
@@ -647,9 +651,9 @@ void main() {
 #endif
     }
     if (live) {
-        edyn[idx * 2u] = uvec4(floatBitsToUint(phase), floatBitsToUint(z1),
+        edyn[(uListBase + idx) * 2u] = uvec4(floatBitsToUint(phase), floatBitsToUint(z1),
                                floatBitsToUint(z2), floatBitsToUint(gain));
-        edyn[idx * 2u + 1u] = uvec4((stage << 24u) | (retire & 0xFFFFFFu),
+        edyn[(uListBase + idx) * 2u + 1u] = uvec4((stage << 24u) | (retire & 0xFFFFFFu),
                                     atkRem, decRem, relRem);
         uint sb = handle * 8u;
         state[sb] = floatBitsToUint(phase);
@@ -669,6 +673,8 @@ layout(std430, binding = 3) readonly buffer PartialBuf { float partial[]; };
 layout(std430, binding = 4) writeonly buffer MixBuf { float mixout[]; };
 uniform uint uFrames;
 uniform uint uGroups;
+uniform uint uGroupFirst;
+uniform uint uMixBase;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
@@ -676,8 +682,8 @@ void main() {
     precise float acc = 0.0;
     uint stride = uFrames * 2u;
     for (uint g = 0u; g < uGroups; ++g)
-        acc += partial[g * stride + i];
-    mixout[i] = acc;
+        acc += partial[(uGroupFirst + g) * stride + i];
+    mixout[uMixBase + i] = acc;
 }
 #endif
 
