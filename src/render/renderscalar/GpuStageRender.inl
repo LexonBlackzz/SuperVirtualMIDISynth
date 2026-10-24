@@ -90,8 +90,10 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
             for (uint32_t k = begin; k < end; ++k) {
                 const uint32_t h = list[k];
                 v.phases[h] = dyn[k].phase;
-                v.filterZ1[h] = dyn[k].z1;
-                v.filterZ2[h] = dyn[k].z2;
+                if (v.filterEnabled[h] != 0u) {
+                    v.filterZ1[h] = dyn[k].z1;
+                    v.filterZ2[h] = dyn[k].z2;
+                }
             }
         }
         const uint32_t begin = c.envCount * job / c.jobCount;
@@ -112,8 +114,11 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
             const gpu::EnvDynOut& d = dyn[k];
             // Only the fields the kernel can change for this lifecycle stage.
             v.phases[h] = d.phase;
-            v.filterZ1[h] = d.z1;
-            v.filterZ2[h] = d.z2;
+            if (v.filterEnabled[h] != 0u) {
+                // The kernel leaves an unfiltered row's delay line alone.
+                v.filterZ1[h] = d.z1;
+                v.filterZ2[h] = d.z2;
+            }
             if (stageBefore == 0u) {
                 v.currentGain[h] = d.gain;
                 v.releaseSamplesRemaining[h] = d.releaseRem;

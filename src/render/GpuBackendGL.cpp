@@ -68,6 +68,11 @@ constexpr GLenum GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS = 0x90EB;
 constexpr GLenum GL_MAX_SHADER_STORAGE_BLOCK_SIZE = 0x90DE;
 constexpr GLenum GL_NO_ERROR = 0;
 constexpr GLenum GL_TIME_ELAPSED = 0x88BF;
+constexpr GLenum GL_EXTENSIONS = 0x1F03;
+constexpr GLenum GL_NUM_EXTENSIONS = 0x821D;
+constexpr GLenum GL_SUBGROUP_SIZE_KHR = 0x9532;
+constexpr GLenum GL_SUBGROUP_SUPPORTED_STAGES_KHR = 0x9533;
+constexpr GLenum GL_SUBGROUP_SUPPORTED_FEATURES_KHR = 0x9534;
 constexpr GLenum GL_COPY_READ_BUFFER = 0x8F36;
 constexpr GLenum GL_COPY_WRITE_BUFFER = 0x8F37;
 constexpr GLbitfield GL_MAP_READ_BIT = 0x0001;
@@ -85,6 +90,7 @@ constexpr GLuint64 GL_TIMEOUT_IGNORED = 0xFFFFFFFFFFFFFFFFull;
 
 struct GLFns {
     const unsigned char* (SVMS_GLAPI* GetString)(GLenum) = nullptr;
+    const unsigned char* (SVMS_GLAPI* GetStringi)(GLenum, GLuint) = nullptr;
     void (SVMS_GLAPI* GetIntegerv)(GLenum, GLint*) = nullptr;
     GLenum (SVMS_GLAPI* GetError)() = nullptr;
     void (SVMS_GLAPI* Flush)() = nullptr;
@@ -395,6 +401,7 @@ private:
     bool Bind();
     void BindAll();
     GLuint BuildProgram(const char* define, std::string& error);
+    bool DetectSubgroup32();
     bool ResizeBuffer(Buf which, size_t bytes);
     bool ResizeReadback(Buf which, size_t bytes);
     void Shutdown();
@@ -412,6 +419,7 @@ private:
     size_t bufBytes_[kBufCount] = {};
     GLsync fence_ = nullptr;
     bool pinned_ = false;             // read-back through persistent mappings
+    bool subgroup32_ = false;         // 32-wide subgroups with shuffles (KHR)
     void* mapped_[kBufCount] = {};
     std::vector<float> mixCopy_;      // fallback read-back storage
     std::vector<DynOut> dynCopy_;
@@ -452,6 +460,7 @@ bool GLBackend::Init(uint32_t, std::string& error) {
     bool ok = true;
 #define SVMS_FETCH(field, glname) ok = Fetch(context_, gl_.field, glname) && ok
     SVMS_FETCH(GetString, "glGetString");
+    SVMS_FETCH(GetStringi, "glGetStringi");
     SVMS_FETCH(GetIntegerv, "glGetIntegerv");
     SVMS_FETCH(GetError, "glGetError");
     SVMS_FETCH(Flush, "glFlush");
@@ -518,10 +527,47 @@ bool GLBackend::Init(uint32_t, std::string& error) {
     }
     static const char* const kDefines[5] = {"VOICE_CS", "REDUCE_CS", "SCATTER_CS",
                                             "ENV_CS", "ENV_SCATTER_CS"};
-    for (int i = 0; i < 5; ++i) {
-        programs_[i] = BuildProgram(kDefines[i], error);
-        if (programs_[i] == 0u) return false;
+    // Warp-level reduction when the driver offers it; a driver that advertises
+    // it but fails to compile the shader falls back to the shared-memory one.
+    subgroup32_ = DetectSubgroup32();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool built = true;
+        for (int i = 0; i < 5 && built; ++i) {
+            programs_[i] = BuildProgram(kDefines[i], error);
+            built = programs_[i] != 0u;
+        }
+        if (built) break;
+        for (GLuint& program : programs_) {
+            if (program) gl_.DeleteProgram(program);
+            program = 0u;
+        }
+        if (!subgroup32_) return false;
+        subgroup32_ = false;
+        error.clear();
     }
+    if (std::getenv("SVMS_GPU_DUMP") != nullptr) {
+        // Debug: write the linked program binaries (NVIDIA's carries the
+        // assembly as text) next to the working directory.
+        using GetBinary = void (SVMS_GLAPI*)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
+        GetBinary getBinary = reinterpret_cast<GetBinary>(context_.Proc("glGetProgramBinary"));
+        if (getBinary) {
+            for (int p = 0; p < 5; ++p) {
+                GLint length = 0;
+                gl_.GetProgramiv(programs_[p], 0x8741, &length);
+                std::vector<char> blob(static_cast<size_t>(length > 0 ? length : 1));
+                GLsizei written = 0;
+                GLenum format = 0;
+                getBinary(programs_[p], length, &written, &format, blob.data());
+                std::string path = "gpu_program_" + std::to_string(p) + ".bin";
+                if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(blob.data(), 1, static_cast<size_t>(written), f);
+                    std::fclose(f);
+                }
+            }
+        }
+    }
+    if (subgroup32_) name_ += " [subgroup]";
+    if (pinned_) name_ += " [pinned]";
     static const char* const kUniforms[5][4] = {
         {"uCount", "uFrames", nullptr, nullptr},
         {"uFrames", "uGroups", nullptr, nullptr},
@@ -539,8 +585,43 @@ bool GLBackend::Init(uint32_t, std::string& error) {
     return true;
 }
 
+bool GLBackend::DetectSubgroup32() {
+    if (std::getenv("SVMS_GPU_NO_SUBGROUP") != nullptr || !gl_.GetStringi ||
+        (group_ % 32u) != 0u) {
+        return false;
+    }
+    GLint count = 0;
+    gl_.GetIntegerv(GL_NUM_EXTENSIONS, &count);
+    bool basic = false;
+    bool shuffle = false;
+    for (GLint i = 0; i < count; ++i) {
+        const char* name = reinterpret_cast<const char*>(
+            gl_.GetStringi(GL_EXTENSIONS, static_cast<GLuint>(i)));
+        if (!name) continue;
+        // One API-level extension (GL_KHR_shader_subgroup) covers the GLSL
+        // _basic and _shuffle extensions used below.
+        const bool khr = std::strcmp(name, "GL_KHR_shader_subgroup") == 0;
+        basic = basic || khr;
+        shuffle = shuffle || khr;
+    }
+    if (!basic || !shuffle) return false;
+    GLint size = 0, stages = 0, features = 0;
+    gl_.GetIntegerv(GL_SUBGROUP_SIZE_KHR, &size);
+    gl_.GetIntegerv(GL_SUBGROUP_SUPPORTED_STAGES_KHR, &stages);
+    gl_.GetIntegerv(GL_SUBGROUP_SUPPORTED_FEATURES_KHR, &features);
+    gl_.GetError();
+    // Compute stage bit 0x20; basic 0x1 and shuffle 0x10 features.
+    return size == 32 && (stages & 0x20) != 0 && (features & 0x11) == 0x11;
+}
+
 GLuint GLBackend::BuildProgram(const char* define, std::string& error) {
-    const std::string header = std::string("#version 430\n#define ") + define + " 1\n";
+    std::string header = "#version 430\n";
+    if (subgroup32_) {
+        header += "#extension GL_KHR_shader_subgroup_basic : require\n"
+                  "#extension GL_KHR_shader_subgroup_shuffle : require\n"
+                  "#define SUBGROUP32 1\n";
+    }
+    header += std::string("#define ") + define + " 1\n";
     const std::string sizes = "#define GROUP " + std::to_string(group_) + char(10) + "#define TILE " + std::to_string(tile_) + char(10);
     const std::string full = header + sizes;
     const GLchar* sources[2] = {full.c_str(), kVoiceStageGLSL};

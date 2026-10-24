@@ -41,6 +41,65 @@ shared float sh[ROWS * GROUP];
 shared float sh2[ROWS * LANES];
 uint StoreWord(uint wi) { return store[wi]; }
 
+#if defined(SUBGROUP32)
+// The tile stays in eight scalar registers (ov0..ov7 = 2 * frame + channel); a
+// warp reduces it with a reduce-scatter butterfly (nine shuffles for the eight
+// values instead of forty) and the warps of a group meet in shared memory once
+// per BATCH tiles.  Everything is unrolled by hand: the driver keeps dynamically
+// indexed arrays in local memory, which cost more than the reduction itself.
+#define DECLARE_OV precise float ov0 = 0.0, ov1 = 0.0, ov2 = 0.0, ov3 = 0.0, ov4 = 0.0, ov5 = 0.0, ov6 = 0.0, ov7 = 0.0;
+#define STORE_OUT(K, L, R) { precise float l_ = (L); precise float r_ = (R); if ((K) == 0u) { ov0 = l_; ov1 = r_; } else if ((K) == 1u) { ov2 = l_; ov3 = r_; } else if ((K) == 2u) { ov4 = l_; ov5 = r_; } else { ov6 = l_; ov7 = r_; } }
+#define REDUCE_ARGS ov0, ov1, ov2, ov3, ov4, ov5, ov6, ov7
+#define BATCH 4u
+shared float shw[2u * BATCH * (GROUP / 32u) * 8u];
+
+// out = keep + shuffle(send): the lane with the mask bit set keeps the high
+// value, the other keeps the low one.
+#define BUTTERFLY(LOW, HIGH, MASK, UP, OUT) { precise float send_ = (UP) ? (LOW) : (HIGH); precise float keep_ = (UP) ? (HIGH) : (LOW); OUT = keep_ + subgroupShuffleXor(send_, MASK); }
+
+void ReduceTile(float v0, float v1, float v2, float v3, float v4, float v5,
+                float v6, float v7, uint tile, uint tiles, uint t,
+                uint outGroup) {
+    uint lane32 = gl_SubgroupInvocationID;
+    bool up = (lane32 & 16u) != 0u;
+    precise float a0_, a1_, a2_, a3_;
+    BUTTERFLY(v0, v4, 16u, up, a0_)
+    BUTTERFLY(v1, v5, 16u, up, a1_)
+    BUTTERFLY(v2, v6, 16u, up, a2_)
+    BUTTERFLY(v3, v7, 16u, up, a3_)
+    bool up8 = (lane32 & 8u) != 0u;
+    precise float c0_, c1_;
+    BUTTERFLY(a0_, a2_, 8u, up8, c0_)
+    BUTTERFLY(a1_, a3_, 8u, up8, c1_)
+    bool up4 = (lane32 & 4u) != 0u;
+    precise float d;
+    BUTTERFLY(c0_, c1_, 4u, up4, d)
+    d += subgroupShuffleXor(d, 2u);
+    d += subgroupShuffleXor(d, 1u);
+    // Lanes 0, 4, ..., 28 now hold the warp sums of values 0..7 of this tile.
+    uint inBatch = tile & (BATCH - 1u);
+    uint buf = (tile / BATCH) & 1u;
+    if ((lane32 & 3u) == 0u)
+        shw[((buf * BATCH + inBatch) * (GROUP / 32u) + gl_SubgroupID) * 8u +
+            (lane32 >> 2u)] = d;
+    if (inBatch == BATCH - 1u || tile == tiles - 1u) {
+        barrier();
+        if (t < (inBatch + 1u) * 8u) {
+            uint ti = t >> 3u;
+            uint vi = t & 7u;
+            precise float sum = 0.0;
+            for (uint w = 0u; w < GROUP / 32u; ++w)
+                sum += shw[((buf * BATCH + ti) * (GROUP / 32u) + w) * 8u + vi];
+            uint n = (tile - inBatch + ti) * TILE + (vi >> 1u);
+            if (n < uFrames)
+                partial[(outGroup * uFrames + n) * 2u + (vi & 1u)] = sum;
+        }
+    }
+}
+#else
+#define STORE_OUT(K, L, R) sh[(2u * (K)) * GROUP + t] = (L); sh[(2u * (K) + 1u) * GROUP + t] = (R);
+#endif
+
 // Signed 16-bit sample `i` of the store (two samples per 32-bit word).
 int Sample16(uint i) {
     return bitfieldExtract(int(StoreWord(i >> 1u)), int((i & 1u) << 4u), 16);
@@ -59,8 +118,8 @@ layout(std430, binding = 11) buffer StateBuf { uint state[]; };
 // without a branch: shift the 64-bit window (wa, wb) right by 16 * (i & 1).
 #define FAST_LOAD(I) uint wa_ = store[(I) >> 1u]; uint wb_ = store[((I) >> 1u) + 1u];
 #define FAST_PAIR(I) uint p_ = ((I) & 1u) << 4u; FAST_LOAD(I) uint x_ = (wa_ >> p_) | ((wb_ << (31u - p_)) << 1u); int s0_ = (int(x_) << 16) >> 16; int s1_ = int(x_) >> 16; precise float d_ = float(s1_ - s0_); precise float m_ = d_ * f_; precise float u_ = float(s0_) + m_;
-#define FAST_OUT_PLAIN(K, I, F) { precise float f_ = (F); FAST_PAIR(I) sh[(2u * (K)) * GROUP + t] = u_ * gainLs; sh[(2u * (K) + 1u) * GROUP + t] = u_ * gainRs; }
-#define FAST_OUT_FILT(K, I, F) { precise float f_ = (F); FAST_PAIR(I) precise float smp_ = u_ * kScale; precise float outv_ = smp_ * a0 + z1; precise float zin_ = smp_ * twoA0 + z2; precise float fb1_ = b1 * outv_; precise float nz1_ = zin_ - fb1_; precise float zin2_ = smp_ * a0; precise float fb2_ = b2 * outv_; z1 = nz1_; z2 = zin2_ - fb2_; sh[(2u * (K)) * GROUP + t] = outv_ * gainL; sh[(2u * (K) + 1u) * GROUP + t] = outv_ * gainR; }
+#define FAST_OUT_PLAIN(K, I, F) { precise float f_ = (F); FAST_PAIR(I) STORE_OUT(K, u_ * gainLs, u_ * gainRs) }
+#define FAST_OUT_FILT(K, I, F) { precise float f_ = (F); FAST_PAIR(I) precise float smp_ = u_ * kScale; precise float outv_ = smp_ * a0 + z1; precise float zin_ = smp_ * twoA0 + z2; precise float fb1_ = b1 * outv_; precise float nz1_ = zin_ - fb1_; precise float zin2_ = smp_ * a0; precise float fb2_ = b2 * outv_; z1 = nz1_; z2 = zin2_ - fb2_; STORE_OUT(K, outv_ * gainL, outv_ * gainR) }
 
 // Position of the next frame: the scalar kernel's run bookkeeping.  Advances
 // phase (and the run counter) exactly once, only for frames that exist.
@@ -154,6 +213,9 @@ void main() {
     uint lane = t % LANES;
     uint tiles = (uFrames + TILE - 1u) / TILE;
     for (uint tile = 0u; tile < tiles; ++tile) {
+#if defined(SUBGROUP32)
+        DECLARE_OV
+#endif
         // Fast path: four interior frames of a running span (almost every
         // tile).  No wrap, edge or tail bookkeeping is needed.
         bool fast = live && (tile + 1u) * TILE <= uFrames && runLeft >= TILE;
@@ -225,12 +287,14 @@ void main() {
                         oR = u * gainRs;
                     }
                 }
-                sh[(2u * k) * GROUP + t] = oL;
-                sh[(2u * k + 1u) * GROUP + t] = oR;
+                STORE_OUT(k, oL, oR)
                 cValid = nValid; cFirst = nFirst; cFrac = nFrac; cEdge = nEdge;
                 cA = nA; cB = nB;
             }
         }
+#if defined(SUBGROUP32)
+        ReduceTile(REDUCE_ARGS, tile, tiles, t, g);
+#else
         barrier();
         {
             precise float acc = 0.0;
@@ -247,6 +311,7 @@ void main() {
             if (n < uFrames)
                 partial[(g * uFrames + n) * 2u + (row & 1u)] = sum;
         }
+#endif
     }
     if (live) {
         dynv[idx] = vec4(phase, z1, z2, 0.0);
@@ -268,6 +333,71 @@ layout(std430, binding = 9) writeonly buffer EnvDynBuf { uvec4 edyn[]; };
 layout(std430, binding = 11) buffer StateBuf { uint state[]; };
 uniform uint uGroupBase;
 uniform uint uRetireBits;
+#define EMIT(K, L, R) STORE_OUT(K, L, R)
+
+// One interior frame of a released or held-sustained row: the generic machine
+// with the sample pair already loaded.  `ph` is the phase the frame reads and
+// `phNext` the phase after it advances.
+void EnvFastFrame(uint wa, uint wb, uint b, uint sampleStart, float ph,
+                  float phNext, uint n, uint stage, bool filt, float a0,
+                  float b1, float b2, float twoA0, float mixL, float mixR,
+                  float releaseDecay, float retireThreshold,
+                  inout float phase, inout float gain, inout uint relRem,
+                  inout float z1, inout float z2, inout bool alive,
+                  inout uint retire, out float oL, out float oR) {
+    oL = 0.0;
+    oR = 0.0;
+    if (!alive) return;
+    const float kScale = 1.0 / 32768.0;
+    uint par = ((sampleStart + b) & 1u) << 4u;
+    uint x = (wa >> par) | ((wb << (31u - par)) << 1u);
+    // int16 -> float without the integer converts: a 16-bit value v + 32768 in
+    // the low mantissa bits of 2^23 is exactly 2^23 + 32768 + v, so the biased
+    // difference is the exact float(s1 - s0) and the bias folds out of
+    // float(s0) exactly.
+    precise float frac = ph - float(b);
+    precise float f0 = uintBitsToFloat(0x4B000000u | ((x & 0xFFFFu) ^ 0x8000u));
+    precise float f1 = uintBitsToFloat(0x4B000000u | ((x >> 16u) ^ 0x8000u));
+    precise float d = f1 - f0;
+    precise float m = d * frac;
+    precise float u = (f0 - 8421376.0) + m;
+    bool relFin = false;
+    precise float g = gain;
+    uint rr = relRem;
+    if (stage == 0u) {
+        if (rr == 0u) {
+            relFin = true;
+        } else {
+            g = g * releaseDecay;
+            if (rr != 0xFFFFFFFFu) {
+                --rr;
+                relFin = rr == 0u;
+            }
+        }
+    }
+    gain = g;
+    relRem = rr;
+    phase = phNext;
+    precise float smp = u * kScale;
+    if (filt) {
+        precise float outv = smp * a0 + z1;
+        precise float zin = smp * twoA0 + z2;
+        precise float fb1 = b1 * outv;
+        precise float nz1 = zin - fb1;
+        precise float zin2 = smp * a0;
+        precise float fb2 = b2 * outv;
+        z1 = nz1;
+        z2 = zin2 - fb2;
+        smp = outv;
+    }
+    precise float scaled = smp * g;
+    oL = scaled * mixL;
+    oR = scaled * mixR;
+    if (relFin || (stage == 0u && rr == 0xFFFFFFFFu && g < retireThreshold)) {
+        retire = n;
+        alive = false;
+    }
+}
 
 void main() {
     uint t = gl_LocalInvocationID.x;
@@ -351,73 +481,56 @@ void main() {
     // retirement still run frame by frame in the generic machine's order.
     const uint interiorLimit = loop ? relLoopE : relEnd;
     for (uint tile = 0u; tile < tiles; ++tile) {
+#if defined(SUBGROUP32)
+        DECLARE_OV
+#endif
         bool fast = alive && (stage == 0u || stage == 3u) &&
                     (tile + 1u) * TILE <= uFrames;
-        precise float ph[TILE + 1u];
+        precise float p1 = 0.0, p2 = 0.0, p3 = 0.0, p4 = 0.0;
         if (fast) {
-            ph[0] = phase;
-            for (uint k = 0u; k < TILE; ++k) ph[k + 1u] = ph[k] + phaseInc;
-            fast = uint(ph[TILE - 1u]) + 1u < interiorLimit &&
-                   (!loop || ph[TILE] < relLoopEF);
+            p1 = phase + phaseInc;
+            p2 = p1 + phaseInc;
+            p3 = p2 + phaseInc;
+            p4 = p3 + phaseInc;
+            fast = uint(p3) + 1u < interiorLimit &&
+                   (!loop || p4 < relLoopEF);
         }
         if (fast) {
-            uint wa[TILE];
-            uint wb[TILE];
-            for (uint k = 0u; k < TILE; ++k) {
-                uint i = sampleStart + uint(ph[k]);
-                wa[k] = store[i >> 1u];
-                wb[k] = store[(i >> 1u) + 1u];
-            }
-            for (uint k = 0u; k < TILE; ++k) {
-                precise float oL = 0.0;
-                precise float oR = 0.0;
-                if (alive) {
-                    uint b = uint(ph[k]);
-                    uint par = ((sampleStart + b) & 1u) << 4u;
-                    uint x = (wa[k] >> par) | ((wb[k] << (31u - par)) << 1u);
-                    int s0 = (int(x) << 16) >> 16;
-                    int s1 = int(x) >> 16;
-                    precise float frac = ph[k] - float(b);
-                    precise float d = float(s1 - s0);
-                    precise float m = d * frac;
-                    precise float u = float(s0) + m;
-                    bool relFin = false;
-                    if (stage == 0u) {
-                        if (relRem == 0u) {
-                            relFin = true;
-                        } else {
-                            gain *= releaseDecay;
-                            if (relRem != kForever) {
-                                --relRem;
-                                relFin = relRem == 0u;
-                            }
-                        }
-                    }
-                    phase = ph[k + 1u];
-                    precise float smp = u * kScale;
-                    if (filt) {
-                        precise float outv = smp * a0 + z1;
-                        precise float zin = smp * twoA0 + z2;
-                        precise float fb1 = b1 * outv;
-                        precise float nz1 = zin - fb1;
-                        precise float zin2 = smp * a0;
-                        precise float fb2 = b2 * outv;
-                        z1 = nz1;
-                        z2 = zin2 - fb2;
-                        smp = outv;
-                    }
-                    precise float scaled = smp * gain;
-                    oL = scaled * mixL;
-                    oR = scaled * mixR;
-                    if (relFin || (stage == 0u && relRem == kForever &&
-                                   gain < retireThreshold)) {
-                        retire = tile * TILE + k;
-                        alive = false;
-                    }
-                }
-                sh[(2u * k) * GROUP + t] = oL;
-                sh[(2u * k + 1u) * GROUP + t] = oR;
-            }
+            uint q0 = uint(phase);
+            uint q1 = uint(p1);
+            uint q2 = uint(p2);
+            uint q3 = uint(p3);
+            uint i0 = (sampleStart + q0) >> 1u;
+            uint i1 = (sampleStart + q1) >> 1u;
+            uint i2 = (sampleStart + q2) >> 1u;
+            uint i3 = (sampleStart + q3) >> 1u;
+            uint wa0 = store[i0], wb0 = store[i0 + 1u];
+            uint wa1 = store[i1], wb1 = store[i1 + 1u];
+            uint wa2 = store[i2], wb2 = store[i2 + 1u];
+            uint wa3 = store[i3], wb3 = store[i3 + 1u];
+            precise float oL, oR;
+            precise float ph0 = phase;
+            uint n0 = tile * TILE;
+            EnvFastFrame(wa0, wb0, q0, sampleStart, ph0, p1, n0, stage, filt,
+                         a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
+                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retire, oL, oR);
+            EMIT(0u, oL, oR)
+            EnvFastFrame(wa1, wb1, q1, sampleStart, p1, p2, n0 + 1u, stage, filt,
+                         a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
+                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retire, oL, oR);
+            EMIT(1u, oL, oR)
+            EnvFastFrame(wa2, wb2, q2, sampleStart, p2, p3, n0 + 2u, stage, filt,
+                         a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
+                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retire, oL, oR);
+            EMIT(2u, oL, oR)
+            EnvFastFrame(wa3, wb3, q3, sampleStart, p3, p4, n0 + 3u, stage, filt,
+                         a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
+                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retire, oL, oR);
+            EMIT(3u, oL, oR)
         } else
         for (uint k = 0u; k < TILE; ++k) {
             uint n = tile * TILE + k;
@@ -510,9 +623,11 @@ void main() {
                     }
                 }
             }
-            sh[(2u * k) * GROUP + t] = oL;
-            sh[(2u * k + 1u) * GROUP + t] = oR;
+            EMIT(k, oL, oR)
         }
+#if defined(SUBGROUP32)
+        ReduceTile(REDUCE_ARGS, tile, tiles, t, uGroupBase + g);
+#else
         barrier();
         {
             precise float acc = 0.0;
@@ -529,6 +644,7 @@ void main() {
             if (n < uFrames)
                 partial[((uGroupBase + g) * uFrames + n) * 2u + (row & 1u)] = sum;
         }
+#endif
     }
     if (live) {
         edyn[idx * 2u] = uvec4(floatBitsToUint(phase), floatBitsToUint(z1),
