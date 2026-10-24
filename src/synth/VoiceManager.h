@@ -260,6 +260,18 @@ static_assert(sizeof(VoiceLinkRow) == 32, "VoiceLinkRow must stay 32 bytes");
 class VoiceManager {
 public:
     void SetStealPolicy(uint32_t policy);
+
+    // Optional fan-out for the steal index's big linear passes (the volatile
+    // heap's key build over every releasing voice): runs job(context, i) for i
+    // in [0, jobCount) on other threads and returns when all are done.  Set by
+    // the renderer for the duration of its plan; null = run serially.
+    using ParallelForFn = void (*)(void* user, uint32_t jobCount,
+                                   void (*job)(void* context, uint32_t index),
+                                   void* context);
+    void SetParallelFor(ParallelForFn fn, void* user) {
+        parallelFor_ = fn;
+        parallelForUser_ = user;
+    }
     void SetPerKeyVoiceCap(uint32_t cap) { perKeyVoiceCap_ = cap; }
     // Opt-in (default off) BASSMIDI-style victim-score reject: with a full
     // pool, a single-layer note-on whose steal score is strictly worse than
@@ -1022,6 +1034,8 @@ private:
     uint64_t stealIndexRepairCount_;
     uint32_t* stealVolatileList_;
     uint32_t stealVolatileCount_;
+    ParallelForFn parallelFor_ = nullptr;
+    void* parallelForUser_ = nullptr;
     uint64_t* stealVolatileHeapKey_;
     uint32_t* stealVolatileHeapHandle_;
     uint32_t* stealVolatileHeapPosition_;

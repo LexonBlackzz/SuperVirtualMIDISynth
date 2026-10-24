@@ -621,6 +621,12 @@ private:
                              uint32_t sampleDataFrames, float* outL,
                              float* outR, uint32_t frameStart,
                              uint32_t frameCount);
+    // Fan-out the voice manager uses for big linear passes during the plan.
+    static void PlanParallelFor(void* user, uint32_t jobCount,
+                                void (*job)(void* context, uint32_t index),
+                                void* context);
+    static void PlanParallelJobThunk(uint32_t index, const IndexedJobMix& mix,
+                                     uint32_t frameCount, void* userData);
     static void WholeVoiceVoiceConfiguredHook(VoiceHandle handle,
                                               void* userData);
     // A partial release of a merged voice forks a twin that must render the

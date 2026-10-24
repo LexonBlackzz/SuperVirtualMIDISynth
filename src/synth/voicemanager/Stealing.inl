@@ -1039,6 +1039,38 @@ inline void VoiceManager::BuildVolatileStealHeap() {
 #if !defined(SVMS_XP_COMPAT)
     if (stealKeyBackend_ == RenderBackend::AVX2 &&
         stealVolatileCount_ >= 8u) {
+        constexpr uint32_t kParallelMinCandidates = 32768u;
+        constexpr uint32_t kParallelChunk = 16384u;
+        if (parallelFor_ != nullptr && stealVolatileCount_ >= kParallelMinCandidates &&
+            currentFrame_ <= static_cast<uint64_t>(INT32_MAX)) {
+            // The key build is one independent gather-heavy pass per candidate
+            // (cache-miss bound on a big pool): split it over the worker pool.
+            struct Build {
+                VoiceManager* self;
+                uint32_t count;
+                uint32_t chunk;
+                std::atomic<uint32_t> failed;
+            } build{this, stealVolatileCount_, kParallelChunk, {0u}};
+            const uint32_t jobs = (stealVolatileCount_ + kParallelChunk - 1u) / kParallelChunk;
+            parallelFor_(parallelForUser_, jobs,
+                [](void* context, uint32_t index) {
+                    Build& b = *static_cast<Build*>(context);
+                    VoiceManager& m = *b.self;
+                    const uint32_t begin = index * b.chunk;
+                    const uint32_t count = (std::min)(b.chunk, b.count - begin);
+                    if (!BuildVolatileStealKeysAVX2(
+                            m.stealVolatileList_ + begin, count, m.v.birthFrame,
+                            m.v.currentGain, m.v.stealOutputGain, m.activePosition_,
+                            m.currentFrame_, kBassMidiStealGainScale,
+                            m.stealAgeScale_, m.stealVolatileHeapKey_ + begin,
+                            m.stealVolatileHeapHandle_ + begin,
+                            m.stealVolatileHeapPosition_, begin)) {
+                        b.failed.store(1u, std::memory_order_relaxed);
+                    }
+                }, &build);
+            vectorized = build.failed.load(std::memory_order_relaxed) == 0u;
+        }
+        if (!vectorized)
         vectorized = BuildVolatileStealKeysAVX2(
             stealVolatileList_, stealVolatileCount_, v.birthFrame,
             v.currentGain, v.stealOutputGain, activePosition_, currentFrame_,

@@ -107,6 +107,7 @@ bool NearlyEqual(float a, float b, float epsilon = 1.0e-5f) {
 } // namespace
 
 #include "tests/cases/Features.inl"
+#include "tests/cases/ParallelVolatileHeap.inl"
 
 int main() {
     // Run the whole suite with launch staging on: the same differentials, the
@@ -156,6 +157,7 @@ int main() {
     TestPerChannelLimiterDifferential();
     TestWholeVoiceProductionGateParity();
     TestGpuStageDifferential();
+    TestParallelVolatileHeap();
     TestPerKeyVoiceCap();
     TestStealReject();
     TestFastProducerRing();

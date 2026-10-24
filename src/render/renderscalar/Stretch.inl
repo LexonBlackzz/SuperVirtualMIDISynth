@@ -232,9 +232,11 @@ inline void RenderScalar::RenderBlockStretch(
 #if defined(_MSC_VER)
         const uint64_t wvPlanBegin = __rdtsc();
 #endif
+        voices.SetParallelFor(&RenderScalar::PlanParallelFor, this);
         const bool planned =
             PlanWholeVoiceBlock(voices, events, eventCount, blockStartFrame,
                                 channelParams);
+        voices.SetParallelFor(nullptr, nullptr);
 #if defined(_MSC_VER)
         wvPlanCycles_ += __rdtsc() - wvPlanBegin;
 #endif
@@ -254,6 +256,40 @@ inline void RenderScalar::RenderBlockStretch(
     // stretch is skipped.
     (void)vibratoActive;
     (void)correctnessMode;
+}
+
+struct PlanParallelContext {
+    void (*job)(void* context, uint32_t index);
+    void* context;
+    uint32_t base;
+};
+
+inline void RenderScalar::PlanParallelJobThunk(uint32_t index,
+                                               const IndexedJobMix&, uint32_t,
+                                               void* userData) {
+    const PlanParallelContext& c = *static_cast<PlanParallelContext*>(userData);
+    c.job(c.context, c.base + index);
+}
+
+inline void RenderScalar::PlanParallelFor(void* user, uint32_t jobCount,
+                                          void (*job)(void* context, uint32_t index),
+                                          void* context) {
+    RenderScalar* self = static_cast<RenderScalar*>(user);
+    // The pool wants an output pair even for jobs that mix nothing.
+    static float sink[2] = {0.0f, 0.0f};
+    const uint32_t capacity = self->workerPool_ != nullptr
+        ? self->workerPool_->GetJobCapacity() : 0u;
+    for (uint32_t base = 0u; base < jobCount;) {
+        const uint32_t batch = capacity >= 2u
+            ? (std::min)(capacity, jobCount - base) : 1u;
+        PlanParallelContext pc{job, context, base};
+        if (batch < 2u || !self->workerPool_->ExecuteIndexed(
+                batch, 1u, &sink[0], &sink[1], &PlanParallelJobThunk, &pc,
+                nullptr, nullptr)) {
+            for (uint32_t i = 0u; i < batch; ++i) job(context, base + i);
+        }
+        base += batch;
+    }
 }
 
 // ── Whole-voice whole-block renderer ────────────────────────────────────

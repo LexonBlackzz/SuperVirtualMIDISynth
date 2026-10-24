@@ -2266,7 +2266,8 @@ bool BuildVolatileStealKeysAVX2(
     const uint64_t* birthFrames, const float* currentGains,
     const float* outputGains, const uint32_t* activePositions,
     uint64_t currentFrame, float gainScale, float ageScaleValue, uint64_t* outputKeys,
-    uint32_t* outputHandles, uint32_t* inverseHeapPositions) {
+    uint32_t* outputHandles, uint32_t* inverseHeapPositions,
+    uint32_t positionBase) {
     if (!handles || !birthFrames || !currentGains || !outputGains ||
         !activePositions || !outputKeys || !outputHandles ||
         !inverseHeapPositions || currentFrame >
@@ -2344,7 +2345,7 @@ bool BuildVolatileStealKeysAVX2(
         for (uint32_t lane = 0u; lane < 8u; ++lane) {
             const uint32_t heapPosition = position + lane;
             const uint32_t handle = handles[heapPosition];
-            inverseHeapPositions[handle] = heapPosition;
+            inverseHeapPositions[handle] = positionBase + heapPosition;
         }
     }
 
@@ -2363,7 +2364,7 @@ bool BuildVolatileStealKeysAVX2(
         outputKeys[position] = encode(
             score - commonAgeScalar, activePositions[handle]);
         outputHandles[position] = handle;
-        inverseHeapPositions[handle] = position;
+        inverseHeapPositions[handle] = positionBase + position;
     }
     _mm256_zeroupper();
     return true;

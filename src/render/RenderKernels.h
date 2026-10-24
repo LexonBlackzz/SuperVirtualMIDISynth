@@ -144,7 +144,8 @@ bool BuildVolatileStealKeysAVX2(
     const uint64_t* birthFrames, const float* currentGains,
     const float* outputGains, const uint32_t* activePositions,
     uint64_t currentFrame, float gainScale, float ageScale, uint64_t* outputKeys,
-    uint32_t* outputHandles, uint32_t* inverseHeapPositions);
+    uint32_t* outputHandles, uint32_t* inverseHeapPositions,
+    uint32_t positionBase = 0u);
 #endif
 
 uint32_t ScalarRenderSustainedLoop(
