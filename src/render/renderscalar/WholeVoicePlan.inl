@@ -216,6 +216,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     std::fill(wvStartIngress_, wvStartIngress_ + handleCapacity, UINT32_MAX);
     std::fill(wvTailKillFrame_, wvTailKillFrame_ + kStealTailReserve,
               UINT32_MAX);
+    std::fill(wvGhostPendingOf_.begin(), wvGhostPendingOf_.begin() + handleCapacity, 0u);
     wvOpCount_ = 0u;
     wvGhostCount_ = 0u;
     wvRowOpCount_ = 0u;
@@ -256,6 +257,9 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     // window write a record the owning render item applies; no-op when the
     // pool was built without records.
     voices.SetLaunchStagingActive(true);
+    wvDeferredPool_ = &voices;
+    voices.SetDeferredGhostFlush(wvGhostPendingOf_.data(),
+                                 &WholeVoiceDeferredGhostFlush, this);
     voices.SetPlanWindow(true);
 
     // Ingress-order dispatch with the render clock at each event's exact

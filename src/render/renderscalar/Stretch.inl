@@ -286,6 +286,45 @@ inline void CopyGhostRow(const VoiceSoA& source, VoiceSoA& destination,
 // wvReleaseFrame_), so this finds and swaps exactly the entry the former
 // linear scan did — finalization order is unchanged.  The scan was O(pending
 // releases) per steal, i.e. O(steals x pool) per block under chopped churn.
+// Complete a deferred ghost row from its source handle's still-unmaterialized
+// arrays.  Whoever gets here first copies; the other waits for the (short)
+// copy to finish.  Called by the ghost's render item and, through
+// MaterializeLaunch, by the worker about to overwrite the source row.
+#define SVMS_COPY_DEFERRED_FIELD(type, name) \
+    ghosts.name[ghost] = pool.name[source];
+inline void RenderScalar::EnsureGhostCopied(uint32_t ghost) {
+    std::atomic<uint32_t>& claim = wvGhostCopyState_[ghost];
+    if (claim.load(std::memory_order_acquire) == 2u) return;
+    uint32_t expected = 0u;
+    if (claim.compare_exchange_strong(expected, 1u,
+                                      std::memory_order_acq_rel)) {
+        const VoiceSoA& pool = wvDeferredPool_->v;
+        VoiceSoA& ghosts = wvGhostState_;
+        const uint32_t source = wvGhostHandle_[ghost];
+        SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_COPY_DEFERRED_FIELD)
+        const WholeVoiceGhostImmediate& imm = wvGhostImm_[ghost];
+        ghosts.state[ghost] = imm.state;
+        ghosts.envelopeStage[ghost] = imm.envelopeStage;
+        ghosts.renderClass[ghost] = imm.renderClass;
+        ghosts.loopEnabled[ghost] = imm.loopEnabled;
+        ghosts.currentGain[ghost] = imm.currentGain;
+        ghosts.targetGain[ghost] = imm.targetGain;
+        ghosts.stealFadeInFramesRemaining[ghost] =
+            imm.stealFadeInFramesRemaining;
+        ghosts.stealFadeInFramesTotal[ghost] = imm.stealFadeInFramesTotal;
+        claim.store(2u, std::memory_order_release);
+        return;
+    }
+    while (claim.load(std::memory_order_acquire) != 2u) _mm_pause();
+}
+#undef SVMS_COPY_DEFERRED_FIELD
+
+inline void RenderScalar::WholeVoiceDeferredGhostFlush(VoiceHandle handle,
+                                                       void* userData) {
+    RenderScalar* renderer = static_cast<RenderScalar*>(userData);
+    renderer->EnsureGhostCopied(renderer->wvGhostPendingOf_[handle] - 1u);
+}
+
 inline void RenderScalar::DropWholeVoiceReleaseOp(VoiceHandle handle) {
     const uint32_t i = wvOpIndex_[handle];
     if (i >= wvOpCount_ || wvOpHandles_[i] != handle) return;
@@ -469,8 +508,31 @@ inline void RenderScalar::WholeVoicePreTailCaptureHook(
         return;
     }
     const uint32_t ghost = renderer->wvGhostCount_++;
-    CopyGhostRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
-                 handle, ghost);
+    if (renderer->wvPlanVoices_->GhostCopyDeferrable()) {
+        // Deferred copy (see wvGhostImm_): keep only what the successor's
+        // launch overwrites right away; EnsureGhostCopied takes the rest.
+        const VoiceSoA& pool = renderer->wvPlanVoices_->v;
+        VoiceSoA& ghosts = renderer->wvGhostState_;
+        renderer->wvGhostImm_[ghost] = {
+            pool.state[handle], pool.envelopeStage[handle],
+            pool.renderClass[handle], pool.loopEnabled[handle],
+            pool.currentGain[handle], pool.targetGain[handle],
+            pool.stealFadeInFramesRemaining[handle],
+            pool.stealFadeInFramesTotal[handle]};
+        ghosts.rows[ghost] = pool.rows[handle];
+        ghosts.stealOutputGain[ghost] = pool.stealOutputGain[handle];
+        if (pool.rot != nullptr && ghosts.rot != nullptr)
+            ghosts.rot[ghost] = pool.rot[handle];
+        renderer->wvGhostCopyState_[ghost].store(0u, std::memory_order_relaxed);
+        renderer->wvGhostPendingOf_[handle] = ghost + 1u;
+#if defined(SVMS_ENABLE_REFERENCE_RENDERER)
+        g_ghostCopiesDeferred.fetch_add(1u, std::memory_order_relaxed);
+#endif
+    } else {
+        CopyGhostRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
+                     handle, ghost);
+        renderer->wvGhostCopyState_[ghost].store(2u, std::memory_order_relaxed);
+    }
     renderer->wvGhostStartFrame_[ghost] =
         renderer->wvStartFrame_[handle] == UINT32_MAX
             ? 0u : renderer->wvStartFrame_[handle];
@@ -537,6 +599,7 @@ inline void RenderScalar::WholeVoiceSilenceVoiceHook(
     const uint32_t ghost = renderer->wvGhostCount_++;
     CopyGhostRow(renderer->wvPlanVoices_->v, renderer->wvGhostState_,
                  handle, ghost);
+    renderer->wvGhostCopyState_[ghost].store(2u, std::memory_order_relaxed);
     renderer->wvGhostStartFrame_[ghost] =
         renderer->wvStartFrame_[handle] == UINT32_MAX
             ? 0u : renderer->wvStartFrame_[handle];

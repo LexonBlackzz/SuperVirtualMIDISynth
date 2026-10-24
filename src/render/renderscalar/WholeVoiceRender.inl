@@ -627,6 +627,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
             const uint32_t start = renderer->wvGhostStartFrame_[ghost];
             const uint32_t death = renderer->wvGhostDeathFrame_[ghost];
             if (start >= frameCount) continue;
+            renderer->EnsureGhostCopied(ghost);
             uint32_t releaseFrame = renderer->wvGhostReleaseFrame_[ghost];
             VoiceSoA& g = renderer->wvGhostState_;
             // Bus mode: the ghost's snapshot row carries its channel.
@@ -1030,6 +1031,8 @@ inline void RenderScalar::RenderWholeVoiceBlock(
 #endif
         voices.ClearStagedPending();
     }
+    voices.SetDeferredGhostFlush(nullptr, nullptr, nullptr);
+    wvDeferredPool_ = nullptr;
 
     // Retirement in exact (frame, capture-position) order — identical to
     // the frame-major oracle's inline retirement.

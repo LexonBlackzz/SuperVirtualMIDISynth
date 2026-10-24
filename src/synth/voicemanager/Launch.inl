@@ -611,6 +611,10 @@ inline void VoiceManager::ApplyVoiceConfigurationFieldsImpl(
 // Copy a staged launch record into the SoA arrays (see VoiceLaunchRecord).
 // Row-local: any worker may run it on a row it owns.
 inline void VoiceManager::MaterializeLaunch(VoiceHandle handle) noexcept {
+    // The arrays below still hold the displaced voice's values; a deferred
+    // ghost snapshot must take them before they are overwritten.
+    if (deferredGhostPending_ != nullptr && deferredGhostPending_[handle] != 0u)
+        deferredGhostFlush_(handle, deferredGhostUserData_);
     const VoiceLaunchRecord& rec = v.launch[handle];
 #define SVMS_MATERIALIZE_FIELD(type, name) v.name[handle] = rec.name;
     SVMS_VOICE_LAUNCH_FIELDS(SVMS_MATERIALIZE_FIELD)
@@ -744,7 +748,11 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     const bool preserveRenderIndex =
         v.renderClass[handle] == desiredClassValue;
 
+    // The successor is staged right below (same handle, same function), so the
+    // victim's staged-field arrays stay intact until its record is applied.
+    ghostCopyDeferrable_ = launchStagingActive_ && stealTailCaptureSuppressed_;
     CaptureStealTail(handle);
+    ghostCopyDeferrable_ = false;
     if (fromRing) {
         // Mirror tier-pop bookkeeping: unlink the victim from the volatile
         // candidate index it still occupies.

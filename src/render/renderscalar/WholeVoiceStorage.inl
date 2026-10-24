@@ -96,6 +96,9 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     wvPartMixed_.assign(handleCapacity, 0u);
     wvPartMuted_.assign(handleCapacity, 0u);
     wvMutedLast_.assign(handleCapacity, 0u);
+    wvGhostPendingOf_.assign(handleCapacity, 0u);
+    wvGhostImm_.assign(cap, WholeVoiceGhostImmediate{});
+    wvGhostCopyState_.reset(new std::atomic<uint32_t>[cap]());
     if (wvGhostCapacity_ < cap) {
         VoiceSoA grown;
         if (!grown.Reserve(cap)) return false;

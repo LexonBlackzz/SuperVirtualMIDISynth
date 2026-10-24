@@ -15,6 +15,9 @@
 #include "render/VoiceFilter.h"
 #include "render/RenderWorkers.h"
 #include <algorithm>
+#include <atomic>
+#include <memory>
+#include <vector>
 #include <cstdlib>
 #include <malloc.h>
 #include "synth/SoundFont.h"
@@ -720,6 +723,26 @@ private:
     // Handle a ghost was captured from: its re-excite hits live on that
     // handle's list, filtered by the ghost's playIndex.
     uint32_t* wvGhostHandle_ = nullptr;
+    // Deferred ghost copy (launch staging).  A steal victim's ghost row is
+    // filled in two steps: the plan snapshots what the successor's launch
+    // overwrites at once (wvGhostImm_, the VoiceRow line, rot), and the rest of
+    // the dense row is copied later by whoever touches the victim row first
+    // (the ghost's render item, or the successor's MaterializeLaunch) under the
+    // per-ghost claim word: 0 = owed, 1 = being copied, 2 = complete.  Ghosts
+    // copied eagerly start at 2.  wvGhostPendingOf_[handle] = ghost + 1 of the
+    // newest deferred ghost sourced from that handle (0 = none).
+    struct WholeVoiceGhostImmediate {
+        uint8_t state, envelopeStage, renderClass, loopEnabled;
+        float currentGain, targetGain;
+        uint32_t stealFadeInFramesRemaining, stealFadeInFramesTotal;
+    };
+    std::vector<WholeVoiceGhostImmediate> wvGhostImm_;
+    std::unique_ptr<std::atomic<uint32_t>[]> wvGhostCopyState_;
+    std::vector<uint32_t> wvGhostPendingOf_;
+    VoiceManager* wvDeferredPool_ = nullptr;   // source pool of deferred ghosts
+    void EnsureGhostCopied(uint32_t ghost);
+    static void WholeVoiceDeferredGhostFlush(VoiceHandle handle,
+                                             void* userData);
     uint32_t wvHandleCapacity_ = 0u;         // handle-range size of the above
     uint32_t* wvOpHandles_ = nullptr;
     uint32_t* wvOpFrames_ = nullptr;

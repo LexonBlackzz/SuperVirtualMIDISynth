@@ -2317,6 +2317,8 @@ void RunLaunchStagingIdentity(uint32_t renderThreads, bool avx2Pass) {
           "store bit-identical blocks");
     Check(stagedContext.launches > 100u,
           "launch staging identity exercised the launch path");
+    Check(svms::g_ghostCopiesDeferred.load() > 0u,
+          "launch staging identity: no ghost copy was deferred");
 }
 
 void TestLaunchStagingIdentity() {

@@ -53,6 +53,8 @@ inline bool DropZeroLifeVictimsEnabled() noexcept {
 // staged (must stay 0).
 inline std::atomic<uint64_t> g_launchStagingStaged{0};
 inline std::atomic<uint64_t> g_launchStagingLeaks{0};
+// Ghost rows whose dense copy was deferred to the render stage.
+inline std::atomic<uint64_t> g_ghostCopiesDeferred{0};
 // Lazy same-frame launch: keys written lazily vs keys the commit recomputes
 // (must stay 0), and how many lazy steps ran.
 inline std::atomic<uint64_t> g_lazyKeyMismatches{0};
@@ -600,6 +602,22 @@ public:
             MaterializeLaunch(handle);
     }
     void MaterializeLaunch(VoiceHandle handle) noexcept;
+    // Deferred ghost copy (staging only): the in-place steal launch tells the
+    // pre-tail-capture hook that the victim's staged-field arrays survive
+    // until the successor's record is applied, so the hook may snapshot just
+    // the fields the launch overwrites at once and leave the rest of the row
+    // copy to whoever touches the row first.  `pending[handle] != 0` marks a
+    // row whose old values still owe a ghost; MaterializeLaunch calls the
+    // flush hook before it overwrites them (row-local, any worker).
+    using DeferredGhostFlushHook = void(*)(VoiceHandle handle, void* userData);
+    void SetDeferredGhostFlush(const uint32_t* pending,
+                               DeferredGhostFlushHook hook,
+                               void* userData) noexcept {
+        deferredGhostPending_ = pending;
+        deferredGhostFlush_ = hook;
+        deferredGhostUserData_ = userData;
+    }
+    bool GhostCopyDeferrable() const noexcept { return ghostCopyDeferrable_; }
     // Test/diagnostic: rows still carrying a staged record.
     uint32_t CountStagedRows() const noexcept;
     uint32_t GetRenderClassCount(VoiceRenderClass renderClass) const;
@@ -1284,6 +1302,10 @@ private:
     void* rowOpUserData_ = nullptr;
     bool stealTailCaptureSuppressed_ = false;
     bool launchStagingActive_ = false;   // plan window: launches may stage
+    bool ghostCopyDeferrable_ = false;   // set around the in-place steal capture
+    const uint32_t* deferredGhostPending_ = nullptr;
+    DeferredGhostFlushHook deferredGhostFlush_ = nullptr;
+    void* deferredGhostUserData_ = nullptr;
     bool planWindow_ = false;            // inside PlanWholeVoiceBlock dispatch
     bool lazyRunActive_ = false;         // inside a NoteOn run (lazy launches)
     uint64_t lazyChainSteps_ = 0u;
