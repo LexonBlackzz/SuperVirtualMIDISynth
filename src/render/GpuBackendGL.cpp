@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -384,6 +385,7 @@ private:
     GLFns gl_;
     bool created_ = false;
     bool bound_ = false;
+    std::thread::id boundThread_;
     bool bindingsDirty_ = true;
     GLuint programs_[3] = {};        // voice, reduce, scatter
     GLint loc_[3][4] = {};
@@ -539,8 +541,12 @@ GLuint GLBackend::BuildProgram(const char* define, std::string& error) {
 }
 
 bool GLBackend::Bind() {
-    if (bound_) return true;
+    // The context belongs to one thread at a time.  The audio thread binds it
+    // on its first block; a rebuilt audio thread (device change) rebinds it.
+    const std::thread::id self = std::this_thread::get_id();
+    if (bound_ && boundThread_ == self) return true;
     if (!context_.MakeCurrent()) return false;
+    boundThread_ = self;
     bound_ = true;
     return true;
 }
