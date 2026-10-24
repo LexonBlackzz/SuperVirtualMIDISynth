@@ -386,6 +386,12 @@ inline void RenderScalar::WholeVoiceVoiceForkedHook(
     // identical for both halves.
     renderer->wvStartFrame_[twin] = renderer->wvStartFrame_[source];
     renderer->wvStartIngress_[twin] = renderer->wvStartIngress_[source];
+#if defined(SVMS_GPU_STAGE)
+    // The fork scaled the source row's gains in place under the same play
+    // index: any GPU copy of its statics is stale.
+    if (renderer->gpuStage_ != nullptr && renderer->gpuStage_->Enabled())
+        renderer->gpuStage_->ForgetRow(source);
+#endif
     // The twin replays the source's trajectory up to its release, so it
     // must also hear the re-excite hits the source took so far.
     if (renderer->wvExciteHead_ != nullptr &&

@@ -915,6 +915,9 @@ private:
     VoiceManager* voiceManager;
     ChannelCache* channelCache;
     RenderScalar* renderScalar;
+#if defined(SVMS_GPU_STAGE)
+    std::unique_ptr<GpuStage> gpuStage;
+#endif
     SF2Data* soundFontData;
     RuntimeConfigSnapshot* configSnapshot;
     int16_t* sampleDataStore;

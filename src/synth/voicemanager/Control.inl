@@ -206,6 +206,7 @@ inline void VoiceManager::RefreshMixGain(VoiceHandle handle, const ChannelParams
 }
 
 inline void VoiceManager::RefreshMixGains(const ChannelParamsSnapshot* chParams) {
+    ++staticEpoch_;
     bool stableTreeDirty = false;
     for (uint32_t ai = 0; ai < activeCount_; ++ai) {
         uint32_t i = activeList_[ai];
@@ -252,6 +253,7 @@ inline void VoiceManager::ApplyChannelBendRatio(uint8_t channel,
         bendOpHook_(channel, bendSemitones, commonRatio, rowOpUserData_);
         return;
     }
+    ++staticEpoch_;
     ForEachChannelActive(channel, [&](VoiceHandle handle) {
         EnsureMaterialized(handle);
         const float scale = v.pitchBendScales[handle];
@@ -312,6 +314,7 @@ inline void VoiceManager::FoldStaleChannelMixGains() {
     if (pending == 0u) return;
     channelMixStealMask_ = 0u;
     channelMixDirtyMask_ = 0u;
+    ++staticEpoch_;
     FoldMask(pending, true);
 }
 
@@ -336,6 +339,7 @@ inline void VoiceManager::RefreshMixGainsForChannel(
     channelMixScaleR_[channel] = cp.mixScaleRight;
     channelMixStealMask_ &= ~(uint64_t(1) << channel);
     channelMixDirtyMask_ &= ~(uint64_t(1) << channel);
+    ++staticEpoch_;
     bool stableTreeDirty = false;
     ForEachChannelActive(channel, [&](VoiceHandle voice) {
         FoldVoiceMixGains(voice, cp.mixScaleLeft, cp.mixScaleRight,

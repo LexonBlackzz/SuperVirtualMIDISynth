@@ -1,0 +1,718 @@
+// OpenGL 4.3 compute backend of the GPU render stage.
+//
+// No GL loader library and no load-time import: opengl32.dll / libEGL.so.1 are
+// opened only when the stage is enabled and about 40 entry points are fetched
+// by hand.  Windows creates a hidden-window WGL 4.3 core context; Linux uses a
+// surfaceless (or 1x1 pbuffer) EGL context, so no X11/Wayland window is needed.
+
+#include "render/GpuBackend.h"
+#include "render/gpu/VoiceStageGLSL.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <dlfcn.h>
+#endif
+
+namespace svms {
+namespace gpu {
+namespace {
+
+// ── Minimal GL declarations (no system GL headers needed) ───────────────
+using GLenum = unsigned int;
+using GLuint = unsigned int;
+using GLint = int;
+using GLsizei = int;
+using GLbitfield = unsigned int;
+using GLboolean = unsigned char;
+using GLchar = char;
+using GLuint64 = unsigned long long;
+using GLsizeiptr = std::ptrdiff_t;
+using GLintptr = std::ptrdiff_t;
+using GLsync = struct __GLsync*;
+
+constexpr GLenum GL_COMPUTE_SHADER = 0x91B9;
+constexpr GLenum GL_SHADER_STORAGE_BUFFER = 0x90D2;
+constexpr GLenum GL_DYNAMIC_DRAW = 0x88E8;
+constexpr GLenum GL_STATIC_DRAW = 0x88E4;
+constexpr GLenum GL_COMPILE_STATUS = 0x8B81;
+constexpr GLenum GL_LINK_STATUS = 0x8B82;
+constexpr GLenum GL_INFO_LOG_LENGTH = 0x8B84;
+constexpr GLbitfield GL_SHADER_STORAGE_BARRIER_BIT = 0x2000;
+constexpr GLbitfield GL_BUFFER_UPDATE_BARRIER_BIT = 0x0200;
+constexpr GLenum GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117;
+constexpr GLenum GL_ALREADY_SIGNALED = 0x911A;
+constexpr GLenum GL_TIMEOUT_EXPIRED = 0x911B;
+constexpr GLenum GL_CONDITION_SATISFIED = 0x911C;
+constexpr GLbitfield GL_SYNC_FLUSH_COMMANDS_BIT = 0x1;
+constexpr GLenum GL_MAJOR_VERSION = 0x821B;
+constexpr GLenum GL_MINOR_VERSION = 0x821C;
+constexpr GLenum GL_VERSION = 0x1F02;
+constexpr GLenum GL_RENDERER = 0x1F01;
+constexpr GLenum GL_MAX_COMPUTE_SHARED_MEMORY_SIZE = 0x8262;
+constexpr GLenum GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS = 0x90EB;
+constexpr GLenum GL_MAX_SHADER_STORAGE_BLOCK_SIZE = 0x90DE;
+constexpr GLenum GL_NO_ERROR = 0;
+constexpr GLenum GL_TIME_ELAPSED = 0x88BF;
+constexpr GLenum GL_QUERY_RESULT = 0x8866;
+constexpr GLuint64 GL_TIMEOUT_IGNORED = 0xFFFFFFFFFFFFFFFFull;
+
+#if defined(_WIN32)
+#  define SVMS_GLAPI __stdcall
+#else
+#  define SVMS_GLAPI
+#endif
+
+struct GLFns {
+    const unsigned char* (SVMS_GLAPI* GetString)(GLenum) = nullptr;
+    void (SVMS_GLAPI* GetIntegerv)(GLenum, GLint*) = nullptr;
+    GLenum (SVMS_GLAPI* GetError)() = nullptr;
+    void (SVMS_GLAPI* Flush)() = nullptr;
+    GLuint (SVMS_GLAPI* CreateShader)(GLenum) = nullptr;
+    void (SVMS_GLAPI* ShaderSource)(GLuint, GLsizei, const GLchar* const*, const GLint*) = nullptr;
+    void (SVMS_GLAPI* CompileShader)(GLuint) = nullptr;
+    void (SVMS_GLAPI* GetShaderiv)(GLuint, GLenum, GLint*) = nullptr;
+    void (SVMS_GLAPI* GetShaderInfoLog)(GLuint, GLsizei, GLsizei*, GLchar*) = nullptr;
+    GLuint (SVMS_GLAPI* CreateProgram)() = nullptr;
+    void (SVMS_GLAPI* AttachShader)(GLuint, GLuint) = nullptr;
+    void (SVMS_GLAPI* LinkProgram)(GLuint) = nullptr;
+    void (SVMS_GLAPI* GetProgramiv)(GLuint, GLenum, GLint*) = nullptr;
+    void (SVMS_GLAPI* GetProgramInfoLog)(GLuint, GLsizei, GLsizei*, GLchar*) = nullptr;
+    void (SVMS_GLAPI* UseProgram)(GLuint) = nullptr;
+    void (SVMS_GLAPI* DeleteShader)(GLuint) = nullptr;
+    void (SVMS_GLAPI* DeleteProgram)(GLuint) = nullptr;
+    GLint (SVMS_GLAPI* GetUniformLocation)(GLuint, const GLchar*) = nullptr;
+    void (SVMS_GLAPI* Uniform1ui)(GLint, GLuint) = nullptr;
+    void (SVMS_GLAPI* GenBuffers)(GLsizei, GLuint*) = nullptr;
+    void (SVMS_GLAPI* DeleteBuffers)(GLsizei, const GLuint*) = nullptr;
+    void (SVMS_GLAPI* BindBuffer)(GLenum, GLuint) = nullptr;
+    void (SVMS_GLAPI* BindBufferBase)(GLenum, GLuint, GLuint) = nullptr;
+    void (SVMS_GLAPI* BufferData)(GLenum, GLsizeiptr, const void*, GLenum) = nullptr;
+    void (SVMS_GLAPI* BufferSubData)(GLenum, GLintptr, GLsizeiptr, const void*) = nullptr;
+    void (SVMS_GLAPI* GetBufferSubData)(GLenum, GLintptr, GLsizeiptr, void*) = nullptr;
+    void (SVMS_GLAPI* DispatchCompute)(GLuint, GLuint, GLuint) = nullptr;
+    void (SVMS_GLAPI* MemoryBarrier)(GLbitfield) = nullptr;
+    GLsync (SVMS_GLAPI* FenceSync)(GLenum, GLbitfield) = nullptr;
+    GLenum (SVMS_GLAPI* ClientWaitSync)(GLsync, GLbitfield, GLuint64) = nullptr;
+    void (SVMS_GLAPI* DeleteSync)(GLsync) = nullptr;
+    void (SVMS_GLAPI* GenQueries)(GLsizei, GLuint*) = nullptr;
+    void (SVMS_GLAPI* BeginQuery)(GLenum, GLuint) = nullptr;
+    void (SVMS_GLAPI* EndQuery)(GLenum) = nullptr;
+    void (SVMS_GLAPI* GetQueryObjectui64v)(GLuint, GLenum, GLuint64*) = nullptr;
+};
+
+// ── Platform context ────────────────────────────────────────────────────
+class GLContext {
+public:
+    ~GLContext() { Destroy(); }
+    bool Create(std::string& error);
+    bool MakeCurrent();
+    void Release();
+    void Destroy();
+    void* Proc(const char* name) const;
+
+private:
+#if defined(_WIN32)
+    HMODULE opengl32_ = nullptr;
+    HWND window_ = nullptr;
+    HDC dc_ = nullptr;
+    HGLRC rc_ = nullptr;
+    PROC (WINAPI* getProc_)(LPCSTR) = nullptr;
+    BOOL (WINAPI* makeCurrent_)(HDC, HGLRC) = nullptr;
+    BOOL (WINAPI* deleteContext_)(HGLRC) = nullptr;
+#else
+    void* egl_ = nullptr;
+    void* display_ = nullptr;
+    void* context_ = nullptr;
+    void* surface_ = nullptr;
+    void* (*getProc_)(const char*) = nullptr;
+    unsigned (*makeCurrent_)(void*, void*, void*, void*) = nullptr;
+#endif
+};
+
+#if defined(_WIN32)
+
+bool GLContext::Create(std::string& error) {
+    opengl32_ = LoadLibraryW(L"opengl32.dll");
+    HMODULE gdi32 = LoadLibraryW(L"gdi32.dll");
+    HMODULE user32 = LoadLibraryW(L"user32.dll");
+    if (!opengl32_ || !gdi32 || !user32) {
+        error = "opengl32.dll is not available";
+        return false;
+    }
+    auto createContext = reinterpret_cast<HGLRC(WINAPI*)(HDC)>(
+        GetProcAddress(opengl32_, "wglCreateContext"));
+    deleteContext_ = reinterpret_cast<BOOL(WINAPI*)(HGLRC)>(
+        GetProcAddress(opengl32_, "wglDeleteContext"));
+    makeCurrent_ = reinterpret_cast<BOOL(WINAPI*)(HDC, HGLRC)>(
+        GetProcAddress(opengl32_, "wglMakeCurrent"));
+    getProc_ = reinterpret_cast<PROC(WINAPI*)(LPCSTR)>(
+        GetProcAddress(opengl32_, "wglGetProcAddress"));
+    auto choosePixelFormat = reinterpret_cast<int(WINAPI*)(HDC, const PIXELFORMATDESCRIPTOR*)>(
+        GetProcAddress(gdi32, "ChoosePixelFormat"));
+    auto setPixelFormat = reinterpret_cast<BOOL(WINAPI*)(HDC, int, const PIXELFORMATDESCRIPTOR*)>(
+        GetProcAddress(gdi32, "SetPixelFormat"));
+    auto createWindow = reinterpret_cast<HWND(WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID)>(
+        GetProcAddress(user32, "CreateWindowExW"));
+    auto getDC = reinterpret_cast<HDC(WINAPI*)(HWND)>(GetProcAddress(user32, "GetDC"));
+    if (!createContext || !deleteContext_ || !makeCurrent_ || !getProc_ ||
+        !choosePixelFormat || !setPixelFormat || !createWindow || !getDC) {
+        error = "WGL entry points are missing";
+        return false;
+    }
+    // A hidden STATIC window: the cheapest thing that owns a device context.
+    window_ = createWindow(0, L"STATIC", L"SVMS GPU", WS_POPUP, 0, 0, 1, 1,
+                           nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!window_) { error = "CreateWindowEx failed"; return false; }
+    dc_ = getDC(window_);
+    PIXELFORMATDESCRIPTOR pfd{};
+    pfd.nSize = sizeof(pfd);
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 32;
+    pfd.iLayerType = PFD_MAIN_PLANE;
+    const int format = choosePixelFormat(dc_, &pfd);
+    if (format == 0 || !setPixelFormat(dc_, format, &pfd)) {
+        error = "no usable pixel format";
+        return false;
+    }
+    HGLRC legacy = createContext(dc_);
+    if (!legacy || !makeCurrent_(dc_, legacy)) {
+        error = "wglCreateContext failed";
+        if (legacy) deleteContext_(legacy);
+        return false;
+    }
+    using CreateAttribs = HGLRC(WINAPI*)(HDC, HGLRC, const int*);
+    auto createAttribs = reinterpret_cast<CreateAttribs>(
+        getProc_("wglCreateContextAttribsARB"));
+    if (!createAttribs) {
+        makeCurrent_(nullptr, nullptr);
+        deleteContext_(legacy);
+        error = "WGL_ARB_create_context is not supported";
+        return false;
+    }
+    const int attribs[] = {
+        0x2091, 4,        // WGL_CONTEXT_MAJOR_VERSION_ARB
+        0x2092, 3,        // WGL_CONTEXT_MINOR_VERSION_ARB
+        0x9126, 0x1,      // WGL_CONTEXT_PROFILE_MASK_ARB = core
+        0};
+    rc_ = createAttribs(dc_, nullptr, attribs);
+    makeCurrent_(nullptr, nullptr);
+    deleteContext_(legacy);
+    if (!rc_) {
+        error = "OpenGL 4.3 core context creation failed";
+        return false;
+    }
+    return makeCurrent_(dc_, rc_) != FALSE;
+}
+
+bool GLContext::MakeCurrent() {
+    return rc_ && makeCurrent_(dc_, rc_) != FALSE;
+}
+
+void GLContext::Release() {
+    if (makeCurrent_) makeCurrent_(nullptr, nullptr);
+}
+
+void GLContext::Destroy() {
+    if (rc_ && deleteContext_) {
+        makeCurrent_(nullptr, nullptr);
+        deleteContext_(rc_);
+    }
+    rc_ = nullptr;
+    if (window_) {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        auto destroy = reinterpret_cast<BOOL(WINAPI*)(HWND)>(
+            user32 ? GetProcAddress(user32, "DestroyWindow") : nullptr);
+        if (destroy) destroy(window_);
+        window_ = nullptr;
+    }
+}
+
+void* GLContext::Proc(const char* name) const {
+    void* p = getProc_ ? reinterpret_cast<void*>(getProc_(name)) : nullptr;
+    const auto v = reinterpret_cast<intptr_t>(p);
+    if (p && v != 1 && v != 2 && v != 3 && v != -1) return p;
+    return opengl32_ ? reinterpret_cast<void*>(GetProcAddress(opengl32_, name))
+                     : nullptr;
+}
+
+#else  // Linux: EGL
+
+namespace egl {
+constexpr int kNone = 0x3038;
+constexpr int kSurfaceType = 0x3033;
+constexpr int kPbufferBit = 0x0001;
+constexpr int kRenderableType = 0x3040;
+constexpr int kOpenGLBit = 0x0008;
+constexpr unsigned kOpenGLApi = 0x30A2;
+constexpr int kContextMajor = 0x3098;
+constexpr int kContextMinor = 0x30FB;
+constexpr int kContextProfile = 0x30FD;
+constexpr int kCoreProfileBit = 0x1;
+constexpr int kWidth = 0x3057;
+constexpr int kHeight = 0x3056;
+}  // namespace egl
+
+bool GLContext::Create(std::string& error) {
+    egl_ = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!egl_) { error = "libEGL.so.1 is not available"; return false; }
+    auto sym = [&](const char* name) { return dlsym(egl_, name); };
+    using GetDisplay = void* (*)(void*);
+    using Initialize = unsigned (*)(void*, int*, int*);
+    using BindApi = unsigned (*)(unsigned);
+    using ChooseConfig = unsigned (*)(void*, const int*, void**, int, int*);
+    using CreateContext = void* (*)(void*, void*, void*, const int*);
+    using CreatePbuffer = void* (*)(void*, void*, const int*);
+    auto getDisplay = reinterpret_cast<GetDisplay>(sym("eglGetDisplay"));
+    auto initialize = reinterpret_cast<Initialize>(sym("eglInitialize"));
+    auto bindApi = reinterpret_cast<BindApi>(sym("eglBindAPI"));
+    auto chooseConfig = reinterpret_cast<ChooseConfig>(sym("eglChooseConfig"));
+    auto createContext = reinterpret_cast<CreateContext>(sym("eglCreateContext"));
+    auto createPbuffer = reinterpret_cast<CreatePbuffer>(sym("eglCreatePbufferSurface"));
+    getProc_ = reinterpret_cast<void* (*)(const char*)>(sym("eglGetProcAddress"));
+    makeCurrent_ = reinterpret_cast<unsigned (*)(void*, void*, void*, void*)>(
+        sym("eglMakeCurrent"));
+    if (!getDisplay || !initialize || !bindApi || !chooseConfig ||
+        !createContext || !getProc_ || !makeCurrent_) {
+        error = "EGL entry points are missing";
+        return false;
+    }
+    display_ = getDisplay(nullptr);
+    int major = 0, minor = 0;
+    if (!display_ || !initialize(display_, &major, &minor)) {
+        error = "eglInitialize failed";
+        return false;
+    }
+    if (!bindApi(egl::kOpenGLApi)) { error = "eglBindAPI(OpenGL) failed"; return false; }
+    const int configAttribs[] = {egl::kSurfaceType, egl::kPbufferBit,
+                                 egl::kRenderableType, egl::kOpenGLBit,
+                                 egl::kNone};
+    void* config = nullptr;
+    int configCount = 0;
+    if (!chooseConfig(display_, configAttribs, &config, 1, &configCount) ||
+        configCount < 1) {
+        error = "no EGL config for OpenGL";
+        return false;
+    }
+    const int ctxAttribs[] = {egl::kContextMajor, 4, egl::kContextMinor, 3,
+                              egl::kContextProfile, egl::kCoreProfileBit,
+                              egl::kNone};
+    context_ = createContext(display_, config, nullptr, ctxAttribs);
+    if (!context_) { error = "OpenGL 4.3 core context creation failed"; return false; }
+    // Surfaceless first (EGL_KHR_surfaceless_context); a 1x1 pbuffer otherwise.
+    if (!makeCurrent_(display_, nullptr, nullptr, context_)) {
+        if (!createPbuffer) { error = "eglMakeCurrent failed"; return false; }
+        const int pbAttribs[] = {egl::kWidth, 1, egl::kHeight, 1, egl::kNone};
+        surface_ = createPbuffer(display_, config, pbAttribs);
+        if (!surface_ || !makeCurrent_(display_, surface_, surface_, context_)) {
+            error = "eglMakeCurrent failed";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool GLContext::MakeCurrent() {
+    return context_ &&
+           makeCurrent_(display_, surface_, surface_, context_) != 0u;
+}
+
+void GLContext::Release() {
+    if (makeCurrent_ && display_)
+        makeCurrent_(display_, nullptr, nullptr, nullptr);
+}
+
+void GLContext::Destroy() {
+    if (display_ && context_ && egl_) {
+        Release();
+        using DestroyContext = unsigned (*)(void*, void*);
+        auto destroy = reinterpret_cast<DestroyContext>(
+            dlsym(egl_, "eglDestroyContext"));
+        if (destroy) destroy(display_, context_);
+    }
+    context_ = nullptr;
+}
+
+void* GLContext::Proc(const char* name) const {
+    return getProc_ ? getProc_(name) : nullptr;
+}
+
+#endif
+
+// ── The backend ─────────────────────────────────────────────────────────
+class GLBackend final : public Backend {
+public:
+    ~GLBackend() override { Shutdown(); }
+    bool Init(uint32_t adapterIndex, std::string& error) override;
+    bool UploadStore(const int16_t* data, uint32_t frames) override;
+    bool Reserve(uint32_t handleCapacity, uint32_t maxFrames) override;
+    bool UploadRows(const UploadRecord* records, uint32_t count) override;
+    bool Submit(const ListEntry* list, uint32_t count, uint32_t frames) override;
+    Result Collect(uint64_t timeoutMicros, float* mixLR, DynOut* dyn) override;
+    void ProfileNs(uint64_t& voice, uint64_t& reduce) const override {
+        voice = profileNs_[0];
+        reduce = profileNs_[1];
+    }
+    const char* Name() const override { return name_.c_str(); }
+    uint32_t MaxVoices() const override { return handleCapacity_; }
+
+private:
+    enum Buf { kStore, kRows, kList, kPartial, kMix, kDyn, kUpload, kBufCount };
+    bool Bind();
+    void BindAll();
+    GLuint BuildProgram(const char* define, std::string& error);
+    bool ResizeBuffer(Buf which, size_t bytes);
+    void Shutdown();
+    bool CheckError(const char* what);
+
+    GLContext context_;
+    GLFns gl_;
+    bool created_ = false;
+    bool bound_ = false;
+    bool bindingsDirty_ = true;
+    GLuint programs_[3] = {};        // voice, reduce, scatter
+    GLint loc_[3][4] = {};
+    GLuint buf_[kBufCount] = {};
+    size_t bufBytes_[kBufCount] = {};
+    GLsync fence_ = nullptr;
+    bool profile_ = false;
+    GLuint queries_[2] = {};
+    uint64_t profileNs_[2] = {};
+    uint32_t handleCapacity_ = 0u;
+    uint32_t maxFrames_ = 0u;
+    uint32_t group_ = 128u;   // voices per workgroup (shader GROUP)
+    uint32_t tile_ = 4u;      // frames per reduction tile (shader TILE)
+    uint32_t uploadCursor_ = 0u;
+    uint32_t pendingCount_ = 0u;
+    uint32_t pendingFrames_ = 0u;
+    std::string name_ = "opengl";
+};
+
+template <typename F>
+bool Fetch(const GLContext& ctx, F& slot, const char* name) {
+    slot = reinterpret_cast<F>(ctx.Proc(name));
+    return slot != nullptr;
+}
+
+bool GLBackend::CheckError(const char* what) {
+    const GLenum e = gl_.GetError();
+    if (e == GL_NO_ERROR) return true;
+    name_ += std::string(" [") + what + " error " + std::to_string(e) + "]";
+    return false;
+}
+
+bool GLBackend::Init(uint32_t, std::string& error) {
+    if (!context_.Create(error)) return false;
+    created_ = true;
+    bool ok = true;
+#define SVMS_FETCH(field, glname) ok = Fetch(context_, gl_.field, glname) && ok
+    SVMS_FETCH(GetString, "glGetString");
+    SVMS_FETCH(GetIntegerv, "glGetIntegerv");
+    SVMS_FETCH(GetError, "glGetError");
+    SVMS_FETCH(Flush, "glFlush");
+    SVMS_FETCH(CreateShader, "glCreateShader");
+    SVMS_FETCH(ShaderSource, "glShaderSource");
+    SVMS_FETCH(CompileShader, "glCompileShader");
+    SVMS_FETCH(GetShaderiv, "glGetShaderiv");
+    SVMS_FETCH(GetShaderInfoLog, "glGetShaderInfoLog");
+    SVMS_FETCH(CreateProgram, "glCreateProgram");
+    SVMS_FETCH(AttachShader, "glAttachShader");
+    SVMS_FETCH(LinkProgram, "glLinkProgram");
+    SVMS_FETCH(GetProgramiv, "glGetProgramiv");
+    SVMS_FETCH(GetProgramInfoLog, "glGetProgramInfoLog");
+    SVMS_FETCH(UseProgram, "glUseProgram");
+    SVMS_FETCH(DeleteShader, "glDeleteShader");
+    SVMS_FETCH(DeleteProgram, "glDeleteProgram");
+    SVMS_FETCH(GetUniformLocation, "glGetUniformLocation");
+    SVMS_FETCH(Uniform1ui, "glUniform1ui");
+    SVMS_FETCH(GenBuffers, "glGenBuffers");
+    SVMS_FETCH(DeleteBuffers, "glDeleteBuffers");
+    SVMS_FETCH(BindBuffer, "glBindBuffer");
+    SVMS_FETCH(BindBufferBase, "glBindBufferBase");
+    SVMS_FETCH(BufferData, "glBufferData");
+    SVMS_FETCH(BufferSubData, "glBufferSubData");
+    SVMS_FETCH(GetBufferSubData, "glGetBufferSubData");
+    SVMS_FETCH(DispatchCompute, "glDispatchCompute");
+    SVMS_FETCH(MemoryBarrier, "glMemoryBarrier");
+    SVMS_FETCH(FenceSync, "glFenceSync");
+    SVMS_FETCH(ClientWaitSync, "glClientWaitSync");
+    SVMS_FETCH(DeleteSync, "glDeleteSync");
+    SVMS_FETCH(GenQueries, "glGenQueries");
+    SVMS_FETCH(BeginQuery, "glBeginQuery");
+    SVMS_FETCH(EndQuery, "glEndQuery");
+    SVMS_FETCH(GetQueryObjectui64v, "glGetQueryObjectui64v");
+#undef SVMS_FETCH
+    if (!ok) {
+        error = "OpenGL 4.3 compute entry points are missing";
+        return false;
+    }
+    GLint major = 0, minor = 0;
+    gl_.GetIntegerv(GL_MAJOR_VERSION, &major);
+    gl_.GetIntegerv(GL_MINOR_VERSION, &minor);
+    const char* renderer = reinterpret_cast<const char*>(gl_.GetString(GL_RENDERER));
+    name_ = std::string("opengl ") + std::to_string(major) + "." +
+            std::to_string(minor) + ": " + (renderer ? renderer : "?");
+    if (major < 4 || (major == 4 && minor < 3)) {
+        error = "OpenGL 4.3 is required (driver reports " +
+                std::to_string(major) + "." + std::to_string(minor) + ")";
+        return false;
+    }
+    GLint sharedBytes = 0, invocations = 0;
+    gl_.GetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &sharedBytes);
+    gl_.GetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &invocations);
+    const GLint neededShared = static_cast<GLint>(group_ * tile_ * 2u * 4u + group_ * 4u);
+    if (sharedBytes < neededShared || invocations < static_cast<GLint>(group_)) {
+        error = "compute limits too small (shared " +
+                std::to_string(sharedBytes) + " B, invocations " +
+                std::to_string(invocations) + ")";
+        return false;
+    }
+    static const char* const kDefines[3] = {"VOICE_CS", "REDUCE_CS", "SCATTER_CS"};
+    for (int i = 0; i < 3; ++i) {
+        programs_[i] = BuildProgram(kDefines[i], error);
+        if (programs_[i] == 0u) return false;
+    }
+    static const char* const kUniforms[3][4] = {
+        {"uCount", "uFrames", nullptr, nullptr},
+        {"uFrames", "uGroups", nullptr, nullptr},
+        {"uCount", "uBase", nullptr, nullptr}};
+    for (int p = 0; p < 3; ++p)
+        for (int u = 0; u < 4; ++u)
+            loc_[p][u] = kUniforms[p][u]
+                ? gl_.GetUniformLocation(programs_[p], kUniforms[p][u]) : -1;
+    gl_.GenBuffers(kBufCount, buf_);
+    profile_ = std::getenv("SVMS_GPU_PROFILE") != nullptr;
+    if (profile_) gl_.GenQueries(2, queries_);
+    context_.Release();
+    return true;
+}
+
+GLuint GLBackend::BuildProgram(const char* define, std::string& error) {
+    const std::string header = std::string("#version 430\n#define ") + define + " 1\n";
+    const std::string sizes = "#define GROUP " + std::to_string(group_) + char(10) + "#define TILE " + std::to_string(tile_) + char(10);
+    const std::string full = header + sizes;
+    const GLchar* sources[2] = {full.c_str(), kVoiceStageGLSL};
+    GLuint shader = gl_.CreateShader(GL_COMPUTE_SHADER);
+    gl_.ShaderSource(shader, 2, sources, nullptr);
+    gl_.CompileShader(shader);
+    GLint status = 0;
+    gl_.GetShaderiv(shader, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        GLint length = 0;
+        gl_.GetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
+        std::vector<char> log(static_cast<size_t>(length > 1 ? length : 1));
+        gl_.GetShaderInfoLog(shader, length, nullptr, log.data());
+        error = std::string(define) + " failed to compile: " + log.data();
+        gl_.DeleteShader(shader);
+        return 0u;
+    }
+    GLuint program = gl_.CreateProgram();
+    gl_.AttachShader(program, shader);
+    gl_.LinkProgram(program);
+    gl_.DeleteShader(shader);
+    gl_.GetProgramiv(program, GL_LINK_STATUS, &status);
+    if (!status) {
+        GLint length = 0;
+        gl_.GetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
+        std::vector<char> log(static_cast<size_t>(length > 1 ? length : 1));
+        gl_.GetProgramInfoLog(program, length, nullptr, log.data());
+        error = std::string(define) + " failed to link: " + log.data();
+        gl_.DeleteProgram(program);
+        return 0u;
+    }
+    return program;
+}
+
+bool GLBackend::Bind() {
+    if (bound_) return true;
+    if (!context_.MakeCurrent()) return false;
+    bound_ = true;
+    return true;
+}
+
+void GLBackend::BindAll() {
+    if (!bindingsDirty_) return;
+    for (GLuint binding = 0u; binding < 7u; ++binding) {
+        // Binding point order matches the shader: store, rows, list, partial,
+        // mix, dyn, upload.
+        static const Buf kOrder[7] = {kStore, kRows, kList, kPartial, kMix,
+                                      kDyn, kUpload};
+        gl_.BindBufferBase(GL_SHADER_STORAGE_BUFFER, binding,
+                           buf_[kOrder[binding]]);
+    }
+    bindingsDirty_ = false;
+}
+
+bool GLBackend::ResizeBuffer(Buf which, size_t bytes) {
+    if (bytes == 0u) bytes = 16u;
+    GLint maxBlock = 0;
+    gl_.GetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &maxBlock);
+    if (maxBlock > 0 && bytes > static_cast<size_t>(maxBlock)) return false;
+    if (bufBytes_[which] == bytes) return true;
+    gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[which]);
+    gl_.BufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes),
+                   nullptr, GL_DYNAMIC_DRAW);
+    bufBytes_[which] = bytes;
+    return gl_.GetError() == GL_NO_ERROR;
+}
+
+bool GLBackend::UploadStore(const int16_t* data, uint32_t frames) {
+    if (!Bind()) return false;
+    // frames + 8 elements are readable (the sample-store padding contract);
+    // whole 32-bit words only.
+    const size_t words = (static_cast<size_t>(frames) + 8u) / 2u;
+    const size_t bytes = words * 4u;
+    // One spare word: the kernel reads the word after the last sample.
+    const size_t allocBytes = bytes + 16u;
+    GLint maxBlock = 0;
+    gl_.GetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &maxBlock);
+    if (maxBlock > 0 && bytes > static_cast<size_t>(maxBlock)) return false;
+    gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kStore]);
+    gl_.BufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(allocBytes),
+                   nullptr, GL_STATIC_DRAW);
+    gl_.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(bytes),
+                      data);
+    bufBytes_[kStore] = allocBytes;
+    bindingsDirty_ = true;
+    return gl_.GetError() == GL_NO_ERROR;
+}
+
+bool GLBackend::Reserve(uint32_t handleCapacity, uint32_t maxFrames) {
+    if (!Bind()) return false;
+    if (handleCapacity == handleCapacity_ && maxFrames == maxFrames_) return true;
+    const size_t cap = handleCapacity;
+    const size_t groups = (cap + group_ - 1u) / group_;
+    bool ok = ResizeBuffer(kRows, cap * kRowWords * 4u) &&
+              ResizeBuffer(kList, cap * sizeof(ListEntry)) &&
+              ResizeBuffer(kDyn, cap * sizeof(DynOut)) &&
+              ResizeBuffer(kPartial, groups * maxFrames * 2u * 4u) &&
+              ResizeBuffer(kMix, static_cast<size_t>(maxFrames) * 2u * 4u) &&
+              ResizeBuffer(kUpload, cap * sizeof(UploadRecord));
+    if (!ok) return false;
+    bindingsDirty_ = true;
+    handleCapacity_ = handleCapacity;
+    maxFrames_ = maxFrames;
+    uploadCursor_ = 0u;
+    return gl_.GetError() == GL_NO_ERROR;
+}
+
+bool GLBackend::UploadRows(const UploadRecord* records, uint32_t count) {
+    if (count == 0u) return true;
+    if (!Bind() || uploadCursor_ + count > handleCapacity_) return false;
+    BindAll();
+    gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kUpload]);
+    gl_.BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                      static_cast<GLintptr>(uploadCursor_) * sizeof(UploadRecord),
+                      static_cast<GLsizeiptr>(count) * sizeof(UploadRecord),
+                      records);
+    gl_.UseProgram(programs_[2]);
+    gl_.Uniform1ui(loc_[2][0], count);
+    gl_.Uniform1ui(loc_[2][1], uploadCursor_);
+    gl_.DispatchCompute((count + 63u) / 64u, 1u, 1u);
+    // Rows are read by the voice pass; later scatters touch other handles.
+    gl_.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    uploadCursor_ += count;
+    return true;
+}
+
+bool GLBackend::Submit(const ListEntry* list, uint32_t count, uint32_t frames) {
+    if (!Bind() || count > handleCapacity_ || frames == 0u || frames > maxFrames_)
+        return false;
+    if (fence_) { gl_.DeleteSync(fence_); fence_ = nullptr; }
+    BindAll();
+    const uint32_t groups = (count + group_ - 1u) / group_;
+    gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kList]);
+    gl_.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                      static_cast<GLsizeiptr>(count) * sizeof(ListEntry), list);
+    gl_.UseProgram(programs_[0]);
+    gl_.Uniform1ui(loc_[0][0], count);
+    gl_.Uniform1ui(loc_[0][1], frames);
+    if (profile_) gl_.BeginQuery(GL_TIME_ELAPSED, queries_[0]);
+    gl_.DispatchCompute(groups, 1u, 1u);
+    if (profile_) gl_.EndQuery(GL_TIME_ELAPSED);
+    gl_.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    gl_.UseProgram(programs_[1]);
+    gl_.Uniform1ui(loc_[1][0], frames);
+    gl_.Uniform1ui(loc_[1][1], groups);
+    if (profile_) gl_.BeginQuery(GL_TIME_ELAPSED, queries_[1]);
+    gl_.DispatchCompute((frames * 2u + 63u) / 64u, 1u, 1u);
+    if (profile_) gl_.EndQuery(GL_TIME_ELAPSED);
+    gl_.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    fence_ = gl_.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0u);
+    gl_.Flush();
+    uploadCursor_ = 0u;
+    pendingCount_ = count;
+    pendingFrames_ = frames;
+    return fence_ != nullptr && gl_.GetError() == GL_NO_ERROR;
+}
+
+Result GLBackend::Collect(uint64_t timeoutMicros, float* mixLR, DynOut* dyn) {
+    if (!fence_) return Result::Idle;
+    const GLuint64 nanos = timeoutMicros >= (GL_TIMEOUT_IGNORED / 1000ull)
+        ? GL_TIMEOUT_IGNORED : timeoutMicros * 1000ull;
+    const GLenum wait = gl_.ClientWaitSync(fence_, GL_SYNC_FLUSH_COMMANDS_BIT, nanos);
+    if (wait == GL_TIMEOUT_EXPIRED) {
+        // Late: drop the fence; the block's results are never read.
+        gl_.DeleteSync(fence_);
+        fence_ = nullptr;
+        return Result::Late;
+    }
+    if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED) {
+        gl_.DeleteSync(fence_);
+        fence_ = nullptr;
+        return Result::Lost;
+    }
+    gl_.DeleteSync(fence_);
+    fence_ = nullptr;
+    if (profile_) {
+        for (int q = 0; q < 2; ++q) {
+            GLuint64 ns = 0;
+            gl_.GetQueryObjectui64v(queries_[q], GL_QUERY_RESULT, &ns);
+            profileNs_[q] += ns;
+        }
+    }
+    gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kMix]);
+    gl_.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                         static_cast<GLsizeiptr>(pendingFrames_) * 8, mixLR);
+    gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kDyn]);
+    gl_.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                         static_cast<GLsizeiptr>(pendingCount_) * sizeof(DynOut),
+                         dyn);
+    return gl_.GetError() == GL_NO_ERROR ? Result::Ok : Result::Lost;
+}
+
+void GLBackend::Shutdown() {
+    if (!created_) return;
+    if (context_.MakeCurrent()) {
+        if (fence_) gl_.DeleteSync(fence_);
+        for (GLuint program : programs_)
+            if (program) gl_.DeleteProgram(program);
+        gl_.DeleteBuffers(kBufCount, buf_);
+    }
+    context_.Destroy();
+    created_ = false;
+}
+
+}  // namespace
+
+std::unique_ptr<Backend> CreateOpenGLBackend() {
+    return std::unique_ptr<Backend>(new GLBackend());
+}
+
+}  // namespace gpu
+}  // namespace svms

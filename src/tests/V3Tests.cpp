@@ -102,6 +102,7 @@ bool NearlyEqual(float a, float b, float epsilon = 1.0e-5f) {
 #include "tests/cases/SoundFontStack.inl"
 #include "tests/cases/RenderDifferentials.inl"
 #include "tests/cases/WholeVoice.inl"
+#include "tests/cases/GpuStage.inl"
 
 } // namespace
 
@@ -112,6 +113,11 @@ int main() {
     // same tolerances (SVMS_TEST_LAUNCH_STAGING=1).
     const bool launchStaging = std::getenv("SVMS_TEST_LAUNCH_STAGING") != nullptr;
     svms::g_launchStagingEnabled.store(launchStaging);
+    if (std::getenv("SVMS_TEST_GPU_ONLY") != nullptr) {
+        TestGpuStageDifferential();
+        std::puts(g_failures == 0 ? "GPU stage tests passed" : "GPU stage tests FAILED");
+        return g_failures == 0 ? 0 : 1;
+    }
     TestMidiByteStream();
     TestReExciteKey();
     TestReExciteRenderDifferential(128u, 0);
@@ -149,6 +155,7 @@ int main() {
     TestHilbertPairLoopAware();
     TestPerChannelLimiterDifferential();
     TestWholeVoiceProductionGateParity();
+    TestGpuStageDifferential();
     TestPerKeyVoiceCap();
     TestStealReject();
     TestFastProducerRing();

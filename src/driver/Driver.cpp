@@ -651,6 +651,25 @@ bool Driver::Initialize() {
             "maxVoices=%u", cfg.maxVoices);
         return false;
     }
+#if defined(SVMS_GPU_STAGE)
+    if (cfg.gpuApi != 0u && !shard) {
+        // Opt-in GPU stage: a failure here is not an error, the CPU renders
+        // everything exactly as it does without the stage.
+        std::string gpuError;
+        gpuStage = GpuStage::Create(static_cast<gpu::Api>(cfg.gpuApi),
+                                    cfg.gpuDeviceIndex, gpuError);
+        if (gpuStage) {
+            gpuStage->SetSampleRate(sampleRate);
+            gpuStage->SetDeadlinePercent(85u);
+            gpuStage->SetMaxFramesHint(bufferCapacity);
+            renderScalar->SetGpuStage(gpuStage.get());
+            LOG("GPU render stage: %s", gpuStage->Name());
+        } else {
+            LOG("GPU render stage unavailable (%s); rendering on the CPU",
+                gpuError.c_str());
+        }
+    }
+#endif
 
     configSnapshot = new RuntimeConfigSnapshot();
     std::memset(configSnapshot, 0, sizeof(RuntimeConfigSnapshot));
@@ -836,6 +855,10 @@ void Driver::Shutdown() {
                 (unsigned long long)renderScalar->GetWholeVoiceBlocksForTest());
         }
     }
+#if defined(SVMS_GPU_STAGE)
+    if (renderScalar) renderScalar->SetGpuStage(nullptr);
+    gpuStage.reset();
+#endif
     delete renderScalar; renderScalar = nullptr;
     ConfigureRuntimeVoiceGrowthCeiling(kRuntimeVoiceGrowthCeiling);
     delete configSnapshot; configSnapshot = nullptr;

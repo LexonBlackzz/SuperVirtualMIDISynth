@@ -204,7 +204,9 @@ if(NOT WIN32)
         render/RenderWorkersPosix.cpp
         render/RenderDispatch.cpp
         render/RenderKernelsSSE2.cpp
-        render/RenderKernelsAVX2.cpp)
+        render/RenderKernelsAVX2.cpp
+        render/GpuStage.cpp
+        render/GpuBackendGL.cpp)
 
     set_source_files_properties(render/RenderKernelsSSE2.cpp PROPERTIES
         COMPILE_OPTIONS "-msse2;-mno-avx")
@@ -461,7 +463,8 @@ set(SOURCES
 
 if(NOT SVMS_XP_COMPAT)
     list(APPEND SOURCES render/RenderKernelsAVX2.cpp synth/LiveRecorder.cpp
-         render/GpuSynth.cpp render/GpuDevice.cpp)
+         render/GpuSynth.cpp render/GpuDevice.cpp
+         render/GpuStage.cpp render/GpuBackendGL.cpp)
 endif()
 
 # Steinberg ASIO SDK host-side glue (GPLv3 — see asio-main/). Compiled into
@@ -1326,7 +1329,8 @@ if(SVMS_BUILD_TESTS)
         render/RenderKernelsSSE2.cpp
     )
     if(NOT SVMS_XP_COMPAT)
-        target_sources(svms_v3_tests PRIVATE render/RenderKernelsAVX2.cpp)
+        target_sources(svms_v3_tests PRIVATE render/RenderKernelsAVX2.cpp
+            render/GpuStage.cpp render/GpuBackendGL.cpp)
     endif()
     target_compile_definitions(svms_v3_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS SVMS_ENABLE_REFERENCE_RENDERER=1)
@@ -1537,7 +1541,8 @@ if(SVMS_BUILD_TESTS)
         add_dependencies(svms_v3_remote_client_smoke svmsynth)
 
         add_executable(svms_v3_bench tests/V3Bench.cpp synth/SoundFont.cpp synth/SfzLoader.cpp render/RenderKernels.cpp render/RenderWorkers.cpp
-            render/RenderDispatch.cpp render/RenderKernelsSSE2.cpp render/RenderKernelsAVX2.cpp)
+            render/RenderDispatch.cpp render/RenderKernelsSSE2.cpp render/RenderKernelsAVX2.cpp
+            render/GpuStage.cpp render/GpuBackendGL.cpp)
         target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
             SVMS_ENABLE_REFERENCE_RENDERER=1)
         target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

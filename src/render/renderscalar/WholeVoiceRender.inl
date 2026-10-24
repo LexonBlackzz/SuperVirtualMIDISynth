@@ -961,9 +961,23 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         }
     }
     const uint32_t ghostCount = wvGhostCount_;
-    const uint32_t itemCount = activeCount + ghostCount;
+    // GPU stage: eligible sustained rows move to the tail of wvSliceHandles_
+    // and render on the GPU while the pool renders the rest.
+    uint32_t gpuCount = 0u;
+    bool gpuSubmitted = false;
+#if defined(SVMS_GPU_STAGE)
+    if (gpuStage_ != nullptr) {
+        gpuCount = TryGpuSubmit(voices, sampleData, sampleDataFrames,
+                                outputLeft, outputRight, numFrames,
+                                activeCount, channelBusLeft, gpuSubmitted);
+    }
+#else
+    (void)gpuSubmitted;
+#endif
+    const uint32_t cpuVoiceCount = activeCount - gpuCount;
+    const uint32_t itemCount = cpuVoiceCount + ghostCount;
     WholeVoiceJobContext ctx{this, &voices, sampleData, sampleDataFrames,
-                             numFrames, activeCount, ghostCount, 1u};
+                             numFrames, cpuVoiceCount, ghostCount, 1u};
     // Retire-stage input must be zeroed for THIS block: empty blocks
     // (itemCount == 0) dispatch no thunk, so every count slot they will read
     // has to start at zero (thunks re-zero their own slot when they run).
@@ -1015,6 +1029,13 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         wvJobCycles_ += __rdtsc() - wvJobBegin;
 #endif
     }
+#if defined(SVMS_GPU_STAGE)
+    if (gpuCount != 0u) {
+        FinishGpuRows(voices, sampleData, sampleDataFrames, outputLeft,
+                      outputRight, numFrames, gpuCount, cpuVoiceCount,
+                      gpuSubmitted);
+    }
+#endif
 
     // Every active row went through a job item, so no launch record is left
     // to apply.  Test builds verify that (and repair a leak so a bug shows as

@@ -170,6 +170,8 @@ ConfigValues ConfigDocument::Defaults() {
     d.perKeyVoiceCap = 0u;
     d.stealReject = false;
     d.threadAffinityMode = 0u;
+    d.gpuApi = 0u;
+    d.gpuDevice = 0u;
     d.ccCollapse = false;
     d.bendCollapse = false;
     d.minNoteMs = 0u;
@@ -237,6 +239,8 @@ void ConfigDocument::FromJson(const json& root) {
         if (working_.tuningEdo != 31u) working_.tuningEdo = 12u;
         ReadNum(*it, "thread_affinity_mode", working_.threadAffinityMode,
                 0u, 2u);
+        ReadNum(*it, "gpu_api", working_.gpuApi, 0u, 4u);
+        ReadNum(*it, "gpu_device", working_.gpuDevice, 0u, 15u);
         if (auto bt = it->find("block_timing"); bt != it->end()) {
             if (bt->is_boolean())
                 working_.blockTiming = bt->get<bool>();
@@ -495,6 +499,8 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["drop_zero_life_victims"] = working_.dropZeroLifeVictims;
     root["voices"]["launch_staging"] = working_.launchStaging;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
+    root["synth"]["gpu_api"] = working_.gpuApi;
+    root["synth"]["gpu_device"] = working_.gpuDevice;
     root["events"]["cc_collapse"] = working_.ccCollapse;
     root["events"]["bend_collapse"] = working_.bendCollapse;
     root["events"]["min_note_ms"] = working_.minNoteMs;
@@ -713,6 +719,8 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.dropZeroLifeVictims == b.dropZeroLifeVictims
         && a.launchStaging == b.launchStaging
         && a.threadAffinityMode == b.threadAffinityMode
+        && a.gpuApi == b.gpuApi
+        && a.gpuDevice == b.gpuDevice
         && a.ccCollapse == b.ccCollapse
         && a.bendCollapse == b.bendCollapse
         && a.minNoteMs == b.minNoteMs

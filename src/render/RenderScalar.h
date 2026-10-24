@@ -14,6 +14,11 @@
 #include "render/RenderKernels.h"
 #include "render/VoiceFilter.h"
 #include "render/RenderWorkers.h"
+// GPU render stage (default off; compiled out of the XP build).
+#if !defined(SVMS_XP_COMPAT) && !defined(SVMS_NO_GPU_STAGE)
+#define SVMS_GPU_STAGE 1
+#include "render/GpuStage.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -654,6 +659,25 @@ private:
                                    const IndexedJobMix& mix,
                                    uint32_t frameCount, void* userData);
 
+#if defined(SVMS_GPU_STAGE)
+    struct GpuPassContext;
+    GpuStage* gpuStage_ = nullptr;
+    uint32_t gpuVoiceEpoch_ = 0u;   // VoiceManager::StaticEpoch last seen
+    bool GpuRowEligible(const VoiceSoA& v, uint32_t handle, bool stagedPending,
+                        uint32_t storeFrames) const;
+    static void GpuPassThunk(uint32_t job, const IndexedJobMix& mix,
+                             uint32_t frameCount, void* userData);
+    void RunGpuPass(GpuPassContext& ctx, float* outputLeft, float* outputRight);
+    uint32_t TryGpuSubmit(VoiceManager& voices, const int16_t* sampleData,
+                          uint32_t sampleDataFrames, float* outputLeft,
+                          float* outputRight, uint32_t numFrames,
+                          uint32_t activeCount, float* const* channelBusLeft,
+                          bool& submitted);
+    void FinishGpuRows(VoiceManager& voices, const int16_t* sampleData,
+                       uint32_t sampleDataFrames, float* outputLeft,
+                       float* outputRight, uint32_t numFrames,
+                       uint32_t gpuCount, uint32_t cpuCount, bool submitted);
+#endif
     VoiceSoA wvGhostState_;                  // displaced-voice snapshots
     WholeVoiceGhostTail* wvGhostTails_ = nullptr;
     VoiceSoA* wvTailScratch_ = nullptr;      // per-job single-row tail stage
@@ -810,6 +834,12 @@ public:
     // whole-voice block. Beyond the cap, displaced/killed voices die without
     // their pre-steal render pass (same path as capacity overflow).
     void SetGhostBudget(uint32_t budget) { ghostBudget_ = budget; }
+#if defined(SVMS_GPU_STAGE)
+    // Attach the realtime GPU stage (null = CPU only, today's code exactly).
+    // The stage is owned by the caller and must outlive the renderer's use.
+    void SetGpuStage(GpuStage* stage) { gpuStage_ = stage; }
+    GpuStage* GetGpuStage() const { return gpuStage_; }
+#endif
     void SetEventDispatcher(EventDispatcher dispatcher, void* userData);
     void SetEventBatchDispatcher(EventBatchDispatcher dispatcher, void* userData);
     uint32_t GetWholeVoiceBlocksForTest() const { return wholeVoiceBlocks_; }
@@ -985,6 +1015,7 @@ private:
 #include "render/renderscalar/WholeVoicePlan.inl"
 #include "render/renderscalar/WholeVoiceRender.inl"
 #include "render/renderscalar/WholeVoiceStorage.inl"
+#include "render/renderscalar/GpuStageRender.inl"
 
 } // namespace svms
 

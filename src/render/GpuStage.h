@@ -1,0 +1,221 @@
+#ifndef SVMS_GPU_STAGE_H
+#define SVMS_GPU_STAGE_H
+
+// Realtime GPU render stage: the API-neutral half.  Owns one Backend plus the
+// per-block scratch (voice list, residency stamps, upload staging) that the
+// whole-voice renderer fills in parallel.  RenderScalar partitions the rows
+// and falls back to the CPU; this class never reads a voice row itself.
+// Default OFF: with no stage attached the renderer is unchanged.
+
+#include "render/GpuBackend.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace svms {
+
+struct GpuStageStats {
+    uint64_t blocks = 0u;        // blocks that submitted GPU work
+    uint64_t rows = 0u;          // rows rendered on the GPU
+    uint64_t uploads = 0u;       // static row records uploaded
+    uint64_t late = 0u;          // blocks that missed the deadline (CPU fallback)
+    uint64_t failed = 0u;        // blocks whose submit failed
+    uint64_t submitMicros = 0u;
+    uint64_t waitMicros = 0u;
+    uint64_t readbackMicros = 0u;
+    uint64_t classifyMicros = 0u;   // pass 1: eligibility flags
+    uint64_t packMicros = 0u;       // pass 2: list + row packing
+    uint64_t uploadMicros = 0u;     // static rows to the GPU
+    uint64_t scatterMicros = 0u;    // read-back state into the SoA
+    bool lost = false;           // device gone; the stage is disabled
+};
+
+class GpuStage {
+public:
+    static constexpr uint32_t kMaxJobs = 64u;
+
+    static std::unique_ptr<GpuStage> Create(gpu::Api api, uint32_t deviceIndex,
+                                            std::string& error);
+
+    const char* Name() const { return backend_ ? backend_->Name() : ""; }
+    bool Enabled() const { return enabled_ && !stats_.lost; }
+    const GpuStageStats& Stats() const { return stats_; }
+    void ProfileNs(uint64_t& voice, uint64_t& reduce) const {
+        backend_->ProfileNs(voice, reduce);
+    }
+
+    // Tunables.  minimumVoices: below it the round trip costs more than AVX2.
+    void SetMinimumVoices(uint32_t voices) { minimumVoices_ = voices; }
+    uint32_t MinimumVoices() const { return minimumVoices_; }
+    void SetSampleRate(uint32_t rate) { sampleRate_ = rate ? rate : 44100u; }
+    // Fraction of a block period the GPU may take before the CPU falls back.
+    // 0 = wait forever (tests, offline).
+    void SetDeadlinePercent(uint32_t percent) { deadlinePercent_ = percent; }
+    // Test hook: report the next `blocks` blocks as late.
+    void ForceLateForTest(uint32_t blocks) { forceLate_ = blocks; }
+    void SetMaxFramesHint(uint32_t frames) { maxFramesHint_ = frames; }
+
+    // Anything that rewrites a resident row's static fields outside the
+    // whole-voice plan (sample-store swap, pool rebuild, pitch refresh, ...)
+    // calls this; the next block re-uploads every row.  Callable from any
+    // thread.
+    void BumpEpoch() { epoch_.fetch_add(1u, std::memory_order_relaxed); }
+    // One row's static fields changed under its play index (audio thread,
+    // between Prepare calls): re-upload it next time it is eligible.
+    void ForgetRow(uint32_t handle) {
+        if (handle < resident_.size()) resident_[handle] = UINT32_MAX;
+    }
+
+    // Called by the renderer at the start of every candidate block.  Uploads
+    // the sample store when it changed, sizes the buffers, clears residency on
+    // an epoch change.  False = the stage cannot serve this block.
+    bool Prepare(const int16_t* store, uint32_t storeFrames,
+                 uint32_t handleCapacity, uint32_t maxFrames) {
+        if (!Enabled() || store == nullptr || storeFrames == 0u ||
+            handleCapacity == 0u || maxFrames == 0u) {
+            return false;
+        }
+        bool clearResidency = false;
+        if (handleCapacity != handleCapacity_ || maxFrames > maxFrames_) {
+            const uint32_t frames =
+                (std::max)((std::max)(maxFrames, maxFrames_), maxFramesHint_);
+            try {
+                resident_.assign(handleCapacity, UINT32_MAX);
+                flags_.assign(handleCapacity, 0u);
+                list_.assign(handleCapacity, gpu::ListEntry{});
+                upload_.assign(handleCapacity, gpu::UploadRecord{});
+                dyn_.assign(handleCapacity, gpu::DynOut{});
+                mix_.assign(static_cast<size_t>(frames) * 2u, 0.0f);
+            } catch (...) {
+                enabled_ = false;
+                return false;
+            }
+            if (!backend_->Reserve(handleCapacity, frames)) {
+                enabled_ = false;
+                return false;
+            }
+            handleCapacity_ = handleCapacity;
+            maxFrames_ = frames;
+            clearResidency = true;
+        }
+        if (store != storePtr_ || storeFrames != storeFrames_) {
+            if (!backend_->UploadStore(store, storeFrames)) {
+                enabled_ = false;
+                return false;
+            }
+            storePtr_ = store;
+            storeFrames_ = storeFrames;
+            clearResidency = true;
+        }
+        const uint32_t epoch = epoch_.load(std::memory_order_relaxed);
+        if (epoch != epochSeen_) {
+            epochSeen_ = epoch;
+            clearResidency = true;
+        }
+        if (clearResidency)
+            std::fill(resident_.begin(), resident_.end(), UINT32_MAX);
+        return true;
+    }
+
+    // Per-block scratch (valid after a successful Prepare).
+    uint32_t* Resident() { return resident_.data(); }
+    uint8_t* Flags() { return flags_.data(); }
+    gpu::ListEntry* List() { return list_.data(); }
+    gpu::UploadRecord* UploadScratch() { return upload_.data(); }
+    uint32_t* JobGpuCount() { return jobGpu_; }
+    uint32_t* JobUploadCount() { return jobUpload_; }
+    const gpu::DynOut* Dyn() const { return dyn_.data(); }
+    const float* Mix() const { return mix_.data(); }
+
+    bool UploadRows(const gpu::UploadRecord* records, uint32_t count) {
+        return backend_->UploadRows(records, count);
+    }
+    // Starts the block.  `uploads` is the number of static records already
+    // sent for it (counters only).
+    bool Submit(uint32_t listCount, uint32_t frames, uint32_t uploads) {
+        submitStart_ = NowMicros();
+        if (!backend_->Submit(list_.data(), listCount, frames)) {
+            ++stats_.failed;
+            return false;
+        }
+        ++stats_.blocks;
+        stats_.rows += listCount;
+        stats_.uploads += uploads;
+        stats_.submitMicros += NowMicros() - submitStart_;
+        return true;
+    }
+    // Waits for the block (deadline from the block period).  Ok = Mix()/Dyn()
+    // are valid for the submitted block.
+    gpu::Result Collect(uint32_t frames) {
+        uint64_t timeout = ~0ull;
+        if (deadlinePercent_ != 0u) {
+            const uint64_t budget = static_cast<uint64_t>(frames) * 1000000ull *
+                                    deadlinePercent_ / (100ull * sampleRate_);
+            const uint64_t spent = NowMicros() - submitStart_;
+            timeout = budget > spent ? budget - spent : 0u;
+        }
+        if (forceLate_ != 0u) {
+            // Drain the block so the buffers stay consistent, then report it late.
+            --forceLate_;
+            backend_->Collect(~0ull, mix_.data(), dyn_.data());
+            ++stats_.late;
+            return gpu::Result::Late;
+        }
+        const uint64_t waitStart = NowMicros();
+        const gpu::Result result =
+            backend_->Collect(timeout, mix_.data(), dyn_.data());
+        const uint64_t waited = NowMicros() - waitStart;
+        if (result == gpu::Result::Ok) {
+            stats_.waitMicros += waited;
+        } else if (result == gpu::Result::Late) {
+            ++stats_.late;
+            stats_.waitMicros += waited;
+        } else if (result == gpu::Result::Lost) {
+            stats_.lost = true;
+        }
+        return result;
+    }
+
+private:
+public:
+    static uint64_t NowMicros() {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    std::unique_ptr<gpu::Backend> backend_;
+    bool enabled_ = true;
+    uint32_t minimumVoices_ = 4096u;
+    uint32_t sampleRate_ = 44100u;
+    uint32_t deadlinePercent_ = 0u;
+    uint32_t forceLate_ = 0u;
+    uint32_t maxFramesHint_ = 0u;
+    std::atomic<uint32_t> epoch_{1u};
+    uint32_t epochSeen_ = 0u;
+    const int16_t* storePtr_ = nullptr;
+    uint32_t storeFrames_ = 0u;
+    uint32_t handleCapacity_ = 0u;
+    uint32_t maxFrames_ = 0u;
+    std::vector<uint32_t> resident_;
+    std::vector<uint8_t> flags_;
+    std::vector<gpu::ListEntry> list_;
+    std::vector<gpu::UploadRecord> upload_;
+    std::vector<float> mix_;
+    std::vector<gpu::DynOut> dyn_;
+    uint32_t jobGpu_[kMaxJobs] = {};
+    uint32_t jobUpload_[kMaxJobs] = {};
+public:
+    GpuStageStats& MutableStats() { return stats_; }
+private:
+    GpuStageStats stats_;
+    uint64_t submitStart_ = 0u;
+};
+
+} // namespace svms
+
+#endif

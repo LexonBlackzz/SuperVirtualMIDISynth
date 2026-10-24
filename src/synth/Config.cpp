@@ -350,6 +350,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"render_threads", cfg.renderThreads},
             {"shards", cfg.shards},
             {"thread_affinity_mode", cfg.threadAffinityMode},
+            {"gpu_api", cfg.gpuApi},
+            {"gpu_device", cfg.gpuDeviceIndex},
             {"block_timing", cfg.blockTimingMode},
             {"tuning_edo", cfg.tuningEdo},
             {"unbounded_render", cfg.unboundedRender},
@@ -631,6 +633,10 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "thread_affinity_mode", cfg.threadAffinityMode,
                        0u, 2u))
             AppendWarning(cfg.configWarning, "synth.thread_affinity_mode");
+        if (!ReadValue(*it, "gpu_api", cfg.gpuApi, 0u, 4u))
+            AppendWarning(cfg.configWarning, "synth.gpu_api");
+        if (!ReadValue(*it, "gpu_device", cfg.gpuDeviceIndex, 0u, 15u))
+            AppendWarning(cfg.configWarning, "synth.gpu_device");
         if (auto bt = it->find("block_timing"); bt != it->end()) {
             if (bt->is_boolean())
                 cfg.blockTimingMode = bt->get<bool>();
@@ -1063,8 +1069,8 @@ EngineConfig EngineConfig::Default() {
     cfg.enableChorus = false;
     cfg.enableFilter = false;
     cfg.enableModulators = false;
+    cfg.gpuApi = 0;             // opt-in: the GPU render stage is off
     cfg.gpuDeviceIndex = 0;
-    cfg.enableGPU = false;
     cfg.eventRingCapacity = kDefaultEventRingCapacity;
     // Velocity shedding is opt-in: the default never culls note-ons.
     cfg.eventOverflowMode = EventOverflowMode::LosslessBackpressure;
@@ -1242,6 +1248,7 @@ bool EngineConfig::Validate() const {
             stealPolicy <= 2u &&
             perKeyVoiceCap <= 256u &&
             threadAffinityMode <= 2u &&
+            gpuApi <= 4u &&
             ghostBudget <= 65536u &&
             apiBackend <= 4u &&
             apiWinMmDevice <= 255u &&

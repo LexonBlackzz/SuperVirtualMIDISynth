@@ -479,6 +479,11 @@ public:
     // see SetRowOpHooks).  bendSemitones is the sysex-aware total; the
     // per-voice ratio applies pitchBendScales for scaled regions.
     void ApplyChannelBendRatio(uint8_t channel, float bendSemitones);
+    // Bumped whenever existing rows' render statics (phase increment, render
+    // gain) are rewritten outside the whole-voice plan's per-row op log.  A
+    // renderer that keeps a copy of those fields elsewhere (the GPU stage)
+    // refreshes it when this changes.
+    uint32_t StaticEpoch() const { return staticEpoch_; }
     // Full fold at vintage-exact boundaries (block top, exact-frame dispatch
     // boundaries): mixGain, stealOutputGain, renderGain, steal candidates.
     void FoldStaleChannelMixGains();
@@ -1238,6 +1243,7 @@ private:
                            float mixScaleRight, bool& stableTreeDirty,
                            bool writeRenderGain);
     void FoldMask(uint64_t mask, bool writeRenderGain);
+    uint32_t staticEpoch_ = 0u;
     float ComputeTailLevel(uint32_t tailSlot) const;
     uint32_t SelectStealTailSlot(float outgoingLevel,
                                  bool& replacingHeapRoot);

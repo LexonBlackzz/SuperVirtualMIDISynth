@@ -66,6 +66,7 @@ const SettingDef kSettings[] = {
     {"unbounded", "Never skip ahead (unbounded render)", P, "Performance \xE2\x80\xBA Shortcuts", "unbounded recovery slow down", nullptr, nullptr, false, D(&V::unboundedRender)},
     {"threads", "Render threads", P, "Performance \xE2\x80\xBA CPU", "threads cores cpu workers", nullptr, nullptr, true, D(&V::renderThreads)},
     {"shards", "Engine shards", P, "Performance \xE2\x80\xBA CPU", "shards split engine", nullptr, nullptr, true, D(&V::shards)},
+    {"gpuStage", "GPU rendering (experimental)", P, "Performance \xE2\x80\xBA GPU", "gpu opengl vulkan d3d11 compute offload black midi voices", nullptr, nullptr, true, D(&V::gpuApi, &V::gpuDevice)},
     {"affinity", "Core placement (thread affinity)", P, "Performance \xE2\x80\xBA CPU", "hybrid thread affinity p-cores e-cores intel", nullptr, nullptr, false, D(&V::threadAffinityMode)},
     {"largePages", "Large memory pages", P, "Performance \xE2\x80\xBA CPU", "large pages tlb memory", nullptr, nullptr, true, D(&V::largePages)},
     {"dropZeroLife", "Drop instant-steal blips (experimental)", P, "Performance \xE2\x80\xBA CPU", "drop zero life instant steal lazy launch black midi experimental", nullptr, nullptr, true, D(&V::dropZeroLifeVictims)},

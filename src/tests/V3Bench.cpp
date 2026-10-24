@@ -148,6 +148,10 @@ struct Options {
     uint32_t pinCore = UINT32_MAX;
     bool automaticBackend = true;
     svms::RenderBackend backend = svms::RenderBackend::Scalar;
+    // --gpu-api off|auto|opengl: attach the realtime GPU render stage.
+    svms::gpu::Api gpuApi = svms::gpu::Api::Off;
+    uint32_t gpuMinVoices = 4096u;
+    uint32_t gpuDeadlinePercent = 0u;   // 0 = wait for the GPU
 };
 
 bool ParseBackend(const char* value, Options& options) {
@@ -237,6 +241,17 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         } else if (std::strcmp(argv[i], "--pin-core") == 0) {
             if (!nextNumber(options.pinCore) || options.pinCore >= 64u)
                 return false;
+        } else if (std::strcmp(argv[i], "--gpu-api") == 0) {
+            if (i + 1 >= argc) return false;
+            const char* api = argv[++i];
+            if (std::strcmp(api, "off") == 0) options.gpuApi = svms::gpu::Api::Off;
+            else if (std::strcmp(api, "auto") == 0) options.gpuApi = svms::gpu::Api::Auto;
+            else if (std::strcmp(api, "opengl") == 0) options.gpuApi = svms::gpu::Api::OpenGL;
+            else return false;
+        } else if (std::strcmp(argv[i], "--gpu-min") == 0) {
+            if (!nextNumber(options.gpuMinVoices)) return false;
+        } else if (std::strcmp(argv[i], "--gpu-deadline") == 0) {
+            if (!nextNumber(options.gpuDeadlinePercent)) return false;
         } else if (std::strcmp(argv[i], "--backend") == 0) {
             if (i + 1 >= argc || !ParseBackend(argv[++i], options)) return false;
         } else if (std::strcmp(argv[i], "--enforce") == 0) {
@@ -814,6 +829,12 @@ int main(int argc, char** argv) {
         return 3;
     }
     voices->SetStealReject(options.stealReject);
+    if (options.gpuApi != svms::gpu::Api::Off) {
+        // The GPU stage keys row residency on the play index; the bench's
+        // hand-configured rows carry none.
+        for (uint32_t a = 0; a < voices->activeCount_; ++a)
+            voices->v.playIndex[voices->activeList_[a]] = a + 1u;
+    }
     if (options.genericVoices != 0u) {
         std::fprintf(stderr, "[diag] after configure: active=%u generic=%u rloop=%u\n",
                      voices->GetActiveCount(),
@@ -861,6 +882,20 @@ int main(int argc, char** argv) {
     if (!options.automaticBackend && !renderer->SetRenderBackend(options.backend)) {
         std::fprintf(stderr, "requested render backend is not supported by this CPU/build\n");
         return 3;
+    }
+
+    std::unique_ptr<svms::GpuStage> gpuStage;
+    if (options.gpuApi != svms::gpu::Api::Off) {
+        std::string gpuError;
+        gpuStage = svms::GpuStage::Create(options.gpuApi, 0u, gpuError);
+        if (!gpuStage) {
+            std::fprintf(stderr, "GPU stage unavailable: %s\n", gpuError.c_str());
+            return 5;
+        }
+        gpuStage->SetMinimumVoices(options.gpuMinVoices);
+        gpuStage->SetDeadlinePercent(options.gpuDeadlinePercent);
+        gpuStage->SetMaxFramesHint(options.frames);
+        renderer->SetGpuStage(gpuStage.get());
     }
 
     std::vector<svms::RenderEvent> events;
@@ -1614,6 +1649,31 @@ int main(int argc, char** argv) {
         (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseReservation),
         (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseScalarVibrato),
         (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseForced));
+    if (gpuStage) {
+        uint64_t voiceNs = 0u, reduceNs = 0u;
+        gpuStage->ProfileNs(voiceNs, reduceNs);
+        if (voiceNs != 0u) {
+            const double blocks = static_cast<double>(gpuStage->Stats().blocks);
+            std::fprintf(stderr,
+                "{\"gpu_profile\":{\"voice_ms_per_block\":%.3f,\"reduce_ms_per_block\":%.3f}}\n",
+                voiceNs / blocks / 1.0e6, reduceNs / blocks / 1.0e6);
+        }
+        const svms::GpuStageStats& g = gpuStage->Stats();
+        std::fprintf(stderr,
+            "{\"gpu\":{\"backend\":\"%s\",\"blocks\":%llu,\"rows\":%llu,"
+            "\"uploads\":%llu,\"late\":%llu,\"failed\":%llu,\"lost\":%d,"
+            "\"submit_us\":%llu,\"wait_us\":%llu,\"classify_us\":%llu,"
+            "\"pack_us\":%llu,\"upload_us\":%llu,\"scatter_us\":%llu}}\n",
+            gpuStage->Name(), (unsigned long long)g.blocks,
+            (unsigned long long)g.rows, (unsigned long long)g.uploads,
+            (unsigned long long)g.late, (unsigned long long)g.failed,
+            g.lost ? 1 : 0, (unsigned long long)g.submitMicros,
+            (unsigned long long)g.waitMicros,
+            (unsigned long long)g.classifyMicros,
+            (unsigned long long)g.packMicros,
+            (unsigned long long)g.uploadMicros,
+            (unsigned long long)g.scatterMicros);
+    }
     std::fprintf(stderr, "{\"steal_reject\":{\"enabled\":%d,\"rejected\":%llu}}\n",
                  options.stealReject ? 1 : 0,
                  (unsigned long long)voices->StealRejectCount());

@@ -530,6 +530,18 @@ void CpuCard(ConfigDocument& doc) {
         ui::EndRow();
     }
     {
+        static const char* labels[5] = {"Off", "Auto", "OpenGL", "Vulkan", "D3D11"};
+        int idx = static_cast<int>((std::min)(4u, w.gpuApi));
+        ui::BeginRow("gpuStage", "GPU rendering (experimental)",
+                     "Renders steady sustained voices on the graphics card so a CPU can reach far higher voice counts. Falls back to the CPU on any problem. Needs OpenGL 4.3 (Vulkan and D3D11 are not built yet). Needs a restart.",
+                     ui::SegmentedSize(labels, 5));
+        if (ui::Segmented("##gpustage", &idx, labels, 5)) {
+            w.gpuApi = static_cast<uint32_t>(idx);
+            doc.MarkDirty();
+        }
+        ui::EndRow();
+    }
+    {
         ui::BeginRow("launchStaging", "Staged note launches (experimental)",
                      "Writes a stolen voice's replacement into one compact record and lets the render threads finish the copy, so the single planning thread does less work on extreme black MIDIs. The sound is bit-identical. Needs a restart.",
                      ImVec2(46.0f * s, 28.0f * s));
