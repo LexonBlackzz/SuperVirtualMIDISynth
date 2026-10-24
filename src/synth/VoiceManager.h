@@ -39,6 +39,11 @@ namespace svms {
 // voices.launch_staging, read when a VoiceManager initializes (restart-applied
 // like synth.large_pages).  Off = the production SoA launch path, unchanged.
 inline std::atomic<bool> g_launchStagingEnabled{false};
+// The live DLL has no config key yet: env SVMS_LAUNCH_STAGING switches it on.
+inline bool LaunchStagingRequested() noexcept {
+    static const bool env = std::getenv("SVMS_LAUNCH_STAGING") != nullptr;
+    return env || g_launchStagingEnabled.load(std::memory_order_relaxed);
+}
 // Experimental (voices.drop_zero_life_victims, env SVMS_DROP_ZERO_LIFE for
 // now): a voice stolen on the very frame it was launched has played zero
 // samples; skip its ghost, which only contributes the 64-frame steal-fade
