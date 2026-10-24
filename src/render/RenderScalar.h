@@ -663,8 +663,10 @@ private:
     struct GpuPassContext;
     GpuStage* gpuStage_ = nullptr;
     uint32_t gpuVoiceEpoch_ = 0u;   // VoiceManager::StaticEpoch last seen
-    bool GpuRowEligible(const VoiceSoA& v, uint32_t handle, bool stagedPending,
-                        uint32_t storeFrames) const;
+    uint32_t gpuSustainedRows_ = 0u;   // this block: rows on the sustained kernel
+    uint32_t gpuEnvRows_ = 0u;         // this block: rows on the envelope kernel
+    uint8_t GpuRowKind(const VoiceSoA& v, uint32_t handle, bool stagedPending,
+                       uint32_t storeFrames) const;
     static void GpuPassThunk(uint32_t job, const IndexedJobMix& mix,
                              uint32_t frameCount, void* userData);
     void RunGpuPass(GpuPassContext& ctx, float* outputLeft, float* outputRight);

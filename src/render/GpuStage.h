@@ -21,8 +21,10 @@ namespace svms {
 
 struct GpuStageStats {
     uint64_t blocks = 0u;        // blocks that submitted GPU work
-    uint64_t rows = 0u;          // rows rendered on the GPU
+    uint64_t rows = 0u;          // sustained-loop rows rendered on the GPU
+    uint64_t envRows = 0u;       // envelope rows (release, attack/decay, one-shot)
     uint64_t uploads = 0u;       // static row records uploaded
+    uint64_t envUploads = 0u;    // static envelope records uploaded
     uint64_t late = 0u;          // blocks that missed the deadline (CPU fallback)
     uint64_t failed = 0u;        // blocks whose submit failed
     uint64_t submitMicros = 0u;
@@ -45,8 +47,8 @@ public:
     const char* Name() const { return backend_ ? backend_->Name() : ""; }
     bool Enabled() const { return enabled_ && !stats_.lost; }
     const GpuStageStats& Stats() const { return stats_; }
-    void ProfileNs(uint64_t& voice, uint64_t& reduce) const {
-        backend_->ProfileNs(voice, reduce);
+    void ProfileNs(uint64_t& voice, uint64_t& reduce, uint64_t& env) const {
+        backend_->ProfileNs(voice, reduce, env);
     }
 
     // Tunables.  minimumVoices: below it the round trip costs more than AVX2.
@@ -86,10 +88,15 @@ public:
                 (std::max)((std::max)(maxFrames, maxFrames_), maxFramesHint_);
             try {
                 resident_.assign(handleCapacity, UINT32_MAX);
+                residentKind_.assign(handleCapacity, 0u);
                 flags_.assign(handleCapacity, 0u);
                 list_.assign(handleCapacity, gpu::ListEntry{});
                 upload_.assign(handleCapacity, gpu::UploadRecord{});
                 dyn_.assign(handleCapacity, gpu::DynOut{});
+                envList_.assign(handleCapacity, gpu::EnvListEntry{});
+                envUpload_.assign(handleCapacity, gpu::EnvUploadRecord{});
+                envDyn_.assign(handleCapacity, gpu::EnvDynOut{});
+                retire_.assign(handleCapacity, RetireRec{});
                 mix_.assign(static_cast<size_t>(frames) * 2u, 0.0f);
             } catch (...) {
                 enabled_ = false;
@@ -123,29 +130,52 @@ public:
     }
 
     // Per-block scratch (valid after a successful Prepare).
+    // Row kinds in Flags(): 0 = CPU, kKindSustained, kKindEnvelope.  A row's
+    // residency is valid only for the kind it was uploaded as.
+    static constexpr uint8_t kKindSustained = 1u;
+    static constexpr uint8_t kKindEnvelope = 2u;
+    struct RetireRec {
+        uint32_t handle;
+        uint32_t frame;
+    };
     uint32_t* Resident() { return resident_.data(); }
+    uint8_t* ResidentKind() { return residentKind_.data(); }
     uint8_t* Flags() { return flags_.data(); }
     gpu::ListEntry* List() { return list_.data(); }
+    gpu::EnvListEntry* EnvList() { return envList_.data(); }
     gpu::UploadRecord* UploadScratch() { return upload_.data(); }
+    gpu::EnvUploadRecord* EnvUploadScratch() { return envUpload_.data(); }
+    RetireRec* RetireScratch() { return retire_.data(); }
     uint32_t* JobGpuCount() { return jobGpu_; }
+    uint32_t* JobEnvCount() { return jobEnv_; }
     uint32_t* JobUploadCount() { return jobUpload_; }
+    uint32_t* JobEnvUploadCount() { return jobEnvUpload_; }
+    uint32_t* JobRetireCount() { return jobRetire_; }
     const gpu::DynOut* Dyn() const { return dyn_.data(); }
+    const gpu::EnvDynOut* EnvDyn() const { return envDyn_.data(); }
     const float* Mix() const { return mix_.data(); }
 
     bool UploadRows(const gpu::UploadRecord* records, uint32_t count) {
         return backend_->UploadRows(records, count);
     }
-    // Starts the block.  `uploads` is the number of static records already
-    // sent for it (counters only).
-    bool Submit(uint32_t listCount, uint32_t frames, uint32_t uploads) {
+    bool UploadEnvRows(const gpu::EnvUploadRecord* records, uint32_t count) {
+        return backend_->UploadEnvRows(records, count);
+    }
+    // Starts the block.  `uploads` / `envUploads` are the numbers of static
+    // records already sent for it (counters only).
+    bool Submit(uint32_t listCount, uint32_t envCount, uint32_t frames,
+                uint32_t uploads, uint32_t envUploads, float retireThreshold) {
         submitStart_ = NowMicros();
-        if (!backend_->Submit(list_.data(), listCount, frames)) {
+        if (!backend_->Submit(list_.data(), listCount, envList_.data(),
+                              envCount, frames, retireThreshold)) {
             ++stats_.failed;
             return false;
         }
         ++stats_.blocks;
         stats_.rows += listCount;
+        stats_.envRows += envCount;
         stats_.uploads += uploads;
+        stats_.envUploads += envUploads;
         stats_.submitMicros += NowMicros() - submitStart_;
         return true;
     }
@@ -162,13 +192,13 @@ public:
         if (forceLate_ != 0u) {
             // Drain the block so the buffers stay consistent, then report it late.
             --forceLate_;
-            backend_->Collect(~0ull, mix_.data(), dyn_.data());
+            backend_->Collect(~0ull, mix_.data(), dyn_.data(), envDyn_.data());
             ++stats_.late;
             return gpu::Result::Late;
         }
         const uint64_t waitStart = NowMicros();
         const gpu::Result result =
-            backend_->Collect(timeout, mix_.data(), dyn_.data());
+            backend_->Collect(timeout, mix_.data(), dyn_.data(), envDyn_.data());
         const uint64_t waited = NowMicros() - waitStart;
         if (result == gpu::Result::Ok) {
             stats_.waitMicros += waited;
@@ -202,13 +232,21 @@ public:
     uint32_t handleCapacity_ = 0u;
     uint32_t maxFrames_ = 0u;
     std::vector<uint32_t> resident_;
+    std::vector<uint8_t> residentKind_;
     std::vector<uint8_t> flags_;
     std::vector<gpu::ListEntry> list_;
+    std::vector<gpu::EnvListEntry> envList_;
     std::vector<gpu::UploadRecord> upload_;
+    std::vector<gpu::EnvUploadRecord> envUpload_;
     std::vector<float> mix_;
     std::vector<gpu::DynOut> dyn_;
+    std::vector<gpu::EnvDynOut> envDyn_;
+    std::vector<RetireRec> retire_;
     uint32_t jobGpu_[kMaxJobs] = {};
+    uint32_t jobEnv_[kMaxJobs] = {};
     uint32_t jobUpload_[kMaxJobs] = {};
+    uint32_t jobEnvUpload_[kMaxJobs] = {};
+    uint32_t jobRetire_[kMaxJobs] = {};
 public:
     GpuStageStats& MutableStats() { return stats_; }
 private:

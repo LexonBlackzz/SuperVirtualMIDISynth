@@ -320,12 +320,184 @@ void RunGpuStageEventDifferential(svms::GpuStage& stage) {
     CheckWholeVoiceStateParity(*oracleVoices, *wholeVoices, "gpu-stage");
 }
 
+// Envelope rows: release tails (counted and threshold-governed, loop and
+// one-shot), attack/decay stages that cross into sustain mid-block, and
+// one-shots that run off the end of their sample.  The GPU rows must match
+// the scalar renderer's generic span machine: every piece of state bit-equal
+// (phase, gain, stage and counters, filter), the same voices retired, audio
+// within the oracle tolerance.  One block is forced late (CPU fallback) and
+// one bumps the epoch (full re-upload).
+void ConfigureGpuEnvelopePool(svms::VoiceManager& voices,
+                              const svms::ChannelCache& channels,
+                              uint32_t poolSize) {
+    Check(voices.Initialize(poolSize, 44100u),
+          "gpu envelope pool allocates voice storage");
+    const svms::PreparedVoiceFilter lowPass = svms::PrepareVoiceLowPass(
+        static_cast<uint8_t>(svms::FilterType::LowPass2Pole), 9000, 120, 44100u);
+    for (uint32_t i = 0; i < poolSize; ++i) {
+        const uint8_t channel = static_cast<uint8_t>(i & 3u);
+        const svms::VoiceHandle voice = voices.AllocateVoice(
+            channel, static_cast<uint8_t>(48u + i % 24u),
+            static_cast<uint8_t>(48u + i % 64u));
+        const uint32_t type = i % 8u;
+        const bool loop = type != 3u && type != 5u && type != 6u;
+        float step = 0.4f + static_cast<float>(i % 17u) * 0.11f;
+        float phase = static_cast<float>((i * 37u) % 1700u) + 0.375f;
+        if (!loop) {
+            // One-shots: some run off the end of the sample inside the
+            // blocks, some do not.
+            step = 0.6f + static_cast<float>(i % 5u) * 0.2f;
+            phase = 4096.0f - 1.0f - static_cast<float>(300u + (i % 9u) * 90u);
+        }
+        voices.SetVoiceSample(voice, 0, 4096, 64, 4032, loop ? 1u : 0u, step, 1);
+        voices.v.phases[voice] = phase;
+        const float gain = 0.02f * (1.0f + 0.01f * static_cast<float>(i % 50u));
+        switch (type) {
+        case 1u:   // release loop, threshold-governed tail
+            voices.SetVoiceEnvelope(voice, gain, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f,
+                                    0.985f);
+            break;
+        case 2u:   // release loop, counted tail (some end inside a block)
+            voices.SetVoiceEnvelope(voice, gain, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f,
+                                    0.9995f, 150u + (i % 7u) * 400u);
+            break;
+        case 3u:   // release one-shot
+            voices.SetVoiceEnvelope(voice, gain, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f,
+                                    0.9999f);
+            break;
+        case 4u:   // attack then decay, crossing into sustain mid-run
+            voices.SetVoiceEnvelope(voice, gain, 0.35f, 0, 0,
+                                    200u + (i % 5u) * 150u, 500u + (i % 3u) * 400u,
+                                    gain / 300.0f, 0.9993f, 0.999f);
+            break;
+        case 5u:   // decay-only one-shot
+            voices.SetVoiceEnvelope(voice, gain, 0.4f, 0, 0, 0,
+                                    300u + (i % 4u) * 300u, 0.0f, 0.9994f,
+                                    0.999f);
+            break;
+        default:
+            voices.SetVoiceEnvelope(voice, gain, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f,
+                                    0.999f);
+            break;
+        }
+        voices.SetVoicePlayIndex(voice, i + 1u);
+        voices.SetVoiceGain(voice, 0.02f, 0.02f);
+        voices.RefreshMixGain(voice, channels.GetParams()[channel]);
+        if (type >= 1u && type <= 3u) voices.StartRelease(voice);
+        if ((i % 3u) == 0u) {
+            voices.v.filterEnabled[voice] = lowPass.enabled;
+            voices.v.filterA0[voice] = lowPass.a0;
+            voices.v.filterB1[voice] = lowPass.b1;
+            voices.v.filterB2[voice] = lowPass.b2;
+        }
+    }
+}
+
+void RunGpuStageEnvelopeDifferential(svms::GpuStage& stage, uint32_t poolSize,
+                                     uint32_t frames, uint32_t blocks,
+                                     uint32_t renderThreads) {
+    std::vector<int16_t> samples;
+    FillGpuTestSamples(samples);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    auto seed = std::make_unique<svms::VoiceManager>();
+    ConfigureGpuEnvelopePool(*seed, channels, poolSize);
+    stage.BumpEpoch();
+    auto cpuVoices = std::make_unique<svms::VoiceManager>(*seed);
+    auto gpuVoices = std::make_unique<svms::VoiceManager>(*seed);
+    svms::ChannelCache cpuChannels = channels;
+    svms::ChannelCache gpuChannels = channels;
+    svms::RenderScalar cpu;
+    svms::RenderScalar gpu;
+    Check(cpu.ReserveVoiceCapacity(poolSize) && gpu.ReserveVoiceCapacity(poolSize) &&
+              cpu.ConfigureRenderThreads(1u, frames) &&
+              gpu.ConfigureRenderThreads(renderThreads, frames) &&
+              cpu.SetRenderBackend(svms::RenderBackend::Scalar) &&
+              gpu.SetRenderBackend(svms::RenderBackend::Scalar),
+          "gpu envelope differential starts its renderers");
+    gpu.SetGpuStage(&stage);
+    const uint64_t envBefore = stage.Stats().envRows;
+    const uint64_t lateBefore = stage.Stats().late;
+    const uint32_t startActive = cpuVoices->activeCount_;
+    float maxDiff = 0.0f;
+    uint32_t stateMismatch = 0u;
+    uint32_t listMismatch = 0u;
+    for (uint32_t block = 0; block < blocks; ++block) {
+        if (block == 3u) stage.ForceLateForTest(1u);
+        if (block == 5u) stage.BumpEpoch();
+        std::vector<float> cl(frames, 0.0f), cr(frames, 0.0f);
+        std::vector<float> gl(frames, 0.0f), gr(frames, 0.0f);
+        const uint64_t start = 20000u + static_cast<uint64_t>(block) * frames;
+        cpu.RenderBlock(*cpuVoices, cpuChannels, samples.data(), 4096u,
+                        cl.data(), cr.data(), frames, cfg, nullptr, 0u, true, start);
+        gpu.RenderBlock(*gpuVoices, gpuChannels, samples.data(), 4096u,
+                        gl.data(), gr.data(), frames, cfg, nullptr, 0u, true, start);
+        for (uint32_t f = 0; f < frames; ++f) {
+            maxDiff = (std::max)(maxDiff, std::fabs(cl[f] - gl[f]));
+            maxDiff = (std::max)(maxDiff, std::fabs(cr[f] - gr[f]));
+        }
+        if (cpuVoices->activeCount_ != gpuVoices->activeCount_) {
+            ++listMismatch;
+            continue;
+        }
+        for (uint32_t i = 0; i < cpuVoices->activeCount_; ++i) {
+            const uint32_t h = cpuVoices->activeList_[i];
+            if (gpuVoices->activeList_[i] != h) { ++listMismatch; continue; }
+            const svms::VoiceSoA& a = cpuVoices->v;
+            const svms::VoiceSoA& b = gpuVoices->v;
+            const bool same =
+                std::memcmp(&a.phases[h], &b.phases[h], sizeof(float)) == 0 &&
+                std::memcmp(&a.currentGain[h], &b.currentGain[h], sizeof(float)) == 0 &&
+                std::memcmp(&a.filterZ1[h], &b.filterZ1[h], sizeof(float)) == 0 &&
+                std::memcmp(&a.filterZ2[h], &b.filterZ2[h], sizeof(float)) == 0 &&
+                std::memcmp(&a.renderGainL[h], &b.renderGainL[h], sizeof(float)) == 0 &&
+                std::memcmp(&a.renderGainR[h], &b.renderGainR[h], sizeof(float)) == 0 &&
+                a.state[h] == b.state[h] &&
+                a.envelopeStage[h] == b.envelopeStage[h] &&
+                a.attackSamplesRemaining[h] == b.attackSamplesRemaining[h] &&
+                a.decaySamplesRemaining[h] == b.decaySamplesRemaining[h] &&
+                a.releaseSamplesRemaining[h] == b.releaseSamplesRemaining[h];
+            if (!same && stateMismatch++ < 6u) {
+                std::fprintf(stderr,
+                    "[GPUDIFF] env block %u handle %u: phase %g/%g gain %g/%g "
+                    "stage %u/%u atk %u/%u dec %u/%u rel %u/%u\n",
+                    block, h, a.phases[h], b.phases[h], a.currentGain[h],
+                    b.currentGain[h], a.envelopeStage[h], b.envelopeStage[h],
+                    a.attackSamplesRemaining[h], b.attackSamplesRemaining[h],
+                    a.decaySamplesRemaining[h], b.decaySamplesRemaining[h],
+                    a.releaseSamplesRemaining[h], b.releaseSamplesRemaining[h]);
+            }
+        }
+    }
+    const uint64_t envRows = stage.Stats().envRows - envBefore;
+    std::fprintf(stderr,
+        "[GPUDIFF] envelope pool=%u frames=%u blocks=%u threads=%u audio max=%g "
+        "state-mismatch=%u list-mismatch=%u env-rows=%llu retired=%u late=%llu\n",
+        poolSize, frames, blocks, renderThreads, maxDiff, stateMismatch,
+        listMismatch, static_cast<unsigned long long>(envRows),
+        startActive - cpuVoices->activeCount_,
+        static_cast<unsigned long long>(stage.Stats().late - lateBefore));
+    Check(envRows > 0u, "gpu envelope differential rendered rows on the GPU");
+    Check(startActive > cpuVoices->activeCount_,
+          "gpu envelope differential retired voices");
+    Check(maxDiff <= g_waveTol, "gpu envelope audio matches the scalar renderer");
+    Check(stateMismatch == 0u, "gpu envelope state is bit-equal to scalar");
+    Check(listMismatch == 0u, "gpu envelope retirements match the scalar renderer");
+}
+
 void TestGpuStageDifferential() {
     std::unique_ptr<svms::GpuStage> stage;
     if (!CreateGpuStageForTest(stage)) return;
     RunGpuStageSteadyDifferential(*stage, 200u, 512u, 12u, 1u);
     RunGpuStageSteadyDifferential(*stage, 6000u, 2048u, 6u, 4u);
     RunGpuStageSteadyDifferential(*stage, 3000u, 480u, 6u, 4u);
+    RunGpuStageEnvelopeDifferential(*stage, 400u, 256u, 16u, 1u);
+    RunGpuStageEnvelopeDifferential(*stage, 4000u, 512u, 8u, 4u);
     RunGpuStageWrapSweep(*stage);
     RunGpuStageEventDifferential(*stage);
     Check(!stage->Stats().lost && stage->Stats().failed == 0u,

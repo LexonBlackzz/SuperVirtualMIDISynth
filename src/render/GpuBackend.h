@@ -49,6 +49,61 @@ struct DynOut {
 };
 static_assert(sizeof(DynOut) == 16u, "DynOut is one vec4");
 
+// Envelope rows (release tails, attack/decay, one-shots) run the scalar
+// generic span machine instead of the sustained fast path, so they carry the
+// envelope too.  Statics, 20 words (all 32-bit):
+//   0 sampleStart            7 phaseInc (float)      14 releaseDecay (float)
+//   1 flags: bit0 filter,    8 mixGainL (float)      15 filterA0 (float)
+//     bit1 loop              9 mixGainR (float)      16 filterB1 (float)
+//   2 relEnd                10 targetGain (float)    17 filterB2 (float)
+//   3 relLoopS              11 sustainLevel (float)  18, 19 reserved
+//   4 relLoopE              12 attackStep (float)
+//   5 relLoopSF (float)     13 decaySlope (float)
+//   6 relLoopEF (float)
+constexpr uint32_t kEnvRowWords = 20u;
+constexpr uint32_t kEnvFlagFilter = 1u;
+constexpr uint32_t kEnvFlagLoop = 2u;
+
+struct EnvUploadRecord {
+    uint32_t handle;
+    uint32_t words[kEnvRowWords];
+    uint32_t pad[3];
+};
+static_assert(sizeof(EnvUploadRecord) == 96u, "EnvUploadRecord is 24 words");
+
+// Envelope stage codes carried in the top four bits of EnvListEntry::handleStage
+// (the voice's envelopeStage for a held voice, 0 = releasing).
+constexpr uint32_t kEnvStageShift = 28u;
+constexpr uint32_t kEnvHandleMask = (1u << kEnvStageShift) - 1u;
+
+// Per-block entry of an envelope row (32 B): the dynamic state the CPU owns.
+struct EnvListEntry {
+    uint32_t handleStage;
+    float phase;
+    float z1;
+    float z2;
+    float gain;
+    uint32_t releaseRem;
+    uint32_t attackRem;
+    uint32_t decayRem;
+};
+static_assert(sizeof(EnvListEntry) == 32u, "EnvListEntry is two vec4");
+
+// Read back per envelope row.  stageRetire: bits 24..27 the stage code after
+// the block, bits 0..23 the frame the voice retired on (kEnvNoRetire = none).
+constexpr uint32_t kEnvNoRetire = 0xFFFFFFu;
+struct EnvDynOut {
+    float phase;
+    float z1;
+    float z2;
+    float gain;
+    uint32_t stageRetire;
+    uint32_t attackRem;
+    uint32_t decayRem;
+    uint32_t releaseRem;
+};
+static_assert(sizeof(EnvDynOut) == 32u, "EnvDynOut is two vec4");
+
 enum class Result : uint32_t {
     Ok = 0,     // mix and dynamic state are filled
     Late,       // still running at the deadline; results are discarded
@@ -80,20 +135,29 @@ public:
     // several times before a Submit.
     virtual bool UploadRows(const UploadRecord* records, uint32_t count) = 0;
 
-    // Start rendering `count` list entries over `frames` frames.
+    // Same for envelope rows (the second row buffer).
+    virtual bool UploadEnvRows(const EnvUploadRecord* records,
+                               uint32_t count) = 0;
+
+    // Start rendering `count` sustained-loop entries and `envCount` envelope
+    // entries over `frames` frames.  `retireThreshold` is the release gain
+    // floor (VoiceRetireThreshold()).
     virtual bool Submit(const ListEntry* list, uint32_t count,
-                        uint32_t frames) = 0;
+                        const EnvListEntry* envList, uint32_t envCount,
+                        uint32_t frames, float retireThreshold) = 0;
 
     // Poll until the block finishes or `timeoutMicros` elapse (0 = a single
     // poll, ~0ull = wait forever).  On Ok, mixLR holds 2*frames floats
-    // (left, right per frame) and dyn holds `count` entries.
-    virtual Result Collect(uint64_t timeoutMicros, float* mixLR,
-                           DynOut* dyn) = 0;
+    // (left, right per frame), dyn holds `count` entries and envDyn holds
+    // `envCount` entries.
+    virtual Result Collect(uint64_t timeoutMicros, float* mixLR, DynOut* dyn,
+                           EnvDynOut* envDyn) = 0;
 
     // Accumulated GPU time of the voice and reduction passes (nanoseconds),
     // when the backend profiles (SVMS_GPU_PROFILE=1).
-    virtual void ProfileNs(uint64_t& voice, uint64_t& reduce) const {
-        voice = reduce = 0u;
+    virtual void ProfileNs(uint64_t& voice, uint64_t& reduce,
+                           uint64_t& env) const {
+        voice = reduce = env = 0u;
     }
 
     virtual const char* Name() const = 0;

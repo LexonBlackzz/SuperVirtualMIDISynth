@@ -1650,22 +1650,25 @@ int main(int argc, char** argv) {
         (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseScalarVibrato),
         (unsigned long long)renderer->GetRefusalCount(svms::RenderScalar::kRefuseForced));
     if (gpuStage) {
-        uint64_t voiceNs = 0u, reduceNs = 0u;
-        gpuStage->ProfileNs(voiceNs, reduceNs);
-        if (voiceNs != 0u) {
+        uint64_t voiceNs = 0u, reduceNs = 0u, envNs = 0u;
+        gpuStage->ProfileNs(voiceNs, reduceNs, envNs);
+        if (voiceNs != 0u || envNs != 0u) {
             const double blocks = static_cast<double>(gpuStage->Stats().blocks);
             std::fprintf(stderr,
-                "{\"gpu_profile\":{\"voice_ms_per_block\":%.3f,\"reduce_ms_per_block\":%.3f}}\n",
-                voiceNs / blocks / 1.0e6, reduceNs / blocks / 1.0e6);
+                "{\"gpu_profile\":{\"voice_ms_per_block\":%.3f,\"env_ms_per_block\":%.3f,\"reduce_ms_per_block\":%.3f}}\n",
+                voiceNs / blocks / 1.0e6, envNs / blocks / 1.0e6,
+                reduceNs / blocks / 1.0e6);
         }
         const svms::GpuStageStats& g = gpuStage->Stats();
         std::fprintf(stderr,
             "{\"gpu\":{\"backend\":\"%s\",\"blocks\":%llu,\"rows\":%llu,"
-            "\"uploads\":%llu,\"late\":%llu,\"failed\":%llu,\"lost\":%d,"
+            "\"env_rows\":%llu,\"uploads\":%llu,\"env_uploads\":%llu,"
+            "\"late\":%llu,\"failed\":%llu,\"lost\":%d,"
             "\"submit_us\":%llu,\"wait_us\":%llu,\"classify_us\":%llu,"
             "\"pack_us\":%llu,\"upload_us\":%llu,\"scatter_us\":%llu}}\n",
             gpuStage->Name(), (unsigned long long)g.blocks,
-            (unsigned long long)g.rows, (unsigned long long)g.uploads,
+            (unsigned long long)g.rows, (unsigned long long)g.envRows,
+            (unsigned long long)g.uploads, (unsigned long long)g.envUploads,
             (unsigned long long)g.late, (unsigned long long)g.failed,
             g.lost ? 1 : 0, (unsigned long long)g.submitMicros,
             (unsigned long long)g.waitMicros,
