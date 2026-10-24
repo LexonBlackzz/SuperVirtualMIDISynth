@@ -661,7 +661,9 @@ bool Driver::Initialize() {
                                     cfg.gpuDeviceIndex, gpuError);
         if (gpuStage) {
             gpuStage->SetSampleRate(sampleRate);
-            gpuStage->SetDeadlinePercent(85u);
+            // Only a hang guard: a late block is cheaper to wait for than to
+            // redo on the CPU (which also throws away every resident row).
+            gpuStage->SetDeadlinePercent(400u);
             gpuStage->SetMaxFramesHint(bufferCapacity);
             renderScalar->SetGpuStage(gpuStage.get());
             LOG("GPU render stage: %s", gpuStage->Name());
