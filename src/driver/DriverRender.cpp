@@ -450,6 +450,8 @@ const uint32_t importedPages = self->useEventCompiler_
         ? eventBudget
         : (std::min)(eventBudget, kBlockDispatchSoftCap);
     uint32_t lateDispatched = 0u;
+    uint32_t admittedThisBlock = 0u;
+    bool noteOffRunOpen = false;
     auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
         ++examinedCount;
         // A merged note-on carries its count in the type byte; classify it
@@ -499,9 +501,43 @@ const uint32_t importedPages = self->useEventCompiler_
                     static_cast<uint64_t>(lateness);
             offset = 0;
         }
-        evtBuf[evCount++] = scheduledOut.ToRenderEvent(
+        RenderEvent admitted = scheduledOut.ToRenderEvent(
             static_cast<uint32_t>(offset));
         ++self->telemetry_.dispatched;
+        ++admittedThisBlock;
+        // Same-key same-frame note-off run compaction, fused into admission
+        // (see the comment block after the loop for why it is exact): the
+        // event buffer is written once instead of written and re-read.
+        if (admitted.type == RenderEventType::NoteOff) {
+            if (noteOffRunOpen && evCount != 0u) {
+                RenderEvent& tail = evtBuf[evCount - 1u];
+                if (tail.channel == admitted.channel &&
+                    tail.data1 == admitted.data1 &&
+                    tail.frameOffset == admitted.frameOffset) {
+                    if (tail.type == RenderEventType::NoteOff) {
+                        tail = admitted;
+                        tail.type = RenderEventType::StaleNoteOffBatch;
+                        tail.data2 = 2u;
+                        return;
+                    }
+                    if (tail.data2 < 255u) {
+                        const uint8_t batch = static_cast<uint8_t>(tail.data2 + 1u);
+                        tail = admitted;
+                        tail.type = RenderEventType::StaleNoteOffBatch;
+                        tail.data2 = batch;
+                        return;
+                    }
+                    admitted.type = RenderEventType::StaleNoteOffBatch;
+                    admitted.data2 = 1u;
+                    evtBuf[evCount++] = admitted;
+                    return;
+                }
+            }
+            noteOffRunOpen = true;
+        } else {
+            noteOffRunOpen = false;
+        }
+        evtBuf[evCount++] = admitted;
     };
     if (self->useEventCompiler_) {
         for (;;) {
@@ -529,9 +565,9 @@ const uint32_t importedPages = self->useEventCompiler_
             for (; taken < runCount; ++taken) {
                 if (run[taken].targetFrame < self->virtualRenderSample_) {
                     if (lateDispatched >= lateBudget) break;
-                    const uint32_t before = evCount;
+                    const uint32_t before = admittedThisBlock;
                     admitScheduled(run[taken]);
-                    lateDispatched += evCount - before;
+                    lateDispatched += admittedThisBlock - before;
                 } else {
                     admitScheduled(run[taken]);
                 }
@@ -593,42 +629,6 @@ const uint32_t importedPages = self->useEventCompiler_
     // state (sustain/sostenuto) is constant inside it. Fences only suppress
     // note-ons, so the batch's ingressSequence (last member of the run) is
     // not consulted for note-offs.
-    const uint32_t admittedThisBlock = evCount;
-    uint32_t compactedWrite = 0u;
-    for (uint32_t readIndex = 0u; readIndex < evCount;) {
-        const RenderEvent& head = evtBuf[readIndex];
-        if (head.type != RenderEventType::NoteOff) {
-            evtBuf[compactedWrite++] = head;
-            ++readIndex;
-            continue;
-        }
-        uint32_t runEnd = readIndex + 1u;
-        while (runEnd < evCount &&
-               evtBuf[runEnd].type == RenderEventType::NoteOff &&
-               evtBuf[runEnd].channel == head.channel &&
-               evtBuf[runEnd].data1 == head.data1 &&
-               evtBuf[runEnd].frameOffset == head.frameOffset) {
-            ++runEnd;
-        }
-        const uint32_t runCount = runEnd - readIndex;
-        if (runCount == 1u) {
-            evtBuf[compactedWrite++] = head;
-            ++readIndex;
-            continue;
-        }
-        uint32_t remaining = runCount;
-        while (remaining != 0u) {
-            const uint8_t batch = static_cast<uint8_t>(
-                (std::min)(remaining, 255u));
-            RenderEvent batchEvent = evtBuf[runEnd - 1u];
-            batchEvent.type = RenderEventType::StaleNoteOffBatch;
-            batchEvent.data2 = batch;
-            evtBuf[compactedWrite++] = batchEvent;
-            remaining -= batch;
-        }
-        readIndex = runEnd;
-    }
-    evCount = compactedWrite;
 
     // ── Step 6: Render with sub-sample event slicing ───────────────────
     // RenderBlock will invoke DispatchRenderEvent at each event's exact

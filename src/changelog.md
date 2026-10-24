@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-24 — `perf(v3): fuse note-off run compaction into event admission`. The callback wrote the block's events into the buffer and then re-read the whole thing to merge same-key same-frame note-off runs; admission now merges them as they arrive (same 255-per-batch chunking, same events out), so the buffer is written once. Not measured yet, tests 23/23.
+
 - 2026-10-24 — `perf(v3): chained lazy launches leave the steal tree stale until the commit`. While a pending zero-life group keeps being the tournament root, each further same-frame launch no longer refreshes the winner-tree paths; the first chain step finds the best key outside the group once, later steps just compare against it, and the tree is repaired in one go when the pending note commits. `ShouldRejectNoteOn` reads the root and the pending victim's score from the pending launch. Funky Stars 2:00-2:20 on the live config (1 shard, no skipping): 139% -> 121% load.
 
 - 2026-10-24 — `fix(v3): steal-reject judged a pending lazy launch against a stale pool row`. With `steal_reject` on, `ShouldRejectNoteOn` read the victim's score from its pool row, but a lazily pending victim has not been written yet, so chained same-frame launches were admitted or rejected against the previous occupant. It now scores a pending victim from its setup. The lazy identity test runs with steal-reject on too (verified to fail without the fix).
