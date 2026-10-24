@@ -35,23 +35,29 @@ struct RenderScalar::GpuPassContext {
 // branch of RenderSustainedLoopSpan), kKindEnvelope for any other
 // sample-backed, unfaded, unrotated class (the generic span machine), 0 for
 // the CPU.
-inline uint8_t RenderScalar::GpuRowKind(const VoiceSoA& v, uint32_t h,
-                                        bool stagedPending,
-                                        uint32_t storeFrames) const {
+inline bool RenderScalar::GpuRowBlockOk(const VoiceSoA& v, uint32_t h,
+                                        bool stagedPending) const {
     if (wvStartFrame_[h] != UINT32_MAX || wvReleaseFrame_[h] != UINT32_MAX)
-        return 0u;
-    if (stagedPending && v.staged[h] != 0u) return 0u;
+        return false;
+    if (stagedPending && v.staged[h] != 0u) return false;
     const uint8_t channelRaw = v.channel[h];
     const uint32_t channel = channelRaw < kChannelCount ? channelRaw
                                                         : kChannelCount;
     if (wvChanOpStart_[channel] != wvChanOpStart_[channel + 1u] ||
         wvChanVibratoActive_[channel]) {
-        return 0u;
+        return false;
     }
     if (wvExciteHead_ != nullptr && h < wvExciteCapacity_ &&
         wvExciteHead_[h] != UINT32_MAX) {
-        return 0u;
+        return false;
     }
+    return true;
+}
+
+inline uint8_t RenderScalar::GpuRowKind(const VoiceSoA& v, uint32_t h,
+                                        bool stagedPending,
+                                        uint32_t storeFrames) const {
+    if (!GpuRowBlockOk(v, h, stagedPending)) return 0u;
     const VoiceRenderClass renderClass = ClassifyWholeVoiceRow(v, h);
     if (renderClass == VoiceRenderClass::Generic) return 0u;
     const uint32_t sampleStart = v.sampleStart[h];
@@ -64,7 +70,7 @@ inline uint8_t RenderScalar::GpuRowKind(const VoiceSoA& v, uint32_t h,
         return step > 0.0f && step < v.relLoopEF[h] - v.relLoopSF[h]
             ? GpuStage::kKindSustained : 0u;
     }
-    if (h > gpu::kEnvHandleMask || !(step >= 0.0f)) return 0u;
+    if (!(step >= 0.0f)) return 0u;
     return GpuStage::kKindEnvelope;
 }
 
@@ -79,10 +85,10 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
         {
             const uint32_t begin = c.sustainedCount * job / c.jobCount;
             const uint32_t end = c.sustainedCount * (job + 1u) / c.jobCount;
-            const gpu::ListEntry* list = stage.List();
+            const uint32_t* list = stage.List();
             const gpu::DynOut* dyn = stage.Dyn();
             for (uint32_t k = begin; k < end; ++k) {
-                const uint32_t h = list[k].handle;
+                const uint32_t h = list[k];
                 v.phases[h] = dyn[k].phase;
                 v.filterZ1[h] = dyn[k].z1;
                 v.filterZ2[h] = dyn[k].z2;
@@ -90,32 +96,43 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
         }
         const uint32_t begin = c.envCount * job / c.jobCount;
         const uint32_t end = c.envCount * (job + 1u) / c.jobCount;
-        const gpu::EnvListEntry* list = stage.EnvList();
+        const uint32_t* list = stage.EnvList();
         const gpu::EnvDynOut* dyn = stage.EnvDyn();
         GpuStage::RetireRec* retire = stage.RetireScratch() + begin;
+        uint32_t* cross = stage.CrossScratch() + begin;
         uint32_t retired = 0u;
+        uint32_t crossed = 0u;
         for (uint32_t k = begin; k < end; ++k) {
-            const uint32_t h = list[k].handleStage & gpu::kEnvHandleMask;
-            const uint32_t stageBefore = list[k].handleStage >>
-                                         gpu::kEnvStageShift;
+            const uint32_t h = list[k];
+            // The SoA still holds the pre-block lifecycle (it is rewritten
+            // below), so the stage the kernel started from is read here.
+            const uint32_t stageBefore =
+                v.state[h] == static_cast<uint8_t>(VoiceState::Releasing)
+                    ? 0u : v.envelopeStage[h];
             const gpu::EnvDynOut& d = dyn[k];
+            // Only the fields the kernel can change for this lifecycle stage.
             v.phases[h] = d.phase;
             v.filterZ1[h] = d.z1;
             v.filterZ2[h] = d.z2;
-            v.currentGain[h] = d.gain;
             if (stageBefore == 0u) {
+                v.currentGain[h] = d.gain;
                 v.releaseSamplesRemaining[h] = d.releaseRem;
-            } else {
+            } else if (stageBefore != 3u) {
+                v.currentGain[h] = d.gain;
                 const uint32_t stageAfter = (d.stageRetire >> 24) & 0xFu;
                 v.envelopeStage[h] = static_cast<uint8_t>(stageAfter);
                 v.attackSamplesRemaining[h] = d.attackRem;
                 v.decaySamplesRemaining[h] = d.decayRem;
-                if (stageBefore != 3u && stageAfter == 3u) {
+                if (stageAfter == 3u) {
                     // Transient -> sustained crossing: the sustained kernels
                     // read renderGain, which the launch left at its
                     // pre-envelope value (same bake as the CPU batch path).
+                    // The render class moves with it, and the GPU copy of
+                    // the row (envelope kind) no longer fits the new class.
                     v.renderGainL[h] = v.currentGain[h] * v.mixGainL[h];
                     v.renderGainR[h] = v.currentGain[h] * v.mixGainR[h];
+                    stage.Resident()[h] = UINT32_MAX;
+                    cross[crossed++] = h;
                 }
             }
             const uint32_t frame = d.stageRetire & 0xFFFFFFu;
@@ -123,6 +140,7 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
                 retire[retired++] = {h, frame};
         }
         stage.JobRetireCount()[job] = retired;
+        stage.JobCrossCount()[job] = crossed;
         return;
     }
     const uint32_t begin = c.activeCount * job / c.jobCount;
@@ -132,10 +150,32 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
     if (c.pass == 1u) {
         uint32_t sustained = 0u;
         uint32_t envelope = 0u;
+        uint32_t* resident = stage.Resident();
+        const uint8_t* residentKind = stage.ResidentKind();
         for (uint32_t i = begin; i < end; ++i) {
-            const uint8_t kind = renderer->GpuRowKind(
-                v, active[i], c.stagedPending, c.storeFrames);
-            flags[i] = kind;
+            const uint32_t h = active[i];
+            const uint32_t stamp = v.playIndex[h];
+            uint8_t kind;
+            uint8_t mark = 0u;
+            // A resident row whose lifecycle still matches the kind it was
+            // uploaded as keeps that kind (its statics, class and envelope
+            // can only move through events that change the play index or the
+            // lifecycle state, or through a render, which invalidates it).
+            const uint8_t rk = residentKind[h];
+            const uint8_t st = v.state[h];
+            if (stamp != UINT32_MAX && resident[h] == stamp && rk != 0u &&
+                ((rk == 3u && st == static_cast<uint8_t>(VoiceState::Releasing)) ||
+                 (rk != 3u && st == static_cast<uint8_t>(VoiceState::Active)))) {
+                kind = renderer->GpuRowBlockOk(v, h, c.stagedPending)
+                    ? (rk == 1u ? GpuStage::kKindSustained
+                                : GpuStage::kKindEnvelope)
+                    : 0u;
+            } else {
+                kind = renderer->GpuRowKind(v, h, c.stagedPending, c.storeFrames);
+                mark = GpuStage::kNeedsCheck;
+            }
+            if (kind == 0u && resident[h] != UINT32_MAX) resident[h] = UINT32_MAX;
+            flags[i] = static_cast<uint8_t>(kind | mark);
             sustained += kind == GpuStage::kKindSustained ? 1u : 0u;
             envelope += kind == GpuStage::kKindEnvelope ? 1u : 0u;
         }
@@ -146,24 +186,34 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
     // Pass 2: compact the three lists and pack what the GPU is missing.
     uint32_t* resident = stage.Resident();
     uint8_t* residentKind = stage.ResidentKind();
-    gpu::ListEntry* list = stage.List();
-    gpu::EnvListEntry* envList = stage.EnvList();
+    uint32_t* list = stage.List();
+    uint32_t* envList = stage.EnvList();
     gpu::UploadRecord* scratch = stage.UploadScratch() + begin;
     gpu::EnvUploadRecord* envScratch = stage.EnvUploadScratch() + begin;
     uint32_t* cpuOut = renderer->wvSliceHandles_ + c.cpuBase[job];
     uint32_t* gpuOut = renderer->wvSliceHandles_ + c.cpuCount + c.gpuBase[job];
     uint32_t* envOut = renderer->wvSliceHandles_ + c.cpuCount +
                        c.sustainedCount + c.envBase[job];
-    gpu::ListEntry* listOut = list + c.gpuBase[job];
-    gpu::EnvListEntry* envListOut = envList + c.envBase[job];
+    uint32_t* listOut = list + c.gpuBase[job];
+    uint32_t* envListOut = envList + c.envBase[job];
     uint32_t uploads = 0u;
     uint32_t envUploads = 0u;
     for (uint32_t i = begin; i < end; ++i) {
         const uint32_t h = active[i];
-        const uint8_t kind = flags[i];
+        const uint8_t kind = flags[i] & 3u;
         if (kind == 0u) {
             *cpuOut++ = h;
-            if (resident[h] != UINT32_MAX) resident[h] = UINT32_MAX;
+            continue;
+        }
+        if ((flags[i] & GpuStage::kNeedsCheck) == 0u) {
+            // Resident and still valid: the list is all the GPU needs.
+            if (kind == GpuStage::kKindSustained) {
+                *gpuOut++ = h;
+                *listOut++ = h;
+            } else {
+                *envOut++ = h;
+                *envListOut++ = h;
+            }
             continue;
         }
         // A row without a play index (UINT32_MAX) can't be told apart from its
@@ -173,7 +223,7 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
         const uint32_t stamp = v.playIndex[h];
         if (kind == GpuStage::kKindSustained) {
             *gpuOut++ = h;
-            *listOut++ = {h, v.phases[h], v.filterZ1[h], v.filterZ2[h]};
+            *listOut++ = h;
             if (stamp != UINT32_MAX && resident[h] == stamp &&
                 residentKind[h] == kind) {
                 continue;
@@ -189,6 +239,9 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
             std::memcpy(&r.words[3], &v.relLoopSF[h], sizeof(float));
             std::memcpy(&r.words[4], &v.relLoopEF[h], sizeof(float));
             r.words[5] = 0u;
+            r.phase = v.phases[h];
+            r.z1 = v.filterZ1[h];
+            r.z2 = v.filterZ2[h];
             std::memcpy(&r.words[6], &v.phaseIncs[h], sizeof(float));
             std::memcpy(&r.words[7], &v.renderGainL[h], sizeof(float));
             std::memcpy(&r.words[8], &v.renderGainR[h], sizeof(float));
@@ -201,11 +254,7 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
             v.state[h] == static_cast<uint8_t>(VoiceState::Releasing);
         const uint32_t stage0 = released ? 0u : v.envelopeStage[h];
         *envOut++ = h;
-        *envListOut++ = {h | (stage0 << gpu::kEnvStageShift), v.phases[h],
-                         v.filterZ1[h], v.filterZ2[h], v.currentGain[h],
-                         v.releaseSamplesRemaining[h],
-                         v.attackSamplesRemaining[h],
-                         v.decaySamplesRemaining[h]};
+        *envListOut++ = h;
         const uint8_t envKind = released ? 3u : 2u;
         if (stamp != UINT32_MAX && resident[h] == stamp &&
             residentKind[h] == envKind) {
@@ -215,6 +264,14 @@ inline void RenderScalar::GpuPassThunk(uint32_t job, const IndexedJobMix&,
         residentKind[h] = envKind;
         gpu::EnvUploadRecord& r = envScratch[envUploads++];
         r.handle = h;
+        std::memcpy(&r.dyn[0], &v.phases[h], sizeof(float));
+        std::memcpy(&r.dyn[1], &v.filterZ1[h], sizeof(float));
+        std::memcpy(&r.dyn[2], &v.filterZ2[h], sizeof(float));
+        std::memcpy(&r.dyn[3], &v.currentGain[h], sizeof(float));
+        r.dyn[4] = stage0;
+        r.dyn[5] = v.attackSamplesRemaining[h];
+        r.dyn[6] = v.decaySamplesRemaining[h];
+        r.dyn[7] = v.releaseSamplesRemaining[h];
         r.words[0] = v.sampleStart[h];
         r.words[1] = (v.filterEnabled[h] != 0u ? gpu::kEnvFlagFilter : 0u) |
                      (v.loopEnabled[h] != 0u ? gpu::kEnvFlagLoop : 0u);
@@ -272,6 +329,8 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
     submitted = false;
     gpuSustainedRows_ = 0u;
     gpuEnvRows_ = 0u;
+    gpuSkipRefresh_ = 0u;
+    gpuRefreshHandles_.clear();
     GpuStage& stage = *gpuStage_;
     if (!stage.Enabled()) return 0u;
     if (voices.StaticEpoch() != gpuVoiceEpoch_) {
@@ -419,13 +478,24 @@ inline void RenderScalar::FinishGpuRows(VoiceManager& voices,
                 }
             }
         }
+        if (envCount != 0u) {
+            for (uint32_t job = 0u; job < ctx.jobCount; ++job) {
+                const uint32_t begin = envCount * job / ctx.jobCount;
+                const uint32_t* crossed = stage.CrossScratch() + begin;
+                gpuRefreshHandles_.insert(gpuRefreshHandles_.end(), crossed,
+                                          crossed + stage.JobCrossCount()[job]);
+            }
+        }
+        gpuSkipRefresh_ = gpuCount;
         stage.MutableStats().scatterMicros +=
             GpuStage::NowMicros() - scatterStart;
         return;
     }
     // Late, lost or never submitted: the SoA still holds the pre-block state,
-    // so the CPU kernels reproduce the block exactly (statics are unchanged,
-    // residency stays valid).
+    // so the CPU kernels reproduce the block exactly.  The GPU copy of every
+    // row's dynamic state is now one block ahead of (or unrelated to) the SoA,
+    // so nothing stays resident.
+    stage.BumpEpoch();
     VoiceSoA& v = voices.v;
     const IndexedJobMix mix{outputLeft, outputRight, nullptr, nullptr};
     const uint32_t* gpuRows = wvSliceHandles_ + cpuCount;

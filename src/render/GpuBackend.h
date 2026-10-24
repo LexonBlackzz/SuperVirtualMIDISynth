@@ -22,23 +22,23 @@ namespace gpu {
 constexpr uint32_t kRowWords = 12u;
 constexpr uint32_t kFilterFlag = 0x80000000u;
 
-// One row-static upload record (64 B): the handle then its row words.
+// The dynamic state of a row lives on the GPU between blocks (8 words per
+// handle).  The per-block list is just handles; a row's state is uploaded
+// only when the CPU changed it behind the GPU's back (new row, CPU-rendered
+// block, kind change).  Layout: 0 phase, 1 z1, 2 z2, 3 gain, 4 stage (0 =
+// releasing, else the envelope stage), 5 attackRem, 6 decayRem, 7 releaseRem.
+constexpr uint32_t kDynWords = 8u;
+
+// One row upload record (64 B): the handle, its static row words, and the
+// dynamic state it starts from (phase, filter delay line).
 struct UploadRecord {
     uint32_t handle;
     uint32_t words[kRowWords];
-    uint32_t pad[3];
-};
-static_assert(sizeof(UploadRecord) == 64u, "UploadRecord is 16 words");
-
-// One entry of the per-block voice list (16 B): the row handle plus the
-// dynamic state the CPU owns (phase, filter delay line).
-struct ListEntry {
-    uint32_t handle;
     float phase;
     float z1;
     float z2;
 };
-static_assert(sizeof(ListEntry) == 16u, "ListEntry is one vec4");
+static_assert(sizeof(UploadRecord) == 64u, "UploadRecord is 16 words");
 
 // Dynamic state read back for list position i.
 struct DynOut {
@@ -64,30 +64,15 @@ constexpr uint32_t kEnvRowWords = 20u;
 constexpr uint32_t kEnvFlagFilter = 1u;
 constexpr uint32_t kEnvFlagLoop = 2u;
 
+// Envelope upload record (128 B): handle, static words, initial dynamic
+// state (kDynWords words, layout above).
 struct EnvUploadRecord {
     uint32_t handle;
     uint32_t words[kEnvRowWords];
+    uint32_t dyn[kDynWords];
     uint32_t pad[3];
 };
-static_assert(sizeof(EnvUploadRecord) == 96u, "EnvUploadRecord is 24 words");
-
-// Envelope stage codes carried in the top four bits of EnvListEntry::handleStage
-// (the voice's envelopeStage for a held voice, 0 = releasing).
-constexpr uint32_t kEnvStageShift = 28u;
-constexpr uint32_t kEnvHandleMask = (1u << kEnvStageShift) - 1u;
-
-// Per-block entry of an envelope row (32 B): the dynamic state the CPU owns.
-struct EnvListEntry {
-    uint32_t handleStage;
-    float phase;
-    float z1;
-    float z2;
-    float gain;
-    uint32_t releaseRem;
-    uint32_t attackRem;
-    uint32_t decayRem;
-};
-static_assert(sizeof(EnvListEntry) == 32u, "EnvListEntry is two vec4");
+static_assert(sizeof(EnvUploadRecord) == 128u, "EnvUploadRecord is 32 words");
 
 // Read back per envelope row.  stageRetire: bits 24..27 the stage code after
 // the block, bits 0..23 the frame the voice retired on (kEnvNoRetire = none).
@@ -142,16 +127,17 @@ public:
     // Start rendering `count` sustained-loop entries and `envCount` envelope
     // entries over `frames` frames.  `retireThreshold` is the release gain
     // floor (VoiceRetireThreshold()).
-    virtual bool Submit(const ListEntry* list, uint32_t count,
-                        const EnvListEntry* envList, uint32_t envCount,
+    virtual bool Submit(const uint32_t* list, uint32_t count,
+                        const uint32_t* envList, uint32_t envCount,
                         uint32_t frames, float retireThreshold) = 0;
 
     // Poll until the block finishes or `timeoutMicros` elapse (0 = a single
     // poll, ~0ull = wait forever).  On Ok, mixLR holds 2*frames floats
     // (left, right per frame), dyn holds `count` entries and envDyn holds
     // `envCount` entries.
-    virtual Result Collect(uint64_t timeoutMicros, float* mixLR, DynOut* dyn,
-                           EnvDynOut* envDyn) = 0;
+    // The result pointers stay valid until the next Submit.
+    virtual Result Collect(uint64_t timeoutMicros, const float** mixLR,
+                           const DynOut** dyn, const EnvDynOut** envDyn) = 0;
 
     // Accumulated GPU time of the voice and reduction passes (nanoseconds),
     // when the backend profiles (SVMS_GPU_PROFILE=1).

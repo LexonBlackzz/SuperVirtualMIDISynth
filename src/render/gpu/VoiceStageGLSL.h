@@ -49,8 +49,9 @@ int Sample16(uint i) {
 
 #if defined(VOICE_CS)
 layout(std430, binding = 1) readonly buffer RowBuf { uint rows[]; };
-layout(std430, binding = 2) readonly buffer ListBuf { uvec4 listv[]; };
+layout(std430, binding = 2) readonly buffer ListBuf { uint listv[]; };
 layout(std430, binding = 5) writeonly buffer DynBuf { vec4 dynv[]; };
+layout(std430, binding = 11) buffer StateBuf { uint state[]; };
 
 // Fast path: one interior frame of a running span (no clamp, no wrap).
 #define FAST_POS(I, F) { uint b_ = uint(phase); I = sampleStart + b_; F = phase - float(b_); phase += phaseInc; }
@@ -112,9 +113,11 @@ void main() {
     precise float a0 = 0.0;
     precise float b1 = 0.0;
     precise float b2 = 0.0;
+    uint handle = 0u;
     if (live) {
-        uvec4 e = listv[idx];
-        uint b = e.x * 12u;
+        handle = listv[idx];
+        uint sb = handle * 8u;
+        uint b = handle * 12u;
         uint w0 = rows[b];
         sampleStart = w0 & 0x7FFFFFFFu;
         filt = (w0 & 0x80000000u) != 0u;
@@ -128,9 +131,9 @@ void main() {
         a0 = uintBitsToFloat(rows[b + 9u]);
         b1 = uintBitsToFloat(rows[b + 10u]);
         b2 = uintBitsToFloat(rows[b + 11u]);
-        phase = max(0.0, uintBitsToFloat(e.y));
-        z1 = uintBitsToFloat(e.z);
-        z2 = uintBitsToFloat(e.w);
+        phase = max(0.0, uintBitsToFloat(state[sb]));
+        z1 = uintBitsToFloat(state[sb + 1u]);
+        z2 = uintBitsToFloat(state[sb + 2u]);
     }
     precise float loopLength = relLoopEF - relLoopSF;
     precise float lastInterior = relLoopEF - 1.0;
@@ -245,8 +248,13 @@ void main() {
                 partial[(g * uFrames + n) * 2u + (row & 1u)] = sum;
         }
     }
-    if (live)
+    if (live) {
         dynv[idx] = vec4(phase, z1, z2, 0.0);
+        uint sb = handle * 8u;
+        state[sb] = floatBitsToUint(phase);
+        state[sb + 1u] = floatBitsToUint(z1);
+        state[sb + 2u] = floatBitsToUint(z2);
+    }
 }
 #endif
 
@@ -255,8 +263,9 @@ void main() {
 // decay stages and one-shots.  One frame at a time, same operation order.
 #if defined(ENV_CS)
 layout(std430, binding = 7) readonly buffer EnvRowBuf { uint erows[]; };
-layout(std430, binding = 8) readonly buffer EnvListBuf { uvec4 elist[]; };
+layout(std430, binding = 8) readonly buffer EnvListBuf { uint elist[]; };
 layout(std430, binding = 9) writeonly buffer EnvDynBuf { uvec4 edyn[]; };
+layout(std430, binding = 11) buffer StateBuf { uint state[]; };
 uniform uint uGroupBase;
 uniform uint uRetireBits;
 
@@ -293,18 +302,19 @@ void main() {
     precise float a0 = 0.0;
     precise float b1 = 0.0;
     precise float b2 = 0.0;
+    uint handle = 0u;
     if (live) {
-        uvec4 a = elist[idx * 2u];
-        uvec4 b = elist[idx * 2u + 1u];
-        uint r = (a.x & 0x0FFFFFFFu) * 20u;
-        stage = a.x >> 28u;
-        phase = max(0.0, uintBitsToFloat(a.y));
-        z1 = uintBitsToFloat(a.z);
-        z2 = uintBitsToFloat(a.w);
-        gain = uintBitsToFloat(b.x);
-        relRem = b.y;
-        atkRem = b.z;
-        decRem = b.w;
+        handle = elist[idx];
+        uint sb = handle * 8u;
+        uint r = handle * 20u;
+        phase = max(0.0, uintBitsToFloat(state[sb]));
+        z1 = uintBitsToFloat(state[sb + 1u]);
+        z2 = uintBitsToFloat(state[sb + 2u]);
+        gain = uintBitsToFloat(state[sb + 3u]);
+        stage = state[sb + 4u];
+        atkRem = state[sb + 5u];
+        decRem = state[sb + 6u];
+        relRem = state[sb + 7u];
         sampleStart = erows[r];
         uint flags = erows[r + 1u];
         filt = (flags & 1u) != 0u;
@@ -525,6 +535,15 @@ void main() {
                                floatBitsToUint(z2), floatBitsToUint(gain));
         edyn[idx * 2u + 1u] = uvec4((stage << 24u) | (retire & 0xFFFFFFu),
                                     atkRem, decRem, relRem);
+        uint sb = handle * 8u;
+        state[sb] = floatBitsToUint(phase);
+        state[sb + 1u] = floatBitsToUint(z1);
+        state[sb + 2u] = floatBitsToUint(z2);
+        state[sb + 3u] = floatBitsToUint(gain);
+        state[sb + 4u] = stage;
+        state[sb + 5u] = atkRem;
+        state[sb + 6u] = decRem;
+        state[sb + 7u] = relRem;
     }
 }
 #endif
@@ -549,6 +568,7 @@ void main() {
 #if defined(SCATTER_CS)
 layout(std430, binding = 1) writeonly buffer RowBuf { uint rows[]; };
 layout(std430, binding = 6) readonly buffer UpBuf { uint upload[]; };
+layout(std430, binding = 11) writeonly buffer StateBuf { uint state[]; };
 uniform uint uCount;
 uniform uint uBase;
 
@@ -559,22 +579,27 @@ void main() {
     uint h = upload[b];
     for (uint w = 0u; w < 12u; ++w)
         rows[h * 12u + w] = upload[b + 1u + w];
+    for (uint w = 0u; w < 3u; ++w)
+        state[h * 8u + w] = upload[b + 13u + w];
 }
 #endif
 
 #if defined(ENV_SCATTER_CS)
 layout(std430, binding = 7) writeonly buffer EnvRowBuf { uint erows[]; };
 layout(std430, binding = 10) readonly buffer EnvUpBuf { uint eupload[]; };
+layout(std430, binding = 11) writeonly buffer StateBuf { uint state[]; };
 uniform uint uCount;
 uniform uint uBase;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= uCount) return;
-    uint b = (uBase + i) * 24u;
+    uint b = (uBase + i) * 32u;
     uint h = eupload[b];
     for (uint w = 0u; w < 20u; ++w)
         erows[h * 20u + w] = eupload[b + 1u + w];
+    for (uint w = 0u; w < 8u; ++w)
+        state[h * 8u + w] = eupload[b + 21u + w];
 }
 #endif
 )GLSL";

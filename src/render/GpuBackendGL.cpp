@@ -68,6 +68,12 @@ constexpr GLenum GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS = 0x90EB;
 constexpr GLenum GL_MAX_SHADER_STORAGE_BLOCK_SIZE = 0x90DE;
 constexpr GLenum GL_NO_ERROR = 0;
 constexpr GLenum GL_TIME_ELAPSED = 0x88BF;
+constexpr GLenum GL_COPY_READ_BUFFER = 0x8F36;
+constexpr GLenum GL_COPY_WRITE_BUFFER = 0x8F37;
+constexpr GLbitfield GL_MAP_READ_BIT = 0x0001;
+constexpr GLbitfield GL_MAP_PERSISTENT_BIT = 0x0040;
+constexpr GLbitfield GL_MAP_COHERENT_BIT = 0x0080;
+constexpr GLbitfield GL_CLIENT_STORAGE_BIT = 0x0200;
 constexpr GLenum GL_QUERY_RESULT = 0x8866;
 constexpr GLuint64 GL_TIMEOUT_IGNORED = 0xFFFFFFFFFFFFFFFFull;
 
@@ -104,6 +110,10 @@ struct GLFns {
     void (SVMS_GLAPI* BufferData)(GLenum, GLsizeiptr, const void*, GLenum) = nullptr;
     void (SVMS_GLAPI* BufferSubData)(GLenum, GLintptr, GLsizeiptr, const void*) = nullptr;
     void (SVMS_GLAPI* GetBufferSubData)(GLenum, GLintptr, GLsizeiptr, void*) = nullptr;
+    // GL_ARB_buffer_storage (optional): pinned, persistently mapped read-back.
+    void (SVMS_GLAPI* BufferStorage)(GLenum, GLsizeiptr, const void*, GLbitfield) = nullptr;
+    void* (SVMS_GLAPI* MapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield) = nullptr;
+    void (SVMS_GLAPI* CopyBufferSubData)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr) = nullptr;
     void (SVMS_GLAPI* DispatchCompute)(GLuint, GLuint, GLuint) = nullptr;
     void (SVMS_GLAPI* MemoryBarrier)(GLbitfield) = nullptr;
     GLsync (SVMS_GLAPI* FenceSync)(GLenum, GLbitfield) = nullptr;
@@ -364,11 +374,11 @@ public:
     bool Reserve(uint32_t handleCapacity, uint32_t maxFrames) override;
     bool UploadRows(const UploadRecord* records, uint32_t count) override;
     bool UploadEnvRows(const EnvUploadRecord* records, uint32_t count) override;
-    bool Submit(const ListEntry* list, uint32_t count,
-                const EnvListEntry* envList, uint32_t envCount,
+    bool Submit(const uint32_t* list, uint32_t count,
+                const uint32_t* envList, uint32_t envCount,
                 uint32_t frames, float retireThreshold) override;
-    Result Collect(uint64_t timeoutMicros, float* mixLR, DynOut* dyn,
-                   EnvDynOut* envDyn) override;
+    Result Collect(uint64_t timeoutMicros, const float** mixLR,
+                   const DynOut** dyn, const EnvDynOut** envDyn) override;
     void ProfileNs(uint64_t& voice, uint64_t& reduce,
                    uint64_t& env) const override {
         voice = profileNs_[0];
@@ -380,11 +390,13 @@ public:
 
 private:
     enum Buf { kStore, kRows, kList, kPartial, kMix, kDyn, kUpload,
-               kEnvRows, kEnvList, kEnvDyn, kEnvUpload, kBufCount };
+               kEnvRows, kEnvList, kEnvDyn, kEnvUpload, kState,
+               kMixRead, kDynRead, kEnvDynRead, kBufCount };
     bool Bind();
     void BindAll();
     GLuint BuildProgram(const char* define, std::string& error);
     bool ResizeBuffer(Buf which, size_t bytes);
+    bool ResizeReadback(Buf which, size_t bytes);
     void Shutdown();
     bool CheckError(const char* what);
 
@@ -399,6 +411,11 @@ private:
     GLuint buf_[kBufCount] = {};
     size_t bufBytes_[kBufCount] = {};
     GLsync fence_ = nullptr;
+    bool pinned_ = false;             // read-back through persistent mappings
+    void* mapped_[kBufCount] = {};
+    std::vector<float> mixCopy_;      // fallback read-back storage
+    std::vector<DynOut> dynCopy_;
+    std::vector<EnvDynOut> envDynCopy_;
     bool profile_ = false;
     GLuint queries_[3] = {};
     uint64_t profileNs_[3] = {};
@@ -474,6 +491,10 @@ bool GLBackend::Init(uint32_t, std::string& error) {
         error = "OpenGL 4.3 compute entry points are missing";
         return false;
     }
+    pinned_ = Fetch(context_, gl_.BufferStorage, "glBufferStorage") &&
+              Fetch(context_, gl_.MapBufferRange, "glMapBufferRange") &&
+              Fetch(context_, gl_.CopyBufferSubData, "glCopyBufferSubData") &&
+              std::getenv("SVMS_GPU_NO_PINNED") == nullptr;
     GLint major = 0, minor = 0;
     gl_.GetIntegerv(GL_MAJOR_VERSION, &major);
     gl_.GetIntegerv(GL_MINOR_VERSION, &minor);
@@ -567,12 +588,12 @@ bool GLBackend::Bind() {
 
 void GLBackend::BindAll() {
     if (!bindingsDirty_) return;
-    for (GLuint binding = 0u; binding < 11u; ++binding) {
+    for (GLuint binding = 0u; binding < 12u; ++binding) {
         // Binding point order matches the shader: store, rows, list, partial,
         // mix, dyn, upload, env rows, env list, env dyn, env upload.
-        static const Buf kOrder[11] = {kStore, kRows, kList, kPartial, kMix,
+        static const Buf kOrder[12] = {kStore, kRows, kList, kPartial, kMix,
                                        kDyn, kUpload, kEnvRows, kEnvList,
-                                       kEnvDyn, kEnvUpload};
+                                       kEnvDyn, kEnvUpload, kState};
         gl_.BindBufferBase(GL_SHADER_STORAGE_BUFFER, binding,
                            buf_[kOrder[binding]]);
     }
@@ -590,6 +611,39 @@ bool GLBackend::ResizeBuffer(Buf which, size_t bytes) {
                    nullptr, GL_DYNAMIC_DRAW);
     bufBytes_[which] = bytes;
     return gl_.GetError() == GL_NO_ERROR;
+}
+
+// Host-visible read-back buffer: pinned and persistently mapped when the driver
+// has GL_ARB_buffer_storage (the GPU then DMAs straight into it), a plain
+// buffer plus a host copy otherwise.
+bool GLBackend::ResizeReadback(Buf which, size_t bytes) {
+    if (bytes == 0u) bytes = 16u;
+    if (bufBytes_[which] == bytes) return true;
+    if (!pinned_) {
+        bufBytes_[which] = bytes;
+        return true;
+    }
+    if (mapped_[which] != nullptr) {
+        // Deleting the buffer unmaps it; storage is immutable, so a new size
+        // needs a new buffer object.
+        gl_.DeleteBuffers(1, &buf_[which]);
+        gl_.GenBuffers(1, &buf_[which]);
+        mapped_[which] = nullptr;
+    }
+    const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT |
+                             GL_MAP_COHERENT_BIT | GL_CLIENT_STORAGE_BIT;
+    gl_.BindBuffer(GL_COPY_WRITE_BUFFER, buf_[which]);
+    gl_.BufferStorage(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(bytes),
+                      nullptr, flags);
+    mapped_[which] = gl_.MapBufferRange(
+        GL_COPY_WRITE_BUFFER, 0, static_cast<GLsizeiptr>(bytes),
+        GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+    if (mapped_[which] == nullptr || gl_.GetError() != GL_NO_ERROR) {
+        pinned_ = false;       // fall back to glGetBufferSubData
+        mapped_[which] = nullptr;
+    }
+    bufBytes_[which] = bytes;
+    return true;
 }
 
 bool GLBackend::UploadStore(const int16_t* data, uint32_t frames) {
@@ -620,14 +674,18 @@ bool GLBackend::Reserve(uint32_t handleCapacity, uint32_t maxFrames) {
     // Sustained and envelope rows each round their last group up.
     const size_t groups = (cap + group_ - 1u) / group_ + 1u;
     bool ok = ResizeBuffer(kEnvRows, cap * kEnvRowWords * 4u) &&
-              ResizeBuffer(kEnvList, cap * sizeof(EnvListEntry)) &&
+              ResizeBuffer(kState, cap * kDynWords * 4u) &&
+              ResizeBuffer(kEnvList, cap * sizeof(uint32_t)) &&
               ResizeBuffer(kEnvDyn, cap * sizeof(EnvDynOut)) &&
               ResizeBuffer(kEnvUpload, cap * sizeof(EnvUploadRecord)) &&
               ResizeBuffer(kRows, cap * kRowWords * 4u) &&
-              ResizeBuffer(kList, cap * sizeof(ListEntry)) &&
+              ResizeBuffer(kList, cap * sizeof(uint32_t)) &&
               ResizeBuffer(kDyn, cap * sizeof(DynOut)) &&
               ResizeBuffer(kPartial, groups * maxFrames * 2u * 4u) &&
               ResizeBuffer(kMix, static_cast<size_t>(maxFrames) * 2u * 4u) &&
+              ResizeReadback(kMixRead, static_cast<size_t>(maxFrames) * 2u * 4u) &&
+              ResizeReadback(kDynRead, cap * sizeof(DynOut)) &&
+              ResizeReadback(kEnvDynRead, cap * sizeof(EnvDynOut)) &&
               ResizeBuffer(kUpload, cap * sizeof(UploadRecord));
     if (!ok) return false;
     bindingsDirty_ = true;
@@ -675,8 +733,8 @@ bool GLBackend::UploadEnvRows(const EnvUploadRecord* records, uint32_t count) {
     return true;
 }
 
-bool GLBackend::Submit(const ListEntry* list, uint32_t count,
-                       const EnvListEntry* envList, uint32_t envCount,
+bool GLBackend::Submit(const uint32_t* list, uint32_t count,
+                       const uint32_t* envList, uint32_t envCount,
                        uint32_t frames, float retireThreshold) {
     if (!Bind() || count > handleCapacity_ || envCount > handleCapacity_ ||
         frames == 0u || frames > maxFrames_) {
@@ -689,12 +747,12 @@ bool GLBackend::Submit(const ListEntry* list, uint32_t count,
     if (count != 0u) {
         gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kList]);
         gl_.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                          static_cast<GLsizeiptr>(count) * sizeof(ListEntry), list);
+                          static_cast<GLsizeiptr>(count) * sizeof(uint32_t), list);
     }
     if (envCount != 0u) {
         gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kEnvList]);
         gl_.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                          static_cast<GLsizeiptr>(envCount) * sizeof(EnvListEntry),
+                          static_cast<GLsizeiptr>(envCount) * sizeof(uint32_t),
                           envList);
     }
     if (count != 0u) {
@@ -725,6 +783,19 @@ bool GLBackend::Submit(const ListEntry* list, uint32_t count,
     gl_.DispatchCompute((frames * 2u + 63u) / 64u, 1u, 1u);
     if (profile_) gl_.EndQuery(GL_TIME_ELAPSED);
     gl_.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    if (pinned_ && mapped_[kMixRead] != nullptr) {
+        // The GPU writes the results straight into pinned host memory.
+        auto copy = [&](Buf from, Buf to, size_t bytes) {
+            gl_.BindBuffer(GL_COPY_READ_BUFFER, buf_[from]);
+            gl_.BindBuffer(GL_COPY_WRITE_BUFFER, buf_[to]);
+            gl_.CopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0,
+                                  static_cast<GLsizeiptr>(bytes));
+        };
+        copy(kMix, kMixRead, static_cast<size_t>(frames) * 8u);
+        if (count != 0u) copy(kDyn, kDynRead, static_cast<size_t>(count) * sizeof(DynOut));
+        if (envCount != 0u)
+            copy(kEnvDyn, kEnvDynRead, static_cast<size_t>(envCount) * sizeof(EnvDynOut));
+    }
     fence_ = gl_.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0u);
     gl_.Flush();
     uploadCursor_ = 0u;
@@ -737,8 +808,8 @@ bool GLBackend::Submit(const ListEntry* list, uint32_t count,
     return fence_ != nullptr && gl_.GetError() == GL_NO_ERROR;
 }
 
-Result GLBackend::Collect(uint64_t timeoutMicros, float* mixLR, DynOut* dyn,
-                          EnvDynOut* envDyn) {
+Result GLBackend::Collect(uint64_t timeoutMicros, const float** mixLR,
+                          const DynOut** dyn, const EnvDynOut** envDyn) {
     if (!fence_) return Result::Idle;
     const GLuint64 nanos = timeoutMicros >= (GL_TIMEOUT_IGNORED / 1000ull)
         ? GL_TIMEOUT_IGNORED : timeoutMicros * 1000ull;
@@ -767,21 +838,34 @@ Result GLBackend::Collect(uint64_t timeoutMicros, float* mixLR, DynOut* dyn,
             profileNs_[q] += ns;
         }
     }
+    if (pinned_ && mapped_[kMixRead] != nullptr) {
+        *mixLR = static_cast<const float*>(mapped_[kMixRead]);
+        *dyn = static_cast<const DynOut*>(mapped_[kDynRead]);
+        *envDyn = static_cast<const EnvDynOut*>(mapped_[kEnvDynRead]);
+        return gl_.GetError() == GL_NO_ERROR ? Result::Ok : Result::Lost;
+    }
+    mixCopy_.resize(static_cast<size_t>(pendingFrames_) * 2u);
+    dynCopy_.resize(pendingCount_);
+    envDynCopy_.resize(pendingEnvCount_);
     gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kMix]);
     gl_.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                         static_cast<GLsizeiptr>(pendingFrames_) * 8, mixLR);
+                         static_cast<GLsizeiptr>(pendingFrames_) * 8,
+                         mixCopy_.data());
     if (pendingCount_ != 0u) {
         gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kDyn]);
         gl_.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
                              static_cast<GLsizeiptr>(pendingCount_) * sizeof(DynOut),
-                             dyn);
+                             dynCopy_.data());
     }
     if (pendingEnvCount_ != 0u) {
         gl_.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf_[kEnvDyn]);
         gl_.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
                              static_cast<GLsizeiptr>(pendingEnvCount_) * sizeof(EnvDynOut),
-                             envDyn);
+                             envDynCopy_.data());
     }
+    *mixLR = mixCopy_.data();
+    *dyn = dynCopy_.data();
+    *envDyn = envDynCopy_.data();
     return gl_.GetError() == GL_NO_ERROR ? Result::Ok : Result::Lost;
 }
 

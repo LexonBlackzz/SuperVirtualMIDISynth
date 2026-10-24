@@ -665,6 +665,13 @@ private:
     uint32_t gpuVoiceEpoch_ = 0u;   // VoiceManager::StaticEpoch last seen
     uint32_t gpuSustainedRows_ = 0u;   // this block: rows on the sustained kernel
     uint32_t gpuEnvRows_ = 0u;         // this block: rows on the envelope kernel
+    // GPU rows with no lifecycle change need no render-class refresh: the
+    // post loop skips the GPU tail of wvSliceHandles_ and refreshes only the
+    // rows that crossed a stage (gpuRefreshHandles_).
+    uint32_t gpuSkipRefresh_ = 0u;
+    std::vector<uint32_t> gpuRefreshHandles_;
+    bool GpuRowBlockOk(const VoiceSoA& v, uint32_t handle,
+                       bool stagedPending) const;
     uint8_t GpuRowKind(const VoiceSoA& v, uint32_t handle, bool stagedPending,
                        uint32_t storeFrames) const;
     static void GpuPassThunk(uint32_t job, const IndexedJobMix& mix,

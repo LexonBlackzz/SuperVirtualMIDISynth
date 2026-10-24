@@ -1096,7 +1096,15 @@ inline void RenderScalar::RenderWholeVoiceBlock(
 
     // Render-class lists track lifecycle (transient→sustained crossings
     // included).
-    for (uint32_t i = 0u; i < activeCount; ++i)
+#if defined(SVMS_GPU_STAGE)
+    // GPU rows keep their class unless the kernel moved them across a stage.
+    const uint32_t refreshCount = activeCount - gpuSkipRefresh_;
+    for (uint32_t handle : gpuRefreshHandles_)
+        voices.RefreshRenderClass(static_cast<VoiceHandle>(handle));
+#else
+    const uint32_t refreshCount = activeCount;
+#endif
+    for (uint32_t i = 0u; i < refreshCount; ++i)
         voices.RefreshRenderClass(static_cast<VoiceHandle>(wvSliceHandles_[i]));
 
     // Row-op channels had no masks set during the pre-pass (a launch-entry

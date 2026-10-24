@@ -430,6 +430,15 @@ void RunGpuStageEnvelopeDifferential(svms::GpuStage& stage, uint32_t poolSize,
     for (uint32_t block = 0; block < blocks; ++block) {
         if (block == 3u) stage.ForceLateForTest(1u);
         if (block == 5u) stage.BumpEpoch();
+        if (block == 7u) {
+            // A 4-frame stretch (too short for the stage) renders every row on
+            // the CPU between two GPU blocks: residency must not survive it.
+            std::vector<float> sl(4, 0.0f), sr(4, 0.0f), tl(4, 0.0f), tr(4, 0.0f);
+            cpu.RenderBlock(*cpuVoices, cpuChannels, samples.data(), 4096u,
+                            sl.data(), sr.data(), 4u, cfg, nullptr, 0u, true, 19000u);
+            gpu.RenderBlock(*gpuVoices, gpuChannels, samples.data(), 4096u,
+                            tl.data(), tr.data(), 4u, cfg, nullptr, 0u, true, 19000u);
+        }
         std::vector<float> cl(frames, 0.0f), cr(frames, 0.0f);
         std::vector<float> gl(frames, 0.0f), gr(frames, 0.0f);
         const uint64_t start = 20000u + static_cast<uint64_t>(block) * frames;

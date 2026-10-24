@@ -90,14 +90,12 @@ public:
                 resident_.assign(handleCapacity, UINT32_MAX);
                 residentKind_.assign(handleCapacity, 0u);
                 flags_.assign(handleCapacity, 0u);
-                list_.assign(handleCapacity, gpu::ListEntry{});
+                list_.assign(handleCapacity, 0u);
                 upload_.assign(handleCapacity, gpu::UploadRecord{});
-                dyn_.assign(handleCapacity, gpu::DynOut{});
-                envList_.assign(handleCapacity, gpu::EnvListEntry{});
+                envList_.assign(handleCapacity, 0u);
                 envUpload_.assign(handleCapacity, gpu::EnvUploadRecord{});
-                envDyn_.assign(handleCapacity, gpu::EnvDynOut{});
                 retire_.assign(handleCapacity, RetireRec{});
-                mix_.assign(static_cast<size_t>(frames) * 2u, 0.0f);
+                cross_.assign(handleCapacity, 0u);
             } catch (...) {
                 enabled_ = false;
                 return false;
@@ -134,6 +132,9 @@ public:
     // residency is valid only for the kind it was uploaded as.
     static constexpr uint8_t kKindSustained = 1u;
     static constexpr uint8_t kKindEnvelope = 2u;
+    // Flag bit: the row was classified from scratch, so pass 2 must compare it
+    // with its resident copy (a quick-classified resident row needs nothing).
+    static constexpr uint8_t kNeedsCheck = 0x80u;
     struct RetireRec {
         uint32_t handle;
         uint32_t frame;
@@ -141,19 +142,21 @@ public:
     uint32_t* Resident() { return resident_.data(); }
     uint8_t* ResidentKind() { return residentKind_.data(); }
     uint8_t* Flags() { return flags_.data(); }
-    gpu::ListEntry* List() { return list_.data(); }
-    gpu::EnvListEntry* EnvList() { return envList_.data(); }
+    uint32_t* List() { return list_.data(); }
+    uint32_t* EnvList() { return envList_.data(); }
     gpu::UploadRecord* UploadScratch() { return upload_.data(); }
     gpu::EnvUploadRecord* EnvUploadScratch() { return envUpload_.data(); }
     RetireRec* RetireScratch() { return retire_.data(); }
+    uint32_t* CrossScratch() { return cross_.data(); }
+    uint32_t* JobCrossCount() { return jobCross_; }
     uint32_t* JobGpuCount() { return jobGpu_; }
     uint32_t* JobEnvCount() { return jobEnv_; }
     uint32_t* JobUploadCount() { return jobUpload_; }
     uint32_t* JobEnvUploadCount() { return jobEnvUpload_; }
     uint32_t* JobRetireCount() { return jobRetire_; }
-    const gpu::DynOut* Dyn() const { return dyn_.data(); }
-    const gpu::EnvDynOut* EnvDyn() const { return envDyn_.data(); }
-    const float* Mix() const { return mix_.data(); }
+    const gpu::DynOut* Dyn() const { return dynOut_; }
+    const gpu::EnvDynOut* EnvDyn() const { return envDynOut_; }
+    const float* Mix() const { return mixOut_; }
 
     bool UploadRows(const gpu::UploadRecord* records, uint32_t count) {
         return backend_->UploadRows(records, count);
@@ -192,13 +195,13 @@ public:
         if (forceLate_ != 0u) {
             // Drain the block so the buffers stay consistent, then report it late.
             --forceLate_;
-            backend_->Collect(~0ull, mix_.data(), dyn_.data(), envDyn_.data());
+            backend_->Collect(~0ull, &mixOut_, &dynOut_, &envDynOut_);
             ++stats_.late;
             return gpu::Result::Late;
         }
         const uint64_t waitStart = NowMicros();
         const gpu::Result result =
-            backend_->Collect(timeout, mix_.data(), dyn_.data(), envDyn_.data());
+            backend_->Collect(timeout, &mixOut_, &dynOut_, &envDynOut_);
         const uint64_t waited = NowMicros() - waitStart;
         if (result == gpu::Result::Ok) {
             stats_.waitMicros += waited;
@@ -234,19 +237,21 @@ public:
     std::vector<uint32_t> resident_;
     std::vector<uint8_t> residentKind_;
     std::vector<uint8_t> flags_;
-    std::vector<gpu::ListEntry> list_;
-    std::vector<gpu::EnvListEntry> envList_;
+    std::vector<uint32_t> list_;
+    std::vector<uint32_t> envList_;
     std::vector<gpu::UploadRecord> upload_;
     std::vector<gpu::EnvUploadRecord> envUpload_;
-    std::vector<float> mix_;
-    std::vector<gpu::DynOut> dyn_;
-    std::vector<gpu::EnvDynOut> envDyn_;
+    const float* mixOut_ = nullptr;
+    const gpu::DynOut* dynOut_ = nullptr;
+    const gpu::EnvDynOut* envDynOut_ = nullptr;
     std::vector<RetireRec> retire_;
+    std::vector<uint32_t> cross_;
     uint32_t jobGpu_[kMaxJobs] = {};
     uint32_t jobEnv_[kMaxJobs] = {};
     uint32_t jobUpload_[kMaxJobs] = {};
     uint32_t jobEnvUpload_[kMaxJobs] = {};
     uint32_t jobRetire_[kMaxJobs] = {};
+    uint32_t jobCross_[kMaxJobs] = {};
 public:
     GpuStageStats& MutableStats() { return stats_; }
 private:
