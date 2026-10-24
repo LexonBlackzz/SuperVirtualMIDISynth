@@ -39,7 +39,8 @@ namespace svms {
 // voices.launch_staging, read when a VoiceManager initializes (restart-applied
 // like synth.large_pages).  Off = the production SoA launch path, unchanged.
 inline std::atomic<bool> g_launchStagingEnabled{false};
-// The live DLL has no config key yet: env SVMS_LAUNCH_STAGING switches it on.
+// Config key voices.launch_staging sets the flag at driver init; env
+// SVMS_LAUNCH_STAGING forces it on.
 inline bool LaunchStagingRequested() noexcept {
     static const bool env = std::getenv("SVMS_LAUNCH_STAGING") != nullptr;
     return env || g_launchStagingEnabled.load(std::memory_order_relaxed);

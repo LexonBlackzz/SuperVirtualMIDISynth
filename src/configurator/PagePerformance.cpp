@@ -529,6 +529,13 @@ void CpuCard(ConfigDocument& doc) {
         if (ui::Toggle("##dropzerolife", &w.dropZeroLifeVictims)) doc.MarkDirty();
         ui::EndRow();
     }
+    {
+        ui::BeginRow("launchStaging", "Staged note launches (experimental)",
+                     "Writes a stolen voice's replacement into one compact record and lets the render threads finish the copy, so the single planning thread does less work on extreme black MIDIs. The sound is bit-identical. Needs a restart.",
+                     ImVec2(46.0f * s, 28.0f * s));
+        if (ui::Toggle("##launchstaging", &w.launchStaging)) doc.MarkDirty();
+        ui::EndRow();
+    }
     ui::EndCard();
 }
 

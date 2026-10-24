@@ -144,6 +144,9 @@ struct EngineConfig {
     // the whole-voice plan launch chains of such steals lazily. Applied at
     // engine init. Off by default (audio unchanged).
     bool dropZeroLifeVictims;
+    // Experimental: staged steal relaunches with deferred ghost copies (bit-
+    // identical audio). Applied at engine init. Off by default.
+    bool launchStaging;
     // Synth backend routed by the event sink: 0 = SVMS engine (default,
     // in-process), 1 = external SVMS-API DLL, 2 = external KDMAPI DLL,
     // 3 = WinMM MIDI-out device. External backends own their own audio
