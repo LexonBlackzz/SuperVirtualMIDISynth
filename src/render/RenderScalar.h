@@ -606,6 +606,11 @@ private:
                                     uint32_t segFrames, bool isReal,
                                     uint32_t jobIndex, float lfoDepth,
                                     float lfoBendRatio, bool lfoActive);
+    void RenderWholeVoiceRow(VoiceManager& voices, uint32_t handle,
+                             const int16_t* sampleData,
+                             uint32_t sampleDataFrames, float* itemLeft,
+                             float* itemRight, uint32_t frameCount,
+                             uint32_t jobIndex);
     bool RenderWholeVoiceBatch(VoiceSoA& state, VoiceManager& voices,
                                const uint32_t* handles,
                                uint32_t handleCount,
@@ -684,10 +689,15 @@ private:
     uint32_t gpuPartCount_ = 0u;
     uint32_t gpuSubmittedParts_ = 0u;
     std::vector<uint32_t> gpuRefreshHandles_;
-    bool GpuRowBlockOk(const VoiceSoA& v, uint32_t handle,
-                       bool stagedPending) const;
+    // A start or release frame inside the block: the row's block is split at it.
+    bool GpuRowHasTimeline(uint32_t handle) const {
+        return wvStartFrame_[handle] != UINT32_MAX ||
+               wvReleaseFrame_[handle] != UINT32_MAX;
+    }
+    bool GpuRowBlockOk(const VoiceSoA& v, uint32_t handle, bool stagedPending,
+                       bool timelineOk) const;
     uint8_t GpuRowKind(const VoiceSoA& v, uint32_t handle, bool stagedPending,
-                       uint32_t storeFrames) const;
+                       uint32_t storeFrames, bool timelineOk) const;
     static void GpuPassThunk(uint32_t job, const IndexedJobMix& mix,
                              uint32_t frameCount, void* userData);
     void RunGpuPass(GpuPassContext& ctx, float* outputLeft, float* outputRight);

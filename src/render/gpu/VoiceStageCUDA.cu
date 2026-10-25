@@ -326,11 +326,24 @@ static __device__ __forceinline__ void EnvFastFrame(
     }
 }
 
+// The timeline (tlh, one uint4 per handle: start frame, release frame, flags):
+// a row with a start frame renders nothing, and advances nothing, before it;
+// at its release frame it flips to the released machine (stage 0, looping off
+// for SF2 sampleModes 3) exactly where the CPU flips state; a row that is held
+// as a sustained loop until then (kTlPreSustained) runs the scalar sustained
+// span's math up to the flip, which differs from the generic machine in its
+// wrap bookkeeping.  A row without a timeline is {0, 0xFFFFFFFF, 0}.
+#define TL_ACTIVE 0x80000000u
+#define TL_PRE_SUSTAINED 1u
+#define TL_CLEAR_LOOP 2u
+#define FLIPPED_BIT (1u << 28)
+
 extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
     const u32* __restrict__ store, const u32* __restrict__ erows,
     const u32* __restrict__ elist, uint4* __restrict__ edyn,
     u32* __restrict__ state, float* __restrict__ partial, u32 uCount,
-    u32 uFrames, u32 uListBase, u32 uGroupBase, u32 uRetireBits) {
+    u32 uFrames, u32 uListBase, u32 uGroupBase, u32 uRetireBits,
+    const uint4* __restrict__ tlh) {
     __shared__ float shw[2u * BATCH * WARPS * 8u];
     const u32 t = threadIdx.x;
     const u32 g = blockIdx.x;
@@ -344,7 +357,8 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
     float relLoopSF = 0.0f, relLoopEF = 1.0f, phaseInc = 0.0f;
     float mixL = 0.0f, mixR = 0.0f, targetGain = 0.0f, sustainLevel = 0.0f;
     float attackStep = 0.0f, decaySlope = 1.0f, releaseDecay = 1.0f;
-    float a0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+    float a0 = 0.0f, b1 = 0.0f, b2 = 0.0f, heldL = 0.0f, heldR = 0.0f;
+    u32 tlStart = 0u, tlRelease = 0xFFFFFFFFu, tlFlags = 0u;
     u32 handle = 0u;
     if (live) {
         handle = elist[uListBase + idx];
@@ -378,22 +392,41 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
         a0 = Bf(erows[r + 15u]);
         b1 = Bf(erows[r + 16u]);
         b2 = Bf(erows[r + 17u]);
+        heldL = Bf(erows[r + 18u]);
+        heldR = Bf(erows[r + 19u]);
+        const uint4 th = tlh[handle];
+        tlStart = th.x;
+        tlRelease = th.y;
+        tlFlags = th.z;
     }
     const float twoA0 = 2.0f * a0;
     const float kScale = 1.0f / 32768.0f;
     const float retireThreshold = Bf(uRetireBits);
     const u32 kForever = 0xFFFFFFFFu;
+    const bool tlRow = (tlFlags & TL_ACTIVE) != 0u;
+    const bool clearLoop = (tlFlags & TL_CLEAR_LOOP) != 0u;
+    bool preSustained = (tlFlags & TL_PRE_SUSTAINED) != 0u;
+    bool flipped = false;
+    u32 stageAtFlip = 0u;
+    float gainAtFlip = 0.0f;
+    // The sustained span's constants (the held machine reads render gains).
+    const float loopLength = relLoopEF - relLoopSF;
+    const float lastInterior = relLoopEF - 1.0f;
+    const float heldLs = heldL * kScale;
+    const float heldRs = heldR * kScale;
+    u32 runLeft = 0u;
     bool alive = live;
     u32 retire = 0xFFFFFFu;
     const u32 tiles = (uFrames + TILE - 1u) / TILE;
     // Four-frame fast path (released and held-sustained rows): the four frames
     // of the tile are all interior (same sample pair, no wrap, no end of
     // sample), so the loads can be issued up front.  The envelope, filter and
-    // retirement still run frame by frame in the generic machine's order.
+    // retirement still run frame by frame in the generic machine's order.  Rows
+    // with a timeline take the frame-by-frame path below.
     const u32 interiorLimit = loop ? relLoopE : relEnd;
     for (u32 tile = 0u; tile < tiles; ++tile) {
         float ov[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        bool fast = alive && (stage == 0u || stage == 3u) &&
+        bool fast = !tlRow && alive && (stage == 0u || stage == 3u) &&
                     (tile + 1u) * TILE <= uFrames;
         float p1 = 0.0f, p2 = 0.0f, p3 = 0.0f, p4 = 0.0f;
         if (fast) {
@@ -446,73 +479,35 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
                 const u32 n = tile * TILE + k;
                 float oL = 0.0f;
                 float oR = 0.0f;
-                if (alive && n < uFrames) {
-                    u32 base = __float2uint_rz(phase);
-                    bool ended = false;
-                    if (base + 1u >= relEnd) {
-                        if (!loop) {
-                            ended = true;
-                        } else {
-                            phase = relLoopSF;
-                            base = relLoopS;
-                        }
+                if (alive && n < uFrames && n >= tlStart) {
+                    if (n == tlRelease) {
+                        // The exact-frame release flip: what the CPU does when
+                        // it sets the voice Releasing between two segments.
+                        flipped = true;
+                        stageAtFlip = stage;
+                        gainAtFlip = gain;
+                        stage = 0u;
+                        if (clearLoop) loop = false;
+                        preSustained = false;
                     }
-                    if (ended) {
-                        retire = n;
-                        alive = false;
-                    } else {
-                        u32 nextRel = base + 1u;
-                        if (loop && nextRel >= relLoopE) nextRel = relLoopS;
-                        if (nextRel >= relEnd) nextRel = relEnd - 1u;
-                        const float frac = phase - static_cast<float>(base);
-                        const int s0 = Sample16(store, sampleStart + base);
-                        const int s1 = Sample16(store, sampleStart + nextRel);
+                    if (preSustained) {
+                        // The sustained span's frame (the sustained kernel's
+                        // general path): run bookkeeping, edge frames.
+                        u32 first;
+                        float frac;
+                        bool edge;
+                        Classify(true, phase, runLeft, first, frac, edge,
+                                 sampleStart, relLoopE, relLoopSF, relLoopEF,
+                                 loopLength, lastInterior, phaseInc);
+                        const int s0 = Sample16(store, first);
+                        const int s1 = edge
+                            ? Sample16(store, sampleStart + relLoopS)
+                            : Sample16(store, first + 1u);
                         const float d = static_cast<float>(s1 - s0);
                         const float m = d * frac;
                         const float u = static_cast<float>(s0) + m;
-                        bool relFin = false;
-                        if (stage == 0u) {
-                            if (relRem == 0u) {
-                                relFin = true;
-                            } else {
-                                gain *= releaseDecay;
-                                if (relRem != kForever) {
-                                    --relRem;
-                                    relFin = relRem == 0u;
-                                }
-                            }
-                        } else if (stage != 3u) {
-                            if (stage == 1u) {
-                                if (atkRem > 0u) {
-                                    gain += attackStep;
-                                    --atkRem;
-                                    if (gain > targetGain) gain = targetGain;
-                                } else {
-                                    gain = targetGain;
-                                }
-                                if (atkRem == 0u) stage = decRem > 0u ? 2u : 3u;
-                            }
-                            if (stage == 2u) {
-                                if (decRem > 0u) {
-                                    gain *= decaySlope;
-                                    --decRem;
-                                    if (gain < sustainLevel) gain = sustainLevel;
-                                } else {
-                                    gain = sustainLevel;
-                                }
-                                if (decRem == 0u) stage = 3u;
-                            }
-                        }
-                        phase += phaseInc;
-                        if (loop && phase >= relLoopEF) {
-                            float overflow = phase - relLoopEF;
-                            const float loopLength = relLoopEF - relLoopSF;
-                            if (loopLength > 0.0f && overflow >= loopLength)
-                                overflow -= floorf(overflow / loopLength) * loopLength;
-                            phase = relLoopSF + overflow;
-                        }
-                        float smp = u * kScale;
                         if (filt) {
+                            const float smp = u * kScale;
                             const float outv = smp * a0 + z1;
                             const float zin = smp * twoA0 + z2;
                             const float fb1 = b1 * outv;
@@ -521,15 +516,97 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
                             const float fb2 = b2 * outv;
                             z1 = nz1;
                             z2 = zin2 - fb2;
-                            smp = outv;
+                            oL = outv * heldL;
+                            oR = outv * heldR;
+                        } else {
+                            oL = u * heldLs;
+                            oR = u * heldRs;
                         }
-                        const float scaled = smp * gain;
-                        oL = scaled * mixL;
-                        oR = scaled * mixR;
-                        if (relFin || (stage == 0u && relRem == kForever &&
-                                       gain < retireThreshold)) {
+                    } else {
+                        u32 base = __float2uint_rz(phase);
+                        bool ended = false;
+                        if (base + 1u >= relEnd) {
+                            if (!loop) {
+                                ended = true;
+                            } else {
+                                phase = relLoopSF;
+                                base = relLoopS;
+                            }
+                        }
+                        if (ended) {
                             retire = n;
                             alive = false;
+                        } else {
+                            u32 nextRel = base + 1u;
+                            if (loop && nextRel >= relLoopE) nextRel = relLoopS;
+                            if (nextRel >= relEnd) nextRel = relEnd - 1u;
+                            const float frac = phase - static_cast<float>(base);
+                            const int s0 = Sample16(store, sampleStart + base);
+                            const int s1 = Sample16(store, sampleStart + nextRel);
+                            const float d = static_cast<float>(s1 - s0);
+                            const float m = d * frac;
+                            const float u = static_cast<float>(s0) + m;
+                            bool relFin = false;
+                            if (stage == 0u) {
+                                if (relRem == 0u) {
+                                    relFin = true;
+                                } else {
+                                    gain *= releaseDecay;
+                                    if (relRem != kForever) {
+                                        --relRem;
+                                        relFin = relRem == 0u;
+                                    }
+                                }
+                            } else if (stage != 3u) {
+                                if (stage == 1u) {
+                                    if (atkRem > 0u) {
+                                        gain += attackStep;
+                                        --atkRem;
+                                        if (gain > targetGain) gain = targetGain;
+                                    } else {
+                                        gain = targetGain;
+                                    }
+                                    if (atkRem == 0u) stage = decRem > 0u ? 2u : 3u;
+                                }
+                                if (stage == 2u) {
+                                    if (decRem > 0u) {
+                                        gain *= decaySlope;
+                                        --decRem;
+                                        if (gain < sustainLevel) gain = sustainLevel;
+                                    } else {
+                                        gain = sustainLevel;
+                                    }
+                                    if (decRem == 0u) stage = 3u;
+                                }
+                            }
+                            phase += phaseInc;
+                            if (loop && phase >= relLoopEF) {
+                                float overflow = phase - relLoopEF;
+                                const float loopLen = relLoopEF - relLoopSF;
+                                if (loopLen > 0.0f && overflow >= loopLen)
+                                    overflow -= floorf(overflow / loopLen) * loopLen;
+                                phase = relLoopSF + overflow;
+                            }
+                            float smp = u * kScale;
+                            if (filt) {
+                                const float outv = smp * a0 + z1;
+                                const float zin = smp * twoA0 + z2;
+                                const float fb1 = b1 * outv;
+                                const float nz1 = zin - fb1;
+                                const float zin2 = smp * a0;
+                                const float fb2 = b2 * outv;
+                                z1 = nz1;
+                                z2 = zin2 - fb2;
+                                smp = outv;
+                            }
+                            const float scaled = smp * gain;
+                            oL = scaled * mixL;
+                            oR = scaled * mixR;
+                            if (relFin || (stage == 0u && relRem == kForever &&
+                                           gain < retireThreshold)) {
+                                retire = n;
+                                alive = false;
+                            }
                         }
                     }
                 }
@@ -540,10 +617,18 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
         ReduceTile(ov, tile, tiles, t, uGroupBase + g, uFrames, partial, shw);
     }
     if (live) {
+        // A row that left its sustain stage at the flip reports its gain at the
+        // flip in attackRem (the stage's counters are zero), for the CPU's
+        // render-gain bake.
+        const bool gainSlot = flipped && stageAtFlip == 3u;
+        const u32 shownStage = flipped ? stageAtFlip : stage;
         edyn[(static_cast<size_t>(uListBase) + idx) * 2u] =
             make_uint4(Fb(phase), Fb(z1), Fb(z2), Fb(gain));
         edyn[(static_cast<size_t>(uListBase) + idx) * 2u + 1u] =
-            make_uint4((stage << 24u) | (retire & 0xFFFFFFu), atkRem, decRem, relRem);
+            make_uint4((shownStage << 24u) | (flipped ? FLIPPED_BIT : 0u) |
+                           (retire & 0xFFFFFFu),
+                       gainSlot ? Fb(gainAtFlip) : atkRem,
+                       gainSlot ? 0u : decRem, relRem);
         const size_t sb = static_cast<size_t>(handle) * 8u;
         state[sb] = Fb(phase);
         state[sb + 1u] = Fb(z1);
@@ -582,14 +667,15 @@ extern "C" __global__ void svms_scatter(
     for (u32 w = 0u; w < 3u; ++w) state[static_cast<size_t>(h) * 8u + w] = upload[b + 13u + w];
 }
 
-// Envelope row records (32 words).
+// Envelope row records (32 words): statics, dynamic state and the block timeline.
 extern "C" __global__ void svms_env_scatter(
     u32* __restrict__ erows, const u32* __restrict__ eupload,
-    u32* __restrict__ state, u32 uCount, u32 uBase) {
+    u32* __restrict__ state, uint4* __restrict__ tlh, u32 uCount, u32 uBase) {
     const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= uCount) return;
     const size_t b = (static_cast<size_t>(uBase) + i) * 32u;
     const u32 h = eupload[b];
     for (u32 w = 0u; w < 20u; ++w) erows[static_cast<size_t>(h) * 20u + w] = eupload[b + 1u + w];
     for (u32 w = 0u; w < 8u; ++w) state[static_cast<size_t>(h) * 8u + w] = eupload[b + 21u + w];
+    tlh[h] = make_uint4(eupload[b + 29u], eupload[b + 30u], eupload[b + 31u], 0u);
 }

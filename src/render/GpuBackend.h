@@ -59,26 +59,48 @@ static_assert(sizeof(DynOut) == 16u, "DynOut is one vec4");
 //   1 flags: bit0 filter,    8 mixGainL (float)      15 filterA0 (float)
 //     bit1 loop              9 mixGainR (float)      16 filterB1 (float)
 //   2 relEnd                10 targetGain (float)    17 filterB2 (float)
-//   3 relLoopS              11 sustainLevel (float)  18, 19 reserved
+//   3 relLoopS              11 sustainLevel (float)  18, 19 see below
 //   4 relLoopE              12 attackStep (float)
 //   5 relLoopSF (float)     13 decaySlope (float)
 //   6 relLoopEF (float)
+//   18, 19 renderGainL/R (float): the gains of a row that renders as a held
+//     sustained loop until its release frame (kTlPreSustained).
 constexpr uint32_t kEnvRowWords = 20u;
 constexpr uint32_t kEnvFlagFilter = 1u;
 constexpr uint32_t kEnvFlagLoop = 2u;
 
+// Timeline of an envelope row inside the block (EnvUploadRecord::timeline):
+//   [0] startFrame: nothing renders (and no state advances) before it
+//   [1] releaseFrame: the row flips to its release at this frame
+//       (kNoReleaseFrame = none)
+//   [2] flags: kTlActive when the row has a start or release frame, plus
+//       kTlPreSustained (frames before the release run the held sustained-loop
+//       machine, the one the CPU's sustained span uses) and kTlClearLoop (the
+//       release also ends looping: SF2 sampleModes 3)
+// A row without a timeline carries {0, kNoReleaseFrame, 0}.  Rows whose
+// timeline changes every block are re-uploaded every block.
+constexpr uint32_t kNoReleaseFrame = 0xFFFFFFFFu;
+constexpr uint32_t kTlActive = 0x80000000u;
+constexpr uint32_t kTlPreSustained = 1u;
+constexpr uint32_t kTlClearLoop = 2u;
+
 // Envelope upload record (128 B): handle, static words, initial dynamic
-// state (kDynWords words, layout above).
+// state (kDynWords words, layout above), the block timeline.
 struct EnvUploadRecord {
     uint32_t handle;
     uint32_t words[kEnvRowWords];
     uint32_t dyn[kDynWords];
-    uint32_t pad[3];
+    uint32_t timeline[3];
 };
 static_assert(sizeof(EnvUploadRecord) == 128u, "EnvUploadRecord is 32 words");
 
 // Read back per envelope row.  stageRetire: bits 24..27 the stage code after
-// the block, bits 0..23 the frame the voice retired on (kEnvNoRetire = none).
+// the block (for a row that flipped to its release inside the block: the stage
+// it had at the flip), bit 28 set when the row flipped to its release at its
+// timeline frame, bits 0..23 the frame the voice retired on (kEnvNoRetire =
+// none).  A row that flipped out of the sustain stage reports its gain at the
+// flip in attackRem (both attackRem and decayRem are zero there).
+constexpr uint32_t kEnvFlipped = 1u << 28;
 constexpr uint32_t kEnvNoRetire = 0xFFFFFFu;
 struct EnvDynOut {
     float phase;
@@ -158,6 +180,11 @@ public:
 
     virtual const char* Name() const = 0;
     virtual uint32_t MaxVoices() const { return 0u; }
+
+    // True when the envelope kernel honors EnvUploadRecord::timeline (rows with
+    // a start and/or release frame inside the block).  A backend without it only
+    // takes rows that span the whole block.
+    virtual bool SupportsTimeline() const { return false; }
 };
 
 // Selector values for synth.gpu_api (0 = off).

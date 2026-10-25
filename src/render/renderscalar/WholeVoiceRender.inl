@@ -276,6 +276,217 @@ inline void RenderScalar::RenderGhostTailSpan(uint32_t ghost, VoiceSoA& s,
     if (s.rot != nullptr) wvGhostTails_[ghost].rot = s.stealTailRot[0];
 }
 
+// One real voice's whole-block timeline on the CPU: the start frame, the
+// exact-frame release flip, channel-op windows, re-excite hits and vibrato
+// windows split it into segments, each rendered by the class kernel.  The
+// worker jobs call it per item; the GPU stage calls it for the rows of a late
+// block.  `jobIndex` picks the retirement buffer the row's retirements go to.
+inline void RenderScalar::RenderWholeVoiceRow(
+    VoiceManager& voices, uint32_t handle, const int16_t* sampleData,
+    uint32_t sampleDataFrames, float* itemLeft, float* itemRight,
+    uint32_t frameCount, uint32_t jobIndex) {
+    VoiceSoA& v = voices.v;
+    uint32_t start = wvStartFrame_[handle];
+    if (start == UINT32_MAX) start = 0u;
+    uint32_t releaseFrame = wvReleaseFrame_[handle];
+    // Channel row-op window: bend/mix/vibrato ops at frames inside
+    // the voice's timeline split it exactly where the frame-major
+    // renderers fold/bend inline at their dispatch boundaries.
+    const uint8_t opChannelRaw = v.channel[handle];
+    const uint32_t opChannel =
+        opChannelRaw < kChannelCount ? opChannelRaw : kChannelCount;
+    uint32_t opIdx = wvChanOpStart_[opChannel];
+    const uint32_t opEnd = wvChanOpStart_[opChannel + 1];
+    // Per-row vibrato/bend cursors: depth and bend ratio start from
+    // the block-start channel snapshot and follow the op log.  Ops
+    // skipped below (before the voice's window, or dispatched
+    // before its same-frame launch) are already baked into the
+    // row's configure-time state — tracking them keeps the cursors
+    // truthful for later LFO window rebuilds.
+    float vDepth = wvChanStartDepth_[opChannel];
+    float vRatio;
+    {
+        const float rowScale = v.pitchBendScales[handle];
+        const float startRatio =
+            wvChanStartBendRatio_[opChannel];
+        vRatio = rowScale == 1.0f && startRatio > 0.0f
+            ? startRatio
+            : powf(2.0f, wvChanStartBendCents_[opChannel] *
+                              rowScale / 1200.0f);
+    }
+    while (opIdx < opEnd &&
+           wvChanOps_[opIdx].frame < start) {
+        const WholeVoiceChannelOp& op =
+            wvChanOps_[opIdx];
+        if (op.kind == 2u) {
+            vDepth = op.a;
+        } else if (op.kind == 0u) {
+            const float scale = v.pitchBendScales[handle];
+            vRatio = scale == 1.0f ? op.b
+                : powf(2.0f, op.a * scale / 12.0f);
+        }
+        ++opIdx;
+    }
+    // Same-frame qualification: an op dispatched in the same frame
+    // BEFORE this voice's launch never observed it (the voice reads
+    // the fresh channel state at configure time instead).  Carried
+    // over voices (UINT32_MAX) hear every op in the block.
+    const uint32_t startIngress = wvStartIngress_[handle];
+    if (startIngress != UINT32_MAX) {
+        while (opIdx < opEnd &&
+               wvChanOps_[opIdx].frame == start &&
+               wvChanOps_[opIdx].ingress < startIngress) {
+            const WholeVoiceChannelOp& op =
+                wvChanOps_[opIdx];
+            if (op.kind == 2u) {
+                vDepth = op.a;
+            } else if (op.kind == 0u) {
+                const float scale = v.pitchBendScales[handle];
+                vRatio = scale == 1.0f ? op.b
+                    : powf(2.0f, op.a * scale / 12.0f);
+            }
+            ++opIdx;
+        }
+    }
+    // Re-excite hits on this generation, in frame order: each one
+    // splits the timeline and restarts the row's envelope at its
+    // exact frame, before the release flip a later-ordinal note-off
+    // may land on the same frame (an earlier one would have unlinked
+    // the voice from the key chain, so no hit exists for it).
+    uint32_t exIdx = UINT32_MAX;
+    const uint32_t rowPlayIndex = v.playIndex[handle];
+    if (wvExciteHead_ != nullptr &&
+        handle < wvExciteCapacity_) {
+        exIdx = WholeVoiceSkipForeignExcites(
+            wvExciteHead_[handle], rowPlayIndex);
+    }
+    const uint32_t exciteFrames =
+        voices.ReExciteAttackFrames();
+    if (exIdx != UINT32_MAX) {
+        // Undo the pre-pass overlay: render from the block-start
+        // envelope and replay each hit at its exact frame.
+        const WholeVoiceExcite& first = wvExcites_[exIdx];
+        v.envelopeStage[handle] = first.savedStage;
+        v.attackSamplesRemaining[handle] = first.savedAttackRemaining;
+        v.decaySamplesRemaining[handle] = first.savedDecayRemaining;
+        v.attackGainStep[handle] = first.savedAttackStep;
+    }
+    // A hit that lands while the previous hit's attack ramp is still
+    // running changes nothing (the stage is already attack), so it
+    // neither splits the timeline nor needs replaying: a flood of
+    // repeats costs one segment per ramp, not one per hit.
+    uint32_t exSkipUntil = 0u;
+    uint32_t cursor = start;
+    while (cursor < frameCount) {
+        while (exIdx != UINT32_MAX &&
+               wvExcites_[exIdx].frame < exSkipUntil) {
+            exIdx = WholeVoiceSkipForeignExcites(
+                wvExcites_[exIdx].next, rowPlayIndex);
+        }
+        uint32_t stop = frameCount;
+        if (releaseFrame != UINT32_MAX && releaseFrame < stop)
+            stop = releaseFrame;
+        if (opIdx < opEnd &&
+            wvChanOps_[opIdx].frame < stop)
+            stop = wvChanOps_[opIdx].frame;
+        if (exIdx != UINT32_MAX &&
+            wvExcites_[exIdx].frame < stop)
+            stop = wvExcites_[exIdx].frame;
+        if (stop > cursor) {
+            // Vibrato gating per segment (only on channels where a
+            // depth exists at block start or arrives mid-block): an
+            // LFO-bearing row renders with kernel-internal 64-frame
+            // windows while its channel depth is positive (the
+            // kernels advance the free-running LFO phase); while
+            // delayed or unmodulated the phase free-runs linearly
+            // here instead.  A delay that exhausts mid-segment
+            // splits the segment so the modulation wakes at its
+            // exact frame.
+            bool lfoActive = false;
+            uint32_t segFrames = stop - cursor;
+            if (!wvScalarVibrato_ && !wvScalarNoVibrato_ &&
+                wvChanVibratoActive_[opChannel] &&
+                v.vibLfoSteps[handle] != 0.0f &&
+                v.vibLfoToPitchCents[handle] > 0.0f) {
+                const uint32_t delay = v.vibLfoDelays[handle];
+                if (delay != 0u) {
+                    if (delay >= segFrames) {
+                        v.vibLfoDelays[handle] = delay - segFrames;
+                    } else {
+                        v.vibLfoDelays[handle] = 0u;
+                        stop = cursor + delay;
+                        segFrames = delay;
+                    }
+                } else if (vDepth > 0.0f) {
+                    lfoActive = true;
+                } else {
+                    float lp = v.vibLfoPhases[handle] +
+                        v.vibLfoSteps[handle] *
+                            static_cast<float>(segFrames);
+                    lp -= std::floor(lp);
+                    v.vibLfoPhases[handle] = lp;
+                }
+            }
+            if (RenderWholeVoiceSegmentLfo(
+                    v, &voices, handle, sampleData,
+                    sampleDataFrames, itemLeft, itemRight,
+                    cursor, stop - cursor, true, jobIndex,
+                    vDepth, vRatio, lfoActive)) {
+                break;  // retired; coordinator applies it
+            }
+            cursor = stop;
+        }
+        while (exIdx != UINT32_MAX &&
+               wvExcites_[exIdx].frame <= cursor) {
+            if (wvExcites_[exIdx].frame == cursor &&
+                cursor >= exSkipUntil) {
+                ExciteVoiceRow(v, handle, exciteFrames);
+                if (v.envelopeStage[handle] == 1u &&
+                    v.attackSamplesRemaining[handle] != 0u) {
+                    exSkipUntil =
+                        cursor + v.attackSamplesRemaining[handle];
+                }
+            }
+            exIdx = WholeVoiceSkipForeignExcites(
+                wvExcites_[exIdx].next, rowPlayIndex);
+        }
+        if (releaseFrame != UINT32_MAX && cursor == releaseFrame &&
+            cursor < frameCount) {
+            // Exact-frame deferred release flip.
+            v.state[handle] =
+                static_cast<uint8_t>(VoiceState::Releasing);
+            if (v.loopMode[handle] == 3u)
+                v.loopEnabled[handle] = 0u;
+            releaseFrame = UINT32_MAX;
+        }
+        // Apply every op landing on this frame (ingress order).
+        while (opIdx < opEnd &&
+               wvChanOps_[opIdx].frame == cursor) {
+            const WholeVoiceChannelOp& op =
+                wvChanOps_[opIdx];
+            if (op.kind == 2u) {
+                vDepth = op.a;
+                if (!(vDepth > 0.0f) &&
+                    v.vibLfoModulated[handle] != 0u) {
+                    // Modulation ended: restore the exact
+                    // unmodulated increment once.
+                    v.vibLfoModulated[handle] = 0u;
+                    v.phaseIncs[handle] =
+                        v.basePhaseIncs[handle] * vRatio;
+                }
+            } else {
+                if (op.kind == 0u) {
+                    const float scale = v.pitchBendScales[handle];
+                    vRatio = scale == 1.0f ? op.b
+                        : powf(2.0f, op.a * scale / 12.0f);
+                }
+                ApplyWholeVoiceRowOp(v, handle, op);
+            }
+            ++opIdx;
+        }
+    }
+}
+
 inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                                              const IndexedJobMix& mix,
                                              uint32_t frameCount,
@@ -430,205 +641,9 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 itemLeft = mix.busLeft[safeChannel];
                 itemRight = mix.busRight[safeChannel];
             }
-            uint32_t start = renderer->wvStartFrame_[handle];
-            if (start == UINT32_MAX) start = 0u;
-            uint32_t releaseFrame = renderer->wvReleaseFrame_[handle];
-            // Channel row-op window: bend/mix/vibrato ops at frames inside
-            // the voice's timeline split it exactly where the frame-major
-            // renderers fold/bend inline at their dispatch boundaries.
-            const uint8_t opChannelRaw = v.channel[handle];
-            const uint32_t opChannel =
-                opChannelRaw < kChannelCount ? opChannelRaw : kChannelCount;
-            uint32_t opIdx = renderer->wvChanOpStart_[opChannel];
-            const uint32_t opEnd = renderer->wvChanOpStart_[opChannel + 1];
-            // Per-row vibrato/bend cursors: depth and bend ratio start from
-            // the block-start channel snapshot and follow the op log.  Ops
-            // skipped below (before the voice's window, or dispatched
-            // before its same-frame launch) are already baked into the
-            // row's configure-time state — tracking them keeps the cursors
-            // truthful for later LFO window rebuilds.
-            float vDepth = renderer->wvChanStartDepth_[opChannel];
-            float vRatio;
-            {
-                const float rowScale = v.pitchBendScales[handle];
-                const float startRatio =
-                    renderer->wvChanStartBendRatio_[opChannel];
-                vRatio = rowScale == 1.0f && startRatio > 0.0f
-                    ? startRatio
-                    : powf(2.0f, renderer->wvChanStartBendCents_[opChannel] *
-                                      rowScale / 1200.0f);
-            }
-            while (opIdx < opEnd &&
-                   renderer->wvChanOps_[opIdx].frame < start) {
-                const WholeVoiceChannelOp& op =
-                    renderer->wvChanOps_[opIdx];
-                if (op.kind == 2u) {
-                    vDepth = op.a;
-                } else if (op.kind == 0u) {
-                    const float scale = v.pitchBendScales[handle];
-                    vRatio = scale == 1.0f ? op.b
-                        : powf(2.0f, op.a * scale / 12.0f);
-                }
-                ++opIdx;
-            }
-            // Same-frame qualification: an op dispatched in the same frame
-            // BEFORE this voice's launch never observed it (the voice reads
-            // the fresh channel state at configure time instead).  Carried
-            // over voices (UINT32_MAX) hear every op in the block.
-            const uint32_t startIngress = renderer->wvStartIngress_[handle];
-            if (startIngress != UINT32_MAX) {
-                while (opIdx < opEnd &&
-                       renderer->wvChanOps_[opIdx].frame == start &&
-                       renderer->wvChanOps_[opIdx].ingress < startIngress) {
-                    const WholeVoiceChannelOp& op =
-                        renderer->wvChanOps_[opIdx];
-                    if (op.kind == 2u) {
-                        vDepth = op.a;
-                    } else if (op.kind == 0u) {
-                        const float scale = v.pitchBendScales[handle];
-                        vRatio = scale == 1.0f ? op.b
-                            : powf(2.0f, op.a * scale / 12.0f);
-                    }
-                    ++opIdx;
-                }
-            }
-            // Re-excite hits on this generation, in frame order: each one
-            // splits the timeline and restarts the row's envelope at its
-            // exact frame, before the release flip a later-ordinal note-off
-            // may land on the same frame (an earlier one would have unlinked
-            // the voice from the key chain, so no hit exists for it).
-            uint32_t exIdx = UINT32_MAX;
-            const uint32_t rowPlayIndex = v.playIndex[handle];
-            if (renderer->wvExciteHead_ != nullptr &&
-                handle < renderer->wvExciteCapacity_) {
-                exIdx = renderer->WholeVoiceSkipForeignExcites(
-                    renderer->wvExciteHead_[handle], rowPlayIndex);
-            }
-            const uint32_t exciteFrames =
-                ctx->voices->ReExciteAttackFrames();
-            if (exIdx != UINT32_MAX) {
-                // Undo the pre-pass overlay: render from the block-start
-                // envelope and replay each hit at its exact frame.
-                const WholeVoiceExcite& first = renderer->wvExcites_[exIdx];
-                v.envelopeStage[handle] = first.savedStage;
-                v.attackSamplesRemaining[handle] = first.savedAttackRemaining;
-                v.decaySamplesRemaining[handle] = first.savedDecayRemaining;
-                v.attackGainStep[handle] = first.savedAttackStep;
-            }
-            // A hit that lands while the previous hit's attack ramp is still
-            // running changes nothing (the stage is already attack), so it
-            // neither splits the timeline nor needs replaying: a flood of
-            // repeats costs one segment per ramp, not one per hit.
-            uint32_t exSkipUntil = 0u;
-            uint32_t cursor = start;
-            while (cursor < frameCount) {
-                while (exIdx != UINT32_MAX &&
-                       renderer->wvExcites_[exIdx].frame < exSkipUntil) {
-                    exIdx = renderer->WholeVoiceSkipForeignExcites(
-                        renderer->wvExcites_[exIdx].next, rowPlayIndex);
-                }
-                uint32_t stop = frameCount;
-                if (releaseFrame != UINT32_MAX && releaseFrame < stop)
-                    stop = releaseFrame;
-                if (opIdx < opEnd &&
-                    renderer->wvChanOps_[opIdx].frame < stop)
-                    stop = renderer->wvChanOps_[opIdx].frame;
-                if (exIdx != UINT32_MAX &&
-                    renderer->wvExcites_[exIdx].frame < stop)
-                    stop = renderer->wvExcites_[exIdx].frame;
-                if (stop > cursor) {
-                    // Vibrato gating per segment (only on channels where a
-                    // depth exists at block start or arrives mid-block): an
-                    // LFO-bearing row renders with kernel-internal 64-frame
-                    // windows while its channel depth is positive (the
-                    // kernels advance the free-running LFO phase); while
-                    // delayed or unmodulated the phase free-runs linearly
-                    // here instead.  A delay that exhausts mid-segment
-                    // splits the segment so the modulation wakes at its
-                    // exact frame.
-                    bool lfoActive = false;
-                    uint32_t segFrames = stop - cursor;
-                    if (!renderer->wvScalarVibrato_ && !renderer->wvScalarNoVibrato_ &&
-                        renderer->wvChanVibratoActive_[opChannel] &&
-                        v.vibLfoSteps[handle] != 0.0f &&
-                        v.vibLfoToPitchCents[handle] > 0.0f) {
-                        const uint32_t delay = v.vibLfoDelays[handle];
-                        if (delay != 0u) {
-                            if (delay >= segFrames) {
-                                v.vibLfoDelays[handle] = delay - segFrames;
-                            } else {
-                                v.vibLfoDelays[handle] = 0u;
-                                stop = cursor + delay;
-                                segFrames = delay;
-                            }
-                        } else if (vDepth > 0.0f) {
-                            lfoActive = true;
-                        } else {
-                            float lp = v.vibLfoPhases[handle] +
-                                v.vibLfoSteps[handle] *
-                                    static_cast<float>(segFrames);
-                            lp -= std::floor(lp);
-                            v.vibLfoPhases[handle] = lp;
-                        }
-                    }
-                    if (renderer->RenderWholeVoiceSegmentLfo(
-                            v, ctx->voices, handle, ctx->sampleData,
-                            ctx->sampleDataFrames, itemLeft, itemRight,
-                            cursor, stop - cursor, true, jobIndex,
-                            vDepth, vRatio, lfoActive)) {
-                        break;  // retired; coordinator applies it
-                    }
-                    cursor = stop;
-                }
-                while (exIdx != UINT32_MAX &&
-                       renderer->wvExcites_[exIdx].frame <= cursor) {
-                    if (renderer->wvExcites_[exIdx].frame == cursor &&
-                        cursor >= exSkipUntil) {
-                        ExciteVoiceRow(v, handle, exciteFrames);
-                        if (v.envelopeStage[handle] == 1u &&
-                            v.attackSamplesRemaining[handle] != 0u) {
-                            exSkipUntil =
-                                cursor + v.attackSamplesRemaining[handle];
-                        }
-                    }
-                    exIdx = renderer->WholeVoiceSkipForeignExcites(
-                        renderer->wvExcites_[exIdx].next, rowPlayIndex);
-                }
-                if (releaseFrame != UINT32_MAX && cursor == releaseFrame &&
-                    cursor < frameCount) {
-                    // Exact-frame deferred release flip.
-                    v.state[handle] =
-                        static_cast<uint8_t>(VoiceState::Releasing);
-                    if (v.loopMode[handle] == 3u)
-                        v.loopEnabled[handle] = 0u;
-                    releaseFrame = UINT32_MAX;
-                }
-                // Apply every op landing on this frame (ingress order).
-                while (opIdx < opEnd &&
-                       renderer->wvChanOps_[opIdx].frame == cursor) {
-                    const WholeVoiceChannelOp& op =
-                        renderer->wvChanOps_[opIdx];
-                    if (op.kind == 2u) {
-                        vDepth = op.a;
-                        if (!(vDepth > 0.0f) &&
-                            v.vibLfoModulated[handle] != 0u) {
-                            // Modulation ended: restore the exact
-                            // unmodulated increment once.
-                            v.vibLfoModulated[handle] = 0u;
-                            v.phaseIncs[handle] =
-                                v.basePhaseIncs[handle] * vRatio;
-                        }
-                    } else {
-                        if (op.kind == 0u) {
-                            const float scale = v.pitchBendScales[handle];
-                            vRatio = scale == 1.0f ? op.b
-                                : powf(2.0f, op.a * scale / 12.0f);
-                        }
-                        renderer->ApplyWholeVoiceRowOp(v, handle, op);
-                    }
-                    ++opIdx;
-                }
-            }
+            renderer->RenderWholeVoiceRow(*ctx->voices, handle, ctx->sampleData,
+                                ctx->sampleDataFrames, itemLeft, itemRight,
+                                frameCount, jobIndex);
         } else {
             const uint32_t ghost = item - ctx->voiceItemCount;
             if (ghost >= renderer->wvGhostCount_) continue;

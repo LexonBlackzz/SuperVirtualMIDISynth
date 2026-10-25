@@ -211,8 +211,11 @@ void RunGpuStageWrapSweep(svms::GpuStage& stage) {
 
 // Events, ops, steals and releases around GPU rows: every block mixes rows
 // that enter and leave the GPU set; one block is forced late (CPU fallback)
-// and one bumps the epoch (full re-upload).
-void RunGpuStageEventDifferential(svms::GpuStage& stage) {
+// and one bumps the epoch (full re-upload).  Without ops (note on/off and
+// All Notes Off only) almost every row has a start or release frame in its
+// block, so a backend that honors the timeline renders them on the GPU: the
+// run then must show timeline rows and still match the oracle, state and all.
+void RunGpuStageEventDifferential(svms::GpuStage& stage, bool opsEnabled) {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 10u;
     constexpr uint32_t kPool = 64u;
@@ -252,6 +255,8 @@ void RunGpuStageEventDifferential(svms::GpuStage& stage) {
     oracle.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent, &oracleContext);
     whole.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent, &wholeContext);
     const uint64_t rowsBefore = stage.Stats().rows;
+    const uint64_t envBefore = stage.Stats().envRows;
+    const uint64_t timelineBefore = stage.Stats().timelineRows;
     const uint64_t lateBefore = stage.Stats().late;
     const uint64_t uploadsBefore = stage.Stats().uploads;
 
@@ -269,7 +274,8 @@ void RunGpuStageEventDifferential(svms::GpuStage& stage) {
             // Blocks 1 and 4 have no events at all: pure GPU blocks after a
             // block of ops, which re-uploads the rows those ops touched.
             if (block == 1u || block == 4u) continue;
-            const uint32_t roll = rng.Next() % 8u;
+            uint32_t roll = rng.Next() % 8u;
+            if (!opsEnabled && (roll == 5u || roll == 6u)) roll -= 2u;
             if (roll < 3u) {
                 event.type = svms::RenderEventType::NoteOn;
                 event.data1 = static_cast<uint8_t>(36u + rng.Next() % 72u);
@@ -312,11 +318,20 @@ void RunGpuStageEventDifferential(svms::GpuStage& stage) {
     }
     const svms::GpuStageStats& stats = stage.Stats();
     std::fprintf(stderr,
-        "[GPUDIFF] events max=%g gpu-rows=%llu uploads=%llu late=%llu\n",
-        maxDiff, static_cast<unsigned long long>(stats.rows - rowsBefore),
+        "[GPUDIFF] events%s max=%g gpu-rows=%llu env-rows=%llu timeline-rows=%llu "
+        "uploads=%llu late=%llu\n",
+        opsEnabled ? "" : " (no ops)", maxDiff,
+        static_cast<unsigned long long>(stats.rows - rowsBefore),
+        static_cast<unsigned long long>(stats.envRows - envBefore),
+        static_cast<unsigned long long>(stats.timelineRows - timelineBefore),
         static_cast<unsigned long long>(stats.uploads - uploadsBefore),
         static_cast<unsigned long long>(stats.late - lateBefore));
-    Check(stats.rows > rowsBefore, "gpu event differential used the GPU");
+    Check(stats.rows > rowsBefore || stats.envRows > envBefore,
+          "gpu event differential used the GPU");
+    if (!opsEnabled && stage.SupportsTimeline()) {
+        Check(stats.timelineRows > timelineBefore,
+              "gpu event differential rendered rows with start/release frames on the GPU");
+    }
     Check(stats.late - lateBefore == 1u, "forced-late block fell back to the CPU");
     Check(maxDiff <= g_waveTol, "gpu stage blocks with events match the oracle");
     CheckWholeVoiceStateParity(*oracleVoices, *wholeVoices, "gpu-stage");
@@ -509,6 +524,169 @@ void RunGpuStageEnvelopeDifferential(svms::GpuStage& stage, uint32_t poolSize,
     Check(listMismatch == 0u, "gpu envelope retirements match the scalar renderer");
 }
 
+// Rows that start and/or release inside the block: note-ons launch transient
+// voices at their exact frames, note-offs release both the immortal sustained
+// loops and the fresh launches, All Notes Off releases the rest.  The GPU
+// (which splits those rows at the frame itself) must match the CPU
+// whole-voice renderer on the same event stream: every piece of state
+// bit-equal per voice (matched by play index), the same voices alive, audio
+// within the oracle tolerance.  One block is forced late (the CPU renders the
+// timeline rows), one bumps the epoch.
+void RunGpuStageTimelineDifferential(svms::GpuStage& stage, uint32_t poolSize,
+                                     uint32_t seedCount, uint32_t frames,
+                                     uint32_t blocks, uint32_t renderThreads,
+                                     uint32_t eventsPerBlock) {
+    std::vector<int16_t> samples;
+    FillGpuTestSamples(samples);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+    auto seedVoices = std::make_unique<svms::VoiceManager>();
+    ConfigureGpuSeedPool(*seedVoices, seedChannels, poolSize, seedCount, false);
+    stage.BumpEpoch();
+    auto cpuVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    auto gpuVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    svms::ChannelCache cpuChannels = seedChannels;
+    svms::ChannelCache gpuChannels = seedChannels;
+    svms::RenderScalar cpu;
+    svms::RenderScalar gpu;
+    Check(cpu.ReserveVoiceCapacity(poolSize) && gpu.ReserveVoiceCapacity(poolSize) &&
+              cpu.ConfigureRenderThreads(1u, frames) &&
+              gpu.ConfigureRenderThreads(renderThreads, frames) &&
+              cpu.SetRenderBackend(svms::RenderBackend::Scalar) &&
+              gpu.SetRenderBackend(svms::RenderBackend::Scalar),
+          "gpu timeline differential starts its renderers");
+    gpu.SetGpuStage(&stage);
+    WholeVoiceCCContext cpuContext{cpuVoices.get(), &cpuChannels,
+                                   cpuChannels.GetParams(), &cfg};
+    WholeVoiceCCContext gpuContext{gpuVoices.get(), &gpuChannels,
+                                   gpuChannels.GetParams(), &cfg};
+    cpuContext.ResetMasterState();
+    gpuContext.ResetMasterState();
+    cpu.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent, &cpuContext);
+    gpu.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent, &gpuContext);
+    const uint64_t timelineBefore = stage.Stats().timelineRows;
+    const uint64_t envBefore = stage.Stats().envRows;
+    const uint64_t lateBefore = stage.Stats().late;
+
+    WholeVoiceRng rng;
+    float maxDiff = 0.0f;
+    uint32_t stateMismatch = 0u;
+    uint32_t identityMismatch = 0u;
+    for (uint32_t block = 0; block < blocks; ++block) {
+        if (block == 3u) stage.ForceLateForTest(1u);
+        if (block == 5u) stage.BumpEpoch();
+        std::vector<svms::RenderEvent> events;
+        for (uint32_t j = 0; j < eventsPerBlock; ++j) {
+            svms::RenderEvent event{};
+            event.channel = static_cast<uint8_t>(rng.Next() % 4u);
+            event.frameOffset = rng.Next() % frames;
+            event.ingressSequence = block * eventsPerBlock + j;
+            const uint32_t roll = rng.Next() % 16u;
+            if (roll < 7u) {
+                event.type = svms::RenderEventType::NoteOn;
+                event.data1 = static_cast<uint8_t>(48u + rng.Next() % 24u);
+                event.data2 = static_cast<uint8_t>(64u + rng.Next() % 64u);
+            } else if (roll < 15u) {
+                event.type = svms::RenderEventType::NoteOff;
+                event.data1 = static_cast<uint8_t>(48u + rng.Next() % 24u);
+            } else {
+                event.type = svms::RenderEventType::ControlChange;
+                event.data1 = 123u;
+            }
+            events.push_back(event);
+        }
+        std::stable_sort(events.begin(), events.end(),
+            [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                return a.frameOffset < b.frameOffset;
+            });
+        std::vector<float> cl(frames, 0.0f), cr(frames, 0.0f);
+        std::vector<float> gl(frames, 0.0f), gr(frames, 0.0f);
+        const uint64_t start = 20000u + static_cast<uint64_t>(block) * frames;
+        cpu.RenderBlock(*cpuVoices, cpuChannels, samples.data(), 4096u,
+                        cl.data(), cr.data(), frames, cfg, events.data(),
+                        static_cast<uint32_t>(events.size()), true, start);
+        gpu.RenderBlock(*gpuVoices, gpuChannels, samples.data(), 4096u,
+                        gl.data(), gr.data(), frames, cfg, events.data(),
+                        static_cast<uint32_t>(events.size()), true, start);
+        for (uint32_t f = 0; f < frames; ++f) {
+            maxDiff = (std::max)(maxDiff, std::fabs(cl[f] - gl[f]));
+            maxDiff = (std::max)(maxDiff, std::fabs(cr[f] - gr[f]));
+        }
+        // Same voices alive, matched by play index (slot recycling can differ).
+        if (cpuVoices->activeCount_ != gpuVoices->activeCount_) {
+            ++identityMismatch;
+            continue;
+        }
+        for (uint32_t i = 0; i < cpuVoices->activeCount_; ++i) {
+            const uint32_t h = cpuVoices->activeList_[i];
+            uint32_t g = UINT32_MAX;
+            for (uint32_t k = 0; k < gpuVoices->activeCount_; ++k) {
+                const uint32_t cand = gpuVoices->activeList_[k];
+                if (gpuVoices->v.playIndex[cand] == cpuVoices->v.playIndex[h]) {
+                    g = cand;
+                    break;
+                }
+            }
+            if (g == UINT32_MAX) { ++identityMismatch; continue; }
+            const svms::VoiceSoA& a = cpuVoices->v;
+            const svms::VoiceSoA& b = gpuVoices->v;
+            const bool same =
+                std::memcmp(&a.phases[h], &b.phases[g], sizeof(float)) == 0 &&
+                std::memcmp(&a.currentGain[h], &b.currentGain[g], sizeof(float)) == 0 &&
+                std::memcmp(&a.filterZ1[h], &b.filterZ1[g], sizeof(float)) == 0 &&
+                std::memcmp(&a.filterZ2[h], &b.filterZ2[g], sizeof(float)) == 0 &&
+                std::memcmp(&a.renderGainL[h], &b.renderGainL[g], sizeof(float)) == 0 &&
+                std::memcmp(&a.renderGainR[h], &b.renderGainR[g], sizeof(float)) == 0 &&
+                a.state[h] == b.state[g] &&
+                a.loopEnabled[h] == b.loopEnabled[g] &&
+                a.envelopeStage[h] == b.envelopeStage[g] &&
+                a.attackSamplesRemaining[h] == b.attackSamplesRemaining[g] &&
+                a.decaySamplesRemaining[h] == b.decaySamplesRemaining[g] &&
+                a.releaseSamplesRemaining[h] == b.releaseSamplesRemaining[g];
+            if (!same && stateMismatch++ < 6u) {
+                std::fprintf(stderr,
+                    "[GPUDIFF] timeline block %u play %u: state %u/%u phase %g/%g "
+                    "gain %g/%g stage %u/%u atk %u/%u dec %u/%u rel %u/%u "
+                    "rgL %g/%g loop %u/%u\n",
+                    block, a.playIndex[h], a.state[h], b.state[g], a.phases[h],
+                    b.phases[g], a.currentGain[h], b.currentGain[g],
+                    a.envelopeStage[h], b.envelopeStage[g],
+                    a.attackSamplesRemaining[h], b.attackSamplesRemaining[g],
+                    a.decaySamplesRemaining[h], b.decaySamplesRemaining[g],
+                    a.releaseSamplesRemaining[h], b.releaseSamplesRemaining[g],
+                    a.renderGainL[h], b.renderGainL[g], a.loopEnabled[h],
+                    b.loopEnabled[g]);
+            }
+        }
+    }
+    const svms::GpuStageStats& stats = stage.Stats();
+    std::fprintf(stderr,
+        "[GPUDIFF] timeline pool=%u frames=%u blocks=%u threads=%u audio max=%g "
+        "state-mismatch=%u identity-mismatch=%u timeline-rows=%llu env-rows=%llu "
+        "active=%u late=%llu launches=%u\n",
+        poolSize, frames, blocks, renderThreads, maxDiff, stateMismatch,
+        identityMismatch,
+        static_cast<unsigned long long>(stats.timelineRows - timelineBefore),
+        static_cast<unsigned long long>(stats.envRows - envBefore),
+        cpuVoices->activeCount_,
+        static_cast<unsigned long long>(stats.late - lateBefore),
+        gpuContext.launches);
+    if (stage.SupportsTimeline()) {
+        Check(stats.timelineRows > timelineBefore,
+              "gpu timeline differential rendered start/release rows on the GPU");
+    }
+    Check(stats.late - lateBefore >= 1u,
+          "gpu timeline differential's forced-late block fell back to the CPU");
+    Check(maxDiff <= g_waveTol, "gpu timeline audio matches the CPU renderer");
+    Check(stateMismatch == 0u, "gpu timeline state is bit-equal to the CPU renderer");
+    Check(identityMismatch == 0u, "gpu timeline keeps the same voices alive");
+}
+
 void RunGpuStageDifferentialSuite(svms::gpu::Api api) {
     std::unique_ptr<svms::GpuStage> stage;
     if (!CreateGpuStageForTest(stage, api)) return;
@@ -518,7 +696,10 @@ void RunGpuStageDifferentialSuite(svms::gpu::Api api) {
     RunGpuStageEnvelopeDifferential(*stage, 400u, 256u, 16u, 1u);
     RunGpuStageEnvelopeDifferential(*stage, 20000u, 512u, 8u, 4u);
     RunGpuStageWrapSweep(*stage);
-    RunGpuStageEventDifferential(*stage);
+    RunGpuStageEventDifferential(*stage, true);
+    RunGpuStageEventDifferential(*stage, false);
+    RunGpuStageTimelineDifferential(*stage, 400u, 300u, 256u, 16u, 1u, 40u);
+    RunGpuStageTimelineDifferential(*stage, 6000u, 1200u, 512u, 10u, 4u, 400u);
     Check(!stage->Stats().lost && stage->Stats().failed == 0u,
           "gpu stage never lost the device or failed a submit");
 }

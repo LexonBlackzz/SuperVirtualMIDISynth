@@ -29,6 +29,7 @@ struct RenderScalar::GpuPassContext {
     uint32_t envCount;
     uint32_t storeFrames;
     bool stagedPending;
+    bool timelineOk;        // the backend honors start/release frames
     uint32_t cpuBase[GpuStage::kMaxJobs];
     uint32_t gpuBase[GpuStage::kMaxJobs];
     uint32_t envBase[GpuStage::kMaxJobs];
@@ -42,15 +43,18 @@ struct RenderScalar::GpuPassContext {
     const float* sortPhases;
 };
 
-// Which GPU kernel (if any) renders the row's whole block exactly like the
-// CPU: GpuStage::kKindSustained for a plain sustained-loop segment (the fast
-// branch of RenderSustainedLoopSpan), kKindEnvelope for any other
-// sample-backed, unfaded, unrotated class (the generic span machine), 0 for
-// the CPU.
+// Which GPU kernel (if any) renders the row's block exactly like the CPU:
+// GpuStage::kKindSustained for a plain sustained-loop segment (the fast branch
+// of RenderSustainedLoopSpan), kKindEnvelope for any other sample-backed,
+// unfaded, unrotated class (the generic span machine), 0 for the CPU.  A row
+// with a start and/or release frame in the block (timelineOk: the backend
+// splits the block there itself) is always an envelope row: the envelope
+// kernel runs the held sustained loop up to the release frame, then the
+// released machine.
 inline bool RenderScalar::GpuRowBlockOk(const VoiceSoA& v, uint32_t h,
-                                        bool stagedPending) const {
-    if (wvStartFrame_[h] != UINT32_MAX || wvReleaseFrame_[h] != UINT32_MAX)
-        return false;
+                                        bool stagedPending,
+                                        bool timelineOk) const {
+    if (!timelineOk && GpuRowHasTimeline(h)) return false;
     if (stagedPending && v.staged[h] != 0u) return false;
     const uint8_t channelRaw = v.channel[h];
     const uint32_t channel = channelRaw < kChannelCount ? channelRaw
@@ -68,8 +72,9 @@ inline bool RenderScalar::GpuRowBlockOk(const VoiceSoA& v, uint32_t h,
 
 inline uint8_t RenderScalar::GpuRowKind(const VoiceSoA& v, uint32_t h,
                                         bool stagedPending,
-                                        uint32_t storeFrames) const {
-    if (!GpuRowBlockOk(v, h, stagedPending)) return 0u;
+                                        uint32_t storeFrames,
+                                        bool timelineOk) const {
+    if (!GpuRowBlockOk(v, h, stagedPending, timelineOk)) return 0u;
     const VoiceRenderClass renderClass = ClassifyWholeVoiceRow(v, h);
     if (renderClass == VoiceRenderClass::Generic) return 0u;
     const uint32_t sampleStart = v.sampleStart[h];
@@ -79,8 +84,9 @@ inline uint8_t RenderScalar::GpuRowKind(const VoiceSoA& v, uint32_t h,
     const float step = v.phaseIncs[h];
     if (renderClass == VoiceRenderClass::SustainedLoop) {
         if (sampleStart >= gpu::kFilterFlag) return 0u;
-        return step > 0.0f && step < v.relLoopEF[h] - v.relLoopSF[h]
-            ? GpuStage::kKindSustained : 0u;
+        if (!(step > 0.0f && step < v.relLoopEF[h] - v.relLoopSF[h])) return 0u;
+        return GpuRowHasTimeline(h) ? GpuStage::kKindEnvelope
+                                    : GpuStage::kKindSustained;
     }
     if (!(step >= 0.0f)) return 0u;
     return GpuStage::kKindEnvelope;
@@ -166,25 +172,44 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
                 v.filterZ1[h] = d.z1;
                 v.filterZ2[h] = d.z2;
             }
+            const bool timeline = renderer->GpuRowHasTimeline(h);
             if (stageBefore == 0u) {
                 v.currentGain[h] = d.gain;
                 v.releaseSamplesRemaining[h] = d.releaseRem;
-            } else if (stageBefore != 3u) {
+            } else if (stageBefore != 3u || timeline) {
                 v.currentGain[h] = d.gain;
+                // A row that flipped to its release inside the block reports
+                // the stage it had at the flip; one that left its sustain
+                // stage there reports its gain at the flip in attackRem.
+                const bool flipped = (d.stageRetire & gpu::kEnvFlipped) != 0u;
                 const uint32_t stageAfter = (d.stageRetire >> 24) & 0xFu;
+                const bool gainSlot = flipped && stageAfter == 3u;
                 v.envelopeStage[h] = static_cast<uint8_t>(stageAfter);
-                v.attackSamplesRemaining[h] = d.attackRem;
-                v.decaySamplesRemaining[h] = d.decayRem;
-                if (stageAfter == 3u) {
-                    // Transient -> sustained crossing: the sustained kernels
-                    // read renderGain, which the launch left at its
-                    // pre-envelope value (same bake as the CPU batch path).
-                    // The render class moves with it, and the GPU copy of
-                    // the row (envelope kind) no longer fits the new class.
-                    v.renderGainL[h] = v.currentGain[h] * v.mixGainL[h];
-                    v.renderGainR[h] = v.currentGain[h] * v.mixGainR[h];
+                v.attackSamplesRemaining[h] = gainSlot ? 0u : d.attackRem;
+                v.decaySamplesRemaining[h] = gainSlot ? 0u : d.decayRem;
+                float bakeGain = d.gain;
+                if (gainSlot) std::memcpy(&bakeGain, &d.attackRem, sizeof(float));
+                if (flipped) {
+                    // The exact-frame release flip the CPU's row timeline does.
+                    v.releaseSamplesRemaining[h] = d.releaseRem;
+                    v.state[h] = static_cast<uint8_t>(VoiceState::Releasing);
+                    if (v.loopMode[h] == 3u) v.loopEnabled[h] = 0u;
                     stage.Resident()[h] = UINT32_MAX;
                     cross[crossed++] = h;
+                }
+                if (stageAfter == 3u && stageBefore != 3u) {
+                    // Transient -> sustained crossing (before the release, if
+                    // there is one): the sustained kernels read renderGain,
+                    // which the launch left at its pre-envelope value (same
+                    // bake as the CPU batch path, at the crossing's vintage).
+                    // The render class moves with it, and the GPU copy of
+                    // the row (envelope kind) no longer fits the new class.
+                    v.renderGainL[h] = bakeGain * v.mixGainL[h];
+                    v.renderGainR[h] = bakeGain * v.mixGainR[h];
+                    if (!flipped) {
+                        stage.Resident()[h] = UINT32_MAX;
+                        cross[crossed++] = h;
+                    }
                 }
             }
             const uint32_t frame = d.stageRetire & 0xFFFFFFu;
@@ -215,15 +240,21 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
             // lifecycle state, or through a render, which invalidates it).
             const uint8_t rk = residentKind[h];
             const uint8_t st = v.state[h];
-            if (stamp != UINT32_MAX && resident[h] == stamp && rk != 0u &&
+            // A row with a start or release frame in this block changes every
+            // block: it never keeps a resident copy.
+            const bool timeline = c.timelineOk && renderer->GpuRowHasTimeline(h);
+            if (!timeline && stamp != UINT32_MAX && resident[h] == stamp &&
+                rk != 0u &&
                 ((rk == 3u && st == static_cast<uint8_t>(VoiceState::Releasing)) ||
                  (rk != 3u && st == static_cast<uint8_t>(VoiceState::Active)))) {
-                kind = renderer->GpuRowBlockOk(v, h, c.stagedPending)
+                kind = renderer->GpuRowBlockOk(v, h, c.stagedPending,
+                                               c.timelineOk)
                     ? (rk == 1u ? GpuStage::kKindSustained
                                 : GpuStage::kKindEnvelope)
                     : 0u;
             } else {
-                kind = renderer->GpuRowKind(v, h, c.stagedPending, c.storeFrames);
+                kind = renderer->GpuRowKind(v, h, c.stagedPending, c.storeFrames,
+                                            c.timelineOk);
                 mark = GpuStage::kNeedsCheck;
             }
             if (kind == 0u && resident[h] != UINT32_MAX) resident[h] = UINT32_MAX;
@@ -247,6 +278,7 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
     uint32_t* envListOut = envList + c.envBase[job];
     uint32_t uploads = 0u;
     uint32_t envUploads = 0u;
+    uint32_t timelineRows = 0u;
     for (uint32_t i = begin; i < end; ++i) {
         const uint32_t h = active[i];
         const uint8_t kind = flags[i] & 3u;
@@ -301,11 +333,13 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
         const uint32_t stage0 = released ? 0u : v.envelopeStage[h];
         *envListOut++ = h;
         const uint8_t envKind = released ? 3u : 2u;
-        if (stamp != UINT32_MAX && resident[h] == stamp &&
+        const bool timeline = c.timelineOk && renderer->GpuRowHasTimeline(h);
+        if (!timeline && stamp != UINT32_MAX && resident[h] == stamp &&
             residentKind[h] == envKind) {
             continue;
         }
-        resident[h] = stamp;
+        // A row with a timeline is uploaded every block and never resident.
+        resident[h] = timeline ? UINT32_MAX : stamp;
         residentKind[h] = envKind;
         gpu::EnvUploadRecord& r = envScratch[envUploads++];
         r.handle = h;
@@ -338,9 +372,31 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
         std::memcpy(&r.words[17], &v.filterB2[h], sizeof(float));
         r.words[18] = 0u;
         r.words[19] = 0u;
+        r.timeline[0] = 0u;
+        r.timeline[1] = gpu::kNoReleaseFrame;
+        r.timeline[2] = 0u;
+        if (timeline) {
+            // Frames before the start render nothing; at the release frame
+            // the row flips to its release.  A held sustained loop renders as
+            // the sustained span until then.
+            ++timelineRows;
+            const uint32_t startFrame = renderer->wvStartFrame_[h];
+            r.timeline[0] = startFrame == UINT32_MAX ? 0u : startFrame;
+            r.timeline[1] = renderer->wvReleaseFrame_[h] == UINT32_MAX
+                ? gpu::kNoReleaseFrame : renderer->wvReleaseFrame_[h];
+            uint32_t tlFlags = gpu::kTlActive;
+            if (ClassifyWholeVoiceRow(v, h) == VoiceRenderClass::SustainedLoop) {
+                tlFlags |= gpu::kTlPreSustained;
+                std::memcpy(&r.words[18], &v.renderGainL[h], sizeof(float));
+                std::memcpy(&r.words[19], &v.renderGainR[h], sizeof(float));
+            }
+            if (v.loopMode[h] == 3u) tlFlags |= gpu::kTlClearLoop;
+            r.timeline[2] = tlFlags;
+        }
     }
     stage.JobUploadCount()[job] = uploads;
     stage.JobEnvUploadCount()[job] = envUploads;
+    stage.JobTimelineCount()[job] = timelineRows;
 }
 
 // Runs one pass over the pool (or inline when the pool refuses).
@@ -466,6 +522,7 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
     ctx.activeCount = activeCount;
     ctx.storeFrames = sampleDataFrames;
     ctx.stagedPending = voices.StagedPending();
+    ctx.timelineOk = stage.SupportsTimeline();
     // A big block is classified, packed and submitted part by part: the GPU
     // starts on part 0 after a fraction of the CPU passes and the CPU keeps
     // packing the next part (and scattering the previous one) while it runs.
@@ -539,6 +596,7 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
             const uint32_t envCount = stage.JobEnvUploadCount()[job];
             uploads += count;
             envUploads += envCount;
+            stage.MutableStats().timelineRows += stage.JobTimelineCount()[job];
             ok = stage.UploadRows(stage.UploadScratch() + begin, count) &&
                  stage.UploadEnvRows(stage.EnvUploadScratch() + begin, envCount);
         }
@@ -673,6 +731,14 @@ inline void RenderScalar::FinishGpuRows(VoiceManager& voices,
         }
         const uint32_t* eRows = stage.EnvList() + info.eBase;
         for (uint32_t i = 0u; i < info.eCount; ++i) {
+            if (GpuRowHasTimeline(eRows[i])) {
+                // Start/release frames split the block: the CPU row timeline
+                // renders it (retirements join job slot 0's list).
+                RenderWholeVoiceRow(voices, eRows[i], sampleData,
+                                    sampleDataFrames, outputLeft, outputRight,
+                                    numFrames, 0u);
+                continue;
+            }
             RenderWholeVoiceSegment(v, &voices, eRows[i], sampleData,
                                     sampleDataFrames, outputLeft, outputRight,
                                     0u, numFrames, true, 0u, 0.0f, 1.0f, false);

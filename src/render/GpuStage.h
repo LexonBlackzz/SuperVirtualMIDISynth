@@ -24,6 +24,7 @@ struct GpuStageStats {
     uint64_t blocks = 0u;        // blocks that submitted GPU work
     uint64_t rows = 0u;          // sustained-loop rows rendered on the GPU
     uint64_t envRows = 0u;       // envelope rows (release, attack/decay, one-shot)
+    uint64_t timelineRows = 0u;  // rows with a start and/or release frame in the block
     uint64_t uploads = 0u;       // static row records uploaded
     uint64_t envUploads = 0u;    // static envelope records uploaded
     uint64_t late = 0u;          // blocks that missed the deadline (CPU fallback)
@@ -55,6 +56,9 @@ public:
 
     const char* Name() const { return backend_ ? backend_->Name() : ""; }
     bool Enabled() const { return enabled_ && !stats_.lost; }
+    // Rows with a start and/or release frame inside the block can go to this
+    // backend (its envelope kernel honors the timeline).
+    bool SupportsTimeline() const { return backend_ && backend_->SupportsTimeline(); }
     const GpuStageStats& Stats() const { return stats_; }
     void ProfileNs(uint64_t& voice, uint64_t& reduce, uint64_t& env) const {
         backend_->ProfileNs(voice, reduce, env);
@@ -230,6 +234,7 @@ public:
     uint32_t* JobEnvCount() { return jobEnv_; }
     uint32_t* JobUploadCount() { return jobUpload_; }
     uint32_t* JobEnvUploadCount() { return jobEnvUpload_; }
+    uint32_t* JobTimelineCount() { return jobTimeline_; }
     uint32_t* JobRetireCount() { return jobRetire_; }
     const gpu::DynOut* Dyn() const { return dynOut_; }
     const gpu::EnvDynOut* EnvDyn() const { return envDynOut_; }
@@ -354,6 +359,7 @@ public:
     uint32_t jobEnv_[kMaxJobs] = {};
     uint32_t jobUpload_[kMaxJobs] = {};
     uint32_t jobEnvUpload_[kMaxJobs] = {};
+    uint32_t jobTimeline_[kMaxJobs] = {};
     uint32_t jobRetire_[kMaxJobs] = {};
     uint32_t jobCross_[kMaxJobs] = {};
 public:

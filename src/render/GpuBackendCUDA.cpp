@@ -119,11 +119,12 @@ public:
         env = profileNs_[2];
     }
     const char* Name() const override { return name_.c_str(); }
+    bool SupportsTimeline() const override { return true; }
 
 private:
     enum Buf {
         kStore, kRows, kList, kPartial, kMix, kDyn, kUpload, kEnvRows,
-        kEnvList, kEnvDyn, kEnvUpload, kState, kDevBufCount
+        kEnvList, kEnvDyn, kEnvUpload, kState, kTimeline, kDevBufCount
     };
     enum Host { kMixRead, kDynRead, kEnvDynRead, kHostBufCount };
     // Kernel group size / tile (constants of the .cu file).
@@ -374,6 +375,7 @@ bool CudaBackend::Reserve(uint32_t handleCapacity, uint32_t maxFrames) {
     const bool ok =
         Alloc(kEnvRows, cap * kEnvRowWords * 4u) &&
         Alloc(kState, cap * kDynWords * 4u) &&
+        Alloc(kTimeline, cap * 16u) &&
         Alloc(kEnvList, cap * sizeof(uint32_t)) &&
         Alloc(kEnvDyn, cap * sizeof(EnvDynOut)) &&
         Alloc(kEnvUpload, cap * sizeof(EnvUploadRecord)) &&
@@ -427,9 +429,10 @@ bool CudaBackend::UploadEnvRows(const EnvUploadRecord* records, uint32_t count) 
                                 stream_), "env row upload")) {
         return false;
     }
-    CUdeviceptr rows = buf_[kEnvRows], up = buf_[kEnvUpload], state = buf_[kState];
+    CUdeviceptr rows = buf_[kEnvRows], up = buf_[kEnvUpload], state = buf_[kState],
+                timeline = buf_[kTimeline];
     uint32_t n = count, base = envUploadCursor_;
-    void* args[] = {&rows, &up, &state, &n, &base};
+    void* args[] = {&rows, &up, &state, &timeline, &n, &base};
     if (!Launch(fnEnvScatter_, (count + 63u) / 64u, 64u, args)) return false;
     envUploadCursor_ += count;
     return true;
@@ -477,12 +480,13 @@ bool CudaBackend::Submit(const uint32_t* list, uint32_t count,
     }
     if (envCount != 0u) {
         CUdeviceptr store = buf_[kStore], erows = buf_[kEnvRows], elist = buf_[kEnvList],
-                    edyn = buf_[kEnvDyn], state = buf_[kState], partial = buf_[kPartial];
+                    edyn = buf_[kEnvDyn], state = buf_[kState], partial = buf_[kPartial],
+                    timeline = buf_[kTimeline];
         uint32_t retireBits = 0u;
         std::memcpy(&retireBits, &retireThreshold, sizeof(retireBits));
         uint32_t n = envCount, f = frames, eb = envBase_, gb = groupBase_ + groups;
         void* args[] = {&store, &erows, &elist, &edyn, &state, &partial, &n, &f,
-                        &eb, &gb, &retireBits};
+                        &eb, &gb, &retireBits, &timeline};
         if (p.envTimed) cu_.EventRecord(p.timed[4], stream_);
         if (!Launch(fnEnv_, envGroups, kGroup, args)) return false;
         if (p.envTimed) cu_.EventRecord(p.timed[5], stream_);
