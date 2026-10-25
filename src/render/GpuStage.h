@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,6 +35,7 @@ struct GpuStageStats {
     uint64_t packMicros = 0u;       // pass 2: list + row packing
     uint64_t uploadMicros = 0u;     // static rows to the GPU
     uint64_t scatterMicros = 0u;    // read-back state into the SoA
+    uint64_t sortMicros = 0u;       // ordering the lists by sample region
     uint32_t lastBlockRows = 0u; // voices on the GPU in the latest GPU block
     uint64_t considered = 0u;    // blocks the renderer offered to the stage
     // Blocks the stage declined, by reason: 0 no store / short block, 1 channel
@@ -77,6 +79,47 @@ public:
     // Test hook: report the next `blocks` blocks as late.
     void ForceLateForTest(uint32_t blocks) { forceLate_ = blocks; }
     void SetMaxFramesHint(uint32_t frames) { maxFramesHint_ = frames; }
+    // Orders each part's lists by sample region before submitting.  Voices that
+    // read the same sample then share a warp, so their loads land on the same
+    // cache lines instead of one line per lane.  Only the order the GPU sums
+    // the voices in changes (the mix is tolerance-equal either way).
+    void SetSortByRegion(bool on) { sortByRegion_ = on; }
+    bool SortByRegion() const { return sortByRegion_; }
+
+    // Stable counting sort of rows[0, count) by the store position each row
+    // reads at block start, in 64-frame (one cache line) steps: two 12-bit
+    // passes.  `sampleStart` and `phases` are the voice pool's per-handle arrays.
+    void SortRows(uint32_t* rows, uint32_t count, const uint32_t* sampleStart,
+                  const float* phases) {
+        if (!sortByRegion_ || count < 64u || count > sortA_.size()) return;
+        const uint64_t start = NowMicros();
+        uint64_t* a = sortA_.data();
+        uint64_t* b = sortB_.data();
+        for (uint32_t i = 0u; i < count; ++i) {
+            const uint32_t h = rows[i];
+            const float phase = phases[h];
+            const uint32_t position =
+                sampleStart[h] + (phase > 0.0f && phase < 1.0e9f ? static_cast<uint32_t>(phase) : 0u);
+            const uint32_t key = (std::min)(position >> 6, 0xFFFFFFu);
+            a[i] = (static_cast<uint64_t>(key) << 32) | h;
+        }
+        uint32_t counts[4096];
+        for (uint32_t shift = 32u; shift <= 44u; shift += 12u) {
+            std::memset(counts, 0, sizeof(counts));
+            for (uint32_t i = 0u; i < count; ++i) ++counts[(a[i] >> shift) & 4095u];
+            uint32_t sum = 0u;
+            for (uint32_t d = 0u; d < 4096u; ++d) {
+                const uint32_t c = counts[d];
+                counts[d] = sum;
+                sum += c;
+            }
+            for (uint32_t i = 0u; i < count; ++i)
+                b[counts[(a[i] >> shift) & 4095u]++] = a[i];
+            std::swap(a, b);
+        }
+        for (uint32_t i = 0u; i < count; ++i) rows[i] = static_cast<uint32_t>(a[i]);
+        stats_.sortMicros += NowMicros() - start;
+    }
 
     // Anything that rewrites a resident row's static fields outside the
     // whole-voice plan (sample-store swap, pool rebuild, pitch refresh, ...)
@@ -113,6 +156,8 @@ public:
                 retire_.assign(handleCapacity, RetireRec{});
                 cross_.assign(handleCapacity, 0u);
                 cpuRows_.assign(handleCapacity, 0u);
+                sortA_.assign(handleCapacity, 0u);
+                sortB_.assign(handleCapacity, 0u);
             } catch (...) {
                 enabled_ = false;
                 return false;
@@ -288,6 +333,9 @@ public:
     std::vector<RetireRec> retire_;
     std::vector<uint32_t> cross_;
     std::vector<uint32_t> cpuRows_;
+    std::vector<uint64_t> sortA_;
+    std::vector<uint64_t> sortB_;
+    bool sortByRegion_ = true;
     uint32_t jobGpu_[kMaxJobs] = {};
     uint32_t jobEnv_[kMaxJobs] = {};
     uint32_t jobUpload_[kMaxJobs] = {};

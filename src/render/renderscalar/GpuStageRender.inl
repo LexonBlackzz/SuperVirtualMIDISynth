@@ -444,6 +444,10 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
                  stage.UploadEnvRows(stage.EnvUploadScratch() + begin, envCount);
         }
         stage.MutableStats().uploadMicros += GpuStage::NowMicros() - uploadStart;
+        if (ok) {
+            stage.SortRows(stage.List() + sStart, gpuRun - sStart, voices.v.sampleStart, voices.v.phases);
+            stage.SortRows(stage.EnvList() + eStart, envRun - eStart, voices.v.sampleStart, voices.v.phases);
+        }
         ok = ok && stage.SubmitPart(sStart, gpuRun - sStart, eStart,
                                     envRun - eStart, numFrames, uploads,
                                     envUploads, VoiceRetireThreshold(),

@@ -22,6 +22,9 @@
 static float gBenchReleaseDecay = 0.9999999f;  // --release-ms
 static bool gBenchVelocitySpread = false;      // --velocity-spread
 static bool gBenchVelocityGain = false;        // --velocity-gain: note velocity scales the launch gain + spreads chopped-notes velocities
+static uint32_t gBenchStoreFrames = 64u * 2048u;  // --store-mb: synthetic sample store size
+static uint32_t gBenchRegionFrames = 2048u;       // --regions: frames per sample region
+static uint32_t gBenchRegionCount = 0u;           // --regions: distinct sample regions (0 = store / 2048 frames)
 static int gBenchFilterCents = -1;             // --filter-cents: SF2 low-pass on every voice (-1 = none)
 static uint32_t gBenchReleaseSamples = 0u;      // counted tail (live SF2 semantics)
 
@@ -151,6 +154,7 @@ struct Options {
     // --gpu-api off|auto|opengl: attach the realtime GPU render stage.
     svms::gpu::Api gpuApi = svms::gpu::Api::Off;
     uint32_t gpuMinVoices = 4096u;
+    bool gpuSort = true;                // --gpu-sort 0|1: order GPU lists by sample region
     uint32_t gpuDeadlinePercent = 0u;   // 0 = wait for the GPU
 };
 
@@ -248,6 +252,18 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             else if (std::strcmp(api, "auto") == 0) options.gpuApi = svms::gpu::Api::Auto;
             else if (std::strcmp(api, "opengl") == 0) options.gpuApi = svms::gpu::Api::OpenGL;
             else return false;
+        } else if (std::strcmp(argv[i], "--store-mb") == 0) {
+            uint32_t mb = 0u;
+            if (!nextNumber(mb) || mb == 0u || mb > 2048u) return false;
+            gBenchStoreFrames = mb * (512u * 1024u);
+        } else if (std::strcmp(argv[i], "--regions") == 0) {
+            uint32_t regions = 0u;
+            if (!nextNumber(regions) || regions == 0u) return false;
+            gBenchRegionCount = regions;
+        } else if (std::strcmp(argv[i], "--gpu-sort") == 0) {
+            uint32_t on = 1u;
+            if (!nextNumber(on)) return false;
+            options.gpuSort = on != 0u;
         } else if (std::strcmp(argv[i], "--gpu-min") == 0) {
             if (!nextNumber(options.gpuMinVoices)) return false;
         } else if (std::strcmp(argv[i], "--gpu-deadline") == 0) {
@@ -360,7 +376,7 @@ bool ConfigureVoices(svms::VoiceManager& voices, svms::ChannelCache& channels,
     voices.SetStealPolicy(stealPolicy);
     channels.SetMasterVolume(1.0f);
     channels.RebuildCache(cfg, 44100.0f);
-    constexpr uint32_t regionFrames = 2048;
+    const uint32_t regionFrames = gBenchRegionFrames;
     const uint32_t regionCount = sampleFrames / regionFrames;
 
     for (uint32_t i = 0; i < voiceCount; ++i) {
@@ -443,7 +459,7 @@ static bool gBenchVibratoLfo = false;
 void PrepareSyntheticLaunchPlan(svms::VoiceConfiguration* setups,
                                 uint32_t count, uint32_t sampleFrames,
                                 uint8_t note, uint32_t attackFrames) {
-    constexpr uint32_t regionFrames = 2048u;
+    const uint32_t regionFrames = gBenchRegionFrames;
     const uint32_t regionCount = sampleFrames / regionFrames;
     for (uint32_t layer = 0u; layer < count; ++layer) {
         const uint32_t identity = static_cast<uint32_t>(note) * 8u + layer;
@@ -484,7 +500,7 @@ void PerformSteals(svms::VoiceManager& voices, const svms::ChannelCache& channel
                    uint32_t profileScale = 0u,
                    const svms::VoiceConfiguration* preparedSetups = nullptr,
                    uint32_t multiplicity = 1u) {
-    constexpr uint32_t regionFrames = 2048;
+    const uint32_t regionFrames = gBenchRegionFrames;
     const uint32_t regionCount = sampleFrames / regionFrames;
     if (multiplicity > 1u && !(transactional && count <= 8u)) {
         // Only the transactional launch carries a multiplicity; the legacy
@@ -806,11 +822,20 @@ int main(int argc, char** argv) {
     // voices/N), the events are partitioned by (channel,key).
     if (options.shards > 1u)
         options.voices = (std::max)(1u, options.voices / options.shards);
-    constexpr uint32_t sampleFrames = 64u * 2048u;
+    if (gBenchRegionCount != 0u)
+        gBenchRegionFrames = (std::max)(64u, gBenchStoreFrames / gBenchRegionCount);
+    const uint32_t sampleFrames = gBenchStoreFrames;
     std::vector<int16_t> samples(sampleFrames + 8u, 0);
-    for (uint32_t i = 0; i < sampleFrames; ++i) {
-        samples[i] = static_cast<int16_t>((0.45f * std::sin(static_cast<float>(i) * 0.017f) +
-                      0.2f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+    {
+        // The waveform repeats every 131072 frames, so a large store costs one
+        // table of sines plus a copy.
+        const uint32_t tileFrames = (std::min)(sampleFrames, 131072u);
+        for (uint32_t i = 0; i < tileFrames; ++i) {
+            samples[i] = static_cast<int16_t>((0.45f * std::sin(static_cast<float>(i) * 0.017f) +
+                          0.2f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+        }
+        for (uint32_t i = tileFrames; i < sampleFrames; ++i)
+            samples[i] = samples[i % tileFrames];
     }
 
     svms::RuntimeConfigSnapshot cfg{};
@@ -893,6 +918,7 @@ int main(int argc, char** argv) {
             return 5;
         }
         gpuStage->SetMinimumVoices(options.gpuMinVoices);
+        gpuStage->SetSortByRegion(options.gpuSort);
         gpuStage->SetDeadlinePercent(options.gpuDeadlinePercent);
         gpuStage->SetMaxFramesHint(options.frames);
         renderer->SetGpuStage(gpuStage.get());
@@ -1665,7 +1691,7 @@ int main(int argc, char** argv) {
             "\"env_rows\":%llu,\"uploads\":%llu,\"env_uploads\":%llu,"
             "\"late\":%llu,\"failed\":%llu,\"lost\":%d,"
             "\"submit_us\":%llu,\"wait_us\":%llu,\"classify_us\":%llu,"
-            "\"pack_us\":%llu,\"upload_us\":%llu,\"scatter_us\":%llu}}\n",
+            "\"pack_us\":%llu,\"upload_us\":%llu,\"scatter_us\":%llu,\"sort_us\":%llu}}\n",
             gpuStage->Name(), (unsigned long long)g.blocks,
             (unsigned long long)g.rows, (unsigned long long)g.envRows,
             (unsigned long long)g.uploads, (unsigned long long)g.envUploads,
@@ -1675,7 +1701,8 @@ int main(int argc, char** argv) {
             (unsigned long long)g.classifyMicros,
             (unsigned long long)g.packMicros,
             (unsigned long long)g.uploadMicros,
-            (unsigned long long)g.scatterMicros);
+            (unsigned long long)g.scatterMicros,
+            (unsigned long long)g.sortMicros);
     }
     std::fprintf(stderr, "{\"steal_reject\":{\"enabled\":%d,\"rejected\":%llu}}\n",
                  options.stealReject ? 1 : 0,
