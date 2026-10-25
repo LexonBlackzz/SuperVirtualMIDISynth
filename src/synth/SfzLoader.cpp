@@ -113,6 +113,20 @@ struct SfzZone {
     bool filterTypeExplicit = false;
     int group = 0;
     int offBy = 0;
+    double filVeltrack = 0.0; // cents of cutoff at velocity 127
+    double filKeytrack = 0.0; // cents of cutoff per key
+    int filKeycenter = 60;
+    double pitchVeltrack = 0.0; // cents of pitch at velocity 127
+    double pitchLfoDepth = 0.0; // cents
+    double pitchLfoFreq = 0.0;  // Hz
+    double pitchLfoDelay = 0.0;
+    double effect1 = 0.0;       // percent, reverb send
+    double effect2 = 0.0;       // percent, chorus send
+    int swLast = -1;
+    int swDefault = -1;
+    double loRand = 0.0;
+    int seqPosition = 1;
+    bool skip = false;          // release triggers never play on note-on
 };
 
 struct SfzToken {
@@ -332,10 +346,48 @@ static bool ApplySfzOpcode(SfzZone& zone, const SfzToken& token,
         }
         return true;
     }
+    if (op == "fil_veltrack" || op == "fil_keytrack" || op == "pitch_veltrack" ||
+        op == "pitchlfo_depth" || op == "pitchlfo_freq" || op == "pitchlfo_delay" ||
+        op == "effect1" || op == "effect2" || op == "lorand" || op == "cents") {
+        if (!ParseNumber(token.value, number)) return false;
+        if (op == "fil_veltrack") zone.filVeltrack = number;
+        else if (op == "fil_keytrack") zone.filKeytrack = number;
+        else if (op == "pitch_veltrack") zone.pitchVeltrack = number;
+        else if (op == "pitchlfo_depth") zone.pitchLfoDepth = number;
+        else if (op == "pitchlfo_freq") zone.pitchLfoFreq = number;
+        else if (op == "pitchlfo_delay") zone.pitchLfoDelay = number;
+        else if (op == "effect1") zone.effect1 = number;
+        else if (op == "effect2") zone.effect2 = number;
+        else if (op == "lorand") zone.loRand = number;
+        else zone.tune = static_cast<int>(std::lround(number));
+        return true;
+    }
+    if (op == "fil_keycenter" || op == "sw_last" || op == "sw_default") {
+        int key = 0; if (!ParseSfzKey(token.value, key)) return false;
+        if (op == "fil_keycenter") zone.filKeycenter = key;
+        else if (op == "sw_last") zone.swLast = key;
+        else zone.swDefault = key;
+        return true;
+    }
+    if (op == "seq_position") {
+        if (!ParseInteger(token.value, integer)) return false;
+        zone.seqPosition = static_cast<int>(integer);
+        return true;
+    }
+    if (op == "trigger") {
+        const std::string mode = LowerAscii(token.value);
+        if (mode != "attack" && mode != "first" && mode != "legato") zone.skip = true;
+        return true;
+    }
+    if (op == "loopmode") {
+        SfzToken alias = token;
+        alias.name = "loop_mode";
+        return ApplySfzOpcode(zone, alias, unsupported);
+    }
     if (op == "fil_type") {
         const std::string type = LowerAscii(token.value);
         zone.filterTypeExplicit = true;
-        if (type == "lpf_2p") {
+        if (type == "lpf_2p" || type == "lpf_1p" || type == "lpf_4p" || type == "lpf_6p") {
             zone.filterType = static_cast<uint8_t>(FilterType::LowPass2Pole);
         } else if (type == "none" || type == "no_filter") {
             zone.filterType = static_cast<uint8_t>(FilterType::None);
@@ -697,6 +749,38 @@ static bool ExpandSfzIncludes(
     return true;
 }
 
+// `#define $NAME value` lines: drop them and substitute $NAME in the rest.
+static void ExpandSfzDefines(std::string& source) {
+    std::vector<std::pair<std::string, std::string>> defines;
+    std::string out;
+    size_t pos = 0;
+    while (pos < source.size()) {
+        size_t eol = source.find('\n', pos);
+        if (eol == std::string::npos) eol = source.size();
+        const std::string line = source.substr(pos, eol - pos);
+        const std::string trimmed = TrimAscii(line);
+        if (trimmed.compare(0, 7, "#define") == 0) {
+            const std::string rest = TrimAscii(trimmed.substr(7));
+            const size_t space = rest.find_first_of(" \t");
+            if (space != std::string::npos)
+                defines.emplace_back(rest.substr(0, space), TrimAscii(rest.substr(space)));
+        } else {
+            out += line;
+        }
+        out.push_back('\n');
+        pos = eol + 1;
+    }
+    if (defines.empty()) return;
+    std::sort(defines.begin(), defines.end(), [](const auto& l, const auto& r) {
+        return l.first.size() > r.first.size(); });
+    for (const auto& d : defines) {
+        for (size_t at = 0; (at = out.find(d.first, at)) != std::string::npos;
+             at += d.second.size())
+            out.replace(at, d.first.size(), d.second);
+    }
+    source.swap(out);
+}
+
 static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
     if (!outData) return false;
     std::memset(outData, 0, sizeof(*outData));
@@ -707,8 +791,11 @@ static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
         if (!ExpandSfzIncludes(sfzPath, source, activeIncludes,
                                0u, expandedBytes))
             return false;
+        ExpandSfzDefines(source);
         const std::vector<SfzToken> tokens = TokenizeSfz(source);
         SfzZone global;
+        SfzZone master;
+        bool haveMaster = false;
         SfzZone group = global;
         SfzZone region;
         bool inRegion = false;
@@ -728,11 +815,16 @@ static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
                 if (section == "global") {
                     global = SfzZone{};
                     haveGroup = false;
+                    haveMaster = false;
+                } else if (section == "master") {
+                    master = global;
+                    haveMaster = true;
+                    haveGroup = false;
                 } else if (section == "group") {
-                    group = global;
+                    group = haveMaster ? master : global;
                     haveGroup = true;
                 } else if (section == "region") {
-                    region = haveGroup ? group : global;
+                    region = haveGroup ? group : (haveMaster ? master : global);
                     inRegion = true;
                 }
                 continue;
@@ -743,6 +835,7 @@ static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
             }
             SfzZone* target = nullptr;
             if (section == "global") target = &global;
+            else if (section == "master") target = &master;
             else if (section == "group") target = &group;
             else if (section == "region" && inRegion) target = &region;
             if (target && !ApplySfzOpcode(*target, token, unsupported)) {
@@ -755,6 +848,59 @@ static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
         }
         finishRegion();
         if (regions.empty()) return false;
+
+        // Cutoff and pitch are baked per region, so velocity/key tracking is
+        // applied by splitting a region into velocity bands and key groups
+        // that each get their own value.  Release triggers, round robins
+        // beyond the first and non-default keyswitches never play on note-on.
+        {
+            constexpr int kBands = 8;
+            constexpr int kKeyGroup = 3;
+            std::vector<SfzZone> expanded;
+            expanded.reserve(regions.size());
+            for (const SfzZone& zone : regions) {
+                if (zone.skip || zone.loRand > 0.0 || zone.seqPosition > 1 ||
+                    (zone.swLast >= 0 && zone.swLast != zone.swDefault))
+                    continue;
+                const bool filtered = zone.cutoffSet &&
+                    zone.filterType == static_cast<uint8_t>(FilterType::LowPass2Pole);
+                const bool velSplit = (filtered && zone.filVeltrack != 0.0) ||
+                                      zone.pitchVeltrack != 0.0;
+                const bool keySplit = filtered && zone.filKeytrack != 0.0;
+                if (!velSplit && !keySplit) { expanded.push_back(zone); continue; }
+                const int bands = velSplit ? kBands : 1;
+                const int keyStep = keySplit ? kKeyGroup : 128;
+                for (int band = 0; band < bands; ++band) {
+                    SfzZone velZone = zone;
+                    if (velSplit) {
+                        velZone.velLo = (std::max)(zone.velLo, band * 128 / kBands);
+                        velZone.velHi = (std::min)(zone.velHi, (band + 1) * 128 / kBands - 1);
+                        if (velZone.velLo > velZone.velHi) continue;
+                    }
+                    const double vel = 0.5 * (velZone.velLo + velZone.velHi);
+                    for (int key = zone.keyLo; key <= zone.keyHi; key += keyStep) {
+                        SfzZone split = velZone;
+                        if (keySplit) {
+                            split.keyLo = key;
+                            split.keyHi = (std::min)(zone.keyHi, key + keyStep - 1);
+                        }
+                        if (filtered) {
+                            double cents = zone.filVeltrack * vel / 127.0;
+                            if (keySplit)
+                                cents += zone.filKeytrack *
+                                    (0.5 * (split.keyLo + split.keyHi) - zone.filKeycenter);
+                            split.cutoffHz = (std::min)(24000.0,
+                                zone.cutoffHz * std::pow(2.0, cents / 1200.0));
+                        }
+                        split.tune += static_cast<int>(
+                            std::lround(zone.pitchVeltrack * vel / 127.0));
+                        expanded.push_back(split);
+                    }
+                }
+            }
+            regions.swap(expanded);
+            if (regions.empty()) return false;
+        }
 
         std::vector<int16_t> sampleStore;
         std::unordered_map<std::wstring, SfzCachedSample> cache;
@@ -891,6 +1037,17 @@ static bool LoadSfzPath(const fs::path& sfzPath, SF2Data* outData) {
                         ? ResonanceDbToCentibels(zone.resonanceDb)
                         : int16_t(0);
                 }
+                if (zone.pitchLfoDepth != 0.0 && zone.pitchLfoFreq > 0.0) {
+                    compiled.vibLfoToPitch = static_cast<int16_t>((std::max)(-12000.0,
+                        (std::min)(12000.0, zone.pitchLfoDepth)));
+                    compiled.freqVibLfo = static_cast<int16_t>(std::lround(
+                        1200.0 * std::log2(zone.pitchLfoFreq)));
+                    compiled.delayVibLfo = SecondsToTimecents(zone.pitchLfoDelay);
+                }
+                compiled.reverbSend = static_cast<int16_t>((std::max)(0.0,
+                    (std::min)(1000.0, zone.effect1 * 10.0)));
+                compiled.chorusSend = static_cast<int16_t>((std::max)(0.0,
+                    (std::min)(1000.0, zone.effect2 * 10.0)));
                 compiled.delayVolEnv = SecondsToTimecents(zone.ampDelay);
                 compiled.attackVolEnv = SecondsToTimecents(zone.ampAttack);
                 compiled.holdVolEnv = SecondsToTimecents(zone.ampHold);

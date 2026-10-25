@@ -10,6 +10,17 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-25 feat(v3): more SFZ opcodes. `<master>`, `#define`/`$var`,
+  `fil_keytrack`/`fil_keycenter`, `pitch_veltrack`, `pitchlfo_*`, `effect1/2`
+  (reverb/chorus send), `cents`, `loopmode`, more `fil_type` lowpass variants.
+  Release triggers, later round-robin/sequence slots and non-default
+  keyswitch regions no longer play on note-on.
+
+- 2026-10-25 fix(v3): SFZ `fil_veltrack` is honoured. Sets like Red Steinway II
+  keep `cutoff=200` and let velocity open the filter, so ignoring it left every
+  note low-passed. The cutoff is baked per region, so I split each region into
+  eight velocity bands with their own cutoff.
+
 - 2026-10-25 — `perf(v3): GPU rows may start and release inside the block`. Rows with a start and/or release frame no longer stay on the CPU when the backend honors the block timeline (CUDA now; OpenGL keeps the old behavior until I port it). The envelope kernel reads a per-row header (start frame, release frame, flags): nothing renders or advances before the start frame, and at the release frame the row flips to the released machine exactly where the CPU flips `state` (looping off for sampleModes 3). A row held as a sustained loop runs the sustained span's math up to the flip, so its phase bookkeeping stays identical. The kernel reports the stage and gain at the flip so the CPU applies the same render-gain bake it does after a transient-to-sustained crossing. These rows are re-uploaded every block (never resident), and a late block renders them with the same per-row timeline the workers use, now one shared function. The GPU differential gained a note-on/off-only event run and a pool test against the CPU whole-voice renderer: state bit-equal per voice over 2,700 timeline rows, forced-late block included, audio within 4e-6. On chopped notes the gain is small (28.0% to 22.5% p50 at 30000 voices) because that workload is bound by the serial plan.
 
 - 2026-10-25 — `perf(v3): CUDA backend for the GPU render stage`. New `gpu_api` choice 5 (CUDA); Auto now tries CUDA, then OpenGL. The kernels are a line-for-line port of the GLSL ones (same row layouts, same per-frame operation order, same warp butterfly reduction), built with `--fmad=false` so nothing is fused. They ship as a fat binary (SASS for sm_75 through sm_120, plus PTX) embedded in the DLL, and the driver API is opened at run time, so users need only the NVIDIA driver. A build without `nvcc` simply reports the backend unavailable. The GPU differential now runs once per backend: phase/filter state is bit-equal to the scalar renderer, audio within 2e-6. 30000 sustained voices, AVX2, 6 threads, RTX 3060: CPU 0.454 cycles/voice-sample (p50 18.0%), OpenGL 0.109 (3.7%), CUDA 0.096 (3.3%). First step towards a GPU path as capable as the CPU one.
