@@ -82,7 +82,7 @@ struct ConfigValues {
     bool stealReject = false;
     // 0 off, 1 RT threads -> P-cores, 2 + workers -> E-cores.
     uint32_t threadAffinityMode = 0u;
-    uint32_t gpuApi = 0u;       // 0 off, 1 auto, 2 OpenGL, 3 Vulkan, 4 D3D11
+    uint32_t gpuApi = 0u;       // 0 off, 1 auto, 2 OpenGL, 3 Vulkan, 4 D3D11, 5 CUDA
     uint32_t gpuDevice = 0u;
     // Opt-in compiler-side CC collapse (superseded same-(channel,controller)).
     bool ccCollapse = false;

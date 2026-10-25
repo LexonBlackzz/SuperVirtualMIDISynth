@@ -238,7 +238,7 @@ void ConfigDocument::FromJson(const json& root) {
         if (working_.tuningEdo != 31u) working_.tuningEdo = 12u;
         ReadNum(*it, "thread_affinity_mode", working_.threadAffinityMode,
                 0u, 2u);
-        ReadNum(*it, "gpu_api", working_.gpuApi, 0u, 4u);
+        ReadNum(*it, "gpu_api", working_.gpuApi, 0u, 5u);
         ReadNum(*it, "gpu_device", working_.gpuDevice, 0u, 15u);
         if (auto bt = it->find("block_timing"); bt != it->end()) {
             if (bt->is_boolean())

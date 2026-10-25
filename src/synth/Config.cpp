@@ -665,7 +665,7 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "thread_affinity_mode", cfg.threadAffinityMode,
                        0u, 2u))
             AppendWarning(cfg.configWarning, "synth.thread_affinity_mode");
-        if (!ReadValue(*it, "gpu_api", cfg.gpuApi, 0u, 4u))
+        if (!ReadValue(*it, "gpu_api", cfg.gpuApi, 0u, 5u))
             AppendWarning(cfg.configWarning, "synth.gpu_api");
         if (!ReadValue(*it, "gpu_device", cfg.gpuDeviceIndex, 0u, 15u))
             AppendWarning(cfg.configWarning, "synth.gpu_device");
@@ -1285,7 +1285,7 @@ bool EngineConfig::Validate() const {
             voiceRetireThreshold > 0.0f && voiceRetireThreshold <= 0.05f &&
             perKeyVoiceCap <= 256u &&
             threadAffinityMode <= 2u &&
-            gpuApi <= 4u &&
+            gpuApi <= 5u &&
             ghostBudget <= 65536u &&
             apiBackend <= 4u &&
             apiWinMmDevice <= 255u &&

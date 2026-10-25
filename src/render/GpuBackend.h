@@ -161,7 +161,7 @@ public:
 };
 
 // Selector values for synth.gpu_api (0 = off).
-enum class Api : uint32_t { Off = 0, Auto = 1, OpenGL = 2, Vulkan = 3, D3D11 = 4 };
+enum class Api : uint32_t { Off = 0, Auto = 1, OpenGL = 2, Vulkan = 3, D3D11 = 4, CUDA = 5 };
 
 // Creates (but does not Init) the backend for `api`; null when the API is not
 // compiled into this build.

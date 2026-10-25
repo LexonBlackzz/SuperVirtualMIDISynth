@@ -42,9 +42,10 @@ void ConfigureGpuSeedPool(svms::VoiceManager& voices,
     }
 }
 
-bool CreateGpuStageForTest(std::unique_ptr<svms::GpuStage>& stage) {
+bool CreateGpuStageForTest(std::unique_ptr<svms::GpuStage>& stage,
+                           svms::gpu::Api api) {
     std::string error;
-    stage = svms::GpuStage::Create(svms::gpu::Api::OpenGL, 0u, error);
+    stage = svms::GpuStage::Create(api, 0u, error);
     if (!stage) {
         std::printf("GPU stage differential skipped: %s\n", error.c_str());
         return false;
@@ -508,9 +509,9 @@ void RunGpuStageEnvelopeDifferential(svms::GpuStage& stage, uint32_t poolSize,
     Check(listMismatch == 0u, "gpu envelope retirements match the scalar renderer");
 }
 
-void TestGpuStageDifferential() {
+void RunGpuStageDifferentialSuite(svms::gpu::Api api) {
     std::unique_ptr<svms::GpuStage> stage;
-    if (!CreateGpuStageForTest(stage)) return;
+    if (!CreateGpuStageForTest(stage, api)) return;
     RunGpuStageSteadyDifferential(*stage, 200u, 512u, 12u, 1u);
     RunGpuStageSteadyDifferential(*stage, 6000u, 2048u, 6u, 4u);
     RunGpuStageSteadyDifferential(*stage, 3000u, 480u, 6u, 4u);
@@ -520,6 +521,12 @@ void TestGpuStageDifferential() {
     RunGpuStageEventDifferential(*stage);
     Check(!stage->Stats().lost && stage->Stats().failed == 0u,
           "gpu stage never lost the device or failed a submit");
+}
+
+// Every backend runs the same gates against the scalar renderer.
+void TestGpuStageDifferential() {
+    RunGpuStageDifferentialSuite(svms::gpu::Api::OpenGL);
+    RunGpuStageDifferentialSuite(svms::gpu::Api::CUDA);
 }
 
 #else

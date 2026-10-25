@@ -104,7 +104,8 @@ struct EngineConfig {
     bool enableFilter;
     bool enableModulators;
     // Realtime GPU render stage (render/GpuStage.h): 0 off [default], 1 auto,
-    // 2 OpenGL, 3 Vulkan, 4 D3D11.  Restart-applied; the CPU renders every row
+    // 2 OpenGL, 3 Vulkan, 4 D3D11, 5 CUDA (auto tries CUDA, then OpenGL).
+    // Restart-applied; the CPU renders every row
     // the GPU can't take.  gpuDeviceIndex picks the adapter within the API.
     uint32_t gpuApi;
     uint32_t gpuDeviceIndex;

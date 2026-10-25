@@ -7,6 +7,55 @@ include(CTest)
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 
 option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
+option(SVMS_CUDA "Embed the CUDA kernels of the GPU render stage (needs nvcc; point CUDA_PATH at the toolkit)" ON)
+
+# CUDA backend of the GPU render stage.  The host half (GpuBackendCUDA.cpp)
+# declares the driver API itself and opens nvcuda at run time, so it builds
+# anywhere; the kernels are embedded only when nvcc is found, and a build
+# without them reports it when the stage is enabled.  --fmad=false keeps the
+# scalar path's math step by step (no fused multiply-add).  Architectures: SASS
+# for Turing through Blackwell plus PTX for newer GPUs on a new enough driver.
+if(NOT SVMS_XP_COMPAT)
+    add_library(svms_gpu_cuda OBJECT render/GpuBackendCUDA.cpp)
+endif()
+if(SVMS_CUDA AND NOT SVMS_XP_COMPAT AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    find_program(SVMS_NVCC nvcc HINTS ENV CUDA_PATH ENV CUDAToolkit_ROOT PATH_SUFFIXES bin)
+endif()
+if(SVMS_NVCC)
+    get_filename_component(SVMS_NVCC_BIN_DIR "${SVMS_NVCC}" DIRECTORY)
+    find_program(SVMS_BIN2C bin2c HINTS "${SVMS_NVCC_BIN_DIR}" NO_DEFAULT_PATH)
+endif()
+if(SVMS_NVCC AND SVMS_BIN2C AND TARGET svms_gpu_cuda)
+    set(SVMS_CUDA_GEN "${CMAKE_CURRENT_BINARY_DIR}/gpu_cuda")
+    set(SVMS_CUDA_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/VoiceStageCUDA.cu")
+    set(SVMS_CUDA_GENCODE)
+    foreach(arch 75 80 86 89 90 100 120)
+        list(APPEND SVMS_CUDA_GENCODE -gencode arch=compute_${arch},code=sm_${arch})
+    endforeach()
+    list(APPEND SVMS_CUDA_GENCODE -gencode arch=compute_75,code=compute_75)
+    add_custom_command(
+        OUTPUT "${SVMS_CUDA_GEN}/VoiceStageCUDA_fatbin.h"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${SVMS_CUDA_GEN}"
+        COMMAND "${SVMS_NVCC}" -fatbin -O3 --fmad=false -prec-div=true
+                -prec-sqrt=true -ftz=false --compress-mode=none
+                ${SVMS_CUDA_GENCODE} "${SVMS_CUDA_SOURCE}"
+                -o "${SVMS_CUDA_GEN}/VoiceStageCUDA.fatbin"
+        COMMAND "${CMAKE_COMMAND}" "-DBIN2C=${SVMS_BIN2C}"
+                "-DIN=${SVMS_CUDA_GEN}/VoiceStageCUDA.fatbin"
+                "-DOUT=${SVMS_CUDA_GEN}/VoiceStageCUDA_fatbin.h"
+                -DNAME=svms_cuda_fatbin
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/EmbedFatbin.cmake"
+        DEPENDS "${SVMS_CUDA_SOURCE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/EmbedFatbin.cmake"
+        COMMENT "Compiling the CUDA kernels of the GPU render stage"
+        VERBATIM)
+    target_sources(svms_gpu_cuda PRIVATE "${SVMS_CUDA_GEN}/VoiceStageCUDA_fatbin.h")
+    target_include_directories(svms_gpu_cuda PRIVATE "${SVMS_CUDA_GEN}")
+    target_compile_definitions(svms_gpu_cuda PRIVATE SVMS_HAVE_CUDA_KERNELS=1)
+    message(STATUS "SVMS: CUDA kernels enabled (${SVMS_NVCC})")
+else()
+    message(STATUS "SVMS: CUDA kernels not embedded (no nvcc/bin2c; set CUDA_PATH)")
+endif()
 
 if(WIN32)
     enable_language(RC)
@@ -206,7 +255,7 @@ if(NOT WIN32)
         render/RenderKernelsSSE2.cpp
         render/RenderKernelsAVX2.cpp
         render/GpuStage.cpp
-        render/GpuBackendGL.cpp)
+        render/GpuBackendGL.cpp $<TARGET_OBJECTS:svms_gpu_cuda>)
 
     set_source_files_properties(render/RenderKernelsSSE2.cpp PROPERTIES
         COMPILE_OPTIONS "-msse2;-mno-avx")
@@ -614,6 +663,9 @@ foreach(svms_engine_target ${SVMS_DLL_TARGETS})
         continue()
     endif()
     target_link_libraries(${svms_engine_target} PRIVATE svms_engine)
+    if(TARGET svms_gpu_cuda)
+        target_link_libraries(${svms_engine_target} PRIVATE svms_gpu_cuda)
+    endif()
     if(SVMS_XP_COMPAT)
         target_link_libraries(${svms_engine_target} PRIVATE
             dsound dxguid shell32 user32)
@@ -1330,7 +1382,7 @@ if(SVMS_BUILD_TESTS)
     )
     if(NOT SVMS_XP_COMPAT)
         target_sources(svms_v3_tests PRIVATE render/RenderKernelsAVX2.cpp
-            render/GpuStage.cpp render/GpuBackendGL.cpp)
+            render/GpuStage.cpp render/GpuBackendGL.cpp $<TARGET_OBJECTS:svms_gpu_cuda>)
     endif()
     target_compile_definitions(svms_v3_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS SVMS_ENABLE_REFERENCE_RENDERER=1)
@@ -1542,7 +1594,7 @@ if(SVMS_BUILD_TESTS)
 
         add_executable(svms_v3_bench tests/V3Bench.cpp synth/SoundFont.cpp synth/SfzLoader.cpp render/RenderKernels.cpp render/RenderWorkers.cpp
             render/RenderDispatch.cpp render/RenderKernelsSSE2.cpp render/RenderKernelsAVX2.cpp
-            render/GpuStage.cpp render/GpuBackendGL.cpp)
+            render/GpuStage.cpp render/GpuBackendGL.cpp $<TARGET_OBJECTS:svms_gpu_cuda>)
         target_compile_definitions(svms_v3_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
             SVMS_ENABLE_REFERENCE_RENDERER=1)
         target_include_directories(svms_v3_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
