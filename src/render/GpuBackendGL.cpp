@@ -139,6 +139,10 @@ public:
     bool MakeCurrent();
     void Release();
     void Destroy();
+    // Remember / put back whichever context the calling thread had current, so
+    // a host that renders with OpenGL on this thread keeps its own context.
+    void Push();
+    void Pop();
     void* Proc(const char* name) const;
 
 private:
@@ -150,6 +154,8 @@ private:
     PROC (WINAPI* getProc_)(LPCSTR) = nullptr;
     BOOL (WINAPI* makeCurrent_)(HDC, HGLRC) = nullptr;
     BOOL (WINAPI* deleteContext_)(HGLRC) = nullptr;
+    HDC prevDc_ = nullptr;
+    HGLRC prevRc_ = nullptr;
 #else
     void* egl_ = nullptr;
     void* display_ = nullptr;
@@ -178,6 +184,7 @@ bool GLContext::Create(std::string& error) {
         GetProcAddress(opengl32_, "wglMakeCurrent"));
     getProc_ = reinterpret_cast<PROC(WINAPI*)(LPCSTR)>(
         GetProcAddress(opengl32_, "wglGetProcAddress"));
+    Push();
     auto choosePixelFormat = reinterpret_cast<int(WINAPI*)(HDC, const PIXELFORMATDESCRIPTOR*)>(
         GetProcAddress(gdi32, "ChoosePixelFormat"));
     auto setPixelFormat = reinterpret_cast<BOOL(WINAPI*)(HDC, int, const PIXELFORMATDESCRIPTOR*)>(
@@ -241,8 +248,27 @@ bool GLContext::MakeCurrent() {
     return rc_ && makeCurrent_(dc_, rc_) != FALSE;
 }
 
+void GLContext::Push() {
+    if (!opengl32_) opengl32_ = LoadLibraryW(L"opengl32.dll");
+    if (!opengl32_) return;
+    auto getDc = reinterpret_cast<HDC(WINAPI*)()>(
+        GetProcAddress(opengl32_, "wglGetCurrentDC"));
+    auto getRc = reinterpret_cast<HGLRC(WINAPI*)()>(
+        GetProcAddress(opengl32_, "wglGetCurrentContext"));
+    prevDc_ = getDc ? getDc() : nullptr;
+    prevRc_ = getRc ? getRc() : nullptr;
+}
+
+void GLContext::Pop() {
+    if (!makeCurrent_) return;
+    if (prevRc_ && prevRc_ != rc_) makeCurrent_(prevDc_, prevRc_);
+    else makeCurrent_(nullptr, nullptr);
+    prevDc_ = nullptr;
+    prevRc_ = nullptr;
+}
+
 void GLContext::Release() {
-    if (makeCurrent_) makeCurrent_(nullptr, nullptr);
+    Pop();
 }
 
 void GLContext::Destroy() {
@@ -251,6 +277,7 @@ void GLContext::Destroy() {
         deleteContext_(rc_);
     }
     rc_ = nullptr;
+    Pop();
     if (window_) {
         HMODULE user32 = GetModuleHandleW(L"user32.dll");
         auto destroy = reinterpret_cast<BOOL(WINAPI*)(HWND)>(
@@ -343,6 +370,9 @@ bool GLContext::Create(std::string& error) {
     }
     return true;
 }
+
+void GLContext::Push() {}
+void GLContext::Pop() {}
 
 bool GLContext::MakeCurrent() {
     return context_ &&
@@ -1005,6 +1035,7 @@ Result GLBackend::Collect(uint64_t timeoutMicros, const float** mixLR,
 
 void GLBackend::Shutdown() {
     if (!created_) return;
+    context_.Push();
     if (context_.MakeCurrent()) {
         Abandon();
         for (GLuint program : programs_)

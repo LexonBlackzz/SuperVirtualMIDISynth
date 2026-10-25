@@ -10,6 +10,10 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-25 fix(v3): the OpenGL GPU stage keeps the host's current GL context. Creating
+  mine used to unbind the calling thread's context, which crashed Ziggy's ImGui
+  right after its shader compile failed; I now save it and put it back.
+
 - 2026-10-25 feat(v3): `svms_v3_render` uses the GPU render stage. It follows the driver
   `gpu_api` setting by default, so the Configurator render gets it too, and
   `--gpu-api off|auto|opengl|vulkan|d3d11|cuda` overrides it.
