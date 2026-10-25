@@ -2300,7 +2300,28 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
         else if (controller == 73u) ctl.attack = static_cast<int16_t>(centered * 3600 / 64);
         else if (controller == 72u) ctl.release = static_cast<int16_t>(centered * 3600 / 64);
         else if (controller == 121u) ctl = ChannelSoundCtl{};
-        if (controller >= 71u && controller <= 74u) ++channelLaunchRevision_[channel];
+        else if (controller == 99u || controller == 98u) {
+            // Selecting an NRPN deselects the RPN, so a later data entry can
+            // not move the pitch bend range.
+            (controller == 99u ? ctl.nrpnMsb : ctl.nrpnLsb) = value;
+            if (channelCache) {
+                channelCache->ControlChange(channel, 101u, 127u);
+                channelCache->ControlChange(channel, 100u, 127u);
+            }
+        } else if (controller == 101u || controller == 100u) {
+            ctl.nrpnMsb = ctl.nrpnLsb = 0u;
+        } else if (controller == 6u && ctl.nrpnMsb == 1u) {
+            // GS NRPNs: 0x20 cutoff, 0x21 resonance, 0x63 attack, 0x66 release.
+            switch (ctl.nrpnLsb) {
+            case 0x20: ctl.cutoff = static_cast<int16_t>(centered * 2400 / 64); break;
+            case 0x21: ctl.resonance = static_cast<int16_t>(centered * 240 / 63); break;
+            case 0x63: ctl.attack = static_cast<int16_t>(centered * 3600 / 64); break;
+            case 0x66: ctl.release = static_cast<int16_t>(centered * 3600 / 64); break;
+            default: break;
+            }
+        }
+        if ((controller >= 71u && controller <= 74u) || controller == 6u)
+            ++channelLaunchRevision_[channel];
     }
     if (channel < kChannelCount &&
         (controller == 0u || controller == 32u || controller == 6u ||

@@ -979,7 +979,11 @@ private:
     float channelPitchBendRatio_[kChannelCount];
     // CC74 cutoff / CC71 resonance / CC73 attack / CC72 release offsets in
     // cents, centibels and timecents; read when a note launches.
-    struct ChannelSoundCtl { int16_t cutoff, resonance, attack, release; };
+    // nrpnMsb/Lsb track the selected NRPN (0 = none).
+    struct ChannelSoundCtl {
+        int16_t cutoff, resonance, attack, release;
+        uint8_t nrpnMsb, nrpnLsb;
+    };
     ChannelSoundCtl channelSoundCtl_[kChannelCount];
     uint32_t sampleStoreCount;
     uint32_t sampleDataFrames;

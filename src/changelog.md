@@ -10,6 +10,10 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-25 feat(v3): GS NRPN cutoff, resonance, attack and release (MSB 1, LSB 0x20/21/63/66)
+  feed the same launch-time offsets as CC74/71/73/72. Selecting an NRPN now also
+  deselects the RPN, so its data entry can no longer move the pitch bend range.
+
 - 2026-10-25 feat(v3): CC74 (cutoff), CC71 (resonance), CC73 (attack) and CC72
   (release) are read when a note launches, so they ride the whole-voice path
   with no extra cost. Cutoff is +-2400 cents, resonance up to +-24 dB, attack
