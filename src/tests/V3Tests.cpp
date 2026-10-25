@@ -137,6 +137,7 @@ int main() {
 #endif
     TestWholeVoiceStealDifferential();
     TestStealTailSpanAvx2();
+    TestWholeVoiceLoudStealParity();
     TestWholeVoiceRotationStealDifferential();
     TestWholeVoiceLaunchDifferential();
     TestLaunchStagingIdentity();

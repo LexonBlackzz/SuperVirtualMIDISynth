@@ -757,6 +757,162 @@ void TestStealTailSpanAvx2() {
     Check(totalDone >= 256u, "the AVX2 steal-tail kernel takes chunks in the cases");
 }
 
+struct WholeVoiceLoudStealContext {
+    svms::VoiceManager* voices;
+    const svms::ChannelParamsSnapshot* channelParams;
+    uint32_t playIndex = 5000u;
+    uint32_t launches = 0u;
+};
+
+void DispatchWholeVoiceLoudStealEvent(const svms::RenderEvent* events,
+                                      uint32_t eventCount, uint32_t,
+                                      void* userData) {
+    auto& context = *static_cast<WholeVoiceLoudStealContext*>(userData);
+    for (uint32_t index = 0u; index < eventCount; ++index) {
+        const svms::RenderEvent& event = events[index];
+        if (event.type != svms::RenderEventType::NoteOn) continue;
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 4096u;
+        setup.loopStart = 64u;
+        setup.loopEnd = 4032u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep = 0.637f + event.data1 * 0.011f;
+        setup.initialGain =
+            2.0f + 0.05f * static_cast<float>(context.launches + 1u);
+        setup.sustainLevel = 1.0f;
+        setup.attackGainStep = 0.0f;
+        setup.decaySlope = 1.0f;
+        setup.releaseDecay = 0.999f;
+        setup.gainLeft = setup.gainRight = 0.5f;
+        setup.sampleBacked = 1u;
+        setup.playIndex = context.playIndex++;
+        svms::VoiceHandle handle = svms::kInvalidVoice;
+        context.voices->LaunchVoiceGroup(
+            event.channel, event.data1, event.data2, &setup, 1u,
+            setup.playIndex, context.channelParams[event.channel], &handle);
+        if (handle != svms::kInvalidVoice) ++context.launches;
+    }
+}
+
+// Steals whose victims are loud enough to leave a fade tail (the differentials
+// above use a gain ladder so quiet that no tail is ever captured).  The
+// whole-voice renderer's in-block tail fade is not sample-identical to the
+// frame-major oracle's: the difference is a ~64-frame burst at each steal.
+// After listening to it (amplified 20x it is a faint swish) a peak difference
+// of 1% of the signal peak (-40 dB) is accepted; the tail census is not
+// compared here.  `lateSteals` puts every steal in the last 60 frames of the
+// block so the fade straddles the block end and is adopted into a tail slot;
+// `filtered` gives every victim a low-pass.
+void RunWholeVoiceLoudStealParity(bool lateSteals, bool filtered) {
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kPool = 192u;
+    constexpr uint32_t kBlocks = kPool - 2u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+             0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 32767.0f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    for (int backendPass = 0; backendPass < 2; ++backendPass) {
+        const bool avx2Pass = backendPass == 1;
+        if (avx2Pass &&
+            !svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) {
+            break;
+        }
+        auto seed = std::make_unique<svms::VoiceManager>();
+        ConfigureWholeVoiceSeedPool(*seed, channels, kPool, kPool, false);
+        for (uint32_t k = 0; k < seed->activeCount_; ++k) {
+            const uint32_t h = seed->activeList_[k];
+            seed->SetVoiceGain(h, 0.5f, 0.5f);
+            seed->RefreshMixGain(h, channels.GetParams()[seed->v.channel[h]]);
+            if (filtered) {
+                // Low-pass near 140 Hz: the test tones sit at 100-600 Hz.
+                const svms::PreparedVoiceFilter f = svms::PrepareVoiceLowPass(
+                    static_cast<uint8_t>(svms::FilterType::LowPass2Pole), 7500,
+                    0, 44100u);
+                seed->v.filterA0[h] = f.a0;
+                seed->v.filterB1[h] = f.b1;
+                seed->v.filterB2[h] = f.b2;
+                seed->v.filterEnabled[h] = f.enabled;
+            }
+        }
+        auto oracleVoices = std::make_unique<svms::VoiceManager>(*seed);
+        auto wholeVoices = std::make_unique<svms::VoiceManager>(*seed);
+        svms::ChannelCache oracleChannels = channels;
+        svms::ChannelCache wholeChannels = channels;
+        svms::RenderScalar oracle;
+        svms::RenderScalar whole;
+        Check(oracle.ReserveVoiceCapacity(kPool) &&
+                  whole.ReserveVoiceCapacity(kPool) &&
+                  oracle.ConfigureRenderThreads(1u, kFrames) &&
+                  whole.ConfigureRenderThreads(4u, kFrames) &&
+                  whole.SetRenderBackend(avx2Pass
+                                             ? svms::RenderBackend::AVX2
+                                             : svms::RenderBackend::Scalar),
+              "loud steal parity starts both renderers");
+        WholeVoiceLoudStealContext oracleContext{oracleVoices.get(),
+                                                 oracleChannels.GetParams()};
+        WholeVoiceLoudStealContext wholeContext{wholeVoices.get(),
+                                                wholeChannels.GetParams()};
+        oracle.SetEventBatchDispatcher(DispatchWholeVoiceLoudStealEvent,
+                                       &oracleContext);
+        whole.SetEventBatchDispatcher(DispatchWholeVoiceLoudStealEvent,
+                                      &wholeContext);
+        WholeVoiceRng rng;
+        float peak = 0.0f;
+        float diffPeak = 0.0f;
+        for (uint32_t block = 0; block < kBlocks; ++block) {
+            svms::RenderEvent event{};
+            event.type = svms::RenderEventType::NoteOn;
+            event.channel = static_cast<uint8_t>(rng.Next() % 4u);
+            event.data1 = static_cast<uint8_t>(36u + rng.Next() % 72u);
+            event.data2 = static_cast<uint8_t>(64u + rng.Next() % 64u);
+            event.frameOffset = lateSteals ? kFrames - 60u + rng.Next() % 40u
+                                           : 32u + rng.Next() % 469u;
+            event.ingressSequence = block;
+            std::vector<float> oracleLeft(kFrames, 0.0f),
+                oracleRight(kFrames, 0.0f), wholeLeft(kFrames, 0.0f),
+                wholeRight(kFrames, 0.0f);
+            const uint64_t blockStart = 10000u + block * kFrames;
+            oracle.RenderBlockReference(
+                *oracleVoices, oracleChannels, samples.data(), nullptr,
+                sampleCount, oracleLeft.data(), oracleRight.data(), kFrames,
+                cfg, &event, 1u, true, blockStart);
+            whole.RenderBlock(*wholeVoices, wholeChannels, samples.data(),
+                              nullptr, sampleCount, wholeLeft.data(),
+                              wholeRight.data(), kFrames, cfg, &event, 1u,
+                              true, blockStart);
+            for (uint32_t frame = 0; frame < kFrames; ++frame) {
+                peak = (std::max)(peak, (std::max)(std::fabs(oracleLeft[frame]),
+                                                   std::fabs(oracleRight[frame])));
+                diffPeak = (std::max)(diffPeak,
+                    (std::max)(std::fabs(oracleLeft[frame] - wholeLeft[frame]),
+                               std::fabs(oracleRight[frame] - wholeRight[frame])));
+            }
+        }
+        Check(oracleContext.launches == kBlocks &&
+                  wholeContext.launches == kBlocks,
+              "loud steal parity steals once per block");
+        Check(peak > 1.0f && diffPeak <= 0.01f * peak,
+              "loud-victim steal tails stay within -40 dB of the oracle");
+    }
+}
+
+void TestWholeVoiceLoudStealParity() {
+    RunWholeVoiceLoudStealParity(false, false);
+    RunWholeVoiceLoudStealParity(true, false);
+    RunWholeVoiceLoudStealParity(false, true);
+    RunWholeVoiceLoudStealParity(true, true);
+}
+
 // Rotated pools (Analytic/Sweep/Random pair form) ride the whole-voice path:
 // ghosts carry their rotation state into the in-band tail, and adopted tails
 // continue it.  Same scenario and oracle as the Coherent steal differential.
