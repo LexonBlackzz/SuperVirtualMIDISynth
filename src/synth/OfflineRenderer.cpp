@@ -81,6 +81,8 @@ struct Options {
     uint32_t phaseRotationMode = 0u;
     uint32_t tuningEdo = 12u;
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
+    uint32_t gpuApi = 0u;          // GPU render stage (gpu::Api), 0 = off
+    uint32_t gpuDeviceIndex = 0u;
     bool quiet = false;
     bool scanOnly = false;
     bool machineProgress = false;
@@ -227,6 +229,8 @@ bool ReportScanProgress(uint64_t processed, uint64_t total,
 void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
     o.tuningEdo = cfg.tuningEdo;
     o.phaseRotationMode = cfg.phaseRotationMode;
+    o.gpuApi = cfg.gpuApi;
+    o.gpuDeviceIndex = cfg.gpuDeviceIndex;
     if (cfg.renderBackend == RenderBackend::Scalar ||
         cfg.renderBackend == RenderBackend::SSE2 ||
         cfg.renderBackend == RenderBackend::AVX2)
@@ -344,6 +348,7 @@ void Usage() {
            L"  --limiter-release-ms F    Override release, 1-5000 ms\n"
            L"  --phase-rotation coherent|analytic|sweep|diffuse|random  Post-mix hum-killing phase rotation (default coherent/off)\n"
                        L"  --backend auto|scalar|sse2|avx2|gpu\n"
+                       L"  --gpu-api off|auto|opengl|vulkan|d3d11|cuda  GPU render stage (default: the driver setting)\n"
            L"  --tuning-edo 12|31    Melodic tuning (31EDO key 155 = middle C)\n"
            L"  --config FILE         Use this V3 config JSON instead of the active one\n"
            L"  --tracks A,B,...      Stem: keep notes of these 0-based MIDI tracks only (length unchanged)\n"
@@ -439,6 +444,15 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             const auto p=value(); if (!p || !ParseFloat(p,1.0f,5000.0f,o.limiterReleaseMs)) return false;
         } else if (arg == L"--phase-rotation") {
             const auto p=value(); if (!p || !ParsePhaseRotationMode(p,o.phaseRotationMode)) return false;
+        } else if (arg == L"--gpu-api") {
+            const auto p=value(); if (!p) return false; const std::wstring name=p;
+            if (name == L"off") o.gpuApi=0u;
+            else if (name == L"auto") o.gpuApi=1u;
+            else if (name == L"opengl") o.gpuApi=2u;
+            else if (name == L"vulkan") o.gpuApi=3u;
+            else if (name == L"d3d11") o.gpuApi=4u;
+            else if (name == L"cuda") o.gpuApi=5u;
+            else return false;
         } else if (arg == L"--backend") {
             const auto p=value(); if (!p) return false; const std::wstring name=p;
             if (name == L"auto") o.backend=RenderBackend::AVX512;
@@ -792,6 +806,8 @@ public:
         config.tuningEdo = o.tuningEdo;
         config.oversample = o.oversample;
         config.tuning = o.tuning;
+        config.gpuApi = o.gpuApi;
+        config.gpuDeviceIndex = o.gpuDeviceIndex;
         return synth_.Initialize(config, error);
     }
     void Dispatch(uint32_t message, uint64_t frame) override {

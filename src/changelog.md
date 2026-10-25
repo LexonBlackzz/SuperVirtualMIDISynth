@@ -10,6 +10,10 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-25 feat(v3): `svms_v3_render` uses the GPU render stage. It follows the driver
+  `gpu_api` setting by default, so the Configurator render gets it too, and
+  `--gpu-api off|auto|opengl|vulkan|d3d11|cuda` overrides it.
+
 - 2026-10-25 feat(v3): offline sessions can use the GPU render stage. `StandaloneSynthConfig::gpuApi`
   creates the same stage as the driver (no deadline, a stage that cannot start leaves the
   render on the CPU), and `SVMS_OfflineSessionConfig::gpu_api` (was `reserved[0]`) exposes it
