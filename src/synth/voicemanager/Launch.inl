@@ -67,6 +67,7 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
                                                         VoiceHandle preselectedVictim,
                                                         uint32_t preselectedVictimPosition,
                                                         VoiceHandle forcedVictim) {
+    ++stealPeekEpoch_;
     // While a lowered cap is still draining its forced-release tails, do not
     // admit replacement notes that would turn those tails back into primaries.
     // The transition is bounded by the forced release (normally 50 ms).
@@ -263,6 +264,7 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
 }
 
 inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
+    ++stealPeekEpoch_;
     if (handle >= maxVoices_ || stealCandidateDeferred_[handle] == 0u) return;
     stealCandidateDeferred_[handle] = 0u;
     if (stealCandidateReserved_[handle] != 0u) {
@@ -317,6 +319,7 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
 }
 
 inline void VoiceManager::StartRelease(VoiceHandle handle) {
+    ++stealPeekEpoch_;
     if (handle >= maxVoices_) return;
     if (v.state[handle] == static_cast<uint8_t>(VoiceState::Active)) {
         // A planner hook may advance this voice to the event frame and
@@ -363,6 +366,7 @@ inline void VoiceManager::StartRelease(VoiceHandle handle) {
 }
 
 inline void VoiceManager::FinalizeDeferredRelease(VoiceHandle handle) {
+    ++stealPeekEpoch_;
     if (handle >= maxVoices_ ||
         v.state[handle] != static_cast<uint8_t>(VoiceState::Releasing))
         return;
@@ -381,6 +385,7 @@ inline void VoiceManager::FinalizeDeferredRelease(VoiceHandle handle) {
 }
 
 inline void VoiceManager::AdoptStealTailSlot(uint32_t slot) {
+    ++stealPeekEpoch_;
     if (slot >= kStealTailReserve) return;
     if (v.stealTailFramesRemaining[slot] == 0u) return;
     if (stealTailPosition_[slot] < stealTailCount_) return;  // already live
@@ -392,6 +397,7 @@ inline void VoiceManager::AdoptStealTailSlot(uint32_t slot) {
 }
 
 inline void VoiceManager::RetireVoice(VoiceHandle handle) {
+    ++stealPeekEpoch_;
     if (handle >= maxVoices_ || v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
         return;
 
@@ -488,6 +494,7 @@ template <bool kStage>
 inline void VoiceManager::ApplyVoiceConfigurationFieldsImpl(
     VoiceHandle handle, const VoiceConfiguration& setup,
     const ChannelParamsSnapshot& cp, VoiceRenderClass knownClass) {
+    ++stealPeekEpoch_;
 #define SVMS_LAUNCH_SET(name, value) \
     do { \
         if constexpr (kStage) rec->name = (value); \
@@ -991,6 +998,7 @@ inline void VoiceManager::ReplaceGroupInPlace(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count,
     const VoiceHandle* outHandles, bool candidatesReservedInPlace) {
+    ++stealPeekEpoch_;
     // Staging: the group's successors are configured into launch records right
     // after this (groupStageNext_), so the victims' staged-field arrays survive
     // until the records are applied and their ghost copies can be deferred.
@@ -1062,6 +1070,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
     uint8_t channel, uint8_t note, uint8_t velocity,
     const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
     const ChannelParamsSnapshot& cp, VoiceHandle* outHandles) {
+    ++stealPeekEpoch_;
     if (count < 2u || count > 8u || perKeyVoiceCap_ != 0u || freeTop_ != 0u ||
         FastSteal() || !stealHeapValid_ || stealHeapCount_ == 0u)
         return false;
@@ -1235,6 +1244,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
 // runs: reserve the group's leaves, replace it in place (the victim here is
 // the zero-life group, whose tail the plan hook skips), configure, commit.
 inline void VoiceManager::CommitPendingLaunchImpl() {
+    ++stealPeekEpoch_;
     FlushPendingTree();
     PendingLaunch& p = pendingLaunch_;
     p.valid = false;
@@ -1273,6 +1283,7 @@ inline void VoiceManager::CommitPendingLaunchImpl() {
 inline void VoiceManager::CommitVoiceGroupConfigurations(
     const VoiceHandle* handles, uint32_t count,
     bool candidatesReservedInPlace) {
+    ++stealPeekEpoch_;
     if (!candidatesReservedInPlace) {
         // A prepared SF2 note becomes visible atomically. When every layer is
         // a stable candidate, publish all leaves first and repair the union of
@@ -1363,6 +1374,7 @@ inline bool VoiceManager::LaunchVoiceGroup(
         ++stealRejectCount_;
         return false;
     }
+    ++stealPeekEpoch_;
     // Scope the multiplicity to this launch: ApplyVoiceConfigurationFields
     // reads launchMult_, and every return path below must restore it.
     struct MultiplicityScope {

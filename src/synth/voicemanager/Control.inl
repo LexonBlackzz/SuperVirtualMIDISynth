@@ -147,6 +147,7 @@ inline void VoiceManager::SetVoiceEnvelope(VoiceHandle handle, float initialGain
                                             uint32_t decaySamples, float attackGainStep,
                                             float decaySlope, float releaseDecay,
                                             uint32_t releaseSamples) {
+    ++stealPeekEpoch_;
     if (handle >= maxVoices_) return;
     EnsureMaterialized(handle);
     v.targetGain[handle] = initialGain;
@@ -187,12 +188,14 @@ inline void VoiceManager::SetVoiceEnvelope(VoiceHandle handle, float initialGain
 }
 
 inline void VoiceManager::SetVoiceGain(VoiceHandle handle, float left, float right) {
+    ++stealPeekEpoch_;
     if (handle >= maxVoices_) return;
     v.gainLeft[handle]  = left;
     v.gainRight[handle] = right;
 }
 
 inline void VoiceManager::RefreshMixGain(VoiceHandle handle, const ChannelParamsSnapshot& cp) {
+    ++stealPeekEpoch_;
     if (handle >= maxVoices_) return;
     EnsureMaterialized(handle);
     v.mixGainL[handle] = v.gainLeft[handle] * cp.mixScaleLeft;
@@ -206,6 +209,7 @@ inline void VoiceManager::RefreshMixGain(VoiceHandle handle, const ChannelParams
 }
 
 inline void VoiceManager::RefreshMixGains(const ChannelParamsSnapshot* chParams) {
+    ++stealPeekEpoch_;
     ++staticEpoch_;
     bool stableTreeDirty = false;
     for (uint32_t ai = 0; ai < activeCount_; ++ai) {
@@ -266,6 +270,7 @@ inline void VoiceManager::ApplyChannelBendRatio(uint8_t channel,
 inline void VoiceManager::FoldVoiceMixGains(
     VoiceHandle handle, float mixScaleLeft, float mixScaleRight,
     bool& stableTreeDirty, bool writeRenderGain) {
+    ++stealPeekEpoch_;
     const uint32_t i = handle;
     EnsureMaterialized(handle);
     v.mixGainL[i] = v.gainLeft[i] * mixScaleLeft;
@@ -506,6 +511,7 @@ inline uint32_t VoiceManager::NoteOffOldestPlayIndices(
 inline bool VoiceManager::ForkReleasedUnits(
     uint8_t channel, uint8_t note, uint32_t playIndex, uint32_t units,
     bool sustain, uint32_t blockOffset) {
+    ++stealPeekEpoch_;
     constexpr uint32_t kMaxForkLayers = 16u;
     VoiceHandle source[kMaxForkLayers];
     uint32_t layers = 0u;
@@ -620,6 +626,7 @@ inline bool VoiceManager::ForkReleasedUnits(
 
 inline uint32_t VoiceManager::ReExciteKey(uint8_t channel, uint8_t note,
                                           uint32_t attackFrames) noexcept {
+    ++stealPeekEpoch_;
     if (attackFrames == 0u) attackFrames = ReExciteAttackFrames();
     uint32_t found = 0u;
     ForEachChannelKeyVoice(channel, note, [&](VoiceHandle h) {

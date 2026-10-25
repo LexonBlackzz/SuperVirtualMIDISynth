@@ -1209,7 +1209,25 @@ inline VoiceHandle VoiceManager::NextValidReleasingRingVictim(
     uint32_t bestPosition = 0u;
     uint64_t bestKey = 0u;
     uint32_t bestSlot = 0u;
-    {
+    // A rejected note-on mutates nothing, so the next one scans the identical
+    // window.  Reuse the previous winner while the fingerprint below (every
+    // mutator bumps stealPeekEpoch_) still matches, after confirming the
+    // winner itself is still the live Releasing voice at that position.
+    RingPeekCache& cache = ringPeekCache_;
+    bool cacheHit = false;
+    if (cache.valid && cache.epoch == stealPeekEpoch_ &&
+        cache.frame == currentFrame_ && cache.head == releasingRingHead_ &&
+        cache.count == releasingRingCount_ &&
+        cache.activeCount == activeCount_ && cache.freeTop == freeTop_ &&
+        cache.ageScale == stealAgeScale_ && cache.handle < maxVoices_ &&
+        v.state[cache.handle] == releasingState &&
+        activePosition_[cache.handle] == cache.position) {
+        bestHandle = static_cast<VoiceHandle>(cache.handle);
+        bestPosition = cache.position;
+        bestSlot = cache.slot;
+        cacheHit = true;
+    }
+    if (!cacheHit) {
         const uint32_t window =
             releasingRingCount_ < 12u ? releasingRingCount_ : 12u;
         for (uint32_t i = 0u; i < window; ++i) {
@@ -1238,6 +1256,19 @@ inline VoiceHandle VoiceManager::NextValidReleasingRingVictim(
         }
     }
     if (bestHandle != kInvalidVoice) {
+        if (!cacheHit) {
+            cache.valid = true;
+            cache.epoch = stealPeekEpoch_;
+            cache.frame = currentFrame_;
+            cache.head = releasingRingHead_;
+            cache.count = releasingRingCount_;
+            cache.activeCount = activeCount_;
+            cache.freeTop = freeTop_;
+            cache.ageScale = stealAgeScale_;
+            cache.handle = bestHandle;
+            cache.position = bestPosition;
+            cache.slot = bestSlot;
+        }
         if (!consume) {
             victimPosition = bestPosition;
             return bestHandle;

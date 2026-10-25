@@ -205,6 +205,7 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
 }
 
 inline void VoiceManager::CopyFrom(const VoiceManager& other) {
+    ++stealPeekEpoch_;
     v = other.v;
     std::memcpy(metadataStorage_, other.metadataStorage_, metadataBytes_);
     activeCount_ = other.activeCount_;
@@ -308,6 +309,7 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
 }
 
 inline void VoiceManager::Reset() {
+    ++stealPeekEpoch_;
     v.Reset();
     std::memset(activeList_, 0, sizeof(*activeList_) * maxVoices_);
     std::memset(activePosition_, 0xff,
@@ -398,6 +400,7 @@ inline void VoiceManager::Reset() {
 }
 
 inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
+    ++stealPeekEpoch_;
     if (capacity <= maxVoices_) return capacity != 0u;
     if (capacity == 0u || capacity > kMaxPolyphony) return false;
 
@@ -698,6 +701,7 @@ inline bool VoiceManager::SetVoiceLimit(uint32_t limit) {
 
 inline uint32_t VoiceManager::EnforceVoiceLimit(uint32_t maxReleases,
                                                  float releaseSeconds) {
+    ++stealPeekEpoch_;
     if (voiceLimit_ == 0u || maxReleases == 0u) return 0u;
     const uint32_t releasing = GetReleasingCount();
     const uint32_t primaryVoices = activeCount_ > releasing
@@ -944,6 +948,7 @@ inline void VoiceManager::RecordVictimGroupForTest(
 #endif
 
 inline void VoiceManager::ApplyRuntimeVoiceLimit(uint64_t frame) {
+    ++stealPeekEpoch_;
     SetCurrentFrame(frame);
     // RuntimeLink publishes only a process-local atomic request. Applying it
     // here keeps all VoiceManager mutation on the audio/render thread. This

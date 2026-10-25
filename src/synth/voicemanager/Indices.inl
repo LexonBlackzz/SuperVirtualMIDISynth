@@ -18,6 +18,7 @@ inline void VoiceManager::ForEachChannelActive(
 }
 
 inline void VoiceManager::InvalidateStealCandidates() {
+    ++stealPeekEpoch_;
     stealHeapValid_ = false;
 }
 
@@ -148,6 +149,7 @@ inline void VoiceManager::PrefetchVoiceLines(VoiceHandle handle) {
 }
 
 inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity) {
+    ++stealPeekEpoch_;
     v.state[handle]        = static_cast<uint8_t>(VoiceState::Active);
     v.channel[handle]      = channel;
     v.note[handle]         = note;
@@ -220,6 +222,7 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
 inline void VoiceManager::InitializePreparedVoice(
     VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity,
     bool staged) {
+    ++stealPeekEpoch_;
     // ConfigureVoice immediately supplies every sample/envelope/gain field.
     // Initialize only state observed by lifecycle indices before that
     // transaction commits, avoiding dozens of default stores per SF2 note.

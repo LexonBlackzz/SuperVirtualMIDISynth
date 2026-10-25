@@ -907,6 +907,17 @@ public:
     // Diagnostic counter: steals served by the Releasing-ring fast path
     // instead of the stable-tree/volatile-heap tiers.
     uint64_t releasingRingHits_{0u};
+    // Peek cache for the Releasing-ring window scan.  Every mutation that can
+    // change a window entry's validity or key without moving the ring head,
+    // the active count or the free stack bumps stealPeekEpoch_; the scan result
+    // is reused only while all of those and the frame are unchanged.
+    uint32_t stealPeekEpoch_{0u};
+    struct RingPeekCache {
+        bool valid;
+        uint32_t epoch, head, count, activeCount, freeTop, handle, position, slot;
+        uint64_t frame;
+        float ageScale;
+    } ringPeekCache_{};
     uint32_t GetReleasingRingCountForTest() const {
         return releasingRingCount_;
     }
