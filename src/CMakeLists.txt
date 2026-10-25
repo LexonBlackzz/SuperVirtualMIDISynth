@@ -1048,7 +1048,9 @@ if(NOT SVMS_XP_COMPAT)
         render/RenderKernelsSSE2.cpp
         render/RenderKernelsAVX2.cpp
         render/GpuSynth.cpp
-        render/GpuDevice.cpp)
+        render/GpuDevice.cpp
+        render/GpuStage.cpp
+        render/GpuBackendGL.cpp $<TARGET_OBJECTS:svms_gpu_cuda>)
     target_compile_definitions(svms_v3_render PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     if(MINGW)
@@ -1075,7 +1077,9 @@ if(NOT SVMS_XP_COMPAT)
         render/RenderKernelsSSE2.cpp
         render/RenderKernelsAVX2.cpp
         render/GpuSynth.cpp
-        render/GpuDevice.cpp)
+        render/GpuDevice.cpp
+        render/GpuStage.cpp
+        render/GpuBackendGL.cpp $<TARGET_OBJECTS:svms_gpu_cuda>)
     target_compile_definitions(svms_v3_realtime_block_tests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_realtime_block_tests PRIVATE
@@ -1628,7 +1632,8 @@ if(SVMS_BUILD_TESTS)
         target_link_libraries(svms_v3_midi_song PRIVATE winmm shell32)
         if(NOT SVMS_XP_COMPAT)
             target_sources(svms_v3_midi_song PRIVATE
-                render/GpuSynth.cpp render/GpuDevice.cpp)
+                render/GpuSynth.cpp render/GpuDevice.cpp
+                render/GpuStage.cpp render/GpuBackendGL.cpp $<TARGET_OBJECTS:svms_gpu_cuda>)
             target_link_libraries(svms_v3_midi_song PRIVATE d3d11 dxgi d3dcompiler)
         endif()
         add_test(NAME svms_v3_midi_song

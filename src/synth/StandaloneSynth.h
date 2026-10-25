@@ -74,6 +74,10 @@ struct StandaloneSynthConfig {
     // note that is not louder than its quietest voice (VoiceManager::SetStealReject).
     bool stealReject = false;
     bool stealAgeless = false;  // with stealReject: BASSMIDI 2018 ranking, no age term
+    // GPU render stage (render/GpuStage.h): 0 off, otherwise a gpu::Api value.
+    // A stage that cannot start leaves the render on the CPU.
+    uint32_t gpuApi = 0u;
+    uint32_t gpuDeviceIndex = 0u;
 };
 
 // Platform-neutral owner for the existing V3 synthesis core. Event ordering
@@ -190,6 +194,20 @@ public:
             }
             gpuEnabled_ = false;
         }
+#if defined(SVMS_GPU_STAGE)
+        if (config.gpuApi != 0u) {
+            std::string gpuError;
+            gpuStage_ = GpuStage::Create(static_cast<gpu::Api>(config.gpuApi),
+                                         config.gpuDeviceIndex, gpuError);
+            if (gpuStage_) {
+                gpuStage_->SetSampleRate(rate_);
+                // Offline has no deadline: a slow block is waited for.
+                gpuStage_->SetDeadlinePercent(1000000u);
+                gpuStage_->SetMaxFramesHint(config.maxBlockFrames);
+                renderer_.SetGpuStage(gpuStage_.get());
+            }
+        }
+#endif
         for (float& ratio : bendRatio_) ratio = 1.0f;
         sysexMasterVolume_ = 1.0f;
         sysexMasterFineTune_ = 0.0f;
@@ -292,6 +310,9 @@ public:
     uint32_t SoundFontCount() const { return uint32_t(banks_.size()); }
 
     ~StandaloneSynth() {
+#if defined(SVMS_GPU_STAGE)
+        renderer_.SetGpuStage(nullptr);
+#endif
         // Opt-in end-of-session diagnostic: every plan refusal is a skipped
         // stretch (silence), so a real file should report zero.
         if (std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {
@@ -1263,6 +1284,9 @@ private:
     std::vector<PreparedRegion> prepared_;
     VoiceManager voices_;
     ChannelCache channels_;
+#if defined(SVMS_GPU_STAGE)
+    std::unique_ptr<GpuStage> gpuStage_; // declared before renderer_ so it is destroyed after it
+#endif
     RenderScalar renderer_;
     bool gpuEnabled_ = false;
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)

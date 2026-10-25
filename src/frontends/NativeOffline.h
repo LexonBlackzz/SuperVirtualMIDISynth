@@ -61,6 +61,7 @@ public:
                 synthConfig.stealAgeless = g_nativeOfflineStealAgeless.load(std::memory_order_relaxed);
                 synthConfig.sampleRate = config->sample_rate;
                 synthConfig.maxVoices = config->max_voices;
+                synthConfig.gpuApi = config->gpu_api;
                 synthConfig.renderThreads = config->render_threads;
                 synthConfig.maxBlockFrames = config->max_block_frames;
                 synthConfig.masterVolume = config->master_volume;

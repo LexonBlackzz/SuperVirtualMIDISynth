@@ -10,6 +10,11 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-25 feat(v3): offline sessions can use the GPU render stage. `StandaloneSynthConfig::gpuApi`
+  creates the same stage as the driver (no deadline, a stage that cannot start leaves the
+  render on the CPU), and `SVMS_OfflineSessionConfig::gpu_api` (was `reserved[0]`) exposes it
+  through `create_offline_session`.
+
 - 2026-10-25 feat(v3): GS NRPN cutoff, resonance, attack and release (MSB 1, LSB 0x20/21/63/66)
   feed the same launch-time offsets as CC74/71/73/72. Selecting an NRPN now also
   deselects the RPN, so its data entry can no longer move the pitch bend range.

@@ -191,7 +191,11 @@ typedef struct SVMS_OfflineSessionConfig {
        one reverb+limiter runs on the sum). Was reserved[0], so zeroed callers
        are unchanged; an older runtime rejects a nonzero value. 0..64. */
     uint32_t shards;
-    uint32_t reserved[3];
+    /* GPU render stage: 0 = off, otherwise the same API value as the driver's
+       gpu_api setting. Was reserved[0]; a stage that cannot start leaves the
+       render on the CPU. */
+    uint32_t gpu_api;
+    uint32_t reserved[2];
 } SVMS_OfflineSessionConfig;
 
 // frame_offset is exact within the current render call. Records must be
