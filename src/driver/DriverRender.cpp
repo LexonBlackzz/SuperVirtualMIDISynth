@@ -1,10 +1,37 @@
 // Audio callback and MIDI dispatch: RenderCallback, DispatchRenderEvent*,
 // Handle*. Kept in one file so the per-event calls stay inlinable.
+//
+// Contents:
+//   RenderCallback            the audio-thread entry point, one block per call
+//   DispatchRenderEvent       per-event dispatch at the event's exact frame
+//   DispatchRenderEventBatch  same-frame runs of note events in one call
+//   ResolveNoteRegions /      SoundFont region lookup for a note-on
+//   RefreshSelectedPresets
+//   Handle*                   NoteOn, NoteOff, ControlChange, ChannelPressure,
+//                             ProgramChange, PitchBend
+//   RefreshAllPitchIncrements recompute every voice's phase step after a
+//                             pitch or tuning change
 
 #include "driver/DriverInternal.h"
 
 namespace svms {
 
+// Renders one audio block into `output` (interleaved stereo float).
+//
+// Runs on the audio thread and must never block, allocate or take a lock.
+// Phases, in order:
+//   1. Block-boundary housekeeping: pending device format, SoundFont swap,
+//      live-config mailbox.
+//   2. Clear the mix buffers; pick the direct mix or the channel buses.
+//   3. Virtual render clock: advance it, recover from falling behind.
+//   4. Ingress: drain the MIDI queue (or take compiled pages), recover stale
+//      note events, fill the scheduler.
+//   5. Admission: pop every event due in this block, convert it to a
+//      RenderEvent with a frame offset, compact same-frame note-off runs.
+//   6. Render: RenderBlock (or forward the events to an external backend).
+//   7. Post: channel limiter, shards, copy to `output`, reverb, limiter.
+//   8. Timing and telemetry: CPU load, census lines, diagnostics window,
+//      callback trace, audio->control snapshot.
 void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     Driver* self = static_cast<Driver*>(userData);
     if (!self || !self->initialized) return;
@@ -31,7 +58,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
 
     if (!vm || !cc || !render || !snap) return;
 
-    // ── Mailbox sync: dirty-gated monotonic seqlock read ───────────
+    // ── 1. Mailbox sync: dirty-gated monotonic seqlock read ───────────
     // The control thread publishes only when the user actually moves a
     // knob; the mailbox is skipped entirely when the sequence matches
     // lastAppliedLiveSeq_ (the common per-block case).  On a torn (odd
@@ -114,6 +141,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->lastAppliedLiveSeq_ = appliedSeq;
     }
 
+    // ── Timing probes ──────────────────────────────────────────────
+    // Start-of-block timestamps for the CPU-load figure, the profile split
+    // and the optional callback trace.
     LARGE_INTEGER renderStartQPC;
     QueryPerformanceCounter(&renderStartQPC);
     const bool profileCallback = self->diagnosticsEnabled_;
@@ -146,6 +176,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         }
     }
 
+    // ── 2. Clear the mix buffers ───────────────────────────────────
     if (!self->leftBuffer || !self->rightBuffer) {
         std::memset(output, 0, numFrames * 2 * sizeof(float));
         return;
@@ -168,31 +199,24 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                                         numFrames);
     }
 
-    // ── Diagnostic: voice retire stats ──────────────────────────────
-
-    // ── Persistent Pending Queue — Unified Event Pipeline ──────────────
-    // The SPSC queue carries TimestampedMidiEvent structs from the MIDI
-    // host thread.  We drain ALL of them into a persistent, audio-thread-
-    // only `pendingEventBuffer`.  Events are converted to RenderEvent with
-    // a fractional sampleOffset computed ONCE against this block's start
-    // QPC.  From the pending queue we budget-extract at most
-    // kMaxEventsPerBlock events that fall within [0, numFrames) into
-    // evtBuf for dispatch.  Remaining events stay in the pending queue
-    // and have their offsets decremented by numFrames at block end (smooth
-    // rollover).  This guarantees:
+    // ── 3. Virtual render clock ────────────────────────────────────
+    // Event pipeline overview (steps 3-5):
+    //   MIDI host thread -> SPSC ingress queue -> (compiler thread, optional)
+    //   -> scheduler ordered by target frame -> admission into `evtBuf`.
+    // Every event is timestamped against the virtual render clock, so its
+    // frame offset inside a block is fixed once and never re-derived from
+    // wall time.  This guarantees:
     //
-    //   a) Zero event loss — events beyond the budget simply queue up and
-    //      fire in subsequent blocks (natural time-stretching).
-    //   b) No frame-0 clumping — pending offsets are decremented uniformly,
-    //      never re-computed from QPC.
-    //   c) Bounded per-block work — the DSP thread processes at most
-    //      kMaxEventsPerBlock events regardless of input density.
+    //   a) Zero event loss: events beyond the per-block budget stay in the
+    //      scheduler and fire in later blocks.
+    //   b) No frame-0 clumping: offsets are relative to the audio timeline.
+    //   c) Bounded per-block work: at most `eventBudget` events are admitted
+    //      per block, however dense the input is.
     uint64_t blockStartQPC;
     QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&blockStartQPC));
     self->tscClock_.Refresh(blockStartQPC, __rdtsc());
 
-    // ── Virtual render clock ─────────────────────────────────────────
-    // Monotonically advances by (numFrames * qpcFreq / sr) each callback
+    // The clock monotonically advances by (numFrames * qpcFreq / sr) each callback
     // so event offsets are relative to the audio timeline, not the
     // wall-clock callback time.  Without this, every SPSC event pushed
     // during the previous block has a negative deltaQPC and snaps to
@@ -215,6 +239,12 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // toggle on, the render cursor stays on its own timeline: events keep
     // their exact frames in exact order, playback runs at whatever speed
     // the engine manages, and WASAPI glitches instead of the schedule.
+    //
+    // Drift recovery: if a render takes more than 100% CPU the virtual clock
+    // falls behind wall time.  Left unchecked, event offsets would inflate
+    // forever, the queue would never drain and the audio would stay delayed.
+    // RecoverRealtimeRenderFrame fast-forwards the clock, and the skipped
+    // frames are counted in the telemetry.
     const uint64_t skippedFramesBefore = self->telemetry_.skippedOutputFrames;
     if (self->shardMaster_) {
         // Headless shard: lockstep with the master's (possibly recovered)
@@ -237,13 +267,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     const uint64_t traceOutputFrame =
         static_cast<uint64_t>(self->virtualRenderSample_);
 
-    // ── Drift recovery ──────────────────────────────────────────────
-    // If the render takes >100% CPU, the virtual clock falls behind
-    // wall time.  Left unchecked this causes permanent desync: event
-    // offsets inflate forever, the pending queue never drains, and the
-    // audio is delayed until reset.  Fast-forward the clock to catch
-    // up and rescale queued event offsets so they land in this block.
-    // ── Step 1: Drain ALL SPSC events → append to pending queue ─────────
+    // ── 4. Ingress: drain the MIDI queue into the scheduler ─────────
+    // Per-block stale-recovery tables are cleared first.  A note-on that
+    // arrives obsolete is parked per (channel, key) and replayed at the first
+    // frame of the block; late note-offs are counted and replayed in batches.
     uint32_t scannedIngress = 0;
     uint32_t admittedEvents = 0;
     std::memset(self->staleRecoveryValid_, 0,
@@ -252,7 +279,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                 sizeof(self->staleRecoveryNoteOffValid_));
     std::memset(self->staleRecoveryNoteOffCount_, 0,
                 sizeof(self->staleRecoveryNoteOffCount_));
-        // Apply a parked steal-policy switch at the block boundary: launch
+    // Apply a parked steal-policy switch at the block boundary: launch
     // transactions never span callbacks, so the index rebuild is atomic
     // with respect to every reserved-candidate commit.
     {
@@ -262,7 +289,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         if (pendingPolicy != UINT32_MAX && self->voiceManager)
             self->voiceManager->SetStealPolicy(pendingPolicy);
     }
-const uint32_t importedPages = self->useEventCompiler_
+    // With the event compiler, pre-compiled pages are imported into the paged
+    // scheduler; without it the loop below pops and compiles raw ingress here.
+    const uint32_t importedPages = self->useEventCompiler_
         ? self->FlushDirectPage() + self->pagedScheduler_.ImportAllReady()
         : 0u;
     if (self->useEventCompiler_) {
@@ -421,7 +450,8 @@ const uint32_t importedPages = self->useEventCompiler_
     self->scheduledSizePublished_.store(scheduledBeforeDispatch,
                                         std::memory_order_release);
 
-    // Extract only this render window.  Future events remain in the heap.
+    // ── 5. Admission ─────────────────────────────────────────────────
+    // Extract only this render window.  Future events remain in the scheduler.
     RenderEvent* evtBuf = self->eventBuffer;
     uint32_t evCount = 0;
     uint32_t examinedCount = 0;
@@ -452,6 +482,9 @@ const uint32_t importedPages = self->useEventCompiler_
     uint32_t lateDispatched = 0u;
     uint32_t admittedThisBlock = 0u;
     bool noteOffRunOpen = false;
+    // Admits one scheduled event into `evtBuf`, or drops it (obsolete note-on,
+    // backend load shedding).  Computes the event's frame offset in the block;
+    // events already late are clamped to frame 0 and counted.
     auto admitScheduled = [&](const ScheduledRenderEvent& scheduledOut) {
         ++examinedCount;
         // A merged note-on carries its count in the type byte; classify it
@@ -598,24 +631,11 @@ const uint32_t importedPages = self->useEventCompiler_
         WakeAddressWaiters(self->compilerWakeEpoch_);
     }
 
-    // ── Step 2: Sort pending queue by sampleOffset ─────────────────────
-    // Insertion sort.  The carry-forward portion (from previous blocks) is
-    // already sorted (offset decrement preserves relative order).  Newly
-    // appended SPSC events at the tail are the only unsorted elements.
-    // For mostly-sorted data this is O(N) with a small constant.
-
-    // ── Step 3: Extract all in-block events for this block ──────────────
-    // Walk the sorted pending queue from offset 0.  Take every event with
-    // sampleOffset < numFrames into evtBuf.  Stop at the first future
-    // event (offset >= numFrames).  With in-place voice recycling keeping
-    // active polyphony bounded to ~128-256 voices, the engine can process
-    // all incoming events in real-time without batch-chunking artifacts.
-    // ── Step 4: Decrement remaining pending offsets by numFrames ────────
-    // Smooth rollover: future events advance at the true audio clock rate
-    // toward their firing time without frame-boundary re-quantization.
-    // ── Step 5: Sort evtBuf by sampleOffset (defensive) ─────────────────
-
-    // ── Same-key same-frame note-off run compaction ─────────────────────
+    // The scheduler hands events back in (frame, sequence) order, so `evtBuf`
+    // needs no sort, and events left in the scheduler keep their absolute
+    // target frames (no per-block offset rewriting).
+    //
+    // Same-key same-frame note-off run compaction (done inside admitScheduled)
     // The compiler path delivers one event per note-off. Black-MIDI note-off
     // avalanches then cost twice: once as per-event dispatch, once as
     // whole-voice render fragmentation, because every event splits the block
@@ -630,7 +650,7 @@ const uint32_t importedPages = self->useEventCompiler_
     // note-ons, so the batch's ingressSequence (last member of the run) is
     // not consulted for note-offs.
 
-    // ── Step 6: Render with sub-sample event slicing ───────────────────
+    // ── 6. Render with exact-frame event slicing ─────────────────────
     // RenderBlock will invoke DispatchRenderEvent at each event's exact
     // fractional sample offset.  All event handling (voice allocation,
     // release, CC updates) happens inside the render loop via the callback.
@@ -670,7 +690,7 @@ const uint32_t importedPages = self->useEventCompiler_
     LARGE_INTEGER traceRenderEndQPC{};
     if (traceRing) QueryPerformanceCounter(&traceRenderEndQPC);
 
-    // ── Advance virtual render clock for the next callback ──────────
+    // ── 7. Post: advance the clock, copy out, effects ─────────────────
     self->virtualRenderSample_ += static_cast<int64_t>(numFrames);
     self->outputFramePublished_.store(
         static_cast<uint64_t>(self->virtualRenderSample_),
@@ -697,7 +717,7 @@ const uint32_t importedPages = self->useEventCompiler_
             self->sf2Telemetry_.lastPhase = vm->v.phases[h];
         }
     }
-    // Periodic pool census moved below: it needs the block's cpu/percent
+    // The pool census is emitted further down: it needs the block's cpu/percent
     // fields, which are only known after the post-processing timing pass.
     // Scheduler-lateness census, same 64-block cadence. Deltas since the
     // previous census keep the numbers readable while the stream runs.
@@ -823,6 +843,8 @@ const uint32_t importedPages = self->useEventCompiler_
 
     const uint64_t profilePostEnd = profileCallback ? __rdtsc() : 0u;
 
+    // ── 8. Timing and telemetry ────────────────────────────────────────
+    // cpuPct is the block's wall time as a percentage of its audio budget.
     LARGE_INTEGER renderEndQPC;
     QueryPerformanceCounter(&renderEndQPC);
 
@@ -974,7 +996,7 @@ const uint32_t importedPages = self->useEventCompiler_
     // Smooth CPU reading with a simple low-pass
     static float s_cpuSmoothed = 0.0f;
     if (!self->shardMaster_)
-    s_cpuSmoothed += 0.1f * (cpuPct - s_cpuSmoothed);
+        s_cpuSmoothed += 0.1f * (cpuPct - s_cpuSmoothed);
     static float s_schedulerSmoothed = 0.0f;
     static float s_dispatchSmoothed = 0.0f;
     static float s_synthesisSmoothed = 0.0f;
@@ -1048,8 +1070,8 @@ const uint32_t importedPages = self->useEventCompiler_
             std::snprintf(refuseCensus, sizeof(refuseCensus),
                 "[SVMS] planRefuse: type=%u ctrl=%u\n",
                 (unsigned)refuseType, (unsigned)refuseData1);
-    #if SVMS_AUDIO_CENSUS
-        OutputDebugStringA(refuseCensus);
+#if SVMS_AUDIO_CENSUS
+            OutputDebugStringA(refuseCensus);
 #endif
         }
     }
@@ -1306,10 +1328,13 @@ const uint32_t importedPages = self->useEventCompiler_
 #endif
 }
 
-// ── EventDispatcher callback ─────────────────────────────────────────────
-// Called by RenderScalar::RenderBlock at each event's exact sub-sample
-// position.  Voice allocation, release, CC updates all happen here so
-// that the sub-sample phase offset and releaseStartInBlock are set at the precise frame.
+// ── Event dispatch ───────────────────────────────────────────────────────
+
+// Dispatches one event.  Called by RenderScalar::RenderBlock at each event's
+// exact frame (`blockCursor`), so voice allocation, release and controller
+// updates all take effect at the precise sample.  Note-ons and re-excites are
+// first checked against the termination fences (a CC120/CC123/reset that
+// arrived later in ingress order must not be undone by an earlier note-on).
 void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
                                   void* userData) {
     Driver* self = static_cast<Driver*>(userData);
@@ -1466,6 +1491,11 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
     }
 }
 
+// Dispatches a range of events that share one output frame.  Runs of
+// note-ons and note-offs are handled together (one prologue, shared launch
+// plan); anything else breaks the run and goes through DispatchRenderEvent.
+// Under PriorityVelocity overflow, superseded state writes in the range may
+// be coalesced; otherwise every event is applied literally in order.
 void Driver::DispatchRenderEventBatch(const RenderEvent* events,
                                       uint32_t eventCount,
                                       uint32_t blockCursor, void* userData) {
@@ -1722,6 +1752,12 @@ void Driver::DispatchRenderEventBatch(const RenderEvent* events,
         self->dispatchCyclesCurrent_ += __rdtsc() - profileBegin;
 }
 
+// ── Note handling ────────────────────────────────────────────────────────
+
+// Finds the SoundFont regions that sound for (preset, note, velocity).
+// Results are memoized in a direct-mapped cache keyed by the packed tuple, so
+// a repeated note skips the region search.  Returns the full region count
+// even when more than `outCapacity` regions match.
 uint32_t Driver::ResolveNoteRegions(const SoundFontBundle* bank,
                                     uint8_t soundFontIndex,
                                     uint32_t presetIndex, uint8_t note,
@@ -1765,6 +1801,8 @@ uint32_t Driver::ResolveNoteRegions(const SoundFontBundle* bank,
     return count;
 }
 
+// Re-resolves the selected preset (and SoundFont index) of every channel from
+// its bank/program state.  Used after a reset or a SoundFont swap.
 void Driver::RefreshSelectedPresets() {
     if (!channelCache || !activeSoundFontStack_) return;
     for (uint8_t channel = 0; channel < kChannelCount; ++channel) {
@@ -1782,6 +1820,11 @@ void Driver::RefreshSelectedPresets() {
     }
 }
 
+// Launches the voices for one note-on at `blockOffset`.  `multiplicity` > 1
+// stands for that many merged identical note-ons.  With
+// `deferLifetimeCounters` the caller (the batch dispatcher) folds the
+// telemetry counters itself; `exactFramePlan` is the batch's reusable launch
+// plan.  Returns the number of voices configured.
 uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
                               bool deferLifetimeCounters,
                               const NoteLaunchPlanCacheEntry* exactFramePlan,
@@ -2185,6 +2228,10 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     return lifetimeDelta;
 }
 
+// ── Channel events ───────────────────────────────────────────────────────
+
+// Releases the oldest sounding voice of (channel, note), or holds it if the
+// sustain pedal is down.
 void Driver::HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset) {
     if (!channelCache || !voiceManager) return;
 
@@ -2201,6 +2248,8 @@ void Driver::HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset) 
                                            blockOffset);
 }
 
+// Applies `count` identical note-offs for (channel, note) at once; equivalent
+// to `count` sequential HandleNoteOff calls with nothing in between.
 void Driver::HandleStaleNoteOffBatch(uint8_t channel, uint8_t note,
                                      uint8_t count,
                                      uint32_t blockOffset) {
@@ -2211,6 +2260,9 @@ void Driver::HandleStaleNoteOffBatch(uint8_t channel, uint8_t note,
                                            blockOffset);
 }
 
+// Applies a controller change: updates the channel cache, then the playing
+// voices that depend on it (sustain/sostenuto release, volume/pan mix gains,
+// vibrato depth, bank/program state, and CC120/CC123 voice termination).
 void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t value,
                                  uint32_t blockOffset) {
     const bool sustainWasActive = channelCache && channelCache->IsSustainActive(channel);
@@ -2304,6 +2356,8 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     }
 }
 
+// Channel aftertouch: updates the channel cache and rebuilds the channel's
+// derived parameters (it feeds vibrato depth).
 void Driver::HandleChannelPressure(uint8_t channel, uint8_t value) {
     if (!channelCache || channel >= kChannelCount) return;
     channelCache->ChannelPressure(channel, value);
@@ -2316,6 +2370,8 @@ void Driver::HandleChannelPressure(uint8_t channel, uint8_t value) {
             channel, channelCache->GetParams()[channel].modDepth);
 }
 
+// Selects the program on a channel.  Takes effect for later note-ons only;
+// voices already playing keep their instrument.
 void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
     if (!channelCache || !activeSoundFontStack_ ||
         channel >= kChannelCount) return;
@@ -2342,6 +2398,7 @@ void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
     ++channelLaunchRevision_[channel];
 }
 
+// Applies a 14-bit pitch bend to the channel and to its playing voices.
 void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
     if (channelCache)
         channelCache->PitchBend(channel, static_cast<int16_t>((msb << 7) | lsb));
@@ -2360,6 +2417,8 @@ void Driver::HandlePitchBend(uint8_t channel, uint8_t lsb, uint8_t msb) {
     voiceManager->ApplyChannelBendRatio(channel, bendSemitones);
 }
 
+// Recomputes every channel's bend ratio (pitch bend plus the SysEx master
+// tune/transpose terms) and applies it to the playing voices.
 void Driver::RefreshAllPitchIncrements() {
     if (!voiceManager || !channelCache) return;
     for (uint8_t channel = 0u; channel < kChannelCount; ++channel) {

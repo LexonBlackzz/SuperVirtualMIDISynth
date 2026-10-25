@@ -42,9 +42,27 @@
 #include <thread>
 #include <vector>
 
+// Standalone offline renderer (svms_v3_render): MIDI file + SoundFont -> WAV.
+//
+// File map:
+//   Options, Parse*, Usage   command line
+//   Machine*                 tab-separated progress stream for other frontends
+//   ExternalCancellation     a named Windows event that cancels a render
+//   WaveWriter               streaming float32 WAV / RF64 writer
+//   OfflineSessionSynth      the synth interface the render loop drives, with
+//                            Legacy / Sharded / Canonical implementations
+//   MergeStems, RunStems     one synth instance per track, then optional merge
+//   RenderOne                one complete decode -> synth -> WAV render
+//   RendererMain             entry point: config, options, dispatch
+//
+// Rendering is a single pass: a decoder thread streams parsed events into a
+// bounded ring while the render loop consumes them in frame order.
+
 namespace svms {
 namespace {
 
+// Everything the command line can set.  Defaults come from the active V3
+// config (ApplyConfigDefaults); command-line flags override them.
 struct Options {
     std::wstring midi, soundfont, output;
     uint32_t sampleRate = 44100;
@@ -129,6 +147,8 @@ void MachineRenderProgress(const Options& o, double progress, double elapsed,
     std::fflush(stdout);
 }
 
+// Wraps an optional named Windows event; when it is signalled, the render is
+// cancelled.  Without a name it never requests cancellation.
 class ExternalCancellation {
 public:
     ~ExternalCancellation() {
@@ -167,6 +187,7 @@ private:
 #endif
 };
 
+// State for the file-scan progress callback.
 struct ScanProgressContext {
     const Options* options = nullptr;
     ExternalCancellation* externalCancel = nullptr;
@@ -175,6 +196,8 @@ struct ScanProgressContext {
     std::chrono::steady_clock::time_point last{};
 };
 
+// Scan progress callback, rate-limited to every 100 ms.  Returns false to stop
+// the scan (cancelled).
 bool ReportScanProgress(uint64_t processed, uint64_t total,
                         uint64_t, void* user) {
     auto& context = *static_cast<ScanProgressContext*>(user);
@@ -199,6 +222,8 @@ bool ReportScanProgress(uint64_t processed, uint64_t total,
     return true;
 }
 
+// Seeds `o` from the active engine config so the renderer matches the live
+// synth unless a flag says otherwise.
 void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
     o.tuningEdo = cfg.tuningEdo;
     o.phaseRotationMode = cfg.phaseRotationMode;
@@ -221,6 +246,7 @@ void ApplyConfigDefaults(const EngineConfig& cfg, Options& o) {
     o.limiterReleaseMs = cfg.limiterReleaseMs;
 }
 
+// Seconds as HH:MM:SS, or "--:--:--" when unknown.
 std::wstring FormatTime(double seconds) {
     if (!std::isfinite(seconds) || seconds < 0) return L"--:--:--";
     const uint64_t s = static_cast<uint64_t>(seconds + 0.5);
@@ -237,10 +263,14 @@ std::wstring FormatTime(double seconds) {
     return text;
 }
 
+// Command-line value parsers: each accepts only a complete, in-range value and
+// leaves `out` untouched on failure.
 bool ParseU32(const wchar_t* s, uint32_t lo, uint32_t hi, uint32_t& out) {
-    wchar_t* end = nullptr; const unsigned long v = wcstoul(s, &end, 10);
+    wchar_t* end = nullptr;
+    const unsigned long v = wcstoul(s, &end, 10);
     if (!s[0] || *end || v < lo || v > hi) return false;
-    out = static_cast<uint32_t>(v); return true;
+    out = static_cast<uint32_t>(v);
+    return true;
 }
 
 bool ParseFloat(const wchar_t* s, float lo, float hi, float& out) {
@@ -291,7 +321,7 @@ bool ParsePhaseRotationMode(const wchar_t* s, uint32_t& out) {
     return false;
 }
 
-
+// Prints the option reference to stderr.
 void Usage() {
     fputws(L"SuperVirtualMIDISynth V3 offline renderer\n\n"
            L"svms_v3_render <input.mid> <instrument.sf2|.sfz> <output.wav> [options]\n\n"
@@ -331,6 +361,8 @@ void Usage() {
            L"  --machine-progress    Emit tab-separated progress records\n", stderr);
 }
 
+// Parses the command line into `o`.  Returns false on any unknown or invalid
+// option (the caller prints Usage).
 bool ParseOptions(int argc, wchar_t** argv, Options& o) {
     if (argc >= 3 && std::wstring(argv[2]) == L"--scan-only") {
         o.midi = argv[1]; o.scanOnly = true;
@@ -422,49 +454,82 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
     return true;
 }
 
+// Streams a stereo float32 WAV to disk.  The final length is unknown while
+// rendering, so the header is patched in Close(); a file that outgrew 4 GB is
+// converted to RF64 there.
 class WaveWriter {
 public:
     ~WaveWriter() { Close(); }
+
     bool Open(const wchar_t* path, uint32_t rate, uint64_t estimatedFrames) {
-        Close(); rate_ = rate;
+        Close();
+        rate_ = rate;
 #if defined(_WIN32)
-        file_ = _wfopen(path, L"wb+"); if (!file_) return false;
+        file_ = _wfopen(path, L"wb+");
 #else
         std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
         const std::string utf8 = converter.to_bytes(path);
-        file_ = std::fopen(utf8.c_str(), "wb+"); if (!file_) return false;
+        file_ = std::fopen(utf8.c_str(), "wb+");
 #endif
+        if (!file_) return false;
         (void)estimatedFrames;
         // The length is unknown while streaming, so reserve the ds64 slot as a
         // JUNK chunk; Close() either leaves it (plain RIFF) or turns the file
         // into RF64 when it outgrew 4 GB.
-        fwrite("RIFF",1,4,file_); U32(0); fwrite("WAVE",1,4,file_);
-        fwrite("JUNK",1,4,file_); U32(28); ds64Pos_=Tell();
+        fwrite("RIFF", 1, 4, file_);
+        U32(0);
+        fwrite("WAVE", 1, 4, file_);
+        fwrite("JUNK", 1, 4, file_);
+        U32(28);
+        ds64Pos_ = Tell();
         U64(0); U64(0); U64(0); U32(0);
-        fwrite("fmt ",1,4,file_); U32(16); U16(3); U16(2); U32(rate); U32(rate*8); U16(8); U16(32);
-        fwrite("data",1,4,file_); dataSizePos_=Tell(); U32(0);
+        // fmt chunk: IEEE float (3), 2 channels, rate, byte rate, block align, 32 bits.
+        fwrite("fmt ", 1, 4, file_);
+        U32(16); U16(3); U16(2); U32(rate); U32(rate * 8); U16(8); U16(32);
+        fwrite("data", 1, 4, file_);
+        dataSizePos_ = Tell();
+        U32(0);
         return true;
     }
+
+    // Appends `frames` frames, interleaving the two planar channels.
     bool Write(const float* left, const float* right, uint32_t frames) {
-        scratch_.resize(size_t(frames)*2);
-        for (uint32_t i=0;i<frames;++i) { scratch_[i*2]=left[i]; scratch_[i*2+1]=right[i]; }
-        if (fwrite(scratch_.data(), sizeof(float)*2, frames, file_) != frames) return false;
-        frames_ += frames; return true;
+        scratch_.resize(size_t(frames) * 2);
+        for (uint32_t i = 0; i < frames; ++i) {
+            scratch_[i * 2] = left[i];
+            scratch_[i * 2 + 1] = right[i];
+        }
+        if (fwrite(scratch_.data(), sizeof(float) * 2, frames, file_) != frames)
+            return false;
+        frames_ += frames;
+        return true;
     }
+
+    // Patches the header sizes (RIFF, or RF64 past 4 GB) and closes the file.
     bool Close() {
         if (!file_) return true;
-        const uint64_t bytes=frames_*8, end=Tell();
+        const uint64_t bytes = frames_ * 8, end = Tell();
         if (end - 8 > 0xffffffffull || bytes > 0xffffffffull) {
-            Seek(0); fwrite("RF64",1,4,file_); U32(0xffffffffu);
-            Seek(12); fwrite("ds64",1,4,file_);
-            Seek(ds64Pos_); U64(end-8); U64(bytes); U64(frames_);
-            Seek(dataSizePos_); U32(0xffffffffu);
+            Seek(0);
+            fwrite("RF64", 1, 4, file_);
+            U32(0xffffffffu);
+            Seek(12);
+            fwrite("ds64", 1, 4, file_);
+            Seek(ds64Pos_);
+            U64(end - 8); U64(bytes); U64(frames_);
+            Seek(dataSizePos_);
+            U32(0xffffffffu);
         } else {
-            Seek(4); U32(static_cast<uint32_t>(end-8));
-            Seek(dataSizePos_); U32(static_cast<uint32_t>(bytes));
+            Seek(4);
+            U32(static_cast<uint32_t>(end - 8));
+            Seek(dataSizePos_);
+            U32(static_cast<uint32_t>(bytes));
         }
-        const bool ok=fclose(file_)==0; file_=nullptr; return ok;
+        const bool ok = fclose(file_) == 0;
+        file_ = nullptr;
+        return ok;
     }
+
     uint64_t Frames() const { return frames_; }
 private:
     uint64_t Tell() const {
@@ -484,8 +549,12 @@ private:
     void U16(uint16_t v) { fwrite(&v,2,1,file_); }
     void U32(uint32_t v) { fwrite(&v,4,1,file_); }
     void U64(uint64_t v) { fwrite(&v,8,1,file_); }
-    FILE* file_=nullptr; uint32_t rate_=0;
-    uint64_t frames_=0, ds64Pos_=0, dataSizePos_=0; std::vector<float> scratch_;
+    FILE* file_ = nullptr;
+    uint32_t rate_ = 0;
+    uint64_t frames_ = 0;
+    uint64_t ds64Pos_ = 0;        // where the RF64 ds64 payload goes
+    uint64_t dataSizePos_ = 0;    // where the data chunk size goes
+    std::vector<float> scratch_;  // interleave buffer
 };
 
 #if 0
@@ -662,6 +731,9 @@ private:
 
 #endif
 
+// The synth as the render loop sees it: dispatch events at exact frames and
+// pull rendered blocks, plus telemetry getters for the progress line.
+// Implementations differ in how they run the engine, not in what they output.
 class OfflineSessionSynth {
 public:
     virtual ~OfflineSessionSynth() = default;
@@ -697,6 +769,8 @@ public:
     virtual const char* Backend() const = 0;
 };
 
+// The default session: the shared StandaloneSynth plus the realtime block
+// renderer, one engine instance.
 class LegacyOfflineSession final : public OfflineSessionSynth {
 public:
     bool Initialize(const Options& o, std::string& error) override {
@@ -770,7 +844,7 @@ private:
 // cores; cores render raw mixes in parallel, then the sum gets reverb and
 // the limiter once. The serial plan loop (note launch/steal) is what bounds
 // Black MIDI speed, and this splits it. Voices are divided between cores.
-// ponytail: each core loads its own SoundFont copy; share one bundle if RAM bites.
+// Note: each core loads its own SoundFont copy; share one bundle if RAM bites.
 class ShardedOfflineSession final : public OfflineSessionSynth {
 public:
     ~ShardedOfflineSession() override {
@@ -935,6 +1009,7 @@ private:
     float* outR_ = nullptr;
 };
 
+// Session backed by the canonical engine (--synth canonical).
 class CanonicalOfflineSession final : public OfflineSessionSynth {
 public:
     bool Initialize(const Options& o, std::string& error) override {
@@ -1058,8 +1133,25 @@ private:
     float masterVolume_{1.0f};
 };
 
-struct ProducerContext { ParsedEventRing* ring; const MappedMidiFile* file; uint32_t rate; std::atomic<bool>* cancel; std::atomic<bool>* done; std::atomic<uint64_t>* decoded; std::string* error; };
-bool RingSink(const PackedMidiEvent& e,void* p){auto& c=*static_cast<ProducerContext*>(p);if(!c.ring->Push(e,*c.cancel))return false;c.decoded->fetch_add(1,std::memory_order_relaxed);return true;}
+// State shared with the MIDI decoder thread that feeds the render loop.
+struct ProducerContext {
+    ParsedEventRing* ring;
+    const MappedMidiFile* file;
+    uint32_t rate;
+    std::atomic<bool>* cancel;
+    std::atomic<bool>* done;
+    std::atomic<uint64_t>* decoded;
+    std::string* error;
+};
+
+// Decoder callback: pushes one event into the ring and counts it.  Returns
+// false when the render was cancelled.
+bool RingSink(const PackedMidiEvent& e, void* p) {
+    auto& c = *static_cast<ProducerContext*>(p);
+    if (!c.ring->Push(e, *c.cancel)) return false;
+    c.decoded->fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
 
 } // namespace
 } // namespace svms
@@ -1190,7 +1282,10 @@ std::wstring MakeStemDir(const std::wstring& out, const std::wstring& midi) {
     return make(path) ? path + L"/" : L"";
 }
 
-// ponytail: every instance loads its own SoundFont copy; share one bundle if RAM bites.
+// Stem rendering: finds the note-bearing tracks, renders each in its own synth
+// instance (up to --render-threads at once, the threads split between them),
+// then writes per-track WAVs, a merged sum, or both.
+// Note: every instance loads its own SoundFont copy; share one bundle if RAM bites.
 int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
     using namespace svms;
     std::string error;
@@ -1289,6 +1384,9 @@ int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
 #include "synth/NoteTableStream.inl"
 } // namespace
 
+// Entry point shared by the Windows and POSIX mains: loads the engine config,
+// applies the command line on top, then runs the note-table, stem or normal
+// render.  Returns the process exit code (2 = bad command line).
 int RendererMain(int argc, wchar_t** argv) {
     using namespace svms;
 #if defined(_WIN32)

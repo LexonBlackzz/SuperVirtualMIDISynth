@@ -1,3 +1,19 @@
+// Engine configuration: config.json load/validate/patch, SoundFont path
+// resolution, and the legacy config.ini import.
+//
+// File map:
+//   helpers            platform shims (paths, UTF-8, config mutex)
+//   MakeDefaultJson    the JSON written on first run
+//   ApplyJson          JSON -> EngineConfig, one block per section; invalid
+//                      fields append to configWarning and keep their default
+//   ApplyEnvironment   SVMS_* environment overrides, applied last
+//   EngineConfig::     Default / Load / Validate
+//   *V3ConfigJson      read and merge-patch the document (used by the
+//                      Configurator and the native API)
+//   Resolve*SoundFont  turn configured names into real files
+//
+// Load order: defaults, then config.json, then environment variables.
+
 #include "synth/Config.h"
 #include "render/Envelope.h"
 
@@ -50,7 +66,7 @@ constexpr uint64_t kMaximumConfigDocumentBytes = 16u * 1024u * 1024u;
 
 #ifndef _WIN32
 // In-process only for now; Windows additionally serialises across processes
-// with a named mutex. ponytail: add flock() on the config file if two SVMS
+// with a named mutex. Note: add flock() on the config file if two SVMS
 // processes ever write the same config concurrently on Linux.
 class ScopedConfigMutex {
 public:
@@ -82,6 +98,7 @@ private:
 };
 #endif
 
+// exists() that never throws (false on any filesystem error).
 bool PathExists(const fs::path& path) noexcept {
     if (path.empty()) return false;
     std::error_code error;
@@ -213,6 +230,7 @@ std::wstring GetExecutableDirectory() {
 }
 #endif
 
+// Directory that relative SoundFont paths and local discovery are based on.
 fs::path GetSoundFontSearchDirectory() {
     // Test-only override. Production always discovers beside winmm.dll.
     std::wstring testPath(32768, L'\0');
@@ -226,6 +244,7 @@ fs::path GetSoundFontSearchDirectory() {
     return fs::path(GetV3ModuleDirectory());
 }
 
+// True for an existing regular .sf2 or .sfz file.
 bool IsSoundFontFile(const fs::path& path) {
     std::error_code error;
     if (!fs::is_regular_file(path, error) || error) return false;
@@ -235,6 +254,8 @@ bool IsSoundFontFile(const fs::path& path) {
     return extension == L".sf2" || extension == L".sfz";
 }
 
+// SoundFonts found beside the DLL (searching its subfolders), sorted by
+// relative path, case-insensitively, so "the first one" is stable.
 std::vector<fs::path> DiscoverLocalSoundFonts() {
     std::vector<fs::path> paths;
     std::error_code error;
@@ -268,6 +289,7 @@ std::string Trim(std::string value) {
     return value;
 }
 
+// Reads a legacy config.ini into key -> value (section headers ignored).
 std::map<std::string, std::string> ReadLegacyIni(const fs::path& path) {
     std::map<std::string, std::string> values;
     std::ifstream input(path);
@@ -303,6 +325,8 @@ void ImportNumber(const std::map<std::string, std::string>& ini,
     if (input >> value) destination = value;
 }
 
+// The config.json document for `cfg`, written on first run.  Its sections and
+// key names are what ApplyJson reads back.
 json MakeDefaultJson(const EngineConfig& cfg) {
     const char* backend = cfg.audioBackend == AudioBackend::DirectSound
                             ? "directsound"
@@ -453,6 +477,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
     };
 }
 
+// Copies the settings of an old config.ini into a new config document.
 void ImportLegacyIni(json& root, const fs::path& path) {
     const auto ini = ReadLegacyIni(path);
     if (ini.empty()) return;
@@ -496,6 +521,8 @@ void ImportLegacyIni(json& root, const fs::path& path) {
     }
 }
 
+// Writes `root` next to `target` and swaps it in, so a crash never leaves a
+// half-written config.json.  Returns false if any step fails.
 bool AtomicWriteJson(const fs::path& target, const json& root) {
     std::error_code ec;
     fs::create_directories(target.parent_path(), ec);
@@ -532,6 +559,7 @@ bool AtomicWriteJson(const fs::path& target, const json& root) {
     return true;
 }
 
+// The old config.ini beside the DLL or the executable, or empty if none.
 fs::path FindLegacyIni() {
     std::wstring testPath(32768, L'\0');
     DWORD testLength = GetEnvironmentVariableW(L"SVMS_TEST_LEGACY_INI",
@@ -562,6 +590,8 @@ bool ReadValue(const json& object, const char* key, T& destination,
     }
 }
 
+// Reads a boolean key into `destination`; false (value untouched) if absent
+// or not a boolean.
 bool ReadBool(const json& object, const char* key, bool& destination) {
     auto it = object.find(key);
     if (it == object.end()) return true;
@@ -576,6 +606,9 @@ void AppendWarning(std::string& warning, const char* field) {
     warning += field;
 }
 
+// Applies a config document onto `cfg`, section by section.  A missing key
+// keeps the current value; a key of the wrong type or out of range is skipped
+// and named in cfg.configWarning.
 void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("audio"); it != root.end() && it->is_object()) {
         auto device = it->find("device");
@@ -970,6 +1003,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     }
 }
 
+// Boolean environment variable: 1/true/yes or 0/false/no; anything else
+// (including unset) keeps `current`.
 bool EnvironmentFlag(const wchar_t* name, bool current) {
     wchar_t value[16]{};
     if (GetEnvironmentVariableW(name, value, 16) == 0) return current;
@@ -980,6 +1015,8 @@ bool EnvironmentFlag(const wchar_t* name, bool current) {
     return current;
 }
 
+// SVMS_* environment overrides, applied after config.json so a one-off run
+// can change a setting without editing the file.
 void ApplyEnvironment(EngineConfig& cfg) {
     wchar_t audioDevice[1024]{};
     const DWORD audioDeviceLength = GetEnvironmentVariableW(
@@ -1077,7 +1114,7 @@ EngineConfig EngineConfig::Default() {
     cfg.highPriorityVelocity = 96;
     cfg.shedStartPercent = 70;
     cfg.maxEventsPerBlock = 65536;
-    cfg.voiceRetireThreshold = 0.00177828f;  // -55 dB (owner-chosen default)
+    cfg.voiceRetireThreshold = 0.00177828f;  // -55 dB (default picked by listening tests)
     cfg.stealPolicy = 0;
     cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
     cfg.stealReject = false;  // opt-in: every note-on launches by default
@@ -1124,6 +1161,10 @@ EngineConfig EngineConfig::Default() {
     return cfg;
 }
 
+// Loads the effective configuration: defaults, then config.json, then
+// environment overrides.  Creates config.json on first run (importing a legacy
+// config.ini if one exists).  Problems are reported in configWarning, never
+// thrown; a malformed document falls back to the defaults.
 EngineConfig EngineConfig::Load() {
     EngineConfig cfg = Default();
 
@@ -1145,7 +1186,7 @@ EngineConfig EngineConfig::Load() {
 
     if (!PathExists(path)) {
         // A new configuration records an actually discovered DLL-local
-        // SF2/SFZ, retaining subfolder components needed by SFZ samples.
+        // SF2/SFZ (keeping the subfolder components SFZ samples need)
         // instead of baking a particular filename into every installation.
         const auto localSoundFonts = DiscoverLocalSoundFonts();
         if (!localSoundFonts.empty())
@@ -1204,6 +1245,7 @@ EngineConfig EngineConfig::Load() {
     return cfg;
 }
 
+// True when every numeric setting is inside the range the engine supports.
 bool EngineConfig::Validate() const {
     return sampleRate >= 8000 && sampleRate <= 384000 &&
             bufferFrames >= 16 && bufferFrames <= 8192 &&
@@ -1255,6 +1297,8 @@ bool EngineConfig::Validate() const {
             maxEventsPerBlock > 0;
 }
 
+// Reads the raw config.json text under the cross-process lock.  Returns false
+// (with `warning` set) if the file is missing, huge or unreadable.
 bool ReadV3ConfigJson(std::string& document, std::string* warning) {
     document.clear();
     if (warning) warning->clear();
@@ -1290,6 +1334,9 @@ bool ReadV3ConfigJson(std::string& document, std::string* warning) {
     return true;
 }
 
+// Applies a JSON merge patch (RFC 7386) to config.json.  The patch is
+// validated first and the file is replaced atomically; on any failure the
+// file is left unchanged and `warning` says why.
 bool PatchV3ConfigJson(const char* mergePatch, size_t mergePatchBytes,
                        std::string* warning) {
     if (warning) warning->clear();
@@ -1413,6 +1460,7 @@ std::wstring GetV3AppDataConfigPath() {
     return result;
 }
 
+// The config.json in use: the DLL-local one if present, else the AppData one.
 std::wstring GetV3ConfigPath() {
     const fs::path local(GetV3LocalConfigPath());
     if (PathExists(local)) return local.wstring();
@@ -1443,6 +1491,8 @@ std::wstring GetV3ModuleDirectory() {
 }
 #endif
 
+// The primary SoundFont file: the configured one if it exists, else the first
+// SoundFont found beside the DLL.  `warning` explains any fallback.
 std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
                                     std::string* warning) {
     const fs::path searchDirectory = GetSoundFontSearchDirectory();
@@ -1476,6 +1526,9 @@ std::wstring ResolveV3SoundFontPath(const EngineConfig& cfg,
     return localSoundFonts.front().wstring();
 }
 
+// The full SoundFont stack: the primary file first, then the configured
+// stack entries that exist (duplicates dropped, capped at
+// kMaxSoundFontStackEntries).
 std::vector<std::wstring> ResolveV3SoundFontPaths(
     const EngineConfig& cfg, std::string* warning) {
     std::vector<std::wstring> resolved;

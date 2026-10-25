@@ -525,7 +525,7 @@ inline std::vector<HilbertSliceSpec> PlanHilbertSlices(const SF2Data& sf2) {
         if (spec.end > spec.start && spec.end <= sf2.sampleDataFrames)
             specs.push_back(spec);
     }
-    // ponytail: slices that overlap without being identical are built
+    // Note: slices that overlap without being identical are built
     // independently (last writer wins); dedupe only exact duplicates.
     std::stable_sort(specs.begin(), specs.end(), [](const HilbertSliceSpec& a,
                                               const HilbertSliceSpec& b) {

@@ -1,4 +1,14 @@
 // BASS/BASSMIDI prerender shim exports (C++ linkage, exported by name).
+//
+// File map:
+//   state            BassStream / BassFont tables, guarded by g_bassMutex
+//   helpers          logging, offline-session config, event translation
+//   MIDI files       SMF reader and the streaming feed for huge files
+//   KMC modes        exact / hold / note-table behaviours (BassModeSelect)
+//   BASS_* exports   init, config, fonts, streams, events
+//   BassChannelGetDataCore / BASS_ChannelGetData   the render pull
+//   unsupported      BASSMIDI calls that return a clean error
+//   channel, FX, DSP and attribute calls that hosts probe
 
 #include "driver/DriverInternal.h"
 #include "events/MidiStream.h"
@@ -9,7 +19,6 @@
 #include <queue>
 #include <chrono>
 #include <thread>
-
 
 // ── BASS/BASSMIDI prerender shim ─────────────────────────────────────
 // The subset of the BASS/BASSMIDI surface that MIDI players drive for
@@ -29,6 +38,8 @@ typedef DWORD HSOUNDFONT;
 
 namespace {
 
+// One entry of a stream's soundfont list (BASS_MIDI_FONTEX): which font, and
+// the source and destination preset/bank it maps.
 struct BassFontMapEntry {
     uint32_t font = 0u;      // BASS_MIDI_FontInit handle
     int32_t spreset = -1;
@@ -38,6 +49,7 @@ struct BassFontMapEntry {
     int32_t dbanklsb = -1;
 };
 
+// A DSP callback installed with BASS_ChannelSetDSP (bassenc uses this).
 struct BassDspEntry {
     DWORD handle;
     void* proc;
@@ -45,6 +57,7 @@ struct BassDspEntry {
     int priority;
 };
 
+// An FX handle created with BASS_ChannelSetFX.
 struct BassFxEntry {
     DWORD stream;
     DWORD type;
@@ -80,6 +93,9 @@ struct BassFileEv {
     }
 };
 
+// One BASSMIDI stream.  Backed by an offline SVMS session: events are queued
+// with absolute frames, and BASS_ChannelGetData renders forward on demand.
+// Handles are 1-based indices into g_bassStreams.
 struct BassStream {
     SVMS_Session session = 0;
     uint32_t sampleRate = 44100u;
@@ -116,7 +132,9 @@ struct BassStream {
     // reaches the submitted-events horizon; see BASS_ChannelGetData.
     uint64_t lastSubmitTickMs = 0u;
     // Events accumulated from BASS_MIDI_StreamEvents, sorted by frame at
-    // render time and consumed as the pull cursor passes them.
+    // render time and consumed as the pull cursor passes them.  Events whose
+    // frame lands beyond the current render call's window stay here with
+    // ABSOLUTE frames and are re-based at the next pull.
     std::vector<SVMS_OfflineEvent> pending;
     std::vector<BassDspEntry> dsps;   // BASS_ChannelSetDSP chain (bassenc installs one)
     float fxVolume = 1.0f;            // BASS_FX_VOLUME target (BASS_ChannelSetFX type 9)
@@ -146,9 +164,6 @@ struct BassStream {
     ~BassStream() {
         if (kmc) SvmsBassKmcApi()->Close(kmc);
     }
-    // Per-stream pending events whose frame_offset landed beyond the
-    // current render_offline call's window stay here with ABSOLUTE frames;
-    // they are re-based at the next pull.
 };
 
 // Soundfont slots from BASS_MIDI_FontInit. Handles are 1-based indices into
@@ -170,6 +185,7 @@ std::vector<BassFontMapEntry> g_bassDefaultFonts;
 uint32_t g_bassInitRate = 44100u;
 int g_bassLastError = 0;   // BASS_ERROR codes: 0 = BASS_OK
 
+// Looks up a live font by handle; null for 0, unknown, freed or empty fonts.
 const BassFont* BassFontResolve(uint32_t handle) {
     if (handle == 0u || handle > g_bassFonts.size()) return nullptr;
     const BassFont& font = g_bassFonts[handle - 1u];
@@ -253,6 +269,7 @@ bool BassApplyStreamFont(BassStream& stream, const std::wstring& fontPath,
     return true;
 }
 
+// Looks up a stream by handle (null when unknown).  Call with g_bassMutex held.
 BassStream* BassStreamResolve(DWORD handle) {
     if (handle == 0u || handle > g_bassStreams.size()) return nullptr;
     return g_bassStreams[handle - 1u].get();
@@ -337,6 +354,7 @@ void BassLog(const char* fmt, ...) {
 }
 #define SVMS_ILLPARAM() (BassLogNow("BASS_ERROR_ILLPARAM set in %s:%d", __func__, __LINE__), 20)
 
+// Builds an offline-session event for a packed short message at `frame`.
 SVMS_OfflineEvent BassPackEvent(uint32_t frame, uint32_t message) {
     SVMS_OfflineEvent ev{};
     ev.frame_offset = frame;
@@ -438,6 +456,9 @@ uint64_t BassStreamFileBytes() {
     return kBassStreamFileBytes;
 }
 
+// Decoder callbacks: the feed sink pushes into the stream's ring (false =
+// cancelled); the count sink only counts, for measuring a file without
+// keeping its events.
 bool BassFeedSink(const svms::PackedMidiEvent& e, void* user) {
     auto* f = static_cast<BassFileFeed*>(user);
     return f->ring.Push(e, f->cancel);
@@ -493,6 +514,7 @@ void BassMeasureStore(const BassMeasureKey& k, uint64_t frames, const std::vecto
     std::fclose(f);
 }
 
+// Starts the decoder thread for a streamed file (no-op if already running).
 void BassFeedStart(BassFileFeed& f) {
     if (f.thread.joinable()) return;
     f.thread = std::thread([&f] {
@@ -528,6 +550,7 @@ bool BassFilePeek(BassStream& s, uint32_t& frame, uint32_t& message) {
     message = s.fileEvents[s.fileHead].packed_message;
     return true;
 }
+// Consumes the event BassFilePeek returned.
 void BassFilePop(BassStream& s) {
     if (s.feed) s.feed->hasHead = false; else ++s.fileHead;
 }
@@ -595,6 +618,7 @@ void BassKmcRead(BassStream& s, uint32_t n) {
     SvmsBassKmcApi()->Read(s.kmc, s.scratchLeft.data(), s.scratchRight.data(), n);
 }
 
+// Byte source for the SMF parser: a file handle or a memory block.
 struct BassMidiReader {
     HANDLE file = INVALID_HANDLE_VALUE;
     const uint8_t* mem = nullptr;   // memory source (whole block)
@@ -736,6 +760,11 @@ uint64_t BassNowTickMs() {
 #endif
 }
 
+// ── BASS exports: init, config, errors ───────────────────────────────────
+// The BASS_* and BASS_MIDI_* functions below mirror the real library's
+// signatures.  Anything the shim does not implement fails with the matching
+// BASS error code, or succeeds as a no-op where hosts only probe.
+
 BOOL WINAPI BASS_Init(int device, DWORD freq, DWORD flags, HWND win,
                       const GUID* clsid) {
     (void)device; (void)flags; (void)win; (void)clsid;
@@ -777,6 +806,8 @@ int WINAPI BASS_ErrorGetCode(void) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
     return g_bassLastError;
 }
+
+// ── BASSMIDI exports: fonts, streams, events ─────────────────────────────
 
 HSOUNDFONT WINAPI BASS_MIDI_FontInit(const void* file, DWORD flags) {
     std::lock_guard<std::mutex> lock(g_bassMutex);
@@ -924,6 +955,8 @@ BOOL WINAPI BASS_MIDI_StreamSetFonts(HSTREAM handle, const void* fonts,
     return TRUE;
 }
 
+// Creates a stream and its offline session.  Call with g_bassMutex held.
+// Returns the 1-based handle, or 0 with g_bassLastError set.
 static HSTREAM BassCreateStreamLocked(DWORD channels, DWORD flags,
                                       DWORD freq, bool allowNoFont = false) {
     // First parameter = the stream's MIDI channel count (Kiva passes 16 and
@@ -1584,6 +1617,11 @@ BOOL WINAPI BASS_MIDI_InGetDeviceInfo(DWORD device, void* info) {
     return FALSE;
 }
 
+// ── The render pull ──────────────────────────────────────────────────────
+// Serves BASS_ChannelGetData: delivers the requested bytes from a render-ahead
+// cache, refilling it from the offline session in bounded chunks.  Handles the
+// float/16-bit formats and the BASS_DATA_* query flags.  DSP callbacks are run
+// by the BASS_ChannelGetData wrapper below, outside the shim lock.
 static DWORD BassChannelGetDataCore(DWORD handle, void* buffer, DWORD length) {
     // Flag values reflected from Bass.Net (BASSData):
     // BASS_DATA_FLOAT = 0x40000000, BASS_DATA_AVAILABLE = 0.
@@ -2070,6 +2108,8 @@ int WINAPI BASS_MIDI_StreamGetTrackCount(HSTREAM handle) {
     g_bassLastError = 0;
     return static_cast<int>(stream->trackCount);
 }
+
+// ── Channel position, attributes and info ────────────────────────────────
 
 unsigned long long WINAPI BASS_ChannelGetLength(DWORD handle, DWORD mode) {
     std::lock_guard<std::mutex> lock(g_bassMutex);

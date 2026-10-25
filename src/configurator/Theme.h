@@ -42,8 +42,8 @@ struct ThemeSettings {
 
 inline constexpr int kStyleRack = 0;
 inline constexpr int kStyleModern = 1;
-// Theme files written before this get Modern forced once (owner decision for
-// the 0.11 redesign); after that the user's style choice sticks.
+// Theme files written before this get Modern forced once (a deliberate choice
+// for the 0.11 redesign); after that the user's style choice sticks.
 inline constexpr int kThemeUiVersion = 11;
 
 bool IsModernStyle();

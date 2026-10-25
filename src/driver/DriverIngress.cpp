@@ -1,9 +1,32 @@
 // Event ingress: MIDI input, Submit*, SysEx, event compiler thread.
+//
+// Everything a MIDI event goes through before the audio thread sees it:
+//
+//   1. Physical MIDI input     StartConfiguredMidiInput / MidiInputCallback
+//   2. Single-event submit     SubmitShortMsg*, PrepareShortEvent
+//                              (fences, coalescing, lane choice, shedding)
+//   3. Batch submit            SubmitShortBatch*, SubmitMixedBatchFast,
+//                              SubmitShardedBatch, SubmitMidiStreamCancellable
+//   4. SysEx                   SubmitSystemExclusiveCancellable (GM/GS/XG ->
+//                              internal engine messages)
+//   5. Direct page feed        SubmitShortBatchDirect, FlushDirectPage:
+//                              already-ordered batches skip the ring
+//   6. Compiler thread         EventCompilerLoop: ring -> sorted event pages
+//
+// Producers (any thread) push TimestampedMidiEvent into the priority ingress
+// ring; the compiler thread turns them into ScheduledRenderEvent pages; the
+// audio callback imports the pages into the scheduler.  Sequence numbers are
+// assigned at submit time and define the ingress order the renderer keeps.
 
 #include "driver/DriverInternal.h"
 
 namespace svms {
 
+// ── 1. Physical MIDI input ───────────────────────────────────────────────
+
+// Opens the configured physical input device through the system WinMM (never
+// our own shim) and starts it with a ring of SysEx buffers.  Returns false and
+// leaves routing off if the device is missing or cannot be started.
 bool Driver::StartConfiguredMidiInput() {
     StopConfiguredMidiInput();
     if (!engineConfig_.midiInputEnabled) return true;
@@ -100,6 +123,8 @@ bool Driver::StartConfiguredMidiInput() {
     return true;
 }
 
+// Stops and closes the physical input and releases its SysEx buffers.
+// Safe to call when nothing is open.
 void Driver::StopConfiguredMidiInput() noexcept {
     midiInputRunning_.store(false, std::memory_order_release);
     HMIDIIN input = midiInput_;
@@ -128,6 +153,8 @@ void Driver::StopConfiguredMidiInput() noexcept {
     std::memset(midiInputHeaders_, 0, sizeof(midiInputHeaders_));
 }
 
+// WinMM input callback.  Short messages are timestamped and submitted as they
+// arrive; completed SysEx buffers are submitted and handed back to the device.
 void CALLBACK Driver::MidiInputCallback(HMIDIIN input, UINT message,
                                         DWORD_PTR instance,
                                         DWORD_PTR parameter1,
@@ -162,6 +189,11 @@ void CALLBACK Driver::MidiInputCallback(HMIDIIN input, UINT message,
     if (addBuffer) (void)addBuffer(input, header, sizeof(*header));
 }
 
+// ── 2. Single-event submit ───────────────────────────────────────────────
+
+// Silences everything.  While audio is running this goes through the event
+// pipeline as an internal reset message, so it lands at an exact frame in
+// order; otherwise the state is reset directly.
 void Driver::ResetAllVoices() {
     if (audioOutput && audioOutput->IsRunning()) {
         SubmitShortMsg(kInternalResetMessage);
@@ -187,6 +219,8 @@ void Driver::ResetAllVoices() {
     for (Driver* shard : shards_) shard->ResetAllVoices();
 }
 
+// Blocks a lossless producer until the audio thread frees ingress space
+// (the wake epoch changes from `observed`).  Time spent here is counted.
 void Driver::WaitForProducerSlot(uint32_t observed) noexcept {
     LARGE_INTEGER begin{}, end{};
     QueryPerformanceCounter(&begin);
@@ -198,6 +232,7 @@ void Driver::WaitForProducerSlot(uint32_t observed) noexcept {
         std::memory_order_relaxed);
 }
 
+// Submits a packed short message (0x00vvddss) timestamped "now".
 void Driver::SubmitShortMsg(uint32_t msg) {
     uint64_t timestamp = 0u;
     if (!tscClock_.Now(timestamp)) {
@@ -208,6 +243,8 @@ void Driver::SubmitShortMsg(uint32_t msg) {
     SubmitShortMsgAtQpc(msg, timestamp);
 }
 
+// Submits a message for an absolute output frame.  The frame rides in the
+// timestamp field behind kAbsoluteFrameTimestampTag.
 void Driver::SubmitShortMsgAtFrame(uint32_t msg, uint64_t outputFrame) {
     (void)SubmitShortMsgAtFrameCancellable(msg, outputFrame, nullptr, 0u);
 }
@@ -222,6 +259,7 @@ bool Driver::SubmitShortMsgAtFrameCancellable(
         externalCancellation, cancellationToken);
 }
 
+// Releases every producer waiting in WaitForProducerSlot.
 void Driver::WakeBlockedProducers() {
     producerWakeEpoch_.fetch_add(1u, std::memory_order_release);
     WakeAddressWaiters(producerWakeEpoch_);
@@ -239,6 +277,7 @@ void Driver::EnableNoteOnCollapse(bool enable) {
     noteOnCollapse_.SetThreshold(enable ? kNoteOnCollapseDefaultThreshold : 1u);
 }
 
+// Fills the native-API queue report (backlogs, shed and cancel counts).
 void Driver::CopyNativeQueueInfo(SVMS_QueueInfo& out) const {
     out = {};
     out.struct_size = sizeof(out);
@@ -272,6 +311,9 @@ void Driver::SubmitShortMsgAtQpc(uint32_t msg, uint64_t qpcTimestamp) {
     (void)SubmitShortMsgAtQpcCancellable(msg, qpcTimestamp, nullptr, 0u);
 }
 
+// Recomputes the velocity shed cutoff from the fullest queue (the lane, the
+// raw ring, compiled pages, or the scheduler).  Below `shedStartPercent_` full
+// the cutoff is 1 (nothing shed); above it, it rises linearly to 95.
 uint32_t Driver::RefreshVelocityCutoff(EventLane lane) noexcept {
     const uint32_t rawIngress = midiIngress_.TotalSize();
     const uint32_t compiledIngress = compiledPages_.ReadyEventCount();
@@ -318,6 +360,8 @@ uint32_t Driver::RefreshVelocityCutoff(EventLane lane) noexcept {
     return cutoff;
 }
 
+// True if the calling thread owns the single-producer fast ring.  The first
+// submitting thread claims it when `events.fast_producer` is on.
 bool Driver::IsFastProducerThread() noexcept {
     const uint32_t thread = GetCurrentThreadId();
     const uint32_t owner = fastOwnerThreadId_.load(std::memory_order_relaxed);
@@ -471,6 +515,10 @@ bool Driver::PrepareShortEvent(uint32_t msg, uint64_t qpcTimestamp,
     return true;
 }
 
+// Core single-event submit: assigns the sequence number, applies
+// PrepareShortEvent, then pushes into the ring.  A lossless event waits for
+// space; a sheddable one is dropped and counted.  Returns false only when
+// cancelled.
 bool Driver::SubmitShortMsgAtQpcCancellableCore(
     uint32_t msg, uint64_t qpcTimestamp,
     const std::atomic<uint64_t>* externalCancellation,
@@ -515,21 +563,21 @@ bool Driver::SubmitShortMsgAtQpcCancellableCore(
                            lossless, velocity, fastOwner))
         return true;
     for (;;) {
-            if (fastOwner ? midiIngress_.TryPushFast(evt)
-                          : midiIngress_.TryPush(lane, evt)) {
-                // A running compiler will observe the queue without help. Only
-                // cross the kernel/API boundary when it explicitly published
-                // that it is asleep. The load keeps the ordinary (awake) case
-                // a plain read; the exchange only runs when a wake is real.
-                // No lost wakeup is possible: the compiler re-pops the queue
-                // after publishing sleeping=true, and this event's push
-                // already completed before the load below observed anything.
-                if (compilerSleeping_.load(std::memory_order_acquire) &&
-                    compilerSleeping_.exchange(false,
-                        std::memory_order_acq_rel)) {
-                    compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
-                    WakeAddressWaiters(compilerWakeEpoch_);
-                }
+        if (fastOwner ? midiIngress_.TryPushFast(evt)
+                      : midiIngress_.TryPush(lane, evt)) {
+            // A running compiler will observe the queue without help. Only
+            // cross the kernel/API boundary when it explicitly published
+            // that it is asleep. The load keeps the ordinary (awake) case
+            // a plain read; the exchange only runs when a wake is real.
+            // No lost wakeup is possible: the compiler re-pops the queue
+            // after publishing sleeping=true, and this event's push
+            // already completed before the load below observed anything.
+            if (compilerSleeping_.load(std::memory_order_acquire) &&
+                compilerSleeping_.exchange(false,
+                    std::memory_order_acq_rel)) {
+                compilerWakeEpoch_.fetch_add(1, std::memory_order_release);
+                WakeAddressWaiters(compilerWakeEpoch_);
+            }
 #if defined(SVMS_XP_COMPAT)
             static LONG acceptedTraceCount = 0;
             const LONG acceptedIndex = InterlockedIncrement(&acceptedTraceCount);
@@ -564,6 +612,8 @@ bool Driver::SubmitShortMsgAtQpcCancellableCore(
     }
 }
 
+// ── 3. Batch submit ──────────────────────────────────────────────────────
+
 // Public entry: on a sharded master the batch is split per core (notes to
 // their shard, everything else to every core, each core's subsequence in the
 // original order); otherwise it goes straight to the core path.
@@ -580,6 +630,9 @@ bool Driver::SubmitShortBatchAtQpcCancellable(
                                 externalCancellation, cancellationToken);
 }
 
+// Splits a batch across key-sharded cores in chunks: notes go to the core that
+// owns their (channel, key), everything else goes to every core.  Each core
+// sees its own subsequence in the original order.
 bool Driver::SubmitShardedBatch(
     const SVMS_ShortEvent* events, uint32_t eventCount,
     uint64_t immediateQpc,
@@ -712,6 +765,9 @@ bool Driver::SubmitMixedBatchFast(
     return true;
 }
 
+// Batch submit for one core.  A batch of only loud note-ons reserves ring
+// cells and sequence numbers in blocks of 256 (one CAS per block); anything
+// else takes the mixed fast path (fast owner) or the per-event path.
 bool Driver::SubmitShortBatchCore(
     const SVMS_ShortEvent* events, uint32_t eventCount,
     uint64_t immediateQpc,
@@ -830,6 +886,9 @@ bool Driver::SubmitShortBatchCore(
     return true;
 }
 
+// Submits a raw MIDI byte stream: parses it into short messages (in chunks of
+// 256) and SysEx messages, keeping them in stream order.  The caller's buffer
+// is copied once through ReadProcessMemory so a bad pointer fails cleanly.
 bool Driver::SubmitMidiStreamCancellable(
     const uint8_t* data, uint32_t size,
     const std::atomic<uint64_t>* externalCancellation,
@@ -873,10 +932,17 @@ bool Driver::SubmitMidiStreamCancellable(
     return accepted;
 }
 
+// ── 4. SysEx ─────────────────────────────────────────────────────────────
+
 void Driver::SubmitSystemExclusive(const uint8_t* data, uint32_t size) {
     (void)SubmitSystemExclusiveCancellable(data, size, nullptr, 0u);
 }
 
+// Translates a SysEx message into ordinary timestamped engine events:
+// GM1/GM2 mode messages and GS reset become a reset, master volume and
+// tuning become internal messages, and GS (and a subset of XG) part
+// parameters become CC and program changes.  Nothing is applied on this thread, so the effects land at
+// an exact frame in ingress order.  Unknown messages are ignored.
 bool Driver::SubmitSystemExclusiveCancellable(
     const uint8_t* data, uint32_t size,
     const std::atomic<uint64_t>* externalCancellation,
@@ -1010,7 +1076,11 @@ bool Driver::SubmitSystemExclusiveCancellable(
     return accepted;
 }
 
+// ── 5. Direct page feed ──────────────────────────────────────────────────
+
 namespace {
+// Spin lock over an atomic_flag, for the short critical sections around the
+// compiled-page pool and the direct producer slot.
 struct PoolGuard {
     std::atomic_flag& flag;
     explicit PoolGuard(std::atomic_flag& f) noexcept : flag(f) {
@@ -1257,6 +1327,13 @@ uint32_t Driver::FlushDirectPage() noexcept {
     return pagedScheduler_.ImportPage(pageIndex, count) ? 1u : 0u;
 }
 
+// ── 6. Compiler thread ───────────────────────────────────────────────────
+
+// The compiler thread: pops ingress events in sequence order, compiles each
+// to a ScheduledRenderEvent (exact target frame), applies the opt-in
+// minimum-note-length, CC-collapse and bend-collapse rules, sorts the page,
+// optionally merges identical note-ons, and publishes it to the audio thread.
+// Sleeps (with a wake epoch) when the ring is empty or no clock epoch exists.
 void Driver::EventCompilerLoop() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     // Small enough to stay cache-friendly, large enough that one 2048-frame

@@ -1,3 +1,29 @@
+// AVX2 render kernels.
+//
+// Layout of this file (all kernels live in the anonymous namespace until the
+// public entry points near the end):
+//
+//   1. Helpers            filter, scatter and horizontal-sum helpers
+//   2. Sample gathers     int16 store gathers (see the padding contract below)
+//   3. Steal tails        fading tail of a stolen voice (RenderStealTailsAVX2)
+//   4. Looping voices     per-voice time-chunk kernels (8 frames per vector):
+//                         sustained, release, transient; plus the
+//                         voice-batched short-span kernels (1-7 frames)
+//   5. Filtered groups    eight filtered voices per vector, via 8x8 transpose
+//   6. Class entry points RenderSustainedLoopAVX2 / RenderReleaseLoopAVX2 /
+//                         RenderTransientLoopAVX2: pick the kernel for a batch
+//                         and return false (state untouched) to refuse it
+//   7. Public functions   test switches and the steal-key builder
+//   8. One-shot voices    non-looping voices: scalar spans, time-chunk
+//                         kernels, class entry points
+//
+// Contracts every kernel here keeps:
+//   - Envelope gains are simulated scalarly into gains[8] with the exact
+//     sequential recurrence; phase advances by repeated `phase += step`.
+//   - A class entry point returns false WITHOUT mutating state when it cannot
+//     take the batch; the caller then renders each voice on the scalar path.
+//   - Retirements go through RecordRetirement, class changes through the
+//     context's classChangeHandles.
 #include "render/RenderKernels.h"
 #include "render/Envelope.h"
 #include "render/VoiceFilter.h"
@@ -24,6 +50,9 @@ namespace {
 // interpolation are untouched.  Default off keeps the exact sequential math.
 bool g_fastChunkMath = false;
 
+// ════════════════════════════════════════════════════════════════════════
+// 1. Helpers
+// ════════════════════════════════════════════════════════════════════════
 
 // GCC-target-compatible replacement for _mm256_i32scatter_ps (which is an
 // AVX512VL intrinsic). Performs the same lane-wise store using only AVX2:
@@ -37,6 +66,7 @@ inline void SVMS_ScatterPs(float* base, __m256i index, __m256 value) {
         base[idx[lane]] = val[lane];
 }
 
+// Sums the eight lanes in a fixed pairwise order so results are deterministic.
 float HorizontalSum(__m256 value) {
     alignas(32) float lanes[8];
     _mm256_store_ps(lanes, value);
@@ -92,7 +122,7 @@ inline __m256 FilterVoices8AVX2(VoiceSoA& v, __m256i handles,
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// 16-bit sample-store gathers.
+// 2. 16-bit sample-store gathers.
 //
 // The sample store holds raw SF2 int16 values (the previous float store
 // held exact float(int16) values, so converting on load is identical
@@ -187,7 +217,18 @@ inline void GatherSamplePairSeqAVX2(const int16_t* data, uint32_t readable,
     second = _mm256_mul_ps(_mm256_cvtepi32_ps(sec), int16Scale);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// 3. Steal tails
+//
+// When a voice is stolen its last samples keep playing as a short fading
+// "tail" so the steal does not click.  RenderTailScalar renders one tail;
+// RenderStealTailsAVX2 batches eight tails per vector when every lane is
+// simple enough (looping, unfiltered, same frame count, no wrap in span) and
+// falls back to the scalar tail otherwise.
+// ════════════════════════════════════════════════════════════════════════
 
+// Renders up to `frameCount` frames of one steal tail, advancing its stored
+// phase and remaining-frame count.  Mixes into the context's output planes.
 void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
                       uint32_t frameCount) {
     VoiceSoA& v = *c.voices;
@@ -252,6 +293,8 @@ void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
     v.stealTailFramesRemaining[h] = remaining;
 }
 
+// Renders the tails of `handles` for `c.frameCount` frames.  `frameCounts` is
+// indexed by voice handle (not by position in `handles`).
 void RenderStealTailsAVX2(const RenderSpanContext& c,
                           const uint32_t* handles, uint32_t handleCount,
                           const uint32_t* frameCounts) {
@@ -386,6 +429,9 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
     _mm256_zeroupper();
 }
 
+// Reports that `handle` finished at `frameOffset` of this span.  Real voices
+// append to the context's retirement list (applied later in exact order);
+// ghost rows have no list and are simply marked Free.
 void RecordRetirement(const RenderSpanContext& c, uint32_t handle,
                       uint32_t frameOffset) {
     if (c.retirements != nullptr && c.retirementCount != nullptr &&
@@ -484,6 +530,17 @@ struct ChunkRotation {
     }
 };
 
+// ════════════════════════════════════════════════════════════════════════
+// 4. Looping voices
+//
+// Per-voice kernels vectorize across TIME (8 consecutive frames of one
+// voice).  The *Short* kernels further down vectorize across VOICES for
+// spans of 1-7 frames.
+// ════════════════════════════════════════════════════════════════════════
+
+// True when the voice's loop/sample bounds are sane enough for the vector
+// kernels (loop inside the sample, sample inside the store, step below the
+// loop length).  Kernels fall back to scalar when this is false.
 bool ValidateLoopVoice(const RenderSpanContext& c, uint32_t handle) {
     const VoiceSoA& v = *c.voices;
     return v.relEnd[handle] >= 2u &&
@@ -495,6 +552,10 @@ bool ValidateLoopVoice(const RenderSpanContext& c, uint32_t handle) {
         v.phaseIncs[handle] < v.relLoopEF[handle] - v.relLoopSF[handle];
 }
 
+// Sustained looping voice, one voice for the whole span, 8 frames per chunk.
+// Chunks run only while 8 frames remain, the vibrato window covers them and
+// the last read stays clear of the loop end; everything else steps one frame
+// at a time.  Returns UINT32_MAX (sustained voices never retire here).
 uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
                                        uint32_t handle) {
     VoiceSoA& v = *c.voices;
@@ -565,14 +626,14 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
         const float lastPhase = phase + step * 7.0f;
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             lastPhase < loopEnd - 1.0f) {
-                        // Warm the next chunk's sample lines: reads are sequential per
+            // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
             _mm_prefetch(reinterpret_cast<const char*>(
                              region +
                              static_cast<uint32_t>(lastPhase + step)),
                          _MM_HINT_T0);
-const __m256 phases = _mm256_add_ps(
+            const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
             __m256 first, second;
@@ -661,6 +722,9 @@ const __m256 phases = _mm256_add_ps(
     return UINT32_MAX;
 }
 
+// Frame-by-frame release of a looping voice (used by the short kernel when a
+// lane fails validation).  Returns the retirement frame or UINT32_MAX; also
+// returns 0 when the voice fails ValidateLoopVoice, without mutating it.
 uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
                                  uint32_t handle) {
     VoiceSoA& v = *c.voices;
@@ -719,6 +783,9 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
     return retiredAt;
 }
 
+// Releasing looping voice, 8 frames per chunk.  The release gain ladder is
+// simulated scalarly into gains[8]; only fetch/lerp/mix is vectorized.
+// Returns the frame the voice retired at, or UINT32_MAX if it is still alive.
 uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
                                      uint32_t handle) {
     VoiceSoA& v = *c.voices;
@@ -810,14 +877,14 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             countdownSafe && thresholdSafe &&
             lastPhase < loopEnd - 1.0f) {
-                        // Warm the next chunk's sample lines: reads are sequential per
+            // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
             _mm_prefetch(reinterpret_cast<const char*>(
                              region +
                              static_cast<uint32_t>(lastPhase + step)),
                          _MM_HINT_T0);
-const __m256 phases = _mm256_add_ps(
+            const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
             __m256 first, second;
@@ -949,6 +1016,8 @@ const __m256 phases = _mm256_add_ps(
     return retiredAt;
 }
 
+// Voice-batched release for spans of 1-4 frames: eight voices per vector,
+// frame-outer.  A group with any invalid lane is rendered scalar instead.
 void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
                                 const uint32_t* handles,
                                 uint32_t handleCount) {
@@ -1057,6 +1126,10 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
 void RenderReleaseFramesGrouped(const RenderSpanContext& c,
                                 const uint32_t* handles, uint32_t count);
 
+// ── Class entry point: release-loop batch ───────────────────────────────
+// Routes by span length: 1-4 frames voice-batched, 8+ frames grouped (filtered
+// voices eight at a time), otherwise per-voice chunks.  Returns false before
+// touching any state when the batch needs the scalar fallback.
 bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
                            const uint32_t* handles,
                            uint32_t handleCount) {
@@ -1100,6 +1173,7 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
     _mm256_zeroupper();
     return true;
 }
+
 // ════════════════════════════════════════════════════════════════════════
 // Transient-loop kernel (looping attack/decay voices).
 //
@@ -1245,14 +1319,14 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             futureStage == stage &&
             lastPhase < loopEnd - 1.0f) {
-                        // Warm the next chunk's sample lines: reads are sequential per
+            // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
             _mm_prefetch(reinterpret_cast<const char*>(
                              region +
                              static_cast<uint32_t>(lastPhase + step)),
                          _MM_HINT_T0);
-const __m256 phases = _mm256_add_ps(
+            const __m256 phases = _mm256_add_ps(
                 _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
             const __m256i bases = _mm256_cvttps_epi32(phases);
             __m256 first, second;
@@ -1351,6 +1425,8 @@ const __m256 phases = _mm256_add_ps(
 // (bit-exact by construction) and only the sample fetch / lerp / mix is
 // vectorized.  Callers must have validated every handle with
 // ValidateLoopVoice and the transient preconditions.
+// Voice-batched transient kernel for spans of 1-7 frames (per-lane scalar
+// envelope).  Completed attack/decay goes to classChangeHandles.
 void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
                                   const uint32_t* handles,
                                   uint32_t handleCount) {
@@ -1486,6 +1562,9 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
     }
 }
 
+// ── Class entry point: transient-loop batch ─────────────────────────────
+// Short spans take the voice-batched kernel, longer ones the per-voice chunk
+// kernel.  Refuses (state untouched) for rotation cases it cannot handle.
 bool RenderTransientLoopAVX2(const RenderSpanContext& context,
 
                              const uint32_t* handles,
@@ -1538,7 +1617,7 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
 
 
 // ════════════════════════════════════════════════════════════════════════
-// Filtered sustained loops, eight voices per vector.
+// 5. Filtered sustained loops, eight voices per vector.
 //
 // The per-voice time-chunk kernel interpolates eight frames at once but must
 // run the voice's recursive 2-pole low-pass one sample at a time (scalar
@@ -1558,8 +1637,10 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
 // exact).  Lanes mix in lane order, which is the handle order the sequential
 // path uses, so even the mix order is unchanged while lanes stay aligned.
 // ════════════════════════════════════════════════════════════════════════
+// Test switch (SetFilteredGroupKernelForTest): off forces the per-voice kernels.
 bool g_filteredGroupsEnabled = true;
 
+// In-place 8x8 float transpose: rows <-> columns.
 inline void Transpose8x8Ps(__m256* r) {
     const __m256 t0 = _mm256_unpacklo_ps(r[0], r[1]);
     const __m256 t1 = _mm256_unpackhi_ps(r[0], r[1]);
@@ -1598,6 +1679,7 @@ inline bool FilteredGroupEligible(const RenderSpanContext& c, uint32_t h) {
     return !lfoOn;
 }
 
+// Renders eight eligible filtered sustained voices (`h[0..7]`) together.
 void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
                                       const uint32_t* h) {
     VoiceSoA& v = *c.voices;
@@ -1792,11 +1874,15 @@ void RenderSustainedFramesGrouped(const RenderSpanContext& c,
 // ends the group, and every lane then finishes through the per-voice kernel
 // on the remaining sub-span (which owns retirement).  retiredAt[i] is the
 // span-relative frame the voice retires on, or UINT32_MAX.
+// Same eligibility as the sustained group; kept as a separate name so the
+// release path can diverge without touching the sustained one.
 inline bool FilteredReleaseGroupEligible(const RenderSpanContext& c,
                                          uint32_t h) {
     return FilteredGroupEligible(c, h);
 }
 
+// Renders eight eligible filtered releasing voices together; `retiredAt[k]`
+// is the retirement frame of voice k or UINT32_MAX.
 void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
                                     const uint32_t* h, uint32_t* retiredAt) {
     VoiceSoA& v = *c.voices;
@@ -2038,7 +2124,8 @@ void RenderReleaseFramesGrouped(const RenderSpanContext& c,
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Rotation-aware sustained-loop kernel (PhaseRotation.h).
+// 6. Sustained-loop class entry point, with the rotation-aware
+//    voice-batched kernel (PhaseRotation.h).
 //
 // The regular AVX2 path vectorizes across TIME for one voice, but the
 // per-voice phase-rotation filter is an IIR with a sequential time
@@ -2252,6 +2339,10 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
 }
 
 } // namespace
+
+// ════════════════════════════════════════════════════════════════════════
+// 7. Public functions
+// ════════════════════════════════════════════════════════════════════════
 
 void SetFilteredGroupKernelForTest(bool enabled) {
     g_filteredGroupsEnabled = enabled;
@@ -2534,7 +2625,7 @@ uint32_t RenderTransientOneShotSpanScalar(
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// One-shot kernels (held and releasing non-looping voices).
+// 8. One-shot kernels (held and releasing non-looping voices).
 //
 // Every one-shot instrument (pianos, plucks, mallets — any SF2 region
 // without a loop) used to classify into SustainedOneShot/ReleaseOneShot

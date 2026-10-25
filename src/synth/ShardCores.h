@@ -22,7 +22,7 @@ namespace svms {
 // is broadcast. Cores render raw mixes in parallel, the sum gets reverb and the
 // limiter once on core 0. The serial plan loop (note launch/steal) is what bounds
 // Black MIDI speed, and this splits it.
-// ponytail: every core loads its own SoundFont copy; share one bundle if RAM bites.
+// Note: every core loads its own SoundFont copy; share one bundle if RAM bites.
 class ShardCores {
 public:
     ~ShardCores() { StopWorkers(); }

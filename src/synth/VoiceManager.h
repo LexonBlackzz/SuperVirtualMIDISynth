@@ -256,6 +256,23 @@ static_assert(sizeof(VoiceLinkRow) == 32, "VoiceLinkRow must stay 32 bytes");
 // level protects audible voices while rendered age makes older voices easier
 // to replace. MIDI velocity is not a separate priority. Audible victims enter
 // a bounded reserve of short fade tails so replacement never hard-cuts them.
+//
+// Layout of the class, roughly in file order:
+//   public
+//     policy and pool setup      steal policy, voice limit, sample rate
+//     launching                  AllocateVoiceOrSteal, ConfigureVoice,
+//                                LaunchVoiceGroup, merged voices, re-excite
+//     per-note configuration     SetVoice* (called once per note-on)
+//     release and note-off       sustain, sostenuto, release by play index
+//     mix gains                  batched fold of channel gain changes
+//     whole-voice hooks          callbacks the whole-voice renderer installs
+//                                so pre-pass events land at their exact frame
+//     test accessors             *ForTest counters and oracles
+//     read-only access           the SoA pool `v`, active list, class counts
+//   private
+//     steal index                score tree / heap, releasing ring
+//     channel and key indices    per-channel blocks, per-key chains
+//     launch internals           group reuse, deferred and lazy launches
 // ════════════════════════════════════════════════════════════════════════
 class VoiceManager {
 public:

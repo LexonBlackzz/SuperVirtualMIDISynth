@@ -16,7 +16,7 @@ struct AnimState {
 };
 
 Motion g_motion = Motion::Full;
-// ponytail: entries are never evicted; a few hundred widget IDs at most.
+// Note: entries are never evicted; a few hundred widget IDs at most.
 std::unordered_map<ImGuiID, AnimState> g_springs;
 std::unordered_map<ImGuiID, AnimState> g_eases;
 std::unordered_map<ImGuiID, double> g_pulses;

@@ -16,9 +16,7 @@
 # Local config / state
 config.ini
 imgui.ini
-/AGENTS.md
 /.vscode
-/.claude
 *.local.md
 
 # Large media and soundfonts

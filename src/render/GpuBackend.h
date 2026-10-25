@@ -1,7 +1,7 @@
 #ifndef SVMS_GPU_BACKEND_H
 #define SVMS_GPU_BACKEND_H
 
-// Realtime GPU render stage: the per-API half (see NEXT_SESSION_GPU_RENDER_STAGE.md).
+// Realtime GPU render stage: the per-API half.
 // A backend owns one device/context and renders one block of sustained-loop
 // rows per Submit/Collect pair.  Everything API-neutral lives in GpuStage.
 
