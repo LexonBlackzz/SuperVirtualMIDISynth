@@ -113,10 +113,20 @@ inline float AdvanceVibratoLfoWindow(VoiceSoA& v, uint32_t row,
 using RenderClassKernel = bool(*)(const RenderSpanContext& context,
                                   const uint32_t* handles,
                                   uint32_t handleCount);
+// Optional: renders the first whole 8-frame chunks of one steal-tail span for
+// the row `idx` of `v` and returns how many frames it consumed (0 when it
+// cannot take the span); state is committed, so the caller finishes the rest
+// with the scalar RenderStealTailSpan.
+using StealTailSpanFn = uint32_t(*)(VoiceSoA& v, uint32_t idx,
+                                    const int16_t* sampleData,
+                                    uint32_t sampleDataFrames,
+                                    float* outputLeft, float* outputRight,
+                                    uint32_t frameStart, uint32_t frameCount);
 struct RenderKernelSet {
     RenderClassKernel kernels[kVoiceRenderClassCount];
     RenderBackend backend;
     const char* name;
+    StealTailSpanFn stealTailSpan;
 };
 
 const RenderKernelSet& GetScalarRenderKernelSet();

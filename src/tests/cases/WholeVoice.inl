@@ -657,6 +657,106 @@ void RunWholeVoiceStealDifferential(uint32_t rotationMode) {
 
 void TestWholeVoiceStealDifferential() { RunWholeVoiceStealDifferential(0u); }
 
+// The AVX2 steal-tail span takes whole 8-frame chunks and leaves the rest to
+// the scalar span: the pair must match the scalar span alone on output, phase,
+// remaining frames and filter state, across loop wraps, the sample end, odd
+// remaining counts and a span longer than the fade.
+void TestStealTailSpanAvx2() {
+    if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    const svms::RenderKernelSet* kernels =
+        svms::SelectRenderKernelSet(svms::RenderBackend::AVX2);
+    Check(kernels != nullptr && kernels->stealTailSpan != nullptr,
+          "the AVX2 kernel set provides a steal-tail span");
+    if (kernels == nullptr || kernels->stealTailSpan == nullptr) return;
+    constexpr uint32_t kStoreFrames = 4096u;
+    std::vector<int16_t> samples(kStoreFrames + 8u, 0);
+    for (uint32_t i = 0; i < kStoreFrames; ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+             0.2f * std::cos(static_cast<float>(i) * 0.113f)) * 32767.0f);
+    struct TailCase {
+        float phase, step;
+        bool loop, filter;
+        uint32_t remaining, frames;
+    };
+    const TailCase cases[] = {
+        {100.3f, 0.77f, true, false, 64u, 64u},
+        {100.3f, 1.90f, true, true, 64u, 64u},
+        {3990.0f, 1.30f, true, false, 64u, 64u},   // wraps the loop
+        {4010.0f, 0.90f, false, false, 64u, 64u},  // runs off the sample end
+        {10.0f, 0.50f, true, true, 37u, 64u},      // odd remaining count
+        {250.0f, 1.10f, true, true, 64u, 100u},    // span longer than the fade
+        {250.0f, 1.10f, true, false, 64u, 13u},    // one chunk plus a remainder
+        {7.0f, 0.00f, true, true, 64u, 64u},       // zero step
+    };
+    uint32_t totalDone = 0u;
+    for (const TailCase& c : cases) {
+        svms::VoiceSoA scalarRow, kernelRow;
+        Check(scalarRow.Reserve(1u) && kernelRow.Reserve(1u),
+              "steal-tail test rows allocate");
+        for (svms::VoiceSoA* row : {&scalarRow, &kernelRow}) {
+            row->stealTailPhase[0] = c.phase;
+            row->stealTailPhaseInc[0] = c.step;
+            row->stealTailGain[0] = 0.8f;
+            row->stealTailMixGainL[0] = 0.6f;
+            row->stealTailMixGainR[0] = 0.4f;
+            row->stealTailSampleStart[0] = 0u;
+            row->stealTailRelEnd[0] = kStoreFrames;
+            row->stealTailRelLoopS[0] = 64u;
+            row->stealTailRelLoopE[0] = 4032u;
+            row->stealTailRelLoopSF[0] = 64.0f;
+            row->stealTailRelLoopEF[0] = 4032.0f;
+            row->stealTailSampleBacked[0] = 1u;
+            row->stealTailLoopEnabled[0] = c.loop ? 1u : 0u;
+            row->stealTailFramesRemaining[0] = c.remaining;
+            row->stealTailFramesTotal[0] = 64u;
+            row->stealTailFilterEnabled[0] = c.filter ? 1u : 0u;
+            row->stealTailFilterA0[0] = 0.12f;
+            row->stealTailFilterB1[0] = -0.7f;
+            row->stealTailFilterB2[0] = 0.25f;
+            row->stealTailFilterZ1[0] = 0.01f;
+            row->stealTailFilterZ2[0] = -0.02f;
+        }
+        const uint32_t offset = 5u;
+        std::vector<float> scalarL(offset + c.frames, 0.25f),
+            scalarR(offset + c.frames, -0.25f);
+        std::vector<float> kernelL = scalarL, kernelR = scalarR;
+        svms::RenderStealTailSpan(scalarRow, 0u, samples.data(), nullptr,
+                                  kStoreFrames, scalarL.data(), scalarR.data(),
+                                  offset, c.frames);
+        const uint32_t done = kernels->stealTailSpan(
+            kernelRow, 0u, samples.data(), kStoreFrames, kernelL.data(),
+            kernelR.data(), offset, c.frames);
+        Check(done % 8u == 0u && done <= c.frames,
+              "steal-tail kernel consumes whole 8-frame chunks");
+        totalDone += done;
+        if (done < c.frames) {
+            svms::RenderStealTailSpan(kernelRow, 0u, samples.data(), nullptr,
+                                      kStoreFrames, kernelL.data(),
+                                      kernelR.data(), offset + done,
+                                      c.frames - done);
+        }
+        float diff = 0.0f;
+        for (size_t i = 0; i < scalarL.size(); ++i) {
+            diff = (std::max)(diff, std::fabs(scalarL[i] - kernelL[i]));
+            diff = (std::max)(diff, std::fabs(scalarR[i] - kernelR[i]));
+        }
+        Check(diff <= 1.0e-6f, "steal-tail kernel matches the scalar span");
+        Check(scalarRow.stealTailFramesRemaining[0] ==
+                  kernelRow.stealTailFramesRemaining[0],
+              "steal-tail kernel leaves the same frames remaining");
+        Check(std::fabs(scalarRow.stealTailPhase[0] -
+                        kernelRow.stealTailPhase[0]) <= 1.0e-4f,
+              "steal-tail kernel leaves the same phase");
+        Check(std::fabs(scalarRow.stealTailFilterZ1[0] -
+                        kernelRow.stealTailFilterZ1[0]) <= 1.0e-6f &&
+                  std::fabs(scalarRow.stealTailFilterZ2[0] -
+                            kernelRow.stealTailFilterZ2[0]) <= 1.0e-6f,
+              "steal-tail kernel leaves the same filter state");
+    }
+    Check(totalDone >= 256u, "the AVX2 steal-tail kernel takes chunks in the cases");
+}
+
 // Rotated pools (Analytic/Sweep/Random pair form) ride the whole-voice path:
 // ghosts carry their rotation state into the in-band tail, and adopted tails
 // continue it.  Same scenario and oracle as the Coherent steal differential.

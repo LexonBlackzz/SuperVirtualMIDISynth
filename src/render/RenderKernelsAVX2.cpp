@@ -3164,6 +3164,94 @@ bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
     return true;
 }
 
+// Steal-tail span, eight frames per step: the phase recurrence stays scalar
+// (repeated += step, as in RenderStealTailSpan), the sample gather, lerp, fade
+// and mix are vectors, and the voice filter (a recurrence) runs per frame on
+// the vector's lanes.  A chunk is taken only when no frame of it wraps the
+// loop, reaches the sample end or the loop edge, or leaves the store; anything
+// else is left to the scalar span, so those frames are bit-identical to it.
+uint32_t RenderStealTailSpanAVX2(VoiceSoA& v, uint32_t idx,
+                                 const int16_t* sampleData,
+                                 uint32_t sampleDataFrames,
+                                 float* outputLeft, float* outputRight,
+                                 uint32_t frameStart, uint32_t frameCount) {
+    uint32_t remaining = v.stealTailFramesRemaining[idx];
+    if (remaining < 8u || frameCount < 8u || sampleData == nullptr ||
+        v.stealTailSampleBacked[idx] == 0u || v.rot != nullptr) {
+        return 0u;
+    }
+    const uint32_t relEnd = v.stealTailRelEnd[idx];
+    if (relEnd < 2u) return 0u;
+    const float step = v.stealTailPhaseInc[idx];
+    if (!(step >= 0.0f)) return 0u;
+    const bool loop = v.stealTailLoopEnabled[idx] != 0u;
+    const uint32_t sampleStart = v.stealTailSampleStart[idx];
+    const float loopEndF = v.stealTailRelLoopEF[idx];
+    const uint32_t limit = loop ? (std::min)(relEnd, v.stealTailRelLoopE[idx])
+                                : relEnd;
+    const uint32_t total = v.stealTailFramesTotal[idx];
+    const bool filtered = v.stealTailFilterEnabled[idx] != 0u;
+    float phase = (std::max)(0.0f, v.stealTailPhase[idx]);
+    const __m256 gain = _mm256_set1_ps(v.stealTailGain[idx]);
+    const __m256 mixL = _mm256_set1_ps(v.stealTailMixGainL[idx]);
+    const __m256 mixR = _mm256_set1_ps(v.stealTailMixGainR[idx]);
+    const __m256 fadeDen = _mm256_set1_ps(
+        total > 1u ? static_cast<float>(total - 1u) : 1.0f);
+    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f,
+                                       6.0f, 7.0f);
+    uint32_t consumed = 0u;
+    while (frameCount - consumed >= 8u && remaining >= 8u) {
+        alignas(32) float phases[8];
+        float p = phase;
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            phases[k] = p;
+            p += step;
+        }
+        // phases[7] is the largest; p is the phase after the chunk.
+        const uint32_t base7 = static_cast<uint32_t>(phases[7]);
+        if (base7 + 1u >= limit || (loop && p >= loopEndF) ||
+            sampleStart + base7 + 1u >= sampleDataFrames) {
+            break;
+        }
+        const __m256 ph = _mm256_load_ps(phases);
+        const __m256i base = _mm256_cvttps_epi32(ph);
+        const __m256 frac = _mm256_sub_ps(ph, _mm256_cvtepi32_ps(base));
+        __m256 first, second;
+        GatherSamplePairAVX2(sampleData,
+            _mm256_add_epi32(base, _mm256_set1_epi32(
+                static_cast<int>(sampleStart))), first, second);
+        __m256 sample = _mm256_add_ps(first, _mm256_mul_ps(
+            _mm256_sub_ps(second, first), frac));
+        if (filtered) {
+            alignas(32) float s[8];
+            _mm256_store_ps(s, sample);
+            for (uint32_t k = 0u; k < 8u; ++k)
+                s[k] = ProcessStealTailFilterSample(v, idx, s[k]);
+            sample = _mm256_load_ps(s);
+        }
+        const __m256 fade = total > 1u
+            ? _mm256_div_ps(_mm256_sub_ps(_mm256_set1_ps(
+                  static_cast<float>(remaining - 1u)), lane), fadeDen)
+            : _mm256_setzero_ps();
+        const __m256 scaled = _mm256_mul_ps(_mm256_mul_ps(sample, gain), fade);
+        float* l = outputLeft + frameStart + consumed;
+        float* r = outputRight + frameStart + consumed;
+        _mm256_storeu_ps(l, _mm256_add_ps(_mm256_loadu_ps(l),
+                                          _mm256_mul_ps(scaled, mixL)));
+        _mm256_storeu_ps(r, _mm256_add_ps(_mm256_loadu_ps(r),
+                                          _mm256_mul_ps(scaled, mixR)));
+        phase = p;
+        remaining -= 8u;
+        consumed += 8u;
+    }
+    if (consumed != 0u) {
+        v.stealTailPhase[idx] = phase;
+        v.stealTailFramesRemaining[idx] = remaining;
+    }
+    _mm256_zeroupper();
+    return consumed;
+}
+
 const RenderKernelSet& GetAVX2RenderKernelSet() {
     static const RenderKernelSet set = [] {
         RenderKernelSet result{};
@@ -3180,6 +3268,7 @@ const RenderKernelSet& GetAVX2RenderKernelSet() {
         result.kernels[static_cast<uint32_t>(VoiceRenderClass::TransientOneShot)] =
             RenderTransientOneShotAVX2;
         result.backend = RenderBackend::AVX2;
+        result.stealTailSpan = RenderStealTailSpanAVX2;
         result.name = "avx2";
         return result;
     }();

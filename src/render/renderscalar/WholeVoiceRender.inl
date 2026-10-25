@@ -261,8 +261,16 @@ inline void RenderScalar::RenderGhostTailSpan(uint32_t ghost, VoiceSoA& s,
     s.stealTailFramesRemaining[0] = tail.framesRemaining;
     s.stealTailFramesTotal[0] = tail.framesTotal;
     if (s.rot != nullptr) s.stealTailRot[0] = tail.rot;
-    RenderStealTailSpan(s, 0, sampleData, wvHilbertData_, sampleDataFrames,
-                        outL, outR, frameStart, frameCount);
+    // AVX2 takes the whole 8-frame chunks; the scalar span finishes the rest.
+    uint32_t done = 0u;
+    if (kernelSet_->stealTailSpan != nullptr && s.rot == nullptr) {
+        done = kernelSet_->stealTailSpan(s, 0, sampleData, sampleDataFrames,
+                                         outL, outR, frameStart, frameCount);
+    }
+    if (done < frameCount) {
+        RenderStealTailSpan(s, 0, sampleData, wvHilbertData_, sampleDataFrames,
+                            outL, outR, frameStart + done, frameCount - done);
+    }
     wvGhostTails_[ghost].framesRemaining = s.stealTailFramesRemaining[0];
     // Rotation phase/angle advanced with the fade; adoption continues it.
     if (s.rot != nullptr) wvGhostTails_[ghost].rot = s.stealTailRot[0];
