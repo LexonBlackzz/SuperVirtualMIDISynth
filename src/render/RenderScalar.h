@@ -691,6 +691,8 @@ private:
     static void GpuPassThunk(uint32_t job, const IndexedJobMix& mix,
                              uint32_t frameCount, void* userData);
     void RunGpuPass(GpuPassContext& ctx, float* outputLeft, float* outputRight);
+    void SortGpuRows(GpuPassContext& ctx, uint32_t* rows, uint32_t count,
+                     float* outputLeft, float* outputRight);
     uint32_t TryGpuSubmit(VoiceManager& voices, const int16_t* sampleData,
                           uint32_t sampleDataFrames, float* outputLeft,
                           float* outputRight, uint32_t numFrames,

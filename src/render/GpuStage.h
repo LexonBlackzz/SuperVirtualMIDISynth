@@ -85,6 +85,22 @@ public:
     // the voices in changes (the mix is tolerance-equal either way).
     void SetSortByRegion(bool on) { sortByRegion_ = on; }
     bool SortByRegion() const { return sortByRegion_; }
+    // The store position a row reads at block start, in 64-frame steps, with the
+    // handle: the sort entry (key in the high word).
+    static uint64_t SortEntry(uint32_t handle, uint32_t sampleStart, float phase) {
+        const uint32_t position =
+            sampleStart + (phase > 0.0f && phase < 1.0e9f ? static_cast<uint32_t>(phase) : 0u);
+        const uint32_t key = (std::min)(position >> 6, 0xFFFFFFu);
+        return (static_cast<uint64_t>(key) << 32) | handle;
+    }
+    static constexpr uint32_t kSortBuckets = 4096u;
+    // Scratch of the parallel sort: two entry arrays and one histogram of
+    // kSortBuckets counters per job.
+    uint64_t* SortA() { return sortA_.data(); }
+    uint64_t* SortB() { return sortB_.data(); }
+    uint32_t* SortHist() { return sortHist_.data(); }
+    uint32_t SortCapacity() const { return static_cast<uint32_t>(sortA_.size()); }
+    void AddSortMicros(uint64_t micros) { stats_.sortMicros += micros; }
 
     // Stable counting sort of rows[0, count) by the store position each row
     // reads at block start, in 64-frame (one cache line) steps: two 12-bit
@@ -97,11 +113,7 @@ public:
         uint64_t* b = sortB_.data();
         for (uint32_t i = 0u; i < count; ++i) {
             const uint32_t h = rows[i];
-            const float phase = phases[h];
-            const uint32_t position =
-                sampleStart[h] + (phase > 0.0f && phase < 1.0e9f ? static_cast<uint32_t>(phase) : 0u);
-            const uint32_t key = (std::min)(position >> 6, 0xFFFFFFu);
-            a[i] = (static_cast<uint64_t>(key) << 32) | h;
+            a[i] = SortEntry(h, sampleStart[h], phases[h]);
         }
         uint32_t counts[4096];
         for (uint32_t shift = 32u; shift <= 44u; shift += 12u) {
@@ -158,6 +170,7 @@ public:
                 cpuRows_.assign(handleCapacity, 0u);
                 sortA_.assign(handleCapacity, 0u);
                 sortB_.assign(handleCapacity, 0u);
+                sortHist_.assign(kMaxJobs * kSortBuckets, 0u);
             } catch (...) {
                 enabled_ = false;
                 return false;
@@ -335,6 +348,7 @@ public:
     std::vector<uint32_t> cpuRows_;
     std::vector<uint64_t> sortA_;
     std::vector<uint64_t> sortB_;
+    std::vector<uint32_t> sortHist_;
     bool sortByRegion_ = true;
     uint32_t jobGpu_[kMaxJobs] = {};
     uint32_t jobEnv_[kMaxJobs] = {};

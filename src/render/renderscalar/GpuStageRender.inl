@@ -32,6 +32,14 @@ struct RenderScalar::GpuPassContext {
     uint32_t cpuBase[GpuStage::kMaxJobs];
     uint32_t gpuBase[GpuStage::kMaxJobs];
     uint32_t envBase[GpuStage::kMaxJobs];
+    // Sort passes 4..7 (SortGpuRows): the list being sorted and its scratch.
+    uint32_t sortCount;
+    uint32_t* sortRows;
+    uint64_t* sortA;
+    uint64_t* sortB;
+    uint32_t* sortHist;     // sort jobs x GpuStage::kSortBuckets counters
+    const uint32_t* sortSampleStart;
+    const float* sortPhases;
 };
 
 // Which GPU kernel (if any) renders the row's whole block exactly like the
@@ -83,6 +91,38 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
     GpuPassContext& c = *static_cast<GpuPassContext*>(userData);
     // Passes 1 and 2 split the active list into jobCount ranges (pass 2 runs
     // them part by part); pass 3 splits one part's list slice.
+    if (c.pass >= 4u) {
+        // Parallel radix sort (two 12-bit digits) of c.sortRows[0, c.sortCount):
+        // each job owns one contiguous chunk of the input of every pass.
+        const uint32_t jobs = c.jobEnd - c.jobFirst;
+        const uint32_t begin = c.sortCount * localJob / jobs;
+        const uint32_t end = c.sortCount * (localJob + 1u) / jobs;
+        uint32_t* hist = c.sortHist + localJob * GpuStage::kSortBuckets;
+        constexpr uint32_t kMask = GpuStage::kSortBuckets - 1u;
+        if (c.pass == 4u) {
+            std::memset(hist, 0, GpuStage::kSortBuckets * sizeof(uint32_t));
+            for (uint32_t i = begin; i < end; ++i) {
+                const uint32_t h = c.sortRows[i];
+                const uint64_t e = GpuStage::SortEntry(
+                    h, c.sortSampleStart[h], c.sortPhases[h]);
+                c.sortA[i] = e;
+                ++hist[(e >> 32) & kMask];
+            }
+        } else if (c.pass == 5u) {
+            for (uint32_t i = begin; i < end; ++i)
+                c.sortB[hist[(c.sortA[i] >> 32) & kMask]++] = c.sortA[i];
+        } else if (c.pass == 6u) {
+            std::memset(hist, 0, GpuStage::kSortBuckets * sizeof(uint32_t));
+            for (uint32_t i = begin; i < end; ++i)
+                ++hist[(c.sortB[i] >> 44) & kMask];
+        } else {
+            for (uint32_t i = begin; i < end; ++i) {
+                c.sortRows[hist[(c.sortB[i] >> 44) & kMask]++] =
+                    static_cast<uint32_t>(c.sortB[i]);
+            }
+        }
+        return;
+    }
     const uint32_t job = c.pass == 3u ? localJob : c.jobFirst + localJob;
     RenderScalar* renderer = c.renderer;
     VoiceSoA& v = c.voices->v;
@@ -319,6 +359,65 @@ inline void RenderScalar::RunGpuPass(GpuPassContext& ctx, float* outputLeft,
     }
 }
 
+// Orders rows[0, count) by the store position each row reads at block start
+// (see GpuStage::SortEntry).  Big lists go through the worker pool: four short
+// dispatches (keys + digit-0 histogram, scatter, digit-1 histogram, scatter)
+// with a serial prefix over jobs x 4096 counters between them.  Small lists and
+// a missing pool use the serial sort.  Stable, so equal keys keep list order.
+inline void RenderScalar::SortGpuRows(GpuPassContext& ctx, uint32_t* rows,
+                                      uint32_t count, float* outputLeft,
+                                      float* outputRight) {
+    GpuStage& stage = *ctx.stage;
+    if (!stage.SortByRegion() || count < 64u || count > stage.SortCapacity())
+        return;
+    const VoiceSoA& v = ctx.voices->v;
+    uint32_t jobs = 1u;
+    if (workerPool_ != nullptr) {
+        jobs = (std::min)((std::min)(workerPool_->GetThreadCount(),
+                                     workerPool_->GetJobCapacity()),
+                          GpuStage::kMaxJobs);
+        jobs = (std::min)(jobs, count / 8192u);
+    }
+    if (jobs < 2u) {
+        stage.SortRows(rows, count, v.sampleStart, v.phases);
+        return;
+    }
+    const uint64_t start = GpuStage::NowMicros();
+    ctx.jobFirst = 0u;
+    ctx.jobEnd = jobs;
+    ctx.sortCount = count;
+    ctx.sortRows = rows;
+    ctx.sortA = stage.SortA();
+    ctx.sortB = stage.SortB();
+    ctx.sortHist = stage.SortHist();
+    ctx.sortSampleStart = v.sampleStart;
+    ctx.sortPhases = v.phases;
+    // Turns the per-job counts into start offsets: bucket-major, job-minor, so
+    // earlier jobs' elements precede later jobs' within a bucket (stable).
+    auto prefix = [&]() {
+        uint32_t total = 0u;
+        for (uint32_t d = 0u; d < GpuStage::kSortBuckets; ++d) {
+            for (uint32_t j = 0u; j < jobs; ++j) {
+                uint32_t& c = ctx.sortHist[j * GpuStage::kSortBuckets + d];
+                const uint32_t n = c;
+                c = total;
+                total += n;
+            }
+        }
+    };
+    ctx.pass = 4u;
+    RunGpuPass(ctx, outputLeft, outputRight);
+    prefix();
+    ctx.pass = 5u;
+    RunGpuPass(ctx, outputLeft, outputRight);
+    ctx.pass = 6u;
+    RunGpuPass(ctx, outputLeft, outputRight);
+    prefix();
+    ctx.pass = 7u;
+    RunGpuPass(ctx, outputLeft, outputRight);
+    stage.AddSortMicros(GpuStage::NowMicros() - start);
+}
+
 // Lists the block's GPU rows (the CPU keeps the rest in wvItemHandles_) and
 // starts the GPU.  Returns the number of rows the GPU owns this block (0 = CPU only).
 // `submitted` is false when rows were partitioned but the submit failed; the
@@ -445,8 +544,10 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
         }
         stage.MutableStats().uploadMicros += GpuStage::NowMicros() - uploadStart;
         if (ok) {
-            stage.SortRows(stage.List() + sStart, gpuRun - sStart, voices.v.sampleStart, voices.v.phases);
-            stage.SortRows(stage.EnvList() + eStart, envRun - eStart, voices.v.sampleStart, voices.v.phases);
+            SortGpuRows(ctx, stage.List() + sStart, gpuRun - sStart,
+                        outputLeft, outputRight);
+            SortGpuRows(ctx, stage.EnvList() + eStart, envRun - eStart,
+                        outputLeft, outputRight);
         }
         ok = ok && stage.SubmitPart(sStart, gpuRun - sStart, eStart,
                                     envRun - eStart, numFrames, uploads,
