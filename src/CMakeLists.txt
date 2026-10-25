@@ -17,6 +17,7 @@ option(SVMS_CUDA "Embed the CUDA kernels of the GPU render stage (needs nvcc; po
 # for Turing through Blackwell plus PTX for newer GPUs on a new enough driver.
 if(NOT SVMS_XP_COMPAT)
     add_library(svms_gpu_cuda OBJECT render/GpuBackendCUDA.cpp)
+    set_target_properties(svms_gpu_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 if(SVMS_CUDA AND NOT SVMS_XP_COMPAT AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     find_program(SVMS_NVCC nvcc HINTS ENV CUDA_PATH ENV CUDAToolkit_ROOT PATH_SUFFIXES bin)
