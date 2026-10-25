@@ -1409,6 +1409,7 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
             self->RefreshSelectedPresets();
             std::fill(std::begin(self->channelPitchBendRatio_),
                       std::end(self->channelPitchBendRatio_), 1.0f);
+            std::memset(self->channelSoundCtl_, 0, sizeof(self->channelSoundCtl_));
             for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
                 self->channelCache->SetBendRatio(
                     static_cast<uint8_t>(channel), 1.0f);
@@ -2153,6 +2154,38 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
             setup.filterB2 = filter.b2;
             setup.filterEnabled = filter.enabled;
         }
+        const ChannelSoundCtl& ctl = channelSoundCtl_[channel];
+        if (ctl.cutoff != 0 || ctl.resonance != 0) {
+            const bool lowPass = matchedRegion->filterType ==
+                static_cast<uint8_t>(FilterType::LowPass2Pole);
+            const PreparedVoiceFilter filter = PrepareVoiceLowPass(
+                static_cast<uint8_t>(FilterType::LowPass2Pole),
+                static_cast<int16_t>((lowPass ? matchedRegion->initialFilterFc : 13500) +
+                                     ctl.cutoff),
+                static_cast<int16_t>((lowPass ? matchedRegion->initialFilterQ : 0) +
+                                     ctl.resonance),
+                static_cast<uint32_t>(sr));
+            setup.filterA0 = filter.a0;
+            setup.filterB1 = filter.b1;
+            setup.filterB2 = filter.b2;
+            setup.filterEnabled = filter.enabled;
+        }
+        if (ctl.release != 0) {
+            const float releaseSeconds =
+                TimecentsToSeconds(matchedRegion->releaseVolEnv) *
+                powf(2.0f, static_cast<float>(ctl.release) / 1200.0f);
+            setup.releaseDecay = MakeReleaseDecay(releaseSeconds, sampleRate);
+            setup.releaseSamples = MakeReleaseSamples(releaseSeconds, sampleRate);
+        }
+        if (ctl.attack != 0) {
+            const float attackSeconds = (std::max)(0.001f,
+                TimecentsToSeconds(matchedRegion->attackVolEnv)) *
+                powf(2.0f, static_cast<float>(ctl.attack) / 1200.0f);
+            setup.attackSamples = attackSeconds > 0.0001f
+                ? static_cast<uint32_t>(attackSeconds * sr) : 0u;
+            setup.attackGainStep = setup.attackSamples > 0u
+                ? setup.initialGain / static_cast<float>(setup.attackSamples) : 0.0f;
+        }
         noteLaunchScratch_[mi] = setup;
     }
 
@@ -2259,6 +2292,16 @@ void Driver::HandleControlChange(uint8_t channel, uint8_t controller, uint8_t va
     const bool sostenutoWasActive =
         channelCache && channelCache->IsSostenutoActive(channel);
     if (channelCache) channelCache->ControlChange(channel, controller, value);
+    if (channel < kChannelCount) {
+        ChannelSoundCtl& ctl = channelSoundCtl_[channel];
+        const int centered = static_cast<int>(value) - 64;
+        if (controller == 74u) ctl.cutoff = static_cast<int16_t>(centered * 2400 / 64);
+        else if (controller == 71u) ctl.resonance = static_cast<int16_t>(centered * 240 / 63);
+        else if (controller == 73u) ctl.attack = static_cast<int16_t>(centered * 3600 / 64);
+        else if (controller == 72u) ctl.release = static_cast<int16_t>(centered * 3600 / 64);
+        else if (controller == 121u) ctl = ChannelSoundCtl{};
+        if (controller >= 71u && controller <= 74u) ++channelLaunchRevision_[channel];
+    }
     if (channel < kChannelCount &&
         (controller == 0u || controller == 32u || controller == 6u ||
          controller == 38u || controller == 96u || controller == 97u ||

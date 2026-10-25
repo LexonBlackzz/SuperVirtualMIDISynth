@@ -209,6 +209,7 @@ void Driver::ResetAllVoices() {
     RefreshSelectedPresets();
     std::fill(std::begin(channelPitchBendRatio_),
               std::end(channelPitchBendRatio_), 1.0f);
+    std::memset(channelSoundCtl_, 0, sizeof(channelSoundCtl_));
     for (uint32_t channel = 0; channel < kChannelCount; ++channel)
         ++channelLaunchRevision_[channel];
     nextPlayIndex_ = 1;

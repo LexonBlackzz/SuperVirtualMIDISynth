@@ -261,6 +261,7 @@ Driver::Driver()
     std::memset(configuredVelocityGain_, 0, sizeof(configuredVelocityGain_));
     std::fill(std::begin(channelPitchBendRatio_),
               std::end(channelPitchBendRatio_), 1.0f);
+    std::memset(channelSoundCtl_, 0, sizeof(channelSoundCtl_));
     for (auto& counter : shedByVelocityAtomic_) counter.store(0, std::memory_order_relaxed);
     for (auto& fence : channelTerminationFence_) fence.store(0, std::memory_order_relaxed);
     reverb.Reset();

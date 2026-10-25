@@ -977,6 +977,10 @@ private:
     VoiceHandle noteLaunchHandles_[kMaxMatchingRegions];
     float configuredVelocityGain_[128];
     float channelPitchBendRatio_[kChannelCount];
+    // CC74 cutoff / CC71 resonance / CC73 attack / CC72 release offsets in
+    // cents, centibels and timecents; read when a note launches.
+    struct ChannelSoundCtl { int16_t cutoff, resonance, attack, release; };
+    ChannelSoundCtl channelSoundCtl_[kChannelCount];
     uint32_t sampleStoreCount;
     uint32_t sampleDataFrames;
     uint64_t qpcFreq;
