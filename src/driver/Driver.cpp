@@ -583,7 +583,6 @@ bool Driver::Initialize() {
                                        std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
-    voiceManager->SetStealPolicy(cfg.stealPolicy);
     voiceManager->SetPerKeyVoiceCap(cfg.perKeyVoiceCap);
     voiceManager->SetStealReject(cfg.stealReject);
     if (!voiceManager->Initialize(cfg.maxVoices, sampleRate)) {

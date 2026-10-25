@@ -368,143 +368,8 @@ inline void VoiceManager::BuildStealHeap() {
     stealHeapValid_ = true;
 }
 
-inline void VoiceManager::SetStealPolicy(uint32_t policy) {
-    if (stealPolicy_ == policy) return;
-    stealPolicy_ = policy;
-    if (policy == 0u) {
-        // Returning to Quality: rebuild every index structure from live
-        // pool state. BuildStealHeap resets the volatile list, tree, and
-        // heaps before rescanning, so nothing stale survives FastCursor.
-        BuildStealHeap();
-    } else {
-        stealHeapValid_ = false;
-        stealVolatileHeapValid_ = false;
-        stealHeapCount_ = 0u;
-        stealVolatileCount_ = 0u;
-        stealVolatileHeapCount_ = 0u;
-    }
-}
-
-// FastCursor victim: the next Active slot at the allocation cursor that is
-// not inside an uncommitted launch transaction. Everything downstream
-// (sibling group retirement, ghost capture, in-place reinit) runs exactly
-// as it does for a searched victim.
-inline VoiceHandle VoiceManager::SelectCursorVictim() {
-    const uint32_t capacity = maxVoices_;
-    for (uint32_t probes = 0u; probes < capacity; ++probes) {
-        const uint32_t idx = stealCursor_;
-        stealCursor_ = idx + 1u < capacity ? idx + 1u : 0u;
-        if (v.state[idx] != static_cast<uint8_t>(VoiceState::Active))
-            continue;
-        if (stealCandidateDeferred_[idx] != 0u ||
-            stealCandidateReserved_[idx] != 0u)
-            continue;  // inside an uncommitted launch transaction
-        return static_cast<VoiceHandle>(idx);
-    }
-    return kInvalidVoice;
-}
-
-// ScanSteal victim: quietest effective level among the next
-// kStealScanWindow slots from a rotating cursor, masked to Active voices
-// outside an uncommitted launch transaction. The window is fully
-// prefetch-friendly (linear) and SIMD-reducible, so the whole search is a
-// handful of vector ops with no index structures anywhere. Falls back to a
-// full-pool scan when the window contains no eligible voice.
-inline VoiceHandle VoiceManager::SelectScanVictim() {
-    // Quietest effective level among the next kStealScanWindow Active
-    // slots from a rotating cursor. Linear, prefetch-friendly, SIMD
-    // reducible; falls back to a full-pool scan when the window holds no
-    // eligible voice. Assumes capacity is a power of two for the mask; the
-    // pool reserves capacities as powers of two.
-    const uint32_t capacity = maxVoices_;
-    constexpr uint32_t kStealScanWindow = 128u;
-    const uint32_t start = (capacity & (capacity - 1u)) == 0u
-        ? stealScanCursor_ & (capacity - 1u)
-        : stealScanCursor_ % capacity;
-    float bestLevel = 3.402823466e+38F;
-    uint32_t bestIdx = UINT32_MAX;
-#if defined(_MSC_VER) || defined(__AVX2__)
-    const __m256 signMask = _mm256_set1_ps(-0.0f);
-#endif
-    for (uint32_t pass = 0u; pass < 2u && bestIdx == UINT32_MAX; ++pass) {
-        const uint32_t probes = pass == 0u
-            ? (capacity > kStealScanWindow ? kStealScanWindow : 0u)
-            : capacity;
-        uint32_t probe = 0u;
-        while (probe < probes) {
-            const uint32_t idx0 = start + probe;
-            if (idx0 + 8u <= capacity) {
-                // Vector path: 8 contiguous slots, entirely in range.
-                uint32_t valid = 0u;
-                for (uint32_t l = 0u; l < 8u; ++l) {
-                    const uint32_t idx = idx0 + l;
-                    valid |= (v.state[idx] == static_cast<uint8_t>(
-                                  VoiceState::Active) &&
-                              stealCandidateDeferred_[idx] == 0u &&
-                              stealCandidateReserved_[idx] == 0u)
-                        ? (1u << l) : 0u;
-                }
-                if (valid != 0u) {
-#if defined(_MSC_VER) || defined(__AVX2__)
-                    const __m256 level = _mm256_mul_ps(
-                        _mm256_andnot_ps(
-                            signMask, _mm256_loadu_ps(v.currentGain + idx0)),
-                        _mm256_loadu_ps(v.stealOutputGain + idx0));
-                    float lv[8];
-                    _mm256_storeu_ps(lv, level);
-#else
-                    float lv[8];
-                    for (uint32_t l = 0u; l < 8u; ++l)
-                        lv[l] = std::fabs(v.currentGain[idx0 + l]) *
-                                v.stealOutputGain[idx0 + l];
-#endif
-                    for (uint32_t l = 0u; l < 8u; ++l) {
-                        if ((valid & (1u << l)) != 0u && lv[l] < bestLevel) {
-                            bestLevel = lv[l];
-                            bestIdx = idx0 + l;
-                        }
-                    }
-                }
-                probe += 8u;
-            } else {
-                // Tail (and the full-pool fallback path): scalar.
-                const uint32_t idx = idx0 < capacity ? idx0 : idx0 - capacity;
-                if (v.state[idx] == static_cast<uint8_t>(VoiceState::Active) &&
-                    stealCandidateDeferred_[idx] == 0u &&
-                    stealCandidateReserved_[idx] == 0u) {
-                    const float level = std::fabs(v.currentGain[idx]) *
-                        v.stealOutputGain[idx];
-                    if (level < bestLevel) {
-                        bestLevel = level;
-                        bestIdx = idx;
-                    }
-                }
-                ++probe;
-            }
-        }
-        if (bestIdx != UINT32_MAX) {
-            stealScanCursor_ = (capacity & (capacity - 1u)) == 0u
-                ? (bestIdx + kStealScanWindow) % capacity
-                : (bestIdx + kStealScanWindow) & (capacity - 1u);
-            return static_cast<VoiceHandle>(bestIdx);
-        }
-    }
-    return kInvalidVoice;
-}
-
 inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
                                                     bool reserveVolatileRoot) {
-    if (FastSteal()) {
-        // (void)reserveVolatileRoot: index-free policies never reserve --
-        // the victim is consumed immediately by the launch transaction.
-        const VoiceHandle victim = ScanSteal() ? SelectScanVictim()
-                                               : SelectCursorVictim();
-        if (victim == kInvalidVoice) return kInvalidVoice;
-        PrefetchVoiceLines(victim);
-        const uint32_t position = activePosition_[victim];
-        activePosition = position < activeCount_ ? position : 0u;
-        return victim;
-    }
     if (!stealHeapValid_) BuildStealHeap();
 
     // Releasing-ring fast path. Under saturated chopped-note churn the pool
@@ -736,7 +601,7 @@ inline bool VoiceManager::ShouldRejectNoteOn(
     // a level closely enough that the whole-note call is the same in practice).
     for (uint32_t layer = 0u; layer < count; ++layer)
         if (setups[layer].exclusiveClass != 0u) return false;
-    if (FastSteal() || perKeyVoiceCap_ != 0u ||
+    if (perKeyVoiceCap_ != 0u ||
         freeTop_ >= count || activeCount_ + count <= voiceLimit_ ||
         activeCount_ == 0u)
         return false;
@@ -803,7 +668,6 @@ inline bool VoiceManager::ShouldRejectNoteOn(
 }
 
 inline void VoiceManager::InsertPreselectedVictim(VoiceHandle victim) {
-    if (FastSteal()) return;
     // The sequential path builds the volatile heap before any selection that
     // can observe volatile candidates (tier c inside PopStealCandidate), so
     // the re-arm must guarantee the same precondition before re-linking a
@@ -846,7 +710,6 @@ inline void VoiceManager::RearmLiveBatchVictims(const VoiceHandle* victims,
 
 inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
                                               uint32_t activePosition) {
-    if (FastSteal()) return;
     if (!stealHeapValid_ || handle >= maxVoices_) return;
     if (!IsLinkedActiveVoice(handle)) return;  // unlinked: not indexable yet
     if (!IsStableStealCandidate(handle)) {
@@ -862,7 +725,6 @@ inline void VoiceManager::PushStealCandidate(VoiceHandle handle,
 }
 
 inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
-    if (FastSteal()) return;
     if (!stealHeapValid_ || handle >= maxVoices_ ||
         stealCandidateDeferred_[handle] != 0u) return;
 

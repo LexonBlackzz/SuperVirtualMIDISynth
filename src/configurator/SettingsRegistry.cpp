@@ -71,7 +71,6 @@ const SettingDef kSettings[] = {
     {"largePages", "Large memory pages", P, "Performance \xE2\x80\xBA CPU", "large pages tlb memory", nullptr, nullptr, true, D(&V::largePages)},
     {"dropZeroLife", "Drop instant-steal blips (experimental)", P, "Performance \xE2\x80\xBA CPU", "drop zero life instant steal lazy launch black midi experimental", nullptr, nullptr, true, D(&V::dropZeroLifeVictims)},
     {"launchStaging", "Staged note launches (experimental)", P, "Performance âº CPU", "staged launch staging ghost copy steal black midi experimental", nullptr, nullptr, true, D(&V::launchStaging)},
-    {"steal", "Steal policy", P, "Performance \xE2\x80\xBA Engine internals", "steal quality fast scan", nullptr, "perf", false, D(&V::stealPolicy)},
     {"retire", "Retire floor", P, "Performance \xE2\x80\xBA Engine internals", "voice retire floor release tail -76 db", nullptr, "perf", false, D(&V::voiceRetireThreshold)},
     {"perKey", "Per-key voice cap", P, "Performance \xE2\x80\xBA Engine internals", "per key cap", nullptr, "perf", false, D(&V::perKeyVoiceCap)},
     {"ghost", "Ghost budget", P, "Performance \xE2\x80\xBA Engine internals", "ghost steal storm", nullptr, "perf", false, D(&V::ghostBudget)},

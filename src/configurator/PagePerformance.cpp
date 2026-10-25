@@ -559,21 +559,6 @@ void Internals(ConfigDocument& doc) {
     ui::BeginReveal("perf");
     ui::BeginCard("##internals");
     {
-        static const char* labels[3] = {"Quality", "Fast", "Scan"};
-        static const char* descs[3] = {
-            "Quality replaces the quietest voice. Clearly the best by ear; keep this.",
-            "Fast skips the priority index. Audibly worse under heavy note churn; for experiments only.",
-            "Scan searches linearly. Audibly worse under heavy note churn; for experiments only."};
-        int idx = static_cast<int>((std::min)(2u, w.stealPolicy));
-        ui::BeginRow("steal", "Which voice gets replaced", descs[idx], ui::SegmentedSize(labels, 3));
-        if (ui::Segmented("##steal", &idx, labels, 3)) {
-            w.stealPolicy = static_cast<uint32_t>(idx);
-            doc.MarkDirty();
-            SendLiveCommand(SVMS_COMMAND_SET_STEAL_POLICY, w.stealPolicy);
-        }
-        ui::EndRow();
-    }
-    {
         const float width = ImGui::GetContentRegionAvail().x;
         const float kw = 96.0f * s;
         const float free = (std::max)(0.0f, width - 3.0f * kw) / 3.0f;

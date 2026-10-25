@@ -136,16 +136,6 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
         // the steal index, so it is dropped from the index below; ring
         // entries are self-invalidating hints and need no repair.
         bestHandle = forcedVictim;
-    } else if (FastSteal()) {
-        // FastCursor: consume the batch-provided victim when valid,
-        // otherwise take the next slot at the allocation cursor. No index
-        // search, no repair — downstream runs identically.
-        bestHandle = preselectedVictim;
-        if (bestHandle == kInvalidVoice ||
-            v.state[bestHandle] !=
-                static_cast<uint8_t>(VoiceState::Active))
-            bestHandle = ScanSteal() ? SelectScanVictim()
-                                     : SelectCursorVictim();
     } else {
         bestHandle = preselectedVictim != kInvalidVoice
             ? preselectedVictim
@@ -161,8 +151,8 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     // retirement, tail capture, and index repair below still have work to
     // run before the first field write.
     PrefetchVoiceLines(bestHandle);
-    // Quality mode receives this from the pop; FastCursor derives it here
-    // (the batch path's positions are cursor positions either way).
+    // The pop supplies this for a fresh selection; a preselected or forced
+    // victim derives it from the active list.
     bestPos = activePosition_[bestHandle];
     const uint32_t bestIdx = bestHandle;
     if (forcedVictim != kInvalidVoice) {
@@ -276,7 +266,7 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
             // invalidated the index between the launch transaction's
             // reservation and this commit must fall through to the
             // guarded removal/re-push below.
-            if (stealHeapValid_ && !FastSteal() &&
+            if (stealHeapValid_ &&
                 IsStableStealCandidate(handle) && IsLinkedActiveVoice(handle)) {
                 const float score = ComputeStableStealKey(handle);
                 stealStableKey_[handle] = EncodeStableWinnerKey(
@@ -1072,7 +1062,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
     const ChannelParamsSnapshot& cp, VoiceHandle* outHandles) {
     ++stealPeekEpoch_;
     if (count < 2u || count > 8u || perKeyVoiceCap_ != 0u || freeTop_ != 0u ||
-        FastSteal() || !stealHeapValid_ || stealHeapCount_ == 0u)
+        !stealHeapValid_ || stealHeapCount_ == 0u)
         return false;
     for (uint32_t i = 0u; i < count; ++i) {
         const VoiceConfiguration& s = setups[i];

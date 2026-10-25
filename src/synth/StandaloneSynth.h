@@ -93,7 +93,6 @@ public:
             if (!LoadBanks(paths, error)) return false;
         }
         if (const EngineConfig* t = config.tuning) {
-            voices_.SetStealPolicy(t->stealPolicy);
             voices_.SetPerKeyVoiceCap(t->perKeyVoiceCap);
             voices_.SetStealReject(t->stealReject);
             g_voiceRetireThreshold.store(t->voiceRetireThreshold,

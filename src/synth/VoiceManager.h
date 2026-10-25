@@ -276,8 +276,6 @@ static_assert(sizeof(VoiceLinkRow) == 32, "VoiceLinkRow must stay 32 bytes");
 // ════════════════════════════════════════════════════════════════════════
 class VoiceManager {
 public:
-    void SetStealPolicy(uint32_t policy);
-
     // Optional fan-out for the steal index's big linear passes (the volatile
     // heap's key build over every releasing voice): runs job(context, i) for i
     // in [0, jobCount) on other threads and returns when all are done.  Set by
@@ -1071,12 +1069,8 @@ private:
     uint64_t stealVolatileHeapFrame_;
     bool stealVolatileHeapValid_;
     RenderBackend stealKeyBackend_;
-    // Steal policy: 0 = Quality (incremental winner tree + volatile heap,
-    // quietest-victim semantics), 1 = FastCursor (O(1) round-robin slot
-    // takeover, no index structures; victim quality is "oldest slot"). The
-    // index is unmaintained under FastCursor and fully rebuilt from live
-    // pool state on a switch back to Quality.
-    uint32_t stealPolicy_ = 0u;  // 0 quality, 1 cursor, 2 scan
+    // Victim ranking is Quality: an incremental winner tree plus a volatile
+    // heap, quietest voice first.
     uint32_t perKeyVoiceCap_ = 0u;  // 0 = off; else max playing voices per (channel,key)
     std::atomic<bool> stealReject_{false};  // live-togglable from the link thread
     float stealAgeScale_ = 1.0f / 256.0f;   // score units per sample of age; 0 = ageless
@@ -1085,8 +1079,6 @@ private:
     bool ShouldRejectNoteOn(const VoiceConfiguration* setups, uint32_t count,
                             const ChannelParamsSnapshot& cp,
                             uint32_t multiplicity);
-    uint32_t stealScanCursor_ = 0u;  // rotating scan window (policy 2)
-    uint32_t stealCursor_ = 0u;
     uint8_t* stealCandidateDeferred_;
     // A deferred same-frame replacement may keep ownership of the volatile
     // heap root while its sample/envelope fields are configured.  The slot
@@ -1261,10 +1253,6 @@ private:
     VoiceHandle NextValidReleasingRingVictim(uint32_t& victimPosition,
                                              bool consume);
     bool ReleasingRingEligible() const;
-    bool FastSteal() const { return stealPolicy_ != 0u; }
-    VoiceHandle SelectCursorVictim();
-    VoiceHandle SelectScanVictim();
-    bool ScanSteal() const { return stealPolicy_ == 2u; }
     void PushStealCandidate(VoiceHandle handle, uint32_t activePosition);
     void UpdateStealCandidate(VoiceHandle handle);
     void RemoveStealCandidate(VoiceHandle handle);

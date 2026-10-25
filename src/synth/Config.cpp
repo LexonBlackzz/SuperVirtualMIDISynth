@@ -451,7 +451,6 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         }},
         {"voices", {
             {"retire_threshold", cfg.voiceRetireThreshold},
-            {"steal_policy", cfg.stealPolicy},
             {"per_key_voice_cap", cfg.perKeyVoiceCap},
             {"steal_reject", cfg.stealReject},
             {"ghost_budget", cfg.ghostBudget},
@@ -944,8 +943,6 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "retire_threshold", cfg.voiceRetireThreshold,
                        1e-8f, 0.05f))
             AppendWarning(cfg.configWarning, "voices.retire_threshold");
-        if (!ReadValue(*it, "steal_policy", cfg.stealPolicy, 0u, 2u))
-            AppendWarning(cfg.configWarning, "voices.steal_policy");
         if (!ReadValue(*it, "per_key_voice_cap", cfg.perKeyVoiceCap, 0u, 256u))
             AppendWarning(cfg.configWarning, "voices.per_key_voice_cap");
         if (!ReadBool(*it, "steal_reject", cfg.stealReject))
@@ -1115,7 +1112,6 @@ EngineConfig EngineConfig::Default() {
     cfg.shedStartPercent = 70;
     cfg.maxEventsPerBlock = 65536;
     cfg.voiceRetireThreshold = 0.00177828f;  // -55 dB (default picked by listening tests)
-    cfg.stealPolicy = 0;
     cfg.perKeyVoiceCap = 0;  // opt-in: no per-key limit by default
     cfg.stealReject = false;  // opt-in: every note-on launches by default
     cfg.decimation = false;  // opt-in: every voice mixes by default
@@ -1287,7 +1283,6 @@ bool EngineConfig::Validate() const {
             highPriorityVelocity >= 1 && highPriorityVelocity <= 127 &&
             shedStartPercent >= 1 && shedStartPercent < 100 &&
             voiceRetireThreshold > 0.0f && voiceRetireThreshold <= 0.05f &&
-            stealPolicy <= 2u &&
             perKeyVoiceCap <= 256u &&
             threadAffinityMode <= 2u &&
             gpuApi <= 4u &&

@@ -76,7 +76,6 @@ struct ConfigValues {
     uint32_t shedStartPercent = 70;
     uint32_t maxEventsPerBlock = 65536;
     float voiceRetireThreshold = 0.00177828f;
-    uint32_t stealPolicy = 0;
     // Opt-in per-key voice cap; 0 = off (no per-key limit).
     uint32_t perKeyVoiceCap = 0u;
     // Opt-in listening test: drop note-ons that would be the first steal victim.

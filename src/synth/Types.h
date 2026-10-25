@@ -445,8 +445,7 @@ struct SamplePage {
     X(uint32_t, stealFadeInFramesTotal)
 
 // Cold fields that stay SoA: the steal scorers scan them across many voices
-// (contiguous AVX2 loads in SelectScanVictim, index gathers in
-// BuildVolatileStealKeysAVX2).
+// (index gathers in BuildVolatileStealKeysAVX2).
 #define SVMS_VOICE_SOA_COLD_FIELDS(X) \
     X(float, stealOutputGain) \
     X(uint64_t, birthFrame)

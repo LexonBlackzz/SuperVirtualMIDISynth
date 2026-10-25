@@ -164,7 +164,6 @@ struct EngineConfig {
     uint32_t shedStartPercent;
     uint32_t maxEventsPerBlock;
     float voiceRetireThreshold;
-    uint32_t stealPolicy;  // 0 = quality (priority tree), 1 = fast cursor
     // Opt-in per-key voice cap (0 = off): a note-on for a (channel,note)
     // already playing at the cap replaces the oldest key member instead of
     // growing the pileup. syndrv-style; release tails never count.

@@ -338,22 +338,14 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         return svms::RLResult::Ok;
     }
     case RT::SetStealPolicy: {
-        // param = 0 (quality: incremental priority tree) or 1 (fast
-        // cursor: O(1) round-robin victim, no index structures). Live
-        // switches rebuild or drop the index as appropriate.
-        if (cmd.param > 2u || !voiceManager) {
-            strncpy_s(resultText, kText, "steal policy must be 0, 1 or 2",
+        // Quality is the only victim ranking left. The command id stays so
+        // existing clients keep working: 0 is accepted as a no-op.
+        if (cmd.param != 0u) {
+            strncpy_s(resultText, kText, "steal policy must be 0 (quality)",
                       _TRUNCATE);
             return svms::RLResult::InvalidArgument;
         }
-        // Applied by the audio thread at the next block boundary — never
-        // here, mid-block, where it would race a launch transaction.
-        pendingStealPolicy_.store(cmd.param, std::memory_order_release);
-        engineConfig_.stealPolicy = cmd.param;
-        static const char* const policyNames[] = {
-            "quality (priority tree)", "fast cursor", "scan" };
-        snprintf(resultText, kText, "steal policy: %s (next block)",
-                 policyNames[cmd.param]);
+        snprintf(resultText, kText, "steal policy: quality");
         return svms::RLResult::Ok;
     }
     case RT::SetPerKeyVoiceCap: {

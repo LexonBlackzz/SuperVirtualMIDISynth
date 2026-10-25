@@ -279,16 +279,6 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                 sizeof(self->staleRecoveryNoteOffValid_));
     std::memset(self->staleRecoveryNoteOffCount_, 0,
                 sizeof(self->staleRecoveryNoteOffCount_));
-    // Apply a parked steal-policy switch at the block boundary: launch
-    // transactions never span callbacks, so the index rebuild is atomic
-    // with respect to every reserved-candidate commit.
-    {
-        const uint32_t pendingPolicy =
-            self->pendingStealPolicy_.exchange(UINT32_MAX,
-                                               std::memory_order_acq_rel);
-        if (pendingPolicy != UINT32_MAX && self->voiceManager)
-            self->voiceManager->SetStealPolicy(pendingPolicy);
-    }
     // With the event compiler, pre-compiled pages are imported into the paged
     // scheduler; without it the loop below pops and compiles raw ingress here.
     const uint32_t importedPages = self->useEventCompiler_

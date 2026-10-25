@@ -814,13 +814,6 @@ private:
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block sample offset.
     std::atomic<bool> blockTimingEnabled_{false};
-    // Pending steal-policy switch (UINT32_MAX = none). The policy is
-    // structural to the steal index, so the audio thread applies it at a
-    // block boundary instead of the config thread doing it mid-render,
-    // where it tore launch transactions apart (observed as a wild write in
-    // VolatileHeapSiftDown when a reserved-candidate commit raced the
-    // index teardown).
-    std::atomic<uint32_t> pendingStealPolicy_{UINT32_MAX};
     // Opt-in unbounded render: no wall-time recovery jump, no per-block
     // admission soft cap. The schedule is rendered in exact order at
     // whatever speed the engine manages; WASAPI glitches are accepted.
