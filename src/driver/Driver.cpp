@@ -651,8 +651,8 @@ bool Driver::Initialize() {
         return false;
     }
 #if defined(SVMS_GPU_STAGE)
-    gpuRequested = cfg.gpuApi != 0u && !shard;
-    if (cfg.gpuApi != 0u && !shard) {
+    gpuRequested = cfg.gpuApi != 0u;
+    if (cfg.gpuApi != 0u) {
         // Opt-in GPU stage: a failure here is not an error, the CPU renders
         // everything exactly as it does without the stage.
         std::string gpuError;
