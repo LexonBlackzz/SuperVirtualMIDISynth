@@ -109,22 +109,6 @@ void ReduceTile(float v0, float v1, float v2, float v3, float v4, float v5,
 int Sample16(uint i) {
     return bitfieldExtract(int(StoreWord(i >> 1u)), int((i & 1u) << 4u), 16);
 }
-#endif
-
-#if defined(VOICE_CS)
-layout(std430, binding = 1) readonly buffer RowBuf { uint rows[]; };
-layout(std430, binding = 2) readonly buffer ListBuf { uint listv[]; };
-layout(std430, binding = 5) writeonly buffer DynBuf { vec4 dynv[]; };
-layout(std430, binding = 11) buffer StateBuf { uint state[]; };
-
-// Fast path: one interior frame of a running span (no clamp, no wrap).
-#define FAST_POS(I, F) { uint b_ = uint(phase); I = sampleStart + b_; F = phase - float(b_); phase += phaseInc; }
-// The two samples at positions i, i+1 as the halves of one 32-bit value,
-// without a branch: shift the 64-bit window (wa, wb) right by 16 * (i & 1).
-#define FAST_LOAD(I) uint wa_ = store[(I) >> 1u]; uint wb_ = store[((I) >> 1u) + 1u];
-#define FAST_PAIR(I) uint p_ = ((I) & 1u) << 4u; FAST_LOAD(I) uint x_ = (wa_ >> p_) | ((wb_ << (31u - p_)) << 1u); int s0_ = (int(x_) << 16) >> 16; int s1_ = int(x_) >> 16; precise float d_ = float(s1_ - s0_); precise float m_ = d_ * f_; precise float u_ = float(s0_) + m_;
-#define FAST_OUT_PLAIN(K, I, F) { precise float f_ = (F); FAST_PAIR(I) STORE_OUT(K, u_ * gainLs, u_ * gainRs) }
-#define FAST_OUT_FILT(K, I, F) { precise float f_ = (F); FAST_PAIR(I) precise float smp_ = u_ * kScale; precise float outv_ = smp_ * a0 + z1; precise float zin_ = smp_ * twoA0 + z2; precise float fb1_ = b1 * outv_; precise float nz1_ = zin_ - fb1_; precise float zin2_ = smp_ * a0; precise float fb2_ = b2 * outv_; z1 = nz1_; z2 = zin2_ - fb2_; STORE_OUT(K, outv_ * gainL, outv_ * gainR) }
 
 // Position of the next frame: the scalar kernel's run bookkeeping.  Advances
 // phase (and the run counter) exactly once, only for frames that exist.
@@ -155,6 +139,23 @@ void Classify(bool v, inout precise float phase, inout uint runLeft,
     frac = phase - float(base);
     if (v) phase += phaseInc;
 }
+
+#endif
+
+#if defined(VOICE_CS)
+layout(std430, binding = 1) readonly buffer RowBuf { uint rows[]; };
+layout(std430, binding = 2) readonly buffer ListBuf { uint listv[]; };
+layout(std430, binding = 5) writeonly buffer DynBuf { vec4 dynv[]; };
+layout(std430, binding = 11) buffer StateBuf { uint state[]; };
+
+// Fast path: one interior frame of a running span (no clamp, no wrap).
+#define FAST_POS(I, F) { uint b_ = uint(phase); I = sampleStart + b_; F = phase - float(b_); phase += phaseInc; }
+// The two samples at positions i, i+1 as the halves of one 32-bit value,
+// without a branch: shift the 64-bit window (wa, wb) right by 16 * (i & 1).
+#define FAST_LOAD(I) uint wa_ = store[(I) >> 1u]; uint wb_ = store[((I) >> 1u) + 1u];
+#define FAST_PAIR(I) uint p_ = ((I) & 1u) << 4u; FAST_LOAD(I) uint x_ = (wa_ >> p_) | ((wb_ << (31u - p_)) << 1u); int s0_ = (int(x_) << 16) >> 16; int s1_ = int(x_) >> 16; precise float d_ = float(s1_ - s0_); precise float m_ = d_ * f_; precise float u_ = float(s0_) + m_;
+#define FAST_OUT_PLAIN(K, I, F) { precise float f_ = (F); FAST_PAIR(I) STORE_OUT(K, u_ * gainLs, u_ * gainRs) }
+#define FAST_OUT_FILT(K, I, F) { precise float f_ = (F); FAST_PAIR(I) precise float smp_ = u_ * kScale; precise float outv_ = smp_ * a0 + z1; precise float zin_ = smp_ * twoA0 + z2; precise float fb1_ = b1 * outv_; precise float nz1_ = zin_ - fb1_; precise float zin2_ = smp_ * a0; precise float fb2_ = b2 * outv_; z1 = nz1_; z2 = zin2_ - fb2_; STORE_OUT(K, outv_ * gainL, outv_ * gainR) }
 
 void main() {
     uint t = gl_LocalInvocationID.x;
@@ -336,6 +337,12 @@ layout(std430, binding = 7) readonly buffer EnvRowBuf { uint erows[]; };
 layout(std430, binding = 8) readonly buffer EnvListBuf { uint elist[]; };
 layout(std430, binding = 9) writeonly buffer EnvDynBuf { uvec4 edyn[]; };
 layout(std430, binding = 11) buffer StateBuf { uint state[]; };
+// Block timeline, one uvec4 per handle: start frame, release frame, flags.
+layout(std430, binding = 12) readonly buffer TlBuf { uvec4 tlh[]; };
+#define TL_ACTIVE 0x80000000u
+#define TL_PRE_SUSTAINED 1u
+#define TL_CLEAR_LOOP 2u
+#define FLIPPED_BIT (1u << 28)
 uniform uint uRetireBits;
 #define EMIT(K, L, R) STORE_OUT(K, L, R)
 
@@ -436,6 +443,11 @@ void main() {
     precise float a0 = 0.0;
     precise float b1 = 0.0;
     precise float b2 = 0.0;
+    precise float heldL = 0.0;
+    precise float heldR = 0.0;
+    uint tlStart = 0u;
+    uint tlRelease = 0xFFFFFFFFu;
+    uint tlFlags = 0u;
     uint handle = 0u;
     if (live) {
         handle = elist[uListBase + idx];
@@ -469,11 +481,33 @@ void main() {
         a0 = uintBitsToFloat(erows[r + 15u]);
         b1 = uintBitsToFloat(erows[r + 16u]);
         b2 = uintBitsToFloat(erows[r + 17u]);
+        heldL = uintBitsToFloat(erows[r + 18u]);
+        heldR = uintBitsToFloat(erows[r + 19u]);
+        uvec4 th = tlh[handle];
+        tlStart = th.x;
+        tlRelease = th.y;
+        tlFlags = th.z;
     }
     precise float twoA0 = 2.0 * a0;
     const float kScale = 1.0 / 32768.0;
     const float retireThreshold = uintBitsToFloat(uRetireBits);
     const uint kForever = 0xFFFFFFFFu;
+    // Timeline: a row with a start frame renders nothing, and advances nothing,
+    // before it; at its release frame it flips to the released machine (stage 0,
+    // looping off for SF2 sampleModes 3) where the CPU flips state; a row held
+    // as a sustained loop until then runs the scalar sustained span's math up to
+    // the flip, which differs from the generic machine in its wrap bookkeeping.
+    const bool tlRow = (tlFlags & TL_ACTIVE) != 0u;
+    const bool clearLoop = (tlFlags & TL_CLEAR_LOOP) != 0u;
+    bool preSustained = (tlFlags & TL_PRE_SUSTAINED) != 0u;
+    bool flipped = false;
+    uint stageAtFlip = 0u;
+    precise float gainAtFlip = 0.0;
+    precise float plLength = relLoopEF - relLoopSF;
+    precise float plInterior = relLoopEF - 1.0;
+    precise float heldLs = heldL * kScale;
+    precise float heldRs = heldR * kScale;
+    uint runLeft = 0u;
     bool alive = live;
     uint retire = 0xFFFFFFu;
     uint row = t / LANES;
@@ -488,7 +522,7 @@ void main() {
 #if defined(SUBGROUP32)
         DECLARE_OV
 #endif
-        bool fast = alive && (stage == 0u || stage == 3u) &&
+        bool fast = !tlRow && alive && (stage == 0u || stage == 3u) &&
                     (tile + 1u) * TILE <= uFrames;
         precise float p1 = 0.0, p2 = 0.0, p3 = 0.0, p4 = 0.0;
         if (fast) {
@@ -540,7 +574,47 @@ void main() {
             uint n = tile * TILE + k;
             precise float oL = 0.0;
             precise float oR = 0.0;
-            if (alive && n < uFrames) {
+            if (alive && n < uFrames && n >= tlStart) {
+                if (n == tlRelease) {
+                    // The exact-frame release flip: what the CPU does when it
+                    // sets the voice Releasing between two segments.
+                    flipped = true;
+                    stageAtFlip = stage;
+                    gainAtFlip = gain;
+                    stage = 0u;
+                    if (clearLoop) loop = false;
+                    preSustained = false;
+                }
+                if (preSustained) {
+                    uint first;
+                    float frac;
+                    bool edge;
+                    Classify(true, phase, runLeft, first, frac, edge, sampleStart,
+                             relLoopE, relLoopSF, relLoopEF, plLength, plInterior,
+                             phaseInc);
+                    int s0 = Sample16(first);
+                    int s1 = edge ? Sample16(sampleStart + relLoopS)
+                                  : Sample16(first + 1u);
+                    precise float d = float(s1 - s0);
+                    precise float m = d * frac;
+                    precise float u = float(s0) + m;
+                    if (filt) {
+                        precise float smp = u * kScale;
+                        precise float outv = smp * a0 + z1;
+                        precise float zin = smp * twoA0 + z2;
+                        precise float fb1 = b1 * outv;
+                        precise float nz1 = zin - fb1;
+                        precise float zin2 = smp * a0;
+                        precise float fb2 = b2 * outv;
+                        z1 = nz1;
+                        z2 = zin2 - fb2;
+                        oL = outv * heldL;
+                        oR = outv * heldR;
+                    } else {
+                        oL = u * heldLs;
+                        oR = u * heldRs;
+                    }
+                } else {
                 uint base = uint(phase);
                 bool ended = false;
                 if (base + 1u >= relEnd) {
@@ -626,6 +700,7 @@ void main() {
                         alive = false;
                     }
                 }
+                }
             }
             EMIT(k, oL, oR)
         }
@@ -653,8 +728,15 @@ void main() {
     if (live) {
         edyn[(uListBase + idx) * 2u] = uvec4(floatBitsToUint(phase), floatBitsToUint(z1),
                                floatBitsToUint(z2), floatBitsToUint(gain));
-        edyn[(uListBase + idx) * 2u + 1u] = uvec4((stage << 24u) | (retire & 0xFFFFFFu),
-                                    atkRem, decRem, relRem);
+        // A row that left its sustain stage at the flip reports its gain at the
+        // flip in attackRem (the stage's counters are zero), for the CPU's
+        // render-gain bake.
+        bool gainSlot = flipped && stageAtFlip == 3u;
+        uint shownStage = flipped ? stageAtFlip : stage;
+        edyn[(uListBase + idx) * 2u + 1u] = uvec4(
+            (shownStage << 24u) | (flipped ? FLIPPED_BIT : 0u) | (retire & 0xFFFFFFu),
+            gainSlot ? floatBitsToUint(gainAtFlip) : atkRem,
+            gainSlot ? 0u : decRem, relRem);
         uint sb = handle * 8u;
         state[sb] = floatBitsToUint(phase);
         state[sb + 1u] = floatBitsToUint(z1);
@@ -710,6 +792,7 @@ void main() {
 layout(std430, binding = 7) writeonly buffer EnvRowBuf { uint erows[]; };
 layout(std430, binding = 10) readonly buffer EnvUpBuf { uint eupload[]; };
 layout(std430, binding = 11) writeonly buffer StateBuf { uint state[]; };
+layout(std430, binding = 12) writeonly buffer TlBuf { uvec4 tlh[]; };
 uniform uint uCount;
 uniform uint uBase;
 
@@ -722,6 +805,7 @@ void main() {
         erows[h * 20u + w] = eupload[b + 1u + w];
     for (uint w = 0u; w < 8u; ++w)
         state[h * 8u + w] = eupload[b + 21u + w];
+    tlh[h] = uvec4(eupload[b + 29u], eupload[b + 30u], eupload[b + 31u], 0u);
 }
 #endif
 )GLSL";

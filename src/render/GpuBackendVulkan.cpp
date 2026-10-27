@@ -8,9 +8,11 @@
 // fetched by hand.  A build without the Vulkan SDK compiles this file without
 // the shaders and Init reports it.
 //
-// Every operation (row upload, one part of a block) is its own queue
-// submission, so the GPU starts part 0 while the CPU packs part 1.  The queue
-// executes in order and each command buffer opens with a full memory barrier.
+// Each part of a block is its own queue submission, so the GPU starts part 0
+// while the CPU packs part 1.  Row uploads only record their scatter dispatch
+// into the command buffer of the next part, so they cost no submission of
+// their own.  The queue executes in order and every command buffer opens with
+// a full memory barrier.
 // Host-visible staging (lists, upload records, read-back) comes in two slots
 // that alternate per block, so a late block the GPU is still working on never
 // shares a buffer with the next one.
@@ -105,15 +107,13 @@ public:
                    const DynOut** dyn, const EnvDynOut** envDyn) override;
     void Abandon() override;
     const char* Name() const override { return name_.c_str(); }
-    // The GLSL kernels carry no per-block timeline (rows with a start or
-    // release frame inside the block stay on the CPU), like the OpenGL ones.
-    bool SupportsTimeline() const override { return false; }
+    bool SupportsTimeline() const override { return true; }
 
 private:
     static constexpr uint32_t kGroup = 128u;   // shader GROUP
     static constexpr uint32_t kTile = 4u;      // shader TILE
     static constexpr uint32_t kSlots = 2u;
-    static constexpr uint32_t kBindings = 12u;
+    static constexpr uint32_t kBindings = 13u;
     static constexpr VkDeviceSize kStagingChunk = 32u << 20;
 
     enum Kernel { kVoice, kEnv, kReduce, kScatter, kEnvScatter, kKernelCount };
@@ -153,6 +153,7 @@ private:
     void FreeBuf(Buf& b);
     void UpdateDescriptors();
     bool OpenBlock();
+    bool Recording(VkCommandBuffer& cmd, VkFence& fence);
     bool BeginOp(VkCommandBuffer& cmd, VkFence& fence);
     bool EndOp(VkCommandBuffer cmd, VkFence fence);
     void Barrier(VkCommandBuffer cmd, bool toHost);
@@ -178,11 +179,15 @@ private:
     VkPipelineLayout pipeLayout_ = VK_NULL_HANDLE;
     VkPipeline pipes_[kKernelCount] = {};
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
-    Buf store_, rows_, envRows_, state_, partial_, mix_, dyn_, envDyn_, staging_;
+    Buf store_, rows_, envRows_, state_, timeline_, partial_, mix_, dyn_, envDyn_, staging_;
     Slot slots_[kSlots];
     Part parts_[kMaxParts];
     uint32_t curSlot_ = kSlots - 1u;
     bool blockOpen_ = false;
+    // Command buffer collecting row uploads until the next part is submitted.
+    bool pending_ = false;
+    VkCommandBuffer pendingCmd_ = VK_NULL_HANDLE;
+    VkFence pendingFence_ = VK_NULL_HANDLE;
     bool lost_ = false;
     uint32_t partsSubmitted_ = 0u, partsCollected_ = 0u;
     uint32_t listBase_ = 0u, envBase_ = 0u, groupBase_ = 0u;
@@ -524,7 +529,7 @@ void VulkanBackend::UpdateDescriptors() {
     for (Slot& s : slots_) {
         const Buf* order[kBindings] = {&store_, &rows_, &s.list, &partial_, &mix_, &dyn_,
                                        &s.upload, &envRows_, &s.envList, &envDyn_,
-                                       &s.envUpload, &state_};
+                                       &s.envUpload, &state_, &timeline_};
         VkDescriptorBufferInfo infos[kBindings];
         VkWriteDescriptorSet writes[kBindings];
         for (uint32_t i = 0u; i < kBindings; ++i) {
@@ -616,6 +621,7 @@ bool VulkanBackend::Reserve(uint32_t handleCapacity, uint32_t maxFrames) {
         AllocBuf(rows_, cap * kRowWords * 4u, kStorage, Mem::Device) &&
         AllocBuf(envRows_, cap * kEnvRowWords * 4u, kStorage, Mem::Device) &&
         AllocBuf(state_, cap * kDynWords * 4u, kStorage, Mem::Device) &&
+        AllocBuf(timeline_, cap * 16u, kStorage, Mem::Device) &&
         AllocBuf(partial_, groups * maxFrames * 2u * 4u, kStorage, Mem::Device) &&
         AllocBuf(mix_, mixBytes, kSrc, Mem::Device) &&
         AllocBuf(dyn_, cap * sizeof(DynOut), kSrc, Mem::Device) &&
@@ -659,6 +665,19 @@ bool VulkanBackend::OpenBlock() {
     vk_.ResetCommandPool(device_, s.pool, 0u);
     s.used = 0u;
     blockOpen_ = true;
+    return true;
+}
+
+// The command buffer of the part being built: opened (with its leading barrier)
+// by the first upload or by the part itself.
+bool VulkanBackend::Recording(VkCommandBuffer& cmd, VkFence& fence) {
+    if (!pending_) {
+        if (!BeginOp(pendingCmd_, pendingFence_)) return false;
+        Barrier(pendingCmd_, false);
+        pending_ = true;
+    }
+    cmd = pendingCmd_;
+    fence = pendingFence_;
     return true;
 }
 
@@ -735,13 +754,12 @@ bool VulkanBackend::UploadRows(const UploadRecord* records, uint32_t count) {
                 records, static_cast<size_t>(count) * sizeof(UploadRecord));
     VkCommandBuffer cmd;
     VkFence fence;
-    if (!BeginOp(cmd, fence)) return false;
-    Barrier(cmd, false);
+    if (!Recording(cmd, fence)) return false;
     Push push = {};
     push.count = count;
     push.base = uploadCursor_;
     Dispatch(cmd, kScatter, push, (count + 63u) / 64u);
-    if (!EndOp(cmd, fence)) return false;
+    Barrier(cmd, false);
     uploadCursor_ += count;
     return true;
 }
@@ -756,13 +774,12 @@ bool VulkanBackend::UploadEnvRows(const EnvUploadRecord* records, uint32_t count
                 records, static_cast<size_t>(count) * sizeof(EnvUploadRecord));
     VkCommandBuffer cmd;
     VkFence fence;
-    if (!BeginOp(cmd, fence)) return false;
-    Barrier(cmd, false);
+    if (!Recording(cmd, fence)) return false;
     Push push = {};
     push.count = count;
     push.base = envUploadCursor_;
     Dispatch(cmd, kEnvScatter, push, (count + 63u) / 64u);
-    if (!EndOp(cmd, fence)) return false;
+    Barrier(cmd, false);
     envUploadCursor_ += count;
     return true;
 }
@@ -794,8 +811,7 @@ bool VulkanBackend::Submit(const uint32_t* list, uint32_t count, const uint32_t*
 
     VkCommandBuffer cmd;
     VkFence fence;
-    if (!BeginOp(cmd, fence)) return false;
-    Barrier(cmd, false);
+    if (!Recording(cmd, fence)) return false;
     if (count != 0u) {
         Push push = {};
         push.count = count;
@@ -838,6 +854,7 @@ bool VulkanBackend::Submit(const uint32_t* list, uint32_t count, const uint32_t*
         vk_.CmdCopyBuffer(cmd, envDyn_.buf, s.envDynRead.buf, 1u, &c);
     }
     Barrier(cmd, true);
+    pending_ = false;
     if (!EndOp(cmd, fence)) return false;
 
     Part& p = parts_[part];
@@ -872,6 +889,9 @@ void VulkanBackend::Abandon() {
     listBase_ = envBase_ = groupBase_ = 0u;
     uploadCursor_ = envUploadCursor_ = 0u;
     blockOpen_ = false;
+    // Uploads recorded but not yet submitted are dropped with the block (the
+    // slot's pool is reset when it is next opened).
+    pending_ = false;
 }
 
 Result VulkanBackend::Collect(uint64_t timeoutMicros, const float** mixLR,
@@ -928,7 +948,7 @@ void VulkanBackend::Shutdown() {
                 FreeBuf(*b);
             }
         }
-        for (Buf* b : {&store_, &rows_, &envRows_, &state_, &partial_, &mix_, &dyn_,
+        for (Buf* b : {&store_, &rows_, &envRows_, &state_, &timeline_, &partial_, &mix_, &dyn_,
                        &envDyn_, &staging_}) {
             FreeBuf(*b);
         }

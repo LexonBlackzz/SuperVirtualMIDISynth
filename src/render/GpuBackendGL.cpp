@@ -424,10 +424,11 @@ public:
     }
     const char* Name() const override { return name_.c_str(); }
     uint32_t MaxVoices() const override { return handleCapacity_; }
+    bool SupportsTimeline() const override { return true; }
 
 private:
     enum Buf { kStore, kRows, kList, kPartial, kMix, kDyn, kUpload,
-               kEnvRows, kEnvList, kEnvDyn, kEnvUpload, kState,
+               kEnvRows, kEnvList, kEnvDyn, kEnvUpload, kState, kTimeline,
                kMixRead, kDynRead, kEnvDynRead, kBufCount };
     bool Bind();
     void BindAll();
@@ -712,12 +713,13 @@ bool GLBackend::Bind() {
 
 void GLBackend::BindAll() {
     if (!bindingsDirty_) return;
-    for (GLuint binding = 0u; binding < 12u; ++binding) {
+    for (GLuint binding = 0u; binding < 13u; ++binding) {
         // Binding point order matches the shader: store, rows, list, partial,
-        // mix, dyn, upload, env rows, env list, env dyn, env upload.
-        static const Buf kOrder[12] = {kStore, kRows, kList, kPartial, kMix,
+        // mix, dyn, upload, env rows, env list, env dyn, env upload, state,
+        // timeline.
+        static const Buf kOrder[13] = {kStore, kRows, kList, kPartial, kMix,
                                        kDyn, kUpload, kEnvRows, kEnvList,
-                                       kEnvDyn, kEnvUpload, kState};
+                                       kEnvDyn, kEnvUpload, kState, kTimeline};
         gl_.BindBufferBase(GL_SHADER_STORAGE_BUFFER, binding,
                            buf_[kOrder[binding]]);
     }
@@ -800,6 +802,7 @@ bool GLBackend::Reserve(uint32_t handleCapacity, uint32_t maxFrames) {
     const size_t groups = (cap + group_ - 1u) / group_ + 2u * kMaxParts;
     bool ok = ResizeBuffer(kEnvRows, cap * kEnvRowWords * 4u) &&
               ResizeBuffer(kState, cap * kDynWords * 4u) &&
+              ResizeBuffer(kTimeline, cap * 16u) &&
               ResizeBuffer(kEnvList, cap * sizeof(uint32_t)) &&
               ResizeBuffer(kEnvDyn, cap * sizeof(EnvDynOut)) &&
               ResizeBuffer(kEnvUpload, cap * sizeof(EnvUploadRecord)) &&
