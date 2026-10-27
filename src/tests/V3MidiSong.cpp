@@ -29,6 +29,7 @@
 #include "events/MidiStream.h"
 #include "configurator/EngineLink.h"
 #include "synth/StandaloneSynth.h"
+#include "render/RealtimeBlock.h"
 
 #include <windows.h>
 #include <mmsystem.h>
@@ -62,6 +63,7 @@ struct Options {
     bool verbose = false;
     bool quiet = false;
     bool coverage = false;
+    bool blockDispatch = false;       // old behaviour: events start at the block boundary
     uint32_t tuningEdo = 12u;
     uint32_t frames = 2048u;
     uint32_t renderThreads = 0u;      // 0 = automatic
@@ -93,6 +95,8 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.coverage = true;
         } else if (std::strcmp(arg, "--quiet") == 0) {
             options.quiet = true;
+        } else if (std::strcmp(arg, "--block-dispatch") == 0) {
+            options.blockDispatch = true;
         } else if (std::strcmp(arg, "--midi") == 0 && hasValue) {
             options.midiPath = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--soundfont") == 0 && hasValue) {
@@ -588,6 +592,8 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     uint64_t nextVerboseFrame = 44100u * 2u;
     std::vector<double> cpvsSamples, budgetSamples;
     std::vector<double> dispatchPerEvent, renderOnlyCpvs;
+    svms::RealtimeBlockRenderer blockRenderer;
+    std::vector<svms::RealtimeEvent> blockBatch;
     uint64_t peakActive = 0u, peakTails = 0u;
     float audioPeak = 0.0f;
 
@@ -598,16 +604,36 @@ bool RunOffline(const Options& options, const DecodedSong& song,
         QueryPerformanceCounter(&qpcBegin);
         const uint64_t renderBegin = __rdtsc();
         uint64_t blockEvents = 0u;
-        while (eventIndex < eventCount &&
-               song.events[eventIndex].outputFrame < frame + n) {
-            synth.Dispatch(song.events[eventIndex].message,
-                           song.events[eventIndex].outputFrame);
-            ++eventIndex;
-            ++dispatched;
-            ++blockEvents;
+        uint64_t dispatchEnd;
+        if (options.blockDispatch) {
+            while (eventIndex < eventCount &&
+                   song.events[eventIndex].outputFrame < frame + n) {
+                synth.Dispatch(song.events[eventIndex].message,
+                               song.events[eventIndex].outputFrame);
+                ++eventIndex;
+                ++dispatched;
+                ++blockEvents;
+            }
+            dispatchEnd = __rdtsc();
+            synth.Render(left.data(), right.data(), n, frame);
+        } else {
+            // Events go to the renderer with the block, each at its exact frame.
+            blockBatch.clear();
+            while (eventIndex < eventCount &&
+                   song.events[eventIndex].outputFrame < frame + n) {
+                svms::RealtimeEvent due{};
+                due.targetFrame = song.events[eventIndex].outputFrame;
+                due.sequence = song.events[eventIndex].sequence;
+                due.message = song.events[eventIndex].message;
+                blockBatch.push_back(due);
+                ++eventIndex;
+                ++dispatched;
+                ++blockEvents;
+            }
+            dispatchEnd = renderBegin;
+            blockRenderer.Render(synth, blockBatch.data(), blockBatch.size(),
+                                 left.data(), right.data(), n, frame);
         }
-        const uint64_t dispatchEnd = __rdtsc();
-        synth.Render(left.data(), right.data(), n, frame);
         const uint64_t renderEnd = __rdtsc();
         QueryPerformanceCounter(&qpcEnd);
         if (blockEvents != 0u)
