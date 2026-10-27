@@ -281,7 +281,14 @@ inline void VoiceManager::CommitVoiceConfiguration(VoiceHandle handle) {
             }
             return;
         }
-        const uint32_t heapPosition = stealVolatileHeapPosition_[handle];
+        if (bucketSteal_ && !IsStableStealCandidate(handle) &&
+            IsLinkedActiveVoice(handle) && stealVolatileHeapValid_ &&
+            VolHeapHas(handle) && stealVolatileHeapFrame_ == currentFrame_) {
+            VolBucketSet(handle);
+            return;
+        }
+        const uint32_t heapPosition = bucketSteal_
+            ? UINT32_MAX : stealVolatileHeapPosition_[handle];
         if (!IsStableStealCandidate(handle) && IsLinkedActiveVoice(handle) &&
             heapPosition < stealVolatileHeapCount_ &&
             stealVolatileHeapFrame_ == currentFrame_) {
@@ -727,8 +734,7 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
 
     const bool volatileVictim = !fromRing &&
         stealCandidateReserved_[handle] == 1u &&
-        !IsStableStealCandidate(handle) &&
-        stealVolatileHeapPosition_[handle] < stealVolatileHeapCount_;
+        !IsStableStealCandidate(handle) && VolHeapHas(handle);
     const bool eligible = fromRing ||
         ((stealCandidateReserved_[handle] == 2u &&
           IsStableStealCandidate(handle) &&
@@ -956,8 +962,7 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
         const bool selectedVolatileRoot =
             stealCandidateReserved_[selected] == 1u &&
             stealVolatileHeapValid_ && stealVolatileHeapCount_ != 0u &&
-            stealVolatileHeapHandle_[0] == selected &&
-            stealVolatileHeapPosition_[selected] == 0u;
+            VolHeapIsRoot(selected);
         stealCandidateReserved_[selected] = 0u;
         if (selectedVolatileRoot)
             RemoveReservedVolatileRoot(selected);
@@ -1103,7 +1108,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
         bool ok = true;
         if (stealVolatileCount_ != 0u)
             ok = stealVolatileHeapValid_ && stealVolatileHeapCount_ != 0u &&
-                 !(stealVolatileHeapKey_[0] > p.maxKey);
+                 !(VolHeapRootKey() > p.maxKey);
         if (ok) ok = walkGroup(p.handles[p.winnerIdx]);
         if (ok) {
             stealCount_ += count;
@@ -1132,7 +1137,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
             return false;
         if (stealVolatileCount_ != 0u) {
             if (!stealVolatileHeapValid_ || stealVolatileHeapCount_ == 0u ||
-                stealVolatileHeapKey_[0] > rootKey)
+                VolHeapRootKey() > rootKey)
                 return false;
         }
         if (!walkGroup(winner)) return false;

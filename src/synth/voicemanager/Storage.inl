@@ -101,11 +101,17 @@ inline size_t VoiceManager::EstimateAllocatedBytes(
     add(sizeof(uint8_t), capacity);
     {
         const size_t bucketNodes = static_cast<size_t>(capacity) * 2u + 4096u;
-        add(sizeof(uint32_t), 65536u);
-        add(sizeof(uint32_t), bucketNodes);
-        add(sizeof(uint32_t), bucketNodes);
-        add(sizeof(uint64_t), 1024u);
-        add(sizeof(uint64_t), 16u);
+        for (int set = 0; set < 2; ++set) {
+            add(sizeof(uint32_t), 65536u);
+            add(sizeof(uint32_t), 65536u);
+            add(sizeof(uint32_t), bucketNodes);
+            add(sizeof(uint32_t), bucketNodes);
+            add(sizeof(uint32_t), bucketNodes);
+            add(sizeof(uint32_t), capacity);
+            add(sizeof(uint64_t), 1024u);
+            add(sizeof(uint64_t), 16u);
+        }
+        add(sizeof(uint64_t), capacity);
     }
     add(sizeof(int32_t), capacity);
     add(sizeof(int32_t), capacity);
@@ -159,11 +165,17 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     add(sizeof(uint8_t), capacity);  // deferred
     add(sizeof(uint8_t), capacity);  // reserved
     const uint32_t bucketNodes = capacity * 2u + 4096u;
-    add(sizeof(uint32_t), 65536u);       // bucket heads
-    add(sizeof(uint32_t), bucketNodes);  // bucket node handles
-    add(sizeof(uint32_t), bucketNodes);  // bucket node links
-    add(sizeof(uint64_t), 1024u);        // non-empty bucket bits
-    add(sizeof(uint64_t), 16u);          // non-empty word bits
+    for (int set = 0; set < 2; ++set) {  // sustained set, volatile set
+        add(sizeof(uint32_t), 65536u);       // bucket heads
+        add(sizeof(uint32_t), 65536u);       // bucket tails
+        add(sizeof(uint32_t), bucketNodes);  // bucket node handles
+        add(sizeof(uint32_t), bucketNodes);  // bucket node links
+        add(sizeof(uint32_t), bucketNodes);  // bucket node stamps
+        add(sizeof(uint32_t), capacity);     // live stamp per handle
+        add(sizeof(uint64_t), 1024u);        // non-empty bucket bits
+        add(sizeof(uint64_t), 16u);          // non-empty word bits
+    }
+    add(sizeof(uint64_t), capacity);     // volatile keys by handle
     add(sizeof(VoiceLinkRow), capacity);
     if (bytes == (std::numeric_limits<size_t>::max)()) return false;
 
@@ -213,14 +225,25 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
         take(sizeof(uint8_t), capacity));
     stealCandidateReserved_ = static_cast<uint8_t*>(
         take(sizeof(uint8_t), capacity));
-    bucketHead_ = static_cast<uint32_t*>(take(sizeof(uint32_t), 65536u));
-    bucketNodeHandle_ = static_cast<uint32_t*>(
-        take(sizeof(uint32_t), bucketNodes));
-    bucketNodeNext_ = static_cast<uint32_t*>(
-        take(sizeof(uint32_t), bucketNodes));
-    bucketBits_ = static_cast<uint64_t*>(take(sizeof(uint64_t), 1024u));
-    bucketSummary_ = static_cast<uint64_t*>(take(sizeof(uint64_t), 16u));
-    bucketNodeCap_ = bucketNodes;
+    for (StealBucketSet* set : {&stableBuckets_, &volBuckets_}) {
+        set->head = static_cast<uint32_t*>(take(sizeof(uint32_t), 65536u));
+        set->tail = static_cast<uint32_t*>(take(sizeof(uint32_t), 65536u));
+        set->nodeHandle = static_cast<uint32_t*>(
+            take(sizeof(uint32_t), bucketNodes));
+        set->nodeNext = static_cast<uint32_t*>(
+            take(sizeof(uint32_t), bucketNodes));
+        set->nodeBucket = static_cast<uint32_t*>(
+            take(sizeof(uint32_t), bucketNodes));
+        set->handleNode = static_cast<uint32_t*>(
+            take(sizeof(uint32_t), capacity));
+        set->bits = static_cast<uint64_t*>(take(sizeof(uint64_t), 1024u));
+        set->summary = static_cast<uint64_t*>(take(sizeof(uint64_t), 16u));
+        set->cap = bucketNodes;
+        set->handles = capacity;
+        set->used = 0u;
+        set->freeHead = 0u;
+    }
+    volKey_ = static_cast<uint64_t*>(take(sizeof(uint64_t), capacity));
     BindLinkRows(static_cast<VoiceLinkRow*>(
         take(sizeof(VoiceLinkRow), capacity)));
     return offset <= metadataBytes_;
@@ -262,8 +285,10 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     stealHeapBuildCount_ = other.stealHeapBuildCount_;
     stealIndexRepairCount_ = other.stealIndexRepairCount_;
     bucketSteal_ = other.bucketSteal_;
-    bucketUsed_ = other.bucketUsed_;
-    bucketFree_ = other.bucketFree_;
+    stableBuckets_.used = other.stableBuckets_.used;
+    stableBuckets_.freeHead = other.stableBuckets_.freeHead;
+    volBuckets_.used = other.volBuckets_.used;
+    volBuckets_.freeHead = other.volBuckets_.freeHead;
     stealVolatileCount_ = other.stealVolatileCount_;
     stealVolatileHeapCount_ = other.stealVolatileHeapCount_;
     stealVolatileHeapFrame_ = other.stealVolatileHeapFrame_;
@@ -326,6 +351,12 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
         voiceLimit_ = 0u;
         return false;
     }
+    // The releasing ring is a stand-in for what the bucketed index does for
+    // every volatile voice; a zero capacity keeps it out of the way.
+    if (bucketSteal_) {
+        releasingRingCapacity_ = 0u;
+        releasingRingMask_ = 0u;
+    }
     maxVoices_ = requested;
     voiceLimit_ = requested;
     sampleRate_ = sampleRate > 0 ? sampleRate : 44100;
@@ -370,7 +401,9 @@ inline void VoiceManager::Reset() {
                 sizeof(*stealCandidateDeferred_) * maxVoices_);
     std::memset(stealCandidateReserved_, 0,
                 sizeof(*stealCandidateReserved_) * maxVoices_);
-    ResetBuckets();
+    stableBuckets_.Reset();
+    volBuckets_.Reset();
+    std::memset(volKey_, 0, sizeof(*volKey_) * maxVoices_);
     for (uint32_t i = 0u; i < maxVoices_; ++i) {
         playGroupNext_[i] = -1;
         playGroupPrev_[i] = -1;
@@ -660,14 +693,9 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     stealVolatileHeapPosition_ = grown.stealVolatileHeapPosition_;
     stealCandidateDeferred_ = grown.stealCandidateDeferred_;
     stealCandidateReserved_ = grown.stealCandidateReserved_;
-    bucketHead_ = grown.bucketHead_;
-    bucketNodeHandle_ = grown.bucketNodeHandle_;
-    bucketNodeNext_ = grown.bucketNodeNext_;
-    bucketBits_ = grown.bucketBits_;
-    bucketSummary_ = grown.bucketSummary_;
-    bucketNodeCap_ = grown.bucketNodeCap_;
-    bucketUsed_ = grown.bucketUsed_;
-    bucketFree_ = grown.bucketFree_;
+    stableBuckets_ = grown.stableBuckets_;
+    volBuckets_ = grown.volBuckets_;
+    volKey_ = grown.volKey_;
     BindLinkRows(grown.linkRows_);
     metadataStorage_ = grown.metadataStorage_;
     metadataBytes_ = grown.metadataBytes_;

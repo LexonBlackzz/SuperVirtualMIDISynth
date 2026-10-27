@@ -74,6 +74,166 @@ SVMS_VM_FORCEINLINE uint32_t StealHighBit64(uint64_t x) noexcept {
     return 63u - static_cast<uint32_t>(__builtin_clzll(x));
 #endif
 }
+// One bucketed ordering of handles by a 64-bit key whose top 16 bits pick a
+// bucket.  An entry is live only while the caller's per-handle key array
+// still holds a non-zero key that maps to that bucket and the node is the
+// handle's newest, so re-keying or removing a handle never touches the lists.
+struct StealBucketSet {
+    uint32_t* head = nullptr;        // bucket -> oldest node + 1
+    uint32_t* tail = nullptr;        // bucket -> newest node + 1
+    uint32_t* nodeHandle = nullptr;
+    uint32_t* nodeNext = nullptr;    // node + 1 of the next newer node
+    uint32_t* nodeBucket = nullptr;
+    uint32_t* handleNode = nullptr;  // per handle: its live node + 1, or 0
+    uint64_t* bits = nullptr;        // 1024 words: non-empty buckets
+    uint64_t* summary = nullptr;     // 16 words: non-empty bit words
+    uint32_t cap = 0u;
+    uint32_t handles = 0u;
+    uint32_t used = 0u;
+    uint32_t freeHead = 0u;
+
+    void Reset() {
+        if (head == nullptr) return;
+        std::memset(handleNode, 0, handles * sizeof(uint32_t));
+        std::memset(head, 0, 65536u * sizeof(uint32_t));
+        std::memset(tail, 0, 65536u * sizeof(uint32_t));
+        std::memset(bits, 0, 1024u * sizeof(uint64_t));
+        std::memset(summary, 0, 16u * sizeof(uint64_t));
+        used = 0u;
+        freeHead = 0u;
+    }
+    // Empties the set by walking only the occupied buckets. handleNode is
+    // cleared by the caller's rebuild (every handle that gets a node again
+    // overwrites its entry; the others are never read without a live node).
+    void Clear() {
+        for (uint32_t s = 0u; s < 16u; ++s) {
+            uint64_t sm = summary[s];
+            while (sm != 0u) {
+                const uint32_t sb = StealHighBit64(sm);
+                sm &= ~(1ull << sb);
+                const uint32_t word = s * 64u + sb;
+                uint64_t b = bits[word];
+                while (b != 0u) {
+                    const uint32_t bit = StealHighBit64(b);
+                    b &= ~(1ull << bit);
+                    const uint32_t bucket = word * 64u + bit;
+                    for (uint32_t node = head[bucket]; node != 0u;
+                         node = nodeNext[node - 1u]) {
+                        const uint32_t handle = nodeHandle[node - 1u];
+                        if (handleNode[handle] == node) handleNode[handle] = 0u;
+                    }
+                    head[bucket] = 0u;
+                    tail[bucket] = 0u;
+                }
+                bits[word] = 0u;
+            }
+            summary[s] = 0u;
+        }
+        used = 0u;
+        freeHead = 0u;
+    }
+    // Entries of a bucket are a FIFO: the voice that has sat in the bucket
+    // longest is the first victim among equals.  A handle has at most one
+    // live node; re-keying it inside the same bucket keeps its place, moving
+    // it to another bucket leaves the old node dead.
+    void Link(uint32_t node, uint32_t handle, uint32_t bucket, bool front) {
+        nodeHandle[node - 1u] = handle;
+        nodeBucket[node - 1u] = bucket;
+        handleNode[handle] = node;
+        if (head[bucket] == 0u) {
+            nodeNext[node - 1u] = 0u;
+            head[bucket] = tail[bucket] = node;
+            const uint32_t word = bucket >> 6u;
+            bits[word] |= 1ull << (bucket & 63u);
+            summary[word >> 6u] |= 1ull << (word & 63u);
+        } else if (front) {
+            nodeNext[node - 1u] = head[bucket];
+            head[bucket] = node;
+        } else {
+            nodeNext[node - 1u] = 0u;
+            nodeNext[tail[bucket] - 1u] = node;
+            tail[bucket] = node;
+        }
+    }
+    // Only valid right after Clear(): the pool cannot be exhausted by the
+    // number of distinct handles.
+    void PushUnchecked(uint32_t handle, uint64_t key) {
+        Link(++used, handle, static_cast<uint32_t>(key >> 48u), false);
+    }
+    // False when the node pool ran out; the caller rebuilds.  `front` puts a
+    // new node at the head of its bucket (re-arming a victim that was popped
+    // but not consumed).
+    bool Push(uint32_t handle, uint64_t key, bool front) {
+        const uint32_t bucket = static_cast<uint32_t>(key >> 48u);
+        const uint32_t live = handleNode[handle];
+        if (live != 0u && nodeHandle[live - 1u] == handle &&
+            nodeBucket[live - 1u] == bucket)
+            return true;
+        uint32_t node;
+        if (freeHead != 0u) {
+            node = freeHead;
+            freeHead = nodeNext[node - 1u];
+        } else if (used < cap) {
+            node = ++used;
+        } else {
+            return false;
+        }
+        Link(node, handle, bucket, front);
+        return true;
+    }
+    void Unlink(uint32_t bucket) {
+        const uint32_t node = head[bucket];
+        const uint32_t next = nodeNext[node - 1u];
+        const uint32_t handle = nodeHandle[node - 1u];
+        if (handleNode[handle] == node) handleNode[handle] = 0u;
+        nodeNext[node - 1u] = freeHead;
+        freeHead = node;
+        head[bucket] = next;
+        if (next == 0u) {
+            tail[bucket] = 0u;
+            const uint32_t word = bucket >> 6u;
+            bits[word] &= ~(1ull << (bucket & 63u));
+            if (bits[word] == 0u)
+                summary[word >> 6u] &= ~(1ull << (word & 63u));
+        }
+    }
+    // A handle that just lost its key and sits at the head of its bucket
+    // leaves the list at once, so the order does not depend on whether a
+    // later lookup happens to find it first.
+    void DropIfHead(uint32_t handle) {
+        const uint32_t node = handleNode[handle];
+        if (node == 0u || nodeHandle[node - 1u] != handle) return;
+        const uint32_t bucket = nodeBucket[node - 1u];
+        if (head[bucket] == node) Unlink(bucket);
+    }
+    // Key of the live entry at the head of the highest occupied bucket, or
+    // 0.  Dead entries met on the way are dropped, so the cost amortizes over
+    // the pushes.
+    uint64_t Root(const uint64_t* keys, uint32_t* handleOut) {
+        for (;;) {
+            uint32_t s = 16u;
+            uint64_t sm = 0u;
+            while (s != 0u) {
+                sm = summary[--s];
+                if (sm != 0u) break;
+            }
+            if (sm == 0u) return 0u;
+            const uint32_t word = s * 64u + StealHighBit64(sm);
+            const uint32_t bucket = word * 64u + StealHighBit64(bits[word]);
+            while (head[bucket] != 0u) {
+                const uint32_t node = head[bucket];
+                const uint32_t handle = nodeHandle[node - 1u];
+                const uint64_t key = keys[handle];
+                if (key != 0u && handleNode[handle] == node &&
+                    static_cast<uint32_t>(key >> 48u) == bucket) {
+                    if (handleOut) *handleOut = handle;
+                    return key;
+                }
+                Unlink(bucket);
+            }
+        }
+    }
+};
 // Experimental (voices.drop_zero_life_victims, env SVMS_DROP_ZERO_LIFE for
 // now): a voice stolen on the very frame it was launched has played zero
 // samples; skip its ghost, which only contributes the 64-frame steal-fade
@@ -1087,19 +1247,15 @@ private:
     uint64_t* stealWinnerTree_;
     uint32_t stealTreeLeafBase_;
     // Bucketed steal index (voices.steal_index).  The leaves of
-    // stealWinnerTree_ stay the source of truth; the buckets only order them.
-    // A bucket is a LIFO list of (handle) nodes keyed by the top 16 bits of
-    // the ordered score; an entry is live only while the handle's leaf is
-    // non-zero and still maps to that bucket, so updates never delete.
+    // stealWinnerTree_ stay the source of truth for sustained voices and
+    // volKey_ holds the keys of decaying/releasing voices (rebuilt once per
+    // block); the bucket sets only order them.  The releasing ring is unused
+    // in this mode.
     bool bucketSteal_ = false;
-    uint32_t* bucketHead_ = nullptr;        // bucket -> newest node + 1
-    uint32_t* bucketNodeHandle_ = nullptr;
-    uint32_t* bucketNodeNext_ = nullptr;    // node + 1 of the next older node
-    uint64_t* bucketBits_ = nullptr;        // 1024 words: non-empty buckets
-    uint64_t* bucketSummary_ = nullptr;     // 16 words: non-empty bit words
-    uint32_t bucketNodeCap_ = 0u;
-    uint32_t bucketUsed_ = 0u;
-    uint32_t bucketFree_ = 0u;
+    bool bucketFront_ = false;   // re-arming popped victims: back to the head
+    StealBucketSet stableBuckets_;
+    StealBucketSet volBuckets_;
+    uint64_t* volKey_ = nullptr;
     uint32_t stealHeapCount_;
     bool stealHeapValid_;
     uint64_t stealHeapBuildCount_;
@@ -1284,10 +1440,30 @@ private:
     SVMS_VM_FORCEINLINE void RefreshStealWinnerPath(VoiceHandle handle);
     void RefreshStealWinnerPaths(const VoiceHandle* handles, uint32_t count);
     void RebuildStableWinnerTree();
-    void ResetBuckets();
     void BuildBuckets();
     SVMS_VM_FORCEINLINE void BucketPush(VoiceHandle handle);
     uint64_t BucketRoot();
+    void RebuildVolBuckets();
+    void VolBucketSet(VoiceHandle handle);
+    bool VolHeapRoot(uint64_t& key, VoiceHandle& handle);
+    uint64_t VolHeapRootKey() {
+        uint64_t key = 0u;
+        VoiceHandle handle = kInvalidVoice;
+        VolHeapRoot(key, handle);
+        return key;
+    }
+    bool VolHeapHas(VoiceHandle handle) const {
+        return bucketSteal_ ? volKey_[handle] != 0u
+                            : stealVolatileHeapPosition_[handle] <
+                                  stealVolatileHeapCount_;
+    }
+    bool VolHeapIsRoot(VoiceHandle handle) const {
+        return bucketSteal_
+            ? volKey_[handle] != 0u
+            : stealVolatileHeapCount_ != 0u &&
+                  stealVolatileHeapHandle_[0] == handle &&
+                  stealVolatileHeapPosition_[handle] == 0u;
+    }
     uint64_t StealTreeRoot() {
         return bucketSteal_ ? BucketRoot() : stealWinnerTree_[1];
     }

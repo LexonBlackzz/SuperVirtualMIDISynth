@@ -278,111 +278,65 @@ SVMS_VM_FORCEINLINE uint64_t VoiceManager::EncodeStableWinnerKey(
 
 SVMS_VM_FORCEINLINE void VoiceManager::BucketPush(VoiceHandle handle) {
     const uint64_t key = stealWinnerTree_[stealTreeLeafBase_ + handle];
-    if (key == 0u) return;
-    const uint32_t bucket = static_cast<uint32_t>(key >> 48u);
-    const uint32_t top = bucketHead_[bucket];
-    // A handle re-keyed into the bucket it already tops (reserve then commit
-    // in place) needs no second entry.
-    if (top != 0u && bucketNodeHandle_[top - 1u] == handle) return;
-    uint32_t node;
-    if (bucketFree_ != 0u) {
-        node = bucketFree_;
-        bucketFree_ = bucketNodeNext_[node - 1u];
-    } else if (bucketUsed_ < bucketNodeCap_) {
-        node = ++bucketUsed_;
-    } else {
-        // Pool exhausted by stale entries: rebuild from the leaves, which
-        // already include this handle.
-        BuildBuckets();
+    if (key == 0u) {
+        stableBuckets_.DropIfHead(handle);
         return;
     }
-    bucketNodeHandle_[node - 1u] = handle;
-    bucketNodeNext_[node - 1u] = top;
-    bucketHead_[bucket] = node;
-    if (top == 0u) {
-        const uint32_t word = bucket >> 6u;
-        bucketBits_[word] |= 1ull << (bucket & 63u);
-        bucketSummary_[word >> 6u] |= 1ull << (word & 63u);
-    }
-}
-
-inline void VoiceManager::ResetBuckets() {
-    if (bucketHead_ == nullptr) return;
-    std::memset(bucketHead_, 0, 65536u * sizeof(uint32_t));
-    std::memset(bucketBits_, 0, 1024u * sizeof(uint64_t));
-    std::memset(bucketSummary_, 0, 16u * sizeof(uint64_t));
-    bucketUsed_ = 0u;
-    bucketFree_ = 0u;
+    // Pool exhausted by stale entries: rebuild from the leaves, which
+    // already include this handle.
+    if (!stableBuckets_.Push(handle, key, bucketFront_)) BuildBuckets();
 }
 
 inline void VoiceManager::BuildBuckets() {
-    // Clear only the occupied buckets by walking the bitmaps.
-    for (uint32_t s = 0u; s < 16u; ++s) {
-        uint64_t summary = bucketSummary_[s];
-        while (summary != 0u) {
-            const uint32_t sb = StealHighBit64(summary);
-            summary &= ~(1ull << sb);
-            const uint32_t word = s * 64u + sb;
-            uint64_t bits = bucketBits_[word];
-            while (bits != 0u) {
-                const uint32_t b = StealHighBit64(bits);
-                bits &= ~(1ull << b);
-                bucketHead_[word * 64u + b] = 0u;
-            }
-            bucketBits_[word] = 0u;
-        }
-        bucketSummary_[s] = 0u;
-    }
-    bucketUsed_ = 0u;
-    bucketFree_ = 0u;
-    for (uint32_t handle = 0u; handle < maxVoices_; ++handle) {
+    stableBuckets_.Clear();
+    // Active-list order, so a rebuild keeps the oldest-first order among
+    // equal levels instead of reshuffling it by handle number.
+    for (uint32_t position = 0u; position < activeCount_; ++position) {
+        const uint32_t handle = activeList_[position];
         const uint64_t key = stealWinnerTree_[stealTreeLeafBase_ + handle];
-        if (key == 0u) continue;
-        const uint32_t bucket = static_cast<uint32_t>(key >> 48u);
-        const uint32_t top = bucketHead_[bucket];
-        const uint32_t node = ++bucketUsed_;
-        bucketNodeHandle_[node - 1u] = handle;
-        bucketNodeNext_[node - 1u] = top;
-        bucketHead_[bucket] = node;
-        if (top == 0u) {
-            const uint32_t word = bucket >> 6u;
-            bucketBits_[word] |= 1ull << (bucket & 63u);
-            bucketSummary_[word >> 6u] |= 1ull << (word & 63u);
-        }
+        if (key != 0u) stableBuckets_.PushUnchecked(handle, key);
     }
 }
 
-// Key of the live entry on top of the highest occupied bucket, or 0. Stale
-// entries met on the way are dropped, so the cost amortizes over the pushes.
 inline uint64_t VoiceManager::BucketRoot() {
-    for (;;) {
-        uint32_t s = 16u;
-        uint64_t summary = 0u;
-        while (s != 0u) {
-            summary = bucketSummary_[--s];
-            if (summary != 0u) break;
-        }
-        if (summary == 0u) return 0u;
-        const uint32_t word = s * 64u + StealHighBit64(summary);
-        const uint32_t bucket = word * 64u + StealHighBit64(bucketBits_[word]);
-        uint32_t node = bucketHead_[bucket];
-        while (node != 0u) {
-            const uint64_t key = stealWinnerTree_[
-                stealTreeLeafBase_ + bucketNodeHandle_[node - 1u]];
-            if (key != 0u && static_cast<uint32_t>(key >> 48u) == bucket) {
-                bucketHead_[bucket] = node;
-                return key;
-            }
-            const uint32_t next = bucketNodeNext_[node - 1u];
-            bucketNodeNext_[node - 1u] = bucketFree_;
-            bucketFree_ = node;
-            node = next;
-        }
-        bucketHead_[bucket] = 0u;
-        bucketBits_[word] &= ~(1ull << (bucket & 63u));
-        if (bucketBits_[word] == 0u)
-            bucketSummary_[word >> 6u] &= ~(1ull << (word & 63u));
+    return stableBuckets_.Root(stealWinnerTree_ + stealTreeLeafBase_, nullptr);
+}
+
+// Volatile (decaying / releasing) candidates in bucket mode: volKey_[handle]
+// is the key while the handle is in the current block's set, 0 otherwise.
+inline void VoiceManager::VolBucketSet(VoiceHandle handle) {
+    const bool had = volKey_[handle] != 0u;
+    const uint64_t key = EncodeStableWinnerKey(
+        ComputeStableStealKey(handle), activePosition_[handle]);
+    volKey_[handle] = key;
+    if (!had) ++stealVolatileHeapCount_;
+    if (!volBuckets_.Push(handle, key, bucketFront_)) RebuildVolBuckets();
+}
+
+inline void VoiceManager::RebuildVolBuckets() {
+    volBuckets_.Clear();
+    for (uint32_t i = 0u; i < stealVolatileCount_; ++i) {
+        const uint32_t handle = stealVolatileList_[i];
+        if (volKey_[handle] != 0u)
+            volBuckets_.PushUnchecked(handle, volKey_[handle]);
     }
+}
+
+// Best volatile candidate: (key, handle), false when there is none.
+inline bool VoiceManager::VolHeapRoot(uint64_t& key, VoiceHandle& handle) {
+    key = 0u;
+    handle = kInvalidVoice;
+    if (stealVolatileHeapCount_ == 0u) return false;
+    if (bucketSteal_) {
+        uint32_t found = 0u;
+        key = volBuckets_.Root(volKey_, &found);
+        if (key == 0u) return false;
+        handle = static_cast<VoiceHandle>(found);
+        return true;
+    }
+    key = stealVolatileHeapKey_[0];
+    handle = stealVolatileHeapHandle_[0];
+    return true;
 }
 
 SVMS_VM_FORCEINLINE void VoiceManager::RefreshStealWinnerPath(
@@ -472,6 +426,7 @@ inline void VoiceManager::BuildStealHeap() {
                 sizeof(*stealWinnerTree_) * stealTreeLeafBase_ * 2u);
     for (uint32_t i = 0u; i < maxVoices_; ++i)
         stealVolatilePosition_[i] = UINT32_MAX;
+    if (bucketSteal_) std::memset(volKey_, 0, sizeof(*volKey_) * maxVoices_);
     for (uint32_t position = 0; position < activeCount_; ++position) {
         const uint32_t handle = activeList_[position];
         if (IsStableStealCandidate(handle)) {
@@ -600,12 +555,12 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
         }
     }
     if (stealVolatileHeapCount_ > 0u) {
-        const uint64_t candidateKey = stealVolatileHeapKey_[0];
-        if (!haveBest || candidateKey > bestKey) {
+        uint64_t candidateKey = 0u;
+        VoiceHandle candidateHandle = kInvalidVoice;
+        VolHeapRoot(candidateKey, candidateHandle);
+        if (candidateKey != 0u && (!haveBest || candidateKey > bestKey)) {
             const uint32_t candidatePosition =
                 UINT32_MAX - static_cast<uint32_t>(candidateKey);
-            const VoiceHandle candidateHandle =
-                stealVolatileHeapHandle_[0];
             // Same linkage validation as the stable-tree root: a stale
             // volatile entry must be dropped, not returned.
             if (candidateKey != 0u && candidatePosition < activeCount_ &&
@@ -657,7 +612,7 @@ inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
     activePosition = bestPosition;
     if (bestIsVolatile) {
         const bool canReserve = reserveVolatileRoot &&
-            stealVolatileHeapPosition_[bestHandle] == 0u;
+            VolHeapIsRoot(static_cast<VoiceHandle>(bestHandle));
         if (canReserve) {
             stealCandidateReserved_[bestHandle] = 1u;
         } else {
@@ -742,11 +697,13 @@ inline bool VoiceManager::ShouldRejectNoteOn(
             bestKey = rootKey;
         }
         if (stealVolatileHeapCount_ > 0u) {
-            const uint64_t key = stealVolatileHeapKey_[0];
-            if (victim == kInvalidVoice || key > bestKey) {
+            uint64_t key = 0u;
+            VoiceHandle rootHandle = kInvalidVoice;
+            VolHeapRoot(key, rootHandle);
+            if (key != 0u && (victim == kInvalidVoice || key > bestKey)) {
                 const uint32_t position = UINT32_MAX - static_cast<uint32_t>(key);
-                if (key == 0u || position >= activeCount_) return false;
-                victim = stealVolatileHeapHandle_[0];
+                if (position >= activeCount_) return false;
+                victim = rootHandle;
             }
         }
     }
@@ -818,7 +775,16 @@ inline void VoiceManager::RearmLiveBatchVictims(const VoiceHandle* victims,
                                                 const bool* consumed,
                                                 VoiceHandle consumedByForcedSteal) {
     if (!victims || !consumed) return;
-    for (uint32_t i = 0u; i < popped; ++i) {
+    // Re-armed victims go back to the head of their buckets, in reverse pop
+    // order, so the first popped victim is first again, exactly where
+    // one-at-a-time pops left it.
+    bucketFront_ = bucketSteal_;
+    struct FrontRestore {
+        bool& flag;
+        ~FrontRestore() { flag = false; }
+    } frontRestore{bucketFront_};
+    for (uint32_t n = 0u; n < popped; ++n) {
+        const uint32_t i = bucketSteal_ ? popped - 1u - n : n;
         const VoiceHandle victim = victims[i];
         if (victim == kInvalidVoice || consumed[i] ||
             victim == consumedByForcedSteal ||
@@ -892,6 +858,12 @@ inline void VoiceManager::UpdateStealCandidate(VoiceHandle handle) {
         return;
     }
 
+    if (bucketSteal_) {
+        if (stealVolatileHeapValid_ &&
+            stealVolatileHeapFrame_ == currentFrame_ && VolHeapHas(handle))
+            VolBucketSet(handle);
+        return;
+    }
     // A volatile candidate can change gain or active-position without
     // changing class. Refresh its current-frame heap entry in place instead
     // of unlinking it from both the heap and compact candidate list.
@@ -946,6 +918,10 @@ inline void VoiceManager::LinkVolatileCandidate(VoiceHandle handle) {
     stealVolatileList_[position] = handle;
     stealVolatilePosition_[handle] = position;
     if (stealVolatileHeapValid_) {
+        if (bucketSteal_) {
+            VolBucketSet(handle);
+            return;
+        }
         const uint32_t heapPosition = stealVolatileHeapCount_++;
         stealVolatileHeapKey_[heapPosition] = EncodeStableWinnerKey(
             ComputeStableStealKey(handle), activePosition_[handle]);
@@ -1098,7 +1074,15 @@ inline void VoiceManager::BuildVolatileStealHeap() {
         }
     }
     stealVolatileHeapCount_ = stealVolatileCount_;
-    if (stealVolatileHeapCount_ > 1u) {
+    if (bucketSteal_) {
+        volBuckets_.Clear();
+        for (uint32_t position = 0u; position < stealVolatileHeapCount_;
+             ++position) {
+            const uint32_t handle = stealVolatileHeapHandle_[position];
+            volKey_[handle] = stealVolatileHeapKey_[position];
+            volBuckets_.PushUnchecked(handle, volKey_[handle]);
+        }
+    } else if (stealVolatileHeapCount_ > 1u) {
         for (uint32_t position = stealVolatileHeapCount_ / 2u;
              position-- > 0u;) VolatileHeapSiftDown(position);
     }
@@ -1115,6 +1099,14 @@ inline void VoiceManager::BuildVolatileStealHeap() {
 }
 
 inline void VoiceManager::RemoveVolatileHeapCandidate(VoiceHandle handle) {
+    if (bucketSteal_) {
+        if (handle >= maxVoices_ || volKey_[handle] == 0u) return;
+        volKey_[handle] = 0u;
+        volBuckets_.DropIfHead(handle);
+        if (stealVolatileHeapValid_ && stealVolatileHeapCount_ != 0u)
+            --stealVolatileHeapCount_;
+        return;
+    }
     if (!stealVolatileHeapValid_ || handle >= maxVoices_) return;
     const uint32_t position = stealVolatileHeapPosition_[handle];
     if (position >= stealVolatileHeapCount_) return;
@@ -1132,6 +1124,10 @@ inline void VoiceManager::RemoveVolatileHeapCandidate(VoiceHandle handle) {
 }
 
 inline void VoiceManager::RemoveReservedVolatileRoot(VoiceHandle handle) {
+    if (bucketSteal_) {
+        UnlinkVolatileCandidate(handle);
+        return;
+    }
     assert(handle < maxVoices_ && stealVolatileHeapValid_ &&
            stealVolatileHeapCount_ != 0u &&
            stealVolatileHeapHandle_[0] == handle &&
