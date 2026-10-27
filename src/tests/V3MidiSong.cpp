@@ -73,6 +73,7 @@ struct Options {
     uint32_t realtimeSecondsCap = 0u; // 0 = unlimited (piece + tail)
     uint32_t tailSeconds = 4u;
     double startSeconds = 0.0;        // trim/shift: window starts at 0
+    double windowSeconds = 0.0;       // keep only this much after the start while decoding (0 = all)
     std::string backend = "auto";
 };
 
@@ -96,6 +97,8 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.coverage = true;
         } else if (std::strcmp(arg, "--quiet") == 0) {
             options.quiet = true;
+        } else if (std::strcmp(arg, "--window-seconds") == 0 && hasValue) {
+            options.windowSeconds = std::atof(argv[++i]);
         } else if (std::strcmp(arg, "--live-config") == 0) {
             options.liveConfig = true;
         } else if (std::strcmp(arg, "--block-dispatch") == 0) {
@@ -331,13 +334,27 @@ struct DecodeContext {
     std::vector<svms::PackedMidiEvent>* events = nullptr;
     uint64_t frameOffset = 0u;                  // repetition offset
     uint64_t noteOns = 0u;
+    // Windowed decode (huge files): notes before keepStart are dropped, other
+    // events before it are clamped onto it, decoding stops at keepEnd.
+    uint64_t keepStart = 0u;
+    uint64_t keepEnd = UINT64_MAX;
+    bool stopped = false;
 };
 
 bool DecodeSink(const svms::PackedMidiEvent& event, void* user) {
     auto* context = static_cast<DecodeContext*>(user);
-    context->events->push_back(event);
-    context->events->back().outputFrame += context->frameOffset;
     const uint8_t status = static_cast<uint8_t>(event.message);
+    if (event.outputFrame >= context->keepEnd) {
+        context->stopped = true;
+        return false;
+    }
+    if (event.outputFrame < context->keepStart &&
+        ((status & 0xf0u) == 0x80u || (status & 0xf0u) == 0x90u))
+        return true;
+    context->events->push_back(event);
+    if (event.outputFrame < context->keepStart)
+        context->events->back().outputFrame = context->keepStart;
+    context->events->back().outputFrame += context->frameOffset;
     if ((status & 0xf0u) == 0x90u &&
         static_cast<uint8_t>(event.message >> 16u) != 0u) {
         ++context->noteOns;
@@ -346,7 +363,8 @@ bool DecodeSink(const svms::PackedMidiEvent& event, void* user) {
 }
 
 bool LoadSongFile(const wchar_t* path, uint32_t repetitions,
-                  DecodedSong& song, std::string& error) {
+                  DecodedSong& song, std::string& error,
+                  uint64_t keepStart = 0u, uint64_t keepEnd = UINT64_MAX) {
     svms::MappedMidiFile file;
     if (!file.Open(path, error)) return false;
     svms::MidiStreamDecoder decoder;
@@ -354,14 +372,16 @@ bool LoadSongFile(const wchar_t* path, uint32_t repetitions,
     std::atomic<bool> cancel{false};
     DecodeContext context;
     context.events = &song.events;
+    context.keepStart = keepStart;
+    context.keepEnd = keepEnd;
     if (!decoder.Decode(file, 44100u, DecodeSink, &context, &cancel,
-                        &info, error)) {
+                        &info, error) && !context.stopped) {
         file.Close();
         return false;
     }
     file.Close();
 
-    song.pieceFrames = info.totalFrames;
+    song.pieceFrames = context.stopped ? keepEnd : info.totalFrames;
     song.noteOns = context.noteOns;
     song.peakNoteOnsPerSecond = info.peakNoteOnsPerSecond;
     song.format = info.format;
@@ -390,8 +410,13 @@ void TrimSongStart(double startSeconds, DecodedSong& song);
 
 bool LoadSong(const Options& options, DecodedSong& song, std::string& error) {
     if (!options.midiPath.empty()) {
+        const uint64_t keepStart = static_cast<uint64_t>(
+            options.startSeconds * 44100.0 + 0.5);
+        const uint64_t keepEnd = options.windowSeconds > 0.0
+            ? keepStart + static_cast<uint64_t>(options.windowSeconds * 44100.0)
+            : UINT64_MAX;
         if (!LoadSongFile(options.midiPath.c_str(), options.repeat,
-                          song, error)) return false;
+                          song, error, keepStart, keepEnd)) return false;
         TrimSongStart(options.startSeconds, song);
         return true;
     }
