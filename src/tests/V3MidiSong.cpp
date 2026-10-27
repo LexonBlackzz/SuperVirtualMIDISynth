@@ -64,6 +64,7 @@ struct Options {
     bool quiet = false;
     bool coverage = false;
     bool blockDispatch = false;       // old behaviour: events start at the block boundary
+    bool liveConfig = false;          // apply the user's engine configuration (velocity curve, retire floor, ...)
     uint32_t tuningEdo = 12u;
     uint32_t frames = 2048u;
     uint32_t renderThreads = 0u;      // 0 = automatic
@@ -95,6 +96,8 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.coverage = true;
         } else if (std::strcmp(arg, "--quiet") == 0) {
             options.quiet = true;
+        } else if (std::strcmp(arg, "--live-config") == 0) {
+            options.liveConfig = true;
         } else if (std::strcmp(arg, "--block-dispatch") == 0) {
             options.blockDispatch = true;
         } else if (std::strcmp(arg, "--midi") == 0 && hasValue) {
@@ -564,6 +567,19 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     config.maxBlockFrames = options.frames;
     config.masterVolume = 1.0f;
     config.backend = ParseBackend(options.backend);
+
+    // The same snapshot the live driver applies: velocity curve, retire floor,
+    // pan law, interpolation, master volume, zero-life dropping.
+    svms::EngineConfig liveTuning{};
+    if (options.liveConfig) {
+        liveTuning = svms::EngineConfig::Load();
+        config.tuning = &liveTuning;
+        config.masterVolume = liveTuning.masterVolume;
+        config.gpuApi = liveTuning.gpuApi;
+        config.gpuDeviceIndex = liveTuning.gpuDeviceIndex;
+        svms::g_dropZeroLifeVictims.store(liveTuning.dropZeroLifeVictims,
+                                          std::memory_order_relaxed);
+    }
 
     svms::StandaloneSynth synth;
     std::string error;
