@@ -339,14 +339,20 @@ public:
 // than the pool has voices.
 class EpochPolicy final : public Policy {
 public:
-    explicit EpochPolicy(bool ephemeral) : ephemeral_(ephemeral) {}
-    const char* Name() const override { return ephemeral_ ? "epoch-eph" : "epoch"; }
+    EpochPolicy(bool ephemeral, bool byRank, bool chain = false)
+        : ephemeral_(ephemeral), byRank_(byRank), chain_(chain) {}
+    const char* Name() const override {
+        if (chain_) return "rank-chain";
+        if (byRank_) return ephemeral_ ? "rank-eph" : "rank";
+        return ephemeral_ ? "epoch-eph" : "epoch";
+    }
 
     void Block(uint64_t start, std::vector<Ev>& evs) override {
         const double tb = start / kSampleRate;
         const double te = (start + g.block) / kSampleRate;
         Retire(tb);
         if (ephemeral_) MarkEphemeral(evs);
+        else for (Ev& e : evs) e.ephemeral = false;
         uint32_t wanted = 0;
         for (const Ev& e : evs) wanted += (!e.off && !e.ephemeral);
         uint32_t freeSlots = g.cap > active ? g.cap - active : 0;
@@ -355,7 +361,27 @@ public:
         size_t next = 0;
         born_.clear();
         newborn_.clear();
-        for (const Ev& e : evs) {
+        chainPrev_ = ~0u;
+        // Rank pairing: the loudest note takes the emptiest slot or quietest
+        // victim, whatever its position in the block, so survival does not
+        // depend on where in the block a note lands.
+        const uint32_t freeCount = freeSlots;
+        if (byRank_) {
+            order_.clear();
+            for (size_t i = 0; i < evs.size(); ++i)
+                if (!evs[i].off && !evs[i].ephemeral) order_.push_back(uint32_t(i));
+            std::stable_sort(order_.begin(), order_.end(), [&](uint32_t a, uint32_t b) {
+                const uint8_t va = g_notes[evs[a].note].velocity, vb = g_notes[evs[b].note].velocity;
+                if (va != vb) return va > vb;
+                return Mix(evs[a].note) < Mix(evs[b].note);  // equal levels: no positional preference
+            });
+            slot_.assign(evs.size(), -1);
+            for (size_t r = 0; r < order_.size(); ++r)
+                if (r < size_t(freeCount) + victims_.size()) slot_[order_[r]] = int32_t(r);
+            used_.assign(victims_.size(), 0);
+        }
+        for (size_t evIndex = 0; evIndex < evs.size(); ++evIndex) {
+            const Ev& e = evs[evIndex];
             const double t = e.frame / kSampleRate;
             if (e.off) {
                 NoteOff(t, e);
@@ -367,6 +393,25 @@ public:
                 continue;
             }
             const double ln = LevelOfVelocity(g_notes[e.note].velocity);
+            if (byRank_) {
+                const int32_t c = slot_[evIndex];
+                if (c < 0) {
+                    LoseSlot(e);
+                } else if (uint32_t(c) < freeCount) {
+                    Born(Spawn(e.note, e, false));
+                } else {
+                    const size_t vi = size_t(c) - freeCount;
+                    const double lv = LevelAt(recs[victims_[vi]], t);
+                    if (lv >= g.floorLevel && g.reject && lv >= ln) {
+                        LoseSlot(e);
+                    } else {
+                        used_[vi] = 1;
+                        Cut(victims_[vi], t);
+                        Born(Spawn(e.note, e, false));
+                    }
+                }
+                continue;
+            }
             if (freeSlots > 0) {
                 --freeSlots;
                 Born(Spawn(e.note, e, false));
@@ -407,7 +452,8 @@ public:
             Cut(id, t);
             Born(Spawn(e.note, e, false));
         }
-        for (size_t i = next; i < victims_.size(); ++i) Reinsert(victims_[i]);
+        for (size_t i = byRank_ ? 0 : next; i < victims_.size(); ++i)
+            if (!byRank_ || !used_[i]) Reinsert(victims_[i]);
         for (uint32_t id : born_) Reinsert(id);
         if (ephemeral_) {
             Retire(te);
@@ -418,6 +464,31 @@ public:
     }
 
 private:
+    // A note that wins no slot is dropped, or in the ephemeral variants plays to
+    // the end of its block and is cut there if it is still the quietest.
+    static uint32_t Mix(uint32_t x) {
+        x ^= x >> 16;
+        x *= 0x7feb352dU;
+        x ^= x >> 15;
+        x *= 0x846ca68bU;
+        return x ^ (x >> 16);
+    }
+    void LoseSlot(const Ev& e) {
+        if (!ephemeral_) {
+            Drop(e);
+            return;
+        }
+        ++ephCount;
+        const uint32_t id = Spawn(e.note, e, false);
+        born_.push_back(id);
+        if (chain_) {
+            // Each slotless note ends where the next one starts, as stealing the
+            // previous newborn would; the last one joins the pool at block end.
+            if (chainPrev_ != ~0u && recs[chainPrev_].state == kHeld && recs[chainPrev_].note != e.note)
+                Cut(chainPrev_, e.frame / kSampleRate);
+            chainPrev_ = id;
+        }
+    }
     using Newborn = std::pair<uint32_t, uint32_t>;  // gen, id (keyed by gen only for staleness)
     void Born(uint32_t id) {
         born_.push_back(id);
@@ -489,7 +560,11 @@ private:
         }
     }
 
-    bool ephemeral_;
+    bool ephemeral_, byRank_, chain_;
+    uint32_t chainPrev_ = ~0u;
+    std::vector<uint32_t> order_;
+    std::vector<int32_t> slot_;
+    std::vector<char> used_;
     std::vector<uint32_t> victims_, born_;
     std::vector<Newborn> newborn_;
     struct Cand {
@@ -540,8 +615,11 @@ bool OnEvent(const svms::PackedMidiEvent& pe, void*) {
 
 std::unique_ptr<Policy> Make(const std::string& name) {
     if (name == "exact") return std::make_unique<ExactPolicy>();
-    if (name == "epoch") return std::make_unique<EpochPolicy>(false);
-    if (name == "epoch-eph") return std::make_unique<EpochPolicy>(true);
+    if (name == "epoch") return std::make_unique<EpochPolicy>(false, false);
+    if (name == "epoch-eph") return std::make_unique<EpochPolicy>(true, false);
+    if (name == "rank") return std::make_unique<EpochPolicy>(false, true);
+    if (name == "rank-eph") return std::make_unique<EpochPolicy>(true, true);
+    if (name == "rank-chain") return std::make_unique<EpochPolicy>(true, true, true);
     return nullptr;
 }
 
