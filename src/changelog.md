@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-10-27 `feat(v3): Vulkan backend for the GPU render stage` - `synth.gpu_api = 3` now works on any Vulkan 1.1 compute device. The GLSL of the GL backend is compiled to SPIR-V at build time (glslc; the GL uniforms become one push-constant block; voice and envelope also have a 32-wide subgroup variant), and `GpuBackendVulkan.cpp` opens vulkan-1 at run time like the CUDA backend opens nvcuda. Every upload and every part of a block is its own queue submission, with two alternating staging slots so a late block never shares buffers with the next. CMake embeds the kernels only when the SDK is found (`SVMS_VULKAN`, `VULKAN_SDK`), otherwise Init reports it. Rows with a start or release frame inside the block stay on the CPU, like the GL backend (no timeline kernel yet). Differential suite: same errors as OpenGL (audio max 2e-6, zero phase/filter/state mismatches). Sustained 65536 voices, 2048 frames, AVX2, 6 threads, RTX 3060: CPU 0.453 cycles/voice-sample (p50 41%), OpenGL 0.079 (7.2%), CUDA 0.070 (6.1%), Vulkan 0.066 (5.6%). Auto still tries CUDA, then OpenGL; `--gpu-api vulkan` in the bench.
 - 2026-10-25 fix(v3): the OpenGL GPU stage keeps the host's current GL context. Creating
   mine used to unbind the calling thread's context, which crashed Ziggy's ImGui
   right after its shader compile failed; I now save it and put it back.

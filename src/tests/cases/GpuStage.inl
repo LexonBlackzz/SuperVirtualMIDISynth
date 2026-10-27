@@ -708,6 +708,7 @@ void RunGpuStageDifferentialSuite(svms::gpu::Api api) {
 void TestGpuStageDifferential() {
     RunGpuStageDifferentialSuite(svms::gpu::Api::OpenGL);
     RunGpuStageDifferentialSuite(svms::gpu::Api::CUDA);
+    RunGpuStageDifferentialSuite(svms::gpu::Api::Vulkan);
 }
 
 #else

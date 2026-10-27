@@ -248,6 +248,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             else if (std::strcmp(api, "auto") == 0) options.gpuApi = svms::gpu::Api::Auto;
             else if (std::strcmp(api, "opengl") == 0) options.gpuApi = svms::gpu::Api::OpenGL;
             else if (std::strcmp(api, "cuda") == 0) options.gpuApi = svms::gpu::Api::CUDA;
+            else if (std::strcmp(api, "vulkan") == 0) options.gpuApi = svms::gpu::Api::Vulkan;
             else return false;
         } else if (std::strcmp(argv[i], "--store-mb") == 0) {
             uint32_t mb = 0u;

@@ -10,6 +10,7 @@ namespace svms {
 namespace gpu {
 std::unique_ptr<Backend> CreateOpenGLBackend();
 std::unique_ptr<Backend> CreateCudaBackend();
+std::unique_ptr<Backend> CreateVulkanBackend();
 
 std::unique_ptr<Backend> CreateBackend(Api api) {
     switch (api) {
@@ -17,6 +18,8 @@ std::unique_ptr<Backend> CreateBackend(Api api) {
             return CreateOpenGLBackend();
         case Api::CUDA:
             return CreateCudaBackend();
+        case Api::Vulkan:
+            return CreateVulkanBackend();
         default:
             return nullptr;
     }

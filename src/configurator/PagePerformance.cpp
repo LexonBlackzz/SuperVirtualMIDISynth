@@ -533,7 +533,7 @@ void CpuCard(ConfigDocument& doc) {
         static const char* labels[6] = {"Off", "Auto", "OpenGL", "Vulkan", "D3D11", "CUDA"};
         int idx = static_cast<int>((std::min)(5u, w.gpuApi));
         ui::BeginRow("gpuStage", "GPU rendering (experimental)",
-                     "Renders steady sustained voices on the graphics card so a CPU can reach far higher voice counts. Falls back to the CPU on any problem. CUDA needs an NVIDIA card; OpenGL needs 4.3 (Vulkan and D3D11 are not built yet); Auto tries CUDA, then OpenGL. Needs a restart.",
+                     "Renders steady sustained voices on the graphics card so a CPU can reach far higher voice counts. Falls back to the CPU on any problem. CUDA needs an NVIDIA card; OpenGL needs 4.3; Vulkan needs any Vulkan 1.1 card (D3D11 is not built yet); Auto tries CUDA, then OpenGL. Needs a restart.",
                      ui::SegmentedSize(labels, 6));
         if (ui::Segmented("##gpustage", &idx, labels, 6)) {
             w.gpuApi = static_cast<uint32_t>(idx);

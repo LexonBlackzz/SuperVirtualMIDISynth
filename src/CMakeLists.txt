@@ -8,6 +8,7 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 
 option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
 option(SVMS_CUDA "Embed the CUDA kernels of the GPU render stage (needs nvcc; point CUDA_PATH at the toolkit)" ON)
+option(SVMS_VULKAN "Embed the SPIR-V kernels of the GPU render stage (needs the Vulkan SDK: headers and glslc)" ON)
 
 # CUDA backend of the GPU render stage.  The host half (GpuBackendCUDA.cpp)
 # declares the driver API itself and opens nvcuda at run time, so it builds
@@ -16,7 +17,7 @@ option(SVMS_CUDA "Embed the CUDA kernels of the GPU render stage (needs nvcc; po
 # scalar path's math step by step (no fused multiply-add).  Architectures: SASS
 # for Turing through Blackwell plus PTX for newer GPUs on a new enough driver.
 if(NOT SVMS_XP_COMPAT)
-    add_library(svms_gpu_cuda OBJECT render/GpuBackendCUDA.cpp)
+    add_library(svms_gpu_cuda OBJECT render/GpuBackendCUDA.cpp render/GpuBackendVulkan.cpp)
     set_target_properties(svms_gpu_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 if(SVMS_CUDA AND NOT SVMS_XP_COMPAT AND CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -56,6 +57,36 @@ if(SVMS_NVCC AND SVMS_BIN2C AND TARGET svms_gpu_cuda)
     message(STATUS "SVMS: CUDA kernels enabled (${SVMS_NVCC})")
 else()
     message(STATUS "SVMS: CUDA kernels not embedded (no nvcc/bin2c; set CUDA_PATH)")
+endif()
+
+# Vulkan backend of the GPU render stage (lives in the same object library).
+# Like CUDA it opens its driver (vulkan-1) at run time; the SDK is needed only
+# at build time, for the headers and for glslc, which compiles the GLSL of
+# render/gpu/VoiceStageGLSL.h to SPIR-V.  Without them the backend reports it.
+if(SVMS_VULKAN AND TARGET svms_gpu_cuda AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    find_path(SVMS_VULKAN_INCLUDE vulkan/vulkan.h HINTS ENV VULKAN_SDK PATH_SUFFIXES Include include)
+    find_program(SVMS_GLSLC glslc HINTS ENV VULKAN_SDK PATH_SUFFIXES Bin bin)
+endif()
+if(SVMS_VULKAN_INCLUDE AND SVMS_GLSLC)
+    set(SVMS_VULKAN_GEN "${CMAKE_CURRENT_BINARY_DIR}/gpu_vulkan")
+    set(SVMS_VULKAN_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/VoiceStageGLSL.h")
+    add_custom_command(
+        OUTPUT "${SVMS_VULKAN_GEN}/VoiceStageVulkan_spv.h"
+        COMMAND "${CMAKE_COMMAND}" "-DGLSLC=${SVMS_GLSLC}" "-DSRC=${SVMS_VULKAN_SOURCE}"
+                "-DWORK=${SVMS_VULKAN_GEN}" "-DOUT=${SVMS_VULKAN_GEN}/VoiceStageVulkan_spv.h"
+                -DGROUP=128 -DTILE=4
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/BuildVulkanShaders.cmake"
+        DEPENDS "${SVMS_VULKAN_SOURCE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/BuildVulkanShaders.cmake"
+        COMMENT "Compiling the Vulkan kernels of the GPU render stage"
+        VERBATIM)
+    set_source_files_properties(render/GpuBackendVulkan.cpp PROPERTIES
+        OBJECT_DEPENDS "${SVMS_VULKAN_GEN}/VoiceStageVulkan_spv.h"
+        COMPILE_DEFINITIONS SVMS_HAVE_VULKAN=1
+        INCLUDE_DIRECTORIES "${SVMS_VULKAN_GEN};${SVMS_VULKAN_INCLUDE}")
+    message(STATUS "SVMS: Vulkan kernels enabled (${SVMS_GLSLC})")
+else()
+    message(STATUS "SVMS: Vulkan kernels not embedded (no Vulkan SDK; set VULKAN_SDK)")
 endif()
 
 if(WIN32)
