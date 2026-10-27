@@ -128,7 +128,7 @@ public:
     std::vector<uint8_t> fate;  // 0 played to its natural end, 1 cut, 2 dropped
     std::vector<uint32_t> series;
     double totalLoss = 0, loudLoss = 0, grossAud = 0;
-    uint64_t cycles = 0, noteOnCount = 0, cutCount = 0, dropCount = 0, ephCount = 0;
+    uint64_t tailCutCount = 0, cycles = 0, noteOnCount = 0, cutCount = 0, dropCount = 0, ephCount = 0;
     uint32_t active = 0, maxActive = 0;
 
 protected:
@@ -239,6 +239,7 @@ protected:
             cutHeldAt[r.note] = float(t);
             ++r.gen;
         } else {
+            ++tailCutCount;
             const double l = LevelAt(r, t);
             Account(r.note, g.tauRelease * (l - g.floorLevel));
             FreeRec(id);
@@ -685,10 +686,10 @@ bool WriteWindow(const Policy& p, const svms::MappedMidiFile& file, const std::s
     else dec.Decode(file, uint32_t(kSampleRate), OnWindowEvent, &w, nullptr, nullptr, error);
     for (int ch = 0; ch < 16; ++ch) w.out.push_back({w.end + 44100u * 3, uint32_t(0xB0 | ch) | (123u << 8)});
     std::stable_sort(w.out.begin(), w.out.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    std::vector<uint8_t> trk = {0, 0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40};  // 1 s per quarter, 960 ticks per quarter
+    std::vector<uint8_t> trk = {0, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20};  // 0.5 s per quarter, 22050 ticks per quarter: one tick per frame at 44100
     uint64_t prev = 0;
     for (const auto& e : w.out) {
-        const uint64_t tick = uint64_t(double(e.first - w.begin) * 960.0 / kSampleRate);
+        const uint64_t tick = e.first - w.begin;
         WriteVlq(trk, uint32_t(tick - prev));
         prev = tick;
         const uint8_t st = uint8_t(e.second & 0xFF);
@@ -697,7 +698,7 @@ bool WriteWindow(const Policy& p, const svms::MappedMidiFile& file, const std::s
         if ((st & 0xF0) != 0xC0 && (st & 0xF0) != 0xD0) trk.push_back(uint8_t((e.second >> 16) & 0x7F));
     }
     trk.insert(trk.end(), {0, 0xFF, 0x2F, 0});
-    std::vector<uint8_t> f = {'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x03, 0xC0, 'M', 'T', 'r', 'k'};
+    std::vector<uint8_t> f = {'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x56, 0x22, 'M', 'T', 'r', 'k'};
     for (int s = 24; s >= 0; s -= 8) f.push_back(uint8_t(trk.size() >> s));
     f.insert(f.end(), trk.begin(), trk.end());
     FILE* fp = std::fopen(path.c_str(), "wb");
@@ -814,6 +815,8 @@ int wmain(int argc, wchar_t** argv) {
                     100 * p.loudLoss / gross, (unsigned long long)p.cutCount, (unsigned long long)p.dropCount,
                     100 * worse / gross, 100 * better / gross, p.series.empty() ? 0.0 : dsum / double(p.series.size()),
                     dmax);
+        std::printf("  cuts of released tails (not expressible in a rendered MIDI): %llu of %llu\n",
+                    (unsigned long long)p.tailCutCount, (unsigned long long)p.cutCount);
         if (&p == &ref) continue;
         struct Row {
             double delta;
