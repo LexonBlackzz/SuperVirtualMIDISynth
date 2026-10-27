@@ -94,8 +94,20 @@ inline float VoiceManager::ComputeStealScore(uint32_t idx) const {
     // voice-state changes while preserving the same ordering and scale.
     const float ageUnits = static_cast<float>(GetVoiceAge(
         static_cast<VoiceHandle>(idx))) * stealAgeScale_;
-    return ageUnits - ComputeEffectiveStealLevel(
-        static_cast<VoiceHandle>(idx)) * kBassMidiStealGainScale;
+    float level = ComputeEffectiveStealLevel(static_cast<VoiceHandle>(idx));
+    if (priorityPolicy_) level *= StealLaneFactor(static_cast<VoiceHandle>(idx));
+    return ageUnits - level * kBassMidiStealGainScale;
+}
+
+inline float VoiceManager::StealLaneFactor(VoiceHandle handle) const {
+    // Released tails are the cheapest victims; everything else is weighted by
+    // its velocity lane, with low keys and voices still in delay/hold/attack
+    // protected further.
+    if (v.state[handle] == static_cast<uint8_t>(VoiceState::Releasing))
+        return 0.5f;
+    const uint8_t stage = v.envelopeStage[handle];
+    const bool inAttack = stage == 4u || stage == 0u || stage == 1u;
+    return StealLaneFactorFor(v.velocity[handle], v.note[handle], inAttack);
 }
 
 // Pull the per-handle SoA lines a launch writes and the render kernels read

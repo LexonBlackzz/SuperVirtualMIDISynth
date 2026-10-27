@@ -285,6 +285,7 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     stealHeapBuildCount_ = other.stealHeapBuildCount_;
     stealIndexRepairCount_ = other.stealIndexRepairCount_;
     bucketSteal_ = other.bucketSteal_;
+    priorityPolicy_ = other.priorityPolicy_;
     stableBuckets_.used = other.stableBuckets_.used;
     stableBuckets_.freeHead = other.stableBuckets_.freeHead;
     volBuckets_.used = other.volBuckets_.used;
@@ -345,6 +346,7 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
         launchStagingMode_ = LaunchStagingRequested() ? 1 : 0;
     v.launchStaging = launchStagingMode_ != 0;
     bucketSteal_ = StealIndexBucketsRequested();
+    priorityPolicy_ = StealPriorityRequested();
     if (requested == 0u || !v.Reserve(requested) ||
         !ReserveMetadata(requested)) {
         maxVoices_ = 0u;

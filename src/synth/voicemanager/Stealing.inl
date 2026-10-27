@@ -671,7 +671,8 @@ inline uint32_t VoiceManager::PopStealCandidates(uint32_t count,
 // ordered by unique keys, so every subsequent selection is identical.
 inline bool VoiceManager::ShouldRejectNoteOn(
     const VoiceConfiguration* setups, uint32_t count,
-    const ChannelParamsSnapshot& cp, uint32_t multiplicity) {
+    const ChannelParamsSnapshot& cp, uint32_t multiplicity,
+    const PriorityIncoming* incoming) {
     // A layered note is admitted or skipped as a whole, judged by its loudest
     // layer (BASSMIDI judges each region voice alone; layers of one note share
     // a level closely enough that the whole-note call is the same in practice).
@@ -721,6 +722,29 @@ inline bool VoiceManager::ShouldRejectNoteOn(
         const float mixR = setups[layer].gainRight * scale * cp.mixScaleRight;
         level = (std::max)(level, std::fabs(setups[layer].initialGain) *
                                       std::sqrt(mixL * mixL + mixR * mixR));
+    }
+    if (incoming != nullptr) {
+        // Velocity-lane admission: the best victim decides.  A tail goes unless
+        // it is much louder than the note; anything else needs a strictly
+        // higher lane, and bass and voices still in their attack are kept.
+        if (v.state[victim] == static_cast<uint8_t>(VoiceState::Free))
+            return false;
+        if (pendingLaunch_.valid) {
+            const PendingLaunch& p = pendingLaunch_;
+            for (uint32_t i = 0u; i < p.count; ++i)
+                if (p.handles[i] == victim) return true;
+        }
+        if (v.state[victim] == static_cast<uint8_t>(VoiceState::Releasing))
+            return ComputeEffectiveStealLevel(victim) > level * 2.0f;
+        if (v.channel[victim] == incoming->channel &&
+            v.note[victim] == incoming->note)
+            return false;
+        const uint8_t stage = v.envelopeStage[victim];
+        if (stage == 4u || stage == 0u || stage == 1u) return true;
+        if (v.note[victim] < 48u && incoming->note > v.note[victim])
+            return true;
+        return StealLaneOfVelocity(v.velocity[victim]) >=
+               StealLaneOfVelocity(incoming->velocity);
     }
     const float newbornScore = 0.0f - level * kBassMidiStealGainScale;
     if (bucketSteal_ && floorKey != 0u && stealAgeScale_ == 0.0f &&
@@ -1010,7 +1034,7 @@ inline void VoiceManager::BuildVolatileStealHeap() {
     stealVolatileHeapCount_ = 0u;
     bool vectorized = false;
 #if !defined(SVMS_XP_COMPAT)
-    if (stealKeyBackend_ == RenderBackend::AVX2 &&
+    if (stealKeyBackend_ == RenderBackend::AVX2 && !priorityPolicy_ &&
         stealVolatileCount_ >= 8u) {
         constexpr uint32_t kParallelMinCandidates = 32768u;
         constexpr uint32_t kParallelChunk = 16384u;
@@ -1077,8 +1101,9 @@ inline void VoiceManager::BuildVolatileStealHeap() {
                 ? UINT32_MAX : static_cast<uint32_t>(rawAge);
             const float ageUnits =
                 static_cast<float>(age) * stealAgeScale_;
-            const float effectiveLevel = std::fabs(v.currentGain[handle]) *
+            float effectiveLevel = std::fabs(v.currentGain[handle]) *
                 v.stealOutputGain[handle];
+            if (priorityPolicy_) effectiveLevel *= StealLaneFactor(handle);
             const float score = ageUnits -
                 effectiveLevel * kBassMidiStealGainScale;
             stealVolatileHeapKey_[position] = EncodeStableWinnerKey(

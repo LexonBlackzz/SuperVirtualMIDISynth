@@ -677,8 +677,9 @@ inline bool VoiceManager::IsStableConfiguration(
 inline float VoiceManager::ComputeNewbornStableStealKey(
     VoiceHandle handle) const {
     const float outputGain = v.stealOutputGain[handle];
-    const float effectiveLevel =
+    float effectiveLevel =
         std::fabs(v.targetGain[handle]) * outputGain;
+    if (priorityPolicy_) effectiveLevel *= StealLaneFactor(handle);
     const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
     const float commonAgeScore =
         static_cast<float>(currentFrame_) * stealAgeScale_;
@@ -1211,8 +1212,10 @@ inline bool VoiceManager::TryLazyGroupLaunch(
         const float mixGainR = gainRight * cp.mixScaleRight;
         const float outputGain = std::sqrt(
             mixGainL * mixGainL + mixGainR * mixGainR);
-        const float effectiveLevel = std::fabs(setups[i].initialGain) *
+        float effectiveLevel = std::fabs(setups[i].initialGain) *
             outputGain;
+        if (priorityPolicy_)
+            effectiveLevel *= StealLaneFactorFor(velocity, note, true);
         const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
         p.scores[i] = score;
         const uint64_t key = EncodeStableWinnerKey(
@@ -1362,8 +1365,10 @@ inline bool VoiceManager::LaunchVoiceGroup(
         count > voiceLimit_)
         return false;
     if (count > launchLayersHighWater_) launchLayersHighWater_ = count;
-    if (stealReject_.load(std::memory_order_relaxed) &&
-        ShouldRejectNoteOn(setups, count, channelParams, multiplicity)) {
+    const PriorityIncoming incoming{channel, note, velocity};
+    if ((priorityPolicy_ || stealReject_.load(std::memory_order_relaxed)) &&
+        ShouldRejectNoteOn(setups, count, channelParams, multiplicity,
+                           priorityPolicy_ ? &incoming : nullptr)) {
         // Pairing note-offs sees no voice for this generation, exactly as if
         // the note had been launched and stolen before it rendered.
         lastLaunchRejected_ = true;

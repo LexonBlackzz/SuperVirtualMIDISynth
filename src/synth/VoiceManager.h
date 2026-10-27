@@ -56,6 +56,19 @@ inline bool StealIndexBucketsRequested() noexcept {
     static const bool env = std::getenv("SVMS_STEAL_INDEX") != nullptr;
     return env || g_stealIndexBuckets.load(std::memory_order_relaxed);
 }
+// Velocity-lane stealing (env SVMS_STEAL_PRIORITY).  A sustained voice is only
+// replaced by a note from a strictly higher velocity lane, released tails go
+// first, low sustained keys and voices still in their attack are protected, and
+// a note that finds only protected victims is dropped instead of cutting one.
+inline bool StealPriorityRequested() noexcept {
+    static const bool env = std::getenv("SVMS_STEAL_PRIORITY") != nullptr;
+    return env;
+}
+// Velocity lane 0..5 (thresholds follow velocity^1.7 against 0.22/0.35/0.50/0.62/0.78).
+SVMS_VM_FORCEINLINE uint32_t StealLaneOfVelocity(uint32_t velocity) noexcept {
+    return velocity <= 52u ? 0u : velocity <= 68u ? 1u : velocity <= 84u ? 2u
+         : velocity <= 95u ? 3u : velocity <= 109u ? 4u : 5u;
+}
 // Index of the highest set bit; x must be non-zero.
 SVMS_VM_FORCEINLINE uint32_t StealHighBit64(uint64_t x) noexcept {
 #if defined(_MSC_VER) && defined(_WIN64)
@@ -1252,6 +1265,7 @@ private:
     // block); the bucket sets only order them.  The releasing ring is unused
     // in this mode.
     bool bucketSteal_ = false;
+    bool priorityPolicy_ = false;
     bool bucketFront_ = false;   // re-arming popped victims: back to the head
     StealBucketSet stableBuckets_;
     StealBucketSet volBuckets_;
@@ -1280,9 +1294,22 @@ private:
     float stealAgeScale_ = 1.0f / 256.0f;   // score units per sample of age; 0 = ageless
     bool lastLaunchRejected_ = false;
     uint64_t stealRejectCount_ = 0u;
+    struct PriorityIncoming {
+        uint8_t channel, note, velocity;
+    };
     bool ShouldRejectNoteOn(const VoiceConfiguration* setups, uint32_t count,
                             const ChannelParamsSnapshot& cp,
-                            uint32_t multiplicity);
+                            uint32_t multiplicity,
+                            const PriorityIncoming* incoming = nullptr);
+    // Multiplies a voice's steal level while the priority policy ranks it.
+    float StealLaneFactor(VoiceHandle handle) const;
+    static float StealLaneFactorFor(uint8_t velocity, uint8_t note,
+                                    bool inAttack) {
+        float factor = static_cast<float>(1u << (3u * StealLaneOfVelocity(velocity)));
+        if (note < 48u) factor *= 8.0f;
+        if (inAttack) factor *= 16.0f;
+        return factor;
+    }
     uint8_t* stealCandidateDeferred_;
     // A deferred same-frame replacement may keep ownership of the volatile
     // heap root while its sample/envelope fields are configured.  The slot
