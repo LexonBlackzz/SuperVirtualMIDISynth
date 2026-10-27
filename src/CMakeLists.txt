@@ -1687,5 +1687,11 @@ if(SVMS_BUILD_TESTS)
             NOMINMAX WIN32_LEAN_AND_MEAN)
         target_include_directories(svms_v3_event_bench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
+
+        add_executable(svms_policy_lab tests/PolicyLab.cpp events/MidiStream.cpp)
+        target_compile_definitions(svms_policy_lab PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+        target_include_directories(svms_policy_lab PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
     endif()
 endif()
