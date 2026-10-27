@@ -99,6 +99,14 @@ inline size_t VoiceManager::EstimateAllocatedBytes(
     add(sizeof(uint32_t), capacity);
     add(sizeof(uint8_t), capacity);
     add(sizeof(uint8_t), capacity);
+    {
+        const size_t bucketNodes = static_cast<size_t>(capacity) * 2u + 4096u;
+        add(sizeof(uint32_t), 65536u);
+        add(sizeof(uint32_t), bucketNodes);
+        add(sizeof(uint32_t), bucketNodes);
+        add(sizeof(uint64_t), 1024u);
+        add(sizeof(uint64_t), 16u);
+    }
     add(sizeof(int32_t), capacity);
     add(sizeof(int32_t), capacity);
     add(sizeof(uint8_t), capacity);
@@ -150,6 +158,12 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
     add(sizeof(uint32_t), capacity); // volatile heap position
     add(sizeof(uint8_t), capacity);  // deferred
     add(sizeof(uint8_t), capacity);  // reserved
+    const uint32_t bucketNodes = capacity * 2u + 4096u;
+    add(sizeof(uint32_t), 65536u);       // bucket heads
+    add(sizeof(uint32_t), bucketNodes);  // bucket node handles
+    add(sizeof(uint32_t), bucketNodes);  // bucket node links
+    add(sizeof(uint64_t), 1024u);        // non-empty bucket bits
+    add(sizeof(uint64_t), 16u);          // non-empty word bits
     add(sizeof(VoiceLinkRow), capacity);
     if (bytes == (std::numeric_limits<size_t>::max)()) return false;
 
@@ -199,6 +213,14 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
         take(sizeof(uint8_t), capacity));
     stealCandidateReserved_ = static_cast<uint8_t*>(
         take(sizeof(uint8_t), capacity));
+    bucketHead_ = static_cast<uint32_t*>(take(sizeof(uint32_t), 65536u));
+    bucketNodeHandle_ = static_cast<uint32_t*>(
+        take(sizeof(uint32_t), bucketNodes));
+    bucketNodeNext_ = static_cast<uint32_t*>(
+        take(sizeof(uint32_t), bucketNodes));
+    bucketBits_ = static_cast<uint64_t*>(take(sizeof(uint64_t), 1024u));
+    bucketSummary_ = static_cast<uint64_t*>(take(sizeof(uint64_t), 16u));
+    bucketNodeCap_ = bucketNodes;
     BindLinkRows(static_cast<VoiceLinkRow*>(
         take(sizeof(VoiceLinkRow), capacity)));
     return offset <= metadataBytes_;
@@ -239,6 +261,9 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     stealHeapValid_ = other.stealHeapValid_;
     stealHeapBuildCount_ = other.stealHeapBuildCount_;
     stealIndexRepairCount_ = other.stealIndexRepairCount_;
+    bucketSteal_ = other.bucketSteal_;
+    bucketUsed_ = other.bucketUsed_;
+    bucketFree_ = other.bucketFree_;
     stealVolatileCount_ = other.stealVolatileCount_;
     stealVolatileHeapCount_ = other.stealVolatileHeapCount_;
     stealVolatileHeapFrame_ = other.stealVolatileHeapFrame_;
@@ -294,6 +319,7 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
     if (launchStagingMode_ < 0)
         launchStagingMode_ = LaunchStagingRequested() ? 1 : 0;
     v.launchStaging = launchStagingMode_ != 0;
+    bucketSteal_ = StealIndexBucketsRequested();
     if (requested == 0u || !v.Reserve(requested) ||
         !ReserveMetadata(requested)) {
         maxVoices_ = 0u;
@@ -344,6 +370,7 @@ inline void VoiceManager::Reset() {
                 sizeof(*stealCandidateDeferred_) * maxVoices_);
     std::memset(stealCandidateReserved_, 0,
                 sizeof(*stealCandidateReserved_) * maxVoices_);
+    ResetBuckets();
     for (uint32_t i = 0u; i < maxVoices_; ++i) {
         playGroupNext_[i] = -1;
         playGroupPrev_[i] = -1;
@@ -633,6 +660,14 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     stealVolatileHeapPosition_ = grown.stealVolatileHeapPosition_;
     stealCandidateDeferred_ = grown.stealCandidateDeferred_;
     stealCandidateReserved_ = grown.stealCandidateReserved_;
+    bucketHead_ = grown.bucketHead_;
+    bucketNodeHandle_ = grown.bucketNodeHandle_;
+    bucketNodeNext_ = grown.bucketNodeNext_;
+    bucketBits_ = grown.bucketBits_;
+    bucketSummary_ = grown.bucketSummary_;
+    bucketNodeCap_ = grown.bucketNodeCap_;
+    bucketUsed_ = grown.bucketUsed_;
+    bucketFree_ = grown.bucketFree_;
     BindLinkRows(grown.linkRows_);
     metadataStorage_ = grown.metadataStorage_;
     metadataBytes_ = grown.metadataBytes_;

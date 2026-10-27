@@ -1329,3 +1329,101 @@ void TestOverlappingRetriggerGenerations() {
                   static_cast<uint8_t>(svms::VoiceState::Active),
           "batched stale note-off stops at an empty key without touching others");
 }
+
+// Bucketed steal index: quiet voices go first, capacity holds through a
+// launch / release / retire storm, and nothing is lost when the node pool is
+// recycled many times over.
+void TestBucketStealIndex() {
+    const bool savedFlag = svms::g_stealIndexBuckets.load();
+    svms::g_stealIndexBuckets.store(true);
+    {
+        constexpr uint32_t kPool = 64u;
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(kPool, 44100u);
+        svms::ChannelParamsSnapshot channel{};
+        channel.volume = channel.expression = 1.0f;
+        channel.panLeft = channel.panRight = 0.70710678f;
+        channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 128u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 120u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep = 1.0f;
+        setup.gainLeft = setup.gainRight = 0.1f;
+        svms::VoiceHandle handle{};
+        for (uint32_t i = 0u; i < kPool; ++i) {
+            const bool quiet = i < kPool / 2u;
+            setup.initialGain = setup.sustainLevel = quiet ? 0.1f : 1.0f;
+            setup.playIndex = (quiet ? 1u : 101u) + i;
+            Check(voices->LaunchVoiceGroup(0u, static_cast<uint8_t>(30u + i),
+                                           100u, &setup, 1u, channel, &handle),
+                  "bucket index: filling launch succeeds");
+        }
+        setup.initialGain = setup.sustainLevel = 1.0f;
+        for (uint32_t i = 0u; i < kPool / 2u; ++i) {
+            setup.playIndex = 1000u + i;
+            Check(voices->LaunchVoiceGroup(0u, static_cast<uint8_t>(100u + i % 20u),
+                                           100u, &setup, 1u, channel, &handle),
+                  "bucket index: stealing launch succeeds");
+        }
+        uint32_t quietLeft = 0u, loudLeft = 0u, fresh = 0u;
+        for (uint32_t h = 0u; h < kPool; ++h) {
+            const uint32_t play = voices->v.playIndex[h];
+            if (play >= 1u && play <= kPool / 2u) ++quietLeft;
+            else if (play >= 101u && play < 101u + kPool) ++loudLeft;
+            else if (play >= 1000u) ++fresh;
+        }
+        Check(quietLeft == 0u && loudLeft == kPool / 2u && fresh == kPool / 2u,
+              "bucket index steals the quiet voices before any loud one");
+    }
+    {
+        // Storm: random levels, releases and retirements around a full pool.
+        constexpr uint32_t kPool = 96u;
+        auto voices = std::make_unique<svms::VoiceManager>();
+        voices->Initialize(kPool, 44100u);
+        svms::ChannelParamsSnapshot channel{};
+        channel.volume = channel.expression = 1.0f;
+        channel.panLeft = channel.panRight = 0.70710678f;
+        channel.mixScaleLeft = channel.mixScaleRight = 0.70710678f;
+        svms::VoiceConfiguration setup{};
+        setup.sampleStart = 0u;
+        setup.sampleEnd = 128u;
+        setup.loopStart = 8u;
+        setup.loopEnd = 120u;
+        setup.loopMode = 1u;
+        setup.phaseStep = setup.basePhaseStep = 1.0f;
+        setup.gainLeft = setup.gainRight = 0.1f;
+        uint32_t rng = 12345u;
+        const auto next = [&rng]() {
+            rng = rng * 1664525u + 1013904223u;
+            return rng >> 8u;
+        };
+        bool capacityHeld = true;
+        for (uint32_t i = 0u; i < 60000u; ++i) {
+            setup.initialGain = setup.sustainLevel =
+                0.05f + static_cast<float>(next() % 1000u) / 1050.0f;
+            setup.playIndex = 1u + i;
+            svms::VoiceHandle handles[1]{};
+            voices->LaunchVoiceGroup(static_cast<uint8_t>(next() % 4u),
+                                     static_cast<uint8_t>(next() % 88u + 10u),
+                                     100u, &setup, 1u, channel, handles);
+            const uint32_t op = next() % 8u;
+            if (op == 0u && voices->GetActiveCount() != 0u) {
+                const svms::VoiceHandle victim =
+                    static_cast<svms::VoiceHandle>(voices->activeList_[next() % voices->GetActiveCount()]);
+                voices->StartRelease(victim);
+            } else if (op == 1u && voices->GetActiveCount() != 0u) {
+                const svms::VoiceHandle victim =
+                    static_cast<svms::VoiceHandle>(voices->activeList_[next() % voices->GetActiveCount()]);
+                voices->RetireVoice(victim);
+            }
+            capacityHeld = capacityHeld && voices->GetActiveCount() <= kPool;
+        }
+        Check(capacityHeld, "bucket index: capacity holds through a storm");
+        Check(voices->GetActiveCount() > kPool / 2u,
+              "bucket index: pool stays populated through a storm");
+    }
+    svms::g_stealIndexBuckets.store(savedFlag);
+}

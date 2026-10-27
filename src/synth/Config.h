@@ -151,6 +151,10 @@ struct EngineConfig {
     // Experimental: staged steal relaunches with deferred ghost copies (bit-
     // identical audio). Applied at engine init. Off by default.
     bool launchStaging;
+    // Experimental: bucketed steal index (O(1) updates; the victim is taken
+    // from the quietest 16-bit level bucket instead of the exact minimum).
+    // Applied at engine init. Off by default (exact tournament tree).
+    bool stealIndexBuckets;
     // Synth backend routed by the event sink: 0 = SVMS engine (default,
     // in-process), 1 = external SVMS-API DLL, 2 = external KDMAPI DLL,
     // 3 = WinMM MIDI-out device. External backends own their own audio

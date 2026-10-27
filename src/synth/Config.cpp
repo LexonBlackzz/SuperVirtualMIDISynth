@@ -455,7 +455,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"steal_reject", cfg.stealReject},
             {"ghost_budget", cfg.ghostBudget},
             {"drop_zero_life_victims", cfg.dropZeroLifeVictims},
-            {"launch_staging", cfg.launchStaging}
+            {"launch_staging", cfg.launchStaging},
+            {"steal_index", cfg.stealIndexBuckets ? 1 : 0}
         }},
 
         {"midi", {
@@ -953,6 +954,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "voices.drop_zero_life_victims");
         if (!ReadBool(*it, "launch_staging", cfg.launchStaging))
             AppendWarning(cfg.configWarning, "voices.launch_staging");
+        {
+            uint32_t stealIndex = cfg.stealIndexBuckets ? 1u : 0u;
+            if (!ReadValue(*it, "steal_index", stealIndex, 0u, 1u))
+                AppendWarning(cfg.configWarning, "voices.steal_index");
+            cfg.stealIndexBuckets = stealIndex != 0u;
+        }
     }
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
@@ -1131,6 +1138,7 @@ EngineConfig EngineConfig::Default() {
     cfg.largePages = false;       // opt-in: standard aligned allocation by default
     cfg.dropZeroLifeVictims = false;  // opt-in: exact steal-fade tails by default
     cfg.launchStaging = false;    // opt-in: direct SoA launches by default
+    cfg.stealIndexBuckets = false;  // opt-in: exact tournament tree by default
     cfg.apiBackend = 0;           // SVMS engine in-process by default
     cfg.apiAllowNested = false;   // nested-chain guard on by default
     cfg.apiWinMmDevice = 0;

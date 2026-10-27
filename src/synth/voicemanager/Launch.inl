@@ -1120,7 +1120,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
         // it when the stable tournament root wins: root of the winner tree,
         // unless a volatile candidate outranks it (then the normal path
         // decides).
-        const uint64_t rootKey = stealWinnerTree_[1];
+        const uint64_t rootKey = StealTreeRoot();
         if (rootKey == 0u) return false;
         const uint32_t winnerPosition =
             UINT32_MAX - static_cast<uint32_t>(rootKey);
@@ -1170,7 +1170,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
         for (uint32_t i = 0u; i < count; ++i)
             stealWinnerTree_[stealTreeLeafBase_ + group[i]] = 0u;
         RefreshStealWinnerPaths(group, count);
-        runnerUp = stealWinnerTree_[1];
+        runnerUp = StealTreeRoot();
     }
 
     p.valid = true;

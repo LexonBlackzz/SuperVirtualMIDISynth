@@ -425,6 +425,8 @@ bool Driver::Initialize() {
                                       std::memory_order_relaxed);
     svms::g_launchStagingEnabled.store(cfg.launchStaging,
                                        std::memory_order_relaxed);
+    svms::g_stealIndexBuckets.store(cfg.stealIndexBuckets,
+                                    std::memory_order_relaxed);
 
     sampleRate = cfg.sampleRate;
     bufferFrames = cfg.bufferFrames;
@@ -582,6 +584,8 @@ bool Driver::Initialize() {
                                       std::memory_order_relaxed);
     svms::g_launchStagingEnabled.store(cfg.launchStaging,
                                        std::memory_order_relaxed);
+    svms::g_stealIndexBuckets.store(cfg.stealIndexBuckets,
+                                    std::memory_order_relaxed);
 
     voiceManager = new VoiceManager();
     voiceManager->SetPerKeyVoiceCap(cfg.perKeyVoiceCap);

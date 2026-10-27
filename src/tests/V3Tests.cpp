@@ -150,6 +150,7 @@ int main() {
     TestMutedTailCull();
     TestFilteredGroupKernel();
     TestWholeVoiceCCDifferential();
+    TestBucketStealIndex();
     TestFastChunkMathDifferential();
     TestWholeVoiceOpBudgetSplitDifferential();
     TestWholeVoiceVibratoDifferential();

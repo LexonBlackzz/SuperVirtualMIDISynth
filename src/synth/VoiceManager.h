@@ -19,8 +19,10 @@
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER) && defined(_MSC_VER)
 #include <intrin.h>
 #endif
-#if defined(_MSC_VER) && defined(_M_X64)
+#if defined(_MSC_VER)
 #include <intrin.h>
+#endif
+#if defined(_MSC_VER) && defined(_M_X64)
 #define SVMS_VM_HAS_PREFETCH 1
 #elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #include <x86intrin.h>
@@ -44,6 +46,33 @@ inline std::atomic<bool> g_launchStagingEnabled{false};
 inline bool LaunchStagingRequested() noexcept {
     static const bool env = std::getenv("SVMS_LAUNCH_STAGING") != nullptr;
     return env || g_launchStagingEnabled.load(std::memory_order_relaxed);
+}
+// voices.steal_index, read when a VoiceManager initializes (restart-applied).
+// Off = the exact tournament tree.  On = bucketed index: updates are O(1) and
+// the victim comes from the quietest 16-bit level bucket (ties by recency).
+// Env SVMS_STEAL_INDEX forces it on.
+inline std::atomic<bool> g_stealIndexBuckets{false};
+inline bool StealIndexBucketsRequested() noexcept {
+    static const bool env = std::getenv("SVMS_STEAL_INDEX") != nullptr;
+    return env || g_stealIndexBuckets.load(std::memory_order_relaxed);
+}
+// Index of the highest set bit; x must be non-zero.
+SVMS_VM_FORCEINLINE uint32_t StealHighBit64(uint64_t x) noexcept {
+#if defined(_MSC_VER) && defined(_WIN64)
+    unsigned long index = 0;
+    _BitScanReverse64(&index, x);
+    return static_cast<uint32_t>(index);
+#elif defined(_MSC_VER)
+    unsigned long index = 0;
+    if ((x >> 32u) != 0u) {
+        _BitScanReverse(&index, static_cast<unsigned long>(x >> 32u));
+        return static_cast<uint32_t>(index) + 32u;
+    }
+    _BitScanReverse(&index, static_cast<unsigned long>(x));
+    return static_cast<uint32_t>(index);
+#else
+    return 63u - static_cast<uint32_t>(__builtin_clzll(x));
+#endif
 }
 // Experimental (voices.drop_zero_life_victims, env SVMS_DROP_ZERO_LIFE for
 // now): a voice stolen on the very frame it was launched has played zero
@@ -627,9 +656,12 @@ public:
     uint64_t GetLazyStarts() const noexcept { return lazyStarts_; }
     // Test: the steal index (winner tree + stable keys) matches another pool's.
     bool SameStealIndexAs(const VoiceManager& other) const noexcept {
+        // The bucketed index keeps only the leaves meaningful.
+        const size_t skip = bucketSteal_ ? stealTreeLeafBase_ : 0u;
         return stealTreeLeafBase_ == other.stealTreeLeafBase_ &&
-            std::memcmp(stealWinnerTree_, other.stealWinnerTree_,
-                        stealTreeLeafBase_ * 2u * sizeof(uint64_t)) == 0 &&
+            std::memcmp(stealWinnerTree_ + skip, other.stealWinnerTree_ + skip,
+                        (stealTreeLeafBase_ * 2u - skip) *
+                            sizeof(uint64_t)) == 0 &&
             std::memcmp(stealStableKey_, other.stealStableKey_,
                         maxVoices_ * sizeof(uint64_t)) == 0;
     }
@@ -1054,6 +1086,20 @@ private:
     // at every level.
     uint64_t* stealWinnerTree_;
     uint32_t stealTreeLeafBase_;
+    // Bucketed steal index (voices.steal_index).  The leaves of
+    // stealWinnerTree_ stay the source of truth; the buckets only order them.
+    // A bucket is a LIFO list of (handle) nodes keyed by the top 16 bits of
+    // the ordered score; an entry is live only while the handle's leaf is
+    // non-zero and still maps to that bucket, so updates never delete.
+    bool bucketSteal_ = false;
+    uint32_t* bucketHead_ = nullptr;        // bucket -> newest node + 1
+    uint32_t* bucketNodeHandle_ = nullptr;
+    uint32_t* bucketNodeNext_ = nullptr;    // node + 1 of the next older node
+    uint64_t* bucketBits_ = nullptr;        // 1024 words: non-empty buckets
+    uint64_t* bucketSummary_ = nullptr;     // 16 words: non-empty bit words
+    uint32_t bucketNodeCap_ = 0u;
+    uint32_t bucketUsed_ = 0u;
+    uint32_t bucketFree_ = 0u;
     uint32_t stealHeapCount_;
     bool stealHeapValid_;
     uint64_t stealHeapBuildCount_;
@@ -1238,6 +1284,13 @@ private:
     SVMS_VM_FORCEINLINE void RefreshStealWinnerPath(VoiceHandle handle);
     void RefreshStealWinnerPaths(const VoiceHandle* handles, uint32_t count);
     void RebuildStableWinnerTree();
+    void ResetBuckets();
+    void BuildBuckets();
+    SVMS_VM_FORCEINLINE void BucketPush(VoiceHandle handle);
+    uint64_t BucketRoot();
+    uint64_t StealTreeRoot() {
+        return bucketSteal_ ? BucketRoot() : stealWinnerTree_[1];
+    }
     VoiceHandle PopStealCandidate(uint32_t& activePosition,
                                   bool reserveVolatileRoot);
     // Batched per-launch steal selection support. A batch-popped victim is
@@ -1384,9 +1437,9 @@ private:
         uint64_t runnerUp = 0u;
     } pendingLaunch_;
     void FlushPendingTree();
-    uint64_t StealRootKey() const noexcept {
+    uint64_t StealRootKey() noexcept {
         return pendingLaunch_.valid && pendingLaunch_.treeDirty
-            ? pendingLaunch_.maxKey : stealWinnerTree_[1];
+            ? pendingLaunch_.maxKey : StealTreeRoot();
     }
     bool TryLazyGroupLaunch(uint8_t channel, uint8_t note, uint8_t velocity,
                             const VoiceConfiguration* setups, uint32_t count,
