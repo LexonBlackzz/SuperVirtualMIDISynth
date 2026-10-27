@@ -17,9 +17,7 @@ inline RenderScalar::~RenderScalar() {
     _aligned_free(retirements_);
     _aligned_free(wvExciteHead_);
     _aligned_free(wvExciteTail_);
-    _aligned_free(wvStartFrame_);
-    _aligned_free(wvReleaseFrame_);
-    _aligned_free(wvStartIngress_);
+    _aligned_free(wvPlan_);
     _aligned_free(wvSliceHandles_);
     _aligned_free(wvOpHandles_);
     _aligned_free(wvOpFrames_);

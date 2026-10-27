@@ -648,10 +648,12 @@ public:
     // row whose old values still owe a ghost; MaterializeLaunch calls the
     // flush hook before it overwrites them (row-local, any worker).
     using DeferredGhostFlushHook = void(*)(VoiceHandle handle, void* userData);
-    void SetDeferredGhostFlush(const uint32_t* pending,
+    // `stride` is the distance in 32-bit words between two handles' entries.
+    void SetDeferredGhostFlush(const uint32_t* pending, uint32_t stride,
                                DeferredGhostFlushHook hook,
                                void* userData) noexcept {
         deferredGhostPending_ = pending;
+        deferredGhostStride_ = stride;
         deferredGhostFlush_ = hook;
         deferredGhostUserData_ = userData;
     }
@@ -1353,6 +1355,7 @@ private:
     // complete the same group launch (they write launch records, not SoA).
     bool groupStageNext_ = false;
     const uint32_t* deferredGhostPending_ = nullptr;
+    uint32_t deferredGhostStride_ = 1u;
     DeferredGhostFlushHook deferredGhostFlush_ = nullptr;
     void* deferredGhostUserData_ = nullptr;
     bool planWindow_ = false;            // inside PlanWholeVoiceBlock dispatch

@@ -211,12 +211,10 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     wvExciteTouched_.clear();
     wvExcites_.clear();
 
-    std::fill(wvStartFrame_, wvStartFrame_ + handleCapacity, UINT32_MAX);
-    std::fill(wvReleaseFrame_, wvReleaseFrame_ + handleCapacity, UINT32_MAX);
-    std::fill(wvStartIngress_, wvStartIngress_ + handleCapacity, UINT32_MAX);
+    std::fill(wvPlan_, wvPlan_ + handleCapacity,
+              WvPlanRec{UINT32_MAX, UINT32_MAX, UINT32_MAX, 0u});
     std::fill(wvTailKillFrame_, wvTailKillFrame_ + kStealTailReserve,
               UINT32_MAX);
-    std::fill(wvGhostPendingOf_.begin(), wvGhostPendingOf_.begin() + handleCapacity, 0u);
     wvOpCount_ = 0u;
     wvGhostCount_ = 0u;
     wvRowOpCount_ = 0u;
@@ -258,7 +256,8 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     // pool was built without records.
     voices.SetLaunchStagingActive(true);
     wvDeferredPool_ = &voices;
-    voices.SetDeferredGhostFlush(wvGhostPendingOf_.data(),
+    voices.SetDeferredGhostFlush(&wvPlan_[0].pending,
+                                 sizeof(WvPlanRec) / sizeof(uint32_t),
                                  &WholeVoiceDeferredGhostFlush, this);
     voices.SetPlanWindow(true);
 

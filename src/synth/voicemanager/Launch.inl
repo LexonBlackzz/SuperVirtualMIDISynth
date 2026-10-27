@@ -614,7 +614,8 @@ inline void VoiceManager::ApplyVoiceConfigurationFieldsImpl(
 inline void VoiceManager::MaterializeLaunch(VoiceHandle handle) noexcept {
     // The arrays below still hold the displaced voice's values; a deferred
     // ghost snapshot must take them before they are overwritten.
-    if (deferredGhostPending_ != nullptr && deferredGhostPending_[handle] != 0u)
+    if (deferredGhostPending_ != nullptr &&
+        deferredGhostPending_[static_cast<size_t>(handle) * deferredGhostStride_] != 0u)
         deferredGhostFlush_(handle, deferredGhostUserData_);
     const VoiceLaunchRecord& rec = v.launch[handle];
 #define SVMS_MATERIALIZE_FIELD(type, name) v.name[handle] = rec.name;

@@ -15,7 +15,7 @@ inline bool RenderScalar::PrepareWholeVoice(VoiceManager& voices) {
 inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     const uint32_t cap = scratchCapacity_;
     if (cap == 0u || handleCapacity == 0u) return false;
-    if (wvStartFrame_ != nullptr && wvGhostCapacity_ >= cap &&
+    if (wvPlan_ != nullptr && wvGhostCapacity_ >= cap &&
         wvOpCapacity_ >= cap && wvHandleCapacity_ >= handleCapacity) {
         return true;
     }
@@ -28,9 +28,8 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
         return static_cast<uint32_t*>(_aligned_malloc(
             static_cast<size_t>(count) * sizeof(uint32_t), kMixBufferAlign));
     };
-    uint32_t* freshStart = allocU32(wvStartFrame_, handleCapacity);
-    uint32_t* freshRelease = allocU32(wvReleaseFrame_, handleCapacity);
-    uint32_t* freshStartIngress = allocU32(wvStartIngress_, handleCapacity);
+    auto* freshPlan = static_cast<WvPlanRec*>(_aligned_malloc(
+        static_cast<size_t>(handleCapacity) * sizeof(WvPlanRec), kMixBufferAlign));
     uint32_t* freshOpIndex = allocU32(wvOpIndex_, handleCapacity);
     uint32_t* freshSlice = allocU32(wvSliceHandles_, cap);
     uint32_t* freshOpHandles = allocU32(wvOpHandles_, cap);
@@ -42,16 +41,13 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     uint32_t* freshGhostHandle = allocU32(wvGhostHandle_, cap);
     uint8_t* freshGhostNoTail = static_cast<uint8_t*>(_aligned_malloc(
         static_cast<size_t>(cap) * sizeof(uint8_t), kMixBufferAlign));
-    if (freshStart == nullptr || freshRelease == nullptr ||
-        freshStartIngress == nullptr || freshOpIndex == nullptr ||
+    if (freshPlan == nullptr || freshOpIndex == nullptr ||
         freshSlice == nullptr || freshOpHandles == nullptr ||
         freshOpFrames == nullptr || freshGhostStart == nullptr ||
         freshGhostDeath == nullptr || freshGhostRelease == nullptr ||
         freshGhostIngress == nullptr || freshGhostHandle == nullptr ||
         freshGhostNoTail == nullptr) {
-        _aligned_free(freshStart);
-        _aligned_free(freshRelease);
-        _aligned_free(freshStartIngress);
+        _aligned_free(freshPlan);
         _aligned_free(freshOpIndex);
         _aligned_free(freshSlice);
         _aligned_free(freshOpHandles);
@@ -64,9 +60,7 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
         _aligned_free(freshGhostNoTail);
         return false;
     }
-    _aligned_free(wvStartFrame_);
-    _aligned_free(wvReleaseFrame_);
-    _aligned_free(wvStartIngress_);
+    _aligned_free(wvPlan_);
     _aligned_free(wvSliceHandles_);
     _aligned_free(wvOpHandles_);
     _aligned_free(wvOpFrames_);
@@ -76,9 +70,9 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     _aligned_free(wvGhostStartIngress_);
     _aligned_free(wvGhostHandle_);
     _aligned_free(wvGhostNoTail_);
-    wvStartFrame_ = freshStart;
-    wvReleaseFrame_ = freshRelease;
-    wvStartIngress_ = freshStartIngress;
+    wvPlan_ = freshPlan;
+    wvStartFrame_.base = wvReleaseFrame_.base = wvStartIngress_.base =
+        wvGhostPendingOf_.base = freshPlan;
     _aligned_free(wvOpIndex_);
     wvOpIndex_ = freshOpIndex;
     wvSliceHandles_ = freshSlice;
@@ -96,7 +90,6 @@ inline bool RenderScalar::ReserveWholeVoiceStorage(uint32_t handleCapacity) {
     wvPartMixed_.assign(handleCapacity, 0u);
     wvPartMuted_.assign(handleCapacity, 0u);
     wvMutedLast_.assign(handleCapacity, 0u);
-    wvGhostPendingOf_.assign(handleCapacity, 0u);
     wvGhostImm_.assign(cap, WholeVoiceGhostImmediate{});
     wvGhostCopyState_.reset(new std::atomic<uint32_t>[cap]());
     if (wvGhostCapacity_ < cap) {

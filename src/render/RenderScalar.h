@@ -771,13 +771,28 @@ private:
     uint32_t* wvExciteHead_ = nullptr;
     uint32_t* wvExciteTail_ = nullptr;
     uint32_t wvExciteCapacity_ = 0u;
-    uint32_t* wvStartFrame_ = nullptr;       // per handle; UINT32_MAX = from 0
-    uint32_t* wvReleaseFrame_ = nullptr;     // per handle; UINT32_MAX = none
+    // The per-handle plan state is one 16-byte record, so the plan hooks (and a
+    // steal victim's ghost snapshot) touch one cache line per handle instead of
+    // one per array.  The column views keep the old array spelling.
+    struct WvPlanRec {
+        uint32_t start;     // UINT32_MAX = from 0
+        uint32_t release;   // UINT32_MAX = none
+        uint32_t ingress;   // see wvStartIngress_ below
+        uint32_t pending;   // see wvGhostPendingOf_ below
+    };
+    template <uint32_t WvPlanRec::*Member>
+    struct WvPlanColumn {
+        WvPlanRec* base = nullptr;
+        uint32_t& operator[](size_t i) const { return base[i].*Member; }
+    };
+    WvPlanRec* wvPlan_ = nullptr;
+    WvPlanColumn<&WvPlanRec::start> wvStartFrame_;
+    WvPlanColumn<&WvPlanRec::release> wvReleaseFrame_;
     // Dispatch ordinal of the launch that created each handle's current
     // generation (UINT32_MAX = carried over from a previous block, so every
     // op in the block applies).  Qualifies same-frame ops — see
     // WholeVoiceChannelOp::ingress.
-    uint32_t* wvStartIngress_ = nullptr;
+    WvPlanColumn<&WvPlanRec::ingress> wvStartIngress_;
     uint32_t* wvGhostStartIngress_ = nullptr;
     // Handle a ghost was captured from: its re-excite hits live on that
     // handle's list, filtered by the ghost's playIndex.
@@ -797,7 +812,7 @@ private:
     };
     std::vector<WholeVoiceGhostImmediate> wvGhostImm_;
     std::unique_ptr<std::atomic<uint32_t>[]> wvGhostCopyState_;
-    std::vector<uint32_t> wvGhostPendingOf_;
+    WvPlanColumn<&WvPlanRec::pending> wvGhostPendingOf_;
     VoiceManager* wvDeferredPool_ = nullptr;   // source pool of deferred ghosts
     void EnsureGhostCopied(uint32_t ghost);
     static void WholeVoiceDeferredGhostFlush(VoiceHandle handle,

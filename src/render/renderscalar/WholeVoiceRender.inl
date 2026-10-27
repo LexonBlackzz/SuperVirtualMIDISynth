@@ -1076,7 +1076,7 @@ inline void RenderScalar::RenderWholeVoiceBlock(
 #endif
         voices.ClearStagedPending();
     }
-    voices.SetDeferredGhostFlush(nullptr, nullptr, nullptr);
+    voices.SetDeferredGhostFlush(nullptr, 1u, nullptr, nullptr);
     wvDeferredPool_ = nullptr;
 
     // Retirement in exact (frame, capture-position) order — identical to
