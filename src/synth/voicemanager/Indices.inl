@@ -81,7 +81,7 @@ inline float VoiceManager::ComputeEffectiveStealLevel(
     const uint8_t stage = v.envelopeStage[handle];
     const bool preDecay =
         v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
-        (stage == 4u || stage == 0u || stage == 1u);
+        (decayBlind_ || stage == 4u || stage == 0u || stage == 1u);
     const float envelopeGain = preDecay
         ? v.targetGain[handle] : v.currentGain[handle];
     return std::fabs(envelopeGain) * outputGain;

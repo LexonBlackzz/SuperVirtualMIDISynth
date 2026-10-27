@@ -60,17 +60,28 @@ inline bool StealIndexBucketsRequested() noexcept {
 // replaced by a note from a strictly higher velocity lane, released tails go
 // first, low sustained keys and voices still in their attack are protected, and
 // a note that finds only protected victims is dropped instead of cutting one.
-inline bool StealPriorityRequested() noexcept {
-    static const bool env = std::getenv("SVMS_STEAL_PRIORITY") != nullptr;
-    return env;
-}
-// Value 2: a re-struck key always replaces its own previous voice (no decay test).
-inline bool StealPriorityStrong() noexcept {
-    static const bool strong = [] {
+// Config voices.steal_priority: 0 off, 1 lanes, 2 lanes + unconditional same-key
+// recycling.  The environment variable of the same name overrides it.
+inline std::atomic<uint32_t> g_stealPriority{0u};
+inline uint32_t StealPriorityMode() noexcept {
+    static const int env = [] {
         const char* value = std::getenv("SVMS_STEAL_PRIORITY");
-        return value != nullptr && value[0] == '2';
+        if (value == nullptr) return 0;
+        return value[0] == '2' ? 2 : 1;
     }();
-    return strong;
+    return env != 0 ? static_cast<uint32_t>(env)
+                    : g_stealPriority.load(std::memory_order_relaxed);
+}
+inline bool StealPriorityRequested() noexcept { return StealPriorityMode() != 0u; }
+inline bool StealPriorityStrong() noexcept { return StealPriorityMode() == 2u; }
+// Decay-blind ranking (env SVMS_STEAL_DECAYBLIND): a voice that has not been
+// released is ranked by its peak level, so a note does not become the cheapest
+// victim just because its envelope has decayed; released voices still rank by
+// their current level.
+inline std::atomic<bool> g_stealDecayBlind{false};  // config voices.steal_decay_blind
+inline bool StealDecayBlindRequested() noexcept {
+    static const bool env = std::getenv("SVMS_STEAL_DECAYBLIND") != nullptr;
+    return env || g_stealDecayBlind.load(std::memory_order_relaxed);
 }
 // Velocity lane 0..5 (thresholds follow velocity^1.7 against 0.22/0.35/0.50/0.62/0.78).
 SVMS_VM_FORCEINLINE uint32_t StealLaneOfVelocity(uint32_t velocity) noexcept {
@@ -1274,6 +1285,7 @@ private:
     // in this mode.
     bool bucketSteal_ = false;
     bool priorityPolicy_ = false;
+    bool decayBlind_ = false;
     bool priorityStrong_ = false;
     bool bucketFront_ = false;   // re-arming popped victims: back to the head
     StealBucketSet stableBuckets_;

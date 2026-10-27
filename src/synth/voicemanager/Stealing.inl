@@ -1067,6 +1067,7 @@ inline void VoiceManager::BuildVolatileStealHeap() {
     bool vectorized = false;
 #if !defined(SVMS_XP_COMPAT)
     if (stealKeyBackend_ == RenderBackend::AVX2 && !priorityPolicy_ &&
+        !decayBlind_ &&
         stealVolatileCount_ >= 8u) {
         constexpr uint32_t kParallelMinCandidates = 32768u;
         constexpr uint32_t kParallelChunk = 16384u;
@@ -1133,7 +1134,10 @@ inline void VoiceManager::BuildVolatileStealHeap() {
                 ? UINT32_MAX : static_cast<uint32_t>(rawAge);
             const float ageUnits =
                 static_cast<float>(age) * stealAgeScale_;
-            float effectiveLevel = std::fabs(v.currentGain[handle]) *
+            float effectiveLevel = std::fabs(
+                (decayBlind_ &&
+                 v.state[handle] == static_cast<uint8_t>(VoiceState::Active))
+                    ? v.targetGain[handle] : v.currentGain[handle]) *
                 v.stealOutputGain[handle];
             if (priorityPolicy_) effectiveLevel *= StealLaneFactor(handle);
             const float score = ageUnits -

@@ -456,7 +456,9 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"ghost_budget", cfg.ghostBudget},
             {"drop_zero_life_victims", cfg.dropZeroLifeVictims},
             {"launch_staging", cfg.launchStaging},
-            {"steal_index", cfg.stealIndexBuckets ? 1 : 0}
+            {"steal_index", cfg.stealIndexBuckets ? 1 : 0},
+            {"steal_priority", cfg.stealPriority},
+            {"steal_decay_blind", cfg.stealDecayBlind}
         }},
 
         {"midi", {
@@ -960,6 +962,10 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
                 AppendWarning(cfg.configWarning, "voices.steal_index");
             cfg.stealIndexBuckets = stealIndex != 0u;
         }
+        if (!ReadValue(*it, "steal_priority", cfg.stealPriority, 0u, 2u))
+            AppendWarning(cfg.configWarning, "voices.steal_priority");
+        if (!ReadBool(*it, "steal_decay_blind", cfg.stealDecayBlind))
+            AppendWarning(cfg.configWarning, "voices.steal_decay_blind");
     }
     if (auto it = root.find("note_on_collapse"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "threshold", cfg.noteOnCollapseThreshold, 0u, 65536u))
@@ -1139,6 +1145,8 @@ EngineConfig EngineConfig::Default() {
     cfg.dropZeroLifeVictims = false;  // opt-in: exact steal-fade tails by default
     cfg.launchStaging = false;    // opt-in: direct SoA launches by default
     cfg.stealIndexBuckets = false;  // opt-in: exact tournament tree by default
+    cfg.stealPriority = 0;          // opt-in: quietest-first ranking by default
+    cfg.stealDecayBlind = false;
     cfg.apiBackend = 0;           // SVMS engine in-process by default
     cfg.apiAllowNested = false;   // nested-chain guard on by default
     cfg.apiWinMmDevice = 0;
