@@ -512,6 +512,7 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
     if (declineReason != 8u) {
         // CPU-only block: rows may change under a resident copy.
         ++counters.declined[declineReason];
+        counters.declinedRows += activeCount;
         stage.BumpEpoch();
         return 0u;
     }
@@ -576,6 +577,7 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
                 stage.MinimumVoices()) {
             // Too little for the GPU to pay off: everything stays on the CPU.
             ++counters.declined[6];
+            counters.declinedRows += activeCount;
             stage.BumpEpoch();
             return 0u;
         }
@@ -615,6 +617,7 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
             // Nothing has been folded into the SoA yet, so the whole block
             // simply stays on the CPU.
             ++counters.declined[7];
+            counters.declinedRows += activeCount;
             stage.Abandon();
             stage.BumpEpoch();
             return 0u;
@@ -623,6 +626,7 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
         ++gpuSubmittedParts_;
     }
     submitted = true;
+    counters.cpuRows += cpuRun;
     gpuSustainedRows_ = gpuRun;
     gpuEnvRows_ = envRun;
     wvItemHandles_ = stage.CpuRows();

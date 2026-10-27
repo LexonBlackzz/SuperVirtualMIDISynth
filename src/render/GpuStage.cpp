@@ -53,6 +53,10 @@ std::unique_ptr<GpuStage> GpuStage::Create(gpu::Api api, uint32_t deviceIndex,
     // Debug/bench override: SVMS_GPU_SPLIT_MIN=<rows> (huge = never split).
     if (const char* parts = std::getenv("SVMS_GPU_PARTS"))
         stage->SetParts(static_cast<uint32_t>(std::strtoul(parts, nullptr, 10)));
+    // Smallest block (active rows, and GPU-eligible rows) the stage takes; the
+    // default is 1, i.e. every block that has an eligible row.
+    if (const char* floor = std::getenv("SVMS_GPU_MIN_VOICES"))
+        stage->SetMinimumVoices(static_cast<uint32_t>(std::strtoul(floor, nullptr, 10)));
     if (const char* split = std::getenv("SVMS_GPU_SPLIT_MIN"))
         stage->SetSplitMinRows(static_cast<uint32_t>(std::strtoul(split, nullptr, 10)));
     return stage;

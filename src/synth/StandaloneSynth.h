@@ -332,6 +332,41 @@ public:
                 (unsigned long long)renderer_.GetWvSegFallback(),
                 (unsigned long long)renderer_.GetGhostOverflowCount());
         }
+        if (std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {
+            // Cycles (TSC) per block phase over the whole session.
+            std::fprintf(stderr,
+                "[SVMS] whole-voice cycles: plan=%llu jobs=%llu post=%llu\n",
+                (unsigned long long)renderer_.GetWvPlanCycles(),
+                (unsigned long long)renderer_.GetWvJobCycles(),
+                (unsigned long long)renderer_.GetWvPostCycles());
+        }
+        if (gpuStage_ && std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {
+            const GpuStageStats& g = gpuStage_->Stats();
+            const unsigned long long onGpu = g.rows + g.envRows;
+            const unsigned long long total = onGpu + g.cpuRows + g.declinedRows;
+            std::fprintf(stderr,
+                "[SVMS] gpu %s: considered=%llu gpu_blocks=%llu rows gpu=%llu (sustained %llu, "
+                "envelope %llu, timeline %llu) cpu-in-gpu-block=%llu declined-block=%llu "
+                "gpu-share=%.1f%% declined(no-store=%llu buses=%llu rotation=%llu "
+                "decim/vibrato=%llu min-voices=%llu prepare=%llu few-eligible=%llu "
+                "submit-failed=%llu) late=%llu failed=%llu\n",
+                gpuStage_->Name(), (unsigned long long)g.considered,
+                (unsigned long long)g.blocks, onGpu, (unsigned long long)g.rows,
+                (unsigned long long)g.envRows, (unsigned long long)g.timelineRows,
+                (unsigned long long)g.cpuRows, (unsigned long long)g.declinedRows,
+                total ? 100.0 * (double)onGpu / (double)total : 0.0,
+                (unsigned long long)g.declined[0], (unsigned long long)g.declined[1],
+                (unsigned long long)g.declined[2], (unsigned long long)g.declined[3],
+                (unsigned long long)g.declined[4], (unsigned long long)g.declined[5],
+                (unsigned long long)g.declined[6], (unsigned long long)g.declined[7],
+                (unsigned long long)g.late, (unsigned long long)g.failed);
+            std::fprintf(stderr,
+                "[SVMS] gpu ms: classify=%.0f pack=%.0f upload=%.0f sort=%.0f submit=%.0f "
+                "wait=%.0f scatter=%.0f\n",
+                g.classifyMicros / 1000.0, g.packMicros / 1000.0, g.uploadMicros / 1000.0,
+                g.sortMicros / 1000.0, g.submitMicros / 1000.0, g.waitMicros / 1000.0,
+                g.scatterMicros / 1000.0);
+        }
         for (Bank& bank : banks_) sf2_free(bank.data.get());
     }
 

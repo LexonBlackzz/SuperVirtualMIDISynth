@@ -44,6 +44,10 @@ struct GpuStageStats {
     // rows than the minimum, 5 stage could not prepare, 6 too few GPU-eligible
     // rows (the rest could not go to the GPU), 7 a submit failed.
     uint64_t declined[8] = {};
+    // Rows of the blocks the stage offered: left on the CPU inside a block that
+    // went to the GPU, and every active row of a block the stage declined.
+    uint64_t cpuRows = 0u;
+    uint64_t declinedRows = 0u;
     bool lost = false;           // device gone; the stage is disabled
 };
 
@@ -64,7 +68,8 @@ public:
         backend_->ProfileNs(voice, reduce, env);
     }
 
-    // Tunables.  minimumVoices: below it the round trip costs more than AVX2.
+    // Tunables.  minimumVoices: blocks with fewer active (or GPU-eligible)
+    // rows stay on the CPU.
     void SetMinimumVoices(uint32_t voices) { minimumVoices_ = voices; }
     uint32_t MinimumVoices() const { return minimumVoices_; }
     // Blocks with at least this many GPU rows go out in two parts.
@@ -324,7 +329,9 @@ public:
     }
     std::unique_ptr<gpu::Backend> backend_;
     bool enabled_ = true;
-    uint32_t minimumVoices_ = 4096u;
+    // Any block with an eligible row goes to the GPU.  The old floor of 4096
+    // meant a pool of 4092 voices never used it; SVMS_GPU_MIN_VOICES raises it.
+    uint32_t minimumVoices_ = 1u;
     uint32_t splitMinRows_ = 8192u;
     uint32_t parts_ = 3u;
     uint32_t sampleRate_ = 44100u;
