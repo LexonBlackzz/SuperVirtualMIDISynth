@@ -64,6 +64,14 @@ inline bool StealPriorityRequested() noexcept {
     static const bool env = std::getenv("SVMS_STEAL_PRIORITY") != nullptr;
     return env;
 }
+// Value 2: a re-struck key always replaces its own previous voice (no decay test).
+inline bool StealPriorityStrong() noexcept {
+    static const bool strong = [] {
+        const char* value = std::getenv("SVMS_STEAL_PRIORITY");
+        return value != nullptr && value[0] == '2';
+    }();
+    return strong;
+}
 // Velocity lane 0..5 (thresholds follow velocity^1.7 against 0.22/0.35/0.50/0.62/0.78).
 SVMS_VM_FORCEINLINE uint32_t StealLaneOfVelocity(uint32_t velocity) noexcept {
     return velocity <= 52u ? 0u : velocity <= 68u ? 1u : velocity <= 84u ? 2u
@@ -1266,6 +1274,7 @@ private:
     // in this mode.
     bool bucketSteal_ = false;
     bool priorityPolicy_ = false;
+    bool priorityStrong_ = false;
     bool bucketFront_ = false;   // re-arming popped victims: back to the head
     StealBucketSet stableBuckets_;
     StealBucketSet volBuckets_;
@@ -1301,6 +1310,15 @@ private:
                             const ChannelParamsSnapshot& cp,
                             uint32_t multiplicity,
                             const PriorityIncoming* incoming = nullptr);
+    // Level a launch would start at (what ShouldRejectNoteOn compares).
+    float NewbornStealLevel(const VoiceConfiguration* setups, uint32_t count,
+                            const ChannelParamsSnapshot& cp,
+                            uint32_t multiplicity) const;
+    // Priority policy: the oldest sustained voice on this key, when it may be
+    // recycled for the new note (not louder, past its attack, decayed under
+    // half the new level); kInvalidVoice otherwise.
+    VoiceHandle SameKeyRecycleVictim(uint8_t channel, uint8_t note,
+                                     uint8_t velocity, float newLevel) const;
     // Multiplies a voice's steal level while the priority policy ranks it.
     float StealLaneFactor(VoiceHandle handle) const;
     static float StealLaneFactorFor(uint8_t velocity, uint8_t note,
@@ -1384,6 +1402,9 @@ private:
     // identify the oldest outstanding generation in O(1), then touch only
     // that generation's adjacent SF2 layers.
     int32_t channelKeyVoiceOldest_[kChannelCount][kNoteCount];
+    // Last voice taken off a key's chain (released, stolen or retired); the
+    // priority policy checks it is still a release tail on that key before use.
+    int32_t lastUnlinkedByKey_[kChannelCount][kNoteCount];
     // Live chain length per (channel,note) — only still-playing voices are
     // linked (StartRelease unlinks), so this is the per-key polyphony the
     // optional per-key voice cap is measured against. Maintained by

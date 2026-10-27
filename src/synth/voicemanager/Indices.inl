@@ -295,6 +295,7 @@ inline void VoiceManager::UnlinkChannelKey(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     const uint8_t ch = v.channel[handle];
     const uint8_t nt = v.note[handle];
+    if (priorityPolicy_) lastUnlinkedByKey_[ch][nt] = static_cast<int32_t>(handle);
     const int32_t previous = v.prevChannelKeyVoice[handle];
     const int32_t next = v.nextChannelKeyVoice[handle];
     if (previous >= 0) {

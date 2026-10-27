@@ -36,7 +36,8 @@ inline VoiceManager::VoiceManager()
     lastLinkedPlayVoice_ = kInvalidVoice;
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
         for (uint32_t n = 0; n < kNoteCount; ++n) {
-            channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
+            channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] =
+                lastUnlinkedByKey_[ch][n] = -1;
             channelKeyVoiceCount_[ch][n] = 0u;
         }
     std::memset(channelMixScaleL_, 0, sizeof(channelMixScaleL_));
@@ -286,6 +287,7 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     stealIndexRepairCount_ = other.stealIndexRepairCount_;
     bucketSteal_ = other.bucketSteal_;
     priorityPolicy_ = other.priorityPolicy_;
+    priorityStrong_ = other.priorityStrong_;
     stableBuckets_.used = other.stableBuckets_.used;
     stableBuckets_.freeHead = other.stableBuckets_.freeHead;
     volBuckets_.used = other.volBuckets_.used;
@@ -321,6 +323,8 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
                 sizeof(channelKeyVoiceHead_));
     std::memcpy(channelKeyVoiceOldest_, other.channelKeyVoiceOldest_,
                 sizeof(channelKeyVoiceOldest_));
+    std::memcpy(lastUnlinkedByKey_, other.lastUnlinkedByKey_,
+                sizeof(lastUnlinkedByKey_));
     std::memcpy(channelKeyVoiceCount_, other.channelKeyVoiceCount_,
                 sizeof(channelKeyVoiceCount_));
     std::memcpy(exclusiveClassHead_, other.exclusiveClassHead_,
@@ -347,6 +351,7 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
     v.launchStaging = launchStagingMode_ != 0;
     bucketSteal_ = StealIndexBucketsRequested();
     priorityPolicy_ = StealPriorityRequested();
+    priorityStrong_ = StealPriorityStrong();
     if (requested == 0u || !v.Reserve(requested) ||
         !ReserveMetadata(requested)) {
         maxVoices_ = 0u;
@@ -456,7 +461,8 @@ inline void VoiceManager::Reset() {
     }
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
         for (uint32_t n = 0; n < kNoteCount; ++n) {
-            channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] = -1;
+            channelKeyVoiceHead_[ch][n] = channelKeyVoiceOldest_[ch][n] =
+                lastUnlinkedByKey_[ch][n] = -1;
             channelKeyVoiceCount_[ch][n] = 0u;
         }
 }
@@ -580,6 +586,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
                 sizeof(channelKeyVoiceHead_));
     std::memcpy(grown.channelKeyVoiceOldest_, channelKeyVoiceOldest_,
                 sizeof(channelKeyVoiceOldest_));
+    std::memcpy(grown.lastUnlinkedByKey_, lastUnlinkedByKey_,
+                sizeof(lastUnlinkedByKey_));
     std::memcpy(grown.channelMixScaleL_, channelMixScaleL_,
                 sizeof(channelMixScaleL_));
     std::memcpy(grown.channelMixScaleR_, channelMixScaleR_,

@@ -1365,8 +1365,20 @@ inline bool VoiceManager::LaunchVoiceGroup(
         count > voiceLimit_)
         return false;
     if (count > launchLayersHighWater_) launchLayersHighWater_ = count;
+    // Priority policy: a full pool first recycles an older sustained voice on
+    // the same key, before any other victim is considered.
+    VoiceHandle recycleVictim = kInvalidVoice;
+    if (priorityPolicy_) {
+        if (pendingLaunch_.valid) CommitPendingLaunchImpl();
+        if (freeTop_ == 0u && activeCount_ >= voiceLimit_ &&
+            perKeyVoiceCap_ == 0u)
+            recycleVictim = SameKeyRecycleVictim(
+                channel, note, velocity,
+                NewbornStealLevel(setups, count, channelParams, multiplicity));
+    }
     const PriorityIncoming incoming{channel, note, velocity};
-    if ((priorityPolicy_ || stealReject_.load(std::memory_order_relaxed)) &&
+    if (recycleVictim == kInvalidVoice &&
+        (priorityPolicy_ || stealReject_.load(std::memory_order_relaxed)) &&
         ShouldRejectNoteOn(setups, count, channelParams, multiplicity,
                            priorityPolicy_ ? &incoming : nullptr)) {
         // Pairing note-offs sees no voice for this generation, exactly as if
@@ -1386,7 +1398,7 @@ inline bool VoiceManager::LaunchVoiceGroup(
         ~MultiplicityScope() { slot = 1u; }
     } multiplicityScope(launchMult_, multiplicity);
     if (multiplicity > 1u) mergedVoicesMayExist_ = true;
-    if (lazyRunActive_) {
+    if (lazyRunActive_ && recycleVictim == kInvalidVoice) {
         if (TryLazyGroupLaunch(channel, note, velocity, setups, count,
                                playIndex, channelParams, outHandles))
             return true;
@@ -1399,7 +1411,8 @@ inline bool VoiceManager::LaunchVoiceGroup(
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     BeginLaunchTestProfile(channel, note, setups, count);
 #endif
-    if (count == 1u && TryLaunchSingleVoiceInPlace(
+    if (count == 1u && recycleVictim == kInvalidVoice &&
+        TryLaunchSingleVoiceInPlace(
             channel, note, velocity, setups[0], playIndex, channelParams,
             outHandles[0])) {
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
@@ -1411,7 +1424,8 @@ inline bool VoiceManager::LaunchVoiceGroup(
         return true;
     }
     bool candidatesReservedInPlace = false;
-    if (!ReuseMatchingStealGroup(channel, note, velocity, setups, count,
+    if (recycleVictim != kInvalidVoice ||
+        !ReuseMatchingStealGroup(channel, note, velocity, setups, count,
                                  outHandles, candidatesReservedInPlace)) {
         // ── FLAG (steal-batch scope) ─────────────────────────────────────
         // The victim batching is deliberately scoped to ONE launch
@@ -1441,6 +1455,8 @@ inline bool VoiceManager::LaunchVoiceGroup(
             if (oldest >= 0 &&
                 v.state[oldest] == static_cast<uint8_t>(VoiceState::Active))
                 keyedVictim = static_cast<VoiceHandle>(oldest);
+        } else if (recycleVictim != kInvalidVoice) {
+            keyedVictim = recycleVictim;
         }
         VoiceHandle batchVictims[kStealBatchMaxLayers];
         uint32_t batchPositions[kStealBatchMaxLayers];

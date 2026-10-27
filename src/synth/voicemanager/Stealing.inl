@@ -669,6 +669,45 @@ inline uint32_t VoiceManager::PopStealCandidates(uint32_t count,
 // allocation loop), so it sifts back to the root the pop assumed. Heap-array
 // order may differ from the pre-pop arrangement, but the heap is fully
 // ordered by unique keys, so every subsequent selection is identical.
+inline float VoiceManager::NewbornStealLevel(
+    const VoiceConfiguration* setups, uint32_t count,
+    const ChannelParamsSnapshot& cp, uint32_t multiplicity) const {
+    const float scale = multiplicity > 1u ? static_cast<float>(multiplicity) : 1.0f;
+    float level = 0.0f;
+    for (uint32_t layer = 0u; layer < count; ++layer) {
+        const float mixL = setups[layer].gainLeft * scale * cp.mixScaleLeft;
+        const float mixR = setups[layer].gainRight * scale * cp.mixScaleRight;
+        level = (std::max)(level, std::fabs(setups[layer].initialGain) *
+                                      std::sqrt(mixL * mixL + mixR * mixR));
+    }
+    return level;
+}
+
+inline VoiceHandle VoiceManager::SameKeyRecycleVictim(
+    uint8_t channel, uint8_t note, uint8_t velocity, float newLevel) const {
+    // A release tail left on this key goes first once it is quiet enough.
+    const int32_t tail = lastUnlinkedByKey_[channel][note];
+    if (tail >= 0 && static_cast<uint32_t>(tail) < maxVoices_ &&
+        v.state[tail] == static_cast<uint8_t>(VoiceState::Releasing) &&
+        v.channel[tail] == channel && v.note[tail] == note &&
+        (priorityStrong_ ||
+         ComputeEffectiveStealLevel(static_cast<VoiceHandle>(tail)) <=
+            0.8f * newLevel))
+        return static_cast<VoiceHandle>(tail);
+    const int32_t oldest = channelKeyVoiceOldest_[channel][note];
+    if (oldest < 0) return kInvalidVoice;
+    const VoiceHandle h = static_cast<VoiceHandle>(oldest);
+    if (h >= maxVoices_ ||
+        v.state[h] != static_cast<uint8_t>(VoiceState::Active))
+        return kInvalidVoice;
+    const uint8_t stage = v.envelopeStage[h];
+    if (stage == 4u || stage == 0u || stage == 1u) return kInvalidVoice;
+    if (v.velocity[h] > velocity) return kInvalidVoice;
+    if (!priorityStrong_ && !(ComputeEffectiveStealLevel(h) < 0.5f * newLevel))
+        return kInvalidVoice;
+    return h;
+}
+
 inline bool VoiceManager::ShouldRejectNoteOn(
     const VoiceConfiguration* setups, uint32_t count,
     const ChannelParamsSnapshot& cp, uint32_t multiplicity,
@@ -715,14 +754,7 @@ inline bool VoiceManager::ShouldRejectNoteOn(
     // Newborn score: age 0, level = |initialGain| * stereo energy norm of the
     // mix gains (what ApplyVoiceConfigurationFields caches as stealOutputGain,
     // merged-launch multiplicity included).
-    const float scale = multiplicity > 1u ? static_cast<float>(multiplicity) : 1.0f;
-    float level = 0.0f;
-    for (uint32_t layer = 0u; layer < count; ++layer) {
-        const float mixL = setups[layer].gainLeft * scale * cp.mixScaleLeft;
-        const float mixR = setups[layer].gainRight * scale * cp.mixScaleRight;
-        level = (std::max)(level, std::fabs(setups[layer].initialGain) *
-                                      std::sqrt(mixL * mixL + mixR * mixR));
-    }
+    const float level = NewbornStealLevel(setups, count, cp, multiplicity);
     if (incoming != nullptr) {
         // Velocity-lane admission: the best victim decides.  A tail goes unless
         // it is much louder than the note; anything else needs a strictly
