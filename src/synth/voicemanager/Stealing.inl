@@ -683,6 +683,7 @@ inline bool VoiceManager::ShouldRejectNoteOn(
         return false;
     if (!stealHeapValid_) BuildStealHeap();
     VoiceHandle victim = kInvalidVoice;
+    uint64_t floorKey = 0u;
     if (ReleasingRingEligible()) {
         uint32_t position = 0u;
         victim = NextValidReleasingRingVictim(position, false);
@@ -695,6 +696,7 @@ inline bool VoiceManager::ShouldRejectNoteOn(
             if (rootKey == 0u || position >= activeCount_) return false;
             victim = static_cast<VoiceHandle>(activeList_[position]);
             bestKey = rootKey;
+            floorKey = rootKey;
         }
         if (stealVolatileHeapCount_ > 0u) {
             uint64_t key = 0u;
@@ -704,12 +706,11 @@ inline bool VoiceManager::ShouldRejectNoteOn(
                 const uint32_t position = UINT32_MAX - static_cast<uint32_t>(key);
                 if (position >= activeCount_) return false;
                 victim = rootHandle;
+                floorKey = key;
             }
         }
     }
-    if (victim == kInvalidVoice || victim >= maxVoices_ ||
-        v.state[victim] == static_cast<uint8_t>(VoiceState::Free))
-        return false;
+    if (victim == kInvalidVoice || victim >= maxVoices_) return false;
     // Newborn score: age 0, level = |initialGain| * stereo energy norm of the
     // mix gains (what ApplyVoiceConfigurationFields caches as stealOutputGain,
     // merged-launch multiplicity included).
@@ -722,6 +723,19 @@ inline bool VoiceManager::ShouldRejectNoteOn(
                                       std::sqrt(mixL * mixL + mixR * mixR));
     }
     const float newbornScore = 0.0f - level * kBassMidiStealGainScale;
+    if (bucketSteal_ && floorKey != 0u && stealAgeScale_ == 0.0f &&
+        !pendingLaunch_.valid) {
+        // The index already holds the floor's score in its key (no age term
+        // when ranking is ageless), so the victim's row is never touched.
+        const uint32_t ordered = static_cast<uint32_t>(floorKey >> 32u);
+        const uint32_t bits = (ordered & 0x80000000u) != 0u
+            ? ordered ^ 0x80000000u : ~ordered;
+        float floorScore = 0.0f;
+        std::memcpy(&floorScore, &bits, sizeof(floorScore));
+        return newbornScore >= floorScore * (1.0f + 1e-5f);
+    }
+    if (v.state[victim] == static_cast<uint8_t>(VoiceState::Free))
+        return false;
     // BASSMIDI 2018 (ageless ranking): a newcomer that is not strictly louder than
     // the quietest voice is dropped, so an equal level loses. The newborn level is
     // computed from the setup and the victim's from its cached envelope, so equal
