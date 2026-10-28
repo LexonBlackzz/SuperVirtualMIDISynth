@@ -765,7 +765,13 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     // The successor is staged right below (same handle, same function), so the
     // victim's staged-field arrays stay intact until its record is applied.
     ghostCopyDeferrable_ = launchStagingActive_ && stealTailCaptureSuppressed_;
+#if defined(SVMS_NOTE_TRACE)
+    if (g_noteTrace) g_noteTrace->how = fromRing ? 1u : volatileVictim ? 2u : 3u;
+#endif
     CaptureStealTail(handle);
+#if defined(SVMS_NOTE_TRACE)
+    if (g_noteTrace) g_noteTrace->how = 0u;
+#endif
     ghostCopyDeferrable_ = false;
     if (fromRing) {
         // Mirror tier-pop bookkeeping: unlink the victim from the volatile

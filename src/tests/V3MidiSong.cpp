@@ -717,6 +717,34 @@ bool WriteNoteTable(const DecodedSong& song, const svms::NoteTrace& trace,
         a = b;
     }
 
+    // Launch cost by fate: a launch cut on its own start frame is never heard.
+    uint64_t zeroCycles = 0u, otherCycles = 0u, zeroLaunches = 0u, otherLaunches = 0u;
+    for (const svms::NoteTrace::Launch& launch : launches) {
+        if (launch.cut == launch.frame) {
+            zeroCycles += launch.cycles;
+            ++zeroLaunches;
+        } else {
+            otherCycles += launch.cycles;
+            ++otherLaunches;
+        }
+    }
+    std::printf("[launch-cost] cut-on-own-frame: %llu launches, %.0f cy each, %.1f%% of "
+                "launch cycles | others: %llu launches, %.0f cy each\n",
+                static_cast<unsigned long long>(zeroLaunches),
+                zeroLaunches ? double(zeroCycles) / double(zeroLaunches) : 0.0,
+                100.0 * double(zeroCycles) / double(zeroCycles + otherCycles + 1u),
+                static_cast<unsigned long long>(otherLaunches),
+                otherLaunches ? double(otherCycles) / double(otherLaunches) : 0.0);
+    std::printf("[cut-by] general=%llu ring=%llu volatile=%llu stable=%llu | "
+                "of which on own frame: %llu %llu %llu %llu\n",
+                static_cast<unsigned long long>(trace.cutBy[0]),
+                static_cast<unsigned long long>(trace.cutBy[1]),
+                static_cast<unsigned long long>(trace.cutBy[2]),
+                static_cast<unsigned long long>(trace.cutBy[3]),
+                static_cast<unsigned long long>(trace.zeroCutBy[0]),
+                static_cast<unsigned long long>(trace.zeroCutBy[1]),
+                static_cast<unsigned long long>(trace.zeroCutBy[2]),
+                static_cast<unsigned long long>(trace.zeroCutBy[3]));
     uint64_t unheard = 0u, cutEarly = 0u, zeroLife = 0u;
     for (const NoteRow& row : rows) {
         if (row.launches == 0u) { ++unheard; continue; }
@@ -1034,6 +1062,9 @@ bool RunOffline(const Options& options, const DecodedSong& song,
             (unsigned long long)p.bendCalls,
             (double)p.bendTotal / bendCalls,
             (unsigned long long)synth.StealHeapBuildCount());
+        std::printf("[lazy-launch] starts=%llu chainSteps=%llu steals=%u\n",
+                    (unsigned long long)synth.LazyStarts(),
+                    (unsigned long long)synth.LazyChainSteps(), synth.Steals());
         std::fflush(stdout);
     }
 #endif

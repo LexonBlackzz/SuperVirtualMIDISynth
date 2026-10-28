@@ -233,6 +233,7 @@ public:
         // VoiceManager::ApplyChannelBendRatio's hook — see
         // RefreshChannelPitch.
         renderer_.SetEventDispatcher(&DispatchRenderEventStatic, this);
+        renderer_.SetEventBatchDispatcher(&DispatchRenderEventBatchStatic, this);
         // Batched steal-victim selection inside LaunchVoiceGroup: provably
         // identical victims to the sequential per-layer pops (no candidate
         // insertion can occur inside one launch transaction), at a fraction
@@ -441,6 +442,28 @@ public:
                                   absoluteFrame);
             if (!rawMix_) PostProcess(left, right, frameCount);
         }
+    }
+
+    // Same events, one same-frame run at a time, so a run of note-ons can use
+    // the lazy same-frame launch the realtime driver uses (a no-op unless
+    // voices.drop_zero_life_victims is on). Whatever is pending lands before
+    // any other event is handled.
+    static void DispatchRenderEventBatchStatic(const RenderEvent* events,
+                                               uint32_t count, uint32_t frame,
+                                               void* userData) {
+        StandaloneSynth* self = static_cast<StandaloneSynth*>(userData);
+        if (!self) return;
+        bool lazy = false;
+        for (uint32_t i = 0u; i < count; ++i) {
+            if (events[i].type == RenderEventType::NoteOn) {
+                if (!lazy) lazy = self->voices_.BeginLazyLaunchRun();
+            } else if (lazy) {
+                self->voices_.EndLazyLaunchRun();
+                lazy = false;
+            }
+            DispatchRenderEventStatic(events[i], frame, self);
+        }
+        if (lazy) self->voices_.EndLazyLaunchRun();
     }
 
     // Production EventDispatcher: applies one render event to the synth
@@ -657,6 +680,8 @@ public:
         }
     }
     uint32_t Steals() const { return voices_.stealCount_; }
+    uint64_t LazyChainSteps() const { return voices_.GetLazyChainSteps(); }
+    uint64_t LazyStarts() const { return voices_.GetLazyStarts(); }
     // ── Temporary dispatch-phase profiler (diagnostics only) ────────────
     struct DispatchProfile {
         uint64_t noteOnCalls = 0, noteOffCalls = 0;
@@ -1102,9 +1127,16 @@ private:
         const uint64_t allocBegin = __rdtsc();
 #endif
         VoiceHandle handles[512];
+#if defined(SVMS_NOTE_TRACE)
+        const size_t traceFirst = g_noteTrace ? g_noteTrace->launches.size() : 0u;
+        const uint64_t traceBegin = __rdtsc();
+#endif
         const bool launched = voices_.LaunchVoiceGroup(
             channel, note, velocity, launchSetups_, count, generation,
             channels_.GetParams()[channel], handles, 0u, multiplicity);
+#if defined(SVMS_NOTE_TRACE)
+        if (g_noteTrace) g_noteTrace->StampCycles(traceFirst, __rdtsc() - traceBegin);
+#endif
         if (launched) { physicalLaunches_ += count; lastNoteLaunched_ = true; }
 #if defined(_MSC_VER)
         dispatchProfile.alloc += __rdtsc() - allocBegin;
