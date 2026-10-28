@@ -147,14 +147,15 @@ Earlier generations live on separate branches: `v1` (TinySoundFont) and `v2`
   SSV2 by Savrien.
 - The per-key voice cap (`voices.per_key_voice_cap`) and block-granular event
   dispatch (`synth.block_timing`) are modelled on syndrv.
-- Dropping obsolete low-priority notes when a backend cannot keep up (the
-  Priority overload mode) is inspired by Kiva.
+- Kiva (Arduano, open source) is used to test the BASSMIDI prerender shim. No
+  Kiva code is used here.
 - The KDMAPI-compatible exports and the single-header integration file follow
   OmniMIDI and KDMAPI.
 - BASSMIDI (Un4seen Developments) is the reference the admission, ranking and
-  offline modes were measured against; v1 was built on TinySoundFont (Bernhard
-  Schelling).
+  offline modes were measured against. The v1 branch was built on
+  TinySoundFont (Bernhard Schelling); v3 does not use it.
 - Dear ImGui (Omar Cornut and contributors) and nlohmann/json (Niels Lohmann).
+- Everyone who tested the software and sent suggestions.
 
 ## License
 
