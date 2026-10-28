@@ -2,6 +2,9 @@
 #define SVMS_VOICE_MANAGER_H
 
 #include "synth/Types.h"
+#if defined(SVMS_NOTE_TRACE)
+#include "synth/NoteTrace.h"
+#endif
 #include "render/Envelope.h"
 #include "render/PhaseRotation.h"
 #include "synth/LiveControl.h"

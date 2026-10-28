@@ -472,6 +472,11 @@ inline void VoiceManager::ConfigureVoice(
         CommitVoiceConfiguration(handle);
     else
         UpdateStealCandidate(handle);
+#if defined(SVMS_NOTE_TRACE)
+    if (g_noteTrace)
+        g_noteTrace->OnLaunch(handle, v.playIndex[handle], v.channel[handle],
+                              v.note[handle], v.velocity[handle], currentFrame_);
+#endif
     if (voiceConfiguredHook_)
         voiceConfiguredHook_(handle, voiceConfiguredUserData_);
 }
@@ -864,6 +869,11 @@ SVMS_VM_FORCEINLINE bool VoiceManager::TryLaunchSingleVoiceInPlace(
     }
 #endif
     outHandle = handle;
+#if defined(SVMS_NOTE_TRACE)
+    if (g_noteTrace)
+        g_noteTrace->OnLaunch(handle, v.playIndex[handle], v.channel[handle],
+                              v.note[handle], v.velocity[handle], currentFrame_);
+#endif
     if (voiceConfiguredHook_)
         voiceConfiguredHook_(handle, voiceConfiguredUserData_);
     return true;

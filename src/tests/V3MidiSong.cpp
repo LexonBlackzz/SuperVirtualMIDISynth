@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,9 @@ struct Options {
     std::wstring soundfontPath;
     std::wstring dllPath;
     std::wstring wavPath;
+    uint32_t dropVelBelow = 0u;       // listening experiment: remove notes below this velocity
+    double dropLenBelowMs = 0.0;      // ... and notes shorter than this
+    std::wstring noteTracePath;       // write the per-note fate table (offline)
     bool realtime = false;
     bool audible = false;
     bool verbose = false;
@@ -111,6 +115,12 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.dllPath = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--wav") == 0 && hasValue) {
             options.wavPath = WArg(argv[++i]);
+        } else if (std::strcmp(arg, "--drop-vel-below") == 0 && hasValue) {
+            options.dropVelBelow = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(arg, "--drop-len-below-ms") == 0 && hasValue) {
+            options.dropLenBelowMs = std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--note-trace") == 0 && hasValue) {
+            options.noteTracePath = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--tuning-edo") == 0 && hasValue) {
             options.tuningEdo = static_cast<uint32_t>(std::atoi(argv[++i]));
             if (options.tuningEdo != 12u && options.tuningEdo != 31u) return false;
@@ -408,6 +418,50 @@ bool LoadSongFile(const wchar_t* path, uint32_t repetitions,
 
 void TrimSongStart(double startSeconds, DecodedSong& song);
 
+// Listening experiment: removes whole classes of notes (and their note-offs)
+// before the render, to hear which ones the sound depends on.
+void DropNoteClasses(const Options& options, DecodedSong& song) {
+    if (options.dropVelBelow == 0u && options.dropLenBelowMs <= 0.0) return;
+    std::vector<uint8_t> drop(song.events.size(), 0u);
+    std::vector<std::deque<size_t>> open(2048u);
+    const uint64_t minFrames =
+        static_cast<uint64_t>(options.dropLenBelowMs * 44.1);
+    for (size_t i = 0u; i < song.events.size(); ++i) {
+        const svms::PackedMidiEvent& event = song.events[i];
+        const uint8_t status = static_cast<uint8_t>(event.message);
+        const uint8_t type = status & 0xf0u;
+        if (type != 0x80u && type != 0x90u) continue;
+        const uint8_t note = static_cast<uint8_t>(event.message >> 8);
+        const uint8_t velocity = static_cast<uint8_t>(event.message >> 16);
+        const uint16_t key = static_cast<uint16_t>(((status & 0x0fu) << 7) | note);
+        if (type == 0x90u && velocity != 0u) {
+            if (velocity < options.dropVelBelow) drop[i] = 1u;
+            open[key].push_back(i);
+        } else if (!open[key].empty()) {
+            const size_t on = open[key].front();
+            open[key].pop_front();
+            const uint64_t length = event.outputFrame - song.events[on].outputFrame;
+            if (drop[on] != 0u || length < minFrames) drop[on] = drop[i] = 1u;
+        }
+    }
+    size_t kept = 0u;
+    uint64_t droppedOns = 0u;
+    for (size_t i = 0u; i < song.events.size(); ++i) {
+        if (drop[i] != 0u) {
+            const uint8_t status = static_cast<uint8_t>(song.events[i].message);
+            if ((status & 0xf0u) == 0x90u &&
+                static_cast<uint8_t>(song.events[i].message >> 16) != 0u)
+                ++droppedOns;
+            continue;
+        }
+        song.events[kept++] = song.events[i];
+    }
+    song.events.resize(kept);
+    song.noteOns -= (std::min)(song.noteOns, droppedOns);
+    std::printf("[drop] removed %llu note-ons, %zu events left\n",
+                static_cast<unsigned long long>(droppedOns), kept);
+}
+
 bool LoadSong(const Options& options, DecodedSong& song, std::string& error) {
     if (!options.midiPath.empty()) {
         const uint64_t keepStart = static_cast<uint64_t>(
@@ -418,6 +472,7 @@ bool LoadSong(const Options& options, DecodedSong& song, std::string& error) {
         if (!LoadSongFile(options.midiPath.c_str(), options.repeat,
                           song, error, keepStart, keepEnd)) return false;
         TrimSongStart(options.startSeconds, song);
+        DropNoteClasses(options, song);
         return true;
     }
     // Built-in piece: compose to a temp file so the real decoder parses it.
@@ -581,6 +636,96 @@ svms::RenderBackend ParseBackend(const std::string& name) {
     return svms::RenderBackend::AVX512;
 }
 
+#if defined(SVMS_NOTE_TRACE)
+// One row per note-on: when it starts, when its note-off arrives, whether the
+// engine launched a voice for it and the frame a steal cut that voice.  Rows
+// are in event order; a note-on shares its result with every note-on of the
+// same key on the same frame.
+struct NoteRow {
+    uint32_t frame;
+    uint32_t off;        // note-off frame, UINT32_MAX if none inside the run
+    uint32_t cut;        // steal frame, UINT32_MAX if never cut
+    uint16_t key;        // channel << 7 | note
+    uint8_t velocity;
+    uint8_t launches;    // voices launched for this note-on (0 = not heard)
+};
+static_assert(sizeof(NoteRow) == 16, "note table row layout");
+
+bool WriteNoteTable(const DecodedSong& song, const svms::NoteTrace& trace,
+                    const wchar_t* path) {
+    std::vector<NoteRow> rows;
+    rows.reserve(static_cast<size_t>(song.noteOns));
+    std::vector<std::deque<uint32_t>> open(2048u);
+    for (const svms::PackedMidiEvent& event : song.events) {
+        const uint8_t status = static_cast<uint8_t>(event.message);
+        const uint8_t type = status & 0xf0u;
+        if (type != 0x80u && type != 0x90u) continue;
+        const uint8_t note = static_cast<uint8_t>(event.message >> 8);
+        const uint8_t velocity = static_cast<uint8_t>(event.message >> 16);
+        const uint16_t key = static_cast<uint16_t>(((status & 0x0fu) << 7) | note);
+        if (type == 0x90u && velocity != 0u) {
+            open[key].push_back(static_cast<uint32_t>(rows.size()));
+            rows.push_back({static_cast<uint32_t>(event.outputFrame),
+                            UINT32_MAX, UINT32_MAX, key, velocity, 0u});
+        } else if (!open[key].empty()) {
+            rows[open[key].front()].off = static_cast<uint32_t>(event.outputFrame);
+            open[key].pop_front();
+        }
+    }
+
+    const std::vector<svms::NoteTrace::Launch>& launches = trace.launches;
+    std::vector<svms::NoteTrace::Launch> group;
+    size_t li = 0u;
+    for (size_t a = 0u; a < rows.size();) {
+        size_t b = a;
+        while (b < rows.size() && rows[b].frame == rows[a].frame) ++b;
+        const uint32_t frame = rows[a].frame;
+        while (li < launches.size() && launches[li].frame < frame) ++li;
+        size_t le = li;
+        while (le < launches.size() && launches[le].frame == frame) ++le;
+        group.assign(launches.begin() + li, launches.begin() + le);
+        std::sort(group.begin(), group.end(),
+                  [](const svms::NoteTrace::Launch& x,
+                     const svms::NoteTrace::Launch& y) { return x.key < y.key; });
+        for (size_t r = a; r < b; ++r) {
+            uint32_t count = 0u, cut = UINT32_MAX;
+            auto it = std::lower_bound(
+                group.begin(), group.end(), rows[r].key,
+                [](const svms::NoteTrace::Launch& x, uint16_t k) { return x.key < k; });
+            for (; it != group.end() && it->key == rows[r].key; ++it) {
+                ++count;
+                cut = (std::min)(cut, it->cut);
+            }
+            rows[r].launches = static_cast<uint8_t>((std::min)(count, 255u));
+            rows[r].cut = cut;
+        }
+        li = le;
+        a = b;
+    }
+
+    uint64_t unheard = 0u, cutEarly = 0u, zeroLife = 0u;
+    for (const NoteRow& row : rows) {
+        if (row.launches == 0u) { ++unheard; continue; }
+        if (row.cut != UINT32_MAX) {
+            if (row.cut == row.frame) ++zeroLife;
+            if (row.cut < row.off) ++cutEarly;
+        }
+    }
+    std::printf("[note-trace] noteOns=%zu launches=%zu notLaunched=%llu "
+                "cutBeforeNoteOff=%llu zeroLife=%llu\n",
+                rows.size(), launches.size(),
+                static_cast<unsigned long long>(unheard),
+                static_cast<unsigned long long>(cutEarly),
+                static_cast<unsigned long long>(zeroLife));
+
+    FILE* file = _wfopen(path, L"wb");
+    if (file == nullptr) return false;
+    const bool ok = std::fwrite(rows.data(), sizeof(NoteRow), rows.size(), file) ==
+                    rows.size();
+    return std::fclose(file) == 0 && ok;
+}
+#endif
+
 bool RunOffline(const Options& options, const DecodedSong& song,
                 const std::wstring& soundfont, OfflineResult& out) {
     svms::StandaloneSynthConfig config{};
@@ -637,6 +782,10 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     std::vector<svms::RealtimeEvent> blockBatch;
     uint64_t peakActive = 0u, peakTails = 0u;
     float audioPeak = 0.0f;
+#if defined(SVMS_NOTE_TRACE)
+    svms::NoteTrace noteTrace;
+    if (!options.noteTracePath.empty()) svms::g_noteTrace = &noteTrace;
+#endif
 
     while (frame < totalFrames) {
         const uint32_t n = static_cast<uint32_t>(
@@ -761,6 +910,14 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     }
 #endif
 
+#if defined(SVMS_NOTE_TRACE)
+    svms::g_noteTrace = nullptr;
+    if (!options.noteTracePath.empty() &&
+        !WriteNoteTable(song, noteTrace, options.noteTracePath.c_str())) {
+        out.error = "cannot write the note trace";
+        return false;
+    }
+#endif
     if (eventIndex != eventCount) {
         out.error = "not all MIDI events were dispatched";
         return false;

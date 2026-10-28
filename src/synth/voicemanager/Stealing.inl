@@ -114,6 +114,10 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     // victim's dense arrays: a victim launched earlier in this plan must have
     // its record applied first.
     EnsureMaterialized(handle);
+#if defined(SVMS_NOTE_TRACE)
+    if (g_noteTrace)
+        g_noteTrace->OnSteal(handle, v.playIndex[handle], currentFrame_);
+#endif
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t tailBegin = BeginLaunchStageForTest();
     if (launchTestContext_.active)

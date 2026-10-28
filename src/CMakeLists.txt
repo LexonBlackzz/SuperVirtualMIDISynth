@@ -1516,7 +1516,7 @@ if(SVMS_BUILD_TESTS)
             render/RenderKernelsSSE2.cpp
             render/RenderKernelsAVX2.cpp)
         target_compile_definitions(svms_v3_midi_song PRIVATE
-            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+            SVMS_NOTE_TRACE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
             _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_v3_midi_song PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -1655,7 +1655,7 @@ if(SVMS_BUILD_TESTS)
             render/RenderKernelsAVX2.cpp)
         add_executable(svms_v3_midi_song ${SVMS_MIDI_SONG_SOURCES})
         target_compile_definitions(svms_v3_midi_song PRIVATE
-            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+            SVMS_NOTE_TRACE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
             _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_v3_midi_song PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}"
