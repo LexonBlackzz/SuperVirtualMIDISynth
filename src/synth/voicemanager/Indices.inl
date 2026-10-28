@@ -81,7 +81,7 @@ inline float VoiceManager::ComputeEffectiveStealLevel(
     const uint8_t stage = v.envelopeStage[handle];
     const bool preDecay =
         v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
-        (decayBlind_ || stage == 4u || stage == 0u || stage == 1u);
+        (stage == 4u || stage == 0u || stage == 1u);
     const float envelopeGain = preDecay
         ? v.targetGain[handle] : v.currentGain[handle];
     return std::fabs(envelopeGain) * outputGain;
@@ -95,7 +95,7 @@ inline float VoiceManager::ComputeStealScore(uint32_t idx) const {
     const float ageUnits = static_cast<float>(GetVoiceAge(
         static_cast<VoiceHandle>(idx))) * stealAgeScale_;
     float level = ComputeEffectiveStealLevel(static_cast<VoiceHandle>(idx));
-    if (priorityPolicy_) level *= StealLaneFactor(static_cast<VoiceHandle>(idx));
+    if (sampledSteal_) level *= StealLaneFactor(static_cast<VoiceHandle>(idx));
     return ageUnits - level * kBassMidiStealGainScale;
 }
 
@@ -295,7 +295,7 @@ inline void VoiceManager::UnlinkChannelKey(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     const uint8_t ch = v.channel[handle];
     const uint8_t nt = v.note[handle];
-    if (priorityPolicy_) lastUnlinkedByKey_[ch][nt] = static_cast<int32_t>(handle);
+    if (sampledSteal_) lastUnlinkedByKey_[ch][nt] = static_cast<int32_t>(handle);
     const int32_t previous = v.prevChannelKeyVoice[handle];
     const int32_t next = v.nextChannelKeyVoice[handle];
     if (previous >= 0) {

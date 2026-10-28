@@ -104,6 +104,9 @@ struct ConfigValues {
     // Experimental: skip the steal-fade tail of voices stolen on their birth
     // frame and launch chains of such steals lazily (needs restart).
     bool dropZeroLifeVictims = false;
+    // Experimental: pick steal victims from a bounded sample of voices instead
+    // of the quietest one (needs restart).
+    bool sampledSteal = false;
     // Experimental: stage steal relaunches in launch records and defer the
     // victims' ghost copies to the render workers (needs restart).
     bool launchStaging = false;

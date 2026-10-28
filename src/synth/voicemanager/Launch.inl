@@ -684,7 +684,7 @@ inline float VoiceManager::ComputeNewbornStableStealKey(
     const float outputGain = v.stealOutputGain[handle];
     float effectiveLevel =
         std::fabs(v.targetGain[handle]) * outputGain;
-    if (priorityPolicy_) effectiveLevel *= StealLaneFactor(handle);
+    if (sampledSteal_) effectiveLevel *= StealLaneFactor(handle);
     const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
     const float commonAgeScore =
         static_cast<float>(currentFrame_) * stealAgeScale_;
@@ -1224,7 +1224,7 @@ inline bool VoiceManager::TryLazyGroupLaunch(
             mixGainL * mixGainL + mixGainR * mixGainR);
         float effectiveLevel = std::fabs(setups[i].initialGain) *
             outputGain;
-        if (priorityPolicy_)
+        if (sampledSteal_)
             effectiveLevel *= StealLaneFactorFor(velocity, note, true);
         const float score = 0.0f - effectiveLevel * kBassMidiStealGainScale;
         p.scores[i] = score;
@@ -1375,22 +1375,33 @@ inline bool VoiceManager::LaunchVoiceGroup(
         count > voiceLimit_)
         return false;
     if (count > launchLayersHighWater_) launchLayersHighWater_ = count;
-    // Priority policy: a full pool first recycles an older sustained voice on
-    // the same key, before any other victim is considered.
+    // Sampled stealing: a full pool first recycles an older sustained voice on
+    // the same key, then takes the cheapest of a bounded sample.
     VoiceHandle recycleVictim = kInvalidVoice;
-    if (priorityPolicy_) {
+    if (sampledSteal_) {
         if (pendingLaunch_.valid) CommitPendingLaunchImpl();
         if (freeTop_ == 0u && activeCount_ >= voiceLimit_ &&
-            perKeyVoiceCap_ == 0u)
-            recycleVictim = SameKeyRecycleVictim(
-                channel, note, velocity,
-                NewbornStealLevel(setups, count, channelParams, multiplicity));
+            perKeyVoiceCap_ == 0u) {
+            const float newLevel =
+                NewbornStealLevel(setups, count, channelParams, multiplicity);
+            recycleVictim = SameKeyRecycleVictim(channel, note, velocity,
+                                                 newLevel);
+            if (recycleVictim == kInvalidVoice) {
+                recycleVictim = SampledVictim(newLevel, playIndex);
+                if (recycleVictim == kInvalidVoice) {
+                    // Nothing cheap enough in the sample: the note is dropped.
+                    lastLaunchRejected_ = true;
+                    ++stealRejectCount_;
+                    return false;
+                }
+            }
+        }
     }
     const PriorityIncoming incoming{channel, note, velocity};
     if (recycleVictim == kInvalidVoice &&
-        (priorityPolicy_ || stealReject_.load(std::memory_order_relaxed)) &&
+        (sampledSteal_ || stealReject_.load(std::memory_order_relaxed)) &&
         ShouldRejectNoteOn(setups, count, channelParams, multiplicity,
-                           priorityPolicy_ ? &incoming : nullptr)) {
+                           sampledSteal_ ? &incoming : nullptr)) {
         // Pairing note-offs sees no voice for this generation, exactly as if
         // the note had been launched and stolen before it rendered.
         lastLaunchRejected_ = true;

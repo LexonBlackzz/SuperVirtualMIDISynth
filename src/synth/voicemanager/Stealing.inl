@@ -687,6 +687,50 @@ inline float VoiceManager::NewbornStealLevel(
     return level;
 }
 
+// Cheapest voice among a bounded sample, walked from a cursor that persists
+// between calls.  The sample shrinks as the pool fills (512 voices below 96%,
+// 320 to 98.5%, 192 to 99%, 128 above), so a saturated pool pays a small, flat
+// cost per steal.  A candidate must not be louder than the new note; releasing
+// voices count at 45% of their level; voices still in delay/hold/attack and the
+// last 96 launches (unless releasing) are protected.
+inline VoiceHandle VoiceManager::SampledVictim(float newLevel,
+                                               uint32_t playIndex) {
+    const uint32_t count = activeCount_;
+    if (count == 0u || voiceLimit_ == 0u) return kInvalidVoice;
+    const uint64_t permille = static_cast<uint64_t>(count) * 1000u / voiceLimit_;
+    uint32_t budget = count > 1920u ? count / 10u : 192u;
+    if (permille > 940u) budget = (std::max)(budget, count / 8u);
+    const uint32_t cap = permille > 990u ? 128u
+                       : permille > 985u ? 192u
+                       : permille > 960u ? 320u : 512u;
+    budget = (std::min)((std::min)(budget, cap), count);
+    uint32_t cursor = sampleCursor_ < count ? sampleCursor_ : 0u;
+    float best = std::numeric_limits<float>::max();
+    VoiceHandle bestHandle = kInvalidVoice;
+    for (uint32_t i = 0u; i < budget; ++i) {
+        const VoiceHandle h = static_cast<VoiceHandle>(activeList_[cursor]);
+        if (++cursor >= count) cursor = 0u;
+        const uint8_t state = v.state[h];
+        if (state == static_cast<uint8_t>(VoiceState::Free)) continue;
+        const bool releasing = state == static_cast<uint8_t>(VoiceState::Releasing);
+        if (!releasing) {
+            const uint8_t stage = v.envelopeStage[h];
+            if (stage == 4u || stage == 0u || stage == 1u) continue;
+            if (playIndex - v.playIndex[h] < 96u) continue;
+        }
+        float level = ComputeEffectiveStealLevel(h);
+        if (releasing) level *= 0.45f;
+        if (level > newLevel) continue;
+        if (level < best) {
+            best = level;
+            bestHandle = h;
+            if (level < 1.5258789e-07f) break;
+        }
+    }
+    sampleCursor_ = cursor;
+    return bestHandle;
+}
+
 inline VoiceHandle VoiceManager::SameKeyRecycleVictim(
     uint8_t channel, uint8_t note, uint8_t velocity, float newLevel) const {
     // A release tail left on this key goes first once it is quiet enough.
@@ -694,9 +738,8 @@ inline VoiceHandle VoiceManager::SameKeyRecycleVictim(
     if (tail >= 0 && static_cast<uint32_t>(tail) < maxVoices_ &&
         v.state[tail] == static_cast<uint8_t>(VoiceState::Releasing) &&
         v.channel[tail] == channel && v.note[tail] == note &&
-        (priorityStrong_ ||
-         ComputeEffectiveStealLevel(static_cast<VoiceHandle>(tail)) <=
-            0.8f * newLevel))
+        ComputeEffectiveStealLevel(static_cast<VoiceHandle>(tail)) <=
+            0.8f * newLevel)
         return static_cast<VoiceHandle>(tail);
     const int32_t oldest = channelKeyVoiceOldest_[channel][note];
     if (oldest < 0) return kInvalidVoice;
@@ -707,7 +750,7 @@ inline VoiceHandle VoiceManager::SameKeyRecycleVictim(
     const uint8_t stage = v.envelopeStage[h];
     if (stage == 4u || stage == 0u || stage == 1u) return kInvalidVoice;
     if (v.velocity[h] > velocity) return kInvalidVoice;
-    if (!priorityStrong_ && !(ComputeEffectiveStealLevel(h) < 0.5f * newLevel))
+    if (!(ComputeEffectiveStealLevel(h) < 0.5f * newLevel))
         return kInvalidVoice;
     return h;
 }
@@ -1070,8 +1113,7 @@ inline void VoiceManager::BuildVolatileStealHeap() {
     stealVolatileHeapCount_ = 0u;
     bool vectorized = false;
 #if !defined(SVMS_XP_COMPAT)
-    if (stealKeyBackend_ == RenderBackend::AVX2 && !priorityPolicy_ &&
-        !decayBlind_ &&
+    if (stealKeyBackend_ == RenderBackend::AVX2 && !sampledSteal_ &&
         stealVolatileCount_ >= 8u) {
         constexpr uint32_t kParallelMinCandidates = 32768u;
         constexpr uint32_t kParallelChunk = 16384u;
@@ -1138,12 +1180,9 @@ inline void VoiceManager::BuildVolatileStealHeap() {
                 ? UINT32_MAX : static_cast<uint32_t>(rawAge);
             const float ageUnits =
                 static_cast<float>(age) * stealAgeScale_;
-            float effectiveLevel = std::fabs(
-                (decayBlind_ &&
-                 v.state[handle] == static_cast<uint8_t>(VoiceState::Active))
-                    ? v.targetGain[handle] : v.currentGain[handle]) *
+            float effectiveLevel = std::fabs(v.currentGain[handle]) *
                 v.stealOutputGain[handle];
-            if (priorityPolicy_) effectiveLevel *= StealLaneFactor(handle);
+            if (sampledSteal_) effectiveLevel *= StealLaneFactor(handle);
             const float score = ageUnits -
                 effectiveLevel * kBassMidiStealGainScale;
             stealVolatileHeapKey_[position] = EncodeStableWinnerKey(

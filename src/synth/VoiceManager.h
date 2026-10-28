@@ -59,32 +59,18 @@ inline bool StealIndexBucketsRequested() noexcept {
     static const bool env = std::getenv("SVMS_STEAL_INDEX") != nullptr;
     return env || g_stealIndexBuckets.load(std::memory_order_relaxed);
 }
-// Velocity-lane stealing (env SVMS_STEAL_PRIORITY).  A sustained voice is only
-// replaced by a note from a strictly higher velocity lane, released tails go
-// first, low sustained keys and voices still in their attack are protected, and
-// a note that finds only protected victims is dropped instead of cutting one.
-// Config voices.steal_priority: 0 off, 1 lanes, 2 lanes + unconditional same-key
-// recycling.  The environment variable of the same name overrides it.
-inline std::atomic<uint32_t> g_stealPriority{0u};
-inline uint32_t StealPriorityMode() noexcept {
-    static const int env = [] {
-        const char* value = std::getenv("SVMS_STEAL_PRIORITY");
-        if (value == nullptr) return 0;
-        return value[0] == '2' ? 2 : 1;
-    }();
-    return env != 0 ? static_cast<uint32_t>(env)
-                    : g_stealPriority.load(std::memory_order_relaxed);
-}
-inline bool StealPriorityRequested() noexcept { return StealPriorityMode() != 0u; }
-inline bool StealPriorityStrong() noexcept { return StealPriorityMode() == 2u; }
-// Decay-blind ranking (env SVMS_STEAL_DECAYBLIND): a voice that has not been
-// released is ranked by its peak level, so a note does not become the cheapest
-// victim just because its envelope has decayed; released voices still rank by
-// their current level.
-inline std::atomic<bool> g_stealDecayBlind{false};  // config voices.steal_decay_blind
-inline bool StealDecayBlindRequested() noexcept {
-    static const bool env = std::getenv("SVMS_STEAL_DECAYBLIND") != nullptr;
-    return env || g_stealDecayBlind.load(std::memory_order_relaxed);
+// Sampled stealing (config voices.sampled_steal, env SVMS_SAMPLED_STEAL).  On a
+// full pool a note takes a free slot, else a release tail or older voice on its
+// own key, else the cheapest of a bounded sample of voices from a rotating
+// cursor (never one louder than the note itself, never one of the last 96
+// launches unless it is already releasing); when nothing qualifies the note is
+// dropped.  A sustained voice is only replaced by a note from a strictly higher
+// velocity lane, and low keys and voices still in their attack are protected.
+// Off by default: the quietest-first ranking stays the standard.
+inline std::atomic<bool> g_sampledSteal{false};
+inline bool SampledStealRequested() noexcept {
+    static const bool env = std::getenv("SVMS_SAMPLED_STEAL") != nullptr;
+    return env || g_sampledSteal.load(std::memory_order_relaxed);
 }
 // Velocity lane 0..5 (thresholds follow velocity^1.7 against 0.22/0.35/0.50/0.62/0.78).
 SVMS_VM_FORCEINLINE uint32_t StealLaneOfVelocity(uint32_t velocity) noexcept {
@@ -1287,9 +1273,9 @@ private:
     // block); the bucket sets only order them.  The releasing ring is unused
     // in this mode.
     bool bucketSteal_ = false;
-    bool priorityPolicy_ = false;
-    bool decayBlind_ = false;
-    bool priorityStrong_ = false;
+    bool sampledSteal_ = false;
+    uint32_t sampleCursor_ = 0u;
+    VoiceHandle SampledVictim(float newLevel, uint32_t playIndex);
     bool bucketFront_ = false;   // re-arming popped victims: back to the head
     StealBucketSet stableBuckets_;
     StealBucketSet volBuckets_;
@@ -1329,7 +1315,7 @@ private:
     float NewbornStealLevel(const VoiceConfiguration* setups, uint32_t count,
                             const ChannelParamsSnapshot& cp,
                             uint32_t multiplicity) const;
-    // Priority policy: the oldest sustained voice on this key, when it may be
+    // Sampled stealing: the oldest sustained voice on this key, when it may be
     // recycled for the new note (not louder, past its attack, decayed under
     // half the new level); kInvalidVoice otherwise.
     VoiceHandle SameKeyRecycleVictim(uint8_t channel, uint8_t note,
