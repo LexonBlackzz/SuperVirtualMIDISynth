@@ -67,6 +67,7 @@ inline bool StealIndexBucketsRequested() noexcept {
 // dropped.  A sustained voice is only replaced by a note from a strictly higher
 // velocity lane, and low keys and voices still in their attack are protected.
 // Off by default: the quietest-first ranking stays the standard.
+// Credit: the approach follows the voice stealing in SSV2 by Savrien.
 inline std::atomic<bool> g_sampledSteal{false};
 inline bool SampledStealRequested() noexcept {
     static const bool env = std::getenv("SVMS_SAMPLED_STEAL") != nullptr;

@@ -141,6 +141,11 @@ limiting, native-API ABI compatibility, configuration profiles and multi-process
 Earlier generations live on separate branches: `v1` (TinySoundFont) and `v2`
 (BASSMIDI). `v3` is the current code.
 
+## Credits
+
+- Sampled voice stealing (`voices.sampled_steal`) follows the voice stealing in
+  SSV2 by Savrien.
+
 ## License
 
 GNU General Public License v3, see [LICENSE](LICENSE). Vendored dependencies keep

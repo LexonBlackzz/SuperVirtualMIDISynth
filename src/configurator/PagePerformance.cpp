@@ -524,7 +524,7 @@ void CpuCard(ConfigDocument& doc) {
     }
     {
         ui::BeginRow("sampledSteal", "Sampled voice stealing (experimental)",
-                     "When the voice pool is full, a new note replaces the cheapest voice in a rotating sample of the pool instead of the single quietest one, and is dropped if nothing in the sample is quiet enough. Keeps more fidelity in dense black MIDIs at higher voice limits; slower than the default. Needs a restart.",
+                     "When the voice pool is full, a new note replaces the cheapest voice in a rotating sample of the pool instead of the single quietest one, and is dropped if nothing in the sample is quiet enough. Keeps more fidelity in dense black MIDIs at higher voice limits; slower than the default. Based on the voice stealing in SSV2 by Savrien. Needs a restart.",
                      ImVec2(46.0f * s, 28.0f * s));
         if (ui::Toggle("##sampledsteal", &w.sampledSteal)) doc.MarkDirty();
         ui::EndRow();

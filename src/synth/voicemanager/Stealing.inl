@@ -687,6 +687,9 @@ inline float VoiceManager::NewbornStealLevel(
     return level;
 }
 
+// Credit: this sampling scheme (a bounded probe from a rotating cursor, a
+// budget that shrinks as the pool fills, protection for the newest launches)
+// follows the voice stealing in SSV2 by Savrien.
 // Cheapest voice among a bounded sample, walked from a cursor that persists
 // between calls.  The sample shrinks as the pool fills (512 voices below 96%,
 // 320 to 98.5%, 192 to 99%, 128 above), so a saturated pool pays a small, flat
