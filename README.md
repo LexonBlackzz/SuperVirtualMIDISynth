@@ -145,6 +145,16 @@ Earlier generations live on separate branches: `v1` (TinySoundFont) and `v2`
 
 - Sampled voice stealing (`voices.sampled_steal`) follows the voice stealing in
   SSV2 by Savrien.
+- The per-key voice cap (`voices.per_key_voice_cap`) and block-granular event
+  dispatch (`synth.block_timing`) are modelled on syndrv.
+- Dropping obsolete low-priority notes when a backend cannot keep up (the
+  Priority overload mode) is inspired by Kiva.
+- The KDMAPI-compatible exports and the single-header integration file follow
+  OmniMIDI and KDMAPI.
+- BASSMIDI (Un4seen Developments) is the reference the admission, ranking and
+  offline modes were measured against; v1 was built on TinySoundFont (Bernhard
+  Schelling).
+- Dear ImGui (Omar Cornut and contributors) and nlohmann/json (Niels Lohmann).
 
 ## License
 
