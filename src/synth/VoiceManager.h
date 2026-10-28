@@ -507,6 +507,27 @@ public:
         stealReject_.store(on, std::memory_order_relaxed);
     }
     uint64_t StealRejectCount() const { return stealRejectCount_; }
+    bool StealRejectEnabled() const {
+        return stealReject_.load(std::memory_order_relaxed);
+    }
+    // Early admission: the level a launch of these setups would start at, and
+    // the reject decision from a level remembered for the same note under
+    // unchanged channel state, so a skipped note never builds its setups.  Not
+    // used with sampled stealing, which makes its own admission decision.
+    float QueryNewbornLevel(const VoiceConfiguration* setups, uint32_t count,
+                            const ChannelParamsSnapshot& cp,
+                            uint32_t multiplicity) const {
+        return NewbornStealLevel(setups, count, cp, multiplicity);
+    }
+    bool RejectByNewbornLevel(uint32_t count, float level) {
+        if (sampledSteal_ || !stealReject_.load(std::memory_order_relaxed))
+            return false;
+        if (!RejectNoteOnWith(count, [level]() { return level; }, nullptr))
+            return false;
+        lastLaunchRejected_ = true;
+        ++stealRejectCount_;
+        return true;
+    }
     // Opt-in (default off) BASSMIDI 2018 victim ranking: the steal score has no age
     // term (KMC 18.2.8's bassmidi.dll ranks voices by level alone, and an equal-level
     // newcomer loses). Pair with SetStealReject. Call before the pool is used.
@@ -1276,6 +1297,9 @@ private:
     bool bucketSteal_ = false;
     bool sampledSteal_ = false;
     uint32_t sampleCursor_ = 0u;
+    // Loudest note a scan has already failed to place on sampleFailFrame_.
+    uint64_t sampleFailFrame_ = UINT64_MAX;
+    float sampleFailLevel_ = 0.0f;
     VoiceHandle SampledVictim(float newLevel, uint32_t playIndex);
     bool bucketFront_ = false;   // re-arming popped victims: back to the head
     StealBucketSet stableBuckets_;
@@ -1312,6 +1336,9 @@ private:
                             const ChannelParamsSnapshot& cp,
                             uint32_t multiplicity,
                             const PriorityIncoming* incoming = nullptr);
+    template <typename LevelFn>
+    bool RejectNoteOnWith(uint32_t count, LevelFn&& levelOf,
+                          const PriorityIncoming* incoming);
     // Level a launch would start at (what ShouldRejectNoteOn compares).
     float NewbornStealLevel(const VoiceConfiguration* setups, uint32_t count,
                             const ChannelParamsSnapshot& cp,

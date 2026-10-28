@@ -302,6 +302,7 @@ public:
 
     // font 0 = automatic, N = stack entry N (1-based) answers the channel first.
     bool SetChannelSoundFont(uint8_t channel, uint32_t font) {
+        ++levelEpoch_;
         if (channel >= kChannelCount || font > banks_.size()) return false;
         channelFont_[channel] = uint8_t(font);
         RefreshPreset(channel);
@@ -629,6 +630,7 @@ public:
     }
 
     void ResetAll(uint64_t absoluteFrame) {
+        ++levelEpoch_;
         noteOnCollapse_.ResetAll();
         coalescedNoteOns_ = 0;
         reExcitedNoteOns_ = 0;
@@ -650,6 +652,7 @@ public:
     // Live parameter changes. Audio-thread only (call between blocks): the
     // control thread parks the request and the render loop applies it.
     void SetMasterVolume(float volume) {
+        ++levelEpoch_;
         master_ = volume;
         channels_.SetMasterVolume(master_ * sysexMasterVolume_);
         channels_.RebuildCache(cfg_, static_cast<float>(rate_));
@@ -758,6 +761,14 @@ private:
     uint32_t tuningEdo_ = 12u;
     bool releaseAll_ = false;     // BASSMIDI 2018: a note-off frees every generation on the key
     bool rejectPairing_ = false;  // see OutcomeTrack in NoteOn
+    // Newborn level remembered per (channel, note, velocity) while nothing that
+    // changes it has happened (levelEpoch_ counts controls, programs, bends,
+    // sysex, resets, volume and bank changes), so a note the full pool would
+    // skip anyway never builds its setups.  Only used with steal reject.
+    struct NewbornMemo { uint32_t key; uint32_t epoch; float level; };
+    static constexpr uint32_t kNewbornMemoBits = 14u;
+    std::vector<NewbornMemo> newbornMemo_;
+    uint32_t levelEpoch_ = 1u;
     bool lastNoteLaunched_ = false;
     std::vector<std::deque<uint8_t>> keyOutcome_;
 
@@ -971,6 +982,7 @@ private:
         hilbertData_ = std::move(hilbert);
         sampleFrames_ = uint32_t(frames);
         prepared_.assign(size_t(regions), PreparedRegion{});
+        ++levelEpoch_;
         for (RegionCacheEntry& e : regionCache_) e = RegionCacheEntry{};
         for (uint8_t& f : selFont_) f = 0;
         for (uint8_t& f : channelFont_) if (f > banks_.size()) f = 0;
@@ -978,6 +990,7 @@ private:
     }
 
     void RebuildPrepared() {
+        ++levelEpoch_;
         for (const Bank& b : banks_)
             for (uint32_t i = 0; i < b.data->regionCount; ++i)
                 Prepare(b.data.get(), b.data->regions[i],
@@ -1066,6 +1079,25 @@ private:
         }
         if (playIndex_ == 0 || playIndex_ >= UINT32_MAX - 1) playIndex_ = 1;
         const uint32_t generation = playIndex_++;
+        NewbornMemo* memo = nullptr;
+        const uint32_t memoKey = (uint32_t(channel) << 14) |
+            (uint32_t(note) << 7) | (velocity & 127u);
+        if (multiplicity == 1u && voices_.StealRejectEnabled()) {
+            if (newbornMemo_.empty())
+                newbornMemo_.assign(size_t(1) << kNewbornMemoBits,
+                                    NewbornMemo{UINT32_MAX, 0u, 0.0f});
+            memo = &newbornMemo_[(memoKey * 2654435761u) >>
+                                 (32u - kNewbornMemoBits)];
+            if (memo->key == memoKey && memo->epoch == levelEpoch_ &&
+                voices_.RejectByNewbornLevel(count, memo->level)) {
+#if defined(_MSC_VER)
+                dispatchProfile.noteOnTotal += __rdtsc() - totalBegin;
+                ++dispatchProfile.noteOnCalls;
+#endif
+                ++notes_;
+                return;
+            }
+        }
         const float velocityGain = velGain_[velocity & 127u];
         const float bend = channels_.GetPitchBendSemitones(channel) +
             sysexMasterFineTune_ + sysexMasterTranspose_;
@@ -1119,6 +1151,15 @@ private:
                     ? uint16_t(region.offByClass) : 0u);
             voice.sampleBacked = 1;
         }
+        if (memo != nullptr && !(memo->key == memoKey && memo->epoch == levelEpoch_)) {
+            bool memoizable = true;
+            for (uint32_t i = 0; i < count; ++i)
+                memoizable = memoizable && launchSetups_[i].exclusiveClass == 0u;
+            if (memoizable)
+                *memo = NewbornMemo{memoKey, levelEpoch_,
+                    voices_.QueryNewbornLevel(launchSetups_, count,
+                                              channels_.GetParams()[channel], 1u)};
+        }
         // Production launch path: one transaction resolves the batched
         // victim selection once for the whole region group (layers feed on
         // freed sibling slots), instead of one full steal-transaction per
@@ -1171,6 +1212,7 @@ private:
     }
 
     void Control(uint8_t channel, uint8_t controller, uint8_t value) {
+        ++levelEpoch_;
 #if defined(_MSC_VER)
         const uint64_t controlBegin = __rdtsc();
 #endif
@@ -1228,6 +1270,7 @@ private:
     }
 
     void Program(uint8_t channel, uint8_t program) {
+        ++levelEpoch_;
         const uint8_t oldProgram = channels_.GetProgram(channel);
         channels_.ProgramChange(channel, program);
         uint32_t font = 0, preset = 0;
@@ -1242,6 +1285,7 @@ private:
     }
 
     void Bend(uint8_t channel, uint8_t low, uint8_t high) {
+        ++levelEpoch_;
 #if defined(_MSC_VER)
         const uint64_t bendBegin = __rdtsc();
 #endif
@@ -1271,6 +1315,7 @@ private:
     }
 
     void DispatchInternal(uint32_t message, uint64_t frame) {
+        ++levelEpoch_;
         if (message == kInternalResetMessage) {
             ResetAll(frame);
             return;

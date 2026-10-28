@@ -700,6 +700,11 @@ inline VoiceHandle VoiceManager::SampledVictim(float newLevel,
                                                uint32_t playIndex) {
     const uint32_t count = activeCount_;
     if (count == 0u || voiceLimit_ == 0u) return kInvalidVoice;
+    // A scan for a note at least this loud already found no voice on this very
+    // frame, and the pool has barely changed since: skip the scan.  On a flood
+    // most notes in a frame are the quiet ones, so this removes most scans.
+    if (sampleFailFrame_ == currentFrame_ && newLevel <= sampleFailLevel_)
+        return kInvalidVoice;
     const uint64_t permille = static_cast<uint64_t>(count) * 1000u / voiceLimit_;
     uint32_t budget = count > 1920u ? count / 10u : 192u;
     if (permille > 940u) budget = (std::max)(budget, count / 8u);
@@ -731,6 +736,14 @@ inline VoiceHandle VoiceManager::SampledVictim(float newLevel,
         }
     }
     sampleCursor_ = cursor;
+    if (bestHandle == kInvalidVoice) {
+        if (sampleFailFrame_ != currentFrame_) {
+            sampleFailFrame_ = currentFrame_;
+            sampleFailLevel_ = newLevel;
+        } else {
+            sampleFailLevel_ = (std::max)(sampleFailLevel_, newLevel);
+        }
+    }
     return bestHandle;
 }
 
@@ -758,15 +771,11 @@ inline VoiceHandle VoiceManager::SameKeyRecycleVictim(
     return h;
 }
 
-inline bool VoiceManager::ShouldRejectNoteOn(
-    const VoiceConfiguration* setups, uint32_t count,
-    const ChannelParamsSnapshot& cp, uint32_t multiplicity,
-    const PriorityIncoming* incoming) {
-    // A layered note is admitted or skipped as a whole, judged by its loudest
-    // layer (BASSMIDI judges each region voice alone; layers of one note share
-    // a level closely enough that the whole-note call is the same in practice).
-    for (uint32_t layer = 0u; layer < count; ++layer)
-        if (setups[layer].exclusiveClass != 0u) return false;
+// `levelOf` supplies the newborn level once a victim exists, so the setups need
+// not be built for a note that is skipped.
+template <typename LevelFn>
+inline bool VoiceManager::RejectNoteOnWith(uint32_t count, LevelFn&& levelOf,
+                                           const PriorityIncoming* incoming) {
     if (perKeyVoiceCap_ != 0u ||
         freeTop_ >= count || activeCount_ + count <= voiceLimit_ ||
         activeCount_ == 0u)
@@ -804,7 +813,7 @@ inline bool VoiceManager::ShouldRejectNoteOn(
     // Newborn score: age 0, level = |initialGain| * stereo energy norm of the
     // mix gains (what ApplyVoiceConfigurationFields caches as stealOutputGain,
     // merged-launch multiplicity included).
-    const float level = NewbornStealLevel(setups, count, cp, multiplicity);
+    const float level = levelOf();
     if (incoming != nullptr) {
         // Velocity-lane admission: the best victim decides.  A tail goes unless
         // it is much louder than the note; anything else needs a strictly
@@ -863,6 +872,21 @@ inline bool VoiceManager::ShouldRejectNoteOn(
     if (stealAgeScale_ == 0.0f)
         return newbornScore >= victimScore * (1.0f + 1e-5f);
     return newbornScore > victimScore;
+}
+
+inline bool VoiceManager::ShouldRejectNoteOn(
+    const VoiceConfiguration* setups, uint32_t count,
+    const ChannelParamsSnapshot& cp, uint32_t multiplicity,
+    const PriorityIncoming* incoming) {
+    // A layered note is admitted or skipped as a whole, judged by its loudest
+    // layer (BASSMIDI judges each region voice alone; layers of one note share
+    // a level closely enough that the whole-note call is the same in practice).
+    for (uint32_t layer = 0u; layer < count; ++layer)
+        if (setups[layer].exclusiveClass != 0u) return false;
+    return RejectNoteOnWith(
+        count,
+        [&]() { return NewbornStealLevel(setups, count, cp, multiplicity); },
+        incoming);
 }
 
 inline void VoiceManager::InsertPreselectedVictim(VoiceHandle victim) {

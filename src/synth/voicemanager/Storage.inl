@@ -288,6 +288,8 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     bucketSteal_ = other.bucketSteal_;
     sampledSteal_ = other.sampledSteal_;
     sampleCursor_ = other.sampleCursor_;
+    sampleFailFrame_ = other.sampleFailFrame_;
+    sampleFailLevel_ = other.sampleFailLevel_;
     stableBuckets_.used = other.stableBuckets_.used;
     stableBuckets_.freeHead = other.stableBuckets_.freeHead;
     volBuckets_.used = other.volBuckets_.used;
