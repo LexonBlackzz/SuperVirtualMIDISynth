@@ -59,8 +59,10 @@ struct Options {
     std::wstring soundfontPath;
     std::wstring dllPath;
     std::wstring wavPath;
+    bool floatWav = false;            // 32-bit float WAV: no clipping, no quantisation
     uint32_t dropVelBelow = 0u;       // listening experiment: remove notes below this velocity
     double dropLenBelowMs = 0.0;      // ... and notes shorter than this
+    std::wstring snappyDll;           // render through this Snappy-style offline DLL instead of our synth
     std::wstring noteTracePath;       // write the per-note fate table (offline)
     bool realtime = false;
     bool audible = false;
@@ -113,12 +115,16 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.soundfontPath = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--dll") == 0 && hasValue) {
             options.dllPath = WArg(argv[++i]);
+        } else if (std::strcmp(arg, "--float-wav") == 0) {
+            options.floatWav = true;
         } else if (std::strcmp(arg, "--wav") == 0 && hasValue) {
             options.wavPath = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--drop-vel-below") == 0 && hasValue) {
             options.dropVelBelow = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(arg, "--drop-len-below-ms") == 0 && hasValue) {
             options.dropLenBelowMs = std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--snappy-dll") == 0 && hasValue) {
+            options.snappyDll = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--note-trace") == 0 && hasValue) {
             options.noteTracePath = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--tuning-edo") == 0 && hasValue) {
@@ -537,23 +543,25 @@ void TrimSongStart(double startSeconds, DecodedSong& song) {
 
 class WaveWriter {
 public:
-    bool Open(const wchar_t* path, uint32_t sampleRate) {
+    bool Open(const wchar_t* path, uint32_t sampleRate, bool floatSamples = false) {
         file_ = _wfopen(path, L"wb");
         if (file_ == nullptr) return false;
         dataBytes_ = 0u;
         sampleRate_ = sampleRate;
+        float_ = floatSamples;
+        const uint32_t sampleBytes = floatSamples ? 4u : 2u;
         uint8_t header[44] = {};
         std::memcpy(header, "RIFF", 4u);
         StoreU32(header + 4u, 0u);              // patched at Close
         std::memcpy(header + 8u, "WAVE", 4u);
         std::memcpy(header + 12u, "fmt ", 4u);
         StoreU32(header + 16u, 16u);
-        header[20u] = 1u; header[21u] = 0u;     // PCM
+        header[20u] = floatSamples ? 3u : 1u; header[21u] = 0u;  // IEEE float / PCM
         header[22u] = 2u; header[23u] = 0u;     // stereo
         StoreU32(header + 24u, sampleRate);
-        StoreU32(header + 28u, sampleRate * 4u);// byte rate
-        header[32u] = 4u; header[33u] = 0u;     // block align
-        header[34u] = 16u; header[35u] = 0u;    // bits
+        StoreU32(header + 28u, sampleRate * 2u * sampleBytes);   // byte rate
+        header[32u] = static_cast<uint8_t>(2u * sampleBytes); header[33u] = 0u;  // block align
+        header[34u] = static_cast<uint8_t>(8u * sampleBytes); header[35u] = 0u;  // bits
         std::memcpy(header + 36u, "data", 4u);
         StoreU32(header + 40u, 0u);             // patched at Close
         return std::fwrite(header, 1u, sizeof(header), file_) == sizeof(header);
@@ -563,6 +571,11 @@ public:
         for (uint32_t i = 0u; i < frames; ++i) {
             for (const float* channel : {left, right}) {
                 float v = channel[i];
+                if (float_) {
+                    if (std::fwrite(&v, 4u, 1u, file_) != 1u) return false;
+                    dataBytes_ += 4u;
+                    continue;
+                }
                 if (!(v > -1.0f && v < 1.0f))
                     v = v >= 0.0f ? 1.0f : -1.0f;
                 const int32_t s = static_cast<int32_t>(v * 32767.0f);
@@ -606,6 +619,7 @@ private:
 
     std::FILE* file_ = nullptr;
     uint32_t sampleRate_ = 44100u;
+    bool float_ = false;
     uint64_t dataBytes_ = 0u;
 };
 
@@ -726,6 +740,118 @@ bool WriteNoteTable(const DecodedSong& song, const svms::NoteTrace& trace,
 }
 #endif
 
+// Renders the same events through an external Snappy-style offline DLL
+// (Render_Init / Render_PushMIDIDataWithOffset / Render_RenderFloatBuffer) so its
+// victim choices can be compared with ours on identical input.  The DLL reads its
+// configuration from %APPDATA%\SnappySynth, so that variable points at a private
+// folder holding a config with the pool size and a one-line soundfont list.
+bool RunSnappyOffline(const Options& options, const DecodedSong& song,
+                      const std::wstring& soundfont) {
+    wchar_t fullBase[MAX_PATH] = {};
+    const std::wstring baseName = options.wavPath.empty()
+        ? std::wstring(L"snappy_appdata") : options.wavPath + L".appdata";
+    if (_wfullpath(fullBase, baseName.c_str(), MAX_PATH) == nullptr) return false;
+    const std::wstring base = fullBase;
+    CreateDirectoryW(base.c_str(), nullptr);
+    CreateDirectoryW((base + L"\\SnappySynth").c_str(), nullptr);
+    auto narrow = [](const std::wstring& text) {
+        std::string out(text.size() * 4u + 4u, '\0');
+        const int n = WideCharToMultiByte(CP_ACP, 0, text.c_str(), -1, &out[0],
+                                          static_cast<int>(out.size()), nullptr, nullptr);
+        out.resize(n > 0 ? static_cast<size_t>(n - 1) : 0u);
+        return out;
+    };
+    {
+        FILE* cfg = _wfopen((base + L"\\SnappySynth\\SnappySynth.cfg").c_str(), L"wb");
+        FILE* list = _wfopen((base + L"\\SnappySynth\\ss.sflist").c_str(), L"wb");
+        if (cfg == nullptr || list == nullptr) return false;
+        std::fprintf(cfg, "MaxVoices=%u\r\nSampleRate=44100\r\nNumChannels=2\r\nBitsPerSample=32\r\n",
+                     options.maxVoices);
+        std::fprintf(list, "%s\r\n", narrow(soundfont).c_str());
+        std::fclose(cfg);
+        std::fclose(list);
+    }
+    SetEnvironmentVariableW(L"APPDATA", base.c_str());
+
+    HMODULE dll = LoadLibraryW(options.snappyDll.c_str());
+    if (dll == nullptr) {
+        std::fprintf(stderr, "cannot load %ls\n", options.snappyDll.c_str());
+        return false;
+    }
+    using InitFn = uint64_t (*)(uint32_t, int32_t, int32_t, int32_t, uint32_t);
+    using PushFn = uint64_t (*)(uint32_t, int32_t);
+    using RenderFn = int (*)(uint32_t, void*, void*, uint64_t);
+    using GetFn = float* (*)(int32_t*, int32_t*);
+    using FreeFn = void (*)(void*);
+    using StatFn = void* (*)(svms::SnappyVoiceStatistics*);
+    using StopFn = void (*)();
+    auto init = reinterpret_cast<InitFn>(GetProcAddress(dll, "Render_Init"));
+    auto push = reinterpret_cast<PushFn>(GetProcAddress(dll, "Render_PushMIDIDataWithOffset"));
+    auto render = reinterpret_cast<RenderFn>(GetProcAddress(dll, "Render_RenderFloatBuffer"));
+    auto getData = reinterpret_cast<GetFn>(GetProcAddress(dll, "Render_GetFloatData"));
+    auto freeData = reinterpret_cast<FreeFn>(GetProcAddress(dll, "Render_FreeData"));
+    auto stats = reinterpret_cast<StatFn>(GetProcAddress(dll, "GetVoiceStatistics"));
+    auto stop = reinterpret_cast<StopFn>(GetProcAddress(dll, "Render_Stop"));
+    if (!init || !push || !render || !getData || !freeData) {
+        std::fprintf(stderr, "the DLL lacks the offline Render_* exports\n");
+        return false;
+    }
+    const uint32_t block = (std::min)((std::max)(options.frames, 64u), 8192u);
+    if (init(44100u, 2, 32, static_cast<int32_t>(block), options.maxVoices) == 0u) {
+        std::fprintf(stderr, "Render_Init failed\n");
+        return false;
+    }
+
+    WaveWriter wave;
+    const bool wantWav = !options.wavPath.empty();
+    if (wantWav && !wave.Open(options.wavPath.c_str(), 44100u, options.floatWav)) return false;
+    const uint64_t totalFrames =
+        song.pieceFrames + static_cast<uint64_t>(options.tailSeconds) * 44100u;
+    std::vector<float> left(block), right(block);
+    uint64_t frame = 0u, eventIndex = 0u;
+    uint32_t peakActive = 0u;
+    svms::SnappyVoiceStatistics last{};
+    for (uint64_t blockIndex = 0u; frame < totalFrames; ++blockIndex) {
+        const uint32_t n = static_cast<uint32_t>((std::min<uint64_t>)(block, totalFrames - frame));
+        while (eventIndex < song.events.size() &&
+               song.events[eventIndex].outputFrame < frame + block) {
+            push(song.events[eventIndex].message,
+                 static_cast<int32_t>(song.events[eventIndex].outputFrame - frame));
+            ++eventIndex;
+        }
+        render(1u, nullptr, nullptr, 0u);
+        int32_t got = 0, channels = 0;
+        float* data = getData(&got, &channels);
+        if (data != nullptr) {
+            const uint32_t take = (std::min)(n, static_cast<uint32_t>(got));
+            for (uint32_t i = 0u; i < take; ++i) {
+                left[i] = data[i * 2u];
+                right[i] = data[i * 2u + 1u];
+            }
+            for (uint32_t i = take; i < n; ++i) left[i] = right[i] = 0.0f;
+            freeData(data);
+        } else {
+            std::fill(left.begin(), left.end(), 0.0f);
+            std::fill(right.begin(), right.end(), 0.0f);
+        }
+        if (wantWav && !wave.Write(left.data(), right.data(), n)) return false;
+        if (stats != nullptr && (blockIndex & 31u) == 0u) {
+            stats(&last);
+            peakActive = (std::max)(peakActive, last.activeVoices);
+        }
+        frame += n;
+    }
+    if (stats != nullptr) stats(&last);
+    if (stop != nullptr) stop();
+    if (wantWav && !wave.Close()) return false;
+    std::printf("{\"mode\":\"snappy-offline\",\"events\":%llu,\"noteOns\":%llu,"
+                "\"peakActive\":%u,\"steals\":%u}\n",
+                static_cast<unsigned long long>(song.events.size()),
+                static_cast<unsigned long long>(song.noteOns), peakActive,
+                last.voiceSteals);
+    return true;
+}
+
 bool RunOffline(const Options& options, const DecodedSong& song,
                 const std::wstring& soundfont, OfflineResult& out) {
     svms::StandaloneSynthConfig config{};
@@ -749,6 +875,8 @@ bool RunOffline(const Options& options, const DecodedSong& song,
         config.gpuDeviceIndex = liveTuning.gpuDeviceIndex;
         svms::g_dropZeroLifeVictims.store(liveTuning.dropZeroLifeVictims,
                                           std::memory_order_relaxed);
+        svms::g_sampledSteal.store(liveTuning.sampledSteal,
+                                   std::memory_order_relaxed);
     }
 
     svms::StandaloneSynth synth;
@@ -761,7 +889,7 @@ bool RunOffline(const Options& options, const DecodedSong& song,
 
     WaveWriter wave;
     const bool wantWav = !options.wavPath.empty();
-    if (wantWav && !wave.Open(options.wavPath.c_str(), 44100u)) {
+    if (wantWav && !wave.Open(options.wavPath.c_str(), 44100u, options.floatWav)) {
         out.error = "cannot open the output WAV file";
         return false;
     }
@@ -1493,6 +1621,8 @@ int main(int argc, char** argv) {
         return 77;
     }
 
+    if (!options.snappyDll.empty())
+        return RunSnappyOffline(options, song, soundfont) ? 0 : 1;
     OfflineResult result;
     if (!RunOffline(options, song, soundfont, result)) {
         std::fprintf(stderr, "FAIL: %s\n", result.error.c_str());
