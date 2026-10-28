@@ -74,6 +74,8 @@ struct StandaloneSynthConfig {
     // note that is not louder than its quietest voice (VoiceManager::SetStealReject).
     bool stealReject = false;
     bool stealAgeless = false;  // with stealReject: BASSMIDI 2018 ranking, no age term
+    // Both output channels carry the average of left and right (before the limiter).
+    bool monoDownmix = false;
     // GPU render stage (render/GpuStage.h): 0 off, otherwise a gpu::Api value.
     // A stage that cannot start leaves the render on the CPU.
     uint32_t gpuApi = 0u;
@@ -109,6 +111,7 @@ public:
             renderer_.SetMutedTailCullBlocks(t->decimationCullBlocks);
             SetFastChunkMath(t->fastChunkMath);
         }
+        monoDownmix_ = config.monoDownmix || (config.tuning && config.tuning->monoDownmix);
         if (config.stealReject) {
             voices_.SetStealReject(true);
             rejectPairing_ = true;
@@ -430,6 +433,7 @@ public:
             gpuSynth_.RenderBlock(voices_, left, right, frameCount,
                                   absoluteFrame);
             ApplyReverb(left, right, frameCount);
+            ApplyMono(left, right, frameCount);
             limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
             return;
         }
@@ -590,6 +594,7 @@ public:
     }
     void PostProcess(float* left, float* right, uint32_t frameCount) {
         ApplyReverb(left, right, frameCount);
+        ApplyMono(left, right, frameCount);
         limiter_.ProcessPlanar(left, right, frameCount, postHighPass_);
     }
 
@@ -1410,6 +1415,15 @@ private:
     // Driver::RenderCallback (interleaved scratch round trip).
     std::unique_ptr<ReverbState> reverb_;  // large; heap, only when enabled
     bool reverbOn_ = false;
+    bool monoDownmix_ = false;
+    void ApplyMono(float* left, float* right, uint32_t frames) const {
+        if (!monoDownmix_) return;
+        for (uint32_t i = 0u; i < frames; ++i) {
+            const float mid = 0.5f * (left[i] + right[i]);
+            left[i] = mid;
+            right[i] = mid;
+        }
+    }
     std::vector<float> reverbScratch_;
     void ApplyReverb(float* left, float* right, uint32_t frames) {
         if (!reverbOn_ || frames == 0u) return;

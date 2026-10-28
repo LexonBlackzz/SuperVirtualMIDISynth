@@ -825,6 +825,13 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // neither changes gain detection nor requires another memory pass.
     if (!self->shardMaster_) {
         self->reverb.Process(output, numFrames, 2);
+        if (self->monoDownmix_.load(std::memory_order_relaxed)) {
+            for (uint32_t i = 0u; i < numFrames; ++i) {
+                const float mid = 0.5f * (output[2u * i] + output[2u * i + 1u]);
+                output[2u * i] = mid;
+                output[2u * i + 1u] = mid;
+            }
+        }
         self->limiter.Process(output, numFrames, 2, self->postHighPass);
 #if !defined(SVMS_XP_COMPAT)
         self->liveRecorder_.Capture(output, numFrames);

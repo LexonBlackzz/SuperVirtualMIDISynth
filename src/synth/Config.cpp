@@ -361,7 +361,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"backend", backend},
             {"device", WideToUtf8(cfg.audioDevice)},
             {"sample_rate", cfg.sampleRate},
-            {"buffer_frames", cfg.bufferFrames}
+            {"buffer_frames", cfg.bufferFrames},
+            {"mono_downmix", cfg.monoDownmix}
         }},
         {"synth", {
             {"soundfont", WideToUtf8(cfg.soundFontPath)},
@@ -612,6 +613,8 @@ void AppendWarning(std::string& warning, const char* field) {
 // and named in cfg.configWarning.
 void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("audio"); it != root.end() && it->is_object()) {
+        if (!ReadBool(*it, "mono_downmix", cfg.monoDownmix))
+            AppendWarning(cfg.configWarning, "audio.mono_downmix");
         auto device = it->find("device");
         if (device != it->end()) {
             if (device->is_string()) cfg.audioDevice = Utf8ToWide(device->get<std::string>());
@@ -1142,6 +1145,7 @@ EngineConfig EngineConfig::Default() {
     cfg.dropZeroLifeVictims = false;  // opt-in: exact steal-fade tails by default
     cfg.launchStaging = false;    // opt-in: direct SoA launches by default
     cfg.stealIndexBuckets = false;  // opt-in: exact tournament tree by default
+    cfg.monoDownmix = false;
     cfg.sampledSteal = false;       // opt-in: quietest-first ranking by default
     cfg.apiBackend = 0;           // SVMS engine in-process by default
     cfg.apiAllowNested = false;   // nested-chain guard on by default

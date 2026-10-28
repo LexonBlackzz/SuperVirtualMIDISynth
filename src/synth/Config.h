@@ -159,6 +159,9 @@ struct EngineConfig {
     // sample of voices instead of the quietest one. Applied at engine init.
     // Off by default.
     bool sampledSteal;
+    // audio.mono_downmix: both output channels carry the average of left and
+    // right. Live-togglable.
+    bool monoDownmix;
     // Synth backend routed by the event sink: 0 = SVMS engine (default,
     // in-process), 1 = external SVMS-API DLL, 2 = external KDMAPI DLL,
     // 3 = WinMM MIDI-out device. External backends own their own audio

@@ -48,6 +48,7 @@ const SettingDef kSettings[] = {
     {"chOn", "Channel limiter", E, "Effects \xE2\x80\xBA Channel limiter", "per channel limiter 16 channels", "chlim", nullptr, false, D(&V::channelLimiterEnabled)},
     {"device", "Audio device", O, "Output", "output device speakers headphones interface refresh devices", nullptr, nullptr, true, D(&V::audioDevice, &V::linuxDevice)},
     {"audioBe", "WASAPI / ASIO", O, "Output", "audio backend asio wasapi shared output driver", nullptr, nullptr, true, D(&V::audioBackend)},
+    {"monoDown", "Mono output (downmix)", O, "Output", "mono downmix stereo left right both ears", nullptr, nullptr, false, D(&V::monoDownmix)},
     {"buf", "Buffer size / latency", O, "Output \xE2\x80\xBA Latency", "buffer frames latency delay crackle stutter", nullptr, nullptr, true, D(&V::bufferFrames)},
     {"sr", "Sample rate", O, "Output \xE2\x80\xBA Latency", "sample rate 44100 48000 khz", nullptr, nullptr, true, D(&V::sampleRate)},
     {"synthBe", "Synth backend (OmniMIDI, KDMAPI, WinMM)", O, "Output \xE2\x80\xBA Different synth", "kdmapi omnimidi winmm dll backend route", nullptr, "out", true, D(&V::apiBackend)},

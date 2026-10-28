@@ -128,6 +128,7 @@ ConfigValues ConfigDocument::Defaults() {
     ConfigValues d{};
     d.sampleRate = 44100;
     d.bufferFrames = 2048;
+    d.monoDownmix = false;
     d.maxVoices = 1000;
     d.voiceMemoryBudgetMB = 0;
     d.renderThreads = 0;
@@ -217,6 +218,7 @@ void ConfigDocument::FromJson(const json& root) {
         ReadString(*it, "linux_device", working_.linuxDevice);
         ReadNum(*it, "sample_rate", working_.sampleRate, 8000u, 384000u);
         ReadNum(*it, "buffer_frames", working_.bufferFrames, 16u, 8192u);
+        ReadBool(*it, "mono_downmix", working_.monoDownmix);
     }
     if (auto it = root.find("synth"); it != root.end() && it->is_object()) {
         ReadString(*it, "soundfont", working_.soundFontPath);
@@ -417,6 +419,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["audio"]["linux_device"] = WideToUtf8(working_.linuxDevice);
     root["audio"]["sample_rate"] = working_.sampleRate;
     root["audio"]["buffer_frames"] = working_.bufferFrames;
+    root["audio"]["mono_downmix"] = working_.monoDownmix;
 
     root["synth"]["soundfont"] = WideToUtf8(working_.soundFontPath);
     json soundFonts = json::array();
@@ -675,6 +678,7 @@ bool ConfigDocument::ExportProfile(const std::wstring& path,
 bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
     return a.sampleRate == b.sampleRate
         && a.bufferFrames == b.bufferFrames
+        && a.monoDownmix == b.monoDownmix
         && a.maxVoices == b.maxVoices
         && a.voiceMemoryBudgetMB == b.voiceMemoryBudgetMB
         && a.renderThreads == b.renderThreads

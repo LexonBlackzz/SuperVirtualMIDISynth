@@ -419,6 +419,7 @@ bool Driver::Initialize() {
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
     unboundedRenderEnabled_.store(cfg.unboundedRender,
                                   std::memory_order_relaxed);
+    monoDownmix_.store(cfg.monoDownmix, std::memory_order_relaxed);
     svms::g_largePagesEnabled.store(cfg.largePages,
                                     std::memory_order_relaxed);
     svms::g_dropZeroLifeVictims.store(cfg.dropZeroLifeVictims,
@@ -579,6 +580,7 @@ bool Driver::Initialize() {
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
     unboundedRenderEnabled_.store(cfg.unboundedRender,
                                   std::memory_order_relaxed);
+    monoDownmix_.store(cfg.monoDownmix, std::memory_order_relaxed);
     svms::g_largePagesEnabled.store(cfg.largePages,
                                     std::memory_order_relaxed);
     svms::g_dropZeroLifeVictims.store(cfg.dropZeroLifeVictims,

@@ -531,6 +531,19 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetMonoDownmix: {
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "mono downmix must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        monoDownmix_.store(cmd.param != 0u, std::memory_order_relaxed);
+        engineConfig_.monoDownmix = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "mono output: on" : "mono output: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
     case RT::SetNoteOnReexcite: {
         // param = 1: coalescing keeps collapsed repeat hits as re-excite
         // events (timing-exact); 0: it drops them.

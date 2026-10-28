@@ -818,6 +818,9 @@ private:
     // admission soft cap. The schedule is rendered in exact order at
     // whatever speed the engine manages; WASAPI glitches are accepted.
     std::atomic<bool> unboundedRenderEnabled_{false};
+    // audio.mono_downmix: left and right replaced by their average before the
+    // master limiter. Live via SetMonoDownmix.
+    std::atomic<bool> monoDownmix_{false};
     // External synth backend state (api.backend). externalBackendKind_ is
     // read by the audio thread every callback; the rest is only touched by
     // init/shutdown before audio starts.

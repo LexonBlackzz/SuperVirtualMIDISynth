@@ -259,6 +259,8 @@ enum class RLCommandType : uint32_t {
     SetSoundFontEntry     = 0x00000124,
     // param = channel | (font << 8); font 0 = automatic, N = stack entry N.
     SetChannelSoundFont   = 0x00000125,
+    // param = 1: left and right both carry their average (mono output).
+    SetMonoDownmix        = 0x00000126,
 
 
     Invalid              = 0xFFFFFFFF,

@@ -1,8 +1,10 @@
 #include "configurator/PageOutput.h"
 #include "configurator/ConfigDocument.h"
 #include "configurator/EasterEggs.h"
+#include "configurator/DriverLink.h"
 #include "configurator/ModernWidgets.h"
 #include "configurator/PlatformUtil.h"
+#include "configurator/Widgets.h"
 #include "configurator/Anim.h"
 #include "imgui.h"
 #ifdef _WIN32
@@ -406,8 +408,24 @@ void SynthCard(ConfigDocument& doc) {
 
 } // namespace
 
+static void ChannelsCard(ConfigDocument& doc) {
+    ConfigValues& w = doc.Working();
+    const float s = ui::Scale();
+    ui::BeginCard("##channels", "Output channels", nullptr, 0.0f, "monoDown");
+    ui::BeginRow("monoDownmix", "Mono output",
+                 "Both speakers get the average of left and right. Useful for MIDIs that pan hard to one side. Applies immediately.",
+                 ImVec2(46.0f * s, 28.0f * s));
+    if (ui::Toggle("##monodownmix", &w.monoDownmix)) {
+        doc.MarkDirty();
+        SendLiveCommand(SVMS_COMMAND_SET_MONO_DOWNMIX, w.monoDownmix ? 1u : 0u);
+    }
+    ui::EndRow();
+    ui::EndCard();
+}
+
 void DrawOutputPage(ConfigDocument& doc, const EasterEggState& eggs) {
     DeviceCard(doc, eggs);
+    ChannelsCard(doc);
     LatencyCard(doc);
     SynthCard(doc);
 }

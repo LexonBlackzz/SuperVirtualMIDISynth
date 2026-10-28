@@ -61,6 +61,7 @@ struct Options {
     std::wstring wavPath;
     bool floatWav = false;            // 32-bit float WAV: no clipping, no quantisation
     bool stealReject = false;         // skip a note that is not louder than the quietest voice
+    bool mono = false;                // average left and right into both channels
     uint32_t dropVelBelow = 0u;       // listening experiment: remove notes below this velocity
     double dropLenBelowMs = 0.0;      // ... and notes shorter than this
     std::wstring snappyDll;           // render through this Snappy-style offline DLL instead of our synth
@@ -116,6 +117,8 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.soundfontPath = WArg(argv[++i]);
         } else if (std::strcmp(arg, "--dll") == 0 && hasValue) {
             options.dllPath = WArg(argv[++i]);
+        } else if (std::strcmp(arg, "--mono") == 0) {
+            options.mono = true;
         } else if (std::strcmp(arg, "--steal-reject") == 0) {
             options.stealReject = true;
         } else if (std::strcmp(arg, "--float-wav") == 0) {
@@ -894,6 +897,7 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     config.maxBlockFrames = options.frames;
     config.masterVolume = 1.0f;
     config.stealReject = options.stealReject;
+    config.monoDownmix = options.mono;
     config.backend = ParseBackend(options.backend);
 
     // The same snapshot the live driver applies: velocity curve, retire floor,

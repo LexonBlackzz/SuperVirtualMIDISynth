@@ -30,6 +30,7 @@ struct SoundFontRouteValue {
 struct ConfigValues {
     uint32_t sampleRate = 44100;
     uint32_t bufferFrames = 2048;
+    bool monoDownmix = false;
     uint32_t maxVoices = 1024;
     uint32_t voiceMemoryBudgetMB = 0;
     uint32_t renderThreads = 0;
