@@ -269,7 +269,11 @@ typedef struct SVMS_RealtimeSessionConfig {
     /* Key shards, same meaning as SVMS_OfflineSessionConfig::shards (was
        reserved[0]). */
     uint32_t shards;
-    uint32_t reserved[5];
+    /* GPU render stage, same meaning as SVMS_OfflineSessionConfig::gpu_api
+       (0 = off, 1 = auto, 2 OpenGL, 3 Vulkan, 4 D3D11, 5 CUDA). Was
+       reserved[0]; a stage that cannot start leaves the render on the CPU. */
+    uint32_t gpu_api;
+    uint32_t reserved[4];
 } SVMS_RealtimeSessionConfig;
 
 typedef struct SVMS_TelemetryV1 {

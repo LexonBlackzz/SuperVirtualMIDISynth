@@ -322,6 +322,7 @@ private:
             synthConfig.soundfont = soundfont;
             synthConfig.sampleRate = sampleRate;
             synthConfig.maxVoices = config.max_voices;
+            synthConfig.gpuApi = config.gpu_api;
             synthConfig.renderThreads = config.render_threads;
             synthConfig.maxBlockFrames = bufferFrames;
             synthConfig.masterVolume = config.master_volume;
@@ -585,6 +586,7 @@ private:
             config.sample_rate > 384000u || config.buffer_frames < 16u ||
             config.buffer_frames > 8192u || config.max_voices == 0u ||
             config.max_voices > kMaxPolyphony || config.render_threads > 64u || config.shards > 64u ||
+            config.gpu_api > 5u ||
             config.render_backend > SVMS_RENDER_BACKEND_AVX2 ||
             config.event_capacity < 1024u ||
             config.start_immediately > 1u || config.limiter_enabled > 1u ||
