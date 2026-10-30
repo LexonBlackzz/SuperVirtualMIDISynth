@@ -688,6 +688,9 @@ public:
         }
     }
     uint32_t Steals() const { return voices_.stealCount_; }
+    uint32_t ClassCount(uint32_t renderClass) const {
+        return voices_.GetRenderClassCount(static_cast<VoiceRenderClass>(renderClass));
+    }
     uint64_t LazyChainSteps() const { return voices_.GetLazyChainSteps(); }
     uint64_t LazyStarts() const { return voices_.GetLazyStarts(); }
     // ── Temporary dispatch-phase profiler (diagnostics only) ────────────

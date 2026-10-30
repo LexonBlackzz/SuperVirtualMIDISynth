@@ -946,6 +946,8 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     std::vector<svms::RealtimeEvent> blockBatch;
     uint64_t peakActive = 0u, peakTails = 0u;
     float audioPeak = 0.0f;
+    double intervalBudgetSum = 0.0, intervalBudgetMax = 0.0;
+    uint64_t intervalBlocks = 0u;
 #if defined(SVMS_NOTE_TRACE)
     svms::NoteTrace noteTrace;
     if (!options.noteTracePath.empty()) svms::g_noteTrace = &noteTrace;
@@ -1003,6 +1005,9 @@ bool RunOffline(const Options& options, const DecodedSong& song,
             static_cast<double>(qpcEnd.QuadPart - qpcBegin.QuadPart) /
             static_cast<double>(qpf.QuadPart);
         budgetSamples.push_back(wallSeconds / budgetSeconds * 100.0);
+        intervalBudgetSum += budgetSamples.back();
+        intervalBudgetMax = (std::max)(intervalBudgetMax, budgetSamples.back());
+        ++intervalBlocks;
         if (active > 0u) {
             cpvsSamples.push_back(
                 static_cast<double>(renderEnd - renderBegin) /
@@ -1026,11 +1031,19 @@ bool RunOffline(const Options& options, const DecodedSong& song,
         }
         if (options.verbose && frame + n >= nextVerboseFrame &&
             nextVerboseFrame <= song.pieceFrames) {
-            std::printf("[song] t=%5.1fs active=%4u tails=%3u cpvs=%6.2f "
-                        "budget=%5.1f%%\n",
+            std::printf("[song] t=%5.1fs active=%5u tails=%3u cpvs=%6.2f "
+                        "load avg=%5.1f%% max=%5.1f%% | sustained=%u oneshot=%u "
+                        "transient=%u release=%u generic=%u\n",
                         static_cast<double>(frame) / 44100.0, active,
-                        synth.Tails(), cpvsSamples.back(),
-                        budgetSamples.back());
+                        synth.Tails(), cpvsSamples.empty() ? 0.0 : cpvsSamples.back(),
+                        intervalBlocks ? intervalBudgetSum / double(intervalBlocks) : 0.0,
+                        intervalBudgetMax,
+                        synth.ClassCount(0u), synth.ClassCount(1u),
+                        synth.ClassCount(2u) + synth.ClassCount(3u),
+                        synth.ClassCount(4u) + synth.ClassCount(5u),
+                        synth.ClassCount(6u));
+            intervalBudgetSum = intervalBudgetMax = 0.0;
+            intervalBlocks = 0u;
             std::fflush(stdout);
             nextVerboseFrame += 44100u * 2u;
         }
