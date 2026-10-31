@@ -372,6 +372,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"max_voices", cfg.maxVoices},
             {"voice_memory_budget_mb", cfg.voiceMemoryBudgetMB},
             {"large_pages", cfg.largePages},
+            {"keep_loaded", cfg.keepLoaded},
             {"render_threads", cfg.renderThreads},
             {"shards", cfg.shards},
             {"thread_affinity_mode", cfg.threadAffinityMode},
@@ -656,6 +657,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
                 cfg.largePages = lp->get<bool>();
             else
                 AppendWarning(cfg.configWarning, "synth.large_pages");
+        }
+        if (auto kl = it->find("keep_loaded"); kl != it->end()) {
+            if (kl->is_boolean())
+                cfg.keepLoaded = kl->get<bool>();
+            else
+                AppendWarning(cfg.configWarning, "synth.keep_loaded");
         }
         if (!ReadValue(*it, "voice_memory_budget_mb",
                        cfg.voiceMemoryBudgetMB, 0u, 65536u))
@@ -1055,6 +1062,7 @@ void ApplyEnvironment(EngineConfig& cfg) {
         cfg.eventOverflowMode = EventOverflowMode::LosslessBackpressure;
     // Handy for A/B renders of one file with the tools (svms_v3_midi_song).
     cfg.noteMerge = EnvironmentFlag(L"SVMS_NOTE_MERGE", cfg.noteMerge);
+    cfg.keepLoaded = EnvironmentFlag(L"SVMS_KEEP_LOADED", cfg.keepLoaded);
     cfg.noteOnReexcite = EnvironmentFlag(L"SVMS_NOTE_REEXCITE", cfg.noteOnReexcite);
     cfg.correctnessMode = EnvironmentFlag(L"SVMS_CORRECTNESS_MODE", cfg.correctnessMode);
     cfg.diagnosticsEnabled = EnvironmentFlag(L"SVMS_DIAGNOSTICS", cfg.diagnosticsEnabled);
@@ -1149,6 +1157,7 @@ EngineConfig EngineConfig::Default() {
     cfg.unboundedRender = false;  // opt-in: recovery + caps stay on by default
     cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default
     cfg.largePages = false;       // opt-in: standard aligned allocation by default
+    cfg.keepLoaded = false;       // opt-in: the engine shuts down with its last client
     cfg.dropZeroLifeVictims = false;  // opt-in: exact steal-fade tails by default
     cfg.launchStaging = false;    // forced staging is opt-in
     cfg.launchStagingAuto = true; // large pools stage on their own

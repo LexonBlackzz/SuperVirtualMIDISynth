@@ -765,8 +765,10 @@ bool Driver::Initialize() {
 #endif
 
     initialized = true;
+    parked_ = false;
     LOG("Initialize SUCCESS");
     if (shard) return true;
+    if (engineConfig_.keepLoaded) (void)ReadV3ConfigJson(loadedConfigJson_, nullptr);
 
     // External synth backend (api.backend): loaded once at init; on any
     // failure the driver falls back to the in-process SVMS engine.
@@ -908,6 +910,7 @@ void Driver::Shutdown() {
         DiagWindow_Destroy();
 
     initialized = false;
+    parked_ = false;
 }
 
 // ── Per-MIDI-channel limiter bus planes ──────────────────────────────────
@@ -973,8 +976,53 @@ const LegacyDriverDebugInfo* Driver::GetLegacyDebugInfo() const {
     return &legacyDebugSnapshots_[index];
 }
 
+void Driver::Park() {
+    if (!initialized || parked_) return;
+    StopConfiguredMidiInput();
+    // The reset goes through the event path, so notes already queued go quiet
+    // in order; give the audio thread a few blocks to run it.
+    ResetAllVoices();
+    const DWORD began = GetTickCount();
+    while (voiceManager && voiceManager->activeCount_ != 0u &&
+           GetTickCount() - began < 250u)
+        Sleep(2);
+    if (audioOutput) audioOutput->Stop();
+    parked_ = true;
+    LOG("Engine parked (synth.keep_loaded)");
+}
+
+bool Driver::Unpark() {
+    if (!parked_) return true;
+    std::string now;
+    if (!ReadV3ConfigJson(now, nullptr) || now != loadedConfigJson_) {
+        LOG("Parked engine: configuration changed, loading afresh");
+        return false;
+    }
+    // The stream is stopped, so this resets directly (voices, effects tails,
+    // queued events).
+    ResetAllVoices();
+    parked_ = false;
+    const bool started = StartAudio();
+    LOG("Engine resumed from park: %s", started ? "ok" : "stream start FAILED");
+    return started;
+}
+
+void Driver::ArmGpuStage() {
+#if defined(SVMS_GPU_STAGE)
+    if (!gpuStage || !voiceManager || !sampleDataStore || sampleDataFrames == 0u)
+        return;
+    if (!gpuStage->Arm(sampleDataStore, sampleDataFrames,
+                       voiceManager->v.GetCapacity(), bufferFrames))
+        LOG("GPU render stage: could not prepare ahead of the first note");
+#endif
+}
+
 bool Driver::StartAudio() {
     if (audioOutput && !audioOutput->IsRunning()) {
+        // Every core's GPU stage takes the SoundFont now, while no stream runs,
+        // so no note pays for the upload.
+        ArmGpuStage();
+        for (Driver* shard : shards_) shard->ArmGpuStage();
         LOG("StartAudio: starting audio stream...");
         const bool ok = audioOutput->Start();
         LOG("StartAudio: %s", ok ? "SUCCESS" : "FAILED");

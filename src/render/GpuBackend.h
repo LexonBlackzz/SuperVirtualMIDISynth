@@ -141,6 +141,11 @@ public:
     // owns the context until the first Submit rebinds it to the audio thread.
     virtual bool Init(uint32_t adapterIndex, std::string& error) = 0;
 
+    // Gives up the calling thread's claim on the context (a backend whose
+    // context is current on one thread at a time), so the audio thread can bind
+    // it on its first block after the stage was prepared elsewhere.
+    virtual void Unbind() {}
+
     // Upload the int16 sample store.  `frames` excludes the trailing padding;
     // the source holds at least frames + 8 readable elements.
     virtual bool UploadStore(const int16_t* data, uint32_t frames) = 0;

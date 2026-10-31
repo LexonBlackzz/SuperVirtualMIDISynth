@@ -537,6 +537,14 @@ public:
     bool LoadSoundFont(const wchar_t* path);
     bool LoadConfiguredSoundFont();
     bool StartAudio();
+    // synth.keep_loaded: the last client closed, so the engine goes quiet and
+    // stops its stream but stays loaded.  Unpark restarts the stream; false
+    // means the config file changed (or the stream would not start) and the
+    // caller shuts the engine down and starts it afresh.
+    bool KeepLoaded() const { return initialized && !shardMaster_ && engineConfig_.keepLoaded; }
+    bool IsParked() const { return parked_; }
+    void Park();
+    bool Unpark();
     void ResetAllVoices();
 #if !defined(SVMS_XP_COMPAT)
     // Public pass-through to the runtime-link command handler so the native
@@ -638,6 +646,8 @@ public:
     uint64_t GetNextOutputFrame() const;
 
     bool initialized;
+    bool parked_ = false;
+    std::string loadedConfigJson_;   // config.json as read at init (see Unpark)
     uint32_t sampleRate;
     uint32_t bufferFrames;
 
@@ -1154,6 +1164,9 @@ private:
     void KickShards(uint32_t numFrames);
     void JoinShardsAndMix(float* left, float* right, uint32_t numFrames);
     void ShardThreadLoop();
+    // Uploads the SoundFont to the GPU stage and sizes its buffers now, on the
+    // calling thread, instead of at the first note.
+    void ArmGpuStage();
     void ApplySoundFontStack(SoundFontBundle* next) noexcept;
     bool PrepareShortEvent(uint32_t msg, uint64_t qpcTimestamp,
                            uint64_t cadenceCounter, TimestampedMidiEvent& evt,

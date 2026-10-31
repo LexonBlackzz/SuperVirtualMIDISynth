@@ -406,6 +406,12 @@ class GLBackend final : public Backend {
 public:
     ~GLBackend() override { Shutdown(); }
     bool Init(uint32_t adapterIndex, std::string& error) override;
+    void Unbind() override {
+        if (bound_ && boundThread_ == std::this_thread::get_id()) {
+            context_.Release();
+            bound_ = false;
+        }
+    }
     bool UploadStore(const int16_t* data, uint32_t frames) override;
     bool Reserve(uint32_t handleCapacity, uint32_t maxFrames) override;
     bool UploadRows(const UploadRecord* records, uint32_t count) override;

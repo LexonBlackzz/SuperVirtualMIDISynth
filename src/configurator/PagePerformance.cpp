@@ -522,6 +522,13 @@ void CpuCard(ConfigDocument& doc) {
         if (ui::Toggle("##largepages", &w.largePages)) doc.MarkDirty();
         ui::EndRow();
     }
+    {
+        ui::BeginRow("keepLoaded", "Keep the engine loaded",
+                     "When the program closes its MIDI output the synth goes quiet but keeps the SoundFont, GPU and shards loaded, so the next open starts at once. Saving a changed configuration loads everything afresh.",
+                     ImVec2(46.0f * s, 28.0f * s));
+        if (ui::Toggle("##keeploaded", &w.keepLoaded)) doc.MarkDirty();
+        ui::EndRow();
+    }
     ui::EndCard();
 }
 

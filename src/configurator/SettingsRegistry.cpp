@@ -70,6 +70,7 @@ const SettingDef kSettings[] = {
     {"gpuStage", "GPU rendering (experimental)", X, "Experimental", "gpu opengl cuda nvidia vulkan d3d11 compute offload black midi voices", nullptr, nullptr, true, D(&V::gpuApi, &V::gpuDevice)},
     {"affinity", "Core placement (thread affinity)", P, "Performance \xE2\x80\xBA CPU", "hybrid thread affinity p-cores e-cores intel", nullptr, nullptr, false, D(&V::threadAffinityMode)},
     {"largePages", "Large memory pages", P, "Performance \xE2\x80\xBA CPU", "large pages tlb memory", nullptr, nullptr, true, D(&V::largePages)},
+    {"keepLoaded", "Keep the engine loaded", P, "Performance \xE2\x80\xBA CPU", "keep loaded preload soundfont reload reset close reopen gpu shards", nullptr, nullptr, true, D(&V::keepLoaded)},
     {"dropZeroLife", "Drop instant-steal blips (experimental)", X, "Experimental", "drop zero life instant steal lazy launch black midi experimental", nullptr, nullptr, true, D(&V::dropZeroLifeVictims)},
     {"sampledSteal", "Sampled voice stealing (experimental)", X, "Experimental", "sampled steal victim voice stealing quality black midi experimental", nullptr, nullptr, true, D(&V::sampledSteal)},
     {"launchStaging", "Staged note launches (experimental)", X, "Experimental", "staged launch staging ghost copy steal black midi experimental", nullptr, nullptr, true, D(&V::launchStaging)},

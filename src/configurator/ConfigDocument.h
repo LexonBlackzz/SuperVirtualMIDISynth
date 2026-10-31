@@ -102,6 +102,8 @@ struct ConfigValues {
     uint32_t ghostBudget = 0u;
     // Opt-in large-page backing for the biggest pools (needs restart).
     bool largePages = false;
+    // Keep the engine (SoundFont, GPU) loaded after the last client closes.
+    bool keepLoaded = false;
     // Experimental: skip the steal-fade tail of voices stolen on their birth
     // frame and launch chains of such steals lazily (needs restart).
     bool dropZeroLifeVictims = false;

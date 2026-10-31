@@ -183,6 +183,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.unboundedRender = false;
     d.ghostBudget = 0u;
     d.largePages = false;
+    d.keepLoaded = false;
     d.dropZeroLifeVictims = false;
     d.sampledSteal = false;
     d.launchStaging = false;
@@ -256,6 +257,10 @@ void ConfigDocument::FromJson(const json& root) {
         if (auto lp = it->find("large_pages"); lp != it->end()) {
             if (lp->is_boolean())
                 working_.largePages = lp->get<bool>();
+        }
+        if (auto kl = it->find("keep_loaded"); kl != it->end()) {
+            if (kl->is_boolean())
+                working_.keepLoaded = kl->get<bool>();
         }
         ReadNum(*it, "backend", working_.apiBackend, 0u, 4u);
         if (auto dll = it->find("backend_dll"); dll != it->end() &&
@@ -520,6 +525,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["synth"]["tuning_edo"] = working_.tuningEdo;
     root["synth"]["unbounded_render"] = working_.unboundedRender;
     root["synth"]["large_pages"] = working_.largePages;
+    root["synth"]["keep_loaded"] = working_.keepLoaded;
     root["api"]["backend"] = working_.apiBackend;
     root["api"]["backend_dll"] = WideToUtf8(working_.apiBackendDll);
     root["api"]["allow_nested"] = working_.apiAllowNested;
@@ -744,6 +750,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.blockTiming == b.blockTiming
         && a.unboundedRender == b.unboundedRender
         && a.largePages == b.largePages
+        && a.keepLoaded == b.keepLoaded
         && a.apiBackend == b.apiBackend
         && a.apiBackendDll == b.apiBackendDll
         && a.apiAllowNested == b.apiAllowNested

@@ -152,6 +152,17 @@ public:
         if (handle < resident_.size()) resident_[handle] = UINT32_MAX;
     }
 
+    // Prepare before any block exists (no voices yet, nothing playing): sizes
+    // the buffers and uploads the sample store on the calling thread, then lets
+    // go of the context so the thread that renders can take it.  Without this
+    // the first block that carries a note pays for the upload.
+    bool Arm(const int16_t* store, uint32_t storeFrames, uint32_t handleCapacity,
+             uint32_t maxFrames) {
+        const bool ok = Prepare(store, storeFrames, handleCapacity, maxFrames);
+        if (backend_) backend_->Unbind();
+        return ok;
+    }
+
     // Called by the renderer at the start of every candidate block.  Uploads
     // the sample store when it changed, sizes the buffers, clears residency on
     // an epoch change.  False = the stage cannot serve this block.

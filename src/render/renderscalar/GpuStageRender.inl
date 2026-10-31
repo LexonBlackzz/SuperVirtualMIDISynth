@@ -513,14 +513,20 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
     else if (channelBusLeft != nullptr) declineReason = 1u;
     else if (voices.v.rot != nullptr) declineReason = 2u;
     else if (wvDecimating_ || wvScalarVibrato_) declineReason = 3u;
-    else if (activeCount < stage.MinimumVoices()) declineReason = 4u;
     else if (!stage.Prepare(sampleData, sampleDataFrames,
                             voices.v.GetCapacity(), numFrames)) declineReason = 5u;
+    // Prepare runs for every block, empty ones included: it binds the context
+    // to this thread, sizes the buffers and uploads the sample store, which
+    // takes long enough to be heard when it waits for the first note (a shard
+    // that is silent for a while paid it on its first note-on).  Once armed it
+    // only compares a few fields.
+    else if (activeCount < stage.MinimumVoices()) declineReason = 4u;
     if (declineReason != 8u) {
         // CPU-only block: rows may change under a resident copy.
         ++counters.declined[declineReason];
         counters.declinedRows += activeCount;
-        stage.BumpEpoch();
+        // An empty block has no row a resident copy could go stale under.
+        if (activeCount != 0u) stage.BumpEpoch();
         return 0u;
     }
     GpuPassContext ctx{};

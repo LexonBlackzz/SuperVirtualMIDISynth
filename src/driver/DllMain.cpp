@@ -6,8 +6,10 @@
 bool EnsureDriverInitialized() {
     EnterCriticalSection(&g_frontendLock);
     if (g_driver && g_driver->initialized) {
-        LeaveCriticalSection(&g_frontendLock);
-        return true;
+        if (!g_driver->IsParked() || g_driver->Unpark()) {
+            LeaveCriticalSection(&g_frontendLock);
+            return true;
+        }
     }
     if (g_driver) { g_driver->Shutdown(); g_driver = nullptr; }
     g_driver = &svms::Driver::Instance();
@@ -36,8 +38,12 @@ void MaybeShutdownDriver() {
     if (g_winmmOwners.load(std::memory_order_acquire) == 0u &&
         g_nativeOwners.load(std::memory_order_acquire) == 0u &&
         !g_kdmapiInitialized.load(std::memory_order_acquire) && g_driver) {
-        g_driver->Shutdown();
-        g_driver = nullptr;
+        if (g_driver->KeepLoaded()) {
+            g_driver->Park();
+        } else {
+            g_driver->Shutdown();
+            g_driver = nullptr;
+        }
     }
     LeaveCriticalSection(&g_frontendLock);
 }
