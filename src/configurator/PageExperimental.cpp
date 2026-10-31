@@ -8,58 +8,45 @@
 #include "imgui_internal.h"
 
 #include <algorithm>
-#include <cstdio>
+#include <cstdint>
+#include <iterator>
 
 namespace svms::cfg {
 
 namespace {
 
-// Slider with a mono readout, as a row control ("Off" at zero).
-bool BudgetSlider(const char* id, int* value, int minValue, int maxValue,
-                  ImVec2 size) {
-    const float s = ui::Scale();
-    const float rw = 56.0f * s;
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + (size.y - 22.0f * s) * 0.5f));
-    float v = static_cast<float>(*value);
-    bool changed = false;
-    if (ui::RangeSlider(id, &v, static_cast<float>(minValue),
-                        static_cast<float>(maxValue),
-                        size.x - rw - 10.0f * s)) {
-        const int iv = static_cast<int>(v + 0.5f);
-        if (iv != *value) {
-            *value = iv;
-            changed = true;
+// Budget steps, percent of the voice limit per block (0 = off).  A value that
+// came from the config file and is not a step shows the nearest one; nothing
+// changes until a step is clicked.
+constexpr uint32_t kBudgetSteps[] = {0u, 100u, 200u, 400u, 800u};
+
+int NearestBudgetStep(uint32_t percent) {
+    int best = 0;
+    uint32_t bestDistance = UINT32_MAX;
+    for (int i = 0; i < static_cast<int>(std::size(kBudgetSteps)); ++i) {
+        const uint32_t d = percent > kBudgetSteps[i] ? percent - kBudgetSteps[i]
+                                                     : kBudgetSteps[i] - percent;
+        if (d < bestDistance) {
+            bestDistance = d;
+            best = i;
         }
     }
-    char txt[16];
-    if (*value == 0) std::snprintf(txt, sizeof(txt), "Off");
-    else std::snprintf(txt, sizeof(txt), "%d%%", *value);
-    ImGui::SetCursorScreenPos(ImVec2(p.x + size.x - rw, p.y));
-    ui::PushNum(13.0f);
-    const ImVec2 ts = ImGui::CalcTextSize(txt);
-    ImGui::GetWindowDrawList()->AddText(
-        ImVec2(p.x + size.x - ts.x, p.y + (size.y - ts.y) * 0.5f),
-        ui::Tok().text, txt);
-    ui::PopFont();
-    ImGui::Dummy(ImVec2(rw, size.y));
-    return changed;
+    return best;
 }
 
 void PlaybackCard(ConfigDocument& doc) {
     ConfigValues& w = doc.Working();
-    const float s = ui::Scale();
     ui::BeginCard("##expplay", "While it plays",
                   "Applied at once, no restart. Use these to hear what they do.",
                   0.0f, "expplay");
     {
-        const ImVec2 size(300.0f * s, 28.0f * s);
+        static const char* labels[5] = {"Off", "100%", "200%", "400%", "800%"};
         ui::BeginRow("bulkAdmission", "Bulk note admission",
-                     "When a block carries more new notes than this share of the voice limit, only the loudest are started (by velocity, ties to the later note) and the rest never launch. The notes that stay keep their exact timing. It makes extreme black MIDIs far lighter, but it changes the sound: the many short, quickly stolen notes are where the bright noise lives, so lower budgets sound darker and fuller in the lows. 100% is the strongest useful setting, around 800% is close to unchanged, Off keeps every note.",
-                     size);
-        int v = static_cast<int>((std::min)(1000u, w.bulkAdmissionPercent));
-        if (BudgetSlider("##bulkadmission", &v, 0, 1000, size)) {
-            w.bulkAdmissionPercent = static_cast<uint32_t>(v);
+                     "When a block carries more new notes than this share of the voice limit, only the loudest are started (by velocity, ties to the later note) and the rest never launch. The notes that stay keep their exact timing. It makes extreme black MIDIs far lighter, but it changes the sound: the many short, quickly stolen notes are where the bright noise lives, so lower budgets sound darker and fuller in the lows. 100% is the strongest, 800% is close to unchanged, Off keeps every note.",
+                     ui::SegmentedSize(labels, 5));
+        int idx = NearestBudgetStep(w.bulkAdmissionPercent);
+        if (ui::Segmented("##bulkadmission", &idx, labels, 5)) {
+            w.bulkAdmissionPercent = kBudgetSteps[idx];
             doc.MarkDirty();
             SendLiveCommand(SVMS_COMMAND_SET_BULK_ADMISSION,
                             w.bulkAdmissionPercent);
