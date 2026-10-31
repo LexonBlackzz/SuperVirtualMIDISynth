@@ -117,6 +117,27 @@ inline float VoiceManager::StealLaneFactor(VoiceHandle handle) const {
 // pool size.
 inline void VoiceManager::PrefetchVoiceLines(VoiceHandle handle) {
 #if defined(SVMS_VM_HAS_PREFETCH)
+    if (launchStagingActive_) {
+        // Under launch staging the launch-derived dense arrays are written by
+        // the render jobs (MaterializeLaunch), not by this serial path, so
+        // only the lines the plan itself reads or writes are worth pulling:
+        // the steal score inputs, the lifecycle row and the staged record.
+#define SVMS_PREFETCH_PLAN_FIELD(field)         _mm_prefetch(reinterpret_cast<const char*>(&v.field[handle]),                      _MM_HINT_T0)
+        SVMS_PREFETCH_PLAN_FIELD(state);
+        SVMS_PREFETCH_PLAN_FIELD(staged);
+        SVMS_PREFETCH_PLAN_FIELD(envelopeStage);
+        SVMS_PREFETCH_PLAN_FIELD(currentGain);
+        SVMS_PREFETCH_PLAN_FIELD(targetGain);
+        SVMS_PREFETCH_PLAN_FIELD(stealOutputGain);
+        SVMS_PREFETCH_PLAN_FIELD(birthFrame);
+        SVMS_PREFETCH_PLAN_FIELD(renderClass);
+        SVMS_PREFETCH_PLAN_FIELD(rows);
+        SVMS_PREFETCH_PLAN_FIELD(launch);
+#undef SVMS_PREFETCH_PLAN_FIELD
+        _mm_prefetch(reinterpret_cast<const char*>(
+                         &stealCandidateDeferred_[handle]), _MM_HINT_T0);
+        return;
+    }
     const char* base = reinterpret_cast<const char*>(&v.state[handle]);
     // state/channel/note/velocity share neighborhood layout only per array;
     // each SoA array is separately allocated, so prefetch each line.

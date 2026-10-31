@@ -1186,11 +1186,15 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     // Ghost tails that outlive the block are adopted into real tail slots
     // so their fade continues into the next block exactly as an in-band
     // capture would.
+    // Adoption never frees a slot, so every slot below the last one taken is
+    // known to be busy: the scan resumes there instead of restarting at 0
+    // (that restart made a storm of surviving tails quadratic).
+    uint32_t firstFreeTailSlot = 0u;
     for (uint32_t ghost = 0u; ghost < ghostCount; ++ghost) {
         const WholeVoiceGhostTail& tail = wvGhostTails_[ghost];
         if (tail.framesRemaining == 0u) continue;
         if (wvGhostDeathFrame_[ghost] >= numFrames) continue;
-        for (uint32_t slot = 0u; slot < tailCapacity; ++slot) {
+        for (uint32_t slot = firstFreeTailSlot; slot < tailCapacity; ++slot) {
             if (voices.v.stealTailFramesRemaining[slot] != 0u) continue;
             voices.v.stealTailPhaseIdx[slot] = tail.phaseIdx;
             voices.v.stealTailPhaseFrac[slot] = tail.phaseFrac;
@@ -1216,6 +1220,7 @@ inline void RenderScalar::RenderWholeVoiceBlock(
             voices.v.stealTailFramesTotal[slot] = tail.framesTotal;
             if (voices.v.rot != nullptr) voices.v.stealTailRot[slot] = tail.rot;
             voices.AdoptStealTailSlot(slot);
+            firstFreeTailSlot = slot + 1u;
             break;
         }
     }
