@@ -3,11 +3,11 @@
 
 // The one GLSL source of the GPU render stage (GLSL 4.30 compute).  The
 // backend prepends "#version 430", GROUP/TILE sizes and one of VOICE_CS /
-// REDUCE_CS / SCATTER_CS.  Boundary 3: the voice kernel repeats the scalar
-// sustained-loop math step by step (phase += step once per frame, the same
-// wrap and interior-run bookkeeping, `precise` on every value so no compiler
-// fuses mul+add); only the cross-voice sum order differs, so audio is
-// tolerance-equal and phase/filter state is bit-equal.
+// REDUCE_CS / SCATTER_CS.  The voice kernel repeats the scalar sustained-loop
+// math step by step (a 32.32 fixed-point cursor held as an index word and a
+// fraction word, the same wrap and interior/edge classification, `precise` on
+// every value so no compiler fuses mul+add); only the cross-voice sum order
+// differs, so audio is tolerance-equal and cursor/filter state is bit-equal.
 //
 // Memory: a voice reads two neighbouring samples per frame from its own spot
 // of a multi-megabyte store, so a warp's loads land on ~32 cache lines.  A
@@ -110,34 +110,43 @@ int Sample16(uint i) {
     return bitfieldExtract(int(StoreWord(i >> 1u)), int((i & 1u) << 4u), 16);
 }
 
-// Position of the next frame: the scalar kernel's run bookkeeping.  Advances
-// phase (and the run counter) exactly once, only for frames that exist.
-void Classify(bool v, inout precise float phase, inout uint runLeft,
-              out uint first, out float frac, out bool edge,
-              uint sampleStart, uint relLoopE, float relLoopSF,
-              float relLoopEF, float loopLength, float lastInterior,
-              float phaseInc) {
-    if (v && runLeft == 0u) {
-        if (phase >= relLoopEF) {
-            precise float overflow = phase - relLoopEF;
-            if (overflow >= loopLength)
-                overflow -= floor(overflow / loopLength) * loopLength;
-            phase = relLoopSF + overflow;
+// Interpolation weight of a 32-bit fraction: its top 24 bits, exact in a float
+// (the same value the scalar and AVX2 kernels use).
+float FxWeight(uint frac) {
+    return float(frac >> 8u) * (1.0 / 16777216.0);
+}
+
+// pos += step in 32.32 (index word, fraction word).
+#define FX_ADD(PI, PF, SI, SF) { uint c_; PF = uaddCarry(PF, SF, c_); PI += (SI) + c_; }
+
+// Wraps an index past the loop end back into the loop (any number of loops);
+// the loop end has no fraction, so the fraction word is untouched.
+void FxWrap(inout uint idx, uint relLoopS, uint relLoopE) {
+    if (idx >= relLoopE) {
+        uint over = idx - relLoopE;
+        uint len = relLoopE - relLoopS;
+        if (len == 0u) {
+            over = 0u;
+        } else if (over >= len) {
+            over = over % len;
         }
-        if (phase < lastInterior) {
-            precise float distance = lastInterior - phase;
-            precise float runF = ceil(distance / phaseInc);
-            runLeft = max(uint(min(runF, 4.0e9)), 1u);
-        }
+        idx = relLoopS + over;
     }
-    bool inRun = runLeft != 0u;
-    uint base = uint(phase);
-    if (!inRun) base = min(base, relLoopE - 1u);
-    edge = v && !inRun;
-    if (v && inRun) --runLeft;
+}
+
+// Position of the next frame of a sustained-loop row: wrap, then interior
+// (reads idx and idx + 1) or edge (reads idx and the loop start).  Advances the
+// cursor exactly once, only for frames that exist.
+void Classify(bool v, inout uint pIdx, inout uint pFrac, uint sIdx, uint sFrac,
+              out uint first, out float frac, out bool edge,
+              uint sampleStart, uint relLoopS, uint relLoopE) {
+    if (v) FxWrap(pIdx, relLoopS, relLoopE);
+    uint base = pIdx;
+    edge = v && (pIdx + 1u >= relLoopE);
+    if (edge) base = min(base, relLoopE - 1u);
     first = sampleStart + base;
-    frac = phase - float(base);
-    if (v) phase += phaseInc;
+    frac = FxWeight(pFrac);
+    if (v) FX_ADD(pIdx, pFrac, sIdx, sFrac)
 }
 
 #endif
@@ -145,11 +154,12 @@ void Classify(bool v, inout precise float phase, inout uint runLeft,
 #if defined(VOICE_CS)
 layout(std430, binding = 1) readonly buffer RowBuf { uint rows[]; };
 layout(std430, binding = 2) readonly buffer ListBuf { uint listv[]; };
-layout(std430, binding = 5) writeonly buffer DynBuf { vec4 dynv[]; };
+layout(std430, binding = 5) writeonly buffer DynBuf { uvec4 dynv[]; };
 layout(std430, binding = 11) buffer StateBuf { uint state[]; };
 
-// Fast path: one interior frame of a running span (no clamp, no wrap).
-#define FAST_POS(I, F) { uint b_ = uint(phase); I = sampleStart + b_; F = phase - float(b_); phase += phaseInc; }
+// Fast path: four interior frames (no clamp, no wrap): the cursor positions
+// of frames 1..3 are computed up front, frame k reads (I, F) = (index, weight).
+#define FAST_POS(I, F, PI, PF) { I = sampleStart + (PI); F = FxWeight(PF); }
 // The two samples at positions i, i+1 as the halves of one 32-bit value,
 // without a branch: shift the 64-bit window (wa, wb) right by 16 * (i & 1).
 #define FAST_LOAD(I) uint wa_ = store[(I) >> 1u]; uint wb_ = store[((I) >> 1u) + 1u];
@@ -163,16 +173,16 @@ void main() {
     uint idx = g * GROUP + t;
     bool live = idx < uCount;
 
-    precise float phase = 0.0;
+    uint pIdx = 0u;
+    uint pFrac = 0u;
+    uint sIdx = 0u;
+    uint sFrac = 0u;
     precise float z1 = 0.0;
     precise float z2 = 0.0;
     uint sampleStart = 0u;
     uint relLoopS = 0u;
     uint relLoopE = 1u;
     bool filt = false;
-    precise float relLoopSF = 0.0;
-    precise float relLoopEF = 1.0;
-    precise float phaseInc = 0.0;
     precise float gainL = 0.0;
     precise float gainR = 0.0;
     precise float a0 = 0.0;
@@ -181,27 +191,25 @@ void main() {
     uint handle = 0u;
     if (live) {
         handle = listv[uListBase + idx];
-        uint sb = handle * 8u;
+        uint sb = handle * 9u;
         uint b = handle * 12u;
         uint w0 = rows[b];
         sampleStart = w0 & 0x7FFFFFFFu;
         filt = (w0 & 0x80000000u) != 0u;
         relLoopS = rows[b + 1u];
         relLoopE = rows[b + 2u];
-        relLoopSF = uintBitsToFloat(rows[b + 3u]);
-        relLoopEF = uintBitsToFloat(rows[b + 4u]);
-        phaseInc = uintBitsToFloat(rows[b + 6u]);
+        sIdx = rows[b + 3u];
+        sFrac = rows[b + 4u];
         gainL = uintBitsToFloat(rows[b + 7u]);
         gainR = uintBitsToFloat(rows[b + 8u]);
         a0 = uintBitsToFloat(rows[b + 9u]);
         b1 = uintBitsToFloat(rows[b + 10u]);
         b2 = uintBitsToFloat(rows[b + 11u]);
-        phase = max(0.0, uintBitsToFloat(state[sb]));
+        pIdx = state[sb];
+        pFrac = state[sb + 8u];
         z1 = uintBitsToFloat(state[sb + 1u]);
         z2 = uintBitsToFloat(state[sb + 2u]);
     }
-    precise float loopLength = relLoopEF - relLoopSF;
-    precise float lastInterior = relLoopEF - 1.0;
     precise float twoA0 = 2.0 * a0;
     // Samples are fetched as integers; the 1/32768 conversion is a power of
     // two, so it commutes exactly with the interpolation and folds into the
@@ -209,11 +217,6 @@ void main() {
     const float kScale = 1.0 / 32768.0;
     precise float gainLs = gainL * kScale;
     precise float gainRs = gainR * kScale;
-    // The scalar kernel classifies frames in runs: at a run start it measures
-    // the distance to the last interior phase once (ceil(distance / step)) and
-    // renders that many interior frames with no wrap check, even if the
-    // accumulated phase has drifted past the boundary by then.  Mirror it.
-    uint runLeft = 0u;
     
     uint row = t / LANES;
     uint lane = t % LANES;
@@ -222,14 +225,24 @@ void main() {
 #if defined(SUBGROUP32)
         DECLARE_OV
 #endif
-        // Fast path: four interior frames of a running span (almost every
-        // tile).  No wrap, edge or tail bookkeeping is needed.
-        bool fast = live && (tile + 1u) * TILE <= uFrames && runLeft >= TILE;
+        // Fast path: four interior frames (almost every tile).  The cursor
+        // is exact, so the last frame's index decides whether any of the four
+        // wraps or touches the loop edge.
+        uint q1i = 0u, q1f = 0u, q2i = 0u, q2f = 0u, q3i = 0u, q3f = 0u;
+        bool fast = live && (tile + 1u) * TILE <= uFrames;
+        if (fast) {
+            FxWrap(pIdx, relLoopS, relLoopE);
+            q1i = pIdx; q1f = pFrac; FX_ADD(q1i, q1f, sIdx, sFrac)
+            q2i = q1i; q2f = q1f; FX_ADD(q2i, q2f, sIdx, sFrac)
+            q3i = q2i; q3f = q2f; FX_ADD(q3i, q3f, sIdx, sFrac)
+            fast = q3i + 1u < relLoopE;
+        }
         if (fast) {
             uint i0, i1, i2, i3;
             float f0, f1, f2, f3;
-            FAST_POS(i0, f0) FAST_POS(i1, f1) FAST_POS(i2, f2) FAST_POS(i3, f3)
-            runLeft -= TILE;
+            FAST_POS(i0, f0, pIdx, pFrac) FAST_POS(i1, f1, q1i, q1f)
+            FAST_POS(i2, f2, q2i, q2f) FAST_POS(i3, f3, q3i, q3f)
+            pIdx = q3i; pFrac = q3f; FX_ADD(pIdx, pFrac, sIdx, sFrac)
             if (filt) {
                 FAST_OUT_FILT(0u, i0, f0) FAST_OUT_FILT(1u, i1, f1)
                 FAST_OUT_FILT(2u, i2, f2) FAST_OUT_FILT(3u, i3, f3)
@@ -245,9 +258,8 @@ void main() {
             bool cEdge, nEdge, cValid, nValid;
             uint cA, cB, nA, nB;
             cValid = live && (tile * TILE) < uFrames;
-            Classify(cValid, phase, runLeft, cFirst, cFrac, cEdge, sampleStart,
-                     relLoopE, relLoopSF, relLoopEF, loopLength, lastInterior,
-                     phaseInc);
+            Classify(cValid, pIdx, pFrac, sIdx, sFrac, cFirst, cFrac, cEdge,
+                     sampleStart, relLoopS, relLoopE);
             cA = StoreWord(cFirst >> 1u);
             cB = StoreWord((cFirst >> 1u) + 1u);
             for (uint k = 0u; k < TILE; ++k) {
@@ -255,9 +267,8 @@ void main() {
                 nFirst = 0u; nFrac = 0.0; nEdge = false; nA = 0u; nB = 0u;
                 if (k + 1u < TILE) {
                     nValid = live && (tile * TILE + k + 1u) < uFrames;
-                    Classify(nValid, phase, runLeft, nFirst, nFrac, nEdge,
-                             sampleStart, relLoopE, relLoopSF, relLoopEF,
-                             loopLength, lastInterior, phaseInc);
+                    Classify(nValid, pIdx, pFrac, sIdx, sFrac, nFirst, nFrac, nEdge,
+                             sampleStart, relLoopS, relLoopE);
                     nA = StoreWord(nFirst >> 1u);
                     nB = StoreWord((nFirst >> 1u) + 1u);
                 }
@@ -320,9 +331,11 @@ void main() {
 #endif
     }
     if (live) {
-        dynv[uListBase + idx] = vec4(phase, z1, z2, 0.0);
-        uint sb = handle * 8u;
-        state[sb] = floatBitsToUint(phase);
+        dynv[uListBase + idx] = uvec4(pIdx, floatBitsToUint(z1),
+                                      floatBitsToUint(z2), pFrac);
+        uint sb = handle * 9u;
+        state[sb] = pIdx;
+        state[sb + 8u] = pFrac;
         state[sb + 1u] = floatBitsToUint(z1);
         state[sb + 2u] = floatBitsToUint(z2);
     }
@@ -347,13 +360,13 @@ uniform uint uRetireBits;
 #define EMIT(K, L, R) STORE_OUT(K, L, R)
 
 // One interior frame of a released or held-sustained row: the generic machine
-// with the sample pair already loaded.  `ph` is the phase the frame reads and
-// `phNext` the phase after it advances.
-void EnvFastFrame(uint wa, uint wb, uint b, uint sampleStart, float ph,
-                  float phNext, uint n, uint stage, bool filt, float a0,
+// with the sample pair already loaded.  `pf` is the fraction word of the
+// cursor the frame reads (the caller advances the cursor).
+void EnvFastFrame(uint wa, uint wb, uint b, uint sampleStart, uint pf,
+                  uint n, uint stage, bool filt, float a0,
                   float b1, float b2, float twoA0, float mixL, float mixR,
                   float releaseDecay, float retireThreshold,
-                  inout float phase, inout float gain, inout uint relRem,
+                  inout float gain, inout uint relRem,
                   inout float z1, inout float z2, inout bool alive,
                   inout uint retire, out float oL, out float oR) {
     oL = 0.0;
@@ -366,7 +379,7 @@ void EnvFastFrame(uint wa, uint wb, uint b, uint sampleStart, float ph,
     // the low mantissa bits of 2^23 is exactly 2^23 + 32768 + v, so the biased
     // difference is the exact float(s1 - s0) and the bias folds out of
     // float(s0) exactly.
-    precise float frac = ph - float(b);
+    precise float frac = FxWeight(pf);
     precise float f0 = uintBitsToFloat(0x4B000000u | ((x & 0xFFFFu) ^ 0x8000u));
     precise float f1 = uintBitsToFloat(0x4B000000u | ((x >> 16u) ^ 0x8000u));
     precise float d = f1 - f0;
@@ -388,7 +401,6 @@ void EnvFastFrame(uint wa, uint wb, uint b, uint sampleStart, float ph,
     }
     gain = g;
     relRem = rr;
-    phase = phNext;
     precise float smp = u * kScale;
     if (filt) {
         precise float outv = smp * a0 + z1;
@@ -416,7 +428,10 @@ void main() {
     uint idx = g * GROUP + t;
     bool live = idx < uCount;
 
-    precise float phase = 0.0;
+    uint pIdx = 0u;
+    uint pFrac = 0u;
+    uint sIdx = 0u;
+    uint sFrac = 0u;
     precise float z1 = 0.0;
     precise float z2 = 0.0;
     precise float gain = 0.0;
@@ -430,9 +445,6 @@ void main() {
     uint relLoopE = 1u;
     bool filt = false;
     bool loop = false;
-    precise float relLoopSF = 0.0;
-    precise float relLoopEF = 1.0;
-    precise float phaseInc = 0.0;
     precise float mixL = 0.0;
     precise float mixR = 0.0;
     precise float targetGain = 0.0;
@@ -451,9 +463,10 @@ void main() {
     uint handle = 0u;
     if (live) {
         handle = elist[uListBase + idx];
-        uint sb = handle * 8u;
+        uint sb = handle * 9u;
         uint r = handle * 20u;
-        phase = max(0.0, uintBitsToFloat(state[sb]));
+        pIdx = state[sb];
+        pFrac = state[sb + 8u];
         z1 = uintBitsToFloat(state[sb + 1u]);
         z2 = uintBitsToFloat(state[sb + 2u]);
         gain = uintBitsToFloat(state[sb + 3u]);
@@ -468,9 +481,8 @@ void main() {
         relEnd = erows[r + 2u];
         relLoopS = erows[r + 3u];
         relLoopE = erows[r + 4u];
-        relLoopSF = uintBitsToFloat(erows[r + 5u]);
-        relLoopEF = uintBitsToFloat(erows[r + 6u]);
-        phaseInc = uintBitsToFloat(erows[r + 7u]);
+        sIdx = erows[r + 5u];
+        sFrac = erows[r + 6u];
         mixL = uintBitsToFloat(erows[r + 8u]);
         mixR = uintBitsToFloat(erows[r + 9u]);
         targetGain = uintBitsToFloat(erows[r + 10u]);
@@ -503,11 +515,8 @@ void main() {
     bool flipped = false;
     uint stageAtFlip = 0u;
     precise float gainAtFlip = 0.0;
-    precise float plLength = relLoopEF - relLoopSF;
-    precise float plInterior = relLoopEF - 1.0;
     precise float heldLs = heldL * kScale;
     precise float heldRs = heldR * kScale;
-    uint runLeft = 0u;
     bool alive = live;
     uint retire = 0xFFFFFFu;
     uint row = t / LANES;
@@ -524,20 +533,21 @@ void main() {
 #endif
         bool fast = !tlRow && alive && (stage == 0u || stage == 3u) &&
                     (tile + 1u) * TILE <= uFrames;
-        precise float p1 = 0.0, p2 = 0.0, p3 = 0.0, p4 = 0.0;
+        // Cursor positions of frames 1..3 and the one after the tile (exact).
+        uint a1i = pIdx, a1f = pFrac, a2i = 0u, a2f = 0u, a3i = 0u, a3f = 0u;
+        uint a4i = 0u, a4f = 0u;
         if (fast) {
-            p1 = phase + phaseInc;
-            p2 = p1 + phaseInc;
-            p3 = p2 + phaseInc;
-            p4 = p3 + phaseInc;
-            fast = uint(p3) + 1u < interiorLimit &&
-                   (!loop || p4 < relLoopEF);
+            FX_ADD(a1i, a1f, sIdx, sFrac)
+            a2i = a1i; a2f = a1f; FX_ADD(a2i, a2f, sIdx, sFrac)
+            a3i = a2i; a3f = a2f; FX_ADD(a3i, a3f, sIdx, sFrac)
+            a4i = a3i; a4f = a3f; FX_ADD(a4i, a4f, sIdx, sFrac)
+            fast = a3i + 1u < interiorLimit && (!loop || a4i < relLoopE);
         }
         if (fast) {
-            uint q0 = uint(phase);
-            uint q1 = uint(p1);
-            uint q2 = uint(p2);
-            uint q3 = uint(p3);
+            uint q0 = pIdx;
+            uint q1 = a1i;
+            uint q2 = a2i;
+            uint q3 = a3i;
             uint i0 = (sampleStart + q0) >> 1u;
             uint i1 = (sampleStart + q1) >> 1u;
             uint i2 = (sampleStart + q2) >> 1u;
@@ -547,28 +557,38 @@ void main() {
             uint wa2 = store[i2], wb2 = store[i2 + 1u];
             uint wa3 = store[i3], wb3 = store[i3 + 1u];
             precise float oL, oR;
-            precise float ph0 = phase;
             uint n0 = tile * TILE;
-            EnvFastFrame(wa0, wb0, q0, sampleStart, ph0, p1, n0, stage, filt,
+            // The cursor advances with every frame the row was alive for,
+            // the retiring frame included (as in the scalar machine).
+            const uint q0f = pFrac;
+            bool live0 = alive;
+            EnvFastFrame(wa0, wb0, q0, sampleStart, q0f, n0, stage, filt,
                          a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
-                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retireThreshold, gain, relRem, z1, z2, alive,
                          retire, oL, oR);
             EMIT(0u, oL, oR)
-            EnvFastFrame(wa1, wb1, q1, sampleStart, p1, p2, n0 + 1u, stage, filt,
+            if (live0) { pIdx = a1i; pFrac = a1f; }
+            bool live1 = alive;
+            EnvFastFrame(wa1, wb1, q1, sampleStart, a1f, n0 + 1u, stage, filt,
                          a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
-                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retireThreshold, gain, relRem, z1, z2, alive,
                          retire, oL, oR);
             EMIT(1u, oL, oR)
-            EnvFastFrame(wa2, wb2, q2, sampleStart, p2, p3, n0 + 2u, stage, filt,
+            if (live1) { pIdx = a2i; pFrac = a2f; }
+            bool live2 = alive;
+            EnvFastFrame(wa2, wb2, q2, sampleStart, a2f, n0 + 2u, stage, filt,
                          a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
-                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retireThreshold, gain, relRem, z1, z2, alive,
                          retire, oL, oR);
             EMIT(2u, oL, oR)
-            EnvFastFrame(wa3, wb3, q3, sampleStart, p3, p4, n0 + 3u, stage, filt,
+            if (live2) { pIdx = a3i; pFrac = a3f; }
+            bool live3 = alive;
+            EnvFastFrame(wa3, wb3, q3, sampleStart, a3f, n0 + 3u, stage, filt,
                          a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
-                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retireThreshold, gain, relRem, z1, z2, alive,
                          retire, oL, oR);
             EMIT(3u, oL, oR)
+            if (live3) { pIdx = a4i; pFrac = a4f; }
         } else
         for (uint k = 0u; k < TILE; ++k) {
             uint n = tile * TILE + k;
@@ -589,9 +609,8 @@ void main() {
                     uint first;
                     float frac;
                     bool edge;
-                    Classify(true, phase, runLeft, first, frac, edge, sampleStart,
-                             relLoopE, relLoopSF, relLoopEF, plLength, plInterior,
-                             phaseInc);
+                    Classify(true, pIdx, pFrac, sIdx, sFrac, first, frac, edge,
+                             sampleStart, relLoopS, relLoopE);
                     int s0 = Sample16(first);
                     int s1 = edge ? Sample16(sampleStart + relLoopS)
                                   : Sample16(first + 1u);
@@ -615,13 +634,14 @@ void main() {
                         oR = u * heldRs;
                     }
                 } else {
-                uint base = uint(phase);
+                uint base = pIdx;
                 bool ended = false;
                 if (base + 1u >= relEnd) {
                     if (!loop) {
                         ended = true;
                     } else {
-                        phase = relLoopSF;
+                        pIdx = relLoopS;
+                        pFrac = 0u;
                         base = relLoopS;
                     }
                 }
@@ -632,7 +652,7 @@ void main() {
                     uint nextRel = base + 1u;
                     if (loop && nextRel >= relLoopE) nextRel = relLoopS;
                     if (nextRel >= relEnd) nextRel = relEnd - 1u;
-                    precise float frac = phase - float(base);
+                    precise float frac = FxWeight(pFrac);
                     int s0 = Sample16(sampleStart + base);
                     int s1 = Sample16(sampleStart + nextRel);
                     precise float d = float(s1 - s0);
@@ -671,14 +691,8 @@ void main() {
                             if (decRem == 0u) stage = 3u;
                         }
                     }
-                    phase += phaseInc;
-                    if (loop && phase >= relLoopEF) {
-                        precise float overflow = phase - relLoopEF;
-                        precise float loopLength = relLoopEF - relLoopSF;
-                        if (loopLength > 0.0 && overflow >= loopLength)
-                            overflow -= floor(overflow / loopLength) * loopLength;
-                        phase = relLoopSF + overflow;
-                    }
+                    FX_ADD(pIdx, pFrac, sIdx, sFrac)
+                    if (loop) FxWrap(pIdx, relLoopS, relLoopE);
                     precise float smp = u * kScale;
                     if (filt) {
                         precise float outv = smp * a0 + z1;
@@ -726,19 +740,21 @@ void main() {
 #endif
     }
     if (live) {
-        edyn[(uListBase + idx) * 2u] = uvec4(floatBitsToUint(phase), floatBitsToUint(z1),
+        edyn[(uListBase + idx) * 3u] = uvec4(pIdx, floatBitsToUint(z1),
                                floatBitsToUint(z2), floatBitsToUint(gain));
+        edyn[(uListBase + idx) * 3u + 2u] = uvec4(pFrac, 0u, 0u, 0u);
         // A row that left its sustain stage at the flip reports its gain at the
         // flip in attackRem (the stage's counters are zero), for the CPU's
         // render-gain bake.
         bool gainSlot = flipped && stageAtFlip == 3u;
         uint shownStage = flipped ? stageAtFlip : stage;
-        edyn[(uListBase + idx) * 2u + 1u] = uvec4(
+        edyn[(uListBase + idx) * 3u + 1u] = uvec4(
             (shownStage << 24u) | (flipped ? FLIPPED_BIT : 0u) | (retire & 0xFFFFFFu),
             gainSlot ? floatBitsToUint(gainAtFlip) : atkRem,
             gainSlot ? 0u : decRem, relRem);
-        uint sb = handle * 8u;
-        state[sb] = floatBitsToUint(phase);
+        uint sb = handle * 9u;
+        state[sb] = pIdx;
+        state[sb + 8u] = pFrac;
         state[sb + 1u] = floatBitsToUint(z1);
         state[sb + 2u] = floatBitsToUint(z2);
         state[sb + 3u] = floatBitsToUint(gain);
@@ -784,7 +800,8 @@ void main() {
     for (uint w = 0u; w < 12u; ++w)
         rows[h * 12u + w] = upload[b + 1u + w];
     for (uint w = 0u; w < 3u; ++w)
-        state[h * 8u + w] = upload[b + 13u + w];
+        state[h * 9u + w] = upload[b + 13u + w];
+    state[h * 9u + 8u] = upload[b + 6u];
 }
 #endif
 
@@ -799,13 +816,13 @@ uniform uint uBase;
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= uCount) return;
-    uint b = (uBase + i) * 32u;
+    uint b = (uBase + i) * 36u;
     uint h = eupload[b];
     for (uint w = 0u; w < 20u; ++w)
         erows[h * 20u + w] = eupload[b + 1u + w];
-    for (uint w = 0u; w < 8u; ++w)
-        state[h * 8u + w] = eupload[b + 21u + w];
-    tlh[h] = uvec4(eupload[b + 29u], eupload[b + 30u], eupload[b + 31u], 0u);
+    for (uint w = 0u; w < 9u; ++w)
+        state[h * 9u + w] = eupload[b + 21u + w];
+    tlh[h] = uvec4(eupload[b + 30u], eupload[b + 31u], eupload[b + 32u], 0u);
 }
 #endif
 )GLSL";

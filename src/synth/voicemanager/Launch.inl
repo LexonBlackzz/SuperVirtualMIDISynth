@@ -521,7 +521,7 @@ inline void VoiceManager::ApplyVoiceConfigurationFieldsImpl(
     v.pitchBendScales[handle] = setup.pitchBendScale;
     SVMS_LAUNCH_SET(sampleBacked, setup.sampleBacked);
 
-    if constexpr (!kStage) v.phases[handle] = 0.0f;
+    if constexpr (!kStage) { v.phaseIdx[handle] = 0u; v.phaseFrac[handle] = 0u; }
 
     const uint32_t relEnd = setup.sampleEnd > setup.sampleStart
         ? setup.sampleEnd - setup.sampleStart : 0u;
@@ -633,7 +633,8 @@ inline void VoiceManager::MaterializeLaunch(VoiceHandle handle) noexcept {
 #define SVMS_MATERIALIZE_FIELD(type, name) v.name[handle] = rec.name;
     SVMS_VOICE_LAUNCH_FIELDS(SVMS_MATERIALIZE_FIELD)
 #undef SVMS_MATERIALIZE_FIELD
-    v.phases[handle] = 0.0f;
+    v.phaseIdx[handle] = 0u;
+    v.phaseFrac[handle] = 0u;
     v.filterZ1[handle] = 0.0f;
     v.filterZ2[handle] = 0.0f;
     v.relLoopSF[handle] = static_cast<float>(rec.relLoopS);

@@ -96,9 +96,8 @@ public:
     bool SortByRegion() const { return sortByRegion_; }
     // The store position a row reads at block start, in 64-frame steps, with the
     // handle: the sort entry (key in the high word).
-    static uint64_t SortEntry(uint32_t handle, uint32_t sampleStart, float phase) {
-        const uint32_t position =
-            sampleStart + (phase > 0.0f && phase < 1.0e9f ? static_cast<uint32_t>(phase) : 0u);
+    static uint64_t SortEntry(uint32_t handle, uint32_t sampleStart, uint32_t phaseIdx) {
+        const uint32_t position = sampleStart + phaseIdx;
         const uint32_t key = (std::min)(position >> 6, 0xFFFFFFu);
         return (static_cast<uint64_t>(key) << 32) | handle;
     }
@@ -113,16 +112,16 @@ public:
 
     // Stable counting sort of rows[0, count) by the store position each row
     // reads at block start, in 64-frame (one cache line) steps: two 12-bit
-    // passes.  `sampleStart` and `phases` are the voice pool's per-handle arrays.
+    // passes.  `sampleStart` and `phaseIdx` are the voice pool's per-handle arrays.
     void SortRows(uint32_t* rows, uint32_t count, const uint32_t* sampleStart,
-                  const float* phases) {
+                  const uint32_t* phaseIdx) {
         if (!sortByRegion_ || count < 64u || count > sortA_.size()) return;
         const uint64_t start = NowMicros();
         uint64_t* a = sortA_.data();
         uint64_t* b = sortB_.data();
         for (uint32_t i = 0u; i < count; ++i) {
             const uint32_t h = rows[i];
-            a[i] = SortEntry(h, sampleStart[h], phases[h]);
+            a[i] = SortEntry(h, sampleStart[h], phaseIdx[h]);
         }
         uint32_t counts[4096];
         for (uint32_t shift = 32u; shift <= 44u; shift += 12u) {

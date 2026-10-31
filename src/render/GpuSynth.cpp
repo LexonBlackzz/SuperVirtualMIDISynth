@@ -41,9 +41,11 @@ constexpr uint32_t kChunkFrameCeiling = 2048u;
 // struct packing and the structured-buffer stride agree; the trailing pad
 // keeps the stride a multiple of 16 for the structured-buffer bind.
 struct GpuVoiceIn {
-    float phase, phaseInc, currentGain, targetGain, sustainLevel;
+    uint32_t phaseIdx, phaseFrac;       // 32.32 fixed-point cursor
+    float currentGain, targetGain, sustainLevel;
     float attackGainStep, decaySlope, releaseDecay;
-    float mixGainL, mixGainR, relLoopSF, relLoopEF;
+    float mixGainL, mixGainR;
+    uint32_t stepIdx, stepFrac;         // 32.32 fixed-point step
     uint32_t sampleStart, relEnd, relLoopS, relLoopE;
     uint32_t delayRemaining, holdRemaining, attackRemaining, decayRemaining;
     uint32_t releaseRemaining, fadeRemaining, fadeTotal;
@@ -55,10 +57,11 @@ static_assert(sizeof(GpuVoiceIn) % 16 == 0,
 
 // Per-voice state read back from the GPU after rendering.
 struct GpuVoiceOut {
-    float phase, currentGain;
+    uint32_t phaseIdx;
+    float currentGain;
     uint32_t delayRemaining, holdRemaining, attackRemaining, decayRemaining;
     uint32_t releaseRemaining, fadeRemaining, envelopeStage, state;
-    uint32_t pad0, pad1;
+    uint32_t phaseFrac, pad1;
 };
 static_assert(sizeof(GpuVoiceOut) % 16 == 0,
               "GpuVoiceOut stride must be a multiple of 16");
@@ -80,9 +83,11 @@ const char* kGpuVoiceShader = R"HLSL(
 #define RELEASE_INFINITE 0xFFFFFFFFu
 
 struct VoiceIn {
-    float phase, phaseInc, currentGain, targetGain, sustainLevel;
+    uint phaseIdx, phaseFrac;
+    float currentGain, targetGain, sustainLevel;
     float attackGainStep, decaySlope, releaseDecay;
-    float mixGainL, mixGainR, relLoopSF, relLoopEF;
+    float mixGainL, mixGainR;
+    uint stepIdx, stepFrac;
     uint sampleStart, relEnd, relLoopS, relLoopE;
     uint delayRemaining, holdRemaining, attackRemaining, decayRemaining;
     uint releaseRemaining, fadeRemaining, fadeTotal;
@@ -90,10 +95,11 @@ struct VoiceIn {
     uint pad;
 };
 struct VoiceOut {
-    float phase, currentGain;
+    uint phaseIdx;
+    float currentGain;
     uint delayRemaining, holdRemaining, attackRemaining, decayRemaining;
     uint releaseRemaining, fadeRemaining, envelopeStage, state;
-    uint pad0, pad1;
+    uint phaseFrac, pad1;
 };
 
 cbuffer Params : register(b0) { uint numVoices, numFrames, poolFrames, pad; }
@@ -107,8 +113,8 @@ void VoiceCS(uint3 id : SV_DispatchThreadID) {
     uint v = id.x;
     if (v >= numVoices) return;
     VoiceIn In = gVoiceIn[v];
-    float phase = In.phase;
-    const float phaseInc = In.phaseInc;
+    uint pIdx = In.phaseIdx, pFrac = In.phaseFrac;
+    const uint sIdx = In.stepIdx, sFrac = In.stepFrac;
     float gain = In.currentGain;
     const float targetGain = In.targetGain;
     const float sustainLev = In.sustainLevel;
@@ -129,7 +135,6 @@ void VoiceCS(uint3 id : SV_DispatchThreadID) {
     const uint relEnd = In.relEnd;
     const uint relLoopS = In.relLoopS;
     const uint relLoopE = In.relLoopE;
-    const float relLoopSF = In.relLoopSF, relLoopEF = In.relLoopEF;
     const bool isReleased = (state == STATE_RELEASE);
 
     bool dead = false;
@@ -145,23 +150,23 @@ void VoiceCS(uint3 id : SV_DispatchThreadID) {
         bool releaseFinished = false;
 
         if (sampleBacked) {
-            if (phase < 0.0f) phase = 0.0f;
-            uint baseOffset = (uint)phase;
+            uint baseOffset = pIdx;
             if (baseOffset + 1u >= relEnd) {
                 if (!looping) {
                     // CPU: retireVoice = true; goto done.  The final sample
                     // is never emitted and the envelope/phase do not advance.
                     retireVoice = true;
                 } else {
-                    // CPU snaps the phase to the loop start on deref.
-                    phase = relLoopSF;
+                    // CPU snaps the cursor to the loop start on deref.
+                    pIdx = relLoopS;
+                    pFrac = 0u;
                     baseOffset = relLoopS;
                     uint nextRel = baseOffset + 1u;
                     if (nextRel >= relLoopE) nextRel = relLoopS;
                     if (nextRel >= relEnd) nextRel = relEnd - 1u;
                     const float s0 = gPool[base + baseOffset];
                     const float s1 = gPool[base + nextRel];
-                    const float fr = phase - (float)baseOffset;
+                    const float fr = (float)(pFrac >> 8u) * (1.0f / 16777216.0f);
                     sample = s0 + (s1 - s0) * fr;
                 }
             } else {
@@ -170,7 +175,7 @@ void VoiceCS(uint3 id : SV_DispatchThreadID) {
                 if (nextRel >= relEnd) nextRel = relEnd - 1u;
                 const float s0 = gPool[base + baseOffset];
                 const float s1 = gPool[base + nextRel];
-                const float fr = phase - (float)baseOffset;
+                const float fr = (float)(pFrac >> 8u) * (1.0f / 16777216.0f);
                 sample = s0 + (s1 - s0) * fr;
             }
         }
@@ -216,13 +221,15 @@ void VoiceCS(uint3 id : SV_DispatchThreadID) {
                     if (decayRem == 0u) stage = ENV_SUSTAIN;
                 }
             }
-            phase += phaseInc;
-            if (looping && phase >= relLoopEF) {
-                float overflow = phase - relLoopEF;
-                const float loopLength = relLoopEF - relLoopSF;
-                if (loopLength > 0.0f && overflow >= loopLength)
-                    overflow -= floor(overflow / loopLength) * loopLength;
-                phase = relLoopSF + overflow;
+            const uint nf = pFrac + sFrac;
+            pIdx += sIdx + (nf < sFrac ? 1u : 0u);
+            pFrac = nf;
+            if (looping && pIdx >= relLoopE) {
+                uint over = pIdx - relLoopE;
+                const uint loopLen = relLoopE - relLoopS;
+                if (loopLen == 0u) over = 0u;
+                else if (over >= loopLen) over = over % loopLen;
+                pIdx = relLoopS + over;
             }
         }
 
@@ -250,7 +257,7 @@ void VoiceCS(uint3 id : SV_DispatchThreadID) {
     }
 
     VoiceOut outv;
-    outv.phase = phase;
+    outv.phaseIdx = pIdx;
     outv.currentGain = gain;
     outv.delayRemaining = delayRem;
     outv.holdRemaining = holdRem;
@@ -260,7 +267,7 @@ void VoiceCS(uint3 id : SV_DispatchThreadID) {
     outv.fadeRemaining = fadeRem;
     outv.envelopeStage = stage;
     outv.state = state;
-    outv.pad0 = 0u;
+    outv.phaseFrac = pFrac;
     outv.pad1 = 0u;
     gVoiceOut[v] = outv;
 }
@@ -475,8 +482,13 @@ void GpuSynth::RenderBlock(VoiceManager& voices, float* outL, float* outR,
                 continue;
             handles[upCount] = h;
             GpuVoiceIn& p = packed[upCount++];
-            p.phase = v.phases[h];
-            p.phaseInc = v.phaseIncs[h];
+            p.phaseIdx = v.phaseIdx[h];
+            p.phaseFrac = v.phaseFrac[h];
+            {
+                const uint64_t stepFx = phasefx::FromFloat(v.phaseIncs[h]);
+                p.stepIdx = phasefx::Index(stepFx);
+                p.stepFrac = phasefx::Frac(stepFx);
+            }
             p.currentGain = v.currentGain[h];
             p.targetGain = v.targetGain[h];
             p.sustainLevel = v.sustainLevel[h];
@@ -485,8 +497,6 @@ void GpuSynth::RenderBlock(VoiceManager& voices, float* outL, float* outR,
             p.releaseDecay = v.releaseDecay[h];
             p.mixGainL = v.mixGainL[h];
             p.mixGainR = v.mixGainR[h];
-            p.relLoopSF = v.relLoopSF[h];
-            p.relLoopEF = v.relLoopEF[h];
             p.sampleStart = v.sampleStart[h];
             p.relEnd = v.relEnd[h];
             p.relLoopS = v.relLoopS[h];
@@ -582,7 +592,8 @@ void GpuSynth::RenderBlock(VoiceManager& voices, float* outL, float* outR,
             if (o.state == 0u) continue; // retired; skipped in apply pass
             const uint32_t h = handles[i];
             const uint8_t oldStage = v.envelopeStage[h];
-            v.phases[h] = o.phase;
+            v.phaseIdx[h] = o.phaseIdx;
+            v.phaseFrac[h] = o.phaseFrac;
             v.currentGain[h] = o.currentGain;
             v.delaySamplesRemaining[h] = o.delayRemaining;
             v.holdSamplesRemaining[h] = o.holdRemaining;

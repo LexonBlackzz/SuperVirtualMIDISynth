@@ -704,7 +704,7 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->sf2Telemetry_.renderPeak = renderPeak;
         if (self->sf2Telemetry_.lastVoiceHandle < vm->GetMaxVoices()) {
             const uint32_t h = self->sf2Telemetry_.lastVoiceHandle;
-            self->sf2Telemetry_.lastPhase = vm->v.phases[h];
+            self->sf2Telemetry_.lastPhase = phasefx::LoadFloat(vm->v, h);
         }
     }
     // The pool census is emitted further down: it needs the block's cpu/percent
@@ -2251,7 +2251,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
     sf2Telemetry_.lastAttackSamples = lastSetup.attackSamples;
     sf2Telemetry_.lastFloatSample = static_cast<float>(sampleDataStore[lastSetup.sampleStart]) / 32768.0f;
     sf2Telemetry_.lastPhaseStep = lastSetup.phaseStep;
-    sf2Telemetry_.lastPhase = voiceManager->v.phases[lastVoice];
+    sf2Telemetry_.lastPhase = phasefx::LoadFloat(voiceManager->v, lastVoice);
     sf2Telemetry_.lastRelativeEnd = voiceManager->v.relEnd[lastVoice];
     sf2Telemetry_.lastSampleBacked = voiceManager->v.sampleBacked[lastVoice];
     sf2Telemetry_.lastVoiceHandle = lastVoice;

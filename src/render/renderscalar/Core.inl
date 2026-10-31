@@ -226,8 +226,8 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                     kNewbornProtectSamples);
 
             // ── Fused per-voice body ──────────────────────────────────
-            float phase          = v.phases[idx];
-            const float phaseStep = v.phaseIncs[idx];
+            uint64_t pos         = phasefx::Load(v, idx);
+            const uint64_t step  = phasefx::FromFloat(v.phaseIncs[idx]);
             float gain           = v.currentGain[idx];
             const uint8_t voiceState = v.state[idx];
             const uint32_t sStart = v.sampleStart[idx];
@@ -240,8 +240,8 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
             const uint32_t relEnd    = v.relEnd[idx];
             const uint32_t relLoopS  = v.relLoopS[idx];
             const uint32_t relLoopE  = v.relLoopE[idx];
-            const float    relLoopSF = v.relLoopSF[idx];
-            const float    relLoopEF = v.relLoopEF[idx];
+            const uint64_t loopS64   = phasefx::Pack(relLoopS, 0u);
+            const uint64_t loopE64   = phasefx::Pack(relLoopE, 0u);
             const bool loop = isSampleBacked && (v.loopEnabled[idx] != 0);
 
             float sample = 0.0f;
@@ -257,15 +257,13 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
             bool sustain = false;
 
             if (isSampleBacked) {
-                if (phase < 0.0f) phase = 0.0f;
-
-                uint32_t baseOffset = static_cast<uint32_t>(phase);
+                uint32_t baseOffset = phasefx::Index(pos);
                 if (baseOffset + 1u >= relEnd) {
                     if (!loop) {
                         retireVoice = true;
                         goto done;
                     }
-                    phase = relLoopSF;
+                    pos = loopS64;
                     baseOffset = relLoopS;
                 }
 
@@ -276,7 +274,7 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                     if (nextRel >= relEnd) nextRel = relEnd - 1u;
                     const uint32_t nextIdx = sStart + nextRel;
 
-                    const float frac = phase - static_cast<float>(baseOffset);
+                    const float frac = phasefx::Weight(phasefx::Frac(pos));
 
                     // Skip expensive sample memory access when decimated.
                     // The voice still advances phase and envelope so it
@@ -352,19 +350,12 @@ inline void RenderScalar::RenderBlockFrameMajor(VoiceManager& voices, const Chan
                     }
                 }
 
-                phase += phaseStep;
-
-                if (loop && phase >= relLoopEF) {
-                    float overflow = phase - relLoopEF;
-                    const float loopLength = relLoopEF - relLoopSF;
-                    if (loopLength > 0.0f && overflow >= loopLength)
-                        overflow -= floorf(overflow / loopLength) * loopLength;
-                    phase = relLoopSF + overflow;
-                }
+                pos += step;
+                if (loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
             }
 
         done:
-            v.phases[idx] = phase;
+            phasefx::Store(v, idx, pos);
             if (!sustain) v.currentGain[idx] = gain;
 
             float stealFadeIn = 1.0f;

@@ -347,7 +347,7 @@ void ConfigureWholeVoiceSeedPool(svms::VoiceManager& voices,
                               loop ? 0.4f + static_cast<float>(i % 17u) * 0.11f
                                    : 0.05f,
                               1);
-        voices.v.phases[voice] = static_cast<float>((i * 37u) % 1700u) + 0.375f;
+        svms::phasefx::StoreFloat(voices.v, voice, static_cast<float>((i * 37u) % 1700u) + 0.375f);
         const float gain =
             0.004f * std::ldexp(1.0f, static_cast<int>(i % 9u)) *
             (1.0f + 0.01f * static_cast<float>(i));
@@ -432,8 +432,8 @@ void CheckWholeVoiceStateParity(const svms::VoiceManager& oracleVoices,
             if (wholeVoice == UINT32_MAX) continue;
             const bool stateMatches =
                 oracleVoices.v.state[voice] == wholeVoices.v.state[wholeVoice] &&
-                NearlyEqual(oracleVoices.v.phases[voice],
-                            wholeVoices.v.phases[wholeVoice], g_phaseTol) &&
+                NearlyEqual(svms::phasefx::LoadFloat(oracleVoices.v, voice),
+                            svms::phasefx::LoadFloat(wholeVoices.v, wholeVoice), g_phaseTol) &&
                 NearlyEqual(oracleVoices.v.currentGain[voice],
                             wholeVoices.v.currentGain[wholeVoice], 2.0e-5f) &&
                 oracleVoices.v.releaseSamplesRemaining[voice] ==
@@ -445,8 +445,8 @@ void CheckWholeVoiceStateParity(const svms::VoiceManager& oracleVoices,
                         label, playIndex,
                         oracleVoices.v.state[voice],
                         wholeVoices.v.state[wholeVoice],
-                        oracleVoices.v.phases[voice],
-                        wholeVoices.v.phases[wholeVoice],
+                        svms::phasefx::LoadFloat(oracleVoices.v, voice),
+                        svms::phasefx::LoadFloat(wholeVoices.v, wholeVoice),
                         oracleVoices.v.currentGain[voice],
                         wholeVoices.v.currentGain[wholeVoice],
                         oracleVoices.v.releaseSamplesRemaining[voice],
@@ -695,7 +695,11 @@ void TestStealTailSpanAvx2() {
         Check(scalarRow.Reserve(1u) && kernelRow.Reserve(1u),
               "steal-tail test rows allocate");
         for (svms::VoiceSoA* row : {&scalarRow, &kernelRow}) {
-            row->stealTailPhase[0] = c.phase;
+            {
+                const uint64_t start = svms::phasefx::FromFloat(c.phase);
+                row->stealTailPhaseIdx[0] = svms::phasefx::Index(start);
+                row->stealTailPhaseFrac[0] = svms::phasefx::Frac(start);
+            }
             row->stealTailPhaseInc[0] = c.step;
             row->stealTailGain[0] = 0.8f;
             row->stealTailMixGainL[0] = 0.6f;
@@ -745,8 +749,8 @@ void TestStealTailSpanAvx2() {
         Check(scalarRow.stealTailFramesRemaining[0] ==
                   kernelRow.stealTailFramesRemaining[0],
               "steal-tail kernel leaves the same frames remaining");
-        Check(std::fabs(scalarRow.stealTailPhase[0] -
-                        kernelRow.stealTailPhase[0]) <= 1.0e-4f,
+        Check(scalarRow.stealTailPhaseIdx[0] == kernelRow.stealTailPhaseIdx[0] &&
+                  scalarRow.stealTailPhaseFrac[0] == kernelRow.stealTailPhaseFrac[0],
               "steal-tail kernel leaves the same phase");
         Check(std::fabs(scalarRow.stealTailFilterZ1[0] -
                         kernelRow.stealTailFilterZ1[0]) <= 1.0e-6f &&
@@ -1139,8 +1143,8 @@ void TestWholeVoiceDecimation() {
                         // per frame, so its float rounding drifts by a
                         // fraction of a sample over a few blocks; envelopes
                         // are exact.  Inaudible while muted.
-                        NearlyEqual(oracleVoices->v.phases[h],
-                                    wholeVoices->v.phases[h], 0.5f) &&
+                        NearlyEqual(svms::phasefx::LoadFloat(oracleVoices->v, h),
+                                    svms::phasefx::LoadFloat(wholeVoices->v, h), 0.5f) &&
                         NearlyEqual(oracleVoices->v.currentGain[h],
                                     wholeVoices->v.currentGain[h], 2.0e-5f);
                 }
@@ -1293,7 +1297,7 @@ void RunFilteredGroupKernelTest(bool release) {
         const uint32_t loopLen = loopLengths[i % 4u];
         seed->SetVoiceSample(voice, 0, kRegion, 16, 16 + loopLen, 1u,
                              0.3f + 0.07f * static_cast<float>(i % 23u), 1);
-        seed->v.phases[voice] = static_cast<float>((i * 53u) % 900u) + 0.25f;
+        svms::phasefx::StoreFloat(seed->v, voice, static_cast<float>((i * 53u) % 900u) + 0.25f);
         seed->SetVoiceEnvelope(voice, 0.5f, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f, 0.999f);
         seed->SetVoicePlayIndex(voice, i + 1u);
         seed->SetVoiceGain(voice, 0.3f + 0.01f * static_cast<float>(i),
@@ -1390,7 +1394,7 @@ void RunFilteredGroupKernelTest(bool release) {
             bool stateExact = true;
             for (uint32_t handle : handles) {
                 stateExact = stateExact &&
-                    run[0]->v.phases[handle] == run[1]->v.phases[handle] &&
+                    svms::phasefx::LoadFloat(run[0]->v, handle) == svms::phasefx::LoadFloat(run[1]->v, handle) &&
                     run[0]->v.filterZ1[handle] == run[1]->v.filterZ1[handle] &&
                     run[0]->v.filterZ2[handle] == run[1]->v.filterZ2[handle] &&
                     run[0]->v.currentGain[handle] == run[1]->v.currentGain[handle] &&
@@ -2264,20 +2268,14 @@ void RunWholeVoiceCCDifferential(uint32_t rowOpBudget) {
 
 void TestWholeVoiceCCDifferential() { RunWholeVoiceCCDifferential(0u); }
 
-// quality.fast_chunk_math: closed-form gain/phase per chunk is tolerance-equal
+// quality.fast_chunk_math: closed-form gain ladder per chunk is tolerance-equal
 // (not bit-equal) to the frame-major oracle.  Re-run the steal, launch and CC
 // differentials (their AVX2 passes carry release tails and note-off churn)
 // with the toggle on, at the same tolerances, then restore the exact default.
 void TestFastChunkMathDifferential() {
     svms::SetFastChunkMath(true);
-    // The oracle advances phase with one float add per frame, which at large
-    // phases drifts whole frames over a block (8 adds round in one direction);
-    // the closed-form chunk advance is the closer one to the true phase
-    // (.perf/phasedrift.py: 0.1-0.7 frames vs 0.9-3.5 after 2048 frames).  The
-    // wave tolerance therefore has to cover the oracle's own drift on a
-    // steep waveform, not just float-ulp differences.
-    g_waveTol = 4.0e-3f;
-    g_phaseTol = 0.5f;     // frames, as for muted rows
+    // The cursor is 32.32 fixed point in both the oracle and the chunk kernels,
+    // so only the closed-form gain ladder differs: the default tolerances hold.
     RunWholeVoiceStealDifferential(0u);
     RunWholeVoiceLaunchDifferential(0u);
     RunWholeVoiceCCDifferential(0u);
@@ -2314,7 +2312,12 @@ void RunWholeVoiceVibratoDifferential(bool scalarExact) {
     // steal and retire: those paths diverge from the reference by design
     // (whole-voice scores victims at block start, retires at block end) and
     // are covered by the steal differentials.
-    const uint32_t kBlocks = scalarExact ? 6u : 8u;
+    // SVMS_DUMP_VIB_GOLDEN=<path> (scalar pass only) re-captures the frozen
+    // reference instead of comparing against it: 8 blocks, one render thread.
+    const char* dumpPath = scalarExact ? std::getenv("SVMS_DUMP_VIB_GOLDEN")
+                                       : nullptr;
+    const uint32_t kBlocks = (scalarExact && dumpPath == nullptr) ? 6u : 8u;
+    std::vector<float> dumpLeft, dumpRight;
     constexpr uint32_t kPool = 48u;
     constexpr uint32_t kSeedCount = 32u;
     constexpr uint32_t kEventsPerBlock = 10u;
@@ -2344,7 +2347,7 @@ void RunWholeVoiceVibratoDifferential(bool scalarExact) {
 
     svms::RenderScalar whole;
     Check(whole.ReserveVoiceCapacity(kPool) &&
-              whole.ConfigureRenderThreads(4u, kFrames),
+              whole.ConfigureRenderThreads(dumpPath != nullptr ? 1u : 4u, kFrames),
           "vibrato differential starts the parallel renderer");
     Check(whole.SetRenderBackend(scalarExact ? svms::RenderBackend::Scalar
                                              : svms::RenderBackend::AVX2),
@@ -2403,6 +2406,10 @@ void RunWholeVoiceVibratoDifferential(bool scalarExact) {
                           kFrames, cfg, events.data(),
                           static_cast<uint32_t>(events.size()), true,
                           blockStartFrame);
+        if (dumpPath != nullptr) {
+            dumpLeft.insert(dumpLeft.end(), wholeLeft.begin(), wholeLeft.end());
+            dumpRight.insert(dumpRight.end(), wholeRight.begin(), wholeRight.end());
+        }
         float blockDiff = 0.0f;
         for (uint32_t frame = 0; frame < kFrames; ++frame) {
             blockDiff = (std::max)(blockDiff,
@@ -2417,6 +2424,40 @@ void RunWholeVoiceVibratoDifferential(bool scalarExact) {
     }
     std::fprintf(stderr, "[WVDIFFV] %s vibrato whole-voice vs golden max=%g\n",
                  scalarExact ? "scalar" : "avx2", passMaxDiff);
+    if (dumpPath != nullptr) {
+        std::FILE* out = std::fopen(dumpPath, "wb");
+        Check(out != nullptr, "vibrato golden dump file opens");
+        if (out != nullptr) {
+            std::fputs("// Frozen output of the whole-voice scalar renderer for the vibrato\r\n"
+                       "// differential scenario in V3Tests.cpp (RunWholeVoiceVibratoDifferential):\r\n"
+                       "// 8 blocks x 512 frames, Scalar backend, 1 render thread, seed pool 48/32,\r\n"
+                       "// WholeVoiceRng default seed, DispatchWholeVoiceCCEvent with vibratoLaunches.\r\n"
+                       "// It is the definition of today's forced-scalar vibrato audio; regenerate it\r\n"
+                       "// ONLY on purpose (SVMS_DUMP_VIB_GOLDEN=<path> on the correctness test).\r\n"
+                       "// The cursor is 32.32 fixed point; the previous capture used a float cursor.\r\n"
+                       "// kVibGoldenActive is the sorted playIndex list of the voices still active\r\n"
+                       "// after block 8.\r\n#pragma once\r\n\r\n", out);
+            auto dumpArray = [&](const char* name, const std::vector<float>& data) {
+                std::fprintf(out, "static const float %s[] = {\r\n", name);
+                for (size_t i = 0; i < data.size(); ++i) {
+                    std::fprintf(out, "%.9gf,", data[i]);
+                    if ((i & 7u) == 7u) std::fputs("\r\n", out);
+                }
+                std::fputs("};\r\n", out);
+            };
+            dumpArray("kVibGoldenL", dumpLeft);
+            dumpArray("kVibGoldenR", dumpRight);
+            std::vector<uint32_t> ids;
+            for (uint32_t i = 0; i < wholeVoices->activeCount_; ++i)
+                ids.push_back(wholeVoices->v.playIndex[wholeVoices->activeList_[i]]);
+            std::sort(ids.begin(), ids.end());
+            std::fputs("static const unsigned kVibGoldenActive[] = {", out);
+            for (uint32_t id : ids) std::fprintf(out, "%u,", id);
+            std::fputs("};\r\n", out);
+            std::fclose(out);
+        }
+        return;
+    }
     Check(passMaxDiff <= kMaxWaveDiff,
           "whole-voice vibrato matches the frozen reference within the "
           "control-rate drift budget");

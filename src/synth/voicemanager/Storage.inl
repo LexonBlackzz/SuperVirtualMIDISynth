@@ -490,7 +490,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(envelopeStage);
     SVMS_COPY_GROWN_VOICE_FIELD(sampleBacked);
     SVMS_COPY_GROWN_VOICE_FIELD(renderClass);
-    SVMS_COPY_GROWN_VOICE_FIELD(phases);
+    SVMS_COPY_GROWN_VOICE_FIELD(phaseIdx);
+    SVMS_COPY_GROWN_VOICE_FIELD(phaseFrac);
     SVMS_COPY_GROWN_VOICE_FIELD(phaseIncs);
     SVMS_COPY_GROWN_VOICE_FIELD(currentGain);
     SVMS_COPY_GROWN_VOICE_FIELD(targetGain);
@@ -534,7 +535,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
 
 #define SVMS_COPY_GROWN_TAIL_FIELD(name) \
     std::memcpy(grown.v.name, v.name, sizeof(v.name))
-    SVMS_COPY_GROWN_TAIL_FIELD(stealTailPhase);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailPhaseIdx);
+    SVMS_COPY_GROWN_TAIL_FIELD(stealTailPhaseFrac);
     SVMS_COPY_GROWN_TAIL_FIELD(stealTailPhaseInc);
     SVMS_COPY_GROWN_TAIL_FIELD(stealTailGain);
     SVMS_COPY_GROWN_TAIL_FIELD(stealTailMixGainL);

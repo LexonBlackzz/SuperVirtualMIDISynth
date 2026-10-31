@@ -195,7 +195,7 @@ void TestCapacitySizedVoiceStorage() {
     const auto aligned64 = [](const void* pointer) {
         return (reinterpret_cast<uintptr_t>(pointer) & 63u) == 0u;
     };
-    Check(aligned64(voices->v.rows) && aligned64(voices->v.phases) &&
+    Check(aligned64(voices->v.rows) && aligned64(voices->v.phaseIdx) &&
               aligned64(voices->v.currentGain) &&
               aligned64(voices->v.sampleStart) &&
               aligned64(voices->v.birthFrame),
@@ -206,23 +206,23 @@ void TestCapacitySizedVoiceStorage() {
     Check(handle != svms::kInvalidVoice,
           "capacity-sized storage supports voice allocation");
     if (handle != svms::kInvalidVoice) {
-        voices->v.phases[handle] = 123.25f;
+        svms::phasefx::StoreFloat(voices->v, handle, 123.25f);
         voices->v.currentGain[handle] = 0.625f;
         voices->v.birthFrame[handle] = 987654321ull;
     }
 
     auto copied = std::make_unique<svms::VoiceManager>(*voices);
-    Check(copied->v.phases != voices->v.phases &&
+    Check(copied->v.phaseIdx != voices->v.phaseIdx &&
               copied->v.currentGain != voices->v.currentGain &&
               copied->v.GetCapacity() == voices->v.GetCapacity(),
           "VoiceManager copies own independent voice storage");
     if (handle != svms::kInvalidVoice) {
-        Check(copied->v.phases[handle] == 123.25f &&
+        Check(svms::phasefx::LoadFloat(copied->v, handle) == 123.25f &&
                   copied->v.currentGain[handle] == 0.625f &&
                   copied->v.birthFrame[handle] == 987654321ull,
               "VoiceManager deep copy preserves voice state");
-        voices->v.phases[handle] = 7.0f;
-        Check(copied->v.phases[handle] == 123.25f,
+        svms::phasefx::StoreFloat(voices->v, handle, 7.0f);
+        Check(svms::phasefx::LoadFloat(copied->v, handle) == 123.25f,
               "VoiceManager deep copy is isolated from source writes");
     }
 
@@ -490,8 +490,8 @@ void TestPriorityAwareStealingAndFadeTail() {
                 legacy->v.playIndex[i] == transactional->v.playIndex[i] &&
                 legacy->v.envelopeStage[i] ==
                     transactional->v.envelopeStage[i] &&
-                std::fabs(legacy->v.phases[i] -
-                          transactional->v.phases[i]) < 1.0e-7f &&
+                std::fabs(svms::phasefx::LoadFloat(legacy->v, i) -
+                          svms::phasefx::LoadFloat(transactional->v, i)) < 1.0e-7f &&
                 std::fabs(legacy->v.currentGain[i] -
                           transactional->v.currentGain[i]) < 1.0e-7f;
         }

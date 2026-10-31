@@ -172,7 +172,8 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     }
 #endif
 
-    v.stealTailPhase[tailSlot] = v.phases[handle];
+    v.stealTailPhaseIdx[tailSlot] = v.phaseIdx[handle];
+    v.stealTailPhaseFrac[tailSlot] = v.phaseFrac[handle];
     v.stealTailPhaseInc[tailSlot] = v.phaseIncs[handle];
     v.stealTailGain[tailSlot] = gain;
     v.stealTailMixGainL[tailSlot] = mixL;

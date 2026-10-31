@@ -19,7 +19,7 @@
 //
 // Contracts every kernel here keeps:
 //   - Envelope gains are simulated scalarly into gains[8] with the exact
-//     sequential recurrence; phase advances by repeated `phase += step`.
+//     sequential recurrence; the cursor is a 32.32 fixed-point integer.
 //   - A class entry point returns false WITHOUT mutating state when it cannot
 //     take the batch; the caller then renders each voice on the scalar path.
 //   - Retirements go through RecordRetirement, class changes through the
@@ -119,6 +119,80 @@ inline __m256 FilterVoices8AVX2(VoiceSoA& v, __m256i handles,
     SVMS_ScatterPs(v.filterZ1, h, _mm256_blendv_ps(oldZ1, newZ1, mask));
     SVMS_ScatterPs(v.filterZ2, h, _mm256_blendv_ps(oldZ2, newZ2, mask));
     return _mm256_blendv_ps(input, output, mask);
+}
+
+
+// ════════════════════════════════════════════════════════════════════════
+// 32.32 fixed-point cursor helpers (see synth/PhaseFx.h).
+//
+// A voice cursor is one uint64 (index << 32 | fraction).  The interpolation
+// weight is the top 24 fraction bits as a float, the same value the scalar
+// path derives, so scalar and AVX2 read identical (index, weight) pairs and
+// integer adds make a whole chunk's positions exact.
+// ════════════════════════════════════════════════════════════════════════
+
+// k * step for k = 0..7, ready for FxChunk, plus the scalar multiples the
+// chunk guards use.
+struct FxSteps8 {
+    __m256i lo;      // k * step, k = 0..3 (one uint64 per lane)
+    __m256i hi;      // k * step, k = 4..7
+    uint64_t step;
+    uint64_t step7;
+    uint64_t step8;
+};
+
+inline FxSteps8 MakeFxSteps8(uint64_t step) {
+    alignas(32) uint64_t multiples[8];
+    for (uint32_t k = 0u; k < 8u; ++k) multiples[k] = step * k;
+    FxSteps8 s;
+    s.lo = _mm256_load_si256(reinterpret_cast<const __m256i*>(multiples));
+    s.hi = _mm256_load_si256(reinterpret_cast<const __m256i*>(multiples + 4));
+    s.step = step;
+    s.step7 = multiples[7];
+    s.step8 = step * 8u;
+    return s;
+}
+
+// Weight (top 24 fraction bits) of eight 32-bit fractions.
+inline __m256 FxWeight8(__m256i frac) {
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_srli_epi32(frac, 8)),
+                         _mm256_set1_ps(1.0f / 16777216.0f));
+}
+
+// Sample indices and interpolation weights of the eight frames starting at pos.
+inline void FxChunk(uint64_t pos, const FxSteps8& s, __m256i& bases,
+                    __m256& weight) {
+    const __m256i p = _mm256_set1_epi64x(static_cast<long long>(pos));
+    const __m256i a = _mm256_add_epi64(p, s.lo);
+    const __m256i b = _mm256_add_epi64(p, s.hi);
+    const __m256i odd = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
+    const __m256i even = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    bases = _mm256_permute2x128_si256(
+        _mm256_permutevar8x32_epi32(a, odd),
+        _mm256_permutevar8x32_epi32(b, odd), 0x20);
+    weight = FxWeight8(_mm256_permute2x128_si256(
+        _mm256_permutevar8x32_epi32(a, even),
+        _mm256_permutevar8x32_epi32(b, even), 0x20));
+}
+
+// Eight independent cursors: a cursor past its loop end re-enters at the loop
+// start with the same fraction (single wrap; callers keep step < loop length).
+inline void FxWrap8(__m256i& idx, __m256i loopStart, __m256i loopEnd) {
+    const __m256i past = _mm256_cmpgt_epi32(
+        idx, _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
+    idx = _mm256_blendv_epi8(
+        idx, _mm256_add_epi32(_mm256_sub_epi32(idx, loopEnd), loopStart), past);
+}
+
+// Eight independent cursors (voice-batched kernels): idx/frac += stepIdx/stepFrac
+// with the carry out of the fraction.
+inline void FxAdd8(__m256i& idx, __m256i& frac, __m256i stepIdx,
+                   __m256i stepFrac) {
+    frac = _mm256_add_epi32(frac, stepFrac);
+    const __m256i noCarry = _mm256_cmpeq_epi32(
+        _mm256_max_epu32(frac, stepFrac), frac);
+    const __m256i carry = _mm256_andnot_si256(noCarry, _mm256_set1_epi32(1));
+    idx = _mm256_add_epi32(_mm256_add_epi32(idx, stepIdx), carry);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -237,20 +311,20 @@ void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
         c.sampleData == nullptr || frameCount == 0u) return;
     const uint32_t relEnd = v.stealTailRelEnd[h];
     if (relEnd < 2u) { v.stealTailFramesRemaining[h] = 0u; return; }
-    float phase = (std::max)(0.0f, v.stealTailPhase[h]);
-    const float step = v.stealTailPhaseInc[h];
+    uint64_t pos = phasefx::Pack(v.stealTailPhaseIdx[h], v.stealTailPhaseFrac[h]);
+    const uint64_t step = phasefx::FromFloat(v.stealTailPhaseInc[h]);
     const uint32_t loopS = v.stealTailRelLoopS[h];
     const uint32_t loopE = v.stealTailRelLoopE[h];
-    const float loopSF = v.stealTailRelLoopSF[h];
-    const float loopEF = v.stealTailRelLoopEF[h];
+    const uint64_t loopS64 = phasefx::Pack(loopS, 0u);
+    const uint64_t loopE64 = phasefx::Pack(loopE, 0u);
     const bool loop = v.stealTailLoopEnabled[h] != 0u;
     const uint32_t total = v.stealTailFramesTotal[h];
     const uint32_t count = (std::min)(frameCount, remaining);
     for (uint32_t n = 0; n < count; ++n) {
-        uint32_t base = static_cast<uint32_t>(phase);
+        uint32_t base = phasefx::Index(pos);
         if (base + 1u >= relEnd) {
             if (!loop) { remaining = 0u; break; }
-            phase = loopSF;
+            pos = loopS64;
             base = loopS;
         }
         uint32_t next = base + 1u;
@@ -262,7 +336,7 @@ void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
             remaining = 0u;
             break;
         }
-        const float fraction = phase - static_cast<float>(base);
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(c.sampleData[firstIndex]) *
                             (1.0f / 32768.0f);
         float sample =
@@ -279,17 +353,12 @@ void RenderTailScalar(const RenderSpanContext& c, uint32_t h,
         const float scaled = sample * v.stealTailGain[h] * fade;
         c.outputLeft[c.frameStart + n] += scaled * v.stealTailMixGainL[h];
         c.outputRight[c.frameStart + n] += scaled * v.stealTailMixGainR[h];
-        phase += step;
-        if (loop && phase >= loopEF) {
-            float overflow = phase - loopEF;
-            const float length = loopEF - loopSF;
-            if (length > 0.0f && overflow >= length)
-                overflow -= std::floor(overflow / length) * length;
-            phase = loopSF + overflow;
-        }
+        pos += step;
+        if (loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
         --remaining;
     }
-    v.stealTailPhase[h] = phase;
+    v.stealTailPhaseIdx[h] = phasefx::Index(pos);
+    v.stealTailPhaseFrac[h] = phasefx::Frac(pos);
     v.stealTailFramesRemaining[h] = remaining;
 }
 
@@ -344,11 +413,16 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
         alignas(32) uint32_t hs[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
         bool valid = true;
+        alignas(32) uint32_t stepIdxLane[8], stepFracLane[8];
         for (uint32_t lane = 0; lane < 8u; ++lane) {
             const uint32_t x = hs[lane];
-            const float phase = v.stealTailPhase[x];
-            const float step = v.stealTailPhaseInc[x];
-            const float loopEnd = v.stealTailRelLoopEF[x];
+            const uint64_t pos = phasefx::Pack(v.stealTailPhaseIdx[x],
+                                               v.stealTailPhaseFrac[x]);
+            const uint64_t step = phasefx::FromFloat(v.stealTailPhaseInc[x]);
+            stepIdxLane[lane] = phasefx::Index(step);
+            stepFracLane[lane] = phasefx::Frac(step);
+            const uint64_t loopS64 = phasefx::Pack(v.stealTailRelLoopS[x], 0u);
+            const uint64_t loopE64 = phasefx::Pack(v.stealTailRelLoopE[x], 0u);
             valid = valid && frameCounts[x] == c.frameCount &&
                 v.stealTailFramesRemaining[x] >= c.frameCount &&
                 v.stealTailSampleBacked[x] != 0u &&
@@ -357,24 +431,28 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
                 v.stealTailRelEnd[x] >= 2u &&
                 v.stealTailRelLoopS[x] < v.stealTailRelLoopE[x] &&
                 v.stealTailSampleStart[x] + v.stealTailRelEnd[x] <=
-                    c.sampleDataFrames && phase >= 0.0f && step >= 0.0f &&
-                phase + step * static_cast<float>(c.frameCount - 1u) < loopEnd &&
-                step < loopEnd - v.stealTailRelLoopSF[x];
+                    c.sampleDataFrames &&
+                pos + step * (c.frameCount - 1u) < loopE64 &&
+                step < loopE64 - loopS64;
         }
         if (!valid) {
             for (uint32_t lane = 0; lane < 8u; ++lane)
                 RenderTailScalar(c, hs[lane], frameCounts[hs[lane]]);
             continue;
         }
-        __m256 phase = _mm256_i32gather_ps(v.stealTailPhase, h, 4);
-        const __m256 step = _mm256_i32gather_ps(v.stealTailPhaseInc, h, 4);
+        __m256i phaseIdx = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.stealTailPhaseIdx), h, 4);
+        __m256i phaseFrac = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.stealTailPhaseFrac), h, 4);
+        const __m256i stepIdxV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepIdxLane));
+        const __m256i stepFracV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepFracLane));
         const __m256 gain = _mm256_i32gather_ps(v.stealTailGain, h, 4);
         const __m256 gainL = _mm256_mul_ps(
             gain, _mm256_i32gather_ps(v.stealTailMixGainL, h, 4));
         const __m256 gainR = _mm256_mul_ps(
             gain, _mm256_i32gather_ps(v.stealTailMixGainR, h, 4));
-        const __m256 loopSF = _mm256_i32gather_ps(v.stealTailRelLoopSF, h, 4);
-        const __m256 loopEF = _mm256_i32gather_ps(v.stealTailRelLoopEF, h, 4);
         const __m256i sampleStart = _mm256_i32gather_epi32(
             reinterpret_cast<const int*>(v.stealTailSampleStart), h, 4);
         const __m256i loopS = _mm256_i32gather_epi32(
@@ -386,7 +464,7 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
         const __m256 total = _mm256_cvtepi32_ps(_mm256_i32gather_epi32(
             reinterpret_cast<const int*>(v.stealTailFramesTotal), h, 4));
         for (uint32_t frame = 0; frame < c.frameCount; ++frame) {
-            const __m256i base = _mm256_cvttps_epi32(phase);
+            const __m256i base = phaseIdx;
             const __m256i nextRaw = _mm256_add_epi32(base, _mm256_set1_epi32(1));
             const __m256i wraps = _mm256_cmpgt_epi32(
                 nextRaw, _mm256_sub_epi32(loopE, _mm256_set1_epi32(1)));
@@ -395,8 +473,7 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
                 _mm256_add_epi32(sampleStart, base));
             const __m256 second = GatherSampleAVX2(c.sampleData,
                 _mm256_add_epi32(sampleStart, next));
-            const __m256 fraction = _mm256_sub_ps(
-                phase, _mm256_cvtepi32_ps(base));
+            const __m256 fraction = FxWeight8(phaseFrac);
             const __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             const __m256 fade = _mm256_div_ps(
@@ -407,17 +484,20 @@ void RenderStealTailsAVX2(const RenderSpanContext& c,
             sumR[frame] = _mm256_add_ps(sumR[frame],
                 _mm256_mul_ps(_mm256_mul_ps(sample, fade), gainR));
             remaining = _mm256_sub_ps(remaining, _mm256_set1_ps(1.0f));
-            phase = _mm256_add_ps(phase, step);
+            FxAdd8(phaseIdx, phaseFrac, stepIdxV, stepFracV);
         }
-        const __m256 wrapped = _mm256_add_ps(loopSF,
-            _mm256_sub_ps(phase, loopEF));
-        phase = _mm256_blendv_ps(phase, wrapped,
-            _mm256_cmp_ps(phase, loopEF, _CMP_GE_OQ));
-        alignas(32) float phases[8];
-        _mm256_store_ps(phases, phase);
+        alignas(32) uint32_t idxOut[8], fracOut[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idxOut), phaseIdx);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(fracOut), phaseFrac);
         for (uint32_t lane = 0; lane < 8u; ++lane) {
-            v.stealTailPhase[hs[lane]] = phases[lane];
-            v.stealTailFramesRemaining[hs[lane]] -= c.frameCount;
+            const uint32_t x = hs[lane];
+            const uint64_t wrapped = phasefx::Wrap(
+                phasefx::Pack(idxOut[lane], fracOut[lane]),
+                phasefx::Pack(v.stealTailRelLoopS[x], 0u),
+                phasefx::Pack(v.stealTailRelLoopE[x], 0u));
+            v.stealTailPhaseIdx[x] = phasefx::Index(wrapped);
+            v.stealTailPhaseFrac[x] = phasefx::Frac(wrapped);
+            v.stealTailFramesRemaining[x] -= c.frameCount;
         }
     }
     for (; position < handleCount; ++position)
@@ -573,23 +653,23 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
             c.outputLeft, c.outputRight, c.frameStart, c.frameCount);
     }
 
-    float phase = (std::max)(0.0f, v.phases[handle]);
+    uint64_t pos = phasefx::Load(v, handle);
     float step = v.phaseIncs[handle];
-    const float loopStart = v.relLoopSF[handle];
-    const float loopEnd = v.relLoopEF[handle];
-    const float loopLength = loopEnd - loopStart;
+    uint64_t stepFx = phasefx::FromFloat(step);
+    const uint32_t relLoopS = v.relLoopS[handle];
+    const uint32_t relLoopE = v.relLoopE[handle];
+    const uint64_t loopS64 = phasefx::Pack(relLoopS, 0u);
+    const uint64_t loopE64 = phasefx::Pack(relLoopE, 0u);
+    const uint64_t guard64 = phasefx::Pack(relLoopE - 1u, 0u);
     const float gainL = v.renderGainL[handle];
     const float gainR = v.renderGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
     const uint32_t readable = c.sampleDataFrames - v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
-    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
-                                       4.0f, 5.0f, 6.0f, 7.0f);
-    __m256 stepVector = _mm256_set1_ps(step);
+    FxSteps8 fs = MakeFxSteps8(stepFx);
     const __m256 gainLVector = _mm256_set1_ps(gainL);
     const __m256 gainRVector = _mm256_set1_ps(gainR);
-    const __m256i one = _mm256_set1_epi32(1);
     // Whole-voice vibrato: the 64-frame LFO control window is rebuilt at
     // the loop top; the gate keeps fast chunks from straddling a window
     // boundary.  UINT32_MAX = LFO off (scalar/SSE2 windows are handled by
@@ -601,12 +681,10 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
     if (lfoOn) {
         step = AdvanceVibratoLfoWindow(v, handle,
             (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepVector = _mm256_set1_ps(step);
+        stepFx = phasefx::FromFloat(step);
+        fs = MakeFxSteps8(stepFx);
         windowRemaining = (std::min)(64u, c.frameCount);
     }
-    // quality.fast_chunk_math: phase advances 8 frames in one multiply.
-    const bool fastMath = g_fastChunkMath && !lfoOn;
-    const float step8 = step * 8.0f;
     uint32_t frame = 0u;
 
     while (frame < c.frameCount) {
@@ -614,32 +692,25 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
             const uint32_t win = (std::min)(64u, c.frameCount - frame);
             step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
                                            c.lfoBendRatio);
-            stepVector = _mm256_set1_ps(step);
+            stepFx = phasefx::FromFloat(step);
+            fs = MakeFxSteps8(stepFx);
             windowRemaining = win;
         }
-        if (phase >= loopEnd) {
-            float overflow = phase - loopEnd;
-            if (overflow >= loopLength)
-                overflow -= std::floor(overflow / loopLength) * loopLength;
-            phase = loopStart + overflow;
-        }
-        const float lastPhase = phase + step * 7.0f;
+        pos = phasefx::Wrap(pos, loopS64, loopE64);
+        const uint64_t lastPos = pos + fs.step7;
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
-            lastPhase < loopEnd - 1.0f) {
+            lastPos < guard64) {
             // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
             _mm_prefetch(reinterpret_cast<const char*>(
-                             region +
-                             static_cast<uint32_t>(lastPhase + step)),
+                             region + phasefx::Index(lastPos + stepFx)),
                          _MM_HINT_T0);
-            const __m256 phases = _mm256_add_ps(
-                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
-            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256i bases;
+            __m256 fraction;
+            FxChunk(pos, fs, bases, fraction);
             __m256 first, second;
             GatherSamplePairSeqAVX2(region, readable, bases, first, second);
-            const __m256 fraction = _mm256_sub_ps(
-                phases, _mm256_cvtepi32_ps(bases));
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             if (rot) sample = rot.Chunk(sample, bases, fraction);
@@ -650,13 +721,7 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
             _mm256_storeu_ps(outR + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outR + frame),
                 _mm256_mul_ps(sample, gainRVector)));
-            // Preserve the scalar cursor's repeated-add rounding.
-            if (fastMath) {
-                phase += step8;
-            } else {
-                for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                    phase += step;
-            }
+            pos += fs.step8;
             frame += 8u;
             windowRemaining -= 8u;
             continue;
@@ -664,24 +729,23 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
 
         // Masked tail chunk (see RenderReleaseLoopFramesAVX2): plain voices
         // only, since filter and rotation state advance per lane.
-        if (fastMath && !rot && v.filterEnabled[handle] == 0u &&
+        if (!rot && v.filterEnabled[handle] == 0u && windowRemaining >= c.frameCount - frame &&
             c.frameCount - frame < 8u) {
             const uint32_t rem = c.frameCount - frame;
-            const float lastLive = phase + step * static_cast<float>(rem - 1u);
-            if (lastLive < loopEnd - 1.0f) {
+            const uint64_t lastLive = pos + stepFx * (rem - 1u);
+            if (lastLive < guard64) {
                 const __m256i liveMask = _mm256_cmpgt_epi32(
                     _mm256_set1_epi32(static_cast<int>(rem)),
                     _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-                const __m256 phases = _mm256_min_ps(
-                    _mm256_add_ps(_mm256_set1_ps(phase),
-                                  _mm256_mul_ps(stepVector, lane)),
-                    _mm256_set1_ps(lastLive));
-                const __m256i bases = _mm256_cvttps_epi32(phases);
+                __m256i bases;
+                __m256 fraction;
+                FxChunk(pos, fs, bases, fraction);
+                // Dead lanes may sit past the loop; keep their reads in range.
+                bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
+                    static_cast<int>(phasefx::Index(lastLive))));
                 __m256 first, second;
                 GatherSamplePairSeqAVX2(region, readable, bases, first,
                                         second);
-                const __m256 fraction = _mm256_sub_ps(
-                    phases, _mm256_cvtepi32_ps(bases));
                 const __m256 sample = _mm256_add_ps(first,
                     _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
                 _mm256_maskstore_ps(outL + frame, liveMask, _mm256_add_ps(
@@ -690,34 +754,33 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
                 _mm256_maskstore_ps(outR + frame, liveMask, _mm256_add_ps(
                     _mm256_maskload_ps(outR + frame, liveMask),
                     _mm256_mul_ps(sample, gainRVector)));
-                phase += step * static_cast<float>(rem);
+                pos += stepFx * rem;
                 frame += rem;
+                if (windowRemaining != UINT32_MAX) windowRemaining -= rem;
                 continue;
             }
         }
 
-        uint32_t base = static_cast<uint32_t>(phase);
+        uint32_t base = phasefx::Index(pos);
         if (base + 1u >= v.relEnd[handle]) {
-            phase = loopStart;
-            base = v.relLoopS[handle];
+            pos = loopS64;
+            base = relLoopS;
         }
         uint32_t next = base + 1u;
-        if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
-        const float fraction = phase - static_cast<float>(base);
+        if (next >= relLoopE) next = relLoopS;
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         if (rot) sample = rot.Scalar(sample, base, next, fraction);
         sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
-        phase += step;
+        pos += stepFx;
         --windowRemaining;
         ++frame;
     }
-    // Match the existing AVX2 short-span cursor contract: wrapping happens
-    // before the next rendered sample, so the final increment may remain
-    // just past loopEnd in the stored snapshot.
-    v.phases[handle] = phase;
+    // The stored cursor is wrapped, like the scalar span's.
+    phasefx::Store(v, handle, phasefx::Wrap(pos, loopS64, loopE64));
     rot.Store();
     return UINT32_MAX;
 }
@@ -729,14 +792,13 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
                                  uint32_t handle) {
     VoiceSoA& v = *c.voices;
     if (!ValidateLoopVoice(c, handle)) return 0u;
-    float phase = (std::max)(0.0f, v.phases[handle]);
+    uint64_t pos = phasefx::Load(v, handle);
     float gain = v.currentGain[handle];
     uint32_t remaining = v.releaseSamplesRemaining[handle];
     const float decay = v.releaseDecay[handle];
-    const float step = v.phaseIncs[handle];
-    const float loopStart = v.relLoopSF[handle];
-    const float loopEnd = v.relLoopEF[handle];
-    const float loopLength = loopEnd - loopStart;
+    const uint64_t step = phasefx::FromFloat(v.phaseIncs[handle]);
+    const uint64_t loopS64 = phasefx::Pack(v.relLoopS[handle], 0u);
+    const uint64_t loopE64 = phasefx::Pack(v.relLoopE[handle], 0u);
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
@@ -744,14 +806,14 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     uint32_t retiredAt = UINT32_MAX;
     for (uint32_t frame = 0u; frame < c.frameCount; ++frame) {
-        uint32_t base = static_cast<uint32_t>(phase);
+        uint32_t base = phasefx::Index(pos);
         if (base + 1u >= v.relEnd[handle]) {
-            phase = loopStart;
+            pos = loopS64;
             base = v.relLoopS[handle];
         }
         uint32_t next = base + 1u;
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
-        const float fraction = phase - static_cast<float>(base);
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         bool finished = remaining == 0u;
@@ -764,20 +826,14 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
         }
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        phase += step;
-        if (phase >= loopEnd) {
-            float overflow = phase - loopEnd;
-            if (overflow >= loopLength)
-                overflow -= std::floor(overflow / loopLength) * loopLength;
-            phase = loopStart + overflow;
-        }
+        pos = phasefx::Wrap(pos + step, loopS64, loopE64);
         if (finished ||
             (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
             retiredAt = frame;
             break;
         }
     }
-    v.phases[handle] = phase;
+    phasefx::Store(v, handle, pos);
     v.currentGain[handle] = gain;
     v.releaseSamplesRemaining[handle] = remaining;
     return retiredAt;
@@ -794,24 +850,24 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     // before any state is touched.
     ChunkRotation rot;
     rot.Init(v, c.hilbertData, handle);
-    float phase = (std::max)(0.0f, v.phases[handle]);
+    uint64_t pos = phasefx::Load(v, handle);
     float gain = v.currentGain[handle];
     uint32_t remaining = v.releaseSamplesRemaining[handle];
     const float decay = v.releaseDecay[handle];
     float step = v.phaseIncs[handle];
-    const float loopStart = v.relLoopSF[handle];
-    const float loopEnd = v.relLoopEF[handle];
-    const float loopLength = loopEnd - loopStart;
+    uint64_t stepFx = phasefx::FromFloat(step);
+    const uint32_t relLoopS = v.relLoopS[handle];
+    const uint32_t relLoopE = v.relLoopE[handle];
+    const uint64_t loopS64 = phasefx::Pack(relLoopS, 0u);
+    const uint64_t loopE64 = phasefx::Pack(relLoopE, 0u);
+    const uint64_t guard64 = phasefx::Pack(relLoopE - 1u, 0u);
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
     const uint32_t readable = c.sampleDataFrames - v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
-    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
-                                       4.0f, 5.0f, 6.0f, 7.0f);
-    __m256 stepVector = _mm256_set1_ps(step);
-    const __m256i one = _mm256_set1_epi32(1);
+    FxSteps8 fs = MakeFxSteps8(stepFx);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
     const bool lfoOn = c.lfoActive != 0u &&
         v.vibLfoSteps[handle] != 0.0f &&
@@ -820,13 +876,14 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     if (lfoOn) {
         step = AdvanceVibratoLfoWindow(v, handle,
             (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepVector = _mm256_set1_ps(step);
+        stepFx = phasefx::FromFloat(step);
+        fs = MakeFxSteps8(stepFx);
         windowRemaining = (std::min)(64u, c.frameCount);
     }
-    // quality.fast_chunk_math: gain ladder and phase advance in closed form.
+    // quality.fast_chunk_math: the gain ladder in closed form.
     const bool fastMath = g_fastChunkMath && !lfoOn;
     __m256 decayLadder = _mm256_setzero_ps();
-    float decay8 = 1.0f, step8 = 0.0f;
+    float decay8 = 1.0f;
     alignas(32) float ladder[8] = {};
     if (fastMath) {
         // Powers by squaring in double: three dependent steps, and each float
@@ -842,7 +899,6 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         ladder[7] = static_cast<float>(d4 * d4);
         decayLadder = _mm256_load_ps(ladder);
         decay8 = ladder[7];
-        step8 = step * 8.0f;
     }
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
@@ -851,15 +907,11 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
             const uint32_t win = (std::min)(64u, c.frameCount - frame);
             step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
                                            c.lfoBendRatio);
-            stepVector = _mm256_set1_ps(step);
+            stepFx = phasefx::FromFloat(step);
+            fs = MakeFxSteps8(stepFx);
             windowRemaining = win;
         }
-        if (phase >= loopEnd) {
-            float overflow = phase - loopEnd;
-            if (overflow >= loopLength)
-                overflow -= std::floor(overflow / loopLength) * loopLength;
-            phase = loopStart + overflow;
-        }
+        pos = phasefx::Wrap(pos, loopS64, loopE64);
         float futureGain = gain;
         alignas(32) float gains[8];
         if (fastMath) {
@@ -873,24 +925,20 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
         const bool thresholdSafe = remaining != UINT32_MAX ||
             (fastMath ? futureGain : gains[7]) >= VoiceRetireThreshold();
-        const float lastPhase = phase + step * 7.0f;
+        const uint64_t lastPos = pos + fs.step7;
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
-            countdownSafe && thresholdSafe &&
-            lastPhase < loopEnd - 1.0f) {
+            countdownSafe && thresholdSafe && lastPos < guard64) {
             // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
             _mm_prefetch(reinterpret_cast<const char*>(
-                             region +
-                             static_cast<uint32_t>(lastPhase + step)),
+                             region + phasefx::Index(lastPos + stepFx)),
                          _MM_HINT_T0);
-            const __m256 phases = _mm256_add_ps(
-                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
-            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256i bases;
+            __m256 fraction;
+            FxChunk(pos, fs, bases, fraction);
             __m256 first, second;
             GatherSamplePairSeqAVX2(region, readable, bases, first, second);
-            const __m256 fraction = _mm256_sub_ps(
-                phases, _mm256_cvtepi32_ps(bases));
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
@@ -907,12 +955,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
                 _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
             gain = futureGain;
             if (remaining != UINT32_MAX) remaining -= 8u;
-            if (fastMath) {
-                phase += step8;
-            } else {
-                for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                    phase += step;
-            }
+            pos += fs.step8;
             frame += 8u;
             windowRemaining -= 8u;
             continue;
@@ -928,26 +971,25 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         if (!lfoOn && !rot && v.filterEnabled[handle] == 0u &&
             c.frameCount - frame < 8u) {
             const uint32_t rem = c.frameCount - frame;
-            const float lastLive = phase + step * static_cast<float>(rem - 1u);
+            const uint64_t lastLive = pos + stepFx * (rem - 1u);
             const float tailGain = fastMath ? gain * ladder[rem - 1u]
                                             : gains[rem - 1u];
             if ((remaining == UINT32_MAX || remaining > rem) &&
                 (remaining != UINT32_MAX ||
                  tailGain >= VoiceRetireThreshold()) &&
-                lastLive < loopEnd - 1.0f) {
+                lastLive < guard64) {
                 const __m256i liveMask = _mm256_cmpgt_epi32(
                     _mm256_set1_epi32(static_cast<int>(rem)),
                     _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-                const __m256 phases = _mm256_min_ps(
-                    _mm256_add_ps(_mm256_set1_ps(phase),
-                                  _mm256_mul_ps(stepVector, lane)),
-                    _mm256_set1_ps(lastLive));
-                const __m256i bases = _mm256_cvttps_epi32(phases);
+                __m256i bases;
+                __m256 fraction;
+                FxChunk(pos, fs, bases, fraction);
+                // Dead lanes may sit past the loop; keep their reads in range.
+                bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
+                    static_cast<int>(phasefx::Index(lastLive))));
                 __m256 first, second;
                 GatherSamplePairSeqAVX2(region, readable, bases, first,
                                         second);
-                const __m256 fraction = _mm256_sub_ps(
-                    phases, _mm256_cvtepi32_ps(bases));
                 __m256 sample = _mm256_add_ps(first,
                     _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
                 sample = FilterTime8AVX2(v, handle, sample);
@@ -956,30 +998,28 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
                     ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
                     : _mm256_load_ps(gains);
                 const __m256 scaled = _mm256_mul_ps(sample, gainVector);
-                const __m256 maskPs = _mm256_castsi256_ps(liveMask);
                 _mm256_maskstore_ps(outL + frame, liveMask, _mm256_add_ps(
                     _mm256_maskload_ps(outL + frame, liveMask),
                     _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
                 _mm256_maskstore_ps(outR + frame, liveMask, _mm256_add_ps(
                     _mm256_maskload_ps(outR + frame, liveMask),
                     _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
-                (void)maskPs;
                 gain = tailGain;
                 if (remaining != UINT32_MAX) remaining -= rem;
-                for (uint32_t k = 0u; k < rem; ++k) phase += step;
+                pos += stepFx * rem;
                 frame += rem;
                 continue;
             }
         }
 
-        uint32_t base = static_cast<uint32_t>(phase);
+        uint32_t base = phasefx::Index(pos);
         if (base + 1u >= v.relEnd[handle]) {
-            phase = loopStart;
-            base = v.relLoopS[handle];
+            pos = loopS64;
+            base = relLoopS;
         }
         uint32_t next = base + 1u;
-        if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
-        const float fraction = phase - static_cast<float>(base);
+        if (next >= relLoopE) next = relLoopS;
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         bool finished = remaining == 0u;
@@ -994,14 +1034,8 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         if (rot) sample = rot.Scalar(sample, base, next, fraction);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        phase += step;
+        pos = phasefx::Wrap(pos + stepFx, loopS64, loopE64);
         --windowRemaining;
-        if (phase >= loopEnd) {
-            float overflow = phase - loopEnd;
-            if (overflow >= loopLength)
-                overflow -= std::floor(overflow / loopLength) * loopLength;
-            phase = loopStart + overflow;
-        }
         if (finished ||
             (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
             retiredAt = frame;
@@ -1009,7 +1043,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         }
         ++frame;
     }
-    v.phases[handle] = phase;
+    phasefx::Store(v, handle, pos);
     v.currentGain[handle] = gain;
     v.releaseSamplesRemaining[handle] = remaining;
     rot.Store();
@@ -1033,8 +1067,12 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
         alignas(32) uint32_t hs[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
         bool valid = true;
+        alignas(32) uint32_t stepIdxLane[8], stepFracLane[8];
         for (uint32_t lane = 0u; lane < 8u; ++lane) {
             const uint32_t handle = hs[lane];
+            const uint64_t stepFx = phasefx::FromFloat(v.phaseIncs[handle]);
+            stepIdxLane[lane] = phasefx::Index(stepFx);
+            stepFracLane[lane] = phasefx::Frac(stepFx);
             float finalGain = v.currentGain[handle];
             for (uint32_t frame = 0u; frame < c.frameCount; ++frame)
                 finalGain *= v.releaseDecay[handle];
@@ -1053,15 +1091,18 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
             continue;
         }
 
-        __m256 phase = _mm256_i32gather_ps(v.phases, h, 4);
-        phase = _mm256_max_ps(phase, _mm256_setzero_ps());
-        const __m256 step = _mm256_i32gather_ps(v.phaseIncs, h, 4);
+        __m256i phaseIdx = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.phaseIdx), h, 4);
+        __m256i phaseFrac = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.phaseFrac), h, 4);
+        const __m256i stepIdxV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepIdxLane));
+        const __m256i stepFracV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepFracLane));
         __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
         const __m256 decay = _mm256_i32gather_ps(v.releaseDecay, h, 4);
         const __m256 mixL = _mm256_i32gather_ps(v.mixGainL, h, 4);
         const __m256 mixR = _mm256_i32gather_ps(v.mixGainR, h, 4);
-        const __m256 loopStartF = _mm256_i32gather_ps(v.relLoopSF, h, 4);
-        const __m256 loopEndF = _mm256_i32gather_ps(v.relLoopEF, h, 4);
         const __m256i sampleStart = _mm256_i32gather_epi32(
             reinterpret_cast<const int*>(v.sampleStart), h, 4);
         const __m256i loopStart = _mm256_i32gather_epi32(
@@ -1069,12 +1110,8 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
         const __m256i loopEnd = _mm256_i32gather_epi32(
             reinterpret_cast<const int*>(v.relLoopE), h, 4);
         for (uint32_t frame = 0u; frame < c.frameCount; ++frame) {
-            const __m256 pastLoop = _mm256_cmp_ps(
-                phase, loopEndF, _CMP_GE_OQ);
-            phase = _mm256_blendv_ps(phase,
-                _mm256_add_ps(loopStartF, _mm256_sub_ps(phase, loopEndF)),
-                pastLoop);
-            const __m256i base = _mm256_cvttps_epi32(phase);
+            FxWrap8(phaseIdx, loopStart, loopEnd);
+            const __m256i base = phaseIdx;
             const __m256i nextRaw = _mm256_add_epi32(
                 base, _mm256_set1_epi32(1));
             const __m256i wraps = _mm256_cmpgt_epi32(
@@ -1084,8 +1121,7 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
                 _mm256_add_epi32(sampleStart, base));
             const __m256 second = GatherSampleAVX2(c.sampleData,
                 _mm256_add_epi32(sampleStart, next));
-            const __m256 fraction = _mm256_sub_ps(
-                phase, _mm256_cvtepi32_ps(base));
+            const __m256 fraction = FxWeight8(phaseFrac);
             const __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             gain = _mm256_mul_ps(gain, decay);
@@ -1094,18 +1130,18 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
                 sumsL[frame], _mm256_mul_ps(scaled, mixL));
             sumsR[frame] = _mm256_add_ps(
                 sumsR[frame], _mm256_mul_ps(scaled, mixR));
-            phase = _mm256_add_ps(phase, step);
+            FxAdd8(phaseIdx, phaseFrac, stepIdxV, stepFracV);
         }
-        const __m256 wrapped = _mm256_add_ps(
-            loopStartF, _mm256_sub_ps(phase, loopEndF));
-        phase = _mm256_blendv_ps(phase, wrapped,
-            _mm256_cmp_ps(phase, loopEndF, _CMP_GE_OQ));
-        alignas(32) float phases[8], gains[8];
-        _mm256_store_ps(phases, phase);
+        FxWrap8(phaseIdx, loopStart, loopEnd);
+        alignas(32) uint32_t idxOut[8], fracOut[8];
+        alignas(32) float gains[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idxOut), phaseIdx);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(fracOut), phaseFrac);
         _mm256_store_ps(gains, gain);
         for (uint32_t lane = 0u; lane < 8u; ++lane) {
             const uint32_t handle = hs[lane];
-            v.phases[handle] = phases[lane];
+            v.phaseIdx[handle] = idxOut[lane];
+            v.phaseFrac[handle] = fracOut[lane];
             v.currentGain[handle] = gains[lane];
             if (v.releaseSamplesRemaining[handle] != UINT32_MAX)
                 v.releaseSamplesRemaining[handle] -= c.frameCount;
@@ -1191,13 +1227,14 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     if (!ValidateLoopVoice(c, handle)) return;
     ChunkRotation rot;
     rot.Init(v, c.hilbertData, handle);
-    float phase = (std::max)(0.0f, v.phases[handle]);
+    uint64_t pos = phasefx::Load(v, handle);
     float gain = v.currentGain[handle];
     uint8_t stage = v.envelopeStage[handle];
     const uint8_t initialStage = stage;
     uint32_t attackRemaining = v.attackSamplesRemaining[handle];
     uint32_t decayRemaining = v.decaySamplesRemaining[handle];
     float step = v.phaseIncs[handle];
+    uint64_t stepFx = phasefx::FromFloat(step);
     const float targetGain = v.targetGain[handle];
     const float sustainLevel = v.sustainLevel[handle];
     const float attackStep = v.attackGainStep[handle];
@@ -1205,19 +1242,16 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     const uint32_t relEnd = v.relEnd[handle];
     const uint32_t loopS = v.relLoopS[handle];
     const uint32_t loopE = v.relLoopE[handle];
-    const float loopStart = v.relLoopSF[handle];
-    const float loopEnd = v.relLoopEF[handle];
-    const float loopLength = loopEnd - loopStart;
+    const uint64_t loopS64 = phasefx::Pack(loopS, 0u);
+    const uint64_t loopE64 = phasefx::Pack(loopE, 0u);
+    const uint64_t guard64 = phasefx::Pack(loopE - 1u, 0u);
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
     const uint32_t readable = c.sampleDataFrames - v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
-    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
-                                       4.0f, 5.0f, 6.0f, 7.0f);
-    __m256 stepVector = _mm256_set1_ps(step);
-    const __m256i one = _mm256_set1_epi32(1);
+    FxSteps8 fs = MakeFxSteps8(stepFx);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
     const bool lfoOn = c.lfoActive != 0u &&
         v.vibLfoSteps[handle] != 0.0f &&
@@ -1226,7 +1260,8 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     if (lfoOn) {
         step = AdvanceVibratoLfoWindow(v, handle,
             (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepVector = _mm256_set1_ps(step);
+        stepFx = phasefx::FromFloat(step);
+        fs = MakeFxSteps8(stepFx);
         windowRemaining = (std::min)(64u, c.frameCount);
     }
     const bool fastMath = g_fastChunkMath && !lfoOn;
@@ -1236,15 +1271,11 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
             const uint32_t win = (std::min)(64u, c.frameCount - frame);
             step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
                                            c.lfoBendRatio);
-            stepVector = _mm256_set1_ps(step);
+            stepFx = phasefx::FromFloat(step);
+            fs = MakeFxSteps8(stepFx);
             windowRemaining = win;
         }
-        if (phase >= loopEnd) {
-            float overflow = phase - loopEnd;
-            if (overflow >= loopLength)
-                overflow -= std::floor(overflow / loopLength) * loopLength;
-            phase = loopStart + overflow;
-        }
+        pos = phasefx::Wrap(pos, loopS64, loopE64);
         // Simulate the exact scalar envelope recurrence eight steps ahead.
         // The clamps are part of the simulated sequence, so gains[] is
         // bit-exact regardless.  The chunk is only taken when the stage is
@@ -1311,28 +1342,24 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
             }
             gains[laneIndex] = futureGain;
         }
-        // lastPhase < loopEnd - 1 proves every lane's base + 1 < relLoopE,
-        // so neither the sample end (base + 1 >= relEnd) nor the loop point
+        // lastPos < guard proves every lane's base + 1 < relLoopE, so neither
+        // the sample end (base + 1 >= relEnd) nor the loop point
         // (next >= relLoopE) can be crossed inside the chunk, and both
         // gather indices stay inside the validated region.
-        const float lastPhase = phase + step * 7.0f;
+        const uint64_t lastPos = pos + fs.step7;
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
-            futureStage == stage &&
-            lastPhase < loopEnd - 1.0f) {
+            futureStage == stage && lastPos < guard64) {
             // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
             _mm_prefetch(reinterpret_cast<const char*>(
-                             region +
-                             static_cast<uint32_t>(lastPhase + step)),
+                             region + phasefx::Index(lastPos + stepFx)),
                          _MM_HINT_T0);
-            const __m256 phases = _mm256_add_ps(
-                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
-            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256i bases;
+            __m256 fraction;
+            FxChunk(pos, fs, bases, fraction);
             __m256 first, second;
             GatherSamplePairSeqAVX2(region, readable, bases, first, second);
-            const __m256 fraction = _mm256_sub_ps(
-                phases, _mm256_cvtepi32_ps(bases));
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
@@ -1348,12 +1375,7 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
             stage = futureStage;
             attackRemaining = futureAttack;
             decayRemaining = futureDecay;
-            if (fastMath) {
-                phase += step * 8.0f;
-            } else {
-                for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                    phase += step;
-            }
+            pos += fs.step8;
             frame += 8u;
             windowRemaining -= 8u;
             continue;
@@ -1361,14 +1383,14 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
 
         // Scalar tail: the exact per-frame sequence from the reference
         // path (RenderScalar.h full-quality looping attack/decay).
-        uint32_t base = static_cast<uint32_t>(phase);
+        uint32_t base = phasefx::Index(pos);
         if (base + 1u >= relEnd) {
-            phase = loopStart;
+            pos = loopS64;
             base = loopS;
         }
         uint32_t next = base + 1u;
         if (next >= loopE) next = loopS;
-        const float fraction = phase - static_cast<float>(base);
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         if (stage == 1u) {
@@ -1396,17 +1418,11 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         if (rot) sample = rot.Scalar(sample, base, next, fraction);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        phase += step;
+        pos = phasefx::Wrap(pos + stepFx, loopS64, loopE64);
         --windowRemaining;
-        if (phase >= loopEnd) {
-            float overflow = phase - loopEnd;
-            if (overflow >= loopLength)
-                overflow -= std::floor(overflow / loopLength) * loopLength;
-            phase = loopStart + overflow;
-        }
         ++frame;
     }
-    v.phases[handle] = phase;
+    phasefx::Store(v, handle, pos);
     v.currentGain[handle] = gain;
     v.envelopeStage[handle] = stage;
     v.attackSamplesRemaining[handle] = attackRemaining;
@@ -1444,14 +1460,23 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
             reinterpret_cast<const __m256i*>(handles + position));
         alignas(32) uint32_t hs[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
-        __m256 phase = _mm256_max_ps(
-            _mm256_i32gather_ps(v.phases, h, 4), zero);
-        const __m256 step = _mm256_i32gather_ps(v.phaseIncs, h, 4);
+        __m256i phaseIdx = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.phaseIdx), h, 4);
+        __m256i phaseFrac = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.phaseFrac), h, 4);
+        alignas(32) uint32_t stepIdxLane[8], stepFracLane[8];
+        for (uint32_t lane = 0u; lane < 8u; ++lane) {
+            const uint64_t stepFx = phasefx::FromFloat(v.phaseIncs[hs[lane]]);
+            stepIdxLane[lane] = phasefx::Index(stepFx);
+            stepFracLane[lane] = phasefx::Frac(stepFx);
+        }
+        const __m256i stepIdxV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepIdxLane));
+        const __m256i stepFracV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepFracLane));
         __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
         const __m256 mixL = _mm256_i32gather_ps(v.mixGainL, h, 4);
         const __m256 mixR = _mm256_i32gather_ps(v.mixGainR, h, 4);
-        const __m256 loopStartF = _mm256_i32gather_ps(v.relLoopSF, h, 4);
-        const __m256 loopEndF = _mm256_i32gather_ps(v.relLoopEF, h, 4);
         const __m256 targetGain = _mm256_i32gather_ps(v.targetGain, h, 4);
         const __m256 sustainLevel = _mm256_i32gather_ps(v.sustainLevel, h, 4);
         const __m256 attackStep = _mm256_i32gather_ps(v.attackGainStep, h, 4);
@@ -1473,12 +1498,8 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
         }
 
         for (uint32_t frame = 0u; frame < frames; ++frame) {
-            const __m256 pastLoop = _mm256_cmp_ps(
-                phase, loopEndF, _CMP_GE_OQ);
-            phase = _mm256_blendv_ps(phase,
-                _mm256_add_ps(loopStartF, _mm256_sub_ps(phase, loopEndF)),
-                pastLoop);
-            const __m256i base = _mm256_cvttps_epi32(phase);
+            FxWrap8(phaseIdx, loopStart, loopEnd);
+            const __m256i base = phaseIdx;
             const __m256i nextRaw = _mm256_add_epi32(
                 base, _mm256_set1_epi32(1));
             const __m256i wrap = _mm256_cmpgt_epi32(
@@ -1488,8 +1509,7 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
                 _mm256_add_epi32(sampleStart, base));
             const __m256 second = GatherSampleAVX2(c.sampleData,
                 _mm256_add_epi32(sampleStart, next));
-            const __m256 fraction = _mm256_sub_ps(
-                phase, _mm256_cvtepi32_ps(base));
+            const __m256 fraction = FxWeight8(phaseFrac);
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterVoices8AVX2(v, h, sample);
@@ -1533,15 +1553,19 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
                 _mm256_mul_ps(scaled, mixL));
             sumsR[frame] = _mm256_add_ps(sumsR[frame],
                 _mm256_mul_ps(scaled, mixR));
-            phase = _mm256_add_ps(phase, step);
+            FxAdd8(phaseIdx, phaseFrac, stepIdxV, stepFracV);
         }
-        alignas(32) float finalGains[8], finalPhases[8];
+        FxWrap8(phaseIdx, loopStart, loopEnd);
+        alignas(32) float finalGains[8];
+        alignas(32) uint32_t idxOut[8], fracOut[8];
         _mm256_store_ps(finalGains, gain);
-        _mm256_store_ps(finalPhases, phase);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idxOut), phaseIdx);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(fracOut), phaseFrac);
         for (uint32_t lane = 0u; lane < 8u; ++lane) {
             const uint32_t handle = hs[lane];
             const uint8_t finalStage = stageV[lane];
-            v.phases[handle] = finalPhases[lane];
+            v.phaseIdx[handle] = idxOut[lane];
+            v.phaseFrac[handle] = fracOut[lane];
             v.currentGain[handle] = finalGains[lane];
             v.envelopeStage[handle] = finalStage;
             v.attackSamplesRemaining[handle] = attackR[lane];
@@ -1684,7 +1708,8 @@ void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
                                       const uint32_t* h) {
     VoiceSoA& v = *c.voices;
     RenderSpanContext dest[8];
-    float phase[8], step[8], loopStart[8], loopEnd[8], loopLength[8];
+    uint64_t pos[8], stepFx[8], loopS64[8], loopE64[8], guard64[8];
+    FxSteps8 fsA[8];
     float gainL[8], gainR[8];
     const int16_t* region[8];
     float* outL[8];
@@ -1692,11 +1717,12 @@ void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
     uint32_t frame[8];
     for (uint32_t i = 0u; i < 8u; ++i) {
         dest[i] = SelectVoiceDestination(c, v.channel[h[i]]);
-        phase[i] = (std::max)(0.0f, v.phases[h[i]]);
-        step[i] = v.phaseIncs[h[i]];
-        loopStart[i] = v.relLoopSF[h[i]];
-        loopEnd[i] = v.relLoopEF[h[i]];
-        loopLength[i] = loopEnd[i] - loopStart[i];
+        pos[i] = phasefx::Load(v, h[i]);
+        stepFx[i] = phasefx::FromFloat(v.phaseIncs[h[i]]);
+        fsA[i] = MakeFxSteps8(stepFx[i]);
+        loopS64[i] = phasefx::Pack(v.relLoopS[h[i]], 0u);
+        loopE64[i] = phasefx::Pack(v.relLoopE[h[i]], 0u);
+        guard64[i] = phasefx::Pack(v.relLoopE[h[i]] - 1u, 0u);
         gainL[i] = v.renderGainL[h[i]];
         gainR[i] = v.renderGainR[h[i]];
         region[i] = c.sampleData + v.sampleStart[h[i]];
@@ -1714,8 +1740,6 @@ void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
     const __m256 a0x2v = _mm256_add_ps(a0v, a0v);  // == 2.0f * a0, exactly
     const __m256 b1v = _mm256_load_ps(b1a);
     const __m256 b2v = _mm256_load_ps(b2a);
-    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
-                                       4.0f, 5.0f, 6.0f, 7.0f);
     __m256 z1, z2;
     auto loadZ = [&]() {
         for (uint32_t i = 0u; i < 8u; ++i) {
@@ -1740,27 +1764,21 @@ void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
         bool spilled = false;
         for (uint32_t i = 0u; i < 8u && !done; ++i) {
             for (;;) {
-                if (phase[i] >= loopEnd[i]) {
-                    float overflow = phase[i] - loopEnd[i];
-                    if (overflow >= loopLength[i])
-                        overflow -= std::floor(overflow / loopLength[i]) *
-                                    loopLength[i];
-                    phase[i] = loopStart[i] + overflow;
-                }
+                pos[i] = phasefx::Wrap(pos[i], loopS64[i], loopE64[i]);
                 if (frame[i] + 8u > c.frameCount) { done = true; break; }
-                if (phase[i] + step[i] * 7.0f < loopEnd[i] - 1.0f) break;
+                if (pos[i] + fsA[i].step7 < guard64[i]) break;
                 // Straddling this lane's loop end: one scalar frame, exactly
                 // as the per-voice kernel steps it (filter state via the SoA).
                 if (!spilled) { spillZ(); spilled = true; }
                 const uint32_t hh = h[i];
-                uint32_t base = static_cast<uint32_t>(phase[i]);
+                uint32_t base = phasefx::Index(pos[i]);
                 if (base + 1u >= v.relEnd[hh]) {
-                    phase[i] = loopStart[i];
+                    pos[i] = loopS64[i];
                     base = v.relLoopS[hh];
                 }
                 uint32_t next = base + 1u;
                 if (next >= v.relLoopE[hh]) next = v.relLoopS[hh];
-                const float fraction = phase[i] - static_cast<float>(base);
+                const float fraction = phasefx::Weight(phasefx::Frac(pos[i]));
                 const float first =
                     static_cast<float>(region[i][base]) * (1.0f / 32768.0f);
                 float sample = first +
@@ -1769,7 +1787,7 @@ void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
                 sample = ProcessVoiceFilterSample(v, hh, sample);
                 outL[i][frame[i]] += sample * gainL[i];
                 outR[i][frame[i]] += sample * gainR[i];
-                phase[i] += step[i];
+                pos[i] += stepFx[i];
                 ++frame[i];
             }
         }
@@ -1781,19 +1799,17 @@ void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
 
         __m256 rows[8];
         for (uint32_t i = 0u; i < 8u; ++i) {
-            const float lastPhase = phase[i] + step[i] * 7.0f;
             _mm_prefetch(reinterpret_cast<const char*>(
-                             region[i] +
-                             static_cast<uint32_t>(lastPhase + step[i])),
+                             region[i] + phasefx::Index(
+                                 pos[i] + fsA[i].step7 + stepFx[i])),
                          _MM_HINT_T0);
-            const __m256 phases = _mm256_add_ps(
-                _mm256_set1_ps(phase[i]),
-                _mm256_mul_ps(_mm256_set1_ps(step[i]), lane));
-            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256i bases;
+            __m256 fraction;
+            FxChunk(pos[i], fsA[i], bases, fraction);
             __m256 first, second;
-            GatherSamplePairAVX2(region[i], bases, first, second);
-            const __m256 fraction = _mm256_sub_ps(
-                phases, _mm256_cvtepi32_ps(bases));
+            GatherSamplePairSeqAVX2(region[i],
+                c.sampleDataFrames - v.sampleStart[h[i]], bases, first,
+                second);
             rows[i] = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
         }
@@ -1817,12 +1833,14 @@ void RenderSustainedFilteredGroupAVX2(const RenderSpanContext& c,
             _mm256_storeu_ps(outR[i] + frame[i], _mm256_add_ps(
                 _mm256_loadu_ps(outR[i] + frame[i]),
                 _mm256_mul_ps(rows[i], _mm256_set1_ps(gainR[i]))));
-            for (uint32_t k = 0u; k < 8u; ++k) phase[i] += step[i];
+            pos[i] += fsA[i].step8;
             frame[i] += 8u;
         }
     }
 
-    for (uint32_t i = 0u; i < 8u; ++i) v.phases[h[i]] = phase[i];
+    for (uint32_t i = 0u; i < 8u; ++i)
+        phasefx::Store(v, h[i],
+                       phasefx::Wrap(pos[i], loopS64[i], loopE64[i]));
     for (uint32_t i = 0u; i < 8u; ++i) {
         if (frame[i] >= c.frameCount) continue;
         RenderSpanContext rest = dest[i];
@@ -1887,7 +1905,8 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
                                     const uint32_t* h, uint32_t* retiredAt) {
     VoiceSoA& v = *c.voices;
     RenderSpanContext dest[8];
-    float phase[8], step[8], loopStart[8], loopEnd[8], loopLength[8];
+    uint64_t pos[8], stepFx[8], loopS64[8], loopE64[8], guard64[8];
+    FxSteps8 fsA[8];
     float gain[8], decay[8], mixL[8], mixR[8];
     uint32_t remaining[8];
     const int16_t* region[8];
@@ -1896,11 +1915,12 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
     uint32_t frame[8];
     for (uint32_t i = 0u; i < 8u; ++i) {
         dest[i] = SelectVoiceDestination(c, v.channel[h[i]]);
-        phase[i] = (std::max)(0.0f, v.phases[h[i]]);
-        step[i] = v.phaseIncs[h[i]];
-        loopStart[i] = v.relLoopSF[h[i]];
-        loopEnd[i] = v.relLoopEF[h[i]];
-        loopLength[i] = loopEnd[i] - loopStart[i];
+        pos[i] = phasefx::Load(v, h[i]);
+        stepFx[i] = phasefx::FromFloat(v.phaseIncs[h[i]]);
+        fsA[i] = MakeFxSteps8(stepFx[i]);
+        loopS64[i] = phasefx::Pack(v.relLoopS[h[i]], 0u);
+        loopE64[i] = phasefx::Pack(v.relLoopE[h[i]], 0u);
+        guard64[i] = phasefx::Pack(v.relLoopE[h[i]] - 1u, 0u);
         gain[i] = v.currentGain[h[i]];
         remaining[i] = v.releaseSamplesRemaining[h[i]];
         decay[i] = v.releaseDecay[h[i]];
@@ -1922,8 +1942,6 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
     const __m256 a0x2v = _mm256_add_ps(a0v, a0v);
     const __m256 b1v = _mm256_load_ps(b1a);
     const __m256 b2v = _mm256_load_ps(b2a);
-    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
-                                       4.0f, 5.0f, 6.0f, 7.0f);
     __m256 z1, z2;
     auto loadZ = [&]() {
         for (uint32_t i = 0u; i < 8u; ++i) {
@@ -1950,13 +1968,7 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
         bool spilled = false;
         for (uint32_t i = 0u; i < 8u && !done; ++i) {
             for (;;) {
-                if (phase[i] >= loopEnd[i]) {
-                    float overflow = phase[i] - loopEnd[i];
-                    if (overflow >= loopLength[i])
-                        overflow -= std::floor(overflow / loopLength[i]) *
-                                    loopLength[i];
-                    phase[i] = loopStart[i] + overflow;
-                }
+                pos[i] = phasefx::Wrap(pos[i], loopS64[i], loopE64[i]);
                 if (frame[i] + 8u > c.frameCount) { done = true; break; }
                 float fg = gain[i];
                 for (uint32_t k = 0u; k < 8u; ++k) {
@@ -1969,19 +1981,19 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
                 const bool thresholdSafe = remaining[i] != UINT32_MAX ||
                     gains[i][7] >= VoiceRetireThreshold();
                 if (!countdownSafe || !thresholdSafe) { done = true; break; }
-                if (phase[i] + step[i] * 7.0f < loopEnd[i] - 1.0f) break;
+                if (pos[i] + fsA[i].step7 < guard64[i]) break;
                 // Loop-end straddle: one scalar frame exactly as the
                 // per-voice kernel steps it (safe: no retirement possible).
                 if (!spilled) { spillZ(); spilled = true; }
                 const uint32_t hh = h[i];
-                uint32_t base = static_cast<uint32_t>(phase[i]);
+                uint32_t base = phasefx::Index(pos[i]);
                 if (base + 1u >= v.relEnd[hh]) {
-                    phase[i] = loopStart[i];
+                    pos[i] = loopS64[i];
                     base = v.relLoopS[hh];
                 }
                 uint32_t next = base + 1u;
                 if (next >= v.relLoopE[hh]) next = v.relLoopS[hh];
-                const float fraction = phase[i] - static_cast<float>(base);
+                const float fraction = phasefx::Weight(phasefx::Frac(pos[i]));
                 const float first =
                     static_cast<float>(region[i][base]) * (1.0f / 32768.0f);
                 float sample = first +
@@ -1998,14 +2010,8 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
                 sample = ProcessVoiceFilterSample(v, hh, sample);
                 outL[i][frame[i]] += sample * gain[i] * mixL[i];
                 outR[i][frame[i]] += sample * gain[i] * mixR[i];
-                phase[i] += step[i];
-                if (phase[i] >= loopEnd[i]) {
-                    float overflow = phase[i] - loopEnd[i];
-                    if (overflow >= loopLength[i])
-                        overflow -= std::floor(overflow / loopLength[i]) *
-                                    loopLength[i];
-                    phase[i] = loopStart[i] + overflow;
-                }
+                pos[i] = phasefx::Wrap(pos[i] + stepFx[i], loopS64[i],
+                                       loopE64[i]);
                 (void)finished;  // cannot be set: the chunk was proven safe
                 ++frame[i];
             }
@@ -2018,19 +2024,17 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
 
         __m256 rows[8];
         for (uint32_t i = 0u; i < 8u; ++i) {
-            const float lastPhase = phase[i] + step[i] * 7.0f;
             _mm_prefetch(reinterpret_cast<const char*>(
-                             region[i] +
-                             static_cast<uint32_t>(lastPhase + step[i])),
+                             region[i] + phasefx::Index(
+                                 pos[i] + fsA[i].step7 + stepFx[i])),
                          _MM_HINT_T0);
-            const __m256 phases = _mm256_add_ps(
-                _mm256_set1_ps(phase[i]),
-                _mm256_mul_ps(_mm256_set1_ps(step[i]), lane));
-            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256i bases;
+            __m256 fraction;
+            FxChunk(pos[i], fsA[i], bases, fraction);
             __m256 first, second;
-            GatherSamplePairAVX2(region[i], bases, first, second);
-            const __m256 fraction = _mm256_sub_ps(
-                phases, _mm256_cvtepi32_ps(bases));
+            GatherSamplePairSeqAVX2(region[i],
+                c.sampleDataFrames - v.sampleStart[h[i]], bases, first,
+                second);
             rows[i] = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
         }
@@ -2058,13 +2062,14 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
                 _mm256_mul_ps(scaled, _mm256_set1_ps(mixR[i]))));
             gain[i] = futureGain[i];
             if (remaining[i] != UINT32_MAX) remaining[i] -= 8u;
-            for (uint32_t k = 0u; k < 8u; ++k) phase[i] += step[i];
+            pos[i] += fsA[i].step8;
             frame[i] += 8u;
         }
     }
 
     for (uint32_t i = 0u; i < 8u; ++i) {
-        v.phases[h[i]] = phase[i];
+        phasefx::Store(v, h[i],
+                       phasefx::Wrap(pos[i], loopS64[i], loopE64[i]));
         v.currentGain[h[i]] = gain[i];
         v.releaseSamplesRemaining[h[i]] = remaining[i];
     }
@@ -2240,32 +2245,36 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                 continue;
             }
         }
-        __m256 phase = denseHandles ? _mm256_load_ps(v.phases + position)
-            : _mm256_i32gather_ps(v.phases, h, 4);
+        __m256i phaseIdx = denseHandles
+            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.phaseIdx + position))
+            : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.phaseIdx), h, 4);
+        __m256i phaseFrac = denseHandles
+            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.phaseFrac + position))
+            : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.phaseFrac), h, 4);
         const __m256 step = denseHandles ? _mm256_load_ps(v.phaseIncs + position)
             : _mm256_i32gather_ps(v.phaseIncs, h, 4);
         const __m256 gainL = denseHandles ? _mm256_load_ps(v.renderGainL + position)
             : _mm256_i32gather_ps(v.renderGainL, h, 4);
         const __m256 gainR = denseHandles ? _mm256_load_ps(v.renderGainR + position)
             : _mm256_i32gather_ps(v.renderGainR, h, 4);
-        const __m256 loopStartF = denseHandles ? _mm256_load_ps(v.relLoopSF + position)
-            : _mm256_i32gather_ps(v.relLoopSF, h, 4);
-        const __m256 loopEndF = denseHandles ? _mm256_load_ps(v.relLoopEF + position)
-            : _mm256_i32gather_ps(v.relLoopEF, h, 4);
-        const __m256 loopLength = _mm256_sub_ps(loopEndF, loopStartF);
 
         alignas(32) uint32_t hs[8];
-        alignas(32) float steps[8], lengths[8];
+        alignas(32) float steps[8];
+        alignas(32) uint32_t stepIdxLane[8], stepFracLane[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
         _mm256_store_ps(steps, step);
-        _mm256_store_ps(lengths, loopLength);
         bool valid = true;
         for (uint32_t lane = 0; lane < 8u; ++lane) {
             const uint32_t handle = hs[lane];
+            const uint64_t stepFx = phasefx::FromFloat(steps[lane]);
+            stepIdxLane[lane] = phasefx::Index(stepFx);
+            stepFracLane[lane] = phasefx::Frac(stepFx);
             valid = valid && v.relEnd[handle] >= 2u &&
                 v.relLoopS[handle] < v.relLoopE[handle] &&
                 v.sampleStart[handle] < context.sampleDataFrames &&
-                steps[lane] >= 0.0f && steps[lane] < lengths[lane];
+                steps[lane] >= 0.0f &&
+                steps[lane] < static_cast<float>(
+                    v.relLoopE[handle] - v.relLoopS[handle]);
         }
         if (!valid) {
             for (uint32_t lane = 0; lane < 8u; ++lane) {
@@ -2286,15 +2295,14 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
         const __m256i loopEnd = denseHandles
             ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopE + position))
             : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.relLoopE), h, 4);
-        const __m256 zero = _mm256_setzero_ps();
-        phase = _mm256_max_ps(phase, zero);
+        const __m256i stepIdxV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepIdxLane));
+        const __m256i stepFracV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepFracLane));
 
         for (uint32_t frame = 0; frame < context.frameCount; ++frame) {
-            const __m256 pastLoop = _mm256_cmp_ps(phase, loopEndF, _CMP_GE_OQ);
-            phase = _mm256_blendv_ps(
-                phase, _mm256_add_ps(loopStartF, _mm256_sub_ps(phase, loopEndF)),
-                pastLoop);
-            const __m256i base = _mm256_cvttps_epi32(phase);
+            FxWrap8(phaseIdx, loopStart, loopEnd);
+            const __m256i base = phaseIdx;
             const __m256i nextRaw = _mm256_add_epi32(base, _mm256_set1_epi32(1));
             const __m256i wrap = _mm256_cmpgt_epi32(nextRaw,
                 _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
@@ -2303,7 +2311,7 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             const __m256i nextIndex = _mm256_add_epi32(sampleStart, next);
             const __m256 first = GatherSampleAVX2(context.sampleData, baseIndex);
             const __m256 second = GatherSampleAVX2(context.sampleData, nextIndex);
-            const __m256 fraction = _mm256_sub_ps(phase, _mm256_cvtepi32_ps(base));
+            const __m256 fraction = FxWeight8(phaseFrac);
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterVoices8AVX2(v, h, sample);
@@ -2311,12 +2319,21 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                 accumulatedLeft[frame], _mm256_mul_ps(sample, gainL));
             accumulatedRight[frame] = _mm256_add_ps(
                 accumulatedRight[frame], _mm256_mul_ps(sample, gainR));
-            phase = _mm256_add_ps(phase, step);
+            FxAdd8(phaseIdx, phaseFrac, stepIdxV, stepFracV);
         }
-        alignas(32) float phases[8];
-        _mm256_store_ps(phases, phase);
-        if (denseHandles) _mm256_store_ps(v.phases + position, phase);
-        else for (uint32_t lane = 0; lane < 8u; ++lane) v.phases[hs[lane]] = phases[lane];
+        FxWrap8(phaseIdx, loopStart, loopEnd);
+        if (denseHandles) {
+            _mm256_store_si256(reinterpret_cast<__m256i*>(v.phaseIdx + position), phaseIdx);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(v.phaseFrac + position), phaseFrac);
+        } else {
+            alignas(32) uint32_t idxOut[8], fracOut[8];
+            _mm256_store_si256(reinterpret_cast<__m256i*>(idxOut), phaseIdx);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(fracOut), phaseFrac);
+            for (uint32_t lane = 0; lane < 8u; ++lane) {
+                v.phaseIdx[hs[lane]] = idxOut[lane];
+                v.phaseFrac[hs[lane]] = fracOut[lane];
+            }
+        }
     }
     for (; position < iterationCount; ++position) {
         const uint32_t handle = denseHandles ? position : handles[position];
@@ -2478,20 +2495,20 @@ uint32_t RenderReleaseOneShotSpanScalar(
         relEnd > sampleDataFrames - v.sampleStart[idx]) {
         return 0u;
     }
-    float phase = (std::max)(0.0f, v.phases[idx]);
+    uint64_t pos = phasefx::Load(v, idx);
     float gain = v.currentGain[idx];
     uint32_t remaining = v.releaseSamplesRemaining[idx];
     const float decay = v.releaseDecay[idx];
-    const float step = v.phaseIncs[idx];
+    const uint64_t step = phasefx::FromFloat(v.phaseIncs[idx]);
     const float mixL = v.mixGainL[idx];
     const float mixR = v.mixGainR[idx];
     const int16_t* region = sampleData + v.sampleStart[idx];
     float* outL = outputLeft + frameStart;
     float* outR = outputRight + frameStart;
     for (uint32_t frame = 0u; frame < frameCount; ++frame) {
-        const uint32_t base = static_cast<uint32_t>(phase);
+        const uint32_t base = phasefx::Index(pos);
         if (base + 1u >= relEnd) {
-            v.phases[idx] = phase;
+            phasefx::Store(v, idx, pos);
             v.currentGain[idx] = gain;
             v.releaseSamplesRemaining[idx] = remaining;
             return frame;
@@ -2504,23 +2521,23 @@ uint32_t RenderReleaseOneShotSpanScalar(
                 finished = remaining == 0u;
             }
         }
-        const float fraction = phase - static_cast<float>(base);
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
         sample = ProcessVoiceFilterSample(v, idx, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        phase += step;
+        pos += step;
         if (finished ||
             (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
-            v.phases[idx] = phase;
+            phasefx::Store(v, idx, pos);
             v.currentGain[idx] = gain;
             v.releaseSamplesRemaining[idx] = remaining;
             return frame;
         }
     }
-    v.phases[idx] = phase;
+    phasefx::Store(v, idx, pos);
     v.currentGain[idx] = gain;
     v.releaseSamplesRemaining[idx] = remaining;
     return UINT32_MAX;
@@ -2536,14 +2553,14 @@ uint32_t RenderTransientOneShotSpanScalar(
         relEnd > sampleDataFrames - v.sampleStart[idx]) {
         return UINT32_MAX;
     }
-    float phase = (std::max)(0.0f, v.phases[idx]);
+    uint64_t pos = phasefx::Load(v, idx);
     float gain = v.currentGain[idx];
     uint8_t stage = v.envelopeStage[idx];
     uint32_t delayRemaining = v.delaySamplesRemaining[idx];
     uint32_t holdRemaining = v.holdSamplesRemaining[idx];
     uint32_t attackRemaining = v.attackSamplesRemaining[idx];
     uint32_t decayRemaining = v.decaySamplesRemaining[idx];
-    const float step = v.phaseIncs[idx];
+    const uint64_t step = phasefx::FromFloat(v.phaseIncs[idx]);
     const float targetGain = v.targetGain[idx];
     const float sustainLevel = v.sustainLevel[idx];
     const float attackStep = v.attackGainStep[idx];
@@ -2554,10 +2571,10 @@ uint32_t RenderTransientOneShotSpanScalar(
     float* outL = outputLeft + frameStart;
     float* outR = outputRight + frameStart;
     for (uint32_t frame = 0u; frame < frameCount; ++frame) {
-        const uint32_t base = static_cast<uint32_t>(phase);
+        const uint32_t base = phasefx::Index(pos);
         if (base + 1u >= relEnd) {
             // One-shot sample ended: retire (no loop to wrap to).
-            v.phases[idx] = phase;
+            phasefx::Store(v, idx, pos);
             v.currentGain[idx] = gain;
             v.envelopeStage[idx] = stage;
             v.delaySamplesRemaining[idx] = delayRemaining;
@@ -2605,16 +2622,16 @@ uint32_t RenderTransientOneShotSpanScalar(
             }
             if (decayRemaining == 0u) stage = 3u;
         }
-        const float fraction = phase - static_cast<float>(base);
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
         sample = ProcessVoiceFilterSample(v, idx, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        phase += step;
+        pos += step;
     }
-    v.phases[idx] = phase;
+    phasefx::Store(v, idx, pos);
     v.currentGain[idx] = gain;
     v.envelopeStage[idx] = stage;
     v.delaySamplesRemaining[idx] = delayRemaining;
@@ -2651,24 +2668,20 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
                                           uint32_t handle) {
     VoiceSoA& v = *c.voices;
     const uint32_t relEnd = v.relEnd[handle];
-    float phase = (std::max)(0.0f, v.phases[handle]);
+    uint64_t pos = phasefx::Load(v, handle);
     float step = v.phaseIncs[handle];
     const float gainL = v.renderGainL[handle];
     const float gainR = v.renderGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
-    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
-                                       4.0f, 5.0f, 6.0f, 7.0f);
-    __m256 stepVector = _mm256_set1_ps(step);
+    uint64_t stepFx = phasefx::FromFloat(step);
+    FxSteps8 fs = MakeFxSteps8(stepFx);
     const __m256 gainLVector = _mm256_set1_ps(gainL);
     const __m256 gainRVector = _mm256_set1_ps(gainR);
-    // The 8-frame fast chunk needs floor(phase + 7*step) + 1 < relEnd for
-    // every lane; comparing against the float-converted bound is exact
-    // while the sample fits in 24 bits of mantissa.
-    const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
-    const float lastSafePhase = fastGuardExact
-        ? static_cast<float>(relEnd - 1u) : -1.0f;
+    // The 8-frame fast chunk needs index(pos + 7*step) + 1 < relEnd for
+    // every lane, i.e. pos + 7*step < (relEnd - 1).0.
+    const uint64_t lastSafePos = phasefx::Pack(relEnd - 1u, 0u);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
     const bool lfoOn = c.lfoActive != 0u &&
         v.vibLfoSteps[handle] != 0.0f &&
@@ -2677,7 +2690,8 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
     if (lfoOn) {
         step = AdvanceVibratoLfoWindow(v, handle,
             (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepVector = _mm256_set1_ps(step);
+        stepFx = phasefx::FromFloat(step);
+        fs = MakeFxSteps8(stepFx);
         windowRemaining = (std::min)(64u, c.frameCount);
     }
     uint32_t frame = 0u;
@@ -2686,24 +2700,24 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
             const uint32_t win = (std::min)(64u, c.frameCount - frame);
             step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
                                            c.lfoBendRatio);
-            stepVector = _mm256_set1_ps(step);
+            stepFx = phasefx::FromFloat(step);
+            fs = MakeFxSteps8(stepFx);
             windowRemaining = win;
         }
-        const float lastPhase = phase + step * 7.0f;
-        if (fastGuardExact && frame + 8u <= c.frameCount &&
-            windowRemaining >= 8u && lastPhase < lastSafePhase) {
+        const uint64_t lastPos = pos + fs.step7;
+        if (frame + 8u <= c.frameCount &&
+            windowRemaining >= 8u && lastPos < lastSafePos) {
             // Warm the next chunk's sample lines (sequential per voice).
             _mm_prefetch(reinterpret_cast<const char*>(
-                             region +
-                             static_cast<uint32_t>(lastPhase + step)),
+                             region + phasefx::Index(lastPos + stepFx)),
                          _MM_HINT_T0);
-            const __m256 phases = _mm256_add_ps(
-                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
-            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256i bases;
+            __m256 fraction;
+            FxChunk(pos, fs, bases, fraction);
             __m256 first, second;
-            GatherSamplePairAVX2(region, bases, first, second);
-            const __m256 fraction = _mm256_sub_ps(
-                phases, _mm256_cvtepi32_ps(bases));
+            GatherSamplePairSeqAVX2(region,
+                c.sampleDataFrames - v.sampleStart[handle], bases, first,
+                second);
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
@@ -2713,32 +2727,30 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
             _mm256_storeu_ps(outR + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outR + frame),
                 _mm256_mul_ps(sample, gainRVector)));
-            // Preserve the scalar cursor's repeated-add rounding.
-            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                phase += step;
+            pos += fs.step8;
             frame += 8u;
             windowRemaining -= 8u;
             continue;
         }
-        const uint32_t base = static_cast<uint32_t>(phase);
+        const uint32_t base = phasefx::Index(pos);
         if (base + 1u >= relEnd) {
             // Sample ended: the lerp partner would read past the region.
             // Retire at this frame; the phase is not advanced.
-            v.phases[handle] = phase;
+            phasefx::Store(v, handle, pos);
             return frame;
         }
-        const float fraction = phase - static_cast<float>(base);
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
         sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gainL;
         outR[frame] += sample * gainR;
-        phase += step;
+        pos += stepFx;
         --windowRemaining;
         ++frame;
     }
-    v.phases[handle] = phase;
+    phasefx::Store(v, handle, pos);
     return UINT32_MAX;
 }
 
@@ -2746,7 +2758,7 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
                                         uint32_t handle) {
     VoiceSoA& v = *c.voices;
     const uint32_t relEnd = v.relEnd[handle];
-    float phase = (std::max)(0.0f, v.phases[handle]);
+    uint64_t pos = phasefx::Load(v, handle);
     float gain = v.currentGain[handle];
     uint32_t remaining = v.releaseSamplesRemaining[handle];
     const float decay = v.releaseDecay[handle];
@@ -2756,12 +2768,9 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
     const int16_t* region = c.sampleData + v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
-    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
-                                       4.0f, 5.0f, 6.0f, 7.0f);
-    __m256 stepVector = _mm256_set1_ps(step);
-    const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
-    const float lastSafePhase = fastGuardExact
-        ? static_cast<float>(relEnd - 1u) : -1.0f;
+    uint64_t stepFx = phasefx::FromFloat(step);
+    FxSteps8 fs = MakeFxSteps8(stepFx);
+    const uint64_t lastSafePos = phasefx::Pack(relEnd - 1u, 0u);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
     const bool lfoOn = c.lfoActive != 0u &&
         v.vibLfoSteps[handle] != 0.0f &&
@@ -2770,7 +2779,8 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
     if (lfoOn) {
         step = AdvanceVibratoLfoWindow(v, handle,
             (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepVector = _mm256_set1_ps(step);
+        stepFx = phasefx::FromFloat(step);
+        fs = MakeFxSteps8(stepFx);
         windowRemaining = (std::min)(64u, c.frameCount);
     }
     uint32_t frame = 0u;
@@ -2779,7 +2789,8 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
             const uint32_t win = (std::min)(64u, c.frameCount - frame);
             step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
                                            c.lfoBendRatio);
-            stepVector = _mm256_set1_ps(step);
+            stepFx = phasefx::FromFloat(step);
+            fs = MakeFxSteps8(stepFx);
             windowRemaining = win;
         }
         float futureGain = gain;
@@ -2791,21 +2802,20 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
         const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
         const bool thresholdSafe = remaining != UINT32_MAX ||
             gains[7] >= VoiceRetireThreshold();
-        const float lastPhase = phase + step * 7.0f;
-        if (fastGuardExact && frame + 8u <= c.frameCount &&
+        const uint64_t lastPos = pos + fs.step7;
+        if (frame + 8u <= c.frameCount &&
             windowRemaining >= 8u && countdownSafe &&
-            thresholdSafe && lastPhase < lastSafePhase) {
+            thresholdSafe && lastPos < lastSafePos) {
             _mm_prefetch(reinterpret_cast<const char*>(
-                             region +
-                             static_cast<uint32_t>(lastPhase + step)),
+                             region + phasefx::Index(lastPos + stepFx)),
                          _MM_HINT_T0);
-            const __m256 phases = _mm256_add_ps(
-                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
-            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256i bases;
+            __m256 fraction;
+            FxChunk(pos, fs, bases, fraction);
             __m256 first, second;
-            GatherSamplePairAVX2(region, bases, first, second);
-            const __m256 fraction = _mm256_sub_ps(
-                phases, _mm256_cvtepi32_ps(bases));
+            GatherSamplePairSeqAVX2(region,
+                c.sampleDataFrames - v.sampleStart[handle], bases, first,
+                second);
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
@@ -2818,17 +2828,16 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
                 _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
             gain = futureGain;
             if (remaining != UINT32_MAX) remaining -= 8u;
-            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                phase += step;
+            pos += fs.step8;
             frame += 8u;
             windowRemaining -= 8u;
             continue;
         }
-        const uint32_t base = static_cast<uint32_t>(phase);
+        const uint32_t base = phasefx::Index(pos);
         if (base + 1u >= relEnd) {
             // Sample ended: retire before the envelope consumes a frame
             // (mirrors the generic state machine's sampleEnded branch).
-            v.phases[handle] = phase;
+            phasefx::Store(v, handle, pos);
             v.currentGain[handle] = gain;
             v.releaseSamplesRemaining[handle] = remaining;
             return frame;
@@ -2841,25 +2850,25 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
                 finished = remaining == 0u;
             }
         }
-        const float fraction = phase - static_cast<float>(base);
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
         sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        phase += step;
+        pos += stepFx;
         --windowRemaining;
         ++frame;
         if (finished ||
             (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
-            v.phases[handle] = phase;
+            phasefx::Store(v, handle, pos);
             v.currentGain[handle] = gain;
             v.releaseSamplesRemaining[handle] = remaining;
             return frame - 1u;
         }
     }
-    v.phases[handle] = phase;
+    phasefx::Store(v, handle, pos);
     v.currentGain[handle] = gain;
     v.releaseSamplesRemaining[handle] = remaining;
     return UINT32_MAX;
@@ -2874,7 +2883,7 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
                                           uint32_t handle) {
     VoiceSoA& v = *c.voices;
     const uint32_t relEnd = v.relEnd[handle];
-    float phase = (std::max)(0.0f, v.phases[handle]);
+    uint64_t pos = phasefx::Load(v, handle);
     float gain = v.currentGain[handle];
     uint8_t stage = v.envelopeStage[handle];
     const uint8_t initialStage = stage;
@@ -2890,12 +2899,9 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
     const int16_t* region = c.sampleData + v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
-    const __m256 lane = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f,
-                                       4.0f, 5.0f, 6.0f, 7.0f);
-    __m256 stepVector = _mm256_set1_ps(step);
-    const bool fastGuardExact = relEnd <= 0x1000000u && step >= 0.0f;
-    const float lastSafePhase = fastGuardExact
-        ? static_cast<float>(relEnd - 1u) : -1.0f;
+    uint64_t stepFx = phasefx::FromFloat(step);
+    FxSteps8 fs = MakeFxSteps8(stepFx);
+    const uint64_t lastSafePos = phasefx::Pack(relEnd - 1u, 0u);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
     const bool lfoOn = c.lfoActive != 0u &&
         v.vibLfoSteps[handle] != 0.0f &&
@@ -2904,7 +2910,8 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
     if (lfoOn) {
         step = AdvanceVibratoLfoWindow(v, handle,
             (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepVector = _mm256_set1_ps(step);
+        stepFx = phasefx::FromFloat(step);
+        fs = MakeFxSteps8(stepFx);
         windowRemaining = (std::min)(64u, c.frameCount);
     }
     uint32_t frame = 0u;
@@ -2913,7 +2920,8 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
             const uint32_t win = (std::min)(64u, c.frameCount - frame);
             step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
                                            c.lfoBendRatio);
-            stepVector = _mm256_set1_ps(step);
+            stepFx = phasefx::FromFloat(step);
+            fs = MakeFxSteps8(stepFx);
             windowRemaining = win;
         }
         // Simulate the exact scalar envelope recurrence eight steps ahead;
@@ -2948,21 +2956,20 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
             }
             gains[laneIndex] = futureGain;
         }
-        const float lastPhase = phase + step * 7.0f;
-        if (fastGuardExact && frame + 8u <= c.frameCount &&
+        const uint64_t lastPos = pos + fs.step7;
+        if (frame + 8u <= c.frameCount &&
             windowRemaining >= 8u &&
-            futureStage == stage && lastPhase < lastSafePhase) {
+            futureStage == stage && lastPos < lastSafePos) {
             _mm_prefetch(reinterpret_cast<const char*>(
-                             region +
-                             static_cast<uint32_t>(lastPhase + step)),
+                             region + phasefx::Index(lastPos + stepFx)),
                          _MM_HINT_T0);
-            const __m256 phases = _mm256_add_ps(
-                _mm256_set1_ps(phase), _mm256_mul_ps(stepVector, lane));
-            const __m256i bases = _mm256_cvttps_epi32(phases);
+            __m256i bases;
+            __m256 fraction;
+            FxChunk(pos, fs, bases, fraction);
             __m256 first, second;
-            GatherSamplePairAVX2(region, bases, first, second);
-            const __m256 fraction = _mm256_sub_ps(
-                phases, _mm256_cvtepi32_ps(bases));
+            GatherSamplePairSeqAVX2(region,
+                c.sampleDataFrames - v.sampleStart[handle], bases, first,
+                second);
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
@@ -2977,16 +2984,15 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
             stage = futureStage;
             attackRemaining = futureAttack;
             decayRemaining = futureDecay;
-            for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex)
-                phase += step;
+            pos += fs.step8;
             frame += 8u;
             windowRemaining -= 8u;
             continue;
         }
-        const uint32_t base = static_cast<uint32_t>(phase);
+        const uint32_t base = phasefx::Index(pos);
         if (base + 1u >= relEnd) {
             // One-shot sample ended: retire.
-            v.phases[handle] = phase;
+            phasefx::Store(v, handle, pos);
             v.currentGain[handle] = gain;
             v.envelopeStage[handle] = stage;
             v.attackSamplesRemaining[handle] = attackRemaining;
@@ -3014,18 +3020,18 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
             }
             if (decayRemaining == 0u) stage = 3u;
         }
-        const float fraction = phase - static_cast<float>(base);
+        const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[base + 1u]) *
             (1.0f / 32768.0f) - first) * fraction;
         sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        phase += step;
+        pos += stepFx;
         --windowRemaining;
         ++frame;
     }
-    v.phases[handle] = phase;
+    phasefx::Store(v, handle, pos);
     v.currentGain[handle] = gain;
     v.envelopeStage[handle] = stage;
     v.attackSamplesRemaining[handle] = attackRemaining;
@@ -3051,7 +3057,7 @@ bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
             v.relEnd[h] < 2u ||
             v.sampleStart[h] >= context.sampleDataFrames ||
             v.relEnd[h] > context.sampleDataFrames - v.sampleStart[h] ||
-            v.phaseIncs[h] < 0.0f || v.relEnd[h] > 0x1000000u) {
+            v.phaseIncs[h] < 0.0f) {
             return false;
         }
     }
@@ -3092,7 +3098,7 @@ bool RenderSustainedOneShotAVX2(const RenderSpanContext& context,
         if (v.relEnd[h] < 2u ||
             v.sampleStart[h] >= context.sampleDataFrames ||
             v.relEnd[h] > context.sampleDataFrames - v.sampleStart[h] ||
-            v.phaseIncs[h] < 0.0f || v.relEnd[h] > 0x1000000u) {
+            v.phaseIncs[h] < 0.0f) {
             return false;
         }
     }
@@ -3135,7 +3141,7 @@ bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
         if (v.relEnd[h] < 2u ||
             v.sampleStart[h] >= context.sampleDataFrames ||
             v.relEnd[h] > context.sampleDataFrames - v.sampleStart[h] ||
-            v.phaseIncs[h] < 0.0f || v.relEnd[h] > 0x1000000u) {
+            v.phaseIncs[h] < 0.0f) {
             return false;
         }
     }
@@ -3164,8 +3170,8 @@ bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
     return true;
 }
 
-// Steal-tail span, eight frames per step: the phase recurrence stays scalar
-// (repeated += step, as in RenderStealTailSpan), the sample gather, lerp, fade
+// Steal-tail span, eight frames per step: the cursor advances in fixed point
+// (exact, as in RenderStealTailSpan), the sample gather, lerp, fade
 // and mix are vectors, and the voice filter (a recurrence) runs per frame on
 // the vector's lanes.  A chunk is taken only when no frame of it wraps the
 // loop, reaches the sample end or the loop edge, or leaves the store; anything
@@ -3182,16 +3188,18 @@ uint32_t RenderStealTailSpanAVX2(VoiceSoA& v, uint32_t idx,
     }
     const uint32_t relEnd = v.stealTailRelEnd[idx];
     if (relEnd < 2u) return 0u;
-    const float step = v.stealTailPhaseInc[idx];
-    if (!(step >= 0.0f)) return 0u;
+    const float stepF = v.stealTailPhaseInc[idx];
+    if (!(stepF >= 0.0f)) return 0u;
+    const uint64_t stepFx = phasefx::FromFloat(stepF);
+    const FxSteps8 fs = MakeFxSteps8(stepFx);
     const bool loop = v.stealTailLoopEnabled[idx] != 0u;
     const uint32_t sampleStart = v.stealTailSampleStart[idx];
-    const float loopEndF = v.stealTailRelLoopEF[idx];
+    const uint64_t loopE64 = phasefx::Pack(v.stealTailRelLoopE[idx], 0u);
     const uint32_t limit = loop ? (std::min)(relEnd, v.stealTailRelLoopE[idx])
                                 : relEnd;
     const uint32_t total = v.stealTailFramesTotal[idx];
     const bool filtered = v.stealTailFilterEnabled[idx] != 0u;
-    float phase = (std::max)(0.0f, v.stealTailPhase[idx]);
+    uint64_t pos = phasefx::Pack(v.stealTailPhaseIdx[idx], v.stealTailPhaseFrac[idx]);
     const __m256 gain = _mm256_set1_ps(v.stealTailGain[idx]);
     const __m256 mixL = _mm256_set1_ps(v.stealTailMixGainL[idx]);
     const __m256 mixR = _mm256_set1_ps(v.stealTailMixGainR[idx]);
@@ -3201,21 +3209,16 @@ uint32_t RenderStealTailSpanAVX2(VoiceSoA& v, uint32_t idx,
                                        6.0f, 7.0f);
     uint32_t consumed = 0u;
     while (frameCount - consumed >= 8u && remaining >= 8u) {
-        alignas(32) float phases[8];
-        float p = phase;
-        for (uint32_t k = 0u; k < 8u; ++k) {
-            phases[k] = p;
-            p += step;
-        }
-        // phases[7] is the largest; p is the phase after the chunk.
-        const uint32_t base7 = static_cast<uint32_t>(phases[7]);
-        if (base7 + 1u >= limit || (loop && p >= loopEndF) ||
+        // The last lane is the largest; `after` is the cursor after the chunk.
+        const uint32_t base7 = phasefx::Index(pos + fs.step7);
+        const uint64_t after = pos + fs.step8;
+        if (base7 + 1u >= limit || (loop && after >= loopE64) ||
             sampleStart + base7 + 1u >= sampleDataFrames) {
             break;
         }
-        const __m256 ph = _mm256_load_ps(phases);
-        const __m256i base = _mm256_cvttps_epi32(ph);
-        const __m256 frac = _mm256_sub_ps(ph, _mm256_cvtepi32_ps(base));
+        __m256i base;
+        __m256 frac;
+        FxChunk(pos, fs, base, frac);
         __m256 first, second;
         GatherSamplePairAVX2(sampleData,
             _mm256_add_epi32(base, _mm256_set1_epi32(
@@ -3240,12 +3243,13 @@ uint32_t RenderStealTailSpanAVX2(VoiceSoA& v, uint32_t idx,
                                           _mm256_mul_ps(scaled, mixL)));
         _mm256_storeu_ps(r, _mm256_add_ps(_mm256_loadu_ps(r),
                                           _mm256_mul_ps(scaled, mixR)));
-        phase = p;
+        pos = after;
         remaining -= 8u;
         consumed += 8u;
     }
     if (consumed != 0u) {
-        v.stealTailPhase[idx] = phase;
+        v.stealTailPhaseIdx[idx] = phasefx::Index(pos);
+        v.stealTailPhaseFrac[idx] = phasefx::Frac(pos);
         v.stealTailFramesRemaining[idx] = remaining;
     }
     _mm256_zeroupper();

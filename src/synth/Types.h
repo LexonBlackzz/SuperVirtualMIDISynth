@@ -3,6 +3,7 @@
 
 #include "synth/Portability.h"
 #include "synth/LargePages.h"
+#include "synth/PhaseFx.h"
 #include <cassert>
 #include <cstdint>
 #include <cstddef>
@@ -411,7 +412,8 @@ struct SamplePage {
     X(uint8_t, envelopeStage) \
     X(uint8_t, sampleBacked) \
     X(uint8_t, renderClass) \
-    X(float, phases) \
+    X(uint32_t, phaseIdx) \
+    X(uint32_t, phaseFrac) \
     X(float, phaseIncs) \
     X(float, currentGain) \
     X(float, targetGain) \
@@ -504,7 +506,7 @@ static_assert(sizeof(VoiceRow) == 64, "VoiceRow must stay one cache line");
 // scorers and the render-class logic read at launch (state, envelopeStage,
 // renderClass, loopEnabled, currentGain, targetGain, stealOutputGain,
 // birthFrame, stealFadeIn*) stay SoA and are written at launch.  Constants
-// the launch always writes (phases, filterZ1/Z2 = 0; relLoopSF/EF derived
+// the launch always writes (phaseIdx/phaseFrac, filterZ1/Z2 = 0; relLoopSF/EF derived
 // from relLoopS/E) are rebuilt by Materialize, not stored.
 #define SVMS_VOICE_LAUNCH_FIELDS(X) \
     X(float, phaseIncs) \
@@ -572,7 +574,8 @@ struct VoiceRotationState {
 };
 
 #define SVMS_VOICE_SOA_FIXED_TAIL_FIELDS(X) \
-    X(float, stealTailPhase, kStealTailReserve) \
+    X(uint32_t, stealTailPhaseIdx, kStealTailReserve) \
+    X(uint32_t, stealTailPhaseFrac, kStealTailReserve) \
     X(float, stealTailPhaseInc, kStealTailReserve) \
     X(float, stealTailGain, kStealTailReserve) \
     X(float, stealTailMixGainL, kStealTailReserve) \

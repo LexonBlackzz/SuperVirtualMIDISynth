@@ -20,28 +20,28 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
         return;
     }
 
-    float phase = (std::max)(0.0f, v.stealTailPhase[idx]);
-    const float phaseStep = v.stealTailPhaseInc[idx];
+    uint64_t pos = phasefx::Pack(v.stealTailPhaseIdx[idx], v.stealTailPhaseFrac[idx]);
+    const uint64_t step = phasefx::FromFloat(v.stealTailPhaseInc[idx]);
     const float gain = v.stealTailGain[idx];
     const float mixL = v.stealTailMixGainL[idx];
     const float mixR = v.stealTailMixGainR[idx];
     const uint32_t sampleStart = v.stealTailSampleStart[idx];
     const uint32_t relLoopS = v.stealTailRelLoopS[idx];
     const uint32_t relLoopE = v.stealTailRelLoopE[idx];
-    const float relLoopSF = v.stealTailRelLoopSF[idx];
-    const float relLoopEF = v.stealTailRelLoopEF[idx];
+    const uint64_t loopS64 = phasefx::Pack(relLoopS, 0u);
+    const uint64_t loopE64 = phasefx::Pack(relLoopE, 0u);
     const bool loop = v.stealTailLoopEnabled[idx] != 0u;
     const uint32_t total = v.stealTailFramesTotal[idx];
     const uint32_t count = (std::min)(frameCount, remaining);
 
     for (uint32_t n = 0; n < count; ++n) {
-        uint32_t baseOffset = static_cast<uint32_t>(phase);
+        uint32_t baseOffset = phasefx::Index(pos);
         if (baseOffset + 1u >= relEnd) {
             if (!loop) {
                 remaining = 0u;
                 break;
             }
-            phase = relLoopSF;
+            pos = loopS64;
             baseOffset = relLoopS;
         }
 
@@ -55,7 +55,7 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
             break;
         }
 
-        const float frac = phase - static_cast<float>(baseOffset);
+        const float frac = phasefx::Weight(phasefx::Frac(pos));
         float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
         if (v.rot)
             sample = RotateVoiceSample(v.stealTailRot[idx], sample,
@@ -69,18 +69,13 @@ inline void RenderStealTailSpan(VoiceSoA& v, uint32_t idx,
         outputLeft[frameStart + n] += scaled * mixL;
         outputRight[frameStart + n] += scaled * mixR;
 
-        phase += phaseStep;
-        if (loop && phase >= relLoopEF) {
-            float overflow = phase - relLoopEF;
-            const float loopLength = relLoopEF - relLoopSF;
-            if (loopLength > 0.0f && overflow >= loopLength)
-                overflow -= floorf(overflow / loopLength) * loopLength;
-            phase = relLoopSF + overflow;
-        }
+        pos += step;
+        if (loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
         --remaining;
     }
 
-    v.stealTailPhase[idx] = phase;
+    v.stealTailPhaseIdx[idx] = phasefx::Index(pos);
+    v.stealTailPhaseFrac[idx] = phasefx::Frac(pos);
     v.stealTailFramesRemaining[idx] = remaining;
 }
 
@@ -171,13 +166,14 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
     const uint32_t relEnd = v.relEnd[idx];
     const uint32_t relLoopS = v.relLoopS[idx];
     const uint32_t relLoopE = v.relLoopE[idx];
-    const float relLoopSF = v.relLoopSF[idx];
-    const float relLoopEF = v.relLoopEF[idx];
+    const uint64_t loopS64 = phasefx::Pack(relLoopS, 0u);
+    const uint64_t loopE64 = phasefx::Pack(relLoopE, 0u);
     const bool loop = v.loopEnabled[idx] != 0u;
     const float phaseStep = v.phaseIncs[idx];
+    const uint64_t step = phasefx::FromFloat(phaseStep);
     const float mixL = v.mixGainL[idx];
     const float mixR = v.mixGainR[idx];
-    float phase = (std::max)(0.0f, v.phases[idx]);
+    uint64_t pos = phasefx::Load(v, idx);
     float gain = v.currentGain[idx];
     const bool released = v.state[idx] == static_cast<uint8_t>(VoiceState::Releasing);
     uint8_t stage = v.envelopeStage[idx];
@@ -198,114 +194,70 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             const float gainR = gain * mixR;
             float* outL = outputLeft + frameStart;
             float* outR = outputRight + frameStart;
-            // Wrap-free fast chunks: phaseStep and the loop bounds are fixed
-            // for the whole span, so a bounded run of frames can interpolate
-            // without any wrap checks, as long as the run is provably short
-            // of the next wrap point. Repeated float addition is kept (not
-            // phase += step*k) so the phase trajectory is bit-identical to
-            // the branchy loop; only the checks — guaranteed not to fire
-            // inside the chunk — are skipped. Chunks are capped at 64 frames
-            // with an 8-frame safety margin so accumulated addition drift
-            // (per-frame ulp(phase)) can never cross the wrap estimate.
-            const float wrapGuard = static_cast<float>(relLoopE - 1u);
+            // Wrap-free fast chunks: the cursor is exact, so a run of frames
+            // that provably stays short of the last interior position needs no
+            // wrap checks.  Chunks are capped at 64 frames.
+            const uint64_t guard64 = phasefx::Pack(relLoopE - 1u, 0u);
             uint32_t n = 0u;
             while (n < frameCount) {
-                const float distToWrap = (std::min)(wrapGuard, relLoopEF) - phase;
                 uint32_t run = 0u;
-                if (phaseStep > 0.0f && distToWrap > 64.0f &&
-                    phase < 1048576.0f) {
-                    run = static_cast<uint32_t>(distToWrap / phaseStep);
-                    if (run > 8u) run -= 8u; else run = 0u;
-                    if (run > 64u) run = 64u;
+                if (step > 0u && pos < guard64) {
+                    const uint64_t frames = (guard64 - pos + step - 1u) / step;
+                    run = static_cast<uint32_t>((std::min<uint64_t>)(frames, 64u));
                     if (run > frameCount - n) run = frameCount - n;
                 }
                 if (run == 0u) {
-                    uint32_t baseOffset = static_cast<uint32_t>(phase);
-                    if (phase >= relLoopEF) {  // a long span may end with the wrap pending: carry the overflow
-                        float wrapOverflow = phase - relLoopEF;
-                        const float wrapLength = relLoopEF - relLoopSF;
-                        if (wrapLength > 0.0f && wrapOverflow >= wrapLength)
-                            wrapOverflow -= floorf(wrapOverflow / wrapLength) * wrapLength;
-                        phase = relLoopSF + wrapOverflow;
-                        baseOffset = static_cast<uint32_t>(phase);
-                    }
+                    // a long span may end with the wrap pending: carry the overflow
+                    pos = phasefx::Wrap(pos, loopS64, loopE64);
+                    uint32_t baseOffset = phasefx::Index(pos);
                     if (baseOffset + 1u >= relEnd) {
-                        phase = relLoopSF;
+                        pos = loopS64;
                         baseOffset = relLoopS;
                     }
                     uint32_t nextRel = baseOffset + 1u;
                     if (nextRel >= relLoopE) nextRel = relLoopS;
-                    const float frac = phase - static_cast<float>(baseOffset);
+                    const float frac = phasefx::Weight(phasefx::Frac(pos));
                     float sample = InterpolateSample(
                         sampleData, sampleStart + baseOffset,
                         sampleStart + nextRel, frac);
                     sample = ProcessVoiceFilterSample(v, idx, sample);
                     outL[n] += sample * gainL;
                     outR[n] += sample * gainR;
-                    phase += phaseStep;
-                    if (phase >= relLoopEF) {
-                        float overflow = phase - relLoopEF;
-                        const float loopLength = relLoopEF - relLoopSF;
-                        if (overflow >= loopLength)
-                            overflow -= floorf(overflow / loopLength) * loopLength;
-                        phase = relLoopSF + overflow;
-                    }
+                    pos = phasefx::Wrap(pos + step, loopS64, loopE64);
                     ++n;
                 } else {
                     const uint32_t endIndex = n + run;
                     for (; n < endIndex; ++n) {
-                        const float phaseF = phase;
-                        const uint32_t baseOffset = static_cast<uint32_t>(phaseF);
-                        const float frac = phaseF - static_cast<float>(baseOffset);
+                        const uint32_t baseOffset = phasefx::Index(pos);
+                        const float frac = phasefx::Weight(phasefx::Frac(pos));
                         float sample = InterpolateSample(
                             sampleData, sampleStart + baseOffset,
                             sampleStart + baseOffset + 1u, frac);
                         sample = ProcessVoiceFilterSample(v, idx, sample);
                         outL[n] += sample * gainL;
                         outR[n] += sample * gainR;
-                        phase += phaseStep;
+                        pos += step;
                     }
                 }
             }
-            v.phases[idx] = phase;
+            phasefx::Store(v, idx, pos);
             return UINT32_MAX;
         }
 
         // Decimated steady voices still advance phase without fetching sample
         // memory or touching the output buffers.
         if (mixedFrameCount == 0u && fadeRemaining == 0u) {
-            if (exactSilentAdvance) {
-                // A muted/silent advance moves authoritative state without
-                // fetching samples. Repeated addition preserves the same
-                // phase rounding as the full-quality scalar/SIMD kernels.
-                for (uint32_t n = 0u; n < frameCount; ++n) {
-                    phase += phaseStep;
-                    if (phase >= relLoopEF) {
-                        float overflow = phase - relLoopEF;
-                        const float loopLength = relLoopEF - relLoopSF;
-                        if (loopLength > 0.0f && overflow >= loopLength)
-                            overflow -= floorf(overflow / loopLength) * loopLength;
-                        phase = relLoopSF + overflow;
-                    }
-                }
-            } else {
-                phase += phaseStep * static_cast<float>(frameCount);
-                if (phase >= relLoopEF) {
-                    float overflow = phase - relLoopEF;
-                    const float loopLength = relLoopEF - relLoopSF;
-                    if (loopLength > 0.0f && overflow >= loopLength)
-                        overflow -= floorf(overflow / loopLength) * loopLength;
-                    phase = relLoopSF + overflow;
-                }
-            }
-            v.phases[idx] = phase;
+            // A muted/silent advance moves authoritative state without
+            // fetching samples; the cursor is exact, so one add covers it.
+            pos = phasefx::Wrap(pos + step * frameCount, loopS64, loopE64);
+            phasefx::Store(v, idx, pos);
             return UINT32_MAX;
         }
 
         for (uint32_t n = 0; n < frameCount; ++n) {
-            uint32_t baseOffset = static_cast<uint32_t>(phase);
+            uint32_t baseOffset = phasefx::Index(pos);
             if (baseOffset + 1u >= relEnd) {
-                phase = relLoopSF;
+                pos = loopS64;
                 baseOffset = relLoopS;
             }
 
@@ -324,7 +276,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 if (nextRel >= relEnd) nextRel = relEnd - 1u;
                 const uint32_t baseIndex = sampleStart + baseOffset;
                 const uint32_t nextIndex = sampleStart + nextRel;
-                const float frac = phase - static_cast<float>(baseOffset);
+                const float frac = phasefx::Weight(phasefx::Frac(pos));
                 float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
                 sample = ProcessVoiceFilterSample(v, idx, sample);
                 if (v.rot)
@@ -335,16 +287,9 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 outputRight[frameStart + n] += scaled * mixR;
             }
 
-            phase += phaseStep;
-            if (phase >= relLoopEF) {
-                float overflow = phase - relLoopEF;
-                const float loopLength = relLoopEF - relLoopSF;
-                if (loopLength > 0.0f && overflow >= loopLength)
-                    overflow -= floorf(overflow / loopLength) * loopLength;
-                phase = relLoopSF + overflow;
-            }
+            pos = phasefx::Wrap(pos + step, loopS64, loopE64);
         }
-        v.phases[idx] = phase;
+        phasefx::Store(v, idx, pos);
         v.stealFadeInFramesRemaining[idx] = fadeRemaining;
         return UINT32_MAX;
     }
@@ -361,30 +306,23 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
 
         if (!exactSilentAdvance && releaseDecay > 0.0f &&
             releaseDecay < 1.0f) {
-            if (static_cast<uint32_t>(phase) + 1u >= relEnd)
-                phase = relLoopSF;
+            if (phasefx::Index(pos) + 1u >= relEnd)
+                pos = loopS64;
             uint32_t consumed = 0u;
             retiredAt = SilentReleaseAdvance(gain, releaseRemaining,
                                              releaseDecay, frameCount,
                                              consumed);
-            phase += phaseStep * static_cast<float>(consumed);
-            if (phase >= relLoopEF) {
-                float overflow = phase - relLoopEF;
-                const float loopLength = relLoopEF - relLoopSF;
-                if (loopLength > 0.0f && overflow >= loopLength)
-                    overflow -= floorf(overflow / loopLength) * loopLength;
-                phase = relLoopSF + overflow;
-            }
-            v.phases[idx] = phase;
+            pos = phasefx::Wrap(pos + step * consumed, loopS64, loopE64);
+            phasefx::Store(v, idx, pos);
             v.currentGain[idx] = gain;
             v.releaseSamplesRemaining[idx] = releaseRemaining;
             return retiredAt;
         }
 
         for (uint32_t n = 0u; n < frameCount; ++n) {
-            const uint32_t baseOffset = static_cast<uint32_t>(phase);
+            const uint32_t baseOffset = phasefx::Index(pos);
             if (baseOffset + 1u >= relEnd)
-                phase = relLoopSF;
+                pos = loopS64;
 
             bool releaseFinished = false;
             if (releaseRemaining == 0u) {
@@ -397,14 +335,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 }
             }
 
-            phase += phaseStep;
-            if (phase >= relLoopEF) {
-                float overflow = phase - relLoopEF;
-                const float loopLength = relLoopEF - relLoopSF;
-                if (loopLength > 0.0f && overflow >= loopLength)
-                    overflow -= floorf(overflow / loopLength) * loopLength;
-                phase = relLoopSF + overflow;
-            }
+            pos = phasefx::Wrap(pos + step, loopS64, loopE64);
 
             if (releaseFinished ||
                 (releaseRemaining == UINT32_MAX &&
@@ -414,7 +345,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             }
         }
 
-        v.phases[idx] = phase;
+        phasefx::Store(v, idx, pos);
         v.currentGain[idx] = gain;
         v.releaseSamplesRemaining[idx] = releaseRemaining;
         return retiredAt;
@@ -427,17 +358,17 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
         uint32_t retiredAt = UINT32_MAX;
 
         if (!exactSilentAdvance && releaseDecay > 0.0f &&
-            releaseDecay < 1.0f && phaseStep > 0.0f) {
+            releaseDecay < 1.0f && step > 0u) {
             // The sample runs out (base + 1 >= relEnd) at the first frame
             // whose phase reaches relEnd - 1; the release retires on its own
             // schedule. The earlier of the two wins.
-            const float lastPhase = static_cast<float>(relEnd - 1u);
+            const uint64_t lastPos = phasefx::Pack(relEnd - 1u, 0u);
             uint32_t endFrame = UINT32_MAX;
-            if (phase >= lastPhase) {
+            if (pos >= lastPos) {
                 endFrame = 0u;
             } else {
-                const float frames = ceilf((lastPhase - phase) / phaseStep);
-                if (frames < 4.0e9f) endFrame = static_cast<uint32_t>(frames);
+                const uint64_t frames = (lastPos - pos + step - 1u) / step;
+                if (frames < 4000000000ull) endFrame = static_cast<uint32_t>(frames);
             }
             uint32_t consumed = 0u;
             const uint32_t releaseAt = SilentReleaseAdvance(
@@ -449,15 +380,15 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             } else {
                 retiredAt = releaseAt;
             }
-            phase += phaseStep * static_cast<float>(consumed);
-            v.phases[idx] = phase;
+            pos += step * consumed;
+            phasefx::Store(v, idx, pos);
             v.currentGain[idx] = gain;
             v.releaseSamplesRemaining[idx] = releaseRemaining;
             return retiredAt;
         }
 
         for (uint32_t n = 0u; n < frameCount; ++n) {
-            const uint32_t baseOffset = static_cast<uint32_t>(phase);
+            const uint32_t baseOffset = phasefx::Index(pos);
             if (baseOffset + 1u >= relEnd) {
                 retiredAt = n;
                 break;
@@ -473,7 +404,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                     releaseFinished = releaseRemaining == 0u;
                 }
             }
-            phase += phaseStep;
+            pos += step;
 
             if (releaseFinished ||
                 (releaseRemaining == UINT32_MAX &&
@@ -483,7 +414,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             }
         }
 
-        v.phases[idx] = phase;
+        phasefx::Store(v, idx, pos);
         v.currentGain[idx] = gain;
         v.releaseSamplesRemaining[idx] = releaseRemaining;
         return retiredAt;
@@ -504,14 +435,14 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
         float* outR = outputRight + frameStart;
 
         for (uint32_t n = 0; n < frameCount; ++n) {
-            uint32_t baseOffset = static_cast<uint32_t>(phase);
+            uint32_t baseOffset = phasefx::Index(pos);
             if (baseOffset + 1u >= relEnd) {
-                phase = relLoopSF;
+                pos = loopS64;
                 baseOffset = relLoopS;
             }
             uint32_t nextRel = baseOffset + 1u;
             if (nextRel >= relLoopE) nextRel = relLoopS;
-            const float frac = phase - static_cast<float>(baseOffset);
+            const float frac = phasefx::Weight(phasefx::Frac(pos));
             float sample = InterpolateSample(
                 sampleData, sampleStart + baseOffset, sampleStart + nextRel, frac);
             sample = ProcessVoiceFilterSample(v, idx, sample);
@@ -546,17 +477,10 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             const float scaled = sampleR * gain;
             outL[n] += scaled * mixL;
             outR[n] += scaled * mixR;
-            phase += phaseStep;
-            if (phase >= relLoopEF) {
-                float overflow = phase - relLoopEF;
-                const float loopLength = relLoopEF - relLoopSF;
-                if (overflow >= loopLength)
-                    overflow -= floorf(overflow / loopLength) * loopLength;
-                phase = relLoopSF + overflow;
-            }
+            pos = phasefx::Wrap(pos + step, loopS64, loopE64);
         }
 
-        v.phases[idx] = phase;
+        phasefx::Store(v, idx, pos);
         v.currentGain[idx] = gain;
         v.envelopeStage[idx] = stage;
         v.attackSamplesRemaining[idx] = attackRemaining;
@@ -575,14 +499,14 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
         uint32_t retiredAt = UINT32_MAX;
 
         for (uint32_t n = 0; n < frameCount; ++n) {
-            uint32_t baseOffset = static_cast<uint32_t>(phase);
+            uint32_t baseOffset = phasefx::Index(pos);
             if (baseOffset + 1u >= relEnd) {
-                phase = relLoopSF;
+                pos = loopS64;
                 baseOffset = relLoopS;
             }
             uint32_t nextRel = baseOffset + 1u;
             if (nextRel >= relLoopE) nextRel = relLoopS;
-            const float frac = phase - static_cast<float>(baseOffset);
+            const float frac = phasefx::Weight(phasefx::Frac(pos));
             float sample = InterpolateSample(
                 sampleData, sampleStart + baseOffset, sampleStart + nextRel, frac);
             sample = ProcessVoiceFilterSample(v, idx, sample);
@@ -606,14 +530,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             outL[n] += scaled * mixL;
             outR[n] += scaled * mixR;
 
-            phase += phaseStep;
-            if (phase >= relLoopEF) {
-                float overflow = phase - relLoopEF;
-                const float loopLength = relLoopEF - relLoopSF;
-                if (overflow >= loopLength)
-                    overflow -= floorf(overflow / loopLength) * loopLength;
-                phase = relLoopSF + overflow;
-            }
+            pos = phasefx::Wrap(pos + step, loopS64, loopE64);
             if (releaseFinished ||
                 (releaseRemaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
                 retiredAt = n;
@@ -621,7 +538,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             }
         }
 
-        v.phases[idx] = phase;
+        phasefx::Store(v, idx, pos);
         v.currentGain[idx] = gain;
         v.releaseSamplesRemaining[idx] = releaseRemaining;
         return retiredAt;
@@ -647,12 +564,12 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
         uint32_t fetchNextIndex = 0u;
         float fetchFrac = 0.0f;
         bool sampleEnded = false;
-        uint32_t baseOffset = static_cast<uint32_t>(phase);
+        uint32_t baseOffset = phasefx::Index(pos);
         if (baseOffset + 1u >= relEnd) {
             if (!loop) {
                 sampleEnded = true;
             } else {
-                phase = relLoopSF;
+                pos = loopS64;
                 baseOffset = relLoopS;
             }
         }
@@ -663,7 +580,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
             if (nextRel >= relEnd) nextRel = relEnd - 1u;
             const uint32_t baseIndex = sampleStart + baseOffset;
             const uint32_t nextIndex = sampleStart + nextRel;
-            const float frac = phase - static_cast<float>(baseOffset);
+            const float frac = phasefx::Weight(phasefx::Frac(pos));
             sample = InterpolateSample(
                 sampleData, baseIndex, nextIndex, frac);
             fetchBaseIndex = baseIndex;
@@ -724,14 +641,8 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                 }
             }
 
-            phase += phaseStep;
-            if (loop && phase >= relLoopEF) {
-                float overflow = phase - relLoopEF;
-                const float loopLength = relLoopEF - relLoopSF;
-                if (loopLength > 0.0f && overflow >= loopLength)
-                    overflow -= floorf(overflow / loopLength) * loopLength;
-                phase = relLoopSF + overflow;
-            }
+            pos += step;
+            if (loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
         }
 
         float fade = 1.0f;
@@ -763,7 +674,7 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
         }
     }
 
-    v.phases[idx] = phase;
+    phasefx::Store(v, idx, pos);
     v.currentGain[idx] = gain;
     v.envelopeStage[idx] = stage;
     v.delaySamplesRemaining[idx] = delayRemaining;

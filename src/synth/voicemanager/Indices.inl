@@ -123,7 +123,8 @@ inline void VoiceManager::PrefetchVoiceLines(VoiceHandle handle) {
     _mm_prefetch(base, _MM_HINT_T0);
 #define SVMS_PREFETCH_FIELD(field) \
     _mm_prefetch(reinterpret_cast<const char*>(&v.field[handle]), _MM_HINT_T0)
-    SVMS_PREFETCH_FIELD(phases);
+    SVMS_PREFETCH_FIELD(phaseIdx);
+    SVMS_PREFETCH_FIELD(phaseFrac);
     SVMS_PREFETCH_FIELD(phaseIncs);
     SVMS_PREFETCH_FIELD(currentGain);
     SVMS_PREFETCH_FIELD(targetGain);
@@ -167,7 +168,8 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.note[handle]         = note;
     v.velocity[handle]     = velocity;
     v.staged[handle]       = 0u;
-    v.phases[handle]       = 0.0f;
+    v.phaseIdx[handle]     = 0u;
+    v.phaseFrac[handle]    = 0u;
     v.phaseIncs[handle]    = 0.0f;
     v.basePhaseIncs[handle] = 0.0f;
     v.pitchBendScales[handle] = 1.0f;

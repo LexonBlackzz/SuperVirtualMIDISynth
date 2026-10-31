@@ -118,8 +118,7 @@ void RunGpuStageSteadyDifferential(svms::GpuStage& stage, uint32_t poolSize,
     uint32_t filterMismatch = 0u;
     for (uint32_t i = 0; i < gpuVoices->activeCount_; ++i) {
         const uint32_t h = gpuVoices->activeList_[i];
-        if (std::memcmp(&gpuVoices->v.phases[h], &cpuVoices->v.phases[h],
-                        sizeof(float)) != 0) ++phaseMismatch;
+        if ((gpuVoices->v.phaseIdx[h] != cpuVoices->v.phaseIdx[h] || gpuVoices->v.phaseFrac[h] != cpuVoices->v.phaseFrac[h])) ++phaseMismatch;
         if (std::memcmp(&gpuVoices->v.filterZ1[h], &cpuVoices->v.filterZ1[h],
                         sizeof(float)) != 0 ||
             std::memcmp(&gpuVoices->v.filterZ2[h], &cpuVoices->v.filterZ2[h],
@@ -162,7 +161,7 @@ void RunGpuStageWrapSweep(svms::GpuStage& stage) {
         const bool bigStep = (trial % 3u) == 2u;
         const float step = bigStep ? 3000.0f + static_cast<float>(rng.Next() % 960u)
                                    : 0.3f + static_cast<float>(rng.Next() % 2000u) * 0.001f;
-        seed->v.phases[0] = 4032.0f - static_cast<float>(rng.Next() % 4000u) * 0.01f;
+        svms::phasefx::StoreFloat(seed->v, 0, 4032.0f - static_cast<float>(rng.Next() % 4000u) * 0.01f);
         seed->v.phaseIncs[0] = seed->v.basePhaseIncs[0] = step;
         if ((trial % 2u) == 1u) {
             seed->v.filterEnabled[0] = lowPass.enabled;
@@ -192,8 +191,7 @@ void RunGpuStageWrapSweep(svms::GpuStage& stage) {
             worst = (std::max)(worst, (std::max)(std::fabs(cl[f] - gl[f]),
                                                  std::fabs(cr[f] - gr[f])));
         const bool stateEqual =
-            std::memcmp(&cpuVoices->v.phases[0], &gpuVoices->v.phases[0],
-                        sizeof(float)) == 0 &&
+            (cpuVoices->v.phaseIdx[0] == gpuVoices->v.phaseIdx[0] && cpuVoices->v.phaseFrac[0] == gpuVoices->v.phaseFrac[0]) &&
             std::memcmp(&cpuVoices->v.filterZ1[0], &gpuVoices->v.filterZ1[0],
                         sizeof(float)) == 0 &&
             std::memcmp(&cpuVoices->v.filterZ2[0], &gpuVoices->v.filterZ2[0],
@@ -367,7 +365,7 @@ void ConfigureGpuEnvelopePool(svms::VoiceManager& voices,
             phase = 4096.0f - 1.0f - static_cast<float>(300u + (i % 9u) * 90u);
         }
         voices.SetVoiceSample(voice, 0, 4096, 64, 4032, loop ? 1u : 0u, step, 1);
-        voices.v.phases[voice] = phase;
+        svms::phasefx::StoreFloat(voices.v, voice, phase);
         const float gain = 0.02f * (1.0f + 0.01f * static_cast<float>(i % 50u));
         switch (type) {
         case 1u:   // release loop, threshold-governed tail
@@ -480,7 +478,7 @@ void RunGpuStageEnvelopeDifferential(svms::GpuStage& stage, uint32_t poolSize,
             const svms::VoiceSoA& a = cpuVoices->v;
             const svms::VoiceSoA& b = gpuVoices->v;
             const bool same =
-                std::memcmp(&a.phases[h], &b.phases[h], sizeof(float)) == 0 &&
+                (a.phaseIdx[h] == b.phaseIdx[h] && a.phaseFrac[h] == b.phaseFrac[h]) &&
                 std::memcmp(&a.currentGain[h], &b.currentGain[h], sizeof(float)) == 0 &&
                 std::memcmp(&a.filterZ1[h], &b.filterZ1[h], sizeof(float)) == 0 &&
                 std::memcmp(&a.filterZ2[h], &b.filterZ2[h], sizeof(float)) == 0 &&
@@ -495,7 +493,7 @@ void RunGpuStageEnvelopeDifferential(svms::GpuStage& stage, uint32_t poolSize,
                 std::fprintf(stderr,
                     "[GPUDIFF] env block %u handle %u: phase %g/%g gain %g/%g "
                     "stage %u/%u atk %u/%u dec %u/%u rel %u/%u\n",
-                    block, h, a.phases[h], b.phases[h], a.currentGain[h],
+                    block, h, svms::phasefx::LoadFloat(a, h), svms::phasefx::LoadFloat(b, h), a.currentGain[h],
                     b.currentGain[h], a.envelopeStage[h], b.envelopeStage[h],
                     a.attackSamplesRemaining[h], b.attackSamplesRemaining[h],
                     a.decaySamplesRemaining[h], b.decaySamplesRemaining[h],
@@ -636,7 +634,7 @@ void RunGpuStageTimelineDifferential(svms::GpuStage& stage, uint32_t poolSize,
             const svms::VoiceSoA& a = cpuVoices->v;
             const svms::VoiceSoA& b = gpuVoices->v;
             const bool same =
-                std::memcmp(&a.phases[h], &b.phases[g], sizeof(float)) == 0 &&
+                (a.phaseIdx[h] == b.phaseIdx[g] && a.phaseFrac[h] == b.phaseFrac[g]) &&
                 std::memcmp(&a.currentGain[h], &b.currentGain[g], sizeof(float)) == 0 &&
                 std::memcmp(&a.filterZ1[h], &b.filterZ1[g], sizeof(float)) == 0 &&
                 std::memcmp(&a.filterZ2[h], &b.filterZ2[g], sizeof(float)) == 0 &&
@@ -653,8 +651,8 @@ void RunGpuStageTimelineDifferential(svms::GpuStage& stage, uint32_t poolSize,
                     "[GPUDIFF] timeline block %u play %u: state %u/%u phase %g/%g "
                     "gain %g/%g stage %u/%u atk %u/%u dec %u/%u rel %u/%u "
                     "rgL %g/%g loop %u/%u\n",
-                    block, a.playIndex[h], a.state[h], b.state[g], a.phases[h],
-                    b.phases[g], a.currentGain[h], b.currentGain[g],
+                    block, a.playIndex[h], a.state[h], b.state[g], svms::phasefx::LoadFloat(a, h),
+                    svms::phasefx::LoadFloat(b, g), a.currentGain[h], b.currentGain[g],
                     a.envelopeStage[h], b.envelopeStage[g],
                     a.attackSamplesRemaining[h], b.attackSamplesRemaining[g],
                     a.decaySamplesRemaining[h], b.decaySamplesRemaining[g],

@@ -211,7 +211,8 @@ inline void RenderScalar::CaptureGhostTail(uint32_t ghost) {
     const float outgoingLevel =
         std::fabs(gain) * (std::fabs(mixL) + std::fabs(mixR));
     if (outgoingLevel <= VoiceRetireThreshold()) return;
-    tail.phase = v.phases[ghost];
+    tail.phaseIdx = v.phaseIdx[ghost];
+    tail.phaseFrac = v.phaseFrac[ghost];
     tail.phaseInc = v.phaseIncs[ghost];
     tail.gain = gain;
     tail.mixGainL = mixL;
@@ -245,7 +246,8 @@ inline void RenderScalar::RenderGhostTailSpan(uint32_t ghost, VoiceSoA& s,
                                               uint32_t frameCount) {
     const WholeVoiceGhostTail& tail = wvGhostTails_[ghost];
     if (tail.framesRemaining == 0u) return;
-    s.stealTailPhase[0] = tail.phase;
+    s.stealTailPhaseIdx[0] = tail.phaseIdx;
+    s.stealTailPhaseFrac[0] = tail.phaseFrac;
     s.stealTailPhaseInc[0] = tail.phaseInc;
     s.stealTailGain[0] = tail.gain;
     s.stealTailMixGainL[0] = tail.mixGainL;
@@ -1190,7 +1192,8 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         if (wvGhostDeathFrame_[ghost] >= numFrames) continue;
         for (uint32_t slot = 0u; slot < tailCapacity; ++slot) {
             if (voices.v.stealTailFramesRemaining[slot] != 0u) continue;
-            voices.v.stealTailPhase[slot] = tail.phase;
+            voices.v.stealTailPhaseIdx[slot] = tail.phaseIdx;
+            voices.v.stealTailPhaseFrac[slot] = tail.phaseFrac;
             voices.v.stealTailPhaseInc[slot] = tail.phaseInc;
             voices.v.stealTailGain[slot] = tail.gain;
             voices.v.stealTailMixGainL[slot] = tail.mixGainL;

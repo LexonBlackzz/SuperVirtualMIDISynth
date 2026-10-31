@@ -13,31 +13,34 @@ namespace svms {
 namespace gpu {
 
 // Words per GPU row record.  Layout (all 32-bit):
-//   0 sampleStart | filterEnabled << 31     6 phaseInc    (float)
+//   0 sampleStart | filterEnabled << 31     6 (reserved)
 //   1 relLoopS                              7 renderGainL (float)
 //   2 relLoopE                              8 renderGainR (float)
-//   3 relLoopSF   (float)                   9 filterA0    (float)
-//   4 relLoopEF   (float)                  10 filterB1    (float)
-//   5 (reserved)                           11 filterB2    (float)
+//   3 stepIdx  (32.32 step, whole frames)   9 filterA0    (float)
+//   4 stepFrac (32.32 step, fraction)      10 filterB1    (float)
+//   5 phaseFrac (initial cursor fraction;  11 filterB2    (float)
+//     only read when the row is uploaded)
 constexpr uint32_t kRowWords = 12u;
 constexpr uint32_t kFilterFlag = 0x80000000u;
 
 // The dynamic state of a row lives on the GPU between blocks (8 words per
 // handle).  The per-block list is just handles; a row's state is uploaded
 // only when the CPU changed it behind the GPU's back (new row, CPU-rendered
-// block, kind change).  Layout: 0 phase, 1 z1, 2 z2, 3 gain, 4 stage (0 =
-// releasing, else the envelope stage), 5 attackRem, 6 decayRem, 7 releaseRem.
-constexpr uint32_t kDynWords = 8u;
+// block, kind change).  Layout: 0 cursor index, 1 z1, 2 z2, 3 gain, 4 stage (0 =
+// releasing, else the envelope stage), 5 attackRem, 6 decayRem, 7 releaseRem,
+// 8 cursor fraction.  The cursor is 32.32 fixed point (synth/PhaseFx.h).
+constexpr uint32_t kDynWords = 9u;
 
 // A block is submitted in up to this many parts.
 constexpr uint32_t kMaxParts = 4u;
 
 // One row upload record (64 B): the handle, its static row words, and the
-// dynamic state it starts from (phase, filter delay line).
+// dynamic state it starts from (cursor index, filter delay line; the cursor
+// fraction rides in words[5]).
 struct UploadRecord {
     uint32_t handle;
     uint32_t words[kRowWords];
-    float phase;
+    uint32_t phaseIdx;
     float z1;
     float z2;
 };
@@ -45,24 +48,24 @@ static_assert(sizeof(UploadRecord) == 64u, "UploadRecord is 16 words");
 
 // Dynamic state read back for list position i.
 struct DynOut {
-    float phase;
+    uint32_t phaseIdx;
     float z1;
     float z2;
-    float pad;
+    uint32_t phaseFrac;
 };
 static_assert(sizeof(DynOut) == 16u, "DynOut is one vec4");
 
 // Envelope rows (release tails, attack/decay, one-shots) run the scalar
 // generic span machine instead of the sustained fast path, so they carry the
 // envelope too.  Statics, 20 words (all 32-bit):
-//   0 sampleStart            7 phaseInc (float)      14 releaseDecay (float)
+//   0 sampleStart            7 (reserved)            14 releaseDecay (float)
 //   1 flags: bit0 filter,    8 mixGainL (float)      15 filterA0 (float)
 //     bit1 loop              9 mixGainR (float)      16 filterB1 (float)
 //   2 relEnd                10 targetGain (float)    17 filterB2 (float)
 //   3 relLoopS              11 sustainLevel (float)  18, 19 see below
 //   4 relLoopE              12 attackStep (float)
-//   5 relLoopSF (float)     13 decaySlope (float)
-//   6 relLoopEF (float)
+//   5 stepIdx               13 decaySlope (float)
+//   6 stepFrac
 //   18, 19 renderGainL/R (float): the gains of a row that renders as a held
 //     sustained loop until its release frame (kTlPreSustained).
 constexpr uint32_t kEnvRowWords = 20u;
@@ -84,15 +87,17 @@ constexpr uint32_t kTlActive = 0x80000000u;
 constexpr uint32_t kTlPreSustained = 1u;
 constexpr uint32_t kTlClearLoop = 2u;
 
-// Envelope upload record (128 B): handle, static words, initial dynamic
-// state (kDynWords words, layout above), the block timeline.
+// Envelope upload record (144 B): handle, static words, initial dynamic
+// state (kDynWords words, layout above), the block timeline, padding to a
+// whole number of vec4s.
 struct EnvUploadRecord {
     uint32_t handle;
     uint32_t words[kEnvRowWords];
     uint32_t dyn[kDynWords];
     uint32_t timeline[3];
+    uint32_t pad[3];
 };
-static_assert(sizeof(EnvUploadRecord) == 128u, "EnvUploadRecord is 32 words");
+static_assert(sizeof(EnvUploadRecord) == 144u, "EnvUploadRecord is 36 words");
 
 // Read back per envelope row.  stageRetire: bits 24..27 the stage code after
 // the block (for a row that flipped to its release inside the block: the stage
@@ -103,7 +108,7 @@ static_assert(sizeof(EnvUploadRecord) == 128u, "EnvUploadRecord is 32 words");
 constexpr uint32_t kEnvFlipped = 1u << 28;
 constexpr uint32_t kEnvNoRetire = 0xFFFFFFu;
 struct EnvDynOut {
-    float phase;
+    uint32_t phaseIdx;
     float z1;
     float z2;
     float gain;
@@ -111,8 +116,10 @@ struct EnvDynOut {
     uint32_t attackRem;
     uint32_t decayRem;
     uint32_t releaseRem;
+    uint32_t phaseFrac;
+    uint32_t pad[3];
 };
-static_assert(sizeof(EnvDynOut) == 32u, "EnvDynOut is two vec4");
+static_assert(sizeof(EnvDynOut) == 48u, "EnvDynOut is three vec4");
 
 enum class Result : uint32_t {
     Ok = 0,     // mix and dynamic state are filled

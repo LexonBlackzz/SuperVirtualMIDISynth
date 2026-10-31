@@ -31,7 +31,8 @@ inline void VoiceManager::SetVoiceSample(VoiceHandle handle, uint32_t start, uin
     // Render-correct engines retrigger chopped notes from the same sample
     // position; randomizing this phase smears the repeated waveform and
     // destroys the characteristic coherent buzz of dense retriggers.
-    v.phases[handle] = 0.0f;
+    v.phaseIdx[handle] = 0u;
+    v.phaseFrac[handle] = 0u;
     RefreshRenderClass(handle);
 }
 

@@ -62,17 +62,18 @@ inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
         return;
     }
 
-    float phase = v.stealTailPhase[idx];
-    if (phase < 0.0f) phase = 0.0f;
-    uint32_t baseOffset = static_cast<uint32_t>(phase);
+    uint64_t pos = phasefx::Pack(v.stealTailPhaseIdx[idx], v.stealTailPhaseFrac[idx]);
+    uint32_t baseOffset = phasefx::Index(pos);
     const bool loop = v.stealTailLoopEnabled[idx] != 0;
+    const uint64_t loopS64 = phasefx::Pack(v.stealTailRelLoopS[idx], 0u);
+    const uint64_t loopE64 = phasefx::Pack(v.stealTailRelLoopE[idx], 0u);
 
     if (baseOffset + 1u >= relEnd) {
         if (!loop) {
             v.stealTailFramesRemaining[idx] = 0;
             return;
         }
-        phase = v.stealTailRelLoopSF[idx];
+        pos = loopS64;
         baseOffset = v.stealTailRelLoopS[idx];
     }
 
@@ -89,7 +90,7 @@ inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
         return;
     }
 
-    const float frac = phase - static_cast<float>(baseOffset);
+    const float frac = phasefx::Weight(phasefx::Frac(pos));
     float sample = InterpolateSample(sampleData, baseIndex, nextIndex, frac);
     if (v.rot)
         sample = RotateVoiceSample(v.stealTailRot[idx], sample, hilbertData,
@@ -103,18 +104,11 @@ inline void RenderStealTailSample(VoiceSoA& v, uint32_t idx,
     *outL += scaled * v.stealTailMixGainL[idx];
     *outR += scaled * v.stealTailMixGainR[idx];
 
-    phase += v.stealTailPhaseInc[idx];
-    const float loopEnd = v.stealTailRelLoopEF[idx];
-    if (loop && phase >= loopEnd) {
-        float overflow = phase - loopEnd;
-        const float loopStart = v.stealTailRelLoopSF[idx];
-        const float loopLength = loopEnd - loopStart;
-        if (loopLength > 0.0f && overflow >= loopLength)
-            overflow -= floorf(overflow / loopLength) * loopLength;
-        phase = loopStart + overflow;
-    }
+    pos += phasefx::FromFloat(v.stealTailPhaseInc[idx]);
+    if (loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
 
-    v.stealTailPhase[idx] = phase;
+    v.stealTailPhaseIdx[idx] = phasefx::Index(pos);
+    v.stealTailPhaseFrac[idx] = phasefx::Frac(pos);
     v.stealTailFramesRemaining[idx] = remaining - 1u;
 }
 
@@ -122,32 +116,27 @@ inline void AdvanceStealTailSpanExact(VoiceSoA& v, uint32_t idx,
                                       uint32_t frameCount) {
     uint32_t remaining = v.stealTailFramesRemaining[idx];
     if (remaining == 0u || v.stealTailSampleBacked[idx] == 0u) return;
-    float phase = (std::max)(0.0f, v.stealTailPhase[idx]);
-    const float phaseStep = v.stealTailPhaseInc[idx];
+    uint64_t pos = phasefx::Pack(v.stealTailPhaseIdx[idx], v.stealTailPhaseFrac[idx]);
+    const uint64_t step = phasefx::FromFloat(v.stealTailPhaseInc[idx]);
     const uint32_t relEnd = v.stealTailRelEnd[idx];
     const bool loop = v.stealTailLoopEnabled[idx] != 0u;
+    const uint64_t loopS64 = phasefx::Pack(v.stealTailRelLoopS[idx], 0u);
+    const uint64_t loopE64 = phasefx::Pack(v.stealTailRelLoopE[idx], 0u);
     for (uint32_t frame = 0u; frame < frameCount && remaining != 0u; ++frame) {
-        uint32_t base = static_cast<uint32_t>(phase);
+        uint32_t base = phasefx::Index(pos);
         if (relEnd < 2u || base + 1u >= relEnd) {
             if (!loop) {
                 remaining = 0u;
                 break;
             }
-            phase = v.stealTailRelLoopSF[idx];
+            pos = loopS64;
         }
-        phase += phaseStep;
-        const float loopEnd = v.stealTailRelLoopEF[idx];
-        if (loop && phase >= loopEnd) {
-            float overflow = phase - loopEnd;
-            const float loopStart = v.stealTailRelLoopSF[idx];
-            const float loopLength = loopEnd - loopStart;
-            if (loopLength > 0.0f && overflow >= loopLength)
-                overflow -= floorf(overflow / loopLength) * loopLength;
-            phase = loopStart + overflow;
-        }
+        pos += step;
+        if (loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
         --remaining;
     }
-    v.stealTailPhase[idx] = phase;
+    v.stealTailPhaseIdx[idx] = phasefx::Index(pos);
+    v.stealTailPhaseFrac[idx] = phasefx::Frac(pos);
     v.stealTailFramesRemaining[idx] = remaining;
 }
 
@@ -356,7 +345,8 @@ struct WholeVoiceJobContext {
 // VoiceSoA steal-tail arrays are fixed kStealTailReserve slots and must
 // never be indexed by ghost row, so ghosts carry their own records.
 struct WholeVoiceGhostTail {
-    float phase = 0.0f;
+    uint32_t phaseIdx = 0u;
+    uint32_t phaseFrac = 0u;
     float phaseInc = 0.0f;
     float gain = 0.0f;
     float mixGainL = 0.0f;

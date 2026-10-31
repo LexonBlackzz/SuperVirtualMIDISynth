@@ -5,7 +5,7 @@ void RenderDeterministic(float* left, float* right, uint32_t frames) {
     voices->Initialize(4);
     svms::VoiceHandle voice = voices->AllocateVoice(0, 60, 127);
     voices->SetVoiceSample(voice, 0, 256, 0, 0, 0, 1.0f, 1);
-    voices->v.phases[voice] = 0.0f;
+    svms::phasefx::StoreFloat(voices->v, voice, 0.0f);
     voices->SetVoiceEnvelope(voice, 1.0f, 1.0f, 0, 0, 0, 0,
                             0.0f, 1.0f, 0.999f);
     voices->SetVoiceGain(voice, 1.0f, 1.0f);

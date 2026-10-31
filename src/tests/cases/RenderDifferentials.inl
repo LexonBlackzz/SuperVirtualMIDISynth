@@ -48,7 +48,7 @@ void TestExpressionAgeRetirementAndLoopWrap() {
     int16_t samples[18]{};
     for (uint32_t i = 0; i < 16; ++i) samples[i] = 8192;
     voices->SetVoiceSample(first, 0, 10, 2, 6, 1, 12.25f, 1);
-    voices->v.phases[first] = 3.5f;
+    svms::phasefx::StoreFloat(voices->v, first, 3.5f);
     voices->SetVoiceEnvelope(first, 1.0f, 1.0f, 0, 0, 0, 0,
                              0.0f, 1.0f, 0.999f);
     float left[1]{};
@@ -56,7 +56,7 @@ void TestExpressionAgeRetirementAndLoopWrap() {
     svms::RenderScalar renderer;
     renderer.RenderBlock(*voices, channels, samples, 16, left, right, 1, cfg,
                          nullptr, 0, true, 1245);
-    Check(NearlyEqual(voices->v.phases[first], 3.75f),
+    Check(NearlyEqual(svms::phasefx::LoadFloat(voices->v, first), 3.75f),
           "loop wrapping preserves overshoot across multiple loop lengths");
 }
 
@@ -128,7 +128,7 @@ void ConfigureDifferentialSeed(svms::VoiceManager& voices,
         const bool loop = (i % 4u) != 1u;
         voices.SetVoiceSample(voice, 0, 4096, 64, 4032, loop ? 1u : 0u,
                               0.4f + static_cast<float>(i % 17u) * 0.11f, 1);
-        voices.v.phases[voice] = static_cast<float>((i * 37u) % 1700u) + 0.375f;
+        svms::phasefx::StoreFloat(voices.v, voice, static_cast<float>((i * 37u) % 1700u) + 0.375f);
         if ((i % 4u) == 2u) {
             voices.SetVoiceEnvelope(voice, 0.8f, 0.35f, 0, 0, 101 + i, 0,
                                     0.8f / static_cast<float>(101 + i),
@@ -250,8 +250,8 @@ void TestSpanRendererDifferential() {
         for (uint32_t voice : referenceActive) {
             const bool stateMatches =
                 referenceVoices->v.state[voice] == spanVoices->v.state[voice] &&
-                NearlyEqual(referenceVoices->v.phases[voice],
-                            spanVoices->v.phases[voice], 2.0e-3f) &&
+                NearlyEqual(svms::phasefx::LoadFloat(referenceVoices->v, voice),
+                            svms::phasefx::LoadFloat(spanVoices->v, voice), 2.0e-3f) &&
                 NearlyEqual(referenceVoices->v.currentGain[voice],
                             spanVoices->v.currentGain[voice], 2.0e-5f) &&
                 referenceVoices->v.releaseSamplesRemaining[voice] ==
@@ -260,7 +260,7 @@ void TestSpanRendererDifferential() {
                 std::fprintf(stderr,
                     "differential state mismatch frames=%u voice=%u state=%u/%u phase=%g/%g gain=%g/%g release=%u/%u\n",
                     frames, voice, referenceVoices->v.state[voice], spanVoices->v.state[voice],
-                    referenceVoices->v.phases[voice], spanVoices->v.phases[voice],
+                    svms::phasefx::LoadFloat(referenceVoices->v, voice), svms::phasefx::LoadFloat(spanVoices->v, voice),
                     referenceVoices->v.currentGain[voice], spanVoices->v.currentGain[voice],
                     referenceVoices->v.releaseSamplesRemaining[voice],
                     spanVoices->v.releaseSamplesRemaining[voice]);
@@ -537,8 +537,8 @@ void TestRenderBackendSelectionAndDenseEquivalence() {
                   "accelerated dense kernel matches scalar audio");
         }
         for (uint32_t h = 0; h < voiceCount; ++h)
-            Check(NearlyEqual(scalarVoices->v.phases[h],
-                              acceleratedVoices->v.phases[h], 1.0e-5f),
+            Check(NearlyEqual(svms::phasefx::LoadFloat(scalarVoices->v, h),
+                              svms::phasefx::LoadFloat(acceleratedVoices->v, h), 1.0e-5f),
                   "accelerated dense kernel preserves phase state");
     }
 }
@@ -586,8 +586,8 @@ void TestTransientClassKernelDifferential() {
                     0.97f, 0.9999f);
                 seed->SetVoiceGain(h, 0.01f, 0.012f);
                 seed->RefreshMixGain(h, channels.GetParams()[0]);
-                seed->v.phases[h] = scenario.phase +
-                    static_cast<float>(i & 3u) * 0.03125f;
+                svms::phasefx::StoreFloat(seed->v, h, scenario.phase +
+                    static_cast<float>(i & 3u) * 0.03125f);
             }
 
             auto referenceVoices = std::make_unique<svms::VoiceManager>(*seed);
@@ -613,8 +613,8 @@ void TestTransientClassKernelDifferential() {
                       "short transient class kernel matches oracle audio");
             }
             for (uint32_t h = 0; h < voiceCount; ++h) {
-                Check(NearlyEqual(referenceVoices->v.phases[h],
-                                  spanVoices->v.phases[h], 1.0e-5f) &&
+                Check(NearlyEqual(svms::phasefx::LoadFloat(referenceVoices->v, h),
+                                  svms::phasefx::LoadFloat(spanVoices->v, h), 1.0e-5f) &&
                           NearlyEqual(referenceVoices->v.currentGain[h],
                                       spanVoices->v.currentGain[h], 1.0e-6f) &&
                           referenceVoices->v.envelopeStage[h] ==
@@ -687,8 +687,8 @@ void TestTransientAVX2LongSpanDifferential() {
                     0.97f, 0.9999f);
                 seed->SetVoiceGain(h, 0.01f, 0.012f);
                 seed->RefreshMixGain(h, channels.GetParams()[0]);
-                seed->v.phases[h] = scenario.phase +
-                    static_cast<float>(i & 3u) * 0.03125f;
+                svms::phasefx::StoreFloat(seed->v, h, scenario.phase +
+                    static_cast<float>(i & 3u) * 0.03125f);
             }
 
             auto referenceVoices = std::make_unique<svms::VoiceManager>(*seed);
@@ -717,8 +717,8 @@ void TestTransientAVX2LongSpanDifferential() {
                       "AVX2 transient long-span kernel matches oracle audio");
             }
             for (uint32_t h = 0; h < voiceCount; ++h) {
-                Check(NearlyEqual(referenceVoices->v.phases[h],
-                                  spanVoices->v.phases[h], 1.0e-5f) &&
+                Check(NearlyEqual(svms::phasefx::LoadFloat(referenceVoices->v, h),
+                                  svms::phasefx::LoadFloat(spanVoices->v, h), 1.0e-5f) &&
                           NearlyEqual(referenceVoices->v.currentGain[h],
                                       spanVoices->v.currentGain[h], 1.0e-6f) &&
                           referenceVoices->v.envelopeStage[h] ==
@@ -842,8 +842,8 @@ void TestParallelSustainedRenderDifferential() {
               "parallel sustained renderer preserves waveform tolerance");
     }
     for (uint32_t voice = 0u; voice < voiceCount; ++voice) {
-        Check(serialVoices->v.phases[voice] ==
-                  parallelVoices->v.phases[voice] &&
+        Check(svms::phasefx::LoadFloat(serialVoices->v, voice) ==
+                  svms::phasefx::LoadFloat(parallelVoices->v, voice) &&
                   serialVoices->v.state[voice] ==
                   parallelVoices->v.state[voice],
               "parallel sustained renderer preserves exact voice state");

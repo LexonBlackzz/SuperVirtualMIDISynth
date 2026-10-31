@@ -2,11 +2,11 @@
 // VoiceStageGLSL.h: the same row/state layouts (render/GpuBackend.h), the same
 // per-frame operation order and the same warp butterfly reduction, so the two
 // backends agree and both match the scalar renderer.  The scalar path's math is
-// repeated step by step (phase += step once per frame, the interior-run
-// bookkeeping), which needs no fused multiply-add: build with --fmad=false
+// repeated step by step (cursor += step once per frame, the interior/edge
+// classification), which needs no fused multiply-add: build with --fmad=false
 // (CMake passes it) so nothing is contracted.  Only the cross-voice sum order
-// differs from the CPU, so audio is tolerance-equal and phase/filter state is
-// bit-equal.
+// differs from the CPU, so audio is tolerance-equal and cursor/filter state is
+// bit-equal.  The cursor is 32.32 fixed point: an index word and a fraction word.
 //
 // One thread renders one voice, GROUP voices per block.  Each block writes one
 // partial sum per frame and channel; svms_reduce adds the blocks of a part.
@@ -77,38 +77,48 @@ static __device__ __forceinline__ int Sample16(const u32* store, u32 i) {
     return static_cast<int>(store[i >> 1u] << (16u - ((i & 1u) << 4u))) >> 16;
 }
 
-// Position of the next frame: the scalar kernel's run bookkeeping.  Advances
-// phase (and the run counter) exactly once, only for frames that exist.
-static __device__ __forceinline__ void Classify(
-    bool v, float& phase, u32& runLeft, u32& first, float& frac, bool& edge,
-    u32 sampleStart, u32 relLoopE, float relLoopSF, float relLoopEF,
-    float loopLength, float lastInterior, float phaseInc) {
-    if (v && runLeft == 0u) {
-        if (phase >= relLoopEF) {
-            float overflow = phase - relLoopEF;
-            if (overflow >= loopLength)
-                overflow -= floorf(overflow / loopLength) * loopLength;
-            phase = relLoopSF + overflow;
-        }
-        if (phase < lastInterior) {
-            const float distance = lastInterior - phase;
-            const float runF = ceilf(distance / phaseInc);
-            const u32 run = __float2uint_rz(fminf(runF, 4.0e9f));
-            runLeft = run > 1u ? run : 1u;
-        }
-    }
-    const bool inRun = runLeft != 0u;
-    u32 base = __float2uint_rz(phase);
-    if (!inRun) base = base < relLoopE - 1u ? base : relLoopE - 1u;
-    edge = v && !inRun;
-    if (v && inRun) --runLeft;
-    first = sampleStart + base;
-    frac = phase - static_cast<float>(base);
-    if (v) phase += phaseInc;
+// Interpolation weight of a 32-bit fraction: its top 24 bits, exact in a float
+// (the same value the scalar and AVX2 kernels use).
+static __device__ __forceinline__ float FxWeight(u32 frac) {
+    return static_cast<float>(frac >> 8u) * (1.0f / 16777216.0f);
 }
 
-// Fast path: one interior frame of a running span (no clamp, no wrap).
-#define FAST_POS(I, F) { u32 b_ = __float2uint_rz(phase); I = sampleStart + b_; F = phase - static_cast<float>(b_); phase += phaseInc; }
+// cursor += step in 32.32 (index word, fraction word).
+#define FX_ADD(PI, PF, SI, SF) { const u32 nf_ = (PF) + (SF); const u32 c_ = nf_ < (SF) ? 1u : 0u; PF = nf_; PI += (SI) + c_; }
+
+// Wraps an index past the loop end back into the loop (any number of loops);
+// the loop end has no fraction, so the fraction word is untouched.
+static __device__ __forceinline__ void FxWrap(u32& idx, u32 relLoopS, u32 relLoopE) {
+    if (idx >= relLoopE) {
+        u32 over = idx - relLoopE;
+        const u32 len = relLoopE - relLoopS;
+        if (len == 0u) {
+            over = 0u;
+        } else if (over >= len) {
+            over = over % len;
+        }
+        idx = relLoopS + over;
+    }
+}
+
+// Position of the next frame of a sustained-loop row: wrap, then interior
+// (reads idx and idx + 1) or edge (reads idx and the loop start).  Advances the
+// cursor exactly once, only for frames that exist.
+static __device__ __forceinline__ void Classify(
+    bool v, u32& pIdx, u32& pFrac, u32 sIdx, u32 sFrac, u32& first,
+    float& frac, bool& edge, u32 sampleStart, u32 relLoopS, u32 relLoopE) {
+    if (v) FxWrap(pIdx, relLoopS, relLoopE);
+    u32 base = pIdx;
+    edge = v && (pIdx + 1u >= relLoopE);
+    if (edge) base = base < relLoopE - 1u ? base : relLoopE - 1u;
+    first = sampleStart + base;
+    frac = FxWeight(pFrac);
+    if (v) FX_ADD(pIdx, pFrac, sIdx, sFrac)
+}
+
+// Fast path: four interior frames (no clamp, no wrap): frame k reads (I, F) =
+// (index, weight) of the cursor (PI, PF).
+#define FAST_POS(I, F, PI, PF) { I = sampleStart + (PI); F = FxWeight(PF); }
 // The two samples at positions i, i+1 as the halves of one 32-bit value,
 // without a branch: shift the 64-bit window (wa, wb) right by 16 * (i & 1).
 #define FAST_PAIR(I) u32 p_ = ((I) & 1u) << 4u; u32 wa_ = store[(I) >> 1u]; u32 wb_ = store[((I) >> 1u) + 1u]; u32 x_ = (wa_ >> p_) | ((wb_ << (31u - p_)) << 1u); int s0_ = Sx16(x_); int s1_ = static_cast<int>(x_) >> 16; float d_ = static_cast<float>(s1_ - s0_); float m_ = d_ * f_; float u_ = static_cast<float>(s0_) + m_;
@@ -117,7 +127,7 @@ static __device__ __forceinline__ void Classify(
 
 extern "C" __global__ void __launch_bounds__(GROUP) svms_voice(
     const u32* __restrict__ store, const u32* __restrict__ rows,
-    const u32* __restrict__ listv, float4* __restrict__ dynv,
+    const u32* __restrict__ listv, uint4* __restrict__ dynv,
     u32* __restrict__ state, float* __restrict__ partial, u32 uCount,
     u32 uFrames, u32 uListBase, u32 uGroupBase) {
     __shared__ float shw[2u * BATCH * WARPS * 8u];
@@ -126,35 +136,33 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_voice(
     const u32 idx = g * GROUP + t;
     const bool live = idx < uCount;
 
-    float phase = 0.0f, z1 = 0.0f, z2 = 0.0f;
+    u32 pIdx = 0u, pFrac = 0u, sIdx = 0u, sFrac = 0u;
+    float z1 = 0.0f, z2 = 0.0f;
     u32 sampleStart = 0u, relLoopS = 0u, relLoopE = 1u;
     bool filt = false;
-    float relLoopSF = 0.0f, relLoopEF = 1.0f, phaseInc = 0.0f;
     float gainL = 0.0f, gainR = 0.0f, a0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
     u32 handle = 0u;
     if (live) {
         handle = listv[uListBase + idx];
-        const size_t sb = static_cast<size_t>(handle) * 8u;
+        const size_t sb = static_cast<size_t>(handle) * 9u;
         const size_t b = static_cast<size_t>(handle) * 12u;
         const u32 w0 = rows[b];
         sampleStart = w0 & 0x7FFFFFFFu;
         filt = (w0 & 0x80000000u) != 0u;
         relLoopS = rows[b + 1u];
         relLoopE = rows[b + 2u];
-        relLoopSF = Bf(rows[b + 3u]);
-        relLoopEF = Bf(rows[b + 4u]);
-        phaseInc = Bf(rows[b + 6u]);
+        sIdx = rows[b + 3u];
+        sFrac = rows[b + 4u];
         gainL = Bf(rows[b + 7u]);
         gainR = Bf(rows[b + 8u]);
         a0 = Bf(rows[b + 9u]);
         b1 = Bf(rows[b + 10u]);
         b2 = Bf(rows[b + 11u]);
-        phase = fmaxf(0.0f, Bf(state[sb]));
+        pIdx = state[sb];
+        pFrac = state[sb + 8u];
         z1 = Bf(state[sb + 1u]);
         z2 = Bf(state[sb + 2u]);
     }
-    const float loopLength = relLoopEF - relLoopSF;
-    const float lastInterior = relLoopEF - 1.0f;
     const float twoA0 = 2.0f * a0;
     // Samples are fetched as integers; the 1/32768 conversion is a power of
     // two, so it commutes exactly with the interpolation and folds into the
@@ -162,22 +170,27 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_voice(
     const float kScale = 1.0f / 32768.0f;
     const float gainLs = gainL * kScale;
     const float gainRs = gainR * kScale;
-    // The scalar kernel classifies frames in runs: at a run start it measures
-    // the distance to the last interior phase once (ceil(distance / step)) and
-    // renders that many interior frames with no wrap check, even if the
-    // accumulated phase has drifted past the boundary by then.  Mirror it.
-    u32 runLeft = 0u;
     const u32 tiles = (uFrames + TILE - 1u) / TILE;
     for (u32 tile = 0u; tile < tiles; ++tile) {
         float ov[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        // Fast path: four interior frames of a running span (almost every
-        // tile).  No wrap, edge or tail bookkeeping is needed.
-        const bool fast = live && (tile + 1u) * TILE <= uFrames && runLeft >= TILE;
+        // Fast path: four interior frames (almost every tile).  The cursor is
+        // exact, so the last frame's index decides whether any of the four
+        // wraps or touches the loop edge.
+        u32 q1i = 0u, q1f = 0u, q2i = 0u, q2f = 0u, q3i = 0u, q3f = 0u;
+        bool fast = live && (tile + 1u) * TILE <= uFrames;
+        if (fast) {
+            FxWrap(pIdx, relLoopS, relLoopE);
+            q1i = pIdx; q1f = pFrac; FX_ADD(q1i, q1f, sIdx, sFrac)
+            q2i = q1i; q2f = q1f; FX_ADD(q2i, q2f, sIdx, sFrac)
+            q3i = q2i; q3f = q2f; FX_ADD(q3i, q3f, sIdx, sFrac)
+            fast = q3i + 1u < relLoopE;
+        }
         if (fast) {
             u32 i0, i1, i2, i3;
             float f0, f1, f2, f3;
-            FAST_POS(i0, f0) FAST_POS(i1, f1) FAST_POS(i2, f2) FAST_POS(i3, f3)
-            runLeft -= TILE;
+            FAST_POS(i0, f0, pIdx, pFrac) FAST_POS(i1, f1, q1i, q1f)
+            FAST_POS(i2, f2, q2i, q2f) FAST_POS(i3, f3, q3i, q3f)
+            pIdx = q3i; pFrac = q3f; FX_ADD(pIdx, pFrac, sIdx, sFrac)
             if (filt) {
                 FAST_OUT_FILT(0u, i0, f0) FAST_OUT_FILT(1u, i1, f1)
                 FAST_OUT_FILT(2u, i2, f2) FAST_OUT_FILT(3u, i3, f3)
@@ -193,9 +206,8 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_voice(
             bool cEdge, nEdge, cValid, nValid;
             u32 cA, cB, nA, nB;
             cValid = live && (tile * TILE) < uFrames;
-            Classify(cValid, phase, runLeft, cFirst, cFrac, cEdge, sampleStart,
-                     relLoopE, relLoopSF, relLoopEF, loopLength, lastInterior,
-                     phaseInc);
+            Classify(cValid, pIdx, pFrac, sIdx, sFrac, cFirst, cFrac, cEdge,
+                     sampleStart, relLoopS, relLoopE);
             cA = store[cFirst >> 1u];
             cB = store[(cFirst >> 1u) + 1u];
 #pragma unroll
@@ -204,9 +216,8 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_voice(
                 nFirst = 0u; nFrac = 0.0f; nEdge = false; nA = 0u; nB = 0u;
                 if (k + 1u < TILE) {
                     nValid = live && (tile * TILE + k + 1u) < uFrames;
-                    Classify(nValid, phase, runLeft, nFirst, nFrac, nEdge,
-                             sampleStart, relLoopE, relLoopSF, relLoopEF,
-                             loopLength, lastInterior, phaseInc);
+                    Classify(nValid, pIdx, pFrac, sIdx, sFrac, nFirst, nFrac, nEdge,
+                             sampleStart, relLoopS, relLoopE);
                     nA = store[nFirst >> 1u];
                     nB = store[(nFirst >> 1u) + 1u];
                 }
@@ -251,9 +262,10 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_voice(
         ReduceTile(ov, tile, tiles, t, uGroupBase + g, uFrames, partial, shw);
     }
     if (live) {
-        dynv[uListBase + idx] = make_float4(phase, z1, z2, 0.0f);
-        const size_t sb = static_cast<size_t>(handle) * 8u;
-        state[sb] = Fb(phase);
+        dynv[uListBase + idx] = make_uint4(pIdx, Fb(z1), Fb(z2), pFrac);
+        const size_t sb = static_cast<size_t>(handle) * 9u;
+        state[sb] = pIdx;
+        state[sb + 8u] = pFrac;
         state[sb + 1u] = Fb(z1);
         state[sb + 2u] = Fb(z2);
     }
@@ -264,12 +276,12 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_voice(
 // stages and one-shots.  One frame at a time, same operation order.
 
 // One interior frame of a released or held-sustained row: the generic machine
-// with the sample pair already loaded.  `ph` is the phase the frame reads and
-// `phNext` the phase after it advances.
+// with the sample pair already loaded.  `pf` is the fraction word of the cursor
+// the frame reads (the caller advances the cursor).
 static __device__ __forceinline__ void EnvFastFrame(
-    u32 wa, u32 wb, u32 b, u32 sampleStart, float ph, float phNext, u32 n,
+    u32 wa, u32 wb, u32 b, u32 sampleStart, u32 pf, u32 n,
     u32 stage, bool filt, float a0, float b1, float b2, float twoA0, float mixL,
-    float mixR, float releaseDecay, float retireThreshold, float& phase,
+    float mixR, float releaseDecay, float retireThreshold,
     float& gain, u32& relRem, float& z1, float& z2, bool& alive, u32& retire,
     float& oL, float& oR) {
     oL = 0.0f;
@@ -282,7 +294,7 @@ static __device__ __forceinline__ void EnvFastFrame(
     // the low mantissa bits of 2^23 is exactly 2^23 + 32768 + v, so the biased
     // difference is the exact float(s1 - s0) and the bias folds out of float(s0)
     // exactly.
-    const float frac = ph - static_cast<float>(b);
+    const float frac = FxWeight(pf);
     const float f0 = Bf(0x4B000000u | ((x & 0xFFFFu) ^ 0x8000u));
     const float f1 = Bf(0x4B000000u | ((x >> 16u) ^ 0x8000u));
     const float d = f1 - f0;
@@ -304,7 +316,6 @@ static __device__ __forceinline__ void EnvFastFrame(
     }
     gain = g;
     relRem = rr;
-    phase = phNext;
     float smp = u * kScale;
     if (filt) {
         const float outv = smp * a0 + z1;
@@ -350,11 +361,11 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
     const u32 idx = g * GROUP + t;
     const bool live = idx < uCount;
 
-    float phase = 0.0f, z1 = 0.0f, z2 = 0.0f, gain = 0.0f;
+    u32 pIdx = 0u, pFrac = 0u, sIdx = 0u, sFrac = 0u;
+    float z1 = 0.0f, z2 = 0.0f, gain = 0.0f;
     u32 stage = 3u, relRem = 0u, atkRem = 0u, decRem = 0u;
     u32 sampleStart = 0u, relEnd = 2u, relLoopS = 0u, relLoopE = 1u;
     bool filt = false, loop = false;
-    float relLoopSF = 0.0f, relLoopEF = 1.0f, phaseInc = 0.0f;
     float mixL = 0.0f, mixR = 0.0f, targetGain = 0.0f, sustainLevel = 0.0f;
     float attackStep = 0.0f, decaySlope = 1.0f, releaseDecay = 1.0f;
     float a0 = 0.0f, b1 = 0.0f, b2 = 0.0f, heldL = 0.0f, heldR = 0.0f;
@@ -362,9 +373,10 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
     u32 handle = 0u;
     if (live) {
         handle = elist[uListBase + idx];
-        const size_t sb = static_cast<size_t>(handle) * 8u;
+        const size_t sb = static_cast<size_t>(handle) * 9u;
         const size_t r = static_cast<size_t>(handle) * 20u;
-        phase = fmaxf(0.0f, Bf(state[sb]));
+        pIdx = state[sb];
+        pFrac = state[sb + 8u];
         z1 = Bf(state[sb + 1u]);
         z2 = Bf(state[sb + 2u]);
         gain = Bf(state[sb + 3u]);
@@ -379,9 +391,8 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
         relEnd = erows[r + 2u];
         relLoopS = erows[r + 3u];
         relLoopE = erows[r + 4u];
-        relLoopSF = Bf(erows[r + 5u]);
-        relLoopEF = Bf(erows[r + 6u]);
-        phaseInc = Bf(erows[r + 7u]);
+        sIdx = erows[r + 5u];
+        sFrac = erows[r + 6u];
         mixL = Bf(erows[r + 8u]);
         mixR = Bf(erows[r + 9u]);
         targetGain = Bf(erows[r + 10u]);
@@ -409,12 +420,9 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
     bool flipped = false;
     u32 stageAtFlip = 0u;
     float gainAtFlip = 0.0f;
-    // The sustained span's constants (the held machine reads render gains).
-    const float loopLength = relLoopEF - relLoopSF;
-    const float lastInterior = relLoopEF - 1.0f;
+    // The held machine reads render gains.
     const float heldLs = heldL * kScale;
     const float heldRs = heldR * kScale;
-    u32 runLeft = 0u;
     bool alive = live;
     u32 retire = 0xFFFFFFu;
     const u32 tiles = (uFrames + TILE - 1u) / TILE;
@@ -428,20 +436,21 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
         float ov[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         bool fast = !tlRow && alive && (stage == 0u || stage == 3u) &&
                     (tile + 1u) * TILE <= uFrames;
-        float p1 = 0.0f, p2 = 0.0f, p3 = 0.0f, p4 = 0.0f;
+        // Cursor positions of frames 1..3 and the one after the tile (exact).
+        u32 a1i = pIdx, a1f = pFrac, a2i = 0u, a2f = 0u, a3i = 0u, a3f = 0u;
+        u32 a4i = 0u, a4f = 0u;
         if (fast) {
-            p1 = phase + phaseInc;
-            p2 = p1 + phaseInc;
-            p3 = p2 + phaseInc;
-            p4 = p3 + phaseInc;
-            fast = __float2uint_rz(p3) + 1u < interiorLimit &&
-                   (!loop || p4 < relLoopEF);
+            FX_ADD(a1i, a1f, sIdx, sFrac)
+            a2i = a1i; a2f = a1f; FX_ADD(a2i, a2f, sIdx, sFrac)
+            a3i = a2i; a3f = a2f; FX_ADD(a3i, a3f, sIdx, sFrac)
+            a4i = a3i; a4f = a3f; FX_ADD(a4i, a4f, sIdx, sFrac)
+            fast = a3i + 1u < interiorLimit && (!loop || a4i < relLoopE);
         }
         if (fast) {
-            const u32 q0 = __float2uint_rz(phase);
-            const u32 q1 = __float2uint_rz(p1);
-            const u32 q2 = __float2uint_rz(p2);
-            const u32 q3 = __float2uint_rz(p3);
+            const u32 q0 = pIdx;
+            const u32 q1 = a1i;
+            const u32 q2 = a2i;
+            const u32 q3 = a3i;
             const u32 i0 = (sampleStart + q0) >> 1u;
             const u32 i1 = (sampleStart + q1) >> 1u;
             const u32 i2 = (sampleStart + q2) >> 1u;
@@ -451,28 +460,38 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
             const u32 wa2 = store[i2], wb2 = store[i2 + 1u];
             const u32 wa3 = store[i3], wb3 = store[i3 + 1u];
             float oL, oR;
-            const float ph0 = phase;
             const u32 n0 = tile * TILE;
-            EnvFastFrame(wa0, wb0, q0, sampleStart, ph0, p1, n0, stage, filt,
+            // The cursor advances with every frame the row was alive for, the
+            // retiring frame included (as in the scalar machine).
+            const u32 q0f = pFrac;
+            const bool live0 = alive;
+            EnvFastFrame(wa0, wb0, q0, sampleStart, q0f, n0, stage, filt,
                          a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
-                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retireThreshold, gain, relRem, z1, z2, alive,
                          retire, oL, oR);
             ov[0] = oL; ov[1] = oR;
-            EnvFastFrame(wa1, wb1, q1, sampleStart, p1, p2, n0 + 1u, stage, filt,
+            if (live0) { pIdx = a1i; pFrac = a1f; }
+            const bool live1 = alive;
+            EnvFastFrame(wa1, wb1, q1, sampleStart, a1f, n0 + 1u, stage, filt,
                          a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
-                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retireThreshold, gain, relRem, z1, z2, alive,
                          retire, oL, oR);
             ov[2] = oL; ov[3] = oR;
-            EnvFastFrame(wa2, wb2, q2, sampleStart, p2, p3, n0 + 2u, stage, filt,
+            if (live1) { pIdx = a2i; pFrac = a2f; }
+            const bool live2 = alive;
+            EnvFastFrame(wa2, wb2, q2, sampleStart, a2f, n0 + 2u, stage, filt,
                          a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
-                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retireThreshold, gain, relRem, z1, z2, alive,
                          retire, oL, oR);
             ov[4] = oL; ov[5] = oR;
-            EnvFastFrame(wa3, wb3, q3, sampleStart, p3, p4, n0 + 3u, stage, filt,
+            if (live2) { pIdx = a3i; pFrac = a3f; }
+            const bool live3 = alive;
+            EnvFastFrame(wa3, wb3, q3, sampleStart, a3f, n0 + 3u, stage, filt,
                          a0, b1, b2, twoA0, mixL, mixR, releaseDecay,
-                         retireThreshold, phase, gain, relRem, z1, z2, alive,
+                         retireThreshold, gain, relRem, z1, z2, alive,
                          retire, oL, oR);
             ov[6] = oL; ov[7] = oR;
+            if (live3) { pIdx = a4i; pFrac = a4f; }
         } else {
 #pragma unroll
             for (u32 k = 0u; k < TILE; ++k) {
@@ -492,13 +511,12 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
                     }
                     if (preSustained) {
                         // The sustained span's frame (the sustained kernel's
-                        // general path): run bookkeeping, edge frames.
+                        // general path): interior or edge frame.
                         u32 first;
                         float frac;
                         bool edge;
-                        Classify(true, phase, runLeft, first, frac, edge,
-                                 sampleStart, relLoopE, relLoopSF, relLoopEF,
-                                 loopLength, lastInterior, phaseInc);
+                        Classify(true, pIdx, pFrac, sIdx, sFrac, first, frac,
+                                 edge, sampleStart, relLoopS, relLoopE);
                         const int s0 = Sample16(store, first);
                         const int s1 = edge
                             ? Sample16(store, sampleStart + relLoopS)
@@ -523,13 +541,14 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
                             oR = u * heldRs;
                         }
                     } else {
-                        u32 base = __float2uint_rz(phase);
+                        u32 base = pIdx;
                         bool ended = false;
                         if (base + 1u >= relEnd) {
                             if (!loop) {
                                 ended = true;
                             } else {
-                                phase = relLoopSF;
+                                pIdx = relLoopS;
+                                pFrac = 0u;
                                 base = relLoopS;
                             }
                         }
@@ -540,7 +559,7 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
                             u32 nextRel = base + 1u;
                             if (loop && nextRel >= relLoopE) nextRel = relLoopS;
                             if (nextRel >= relEnd) nextRel = relEnd - 1u;
-                            const float frac = phase - static_cast<float>(base);
+                            const float frac = FxWeight(pFrac);
                             const int s0 = Sample16(store, sampleStart + base);
                             const int s1 = Sample16(store, sampleStart + nextRel);
                             const float d = static_cast<float>(s1 - s0);
@@ -579,14 +598,8 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
                                     if (decRem == 0u) stage = 3u;
                                 }
                             }
-                            phase += phaseInc;
-                            if (loop && phase >= relLoopEF) {
-                                float overflow = phase - relLoopEF;
-                                const float loopLen = relLoopEF - relLoopSF;
-                                if (loopLen > 0.0f && overflow >= loopLen)
-                                    overflow -= floorf(overflow / loopLen) * loopLen;
-                                phase = relLoopSF + overflow;
-                            }
+                            FX_ADD(pIdx, pFrac, sIdx, sFrac)
+                            if (loop) FxWrap(pIdx, relLoopS, relLoopE);
                             float smp = u * kScale;
                             if (filt) {
                                 const float outv = smp * a0 + z1;
@@ -622,15 +635,18 @@ extern "C" __global__ void __launch_bounds__(GROUP) svms_env(
         // render-gain bake.
         const bool gainSlot = flipped && stageAtFlip == 3u;
         const u32 shownStage = flipped ? stageAtFlip : stage;
-        edyn[(static_cast<size_t>(uListBase) + idx) * 2u] =
-            make_uint4(Fb(phase), Fb(z1), Fb(z2), Fb(gain));
-        edyn[(static_cast<size_t>(uListBase) + idx) * 2u + 1u] =
+        edyn[(static_cast<size_t>(uListBase) + idx) * 3u] =
+            make_uint4(pIdx, Fb(z1), Fb(z2), Fb(gain));
+        edyn[(static_cast<size_t>(uListBase) + idx) * 3u + 2u] =
+            make_uint4(pFrac, 0u, 0u, 0u);
+        edyn[(static_cast<size_t>(uListBase) + idx) * 3u + 1u] =
             make_uint4((shownStage << 24u) | (flipped ? FLIPPED_BIT : 0u) |
                            (retire & 0xFFFFFFu),
                        gainSlot ? Fb(gainAtFlip) : atkRem,
                        gainSlot ? 0u : decRem, relRem);
-        const size_t sb = static_cast<size_t>(handle) * 8u;
-        state[sb] = Fb(phase);
+        const size_t sb = static_cast<size_t>(handle) * 9u;
+        state[sb] = pIdx;
+        state[sb + 8u] = pFrac;
         state[sb + 1u] = Fb(z1);
         state[sb + 2u] = Fb(z2);
         state[sb + 3u] = Fb(gain);
@@ -664,18 +680,19 @@ extern "C" __global__ void svms_scatter(
     const size_t b = (static_cast<size_t>(uBase) + i) * 16u;
     const u32 h = upload[b];
     for (u32 w = 0u; w < 12u; ++w) rows[static_cast<size_t>(h) * 12u + w] = upload[b + 1u + w];
-    for (u32 w = 0u; w < 3u; ++w) state[static_cast<size_t>(h) * 8u + w] = upload[b + 13u + w];
+    for (u32 w = 0u; w < 3u; ++w) state[static_cast<size_t>(h) * 9u + w] = upload[b + 13u + w];
+    state[static_cast<size_t>(h) * 9u + 8u] = upload[b + 6u];
 }
 
-// Envelope row records (32 words): statics, dynamic state and the block timeline.
+// Envelope row records (36 words): statics, dynamic state and the block timeline.
 extern "C" __global__ void svms_env_scatter(
     u32* __restrict__ erows, const u32* __restrict__ eupload,
     u32* __restrict__ state, uint4* __restrict__ tlh, u32 uCount, u32 uBase) {
     const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= uCount) return;
-    const size_t b = (static_cast<size_t>(uBase) + i) * 32u;
+    const size_t b = (static_cast<size_t>(uBase) + i) * 36u;
     const u32 h = eupload[b];
     for (u32 w = 0u; w < 20u; ++w) erows[static_cast<size_t>(h) * 20u + w] = eupload[b + 1u + w];
-    for (u32 w = 0u; w < 8u; ++w) state[static_cast<size_t>(h) * 8u + w] = eupload[b + 21u + w];
-    tlh[h] = make_uint4(eupload[b + 29u], eupload[b + 30u], eupload[b + 31u], 0u);
+    for (u32 w = 0u; w < 9u; ++w) state[static_cast<size_t>(h) * 9u + w] = eupload[b + 21u + w];
+    tlh[h] = make_uint4(eupload[b + 30u], eupload[b + 31u], eupload[b + 32u], 0u);
 }

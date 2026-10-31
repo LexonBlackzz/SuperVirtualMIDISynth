@@ -40,7 +40,7 @@ struct RenderScalar::GpuPassContext {
     uint64_t* sortB;
     uint32_t* sortHist;     // sort jobs x GpuStage::kSortBuckets counters
     const uint32_t* sortSampleStart;
-    const float* sortPhases;
+    const uint32_t* sortPhases;
 };
 
 // Which GPU kernel (if any) renders the row's block exactly like the CPU:
@@ -142,7 +142,8 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
             const gpu::DynOut* dyn = stage.Dyn();
             for (uint32_t k = begin; k < end; ++k) {
                 const uint32_t h = list[k];
-                v.phases[h] = dyn[k].phase;
+                v.phaseIdx[h] = dyn[k].phaseIdx;
+                v.phaseFrac[h] = dyn[k].phaseFrac;
                 if (v.filterEnabled[h] != 0u) {
                     v.filterZ1[h] = dyn[k].z1;
                     v.filterZ2[h] = dyn[k].z2;
@@ -166,7 +167,8 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
                     ? 0u : v.envelopeStage[h];
             const gpu::EnvDynOut& d = dyn[k];
             // Only the fields the kernel can change for this lifecycle stage.
-            v.phases[h] = d.phase;
+            v.phaseIdx[h] = d.phaseIdx;
+            v.phaseFrac[h] = d.phaseFrac;
             if (v.filterEnabled[h] != 0u) {
                 // The kernel leaves an unfiltered row's delay line alone.
                 v.filterZ1[h] = d.z1;
@@ -314,13 +316,14 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
                          (v.filterEnabled[h] != 0u ? gpu::kFilterFlag : 0u);
             r.words[1] = v.relLoopS[h];
             r.words[2] = v.relLoopE[h];
-            std::memcpy(&r.words[3], &v.relLoopSF[h], sizeof(float));
-            std::memcpy(&r.words[4], &v.relLoopEF[h], sizeof(float));
-            r.words[5] = 0u;
-            r.phase = v.phases[h];
+            const uint64_t stepFx = phasefx::FromFloat(v.phaseIncs[h]);
+            r.words[3] = phasefx::Index(stepFx);
+            r.words[4] = phasefx::Frac(stepFx);
+            r.words[5] = v.phaseFrac[h];
+            r.phaseIdx = v.phaseIdx[h];
             r.z1 = v.filterZ1[h];
             r.z2 = v.filterZ2[h];
-            std::memcpy(&r.words[6], &v.phaseIncs[h], sizeof(float));
+            r.words[6] = 0u;
             std::memcpy(&r.words[7], &v.renderGainL[h], sizeof(float));
             std::memcpy(&r.words[8], &v.renderGainR[h], sizeof(float));
             std::memcpy(&r.words[9], &v.filterA0[h], sizeof(float));
@@ -343,7 +346,8 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
         residentKind[h] = envKind;
         gpu::EnvUploadRecord& r = envScratch[envUploads++];
         r.handle = h;
-        std::memcpy(&r.dyn[0], &v.phases[h], sizeof(float));
+        r.dyn[0] = v.phaseIdx[h];
+        r.dyn[8] = v.phaseFrac[h];
         std::memcpy(&r.dyn[1], &v.filterZ1[h], sizeof(float));
         std::memcpy(&r.dyn[2], &v.filterZ2[h], sizeof(float));
         std::memcpy(&r.dyn[3], &v.currentGain[h], sizeof(float));
@@ -357,9 +361,12 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
         r.words[2] = v.relEnd[h];
         r.words[3] = v.relLoopS[h];
         r.words[4] = v.relLoopE[h];
-        std::memcpy(&r.words[5], &v.relLoopSF[h], sizeof(float));
-        std::memcpy(&r.words[6], &v.relLoopEF[h], sizeof(float));
-        std::memcpy(&r.words[7], &v.phaseIncs[h], sizeof(float));
+        {
+            const uint64_t stepFx = phasefx::FromFloat(v.phaseIncs[h]);
+            r.words[5] = phasefx::Index(stepFx);
+            r.words[6] = phasefx::Frac(stepFx);
+        }
+        r.words[7] = 0u;
         std::memcpy(&r.words[8], &v.mixGainL[h], sizeof(float));
         std::memcpy(&r.words[9], &v.mixGainR[h], sizeof(float));
         std::memcpy(&r.words[10], &v.targetGain[h], sizeof(float));
@@ -435,7 +442,7 @@ inline void RenderScalar::SortGpuRows(GpuPassContext& ctx, uint32_t* rows,
         jobs = (std::min)(jobs, count / 8192u);
     }
     if (jobs < 2u) {
-        stage.SortRows(rows, count, v.sampleStart, v.phases);
+        stage.SortRows(rows, count, v.sampleStart, v.phaseIdx);
         return;
     }
     const uint64_t start = GpuStage::NowMicros();
@@ -447,7 +454,7 @@ inline void RenderScalar::SortGpuRows(GpuPassContext& ctx, uint32_t* rows,
     ctx.sortB = stage.SortB();
     ctx.sortHist = stage.SortHist();
     ctx.sortSampleStart = v.sampleStart;
-    ctx.sortPhases = v.phases;
+    ctx.sortPhases = v.phaseIdx;
     // Turns the per-job counts into start offsets: bucket-major, job-minor, so
     // earlier jobs' elements precede later jobs' within a bucket (stable).
     auto prefix = [&]() {

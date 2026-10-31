@@ -353,7 +353,7 @@ int main() {
                                 0.0f, 1.0f, 0.9995f);
         voices.SetVoiceGain(voice, 0.0005f, 0.0005f);
         voices.RefreshMixGain(voice, channels.GetParams()[index & 15u]);
-        voices.v.phases[voice] = static_cast<float>(index % 97u) + 0.375f;
+        svms::phasefx::StoreFloat(voices.v, voice, static_cast<float>(index % 97u) + 0.375f);
     }
 
     Check(voices.GetActiveCount() == kOldCapacity,
@@ -394,7 +394,7 @@ int main() {
             voices.v.note[handle],
             voices.v.renderClass[handle],
             voices.v.playIndex[handle],
-            voices.v.phases[handle],
+            svms::phasefx::LoadFloat(voices.v, handle),
             voices.v.currentGain[handle],
             voices.v.mixGainL[handle],
             voices.v.mixGainR[handle],
@@ -428,7 +428,7 @@ int main() {
             voices.v.note[handle] == before.note &&
             voices.v.renderClass[handle] == before.renderClass &&
             voices.v.playIndex[handle] == before.playIndex &&
-            NearlyEqual(voices.v.phases[handle], before.phase) &&
+            NearlyEqual(svms::phasefx::LoadFloat(voices.v, handle), before.phase) &&
             NearlyEqual(voices.v.currentGain[handle], before.currentGain) &&
             NearlyEqual(voices.v.mixGainL[handle], before.mixGainL) &&
             NearlyEqual(voices.v.mixGainR[handle], before.mixGainR) &&
@@ -453,7 +453,7 @@ int main() {
           "serial-renderer memory estimate matches the reserved layout");
     std::vector<float> left(kFrames, 0.0f);
     std::vector<float> right(kFrames, 0.0f);
-    const float phaseBeforeRender = voices.v.phases[0u];
+    const float phaseBeforeRender = svms::phasefx::LoadFloat(voices.v, 0u);
     renderer.RenderBlock(voices, channels, samples.data(), kSampleFrames,
                          left.data(), right.data(), kFrames, cfg,
                          nullptr, 0u, true, 100u);
@@ -467,7 +467,7 @@ int main() {
     }
     Check(nonzeroOutput,
           "old voices still render after physical pool growth");
-    Check(!NearlyEqual(voices.v.phases[0u], phaseBeforeRender),
+    Check(!NearlyEqual(svms::phasefx::LoadFloat(voices.v, 0u), phaseBeforeRender),
           "old voice phase advances after physical pool growth");
 
     // A new allocation must be able to use the grown handle range. The grown
