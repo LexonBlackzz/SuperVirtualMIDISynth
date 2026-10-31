@@ -660,6 +660,155 @@ struct VibratoWindow {
     }
 };
 
+// In-place 8x8 float transpose: rows <-> columns.
+inline void Transpose8x8Ps(__m256* r) {
+    const __m256 t0 = _mm256_unpacklo_ps(r[0], r[1]);
+    const __m256 t1 = _mm256_unpackhi_ps(r[0], r[1]);
+    const __m256 t2 = _mm256_unpacklo_ps(r[2], r[3]);
+    const __m256 t3 = _mm256_unpackhi_ps(r[2], r[3]);
+    const __m256 t4 = _mm256_unpacklo_ps(r[4], r[5]);
+    const __m256 t5 = _mm256_unpackhi_ps(r[4], r[5]);
+    const __m256 t6 = _mm256_unpacklo_ps(r[6], r[7]);
+    const __m256 t7 = _mm256_unpackhi_ps(r[6], r[7]);
+    const __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    const __m256 u1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    const __m256 u2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    const __m256 u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    const __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    const __m256 u5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    const __m256 u6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    const __m256 u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+    r[0] = _mm256_permute2f128_ps(u0, u4, 0x20);
+    r[1] = _mm256_permute2f128_ps(u1, u5, 0x20);
+    r[2] = _mm256_permute2f128_ps(u2, u6, 0x20);
+    r[3] = _mm256_permute2f128_ps(u3, u7, 0x20);
+    r[4] = _mm256_permute2f128_ps(u0, u4, 0x31);
+    r[5] = _mm256_permute2f128_ps(u1, u5, 0x31);
+    r[6] = _mm256_permute2f128_ps(u2, u6, 0x31);
+    r[7] = _mm256_permute2f128_ps(u3, u7, 0x31);
+}
+
+// Exact release-gain tables for eight voices at once.  A voice's gain chain
+// (gain *= decay, once per frame) is a latency-bound dependency, so one voice
+// alone leaves the multiplier idle most of the time.  The chains of eight
+// different voices are independent: lane k of the vector multiply is the same
+// single-precision multiply the scalar recurrence does, in the same order, so
+// every table entry is bit-identical to the scalar chain.  Entry f of voice k
+// (table + k * stride) is the gain after f + 1 steps; stride must be at least
+// ReleaseGainStride(frames).
+inline uint32_t ReleaseGainStride(uint32_t frames) {
+    // The chunk kernel reads eight gains ahead of the frame it is on, so the
+    // table runs up to seven frames past the span.
+    return ((frames + 15u) / 8u) * 8u;
+}
+
+void ReleaseGainTables8(const VoiceSoA& v, const uint32_t* hs,
+                        uint32_t frames, float* table) {
+    const uint32_t stride = ReleaseGainStride(frames);
+    const __m256i h = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(hs));
+    __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
+    const __m256 decay = _mm256_i32gather_ps(v.releaseDecay, h, 4);
+    for (uint32_t block = 0u; block < stride; block += 8u) {
+        __m256 rows[8];
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            gain = _mm256_mul_ps(gain, decay);
+            rows[k] = gain;
+        }
+        Transpose8x8Ps(rows);  // rows[k] = eight consecutive gains of voice k
+        for (uint32_t k = 0u; k < 8u; ++k)
+            _mm256_storeu_ps(table + static_cast<size_t>(k) * stride + block,
+                             rows[k]);
+    }
+}
+
+// Envelope-gain tables for eight transient voices, the attack/decay twin of
+// ReleaseGainTables8.  A lane qualifies when its voice stays inside the same
+// stage (attack or decay) for the whole span plus the look-ahead, so the stage
+// counters and transitions never matter; the returned mask has one bit per
+// qualifying lane.  Attack lanes run gain += step then the target clamp, decay
+// lanes gain *= slope then the sustain clamp, with the clamps selected the way
+// the scalar `if (g > t) g = t` / `if (g < s) g = s` select, so every entry is
+// bit-identical to the scalar recurrence.
+uint32_t TransientGainTables8(const VoiceSoA& v, const uint32_t* hs,
+                              uint32_t frames, float* table) {
+    const uint32_t stride = ReleaseGainStride(frames);
+    uint32_t valid = 0u, attack = 0u, decay = 0u;
+    alignas(32) uint32_t attackLane[8];
+    for (uint32_t k = 0u; k < 8u; ++k) {
+        const uint32_t h = hs[k];
+        const uint8_t stage = v.envelopeStage[h];
+        const bool inAttack = stage == 1u &&
+            v.attackSamplesRemaining[h] >= frames + 9u;
+        const bool inDecay = stage == 2u &&
+            v.decaySamplesRemaining[h] >= frames + 9u;
+        attackLane[k] = inAttack ? 0xFFFFFFFFu : 0u;
+        if (inAttack) { valid |= 1u << k; attack |= 1u << k; }
+        if (inDecay) { valid |= 1u << k; decay |= 1u << k; }
+    }
+    if (valid == 0u) return 0u;
+    const __m256i h = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(hs));
+    __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
+    const __m256 target = _mm256_i32gather_ps(v.targetGain, h, 4);
+    const __m256 sustain = _mm256_i32gather_ps(v.sustainLevel, h, 4);
+    const __m256 step = _mm256_i32gather_ps(v.attackGainStep, h, 4);
+    const __m256 slope = _mm256_i32gather_ps(v.decaySlope, h, 4);
+    const __m256 attackMask = _mm256_castsi256_ps(_mm256_load_si256(
+        reinterpret_cast<const __m256i*>(attackLane)));
+    // min_ps(t, g) = t < g ? t : g = (g > t ? t : g); max_ps(s, g) =
+    // (s > g ? s : g) = (g < s ? s : g): the scalar clamp selections.
+    const bool onlyAttack = decay == 0u;
+    const bool onlyDecay = attack == 0u;
+    for (uint32_t block = 0u; block < stride; block += 8u) {
+        __m256 rows[8];
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            if (onlyAttack) {
+                gain = _mm256_min_ps(target, _mm256_add_ps(gain, step));
+            } else if (onlyDecay) {
+                gain = _mm256_max_ps(sustain, _mm256_mul_ps(gain, slope));
+            } else {
+                const __m256 a = _mm256_min_ps(target,
+                    _mm256_add_ps(gain, step));
+                const __m256 d = _mm256_max_ps(sustain,
+                    _mm256_mul_ps(gain, slope));
+                gain = _mm256_blendv_ps(d, a, attackMask);
+            }
+            rows[k] = gain;
+        }
+        Transpose8x8Ps(rows);
+        for (uint32_t k = 0u; k < 8u; ++k)
+            _mm256_storeu_ps(table + static_cast<size_t>(k) * stride + block,
+                             rows[k]);
+    }
+    return valid;
+}
+
+// Calls fn(handle, gainTable) for every handle in order.  Blocks of eight
+// consecutive handles get their transient gain tables built together; a voice
+// that does not qualify (or sits in a short tail block) gets nullptr and runs
+// its own chain.
+template <class Fn>
+void ForEachTransientVoice(const RenderSpanContext& c, const uint32_t* handles,
+                           uint32_t count, Fn&& fn) {
+    static thread_local std::vector<float> store;
+    const uint32_t stride = ReleaseGainStride(c.frameCount);
+    const bool tables = !g_fastChunkMath && count >= 8u;
+    uint32_t valid = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (tables && i % 8u == 0u && i + 8u <= count) {
+            if (store.size() < static_cast<size_t>(8u) * stride)
+                store.resize(static_cast<size_t>(8u) * stride);
+            valid = TransientGainTables8(*c.voices, handles + i, c.frameCount,
+                                         store.data());
+        }
+        const bool has = tables && (i / 8u) * 8u + 8u <= count &&
+            ((valid >> (i % 8u)) & 1u) != 0u;
+        fn(handles[i], has ? store.data() +
+               static_cast<size_t>(i % 8u) * stride : nullptr);
+    }
+}
+
 // Hilbert-pair (form 2) rotation for the time-chunked kernels. Init binds a
 // voice; Chunk rotates eight consecutive frames, Scalar rotates one (the
 // scalar tails), Store writes the angle back. Static angles (dc=1, ds=0) are
@@ -1335,8 +1484,13 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
 // (the frame is returned), and a loop voice that fails ValidateLoopVoice is
 // left untouched.
 // ════════════════════════════════════════════════════════════════════════
+//   gainTable: optional exact gain table (see TransientGainTables8) for a
+//            voice that stays inside its attack or decay stage for the whole
+//            span; a chunk then reads its eight gains instead of running the
+//            serial envelope chain.
 template <bool Loop>
-uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle) {
+uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
+                                const float* gainTable = nullptr) {
     VoiceSoA& v = *c.voices;
     ChunkRotation rot;
     if constexpr (Loop) {
@@ -1419,6 +1573,18 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle) {
                 }
             }
         }
+        __m256 tableGains = _mm256_setzero_ps();
+        bool fromTable = false;
+        if (!closedForm && gainTable != nullptr &&
+            ((stage == 1u && attackRemaining >= 9u) ||
+             (stage == 2u && decayRemaining >= 9u))) {
+            tableGains = _mm256_loadu_ps(gainTable + frame);
+            futureGain = gainTable[frame + 7u];
+            if (stage == 1u) futureAttack -= 8u;
+            else futureDecay -= 8u;
+            closedForm = true;
+            fromTable = true;
+        }
         if (!closedForm)
             closedForm = EnvelopeLadder8(stage, gain, attackRemaining,
                 decayRemaining, attackStep, targetGain, decaySlope,
@@ -1465,7 +1631,8 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle) {
             __m256 sample = LerpGather8(region, readable, bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
             if (rot) sample = rot.Chunk(sample, bases, fraction);
-            const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
+            const __m256 scaled = _mm256_mul_ps(
+                sample, fromTable ? tableGains : Gains8(gains));
             MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
             gain = futureGain;
             stage = futureStage;
@@ -1540,8 +1707,9 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle) {
 }
 
 void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
-                                   uint32_t handle) {
-    (void)RenderTransientChunked<true>(c, handle);
+                                   uint32_t handle,
+                                   const float* gainTable = nullptr) {
+    (void)RenderTransientChunked<true>(c, handle, gainTable);
 }
 
 
@@ -1728,11 +1896,12 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
         _mm256_zeroupper();
         return true;
     }
-    for (uint32_t position = 0u; position < handleCount; ++position) {
-        const RenderSpanContext vc = SelectVoiceDestination(
-            context, v.channel[handles[position]]);
-        RenderTransientLoopFramesAVX2(vc, handles[position]);
-    }
+    ForEachTransientVoice(context, handles, handleCount,
+        [&](uint32_t handle, const float* table) {
+            const RenderSpanContext vc = SelectVoiceDestination(
+                context, v.channel[handle]);
+            RenderTransientLoopFramesAVX2(vc, handle, table);
+        });
     _mm256_zeroupper();
     return true;
 }
@@ -1762,68 +1931,6 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
 // ════════════════════════════════════════════════════════════════════════
 // Test switch (SetFilteredGroupKernelForTest): off forces the per-voice kernels.
 bool g_filteredGroupsEnabled = true;
-
-// In-place 8x8 float transpose: rows <-> columns.
-inline void Transpose8x8Ps(__m256* r) {
-    const __m256 t0 = _mm256_unpacklo_ps(r[0], r[1]);
-    const __m256 t1 = _mm256_unpackhi_ps(r[0], r[1]);
-    const __m256 t2 = _mm256_unpacklo_ps(r[2], r[3]);
-    const __m256 t3 = _mm256_unpackhi_ps(r[2], r[3]);
-    const __m256 t4 = _mm256_unpacklo_ps(r[4], r[5]);
-    const __m256 t5 = _mm256_unpackhi_ps(r[4], r[5]);
-    const __m256 t6 = _mm256_unpacklo_ps(r[6], r[7]);
-    const __m256 t7 = _mm256_unpackhi_ps(r[6], r[7]);
-    const __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44);
-    const __m256 u1 = _mm256_shuffle_ps(t0, t2, 0xEE);
-    const __m256 u2 = _mm256_shuffle_ps(t1, t3, 0x44);
-    const __m256 u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
-    const __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44);
-    const __m256 u5 = _mm256_shuffle_ps(t4, t6, 0xEE);
-    const __m256 u6 = _mm256_shuffle_ps(t5, t7, 0x44);
-    const __m256 u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
-    r[0] = _mm256_permute2f128_ps(u0, u4, 0x20);
-    r[1] = _mm256_permute2f128_ps(u1, u5, 0x20);
-    r[2] = _mm256_permute2f128_ps(u2, u6, 0x20);
-    r[3] = _mm256_permute2f128_ps(u3, u7, 0x20);
-    r[4] = _mm256_permute2f128_ps(u0, u4, 0x31);
-    r[5] = _mm256_permute2f128_ps(u1, u5, 0x31);
-    r[6] = _mm256_permute2f128_ps(u2, u6, 0x31);
-    r[7] = _mm256_permute2f128_ps(u3, u7, 0x31);
-}
-
-// Exact release-gain tables for eight voices at once.  A voice's gain chain
-// (gain *= decay, once per frame) is a latency-bound dependency, so one voice
-// alone leaves the multiplier idle most of the time.  The chains of eight
-// different voices are independent: lane k of the vector multiply is the same
-// single-precision multiply the scalar recurrence does, in the same order, so
-// every table entry is bit-identical to the scalar chain.  Entry f of voice k
-// (table + k * stride) is the gain after f + 1 steps; stride must be at least
-// ReleaseGainStride(frames).
-inline uint32_t ReleaseGainStride(uint32_t frames) {
-    // The chunk kernel reads eight gains ahead of the frame it is on, so the
-    // table runs up to seven frames past the span.
-    return ((frames + 15u) / 8u) * 8u;
-}
-
-void ReleaseGainTables8(const VoiceSoA& v, const uint32_t* hs,
-                        uint32_t frames, float* table) {
-    const uint32_t stride = ReleaseGainStride(frames);
-    const __m256i h = _mm256_loadu_si256(
-        reinterpret_cast<const __m256i*>(hs));
-    __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
-    const __m256 decay = _mm256_i32gather_ps(v.releaseDecay, h, 4);
-    for (uint32_t block = 0u; block < stride; block += 8u) {
-        __m256 rows[8];
-        for (uint32_t k = 0u; k < 8u; ++k) {
-            gain = _mm256_mul_ps(gain, decay);
-            rows[k] = gain;
-        }
-        Transpose8x8Ps(rows);  // rows[k] = eight consecutive gains of voice k
-        for (uint32_t k = 0u; k < 8u; ++k)
-            _mm256_storeu_ps(table + static_cast<size_t>(k) * stride + block,
-                             rows[k]);
-    }
-}
 
 // True when RenderSustainedLoopFramesAVX2 would run this voice through its
 // filtered time-chunk path (no rotation: the caller excludes v.rot).
@@ -2716,8 +2823,9 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
 // Transient one-shot: non-looping attack/decay voices (the decay stage of
 // every piano/pluck note).
 uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
-                                          uint32_t handle) {
-    return RenderTransientChunked<false>(c, handle);
+                                          uint32_t handle,
+                                          const float* gainTable = nullptr) {
+    return RenderTransientChunked<false>(c, handle, gainTable);
 }
 
 bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
@@ -2752,11 +2860,12 @@ bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
         }
         return true;
     }
-    for (uint32_t i = 0u; i < handleCount; ++i) {
-        const RenderSpanContext vc = SelectVoiceDestination(
-            context, v.channel[handles[i]]);
-        RenderTransientOneShotFramesAVX2(vc, handles[i]);
-    }
+    ForEachTransientVoice(context, handles, handleCount,
+        [&](uint32_t handle, const float* table) {
+            const RenderSpanContext vc = SelectVoiceDestination(
+                context, v.channel[handle]);
+            RenderTransientOneShotFramesAVX2(vc, handle, table);
+        });
     _mm256_zeroupper();
     return true;
 }
