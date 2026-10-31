@@ -2211,6 +2211,9 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
     }
 }
 
+void RenderTransientFramesGrouped(const RenderSpanContext& c,
+                                  const uint32_t* handles, uint32_t count);
+
 // ── Class entry point: transient-loop batch ─────────────────────────────
 // Short spans take the voice-batched kernel, longer ones the per-voice chunk
 // kernel.  Refuses (state untouched) for rotation cases it cannot handle.
@@ -2258,12 +2261,7 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
         _mm256_zeroupper();
         return true;
     }
-    ForEachTransientVoice(context, handles, handleCount,
-        [&](uint32_t handle, const float* table) {
-            const RenderSpanContext vc = SelectVoiceDestination(
-                context, v.channel[handle]);
-            RenderTransientLoopFramesAVX2(vc, handle, table);
-        });
+    RenderTransientFramesGrouped(context, handles, handleCount);
     _mm256_zeroupper();
     return true;
 }
@@ -2316,9 +2314,16 @@ inline bool FilteredGroupEligible(const RenderSpanContext& c, uint32_t h) {
 //              through the per-voice kernel on the remaining sub-span (which
 //              owns retirement).  retiredAt[i] is the span-relative frame
 //              voice i retires on, or UINT32_MAX.
-template <bool Release>
+//   Tabled:    attack/decay voices that stay inside one stage for the whole
+//              span: frame f of lane i is scaled by tables[i][f] then by the
+//              mix gain (the per-voice tabled kernel's order).  The envelope
+//              end state is written here for the frames the group rendered,
+//              and the rest of the span continues through the per-voice
+//              kernel on the shifted table.
+template <bool Release, bool Tabled = false>
 void RenderFilteredGroup(const RenderSpanContext& c, const uint32_t* h,
-                         uint32_t* retiredAt) {
+                         uint32_t* retiredAt,
+                         const float* const* tables = nullptr) {
     VoiceSoA& v = *c.voices;
     RenderSpanContext dest[8];
     uint64_t pos[8], stepFx[8], loopS64[8], loopE64[8], guard64[8];
@@ -2344,6 +2349,9 @@ void RenderFilteredGroup(const RenderSpanContext& c, const uint32_t* h,
             mixL[i] = v.mixGainL[h[i]];
             mixR[i] = v.mixGainR[h[i]];
             retiredAt[i] = UINT32_MAX;
+        } else if constexpr (Tabled) {
+            mixL[i] = v.mixGainL[h[i]];
+            mixR[i] = v.mixGainR[h[i]];
         } else {
             // Sustained lanes scale by renderGain only; reuse the mix slots.
             mixL[i] = v.renderGainL[h[i]];
@@ -2440,7 +2448,11 @@ void RenderFilteredGroup(const RenderSpanContext& c, const uint32_t* h,
                     }
                 }
                 sample = ProcessVoiceFilterSample(v, hh, sample);
-                if constexpr (Release) {
+                if constexpr (Tabled) {
+                    const float g = tables[i][frame[i]];
+                    outL[i][frame[i]] += sample * g * mixL[i];
+                    outR[i][frame[i]] += sample * g * mixR[i];
+                } else if constexpr (Release) {
                     outL[i][frame[i]] += sample * gain[i] * mixL[i];
                     outR[i][frame[i]] += sample * gain[i] * mixR[i];
                 } else {
@@ -2484,6 +2496,9 @@ void RenderFilteredGroup(const RenderSpanContext& c, const uint32_t* h,
             __m256 scaled = rows[i];
             if constexpr (Release)
                 scaled = _mm256_mul_ps(rows[i], _mm256_load_ps(gains[i]));
+            else if constexpr (Tabled)
+                scaled = _mm256_mul_ps(
+                    rows[i], _mm256_loadu_ps(tables[i] + frame[i]));
             MixChunk8(outL[i] + frame[i], outR[i] + frame[i], scaled,
                       _mm256_set1_ps(mixL[i]), _mm256_set1_ps(mixR[i]));
             if constexpr (Release) {
@@ -2504,11 +2519,22 @@ void RenderFilteredGroup(const RenderSpanContext& c, const uint32_t* h,
         }
     }
     for (uint32_t i = 0u; i < 8u; ++i) {
+        if constexpr (Tabled) {
+            if (frame[i] != 0u) {
+                v.currentGain[h[i]] = tables[i][frame[i] - 1u];
+                if (v.envelopeStage[h[i]] == 1u)
+                    v.attackSamplesRemaining[h[i]] -= frame[i];
+                else
+                    v.decaySamplesRemaining[h[i]] -= frame[i];
+            }
+        }
         if (frame[i] >= c.frameCount) continue;
         RenderSpanContext rest = dest[i];
         rest.frameStart = c.frameStart + frame[i];
         rest.frameCount = c.frameCount - frame[i];
-        if constexpr (Release) {
+        if constexpr (Tabled) {
+            RenderTransientLoopFramesAVX2(rest, h[i], tables[i] + frame[i]);
+        } else if constexpr (Release) {
             const uint32_t at = RenderReleaseLoopFramesAVX2(rest, h[i]);
             if (at != UINT32_MAX) retiredAt[i] = frame[i] + at;
         } else {
@@ -2643,6 +2669,70 @@ void RenderReleaseFramesGrouped(const RenderSpanContext& c,
         }
         flush();
         perVoice(handle, i);
+    }
+    flush();
+}
+
+// Attack/decay loop spans of 8+ frames: runs of eight filtered voices whose
+// envelope stays in one stage for the whole span (the ones that carry a gain
+// table) go through the group kernel; everything else renders per voice.  The
+// tables of the current and the previous block of eight handles stay alive, as
+// in the release path, so a run that straddles two blocks keeps its tables.
+void RenderTransientFramesGrouped(const RenderSpanContext& c,
+                                  const uint32_t* handles, uint32_t count) {
+    VoiceSoA& v = *c.voices;
+    static thread_local std::vector<float> tableStore[2];
+    uint32_t tableBlock[2] = {UINT32_MAX, UINT32_MAX};
+    uint32_t tableValid[2] = {0u, 0u};
+    const uint32_t stride = ReleaseGainStride(c.frameCount);
+    const bool tables = !g_fastChunkMath && count >= 8u;
+    const bool grouping = g_filteredGroupsEnabled && v.rot == nullptr;
+    const float* pending[8];
+    uint32_t pendingHandle[8];
+    uint32_t pendingCount = 0u;
+    auto tableFor = [&](uint32_t position) -> const float* {
+        const uint32_t block = position / 8u;
+        if (tableBlock[block & 1u] != block ||
+            ((tableValid[block & 1u] >> (position % 8u)) & 1u) == 0u)
+            return nullptr;
+        return tableStore[block & 1u].data() +
+            static_cast<size_t>(position % 8u) * stride;
+    };
+    auto perVoice = [&](uint32_t handle, const float* table) {
+        const RenderSpanContext vc = SelectVoiceDestination(
+            c, v.channel[handle]);
+        RenderTransientLoopFramesAVX2(vc, handle, table);
+    };
+    auto flush = [&]() {
+        if (pendingCount == 8u) {
+            RenderFilteredGroup<false, true>(c, pendingHandle, nullptr,
+                                             pending);
+        } else {
+            for (uint32_t k = 0u; k < pendingCount; ++k)
+                perVoice(pendingHandle[k], pending[k]);
+        }
+        pendingCount = 0u;
+    };
+    for (uint32_t i = 0u; i < count; ++i) {
+        const uint32_t handle = handles[i];
+        if (tables && i % 8u == 0u && i + 8u <= count) {
+            std::vector<float>& store = tableStore[(i / 8u) & 1u];
+            if (store.size() < static_cast<size_t>(8u) * stride)
+                store.resize(static_cast<size_t>(8u) * stride);
+            tableValid[(i / 8u) & 1u] =
+                TransientGainTables8(v, handles + i, c.frameCount,
+                                     store.data());
+            tableBlock[(i / 8u) & 1u] = i / 8u;
+        }
+        const float* table = tableFor(i);
+        if (grouping && table != nullptr && FilteredGroupEligible(c, handle)) {
+            pending[pendingCount] = table;
+            pendingHandle[pendingCount++] = handle;
+            if (pendingCount == 8u) flush();
+            continue;
+        }
+        flush();
+        perVoice(handle, table);
     }
     flush();
 }

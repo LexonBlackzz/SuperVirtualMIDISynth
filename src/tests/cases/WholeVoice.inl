@@ -1307,8 +1307,11 @@ void TestMutedTailCull() {
 // own channel plane (bus mode) the planes and every voice's end state are
 // compared bitwise; on a single shared plane only the mix order of lanes that
 // drifted apart could differ, so that comparison is a tight tolerance.
-void RunFilteredGroupKernelTest(bool release) {
+// mode 0 = sustained, 1 = release, 2 = attack/decay (transient loops).
+void RunFilteredGroupKernelTest(int mode) {
     if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    const bool release = mode == 1;
+    svms::SetFastChunkMath(false);
     constexpr uint32_t kVoices = 27u;  // three groups of eight + a remainder
     constexpr uint32_t kRegion = 4096u;
     std::vector<int16_t> samples(kRegion + 8u, 0);
@@ -1335,7 +1338,22 @@ void RunFilteredGroupKernelTest(bool release) {
         seed->SetVoiceSample(voice, 0, kRegion, 16, 16 + loopLen, 1u,
                              0.3f + 0.07f * static_cast<float>(i % 23u), 1);
         svms::phasefx::StoreFloat(seed->v, voice, static_cast<float>((i * 53u) % 900u) + 0.25f);
-        seed->SetVoiceEnvelope(voice, 0.5f, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f, 0.999f);
+        if (mode == 2) {
+            // Even voices ramp up, odd ones decay, each with far more stage
+            // time left than the longest span, so every one gets a gain table.
+            if (i % 2u == 0u)
+                seed->SetVoiceEnvelope(voice, 0.1f, 0.2f, 0, 0, 20000u, 0,
+                                       0.00004f * static_cast<float>(1u + i % 5u),
+                                       1.0f, 0.999f);
+            else
+                seed->SetVoiceEnvelope(voice, 1.0f, 0.2f, 0, 0, 0, 20000u,
+                                       0.0f, 0.99995f - 0.00001f * static_cast<float>(i % 4u),
+                                       0.999f);
+            Check(seed->v.envelopeStage[voice] == (i % 2u == 0u ? 1u : 2u),
+                  "transient group voice starts in the intended stage");
+        } else {
+            seed->SetVoiceEnvelope(voice, 0.5f, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f, 0.999f);
+        }
         seed->SetVoicePlayIndex(voice, i + 1u);
         seed->SetVoiceGain(voice, 0.3f + 0.01f * static_cast<float>(i),
                            0.2f + 0.01f * static_cast<float>(i));
@@ -1370,7 +1388,8 @@ void RunFilteredGroupKernelTest(bool release) {
     const svms::RenderClassKernel kernel =
         kernels.kernels[static_cast<uint32_t>(release
             ? svms::VoiceRenderClass::ReleaseLoop
-            : svms::VoiceRenderClass::SustainedLoop)];
+            : mode == 2 ? svms::VoiceRenderClass::TransientLoop
+                        : svms::VoiceRenderClass::SustainedLoop)];
     struct Span { uint32_t start, count; };
     const Span spans[] = {{0u, 2048u}, {5u, 203u}, {0u, 64u}};
     for (const Span& span : spans) {
@@ -1435,12 +1454,16 @@ void RunFilteredGroupKernelTest(bool release) {
                     run[0]->v.filterZ1[handle] == run[1]->v.filterZ1[handle] &&
                     run[0]->v.filterZ2[handle] == run[1]->v.filterZ2[handle] &&
                     run[0]->v.currentGain[handle] == run[1]->v.currentGain[handle] &&
+                    run[0]->v.attackSamplesRemaining[handle] ==
+                        run[1]->v.attackSamplesRemaining[handle] &&
+                    run[0]->v.decaySamplesRemaining[handle] ==
+                        run[1]->v.decaySamplesRemaining[handle] &&
                     run[0]->v.releaseSamplesRemaining[handle] ==
                         run[1]->v.releaseSamplesRemaining[handle];
             }
             std::fprintf(stderr,
                 "[FILTGRP] %s start=%u count=%u bus=%d planes-bit-exact=%d state-bit-exact=%d retire-same=%d(%zu) mix-maxdiff=%g\n",
-                release ? "release" : "sustained", span.start, span.count, bus,
+                release ? "release" : mode == 2 ? "transient" : "sustained", span.start, span.count, bus,
                 bus ? (bitExact ? 1 : 0) : -1, stateExact ? 1 : 0,
                 retiredSame ? 1 : 0, retired[0].size(), maxDiff);
             Check(retiredSame, "filter group retires the same voices on the same frames");
@@ -1694,8 +1717,9 @@ void TestStepBreakKernels() {
 }
 
 void TestFilteredGroupKernel() {
-    RunFilteredGroupKernelTest(false);
-    RunFilteredGroupKernelTest(true);
+    RunFilteredGroupKernelTest(0);
+    RunFilteredGroupKernelTest(1);
+    RunFilteredGroupKernelTest(2);
 }
 
 void TestWholeVoiceResetBarrierDifferential() {
