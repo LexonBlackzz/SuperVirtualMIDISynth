@@ -27,6 +27,19 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       float* const* channelBusLeft,
                                       float* const* channelBusRight) {
     (void)cfg;
+    if (bulkAdmissionPercent_ != 0u && eventCount != 0u) {
+        const uint64_t budget = (static_cast<uint64_t>(voices.GetVoiceLimit()) *
+                                 bulkAdmissionPercent_ + 99u) / 100u;
+        const uint32_t dropped = BulkAdmissionFilter(
+            events, eventCount,
+            static_cast<uint32_t>((std::min<uint64_t>)(budget, UINT32_MAX)),
+            admittedEvents_);
+        if (dropped != 0u) {
+            bulkAdmissionDropped_ += dropped;
+            events = admittedEvents_.data();
+            eventCount = static_cast<uint32_t>(admittedEvents_.size());
+        }
+    }
     voices.SetStealKeyBackend(kernelSet_->backend);
     // Gains changed during the previous block's render; the volatile steal
     // heap must rebuild at this block's first steal.  One rebuild per block
@@ -169,6 +182,55 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     }
     renderStretch(numFrames, eventCount);
     lastRenderPaths_ = paths | 0x200u;  // bit9: block was barrier-split
+}
+
+// Keep the `budgetUnits` highest-ranked note-on units of a block (rank:
+// velocity, then the later event), drop the rest.  A velocity histogram finds
+// the cut in one pass, so a block of a quarter million note-ons costs a few
+// passes over its events, not a sort.  A merged note-on counts for its
+// `count` units and is kept or dropped whole.
+inline uint32_t RenderScalar::BulkAdmissionFilter(
+    const RenderEvent* events, uint32_t count, uint32_t budgetUnits,
+    std::vector<RenderEvent>& out) {
+    if (budgetUnits == 0u) budgetUnits = 1u;
+    uint64_t units[128] = {};
+    uint64_t total = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (events[i].type != RenderEventType::NoteOn) continue;
+        const uint64_t u = events[i].count > 1u ? events[i].count : 1u;
+        units[events[i].data2 & 127u] += u;
+        total += u;
+    }
+    if (total <= budgetUnits) return 0u;
+    // Highest velocities first until the budget would be exceeded.
+    uint64_t kept = 0u;
+    int cutVelocity = 127;
+    for (; cutVelocity >= 0; --cutVelocity) {
+        if (kept + units[cutVelocity] > budgetUnits) break;
+        kept += units[cutVelocity];
+    }
+    // At the cut velocity the earliest events go first.
+    uint64_t dropTies = units[cutVelocity] - (budgetUnits - kept);
+    out.clear();
+    out.reserve(count);
+    uint32_t dropped = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const RenderEvent& e = events[i];
+        if (e.type == RenderEventType::NoteOn) {
+            const int velocity = static_cast<int>(e.data2 & 127u);
+            const uint32_t u = e.count > 1u ? e.count : 1u;
+            bool drop = velocity < cutVelocity;
+            if (velocity == cutVelocity && dropTies >= u) {
+                drop = true;
+                dropTies -= u;
+            } else if (velocity == cutVelocity) {
+                dropTies = 0u;
+            }
+            if (drop) { dropped += u; continue; }
+        }
+        out.push_back(e);
+    }
+    return dropped;
 }
 
 inline void RenderScalar::RenderBlockStretch(

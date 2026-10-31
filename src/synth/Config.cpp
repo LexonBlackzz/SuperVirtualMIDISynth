@@ -458,6 +458,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"drop_zero_life_victims", cfg.dropZeroLifeVictims},
             {"launch_staging", cfg.launchStaging},
             {"launch_staging_auto", cfg.launchStagingAuto},
+            {"bulk_admission_percent", cfg.bulkAdmissionPercent},
             {"steal_index", cfg.stealIndexBuckets ? 1 : 0},
             {"sampled_steal", cfg.sampledSteal}
         }},
@@ -961,6 +962,9 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "voices.launch_staging");
         if (!ReadBool(*it, "launch_staging_auto", cfg.launchStagingAuto))
             AppendWarning(cfg.configWarning, "voices.launch_staging_auto");
+        if (!ReadValue(*it, "bulk_admission_percent", cfg.bulkAdmissionPercent,
+                       0u, 1000u))
+            AppendWarning(cfg.configWarning, "voices.bulk_admission_percent");
         {
             uint32_t stealIndex = cfg.stealIndexBuckets ? 1u : 0u;
             if (!ReadValue(*it, "steal_index", stealIndex, 0u, 1u))
@@ -1148,6 +1152,7 @@ EngineConfig EngineConfig::Default() {
     cfg.dropZeroLifeVictims = false;  // opt-in: exact steal-fade tails by default
     cfg.launchStaging = false;    // forced staging is opt-in
     cfg.launchStagingAuto = true; // large pools stage on their own
+    cfg.bulkAdmissionPercent = 0; // opt-in: every note-on launches
     cfg.stealIndexBuckets = false;  // opt-in: exact tournament tree by default
     cfg.monoDownmix = false;
     cfg.sampledSteal = false;       // opt-in: quietest-first ranking by default

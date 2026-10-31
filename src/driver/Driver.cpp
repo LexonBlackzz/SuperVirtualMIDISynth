@@ -628,6 +628,7 @@ bool Driver::Initialize() {
     channelCache->SetMasterVolume(cfg.masterVolume);
     renderScalar = new RenderScalar();
     renderScalar->SetGhostBudget(cfg.ghostBudget);
+    renderScalar->SetBulkAdmissionPercent(cfg.bulkAdmissionPercent);
     renderScalar->SetDecimationEnabled(cfg.decimation);
     renderScalar->SetDecimationByLevel(cfg.decimationByLevel);
     SetFastChunkMath(cfg.fastChunkMath);

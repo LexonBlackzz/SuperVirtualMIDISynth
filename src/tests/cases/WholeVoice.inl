@@ -2669,6 +2669,214 @@ void TestLaunchStagingAutoByPoolSize() {
     svms::g_launchStagingAutoVoices.store(savedAuto);
 }
 
+// Bulk block admission (voices.bulk_admission_percent).  The pure filter keeps
+// the budgeted number of note-on units ranked by velocity (ties to the later
+// event), changes nothing else about the stream, and does nothing when the
+// block fits; and RenderBlock with the feature on must equal RenderBlock fed
+// the filtered stream with the feature off, bit for bit.
+void TestBulkAdmission() {
+    using svms::RenderEvent;
+    using svms::RenderEventType;
+    auto make = [](RenderEventType type, uint8_t channel, uint8_t key,
+                   uint8_t velocity, uint32_t frame, uint32_t count = 1u) {
+        RenderEvent e{};
+        e.type = type;
+        e.channel = channel;
+        e.data1 = key;
+        e.data2 = velocity;
+        e.frameOffset = frame;
+        e.count = count;
+        return e;
+    };
+
+    // The filter alone.
+    std::vector<RenderEvent> stream, kept;
+    WholeVoiceRng rng;
+    for (uint32_t i = 0u; i < 60u; ++i) {
+        stream.push_back(make(RenderEventType::NoteOn, 0u,
+                              static_cast<uint8_t>(40u + i % 20u),
+                              static_cast<uint8_t>((1u + rng.Next() % 6u) * 20u),
+                              i * 3u));
+        if (i % 4u == 0u)
+            stream.push_back(make(RenderEventType::NoteOff, 0u,
+                                  static_cast<uint8_t>(40u + i % 20u), 0u,
+                                  i * 3u + 1u));
+        if (i % 9u == 0u)
+            stream.push_back(make(RenderEventType::ControlChange, 1u, 7u, 90u,
+                                  i * 3u + 2u));
+    }
+    uint32_t noteOns = 0u;
+    for (const RenderEvent& e : stream)
+        if (e.type == RenderEventType::NoteOn) ++noteOns;
+    const uint32_t count = static_cast<uint32_t>(stream.size());
+    Check(svms::RenderScalar::BulkAdmissionFilter(stream.data(), count, noteOns,
+                                                  kept) == 0u &&
+              svms::RenderScalar::BulkAdmissionFilter(
+                  stream.data(), count, noteOns + 50u, kept) == 0u,
+          "bulk admission: a block that fits is left alone");
+    for (const uint32_t budget : {1u, 7u, 25u, noteOns - 1u}) {
+        const uint32_t dropped = svms::RenderScalar::BulkAdmissionFilter(
+            stream.data(), count, budget, kept);
+        Check(dropped == noteOns - budget,
+              "bulk admission: exactly the over-budget units are dropped");
+        // The kept stream must be an order-preserving subsequence.
+        std::vector<char> isKept(stream.size(), 0);
+        size_t at = 0u;
+        for (size_t i = 0u; i < stream.size(); ++i) {
+            if (at < kept.size() &&
+                std::memcmp(&kept[at], &stream[i], sizeof(RenderEvent)) == 0) {
+                isKept[i] = 1;
+                ++at;
+            }
+        }
+        uint32_t keptNoteOns = 0u, otherEvents = 0u, otherKept = 0u;
+        int lowestKept = 128, highestDropped = -1;
+        for (size_t i = 0u; i < stream.size(); ++i) {
+            if (stream[i].type != RenderEventType::NoteOn) {
+                ++otherEvents;
+                otherKept += isKept[i] ? 1u : 0u;
+            } else if (isKept[i]) {
+                ++keptNoteOns;
+                lowestKept = (std::min)(lowestKept, int(stream[i].data2));
+            } else {
+                highestDropped = (std::max)(highestDropped, int(stream[i].data2));
+            }
+        }
+        uint32_t latestDroppedAtCut = 0u, earliestKeptAtCut = UINT32_MAX;
+        for (size_t i = 0u; i < stream.size(); ++i) {
+            if (stream[i].type != RenderEventType::NoteOn ||
+                int(stream[i].data2) != lowestKept)
+                continue;
+            if (isKept[i])
+                earliestKeptAtCut = (std::min)(earliestKeptAtCut, uint32_t(i));
+            else
+                latestDroppedAtCut = (std::max)(latestDroppedAtCut, uint32_t(i));
+        }
+        Check(at == kept.size() && keptNoteOns == budget &&
+                  otherKept == otherEvents,
+              "bulk admission: order kept, every other event kept");
+        Check(highestDropped <= lowestKept,
+              "bulk admission: nothing dropped outranks anything kept");
+        Check(highestDropped < lowestKept ||
+                  latestDroppedAtCut < earliestKeptAtCut,
+              "bulk admission: ties go to the later note");
+    }
+    {   // A merged note-on counts for its units and is kept or dropped whole.
+        std::vector<RenderEvent> merged = {
+            make(RenderEventType::NoteOn, 0u, 60u, 100u, 0u, 4u),
+            make(RenderEventType::NoteOn, 0u, 61u, 50u, 1u, 1u),
+            make(RenderEventType::NoteOn, 0u, 62u, 100u, 2u, 1u)};
+        const uint32_t dropped = svms::RenderScalar::BulkAdmissionFilter(
+            merged.data(), 3u, 5u, kept);
+        Check(dropped == 1u && kept.size() == 2u &&
+                  kept[0].data1 == 60u && kept[1].data1 == 62u,
+              "bulk admission: merged note-on weighs its count");
+    }
+
+    // Through RenderBlock.
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 6u;
+    constexpr uint32_t kPool = 16u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.35f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+    auto bulkVoices = std::make_unique<svms::VoiceManager>();
+    auto plainVoices = std::make_unique<svms::VoiceManager>();
+    ConfigureWholeVoiceSeedPool(*bulkVoices, seedChannels, kPool, kPool);
+    ConfigureWholeVoiceSeedPool(*plainVoices, seedChannels, kPool, kPool);
+    svms::ChannelCache bulkChannels = seedChannels;
+    svms::ChannelCache plainChannels = seedChannels;
+    svms::RenderScalar bulk;
+    svms::RenderScalar plain;
+    Check(bulk.ReserveVoiceCapacity(kPool) && plain.ReserveVoiceCapacity(kPool) &&
+              bulk.ConfigureRenderThreads(1u, kFrames) &&
+              plain.ConfigureRenderThreads(1u, kFrames),
+          "bulk admission renderers start");
+    bulk.SetBulkAdmissionPercent(100u);
+    WholeVoiceLaunchContext bulkContext{bulkVoices.get(),
+                                        bulkChannels.GetParams()};
+    WholeVoiceLaunchContext plainContext{plainVoices.get(),
+                                         plainChannels.GetParams()};
+    bulk.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent, &bulkContext);
+    plain.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent, &plainContext);
+
+    uint32_t mismatchedBlocks = 0u;
+    uint64_t totalDropped = 0u;
+    for (uint32_t block = 0; block < kBlocks; ++block) {
+        const uint64_t blockStartFrame = 20000u + block * kFrames;
+        std::vector<RenderEvent> events;
+        uint32_t sequence = 0u;
+        // 90 note-ons into a 16-voice pool: oversubscribed, with note-offs.
+        for (uint32_t j = 0; j < 90u; ++j) {
+            const uint32_t frame = rng.Next() % (kFrames - 40u);
+            const uint8_t channel = static_cast<uint8_t>(rng.Next() % 3u);
+            const uint8_t key = static_cast<uint8_t>(40u + rng.Next() % 24u);
+            RenderEvent on = make(RenderEventType::NoteOn, channel, key,
+                                  static_cast<uint8_t>(30u + rng.Next() % 90u),
+                                  frame);
+            on.ingressSequence = sequence++;
+            events.push_back(on);
+            if ((rng.Next() % 3u) != 0u) {
+                RenderEvent off = make(RenderEventType::NoteOff, channel, key,
+                                       0u, frame + 1u + rng.Next() % 38u);
+                off.ingressSequence = sequence++;
+                events.push_back(off);
+            }
+        }
+        std::stable_sort(events.begin(), events.end(),
+            [](const RenderEvent& a, const RenderEvent& b) {
+                return a.frameOffset < b.frameOffset;
+            });
+        std::vector<RenderEvent> filtered;
+        const uint32_t dropped = svms::RenderScalar::BulkAdmissionFilter(
+            events.data(), static_cast<uint32_t>(events.size()), kPool,
+            filtered);
+        Check(dropped > 0u, "bulk admission: the block is oversubscribed");
+        totalDropped += dropped;
+        std::vector<float> bulkLeft(kFrames, 0.0f), bulkRight(kFrames, 0.0f);
+        std::vector<float> plainLeft(kFrames, 0.0f), plainRight(kFrames, 0.0f);
+        bulk.RenderBlock(*bulkVoices, bulkChannels, samples.data(), sampleCount,
+                         bulkLeft.data(), bulkRight.data(), kFrames, cfg,
+                         events.data(), static_cast<uint32_t>(events.size()),
+                         true, blockStartFrame);
+        plain.RenderBlock(*plainVoices, plainChannels, samples.data(),
+                          sampleCount, plainLeft.data(), plainRight.data(),
+                          kFrames, cfg, filtered.data(),
+                          static_cast<uint32_t>(filtered.size()), true,
+                          blockStartFrame);
+        bool same =
+            std::memcmp(bulkLeft.data(), plainLeft.data(),
+                        kFrames * sizeof(float)) == 0 &&
+            std::memcmp(bulkRight.data(), plainRight.data(),
+                        kFrames * sizeof(float)) == 0 &&
+            bulkVoices->GetActiveCount() == plainVoices->GetActiveCount();
+        const uint32_t cap = (std::min)(bulkVoices->GetMaxVoices(),
+                                        plainVoices->GetMaxVoices());
+#define SVMS_CMP_FIELD(type, name) \
+        same = same && std::memcmp(bulkVoices->v.name, plainVoices->v.name, \
+                                   cap * sizeof(type)) == 0;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+#undef SVMS_CMP_FIELD
+        if (!same) ++mismatchedBlocks;
+    }
+    Check(mismatchedBlocks == 0u,
+          "bulk admission: RenderBlock equals the pre-filtered stream, bit "
+          "for bit");
+    Check(bulk.GetBulkAdmissionDropped() == totalDropped,
+          "bulk admission: dropped-unit counter matches the filter");
+    Check(bulkContext.launches == plainContext.launches,
+          "bulk admission: both renderers launched the same notes");
+}
+
 // Lazy same-frame launch (DropZeroLifeVictimsEnabled): a launch whose victim
 // group was born on the same frame is parked as pending and committed through
 // the normal launch code later.  With zero-life tails dropped on BOTH sides, a

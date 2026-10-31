@@ -110,7 +110,13 @@ public:
             renderer_.SetDecimationByLevel(t->decimationByLevel);
             renderer_.SetMutedTailCullBlocks(t->decimationCullBlocks);
             SetFastChunkMath(t->fastChunkMath);
+            renderer_.SetBulkAdmissionPercent(t->bulkAdmissionPercent);
         }
+        // Env override for offline experiments (percent of the voice limit
+        // per block, 0 = off), like the other experimental switches.
+        if (const char* bulk = std::getenv("SVMS_BULK_ADMISSION"))
+            renderer_.SetBulkAdmissionPercent(
+                static_cast<uint32_t>(std::atoi(bulk)));
         monoDownmix_ = config.monoDownmix || (config.tuning && config.tuning->monoDownmix);
         if (config.stealReject) {
             voices_.SetStealReject(true);

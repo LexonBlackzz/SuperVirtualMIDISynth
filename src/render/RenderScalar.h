@@ -556,6 +556,9 @@ private:
         }
     }
     std::vector<RenderEvent> splitEvents_;
+    uint32_t bulkAdmissionPercent_ = 0u;
+    uint64_t bulkAdmissionDropped_ = 0u;
+    std::vector<RenderEvent> admittedEvents_;
     float* splitBusLeft_[kChannelCount] = {};
     float* splitBusRight_[kChannelCount] = {};
     // ── Whole-voice whole-block renderer ────────────────────────────────
@@ -877,6 +880,23 @@ public:
     // whole-voice block. Beyond the cap, displaced/killed voices die without
     // their pre-steal render pass (same path as capacity overflow).
     void SetGhostBudget(uint32_t budget) { ghostBudget_ = budget; }
+    // Bulk block admission (voices.bulk_admission_percent, opt-in, 0 = off):
+    // a block carrying more note-on units than percent% of the voice limit
+    // keeps only the highest-ranked ones; the rest are removed from the event
+    // list before the plan sees them, exactly as if they had been launched and
+    // stolen before they rendered (their note-offs then pair with the oldest
+    // older generation on the key, as for any stolen note).  Ranking is by
+    // velocity, ties to the later event.  Event frames of the notes that stay
+    // are untouched.
+    void SetBulkAdmissionPercent(uint32_t percent) {
+        bulkAdmissionPercent_ = percent;
+    }
+    uint64_t GetBulkAdmissionDropped() const { return bulkAdmissionDropped_; }
+    // Pure filter behind it (public for the tests).  Returns the note-on units
+    // dropped; `out` is filled only when that is non-zero.
+    static uint32_t BulkAdmissionFilter(const RenderEvent* events,
+                                        uint32_t count, uint32_t budgetUnits,
+                                        std::vector<RenderEvent>& out);
 #if defined(SVMS_GPU_STAGE)
     // Attach the realtime GPU stage (null = CPU only, today's code exactly).
     // The stage is owned by the caller and must outlive the renderer's use.

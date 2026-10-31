@@ -155,6 +155,7 @@ struct Options {
     uint32_t gpuMinVoices = 4096u;
     bool gpuSort = true;                // --gpu-sort 0|1: order GPU lists by sample region
     uint32_t gpuDeadlinePercent = 0u;   // 0 = wait for the GPU
+    uint32_t bulkAdmissionPercent = 0u; // --bulk-admission P: 0 = off
 };
 
 bool ParseBackend(const char* value, Options& options) {
@@ -289,6 +290,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.cullMutedBlocks = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--no-filter-groups") == 0) {
             svms::SetFilteredGroupKernelForTest(false);
+        } else if (std::strcmp(argv[i], "--bulk-admission") == 0) {
+            if (!nextNumber(options.bulkAdmissionPercent)) return false;
         } else if (std::strcmp(argv[i], "--fast-chunk-math") == 0) {
             svms::SetFastChunkMath(true);
         } else if (std::strcmp(argv[i], "--filter-cents") == 0 && i + 1 < argc) {
@@ -880,6 +883,7 @@ int main(int argc, char** argv) {
     renderer->SetDecimationEnabled(options.decimation);
     renderer->SetDecimationByLevel(options.decimationByLevel);
     renderer->SetMutedTailCullBlocks(options.cullMutedBlocks);
+    renderer->SetBulkAdmissionPercent(options.bulkAdmissionPercent);
     gBenchVibratoLfo = options.vibratoLfo;
     if (options.vibratoLfo) {
         for (uint32_t a = 0; a < voices->activeCount_; ++a) {
@@ -1655,6 +1659,10 @@ int main(int argc, char** argv) {
         voices->GetStealTailCount(), p50, p95, p99, p999, maximum);
     // Whole-voice phase split (includes warmup): plan is serial on the audio
     // thread, jobs fan out to the workers.  stderr keeps the JSON line intact.
+    if (options.bulkAdmissionPercent != 0u)
+        std::fprintf(stderr, "{\"bulk_admission\":{\"percent\":%u,\"dropped\":%llu}}\n",
+            options.bulkAdmissionPercent,
+            static_cast<unsigned long long>(renderer->GetBulkAdmissionDropped()));
     std::fprintf(stderr, "{\"wv_cycles\":{\"plan\":%llu,\"jobs\":%llu,\"post\":%llu}}\n",
         static_cast<unsigned long long>(renderer->GetWvPlanCycles()),
         static_cast<unsigned long long>(renderer->GetWvJobCycles()),
