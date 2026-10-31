@@ -1128,6 +1128,9 @@ public:
     uint32_t* activeList_;
     uint32_t* activePosition_;
     uint32_t freeTop_;
+    // False while no slot has been handed out since the last Reset, so a
+    // repeated Reset (a GM reset per track) skips the per-voice array wipes.
+    bool poolDirty_ = true;
 
     void RebuildActivePositions();
 

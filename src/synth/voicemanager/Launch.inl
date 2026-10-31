@@ -41,6 +41,7 @@ inline VoiceHandle VoiceManager::AllocateVoice(uint8_t channel, uint8_t note, ui
     // the steal-only fold: renderGain rewrites stay with the vintage-exact
     // batch-boundary folds.
     FoldStaleChannelMixGainsForSteal();
+    poolDirty_ = true;
     uint32_t idx = freeStack_[--freeTop_];
 
     InitializeVoice(static_cast<VoiceHandle>(idx), channel, note, velocity);
@@ -90,6 +91,7 @@ inline VoiceHandle VoiceManager::AllocateVoiceOrSteal(uint8_t channel, uint8_t n
     // AllocateVoice fallback while one is pending.
     if (forcedVictim == kInvalidVoice) {
         if (deferCandidate && freeTop_ != 0u && activeCount_ < voiceLimit_) {
+            poolDirty_ = true;
             const uint32_t idx = static_cast<uint32_t>(freeStack_[--freeTop_]);
             vh = static_cast<VoiceHandle>(idx);
             PrefetchVoiceLines(vh);

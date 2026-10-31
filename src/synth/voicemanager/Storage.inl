@@ -253,6 +253,7 @@ inline bool VoiceManager::ReserveMetadata(uint32_t capacity) {
 inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     ++stealPeekEpoch_;
     v = other.v;
+    poolDirty_ = true;
     std::memcpy(metadataStorage_, other.metadataStorage_, metadataBytes_);
     activeCount_ = other.activeCount_;
     freeTop_ = other.freeTop_;
@@ -375,49 +376,53 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
 
 inline void VoiceManager::Reset() {
     ++stealPeekEpoch_;
-    v.Reset();
-    std::memset(activeList_, 0, sizeof(*activeList_) * maxVoices_);
-    std::memset(activePosition_, 0xff,
-                sizeof(*activePosition_) * maxVoices_);
-    std::memset(channelActiveCount_, 0, sizeof(channelActiveCount_));
-    std::memset(channelActiveHead_, 0xff, sizeof(channelActiveHead_));
-    std::memset(channelActiveTail_, 0xff, sizeof(channelActiveTail_));
-    for (uint32_t i = 0u; i < maxVoices_; ++i) {
-        channelActiveBlock_[i] = UINT32_MAX;
-        channelActiveOffset_[i] = UINT8_MAX;
-    }
-    channelIndexFreeTop_ = channelIndexBlockCount_;
-    for (uint32_t block = 0u; block < channelIndexBlockCount_; ++block) {
-        channelIndexFreeStack_[block] = channelIndexBlockCount_ - 1u - block;
-        channelIndexBlocks_[block].count = 0u;
-        channelIndexBlocks_[block].previous = UINT32_MAX;
-        channelIndexBlocks_[block].next = UINT32_MAX;
-    }
-    std::memset(renderClassCount_, 0, sizeof(renderClassCount_));
-    for (uint32_t i = 0u; i < maxVoices_; ++i)
-        renderClassLinked_[i] = 0u;
-    std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
-    std::memset(stealWinnerTree_, 0,
-                sizeof(*stealWinnerTree_) * stealTreeLeafBase_ * 2u);
-    std::memset(stealStableKey_, 0,
-                sizeof(*stealStableKey_) * maxVoices_);
-    for (uint32_t i = 0u; i < maxVoices_; ++i)
-        stealVolatilePosition_[i] = UINT32_MAX;
-    std::memset(stealVolatileHeapPosition_, 0xff,
-                sizeof(*stealVolatileHeapPosition_) * maxVoices_);
-    std::memset(stealCandidateDeferred_, 0,
-                sizeof(*stealCandidateDeferred_) * maxVoices_);
-    std::memset(stealCandidateReserved_, 0,
-                sizeof(*stealCandidateReserved_) * maxVoices_);
-    stableBuckets_.Reset();
-    volBuckets_.Reset();
-    std::memset(volKey_, 0, sizeof(*volKey_) * maxVoices_);
-    for (uint32_t i = 0u; i < maxVoices_; ++i) {
-        playGroupNext_[i] = -1;
-        playGroupPrev_[i] = -1;
-        exclusiveClass_[i] = 0u;
-        exclusiveClassNext_[i] = -1;
-        exclusiveClassPrev_[i] = -1;
+    const bool wipe = poolDirty_;
+    poolDirty_ = false;
+    if (wipe) {
+        v.Reset();
+        std::memset(activeList_, 0, sizeof(*activeList_) * maxVoices_);
+        std::memset(activePosition_, 0xff,
+                    sizeof(*activePosition_) * maxVoices_);
+        std::memset(channelActiveCount_, 0, sizeof(channelActiveCount_));
+        std::memset(channelActiveHead_, 0xff, sizeof(channelActiveHead_));
+        std::memset(channelActiveTail_, 0xff, sizeof(channelActiveTail_));
+        for (uint32_t i = 0u; i < maxVoices_; ++i) {
+            channelActiveBlock_[i] = UINT32_MAX;
+            channelActiveOffset_[i] = UINT8_MAX;
+        }
+        channelIndexFreeTop_ = channelIndexBlockCount_;
+        for (uint32_t block = 0u; block < channelIndexBlockCount_; ++block) {
+            channelIndexFreeStack_[block] = channelIndexBlockCount_ - 1u - block;
+            channelIndexBlocks_[block].count = 0u;
+            channelIndexBlocks_[block].previous = UINT32_MAX;
+            channelIndexBlocks_[block].next = UINT32_MAX;
+        }
+        std::memset(renderClassCount_, 0, sizeof(renderClassCount_));
+        for (uint32_t i = 0u; i < maxVoices_; ++i)
+            renderClassLinked_[i] = 0u;
+        std::memset(stealTailPosition_, 0xff, sizeof(stealTailPosition_));
+        std::memset(stealWinnerTree_, 0,
+                    sizeof(*stealWinnerTree_) * stealTreeLeafBase_ * 2u);
+        std::memset(stealStableKey_, 0,
+                    sizeof(*stealStableKey_) * maxVoices_);
+        for (uint32_t i = 0u; i < maxVoices_; ++i)
+            stealVolatilePosition_[i] = UINT32_MAX;
+        std::memset(stealVolatileHeapPosition_, 0xff,
+                    sizeof(*stealVolatileHeapPosition_) * maxVoices_);
+        std::memset(stealCandidateDeferred_, 0,
+                    sizeof(*stealCandidateDeferred_) * maxVoices_);
+        std::memset(stealCandidateReserved_, 0,
+                    sizeof(*stealCandidateReserved_) * maxVoices_);
+        stableBuckets_.Reset();
+        volBuckets_.Reset();
+        std::memset(volKey_, 0, sizeof(*volKey_) * maxVoices_);
+        for (uint32_t i = 0u; i < maxVoices_; ++i) {
+            playGroupNext_[i] = -1;
+            playGroupPrev_[i] = -1;
+            exclusiveClass_[i] = 0u;
+            exclusiveClassNext_[i] = -1;
+            exclusiveClassPrev_[i] = -1;
+        }
     }
     std::memset(exclusiveClassHead_, 0xff, sizeof(exclusiveClassHead_));
     activeCount_ = 0;
@@ -454,11 +459,13 @@ inline void VoiceManager::Reset() {
     releasingRingHead_ = 0u;
     releasingRingCount_ = 0u;
     releasingRingHits_ = 0u;
-    for (uint32_t i = 0; i < maxVoices_; ++i) {
-        v.state[i] = static_cast<uint8_t>(VoiceState::Free);
-        v.nextChannelKeyVoice[i] = -1;
-        v.prevChannelKeyVoice[i] = -1;
-        freeStack_[i] = static_cast<int32_t>(i);
+    if (wipe) {
+        for (uint32_t i = 0; i < maxVoices_; ++i) {
+            v.state[i] = static_cast<uint8_t>(VoiceState::Free);
+            v.nextChannelKeyVoice[i] = -1;
+            v.prevChannelKeyVoice[i] = -1;
+            freeStack_[i] = static_cast<int32_t>(i);
+        }
     }
     for (uint32_t ch = 0; ch < kChannelCount; ++ch)
         for (uint32_t n = 0; n < kNoteCount; ++n) {
@@ -719,6 +726,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     voiceLimit_ = grown.voiceLimit_;
     activeCount_ = grown.activeCount_;
     freeTop_ = grown.freeTop_;
+    poolDirty_ = true;
     channelIndexBlockCount_ = grown.channelIndexBlockCount_;
     channelIndexFreeTop_ = grown.channelIndexFreeTop_;
     std::memcpy(channelActiveCount_, grown.channelActiveCount_,
