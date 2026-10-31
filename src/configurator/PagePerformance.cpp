@@ -555,6 +555,13 @@ void CpuCard(ConfigDocument& doc) {
         if (ui::Toggle("##launchstaging", &w.launchStaging)) doc.MarkDirty();
         ui::EndRow();
     }
+    {
+        ui::BeginRow("launchStagingAuto", "Staged launches for large pools",
+                     "Turns staged note launches on by itself when the voice pool is 1024 voices or more, where it speeds up extreme black MIDIs by 25 to 30 percent. Smaller pools keep the direct path. The sound is bit-identical either way. Needs a restart.",
+                     ImVec2(46.0f * s, 28.0f * s));
+        if (ui::Toggle("##launchstagingauto", &w.launchStagingAuto)) doc.MarkDirty();
+        ui::EndRow();
+    }
     ui::EndCard();
 }
 

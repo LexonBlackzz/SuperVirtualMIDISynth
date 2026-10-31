@@ -122,7 +122,7 @@ inline size_t VoiceManager::EstimateAllocatedBytes(
     if (metadataBytes == (std::numeric_limits<size_t>::max)())
         return metadataBytes;
     const size_t voiceBytes = VoiceSoA::EstimateStorageBytes(
-        capacity, LaunchStagingRequested());
+        capacity, LaunchStagingFor(capacity));
     if (voiceBytes > (std::numeric_limits<size_t>::max)() -
                          sizeof(VoiceManager) - metadataBytes)
         return (std::numeric_limits<size_t>::max)();
@@ -349,7 +349,7 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
     const uint32_t requested = maxVoices < kMaxPolyphony
         ? maxVoices : kMaxPolyphony;
     if (launchStagingMode_ < 0)
-        launchStagingMode_ = LaunchStagingRequested() ? 1 : 0;
+        launchStagingMode_ = LaunchStagingFor(requested) ? 1 : 0;
     v.launchStaging = launchStagingMode_ != 0;
     bucketSteal_ = StealIndexBucketsRequested();
     sampledSteal_ = SampledStealRequested();

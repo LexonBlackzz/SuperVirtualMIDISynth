@@ -73,6 +73,7 @@ const SettingDef kSettings[] = {
     {"dropZeroLife", "Drop instant-steal blips (experimental)", P, "Performance \xE2\x80\xBA CPU", "drop zero life instant steal lazy launch black midi experimental", nullptr, nullptr, true, D(&V::dropZeroLifeVictims)},
     {"sampledSteal", "Sampled voice stealing (experimental)", P, "Performance \xE2\x80\xBA CPU", "sampled steal victim voice stealing quality black midi experimental", nullptr, nullptr, true, D(&V::sampledSteal)},
     {"launchStaging", "Staged note launches (experimental)", P, "Performance \xE2\x80\xBA CPU", "staged launch staging ghost copy steal black midi experimental", nullptr, nullptr, true, D(&V::launchStaging)},
+    {"launchStagingAuto", "Staged launches for large pools", P, "Performance \xE2\x80\xBA CPU", "staged launch staging automatic auto large pool black midi", nullptr, nullptr, true, D(&V::launchStagingAuto)},
     {"retire", "Retire floor", P, "Performance \xE2\x80\xBA Engine internals", "voice retire floor release tail -76 db", nullptr, "perf", false, D(&V::voiceRetireThreshold)},
     {"perKey", "Per-key voice cap", P, "Performance \xE2\x80\xBA Engine internals", "per key cap", nullptr, "perf", false, D(&V::perKeyVoiceCap)},
     {"ghost", "Ghost budget", P, "Performance \xE2\x80\xBA Engine internals", "ghost steal storm", nullptr, "perf", false, D(&V::ghostBudget)},

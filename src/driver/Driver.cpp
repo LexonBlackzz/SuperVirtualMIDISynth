@@ -426,6 +426,9 @@ bool Driver::Initialize() {
                                       std::memory_order_relaxed);
     svms::g_launchStagingEnabled.store(cfg.launchStaging,
                                        std::memory_order_relaxed);
+    svms::g_launchStagingAutoVoices.store(
+        cfg.launchStagingAuto ? svms::kLaunchStagingAutoVoices : 0u,
+        std::memory_order_relaxed);
     svms::g_stealIndexBuckets.store(cfg.stealIndexBuckets,
                                     std::memory_order_relaxed);
     svms::g_sampledSteal.store(cfg.sampledSteal, std::memory_order_relaxed);
@@ -587,6 +590,9 @@ bool Driver::Initialize() {
                                       std::memory_order_relaxed);
     svms::g_launchStagingEnabled.store(cfg.launchStaging,
                                        std::memory_order_relaxed);
+    svms::g_launchStagingAutoVoices.store(
+        cfg.launchStagingAuto ? svms::kLaunchStagingAutoVoices : 0u,
+        std::memory_order_relaxed);
     svms::g_stealIndexBuckets.store(cfg.stealIndexBuckets,
                                     std::memory_order_relaxed);
     svms::g_sampledSteal.store(cfg.sampledSteal, std::memory_order_relaxed);

@@ -111,6 +111,8 @@ struct ConfigValues {
     // Experimental: stage steal relaunches in launch records and defer the
     // victims' ghost copies to the render workers (needs restart).
     bool launchStaging = false;
+    // Staged launches switch on by themselves for large pools (needs restart).
+    bool launchStagingAuto = true;
     // Synth backend routing: 0 SVMS engine, 1 SVMS-API DLL, 2 KDMAPI DLL,
     // 3 WinMM device. Applied at driver init (restart).
     uint32_t apiBackend = 0u;

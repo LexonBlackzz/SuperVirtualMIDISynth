@@ -457,6 +457,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"ghost_budget", cfg.ghostBudget},
             {"drop_zero_life_victims", cfg.dropZeroLifeVictims},
             {"launch_staging", cfg.launchStaging},
+            {"launch_staging_auto", cfg.launchStagingAuto},
             {"steal_index", cfg.stealIndexBuckets ? 1 : 0},
             {"sampled_steal", cfg.sampledSteal}
         }},
@@ -958,6 +959,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             AppendWarning(cfg.configWarning, "voices.drop_zero_life_victims");
         if (!ReadBool(*it, "launch_staging", cfg.launchStaging))
             AppendWarning(cfg.configWarning, "voices.launch_staging");
+        if (!ReadBool(*it, "launch_staging_auto", cfg.launchStagingAuto))
+            AppendWarning(cfg.configWarning, "voices.launch_staging_auto");
         {
             uint32_t stealIndex = cfg.stealIndexBuckets ? 1u : 0u;
             if (!ReadValue(*it, "steal_index", stealIndex, 0u, 1u))
@@ -1143,7 +1146,8 @@ EngineConfig EngineConfig::Default() {
     cfg.ghostBudget = 0;          // optional: unbounded ghost capture by default
     cfg.largePages = false;       // opt-in: standard aligned allocation by default
     cfg.dropZeroLifeVictims = false;  // opt-in: exact steal-fade tails by default
-    cfg.launchStaging = false;    // opt-in: direct SoA launches by default
+    cfg.launchStaging = false;    // forced staging is opt-in
+    cfg.launchStagingAuto = true; // large pools stage on their own
     cfg.stealIndexBuckets = false;  // opt-in: exact tournament tree by default
     cfg.monoDownmix = false;
     cfg.sampledSteal = false;       // opt-in: quietest-first ranking by default

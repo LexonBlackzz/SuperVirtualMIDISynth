@@ -50,6 +50,19 @@ inline bool LaunchStagingRequested() noexcept {
     static const bool env = std::getenv("SVMS_LAUNCH_STAGING") != nullptr;
     return env || g_launchStagingEnabled.load(std::memory_order_relaxed);
 }
+// voices.launch_staging_auto: staging also turns on by itself for a pool of at
+// least this many voices (0 = never automatic).  Measured crossover on chopped
+// black MIDI at 1.5M-5M notes/s: staging costs 6-9% at 512 voices and gains
+// 25-30% from 1024 voices up, so the automatic floor sits at 1024.  Audio is
+// bit-identical either way.
+constexpr uint32_t kLaunchStagingAutoVoices = 1024u;
+inline std::atomic<uint32_t> g_launchStagingAutoVoices{0};
+inline bool LaunchStagingFor(uint32_t voices) noexcept {
+    if (LaunchStagingRequested()) return true;
+    const uint32_t floor =
+        g_launchStagingAutoVoices.load(std::memory_order_relaxed);
+    return floor != 0u && voices >= floor;
+}
 // voices.steal_index, read when a VoiceManager initializes (restart-applied).
 // Off = the exact tournament tree.  On = bucketed index: updates are O(1) and
 // the victim comes from the quietest 16-bit level bucket (ties by recency).

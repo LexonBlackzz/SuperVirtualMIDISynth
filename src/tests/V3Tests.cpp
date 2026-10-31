@@ -141,6 +141,7 @@ int main() {
     TestWholeVoiceRotationStealDifferential();
     TestWholeVoiceLaunchDifferential();
     TestLaunchStagingIdentity();
+    TestLaunchStagingAutoByPoolSize();
     TestLazyLaunchIdentity();
     TestWholeVoiceRotationLaunchDifferential();
     TestWholeVoiceResetBarrierDifferential();

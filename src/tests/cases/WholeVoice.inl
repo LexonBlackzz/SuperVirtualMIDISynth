@@ -2645,6 +2645,30 @@ void TestLaunchStagingIdentity() {
     }
 }
 
+// voices.launch_staging_auto: with staging not forced, a pool at or above the
+// automatic floor gets launch records and a smaller pool does not; the
+// switch off (floor 0) and a forced request behave as documented.
+void TestLaunchStagingAutoByPoolSize() {
+    const bool savedFlag = svms::g_launchStagingEnabled.load();
+    const uint32_t savedAuto = svms::g_launchStagingAutoVoices.load();
+    const uint32_t floor = svms::kLaunchStagingAutoVoices;
+    auto stagingStorage = [](uint32_t pool) {
+        svms::VoiceManager voices;
+        Check(voices.Initialize(pool, 44100u), "staging auto pool initializes");
+        return voices.LaunchStagingStorage();
+    };
+    svms::g_launchStagingEnabled.store(false);
+    svms::g_launchStagingAutoVoices.store(floor);
+    Check(!stagingStorage(floor - 1u), "pool below the floor stays direct");
+    Check(stagingStorage(floor), "pool at the floor stages");
+    svms::g_launchStagingAutoVoices.store(0u);
+    Check(!stagingStorage(floor * 2u), "auto off: large pool stays direct");
+    svms::g_launchStagingEnabled.store(true);
+    Check(stagingStorage(8u), "forced staging applies to any pool");
+    svms::g_launchStagingEnabled.store(savedFlag);
+    svms::g_launchStagingAutoVoices.store(savedAuto);
+}
+
 // Lazy same-frame launch (DropZeroLifeVictimsEnabled): a launch whose victim
 // group was born on the same frame is parked as pending and committed through
 // the normal launch code later.  With zero-life tails dropped on BOTH sides, a
