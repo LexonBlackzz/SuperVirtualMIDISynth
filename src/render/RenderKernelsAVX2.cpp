@@ -966,8 +966,14 @@ bool ValidateLoopVoice(const RenderSpanContext& c, uint32_t handle) {
 //            returns UINT32_MAX (sustained voices never retire here).
 //   OneShot: retires at the first frame whose lerp partner would read past
 //            the sample, returning that frame, with the phase not advanced.
-template <bool Loop>
-uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle) {
+//   Tabled:  the gain is not constant: frame f is scaled by gainTable[f] and
+//            then by the voice's mix gain, in that order (the release and
+//            attack/decay rounding).  Used by those kernels for a voice whose
+//            envelope stays in one stage for the whole span, so the per-frame
+//            envelope bookkeeping drops out; the caller applies the end state.
+template <bool Loop, bool Tabled = false>
+uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle,
+                                const float* gainTable = nullptr) {
     VoiceSoA& v = *c.voices;
     ChunkRotation rot;
     if constexpr (Loop) {
@@ -990,8 +996,8 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle) {
     // A chunk needs index(pos + 7*step) + 1 < bound for every lane, i.e.
     // pos + 7*step < (bound - 1).0
     const uint64_t guard64 = phasefx::Pack((Loop ? relLoopE : relEnd) - 1u, 0u);
-    const float gainL = v.renderGainL[handle];
-    const float gainR = v.renderGainR[handle];
+    const float gainL = Tabled ? v.mixGainL[handle] : v.renderGainL[handle];
+    const float gainR = Tabled ? v.mixGainR[handle] : v.renderGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
     const uint32_t readable = c.sampleDataFrames - v.sampleStart[handle];
     float* outL = c.outputLeft + c.frameStart;
@@ -1019,6 +1025,9 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle) {
                                           phasefx::Index(lastPos));
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
+            if constexpr (Tabled)
+                sample = _mm256_mul_ps(sample,
+                                       _mm256_loadu_ps(gainTable + frame));
             MixChunk8(outL + frame, outR + frame, sample, gainLVector,
                       gainRVector);
             pos += fs.step8;
@@ -1046,10 +1055,13 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle) {
                     // range.
                     bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
                         static_cast<int>(phasefx::Index(lastLive))));
-                    const __m256 sample =
+                    __m256 sample =
                         LerpGather8(region, readable, bases, fraction,
                                    phasefx::Index(pos),
                                    phasefx::Index(lastLive));
+                    if constexpr (Tabled)
+                        sample = _mm256_mul_ps(
+                            sample, _mm256_loadu_ps(gainTable + frame));
                     MixChunk8Masked(outL + frame, outR + frame, liveMask,
                                     sample, gainLVector, gainRVector);
                     pos += stepFx * rem;
@@ -1081,8 +1093,14 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle) {
             (1.0f / 32768.0f) - first) * fraction;
         if (rot) sample = rot.Scalar(sample, base, next, fraction);
         sample = ProcessVoiceFilterSample(v, handle, sample);
-        outL[frame] += sample * gainL;
-        outR[frame] += sample * gainR;
+        if constexpr (Tabled) {
+            const float g = gainTable[frame];
+            outL[frame] += sample * g * gainL;
+            outR[frame] += sample * g * gainR;
+        } else {
+            outL[frame] += sample * gainL;
+            outR[frame] += sample * gainR;
+        }
         pos += stepFx;
         --windowRemaining;
         ++frame;
@@ -1185,6 +1203,31 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
     float gain = v.currentGain[handle];
     uint32_t remaining = v.releaseSamplesRemaining[handle];
     const float decay = v.releaseDecay[handle];
+    // The countdown and retire-threshold tests only matter near the end of a
+    // voice's life.  When the gain table proves no frame of this span can trip
+    // them (the gain never rises, 0 <= decay <= 1, so the last gain the span
+    // reads, table[frames - 1], is the smallest; the countdown drops one per
+    // frame), the envelope is a plain per-frame gain: the span renders through
+    // the sustained kernel's lean loop and only the end state is written here.
+    // Rotation stays on the general path (it applies after the filter here).
+    bool testsMoot = false;
+    if (gainTable != nullptr && !(Loop && g_fastChunkMath) && !rot) {
+        if (remaining == UINT32_MAX)
+            testsMoot = decay >= 0.0f && decay <= 1.0f && gain >= 0.0f &&
+                gainTable[c.frameCount - 1u] >= VoiceRetireThreshold();
+        else
+            testsMoot = remaining > c.frameCount;
+    }
+    if (testsMoot) {
+        const uint32_t ret =
+            RenderSustainedChunked<Loop, true>(c, handle, gainTable);
+        const uint32_t done = ret == UINT32_MAX ? c.frameCount : ret;
+        if (done != 0u) gain = gainTable[done - 1u];
+        if (remaining != UINT32_MAX) remaining -= done;
+        v.currentGain[handle] = gain;
+        v.releaseSamplesRemaining[handle] = remaining;
+        return ret;
+    }
     float step = v.phaseIncs[handle];
     uint64_t stepFx = phasefx::FromFloat(step);
     const uint32_t relLoopS = Loop ? v.relLoopS[handle] : 0u;
@@ -1223,20 +1266,6 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
         decay8 = ladder[7];
     }
     const bool tabled = gainTable != nullptr && !fastMath;
-    // The countdown and retire-threshold tests below only matter near the end
-    // of a voice's life.  When the gain table proves no chunk of this span can
-    // trip them, they are skipped.  The gain never rises (0 <= decay <= 1), so
-    // the last gain a chunk reads, table[frames - 1], is the smallest; the
-    // countdown drops one per frame, so it stays above 8 for every chunk when
-    // it starts above the span length.
-    bool testsMoot = false;
-    if (tabled) {
-        if (remaining == UINT32_MAX)
-            testsMoot = decay >= 0.0f && decay <= 1.0f && gain >= 0.0f &&
-                gainTable[c.frameCount - 1u] >= VoiceRetireThreshold();
-        else
-            testsMoot = remaining > c.frameCount;
-    }
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
     while (frame < c.frameCount) {
@@ -1256,9 +1285,8 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
                 gains[laneIndex] = futureGain;
             }
         }
-        const bool countdownSafe = testsMoot || remaining == UINT32_MAX ||
-            remaining > 8u;
-        const bool thresholdSafe = testsMoot || remaining != UINT32_MAX ||
+        const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
+        const bool thresholdSafe = remaining != UINT32_MAX ||
             ((fastMath || tabled) ? futureGain : gains[7]) >=
                 VoiceRetireThreshold();
         const uint64_t lastPos = pos + fs.step7;
@@ -1575,6 +1603,22 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
     const float sustainLevel = v.sustainLevel[handle];
     const float attackStep = v.attackGainStep[handle];
     const float decaySlope = v.decaySlope[handle];
+    // A table lane exists only for a voice that stays in its attack or decay
+    // stage for the whole span, so its envelope is a plain per-frame gain: the
+    // span renders through the sustained kernel's lean loop and only the end
+    // state is written here.  Rotation stays on the general path.
+    if (gainTable != nullptr && !(Loop && g_fastChunkMath) && !rot) {
+        const uint32_t ret =
+            RenderSustainedChunked<Loop, true>(c, handle, gainTable);
+        const uint32_t done = ret == UINT32_MAX ? c.frameCount : ret;
+        if (done != 0u) gain = gainTable[done - 1u];
+        if (stage == 1u) attackRemaining -= done;
+        else decayRemaining -= done;
+        v.currentGain[handle] = gain;
+        v.attackSamplesRemaining[handle] = attackRemaining;
+        v.decaySamplesRemaining[handle] = decayRemaining;
+        return ret;
+    }
     const uint32_t relEnd = v.relEnd[handle];
     const uint32_t loopS = Loop ? v.relLoopS[handle] : 0u;
     const uint32_t loopE = Loop ? v.relLoopE[handle] : 0u;
