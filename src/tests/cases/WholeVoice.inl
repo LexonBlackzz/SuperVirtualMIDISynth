@@ -1414,6 +1414,186 @@ void RunFilteredGroupKernelTest(bool release) {
     }
 }
 
+// Step breaks (pitch bends inside one span): a single kernel call carrying a
+// list of (frame, new step) must be bit-identical to the same span split at
+// those frames with the step set before each piece.  Sustained and release
+// loops, filtered and not, random break frames (adjacent ones included),
+// steps above and below one frame per frame, spans that are not a multiple of
+// eight.
+void RunStepBreakKernelTest(bool release) {
+    if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    // The closed-form gain ladder is not bit-exact with the sequential
+    // recurrence, so chunk alignment would change the bits; this test is about
+    // the exact path.
+    svms::SetFastChunkMath(false);
+    constexpr uint32_t kVoices = 24u;
+    constexpr uint32_t kRegion = 4096u;
+    std::vector<int16_t> samples(kRegion + 8u, 0);
+    uint32_t rng = 777u;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    for (uint32_t i = 0; i < kRegion; ++i)
+        samples[i] = static_cast<int16_t>(next() & 0x7FFF) - 16384;
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    auto seed = std::make_unique<svms::VoiceManager>();
+    Check(seed->Initialize(64u, 44100u), "step break pool allocates");
+    const uint32_t loopLengths[] = {40u, 130u, 700u, 3000u};
+    std::vector<uint32_t> handles;
+    for (uint32_t i = 0; i < kVoices; ++i) {
+        const uint8_t channel = static_cast<uint8_t>(i % 16u);
+        const svms::VoiceHandle voice = seed->AllocateVoice(
+            channel, static_cast<uint8_t>(40u + i), 100);
+        const uint32_t loopLen = loopLengths[i % 4u];
+        seed->SetVoiceSample(voice, 0, kRegion, 16, 16 + loopLen, 1u,
+                             0.3f + 0.07f * static_cast<float>(i % 23u), 1);
+        // A loop voice's stored cursor is always inside its loop (the kernels
+        // wrap it on exit), so seed it there.
+        svms::phasefx::StoreFloat(
+            seed->v, voice,
+            16.0f + static_cast<float>((i * 53u) % (loopLen - 2u)) + 0.25f);
+        seed->SetVoiceEnvelope(voice, 0.5f, 1.0f, 0, 0, 0, 0, 0.0f, 1.0f, 0.999f);
+        seed->SetVoicePlayIndex(voice, i + 1u);
+        seed->SetVoiceGain(voice, 0.3f + 0.01f * static_cast<float>(i),
+                           0.2f + 0.01f * static_cast<float>(i));
+        seed->RefreshMixGain(voice, channels.GetParams()[channel]);
+        seed->v.renderGainL[voice] = seed->v.currentGain[voice] * seed->v.mixGainL[voice];
+        seed->v.renderGainR[voice] = seed->v.currentGain[voice] * seed->v.mixGainR[voice];
+        if (i % 3u != 0u) {   // two thirds carry the SF2 low-pass
+            const svms::PreparedVoiceFilter f = svms::PrepareVoiceLowPass(
+                static_cast<uint8_t>(svms::FilterType::LowPass2Pole),
+                static_cast<int16_t>(6000 + 250 * static_cast<int>(i % 28u)),
+                static_cast<int16_t>((i % 5u) * 60), 44100u);
+            seed->v.filterA0[voice] = f.a0;
+            seed->v.filterB1[voice] = f.b1;
+            seed->v.filterB2[voice] = f.b2;
+            seed->v.filterEnabled[voice] = f.enabled;
+            seed->v.filterZ1[voice] = 0.01f * static_cast<float>(i % 7u);
+            seed->v.filterZ2[voice] = -0.005f * static_cast<float>(i % 5u);
+        }
+        if (release) {
+            seed->StartRelease(voice);
+            seed->v.currentGain[voice] = 0.4f + 0.01f * static_cast<float>(i);
+            seed->v.releaseDecay[voice] = 0.9990f - 0.0004f * static_cast<float>(i % 9u);
+            seed->v.releaseSamplesRemaining[voice] =
+                (i % 3u == 0u) ? UINT32_MAX : 200u + 150u * (i % 11u);
+        }
+        handles.push_back(voice);
+    }
+
+    const svms::RenderKernelSet& kernels = svms::GetAVX2RenderKernelSet();
+    const svms::RenderClassKernel kernel =
+        kernels.kernels[static_cast<uint32_t>(release
+            ? svms::VoiceRenderClass::ReleaseLoop
+            : svms::VoiceRenderClass::SustainedLoop)];
+    struct Span { uint32_t start, count; };
+    const Span spans[] = {{0u, 2048u}, {5u, 203u}, {0u, 64u}, {3u, 37u}};
+    const uint32_t breakCounts[] = {1u, 2u, 3u, 7u, 40u};
+    uint32_t mismatched = 0u, cases = 0u, retiredCases = 0u;
+    for (const Span& span : spans) {
+        for (const uint32_t breakCount : breakCounts) {
+            if (breakCount >= span.count) continue;
+            for (const uint32_t handle : handles) {
+                // Strictly increasing frames in 1..count-1, some adjacent.
+                std::vector<svms::StepBreak> breaks;
+                uint32_t frame = 0u;
+                for (uint32_t b = 0u; b < breakCount; ++b) {
+                    const uint32_t room = span.count - 1u - frame;
+                    const uint32_t left = breakCount - b;
+                    if (room < left) break;
+                    const uint32_t maxGap = (std::max)(1u, (room - left + 1u) / left * 2u);
+                    frame += 1u + (next() % maxGap) % (room - left + 1u);
+                    const float base = seed->v.basePhaseIncs[handle] != 0.0f
+                        ? seed->v.basePhaseIncs[handle] : seed->v.phaseIncs[handle];
+                    const float ratio = 0.55f + static_cast<float>(next() % 1000u) / 500.0f;
+                    svms::StepBreak sb{};
+                    sb.frame = frame;
+                    sb.phaseInc = (std::min)(base * ratio, 2.9f);
+                    sb.step = svms::phasefx::FromFloat(sb.phaseInc);
+                    breaks.push_back(sb);
+                }
+                if (breaks.empty()) continue;
+                std::vector<uint32_t> positions(64u);
+                for (uint32_t p = 0; p < 64u; ++p) positions[p] = p;
+
+                std::unique_ptr<svms::VoiceManager> run[2];
+                std::vector<float> mixL[2], mixR[2];
+                uint32_t retiredFrame[2] = {UINT32_MAX, UINT32_MAX};
+                for (int piecewise = 0; piecewise < 2; ++piecewise) {
+                    run[piecewise] = std::make_unique<svms::VoiceManager>(*seed);
+                    mixL[piecewise].assign(span.start + span.count + 16u, 0.0f);
+                    mixR[piecewise].assign(span.start + span.count + 16u, 0.0f);
+                    std::vector<svms::SpanRetirement> retired(64u);
+                    uint32_t retiredCount = 0u;
+                    auto makeContext = [&](uint32_t from, uint32_t length,
+                                           const svms::StepBreak* sb, uint32_t n) {
+                        return svms::RenderSpanContext{
+                            &run[piecewise]->v, samples.data(), nullptr, kRegion + 8u,
+                            mixL[piecewise].data(), mixR[piecewise].data(),
+                            span.start + from, length, 64u, nullptr, nullptr,
+                            positions.data(), retired.data(), &retiredCount,
+                            0.0f, 1.0f, 0u, nullptr, nullptr, sb, n};
+                    };
+                    uint32_t h = handle;
+                    if (!piecewise) {
+                        const svms::RenderSpanContext ctx = makeContext(
+                            0u, span.count, breaks.data(),
+                            static_cast<uint32_t>(breaks.size()));
+                        Check(kernel(ctx, &h, 1u), "step break kernel takes one voice");
+                        if (retiredCount != 0u) retiredFrame[0] = retired[0].frameOffset;
+                    } else {
+                        uint32_t cursor = 0u;
+                        for (size_t piece = 0u; piece <= breaks.size(); ++piece) {
+                            const uint32_t end = piece < breaks.size()
+                                ? breaks[piece].frame : span.count;
+                            if (piece > 0u)
+                                run[1]->v.phaseIncs[handle] = breaks[piece - 1u].phaseInc;
+                            const svms::RenderSpanContext ctx =
+                                makeContext(cursor, end - cursor, nullptr, 0u);
+                            Check(kernel(ctx, &h, 1u), "piece kernel takes one voice");
+                            if (retiredCount != 0u) {
+                                retiredFrame[1] = cursor + retired[0].frameOffset;
+                                break;
+                            }
+                            cursor = end;
+                        }
+                    }
+                }
+                ++cases;
+                if (retiredFrame[0] != UINT32_MAX) ++retiredCases;
+                bool same = retiredFrame[0] == retiredFrame[1] &&
+                    std::memcmp(mixL[0].data(), mixL[1].data(),
+                                mixL[0].size() * sizeof(float)) == 0 &&
+                    std::memcmp(mixR[0].data(), mixR[1].data(),
+                                mixR[0].size() * sizeof(float)) == 0;
+                same = same &&
+                    svms::phasefx::Load(run[0]->v, handle) ==
+                        svms::phasefx::Load(run[1]->v, handle) &&
+                    run[0]->v.filterZ1[handle] == run[1]->v.filterZ1[handle] &&
+                    run[0]->v.filterZ2[handle] == run[1]->v.filterZ2[handle] &&
+                    run[0]->v.currentGain[handle] == run[1]->v.currentGain[handle] &&
+                    run[0]->v.releaseSamplesRemaining[handle] ==
+                        run[1]->v.releaseSamplesRemaining[handle];
+                if (!same) ++mismatched;
+            }
+        }
+    }
+    std::fprintf(stderr, "[STEPBRK] %s cases=%u retired=%u mismatched=%u\n",
+                 release ? "release" : "sustained", cases, retiredCases,
+                 mismatched);
+    Check(cases > 100u, "step break kernel test ran its cases");
+    Check(mismatched == 0u,
+          "step breaks inside one kernel call equal the span split at the same frames, bit for bit");
+}
+
+void TestStepBreakKernels() {
+    RunStepBreakKernelTest(false);
+    RunStepBreakKernelTest(true);
+}
+
 void TestFilteredGroupKernel() {
     RunFilteredGroupKernelTest(false);
     RunFilteredGroupKernelTest(true);
@@ -2890,6 +3070,154 @@ void TestBulkAdmission() {
           "bulk admission: dropped-unit counter matches the filter");
     Check(bulkContext.launches == plainContext.launches,
           "bulk admission: both renderers launched the same notes");
+}
+
+// Pitch bends fused into a voice's span (SetBendFusion) must not change what
+// plays: the same bend-heavy stream through an AVX2 renderer that fuses and one
+// that splits at every bend leaves every voice in a bit-identical state and
+// gives the same audio.  The audio is compared to 1e-7 rather than bitwise:
+// fusing moves frames between the scalar remainder code and the vector chunk
+// code, and the multiply-add that accumulates a voice into the shared mix can
+// round differently between the two (the oracle differentials already allow
+// 2e-5 for the same reason).  Mix CCs and note-offs in the stream cut the fused
+// runs, so every kind of boundary shows up next to the bends.
+void TestBendFusionIdentity() {
+    if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    svms::SetFastChunkMath(false);
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 10u;
+    constexpr uint32_t kPool = 64u;
+    constexpr uint32_t kSeedCount = 40u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+             0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 32767.0f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+    auto seedVoices = std::make_unique<svms::VoiceManager>();
+    ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, kPool, kSeedCount);
+    auto splitVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    auto fusedVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    svms::ChannelCache splitChannels = seedChannels;
+    svms::ChannelCache fusedChannels = seedChannels;
+    svms::RenderScalar split;
+    svms::RenderScalar fused;
+    Check(split.ReserveVoiceCapacity(kPool) && fused.ReserveVoiceCapacity(kPool) &&
+              split.ConfigureRenderThreads(4u, kFrames) &&
+              fused.ConfigureRenderThreads(4u, kFrames),
+          "bend fusion identity starts both renderers");
+    Check(split.SetRenderBackend(svms::RenderBackend::AVX2) &&
+              fused.SetRenderBackend(svms::RenderBackend::AVX2),
+          "bend fusion identity selects AVX2");
+    split.SetBendFusion(false);
+    fused.SetBendFusion(true);
+    WholeVoiceCCContext splitContext{splitVoices.get(), &splitChannels,
+                                     splitChannels.GetParams(), &cfg};
+    WholeVoiceCCContext fusedContext{fusedVoices.get(), &fusedChannels,
+                                     fusedChannels.GetParams(), &cfg};
+    splitContext.ResetMasterState();
+    fusedContext.ResetMasterState();
+    split.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent, &splitContext);
+    fused.SetEventBatchDispatcher(DispatchWholeVoiceCCEvent, &fusedContext);
+
+    WholeVoiceRng rng;
+    uint32_t mismatchedBlocks = 0u;
+    float worstAudio = 0.0f;
+    for (uint32_t block = 0; block < kBlocks; ++block) {
+        const uint64_t blockStartFrame = 20000u + block * kFrames;
+        std::vector<svms::RenderEvent> events;
+        uint32_t sequence = 0u;
+        const auto push = [&](svms::RenderEventType type, uint8_t channel,
+                              uint8_t data1, uint8_t data2, uint32_t frame) {
+            svms::RenderEvent event{};
+            event.type = type;
+            event.channel = channel;
+            event.data1 = data1;
+            event.data2 = data2;
+            event.frameOffset = frame;
+            event.ingressSequence = sequence++;
+            events.push_back(event);
+        };
+        for (uint32_t j = 0; j < 8u; ++j)
+            push(svms::RenderEventType::NoteOn,
+                 static_cast<uint8_t>(rng.Next() % 4u),
+                 static_cast<uint8_t>(36u + rng.Next() % 72u),
+                 static_cast<uint8_t>(64u + rng.Next() % 64u),
+                 rng.Next() % kFrames);
+        for (uint32_t j = 0; j < 6u; ++j)
+            push(svms::RenderEventType::NoteOff,
+                 static_cast<uint8_t>(rng.Next() % 4u),
+                 static_cast<uint8_t>(36u + rng.Next() % 72u), 0u,
+                 rng.Next() % kFrames);
+        // A bend riser: many bends per channel, some on the same frame.
+        for (uint32_t j = 0; j < 160u; ++j) {
+            const uint32_t wheel = 4096u + rng.Next() % 8192u;
+            push(svms::RenderEventType::PitchBend,
+                 static_cast<uint8_t>(rng.Next() % 4u),
+                 static_cast<uint8_t>(wheel & 0x7Fu),
+                 static_cast<uint8_t>(wheel >> 7u),
+                 (rng.Next() % 5u == 0u && !events.empty())
+                     ? events.back().frameOffset : rng.Next() % kFrames);
+        }
+        // Mix CCs (volume, pan): non-bend ops that cut a fused run.
+        for (uint32_t j = 0; j < 5u; ++j)
+            push(svms::RenderEventType::ControlChange,
+                 static_cast<uint8_t>(rng.Next() % 4u),
+                 (rng.Next() % 2u) != 0u ? 7u : 10u,
+                 static_cast<uint8_t>(30u + rng.Next() % 97u),
+                 rng.Next() % kFrames);
+        std::stable_sort(events.begin(), events.end(),
+            [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                return a.frameOffset < b.frameOffset;
+            });
+        for (uint32_t i = 0u; i < events.size(); ++i)
+            events[i].ingressSequence = i;
+        std::vector<float> splitLeft(kFrames, 0.0f), splitRight(kFrames, 0.0f);
+        std::vector<float> fusedLeft(kFrames, 0.0f), fusedRight(kFrames, 0.0f);
+        split.RenderBlock(*splitVoices, splitChannels, samples.data(),
+                          sampleCount, splitLeft.data(), splitRight.data(),
+                          kFrames, cfg, events.data(),
+                          static_cast<uint32_t>(events.size()), true,
+                          blockStartFrame);
+        fused.RenderBlock(*fusedVoices, fusedChannels, samples.data(),
+                          sampleCount, fusedLeft.data(), fusedRight.data(),
+                          kFrames, cfg, events.data(),
+                          static_cast<uint32_t>(events.size()), true,
+                          blockStartFrame);
+        float worst = 0.0f;
+        for (uint32_t f = 0u; f < kFrames; ++f) {
+            worst = (std::max)(worst, std::fabs(splitLeft[f] - fusedLeft[f]));
+            worst = (std::max)(worst, std::fabs(splitRight[f] - fusedRight[f]));
+        }
+        worstAudio = (std::max)(worstAudio, worst);
+        bool same = worst <= 1.0e-7f &&
+            splitVoices->GetActiveCount() == fusedVoices->GetActiveCount();
+        const uint32_t cap = (std::min)(splitVoices->GetMaxVoices(),
+                                        fusedVoices->GetMaxVoices());
+#define SVMS_CMP_FIELD(type, name) \
+        same = same && std::memcmp(splitVoices->v.name, fusedVoices->v.name, \
+                                   cap * sizeof(type)) == 0;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+#undef SVMS_CMP_FIELD
+        if (!same) ++mismatchedBlocks;
+    }
+    std::fprintf(stderr, "[BENDFUSE] mismatched blocks=%u worst audio diff=%g fused spans=%llu (split renderer: %llu)\n",
+                 mismatchedBlocks, worstAudio,
+                 static_cast<unsigned long long>(fused.GetFusedBendSpans()),
+                 static_cast<unsigned long long>(split.GetFusedBendSpans()));
+    Check(fused.GetFusedBendSpans() > 50u && split.GetFusedBendSpans() == 0u,
+          "bend fusion identity exercised fused spans");
+    Check(mismatchedBlocks == 0u,
+          "fusing pitch bends into the span gives the same voice state (bit "
+          "for bit) and the same audio (1e-7) as splitting at every bend");
 }
 
 // Lazy same-frame launch (DropZeroLifeVictimsEnabled): a launch whose victim

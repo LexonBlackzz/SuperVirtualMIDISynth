@@ -143,6 +143,8 @@ int main() {
     TestLaunchStagingIdentity();
     TestLaunchStagingAutoByPoolSize();
     TestBulkAdmission();
+    TestStepBreakKernels();
+    TestBendFusionIdentity();
     TestLazyLaunchIdentity();
     TestWholeVoiceRotationLaunchDifferential();
     TestWholeVoiceResetBarrierDifferential();

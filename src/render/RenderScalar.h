@@ -557,6 +557,8 @@ private:
     }
     std::vector<RenderEvent> splitEvents_;
     std::atomic<uint32_t> bulkAdmissionPercent_{0u};
+    bool bendFusion_ = true;
+    std::atomic<uint64_t> bendFusedSpans_{0u};
     uint64_t bulkAdmissionDropped_ = 0u;
     std::vector<RenderEvent> admittedEvents_;
     float* splitBusLeft_[kChannelCount] = {};
@@ -591,14 +593,18 @@ private:
                                  float* outR, uint32_t segStart,
                                  uint32_t segFrames, bool isReal,
                                  uint32_t jobIndex, float lfoDepth,
-                                 float lfoBendRatio, bool lfoActive);
+                                 float lfoBendRatio, bool lfoActive,
+                                 const StepBreak* breaks = nullptr,
+                                 uint32_t breakCount = 0u);
     bool RenderWholeVoiceSegmentLfo(VoiceSoA& state, VoiceManager* voices,
                                     uint32_t row, const int16_t* sampleData,
                                     uint32_t sampleDataFrames, float* outL,
                                     float* outR, uint32_t segStart,
                                     uint32_t segFrames, bool isReal,
                                     uint32_t jobIndex, float lfoDepth,
-                                    float lfoBendRatio, bool lfoActive);
+                                    float lfoBendRatio, bool lfoActive,
+                                    const StepBreak* breaks = nullptr,
+                                    uint32_t breakCount = 0u);
     void RenderWholeVoiceRow(VoiceManager& voices, uint32_t handle,
                              const int16_t* sampleData,
                              uint32_t sampleDataFrames, float* itemLeft,
@@ -831,6 +837,9 @@ private:
     uint32_t* wvJobRetireCounts_ = nullptr;
     static constexpr uint32_t kWvJobsPerThread = 4u;
     static constexpr uint32_t kWvMinItemsPerJob = 64u;
+    // Most pitch bends one row fuses into a single span before the next span
+    // starts at the bend that did not fit.
+    static constexpr uint32_t kWvMaxFusedBreaks = 256u;
     uint32_t wvJobCapacity_ = 0u;
     uint32_t wvJobScratchCapacity_ = 0u;     // scratch stride wvJobRetirements_ was sized for
     uint64_t wvGhostOverflowCount_ = 0u;
@@ -888,6 +897,15 @@ public:
     // older generation on the key, as for any stolen note).  Ranking is by
     // velocity; the notes at the cut velocity are thinned evenly along the
     // block.  Event frames of the notes that stay are untouched.
+    // Pitch bends inside a voice's span ride the AVX2 kernels as step breaks
+    // (the cursor changes step at the bend's exact frame inside a chunk)
+    // instead of splitting the span at every bend.  On by default; off
+    // restores the split, which the tests use as the reference.
+    void SetBendFusion(bool on) { bendFusion_ = on; }
+    // Spans that ran with fused bends since the renderer started.
+    uint64_t GetFusedBendSpans() const {
+        return bendFusedSpans_.load(std::memory_order_relaxed);
+    }
     void SetBulkAdmissionPercent(uint32_t percent) {
         bulkAdmissionPercent_.store(percent, std::memory_order_relaxed);
     }

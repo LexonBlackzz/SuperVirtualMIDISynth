@@ -14,6 +14,16 @@ struct SpanRetirement {
 
 // Backend-neutral span contract.  Explicit SSE2 and AVX2 implementations can
 // replace a class function without changing scheduling or voice ownership.
+// A step change inside a span: from `frame` (relative to the span start) on,
+// the voice advances by `step` (32.32 fixed point) per frame.  `phaseInc` is
+// the float the row's phaseIncs holds from there on (the caller writes it back
+// after the span).  A pitch bend is one of these.
+struct StepBreak {
+    uint32_t frame;
+    float phaseInc;
+    uint64_t step;
+};
+
 struct RenderSpanContext {
     VoiceSoA* voices;
     const int16_t* sampleData;
@@ -56,6 +66,15 @@ struct RenderSpanContext {
     // (legacy behavior), so existing construction sites stay untouched.
     float* const* channelBusLeft;
     float* const* channelBusRight;
+    // Optional step changes inside the span (pitch bends), strictly
+    // increasing frames in 1..frameCount-1.  Only the AVX2 per-voice class
+    // kernels honor them and only for a batch of one voice of 8+ frames
+    // without vibrato; every other kernel returns false (nothing mutated)
+    // when stepBreakCount is non-zero, so callers pass them only to kernels
+    // that take them and split the span otherwise.  Aggregate initializers
+    // that omit these fields value-init them to none.
+    const StepBreak* stepBreaks;
+    uint32_t stepBreakCount;
 };
 
 // Per-voice destination resolution for class kernels: when the span carries

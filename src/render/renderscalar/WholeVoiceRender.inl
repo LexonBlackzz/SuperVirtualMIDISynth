@@ -4,7 +4,8 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     VoiceSoA& state, VoiceManager* voices, uint32_t row,
     const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
     float* outR, uint32_t segStart, uint32_t segFrames, bool isReal,
-    uint32_t jobIndex, float lfoDepth, float lfoBendRatio, bool lfoActive) {
+    uint32_t jobIndex, float lfoDepth, float lfoBendRatio, bool lfoActive,
+    const StepBreak* breaks, uint32_t breakCount) {
     // Per-segment rdtsc profiling is opt-in: this function runs once per
     // voice per op-split segment (tens of thousands of calls per block on
     // op-dense material), and six rdtsc per call measured ~+25% on every
@@ -26,6 +27,30 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     // always is.
     const bool muted = isReal && wvDecimating_ && wvMuted_[row] != 0u &&
                        wvStartFrame_[row] == UINT32_MAX;
+    // Pitch bends fused into this span (see StepBreak).  A path that cannot
+    // take them renders the span in pieces, the step set before each one,
+    // which is exactly what splitting at every bend did.
+    const bool fused = breakCount != 0u;
+    auto renderPieces = [&]() -> bool {
+        uint32_t cursor = segStart;
+        for (uint32_t i = 0u; i <= breakCount; ++i) {
+            const uint32_t end = i < breakCount ? segStart + breaks[i].frame
+                                                : segStart + segFrames;
+            if (i > 0u) state.phaseIncs[row] = breaks[i - 1u].phaseInc;
+            if (end > cursor &&
+                RenderWholeVoiceSegment(state, voices, row, sampleData,
+                                        sampleDataFrames, outL, outR, cursor,
+                                        end - cursor, isReal, jobIndex,
+                                        lfoDepth, lfoBendRatio, lfoActive,
+                                        nullptr, 0u))
+                return true;
+            cursor = end;
+        }
+        return false;
+    };
+    if (fused && (muted || segFrames < 8u || kernel == nullptr ||
+                  sampleData == nullptr))
+        return renderPieces();
     if (!muted && segFrames >= 8u && kernel != nullptr &&
         sampleData != nullptr) {
         ++segStats[kWvSegKernelOk];
@@ -37,8 +62,25 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
             isReal ? voices->activePosition_ : nullptr,
             isReal ? retBuf : nullptr,
             isReal ? &wvJobRetireCounts_[jobIndex * kWvRetireCountStride] : nullptr,
-            lfoDepth, lfoBendRatio, lfoActive ? 1u : 0u};
+            lfoDepth, lfoBendRatio, lfoActive ? 1u : 0u,
+            nullptr, nullptr, breaks, breakCount};
         if (kernel(context, &row, 1u)) {
+            // The kernel stepped across the bends; the row keeps the last one
+            // it reached (a voice that retired mid-span never saw the later
+            // ones, as when the span was split at every bend).
+            if (fused) {
+                uint32_t reached = breakCount;
+                const uint32_t retiredNow =
+                    wvJobRetireCounts_[jobIndex * kWvRetireCountStride];
+                if (isReal && retiredNow > retCountBefore) {
+                    const uint32_t at = retBuf[retiredNow - 1u].frameOffset;
+                    reached = 0u;
+                    while (reached < breakCount && breaks[reached].frame <= at)
+                        ++reached;
+                }
+                if (reached != 0u)
+                    state.phaseIncs[row] = breaks[reached - 1u].phaseInc;
+            }
             if (isReal) {
                 for (uint32_t i = retCountBefore;
                      i < wvJobRetireCounts_[jobIndex * kWvRetireCountStride]; ++i) {
@@ -55,6 +97,7 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
             return false;
         }
     }
+    if (fused) return renderPieces();   // the kernel refused (nothing mutated)
     ++segStats[kWvSegFallback];
     segStats[kWvSegFallbackFrames] += segFrames;
     if (lfoActive) {
@@ -117,13 +160,15 @@ inline bool RenderScalar::RenderWholeVoiceSegmentLfo(
     VoiceSoA& state, VoiceManager* voices, uint32_t row,
     const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
     float* outR, uint32_t segStart, uint32_t segFrames, bool isReal,
-    uint32_t jobIndex, float lfoDepth, float lfoBendRatio, bool lfoActive) {
+    uint32_t jobIndex, float lfoDepth, float lfoBendRatio, bool lfoActive,
+    const StepBreak* breaks, uint32_t breakCount) {
     // A row with no LFO (step 0) is untouched by every window, so it renders
     // as one segment; windows only matter for rows that carry a vibrato LFO.
+    // (Step breaks only exist on AVX2 blocks, where wvScalarVibrato_ is off.)
     if (!wvScalarVibrato_ || state.vibLfoSteps[row] == 0.0f) {
         return RenderWholeVoiceSegment(state, voices, row, sampleData,
             sampleDataFrames, outL, outR, segStart, segFrames, isReal,
-            jobIndex, lfoDepth, lfoBendRatio, lfoActive);
+            jobIndex, lfoDepth, lfoBendRatio, lfoActive, breaks, breakCount);
     }
     const uint32_t end = segStart + segFrames;
     uint32_t pos = segStart;
@@ -429,12 +474,78 @@ inline void RenderScalar::RenderWholeVoiceRow(
                     v.vibLfoPhases[handle] = lp;
                 }
             }
+            // Consecutive pitch bends ahead of the next hard boundary ride the
+            // kernel as step breaks: one span instead of one per bend.  Only
+            // where nothing else needs the span cut (no vibrato LFO on the
+            // row), the kernels take breaks (AVX2) and the span is long enough
+            // for the chunk path; everything else splits as before.
+            StepBreak fuseBuffer[kWvMaxFusedBreaks];
+            uint32_t fuseCount = 0u;
+            uint32_t fuseOps = 0u;       // ops consumed by the fused bends
+            float fuseRatio = vRatio;
+            if (bendFusion_ && !lfoActive &&
+                kernelSet_->backend == RenderBackend::AVX2 &&
+                opIdx < opEnd && wvChanOps_[opIdx].kind == 0u &&
+                wvChanOps_[opIdx].frame > cursor &&
+                !(!wvScalarVibrato_ && !wvScalarNoVibrato_ &&
+                  wvChanVibratoActive_[opChannel] &&
+                  v.vibLfoSteps[handle] != 0.0f &&
+                  v.vibLfoToPitchCents[handle] > 0.0f)) {
+                // Hard boundary: the release flip, a re-excite or the block
+                // end; a non-bend op also ends the fused run at its frame.
+                uint32_t hardStop = frameCount;
+                if (releaseFrame != UINT32_MAX && releaseFrame < hardStop)
+                    hardStop = releaseFrame;
+                if (exIdx != UINT32_MAX && wvExcites_[exIdx].frame < hardStop)
+                    hardStop = wvExcites_[exIdx].frame;
+                uint32_t runStop = hardStop;
+                for (uint32_t j = opIdx; j < opEnd; ++j) {
+                    if (wvChanOps_[j].frame >= hardStop) break;
+                    if (wvChanOps_[j].kind != 0u) {
+                        runStop = wvChanOps_[j].frame;
+                        break;
+                    }
+                }
+                const float scale = v.pitchBendScales[handle];
+                uint32_t j = opIdx;
+                for (; j < opEnd && wvChanOps_[j].frame < runStop &&
+                       wvChanOps_[j].kind == 0u; ++j) {
+                    const WholeVoiceChannelOp& op = wvChanOps_[j];
+                    const uint32_t rel = op.frame - cursor;
+                    const bool sameFrame =
+                        fuseCount != 0u && fuseBuffer[fuseCount - 1u].frame == rel;
+                    if (!sameFrame && fuseCount == kWvMaxFusedBreaks) {
+                        runStop = op.frame;   // the next span starts at this bend
+                        break;
+                    }
+                    fuseRatio = scale == 1.0f
+                        ? op.b : powf(2.0f, op.a * scale / 12.0f);
+                    const float inc = v.basePhaseIncs[handle] * fuseRatio;
+                    StepBreak& slot = fuseBuffer[sameFrame ? fuseCount - 1u
+                                                           : fuseCount++];
+                    slot.frame = rel;
+                    slot.phaseInc = inc;
+                    slot.step = phasefx::FromFloat(inc);
+                }
+                if (fuseCount != 0u && runStop - cursor >= 8u) {
+                    fuseOps = j - opIdx;
+                    stop = runStop;
+                    bendFusedSpans_.fetch_add(1u, std::memory_order_relaxed);
+                } else {
+                    fuseCount = 0u;   // too short to be worth it: split as before
+                }
+            }
             if (RenderWholeVoiceSegmentLfo(
                     v, &voices, handle, sampleData,
                     sampleDataFrames, itemLeft, itemRight,
                     cursor, stop - cursor, true, jobIndex,
-                    vDepth, vRatio, lfoActive)) {
+                    vDepth, vRatio, lfoActive,
+                    fuseCount != 0u ? fuseBuffer : nullptr, fuseCount)) {
                 break;  // retired; coordinator applies it
+            }
+            if (fuseCount != 0u) {
+                opIdx += fuseOps;
+                vRatio = fuseRatio;
             }
             cursor = stop;
         }

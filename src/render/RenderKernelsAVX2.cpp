@@ -170,17 +170,96 @@ inline __m256 FxWeight8(__m256i frac) {
                          _mm256_set1_ps(1.0f / 16777216.0f));
 }
 
-// Sample indices and interpolation weights of the eight frames starting at pos.
-inline void FxChunk(uint64_t pos, const FxSteps8& s, __m256i& bases,
-                    __m256& weight) {
-    const __m256i p = _mm256_set1_epi64x(static_cast<long long>(pos));
-    const __m256i a = _mm256_add_epi64(p, s.lo);
-    const __m256i b = _mm256_add_epi64(p, s.hi);
+// Indices and weights from the eight 64-bit positions, held as the two halves
+// MakeFxSteps8 orders ({0,1,4,5} and {2,3,6,7}).
+inline void FxUnpack(__m256i a, __m256i b, __m256i& bases, __m256& weight) {
     const __m256 fa = _mm256_castsi256_ps(a);
     const __m256 fb = _mm256_castsi256_ps(b);
     // high dwords (indices) and low dwords (fractions) of the eight sums
     bases = _mm256_castps_si256(_mm256_shuffle_ps(fa, fb, 0xDD));
     weight = FxWeight8(_mm256_castps_si256(_mm256_shuffle_ps(fa, fb, 0x88)));
+}
+
+// Sample indices and interpolation weights of the eight frames starting at pos.
+inline void FxChunk(uint64_t pos, const FxSteps8& s, __m256i& bases,
+                    __m256& weight) {
+    const __m256i p = _mm256_set1_epi64x(static_cast<long long>(pos));
+    FxUnpack(_mm256_add_epi64(p, s.lo), _mm256_add_epi64(p, s.hi), bases,
+             weight);
+}
+
+// ---- Step breaks (pitch bends inside a span) -----------------------------
+// RenderSpanContext::stepBreaks: from break.frame on the voice advances by
+// break.step per frame.  A break at frame F changes the advance AFTER frame
+// F - 1 is rendered, so frame F still sits where the old step put it.
+struct BreakWalker {
+    const StepBreak* breaks;
+    uint32_t count;
+    uint32_t index;
+    uint32_t next;   // frame of the next break, UINT32_MAX when none
+    BreakWalker(const RenderSpanContext& c, bool allowed)
+        : breaks(allowed ? c.stepBreaks : nullptr),
+          count(allowed ? c.stepBreakCount : 0u), index(0u),
+          next(count != 0u ? breaks[0].frame : UINT32_MAX) {}
+    // Takes every break that starts at or before `frame`.
+    void Apply(uint32_t frame, uint64_t& stepFx, FxSteps8& fs) {
+        while (index < count && breaks[index].frame <= frame)
+            stepFx = breaks[index++].step;
+        fs = MakeFxSteps8(stepFx);
+        next = index < count ? breaks[index].frame : UINT32_MAX;
+    }
+    void Take() {
+        ++index;
+        next = index < count ? breaks[index].frame : UINT32_MAX;
+    }
+};
+
+// A chunk of eight frames that holds one step change: frame + lane is the
+// first frame at the new step (1 <= lane <= 7).
+struct BreakChunk {
+    FxSteps8 fsNew;
+    uint64_t newStep;
+    uint64_t delta;     // lane * (old - new): lanes past the break add it to k * new
+    uint64_t lastPos;   // position of the chunk's last frame
+    uint64_t advance;   // cursor movement over the whole chunk
+    uint32_t lane;
+};
+
+// Plans the chunk at `frame`; false when a second break also lands inside it
+// (the chunk then steps frame by frame until the first break is behind it).
+inline bool PlanBreakChunk(const BreakWalker& w, uint32_t frame, uint64_t pos,
+                           uint64_t stepFx, const FxSteps8& fs,
+                           BreakChunk& bc) {
+    if (w.index + 1u < w.count && w.breaks[w.index + 1u].frame < frame + 8u)
+        return false;
+    bc.lane = w.next - frame;
+    bc.newStep = w.breaks[w.index].step;
+    bc.fsNew = MakeFxSteps8(bc.newStep);
+    bc.delta = static_cast<uint64_t>(bc.lane) * stepFx -
+               static_cast<uint64_t>(bc.lane) * bc.newStep;
+    bc.lastPos = pos + (bc.lane >= 7u ? fs.step7 : bc.delta + bc.fsNew.step7);
+    bc.advance = bc.delta + bc.fsNew.step8;
+    return true;
+}
+
+// Lane k <= lane sits at k * old, lane k > lane at lane * old + (k - lane) *
+// new = delta + k * new: exactly where per-frame steps would have put them.
+inline void FxChunkBreak(uint64_t pos, const FxSteps8& s, const BreakChunk& bc,
+                         __m256i& bases, __m256& weight) {
+    const __m256i p = _mm256_set1_epi64x(static_cast<long long>(pos));
+    const __m256i m = _mm256_set1_epi64x(static_cast<long long>(bc.lane));
+    const __m256i d = _mm256_set1_epi64x(static_cast<long long>(bc.delta));
+    const __m256i idxLo = _mm256_set_epi64x(5, 4, 1, 0);
+    const __m256i idxHi = _mm256_set_epi64x(7, 6, 3, 2);
+    const __m256i a = _mm256_blendv_epi8(
+        _mm256_add_epi64(p, s.lo),
+        _mm256_add_epi64(_mm256_add_epi64(p, bc.fsNew.lo), d),
+        _mm256_cmpgt_epi64(idxLo, m));
+    const __m256i b = _mm256_blendv_epi8(
+        _mm256_add_epi64(p, s.hi),
+        _mm256_add_epi64(_mm256_add_epi64(p, bc.fsNew.hi), d),
+        _mm256_cmpgt_epi64(idxHi, m));
+    FxUnpack(a, b, bases, weight);
 }
 
 // The eight scalar gains of a chunk as one vector.  They are produced by eight
@@ -962,6 +1041,16 @@ bool ValidateLoopVoice(const RenderSpanContext& c, uint32_t handle) {
         v.phaseIncs[handle] < v.relLoopEF[handle] - v.relLoopSF[handle];
 }
 
+// A loop voice the chunk templates would hand to a scalar fallback (invalid
+// loop bounds, or the recursive diffuse rotation) cannot take step breaks: the
+// class entry refuses, before touching anything, and the caller renders the
+// span in pieces instead.
+inline bool LoopVoiceTakesBreaks(const RenderSpanContext& c, uint32_t handle) {
+    if (!ValidateLoopVoice(c, handle)) return false;
+    const VoiceSoA& v = *c.voices;
+    return v.rot == nullptr || v.rot[handle].form != 1u;
+}
+
 // Sustained voice (constant gain), one voice for the whole span, 8 frames per
 // chunk.  Chunks run only while 8 frames remain, the vibrato window covers
 // them and the last read stays clear of the loop end (or of the sample end for
@@ -1010,20 +1099,33 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle,
     const __m256 gainLVector = _mm256_set1_ps(gainL);
     const __m256 gainRVector = _mm256_set1_ps(gainR);
     VibratoWindow vib;
-    (void)vib.Begin(c, v, handle, step, stepFx, fs);
+    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
     uint32_t& windowRemaining = vib.remaining;
+    BreakWalker bw(c, !lfoOn);
+    BreakChunk bc;
     uint32_t frame = 0u;
 
     while (frame < c.frameCount) {
         vib.Refill(c, v, handle, frame, step, stepFx, fs);
         if constexpr (Loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
-        const uint64_t lastPos = pos + fs.step7;
-        if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
+        if (bw.next <= frame) bw.Apply(frame, stepFx, fs);
+        uint64_t lastPos = pos + fs.step7;
+        uint64_t advance = fs.step8;
+        bool brk = false;
+        bool chunkOk = true;
+        if (bw.next - frame < 8u) {
+            brk = true;
+            chunkOk = PlanBreakChunk(bw, frame, pos, stepFx, fs, bc);
+            lastPos = bc.lastPos;
+            advance = bc.advance;
+        }
+        if (chunkOk && frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             lastPos < guard64) {
             PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
-            FxChunk(pos, fs, bases, fraction);
+            if (brk) FxChunkBreak(pos, fs, bc, bases, fraction);
+            else FxChunk(pos, fs, bases, fraction);
             __m256 sample = LerpGather8(region, readable, bases, fraction,
                                           phasefx::Index(pos),
                                           phasefx::Index(lastPos));
@@ -1034,7 +1136,12 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle,
                                        _mm256_loadu_ps(gainTable + frame));
             MixChunk8(outL + frame, outR + frame, sample, gainLVector,
                       gainRVector);
-            pos += fs.step8;
+            pos += advance;
+            if (brk) {
+                stepFx = bc.newStep;
+                fs = bc.fsNew;
+                bw.Take();
+            }
             frame += 8u;
             windowRemaining -= 8u;
             continue;
@@ -1045,7 +1152,7 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle,
             // voices only, since filter and rotation state advance per lane.
             if (!rot && v.filterEnabled[handle] == 0u &&
                 windowRemaining >= c.frameCount - frame &&
-                c.frameCount - frame < 8u) {
+                c.frameCount - frame < 8u && bw.next >= c.frameCount) {
                 const uint32_t rem = c.frameCount - frame;
                 const uint64_t lastLive = pos + stepFx * (rem - 1u);
                 if (lastLive < guard64) {
@@ -1154,7 +1261,7 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
         if (next >= v.relLoopE[handle]) next = v.relLoopS[handle];
         const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        const float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
+        float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
         bool finished = remaining == 0u;
         if (!finished) {
             gain *= decay;
@@ -1163,6 +1270,8 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
                 finished = remaining == 0u;
             }
         }
+        // The voice's own low-pass, as in every other release path.
+        sample = ProcessVoiceFilterSample(v, handle, sample);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
         pos = phasefx::Wrap(pos + step, loopS64, loopE64);
@@ -1249,6 +1358,8 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
     VibratoWindow vib;
     const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
     uint32_t& windowRemaining = vib.remaining;
+    BreakWalker bw(c, !lfoOn);
+    BreakChunk bc;
     // quality.fast_chunk_math: the gain ladder in closed form (loop voices).
     const bool fastMath = Loop && g_fastChunkMath && !lfoOn;
     __m256 decayLadder = _mm256_setzero_ps();
@@ -1293,13 +1404,24 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
         const bool thresholdSafe = remaining != UINT32_MAX ||
             ((fastMath || tabled) ? futureGain : gains[7]) >=
                 VoiceRetireThreshold();
-        const uint64_t lastPos = pos + fs.step7;
-        if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
+        if (bw.next <= frame) bw.Apply(frame, stepFx, fs);
+        uint64_t lastPos = pos + fs.step7;
+        uint64_t advance = fs.step8;
+        bool brk = false;
+        bool chunkOk = true;
+        if (bw.next - frame < 8u) {
+            brk = true;
+            chunkOk = PlanBreakChunk(bw, frame, pos, stepFx, fs, bc);
+            lastPos = bc.lastPos;
+            advance = bc.advance;
+        }
+        if (chunkOk && frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             countdownSafe && thresholdSafe && lastPos < guard64) {
             PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
-            FxChunk(pos, fs, bases, fraction);
+            if (brk) FxChunkBreak(pos, fs, bc, bases, fraction);
+            else FxChunk(pos, fs, bases, fraction);
             __m256 sample = LerpGather8(region, readable, bases, fraction,
                                           phasefx::Index(pos),
                                           phasefx::Index(lastPos));
@@ -1313,7 +1435,12 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
                       _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
             gain = futureGain;
             if (remaining != UINT32_MAX) remaining -= 8u;
-            pos += fs.step8;
+            pos += advance;
+            if (brk) {
+                stepFx = bc.newStep;
+                fs = bc.fsNew;
+                bw.Take();
+            }
             frame += 8u;
             windowRemaining -= 8u;
             continue;
@@ -1328,7 +1455,7 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
             // Rotation and filter state advance per lane in order, so voices
             // that carry either keep the per-frame remainder.
             if (!lfoOn && !rot && v.filterEnabled[handle] == 0u &&
-                c.frameCount - frame < 8u) {
+                c.frameCount - frame < 8u && bw.next >= c.frameCount) {
                 const uint32_t rem = c.frameCount - frame;
                 const uint64_t lastLive = pos + stepFx * (rem - 1u);
                 const float tailGain = fastMath ? gain * ladder[rem - 1u]
@@ -1480,8 +1607,12 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
         const __m256i loopEnd = _mm256_i32gather_epi32(
             reinterpret_cast<const int*>(v.relLoopE), h, 4);
         for (uint32_t frame = 0u; frame < c.frameCount; ++frame) {
-            const __m256 sample = LoopLerp8(c.sampleData, phaseIdx, phaseFrac, sampleStart,
+            __m256 sample = LoopLerp8(c.sampleData, phaseIdx, phaseFrac, sampleStart,
             loopStart, loopEnd);
+            // Same per-voice low-pass the chunk kernel and the scalar span
+            // apply; without it a filtered tail got unfiltered samples (and a
+            // stalled filter state) on every span of 1-4 frames.
+            sample = FilterVoices8AVX2(v, h, sample);
             gain = _mm256_mul_ps(gain, decay);
             const __m256 scaled = _mm256_mul_ps(sample, gain);
             sumsL[frame] = _mm256_add_ps(
@@ -1527,6 +1658,10 @@ void RenderReleaseFramesGrouped(const RenderSpanContext& c,
 bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
                            const uint32_t* handles,
                            uint32_t handleCount) {
+    // Step breaks (pitch bends inside the span) are for one voice at a time.
+    if (context.stepBreakCount != 0u &&
+        (handleCount != 1u || !LoopVoiceTakesBreaks(context, handles[0])))
+        return false;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     // Per-voice phase rotation: Hilbert-pair (form 2) voices ride the
     // time-chunked kernel below. Refuse (nothing mutated yet) for the
@@ -1640,6 +1775,8 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
     VibratoWindow vib;
     const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
     uint32_t& windowRemaining = vib.remaining;
+    BreakWalker bw(c, !lfoOn);
+    BreakChunk bc;
     const bool fastMath = Loop && g_fastChunkMath && !lfoOn;
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
@@ -1732,8 +1869,18 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
         // the sample end (base + 1 >= relEnd) nor the loop point
         // (next >= relLoopE) can be crossed inside the chunk, and both
         // gather indices stay inside the validated region.
-        const uint64_t lastPos = pos + fs.step7;
-        if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
+        if (bw.next <= frame) bw.Apply(frame, stepFx, fs);
+        uint64_t lastPos = pos + fs.step7;
+        uint64_t advance = fs.step8;
+        bool brk = false;
+        bool chunkOk = true;
+        if (bw.next - frame < 8u) {
+            brk = true;
+            chunkOk = PlanBreakChunk(bw, frame, pos, stepFx, fs, bc);
+            lastPos = bc.lastPos;
+            advance = bc.advance;
+        }
+        if (chunkOk && frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             futureStage == stage && lastPos < guard64) {
             // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
@@ -1741,7 +1888,8 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
             PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
-            FxChunk(pos, fs, bases, fraction);
+            if (brk) FxChunkBreak(pos, fs, bc, bases, fraction);
+            else FxChunk(pos, fs, bases, fraction);
             __m256 sample = LerpGather8(region, readable, bases, fraction,
                                           phasefx::Index(pos),
                                           phasefx::Index(lastPos));
@@ -1754,7 +1902,12 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
             stage = futureStage;
             attackRemaining = futureAttack;
             decayRemaining = futureDecay;
-            pos += fs.step8;
+            pos += advance;
+            if (brk) {
+                stepFx = bc.newStep;
+                fs = bc.fsNew;
+                bw.Take();
+            }
             frame += 8u;
             windowRemaining -= 8u;
             continue;
@@ -1976,6 +2129,10 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
 
                              const uint32_t* handles,
                              uint32_t handleCount) {
+    // Step breaks (pitch bends inside the span) are for one voice at a time.
+    if (context.stepBreakCount != 0u &&
+        (handleCount != 1u || !LoopVoiceTakesBreaks(context, handles[0])))
+        return false;
     if (handleCount == 0u) return true;
     if (context.frameCount == 0u || context.sampleData == nullptr) return false;
     // Per-voice phase rotation: form-2 voices take the time-chunked kernel;
@@ -2420,6 +2577,10 @@ void RenderReleaseFramesGrouped(const RenderSpanContext& c,
 bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                              const uint32_t* handles,
                              uint32_t handleCount) {
+    // Step breaks (pitch bends inside the span) are for one voice at a time.
+    if (context.stepBreakCount != 0u &&
+        (handleCount != 1u || !LoopVoiceTakesBreaks(context, handles[0])))
+        return false;
     VoiceSoA& v = *context.voices;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     // Per-voice phase rotation: spans of 8+ frames take the time-chunked
@@ -2947,6 +3108,8 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
 bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
                                 const uint32_t* handles,
                                 uint32_t handleCount) {
+    // Step breaks (pitch bends inside the span) are for one voice at a time.
+    if (context.stepBreakCount != 0u && handleCount != 1u) return false;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     if (context.voices->rot != nullptr) return false;
     VoiceSoA& v = *context.voices;
@@ -2989,6 +3152,8 @@ bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
 bool RenderSustainedOneShotAVX2(const RenderSpanContext& context,
                                 const uint32_t* handles,
                                 uint32_t handleCount) {
+    // Step breaks (pitch bends inside the span) are for one voice at a time.
+    if (context.stepBreakCount != 0u && handleCount != 1u) return false;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     // Rotation voices render through the rotation-hooked scalar spans.
     if (context.voices->rot != nullptr) return false;
@@ -3035,6 +3200,8 @@ bool RenderSustainedOneShotAVX2(const RenderSpanContext& context,
 bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
                               const uint32_t* handles,
                               uint32_t handleCount) {
+    // Step breaks (pitch bends inside the span) are for one voice at a time.
+    if (context.stepBreakCount != 0u && handleCount != 1u) return false;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     if (context.voices->rot != nullptr) return false;
     VoiceSoA& v = *context.voices;
