@@ -2670,9 +2670,9 @@ void TestLaunchStagingAutoByPoolSize() {
 }
 
 // Bulk block admission (voices.bulk_admission_percent).  The pure filter keeps
-// the budgeted number of note-on units ranked by velocity (ties to the later
-// event), changes nothing else about the stream, and does nothing when the
-// block fits; and RenderBlock with the feature on must equal RenderBlock fed
+// the budgeted number of note-on units ranked by velocity (the notes at the cut
+// velocity thinned evenly along the block), changes nothing else about the
+// stream, and does nothing when the block fits; and RenderBlock with the feature on must equal RenderBlock fed
 // the filtered stream with the feature off, bit for bit.
 void TestBulkAdmission() {
     using svms::RenderEvent;
@@ -2742,24 +2742,39 @@ void TestBulkAdmission() {
                 highestDropped = (std::max)(highestDropped, int(stream[i].data2));
             }
         }
-        uint32_t latestDroppedAtCut = 0u, earliestKeptAtCut = UINT32_MAX;
-        for (size_t i = 0u; i < stream.size(); ++i) {
-            if (stream[i].type != RenderEventType::NoteOn ||
-                int(stream[i].data2) != lowestKept)
-                continue;
-            if (isKept[i])
-                earliestKeptAtCut = (std::min)(earliestKeptAtCut, uint32_t(i));
-            else
-                latestDroppedAtCut = (std::max)(latestDroppedAtCut, uint32_t(i));
+        // Notes at the cut velocity are thinned evenly: at every point of the
+        // block the kept share is within one note of the ideal share.  (Keeping
+        // the late ones instead started every kept note near the end of its
+        // block and made the block rate audible as a buzz.)
+        bool evenTies = true;
+        if (highestDropped == lowestKept) {
+            uint32_t tieTotal = 0u, tieKept = 0u;
+            for (size_t i = 0u; i < stream.size(); ++i) {
+                if (stream[i].type != RenderEventType::NoteOn ||
+                    int(stream[i].data2) != lowestKept)
+                    continue;
+                ++tieTotal;
+                tieKept += isKept[i] ? 1u : 0u;
+            }
+            uint32_t seen = 0u, keptSoFar = 0u;
+            for (size_t i = 0u; i < stream.size(); ++i) {
+                if (stream[i].type != RenderEventType::NoteOn ||
+                    int(stream[i].data2) != lowestKept)
+                    continue;
+                ++seen;
+                keptSoFar += isKept[i] ? 1u : 0u;
+                const double ideal = double(seen) * tieKept / tieTotal;
+                if (std::abs(double(keptSoFar) - ideal) >= 1.0001)
+                    evenTies = false;
+            }
         }
         Check(at == kept.size() && keptNoteOns == budget &&
                   otherKept == otherEvents,
               "bulk admission: order kept, every other event kept");
         Check(highestDropped <= lowestKept,
               "bulk admission: nothing dropped outranks anything kept");
-        Check(highestDropped < lowestKept ||
-                  latestDroppedAtCut < earliestKeptAtCut,
-              "bulk admission: ties go to the later note");
+        Check(evenTies,
+              "bulk admission: ties are thinned evenly along the block");
     }
     {   // A merged note-on counts for its units and is kept or dropped whole.
         std::vector<RenderEvent> merged = {

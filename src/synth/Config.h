@@ -157,7 +157,8 @@ struct EngineConfig {
     bool launchStagingAuto;
     // Experimental bulk block admission: a block carrying more note-ons than
     // this percentage of the voice limit keeps only the loudest (by velocity,
-    // ties to the later note) and never launches the rest. 0 = off (default),
+    // the ones at the cut thinned evenly along the block) and never
+    // launches the rest. 0 = off (default),
     // so every note-on is launched and stolen in order as before.
     uint32_t bulkAdmissionPercent;
     // Experimental: bucketed steal index (O(1) updates; the victim is taken

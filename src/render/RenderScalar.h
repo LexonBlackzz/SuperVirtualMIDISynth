@@ -886,8 +886,8 @@ public:
     // list before the plan sees them, exactly as if they had been launched and
     // stolen before they rendered (their note-offs then pair with the oldest
     // older generation on the key, as for any stolen note).  Ranking is by
-    // velocity, ties to the later event.  Event frames of the notes that stay
-    // are untouched.
+    // velocity; the notes at the cut velocity are thinned evenly along the
+    // block.  Event frames of the notes that stay are untouched.
     void SetBulkAdmissionPercent(uint32_t percent) {
         bulkAdmissionPercent_.store(percent, std::memory_order_relaxed);
     }

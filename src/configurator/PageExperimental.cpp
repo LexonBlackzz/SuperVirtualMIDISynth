@@ -42,7 +42,7 @@ void PlaybackCard(ConfigDocument& doc) {
     {
         static const char* labels[5] = {"Off", "100%", "200%", "400%", "800%"};
         ui::BeginRow("bulkAdmission", "Bulk note admission",
-                     "When a block carries more new notes than this share of the voice limit, only the loudest are started (by velocity, ties to the later note) and the rest never launch. The notes that stay keep their exact timing. It makes extreme black MIDIs far lighter, but it changes the sound: the many short, quickly stolen notes are where the bright noise lives, so lower budgets sound darker and fuller in the lows. 100% is the strongest, 800% is close to unchanged, Off keeps every note.",
+                     "When a block carries more new notes than this share of the voice limit, only the loudest are started (by velocity, the ones at the cut spread evenly along the block) and the rest never launch. The notes that stay keep their exact timing. It makes extreme black MIDIs far lighter, but it changes the sound: the many short, quickly stolen notes are where the bright noise lives, so lower budgets sound darker and fuller in the lows. 100% is the strongest, 800% is close to unchanged, Off keeps every note.",
                      ui::SegmentedSize(labels, 5));
         int idx = NearestBudgetStep(w.bulkAdmissionPercent);
         if (ui::Segmented("##bulkadmission", &idx, labels, 5)) {

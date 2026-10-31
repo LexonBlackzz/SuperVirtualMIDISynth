@@ -187,10 +187,13 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
 }
 
 // Keep the `budgetUnits` highest-ranked note-on units of a block (rank:
-// velocity, then the later event), drop the rest.  A velocity histogram finds
-// the cut in one pass, so a block of a quarter million note-ons costs a few
-// passes over its events, not a sort.  A merged note-on counts for its
-// `count` units and is kept or dropped whole.
+// velocity), drop the rest.  A velocity histogram finds the cut in one pass, so
+// a block of a quarter million note-ons costs a few passes over its events, not
+// a sort.  Of the notes at exactly the cut velocity only part fit; they are
+// thinned evenly along the block (an error-diffusion walk over those events),
+// never earliest-first: keeping the late ones would start every kept note near
+// the end of its block and turn the block rate into an audible buzz.  A merged
+// note-on counts for its `count` units and is kept or dropped whole.
 inline uint32_t RenderScalar::BulkAdmissionFilter(
     const RenderEvent* events, uint32_t count, uint32_t budgetUnits,
     std::vector<RenderEvent>& out) {
@@ -211,8 +214,9 @@ inline uint32_t RenderScalar::BulkAdmissionFilter(
         if (kept + units[cutVelocity] > budgetUnits) break;
         kept += units[cutVelocity];
     }
-    // At the cut velocity the earliest events go first.
-    uint64_t dropTies = units[cutVelocity] - (budgetUnits - kept);
+    const uint64_t tieUnits = units[cutVelocity];
+    const uint64_t tieKeep = budgetUnits - kept;   // < tieUnits
+    uint64_t tieSeen = 0u, tieKept = 0u;
     out.clear();
     out.reserve(count);
     uint32_t dropped = 0u;
@@ -222,11 +226,15 @@ inline uint32_t RenderScalar::BulkAdmissionFilter(
             const int velocity = static_cast<int>(e.data2 & 127u);
             const uint32_t u = e.count > 1u ? e.count : 1u;
             bool drop = velocity < cutVelocity;
-            if (velocity == cutVelocity && dropTies >= u) {
-                drop = true;
-                dropTies -= u;
-            } else if (velocity == cutVelocity) {
-                dropTies = 0u;
+            if (velocity == cutVelocity) {
+                tieSeen += u;
+                // Units that should be kept by now, spread evenly.
+                const uint64_t due = tieSeen * tieKeep / tieUnits;
+                if (tieKept < due && tieKept + u <= tieKeep) {
+                    tieKept += u;
+                } else {
+                    drop = true;
+                }
             }
             if (drop) { dropped += u; continue; }
         }
