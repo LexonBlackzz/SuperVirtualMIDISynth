@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstring>
 #include <immintrin.h>
+#include <vector>
 
 #if defined(_MSC_VER)
 #define SVMS_K_FORCEINLINE __forceinline
@@ -968,8 +969,13 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
 //   OneShot: retires at the first frame whose lerp partner would read past
 //            the sample, before the envelope consumes that frame (mirrors the
 //            generic state machine's sampleEnded branch).
+//   gainTable: optional exact gain table of this voice (see
+//            ReleaseGainTables8); entry f is the gain after f + 1 steps of the
+//            release recurrence, so a chunk reads its eight gains instead of
+//            running the serial multiply chain itself.
 template <bool Loop>
-uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
+uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
+                              const float* gainTable = nullptr) {
     VoiceSoA& v = *c.voices;
     // Form-1 (diffuse) rotation never reaches here: the class kernel refuses
     // before any state is touched.
@@ -1020,6 +1026,7 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
         decayLadder = _mm256_load_ps(ladder);
         decay8 = ladder[7];
     }
+    const bool tabled = gainTable != nullptr && !fastMath;
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
     while (frame < c.frameCount) {
@@ -1027,8 +1034,12 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
         if constexpr (Loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
         float futureGain = gain;
         alignas(32) float gains[8];
+        __m256 tableGains = _mm256_setzero_ps();
         if (fastMath) {
             futureGain = gain * decay8;
+        } else if (tabled) {
+            tableGains = _mm256_loadu_ps(gainTable + frame);
+            futureGain = gainTable[frame + 7u];
         } else {
             for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
                 futureGain *= decay;
@@ -1037,7 +1048,8 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
         }
         const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
         const bool thresholdSafe = remaining != UINT32_MAX ||
-            (fastMath ? futureGain : gains[7]) >= VoiceRetireThreshold();
+            ((fastMath || tabled) ? futureGain : gains[7]) >=
+                VoiceRetireThreshold();
         const uint64_t lastPos = pos + fs.step7;
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             countdownSafe && thresholdSafe && lastPos < guard64) {
@@ -1050,7 +1062,7 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 gainVector = fastMath
                 ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
-                : Gains8(gains);
+                : (tabled ? tableGains : Gains8(gains));
             MixChunk8(outL + frame, outR + frame,
                       _mm256_mul_ps(sample, gainVector),
                       _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
@@ -1075,7 +1087,7 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
                 const uint32_t rem = c.frameCount - frame;
                 const uint64_t lastLive = pos + stepFx * (rem - 1u);
                 const float tailGain = fastMath ? gain * ladder[rem - 1u]
-                                                : gains[rem - 1u];
+                    : (tabled ? gainTable[frame + rem - 1u] : gains[rem - 1u]);
                 if ((remaining == UINT32_MAX || remaining > rem) &&
                     (remaining != UINT32_MAX ||
                      tailGain >= VoiceRetireThreshold()) &&
@@ -1095,7 +1107,7 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
                     sample = FilterTime8AVX2(v, handle, sample);
                     const __m256 gainVector = fastMath
                         ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
-                        : Gains8(gains);
+                        : (tabled ? tableGains : Gains8(gains));
                     MixChunk8Masked(outL + frame, outR + frame, liveMask,
                                     _mm256_mul_ps(sample, gainVector),
                                     _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
@@ -1156,8 +1168,9 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
 }
 
 uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
-                                     uint32_t handle) {
-    return RenderReleaseChunked<true>(c, handle);
+                                     uint32_t handle,
+                                     const float* gainTable = nullptr) {
+    return RenderReleaseChunked<true>(c, handle, gainTable);
 }
 
 // Voice-batched release for spans of 1-4 frames: eight voices per vector,
@@ -1778,6 +1791,40 @@ inline void Transpose8x8Ps(__m256* r) {
     r[7] = _mm256_permute2f128_ps(u3, u7, 0x31);
 }
 
+// Exact release-gain tables for eight voices at once.  A voice's gain chain
+// (gain *= decay, once per frame) is a latency-bound dependency, so one voice
+// alone leaves the multiplier idle most of the time.  The chains of eight
+// different voices are independent: lane k of the vector multiply is the same
+// single-precision multiply the scalar recurrence does, in the same order, so
+// every table entry is bit-identical to the scalar chain.  Entry f of voice k
+// (table + k * stride) is the gain after f + 1 steps; stride must be at least
+// ReleaseGainStride(frames).
+inline uint32_t ReleaseGainStride(uint32_t frames) {
+    // The chunk kernel reads eight gains ahead of the frame it is on, so the
+    // table runs up to seven frames past the span.
+    return ((frames + 15u) / 8u) * 8u;
+}
+
+void ReleaseGainTables8(const VoiceSoA& v, const uint32_t* hs,
+                        uint32_t frames, float* table) {
+    const uint32_t stride = ReleaseGainStride(frames);
+    const __m256i h = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(hs));
+    __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
+    const __m256 decay = _mm256_i32gather_ps(v.releaseDecay, h, 4);
+    for (uint32_t block = 0u; block < stride; block += 8u) {
+        __m256 rows[8];
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            gain = _mm256_mul_ps(gain, decay);
+            rows[k] = gain;
+        }
+        Transpose8x8Ps(rows);  // rows[k] = eight consecutive gains of voice k
+        for (uint32_t k = 0u; k < 8u; ++k)
+            _mm256_storeu_ps(table + static_cast<size_t>(k) * stride + block,
+                             rows[k]);
+    }
+}
+
 // True when RenderSustainedLoopFramesAVX2 would run this voice through its
 // filtered time-chunk path (no rotation: the caller excludes v.rot).
 inline bool FilteredGroupEligible(const RenderSpanContext& c, uint32_t h) {
@@ -2068,16 +2115,31 @@ void RenderReleaseFilteredGroupAVX2(const RenderSpanContext& c,
 void RenderReleaseFramesGrouped(const RenderSpanContext& c,
                                 const uint32_t* handles, uint32_t count) {
     VoiceSoA& v = *c.voices;
+    // Gain tables for the current and the previous block of eight handles.
+    // A pending filtered run is shorter than eight, so it never reaches back
+    // past the previous block.
+    static thread_local std::vector<float> tableStore[2];
+    uint32_t tableBlock[2] = {UINT32_MAX, UINT32_MAX};
+    const uint32_t stride = ReleaseGainStride(c.frameCount);
+    const bool tables = !g_fastChunkMath;
     uint32_t pending[8];
+    uint32_t pendingPosition[8];
     uint32_t pendingCount = 0u;
-    auto perVoice = [&](uint32_t handle) {
+    auto tableFor = [&](uint32_t position) -> const float* {
+        const uint32_t block = position / 8u;
+        if (tableBlock[block & 1u] != block) return nullptr;
+        return tableStore[block & 1u].data() +
+            static_cast<size_t>(position % 8u) * stride;
+    };
+    auto perVoice = [&](uint32_t handle, uint32_t position) {
         uint32_t retiredAt;
+        const float* table = tableFor(position);
         if (c.channelBusLeft == nullptr) {
-            retiredAt = RenderReleaseLoopFramesAVX2(c, handle);  // no copy
+            retiredAt = RenderReleaseLoopFramesAVX2(c, handle, table);  // no copy
         } else {
             const RenderSpanContext vc = SelectVoiceDestination(
                 c, v.channel[handle]);
-            retiredAt = RenderReleaseLoopFramesAVX2(vc, handle);
+            retiredAt = RenderReleaseLoopFramesAVX2(vc, handle, table);
         }
         if (retiredAt != UINT32_MAX) RecordRetirement(c, handle, retiredAt);
     };
@@ -2089,20 +2151,29 @@ void RenderReleaseFramesGrouped(const RenderSpanContext& c,
                 if (retiredAt[k] != UINT32_MAX)
                     RecordRetirement(c, pending[k], retiredAt[k]);
         } else {
-            for (uint32_t k = 0u; k < pendingCount; ++k) perVoice(pending[k]);
+            for (uint32_t k = 0u; k < pendingCount; ++k)
+                perVoice(pending[k], pendingPosition[k]);
         }
         pendingCount = 0u;
     };
     for (uint32_t i = 0u; i < count; ++i) {
         const uint32_t handle = handles[i];
+        if (tables && i % 8u == 0u && i + 8u <= count) {
+            std::vector<float>& store = tableStore[(i / 8u) & 1u];
+            if (store.size() < static_cast<size_t>(8u) * stride)
+                store.resize(static_cast<size_t>(8u) * stride);
+            ReleaseGainTables8(v, handles + i, c.frameCount, store.data());
+            tableBlock[(i / 8u) & 1u] = i / 8u;
+        }
         if (g_filteredGroupsEnabled && c.frameCount >= 8u &&
             FilteredReleaseGroupEligible(c, handle)) {
+            pendingPosition[pendingCount] = i;
             pending[pendingCount++] = handle;
             if (pendingCount == 8u) flush();
             continue;
         }
         flush();
-        perVoice(handle);
+        perVoice(handle, i);
     }
     flush();
 }

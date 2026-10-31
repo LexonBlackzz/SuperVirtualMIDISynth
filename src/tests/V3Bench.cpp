@@ -289,6 +289,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.cullMutedBlocks = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--no-filter-groups") == 0) {
             svms::SetFilteredGroupKernelForTest(false);
+        } else if (std::strcmp(argv[i], "--fast-chunk-math") == 0) {
+            svms::SetFastChunkMath(true);
         } else if (std::strcmp(argv[i], "--filter-cents") == 0 && i + 1 < argc) {
             gBenchFilterCents = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--velocity-spread") == 0) {
