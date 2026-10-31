@@ -569,6 +569,75 @@ void RecordRetirement(const RenderSpanContext& c, uint32_t handle,
     }
 }
 
+// One sequential chunk fetch: lerp of the pair-word gather (the sample's
+// neighbours are one word apart, so a single gather yields both).
+SVMS_K_FORCEINLINE __m256 LerpGather8(const int16_t* region, uint32_t readable,
+                                      __m256i bases, __m256 fraction) {
+    __m256 first, second;
+    GatherSamplePairSeqAVX2(region, readable, bases, first, second);
+    return _mm256_add_ps(first,
+        _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+}
+
+// Warm the next chunk's sample lines: reads are sequential per voice, so one
+// prefetch per chunk hides most of the gather's memory latency at ~0.1 cycles
+// per frame.
+SVMS_K_FORCEINLINE void PrefetchNext(const int16_t* region, uint64_t nextPos) {
+    _mm_prefetch(reinterpret_cast<const char*>(
+                     region + phasefx::Index(nextPos)),
+                 _MM_HINT_T0);
+}
+
+// out += sample * gain for eight frames of both channels.
+SVMS_K_FORCEINLINE void MixChunk8(float* outL, float* outR, __m256 sample,
+                                  __m256 gainL, __m256 gainR) {
+    _mm256_storeu_ps(outL, _mm256_add_ps(_mm256_loadu_ps(outL),
+        _mm256_mul_ps(sample, gainL)));
+    _mm256_storeu_ps(outR, _mm256_add_ps(_mm256_loadu_ps(outR),
+        _mm256_mul_ps(sample, gainR)));
+}
+SVMS_K_FORCEINLINE void MixChunk8Masked(float* outL, float* outR,
+                                        __m256i mask, __m256 sample,
+                                        __m256 gainL, __m256 gainR) {
+    _mm256_maskstore_ps(outL, mask, _mm256_add_ps(
+        _mm256_maskload_ps(outL, mask), _mm256_mul_ps(sample, gainL)));
+    _mm256_maskstore_ps(outR, mask, _mm256_add_ps(
+        _mm256_maskload_ps(outR, mask), _mm256_mul_ps(sample, gainR)));
+}
+
+// Whole-voice vibrato: the 64-frame LFO control window is rebuilt whenever it
+// runs out, and the fast-chunk gate keeps a chunk from straddling a window
+// boundary.  remaining = UINT32_MAX means the LFO is off (scalar/SSE2 windows
+// are handled by the renderer, not the kernel).
+struct VibratoWindow {
+    uint32_t remaining = UINT32_MAX;
+
+    bool Begin(const RenderSpanContext& c, VoiceSoA& v, uint32_t handle,
+               float& step, uint64_t& stepFx, FxSteps8& fs) {
+        const bool on = c.lfoActive != 0u &&
+            v.vibLfoSteps[handle] != 0.0f &&
+            v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
+        if (on) {
+            step = AdvanceVibratoLfoWindow(v, handle,
+                (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
+            stepFx = phasefx::FromFloat(step);
+            fs = MakeFxSteps8(stepFx);
+            remaining = (std::min)(64u, c.frameCount);
+        }
+        return on;
+    }
+    void Refill(const RenderSpanContext& c, VoiceSoA& v, uint32_t handle,
+                uint32_t frame, float& step, uint64_t& stepFx, FxSteps8& fs) {
+        if (remaining != 0u) return;
+        const uint32_t win = (std::min)(64u, c.frameCount - frame);
+        step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
+                                       c.lfoBendRatio);
+        stepFx = phasefx::FromFloat(step);
+        fs = MakeFxSteps8(stepFx);
+        remaining = win;
+    }
+};
+
 // Hilbert-pair (form 2) rotation for the time-chunked kernels. Init binds a
 // voice; Chunk rotates eight consecutive frames, Scalar rotates one (the
 // scalar tails), Store writes the angle back. Static angles (dc=1, ds=0) are
@@ -717,28 +786,13 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
     // the loop top; the gate keeps fast chunks from straddling a window
     // boundary.  UINT32_MAX = LFO off (scalar/SSE2 windows are handled by
     // the renderer, not the kernel).
-    const bool lfoOn = c.lfoActive != 0u &&
-        v.vibLfoSteps[handle] != 0.0f &&
-        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
-    uint32_t windowRemaining = UINT32_MAX;
-    if (lfoOn) {
-        step = AdvanceVibratoLfoWindow(v, handle,
-            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepFx = phasefx::FromFloat(step);
-        fs = MakeFxSteps8(stepFx);
-        windowRemaining = (std::min)(64u, c.frameCount);
-    }
+    VibratoWindow vib;
+    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
+    uint32_t& windowRemaining = vib.remaining;
     uint32_t frame = 0u;
 
     while (frame < c.frameCount) {
-        if (windowRemaining == 0u) {
-            const uint32_t win = (std::min)(64u, c.frameCount - frame);
-            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
-                                           c.lfoBendRatio);
-            stepFx = phasefx::FromFloat(step);
-            fs = MakeFxSteps8(stepFx);
-            windowRemaining = win;
-        }
+        vib.Refill(c, v, handle, frame, step, stepFx, fs);
         pos = phasefx::Wrap(pos, loopS64, loopE64);
         const uint64_t lastPos = pos + fs.step7;
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
@@ -746,24 +800,14 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
             // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
-            _mm_prefetch(reinterpret_cast<const char*>(
-                             region + phasefx::Index(lastPos + stepFx)),
-                         _MM_HINT_T0);
+            PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 first, second;
-            GatherSamplePairSeqAVX2(region, readable, bases, first, second);
-            __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = LerpGather8(region, readable, bases, fraction);
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
-            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outL + frame),
-                _mm256_mul_ps(sample, gainLVector)));
-            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outR + frame),
-                _mm256_mul_ps(sample, gainRVector)));
+            MixChunk8(outL + frame, outR + frame, sample, gainLVector, gainRVector);
             pos += fs.step8;
             frame += 8u;
             windowRemaining -= 8u;
@@ -786,17 +830,8 @@ uint32_t RenderSustainedLoopFramesAVX2(const RenderSpanContext& c,
                 // Dead lanes may sit past the loop; keep their reads in range.
                 bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
                     static_cast<int>(phasefx::Index(lastLive))));
-                __m256 first, second;
-                GatherSamplePairSeqAVX2(region, readable, bases, first,
-                                        second);
-                const __m256 sample = _mm256_add_ps(first,
-                    _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
-                _mm256_maskstore_ps(outL + frame, liveMask, _mm256_add_ps(
-                    _mm256_maskload_ps(outL + frame, liveMask),
-                    _mm256_mul_ps(sample, gainLVector)));
-                _mm256_maskstore_ps(outR + frame, liveMask, _mm256_add_ps(
-                    _mm256_maskload_ps(outR + frame, liveMask),
-                    _mm256_mul_ps(sample, gainRVector)));
+                const __m256 sample = LerpGather8(region, readable, bases, fraction);
+                MixChunk8Masked(outL + frame, outR + frame, liveMask, sample, gainLVector, gainRVector);
                 pos += stepFx * rem;
                 frame += rem;
                 if (windowRemaining != UINT32_MAX) windowRemaining -= rem;
@@ -912,17 +947,9 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     FxSteps8 fs = MakeFxSteps8(stepFx);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
-    const bool lfoOn = c.lfoActive != 0u &&
-        v.vibLfoSteps[handle] != 0.0f &&
-        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
-    uint32_t windowRemaining = UINT32_MAX;
-    if (lfoOn) {
-        step = AdvanceVibratoLfoWindow(v, handle,
-            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepFx = phasefx::FromFloat(step);
-        fs = MakeFxSteps8(stepFx);
-        windowRemaining = (std::min)(64u, c.frameCount);
-    }
+    VibratoWindow vib;
+    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
+    uint32_t& windowRemaining = vib.remaining;
     // quality.fast_chunk_math: the gain ladder in closed form.
     const bool fastMath = g_fastChunkMath && !lfoOn;
     __m256 decayLadder = _mm256_setzero_ps();
@@ -946,14 +973,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
     while (frame < c.frameCount) {
-        if (windowRemaining == 0u) {
-            const uint32_t win = (std::min)(64u, c.frameCount - frame);
-            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
-                                           c.lfoBendRatio);
-            stepFx = phasefx::FromFloat(step);
-            fs = MakeFxSteps8(stepFx);
-            windowRemaining = win;
-        }
+        vib.Refill(c, v, handle, frame, step, stepFx, fs);
         pos = phasefx::Wrap(pos, loopS64, loopE64);
         float futureGain = gain;
         alignas(32) float gains[8];
@@ -974,28 +994,18 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
             // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
-            _mm_prefetch(reinterpret_cast<const char*>(
-                             region + phasefx::Index(lastPos + stepFx)),
-                         _MM_HINT_T0);
+            PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 first, second;
-            GatherSamplePairSeqAVX2(region, readable, bases, first, second);
-            __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = LerpGather8(region, readable, bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 gainVector = fastMath
                 ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
                 : Gains8(gains);
             const __m256 scaled = _mm256_mul_ps(sample, gainVector);
-            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outL + frame),
-                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
-            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outR + frame),
-                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+            MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
             gain = futureGain;
             if (remaining != UINT32_MAX) remaining -= 8u;
             pos += fs.step8;
@@ -1030,23 +1040,14 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
                 // Dead lanes may sit past the loop; keep their reads in range.
                 bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
                     static_cast<int>(phasefx::Index(lastLive))));
-                __m256 first, second;
-                GatherSamplePairSeqAVX2(region, readable, bases, first,
-                                        second);
-                __m256 sample = _mm256_add_ps(first,
-                    _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+                __m256 sample = LerpGather8(region, readable, bases, fraction);
                 sample = FilterTime8AVX2(v, handle, sample);
                 if (rot) sample = rot.Chunk(sample, bases, fraction);
                 const __m256 gainVector = fastMath
                     ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
                     : Gains8(gains);
                 const __m256 scaled = _mm256_mul_ps(sample, gainVector);
-                _mm256_maskstore_ps(outL + frame, liveMask, _mm256_add_ps(
-                    _mm256_maskload_ps(outL + frame, liveMask),
-                    _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
-                _mm256_maskstore_ps(outR + frame, liveMask, _mm256_add_ps(
-                    _mm256_maskload_ps(outR + frame, liveMask),
-                    _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+                MixChunk8Masked(outL + frame, outR + frame, liveMask, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
                 gain = tailGain;
                 if (remaining != UINT32_MAX) remaining -= rem;
                 pos += stepFx * rem;
@@ -1296,28 +1297,13 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     float* outR = c.outputRight + c.frameStart;
     FxSteps8 fs = MakeFxSteps8(stepFx);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
-    const bool lfoOn = c.lfoActive != 0u &&
-        v.vibLfoSteps[handle] != 0.0f &&
-        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
-    uint32_t windowRemaining = UINT32_MAX;
-    if (lfoOn) {
-        step = AdvanceVibratoLfoWindow(v, handle,
-            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepFx = phasefx::FromFloat(step);
-        fs = MakeFxSteps8(stepFx);
-        windowRemaining = (std::min)(64u, c.frameCount);
-    }
+    VibratoWindow vib;
+    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
+    uint32_t& windowRemaining = vib.remaining;
     const bool fastMath = g_fastChunkMath && !lfoOn;
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
-        if (windowRemaining == 0u) {
-            const uint32_t win = (std::min)(64u, c.frameCount - frame);
-            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
-                                           c.lfoBendRatio);
-            stepFx = phasefx::FromFloat(step);
-            fs = MakeFxSteps8(stepFx);
-            windowRemaining = win;
-        }
+        vib.Refill(c, v, handle, frame, step, stepFx, fs);
         pos = phasefx::Wrap(pos, loopS64, loopE64);
         // Simulate the exact scalar envelope recurrence eight steps ahead.
         // The clamps are part of the simulated sequence, so gains[] is
@@ -1399,25 +1385,15 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
             // Warm the next chunk's sample lines: reads are sequential per
             // voice, so one prefetch per chunk hides most of the gather's
             // memory latency at ~0.1 cycles per frame.
-            _mm_prefetch(reinterpret_cast<const char*>(
-                             region + phasefx::Index(lastPos + stepFx)),
-                         _MM_HINT_T0);
+            PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 first, second;
-            GatherSamplePairSeqAVX2(region, readable, bases, first, second);
-            __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = LerpGather8(region, readable, bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
-            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outL + frame),
-                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
-            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outR + frame),
-                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+            MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
             gain = futureGain;
             stage = futureStage;
             attackRemaining = futureAttack;
@@ -2730,50 +2706,23 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
     // every lane, i.e. pos + 7*step < (relEnd - 1).0.
     const uint64_t lastSafePos = phasefx::Pack(relEnd - 1u, 0u);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
-    const bool lfoOn = c.lfoActive != 0u &&
-        v.vibLfoSteps[handle] != 0.0f &&
-        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
-    uint32_t windowRemaining = UINT32_MAX;
-    if (lfoOn) {
-        step = AdvanceVibratoLfoWindow(v, handle,
-            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepFx = phasefx::FromFloat(step);
-        fs = MakeFxSteps8(stepFx);
-        windowRemaining = (std::min)(64u, c.frameCount);
-    }
+    VibratoWindow vib;
+    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
+    uint32_t& windowRemaining = vib.remaining;
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
-        if (windowRemaining == 0u) {
-            const uint32_t win = (std::min)(64u, c.frameCount - frame);
-            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
-                                           c.lfoBendRatio);
-            stepFx = phasefx::FromFloat(step);
-            fs = MakeFxSteps8(stepFx);
-            windowRemaining = win;
-        }
+        vib.Refill(c, v, handle, frame, step, stepFx, fs);
         const uint64_t lastPos = pos + fs.step7;
         if (frame + 8u <= c.frameCount &&
             windowRemaining >= 8u && lastPos < lastSafePos) {
             // Warm the next chunk's sample lines (sequential per voice).
-            _mm_prefetch(reinterpret_cast<const char*>(
-                             region + phasefx::Index(lastPos + stepFx)),
-                         _MM_HINT_T0);
+            PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 first, second;
-            GatherSamplePairSeqAVX2(region,
-                c.sampleDataFrames - v.sampleStart[handle], bases, first,
-                second);
-            __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = LerpGather8(region, c.sampleDataFrames - v.sampleStart[handle], bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
-            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outL + frame),
-                _mm256_mul_ps(sample, gainLVector)));
-            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outR + frame),
-                _mm256_mul_ps(sample, gainRVector)));
+            MixChunk8(outL + frame, outR + frame, sample, gainLVector, gainRVector);
             pos += fs.step8;
             frame += 8u;
             windowRemaining -= 8u;
@@ -2819,27 +2768,12 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
     FxSteps8 fs = MakeFxSteps8(stepFx);
     const uint64_t lastSafePos = phasefx::Pack(relEnd - 1u, 0u);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
-    const bool lfoOn = c.lfoActive != 0u &&
-        v.vibLfoSteps[handle] != 0.0f &&
-        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
-    uint32_t windowRemaining = UINT32_MAX;
-    if (lfoOn) {
-        step = AdvanceVibratoLfoWindow(v, handle,
-            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepFx = phasefx::FromFloat(step);
-        fs = MakeFxSteps8(stepFx);
-        windowRemaining = (std::min)(64u, c.frameCount);
-    }
+    VibratoWindow vib;
+    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
+    uint32_t& windowRemaining = vib.remaining;
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
-        if (windowRemaining == 0u) {
-            const uint32_t win = (std::min)(64u, c.frameCount - frame);
-            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
-                                           c.lfoBendRatio);
-            stepFx = phasefx::FromFloat(step);
-            fs = MakeFxSteps8(stepFx);
-            windowRemaining = win;
-        }
+        vib.Refill(c, v, handle, frame, step, stepFx, fs);
         float futureGain = gain;
         alignas(32) float gains[8];
         for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
@@ -2853,26 +2787,14 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
         if (frame + 8u <= c.frameCount &&
             windowRemaining >= 8u && countdownSafe &&
             thresholdSafe && lastPos < lastSafePos) {
-            _mm_prefetch(reinterpret_cast<const char*>(
-                             region + phasefx::Index(lastPos + stepFx)),
-                         _MM_HINT_T0);
+            PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 first, second;
-            GatherSamplePairSeqAVX2(region,
-                c.sampleDataFrames - v.sampleStart[handle], bases, first,
-                second);
-            __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = LerpGather8(region, c.sampleDataFrames - v.sampleStart[handle], bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
             const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
-            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outL + frame),
-                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
-            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outR + frame),
-                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+            MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
             gain = futureGain;
             if (remaining != UINT32_MAX) remaining -= 8u;
             pos += fs.step8;
@@ -2950,27 +2872,12 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
     FxSteps8 fs = MakeFxSteps8(stepFx);
     const uint64_t lastSafePos = phasefx::Pack(relEnd - 1u, 0u);
     // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
-    const bool lfoOn = c.lfoActive != 0u &&
-        v.vibLfoSteps[handle] != 0.0f &&
-        v.vibLfoToPitchCents[handle] > 0.0f && c.lfoDepth > 0.0f;
-    uint32_t windowRemaining = UINT32_MAX;
-    if (lfoOn) {
-        step = AdvanceVibratoLfoWindow(v, handle,
-            (std::min)(64u, c.frameCount), c.lfoDepth, c.lfoBendRatio);
-        stepFx = phasefx::FromFloat(step);
-        fs = MakeFxSteps8(stepFx);
-        windowRemaining = (std::min)(64u, c.frameCount);
-    }
+    VibratoWindow vib;
+    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
+    uint32_t& windowRemaining = vib.remaining;
     uint32_t frame = 0u;
     while (frame < c.frameCount) {
-        if (windowRemaining == 0u) {
-            const uint32_t win = (std::min)(64u, c.frameCount - frame);
-            step = AdvanceVibratoLfoWindow(v, handle, win, c.lfoDepth,
-                                           c.lfoBendRatio);
-            stepFx = phasefx::FromFloat(step);
-            fs = MakeFxSteps8(stepFx);
-            windowRemaining = win;
-        }
+        vib.Refill(c, v, handle, frame, step, stepFx, fs);
         // Simulate the exact scalar envelope recurrence eight steps ahead;
         // the chunk is only taken when the stage is unchanged after all
         // eight steps and no lane can reach the sample end.
@@ -3011,26 +2918,14 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
         if (frame + 8u <= c.frameCount &&
             windowRemaining >= 8u &&
             futureStage == stage && lastPos < lastSafePos) {
-            _mm_prefetch(reinterpret_cast<const char*>(
-                             region + phasefx::Index(lastPos + stepFx)),
-                         _MM_HINT_T0);
+            PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 first, second;
-            GatherSamplePairSeqAVX2(region,
-                c.sampleDataFrames - v.sampleStart[handle], bases, first,
-                second);
-            __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = LerpGather8(region, c.sampleDataFrames - v.sampleStart[handle], bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
             const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
-            _mm256_storeu_ps(outL + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outL + frame),
-                _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
-            _mm256_storeu_ps(outR + frame, _mm256_add_ps(
-                _mm256_loadu_ps(outR + frame),
-                _mm256_mul_ps(scaled, _mm256_set1_ps(mixR))));
+            MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
             gain = futureGain;
             stage = futureStage;
             attackRemaining = futureAttack;
