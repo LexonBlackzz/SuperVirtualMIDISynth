@@ -809,6 +809,13 @@ inline bool VoiceManager::RejectNoteOnWith(uint32_t count, LevelFn&& levelOf,
                 floorKey = key;
             }
         }
+        // A pending group that sits outside the index is the victim whenever
+        // its best key beats the index's.
+        if (pendingLaunch_.valid && pendingLaunch_.removed &&
+            pendingLaunch_.maxKey > floorKey) {
+            victim = pendingLaunch_.handles[pendingLaunch_.winnerIdx];
+            floorKey = pendingLaunch_.maxKey;
+        }
     }
     if (victim == kInvalidVoice || victim >= maxVoices_) return false;
     // Newborn score: age 0, level = |initialGain| * stereo energy norm of the

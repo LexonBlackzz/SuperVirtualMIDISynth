@@ -1698,6 +1698,10 @@ private:
         // stale until FlushPendingTree(); the root is maxKey (> runnerUp, the
         // best key of every voice outside the group).
         bool treeDirty = false;
+        // Removed mode (victim group has a decay-start member): the group is
+        // taken out of the steal index while the note is pending, and maxKey
+        // is compared against the index's best key at every chain step.
+        bool removed = false;
         uint32_t winnerIdx = 0u;   // layer of handles[] holding maxKey
         uint64_t maxKey = 0u;
         uint64_t runnerUp = 0u;
@@ -1712,6 +1716,12 @@ private:
                             uint32_t playIndex,
                             const ChannelParamsSnapshot& channelParams,
                             VoiceHandle* outHandles);
+    bool TryLazyRemovedGroupLaunch(uint8_t channel, uint8_t note,
+                                   uint8_t velocity,
+                                   const VoiceConfiguration* setups,
+                                   uint32_t count, uint32_t playIndex,
+                                   const ChannelParamsSnapshot& channelParams,
+                                   VoiceHandle* outHandles);
     void CommitPendingLaunchImpl();
     void ReplaceGroupInPlace(uint8_t channel, uint8_t note, uint8_t velocity,
                              const VoiceConfiguration* setups, uint32_t count,

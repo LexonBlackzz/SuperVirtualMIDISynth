@@ -3382,6 +3382,9 @@ struct LazyLaunchContext {
     const svms::ChannelParamsSnapshot* channelParams;
     bool lazy = false;
     bool graded = false;   // level follows velocity (steal-reject runs)
+    // 0: attack-start layers, 1: decay-start layers, 2: one of each,
+    // 3: a single decay-start voice.
+    uint32_t shape = 0u;
     uint32_t playIndex = 7000u;
     uint32_t launches = 0u;
 };
@@ -3397,7 +3400,8 @@ void DispatchLazyLaunchEvents(const svms::RenderEvent* events,
                    events[i].type == svms::RenderEventType::NoteOn) {
                 const svms::RenderEvent& e = events[i++];
                 svms::VoiceConfiguration setups[2];
-                for (uint32_t layer = 0u; layer < 2u; ++layer) {
+                const uint32_t layers = c.shape == 3u ? 1u : 2u;
+                for (uint32_t layer = 0u; layer < layers; ++layer) {
                     svms::VoiceConfiguration& s = setups[layer];
                     s.sampleStart = 0u;
                     s.sampleEnd = 4096u;
@@ -3410,8 +3414,11 @@ void DispatchLazyLaunchEvents(const svms::RenderEvent* events,
                     s.initialGain = c.graded ? 0.05f * static_cast<float>(e.data2)
                         : (e.data2 >= 100u ? 8.0f : 0.6f);
                     s.sustainLevel = 0.5f;
-                    s.attackSamples = 17u;
-                    s.attackGainStep = s.initialGain / 17.0f;
+                    const bool decayStart = c.shape == 1u || c.shape == 3u ||
+                        (c.shape == 2u && layer == 1u);
+                    s.attackSamples = decayStart ? 0u : 17u;
+                    s.attackGainStep =
+                        decayStart ? 0.0f : s.initialGain / 17.0f;
                     s.decaySamples = 53u;
                     s.decaySlope = 0.99f;
                     s.releaseDecay = 0.9995f;
@@ -3425,7 +3432,7 @@ void DispatchLazyLaunchEvents(const svms::RenderEvent* events,
                 const uint32_t playIndex = c.playIndex++;
                 setups[0].playIndex = setups[1].playIndex = playIndex;
                 if (c.voices->LaunchVoiceGroup(
-                        e.channel, e.data1, e.data2, setups, 2u, playIndex,
+                        e.channel, e.data1, e.data2, setups, layers, playIndex,
                         c.channelParams[e.channel], handles))
                     ++c.launches;
             }
@@ -3445,7 +3452,7 @@ void DispatchLazyLaunchEvents(const svms::RenderEvent* events,
 }
 
 void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass,
-                           bool stealReject) {
+                           bool stealReject, uint32_t shape = 0u) {
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 12u;
     constexpr uint32_t kPool = 32u;
@@ -3491,6 +3498,7 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass,
                                     normalChannels.GetParams()};
     LazyLaunchContext lazyContext{lazyVoices.get(), lazyChannels.GetParams()};
     lazyContext.lazy = true;
+    normalContext.shape = lazyContext.shape = shape;
     normalContext.graded = lazyContext.graded = stealReject;
     normal.SetEventBatchDispatcher(DispatchLazyLaunchEvents, &normalContext);
     lazy.SetEventBatchDispatcher(DispatchLazyLaunchEvents, &lazyContext);
@@ -3514,7 +3522,7 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass,
         };
         if (block == 0u) {
             // Fill the pool with loud two-layer groups (never the quietest).
-            for (uint32_t j = 0; j < kPool / 2u; ++j)
+            for (uint32_t j = 0; j < (shape == 3u ? kPool : kPool / 2u); ++j)
                 push(svms::RenderEventType::NoteOn,
                      static_cast<uint8_t>(j & 3u),
                      static_cast<uint8_t>(30u + j),
@@ -3598,9 +3606,11 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass,
 void TestLazyLaunchIdentity() {
     for (uint32_t threads : {1u, 4u}) {
         for (bool reject : {false, true}) {
-            RunLazyLaunchIdentity(threads, false, reject);
-            if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
-                RunLazyLaunchIdentity(threads, true, reject);
+            for (uint32_t shape : {0u, 1u, 2u, 3u}) {
+                RunLazyLaunchIdentity(threads, false, reject, shape);
+                if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
+                    RunLazyLaunchIdentity(threads, true, reject, shape);
+            }
         }
     }
 }
