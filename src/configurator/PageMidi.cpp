@@ -166,6 +166,22 @@ void OverflowCard(ConfigDocument& doc) {
     ui::EndCard();
 }
 
+void OverlapCard(ConfigDocument& doc) {
+    ConfigValues& w = doc.Working();
+    const float s = ui::Scale();
+    ui::BeginCard("##overlap", "Overlapping notes", nullptr, 0.0f, "nestedOff");
+    ui::BeginRow("nestedOff", "Short notes end themselves",
+                 "When a short note starts on a key that is already sounding, its note-off ends the short note and the long one keeps ringing. "
+                 "Off, the first note-off ends the oldest note, which cuts melodies short under fast arps (common in FL Studio exports).",
+                 ImVec2(46.0f * s, 28.0f * s));
+    if (ui::Toggle("##nestedoff", &w.nestedNoteOff)) {
+        doc.MarkDirty();
+        SendLiveCommand(SVMS_COMMAND_SET_NESTED_NOTE_OFF, w.nestedNoteOff ? 1u : 0u);
+    }
+    ui::EndRow();
+    ui::EndCard();
+}
+
 void VelocityPointerCard() {
     const float s = ui::Scale();
     ui::BeginCard("##velptr", nullptr, nullptr, 0.0f, "velIgnore");
@@ -220,6 +236,7 @@ void QueueCard(ConfigDocument& doc) {
 void DrawMidiPage(ConfigDocument& doc) {
     KeyboardCard(doc);
     OverflowCard(doc);
+    OverlapCard(doc);
     VelocityPointerCard();
     QueueCard(doc);
 }

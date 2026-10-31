@@ -264,6 +264,8 @@ enum class RLCommandType : uint32_t {
     // param = bulk block admission budget, percent of the voice limit
     // (0 = off, 1..1000).
     SetBulkAdmission      = 0x00000127,
+    // param = 1: a note-off ends the newest open note on its key.
+    SetNestedNoteOff      = 0x00000128,
 
 
     Invalid              = 0xFFFFFFFF,

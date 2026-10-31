@@ -270,6 +270,7 @@ public:
         // up front, so the pass runs on each block just before RenderBlock.
         // An exclusive-class SoundFont limits it to adjacent note-ons.
         noteMerge_ = collapseConfig.noteMerge;
+        nestedNoteOff_ = collapseConfig.nestedNoteOff;
         if (config.stealAgeless) {
             // BASSMIDI 2018 launches every note-on as its own voice: no merging
             // or coalescing from the user's performance config.
@@ -756,6 +757,7 @@ private:
     uint64_t dispatchAbsoluteFrame_ = 0;
     // Exact note-on merging (see Initialize / RenderWithEvents).
     bool noteMerge_ = false;
+    bool nestedNoteOff_ = false;  // a note-off ends the newest open note
     bool rawMix_ = false;
     uint32_t oversample_ = 1u;
     bool noteMergeHoist_ = true;
@@ -1218,7 +1220,7 @@ private:
         }
         // One note-off releases one unit: the whole generation, or one copy
         // of a merged voice.
-        voices_.NoteOffOldestPlayIndices(channel, note, releaseAll_ ? UINT32_MAX : 1u, sustain, 0u);
+        voices_.NoteOffOldestPlayIndices(channel, note, releaseAll_ ? UINT32_MAX : 1u, sustain, 0u, nestedNoteOff_);
 #if defined(_MSC_VER)
         dispatchProfile.noteOffTotal += __rdtsc() - offBegin;
         ++dispatchProfile.noteOffCalls;

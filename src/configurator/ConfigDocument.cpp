@@ -178,6 +178,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.fastProducer = false;
     d.shards = 1u;
     d.noteMerge = false;
+    d.nestedNoteOff = false;
     d.noteOnReexcite = false;
     d.blockTiming = false;
     d.unboundedRender = false;
@@ -331,6 +332,10 @@ void ConfigDocument::FromJson(const json& root) {
         if (auto merge = it->find("note_merge"); merge != it->end() &&
             merge->is_boolean()) {
             working_.noteMerge = merge->get<bool>();
+        }
+        if (auto nested = it->find("nested_note_off"); nested != it->end() &&
+            nested->is_boolean()) {
+            working_.nestedNoteOff = nested->get<bool>();
         }
         ReadNum(*it, "ring_capacity", working_.eventRingCapacity, 4096u, UINT32_MAX);
         ReadNum(*it, "high_priority_velocity", working_.highPriorityVelocity, 1u, 127u);
@@ -521,6 +526,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["events"]["min_note_ms"] = working_.minNoteMs;
     root["events"]["fast_producer"] = working_.fastProducer;
     root["events"]["note_merge"] = working_.noteMerge;
+    root["events"]["nested_note_off"] = working_.nestedNoteOff;
     root["synth"]["block_timing"] = working_.blockTiming;
     root["synth"]["tuning_edo"] = working_.tuningEdo;
     root["synth"]["unbounded_render"] = working_.unboundedRender;
@@ -746,6 +752,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.fastProducer == b.fastProducer
         && a.shards == b.shards
         && a.noteMerge == b.noteMerge
+        && a.nestedNoteOff == b.nestedNoteOff
         && a.noteOnReexcite == b.noteOnReexcite
         && a.blockTiming == b.blockTiming
         && a.unboundedRender == b.unboundedRender

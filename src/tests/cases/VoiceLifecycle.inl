@@ -1328,6 +1328,33 @@ void TestOverlappingRetriggerGenerations() {
               batched->v.state[otherKey] ==
                   static_cast<uint8_t>(svms::VoiceState::Active),
           "batched stale note-off stops at an empty key without touching others");
+
+    // Nested pairing: the note-off ends the newest generation, every layer of
+    // it, and the older note keeps sounding until its own note-off.
+    auto nested = std::make_unique<svms::VoiceManager>();
+    nested->Initialize(8);
+    const auto longLeft = nested->AllocateVoice(1, 64, 100);
+    const auto longRight = nested->AllocateVoice(1, 64, 100);
+    const auto shortNote = nested->AllocateVoice(1, 64, 100);
+    nested->SetVoicePlayIndex(longLeft, 30u);
+    nested->SetVoicePlayIndex(longRight, 30u);
+    nested->SetVoicePlayIndex(shortNote, 31u);
+    Check(nested->FindNewestPlayIndex(1, 64) == 31u,
+          "newest generation is the chain head");
+    Check(nested->NoteOffOldestPlayIndices(1, 64, 1u, false, 5u, true) == 1u &&
+              nested->v.state[shortNote] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+              nested->v.state[longLeft] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active) &&
+              nested->v.state[longRight] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active),
+          "nested note-off ends the short note and leaves the long one sounding");
+    Check(nested->NoteOffOldestPlayIndices(1, 64, 1u, false, 9u, true) == 1u &&
+              nested->v.state[longLeft] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+              nested->v.state[longRight] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing),
+          "the second nested note-off ends every layer of the long note");
 }
 
 // Bucketed steal index: quiet voices go first, capacity holds through a

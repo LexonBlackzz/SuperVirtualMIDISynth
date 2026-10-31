@@ -79,6 +79,18 @@ inline uint32_t VoiceManager::FindOldestPlayIndex(uint8_t channel,
         !v.heldBySustain[handle] ? v.playIndex[handle] : UINT32_MAX;
 }
 
+// The generation at the chain head: the most recent note-on still waiting for
+// its note-off on this key.
+inline uint32_t VoiceManager::FindNewestPlayIndex(uint8_t channel,
+                                                   uint8_t note) const {
+    if (channel >= kChannelCount || note >= kNoteCount) return UINT32_MAX;
+    const int32_t head = channelKeyVoiceHead_[channel][note];
+    if (head < 0) return UINT32_MAX;
+    const uint32_t handle = static_cast<uint32_t>(head);
+    return v.state[handle] == static_cast<uint8_t>(VoiceState::Active) &&
+        !v.heldBySustain[handle] ? v.playIndex[handle] : UINT32_MAX;
+}
+
 inline void VoiceManager::StartReleaseForPlayIndex(uint8_t channel,
                                                     uint8_t note,
                                                     uint32_t playIndex) {
@@ -473,21 +485,26 @@ inline void VoiceManager::ReleaseSustain(uint8_t channel,
 
 inline uint32_t VoiceManager::NoteOffOldestPlayIndices(
         uint8_t channel, uint8_t note, uint32_t count, bool sustain,
-        uint32_t blockOffset) {
+        uint32_t blockOffset, bool newest) {
     // `count` is a number of note-offs; the return value is how many of them
     // found a unit to release. An ordinary generation is one unit. A merged
     // generation of m units takes up to m offs: fewer than m releases only
     // that many units, by forking them off into a releasing twin.
+    // `newest` pairs each note-off with the most recent open note-on instead
+    // of the oldest, so a short note inside a long one on the same key ends
+    // itself and leaves the long one sounding.
     uint32_t released = 0u;
     while (released < count) {
-        const uint32_t playIndex = FindOldestPlayIndex(channel, note);
+        const uint32_t playIndex = newest ? FindNewestPlayIndex(channel, note)
+                                          : FindOldestPlayIndex(channel, note);
         if (playIndex == UINT32_MAX) break;
         const uint32_t units = GetVoiceMultiplicity(static_cast<VoiceHandle>(
-            channelKeyVoiceOldest_[channel][note]));
+            newest ? channelKeyVoiceHead_[channel][note]
+                   : channelKeyVoiceOldest_[channel][note]));
         const uint32_t remaining = count - released;
         if (units > 1u && remaining < units) {
             if (ForkReleasedUnits(channel, note, playIndex, remaining, sustain,
-                                  blockOffset)) {
+                                  blockOffset, newest)) {
                 released += remaining;
                 continue;
             }
@@ -511,18 +528,21 @@ inline uint32_t VoiceManager::NoteOffOldestPlayIndices(
 // its current gain. Nothing is audible at the split frame.
 inline bool VoiceManager::ForkReleasedUnits(
     uint8_t channel, uint8_t note, uint32_t playIndex, uint32_t units,
-    bool sustain, uint32_t blockOffset) {
+    bool sustain, uint32_t blockOffset, bool newest) {
     ++stealPeekEpoch_;
     constexpr uint32_t kMaxForkLayers = 16u;
     VoiceHandle source[kMaxForkLayers];
     uint32_t layers = 0u;
-    // The oldest generation is the chain tail and its layers are adjacent.
-    int32_t cursor = channelKeyVoiceOldest_[channel][note];
+    // The oldest generation is the chain tail and the newest the head; the
+    // layers of one generation are adjacent.
+    int32_t cursor = newest ? channelKeyVoiceHead_[channel][note]
+                            : channelKeyVoiceOldest_[channel][note];
     while (cursor >= 0 && layers < kMaxForkLayers) {
         const VoiceHandle handle = static_cast<VoiceHandle>(cursor);
         if (v.playIndex[handle] != playIndex) break;
         source[layers++] = handle;
-        cursor = v.prevChannelKeyVoice[handle];
+        cursor = newest ? v.nextChannelKeyVoice[handle]
+                        : v.prevChannelKeyVoice[handle];
     }
     if (layers == 0u) return false;
     if (cursor >= 0 &&

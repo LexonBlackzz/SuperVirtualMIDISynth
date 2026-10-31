@@ -395,6 +395,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"min_note_ms", cfg.minNoteMs},
             {"fast_producer", cfg.fastProducer},
             {"note_merge", cfg.noteMerge},
+            {"nested_note_off", cfg.nestedNoteOff},
             {"ring_capacity", cfg.eventRingCapacity},
             {"high_priority_velocity", cfg.highPriorityVelocity},
             {"shed_start_percent", cfg.shedStartPercent},
@@ -839,6 +840,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             else
                 AppendWarning(cfg.configWarning, "events.note_merge");
         }
+        if (auto nested = it->find("nested_note_off"); nested != it->end()) {
+            if (nested->is_boolean())
+                cfg.nestedNoteOff = nested->get<bool>();
+            else
+                AppendWarning(cfg.configWarning, "events.nested_note_off");
+        }
     }
     if (auto it = root.find("quality"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "correctness_mode", cfg.correctnessMode))
@@ -1062,6 +1069,7 @@ void ApplyEnvironment(EngineConfig& cfg) {
         cfg.eventOverflowMode = EventOverflowMode::LosslessBackpressure;
     // Handy for A/B renders of one file with the tools (svms_v3_midi_song).
     cfg.noteMerge = EnvironmentFlag(L"SVMS_NOTE_MERGE", cfg.noteMerge);
+    cfg.nestedNoteOff = EnvironmentFlag(L"SVMS_NESTED_NOTE_OFF", cfg.nestedNoteOff);
     cfg.keepLoaded = EnvironmentFlag(L"SVMS_KEEP_LOADED", cfg.keepLoaded);
     cfg.noteOnReexcite = EnvironmentFlag(L"SVMS_NOTE_REEXCITE", cfg.noteOnReexcite);
     cfg.correctnessMode = EnvironmentFlag(L"SVMS_CORRECTNESS_MODE", cfg.correctnessMode);
@@ -1152,6 +1160,7 @@ EngineConfig EngineConfig::Default() {
     cfg.ccCollapse = false;      // opt-in: every CC dispatches by default
     cfg.fastProducer = false;    // opt-in: shared MPSC lanes by default
     cfg.noteMerge = false;       // opt-in: every note-on launches its own voice
+    cfg.nestedNoteOff = false;   // opt-in: a note-off ends the oldest open note
     cfg.noteOnReexcite = false;  // opt-in: collapsed hits are dropped, not re-excited
     cfg.blockTimingMode = false;  // opt-in: exact-frame dispatch by default
     cfg.unboundedRender = false;  // opt-in: recovery + caps stay on by default

@@ -93,6 +93,7 @@ struct ConfigValues {
     // Key-sharded engine (JSON-only for now): 0/1 = off.
     uint32_t shards = 1u;
     bool noteMerge = false;
+    bool nestedNoteOff = false;
     bool noteOnReexcite = false;
     // Opt-in block-granular dispatch (events fire at block start).
     bool blockTiming = false;

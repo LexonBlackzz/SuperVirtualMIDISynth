@@ -861,6 +861,9 @@ private:
     // SoundFont has exclusive classes (hi-hat chokes make launch order
     // observable), which limits merging to adjacent note-ons.
     std::atomic<bool> noteMergeEnabled_{false};
+    // Opt-in: a note-off ends the newest open note on its key (see
+    // VoiceManager::NoteOffOldestPlayIndices). Read by the audio thread.
+    std::atomic<bool> nestedNoteOff_{false};
     // Opt-in: coalescing keeps collapsed repeat hits as re-excite events.
     std::atomic<bool> noteOnReexcite_{false};
     std::atomic<bool> noteMergeHoist_{true};

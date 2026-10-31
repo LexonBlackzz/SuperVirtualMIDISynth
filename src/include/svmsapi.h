@@ -546,6 +546,8 @@ typedef enum SVMS_Command {
     /* param = 1: both output channels carry the average of left and right. */
     SVMS_COMMAND_SET_MONO_DOWNMIX        = 0x00000126,
     SVMS_COMMAND_SET_BULK_ADMISSION      = 0x00000127,
+    /* param = 1: a note-off ends the newest open note on its key. */
+    SVMS_COMMAND_SET_NESTED_NOTE_OFF     = 0x00000128,
     /* Reload the configured SoundFont (text = optional UTF-8 path). */
     SVMS_COMMAND_RELOAD_SOUNDFONT        = 0x00000101,
     SVMS_COMMAND_RESET_VOICES            = 0x00000102,

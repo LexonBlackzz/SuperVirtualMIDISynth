@@ -716,13 +716,15 @@ public:
                                    uint16_t regionIndex);
     void SetVoicePlayIndex(VoiceHandle handle, uint32_t playIndex);
     uint32_t FindOldestPlayIndex(uint8_t channel, uint8_t note) const;
+    uint32_t FindNewestPlayIndex(uint8_t channel, uint8_t note) const;
     void StartReleaseForPlayIndex(uint8_t channel, uint8_t note,
                                   uint32_t playIndex);
     void NoteOffPlayIndex(uint8_t channel, uint8_t note, uint32_t playIndex,
                           bool sustain, uint32_t blockOffset);
     uint32_t NoteOffOldestPlayIndices(uint8_t channel, uint8_t note,
                                       uint32_t count, bool sustain,
-                                      uint32_t blockOffset);
+                                      uint32_t blockOffset,
+                                      bool newest = false);
 
     void SetVoiceEnvelope(VoiceHandle handle, float initialGain, float sustainLevel,
                           uint32_t delaySamples, uint32_t holdSamples, uint32_t attackSamples,
@@ -1654,7 +1656,8 @@ private:
     VoiceForkedHook voiceForkedHook_ = nullptr;
     void* voiceForkedUserData_ = nullptr;
     bool ForkReleasedUnits(uint8_t channel, uint8_t note, uint32_t playIndex,
-                           uint32_t units, bool sustain, uint32_t blockOffset);
+                           uint32_t units, bool sustain, uint32_t blockOffset,
+                           bool newest = false);
     PreTailCaptureHook preTailCaptureHook_ = nullptr;
     void* preTailCaptureUserData_ = nullptr;
     VoiceConfiguredHook voiceConfiguredHook_ = nullptr;

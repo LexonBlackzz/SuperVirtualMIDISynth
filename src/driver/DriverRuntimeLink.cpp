@@ -625,6 +625,23 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetNestedNoteOff: {
+        // param = opt-in: note-offs pair with the newest open note-on. Read by
+        // the audio thread per note-off; sounding voices are untouched.
+        if (cmd.param > 1u) {
+            strncpy_s(resultText, kText, "nested note-off must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        nestedNoteOff_.store(cmd.param != 0u, std::memory_order_relaxed);
+        engineConfig_.nestedNoteOff = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "nested note-off: on (a note-off ends the "
+                              "newest open note on its key)"
+                            : "nested note-off: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
     case RT::SetBlockTiming: {
         // param = opt-in block-granular dispatch. Events still admitted in
         // order; only their intra-block offset is relinquished (fires at

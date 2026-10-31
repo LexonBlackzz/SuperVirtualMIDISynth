@@ -2274,8 +2274,9 @@ void Driver::HandleNoteOff(uint8_t channel, uint8_t note, uint32_t blockOffset) 
     // varying polyphony loads.
     // One note-off releases one unit of the oldest generation: the whole
     // generation for an ordinary voice, one copy of a merged voice.
-    voiceManager->NoteOffOldestPlayIndices(channel, note, 1u, sustain,
-                                           blockOffset);
+    voiceManager->NoteOffOldestPlayIndices(
+        channel, note, 1u, sustain, blockOffset,
+        nestedNoteOff_.load(std::memory_order_relaxed));
 }
 
 // Applies `count` identical note-offs for (channel, note) at once; equivalent
@@ -2286,8 +2287,9 @@ void Driver::HandleStaleNoteOffBatch(uint8_t channel, uint8_t note,
     if (!channelCache || !voiceManager || count == 0u) return;
     const bool sustain = channelCache->IsSustainActive(channel);
     channelCache->NoteOff(channel, note);
-    voiceManager->NoteOffOldestPlayIndices(channel, note, count, sustain,
-                                           blockOffset);
+    voiceManager->NoteOffOldestPlayIndices(
+        channel, note, count, sustain, blockOffset,
+        nestedNoteOff_.load(std::memory_order_relaxed));
 }
 
 // Applies a controller change: updates the channel cache, then the playing

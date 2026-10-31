@@ -415,6 +415,7 @@ bool Driver::Initialize() {
     minNoteMs_.store(cfg.minNoteMs, std::memory_order_relaxed);
     SetFastProducer(cfg.fastProducer);
     noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
+    nestedNoteOff_.store(cfg.nestedNoteOff, std::memory_order_relaxed);
     noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
     unboundedRenderEnabled_.store(cfg.unboundedRender,
@@ -579,6 +580,7 @@ bool Driver::Initialize() {
     minNoteMs_.store(cfg.minNoteMs, std::memory_order_relaxed);
     SetFastProducer(cfg.fastProducer);
     noteMergeEnabled_.store(cfg.noteMerge, std::memory_order_relaxed);
+    nestedNoteOff_.store(cfg.nestedNoteOff, std::memory_order_relaxed);
     noteOnReexcite_.store(cfg.noteOnReexcite, std::memory_order_relaxed);
     blockTimingEnabled_.store(cfg.blockTimingMode, std::memory_order_relaxed);
     unboundedRenderEnabled_.store(cfg.unboundedRender,

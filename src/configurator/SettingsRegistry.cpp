@@ -84,6 +84,7 @@ const SettingDef kSettings[] = {
     {"overflow", "Overload behavior (Priority / Lossless)", M, "MIDI", "overflow shed lossless priority queue", nullptr, nullptr, true, D(&V::overflowMode)},
     {"protVel", "Protected velocity", M, "MIDI", "high-priority velocity protected shed", nullptr, nullptr, true, D(&V::highPriorityVelocity)},
     {"shedPct", "Start dropping at queue %", M, "MIDI", "shed start percent queue full", nullptr, nullptr, true, D(&V::shedStartPercent)},
+    {"nestedOff", "Overlapping notes on one key", M, "MIDI", "nested overlapping same key note off release short long arp fl studio", nullptr, nullptr, false, D(&V::nestedNoteOff)},
     {"queueCap", "Queue capacity", M, "MIDI \xE2\x80\xBA Queue sizes", "ring capacity events", nullptr, "midi", true, D(&V::eventRingCapacity)},
     {"perCb", "Max events per audio block", M, "MIDI \xE2\x80\xBA Queue sizes", "events per callback", nullptr, "midi", true, D(&V::maxEventsPerBlock)},
     // Sent live with SetFastProducer (the prototype marked it ↻).

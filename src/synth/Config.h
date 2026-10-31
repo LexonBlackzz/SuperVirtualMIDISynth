@@ -130,6 +130,10 @@ struct EngineConfig {
     // Opt-in exact note-on merging (NoteMerge.h): identical note-ons on
     // one frame become one voice at N times the gain. Off by default.
     bool noteMerge;
+    // Opt-in pairing of note-offs with the newest open note-on on a key
+    // (events.nested_note_off), so a short note inside a long one on the same
+    // key does not end the long one. Off by default: the oldest is released.
+    bool nestedNoteOff;
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block offset. Off by default.
     bool blockTimingMode;
