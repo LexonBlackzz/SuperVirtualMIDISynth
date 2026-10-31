@@ -145,9 +145,15 @@ struct FxSteps8 {
 inline FxSteps8 MakeFxSteps8(uint64_t step) {
     alignas(32) uint64_t multiples[8];
     for (uint32_t k = 0u; k < 8u; ++k) multiples[k] = step * k;
+    // lo/hi hold the multiples as {0,1,4,5} and {2,3,6,7}: one in-lane
+    // shuffle of the two sums then yields the eight lanes in frame order.
+    alignas(32) uint64_t loOrder[4] = {multiples[0], multiples[1],
+                                       multiples[4], multiples[5]};
+    alignas(32) uint64_t hiOrder[4] = {multiples[2], multiples[3],
+                                       multiples[6], multiples[7]};
     FxSteps8 s;
-    s.lo = _mm256_load_si256(reinterpret_cast<const __m256i*>(multiples));
-    s.hi = _mm256_load_si256(reinterpret_cast<const __m256i*>(multiples + 4));
+    s.lo = _mm256_load_si256(reinterpret_cast<const __m256i*>(loOrder));
+    s.hi = _mm256_load_si256(reinterpret_cast<const __m256i*>(hiOrder));
     s.step = step;
     s.step7 = multiples[7];
     s.step8 = step * 8u;
@@ -166,14 +172,11 @@ inline void FxChunk(uint64_t pos, const FxSteps8& s, __m256i& bases,
     const __m256i p = _mm256_set1_epi64x(static_cast<long long>(pos));
     const __m256i a = _mm256_add_epi64(p, s.lo);
     const __m256i b = _mm256_add_epi64(p, s.hi);
-    const __m256i odd = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
-    const __m256i even = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
-    bases = _mm256_permute2x128_si256(
-        _mm256_permutevar8x32_epi32(a, odd),
-        _mm256_permutevar8x32_epi32(b, odd), 0x20);
-    weight = FxWeight8(_mm256_permute2x128_si256(
-        _mm256_permutevar8x32_epi32(a, even),
-        _mm256_permutevar8x32_epi32(b, even), 0x20));
+    const __m256 fa = _mm256_castsi256_ps(a);
+    const __m256 fb = _mm256_castsi256_ps(b);
+    // high dwords (indices) and low dwords (fractions) of the eight sums
+    bases = _mm256_castps_si256(_mm256_shuffle_ps(fa, fb, 0xDD));
+    weight = FxWeight8(_mm256_castps_si256(_mm256_shuffle_ps(fa, fb, 0x88)));
 }
 
 // The eight scalar gains of a chunk as one vector.  They are produced by eight
@@ -299,16 +302,38 @@ inline void GatherSamplePairAVX2(const int16_t* data, __m256i elem,
 // permutes: no gather (slow, latency-bound, microcoded on E-cores), identical
 // values and scale, so results are bit-exact vs GatherSamplePairAVX2.
 // `readable` = int16 elements readable from `data`; anything else falls back.
-inline void GatherSamplePairSeqAVX2(const int16_t* data, uint32_t readable,
-                                    __m256i bases, __m256& first,
-                                    __m256& second) {
-    const uint32_t lo = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm256_castsi256_si128(bases)));
-    const uint32_t hi = static_cast<uint32_t>(_mm256_extract_epi32(bases, 7));
+inline void GatherSamplePairSeqAtAVX2(const int16_t* data, uint32_t readable,
+                                      __m256i bases, uint32_t lo, uint32_t hi,
+                                      __m256& first, __m256& second) {
     if (hi - lo > 15u || lo + 24u > readable) {
         GatherSamplePairAVX2(data, bases, first, second);
         return;
     }
     const int16_t* p = data + lo;
+    if (hi - lo <= 7u) {
+        // Pitch at or below the sample rate: every lane's pair lies in the
+        // eight samples at p and the eight at p + 1, so two 16-byte loads and
+        // a byte shuffle each replace the three widened vectors and the
+        // permute/blend ladder.  Same values and scale as below.
+        const __m256i rel8 = _mm256_sub_epi32(bases, _mm256_set1_epi32(
+            static_cast<int>(lo)));
+        const __m128i rel16 = _mm_packus_epi32(
+            _mm256_castsi256_si128(rel8), _mm256_extracti128_si256(rel8, 1));
+        // byte pair (2r, 2r + 1) per lane: r * 0x0202 + 0x0100
+        const __m128i control = _mm_add_epi16(
+            _mm_mullo_epi16(rel16, _mm_set1_epi16(0x0202)),
+            _mm_set1_epi16(0x0100));
+        const __m128i a8 = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(p));
+        const __m128i b8 = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(p + 1));
+        const __m256 scale = _mm256_set1_ps(1.0f / 32768.0f);
+        first = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(
+            _mm_shuffle_epi8(a8, control))), scale);
+        second = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(
+            _mm_shuffle_epi8(b8, control))), scale);
+        return;
+    }
     const __m256i a = _mm256_cvtepi16_epi32(
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
     const __m256i b = _mm256_cvtepi16_epi32(
@@ -333,6 +358,16 @@ inline void GatherSamplePairSeqAVX2(const int16_t* data, uint32_t readable,
     const __m256 int16Scale = _mm256_set1_ps(1.0f / 32768.0f);
     first = _mm256_mul_ps(_mm256_cvtepi32_ps(f), int16Scale);
     second = _mm256_mul_ps(_mm256_cvtepi32_ps(sec), int16Scale);
+}
+
+// Same fetch, first and last lane index taken from the vector.
+inline void GatherSamplePairSeqAVX2(const int16_t* data, uint32_t readable,
+                                    __m256i bases, __m256& first,
+                                    __m256& second) {
+    const uint32_t lo = static_cast<uint32_t>(
+        _mm_cvtsi128_si32(_mm256_castsi256_si128(bases)));
+    const uint32_t hi = static_cast<uint32_t>(_mm256_extract_epi32(bases, 7));
+    GatherSamplePairSeqAtAVX2(data, readable, bases, lo, hi, first, second);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -572,6 +607,14 @@ void RecordRetirement(const RenderSpanContext& c, uint32_t handle,
 
 // One sequential chunk fetch: lerp of the pair-word gather (the sample's
 // neighbours are one word apart, so a single gather yields both).
+SVMS_K_FORCEINLINE __m256 LerpGather8(const int16_t* region, uint32_t readable,
+                                      __m256i bases, __m256 fraction,
+                                      uint32_t lo, uint32_t hi) {
+    __m256 first, second;
+    GatherSamplePairSeqAtAVX2(region, readable, bases, lo, hi, first, second);
+    return _mm256_add_ps(first,
+        _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+}
 SVMS_K_FORCEINLINE __m256 LerpGather8(const int16_t* region, uint32_t readable,
                                       __m256i bases, __m256 fraction) {
     __m256 first, second;
@@ -971,7 +1014,9 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle) {
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 sample = LerpGather8(region, readable, bases, fraction);
+            __m256 sample = LerpGather8(region, readable, bases, fraction,
+                                          phasefx::Index(pos),
+                                          phasefx::Index(lastPos));
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             sample = FilterTime8AVX2(v, handle, sample);
             MixChunk8(outL + frame, outR + frame, sample, gainLVector,
@@ -1002,7 +1047,9 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle) {
                     bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
                         static_cast<int>(phasefx::Index(lastLive))));
                     const __m256 sample =
-                        LerpGather8(region, readable, bases, fraction);
+                        LerpGather8(region, readable, bases, fraction,
+                                   phasefx::Index(pos),
+                                   phasefx::Index(lastLive));
                     MixChunk8Masked(outL + frame, outR + frame, liveMask,
                                     sample, gainLVector, gainRVector);
                     pos += stepFx * rem;
@@ -1206,7 +1253,9 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 sample = LerpGather8(region, readable, bases, fraction);
+            __m256 sample = LerpGather8(region, readable, bases, fraction,
+                                          phasefx::Index(pos),
+                                          phasefx::Index(lastPos));
             sample = FilterTime8AVX2(v, handle, sample);
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 gainVector = fastMath
@@ -1252,7 +1301,9 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
                     bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
                         static_cast<int>(phasefx::Index(lastLive))));
                     __m256 sample =
-                        LerpGather8(region, readable, bases, fraction);
+                        LerpGather8(region, readable, bases, fraction,
+                                   phasefx::Index(pos),
+                                   phasefx::Index(lastLive));
                     sample = FilterTime8AVX2(v, handle, sample);
                     const __m256 gainVector = fastMath
                         ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
@@ -1628,7 +1679,9 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
             __m256i bases;
             __m256 fraction;
             FxChunk(pos, fs, bases, fraction);
-            __m256 sample = LerpGather8(region, readable, bases, fraction);
+            __m256 sample = LerpGather8(region, readable, bases, fraction,
+                                          phasefx::Index(pos),
+                                          phasefx::Index(lastPos));
             sample = FilterTime8AVX2(v, handle, sample);
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 scaled = _mm256_mul_ps(
