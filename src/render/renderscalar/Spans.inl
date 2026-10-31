@@ -240,7 +240,8 @@ inline uint32_t RenderPrimaryVoiceSpan(VoiceSoA& v, uint32_t idx,
                     }
                 }
             }
-            phasefx::Store(v, idx, pos);
+            // Stored wrapped, like every other looping path.
+            phasefx::Store(v, idx, phasefx::Wrap(pos, loopS64, loopE64));
             return UINT32_MAX;
         }
 

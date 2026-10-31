@@ -303,13 +303,33 @@ void TestNoteOnCollapseGate() {
 // bit-replacing, the scalar path).
 // ═══════════════════════════════════════════════════════════════════════
 
+// SVMS_TEST_SEEDS=N reruns the random differentials with N different streams.
+uint32_t g_wholeVoiceSeedSalt = 0u;
+
 struct WholeVoiceRng {
-    uint32_t state = 0x9E3779B9u;
+    uint32_t state = 0x9E3779B9u + g_wholeVoiceSeedSalt * 0x632BE5ABu;
     uint32_t Next() {
         state = state * 1664525u + 1013904223u;
         return state;
     }
 };
+
+uint32_t WholeVoiceWideSeeds() {
+    const char* wide = std::getenv("SVMS_TEST_SEEDS");
+    const uint32_t n = wide != nullptr ? static_cast<uint32_t>(std::atoi(wide)) : 0u;
+    return n != 0u ? n : 1u;
+}
+
+template <class F>
+void ForWideSeeds(F&& body) {
+    const uint32_t n = WholeVoiceWideSeeds();
+    for (uint32_t s = 0u; s < n; ++s) {
+        g_wholeVoiceSeedSalt = s;
+        if (n > 1u) std::fprintf(stderr, "[SEED] salt=%u\n", s);
+        body();
+    }
+    g_wholeVoiceSeedSalt = 0u;
+}
 
 void ConfigureWholeVoiceSeedPool(svms::VoiceManager& voices,
                                  const svms::ChannelCache& channels,
@@ -406,6 +426,20 @@ void CheckWholeVoiceStateParity(const svms::VoiceManager& oracleVoices,
         std::fprintf(stderr,
                      "[WVDIFFV] %s active mismatch: oracle=%zu whole=%zu\n",
                      label, oracleIds.size(), wholeIds.size());
+        for (const uint32_t voice : wholeActive) {
+            const uint32_t id = wholeVoices.v.playIndex[voice];
+            if (std::binary_search(oracleIds.begin(), oracleIds.end(), id)) continue;
+            std::fprintf(stderr,
+                "[WVDIFFV] %s only in whole: playIndex=%u handle=%u state=%u stage=%u "
+                "gain=%g release=%u class=%u phase=%g relEnd=%u loop=%u\n",
+                label, id, voice, unsigned(wholeVoices.v.state[voice]),
+                unsigned(wholeVoices.v.envelopeStage[voice]),
+                wholeVoices.v.currentGain[voice],
+                wholeVoices.v.releaseSamplesRemaining[voice],
+                unsigned(wholeVoices.v.renderClass[voice]),
+                svms::phasefx::LoadFloat(wholeVoices.v, voice),
+                wholeVoices.v.relEnd[voice], unsigned(wholeVoices.v.loopEnabled[voice]));
+        }
         const size_t n = (std::min)(oracleIds.size(), wholeIds.size());
         for (size_t i = 0; i < n; ++i) {
             if (oracleIds[i] != wholeIds[i]) {
@@ -655,7 +689,9 @@ void RunWholeVoiceStealDifferential(uint32_t rotationMode) {
     }
 }
 
-void TestWholeVoiceStealDifferential() { RunWholeVoiceStealDifferential(0u); }
+void TestWholeVoiceStealDifferential() {
+    ForWideSeeds([] { RunWholeVoiceStealDifferential(0u); });
+}
 
 // The AVX2 steal-tail span takes whole 8-frame chunks and leaves the rest to
 // the scalar span: the pair must match the scalar span alone on output, phase,
@@ -921,7 +957,8 @@ void TestWholeVoiceLoudStealParity() {
 // ghosts carry their rotation state into the in-band tail, and adopted tails
 // continue it.  Same scenario and oracle as the Coherent steal differential.
 void TestWholeVoiceRotationStealDifferential() {
-    for (uint32_t mode : {1u, 2u, 4u}) RunWholeVoiceStealDifferential(mode);
+    for (uint32_t mode : {1u, 2u, 4u})
+        ForWideSeeds([mode] { RunWholeVoiceStealDifferential(mode); });
 }
 
 struct WholeVoiceLaunchContext {
@@ -1640,7 +1677,15 @@ void RunStepBreakKernelTest(bool release, bool curve, uint32_t seedValue) {
 void TestStepBreakKernels() {
     // A few seeds: the break and curve frames are random, and one seed once
     // missed a release cursor stored past the loop end that others caught.
-    for (const uint32_t seedValue : {777u, 1u, 2u, 3u}) {
+    // SVMS_TEST_SEEDS=N runs seeds 1..N instead, for a wide sweep.
+    const char* wide = std::getenv("SVMS_TEST_SEEDS");
+    const uint32_t wideCount = wide != nullptr ? static_cast<uint32_t>(std::atoi(wide)) : 0u;
+    std::vector<uint32_t> seeds = {777u, 1u, 2u, 3u};
+    if (wideCount != 0u) {
+        seeds.clear();
+        for (uint32_t s = 1u; s <= wideCount; ++s) seeds.push_back(s);
+    }
+    for (const uint32_t seedValue : seeds) {
         RunStepBreakKernelTest(false, false, seedValue);
         RunStepBreakKernelTest(true, false, seedValue);
         RunStepBreakKernelTest(false, true, seedValue);
@@ -1988,13 +2033,16 @@ void RunWholeVoiceLaunchDifferential(uint32_t rotationMode) {
     }
 }
 
-void TestWholeVoiceLaunchDifferential() { RunWholeVoiceLaunchDifferential(0u); }
+void TestWholeVoiceLaunchDifferential() {
+    ForWideSeeds([] { RunWholeVoiceLaunchDifferential(0u); });
+}
 
 
 // Rotated pools: free-slot launches seed their own state; deferred releases
 // and natural retirements keep rotating voices exact against the oracle.
 void TestWholeVoiceRotationLaunchDifferential() {
-    for (uint32_t mode : {1u, 2u, 4u}) RunWholeVoiceLaunchDifferential(mode);
+    for (uint32_t mode : {1u, 2u, 4u})
+        ForWideSeeds([mode] { RunWholeVoiceLaunchDifferential(mode); });
 }
 
 struct WholeVoiceCCContext {
@@ -2276,7 +2324,7 @@ void DispatchWholeVoiceCCEvent(const svms::RenderEvent* events,
     }
 }
 
-void RunWholeVoiceCCDifferential(uint32_t rowOpBudget) {
+void RunWholeVoiceCCDifferential(uint32_t rowOpBudget, uint32_t kPool = 48u) {
     // Notes interleaved with lifecycle CCs: pedal capture/release chains,
     // all-notes-off sweeps and mid-block all-sound-off kills (which free
     // slots that later same-block launches reuse, and which kill pre-existing
@@ -2285,7 +2333,6 @@ void RunWholeVoiceCCDifferential(uint32_t rowOpBudget) {
     // deferred releases for CC64/66/123.
     constexpr uint32_t kFrames = 512u;
     constexpr uint32_t kBlocks = 8u;
-    constexpr uint32_t kPool = 48u;
     constexpr uint32_t kSeedCount = 32u;
     constexpr uint32_t kEventsPerBlock = 12u;
     const uint32_t sampleCount = 4096u;
@@ -2500,7 +2547,14 @@ void RunWholeVoiceCCDifferential(uint32_t rowOpBudget) {
     }
 }
 
-void TestWholeVoiceCCDifferential() { RunWholeVoiceCCDifferential(0u); }
+void TestWholeVoiceCCDifferential() {
+    ForWideSeeds([] { RunWholeVoiceCCDifferential(0u); });
+    // A pool big enough that nothing is stolen, on a stream where non-looping
+    // decaying voices run off the end of their sample: they must retire.
+    g_wholeVoiceSeedSalt = 2u;
+    RunWholeVoiceCCDifferential(0u, 400u);
+    g_wholeVoiceSeedSalt = 0u;
+}
 
 // quality.fast_chunk_math: closed-form gain ladder per chunk is tolerance-equal
 // (not bit-equal) to the frame-major oracle.  Re-run the steal, launch and CC
@@ -2523,7 +2577,7 @@ void TestFastChunkMathDifferential() {
 // event groups (no dispatch, same frames and order); the result must still
 // match the oracle, and no block may fall back to dense or sparse.
 void TestWholeVoiceOpBudgetSplitDifferential() {
-    RunWholeVoiceCCDifferential(3u);
+    ForWideSeeds([] { RunWholeVoiceCCDifferential(3u); });
 }
 
 // scalarExact: the whole-voice side runs the SCALAR backend (sparse-identical

@@ -3223,10 +3223,15 @@ bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
         for (uint32_t i = 0u; i < handleCount; ++i) {
             const RenderSpanContext vc = SelectVoiceDestination(
                 context, v.channel[handles[i]]);
-            RenderTransientOneShotSpanScalar(
+            // A sample that ends while the voice is still in its attack or
+            // decay retires here; dropping the report left the voice active
+            // and silent until its note-off.
+            const uint32_t retiredAt = RenderTransientOneShotSpanScalar(
                 v, handles[i], vc.sampleData, vc.sampleDataFrames,
                 vc.outputLeft, vc.outputRight, vc.frameStart,
                 vc.frameCount);
+            if (retiredAt != UINT32_MAX)
+                RecordRetirement(context, handles[i], retiredAt);
         }
         return true;
     }
@@ -3234,7 +3239,10 @@ bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
         [&](uint32_t handle, const float* table) {
             const RenderSpanContext vc = SelectVoiceDestination(
                 context, v.channel[handle]);
-            RenderTransientOneShotFramesAVX2(vc, handle, table);
+            const uint32_t retiredAt =
+                RenderTransientOneShotFramesAVX2(vc, handle, table);
+            if (retiredAt != UINT32_MAX)
+                RecordRetirement(context, handle, retiredAt);
         });
     _mm256_zeroupper();
     return true;
