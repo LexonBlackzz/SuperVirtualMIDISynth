@@ -938,28 +938,37 @@ uint32_t RenderReleaseLoopScalar(const RenderSpanContext& c,
     return retiredAt;
 }
 
-// Releasing looping voice, 8 frames per chunk.  The release gain ladder is
-// simulated scalarly into gains[8]; only fetch/lerp/mix is vectorized.
-// Returns the frame the voice retired at, or UINT32_MAX if it is still alive.
-uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
-                                     uint32_t handle) {
+// Releasing voice, 8 frames per chunk.  The release gain ladder is simulated
+// scalarly into gains[8]; only fetch/lerp/mix is vectorized.  Returns the
+// frame the voice retired at, or UINT32_MAX if it is still alive.
+//   Loop:    wraps the cursor, rides rotation, the masked tail chunk and the
+//            optional closed-form gain ladder; returns 0 (untouched) when the
+//            voice fails ValidateLoopVoice.
+//   OneShot: retires at the first frame whose lerp partner would read past
+//            the sample, before the envelope consumes that frame (mirrors the
+//            generic state machine's sampleEnded branch).
+template <bool Loop>
+uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle) {
     VoiceSoA& v = *c.voices;
-    if (!ValidateLoopVoice(c, handle)) return 0u;
     // Form-1 (diffuse) rotation never reaches here: the class kernel refuses
     // before any state is touched.
     ChunkRotation rot;
-    rot.Init(v, c.hilbertData, handle);
+    if constexpr (Loop) {
+        if (!ValidateLoopVoice(c, handle)) return 0u;
+        rot.Init(v, c.hilbertData, handle);
+    }
+    const uint32_t relEnd = v.relEnd[handle];
     uint64_t pos = phasefx::Load(v, handle);
     float gain = v.currentGain[handle];
     uint32_t remaining = v.releaseSamplesRemaining[handle];
     const float decay = v.releaseDecay[handle];
     float step = v.phaseIncs[handle];
     uint64_t stepFx = phasefx::FromFloat(step);
-    const uint32_t relLoopS = v.relLoopS[handle];
-    const uint32_t relLoopE = v.relLoopE[handle];
+    const uint32_t relLoopS = Loop ? v.relLoopS[handle] : 0u;
+    const uint32_t relLoopE = Loop ? v.relLoopE[handle] : 0u;
     const uint64_t loopS64 = phasefx::Pack(relLoopS, 0u);
     const uint64_t loopE64 = phasefx::Pack(relLoopE, 0u);
-    const uint64_t guard64 = phasefx::Pack(relLoopE - 1u, 0u);
+    const uint64_t guard64 = phasefx::Pack((Loop ? relLoopE : relEnd) - 1u, 0u);
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
@@ -967,12 +976,11 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     FxSteps8 fs = MakeFxSteps8(stepFx);
-    // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
     VibratoWindow vib;
     const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
     uint32_t& windowRemaining = vib.remaining;
-    // quality.fast_chunk_math: the gain ladder in closed form.
-    const bool fastMath = g_fastChunkMath && !lfoOn;
+    // quality.fast_chunk_math: the gain ladder in closed form (loop voices).
+    const bool fastMath = Loop && g_fastChunkMath && !lfoOn;
     __m256 decayLadder = _mm256_setzero_ps();
     float decay8 = 1.0f;
     alignas(32) float ladder[8] = {};
@@ -995,7 +1003,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     uint32_t retiredAt = UINT32_MAX;
     while (frame < c.frameCount) {
         vib.Refill(c, v, handle, frame, step, stepFx, fs);
-        pos = phasefx::Wrap(pos, loopS64, loopE64);
+        if constexpr (Loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
         float futureGain = gain;
         alignas(32) float gains[8];
         if (fastMath) {
@@ -1012,9 +1020,6 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         const uint64_t lastPos = pos + fs.step7;
         if (frame + 8u <= c.frameCount && windowRemaining >= 8u &&
             countdownSafe && thresholdSafe && lastPos < guard64) {
-            // Warm the next chunk's sample lines: reads are sequential per
-            // voice, so one prefetch per chunk hides most of the gather's
-            // memory latency at ~0.1 cycles per frame.
             PrefetchNext(region, lastPos + stepFx);
             __m256i bases;
             __m256 fraction;
@@ -1025,8 +1030,9 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
             const __m256 gainVector = fastMath
                 ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
                 : Gains8(gains);
-            const __m256 scaled = _mm256_mul_ps(sample, gainVector);
-            MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
+            MixChunk8(outL + frame, outR + frame,
+                      _mm256_mul_ps(sample, gainVector),
+                      _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
             gain = futureGain;
             if (remaining != UINT32_MAX) remaining -= 8u;
             pos += fs.step8;
@@ -1035,58 +1041,70 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
             continue;
         }
 
-        // Masked tail chunk: the last 1..7 frames of a span ride the same
-        // vector code (only the live lanes are committed) instead of the slow
-        // per-frame path.  Spans are short when events split them, so most
-        // chunk-path misses were exactly this remainder.  Same guards as the
-        // full chunk, evaluated for the live lanes only.
-        // Rotation and filter state advance per lane in order, so voices that
-        // carry either keep the per-frame remainder.
-        if (!lfoOn && !rot && v.filterEnabled[handle] == 0u &&
-            c.frameCount - frame < 8u) {
-            const uint32_t rem = c.frameCount - frame;
-            const uint64_t lastLive = pos + stepFx * (rem - 1u);
-            const float tailGain = fastMath ? gain * ladder[rem - 1u]
-                                            : gains[rem - 1u];
-            if ((remaining == UINT32_MAX || remaining > rem) &&
-                (remaining != UINT32_MAX ||
-                 tailGain >= VoiceRetireThreshold()) &&
-                lastLive < guard64) {
-                const __m256i liveMask = _mm256_cmpgt_epi32(
-                    _mm256_set1_epi32(static_cast<int>(rem)),
-                    _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-                __m256i bases;
-                __m256 fraction;
-                FxChunk(pos, fs, bases, fraction);
-                // Dead lanes may sit past the loop; keep their reads in range.
-                bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
-                    static_cast<int>(phasefx::Index(lastLive))));
-                __m256 sample = LerpGather8(region, readable, bases, fraction);
-                sample = FilterTime8AVX2(v, handle, sample);
-                if (rot) sample = rot.Chunk(sample, bases, fraction);
-                const __m256 gainVector = fastMath
-                    ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
-                    : Gains8(gains);
-                const __m256 scaled = _mm256_mul_ps(sample, gainVector);
-                MixChunk8Masked(outL + frame, outR + frame, liveMask, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
-                gain = tailGain;
-                if (remaining != UINT32_MAX) remaining -= rem;
-                pos += stepFx * rem;
-                frame += rem;
-                continue;
+        if constexpr (Loop) {
+            // Masked tail chunk: the last 1..7 frames of a span ride the same
+            // vector code (only the live lanes are committed) instead of the
+            // slow per-frame path.  Spans are short when events split them,
+            // so most chunk-path misses were exactly this remainder.  Same
+            // guards as the full chunk, evaluated for the live lanes only.
+            // Rotation and filter state advance per lane in order, so voices
+            // that carry either keep the per-frame remainder.
+            if (!lfoOn && !rot && v.filterEnabled[handle] == 0u &&
+                c.frameCount - frame < 8u) {
+                const uint32_t rem = c.frameCount - frame;
+                const uint64_t lastLive = pos + stepFx * (rem - 1u);
+                const float tailGain = fastMath ? gain * ladder[rem - 1u]
+                                                : gains[rem - 1u];
+                if ((remaining == UINT32_MAX || remaining > rem) &&
+                    (remaining != UINT32_MAX ||
+                     tailGain >= VoiceRetireThreshold()) &&
+                    lastLive < guard64) {
+                    const __m256i liveMask = _mm256_cmpgt_epi32(
+                        _mm256_set1_epi32(static_cast<int>(rem)),
+                        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+                    __m256i bases;
+                    __m256 fraction;
+                    FxChunk(pos, fs, bases, fraction);
+                    // Dead lanes may sit past the loop; keep their reads in
+                    // range.
+                    bases = _mm256_min_epi32(bases, _mm256_set1_epi32(
+                        static_cast<int>(phasefx::Index(lastLive))));
+                    __m256 sample =
+                        LerpGather8(region, readable, bases, fraction);
+                    sample = FilterTime8AVX2(v, handle, sample);
+                    const __m256 gainVector = fastMath
+                        ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
+                        : Gains8(gains);
+                    MixChunk8Masked(outL + frame, outR + frame, liveMask,
+                                    _mm256_mul_ps(sample, gainVector),
+                                    _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
+                    gain = tailGain;
+                    if (remaining != UINT32_MAX) remaining -= rem;
+                    pos += stepFx * rem;
+                    frame += rem;
+                    continue;
+                }
             }
         }
 
         uint32_t base = phasefx::Index(pos);
-        if (base + 1u >= v.relEnd[handle]) {
-            pos = loopS64;
-            base = relLoopS;
-        }
         uint32_t next = base + 1u;
-        if (next >= relLoopE) next = relLoopS;
+        if constexpr (Loop) {
+            if (base + 1u >= relEnd) {
+                pos = loopS64;
+                base = relLoopS;
+            }
+            next = base + 1u;
+            if (next >= relLoopE) next = relLoopS;
+        } else if (base + 1u >= relEnd) {
+            // Sample ended: retire before the envelope consumes a frame.
+            retiredAt = frame;
+            break;
+        }
         const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
+        float sample = first + (static_cast<float>(region[next]) *
+            (1.0f / 32768.0f) - first) * fraction;
         bool finished = remaining == 0u;
         if (!finished) {
             gain *= decay;
@@ -1099,7 +1117,8 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
         if (rot) sample = rot.Scalar(sample, base, next, fraction);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        pos = phasefx::Wrap(pos + stepFx, loopS64, loopE64);
+        if constexpr (Loop) pos = phasefx::Wrap(pos + stepFx, loopS64, loopE64);
+        else pos += stepFx;
         --windowRemaining;
         if (finished ||
             (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
@@ -1113,6 +1132,11 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
     v.releaseSamplesRemaining[handle] = remaining;
     rot.Store();
     return retiredAt;
+}
+
+uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
+                                     uint32_t handle) {
+    return RenderReleaseChunked<true>(c, handle);
 }
 
 // Voice-batched release for spans of 1-4 frames: eight voices per vector,
@@ -2715,95 +2739,7 @@ uint32_t RenderSustainedOneShotFramesAVX2(const RenderSpanContext& c,
 
 uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
                                         uint32_t handle) {
-    VoiceSoA& v = *c.voices;
-    const uint32_t relEnd = v.relEnd[handle];
-    uint64_t pos = phasefx::Load(v, handle);
-    float gain = v.currentGain[handle];
-    uint32_t remaining = v.releaseSamplesRemaining[handle];
-    const float decay = v.releaseDecay[handle];
-    float step = v.phaseIncs[handle];
-    const float mixL = v.mixGainL[handle];
-    const float mixR = v.mixGainR[handle];
-    const int16_t* region = c.sampleData + v.sampleStart[handle];
-    float* outL = c.outputLeft + c.frameStart;
-    float* outR = c.outputRight + c.frameStart;
-    uint64_t stepFx = phasefx::FromFloat(step);
-    FxSteps8 fs = MakeFxSteps8(stepFx);
-    const uint64_t lastSafePos = phasefx::Pack(relEnd - 1u, 0u);
-    // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
-    VibratoWindow vib;
-    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
-    uint32_t& windowRemaining = vib.remaining;
-    uint32_t frame = 0u;
-    while (frame < c.frameCount) {
-        vib.Refill(c, v, handle, frame, step, stepFx, fs);
-        float futureGain = gain;
-        alignas(32) float gains[8];
-        for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
-            futureGain *= decay;
-            gains[laneIndex] = futureGain;
-        }
-        const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
-        const bool thresholdSafe = remaining != UINT32_MAX ||
-            gains[7] >= VoiceRetireThreshold();
-        const uint64_t lastPos = pos + fs.step7;
-        if (frame + 8u <= c.frameCount &&
-            windowRemaining >= 8u && countdownSafe &&
-            thresholdSafe && lastPos < lastSafePos) {
-            PrefetchNext(region, lastPos + stepFx);
-            __m256i bases;
-            __m256 fraction;
-            FxChunk(pos, fs, bases, fraction);
-            __m256 sample = LerpGather8(region, c.sampleDataFrames - v.sampleStart[handle], bases, fraction);
-            sample = FilterTime8AVX2(v, handle, sample);
-            const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
-            MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
-            gain = futureGain;
-            if (remaining != UINT32_MAX) remaining -= 8u;
-            pos += fs.step8;
-            frame += 8u;
-            windowRemaining -= 8u;
-            continue;
-        }
-        const uint32_t base = phasefx::Index(pos);
-        if (base + 1u >= relEnd) {
-            // Sample ended: retire before the envelope consumes a frame
-            // (mirrors the generic state machine's sampleEnded branch).
-            phasefx::Store(v, handle, pos);
-            v.currentGain[handle] = gain;
-            v.releaseSamplesRemaining[handle] = remaining;
-            return frame;
-        }
-        bool finished = remaining == 0u;
-        if (!finished) {
-            gain *= decay;
-            if (remaining != UINT32_MAX) {
-                --remaining;
-                finished = remaining == 0u;
-            }
-        }
-        const float fraction = phasefx::Weight(phasefx::Frac(pos));
-        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        float sample = first + (static_cast<float>(region[base + 1u]) *
-            (1.0f / 32768.0f) - first) * fraction;
-        sample = ProcessVoiceFilterSample(v, handle, sample);
-        outL[frame] += sample * gain * mixL;
-        outR[frame] += sample * gain * mixR;
-        pos += stepFx;
-        --windowRemaining;
-        ++frame;
-        if (finished ||
-            (remaining == UINT32_MAX && gain < VoiceRetireThreshold())) {
-            phasefx::Store(v, handle, pos);
-            v.currentGain[handle] = gain;
-            v.releaseSamplesRemaining[handle] = remaining;
-            return frame - 1u;
-        }
-    }
-    phasefx::Store(v, handle, pos);
-    v.currentGain[handle] = gain;
-    v.releaseSamplesRemaining[handle] = remaining;
-    return UINT32_MAX;
+    return RenderReleaseChunked<false>(c, handle);
 }
 
 // Transient one-shot: non-looping attack/decay voices (the decay stage of
