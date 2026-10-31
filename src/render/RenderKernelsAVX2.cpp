@@ -605,6 +605,27 @@ SVMS_K_FORCEINLINE void MixChunk8Masked(float* outL, float* outR,
         _mm256_maskload_ps(outR, mask), _mm256_mul_ps(sample, gainR)));
 }
 
+// One frame of eight looping voices, one per lane: wraps the cursors into
+// their loops, fetches both lerp neighbours (the second wraps to the loop
+// start) and interpolates.  The cursors are not advanced.
+SVMS_K_FORCEINLINE __m256 LoopLerp8(const int16_t* data, __m256i& phaseIdx,
+                                    __m256i phaseFrac, __m256i sampleStart,
+                                    __m256i loopStart, __m256i loopEnd) {
+    FxWrap8(phaseIdx, loopStart, loopEnd);
+    const __m256i base = phaseIdx;
+    const __m256i nextRaw = _mm256_add_epi32(base, _mm256_set1_epi32(1));
+    const __m256i wrap = _mm256_cmpgt_epi32(
+        nextRaw, _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
+    const __m256i next = _mm256_blendv_epi8(nextRaw, loopStart, wrap);
+    const __m256 first = GatherSampleAVX2(
+        data, _mm256_add_epi32(sampleStart, base));
+    const __m256 second = GatherSampleAVX2(
+        data, _mm256_add_epi32(sampleStart, next));
+    const __m256 fraction = FxWeight8(phaseFrac);
+    return _mm256_add_ps(first,
+        _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+}
+
 // Whole-voice vibrato: the 64-frame LFO control window is rebuilt whenever it
 // runs out, and the fast-chunk gate keeps a chunk from straddling a window
 // boundary.  remaining = UINT32_MAX means the LFO is off (scalar/SSE2 windows
@@ -1199,20 +1220,8 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
         const __m256i loopEnd = _mm256_i32gather_epi32(
             reinterpret_cast<const int*>(v.relLoopE), h, 4);
         for (uint32_t frame = 0u; frame < c.frameCount; ++frame) {
-            FxWrap8(phaseIdx, loopStart, loopEnd);
-            const __m256i base = phaseIdx;
-            const __m256i nextRaw = _mm256_add_epi32(
-                base, _mm256_set1_epi32(1));
-            const __m256i wraps = _mm256_cmpgt_epi32(
-                nextRaw, _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
-            const __m256i next = _mm256_blendv_epi8(nextRaw, loopStart, wraps);
-            const __m256 first = GatherSampleAVX2(c.sampleData,
-                _mm256_add_epi32(sampleStart, base));
-            const __m256 second = GatherSampleAVX2(c.sampleData,
-                _mm256_add_epi32(sampleStart, next));
-            const __m256 fraction = FxWeight8(phaseFrac);
-            const __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            const __m256 sample = LoopLerp8(c.sampleData, phaseIdx, phaseFrac, sampleStart,
+            loopStart, loopEnd);
             gain = _mm256_mul_ps(gain, decay);
             const __m256 scaled = _mm256_mul_ps(sample, gain);
             sumsL[frame] = _mm256_add_ps(
@@ -1587,20 +1596,8 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
         }
 
         for (uint32_t frame = 0u; frame < frames; ++frame) {
-            FxWrap8(phaseIdx, loopStart, loopEnd);
-            const __m256i base = phaseIdx;
-            const __m256i nextRaw = _mm256_add_epi32(
-                base, _mm256_set1_epi32(1));
-            const __m256i wrap = _mm256_cmpgt_epi32(
-                nextRaw, _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
-            const __m256i next = _mm256_blendv_epi8(nextRaw, loopStart, wrap);
-            const __m256 first = GatherSampleAVX2(c.sampleData,
-                _mm256_add_epi32(sampleStart, base));
-            const __m256 second = GatherSampleAVX2(c.sampleData,
-                _mm256_add_epi32(sampleStart, next));
-            const __m256 fraction = FxWeight8(phaseFrac);
-            __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = LoopLerp8(c.sampleData, phaseIdx, phaseFrac, sampleStart,
+            loopStart, loopEnd);
             sample = FilterVoices8AVX2(v, h, sample);
             // Exact scalar envelope recurrence per lane: gains are
             // bit-identical to the per-voice scalar sequence.
@@ -2283,19 +2280,8 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             reinterpret_cast<const __m256i*>(stepFracLane));
 
         for (uint32_t frame = 0; frame < context.frameCount; ++frame) {
-            FxWrap8(phaseIdx, loopStart, loopEnd);
-            const __m256i base = phaseIdx;
-            const __m256i nextRaw = _mm256_add_epi32(base, _mm256_set1_epi32(1));
-            const __m256i wrap = _mm256_cmpgt_epi32(nextRaw,
-                _mm256_sub_epi32(loopEnd, _mm256_set1_epi32(1)));
-            const __m256i next = _mm256_blendv_epi8(nextRaw, loopStart, wrap);
-            const __m256i baseIndex = _mm256_add_epi32(sampleStart, base);
-            const __m256i nextIndex = _mm256_add_epi32(sampleStart, next);
-            const __m256 first = GatherSampleAVX2(context.sampleData, baseIndex);
-            const __m256 second = GatherSampleAVX2(context.sampleData, nextIndex);
-            const __m256 fraction = FxWeight8(phaseFrac);
-            __m256 sample = _mm256_add_ps(first,
-                _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
+            __m256 sample = LoopLerp8(context.sampleData, phaseIdx, phaseFrac, sampleStart,
+            loopStart, loopEnd);
             sample = FilterVoices8AVX2(v, h, sample);
             accumulatedLeft[frame] = _mm256_add_ps(
                 accumulatedLeft[frame], _mm256_mul_ps(sample, gainL));
