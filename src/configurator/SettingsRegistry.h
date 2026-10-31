@@ -22,6 +22,7 @@ enum class NavPage {
     Diagnostics,
     Settings,
     DriverFeatures,  // Linux: schema-driven page, listed under Tools
+    Experimental,    // settings still being tried out
     Count
 };
 

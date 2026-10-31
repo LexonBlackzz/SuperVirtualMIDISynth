@@ -522,46 +522,6 @@ void CpuCard(ConfigDocument& doc) {
         if (ui::Toggle("##largepages", &w.largePages)) doc.MarkDirty();
         ui::EndRow();
     }
-    {
-        ui::BeginRow("sampledSteal", "Sampled voice stealing (experimental)",
-                     "When the voice pool is full, a new note replaces the cheapest voice in a rotating sample of the pool instead of the single quietest one, and is dropped if nothing in the sample is quiet enough. Keeps more fidelity in dense black MIDIs at higher voice limits; slower than the default. Based on the voice stealing in SSV2 by Savrien. Needs a restart.",
-                     ImVec2(46.0f * s, 28.0f * s));
-        if (ui::Toggle("##sampledsteal", &w.sampledSteal)) doc.MarkDirty();
-        ui::EndRow();
-    }
-    {
-        ui::BeginRow("dropZeroLife", "Drop instant-steal blips (experimental)",
-                     "A voice stolen on the same frame it started never plays a sample. This skips the short fade-out it would leave and lets those launches skip most of their work, which makes extreme black MIDIs far lighter on one shard. May change the sound slightly. Needs a restart.",
-                     ImVec2(46.0f * s, 28.0f * s));
-        if (ui::Toggle("##dropzerolife", &w.dropZeroLifeVictims)) doc.MarkDirty();
-        ui::EndRow();
-    }
-    {
-        static const char* labels[6] = {"Off", "Auto", "OpenGL", "Vulkan", "D3D11", "CUDA"};
-        int idx = static_cast<int>((std::min)(5u, w.gpuApi));
-        ui::BeginRow("gpuStage", "GPU rendering (experimental)",
-                     "Renders steady sustained voices on the graphics card so a CPU can reach far higher voice counts. Falls back to the CPU on any problem. CUDA needs an NVIDIA card; OpenGL needs 4.3; Vulkan needs any Vulkan 1.1 card (D3D11 is not built yet); Auto tries CUDA, then OpenGL. Needs a restart.",
-                     ui::SegmentedSize(labels, 6));
-        if (ui::Segmented("##gpustage", &idx, labels, 6)) {
-            w.gpuApi = static_cast<uint32_t>(idx);
-            doc.MarkDirty();
-        }
-        ui::EndRow();
-    }
-    {
-        ui::BeginRow("launchStaging", "Staged note launches (experimental)",
-                     "Writes a stolen voice's replacement into one compact record and lets the render threads finish the copy, so the single planning thread does less work on extreme black MIDIs. The sound is bit-identical. Needs a restart.",
-                     ImVec2(46.0f * s, 28.0f * s));
-        if (ui::Toggle("##launchstaging", &w.launchStaging)) doc.MarkDirty();
-        ui::EndRow();
-    }
-    {
-        ui::BeginRow("launchStagingAuto", "Staged launches for large pools",
-                     "Turns staged note launches on by itself when the voice pool is 1024 voices or more, where it speeds up extreme black MIDIs by 25 to 30 percent. Smaller pools keep the direct path. The sound is bit-identical either way. Needs a restart.",
-                     ImVec2(46.0f * s, 28.0f * s));
-        if (ui::Toggle("##launchstagingauto", &w.launchStagingAuto)) doc.MarkDirty();
-        ui::EndRow();
-    }
     ui::EndCard();
 }
 

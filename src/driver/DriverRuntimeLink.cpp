@@ -544,6 +544,25 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetBulkAdmission: {
+        // param = budget in percent of the voice limit per block; 0 = off.
+        // Read once per block by the renderer.
+        if (cmd.param > 1000u || !renderScalar) {
+            strncpy_s(resultText, kText,
+                      "bulk admission must be 0 (off) to 1000 percent",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        renderScalar->SetBulkAdmissionPercent(cmd.param);
+        engineConfig_.bulkAdmissionPercent = cmd.param;
+        if (cmd.param == 0u)
+            strncpy_s(resultText, kText, "bulk admission: off", _TRUNCATE);
+        else
+            _snprintf_s(resultText, kText, _TRUNCATE,
+                        "bulk admission: %u%% of the voice limit per block",
+                        cmd.param);
+        return svms::RLResult::Ok;
+    }
     case RT::SetNoteOnReexcite: {
         // param = 1: coalescing keeps collapsed repeat hits as re-excite
         // events (timing-exact); 0: it drops them.

@@ -16,6 +16,7 @@
 #include "configurator/PageSound.h"
 #include "configurator/PageOutput.h"
 #include "configurator/PagePerformance.h"
+#include "configurator/PageExperimental.h"
 #include "configurator/PageMidi.h"
 #include "configurator/PageOffline.h"
 #include "configurator/PageLiveRecording.h"
@@ -239,6 +240,7 @@ const NavItem kNavMain[] = {
     {NavPage::Output, "Output", "M11 5L6 9H2v6h4l5 4V5zM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"},
     {NavPage::Performance, "Performance", "M13 2L3 14h9l-1 8 10-12h-9l1-8z"},
     {NavPage::Midi, "MIDI", "M2 6h20v12H2zM7 6v7M12 6v7M17 6v7"},
+    {NavPage::Experimental, "Experimental", "M9 3h6M10 3v6l-5 9a2 2 0 0 0 1.8 3h10.4a2 2 0 0 0 1.8-3l-5-9V3M7.5 15h9"},
 };
 const NavItem kNavTools[] = {
     {NavPage::Render, "Render to file", "M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6M12 12v6M9 15l3 3 3-3"},
@@ -263,6 +265,7 @@ const PageHeader kPageHeaders[] = {
     {NavPage::Output, "Output", "Where the sound comes out, and how much delay you accept for stability."},
     {NavPage::Performance, "Performance", "How many notes SVMS can carry, and which shortcuts it may take when the CPU runs out."},
     {NavPage::Midi, "MIDI", "A hardware keyboard, and how SVMS copes when a file sends more events than it can take."},
+    {NavPage::Experimental, "Experimental", "Settings still being tried out. Some change how the music sounds, and each one says so."},
     {NavPage::Render, "Render to file", "Turn a MIDI file into a WAV, faster than realtime, with the settings you have now."},
     {NavPage::Record, "Record", "Capture exactly what you hear (after reverb and limiter) to a WAV file."},
     {NavPage::Diagnostics, "Diagnostics", "For bug reports. Copy the report and paste it into an issue."},
@@ -1071,6 +1074,7 @@ void ConfiguratorApp::DrawPageContent() {
     case NavPage::Output:      DrawOutputPage(config_, easterEggs_); break;
     case NavPage::Performance: DrawPerformancePage(config_); break;
     case NavPage::Midi:        DrawMidiPage(config_); break;
+    case NavPage::Experimental: DrawExperimentalPage(config_); break;
     case NavPage::Render:
         offlineRendererPage_.Draw(config_, static_cast<HWND>(platform_->NativeWindow()));
         break;

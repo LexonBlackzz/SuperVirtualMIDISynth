@@ -261,6 +261,9 @@ enum class RLCommandType : uint32_t {
     SetChannelSoundFont   = 0x00000125,
     // param = 1: left and right both carry their average (mono output).
     SetMonoDownmix        = 0x00000126,
+    // param = bulk block admission budget, percent of the voice limit
+    // (0 = off, 1..1000).
+    SetBulkAdmission      = 0x00000127,
 
 
     Invalid              = 0xFFFFFFFF,

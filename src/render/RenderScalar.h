@@ -556,7 +556,7 @@ private:
         }
     }
     std::vector<RenderEvent> splitEvents_;
-    uint32_t bulkAdmissionPercent_ = 0u;
+    std::atomic<uint32_t> bulkAdmissionPercent_{0u};
     uint64_t bulkAdmissionDropped_ = 0u;
     std::vector<RenderEvent> admittedEvents_;
     float* splitBusLeft_[kChannelCount] = {};
@@ -889,7 +889,7 @@ public:
     // velocity, ties to the later event.  Event frames of the notes that stay
     // are untouched.
     void SetBulkAdmissionPercent(uint32_t percent) {
-        bulkAdmissionPercent_ = percent;
+        bulkAdmissionPercent_.store(percent, std::memory_order_relaxed);
     }
     uint64_t GetBulkAdmissionDropped() const { return bulkAdmissionDropped_; }
     // Pure filter behind it (public for the tests).  Returns the note-on units

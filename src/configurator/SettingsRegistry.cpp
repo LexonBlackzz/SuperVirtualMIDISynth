@@ -23,7 +23,7 @@ bool Diff(const V& a, const V& b, M... members) {
 constexpr NavPage H = NavPage::Home, S = NavPage::Sound, E = NavPage::Effects,
                   O = NavPage::Output, P = NavPage::Performance, M = NavPage::Midi,
                   R = NavPage::Render, RC = NavPage::Record, G = NavPage::Diagnostics,
-                  T = NavPage::Settings;
+                  T = NavPage::Settings, X = NavPage::Experimental;
 
 // Searchable rows are the prototype's IDX table (names, places and keywords
 // verbatim). Rows without a name cover the remaining settings so every
@@ -67,13 +67,14 @@ const SettingDef kSettings[] = {
     {"unbounded", "Never skip ahead (unbounded render)", P, "Performance \xE2\x80\xBA Shortcuts", "unbounded recovery slow down", nullptr, nullptr, false, D(&V::unboundedRender)},
     {"threads", "Render threads", P, "Performance \xE2\x80\xBA CPU", "threads cores cpu workers", nullptr, nullptr, true, D(&V::renderThreads)},
     {"shards", "Engine shards", P, "Performance \xE2\x80\xBA CPU", "shards split engine", nullptr, nullptr, true, D(&V::shards)},
-    {"gpuStage", "GPU rendering (experimental)", P, "Performance \xE2\x80\xBA GPU", "gpu opengl cuda nvidia vulkan d3d11 compute offload black midi voices", nullptr, nullptr, true, D(&V::gpuApi, &V::gpuDevice)},
+    {"gpuStage", "GPU rendering (experimental)", X, "Experimental", "gpu opengl cuda nvidia vulkan d3d11 compute offload black midi voices", nullptr, nullptr, true, D(&V::gpuApi, &V::gpuDevice)},
     {"affinity", "Core placement (thread affinity)", P, "Performance \xE2\x80\xBA CPU", "hybrid thread affinity p-cores e-cores intel", nullptr, nullptr, false, D(&V::threadAffinityMode)},
     {"largePages", "Large memory pages", P, "Performance \xE2\x80\xBA CPU", "large pages tlb memory", nullptr, nullptr, true, D(&V::largePages)},
-    {"dropZeroLife", "Drop instant-steal blips (experimental)", P, "Performance \xE2\x80\xBA CPU", "drop zero life instant steal lazy launch black midi experimental", nullptr, nullptr, true, D(&V::dropZeroLifeVictims)},
-    {"sampledSteal", "Sampled voice stealing (experimental)", P, "Performance \xE2\x80\xBA CPU", "sampled steal victim voice stealing quality black midi experimental", nullptr, nullptr, true, D(&V::sampledSteal)},
-    {"launchStaging", "Staged note launches (experimental)", P, "Performance \xE2\x80\xBA CPU", "staged launch staging ghost copy steal black midi experimental", nullptr, nullptr, true, D(&V::launchStaging)},
-    {"launchStagingAuto", "Staged launches for large pools", P, "Performance \xE2\x80\xBA CPU", "staged launch staging automatic auto large pool black midi", nullptr, nullptr, true, D(&V::launchStagingAuto)},
+    {"dropZeroLife", "Drop instant-steal blips (experimental)", X, "Experimental", "drop zero life instant steal lazy launch black midi experimental", nullptr, nullptr, true, D(&V::dropZeroLifeVictims)},
+    {"sampledSteal", "Sampled voice stealing (experimental)", X, "Experimental", "sampled steal victim voice stealing quality black midi experimental", nullptr, nullptr, true, D(&V::sampledSteal)},
+    {"launchStaging", "Staged note launches (experimental)", X, "Experimental", "staged launch staging ghost copy steal black midi experimental", nullptr, nullptr, true, D(&V::launchStaging)},
+    {"launchStagingAuto", "Staged launches for large pools", X, "Experimental", "staged launch staging automatic auto large pool black midi", nullptr, nullptr, true, D(&V::launchStagingAuto)},
+    {"bulkAdmission", "Bulk note admission (experimental)", X, "Experimental", "bulk admission block budget velocity drop notes black midi overload dense saturated", nullptr, nullptr, false, D(&V::bulkAdmissionPercent)},
     {"retire", "Retire floor", P, "Performance \xE2\x80\xBA Engine internals", "voice retire floor release tail -76 db", nullptr, "perf", false, D(&V::voiceRetireThreshold)},
     {"perKey", "Per-key voice cap", P, "Performance \xE2\x80\xBA Engine internals", "per key cap", nullptr, "perf", false, D(&V::perKeyVoiceCap)},
     {"ghost", "Ghost budget", P, "Performance \xE2\x80\xBA Engine internals", "ghost steal storm", nullptr, "perf", false, D(&V::ghostBudget)},

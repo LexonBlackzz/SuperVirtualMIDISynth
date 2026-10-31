@@ -27,9 +27,11 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       float* const* channelBusLeft,
                                       float* const* channelBusRight) {
     (void)cfg;
-    if (bulkAdmissionPercent_ != 0u && eventCount != 0u) {
+    const uint32_t bulkPercent =
+        bulkAdmissionPercent_.load(std::memory_order_relaxed);
+    if (bulkPercent != 0u && eventCount != 0u) {
         const uint64_t budget = (static_cast<uint64_t>(voices.GetVoiceLimit()) *
-                                 bulkAdmissionPercent_ + 99u) / 100u;
+                                 bulkPercent + 99u) / 100u;
         const uint32_t dropped = BulkAdmissionFilter(
             events, eventCount,
             static_cast<uint32_t>((std::min<uint64_t>)(budget, UINT32_MAX)),

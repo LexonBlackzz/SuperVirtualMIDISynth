@@ -442,6 +442,7 @@ if(NOT WIN32)
                 configurator/PageOutput.cpp
                 configurator/PageSound.cpp
                 configurator/PagePerformance.cpp
+                configurator/PageExperimental.cpp
                 configurator/PageMidi.cpp
                 configurator/PageOffline.cpp
                 configurator/PageLiveRecording.cpp
@@ -1165,6 +1166,7 @@ if(NOT SVMS_XP_COMPAT)
         configurator/PageOutput.cpp
         configurator/PageSound.cpp
         configurator/PagePerformance.cpp
+        configurator/PageExperimental.cpp
         configurator/PageMidi.cpp
         configurator/PageOffline.cpp
         configurator/PageLiveRecording.cpp

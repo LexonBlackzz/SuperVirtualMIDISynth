@@ -545,6 +545,7 @@ typedef enum SVMS_Command {
     SVMS_COMMAND_SET_CHANNEL_SOUNDFONT   = 0x00000125,
     /* param = 1: both output channels carry the average of left and right. */
     SVMS_COMMAND_SET_MONO_DOWNMIX        = 0x00000126,
+    SVMS_COMMAND_SET_BULK_ADMISSION      = 0x00000127,
     /* Reload the configured SoundFont (text = optional UTF-8 path). */
     SVMS_COMMAND_RELOAD_SOUNDFONT        = 0x00000101,
     SVMS_COMMAND_RESET_VOICES            = 0x00000102,
