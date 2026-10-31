@@ -1223,6 +1223,20 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
         decay8 = ladder[7];
     }
     const bool tabled = gainTable != nullptr && !fastMath;
+    // The countdown and retire-threshold tests below only matter near the end
+    // of a voice's life.  When the gain table proves no chunk of this span can
+    // trip them, they are skipped.  The gain never rises (0 <= decay <= 1), so
+    // the last gain a chunk reads, table[frames - 1], is the smallest; the
+    // countdown drops one per frame, so it stays above 8 for every chunk when
+    // it starts above the span length.
+    bool testsMoot = false;
+    if (tabled) {
+        if (remaining == UINT32_MAX)
+            testsMoot = decay >= 0.0f && decay <= 1.0f && gain >= 0.0f &&
+                gainTable[c.frameCount - 1u] >= VoiceRetireThreshold();
+        else
+            testsMoot = remaining > c.frameCount;
+    }
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
     while (frame < c.frameCount) {
@@ -1242,8 +1256,9 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
                 gains[laneIndex] = futureGain;
             }
         }
-        const bool countdownSafe = remaining == UINT32_MAX || remaining > 8u;
-        const bool thresholdSafe = remaining != UINT32_MAX ||
+        const bool countdownSafe = testsMoot || remaining == UINT32_MAX ||
+            remaining > 8u;
+        const bool thresholdSafe = testsMoot || remaining != UINT32_MAX ||
             ((fastMath || tabled) ? futureGain : gains[7]) >=
                 VoiceRetireThreshold();
         const uint64_t lastPos = pos + fs.step7;
