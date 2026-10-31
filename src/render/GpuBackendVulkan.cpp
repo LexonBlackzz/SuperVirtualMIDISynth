@@ -647,14 +647,16 @@ bool VulkanBackend::Reserve(uint32_t handleCapacity, uint32_t maxFrames) {
 bool VulkanBackend::OpenBlock() {
     curSlot_ = (curSlot_ + 1u) % kSlots;
     Slot& s = slots_[curSlot_];
-    // The block this slot served two blocks ago is normally long finished; a
-    // late one the GPU still runs makes this wait.
+    // The block this slot served two blocks ago is normally long finished. A
+    // GPU that is busy with other work (a window being drawn) can still hold
+    // it; this waits a moment, then declines the block so the CPU renders it
+    // instead of the audio thread sitting on the fence.
     std::vector<VkFence> pending;
     for (size_t i = 0u; i < s.submitted.size(); ++i)
         if (s.submitted[i]) pending.push_back(s.fences[i]);
     if (!pending.empty()) {
         const VkResult w = vk_.WaitForFences(device_, static_cast<uint32_t>(pending.size()),
-                                             pending.data(), VK_TRUE, 2000000000ull);
+                                             pending.data(), VK_TRUE, 1500000ull);
         if (w != VK_SUCCESS) {
             if (w == VK_ERROR_DEVICE_LOST) lost_ = true;
             return false;
