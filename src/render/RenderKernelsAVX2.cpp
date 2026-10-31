@@ -175,6 +175,49 @@ inline void FxChunk(uint64_t pos, const FxSteps8& s, __m256i& bases,
         _mm256_permutevar8x32_epi32(b, even), 0x20));
 }
 
+// The eight scalar gains of a chunk as one vector.  They are produced by eight
+// scalar stores, so a single 256-bit load of the array stalls on store
+// forwarding; assembling the vector from the eight scalars does not.
+SVMS_K_FORCEINLINE __m256 Gains8(const float* g) {
+    return _mm256_setr_ps(g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+}
+
+// Exact eight-step envelope ladder for a voice deep inside its attack or decay
+// stage (at least nine counted steps left, so all eight steps stay in the
+// stage).  It is the same sequential recurrence the general simulation runs,
+// minus the stage and counter tests that cannot fire, so the gains are
+// bit-identical.  Returns false (nothing written) when the counters are too
+// small and the general simulation has to run.
+SVMS_K_FORCEINLINE bool EnvelopeLadder8(
+    uint8_t stage, float gain, uint32_t attackRemaining,
+    uint32_t decayRemaining, float attackStep, float targetGain,
+    float decaySlope, float sustainLevel, float* gains, float& futureGain,
+    uint32_t& futureAttack, uint32_t& futureDecay) {
+    if (stage == 1u && attackRemaining >= 9u) {
+        float g = gain;
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            g += attackStep;
+            if (g > targetGain) g = targetGain;
+            gains[k] = g;
+        }
+        futureGain = g;
+        futureAttack = attackRemaining - 8u;
+        return true;
+    }
+    if (stage == 2u && decayRemaining >= 9u) {
+        float g = gain;
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            g *= decaySlope;
+            if (g < sustainLevel) g = sustainLevel;
+            gains[k] = g;
+        }
+        futureGain = g;
+        futureDecay = decayRemaining - 8u;
+        return true;
+    }
+    return false;
+}
+
 // Eight independent cursors: a cursor past its loop end re-enters at the loop
 // start with the same fraction (single wrap; callers keep step < loop length).
 inline void FxWrap8(__m256i& idx, __m256i loopStart, __m256i loopEnd) {
@@ -945,7 +988,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 gainVector = fastMath
                 ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
-                : _mm256_load_ps(gains);
+                : Gains8(gains);
             const __m256 scaled = _mm256_mul_ps(sample, gainVector);
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
@@ -996,7 +1039,7 @@ uint32_t RenderReleaseLoopFramesAVX2(const RenderSpanContext& c,
                 if (rot) sample = rot.Chunk(sample, bases, fraction);
                 const __m256 gainVector = fastMath
                     ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
-                    : _mm256_load_ps(gains);
+                    : Gains8(gains);
                 const __m256 scaled = _mm256_mul_ps(sample, gainVector);
                 _mm256_maskstore_ps(outL + frame, liveMask, _mm256_add_ps(
                     _mm256_maskload_ps(outL + frame, liveMask),
@@ -1317,6 +1360,10 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
                 }
             }
         }
+        if (!closedForm)
+            closedForm = EnvelopeLadder8(stage, gain, attackRemaining,
+                decayRemaining, attackStep, targetGain, decaySlope,
+                sustainLevel, gains, futureGain, futureAttack, futureDecay);
         for (uint32_t laneIndex = 0u; !closedForm && laneIndex < 8u;
              ++laneIndex) {
             if (futureStage == 1u) {
@@ -1364,7 +1411,7 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
             if (rot) sample = rot.Chunk(sample, bases, fraction);
-            const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
+            const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
                 _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
@@ -1547,7 +1594,7 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
                     if (decayR[lane] == 0u) stageV[lane] = 3u;
                 }
             }
-            gain = _mm256_load_ps(gains);
+            gain = Gains8(gains);
             const __m256 scaled = _mm256_mul_ps(sample, gain);
             sumsL[frame] = _mm256_add_ps(sumsL[frame],
                 _mm256_mul_ps(scaled, mixL));
@@ -2819,7 +2866,7 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
-            const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
+            const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
                 _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
@@ -2932,7 +2979,11 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
         uint32_t futureAttack = attackRemaining;
         uint32_t futureDecay = decayRemaining;
         alignas(32) float gains[8];
-        for (uint32_t laneIndex = 0u; laneIndex < 8u; ++laneIndex) {
+        const bool straight = EnvelopeLadder8(stage, gain, attackRemaining,
+            decayRemaining, attackStep, targetGain, decaySlope, sustainLevel,
+            gains, futureGain, futureAttack, futureDecay);
+        for (uint32_t laneIndex = 0u; !straight && laneIndex < 8u;
+             ++laneIndex) {
             if (futureStage == 1u) {
                 if (futureAttack > 0u) {
                     futureGain += attackStep;
@@ -2973,7 +3024,7 @@ uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
             __m256 sample = _mm256_add_ps(first,
                 _mm256_mul_ps(_mm256_sub_ps(second, first), fraction));
             sample = FilterTime8AVX2(v, handle, sample);
-            const __m256 scaled = _mm256_mul_ps(sample, _mm256_load_ps(gains));
+            const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
             _mm256_storeu_ps(outL + frame, _mm256_add_ps(
                 _mm256_loadu_ps(outL + frame),
                 _mm256_mul_ps(scaled, _mm256_set1_ps(mixL))));
