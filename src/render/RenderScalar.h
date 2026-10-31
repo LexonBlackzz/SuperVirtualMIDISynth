@@ -378,6 +378,20 @@ struct WholeVoiceGhostTail {
 // per-channel log (not per-voice) is what makes ghosts correct for free: a
 // killed or stolen voice's ghost walks the same channel ops inside its own
 // [start, death) window, no transfer bookkeeping needed.
+// The volume/pan ops of one channel over a block as a curve (see
+// BuildWholeVoiceMixCurves): the AVX2 kernels read it instead of the voice being
+// cut at every op.  Built once per block per channel; every voice of the channel
+// shares it.
+struct WholeVoiceMixCurve {
+    const float* left;          // channel mix scale in force at each frame
+    const float* right;         // (readable 8 frames past the block)
+    uint32_t from;              // frame of the channel's first mix op
+    uint32_t lastFrame;         // frame of its last mix op
+    uint32_t rowStart;          // frame the row being rendered starts
+    const uint32_t* opFrames;   // frames of the channel's mix ops, ascending
+    uint32_t opCount;
+};
+
 struct WholeVoiceChannelOp {
     uint32_t frame;
     // Dispatch ordinal (position in the block's event array).  Same-frame
@@ -595,7 +609,8 @@ private:
                                  uint32_t jobIndex, float lfoDepth,
                                  float lfoBendRatio, bool lfoActive,
                                  const StepBreak* breaks = nullptr,
-                                 uint32_t breakCount = 0u);
+                                 uint32_t breakCount = 0u,
+                                 const WholeVoiceMixCurve* curve = nullptr);
     bool RenderWholeVoiceSegmentLfo(VoiceSoA& state, VoiceManager* voices,
                                     uint32_t row, const int16_t* sampleData,
                                     uint32_t sampleDataFrames, float* outL,
@@ -604,7 +619,12 @@ private:
                                     uint32_t jobIndex, float lfoDepth,
                                     float lfoBendRatio, bool lfoActive,
                                     const StepBreak* breaks = nullptr,
-                                    uint32_t breakCount = 0u);
+                                    uint32_t breakCount = 0u,
+                                    const WholeVoiceMixCurve* curve = nullptr);
+    void BuildWholeVoiceMixCurves(uint32_t numFrames);
+    static void SyncMixFromCurve(VoiceSoA& state, uint32_t row,
+                                 const WholeVoiceMixCurve& curve,
+                                 uint32_t frame);
     void RenderWholeVoiceRow(VoiceManager& voices, uint32_t handle,
                              const int16_t* sampleData,
                              uint32_t sampleDataFrames, float* itemLeft,
@@ -761,6 +781,17 @@ private:
     uint32_t wvChanOpStart_[kChannelCount + 2];
     // Index in wvChanOps_ of each channel's last mix op (UINT32_MAX = none).
     uint32_t wvChanLastMix_[kChannelCount + 1];
+    // Volume/pan curves (BuildWholeVoiceMixCurves): per channel the mix scale in
+    // force at every frame, the first and last mix op frames (UINT32_MAX = the
+    // channel has none this block), the ascending op frames, and for every op
+    // the index of the next op that is not a mix op.
+    std::vector<float> wvMixCurve_;
+    uint32_t wvMixCurveStride_ = 0u;
+    uint32_t wvMixCurveFrom_[kChannelCount + 1] = {};
+    uint32_t wvMixCurveLast_[kChannelCount + 1] = {};
+    uint32_t wvMixOpStart_[kChannelCount + 2] = {};
+    std::vector<uint32_t> wvMixOpFrames_;
+    std::vector<uint32_t> wvNextNonMix_;
     // Per steal-tail slot: frame an in-block All Sound Off killed the tail
     // (UINT32_MAX = alive or dead before this block).  kStealTailReserve is
     // a small compile-time constant, so a fixed member array is fine.
@@ -901,9 +932,10 @@ public:
     // velocity; the notes at the cut velocity are thinned evenly along the
     // block.  Event frames of the notes that stay are untouched.
     // Pitch bends inside a voice's span ride the AVX2 kernels as step breaks
-    // (the cursor changes step at the bend's exact frame inside a chunk)
-    // instead of splitting the span at every bend.  On by default; off
-    // restores the split, which the tests use as the reference.
+    // (the cursor changes step at the bend's exact frame inside a chunk) and
+    // volume/pan ops as a per-channel gain curve, instead of splitting the span
+    // at every op.  On by default; off restores the split, which the tests use
+    // as the reference.
     void SetBendFusion(bool on) { bendFusion_ = on; }
     // Spans that ran with fused bends since the renderer started.
     uint64_t GetFusedBendSpans() const {

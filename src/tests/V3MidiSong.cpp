@@ -953,6 +953,10 @@ bool RunOffline(const Options& options, const DecodedSong& song,
     if (!options.noteTracePath.empty()) svms::g_noteTrace = &noteTrace;
 #endif
 
+    // SVMS_BLOCK_CSV=<path>: one line per block (frame,events,active,budget%).
+    std::FILE* blockCsv = nullptr;
+    if (const char* csvPath = std::getenv("SVMS_BLOCK_CSV"))
+        blockCsv = std::fopen(csvPath, "w");
     while (frame < totalFrames) {
         const uint32_t n = static_cast<uint32_t>(
             (std::min<uint64_t>)(options.frames, totalFrames - frame));
@@ -1008,6 +1012,11 @@ bool RunOffline(const Options& options, const DecodedSong& song,
         intervalBudgetSum += budgetSamples.back();
         intervalBudgetMax = (std::max)(intervalBudgetMax, budgetSamples.back());
         ++intervalBlocks;
+        if (blockCsv != nullptr)
+            std::fprintf(blockCsv, "%llu,%llu,%u,%.2f\n",
+                         static_cast<unsigned long long>(frame),
+                         static_cast<unsigned long long>(blockEvents), active,
+                         budgetSamples.back());
         if (active > 0u) {
             cpvsSamples.push_back(
                 static_cast<double>(renderEnd - renderBegin) /

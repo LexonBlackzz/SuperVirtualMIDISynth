@@ -5,7 +5,8 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
     float* outR, uint32_t segStart, uint32_t segFrames, bool isReal,
     uint32_t jobIndex, float lfoDepth, float lfoBendRatio, bool lfoActive,
-    const StepBreak* breaks, uint32_t breakCount) {
+    const StepBreak* breaks, uint32_t breakCount,
+    const WholeVoiceMixCurve* curve) {
     // Per-segment rdtsc profiling is opt-in: this function runs once per
     // voice per op-split segment (tens of thousands of calls per block on
     // op-dense material), and six rdtsc per call measured ~+25% on every
@@ -30,19 +31,37 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
     // Pitch bends fused into this span (see StepBreak).  A path that cannot
     // take them renders the span in pieces, the step set before each one,
     // which is exactly what splitting at every bend did.
-    const bool fused = breakCount != 0u;
+    const bool fused = breakCount != 0u || curve != nullptr;
     auto renderPieces = [&]() -> bool {
+        const uint32_t segEnd = segStart + segFrames;
         uint32_t cursor = segStart;
-        for (uint32_t i = 0u; i <= breakCount; ++i) {
-            const uint32_t end = i < breakCount ? segStart + breaks[i].frame
-                                                : segStart + segFrames;
-            if (i > 0u) state.phaseIncs[row] = breaks[i - 1u].phaseInc;
-            if (end > cursor &&
-                RenderWholeVoiceSegment(state, voices, row, sampleData,
+        uint32_t nextBreak = 0u;
+        uint32_t nextOp = 0u;
+        if (curve != nullptr) {
+            nextOp = static_cast<uint32_t>(std::upper_bound(
+                curve->opFrames, curve->opFrames + curve->opCount, segStart) -
+                curve->opFrames);
+        }
+        while (cursor < segEnd) {
+            // The state in force at the piece start: the mix and the pitch the
+            // splitting left in the row before this piece.
+            if (curve != nullptr) SyncMixFromCurve(state, row, *curve, cursor);
+            while (nextBreak < breakCount &&
+                   segStart + breaks[nextBreak].frame <= cursor)
+                state.phaseIncs[row] = breaks[nextBreak++].phaseInc;
+            uint32_t end = segEnd;
+            if (nextBreak < breakCount)
+                end = (std::min)(end, segStart + breaks[nextBreak].frame);
+            if (curve != nullptr && nextOp < curve->opCount)
+                end = (std::min)(end, curve->opFrames[nextOp]);
+            if (curve != nullptr)
+                while (nextOp < curve->opCount && curve->opFrames[nextOp] <= end)
+                    ++nextOp;
+            if (RenderWholeVoiceSegment(state, voices, row, sampleData,
                                         sampleDataFrames, outL, outR, cursor,
                                         end - cursor, isReal, jobIndex,
                                         lfoDepth, lfoBendRatio, lfoActive,
-                                        nullptr, 0u))
+                                        nullptr, 0u, nullptr))
                 return true;
             cursor = end;
         }
@@ -63,13 +82,17 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
             isReal ? retBuf : nullptr,
             isReal ? &wvJobRetireCounts_[jobIndex * kWvRetireCountStride] : nullptr,
             lfoDepth, lfoBendRatio, lfoActive ? 1u : 0u,
-            nullptr, nullptr, breaks, breakCount};
+            nullptr, nullptr, breaks, breakCount,
+            curve != nullptr ? curve->left : nullptr,
+            curve != nullptr ? curve->right : nullptr,
+            curve != nullptr ? curve->from : 0u};
         if (kernel(context, &row, 1u)) {
             // The kernel stepped across the bends; the row keeps the last one
             // it reached (a voice that retired mid-span never saw the later
             // ones, as when the span was split at every bend).
             if (fused) {
                 uint32_t reached = breakCount;
+                uint32_t lastFrame = segStart + segFrames - 1u;
                 const uint32_t retiredNow =
                     wvJobRetireCounts_[jobIndex * kWvRetireCountStride];
                 if (isReal && retiredNow > retCountBefore) {
@@ -77,9 +100,14 @@ inline bool RenderScalar::RenderWholeVoiceSegment(
                     reached = 0u;
                     while (reached < breakCount && breaks[reached].frame <= at)
                         ++reached;
+                    lastFrame = segStart + at;
                 }
                 if (reached != 0u)
                     state.phaseIncs[row] = breaks[reached - 1u].phaseInc;
+                // The row keeps the volume/pan in force at the last frame the
+                // kernel rendered.
+                if (curve != nullptr)
+                    SyncMixFromCurve(state, row, *curve, lastFrame);
             }
             if (isReal) {
                 for (uint32_t i = retCountBefore;
@@ -161,14 +189,16 @@ inline bool RenderScalar::RenderWholeVoiceSegmentLfo(
     const int16_t* sampleData, uint32_t sampleDataFrames, float* outL,
     float* outR, uint32_t segStart, uint32_t segFrames, bool isReal,
     uint32_t jobIndex, float lfoDepth, float lfoBendRatio, bool lfoActive,
-    const StepBreak* breaks, uint32_t breakCount) {
+    const StepBreak* breaks, uint32_t breakCount,
+    const WholeVoiceMixCurve* curve) {
     // A row with no LFO (step 0) is untouched by every window, so it renders
     // as one segment; windows only matter for rows that carry a vibrato LFO.
     // (Step breaks only exist on AVX2 blocks, where wvScalarVibrato_ is off.)
     if (!wvScalarVibrato_ || state.vibLfoSteps[row] == 0.0f) {
         return RenderWholeVoiceSegment(state, voices, row, sampleData,
             sampleDataFrames, outL, outR, segStart, segFrames, isReal,
-            jobIndex, lfoDepth, lfoBendRatio, lfoActive, breaks, breakCount);
+            jobIndex, lfoDepth, lfoBendRatio, lfoActive, breaks, breakCount,
+            curve);
     }
     const uint32_t end = segStart + segFrames;
     uint32_t pos = segStart;
@@ -323,6 +353,105 @@ inline void RenderScalar::RenderGhostTailSpan(uint32_t ghost, VoiceSoA& s,
     if (s.rot != nullptr) wvGhostTails_[ghost].rot = s.stealTailRot[0];
 }
 
+// Per channel with volume/pan ops this block: the mix scale in force at every
+// frame as two arrays (the value the last op at or before the frame set, the
+// same left/right scales a mix op multiplies the voice's gains by), the first and
+// last op frames and the ascending op frames.  Also, for every op, the index of
+// the next op that is not a mix op.  AVX2 only: the other backends keep splitting
+// at every op.  Serial, once per block, a few frames per channel.
+inline void RenderScalar::BuildWholeVoiceMixCurves(uint32_t numFrames) {
+    for (uint32_t channel = 0u; channel <= kChannelCount; ++channel) {
+        wvMixCurveFrom_[channel] = UINT32_MAX;
+        wvMixCurveLast_[channel] = UINT32_MAX;
+        wvMixOpStart_[channel] = 0u;
+    }
+    wvMixOpStart_[kChannelCount + 1] = 0u;
+    const uint32_t total = wvChanOpStart_[kChannelCount];
+    if (!bendFusion_ || kernelSet_->backend != RenderBackend::AVX2 ||
+        total == 0u || wvChanOps_ == nullptr || numFrames == 0u)
+        return;
+    wvNextNonMix_.resize(total);
+    wvMixOpFrames_.clear();
+    const uint32_t stride = (numFrames + 8u + 7u) & ~7u;
+    if (wvMixCurveStride_ != stride ||
+        wvMixCurve_.size() < static_cast<size_t>(kChannelCount) * 2u * stride) {
+        wvMixCurveStride_ = stride;
+        wvMixCurve_.assign(static_cast<size_t>(kChannelCount) * 2u * stride,
+                           0.0f);
+    }
+    for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+        const uint32_t begin = wvChanOpStart_[channel];
+        const uint32_t end = wvChanOpStart_[channel + 1u];
+        wvMixOpStart_[channel] = static_cast<uint32_t>(wvMixOpFrames_.size());
+        uint32_t next = end;
+        for (uint32_t i = end; i-- > begin;) {
+            if (wvChanOps_[i].kind != 1u) next = i;
+            wvNextNonMix_[i] = next;
+        }
+        float* left = wvMixCurve_.data() +
+                      static_cast<size_t>(channel) * 2u * stride;
+        float* right = left + stride;
+        bool any = false;
+        uint32_t prevFrame = 0u;
+        float prevA = 0.0f, prevB = 0.0f;
+        for (uint32_t i = begin; i < end; ++i) {
+            const WholeVoiceChannelOp& op = wvChanOps_[i];
+            if (op.kind != 1u || op.frame >= numFrames) continue;
+            if (any && op.frame < prevFrame) {
+                // Ops arrive in frame order; anything else keeps the split.
+                wvMixCurveFrom_[channel] = UINT32_MAX;
+                wvMixOpFrames_.resize(wvMixOpStart_[channel]);
+                any = false;
+                break;
+            }
+            if (any) {
+                for (uint32_t f = prevFrame; f < op.frame; ++f) {
+                    left[f] = prevA;
+                    right[f] = prevB;
+                }
+            } else {
+                wvMixCurveFrom_[channel] = op.frame;
+            }
+            if (!any || op.frame != prevFrame)
+                wvMixOpFrames_.push_back(op.frame);
+            any = true;
+            prevFrame = op.frame;
+            prevA = op.a;
+            prevB = op.b;
+            wvMixCurveLast_[channel] = op.frame;
+        }
+        if (any) {
+            for (uint32_t f = prevFrame; f < stride; ++f) {
+                left[f] = prevA;
+                right[f] = prevB;
+            }
+        } else {
+            wvMixCurveFrom_[channel] = UINT32_MAX;
+            wvMixCurveLast_[channel] = UINT32_MAX;
+        }
+    }
+    wvMixOpStart_[kChannelCount] = static_cast<uint32_t>(wvMixOpFrames_.size());
+    wvMixOpStart_[kChannelCount + 1u] = wvMixOpStart_[kChannelCount];
+}
+
+// What a mix op leaves in a row (ApplyWholeVoiceRowOp), for the curve value at
+// `frame`: the mix gains, the sustained render gain from the current envelope
+// gain, and, once the channel's last op has been reached, the steal output gain.
+inline void RenderScalar::SyncMixFromCurve(VoiceSoA& state, uint32_t row,
+                                           const WholeVoiceMixCurve& curve,
+                                           uint32_t frame) {
+    if (frame < curve.from) return;
+    const float mixL = state.gainLeft[row] * curve.left[frame];
+    const float mixR = state.gainRight[row] * curve.right[frame];
+    const float gain = state.currentGain[row];
+    state.mixGainL[row] = mixL;
+    state.mixGainR[row] = mixR;
+    state.renderGainL[row] = gain * mixL;
+    state.renderGainR[row] = gain * mixR;
+    if (frame >= curve.lastFrame && curve.lastFrame >= curve.rowStart)
+        state.stealOutputGain[row] = std::sqrt(mixL * mixL + mixR * mixR);
+}
+
 // One real voice's whole-block timeline on the CPU: the start frame, the
 // exact-frame release flip, channel-op windows, re-excite hits and vibrato
 // windows split it into segments, each rendered by the class kernel.  The
@@ -395,6 +524,34 @@ inline void RenderScalar::RenderWholeVoiceRow(
             ++opIdx;
         }
     }
+    // Volume/pan ops ride the AVX2 kernels as the channel's gain curve instead
+    // of cutting the row at every op.  Not on a channel with vibrato, and not
+    // for a voice launched on the frame of a mix op: whether that op reaches
+    // it depends on the dispatch order, which the curve does not carry.
+    WholeVoiceMixCurve curve{};
+    bool rowCurve = false;
+    if (opChannel < kChannelCount &&
+        wvMixCurveFrom_[opChannel] != UINT32_MAX &&
+        !wvChanVibratoActive_[opChannel]) {
+        const uint32_t* opFrames = wvMixOpFrames_.data() +
+                                   wvMixOpStart_[opChannel];
+        const uint32_t opCount =
+            wvMixOpStart_[opChannel + 1u] - wvMixOpStart_[opChannel];
+        rowCurve = true;
+        if (startIngress != UINT32_MAX) {
+            const uint32_t* at = std::lower_bound(opFrames, opFrames + opCount,
+                                                  start);
+            if (at != opFrames + opCount && *at == start) rowCurve = false;
+        }
+        if (rowCurve) {
+            const float* left = wvMixCurve_.data() +
+                static_cast<size_t>(opChannel) * 2u * wvMixCurveStride_;
+            curve = {left, left + wvMixCurveStride_,
+                     wvMixCurveFrom_[opChannel], wvMixCurveLast_[opChannel],
+                     start, opFrames, opCount};
+        }
+    }
+    bool retiredRow = false;
     // Re-excite hits on this generation, in frame order: each one
     // splits the timeline and restarts the row's envelope at its
     // exact frame, before the release flip a later-ordinal note-off
@@ -433,9 +590,13 @@ inline void RenderScalar::RenderWholeVoiceRow(
         uint32_t stop = frameCount;
         if (releaseFrame != UINT32_MAX && releaseFrame < stop)
             stop = releaseFrame;
-        if (opIdx < opEnd &&
-            wvChanOps_[opIdx].frame < stop)
-            stop = wvChanOps_[opIdx].frame;
+        {
+            // With the gain curve the volume/pan ops are not stop points.
+            const uint32_t nextOp = rowCurve && opIdx < opEnd
+                ? wvNextNonMix_[opIdx] : opIdx;
+            if (nextOp < opEnd && wvChanOps_[nextOp].frame < stop)
+                stop = wvChanOps_[nextOp].frame;
+        }
         if (exIdx != UINT32_MAX &&
             wvExcites_[exIdx].frame < stop)
             stop = wvExcites_[exIdx].frame;
@@ -481,12 +642,18 @@ inline void RenderScalar::RenderWholeVoiceRow(
             // for the chunk path; everything else splits as before.
             StepBreak fuseBuffer[kWvMaxFusedBreaks];
             uint32_t fuseCount = 0u;
-            uint32_t fuseOps = 0u;       // ops consumed by the fused bends
+            uint32_t fuseNext = opIdx;   // first op the fused bends left
             float fuseRatio = vRatio;
+            // The next op that matters to the bends: with the gain curve the
+            // volume/pan ops in between are skipped.
+            auto relevant = [&](uint32_t x) -> uint32_t {
+                return rowCurve && x < opEnd ? wvNextNonMix_[x] : x;
+            };
+            const uint32_t firstOp = relevant(opIdx);
             if (bendFusion_ && !lfoActive &&
                 kernelSet_->backend == RenderBackend::AVX2 &&
-                opIdx < opEnd && wvChanOps_[opIdx].kind == 0u &&
-                wvChanOps_[opIdx].frame > cursor &&
+                firstOp < opEnd && wvChanOps_[firstOp].kind == 0u &&
+                wvChanOps_[firstOp].frame > cursor &&
                 !(!wvScalarVibrato_ && !wvScalarNoVibrato_ &&
                   wvChanVibratoActive_[opChannel] &&
                   v.vibLfoSteps[handle] != 0.0f &&
@@ -499,7 +666,7 @@ inline void RenderScalar::RenderWholeVoiceRow(
                 if (exIdx != UINT32_MAX && wvExcites_[exIdx].frame < hardStop)
                     hardStop = wvExcites_[exIdx].frame;
                 uint32_t runStop = hardStop;
-                for (uint32_t j = opIdx; j < opEnd; ++j) {
+                for (uint32_t j = firstOp; j < opEnd; j = relevant(j + 1u)) {
                     if (wvChanOps_[j].frame >= hardStop) break;
                     if (wvChanOps_[j].kind != 0u) {
                         runStop = wvChanOps_[j].frame;
@@ -507,9 +674,9 @@ inline void RenderScalar::RenderWholeVoiceRow(
                     }
                 }
                 const float scale = v.pitchBendScales[handle];
-                uint32_t j = opIdx;
+                uint32_t j = firstOp;
                 for (; j < opEnd && wvChanOps_[j].frame < runStop &&
-                       wvChanOps_[j].kind == 0u; ++j) {
+                       wvChanOps_[j].kind == 0u; j = relevant(j + 1u)) {
                     const WholeVoiceChannelOp& op = wvChanOps_[j];
                     const uint32_t rel = op.frame - cursor;
                     const bool sameFrame =
@@ -528,7 +695,7 @@ inline void RenderScalar::RenderWholeVoiceRow(
                     slot.step = phasefx::FromFloat(inc);
                 }
                 if (fuseCount != 0u && runStop - cursor >= 8u) {
-                    fuseOps = j - opIdx;
+                    fuseNext = j;
                     stop = runStop;
                     bendFusedSpans_.fetch_add(1u, std::memory_order_relaxed);
                 } else {
@@ -540,11 +707,13 @@ inline void RenderScalar::RenderWholeVoiceRow(
                     sampleDataFrames, itemLeft, itemRight,
                     cursor, stop - cursor, true, jobIndex,
                     vDepth, vRatio, lfoActive,
-                    fuseCount != 0u ? fuseBuffer : nullptr, fuseCount)) {
+                    fuseCount != 0u ? fuseBuffer : nullptr, fuseCount,
+                    rowCurve ? &curve : nullptr)) {
+                retiredRow = true;
                 break;  // retired; coordinator applies it
             }
             if (fuseCount != 0u) {
-                opIdx += fuseOps;
+                opIdx = fuseNext;
                 vRatio = fuseRatio;
             }
             cursor = stop;
@@ -572,11 +741,18 @@ inline void RenderScalar::RenderWholeVoiceRow(
                 v.loopEnabled[handle] = 0u;
             releaseFrame = UINT32_MAX;
         }
-        // Apply every op landing on this frame (ingress order).
+        // Apply every op landing on this frame (ingress order).  With the gain
+        // curve the volume/pan ops before it were already taken (the curve
+        // carries them) and are only stepped over.
         while (opIdx < opEnd &&
-               wvChanOps_[opIdx].frame == cursor) {
+               (wvChanOps_[opIdx].frame == cursor ||
+                (rowCurve && wvChanOps_[opIdx].frame < cursor))) {
             const WholeVoiceChannelOp& op =
                 wvChanOps_[opIdx];
+            if (rowCurve && op.kind == 1u) {
+                ++opIdx;
+                continue;
+            }
             if (op.kind == 2u) {
                 vDepth = op.a;
                 if (!(vDepth > 0.0f) &&
@@ -599,6 +775,10 @@ inline void RenderScalar::RenderWholeVoiceRow(
             ++opIdx;
         }
     }
+    // The row ends with the volume/pan of the last frame (the curve ops that
+    // fell inside its segments were never applied one by one).
+    if (rowCurve && !retiredRow && start < frameCount)
+        SyncMixFromCurve(v, handle, curve, frameCount - 1u);
 }
 
 inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
@@ -975,6 +1155,7 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     float* const* channelBusLeft, float* const* channelBusRight) {
     const uint32_t activeCount = voices.GetActiveCount();
     ++wholeVoiceBlocks_;
+    BuildWholeVoiceMixCurves(numFrames);
     std::memcpy(wvSliceHandles_, voices.activeList_,
                 static_cast<size_t>(activeCount) * sizeof(uint32_t));
     // Decimation: rank the active voices by velocity once and mute the

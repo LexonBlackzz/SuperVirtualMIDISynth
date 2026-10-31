@@ -277,6 +277,66 @@ inline void FxChunkBreak(uint64_t pos, const FxSteps8& s, const BreakChunk& bc,
     FxUnpack(a, b, bases, weight);
 }
 
+// The channel's volume/pan curve (RenderSpanContext::mixCurveL) as the gains
+// of a chunk.  `scale` is 1 for every kernel that applies the envelope gain
+// separately and currentGain for the sustained kernel, which folds its constant
+// gain into the mix (renderGain = currentGain x mix, in that order).
+struct MixCurve8 {
+    const float* l;
+    const float* r;
+    uint32_t from;
+    uint32_t base;
+    float gl, gr, scale;
+    bool on;
+    MixCurve8(const RenderSpanContext& c, const VoiceSoA& v, uint32_t handle,
+              float scaleIn)
+        : l(c.mixCurveL), r(c.mixCurveR), from(c.mixCurveFrom),
+          base(c.frameStart), gl(0.0f), gr(0.0f), scale(scaleIn),
+          on(c.mixCurveL != nullptr) {
+        if (on) {
+            gl = v.gainLeft[handle];
+            gr = v.gainRight[handle];
+        }
+    }
+    // Gains of the eight frames starting at span frame `frame`; rowL/rowR are
+    // what the row carries before the curve starts.
+    SVMS_K_FORCEINLINE void Chunk(uint32_t frame, float rowL, float rowR,
+                                  __m256& outL, __m256& outR) const {
+        const uint32_t b = base + frame;
+        if (!on || b + 8u <= from) {
+            outL = _mm256_set1_ps(rowL);
+            outR = _mm256_set1_ps(rowR);
+            return;
+        }
+        __m256 cl = _mm256_mul_ps(_mm256_set1_ps(gl), _mm256_loadu_ps(l + b));
+        __m256 cr = _mm256_mul_ps(_mm256_set1_ps(gr), _mm256_loadu_ps(r + b));
+        if (scale != 1.0f) {
+            cl = _mm256_mul_ps(_mm256_set1_ps(scale), cl);
+            cr = _mm256_mul_ps(_mm256_set1_ps(scale), cr);
+        }
+        if (b < from) {
+            const __m256i lane = _mm256_add_epi32(
+                _mm256_set1_epi32(static_cast<int>(b)),
+                _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+            const __m256 live = _mm256_castsi256_ps(_mm256_cmpgt_epi32(
+                lane, _mm256_set1_epi32(static_cast<int>(from) - 1)));
+            outL = _mm256_blendv_ps(_mm256_set1_ps(rowL), cl, live);
+            outR = _mm256_blendv_ps(_mm256_set1_ps(rowR), cr, live);
+        } else {
+            outL = cl;
+            outR = cr;
+        }
+    }
+    SVMS_K_FORCEINLINE float ScalarL(uint32_t frame, float rowL) const {
+        const uint32_t b = base + frame;
+        return (on && b >= from) ? scale * (gl * l[b]) : rowL;
+    }
+    SVMS_K_FORCEINLINE float ScalarR(uint32_t frame, float rowR) const {
+        const uint32_t b = base + frame;
+        return (on && b >= from) ? scale * (gr * r[b]) : rowR;
+    }
+};
+
 // The eight scalar gains of a chunk as one vector.  They are produced by eight
 // scalar stores, so a single 256-bit load of the array stalls on store
 // forwarding; assembling the vector from the eight scalars does not.
@@ -1111,8 +1171,7 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle,
     float* outL = c.outputLeft + c.frameStart;
     float* outR = c.outputRight + c.frameStart;
     FxSteps8 fs = MakeFxSteps8(stepFx);
-    const __m256 gainLVector = _mm256_set1_ps(gainL);
-    const __m256 gainRVector = _mm256_set1_ps(gainR);
+    const MixCurve8 mc(c, v, handle, Tabled ? 1.0f : v.currentGain[handle]);
     VibratoWindow vib;
     const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
     uint32_t& windowRemaining = vib.remaining;
@@ -1149,6 +1208,8 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle,
             if constexpr (Tabled)
                 sample = _mm256_mul_ps(sample,
                                        _mm256_loadu_ps(gainTable + frame));
+            __m256 gainLVector, gainRVector;
+            mc.Chunk(frame, gainL, gainR, gainLVector, gainRVector);
             MixChunk8(outL + frame, outR + frame, sample, gainLVector,
                       gainRVector);
             pos += advance;
@@ -1188,6 +1249,8 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle,
                     if constexpr (Tabled)
                         sample = _mm256_mul_ps(
                             sample, _mm256_loadu_ps(gainTable + frame));
+                    __m256 gainLVector, gainRVector;
+                    mc.Chunk(frame, gainL, gainR, gainLVector, gainRVector);
                     MixChunk8Masked(outL + frame, outR + frame, liveMask,
                                     sample, gainLVector, gainRVector);
                     pos += stepFx * rem;
@@ -1221,11 +1284,11 @@ uint32_t RenderSustainedChunked(const RenderSpanContext& c, uint32_t handle,
         sample = ProcessVoiceFilterSample(v, handle, sample);
         if constexpr (Tabled) {
             const float g = gainTable[frame];
-            outL[frame] += sample * g * gainL;
-            outR[frame] += sample * g * gainR;
+            outL[frame] += sample * g * mc.ScalarL(frame, gainL);
+            outR[frame] += sample * g * mc.ScalarR(frame, gainR);
         } else {
-            outL[frame] += sample * gainL;
-            outR[frame] += sample * gainR;
+            outL[frame] += sample * mc.ScalarL(frame, gainL);
+            outR[frame] += sample * mc.ScalarR(frame, gainR);
         }
         pos += stepFx;
         --windowRemaining;
@@ -1375,6 +1438,7 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
     uint32_t& windowRemaining = vib.remaining;
     BreakWalker bw(c, !lfoOn);
     BreakChunk bc;
+    const MixCurve8 mc(c, v, handle, 1.0f);
     // quality.fast_chunk_math: the gain ladder in closed form (loop voices).
     const bool fastMath = Loop && g_fastChunkMath && !lfoOn;
     __m256 decayLadder = _mm256_setzero_ps();
@@ -1445,9 +1509,11 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
             const __m256 gainVector = fastMath
                 ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
                 : (tabled ? tableGains : Gains8(gains));
+            __m256 mixLVector, mixRVector;
+            mc.Chunk(frame, mixL, mixR, mixLVector, mixRVector);
             MixChunk8(outL + frame, outR + frame,
-                      _mm256_mul_ps(sample, gainVector),
-                      _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
+                      _mm256_mul_ps(sample, gainVector), mixLVector,
+                      mixRVector);
             gain = futureGain;
             if (remaining != UINT32_MAX) remaining -= 8u;
             pos += advance;
@@ -1497,9 +1563,11 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
                     const __m256 gainVector = fastMath
                         ? _mm256_mul_ps(_mm256_set1_ps(gain), decayLadder)
                         : (tabled ? tableGains : Gains8(gains));
+                    __m256 mixLVector, mixRVector;
+                    mc.Chunk(frame, mixL, mixR, mixLVector, mixRVector);
                     MixChunk8Masked(outL + frame, outR + frame, liveMask,
                                     _mm256_mul_ps(sample, gainVector),
-                                    _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
+                                    mixLVector, mixRVector);
                     gain = tailGain;
                     if (remaining != UINT32_MAX) remaining -= rem;
                     pos += stepFx * rem;
@@ -1537,8 +1605,8 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
         }
         sample = ProcessVoiceFilterSample(v, handle, sample);
         if (rot) sample = rot.Scalar(sample, base, next, fraction);
-        outL[frame] += sample * gain * mixL;
-        outR[frame] += sample * gain * mixR;
+        outL[frame] += sample * gain * mc.ScalarL(frame, mixL);
+        outR[frame] += sample * gain * mc.ScalarR(frame, mixR);
         if constexpr (Loop) pos = phasefx::Wrap(pos + stepFx, loopS64, loopE64);
         else pos += stepFx;
         --windowRemaining;
@@ -1549,7 +1617,9 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
         }
         ++frame;
     }
-    phasefx::Store(v, handle, pos);
+    // The stored cursor is wrapped, like the sustained kernel's and the scalar
+    // span's: the 1-4 frame kernels read it without wrapping first.
+    phasefx::Store(v, handle, Loop ? phasefx::Wrap(pos, loopS64, loopE64) : pos);
     v.currentGain[handle] = gain;
     v.releaseSamplesRemaining[handle] = remaining;
     rot.Store();
@@ -1674,7 +1744,7 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
                            const uint32_t* handles,
                            uint32_t handleCount) {
     // Step breaks (pitch bends inside the span) are for one voice at a time.
-    if (context.stepBreakCount != 0u &&
+    if ((context.stepBreakCount != 0u || context.mixCurveL != nullptr) &&
         (handleCount != 1u || !LoopVoiceTakesBreaks(context, handles[0])))
         return false;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
@@ -1792,6 +1862,7 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
     uint32_t& windowRemaining = vib.remaining;
     BreakWalker bw(c, !lfoOn);
     BreakChunk bc;
+    const MixCurve8 mc(c, v, handle, 1.0f);
     const bool fastMath = Loop && g_fastChunkMath && !lfoOn;
     uint32_t frame = 0u;
     uint32_t retiredAt = UINT32_MAX;
@@ -1912,7 +1983,10 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
             if (rot) sample = rot.Chunk(sample, bases, fraction);
             const __m256 scaled = _mm256_mul_ps(
                 sample, fromTable ? tableGains : Gains8(gains));
-            MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
+            __m256 mixLVector, mixRVector;
+            mc.Chunk(frame, mixL, mixR, mixLVector, mixRVector);
+            MixChunk8(outL + frame, outR + frame, scaled, mixLVector,
+                      mixRVector);
             gain = futureGain;
             stage = futureStage;
             attackRemaining = futureAttack;
@@ -1970,14 +2044,14 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
         }
         sample = ProcessVoiceFilterSample(v, handle, sample);
         if (rot) sample = rot.Scalar(sample, base, next, fraction);
-        outL[frame] += sample * gain * mixL;
-        outR[frame] += sample * gain * mixR;
+        outL[frame] += sample * gain * mc.ScalarL(frame, mixL);
+        outR[frame] += sample * gain * mc.ScalarR(frame, mixR);
         if constexpr (Loop) pos = phasefx::Wrap(pos + stepFx, loopS64, loopE64);
         else pos += stepFx;
         --windowRemaining;
         ++frame;
     }
-    phasefx::Store(v, handle, pos);
+    phasefx::Store(v, handle, Loop ? phasefx::Wrap(pos, loopS64, loopE64) : pos);
     v.currentGain[handle] = gain;
     v.envelopeStage[handle] = stage;
     v.attackSamplesRemaining[handle] = attackRemaining;
@@ -2145,7 +2219,7 @@ bool RenderTransientLoopAVX2(const RenderSpanContext& context,
                              const uint32_t* handles,
                              uint32_t handleCount) {
     // Step breaks (pitch bends inside the span) are for one voice at a time.
-    if (context.stepBreakCount != 0u &&
+    if ((context.stepBreakCount != 0u || context.mixCurveL != nullptr) &&
         (handleCount != 1u || !LoopVoiceTakesBreaks(context, handles[0])))
         return false;
     if (handleCount == 0u) return true;
@@ -2593,7 +2667,7 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                              const uint32_t* handles,
                              uint32_t handleCount) {
     // Step breaks (pitch bends inside the span) are for one voice at a time.
-    if (context.stepBreakCount != 0u &&
+    if ((context.stepBreakCount != 0u || context.mixCurveL != nullptr) &&
         (handleCount != 1u || !LoopVoiceTakesBreaks(context, handles[0])))
         return false;
     VoiceSoA& v = *context.voices;
@@ -3124,7 +3198,9 @@ bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
                                 const uint32_t* handles,
                                 uint32_t handleCount) {
     // Step breaks (pitch bends inside the span) are for one voice at a time.
-    if (context.stepBreakCount != 0u && handleCount != 1u) return false;
+    if ((context.stepBreakCount != 0u || context.mixCurveL != nullptr) &&
+        handleCount != 1u)
+        return false;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     if (context.voices->rot != nullptr) return false;
     VoiceSoA& v = *context.voices;
@@ -3168,7 +3244,9 @@ bool RenderSustainedOneShotAVX2(const RenderSpanContext& context,
                                 const uint32_t* handles,
                                 uint32_t handleCount) {
     // Step breaks (pitch bends inside the span) are for one voice at a time.
-    if (context.stepBreakCount != 0u && handleCount != 1u) return false;
+    if ((context.stepBreakCount != 0u || context.mixCurveL != nullptr) &&
+        handleCount != 1u)
+        return false;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     // Rotation voices render through the rotation-hooked scalar spans.
     if (context.voices->rot != nullptr) return false;
@@ -3216,7 +3294,9 @@ bool RenderReleaseOneShotAVX2(const RenderSpanContext& context,
                               const uint32_t* handles,
                               uint32_t handleCount) {
     // Step breaks (pitch bends inside the span) are for one voice at a time.
-    if (context.stepBreakCount != 0u && handleCount != 1u) return false;
+    if ((context.stepBreakCount != 0u || context.mixCurveL != nullptr) &&
+        handleCount != 1u)
+        return false;
     if (context.frameCount == 0u || context.sampleData == nullptr) return true;
     if (context.voices->rot != nullptr) return false;
     VoiceSoA& v = *context.voices;

@@ -75,6 +75,16 @@ struct RenderSpanContext {
     // that omit these fields value-init them to none.
     const StepBreak* stepBreaks;
     uint32_t stepBreakCount;
+    // Optional volume/pan curve of the voice's channel over the span: from
+    // block frame mixCurveFrom on (the block frame is frameStart plus the
+    // frame inside the span) the voice mixes with gainLeft x mixCurveL[frame]
+    // and gainRight x mixCurveR[frame], the product a mix op leaves in the
+    // row's mixGainL/R; before that frame it mixes with the gains the row
+    // carries.  Honored by the same kernels, under the same conditions, as the
+    // step breaks (the arrays are readable up to 8 frames past the span).
+    const float* mixCurveL;
+    const float* mixCurveR;
+    uint32_t mixCurveFrom;
 };
 
 // Per-voice destination resolution for class kernels: when the span carries

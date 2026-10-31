@@ -1419,8 +1419,11 @@ void RunFilteredGroupKernelTest(bool release) {
 // those frames with the step set before each piece.  Sustained and release
 // loops, filtered and not, random break frames (adjacent ones included),
 // steps above and below one frame per frame, spans that are not a multiple of
-// eight.
-void RunStepBreakKernelTest(bool release) {
+// eight.  With `curve`, the channel's volume/pan curve rides the same call
+// (mixCurveL/R: from its first op frame the voice mixes with gainLeft x the
+// curve) and the reference splits at the curve's op frames too, setting the row's
+// mix from the curve at each piece start, as the splitting did.
+void RunStepBreakKernelTest(bool release, bool curve, uint32_t seedValue) {
     if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
     // The closed-form gain ladder is not bit-exact with the sequential
     // recurrence, so chunk alignment would change the bits; this test is about
@@ -1429,7 +1432,7 @@ void RunStepBreakKernelTest(bool release) {
     constexpr uint32_t kVoices = 24u;
     constexpr uint32_t kRegion = 4096u;
     std::vector<int16_t> samples(kRegion + 8u, 0);
-    uint32_t rng = 777u;
+    uint32_t rng = seedValue;
     auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
     for (uint32_t i = 0; i < kRegion; ++i)
         samples[i] = static_cast<int16_t>(next() & 0x7FFF) - 16384;
@@ -1497,6 +1500,31 @@ void RunStepBreakKernelTest(bool release) {
         for (const uint32_t breakCount : breakCounts) {
             if (breakCount >= span.count) continue;
             for (const uint32_t handle : handles) {
+                // The curve: ops at random frames (adjacent ones included) of
+                // the block (the span starts at span.start), values near 1.
+                std::vector<float> curveL(span.start + span.count + 16u, 1.0f);
+                std::vector<float> curveR(span.start + span.count + 16u, 1.0f);
+                std::vector<uint32_t> opFrames;
+                uint32_t curveFrom = UINT32_MAX;
+                if (curve) {
+                    const uint32_t ops = 1u + next() % 12u;
+                    uint32_t at = span.start + next() % (span.count / 2u + 1u);
+                    for (uint32_t k = 0u; k < ops && at < span.start + span.count; ++k) {
+                        opFrames.push_back(at);
+                        at += 1u + next() % (span.count / ops + 1u);
+                    }
+                    curveFrom = opFrames[0];
+                    for (uint32_t k = 0u; k < opFrames.size(); ++k) {
+                        const float a = 0.2f + static_cast<float>(next() % 1000u) / 600.0f;
+                        const float b = 0.2f + static_cast<float>(next() % 1000u) / 600.0f;
+                        const uint32_t to = k + 1u < opFrames.size()
+                            ? opFrames[k + 1u] : static_cast<uint32_t>(curveL.size());
+                        for (uint32_t f = opFrames[k]; f < to; ++f) {
+                            curveL[f] = a;
+                            curveR[f] = b;
+                        }
+                    }
+                }
                 // Strictly increasing frames in 1..count-1, some adjacent.
                 std::vector<svms::StepBreak> breaks;
                 uint32_t frame = 0u;
@@ -1515,7 +1543,7 @@ void RunStepBreakKernelTest(bool release) {
                     sb.step = svms::phasefx::FromFloat(sb.phaseInc);
                     breaks.push_back(sb);
                 }
-                if (breaks.empty()) continue;
+                if (breaks.empty() && !curve) continue;
                 std::vector<uint32_t> positions(64u);
                 for (uint32_t p = 0; p < 64u; ++p) positions[p] = p;
 
@@ -1529,30 +1557,50 @@ void RunStepBreakKernelTest(bool release) {
                     std::vector<svms::SpanRetirement> retired(64u);
                     uint32_t retiredCount = 0u;
                     auto makeContext = [&](uint32_t from, uint32_t length,
-                                           const svms::StepBreak* sb, uint32_t n) {
+                                           const svms::StepBreak* sb, uint32_t n,
+                                           bool withCurve) {
                         return svms::RenderSpanContext{
                             &run[piecewise]->v, samples.data(), nullptr, kRegion + 8u,
                             mixL[piecewise].data(), mixR[piecewise].data(),
                             span.start + from, length, 64u, nullptr, nullptr,
                             positions.data(), retired.data(), &retiredCount,
-                            0.0f, 1.0f, 0u, nullptr, nullptr, sb, n};
+                            0.0f, 1.0f, 0u, nullptr, nullptr, sb, n,
+                            withCurve ? curveL.data() : nullptr,
+                            withCurve ? curveR.data() : nullptr, curveFrom};
                     };
                     uint32_t h = handle;
                     if (!piecewise) {
                         const svms::RenderSpanContext ctx = makeContext(
                             0u, span.count, breaks.data(),
-                            static_cast<uint32_t>(breaks.size()));
+                            static_cast<uint32_t>(breaks.size()), curve);
                         Check(kernel(ctx, &h, 1u), "step break kernel takes one voice");
                         if (retiredCount != 0u) retiredFrame[0] = retired[0].frameOffset;
                     } else {
+                        // Piece boundaries: every break frame and every curve op.
+                        std::vector<uint32_t> cuts;
+                        for (const svms::StepBreak& b : breaks) cuts.push_back(b.frame);
+                        for (const uint32_t f : opFrames)
+                            if (f > span.start && f < span.start + span.count)
+                                cuts.push_back(f - span.start);
+                        cuts.push_back(span.count);
+                        std::sort(cuts.begin(), cuts.end());
+                        cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
                         uint32_t cursor = 0u;
-                        for (size_t piece = 0u; piece <= breaks.size(); ++piece) {
-                            const uint32_t end = piece < breaks.size()
-                                ? breaks[piece].frame : span.count;
-                            if (piece > 0u)
-                                run[1]->v.phaseIncs[handle] = breaks[piece - 1u].phaseInc;
+                        for (const uint32_t end : cuts) {
+                            for (const svms::StepBreak& b : breaks)
+                                if (b.frame <= cursor && cursor != 0u)
+                                    run[1]->v.phaseIncs[handle] = b.phaseInc;
+                            if (curve && span.start + cursor >= curveFrom) {
+                                svms::VoiceSoA& pv = run[1]->v;
+                                const float mixL = pv.gainLeft[handle] * curveL[span.start + cursor];
+                                const float mixR = pv.gainRight[handle] * curveR[span.start + cursor];
+                                pv.mixGainL[handle] = mixL;
+                                pv.mixGainR[handle] = mixR;
+                                pv.renderGainL[handle] = pv.currentGain[handle] * mixL;
+                                pv.renderGainR[handle] = pv.currentGain[handle] * mixR;
+                            }
                             const svms::RenderSpanContext ctx =
-                                makeContext(cursor, end - cursor, nullptr, 0u);
+                                makeContext(cursor, end - cursor, nullptr, 0u, false);
                             Check(kernel(ctx, &h, 1u), "piece kernel takes one voice");
                             if (retiredCount != 0u) {
                                 retiredFrame[1] = cursor + retired[0].frameOffset;
@@ -1581,17 +1629,23 @@ void RunStepBreakKernelTest(bool release) {
             }
         }
     }
-    std::fprintf(stderr, "[STEPBRK] %s cases=%u retired=%u mismatched=%u\n",
-                 release ? "release" : "sustained", cases, retiredCases,
-                 mismatched);
+    std::fprintf(stderr, "[STEPBRK] %s%s cases=%u retired=%u mismatched=%u\n",
+                 release ? "release" : "sustained", curve ? "+curve" : "", cases,
+                 retiredCases, mismatched);
     Check(cases > 100u, "step break kernel test ran its cases");
     Check(mismatched == 0u,
           "step breaks inside one kernel call equal the span split at the same frames, bit for bit");
 }
 
 void TestStepBreakKernels() {
-    RunStepBreakKernelTest(false);
-    RunStepBreakKernelTest(true);
+    // A few seeds: the break and curve frames are random, and one seed once
+    // missed a release cursor stored past the loop end that others caught.
+    for (const uint32_t seedValue : {777u, 1u, 2u, 3u}) {
+        RunStepBreakKernelTest(false, false, seedValue);
+        RunStepBreakKernelTest(true, false, seedValue);
+        RunStepBreakKernelTest(false, true, seedValue);
+        RunStepBreakKernelTest(true, true, seedValue);
+    }
 }
 
 void TestFilteredGroupKernel() {
@@ -3167,8 +3221,8 @@ void TestBendFusionIdentity() {
                  (rng.Next() % 5u == 0u && !events.empty())
                      ? events.back().frameOffset : rng.Next() % kFrames);
         }
-        // Mix CCs (volume, pan): non-bend ops that cut a fused run.
-        for (uint32_t j = 0; j < 5u; ++j)
+        // Mix CCs (volume, pan): they ride the fused runs with the bends.
+        for (uint32_t j = 0; j < 40u; ++j)
             push(svms::RenderEventType::ControlChange,
                  static_cast<uint8_t>(rng.Next() % 4u),
                  (rng.Next() % 2u) != 0u ? 7u : 10u,
@@ -3202,11 +3256,29 @@ void TestBendFusionIdentity() {
             splitVoices->GetActiveCount() == fusedVoices->GetActiveCount();
         const uint32_t cap = (std::min)(splitVoices->GetMaxVoices(),
                                         fusedVoices->GetMaxVoices());
+        // renderGainL/R of a row that is not held at its sustain level is dead
+        // state (only the sustained kernels read it, and it is rebuilt when a
+        // row reaches sustain), so a fused mix op leaves currentGain x mix at
+        // the end of the span where splitting left the value at the op's frame.
+        // Held rows are compared as every other field is.
+        auto heldAtSustain = [&](uint32_t h) {
+            return splitVoices->v.state[h] ==
+                       static_cast<uint8_t>(svms::VoiceState::Active) &&
+                   splitVoices->v.envelopeStage[h] == 3u;
+        };
 #define SVMS_CMP_FIELD(type, name) \
-        same = same && std::memcmp(splitVoices->v.name, fusedVoices->v.name, \
-                                   cap * sizeof(type)) == 0;
+        same = same && (std::strcmp(#name, "renderGainL") == 0 || \
+                        std::strcmp(#name, "renderGainR") == 0 || \
+                        std::memcmp(splitVoices->v.name, fusedVoices->v.name, \
+                                    cap * sizeof(type)) == 0);
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
 #undef SVMS_CMP_FIELD
+        for (uint32_t h = 0u; h < cap; ++h) {
+            if (!heldAtSustain(h)) continue;
+            same = same &&
+                splitVoices->v.renderGainL[h] == fusedVoices->v.renderGainL[h] &&
+                splitVoices->v.renderGainR[h] == fusedVoices->v.renderGainR[h];
+        }
         if (!same) ++mismatchedBlocks;
     }
     std::fprintf(stderr, "[BENDFUSE] mismatched blocks=%u worst audio diff=%g fused spans=%llu (split renderer: %llu)\n",
