@@ -1300,22 +1300,27 @@ bool RenderReleaseLoopAVX2(const RenderSpanContext& context,
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Transient-loop kernel (looping attack/decay voices).
+// Transient kernel (attack/decay voices), loop and one-shot.
 //
-// Mirrors RenderReleaseLoopFramesAVX2: the envelope is advanced scalarly
+// Mirrors RenderReleaseChunked: the envelope is advanced scalarly
 // eight steps ahead into gains[8] using the exact sequential scalar
 // recurrence (bit-exact by construction — no decay^8 power tricks), and
 // only the sample fetch / lerp / mix is vectorized across time.  Transient
 // voices never retire mid-span; when attack+decay completes (stage reaches
 // 3) the voice is reported through classChangeHandles instead of
-// retirements, matching the scalar class kernel.
+// retirements, matching the scalar class kernel.  A one-shot voice instead
+// retires at the first frame whose lerp partner would read past the sample
+// (the frame is returned), and a loop voice that fails ValidateLoopVoice is
+// left untouched.
 // ════════════════════════════════════════════════════════════════════════
-void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
-                                   uint32_t handle) {
+template <bool Loop>
+uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle) {
     VoiceSoA& v = *c.voices;
-    if (!ValidateLoopVoice(c, handle)) return;
     ChunkRotation rot;
-    rot.Init(v, c.hilbertData, handle);
+    if constexpr (Loop) {
+        if (!ValidateLoopVoice(c, handle)) return UINT32_MAX;
+        rot.Init(v, c.hilbertData, handle);
+    }
     uint64_t pos = phasefx::Load(v, handle);
     float gain = v.currentGain[handle];
     uint8_t stage = v.envelopeStage[handle];
@@ -1329,11 +1334,11 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     const float attackStep = v.attackGainStep[handle];
     const float decaySlope = v.decaySlope[handle];
     const uint32_t relEnd = v.relEnd[handle];
-    const uint32_t loopS = v.relLoopS[handle];
-    const uint32_t loopE = v.relLoopE[handle];
+    const uint32_t loopS = Loop ? v.relLoopS[handle] : 0u;
+    const uint32_t loopE = Loop ? v.relLoopE[handle] : 0u;
     const uint64_t loopS64 = phasefx::Pack(loopS, 0u);
     const uint64_t loopE64 = phasefx::Pack(loopE, 0u);
-    const uint64_t guard64 = phasefx::Pack(loopE - 1u, 0u);
+    const uint64_t guard64 = phasefx::Pack((Loop ? loopE : relEnd) - 1u, 0u);
     const float mixL = v.mixGainL[handle];
     const float mixR = v.mixGainR[handle];
     const int16_t* region = c.sampleData + v.sampleStart[handle];
@@ -1345,11 +1350,12 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     VibratoWindow vib;
     const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
     uint32_t& windowRemaining = vib.remaining;
-    const bool fastMath = g_fastChunkMath && !lfoOn;
+    const bool fastMath = Loop && g_fastChunkMath && !lfoOn;
     uint32_t frame = 0u;
+    uint32_t retiredAt = UINT32_MAX;
     while (frame < c.frameCount) {
         vib.Refill(c, v, handle, frame, step, stepFx, fs);
-        pos = phasefx::Wrap(pos, loopS64, loopE64);
+        if constexpr (Loop) pos = phasefx::Wrap(pos, loopS64, loopE64);
         // Simulate the exact scalar envelope recurrence eight steps ahead.
         // The clamps are part of the simulated sequence, so gains[] is
         // bit-exact regardless.  The chunk is only taken when the stage is
@@ -1452,12 +1458,19 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         // Scalar tail: the exact per-frame sequence from the reference
         // path (RenderScalar.h full-quality looping attack/decay).
         uint32_t base = phasefx::Index(pos);
-        if (base + 1u >= relEnd) {
-            pos = loopS64;
-            base = loopS;
-        }
         uint32_t next = base + 1u;
-        if (next >= loopE) next = loopS;
+        if constexpr (Loop) {
+            if (base + 1u >= relEnd) {
+                pos = loopS64;
+                base = loopS;
+            }
+            next = base + 1u;
+            if (next >= loopE) next = loopS;
+        } else if (base + 1u >= relEnd) {
+            // One-shot sample ended: retire.
+            retiredAt = frame;
+            break;
+        }
         const float fraction = phasefx::Weight(phasefx::Frac(pos));
         const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
         float sample = first + (static_cast<float>(region[next]) * (1.0f / 32768.0f) - first) * fraction;
@@ -1486,7 +1499,8 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
         if (rot) sample = rot.Scalar(sample, base, next, fraction);
         outL[frame] += sample * gain * mixL;
         outR[frame] += sample * gain * mixR;
-        pos = phasefx::Wrap(pos + stepFx, loopS64, loopE64);
+        if constexpr (Loop) pos = phasefx::Wrap(pos + stepFx, loopS64, loopE64);
+        else pos += stepFx;
         --windowRemaining;
         ++frame;
     }
@@ -1496,11 +1510,18 @@ void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
     v.attackSamplesRemaining[handle] = attackRemaining;
     v.decaySamplesRemaining[handle] = decayRemaining;
     rot.Store();
-    if (stage != initialStage && c.classChangeHandles != nullptr &&
-        c.classChangeCount != nullptr) {
+    if (retiredAt == UINT32_MAX && stage != initialStage &&
+        c.classChangeHandles != nullptr && c.classChangeCount != nullptr) {
         c.classChangeHandles[(*c.classChangeCount)++] = handle;
     }
+    return retiredAt;
 }
+
+void RenderTransientLoopFramesAVX2(const RenderSpanContext& c,
+                                   uint32_t handle) {
+    (void)RenderTransientChunked<true>(c, handle);
+}
+
 
 // Voice-batched short-span transient kernel.  Spans of 1-7 frames dominate
 // event-fragmented (buzz) workloads, where per-voice time-vectorization
@@ -2743,149 +2764,10 @@ uint32_t RenderReleaseOneShotFramesAVX2(const RenderSpanContext& c,
 }
 
 // Transient one-shot: non-looping attack/decay voices (the decay stage of
-// every piano/pluck note).  Mirrors RenderTransientLoopFramesAVX2 with the
-// loop-wrap math replaced by end-of-sample retirement; the envelope runs
-// with the exact scalar recurrence into gains[8], stage transitions fall to
-// the scalar tail so the class change is reported once.
+// every piano/pluck note).
 uint32_t RenderTransientOneShotFramesAVX2(const RenderSpanContext& c,
                                           uint32_t handle) {
-    VoiceSoA& v = *c.voices;
-    const uint32_t relEnd = v.relEnd[handle];
-    uint64_t pos = phasefx::Load(v, handle);
-    float gain = v.currentGain[handle];
-    uint8_t stage = v.envelopeStage[handle];
-    const uint8_t initialStage = stage;
-    uint32_t attackRemaining = v.attackSamplesRemaining[handle];
-    uint32_t decayRemaining = v.decaySamplesRemaining[handle];
-    float step = v.phaseIncs[handle];
-    const float targetGain = v.targetGain[handle];
-    const float sustainLevel = v.sustainLevel[handle];
-    const float attackStep = v.attackGainStep[handle];
-    const float decaySlope = v.decaySlope[handle];
-    const float mixL = v.mixGainL[handle];
-    const float mixR = v.mixGainR[handle];
-    const int16_t* region = c.sampleData + v.sampleStart[handle];
-    float* outL = c.outputLeft + c.frameStart;
-    float* outR = c.outputRight + c.frameStart;
-    uint64_t stepFx = phasefx::FromFloat(step);
-    FxSteps8 fs = MakeFxSteps8(stepFx);
-    const uint64_t lastSafePos = phasefx::Pack(relEnd - 1u, 0u);
-    // Whole-voice vibrato windows (see RenderSustainedLoopFramesAVX2).
-    VibratoWindow vib;
-    const bool lfoOn = vib.Begin(c, v, handle, step, stepFx, fs);
-    uint32_t& windowRemaining = vib.remaining;
-    uint32_t frame = 0u;
-    while (frame < c.frameCount) {
-        vib.Refill(c, v, handle, frame, step, stepFx, fs);
-        // Simulate the exact scalar envelope recurrence eight steps ahead;
-        // the chunk is only taken when the stage is unchanged after all
-        // eight steps and no lane can reach the sample end.
-        float futureGain = gain;
-        uint8_t futureStage = stage;
-        uint32_t futureAttack = attackRemaining;
-        uint32_t futureDecay = decayRemaining;
-        alignas(32) float gains[8];
-        const bool straight = EnvelopeLadder8(stage, gain, attackRemaining,
-            decayRemaining, attackStep, targetGain, decaySlope, sustainLevel,
-            gains, futureGain, futureAttack, futureDecay);
-        for (uint32_t laneIndex = 0u; !straight && laneIndex < 8u;
-             ++laneIndex) {
-            if (futureStage == 1u) {
-                if (futureAttack > 0u) {
-                    futureGain += attackStep;
-                    --futureAttack;
-                    if (futureGain > targetGain) futureGain = targetGain;
-                } else {
-                    futureGain = targetGain;
-                }
-                if (futureAttack == 0u)
-                    futureStage = futureDecay > 0u ? 2u : 3u;
-            }
-            if (futureStage == 2u) {
-                if (futureDecay > 0u) {
-                    futureGain *= decaySlope;
-                    --futureDecay;
-                    if (futureGain < sustainLevel) futureGain = sustainLevel;
-                } else {
-                    futureGain = sustainLevel;
-                }
-                if (futureDecay == 0u) futureStage = 3u;
-            }
-            gains[laneIndex] = futureGain;
-        }
-        const uint64_t lastPos = pos + fs.step7;
-        if (frame + 8u <= c.frameCount &&
-            windowRemaining >= 8u &&
-            futureStage == stage && lastPos < lastSafePos) {
-            PrefetchNext(region, lastPos + stepFx);
-            __m256i bases;
-            __m256 fraction;
-            FxChunk(pos, fs, bases, fraction);
-            __m256 sample = LerpGather8(region, c.sampleDataFrames - v.sampleStart[handle], bases, fraction);
-            sample = FilterTime8AVX2(v, handle, sample);
-            const __m256 scaled = _mm256_mul_ps(sample, Gains8(gains));
-            MixChunk8(outL + frame, outR + frame, scaled, _mm256_set1_ps(mixL), _mm256_set1_ps(mixR));
-            gain = futureGain;
-            stage = futureStage;
-            attackRemaining = futureAttack;
-            decayRemaining = futureDecay;
-            pos += fs.step8;
-            frame += 8u;
-            windowRemaining -= 8u;
-            continue;
-        }
-        const uint32_t base = phasefx::Index(pos);
-        if (base + 1u >= relEnd) {
-            // One-shot sample ended: retire.
-            phasefx::Store(v, handle, pos);
-            v.currentGain[handle] = gain;
-            v.envelopeStage[handle] = stage;
-            v.attackSamplesRemaining[handle] = attackRemaining;
-            v.decaySamplesRemaining[handle] = decayRemaining;
-            return frame;
-        }
-        if (stage == 1u) {
-            if (attackRemaining > 0u) {
-                gain += attackStep;
-                --attackRemaining;
-                if (gain > targetGain) gain = targetGain;
-            } else {
-                gain = targetGain;
-            }
-            if (attackRemaining == 0u)
-                stage = decayRemaining > 0u ? 2u : 3u;
-        }
-        if (stage == 2u) {
-            if (decayRemaining > 0u) {
-                gain *= decaySlope;
-                --decayRemaining;
-                if (gain < sustainLevel) gain = sustainLevel;
-            } else {
-                gain = sustainLevel;
-            }
-            if (decayRemaining == 0u) stage = 3u;
-        }
-        const float fraction = phasefx::Weight(phasefx::Frac(pos));
-        const float first = static_cast<float>(region[base]) * (1.0f / 32768.0f);
-        float sample = first + (static_cast<float>(region[base + 1u]) *
-            (1.0f / 32768.0f) - first) * fraction;
-        sample = ProcessVoiceFilterSample(v, handle, sample);
-        outL[frame] += sample * gain * mixL;
-        outR[frame] += sample * gain * mixR;
-        pos += stepFx;
-        --windowRemaining;
-        ++frame;
-    }
-    phasefx::Store(v, handle, pos);
-    v.currentGain[handle] = gain;
-    v.envelopeStage[handle] = stage;
-    v.attackSamplesRemaining[handle] = attackRemaining;
-    v.decaySamplesRemaining[handle] = decayRemaining;
-    if (stage != initialStage && c.classChangeHandles != nullptr &&
-        c.classChangeCount != nullptr) {
-        c.classChangeHandles[(*c.classChangeCount)++] = handle;
-    }
-    return UINT32_MAX;
+    return RenderTransientChunked<false>(c, handle);
 }
 
 bool RenderTransientOneShotAVX2(const RenderSpanContext& context,
