@@ -81,10 +81,25 @@ SVMS_K_NOINLINE __m256 FilterTime8EnabledAVX2(VoiceSoA& v, uint32_t handle,
                                               __m256 input) {
     // Recursive IIR state must preserve scalar ordering exactly.
     // Keep interpolation vectorized, then consume these 8 samples in-order.
+    // Coefficients and both state words stay in registers for the eight
+    // samples (the per-sample version stored z1/z2 and reloaded them, which
+    // put a store-forward on the recursive chain); the arithmetic is the same.
     alignas(32) float lanes[8];
     _mm256_store_ps(lanes, input);
-    for (uint32_t lane = 0u; lane < 8u; ++lane)
-        lanes[lane] = ProcessVoiceFilterSample(v, handle, lanes[lane]);
+    const float a0 = v.filterA0[handle];
+    const float b1 = v.filterB1[handle];
+    const float b2 = v.filterB2[handle];
+    float z1 = v.filterZ1[handle];
+    float z2 = v.filterZ2[handle];
+    for (uint32_t lane = 0u; lane < 8u; ++lane) {
+        const float x = lanes[lane];
+        const float output = x * a0 + z1;
+        z1 = x * (2.0f * a0) + z2 - b1 * output;
+        z2 = x * a0 - b2 * output;
+        lanes[lane] = output;
+    }
+    v.filterZ1[handle] = z1;
+    v.filterZ2[handle] = z2;
     return _mm256_load_ps(lanes);
 }
 
