@@ -143,19 +143,23 @@ struct FxSteps8 {
 };
 
 inline FxSteps8 MakeFxSteps8(uint64_t step) {
-    alignas(32) uint64_t multiples[8];
-    for (uint32_t k = 0u; k < 8u; ++k) multiples[k] = step * k;
+    const uint64_t m2 = step * 2u, m3 = step * 3u, m4 = step * 4u;
+    const uint64_t m5 = step * 5u, m6 = step * 6u, m7 = step * 7u;
     // lo/hi hold the multiples as {0,1,4,5} and {2,3,6,7}: one in-lane
     // shuffle of the two sums then yields the eight lanes in frame order.
-    alignas(32) uint64_t loOrder[4] = {multiples[0], multiples[1],
-                                       multiples[4], multiples[5]};
-    alignas(32) uint64_t hiOrder[4] = {multiples[2], multiples[3],
-                                       multiples[6], multiples[7]};
+    // Built straight from registers: storing the multiples and loading them
+    // back as 32-byte vectors stalls store forwarding, and this runs once per
+    // voice per span (millions of spans per second under pitch bends).
     FxSteps8 s;
-    s.lo = _mm256_load_si256(reinterpret_cast<const __m256i*>(loOrder));
-    s.hi = _mm256_load_si256(reinterpret_cast<const __m256i*>(hiOrder));
+    s.lo = _mm256_set_epi64x(static_cast<long long>(m5),
+                             static_cast<long long>(m4),
+                             static_cast<long long>(step), 0);
+    s.hi = _mm256_set_epi64x(static_cast<long long>(m7),
+                             static_cast<long long>(m6),
+                             static_cast<long long>(m3),
+                             static_cast<long long>(m2));
     s.step = step;
-    s.step7 = multiples[7];
+    s.step7 = m7;
     s.step8 = step * 8u;
     return s;
 }

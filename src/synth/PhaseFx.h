@@ -25,10 +25,14 @@ inline uint32_t Index(uint64_t pos) { return static_cast<uint32_t>(pos >> 32); }
 inline uint32_t Frac(uint64_t pos) { return static_cast<uint32_t>(pos); }
 
 // Float -> cursor.  Negative values clamp to 0 (the float cursor did the same).
+// Rounds half up like llround does for a positive value, without the library
+// call: the product has at most 24 significant bits, so adding one half and
+// truncating is exact.  This runs once per voice per span, and bend-heavy
+// material makes that millions of spans per second.
 inline uint64_t FromFloat(float value) {
-    return value <= 0.0f ? 0u
-                         : static_cast<uint64_t>(std::llround(
-                               static_cast<double>(value) * kOne));
+    if (!(value > 0.0f)) return 0u;
+    const double scaled = static_cast<double>(value) * kOne;
+    return static_cast<uint64_t>(scaled < 9.0e18 ? scaled + 0.5 : 9.0e18);
 }
 
 // Cursor -> float (telemetry, tests, GPU upload).
