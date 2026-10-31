@@ -30,21 +30,26 @@ inline bool RenderScalar::EnsureWholeVoiceRowOpStorage(uint32_t opCount) {
 // mirror VoiceManager::FoldVoiceMixGains and the bend expression mirrors
 // VoiceManager::ApplyChannelBendRatio bit-for-bit.
 inline void RenderScalar::ApplyWholeVoiceRowOp(VoiceSoA& state, uint32_t row,
-                                               const WholeVoiceChannelOp& op) {
+                                               const WholeVoiceChannelOp& op,
+                                               float bendRatio, bool finalMix) {
+    // bendRatio is the ratio the caller just computed for this bend op (the
+    // same powf expression), so the bend is not evaluated twice.  The steal
+    // output gain is only read when the plan picks a victim, never between
+    // the ops of one block, so a mix op followed by another on the same
+    // channel leaves the sqrt to the last one (finalMix).
     if (op.kind == 0u) {
-        const float scale = state.pitchBendScales[row];
-        const float ratio = scale == 1.0f
-            ? op.b : powf(2.0f, op.a * scale / 12.0f);
-        state.phaseIncs[row] = state.basePhaseIncs[row] * ratio;
+        state.phaseIncs[row] = state.basePhaseIncs[row] * bendRatio;
         return;
     }
-    state.mixGainL[row] = state.gainLeft[row] * op.a;
-    state.mixGainR[row] = state.gainRight[row] * op.b;
-    state.stealOutputGain[row] = std::sqrt(
-        state.mixGainL[row] * state.mixGainL[row] +
-        state.mixGainR[row] * state.mixGainR[row]);
-    state.renderGainL[row] = state.currentGain[row] * state.mixGainL[row];
-    state.renderGainR[row] = state.currentGain[row] * state.mixGainR[row];
+    const float mixL = state.gainLeft[row] * op.a;
+    const float mixR = state.gainRight[row] * op.b;
+    const float gain = state.currentGain[row];
+    state.mixGainL[row] = mixL;
+    state.mixGainR[row] = mixR;
+    state.renderGainL[row] = gain * mixL;
+    state.renderGainR[row] = gain * mixR;
+    if (finalMix)
+        state.stealOutputGain[row] = std::sqrt(mixL * mixL + mixR * mixR);
 }
 
 inline void RenderScalar::WholeVoiceDeferredReleaseHook(
@@ -341,9 +346,13 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
         uint32_t writeCursor[kChannelCount];
         for (uint32_t channel = 0u; channel < kChannelCount; ++channel)
             writeCursor[channel] = wvChanOpStart_[channel];
+        for (uint32_t channel = 0u; channel <= kChannelCount; ++channel)
+            wvChanLastMix_[channel] = UINT32_MAX;
         for (uint32_t i = 0u; i < wvRowOpCount_; ++i) {
             const WholeVoiceChannelOp& op = wvRowOps_[i];
-            wvChanOps_[writeCursor[op.channel]++] = op;
+            const uint32_t at = writeCursor[op.channel]++;
+            wvChanOps_[at] = op;
+            if (op.kind == 1u) wvChanLastMix_[op.channel] = at;
         }
     }
     return true;

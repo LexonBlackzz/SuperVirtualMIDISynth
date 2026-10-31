@@ -664,7 +664,8 @@ private:
     void DropWholeVoiceReleaseOp(VoiceHandle handle);
     bool EnsureWholeVoiceRowOpStorage(uint32_t opCount);
     void ApplyWholeVoiceRowOp(VoiceSoA& state, uint32_t row,
-                              const WholeVoiceChannelOp& op);
+                              const WholeVoiceChannelOp& op, float bendRatio,
+                              bool finalMix);
     static void WholeVoiceJobThunk(uint32_t jobIndex,
                                    const IndexedJobMix& mix,
                                    uint32_t frameCount, void* userData);
@@ -758,6 +759,8 @@ private:
     // CSR bracket for wvChanOps_; one extra slot so a defensive clamp of a
     // corrupt channel to kChannelCount yields an empty (safe) op range.
     uint32_t wvChanOpStart_[kChannelCount + 2];
+    // Index in wvChanOps_ of each channel's last mix op (UINT32_MAX = none).
+    uint32_t wvChanLastMix_[kChannelCount + 1];
     // Per steal-tail slot: frame an in-block All Sound Off killed the tail
     // (UINT32_MAX = alive or dead before this block).  kStealTailReserve is
     // a small compile-time constant, so a fixed member array is fine.

@@ -593,7 +593,8 @@ inline void RenderScalar::RenderWholeVoiceRow(
                     vRatio = scale == 1.0f ? op.b
                         : powf(2.0f, op.a * scale / 12.0f);
                 }
-                ApplyWholeVoiceRowOp(v, handle, op);
+                ApplyWholeVoiceRowOp(v, handle, op, vRatio,
+                                     opIdx == wvChanLastMix_[opChannel]);
             }
             ++opIdx;
         }
@@ -942,7 +943,8 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                             vRatio = scale == 1.0f ? op.b
                                 : powf(2.0f, op.a * scale / 12.0f);
                         }
-                        renderer->ApplyWholeVoiceRowOp(g, ghost, op);
+                        renderer->ApplyWholeVoiceRowOp(g, ghost, op, vRatio,
+                                                       true);
                     }
                     ++opIdx;
                 }
