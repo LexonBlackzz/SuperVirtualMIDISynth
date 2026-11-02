@@ -1,0 +1,120 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_shader_atomic_float : require
+
+// Energy ray tracing for the 3D stage tail: the same algorithm as the CPU
+// tracer (StageTracer.h), one ray per invocation, with the geometry walked by
+// the GPU's ray-query hardware. Energy is added to the histogram with float
+// atomics, so sums agree with the CPU within tolerance, not bit for bit.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1, std430) readonly buffer Tris { vec4 tri[]; };    // per triangle: normal.xyz + scatter, keep.rgba
+layout(set = 0, binding = 2, std430) readonly buffer Srcs { vec4 src[]; };    // xyz position
+layout(set = 0, binding = 3, std430) buffer Hist { float hist[]; };           // [band][bin]
+
+layout(push_constant) uniform Push {
+    vec4 listenerR2;       // xyz listener, w radius squared
+    uint perSource;
+    uint rayBase;
+    uint rayCount;
+    uint bins;
+    float dt;
+    uint skipOrder;
+    uint includeDirect;
+    uint maxBounces;
+    uint seed;
+    float tmax;
+    uint pad0;
+    uint pad1;
+} p;
+
+const float C_SOUND = 343.0;
+const float TWO_PI = 6.283185307179586;
+
+uint rngState;
+float nextRand() {
+    rngState += 0x6D2B79F5u;
+    uint t = (rngState ^ (rngState >> 15)) * (1u | rngState);
+    t = (t + ((t ^ (t >> 7)) * (61u | t))) ^ t;
+    return float((t ^ (t >> 14)) >> 8) * (1.0 / 16777216.0);
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.rayCount) return;
+    const uint ray = p.rayBase + gid;
+    const uint si = ray / p.perSource;
+
+    // One stream per ray: hash the ray index into the seed.
+    uint h = ray * 0x9E3779B9u + p.seed * 0x85EBCA6Bu + 0x1234567u;
+    h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
+    rngState = h;
+
+    vec3 o = src[si].xyz;
+    float z = 1.0 - 2.0 * nextRand();
+    float rr = sqrt(max(0.0, 1.0 - z * z));
+    float ph = TWO_PI * nextRand();
+    vec3 d = vec3(rr * cos(ph), rr * sin(ph), z);
+    vec4 e = vec4(1.0);
+    float dist = 0.0;
+    uint nb = 0u;
+    bool scat = false;
+    const vec3 L = p.listenerR2.xyz;
+
+    while (nb < p.maxBounces) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, o, 1e-4, d, 1e6);
+        while (rayQueryProceedEXT(rq)) {}
+        const bool hit = rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+        const float t = hit ? rayQueryGetIntersectionTEXT(rq, true) : 50.0;
+
+        if ((nb > 0u || p.includeDirect != 0u) &&
+            (scat || nb > p.skipOrder || (nb == 0u && p.includeDirect != 0u))) {
+            const vec3 c = o - L;
+            const float b = dot(c, d);
+            const float disc = b * b - (dot(c, c) - p.listenerR2.w);
+            if (disc > 0.0) {
+                const float sq = sqrt(disc);
+                const float t0 = max(0.0, -b - sq);
+                const float t1 = min(t, -b + sq);
+                if (t1 > t0) {
+                    const uint bin = uint(((dist + (t0 + t1) * 0.5) / C_SOUND) / p.dt);
+                    if (bin < p.bins) {
+                        const float ch = t1 - t0;
+                        atomicAdd(hist[0u * p.bins + bin], e.x * ch);
+                        atomicAdd(hist[1u * p.bins + bin], e.y * ch);
+                        atomicAdd(hist[2u * p.bins + bin], e.z * ch);
+                        atomicAdd(hist[3u * p.bins + bin], e.w * ch);
+                    }
+                }
+            }
+        }
+        if (!hit) break;
+        dist += t;
+        if (dist / C_SOUND > p.tmax) break;
+        const uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+        o += d * t;
+        e *= tri[2u * prim + 1u];
+        if (e.x + e.y + e.z + e.w < 1e-9) break;
+        vec3 n = tri[2u * prim].xyz;
+        const float scatter = tri[2u * prim].w;
+        if (dot(n, d) > 0.0) n = -n;
+        // Step off the surface so the next query cannot hit it again.
+        o += n * 1e-4;
+        if (nextRand() < scatter) {
+            scat = true;
+            vec3 u = abs(n.x) < 0.9 ? normalize(vec3(0.0, n.z, -n.y)) : normalize(vec3(-n.z, 0.0, n.x));
+            const vec3 v = cross(n, u);
+            const float r1 = TWO_PI * nextRand();
+            const float r2 = nextRand();
+            const float sr = sqrt(r2);
+            const float cs = sqrt(1.0 - r2);
+            d = (u * cos(r1) + v * sin(r1)) * sr + n * cs;
+        } else {
+            d -= 2.0 * dot(d, n) * n;
+        }
+        ++nb;
+    }
+}

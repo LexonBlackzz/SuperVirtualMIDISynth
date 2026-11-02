@@ -89,6 +89,28 @@ else()
     message(STATUS "SVMS: Vulkan kernels not embedded (no Vulkan SDK; set VULKAN_SDK)")
 endif()
 
+# GPU backend of the 3D stage tracer (Vulkan ray queries): one compute shader
+# compiled to SPIR-V and embedded.  Without the SDK the file compiles to a stub
+# whose factory reports it, and the CPU tracer is used.
+if(SVMS_VULKAN_INCLUDE AND SVMS_GLSLC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(SVMS_STAGE_RT_GEN "${CMAKE_CURRENT_BINARY_DIR}/stage_rt")
+    set(SVMS_STAGE_RT_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/StageTrace.comp")
+    add_custom_command(
+        OUTPUT "${SVMS_STAGE_RT_GEN}/StageTrace_spv.h"
+        COMMAND "${CMAKE_COMMAND}" "-DGLSLC=${SVMS_GLSLC}" "-DSRC=${SVMS_STAGE_RT_SOURCE}"
+                "-DOUT=${SVMS_STAGE_RT_GEN}/StageTrace_spv.h" -DNAME=stage_trace
+                -DTARGET_ENV=vulkan1.2
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/BuildSpvHeader.cmake"
+        DEPENDS "${SVMS_STAGE_RT_SOURCE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/render/gpu/BuildSpvHeader.cmake"
+        COMMENT "Compiling the stage tracer shader"
+        VERBATIM)
+    set_source_files_properties(render/StageTracerVulkan.cpp PROPERTIES
+        OBJECT_DEPENDS "${SVMS_STAGE_RT_GEN}/StageTrace_spv.h"
+        COMPILE_DEFINITIONS SVMS_HAVE_VULKAN_RT=1
+        INCLUDE_DIRECTORIES "${SVMS_STAGE_RT_GEN};${SVMS_VULKAN_INCLUDE}")
+endif()
+
 if(WIN32)
     enable_language(RC)
 endif()
@@ -1499,6 +1521,14 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_stage_engine_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_stage_engine COMMAND svms_v3_stage_engine_tests)
+
+    add_executable(svms_v3_stage_gpu_tests
+        tests/StageGpuTests.cpp render/StageTracerVulkan.cpp)
+    target_compile_definitions(svms_v3_stage_gpu_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_stage_gpu_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME svms_v3_stage_gpu COMMAND svms_v3_stage_gpu_tests)
 
         add_executable(svms_v3_control_tests tests/ControlRegistryTests.cpp
             ${SVMS_CONTROL_SERVER_SOURCES})
