@@ -128,6 +128,7 @@ ConfigValues ConfigDocument::Defaults() {
     ConfigValues d{};
     d.sampleRate = 44100;
     for (auto& c : d.stageChannel) c = {12.0f, 10.0f, 1.5f};
+    d.stageChannelOn.fill(true);
     d.bufferFrames = 2048;
     d.monoDownmix = false;
     d.maxVoices = 1000;
@@ -374,15 +375,23 @@ void ConfigDocument::FromJson(const json& root) {
         ReadBool(*it, "keep_reverb", working_.stageKeepReverb);
         ReadNum(*it, "rays", working_.stageRays, 8000u, 400000u);
         ReadNum(*it, "tail_trim", working_.stageTailTrim, 0.0f, 4.0f);
+        ReadBool(*it, "air_absorption", working_.stageAir);
+        ReadBool(*it, "ear_model", working_.stageEar);
         if (auto r = it->find("room"); r != it->end() && r->is_object()) {
             ReadNum(*r, "width", working_.stageRoom[0], 1.0f, 200.0f);
             ReadNum(*r, "depth", working_.stageRoom[1], 1.0f, 200.0f);
             ReadNum(*r, "height", working_.stageRoom[2], 1.0f, 100.0f);
+            if (auto sf = r->find("surfaces"); sf != r->end() && sf->is_array() && sf->size() == 6) {
+                for (size_t i = 0; i < 6; ++i)
+                    if ((*sf)[i].is_number_integer() && (*sf)[i].get<int>() >= 0 && (*sf)[i].get<int>() < 12)
+                        working_.stageSurface[i] = static_cast<uint8_t>((*sf)[i].get<int>());
+            }
         }
         if (auto l = it->find("listener"); l != it->end() && l->is_object()) {
             ReadNum(*l, "x", working_.stageListener[0], -50.0f, 250.0f);
             ReadNum(*l, "y", working_.stageListener[1], -50.0f, 250.0f);
             ReadNum(*l, "z", working_.stageListener[2], 0.0f, 100.0f);
+            ReadNum(*l, "yaw", working_.stageYaw, -360.0f, 360.0f);
         }
         if (auto ch = it->find("channels"); ch != it->end() && ch->is_array()) {
             for (size_t i = 0; i < ch->size() && i < 16; ++i) {
@@ -390,6 +399,22 @@ void ConfigDocument::FromJson(const json& root) {
                 ReadNum((*ch)[i], "x", working_.stageChannel[i][0], -50.0f, 250.0f);
                 ReadNum((*ch)[i], "y", working_.stageChannel[i][1], -50.0f, 250.0f);
                 ReadNum((*ch)[i], "z", working_.stageChannel[i][2], 0.0f, 100.0f);
+                ReadBool((*ch)[i], "on", working_.stageChannelOn[i]);
+            }
+        }
+        if (auto fu = it->find("furniture"); fu != it->end() && fu->is_array()) {
+            working_.stageFurniture.clear();
+            for (const auto& f : *fu) {
+                if (!f.is_object() || working_.stageFurniture.size() >= 32) continue;
+                StageFurnitureValue v;
+                uint32_t kind = 99;
+                ReadNum(f, "kind", kind, 0u, 12u);
+                if (kind > 12u) continue;
+                v.kind = static_cast<uint8_t>(kind);
+                ReadNum(f, "x", v.x, -50.0f, 250.0f);
+                ReadNum(f, "y", v.y, -50.0f, 250.0f);
+                ReadBool(f, "rotated", v.rotated);
+                working_.stageFurniture.push_back(v);
             }
         }
     }
@@ -524,6 +549,13 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["stage"]["keep_reverb"] = working_.stageKeepReverb;
     root["stage"]["rays"] = working_.stageRays;
     root["stage"]["tail_trim"] = working_.stageTailTrim;
+    root["stage"]["air_absorption"] = working_.stageAir;
+    root["stage"]["ear_model"] = working_.stageEar;
+    for (int i = 0; i < 6; ++i) root["stage"]["room"]["surfaces"][i] = working_.stageSurface[i];
+    root["stage"]["listener"]["yaw"] = working_.stageYaw;
+    root["stage"]["furniture"] = nlohmann::json::array();
+    for (const auto& f : working_.stageFurniture)
+        root["stage"]["furniture"].push_back({{"kind", f.kind}, {"x", f.x}, {"y", f.y}, {"rotated", f.rotated}});
     root["stage"]["room"]["width"] = working_.stageRoom[0];
     root["stage"]["room"]["depth"] = working_.stageRoom[1];
     root["stage"]["room"]["height"] = working_.stageRoom[2];
@@ -534,6 +566,7 @@ nlohmann::json ConfigDocument::ToJson() const {
         root["stage"]["channels"][i]["x"] = working_.stageChannel[i][0];
         root["stage"]["channels"][i]["y"] = working_.stageChannel[i][1];
         root["stage"]["channels"][i]["z"] = working_.stageChannel[i][2];
+        root["stage"]["channels"][i]["on"] = working_.stageChannelOn[i];
     }
 
     root["reverb"]["decay"] = working_.reverbDecay;

@@ -484,6 +484,7 @@ if(NOT WIN32)
                 configurator/PageOffline.cpp
                 configurator/PageLiveRecording.cpp
                 configurator/PageEffects.cpp
+        configurator/PageStage.cpp
                 configurator/PageDiagnostics.cpp
                 configurator/PageSettings.cpp
                 configurator/Tour.cpp
@@ -1208,6 +1209,7 @@ if(NOT SVMS_XP_COMPAT)
         configurator/PageOffline.cpp
         configurator/PageLiveRecording.cpp
         configurator/PageEffects.cpp
+        configurator/PageStage.cpp
         configurator/PageDiagnostics.cpp
         configurator/PageSettings.cpp
         configurator/Tour.cpp

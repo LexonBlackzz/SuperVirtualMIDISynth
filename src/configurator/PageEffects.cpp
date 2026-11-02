@@ -197,10 +197,9 @@ void ChainCard(std::string& panel, const ConfigValues& w, bool connected) {
     std::snprintf(buf, sizeof(buf), "%s %gk", asio ? "ASIO" : "WASAPI", w.sampleRate / 1000.0);
     const std::string outSub = buf;
     std::snprintf(buf, sizeof(buf), "%.0f%% wet", w.reverbMix * 100.0f);
-    const ChainNode nodes[6] = {
+    const ChainNode nodes[5] = {
         {"synth", "Synth", synthSub, true},
         {"chlim", "Channel limiter", w.channelLimiterEnabled ? dbText(w.channelLimiterThreshold) : "bypassed", w.channelLimiterEnabled},
-        {"stage", "3D stage", w.stageEnabled ? "on" : "bypassed", w.stageEnabled},
         {"reverb", "Reverb", w.enableReverb ? std::string(buf) : "bypassed", w.enableReverb},
         {"limiter", "Master limiter", w.limiterEnabled ? dbText(w.limiterThreshold) : "bypassed", w.limiterEnabled},
         {"out", "Output", outSub, true},
@@ -211,9 +210,9 @@ void ChainCard(std::string& panel, const ConfigValues& w, bool connected) {
     const float avail = ImGui::GetContentRegionAvail().x;
     const float nodeH = 60.0f * s;
     const float pad = 6.0f * s;   // room for the hover lift and selection ring
-    float nodeW[6];
+    float nodeW[5];
     float total = 0.0f;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 5; ++i) {
         ui::PushText(2, 13.0f);
         const float nw = ImGui::CalcTextSize(nodes[i].name).x + 14.0f * s + 32.0f * s;
         ui::PopFont();
@@ -224,7 +223,7 @@ void ChainCard(std::string& panel, const ConfigValues& w, bool connected) {
         total += nodeW[i];
     }
     // Too wide for the card (big UI sizes): scroll sideways instead of clipping.
-    const float need = total + 5.0f * 18.0f * s;
+    const float need = total + 4.0f * 18.0f * s;
     const bool scroll = need + 2.0f * pad > avail;
     if (scroll) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
@@ -232,11 +231,11 @@ void ChainCard(std::string& panel, const ConfigValues& w, bool connected) {
                           ImGuiWindowFlags_HorizontalScrollbar);
         dl = ImGui::GetWindowDrawList();
     }
-    const float wireW = scroll ? 18.0f * s : (std::max)(18.0f * s, (avail - total) / 5.0f);
+    const float wireW = scroll ? 18.0f * s : (std::max)(18.0f * s, (avail - total) / 4.0f);
     ImVec2 origin = ImGui::GetCursorScreenPos();
     if (scroll) { origin.x += pad; origin.y += pad; }
     float x = origin.x;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 5; ++i) {
         if (i > 0) {
             DashedWire(dl, x + 6.0f * s, x + wireW - 6.0f * s, origin.y + nodeH * 0.5f, connected);
             x += wireW;
@@ -280,107 +279,6 @@ void ChainCard(std::string& panel, const ConfigValues& w, bool connected) {
         ImGui::EndChild();
         ImGui::PopStyleColor();
     }
-    ui::EndCard();
-}
-
-// --- 3D stage ---------------------------------------------------------------------------
-
-// Top-down map of the room: drag a channel dot or the listener ring.
-void StageMap(ConfigDocument& doc) {
-    ConfigValues& w = doc.Working();
-    const ui::Tokens& k = ui::Tok();
-    const float s = S();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float availW = ImGui::GetContentRegionAvail().x;
-    const float rw = w.stageRoom[0], rd = w.stageRoom[1];
-    const float scale = (std::min)(availW / rw, 340.0f * s / rd);
-    const ImVec2 size(rw * scale, rd * scale);
-    const ImVec2 p0(ImGui::GetCursorScreenPos().x + (availW - size.x) * 0.5f, ImGui::GetCursorScreenPos().y);
-    const ImVec2 p1(p0.x + size.x, p0.y + size.y);
-    ImGui::SetCursorScreenPos(p0);
-    ImGui::InvisibleButton("##stagemap", size);
-    const ImVec2 mouse = ImGui::GetIO().MousePos;
-    // Room coordinates: x to the right, y from the front wall (top of the map) to the back.
-    auto toScreen = [&](float x, float y) { return ImVec2(p0.x + x * scale, p0.y + y * scale); };
-    static int dragging = -1;  // 0..15 channel, 16 listener
-    const float grab = 12.0f * s;
-    if (ImGui::IsItemActivated()) {
-        float best = grab * grab;
-        dragging = -1;
-        for (int i = 0; i < 17; ++i) {
-            const ImVec2 q = i < 16 ? toScreen(w.stageChannel[i][0], w.stageChannel[i][1])
-                                    : toScreen(w.stageListener[0], w.stageListener[1]);
-            const float d = (q.x - mouse.x) * (q.x - mouse.x) + (q.y - mouse.y) * (q.y - mouse.y);
-            if (d <= best) { best = d; dragging = i; }
-        }
-    }
-    if (!ImGui::IsMouseDown(0)) dragging = -1;
-    if (dragging >= 0) {
-        const float x = Clamp((mouse.x - p0.x) / scale, 0.0f, rw), y = Clamp((mouse.y - p0.y) / scale, 0.0f, rd);
-        float* v = dragging < 16 ? w.stageChannel[dragging].data() : w.stageListener.data();
-        if (v[0] != x || v[1] != y) { v[0] = x; v[1] = y; doc.MarkDirty(); }
-    }
-    dl->AddRectFilled(p0, p1, k.bg, 4.0f * s);
-    dl->AddRect(p0, p1, k.line2, 4.0f * s);
-    MonoAt(dl, ImVec2(p0.x + 6.0f * s, p0.y + 4.0f * s), k.muted, "front");
-    for (int i = 0; i < 16; ++i) {
-        const ImVec2 q = toScreen(w.stageChannel[i][0], w.stageChannel[i][1]);
-        dl->AddCircleFilled(q, 8.0f * s, i == dragging ? k.acc : k.accSoft);
-        dl->AddCircle(q, 8.0f * s, k.acc);
-        char n[8];
-        std::snprintf(n, sizeof(n), "%d", i + 1);
-        ui::PushNum(10.0f);
-        const ImVec2 ts = ImGui::CalcTextSize(n);
-        dl->AddText(ImVec2(q.x - ts.x * 0.5f, q.y - ts.y * 0.5f), k.text, n);
-        ui::PopFont();
-    }
-    const ImVec2 l = toScreen(w.stageListener[0], w.stageListener[1]);
-    dl->AddCircle(l, 9.0f * s, k.ok, 0, 3.0f * s);
-    dl->AddCircleFilled(l, 3.0f * s, k.ok);
-    ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y));
-    ImGui::Dummy(ImVec2(size.x, 0.0f));
-}
-
-void StageCard(ConfigDocument& doc) {
-    ConfigValues& w = doc.Working();
-    ui::BeginCard("##stage", "3D stage",
-                  "Puts the 16 channels in a room: each one is heard from where it stands, with that room's reflections and tail.",
-                  HeaderToggleWidth(), "stageOn");
-    if (HeaderToggle("##stageon", &w.stageEnabled)) doc.MarkDirty();
-    ui::CardHeaderEnd();
-    Dim dim;
-    dim.Begin("##stagedim");
-    StageMap(doc);
-    ImGui::Dummy(ImVec2(0.0f, 8.0f * S()));
-    static const ui::KnobSpec width = {"Width", 4.0f, 80.0f, 24.0f, 0.5f, false, "%.1f m"};
-    static const ui::KnobSpec depth = {"Depth", 4.0f, 120.0f, 36.0f, 0.5f, false, "%.1f m"};
-    static const ui::KnobSpec height = {"Height", 2.5f, 40.0f, 14.0f, 0.5f, false, "%.1f m"};
-    static const ui::KnobSpec trim = {"Tail", 0.0f, 4.0f, 1.0f, 0.05f, false, "%.2f"};
-    static const ui::KnobSpec rays = {"Quality", 8000.0f, 400000.0f, 40000.0f, 1000.0f, true, "%.0f rays"};
-    KnobRow(5, [&](int i, ImVec2 pos) {
-        const ImVec2 ks = ui::KnobSize();
-        static const char* ids[5] = {"stageRoom", "stageRoom", "stageRoom", "stageTrim", "stageRays"};
-        ui::Anchor(ids[i], pos, ImVec2(pos.x + ks.x, pos.y + ks.y));
-        bool changed = false;
-        float r = static_cast<float>(w.stageRays);
-        switch (i) {
-        case 0: changed = ui::Knob("stW", &w.stageRoom[0], width); break;
-        case 1: changed = ui::Knob("stD", &w.stageRoom[1], depth); break;
-        case 2: changed = ui::Knob("stH", &w.stageRoom[2], height); break;
-        case 3: changed = ui::Knob("stT", &w.stageTailTrim, trim); break;
-        default:
-            if (ui::Knob("stR", &r, rays)) { w.stageRays = static_cast<uint32_t>(r); changed = true; }
-        }
-        if (changed) doc.MarkDirty();
-    });
-    ImGui::Dummy(ImVec2(0.0f, 8.0f * S()));
-    bool keep = w.stageKeepReverb;
-    if (ui::Toggle("##stagekeep", &keep)) { w.stageKeepReverb = keep; doc.MarkDirty(); }
-    ImGui::SameLine();
-    ImGui::TextUnformatted("Keep the driver reverb after the stage");
-    NoteLine("Takes effect when the engine restarts. The channel limiter (if on) runs first. Wall materials and "
-             "furniture are edited in the config file's \"stage\" section. Off sounds exactly like before.", 12.0f);
-    dim.End(w.stageEnabled);
     ui::EndCard();
 }
 
@@ -745,7 +643,6 @@ void DrawEffectsPage(ConfigDocument& doc, std::string& panel) {
     ChainCard(panel, doc.Working(), live.connected);
     if (panel == "limiter") LimiterCard(doc, t);
     else if (panel == "chlim") ChannelLimiterCard(doc, t);
-    else if (panel == "stage") StageCard(doc);
     else ReverbCard(doc);
 }
 

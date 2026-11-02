@@ -23,7 +23,7 @@ bool Diff(const V& a, const V& b, M... members) {
 constexpr NavPage H = NavPage::Home, S = NavPage::Sound, E = NavPage::Effects,
                   O = NavPage::Output, P = NavPage::Performance, M = NavPage::Midi,
                   R = NavPage::Render, RC = NavPage::Record, G = NavPage::Diagnostics,
-                  T = NavPage::Settings, X = NavPage::Experimental;
+                  T = NavPage::Settings, X = NavPage::Experimental, ST = NavPage::Stage;
 
 // Searchable rows are the prototype's IDX table (names, places and keywords
 // verbatim). Rows without a name cover the remaining settings so every
@@ -119,12 +119,7 @@ const SettingDef kSettings[] = {
     {"chThresh", nullptr, E, nullptr, nullptr, "chlim", nullptr, false, D(&V::channelLimiterThreshold)},
     {"chRel", nullptr, E, nullptr, nullptr, "chlim", nullptr, false, D(&V::channelLimiterReleaseMs)},
     {"decByLevel", nullptr, P, nullptr, nullptr, nullptr, nullptr, false, D(&V::decimationByLevel)},
-    {"stageOn", "3D stage", E, "Effects âº 3D stage", "3d stage room hall space position reflections binaural ear listener", "stage", nullptr, true, D(&V::stageEnabled)},
-    {"stageKeep", nullptr, E, nullptr, nullptr, "stage", nullptr, true, D(&V::stageKeepReverb)},
-    {"stageRays", nullptr, E, nullptr, nullptr, "stage", nullptr, true, D(&V::stageRays)},
-    {"stageTrim", nullptr, E, nullptr, nullptr, "stage", nullptr, true, D(&V::stageTailTrim)},
-    {"stageRoom", nullptr, E, nullptr, nullptr, "stage", nullptr, true, D(&V::stageRoom)},
-    {"stageSeat", nullptr, E, nullptr, nullptr, "stage", nullptr, true, D(&V::stageListener, &V::stageChannel)},
+    {"stageOn", "3D stage", ST, "3D Stage", "3d stage room hall space position reflections binaural ear listener", nullptr, nullptr, true, D(&V::stageEnabled, &V::stageKeepReverb, &V::stageRays, &V::stageTailTrim, &V::stageRoom, &V::stageListener, &V::stageChannel, &V::stageYaw, &V::stageAir, &V::stageEar, &V::stageSurface, &V::stageChannelOn, &V::stageFurniture)},
     {"cull", nullptr, P, nullptr, nullptr, nullptr, nullptr, false, D(&V::decimationCullBlocks)},
     {"reexcite", nullptr, P, nullptr, nullptr, nullptr, nullptr, false, D(&V::noteOnReexcite)},
     {"midiDev", nullptr, M, nullptr, nullptr, nullptr, nullptr, true, D(&V::midiInputDevice)},

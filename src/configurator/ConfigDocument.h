@@ -27,6 +27,15 @@ struct SoundFontRouteValue {
     }
 };
 
+struct StageFurnitureValue {
+    uint8_t kind = 0;   // render/StageSolver.h FurnitureKind
+    float x = 0.0f, y = 0.0f;
+    bool rotated = false;
+    bool operator==(const StageFurnitureValue& o) const {
+        return kind == o.kind && x == o.x && y == o.y && rotated == o.rotated;
+    }
+};
+
 struct ConfigValues {
     uint32_t sampleRate = 44100;
     uint32_t bufferFrames = 2048;
@@ -59,6 +68,12 @@ struct ConfigValues {
     std::array<float, 3> stageRoom = {24.0f, 36.0f, 14.0f};
     std::array<float, 3> stageListener = {12.0f, 24.0f, 1.2f};
     std::array<std::array<float, 3>, 16> stageChannel{};
+    float stageYaw = 0.0f;
+    bool stageAir = true;
+    bool stageEar = true;
+    std::array<uint8_t, 6> stageSurface = {6, 0, 3, 3, 3, 7};
+    std::array<bool, 16> stageChannelOn{};
+    std::vector<StageFurnitureValue> stageFurniture;
 
     bool enableReverb = false;
     float reverbMix = 0.25f;

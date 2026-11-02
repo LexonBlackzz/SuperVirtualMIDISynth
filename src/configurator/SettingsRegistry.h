@@ -14,6 +14,7 @@ enum class NavPage {
     Home,
     Sound,
     Effects,
+    Stage,
     Output,
     Performance,
     Midi,

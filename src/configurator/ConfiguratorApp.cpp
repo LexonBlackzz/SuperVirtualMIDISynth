@@ -21,6 +21,7 @@
 #include "configurator/PageOffline.h"
 #include "configurator/PageLiveRecording.h"
 #include "configurator/PageEffects.h"
+#include "configurator/PageStage.h"
 #include "configurator/PageDiagnostics.h"
 #include "configurator/PageSettings.h"
 #ifndef _WIN32
@@ -237,6 +238,7 @@ const NavItem kNavMain[] = {
     {NavPage::Home, "Home", "M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"},
     {NavPage::Sound, "Sound", "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z"},
     {NavPage::Effects, "Effects", "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"},
+    {NavPage::Stage, "3D Stage", "M21 16V8l-9-5-9 5v8l9 5 9-5zM3.3 7L12 12l8.7-5M12 22V12"},
     {NavPage::Output, "Output", "M11 5L6 9H2v6h4l5 4V5zM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"},
     {NavPage::Performance, "Performance", "M13 2L3 14h9l-1 8 10-12h-9l1-8z"},
     {NavPage::Midi, "MIDI", "M2 6h20v12H2zM7 6v7M12 6v7M17 6v7"},
@@ -262,6 +264,7 @@ const PageHeader kPageHeaders[] = {
     {NavPage::Home, "Home", "What SVMS is doing right now, and the switches you will touch most."},
     {NavPage::Sound, "Sound", "Which instruments play, and how hard notes hit."},
     {NavPage::Effects, "Effects", "Everything after the synth, in the order the sound flows. Click a block to edit it."},
+    {NavPage::Stage, "3D Stage", "Put every MIDI channel in a room around you. Distance, direction and reflections are added after the mix, so your notes and their timing stay exactly as played."},
     {NavPage::Output, "Output", "Where the sound comes out, and how much delay you accept for stability."},
     {NavPage::Performance, "Performance", "How many notes SVMS can carry, and which shortcuts it may take when the CPU runs out."},
     {NavPage::Midi, "MIDI", "A hardware keyboard, and how SVMS copes when a file sends more events than it can take."},
@@ -1071,6 +1074,7 @@ void ConfiguratorApp::DrawPageContent() {
     case NavPage::Effects:
         DrawEffectsPage(config_, effectsPanel_);
         break;
+    case NavPage::Stage:       DrawStagePage(config_); break;
     case NavPage::Output:      DrawOutputPage(config_, easterEggs_); break;
     case NavPage::Performance: DrawPerformancePage(config_); break;
     case NavPage::Midi:        DrawMidiPage(config_); break;
