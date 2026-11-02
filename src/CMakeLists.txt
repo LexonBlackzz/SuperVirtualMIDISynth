@@ -383,6 +383,11 @@ if(NOT WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_stage_tracer COMMAND svms_v3_stage_tracer_tests)
 
+        add_executable(svms_v3_stage_renderer_tests tests/StageRendererTests.cpp)
+        target_include_directories(svms_v3_stage_renderer_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME svms_v3_stage_renderer COMMAND svms_v3_stage_renderer_tests)
+
         add_executable(svms_v3_control_tests tests/ControlRegistryTests.cpp
             ${SVMS_CONTROL_SERVER_SOURCES})
         target_include_directories(svms_v3_control_tests PRIVATE
@@ -1478,6 +1483,14 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_stage_tracer_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_stage_tracer COMMAND svms_v3_stage_tracer_tests)
+
+    add_executable(svms_v3_stage_renderer_tests
+        tests/StageRendererTests.cpp)
+    target_compile_definitions(svms_v3_stage_renderer_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_stage_renderer_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME svms_v3_stage_renderer COMMAND svms_v3_stage_renderer_tests)
 
         add_executable(svms_v3_control_tests tests/ControlRegistryTests.cpp
             ${SVMS_CONTROL_SERVER_SOURCES})
