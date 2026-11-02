@@ -1282,6 +1282,8 @@ void AdvancedCards(ConfigDocument& doc) {
                 g.baseValid = false;
                 doc.MarkDirty();
             }
+        } else {
+            ImGui::Dummy(ImVec2(0, 2.0f * s));
         }
         ui::EndCard();
     }
