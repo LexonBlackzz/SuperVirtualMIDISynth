@@ -27,7 +27,7 @@ struct BuildOptions {
     int liveTaps = kMaxLiveTaps;  // strongest wall paths that glide when a source moves
     float earlySeconds = 0.42f;
     float tailTrim = 1.0f;        // tail level against the critical-distance balance
-    float roomSend = 0.35f;       // share of each source that feeds the tail (the design prototype's default send)
+    float roomSend = 0.2f;        // share of each source that feeds the tail (0.35 was the prototype's default and sounded too wet)
     uint32_t seed = 4242;
     const std::atomic<bool>* cancel = nullptr;   // set to stop a long trace early
 };
