@@ -1186,15 +1186,15 @@ void RoomAndFurniture(ConfigDocument& doc) {
 }
 
 void ListenCard(ConfigDocument& doc) {
-    (void)doc;
     static StageAudition audition;
-    const ConfigValues& w = doc.Working();
+    ConfigValues& w = doc.Working();
     const float s = S();
     ui::BeginCard("##stlisten", "Listen", "Plays a short test piece through the room as it is set up now, saved or not. Needs a few seconds to prepare.");
     struct B { const char* label; StageAudition::Mode mode; ui::ButtonKind kind; const char* tip; };
     static const B buttons[] = {
         {"Play selected channel", StageAudition::Mode::Channel, ui::ButtonKind::Primary, "The channel you picked plays an arpeggio from where it stands."},
         {"Play each channel in turn", StageAudition::Mode::Tour, ui::ButtonKind::Normal, "One note per channel, 1 to 16, so you hear where each one is."},
+        {"Play 5.1 test (6 tracks)", StageAudition::Mode::Surround, ui::ButtonKind::Normal, "Seats channels 1 to 6 as front left, front right, centre, bass, rear left, rear right and plays a surround test on them."},
         {"Play music loop", StageAudition::Mode::Music, ui::ButtonKind::Normal, "The loop plays through the selected channel, three times."},
         {"Loop around me", StageAudition::Mode::Around, ui::ButtonKind::Normal, "The loop circles your head once per pass, with Doppler."},
         {"Walk around me", StageAudition::Mode::Walk, ui::ButtonKind::Normal, "The selected channel circles you, with Doppler."},
@@ -1208,7 +1208,18 @@ void ListenCard(ConfigDocument& doc) {
         if (!first && x + bw > avail) x = 0;
         else if (!first) ImGui::SameLine(0, 8.0f * s);
         first = false;
-        if (ui::Button(b.label, b.kind)) audition.Start(b.mode, w, g.sel);
+        if (ui::Button(b.label, b.kind)) {
+            if (b.mode == StageAudition::Mode::Surround) {
+                static const float seat51[6][3] = {{-30, 0, 4}, {30, 0, 4}, {0, 0, 4}, {0, -12, 3}, {-140, 0, 4}, {140, 0, 4}};
+                for (int i = 0; i < 6; ++i) SetPolar(w, w.stageChannel[i], seat51[i][0], seat51[i][1], seat51[i][2]);
+                g.sel = 0;
+                g.you = false;
+                g.fsel = -1;
+                g.baseValid = false;
+                doc.MarkDirty();
+            }
+            audition.Start(b.mode, w, g.sel);
+        }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", b.tip);
         x += bw + 8.0f * s;
     }

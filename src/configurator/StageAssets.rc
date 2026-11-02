@@ -1,0 +1,9 @@
+// Test tracks of the 3D Stage page's 5.1 listening test (mono AAC, 46 s each),
+// decoded with Media Foundation when the test is played.
+#include <winres.h>
+201 RCDATA "assets/stage51_1.m4a"
+202 RCDATA "assets/stage51_2.m4a"
+203 RCDATA "assets/stage51_3.m4a"
+204 RCDATA "assets/stage51_4.m4a"
+205 RCDATA "assets/stage51_5.m4a"
+206 RCDATA "assets/stage51_6.m4a"

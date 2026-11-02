@@ -24,6 +24,7 @@ public:
         Around,    // the music circles the listener once
         Walk,      // the selected channel circles the listener once
         Dry,       // the selected channel without room or reflections
+        Surround,  // six surround tracks on channels 1 to 6
     };
 
     ~StageAudition() { Stop(); }

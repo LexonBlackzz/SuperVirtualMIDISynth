@@ -12,6 +12,10 @@
 #include <audioclient.h>
 #include <mmdeviceapi.h>
 #include <objbase.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <shlwapi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -60,6 +64,57 @@ void Note(std::vector<float>& out, int ch, float startSec, float lenSec, int mid
         }
         out[static_cast<size_t>(n0 + i)] += v;
     }
+}
+
+// One embedded AAC track (resource id) decoded to mono float at kRate.
+std::vector<float> DecodeTrack(int id) {
+    std::vector<float> out;
+    HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!res) return out;
+    HGLOBAL mem = LoadResource(nullptr, res);
+    const void* data = mem ? LockResource(mem) : nullptr;
+    if (!data) return out;
+    IStream* stream = SHCreateMemStream(static_cast<const BYTE*>(data), SizeofResource(nullptr, res));
+    IMFByteStream* bytes = nullptr;
+    IMFSourceReader* reader = nullptr;
+    IMFMediaType* type = nullptr;
+    if (stream && SUCCEEDED(MFCreateMFByteStreamOnStream(stream, &bytes)) &&
+        SUCCEEDED(MFCreateSourceReaderFromByteStream(bytes, nullptr, &reader)) && SUCCEEDED(MFCreateMediaType(&type))) {
+        type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
+        type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 1);
+        type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kRate);
+        type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 32);
+        type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+        type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kRate * 4);
+        if (SUCCEEDED(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, type))) {
+            for (;;) {
+                DWORD flags = 0;
+                IMFSample* sample = nullptr;
+                if (FAILED(reader->ReadSample(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, nullptr, &flags, nullptr, &sample))) break;
+                if (sample) {
+                    IMFMediaBuffer* buf = nullptr;
+                    if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buf))) {
+                        BYTE* p = nullptr;
+                        DWORD len = 0;
+                        if (SUCCEEDED(buf->Lock(&p, nullptr, &len))) {
+                            const float* f = reinterpret_cast<const float*>(p);
+                            out.insert(out.end(), f, f + len / 4);
+                            buf->Unlock();
+                        }
+                        buf->Release();
+                    }
+                    sample->Release();
+                }
+                if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
+            }
+        }
+    }
+    if (type) type->Release();
+    if (reader) reader->Release();
+    if (bytes) bytes->Release();
+    if (stream) stream->Release();
+    return out;
 }
 
 st::StageScene MakeScene(const ConfigValues& w) {
@@ -185,9 +240,22 @@ void StageAudition::Start(Mode mode, const ConfigValues& values, int selected) {
 void StageAudition::Work(Mode mode, const ConfigValues& w, int selected) {
     const bool orbit = mode == Mode::Around || mode == Mode::Walk;
     const bool music = mode == Mode::Music || mode == Mode::Around;
-    const bool solo = mode != Mode::Tour;
+    const bool surround = mode == Mode::Surround;
+    const bool solo = mode != Mode::Tour && !surround;
     const bool dry = mode == Mode::Dry;
-    const float seconds = mode == Mode::Tour ? 16 * 0.6f + 0.4f : music ? kLoopSec * kLoopPasses : 8.0f;
+    std::vector<float> stems[6];
+    float stemSec = 0.0f;
+    if (surround) {
+        SetStatus("Decoding the tracks");
+        MFStartup(MF_VERSION);
+        for (int i = 0; i < 6; ++i) stems[i] = DecodeTrack(201 + i);
+        MFShutdown();
+        size_t n = stems[0].size();
+        for (auto& v : stems) n = (std::min)(n, v.size());
+        if (n == 0) { SetStatus("Could not decode the 5.1 tracks"); busy_.store(false); return; }
+        stemSec = static_cast<float>(n) / kRate;
+    }
+    const float seconds = surround ? stemSec : mode == Mode::Tour ? 16 * 0.6f + 0.4f : music ? kLoopSec * kLoopPasses : 8.0f;
     const float period = music ? kLoopSec : 8.0f;   // one trip around the listener
 
     // The test piece: one mono feed per channel.
@@ -198,8 +266,13 @@ void StageAudition::Work(Mode mode, const ConfigValues& w, int selected) {
     for (int c = 0; c < 16; ++c) {
         if (!w.stageChannelOn[c]) continue;
         if (solo && c != selected) continue;
+        if (surround && c >= 6) continue;
         active[c] = true;
         feed[c].assign(static_cast<size_t>(body), 0.0f);
+        if (surround) {
+            for (int i = 0; i < body; ++i) feed[c][static_cast<size_t>(i)] = stems[c][static_cast<size_t>(i)];
+            continue;
+        }
         if (music) {
             // The supplied loop, through the selected channel only.
             for (int i = 0; i < body; ++i) {

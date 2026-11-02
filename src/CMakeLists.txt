@@ -1236,6 +1236,7 @@ if(NOT SVMS_XP_COMPAT)
         ${IMGUI_SOURCES}
         ${CONFIGURATOR_SOURCES}
         "${SVMS_GENERATED_DIR}/SVMSConfiguratorVersion.rc"
+        configurator/StageAssets.rc
     )
     target_include_directories(svms_v3_configurator PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -1246,7 +1247,8 @@ if(NOT SVMS_XP_COMPAT)
     target_compile_definitions(svms_v3_configurator PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(svms_v3_configurator PRIVATE
-        d3d11 dxgi d3dcompiler dwmapi user32 gdi32 shell32 ole32 uuid comdlg32 winhttp)
+        d3d11 dxgi d3dcompiler dwmapi user32 gdi32 shell32 ole32 uuid comdlg32 winhttp
+        mfplat mfreadwrite mfuuid shlwapi)
     set_target_properties(svms_v3_configurator PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
