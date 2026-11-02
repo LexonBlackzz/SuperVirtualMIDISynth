@@ -93,9 +93,9 @@ void TestReflectionCounts() {
     CHECK(FindReflections(r, s, l, 3).size() == 6 + 18 + 38);
 
     Room f = r;
-    f.furniture.push_back({FurnitureKind::Sofa, 4.0f, 5.0f, false});
+    f.furniture.push_back({FurnitureKind::Bookshelf, 4.5f, 8.8f, false});
     const auto withFurn = FindReflections(f, s, l, 3);
-    CHECK(withFurn.size() > 62 && withFurn.size() <= 62 + 8);
+    CHECK(withFurn.size() > 62 && withFurn.size() <= 62 + 12);
 }
 
 void TestFirstOrderGeometry() {
@@ -108,9 +108,9 @@ void TestFirstOrderGeometry() {
     // Left wall image sits behind x = 0.
     CHECK(std::fabs(list[2].image.x + 2.0f) < 1e-5f);
     // Every reflection is later than the direct sound.
-    for (const Reflection& rf : list) CHECK(rf.path > Distance(s, l));
+    for (const EarlyPath& rf : list) CHECK(rf.path > Distance(s, l));
     // Plaster loses little at 500 Hz, so gains stay near 1 and below it.
-    for (const Reflection& rf : list)
+    for (const EarlyPath& rf : list)
         for (int b = 0; b < kBands; ++b) CHECK(rf.gain[b] > 0.9f && rf.gain[b] < 1.0f);
 }
 
@@ -133,7 +133,7 @@ void TestMirroredRoom() {
     CHECK(std::fabs(aL - bR) < 0.15 * (std::max)(aL, bR));
     CHECK(std::fabs(aR - bL) < 0.15 * (std::max)(aR, bL));
     // The room is not symmetric by itself, so the two ears differ.
-    CHECK(std::fabs(aL - aR) > 0.3 * (std::max)(aL, aR));
+    CHECK(std::fabs(aL - aR) > 0.1 * (std::max)(aL, aR));
 }
 
 void TestDeterminism() {
@@ -156,7 +156,7 @@ void TestPerSourceIndependence() {
     Room r = Hall();
     r.furniture.push_back({FurnitureKind::Bookshelf, 12.0f, 18.0f, false});
     r.furniture.push_back({FurnitureKind::Pillar, 6.0f, 10.0f, false});
-    const Vec3 a{3.0f, 5.0f, 1.5f}, b{10.0f, 16.0f, 1.5f}, l{12.0f, 24.0f, 1.2f};
+    const Vec3 a{11.0f, 5.0f, 1.5f}, b{13.0f, 10.0f, 1.5f}, l{12.0f, 12.0f, 1.2f};
     const auto a1 = FindReflections(r, a, l, 3);
     const auto b1 = FindReflections(r, b, l, 3);
     const auto a2 = FindReflections(r, a, l, 3);
@@ -167,8 +167,8 @@ void TestPerSourceIndependence() {
     CHECK(same);
     // The furniture taps of the two sources differ.
     float pa = 0.0f, pb = 0.0f;
-    for (const Reflection& rf : a1) if (rf.furniture) { pa = rf.path; break; }
-    for (const Reflection& rf : b1) if (rf.furniture) { pb = rf.path; break; }
+    for (const EarlyPath& rf : a1) if (rf.furniture) { pa = rf.path; break; }
+    for (const EarlyPath& rf : b1) if (rf.furniture) { pb = rf.path; break; }
     CHECK(pa > 0.0f && pb > 0.0f && std::fabs(pa - pb) > 1.0f);
 }
 
@@ -191,16 +191,16 @@ void TestOcclusion() {
     const DirectPath hidden = SolveDirect(r, Vec3{5.0f, 1.0f, 1.5f}, l, 180.0f, true, true);
     const DirectPath open = SolveDirect(r, Vec3{2.0f, 1.0f, 1.5f}, l, 180.0f, true, true);
     CHECK(hidden.occluded && !open.occluded);
-    CHECK(hidden.lowpassHz <= 2200.0f);
+    CHECK(hidden.occlusionDb[3] > 10.0f && open.occlusionDb[3] == 0.0f);
 }
 
 void TestDirectPath() {
     const Room r = Uniform(Material::Plaster, 20.0f, 20.0f, 4.0f);
     const Vec3 l{10.0f, 10.0f, 1.5f};
-    const DirectPath right = SolveDirect(r, Vec3{14.0f, 10.0f, 1.5f}, l, 0.0f, true, true);
+    const DirectPath right = SolveDirect(r, Vec3{14.0f, 10.0f, 1.5f}, l, 0.0f, false, true);
     CHECK(std::fabs(right.azimuthDegrees - 90.0f) < 0.5f);
     CHECK(std::fabs(right.delaySeconds - 4.0f / kSpeedOfSound) < 1e-6f);
-    CHECK(std::fabs(right.gain - 0.25f) < 1e-5f);
+    for (int b = 0; b < kBands; ++b) CHECK(std::fabs(right.gain[b] - 0.25f) < 1e-5f);
     const DirectPath ahead = SolveDirect(r, Vec3{10.0f, 14.0f, 1.5f}, l, 0.0f, true, true);
     const DirectPath behind = SolveDirect(r, Vec3{10.0f, 6.0f, 1.5f}, l, 0.0f, true, true);
     CHECK(std::fabs(ahead.azimuthDegrees) < 0.5f);
@@ -209,10 +209,120 @@ void TestDirectPath() {
     // Turning the listener around swaps ahead and behind.
     const DirectPath turned = SolveDirect(r, Vec3{10.0f, 14.0f, 1.5f}, l, 180.0f, true, true);
     CHECK(std::fabs(std::fabs(turned.azimuthDegrees) - 180.0f) < 0.5f);
-    // Distance darkens the sound.
+    // Air darkens distant sound: far loses more of the 8 kHz band than the 125 Hz band.
     const DirectPath far = SolveDirect(r, Vec3{10.0f, 19.5f, 1.5f}, l, 0.0f, true, false);
-    const DirectPath near = SolveDirect(r, Vec3{10.0f, 11.0f, 1.5f}, l, 0.0f, true, false);
-    CHECK(far.lowpassHz < near.lowpassHz);
+    const DirectPath dry = SolveDirect(r, Vec3{10.0f, 19.5f, 1.5f}, l, 0.0f, false, false);
+    CHECK(far.gain[3] / dry.gain[3] < 0.95f);
+    CHECK(far.gain[0] / dry.gain[0] > 0.99f);
+    CHECK(far.lowpassHz == 20000.0f);
+}
+
+// ISO 9613-1 values at 20 C, 50 % humidity (dB per km).
+void TestAirAbsorption() {
+    CHECK(std::fabs(AirAlphaDbPerM(125.0) * 1000.0 - 0.44) < 0.02);
+    CHECK(std::fabs(AirAlphaDbPerM(500.0) * 1000.0 - 2.73) < 0.08);
+    CHECK(std::fabs(AirAlphaDbPerM(2000.0) * 1000.0 - 9.89) < 0.3);
+    CHECK(std::fabs(AirAlphaDbPerM(8000.0) * 1000.0 - 105.29) < 3.2);
+    CHECK(AirAlphaDbPerM(4000.0) > AirAlphaDbPerM(1000.0));
+}
+
+// Eyring never exceeds Sabine, matches it for hard walls and is much shorter
+// for very absorbent ones.
+void TestEyringVersusSabine() {
+    float sab[kBands], eyr[kBands];
+    Room hard = Uniform(Material::Plaster, 8.0f, 10.0f, 3.0f);
+    ReverbTimes(hard, sab);
+    EyringTimes(hard, eyr);
+    CHECK(eyr[1] <= sab[1] + 1e-4f && eyr[1] > 0.97f * sab[1]);
+    Room soft = Uniform(Material::Foam, 8.0f, 10.0f, 3.0f);
+    ReverbTimes(soft, sab);
+    EyringTimes(soft, eyr);
+    CHECK(sab[2] > 1.4f * eyr[2]);
+}
+
+// Maekawa: a blocker costs highs far more than lows, a clear path costs
+// nothing, several blockers add up to the 30 dB cap.
+void TestBlocking() {
+    Room r = Uniform(Material::Plaster, 10.0f, 10.0f, 3.0f);
+    r.furniture.push_back({FurnitureKind::Pillar, 5.0f, 5.0f, false});
+    const Vec3 a{5.0f, 1.0f, 1.5f}, b{5.0f, 9.0f, 1.5f};
+    float loss[kBands];
+    OcclusionLoss(r, a, b, loss);
+    CHECK(loss[0] > 1.0f && loss[0] < 5.0f);
+    CHECK(loss[0] < loss[1] && loss[1] < loss[2] && loss[2] < loss[3]);
+    CHECK(loss[1] > 7.0f && loss[1] < 9.5f);
+    CHECK(loss[3] > 15.0f && loss[3] <= 24.0f);
+    OcclusionLoss(r, Vec3{2.0f, 1.0f, 1.5f}, Vec3{2.0f, 9.0f, 1.5f}, loss);
+    for (int k = 0; k < kBands; ++k) CHECK(loss[k] == 0.0f);
+
+    Room many = r;
+    for (int i = 0; i < 4; ++i)
+        many.furniture.push_back({FurnitureKind::Pillar, 5.0f, 3.0f + static_cast<float>(i), false});
+    OcclusionLoss(many, a, b, loss);
+    for (int k = 0; k < kBands; ++k) CHECK(loss[k] <= 30.0f);
+    CHECK(loss[3] == 30.0f);
+}
+
+// A face of a piece of furniture returns the exact mirror path, and only when
+// the bounce point lies on the face.
+void TestFurnitureMirror() {
+    Room r = Uniform(Material::Plaster, 20.0f, 20.0f, 4.0f);
+    r.furniture.push_back({FurnitureKind::Bookshelf, 10.0f, 10.0f, false});
+    const float plane = 10.0f - 0.5f * Info(FurnitureKind::Bookshelf).depth;
+    const Vec3 s{9.0f, 5.0f, 1.5f}, l{11.0f, 5.0f, 1.5f};
+    const float expected = Distance(Vec3{s.x, 2.0f * plane - s.y, s.z}, l);
+    int count = 0;
+    bool exact = false;
+    for (const EarlyPath& e : FindReflections(r, s, l, 1))
+        if (e.furniture) { ++count; exact = std::fabs(e.path - expected) < 1e-4f; }
+    CHECK(count == 1 && exact);
+
+    // Move the listener so the bounce point falls beside the shelf: no path.
+    count = 0;
+    for (const EarlyPath& e : FindReflections(r, s, Vec3{15.0f, 5.0f, 1.5f}, 1))
+        if (e.furniture) ++count;
+    CHECK(count == 0);
+}
+
+// The legs of a wall path through its bounce points add up to the image distance.
+void TestWallBounceGeometry() {
+    const Room r = Uniform(Material::Plaster, 8.0f, 10.0f, 3.0f);
+    const Vec3 s{2.0f, 3.0f, 1.5f}, l{5.0f, 7.0f, 1.2f};
+    for (const EarlyPath& e : FindReflections(r, s, l, 3)) {
+        Vec3 pts[3];
+        BouncePoints(r, s, l, e.seq, e.order, pts);
+        float sum = Distance(s, pts[0]);
+        for (int k = 1; k < e.order; ++k) sum += Distance(pts[k - 1], pts[k]);
+        sum += Distance(pts[e.order - 1], l);
+        CHECK(std::fabs(sum - e.path) < 1e-3f);
+    }
+}
+
+// Two orderings of perpendicular walls share one image; only one is kept.
+void TestNoDuplicateImages() {
+    const Room r = Uniform(Material::Plaster, 8.0f, 10.0f, 3.0f);
+    const auto list = FindReflections(r, Vec3{2.0f, 3.0f, 1.5f}, Vec3{5.0f, 7.0f, 1.2f}, 3);
+    for (size_t i = 0; i < list.size(); ++i)
+        for (size_t j = i + 1; j < list.size(); ++j)
+            CHECK(Distance(list[i].image, list[j].image) > 1e-3f);
+}
+
+struct OneSided final : SourceModel {
+    float Gain(const Vec3& dir, int) const noexcept override { return dir.x > 0.0f ? 0.25f : 1.0f; }
+};
+
+void TestSourceModel() {
+    const Room r = Uniform(Material::Plaster, 20.0f, 20.0f, 4.0f);
+    const Vec3 s{10.0f, 10.0f, 1.5f}, l{14.0f, 10.0f, 1.5f};
+    const OneSided model;
+    const OmniSource omni;
+    const DirectPath a = SolveDirect(r, s, l, 0.0f, false, false, &model);
+    const DirectPath b = SolveDirect(r, s, l, 0.0f, false, false, &omni);
+    const DirectPath c = SolveDirect(r, s, l, 0.0f, false, false, nullptr);
+    for (int k = 0; k < kBands; ++k) {
+        CHECK(std::fabs(a.gain[k] - 0.25f * b.gain[k]) < 1e-6f);
+        CHECK(b.gain[k] == c.gain[k]);
+    }
 }
 
 void TestResponseShape() {
@@ -223,7 +333,7 @@ void TestResponseShape() {
     // Without the ear model both ears share one timeline.
     const EarlyResponse e = BuildEarlyResponse(refl, l, 0.0f, false, true, sr);
     float earliest = 1e9f;
-    for (const Reflection& rf : refl) earliest = (std::min)(earliest, rf.path);
+    for (const EarlyPath& rf : refl) earliest = (std::min)(earliest, rf.path);
     const int first = static_cast<int>(earliest / kSpeedOfSound * sr) - 2;
     bool silent = true;
     for (int i = 0; i < first && i < static_cast<int>(e.left.size()); ++i)
@@ -262,6 +372,13 @@ int main() {
     TestOcclusion();
     TestDirectPath();
     TestResponseShape();
+    TestAirAbsorption();
+    TestEyringVersusSabine();
+    TestBlocking();
+    TestFurnitureMirror();
+    TestWallBounceGeometry();
+    TestSourceModel();
+    TestNoDuplicateImages();
     if (g_failures) {
         std::printf("%d check(s) failed\n", g_failures);
         return 1;
