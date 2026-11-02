@@ -193,7 +193,14 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         self->channelLimiter.enabled &&
         self->channelBusPlanes != nullptr &&
         self->channelBusCapacity >= numFrames;
-    if (channelLimiterActive) {
+    // The 3D stage reads the buses too, once its response is built.
+    const bool stageActive =
+        self->stage_ != nullptr && self->stage_->Ready() &&
+        !self->stageSuspended_.load(std::memory_order_relaxed) &&
+        self->channelBusPlanes != nullptr &&
+        self->channelBusCapacity >= numFrames;
+    const bool busMode = channelLimiterActive || stageActive;
+    if (busMode) {
         ChannelLimiterState::ClearBuses(self->channelBusLeftTable,
                                         self->channelBusRightTable,
                                         numFrames);
@@ -664,15 +671,20 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                             leftBuf, rightBuf, numFrames, *snap,
                             evtBuf, evCount, self->correctnessMode_,
                             static_cast<uint64_t>(self->virtualRenderSample_),
-                            channelLimiterActive
+                            busMode
                                 ? self->channelBusLeftTable : nullptr,
-                            channelLimiterActive
+                            busMode
                                 ? self->channelBusRightTable : nullptr);
     }
     if (channelLimiterActive) {
         self->channelLimiter.ProcessAndSum(
             self->channelBusLeftTable, self->channelBusRightTable,
-            leftBuf, rightBuf, numFrames);
+            leftBuf, rightBuf, numFrames, stageActive);
+    }
+    if (stageActive) {
+        // Limiter (if on) -> stage -> master mix; the stage replaces the dry sum.
+        self->stage_->Process(self->channelBusLeftTable, self->channelBusRightTable,
+                              numFrames, leftBuf, rightBuf);
     }
     if (self->shardCount_ > 1u && !self->shardMaster_)
         self->JoinShardsAndMix(leftBuf, rightBuf, numFrames);
@@ -824,7 +836,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // Filter the final limited samples in the same loop so the 3 Hz cutoff
     // neither changes gain detection nor requires another memory pass.
     if (!self->shardMaster_) {
-        self->reverb.Process(output, numFrames, 2);
+        // The stage models the room itself, so the driver reverb is skipped
+        // unless the user keeps it.
+        if (!stageActive || self->stage_->KeepReverb())
+            self->reverb.Process(output, numFrames, 2);
         if (self->monoDownmix_.load(std::memory_order_relaxed)) {
             for (uint32_t i = 0u; i < numFrames; ++i) {
                 const float mid = 0.5f * (output[2u * i] + output[2u * i + 1u]);

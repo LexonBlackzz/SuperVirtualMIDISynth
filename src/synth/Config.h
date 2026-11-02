@@ -2,6 +2,7 @@
 #define SVMS_CONFIG_H
 
 #include "synth/Types.h"
+#include "synth/StageConfig.h"
 #include <atomic>
 #include <cstddef>
 #include <cmath>
@@ -242,6 +243,7 @@ struct EngineConfig {
     uint8_t soundFontChannels[16];
     std::wstring configPath;
     std::string configWarning;
+    StageConfig stage;
 
     static EngineConfig Default();
     static EngineConfig Load();

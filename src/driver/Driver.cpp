@@ -513,6 +513,7 @@ bool Driver::Initialize() {
         LOG("FAILED: Could not allocate per-channel limiter buses");
         return false;
     }
+    StartStage(cfg.stage);
 
     uint32_t renderThreads = cfg.renderThreads;
     if (renderThreads == 0u)
@@ -904,6 +905,7 @@ void Driver::Shutdown() {
     _aligned_free(leftBuffer); leftBuffer = nullptr;
     _aligned_free(rightBuffer); rightBuffer = nullptr;
     bufferCapacity = 0;
+    stage_.reset();
     FreeChannelBuses();
 
     DestroyAllSoundFontBundles();
@@ -913,6 +915,22 @@ void Driver::Shutdown() {
 
     initialized = false;
     parked_ = false;
+}
+
+// The 3D stage is built for one sample rate and block size; it starts with
+// the engine and is not rebuilt when the device format changes (see
+// stageSuspended_). Compiled out for the XP build.
+void Driver::StartStage(const StageConfig& cfg) {
+    stage_.reset();
+    stageSuspended_.store(false, std::memory_order_relaxed);
+#if !defined(SVMS_XP_COMPAT)
+    if (!cfg.enabled) return;
+    auto engine = std::make_unique<StageEngine>();
+    if (engine->Start(cfg, sampleRate, bufferCapacity)) stage_ = std::move(engine);
+    else LOG("3D stage: could not start");
+#else
+    (void)cfg;
+#endif
 }
 
 // ── Per-MIDI-channel limiter bus planes ──────────────────────────────────
@@ -1159,6 +1177,7 @@ void Driver::RebuildAudioOutput() {
         AllocateChannelBuses(bufferCapacity);
         LOG("Rebuild mix buffers resized: capacity=%u", bufferCapacity);
     }
+    if (stage_) stageSuspended_.store(true, std::memory_order_relaxed);
     postHighPass.Initialize(sampleRate);
     reverb.Configure(sampleRate, engineConfig_);
     limiter.Configure(sampleRate, engineConfig_);
@@ -1213,6 +1232,7 @@ void Driver::ApplyPendingAudioFormat() {
     }
     if (newRate && newRate != sampleRate) {
         sampleRate = newRate;
+        if (stage_) stageSuspended_.store(true, std::memory_order_relaxed);
         postHighPass.Initialize(sampleRate);
         reverb.Configure(sampleRate, engineConfig_);
         limiter.Configure(sampleRate, engineConfig_);

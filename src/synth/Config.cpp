@@ -325,6 +325,8 @@ void ImportNumber(const std::map<std::string, std::string>& ini,
     if (input >> value) destination = value;
 }
 
+json MakeStageJson(const StageConfig& s);
+
 // The config.json document for `cfg`, written on first run.  Its sections and
 // key names are what ApplyJson reads back.
 json MakeDefaultJson(const EngineConfig& cfg) {
@@ -448,6 +450,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"phase_rotation", {
             {"mode", cfg.phaseRotationMode}
         }},
+        {"stage", MakeStageJson(cfg.stage)},
         {"note_on_collapse", {
             {"threshold", cfg.noteOnCollapseThreshold},
             {"reexcite", cfg.noteOnReexcite}
@@ -610,6 +613,79 @@ void AppendWarning(std::string& warning, const char* field) {
     if (!warning.empty()) warning += "; ";
     warning += "invalid config field: ";
     warning += field;
+}
+
+// ── 3D stage section ─────────────────────────────────────────────────────
+json MakeStageJson(const StageConfig& s) {
+    json surfaces = json::array();
+    for (uint8_t m : s.surface) surfaces.push_back(m);
+    json channels = json::array();
+    for (int i = 0; i < 16; ++i)
+        channels.push_back({{"x", s.channel[i][0]}, {"y", s.channel[i][1]},
+                            {"z", s.channel[i][2]}, {"on", s.channelOn[i]}});
+    json furniture = json::array();
+    for (uint32_t i = 0; i < s.furnitureCount; ++i)
+        furniture.push_back({{"kind", s.furniture[i].kind}, {"x", s.furniture[i].x},
+                             {"y", s.furniture[i].y}, {"rotated", s.furniture[i].rotated}});
+    return {{"enabled", s.enabled}, {"keep_reverb", s.keepReverb},
+            {"air_absorption", s.airAbsorption}, {"ear_model", s.earModel},
+            {"rays", s.rays}, {"tail_trim", s.tailTrim},
+            {"room", {{"width", s.roomWidth}, {"depth", s.roomDepth},
+                      {"height", s.roomHeight}, {"surfaces", surfaces}}},
+            {"listener", {{"x", s.listener[0]}, {"y", s.listener[1]},
+                          {"z", s.listener[2]}, {"yaw", s.listenerYaw}}},
+            {"channels", channels}, {"furniture", furniture}};
+}
+
+void ApplyStageJson(const json& obj, StageConfig& s, std::string& warning) {
+    if (!ReadBool(obj, "enabled", s.enabled)) AppendWarning(warning, "stage.enabled");
+    if (!ReadBool(obj, "keep_reverb", s.keepReverb)) AppendWarning(warning, "stage.keep_reverb");
+    if (!ReadBool(obj, "air_absorption", s.airAbsorption)) AppendWarning(warning, "stage.air_absorption");
+    if (!ReadBool(obj, "ear_model", s.earModel)) AppendWarning(warning, "stage.ear_model");
+    if (!ReadValue(obj, "rays", s.rays, 8000u, 400000u)) AppendWarning(warning, "stage.rays");
+    if (!ReadValue(obj, "tail_trim", s.tailTrim, 0.0f, 4.0f)) AppendWarning(warning, "stage.tail_trim");
+    if (auto it = obj.find("room"); it != obj.end() && it->is_object()) {
+        if (!ReadValue(*it, "width", s.roomWidth, 1.0f, 200.0f)) AppendWarning(warning, "stage.room.width");
+        if (!ReadValue(*it, "depth", s.roomDepth, 1.0f, 200.0f)) AppendWarning(warning, "stage.room.depth");
+        if (!ReadValue(*it, "height", s.roomHeight, 1.0f, 100.0f)) AppendWarning(warning, "stage.room.height");
+        if (auto sf = it->find("surfaces"); sf != it->end() && sf->is_array() && sf->size() == 6) {
+            for (size_t i = 0; i < 6; ++i) {
+                const int m = (*sf)[i].is_number_integer() ? (*sf)[i].get<int>() : -1;
+                if (m >= 0 && m < 12) s.surface[i] = static_cast<uint8_t>(m);
+                else AppendWarning(warning, "stage.room.surfaces");
+            }
+        }
+    }
+    if (auto it = obj.find("listener"); it != obj.end() && it->is_object()) {
+        if (!ReadValue(*it, "x", s.listener[0], -50.0f, 250.0f)) AppendWarning(warning, "stage.listener.x");
+        if (!ReadValue(*it, "y", s.listener[1], -50.0f, 250.0f)) AppendWarning(warning, "stage.listener.y");
+        if (!ReadValue(*it, "z", s.listener[2], 0.0f, 100.0f)) AppendWarning(warning, "stage.listener.z");
+        if (!ReadValue(*it, "yaw", s.listenerYaw, -360.0f, 360.0f)) AppendWarning(warning, "stage.listener.yaw");
+    }
+    if (auto it = obj.find("channels"); it != obj.end() && it->is_array()) {
+        for (size_t i = 0; i < it->size() && i < 16; ++i) {
+            const json& c = (*it)[i];
+            if (!c.is_object()) { AppendWarning(warning, "stage.channels"); continue; }
+            if (!ReadValue(c, "x", s.channel[i][0], -50.0f, 250.0f)) AppendWarning(warning, "stage.channels.x");
+            if (!ReadValue(c, "y", s.channel[i][1], -50.0f, 250.0f)) AppendWarning(warning, "stage.channels.y");
+            if (!ReadValue(c, "z", s.channel[i][2], 0.0f, 100.0f)) AppendWarning(warning, "stage.channels.z");
+            if (!ReadBool(c, "on", s.channelOn[i])) AppendWarning(warning, "stage.channels.on");
+        }
+    }
+    if (auto it = obj.find("furniture"); it != obj.end() && it->is_array()) {
+        s.furnitureCount = 0;
+        for (size_t i = 0; i < it->size() && s.furnitureCount < StageConfig::kMaxFurniture; ++i) {
+            const json& f = (*it)[i];
+            if (!f.is_object()) { AppendWarning(warning, "stage.furniture"); continue; }
+            StageConfig::Furniture item;
+            uint32_t kind = 0;
+            const bool ok = ReadValue(f, "kind", kind, 0u, 12u) && ReadValue(f, "x", item.x, -50.0f, 250.0f) &&
+                            ReadValue(f, "y", item.y, -50.0f, 250.0f) && ReadBool(f, "rotated", item.rotated);
+            if (!ok) { AppendWarning(warning, "stage.furniture"); continue; }
+            item.kind = static_cast<uint8_t>(kind);
+            s.furniture[s.furnitureCount++] = item;
+        }
+    }
 }
 
 // Applies a config document onto `cfg`, section by section.  A missing key
@@ -960,6 +1036,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "mode", cfg.phaseRotationMode, 0u, 4u))
             AppendWarning(cfg.configWarning, "phase_rotation.mode");
     }
+    if (auto it = root.find("stage"); it != root.end() && it->is_object())
+        ApplyStageJson(*it, cfg.stage, cfg.configWarning);
     if (auto it = root.find("voices"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "retire_threshold", cfg.voiceRetireThreshold,
                        1e-8f, 0.05f))

@@ -1492,6 +1492,14 @@ if(SVMS_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_stage_renderer COMMAND svms_v3_stage_renderer_tests)
 
+    add_executable(svms_v3_stage_engine_tests
+        tests/StageEngineTests.cpp)
+    target_compile_definitions(svms_v3_stage_engine_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_stage_engine_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME svms_v3_stage_engine COMMAND svms_v3_stage_engine_tests)
+
         add_executable(svms_v3_control_tests tests/ControlRegistryTests.cpp
             ${SVMS_CONTROL_SERVER_SOURCES})
         target_include_directories(svms_v3_control_tests PRIVATE

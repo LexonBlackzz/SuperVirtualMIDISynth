@@ -116,12 +116,16 @@ struct ChannelLimiterState {
     // Runs only when enabled; the driver gates the call on the same flag
     // that routes RenderBlock into bus mode, so a disabled stage never
     // touches audio.
+    //
+    // With `inPlace` the gained samples are written back to the buses and
+    // nothing is summed (the outputs may be null): the 3D stage then reads the
+    // limited buses itself.
     void ProcessAndSum(float* const* busLeft, float* const* busRight,
                        float* outputLeft, float* outputRight,
-                       uint32_t numFrames) noexcept {
+                       uint32_t numFrames, bool inPlace = false) noexcept {
         ResetMeters();
-        if (!busLeft || !busRight || !outputLeft || !outputRight ||
-            numFrames == 0u) {
+        if (!busLeft || !busRight || numFrames == 0u ||
+            (!inPlace && (!outputLeft || !outputRight))) {
             return;
         }
         for (uint32_t f = 0u; f < numFrames; ++f) {
@@ -181,8 +185,13 @@ struct ChannelLimiterState {
                         -20.0f * std::log10((std::max)(gain, 1.0e-12f)));
                 }
 
-                outputLeft[f] += inL * gain;
-                outputRight[f] += inR * gain;
+                if (inPlace) {
+                    busLeft[c][f] = inL * gain;
+                    busRight[c][f] = inR * gain;
+                } else {
+                    outputLeft[f] += inL * gain;
+                    outputRight[f] += inR * gain;
+                }
             }
         }
         for (uint32_t c = 0u; c < kChannelCount; ++c) {

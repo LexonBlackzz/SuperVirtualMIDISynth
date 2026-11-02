@@ -77,6 +77,7 @@ constexpr uint32_t kNoteOnCollapseDefaultThreshold = 32u;
 #include "render/Limiter.h"
 #include "render/Reverb.h"
 #include "render/ChannelLimiter.h"
+#include "driver/StageEngine.h"
 #include "driver/RuntimeLink.h"
 #include "BuildInfo.h"
 #include "include/svmsapi.h"
@@ -1025,6 +1026,11 @@ private:
     float* channelBusRightTable[kChannelCount];
     uint32_t channelBusCapacity;
     ChannelLimiterState channelLimiter;
+    // 3D stage (opt-in, default off). Needs the channel buses; when it is off,
+    // still building or suspended the mix runs exactly as without it.
+    std::unique_ptr<StageEngine> stage_;
+    std::atomic<bool> stageSuspended_{false};
+    void StartStage(const StageConfig& cfg);
     // Bus planes for the per-MIDI-channel limiter; sized to the mix-buffer
     // capacity, allocated outside the audio callback alongside the mix
     // buffers, and rebuilt wherever those are rebuilt.

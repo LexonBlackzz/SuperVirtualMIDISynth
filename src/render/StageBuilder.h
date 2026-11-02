@@ -28,6 +28,7 @@ struct BuildOptions {
     float earlySeconds = 0.42f;
     float tailTrim = 1.0f;        // tail level against the critical-distance balance
     uint32_t seed = 4242;
+    const std::atomic<bool>* cancel = nullptr;   // set to stop a long trace early
 };
 
 // Tail impulse response: noise whose band envelopes are the traced
@@ -94,7 +95,8 @@ inline std::shared_ptr<const IrSpectra> BuildTailSpectra(const FftPlan& plan, co
     t.radius = (std::max)(0.4f, (std::min)(3.0f, 0.12f * std::cbrt((std::max)(30.0f, volume))));
     t.skipOrder = opt.order;
     t.seed = opt.seed;
-    const EnergyHistogram hist = backend.Run(geometry, sources, scene.listener, t, nullptr);
+    const EnergyHistogram hist = backend.Run(geometry, sources, scene.listener, t, opt.cancel);
+    if (hist.cancelled) return nullptr;
     float absorption[kBands];
     TotalAbsorption(scene.room, absorption);
     const TailResult tail = BuildTail(hist, opt.air, volume, absorption, SabineLowBand{});
