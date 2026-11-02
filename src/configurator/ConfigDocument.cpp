@@ -127,6 +127,7 @@ void ReadLimiterAlgorithm(const json& obj, const char* key, uint32_t& dest) {
 ConfigValues ConfigDocument::Defaults() {
     ConfigValues d{};
     d.sampleRate = 44100;
+    for (auto& c : d.stageChannel) c = {12.0f, 10.0f, 1.5f};
     d.bufferFrames = 2048;
     d.monoDownmix = false;
     d.maxVoices = 1000;
@@ -368,6 +369,30 @@ void ConfigDocument::FromJson(const json& root) {
     }
     if (auto it = root.find("reverb"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.enableReverb);
+    if (auto it = root.find("stage"); it != root.end() && it->is_object()) {
+        ReadBool(*it, "enabled", working_.stageEnabled);
+        ReadBool(*it, "keep_reverb", working_.stageKeepReverb);
+        ReadNum(*it, "rays", working_.stageRays, 8000u, 400000u);
+        ReadNum(*it, "tail_trim", working_.stageTailTrim, 0.0f, 4.0f);
+        if (auto r = it->find("room"); r != it->end() && r->is_object()) {
+            ReadNum(*r, "width", working_.stageRoom[0], 1.0f, 200.0f);
+            ReadNum(*r, "depth", working_.stageRoom[1], 1.0f, 200.0f);
+            ReadNum(*r, "height", working_.stageRoom[2], 1.0f, 100.0f);
+        }
+        if (auto l = it->find("listener"); l != it->end() && l->is_object()) {
+            ReadNum(*l, "x", working_.stageListener[0], -50.0f, 250.0f);
+            ReadNum(*l, "y", working_.stageListener[1], -50.0f, 250.0f);
+            ReadNum(*l, "z", working_.stageListener[2], 0.0f, 100.0f);
+        }
+        if (auto ch = it->find("channels"); ch != it->end() && ch->is_array()) {
+            for (size_t i = 0; i < ch->size() && i < 16; ++i) {
+                if (!(*ch)[i].is_object()) continue;
+                ReadNum((*ch)[i], "x", working_.stageChannel[i][0], -50.0f, 250.0f);
+                ReadNum((*ch)[i], "y", working_.stageChannel[i][1], -50.0f, 250.0f);
+                ReadNum((*ch)[i], "z", working_.stageChannel[i][2], 0.0f, 100.0f);
+            }
+        }
+    }
         ReadNum(*it, "mix", working_.reverbMix, 0.0f, 1.0f);
         ReadNum(*it, "room_size", working_.reverbRoomSize, 0.0f, 1.0f);
         ReadNum(*it, "decay", working_.reverbDecay, 0.0f, 1.0f);
@@ -495,6 +520,22 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["reverb"]["enabled"] = working_.enableReverb;
     root["reverb"]["mix"] = working_.reverbMix;
     root["reverb"]["room_size"] = working_.reverbRoomSize;
+    root["stage"]["enabled"] = working_.stageEnabled;
+    root["stage"]["keep_reverb"] = working_.stageKeepReverb;
+    root["stage"]["rays"] = working_.stageRays;
+    root["stage"]["tail_trim"] = working_.stageTailTrim;
+    root["stage"]["room"]["width"] = working_.stageRoom[0];
+    root["stage"]["room"]["depth"] = working_.stageRoom[1];
+    root["stage"]["room"]["height"] = working_.stageRoom[2];
+    root["stage"]["listener"]["x"] = working_.stageListener[0];
+    root["stage"]["listener"]["y"] = working_.stageListener[1];
+    root["stage"]["listener"]["z"] = working_.stageListener[2];
+    for (int i = 0; i < 16; ++i) {
+        root["stage"]["channels"][i]["x"] = working_.stageChannel[i][0];
+        root["stage"]["channels"][i]["y"] = working_.stageChannel[i][1];
+        root["stage"]["channels"][i]["z"] = working_.stageChannel[i][2];
+    }
+
     root["reverb"]["decay"] = working_.reverbDecay;
     root["reverb"]["damping"] = working_.reverbDamping;
     root["reverb"]["width"] = working_.reverbWidth;

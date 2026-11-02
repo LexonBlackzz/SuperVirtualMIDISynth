@@ -51,6 +51,15 @@ struct ConfigValues {
     float channelLimiterThreshold = 0.5011872336272722f;  // -6 dBFS
     float channelLimiterReleaseMs = 150.0f;
 
+    // 3D stage (applied at engine start; surfaces and furniture stay in the file).
+    bool stageEnabled = false;
+    bool stageKeepReverb = false;
+    uint32_t stageRays = 40000u;
+    float stageTailTrim = 1.0f;
+    std::array<float, 3> stageRoom = {24.0f, 36.0f, 14.0f};
+    std::array<float, 3> stageListener = {12.0f, 24.0f, 1.2f};
+    std::array<std::array<float, 3>, 16> stageChannel{};
+
     bool enableReverb = false;
     float reverbMix = 0.25f;
     float reverbRoomSize = 0.60f;

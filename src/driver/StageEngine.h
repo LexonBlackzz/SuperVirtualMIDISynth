@@ -5,10 +5,12 @@
 // off (or still building) the driver mixes exactly as before.
 
 #include "render/StageBuilder.h"
+#include "render/StageTracerVulkan.h"
 #include "synth/StageConfig.h"
 
 #include <atomic>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -103,7 +105,12 @@ private:
     }
 
     void Build() {
-        stage::CpuTracer tracer;
+        // Ray queries on the GPU when a device has them (about 75x faster); the
+        // CPU tracer otherwise.
+        std::string why;
+        std::unique_ptr<stage::TraceBackend> gpu = stage::CreateVulkanTraceBackend(why);
+        stage::CpuTracer cpu;
+        stage::TraceBackend& tracer = gpu ? *gpu : static_cast<stage::TraceBackend&>(cpu);
         stage::EarModelSpatializer ear;
         ear.enabled = cfg_.earModel;
         const stage::BuildOptions opt = Options();

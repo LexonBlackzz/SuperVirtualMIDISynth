@@ -583,7 +583,7 @@ set(SOURCES
 if(NOT SVMS_XP_COMPAT)
     list(APPEND SOURCES render/RenderKernelsAVX2.cpp synth/LiveRecorder.cpp
          render/GpuSynth.cpp render/GpuDevice.cpp
-         render/GpuStage.cpp render/GpuBackendGL.cpp)
+         render/GpuStage.cpp render/GpuBackendGL.cpp render/StageTracerVulkan.cpp)
 endif()
 
 # Steinberg ASIO SDK host-side glue (GPLv3 — see asio-main/). Compiled into
@@ -1515,7 +1515,7 @@ if(SVMS_BUILD_TESTS)
     add_test(NAME svms_v3_stage_renderer COMMAND svms_v3_stage_renderer_tests)
 
     add_executable(svms_v3_stage_engine_tests
-        tests/StageEngineTests.cpp)
+        tests/StageEngineTests.cpp render/StageTracerVulkan.cpp)
     target_compile_definitions(svms_v3_stage_engine_tests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_stage_engine_tests PRIVATE
