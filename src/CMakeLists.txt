@@ -89,6 +89,20 @@ else()
     message(STATUS "SVMS: Vulkan kernels not embedded (no Vulkan SDK; set VULKAN_SDK)")
 endif()
 
+# The 3D Stage page's test loop (mono, 48 kHz, 16-bit) embedded as a byte array.
+set(SVMS_STAGE_LOOP_GEN "${CMAKE_CURRENT_BINARY_DIR}/stage_loop")
+add_custom_command(
+    OUTPUT "${SVMS_STAGE_LOOP_GEN}/StageLoop.inc"
+    COMMAND "${CMAKE_COMMAND}" "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/configurator/assets/stage_loop.s16"
+            "-DOUT=${SVMS_STAGE_LOOP_GEN}/StageLoop.inc" -DNAME=kStageLoopBytes
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/configurator/assets/EmbedBinary.cmake"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/configurator/assets/stage_loop.s16"
+            "${CMAKE_CURRENT_SOURCE_DIR}/configurator/assets/EmbedBinary.cmake"
+    VERBATIM)
+set_source_files_properties(configurator/StageAudition.cpp PROPERTIES
+    OBJECT_DEPENDS "${SVMS_STAGE_LOOP_GEN}/StageLoop.inc"
+    INCLUDE_DIRECTORIES "${SVMS_STAGE_LOOP_GEN}")
+
 # GPU backend of the 3D stage tracer (Vulkan ray queries): one compute shader
 # compiled to SPIR-V and embedded.  Without the SDK the file compiles to a stub
 # whose factory reports it, and the CPU tracer is used.
@@ -485,6 +499,8 @@ if(NOT WIN32)
                 configurator/PageLiveRecording.cpp
                 configurator/PageEffects.cpp
         configurator/PageStage.cpp
+        configurator/StageAudition.cpp
+        render/StageTracerVulkan.cpp
                 configurator/PageDiagnostics.cpp
                 configurator/PageSettings.cpp
                 configurator/Tour.cpp
@@ -1210,6 +1226,8 @@ if(NOT SVMS_XP_COMPAT)
         configurator/PageLiveRecording.cpp
         configurator/PageEffects.cpp
         configurator/PageStage.cpp
+        configurator/StageAudition.cpp
+        render/StageTracerVulkan.cpp
         configurator/PageDiagnostics.cpp
         configurator/PageSettings.cpp
         configurator/Tour.cpp

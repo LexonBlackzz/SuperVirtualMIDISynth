@@ -2,6 +2,7 @@
 #include "configurator/Anim.h"
 #include "configurator/ConfigDocument.h"
 #include "configurator/ModernWidgets.h"
+#include "configurator/StageAudition.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
 
@@ -1184,6 +1185,44 @@ void RoomAndFurniture(ConfigDocument& doc) {
     ui::EndReveal();
 }
 
+void ListenCard(ConfigDocument& doc) {
+    (void)doc;
+    static StageAudition audition;
+    const ConfigValues& w = doc.Working();
+    const float s = S();
+    ui::BeginCard("##stlisten", "Listen", "Plays a short test piece through the room as it is set up now, saved or not. Needs a few seconds to prepare.");
+    struct B { const char* label; StageAudition::Mode mode; ui::ButtonKind kind; const char* tip; };
+    static const B buttons[] = {
+        {"Play selected channel", StageAudition::Mode::Channel, ui::ButtonKind::Primary, "The channel you picked plays an arpeggio from where it stands."},
+        {"Play each channel in turn", StageAudition::Mode::Tour, ui::ButtonKind::Normal, "One note per channel, 1 to 16, so you hear where each one is."},
+        {"Play music loop", StageAudition::Mode::Music, ui::ButtonKind::Normal, "The loop plays through the selected channel, three times."},
+        {"Loop around me", StageAudition::Mode::Around, ui::ButtonKind::Normal, "The loop circles your head once per pass, with Doppler."},
+        {"Walk around me", StageAudition::Mode::Walk, ui::ButtonKind::Normal, "The selected channel circles you, with Doppler."},
+        {"Without the room", StageAudition::Mode::Dry, ui::ButtonKind::Normal, "The selected channel with no room and no reflections, for comparison."},
+    };
+    const float avail = ImGui::GetContentRegionAvail().x;
+    float x = 0;
+    bool first = true;
+    for (const B& b : buttons) {
+        const float bw = ui::ButtonSize(b.label).x;
+        if (!first && x + bw > avail) x = 0;
+        else if (!first) ImGui::SameLine(0, 8.0f * s);
+        first = false;
+        if (ui::Button(b.label, b.kind)) audition.Start(b.mode, w, g.sel);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", b.tip);
+        x += bw + 8.0f * s;
+    }
+    ImGui::SameLine(0, 8.0f * s);
+    if (ui::Button("Stop")) audition.Stop();
+    ImGui::Dummy(ImVec2(0, 6.0f * s));
+    ui::PushText(0, 13.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
+    ImGui::TextUnformatted(StageAudition::Supported() ? audition.Status().c_str() : "Listening tests need Windows");
+    ImGui::PopStyleColor();
+    ui::PopFont();
+    ui::EndCard();
+}
+
 void AdvancedCards(ConfigDocument& doc) {
     ConfigValues& w = doc.Working();
     const ui::Tokens& k = ui::Tok();
@@ -1335,6 +1374,7 @@ void DrawStagePage(ConfigDocument& doc) {
     ChannelsCard(doc);
     QuickCard(doc);
     RoomAndFurniture(doc);
+    ListenCard(doc);
     if (g.mode == 1) AdvancedCards(doc);
 }
 
