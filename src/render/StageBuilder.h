@@ -27,6 +27,7 @@ struct BuildOptions {
     int liveTaps = kMaxLiveTaps;  // strongest wall paths that glide when a source moves
     float earlySeconds = 0.42f;
     float tailTrim = 1.0f;        // tail level against the critical-distance balance
+    float roomSend = 0.35f;       // share of each source that feeds the tail (the design prototype's default send)
     uint32_t seed = 4242;
     const std::atomic<bool>* cancel = nullptr;   // set to stop a long trace early
 };
@@ -104,7 +105,7 @@ inline std::shared_ptr<const IrSpectra> BuildTailSpectra(const FftPlan& plan, co
     SynthesizeTail(tail, volume, opt.sampleRate, ir);
     float meanT60 = 0.0f;
     for (float v : tail.t60) meanT60 += 0.25f * v;
-    const float gain = opt.tailTrim / CriticalDistance(scene.room, meanT60);
+    const float gain = opt.tailTrim * opt.roomSend / CriticalDistance(scene.room, meanT60);
     // The convolver delays its output by one partition; start the response that much later.
     const int skip = (std::min)(plan.n / 2, static_cast<int>(ir[0].size()));
     for (auto& c : ir) {

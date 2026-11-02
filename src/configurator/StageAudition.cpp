@@ -18,8 +18,11 @@
 #include <shlwapi.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <thread>
 #include <vector>
 
 #include "StageLoop.inc"   // kStageLoopBytes: mono 48 kHz int16
@@ -38,8 +41,6 @@ constexpr int kBlock = 512;
 constexpr float kStep = 0.25f;       // seconds per note
 constexpr int kLoopFrames = static_cast<int>(sizeof(kStageLoopBytes) / 2);
 constexpr float kLoopSec = static_cast<float>(kLoopFrames) / kRate;
-constexpr int kLoopPasses = 3;
-constexpr int kOrbitBlocks = 16;     // room response refresh while a source moves
 const int kScale[10] = {0, 2, 4, 7, 9, 12, 9, 7, 4, 2};
 const int kBase[16] = {60, 67, 72, 48, 76, 69, 55, 72, 64, 40, 36, 60, 65, 67, 72, 84};
 
@@ -64,6 +65,31 @@ void Note(std::vector<float>& out, int ch, float startSec, float lenSec, int mid
         }
         out[static_cast<size_t>(n0 + i)] += v;
     }
+}
+
+using Feed = std::shared_ptr<const std::vector<float>>;
+
+Feed ArpeggioFeed(int ch) {
+    auto v = std::make_shared<std::vector<float>>(static_cast<size_t>(8.0f * kRate), 0.0f);
+    uint32_t rng = 12345u;
+    for (int n = 0; n < 32; ++n) Note(*v, ch, n * kStep, 0.24f, kBase[ch] + kScale[(n + ch) % 10], rng);
+    return v;
+}
+
+Feed TourFeed(int ch) {
+    auto v = std::make_shared<std::vector<float>>(static_cast<size_t>(10.0f * kRate), 0.0f);
+    uint32_t rng = 777u + static_cast<uint32_t>(ch);
+    Note(*v, ch, 0.6f * ch, 0.5f, kBase[ch], rng);
+    return v;
+}
+
+Feed LoopFeed() {
+    auto v = std::make_shared<std::vector<float>>(static_cast<size_t>(kLoopFrames));
+    for (int j = 0; j < kLoopFrames; ++j) {
+        const int16_t s = static_cast<int16_t>(kStageLoopBytes[2 * j] | (kStageLoopBytes[2 * j + 1] << 8));
+        (*v)[static_cast<size_t>(j)] = 0.5f * static_cast<float>(s) / 32768.0f;
+    }
+    return v;
 }
 
 // One embedded AAC track (resource id) decoded to mono float at kRate.
@@ -117,13 +143,52 @@ std::vector<float> DecodeTrack(int id) {
     return out;
 }
 
-st::StageScene MakeScene(const ConfigValues& w) {
+// Everything the page edits that the sound depends on.
+struct Snap {
+    std::array<float, 3> room{}, listener{};
+    float yaw = 0.0f, trim = 1.0f;
+    std::array<uint8_t, 6> surface{};
+    std::vector<StageFurnitureValue> furniture;
+    std::array<std::array<float, 3>, 16> channel{};
+    std::array<bool, 16> on{};
+    uint32_t rays = 40000u;
+    bool air = true, ear = true;
+    int sel = 0;
+};
+
+Snap MakeSnap(const ConfigValues& w, int sel) {
+    Snap s;
+    s.room = w.stageRoom;
+    s.listener = w.stageListener;
+    s.yaw = w.stageYaw;
+    s.trim = w.stageTailTrim;
+    s.surface = w.stageSurface;
+    s.furniture = w.stageFurniture;
+    s.channel = w.stageChannel;
+    s.on = w.stageChannelOn;
+    s.rays = w.stageRays;
+    s.air = w.stageAir;
+    s.ear = w.stageEar;
+    s.sel = sel;
+    return s;
+}
+
+bool SameRoom(const Snap& a, const Snap& b) {
+    return a.room == b.room && a.surface == b.surface && a.furniture == b.furniture && a.rays == b.rays &&
+           a.air == b.air && a.ear == b.ear && a.trim == b.trim;
+}
+
+bool SamePositions(const Snap& a, const Snap& b) {
+    return a.listener == b.listener && a.yaw == b.yaw && a.channel == b.channel && a.on == b.on && a.sel == b.sel;
+}
+
+st::StageScene MakeScene(const Snap& w) {
     st::StageScene s;
-    s.room.width = w.stageRoom[0];
-    s.room.depth = w.stageRoom[1];
-    s.room.height = w.stageRoom[2];
-    for (int i = 0; i < 6; ++i) s.room.surface[i] = static_cast<st::Material>(w.stageSurface[i]);
-    for (const auto& f : w.stageFurniture) {
+    s.room.width = w.room[0];
+    s.room.depth = w.room[1];
+    s.room.height = w.room[2];
+    for (int i = 0; i < 6; ++i) s.room.surface[i] = static_cast<st::Material>(w.surface[i]);
+    for (const auto& f : w.furniture) {
         st::Furniture item;
         item.kind = static_cast<st::FurnitureKind>(f.kind);
         item.x = f.x;
@@ -131,83 +196,249 @@ st::StageScene MakeScene(const ConfigValues& w) {
         item.rotated = f.rotated;
         s.room.furniture.push_back(item);
     }
-    s.listener = {w.stageListener[0], w.stageListener[1], w.stageListener[2]};
-    s.yawDegrees = w.stageYaw;
-    for (int c = 0; c < st::kMaxSources; ++c) {
-        s.source[c] = {w.stageChannel[c][0], w.stageChannel[c][1], w.stageChannel[c][2]};
-        s.sourceOn[c] = w.stageChannelOn[c];
-    }
+    s.listener = {w.listener[0], w.listener[1], w.listener[2]};
+    s.yawDegrees = w.yaw;
+    for (int c = 0; c < st::kMaxSources; ++c) s.source[c] = {w.channel[c][0], w.channel[c][1], w.channel[c][2]};
     return s;
-}
-
-// Plays interleaved stereo floats on the default render device (shared mode, the
-// device converts rate and format). Returns when done or cancelled.
-// `ready` counts the frames rendered so far; playback starts once 0.4 s exist and
-// never runs past what has been rendered.
-bool PlayStereo(const std::vector<float>& pcm, const std::atomic<size_t>& ready, const std::atomic<bool>& cancel,
-                std::string& error) {
-    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    IMMDeviceEnumerator* en = nullptr;
-    IMMDevice* dev = nullptr;
-    IAudioClient* ac = nullptr;
-    IAudioRenderClient* rc = nullptr;
-    bool ok = false;
-    do {
-        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
-                                    reinterpret_cast<void**>(&en)))) { error = "No audio device"; break; }
-        if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev))) { error = "No output device"; break; }
-        if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&ac)))) { error = "Cannot open the device"; break; }
-        WAVEFORMATEX wf = {};
-        wf.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-        wf.nChannels = 2;
-        wf.nSamplesPerSec = kRate;
-        wf.wBitsPerSample = 32;
-        wf.nBlockAlign = 8;
-        wf.nAvgBytesPerSec = kRate * 8;
-        if (FAILED(ac->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                  AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                                  10000000, 0, &wf, nullptr))) { error = "The device refused the format"; break; }
-        UINT32 bufFrames = 0;
-        ac->GetBufferSize(&bufFrames);
-        if (FAILED(ac->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(&rc)))) { error = "No render service"; break; }
-        const size_t total = pcm.size() / 2;
-        size_t pos = 0;
-        const size_t lead = (std::min<size_t>)(total, kRate * 2 / 5);
-        while (ready.load() < lead && !cancel.load()) Sleep(5);
-        ac->Start();
-        while (!cancel.load(std::memory_order_relaxed)) {
-            UINT32 pad = 0;
-            ac->GetCurrentPadding(&pad);
-            const size_t have = ready.load();
-            if (pos >= total) {
-                if (pad == 0) break;
-            } else if (have > pos) {
-                const UINT32 n = static_cast<UINT32>((std::min<size_t>)(bufFrames - pad, have - pos));
-                if (n > 0) {
-                    BYTE* dst = nullptr;
-                    if (SUCCEEDED(rc->GetBuffer(n, &dst))) {
-                        float* o = reinterpret_cast<float*>(dst);
-                        for (UINT32 i = 0; i < n * 2; ++i) o[i] = std::tanh(pcm[pos * 2 + i]);   // soft ceiling
-                        rc->ReleaseBuffer(n, 0);
-                        pos += n;
-                    }
-                }
-            }
-            Sleep(5);
-        }
-        ac->Stop();
-        ok = true;
-    } while (false);
-    if (rc) rc->Release();
-    if (ac) ac->Release();
-    if (dev) dev->Release();
-    if (en) en->Release();
-    if (SUCCEEDED(co)) CoUninitialize();
-    return ok;
 }
 
 } // namespace
 
+struct StageAudition::Session {
+    Mode mode;
+    StageAudition* owner;
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> dry{false};
+    std::atomic<bool> ready{false};
+    std::atomic<uint32_t> mask{0};
+    std::atomic<uint64_t> frames{0};
+    std::mutex m;
+    Snap pending;
+    Feed feed[16];                       // read and written with std::atomic_load/store
+    st::StageRenderer renderer;
+    std::thread control, audio;
+    std::string error;
+
+    Session(Mode md, StageAudition* o) : mode(md), owner(o) {}
+    ~Session() {
+        cancel.store(true);
+        if (control.joinable()) control.join();
+        if (audio.joinable()) audio.join();
+    }
+
+    bool Orbit() const { return mode == Mode::Around || mode == Mode::Walk; }
+    float Period() const { return mode == Mode::Around ? kLoopSec : 8.0f; }
+
+    // Control thread: rebuilds the response whenever the page's edits change it.
+    void Control(Snap first) {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (mode == Mode::Surround) {
+            owner->SetStatus("Decoding the tracks");
+            MFStartup(MF_VERSION);
+            std::vector<float> stems[6];
+            size_t n = SIZE_MAX;
+            for (int i = 0; i < 6; ++i) {
+                stems[i] = DecodeTrack(201 + i);
+                n = (std::min)(n, stems[i].size());
+            }
+            MFShutdown();
+            if (n == 0 || n == SIZE_MAX) {
+                owner->SetStatus("Could not decode the 5.1 tracks");
+                cancel.store(true);
+                CoUninitialize();
+                return;
+            }
+            // Six full-scale stems sum well past full scale, so each sits at 0.3.
+            for (int i = 0; i < 6; ++i) {
+                auto v = std::make_shared<std::vector<float>>(stems[i].begin(), stems[i].begin() + static_cast<std::ptrdiff_t>(n));
+                for (float& x : *v) x *= 0.3f;
+                std::atomic_store(&feed[i], Feed(v));
+            }
+        } else if (mode == Mode::Tour) {
+            for (int c = 0; c < 16; ++c) std::atomic_store(&feed[c], TourFeed(c));
+        }
+        const Feed loop = (mode == Mode::Music || mode == Mode::Around) ? LoopFeed() : Feed();
+
+        std::string why;
+        std::unique_ptr<st::TraceBackend> gpu = st::CreateVulkanTraceBackend(why);
+        st::CpuTracer cpu;
+        st::TraceBackend& tracer = gpu ? *gpu : static_cast<st::TraceBackend&>(cpu);
+        st::EarModelSpatializer ear;
+        st::BuildOptions opt;
+        opt.sampleRate = static_cast<float>(kRate);
+        opt.partition = kBlock;
+        opt.cancel = &cancel;
+        const int earlyParts = static_cast<int>(std::ceil(opt.earlySeconds * kRate / kBlock)) + 2;
+        const int tailParts = static_cast<int>(std::ceil(12.5f * kRate / kBlock)) + 2;
+        renderer.Prepare(static_cast<float>(kRate), kBlock, kBlock, earlyParts, tailParts);
+
+        const bool soloMode = mode == Mode::Channel || mode == Mode::Music || mode == Mode::Around || mode == Mode::Walk;
+        Snap last = first;
+        bool haveLast = false, lastDry = false;
+        int lastSel = -1;
+        std::shared_ptr<const st::IrSpectra> tail;
+        st::RoomMeta meta;
+        uint64_t serial = 1;
+        uint32_t lastMask = 0xFFFFFFFFu;
+        auto lastBuild = std::chrono::steady_clock::now();
+        float lastPhase = -1.0f;
+
+        while (!cancel.load()) {
+            Snap cur;
+            {
+                std::lock_guard<std::mutex> g(m);
+                cur = pending;
+            }
+            const bool isDry = dry.load();
+            const bool roomChanged = !haveLast || !SameRoom(cur, last);
+            if (soloMode && cur.sel != lastSel) {
+                std::atomic_store(&feed[cur.sel], (mode == Mode::Channel || mode == Mode::Walk) ? ArpeggioFeed(cur.sel) : loop);
+                lastSel = cur.sel;
+            }
+            uint32_t m2 = 0;
+            for (int c = 0; c < 16; ++c) {
+                if (!cur.on[c]) continue;
+                if (soloMode ? c == cur.sel : (mode == Mode::Surround ? c < 6 : true)) m2 |= 1u << c;
+            }
+            const uint64_t period = static_cast<uint64_t>(Period() * kRate);
+            const float phase = Orbit() ? static_cast<float>(frames.load() % period) / static_cast<float>(period) : 0.0f;
+            const auto now = std::chrono::steady_clock::now();
+            const bool orbitDue = Orbit() && now - lastBuild > std::chrono::milliseconds(60) && phase != lastPhase;
+            const bool moved = haveLast && (!SamePositions(cur, last) || isDry != lastDry || m2 != lastMask);
+            if (roomChanged || moved || orbitDue) {
+                opt.rays = static_cast<int>(cur.rays);
+                if (!gpu) opt.rays = (std::min)(opt.rays, 20000);
+                opt.air = cur.air;
+                opt.earModel = cur.ear;
+                opt.tailTrim = cur.trim;
+                ear.enabled = cur.ear;
+                st::StageScene scene = MakeScene(cur);
+                for (int c = 0; c < 16; ++c) scene.sourceOn[c] = ((m2 >> c) & 1u) != 0;
+                if (Orbit()) {
+                    const float a = 6.2831853f * phase;
+                    const float ca = std::cos(a), sa = std::sin(a);
+                    const st::Vec3 L = scene.listener;
+                    for (int c = 0; c < 16; ++c) {
+                        if (!scene.sourceOn[c]) continue;
+                        float dx = scene.source[c].x - L.x, dy = scene.source[c].y - L.y;
+                        if (std::hypot(dx, dy) < 1.5f) { dx = 0.0f; dy = 4.0f; }
+                        scene.source[c].x = (std::max)(0.3f, (std::min)(scene.room.width - 0.3f, L.x + dx * ca - dy * sa));
+                        scene.source[c].y = (std::max)(0.3f, (std::min)(scene.room.depth - 0.3f, L.y + dx * sa + dy * ca));
+                    }
+                }
+                if (roomChanged) {
+                    owner->SetStatus(gpu ? "Tracing the room on the GPU" : "Tracing the room");
+                    tail = st::BuildTailSpectra(renderer.Plan(), scene, tracer, opt, &meta);
+                    if (cancel.load()) break;
+                }
+                st::BuildOptions pathOpt = opt;
+                if (Orbit()) pathOpt.order = 1;   // a moving source keeps only the gliding first-order taps
+                auto r = st::BuildPaths(scene, ear, pathOpt, renderer.Plan(), tail, meta, serial++, roomChanged || !haveLast);
+                if (isDry) {
+                    for (auto& s : r->source) { s.tapCount = 0; s.early.reset(); }
+                    r->tail.reset();
+                }
+                renderer.Submit(std::move(r));
+                mask.store(m2);
+                last = cur;
+                lastDry = isDry;
+                lastMask = m2;
+                lastBuild = now;
+                lastPhase = phase;
+                haveLast = true;
+                ready.store(true);
+                owner->SetStatus("Playing");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        CoUninitialize();
+    }
+
+    // Audio thread: keeps the device about 150 ms ahead of the speaker.
+    void Audio() {
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        IMMDeviceEnumerator* en = nullptr;
+        IMMDevice* dev = nullptr;
+        IAudioClient* ac = nullptr;
+        IAudioRenderClient* rc = nullptr;
+        do {
+            if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                        reinterpret_cast<void**>(&en)))) { error = "No audio device"; break; }
+            if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev))) { error = "No output device"; break; }
+            if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&ac)))) { error = "Cannot open the device"; break; }
+            WAVEFORMATEX wf = {};
+            wf.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+            wf.nChannels = 2;
+            wf.nSamplesPerSec = kRate;
+            wf.wBitsPerSample = 32;
+            wf.nBlockAlign = 8;
+            wf.nAvgBytesPerSec = kRate * 8;
+            if (FAILED(ac->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                      AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                      10000000, 0, &wf, nullptr))) { error = "The device refused the format"; break; }
+            UINT32 bufFrames = 0;
+            ac->GetBufferSize(&bufFrames);
+            if (FAILED(ac->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(&rc)))) { error = "No render service"; break; }
+            while (!ready.load() && !cancel.load()) Sleep(5);
+            if (cancel.load()) break;
+            const UINT32 target = kRate * 15 / 100;
+            std::vector<float> in[16], l(kBlock), r(kBlock);
+            for (auto& v : in) v.assign(kBlock, 0.0f);
+            float gain = 1.0f;
+            ac->Start();
+            while (!cancel.load()) {
+                UINT32 pad = 0;
+                ac->GetCurrentPadding(&pad);
+                while (pad < target && bufFrames - pad >= static_cast<UINT32>(kBlock) && !cancel.load()) {
+                    const uint32_t bits = mask.load();
+                    const float* ptr[16] = {};
+                    const uint64_t f0 = frames.load();
+                    for (int c = 0; c < 16; ++c) {
+                        if (!((bits >> c) & 1u)) continue;
+                        const Feed fd = std::atomic_load(&feed[c]);
+                        if (!fd || fd->empty()) continue;
+                        const size_t n = fd->size();
+                        for (int i = 0; i < kBlock; ++i) in[c][static_cast<size_t>(i)] = (*fd)[static_cast<size_t>((f0 + static_cast<uint64_t>(i)) % n)];
+                        ptr[c] = in[c].data();
+                    }
+                    std::fill(l.begin(), l.end(), 0.0f);
+                    std::fill(r.begin(), r.end(), 0.0f);
+                    renderer.Process(ptr, 16, kBlock, l.data(), r.data());
+                    // A limiter that cannot clip: gain drops at once to fit the block, recovers slowly.
+                    float peak = 0.0f;
+                    for (int i = 0; i < kBlock; ++i)
+                        peak = (std::max)(peak, (std::max)(std::fabs(l[static_cast<size_t>(i)]), std::fabs(r[static_cast<size_t>(i)])));
+                    const float need = peak > 0.85f ? 0.85f / peak : 1.0f;
+                    gain = (std::min)(need, (std::min)(1.0f, gain + 0.02f));
+                    BYTE* dst = nullptr;
+                    if (FAILED(rc->GetBuffer(kBlock, &dst))) break;
+                    float* o = reinterpret_cast<float*>(dst);
+                    for (int i = 0; i < kBlock; ++i) {
+                        o[2 * i] = l[static_cast<size_t>(i)] * gain;
+                        o[2 * i + 1] = r[static_cast<size_t>(i)] * gain;
+                    }
+                    rc->ReleaseBuffer(kBlock, 0);
+                    frames.fetch_add(kBlock);
+                    pad += kBlock;
+                }
+                Sleep(4);
+            }
+            ac->Stop();
+        } while (false);
+        if (rc) rc->Release();
+        if (ac) ac->Release();
+        if (dev) dev->Release();
+        if (en) en->Release();
+        if (SUCCEEDED(co)) CoUninitialize();
+        if (!error.empty()) {
+            owner->SetStatus(error);
+            cancel.store(true);
+        }
+    }
+};
+
+StageAudition::StageAudition() = default;
+StageAudition::~StageAudition() { Stop(); }
 bool StageAudition::Supported() { return true; }
 
 void StageAudition::SetStatus(const std::string& text) {
@@ -220,188 +451,52 @@ std::string StageAudition::Status() const {
     return status_;
 }
 
-bool StageAudition::Busy() const { return busy_.load(); }
+bool StageAudition::Busy() const { return session_ && !session_->cancel.load(); }
 
 void StageAudition::Stop() {
-    cancel_.store(true);
-    if (worker_.joinable()) worker_.join();
-    cancel_.store(false);
-    busy_.store(false);
+    session_.reset();
     SetStatus("Stopped");
 }
 
 void StageAudition::Start(Mode mode, const ConfigValues& values, int selected) {
-    Stop();
-    busy_.store(true);
-    SetStatus("Rendering 0%");
-    worker_ = std::thread([this, mode, values, selected] { Work(mode, values, selected); });
+    session_.reset();
+    SetStatus("Starting");
+    auto s = std::make_unique<Session>(mode, this);
+    s->pending = MakeSnap(values, selected);
+    const Snap first = s->pending;
+    Session* raw = s.get();
+    s->control = std::thread([raw, first] { raw->Control(first); });
+    s->audio = std::thread([raw] { raw->Audio(); });
+    session_ = std::move(s);
 }
 
-void StageAudition::Work(Mode mode, const ConfigValues& w, int selected) {
-    const bool orbit = mode == Mode::Around || mode == Mode::Walk;
-    const bool music = mode == Mode::Music || mode == Mode::Around;
-    const bool surround = mode == Mode::Surround;
-    const bool solo = mode != Mode::Tour && !surround;
-    const bool dry = mode == Mode::Dry;
-    std::vector<float> stems[6];
-    float stemSec = 0.0f;
-    if (surround) {
-        SetStatus("Decoding the tracks");
-        MFStartup(MF_VERSION);
-        for (int i = 0; i < 6; ++i) stems[i] = DecodeTrack(201 + i);
-        MFShutdown();
-        size_t n = stems[0].size();
-        for (auto& v : stems) n = (std::min)(n, v.size());
-        if (n == 0) { SetStatus("Could not decode the 5.1 tracks"); busy_.store(false); return; }
-        stemSec = static_cast<float>(n) / kRate;
+void StageAudition::Update(const ConfigValues& values, int selected) {
+    if (!session_) return;
+    if (session_->cancel.load()) {
+        session_.reset();
+        return;
     }
-    const float seconds = surround ? stemSec : mode == Mode::Tour ? 16 * 0.6f + 0.4f : music ? kLoopSec * kLoopPasses : 8.0f;
-    const float period = music ? kLoopSec : 8.0f;   // one trip around the listener
+    std::lock_guard<std::mutex> g(session_->m);
+    session_->pending = MakeSnap(values, selected);
+}
 
-    // The test piece: one mono feed per channel.
-    uint32_t rng = 12345u;
-    const int body = static_cast<int>(seconds * kRate);
-    std::vector<std::vector<float>> feed(16);
-    bool active[16] = {};
-    for (int c = 0; c < 16; ++c) {
-        if (!w.stageChannelOn[c]) continue;
-        if (solo && c != selected) continue;
-        if (surround && c >= 6) continue;
-        active[c] = true;
-        feed[c].assign(static_cast<size_t>(body), 0.0f);
-        if (surround) {
-            for (int i = 0; i < body; ++i) feed[c][static_cast<size_t>(i)] = stems[c][static_cast<size_t>(i)];
-            continue;
-        }
-        if (music) {
-            // The supplied loop, through the selected channel only.
-            for (int i = 0; i < body; ++i) {
-                const int j = i % kLoopFrames;
-                const int16_t v = static_cast<int16_t>(kStageLoopBytes[2 * j] | (kStageLoopBytes[2 * j + 1] << 8));
-                feed[c][static_cast<size_t>(i)] = 0.5f * static_cast<float>(v) / 32768.0f;
-            }
-            continue;
-        }
-        if (mode == Mode::Tour) {
-            Note(feed[c], c, 0.6f * c, 0.5f, kBase[c], rng);
-            continue;
-        }
-        const int steps = static_cast<int>(seconds / kStep);
-        for (int n = 0; n < steps; ++n) {
-            if (!solo && (n + c) % (2 + c % 3) != 0) continue;
-            Note(feed[c], c, n * kStep + (c % 4) * 0.0625f, 0.24f, kBase[c] + kScale[(n + c) % 10], rng);
-        }
-    }
-
-    // The room.
-    st::StageScene scene = MakeScene(w);
-    st::StageRenderer renderer;
-    st::BuildOptions opt;
-    opt.sampleRate = static_cast<float>(kRate);
-    opt.partition = kBlock;
-    opt.rays = static_cast<int>(w.stageRays);
-    opt.air = w.stageAir;
-    opt.earModel = w.stageEar;
-    opt.tailTrim = w.stageTailTrim;
-    opt.cancel = &cancel_;
-    std::string why;
-    std::unique_ptr<st::TraceBackend> gpu = st::CreateVulkanTraceBackend(why);
-    st::CpuTracer cpu;
-    if (!gpu) opt.rays = (std::min)(opt.rays, 20000);
-    st::TraceBackend& tracer = gpu ? *gpu : static_cast<st::TraceBackend&>(cpu);
-    st::EarModelSpatializer ear;
-    ear.enabled = w.stageEar;
-    const int earlyParts = static_cast<int>(std::ceil(opt.earlySeconds * kRate / kBlock)) + 2;
-    const int tailParts = static_cast<int>(std::ceil(12.5f * kRate / kBlock)) + 2;
-    renderer.Prepare(static_cast<float>(kRate), kBlock, kBlock, earlyParts, tailParts);
-
-    st::RoomMeta meta;
-    std::shared_ptr<const st::IrSpectra> tail;
-    if (!dry) {
-        SetStatus(gpu ? "Tracing the room on the GPU" : "Tracing the room");
-        tail = st::BuildTailSpectra(renderer.Plan(), scene, tracer, opt, &meta);
-    }
-    if (cancel_.load()) { busy_.store(false); return; }
-    uint64_t serial = 1;
-    auto build = [&](const st::StageScene& sc, bool cut) {
-        auto r = st::BuildPaths(sc, ear, opt, renderer.Plan(), tail, meta, serial++, cut);
-        if (dry) {
-            for (auto& s : r->source) { s.tapCount = 0; s.early.reset(); }
-            r->tail.reset();
-        }
-        renderer.Submit(std::move(r));
-    };
-    st::BuildOptions fast = opt;
-    if (orbit) { fast.order = 1; }   // a moving source: only the gliding first-order taps, no rebuilt echo set
-    auto buildFast = [&](const st::StageScene& sc, bool cut) {
-        auto r = st::BuildPaths(sc, ear, orbit ? fast : opt, renderer.Plan(), tail, meta, serial++, cut);
-        if (dry) {
-            for (auto& s2 : r->source) { s2.tapCount = 0; s2.early.reset(); }
-            r->tail.reset();
-        }
-        renderer.Submit(std::move(r));
-    };
-    buildFast(scene, true);
-
-    const int tailFrames = dry ? kRate / 2 : static_cast<int>((std::min)(6.0f, meta.tailSeconds + 0.6f) * kRate);
-    const int totalFrames = (body + tailFrames + kBlock - 1) / kBlock * kBlock;
-    std::vector<float> pcm(static_cast<size_t>(totalFrames) * 2, 0.0f);
-    std::atomic<size_t> ready{0};
-    std::string error;
-    bool played = true;
-    std::thread player([&] { played = PlayStereo(pcm, ready, cancel_, error); });
-    auto join = [&] { if (player.joinable()) player.join(); };
-    std::vector<float> in[16], l(kBlock), r(kBlock);
-    for (auto& v : in) v.assign(kBlock, 0.0f);
-    const st::Vec3 L = scene.listener;
-    st::StageScene moving = scene;
-
-    for (int pos = 0, block = 0; pos < totalFrames; pos += kBlock, ++block) {
-        if (cancel_.load()) { join(); busy_.store(false); return; }
-        if (orbit && block % kOrbitBlocks == 0 && block > 0) {
-            const float a = 6.2831853f * static_cast<float>(pos) / (period * kRate);
-            for (int c = 0; c < 16; ++c) {
-                if (!active[c]) continue;
-                float dx = scene.source[c].x - L.x, dy = scene.source[c].y - L.y;
-                if (mode == Mode::Walk && std::hypot(dx, dy) < 1.5f) { dx = 0.0f; dy = 4.0f; }
-                const float ca = std::cos(a), sa = std::sin(a);
-                moving.source[c].x = (std::max)(0.3f, (std::min)(scene.room.width - 0.3f, L.x + dx * ca - dy * sa));
-                moving.source[c].y = (std::max)(0.3f, (std::min)(scene.room.depth - 0.3f, L.y + dx * sa + dy * ca));
-            }
-            buildFast(moving, false);
-        }
-        const float* ptr[16] = {};
-        for (int c = 0; c < 16; ++c) {
-            if (!active[c]) continue;
-            std::fill(in[c].begin(), in[c].end(), 0.0f);
-            for (int i = 0; i < kBlock && pos + i < body; ++i) in[c][static_cast<size_t>(i)] = feed[c][static_cast<size_t>(pos + i)];
-            ptr[c] = in[c].data();
-        }
-        std::fill(l.begin(), l.end(), 0.0f);
-        std::fill(r.begin(), r.end(), 0.0f);
-        renderer.Process(ptr, 16, kBlock, l.data(), r.data());
-        for (int i = 0; i < kBlock; ++i) {
-            pcm[static_cast<size_t>(pos + i) * 2] = l[static_cast<size_t>(i)];
-            pcm[static_cast<size_t>(pos + i) * 2 + 1] = r[static_cast<size_t>(i)];
-        }
-        ready.store(static_cast<size_t>(pos + kBlock));
-        if (pos == 0 || pos + kBlock == kRate / 2) SetStatus("Playing");
-    }
-    SetStatus("Playing");
-    join();
-    SetStatus(played ? "Stopped" : error);
-    busy_.store(false);
+void StageAudition::SetDry(bool dry) {
+    if (session_) session_->dry.store(dry);
 }
 
 #else  // !_WIN32
 
+struct StageAudition::Session {};
+StageAudition::StageAudition() = default;
+StageAudition::~StageAudition() = default;
 bool StageAudition::Supported() { return false; }
 void StageAudition::SetStatus(const std::string& text) { std::lock_guard<std::mutex> g(lock_); status_ = text; }
 std::string StageAudition::Status() const { std::lock_guard<std::mutex> g(lock_); return status_; }
 bool StageAudition::Busy() const { return false; }
 void StageAudition::Stop() {}
+void StageAudition::SetDry(bool) {}
+void StageAudition::Update(const ConfigValues&, int) {}
 void StageAudition::Start(Mode, const ConfigValues&, int) { SetStatus("Listening tests need Windows"); }
-void StageAudition::Work(Mode, const ConfigValues&, int) {}
 
 #endif
 

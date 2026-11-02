@@ -1189,16 +1189,15 @@ void ListenCard(ConfigDocument& doc) {
     static StageAudition audition;
     ConfigValues& w = doc.Working();
     const float s = S();
-    ui::BeginCard("##stlisten", "Listen", "Plays a short test piece through the room as it is set up now, saved or not. Needs a few seconds to prepare.");
+    ui::BeginCard("##stlisten", "Listen", "Plays through the room as it is set up now, saved or not, until you press Stop. Edit the room or move a channel while it plays and the sound follows.");
     struct B { const char* label; StageAudition::Mode mode; ui::ButtonKind kind; const char* tip; };
     static const B buttons[] = {
         {"Play selected channel", StageAudition::Mode::Channel, ui::ButtonKind::Primary, "The channel you picked plays an arpeggio from where it stands."},
         {"Play each channel in turn", StageAudition::Mode::Tour, ui::ButtonKind::Normal, "One note per channel, 1 to 16, so you hear where each one is."},
         {"Play 5.1 test (6 tracks)", StageAudition::Mode::Surround, ui::ButtonKind::Normal, "Seats channels 1 to 6 as front left, front right, centre, bass, rear left, rear right and plays a surround test on them."},
-        {"Play music loop", StageAudition::Mode::Music, ui::ButtonKind::Normal, "The loop plays through the selected channel, three times."},
+        {"Play music loop", StageAudition::Mode::Music, ui::ButtonKind::Normal, "The loop plays through the selected channel until you press Stop. Move it or change the room meanwhile."},
         {"Loop around me", StageAudition::Mode::Around, ui::ButtonKind::Normal, "The loop circles your head once per pass, with Doppler."},
         {"Walk around me", StageAudition::Mode::Walk, ui::ButtonKind::Normal, "The selected channel circles you, with Doppler."},
-        {"Without the room", StageAudition::Mode::Dry, ui::ButtonKind::Normal, "The selected channel with no room and no reflections, for comparison."},
     };
     const float avail = ImGui::GetContentRegionAvail().x;
     float x = 0;
@@ -1223,8 +1222,19 @@ void ListenCard(ConfigDocument& doc) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", b.tip);
         x += bw + 8.0f * s;
     }
-    ImGui::SameLine(0, 8.0f * s);
+    auto place = [&](const char* label) {
+        const float bw = ui::ButtonSize(label).x;
+        if (x + bw > avail) x = 0;
+        else ImGui::SameLine(0, 8.0f * s);
+        x += bw + 8.0f * s;
+    };
+    place("Stop");
     if (ui::Button("Stop")) audition.Stop();
+    place("Hold: hear it without the room");
+    ui::Button("Hold: hear it without the room");
+    audition.SetDry(ImGui::IsItemActive());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hold the button to hear the same sound with no room and no reflections.");
+    audition.Update(w, g.sel);
     ImGui::Dummy(ImVec2(0, 6.0f * s));
     ui::PushText(0, 13.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
