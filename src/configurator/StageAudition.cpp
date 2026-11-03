@@ -300,6 +300,20 @@ struct StageAudition::Session {
                 if (!cur.on[c]) continue;
                 if (soloMode ? c == cur.sel : (mode == Mode::Surround ? c < 6 : true)) m2 |= 1u << c;
             }
+            // The tour sounds one note at a time, so only the channels whose note is about to start,
+            // sounding or ringing out take part; the other twelve would cost paths and convolution for nothing.
+            if (mode == Mode::Tour) {
+                const float len = 10.0f * kRate;
+                const float t = std::fmod(static_cast<float>(frames.load() % static_cast<uint64_t>(len)) / kRate + 0.15f, 10.0f);
+                uint32_t win = 0;
+                for (int c = 0; c < 16; ++c) {
+                    float since = t - 0.6f * c;
+                    if (since < -5.0f) since += 10.0f;
+                    if (since > 5.0f) since -= 10.0f;
+                    if (since >= -0.3f && since < 1.8f) win |= 1u << c;
+                }
+                m2 &= win;
+            }
             const uint64_t period = static_cast<uint64_t>(Period() * kRate);
             const float phase = Orbit() ? static_cast<float>(frames.load() % period) / static_cast<float>(period) : 0.0f;
             const auto now = std::chrono::steady_clock::now();
@@ -328,8 +342,12 @@ struct StageAudition::Session {
                 }
                 if (roomChanged) {
                     owner->SetStatus(gpu ? "Tracing the room on the GPU" : "Tracing the room");
+                    // The tail belongs to the whole band even when only a few channels sound.
+                    if (mode == Mode::Tour)
+                        for (int c = 0; c < 16; ++c) scene.sourceOn[c] = cur.on[c];
                     tail = st::BuildTailSpectra(renderer.Plan(), scene, tracer, opt, &meta);
                     if (cancel.load()) break;
+                    for (int c = 0; c < 16; ++c) scene.sourceOn[c] = ((m2 >> c) & 1u) != 0;
                 }
                 st::BuildOptions pathOpt = opt;
                 if (Orbit()) pathOpt.order = 1;   // a moving source keeps only the gliding first-order taps

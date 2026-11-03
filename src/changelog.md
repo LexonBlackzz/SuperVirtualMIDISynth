@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-04 `perf(v3): the channel tour only renders the channels that are sounding` The tour kept all 16 channels in the stage while it played one note at a time, which lagged quickly. Now only the channels whose note is about to start, sounding or ringing out are rendered; the tail is still traced for the whole band.
+
 - 2026-11-04 `fix(v3): the stage plan draws furniture in its rays and paths` All paths now includes the furniture bounces, and the ray field is traced through the same triangle scene as the tail (furniture blocks, absorbs and scatters the rays) instead of the empty box, so the drawing matches what the audio does.
 
 - 2026-11-04 `feat(v3): ray bounces on the 3D Stage page (All paths, Ray field)` The stage plan can now draw every wall bounce up to third order from the selected channel (the same paths the early reflections use, dashed when the bounce lies off the flat view) and a slowed-down wavefront of 300 rays bouncing through the room, like the prototype did.
