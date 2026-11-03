@@ -36,6 +36,9 @@ void PushLiveMaxVoices(uint32_t value);
 void PushLiveLimiterAlgorithm(uint32_t value);
 // Coalesced per-MIDI-channel limiter update (dedicated wire command).
 void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs);
+void PushLiveStage(const ConfigValues& values);
+// Programs the connected driver has seen per channel (255 = none yet). False when not connected.
+bool QueryChannelPrograms(uint8_t out[16]);
 // Pages that send a RuntimeLink command directly call this for the top bar's
 // "Applied live" chip.
 void NoteLiveChange();

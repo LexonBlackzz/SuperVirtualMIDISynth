@@ -51,6 +51,26 @@ void PushLiveChannelLimiter(bool enabled, float threshold, float releaseMs) {
         enabled, threshold, releaseMs);
 }
 
+bool QueryChannelPrograms(uint8_t out[16]) {
+    if (!g_liveLink.connected || !g_liveLink.client) return false;
+    char result[svms::EngineLink::kResultTextBytes]{};
+    if (g_liveLink.client->SendCommand(SVMS_COMMAND_QUERY_CHANNEL_PROGRAMS, 0u, 100u, result) != SVMS_RESULT_OK)
+        return false;
+    const char* p = result;
+    for (int i = 0; i < 16; ++i) {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(p, &end, 10);
+        if (end == p) return false;
+        out[i] = static_cast<uint8_t>(v > 255ul ? 255ul : v);
+        p = *end == ',' ? end + 1 : end;
+    }
+    return true;
+}
+
+void PushLiveStage(const ConfigValues& values) {
+    if (g_liveLink.app) g_liveLink.app->SetLiveStage(values);
+}
+
 void NoteLiveChange() {
     if (g_liveLink.app) g_liveLink.app->NoteLiveChange();
 }

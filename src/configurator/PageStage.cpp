@@ -7,6 +7,7 @@
 #include "imgui.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -26,8 +27,43 @@ float S() { return ui::Scale(); }
 
 // --- Data copied from the design prototype -------------------------------------------------
 
+const char* const kGm[128] = {
+    "Grand Piano", "Bright Piano", "Electric Grand", "Honky-tonk", "Electric Piano 1", "Electric Piano 2", "Harpsichord", "Clavinet",
+    "Celesta", "Glockenspiel", "Music Box", "Vibraphone", "Marimba", "Xylophone", "Tubular Bells", "Dulcimer",
+    "Drawbar Organ", "Percussive Organ", "Rock Organ", "Church Organ", "Reed Organ", "Accordion", "Harmonica", "Tango Accordion",
+    "Nylon Guitar", "Steel Guitar", "Jazz Guitar", "Clean Guitar", "Muted Guitar", "Overdrive Guitar", "Distortion Guitar", "Guitar Harmonics",
+    "Acoustic Bass", "Finger Bass", "Pick Bass", "Fretless Bass", "Slap Bass 1", "Slap Bass 2", "Synth Bass 1", "Synth Bass 2",
+    "Violin", "Viola", "Cello", "Contrabass", "Tremolo Strings", "Pizzicato Strings", "Harp", "Timpani",
+    "Strings", "Slow Strings", "Synth Strings 1", "Synth Strings 2", "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit",
+    "Trumpet", "Trombone", "Tuba", "Muted Trumpet", "French Horn", "Brass", "Synth Brass 1", "Synth Brass 2",
+    "Soprano Sax", "Alto Sax", "Tenor Sax", "Baritone Sax", "Oboe", "English Horn", "Bassoon", "Clarinet",
+    "Piccolo", "Flute", "Recorder", "Pan Flute", "Blown Bottle", "Shakuhachi", "Whistle", "Ocarina",
+    "Square Lead", "Saw Lead", "Calliope Lead", "Chiff Lead", "Charang Lead", "Voice Lead", "Fifths Lead", "Bass and Lead",
+    "New Age Pad", "Warm Pad", "Polysynth Pad", "Choir Pad", "Bowed Pad", "Metallic Pad", "Halo Pad", "Sweep Pad",
+    "Rain", "Soundtrack", "Crystal", "Atmosphere", "Brightness", "Goblins", "Echoes", "Sci-fi",
+    "Sitar", "Banjo", "Shamisen", "Koto", "Kalimba", "Bagpipe", "Fiddle", "Shanai",
+    "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock", "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
+    "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet", "Telephone Ring", "Helicopter", "Applause", "Gunshot"};
+
 const char* const kNames[16] = {"Piano", "Strings", "Violin", "Cello", "Flute", "Oboe", "Horn", "Harp",
                                 "Choir", "Drums", "Bass", "Brass", "Pads", "Guitar", "Marimba", "Effects"};
+
+// Names follow the instrument each channel has asked for, once a driver is connected and a song has set it.
+std::array<uint8_t, 16> g_prog = [] { std::array<uint8_t, 16> a; a.fill(255); return a; }();
+
+const char* ChannelName(int i) {
+    if (g_prog[i] < 128) return i == 9 ? "Drums" : kGm[g_prog[i]];
+    return kNames[i];
+}
+
+void PollPrograms() {
+    static float timer = 0.0f;
+    timer += ImGui::GetIO().DeltaTime;
+    if (timer < 0.5f) return;
+    timer = 0.0f;
+    uint8_t p[16];
+    if (QueryChannelPrograms(p)) std::copy(p, p + 16, g_prog.begin());
+}
 
 // Material order matches render/StageSolver.h.
 const char* const kMatName[12] = {"Plaster", "Stone", "Concrete", "Wood", "Glass", "Carpet",
@@ -736,7 +772,7 @@ void StageCanvas(ConfigDocument& doc) {
             const ImVec2 ts = ImGui::CalcTextSize(n);
             dl->AddText(ImVec2(q.x - ts.x * 0.5f, q.y - ts.y * 0.5f), IM_COL32(12, 12, 16, 255), n);
             ui::PopFont();
-            if (g.labels && (sel || g.view != 2 || r > 8.0f * s)) Label(dl, ImVec2(q.x, q.y - r - 16.0f * s), IM_COL32(235, 235, 240, on ? 230 : 110), kNames[i]);
+            if (g.labels && (sel || g.view != 2 || r > 8.0f * s)) Label(dl, ImVec2(q.x, q.y - r - 16.0f * s), IM_COL32(235, 235, 240, on ? 230 : 110), ChannelName(i));
         }
         // Listener.
         const V3 L = ListenerPos(w);
@@ -918,8 +954,8 @@ void ChannelsCard(ConfigDocument& doc) {
         const bool on = w.stageChannelOn[i];
         dl->AddCircleFilled(ImVec2(a.x + 16.0f * s, a.y + rh * 0.5f), 5.5f * s, Hue(i, on ? 1.0f : 0.35f));
         ui::PushText(1, 14.0f);
-        dl->AddText(ImVec2(a.x + 32.0f * s, a.y + (rh - ImGui::GetTextLineHeight()) * 0.5f), on ? k.text : k.muted, kNames[i]);
-        const float nw = ImGui::CalcTextSize(kNames[i]).x;
+        dl->AddText(ImVec2(a.x + 32.0f * s, a.y + (rh - ImGui::GetTextLineHeight()) * 0.5f), on ? k.text : k.muted, ChannelName(i));
+        const float nw = ImGui::CalcTextSize(ChannelName(i)).x;
         ui::PopFont();
         char n[8];
         std::snprintf(n, sizeof(n), "%d", i + 1);
@@ -1253,7 +1289,7 @@ void AdvancedCards(ConfigDocument& doc) {
     {
         const bool chan = !g.you && g.fsel < 0;
         char title[48];
-        std::snprintf(title, sizeof(title), chan ? "%s (channel %d)" : g.you ? "You" : "Furniture", kNames[g.sel], g.sel + 1);
+        std::snprintf(title, sizeof(title), chan ? "%s (channel %d)" : g.you ? "You" : "Furniture", ChannelName(g.sel), g.sel + 1);
         ui::BeginCard("##stsel", title, chan ? "Place this channel by direction, height and distance from you." : "Select a channel to place it by numbers.");
         if (chan) {
             Polar p = ToPolar(w, w.stageChannel[g.sel]);
@@ -1388,6 +1424,8 @@ void DrawStagePage(ConfigDocument& doc) {
             ApplyRoom(w, 2, true);
         }
     }
+    PushLiveStage(w);
+    PollPrograms();
     g.sel = (std::max)(0, (std::min)(15, g.sel));
     if (g.fsel >= static_cast<int>(w.stageFurniture.size())) g.fsel = -1;
     HeaderBar(doc);

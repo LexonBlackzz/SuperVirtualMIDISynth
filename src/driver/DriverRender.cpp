@@ -1418,6 +1418,7 @@ void Driver::DispatchRenderEvent(const RenderEvent& event, uint32_t blockCursor,
         case RenderEventType::Reset:
             if (self->voiceManager) self->voiceManager->Reset();
             if (self->channelCache) self->channelCache->Reset();
+            self->programSeenMask_.store(0u, std::memory_order_relaxed);
             self->sysexMasterVolume_ = 1.0f;
             self->sysexMasterFineTune_ = 0.0f;
             self->sysexMasterTranspose_ = 0.0f;
@@ -2459,6 +2460,7 @@ void Driver::HandleProgramChange(uint8_t channel, uint8_t program) {
     const uint8_t oldProgram = channelCache->GetProgram(channel);
     channelCache->ProgramChange(channel, program);
 
+    programSeenMask_.fetch_or(1u << channel, std::memory_order_relaxed);
     uint32_t presetIndex = 0;
     uint8_t soundFontIndex = 0u;
     if (ResolveChannelPreset(activeSoundFontStack_, *channelCache, channel,

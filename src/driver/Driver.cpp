@@ -925,7 +925,7 @@ void Driver::StartStage(const StageConfig& cfg) {
     stage_.reset();
     stageSuspended_.store(false, std::memory_order_relaxed);
 #if !defined(SVMS_XP_COMPAT)
-    if (!cfg.enabled) return;
+    stagePending_ = cfg;
     auto engine = std::make_unique<StageEngine>();
     if (engine->Start(cfg, sampleRate, bufferCapacity)) stage_ = std::move(engine);
     else LOG("3D stage: could not start");
@@ -935,6 +935,32 @@ void Driver::StartStage(const StageConfig& cfg) {
 }
 
 // ── Per-MIDI-channel limiter bus planes ──────────────────────────────────
+// A live edit from the Configurator: collect the parts, then give the engine
+// the whole configuration so it rebuilds off the audio thread.
+bool Driver::ApplyStagePart(uint32_t part, const char* text, std::string& out) {
+#if !defined(SVMS_XP_COMPAT)
+    if (!stage_) {
+        out = "3D stage is not available";
+        return false;
+    }
+    if (part == kStageWireCommit) {
+        stage_->Update(stagePending_);
+        out = stagePending_.enabled ? "3D stage: rebuilding" : "3D stage: off";
+        return true;
+    }
+    if (!DecodeStagePart(stagePending_, part, text)) {
+        out = "malformed 3D stage part";
+        return false;
+    }
+    return true;
+#else
+    (void)part;
+    (void)text;
+    out = "3D stage is not in this build";
+    return false;
+#endif
+}
+
 // 16 stereo planes sized to the mix-buffer capacity, plus two pointer
 // tables handed to RenderBlock/ChannelLimiterState.  Called from non-audio
 // init/rebuild paths only, so the callback never allocates.

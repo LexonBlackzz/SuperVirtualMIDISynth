@@ -78,6 +78,7 @@ constexpr uint32_t kNoteOnCollapseDefaultThreshold = 32u;
 #include "render/Reverb.h"
 #include "render/ChannelLimiter.h"
 #include "driver/StageEngine.h"
+#include "synth/StageWire.h"
 #include "driver/RuntimeLink.h"
 #include "BuildInfo.h"
 #include "include/svmsapi.h"
@@ -1031,6 +1032,11 @@ private:
     std::unique_ptr<StageEngine> stage_;
     std::atomic<bool> stageSuspended_{false};
     void StartStage(const StageConfig& cfg);
+    // Live stage settings arrive in parts (SetStage); the commit hands them to the engine.
+    StageConfig stagePending_;
+    // Channels that have received a program change since the last reset (bit per channel).
+    std::atomic<uint32_t> programSeenMask_{0u};
+    bool ApplyStagePart(uint32_t part, const char* text, std::string& out);
     // Bus planes for the per-MIDI-channel limiter; sized to the mix-buffer
     // capacity, allocated outside the audio callback alongside the mix
     // buffers, and rebuilt wherever those are rebuilt.

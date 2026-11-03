@@ -266,6 +266,13 @@ enum class RLCommandType : uint32_t {
     SetBulkAdmission      = 0x00000127,
     // param = 1: a note-off ends the newest open note on its key.
     SetNestedNoteOff      = 0x00000128,
+    // param = 1: eligible sustained voices render at half rate.
+    SetHalfRate           = 0x00000129,
+    // param = part of the 3D stage settings (see synth/StageWire.h), text = that part;
+    // param 0x100 applies the parts received so far.
+    SetStage              = 0x0000012A,
+    // Returns the program each channel last asked for, "p,p,..." (255 = none yet).
+    QueryChannelPrograms  = 0x0000012B,
 
 
     Invalid              = 0xFFFFFFFF,

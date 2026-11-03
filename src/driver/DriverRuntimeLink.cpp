@@ -642,6 +642,36 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetHalfRate: {
+        // param = opt-in half-rate voice bus; read once per block.
+        if (cmd.param > 1u || !renderScalar) {
+            strncpy_s(resultText, kText, "half rate must be 0 or 1", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        renderScalar->SetHalfRate(cmd.param != 0u, 0.0f);
+        engineConfig_.halfRate = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "half rate: on (eligible sustained voices render at half rate)"
+                            : "half rate: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+    case RT::QueryChannelPrograms: {
+        const uint32_t seen = programSeenMask_.load(std::memory_order_relaxed);
+        std::string text;
+        for (uint32_t c = 0; c < 16u; ++c) {
+            const unsigned program = (((seen >> c) & 1u) != 0u && channelCache) ? channelCache->GetProgram(static_cast<uint8_t>(c)) : 255u;
+            text += (c ? "," : "") + std::to_string(program);
+        }
+        strncpy_s(resultText, kText, text.c_str(), _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+    case RT::SetStage: {
+        std::string text;
+        const bool ok = ApplyStagePart(cmd.param, cmd.resultText, text);
+        strncpy_s(resultText, kText, text.c_str(), _TRUNCATE);
+        return ok ? svms::RLResult::Ok : svms::RLResult::InvalidArgument;
+    }
     case RT::SetBlockTiming: {
         // param = opt-in block-granular dispatch. Events still admitted in
         // order; only their intra-block offset is relinquished (fires at

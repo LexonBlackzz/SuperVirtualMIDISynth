@@ -548,6 +548,12 @@ typedef enum SVMS_Command {
     SVMS_COMMAND_SET_BULK_ADMISSION      = 0x00000127,
     /* param = 1: a note-off ends the newest open note on its key. */
     SVMS_COMMAND_SET_NESTED_NOTE_OFF     = 0x00000128,
+    /* param = 1: eligible sustained voices render at half rate. */
+    SVMS_COMMAND_SET_HALF_RATE           = 0x00000129,
+    /* param = part of the 3D stage settings, text = that part; param 0x100 applies them. */
+    SVMS_COMMAND_SET_STAGE               = 0x0000012A,
+    /* Result text: the program each channel last asked for, "p,p,..." (255 = none yet). */
+    SVMS_COMMAND_QUERY_CHANNEL_PROGRAMS  = 0x0000012B,
     /* Reload the configured SoundFont (text = optional UTF-8 path). */
     SVMS_COMMAND_RELOAD_SOUNDFONT        = 0x00000101,
     SVMS_COMMAND_RESET_VOICES            = 0x00000102,

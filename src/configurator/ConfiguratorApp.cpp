@@ -22,6 +22,7 @@
 #include "configurator/PageLiveRecording.h"
 #include "configurator/PageEffects.h"
 #include "configurator/PageStage.h"
+#include "synth/StageWire.h"
 #include "configurator/PageDiagnostics.h"
 #include "configurator/PageSettings.h"
 #ifndef _WIN32
@@ -1171,7 +1172,77 @@ void ConfiguratorApp::PollRuntimeLink() {
     rlClient_.ReadTelemetry(rlTelemetry_);
 }
 
+// The stage settings as the driver reads them. The page keeps unrelated fields beside these.
+static StageConfig StageFromValues(const ConfigValues& w) {
+    StageConfig s;
+    s.enabled = w.stageEnabled;
+    s.keepReverb = w.stageKeepReverb;
+    s.airAbsorption = w.stageAir;
+    s.earModel = w.stageEar;
+    s.rays = w.stageRays;
+    s.tailTrim = w.stageTailTrim;
+    s.roomWidth = w.stageRoom[0];
+    s.roomDepth = w.stageRoom[1];
+    s.roomHeight = w.stageRoom[2];
+    for (int i = 0; i < 6; ++i) s.surface[i] = w.stageSurface[i];
+    for (int i = 0; i < 3; ++i) s.listener[i] = w.stageListener[i];
+    s.listenerYaw = w.stageYaw;
+    for (int c = 0; c < 16; ++c) {
+        for (int k = 0; k < 3; ++k) s.channel[c][k] = w.stageChannel[c][k];
+        s.channelOn[c] = w.stageChannelOn[c];
+    }
+    s.furnitureCount = 0;
+    for (const auto& f : w.stageFurniture) {
+        if (s.furnitureCount >= StageConfig::kMaxFurniture) break;
+        StageConfig::Furniture& d = s.furniture[s.furnitureCount++];
+        d.kind = static_cast<uint8_t>(f.kind);
+        d.x = f.x;
+        d.y = f.y;
+        d.rotated = f.rotated;
+    }
+    return s;
+}
+
+void ConfiguratorApp::SetLiveStage(const ConfigValues& values) {
+    if (!rlConnected_ || stageUnsupported_ || !rlClient_.HasCapability(
+            svms::build::CapabilityLiveConfiguration)) return;
+    const StageConfig sc = StageFromValues(values);
+    std::vector<std::string> parts;
+    const uint32_t n = StageWirePartCount(sc);
+    for (uint32_t i = 0; i < n; ++i) {
+        char text[348] = {};   // the command text area
+        EncodeStagePart(sc, i, text, sizeof(text));
+        parts.emplace_back(text);
+    }
+    if (parts == stageParts_) return;
+    stageParts_ = std::move(parts);
+    pendingStage_ = true;
+    NoteLiveChange();
+}
+
+void ConfiguratorApp::SendPendingStage() {
+    if (!pendingStage_ || !rlConnected_) return;
+    stageTimer_ += ImGui::GetIO().DeltaTime;
+    if (stageTimer_ < 0.12f) return;   // a trace restarts on every change, so wait for the hand to slow down
+    stageTimer_ = 0.0f;
+    char err[svms::EngineLink::kResultTextBytes] = {};
+    SVMS_Result result = SVMS_RESULT_OK;
+    for (size_t i = 0; i < stageParts_.size() && result == SVMS_RESULT_OK; ++i)
+        result = rlClient_.SendCommand(SVMS_COMMAND_SET_STAGE, static_cast<uint32_t>(i),
+                                       kRlLiveCommandTimeoutMs, err, stageParts_[i].c_str());
+    if (result == SVMS_RESULT_OK)
+        result = rlClient_.SendCommand(SVMS_COMMAND_SET_STAGE, kStageWireCommit, kRlLiveCommandTimeoutMs, err);
+    if (result == SVMS_RESULT_OK) {
+        pendingStage_ = false;
+    } else if (result != SVMS_RESULT_BUSY) {
+        pendingStage_ = false;
+        if (result == SVMS_RESULT_UNSUPPORTED) stageUnsupported_ = true;
+        stageParts_.clear();   // send everything again on the next change
+    }
+}
+
 void ConfiguratorApp::FlushLiveChanges() {
+    SendPendingStage();
     if (!rlConnected_ || !rlClient_.HasCapability(
             svms::build::CapabilityLiveConfiguration) ||
         (pendingLiveMask_ == 0u && !pendingChannelLimiter_)) return;
