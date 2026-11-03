@@ -82,6 +82,7 @@ private:
     float masterVolume_;
     uint16_t dirtyMask_;
     PanLaw cachedPanLaw_;
+    bool cachedGmCurve_ = true;
 };
 
 inline ChannelCache::ChannelCache()
@@ -314,8 +315,9 @@ inline void ChannelCache::AllSoundOff(uint8_t channel) {
 }
 
 inline void ChannelCache::RebuildCache(const RuntimeConfigSnapshot& cfg, float sampleRate) {
-    if (cachedPanLaw_ != cfg.panLaw) {
+    if (cachedPanLaw_ != cfg.panLaw || cachedGmCurve_ != cfg.gmVolumeCurve) {
         cachedPanLaw_ = cfg.panLaw;
+        cachedGmCurve_ = cfg.gmVolumeCurve;
         dirtyMask_ = 0xffffu;
     }
     const uint16_t mask = dirtyMask_;
@@ -331,14 +333,17 @@ inline void ChannelCache::RebuildChannel(uint8_t channel,
                                          float sampleRate) {
     (void)sampleRate;
     if (channel >= kChannelCount) return;
-    if (cachedPanLaw_ != cfg.panLaw) {
+    if (cachedPanLaw_ != cfg.panLaw || cachedGmCurve_ != cfg.gmVolumeCurve) {
         cachedPanLaw_ = cfg.panLaw;
+        cachedGmCurve_ = cfg.gmVolumeCurve;
         dirtyMask_ = 0xffffu;
     }
     const uint32_t ch = channel;
-    const float vol = masterVolume_ * (channelVolume_[ch] / 127.0f);
+    // GM and SF2 both put CC7 and CC11 on a 40 dB-per-decade curve, which is the square of the straight line.
+    const float cv = channelVolume_[ch] / 127.0f, ce = channelExpression_[ch] / 127.0f;
+    const float vol = masterVolume_ * (cfg.gmVolumeCurve ? cv * cv : cv);
     channels_[ch].volume = vol;
-    channels_[ch].expression = channelExpression_[ch] / 127.0f;
+    channels_[ch].expression = cfg.gmVolumeCurve ? ce * ce : ce;
 
     ComputePanGain(static_cast<uint8_t>(channelPan_[ch]),
                    channels_[ch].panLeft, channels_[ch].panRight, cfg);

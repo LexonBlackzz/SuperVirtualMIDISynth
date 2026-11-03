@@ -410,7 +410,8 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"fast_chunk_math", cfg.fastChunkMath},
             {"decimation_cull_blocks", cfg.decimationCullBlocks},
             {"interpolation", "linear"},
-            {"pan_law", "constant-power"}
+            {"pan_law", "constant-power"},
+            {"volume_curve", "gm"}
         }},
         {"limiter", {
             {"enabled", cfg.limiterEnabled},
@@ -955,6 +956,12 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     }
     if (auto it = root.find("limiter"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "enabled", cfg.limiterEnabled))
+        auto curve = it->find("volume_curve");
+        if (curve != it->end()) {
+            if (curve->is_string() && curve->get<std::string>() == "gm") cfg.gmVolumeCurve = true;
+            else if (curve->is_string() && curve->get<std::string>() == "linear") cfg.gmVolumeCurve = false;
+            else AppendWarning(cfg.configWarning, "quality.volume_curve");
+        }
             AppendWarning(cfg.configWarning, "limiter.enabled");
         auto algorithm = it->find("algorithm");
         if (algorithm != it->end()) {
@@ -1189,6 +1196,7 @@ EngineConfig EngineConfig::Default() {
     cfg.limiterEnabled = true;
     cfg.limiterAlgorithm = LimiterAlgorithm::Classic;
     cfg.limiterThreshold = 0.95f;
+    cfg.gmVolumeCurve = true;
     cfg.limiterLookaheadMs = 3.0f;
     cfg.limiterAttackMs = 0.5f;
     cfg.limiterReleaseMs = 100.0f;

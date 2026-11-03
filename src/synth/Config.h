@@ -52,6 +52,7 @@ struct EngineConfig {
     AudioBackend audioBackend;
     RenderBackend renderBackend;
     PanLaw panLaw;
+    bool gmVolumeCurve;   // CC7 / CC11 follow the squared GM curve instead of a straight line
     float masterVolume;
     bool limiterEnabled;
     LimiterAlgorithm limiterAlgorithm;
@@ -292,6 +293,7 @@ struct RuntimeConfigSnapshot {
 
 // ── Atomic process-local live-config mailbox ───────────────────────────
 // Every field is std::atomic so the audio thread's seqlock-guarded copy
+    bool gmVolumeCurve = true;
 // never performs a non-atomic read while the control thread is writing.
 // Writer (control thread): bump liveMailboxSeq_ to ODD, store the fields,
 //   then bump to EVEN (release) — the sequence only ever increases, so no

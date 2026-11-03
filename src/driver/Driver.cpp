@@ -711,6 +711,7 @@ bool Driver::Initialize() {
     configSnapshot->filterType = cfg.filterType;
     configSnapshot->panLaw = cfg.panLaw;
     configSnapshot->correctnessMode = cfg.correctnessMode;
+    configSnapshot->gmVolumeCurve = cfg.gmVolumeCurve;
 
     // Initialize both mailbox buffers with the same starting state.
     liveMailbox_.InitFromEngineConfig(cfg, sampleRate);

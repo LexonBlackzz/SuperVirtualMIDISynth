@@ -2644,6 +2644,7 @@ void RunWholeVoiceVibratoDifferential(bool scalarExact) {
     svms::RuntimeConfigSnapshot cfg{};
     cfg.masterVolume = 1.0f;
     cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.gmVolumeCurve = false;   // the frozen reference was captured with straight-line CC7/CC11
     cfg.correctnessMode = true;
 
     svms::ChannelCache seedChannels;
