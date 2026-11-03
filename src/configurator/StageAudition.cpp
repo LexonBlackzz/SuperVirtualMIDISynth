@@ -211,6 +211,8 @@ struct StageAudition::Session {
     std::atomic<bool> cancel{false};
     std::atomic<bool> dry{false};
     std::atomic<bool> ready{false};
+    std::atomic<bool> drain{false};      // stopped: the sources go quiet, the room rings out, then the session ends
+    std::atomic<float> tailSec{4.0f};
     std::atomic<uint32_t> mask{0};
     std::atomic<uint64_t> frames{0};
     std::mutex m;
@@ -286,6 +288,10 @@ struct StageAudition::Session {
         float lastPhase = -1.0f;
 
         while (!cancel.load()) {
+            if (drain.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
             Snap cur;
             {
                 std::lock_guard<std::mutex> g(m);
@@ -349,6 +355,7 @@ struct StageAudition::Session {
                         for (int c = 0; c < 16; ++c) scene.sourceOn[c] = cur.on[c];
                     tail = st::BuildTailSpectra(renderer.Plan(), scene, tracer, opt, &meta);
                     if (cancel.load()) break;
+                    tailSec.store(meta.tailSeconds);
                     for (int c = 0; c < 16; ++c) scene.sourceOn[c] = ((m2 >> c) & 1u) != 0;
                 }
                 st::BuildOptions pathOpt = opt;
@@ -358,6 +365,9 @@ struct StageAudition::Session {
                 if (Orbit()) {
                     pathOpt.order = 1;
                     reuseEarly = haveLast && !roomChanged;
+                    // A channel that has none yet (a new selection) needs its own.
+                    for (int c = 0; c < 16; ++c)
+                        if (((m2 >> c) & 1u) != 0 && !earlyKeep[c]) reuseEarly = false;
                     pathOpt.buildEarly = !reuseEarly;
                 }
                 auto r = st::BuildPaths(scene, ear, pathOpt, renderer.Plan(), tail, meta, serial++, roomChanged || !haveLast);
@@ -415,6 +425,8 @@ struct StageAudition::Session {
             const UINT32 target = kRate * 15 / 100;
             std::vector<float> in[16], l(kBlock), r(kBlock);
             for (auto& v : in) v.assign(kBlock, 0.0f);
+            const std::vector<float> silence(kBlock, 0.0f);
+            uint64_t drainStart = UINT64_MAX;
             float gain = 1.0f;
             ac->Start();
             while (!cancel.load()) {
@@ -424,8 +436,11 @@ struct StageAudition::Session {
                     const uint32_t bits = mask.load();
                     const float* ptr[16] = {};
                     const uint64_t f0 = frames.load();
+                    const bool dr = drain.load();
+                    if (dr && drainStart == UINT64_MAX) drainStart = f0;
                     for (int c = 0; c < 16; ++c) {
                         if (!((bits >> c) & 1u)) continue;
+                        if (dr) { ptr[c] = silence.data(); continue; }   // still fed, so each source's own early reflections ring out
                         const Feed fd = std::atomic_load(&feed[c]);
                         if (!fd || fd->empty()) continue;
                         const size_t n = fd->size();
@@ -439,15 +454,29 @@ struct StageAudition::Session {
                     float peak = 0.0f;
                     for (int i = 0; i < kBlock; ++i)
                         peak = (std::max)(peak, (std::max)(std::fabs(l[static_cast<size_t>(i)]), std::fabs(r[static_cast<size_t>(i)])));
+                    bool bad = false;   // std::max skips a NaN, so look at the samples themselves
+                    for (int i = 0; i < kBlock; ++i)
+                        bad = bad || !std::isfinite(l[static_cast<size_t>(i)] + r[static_cast<size_t>(i)]);
+                    if (bad) {
+                        std::fill(l.begin(), l.end(), 0.0f);
+                        std::fill(r.begin(), r.end(), 0.0f);
+                        peak = 0.0f;
+                        gain = 1.0f;
+                    }
                     const float need = peak > 0.85f ? 0.85f / peak : 1.0f;
                     gain = (std::min)(need, (std::min)(1.0f, gain + 0.02f));
                     BYTE* dst = nullptr;
                     if (FAILED(rc->GetBuffer(kBlock, &dst))) break;
                     float* o = reinterpret_cast<float*>(dst);
+                    // Stopped: let the room ring out, easing off over the last quarter second.
+                    const float total = (std::min)(12.5f, tailSec.load()) * kRate + 0.3f * kRate, fadeLen = 0.25f * kRate;
                     for (int i = 0; i < kBlock; ++i) {
-                        o[2 * i] = l[static_cast<size_t>(i)] * gain;
-                        o[2 * i + 1] = r[static_cast<size_t>(i)] * gain;
+                        float g2 = gain;
+                        if (dr) g2 *= (std::max)(0.0f, (std::min)(1.0f, (total - static_cast<float>(f0 - drainStart + static_cast<uint64_t>(i))) / fadeLen));
+                        o[2 * i] = l[static_cast<size_t>(i)] * g2;
+                        o[2 * i + 1] = r[static_cast<size_t>(i)] * g2;
                     }
+                    if (dr && static_cast<float>(f0 - drainStart) >= total) cancel.store(true);
                     rc->ReleaseBuffer(kBlock, 0);
                     frames.fetch_add(kBlock);
                     pad += kBlock;
@@ -484,13 +513,21 @@ std::string StageAudition::Status() const {
 
 bool StageAudition::Busy() const { return session_ && !session_->cancel.load(); }
 
+// The sources stop at once but the room keeps ringing, as it does when a real band stops.
 void StageAudition::Stop() {
-    session_.reset();
+    fading_.reset();
+    if (session_ && !session_->cancel.load() && session_->ready.load()) {
+        session_->drain.store(true);
+        fading_ = std::move(session_);
+    } else {
+        session_.reset();
+    }
     SetStatus("Stopped");
 }
 
 void StageAudition::Start(Mode mode, const ConfigValues& values, int selected) {
     session_.reset();
+    fading_.reset();
     SetStatus("Starting");
     auto s = std::make_unique<Session>(mode, this);
     s->pending = MakeSnap(values, selected);
@@ -502,6 +539,7 @@ void StageAudition::Start(Mode mode, const ConfigValues& values, int selected) {
 }
 
 void StageAudition::Update(const ConfigValues& values, int selected) {
+    if (fading_ && fading_->cancel.load()) fading_.reset();
     if (!session_) return;
     if (session_->cancel.load()) {
         session_.reset();

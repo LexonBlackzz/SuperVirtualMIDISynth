@@ -43,6 +43,7 @@ private:
     void SetStatus(const std::string& text);
 
     std::unique_ptr<Session> session_;
+    std::unique_ptr<Session> fading_;   // stopped, its room tail still ringing out
     mutable std::mutex lock_;
     std::string status_ = "Stopped";
 };

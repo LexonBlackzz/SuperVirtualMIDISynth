@@ -367,9 +367,11 @@ inline BandEnvelope MakeEnvelope(const std::vector<double>& e, float dt) {
         if (ia < 0 && es[static_cast<size_t>(k)] < pk * 0.03) ia = k;
         if (ib < 0 && es[static_cast<size_t>(k)] < pk * 3e-4) { ib = k; break; }
     }
-    if (ia > 0 && ib > ia) {
+    // A curve that has fallen to exactly zero (a high band in a big room, after air absorption)
+    // has no slope to extend; dividing by it made the whole tail NaN.
+    if (ia > 0 && ib > ia && es[static_cast<size_t>(ib)] > 0.0) {
         const double kk = std::log(es[static_cast<size_t>(ia)] / es[static_cast<size_t>(ib)]) / (ib - ia);
-        if (kk > 0.0) {
+        if (kk > 0.0 && std::isfinite(kk)) {
             out.t60 = static_cast<float>(13.8155 / kk * dt);
             for (int m = ib; m < n; ++m)
                 es[static_cast<size_t>(m)] = es[static_cast<size_t>(ib)] * std::exp(-kk * (m - ib));

@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-04 `fix(v3): the tail no longer goes NaN in big rooms; Stop lets the room ring out` At a room size around 200% a high band had decayed to exactly zero and the envelope fit divided by it, so the whole tail turned NaN and the reverb stayed dead until the next change (new test over room scales). The audition also drops a non-finite block instead of letting it stick in the limiter, rebuilds the early response when a new channel is selected while walking, and Stop now silences the sources but lets the room tail ring out (as the prototype did) before closing.
+
 - 2026-11-04 `fix(v3): the stage audition notes end with a short release` The plucked test notes were cut at 30% of their level when they ended, a click on every note of Walk around me and the tour; they now fade out over 30 ms.
 
 - 2026-11-04 `fix(v3): Walk around me no longer clicks; the tour lets notes ring out` The orbit modes swapped the static early response for a new one every rebuild, which clicked, so it is now built once per room (BuildOptions::buildEarly) and the moving taps are refreshed every 20 ms instead of 60. The channel tour keeps a channel in the stage for 2.5 s after its note starts.

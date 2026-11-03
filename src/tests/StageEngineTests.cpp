@@ -10,6 +10,7 @@
 namespace {
 
 using namespace svms;
+using namespace svms::stage;
 
 int g_failures = 0;
 
@@ -157,9 +158,40 @@ void TestWire() {
     CHECK(b.furniture[9].kind == 4 && b.furniture[9].rotated);
 }
 
+// The traced tail must carry energy at any room size: a larger room spreads the same rays
+// over more volume, and a tail with no energy is a silent reverb.
+void TestRoomScales() {
+    FftPlan plan;
+    plan.Init(1024);
+    CpuTracer cpu;
+    for (float scale : {0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f}) {
+        StageScene scene;
+        scene.room.width *= scale;
+        scene.room.depth *= scale;
+        scene.room.height *= scale;
+        scene.listener = {scene.room.width * 0.5f, scene.room.depth * 0.35f, 1.2f};
+        for (int c = 0; c < 4; ++c) {
+            scene.source[c] = {scene.room.width * (0.3f + 0.13f * c), scene.room.depth * 0.7f, 1.5f};
+            scene.sourceOn[c] = true;
+        }
+        BuildOptions opt;
+        opt.rays = 20000;
+        RoomMeta meta;
+        const auto tail = BuildTailSpectra(plan, scene, cpu, opt, &meta);
+        double energy = 0.0;
+        if (tail)
+            for (float v : tail->re[0]) energy += static_cast<double>(v) * v;
+        std::printf("scale %.1f: tail %s energy %.3g t60 %.2f %.2f %.2f %.2f seconds %.2f\n", scale,
+                    tail ? "yes" : "NO", energy, meta.t60[0], meta.t60[1], meta.t60[2], meta.t60[3], meta.tailSeconds);
+        CHECK(tail != nullptr);
+        CHECK(energy > 0.0 && std::isfinite(energy));
+    }
+}
+
 } // namespace
 
 int main() {
+    TestRoomScales();
     TestEngine();
     TestWire();
     TestLiveUpdate();
