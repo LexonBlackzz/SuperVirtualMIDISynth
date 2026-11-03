@@ -15,6 +15,11 @@ struct StageScene {
     float yawDegrees = 0.0f;
     Vec3 source[kMaxSources];
     bool sourceOn[kMaxSources] = {};
+    float sourceLevel[kMaxSources] = {};   // linear trim on top of the channel volume
+    float sourceSend[kMaxSources] = {};    // share of the source that feeds the tail, 1 = neutral
+    StageScene() {
+        for (int i = 0; i < kMaxSources; ++i) sourceLevel[i] = sourceSend[i] = 1.0f;
+    }
 };
 
 struct BuildOptions {
@@ -144,6 +149,8 @@ inline std::shared_ptr<RoomResponse> BuildPaths(const StageScene& scene, const S
         if (!scene.sourceOn[i]) continue;
         SourceResponse& s = r->source[i];
         s.active = true;
+        s.level = scene.sourceLevel[i];
+        s.send = scene.sourceSend[i];
         const Vec3& pos = scene.source[i];
         const DirectPath d = SolveDirect(scene.room, pos, scene.listener, scene.yawDegrees, opt.air, false);
         s.direct.delaySeconds = d.delaySeconds;

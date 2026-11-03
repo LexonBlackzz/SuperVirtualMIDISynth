@@ -152,6 +152,7 @@ struct Snap {
     std::vector<StageFurnitureValue> furniture;
     std::array<std::array<float, 3>, 16> channel{};
     std::array<bool, 16> on{};
+    std::array<std::array<float, 3>, 16> mix{};
     uint32_t rays = 40000u;
     bool air = true, ear = true;
     int sel = 0;
@@ -167,6 +168,7 @@ Snap MakeSnap(const ConfigValues& w, int sel) {
     s.furniture = w.stageFurniture;
     s.channel = w.stageChannel;
     s.on = w.stageChannelOn;
+    s.mix = w.stageChannelMix;
     s.rays = w.stageRays;
     s.air = w.stageAir;
     s.ear = w.stageEar;
@@ -180,7 +182,7 @@ bool SameRoom(const Snap& a, const Snap& b) {
 }
 
 bool SamePositions(const Snap& a, const Snap& b) {
-    return a.listener == b.listener && a.yaw == b.yaw && a.channel == b.channel && a.on == b.on && a.sel == b.sel;
+    return a.listener == b.listener && a.yaw == b.yaw && a.channel == b.channel && a.mix == b.mix && a.on == b.on && a.sel == b.sel;
 }
 
 st::StageScene MakeScene(const Snap& w) {
@@ -199,7 +201,11 @@ st::StageScene MakeScene(const Snap& w) {
     }
     s.listener = {w.listener[0], w.listener[1], w.listener[2]};
     s.yawDegrees = w.yaw;
-    for (int c = 0; c < st::kMaxSources; ++c) s.source[c] = {w.channel[c][0], w.channel[c][1], w.channel[c][2]};
+    for (int c = 0; c < st::kMaxSources; ++c) {
+        s.source[c] = {w.channel[c][0], w.channel[c][1], w.channel[c][2]};
+        s.sourceLevel[c] = std::pow(10.0f, w.mix[c][1] / 20.0f);
+        s.sourceSend[c] = w.mix[c][2] / 35.0f;
+    }
     return s;
 }
 

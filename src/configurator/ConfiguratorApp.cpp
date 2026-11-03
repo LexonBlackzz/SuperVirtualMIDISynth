@@ -1190,6 +1190,9 @@ static StageConfig StageFromValues(const ConfigValues& w) {
     for (int c = 0; c < 16; ++c) {
         for (int k = 0; k < 3; ++k) s.channel[c][k] = w.stageChannel[c][k];
         s.channelOn[c] = w.stageChannelOn[c];
+        s.channelWidth[c] = w.stageChannelMix[c][0];
+        s.channelLevelDb[c] = w.stageChannelMix[c][1];
+        s.channelSend[c] = w.stageChannelMix[c][2];
     }
     s.furnitureCount = 0;
     for (const auto& f : w.stageFurniture) {

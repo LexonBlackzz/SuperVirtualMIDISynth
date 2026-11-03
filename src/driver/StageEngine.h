@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 // Driver-side owner of the 3D stage: builds the room response on a background
 // thread, then renders it from the audio callback. Off by default; when it is
 // off (or still building) the driver mixes exactly as before. Update() hands
@@ -151,6 +153,8 @@ private:
         for (int c = 0; c < stage::kMaxSources; ++c) {
             s.source[c] = {cfg_.channel[c][0], cfg_.channel[c][1], cfg_.channel[c][2]};
             s.sourceOn[c] = cfg_.channelOn[c];
+            s.sourceLevel[c] = std::pow(10.0f, cfg_.channelLevelDb[c] / 20.0f);
+            s.sourceSend[c] = cfg_.channelSend[c] / 35.0f;
         }
         return s;
     }

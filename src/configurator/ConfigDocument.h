@@ -73,6 +73,8 @@ struct ConfigValues {
     bool stageEar = true;
     std::array<uint8_t, 6> stageSurface = {6, 0, 3, 3, 3, 7};
     std::array<bool, 16> stageChannelOn{};
+    // Per channel: width (percent, drawn only), level trim (dB) and room send (percent, 35 neutral).
+    std::array<std::array<float, 3>, 16> stageChannelMix{};
     std::vector<StageFurnitureValue> stageFurniture;
 
     bool enableReverb = false;

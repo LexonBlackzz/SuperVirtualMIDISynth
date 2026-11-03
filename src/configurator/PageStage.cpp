@@ -192,7 +192,14 @@ void FitAll(ConfigValues& w) {
 }
 
 // Moving the listener carries the band along, so everyone keeps their direction.
-void MoveListener(ConfigValues& w, float x, float y) {
+// Moves only the listener, so the channels stay where they are in the room. With `carry` the band
+// keeps its place around the listener and moves with it (hold Ctrl while dragging).
+void MoveListener(ConfigValues& w, float x, float y, bool carry) {
+    if (!carry) {
+        w.stageListener[0] = x;
+        w.stageListener[1] = y;
+        return;
+    }
     Polar pol[16];
     for (int i = 0; i < 16; ++i) pol[i] = ToPolar(w, w.stageChannel[i]);
     w.stageListener[0] = x;
@@ -752,7 +759,7 @@ void MoveTarget(ConfigValues& w, float x, float y, float z, bool setX, bool setY
     if (g.you) {
         const float nx = setX ? Clamp(x, 0.5f, w.stageRoom[0] - 0.5f) : t[0];
         const float ny = setY ? Clamp(y, 0.5f, w.stageRoom[1] - 0.5f) : t[1];
-        MoveListener(w, nx, ny);
+        MoveListener(w, nx, ny, ImGui::GetIO().KeyCtrl);
         if (setZ) w.stageListener[2] = Clamp(z, 0.2f, w.stageRoom[2] - 0.2f);
         return;
     }
@@ -933,6 +940,11 @@ void StageCanvas(ConfigDocument& doc) {
                 dl->AddEllipseFilled(fl, ImVec2(5.0f * s, 2.2f * s), Hue(i, 0.35f * a), 0.0f, 12);
             }
             const float r = g.view == 2 ? Clamp(0.85f * kk, 9.0f * s, 17.0f * s) : 9.5f * s;
+            // A wide channel is a cloud rather than a point (flat views only, as in the prototype).
+            const float wd = w.stageChannelMix[i][0];
+            if (g.view != 2 && wd > 0.0f)
+                dl->AddCircleFilled(q, wd / 100.0f * (std::max)(1.2f, (std::min)(w.stageRoom[0], w.stageRoom[1]) * 0.1f) * P.sc,
+                                    Hue(i, 0.09f * a));
             if (on) Glow(dl, q, r * 1.7f, Hue(i, sel ? 0.55f : 0.28f));
             dl->AddCircleFilled(q, r, Hue(i, a));
             dl->AddCircle(q, r, IM_COL32(255, 255, 255, on ? 90 : 40), 0, 1.0f);
@@ -1075,7 +1087,7 @@ void StageCard(ConfigDocument& doc) {
     ui::BeginCard("##ststage", "Stage",
                   g.view == 2 ? "Drag a dot to move it, hold Shift to lift it, drag empty space to orbit"
                   : g.view == 1 ? "Drag up or down for height, left and right along the room"
-                                : "Drag any dot, furniture or yourself to move it",
+                                : "Drag any dot, furniture or yourself to move it (Ctrl-drag yourself to take the band along)",
                   rw, "stageStage");
     ui::Segmented("##stview", &g.view, kViews, 3);
     ui::CardHeaderEnd();
@@ -1500,6 +1512,12 @@ void AdvancedCards(ConfigDocument& doc) {
                 g.baseValid = false;
                 doc.MarkDirty();
             }
+            auto& mx = w.stageChannelMix[g.sel];
+            bool cm = false;
+            cm |= slider("##stWd", "Width", "0 is a point, 100 spreads the channel into a cloud on the plan.", &mx[0], 0, 100, "%.0f%%");
+            cm |= slider("##stLv", "Level", "Trim on top of the channel volume.", &mx[1], -24, 12, "%+.1f dB");
+            cm |= slider("##stSd", "Amount of room", "How much of this channel rings in the room.", &mx[2], 0, 100, "%.0f%%");
+            if (cm) doc.MarkDirty();
         } else {
             ImGui::Dummy(ImVec2(0, 2.0f * s));
         }

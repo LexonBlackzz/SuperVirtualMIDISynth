@@ -35,6 +35,12 @@ struct StageConfig {
         {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f},
         {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f},
         {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f}, {12.0f, 10.0f, 1.5f}};
+    // Per channel: how wide it spreads on the plan (percent; drawn only), a level trim in dB on top
+    // of the channel volume, and how much of it rings in the room (percent; 35 is the neutral send).
+    float channelWidth[16] = {};
+    float channelLevelDb[16] = {};
+    float channelSend[16] = {35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f,
+                             35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f};
     bool channelOn[16] = {true, true, true, true, true, true, true, true,
                           true, true, true, true, true, true, true, true};
 

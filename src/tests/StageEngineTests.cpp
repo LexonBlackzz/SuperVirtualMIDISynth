@@ -84,6 +84,12 @@ double Pulse(StageEngine& engine, uint32_t frames) {
         busR[c] = bus[c][1].data();
     }
     std::vector<float> outL(frames), outR(frames);
+    // Let whatever an earlier pulse left in the room ring out first.
+    for (int block = 0; block < 330; ++block) {
+        std::fill(outL.begin(), outL.end(), 0.0f);
+        std::fill(outR.begin(), outR.end(), 0.0f);
+        if (!engine.Process(busL, busR, frames, outL.data(), outR.data())) return -1.0;
+    }
     double energy = 0.0;
     bus[0][0][0] = bus[0][1][0] = 1.0f;
     for (int block = 0; block < 8; ++block) {
@@ -129,6 +135,41 @@ void TestLiveUpdate() {
     engine.Stop();
 }
 
+// A channel's level trim scales everything it contributes; its room send only the tail.
+void TestChannelMix() {
+    StageConfig cfg;
+    cfg.rays = 8000u;
+    cfg.enabled = true;
+    StageEngine engine;
+    const uint32_t frames = 1024;
+    CHECK(engine.Start(cfg, 48000u, frames));
+    CHECK(WaitReady(engine, 60));
+    const double base = Pulse(engine, frames);
+    cfg.channelLevelDb[0] = -20.0f;
+    engine.Update(cfg);
+    // Settled: below half and two readings in a row agree (the first one after the swap can straddle it).
+    double trimmed = base, before = -1.0;
+    for (int i = 0; i < 400 && !(trimmed < 0.5 * base && std::fabs(trimmed - before) < 0.02 * before); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        before = trimmed;
+        trimmed = Pulse(engine, frames);
+    }
+    std::printf("level -20 dB: energy ratio %.4f (expect 0.0100)\n", trimmed / base);
+    CHECK(trimmed / base > 0.008 && trimmed / base < 0.0125);
+    cfg.channelLevelDb[0] = 0.0f;
+    cfg.channelSend[0] = 0.0f;
+    engine.Update(cfg);
+    double dry = base, prev = -1.0;
+    for (int i = 0; i < 400 && !(dry < 0.995 * base && std::fabs(dry - prev) < 0.02 * prev); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        prev = dry;
+        dry = Pulse(engine, frames);
+    }
+    std::printf("no room send: energy ratio %.4f\n", dry / base);
+    CHECK(dry < 0.995 * base && dry > 0.5 * base);   // no tail send: quieter, but the direct sound and early taps remain
+    engine.Stop();
+}
+
 // Settings survive the trip through the command text parts.
 void TestWire() {
     StageConfig a;
@@ -141,6 +182,9 @@ void TestWire() {
     a.listenerYaw = -40.0f;
     a.channel[11][2] = 4.5f;
     a.channelOn[12] = false;
+    a.channelWidth[4] = 60.0f;
+    a.channelLevelDb[5] = -6.5f;
+    a.channelSend[6] = 80.0f;
     a.furnitureCount = 11;
     for (uint32_t i = 0; i < a.furnitureCount; ++i) a.furniture[i] = {static_cast<uint8_t>(i % 5), 1.0f + i, 2.5f * i, (i & 1u) != 0u};
     StageConfig b;
@@ -153,6 +197,8 @@ void TestWire() {
     CHECK(std::fabs(b.roomWidth - 31.5f) < 1e-2f && b.surface[2] == 9);
     CHECK(std::fabs(b.listener[1] - 17.25f) < 1e-2f && std::fabs(b.listenerYaw + 40.0f) < 1e-2f);
     CHECK(std::fabs(b.channel[11][2] - 4.5f) < 1e-2f && !b.channelOn[12] && b.channelOn[0]);
+    CHECK(std::fabs(b.channelWidth[4] - 60.0f) < 1e-2f && std::fabs(b.channelLevelDb[5] + 6.5f) < 1e-2f);
+    CHECK(std::fabs(b.channelSend[6] - 80.0f) < 1e-2f && std::fabs(b.channelSend[0] - 35.0f) < 1e-2f);
     CHECK(b.furnitureCount == 11);
     CHECK(b.furniture[10].kind == 0 && std::fabs(b.furniture[10].y - 25.0f) < 1e-2f && !b.furniture[10].rotated);
     CHECK(b.furniture[9].kind == 4 && b.furniture[9].rotated);
@@ -195,6 +241,7 @@ int main() {
     TestEngine();
     TestWire();
     TestLiveUpdate();
+    TestChannelMix();
     if (g_failures) {
         std::printf("%d check(s) failed\n", g_failures);
         return 1;

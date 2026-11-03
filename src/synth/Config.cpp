@@ -623,7 +623,9 @@ json MakeStageJson(const StageConfig& s) {
     json channels = json::array();
     for (int i = 0; i < 16; ++i)
         channels.push_back({{"x", s.channel[i][0]}, {"y", s.channel[i][1]},
-                            {"z", s.channel[i][2]}, {"on", s.channelOn[i]}});
+                            {"z", s.channel[i][2]}, {"on", s.channelOn[i]},
+                            {"width", s.channelWidth[i]}, {"level_db", s.channelLevelDb[i]},
+                            {"send", s.channelSend[i]}});
     json furniture = json::array();
     for (uint32_t i = 0; i < s.furnitureCount; ++i)
         furniture.push_back({{"kind", s.furniture[i].kind}, {"x", s.furniture[i].x},
@@ -671,6 +673,9 @@ void ApplyStageJson(const json& obj, StageConfig& s, std::string& warning) {
             if (!ReadValue(c, "y", s.channel[i][1], -50.0f, 250.0f)) AppendWarning(warning, "stage.channels.y");
             if (!ReadValue(c, "z", s.channel[i][2], 0.0f, 100.0f)) AppendWarning(warning, "stage.channels.z");
             if (!ReadBool(c, "on", s.channelOn[i])) AppendWarning(warning, "stage.channels.on");
+            if (!ReadValue(c, "width", s.channelWidth[i], 0.0f, 100.0f)) AppendWarning(warning, "stage.channels.width");
+            if (!ReadValue(c, "level_db", s.channelLevelDb[i], -24.0f, 12.0f)) AppendWarning(warning, "stage.channels.level_db");
+            if (!ReadValue(c, "send", s.channelSend[i], 0.0f, 100.0f)) AppendWarning(warning, "stage.channels.send");
         }
     }
     if (auto it = obj.find("furniture"); it != obj.end() && it->is_array()) {

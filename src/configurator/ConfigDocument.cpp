@@ -129,6 +129,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.sampleRate = 44100;
     for (auto& c : d.stageChannel) c = {12.0f, 10.0f, 1.5f};
     d.stageChannelOn.fill(true);
+    for (auto& m : d.stageChannelMix) m = {0.0f, 0.0f, 35.0f};
     d.bufferFrames = 2048;
     d.monoDownmix = false;
     d.maxVoices = 1000;
@@ -400,6 +401,9 @@ void ConfigDocument::FromJson(const json& root) {
                 ReadNum((*ch)[i], "y", working_.stageChannel[i][1], -50.0f, 250.0f);
                 ReadNum((*ch)[i], "z", working_.stageChannel[i][2], 0.0f, 100.0f);
                 ReadBool((*ch)[i], "on", working_.stageChannelOn[i]);
+                ReadNum((*ch)[i], "width", working_.stageChannelMix[i][0], 0.0f, 100.0f);
+                ReadNum((*ch)[i], "level_db", working_.stageChannelMix[i][1], -24.0f, 12.0f);
+                ReadNum((*ch)[i], "send", working_.stageChannelMix[i][2], 0.0f, 100.0f);
             }
         }
         if (auto fu = it->find("furniture"); fu != it->end() && fu->is_array()) {
@@ -567,6 +571,9 @@ nlohmann::json ConfigDocument::ToJson() const {
         root["stage"]["channels"][i]["y"] = working_.stageChannel[i][1];
         root["stage"]["channels"][i]["z"] = working_.stageChannel[i][2];
         root["stage"]["channels"][i]["on"] = working_.stageChannelOn[i];
+        root["stage"]["channels"][i]["width"] = working_.stageChannelMix[i][0];
+        root["stage"]["channels"][i]["level_db"] = working_.stageChannelMix[i][1];
+        root["stage"]["channels"][i]["send"] = working_.stageChannelMix[i][2];
     }
 
     root["reverb"]["decay"] = working_.reverbDecay;

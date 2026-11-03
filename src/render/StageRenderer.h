@@ -253,6 +253,8 @@ struct SourceResponse {
     int tapCount = 0;
     LiveTap taps[kMaxLiveTaps];
     std::shared_ptr<const IrSpectra> early;   // static early response, may be null
+    float level = 1.0f;   // trim on the source's whole contribution
+    float send = 1.0f;    // share of the source that feeds the tail
 };
 
 struct RoomMeta {
@@ -347,12 +349,15 @@ public:
                 s.early.Process(plan_, nullptr, zeros_.data(), frames, scratchL_.data(), scratchR_.data());
                 continue;
             }
-            const float* x = in[ch];
             const size_t mask = static_cast<size_t>(feedSize_ - 1);
+            const float lv = sr.level, tailGain = sr.level * sr.send;
             for (int i = 0; i < frames; ++i) {
-                s.feed[(s.writePos + static_cast<uint64_t>(i)) & mask] = x[i];
-                tailIn_[static_cast<size_t>(i)] += x[i];
+                const float v = in[ch][i] * lv;
+                s.mono[static_cast<size_t>(i)] = v;
+                s.feed[(s.writePos + static_cast<uint64_t>(i)) & mask] = v;
+                tailIn_[static_cast<size_t>(i)] += in[ch][i] * tailGain;
             }
+            const float* x = s.mono.data();
             RenderTap(s, 0, sr.direct, rsp.cut, frames, outL, outR);
             for (int t = 0; t < sr.tapCount; ++t) RenderTap(s, 1 + t, sr.taps[t], rsp.cut, frames, outL, outR);
             for (int t = sr.tapCount; t < kMaxLiveTaps; ++t) FadeOutTap(s, 1 + t, frames, outL, outR);

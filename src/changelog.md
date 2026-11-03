@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-04 `feat(v3): per-channel level, room send and width on the 3D stage; dragging You moves only you` Each channel gets a level trim (-24..+12 dB, scales its direct sound, early taps and tail send), an amount-of-room send (35 is neutral, only scales its tail feed) and a width (drawn as a cloud on the plan, like the prototype, no audio effect). They travel through stage.channels in the config, the live SetStage parts and the audition. Dragging You no longer carries the band along; hold Ctrl for that.
+
 - 2026-11-04 `fix(v3): the tail no longer goes NaN in big rooms; Stop lets the room ring out` At a room size around 200% a high band had decayed to exactly zero and the envelope fit divided by it, so the whole tail turned NaN and the reverb stayed dead until the next change (new test over room scales). The audition also drops a non-finite block instead of letting it stick in the limiter, rebuilds the early response when a new channel is selected while walking, and Stop now silences the sources but lets the room tail ring out (as the prototype did) before closing.
 
 - 2026-11-04 `fix(v3): the stage audition notes end with a short release` The plucked test notes were cut at 30% of their level when they ended, a click on every note of Walk around me and the tour; they now fade out over 30 ms.

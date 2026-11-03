@@ -34,7 +34,8 @@ inline bool EncodeStagePart(const StageConfig& s, uint32_t part, char* out, size
             s.listenerYaw, s.furnitureCount);
     } else if (part <= kStageWireChannelParts) {
         for (uint32_t i = (part - 1u) * 8u; i < part * 8u; ++i)
-            put("%.3f,%.3f,%.3f,%d;", s.channel[i][0], s.channel[i][1], s.channel[i][2], s.channelOn[i] ? 1 : 0);
+            put("%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.0f;", s.channel[i][0], s.channel[i][1], s.channel[i][2],
+                s.channelOn[i] ? 1 : 0, s.channelWidth[i], s.channelLevelDb[i], s.channelSend[i]);
     } else {
         const uint32_t first = (part - kStageWireFurnitureBase) * 8u;
         for (uint32_t i = first; i < first + 8u && i < s.furnitureCount; ++i)
@@ -77,13 +78,16 @@ inline bool DecodeStagePart(StageConfig& s, uint32_t part, const char* text) {
     const char* p = text;
     if (part <= kStageWireChannelParts) {
         for (uint32_t i = (part - 1u) * 8u; i < part * 8u; ++i) {
-            float x, y, z;
+            float x, y, z, wd, db, sd;
             int on, used = 0;
-            if (std::sscanf(p, "%f,%f,%f,%d;%n", &x, &y, &z, &on, &used) != 4) return false;
+            if (std::sscanf(p, "%f,%f,%f,%d,%f,%f,%f;%n", &x, &y, &z, &on, &wd, &db, &sd, &used) != 7) return false;
             s.channel[i][0] = x;
             s.channel[i][1] = y;
             s.channel[i][2] = z;
             s.channelOn[i] = on != 0;
+            s.channelWidth[i] = wd < 0.0f ? 0.0f : wd > 100.0f ? 100.0f : wd;
+            s.channelLevelDb[i] = db < -24.0f ? -24.0f : db > 12.0f ? 12.0f : db;
+            s.channelSend[i] = sd < 0.0f ? 0.0f : sd > 100.0f ? 100.0f : sd;
             p += used;
         }
         return true;
