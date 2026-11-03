@@ -5,12 +5,14 @@
 #include "configurator/StageAudition.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
+#include "render/StageSolver.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -139,6 +141,8 @@ struct State {
     int sel = 0, fsel = -1;
     bool you = false;
     bool refl = true, labels = true;
+    bool allPaths = false, rayField = false;
+    int pathCount = 0;
     int roomIdx = 2, seat = Orch, level = 1;
     float amount = 100.0f;
     // Quick-knob state; the base is the band as it stood before the first nudge.
@@ -498,6 +502,159 @@ void DrawReflections(ImDrawList* dl, const Proj& P, const ConfigValues& w, int c
     dl->AddLine(P.F(s), P.F(l), Hue(ch, 0.9f), 1.8f * S());
 }
 
+namespace stg = svms::stage;
+
+stg::Room MakeRoom(const ConfigValues& w) {
+    stg::Room r;
+    r.width = w.stageRoom[0];
+    r.depth = w.stageRoom[1];
+    r.height = w.stageRoom[2];
+    for (int i = 0; i < 6; ++i) r.surface[i] = static_cast<stg::Material>(w.stageSurface[i]);
+    for (const auto& f : w.stageFurniture) {
+        stg::Furniture it;
+        it.kind = static_cast<stg::FurnitureKind>(f.kind);
+        it.x = f.x;
+        it.y = f.y;
+        it.rotated = f.rotated;
+        r.furniture.push_back(it);
+    }
+    return r;
+}
+
+float MeanAbsorption(stg::Material m) {
+    const float* a = stg::Absorption(m);
+    float s = 0.0f;
+    for (int b = 0; b < stg::kBands; ++b) s += a[b];
+    return s / stg::kBands;
+}
+
+void Dashed(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float lw, bool dashed) {
+    const float dx = b.x - a.x, dy = b.y - a.y, len = std::sqrt(dx * dx + dy * dy);
+    if (!dashed || len < 1.0f) { dl->AddLine(a, b, col, lw); return; }
+    for (float t = 0.0f; t < len; t += 8.0f * S()) {
+        const float e = (std::min)(len, t + 3.0f * S());
+        dl->AddLine(ImVec2(a.x + dx * t / len, a.y + dy * t / len), ImVec2(a.x + dx * e / len, a.y + dy * e / len), col, lw);
+    }
+}
+
+// Every wall bounce up to third order, as the early reflections use them. A bounce on a wall
+// that faces the camera lies above or below the flat drawing, so that path is dashed.
+void DrawAllPaths(ImDrawList* dl, const Proj& P, const ConfigValues& w, int ch) {
+    const stg::Room room = MakeRoom(w);
+    const stg::Vec3 s{w.stageChannel[ch][0], w.stageChannel[ch][1], w.stageChannel[ch][2]};
+    const stg::Vec3 l{w.stageListener[0], w.stageListener[1], w.stageListener[2]};
+    const auto paths = stg::FindReflections(room, s, l, 3);
+    const ImVec2 ps = P.F(ChPos(w, ch)), pl = P.F(ListenerPos(w));
+    int count = 0;
+    for (const auto& e : paths) {
+        if (e.furniture) continue;
+        ++count;
+        stg::Vec3 pts[3];
+        stg::BouncePoints(room, s, l, e.seq, e.order, pts);
+        ImVec2 q[5];
+        q[0] = ps;
+        bool off = false;
+        for (int k = 0; k < e.order; ++k) {
+            q[k + 1] = P.F({pts[k].x, pts[k].y, pts[k].z});
+            const int wall = e.seq[k];
+            off = off || (P.view == 0 && wall < 2) || (P.view == 1 && wall >= 2 && wall < 4);
+        }
+        q[e.order + 1] = pl;
+        float gm = 0.0f;
+        for (int b = 0; b < stg::kBands; ++b) gm += e.gain[b];
+        gm /= stg::kBands;
+        const float st = (std::max)(0.08f, 0.8f * gm / (e.order * 0.9f));
+        const ImU32 col = Hue(ch, st * 0.6f);
+        const float lw = (e.order == 1 ? 1.5f : e.order == 2 ? 1.0f : 0.7f) * S();
+        for (int k = 0; k <= e.order; ++k) Dashed(dl, q[k], q[k + 1], col, lw, off);
+    }
+    g.pathCount = count;
+    dl->AddLine(ps, pl, Hue(ch, 0.9f), 1.8f * S());
+}
+
+// A few hundred rays from the selected channel through the empty box, followed
+// as they bounce; the wavefront runs along them slowed down about twelve times.
+struct RayPt { float x, y, z, d, en; };
+std::vector<std::vector<RayPt>> g_rays;
+uint64_t g_rayKey = 0;
+
+void BuildRays(const ConfigValues& w, int ch) {
+    uint64_t key = 1469598103934665603ull + static_cast<uint64_t>(ch);
+    auto mix = [&](float v) {
+        uint32_t u;
+        std::memcpy(&u, &v, 4);
+        key = (key ^ u) * 1099511628211ull;
+    };
+    for (float v : w.stageRoom) mix(v);
+    for (int i = 0; i < 6; ++i) mix(static_cast<float>(w.stageSurface[i]));
+    for (int i = 0; i < 3; ++i) mix(w.stageChannel[ch][i]);
+    if (key == g_rayKey) return;
+    g_rayKey = key;
+    g_rays.clear();
+    const stg::Room room = MakeRoom(w);
+    float keep[6];
+    for (int i = 0; i < 6; ++i) keep[i] = 1.0f - MeanAbsorption(room.surface[i]);
+    const float dims[3] = {room.width, room.depth, room.height};
+    uint32_t rng = 12345u;
+    auto rnd = [&] {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<float>(rng >> 8) / 16777216.0f;
+    };
+    for (int i = 0; i < 300; ++i) {
+        const float z = 2.0f * rnd() - 1.0f, a = 6.2831853f * rnd(), rr = std::sqrt((std::max)(0.0f, 1.0f - z * z));
+        float dir[3] = {rr * std::cos(a), rr * std::sin(a), z};
+        float p[3] = {w.stageChannel[ch][0], w.stageChannel[ch][1], w.stageChannel[ch][2]};
+        float dist = 0.0f, en = 1.0f;
+        std::vector<RayPt> ray;
+        ray.push_back({p[0], p[1], p[2], 0.0f, 1.0f});
+        for (int b = 0; b < 30 && dist < 90.0f && en > 0.03f; ++b) {
+            float best = 1e9f;
+            int axis = 0;
+            for (int k = 0; k < 3; ++k) {
+                if (std::fabs(dir[k]) < 1e-6f) continue;
+                const float t = ((dir[k] > 0.0f ? dims[k] : 0.0f) - p[k]) / dir[k];
+                if (t >= 0.0f && t < best) { best = t; axis = k; }
+            }
+            if (best > 1e8f) break;
+            for (int k = 0; k < 3; ++k) p[k] += dir[k] * best;
+            dist += best;
+            // Walls are numbered z (0,1), x (2,3), y (4,5).
+            const int wall = (axis == 2 ? 0 : axis == 0 ? 2 : 4) + (dir[axis] > 0.0f ? 1 : 0);
+            en *= keep[wall];
+            dir[axis] = -dir[axis];
+            ray.push_back({p[0], p[1], p[2], dist, en});
+        }
+        g_rays.push_back(std::move(ray));
+    }
+}
+
+void DrawRayField(ImDrawList* dl, const Proj& P, const ConfigValues& w, int ch) {
+    BuildRays(w, ch);
+    const float ph = std::fmod(static_cast<float>(ImGui::GetTime()) * 0.5f, 2.4f);
+    const float vd = ph * 28.0f, rl = (std::max)(0.0f, 1.0f - ph / 2.4f), tail = 3.5f;
+    std::vector<ImVec2> pts;
+    auto at = [&](const RayPt& a, const RayPt& b, float d) {
+        const float f = (d - a.d) / (std::max)(1e-6f, b.d - a.d);
+        return P.F({a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f});
+    };
+    for (const auto& r : g_rays) {
+        const float d0 = (std::max)(0.0f, vd - tail);
+        pts.clear();
+        float en = 1.0f;
+        for (size_t i = 1; i < r.size(); ++i) {
+            if (r[i].d < d0) continue;
+            if (r[i - 1].d > vd) break;
+            if (pts.empty()) pts.push_back(at(r[i - 1], r[i], (std::max)(d0, r[i - 1].d)));
+            pts.push_back(r[i].d <= vd ? P.F({r[i].x, r[i].y, r[i].z}) : at(r[i - 1], r[i], vd));
+            en = r[i].en;
+        }
+        if (pts.size() < 2) continue;
+        const float a2 = (0.25f + 0.6f * (std::min)(1.0f, en)) * (0.35f + 0.65f * rl);
+        dl->AddPolyline(pts.data(), static_cast<int>(pts.size()), Hue(ch, a2 * 0.5f), 0, 1.4f * S());
+        dl->AddCircleFilled(pts.back(), (1.3f + 1.4f * (std::min)(1.0f, en)) * S(), Hue(ch, (std::min)(1.0f, a2 + 0.2f)));
+    }
+}
+
 void DrawRoom(ImDrawList* dl, const Proj& P, const ConfigValues& w) {
     const ui::Tokens& k = ui::Tok();
     const float W = w.stageRoom[0], D = w.stageRoom[1], H = w.stageRoom[2];
@@ -738,7 +895,11 @@ void StageCanvas(ConfigDocument& doc) {
         for (const auto& o : order) DrawFurn(dl, P, w, o.second);
     }
 
-    if (g.refl && !g.you && g.fsel < 0 && g.view != 1) DrawReflections(dl, P, w, g.sel);
+    if (!g.you && g.fsel < 0) {
+        if (g.rayField) DrawRayField(dl, P, w, g.sel);
+        if (g.allPaths) DrawAllPaths(dl, P, w, g.sel);
+        else if (g.refl && g.view != 1) DrawReflections(dl, P, w, g.sel);
+    }
 
     // Channels, far to near; the listener last.
     {
@@ -920,6 +1081,17 @@ void StageCard(ConfigDocument& doc) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Names");
     ImGui::SameLine(0, 22.0f * s);
+    ui::Toggle("##stpaths", &g.allPaths);
+    ImGui::SameLine(0, 8.0f * s);
+    ImGui::AlignTextToFramePadding();
+    if (g.allPaths) ImGui::Text("All paths (%d)", g.pathCount);
+    else ImGui::TextUnformatted("All paths");
+    ImGui::SameLine(0, 22.0f * s);
+    ui::Toggle("##strays", &g.rayField);
+    ImGui::SameLine(0, 8.0f * s);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Ray field");
+    ImGui::Dummy(ImVec2(0, 4.0f * s));
     ImGui::AlignTextToFramePadding();
     ui::PushText(0, 12.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
