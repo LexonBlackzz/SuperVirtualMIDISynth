@@ -277,6 +277,7 @@ struct StageAudition::Session {
         bool haveLast = false, lastDry = false;
         int lastSel = -1;
         std::shared_ptr<const st::IrSpectra> tail;
+        std::shared_ptr<const st::IrSpectra> earlyKeep[16];
         st::RoomMeta meta;
         uint64_t serial = 1;
         uint32_t lastMask = 0xFFFFFFFFu;
@@ -310,14 +311,14 @@ struct StageAudition::Session {
                     float since = t - 0.6f * c;
                     if (since < -5.0f) since += 10.0f;
                     if (since > 5.0f) since -= 10.0f;
-                    if (since >= -0.3f && since < 1.8f) win |= 1u << c;
+                    if (since >= -0.3f && since < 2.5f) win |= 1u << c;
                 }
                 m2 &= win;
             }
             const uint64_t period = static_cast<uint64_t>(Period() * kRate);
             const float phase = Orbit() ? static_cast<float>(frames.load() % period) / static_cast<float>(period) : 0.0f;
             const auto now = std::chrono::steady_clock::now();
-            const bool orbitDue = Orbit() && now - lastBuild > std::chrono::milliseconds(60) && phase != lastPhase;
+            const bool orbitDue = Orbit() && now - lastBuild > std::chrono::milliseconds(20) && phase != lastPhase;
             const bool moved = haveLast && (!SamePositions(cur, last) || isDry != lastDry || m2 != lastMask);
             if (roomChanged || moved || orbitDue) {
                 opt.rays = static_cast<int>(cur.rays);
@@ -350,8 +351,19 @@ struct StageAudition::Session {
                     for (int c = 0; c < 16; ++c) scene.sourceOn[c] = ((m2 >> c) & 1u) != 0;
                 }
                 st::BuildOptions pathOpt = opt;
-                if (Orbit()) pathOpt.order = 1;   // a moving source keeps only the gliding first-order taps
+                // A moving source keeps only the gliding first-order taps, and the static early response is
+                // built once: swapping it for a new one every few milliseconds clicks.
+                bool reuseEarly = false;
+                if (Orbit()) {
+                    pathOpt.order = 1;
+                    reuseEarly = haveLast && !roomChanged;
+                    pathOpt.buildEarly = !reuseEarly;
+                }
                 auto r = st::BuildPaths(scene, ear, pathOpt, renderer.Plan(), tail, meta, serial++, roomChanged || !haveLast);
+                for (int c = 0; c < 16; ++c) {
+                    if (reuseEarly) r->source[c].early = earlyKeep[c];
+                    else earlyKeep[c] = r->source[c].early;
+                }
                 if (isDry) {
                     for (auto& s : r->source) { s.tapCount = 0; s.early.reset(); }
                     r->tail.reset();

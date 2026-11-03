@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-04 `fix(v3): Walk around me no longer clicks; the tour lets notes ring out` The orbit modes swapped the static early response for a new one every rebuild, which clicked, so it is now built once per room (BuildOptions::buildEarly) and the moving taps are refreshed every 20 ms instead of 60. The channel tour keeps a channel in the stage for 2.5 s after its note starts.
+
 - 2026-11-04 `perf(v3): the channel tour only renders the channels that are sounding` The tour kept all 16 channels in the stage while it played one note at a time, which lagged quickly. Now only the channels whose note is about to start, sounding or ringing out are rendered; the tail is still traced for the whole band.
 
 - 2026-11-04 `fix(v3): the stage plan draws furniture in its rays and paths` All paths now includes the furniture bounces, and the ray field is traced through the same triangle scene as the tail (furniture blocks, absorbs and scatters the rays) instead of the empty box, so the drawing matches what the audio does.

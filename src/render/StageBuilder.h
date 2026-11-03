@@ -25,6 +25,7 @@ struct BuildOptions {
     bool earModel = true;
     int order = 3;                // wall reflection order for early paths (1..3)
     int liveTaps = kMaxLiveTaps;  // strongest wall paths that glide when a source moves
+    bool buildEarly = true;       // false leaves the static early response empty for the caller to fill
     float earlySeconds = 0.42f;
     float tailTrim = 1.0f;        // tail level against the critical-distance balance
     float roomSend = 0.07f;       // share of each source that feeds the tail (0.35 was the prototype's default and sounded too wet)
@@ -166,6 +167,7 @@ inline std::shared_ptr<RoomResponse> BuildPaths(const StageScene& scene, const S
                 rest.push_back(live[k]);
             }
         }
+        if (!opt.buildEarly) continue;
         const EarlyResponse er = BuildEarlyResponse(rest, scene.listener, scene.yawDegrees, opt.earModel,
                                                     opt.air, opt.sampleRate, opt.earlySeconds);
         const int skip = (std::min)(B, static_cast<int>(er.left.size()));
