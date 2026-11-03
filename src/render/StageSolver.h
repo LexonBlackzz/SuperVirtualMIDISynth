@@ -401,6 +401,7 @@ struct EarlyPath {
     uint8_t seq[3] = {};        // walls hit, in order from the source (wall paths only)
     bool furniture = false;
     int8_t wall = -1;           // last wall hit, -1 for furniture
+    Vec3 bounce;                // furniture paths: where the leg touches the face
 };
 
 inline Vec3 MirrorAcrossWall(const Room& r, const Vec3& p, int wall) noexcept {
@@ -490,6 +491,7 @@ inline void FurnitureReflections(const Room& r, const Vec3& source, const Vec3& 
             const Vec3 p{p3[0], p3[1], p3[2]}, image{m3[0], m3[1], m3[2]};
             EarlyPath e;
             e.image = image;
+            e.bounce = p;
             e.path = Distance(image, listener);
             e.furniture = true;
             SurfaceGain(info.material, e.gain);

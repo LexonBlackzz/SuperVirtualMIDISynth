@@ -5,7 +5,7 @@
 #include "configurator/StageAudition.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
-#include "render/StageSolver.h"
+#include "render/StageTracer.h"
 
 #include <algorithm>
 #include <array>
@@ -521,13 +521,6 @@ stg::Room MakeRoom(const ConfigValues& w) {
     return r;
 }
 
-float MeanAbsorption(stg::Material m) {
-    const float* a = stg::Absorption(m);
-    float s = 0.0f;
-    for (int b = 0; b < stg::kBands; ++b) s += a[b];
-    return s / stg::kBands;
-}
-
 void Dashed(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float lw, bool dashed) {
     const float dx = b.x - a.x, dy = b.y - a.y, len = std::sqrt(dx * dx + dy * dy);
     if (!dashed || len < 1.0f) { dl->AddLine(a, b, col, lw); return; }
@@ -547,17 +540,17 @@ void DrawAllPaths(ImDrawList* dl, const Proj& P, const ConfigValues& w, int ch) 
     const ImVec2 ps = P.F(ChPos(w, ch)), pl = P.F(ListenerPos(w));
     int count = 0;
     for (const auto& e : paths) {
-        if (e.furniture) continue;
         ++count;
         stg::Vec3 pts[3];
-        stg::BouncePoints(room, s, l, e.seq, e.order, pts);
+        if (e.furniture) pts[0] = e.bounce;
+        else stg::BouncePoints(room, s, l, e.seq, e.order, pts);
         ImVec2 q[5];
         q[0] = ps;
         bool off = false;
         for (int k = 0; k < e.order; ++k) {
             q[k + 1] = P.F({pts[k].x, pts[k].y, pts[k].z});
             const int wall = e.seq[k];
-            off = off || (P.view == 0 && wall < 2) || (P.view == 1 && wall >= 2 && wall < 4);
+            off = off || !e.furniture && (P.view == 0 && wall < 2) || (P.view == 1 && wall >= 2 && wall < 4);
         }
         q[e.order + 1] = pl;
         float gm = 0.0f;
@@ -572,7 +565,7 @@ void DrawAllPaths(ImDrawList* dl, const Proj& P, const ConfigValues& w, int ch) 
     dl->AddLine(ps, pl, Hue(ch, 0.9f), 1.8f * S());
 }
 
-// A few hundred rays from the selected channel through the empty box, followed
+// A few hundred rays from the selected channel through the room and its furniture, followed
 // as they bounce; the wavefront runs along them slowed down about twelve times.
 struct RayPt { float x, y, z, d, en; };
 std::vector<std::vector<RayPt>> g_rays;
@@ -588,41 +581,58 @@ void BuildRays(const ConfigValues& w, int ch) {
     for (float v : w.stageRoom) mix(v);
     for (int i = 0; i < 6; ++i) mix(static_cast<float>(w.stageSurface[i]));
     for (int i = 0; i < 3; ++i) mix(w.stageChannel[ch][i]);
+    for (const auto& f : w.stageFurniture) {
+        mix(static_cast<float>(f.kind));
+        mix(f.x);
+        mix(f.y);
+        mix(f.rotated ? 1.0f : 0.0f);
+    }
     if (key == g_rayKey) return;
     g_rayKey = key;
     g_rays.clear();
     const stg::Room room = MakeRoom(w);
-    float keep[6];
-    for (int i = 0; i < 6; ++i) keep[i] = 1.0f - MeanAbsorption(room.surface[i]);
-    const float dims[3] = {room.width, room.depth, room.height};
+    // The same triangles the tail is traced through: walls and every piece of furniture.
+    const auto tris = stg::detail::Prepare(stg::BuildBoxScene(room));
     uint32_t rng = 12345u;
     auto rnd = [&] {
         rng = rng * 1664525u + 1013904223u;
         return static_cast<float>(rng >> 8) / 16777216.0f;
     };
+    auto sphere = [&](double* d) {
+        const double z = 2.0 * rnd() - 1.0, a = 6.2831853 * rnd(), rr = std::sqrt((std::max)(0.0, 1.0 - z * z));
+        d[0] = rr * std::cos(a); d[1] = rr * std::sin(a); d[2] = z;
+    };
     for (int i = 0; i < 300; ++i) {
-        const float z = 2.0f * rnd() - 1.0f, a = 6.2831853f * rnd(), rr = std::sqrt((std::max)(0.0f, 1.0f - z * z));
-        float dir[3] = {rr * std::cos(a), rr * std::sin(a), z};
-        float p[3] = {w.stageChannel[ch][0], w.stageChannel[ch][1], w.stageChannel[ch][2]};
-        float dist = 0.0f, en = 1.0f;
+        double dir[3], p[3] = {w.stageChannel[ch][0], w.stageChannel[ch][1], w.stageChannel[ch][2]};
+        sphere(dir);
+        double dist = 0.0, en = 1.0;
+        int skip = -1;
         std::vector<RayPt> ray;
-        ray.push_back({p[0], p[1], p[2], 0.0f, 1.0f});
-        for (int b = 0; b < 30 && dist < 90.0f && en > 0.03f; ++b) {
-            float best = 1e9f;
-            int axis = 0;
-            for (int k = 0; k < 3; ++k) {
-                if (std::fabs(dir[k]) < 1e-6f) continue;
-                const float t = ((dir[k] > 0.0f ? dims[k] : 0.0f) - p[k]) / dir[k];
-                if (t >= 0.0f && t < best) { best = t; axis = k; }
+        ray.push_back({static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]), 0.0f, 1.0f});
+        for (int b = 0; b < 40 && dist < 90.0 && en > 0.03; ++b) {
+            double t;
+            const int hit = stg::detail::Hit(tris, p, dir, skip, &t);
+            if (hit < 0) break;
+            for (int k = 0; k < 3; ++k) p[k] += dir[k] * t;
+            dist += t;
+            const auto& tr = tris[static_cast<size_t>(hit)];
+            double kp = 0.0;
+            for (int k = 0; k < stg::kBands; ++k) kp += tr.keep[k];
+            en *= kp / stg::kBands;
+            ray.push_back({static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]),
+                           static_cast<float>(dist), static_cast<float>(en)});
+            // The face normal that looks back at the ray; a share of the bounces scatter instead of mirroring.
+            const double sg = (dir[0] * tr.n[0] + dir[1] * tr.n[1] + dir[2] * tr.n[2]) > 0.0 ? -1.0 : 1.0;
+            const double n[3] = {sg * tr.n[0], sg * tr.n[1], sg * tr.n[2]};
+            if (rnd() < tr.scatter) {
+                sphere(dir);
+                if (dir[0] * n[0] + dir[1] * n[1] + dir[2] * n[2] < 0.0)
+                    for (int k = 0; k < 3; ++k) dir[k] = -dir[k];
+            } else {
+                const double dn = dir[0] * n[0] + dir[1] * n[1] + dir[2] * n[2];
+                for (int k = 0; k < 3; ++k) dir[k] -= 2.0 * dn * n[k];
             }
-            if (best > 1e8f) break;
-            for (int k = 0; k < 3; ++k) p[k] += dir[k] * best;
-            dist += best;
-            // Walls are numbered z (0,1), x (2,3), y (4,5).
-            const int wall = (axis == 2 ? 0 : axis == 0 ? 2 : 4) + (dir[axis] > 0.0f ? 1 : 0);
-            en *= keep[wall];
-            dir[axis] = -dir[axis];
-            ray.push_back({p[0], p[1], p[2], dist, en});
+            skip = hit;
         }
         g_rays.push_back(std::move(ray));
     }
