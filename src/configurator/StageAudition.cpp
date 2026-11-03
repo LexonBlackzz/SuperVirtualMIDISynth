@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include "render/StageBuilder.h"
+#include "render/StageMesh.h"
 #include "render/StageTracerVulkan.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -153,6 +154,10 @@ struct Snap {
     std::array<std::array<float, 3>, 16> channel{};
     std::array<bool, 16> on{};
     std::array<std::array<float, 3>, 16> mix{};
+    std::string meshPath;
+    bool meshUpY = true;
+    float meshScale = 1.0f;
+    std::array<uint8_t, 24> meshMat{};
     uint32_t rays = 40000u;
     bool air = true, ear = true;
     int sel = 0;
@@ -169,6 +174,10 @@ Snap MakeSnap(const ConfigValues& w, int sel) {
     s.channel = w.stageChannel;
     s.on = w.stageChannelOn;
     s.mix = w.stageChannelMix;
+    s.meshPath = w.stageMeshPath;
+    s.meshUpY = w.stageMeshUpY;
+    s.meshScale = w.stageMeshScale;
+    s.meshMat = w.stageMeshMaterial;
     s.rays = w.stageRays;
     s.air = w.stageAir;
     s.ear = w.stageEar;
@@ -178,18 +187,27 @@ Snap MakeSnap(const ConfigValues& w, int sel) {
 
 bool SameRoom(const Snap& a, const Snap& b) {
     return a.room == b.room && a.surface == b.surface && a.furniture == b.furniture && a.rays == b.rays &&
-           a.air == b.air && a.ear == b.ear && a.trim == b.trim;
+           a.air == b.air && a.ear == b.ear && a.trim == b.trim && a.meshPath == b.meshPath &&
+           a.meshUpY == b.meshUpY && a.meshScale == b.meshScale && a.meshMat == b.meshMat;
 }
 
 bool SamePositions(const Snap& a, const Snap& b) {
     return a.listener == b.listener && a.yaw == b.yaw && a.channel == b.channel && a.mix == b.mix && a.on == b.on && a.sel == b.sel;
 }
 
-st::StageScene MakeScene(const Snap& w) {
+st::StageScene MakeScene(const Snap& w, st::MeshProvider& meshes) {
     st::StageScene s;
     s.room.width = w.room[0];
     s.room.depth = w.room[1];
     s.room.height = w.room[2];
+    meshes.Resolve(w.meshPath, w.meshUpY, w.meshScale, w.meshMat.data());
+    if (meshes.scene && meshes.mesh) {
+        s.mesh = meshes.scene;
+        s.meshVolume = (std::max)(1.0f, meshes.volume);
+        s.room.width = meshes.mesh->width;
+        s.room.depth = meshes.mesh->depth;
+        s.room.height = meshes.mesh->height;
+    }
     for (int i = 0; i < 6; ++i) s.room.surface[i] = static_cast<st::Material>(w.surface[i]);
     for (const auto& f : w.furniture) {
         st::Furniture item;
@@ -287,6 +305,7 @@ struct StageAudition::Session {
         int lastSel = -1;
         std::shared_ptr<const st::IrSpectra> tail;
         std::shared_ptr<const st::IrSpectra> earlyKeep[16];
+        st::MeshProvider meshes;
         st::RoomMeta meta;
         uint64_t serial = 1;
         uint32_t lastMask = 0xFFFFFFFFu;
@@ -340,7 +359,7 @@ struct StageAudition::Session {
                 opt.earModel = cur.ear;
                 opt.tailTrim = cur.trim;
                 ear.enabled = cur.ear;
-                st::StageScene scene = MakeScene(cur);
+                st::StageScene scene = MakeScene(cur, meshes);
                 for (int c = 0; c < 16; ++c) scene.sourceOn[c] = ((m2 >> c) & 1u) != 0;
                 if (Orbit()) {
                     const float a = 6.2831853f * phase;

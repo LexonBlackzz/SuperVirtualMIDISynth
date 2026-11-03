@@ -626,6 +626,8 @@ json MakeStageJson(const StageConfig& s) {
                             {"z", s.channel[i][2]}, {"on", s.channelOn[i]},
                             {"width", s.channelWidth[i]}, {"level_db", s.channelLevelDb[i]},
                             {"send", s.channelSend[i]}});
+    json meshMaterials = json::array();
+    for (uint8_t m : s.meshMaterial) meshMaterials.push_back(m);
     json furniture = json::array();
     for (uint32_t i = 0; i < s.furnitureCount; ++i)
         furniture.push_back({{"kind", s.furniture[i].kind}, {"x", s.furniture[i].x},
@@ -637,7 +639,9 @@ json MakeStageJson(const StageConfig& s) {
                       {"height", s.roomHeight}, {"surfaces", surfaces}}},
             {"listener", {{"x", s.listener[0]}, {"y", s.listener[1]},
                           {"z", s.listener[2]}, {"yaw", s.listenerYaw}}},
-            {"channels", channels}, {"furniture", furniture}};
+            {"channels", channels}, {"furniture", furniture},
+            {"mesh", {{"path", s.meshPath}, {"up_y", s.meshUpY}, {"scale", s.meshScale},
+                      {"materials", meshMaterials}}}};
 }
 
 void ApplyStageJson(const json& obj, StageConfig& s, std::string& warning) {
@@ -676,6 +680,18 @@ void ApplyStageJson(const json& obj, StageConfig& s, std::string& warning) {
             if (!ReadValue(c, "width", s.channelWidth[i], 0.0f, 100.0f)) AppendWarning(warning, "stage.channels.width");
             if (!ReadValue(c, "level_db", s.channelLevelDb[i], -24.0f, 12.0f)) AppendWarning(warning, "stage.channels.level_db");
             if (!ReadValue(c, "send", s.channelSend[i], 0.0f, 100.0f)) AppendWarning(warning, "stage.channels.send");
+        }
+    }
+    if (auto it = obj.find("mesh"); it != obj.end() && it->is_object()) {
+        if (auto p = it->find("path"); p != it->end() && p->is_string()) s.meshPath = p->get<std::string>();
+        if (!ReadBool(*it, "up_y", s.meshUpY)) AppendWarning(warning, "stage.mesh.up_y");
+        if (!ReadValue(*it, "scale", s.meshScale, 0.001f, 1000.0f)) AppendWarning(warning, "stage.mesh.scale");
+        if (auto mt = it->find("materials"); mt != it->end() && mt->is_array()) {
+            for (size_t i = 0; i < mt->size() && i < 24; ++i)
+                if ((*mt)[i].is_number_integer()) {
+                    const int m = (*mt)[i].get<int>();
+                    s.meshMaterial[i] = static_cast<uint8_t>(m >= 0 && m < 12 ? m : 255);
+                }
         }
     }
     if (auto it = obj.find("furniture"); it != obj.end() && it->is_array()) {

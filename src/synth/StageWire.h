@@ -14,6 +14,7 @@ namespace svms {
 
 inline constexpr uint32_t kStageWireChannelParts = 2u;
 inline constexpr uint32_t kStageWireFurnitureBase = 3u;
+inline constexpr uint32_t kStageWireMesh = 0x80u;   // the imported model: up axis, scale, materials, path
 inline constexpr uint32_t kStageWireCommit = 0x100u;
 
 inline uint32_t StageWirePartCount(const StageConfig& s) {
@@ -25,6 +26,12 @@ inline bool EncodeStagePart(const StageConfig& s, uint32_t part, char* out, size
     auto put = [&](const char* fmt, auto... a) {
         if (n >= 0 && static_cast<size_t>(n) < cap) n += std::snprintf(out + n, cap - static_cast<size_t>(n), fmt, a...);
     };
+    if (part == kStageWireMesh) {
+        put("%d;%.4f;", s.meshUpY ? 1 : 0, s.meshScale);
+        for (int i = 0; i < 24; ++i) put("%d,", s.meshMaterial[i]);
+        put(";%s", s.meshPath.c_str());
+        return n > 0 && static_cast<size_t>(n) < cap;
+    }
     if (part == 0u) {
         put("%d;%d;%d;%d;%u;%.4f;%.2f;%.2f;%.2f;", s.enabled ? 1 : 0, s.keepReverb ? 1 : 0,
             s.airAbsorption ? 1 : 0, s.earModel ? 1 : 0, s.rays, s.tailTrim, s.roomWidth, s.roomDepth,
@@ -47,6 +54,23 @@ inline bool EncodeStagePart(const StageConfig& s, uint32_t part, char* out, size
 
 inline bool DecodeStagePart(StageConfig& s, uint32_t part, const char* text) {
     if (!text) return false;
+    if (part == kStageWireMesh) {
+        int up = 1, used = 0;
+        float scale = 1.0f;
+        if (std::sscanf(text, "%d;%f;%n", &up, &scale, &used) != 2) return false;
+        const char* p = text + used;
+        for (int i = 0; i < 24; ++i) {
+            int m, u2 = 0;
+            if (std::sscanf(p, "%d,%n", &m, &u2) != 1) return false;
+            s.meshMaterial[i] = static_cast<uint8_t>(m < 0 ? 255 : m > 255 ? 255 : m);
+            p += u2;
+        }
+        if (*p != ';') return false;
+        s.meshUpY = up != 0;
+        s.meshScale = scale < 0.001f ? 0.001f : scale > 1000.0f ? 1000.0f : scale;
+        s.meshPath = p + 1;
+        return true;
+    }
     if (part == 0u) {
         int en, keep, air, ear, sf[6], count;
         unsigned rays;

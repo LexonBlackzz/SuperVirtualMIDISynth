@@ -123,6 +123,7 @@ private:
     // SVMS_LiveParams has no channel limiter fields).
     bool pendingChannelLimiter_ = false;
     float pendingChannelLimiterValues_[3] = {};
+    std::vector<uint32_t> stagePartIds_;       // the SetStage part number of each of stageParts_
     std::vector<std::string> stageParts_;      // last settings handed to the driver, or waiting to be
     bool pendingStage_ = false;
     bool stageUnsupported_ = false;

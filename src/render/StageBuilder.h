@@ -15,6 +15,10 @@ struct StageScene {
     float yawDegrees = 0.0f;
     Vec3 source[kMaxSources];
     bool sourceOn[kMaxSources] = {};
+    // An imported model replaces the box: the tail is traced through it. Early reflections of a
+    // model are not found (the image-source method needs flat walls); the direct sound is.
+    std::shared_ptr<const TraceScene> mesh;
+    float meshVolume = 0.0f;
     float sourceLevel[kMaxSources] = {};   // linear trim on top of the channel volume
     float sourceSend[kMaxSources] = {};    // share of the source that feeds the tail, 1 = neutral
     StageScene() {
@@ -95,23 +99,30 @@ inline std::shared_ptr<const IrSpectra> BuildTailSpectra(const FftPlan& plan, co
     std::vector<Vec3> sources;
     for (int i = 0; i < kMaxSources; ++i) if (scene.sourceOn[i]) sources.push_back(scene.source[i]);
     if (sources.empty()) return nullptr;
-    const TraceScene geometry = BuildBoxScene(scene.room);
-    const float volume = RoomVolume(scene.room);
+    TraceScene box;
+    if (!scene.mesh) box = BuildBoxScene(scene.room);
+    const TraceScene& geometry = scene.mesh ? *scene.mesh : box;
+    const float volume = scene.mesh ? scene.meshVolume : RoomVolume(scene.room);
     TraceOptions t;
     t.rays = opt.rays;
     t.radius = (std::max)(0.4f, (std::min)(3.0f, 0.12f * std::cbrt((std::max)(30.0f, volume))));
-    t.skipOrder = opt.order;
+    t.skipOrder = scene.mesh ? 0 : opt.order;
     t.seed = opt.seed;
     const EnergyHistogram hist = backend.Run(geometry, sources, scene.listener, t, opt.cancel);
     if (hist.cancelled) return nullptr;
     float absorption[kBands];
-    TotalAbsorption(scene.room, absorption);
+    if (scene.mesh) {
+        SceneAbsorption(*scene.mesh, absorption, nullptr);
+        for (int b = 0; b < kBands; ++b) absorption[b] += 4.0f * AirEnergyPerMetre()[b] * volume;
+    } else {
+        TotalAbsorption(scene.room, absorption);
+    }
     const TailResult tail = BuildTail(hist, opt.air, volume, absorption, SabineLowBand{});
     std::vector<float> ir[2];
     SynthesizeTail(tail, volume, opt.sampleRate, ir);
     float meanT60 = 0.0f;
     for (float v : tail.t60) meanT60 += 0.25f * v;
-    const float gain = opt.tailTrim * opt.roomSend / CriticalDistance(scene.room, meanT60);
+    const float gain = opt.tailTrim * opt.roomSend / CriticalDistanceForVolume(volume, meanT60);
     // The convolver delays its output by one partition; start the response that much later.
     const int skip = (std::min)(plan.n / 2, static_cast<int>(ir[0].size()));
     for (auto& c : ir) {
@@ -156,7 +167,8 @@ inline std::shared_ptr<RoomResponse> BuildPaths(const StageScene& scene, const S
         s.direct.delaySeconds = d.delaySeconds;
         spatial.Filters(RelativeTo(pos, scene.listener, scene.yawDegrees), d.gain, s.direct.ears);
 
-        std::vector<EarlyPath> all = FindReflections(scene.room, pos, scene.listener, opt.order);
+        std::vector<EarlyPath> all;
+        if (!scene.mesh) all = FindReflections(scene.room, pos, scene.listener, opt.order);
         std::vector<EarlyPath> live, rest;
         for (const EarlyPath& e : all)
             (!e.furniture && e.order <= 2 ? live : rest).push_back(e);

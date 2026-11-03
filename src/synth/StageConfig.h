@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace svms {
 
@@ -43,6 +44,14 @@ struct StageConfig {
                              35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f, 35.0f};
     bool channelOn[16] = {true, true, true, true, true, true, true, true,
                           true, true, true, true, true, true, true, true};
+
+    // An imported OBJ model replaces the box. Its size sets the room size the placement uses; the
+    // materials are per group, 255 meaning the guess from the group's name.
+    std::string meshPath;
+    bool meshUpY = true;         // Y is up in the file (the stage is Z-up)
+    float meshScale = 1.0f;
+    uint8_t meshMaterial[24] = {255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
 
     uint32_t furnitureCount = 0u;
     Furniture furniture[kMaxFurniture];

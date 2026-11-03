@@ -1194,6 +1194,10 @@ static StageConfig StageFromValues(const ConfigValues& w) {
         s.channelLevelDb[c] = w.stageChannelMix[c][1];
         s.channelSend[c] = w.stageChannelMix[c][2];
     }
+    s.meshPath = w.stageMeshPath;
+    s.meshUpY = w.stageMeshUpY;
+    s.meshScale = w.stageMeshScale;
+    for (int i = 0; i < 24; ++i) s.meshMaterial[i] = w.stageMeshMaterial[i];
     s.furnitureCount = 0;
     for (const auto& f : w.stageFurniture) {
         if (s.furnitureCount >= StageConfig::kMaxFurniture) break;
@@ -1211,13 +1215,27 @@ void ConfiguratorApp::SetLiveStage(const ConfigValues& values) {
             svms::build::CapabilityLiveConfiguration)) return;
     const StageConfig sc = StageFromValues(values);
     std::vector<std::string> parts;
+    std::vector<uint32_t> ids;
     const uint32_t n = StageWirePartCount(sc);
     for (uint32_t i = 0; i < n; ++i) {
         char text[348] = {};   // the command text area
         EncodeStagePart(sc, i, text, sizeof(text));
         parts.emplace_back(text);
+        ids.push_back(i);
+    }
+    {
+        // The model's part is sent last; a path too long for one command is left out (no model).
+        char text[348] = {};   // the command text area
+        StageConfig noMesh = sc;
+        if (!EncodeStagePart(sc, kStageWireMesh, text, sizeof(text))) {
+            noMesh.meshPath.clear();
+            EncodeStagePart(noMesh, kStageWireMesh, text, sizeof(text));
+        }
+        parts.emplace_back(text);
+        ids.push_back(kStageWireMesh);
     }
     if (parts == stageParts_) return;
+    stagePartIds_ = std::move(ids);
     stageParts_ = std::move(parts);
     pendingStage_ = true;
     NoteLiveChange();
@@ -1231,7 +1249,7 @@ void ConfiguratorApp::SendPendingStage() {
     char err[svms::EngineLink::kResultTextBytes] = {};
     SVMS_Result result = SVMS_RESULT_OK;
     for (size_t i = 0; i < stageParts_.size() && result == SVMS_RESULT_OK; ++i)
-        result = rlClient_.SendCommand(SVMS_COMMAND_SET_STAGE, static_cast<uint32_t>(i),
+        result = rlClient_.SendCommand(SVMS_COMMAND_SET_STAGE, stagePartIds_[i],
                                        kRlLiveCommandTimeoutMs, err, stageParts_[i].c_str());
     if (result == SVMS_RESULT_OK)
         result = rlClient_.SendCommand(SVMS_COMMAND_SET_STAGE, kStageWireCommit, kRlLiveCommandTimeoutMs, err);

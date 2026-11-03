@@ -5,7 +5,8 @@
 #include "configurator/StageAudition.h"
 #include "configurator/Widgets.h"
 #include "imgui.h"
-#include "render/StageTracer.h"
+#include "configurator/PlatformUtil.h"
+#include "render/StageMesh.h"
 
 #include <algorithm>
 #include <array>
@@ -13,9 +14,23 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <commdlg.h>
+#endif
 
 namespace svms::cfg {
 
@@ -511,6 +526,9 @@ void DrawReflections(ImDrawList* dl, const Proj& P, const ConfigValues& w, int c
 
 namespace stg = svms::stage;
 
+const stg::StageMesh* ViewMesh(const ConfigValues& w);
+uint8_t MeshMat(const ConfigValues& w, const stg::StageMesh& m, size_t group);
+
 stg::Room MakeRoom(const ConfigValues& w) {
     stg::Room r;
     r.width = w.stageRoom[0];
@@ -588,6 +606,13 @@ void BuildRays(const ConfigValues& w, int ch) {
     for (float v : w.stageRoom) mix(v);
     for (int i = 0; i < 6; ++i) mix(static_cast<float>(w.stageSurface[i]));
     for (int i = 0; i < 3; ++i) mix(w.stageChannel[ch][i]);
+    const stg::StageMesh* mesh = ViewMesh(w);
+    if (mesh) {
+        for (char c : w.stageMeshPath) mix(static_cast<float>(c));
+        mix(w.stageMeshScale);
+        mix(w.stageMeshUpY ? 1.0f : 0.0f);
+        for (size_t i = 0; i < mesh->groups.size(); ++i) mix(static_cast<float>(MeshMat(w, *mesh, i)));
+    }
     for (const auto& f : w.stageFurniture) {
         mix(static_cast<float>(f.kind));
         mix(f.x);
@@ -599,7 +624,10 @@ void BuildRays(const ConfigValues& w, int ch) {
     g_rays.clear();
     const stg::Room room = MakeRoom(w);
     // The same triangles the tail is traced through: walls and every piece of furniture.
-    const auto tris = stg::detail::Prepare(stg::BuildBoxScene(room));
+    uint8_t mats[stg::kMaxMeshGroups] = {};
+    if (mesh)
+        for (size_t i = 0; i < mesh->groups.size(); ++i) mats[i] = MeshMat(w, *mesh, i);
+    const auto tris = stg::detail::Prepare(mesh ? stg::MeshTraceScene(*mesh, mats) : stg::BuildBoxScene(room));
     uint32_t rng = 12345u;
     auto rnd = [&] {
         rng = rng * 1664525u + 1013904223u;
@@ -672,7 +700,159 @@ void DrawRayField(ImDrawList* dl, const Proj& P, const ConfigValues& w, int ch) 
     }
 }
 
+// --- Imported room model ----------------------------------------------------------------------
+
+// The model the page shows: read once per path / up axis / scale, so the frame loop never touches the file.
+struct MeshView {
+    std::string key;
+    bool ok = false;
+    stg::StageMesh mesh;
+};
+MeshView g_mesh;
+
+const stg::StageMesh* ViewMesh(const ConfigValues& w) {
+    if (w.stageMeshPath.empty()) {
+        g_mesh.key.clear();
+        g_mesh.ok = false;
+        return nullptr;
+    }
+    char tail[32];
+    std::snprintf(tail, sizeof(tail), "|%d|%.4f", w.stageMeshUpY ? 1 : 0, w.stageMeshScale);
+    const std::string key = w.stageMeshPath + tail;
+    if (key != g_mesh.key) {
+        g_mesh.key = key;
+        g_mesh.ok = false;
+        std::ifstream in(w.stageMeshPath, std::ios::binary);
+        if (in) {
+            std::ostringstream text;
+            text << in.rdbuf();
+            g_mesh.ok = stg::ParseObj(text.str(), w.stageMeshUpY, w.stageMeshScale, g_mesh.mesh);
+        }
+    }
+    return g_mesh.ok ? &g_mesh.mesh : nullptr;
+}
+
+bool BrowseObj(std::string& out) {
+#ifndef _WIN32
+    return util::PickFile(false, "Import a room model", "", "*.obj", out);
+#else
+    wchar_t fileBuf[1024] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = L"OBJ models (*.obj)\0*.obj\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileBuf;
+    ofn.nMaxFile = static_cast<DWORD>(_countof(fileBuf));
+    ofn.lpstrTitle = L"Import a room model";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return false;
+    out = util::WideToUtf8(fileBuf);
+    return true;
+#endif
+}
+
+uint8_t MeshMat(const ConfigValues& w, const stg::StageMesh& m, size_t group) {
+    const uint8_t v = w.stageMeshMaterial[group];
+    return v < 12 ? v : m.guess[group];
+}
+
+// The model's triangles on the plan, tinted by their material (at most 2500, evenly spread).
+void DrawMesh(ImDrawList* dl, const Proj& P, const ConfigValues& w, const stg::StageMesh& m) {
+    const size_t step = (std::max)(static_cast<size_t>(1), m.tris.size() / 2500u);
+    for (size_t i = 0; i < m.tris.size(); i += step) {
+        const stg::StageMesh::Tri& t = m.tris[i];
+        const stg::Vec3 &a = m.vertices[t.a], &b = m.vertices[t.b], &c = m.vertices[t.c];
+        const ImVec2 pts[3] = {P.F({a.x, a.y, a.z}), P.F({b.x, b.y, b.z}), P.F({c.x, c.y, c.z})};
+        const float ab = kMatAbs[MeshMat(w, m, t.group)];
+        dl->AddTriangleFilled(pts[0], pts[1], pts[2], WallCol(ab, 0.05f));
+        dl->AddTriangle(pts[0], pts[1], pts[2], WallCol(ab, 0.4f), 1.0f);
+    }
+}
+
+void MeshRow(ConfigDocument& doc, ConfigValues& w, const stg::StageMesh* mesh) {
+    const float s = S();
+    auto fitToModel = [&](const stg::StageMesh& m) {
+        w.stageRoom = {(std::max)(1.0f, m.width), (std::max)(1.0f, m.depth), (std::max)(1.0f, m.height)};
+        FitAll(w);
+        g.roomIdx = -1;
+    };
+    if (ui::Button("Import a room model...")) {
+        std::string path;
+        if (BrowseObj(path)) {
+            w.stageMeshPath = path;
+            w.stageMeshMaterial.fill(255);
+            if (const stg::StageMesh* m = ViewMesh(w)) fitToModel(*m);
+            doc.MarkDirty();
+        }
+    }
+    if (!w.stageMeshPath.empty()) {
+        ImGui::SameLine(0, 10.0f * s);
+        if (ui::Button("Use the box room")) {
+            w.stageMeshPath.clear();
+            doc.MarkDirty();
+        }
+    }
+    ImGui::Dummy(ImVec2(0, 4.0f * s));
+    ui::PushText(0, 12.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
+    if (mesh) {
+        ImGui::TextWrapped("%s: %zu triangles%s, %.1f x %.1f x %.1f m. The tail is traced through the model; its early reflections are not drawn or modelled.",
+                           std::filesystem::path(w.stageMeshPath).filename().string().c_str(), mesh->tris.size(),
+                           mesh->fileTriangles > mesh->tris.size() ? " (the first 12000 of the file are used)" : "",
+                           mesh->width, mesh->depth, mesh->height);
+    } else if (!w.stageMeshPath.empty()) {
+        ImGui::TextWrapped("Could not read a model from %s.", w.stageMeshPath.c_str());
+    } else {
+        ImGui::TextWrapped("Or bring your own room as an OBJ file. Surfaces are matched by group or material names (carpet, foam, wood, glass, concrete, curtain); everything else counts as plaster.");
+    }
+    ImGui::PopStyleColor();
+    ui::PopFont();
+    ImGui::Dummy(ImVec2(0, 6.0f * s));
+    if (mesh) {
+        bool up = w.stageMeshUpY;
+        ui::BeginRow("stMeshUp", "Y is up in the file", "Most modelling tools; turn off for files where Z is up.", ImVec2(46.0f * s, 28.0f * s));
+        if (ui::Toggle("stMeshUp", &up)) {
+            w.stageMeshUpY = up;
+            if (const stg::StageMesh* m = ViewMesh(w)) fitToModel(*m);
+            doc.MarkDirty();
+        }
+        ui::EndRow();
+    }
+}
+
+void MeshMaterials(ConfigDocument& doc, ConfigValues& w, const stg::StageMesh& m) {
+    const float s = S();
+    const ui::Tokens& k = ui::Tok();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const int cols = avail > 700.0f * s ? 3 : 2;
+    const float cw = (avail - 12.0f * s * (cols - 1)) / cols;
+    const ImVec2 so = ImGui::GetCursorScreenPos();
+    const int n = static_cast<int>(m.groups.size());
+    for (int i = 0; i < n; ++i) {
+        const int r = i / cols, c = i % cols;
+        ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 62.0f * s));
+        ui::PushText(0, 12.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+        ImGui::TextUnformatted(m.groups[static_cast<size_t>(i)].c_str());
+        ImGui::PopStyleColor();
+        ui::PopFont();
+        ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 62.0f * s + 20.0f * s));
+        int mat = MeshMat(w, m, static_cast<size_t>(i));
+        char id[24];
+        std::snprintf(id, sizeof(id), "##stmesh%d", i);
+        if (ui::Select(id, &mat, kMatName, 12, cw)) {
+            w.stageMeshMaterial[static_cast<size_t>(i)] = static_cast<uint8_t>(mat);
+            doc.MarkDirty();
+        }
+    }
+    ImGui::SetCursorScreenPos(so);
+    ImGui::Dummy(ImVec2(avail, ((n + cols - 1) / cols) * 62.0f * s));
+}
+
 void DrawRoom(ImDrawList* dl, const Proj& P, const ConfigValues& w) {
+    if (const stg::StageMesh* m = ViewMesh(w)) {
+        DrawMesh(dl, P, w, *m);
+        return;
+    }
     const ui::Tokens& k = ui::Tok();
     const float W = w.stageRoom[0], D = w.stageRoom[1], H = w.stageRoom[2];
     const float area[6] = {W * D, W * D, D * H, D * H, W * H, W * H};
@@ -913,8 +1093,11 @@ void StageCanvas(ConfigDocument& doc) {
     }
 
     if (!g.you && g.fsel < 0) {
+        // The wall bounces assume flat walls, so on an imported model only the direct line is drawn.
+        const bool model = ViewMesh(w) != nullptr;
         if (g.rayField) DrawRayField(dl, P, w, g.sel);
-        if (g.allPaths) DrawAllPaths(dl, P, w, g.sel);
+        if (model) dl->AddLine(P.F(ChPos(w, g.sel)), P.F(ListenerPos(w)), Hue(g.sel, 0.9f), 1.8f * S());
+        else if (g.allPaths) DrawAllPaths(dl, P, w, g.sel);
         else if (g.refl && g.view != 1) DrawReflections(dl, P, w, g.sel);
     }
 
@@ -1529,6 +1712,9 @@ void AdvancedCards(ConfigDocument& doc) {
         char sub[64];
         std::snprintf(sub, sizeof(sub), "Rings for about %.1f s", Rt60(w));
         ui::BeginCard("##stroomadv", "Room", sub);
+        const stg::StageMesh* mesh = ViewMesh(w);
+        MeshRow(doc, w, mesh);
+        if (!mesh) {
         static const ui::KnobSpec kw = {"Width", 3.0f, 100.0f, 24.0f, 0.5f, false, "%.1f m"};
         static const ui::KnobSpec kd = {"Depth", 3.0f, 120.0f, 36.0f, 0.5f, false, "%.1f m"};
         static const ui::KnobSpec kh = {"Height", 2.2f, 60.0f, 14.0f, 0.5f, false, "%.1f m"};
@@ -1575,6 +1761,9 @@ void AdvancedCards(ConfigDocument& doc) {
         }
         ImGui::SetCursorScreenPos(so);
         ImGui::Dummy(ImVec2(avail, ((6 + cols - 1) / cols) * 62.0f * s));
+        } else {
+            MeshMaterials(doc, w, *mesh);
+        }
         ui::EndCard();
     }
 

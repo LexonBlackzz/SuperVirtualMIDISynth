@@ -129,6 +129,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.sampleRate = 44100;
     for (auto& c : d.stageChannel) c = {12.0f, 10.0f, 1.5f};
     d.stageChannelOn.fill(true);
+    d.stageMeshMaterial.fill(255);
     for (auto& m : d.stageChannelMix) m = {0.0f, 0.0f, 35.0f};
     d.bufferFrames = 2048;
     d.monoDownmix = false;
@@ -406,6 +407,17 @@ void ConfigDocument::FromJson(const json& root) {
                 ReadNum((*ch)[i], "send", working_.stageChannelMix[i][2], 0.0f, 100.0f);
             }
         }
+        if (auto me = it->find("mesh"); me != it->end() && me->is_object()) {
+            if (auto p = me->find("path"); p != me->end() && p->is_string()) working_.stageMeshPath = p->get<std::string>();
+            ReadBool(*me, "up_y", working_.stageMeshUpY);
+            ReadNum(*me, "scale", working_.stageMeshScale, 0.001f, 1000.0f);
+            if (auto mt = me->find("materials"); mt != me->end() && mt->is_array())
+                for (size_t i = 0; i < mt->size() && i < 24; ++i)
+                    if ((*mt)[i].is_number_integer()) {
+                        const int m = (*mt)[i].get<int>();
+                        working_.stageMeshMaterial[i] = static_cast<uint8_t>(m >= 0 && m < 12 ? m : 255);
+                    }
+        }
         if (auto fu = it->find("furniture"); fu != it->end() && fu->is_array()) {
             working_.stageFurniture.clear();
             for (const auto& f : *fu) {
@@ -422,6 +434,8 @@ void ConfigDocument::FromJson(const json& root) {
             }
         }
     }
+    if (auto it = root.find("reverb"); it != root.end() && it->is_object()) {
+        ReadBool(*it, "enabled", working_.enableReverb);
         ReadNum(*it, "mix", working_.reverbMix, 0.0f, 1.0f);
         ReadNum(*it, "room_size", working_.reverbRoomSize, 0.0f, 1.0f);
         ReadNum(*it, "decay", working_.reverbDecay, 0.0f, 1.0f);
@@ -530,6 +544,7 @@ nlohmann::json ConfigDocument::ToJson() const {
 
     root["quality"]["correctness_mode"] = working_.correctnessMode;
     root["quality"]["decimation"] = working_.decimation;
+    root["quality"]["half_rate"] = working_.halfRate;
     root["quality"]["decimation_by_level"] = working_.decimationByLevel;
     root["quality"]["fast_chunk_math"] = working_.fastChunkMath;
     root["quality"]["decimation_cull_blocks"] = working_.decimationCullBlocks;
@@ -546,9 +561,6 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["channel_limiter"]["threshold"] = working_.channelLimiterThreshold;
     root["channel_limiter"]["release_ms"] = working_.channelLimiterReleaseMs;
 
-    root["reverb"]["enabled"] = working_.enableReverb;
-    root["reverb"]["mix"] = working_.reverbMix;
-    root["reverb"]["room_size"] = working_.reverbRoomSize;
     root["stage"]["enabled"] = working_.stageEnabled;
     root["stage"]["keep_reverb"] = working_.stageKeepReverb;
     root["stage"]["rays"] = working_.stageRays;
@@ -557,6 +569,11 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["stage"]["ear_model"] = working_.stageEar;
     for (int i = 0; i < 6; ++i) root["stage"]["room"]["surfaces"][i] = working_.stageSurface[i];
     root["stage"]["listener"]["yaw"] = working_.stageYaw;
+    root["stage"]["mesh"]["path"] = working_.stageMeshPath;
+    root["stage"]["mesh"]["up_y"] = working_.stageMeshUpY;
+    root["stage"]["mesh"]["scale"] = working_.stageMeshScale;
+    root["stage"]["mesh"]["materials"] = nlohmann::json::array();
+    for (uint8_t m : working_.stageMeshMaterial) root["stage"]["mesh"]["materials"].push_back(m);
     root["stage"]["furniture"] = nlohmann::json::array();
     for (const auto& f : working_.stageFurniture)
         root["stage"]["furniture"].push_back({{"kind", f.kind}, {"x", f.x}, {"y", f.y}, {"rotated", f.rotated}});

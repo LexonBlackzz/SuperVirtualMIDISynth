@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstring>
 
 // Driver-side owner of the 3D stage: builds the room response on a background
 // thread, then renders it from the audio callback. Off by default; when it is
@@ -9,6 +10,7 @@
 // changed and only the paths when something merely moved.
 
 #include "render/StageBuilder.h"
+#include "render/StageMesh.h"
 #include "render/StageTracerVulkan.h"
 #include "synth/StageConfig.h"
 
@@ -111,8 +113,11 @@ private:
     static bool SameRoom(const StageConfig& a, const StageConfig& b) {
         if (a.roomWidth != b.roomWidth || a.roomDepth != b.roomDepth || a.roomHeight != b.roomHeight ||
             a.rays != b.rays || a.airAbsorption != b.airAbsorption || a.earModel != b.earModel ||
-            a.tailTrim != b.tailTrim || a.furnitureCount != b.furnitureCount)
+            a.tailTrim != b.tailTrim || a.furnitureCount != b.furnitureCount || a.meshPath != b.meshPath ||
+            a.meshUpY != b.meshUpY || a.meshScale != b.meshScale)
             return false;
+        for (int i = 0; i < 24; ++i)
+            if (a.meshMaterial[i] != b.meshMaterial[i]) return false;
         for (int i = 0; i < 6; ++i)
             if (a.surface[i] != b.surface[i]) return false;
         for (uint32_t i = 0; i < a.furnitureCount; ++i)
@@ -134,11 +139,22 @@ private:
         return o;
     }
 
-    static stage::StageScene Scene(const StageConfig& cfg_) {
+    void ResolveMesh(const StageConfig& cfg) {
+        mesh_.Resolve(cfg.meshPath, cfg.meshUpY, cfg.meshScale, cfg.meshMaterial);
+    }
+
+    stage::StageScene Scene(const StageConfig& cfg_) const {
         stage::StageScene s;
         s.room.width = cfg_.roomWidth;
         s.room.depth = cfg_.roomDepth;
         s.room.height = cfg_.roomHeight;
+        if (mesh_.scene && mesh_.mesh) {
+            s.mesh = mesh_.scene;
+            s.meshVolume = (std::max)(1.0f, mesh_.volume);
+            s.room.width = mesh_.mesh->width;
+            s.room.depth = mesh_.mesh->depth;
+            s.room.height = mesh_.mesh->height;
+        }
         for (int w = 0; w < 6; ++w) s.room.surface[w] = static_cast<stage::Material>(cfg_.surface[w]);
         for (uint32_t i = 0; i < cfg_.furnitureCount; ++i) {
             stage::Furniture f;
@@ -185,6 +201,7 @@ private:
             stage::EarModelSpatializer ear;
             ear.enabled = cur.earModel;
             const stage::BuildOptions opt = Options(cur, &cancel_);
+            ResolveMesh(cur);
             const stage::StageScene scene = Scene(cur);
             if (!haveLast || !SameRoom(cur, last) || (!tail && MaskOf(cur) != 0u)) {
                 stage::RoomMeta m2;
@@ -205,6 +222,7 @@ private:
         }
     }
 
+    stage::MeshProvider mesh_;   // control thread only
     StageConfig cfg_;
     StageConfig pending_;
     std::mutex lock_;

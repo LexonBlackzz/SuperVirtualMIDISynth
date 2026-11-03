@@ -272,9 +272,12 @@ inline float SchroederHz(float t60, float volume) noexcept {
 }
 
 // Distance at which the direct sound and the room are equally loud.
-inline float CriticalDistance(const Room& r, float meanT60) noexcept {
+inline float CriticalDistanceForVolume(float volume, float meanT60) noexcept {
     const float t = (std::max)(0.15f, meanT60);
-    return (std::max)(0.4f, 0.057f * std::sqrt(RoomVolume(r) / t));
+    return (std::max)(0.4f, 0.057f * std::sqrt(volume / t));
+}
+inline float CriticalDistance(const Room& r, float meanT60) noexcept {
+    return CriticalDistanceForVolume(RoomVolume(r), meanT60);
 }
 
 // ── Sources ───────────────────────────────────────────────────────────────

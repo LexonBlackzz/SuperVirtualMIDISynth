@@ -1,4 +1,5 @@
 #include "driver/StageEngine.h"
+#include "render/StageMesh.h"
 #include "synth/StageWire.h"
 
 #include <chrono>
@@ -170,6 +171,55 @@ void TestChannelMix() {
     engine.Stop();
 }
 
+// A room imported from an OBJ file (Y up, two groups): size, material guesses, a tail with energy,
+// and the engine playing through it.
+const char* const kRoomObj =
+    "# a 10 x 8 x 4 m room, Y up\n"
+    "v 0 0 0\nv 10 0 0\nv 10 0 8\nv 0 0 8\nv 0 4 0\nv 10 4 0\nv 10 4 8\nv 0 4 8\n"
+    "g wood floor\nf 1 2 3 4\n"
+    "g plaster walls\nf 5 6 7 8\nf 1 2 6 5\nf 2 3 7 6\nf 3 4 8 7\nf 4 1 5 8\n";
+
+void TestMesh() {
+    StageMesh mesh;
+    CHECK(ParseObj(kRoomObj, true, 1.0f, mesh));
+    CHECK(std::fabs(mesh.width - 10.0f) < 1e-3f && std::fabs(mesh.depth - 8.0f) < 1e-3f &&
+          std::fabs(mesh.height - 4.0f) < 1e-3f);
+    CHECK(mesh.groups.size() == 3u && mesh.tris.size() == 12u);   // default, wood floor, plaster walls
+    CHECK(mesh.guess[1] == static_cast<uint8_t>(Material::Wood) && mesh.guess[2] == static_cast<uint8_t>(Material::Plaster));
+    CHECK(!ParseObj("v 0 0 0\n", true, 1.0f, mesh));   // no faces: not a model
+
+    const std::string path = "stage_test_room.obj";
+    {
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        if (f) {
+            std::fputs(kRoomObj, f);
+            std::fclose(f);
+        }
+    }
+    StageConfig cfg;
+    cfg.enabled = true;
+    cfg.rays = 8000u;
+    cfg.meshPath = path;
+    cfg.listener[0] = 5.0f; cfg.listener[1] = 2.0f; cfg.listener[2] = 1.2f;
+    for (int c = 0; c < 16; ++c) { cfg.channel[c][0] = 5.0f; cfg.channel[c][1] = 5.0f; cfg.channel[c][2] = 1.5f; }
+    StageEngine engine;
+    const uint32_t frames = 1024;
+    CHECK(engine.Start(cfg, 48000u, frames));
+    CHECK(WaitReady(engine, 60));
+    const double e = Pulse(engine, frames);
+    std::printf("model room: pulse energy %.4g\n", e);
+    CHECK(e > 0.0 && std::isfinite(e));
+    // An unreadable file falls back to the box and still plays.
+    cfg.meshPath = "does_not_exist.obj";
+    engine.Update(cfg);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(WaitReady(engine, 60));
+    CHECK(Pulse(engine, frames) > 0.0);
+    engine.Stop();
+    std::remove(path.c_str());
+}
+
 // Settings survive the trip through the command text parts.
 void TestWire() {
     StageConfig a;
@@ -200,6 +250,17 @@ void TestWire() {
     CHECK(std::fabs(b.channelWidth[4] - 60.0f) < 1e-2f && std::fabs(b.channelLevelDb[5] + 6.5f) < 1e-2f);
     CHECK(std::fabs(b.channelSend[6] - 80.0f) < 1e-2f && std::fabs(b.channelSend[0] - 35.0f) < 1e-2f);
     CHECK(b.furnitureCount == 11);
+    {
+        a.meshPath = "C:\\models\\hall.obj";
+        a.meshUpY = false;
+        a.meshScale = 0.5f;
+        a.meshMaterial[3] = 4;
+        char text[348] = {};
+        CHECK(EncodeStagePart(a, kStageWireMesh, text, sizeof(text)));
+        CHECK(DecodeStagePart(b, kStageWireMesh, text));
+        CHECK(b.meshPath == a.meshPath && !b.meshUpY && std::fabs(b.meshScale - 0.5f) < 1e-3f);
+        CHECK(b.meshMaterial[3] == 4 && b.meshMaterial[0] == 255);
+    }
     CHECK(b.furniture[10].kind == 0 && std::fabs(b.furniture[10].y - 25.0f) < 1e-2f && !b.furniture[10].rotated);
     CHECK(b.furniture[9].kind == 4 && b.furniture[9].rotated);
 }
@@ -242,6 +303,7 @@ int main() {
     TestWire();
     TestLiveUpdate();
     TestChannelMix();
+    TestMesh();
     if (g_failures) {
         std::printf("%d check(s) failed\n", g_failures);
         return 1;

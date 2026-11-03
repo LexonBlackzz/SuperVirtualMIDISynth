@@ -76,6 +76,12 @@ struct ConfigValues {
     // Per channel: width (percent, drawn only), level trim (dB) and room send (percent, 35 neutral).
     std::array<std::array<float, 3>, 16> stageChannelMix{};
     std::vector<StageFurnitureValue> stageFurniture;
+    // An imported OBJ model replaces the box (empty path = no model). Materials are per group of
+    // the file, 255 meaning the guess from the group's name.
+    std::string stageMeshPath;
+    bool stageMeshUpY = true;
+    float stageMeshScale = 1.0f;
+    std::array<uint8_t, 24> stageMeshMaterial{};
 
     bool enableReverb = false;
     float reverbMix = 0.25f;
@@ -153,6 +159,7 @@ struct ConfigValues {
     int overflowMode = 0;
     bool correctnessMode = true;
     bool decimation = false;
+    bool halfRate = false;
     bool decimationByLevel = true;
     bool fastChunkMath = false;
     uint32_t decimationCullBlocks = 5;
