@@ -59,7 +59,8 @@ void Note(std::vector<float>& out, int ch, float startSec, float lenSec, int mid
             const float noise = static_cast<float>(rng >> 8) / 8388608.0f - 1.0f;
             v = 0.5f * noise * std::exp(-t * 40.0f) + 0.6f * std::sin(6.2832f * (55.0f + 80.0f * std::exp(-t * 30.0f)) * t) * std::exp(-t * 14.0f);
         } else {
-            const float a = (std::min)(1.0f, t / 0.005f) * std::exp(-t * 5.0f);
+            // The decay alone leaves the note at 30% when it ends, which clicked; a short release finishes it.
+            const float a = (std::min)(1.0f, t / 0.005f) * (std::min)(1.0f, (lenSec - t) / 0.03f) * std::exp(-t * 5.0f);
             const float p = 6.2832f * f * t;
             v = 0.2f * a * (std::sin(p) + 0.5f * std::sin(2.0f * p) + 0.25f * std::sin(3.0f * p));
         }
