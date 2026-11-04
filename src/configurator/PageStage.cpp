@@ -141,8 +141,8 @@ const RoomDef kRooms[5] = {
     {"Cathedral", 30, 62, 28, {6, 1, 1, 1, 1, 1}},
     {"Open air", 80, 80, 40, {11, 11, 11, 11, 11, 11}},
 };
-const char* const kSeatNames[4] = {"Orchestra", "Surround", "Close", "Wall"};
-enum Seat { Orch, Wide, Close, Wall };
+const char* const kSeatNames[5] = {"Orchestra", "Surround", "Close", "Wall", "5.1"};
+enum Seat { Orch, Wide, Close, Wall, Five };
 
 struct SceneDef {
     const char* name;
@@ -170,6 +170,10 @@ struct State {
     bool allPaths = false, rayField = false;
     int pathCount = 0;
     int roomIdx = 2, seat = Wide, level = 1;
+    // The 5.1 seat follows the instruments: what it last seated, so a program change re-seats only a band nobody moved.
+    bool seatAuto = false;
+    std::array<uint8_t, 16> seatProg{};
+    std::array<std::array<float, 3>, 16> seatPos{};
     float amount = 100.0f;
     // Quick-knob state; the base is the band as it stood before the first nudge.
     float spread = 1.0f, closeness = 1.0f, lift = 0.0f, size = 1.0f;
@@ -239,8 +243,56 @@ void ResetQuick() {
     g.baseValid = false;
 }
 
+// Where an instrument goes in a 5.1 set: bass to the subwoofer, the voices, leads, winds and the drum
+// channel to the centre, strings, organs, pads and effects to the surrounds, the rest to the front pair.
+enum Role { RoleFront, RoleCentre, RoleSurround, RoleSub };
+
+Role RoleOf(int ch) {
+    // Until a song has set a program, each channel has the instrument its default name says.
+    static const uint8_t kDefaultProg[16] = {0, 48, 40, 42, 73, 68, 60, 46, 52, 0, 32, 61, 88, 24, 12, 96};
+    if (ch == 9) return RoleCentre;
+    const int p = g_prog[ch] < 128 ? g_prog[ch] : kDefaultProg[ch];
+    if ((p >= 32 && p <= 39) || p == 43 || p == 47 || p == 58) return RoleSub;
+    if ((p >= 52 && p <= 54) || (p >= 64 && p <= 87)) return RoleCentre;
+    if ((p >= 16 && p <= 23) || (p >= 40 && p <= 45) || (p >= 48 && p <= 51) || (p >= 88 && p <= 103) || p >= 120)
+        return RoleSurround;
+    return RoleFront;
+}
+
+// Several channels may share a speaker; a small fan keeps their dots apart.
+void SeatFive(ConfigValues& w) {
+    const float R = Clamp(0.4f * (std::min)(w.stageRoom[0], w.stageRoom[1]), 1.5f, 4.0f);
+    int n[4] = {};
+    for (int i = 0; i < 16; ++i) {
+        const Role role = RoleOf(i);
+        const int k = n[role]++;
+        float az = 0.0f, el = 0.0f, di = R;
+        switch (role) {
+        case RoleFront: az = (k % 2) ? 30.0f : -30.0f; break;
+        case RoleSurround: az = (k % 2) ? 110.0f : -110.0f; di = R * 0.8f; break;
+        case RoleSub: el = -20.0f; di = R * 0.85f; break;
+        default: break;
+        }
+        const int m = role == RoleFront || role == RoleSurround ? k / 2 : k;
+        az += ((m % 3) - 1) * 5.0f;
+        el += (m / 3) * 8.0f;
+        di += (m % 2) * 0.4f;
+        SetPolar(w, w.stageChannel[static_cast<size_t>(i)], az, el, di);
+    }
+}
+
 void SeatBand(ConfigValues& w, int kind) {
     g.seat = kind;
+    if (kind == Five) {
+        SeatFive(w);
+        FitAll(w);
+        g.seatAuto = true;
+        g.seatProg = g_prog;
+        g.seatPos = w.stageChannel;
+        ResetQuick();
+        return;
+    }
+    g.seatAuto = false;
     for (int i = 0; i < 16; ++i) {
         const int row = i < 8 ? 0 : 1, k = i % 8;
         float az, el, di;
@@ -1526,9 +1578,9 @@ void RoomAndFurniture(ConfigDocument& doc) {
     }
     ImGui::Dummy(ImVec2(0, 8.0f * s));
     {
-        ui::BeginRow("stageSeat", "Where the band sits", "Seats all 16 channels around you in one of four layouts.", ui::SegmentedSize(kSeatNames, 4));
+        ui::BeginRow("stageSeat", "Where the band sits", "Seats all 16 channels around you in one of five layouts. 5.1 puts each channel where its instrument goes in a surround set.", ui::SegmentedSize(kSeatNames, 5));
         int seat = g.seat;
-        if (ui::Segmented("##stseat", &seat, kSeatNames, 4)) {
+        if (ui::Segmented("##stseat", &seat, kSeatNames, 5)) {
             SeatBand(w, seat);
             doc.MarkDirty();
         }
@@ -1831,8 +1883,17 @@ void DrawStagePage(ConfigDocument& doc) {
             ApplyRoom(w, 2, true);
         }
     }
-    PushLiveStage(w);
     PollPrograms();
+    // A song changed an instrument: a band still sitting where 5.1 put it follows the change.
+    if (g.seat == Five && g.seatAuto && g_prog != g.seatProg) {
+        if (w.stageChannel == g.seatPos) {
+            SeatBand(w, Five);
+            doc.MarkDirty();
+        } else {
+            g.seatAuto = false;
+        }
+    }
+    PushLiveStage(w);
     g.sel = (std::max)(0, (std::min)(15, g.sel));
     if (g.fsel >= static_cast<int>(w.stageFurniture.size())) g.fsel = -1;
     HeaderBar(doc);
