@@ -165,7 +165,7 @@ inline std::shared_ptr<RoomResponse> BuildPaths(const StageScene& scene, const S
         const Vec3& pos = scene.source[i];
         const DirectPath d = SolveDirect(scene.room, pos, scene.listener, scene.yawDegrees, opt.air, false);
         s.direct.delaySeconds = d.delaySeconds;
-        spatial.Filters(RelativeTo(pos, scene.listener, scene.yawDegrees), d.gain, s.direct.ears);
+        spatial.DirectFilters(RelativeTo(pos, scene.listener, scene.yawDegrees), d.gain, s.direct.ears, s.fir);
 
         std::vector<EarlyPath> all;
         if (!scene.mesh) all = FindReflections(scene.room, pos, scene.listener, opt.order);

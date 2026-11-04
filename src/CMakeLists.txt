@@ -103,6 +103,20 @@ set_source_files_properties(configurator/StageAudition.cpp PROPERTIES
     OBJECT_DEPENDS "${SVMS_STAGE_LOOP_GEN}/StageLoop.inc"
     INCLUDE_DIRECTORIES "${SVMS_STAGE_LOOP_GEN}")
 
+# The generic head of the 3D stage (render/data/README.md) embedded as a byte array.
+set(SVMS_STAGE_HEAD_GEN "${CMAKE_CURRENT_BINARY_DIR}/stage_head")
+add_custom_command(
+    OUTPUT "${SVMS_STAGE_HEAD_GEN}/StageHead.inc"
+    COMMAND "${CMAKE_COMMAND}" "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/render/data/hrtf_generic.svhr"
+            "-DOUT=${SVMS_STAGE_HEAD_GEN}/StageHead.inc" -DNAME=kStageHeadBytes
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/configurator/assets/EmbedBinary.cmake"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/render/data/hrtf_generic.svhr"
+            "${CMAKE_CURRENT_SOURCE_DIR}/configurator/assets/EmbedBinary.cmake"
+    VERBATIM)
+set_source_files_properties(render/StageHrtfData.cpp PROPERTIES
+    OBJECT_DEPENDS "${SVMS_STAGE_HEAD_GEN}/StageHead.inc"
+    INCLUDE_DIRECTORIES "${SVMS_STAGE_HEAD_GEN}")
+
 # GPU backend of the 3D stage tracer (Vulkan ray queries): one compute shader
 # compiled to SPIR-V and embedded.  Without the SDK the file compiles to a stub
 # whose factory reports it, and the CPU tracer is used.
@@ -419,7 +433,7 @@ if(NOT WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_stage_tracer COMMAND svms_v3_stage_tracer_tests)
 
-        add_executable(svms_v3_stage_renderer_tests tests/StageRendererTests.cpp)
+        add_executable(svms_v3_stage_renderer_tests tests/StageRendererTests.cpp render/StageHrtfData.cpp)
         target_include_directories(svms_v3_stage_renderer_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_stage_renderer COMMAND svms_v3_stage_renderer_tests)
@@ -501,6 +515,7 @@ if(NOT WIN32)
         configurator/PageStage.cpp
         configurator/StageAudition.cpp
         render/StageTracerVulkan.cpp
+        render/StageHrtfData.cpp
                 configurator/PageDiagnostics.cpp
                 configurator/PageSettings.cpp
                 configurator/Tour.cpp
@@ -600,7 +615,7 @@ set(SOURCES
 if(NOT SVMS_XP_COMPAT)
     list(APPEND SOURCES render/RenderKernelsAVX2.cpp synth/LiveRecorder.cpp
          render/GpuSynth.cpp render/GpuDevice.cpp
-         render/GpuStage.cpp render/GpuBackendGL.cpp render/StageTracerVulkan.cpp)
+         render/GpuStage.cpp render/GpuBackendGL.cpp render/StageTracerVulkan.cpp render/StageHrtfData.cpp)
 endif()
 
 # Steinberg ASIO SDK host-side glue (GPLv3 — see asio-main/). Compiled into
@@ -1228,6 +1243,7 @@ if(NOT SVMS_XP_COMPAT)
         configurator/PageStage.cpp
         configurator/StageAudition.cpp
         render/StageTracerVulkan.cpp
+        render/StageHrtfData.cpp
         configurator/PageDiagnostics.cpp
         configurator/PageSettings.cpp
         configurator/Tour.cpp
@@ -1529,7 +1545,7 @@ if(SVMS_BUILD_TESTS)
     add_test(NAME svms_v3_stage_tracer COMMAND svms_v3_stage_tracer_tests)
 
     add_executable(svms_v3_stage_renderer_tests
-        tests/StageRendererTests.cpp)
+        tests/StageRendererTests.cpp render/StageHrtfData.cpp)
     target_compile_definitions(svms_v3_stage_renderer_tests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_stage_renderer_tests PRIVATE
@@ -1537,7 +1553,7 @@ if(SVMS_BUILD_TESTS)
     add_test(NAME svms_v3_stage_renderer COMMAND svms_v3_stage_renderer_tests)
 
     add_executable(svms_v3_stage_engine_tests
-        tests/StageEngineTests.cpp render/StageTracerVulkan.cpp)
+        tests/StageEngineTests.cpp render/StageTracerVulkan.cpp render/StageHrtfData.cpp)
     target_compile_definitions(svms_v3_stage_engine_tests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     target_include_directories(svms_v3_stage_engine_tests PRIVATE

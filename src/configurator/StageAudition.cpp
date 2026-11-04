@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include "render/StageBuilder.h"
+#include "render/StageHrtf.h"
 #include "render/StageMesh.h"
 #include "render/StageTracerVulkan.h"
 
@@ -291,6 +292,7 @@ struct StageAudition::Session {
         st::CpuTracer cpu;
         st::TraceBackend& tracer = gpu ? *gpu : static_cast<st::TraceBackend&>(cpu);
         st::EarModelSpatializer ear;
+        const std::unique_ptr<st::HrtfSpatializer> head = st::MakeHrtfSpatializer(static_cast<float>(kRate));
         st::BuildOptions opt;
         opt.sampleRate = static_cast<float>(kRate);
         opt.partition = kBlock;
@@ -300,6 +302,7 @@ struct StageAudition::Session {
         renderer.Prepare(static_cast<float>(kRate), kBlock, kBlock, earlyParts, tailParts);
 
         const bool soloMode = mode == Mode::Channel || mode == Mode::Music || mode == Mode::Around || mode == Mode::Walk;
+        const st::Spatializer* spatial = &ear;
         Snap last = first;
         bool haveLast = false, lastDry = false;
         int lastSel = -1;
@@ -359,6 +362,7 @@ struct StageAudition::Session {
                 opt.earModel = cur.ear;
                 opt.tailTrim = cur.trim;
                 ear.enabled = cur.ear;
+                spatial = (cur.ear && head) ? static_cast<const st::Spatializer*>(head.get()) : &ear;
                 st::StageScene scene = MakeScene(cur, meshes);
                 for (int c = 0; c < 16; ++c) scene.sourceOn[c] = ((m2 >> c) & 1u) != 0;
                 if (Orbit()) {
@@ -395,7 +399,7 @@ struct StageAudition::Session {
                         if (((m2 >> c) & 1u) != 0 && !earlyKeep[c]) reuseEarly = false;
                     pathOpt.buildEarly = !reuseEarly;
                 }
-                auto r = st::BuildPaths(scene, ear, pathOpt, renderer.Plan(), tail, meta, serial++, roomChanged || !haveLast);
+                auto r = st::BuildPaths(scene, *spatial, pathOpt, renderer.Plan(), tail, meta, serial++, roomChanged || !haveLast);
                 for (int c = 0; c < 16; ++c) {
                     if (reuseEarly) r->source[c].early = earlyKeep[c];
                     else earlyKeep[c] = r->source[c].early;

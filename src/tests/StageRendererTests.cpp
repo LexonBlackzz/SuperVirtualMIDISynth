@@ -1,4 +1,5 @@
 #include "render/StageBuilder.h"
+#include "render/StageHrtf.h"
 
 #include <cmath>
 #include <cstdio>
@@ -232,6 +233,97 @@ void TestMirroredEars() {
 
 } // namespace
 
+// The measured head: the table loads, a source on the left reaches the left ear first and louder,
+// the mirror image does the opposite, and the output stays independent of the block size.
+double Energy(const std::vector<float>& v) {
+    double e = 0.0;
+    for (float x : v) e += static_cast<double>(x) * x;
+    return e;
+}
+
+size_t Onset(const std::vector<float>& v) {
+    float peak = 0.0f;
+    for (float x : v) peak = (std::max)(peak, std::fabs(x));
+    for (size_t i = 0; i < v.size(); ++i) if (std::fabs(v[i]) > 0.2f * peak) return i;
+    return 0;
+}
+
+void TestHeadTable() {
+    size_t size = 0;
+    const unsigned char* bytes = EmbeddedHeadTable(size);
+    HeadTable table;
+    CHECK(table.Parse(bytes, size));
+    CHECK(table.directions == 440 && table.taps == 256 && std::fabs(table.sampleRate - 44100.0f) < 1.0f);
+    CHECK(!table.Parse(bytes, size - 1));   // a truncated file is refused
+    HrtfSpatializer head;
+    CHECK(head.Build(table, kSr));
+    CHECK(head.FilterLength() >= 32 && head.FilterLength() <= kMaxFir);
+    const BuildOptions opt = Quick();
+    CpuTracer tracer;
+    const Vec3 listener{12.0f, 10.0f, 1.2f};
+    auto render = [&](const Vec3& src, int block) {
+        StageRenderer r;
+        r.Prepare(kSr, opt.partition, 4096, 80, 80);
+        r.Submit(BuildRoomResponse(OneSource(OpenField(), src, listener), head, tracer, opt, r.Plan(), 1));
+        std::vector<float> in(4096, 0.0f), l, rr;
+        in[100] = 1.0f;
+        Run(r, 0, in, block, l, rr);
+        return std::make_pair(l, rr);
+    };
+    const auto left = render(Vec3{6.0f, 10.0f, 1.2f}, 2048);    // 6 m to the listener's left
+    const auto right = render(Vec3{18.0f, 10.0f, 1.2f}, 2048);
+    const auto front = render(Vec3{12.0f, 16.0f, 1.2f}, 2048);
+    const int itd = static_cast<int>(Onset(left.second)) - static_cast<int>(Onset(left.first));
+    std::printf("head: filter %d taps, left source ITD %d samples, energy L/R %.2f\n", head.FilterLength(), itd,
+                Energy(left.first) / Energy(left.second));
+    CHECK(itd >= 20 && itd <= 40);                                         // about 0.45 to 0.8 ms at 48 kHz
+    CHECK(Energy(left.first) > 1.5 * Energy(left.second));                 // near ear louder
+    CHECK(Onset(right.first) > Onset(right.second));                       // and the mirror image
+    CHECK(Energy(right.second) > 1.5 * Energy(right.first));
+    const double ratio = Energy(front.first) / Energy(front.second);
+    CHECK(ratio > 0.6 && ratio < 1.7);                                     // straight ahead is near symmetric
+    // Block size changes nothing.
+    const auto a = render(Vec3{7.0f, 14.0f, 2.0f}, 4096);
+    const auto b = render(Vec3{7.0f, 14.0f, 2.0f}, 137);
+    CHECK(std::memcmp(a.first.data(), b.first.data(), a.first.size() * sizeof(float)) == 0);
+    CHECK(std::memcmp(a.second.data(), b.second.data(), a.second.size() * sizeof(float)) == 0);
+}
+
+// A source that moves from the left to the right while a tone plays: the filter and the delay glide
+// across the block, so no sample steps more than the tone itself does.
+void TestHeadMotion() {
+    HeadTable table;
+    size_t size = 0;
+    const unsigned char* bytes = EmbeddedHeadTable(size);
+    CHECK(table.Parse(bytes, size));
+    HrtfSpatializer head;
+    CHECK(head.Build(table, kSr));
+    BuildOptions opt = Quick();
+    opt.buildEarly = false;
+    CpuTracer tracer;
+    const Vec3 listener{12.0f, 10.0f, 1.2f};
+    StageRenderer r;
+    r.Prepare(kSr, opt.partition, 256, 80, 80);
+    const auto first = BuildRoomResponse(OneSource(OpenField(), Vec3{6.0f, 10.0f, 1.2f}, listener), head, tracer, opt, r.Plan(), 1);
+    r.Submit(first);
+    std::vector<float> tone(256 * 24);
+    for (size_t i = 0; i < tone.size(); ++i) tone[i] = 0.3f * std::sin(6.283185307179586f * 300.0f * static_cast<float>(i) / kSr);
+    std::vector<float> l(tone.size(), 0.0f), rr(tone.size(), 0.0f);
+    for (size_t pos = 0, blk = 0; pos < tone.size(); pos += 256, ++blk) {
+        if (blk == 12)
+            r.Submit(BuildPaths(OneSource(OpenField(), Vec3{18.0f, 10.0f, 1.2f}, listener), head, opt, r.Plan(), first->tail,
+                                first->meta, 2, false));
+        const float* in[kMaxSources] = {};
+        in[0] = tone.data() + pos;
+        r.Process(in, kMaxSources, 256, l.data() + pos, rr.data() + pos);
+    }
+    float steady = 0.0f, across = 0.0f;
+    for (size_t i = 256 * 6 + 1; i < 256 * 10; ++i) steady = (std::max)(steady, std::fabs(l[i] - l[i - 1]));
+    for (size_t i = 256 * 11; i < 256 * 14; ++i) across = (std::max)(across, std::fabs(l[i] - l[i - 1]));
+    std::printf("head motion: steady step %.5f, across the move %.5f\n", steady, across);
+    CHECK(steady > 0.0f && across < 3.0f * steady);
+}
+
 int main() {
     TestDirectDelay();
     TestBlockInvariance();
@@ -239,6 +331,8 @@ int main() {
     TestTail();
     TestDeterministicBuild();
     TestMirroredEars();
+    TestHeadTable();
+    TestHeadMotion();
     if (g_failures) {
         std::printf("%d check(s) failed\n", g_failures);
         return 1;

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -33,12 +34,17 @@ constexpr uint32_t kResponseVersion = 1;
 
 // ── Spatializer seam ──────────────────────────────────────────────────────
 // What reaches each ear from a direction: an arrival time offset and a gain
-// per band. A HRTF implementation adds FIRs through `fir` (null = unused).
+// per band. A measured head adds a filter per ear for the direct sound (DirectFir).
 struct EarFilters {
     float delay[2] = {0.0f, 0.0f};          // seconds, relative to the path's own delay
     float band[2][kBands] = {};
-    const float* fir[2] = {nullptr, nullptr};
-    int firLength = 0;
+};
+
+// One FIR per ear (0 = left), applied to the delayed direct sound before the band gains.
+constexpr int kMaxFir = 640;
+struct DirectFir {
+    int length = 0;                         // 0 = none
+    float h[2][kMaxFir] = {};
 };
 
 struct Spatializer {
@@ -46,6 +52,12 @@ struct Spatializer {
     // `bandGain` is the path's own gain per band (distance, air, surfaces, blocking).
     virtual void Filters(const Relative& rel, const float bandGain[kBands],
                          EarFilters& out) const noexcept = 0;
+    // The direct sound. The default is the same as Filters, without a FIR.
+    virtual void DirectFilters(const Relative& rel, const float bandGain[kBands], EarFilters& out,
+                               DirectFir& fir) const noexcept {
+        Filters(rel, bandGain, out);
+        fir.length = 0;
+    }
 };
 
 // Level panning, interaural time difference (Woodworth), head shadow on the
@@ -250,6 +262,7 @@ struct LiveTap {
 struct SourceResponse {
     bool active = false;
     LiveTap direct;
+    DirectFir fir;        // measured-head filters for the direct sound, length 0 when unused
     int tapCount = 0;
     LiveTap taps[kMaxLiveTaps];
     std::shared_ptr<const IrSpectra> early;   // static early response, may be null
@@ -302,6 +315,12 @@ public:
         zeros_.assign(static_cast<size_t>(maxFrames), 0.0f);
         scratchL_ = zeros_;
         scratchR_ = zeros_;
+        xe_ = zeros_;
+        y_ = zeros_;
+        yPrev_ = zeros_;
+        work_.assign(static_cast<size_t>(maxFrames) + static_cast<size_t>(kMaxFir), 0.0f);
+        for (SourceState& s : src_)
+            for (FirState& f : s.fir) f = FirState{};
         maxFrames_ = maxFrames;
     }
     int Partition() const noexcept { return partition_; }
@@ -344,6 +363,10 @@ public:
             if (!live) {
                 // Keep the feed ringing out silently so a re-enabled source starts clean.
                 s.fresh = true;
+                for (FirState& f : s.fir) {   // a re-enabled source must not replay old samples
+                    f.havePrev = false;
+                    std::fill(f.hist.begin(), f.hist.end(), 0.0f);
+                }
                 std::fill(scratchL_.begin(), scratchL_.begin() + frames, 0.0f);
                 std::fill(scratchR_.begin(), scratchR_.begin() + frames, 0.0f);
                 s.early.Process(plan_, nullptr, zeros_.data(), frames, scratchL_.data(), scratchR_.data());
@@ -358,7 +381,7 @@ public:
                 tailIn_[static_cast<size_t>(i)] += in[ch][i] * tailGain;
             }
             const float* x = s.mono.data();
-            RenderTap(s, 0, sr.direct, rsp.cut, frames, outL, outR);
+            RenderTap(s, 0, sr.direct, rsp.cut, frames, outL, outR, sr.fir.length > 0 ? &sr.fir : nullptr);
             for (int t = 0; t < sr.tapCount; ++t) RenderTap(s, 1 + t, sr.taps[t], rsp.cut, frames, outL, outR);
             for (int t = sr.tapCount; t < kMaxLiveTaps; ++t) FadeOutTap(s, 1 + t, frames, outL, outR);
             s.writePos += static_cast<uint64_t>(frames);
@@ -380,22 +403,66 @@ private:
         EarState ear[2];
         bool primed = false;
     };
+    // Per ear: the last samples of the delayed signal and the filter used for the previous block.
+    struct FirState {
+        std::vector<float> hist, prev;
+        int len = 0;
+        bool havePrev = false;
+    };
     struct SourceState {
         std::vector<float> feed, mono;
         uint64_t writePos = 0;
         StreamConvolver early;
         TapState tap[1 + kMaxLiveTaps];
+        FirState fir[2];
         bool fresh = true;
         int tapsSeen = 0;
     };
 
+    // y = h * x over one block, x being the delayed signal (xe_). A filter that
+    // changed since the last block crossfades from the old one across the block,
+    // so a moving source never steps. The result is left in y_.
+    void ApplyFir(FirState& st, const float* h, int length, int frames) noexcept {
+        const int L = (std::max)(1, (std::min)(length, kMaxFir));
+        const int H = L - 1;
+        float* w = work_.data();
+        if (st.hist.size() < static_cast<size_t>(kMaxFir)) {   // first use
+            st.hist.assign(static_cast<size_t>(kMaxFir), 0.0f);
+            st.prev.assign(static_cast<size_t>(kMaxFir), 0.0f);
+        }
+        if (H > 0) std::memcpy(w, st.hist.data(), static_cast<size_t>(H) * sizeof(float));
+        std::memcpy(w + H, xe_.data(), static_cast<size_t>(frames) * sizeof(float));
+        auto run = [&](const float* taps, float* y) {
+            std::fill(y, y + frames, 0.0f);
+            for (int k = 0; k < L; ++k) {
+                const float hk = taps[k];
+                const float* p = w + H - k;
+                for (int i = 0; i < frames; ++i) y[i] += hk * p[i];
+            }
+        };
+        run(h, y_.data());
+        if (st.havePrev && st.len == L && std::memcmp(st.prev.data(), h, static_cast<size_t>(L) * sizeof(float)) != 0) {
+            run(st.prev.data(), yPrev_.data());
+            const float inv = 1.0f / static_cast<float>(frames);
+            for (int i = 0; i < frames; ++i) {
+                const float u = static_cast<float>(i + 1) * inv;
+                y_[static_cast<size_t>(i)] = yPrev_[static_cast<size_t>(i)] + (y_[static_cast<size_t>(i)] - yPrev_[static_cast<size_t>(i)]) * u;
+            }
+        }
+        if (H > 0) std::memcpy(st.hist.data(), w + frames, static_cast<size_t>(H) * sizeof(float));
+        std::memcpy(st.prev.data(), h, static_cast<size_t>(L) * sizeof(float));
+        st.len = L;
+        st.havePrev = true;
+    }
+
     // Reads one tap from the source's delay line into both ears, ramping the
     // delay and band gains from their previous values over the block.
     void RenderTap(SourceState& s, int slot, const LiveTap& tap, bool cut, int frames,
-                   float* outL, float* outR) noexcept {
+                   float* outL, float* outR, const DirectFir* fir = nullptr) noexcept {
         TapState& ts = s.tap[slot];
         const size_t mask = static_cast<size_t>(feedSize_ - 1);
         float* outs[2] = {outL, outR};
+        if (slot == 0 && !fir) s.fir[0].havePrev = s.fir[1].havePrev = false;
         for (int e = 0; e < 2; ++e) {
             EarState& es = ts.ear[e];
             const float targetDelay = (std::max)(1.0f / sr_, tap.delaySeconds + tap.ears.delay[e]);
@@ -417,7 +484,16 @@ private:
                 const int64_t i0 = static_cast<int64_t>(fl);
                 const float a = s.feed[static_cast<size_t>(i0) & mask];
                 const float b2 = s.feed[static_cast<size_t>(i0 + 1) & mask];
-                const float x = pos < 0.0 ? 0.0f : a + (b2 - a) * fr;
+                xe_[static_cast<size_t>(i)] = pos < 0.0 ? 0.0f : a + (b2 - a) * fr;
+            }
+            const float* sig = xe_.data();
+            if (fir) {
+                ApplyFir(s.fir[e], fir->h[e], fir->length, frames);
+                sig = y_.data();
+            }
+            for (int i = 0; i < frames; ++i) {
+                const float u = static_cast<float>(i + 1) * inv;
+                const float x = sig[i];
                 es.l0 += alpha_[0] * (x - es.l0);
                 es.l1 += alpha_[1] * (x - es.l1);
                 es.l2 += alpha_[2] * (x - es.l2);
@@ -450,6 +526,7 @@ private:
     SourceState src_[kMaxSources];
     StreamConvolver tail_;
     std::vector<float> tailIn_, zeros_, scratchL_, scratchR_;
+    std::vector<float> xe_, y_, yPrev_, work_;   // per-tap scratch: delayed signal, filtered, previous filter, history + block
     std::atomic<const RoomResponse*> current_{nullptr};
     std::atomic<const RoomResponse*> inUse_{nullptr};
     std::vector<std::shared_ptr<const RoomResponse>> owned_;   // control thread only

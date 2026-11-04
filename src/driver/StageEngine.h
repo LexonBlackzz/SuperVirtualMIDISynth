@@ -10,6 +10,7 @@
 // changed and only the paths when something merely moved.
 
 #include "render/StageBuilder.h"
+#include "render/StageHrtf.h"
 #include "render/StageMesh.h"
 #include "render/StageTracerVulkan.h"
 #include "synth/StageConfig.h"
@@ -182,6 +183,8 @@ private:
         std::unique_ptr<stage::TraceBackend> gpu = stage::CreateVulkanTraceBackend(why);
         stage::CpuTracer cpu;
         stage::TraceBackend& tracer = gpu ? *gpu : static_cast<stage::TraceBackend&>(cpu);
+        // The generic measured head for the direct sound (null: plain ear model).
+        const std::unique_ptr<stage::HrtfSpatializer> head = stage::MakeHrtfSpatializer(sr_);
         std::shared_ptr<const stage::IrSpectra> tail;
         stage::RoomMeta meta;
         StageConfig last;
@@ -200,6 +203,7 @@ private:
             }
             stage::EarModelSpatializer ear;
             ear.enabled = cur.earModel;
+            const stage::Spatializer& spatial = (cur.earModel && head) ? static_cast<const stage::Spatializer&>(*head) : ear;
             const stage::BuildOptions opt = Options(cur, &cancel_);
             ResolveMesh(cur);
             const stage::StageScene scene = Scene(cur);
@@ -215,7 +219,7 @@ private:
                 meta = m2;
                 haveLast = false;
             }
-            renderer_->Submit(stage::BuildPaths(scene, ear, opt, renderer_->Plan(), tail, meta, serial++, !haveLast));
+            renderer_->Submit(stage::BuildPaths(scene, spatial, opt, renderer_->Plan(), tail, meta, serial++, !haveLast));
             last = cur;
             haveLast = true;
             ready_.store(true, std::memory_order_release);

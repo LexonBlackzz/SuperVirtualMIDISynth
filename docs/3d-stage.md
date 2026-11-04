@@ -27,6 +27,15 @@ suspends the stage until the engine restarts.
   concrete, curtain, foam and so on), which sets absorption per band.
 - **Furniture**: boxes that block, absorb and scatter rays and add their own bounces.
 
+## The measured head
+
+With the ear model on, the direct sound goes through one generic human head built from the 96 measured
+subjects of the HUTUBS database (CC BY 4.0, TU Berlin; details and how it was made in
+`src/render/data/README.md`). It gives the level, spectral and time differences between the ears for any
+direction, including elevation and front/back. Reflections keep the plain ear model. The table is
+embedded in the driver and the Configurator; setting `SVMS_NO_HRTF=1` switches back to the plain ear
+model for comparing.
+
 ## Per-channel controls
 
 Each channel has a position, a **level** trim (-24 to +12 dB, scaling its direct sound, early taps and
