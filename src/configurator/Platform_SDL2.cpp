@@ -175,6 +175,15 @@ public:
     int Width() const override { return width_; }
     int Height() const override { return height_; }
     float DpiScale() const override { return dpiScale_; }
+    void SetContentScale(float mul) override {
+        contentMul_ = mul > 0.0f ? mul : 1.0f;
+        if (!window_) return;
+        const int w = int(kMinWidth * dpiScale_ * contentMul_), h = int(kMinHeight * dpiScale_ * contentMul_);
+        SDL_SetWindowMinimumSize(window_, w, h);
+        int cw = 0, ch = 0;
+        SDL_GetWindowSize(window_, &cw, &ch);
+        if (cw < w || ch < h) SDL_SetWindowSize(window_, (std::max)(cw, w), (std::max)(ch, h));
+    }
     void* NativeWindow() const override { return nullptr; }
 
     bool LoadSystemFont(bool mono, std::vector<unsigned char>& out) override {
@@ -241,6 +250,7 @@ private:
     mutable int width_ = kDefaultWidth;
     mutable int height_ = kDefaultHeight;
     float dpiScale_ = 1.0f;
+    float contentMul_ = 1.0f;
 };
 
 } // namespace

@@ -102,6 +102,7 @@ bool ConfiguratorApp::Initialize(int argc, char** argv) {
     hooks.hasUnsavedChanges = [this] { return config_.IsDirty(); };
     if (!platform_->CreateWindowAndDevice(hooks, lastInitError_)) return false;
     appliedUiMul_ = GetThemeSettings().uiScale;
+    platform_->SetContentScale(appliedUiMul_);
     dpiScale_ = platform_->DpiScale() * appliedUiMul_;
     if (!CreateImGui()) return false;
     ApplyTheme();
@@ -377,6 +378,7 @@ void ConfiguratorApp::RenderFrame() {
     const bool dpiChanged = platform_->TakeDpiChange(newScale);
     if (dpiChanged || uiMul != appliedUiMul_) {
         appliedUiMul_ = uiMul;
+        platform_->SetContentScale(uiMul);
         RecreateFonts(platform_->DpiScale() * uiMul, true);
     }
 

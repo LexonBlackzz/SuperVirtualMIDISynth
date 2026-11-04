@@ -840,13 +840,13 @@ void MeshMaterials(ConfigDocument& doc, ConfigValues& w, const stg::StageMesh& m
     const int n = static_cast<int>(m.groups.size());
     for (int i = 0; i < n; ++i) {
         const int r = i / cols, c = i % cols;
-        ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 62.0f * s));
+        ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 74.0f * s));
         ui::PushText(0, 12.0f);
         ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
         ImGui::TextUnformatted(m.groups[static_cast<size_t>(i)].c_str());
         ImGui::PopStyleColor();
         ui::PopFont();
-        ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 62.0f * s + 20.0f * s));
+        ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 74.0f * s + 20.0f * s));
         int mat = MeshMat(w, m, static_cast<size_t>(i));
         char id[24];
         std::snprintf(id, sizeof(id), "##stmesh%d", i);
@@ -857,7 +857,7 @@ void MeshMaterials(ConfigDocument& doc, ConfigValues& w, const stg::StageMesh& m
         AbsBar(cw, MeshMat(w, m, static_cast<size_t>(i)));
     }
     ImGui::SetCursorScreenPos(so);
-    ImGui::Dummy(ImVec2(avail, ((n + cols - 1) / cols) * 62.0f * s));
+    ImGui::Dummy(ImVec2(avail, ((n + cols - 1) / cols) * 74.0f * s));
 }
 
 void DrawRoom(ImDrawList* dl, const Proj& P, const ConfigValues& w) {
@@ -1262,12 +1262,17 @@ void ScenesCard(ConfigDocument& doc) {
         const float t = AnimEase(ImGui::GetID("##sh"), hov ? 1.0f : 0.0f, 0.2f);
         dl->AddRectFilled(a, b, k.card2, 12.0f * s);
         dl->AddRect(a, b, ui::MixU32(k.line2, k.acc, t), 12.0f * s);
+        dl->PushClipRect(a, b, true);
         ui::PushText(2, 14.0f);
-        dl->AddText(ImVec2(a.x + 14.0f * s, a.y + 12.0f * s), k.text, kScenes[i].name);
+        // A long name shrinks to fit the tile instead of running out of it.
+        const float room = cw - 24.0f * s, tw = ImGui::CalcTextSize(kScenes[i].name).x;
+        const float fit = tw > room && tw > 0.0f ? room / tw : 1.0f;
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * fit, ImVec2(a.x + 14.0f * s, a.y + 12.0f * s), k.text, kScenes[i].name);
         ui::PopFont();
         ui::PushText(0, 12.0f);
         dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(a.x + 14.0f * s, a.y + 34.0f * s), k.muted, kScenes[i].text, nullptr, cw - 24.0f * s);
         ui::PopFont();
+        dl->PopClipRect();
         ImGui::PopID();
     }
     ImGui::SetCursorScreenPos(o);
@@ -1755,13 +1760,13 @@ void AdvancedCards(ConfigDocument& doc) {
         const ImVec2 so = ImGui::GetCursorScreenPos();
         for (int i = 0; i < 6; ++i) {
             const int r = i / cols, c = i % cols;
-            ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 62.0f * s));
+            ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 74.0f * s));
             ui::PushText(0, 12.0f);
             ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
             ImGui::TextUnformatted(surf[i]);
             ImGui::PopStyleColor();
             ui::PopFont();
-            ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 62.0f * s + 20.0f * s));
+            ImGui::SetCursorScreenPos(ImVec2(so.x + c * (cw + 12.0f * s), so.y + r * 74.0f * s + 20.0f * s));
             int m = w.stageSurface[i];
             char id[16];
             std::snprintf(id, sizeof(id), "##stsurf%d", i);
@@ -1773,7 +1778,7 @@ void AdvancedCards(ConfigDocument& doc) {
             AbsBar(cw, w.stageSurface[i]);
         }
         ImGui::SetCursorScreenPos(so);
-        ImGui::Dummy(ImVec2(avail, ((6 + cols - 1) / cols) * 62.0f * s));
+        ImGui::Dummy(ImVec2(avail, ((6 + cols - 1) / cols) * 74.0f * s));
         } else {
             MeshMaterials(doc, w, *mesh);
         }

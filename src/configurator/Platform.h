@@ -54,6 +54,9 @@ public:
     virtual void ApplyPendingResize() = 0;
     // True once after the monitor scale changed; `scale` is the new factor.
     virtual bool TakeDpiChange(float& scale) = 0;
+    // The Settings size choice. The smallest window grows with it, so the layout
+    // that fits at 100% still fits at 125% and beyond.
+    virtual void SetContentScale(float) {}
     virtual bool CanRender() const = 0;
     virtual void NewFrame() = 0;
     // Renders ImGui's draw data over `clear` (RGBA) and presents.

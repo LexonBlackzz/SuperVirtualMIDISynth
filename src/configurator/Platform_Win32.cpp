@@ -164,6 +164,15 @@ public:
     int Width() const override { return windowWidth_; }
     int Height() const override { return windowHeight_; }
     float DpiScale() const override { return dpiScale_; }
+    void SetContentScale(float mul) override {
+        contentMul_ = mul > 0.0f ? mul : 1.0f;
+        if (!hwnd_) return;
+        // Setting the size again makes Windows apply the new minimum to a window that is now too small.
+        RECT rc;
+        if (GetWindowRect(hwnd_, &rc))
+            SetWindowPos(hwnd_, nullptr, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     void* NativeWindow() const override { return hwnd_; }
 
     bool LoadSystemFont(bool mono, std::vector<unsigned char>& out) override {
@@ -216,15 +225,24 @@ private:
         case WM_GETMINMAXINFO: {
             Win32Platform* p = self(hWnd);
             if (p) {
+                const float k = p->dpiScale_ * p->contentMul_;
                 RECT rc = {0, 0,
-                           static_cast<LONG>(kMinWindowWidth * p->dpiScale_),
-                           static_cast<LONG>(kMinWindowHeight * p->dpiScale_)};
+                           static_cast<LONG>(kMinWindowWidth * k),
+                           static_cast<LONG>(kMinWindowHeight * k)};
                 AdjustWindowRectEx(
                     &rc, static_cast<DWORD>(GetWindowLongPtrW(hWnd, GWL_STYLE)), FALSE,
                     static_cast<DWORD>(GetWindowLongPtrW(hWnd, GWL_EXSTYLE)));
+                LONG w = rc.right - rc.left, h = rc.bottom - rc.top;
+                // Never more than the screen can show.
+                MONITORINFO mi{};
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+                    w = (std::min)(w, mi.rcWork.right - mi.rcWork.left);
+                    h = (std::min)(h, mi.rcWork.bottom - mi.rcWork.top);
+                }
                 MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lParam);
-                info->ptMinTrackSize.x = rc.right - rc.left;
-                info->ptMinTrackSize.y = rc.bottom - rc.top;
+                info->ptMinTrackSize.x = w;
+                info->ptMinTrackSize.y = h;
             }
             return 0;
         }
@@ -436,6 +454,7 @@ private:
     int windowWidth_ = 1180;
     int windowHeight_ = 760;
     float dpiScale_ = 1.0f;
+    float contentMul_ = 1.0f;   // Settings size choice, see SetContentScale
 
     bool resizePending_ = false;
     UINT pendingWidth_ = 0;
