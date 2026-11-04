@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-04 `fix(v3): the 3D stage no longer invents instruments for channels` Until the synth has been told a program the channel list, the stage labels and the selected-channel title say just Channel 1 to 16 (channel 10 stays Drums, the GM drum channel); the instrument name appears once a program change arrives. The 5.1 seat does the same: channels with no known instrument are spread front, front, centre, surround, surround instead of getting a role from a made-up default.
+
 - 2026-11-04 `feat(v3): a 5.1 seat on the 3D stage that follows each channel's instrument` The fifth layout under Where the band sits puts every channel where its instrument goes in a surround set: bass, tuba, timpani and contrabass at the subwoofer (low, in front), the voices, leads, winds and the drum channel at the centre, strings, organs, pads and effects at the surrounds (110 degrees), and everything else on the front pair (30 degrees), alternating sides. Channels that share a speaker stack with a small fan so the dots stay clickable. The instruments come from the programs the song has set (the default names until then); when a program changes, a band that is still where 5.1 put it is seated again, one you have moved is left alone.
 
 - 2026-11-04 `feat(v3): a fresh 3D stage seats the band in the surround ring` A new config, and Reset to a good start, used to put the 16 channels in the orchestra layout at the front of the room. They now start in the Surround seat (all 16 around you, 22.5 degrees apart, alternating heights), which shows the staging better; the Orchestra, Close and Wall seats and the scenes are unchanged, and a config that already has positions keeps them.

@@ -62,15 +62,15 @@ const char* const kGm[128] = {
     "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock", "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
     "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet", "Telephone Ring", "Helicopter", "Applause", "Gunshot"};
 
-const char* const kNames[16] = {"Piano", "Strings", "Violin", "Cello", "Flute", "Oboe", "Horn", "Harp",
-                                "Choir", "Drums", "Bass", "Brass", "Pads", "Guitar", "Marimba", "Effects"};
-
-// Names follow the instrument each channel has asked for, once a driver is connected and a song has set it.
+// Names follow the instrument each channel has asked for, once a driver is connected and a song has set
+// it. Until then a channel is just "Channel": nothing is guessed (channel 10 is the GM drum channel).
 std::array<uint8_t, 16> g_prog = [] { std::array<uint8_t, 16> a; a.fill(255); return a; }();
 
+bool ChannelKnown(int i) { return i == 9 || g_prog[i] < 128; }
+
 const char* ChannelName(int i) {
-    if (g_prog[i] < 128) return i == 9 ? "Drums" : kGm[g_prog[i]];
-    return kNames[i];
+    if (i == 9) return "Drums";
+    return g_prog[i] < 128 ? kGm[g_prog[i]] : "Channel";
 }
 
 void PollPrograms() {
@@ -247,11 +247,14 @@ void ResetQuick() {
 // channel to the centre, strings, organs, pads and effects to the surrounds, the rest to the front pair.
 enum Role { RoleFront, RoleCentre, RoleSurround, RoleSub };
 
-Role RoleOf(int ch) {
-    // Until a song has set a program, each channel has the instrument its default name says.
-    static const uint8_t kDefaultProg[16] = {0, 48, 40, 42, 73, 68, 60, 46, 52, 0, 32, 61, 88, 24, 12, 96};
+Role RoleOf(int ch, int unknownIndex) {
     if (ch == 9) return RoleCentre;
-    const int p = g_prog[ch] < 128 ? g_prog[ch] : kDefaultProg[ch];
+    if (g_prog[ch] >= 128) {
+        // No instrument known yet: front, front, centre, surround, surround, round and round.
+        static const Role kCycle[5] = {RoleFront, RoleFront, RoleCentre, RoleSurround, RoleSurround};
+        return kCycle[unknownIndex % 5];
+    }
+    const int p = g_prog[ch];
     if ((p >= 32 && p <= 39) || p == 43 || p == 47 || p == 58) return RoleSub;
     if ((p >= 52 && p <= 54) || (p >= 64 && p <= 87)) return RoleCentre;
     if ((p >= 16 && p <= 23) || (p >= 40 && p <= 45) || (p >= 48 && p <= 51) || (p >= 88 && p <= 103) || p >= 120)
@@ -262,9 +265,9 @@ Role RoleOf(int ch) {
 // Several channels may share a speaker; a small fan keeps their dots apart.
 void SeatFive(ConfigValues& w) {
     const float R = Clamp(0.4f * (std::min)(w.stageRoom[0], w.stageRoom[1]), 1.5f, 4.0f);
-    int n[4] = {};
+    int n[4] = {}, unknown = 0;
     for (int i = 0; i < 16; ++i) {
-        const Role role = RoleOf(i);
+        const Role role = RoleOf(i, i != 9 && g_prog[i] >= 128 ? unknown++ : 0);
         const int k = n[role]++;
         float az = 0.0f, el = 0.0f, di = R;
         switch (role) {
@@ -1202,7 +1205,7 @@ void StageCanvas(ConfigDocument& doc) {
             const ImVec2 ts = ImGui::CalcTextSize(n);
             dl->AddText(ImVec2(q.x - ts.x * 0.5f, q.y - ts.y * 0.5f), IM_COL32(12, 12, 16, 255), n);
             ui::PopFont();
-            if (g.labels && (sel || g.view != 2 || r > 8.0f * s)) Label(dl, ImVec2(q.x, q.y - r - 16.0f * s), IM_COL32(235, 235, 240, on ? 230 : 110), ChannelName(i));
+            if (g.labels && ChannelKnown(i) && (sel || g.view != 2 || r > 8.0f * s)) Label(dl, ImVec2(q.x, q.y - r - 16.0f * s), IM_COL32(235, 235, 240, on ? 230 : 110), ChannelName(i));
         }
         // Listener.
         const V3 L = ListenerPos(w);
@@ -1735,7 +1738,8 @@ void AdvancedCards(ConfigDocument& doc) {
     {
         const bool chan = !g.you && g.fsel < 0;
         char title[48];
-        std::snprintf(title, sizeof(title), chan ? "%s (channel %d)" : g.you ? "You" : "Furniture", ChannelName(g.sel), g.sel + 1);
+        if (chan && !ChannelKnown(g.sel)) std::snprintf(title, sizeof(title), "Channel %d", g.sel + 1);
+        else std::snprintf(title, sizeof(title), chan ? "%s (channel %d)" : g.you ? "You" : "Furniture", ChannelName(g.sel), g.sel + 1);
         ui::BeginCard("##stsel", title, chan ? "Place this channel by direction, height and distance from you." : "Select a channel to place it by numbers.");
         if (chan) {
             Polar p = ToPolar(w, w.stageChannel[g.sel]);
