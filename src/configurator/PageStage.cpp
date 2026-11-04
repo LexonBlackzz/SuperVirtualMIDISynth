@@ -88,6 +88,17 @@ const char* const kMatName[12] = {"Plaster", "Stone", "Concrete", "Wood", "Glass
 // Mid-band (500 Hz / 2 kHz mean) absorption.
 const float kMatAbs[12] = {0.035f, 0.035f, 0.025f, 0.08f, 0.045f, 0.405f,
                            0.525f, 0.60f, 0.825f, 0.30f, 0.25f, 1.0f};
+// The thin bar under a surface selector: how much of the mid band the material absorbs.
+// Call right after the selector, which it sits under.
+void AbsBar(float width, int mat) {
+    const ui::Tokens& k = ui::Tok();
+    const float s = ui::Scale();
+    const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    const float y = mx.y + 4.0f * s, h = 4.0f * s;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(mn.x, y), ImVec2(mn.x + width, y + h), k.card3, 2.0f * s);
+    dl->AddRectFilled(ImVec2(mn.x, y), ImVec2(mn.x + width * kMatAbs[(std::max)(0, (std::min)(11, mat))], y + h), k.cpu, 2.0f * s);
+}
 const uint8_t kFloorRgb[12][3] = {{180, 180, 180}, {150, 150, 164}, {140, 140, 148}, {206, 150, 92},
                                   {120, 150, 170}, {168, 86, 96},   {118, 106, 150}, {128, 108, 176},
                                   {160, 160, 120}, {150, 105, 60},  {70, 132, 84},   {120, 120, 120}};
@@ -843,6 +854,7 @@ void MeshMaterials(ConfigDocument& doc, ConfigValues& w, const stg::StageMesh& m
             w.stageMeshMaterial[static_cast<size_t>(i)] = static_cast<uint8_t>(mat);
             doc.MarkDirty();
         }
+        AbsBar(cw, MeshMat(w, m, static_cast<size_t>(i)));
     }
     ImGui::SetCursorScreenPos(so);
     ImGui::Dummy(ImVec2(avail, ((n + cols - 1) / cols) * 62.0f * s));
@@ -1758,6 +1770,7 @@ void AdvancedCards(ConfigDocument& doc) {
                 g.roomIdx = -1;
                 doc.MarkDirty();
             }
+            AbsBar(cw, w.stageSurface[i]);
         }
         ImGui::SetCursorScreenPos(so);
         ImGui::Dummy(ImVec2(avail, ((6 + cols - 1) / cols) * 62.0f * s));
