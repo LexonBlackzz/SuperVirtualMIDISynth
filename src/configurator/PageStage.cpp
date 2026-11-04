@@ -169,7 +169,7 @@ struct State {
     bool refl = true, labels = true;
     bool allPaths = false, rayField = false;
     int pathCount = 0;
-    int roomIdx = 2, seat = Orch, level = 1;
+    int roomIdx = 2, seat = Wide, level = 1;
     float amount = 100.0f;
     // Quick-knob state; the base is the band as it stood before the first nudge.
     float spread = 1.0f, closeness = 1.0f, lift = 0.0f, size = 1.0f;
@@ -1213,7 +1213,7 @@ void HeaderBar(ConfigDocument& doc) {
     const float y = ImGui::GetCursorPosY();
     ImGui::SetCursorPos(ImVec2(x0, y));
     if (ui::Button("Reset to a good start")) {
-        g.seat = Orch;
+        g.seat = Wide;
         g.level = 1;
         w.stageTailTrim = 0.7f;
         g.amount = 70.0f;
@@ -1826,7 +1826,7 @@ void DrawStagePage(ConfigDocument& doc) {
         for (int i = 1; i < 16; ++i)
             if (w.stageChannel[i] != w.stageChannel[0]) stacked = false;
         if (stacked) {
-            g.seat = Orch;
+            g.seat = Wide;
             g.level = 1;
             ApplyRoom(w, 2, true);
         }

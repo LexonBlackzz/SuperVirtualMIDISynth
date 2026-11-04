@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-04 `feat(v3): a fresh 3D stage seats the band in the surround ring` A new config, and Reset to a good start, used to put the 16 channels in the orchestra layout at the front of the room. They now start in the Surround seat (all 16 around you, 22.5 degrees apart, alternating heights), which shows the staging better; the Orchestra, Close and Wall seats and the scenes are unchanged, and a config that already has positions keeps them.
+
 - 2026-11-04 `fix(v3): the Configurator minimum size follows the UI scale; surface rows and scene tiles no longer clip` The smallest window was 1100 x 660 times the system scale only, so at a 125% size choice the pages overflowed; it now also multiplies by the Settings size (capped at the monitor work area, and a window that is too small grows when the size is raised). The absorption bars under the surface selectors had overlapped the next row's label, so the row pitch went from 62 to 74, and a scene name too long for its tile shrinks to fit.
 
 - 2026-11-04 `feat(v3): absorption bar under each surface selector on the 3D Stage page` The prototype drew a thin bar under every wall, floor and ceiling selector showing how much of the mid band the material absorbs; the port left it out. It is back, for the box room and for the groups of an imported model.
