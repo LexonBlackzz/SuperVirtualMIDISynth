@@ -289,11 +289,11 @@ struct RuntimeConfigSnapshot {
     FilterType filterType;
     PanLaw panLaw;
     bool correctnessMode;
+    bool gmVolumeCurve = true;
 };
 
 // ── Atomic process-local live-config mailbox ───────────────────────────
 // Every field is std::atomic so the audio thread's seqlock-guarded copy
-    bool gmVolumeCurve = true;
 // never performs a non-atomic read while the control thread is writing.
 // Writer (control thread): bump liveMailboxSeq_ to ODD, store the fields,
 //   then bump to EVEN (release) — the sequence only ever increases, so no

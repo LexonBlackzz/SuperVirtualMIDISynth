@@ -974,15 +974,15 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             else if (pan->is_string() && pan->get<std::string>() == "balance") cfg.panLaw = PanLaw::Balance;
             else AppendWarning(cfg.configWarning, "quality.pan_law");
         }
-    }
-    if (auto it = root.find("limiter"); it != root.end() && it->is_object()) {
-        if (!ReadBool(*it, "enabled", cfg.limiterEnabled))
         auto curve = it->find("volume_curve");
         if (curve != it->end()) {
             if (curve->is_string() && curve->get<std::string>() == "gm") cfg.gmVolumeCurve = true;
             else if (curve->is_string() && curve->get<std::string>() == "linear") cfg.gmVolumeCurve = false;
             else AppendWarning(cfg.configWarning, "quality.volume_curve");
         }
+    }
+    if (auto it = root.find("limiter"); it != root.end() && it->is_object()) {
+        if (!ReadBool(*it, "enabled", cfg.limiterEnabled))
             AppendWarning(cfg.configWarning, "limiter.enabled");
         auto algorithm = it->find("algorithm");
         if (algorithm != it->end()) {
