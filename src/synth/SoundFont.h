@@ -220,10 +220,6 @@ struct SF2Data {
     uint32_t sampleDataSize;
     uint32_t sampleDataFrames;
 
-    float* resampledData;
-    uint32_t resampledDataSize;
-    uint32_t resampledSampleRate;
-
     bool loaded;
     // SFZ is compiled directly into the same sample/header/region tables.
     // Its single instrument intentionally resolves for every MIDI program.
@@ -261,7 +257,6 @@ bool sfz_load(const wchar_t* path, SF2Data* outData);
 bool soundfont_load(const char* path, SF2Data* outData);
 bool soundfont_load(const wchar_t* path, SF2Data* outData);
 void sf2_free(SF2Data* data);
-bool sf2_resample(SF2Data* data, uint32_t targetRate, InterpolationMode mode);
 
 bool sf2_find_preset(const SF2Data* data, uint16_t bank, uint16_t preset,
                      uint32_t* outPresetIndex);

@@ -307,57 +307,7 @@ bool sf2_load(const wchar_t* path, SF2Data* outData) {
 
 void sf2_free(SF2Data* data) {
     free(data->sampleData);
-    free(data->resampledData);
     std::memset(data, 0, sizeof(SF2Data));
-}
-
-bool sf2_resample(SF2Data* data, uint32_t targetRate, InterpolationMode mode) {
-    if (!data->loaded || !data->sampleData) return false;
-
-    uint32_t srcRate = 0;
-    for (uint32_t i = 0; i < data->sampleCount; ++i) {
-        if (data->samples[i].sampleRate > srcRate)
-            srcRate = data->samples[i].sampleRate;
-    }
-    if (srcRate == 0) srcRate = 44100;
-    if (srcRate == targetRate) return true;
-
-    double ratio = static_cast<double>(targetRate) / srcRate;
-    uint32_t dstFrames = static_cast<uint32_t>(data->sampleDataFrames * ratio) + 256;
-
-    float* dst = static_cast<float*>(malloc(dstFrames * sizeof(float)));
-    if (!dst) return false;
-
-    if (mode == InterpolationMode::Nearest) {
-        for (uint32_t i = 0; i < dstFrames; ++i) {
-            uint32_t srcIdx = static_cast<uint32_t>(i / ratio);
-            if (srcIdx >= data->sampleDataFrames) srcIdx = data->sampleDataFrames - 1;
-            dst[i] = data->sampleData[srcIdx] / 32768.0f;
-        }
-    } else {
-        for (uint32_t i = 0; i < dstFrames; ++i) {
-            double srcPos = i / ratio;
-            uint32_t idx0 = static_cast<uint32_t>(srcPos);
-            uint32_t idx1 = idx0 + 1;
-            if (idx1 >= data->sampleDataFrames) idx1 = data->sampleDataFrames - 1;
-            float frac = static_cast<float>(srcPos - idx0);
-            float s0 = data->sampleData[idx0] / 32768.0f;
-            float s1 = data->sampleData[idx1] / 32768.0f;
-            dst[i] = s0 + (s1 - s0) * frac;
-        }
-    }
-
-    data->resampledData = dst;
-    data->resampledDataSize = dstFrames;
-    data->resampledSampleRate = targetRate;
-
-    float rateRatio = static_cast<float>(targetRate) / srcRate;
-    for (uint32_t i = 0; i < data->sampleCount; ++i) {
-        SF2Sample& s = data->samples[i];
-        s.sampleDataOffset = static_cast<uint32_t>(s.start * rateRatio);
-    }
-
-    return true;
 }
 
 static int16_t clamp_gen_value(SF2GeneratorType gen, int16_t amount) {
@@ -420,18 +370,10 @@ bool sf2_build_voice_params(const SF2Data* data, uint32_t instrumentIndex,
 
     const SF2Sample& sample = data->samples[sampleIndex];
 
-    if (data->resampledData) {
-        uint32_t offset = sample.sampleDataOffset;
-        outParams->sampleStart = offset;
-        outParams->loopStart = static_cast<uint32_t>(sample.loopStart * 44100.0f / sample.sampleRate);
-        outParams->loopEnd = static_cast<uint32_t>(sample.loopEnd * 44100.0f / sample.sampleRate);
-        outParams->sampleEnd = static_cast<uint32_t>(sample.end * 44100.0f / sample.sampleRate);
-    } else {
-        outParams->sampleStart = sample.start;
-        outParams->loopStart = sample.loopStart;
-        outParams->loopEnd = sample.loopEnd;
-        outParams->sampleEnd = sample.end;
-    }
+    outParams->sampleStart = sample.start;
+    outParams->loopStart = sample.loopStart;
+    outParams->loopEnd = sample.loopEnd;
+    outParams->sampleEnd = sample.end;
 
     outParams->loopMode = (sample.sampleType & 1) ? 1 : 0;
     outParams->rootKey = sample.originalPitch;
