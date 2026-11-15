@@ -9,6 +9,9 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
 option(SVMS_CUDA "Embed the CUDA kernels of the GPU render stage (needs nvcc; point CUDA_PATH at the toolkit)" ON)
 option(SVMS_VULKAN "Embed the SPIR-V kernels of the GPU render stage (needs the Vulkan SDK: headers and glslc)" ON)
+# The BASS/BASSMIDI prerender shim (bass.dll, bassmidi.dll, bassenc.dll, bass_vst.dll, basswasapi.dll and
+# the BASS exports of winmm.dll) is parked: off by default and not kept in step with the engine.
+option(SVMS_BASS_SHIM "Build the parked BASS/BASSMIDI prerender shim" OFF)
 
 # CUDA backend of the GPU render stage.  The host half (GpuBackendCUDA.cpp)
 # declares the driver API itself and opens nvcuda at run time, so it builds
@@ -595,10 +598,12 @@ set(SVMS_DRIVER_SOURCES
     driver/DriverRender.cpp
     frontends/FrontNative.cpp
     frontends/FrontKDMAPI.cpp
-    frontends/FrontBass.cpp
     events/MidiStream.cpp
     driver/DllMain.cpp
 )
+if(SVMS_BASS_SHIM)
+    list(APPEND SVMS_DRIVER_SOURCES frontends/FrontBass.cpp)
+endif()
 
 set(SOURCES
     synth/Config.cpp
@@ -726,7 +731,7 @@ add_library(svmsapi SHARED frontends/FrontWinMM.cpp frontends/RemoteClient.cpp
     "${SVMS_GENERATED_DIR}/SVMSApiVersion.rc")
 
 set(SVMS_DLL_TARGETS svms_engine svmsynth svmsapi)
-if(NOT SVMS_XP_COMPAT)
+if(NOT SVMS_XP_COMPAT AND SVMS_BASS_SHIM)
     # bass.dll: the winmm runtime (same exports) plus the offline note-table
     # renderer, which the KMC/BASSMIDI imitation mode runs in process.
     add_library(svms_offline_render OBJECT synth/OfflineRenderer.cpp)
@@ -869,79 +874,6 @@ set(EXPORTS
         mciGetErrorStringW
         mciGetDeviceIDA
         mciGetDeviceIDW
-        BASS_Init
-        BASS_Free
-        BASS_SetConfig
-        BASS_GetConfig
-        BASS_GetVersion
-        BASS_ErrorGetCode
-        BASS_MIDI_FontInit
-        BASS_MIDI_FontLoad
-        BASS_MIDI_FontFree
-        BASS_MIDI_StreamSetFonts
-        BASS_MIDI_StreamCreate
-        BASS_MIDI_StreamEvents
-        BASS_MIDI_StreamEvent
-        BASS_MIDI_StreamGetEvent
-        BASS_MIDI_GetVersion
-        BASS_MIDI_StreamLoadSamples
-        BASS_MIDI_StreamSetFilter
-        BASS_MIDI_FontFlags
-        BASS_MIDI_FontSetVolume
-        BASS_MIDI_FontGetVolume
-        BASS_MIDI_FontCompact
-        BASS_MIDI_FontUnload
-        BASS_MIDI_StreamCreateFile
-        BASS_MIDI_StreamCreateURL
-        BASS_MIDI_StreamCreateFileUser
-        BASS_MIDI_StreamCreateEvents
-        BASS_MIDI_ConvertEvents
-        BASS_MIDI_StreamGetEvents
-        BASS_MIDI_StreamGetEventsEx
-        BASS_MIDI_StreamGetMark
-        BASS_MIDI_StreamGetMarks
-        BASS_MIDI_StreamGetPreset
-        BASS_MIDI_StreamGetFonts
-        BASS_MIDI_StreamGetChannel
-        BASS_MIDI_FontInitUser
-        BASS_MIDI_FontLoadEx
-        BASS_MIDI_FontPack
-        BASS_MIDI_FontUnpack
-        BASS_MIDI_FontGetInfo
-        BASS_MIDI_FontGetPreset
-        BASS_MIDI_FontGetPresets
-        BASS_MIDI_InInit
-        BASS_MIDI_InFree
-        BASS_MIDI_InStart
-        BASS_MIDI_InStop
-        BASS_MIDI_InGetDeviceInfo
-        BASS_ChannelGetData
-        BASS_ChannelGetLength
-        BASS_ChannelGetPosition
-        BASS_ChannelSetPosition
-        BASS_ChannelIsActive
-        BASS_ChannelSeconds2Bytes
-        BASS_ChannelBytes2Seconds
-        BASS_ChannelSetAttribute
-        BASS_ChannelGetAttribute
-        BASS_ChannelFlags
-        BASS_ChannelGetInfo
-        BASS_StreamFree
-        BASS_FXReset
-        BASS_FXFree
-        BASS_FXSetParameters
-        BASS_FXGetParameters
-        BASS_FXSetPriority
-        BASS_FXVersion
-        BASS_ChannelSetSync
-        BASS_ChannelRemoveSync
-        BASS_ChannelSetDSP
-        BASS_ChannelRemoveDSP
-        BASS_ChannelSetFX
-        BASS_ChannelRemoveFX
-        BASS_GetConfigPtr
-        BASS_ChannelGetTags
-        BASS_MIDI_StreamGetTrackCount
         midiOutGetNumDevs
         midiOutGetDevCapsA
         midiOutGetDevCapsW
@@ -1049,6 +981,83 @@ set(EXPORTS
         timeSetEvent
         timeKillEvent
 )
+if(SVMS_BASS_SHIM)
+    list(APPEND EXPORTS
+            BASS_Init
+            BASS_Free
+            BASS_SetConfig
+            BASS_GetConfig
+            BASS_GetVersion
+            BASS_ErrorGetCode
+            BASS_MIDI_FontInit
+            BASS_MIDI_FontLoad
+            BASS_MIDI_FontFree
+            BASS_MIDI_StreamSetFonts
+            BASS_MIDI_StreamCreate
+            BASS_MIDI_StreamEvents
+            BASS_MIDI_StreamEvent
+            BASS_MIDI_StreamGetEvent
+            BASS_MIDI_GetVersion
+            BASS_MIDI_StreamLoadSamples
+            BASS_MIDI_StreamSetFilter
+            BASS_MIDI_FontFlags
+            BASS_MIDI_FontSetVolume
+            BASS_MIDI_FontGetVolume
+            BASS_MIDI_FontCompact
+            BASS_MIDI_FontUnload
+            BASS_MIDI_StreamCreateFile
+            BASS_MIDI_StreamCreateURL
+            BASS_MIDI_StreamCreateFileUser
+            BASS_MIDI_StreamCreateEvents
+            BASS_MIDI_ConvertEvents
+            BASS_MIDI_StreamGetEvents
+            BASS_MIDI_StreamGetEventsEx
+            BASS_MIDI_StreamGetMark
+            BASS_MIDI_StreamGetMarks
+            BASS_MIDI_StreamGetPreset
+            BASS_MIDI_StreamGetFonts
+            BASS_MIDI_StreamGetChannel
+            BASS_MIDI_FontInitUser
+            BASS_MIDI_FontLoadEx
+            BASS_MIDI_FontPack
+            BASS_MIDI_FontUnpack
+            BASS_MIDI_FontGetInfo
+            BASS_MIDI_FontGetPreset
+            BASS_MIDI_FontGetPresets
+            BASS_MIDI_InInit
+            BASS_MIDI_InFree
+            BASS_MIDI_InStart
+            BASS_MIDI_InStop
+            BASS_MIDI_InGetDeviceInfo
+            BASS_ChannelGetData
+            BASS_ChannelGetLength
+            BASS_ChannelGetPosition
+            BASS_ChannelSetPosition
+            BASS_ChannelIsActive
+            BASS_ChannelSeconds2Bytes
+            BASS_ChannelBytes2Seconds
+            BASS_ChannelSetAttribute
+            BASS_ChannelGetAttribute
+            BASS_ChannelFlags
+            BASS_ChannelGetInfo
+            BASS_StreamFree
+            BASS_FXReset
+            BASS_FXFree
+            BASS_FXSetParameters
+            BASS_FXGetParameters
+            BASS_FXSetPriority
+            BASS_FXVersion
+            BASS_ChannelSetSync
+            BASS_ChannelRemoveSync
+            BASS_ChannelSetDSP
+            BASS_ChannelRemoveDSP
+            BASS_ChannelSetFX
+            BASS_ChannelRemoveFX
+            BASS_GetConfigPtr
+            BASS_ChannelGetTags
+            BASS_MIDI_StreamGetTrackCount
+    )
+endif()
 if(MSVC)
     foreach(exp ${EXPORTS})
         target_link_options(svmsynth PRIVATE /EXPORT:${exp})
@@ -1285,6 +1294,7 @@ add_custom_target(svms_kdmapi_alias ALL
     DEPENDS svmsynth
     VERBATIM)
 
+if(SVMS_BASS_SHIM)
 # BASS compatibility: bass.dll is the hosting alias of the runtime (the
 # full BASS/BASSMIDI prerender surface lives in svmsynth); bassmidi.dll is
 # a thin forwarder to it so a player loading both module names sees one
@@ -1373,6 +1383,7 @@ set_target_properties(svms_basswasapi_shim PROPERTIES
     PREFIX ""
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
 
 option(SVMS_BUILD_TESTS "Build deterministic V3 correctness tests" ON)
 

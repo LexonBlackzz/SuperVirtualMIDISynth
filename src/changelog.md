@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-15 `chore(v3): park the BASS/BASSMIDI prerender shim behind SVMS_BASS_SHIM (off)` - I don't use the Kiva/KMC prerender path right now, and keeping it in step slows engine work. With the option off (the default) the build drops FrontBass.cpp, the BASS exports of winmm.dll and the bass.dll, bassmidi.dll, bassenc.dll, bass_vst.dll and basswasapi.dll targets. The sources stay in the tree; `-DSVMS_BASS_SHIM=ON` builds them as before, but they are no longer kept compiling with the engine.
+
 - 2026-11-15 `fix(v3): Reset All Controllers keeps channel volume and pan` - CC121 put channel volume back to 100 and pan to the centre, so a song that sets its mix and then resets its controllers lost that mix. Volume and pan now survive it; expression still returns to full, as the MIDI recommended practice says.
 
 - 2026-11-15 `fix(v3): the Configurator saves reverb on/off, mix and room size again` - the Configurator wrote the reverb section without `enabled`, `mix` and `room_size`, so saving from it dropped them and the driver fell back to its defaults, and it only read the stage section when the config also had a reverb section. Both sections are read and written in full again.
