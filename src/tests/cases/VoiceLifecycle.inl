@@ -1158,6 +1158,25 @@ void TestChannelTerminationControllers() {
     }
 
     {
+        // Reset All Controllers leaves volume and pan alone and puts expression back to full.
+        svms::ChannelCache channels;
+        svms::RuntimeConfigSnapshot cfg{};
+        cfg.gmVolumeCurve = false;
+        channels.ControlChange(5, 7, 52);
+        channels.ControlChange(5, 10, 20);
+        channels.ControlChange(5, 11, 30);
+        channels.RebuildChannel(5, cfg, 44100.0f);
+        const float panBefore = channels.GetParams()[5].panLeft;
+        channels.ControlChange(5, 121, 0);
+        channels.RebuildChannel(5, cfg, 44100.0f);
+        const svms::ChannelParamsSnapshot& after = channels.GetParams()[5];
+        Check(std::fabs(after.volume - 52.0f / 127.0f) < 1e-6f,
+              "CC121 keeps the channel volume");
+        Check(after.panLeft == panBefore, "CC121 keeps the channel pan");
+        Check(after.expression == 1.0f, "CC121 puts expression back to full");
+    }
+
+    {
         auto voices = std::make_unique<svms::VoiceManager>();
         voices->Initialize(4, 44100);
         const auto captured = voices->AllocateVoice(0, 60, 100);

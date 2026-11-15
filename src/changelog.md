@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-15 `fix(v3): Reset All Controllers keeps channel volume and pan` - CC121 put channel volume back to 100 and pan to the centre, so a song that sets its mix and then resets its controllers lost that mix. Volume and pan now survive it; expression still returns to full, as the MIDI recommended practice says.
+
 - 2026-11-15 `fix(v3): the Configurator saves reverb on/off, mix and room size again` - the Configurator wrote the reverb section without `enabled`, `mix` and `room_size`, so saving from it dropped them and the driver fell back to its defaults, and it only read the stage section when the config also had a reverb section. Both sections are read and written in full again.
 
 - 2026-11-07 `refactor(v3): drop code nothing uses` - removed the parts of the bundled ASIO SDK the build never compiles (sample driver, sample host, sample-format converter, COM registration glue, the old project files), `NativeRealtime.h` and `driver/Driver.h` (nothing included either), the D3D11 GPU proof spike and its CMake target, and `sf2_resample` with the `resampledData` fields only it set. `sf2_build_voice_params` keeps just its direct-offset path, the only one ever taken. The audio path is untouched.

@@ -265,9 +265,9 @@ inline void ChannelCache::SetSelectedPreset(uint8_t channel, uint16_t presetInde
 
 inline void ChannelCache::ResetControllers(uint8_t channel) {
     if (channel >= kChannelCount) return;
-    channelVolume_[channel] = 100;
+    // Volume (CC7) and pan (CC10) survive Reset All Controllers: a song that sets its mix and then
+    // resets the channel must keep that mix.
     channelExpression_[channel] = 127;
-    channelPan_[channel] = 64;
     channelPitchBend_[channel] = 8192;
     channelRpnMSB_[channel] = channelRpnLSB_[channel] = 127;
     channelBendRangeSemitones_[channel] = 2;
