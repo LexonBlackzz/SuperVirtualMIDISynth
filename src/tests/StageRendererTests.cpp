@@ -196,6 +196,34 @@ void TestTail() {
     CHECK(e == 0.0);
 }
 
+// The tail is cut into small partitions for its first samples and large ones after; the sum must be the
+// plain convolution: an impulse in comes out as the response itself, one partition later.
+void TestSplitTail() {
+    for (int partition : {256, 512}) {
+        StageRenderer r;
+        r.Prepare(kSr, partition, 1024, 4, 200);
+        const int len = 37000;
+        const std::vector<float> hl = Noise(len, 11u), hr = Noise(len, 12u);
+        auto response = std::make_shared<RoomResponse>();
+        response->source[0].active = true;
+        response->tail = MakeTailSpectra(r.Plan(), hl.data(), hr.data(), len);
+        CHECK(response->tail && response->tail->late);
+        r.Submit(response);
+        std::vector<float> feed(static_cast<size_t>(len + 2 * partition + 9000), 0.0f);
+        feed[100] = 1.0f;
+        std::vector<float> l, rr;
+        Run(r, 0, feed, 480, l, rr);
+        double worst = 0.0;
+        for (int j = 0; j < len; ++j) {
+            const size_t at = static_cast<size_t>(100 + partition + j);
+            worst = (std::max)(worst, static_cast<double>(std::fabs(l[at] - hl[static_cast<size_t>(j)])));
+            worst = (std::max)(worst, static_cast<double>(std::fabs(rr[at] - hr[static_cast<size_t>(j)])));
+        }
+        std::printf("split tail partition %d: worst %.3g\n", partition, worst);
+        CHECK(worst < 2e-4);
+    }
+}
+
 // Same scene, same bytes.
 void TestDeterministicBuild() {
     const BuildOptions opt = Quick();
@@ -328,6 +356,7 @@ int main() {
     TestDirectDelay();
     TestBlockInvariance();
     TestDoppler();
+    TestSplitTail();
     TestTail();
     TestDeterministicBuild();
     TestMirroredEars();

@@ -138,11 +138,20 @@ struct FftPlan {
 struct IrSpectra {
     int B = 0, P = 0, bins = 0;
     std::vector<float> re[2], im[2];   // [ear][partition * bins + k]
+    // The room tail is cut in two: these small partitions carry its first kTailHead samples and `late`,
+    // cut into much larger partitions, carries the rest. Large partitions cost a fraction of the
+    // multiplications per second of reverb, and the late part is too diffuse to mind the coarser timing.
+    std::shared_ptr<const IrSpectra> late;
 };
 
+constexpr int kTailHead = 8192;      // samples of tail kept in small partitions
+constexpr int kLateBlock = 4096;     // partition of the late tail
+
 inline std::shared_ptr<const IrSpectra> MakeSpectra(const FftPlan& plan, const float* left,
-                                                    const float* right, int length) {
+                                                    const float* right, int length,
+                                                    std::shared_ptr<const IrSpectra> late = nullptr) {
     auto out = std::make_shared<IrSpectra>();
+    out->late = std::move(late);
     const int B = plan.n / 2;
     out->B = B;
     out->bins = B + 1;
@@ -310,7 +319,18 @@ public:
             s.tapsSeen = 0;
             for (TapState& t : s.tap) t = TapState{};
         }
-        tail_.Prepare(plan_, tailPartitions, maxFrames);
+        // The tail: kTailHead samples in small partitions, the rest in kLateBlock partitions fed from a
+        // delayed copy of the input, so that the two parts line up (see IrSpectra::late).
+        plan2_.Init(2 * kLateBlock);
+        const int headParts = (std::max)(1, kTailHead / partition);
+        tail_.Prepare(plan_, (std::min)(tailPartitions, headParts), maxFrames);
+        tailLate_.Prepare(plan2_, (tailPartitions * partition + kLateBlock - 1) / kLateBlock + 1, maxFrames);
+        lateDelay_ = (std::max)(0, partition + headParts * partition - kLateBlock);
+        lateRing_ = 1;
+        while (lateRing_ < lateDelay_ + maxFrames + 8) lateRing_ <<= 1;
+        lateBuf_.assign(static_cast<size_t>(lateRing_), 0.0f);
+        lateW_ = static_cast<uint64_t>(lateDelay_);
+        lateIn_.assign(static_cast<size_t>(maxFrames), 0.0f);
         tailIn_.assign(static_cast<size_t>(maxFrames), 0.0f);
         zeros_.assign(static_cast<size_t>(maxFrames), 0.0f);
         scratchL_ = zeros_;
@@ -389,6 +409,14 @@ public:
             s.fresh = false;
         }
         tail_.Process(plan_, rsp.tail.get(), tailIn_.data(), frames, outL, outR);
+        const size_t lmask = static_cast<size_t>(lateRing_ - 1);
+        for (int i = 0; i < frames; ++i) {
+            lateBuf_[(lateW_ + static_cast<uint64_t>(i)) & lmask] = tailIn_[static_cast<size_t>(i)];
+            lateIn_[static_cast<size_t>(i)] =
+                lateBuf_[(lateW_ + static_cast<uint64_t>(i) - static_cast<uint64_t>(lateDelay_)) & lmask];
+        }
+        lateW_ += static_cast<uint64_t>(frames);
+        tailLate_.Process(plan2_, rsp.tail ? rsp.tail->late.get() : nullptr, lateIn_.data(), frames, outL, outR);
     }
 
 private:
@@ -524,7 +552,11 @@ private:
     float alpha_[3] = {};
     FftPlan plan_;
     SourceState src_[kMaxSources];
-    StreamConvolver tail_;
+    StreamConvolver tail_, tailLate_;
+    FftPlan plan2_;
+    int lateDelay_ = 0, lateRing_ = 1;
+    uint64_t lateW_ = 0;
+    std::vector<float> lateBuf_, lateIn_;
     std::vector<float> tailIn_, zeros_, scratchL_, scratchR_;
     std::vector<float> xe_, y_, yPrev_, work_;   // per-tap scratch: delayed signal, filtered, previous filter, history + block
     std::atomic<const RoomResponse*> current_{nullptr};

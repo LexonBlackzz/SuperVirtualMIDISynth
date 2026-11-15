@@ -90,6 +90,18 @@ inline void SynthesizeTail(const TailResult& tail, float volume, float sr,
     }
 }
 
+// Spectra of a tail response: the first kTailHead samples in the renderer's partitions, the rest in
+// kLateBlock ones (see IrSpectra::late).
+inline std::shared_ptr<const IrSpectra> MakeTailSpectra(const FftPlan& plan, const float* left,
+                                                        const float* right, int len) {
+    const int head = (std::max)(1, kTailHead / (plan.n / 2)) * (plan.n / 2);
+    if (len <= head) return MakeSpectra(plan, left, right, len);
+    FftPlan latePlan;
+    latePlan.Init(2 * kLateBlock);
+    auto late = MakeSpectra(latePlan, left + head, right + head, len - head);
+    return MakeSpectra(plan, left, right, head, std::move(late));
+}
+
 // Traces the scene and builds the shared tail. `meta` receives decay times and
 // flags. The tail is scaled so that, at the critical distance, the reverberant
 // field is as loud as the direct sound.
@@ -135,7 +147,7 @@ inline std::shared_ptr<const IrSpectra> BuildTailSpectra(const FftPlan& plan, co
         meta->rays = hist.rays;
         meta->tailSeconds = static_cast<float>(ir[0].size()) / opt.sampleRate;
     }
-    return MakeSpectra(plan, ir[0].data(), ir[1].data(), static_cast<int>(ir[0].size()));
+    return MakeTailSpectra(plan, ir[0].data(), ir[1].data(), static_cast<int>(ir[0].size()));
 }
 
 inline void BandGainWithAir(const EarlyPath& e, bool air, float out[kBands]) {
