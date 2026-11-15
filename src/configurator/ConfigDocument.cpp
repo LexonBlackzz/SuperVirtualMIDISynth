@@ -372,8 +372,6 @@ void ConfigDocument::FromJson(const json& root) {
         ReadNum(*it, "release_ms", working_.channelLimiterReleaseMs,
                 20.0f, 1000.0f);
     }
-    if (auto it = root.find("reverb"); it != root.end() && it->is_object()) {
-        ReadBool(*it, "enabled", working_.enableReverb);
     if (auto it = root.find("stage"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.stageEnabled);
         ReadBool(*it, "keep_reverb", working_.stageKeepReverb);
@@ -595,6 +593,9 @@ nlohmann::json ConfigDocument::ToJson() const {
         root["stage"]["channels"][i]["send"] = working_.stageChannelMix[i][2];
     }
 
+    root["reverb"]["enabled"] = working_.enableReverb;
+    root["reverb"]["mix"] = working_.reverbMix;
+    root["reverb"]["room_size"] = working_.reverbRoomSize;
     root["reverb"]["decay"] = working_.reverbDecay;
     root["reverb"]["damping"] = working_.reverbDamping;
     root["reverb"]["width"] = working_.reverbWidth;

@@ -10,6 +10,8 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-15 `fix(v3): the Configurator saves reverb on/off, mix and room size again` - the Configurator wrote the reverb section without `enabled`, `mix` and `room_size`, so saving from it dropped them and the driver fell back to its defaults, and it only read the stage section when the config also had a reverb section. Both sections are read and written in full again.
+
 - 2026-11-07 `refactor(v3): drop code nothing uses` - removed the parts of the bundled ASIO SDK the build never compiles (sample driver, sample host, sample-format converter, COM registration glue, the old project files), `NativeRealtime.h` and `driver/Driver.h` (nothing included either), the D3D11 GPU proof spike and its CMake target, and `sf2_resample` with the `resampledData` fields only it set. `sf2_build_voice_params` keeps just its direct-offset path, the only one ever taken. The audio path is untouched.
 
 - 2026-11-01 `feat(v3): experimental uniform half-rate engine for the offline tools` - the offline renderer (`--uniform-half-rate`) and env `SVMS_UNIFORM_HALF_RATE` run the whole voice engine at half the output rate (voice setup, envelopes, events on a 2-frame grid, an event on an odd frame fires one frame late) and a streaming 2x interpolator rebuilds the output 32 frames late before reverb and limiter. Noise Challenge 2 at 65536 voices, 40 s: 43 s -> 29 s. With a general-MIDI font (65536 voices, 2048-frame blocks, AVX2): 54 s -> 45 s, where the per-voice bus is 20% slower. Everything above about 11 kHz is gone and bright voices alias, so it is a listening experiment, not a default.
