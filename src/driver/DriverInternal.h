@@ -1177,7 +1177,12 @@ private:
     bool CreateShards();
     void StopShards();
     void KickShards(uint32_t numFrames);
-    void JoinShardsAndMix(float* left, float* right, uint32_t numFrames);
+    // With `buses` the shards' per-channel buses are added to this core's buses (the 3D stage reads
+    // those); otherwise their finished mixes are added to left/right.
+    void JoinShardsAndMix(float* left, float* right, uint32_t numFrames, bool buses = false);
+    // Master, set each block before the shards start: render into per-channel buses and leave the
+    // mix to the master, whose single 3D stage plays everything.
+    std::atomic<bool> shardBusHandoff_{false};
     void ShardThreadLoop();
     // Uploads the SoundFont to the GPU stage and sizes its buffers now, on the
     // calling thread, instead of at the first note.

@@ -136,7 +136,7 @@ void Driver::KickShards(uint32_t numFrames) {
 // Master, right after its own RenderBlock: wait for the cores and add their
 // raw mixes into the master's left/right buffers. The master then
 // interleaves and applies reverb/limiter to the sum.
-void Driver::JoinShardsAndMix(float* left, float* right, uint32_t numFrames) {
+void Driver::JoinShardsAndMix(float* left, float* right, uint32_t numFrames, bool buses) {
     HANDLE done[32];
     uint32_t count = 0u;
     for (Driver* core : shards_) done[count++] = core->shardDoneEvent_;
@@ -146,6 +146,19 @@ void Driver::JoinShardsAndMix(float* left, float* right, uint32_t numFrames) {
         return;
     }
     for (Driver* core : shards_) {
+        if (buses) {
+            for (uint32_t ch = 0u; ch < kChannelCount; ++ch) {
+                float* dl = channelBusLeftTable[ch];
+                float* dr = channelBusRightTable[ch];
+                const float* sl = core->channelBusLeftTable[ch];
+                const float* sr = core->channelBusRightTable[ch];
+                for (uint32_t i = 0u; i < numFrames; ++i) {
+                    dl[i] += sl[i];
+                    dr[i] += sr[i];
+                }
+            }
+            continue;
+        }
         const float* in = core->shardOutput_;  // interleaved L,R
         for (uint32_t i = 0u; i < numFrames; ++i) {
             left[i] += in[i * 2u];

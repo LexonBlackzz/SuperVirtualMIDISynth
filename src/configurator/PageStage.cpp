@@ -66,9 +66,13 @@ const char* const kGm[128] = {
 // it. Until then a channel is just "Channel": nothing is guessed (channel 10 is the GM drum channel).
 std::array<uint8_t, 16> g_prog = [] { std::array<uint8_t, 16> a; a.fill(255); return a; }();
 
-bool ChannelKnown(int i) { return i == 9 || g_prog[i] < 128; }
+// Speakers mode: the stage shows two speaker dots (seats 0 and 1) in place of the 16 channels.
+bool g_speakerMode = false;
+
+bool ChannelKnown(int i) { return g_speakerMode || i == 9 || g_prog[i] < 128; }
 
 const char* ChannelName(int i) {
+    if (g_speakerMode) return i == 0 ? "Left speaker" : "Right speaker";
     if (i == 9) return "Drums";
     return g_prog[i] < 128 ? kGm[g_prog[i]] : "Channel";
 }
@@ -210,6 +214,12 @@ void FitAll(ConfigValues& w) {
     w.stageListener[0] = Clamp(w.stageListener[0], 0.5f, w.stageRoom[0] - 0.5f);
     w.stageListener[1] = Clamp(w.stageListener[1], 0.5f, w.stageRoom[1] - 0.5f);
     w.stageListener[2] = Clamp(w.stageListener[2], 0.2f, w.stageRoom[2] - 0.2f);
+    for (int i = 0; i < 2; ++i) {
+        float* p = &w.stageSpeaker[static_cast<size_t>(i) * 3];
+        p[0] = Clamp(p[0], 0.3f, w.stageRoom[0] - 0.3f);
+        p[1] = Clamp(p[1], 0.3f, w.stageRoom[1] - 0.3f);
+        p[2] = Clamp(p[2], 0.2f, w.stageRoom[2] - 0.2f);
+    }
     for (auto& c : w.stageChannel) {
         c[0] = Clamp(c[0], 0.3f, w.stageRoom[0] - 0.3f);
         c[1] = Clamp(c[1], 0.3f, w.stageRoom[1] - 0.3f);
@@ -429,7 +439,7 @@ ImU32 Hsl(float hDeg, float s, float l, float a = 1.0f) {
     return IM_COL32(static_cast<int>((r + m) * 255), static_cast<int>((gg + m) * 255), static_cast<int>((b + m) * 255),
                     static_cast<int>(a * 255));
 }
-ImU32 Hue(int i, float a = 1.0f) { return Hsl(i * 360.0f / 16.0f + 20.0f, 0.72f, 0.62f, a); }
+ImU32 Hue(int i, float a = 1.0f) { if (g_speakerMode) i = i * 8 + 2; return Hsl(i * 360.0f / 16.0f + 20.0f, 0.72f, 0.62f, a); }
 ImU32 WallCol(float absorb, float a) { return Hsl(205.0f - 175.0f * (std::min)(1.0f, absorb * 1.6f), 0.55f, 0.62f, a); }
 ImU32 Rgb(const uint8_t* c, float k, float a) {
     return IM_COL32((std::min)(255, static_cast<int>(c[0] * k)), (std::min)(255, static_cast<int>(c[1] * k)),
@@ -561,7 +571,10 @@ void DrawFurn(ImDrawList* dl, const Proj& P, const ConfigValues& w, int idx) {
          sel ? ui::Tok().acc : Rgb(t.col, 1.4f, 0.8f), sel ? 2.0f * S() : 1.0f);
 }
 
-V3 ChPos(const ConfigValues& w, int i) { return {w.stageChannel[i][0], w.stageChannel[i][1], w.stageChannel[i][2]}; }
+// Where seat i stands: a channel's seat, or in speakers mode one of the two loudspeakers.
+float* ChanXYZ(ConfigValues& w, int i) { return w.stageMode == 1u ? &w.stageSpeaker[static_cast<size_t>(i) * 3] : w.stageChannel[static_cast<size_t>(i)].data(); }
+const float* ChanXYZ(const ConfigValues& w, int i) { return w.stageMode == 1u ? &w.stageSpeaker[static_cast<size_t>(i) * 3] : w.stageChannel[static_cast<size_t>(i)].data(); }
+V3 ChPos(const ConfigValues& w, int i) { const float* c = ChanXYZ(w, i); return {c[0], c[1], c[2]}; }
 V3 ListenerPos(const ConfigValues& w) { return {w.stageListener[0], w.stageListener[1], w.stageListener[2]}; }
 
 // First-order wall reflections of the selected channel, as the audio uses them.
@@ -625,7 +638,7 @@ void Dashed(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float lw, bool dashed
 // that faces the camera lies above or below the flat drawing, so that path is dashed.
 void DrawAllPaths(ImDrawList* dl, const Proj& P, const ConfigValues& w, int ch) {
     const stg::Room room = MakeRoom(w);
-    const stg::Vec3 s{w.stageChannel[ch][0], w.stageChannel[ch][1], w.stageChannel[ch][2]};
+    const stg::Vec3 s{ChanXYZ(w, ch)[0], ChanXYZ(w, ch)[1], ChanXYZ(w, ch)[2]};
     const stg::Vec3 l{w.stageListener[0], w.stageListener[1], w.stageListener[2]};
     const auto paths = stg::FindReflections(room, s, l, 3);
     const ImVec2 ps = P.F(ChPos(w, ch)), pl = P.F(ListenerPos(w));
@@ -671,7 +684,7 @@ void BuildRays(const ConfigValues& w, int ch) {
     };
     for (float v : w.stageRoom) mix(v);
     for (int i = 0; i < 6; ++i) mix(static_cast<float>(w.stageSurface[i]));
-    for (int i = 0; i < 3; ++i) mix(w.stageChannel[ch][i]);
+    for (int i = 0; i < 3; ++i) mix(ChanXYZ(w, ch)[i]);
     const stg::StageMesh* mesh = ViewMesh(w);
     if (mesh) {
         for (char c : w.stageMeshPath) mix(static_cast<float>(c));
@@ -704,7 +717,7 @@ void BuildRays(const ConfigValues& w, int ch) {
         d[0] = rr * std::cos(a); d[1] = rr * std::sin(a); d[2] = z;
     };
     for (int i = 0; i < 300; ++i) {
-        double dir[3], p[3] = {w.stageChannel[ch][0], w.stageChannel[ch][1], w.stageChannel[ch][2]};
+        double dir[3], p[3] = {ChanXYZ(w, ch)[0], ChanXYZ(w, ch)[1], ChanXYZ(w, ch)[2]};
         sphere(dir);
         double dist = 0.0, en = 1.0;
         int skip = -1;
@@ -992,7 +1005,7 @@ float* TargetXYZ(ConfigValues& w, bool& isFurn) {
         isFurn = true;
         return &w.stageFurniture[g.fsel].x;  // x, y adjacent
     }
-    return g.you ? w.stageListener.data() : w.stageChannel[g.sel].data();
+    return g.you ? w.stageListener.data() : ChanXYZ(w, g.sel);
 }
 
 void MoveTarget(ConfigValues& w, float x, float y, float z, bool setX, bool setY, bool setZ) {
@@ -1038,11 +1051,12 @@ void StageCanvas(ConfigDocument& doc) {
         const float grab = 22.0f * s;
         float best = grab;
         int hitCh = -2;  // -1 listener
-        for (int i = 0; i < 17; ++i) {
-            const V3 p = i < 16 ? ChPos(w, i) : ListenerPos(w);
+        const int seats = w.stageMode == 1u ? 2 : 16;
+        for (int i = 0; i <= seats; ++i) {
+            const V3 p = i < seats ? ChPos(w, i) : ListenerPos(w);
             const ImVec2 q = P.F(p);
             const float d = std::hypot(q.x - mouse.x, q.y - mouse.y);
-            if (d < best) { best = d; hitCh = i < 16 ? i : -1; }
+            if (d < best) { best = d; hitCh = i < seats ? i : -1; }
         }
         int hitF = -1;
         if (hitCh == -2) {
@@ -1171,7 +1185,8 @@ void StageCanvas(ConfigDocument& doc) {
     // Channels, far to near; the listener last.
     {
         std::vector<std::pair<float, int>> order;
-        for (int i = 0; i < 16; ++i) {
+        const int seats = w.stageMode == 1u ? 2 : 16;
+        for (int i = 0; i < seats; ++i) {
             float d;
             P.F(ChPos(w, i), &d);
             order.push_back({-d, i});
@@ -1179,28 +1194,29 @@ void StageCanvas(ConfigDocument& doc) {
         std::sort(order.begin(), order.end());
         for (const auto& o : order) {
             const int i = o.second;
+            const int hc = i;
             const V3 pp = ChPos(w, i);
             float kk;
             const ImVec2 q = P.F(pp, nullptr, &kk);
             const ImVec2 fl = P.F({pp.x, pp.y, 0});
-            const bool on = w.stageChannelOn[i], sel = i == g.sel && !g.you && g.fsel < 0;
+            const bool on = seats == 2 || w.stageChannelOn[i], sel = i == g.sel && !g.you && g.fsel < 0;
             const float a = on ? 1.0f : 0.35f;
             if (g.view == 2 && pp.z > 0.05f) {
-                dl->AddLine(q, fl, Hue(i, 0.28f * a), 1.0f);
-                dl->AddEllipseFilled(fl, ImVec2(5.0f * s, 2.2f * s), Hue(i, 0.35f * a), 0.0f, 12);
+                dl->AddLine(q, fl, Hue(hc, 0.28f * a), 1.0f);
+                dl->AddEllipseFilled(fl, ImVec2(5.0f * s, 2.2f * s), Hue(hc, 0.35f * a), 0.0f, 12);
             }
             const float r = g.view == 2 ? Clamp(0.85f * kk, 9.0f * s, 17.0f * s) : 9.5f * s;
             // A wide channel is a cloud rather than a point (flat views only, as in the prototype).
-            const float wd = w.stageChannelMix[i][0];
+            const float wd = seats == 2 ? 0.0f : w.stageChannelMix[i][0];
             if (g.view != 2 && wd > 0.0f)
                 dl->AddCircleFilled(q, wd / 100.0f * (std::max)(1.2f, (std::min)(w.stageRoom[0], w.stageRoom[1]) * 0.1f) * P.sc,
-                                    Hue(i, 0.09f * a));
-            if (on) Glow(dl, q, r * 1.7f, Hue(i, sel ? 0.55f : 0.28f));
-            dl->AddCircleFilled(q, r, Hue(i, a));
+                                    Hue(hc, 0.09f * a));
+            if (on) Glow(dl, q, r * 1.7f, Hue(hc, sel ? 0.55f : 0.28f));
+            dl->AddCircleFilled(q, r, Hue(hc, a));
             dl->AddCircle(q, r, IM_COL32(255, 255, 255, on ? 90 : 40), 0, 1.0f);
             if (sel) dl->AddCircle(q, r + 4.0f * s, k.acc, 0, 2.2f * s);
             char n[8];
-            std::snprintf(n, sizeof(n), "%d", i + 1);
+            if (seats == 2) std::snprintf(n, sizeof(n), "%s", i == 0 ? "L" : "R"); else std::snprintf(n, sizeof(n), "%d", i + 1);
             ui::PushNum(r > 9.0f * s ? 11.0f : 10.0f, true);
             const ImVec2 ts = ImGui::CalcTextSize(n);
             dl->AddText(ImVec2(q.x - ts.x * 0.5f, q.y - ts.y * 0.5f), IM_COL32(12, 12, 16, 255), n);
@@ -1332,6 +1348,57 @@ void ScenesCard(ConfigDocument& doc) {
     }
     ImGui::SetCursorScreenPos(o);
     ImGui::Dummy(ImVec2(avail, ch));
+    ui::EndCard();
+}
+
+// What plays through the stage: the 16 channels, each on its own seat, or the finished mix through
+// two loudspeakers placed around the listener.
+void SourceCard(ConfigDocument& doc) {
+    ConfigValues& w = doc.Working();
+    const float s = S();
+    ui::BeginCard("##stsource", "What plays in the room", "The 16 channels each have their own seat, or the whole mix plays through two speakers you drag on the stage.");
+    {
+        static const char* const kSrc[2] = {"16 channels", "Speakers"};
+        ui::BeginRow("stageSource", "Source", "Speakers keep the sound of the song as one stereo mix and need less processing than 16 separate seats.", ui::SegmentedSize(kSrc, 2));
+        int mode = static_cast<int>(w.stageMode);
+        if (ui::Segmented("##stsrc", &mode, kSrc, 2)) {
+            w.stageMode = static_cast<uint32_t>(mode);
+            doc.MarkDirty();
+        }
+        ui::EndRow();
+    }
+    if (w.stageMode == 1u) {
+        auto slider = [&](const char* id, const char* name, const char* desc, float* v, float lo, float hi, const char* fmt) {
+            ui::BeginRow(id, name, desc, ImVec2(360.0f * s, 28.0f * s));
+            if (ui::RangeSlider(id, v, lo, hi, 290.0f * s)) doc.MarkDirty();
+            ImGui::SameLine(0, 10.0f * s);
+            char b[32];
+            std::snprintf(b, sizeof(b), fmt, *v);
+            ui::PushNum(12.0f);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(b);
+            ui::PopFont();
+            ui::EndRow();
+        };
+        slider("##stsplevel", "Speaker level", "Louder or quieter against the room.", &w.stageSpeaker[6], -24.0f, 12.0f, "%.1f dB");
+        slider("##stspsend", "Room send", "How much of the sound rings in the room. 35 is neutral.", &w.stageSpeaker[7], 0.0f, 100.0f, "%.0f");
+        ui::BeginRow("stageSpPlace", "Speaker positions", "Drag the two speakers on the stage. This puts them back in the usual stereo triangle in front of you, 2.5 m away.", ui::ButtonSize("Reset positions"));
+        if (ui::Button("Reset positions")) {
+            const float a = w.stageYaw * kD2R, ca = std::cos(a), sa = std::sin(a);
+            for (int side = 0; side < 2; ++side) {
+                const float phi = (side == 0 ? -30.0f : 30.0f) * kD2R, right = 2.5f * std::sin(phi), fwd = 2.5f * std::cos(phi);
+                float* p = &w.stageSpeaker[static_cast<size_t>(side) * 3];
+                p[0] = Clamp(w.stageListener[0] + right * ca + fwd * sa, 0.3f, w.stageRoom[0] - 0.3f);
+                p[1] = Clamp(w.stageListener[1] - right * sa + fwd * ca, 0.3f, w.stageRoom[1] - 0.3f);
+                p[2] = Clamp(1.2f, 0.2f, w.stageRoom[2] - 0.2f);
+            }
+            doc.MarkDirty();
+        }
+        ui::EndRow();
+        ui::BeginRow("stageSpDir", "Speaker directivity", "Speakers send highs forward and are duller off to the side or behind, like real ones.", ImVec2(46.0f * s, 28.0f * s));
+        if (ui::Toggle("##stspdir", &w.stageSpeakerDirectivity)) doc.MarkDirty();
+        ui::EndRow();
+    }
     ui::EndCard();
 }
 
@@ -1734,8 +1801,8 @@ void AdvancedCards(ConfigDocument& doc) {
     const ui::Tokens& k = ui::Tok();
     const float s = S();
 
-    // Selected channel.
-    {
+    // Selected channel (the speakers are placed by dragging them on the stage).
+    if (w.stageMode != 1u) {
         const bool chan = !g.you && g.fsel < 0;
         char title[48];
         if (chan && !ChannelKnown(g.sel)) std::snprintf(title, sizeof(title), "Channel %d", g.sel + 1);
@@ -1898,13 +1965,15 @@ void DrawStagePage(ConfigDocument& doc) {
         }
     }
     PushLiveStage(w);
-    g.sel = (std::max)(0, (std::min)(15, g.sel));
+    g_speakerMode = w.stageMode == 1u;
+    g.sel = (std::max)(0, (std::min)(g_speakerMode ? 1 : 15, g.sel));
     if (g.fsel >= static_cast<int>(w.stageFurniture.size())) g.fsel = -1;
     HeaderBar(doc);
     ImGui::Dummy(ImVec2(0, 6.0f * S()));
     ScenesCard(doc);
     StageCard(doc);
-    ChannelsCard(doc);
+    SourceCard(doc);
+    if (!g_speakerMode) ChannelsCard(doc);
     QuickCard(doc);
     RoomAndFurniture(doc);
     ListenCard(doc);

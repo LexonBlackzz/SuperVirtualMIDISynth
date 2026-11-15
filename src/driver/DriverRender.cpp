@@ -189,8 +189,15 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // renders into the 16 channel buses, which the limiter then limits per
     // channel and sums into the master mix.  Nothing upstream of the mix
     // changes; disabled = the direct master-mix path, bit-identical.
+    // A shard whose master plays the 3D stage renders into buses and leaves the limiter and the
+    // mix to the master.
+    const bool shardHandoff =
+        self->shardMaster_ != nullptr &&
+        self->shardMaster_->shardBusHandoff_.load(std::memory_order_acquire) &&
+        self->channelBusPlanes != nullptr &&
+        self->channelBusCapacity >= numFrames;
     const bool channelLimiterActive =
-        self->channelLimiter.enabled &&
+        self->channelLimiter.enabled && !shardHandoff &&
         self->channelBusPlanes != nullptr &&
         self->channelBusCapacity >= numFrames;
     // The 3D stage reads the buses too, once its response is built.
@@ -199,7 +206,15 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
         !self->stageSuspended_.load(std::memory_order_relaxed) &&
         self->channelBusPlanes != nullptr &&
         self->channelBusCapacity >= numFrames;
-    const bool busMode = channelLimiterActive || stageActive;
+    // Speakers mode plays the finished mix, so it needs no per-channel buses.
+    const bool stageBuses = stageActive && self->stage_->UsesBuses();
+    const bool busMode = channelLimiterActive || stageBuses || shardHandoff;
+    // Shards read this at the start of their block (KickShards, below).
+    if (self->shardCount_ > 1u && !self->shardMaster_)
+        self->shardBusHandoff_.store(stageBuses, std::memory_order_release);
+    // With the stage on, the shards' sound joins before it so the single stage plays all of it.
+    const bool joinBeforeStage = stageActive && self->shardCount_ > 1u && !self->shardMaster_;
+    bool shardsJoined = false;
     if (busMode) {
         ChannelLimiterState::ClearBuses(self->channelBusLeftTable,
                                         self->channelBusRightTable,
@@ -676,17 +691,24 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
                             busMode
                                 ? self->channelBusRightTable : nullptr);
     }
+    if (joinBeforeStage) {
+        self->JoinShardsAndMix(leftBuf, rightBuf, numFrames, stageBuses);
+        shardsJoined = true;
+    }
     if (channelLimiterActive) {
         self->channelLimiter.ProcessAndSum(
             self->channelBusLeftTable, self->channelBusRightTable,
-            leftBuf, rightBuf, numFrames, stageActive);
+            leftBuf, rightBuf, numFrames, stageBuses);
     }
-    if (stageActive) {
+    if (stageBuses) {
         // Limiter (if on) -> stage -> master mix; the stage replaces the dry sum.
         self->stage_->Process(self->channelBusLeftTable, self->channelBusRightTable,
                               numFrames, leftBuf, rightBuf);
+    } else if (stageActive) {
+        // Speakers: the finished mix is what the room's loudspeakers play.
+        self->stage_->ProcessMix(leftBuf, rightBuf, numFrames);
     }
-    if (self->shardCount_ > 1u && !self->shardMaster_)
+    if (self->shardCount_ > 1u && !self->shardMaster_ && !shardsJoined)
         self->JoinShardsAndMix(leftBuf, rightBuf, numFrames);
     const uint64_t profileRenderEnd = profileCallback ? __rdtsc() : 0u;
     LARGE_INTEGER traceRenderEndQPC{};

@@ -293,6 +293,24 @@ struct OmniSource final : SourceModel {
     float Gain(const Vec3&, int) const noexcept override { return 1.0f; }
 };
 
+// A loudspeaker aimed along `axis`. Low frequencies leave a box in every direction; as the wavelength
+// gets shorter than the cabinet and the driver, the radiation narrows toward the axis and the back
+// falls away. The amplitude pattern per band is floor + (1 - floor) * ((1 + cos) / 2)^n, so the
+// on-axis level is untouched and a listener off to the side hears duller sound. The exponents and
+// floors are typical of a two-way studio monitor (about -6 dB at 90 degrees and -20 dB behind in
+// the top band); they are starting values for listening, not a measured speaker.
+struct SpeakerSource final : SourceModel {
+    Vec3 axis{0.0f, 1.0f, 0.0f};   // unit vector
+    float Gain(const Vec3& dir, int band) const noexcept override {
+        static const float kExponent[kBands] = {0.0f, 0.35f, 1.1f, 2.2f};
+        static const float kFloor[kBands] = {1.0f, 0.5f, 0.2f, 0.1f};
+        const int b = band < 0 ? 0 : band >= kBands ? kBands - 1 : band;
+        const float c = dir.x * axis.x + dir.y * axis.y + dir.z * axis.z;
+        const float lobe = 0.5f + 0.5f * (c < -1.0f ? -1.0f : c > 1.0f ? 1.0f : c);
+        return kFloor[b] + (1.0f - kFloor[b]) * std::pow(lobe, kExponent[b]);
+    }
+};
+
 inline float EmissionGain(const SourceModel* model, const Vec3& from, const Vec3& toward,
                           int band) noexcept {
     if (!model) return 1.0f;

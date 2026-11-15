@@ -17,6 +17,15 @@ struct StageConfig {
         bool rotated = false;
     };
 
+    // What feeds the stage: 0 = the 16 MIDI channels, each seated on its own; 1 = the finished stereo
+    // mix played through two loudspeakers in the room (no per-channel buses, so synthesis is unchanged).
+    uint8_t mode = 0;
+    // Speakers mode: the left and right speaker stand wherever they are put in the room and face the listener.
+    bool speakerDirectivity = true;   // loudspeaker radiation pattern instead of an omnidirectional point
+    float speaker[2][3] = {{10.75f, 26.17f, 1.2f}, {13.25f, 26.17f, 1.2f}};
+    float speakerLevelDb = 0.0f;
+    float speakerSend = 35.0f;        // share that rings in the room, like channelSend
+
     bool enabled = false;
     bool keepReverb = false;     // run the driver reverb after the stage too
     bool airAbsorption = true;

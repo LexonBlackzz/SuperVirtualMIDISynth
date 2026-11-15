@@ -633,7 +633,11 @@ json MakeStageJson(const StageConfig& s) {
     for (uint32_t i = 0; i < s.furnitureCount; ++i)
         furniture.push_back({{"kind", s.furniture[i].kind}, {"x", s.furniture[i].x},
                              {"y", s.furniture[i].y}, {"rotated", s.furniture[i].rotated}});
-    return {{"enabled", s.enabled}, {"keep_reverb", s.keepReverb},
+    return {{"mode", s.mode == 1u ? "speakers" : "channels"},
+            {"speakers", {{"directivity", s.speakerDirectivity}, {"left", {{"x", s.speaker[0][0]}, {"y", s.speaker[0][1]}, {"z", s.speaker[0][2]}}},
+                          {"right", {{"x", s.speaker[1][0]}, {"y", s.speaker[1][1]}, {"z", s.speaker[1][2]}}},
+                          {"level_db", s.speakerLevelDb}, {"send", s.speakerSend}}},
+            {"enabled", s.enabled}, {"keep_reverb", s.keepReverb},
             {"air_absorption", s.airAbsorption}, {"ear_model", s.earModel},
             {"rays", s.rays}, {"tail_trim", s.tailTrim},
             {"room", {{"width", s.roomWidth}, {"depth", s.roomDepth},
@@ -646,6 +650,24 @@ json MakeStageJson(const StageConfig& s) {
 }
 
 void ApplyStageJson(const json& obj, StageConfig& s, std::string& warning) {
+    if (auto it = obj.find("mode"); it != obj.end()) {
+        if (it->is_string() && (it->get<std::string>() == "speakers" || it->get<std::string>() == "channels"))
+            s.mode = it->get<std::string>() == "speakers" ? 1u : 0u;
+        else AppendWarning(warning, "stage.mode");
+    }
+    if (auto it = obj.find("speakers"); it != obj.end() && it->is_object()) {
+        if (!ReadBool(*it, "directivity", s.speakerDirectivity)) AppendWarning(warning, "stage.speakers.directivity");
+        static const char* const kSide[2] = {"left", "right"};
+        for (int side = 0; side < 2; ++side) {
+            auto p = it->find(kSide[side]);
+            if (p == it->end() || !p->is_object()) continue;
+            if (!ReadValue(*p, "x", s.speaker[side][0], -50.0f, 250.0f)) AppendWarning(warning, "stage.speakers.x");
+            if (!ReadValue(*p, "y", s.speaker[side][1], -50.0f, 250.0f)) AppendWarning(warning, "stage.speakers.y");
+            if (!ReadValue(*p, "z", s.speaker[side][2], 0.0f, 100.0f)) AppendWarning(warning, "stage.speakers.z");
+        }
+        if (!ReadValue(*it, "level_db", s.speakerLevelDb, -24.0f, 12.0f)) AppendWarning(warning, "stage.speakers.level_db");
+        if (!ReadValue(*it, "send", s.speakerSend, 0.0f, 100.0f)) AppendWarning(warning, "stage.speakers.send");
+    }
     if (!ReadBool(obj, "enabled", s.enabled)) AppendWarning(warning, "stage.enabled");
     if (!ReadBool(obj, "keep_reverb", s.keepReverb)) AppendWarning(warning, "stage.keep_reverb");
     if (!ReadBool(obj, "air_absorption", s.airAbsorption)) AppendWarning(warning, "stage.air_absorption");

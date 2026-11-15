@@ -374,6 +374,20 @@ void ConfigDocument::FromJson(const json& root) {
     }
     if (auto it = root.find("stage"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.stageEnabled);
+        if (auto m = it->find("mode"); m != it->end() && m->is_string())
+            working_.stageMode = m->get<std::string>() == "speakers" ? 1u : 0u;
+        if (auto sp = it->find("speakers"); sp != it->end() && sp->is_object()) {
+            ReadBool(*sp, "directivity", working_.stageSpeakerDirectivity);
+            static const char* const kSide[2] = {"left", "right"};
+            for (int side = 0; side < 2; ++side)
+                if (auto p = sp->find(kSide[side]); p != sp->end() && p->is_object()) {
+                    ReadNum(*p, "x", working_.stageSpeaker[side * 3], -50.0f, 250.0f);
+                    ReadNum(*p, "y", working_.stageSpeaker[side * 3 + 1], -50.0f, 250.0f);
+                    ReadNum(*p, "z", working_.stageSpeaker[side * 3 + 2], 0.0f, 100.0f);
+                }
+            ReadNum(*sp, "level_db", working_.stageSpeaker[6], -24.0f, 12.0f);
+            ReadNum(*sp, "send", working_.stageSpeaker[7], 0.0f, 100.0f);
+        }
         ReadBool(*it, "keep_reverb", working_.stageKeepReverb);
         ReadNum(*it, "rays", working_.stageRays, 8000u, 400000u);
         ReadNum(*it, "tail_trim", working_.stageTailTrim, 0.0f, 4.0f);
@@ -562,6 +576,16 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["channel_limiter"]["release_ms"] = working_.channelLimiterReleaseMs;
 
     root["stage"]["enabled"] = working_.stageEnabled;
+    root["stage"]["mode"] = working_.stageMode == 1u ? "speakers" : "channels";
+    root["stage"]["speakers"]["directivity"] = working_.stageSpeakerDirectivity;
+    for (int side = 0; side < 2; ++side) {
+        auto& p = root["stage"]["speakers"][side == 0 ? "left" : "right"];
+        p["x"] = working_.stageSpeaker[side * 3];
+        p["y"] = working_.stageSpeaker[side * 3 + 1];
+        p["z"] = working_.stageSpeaker[side * 3 + 2];
+    }
+    root["stage"]["speakers"]["level_db"] = working_.stageSpeaker[6];
+    root["stage"]["speakers"]["send"] = working_.stageSpeaker[7];
     root["stage"]["keep_reverb"] = working_.stageKeepReverb;
     root["stage"]["rays"] = working_.stageRays;
     root["stage"]["tail_trim"] = working_.stageTailTrim;

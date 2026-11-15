@@ -21,6 +21,10 @@ struct StageScene {
     float meshVolume = 0.0f;
     float sourceLevel[kMaxSources] = {};   // linear trim on top of the channel volume
     float sourceSend[kMaxSources] = {};    // share of the source that feeds the tail, 1 = neutral
+    // A source may radiate like a loudspeaker aimed along `aim` (a unit vector); otherwise it is omnidirectional.
+    // The tail, which is diffuse, does not follow the pattern.
+    bool sourceDirectional[kMaxSources] = {};
+    Vec3 sourceAim[kMaxSources];
     StageScene() {
         for (int i = 0; i < kMaxSources; ++i) sourceLevel[i] = sourceSend[i] = 1.0f;
     }
@@ -37,7 +41,7 @@ struct BuildOptions {
     bool buildEarly = true;       // false leaves the static early response empty for the caller to fill
     float earlySeconds = 0.42f;
     float tailTrim = 1.0f;        // tail level against the critical-distance balance
-    float roomSend = 0.07f;       // share of each source that feeds the tail (0.35 was the prototype's default and sounded too wet)
+    float roomSend = 0.2f;        // share of each source that feeds the tail (1 puts the room at the physical balance, which is very wet for music; 0.07 was inaudible, about -17 dB under the direct sound at 6 m)
     uint32_t seed = 4242;
     const std::atomic<bool>* cancel = nullptr;   // set to stop a long trace early
 };
@@ -175,12 +179,15 @@ inline std::shared_ptr<RoomResponse> BuildPaths(const StageScene& scene, const S
         s.level = scene.sourceLevel[i];
         s.send = scene.sourceSend[i];
         const Vec3& pos = scene.source[i];
-        const DirectPath d = SolveDirect(scene.room, pos, scene.listener, scene.yawDegrees, opt.air, false);
+        SpeakerSource speaker;
+        speaker.axis = scene.sourceAim[i];
+        const SourceModel* model = scene.sourceDirectional[i] ? &speaker : nullptr;
+        const DirectPath d = SolveDirect(scene.room, pos, scene.listener, scene.yawDegrees, opt.air, false, model);
         s.direct.delaySeconds = d.delaySeconds;
         spatial.DirectFilters(RelativeTo(pos, scene.listener, scene.yawDegrees), d.gain, s.direct.ears, s.fir);
 
         std::vector<EarlyPath> all;
-        if (!scene.mesh) all = FindReflections(scene.room, pos, scene.listener, opt.order);
+        if (!scene.mesh) all = FindReflections(scene.room, pos, scene.listener, opt.order, model);
         std::vector<EarlyPath> live, rest;
         for (const EarlyPath& e : all)
             (!e.furniture && e.order <= 2 ? live : rest).push_back(e);

@@ -73,6 +73,47 @@ void TestEngine() {
     engine.Stop();
 }
 
+// Speakers mode plays the finished stereo mix: it needs no buses, a click on one side comes out of both
+// ears, silence stays silent, and the two speakers' settings survive the wire.
+void TestSpeakers() {
+    StageConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = 1u;
+    cfg.rays = 8000u;
+    cfg.speaker[0][0] = 9.5f;
+    cfg.speaker[1][2] = 2.0f;
+    cfg.speakerLevelDb = -3.5f;
+    cfg.speakerDirectivity = false;
+    {
+        StageConfig b;
+        char text[348] = {};
+        CHECK(EncodeStagePart(cfg, kStageWireSpeakers, text, sizeof(text)));
+        CHECK(DecodeStagePart(b, kStageWireSpeakers, text));
+        CHECK(b.mode == 1u && !b.speakerDirectivity && std::fabs(b.speaker[0][0] - 9.5f) < 1e-2f);
+        CHECK(std::fabs(b.speaker[1][2] - 2.0f) < 1e-2f && std::fabs(b.speakerLevelDb + 3.5f) < 1e-2f);
+    }
+    StageEngine engine;
+    const uint32_t frames = 1024;
+    CHECK(engine.Start(cfg, 48000u, frames));
+    CHECK(!engine.UsesBuses());
+    std::vector<float> l(frames, 0.0f), r(frames, 0.0f);
+    if (!engine.Ready()) CHECK(!engine.ProcessMix(l.data(), r.data(), frames));
+    CHECK(WaitReady(engine, 60));
+    double silent = 0.0, left = 0.0;
+    for (int block = 0; block < 12; ++block) {
+        std::fill(l.begin(), l.end(), 0.0f);
+        std::fill(r.begin(), r.end(), 0.0f);
+        if (block == 6) l[0] = 1.0f;   // a click in the left channel only
+        CHECK(engine.ProcessMix(l.data(), r.data(), frames));
+        for (uint32_t i = 0; i < frames; ++i) {
+            CHECK(std::isfinite(l[i]) && std::isfinite(r[i]));
+            (block < 6 ? silent : left) += static_cast<double>(l[i]) * l[i] + static_cast<double>(r[i]) * r[i];
+        }
+    }
+    CHECK(silent == 0.0 && left > 0.0);
+    engine.Stop();
+}
+
 // Energy of eight blocks that start with an impulse on channel 0.
 double Pulse(StageEngine& engine, uint32_t frames) {
     std::vector<float> bus[16][2];
@@ -302,6 +343,7 @@ int main() {
     TestRoomScales();
     TestEngine();
     TestWire();
+    TestSpeakers();
     TestLiveUpdate();
     TestChannelMix();
     TestMesh();

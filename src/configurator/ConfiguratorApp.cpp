@@ -1178,6 +1178,11 @@ void ConfiguratorApp::PollRuntimeLink() {
 static StageConfig StageFromValues(const ConfigValues& w) {
     StageConfig s;
     s.enabled = w.stageEnabled;
+    s.mode = static_cast<uint8_t>(w.stageMode == 1u ? 1u : 0u);
+    s.speakerDirectivity = w.stageSpeakerDirectivity;
+    for (int i = 0; i < 6; ++i) s.speaker[i / 3][i % 3] = w.stageSpeaker[static_cast<size_t>(i)];
+    s.speakerLevelDb = w.stageSpeaker[6];
+    s.speakerSend = w.stageSpeaker[7];
     s.keepReverb = w.stageKeepReverb;
     s.airAbsorption = w.stageAir;
     s.earModel = w.stageEar;
@@ -1235,6 +1240,12 @@ void ConfiguratorApp::SetLiveStage(const ConfigValues& values) {
         }
         parts.emplace_back(text);
         ids.push_back(kStageWireMesh);
+    }
+    {
+        char text[348] = {};
+        EncodeStagePart(sc, kStageWireSpeakers, text, sizeof(text));
+        parts.emplace_back(text);
+        ids.push_back(kStageWireSpeakers);
     }
     if (parts == stageParts_) return;
     stagePartIds_ = std::move(ids);

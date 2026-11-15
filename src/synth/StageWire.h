@@ -15,6 +15,7 @@ namespace svms {
 inline constexpr uint32_t kStageWireChannelParts = 2u;
 inline constexpr uint32_t kStageWireFurnitureBase = 3u;
 inline constexpr uint32_t kStageWireMesh = 0x80u;   // the imported model: up axis, scale, materials, path
+inline constexpr uint32_t kStageWireSpeakers = 0x81u;   // speakers mode: source, pattern, placement, level
 inline constexpr uint32_t kStageWireCommit = 0x100u;
 
 inline uint32_t StageWirePartCount(const StageConfig& s) {
@@ -30,6 +31,12 @@ inline bool EncodeStagePart(const StageConfig& s, uint32_t part, char* out, size
         put("%d;%.4f;", s.meshUpY ? 1 : 0, s.meshScale);
         for (int i = 0; i < 24; ++i) put("%d,", s.meshMaterial[i]);
         put(";%s", s.meshPath.c_str());
+        return n > 0 && static_cast<size_t>(n) < cap;
+    }
+    if (part == kStageWireSpeakers) {
+        put("%d;%d;%.3f,%.3f,%.3f;%.3f,%.3f,%.3f;%.2f;%.1f", s.mode, s.speakerDirectivity ? 1 : 0,
+            s.speaker[0][0], s.speaker[0][1], s.speaker[0][2], s.speaker[1][0], s.speaker[1][1], s.speaker[1][2],
+            s.speakerLevelDb, s.speakerSend);
         return n > 0 && static_cast<size_t>(n) < cap;
     }
     if (part == 0u) {
@@ -69,6 +76,19 @@ inline bool DecodeStagePart(StageConfig& s, uint32_t part, const char* text) {
         s.meshUpY = up != 0;
         s.meshScale = scale < 0.001f ? 0.001f : scale > 1000.0f ? 1000.0f : scale;
         s.meshPath = p + 1;
+        return true;
+    }
+    if (part == kStageWireSpeakers) {
+        int mode, dir;
+        float p[6], db, send;
+        if (std::sscanf(text, "%d;%d;%f,%f,%f;%f,%f,%f;%f;%f", &mode, &dir, &p[0], &p[1], &p[2], &p[3], &p[4],
+                        &p[5], &db, &send) != 10)
+            return false;
+        s.mode = mode == 1 ? 1u : 0u;
+        s.speakerDirectivity = dir != 0;
+        for (int i = 0; i < 6; ++i) s.speaker[i / 3][i % 3] = p[i];
+        s.speakerLevelDb = db < -24.0f ? -24.0f : db > 12.0f ? 12.0f : db;
+        s.speakerSend = send < 0.0f ? 0.0f : send > 100.0f ? 100.0f : send;
         return true;
     }
     if (part == 0u) {

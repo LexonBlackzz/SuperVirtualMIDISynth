@@ -62,6 +62,11 @@ struct ConfigValues {
 
     // 3D stage (applied at engine start; surfaces and furniture stay in the file).
     bool stageEnabled = false;
+    // 0 = the 16 channels, 1 = the finished mix through two speakers. [0..2] is the left speaker's x, y, z in the
+    // room, [3..5] the right one's; [6] is a level trim in dB and [7] the room send in percent (35 neutral).
+    uint32_t stageMode = 0u;
+    bool stageSpeakerDirectivity = true;
+    std::array<float, 8> stageSpeaker = {10.75f, 26.17f, 1.2f, 13.25f, 26.17f, 1.2f, 0.0f, 35.0f};
     bool stageKeepReverb = false;
     uint32_t stageRays = 40000u;
     float stageTailTrim = 1.0f;

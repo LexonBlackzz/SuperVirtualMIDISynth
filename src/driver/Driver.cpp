@@ -513,7 +513,9 @@ bool Driver::Initialize() {
         LOG("FAILED: Could not allocate per-channel limiter buses");
         return false;
     }
-    StartStage(cfg.stage);
+    // One stage on the master plays the sum of every shard; a shard with its own copy would keep the
+    // startup settings and never see a live change.
+    if (!shard) StartStage(cfg.stage);
 
     uint32_t renderThreads = cfg.renderThreads;
     if (renderThreads == 0u)

@@ -37,6 +37,7 @@ public:
         pending_ = cfg;
         keepReverb_.store(cfg.keepReverb, std::memory_order_relaxed);
         enabled_.store(cfg.enabled, std::memory_order_relaxed);
+        mode_.store(cfg.mode, std::memory_order_relaxed);
         mask_.store(MaskOf(cfg), std::memory_order_relaxed);
         sr_ = static_cast<float>(sampleRate);
         stage::BuildOptions opt = Options(cfg, nullptr);
@@ -62,6 +63,7 @@ public:
             pending_ = cfg;
         }
         mask_.store(MaskOf(cfg), std::memory_order_relaxed);
+        mode_.store(cfg.mode, std::memory_order_relaxed);
         enabled_.store(cfg.enabled, std::memory_order_relaxed);
         if (cfg.enabled) {
             cancel_.store(true, std::memory_order_relaxed);
@@ -81,6 +83,24 @@ public:
         return ready_.load(std::memory_order_acquire) && enabled_.load(std::memory_order_relaxed);
     }
     bool KeepReverb() const noexcept { return keepReverb_.load(std::memory_order_relaxed); }
+    // True when the stage wants the 16 per-channel buses; false when it plays the finished mix through speakers.
+    bool UsesBuses() const noexcept { return mode_.load(std::memory_order_relaxed) == 0u; }
+
+    // Audio thread, speakers mode. `left/right` hold the finished mix and are replaced by the room's
+    // output (the two speakers are the first two sources). Returns false when the stage is not ready,
+    // in which case the mix is left alone.
+    bool ProcessMix(float* left, float* right, uint32_t frames) noexcept {
+        if (!Ready() || frames > maxFrames_ || !renderer_) return false;
+        const float* in[stage::kMaxSources] = {};
+        std::memcpy(mono_[0].data(), left, frames * sizeof(float));
+        std::memcpy(mono_[1].data(), right, frames * sizeof(float));
+        in[0] = mono_[0].data();
+        in[1] = mono_[1].data();
+        std::memset(left, 0, frames * sizeof(float));
+        std::memset(right, 0, frames * sizeof(float));
+        renderer_->Process(in, stage::kMaxSources, static_cast<int>(frames), left, right);
+        return true;
+    }
 
     // Audio thread. `busL/busR` are the (limited) per-channel buses; the stage
     // output is added to outL/outR. Returns false when the stage is not ready,
@@ -104,6 +124,7 @@ public:
 
 private:
     static uint32_t MaskOf(const StageConfig& c) {
+        if (c.mode == 1u) return 3u;   // the two speakers
         uint32_t m = 0;
         for (int i = 0; i < stage::kMaxSources; ++i)
             if (c.channelOn[i]) m |= 1u << i;
@@ -112,7 +133,7 @@ private:
 
     // What changes the tail. Positions, the listener and the mute mask only move paths.
     static bool SameRoom(const StageConfig& a, const StageConfig& b) {
-        if (a.roomWidth != b.roomWidth || a.roomDepth != b.roomDepth || a.roomHeight != b.roomHeight ||
+        if (a.mode != b.mode || a.roomWidth != b.roomWidth || a.roomDepth != b.roomDepth || a.roomHeight != b.roomHeight ||
             a.rays != b.rays || a.airAbsorption != b.airAbsorption || a.earModel != b.earModel ||
             a.tailTrim != b.tailTrim || a.furnitureCount != b.furnitureCount || a.meshPath != b.meshPath ||
             a.meshUpY != b.meshUpY || a.meshScale != b.meshScale)
@@ -167,6 +188,21 @@ private:
         }
         s.listener = {cfg_.listener[0], cfg_.listener[1], cfg_.listener[2]};
         s.yawDegrees = cfg_.listenerYaw;
+        if (cfg_.mode == 1u) {
+            // Two loudspeakers wherever they stand, aimed at the listener.
+            for (int side = 0; side < 2; ++side) {
+                stage::Vec3 p{cfg_.speaker[side][0], cfg_.speaker[side][1], cfg_.speaker[side][2]};
+                s.source[side] = p;
+                s.sourceOn[side] = true;
+                s.sourceLevel[side] = std::pow(10.0f, cfg_.speakerLevelDb / 20.0f);
+                s.sourceSend[side] = cfg_.speakerSend / 35.0f;
+                s.sourceDirectional[side] = cfg_.speakerDirectivity;
+                const float dx = cfg_.listener[0] - p.x, dy = cfg_.listener[1] - p.y, dz = cfg_.listener[2] - p.z;
+                const float len = (std::max)(1e-3f, std::sqrt(dx * dx + dy * dy + dz * dz));
+                s.sourceAim[side] = {dx / len, dy / len, dz / len};
+            }
+            return s;
+        }
         for (int c = 0; c < stage::kMaxSources; ++c) {
             s.source[c] = {cfg_.channel[c][0], cfg_.channel[c][1], cfg_.channel[c][2]};
             s.sourceOn[c] = cfg_.channelOn[c];
@@ -232,6 +268,7 @@ private:
     std::mutex lock_;
     std::atomic<bool> dirty_{false}, stop_{false}, enabled_{false}, keepReverb_{false};
     std::atomic<uint32_t> mask_{0};
+    std::atomic<uint8_t> mode_{0};
     float sr_ = 48000.0f;
     uint32_t maxFrames_ = 0;
     std::unique_ptr<stage::StageRenderer> renderer_;

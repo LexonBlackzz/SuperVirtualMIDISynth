@@ -224,6 +224,35 @@ void TestSplitTail() {
     }
 }
 
+// A loudspeaker keeps its level on axis and low frequencies everywhere; highs fall away off axis, more so
+// behind it. A source without a pattern is untouched.
+void TestSpeakerPattern() {
+    SpeakerSource sp;
+    sp.axis = {0.0f, 1.0f, 0.0f};
+    const Vec3 onAxis{0.0f, 1.0f, 0.0f}, side{1.0f, 0.0f, 0.0f}, back{0.0f, -1.0f, 0.0f};
+    for (int b = 0; b < kBands; ++b) CHECK(std::fabs(sp.Gain(onAxis, b) - 1.0f) < 1e-6f);
+    CHECK(std::fabs(sp.Gain(back, 0) - 1.0f) < 1e-6f);                    // lows go everywhere
+    for (int b = 1; b < kBands; ++b) CHECK(sp.Gain(side, b) < sp.Gain(onAxis, b));
+    for (int b = 1; b < kBands; ++b) CHECK(sp.Gain(back, b) < sp.Gain(side, b));
+    CHECK(sp.Gain(side, 3) < sp.Gain(side, 1));                          // the narrower the higher
+
+    // The scene builder applies it: the same speaker turned away is quieter in the highs.
+    const BuildOptions opt = Quick();
+    CpuTracer tracer;
+    EarModelSpatializer ear;
+    StageRenderer probe;
+    probe.Prepare(kSr, opt.partition, 1024, 20, 20);
+    float high[2] = {};
+    for (int turned = 0; turned < 2; ++turned) {
+        StageScene scene = OneSource(OpenField(), Vec3{12.0f, 16.0f, 1.2f}, Vec3{12.0f, 10.0f, 1.2f});
+        scene.sourceDirectional[0] = true;
+        scene.sourceAim[0] = turned ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{0.0f, -1.0f, 0.0f};   // at the listener / away
+        const auto r = BuildRoomResponse(scene, ear, tracer, opt, probe.Plan(), 1);
+        high[turned] = r->source[0].direct.ears.band[0][3];
+    }
+    CHECK(high[1] < 0.5f * high[0]);
+}
+
 // Same scene, same bytes.
 void TestDeterministicBuild() {
     const BuildOptions opt = Quick();
@@ -356,6 +385,7 @@ int main() {
     TestDirectDelay();
     TestBlockInvariance();
     TestDoppler();
+    TestSpeakerPattern();
     TestSplitTail();
     TestTail();
     TestDeterministicBuild();
