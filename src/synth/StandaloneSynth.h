@@ -55,6 +55,12 @@ struct StandaloneSynthConfig {
     uint32_t maxVoices = 4096;
     uint32_t renderThreads = 1;
     uint32_t maxBlockFrames = 2048;
+    // Experimental: the whole voice engine runs at half the output rate (voice
+    // setup, envelopes, events on a 2-frame grid) and the mixed block is
+    // upsampled 2x before reverb and limiter. Roughly halves the render cost;
+    // content above ~0.4 of the engine Nyquist is lost, and the output lags by
+    // 32 frames.  Env SVMS_UNIFORM_HALF_RATE=1 sets it for offline tools.
+    bool uniformHalfRate = false;
     float masterVolume = 1.0f;
     bool limiterEnabled = true;
     LimiterAlgorithm limiterAlgorithm = LimiterAlgorithm::Classic;
@@ -91,6 +97,9 @@ public:
     bool Initialize(const StandaloneSynthConfig& config, std::string& error) {
         tuningEdo_ = config.tuningEdo;
         rate_ = config.sampleRate;
+        uniformHalf_ = config.uniformHalfRate ||
+                       std::getenv("SVMS_UNIFORM_HALF_RATE") != nullptr;
+        engineRate_ = uniformHalf_ ? (rate_ + 1u) / 2u : rate_;
         maxVoices_ = config.maxVoices;
         master_ = config.masterVolume;
         rotationMode_ = config.phaseRotationMode;
@@ -127,7 +136,7 @@ public:
             keyOutcome_.assign(size_t(kChannelCount) * kNoteCount, std::deque<uint8_t>());
         }
         if (config.stealAgeless) voices_.SetStealAgeless(true);
-        if (!voices_.Initialize(maxVoices_, rate_)) {
+        if (!voices_.Initialize(maxVoices_, engineRate_)) {
             error = "cannot allocate voice storage";
             return false;
         }
@@ -141,7 +150,7 @@ public:
             renderThreads = (std::min)(16u, renderThreads);
         }
         if (!renderer_.ConfigureRenderThreads(renderThreads,
-                                              config.maxBlockFrames)) {
+                                              (config.uniformHalfRate ? (config.maxBlockFrames + 1u) / 2u : config.maxBlockFrames))) {
             error = "cannot initialize render workers";
             return false;
         }
@@ -168,7 +177,7 @@ public:
                 reverb_->Configure(rate_, *t);
             }
         }
-        channels_.RebuildCache(cfg_, static_cast<float>(rate_));
+        channels_.RebuildCache(cfg_, static_cast<float>(engineRate_));
         for (uint32_t v = 0; v < 128u; ++v) {
             if (!config.tuning) {
                 velGain_[v] = float(v) * float(v) / (127.0f * 127.0f);
@@ -186,7 +195,7 @@ public:
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             RefreshPreset(channel);
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
-        if (config.backend == RenderBackend::GPU) {
+        if (config.backend == RenderBackend::GPU && !uniformHalf_) {
             std::string gpuError;
             if (!gpuSynth_.Initialize(sampleData_.data(),
                                       sampleFrames_,
@@ -207,7 +216,7 @@ public:
             gpuEnabled_ = false;
         }
 #if defined(SVMS_GPU_STAGE)
-        if (config.gpuApi != 0u) {
+        if (config.gpuApi != 0u && !uniformHalf_) {
             std::string gpuError;
             gpuStage_ = GpuStage::Create(static_cast<gpu::Api>(config.gpuApi),
                                          config.gpuDeviceIndex, gpuError);
@@ -259,11 +268,11 @@ public:
         // threshold 1 = disabled, every note-on spawns.
         static const EngineConfig collapseConfig = EngineConfig::Load();
         noteOnCollapse_.SetWindowTicks(
-            static_cast<uint64_t>(config.sampleRate) *
+            static_cast<uint64_t>(engineRate_) *
             kNoteOnCollapseWindowMs / 1000u);
         noteOnCollapse_.SetThreshold(collapseConfig.noteOnCollapseThreshold);
         noteOnCollapse_.SetReExciteSpacing(
-            static_cast<uint64_t>(config.sampleRate) * kReExciteAttackMs /
+            static_cast<uint64_t>(engineRate_) * kReExciteAttackMs /
             1000u);
         reExcite_ = collapseConfig.noteOnReexcite &&
                     collapseConfig.noteOnCollapseThreshold > 1u;
@@ -395,7 +404,7 @@ public:
     StandaloneSynth& operator=(const StandaloneSynth&) = delete;
 
     void Dispatch(uint32_t message, uint64_t frame) {
-        voices_.SetCurrentFrame(frame);
+        voices_.SetCurrentFrame(EngineFrame(frame));
         if (IsInternalEngineMessage(message)) {
             DispatchInternal(message, frame);
             return;
@@ -419,6 +428,11 @@ public:
 
     void Render(float* left, float* right, uint32_t frameCount,
                 uint64_t absoluteFrame) {
+        if (uniformHalf_) {
+            RenderWithEventsHalf(nullptr, 0u, left, right, frameCount,
+                                 absoluteFrame);
+            return;
+        }
         std::fill(left, left + frameCount, 0.0f);
         std::fill(right, right + frameCount, 0.0f);
 #if !defined(SVMS_XP_COMPAT) && defined(_WIN32)
@@ -573,6 +587,11 @@ public:
     void RenderWithEvents(const RenderEvent* events, uint32_t eventCount,
                           float* left, float* right, uint32_t frameCount,
                           uint64_t absoluteFrame) {
+        if (uniformHalf_) {
+            RenderWithEventsHalf(events, eventCount, left, right, frameCount,
+                                 absoluteFrame);
+            return;
+        }
         std::fill(left, left + frameCount, 0.0f);
         std::fill(right, right + frameCount, 0.0f);
         dispatchAbsoluteFrame_ = absoluteFrame;
@@ -595,6 +614,107 @@ public:
 #if defined(_MSC_VER)
         renderCycles_ += __rdtsc() - renderBegin;
 #endif
+        if (!rawMix_) PostProcess(left, right, frameCount);
+    }
+
+    // Uniform half-rate: half-rate sample k stands for output frame 2k.  A span
+    // of output frames [s, e) renders the half samples with 2k inside it, so
+    // consecutive spans tile exactly, and an event at output frame f fires
+    // before the first half sample at or after f (at most one frame late).
+    // A streaming 2x interpolator rebuilds the output (32 frames late) into a
+    // FIFO; reverb and limiter then run at the full rate.
+    uint64_t EngineFrame(uint64_t frame) const {
+        return uniformHalf_ ? (frame + 1u) >> 1 : frame;
+    }
+
+    void RenderWithEventsHalf(const RenderEvent* events, uint32_t eventCount,
+                              float* left, float* right, uint32_t frameCount,
+                              uint64_t absoluteFrame) {
+        constexpr uint32_t kHist = 2u * halfrate::kLead;
+        const uint64_t k0 = (absoluteFrame + 1u) >> 1;
+        const uint64_t k1 = (absoluteFrame + frameCount + 1u) >> 1;
+        const uint32_t half = static_cast<uint32_t>(k1 - k0);
+        // Events held over from a span with no half sample, then this span's.
+        halfEvents_.assign(halfPending_.begin(), halfPending_.end());
+        halfPending_.clear();
+        for (uint32_t i = 0; i < eventCount; ++i) {
+            RenderEvent e = events[i];
+            const uint64_t at =
+                ((absoluteFrame + e.frameOffset + 1u) >> 1) - k0;
+            if (at >= half) {
+                e.frameOffset = 0u;
+                halfPending_.push_back(e);
+            } else {
+                e.frameOffset = static_cast<uint32_t>(at);
+                halfEvents_.push_back(e);
+            }
+        }
+        for (int c = 0; c < 2; ++c) {
+            if (halfBlock_[c].size() < kHist + half + 8u) {
+                std::vector<float> grown(kHist + half + 8u, 0.0f);
+                std::copy(halfBlock_[c].begin(), halfBlock_[c].begin() +
+                          (std::min)(halfBlock_[c].size(), size_t(kHist)),
+                          grown.begin());
+                halfBlock_[c].swap(grown);
+            }
+            halfOut_[c].assign(size_t(half) * 2u, 0.0f);
+            halfAcc_[c].assign(half + 1u, 0.0f);
+            std::fill(halfBlock_[c].begin() + kHist,
+                      halfBlock_[c].begin() + kHist + half, 0.0f);
+        }
+        if (half != 0u) {
+            float* const bodyL = halfBlock_[0].data() + kHist;
+            float* const bodyR = halfBlock_[1].data() + kHist;
+            dispatchAbsoluteFrame_ = k0;
+            const RenderEvent* run = halfEvents_.data();
+            uint32_t runCount = static_cast<uint32_t>(halfEvents_.size());
+            if (noteMerge_ && runCount > 1u) {
+                mergeScratch_.assign(run, run + runCount);
+                uint64_t folded = 0u;
+                runCount = noteMerger_.MergeEvents(
+                    mergeScratch_.data(), runCount, noteMergeHoist_, folded);
+                mergedNoteOns_ += folded;
+                run = mergeScratch_.data();
+            }
+            renderer_.RenderBlock(
+                voices_, channels_, sampleData_.data(),
+                hilbertData_.empty() ? nullptr : hilbertData_.data(),
+                sampleFrames_, bodyL, bodyR, half, cfg_, run, runCount, false,
+                k0);
+            halfrate::UpsampleAdd(halfBlock_[0].data(), halfBlock_[1].data(),
+                                  halfOut_[0].data(), halfOut_[1].data(),
+                                  half * 2u, halfAcc_[0].data(),
+                                  halfAcc_[1].data());
+            for (int c = 0; c < 2; ++c) {   // the last 32 samples are history
+                halfFifo_[c].insert(halfFifo_[c].end(), halfOut_[c].begin(),
+                                    halfOut_[c].end());
+                std::copy(halfBlock_[c].begin() + half, halfBlock_[c].begin() +
+                          half + kHist, halfBlock_[c].begin());
+            }
+        } else {
+            // No half sample in this span: everything waits for the next one.
+            halfPending_.insert(halfPending_.begin(), halfEvents_.begin(),
+                                halfEvents_.end());
+            halfEvents_.clear();
+        }
+        for (int c = 0; c < 2; ++c) {
+            std::vector<float>& fifo = halfFifo_[c];
+            float* out = c == 0 ? left : right;
+            const size_t have = fifo.size() - halfFifoHead_;
+            const size_t take = (std::min)(have, size_t(frameCount));
+            std::copy(fifo.begin() + halfFifoHead_,
+                      fifo.begin() + halfFifoHead_ + take, out);
+            std::fill(out + take, out + frameCount, 0.0f);
+            if (c == 1) {
+                halfFifoHead_ += take;
+                if (halfFifoHead_ > 65536u) {
+                    for (int q = 0; q < 2; ++q)
+                        halfFifo_[q].erase(halfFifo_[q].begin(),
+                                           halfFifo_[q].begin() + halfFifoHead_);
+                    halfFifoHead_ = 0;
+                }
+            }
+        }
         if (!rawMix_) PostProcess(left, right, frameCount);
     }
 
@@ -636,8 +756,8 @@ public:
     }
 
     void SetCursor(uint64_t absoluteFrame) {
-        dispatchAbsoluteFrame_ = absoluteFrame;
-        voices_.SetCurrentFrame(absoluteFrame);
+        dispatchAbsoluteFrame_ = EngineFrame(absoluteFrame);
+        voices_.SetCurrentFrame(EngineFrame(absoluteFrame));
     }
 
     void ApplyRenderEvent(const RenderEvent& event) {
@@ -654,7 +774,7 @@ public:
         noteOnCollapse_.ResetAll();
         coalescedNoteOns_ = 0;
         reExcitedNoteOns_ = 0;
-        voices_.SetCurrentFrame(absoluteFrame);
+        voices_.SetCurrentFrame(EngineFrame(absoluteFrame));
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             voices_.SilenceChannelImmediate(channel);
         channels_.Reset();
@@ -662,7 +782,7 @@ public:
         sysexMasterVolume_ = 1.0f;
         sysexMasterFineTune_ = 0.0f;
         sysexMasterTranspose_ = 0.0f;
-        channels_.RebuildCache(cfg_, static_cast<float>(rate_));
+        channels_.RebuildCache(cfg_, static_cast<float>(engineRate_));
         for (uint8_t channel = 0; channel < kChannelCount; ++channel) {
             bendRatio_[channel] = 1.0f;
             RefreshPreset(channel);
@@ -675,7 +795,7 @@ public:
         ++levelEpoch_;
         master_ = volume;
         channels_.SetMasterVolume(master_ * sysexMasterVolume_);
-        channels_.RebuildCache(cfg_, static_cast<float>(rate_));
+        channels_.RebuildCache(cfg_, static_cast<float>(engineRate_));
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             voices_.MarkChannelMixStale(channel, channels_.GetParams()[channel]);
     }
@@ -836,7 +956,7 @@ private:
         prepared.bendScale =
             (region.scaleTuning ? region.scaleTuning : 100) / 100.0f;
         const float sampleRatio = float(sample.sampleRate ? sample.sampleRate : 44100) /
-                                  float(rate_);
+                                  float(engineRate_);
         for (uint32_t note = 0; note < kNoteCount; ++note) {
             const float semitones = (float(note) + region.coarseTune +
                                      region.fineTune / 100.0f - root) *
@@ -851,16 +971,16 @@ private:
                       (std::max)(0.0f, float(region.sustainVolEnv))));
         const auto samples = [&](int16_t timecents) {
             const float seconds = TimecentsToSeconds(timecents);
-            return seconds > 0 ? uint32_t(seconds * rate_) : 0u;
+            return seconds > 0 ? uint32_t(seconds * engineRate_) : 0u;
         };
         prepared.delay = samples(region.delayVolEnv);
         prepared.hold = samples(region.holdVolEnv);
         const float attackSeconds = TimecentsToSeconds(region.attackVolEnv);
         const float decaySeconds = TimecentsToSeconds(region.decayVolEnv);
         prepared.attack = attackSeconds > 0.0001f
-            ? uint32_t(attackSeconds * rate_) : 0u;
+            ? uint32_t(attackSeconds * engineRate_) : 0u;
         prepared.decay = decaySeconds > 0.0001f
-            ? uint32_t(decaySeconds * rate_) : 0u;
+            ? uint32_t(decaySeconds * engineRate_) : 0u;
         prepared.decaySlope = 1.0f;
         if (prepared.decay) {
             const float slope = -9.226f / prepared.decay;
@@ -869,11 +989,11 @@ private:
                 prepared.decay = uint32_t(logf(prepared.sustain) / slope);
         }
         const float releaseSeconds = TimecentsToSeconds(region.releaseVolEnv);
-        prepared.releaseDecay = MakeReleaseDecay(releaseSeconds, rate_);
-        prepared.release = MakeReleaseSamples(releaseSeconds, rate_);
+        prepared.releaseDecay = MakeReleaseDecay(releaseSeconds, engineRate_);
+        prepared.release = MakeReleaseSamples(releaseSeconds, engineRate_);
         prepared.filter = PrepareVoiceLowPass(
             region.filterType, region.initialFilterFc, region.initialFilterQ,
-            rate_);
+            engineRate_);
         channels_.ComputeSoundFontPan(region.pan, prepared.panL, prepared.panR);
         prepared.valid = true;
     }
@@ -1274,7 +1394,7 @@ private:
 #endif
         if (controller == 7 || controller == 10 || controller == 11 ||
             controller == 64 || controller == 121 || controller == 1) {
-            channels_.RebuildChannel(channel, cfg_, float(rate_));
+            channels_.RebuildChannel(channel, cfg_, float(engineRate_));
 #if defined(_MSC_VER)
             dispatchProfile.controlRebuild += __rdtsc() - rebuildBegin;
 #endif
@@ -1366,7 +1486,7 @@ private:
             sysexMasterVolume_ = static_cast<float>(message & 0x3fffu) /
                 16383.0f;
             channels_.SetMasterVolume(master_ * sysexMasterVolume_);
-            channels_.RebuildCache(cfg_, static_cast<float>(rate_));
+            channels_.RebuildCache(cfg_, static_cast<float>(engineRate_));
             for (uint8_t channel = 0; channel < kChannelCount; ++channel)
                 voices_.MarkChannelMixStale(
                     channel, channels_.GetParams()[channel]);
@@ -1410,6 +1530,15 @@ private:
 #endif
 
     uint32_t rate_ = 0;
+    uint32_t engineRate_ = 0;   // the voice engine's rate (rate_ or half of it)
+    bool uniformHalf_ = false;
+    std::vector<float> halfBlock_[2];   // [history 32][half-rate samples]
+    std::vector<float> halfOut_[2];
+    std::vector<float> halfAcc_[2];
+    std::vector<RenderEvent> halfEvents_;
+    std::vector<RenderEvent> halfPending_;
+    std::vector<float> halfFifo_[2];
+    size_t halfFifoHead_ = 0;
     uint32_t maxVoices_ = 0;
     uint32_t playIndex_ = 0;
     uint64_t renderCycles_ = 0;

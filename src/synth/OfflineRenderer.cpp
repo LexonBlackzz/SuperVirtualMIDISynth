@@ -82,6 +82,7 @@ struct Options {
     uint32_t tuningEdo = 12u;
     RenderBackend backend = RenderBackend::AVX512; // sentinel: automatic
     uint32_t gpuApi = 0u;          // GPU render stage (gpu::Api), 0 = off
+    bool uniformHalfRate = false;  // whole engine at half the output rate
     uint32_t gpuDeviceIndex = 0u;
     bool quiet = false;
     bool scanOnly = false;
@@ -348,7 +349,8 @@ void Usage() {
            L"  --limiter-release-ms F    Override release, 1-5000 ms\n"
            L"  --phase-rotation coherent|analytic|sweep|diffuse|random  Post-mix hum-killing phase rotation (default coherent/off)\n"
                        L"  --backend auto|scalar|sse2|avx2|gpu\n"
-                       L"  --gpu-api off|auto|opengl|vulkan|d3d11|cuda  GPU render stage (default: the driver setting)\n"
+                       L"  --uniform-half-rate   Run the whole engine at half the output rate (about 1.5x faster; loses highs above ~11 kHz, bright voices alias)\n"
+           L"  --gpu-api off|auto|opengl|vulkan|d3d11|cuda  GPU render stage (default: the driver setting)\n"
            L"  --tuning-edo 12|31    Melodic tuning (31EDO key 155 = middle C)\n"
            L"  --config FILE         Use this V3 config JSON instead of the active one\n"
            L"  --tracks A,B,...      Stem: keep notes of these 0-based MIDI tracks only (length unchanged)\n"
@@ -444,6 +446,8 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
             const auto p=value(); if (!p || !ParseFloat(p,1.0f,5000.0f,o.limiterReleaseMs)) return false;
         } else if (arg == L"--phase-rotation") {
             const auto p=value(); if (!p || !ParsePhaseRotationMode(p,o.phaseRotationMode)) return false;
+        } else if (arg == L"--uniform-half-rate") {
+            o.uniformHalfRate=true;
         } else if (arg == L"--gpu-api") {
             const auto p=value(); if (!p) return false; const std::wstring name=p;
             if (name == L"off") o.gpuApi=0u;
@@ -807,6 +811,7 @@ public:
         config.oversample = o.oversample;
         config.tuning = o.tuning;
         config.gpuApi = o.gpuApi;
+        config.uniformHalfRate = o.uniformHalfRate;
         config.gpuDeviceIndex = o.gpuDeviceIndex;
         return synth_.Initialize(config, error);
     }
