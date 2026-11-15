@@ -765,6 +765,98 @@ static void mergeZoneInto(ZoneGenState& dst, const ZoneGenState& src) {
     dst.endCoarseOffset += src.endCoarseOffset;
 }
 
+// Same-level resolution (SF2 2.04 9.4): a local zone's generator replaces the
+// global zone's value for that generator; generators the local zone leaves
+// unset keep the global (or default) value.
+static void overlayZone(ZoneGenState& dst, const ZoneGenState& src) {
+#define SVMS_OVERRIDE(field, flag) \
+    if (src.flag) { dst.field = src.field; dst.flag = true; }
+    if (src.hasKeyRange) { dst.keyLo = src.keyLo; dst.keyHi = src.keyHi; dst.hasKeyRange = true; }
+    if (src.hasVelRange) { dst.velLo = src.velLo; dst.velHi = src.velHi; dst.hasVelRange = true; }
+    SVMS_OVERRIDE(sampleIndex, hasSample)
+    SVMS_OVERRIDE(rootKey, hasRootKey)
+    SVMS_OVERRIDE(loopMode, hasLoopMode)
+    SVMS_OVERRIDE(coarseTune, hasCoarseTune)
+    SVMS_OVERRIDE(fineTune, hasFineTune)
+    SVMS_OVERRIDE(keyTrack, hasScaleTuning)
+    SVMS_OVERRIDE(initialAttenuation, hasInitialAttenuation)
+    SVMS_OVERRIDE(attackVolEnv, hasAttackVolEnv)
+    SVMS_OVERRIDE(decayVolEnv, hasDecayVolEnv)
+    SVMS_OVERRIDE(sustainVolEnv, hasSustainVolEnv)
+    SVMS_OVERRIDE(releaseVolEnv, hasReleaseVolEnv)
+    SVMS_OVERRIDE(holdVolEnv, hasHoldVolEnv)
+    SVMS_OVERRIDE(delayVolEnv, hasDelayVolEnv)
+    SVMS_OVERRIDE(initialFilterFc, hasInitialFilterFc)
+    SVMS_OVERRIDE(initialFilterQ, hasInitialFilterQ)
+    SVMS_OVERRIDE(pan, hasPan)
+    SVMS_OVERRIDE(reverbSend, hasReverbSend)
+    SVMS_OVERRIDE(chorusSend, hasChorusSend)
+    SVMS_OVERRIDE(modLfoToPitch, hasModLfoToPitch)
+    SVMS_OVERRIDE(vibLfoToPitch, hasVibLfoToPitch)
+    SVMS_OVERRIDE(delayVibLfo, hasDelayVibLfo)
+    SVMS_OVERRIDE(freqVibLfo, hasFreqVibLfo)
+    SVMS_OVERRIDE(modEnvToPitch, hasModEnvToPitch)
+    SVMS_OVERRIDE(modLfoToFilterFc, hasModLfoToFilterFc)
+    SVMS_OVERRIDE(modEnvToFilterFc, hasModEnvToFilterFc)
+    SVMS_OVERRIDE(modLfoToVolume, hasModLfoToVolume)
+    SVMS_OVERRIDE(exclusiveClass, hasExclusiveClass)
+#undef SVMS_OVERRIDE
+    // Address offsets carry no presence flag; global zones almost never set
+    // them, so accumulating keeps the previous behavior for that rare case.
+    dst.startOffset += src.startOffset;
+    dst.endOffset += src.endOffset;
+    dst.loopStartOffset += src.loopStartOffset;
+    dst.loopEndOffset += src.loopEndOffset;
+    dst.startCoarseOffset += src.startCoarseOffset;
+    dst.endCoarseOffset += src.endCoarseOffset;
+}
+
+// Preset level onto instrument level (SF2 2.04 9.4): every preset generator
+// is an offset added to the instrument's value, or to the generator default
+// when the instrument leaves it unset (dst already holds that default).
+// Ranges intersect. Sample, root key, sample modes, exclusive class and
+// address offsets are instrument-only generators and are ignored here.
+static void addPresetLevel(ZoneGenState& dst, const ZoneGenState& p) {
+    if (p.hasKeyRange) {
+        const uint8_t lo = (std::max)(dst.keyLo, p.keyLo);
+        const uint8_t hi = (std::min)(dst.keyHi, p.keyHi);
+        if (lo > hi) { dst.keyLo = 1; dst.keyHi = 0; } else { dst.keyLo = lo; dst.keyHi = hi; }
+        dst.hasKeyRange = true;
+    }
+    if (p.hasVelRange) {
+        const uint8_t lo = (std::max)(dst.velLo, p.velLo);
+        const uint8_t hi = (std::min)(dst.velHi, p.velHi);
+        if (lo > hi) { dst.velLo = 1; dst.velHi = 0; } else { dst.velLo = lo; dst.velHi = hi; }
+        dst.hasVelRange = true;
+    }
+#define SVMS_ADD(field, flag) \
+    if (p.flag) { dst.field = static_cast<decltype(dst.field)>(dst.field + p.field); dst.flag = true; }
+    SVMS_ADD(coarseTune, hasCoarseTune)
+    SVMS_ADD(fineTune, hasFineTune)
+    SVMS_ADD(keyTrack, hasScaleTuning)
+    SVMS_ADD(initialAttenuation, hasInitialAttenuation)
+    SVMS_ADD(attackVolEnv, hasAttackVolEnv)
+    SVMS_ADD(decayVolEnv, hasDecayVolEnv)
+    SVMS_ADD(sustainVolEnv, hasSustainVolEnv)
+    SVMS_ADD(releaseVolEnv, hasReleaseVolEnv)
+    SVMS_ADD(holdVolEnv, hasHoldVolEnv)
+    SVMS_ADD(delayVolEnv, hasDelayVolEnv)
+    SVMS_ADD(initialFilterFc, hasInitialFilterFc)
+    SVMS_ADD(initialFilterQ, hasInitialFilterQ)
+    SVMS_ADD(pan, hasPan)
+    SVMS_ADD(reverbSend, hasReverbSend)
+    SVMS_ADD(chorusSend, hasChorusSend)
+    SVMS_ADD(modLfoToPitch, hasModLfoToPitch)
+    SVMS_ADD(vibLfoToPitch, hasVibLfoToPitch)
+    SVMS_ADD(delayVibLfo, hasDelayVibLfo)
+    SVMS_ADD(freqVibLfo, hasFreqVibLfo)
+    SVMS_ADD(modEnvToPitch, hasModEnvToPitch)
+    SVMS_ADD(modLfoToFilterFc, hasModLfoToFilterFc)
+    SVMS_ADD(modEnvToFilterFc, hasModEnvToFilterFc)
+    SVMS_ADD(modLfoToVolume, hasModLfoToVolume)
+#undef SVMS_ADD
+}
+
 bool sf2_find_instrument(const SF2Data* data, uint32_t presetIndex,
                          uint8_t note, uint8_t velocity,
                          uint32_t* outInstrumentIndex, uint32_t* outSampleIndex) {
@@ -1015,11 +1107,13 @@ void sf2_build_regions(SF2Data* data) {
                     mergeZoneInto(instrumentGlobal, zone);
                     continue;
                 }
-                ZoneGenState merged;
-                mergeZoneInto(merged, presetGlobal);
-                mergeZoneInto(merged, instrumentGlobal);
-                mergeZoneInto(merged, zone);
-                mergeZoneInto(merged, presetZone.second);
+                // Resolve each level on its own (local overrides global),
+                // then add the preset level onto the instrument level.
+                ZoneGenState merged = instrumentGlobal;
+                overlayZone(merged, zone);
+                ZoneGenState presetLevel = presetGlobal;
+                overlayZone(presetLevel, presetZone.second);
+                addPresetLevel(merged, presetLevel);
                 if (merged.keyLo <= merged.keyHi && merged.velLo <= merged.velHi)
                     AppendCompiledRegion(data, pi, merged);
             }
