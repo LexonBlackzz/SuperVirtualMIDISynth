@@ -70,6 +70,9 @@ void FlashAnchor(const char* anchor);
 const char* FlashTarget();
 // The page's scrolling child calls this so jumps centre rows inside it.
 void SetScrollHost();
+// A floating window over the page calls this inside its Begin/End: while the
+// pointer is on it, the mouse wheel scrolls the page instead of being dropped.
+void ForwardWheelToScrollHost();
 // Rows and cards call this with their anchor id and rect.
 void Anchor(const char* anchor, ImVec2 min, ImVec2 max);
 
@@ -168,8 +171,9 @@ ImVec2 ButtonSize(const char* label);
 bool DangerButton(const char* id, const char* label, const char* armedLabel);
 
 // Dropdown styled like a field. Returns true when the selection changed.
+// `tips`, when given, holds one tooltip per item, shown while it is hovered.
 bool Select(const char* id, int* current, const char* const* items, int count,
-            float width);
+            float width, const char* const* tips = nullptr);
 bool Field(const char* id, char* buf, size_t bufSize, float width,
            const char* hint = nullptr);
 bool NumberField(const char* id, int* value, int minValue, int maxValue,

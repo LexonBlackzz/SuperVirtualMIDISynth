@@ -55,10 +55,11 @@ A file that cannot be read falls back to the box room.
 
 ## Listening tests
 
-The Listen card plays test material through the room as the page has it now, saved or not, and keeps
-following the page while it plays: **Play each channel in turn**, **Walk around me** and **Loop around me**
-move a source or you, and a held button plays the same sound without the room. Stop lets the tail ring
-out before closing.
+The strip at the top of the page plays test material through the room as the page has it now, saved or
+not, and stays in view while the page scrolls. It keeps following the page while it plays: **Each channel
+in turn**, **Walk around me** and **Loop around me** move a source or you, and **Hold: no room** plays the
+same sound without the room. Pick a test in the list, then press Play; picking another one while a test
+plays switches to it. Stop lets the tail ring out before closing.
 
 ## Code
 

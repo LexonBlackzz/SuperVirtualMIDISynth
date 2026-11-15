@@ -167,6 +167,7 @@ const SceneDef kScenes[5] = {
 struct State {
     int view = 2;            // 0 top, 1 side, 2 3D
     int mode = 0;            // 0 simple, 1 advanced
+    int listen = 0;          // the listening test the transport plays (index into kListen)
     float yaw = -0.62f, pitch = 0.52f;
     int sel = 0, fsel = -1;
     bool you = false;
@@ -322,8 +323,10 @@ void SeatBand(ConfigValues& w, int kind) {
     ResetQuick();
 }
 
+constexpr size_t kFurnitureCap = 32;
+
 void AddFurn(ConfigValues& w, int kind, float x, float y, bool rotated = false) {
-    if (w.stageFurniture.size() >= 32) return;
+    if (w.stageFurniture.size() >= kFurnitureCap) return;
     StageFurnitureValue f;
     f.kind = static_cast<uint8_t>(kind);
     f.x = x;
@@ -1258,12 +1261,6 @@ void StageCanvas(ConfigDocument& doc) {
         const ImVec2 ts = ImGui::CalcTextSize(buf);
         dl->AddText(ImVec2(p1.x - ts.x - 14.0f * s, p0.y + 14.0f * s), k.muted, buf);
         ui::PopFont();
-        const char* hint = g.view == 2 ? "drag a dot: move on floor | Shift+drag: lift | empty space: orbit"
-                          : g.view == 1 ? "drag a dot: along the room, up and down" : "drag a dot, furniture or yourself";
-        ui::PushText(0, 12.0f);
-        const ImVec2 hs = ImGui::CalcTextSize(hint);
-        dl->AddText(ImVec2(p1.x - hs.x - 14.0f * s, p1.y - hs.y - 10.0f * s), IM_COL32(150, 150, 160, 200), hint);
-        ui::PopFont();
     }
     dl->PopClipRect();
     dl->AddRect(p0, p1, k.line2, 12.0f * s);
@@ -1275,15 +1272,24 @@ void StageCanvas(ConfigDocument& doc) {
 
 void HeaderBar(ConfigDocument& doc) {
     ConfigValues& w = doc.Working();
+    const ui::Tokens& k = ui::Tok();
     const float s = S();
     const float avail = ImGui::GetContentRegionAvail().x;
     static const char* const modes[2] = {"Simple", "Advanced"};
-    const float bw = ui::ButtonSize("Reset to a good start").x, sw = ui::SegmentedSize(modes, 2).x, tw = 46.0f * s;
-    const float gap = 10.0f * s;
-    const float x0 = ImGui::GetCursorPosX() + avail - (bw + sw + tw + 2 * gap);
+    static const char* const resetLabel = "Reset to the starting room";
+    static const char* const switchLabel = "Use the stage";
+    const ImVec2 bs = ui::ButtonSize(resetLabel), ss = ui::SegmentedSize(modes, 2);
+    const float tw = 46.0f * s, th = 28.0f * s;
+    const float gap = 10.0f * s, tgap = 8.0f * s;
+    ui::PushText(1, 13.0f);
+    const float lw = ImGui::CalcTextSize(switchLabel).x, lh = ImGui::GetTextLineHeight();
+    ui::PopFont();
+    const float rowH = (std::max)(bs.y, ss.y);
+    const float x0 = (std::max)(ImGui::GetCursorPosX(),
+                                ImGui::GetCursorPosX() + avail - (bs.x + ss.x + lw + tw + 2 * gap + tgap));
     const float y = ImGui::GetCursorPosY();
     ImGui::SetCursorPos(ImVec2(x0, y));
-    if (ui::Button("Reset to a good start")) {
+    if (ui::Button(resetLabel)) {
         g.seat = Wide;
         g.level = 1;
         w.stageTailTrim = 0.7f;
@@ -1294,17 +1300,46 @@ void HeaderBar(ConfigDocument& doc) {
         ApplyRoom(w, 2, true);
         doc.MarkDirty();
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+        ImGui::TextUnformatted("Replaces your room, furniture and seating with the starting concert hall, resets the tail, "
+                               "air and headphone sound, and turns the stage on. Discard undoes it until you save.");
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
     ImGui::SameLine(0, gap);
     ui::Segmented("##stmode", &g.mode, modes, 2);
     ImGui::SameLine(0, gap);
-    ui::Anchor("stageOn", ImGui::GetCursorScreenPos(), ImVec2(ImGui::GetCursorScreenPos().x + tw, ImGui::GetCursorScreenPos().y + 28.0f * s));
+    // The master switch is centred on the row and carries its own name.
+    ImGui::SetCursorPosY(y + (rowH - th) * 0.5f);
+    const ImVec2 switchPos = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(lw, th));
+    ui::PushText(1, 13.0f);
+    ImGui::GetWindowDrawList()->AddText(ImVec2(switchPos.x, switchPos.y + (th - lh) * 0.5f), k.text, switchLabel);
+    ui::PopFont();
+    ImGui::SameLine(0, tgap);
+    ImGui::SetCursorPosY(y + (rowH - th) * 0.5f);
+    const ImVec2 togglePos = ImGui::GetCursorScreenPos();
     if (ui::Toggle("##stmaster", &w.stageEnabled)) doc.MarkDirty();
+    ui::Anchor("stageOn", switchPos, ImVec2(togglePos.x + tw, togglePos.y + th));
+    ImGui::SetCursorPosY(y + rowH);
     ImGui::Dummy(ImVec2(0, 4.0f * s));
-    ui::RestartMark(true);
-    ImGui::SameLine(0, 8.0f * s);
+
+    // One line on what happens to a change: heard at once, or only after the app restarts.
+    const LiveLinkContext& live = GetLiveLinkContext();
+    const bool restart = w.stageEnabled && !live.stageLive;
+    const char* note = !w.stageEnabled     ? "Off: the sound is unchanged until you switch it on."
+                       : live.stageLive    ? "Changes play live as you make them."
+                       : live.telemetry    ? "This driver can't change the stage live."
+                                           : "Connect to a running SVMS to hear changes as you make them.";
+    if (restart) {
+        ui::RestartMark(true);
+        ImGui::SameLine(0, 8.0f * s);
+    }
     ui::PushText(0, 12.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
-    ImGui::TextUnformatted(w.stageEnabled ? "Everything here is read when the engine starts." : "The stage is off: nothing below changes the sound yet.");
+    ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+    ImGui::TextUnformatted(note);
     ImGui::PopStyleColor();
     ui::PopFont();
 }
@@ -1670,6 +1705,7 @@ void RoomAndFurniture(ConfigDocument& doc) {
         ui::EndRow();
     }
     ImGui::Dummy(ImVec2(0, 6.0f * s));
+    const bool full = w.stageFurniture.size() >= kFurnitureCap;
     {
         const float avail = ImGui::GetContentRegionAvail().x;
         float x = 0;
@@ -1680,7 +1716,7 @@ void RoomAndFurniture(ConfigDocument& doc) {
             if (x > 0 && x + bw > avail) x = 0;
             else if (x > 0) ImGui::SameLine(0, 8.0f * s);
             ImGui::PushID(i);
-            if (ui::Button(label)) {
+            if (ui::Button(label, ui::ButtonKind::Normal, ImVec2(0, 0), !full) && !full) {
                 const FurnType& t = kFurn[i];
                 float fx = w.stageRoom[0] * 0.7f, fy = w.stageRoom[1] * 0.62f;
                 bool rot = false;
@@ -1729,6 +1765,7 @@ void RoomAndFurniture(ConfigDocument& doc) {
         } else {
             ImGui::TextUnformatted("Click a piece of furniture on the stage to select it, then drag, turn or remove it.");
         }
+        if (full) ImGui::Text("The room holds %d pieces. Remove one to add another.", static_cast<int>(kFurnitureCap));
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
         ui::PopFont();
@@ -1737,63 +1774,36 @@ void RoomAndFurniture(ConfigDocument& doc) {
     ui::EndReveal();
 }
 
-void ListenCard(ConfigDocument& doc) {
-    static StageAudition audition;
+// The listening tests. One audition plays at a time; the transport floating over the page drives it.
+StageAudition g_audition;
+
+struct ListenMode {
+    const char* label;
+    const char* tip;
+    StageAudition::Mode mode;
+};
+const ListenMode kListen[6] = {
+    {"Selected channel", "The channel you picked plays an arpeggio from where it stands.", StageAudition::Mode::Channel},
+    {"Each channel in turn", "One note per channel, 1 to 16, so you hear where each one is.", StageAudition::Mode::Tour},
+    {"5.1 test (channels 1 to 6)", "Seats channels 1 to 6 as front left, front right, centre, bass, rear left, rear right and plays a surround test on them.", StageAudition::Mode::Surround},
+    {"Music loop", "The loop plays through the selected channel until you press Stop. Move it or change the room meanwhile.", StageAudition::Mode::Music},
+    {"Loop around me", "The loop circles your head once per pass, with Doppler.", StageAudition::Mode::Around},
+    {"Walk around me", "The selected channel circles you, with Doppler.", StageAudition::Mode::Walk},
+};
+
+void StartListen(ConfigDocument& doc) {
     ConfigValues& w = doc.Working();
-    const float s = S();
-    ui::BeginCard("##stlisten", "Listen", "Plays through the room as it is set up now, saved or not, until you press Stop. Edit the room or move a channel while it plays and the sound follows.");
-    struct B { const char* label; StageAudition::Mode mode; ui::ButtonKind kind; const char* tip; };
-    static const B buttons[] = {
-        {"Play selected channel", StageAudition::Mode::Channel, ui::ButtonKind::Primary, "The channel you picked plays an arpeggio from where it stands."},
-        {"Play each channel in turn", StageAudition::Mode::Tour, ui::ButtonKind::Normal, "One note per channel, 1 to 16, so you hear where each one is."},
-        {"Play 5.1 test (6 tracks)", StageAudition::Mode::Surround, ui::ButtonKind::Normal, "Seats channels 1 to 6 as front left, front right, centre, bass, rear left, rear right and plays a surround test on them."},
-        {"Play music loop", StageAudition::Mode::Music, ui::ButtonKind::Normal, "The loop plays through the selected channel until you press Stop. Move it or change the room meanwhile."},
-        {"Loop around me", StageAudition::Mode::Around, ui::ButtonKind::Normal, "The loop circles your head once per pass, with Doppler."},
-        {"Walk around me", StageAudition::Mode::Walk, ui::ButtonKind::Normal, "The selected channel circles you, with Doppler."},
-    };
-    const float avail = ImGui::GetContentRegionAvail().x;
-    float x = 0;
-    bool first = true;
-    for (const B& b : buttons) {
-        const float bw = ui::ButtonSize(b.label).x;
-        if (!first && x + bw > avail) x = 0;
-        else if (!first) ImGui::SameLine(0, 8.0f * s);
-        first = false;
-        if (ui::Button(b.label, b.kind)) {
-            if (b.mode == StageAudition::Mode::Surround) {
-                static const float seat51[6][3] = {{-30, 0, 4}, {30, 0, 4}, {0, 0, 4}, {0, -12, 3}, {-140, 0, 4}, {140, 0, 4}};
-                for (int i = 0; i < 6; ++i) SetPolar(w, w.stageChannel[i], seat51[i][0], seat51[i][1], seat51[i][2]);
-                g.sel = 0;
-                g.you = false;
-                g.fsel = -1;
-                g.baseValid = false;
-                doc.MarkDirty();
-            }
-            audition.Start(b.mode, w, g.sel);
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", b.tip);
-        x += bw + 8.0f * s;
+    const ListenMode& m = kListen[g.listen];
+    if (m.mode == StageAudition::Mode::Surround) {
+        static const float seat51[6][3] = {{-30, 0, 4}, {30, 0, 4}, {0, 0, 4}, {0, -12, 3}, {-140, 0, 4}, {140, 0, 4}};
+        for (int i = 0; i < 6; ++i) SetPolar(w, w.stageChannel[i], seat51[i][0], seat51[i][1], seat51[i][2]);
+        g.sel = 0;
+        g.you = false;
+        g.fsel = -1;
+        g.baseValid = false;
+        doc.MarkDirty();
     }
-    auto place = [&](const char* label) {
-        const float bw = ui::ButtonSize(label).x;
-        if (x + bw > avail) x = 0;
-        else ImGui::SameLine(0, 8.0f * s);
-        x += bw + 8.0f * s;
-    };
-    place("Stop");
-    if (ui::Button("Stop")) audition.Stop();
-    place("Hold: hear it without the room");
-    ui::Button("Hold: hear it without the room");
-    audition.SetDry(ImGui::IsItemActive());
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hold the button to hear the same sound with no room and no reflections.");
-    audition.Update(w, g.sel);
-    ImGui::Dummy(ImVec2(0, 6.0f * s));
-    ui::PushText(0, 13.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().muted);
-    ImGui::TextUnformatted(StageAudition::Supported() ? audition.Status().c_str() : "Listening tests need Windows");
-    ImGui::PopStyleColor();
-    ui::PopFont();
-    ui::EndCard();
+    g_audition.Start(m.mode, w, g.sel);
 }
 
 void AdvancedCards(ConfigDocument& doc) {
@@ -1851,7 +1861,7 @@ void AdvancedCards(ConfigDocument& doc) {
     {
         char sub[64];
         std::snprintf(sub, sizeof(sub), "Rings for about %.1f s", Rt60(w));
-        ui::BeginCard("##stroomadv", "Room", sub);
+        ui::BeginCard("##stroomadv", "Room shape and surfaces", sub);
         const stg::StageMesh* mesh = ViewMesh(w);
         MeshRow(doc, w, mesh);
         if (!mesh) {
@@ -1976,8 +1986,91 @@ void DrawStagePage(ConfigDocument& doc) {
     if (!g_speakerMode) ChannelsCard(doc);
     QuickCard(doc);
     RoomAndFurniture(doc);
-    ListenCard(doc);
     if (g.mode == 1) AdvancedCards(doc);
+}
+
+void DrawStageTransport(ConfigDocument& doc, ImVec2 areaMin, ImVec2 areaMax) {
+    ConfigValues& w = doc.Working();
+    const ui::Tokens& k = ui::Tok();
+    const float s = S();
+    const bool busy = g_audition.Busy();
+    static const char* const kHold = "Hold: no room";
+    const char* labels[6];
+    const char* tips[6];
+    for (int i = 0; i < 6; ++i) {
+        labels[i] = kListen[i].label;
+        tips[i] = kListen[i].tip;
+    }
+
+    const float padX = 12.0f * s, padY = 5.0f * s, gap = 8.0f * s;
+    const float rowH = ui::ButtonSize("Play").y;
+    const float playW = (std::max)(ui::ButtonSize("Play").x, ui::ButtonSize("Stop").x);
+    const float modeW = 196.0f * s, holdW = ui::ButtonSize(kHold).x;
+    const float fixedW = padX * 2.0f + playW + modeW + holdW + gap * 3.0f;
+    // The status zone fits the longest status the test reports, so the strip does not change size.
+    ui::PushText(0, 13.0f);
+    const float longestStatus = ImGui::CalcTextSize("Tracing the room on the GPU").x;
+    ui::PopFont();
+    // Right-aligned with the page body, like the save bar below it is left-aligned with it.
+    const float bodyW = (std::min)(980.0f * s, areaMax.x - areaMin.x - 68.0f * s);
+    const float width = (std::min)(fixedW + longestStatus, bodyW);
+    const float statusW = width - fixedW;
+
+    ImGui::SetNextWindowPos(ImVec2(areaMin.x + 34.0f * s + bodyW - width, areaMin.y + 6.0f * s));
+    ImGui::SetNextWindowSize(ImVec2(width, rowH + padY * 2.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, padY));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, k.rack ? 4.0f * s : 14.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, k.card2);
+    ImGui::PushStyleColor(ImGuiCol_Border, k.line2);
+    ImGui::Begin("##sttransport", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+
+    if (ui::Button(busy ? "Stop" : "Play", busy ? ui::ButtonKind::Normal : ui::ButtonKind::Primary, ImVec2(playW, rowH),
+                   StageAudition::Supported())) {
+        if (busy) g_audition.Stop();
+        else StartListen(doc);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Plays through the room as it is set up now, saved or not, until you press Stop. "
+                          "Edit the room or move a channel while it plays and the sound follows.");
+    ImGui::SameLine(0, gap);
+    // Picking another test while one plays switches to it; otherwise it only chooses what Play will run.
+    if (ui::Select("##stlistenmode", &g.listen, labels, 6, modeW, tips) && busy) StartListen(doc);
+    ImGui::SameLine(0, gap);
+    ui::Button(kHold, ui::ButtonKind::Normal, ImVec2(holdW, rowH));
+    g_audition.SetDry(ImGui::IsItemActive());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hold the button to hear the same sound with no room and no reflections.");
+    g_audition.Update(w, g.sel);
+
+    // Status: what the test is doing, cut to the room that is left.
+    const std::string status = StageAudition::Supported() ? g_audition.Status() : "Listening tests need Windows";
+    if (statusW > 40.0f * s) {
+        ImGui::SameLine(0, gap);
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(statusW, rowH));
+        const bool hovered = ImGui::IsItemHovered();
+        ui::PushText(0, 13.0f);
+        std::string shown = status;
+        if (ImGui::CalcTextSize(shown.c_str()).x > statusW) {
+            while (shown.size() > 1 && ImGui::CalcTextSize((shown + "...").c_str()).x > statusW) shown.pop_back();
+            shown += "...";
+        }
+        ImGui::GetWindowDrawList()->AddText(ImVec2(at.x, at.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f),
+                                            status == "Playing" ? k.ok : k.muted, shown.c_str());
+        ui::PopFont();
+        if (shown != status && hovered) ImGui::SetTooltip("%s", status.c_str());
+    }
+    ui::ForwardWheelToScrollHost();   // the page keeps scrolling under the pointer
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
+}
+
+// A test plays until Stop, and Stop lives on this page: leaving the page ends it.
+void StopStageListening() {
+    if (g_audition.Busy()) g_audition.Stop();
 }
 
 } // namespace svms::cfg

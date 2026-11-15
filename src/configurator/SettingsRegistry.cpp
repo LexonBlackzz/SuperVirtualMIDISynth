@@ -119,7 +119,7 @@ const SettingDef kSettings[] = {
     {"limRel", nullptr, E, nullptr, nullptr, "limiter", nullptr, false, D(&V::limiterReleaseMs)},
     {"chThresh", nullptr, E, nullptr, nullptr, "chlim", nullptr, false, D(&V::channelLimiterThreshold)},
     {"chRel", nullptr, E, nullptr, nullptr, "chlim", nullptr, false, D(&V::channelLimiterReleaseMs)},
-    {"stageOn", "3D stage", ST, "3D Stage", "3d stage room hall space position reflections binaural ear listener", nullptr, nullptr, true, D(&V::stageEnabled, &V::stageMode, &V::stageSpeakerDirectivity, &V::stageSpeaker, &V::stageKeepReverb, &V::stageRays, &V::stageTailTrim, &V::stageRoom, &V::stageListener, &V::stageChannel, &V::stageYaw, &V::stageAir, &V::stageEar, &V::stageSurface, &V::stageChannelOn, &V::stageChannelMix, &V::stageFurniture, &V::stageMeshPath, &V::stageMeshUpY, &V::stageMeshScale, &V::stageMeshMaterial)},
+    {"stageOn", "3D stage", ST, "3D Stage", "3d stage room hall space position reflections binaural ear listener", nullptr, nullptr, false, D(&V::stageEnabled, &V::stageMode, &V::stageSpeakerDirectivity, &V::stageSpeaker, &V::stageKeepReverb, &V::stageRays, &V::stageTailTrim, &V::stageRoom, &V::stageListener, &V::stageChannel, &V::stageYaw, &V::stageAir, &V::stageEar, &V::stageSurface, &V::stageChannelOn, &V::stageChannelMix, &V::stageFurniture, &V::stageMeshPath, &V::stageMeshUpY, &V::stageMeshScale, &V::stageMeshMaterial)},
     {"decByLevel", nullptr, P, nullptr, nullptr, nullptr, nullptr, false, D(&V::decimationByLevel)},
     {"cull", nullptr, P, nullptr, nullptr, nullptr, nullptr, false, D(&V::decimationCullBlocks)},
     {"reexcite", nullptr, P, nullptr, nullptr, nullptr, nullptr, false, D(&V::noteOnReexcite)},

@@ -462,6 +462,15 @@ const char* FlashTarget() { return FlashLive() ? g_flashAnchor.c_str() : ""; }
 
 void SetScrollHost() { g_scrollHost = ImGui::GetCurrentWindow(); }
 
+void ForwardWheelToScrollHost() {
+    const float wheel = ImGui::GetIO().MouseWheel;
+    if (!g_scrollHost || wheel == 0.0f || !ImGui::IsWindowHovered()) return;
+    // The step ImGui takes in a window it scrolls itself: five lines, at most two thirds of the view.
+    const float step = std::trunc((std::min)(5.0f * g_scrollHost->FontRefSize,
+                                             g_scrollHost->InnerRect.GetHeight() * 0.67f));
+    ImGui::SetScrollY(g_scrollHost, g_scrollHost->Scroll.y - wheel * step);
+}
+
 void Anchor(const char* anchor, ImVec2 min, ImVec2 max) {
     if (!anchor) return;
     tour::Register(anchor, min, max);
@@ -1300,7 +1309,8 @@ bool Field(const char* id, char* buf, size_t bufSize, float width, const char* h
     return changed;
 }
 
-bool Select(const char* id, int* current, const char* const* items, int count, float width) {
+bool Select(const char* id, int* current, const char* const* items, int count, float width,
+            const char* const* tips) {
     PushText(0, 13.0f);
     PushFieldStyle(S(38.0f));
     ImGui::PushStyleColor(ImGuiCol_PopupBg, g_tok.card2);
@@ -1316,6 +1326,7 @@ bool Select(const char* id, int* current, const char* const* items, int count, f
                 *current = i;
                 changed = true;
             }
+            if (tips && tips[i] && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tips[i]);
         }
         ImGui::EndCombo();
     }

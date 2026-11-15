@@ -472,6 +472,8 @@ void ConfiguratorApp::RenderFrame() {
     ImGui::End();
     ImGui::PopStyleVar(3);
 
+    if (page_ == NavPage::Stage) DrawStageTransport(config_, areaMin, areaMax);
+    else StopStageListening();
     DrawSearchResults();
     DrawSaveBar(areaMin, areaMax);
     ShowMegaFuckerNotification(easterEggs_, &showMegaFuckerPopup_);
@@ -1066,6 +1068,7 @@ void ConfiguratorApp::DrawPageContent() {
     lc.client = liveSupported ? &rlClient_ : nullptr;
     lc.telemetry = rlConnected_ ? &rlTelemetry_ : nullptr;
     lc.connected = liveSupported;
+    lc.stageLive = liveSupported && !stageUnsupported_;
     SetLiveLinkContext(lc);
 
     if (const int added = HandleDroppedSoundFonts(config_)) {

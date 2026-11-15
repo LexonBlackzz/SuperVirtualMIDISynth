@@ -25,6 +25,7 @@ struct LiveLinkContext {
     svms::EngineLink* client = nullptr; // direct client access (reserved)
     const SVMS_TelemetryV3* telemetry = nullptr;
     bool connected = false;
+    bool stageLive = false;                      // the 3D stage can be changed on the running driver
 };
 
 void SetLiveLinkContext(const LiveLinkContext& ctx);
