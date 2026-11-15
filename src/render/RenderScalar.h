@@ -720,6 +720,8 @@ private:
     }
     static void WholeVoicePreTailCaptureHook(VoiceHandle handle,
                                              void* userData);
+    static bool WholeVoiceVictimDroppedProbe(VoiceHandle handle,
+                                             void* userData);
     static void WholeVoiceDeferredReleaseHook(VoiceHandle handle,
                                               void* userData);
     static void WholeVoiceSilenceVoiceHook(VoiceHandle handle,

@@ -182,6 +182,44 @@ inline void VoiceManager::PrefetchVoiceLines(VoiceHandle handle) {
 #endif
 }
 
+// Every per-handle line an in-place or free-slot launch reads or writes,
+// requested in one go the moment the slot is known.  Each of these is its own
+// array (or row), so in a large pool they are all cold and, fetched one by
+// one as the launch reaches them, add up to most of its cost; asked for
+// together they arrive in about the time of one.
+inline void VoiceManager::PrefetchLaunchLines(VoiceHandle handle) {
+#if defined(SVMS_VM_HAS_PREFETCH)
+    if (handle >= maxVoices_) return;
+#define SVMS_PREFETCH_LINE(address) _mm_prefetch(reinterpret_cast<const char*>(address), _MM_HINT_T0)
+    SVMS_PREFETCH_LINE(&v.rows[handle]);
+    SVMS_PREFETCH_LINE(&linkRows_[handle]);
+    SVMS_PREFETCH_LINE(&v.state[handle]);
+    SVMS_PREFETCH_LINE(&v.envelopeStage[handle]);
+    SVMS_PREFETCH_LINE(&v.renderClass[handle]);
+    SVMS_PREFETCH_LINE(&v.loopEnabled[handle]);
+    SVMS_PREFETCH_LINE(&v.currentGain[handle]);
+    SVMS_PREFETCH_LINE(&v.targetGain[handle]);
+    SVMS_PREFETCH_LINE(&v.stealOutputGain[handle]);
+    SVMS_PREFETCH_LINE(&v.birthFrame[handle]);
+    SVMS_PREFETCH_LINE(&v.halfBand[handle]);
+    SVMS_PREFETCH_LINE(&v.stealFadeInFramesRemaining[handle]);
+    SVMS_PREFETCH_LINE(&v.stealFadeInFramesTotal[handle]);
+    if (v.launch != nullptr) {
+        SVMS_PREFETCH_LINE(&v.launch[handle]);
+        SVMS_PREFETCH_LINE(reinterpret_cast<const char*>(&v.launch[handle]) + 64);
+    }
+    SVMS_PREFETCH_LINE(&activePosition_[handle]);
+    SVMS_PREFETCH_LINE(&stealCandidateDeferred_[handle]);
+    SVMS_PREFETCH_LINE(&stealCandidateReserved_[handle]);
+    SVMS_PREFETCH_LINE(&stealStableKey_[handle]);
+    SVMS_PREFETCH_LINE(&stealWinnerTree_[stealTreeLeafBase_ + handle]);
+    SVMS_PREFETCH_LINE(&stealVolatileHeapPosition_[handle]);
+#undef SVMS_PREFETCH_LINE
+#else
+    (void)handle;
+#endif
+}
+
 inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity) {
     ++stealPeekEpoch_;
     v.state[handle]        = static_cast<uint8_t>(VoiceState::Active);

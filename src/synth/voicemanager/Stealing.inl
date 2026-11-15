@@ -112,8 +112,13 @@ inline void VoiceManager::CaptureStealTail(VoiceHandle handle) {
     if (handle >= maxVoices_) return;
     // The ghost copy (preTailCaptureHook_) and the tail capture both read the
     // victim's dense arrays: a victim launched earlier in this plan must have
-    // its record applied first.
-    EnsureMaterialized(handle);
+    // its record applied first.  The exception is a victim the plan drops
+    // without a ghost while its successor is staged over it: the successor's
+    // record replaces the victim's, and the arrays keep whatever an earlier
+    // deferred ghost still has to read.
+    if (!(ghostCopyDeferrable_ && victimDroppedProbe_ != nullptr &&
+          victimDroppedProbe_(handle, preTailCaptureUserData_)))
+        EnsureMaterialized(handle);
 #if defined(SVMS_NOTE_TRACE)
     if (g_noteTrace)
         g_noteTrace->OnSteal(handle, v.playIndex[handle], currentFrame_);
@@ -451,6 +456,7 @@ inline void VoiceManager::BuildStealHeap() {
 
 inline VoiceHandle VoiceManager::PopStealCandidate(uint32_t& activePosition,
                                                     bool reserveVolatileRoot) {
+    sampledIndexIdle_ = 0u;
     if (!stealHeapValid_) BuildStealHeap();
 
     // Releasing-ring fast path. Under saturated chopped-note churn the pool
@@ -737,6 +743,7 @@ inline VoiceHandle VoiceManager::SampledVictim(float newLevel,
         }
     }
     sampleCursor_ = cursor;
+    if (bestHandle != kInvalidVoice) PrefetchLaunchLines(bestHandle);
     if (bestHandle == kInvalidVoice) {
         if (sampleFailFrame_ != currentFrame_) {
             sampleFailFrame_ = currentFrame_;
@@ -781,6 +788,7 @@ inline bool VoiceManager::RejectNoteOnWith(uint32_t count, LevelFn&& levelOf,
         freeTop_ >= count || activeCount_ + count <= voiceLimit_ ||
         activeCount_ == 0u)
         return false;
+    sampledIndexIdle_ = 0u;
     if (!stealHeapValid_) BuildStealHeap();
     VoiceHandle victim = kInvalidVoice;
     uint64_t floorKey = 0u;

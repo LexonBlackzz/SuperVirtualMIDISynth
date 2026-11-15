@@ -249,6 +249,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     voices.SetVoiceConfiguredHook(&WholeVoiceVoiceConfiguredHook, this);
     voices.SetVoiceForkedHook(&WholeVoiceVoiceForkedHook, this);
     voices.SetPreTailCaptureHook(&WholeVoicePreTailCaptureHook, this);
+    voices.SetVictimDroppedProbe(&WholeVoiceVictimDroppedProbe);
     voices.SetSilenceChannelHooks(&WholeVoiceSilenceVoiceHook,
                                   &WholeVoiceSilenceTailHook, this);
     voices.SetRowOpHooks(&WholeVoiceMixOpHook, &WholeVoiceBendOpHook,
@@ -312,6 +313,7 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
     voices.SetVoiceConfiguredHook(nullptr, nullptr);
     voices.SetVoiceForkedHook(nullptr, nullptr);
     voices.SetPreTailCaptureHook(nullptr, nullptr);
+    voices.SetVictimDroppedProbe(nullptr);
     voices.SetSilenceChannelHooks(nullptr, nullptr, nullptr);
     voices.SetRowOpHooks(nullptr, nullptr, nullptr, nullptr);
     voices.SetReExciteHook(nullptr, nullptr);

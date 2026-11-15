@@ -861,13 +861,22 @@ public:
     // is committed through the normal launch code the moment anything else
     // happens (see CommitPendingLaunch).
     void SetPlanWindow(bool active) noexcept { planWindow_ = active; }
+    //
+    // Sampled stealing uses the same run to park every launch for one note:
+    // the slots are known when the launch is parked (the chosen victim and
+    // its layers, or the top of the free stack) and their lines are
+    // requested then, so they have arrived when the next note-on, or the end
+    // of the run, writes the launch.  Nothing can observe the pool in
+    // between, so the order of every write is unchanged.
     bool BeginLazyLaunchRun() noexcept {
         lazyRunActive_ = planWindow_ && DropZeroLifeVictimsEnabled();
-        return lazyRunActive_;
+        deferRunActive_ = planWindow_ && sampledSteal_;
+        return lazyRunActive_ || deferRunActive_;
     }
     void EndLazyLaunchRun() noexcept {
         CommitPendingLaunch();
         lazyRunActive_ = false;
+        deferRunActive_ = false;
     }
     void CommitPendingLaunch() {
         if (pendingLaunch_.valid) CommitPendingLaunchImpl();
@@ -920,6 +929,14 @@ public:
                                void* userData) noexcept {
         preTailCaptureHook_ = hook;
         preTailCaptureUserData_ = userData;
+    }
+    // Tells whether the pre-tail-capture hook is about to drop `handle`
+    // without a ghost (a victim stolen on the frame it was born).  A staged
+    // victim that is dropped never needs its record copied to the dense
+    // arrays.  Shares the pre-tail-capture hook's user data.
+    using VictimDroppedProbe = bool(*)(VoiceHandle handle, void* userData);
+    void SetVictimDroppedProbe(VictimDroppedProbe probe) noexcept {
+        victimDroppedProbe_ = probe;
     }
     void SetVoiceConfiguredHook(VoiceConfiguredHook hook,
                                 void* userData) noexcept {
@@ -1317,6 +1334,12 @@ private:
     bool bucketSteal_ = false;
     bool sampledSteal_ = false;
     uint32_t sampleCursor_ = 0u;
+    // Sampled stealing never asks the quietest-first index for a victim, so
+    // a full pool that only replaces sampled victims in place lets the index
+    // go stale after this many launches in a row that did not need it; the
+    // next caller that does need it rebuilds it.
+    static constexpr uint32_t kSampledIndexIdleLaunches = 16384u;
+    uint32_t sampledIndexIdle_ = 0u;
     // Loudest note a scan has already failed to place on sampleFailFrame_.
     uint64_t sampleFailFrame_ = UINT64_MAX;
     float sampleFailLevel_ = 0.0f;
@@ -1491,6 +1514,7 @@ private:
 
     void InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity);
     void PrefetchVoiceLines(VoiceHandle handle);
+    void PrefetchLaunchLines(VoiceHandle handle);
     // staged = true leaves the launch-record fields (sampleBacked, relEnd,
     // filter coefficients/state) alone: the staged configure that follows
     // supplies them, and a deferred ghost copy may still need the old values.
@@ -1611,6 +1635,11 @@ private:
                                  const VoiceConfiguration* setups,
                                  uint32_t count, VoiceHandle* outHandles,
                                  bool& candidatesReservedInPlace);
+    bool ReuseVictimGroupInPlace(uint8_t channel, uint8_t note,
+                                 uint8_t velocity,
+                                 const VoiceConfiguration* setups,
+                                 uint32_t count, VoiceHandle victim,
+                                 VoiceHandle* outHandles);
     SVMS_VM_FORCEINLINE bool TryLaunchSingleVoiceInPlace(
         uint8_t channel, uint8_t note, uint8_t velocity,
         const VoiceConfiguration& setup, uint32_t playIndex,
@@ -1661,6 +1690,7 @@ private:
                            uint32_t units, bool sustain, uint32_t blockOffset,
                            bool newest = false);
     PreTailCaptureHook preTailCaptureHook_ = nullptr;
+    VictimDroppedProbe victimDroppedProbe_ = nullptr;
     void* preTailCaptureUserData_ = nullptr;
     VoiceConfiguredHook voiceConfiguredHook_ = nullptr;
     void* voiceConfiguredUserData_ = nullptr;
@@ -1691,6 +1721,9 @@ private:
     uint64_t lazyStarts_ = 0u;
     struct PendingLaunch {
         bool valid = false;
+        // 0: a lazy same-frame note.  1: a parked launch over a chosen victim
+        // group.  2: a parked launch into free slots.
+        uint8_t deferKind = 0u;
         uint32_t count = 0u;
         VoiceHandle handles[8]{};
         VoiceConfiguration setups[8];
@@ -1731,6 +1764,19 @@ private:
                                    const ChannelParamsSnapshot& channelParams,
                                    VoiceHandle* outHandles);
     void CommitPendingLaunchImpl();
+    bool deferRunActive_ = false;
+    bool CollectVictimGroup(VoiceHandle victim, uint32_t count,
+                            VoiceHandle* outHandles) const;
+    void ReplaceVictimGroup(uint8_t channel, uint8_t note, uint8_t velocity,
+                            const VoiceConfiguration* setups, uint32_t count,
+                            const VoiceHandle* handles);
+    bool TryDeferLaunch(uint8_t channel, uint8_t note, uint8_t velocity,
+                        const VoiceConfiguration* setups, uint32_t count,
+                        uint32_t playIndex,
+                        const ChannelParamsSnapshot& channelParams,
+                        uint32_t multiplicity, VoiceHandle victim,
+                        VoiceHandle* outHandles);
+    void CommitDeferredLaunch();
     void ReplaceGroupInPlace(uint8_t channel, uint8_t note, uint8_t velocity,
                              const VoiceConfiguration* setups, uint32_t count,
                              const VoiceHandle* handles,

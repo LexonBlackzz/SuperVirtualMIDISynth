@@ -593,12 +593,21 @@ inline uint32_t RenderScalar::WholeVoiceGhostLimit() const {
         ? ghostBudget_ : wvGhostCapacity_;
 }
 
+// A victim stolen on the frame it was born never sounded: with zero-life
+// dropping on, the pre-tail-capture hook below discards it without a ghost.
+inline bool RenderScalar::WholeVoiceVictimDroppedProbe(
+    VoiceHandle handle, void* userData) {
+    const RenderScalar* renderer = static_cast<const RenderScalar*>(userData);
+    return renderer != nullptr && handle < renderer->wvHandleCapacity_ &&
+        DropZeroLifeVictimsEnabled() &&
+        renderer->wvStartFrame_[handle] == renderer->wvEventFrame_;
+}
+
 inline void RenderScalar::WholeVoicePreTailCaptureHook(
     VoiceHandle handle, void* userData) {
     RenderScalar* renderer = static_cast<RenderScalar*>(userData);
     if (renderer == nullptr || handle >= renderer->wvHandleCapacity_) return;
-    const bool zeroLife = DropZeroLifeVictimsEnabled() &&
-        renderer->wvStartFrame_[handle] == renderer->wvEventFrame_;
+    const bool zeroLife = WholeVoiceVictimDroppedProbe(handle, userData);
     if (zeroLife ||
         renderer->wvGhostCount_ >= renderer->WholeVoiceGhostLimit()) {
         // Zero-life victim (opt-in) or pathological block (more steals than

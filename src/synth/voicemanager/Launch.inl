@@ -1007,6 +1007,141 @@ inline bool VoiceManager::ReuseMatchingStealGroup(
     return true;
 }
 
+// A victim the caller already chose (sampled stealing, same-key recycling):
+// when its play group has exactly as many layers as the new note, the group
+// is replaced where it stands, like the unreserved branch of
+// ReuseMatchingStealGroup.  The slots keep their active-list places and
+// nothing passes through the free stack, so the launch can be staged and a
+// ghost copy deferred.  CollectVictimGroup lists the group (victim first, then
+// its earlier layers, then its later ones) and fails when the sizes differ.
+inline bool VoiceManager::CollectVictimGroup(
+    VoiceHandle victim, uint32_t count, VoiceHandle* outHandles) const {
+    if (freeTop_ != 0u || count == 0u || count > 8u || victim >= maxVoices_ ||
+        perKeyVoiceCap_ != 0u)
+        return false;
+    uint32_t groupCount = 1u;
+    outHandles[0] = victim;
+    for (int32_t linked = playGroupPrev_[victim]; linked >= 0;
+         linked = playGroupPrev_[static_cast<uint32_t>(linked)]) {
+        if (groupCount >= count) return false;
+        outHandles[groupCount++] = static_cast<VoiceHandle>(linked);
+    }
+    for (int32_t linked = playGroupNext_[victim]; linked >= 0;
+         linked = playGroupNext_[static_cast<uint32_t>(linked)]) {
+        if (groupCount >= count) return false;
+        outHandles[groupCount++] = static_cast<VoiceHandle>(linked);
+    }
+    return groupCount == count;
+}
+
+inline void VoiceManager::ReplaceVictimGroup(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count,
+    const VoiceHandle* handles) {
+    // The index is not consulted on this path: once it has gone unused for a
+    // while it is dropped rather than repaired on every launch.
+    if (stealHeapValid_ && sampledSteal_ &&
+        ++sampledIndexIdle_ >= kSampledIndexIdleLaunches)
+        InvalidateStealCandidates();
+    for (uint32_t i = 0u; i < count; ++i) {
+        stealCandidateReserved_[handles[i]] = 0u;
+        if (stealHeapValid_) RemoveStealCandidate(handles[i]);
+    }
+    ReplaceGroupInPlace(channel, note, velocity, setups, count, handles,
+                        false);
+}
+
+inline bool VoiceManager::ReuseVictimGroupInPlace(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count, VoiceHandle victim,
+    VoiceHandle* outHandles) {
+    if (!CollectVictimGroup(victim, count, outHandles)) return false;
+    for (uint32_t i = 1u; i < count; ++i) PrefetchLaunchLines(outHandles[i]);
+    ReplaceVictimGroup(channel, note, velocity, setups, count, outHandles);
+    return true;
+}
+
+// Parks a launch whose slots are already known (see BeginLazyLaunchRun).
+// Only the group links are read here; everything the launch writes is
+// requested now and written by CommitDeferredLaunch.
+inline bool VoiceManager::TryDeferLaunch(
+    uint8_t channel, uint8_t note, uint8_t velocity,
+    const VoiceConfiguration* setups, uint32_t count, uint32_t playIndex,
+    const ChannelParamsSnapshot& channelParams, uint32_t multiplicity,
+    VoiceHandle victim, VoiceHandle* outHandles) {
+    if (count > 8u || perKeyVoiceCap_ != 0u) return false;
+    for (uint32_t layer = 0u; layer < count; ++layer) {
+        // A choking note retires other voices first; it takes the direct path.
+        if (setups[layer].exclusiveClass != 0u ||
+            setups[layer].offByClass != 0u)
+            return false;
+    }
+    PendingLaunch& p = pendingLaunch_;
+    if (victim != kInvalidVoice) {
+        if (!CollectVictimGroup(victim, count, outHandles)) return false;
+        p.deferKind = 1u;
+    } else {
+        if (voiceLimit_ == 0u || freeTop_ < count ||
+            activeCount_ + count > voiceLimit_)
+            return false;
+        for (uint32_t i = 0u; i < count; ++i)
+            outHandles[i] = static_cast<VoiceHandle>(
+                freeStack_[freeTop_ - 1u - i]);
+        p.deferKind = 2u;
+    }
+    for (uint32_t i = 0u; i < count; ++i) PrefetchLaunchLines(outHandles[i]);
+    p.valid = true;
+    p.removed = false;
+    p.treeDirty = false;
+    p.count = count;
+    p.channel = channel;
+    p.note = note;
+    p.velocity = velocity;
+    p.playIndex = playIndex;
+    p.multiplicity = multiplicity > 1u ? multiplicity : 1u;
+    p.params = &channelParams;
+    for (uint32_t i = 0u; i < count; ++i) {
+        p.handles[i] = outHandles[i];
+        p.setups[i] = setups[i];
+    }
+    if (multiplicity > 1u) mergedVoicesMayExist_ = true;
+    return true;
+}
+
+// Writes a parked launch: the same calls, in the same order, the direct path
+// makes for an in-place victim group or for free slots.
+inline void VoiceManager::CommitDeferredLaunch() {
+    PendingLaunch& p = pendingLaunch_;
+    const uint8_t kind = p.deferKind;
+    p.valid = false;
+    p.deferKind = 0u;
+    struct MultiplicityRestore {
+        uint32_t& slot;
+        uint32_t saved;
+        ~MultiplicityRestore() { slot = saved; }
+    } restore{launchMult_, launchMult_};
+    launchMult_ = p.multiplicity > 1u ? p.multiplicity : 1u;
+    if (kind == 1u) {
+        ReplaceVictimGroup(p.channel, p.note, p.velocity, p.setups, p.count,
+                           p.handles);
+    } else {
+        for (uint32_t layer = 0u; layer < p.count; ++layer) {
+            const VoiceHandle taken = AllocateVoiceOrSteal(
+                p.channel, p.note, p.velocity, nullptr, true, false);
+            assert(taken == p.handles[layer]);
+            (void)taken;
+        }
+    }
+    if (launchStagingActive_ && stealTailCaptureSuppressed_)
+        groupStageNext_ = true;
+    for (uint32_t layer = 0u; layer < p.count; ++layer) {
+        ConfigureVoice(p.handles[layer], p.setups[layer], p.playIndex,
+                       *p.params, false);
+    }
+    groupStageNext_ = false;
+    CommitVoiceGroupConfigurations(p.handles, p.count, false);
+}
+
 // Capture every old layer, then replace the complete physical note in
 // place. The fast path keeps its winner-tree leaves reserved; the fallback
 // removed them above. Active positions and the free stack never move.
@@ -1421,6 +1556,10 @@ inline bool VoiceManager::TryLazyRemovedGroupLaunch(
 inline void VoiceManager::CommitPendingLaunchImpl() {
     ++stealPeekEpoch_;
     PendingLaunch& p = pendingLaunch_;
+    if (p.valid && p.deferKind != 0u) {
+        CommitDeferredLaunch();
+        return;
+    }
     if (p.valid && p.removed) {
         // The group already left the index: this is the tail of a group-reuse
         // launch whose victim could not be reserved in place.
@@ -1584,6 +1723,18 @@ inline bool VoiceManager::LaunchVoiceGroup(
             }
         }
     }
+    if (deferRunActive_ &&
+        TryDeferLaunch(channel, note, velocity, setups, count, playIndex,
+                       channelParams, multiplicity, recycleVictim,
+                       outHandles))
+        return true;
+    if (recycleVictim == kInvalidVoice && freeTop_ != 0u) {
+        // The free slots this launch is about to take.
+        const uint32_t take = (std::min)(count, freeTop_);
+        for (uint32_t i = 0u; i < take; ++i)
+            PrefetchLaunchLines(static_cast<VoiceHandle>(
+                freeStack_[freeTop_ - 1u - i]));
+    }
     const PriorityIncoming incoming{channel, note, velocity};
     if (recycleVictim == kInvalidVoice &&
         (sampledSteal_ || stealReject_.load(std::memory_order_relaxed)) &&
@@ -1638,9 +1789,12 @@ inline bool VoiceManager::LaunchVoiceGroup(
         return true;
     }
     bool candidatesReservedInPlace = false;
-    if (recycleVictim != kInvalidVoice ||
-        !ReuseMatchingStealGroup(channel, note, velocity, setups, count,
-                                 outHandles, candidatesReservedInPlace)) {
+    const bool reusedInPlace = recycleVictim != kInvalidVoice
+        ? ReuseVictimGroupInPlace(channel, note, velocity, setups, count,
+                                  recycleVictim, outHandles)
+        : ReuseMatchingStealGroup(channel, note, velocity, setups, count,
+                                  outHandles, candidatesReservedInPlace);
+    if (!reusedInPlace) {
         // ── FLAG (steal-batch scope) ─────────────────────────────────────
         // The victim batching is deliberately scoped to ONE launch
         // transaction: between the first and last layer selection no
@@ -1676,7 +1830,11 @@ inline bool VoiceManager::LaunchVoiceGroup(
         uint32_t batchPositions[kStealBatchMaxLayers];
         bool consumed[kStealBatchMaxLayers] = {};
         uint32_t popped = 0u;
-        const bool batchSteal = stealBatchingEnabled_ &&
+        // With a free slot for every layer no layer steals, so the victims
+        // popped here would all be put straight back.
+        const bool freeForAll = keyedVictim == kInvalidVoice &&
+            freeTop_ >= count && activeCount_ + count <= voiceLimit_;
+        const bool batchSteal = stealBatchingEnabled_ && !freeForAll &&
             count >= 2u && count <= kStealBatchMaxLayers &&
             // Releasing-ring-ordered victims cannot be re-armed (the ring
             // entry is consumed and there is no front-repush), so the batch
@@ -1741,6 +1899,11 @@ inline bool VoiceManager::LaunchVoiceGroup(
 #if defined(SVMS_ENABLE_REFERENCE_RENDERER)
     const uint64_t configureBegin = BeginLaunchStageForTest();
 #endif
+    // Layers that took a free slot or went through the general steal are
+    // staged like an in-place replacement: nothing is left to read their
+    // dense arrays before the render item applies the record.
+    if (launchStagingActive_ && stealTailCaptureSuppressed_)
+        groupStageNext_ = true;
     for (uint32_t layer = 0u; layer < count; ++layer) {
         // Keep every layer invisible to the steal index until the complete
         // physical note has been prepared.  The former layered path linked a
