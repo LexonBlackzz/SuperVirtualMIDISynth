@@ -419,6 +419,13 @@ void Shortcuts(ConfigDocument& doc) {
         ui::EndTile();
     }
     {
+        const ChipDef tags[] = {{"Saves CPU", ChipKind::Cpu}, {"Not bit-exact", ChipKind::Bad}};
+        SwitchTile(doc, "halfRate", "Half-rate voices",
+                   "Steady, dull-sounding voices render at half the sample rate and are rebuilt at the output rate. Nearly lossless; bright or filtered voices are left alone.",
+                   &w.halfRate, SVMS_COMMAND_SET_HALF_RATE, tags, 2, 0.3f);
+        ui::EndTile();
+    }
+    {
         const ChipDef tags[] = {{"Saves a lot of CPU", ChipKind::Cpu}, {"Bends can land a few ms late", ChipKind::Bad}};
         SwitchTile(doc, "bendCol", "Thin out pitch bends",
                    "Keeps only the latest bend per channel every few milliseconds. Note timing is untouched.",

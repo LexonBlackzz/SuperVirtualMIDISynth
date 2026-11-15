@@ -206,6 +206,7 @@ inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, u
     v.sampleBacked[handle] = 0;
     v.presetIndex[handle] = UINT16_MAX;
     v.regionIndex[handle] = UINT16_MAX;
+    v.halfBand[handle] = 0u;
     v.playIndex[handle] = UINT32_MAX;
     v.mult[handle] = 1u;
     exclusiveClass_[handle] = 0u;

@@ -6,6 +6,8 @@
 #include "synth/ChannelCache.h"
 #include "synth/Config.h"
 #include "synth/PresetResolve.h"
+#include "render/HalfRateBus.h"
+#include "render/SampleBandwidth.h"
 #include "render/Envelope.h"
 #include "events/EventCompile.h"
 #include "render/HilbertPair.h"
@@ -107,6 +109,7 @@ public:
                                        std::memory_order_relaxed);
             renderer_.SetGhostBudget(t->ghostBudget);
             renderer_.SetDecimationEnabled(t->decimation);
+            renderer_.SetHalfRate(t->halfRate, 0.0f);
             renderer_.SetDecimationByLevel(t->decimationByLevel);
             renderer_.SetMutedTailCullBlocks(t->decimationCullBlocks);
             SetFastChunkMath(t->fastChunkMath);
@@ -352,6 +355,11 @@ public:
                 (unsigned long long)renderer_.GetWvJobCycles(),
                 (unsigned long long)renderer_.GetWvPostCycles());
         }
+        if (std::getenv("SVMS_REPORT_REFUSALS") != nullptr &&
+            renderer_.GetHalfRateRows() != 0u)
+            std::fprintf(stderr, "[SVMS] half-rate rows=%llu frames=%llu\n",
+                (unsigned long long)renderer_.GetHalfRateRows(),
+                (unsigned long long)renderer_.GetHalfRateFrames());
         if (gpuStage_ && std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {
             const GpuStageStats& g = gpuStage_->Stats();
             const unsigned long long onGpu = g.rows + g.envRows;
@@ -742,6 +750,7 @@ private:
         float panL, panR;
         uint32_t delay, hold, attack, decay, release;
         bool valid;
+        uint8_t halfBand = 0;  // sample bandwidth code, 0 = unknown
     };
 
     // Launch-transaction scratch: the region group's configurations are
@@ -1007,10 +1016,26 @@ private:
 
     void RebuildPrepared() {
         ++levelEpoch_;
-        for (const Bank& b : banks_)
-            for (uint32_t i = 0; i < b.data->regionCount; ++i)
-                Prepare(b.data.get(), b.data->regions[i],
-                        prepared_[b.regionBase + i]);
+        for (const Bank& b : banks_) {
+            std::vector<int16_t> codes(b.data->sampleCount, int16_t(-1));
+            for (uint32_t i = 0; i < b.data->regionCount; ++i) {
+                PreparedRegion& out = prepared_[b.regionBase + i];
+                Prepare(b.data.get(), b.data->regions[i], out);
+                const uint32_t si = b.data->regions[i].sampleIndex;
+                if (!out.valid || si >= b.data->sampleCount ||
+                    !b.data->sampleData) continue;
+                if (codes[si] < 0) {
+                    const SF2Sample& smp = b.data->samples[si];
+                    codes[si] = smp.end > smp.start &&
+                                smp.end <= b.data->sampleDataFrames
+                        ? int16_t(MeasureSampleBandCode(
+                              sampleData_.data() + b.sampleBase + smp.start,
+                              smp.end - smp.start))
+                        : int16_t(0);
+                }
+                out.halfBand = uint8_t(codes[si]);
+            }
+        }
     }
 
     void UpdateNoteMergeHoist() {
@@ -1159,6 +1184,7 @@ private:
             voice.filterEnabled = prepared.filter.enabled;
             voice.presetIndex = uint16_t(preset);
             voice.regionIndex = uint16_t(localRegion);
+            voice.halfBand = prepared.halfBand;
             voice.exclusiveClass = region.exclusiveClass > 0
                 ? uint16_t(region.exclusiveClass) : 0u;
             voice.offByClass = region.offByClass < 0

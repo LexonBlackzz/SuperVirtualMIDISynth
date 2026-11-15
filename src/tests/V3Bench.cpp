@@ -156,6 +156,8 @@ struct Options {
     bool gpuSort = true;                // --gpu-sort 0|1: order GPU lists by sample region
     uint32_t gpuDeadlinePercent = 0u;   // 0 = wait for the GPU
     uint32_t bulkAdmissionPercent = 0u; // --bulk-admission P: 0 = off
+    const char* dumpAudio = nullptr;    // --dump-audio P: raw float32 L then R of blocks 24..31
+    float halfRateBand = 0.0f;          // --half-rate F: half-rate bus, assumed band fraction F (0 = off)
 };
 
 bool ParseBackend(const char* value, Options& options) {
@@ -292,6 +294,10 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             svms::SetFilteredGroupKernelForTest(false);
         } else if (std::strcmp(argv[i], "--bulk-admission") == 0) {
             if (!nextNumber(options.bulkAdmissionPercent)) return false;
+        } else if (std::strcmp(argv[i], "--dump-audio") == 0 && i + 1 < argc) {
+            options.dumpAudio = argv[++i];
+        } else if (std::strcmp(argv[i], "--half-rate") == 0 && i + 1 < argc) {
+            options.halfRateBand = static_cast<float>(std::atof(argv[++i]));
         } else if (std::strcmp(argv[i], "--fast-chunk-math") == 0) {
             svms::SetFastChunkMath(true);
         } else if (std::strcmp(argv[i], "--filter-cents") == 0 && i + 1 < argc) {
@@ -884,6 +890,7 @@ int main(int argc, char** argv) {
     renderer->SetDecimationByLevel(options.decimationByLevel);
     renderer->SetMutedTailCullBlocks(options.cullMutedBlocks);
     renderer->SetBulkAdmissionPercent(options.bulkAdmissionPercent);
+    renderer->SetHalfRate(options.halfRateBand > 0.0f, options.halfRateBand);
     gBenchVibratoLfo = options.vibratoLfo;
     if (options.vibratoLfo) {
         for (uint32_t a = 0; a < voices->activeCount_; ++a) {
@@ -1337,6 +1344,8 @@ int main(int argc, char** argv) {
     uint64_t absoluteFrame = 0u;
     uint32_t stealSequence = options.voices;
 
+    std::FILE* dumpFile = options.dumpAudio ? std::fopen(options.dumpAudio, "wb") : nullptr;
+    uint32_t dumpBlock = 0u;
     auto renderOne = [&] {
         if (options.shards > 1u) {
             shardFrame.store(absoluteFrame, std::memory_order_release);
@@ -1388,6 +1397,10 @@ int main(int argc, char** argv) {
             channelLimiter.ProcessAndSum(channelBusLeft, channelBusRight,
                                          left.data(), right.data(),
                                          options.frames);
+        }
+        if (dumpFile != nullptr && dumpBlock++ >= 24u && dumpBlock <= 32u) {
+            std::fwrite(left.data(), sizeof(float), options.frames, dumpFile);
+            std::fwrite(right.data(), sizeof(float), options.frames, dumpFile);
         }
         if (gCollectBreakdown) {
             const uint64_t renderEnd = __rdtsc();
@@ -1663,6 +1676,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "{\"bulk_admission\":{\"percent\":%u,\"dropped\":%llu}}\n",
             options.bulkAdmissionPercent,
             static_cast<unsigned long long>(renderer->GetBulkAdmissionDropped()));
+    if (options.halfRateBand > 0.0f)
+        std::fprintf(stderr, "{\"half_rate\":{\"rows\":%llu,\"frames\":%llu}}\n",
+            static_cast<unsigned long long>(renderer->GetHalfRateRows()),
+            static_cast<unsigned long long>(renderer->GetHalfRateFrames()));
     std::fprintf(stderr, "{\"wv_cycles\":{\"plan\":%llu,\"jobs\":%llu,\"post\":%llu}}\n",
         static_cast<unsigned long long>(renderer->GetWvPlanCycles()),
         static_cast<unsigned long long>(renderer->GetWvJobCycles()),

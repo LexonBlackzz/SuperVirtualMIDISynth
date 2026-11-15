@@ -136,6 +136,10 @@ struct EngineConfig {
     // (events.nested_note_off), so a short note inside a long one on the same
     // key does not end the long one. Off by default: the oldest is released.
     bool nestedNoteOff;
+    // Opt-in half-rate voice bus (quality.half_rate): sustained looping voices
+    // with little high-frequency content render at half the output rate and
+    // are reconstructed. Nearly lossless, not bit-equal. Off by default.
+    bool halfRate;
     // Opt-in block-granular dispatch: admitted events fire at block start
     // instead of their exact intra-block offset. Off by default.
     bool blockTimingMode;

@@ -201,6 +201,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.overflowMode = 1;
     d.correctnessMode = true;
     d.decimation = false;
+    d.halfRate = false;
     d.decimationByLevel = true;
     d.fastChunkMath = false;
     d.decimationCullBlocks = 5;
@@ -350,6 +351,7 @@ void ConfigDocument::FromJson(const json& root) {
     if (auto it = root.find("quality"); it != root.end() && it->is_object()) {
         ReadBool(*it, "correctness_mode", working_.correctnessMode);
         ReadBool(*it, "decimation", working_.decimation);
+        ReadBool(*it, "half_rate", working_.halfRate);
         ReadBool(*it, "decimation_by_level", working_.decimationByLevel);
         ReadBool(*it, "fast_chunk_math", working_.fastChunkMath);
         ReadNum(*it, "decimation_cull_blocks", working_.decimationCullBlocks,
@@ -864,6 +866,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.overflowMode == b.overflowMode
         && a.correctnessMode == b.correctnessMode
         && a.decimation == b.decimation
+        && a.halfRate == b.halfRate
         && a.decimationByLevel == b.decimationByLevel
         && a.fastChunkMath == b.fastChunkMath
         && a.decimationCullBlocks == b.decimationCullBlocks

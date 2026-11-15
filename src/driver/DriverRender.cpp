@@ -2142,6 +2142,7 @@ uint64_t Driver::HandleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity,
         setup.gainRight = regionPanRight;
         setup.presetIndex = static_cast<uint16_t>(presetIndex);
         setup.regionIndex = static_cast<uint16_t>(matchedRegionIndex);
+        setup.halfBand = prepared ? prepared->halfBand : uint8_t(0);
         setup.exclusiveClass = matchedRegion->exclusiveClass > 0
             ? static_cast<uint16_t>(matchedRegion->exclusiveClass) : 0u;
         setup.offByClass = matchedRegion->offByClass < 0

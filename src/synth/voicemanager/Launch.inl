@@ -550,6 +550,7 @@ inline void VoiceManager::ApplyVoiceConfigurationFieldsImpl(
 
     v.presetIndex[handle] = setup.presetIndex;
     v.regionIndex[handle] = setup.regionIndex;
+    v.halfBand[handle] = setup.halfBand;
     exclusiveClass_[handle] = setup.exclusiveClass < kExclusiveClassCount
         ? static_cast<uint8_t>(setup.exclusiveClass) : 0u;
     v.targetGain[handle] = setup.initialGain;

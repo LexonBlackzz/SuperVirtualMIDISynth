@@ -406,6 +406,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
         {"quality", {
             {"correctness_mode", cfg.correctnessMode},
             {"decimation", cfg.decimation},
+            {"half_rate", cfg.halfRate},
             {"decimation_by_level", cfg.decimationByLevel},
             {"fast_chunk_math", cfg.fastChunkMath},
             {"decimation_cull_blocks", cfg.decimationCullBlocks},
@@ -948,6 +949,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
     if (auto it = root.find("quality"); it != root.end() && it->is_object()) {
         if (!ReadBool(*it, "correctness_mode", cfg.correctnessMode))
             AppendWarning(cfg.configWarning, "quality.correctness_mode");
+        if (!ReadBool(*it, "half_rate", cfg.halfRate))
+            AppendWarning(cfg.configWarning, "quality.half_rate");
         if (!ReadBool(*it, "decimation", cfg.decimation))
             AppendWarning(cfg.configWarning, "quality.decimation");
         if (!ReadBool(*it, "decimation_by_level", cfg.decimationByLevel))
@@ -1176,6 +1179,7 @@ void ApplyEnvironment(EngineConfig& cfg) {
     // Handy for A/B renders of one file with the tools (svms_v3_midi_song).
     cfg.noteMerge = EnvironmentFlag(L"SVMS_NOTE_MERGE", cfg.noteMerge);
     cfg.nestedNoteOff = EnvironmentFlag(L"SVMS_NESTED_NOTE_OFF", cfg.nestedNoteOff);
+    cfg.halfRate = EnvironmentFlag(L"SVMS_HALF_RATE", cfg.halfRate);
     cfg.keepLoaded = EnvironmentFlag(L"SVMS_KEEP_LOADED", cfg.keepLoaded);
     cfg.noteOnReexcite = EnvironmentFlag(L"SVMS_NOTE_REEXCITE", cfg.noteOnReexcite);
     cfg.correctnessMode = EnvironmentFlag(L"SVMS_CORRECTNESS_MODE", cfg.correctnessMode);
@@ -1268,6 +1272,7 @@ EngineConfig EngineConfig::Default() {
     cfg.fastProducer = false;    // opt-in: shared MPSC lanes by default
     cfg.noteMerge = false;       // opt-in: every note-on launches its own voice
     cfg.nestedNoteOff = false;   // opt-in: a note-off ends the oldest open note
+    cfg.halfRate = false;        // opt-in: every voice renders at the output rate
     cfg.noteOnReexcite = false;  // opt-in: collapsed hits are dropped, not re-excited
     cfg.blockTimingMode = false;  // opt-in: exact-frame dispatch by default
     cfg.unboundedRender = false;  // opt-in: recovery + caps stay on by default

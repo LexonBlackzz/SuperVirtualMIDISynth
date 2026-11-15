@@ -14,6 +14,7 @@
 #include "render/RenderKernels.h"
 #include "render/VoiceFilter.h"
 #include "render/RenderWorkers.h"
+#include "render/HalfRateBus.h"
 // GPU render stage (default off; compiled out of the XP build).
 #if !defined(SVMS_XP_COMPAT) && !defined(SVMS_NO_GPU_STAGE)
 #define SVMS_GPU_STAGE 1
@@ -339,6 +340,7 @@ struct WholeVoiceJobContext {
     uint32_t voiceItemCount;
     uint32_t ghostItemCount;
     uint32_t jobCount;
+    bool halfRate = false;   // half-rate bus enabled for this block
 };
 
 // Steal-tail record captured from a ghost's exact steal-frame state.  The
@@ -573,6 +575,54 @@ private:
     std::atomic<uint32_t> bulkAdmissionPercent_{0u};
     bool bendFusion_ = true;
     std::atomic<uint64_t> bendFusedSpans_{0u};
+    // Half-rate voice bus (HalfRateBus.h): steady sustained looping voices
+    // with little high-frequency content render at half the output rate.
+    // Default off.  `halfRateBand_` is the bandwidth fraction assumed for a
+    // voice whose region has no measured value (1 = never rides the bus).
+    std::atomic<bool> halfRateOn_{false};
+    std::atomic<float> halfRateBand_{1.0f};
+    std::atomic<uint64_t> halfRateRows_{0u};
+    std::atomic<uint64_t> halfRateFrames_{0u};
+    std::atomic<uint64_t> halfRateClassRows_[kVoiceRenderClassCount]{};
+    std::vector<float> wvHalfBus_;     // per job: left then right, wvHalfStride_ each
+    uint32_t wvHalfStride_ = 0u;
+    uint64_t wvHalfBlockStart_ = 0u;   // absolute frame of the block being rendered
+    uint32_t wvHalfJobs_ = 0u;
+    std::vector<uint32_t> wvHalfHandles_;   // per job queue of rows riding the bus
+    std::vector<uint64_t> wvHalfPos_;
+    std::vector<float> wvHalfStep_;
+    std::vector<uint8_t> wvHalfClass_;   // VoiceRenderClass of the queued row
+    std::vector<float> wvHalfG0_;        // gain before the bus run
+    std::vector<float> wvHalfK_;         // original step / slope / decay
+    std::vector<uint32_t> wvHalfRem_;    // original stage / release counter
+    uint32_t wvHalfQueueStride_ = 0u;
+    std::vector<uint8_t> wvHalfUsed_;   // per job: its bus holds voices this block
+    void FinishHalfRate(uint32_t jobCount, uint32_t frameCount, float* outL,
+                        float* outR);
+    bool EnsureHalfRateScratch(uint32_t jobCount, uint32_t numFrames,
+                               uint32_t itemCount);
+    void FlushHalfRate(VoiceManager& voices, const int16_t* sampleData,
+                       uint32_t sampleDataFrames, uint32_t frameCount,
+                       uint32_t jobIndex, uint32_t queued,
+                       const IndexedJobMix& mix);
+    // Renders the row on the half-rate bus when it qualifies for this block;
+    // false = nothing touched, the caller renders it at full rate.
+    static void SetHalfRateEnvelope(VoiceSoA& v, uint32_t handle,
+                                    VoiceRenderClass cls, float gain,
+                                    float param);
+    void FinishHalfRateChunk(VoiceManager& voices, VoiceRenderClass klass,
+                             bool loop, bool rendered, const uint32_t* handles,
+                             const uint32_t* entries, uint32_t count,
+                             size_t base, const int16_t* sampleData,
+                             uint32_t sampleDataFrames, uint32_t frameCount,
+                             uint32_t jobIndex, const IndexedJobMix& mix);
+    bool TryRenderHalfRate(VoiceManager& voices, uint32_t handle,
+                           const int16_t* sampleData,
+                           uint32_t sampleDataFrames, uint32_t frameCount,
+                           uint32_t jobIndex, uint32_t& queued);
+    float* HalfRatePlane(uint32_t jobIndex, bool right);
+    bool HalfRateCandidate(const VoiceSoA& v, uint32_t handle,
+                           uint32_t frameCount) const;
     uint64_t bulkAdmissionDropped_ = 0u;
     std::vector<RenderEvent> admittedEvents_;
     float* splitBusLeft_[kChannelCount] = {};
@@ -937,6 +987,23 @@ public:
     // at every op.  On by default; off restores the split, which the tests use
     // as the reference.
     void SetBendFusion(bool on) { bendFusion_ = on; }
+    // Half-rate voice bus: `defaultBand` is the bandwidth fraction (content
+    // over the sample's Nyquist) assumed for every voice until the loaders
+    // supply per-region values.
+    void SetHalfRate(bool on, float defaultBand) {
+        halfRateBand_.store(defaultBand, std::memory_order_relaxed);
+        halfRateOn_.store(on, std::memory_order_relaxed);
+    }
+    uint64_t GetHalfRateRows() const {
+        return halfRateRows_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetHalfRateClassRows(VoiceRenderClass cls) const {
+        return halfRateClassRows_[static_cast<uint32_t>(cls)].load(
+            std::memory_order_relaxed);
+    }
+    uint64_t GetHalfRateFrames() const {
+        return halfRateFrames_.load(std::memory_order_relaxed);
+    }
     // Spans that ran with fused bends since the renderer started.
     uint64_t GetFusedBendSpans() const {
         return bendFusedSpans_.load(std::memory_order_relaxed);
@@ -1131,6 +1198,7 @@ private:
 #include "render/renderscalar/WholeVoicePlan.inl"
 #include "render/renderscalar/WholeVoiceRender.inl"
 #include "render/renderscalar/WholeVoiceStorage.inl"
+#include "render/renderscalar/HalfRate.inl"
 #include "render/renderscalar/GpuStageRender.inl"
 
 } // namespace svms

@@ -796,6 +796,8 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
     // before any dense-array read (including the batch look-ahead below).
     VoiceManager& poolVoices = *ctx->voices;
     const bool stagedPending = poolVoices.StagedPending();
+    const bool halfRateOn = ctx->halfRate;
+    uint32_t halfQueued = 0u;
     for (uint32_t item = begin; item < end; ++item) {
         if (item < ctx->voiceItemCount) {
             const uint32_t handle = renderer->wvItemHandles_[item];
@@ -854,6 +856,11 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     continue;
                 }
             }
+            if (halfRateOn && mix.busLeft == nullptr &&
+                renderer->TryRenderHalfRate(
+                    *ctx->voices, handle, ctx->sampleData,
+                    ctx->sampleDataFrames, frameCount, jobIndex, halfQueued))
+                continue;
             // Common whole-block case: consecutive carried/new voices with
             // the same single segment can share one class-kernel dispatch.
             // Runs never cross a job boundary, and handles remain in active-
@@ -879,7 +886,8 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     renderer->wvChanOpStart_[batchChannel + 1u] &&
                 !renderer->wvScalarVibrato_ &&
                 !renderer->WholeVoiceRowMuted(handle) &&
-                !renderer->wvChanVibratoActive_[batchChannel];
+                !renderer->wvChanVibratoActive_[batchChannel] &&
+                !(halfRateOn && renderer->HalfRateCandidate(v, handle, frameCount));
             if (batchHeadEligible) {
                 uint32_t batchEnd = item + 1u;
                 while (batchEnd < end &&
@@ -894,6 +902,8 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     if (v.state[next] ==
                         static_cast<uint8_t>(VoiceState::Free) ||
                         renderer->WholeVoiceRowMuted(next) ||
+                        (halfRateOn &&
+                         renderer->HalfRateCandidate(v, next, frameCount)) ||
                         renderer->wvReleaseFrame_[next] != UINT32_MAX ||
                         (renderer->wvExciteHead_ != nullptr &&
                          next < renderer->wvExciteCapacity_ &&
@@ -1146,6 +1156,10 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                                           frameCount - death);
         }
     }
+    if (halfQueued != 0u)
+        renderer->FlushHalfRate(*ctx->voices, ctx->sampleData,
+                                ctx->sampleDataFrames, frameCount, jobIndex,
+                                halfQueued, mix);
 }
 
 inline void RenderScalar::RenderWholeVoiceBlock(
@@ -1323,6 +1337,14 @@ inline void RenderScalar::RenderWholeVoiceBlock(
         }
         if (jobCount < 2u) jobCount = 1u;
         ctx.jobCount = jobCount;
+        ctx.halfRate = halfRateOn_.load(std::memory_order_relaxed) &&
+                       channelBusLeft == nullptr &&
+                       numFrames >= halfrate::kMinFrames &&
+                       EnsureHalfRateScratch(jobCount, numFrames, itemCount);
+        if (ctx.halfRate) {
+            std::fill(wvHalfUsed_.begin(), wvHalfUsed_.end(), uint8_t(0));
+            wvHalfBlockStart_ = blockStartFrame;
+        }
         if (wvDecimating_ && activeCount > 1u &&
             wvPartMixed_.size() >= activeCount)
             PartitionMutedRows(activeCount, itemCount, jobCount);
@@ -1345,6 +1367,8 @@ inline void RenderScalar::RenderWholeVoiceBlock(
                                     channelBusLeft, channelBusRight};
             WholeVoiceJobThunk(0u, serialMix, numFrames, &ctx);
         }
+        if (ctx.halfRate)
+            FinishHalfRate(ctx.jobCount, numFrames, outputLeft, outputRight);
 #if defined(_MSC_VER)
         wvJobCycles_ += __rdtsc() - wvJobBegin;
 #endif

@@ -1277,6 +1277,8 @@ struct PreparedSF2Region {
     uint32_t decaySamples;
     uint32_t releaseSamples;
     uint8_t valid;
+    // Half-rate bus: sample bandwidth code (SampleBandwidth.h), 0 = unknown.
+    uint8_t halfBand;
 };
 
 // One SoundFont load produces one self-contained immutable bundle.  The

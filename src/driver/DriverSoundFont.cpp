@@ -2,6 +2,7 @@
 
 #include "driver/DriverInternal.h"
 #include "render/HilbertPair.h"
+#include "render/SampleBandwidth.h"
 
 namespace svms {
 
@@ -299,6 +300,26 @@ SoundFontBundle* Driver::BuildSoundFontBundle(const wchar_t* path,
             for (uint32_t region = 0; region < sf2->regionCount; ++region) {
                 PrepareSF2Region(sf2, sf2->regions[region], sampleRate,
                                  channelCache, bundle->preparedRegions[region]);
+            }
+            // Bandwidth code per sample, measured once, for the half-rate bus.
+            if (sf2->sampleData && sf2->sampleCount != 0u) {
+                std::vector<uint8_t> codes(sf2->sampleCount, uint8_t(0));
+                std::vector<uint8_t> done(sf2->sampleCount, uint8_t(0));
+                for (uint32_t region = 0; region < sf2->regionCount; ++region) {
+                    PreparedSF2Region& prepared = bundle->preparedRegions[region];
+                    const uint32_t si = sf2->regions[region].sampleIndex;
+                    if (!prepared.valid || si >= sf2->sampleCount) continue;
+                    if (!done[si]) {
+                        const SF2Sample& smp = sf2->samples[si];
+                        if (smp.end > smp.start &&
+                            smp.end <= sf2->sampleDataFrames)
+                            codes[si] = svms::MeasureSampleBandCode(
+                                sf2->sampleData + smp.start,
+                                smp.end - smp.start);
+                        done[si] = 1u;
+                    }
+                    prepared.halfBand = codes[si];
+                }
             }
         }
         if (!bundle->preparedRegions) {

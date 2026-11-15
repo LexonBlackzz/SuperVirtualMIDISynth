@@ -633,6 +633,7 @@ bool Driver::Initialize() {
     renderScalar->SetGhostBudget(cfg.ghostBudget);
     renderScalar->SetBulkAdmissionPercent(cfg.bulkAdmissionPercent);
     renderScalar->SetDecimationEnabled(cfg.decimation);
+    renderScalar->SetHalfRate(cfg.halfRate, 0.0f);
     renderScalar->SetDecimationByLevel(cfg.decimationByLevel);
     SetFastChunkMath(cfg.fastChunkMath);
     renderScalar->SetMutedTailCullBlocks(cfg.decimationCullBlocks);

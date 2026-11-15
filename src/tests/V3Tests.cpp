@@ -146,6 +146,7 @@ int main() {
     TestStepBreakKernels();
     TestBendFusionIdentity();
     TestLazyLaunchIdentity();
+    TestHalfRateBus();
     TestWholeVoiceRotationLaunchDifferential();
     TestWholeVoiceResetBarrierDifferential();
     TestFloorLimitedReleaseSamples();

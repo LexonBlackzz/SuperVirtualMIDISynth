@@ -450,7 +450,8 @@ struct SamplePage {
 // (index gathers in BuildVolatileStealKeysAVX2).
 #define SVMS_VOICE_SOA_COLD_FIELDS(X) \
     X(float, stealOutputGain) \
-    X(uint64_t, birthFrame)
+    X(uint64_t, birthFrame) \
+    X(uint8_t, halfBand)
 
 #define SVMS_VOICE_SOA_DYNAMIC_FIELDS(X) \
     SVMS_VOICE_SOA_DENSE_FIELDS(X) \

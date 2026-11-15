@@ -3615,3 +3615,164 @@ void TestLazyLaunchIdentity() {
         }
     }
 }
+
+// Half-rate voice bus: sustained looping voices with little high-frequency
+// content render at half rate and are reconstructed.  The sample is a sine
+// with a whole number of cycles in the loop (seamless wrap), so the output
+// must match the full-rate render to the linear-interpolation difference.
+struct HalfRateTestContext {
+    svms::VoiceManager* voices;
+    const svms::ChannelParamsSnapshot* channelParams;
+    uint32_t playIndex = 9000u;
+};
+
+void DispatchHalfRateEvents(const svms::RenderEvent* events,
+                            uint32_t eventCount, uint32_t, void* userData) {
+    auto& c = *static_cast<HalfRateTestContext*>(userData);
+    for (uint32_t i = 0u; i < eventCount; ++i) {
+        const svms::RenderEvent& e = events[i];
+        if (e.type == svms::RenderEventType::NoteOn) {
+            svms::VoiceConfiguration s;
+            s.sampleStart = 0u;
+            s.sampleEnd = 16384u;
+            s.loopStart = 64u;
+            s.loopEnd = 4032u;
+            // Even keys loop, odd keys play the sample once.
+            s.loopMode = (e.data1 & 1u) ? 0u : 1u;
+            s.phaseStep = s.basePhaseStep = 0.4f + e.data1 * 0.004f;
+            s.initialGain = 0.6f;
+            s.sustainLevel = 0.5f;
+            // Velocity picks the envelope: 100 reaches sustain at once, 101
+            // has a slow attack, 102 a long decay; every release is long.
+            s.attackSamples = e.data2 == 101u ? 3000u : 0u;
+            s.attackGainStep = e.data2 == 101u ? s.initialGain / 3000.0f : 0.0f;
+            s.decaySamples = e.data2 == 100u ? 53u : 20000u;
+            s.decaySlope = e.data2 == 100u ? 0.99f : 0.99997f;
+            s.releaseDecay = 0.9998f;
+            s.releaseSamples = e.data2 == 100u ? 100000u : 0u;
+            s.gainLeft = 0.02f + 0.001f * static_cast<float>(e.data1 & 7u);
+            s.gainRight = 0.03f;
+            s.sampleBacked = 1u;
+            svms::VoiceHandle handle = svms::kInvalidVoice;
+            s.playIndex = c.playIndex;
+            c.voices->LaunchVoiceGroup(e.channel, e.data1, e.data2, &s, 1u,
+                                       c.playIndex++,
+                                       c.channelParams[e.channel], &handle);
+        } else if (e.type == svms::RenderEventType::NoteOff) {
+            for (uint32_t a = 0; a < c.voices->activeCount_; ++a) {
+                const uint32_t voice = c.voices->activeList_[a];
+                if (c.voices->v.channel[voice] == e.channel &&
+                    c.voices->v.note[voice] == e.data1)
+                    c.voices->StartRelease(voice);
+            }
+        }
+    }
+}
+
+void RunHalfRateBus(bool avx2Pass) {
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 12u;
+    constexpr uint32_t kPool = 32u;
+    const uint32_t sampleCount = 16384u;
+    std::vector<int16_t> samples(16384u + 8u, 0);
+    const double w = 2.0 * 3.14159265358979323846 * 8.0 / 3968.0;
+    for (uint32_t i = 0; i < 16384u; ++i)
+        samples[i] = static_cast<int16_t>(
+            0.35 * std::sin(w * static_cast<double>(i)) * 32767.0);
+
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+
+    auto fullVoices = std::make_unique<svms::VoiceManager>();
+    auto halfVoices = std::make_unique<svms::VoiceManager>();
+    Check(fullVoices->Initialize(kPool, 44100u) &&
+              halfVoices->Initialize(kPool, 44100u),
+          "half-rate bus allocates both pools");
+    svms::ChannelCache fullChannels = seedChannels;
+    svms::ChannelCache halfChannels = seedChannels;
+    svms::RenderScalar full;
+    svms::RenderScalar half;
+    Check(full.ReserveVoiceCapacity(kPool) && half.ReserveVoiceCapacity(kPool) &&
+              full.ConfigureRenderThreads(1u, kFrames) &&
+              half.ConfigureRenderThreads(1u, kFrames),
+          "half-rate bus starts both renderers");
+    const svms::RenderBackend backend = avx2Pass
+        ? svms::RenderBackend::AVX2 : svms::RenderBackend::Scalar;
+    Check(full.SetRenderBackend(backend) && half.SetRenderBackend(backend),
+          "half-rate bus selects the backend");
+    half.SetHalfRate(true, 0.5f);
+    HalfRateTestContext fullContext{fullVoices.get(), fullChannels.GetParams()};
+    HalfRateTestContext halfContext{halfVoices.get(), halfChannels.GetParams()};
+    full.SetEventBatchDispatcher(DispatchHalfRateEvents, &fullContext);
+    half.SetEventBatchDispatcher(DispatchHalfRateEvents, &halfContext);
+
+    float worst = 0.0f, peak = 0.0f;
+    for (uint32_t block = 0; block < kBlocks; ++block) {
+        std::vector<svms::RenderEvent> events;
+        const auto push = [&](svms::RenderEventType type, uint8_t key,
+                              uint32_t frame, uint8_t velocity) {
+            svms::RenderEvent e{};
+            e.type = type;
+            e.channel = 0u;
+            e.data1 = key;
+            e.data2 = velocity;
+            e.frameOffset = frame;
+            e.ingressSequence = static_cast<uint32_t>(events.size());
+            events.push_back(e);
+        };
+        if (block == 0u)
+            for (uint8_t k = 0; k < 12u; ++k)
+                push(svms::RenderEventType::NoteOn, static_cast<uint8_t>(40u + k),
+                     3u + k, 100u + (k % 3u));
+        // Some voices release mid-block (that block renders them at full
+        // rate) and then ride the bus as release voices; a late joiner too.
+        if (block == 5u)
+            for (uint8_t k = 0; k < 12u; ++k)
+                if ((k & 1u) || k % 4u == 0u)
+                    push(svms::RenderEventType::NoteOff, static_cast<uint8_t>(40u + k),
+                     200u + k, 0u);
+        if (block == 6u)
+            push(svms::RenderEventType::NoteOn, 60u, 100u, 100u);
+        std::vector<float> fl(kFrames, 0.0f), fr(kFrames, 0.0f);
+        std::vector<float> hl(kFrames, 0.0f), hr(kFrames, 0.0f);
+        const uint64_t start = 30000u + block * kFrames;
+        full.RenderBlock(*fullVoices, fullChannels, samples.data(), sampleCount,
+                         fl.data(), fr.data(), kFrames, cfg, events.data(),
+                         static_cast<uint32_t>(events.size()), true, start);
+        half.RenderBlock(*halfVoices, halfChannels, samples.data(), sampleCount,
+                         hl.data(), hr.data(), kFrames, cfg, events.data(),
+                         static_cast<uint32_t>(events.size()), true, start);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            worst = (std::max)(worst, (std::max)(std::fabs(fl[i] - hl[i]),
+                                                 std::fabs(fr[i] - hr[i])));
+            peak = (std::max)(peak, std::fabs(fl[i]));
+        }
+    }
+    std::fprintf(stderr, "[HALFRATE] %s worst diff=%g peak=%g rows=%llu\n",
+                 avx2Pass ? "avx2" : "scalar", worst, peak,
+                 static_cast<unsigned long long>(half.GetHalfRateRows()));
+    Check(half.GetHalfRateRows() > 10u, "half-rate bus carried voices");
+    // The scalar kernel set only batches sustained loops; AVX2 takes all six.
+    if (avx2Pass)
+    for (svms::VoiceRenderClass cls :
+         {svms::VoiceRenderClass::SustainedLoop, svms::VoiceRenderClass::SustainedOneShot,
+          svms::VoiceRenderClass::TransientLoop, svms::VoiceRenderClass::TransientOneShot,
+          svms::VoiceRenderClass::ReleaseLoop, svms::VoiceRenderClass::ReleaseOneShot})
+        Check(half.GetHalfRateClassRows(cls) > 0u,
+              "half-rate bus carried voices of every render class");
+    Check(peak > 0.002f, "half-rate bus test is audible");
+    Check(worst < 2.0e-4f * peak + 1.0e-6f,
+          "half-rate bus matches the full-rate render to the interpolation "
+          "difference");
+}
+
+void TestHalfRateBus() {
+    RunHalfRateBus(false);
+    if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
+        RunHalfRateBus(true);
+}

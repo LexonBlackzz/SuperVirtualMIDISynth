@@ -360,6 +360,8 @@ struct VoiceConfiguration {
     uint32_t filterEnabled = 0u;
     uint16_t presetIndex = UINT16_MAX;
     uint16_t regionIndex = UINT16_MAX;
+    // Half-rate bus bandwidth code (SampleBandwidth.h), 0 = unknown.
+    uint8_t halfBand = 0u;
     // Membership class for SF2 exclusiveClass / SFZ group.
     uint16_t exclusiveClass = 0;
     // Class stopped by this note. Zero falls back to exclusiveClass so
