@@ -84,6 +84,7 @@ public:
     // Engine shutdown (never from DllMain): unload the driver, end the thread.
     void ShutdownForProcessEnd();
     uint64_t XrunCount() const;
+    long OutputLatencyFrames() const;   // as the driver last reported it
 
 private:
     AsioHost() = default;

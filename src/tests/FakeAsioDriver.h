@@ -56,8 +56,9 @@ public:
     }
 
     // Test-side triggers (any thread).
-    void RaiseMessage(long selector) {
-        if (ASIOCallbacks* cb = cb_) cb->asioMessage(selector, 0, nullptr, nullptr);
+    long RaiseMessage(long selector) {
+        if (ASIOCallbacks* cb = cb_) return cb->asioMessage(selector, 0, nullptr, nullptr);
+        return -1;
     }
     void RaiseRateChange(double rate) {
         g_fake.rate = rate;
