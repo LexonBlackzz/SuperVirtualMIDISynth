@@ -1163,6 +1163,20 @@ void Driver::ApplyAudioFormat(uint32_t newRate, uint32_t newFrames) {
         bufferFrames = (std::min)(newFrames, bufferCapacity);
     }
     if (newRate && newRate != sampleRate) {
+        if (clockInitialized && qpcFreq) {
+            // Event frames are counted from the clock epoch at the current
+            // rate. Move the epoch so the render cursor keeps the wall-clock
+            // moment it stands for at the new rate; otherwise every later
+            // event lands (seconds played x rate difference) frames off and
+            // snaps onto a block start.
+            const double cursor = static_cast<double>(virtualRenderSample_);
+            const double freq = static_cast<double>(qpcFreq);
+            const double shift = cursor * freq / static_cast<double>(sampleRate) -
+                                 cursor * freq / static_cast<double>(newRate);
+            virtualRenderClockQPC = static_cast<uint64_t>(
+                static_cast<int64_t>(virtualRenderClockQPC) + static_cast<int64_t>(std::llround(shift)));
+            compilerEpochQPC_.store(virtualRenderClockQPC, std::memory_order_release);
+        }
         sampleRate = newRate;
         if (stage_) stageSuspended_.store(true, std::memory_order_relaxed);
         postHighPass.Initialize(sampleRate);

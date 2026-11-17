@@ -189,6 +189,44 @@ void FakeOutputPlays() {
     CHECK(WaitFor(&VoicesQuiet, 3000));
 }
 
+// The most any event so far arrived behind the render cursor, in frames (it
+// is then clamped onto the block start).
+uint64_t MaxLatenessFrames() {
+    SVMS_TelemetryV2 t{};
+    t.struct_size = sizeof(t);
+    t.struct_version = SVMS_STRUCT_VERSION_1;
+    g_api.get_telemetry_v2(g_session, &t);
+    return t.late_clamp_max_lateness_frames;
+}
+
+// Event frames are counted from one clock epoch at the current rate. A live
+// rate change must keep the render cursor on the wall clock, or every later
+// event lands (seconds played x rate difference) frames off: going down from
+// 48 kHz after 3 s put the cursor about 12000 frames ahead of every new note,
+// so each one was clamped onto a block start. Normal jitter stays well under
+// one 256-frame block.
+void RateChangeKeepsEventTiming() {
+    CHECK(SetOutput("frames=256\nrate=48000"));
+    Sleep(3000);
+    CHECK(SetOutput("rate=44100"));
+    CHECK(CallbacksAdvance());
+    Sleep(200);
+    for (int i = 0; i < 25; ++i) {
+        const uint32_t key = 48u + static_cast<uint32_t>(i % 24);
+        g_api.send_short(g_session, 0x90u | (key << 8) | (100u << 16));
+        Sleep(10);
+        g_api.send_short(g_session, 0x80u | (key << 8));
+        Sleep(10);
+    }
+    Sleep(300);
+    const uint64_t lateness = MaxLatenessFrames();
+    if (lateness > 256u)
+        std::fprintf(stderr, "events up to %llu frames late after the rate change\n",
+                     static_cast<unsigned long long>(lateness));
+    CHECK(lateness <= 256u);
+    CHECK(WaitFor(&VoicesQuiet, 3000));
+}
+
 void RestartGrowsCapacity() {
     const uint32_t sizes[] = {32u, 2048u, 8192u, 64u};
     for (uint32_t frames : sizes) {
@@ -293,6 +331,7 @@ int main(int argc, char** argv) {
     }
 
     FakeOutputPlays();
+    RateChangeKeepsEventTiming();
     RestartGrowsCapacity();
     RestartStorm();
     SetAudioOutputRejectsUnknown();
