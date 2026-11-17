@@ -5,11 +5,13 @@
 
 #include "include/svmsapi.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -262,6 +264,28 @@ void RestartStorm() {
     CHECK(CallbacksAdvance());
 }
 
+// A live rate change rebuilds the 3D stage on the restart thread while stage
+// edits from the Configurator arrive on the RuntimeLink thread; the rebuild
+// must not replace the stage under an edit.
+void RestartWithStageEdits() {
+    char commit[512] = {};
+    g_api.send_runtime_command(g_session, SVMS_COMMAND_SET_STAGE, 0x100u, commit, sizeof(commit));
+    CHECK(std::string(commit).find("3D stage") == 0);   // the engine has a stage to rebuild
+    std::atomic<bool> stop{false};
+    std::thread editor([&] {
+        while (!stop) {
+            char text[512] = {};
+            g_api.send_runtime_command(g_session, SVMS_COMMAND_SET_STAGE, 0x100u, text,
+                                       sizeof(text));
+        }
+    });
+    for (int i = 0; i < 20; ++i)
+        CHECK(SetOutput(std::string("rate=") + (i % 2 ? "48000" : "44100")));
+    stop = true;
+    editor.join();
+    CHECK(CallbacksAdvance());
+}
+
 void SetAudioOutputRejectsUnknown() {
     std::string out;
     CHECK(Command(SVMS_COMMAND_SET_AUDIO_OUTPUT, "bogus=1", &out) != SVMS_RESULT_OK);
@@ -334,6 +358,7 @@ int main(int argc, char** argv) {
     RateChangeKeepsEventTiming();
     RestartGrowsCapacity();
     RestartStorm();
+    RestartWithStageEdits();
     SetAudioOutputRejectsUnknown();
     QueryAfterFallback();
 

@@ -1051,8 +1051,14 @@ void Driver::Park() {
     while (voiceManager && voiceManager->activeCount_ != 0u &&
            GetTickCount() - began < 250u)
         Sleep(2);
-    if (audioOutput) audioOutput->Stop();
-    parked_ = true;
+    {
+#if !defined(SVMS_XP_COMPAT)
+        // A live output restart may be swapping the output right now.
+        std::lock_guard<std::mutex> outputLock(audioOutputMutex_);
+#endif
+        if (audioOutput) audioOutput->Stop();
+        parked_ = true;
+    }
     LOG("Engine parked (synth.keep_loaded)");
 }
 
@@ -1066,7 +1072,12 @@ bool Driver::Unpark() {
     // The stream is stopped, so this resets directly (voices, effects tails,
     // queued events).
     ResetAllVoices();
-    parked_ = false;
+    {
+#if !defined(SVMS_XP_COMPAT)
+        std::lock_guard<std::mutex> outputLock(audioOutputMutex_);
+#endif
+        parked_ = false;
+    }
     const bool started = StartAudio();
     LOG("Engine resumed from park: %s", started ? "ok" : "stream start FAILED");
     return started;
@@ -1083,6 +1094,10 @@ void Driver::ArmGpuStage() {
 }
 
 bool Driver::StartAudio() {
+#if !defined(SVMS_XP_COMPAT)
+    // Serialised with live output restarts, which start the output themselves.
+    std::lock_guard<std::mutex> outputLock(audioOutputMutex_);
+#endif
     if (audioOutput && !audioOutput->IsRunning()) {
         // Every core's GPU stage takes the SoundFont now, while no stream runs,
         // so no note pays for the upload.
@@ -1224,8 +1239,19 @@ bool TestFakeAudio() {
 void Driver::OnAsioStreamDead(void* userData) {
     Driver* self = static_cast<Driver*>(userData);
     if (!self) return;
+    const AudioOutputSettings current = self->CurrentAudioSettings();
+    AudioOutputSettings settings;
+    {
+        std::lock_guard<std::mutex> control(self->audioControlMutex_);
+        // A pending request replaces this output anyway. While a restart
+        // runs, the settings it applies are newer than the ones in effect
+        // (those are recorded only when it finishes): repeat that request
+        // rather than reverting it.
+        if (self->audioRestartPending_) return;
+        settings = self->audioRestartRunning_ ? self->audioRestartRequest_ : current;
+    }
     LOG("ASIO stream lost, restarting the audio output");
-    self->RequestAudioRestart(self->CurrentAudioSettings());
+    self->RequestAudioRestart(settings);
 }
 
 // Builds (does not start) the requested output. A failed ASIO open falls
@@ -1323,8 +1349,14 @@ bool Driver::RestartAudioOutputNow(const AudioOutputSettings& settings) {
     bool started = false;
     if (out) {
         ApplyAudioFormat(out->GetSampleRate(), out->GetBufferFrames());
-        if (stage_ && stageSuspended_.load(std::memory_order_relaxed))
-            StartStage(stagePending_);
+        {
+            // Stage edits from the Configurator (ApplyStagePart) run under
+            // the RuntimeLink command lock; rebuilding the stage takes it too.
+            // Nothing a command does under that lock waits on this thread.
+            std::lock_guard<std::mutex> stageLock(runtimeCommandMutex_);
+            if (stage_ && stageSuspended_.load(std::memory_order_relaxed))
+                StartStage(stagePending_);
+        }
         SetGpuMinimumFrames(status.active == AudioBackend::ASIO ? 256u : 0u);
         audioOutput = out;
         if (parked_) {
@@ -1374,8 +1406,11 @@ void Driver::AudioControlLoop() {
             if (audioControlQuit_) return;
             settings = audioRestartRequest_;
             audioRestartPending_ = false;
+            audioRestartRunning_ = true;
         }
         RestartAudioOutputNow(settings);
+        std::lock_guard<std::mutex> lock(audioControlMutex_);
+        audioRestartRunning_ = false;
     }
 }
 

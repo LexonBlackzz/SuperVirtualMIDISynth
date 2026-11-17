@@ -984,6 +984,7 @@ private:
     std::condition_variable audioControlCv_;
     bool audioControlQuit_ = false;
     bool audioRestartPending_ = false;
+    bool audioRestartRunning_ = false;   // audioControlMutex_
     AudioOutputSettings audioRestartRequest_;
     mutable std::mutex audioStatusMutex_;
     AudioOutputSettings audioSettings_;
