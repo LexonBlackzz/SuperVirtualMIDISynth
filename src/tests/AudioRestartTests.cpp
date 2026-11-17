@@ -145,6 +145,37 @@ bool VoicesQuiet() { return Telemetry().active_voices == 0u; }
 bool VoicesSounding() { return Telemetry().active_voices > 0u; }
 bool SoundFontLoaded() { return Telemetry().soundfont_loaded != 0u; }
 
+SVMS_Result Command(uint32_t id, const std::string& in, std::string* out = nullptr) {
+    char text[512] = {};
+    strncpy_s(text, in.c_str(), _TRUNCATE);
+    const SVMS_Result r = g_api.send_runtime_command(g_session, id, 0u, text, sizeof(text));
+    if (out) *out = text;
+    return r;
+}
+
+std::string QueryValue(const std::string& key) {
+    std::string text;
+    Command(SVMS_COMMAND_QUERY_AUDIO_OUTPUT, "", &text);
+    const std::string all = "\n" + text;
+    const std::string k = "\n" + key + "=";
+    size_t p = all.find(k);
+    if (p == std::string::npos) return {};
+    p += k.size();
+    const size_t end = all.find('\n', p);
+    return all.substr(p, end == std::string::npos ? std::string::npos : end - p);
+}
+
+uint32_t QueryNumber(const std::string& key) {
+    return static_cast<uint32_t>(std::strtoul(QueryValue(key).c_str(), nullptr, 10));
+}
+
+bool Settled() { return QueryValue("restarting") == "0"; }
+
+bool SetOutput(const std::string& lines) {
+    return Command(SVMS_COMMAND_SET_AUDIO_OUTPUT, lines) == SVMS_RESULT_OK &&
+           WaitFor(&Settled, 10000);
+}
+
 // ---- tests ---------------------------------------------------------------
 
 void FakeOutputPlays() {
@@ -156,6 +187,62 @@ void FakeOutputPlays() {
     for (uint32_t key = 40; key < 48; ++key) g_api.send_short(g_session, 0x80u | (key << 8));
     PlayNotes(64);
     CHECK(WaitFor(&VoicesQuiet, 3000));
+}
+
+void RestartGrowsCapacity() {
+    const uint32_t sizes[] = {32u, 2048u, 8192u, 64u};
+    for (uint32_t frames : sizes) {
+        CHECK(SetOutput("frames=" + std::to_string(frames)));
+        CHECK(QueryNumber("frames") == frames);
+        CHECK(Telemetry().buffer_frames == frames);
+        CHECK(QueryValue("running") == "1");
+        CHECK(CallbacksAdvance());
+        if (frames == 8192u) CHECK(QueryNumber("capacity") >= 8192u);
+    }
+    PlayNotes(64);
+    CHECK(WaitFor(&VoicesQuiet, 3000));
+}
+
+void RestartStorm() {
+    const uint32_t sizes[] = {8u, 32u, 256u, 2048u, 441u};
+    for (int i = 0; i < 50; ++i) {
+        const std::string lines = "frames=" + std::to_string(sizes[i % 5]) +
+                                  "\nrate=" + (i % 2 ? "48000" : "44100");
+        CHECK(Command(SVMS_COMMAND_SET_AUDIO_OUTPUT, lines) == SVMS_RESULT_OK);
+        PlayNotes(40);
+        Sleep(10);
+    }
+    CHECK(WaitFor(&Settled, 15000));
+    CHECK(QueryNumber("frames") == 441u);
+    CHECK(QueryNumber("rate") == 48000u);
+    CHECK(QueryNumber("capacity") >= 2048u);
+    CHECK(CallbacksAdvance());
+    CHECK(WaitFor(&VoicesQuiet, 3000));
+    CHECK(SetOutput("frames=8192"));
+    CHECK(QueryNumber("capacity") >= 8192u);
+    CHECK(SetOutput("frames=441\nrate=44100"));
+    CHECK(CallbacksAdvance());
+}
+
+void SetAudioOutputRejectsUnknown() {
+    std::string out;
+    CHECK(Command(SVMS_COMMAND_SET_AUDIO_OUTPUT, "bogus=1", &out) != SVMS_RESULT_OK);
+    CHECK(out.find("bogus") != std::string::npos);
+    CHECK(Command(SVMS_COMMAND_SET_AUDIO_OUTPUT, "frames=0", &out) != SVMS_RESULT_OK);
+    CHECK(Command(SVMS_COMMAND_SET_AUDIO_OUTPUT, "backend=dsound", &out) != SVMS_RESULT_OK);
+    CHECK(QueryValue("restarting") == "0");
+}
+
+void QueryAfterFallback() {
+    CHECK(SetOutput("backend=asio\ndevice=NoSuchDriver"));
+    CHECK(QueryValue("requested") == "asio");
+    CHECK(QueryValue("active") == "wasapi-shared");
+    CHECK(QueryValue("fallback") == "1");
+    CHECK(!QueryValue("error").empty());
+    CHECK(CallbacksAdvance());
+    CHECK(SetOutput("backend=wasapi-shared\ndevice="));
+    CHECK(QueryValue("fallback") == "0");
+    CHECK(CallbacksAdvance());
 }
 
 } // namespace
@@ -206,6 +293,10 @@ int main(int argc, char** argv) {
     }
 
     FakeOutputPlays();
+    RestartGrowsCapacity();
+    RestartStorm();
+    SetAudioOutputRejectsUnknown();
+    QueryAfterFallback();
 
     g_api.destroy_session(g_session);
     FreeLibrary(dll);

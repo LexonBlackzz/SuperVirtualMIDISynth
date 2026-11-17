@@ -273,6 +273,13 @@ enum class RLCommandType : uint32_t {
     SetStage              = 0x0000012A,
     // Returns the program each channel last asked for, "p,p,..." (255 = none yet).
     QueryChannelPrograms  = 0x0000012B,
+    // text = "key=value" lines (backend, device, frames, rate, first_channel);
+    // missing keys keep their value. Restarts the audio output; returns at once.
+    SetAudioOutput        = 0x0000012C,
+    // Returns the audio output's state as "key=value" lines.
+    QueryAudioOutput      = 0x0000012D,
+    // text = ASIO driver name; returns its buffer sizes, rates and outputs.
+    ProbeAsioDriver       = 0x0000012E,
 
 
     Invalid              = 0xFFFFFFFF,

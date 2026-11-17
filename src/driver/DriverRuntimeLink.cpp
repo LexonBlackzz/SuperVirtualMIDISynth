@@ -51,6 +51,79 @@ static svms::RuntimeLiveStateV2 LiveStateFromMailbox(
     return l;
 }
 
+// "key=value" lines for the live audio output commands.
+static const char* AudioBackendName(AudioBackend backend) {
+    return backend == AudioBackend::ASIO ? "asio" : "wasapi-shared";
+}
+
+static std::string Utf8FromWide(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n > 0 ? n - 1 : 0), '\0');
+    if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::wstring WideFromUtf8Text(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(static_cast<size_t>(n > 0 ? n - 1 : 0), L'\0');
+    if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    return w;
+}
+
+static bool ParseUnsigned(const std::string& text, uint32_t lo, uint32_t hi, uint32_t& out) {
+    if (text.empty() || text.size() > 9) return false;
+    uint32_t v = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10u + static_cast<uint32_t>(c - '0');
+    }
+    if (v < lo || v > hi) return false;
+    out = v;
+    return true;
+}
+
+// Applies the request's lines on top of `s`; false names the bad line.
+static bool ParseAudioOutputRequest(const char* text, AudioOutputSettings& s,
+                                    std::string& bad) {
+    std::string all(text ? text : "");
+    size_t pos = 0;
+    while (pos <= all.size()) {
+        size_t end = all.find('\n', pos);
+        if (end == std::string::npos) end = all.size();
+        std::string line = all.substr(pos, end - pos);
+        pos = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty()) continue;
+        const size_t eq = line.find('=');
+        const std::string key = line.substr(0, eq);
+        const std::string value = eq == std::string::npos ? std::string() : line.substr(eq + 1);
+        bool ok = eq != std::string::npos;
+        if (!ok) {
+        } else if (key == "backend") {
+            if (value == "asio") s.backend = AudioBackend::ASIO;
+            else if (value == "wasapi-shared") s.backend = AudioBackend::WASAPIShared;
+            else ok = false;
+        } else if (key == "device") {
+            s.device = WideFromUtf8Text(value);
+        } else if (key == "frames") {
+            ok = ParseUnsigned(value, 1u, 8192u, s.bufferFrames);
+        } else if (key == "rate") {
+            ok = ParseUnsigned(value, 8000u, 384000u, s.sampleRate);
+        } else if (key == "first_channel") {
+            ok = ParseUnsigned(value, 0u, 63u, s.asioFirstChannel);
+        } else {
+            ok = false;
+        }
+        if (!ok) {
+            bad = line;
+            return false;
+        }
+    }
+    return true;
+}
+
 svms::RLResult Driver::HandleRuntimeLinkCommand(
     const svms::RuntimeLinkCommandV2& cmd, char* resultText) {
     using RT = svms::RLCommandType;
@@ -665,6 +738,63 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         }
         strncpy_s(resultText, kText, text.c_str(), _TRUNCATE);
         return svms::RLResult::Ok;
+    }
+    case RT::SetAudioOutput: {
+        AudioOutputSettings settings = CurrentAudioSettings();
+        std::string bad;
+        if (shardMaster_ || !ParseAudioOutputRequest(cmd.resultText, settings, bad)) {
+            strncpy_s(resultText, kText, ("bad audio output setting: " + bad).c_str(),
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        engineConfig_.audioBackend = settings.backend;
+        engineConfig_.audioDevice = settings.device;
+        engineConfig_.bufferFrames = settings.bufferFrames;
+        engineConfig_.sampleRate = settings.sampleRate;
+        engineConfig_.asioFirstChannel = settings.asioFirstChannel;
+        RequestAudioRestart(settings);
+        strncpy_s(resultText, kText, "audio output: restarting", _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+    case RT::QueryAudioOutput: {
+        const AudioOutputStatus s = GetAudioOutputStatus();
+        char head[200];
+        std::snprintf(head, sizeof(head),
+                      "requested=%s\nactive=%s\nframes=%u\nrate=%u\nfirst_channel=%u\n"
+                      "latency=%ld\nxruns=%llu\ncapacity=%u\nrunning=%d\nrestarting=%d\n"
+                      "fallback=%d\n",
+                      AudioBackendName(s.requested), AudioBackendName(s.active), s.frames,
+                      s.rate, s.firstChannel, s.outputLatencyFrames,
+                      static_cast<unsigned long long>(s.xruns), s.capacityFrames,
+                      s.running ? 1 : 0, s.restarting ? 1 : 0, s.fallback ? 1 : 0);
+        const std::string text = std::string(head) + "device=" + Utf8FromWide(s.device) +
+                                 "\nnote=" + s.note + "\nerror=" + s.error;
+        strncpy_s(resultText, kText, text.c_str(), _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
+    case RT::ProbeAsioDriver: {
+#if defined(SVMS_WITH_ASIO)
+        AsioCaps caps;
+        std::string error;
+        if (!AsioHost::Instance().Probe(cmd.resultText, caps, error)) {
+            strncpy_s(resultText, kText, error.c_str(), _TRUNCATE);
+            return svms::RLResult::LoadFailed;
+        }
+        std::string text = "sizes=";
+        for (size_t i = 0; i < caps.legalSizes.size(); ++i)
+            text += (i ? "," : "") + std::to_string(caps.legalSizes[i]);
+        text += "\npreferred=" + std::to_string(caps.preferredSize) + "\nrates=";
+        for (size_t i = 0; i < caps.rates.size(); ++i)
+            text += (i ? "," : "") + std::to_string(caps.rates[i]);
+        text += "\noutputs=" + std::to_string(caps.outputChannels) + "\nnames=";
+        for (size_t i = 0; i < caps.outputNames.size(); ++i)
+            text += (i ? "|" : "") + caps.outputNames[i];
+        strncpy_s(resultText, kText, text.c_str(), _TRUNCATE);
+        return svms::RLResult::Ok;
+#else
+        strncpy_s(resultText, kText, "ASIO is not built in", _TRUNCATE);
+        return svms::RLResult::Unsupported;
+#endif
     }
     case RT::SetStage: {
         std::string text;

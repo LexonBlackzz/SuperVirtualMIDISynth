@@ -454,7 +454,7 @@ bool Driver::Initialize() {
         settings.device = cfg.audioDevice;
         settings.bufferFrames = bufferFrames;
         settings.sampleRate = sampleRate;
-        settings.asioFirstChannel = 0u;
+        settings.asioFirstChannel = cfg.asioFirstChannel;
         AudioOutputStatus status;
         audioOutput = BuildAudioOutput(settings, status);
         if (!audioOutput) {

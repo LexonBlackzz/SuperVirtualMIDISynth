@@ -653,6 +653,15 @@ void TestJsonConfigurationLifecycle() {
     Check(invalidField.audioDevice == L"Playback 1/2 (E4x4 Pre)",
           "configured WASAPI endpoint friendly name is preserved");
     Check(!invalidField.configWarning.empty(), "invalid JSON field publishes warning");
+    Check(invalidField.asioFirstChannel == 0u, "ASIO output pair defaults to outputs 1/2");
+
+    {
+        std::ofstream output(configPath, std::ios::binary | std::ios::trunc);
+        output << R"json({"schema_version":1,"audio":{"backend":"asio","buffer_frames":8,"asio_first_channel":2}})json";
+    }
+    svms::EngineConfig asioPair = svms::EngineConfig::Load();
+    Check(asioPair.asioFirstChannel == 2u && asioPair.bufferFrames == 8u && asioPair.Validate(),
+          "ASIO output pair and an 8-frame buffer load from JSON");
 
     {
         std::ofstream output(configPath, std::ios::binary | std::ios::trunc);

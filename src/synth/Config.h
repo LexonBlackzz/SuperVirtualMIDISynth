@@ -238,6 +238,8 @@ struct EngineConfig {
     // render endpoint. Otherwise this is an exact (case-insensitive) WASAPI
     // endpoint friendly name.
     std::wstring audioDevice;
+    // ASIO only: first output of the stereo pair, 0-based (0 = outputs 1/2).
+    uint32_t asioFirstChannel = 0u;
     std::wstring soundFontPath;
     // Canonical priority order. soundFontPath mirrors entry zero for older
     // configurations and APIs that only understand one bank.

@@ -340,6 +340,33 @@ off the audio thread; sounding voices are reset when it activates. An SFZ in a
 multi-entry stack claims only Acoustic Grand Piano (and is the last resort for
 programs nothing else has); pin it to a channel to use it elsewhere.
 
+### Live audio output
+
+```c
+char text[256] = "backend=asio\ndevice=TOPPING Pro USB Audio Device\nframes=32";
+api.send_runtime_command(session, SVMS_COMMAND_SET_AUDIO_OUTPUT, 0u,
+                         text, sizeof(text));      /* returns at once */
+```
+
+`SET_AUDIO_OUTPUT` takes `key=value` lines: `backend` (`wasapi-shared` or
+`asio`), `device` (WASAPI endpoint or ASIO driver name), `frames` (1..8192;
+the exact ASIO buffer size, the nearest legal one when the driver does not
+offer it), `rate`, and `first_channel` (0-based first output of the ASIO
+stereo pair). Keys left out keep their value. The engine stops the output,
+builds the new one and starts it; the synth keeps its voices and queued
+events. An ASIO driver that cannot start falls back to WASAPI shared.
+
+`QUERY_AUDIO_OUTPUT` returns the state as lines: `requested`, `active`,
+`frames`, `rate`, `first_channel`, `latency` (driver-reported output latency
+in frames), `xruns`, `capacity` (largest block the engine is sized for),
+`running`, `restarting`, `fallback`, `device`, `note` (why the stream differs
+from the request) and `error`.
+
+`PROBE_ASIO_DRIVER` takes a driver name and returns `sizes` (the legal buffer
+sizes, comma-separated), `preferred`, `rates`, `outputs` and `names`
+(`|`-separated output names). It answers from the open driver when that driver
+is streaming.
+
 Invalid arguments return `SVMS_RESULT_INVALID_ARGUMENT` without touching
 engine state. New commands are added as new ids — callers must treat
 unknown ids as `SVMS_RESULT_INVALID_ARGUMENT`, not as errors to retry.

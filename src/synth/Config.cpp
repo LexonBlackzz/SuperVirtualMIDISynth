@@ -364,6 +364,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"device", WideToUtf8(cfg.audioDevice)},
             {"sample_rate", cfg.sampleRate},
             {"buffer_frames", cfg.bufferFrames},
+            {"asio_first_channel", cfg.asioFirstChannel},
             {"mono_downmix", cfg.monoDownmix}
         }},
         {"synth", {
@@ -768,8 +769,11 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         }
         if (!ReadValue(*it, "sample_rate", cfg.sampleRate, 8000u, 384000u))
             AppendWarning(cfg.configWarning, "audio.sample_rate");
-        if (!ReadValue(*it, "buffer_frames", cfg.bufferFrames, 16u, 8192u))
+        // ASIO drivers go down to 1-frame buffers (FlexASIO); 8 is common.
+        if (!ReadValue(*it, "buffer_frames", cfg.bufferFrames, 1u, 8192u))
             AppendWarning(cfg.configWarning, "audio.buffer_frames");
+        if (!ReadValue(*it, "asio_first_channel", cfg.asioFirstChannel, 0u, 63u))
+            AppendWarning(cfg.configWarning, "audio.asio_first_channel");
     }
     if (auto it = root.find("synth"); it != root.end() && it->is_object()) {
         if (!ReadValue(*it, "max_voices", cfg.maxVoices, 1u, kMaxPolyphony * 32u))   // total across shards; each core is split to <= kMaxPolyphony
@@ -1421,7 +1425,7 @@ EngineConfig EngineConfig::Load() {
 // True when every numeric setting is inside the range the engine supports.
 bool EngineConfig::Validate() const {
     return sampleRate >= 8000 && sampleRate <= 384000 &&
-            bufferFrames >= 16 && bufferFrames <= 8192 &&
+            bufferFrames >= 1 && bufferFrames <= 8192 &&
             maxVoices >= 1 && maxVoices <= kMaxPolyphony * (shards > 1u ? shards : 1u) &&
             voiceMemoryBudgetMB <= 65536u &&
             renderThreads <= 64u &&

@@ -554,6 +554,15 @@ typedef enum SVMS_Command {
     SVMS_COMMAND_SET_STAGE               = 0x0000012A,
     /* Result text: the program each channel last asked for, "p,p,..." (255 = none yet). */
     SVMS_COMMAND_QUERY_CHANNEL_PROGRAMS  = 0x0000012B,
+    /* text = "key=value" lines: backend (wasapi-shared|asio), device, frames, rate,
+     * first_channel (0-based ASIO output pair). Missing keys keep their value. The
+     * audio output restarts in place; the call returns before it is done. */
+    SVMS_COMMAND_SET_AUDIO_OUTPUT        = 0x0000012C,
+    /* Result text: the audio output's state as "key=value" lines. */
+    SVMS_COMMAND_QUERY_AUDIO_OUTPUT      = 0x0000012D,
+    /* text = ASIO driver name. Result text: its legal buffer sizes, preferred size,
+     * sample rates, output count and output names ("|"-separated). */
+    SVMS_COMMAND_PROBE_ASIO_DRIVER       = 0x0000012E,
     /* Reload the configured SoundFont (text = optional UTF-8 path). */
     SVMS_COMMAND_RELOAD_SOUNDFONT        = 0x00000101,
     SVMS_COMMAND_RESET_VOICES            = 0x00000102,
