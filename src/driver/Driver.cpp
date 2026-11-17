@@ -451,7 +451,7 @@ bool Driver::Initialize() {
     if (cfg.audioBackend == AudioBackend::ASIO) {
         AudioOutputASIO* asio = new AudioOutputASIO();
         asio->SetFormatChangedCallback(&Driver::OnAsioFormatChanged, this);
-        asio->SetRebuildCallback(&Driver::OnAsioRebuildRequested, this);
+        asio->SetDeadCallback(&Driver::OnAsioRebuildRequested, this);
         if (asio->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
             audioOutput = asio;
         } else {
@@ -1161,7 +1161,7 @@ void Driver::RebuildAudioOutput() {
         if (cfg.audioBackend == AudioBackend::ASIO && attempt < 2) {
             AudioOutputASIO* asio = new AudioOutputASIO();
             asio->SetFormatChangedCallback(&Driver::OnAsioFormatChanged, this);
-            asio->SetRebuildCallback(&Driver::OnAsioRebuildRequested, this);
+            asio->SetDeadCallback(&Driver::OnAsioRebuildRequested, this);
             asio->SetRenderCallback(RenderCallback, this);
             if (asio->Initialize(sampleRate, bufferFrames, cfg.audioDevice)) {
                 replacement = asio;
