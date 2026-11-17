@@ -473,8 +473,7 @@ bool Driver::Initialize() {
         if (!wasapi->Initialize(sampleRate, bufferFrames)) {
             HRESULT hr = wasapi->GetLastError();
             LOG("FAILED: AudioOutput::Initialize hr=0x%08X", (unsigned)hr);
-            XPBootstrapTrace("[SVMS XP] DirectSound initialization FAILED
-");
+            XPBootstrapTrace("[SVMS XP] DirectSound initialization FAILED\r\n");
             DiagWindow_UpdateStartup(false, static_cast<int32_t>(hr), false,
                                      sampleRate, bufferFrames, cfg.masterVolume,
                                      UsesXPWaveOut(audioOutput));
