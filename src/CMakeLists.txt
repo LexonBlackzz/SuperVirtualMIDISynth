@@ -1678,6 +1678,16 @@ if(SVMS_BUILD_TESTS)
                      COMMAND svms_v3_asio_stress_tests)
             set_tests_properties(svms_v3_asio_stress PROPERTIES
                 SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+            add_executable(svms_v3_asio_host_tests tests/AsioHostTests.cpp)
+            target_compile_definitions(svms_v3_asio_host_tests PRIVATE
+                NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+                ${SVMS_WITH_ASIO_DEF})
+            target_include_directories(svms_v3_asio_host_tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}"
+                "${SVMS_ASIO_INCLUDE}")
+            add_test(NAME svms_v3_asio_host COMMAND svms_v3_asio_host_tests)
+            set_tests_properties(svms_v3_asio_host PROPERTIES TIMEOUT 300)
         endif()
 
         add_executable(svms_v3_config_profile_tests
