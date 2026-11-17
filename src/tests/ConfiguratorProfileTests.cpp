@@ -85,6 +85,8 @@ int main() {
     route.sourcePreset = -1;
     document.Working().soundFontRoutes = {route};
     document.Working().midiInputDevice = L"Unicode MIDI Ω";
+    document.Working().asioFirstChannel = 2u;
+    document.Working().bufferFrames = 8u;
     document.MarkDirty();
     std::string error;
     ok &= Check(document.ExportProfile(exported.wstring(), &error),
@@ -96,6 +98,16 @@ int main() {
     ok &= Check(ReadJson(exported, exportedJson), "read exported profile");
     ok &= Check(exportedJson["synth"]["max_voices"] == 222u,
                 "export contains working value");
+    ok &= Check(exportedJson["audio"]["asio_first_channel"] == 2u &&
+                    exportedJson["audio"]["buffer_frames"] == 8u,
+                "export contains the ASIO output pair and an 8-frame buffer");
+    {
+        svms::cfg::ConfigDocument reloaded;
+        ok &= Check(reloaded.Load(exported.wstring()) &&
+                        reloaded.Working().asioFirstChannel == 2u &&
+                        reloaded.Working().bufferFrames == 8u,
+                    "ASIO output pair and 8-frame buffer load back");
+    }
     ok &= Check(exportedJson["midi"]["input_enabled"] == true &&
                     exportedJson["midi"]["input_device"] == "Unicode MIDI Ω",
                 "export preserves physical MIDI input routing");

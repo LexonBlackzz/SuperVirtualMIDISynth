@@ -14,12 +14,17 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include "driver/AsioSizes.h"
+#if defined(SVMS_WITH_ASIO)
+#include "driver/AsioHost.h"
+#endif
 #endif
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -118,6 +123,176 @@ int IndexOf(const uint32_t (&values)[N], uint32_t v) {
     return -1;
 }
 
+// --- Live audio output ---------------------------------------------------------------------
+
+#ifndef _WIN32
+// The Linux driver reopens ALSA only at start-up.
+void ApplyAudioOutputLive(const ConfigValues&) {}
+#else
+// The value of `key=` in a driver answer made of key=value lines.
+std::string KeyValue(const std::string& text, const char* key) {
+    const std::string k = std::string(key) + "=";
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        if (text.compare(pos, k.size(), k) == 0) return text.substr(pos + k.size(), end - pos - k.size());
+        pos = end + 1;
+    }
+    return {};
+}
+
+std::vector<std::string> SplitText(const std::string& text, char sep) {
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (!text.empty() && pos <= text.size()) {
+        size_t end = text.find(sep, pos);
+        if (end == std::string::npos) end = text.size();
+        parts.push_back(text.substr(pos, end - pos));
+        pos = end + 1;
+    }
+    return parts;
+}
+
+bool IsAsio(const ConfigValues& w) { return EqualCI(W2U(w.audioBackend), "asio"); }
+
+// Hands the page's whole output setting to the running driver, which restarts
+// its audio output with it. Offline the change waits in the config file.
+void ApplyAudioOutputLive(const ConfigValues& w) {
+    if (!GetLiveLinkContext().connected) return;
+    const std::string request = std::string("backend=") + (IsAsio(w) ? "asio" : "wasapi-shared") +
+        "\ndevice=" + W2U(w.audioDevice) + "\nframes=" + std::to_string(w.bufferFrames) +
+        "\nrate=" + std::to_string(w.sampleRate) + "\nfirst_channel=" + std::to_string(w.asioFirstChannel);
+    std::string result;
+    if (SendLiveText(SVMS_COMMAND_SET_AUDIO_OUTPUT, request, result)) NoteLiveChange();
+}
+
+// What an ASIO driver accepts, for the buffer slider and the pair picker.
+struct AsioCapsView {
+    std::string driver;   // the driver these caps describe
+    bool ok = false;
+    std::vector<uint32_t> sizes;
+    uint32_t outputs = 0;
+    std::vector<std::string> names;
+    std::string error;
+};
+
+AsioCapsView ProbeAsioCaps(const std::string& driver) {
+    AsioCapsView v;
+    v.driver = driver;
+    if (driver.empty()) {
+        v.error = "no ASIO driver is installed";
+        return v;
+    }
+    std::string text;
+    if (GetLiveLinkContext().connected) {
+        // The running synth asks its own ASIO thread (it may hold the driver).
+        if (!SendLiveText(SVMS_COMMAND_PROBE_ASIO_DRIVER, driver, text, 6000u)) {
+            v.error = text;
+            return v;
+        }
+        for (const std::string& s : SplitText(KeyValue(text, "sizes"), ','))
+            if (const unsigned long n = std::strtoul(s.c_str(), nullptr, 10)) v.sizes.push_back(static_cast<uint32_t>(n));
+        v.outputs = static_cast<uint32_t>(std::strtoul(KeyValue(text, "outputs").c_str(), nullptr, 10));
+        v.names = SplitText(KeyValue(text, "names"), '|');
+    } else {
+#if defined(SVMS_WITH_ASIO)
+        // No synth running: load the driver here for a moment.
+        AsioCaps caps;
+        const bool ok = AsioHost::Instance().Probe(driver, caps, v.error);
+        AsioHost::Instance().ShutdownForProcessEnd();
+        if (!ok) return v;
+        v.sizes = caps.legalSizes;
+        v.outputs = caps.outputChannels;
+        v.names = caps.outputNames;
+#else
+        v.error = "ASIO is not built into this Configurator";
+        return v;
+#endif
+    }
+    v.ok = !v.sizes.empty();
+    if (!v.ok && v.error.empty()) v.error = "the driver reported no buffer sizes";
+    return v;
+}
+
+// The driver the synth opens for `w.audioDevice` ("default" = the first one installed).
+std::string AsioDriverFor(const ConfigValues& w, const std::vector<std::string>& installed) {
+    if (!w.audioDevice.empty() && w.audioDevice != L"default") return W2U(w.audioDevice);
+    return installed.empty() ? std::string() : installed.front();
+}
+
+AsioCapsView& AsioCapsFor(const ConfigValues& w, const std::vector<std::string>& installed, bool refresh) {
+    static AsioCapsView caps;
+    static bool probed = false;
+    const std::string driver = AsioDriverFor(w, installed);
+    if (refresh || !probed || caps.driver != driver) {
+        caps = ProbeAsioCaps(driver);
+        probed = true;
+    }
+    return caps;
+}
+
+// The installed ASIO drivers, read from the registry once and again on Refresh.
+std::vector<std::string>& InstalledAsioDrivers(bool refresh) {
+    static std::vector<std::string> drivers;
+    static bool read = false;
+    if (refresh || !read) {
+        drivers = EnumerateAsioDrivers();
+        read = true;
+    }
+    return drivers;
+}
+
+std::string OutputName(const AsioCapsView& caps, uint32_t channel) {
+    if (channel < caps.names.size() && !caps.names[channel].empty()) return caps.names[channel];
+    return "Out " + std::to_string(channel + 1u);
+}
+
+// One line on what the driver is playing through right now, polled once a second.
+void StatusLine(float wrapW) {
+    static double lastPoll = -10.0;
+    static std::string status;
+    if (!GetLiveLinkContext().connected) return;
+    const double now = ImGui::GetTime();
+    if (now - lastPoll >= 1.0) {
+        lastPoll = now;
+        std::string text;
+        if (SendLiveText(SVMS_COMMAND_QUERY_AUDIO_OUTPUT, std::string(), text, 200u)) {
+            const std::string active = KeyValue(text, "active");
+            const unsigned frames = static_cast<unsigned>(std::strtoul(KeyValue(text, "frames").c_str(), nullptr, 10));
+            const unsigned rate = static_cast<unsigned>(std::strtoul(KeyValue(text, "rate").c_str(), nullptr, 10));
+            const unsigned first = static_cast<unsigned>(std::strtoul(KeyValue(text, "first_channel").c_str(), nullptr, 10));
+            char line[256];
+            if (KeyValue(text, "restarting") == "1") {
+                status = "Restarting the audio output...";
+            } else if (KeyValue(text, "running") != "1") {
+                status = "Audio output stopped.";
+            } else {
+                std::snprintf(line, sizeof(line), "Playing: %s, %s, %u frames at %u Hz (%.1f ms)",
+                              active.c_str(), KeyValue(text, "device").c_str(), frames, rate,
+                              rate ? frames * 1000.0 / rate : 0.0);
+                status = line;
+                if (active == "asio") {
+                    std::snprintf(line, sizeof(line), ", outputs %u/%u", first + 1u, first + 2u);
+                    status += line;
+                }
+                status += ".";
+            }
+            if (KeyValue(text, "fallback") == "1") status += " ASIO did not open, so WASAPI took over.";
+            const std::string note = KeyValue(text, "note");
+            const std::string error = KeyValue(text, "error");
+            if (!note.empty()) status += " " + note;
+            if (!error.empty()) status += " " + error;
+        } else {
+            status.clear();
+        }
+    }
+    if (status.empty()) return;
+    ImGui::Dummy(ImVec2(0.0f, 10.0f * ui::Scale() - ImGui::GetStyle().ItemSpacing.y));
+    NoteText(status.c_str(), wrapW);
+}
+#endif
+
 // --- Audio device card --------------------------------------------------------------------
 
 void DeviceCard(ConfigDocument& doc, const EasterEggState& eggs) {
@@ -130,14 +305,8 @@ void DeviceCard(ConfigDocument& doc, const EasterEggState& eggs) {
         deviceList.Enumerate();
         enumerated = true;
     }
-    const bool asio = EqualCI(W2U(w.audioBackend), "asio");
-    static std::vector<std::string> asioDrivers;
-    static bool asioEnumerated = false;
-    if (asio && !asioEnumerated) {
-        asioDrivers = EnumerateAsioDrivers();
-        asioEnumerated = true;
-    }
-    if (!asio) asioEnumerated = false;
+    const bool asio = IsAsio(w);
+    const std::vector<std::string>& asioDrivers = InstalledAsioDrivers(false);
 
     std::vector<std::string> names;
     int current = -1;
@@ -177,12 +346,13 @@ void DeviceCard(ConfigDocument& doc, const EasterEggState& eggs) {
         else if (asio) w.audioDevice = U2W(asioDrivers[static_cast<size_t>(sel - 1)]);
         else w.audioDevice = deviceList.Devices()[static_cast<size_t>(sel - 1)].friendlyName;
         doc.MarkDirty();
+        ApplyAudioOutputLive(w);
     }
     ImGui::SameLine(0.0f, 10.0f * s);
     if (ui::Button("Refresh")) {
         deviceList.Enumerate();
-        asioDrivers = EnumerateAsioDrivers();
-        asioEnumerated = true;
+        InstalledAsioDrivers(true);
+        if (asio) AsioCapsFor(w, InstalledAsioDrivers(false), true);
     }
     if (eggs.megaFuckerDac) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Tok().exp);
@@ -198,11 +368,52 @@ void DeviceCard(ConfigDocument& doc, const EasterEggState& eggs) {
     ui::BeginRow("audioBe", "Driver type",
                  "WASAPI works everywhere. ASIO is lower latency but needs an ASIO driver installed; falls back to WASAPI if none opens.",
                  ui::SegmentedSize(backends, 2));
-    if (ui::Segmented("##backend", &be, backends, 2)) {
+    if (ui::Segmented("##backend", &be, backends, 2) && be != (asio ? 1 : 0)) {
         w.audioBackend = be == 1 ? L"asio" : L"wasapi-shared";
+        // A WASAPI device name means nothing to ASIO and the other way round.
+        w.audioDevice = L"default";
         doc.MarkDirty();
+        ApplyAudioOutputLive(w);
     }
     ui::EndRow();
+
+    if (asio) {
+        const AsioCapsView& caps = AsioCapsFor(w, asioDrivers, false);
+        std::vector<std::string> pairs;
+        std::vector<uint32_t> firsts;
+        for (uint32_t c = 0; c + 1u < caps.outputs; c += 2u) {
+            pairs.push_back(OutputName(caps, c) + " / " + OutputName(caps, c + 1u));
+            firsts.push_back(c);
+        }
+        int pair = -1;
+        for (size_t i = 0; i < firsts.size(); ++i)
+            if (firsts[i] == w.asioFirstChannel) pair = static_cast<int>(i);
+        if (pair < 0) {
+            // Unprobed driver or a pair it no longer has: keep showing what is set.
+            pairs.push_back(OutputName(caps, w.asioFirstChannel) + " / " + OutputName(caps, w.asioFirstChannel + 1u));
+            firsts.push_back(w.asioFirstChannel);
+            pair = static_cast<int>(firsts.size() - 1u);
+        }
+        std::vector<const char*> pairItems;
+        for (const std::string& p : pairs) pairItems.push_back(p.c_str());
+        ImGui::Dummy(ImVec2(0.0f, 10.0f * s - ImGui::GetStyle().ItemSpacing.y));
+        const float pickW = 220.0f * s;
+        ui::BeginRow("asioPair", "Output pair", "The two driver outputs SVMS plays left and right through.",
+                     ImVec2(pickW, 38.0f * s));
+        int picked = pair;
+        if (ui::Select("##asiopair", &picked, pairItems.data(), static_cast<int>(pairItems.size()), pickW) &&
+            picked != pair) {
+            w.asioFirstChannel = firsts[static_cast<size_t>(picked)];
+            doc.MarkDirty();
+            ApplyAudioOutputLive(w);
+        }
+        ui::EndRow();
+        if (!caps.ok && !caps.error.empty()) {
+            const std::string why = "Could not ask the driver what it supports: " + caps.error;
+            NoteText(why.c_str(), ImGui::GetContentRegionAvail().x);
+        }
+    }
+    StatusLine(ImGui::GetContentRegionAvail().x);
     ui::EndCard();
 #else
     (void)eggs;
@@ -255,10 +466,15 @@ void LatencyCard(ConfigDocument& doc) {
     ConfigValues& w = doc.Working();
     const ui::Tokens& k = ui::Tok();
     const float s = ui::Scale();
+#ifdef _WIN32
+    // The running driver restarts its output in place, so nothing here waits for a restart.
+    ui::BeginCard("##latency", "Latency", nullptr, 0.0f, "buf");
+#else
     ui::BeginCard("##latency", "Latency", nullptr, ui::RestartMarkWidth(), "buf");
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 11.0f * s);
     ui::RestartMark();
     ui::CardHeaderEnd();
+#endif
 
     const float lat = static_cast<float>(w.bufferFrames) / static_cast<float>((std::max)(1u, w.sampleRate)) * 1000.0f;
     const float pos = (std::max)(0.0f, (std::min)(100.0f, (std::log2(static_cast<float>((std::max)(1u, w.bufferFrames))) - 6.0f) / 7.0f * 100.0f));
@@ -299,10 +515,48 @@ void LatencyCard(ConfigDocument& doc) {
     ImGui::SetCursorScreenPos(ImVec2(origin.x + colW + gap, origin.y));
     ImGui::BeginGroup();
     Label("Buffer size (frames)", 0.0f);
-    int buf = IndexOf(kBuffers, w.bufferFrames);
-    if (ui::Segmented("##buf", &buf, kBufferLabels, 8, colW) && buf >= 0) {
-        w.bufferFrames = kBuffers[buf];
-        doc.MarkDirty();
+    bool slid = false;
+#ifdef _WIN32
+    if (IsAsio(w)) {
+        // Every size the driver accepts, not just the powers of two.
+        const AsioCapsView& caps = AsioCapsFor(w, InstalledAsioDrivers(false), false);
+        if (caps.ok) {
+            slid = true;
+            const uint32_t shown = AsioNearestLegalSize(caps.sizes, w.bufferFrames);
+            int at = 0;
+            for (size_t i = 0; i < caps.sizes.size(); ++i)
+                if (caps.sizes[i] == shown) at = static_cast<int>(i);
+            float slot = static_cast<float>(at);
+            bool committed = false;
+            static bool moved = false;
+            const float last = static_cast<float>(caps.sizes.size() - 1u);
+            if (ui::RangeSlider("##asiobuf", &slot, 0.0f, last, colW, &committed)) {
+                const int next = static_cast<int>(std::lround(slot));
+                if (caps.sizes[static_cast<size_t>(next)] != w.bufferFrames) {
+                    w.bufferFrames = caps.sizes[static_cast<size_t>(next)];
+                    doc.MarkDirty();
+                    moved = true;
+                }
+            }
+            // Restart once when the drag ends, not on every step of it.
+            if (committed && moved) {
+                ApplyAudioOutputLive(w);
+                moved = false;
+            }
+            char readout[64];
+            std::snprintf(readout, sizeof(readout), "%u frames (%.2f ms)", w.bufferFrames,
+                          w.bufferFrames * 1000.0 / (std::max)(1u, w.sampleRate));
+            NoteText(readout);
+        }
+    }
+#endif
+    if (!slid) {
+        int buf = IndexOf(kBuffers, w.bufferFrames);
+        if (ui::Segmented("##buf", &buf, kBufferLabels, 8, colW) && buf >= 0) {
+            w.bufferFrames = kBuffers[buf];
+            doc.MarkDirty();
+            ApplyAudioOutputLive(w);
+        }
     }
     const ImVec2 srAt = ImGui::GetCursorScreenPos();
     ui::Anchor("sr", srAt, ImVec2(srAt.x + colW, srAt.y + 80.0f * s));
@@ -311,6 +565,7 @@ void LatencyCard(ConfigDocument& doc) {
     if (ui::Segmented("##sr", &sr, kRateLabels, 6, colW) && sr >= 0) {
         w.sampleRate = kRates[sr];
         doc.MarkDirty();
+        ApplyAudioOutputLive(w);
     }
     ImGui::EndGroup();
     const float rightBottom = ImGui::GetItemRectMax().y;

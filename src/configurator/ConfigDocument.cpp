@@ -226,7 +226,8 @@ void ConfigDocument::FromJson(const json& root) {
         ReadString(*it, "device", working_.audioDevice);
         ReadString(*it, "linux_device", working_.linuxDevice);
         ReadNum(*it, "sample_rate", working_.sampleRate, 8000u, 384000u);
-        ReadNum(*it, "buffer_frames", working_.bufferFrames, 16u, 8192u);
+        ReadNum(*it, "buffer_frames", working_.bufferFrames, 1u, 8192u);
+        ReadNum(*it, "asio_first_channel", working_.asioFirstChannel, 0u, 63u);
         ReadBool(*it, "mono_downmix", working_.monoDownmix);
     }
     if (auto it = root.find("synth"); it != root.end() && it->is_object()) {
@@ -516,6 +517,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["audio"]["linux_device"] = WideToUtf8(working_.linuxDevice);
     root["audio"]["sample_rate"] = working_.sampleRate;
     root["audio"]["buffer_frames"] = working_.bufferFrames;
+    root["audio"]["asio_first_channel"] = working_.asioFirstChannel;
     root["audio"]["mono_downmix"] = working_.monoDownmix;
 
     root["synth"]["soundfont"] = WideToUtf8(working_.soundFontPath);
@@ -901,6 +903,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.midiInputEnabled == b.midiInputEnabled
         && a.midiInputDevice == b.midiInputDevice
         && a.audioDevice == b.audioDevice
+        && a.asioFirstChannel == b.asioFirstChannel
         && a.linuxDevice == b.linuxDevice
         && a.audioBackend == b.audioBackend
         && a.soundFontPath == b.soundFontPath
@@ -939,8 +942,8 @@ ConfigValidation ConfigDocument::Validate() const {
 
     if (working_.sampleRate < 8000 || working_.sampleRate > 384000)
         warn("audio.sample_rate", "must be 8000..384000");
-    if (working_.bufferFrames < 16 || working_.bufferFrames > 8192)
-        warn("audio.buffer_frames", "must be 16..8192");
+    if (working_.bufferFrames < 1 || working_.bufferFrames > 8192)
+        warn("audio.buffer_frames", "must be 1..8192");
     if (working_.maxVoices < 1 || working_.maxVoices > 524288u * (working_.shards > 1u ? working_.shards : 1u))
         warn("synth.max_voices", "must be 1..524288 (x shard count)");
     if (working_.voiceMemoryBudgetMB > 65536)

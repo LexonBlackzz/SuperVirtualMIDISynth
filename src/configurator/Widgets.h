@@ -46,6 +46,10 @@ void NoteLiveChange();
 // Sends one RuntimeLink command with a plain integer parameter (the live pushes
 // that are not part of the coalesced working state). No-op when offline.
 void SendLiveCommand(uint32_t command, uint32_t param);
+// Sends a command whose payload is text and returns the driver's answer.
+// False when not connected or the driver refused it (`result` says why).
+bool SendLiveText(uint32_t command, const std::string& request, std::string& result,
+                  uint32_t timeoutMs = 500u);
 
 // --- Rack-style primitives -------------------------------------------------
 // Panel labels: mono caps as authored.

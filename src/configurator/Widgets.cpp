@@ -75,6 +75,17 @@ void NoteLiveChange() {
     if (g_liveLink.app) g_liveLink.app->NoteLiveChange();
 }
 
+bool SendLiveText(uint32_t command, const std::string& request, std::string& result,
+                  uint32_t timeoutMs) {
+    result.clear();
+    if (!g_liveLink.connected || !g_liveLink.client) return false;
+    char text[svms::EngineLink::kResultTextBytes]{};
+    const SVMS_Result r =
+        g_liveLink.client->SendCommand(command, 0u, timeoutMs, text, request.c_str());
+    result = text;
+    return r == SVMS_RESULT_OK;
+}
+
 void SendLiveCommand(uint32_t command, uint32_t param) {
     if (!g_liveLink.connected || !g_liveLink.client) return;
     char result[svms::EngineLink::kResultTextBytes]{};

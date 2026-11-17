@@ -20,6 +20,13 @@ bool Diff(const V& a, const V& b, M... members) {
 
 #define D(...) [](const V& a, const V& b) { return Diff(a, b, __VA_ARGS__); }
 
+// The Windows driver restarts its audio output live; the Linux one does not.
+#ifdef _WIN32
+constexpr bool kAudioRestart = false;
+#else
+constexpr bool kAudioRestart = true;
+#endif
+
 constexpr NavPage H = NavPage::Home, S = NavPage::Sound, E = NavPage::Effects,
                   O = NavPage::Output, P = NavPage::Performance, M = NavPage::Midi,
                   R = NavPage::Render, RC = NavPage::Record, G = NavPage::Diagnostics,
@@ -46,11 +53,12 @@ const SettingDef kSettings[] = {
     {"limOn", "Master limiter", E, "Effects \xE2\x80\xBA Master limiter", "limiter clip clipping loudness compressor threshold", "limiter", nullptr, false, D(&V::limiterEnabled)},
     {"limMode", "Limiter mode (Classic / Adaptive)", E, "Effects \xE2\x80\xBA Master limiter", "adaptive classic lookahead", "limiter", nullptr, false, D(&V::limiterAlgorithm)},
     {"chOn", "Channel limiter", E, "Effects \xE2\x80\xBA Channel limiter", "per channel limiter 16 channels", "chlim", nullptr, false, D(&V::channelLimiterEnabled)},
-    {"device", "Audio device", O, "Output", "output device speakers headphones interface refresh devices", nullptr, nullptr, true, D(&V::audioDevice, &V::linuxDevice)},
-    {"audioBe", "WASAPI / ASIO", O, "Output", "audio backend asio wasapi shared output driver", nullptr, nullptr, true, D(&V::audioBackend)},
+    {"device", "Audio device", O, "Output", "output device speakers headphones interface refresh devices", nullptr, nullptr, kAudioRestart, D(&V::audioDevice, &V::linuxDevice)},
+    {"audioBe", "WASAPI / ASIO", O, "Output", "audio backend asio wasapi shared output driver", nullptr, nullptr, kAudioRestart, D(&V::audioBackend)},
+    {"asioPair", "ASIO outputs", O, "Output", "asio output pair channels outputs 1/2 3/4", nullptr, nullptr, false, D(&V::asioFirstChannel)},
     {"monoDown", "Mono output (downmix)", O, "Output", "mono downmix stereo left right both ears", nullptr, nullptr, false, D(&V::monoDownmix)},
-    {"buf", "Buffer size / latency", O, "Output \xE2\x80\xBA Latency", "buffer frames latency delay crackle stutter", nullptr, nullptr, true, D(&V::bufferFrames)},
-    {"sr", "Sample rate", O, "Output \xE2\x80\xBA Latency", "sample rate 44100 48000 khz", nullptr, nullptr, true, D(&V::sampleRate)},
+    {"buf", "Buffer size / latency", O, "Output \xE2\x80\xBA Latency", "buffer frames latency delay crackle stutter", nullptr, nullptr, kAudioRestart, D(&V::bufferFrames)},
+    {"sr", "Sample rate", O, "Output \xE2\x80\xBA Latency", "sample rate 44100 48000 khz", nullptr, nullptr, kAudioRestart, D(&V::sampleRate)},
     {"synthBe", "Synth backend (OmniMIDI, KDMAPI, WinMM)", O, "Output \xE2\x80\xBA Different synth", "kdmapi omnimidi winmm dll backend route", nullptr, "out", true, D(&V::apiBackend)},
     {"profile", "Performance profile", P, "Performance", "accurate balanced extreme preset", nullptr, nullptr, false, nullptr},
     {"voices", "Voice limit (max voices)", P, "Performance", "maximum voices voice presets polyphony limit pool ceiling", nullptr, nullptr, false, D(&V::maxVoices)},

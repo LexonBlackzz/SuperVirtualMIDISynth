@@ -178,6 +178,7 @@ struct ConfigValues {
 
     std::wstring audioBackend = L"wasapi-shared";
     std::wstring audioDevice = L"default";
+    uint32_t asioFirstChannel = 0;          // audio.asio_first_channel (0 = outputs 1/2)
     std::wstring linuxDevice = L"default";  // audio.linux_device (ALSA PCM, Linux driver only)
     std::wstring soundFontPath;
     std::vector<std::wstring> soundFontPaths;

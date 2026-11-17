@@ -1224,6 +1224,13 @@ if(NOT SVMS_XP_COMPAT)
     target_link_libraries(svms_v3_configurator PRIVATE
         d3d11 dxgi d3dcompiler dwmapi user32 gdi32 shell32 ole32 uuid comdlg32 winhttp
         mfplat mfreadwrite mfuuid shlwapi)
+    if(SVMS_WITH_ASIO_DEF)
+        # The Output page asks an ASIO driver what it supports when no synth is running.
+        target_sources(svms_v3_configurator PRIVATE driver/AsioHost.cpp)
+        target_compile_definitions(svms_v3_configurator PRIVATE ${SVMS_WITH_ASIO_DEF})
+        target_include_directories(svms_v3_configurator PRIVATE "${SVMS_ASIO_INCLUDE}")
+        target_link_libraries(svms_v3_configurator PRIVATE advapi32 avrt)
+    endif()
     set_target_properties(svms_v3_configurator PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
