@@ -72,6 +72,10 @@ public:
     // rows stay on the CPU.
     void SetMinimumVoices(uint32_t voices) { minimumVoices_ = voices; }
     uint32_t MinimumVoices() const { return minimumVoices_; }
+    // Blocks shorter than this stay on the CPU: the GPU round trip does not
+    // fit inside a very short ASIO period.
+    void SetMinimumFrames(uint32_t frames) { minimumFrames_ = frames; }
+    uint32_t MinimumFrames() const { return minimumFrames_; }
     // Blocks with at least this many GPU rows go out in two parts.
     void SetSplitMinRows(uint32_t rows) { splitMinRows_ = rows; }
     uint32_t SplitMinRows() const { return splitMinRows_; }
@@ -342,6 +346,7 @@ public:
     // Any block with an eligible row goes to the GPU.  The old floor of 4096
     // meant a pool of 4092 voices never used it; SVMS_GPU_MIN_VOICES raises it.
     uint32_t minimumVoices_ = 1u;
+    uint32_t minimumFrames_ = 8u;
     uint32_t splitMinRows_ = 8192u;
     uint32_t parts_ = 3u;
     uint32_t sampleRate_ = 44100u;

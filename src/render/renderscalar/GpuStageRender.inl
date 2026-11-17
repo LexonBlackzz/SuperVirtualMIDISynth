@@ -509,7 +509,8 @@ inline uint32_t RenderScalar::TryGpuSubmit(VoiceManager& voices,
     GpuStageStats& counters = stage.MutableStats();
     ++counters.considered;
     uint32_t declineReason = 8u;
-    if (sampleData == nullptr || numFrames < 8u) declineReason = 0u;
+    if (sampleData == nullptr || numFrames < (std::max)(8u, stage.MinimumFrames()))
+        declineReason = 0u;
     else if (channelBusLeft != nullptr) declineReason = 1u;
     else if (voices.v.rot != nullptr) declineReason = 2u;
     else if (wvDecimating_ || wvScalarVibrato_) declineReason = 3u;

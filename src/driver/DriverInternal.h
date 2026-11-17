@@ -28,6 +28,7 @@
 #include <cstdarg>
 #include <algorithm>
 #include <iterator>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -40,6 +41,7 @@
 #include "driver/AudioOutputDirectSound.h"
 #else
 #include "driver/AudioOutput.h"
+#include "driver/AudioOutputFake.h"
 #if defined(SVMS_WITH_ASIO)
 #include "driver/AudioOutputASIO.h"
 #endif
@@ -530,6 +532,35 @@ struct alignas(64) NoteLaunchPlanCacheEntry {
     VoiceConfiguration setup[kNoteRegionCacheLayers];
 };
 
+#if !defined(SVMS_XP_COMPAT)
+// What the user asked the audio output to be.
+struct AudioOutputSettings {
+    AudioBackend backend = AudioBackend::WASAPIShared;
+    std::wstring device;          // WASAPI endpoint or ASIO driver name
+    uint32_t bufferFrames = 0;    // exact ASIO size request; WASAPI hint
+    uint32_t sampleRate = 0;
+    uint32_t asioFirstChannel = 0;
+};
+
+// What the audio output actually is (QueryAudioOutput).
+struct AudioOutputStatus {
+    AudioBackend requested = AudioBackend::WASAPIShared;
+    AudioBackend active = AudioBackend::WASAPIShared;
+    std::wstring device;
+    uint32_t frames = 0;
+    uint32_t rate = 0;
+    uint32_t firstChannel = 0;
+    uint32_t capacityFrames = 0;   // largest block the engine is sized for
+    long outputLatencyFrames = 0;
+    uint64_t xruns = 0;
+    bool running = false;
+    bool restarting = false;
+    bool fallback = false;         // the requested backend failed
+    std::string error;
+    std::string note;              // why the stream differs from the request
+};
+#endif
+
 class Driver {
 public:
     static Driver& Instance();
@@ -539,6 +570,14 @@ public:
     bool LoadSoundFont(const wchar_t* path);
     bool LoadConfiguredSoundFont();
     bool StartAudio();
+#if !defined(SVMS_XP_COMPAT)
+    // Live audio output changes. The request returns at once; the audio
+    // control thread stops the output, builds the new one and starts it.
+    // Requests arriving during a restart collapse: the last one wins.
+    void RequestAudioRestart(const AudioOutputSettings& settings);
+    AudioOutputSettings CurrentAudioSettings() const;
+    AudioOutputStatus GetAudioOutputStatus() const;
+#endif
     // synth.keep_loaded: the last client closed, so the engine goes quiet and
     // stops its stream but stays loaded.  Unpark restarts the stream; false
     // means the config file changed (or the stream would not start) and the
@@ -668,14 +707,17 @@ private:
     static void OnAsioFormatChanged(uint32_t sampleRate, uint32_t bufferFrames,
                                     void* userData);
     void ApplyPendingAudioFormat();
-#if !defined(SVMS_XP_COMPAT) && defined(SVMS_WITH_ASIO)
-    // Object-level ASIO recovery: after repeated reopen failures the output
-    // object is retired (never deleted in-place — the parked instance may
-    // still have in-flight bufferSwitch) and a brand-new one is constructed
-    // on a dedicated thread: fresh COM load, fresh buffers, full reinit.
-    // Also the groundwork for live output device switching.
-    static void OnAsioRebuildRequested(void* userData);
-    void RebuildAudioOutput();
+    // Takes a new block size / rate while nothing renders: grows the mix
+    // buffers, buses and worker pool when needed and retunes the DSP.
+    void ApplyAudioFormat(uint32_t newRate, uint32_t newFrames);
+    bool EnsureRenderCapacity(uint32_t frames);
+#if !defined(SVMS_XP_COMPAT)
+    static void OnAsioStreamDead(void* userData);
+    AudioOutputBase* BuildAudioOutput(const AudioOutputSettings& settings,
+                                      AudioOutputStatus& status);
+    bool RestartAudioOutputNow(const AudioOutputSettings& settings);
+    void AudioControlLoop();
+    void SetGpuMinimumFrames(uint32_t frames);
 #endif
 
     // EventDispatcher callback — invoked by RenderScalar at each event's
@@ -931,16 +973,21 @@ private:
     class AudioOutput* audioOutput;   // XP: concrete DirectSound/waveOut class
 #else
     AudioOutputBase* audioOutput;
-    // Object-level audio output rebuild (ASIO recovery / live switching).
-    // audioOutputMutex_ serializes rebuild vs shutdown; the rebuild itself
-    // happens on audioRebuildThread_ because the watcher thread that
-    // escalated must keep spinning (parked on rebuildRequested_) until the
-    // retired object is finally torn down in Shutdown().
+    // Live output restarts run on audioControlThread_, serialised by
+    // audioOutputMutex_. Replaced outputs are shut down (they hold no
+    // device or thread any more) but their shells are kept until Shutdown:
+    // other threads read audioOutput without a lock.
     std::mutex audioOutputMutex_;
     std::vector<AudioOutputBase*> retiredOutputs_;
-    std::thread audioRebuildThread_;
-    std::atomic<bool> audioRebuildActive_{false};
-    std::atomic<bool> audioRebuildShutdown_{false};
+    std::thread audioControlThread_;
+    std::mutex audioControlMutex_;
+    std::condition_variable audioControlCv_;
+    bool audioControlQuit_ = false;
+    bool audioRestartPending_ = false;
+    AudioOutputSettings audioRestartRequest_;
+    mutable std::mutex audioStatusMutex_;
+    AudioOutputSettings audioSettings_;
+    AudioOutputStatus audioStatus_;
 #endif
     VoiceManager* voiceManager;
     ChannelCache* channelCache;

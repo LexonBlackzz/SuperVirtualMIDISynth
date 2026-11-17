@@ -1388,6 +1388,16 @@ if(SVMS_BUILD_TESTS)
                      "$<TARGET_FILE:svmsapi>")
     set_tests_properties(svms_v3_native_api PROPERTIES SKIP_RETURN_CODE 77)
 
+    if(NOT SVMS_XP_COMPAT)
+        add_executable(svms_v3_audio_restart_tests tests/AudioRestartTests.cpp)
+        target_include_directories(svms_v3_audio_restart_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_dependencies(svms_v3_audio_restart_tests svmsapi)
+        add_test(NAME svms_v3_audio_restart
+                 COMMAND svms_v3_audio_restart_tests "$<TARGET_FILE:svmsapi>")
+        set_tests_properties(svms_v3_audio_restart PROPERTIES TIMEOUT 180)
+    endif()
+
     add_executable(svms_v3_offline_stack_smoke
         tests/OfflineStackSmoke.cpp)
     target_include_directories(svms_v3_offline_stack_smoke PRIVATE
