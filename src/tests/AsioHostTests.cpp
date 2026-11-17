@@ -360,6 +360,58 @@ static void HostLoadRetries() {
     h.ShutdownForProcessEnd();
 }
 
+// A driver still tearing down its last instance makes the host retry the
+// load for longer than the command timeout. That is progress, not a hang.
+static void HostSlowLoadIsNotAHang() {
+    AsioHost& h = FreshHostFast();   // 500 ms timeout
+    fake::g_fake.failLoadTimes = 15; // about 750 ms of 50 ms retries
+    EventCounter c;
+    CHECK(OpenStartEv(h, "Fake A", 32, c));
+    CHECK(WaitFor([&] { return c.calls >= 3; }, 1000));
+    h.Close();
+    h.ShutdownForProcessEnd();
+}
+
+// A command queued behind one that hangs must give up with the hung context,
+// not later on its own clock, where it would detach the next stream.
+static void HostQueuedBehindHangKeepsNextStream() {
+    AsioHost& h = FreshHostFast();
+    EventCounter c;
+    CHECK(OpenStartEv(h, "Fake A", 32, c));
+    fake::g_fake.hangInStopMs = 1500;
+    std::thread closer([&] { h.Close(); });   // hangs in stop(), abandoned at ~500 ms
+    Sleep(400);
+    std::thread prober([&] {
+        AsioCaps caps;
+        std::string err;
+        h.Probe("Fake B", caps, err);          // queued behind the hung Close
+    });
+    closer.join();
+    fake::g_fake.hangInStopMs = 0;
+    EventCounter c2;
+    CHECK(OpenStartEv(h, "Fake B", 32, c2));
+    prober.join();
+    const int after = c2.calls;
+    CHECK(WaitFor([&] { return c2.calls >= after + 5; }, 1000));
+    h.Close();
+    h.ShutdownForProcessEnd();
+    Sleep(1300);   // the abandoned thread comes back from stop()
+}
+
+// An abandoned host thread that comes back from the driver releases it, so a
+// single-client device is not held until the process exits.
+static void HostAbandonedThreadReleasesDriver() {
+    AsioHost& h = FreshHostFast();
+    EventCounter c;
+    CHECK(OpenStartEv(h, "Fake A", 32, c));
+    fake::g_fake.hangInStopMs = 1000;
+    h.Close();                                 // abandoned at ~500 ms
+    fake::g_fake.hangInStopMs = 0;
+    CHECK(WaitFor([&] { return fake::g_fake.liveInstances == 0; }, 2000));
+    CHECK(!fake::g_fake.violation);
+    h.ShutdownForProcessEnd();
+}
+
 static void HostResetReloadFailsReportsDead() {
     AsioHost& h = FreshHost();
     h.SetTimingForTest(5000, 300, 100);
@@ -470,6 +522,9 @@ int main() {
     HostCrashInCreate();
     HostLingerUnload();
     HostSwitchDrivers();
+    HostSlowLoadIsNotAHang();
+    HostQueuedBehindHangKeepsNextStream();
+    HostAbandonedThreadReleasesDriver();
     HostDriverHangTimesOut();   // last: leaves abandoned threads behind
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

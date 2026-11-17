@@ -18,6 +18,7 @@ namespace {
 
 constexpr int kSlots = 8;
 constexpr uint32_t kProbeRates[] = {44100, 48000, 88200, 96000};
+const char kNotResponding[] = "ASIO driver not responding";
 
 struct Context;
 
@@ -60,6 +61,9 @@ struct Context {
     HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     std::deque<std::shared_ptr<Command>> queue;   // Impl::mutex
     std::atomic<bool> poisoned{false};
+    // When the owner thread last made progress (started a command or a load
+    // attempt). A command times out only after this long without progress.
+    std::atomic<ULONGLONG> progressAt{0};
     // Driver messages, set from driver threads.
     std::atomic<bool> resetPending{false};
     std::atomic<ULONGLONG> resetAt{0};
@@ -433,6 +437,7 @@ IASIO* CreateDriver(Context& ctx, const AsioDriverEntry& entry, std::string& err
             Sleep(50);
             CoFreeUnusedLibraries();
         }
+        ctx.progressAt = GetTickCount64();
         IASIO* d = nullptr;
         HRESULT hr = E_FAIL;
         if (!SafeCreate(factory, entry, user, &d, &hr)) {
@@ -445,7 +450,11 @@ IASIO* CreateDriver(Context& ctx, const AsioDriverEntry& entry, std::string& err
             error = "ASIO driver \"" + entry.name + "\" crashed while starting";
             return nullptr;   // leaked: a crashed driver is not called again
         }
-        if (ctx.poisoned) return nullptr;
+        if (ctx.poisoned) {
+            // Abandoned while init ran: this thread still owns the instance.
+            SafeRelease(d);
+            return nullptr;
+        }
         if (ok) return d;
         char msg[128] = {};
         d->getErrorMessage(msg);
@@ -705,6 +714,7 @@ void DoProbe(Context& ctx, Command& cmd, const std::string& name) {
 // rate; a plain reset keeps the client's.
 void Reopen(Context& ctx) {
     Impl& g = G();
+    ctx.progressAt = GetTickCount64();
     const bool wasStarted = ctx.started;
     const uint32_t changedRate = ctx.newRate.exchange(0);
     const uint32_t rate = changedRate ? changedRate : ctx.wantRate;
@@ -755,13 +765,30 @@ void HandleDriverMessages(Context& ctx) {
     Reopen(ctx);
 }
 
+// The thread was abandoned while inside the driver and has come back. It is
+// still the driver's owner, so it finishes what it holds here instead of
+// leaking it: a single-client device would refuse every later open.
+void ReleaseAbandoned(Context& ctx) {
+    if (Stream* s = ctx.stream) {
+        if (ctx.started) {
+            ctx.driver->stop();
+            ctx.started = false;
+        }
+        if (s->slot >= 0) FreeSlot(s->slot);   // the slot stays poisoned
+        ctx.driver->disposeBuffers();
+        delete s;
+        ctx.stream = nullptr;
+    }
+    ReleaseDriver(ctx);
+}
+
 void HostThread(Context* ctx) {
     Impl& g = G();
     t_hostContext = ctx;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ctx->window = CreateHostWindow();
     bool quit = false;
-    while (!quit) {
+    while (!quit && !ctx->poisoned) {
         DWORD timeout = INFINITE;
         const ULONGLONG now = GetTickCount64();
         if (!ctx->stream && ctx->driver)
@@ -785,13 +812,15 @@ void HostThread(Context* ctx) {
                 cmd = ctx->queue.front();
                 ctx->queue.pop_front();
             }
+            ctx->progressAt = GetTickCount64();
             cmd->fn(*ctx, *cmd);
-            if (ctx->poisoned) return;   // abandoned while inside the driver: leak
+            if (ctx->poisoned) break;   // abandoned while inside the driver
             SetEvent(cmd->done);
             if (cmd->quit) quit = true;
         }
+        if (ctx->poisoned) break;
         if (!quit) HandleDriverMessages(*ctx);
-        if (ctx->poisoned) return;
+        if (ctx->poisoned) break;
         if (!ctx->stream && ctx->driver && GetTickCount64() >= ctx->lingerUntil)
             ReleaseDriver(*ctx);
         if (!ctx->stream && !ctx->driver) {
@@ -807,6 +836,9 @@ void HostThread(Context* ctx) {
             if (g.ctx == ctx) g.ctx = nullptr;
         }
     }
+    // Nobody else reads an abandoned context: it left g.ctx and its queued
+    // commands were completed when it was abandoned.
+    if (ctx->poisoned) ReleaseAbandoned(*ctx);
     if (ctx->window) DestroyWindow(ctx->window);
     CloseHandle(ctx->wake);
     delete ctx;
@@ -832,21 +864,37 @@ void JoinExited() {
     for (std::thread& t : done) t.join();
 }
 
-// The host thread hung inside a driver: leave it and its driver behind.
-void AbandonLocked(Impl& g, Context* ctx) {
-    if (g.ctx != ctx) return;
+// The host thread hung inside a driver: leave it behind (it releases the
+// driver itself if it ever comes back). Commands still queued behind the hung
+// one fail now instead of waiting out their own timeouts. False when ctx was
+// already abandoned or gone.
+bool AbandonLocked(Impl& g, Context* ctx) {
+    if (g.ctx != ctx) return false;
     ctx->poisoned = true;
     for (int i = 0; i < kSlots; ++i) {
         Stream* s = g_slot[i].load();
         if (s && s->ctx == ctx) g_slotPoisoned[i] = true;
     }
+    for (const std::shared_ptr<Command>& queued : ctx->queue) {
+        queued->ok = false;
+        queued->error = kNotResponding;
+        SetEvent(queued->done);
+    }
+    ctx->queue.clear();
     if (g.thread.joinable()) g.thread.detach();
     g.ctx = nullptr;
+    // The stream belonged to the abandoned context; detach the client before
+    // anyone can open the next one (attachMutex is only ever taken inside
+    // g.mutex here).
+    std::lock_guard<std::mutex> lock(g.attachMutex);
+    g.running = false;
+    g.attachedId = 0;
+    return true;
 }
 
-// Runs cmd on the host thread and waits. False = the host thread did not
-// finish in time; it is abandoned and cmd must not be read (the hung thread
-// may still write to it).
+// Runs cmd on the host thread and waits. False = the host thread made no
+// progress for the command timeout; it is abandoned and cmd must not be read
+// (the hung thread may still write to it).
 bool Post(std::shared_ptr<Command> cmd) {
     Impl& g = G();
     if (Context* self = t_hostContext) {   // called back from an event on the host thread
@@ -854,29 +902,28 @@ bool Post(std::shared_ptr<Command> cmd) {
         return true;
     }
     Context* ctx;
-    uint32_t timeout;
+    const ULONGLONG queuedAt = GetTickCount64();
     {
         std::lock_guard<std::mutex> lock(g.mutex);
         ctx = EnsureContextLocked(g);
         ctx->queue.push_back(cmd);
-        timeout = g.commandTimeoutMs;
         SetEvent(ctx->wake);
     }
     JoinExited();
-    if (WaitForSingleObject(cmd->done, timeout) == WAIT_OBJECT_0) return true;
-    {
+    for (;;) {
+        if (WaitForSingleObject(cmd->done, 50) == WAIT_OBJECT_0) return true;
         std::lock_guard<std::mutex> lock(g.mutex);
+        if (WaitForSingleObject(cmd->done, 0) == WAIT_OBJECT_0) return true;
+        // Abandoned by another caller while this command was the hung one.
+        if (g.ctx != ctx) return false;
+        // ctx is only read while it is still g.ctx (it is deleted after it
+        // leaves), so this load is safe under g.mutex.
+        const ULONGLONG since = (std::max)(queuedAt, ctx->progressAt.load());
+        if (GetTickCount64() - since < g.commandTimeoutMs) continue;
         AbandonLocked(g, ctx);
+        return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(g.attachMutex);
-        g.running = false;
-        g.attachedId = 0;
-    }
-    return false;
 }
-
-const char kNotResponding[] = "ASIO driver not responding";
 
 } // namespace
 
