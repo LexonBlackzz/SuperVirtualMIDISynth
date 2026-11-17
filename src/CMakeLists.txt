@@ -636,7 +636,7 @@ set(SVMS_ASIO_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../asio-main/common")
 set(SVMS_ASIO_INCLUDE_HOST "${CMAKE_CURRENT_SOURCE_DIR}/../asio-main/host")
 set(SVMS_ASIO_INCLUDE_PC "${CMAKE_CURRENT_SOURCE_DIR}/../asio-main/host/pc")
 if(NOT SVMS_XP_COMPAT AND EXISTS "${SVMS_ASIO_INCLUDE}/asio.h")
-    list(APPEND SOURCES ${SVMS_ASIO_SOURCES})
+    list(APPEND SOURCES ${SVMS_ASIO_SOURCES} driver/AsioHost.cpp)
     set(SVMS_WITH_ASIO_DEF SVMS_WITH_ASIO=1)
     if(MSVC)
         set_source_files_properties(${SVMS_ASIO_SOURCES} PROPERTIES
@@ -1679,7 +1679,10 @@ if(SVMS_BUILD_TESTS)
             set_tests_properties(svms_v3_asio_stress PROPERTIES
                 SKIP_RETURN_CODE 77 TIMEOUT 180)
 
-            add_executable(svms_v3_asio_host_tests tests/AsioHostTests.cpp)
+            add_executable(svms_v3_asio_host_tests tests/AsioHostTests.cpp
+                driver/AsioHost.cpp)
+            target_link_libraries(svms_v3_asio_host_tests PRIVATE
+                ole32 user32 advapi32 avrt)
             target_compile_definitions(svms_v3_asio_host_tests PRIVATE
                 NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
                 ${SVMS_WITH_ASIO_DEF})
