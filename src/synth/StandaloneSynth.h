@@ -109,21 +109,7 @@ public:
             if (paths.empty()) paths.push_back(config.soundfont);
             if (!LoadBanks(paths, error)) return false;
         }
-        if (const EngineConfig* t = config.tuning) {
-            voices_.SetPerKeyVoiceCap(t->perKeyVoiceCap);
-            voices_.SetStealReject(t->stealReject);
-            g_voiceRetireThreshold.store(t->voiceRetireThreshold,
-                                         std::memory_order_relaxed);
-            g_threadAffinityMode.store(t->threadAffinityMode,
-                                       std::memory_order_relaxed);
-            renderer_.SetGhostBudget(t->ghostBudget);
-            renderer_.SetDecimationEnabled(t->decimation);
-            renderer_.SetHalfRate(t->halfRate, 0.0f);
-            renderer_.SetDecimationByLevel(t->decimationByLevel);
-            renderer_.SetMutedTailCullBlocks(t->decimationCullBlocks);
-            SetFastChunkMath(t->fastChunkMath);
-            renderer_.SetBulkAdmissionPercent(t->bulkAdmissionPercent);
-        }
+        if (const EngineConfig* t = config.tuning) ApplyTuning(*t);
         // Env override for offline experiments (percent of the voice limit
         // per block, 0 = off), like the other experimental switches.
         if (const char* bulk = std::getenv("SVMS_BULK_ADMISSION"))
@@ -858,6 +844,26 @@ public:
         return renderer_.GetRenderBackendName();
     }
     // Test/diagnostic access to the render-path counters.
+    // The engine-config switches the offline synth honours (Initialize calls
+    // this when the config carries a tuning block).
+    void ApplyTuning(const EngineConfig& t) {
+        voices_.SetPerKeyVoiceCap(t.perKeyVoiceCap);
+        voices_.SetStealReject(t.stealReject);
+        g_voiceRetireThreshold.store(t.voiceRetireThreshold,
+                                     std::memory_order_relaxed);
+        g_threadAffinityMode.store(t.threadAffinityMode,
+                                   std::memory_order_relaxed);
+        renderer_.SetGhostBudget(t.ghostBudget);
+        renderer_.SetDecimationEnabled(t.decimation);
+        renderer_.SetHalfRate(t.halfRate, 0.0f);
+        renderer_.SetDecimationByLevel(t.decimationByLevel);
+        renderer_.SetMutedTailCullBlocks(t.decimationCullBlocks);
+        SetFastChunkMath(t.fastChunkMath);
+        renderer_.SetLeanVoices(t.leanVoices);
+        renderer_.SetBulkAdmissionPercent(t.bulkAdmissionPercent);
+    }
+    bool LeanVoicesForTest() const { return renderer_.LeanVoices(); }
+
     uint64_t WholeVoiceBlocksForTest() const {
         return renderer_.GetWholeVoiceBlocksForTest();
     }

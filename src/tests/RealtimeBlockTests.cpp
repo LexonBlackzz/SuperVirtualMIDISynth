@@ -182,6 +182,17 @@ int main() {
     // must not leak into this comparison.
     SetEnv("SVMS_TEST_LOCAL_CONFIG_PATH", "svms-test-no-such-config.json");
     SetEnv("SVMS_TEST_CONFIG_PATH", "svms-test-no-such-config.json");
+    {
+        // synth.lean_voices reaches offline renders (no SoundFont needed).
+        StandaloneSynth synth;
+        EngineConfig tuning;
+        tuning.leanVoices = false;
+        synth.ApplyTuning(tuning);
+        if (synth.LeanVoicesForTest()) {
+            std::puts("FAIL: the offline synth ignores synth.lean_voices");
+            return 1;
+        }
+    }
     const std::wstring sf2 = FindSoundFont();
     if (sf2.empty()) { std::puts("no SoundFont; skipping"); return 77; }
 
