@@ -367,8 +367,8 @@ inline void RenderScalar::PlanParallelFor(void* user, uint32_t jobCount,
 // ── Whole-voice whole-block renderer ────────────────────────────────────
 
 // Copy the render state of a displaced/killed voice into a ghost row.  Every
-// dense field rides along (the macro keeps that set complete), plus the
-// launch bookkeeping row (one cache line: channel, loopMode, the row-op
+// dense field and the hot record ride along (the macro keeps that set
+// complete), plus the launch bookkeeping row (one cache line: channel, loopMode, the row-op
 // inputs and the vibrato LFO state are what ghost rendering reads) and
 // stealOutputGain.  birthFrame is voice-manager bookkeeping no ghost path
 // touches.  A new SoA cold field that the ghost render path reads must be
@@ -378,6 +378,7 @@ inline void CopyGhostRow(const VoiceSoA& source, VoiceSoA& destination,
                          uint32_t sourceRow, uint32_t destinationRow) {
     SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_COPY_VOICE_ROW_FIELD)
     destination.rows[destinationRow] = source.rows[sourceRow];
+    destination.hot[destinationRow] = source.hot[sourceRow];
     destination.stealOutputGain[destinationRow] =
         source.stealOutputGain[sourceRow];
     if (source.rot != nullptr && destination.rot != nullptr)
@@ -410,6 +411,7 @@ inline void RenderScalar::EnsureGhostCopied(uint32_t ghost) {
         VoiceSoA& ghosts = wvGhostState_;
         const uint32_t source = wvGhostHandle_[ghost];
         SVMS_VOICE_SOA_DENSE_FIELDS(SVMS_COPY_DEFERRED_FIELD)
+        ghosts.hot[ghost] = pool.hot[source];
         const WholeVoiceGhostImmediate& imm = wvGhostImm_[ghost];
         ghosts.state[ghost] = imm.state;
         ghosts.envelopeStage[ghost] = imm.envelopeStage;

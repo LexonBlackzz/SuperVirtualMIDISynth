@@ -225,7 +225,7 @@ bool IsRenderBackendSupported(RenderBackend backend);
 // range, allowing the caller to retain the scalar path.
 bool BuildVolatileStealKeysAVX2(
     const uint32_t* handles, uint32_t handleCount,
-    const uint64_t* birthFrames, const float* currentGains,
+    const uint64_t* birthFrames, const VoiceHot* hotRecords,
     const float* outputGains, const uint32_t* activePositions,
     uint64_t currentFrame, float gainScale, float ageScale, uint64_t* outputKeys,
     uint32_t* outputHandles, uint32_t* inverseHeapPositions,

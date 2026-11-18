@@ -493,22 +493,9 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
 #define SVMS_COPY_GROWN_VOICE_FIELD(name) \
     std::memcpy(grown.v.name, v.name, \
                 static_cast<size_t>(oldCapacity) * sizeof(*v.name))
-    SVMS_COPY_GROWN_VOICE_FIELD(state);
-    SVMS_COPY_GROWN_VOICE_FIELD(envelopeStage);
-    SVMS_COPY_GROWN_VOICE_FIELD(sampleBacked);
-    SVMS_COPY_GROWN_VOICE_FIELD(renderClass);
-    SVMS_COPY_GROWN_VOICE_FIELD(phaseIdx);
-    SVMS_COPY_GROWN_VOICE_FIELD(phaseFrac);
-    SVMS_COPY_GROWN_VOICE_FIELD(phaseIncs);
-    SVMS_COPY_GROWN_VOICE_FIELD(currentGain);
     SVMS_COPY_GROWN_VOICE_FIELD(targetGain);
     SVMS_COPY_GROWN_VOICE_FIELD(sustainLevel);
     SVMS_COPY_GROWN_VOICE_FIELD(attackGainStep);
-    SVMS_COPY_GROWN_VOICE_FIELD(releaseDecay);
-    SVMS_COPY_GROWN_VOICE_FIELD(mixGainL);
-    SVMS_COPY_GROWN_VOICE_FIELD(mixGainR);
-    SVMS_COPY_GROWN_VOICE_FIELD(renderGainL);
-    SVMS_COPY_GROWN_VOICE_FIELD(renderGainR);
     SVMS_COPY_GROWN_VOICE_FIELD(filterA0);
     SVMS_COPY_GROWN_VOICE_FIELD(filterB1);
     SVMS_COPY_GROWN_VOICE_FIELD(filterB2);
@@ -516,18 +503,12 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     SVMS_COPY_GROWN_VOICE_FIELD(filterZ2);
     SVMS_COPY_GROWN_VOICE_FIELD(filterEnabled);
     SVMS_COPY_GROWN_VOICE_FIELD(stealOutputGain);
-    SVMS_COPY_GROWN_VOICE_FIELD(sampleStart);
-    SVMS_COPY_GROWN_VOICE_FIELD(loopEnabled);
-    SVMS_COPY_GROWN_VOICE_FIELD(relEnd);
-    SVMS_COPY_GROWN_VOICE_FIELD(relLoopS);
-    SVMS_COPY_GROWN_VOICE_FIELD(relLoopE);
     SVMS_COPY_GROWN_VOICE_FIELD(relLoopSF);
     SVMS_COPY_GROWN_VOICE_FIELD(relLoopEF);
     SVMS_COPY_GROWN_VOICE_FIELD(holdSamplesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(attackSamplesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(decaySamplesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(delaySamplesRemaining);
-    SVMS_COPY_GROWN_VOICE_FIELD(releaseSamplesRemaining);
     SVMS_COPY_GROWN_VOICE_FIELD(decaySlope);
     SVMS_COPY_GROWN_VOICE_FIELD(birthFrame);
     SVMS_COPY_GROWN_VOICE_FIELD(stealFadeInFramesRemaining);
@@ -535,6 +516,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
 #undef SVMS_COPY_GROWN_VOICE_FIELD
     std::memcpy(grown.v.rows, v.rows,
                 static_cast<size_t>(oldCapacity) * sizeof(VoiceRow));
+    std::memcpy(grown.v.hot, v.hot,
+                static_cast<size_t>(oldCapacity) * sizeof(VoiceHot));
     if (grown.v.launch != nullptr && v.launch != nullptr)
         std::memcpy(grown.v.launch, v.launch,
                     static_cast<size_t>(oldCapacity) *

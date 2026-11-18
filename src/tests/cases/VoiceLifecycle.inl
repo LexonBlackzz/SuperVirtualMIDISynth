@@ -195,9 +195,7 @@ void TestCapacitySizedVoiceStorage() {
     const auto aligned64 = [](const void* pointer) {
         return (reinterpret_cast<uintptr_t>(pointer) & 63u) == 0u;
     };
-    Check(aligned64(voices->v.rows) && aligned64(voices->v.phaseIdx) &&
-              aligned64(voices->v.currentGain) &&
-              aligned64(voices->v.sampleStart) &&
+    Check(aligned64(voices->v.rows) && aligned64(voices->v.hot) &&
               aligned64(voices->v.birthFrame),
           "render-hot voice arrays retain 64-byte alignment");
 
@@ -212,8 +210,8 @@ void TestCapacitySizedVoiceStorage() {
     }
 
     auto copied = std::make_unique<svms::VoiceManager>(*voices);
-    Check(copied->v.phaseIdx != voices->v.phaseIdx &&
-              copied->v.currentGain != voices->v.currentGain &&
+    Check(copied->v.hot != voices->v.hot &&
+              copied->v.birthFrame != voices->v.birthFrame &&
               copied->v.GetCapacity() == voices->v.GetCapacity(),
           "VoiceManager copies own independent voice storage");
     if (handle != svms::kInvalidVoice) {

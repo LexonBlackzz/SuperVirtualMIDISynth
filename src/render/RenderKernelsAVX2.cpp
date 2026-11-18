@@ -810,6 +810,17 @@ SVMS_K_FORCEINLINE void MixChunk8Masked(float* outL, float* outR,
 // One frame of eight looping voices, one per lane: wraps the cursors into
 // their loops, fetches both lerp neighbours (the second wraps to the loop
 // start) and interpolates.  The cursors are not advanced.
+// Render-hot fields live in VoiceHot records (16 dwords per handle), so a
+// gather scales the handle index by the record size.
+SVMS_K_FORCEINLINE __m256 HotGatherPs(const float& first, __m256i handles) {
+    return _mm256_i32gather_ps(&first, _mm256_slli_epi32(handles, 4), 4);
+}
+SVMS_K_FORCEINLINE __m256i HotGatherEpi32(const uint32_t& first, __m256i handles) {
+    return _mm256_i32gather_epi32(reinterpret_cast<const int*>(&first),
+        _mm256_slli_epi32(handles, 4), 4);
+}
+static_assert(kVoiceHotDwords == 16u, "HotGather shifts by log2(kVoiceHotDwords)");
+
 SVMS_K_FORCEINLINE __m256 LoopLerp8(const int16_t* data, __m256i& phaseIdx,
                                     __m256i phaseFrac, __m256i sampleStart,
                                     __m256i loopStart, __m256i loopEnd) {
@@ -908,8 +919,8 @@ void ReleaseGainTables8(const VoiceSoA& v, const uint32_t* hs,
     const uint32_t stride = ReleaseGainStride(frames);
     const __m256i h = _mm256_loadu_si256(
         reinterpret_cast<const __m256i*>(hs));
-    __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
-    const __m256 decay = _mm256_i32gather_ps(v.releaseDecay, h, 4);
+    __m256 gain = HotGatherPs(v.hot->currentGain, h);
+    const __m256 decay = HotGatherPs(v.hot->releaseDecay, h);
     for (uint32_t block = 0u; block < stride; block += 8u) {
         __m256 rows[8];
         for (uint32_t k = 0u; k < 8u; ++k) {
@@ -950,7 +961,7 @@ uint32_t TransientGainTables8(const VoiceSoA& v, const uint32_t* hs,
     if (valid == 0u) return 0u;
     const __m256i h = _mm256_loadu_si256(
         reinterpret_cast<const __m256i*>(hs));
-    __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
+    __m256 gain = HotGatherPs(v.hot->currentGain, h);
     const __m256 target = _mm256_i32gather_ps(v.targetGain, h, 4);
     const __m256 sustain = _mm256_i32gather_ps(v.sustainLevel, h, 4);
     const __m256 step = _mm256_i32gather_ps(v.attackGainStep, h, 4);
@@ -1665,24 +1676,19 @@ void RenderReleaseLoopShortAVX2(const RenderSpanContext& c,
             continue;
         }
 
-        __m256i phaseIdx = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.phaseIdx), h, 4);
-        __m256i phaseFrac = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.phaseFrac), h, 4);
+        __m256i phaseIdx = HotGatherEpi32(v.hot->phaseIdx, h);
+        __m256i phaseFrac = HotGatherEpi32(v.hot->phaseFrac, h);
         const __m256i stepIdxV = _mm256_load_si256(
             reinterpret_cast<const __m256i*>(stepIdxLane));
         const __m256i stepFracV = _mm256_load_si256(
             reinterpret_cast<const __m256i*>(stepFracLane));
-        __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
-        const __m256 decay = _mm256_i32gather_ps(v.releaseDecay, h, 4);
-        const __m256 mixL = _mm256_i32gather_ps(v.mixGainL, h, 4);
-        const __m256 mixR = _mm256_i32gather_ps(v.mixGainR, h, 4);
-        const __m256i sampleStart = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.sampleStart), h, 4);
-        const __m256i loopStart = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.relLoopS), h, 4);
-        const __m256i loopEnd = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.relLoopE), h, 4);
+        __m256 gain = HotGatherPs(v.hot->currentGain, h);
+        const __m256 decay = HotGatherPs(v.hot->releaseDecay, h);
+        const __m256 mixL = HotGatherPs(v.hot->mixGainL, h);
+        const __m256 mixR = HotGatherPs(v.hot->mixGainR, h);
+        const __m256i sampleStart = HotGatherEpi32(v.hot->sampleStart, h);
+        const __m256i loopStart = HotGatherEpi32(v.hot->relLoopS, h);
+        const __m256i loopEnd = HotGatherEpi32(v.hot->relLoopE, h);
         for (uint32_t frame = 0u; frame < c.frameCount; ++frame) {
             __m256 sample = LoopLerp8(c.sampleData, phaseIdx, phaseFrac, sampleStart,
             loopStart, loopEnd);
@@ -2079,10 +2085,8 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
             reinterpret_cast<const __m256i*>(handles + position));
         alignas(32) uint32_t hs[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
-        __m256i phaseIdx = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.phaseIdx), h, 4);
-        __m256i phaseFrac = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.phaseFrac), h, 4);
+        __m256i phaseIdx = HotGatherEpi32(v.hot->phaseIdx, h);
+        __m256i phaseFrac = HotGatherEpi32(v.hot->phaseFrac, h);
         alignas(32) uint32_t stepIdxLane[8], stepFracLane[8];
         for (uint32_t lane = 0u; lane < 8u; ++lane) {
             const uint64_t stepFx = phasefx::FromFloat(v.phaseIncs[hs[lane]]);
@@ -2093,19 +2097,16 @@ void RenderTransientLoopShortAVX2(const RenderSpanContext& c,
             reinterpret_cast<const __m256i*>(stepIdxLane));
         const __m256i stepFracV = _mm256_load_si256(
             reinterpret_cast<const __m256i*>(stepFracLane));
-        __m256 gain = _mm256_i32gather_ps(v.currentGain, h, 4);
-        const __m256 mixL = _mm256_i32gather_ps(v.mixGainL, h, 4);
-        const __m256 mixR = _mm256_i32gather_ps(v.mixGainR, h, 4);
+        __m256 gain = HotGatherPs(v.hot->currentGain, h);
+        const __m256 mixL = HotGatherPs(v.hot->mixGainL, h);
+        const __m256 mixR = HotGatherPs(v.hot->mixGainR, h);
         const __m256 targetGain = _mm256_i32gather_ps(v.targetGain, h, 4);
         const __m256 sustainLevel = _mm256_i32gather_ps(v.sustainLevel, h, 4);
         const __m256 attackStep = _mm256_i32gather_ps(v.attackGainStep, h, 4);
         const __m256 decaySlope = _mm256_i32gather_ps(v.decaySlope, h, 4);
-        const __m256i sampleStart = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.sampleStart), h, 4);
-        const __m256i loopStart = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.relLoopS), h, 4);
-        const __m256i loopEnd = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.relLoopE), h, 4);
+        const __m256i sampleStart = HotGatherEpi32(v.hot->sampleStart, h);
+        const __m256i loopStart = HotGatherEpi32(v.hot->relLoopS, h);
+        const __m256i loopEnd = HotGatherEpi32(v.hot->relLoopE, h);
         alignas(32) uint32_t attackR[8], decayR[8];
         alignas(32) uint8_t stageV[8], initialStage[8];
         for (uint32_t lane = 0u; lane < 8u; ++lane) {
@@ -2840,18 +2841,11 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
                 continue;
             }
         }
-        __m256i phaseIdx = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.phaseIdx + position))
-            : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.phaseIdx), h, 4);
-        __m256i phaseFrac = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.phaseFrac + position))
-            : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.phaseFrac), h, 4);
-        const __m256 step = denseHandles ? _mm256_load_ps(v.phaseIncs + position)
-            : _mm256_i32gather_ps(v.phaseIncs, h, 4);
-        const __m256 gainL = denseHandles ? _mm256_load_ps(v.renderGainL + position)
-            : _mm256_i32gather_ps(v.renderGainL, h, 4);
-        const __m256 gainR = denseHandles ? _mm256_load_ps(v.renderGainR + position)
-            : _mm256_i32gather_ps(v.renderGainR, h, 4);
+        __m256i phaseIdx = HotGatherEpi32(v.hot->phaseIdx, h);
+        __m256i phaseFrac = HotGatherEpi32(v.hot->phaseFrac, h);
+        const __m256 step = HotGatherPs(v.hot->phaseIncs, h);
+        const __m256 gainL = HotGatherPs(v.hot->renderGainL, h);
+        const __m256 gainR = HotGatherPs(v.hot->renderGainR, h);
 
         alignas(32) uint32_t hs[8];
         alignas(32) float steps[8];
@@ -2881,15 +2875,9 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             continue;
         }
 
-        const __m256i sampleStart = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.sampleStart + position))
-            : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.sampleStart), h, 4);
-        const __m256i loopStart = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopS + position))
-            : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.relLoopS), h, 4);
-        const __m256i loopEnd = denseHandles
-            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(v.relLoopE + position))
-            : _mm256_i32gather_epi32(reinterpret_cast<const int*>(v.relLoopE), h, 4);
+        const __m256i sampleStart = HotGatherEpi32(v.hot->sampleStart, h);
+        const __m256i loopStart = HotGatherEpi32(v.hot->relLoopS, h);
+        const __m256i loopEnd = HotGatherEpi32(v.hot->relLoopE, h);
         const __m256i stepIdxV = _mm256_load_si256(
             reinterpret_cast<const __m256i*>(stepIdxLane));
         const __m256i stepFracV = _mm256_load_si256(
@@ -2906,17 +2894,14 @@ bool RenderSustainedLoopAVX2(const RenderSpanContext& context,
             FxAdd8(phaseIdx, phaseFrac, stepIdxV, stepFracV);
         }
         FxWrap8(phaseIdx, loopStart, loopEnd);
-        if (denseHandles) {
-            _mm256_store_si256(reinterpret_cast<__m256i*>(v.phaseIdx + position), phaseIdx);
-            _mm256_store_si256(reinterpret_cast<__m256i*>(v.phaseFrac + position), phaseFrac);
-        } else {
-            alignas(32) uint32_t idxOut[8], fracOut[8];
-            _mm256_store_si256(reinterpret_cast<__m256i*>(idxOut), phaseIdx);
-            _mm256_store_si256(reinterpret_cast<__m256i*>(fracOut), phaseFrac);
-            for (uint32_t lane = 0; lane < 8u; ++lane) {
-                v.phaseIdx[hs[lane]] = idxOut[lane];
-                v.phaseFrac[hs[lane]] = fracOut[lane];
-            }
+        {
+        alignas(32) uint32_t idxOut[8], fracOut[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idxOut), phaseIdx);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(fracOut), phaseFrac);
+        for (uint32_t lane = 0; lane < 8u; ++lane) {
+            v.phaseIdx[hs[lane]] = idxOut[lane];
+            v.phaseFrac[hs[lane]] = fracOut[lane];
+        }
         }
     }
     for (; position < iterationCount; ++position) {
@@ -2957,12 +2942,12 @@ bool FastChunkMathEnabled() { return g_fastChunkMath; }
 
 bool BuildVolatileStealKeysAVX2(
     const uint32_t* handles, uint32_t handleCount,
-    const uint64_t* birthFrames, const float* currentGains,
+    const uint64_t* birthFrames, const VoiceHot* hotRecords,
     const float* outputGains, const uint32_t* activePositions,
     uint64_t currentFrame, float gainScale, float ageScaleValue, uint64_t* outputKeys,
     uint32_t* outputHandles, uint32_t* inverseHeapPositions,
     uint32_t positionBase) {
-    if (!handles || !birthFrames || !currentGains || !outputGains ||
+    if (!handles || !birthFrames || !hotRecords || !outputGains ||
         !activePositions || !outputKeys || !outputHandles ||
         !inverseHeapPositions || currentFrame >
             static_cast<uint64_t>(INT32_MAX)) {
@@ -2999,7 +2984,7 @@ bool BuildVolatileStealKeysAVX2(
         const __m256 ages = _mm256_cvtepi32_ps(
             _mm256_sub_epi32(current, births));
         const __m256 gains = _mm256_andnot_ps(
-            signMask, _mm256_i32gather_ps(currentGains, h, 4));
+            signMask, HotGatherPs(hotRecords->currentGain, h));
         const __m256 levels = _mm256_mul_ps(
             gains, _mm256_i32gather_ps(outputGains, h, 4));
         const __m256 score = _mm256_sub_ps(
@@ -3052,7 +3037,7 @@ bool BuildVolatileStealKeysAVX2(
         const uint32_t age = rawAge > UINT32_MAX
             ? UINT32_MAX : static_cast<uint32_t>(rawAge);
         const float ageUnits = static_cast<float>(age) * ageScaleValue;
-        const float level = std::fabs(currentGains[handle]) *
+        const float level = std::fabs(hotRecords[handle].currentGain) *
             outputGains[handle];
         const float score = ageUnits - level * gainScale;
         outputKeys[position] = encode(
@@ -3554,30 +3539,22 @@ void RenderQuietGroupsAVX2(const RenderSpanContext& c,
             reinterpret_cast<const __m256i*>(stepIdx));
         const __m256i stepFracV = _mm256_load_si256(
             reinterpret_cast<const __m256i*>(stepFrac));
-        __m256i idx = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.phaseIdx), h, 4);
-        __m256i frac = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.phaseFrac), h, 4);
-        const __m256i start = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.sampleStart), h, 4);
-        const __m256i loopS = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.relLoopS), h, 4);
-        const __m256i loopE = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.relLoopE), h, 4);
-        const __m256i endLast = _mm256_sub_epi32(_mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(v.relEnd), h, 4), one);
+        __m256i idx = HotGatherEpi32(v.hot->phaseIdx, h);
+        __m256i frac = HotGatherEpi32(v.hot->phaseFrac, h);
+        const __m256i start = HotGatherEpi32(v.hot->sampleStart, h);
+        const __m256i loopS = HotGatherEpi32(v.hot->relLoopS, h);
+        const __m256i loopE = HotGatherEpi32(v.hot->relLoopE, h);
+        const __m256i endLast = _mm256_sub_epi32(HotGatherEpi32(v.hot->relEnd, h), one);
         const __m256i loopLast = _mm256_sub_epi32(loopE, one);
-        const __m256 gainL = _mm256_i32gather_ps(
-            Kind == QuietSustained ? v.renderGainL : v.mixGainL, h, 4);
-        const __m256 gainR = _mm256_i32gather_ps(
-            Kind == QuietSustained ? v.renderGainR : v.mixGainR, h, 4);
+        const __m256 gainL = HotGatherPs(Kind == QuietSustained ? v.hot->renderGainL : v.hot->mixGainL, h);
+        const __m256 gainR = HotGatherPs(Kind == QuietSustained ? v.hot->renderGainR : v.hot->mixGainR, h);
         __m256 gain = _mm256_setzero_ps();
         __m256 rate = _mm256_setzero_ps();
         __m256 floorLevel = _mm256_setzero_ps();
         if constexpr (Kind != QuietSustained) {
-            gain = _mm256_i32gather_ps(v.currentGain, h, 4);
-            rate = _mm256_i32gather_ps(
-                Kind == QuietRelease ? v.releaseDecay : v.decaySlope, h, 4);
+            gain = HotGatherPs(v.hot->currentGain, h);
+            rate = Kind == QuietRelease ? HotGatherPs(v.hot->releaseDecay, h)
+                : _mm256_i32gather_ps(v.decaySlope, h, 4);
         }
         if constexpr (Kind == QuietDecay)
             floorLevel = _mm256_i32gather_ps(v.sustainLevel, h, 4);

@@ -39,8 +39,7 @@ struct RenderScalar::GpuPassContext {
     uint64_t* sortA;
     uint64_t* sortB;
     uint32_t* sortHist;     // sort jobs x GpuStage::kSortBuckets counters
-    const uint32_t* sortSampleStart;
-    const uint32_t* sortPhases;
+    const VoiceSoA* sortVoices;
 };
 
 // Which GPU kernel (if any) renders the row's block exactly like the CPU:
@@ -110,7 +109,7 @@ inline void RenderScalar::GpuPassThunk(uint32_t localJob, const IndexedJobMix&,
             for (uint32_t i = begin; i < end; ++i) {
                 const uint32_t h = c.sortRows[i];
                 const uint64_t e = GpuStage::SortEntry(
-                    h, c.sortSampleStart[h], c.sortPhases[h]);
+                    h, c.sortVoices->sampleStart[h], c.sortVoices->phaseIdx[h]);
                 c.sortA[i] = e;
                 ++hist[(e >> 32) & kMask];
             }
@@ -453,8 +452,7 @@ inline void RenderScalar::SortGpuRows(GpuPassContext& ctx, uint32_t* rows,
     ctx.sortA = stage.SortA();
     ctx.sortB = stage.SortB();
     ctx.sortHist = stage.SortHist();
-    ctx.sortSampleStart = v.sampleStart;
-    ctx.sortPhases = v.phaseIdx;
+    ctx.sortVoices = &v;
     // Turns the per-job counts into start offsets: bucket-major, job-minor, so
     // earlier jobs' elements precede later jobs' within a bucket (stable).
     auto prefix = [&]() {

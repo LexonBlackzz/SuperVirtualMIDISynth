@@ -408,40 +408,21 @@ struct SamplePage {
 // Removed: fractional phase offsets; event starts are integer output frames.
 // ════════════════════════════════════════════════════════════════════════
 #define SVMS_VOICE_SOA_DENSE_FIELDS(X) \
-    X(uint8_t, state) \
-    X(uint8_t, envelopeStage) \
-    X(uint8_t, sampleBacked) \
-    X(uint8_t, renderClass) \
-    X(uint32_t, phaseIdx) \
-    X(uint32_t, phaseFrac) \
-    X(float, phaseIncs) \
-    X(float, currentGain) \
     X(float, targetGain) \
     X(float, sustainLevel) \
     X(float, attackGainStep) \
-    X(float, releaseDecay) \
-    X(float, mixGainL) \
-    X(float, mixGainR) \
-    X(float, renderGainL) \
-    X(float, renderGainR) \
     X(float, filterA0) \
     X(float, filterB1) \
     X(float, filterB2) \
     X(float, filterZ1) \
     X(float, filterZ2) \
     X(uint32_t, filterEnabled) \
-    X(uint32_t, sampleStart) \
-    X(uint8_t, loopEnabled) \
-    X(uint32_t, relEnd) \
-    X(uint32_t, relLoopS) \
-    X(uint32_t, relLoopE) \
     X(float, relLoopSF) \
     X(float, relLoopEF) \
     X(uint32_t, holdSamplesRemaining) \
     X(uint32_t, attackSamplesRemaining) \
     X(uint32_t, decaySamplesRemaining) \
     X(uint32_t, delaySamplesRemaining) \
-    X(uint32_t, releaseSamplesRemaining) \
     X(float, decaySlope) \
     X(uint32_t, stealFadeInFramesRemaining) \
     X(uint32_t, stealFadeInFramesTotal)
@@ -497,6 +478,43 @@ struct alignas(64) VoiceRow {
 #undef SVMS_DECLARE_ROW_FIELD
 };
 static_assert(sizeof(VoiceRow) == 64, "VoiceRow must stay one cache line");
+
+// Render-hot per-voice state, stored AoS: one 64-byte VoiceHot per handle.
+// Everything the per-block render of a plain voice reads and writes (cursor,
+// gain, mix, release countdown, sample bounds, lifecycle bytes) shares one
+// line, so a voice costs one miss instead of one per array.  Accessed through
+// RowColumn (`v.currentGain[h]`); vector code gathers from the record with
+// handle * kVoiceHotDwords as the index.  The 32-bit fields come first so
+// every one sits at a dword offset.
+#define SVMS_VOICE_HOT_FIELDS(X) \
+    X(uint32_t, phaseIdx) \
+    X(uint32_t, phaseFrac) \
+    X(float, phaseIncs) \
+    X(float, currentGain) \
+    X(float, mixGainL) \
+    X(float, mixGainR) \
+    X(float, renderGainL) \
+    X(float, renderGainR) \
+    X(float, releaseDecay) \
+    X(uint32_t, releaseSamplesRemaining) \
+    X(uint32_t, sampleStart) \
+    X(uint32_t, relEnd) \
+    X(uint32_t, relLoopS) \
+    X(uint32_t, relLoopE) \
+    X(uint8_t, state) \
+    X(uint8_t, envelopeStage) \
+    X(uint8_t, loopEnabled) \
+    X(uint8_t, sampleBacked) \
+    X(uint8_t, renderClass)
+
+struct alignas(64) VoiceHot {
+#define SVMS_DECLARE_HOT_FIELD(type, name) type name;
+    SVMS_VOICE_HOT_FIELDS(SVMS_DECLARE_HOT_FIELD)
+#undef SVMS_DECLARE_HOT_FIELD
+    uint8_t hotPad[3];  // always zero, so whole records compare with memcmp
+};
+static_assert(sizeof(VoiceHot) == 64, "VoiceHot must stay one cache line");
+inline constexpr uint32_t kVoiceHotDwords = 16u;
 
 // Launch staging (experimental, `voices.launch_staging`, default off).  An
 // in-place steal relaunch inside the whole-voice plan writes these launch-
@@ -608,6 +626,9 @@ struct alignas(64) VoiceSoA {
     // AoS launch bookkeeping (see SVMS_VOICE_ROW_FIELDS); null in dense-only
     // images.  Each column below aliases `rows`.
     VoiceRow* rows = nullptr;
+    // Render-hot records (see SVMS_VOICE_HOT_FIELDS); each column below
+    // aliases `hot`.  Zeroed when reserved.
+    VoiceHot* hot = nullptr;
     // Launch staging records (VoiceLaunchRecord); null unless the storage was
     // reserved with `launchStaging` set.  Bound after `rows` in the block.
     VoiceLaunchRecord* launch = nullptr;
@@ -616,6 +637,10 @@ struct alignas(64) VoiceSoA {
     RowColumn<VoiceRow, type, &VoiceRow::name> name;
     SVMS_VOICE_ROW_FIELDS(SVMS_DECLARE_ROW_COLUMN)
 #undef SVMS_DECLARE_ROW_COLUMN
+#define SVMS_DECLARE_HOT_COLUMN(type, name) \
+    RowColumn<VoiceHot, type, &VoiceHot::name> name;
+    SVMS_VOICE_HOT_FIELDS(SVMS_DECLARE_HOT_COLUMN)
+#undef SVMS_DECLARE_HOT_COLUMN
 
     // Lazily allocated per-voice phase-rotation states (PhaseRotation.h).
     // Null in Coherent mode — every render path checks this pointer and is
@@ -721,6 +746,7 @@ struct alignas(64) VoiceSoA {
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ACCUMULATE_FIELD_SIZE)
 #undef SVMS_ACCUMULATE_FIELD_SIZE
         bytes = AlignUp(bytes) + static_cast<size_t>(capacity) * sizeof(VoiceRow);
+        bytes = AlignUp(bytes) + static_cast<size_t>(capacity) * sizeof(VoiceHot);
         if (launchStaging)
             bytes = AlignUp(bytes) +
                     static_cast<size_t>(capacity) * sizeof(VoiceLaunchRecord);
@@ -750,6 +776,10 @@ struct alignas(64) VoiceSoA {
         offset = AlignUp(offset);
         BindRows(reinterpret_cast<VoiceRow*>(base + offset));
         offset += static_cast<size_t>(capacity_) * sizeof(VoiceRow);
+        offset = AlignUp(offset);
+        BindHot(reinterpret_cast<VoiceHot*>(base + offset));
+        std::memset(hot, 0, static_cast<size_t>(capacity_) * sizeof(VoiceHot));
+        offset += static_cast<size_t>(capacity_) * sizeof(VoiceHot);
         if (launchStaging) {
             offset = AlignUp(offset);
             launch = reinterpret_cast<VoiceLaunchRecord*>(base + offset);
@@ -765,6 +795,7 @@ struct alignas(64) VoiceSoA {
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CLEAR_DYNAMIC_FIELD)
 #undef SVMS_CLEAR_DYNAMIC_FIELD
         if (rows) std::memset(rows, 0, static_cast<size_t>(capacity_) * sizeof(VoiceRow));
+        if (hot) std::memset(hot, 0, static_cast<size_t>(capacity_) * sizeof(VoiceHot));
         if (launch) std::memset(launch, 0, static_cast<size_t>(capacity_) * sizeof(VoiceLaunchRecord));
         pad16 = 0u;
         ResetFixedTails();
@@ -784,6 +815,7 @@ struct alignas(64) VoiceSoA {
         bytes += static_cast<size_t>(capacity) * sizeof(type);
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_ESTIMATE_FIELD_SIZE)
         bytes = AlignUp(bytes) + static_cast<size_t>(capacity) * sizeof(VoiceRow);
+        bytes = AlignUp(bytes) + static_cast<size_t>(capacity) * sizeof(VoiceHot);
         if (withLaunch)
             bytes = AlignUp(bytes) +
                     static_cast<size_t>(capacity) * sizeof(VoiceLaunchRecord);
@@ -799,6 +831,7 @@ struct alignas(64) VoiceSoA {
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_COPY_ONE_DYNAMIC_FIELD)
 #undef SVMS_COPY_ONE_DYNAMIC_FIELD
         destination.rows[destinationHandle] = source.rows[sourceHandle];
+        destination.hot[destinationHandle] = source.hot[sourceHandle];
         if (destination.launch && source.launch)
             destination.launch[destinationHandle] =
                 source.launch[sourceHandle];
@@ -832,6 +865,8 @@ private:
 #undef SVMS_COPY_DYNAMIC_FIELD
         if (rows && other.rows) std::memcpy(rows, other.rows,
             static_cast<size_t>(capacity_) * sizeof(VoiceRow));
+        if (hot && other.hot) std::memcpy(hot, other.hot,
+            static_cast<size_t>(capacity_) * sizeof(VoiceHot));
         if (launch && other.launch) std::memcpy(launch, other.launch,
             static_cast<size_t>(capacity_) * sizeof(VoiceLaunchRecord));
 #define SVMS_COPY_FIXED_TAIL_FIELD(type, name, count) \
@@ -858,6 +893,8 @@ private:
 #undef SVMS_MOVE_DYNAMIC_FIELD
         BindRows(other.rows);
         other.BindRows(nullptr);
+        BindHot(other.hot);
+        other.BindHot(nullptr);
         launch = other.launch;
         other.launch = nullptr;
         launchStaging = other.launchStaging;
@@ -895,6 +932,7 @@ private:
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_NULL_DYNAMIC_FIELD)
 #undef SVMS_NULL_DYNAMIC_FIELD
         BindRows(nullptr);
+        BindHot(nullptr);
         launch = nullptr;
     }
 
@@ -903,6 +941,13 @@ private:
 #define SVMS_BIND_ROW_COLUMN(type, name) name.rows = next;
         SVMS_VOICE_ROW_FIELDS(SVMS_BIND_ROW_COLUMN)
 #undef SVMS_BIND_ROW_COLUMN
+    }
+
+    void BindHot(VoiceHot* next) noexcept {
+        hot = next;
+#define SVMS_BIND_HOT_COLUMN(type, name) name.rows = next;
+        SVMS_VOICE_HOT_FIELDS(SVMS_BIND_HOT_COLUMN)
+#undef SVMS_BIND_HOT_COLUMN
     }
 
     void* storage_ = nullptr;

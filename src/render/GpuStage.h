@@ -116,9 +116,11 @@ public:
 
     // Stable counting sort of rows[0, count) by the store position each row
     // reads at block start, in 64-frame (one cache line) steps: two 12-bit
-    // passes.  `sampleStart` and `phaseIdx` are the voice pool's per-handle arrays.
-    void SortRows(uint32_t* rows, uint32_t count, const uint32_t* sampleStart,
-                  const uint32_t* phaseIdx) {
+    // passes.  `sampleStart` and `phaseIdx` are the voice pool's per-handle
+    // columns (anything indexable by handle).
+    template <class Starts, class Phases>
+    void SortRows(uint32_t* rows, uint32_t count, const Starts& sampleStart,
+                  const Phases& phaseIdx) {
         if (!sortByRegion_ || count < 64u || count > sortA_.size()) return;
         const uint64_t start = NowMicros();
         uint64_t* a = sortA_.data();

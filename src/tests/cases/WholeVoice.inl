@@ -1,5 +1,14 @@
 // Test cases split out of V3Tests.cpp; included inside its anonymous namespace.
 
+// First handle where two per-voice columns differ bit for bit (UINT32_MAX
+// if none).  Works for SoA arrays and for the strided VoiceHot columns.
+template <class Column>
+uint32_t FirstColumnDiff(const Column& a, const Column& b, uint32_t count) {
+    for (uint32_t h = 0u; h < count; ++h)
+        if (std::memcmp(&a[h], &b[h], sizeof(a[h])) != 0) return h;
+    return UINT32_MAX;
+}
+
 void TestLaunchChurnInstrumentation() {
     auto voices = std::make_unique<svms::VoiceManager>();
     Check(voices->Initialize(1u, 44100u),
@@ -2931,9 +2940,10 @@ void RunLaunchStagingIdentity(uint32_t renderThreads, bool avx2Pass,
         const uint32_t cap = (std::min)(directVoices->GetMaxVoices(),
                                         stagedVoices->GetMaxVoices());
 #define SVMS_CMP_FIELD(type, name) \
-        same = same && std::memcmp(directVoices->v.name, stagedVoices->v.name, \
-                                   cap * sizeof(type)) == 0;
+        same = same && FirstColumnDiff(directVoices->v.name, stagedVoices->v.name, \
+                                   cap) == UINT32_MAX;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+        SVMS_VOICE_HOT_FIELDS(SVMS_CMP_FIELD)
 #undef SVMS_CMP_FIELD
         if (!same) ++mismatchedBlocks;
         Check(stagedVoices->CountStagedRows() == 0u,
@@ -3190,9 +3200,10 @@ void TestBulkAdmission() {
         const uint32_t cap = (std::min)(bulkVoices->GetMaxVoices(),
                                         plainVoices->GetMaxVoices());
 #define SVMS_CMP_FIELD(type, name) \
-        same = same && std::memcmp(bulkVoices->v.name, plainVoices->v.name, \
-                                   cap * sizeof(type)) == 0;
+        same = same && FirstColumnDiff(bulkVoices->v.name, plainVoices->v.name, \
+                                   cap) == UINT32_MAX;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+        SVMS_VOICE_HOT_FIELDS(SVMS_CMP_FIELD)
 #undef SVMS_CMP_FIELD
         if (!same) ++mismatchedBlocks;
     }
@@ -3348,9 +3359,10 @@ void TestBendFusionIdentity() {
 #define SVMS_CMP_FIELD(type, name) \
         same = same && (std::strcmp(#name, "renderGainL") == 0 || \
                         std::strcmp(#name, "renderGainR") == 0 || \
-                        std::memcmp(splitVoices->v.name, fusedVoices->v.name, \
-                                    cap * sizeof(type)) == 0);
+                        FirstColumnDiff(splitVoices->v.name, fusedVoices->v.name, \
+                                    cap) == UINT32_MAX);
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+        SVMS_VOICE_HOT_FIELDS(SVMS_CMP_FIELD)
 #undef SVMS_CMP_FIELD
         for (uint32_t h = 0u; h < cap; ++h) {
             if (!heldAtSustain(h)) continue;
@@ -3578,9 +3590,10 @@ void RunLazyLaunchIdentity(uint32_t renderThreads, bool avx2Pass,
             std::memcmp(normalVoices->activeList_, lazyVoices->activeList_,
                         normalVoices->GetActiveCount() * sizeof(uint32_t)) == 0;
 #define SVMS_CMP_FIELD(type, name) \
-        same = same && std::memcmp(normalVoices->v.name, lazyVoices->v.name, \
-                                   kPool * sizeof(type)) == 0;
+        same = same && FirstColumnDiff(normalVoices->v.name, lazyVoices->v.name, \
+                                   kPool) == UINT32_MAX;
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+        SVMS_VOICE_HOT_FIELDS(SVMS_CMP_FIELD)
 #undef SVMS_CMP_FIELD
         same = same && std::memcmp(normalVoices->v.rows, lazyVoices->v.rows,
                                    kPool * sizeof(svms::VoiceRow)) == 0;
@@ -4127,9 +4140,10 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
             const uint32_t flipCap = (std::min)(offVoices->GetMaxVoices(),
                                                 flipVoices->GetMaxVoices());
 #define SVMS_CMP_FIELD(type, name) \
-            flipSame = flipSame && std::memcmp(offVoices->v.name, \
-                flipVoices->v.name, flipCap * sizeof(type)) == 0;
+            flipSame = flipSame && FirstColumnDiff(offVoices->v.name, \
+                flipVoices->v.name, flipCap) == UINT32_MAX;
             SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+            SVMS_VOICE_HOT_FIELDS(SVMS_CMP_FIELD)
 #undef SVMS_CMP_FIELD
             if (!flipSame) ++flipMismatched;
         }
@@ -4139,17 +4153,16 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
         const char* field = nullptr;
         uint32_t fieldHandle = 0u;
 #define SVMS_CMP_FIELD(type, name) \
-        if (std::memcmp(offVoices->v.name, onVoices->v.name, \
-                        cap * sizeof(type)) != 0) { \
-            same = false; \
-            if (field == nullptr) { \
-                field = #name; \
-                while (std::memcmp(offVoices->v.name + fieldHandle, \
-                                   onVoices->v.name + fieldHandle, \
-                                   sizeof(type)) == 0) ++fieldHandle; \
+        { \
+            const uint32_t diff = FirstColumnDiff(offVoices->v.name, \
+                                                  onVoices->v.name, cap); \
+            if (diff != UINT32_MAX) { \
+                same = false; \
+                if (field == nullptr) { field = #name; fieldHandle = diff; } \
             } \
         }
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+        SVMS_VOICE_HOT_FIELDS(SVMS_CMP_FIELD)
 #undef SVMS_CMP_FIELD
         if (!same) {
             if (firstMismatch == UINT32_MAX) {

@@ -1179,7 +1179,7 @@ inline void VoiceManager::BuildVolatileStealHeap() {
                     const uint32_t count = (std::min)(b.chunk, b.count - begin);
                     if (!BuildVolatileStealKeysAVX2(
                             m.stealVolatileList_ + begin, count, m.v.birthFrame,
-                            m.v.currentGain, m.v.stealOutputGain, m.activePosition_,
+                            m.v.hot, m.v.stealOutputGain, m.activePosition_,
                             m.currentFrame_, kBassMidiStealGainScale,
                             m.stealAgeScale_, m.stealVolatileHeapKey_ + begin,
                             m.stealVolatileHeapHandle_ + begin,
@@ -1192,7 +1192,7 @@ inline void VoiceManager::BuildVolatileStealHeap() {
         if (!vectorized)
         vectorized = BuildVolatileStealKeysAVX2(
             stealVolatileList_, stealVolatileCount_, v.birthFrame,
-            v.currentGain, v.stealOutputGain, activePosition_, currentFrame_,
+            v.hot, v.stealOutputGain, activePosition_, currentFrame_,
             kBassMidiStealGainScale, stealAgeScale_, stealVolatileHeapKey_,
             stealVolatileHeapHandle_, stealVolatileHeapPosition_);
     }
