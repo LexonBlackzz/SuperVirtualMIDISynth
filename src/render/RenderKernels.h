@@ -183,6 +183,38 @@ bool FastChunkMathEnabled();
 inline void SetFastChunkMath(bool) {}  // no AVX2 kernels on the XP build
 inline bool FastChunkMathEnabled() { return false; }
 #endif
+// Fast chunk math gain ladders, shared by the per-voice kernels and the lean
+// path.  Release: ladder[k] = decay^(k + 1), powers by squaring in double
+// (three dependent steps, each float entry correctly rounded); a chunk's
+// gains are gain * ladder[k] and the next chunk starts at gain * ladder[7].
+inline void FastReleaseLadder(float decay, float* ladder) {
+    const double dd = decay, d2 = dd * dd, d4 = d2 * d2;
+    ladder[0] = decay; ladder[1] = static_cast<float>(d2);
+    ladder[2] = static_cast<float>(d2 * dd);
+    ladder[3] = static_cast<float>(d4);
+    ladder[4] = static_cast<float>(d4 * dd);
+    ladder[5] = static_cast<float>(d4 * d2);
+    ladder[6] = static_cast<float>(d4 * d2 * dd);
+    ladder[7] = static_cast<float>(d4 * d4);
+}
+// Decay stage: gains[k] = gain * slope^(k + 1) in double.  Returns whether the
+// chunk may use them (no sustain clamp at either end); otherwise the exact
+// recurrence runs.
+inline bool FastDecayChunk(float gain, float slope, float sustain,
+                           float* gains) {
+    const double s1 = slope, s2 = s1 * s1, s4 = s2 * s2;
+    const double g = gain;
+    gains[0] = static_cast<float>(g * s1);
+    gains[1] = static_cast<float>(g * s2);
+    gains[2] = static_cast<float>(g * s2 * s1);
+    gains[3] = static_cast<float>(g * s4);
+    gains[4] = static_cast<float>(g * s4 * s1);
+    gains[5] = static_cast<float>(g * s4 * s2);
+    gains[6] = static_cast<float>(g * s4 * s2 * s1);
+    gains[7] = static_cast<float>(g * s4 * s4);
+    return gains[0] >= sustain && gains[7] >= sustain;
+}
+
 const RenderKernelSet& SelectBestRenderKernelSet();
 const RenderKernelSet* SelectRenderKernelSet(RenderBackend backend);
 bool IsRenderBackendSupported(RenderBackend backend);

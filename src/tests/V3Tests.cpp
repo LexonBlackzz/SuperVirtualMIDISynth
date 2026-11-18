@@ -122,6 +122,7 @@ int main() {
     if (std::getenv("SVMS_TEST_LEAN_ONLY") != nullptr) {
         TestRotationStateFollowsPoolGrowth();
         TestLeanVoicesIdentity();
+        TestLeanVoicesIdentityFastMath();
         std::puts(g_failures == 0 ? "lean tests passed" : "lean tests FAILED");
         return g_failures == 0 ? 0 : 1;
     }
@@ -165,6 +166,7 @@ int main() {
     TestFastChunkMathDifferential();
     TestRotationStateFollowsPoolGrowth();
     TestLeanVoicesIdentity();
+    TestLeanVoicesIdentityFastMath();
     TestWholeVoiceOpBudgetSplitDifferential();
     TestWholeVoiceVibratoDifferential();
     TestWholeVoiceScalarVibratoDifferential();

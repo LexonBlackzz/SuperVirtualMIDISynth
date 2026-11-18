@@ -801,6 +801,43 @@ inline bool ReleaseGainStaysAboveFloor(float gain, float decay,
            static_cast<double>(VoiceRetireThreshold());
 }
 
+// quality.fast_chunk_math: today's looping release and decay kernels take
+// their closed-form chunk gains only for whole 8-frame chunks whose eight reads
+// stay below the loop end (a chunk that meets it runs frame by frame), and a
+// filtered voice in a group of eight keeps the exact chain
+// (RenderFilteredGroup).  The lean path follows fast math only where every
+// chunk of the block is such a chunk: an unfiltered voice, a block of whole
+// chunks, and no chunk reaching the loop end.
+inline bool QuietChunksStayInLoop(const VoiceSoA& v, uint32_t handle,
+                                  uint32_t frameCount) {
+    if ((frameCount & 7u) != 0u || v.filterEnabled[handle] != 0u)
+        return false;
+    const uint64_t step = phasefx::FromFloat(v.phaseIncs[handle]);
+    const uint64_t loopS = phasefx::Pack(v.relLoopS[handle], 0u);
+    const uint64_t loopE = phasefx::Pack(v.relLoopE[handle], 0u);
+    const uint64_t guard = phasefx::Pack(v.relLoopE[handle] - 1u, 0u);
+    uint64_t pos = phasefx::Load(v, handle);
+    for (uint32_t frame = 0u; frame < frameCount; frame += 8u) {
+        pos = phasefx::Wrap(pos, loopS, loopE);
+        if (pos + step * 7u >= guard) return false;
+        pos += step * 8u;
+    }
+    return true;
+}
+
+// Fast-math release: each chunk's end gain (gain * ladder[7], the per-voice
+// kernel's threshold test) stays at or above the retire floor.
+inline bool ReleaseChunksStayAboveFloor(float gain, float decay,
+                                        uint32_t frameCount) {
+    float ladder[8];
+    FastReleaseLadder(decay, ladder);
+    for (uint32_t frame = 0u; frame < frameCount; frame += 8u) {
+        gain *= ladder[7];
+        if (!(gain >= VoiceRetireThreshold())) return false;
+    }
+    return true;
+}
+
 inline bool RenderScalar::WholeVoiceRowQuiet(const VoiceSoA& v,
                                              uint32_t handle,
                                              uint32_t frameCount,
@@ -848,14 +885,22 @@ inline bool RenderScalar::WholeVoiceRowQuiet(const VoiceSoA& v,
             return false;
     }
     if (cls == Cls::SustainedLoop || cls == Cls::SustainedOneShot) return true;
-    // Release and decay follow the exact per-frame gain chain here;
-    // quality.fast_chunk_math renders them in closed form per chunk instead.
-    if (FastChunkMathEnabled()) return false;
+    // One-shots keep the exact chain under fast chunk math as well, and so
+    // does a looping decay voice whose release countdown is already set: the
+    // transient class kernel refuses it and the scalar span renders it.
+    const bool fast = loop && FastChunkMathEnabled() &&
+        !(cls == Cls::TransientLoop &&
+          v.releaseSamplesRemaining[handle] != UINT32_MAX);
+    if (fast && !QuietChunksStayInLoop(v, handle, frameCount)) return false;
     if (cls == Cls::ReleaseLoop || cls == Cls::ReleaseOneShot) {
         // No retirement inside the block: the countdown outlasts it, or (an
         // uncounted release) the gain stays above the retire floor.
         const uint32_t remaining = v.releaseSamplesRemaining[handle];
         if (remaining != UINT32_MAX) return remaining > frameCount;
+        if (fast)
+            return ReleaseChunksStayAboveFloor(v.currentGain[handle],
+                                               v.releaseDecay[handle],
+                                               frameCount);
         return ReleaseGainStaysAboveFloor(v.currentGain[handle],
                                           v.releaseDecay[handle], frameCount);
     }

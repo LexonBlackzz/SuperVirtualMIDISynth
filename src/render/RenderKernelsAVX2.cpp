@@ -1445,17 +1445,9 @@ uint32_t RenderReleaseChunked(const RenderSpanContext& c, uint32_t handle,
     float decay8 = 1.0f;
     alignas(32) float ladder[8] = {};
     if (fastMath) {
-        // Powers by squaring in double: three dependent steps, and each float
-        // entry is correctly rounded (a float decay^8 carried a systematic
+        // Powers by squaring in double (a float decay^8 carried a systematic
         // relative bias that compounds once per chunk).
-        const double dd = decay, d2 = dd * dd, d4 = d2 * d2;
-        ladder[0] = decay; ladder[1] = static_cast<float>(d2);
-        ladder[2] = static_cast<float>(d2 * dd);
-        ladder[3] = static_cast<float>(d4);
-        ladder[4] = static_cast<float>(d4 * dd);
-        ladder[5] = static_cast<float>(d4 * d2);
-        ladder[6] = static_cast<float>(d4 * d2 * dd);
-        ladder[7] = static_cast<float>(d4 * d4);
+        FastReleaseLadder(decay, ladder);
         decayLadder = _mm256_load_ps(ladder);
         decay8 = ladder[7];
     }
@@ -1893,17 +1885,7 @@ uint32_t RenderTransientChunked(const RenderSpanContext& c, uint32_t handle,
                     futureAttack -= 8u;
                 }
             } else if (stage == 2u && decayRemaining >= 9u && decaySlope > 0.0f) {
-                const double s1 = decaySlope, s2 = s1 * s1, s4 = s2 * s2;
-                const double g = gain;
-                gains[0] = static_cast<float>(g * s1);
-                gains[1] = static_cast<float>(g * s2);
-                gains[2] = static_cast<float>(g * s2 * s1);
-                gains[3] = static_cast<float>(g * s4);
-                gains[4] = static_cast<float>(g * s4 * s1);
-                gains[5] = static_cast<float>(g * s4 * s2);
-                gains[6] = static_cast<float>(g * s4 * s2 * s1);
-                gains[7] = static_cast<float>(g * s4 * s4);
-                if (gains[0] >= sustainLevel && gains[7] >= sustainLevel) {
+                if (FastDecayChunk(gain, decaySlope, sustainLevel, gains)) {
                     closedForm = true;
                     futureGain = gains[7];
                     futureDecay -= 8u;
@@ -3540,9 +3522,18 @@ uint32_t RenderStealTailSpanAVX2(VoiceSoA& v, uint32_t idx,
 //   Filtered lanes run the voice low-pass on the interpolated sample before
 //   any gain, as every per-voice kernel does (FilterVoices8AVX2's
 //   recurrence, state kept in registers for the span).
+//   Fast:  quality.fast_chunk_math for looping release and decay voices: the
+//          gains of each 8-frame chunk come from the closed-form ladders the
+//          per-voice kernels use (FastReleaseLadder / FastDecayChunk, the exact
+//          chain where a decay chunk would clamp), built per lane before the
+//          frame loop.  The caller proved every chunk is whole and stays clear
+//          of the loop end, which is when today's kernels take that path.  A
+//          decay lane with its release countdown set runs the exact chain (the
+//          transient class kernel refuses such a voice, the scalar span renders
+//          it), for any frame count.
 enum QuietKind { QuietSustained, QuietRelease, QuietDecay };
 
-template <QuietKind Kind, bool Loop>
+template <QuietKind Kind, bool Loop, bool Fast = false>
 void RenderQuietGroupsAVX2(const RenderSpanContext& c,
                            const uint32_t* handles, uint32_t count,
                            __m256* sumL, __m256* sumR) {
@@ -3606,6 +3597,39 @@ void RenderQuietGroupsAVX2(const RenderSpanContext& c,
             z1 = _mm256_i32gather_ps(v.filterZ1, h, 4);
             z2 = _mm256_i32gather_ps(v.filterZ2, h, 4);
         }
+        alignas(32) float table[Fast ? kLeanMaxFrames * 8u : 1u];
+        if constexpr (Fast) {
+            for (uint32_t lane = 0u; lane < 8u; ++lane) {
+                const uint32_t handle = handles[g + lane];
+                float chunkGain = v.currentGain[handle];
+                float ladder[8];
+                if constexpr (Kind == QuietRelease)
+                    FastReleaseLadder(v.releaseDecay[handle], ladder);
+                const float slope = v.decaySlope[handle];
+                const float sustain = v.sustainLevel[handle];
+                const bool exactLane = Kind == QuietDecay &&
+                    v.releaseSamplesRemaining[handle] != UINT32_MAX;
+                for (uint32_t f0 = 0u; f0 < frames; f0 += 8u) {
+                    float gains[8];
+                    if constexpr (Kind == QuietRelease) {
+                        for (uint32_t k = 0u; k < 8u; ++k)
+                            gains[k] = chunkGain * ladder[k];
+                    } else if (exactLane || !(slope > 0.0f &&
+                                 FastDecayChunk(chunkGain, slope, sustain,
+                                                gains))) {
+                        float x = chunkGain;
+                        for (uint32_t k = 0u; k < 8u; ++k) {
+                            x *= slope;
+                            if (x < sustain) x = sustain;
+                            gains[k] = x;
+                        }
+                    }
+                    for (uint32_t k = 0u; k < 8u; ++k)
+                        table[(f0 + k) * 8u + lane] = gains[k];
+                    chunkGain = gains[7];
+                }
+            }
+        }
         for (uint32_t f = 0u; f < frames; ++f) {
             __m256i next = _mm256_add_epi32(idx, one);
             if constexpr (Loop) {
@@ -3640,7 +3664,10 @@ void RenderQuietGroupsAVX2(const RenderSpanContext& c,
                 z2 = _mm256_blendv_ps(z2, newZ2, filtered);
                 sample = _mm256_blendv_ps(sample, out, filtered);
             }
-            if constexpr (Kind == QuietRelease) {
+            if constexpr (Fast) {
+                gain = _mm256_load_ps(table + f * 8u);
+                sample = _mm256_mul_ps(sample, gain);
+            } else if constexpr (Kind == QuietRelease) {
                 gain = _mm256_mul_ps(gain, rate);
                 sample = _mm256_mul_ps(sample, gain);
             } else if constexpr (Kind == QuietDecay) {
@@ -3699,16 +3726,24 @@ void RenderQuietVoicesAVX2(const RenderSpanContext& c, const uint32_t* handles,
                                                          sumL, sumR);
             break;
         case Cls::ReleaseLoop:
-            RenderQuietGroupsAVX2<QuietRelease, true>(c, handles, count,
-                                                      sumL, sumR);
+            if (g_fastChunkMath)
+                RenderQuietGroupsAVX2<QuietRelease, true, true>(
+                    c, handles, count, sumL, sumR);
+            else
+                RenderQuietGroupsAVX2<QuietRelease, true>(c, handles, count,
+                                                          sumL, sumR);
             break;
         case Cls::ReleaseOneShot:
             RenderQuietGroupsAVX2<QuietRelease, false>(c, handles, count,
                                                        sumL, sumR);
             break;
         case Cls::TransientLoop:
-            RenderQuietGroupsAVX2<QuietDecay, true>(c, handles, count,
-                                                    sumL, sumR);
+            if (g_fastChunkMath)
+                RenderQuietGroupsAVX2<QuietDecay, true, true>(
+                    c, handles, count, sumL, sumR);
+            else
+                RenderQuietGroupsAVX2<QuietDecay, true>(c, handles, count,
+                                                        sumL, sumR);
             break;
         case Cls::TransientOneShot:
             RenderQuietGroupsAVX2<QuietDecay, false>(c, handles, count,

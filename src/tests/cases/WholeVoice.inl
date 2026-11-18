@@ -3935,12 +3935,17 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
             }
             seedVoices->RefreshRenderClass(static_cast<svms::VoiceHandle>(h));
         }
-        // A low-pass on every other seed (loop and one-shot alike).
+        // A low-pass on every other seed (loop and one-shot alike).  Under
+        // fast chunk math a filtered looping release or decay voice keeps
+        // today's path, so that run filters one-shots only and leaves the
+        // looping seeds for the lean kernel.
         const svms::PreparedVoiceFilter lowPass = svms::PrepareVoiceLowPass(
             static_cast<uint8_t>(svms::FilterType::LowPass2Pole), 7200, 0,
             44100u);
         for (uint32_t i = 0u; i < seedCount; i += 2u) {
             const uint32_t h = seedVoices->activeList_[i];
+            if (svms::FastChunkMathEnabled() && sv.loopEnabled[h] != 0u)
+                continue;
             sv.filterA0[h] = lowPass.a0;
             sv.filterB1[h] = lowPass.b1;
             sv.filterB2[h] = lowPass.b2;
@@ -4089,13 +4094,31 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
         bool same = offVoices->GetActiveCount() == onVoices->GetActiveCount();
         const uint32_t cap = (std::min)(offVoices->GetMaxVoices(),
                                         onVoices->GetMaxVoices());
+        const char* field = nullptr;
+        uint32_t fieldHandle = 0u;
 #define SVMS_CMP_FIELD(type, name) \
-        same = same && std::memcmp(offVoices->v.name, onVoices->v.name, \
-                                   cap * sizeof(type)) == 0;
+        if (std::memcmp(offVoices->v.name, onVoices->v.name, \
+                        cap * sizeof(type)) != 0) { \
+            same = false; \
+            if (field == nullptr) { \
+                field = #name; \
+                while (std::memcmp(offVoices->v.name + fieldHandle, \
+                                   onVoices->v.name + fieldHandle, \
+                                   sizeof(type)) == 0) ++fieldHandle; \
+            } \
+        }
         SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
 #undef SVMS_CMP_FIELD
         if (!same) {
-            if (firstMismatch == UINT32_MAX) firstMismatch = block;
+            if (firstMismatch == UINT32_MAX) {
+                firstMismatch = block;
+                if (field != nullptr)
+                    std::fprintf(stderr, "[LEAN] first state mismatch: block "
+                                 "%u field %s handle %u class %u\n", block,
+                                 field, fieldHandle, static_cast<uint32_t>(
+                                     svms::ClassifyWholeVoiceRow(
+                                         offVoices->v, fieldHandle)));
+            }
             ++mismatchedBlocks;
         }
     }
@@ -4140,6 +4163,32 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
             g_leanKernelByClass[c] += on.GetLeanKernelVoicesByClass(
                 static_cast<svms::VoiceRenderClass>(c));
         g_leanFiltered += on.GetLeanFilteredVoices();
+    }
+}
+
+// quality.fast_chunk_math on: looping release and decay voices follow the
+// closed-form chunk gains of today's kernels, chunk for chunk.
+void TestLeanVoicesIdentityFastMath() {
+    if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    svms::SetFastChunkMath(true);
+    for (uint64_t& count : g_leanKernelByClass) count = 0u;
+    for (uint32_t threads : {1u, 4u}) {
+        for (uint32_t frames : {8u, 16u, 64u, 2048u}) {
+            RunLeanVoicesIdentity(threads, frames, 37u, false,
+                                  LeanExclusion::None);
+            RunLeanVoicesIdentity(threads, frames, 4096u, true,
+                                  LeanExclusion::None);
+        }
+    }
+    svms::SetFastChunkMath(false);
+    using Cls = svms::VoiceRenderClass;
+    for (Cls cls : {Cls::SustainedLoop, Cls::ReleaseLoop, Cls::TransientLoop}) {
+        if (g_leanKernelByClass[static_cast<uint32_t>(cls)] == 0u)
+            std::fprintf(stderr, "[LEAN] fast math: class %u never took the "
+                         "lean kernel\n", static_cast<uint32_t>(cls));
+        Check(g_leanKernelByClass[static_cast<uint32_t>(cls)] > 0u,
+              "lean identity (fast chunk math): every looping class took the "
+              "lean kernel");
     }
 }
 
