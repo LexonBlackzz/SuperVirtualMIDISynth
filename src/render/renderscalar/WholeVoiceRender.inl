@@ -781,12 +781,31 @@ inline void RenderScalar::RenderWholeVoiceRow(
         SyncMixFromCurve(v, handle, curve, frameCount - 1u);
 }
 
+// True when `frames` steps of `gain *= decay` (float, rounded each step) end
+// at or above the retire floor.  With 0 <= decay <= 1 and gain >= 0 the chain
+// never rises, so its last value is its smallest; each rounded multiply loses
+// at most 2^-24 of the value, so the exact product gain * decay^frames less
+// frames * 2^-23 of itself (twice the worst case) is a lower bound of that
+// last value.
+inline bool ReleaseGainStaysAboveFloor(float gain, float decay,
+                                       uint32_t frames) {
+    if (!(decay >= 0.0f && decay <= 1.0f && gain >= 0.0f)) return false;
+    double power = 1.0;
+    double base = decay;
+    for (uint32_t n = frames; n != 0u; n >>= 1u) {
+        if ((n & 1u) != 0u) power *= base;
+        base *= base;
+    }
+    const double margin = 1.0 - static_cast<double>(frames) * 0x1p-23;
+    return static_cast<double>(gain) * power * margin >=
+           static_cast<double>(VoiceRetireThreshold());
+}
+
 inline bool RenderScalar::WholeVoiceRowQuiet(const VoiceSoA& v,
                                              uint32_t handle,
                                              uint32_t frameCount,
                                              uint32_t sampleDataFrames,
                                              VoiceRenderClass& cls) const {
-    (void)frameCount;
     if (wvStartFrame_[handle] != UINT32_MAX ||
         wvReleaseFrame_[handle] != UINT32_MAX)
         return false;
@@ -799,20 +818,34 @@ inline bool RenderScalar::WholeVoiceRowQuiet(const VoiceSoA& v,
     if (WholeVoiceRowMuted(handle) || v.filterEnabled[handle] != 0u)
         return false;
     cls = ClassifyWholeVoiceRow(v, handle);
-    switch (cls) {
-        case VoiceRenderClass::SustainedLoop:
-            // The loop bounds the vector kernels take (ValidateLoopVoice).
-            return v.relEnd[handle] >= 2u &&
-                   v.relLoopS[handle] < v.relLoopE[handle] &&
-                   v.relLoopE[handle] <= v.relEnd[handle] &&
-                   v.sampleStart[handle] < sampleDataFrames &&
-                   v.relEnd[handle] <= sampleDataFrames - v.sampleStart[handle] &&
-                   v.phaseIncs[handle] >= 0.0f &&
-                   v.phaseIncs[handle] <
-                       v.relLoopEF[handle] - v.relLoopSF[handle];
-        default:
-            return false;
+    if (cls != VoiceRenderClass::SustainedLoop &&
+        cls != VoiceRenderClass::ReleaseLoop &&
+        cls != VoiceRenderClass::TransientLoop)
+        return false;
+    // The loop bounds the vector kernels take (ValidateLoopVoice).
+    if (!(v.relEnd[handle] >= 2u &&
+          v.relLoopS[handle] < v.relLoopE[handle] &&
+          v.relLoopE[handle] <= v.relEnd[handle] &&
+          v.sampleStart[handle] < sampleDataFrames &&
+          v.relEnd[handle] <= sampleDataFrames - v.sampleStart[handle] &&
+          v.phaseIncs[handle] >= 0.0f &&
+          v.phaseIncs[handle] < v.relLoopEF[handle] - v.relLoopSF[handle]))
+        return false;
+    if (cls == VoiceRenderClass::SustainedLoop) return true;
+    // Release and decay follow the exact per-frame gain chain here;
+    // quality.fast_chunk_math renders them in closed form per chunk instead.
+    if (FastChunkMathEnabled()) return false;
+    if (cls == VoiceRenderClass::ReleaseLoop) {
+        // No retirement inside the block: the countdown outlasts it, or (an
+        // uncounted release) the gain stays above the retire floor.
+        const uint32_t remaining = v.releaseSamplesRemaining[handle];
+        if (remaining != UINT32_MAX) return remaining > frameCount;
+        return ReleaseGainStaysAboveFloor(v.currentGain[handle],
+                                          v.releaseDecay[handle], frameCount);
     }
+    // Transient: the decay stage only, and it does not end inside the block.
+    return v.envelopeStage[handle] == 2u &&
+           v.decaySamplesRemaining[handle] > frameCount;
 }
 
 // Quiet voices of one job, grouped by render class.  Each group goes through
@@ -831,7 +864,9 @@ inline void RenderScalar::RenderQuietVoices(
         uint32_t n = 0u;
         const bool lean = kernelSet_->quietVoices != nullptr &&
             frameCount <= kLeanMaxFrames &&
-            cls == VoiceRenderClass::SustainedLoop;
+            (cls == VoiceRenderClass::SustainedLoop ||
+             cls == VoiceRenderClass::ReleaseLoop ||
+             cls == VoiceRenderClass::TransientLoop);
         const auto flush = [&]() {
             if (n == 0u) return;
             const uint32_t eights = lean ? (n & ~7u) : 0u;
@@ -844,6 +879,7 @@ inline void RenderScalar::RenderQuietVoices(
                     0.0f, 1.0f, 0u, nullptr, nullptr};
                 kernelSet_->quietVoices(context, group, eights, cls);
                 wvJobSeg_[jobIndex].value[kWvSegLeanKernel] += eights;
+                wvJobSeg_[jobIndex].value[kWvSegLeanClassFirst + c] += eights;
                 if (eights == n) {
                     n = 0u;
                     return;

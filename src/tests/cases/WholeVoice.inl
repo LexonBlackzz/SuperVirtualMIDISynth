@@ -3819,6 +3819,8 @@ void DispatchLeanIdentityEvent(const svms::RenderEvent* events,
     }
 }
 
+uint64_t g_leanKernelByClass[svms::kVoiceRenderClassCount] = {};
+
 void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
                            bool grow, LeanExclusion exclusion) {
     // The process-wide requested voice limit is applied to every pool at block
@@ -3863,6 +3865,42 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
         svms::phasefx::StoreFloat(seedVoices->v, tiny, 101.5f);
         seedVoices->SetVoiceSample(fast, 0u, 4096u, 200u, 212u, 1u, 3.7f, 1u);
         svms::phasefx::StoreFloat(seedVoices->v, fast, 205.25f);
+        // Releases that cross the retire floor within 1-3 blocks of 8 frames
+        // (seeds 4 and 6) and one that rings for the whole run (seed 8):
+        // uncounted, so only the gain walk decides.
+        svms::VoiceSoA& sv = seedVoices->v;
+        for (uint32_t i : {4u, 6u, 8u}) {
+            const uint32_t h = seedVoices->activeList_[i];
+            seedVoices->StartRelease(static_cast<svms::VoiceHandle>(h));
+            if (i != 8u) sv.releaseDecay[h] = 0.7f;
+        }
+        // Decay-stage loops: seed 3 reaches sustain after 12 frames, seed 7
+        // clamps at its sustain level long before its decay count ends.
+        for (uint32_t i : {3u, 7u}) {
+            const uint32_t h = seedVoices->activeList_[i];
+            sv.envelopeStage[h] = 2u;
+            sv.decaySamplesRemaining[h] = i == 3u ? 12u : 400u;
+            sv.decaySlope[h] = i == 3u ? 0.98f : 0.9f;
+            sv.sustainLevel[h] = sv.currentGain[h] * (i == 3u ? 0.5f : 0.3f);
+            seedVoices->RefreshRenderClass(static_cast<svms::VoiceHandle>(h));
+        }
+        // Enough long release and decay voices that the lean kernel gets
+        // groups of eight: of the later looping seeds, a third rings out
+        // slowly and a third sits in a long decay stage.
+        for (uint32_t i = 9u; i < seedCount; ++i) {
+            if (i % 4u == 1u || i % 8u == 5u) continue;  // one-shot seeds
+            const uint32_t h = seedVoices->activeList_[i];
+            if (i % 3u == 0u) {
+                seedVoices->StartRelease(static_cast<svms::VoiceHandle>(h));
+            } else if (i % 3u == 1u) {
+                sv.envelopeStage[h] = 2u;
+                sv.decaySamplesRemaining[h] = 4000u;
+                sv.decaySlope[h] = 0.9999f;
+                sv.sustainLevel[h] = sv.currentGain[h] * 0.5f;
+                seedVoices->RefreshRenderClass(
+                    static_cast<svms::VoiceHandle>(h));
+            }
+        }
     }
     auto offVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
     auto onVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
@@ -4049,11 +4087,17 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
             Check(on.GetLeanKernelVoices() > 0u,
                   "lean identity: the lean kernel ran");
         }
+        // Per class, summed over the runs (small pools split over four jobs
+        // rarely hold eight voices of one class per job).
+        for (uint32_t c = 0u; c < svms::kVoiceRenderClassCount; ++c)
+            g_leanKernelByClass[c] += on.GetLeanKernelVoicesByClass(
+                static_cast<svms::VoiceRenderClass>(c));
     }
 }
 
 void TestLeanVoicesIdentity() {
     if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    for (uint64_t& count : g_leanKernelByClass) count = 0u;
     for (uint32_t threads : {1u, 4u}) {
         for (uint32_t frames : {8u, 16u, 64u, 2048u}) {
             RunLeanVoicesIdentity(threads, frames, 37u, false,
@@ -4061,6 +4105,14 @@ void TestLeanVoicesIdentity() {
             RunLeanVoicesIdentity(threads, frames, 4096u, true,
                                   LeanExclusion::None);
         }
+    }
+    using Cls = svms::VoiceRenderClass;
+    for (Cls cls : {Cls::SustainedLoop, Cls::ReleaseLoop, Cls::TransientLoop}) {
+        if (g_leanKernelByClass[static_cast<uint32_t>(cls)] == 0u)
+            std::fprintf(stderr, "[LEAN] class %u never took the lean kernel\n",
+                         static_cast<uint32_t>(cls));
+        Check(g_leanKernelByClass[static_cast<uint32_t>(cls)] > 0u,
+              "lean identity: every lean class took the lean kernel");
     }
     for (LeanExclusion exclusion : {LeanExclusion::Bus,
                                     LeanExclusion::Rotation,

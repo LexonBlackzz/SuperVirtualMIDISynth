@@ -1138,7 +1138,8 @@ public:
         kWvSegKernelFrames, kWvSegFallbackFrames,
         kWvSegLeanQuiet,    // voice-blocks that took the quiet pass
         kWvSegLeanKernel,   // of those, voices the lean kernel rendered
-        kWvSegCounterCount
+        kWvSegLeanClassFirst,  // the same split by render class
+        kWvSegCounterCount = kWvSegLeanClassFirst + kVoiceRenderClassCount
     };
     struct alignas(64) WvJobSegStats {
         uint64_t value[kWvSegCounterCount];
@@ -1164,6 +1165,10 @@ public:
     uint64_t GetWvSegFallback() const { return WvSegSum(kWvSegFallback); }
     uint64_t GetLeanQuietVoices() const { return WvSegSum(kWvSegLeanQuiet); }
     uint64_t GetLeanKernelVoices() const { return WvSegSum(kWvSegLeanKernel); }
+    uint64_t GetLeanKernelVoicesByClass(VoiceRenderClass cls) const {
+        return WvSegSum(static_cast<WvSegCounter>(
+            kWvSegLeanClassFirst + static_cast<uint32_t>(cls)));
+    }
     uint64_t GetWvSegKernelFrames() const {
         return WvSegSum(kWvSegKernelFrames);
     }

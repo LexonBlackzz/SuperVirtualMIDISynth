@@ -178,8 +178,10 @@ void SetFilteredGroupKernelForTest(bool enabled);
 // quality.fast_chunk_math (AVX2 sustained, transient and release loops):
 // closed-form gain/phase per 8-frame chunk. Not bit-exact vs scalar; default off.
 void SetFastChunkMath(bool enabled);
+bool FastChunkMathEnabled();
 #else
 inline void SetFastChunkMath(bool) {}  // no AVX2 kernels on the XP build
+inline bool FastChunkMathEnabled() { return false; }
 #endif
 const RenderKernelSet& SelectBestRenderKernelSet();
 const RenderKernelSet* SelectRenderKernelSet(RenderBackend backend);
