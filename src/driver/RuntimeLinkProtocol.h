@@ -280,6 +280,9 @@ enum class RLCommandType : uint32_t {
     QueryAudioOutput      = 0x0000012D,
     // text = ASIO driver name; returns its buffer sizes, rates and outputs.
     ProbeAsioDriver       = 0x0000012E,
+    // param = 1: voices no event touches render on the lean path (default);
+    // 0 = every voice on the per-voice path. Applies from the next block.
+    SetLeanVoices         = 0x0000012F,
 
 
     Invalid              = 0xFFFFFFFF,

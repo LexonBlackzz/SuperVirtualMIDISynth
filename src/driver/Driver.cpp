@@ -632,6 +632,7 @@ bool Driver::Initialize() {
     renderScalar->SetHalfRate(cfg.halfRate, 0.0f);
     renderScalar->SetDecimationByLevel(cfg.decimationByLevel);
     SetFastChunkMath(cfg.fastChunkMath);
+    renderScalar->SetLeanVoices(cfg.leanVoices);
     renderScalar->SetMutedTailCullBlocks(cfg.decimationCullBlocks);
     // Honor the configured render backend. The constructor already selects
     // the best set (Auto behavior); an explicit non-Auto request overrides

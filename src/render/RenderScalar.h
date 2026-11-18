@@ -844,6 +844,7 @@ private:
     bool wvChanVibratoActive_[kChannelCount] = {};
     // Bit c: channel c has channel ops or a vibrato window this block, so
     // none of its voices is quiet.
+    bool wvLeanBlock_ = true;   // leanVoices_ as read at this block's start
     uint32_t wvChanBusyMask_ = 0u;
     uint32_t wvRowOpCapacity_ = 0u;
     uint32_t wvRowOpCount_ = 0u;
@@ -1014,8 +1015,8 @@ public:
     // at every op.  On by default; off restores the split, which the tests use
     // as the reference.
     void SetBendFusion(bool on) { bendFusion_ = on; }
-    // Lean path for quiet voices (see leanVoices_).  Safe to flip between
-    // blocks from any thread.
+    // Lean path for quiet voices (see leanVoices_).  Safe to flip from any
+    // thread; read once per whole-voice block, so it applies from the next.
     void SetLeanVoices(bool on) {
         leanVoices_.store(on, std::memory_order_relaxed);
     }

@@ -1048,7 +1048,9 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
     // census pinned to real audio callbacks.
     if (self->diagnosticsEnabled_ && (self->callbackCount_ & 63u) == 0u) {
         static uint64_t censusLastCoalesced = 0;
-        char poolCensus[384];
+        static uint64_t censusLastLean = 0;
+        const uint64_t leanTotal = render->GetLeanQuietVoices();
+        char poolCensus[400];
         const uint32_t renderPaths = render->GetLastRenderPaths();
         char pathBuf[8];
         {
@@ -1063,7 +1065,8 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             "[SVMS] pool active=%u/%u retire=%u step=%u cpu=%.1f%% "
             "(disp=%.0f synth=%.0f sched=%.0f post=%.0f) p99=%.0f%% "
             "over=%llu coalesced+%llu(1/%u) path=%s vib=%u "
-            "sos=%u sloop=%u tloop=%u rloop=%u gen=%u effv=%llu merged=%llu\n",
+            "sos=%u sloop=%u tloop=%u rloop=%u gen=%u effv=%llu merged=%llu "
+            "lean=%llu\n",
             (unsigned)vm->activeCount_, (unsigned)vm->GetMaxVoices(),
             (unsigned)vm->retireCount_,
             (unsigned)render->DecimationStep(vm->activeCount_),
@@ -1087,7 +1090,10 @@ void Driver::RenderCallback(float* output, uint32_t numFrames, void* userData) {
             (unsigned long long)self->effectiveVoicesAtomic_.load(
                 std::memory_order_relaxed),
             (unsigned long long)self->noteMergedAtomic_.load(
-                std::memory_order_relaxed));
+                std::memory_order_relaxed),
+            // quiet voices per block over the census window
+            (unsigned long long)((leanTotal - censusLastLean) / 64u));
+        censusLastLean = leanTotal;
 #if SVMS_AUDIO_CENSUS
         OutputDebugStringA(poolCensus);
 #endif

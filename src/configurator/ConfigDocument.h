@@ -167,6 +167,7 @@ struct ConfigValues {
     bool halfRate = false;
     bool decimationByLevel = true;
     bool fastChunkMath = false;
+    bool leanVoices = true;
     uint32_t decimationCullBlocks = 5;
 
     bool diagnosticsEnabled = false;

@@ -563,6 +563,9 @@ void TestJsonConfigurationLifecycle() {
               "created JSON records disabled physical MIDI input routing");
         Check(text.find("Alpha Piano.SF2") != std::string::npos,
               "created JSON explicitly stores the discovered SoundFont");
+        Check(created.leanVoices &&
+                  text.find("\"lean_voices\": true") != std::string::npos,
+              "created JSON turns the lean quiet-voice path on");
     }
 
     std::string queriedConfig;
@@ -587,6 +590,14 @@ void TestJsonConfigurationLifecycle() {
               queriedConfig.find("future_extension") != std::string::npos &&
               queriedConfig.find("Alpha Piano.SF2") != std::string::npos,
           "native config merge patch preserves untouched and unknown fields");
+    const std::string leanPatch = R"json({"synth":{"lean_voices":false}})json";
+    Check(svms::PatchV3ConfigJson(leanPatch.data(), leanPatch.size(),
+                                  &configEditWarning) &&
+              !svms::EngineConfig::Load().leanVoices,
+          "synth.lean_voices: false loads as off");
+    Check(svms::ReadV3ConfigJson(queriedConfig, &configEditWarning) &&
+              queriedConfig.find("\"lean_voices\": false") != std::string::npos,
+          "synth.lean_voices: false stays in the document");
     const std::string beforeRejectedPatch = queriedConfig;
     const std::string invalidPatch =
         R"json({"audio":{"sample_rate":1}})json";

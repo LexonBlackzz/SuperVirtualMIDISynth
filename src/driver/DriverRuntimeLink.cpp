@@ -604,6 +604,22 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
                   _TRUNCATE);
         return svms::RLResult::Ok;
     }
+    case RT::SetLeanVoices: {
+        if (cmd.param > 1u || !renderScalar) {
+            strncpy_s(resultText, kText, "lean voices must be 0 or 1",
+                      _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        renderScalar->SetLeanVoices(cmd.param != 0u);
+        for (Driver* shard : shards_)
+            if (shard->renderScalar)
+                shard->renderScalar->SetLeanVoices(cmd.param != 0u);
+        engineConfig_.leanVoices = cmd.param != 0u;
+        strncpy_s(resultText, kText,
+                  cmd.param ? "lean voices: on" : "lean voices: off",
+                  _TRUNCATE);
+        return svms::RLResult::Ok;
+    }
     case RT::SetMonoDownmix: {
         if (cmd.param > 1u) {
             strncpy_s(resultText, kText, "mono downmix must be 0 or 1",

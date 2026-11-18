@@ -375,6 +375,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"max_voices", cfg.maxVoices},
             {"voice_memory_budget_mb", cfg.voiceMemoryBudgetMB},
             {"large_pages", cfg.largePages},
+            {"lean_voices", cfg.leanVoices},
             {"keep_loaded", cfg.keepLoaded},
             {"render_threads", cfg.renderThreads},
             {"shards", cfg.shards},
@@ -790,6 +791,8 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
             else
                 AppendWarning(cfg.configWarning, "synth.keep_loaded");
         }
+        if (!ReadBool(*it, "lean_voices", cfg.leanVoices))
+            AppendWarning(cfg.configWarning, "synth.lean_voices");
         if (!ReadValue(*it, "voice_memory_budget_mb",
                        cfg.voiceMemoryBudgetMB, 0u, 65536u))
             AppendWarning(cfg.configWarning, "synth.voice_memory_budget_mb");
@@ -1206,6 +1209,7 @@ void ApplyEnvironment(EngineConfig& cfg) {
     cfg.noteMerge = EnvironmentFlag(L"SVMS_NOTE_MERGE", cfg.noteMerge);
     cfg.nestedNoteOff = EnvironmentFlag(L"SVMS_NESTED_NOTE_OFF", cfg.nestedNoteOff);
     cfg.halfRate = EnvironmentFlag(L"SVMS_HALF_RATE", cfg.halfRate);
+    cfg.leanVoices = EnvironmentFlag(L"SVMS_LEAN_VOICES", cfg.leanVoices);
     cfg.keepLoaded = EnvironmentFlag(L"SVMS_KEEP_LOADED", cfg.keepLoaded);
     cfg.noteOnReexcite = EnvironmentFlag(L"SVMS_NOTE_REEXCITE", cfg.noteOnReexcite);
     cfg.correctnessMode = EnvironmentFlag(L"SVMS_CORRECTNESS_MODE", cfg.correctnessMode);
@@ -1290,6 +1294,7 @@ EngineConfig EngineConfig::Default() {
     cfg.decimation = false;  // opt-in: every voice mixes by default
     cfg.decimationByLevel = true;  // only matters once decimation is on
     cfg.fastChunkMath = false;  // opt-in: exact sequential chunk math by default
+    cfg.leanVoices = true;
     cfg.decimationCullBlocks = 5u;  // only matters once decimation is on
     cfg.threadAffinityMode = 0;  // opt-in: default scheduler placement
     cfg.bendCollapse = false;    // opt-in: every pitch bend dispatches by default

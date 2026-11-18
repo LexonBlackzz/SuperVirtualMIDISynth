@@ -3989,6 +3989,23 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
     onContext.ResetMasterState();
     off.SetEventBatchDispatcher(DispatchLeanIdentityEvent, &offContext);
     on.SetEventBatchDispatcher(DispatchLeanIdentityEvent, &onContext);
+    // A third engine flips the switch before every block (a live toggle
+    // lands at a block boundary); it must track the lean-off engine too.
+    const bool flipRun = exclusion == LeanExclusion::None;
+    auto flipVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    svms::ChannelCache flipChannels = seedChannels;
+    svms::RenderScalar flip;
+    if (flipRun) {
+        Check(flip.ReserveVoiceCapacity(initialPool) &&
+                  flip.ConfigureRenderThreads(threads, frames) &&
+                  flip.SetRenderBackend(svms::RenderBackend::AVX2),
+              "lean identity starts the toggling renderer");
+    }
+    WholeVoiceCCContext flipContext{flipVoices.get(), &flipChannels,
+                                    flipChannels.GetParams(), &cfg};
+    flipContext.ResetMasterState();
+    flip.SetEventBatchDispatcher(DispatchLeanIdentityEvent, &flipContext);
+    uint32_t flipMismatched = 0u;
 
     const bool bus = exclusion == LeanExclusion::Bus;
     std::vector<float> offBus(bus ? svms::kChannelCount * 2u * frames : 0u);
@@ -4015,7 +4032,9 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
         if (grow && block == blocks / 4u) {
             Check(offVoices->GrowCapacity(pool) && onVoices->GrowCapacity(pool) &&
                       off.ReserveVoiceCapacity(pool) &&
-                      on.ReserveVoiceCapacity(pool),
+                      on.ReserveVoiceCapacity(pool) &&
+                      (!flipRun || (flipVoices->GrowCapacity(pool) &&
+                                    flip.ReserveVoiceCapacity(pool))),
                   "lean identity: both pools grow mid-run");
         }
         std::vector<svms::RenderEvent> events;
@@ -4091,6 +4110,29 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
         }
         for (size_t i = 0u; i < offBus.size(); ++i)
             maxDiff = (std::max)(maxDiff, std::fabs(offBus[i] - onBus[i]));
+        if (flipRun) {
+            flip.SetLeanVoices((block & 1u) == 0u);
+            std::vector<float> flipL(frames, 0.0f), flipR(frames, 0.0f);
+            flip.RenderBlock(*flipVoices, flipChannels, samples.data(),
+                             hilbertPtr, sampleCount, flipL.data(),
+                             flipR.data(), frames, cfg, events.data(),
+                             static_cast<uint32_t>(events.size()), true,
+                             blockStartFrame, nullptr, nullptr);
+            for (uint32_t f = 0u; f < frames; ++f) {
+                maxDiff = (std::max)(maxDiff, std::fabs(offL[f] - flipL[f]));
+                maxDiff = (std::max)(maxDiff, std::fabs(offR[f] - flipR[f]));
+            }
+            bool flipSame =
+                offVoices->GetActiveCount() == flipVoices->GetActiveCount();
+            const uint32_t flipCap = (std::min)(offVoices->GetMaxVoices(),
+                                                flipVoices->GetMaxVoices());
+#define SVMS_CMP_FIELD(type, name) \
+            flipSame = flipSame && std::memcmp(offVoices->v.name, \
+                flipVoices->v.name, flipCap * sizeof(type)) == 0;
+            SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+#undef SVMS_CMP_FIELD
+            if (!flipSame) ++flipMismatched;
+        }
         bool same = offVoices->GetActiveCount() == onVoices->GetActiveCount();
         const uint32_t cap = (std::min)(offVoices->GetMaxVoices(),
                                         onVoices->GetMaxVoices());
@@ -4135,6 +4177,15 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
     }
     Check(mismatchedBlocks == 0u,
           "lean identity: voice state bit-equal lean on vs off");
+    if (flipRun) {
+        if (flipMismatched != 0u)
+            std::fprintf(stderr, "[LEAN] toggling engine: %u mismatched "
+                         "blocks (threads=%u frames=%u pool=%u)\n",
+                         flipMismatched, threads, frames, pool);
+        Check(flipMismatched == 0u,
+              "lean identity: toggling the switch every block keeps voice "
+              "state bit-equal");
+    }
     Check(maxDiff <= 2.0e-5f, "lean identity: audio within AVX2 tolerance");
     Check(off.GetLeanQuietVoices() == 0u && off.GetLeanRefreshSkips() == 0u,
           "lean identity: the lean-off engine never takes the quiet path");

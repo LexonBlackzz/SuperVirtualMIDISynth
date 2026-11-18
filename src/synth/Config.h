@@ -224,6 +224,10 @@ struct EngineConfig {
     // (the closed-form phase is the closer one to the true position at large
     // offsets), sample data and interpolation are untouched.
     bool fastChunkMath;
+    // On by default: at small blocks, voices no event touches this block
+    // render eight per vector (the lean path); voice state stays identical to
+    // the per-voice path. Off is the escape hatch (env SVMS_LEAN_VOICES=0).
+    bool leanVoices;
     // With decimation on: retire releasing voices muted this many blocks in
     // a row (0 = off). Opt-in listening test.
     uint32_t decimationCullBlocks;

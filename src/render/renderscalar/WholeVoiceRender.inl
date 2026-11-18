@@ -987,7 +987,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
     const bool halfRateOn = ctx->halfRate;
     uint32_t halfQueued = 0u;
     // Lean path: block-wide conditions, once per job.
-    const bool leanJob = renderer->LeanVoices() && mix.busLeft == nullptr &&
+    const bool leanJob = renderer->wvLeanBlock_ && mix.busLeft == nullptr &&
         v.rot == nullptr && !renderer->wvScalarVibrato_ &&
         ctx->sampleData != nullptr && frameCount >= 8u &&
         renderer->kernelSet_->backend == RenderBackend::AVX2;
@@ -1389,6 +1389,7 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     float* const* channelBusLeft, float* const* channelBusRight) {
     const uint32_t activeCount = voices.GetActiveCount();
     ++wholeVoiceBlocks_;
+    wvLeanBlock_ = LeanVoices();
     BuildWholeVoiceMixCurves(numFrames);
     std::memcpy(wvSliceHandles_, voices.activeList_,
                 static_cast<size_t>(activeCount) * sizeof(uint32_t));

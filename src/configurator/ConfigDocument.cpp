@@ -204,6 +204,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.halfRate = false;
     d.decimationByLevel = true;
     d.fastChunkMath = false;
+    d.leanVoices = true;
     d.decimationCullBlocks = 5;
     d.diagnosticsEnabled = false;
     d.diagnosticsWindow = false;
@@ -268,6 +269,10 @@ void ConfigDocument::FromJson(const json& root) {
         if (auto kl = it->find("keep_loaded"); kl != it->end()) {
             if (kl->is_boolean())
                 working_.keepLoaded = kl->get<bool>();
+        }
+        if (auto lv = it->find("lean_voices"); lv != it->end()) {
+            if (lv->is_boolean())
+                working_.leanVoices = lv->get<bool>();
         }
         ReadNum(*it, "backend", working_.apiBackend, 0u, 4u);
         if (auto dll = it->find("backend_dll"); dll != it->end() &&
@@ -659,6 +664,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["synth"]["unbounded_render"] = working_.unboundedRender;
     root["synth"]["large_pages"] = working_.largePages;
     root["synth"]["keep_loaded"] = working_.keepLoaded;
+    root["synth"]["lean_voices"] = working_.leanVoices;
     root["api"]["backend"] = working_.apiBackend;
     root["api"]["backend_dll"] = WideToUtf8(working_.apiBackendDll);
     root["api"]["allow_nested"] = working_.apiAllowNested;
@@ -896,6 +902,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.halfRate == b.halfRate
         && a.decimationByLevel == b.decimationByLevel
         && a.fastChunkMath == b.fastChunkMath
+        && a.leanVoices == b.leanVoices
         && a.decimationCullBlocks == b.decimationCullBlocks
         && a.diagnosticsEnabled == b.diagnosticsEnabled
         && a.diagnosticsWindow == b.diagnosticsWindow

@@ -158,6 +158,7 @@ struct Options {
     uint32_t bulkAdmissionPercent = 0u; // --bulk-admission P: 0 = off
     const char* dumpAudio = nullptr;    // --dump-audio P: raw float32 L then R of blocks 24..31
     float halfRateBand = 0.0f;          // --half-rate F: half-rate bus, assumed band fraction F (0 = off)
+    bool noLean = false;                // --no-lean: every voice on the per-voice path
 };
 
 bool ParseBackend(const char* value, Options& options) {
@@ -298,6 +299,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.dumpAudio = argv[++i];
         } else if (std::strcmp(argv[i], "--half-rate") == 0 && i + 1 < argc) {
             options.halfRateBand = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(argv[i], "--no-lean") == 0) {
+            options.noLean = true;
         } else if (std::strcmp(argv[i], "--fast-chunk-math") == 0) {
             svms::SetFastChunkMath(true);
         } else if (std::strcmp(argv[i], "--filter-cents") == 0 && i + 1 < argc) {
@@ -891,6 +894,7 @@ int main(int argc, char** argv) {
     renderer->SetMutedTailCullBlocks(options.cullMutedBlocks);
     renderer->SetBulkAdmissionPercent(options.bulkAdmissionPercent);
     renderer->SetHalfRate(options.halfRateBand > 0.0f, options.halfRateBand);
+    renderer->SetLeanVoices(!options.noLean);
     gBenchVibratoLfo = options.vibratoLfo;
     if (options.vibratoLfo) {
         for (uint32_t a = 0; a < voices->activeCount_; ++a) {
@@ -1680,6 +1684,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "{\"half_rate\":{\"rows\":%llu,\"frames\":%llu}}\n",
             static_cast<unsigned long long>(renderer->GetHalfRateRows()),
             static_cast<unsigned long long>(renderer->GetHalfRateFrames()));
+    std::fprintf(stderr, "{\"lean\":{\"quiet\":%llu,\"kernel\":%llu}}\n",
+        static_cast<unsigned long long>(renderer->GetLeanQuietVoices()),
+        static_cast<unsigned long long>(renderer->GetLeanKernelVoices()));
     std::fprintf(stderr, "{\"wv_cycles\":{\"plan\":%llu,\"jobs\":%llu,\"post\":%llu}}\n",
         static_cast<unsigned long long>(renderer->GetWvPlanCycles()),
         static_cast<unsigned long long>(renderer->GetWvJobCycles()),
