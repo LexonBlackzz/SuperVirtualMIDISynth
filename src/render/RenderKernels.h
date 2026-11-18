@@ -151,11 +151,22 @@ using StealTailSpanFn = uint32_t(*)(VoiceSoA& v, uint32_t idx,
                                     uint32_t sampleDataFrames,
                                     float* outputLeft, float* outputRight,
                                     uint32_t frameStart, uint32_t frameCount);
+// Optional (AVX2): renders `count` (a multiple of eight) quiet voices of one
+// render class over the whole span, eight voices per vector, frames outer.
+// Only voices RenderScalar::WholeVoiceRowQuiet accepted are passed, so it
+// never refuses; the span is at most kLeanMaxFrames frames.
+using QuietVoicesFn = void(*)(const RenderSpanContext& context,
+                              const uint32_t* handles, uint32_t count,
+                              VoiceRenderClass renderClass);
+// Longest block the quiet-voice kernel takes; longer blocks render quiet
+// voices through the class kernels.
+inline constexpr uint32_t kLeanMaxFrames = 64u;
 struct RenderKernelSet {
     RenderClassKernel kernels[kVoiceRenderClassCount];
     RenderBackend backend;
     const char* name;
     StealTailSpanFn stealTailSpan;
+    QuietVoicesFn quietVoices;
 };
 
 const RenderKernelSet& GetScalarRenderKernelSet();

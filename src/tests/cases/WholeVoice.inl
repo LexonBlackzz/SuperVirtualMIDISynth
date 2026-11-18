@@ -3853,6 +3853,17 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
     auto seedVoices = std::make_unique<svms::VoiceManager>();
     ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, initialPool,
                                 seedCount);
+    // Loops shorter than a block and than 8 frames: the cursor wraps more
+    // than once per block (seed 0: a 5-frame loop, seed 2: a step of 3.7 on
+    // a 12-frame loop).
+    {
+        const uint32_t tiny = seedVoices->activeList_[0];
+        const uint32_t fast = seedVoices->activeList_[2];
+        seedVoices->SetVoiceSample(tiny, 0u, 4096u, 100u, 105u, 1u, 0.9f, 1u);
+        svms::phasefx::StoreFloat(seedVoices->v, tiny, 101.5f);
+        seedVoices->SetVoiceSample(fast, 0u, 4096u, 200u, 212u, 1u, 3.7f, 1u);
+        svms::phasefx::StoreFloat(seedVoices->v, fast, 205.25f);
+    }
     auto offVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
     auto onVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
     if (exclusion == LeanExclusion::Rotation) {
@@ -4025,6 +4036,19 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
               "lean identity: bus mode and rotation keep today's path");
     } else {
         Check(quiet > 0u, "lean identity: the quiet path ran");
+        // Blocks up to 64 frames (kLeanMaxFrames) take the lean kernel, in
+        // groups of eight voices of one class per job: a 37-voice pool split
+        // over four threads has fewer than that per job (leftovers render
+        // through the class kernels).
+        if (exclusion == LeanExclusion::None && frames <= 64u &&
+            (threads == 1u || grow)) {
+            if (on.GetLeanKernelVoices() == 0u)
+                std::fprintf(stderr, "[LEAN] threads=%u frames=%u pool=%u "
+                             "quiet=%llu kernel=0\n", threads, frames, pool,
+                             static_cast<unsigned long long>(quiet));
+            Check(on.GetLeanKernelVoices() > 0u,
+                  "lean identity: the lean kernel ran");
+        }
     }
 }
 

@@ -3518,6 +3518,94 @@ uint32_t RenderStealTailSpanAVX2(VoiceSoA& v, uint32_t idx,
     return consumed;
 }
 
+// Quiet voices (lean path): voices with nothing happening in the block, eight
+// per vector, frames outer.  Each lane runs, frame by frame, exactly the
+// per-frame step of the voice's time-chunked kernel (the scalar frame of
+// RenderSustainedChunked: loop wrap, the end-of-sample jump, lerp, gain,
+// cursor add).  That kernel's 8-frame chunks compute the same values, so each
+// voice's samples and stored state are bit-equal to it; only the order the
+// voices are summed in differs.
+void RenderQuietVoicesAVX2(const RenderSpanContext& c, const uint32_t* handles,
+                           uint32_t count, VoiceRenderClass renderClass) {
+    (void)renderClass;  // SustainedLoop
+    VoiceSoA& v = *c.voices;
+    const uint32_t frames = c.frameCount;
+    __m256 sumL[kLeanMaxFrames];
+    __m256 sumR[kLeanMaxFrames];
+    for (uint32_t f = 0u; f < frames; ++f) {
+        sumL[f] = _mm256_setzero_ps();
+        sumR[f] = _mm256_setzero_ps();
+    }
+    const __m256i one = _mm256_set1_epi32(1);
+    for (uint32_t g = 0u; g + 8u <= count; g += 8u) {
+        const __m256i h = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(handles + g));
+        alignas(32) uint32_t stepIdx[8], stepFrac[8];
+        for (uint32_t lane = 0u; lane < 8u; ++lane) {
+            const uint64_t stepFx =
+                phasefx::FromFloat(v.phaseIncs[handles[g + lane]]);
+            stepIdx[lane] = phasefx::Index(stepFx);
+            stepFrac[lane] = phasefx::Frac(stepFx);
+        }
+        const __m256i stepIdxV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepIdx));
+        const __m256i stepFracV = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(stepFrac));
+        __m256i idx = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.phaseIdx), h, 4);
+        __m256i frac = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.phaseFrac), h, 4);
+        const __m256i start = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.sampleStart), h, 4);
+        const __m256i loopS = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.relLoopS), h, 4);
+        const __m256i loopE = _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.relLoopE), h, 4);
+        const __m256i endLast = _mm256_sub_epi32(_mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(v.relEnd), h, 4), one);
+        const __m256i loopLast = _mm256_sub_epi32(loopE, one);
+        const __m256 gainL = _mm256_i32gather_ps(v.renderGainL, h, 4);
+        const __m256 gainR = _mm256_i32gather_ps(v.renderGainR, h, 4);
+        for (uint32_t f = 0u; f < frames; ++f) {
+            // phasefx::Wrap (one wrap: the step is shorter than the loop)
+            const __m256i past = _mm256_cmpgt_epi32(idx, loopLast);
+            idx = _mm256_blendv_epi8(
+                idx, _mm256_add_epi32(_mm256_sub_epi32(idx, loopE), loopS),
+                past);
+            // base + 1 >= relEnd: the cursor restarts at the loop start
+            const __m256i jump = _mm256_cmpgt_epi32(
+                _mm256_add_epi32(idx, one), endLast);
+            idx = _mm256_blendv_epi8(idx, loopS, jump);
+            frac = _mm256_andnot_si256(jump, frac);
+            const __m256i nextRaw = _mm256_add_epi32(idx, one);
+            const __m256i next = _mm256_blendv_epi8(
+                nextRaw, loopS, _mm256_cmpgt_epi32(nextRaw, loopLast));
+            const __m256 first = GatherSampleAVX2(
+                c.sampleData, _mm256_add_epi32(start, idx));
+            const __m256 second = GatherSampleAVX2(
+                c.sampleData, _mm256_add_epi32(start, next));
+            const __m256 sample = _mm256_add_ps(first, _mm256_mul_ps(
+                _mm256_sub_ps(second, first), FxWeight8(frac)));
+            sumL[f] = _mm256_add_ps(sumL[f], _mm256_mul_ps(sample, gainL));
+            sumR[f] = _mm256_add_ps(sumR[f], _mm256_mul_ps(sample, gainR));
+            FxAdd8(idx, frac, stepIdxV, stepFracV);
+        }
+        FxWrap8(idx, loopS, loopE);
+        alignas(32) uint32_t idxOut[8], fracOut[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idxOut), idx);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(fracOut), frac);
+        for (uint32_t lane = 0u; lane < 8u; ++lane) {
+            v.phaseIdx[handles[g + lane]] = idxOut[lane];
+            v.phaseFrac[handles[g + lane]] = fracOut[lane];
+        }
+    }
+    for (uint32_t f = 0u; f < frames; ++f) {
+        c.outputLeft[c.frameStart + f] += HorizontalSum(sumL[f]);
+        c.outputRight[c.frameStart + f] += HorizontalSum(sumR[f]);
+    }
+    _mm256_zeroupper();
+}
+
 const RenderKernelSet& GetAVX2RenderKernelSet() {
     static const RenderKernelSet set = [] {
         RenderKernelSet result{};
@@ -3535,6 +3623,7 @@ const RenderKernelSet& GetAVX2RenderKernelSet() {
             RenderTransientOneShotAVX2;
         result.backend = RenderBackend::AVX2;
         result.stealTailSpan = RenderStealTailSpanAVX2;
+        result.quietVoices = RenderQuietVoicesAVX2;
         result.name = "avx2";
         return result;
     }();

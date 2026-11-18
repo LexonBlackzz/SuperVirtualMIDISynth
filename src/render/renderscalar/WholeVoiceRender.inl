@@ -829,8 +829,29 @@ inline void RenderScalar::RenderQuietVoices(
         if (classCounts[c] == 0u) continue;
         const VoiceRenderClass cls = static_cast<VoiceRenderClass>(c);
         uint32_t n = 0u;
+        const bool lean = kernelSet_->quietVoices != nullptr &&
+            frameCount <= kLeanMaxFrames &&
+            cls == VoiceRenderClass::SustainedLoop;
         const auto flush = [&]() {
             if (n == 0u) return;
+            const uint32_t eights = lean ? (n & ~7u) : 0u;
+            if (eights != 0u) {
+                RenderSpanContext context{
+                    &voices.v, sampleData, wvHilbertData_, sampleDataFrames,
+                    mix.outputLeft, mix.outputRight, 0u, frameCount,
+                    voices.v.GetCapacity(), nullptr, nullptr,
+                    voices.activePosition_, nullptr, nullptr,
+                    0.0f, 1.0f, 0u, nullptr, nullptr};
+                kernelSet_->quietVoices(context, group, eights, cls);
+                wvJobSeg_[jobIndex].value[kWvSegLeanKernel] += eights;
+                if (eights == n) {
+                    n = 0u;
+                    return;
+                }
+                for (uint32_t i = eights; i < n; ++i)
+                    group[i - eights] = group[i];
+                n -= eights;
+            }
             if (!RenderWholeVoiceBatch(voices.v, voices, group, n, cls,
                                        sampleData, sampleDataFrames, mix, 0u,
                                        frameCount, jobIndex)) {
