@@ -345,6 +345,11 @@ inline bool RenderScalar::PlanWholeVoiceBlock(
         }
         wvChanOpStart_[kChannelCount] = running;
         wvChanOpStart_[kChannelCount + 1] = running;
+        wvChanBusyMask_ = 0u;
+        for (uint32_t channel = 0u; channel < kChannelCount; ++channel) {
+            if (chanCounts[channel] != 0u || wvChanVibratoActive_[channel])
+                wvChanBusyMask_ |= 1u << channel;
+        }
         uint32_t writeCursor[kChannelCount];
         for (uint32_t channel = 0u; channel < kChannelCount; ++channel)
             writeCursor[channel] = wvChanOpStart_[channel];

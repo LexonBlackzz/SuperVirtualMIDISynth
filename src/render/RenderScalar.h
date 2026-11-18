@@ -574,6 +574,10 @@ private:
     std::vector<RenderEvent> splitEvents_;
     std::atomic<uint32_t> bulkAdmissionPercent_{0u};
     bool bendFusion_ = true;
+    // Lean path: voices with nothing happening this block render in a pass
+    // of their own (WholeVoiceRowQuiet).  The state every voice ends the
+    // block in is the same either way; only the mix summation order moves.
+    std::atomic<bool> leanVoices_{true};
     std::atomic<uint64_t> bendFusedSpans_{0u};
     // Half-rate voice bus (HalfRateBus.h): steady sustained looping voices
     // with little high-frequency content render at half the output rate.
@@ -649,6 +653,20 @@ private:
         return wvDecimating_ && wvMuted_[handle] != 0u &&
                wvStartFrame_[handle] == UINT32_MAX;
     }
+    // A carried-over row with nothing happening to it this block: no start,
+    // release or excite, a channel with no ops or vibrato window, not muted,
+    // and a class whose state provably stays in one stage for the block.
+    // Block-wide conditions (backend, bus mode, rotation, scalar vibrato)
+    // are the caller's.  `cls` receives the row's render class.
+    bool WholeVoiceRowQuiet(const VoiceSoA& v, uint32_t handle,
+                            uint32_t frameCount, uint32_t sampleDataFrames,
+                            VoiceRenderClass& cls) const;
+    void RenderQuietVoices(VoiceManager& voices, const int16_t* sampleData,
+                           uint32_t sampleDataFrames,
+                           const IndexedJobMix& mix, const uint32_t* quiet,
+                           const uint8_t* quietClass, uint32_t quietCount,
+                           const uint32_t* classCounts, uint32_t frameCount,
+                           uint32_t jobIndex);
     void PartitionMutedRows(uint32_t activeCount, uint32_t itemCount,
                             uint32_t jobCount);
     bool RenderWholeVoiceSegment(VoiceSoA& state, VoiceManager* voices,
@@ -824,6 +842,9 @@ private:
     // LFO check in the item loop, keeping non-vibrato blocks at their
     // pre-vibrato cost.
     bool wvChanVibratoActive_[kChannelCount] = {};
+    // Bit c: channel c has channel ops or a vibrato window this block, so
+    // none of its voices is quiet.
+    uint32_t wvChanBusyMask_ = 0u;
     uint32_t wvRowOpCapacity_ = 0u;
     uint32_t wvRowOpCount_ = 0u;
     uint64_t wvRowOpChannelMask_ = 0u;   // channels touched by this block's ops
@@ -921,6 +942,10 @@ private:
     // every retirement from all workers at once.
     static constexpr uint32_t kWvRetireCountStride = 16u;
     uint32_t* wvJobRetireCounts_ = nullptr;
+    // Per-job quiet-voice lists (handle + render class), scratchCapacity_
+    // entries per job like wvJobRetirements_.
+    uint32_t* wvJobQuiet_ = nullptr;
+    uint8_t* wvJobQuietClass_ = nullptr;
     static constexpr uint32_t kWvJobsPerThread = 4u;
     static constexpr uint32_t kWvMinItemsPerJob = 64u;
     // Most pitch bends one row fuses into a single span before the next span
@@ -989,6 +1014,14 @@ public:
     // at every op.  On by default; off restores the split, which the tests use
     // as the reference.
     void SetBendFusion(bool on) { bendFusion_ = on; }
+    // Lean path for quiet voices (see leanVoices_).  Safe to flip between
+    // blocks from any thread.
+    void SetLeanVoices(bool on) {
+        leanVoices_.store(on, std::memory_order_relaxed);
+    }
+    bool LeanVoices() const {
+        return leanVoices_.load(std::memory_order_relaxed);
+    }
     // Half-rate voice bus: `defaultBand` is the bandwidth fraction (content
     // over the sample's Nyquist) assumed for every voice until the loaders
     // supply per-region values.
@@ -1102,7 +1135,10 @@ public:
     // Read on the audio thread after the jobs finish.
     enum WvSegCounter : uint32_t {
         kWvSegCalls, kWvSegCycles, kWvSegKernelOk, kWvSegFallback,
-        kWvSegKernelFrames, kWvSegFallbackFrames, kWvSegCounterCount
+        kWvSegKernelFrames, kWvSegFallbackFrames,
+        kWvSegLeanQuiet,    // voice-blocks that took the quiet pass
+        kWvSegLeanKernel,   // of those, voices the lean kernel rendered
+        kWvSegCounterCount
     };
     struct alignas(64) WvJobSegStats {
         uint64_t value[kWvSegCounterCount];
@@ -1126,6 +1162,8 @@ public:
     uint64_t GetWvSegCycles() const { return WvSegSum(kWvSegCycles); }
     uint64_t GetWvSegKernelOk() const { return WvSegSum(kWvSegKernelOk); }
     uint64_t GetWvSegFallback() const { return WvSegSum(kWvSegFallback); }
+    uint64_t GetLeanQuietVoices() const { return WvSegSum(kWvSegLeanQuiet); }
+    uint64_t GetLeanKernelVoices() const { return WvSegSum(kWvSegLeanKernel); }
     uint64_t GetWvSegKernelFrames() const {
         return WvSegSum(kWvSegKernelFrames);
     }

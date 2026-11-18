@@ -33,6 +33,8 @@ inline RenderScalar::~RenderScalar() {
     _aligned_free(wvJobRetirements_);
     _aligned_free(wvJobRetireCounts_);
     _aligned_free(wvJobSeg_);
+    _aligned_free(wvJobQuiet_);
+    _aligned_free(wvJobQuietClass_);
     delete[] wvGhostTails_;
     delete[] wvTailScratch_;
 }

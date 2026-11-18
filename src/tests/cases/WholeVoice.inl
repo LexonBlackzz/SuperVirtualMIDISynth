@@ -3791,3 +3791,257 @@ void TestRotationStateFollowsPoolGrowth() {
           "rotation growth: the rotation state covers every grown handle");
     svms::RequestRuntimeVoiceLimit(savedRequestedLimit);
 }
+
+// Lean path: voices with nothing happening in a block skip the per-voice
+// checks and render in their own pass.  An engine with it on and one with it
+// off get the same pool and the same events; every voice's state must stay
+// bit-equal, and the mix may differ only by the order voices are summed in.
+enum class LeanExclusion { None, Bus, Rotation, Decimation };
+
+// The CC scenario's dispatcher plus the two events it does not model: the
+// Reset barrier and a note-on that re-excites what sounds on its key.
+void DispatchLeanIdentityEvent(const svms::RenderEvent* events,
+                               uint32_t eventCount, uint32_t blockCursor,
+                               void* userData) {
+    auto& context = *static_cast<WholeVoiceCCContext*>(userData);
+    for (uint32_t index = 0u; index < eventCount; ++index) {
+        svms::RenderEvent event = events[index];
+        if (event.type == svms::RenderEventType::Reset) {
+            context.voices->Reset();
+            continue;
+        }
+        if (event.type == svms::RenderEventType::NoteReExcite) {
+            if (context.voices->ReExciteKey(event.channel, event.data1) != 0u)
+                continue;
+            event.type = svms::RenderEventType::NoteOn;
+        }
+        DispatchWholeVoiceCCEvent(&event, 1u, blockCursor, userData);
+    }
+}
+
+void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
+                           bool grow, LeanExclusion exclusion) {
+    // The process-wide requested voice limit is applied to every pool at block
+    // start, and GrowCapacity publishes the grown size into it when it is 0:
+    // run with no request (each pool keeps its own size) and put it back.
+    const uint32_t savedRequestedLimit = svms::RequestedRuntimeVoiceLimit();
+    svms::RequestRuntimeVoiceLimit(0u);
+    const uint32_t blocks =
+        frames <= 8u ? 192u : frames <= 16u ? 128u : frames <= 64u ? 48u : 8u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.4f * std::sin(static_cast<float>(i) * 0.031f) +
+             0.15f * std::cos(static_cast<float>(i) * 0.079f)) * 32767.0f);
+    // Rotation modes need the exact analytic companion store.
+    std::vector<int16_t> hilbert(samples.size(), 0);
+    svms::BuildHilbertSlice(samples.data(), hilbert.data(),
+                            {0u, sampleCount, 0u, sampleCount});
+    const int16_t* hilbertPtr =
+        exclusion == LeanExclusion::Rotation ? hilbert.data() : nullptr;
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+
+    const uint32_t initialPool = grow ? 64u : pool;
+    const uint32_t seedCount = grow ? 48u : 32u;
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+    auto seedVoices = std::make_unique<svms::VoiceManager>();
+    ConfigureWholeVoiceSeedPool(*seedVoices, seedChannels, initialPool,
+                                seedCount);
+    auto offVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    auto onVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
+    if (exclusion == LeanExclusion::Rotation) {
+        Check(offVoices->SetPhaseRotationMode(1u) &&
+                  onVoices->SetPhaseRotationMode(1u),
+              "lean identity: rotation mode 1 is set on both pools");
+    }
+    svms::ChannelCache offChannels = seedChannels;
+    svms::ChannelCache onChannels = seedChannels;
+
+    svms::RenderScalar off;
+    svms::RenderScalar on;
+    Check(off.ReserveVoiceCapacity(initialPool) &&
+              on.ReserveVoiceCapacity(initialPool) &&
+              off.ConfigureRenderThreads(threads, frames) &&
+              on.ConfigureRenderThreads(threads, frames) &&
+              off.SetRenderBackend(svms::RenderBackend::AVX2) &&
+              on.SetRenderBackend(svms::RenderBackend::AVX2),
+          "lean identity starts both AVX2 renderers");
+    off.SetLeanVoices(false);
+    on.SetLeanVoices(true);
+    if (exclusion == LeanExclusion::Decimation) {
+        for (svms::RenderScalar* r : {&off, &on}) {
+            r->SetDecimationTiersForTest(16u, 32u, 48u, 64u);
+            r->SetDecimationEnabled(true);
+        }
+    }
+    WholeVoiceCCContext offContext{offVoices.get(), &offChannels,
+                                   offChannels.GetParams(), &cfg};
+    WholeVoiceCCContext onContext{onVoices.get(), &onChannels,
+                                  onChannels.GetParams(), &cfg};
+    offContext.ResetMasterState();
+    onContext.ResetMasterState();
+    off.SetEventBatchDispatcher(DispatchLeanIdentityEvent, &offContext);
+    on.SetEventBatchDispatcher(DispatchLeanIdentityEvent, &onContext);
+
+    const bool bus = exclusion == LeanExclusion::Bus;
+    std::vector<float> offBus(bus ? svms::kChannelCount * 2u * frames : 0u);
+    std::vector<float> onBus(offBus.size());
+    float* offBusL[svms::kChannelCount] = {};
+    float* offBusR[svms::kChannelCount] = {};
+    float* onBusL[svms::kChannelCount] = {};
+    float* onBusR[svms::kChannelCount] = {};
+    if (bus) {
+        for (uint32_t c = 0u; c < svms::kChannelCount; ++c) {
+            offBusL[c] = offBus.data() + (2u * c) * frames;
+            offBusR[c] = offBus.data() + (2u * c + 1u) * frames;
+            onBusL[c] = onBus.data() + (2u * c) * frames;
+            onBusR[c] = onBus.data() + (2u * c + 1u) * frames;
+        }
+    }
+
+    WholeVoiceRng rng;
+    uint32_t sequence = 0u;
+    uint32_t mismatchedBlocks = 0u;
+    uint32_t firstMismatch = UINT32_MAX;
+    float maxDiff = 0.0f;
+    for (uint32_t block = 0u; block < blocks; ++block) {
+        if (grow && block == blocks / 4u) {
+            Check(offVoices->GrowCapacity(pool) && onVoices->GrowCapacity(pool) &&
+                      off.ReserveVoiceCapacity(pool) &&
+                      on.ReserveVoiceCapacity(pool),
+                  "lean identity: both pools grow mid-run");
+        }
+        std::vector<svms::RenderEvent> events;
+        const auto push = [&](svms::RenderEventType type, uint8_t channel,
+                              uint8_t data1, uint8_t data2) {
+            svms::RenderEvent event{};
+            event.type = type;
+            event.channel = channel;
+            event.data1 = data1;
+            event.data2 = data2;
+            event.frameOffset = rng.Next() % frames;
+            event.ingressSequence = sequence++;
+            events.push_back(event);
+        };
+        const uint32_t eventCount = frames <= 16u
+            ? rng.Next() % 3u : frames / 64u + 4u;
+        for (uint32_t j = 0u; j < eventCount; ++j) {
+            const uint32_t roll = rng.Next() % 100u;
+            const uint8_t channel = static_cast<uint8_t>(rng.Next() % 4u);
+            const uint8_t key = static_cast<uint8_t>(48u + rng.Next() % 24u);
+            using T = svms::RenderEventType;
+            if (roll < 40u || roll >= 90u)
+                push(T::NoteOn, channel, key,
+                     static_cast<uint8_t>(64u + rng.Next() % 64u));
+            else if (roll < 55u) push(T::NoteOff, channel, key, 0u);
+            else if (roll < 60u) push(T::NoteReExcite, channel, key, 100u);
+            else if (roll < 65u)
+                push(T::ControlChange, channel, 64u,
+                     (rng.Next() % 2u) != 0u ? 127u : 0u);
+            else if (roll < 70u)
+                push(T::ControlChange, 0u, 7u,
+                     static_cast<uint8_t>(rng.Next() % 128u));
+            else if (roll < 75u)
+                push(T::ControlChange, 0u, 10u,
+                     static_cast<uint8_t>(rng.Next() % 128u));
+            else if (roll < 80u)
+                push(T::PitchBend, 1u, static_cast<uint8_t>(rng.Next() % 128u),
+                     static_cast<uint8_t>(rng.Next() % 128u));
+            else if (roll < 85u)
+                push(T::ControlChange, 2u, 1u,
+                     (rng.Next() % 2u) != 0u
+                         ? 0u : static_cast<uint8_t>(rng.Next() % 128u));
+            else if (roll < 88u) push(T::ControlChange, channel, 123u, 0u);
+            else push(T::ControlChange, channel, 120u, 0u);
+        }
+        if (block == 2u * blocks / 3u)
+            push(svms::RenderEventType::Reset, 0u, 0u, 0u);
+        std::stable_sort(events.begin(), events.end(),
+            [](const svms::RenderEvent& a, const svms::RenderEvent& b) {
+                return a.frameOffset < b.frameOffset;
+            });
+
+        const uint64_t blockStartFrame = 20000u + uint64_t(block) * frames;
+        std::vector<float> offL(frames, 0.0f), offR(frames, 0.0f);
+        std::vector<float> onL(frames, 0.0f), onR(frames, 0.0f);
+        std::fill(offBus.begin(), offBus.end(), 0.0f);
+        std::fill(onBus.begin(), onBus.end(), 0.0f);
+        off.RenderBlock(*offVoices, offChannels, samples.data(), hilbertPtr,
+                        sampleCount, offL.data(), offR.data(), frames, cfg,
+                        events.data(),
+                        static_cast<uint32_t>(events.size()), true,
+                        blockStartFrame, bus ? offBusL : nullptr,
+                        bus ? offBusR : nullptr);
+        on.RenderBlock(*onVoices, onChannels, samples.data(), hilbertPtr,
+                       sampleCount, onL.data(), onR.data(), frames, cfg,
+                       events.data(),
+                       static_cast<uint32_t>(events.size()), true,
+                       blockStartFrame, bus ? onBusL : nullptr,
+                       bus ? onBusR : nullptr);
+        for (uint32_t f = 0u; f < frames; ++f) {
+            maxDiff = (std::max)(maxDiff, std::fabs(offL[f] - onL[f]));
+            maxDiff = (std::max)(maxDiff, std::fabs(offR[f] - onR[f]));
+        }
+        for (size_t i = 0u; i < offBus.size(); ++i)
+            maxDiff = (std::max)(maxDiff, std::fabs(offBus[i] - onBus[i]));
+        bool same = offVoices->GetActiveCount() == onVoices->GetActiveCount();
+        const uint32_t cap = (std::min)(offVoices->GetMaxVoices(),
+                                        onVoices->GetMaxVoices());
+#define SVMS_CMP_FIELD(type, name) \
+        same = same && std::memcmp(offVoices->v.name, onVoices->v.name, \
+                                   cap * sizeof(type)) == 0;
+        SVMS_VOICE_SOA_DYNAMIC_FIELDS(SVMS_CMP_FIELD)
+#undef SVMS_CMP_FIELD
+        if (!same) {
+            if (firstMismatch == UINT32_MAX) firstMismatch = block;
+            ++mismatchedBlocks;
+        }
+    }
+    svms::RequestRuntimeVoiceLimit(savedRequestedLimit);
+    const uint64_t quiet = on.GetLeanQuietVoices();
+    if (mismatchedBlocks != 0u || maxDiff > 2.0e-5f) {
+        std::fprintf(stderr,
+                     "[LEAN] threads=%u frames=%u pool=%u grow=%d excl=%d "
+                     "mismatched=%u first=%u maxDiff=%g quiet=%llu\n",
+                     threads, frames, pool, grow ? 1 : 0,
+                     static_cast<int>(exclusion), mismatchedBlocks,
+                     firstMismatch, maxDiff,
+                     static_cast<unsigned long long>(quiet));
+    }
+    Check(mismatchedBlocks == 0u,
+          "lean identity: voice state bit-equal lean on vs off");
+    Check(maxDiff <= 2.0e-5f, "lean identity: audio within AVX2 tolerance");
+    Check(off.GetLeanQuietVoices() == 0u,
+          "lean identity: the lean-off engine never takes the quiet path");
+    if (exclusion == LeanExclusion::Bus ||
+        exclusion == LeanExclusion::Rotation) {
+        Check(quiet == 0u,
+              "lean identity: bus mode and rotation keep today's path");
+    } else {
+        Check(quiet > 0u, "lean identity: the quiet path ran");
+    }
+}
+
+void TestLeanVoicesIdentity() {
+    if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
+    for (uint32_t threads : {1u, 4u}) {
+        for (uint32_t frames : {8u, 16u, 64u, 2048u}) {
+            RunLeanVoicesIdentity(threads, frames, 37u, false,
+                                  LeanExclusion::None);
+            RunLeanVoicesIdentity(threads, frames, 4096u, true,
+                                  LeanExclusion::None);
+        }
+    }
+    for (LeanExclusion exclusion : {LeanExclusion::Bus,
+                                    LeanExclusion::Rotation,
+                                    LeanExclusion::Decimation}) {
+        RunLeanVoicesIdentity(4u, 16u, 37u, false, exclusion);
+        RunLeanVoicesIdentity(1u, 64u, 37u, false, exclusion);
+    }
+}

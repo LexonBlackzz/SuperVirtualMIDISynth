@@ -143,11 +143,19 @@ inline bool RenderScalar::EnsureWholeVoiceJobScratch(uint32_t jobCount) {
     VoiceSoA* tailScratch = new (std::nothrow) VoiceSoA[jobCount];
     WvJobSegStats* segStats = static_cast<WvJobSegStats*>(_aligned_malloc(
         static_cast<size_t>(jobCount) * sizeof(WvJobSegStats), 64u));
+    uint32_t* quiet = static_cast<uint32_t*>(_aligned_malloc(
+        static_cast<size_t>(jobCount) * scratchCapacity_ * sizeof(uint32_t),
+        kMixBufferAlign));
+    uint8_t* quietClass = static_cast<uint8_t*>(_aligned_malloc(
+        static_cast<size_t>(jobCount) * scratchCapacity_, kMixBufferAlign));
     if (retirements == nullptr || counts == nullptr ||
-        tailScratch == nullptr || segStats == nullptr) {
+        tailScratch == nullptr || segStats == nullptr || quiet == nullptr ||
+        quietClass == nullptr) {
         _aligned_free(retirements);
         _aligned_free(counts);
         _aligned_free(segStats);
+        _aligned_free(quiet);
+        _aligned_free(quietClass);
         delete[] tailScratch;
         return false;
     }
@@ -158,6 +166,8 @@ inline bool RenderScalar::EnsureWholeVoiceJobScratch(uint32_t jobCount) {
             _aligned_free(retirements);
             _aligned_free(counts);
             _aligned_free(segStats);
+            _aligned_free(quiet);
+            _aligned_free(quietClass);
             delete[] tailScratch;
             return false;
         }
@@ -172,8 +182,12 @@ inline bool RenderScalar::EnsureWholeVoiceJobScratch(uint32_t jobCount) {
     _aligned_free(wvJobRetirements_);
     _aligned_free(wvJobRetireCounts_);
     _aligned_free(wvJobSeg_);
+    _aligned_free(wvJobQuiet_);
+    _aligned_free(wvJobQuietClass_);
     delete[] wvTailScratch_;
     wvJobSeg_ = segStats;
+    wvJobQuiet_ = quiet;
+    wvJobQuietClass_ = quietClass;
     wvJobRetirements_ = retirements;
     wvJobRetireCounts_ = counts;
     wvTailScratch_ = tailScratch;

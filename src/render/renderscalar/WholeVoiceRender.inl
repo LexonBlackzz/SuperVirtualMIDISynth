@@ -781,6 +781,75 @@ inline void RenderScalar::RenderWholeVoiceRow(
         SyncMixFromCurve(v, handle, curve, frameCount - 1u);
 }
 
+inline bool RenderScalar::WholeVoiceRowQuiet(const VoiceSoA& v,
+                                             uint32_t handle,
+                                             uint32_t frameCount,
+                                             uint32_t sampleDataFrames,
+                                             VoiceRenderClass& cls) const {
+    (void)frameCount;
+    if (wvStartFrame_[handle] != UINT32_MAX ||
+        wvReleaseFrame_[handle] != UINT32_MAX)
+        return false;
+    if (wvExciteHead_ != nullptr && handle < wvExciteCapacity_ &&
+        wvExciteHead_[handle] != UINT32_MAX)
+        return false;
+    const uint32_t channel = v.channel[handle];
+    if (channel >= kChannelCount || ((wvChanBusyMask_ >> channel) & 1u) != 0u)
+        return false;
+    if (WholeVoiceRowMuted(handle) || v.filterEnabled[handle] != 0u)
+        return false;
+    cls = ClassifyWholeVoiceRow(v, handle);
+    switch (cls) {
+        case VoiceRenderClass::SustainedLoop:
+            // The loop bounds the vector kernels take (ValidateLoopVoice).
+            return v.relEnd[handle] >= 2u &&
+                   v.relLoopS[handle] < v.relLoopE[handle] &&
+                   v.relLoopE[handle] <= v.relEnd[handle] &&
+                   v.sampleStart[handle] < sampleDataFrames &&
+                   v.relEnd[handle] <= sampleDataFrames - v.sampleStart[handle] &&
+                   v.phaseIncs[handle] >= 0.0f &&
+                   v.phaseIncs[handle] <
+                       v.relLoopEF[handle] - v.relLoopSF[handle];
+        default:
+            return false;
+    }
+}
+
+// Quiet voices of one job, grouped by render class.  Each group goes through
+// the class kernel in one call; a group the kernel refuses (it then mutated
+// nothing) renders voice by voice through today's row path.
+inline void RenderScalar::RenderQuietVoices(
+    VoiceManager& voices, const int16_t* sampleData, uint32_t sampleDataFrames,
+    const IndexedJobMix& mix, const uint32_t* quiet, const uint8_t* quietClass,
+    uint32_t quietCount, const uint32_t* classCounts, uint32_t frameCount,
+    uint32_t jobIndex) {
+    wvJobSeg_[jobIndex].value[kWvSegLeanQuiet] += quietCount;
+    uint32_t group[256];
+    for (uint32_t c = 0u; c < kVoiceRenderClassCount; ++c) {
+        if (classCounts[c] == 0u) continue;
+        const VoiceRenderClass cls = static_cast<VoiceRenderClass>(c);
+        uint32_t n = 0u;
+        const auto flush = [&]() {
+            if (n == 0u) return;
+            if (!RenderWholeVoiceBatch(voices.v, voices, group, n, cls,
+                                       sampleData, sampleDataFrames, mix, 0u,
+                                       frameCount, jobIndex)) {
+                for (uint32_t i = 0u; i < n; ++i)
+                    RenderWholeVoiceRow(voices, group[i], sampleData,
+                                        sampleDataFrames, mix.outputLeft,
+                                        mix.outputRight, frameCount, jobIndex);
+            }
+            n = 0u;
+        };
+        for (uint32_t i = 0u; i < quietCount; ++i) {
+            if (quietClass[i] != c) continue;
+            group[n++] = quiet[i];
+            if (n == 256u) flush();
+        }
+        flush();
+    }
+}
+
 inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                                              const IndexedJobMix& mix,
                                              uint32_t frameCount,
@@ -798,6 +867,17 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
     const bool stagedPending = poolVoices.StagedPending();
     const bool halfRateOn = ctx->halfRate;
     uint32_t halfQueued = 0u;
+    // Lean path: block-wide conditions, once per job.
+    const bool leanJob = renderer->LeanVoices() && mix.busLeft == nullptr &&
+        v.rot == nullptr && !renderer->wvScalarVibrato_ &&
+        ctx->sampleData != nullptr && frameCount >= 8u &&
+        renderer->kernelSet_->backend == RenderBackend::AVX2;
+    uint32_t* quiet = renderer->wvJobQuiet_ +
+        static_cast<size_t>(jobIndex) * renderer->scratchCapacity_;
+    uint8_t* quietClass = renderer->wvJobQuietClass_ +
+        static_cast<size_t>(jobIndex) * renderer->scratchCapacity_;
+    uint32_t quietCount = 0u;
+    uint32_t quietClassCounts[kVoiceRenderClassCount] = {};
     for (uint32_t item = begin; item < end; ++item) {
         if (item < ctx->voiceItemCount) {
             const uint32_t handle = renderer->wvItemHandles_[item];
@@ -861,6 +941,16 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                     *ctx->voices, handle, ctx->sampleData,
                     ctx->sampleDataFrames, frameCount, jobIndex, halfQueued))
                 continue;
+            VoiceRenderClass quietCls;
+            if (leanJob &&
+                !(halfRateOn && renderer->HalfRateCandidate(v, handle, frameCount)) &&
+                renderer->WholeVoiceRowQuiet(v, handle, frameCount,
+                                             ctx->sampleDataFrames, quietCls)) {
+                quiet[quietCount] = handle;
+                quietClass[quietCount++] = static_cast<uint8_t>(quietCls);
+                ++quietClassCounts[static_cast<uint32_t>(quietCls)];
+                continue;
+            }
             // Common whole-block case: consecutive carried/new voices with
             // the same single segment can share one class-kernel dispatch.
             // Runs never cross a job boundary, and handles remain in active-
@@ -1156,6 +1246,11 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                                           frameCount - death);
         }
     }
+    if (quietCount != 0u)
+        renderer->RenderQuietVoices(*ctx->voices, ctx->sampleData,
+                                    ctx->sampleDataFrames, mix, quiet,
+                                    quietClass, quietCount, quietClassCounts,
+                                    frameCount, jobIndex);
     if (halfQueued != 0u)
         renderer->FlushHalfRate(*ctx->voices, ctx->sampleData,
                                 ctx->sampleDataFrames, frameCount, jobIndex,

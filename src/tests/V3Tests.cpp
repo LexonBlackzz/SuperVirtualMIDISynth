@@ -119,6 +119,12 @@ int main() {
         std::puts(g_failures == 0 ? "GPU stage tests passed" : "GPU stage tests FAILED");
         return g_failures == 0 ? 0 : 1;
     }
+    if (std::getenv("SVMS_TEST_LEAN_ONLY") != nullptr) {
+        TestRotationStateFollowsPoolGrowth();
+        TestLeanVoicesIdentity();
+        std::puts(g_failures == 0 ? "lean tests passed" : "lean tests FAILED");
+        return g_failures == 0 ? 0 : 1;
+    }
     TestMidiByteStream();
     TestReExciteKey();
     TestReExciteRenderDifferential(128u, 0);
@@ -158,6 +164,7 @@ int main() {
     TestBucketStealIndex();
     TestFastChunkMathDifferential();
     TestRotationStateFollowsPoolGrowth();
+    TestLeanVoicesIdentity();
     TestWholeVoiceOpBudgetSplitDifferential();
     TestWholeVoiceVibratoDifferential();
     TestWholeVoiceScalarVibratoDifferential();
