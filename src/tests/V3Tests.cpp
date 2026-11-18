@@ -157,6 +157,7 @@ int main() {
     TestWholeVoiceCCDifferential();
     TestBucketStealIndex();
     TestFastChunkMathDifferential();
+    TestRotationStateFollowsPoolGrowth();
     TestWholeVoiceOpBudgetSplitDifferential();
     TestWholeVoiceVibratoDifferential();
     TestWholeVoiceScalarVibratoDifferential();

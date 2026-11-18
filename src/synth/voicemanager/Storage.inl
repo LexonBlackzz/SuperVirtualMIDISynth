@@ -568,7 +568,7 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
     grown.phaseRotationMode_ = phaseRotationMode_;
     grown.rotationSeedCounter_ = rotationSeedCounter_;
     if (phaseRotationMode_ != 0u && v.rot &&
-        grown.v.ReserveRotation(oldCapacity)) {
+        grown.v.ReserveRotation(capacity)) {
         std::memcpy(grown.v.rot, v.rot,
                     static_cast<size_t>(oldCapacity) *
                         sizeof(VoiceRotationState));

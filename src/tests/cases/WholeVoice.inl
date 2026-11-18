@@ -3776,3 +3776,18 @@ void TestHalfRateBus() {
     if (svms::IsRenderBackendSupported(svms::RenderBackend::AVX2))
         RunHalfRateBus(true);
 }
+
+// A pool that grows while phase rotation is on keeps one rotation state per
+// handle, new handles included: a launch into a grown slot seeds v.rot[h].
+void TestRotationStateFollowsPoolGrowth() {
+    const uint32_t savedRequestedLimit = svms::RequestedRuntimeVoiceLimit();
+    svms::RequestRuntimeVoiceLimit(0u);
+    svms::VoiceManager voices;
+    Check(voices.Initialize(16u, 44100u) && voices.SetPhaseRotationMode(1u),
+          "rotation growth: pool and rotation state allocate");
+    Check(voices.GrowCapacity(64u), "rotation growth: the pool grows");
+    Check(voices.v.rot != nullptr &&
+              voices.v.rotCapacity_ >= voices.GetMaxVoices(),
+          "rotation growth: the rotation state covers every grown handle");
+    svms::RequestRuntimeVoiceLimit(savedRequestedLimit);
+}
