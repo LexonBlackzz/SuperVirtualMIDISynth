@@ -4193,6 +4193,12 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
         exclusion == LeanExclusion::Rotation) {
         Check(quiet == 0u,
               "lean identity: bus mode and rotation keep today's path");
+    } else if (frames > svms::kLeanMaxFrames) {
+        // Above the lean kernel's frame cap the quiet pass would only add
+        // its test to every voice.
+        Check(quiet == 0u && on.GetLeanRefreshSkips() == 0u,
+              "lean identity: blocks above the lean frame cap keep today's "
+              "path");
     } else {
         Check(quiet > 0u, "lean identity: the quiet path ran");
         Check(on.GetLeanRefreshSkips() > 0u,

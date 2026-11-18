@@ -990,6 +990,7 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
     const bool leanJob = renderer->wvLeanBlock_ && mix.busLeft == nullptr &&
         v.rot == nullptr && !renderer->wvScalarVibrato_ &&
         ctx->sampleData != nullptr && frameCount >= 8u &&
+        frameCount <= kLeanMaxFrames &&
         renderer->kernelSet_->backend == RenderBackend::AVX2;
     uint32_t* quiet = renderer->wvJobQuiet_ +
         static_cast<size_t>(jobIndex) * renderer->scratchCapacity_;
