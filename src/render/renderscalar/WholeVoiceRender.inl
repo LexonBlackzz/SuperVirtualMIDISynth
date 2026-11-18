@@ -1068,6 +1068,12 @@ inline void RenderScalar::WholeVoiceJobThunk(uint32_t jobIndex,
                 quiet[quietCount] = handle;
                 quietClass[quietCount++] = static_cast<uint8_t>(quietCls);
                 ++quietClassCounts[static_cast<uint32_t>(quietCls)];
+                // A quiet voice keeps its stage and state for the block, so
+                // the block-end class refresh would find nothing to change
+                // (every active voice is linked to its class list).
+                if (v.renderClass[handle] == static_cast<uint8_t>(quietCls))
+                    renderer->wvQuietStamp_[handle] =
+                        renderer->wholeVoiceBlocks_;
                 continue;
             }
             // Common whole-block case: consecutive carried/new voices with
@@ -1664,8 +1670,18 @@ inline void RenderScalar::RenderWholeVoiceBlock(
     const uint32_t refreshCount = activeCount;
     const uint32_t* refreshRows = wvSliceHandles_;
 #endif
-    for (uint32_t i = 0u; i < refreshCount; ++i)
-        voices.RefreshRenderClass(static_cast<VoiceHandle>(refreshRows[i]));
+    const uint32_t quietStamp = wholeVoiceBlocks_;
+    uint64_t refreshSkips = 0u;
+    for (uint32_t i = 0u; i < refreshCount; ++i) {
+        const uint32_t row = refreshRows[i];
+        if (quietStamp != 0u && row < wvHandleCapacity_ &&
+            wvQuietStamp_[row] == quietStamp) {
+            ++refreshSkips;
+            continue;
+        }
+        voices.RefreshRenderClass(static_cast<VoiceHandle>(row));
+    }
+    wvJobSeg_[0].value[kWvSegLeanRefreshSkip] += refreshSkips;
 
     // Row-op channels had no masks set during the pre-pass (a launch-entry
     // steal fold would have corrupted pre-CC ghost captures), so refresh

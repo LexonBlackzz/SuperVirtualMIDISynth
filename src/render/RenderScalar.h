@@ -1139,6 +1139,7 @@ public:
         kWvSegLeanQuiet,    // voice-blocks that took the quiet pass
         kWvSegLeanKernel,   // of those, voices the lean kernel rendered
         kWvSegLeanFiltered, // of those, voices with their low-pass on
+        kWvSegLeanRefreshSkip,  // block-end class refreshes skipped for them
         kWvSegLeanClassFirst,  // the same split by render class
         kWvSegCounterCount = kWvSegLeanClassFirst + kVoiceRenderClassCount
     };
@@ -1168,6 +1169,9 @@ public:
     uint64_t GetLeanKernelVoices() const { return WvSegSum(kWvSegLeanKernel); }
     uint64_t GetLeanFilteredVoices() const {
         return WvSegSum(kWvSegLeanFiltered);
+    }
+    uint64_t GetLeanRefreshSkips() const {
+        return WvSegSum(kWvSegLeanRefreshSkip);
     }
     uint64_t GetLeanKernelVoicesByClass(VoiceRenderClass cls) const {
         return WvSegSum(static_cast<WvSegCounter>(
@@ -1225,6 +1229,10 @@ private:
     uint32_t wvCullBlocks_ = 0u;         // mutedCullBlocks_ latched per block
     std::vector<uint32_t> wvMutedSince_; // per handle: first block of the muted run
     std::vector<uint32_t> wvMutedLast_;  // per handle: last block it was muted
+    // Per handle: the whole-voice block (wholeVoiceBlocks_) it rendered in the
+    // quiet pass with its render class already right; the block-end class
+    // refresh skips it (0 = never).
+    std::vector<uint32_t> wvQuietStamp_;
     uint32_t decimationTiers_[4] = {kDecimationTier1, kDecimationTier2,
                                     kDecimationTier3, kDecimationTier4};
     bool wvDecimating_ = false;          // this block has muted rows

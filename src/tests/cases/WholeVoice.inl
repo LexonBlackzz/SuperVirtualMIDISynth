@@ -4136,7 +4136,7 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
     Check(mismatchedBlocks == 0u,
           "lean identity: voice state bit-equal lean on vs off");
     Check(maxDiff <= 2.0e-5f, "lean identity: audio within AVX2 tolerance");
-    Check(off.GetLeanQuietVoices() == 0u,
+    Check(off.GetLeanQuietVoices() == 0u && off.GetLeanRefreshSkips() == 0u,
           "lean identity: the lean-off engine never takes the quiet path");
     if (exclusion == LeanExclusion::Bus ||
         exclusion == LeanExclusion::Rotation) {
@@ -4144,6 +4144,8 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
               "lean identity: bus mode and rotation keep today's path");
     } else {
         Check(quiet > 0u, "lean identity: the quiet path ran");
+        Check(on.GetLeanRefreshSkips() > 0u,
+              "lean identity: quiet voices skip the block-end class refresh");
         // Blocks up to 64 frames (kLeanMaxFrames) take the lean kernel, in
         // groups of eight voices of one class per job: a 37-voice pool split
         // over four threads has fewer than that per job (leftovers render
