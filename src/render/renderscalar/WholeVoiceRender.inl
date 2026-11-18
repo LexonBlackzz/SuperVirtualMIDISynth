@@ -815,27 +815,43 @@ inline bool RenderScalar::WholeVoiceRowQuiet(const VoiceSoA& v,
     const uint32_t channel = v.channel[handle];
     if (channel >= kChannelCount || ((wvChanBusyMask_ >> channel) & 1u) != 0u)
         return false;
-    if (WholeVoiceRowMuted(handle) || v.filterEnabled[handle] != 0u)
-        return false;
+    if (WholeVoiceRowMuted(handle)) return false;
+    using Cls = VoiceRenderClass;
     cls = ClassifyWholeVoiceRow(v, handle);
-    if (cls != VoiceRenderClass::SustainedLoop &&
-        cls != VoiceRenderClass::ReleaseLoop &&
-        cls != VoiceRenderClass::TransientLoop)
+    const bool loop = cls == Cls::SustainedLoop || cls == Cls::ReleaseLoop ||
+        cls == Cls::TransientLoop;
+    if (!loop && cls != Cls::SustainedOneShot && cls != Cls::ReleaseOneShot &&
+        cls != Cls::TransientOneShot)
         return false;
-    // The loop bounds the vector kernels take (ValidateLoopVoice).
+    // The sample bounds the vector kernels take (ValidateLoopVoice).
     if (!(v.relEnd[handle] >= 2u &&
-          v.relLoopS[handle] < v.relLoopE[handle] &&
-          v.relLoopE[handle] <= v.relEnd[handle] &&
           v.sampleStart[handle] < sampleDataFrames &&
           v.relEnd[handle] <= sampleDataFrames - v.sampleStart[handle] &&
-          v.phaseIncs[handle] >= 0.0f &&
-          v.phaseIncs[handle] < v.relLoopEF[handle] - v.relLoopSF[handle]))
+          v.phaseIncs[handle] >= 0.0f))
         return false;
-    if (cls == VoiceRenderClass::SustainedLoop) return true;
+    if (loop) {
+        if (!(v.relLoopS[handle] < v.relLoopE[handle] &&
+              v.relLoopE[handle] <= v.relEnd[handle] &&
+              v.phaseIncs[handle] < v.relLoopEF[handle] - v.relLoopSF[handle]))
+            return false;
+    } else {
+        // A one-shot never reaches its sample end inside the block: even the
+        // cursor after the last frame keeps its lerp partner in the sample.
+        // 64-bit fixed point: the step is below 2^16 frames and the block at
+        // most 2^13, so nothing overflows.
+        if (!(v.phaseIncs[handle] < 65536.0f)) return false;
+        const uint64_t ahead =
+            phasefx::FromFloat(v.phaseIncs[handle]) * frameCount +
+            v.phaseFrac[handle];
+        if (static_cast<uint64_t>(v.phaseIdx[handle]) + (ahead >> 32u) + 1u >=
+            v.relEnd[handle])
+            return false;
+    }
+    if (cls == Cls::SustainedLoop || cls == Cls::SustainedOneShot) return true;
     // Release and decay follow the exact per-frame gain chain here;
     // quality.fast_chunk_math renders them in closed form per chunk instead.
     if (FastChunkMathEnabled()) return false;
-    if (cls == VoiceRenderClass::ReleaseLoop) {
+    if (cls == Cls::ReleaseLoop || cls == Cls::ReleaseOneShot) {
         // No retirement inside the block: the countdown outlasts it, or (an
         // uncounted release) the gain stays above the retire floor.
         const uint32_t remaining = v.releaseSamplesRemaining[handle];
@@ -863,10 +879,7 @@ inline void RenderScalar::RenderQuietVoices(
         const VoiceRenderClass cls = static_cast<VoiceRenderClass>(c);
         uint32_t n = 0u;
         const bool lean = kernelSet_->quietVoices != nullptr &&
-            frameCount <= kLeanMaxFrames &&
-            (cls == VoiceRenderClass::SustainedLoop ||
-             cls == VoiceRenderClass::ReleaseLoop ||
-             cls == VoiceRenderClass::TransientLoop);
+            frameCount <= kLeanMaxFrames && cls != VoiceRenderClass::Generic;
         const auto flush = [&]() {
             if (n == 0u) return;
             const uint32_t eights = lean ? (n & ~7u) : 0u;
@@ -879,6 +892,10 @@ inline void RenderScalar::RenderQuietVoices(
                     0.0f, 1.0f, 0u, nullptr, nullptr};
                 kernelSet_->quietVoices(context, group, eights, cls);
                 wvJobSeg_[jobIndex].value[kWvSegLeanKernel] += eights;
+                uint32_t filteredCount = 0u;
+                for (uint32_t i = 0u; i < eights; ++i)
+                    filteredCount += voices.v.filterEnabled[group[i]] != 0u;
+                wvJobSeg_[jobIndex].value[kWvSegLeanFiltered] += filteredCount;
                 wvJobSeg_[jobIndex].value[kWvSegLeanClassFirst + c] += eights;
                 if (eights == n) {
                     n = 0u;

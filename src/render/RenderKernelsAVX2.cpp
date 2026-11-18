@@ -3535,12 +3535,17 @@ uint32_t RenderStealTailSpanAVX2(VoiceSoA& v, uint32_t idx,
 //                   sustainLevel per frame, then (sample * gain) * mixGain, as
 //                   RenderTransientChunked; the caller proved the stage does
 //                   not end inside the span.
+//   Loop:  wraps the cursor at the loop end; a one-shot (Loop = false) walks
+//          straight on, the caller proved it does not reach the sample end.
+//   Filtered lanes run the voice low-pass on the interpolated sample before
+//   any gain, as every per-voice kernel does (FilterVoices8AVX2's
+//   recurrence, state kept in registers for the span).
 enum QuietKind { QuietSustained, QuietRelease, QuietDecay };
 
-template <QuietKind Kind>
-void RenderQuietLoopGroupsAVX2(const RenderSpanContext& c,
-                               const uint32_t* handles, uint32_t count,
-                               __m256* sumL, __m256* sumR) {
+template <QuietKind Kind, bool Loop>
+void RenderQuietGroupsAVX2(const RenderSpanContext& c,
+                           const uint32_t* handles, uint32_t count,
+                           __m256* sumL, __m256* sumR) {
     VoiceSoA& v = *c.voices;
     const uint32_t frames = c.frameCount;
     const __m256i one = _mm256_set1_epi32(1);
@@ -3585,26 +3590,56 @@ void RenderQuietLoopGroupsAVX2(const RenderSpanContext& c,
         }
         if constexpr (Kind == QuietDecay)
             floorLevel = _mm256_i32gather_ps(v.sustainLevel, h, 4);
+        const __m256 filtered = _mm256_castsi256_ps(_mm256_cmpgt_epi32(
+            _mm256_i32gather_epi32(
+                reinterpret_cast<const int*>(v.filterEnabled), h, 4),
+            _mm256_setzero_si256()));
+        const bool anyFiltered = _mm256_movemask_ps(filtered) != 0;
+        __m256 a0 = _mm256_setzero_ps(), a0x2 = _mm256_setzero_ps();
+        __m256 b1 = _mm256_setzero_ps(), b2 = _mm256_setzero_ps();
+        __m256 z1 = _mm256_setzero_ps(), z2 = _mm256_setzero_ps();
+        if (anyFiltered) {
+            a0 = _mm256_i32gather_ps(v.filterA0, h, 4);
+            a0x2 = _mm256_add_ps(a0, a0);
+            b1 = _mm256_i32gather_ps(v.filterB1, h, 4);
+            b2 = _mm256_i32gather_ps(v.filterB2, h, 4);
+            z1 = _mm256_i32gather_ps(v.filterZ1, h, 4);
+            z2 = _mm256_i32gather_ps(v.filterZ2, h, 4);
+        }
         for (uint32_t f = 0u; f < frames; ++f) {
-            // phasefx::Wrap (one wrap: the step is shorter than the loop)
-            const __m256i past = _mm256_cmpgt_epi32(idx, loopLast);
-            idx = _mm256_blendv_epi8(
-                idx, _mm256_add_epi32(_mm256_sub_epi32(idx, loopE), loopS),
-                past);
-            // base + 1 >= relEnd: the cursor restarts at the loop start
-            const __m256i jump = _mm256_cmpgt_epi32(
-                _mm256_add_epi32(idx, one), endLast);
-            idx = _mm256_blendv_epi8(idx, loopS, jump);
-            frac = _mm256_andnot_si256(jump, frac);
-            const __m256i nextRaw = _mm256_add_epi32(idx, one);
-            const __m256i next = _mm256_blendv_epi8(
-                nextRaw, loopS, _mm256_cmpgt_epi32(nextRaw, loopLast));
+            __m256i next = _mm256_add_epi32(idx, one);
+            if constexpr (Loop) {
+                // phasefx::Wrap (one wrap: the step is shorter than the loop)
+                const __m256i past = _mm256_cmpgt_epi32(idx, loopLast);
+                idx = _mm256_blendv_epi8(
+                    idx, _mm256_add_epi32(_mm256_sub_epi32(idx, loopE), loopS),
+                    past);
+                // base + 1 >= relEnd: the cursor restarts at the loop start
+                const __m256i jump = _mm256_cmpgt_epi32(
+                    _mm256_add_epi32(idx, one), endLast);
+                idx = _mm256_blendv_epi8(idx, loopS, jump);
+                frac = _mm256_andnot_si256(jump, frac);
+                const __m256i nextRaw = _mm256_add_epi32(idx, one);
+                next = _mm256_blendv_epi8(
+                    nextRaw, loopS, _mm256_cmpgt_epi32(nextRaw, loopLast));
+            }
             const __m256 first = GatherSampleAVX2(
                 c.sampleData, _mm256_add_epi32(start, idx));
             const __m256 second = GatherSampleAVX2(
                 c.sampleData, _mm256_add_epi32(start, next));
             __m256 sample = _mm256_add_ps(first, _mm256_mul_ps(
                 _mm256_sub_ps(second, first), FxWeight8(frac)));
+            if (anyFiltered) {
+                const __m256 out = _mm256_add_ps(_mm256_mul_ps(sample, a0), z1);
+                const __m256 newZ1 = _mm256_sub_ps(
+                    _mm256_add_ps(_mm256_mul_ps(sample, a0x2), z2),
+                    _mm256_mul_ps(b1, out));
+                const __m256 newZ2 = _mm256_sub_ps(
+                    _mm256_mul_ps(sample, a0), _mm256_mul_ps(b2, out));
+                z1 = _mm256_blendv_ps(z1, newZ1, filtered);
+                z2 = _mm256_blendv_ps(z2, newZ2, filtered);
+                sample = _mm256_blendv_ps(sample, out, filtered);
+            }
             if constexpr (Kind == QuietRelease) {
                 gain = _mm256_mul_ps(gain, rate);
                 sample = _mm256_mul_ps(sample, gain);
@@ -3618,12 +3653,16 @@ void RenderQuietLoopGroupsAVX2(const RenderSpanContext& c,
             sumR[f] = _mm256_add_ps(sumR[f], _mm256_mul_ps(sample, gainR));
             FxAdd8(idx, frac, stepIdxV, stepFracV);
         }
-        FxWrap8(idx, loopS, loopE);
+        if constexpr (Loop) FxWrap8(idx, loopS, loopE);
         alignas(32) uint32_t idxOut[8], fracOut[8];
         alignas(32) float gainOut[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(idxOut), idx);
         _mm256_store_si256(reinterpret_cast<__m256i*>(fracOut), frac);
         _mm256_store_ps(gainOut, gain);
+        if (anyFiltered) {
+            SVMS_ScatterPs(v.filterZ1, h, z1);
+            SVMS_ScatterPs(v.filterZ2, h, z2);
+        }
         for (uint32_t lane = 0u; lane < 8u; ++lane) {
             const uint32_t handle = handles[g + lane];
             v.phaseIdx[handle] = idxOut[lane];
@@ -3649,18 +3688,31 @@ void RenderQuietVoicesAVX2(const RenderSpanContext& c, const uint32_t* handles,
         sumL[f] = _mm256_setzero_ps();
         sumR[f] = _mm256_setzero_ps();
     }
+    using Cls = VoiceRenderClass;
     switch (renderClass) {
-        case VoiceRenderClass::SustainedLoop:
-            RenderQuietLoopGroupsAVX2<QuietSustained>(c, handles, count, sumL,
-                                                      sumR);
+        case Cls::SustainedLoop:
+            RenderQuietGroupsAVX2<QuietSustained, true>(c, handles, count,
+                                                        sumL, sumR);
             break;
-        case VoiceRenderClass::ReleaseLoop:
-            RenderQuietLoopGroupsAVX2<QuietRelease>(c, handles, count, sumL,
-                                                    sumR);
+        case Cls::SustainedOneShot:
+            RenderQuietGroupsAVX2<QuietSustained, false>(c, handles, count,
+                                                         sumL, sumR);
             break;
-        case VoiceRenderClass::TransientLoop:
-            RenderQuietLoopGroupsAVX2<QuietDecay>(c, handles, count, sumL,
-                                                  sumR);
+        case Cls::ReleaseLoop:
+            RenderQuietGroupsAVX2<QuietRelease, true>(c, handles, count,
+                                                      sumL, sumR);
+            break;
+        case Cls::ReleaseOneShot:
+            RenderQuietGroupsAVX2<QuietRelease, false>(c, handles, count,
+                                                       sumL, sumR);
+            break;
+        case Cls::TransientLoop:
+            RenderQuietGroupsAVX2<QuietDecay, true>(c, handles, count,
+                                                    sumL, sumR);
+            break;
+        case Cls::TransientOneShot:
+            RenderQuietGroupsAVX2<QuietDecay, false>(c, handles, count,
+                                                     sumL, sumR);
             break;
         default:
             break;

@@ -3820,6 +3820,7 @@ void DispatchLeanIdentityEvent(const svms::RenderEvent* events,
 }
 
 uint64_t g_leanKernelByClass[svms::kVoiceRenderClassCount] = {};
+uint64_t g_leanFiltered = 0u;
 
 void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
                            bool grow, LeanExclusion exclusion) {
@@ -3847,8 +3848,10 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
     cfg.panLaw = svms::PanLaw::ConstantPower;
     cfg.correctnessMode = true;
 
-    const uint32_t initialPool = grow ? 64u : pool;
-    const uint32_t seedCount = grow ? 48u : 32u;
+    // The grown pool also carries 24 one-shot seeds (48..71), eight of each
+    // lean one-shot class.
+    const uint32_t initialPool = grow ? 96u : pool;
+    const uint32_t seedCount = grow ? 72u : 32u;
     svms::ChannelCache seedChannels;
     seedChannels.SetMasterVolume(1.0f);
     seedChannels.RebuildCache(cfg, 44100.0f);
@@ -3887,7 +3890,7 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
         // Enough long release and decay voices that the lean kernel gets
         // groups of eight: of the later looping seeds, a third rings out
         // slowly and a third sits in a long decay stage.
-        for (uint32_t i = 9u; i < seedCount; ++i) {
+        for (uint32_t i = 9u; i < (std::min)(seedCount, 48u); ++i) {
             if (i % 4u == 1u || i % 8u == 5u) continue;  // one-shot seeds
             const uint32_t h = seedVoices->activeList_[i];
             if (i % 3u == 0u) {
@@ -3900,6 +3903,50 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
                 seedVoices->RefreshRenderClass(
                     static_cast<svms::VoiceHandle>(h));
             }
+        }
+    }
+    {
+        svms::VoiceSoA& sv = seedVoices->v;
+        // Sustained one-shots that reach their sample end inside a block
+        // (seed 1 after ~73 frames, seed 9 after ~93).
+        for (uint32_t i : {1u, 9u}) {
+            const uint32_t h = seedVoices->activeList_[i];
+            seedVoices->SetVoiceSample(h, 0u, 4096u, 64u, 4032u, 0u,
+                                       i == 1u ? 1.3f : 2.1f, 1u);
+            svms::phasefx::StoreFloat(sv, h, i == 1u ? 4000.3f : 3900.7f);
+            seedVoices->RefreshRenderClass(static_cast<svms::VoiceHandle>(h));
+        }
+        // One-shot seeds of the grown pool: sustained, releasing and in a
+        // long decay stage, in turn.
+        for (uint32_t i = 48u; i < seedCount; ++i) {
+            const uint32_t h = seedVoices->activeList_[i];
+            seedVoices->SetVoiceSample(h, 0u, 4096u, 64u, 4032u, 0u, 0.3f, 1u);
+            svms::phasefx::StoreFloat(
+                sv, h, static_cast<float>((i * 53u) % 1500u) + 0.625f);
+            const uint32_t kind = (i - 48u) % 3u;
+            sv.envelopeStage[h] = 3u;
+            if (kind == 1u) {
+                seedVoices->StartRelease(static_cast<svms::VoiceHandle>(h));
+            } else if (kind == 2u) {
+                sv.envelopeStage[h] = 2u;
+                sv.decaySamplesRemaining[h] = 4000u;
+                sv.decaySlope[h] = 0.9999f;
+                sv.sustainLevel[h] = sv.currentGain[h] * 0.5f;
+            }
+            seedVoices->RefreshRenderClass(static_cast<svms::VoiceHandle>(h));
+        }
+        // A low-pass on every other seed (loop and one-shot alike).
+        const svms::PreparedVoiceFilter lowPass = svms::PrepareVoiceLowPass(
+            static_cast<uint8_t>(svms::FilterType::LowPass2Pole), 7200, 0,
+            44100u);
+        for (uint32_t i = 0u; i < seedCount; i += 2u) {
+            const uint32_t h = seedVoices->activeList_[i];
+            sv.filterA0[h] = lowPass.a0;
+            sv.filterB1[h] = lowPass.b1;
+            sv.filterB2[h] = lowPass.b2;
+            sv.filterEnabled[h] = lowPass.enabled;
+            sv.filterZ1[h] = 0.0f;
+            sv.filterZ2[h] = 0.0f;
         }
     }
     auto offVoices = std::make_unique<svms::VoiceManager>(*seedVoices);
@@ -4092,12 +4139,14 @@ void RunLeanVoicesIdentity(uint32_t threads, uint32_t frames, uint32_t pool,
         for (uint32_t c = 0u; c < svms::kVoiceRenderClassCount; ++c)
             g_leanKernelByClass[c] += on.GetLeanKernelVoicesByClass(
                 static_cast<svms::VoiceRenderClass>(c));
+        g_leanFiltered += on.GetLeanFilteredVoices();
     }
 }
 
 void TestLeanVoicesIdentity() {
     if (!svms::IsRenderBackendSupported(svms::RenderBackend::AVX2)) return;
     for (uint64_t& count : g_leanKernelByClass) count = 0u;
+    g_leanFiltered = 0u;
     for (uint32_t threads : {1u, 4u}) {
         for (uint32_t frames : {8u, 16u, 64u, 2048u}) {
             RunLeanVoicesIdentity(threads, frames, 37u, false,
@@ -4107,13 +4156,17 @@ void TestLeanVoicesIdentity() {
         }
     }
     using Cls = svms::VoiceRenderClass;
-    for (Cls cls : {Cls::SustainedLoop, Cls::ReleaseLoop, Cls::TransientLoop}) {
+    for (Cls cls : {Cls::SustainedLoop, Cls::ReleaseLoop, Cls::TransientLoop,
+                    Cls::SustainedOneShot, Cls::ReleaseOneShot,
+                    Cls::TransientOneShot}) {
         if (g_leanKernelByClass[static_cast<uint32_t>(cls)] == 0u)
             std::fprintf(stderr, "[LEAN] class %u never took the lean kernel\n",
                          static_cast<uint32_t>(cls));
         Check(g_leanKernelByClass[static_cast<uint32_t>(cls)] > 0u,
               "lean identity: every lean class took the lean kernel");
     }
+    Check(g_leanFiltered > 0u,
+          "lean identity: filtered voices took the lean kernel");
     for (LeanExclusion exclusion : {LeanExclusion::Bus,
                                     LeanExclusion::Rotation,
                                     LeanExclusion::Decimation}) {
