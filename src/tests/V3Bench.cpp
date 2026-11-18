@@ -372,7 +372,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         }
     }
     return options.voices >= 1u && options.voices <= svms::kMaxPolyphony &&
-           options.frames >= 16u && options.frames <= 8192u &&
+           options.frames >= 8u && options.frames <= 8192u &&
            options.noteLengthFrames <= options.frames && options.seconds > 0u;
 }
 
@@ -798,7 +798,7 @@ int main(int argc, char** argv) {
     Options options;
     if (!ParseOptions(argc, argv, options)) {
         std::fprintf(stderr,
-            "usage: svms_v3_bench [--voices 1..524288] [--frames 16..8192] "
+            "usage: svms_v3_bench [--voices 1..524288] [--frames 8..8192] "
             "[--seconds N] [--warmup N] [--workload sustained|envelope|release|steal|dense|mixed-events|note-burst|chopped-notes] "
             "[--event-stride N] [--note-rate N] [--key-count 1..128] [--base-note 0..127] [--key-stride 1..127] [--attack-frames N] [--note-length-frames N] [--cc-rate N] [--cc-controller 0..127] [--generic-voices N] [--soundfont PATH] "
             "[--render-threads 1..64] "
