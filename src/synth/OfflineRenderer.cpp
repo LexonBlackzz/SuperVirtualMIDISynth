@@ -7,6 +7,7 @@
 #include <locale>
 #endif
 #include "events/MidiStream.h"
+#include "events/MidiChunkStore.h"
 #include "synth/SoundFont.h"
 #include "synth/VoiceManager.h"
 #include "synth/ChannelCache.h"
@@ -1303,6 +1304,19 @@ std::wstring MakeStemDir(const std::wstring& out, const std::wstring& midi) {
     return make(path) ? path + L"/" : L"";
 }
 
+// Opens the MIDI; a compressed or archived one gets one line saying how long
+// it took and what it keeps in memory.
+bool OpenMidiFile(svms::MappedMidiFile& midi, const std::wstring& path, std::string& error) {
+    const auto start = std::chrono::steady_clock::now();
+    if (!midi.Open(path.c_str(), error)) return false;
+    if (const svms::MidiChunkStore* store = midi.Store()) {
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        std::fprintf(stderr, "loaded %s MIDI in %.1f s: %.0f MB in memory for %.0f MB of MIDI\n",
+                     midi.Format(), seconds, store->StoredBytes() / 1e6, store->MidiBytes() / 1e6);
+    }
+    return true;
+}
+
 // Stem rendering: finds the note-bearing tracks, renders each in its own synth
 // instance (up to --render-threads at once, the threads split between them),
 // then writes per-track WAVs, a merged sum, or both.
@@ -1313,7 +1327,7 @@ int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
     std::vector<uint32_t> tracks;
     {
         MappedMidiFile midi;
-        if (!midi.Open(o.midi.c_str(), error) ||
+        if (!OpenMidiFile(midi, o.midi, error) ||
             !ParallelMidiDecoder::NoteTracks(midi, tracks, error)) {
             MachineStatus(o, "ERROR", error);
             std::fprintf(stderr, "error: %s\n", error.c_str());
@@ -1473,7 +1487,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
     };
 
     MappedMidiFile midi;
-    if (!midi.Open(o.midi.c_str(), error)) return fail(error);
+    if (!OpenMidiFile(midi, o.midi, error)) return fail(error);
 
     MidiStreamDecoder decoder;
     MidiStreamInfo info;

@@ -275,7 +275,8 @@ void OfflineRendererPage::EnsureInitialPaths(const ConfigDocument& document) {
 
 void OfflineRendererPage::BrowseMidi(HWND owner) {
     static const wchar_t filter[] =
-        L"MIDI files (*.mid;*.midi)\0*.mid;*.midi\0All files (*.*)\0*.*\0\0";
+        L"MIDI files (*.mid;*.midi;*.xz;*.gz;*.zst;*.zip;*.7z)\0*.mid;*.midi;*.xz;*.gz;*.zst;*.zip;*.7z\0"
+        L"All files (*.*)\0*.*\0\0";
     std::wstring selected = midiPath_;
     if (!BrowseOpenFile(owner, L"Select MIDI file", filter,
                         lastMidiDirectory_, selected)) return;

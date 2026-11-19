@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-19 `feat(v3): load line, file pickers and credits for compressed MIDIs` - the offline renderer prints how long a compressed MIDI took to load and how much memory its tracks keep; the Configurator's offline page and the player list .xz/.gz/.zst/.zip/.7z files; the README credits the decoders. DYHTM .mid.xz.xz decodes to the same events as the plain file.
 - 2026-11-19 `perf(v3): chunk store blocks start small and grow` - every shard took a 16 MB block on its first chunk, so any store cost at least 1 GB of commit (PNC3 notes-only, 45 MB of chunks, peaked at 1.19 GB). Blocks now grow from 64 KB to 4 MB per shard: PNC3 peaks at 180 MB, Shinki's Demise .7z (17 GB of MIDI) at 3.8 GB instead of 4.2 GB.
 - 2026-11-19 `feat(v3): open MIDIs inside .7z archives without extracting them` - the chosen entry is decoded straight from its folder's packed stream (LZMA2, LZMA or Copy) through a dictionary capped at the folder's size; in a solid archive the files before it are decoded and dropped. "When ooo 000 isn't home full" (solid, the 9.4 GB MIDI second) loads in 8.9 s and keeps 492 MB. Other 7z methods, and encrypted archives, give a clear error.
 - 2026-11-19 `feat(v3): open MIDIs inside .zip archives` - the largest entry named .mid/.midi (or .mid.xz and friends) is inflated as it is read, never extracted; without such a name, the largest entry that starts like a MIDI or a compressed stream. CRC and size are checked at the end of the entry.

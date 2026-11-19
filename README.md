@@ -23,6 +23,8 @@ binary releases yet. Build it from source.
 - Live SoundFont switching and priority-ordered SoundFont stacks
 - Live post-DSP recording to 32-bit float WAV/RF64
 - Offline MIDI-to-WAV renderer (GUI page and command line)
+- Opens compressed MIDIs directly (.xz, .gz, .zst, nested, and MIDIs inside .zip
+  and .7z archives) without extracting them; repeated track data is stored once
 - Configurator with live controls, diagnostics and profile import/export
 - WASAPI output (ASIO optional), Windows x64/x86/XP and Linux x86-64
 
@@ -155,6 +157,10 @@ Earlier generations live on separate branches: `v1` (TinySoundFont) and `v2`
   offline modes were measured against. The v1 branch was built on
   TinySoundFont (Bernhard Schelling); v3 does not use it.
 - Dear ImGui (Omar Cornut and contributors) and nlohmann/json (Niels Lohmann).
+- Compressed MIDIs are decoded with the LZMA SDK (Igor Pavlov, public domain),
+  miniz (Rich Geldreich and contributors, MIT) and zstd (Meta Platforms, BSD).
+  Keeping MIDI data as deduplicated chunks follows the approach of Kimrashi's
+  fast MIDI player; no Kimrashi code is used here.
 - Everyone who tested the software and sent suggestions.
 
 ## License

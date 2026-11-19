@@ -446,7 +446,7 @@ void RunGuiMode(PlayerCore& core, const EngineSpec& startupEngine,
             ofn.lStructSize = sizeof(ofn);
             ofn.hwndOwner = host.Hwnd();
             ofn.lpstrFilter =
-                L"MIDI files (*.mid;*.midi)\0*.mid;*.midi\0"
+                L"MIDI files (*.mid;*.midi;*.xz;*.gz;*.zst;*.zip;*.7z)\0*.mid;*.midi;*.xz;*.gz;*.zst;*.zip;*.7z\0"
                 L"All files (*.*)\0*.*\0";
             ofn.lpstrFile = midiPath;
             ofn.nMaxFile = MAX_PATH;
