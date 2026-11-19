@@ -66,6 +66,7 @@ public:
     }
 
     uint64_t StoredBytes() const;     // distinct chunk bytes
+    uint64_t ArenaBytes() const;      // bytes allocated to hold them
     uint64_t MidiBytes() const { return midiBytes_; }   // bytes read from the stream
     uint32_t WorkersUsed() const { return workersUsed_; }
 
@@ -80,6 +81,7 @@ private:
         std::vector<std::unique_ptr<uint8_t[]>> blocks;
         uint8_t* smallBlock = nullptr;    // current block for chunks up to 1 MB
         size_t smallUsed = 0, smallSize = 0;
+        uint64_t arena = 0;
         uint64_t bytes = 0;
     };
     friend class MidiTrackChunker;

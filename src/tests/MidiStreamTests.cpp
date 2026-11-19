@@ -5,6 +5,7 @@
 #include "tests/MidiArchiveFixtures.h"
 #if defined(_WIN32)
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <codecvt>
 #include <locale>
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -244,6 +246,26 @@ bool TestStoreDedupsIdenticalTracks() {
     if (!ok) std::printf("FAIL dedup %s\n", error.c_str());
     return ok;
 }
+bool TestStoreArenaFitsSmallMidi() {
+    // A small MIDI must not pay for 64 shards of full-size blocks.
+    const std::wstring path = TempPath(L"store_arena.mid");
+    if (!WriteBytes(path, BuildArchiveTestMidi(3, 1, 200))) return false;
+    svms::MidiChunkParams defaults;
+    svms::MappedMidiFile file; std::string error;
+    bool ok = file.Open(path.c_str(), error, &defaults) && file.Store();
+    if (ok) {
+        const uint64_t stored = file.Store()->StoredBytes(), arena = file.Store()->ArenaBytes();
+        if (arena > stored * 2 + (4u << 20)) {
+            std::printf("FAIL arena: %llu bytes allocated for %llu stored\n",
+                        (unsigned long long)arena, (unsigned long long)stored);
+            ok = false;
+        }
+    }
+    file.Close();
+    RemoveFile(path);
+    if (!ok) std::printf("FAIL arena %s\n", error.c_str());
+    return ok;
+}
 bool TestStoreSysExIsOneChunk() {
     const std::wstring path = TempPath(L"store_c.mid");
     if (!WriteBytes(path, BuildArchiveTestMidi())) return false;
@@ -426,6 +448,7 @@ int RunStoreTests() {
     if (!TestStoreSysExIsOneChunk()) return 22;
     if (!TestForcedStoreErrorsMatch()) return 23;
     if (!TestParallelStoreMatchesSerial()) return 24;
+    if (!TestStoreArenaFitsSmallMidi()) return 25;
     if (!TestXzLayer()) return 30;
     if (!TestXzNested()) return 31;
     if (!TestXzSplitStreams()) return 32;
@@ -453,7 +476,32 @@ int RunStoreTests() {
 }
 // Fixture source for the compressed-file tests: the archive fixtures are this
 // output (and WriteFixture's) compressed by xz, gzip, zstd and 7-Zip.
-int WriteFixtureMode(const std::wstring& mode, const std::wstring& path) {
+double PeakCommitMb() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)))
+        return counters.PeakPagefileUsage / 1e6;
+    return 0.0;
+#else
+    FILE* f = fopen("/proc/self/status", "r");
+    double kb = 0.0;
+    char line[256];
+    while (f && fgets(line, sizeof(line), f))
+        if (std::strncmp(line, "VmPeak:", 7) == 0) kb = std::atof(line + 7);
+    if (f) fclose(f);
+    return kb / 1000.0;
+#endif
+}
+struct EventHash { uint64_t h = 1469598103934665603ull; };
+bool HashEvent(const svms::PackedMidiEvent& e, void* user) {
+    uint64_t& h = static_cast<EventHash*>(user)->h;
+    const uint64_t words[3] = {e.outputFrame, e.sequence, e.message};
+    for (uint64_t w : words)
+        for (int i = 0; i < 8; ++i) { h ^= (w >> (8 * i)) & 0xff; h *= 1099511628211ull; }
+    return true;
+}
+int WriteFixtureMode(const std::wstring& mode, const std::wstring& path, bool forceStore = false) {
     if (mode == L"--write-archive-midi") return WriteBytes(path, BuildArchiveTestMidi(3, 1, 200)) ? 0 : 1;
     if (mode == L"--write-small-midi") return WriteFixture(path.c_str()) ? 0 : 1;
     if (mode == L"--probe-decode") {   // decompression alone, output dropped
@@ -469,27 +517,51 @@ int WriteFixtureMode(const std::wstring& mode, const std::wstring& path) {
         std::printf("format=%s decode_s=%.2f out_mb=%.1f\n", format.c_str(), s, total / 1e6);
         return 0;
     }
-    if (mode == L"--probe") {
+    if (mode == L"--probe" || mode == L"--probe-load") {
+        // Load time, memory, then (--probe) a hash of every decoded event.
+        // --force-store reads a plain MIDI through the store too.
         const auto t0 = std::chrono::steady_clock::now();
         svms::MappedMidiFile file; std::string error;
-        if (!file.Open(path.c_str(), error)) { std::printf("error: %s\n", error.c_str()); return 1; }
+        svms::MidiChunkParams params;
+        if (!file.Open(path.c_str(), error, forceStore ? &params : nullptr)) {
+            std::printf("error: %s\n", error.c_str()); return 1;
+        }
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const svms::MidiChunkStore* st = file.Store();
-        std::printf("format=%s load_s=%.2f store_mb=%.1f midi_mb=%.1f\n", file.Format(), s,
-                    st ? st->StoredBytes() / 1e6 : 0.0, st ? st->MidiBytes() / 1e6 : file.Size() / 1e6);
+        std::printf("format=%s load_s=%.2f store_mb=%.1f arena_mb=%.1f midi_mb=%.1f peak_commit_mb=%.1f\n", file.Format(), s,
+                    st ? st->StoredBytes() / 1e6 : 0.0, st ? st->ArenaBytes() / 1e6 : 0.0,
+                    st ? st->MidiBytes() / 1e6 : file.Size() / 1e6,
+                    PeakCommitMb());
+        std::fflush(stdout);
+        if (mode == L"--probe-load") return 0;
+        const auto t1 = std::chrono::steady_clock::now();
+        svms::ParallelMidiDecoder decoder;
+        svms::MidiStreamInfo info{};
+        EventHash hash;
+        std::atomic<bool> cancel{false};
+        if (!decoder.Decode(file, 48000, HashEvent, &hash, &cancel, &info, error, nullptr, nullptr, 16)) {
+            std::printf("error: %s\n", error.c_str()); return 1;
+        }
+        const double d = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        std::printf("events=%llu note_ons=%llu frames=%llu tracks=%u decode_s=%.2f hash=%016llx\n",
+                    (unsigned long long)info.eventCount, (unsigned long long)info.noteOnCount,
+                    (unsigned long long)info.totalFrames, unsigned(info.tracks), d,
+                    (unsigned long long)hash.h);
         return 0;
     }
     return -1;
 }
 #if defined(_WIN32)
 int wmain(int argc, wchar_t** argv) {
-    if (argc == 3) return WriteFixtureMode(argv[1], argv[2]);
+    if (argc >= 3)
+        return WriteFixtureMode(argv[1], argv[2], argc > 3 && std::wstring(argv[3]) == L"--force-store");
     wchar_t dir[MAX_PATH],path[MAX_PATH];GetTempPathW(MAX_PATH,dir);GetTempFileNameW(dir,L"svm",0,path);
 #else
 int main(int argc, char** argv) {
-    if (argc == 3) {
+    if (argc >= 3) {
         std::wstring_convert<std::codecvt_utf8<wchar_t>> args;
-        return WriteFixtureMode(args.from_bytes(argv[1]), args.from_bytes(argv[2]));
+        return WriteFixtureMode(args.from_bytes(argv[1]), args.from_bytes(argv[2]),
+                                argc > 3 && std::string(argv[3]) == "--force-store");
     }
     char temporary[] = "/tmp/svms-midi-stream-XXXXXX";
     const int descriptor = mkstemp(temporary);
