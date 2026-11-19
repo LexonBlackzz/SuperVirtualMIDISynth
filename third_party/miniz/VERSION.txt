@@ -1,0 +1,4 @@
+miniz 3.0.2 (amalgamated miniz.c / miniz.h from the release zip).
+Downloaded from https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip
+SHA-256 of the archive: ada38db0b703a56d3dd6d57bf84a9c5d664921d870d8fea4db153979fb5332c5
+Unchanged; built with MINIZ_NO_ZLIB_COMPATIBLE_NAMES and MINIZ_NO_ARCHIVE_WRITING_APIS.

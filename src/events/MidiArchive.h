@@ -46,5 +46,29 @@ private:
     std::unique_ptr<State> state_;
 };
 
+// .gz: one or more members; CRC32 and length of each are checked.
+class GzipSource : public ByteSource {
+public:
+    explicit GzipSource(std::unique_ptr<ByteSource> in);
+    ~GzipSource() override;
+    bool Read(uint8_t* dst, size_t want, size_t& got, std::string& error) override;
+private:
+    struct State;
+    std::unique_ptr<ByteSource> in_;
+    std::unique_ptr<State> state_;
+};
+
+// .zst: one or more frames, long-distance windows included.
+class ZstdSource : public ByteSource {
+public:
+    explicit ZstdSource(std::unique_ptr<ByteSource> in);
+    ~ZstdSource() override;
+    bool Read(uint8_t* dst, size_t want, size_t& got, std::string& error) override;
+private:
+    struct State;
+    std::unique_ptr<ByteSource> in_;
+    std::unique_ptr<State> state_;
+};
+
 } // namespace svms
 #endif

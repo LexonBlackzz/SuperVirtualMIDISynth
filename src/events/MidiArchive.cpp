@@ -10,6 +10,8 @@ extern "C" {
 #include "lzma/Xz.h"
 #include "lzma/XzCrc64.h"
 }
+#include "miniz/miniz.h"
+#include "zstd/zstd.h"
 
 namespace svms {
 
@@ -113,6 +115,156 @@ bool XzSource::Read(uint8_t* dst, size_t want, size_t& got, std::string& error) 
     return true;
 }
 
+// ---- buffered input shared by the gzip and zstd sources ------------------------
+
+namespace {
+struct InputBuffer {
+    std::vector<uint8_t> data = std::vector<uint8_t>(1u << 16);
+    size_t pos = 0, len = 0;
+    bool end = false;
+    bool Refill(ByteSource& in, std::string& error) {
+        if (pos < len || end) return true;
+        size_t n = 0;
+        if (!in.Read(data.data(), data.size(), n, error)) return false;
+        pos = 0; len = n; end = n == 0;
+        return true;
+    }
+    // One byte; false at the end of the stream (or on a read error: see error).
+    bool Byte(ByteSource& in, uint8_t& b, std::string& error) {
+        if (!Refill(in, error) || pos == len) return false;
+        b = data[pos++];
+        return true;
+    }
+};
+} // namespace
+
+// ---- GzipSource --------------------------------------------------------------
+
+struct GzipSource::State {
+    InputBuffer in;
+    mz_stream z{};
+    bool zOpen = false, finished = false, inMember = false;
+    uint32_t crc = 0, size = 0;
+    unsigned members = 0;
+};
+
+GzipSource::GzipSource(std::unique_ptr<ByteSource> in) : in_(std::move(in)), state_(new State()) {}
+GzipSource::~GzipSource() { if (state_->zOpen) mz_inflateEnd(&state_->z); }
+
+bool GzipSource::Read(uint8_t* dst, size_t want, size_t& got, std::string& error) {
+    State& s = *state_;
+    got = 0;
+    auto corrupt = [&] {
+        if (error.empty()) error = "gzip data is truncated or corrupt";
+        return false;
+    };
+    while (got == 0 && want && !s.finished) {
+        if (!s.inMember) {
+            // Member header (RFC 1952). After the first member, the end of the
+            // stream or bytes that are not another member end the data.
+            uint8_t h[10];
+            size_t n = 0;
+            while (n < 10 && s.in.Byte(*in_, h[n], error)) ++n;
+            if (!error.empty()) return false;
+            if (s.members > 0 && (n == 0 || (n >= 2 && (h[0] != 0x1f || h[1] != 0x8b)))) {
+                s.finished = true;
+                break;
+            }
+            if (n < 10 || h[0] != 0x1f || h[1] != 0x8b || h[2] != 8) return corrupt();
+            const uint8_t flags = h[3];
+            uint8_t b = 0;
+            if (flags & 4) {   // FEXTRA
+                uint8_t lo = 0, hi = 0;
+                if (!s.in.Byte(*in_, lo, error) || !s.in.Byte(*in_, hi, error)) return corrupt();
+                for (unsigned k = 0, x = lo | (hi << 8); k < x; ++k)
+                    if (!s.in.Byte(*in_, b, error)) return corrupt();
+            }
+            for (unsigned bit : {8u, 16u}) {   // FNAME, FCOMMENT: zero-terminated
+                if (!(flags & bit)) continue;
+                do { if (!s.in.Byte(*in_, b, error)) return corrupt(); } while (b != 0);
+            }
+            if (flags & 2) {   // FHCRC
+                if (!s.in.Byte(*in_, b, error) || !s.in.Byte(*in_, b, error)) return corrupt();
+            }
+            s.z = mz_stream{};
+            if (mz_inflateInit2(&s.z, -MZ_DEFAULT_WINDOW_BITS) != MZ_OK) return corrupt();
+            s.zOpen = true;
+            s.inMember = true;
+            s.crc = 0; s.size = 0;
+            ++s.members;
+        }
+        if (!s.in.Refill(*in_, error)) return false;
+        s.z.next_in = s.in.data.data() + s.in.pos;
+        s.z.avail_in = static_cast<unsigned>(s.in.len - s.in.pos);
+        s.z.next_out = dst;
+        s.z.avail_out = static_cast<unsigned>((std::min<size_t>)(want, 1u << 30));
+        const int r = mz_inflate(&s.z, MZ_NO_FLUSH);
+        const size_t used = (s.in.len - s.in.pos) - s.z.avail_in;
+        s.in.pos += used;
+        got = static_cast<size_t>(s.z.next_out - dst);
+        s.crc = static_cast<uint32_t>(mz_crc32(s.crc, dst, got));
+        s.size += static_cast<uint32_t>(got);
+        if (r == MZ_STREAM_END) {
+            mz_inflateEnd(&s.z);
+            s.zOpen = false;
+            uint8_t t[8];
+            for (size_t k = 0; k < 8; ++k)
+                if (!s.in.Byte(*in_, t[k], error)) return corrupt();
+            const uint32_t crc = t[0] | (t[1] << 8) | (t[2] << 16) | (uint32_t(t[3]) << 24);
+            const uint32_t size = t[4] | (t[5] << 8) | (t[6] << 16) | (uint32_t(t[7]) << 24);
+            if (crc != s.crc || size != s.size) return corrupt();
+            s.inMember = false;
+        } else if (r != MZ_OK && r != MZ_BUF_ERROR) {
+            return corrupt();
+        } else if (got == 0 && used == 0 && s.in.end) {
+            return corrupt();   // the stream ended inside a member
+        }
+    }
+    return true;
+}
+
+// ---- ZstdSource --------------------------------------------------------------
+
+struct ZstdSource::State {
+    InputBuffer in;
+    ZSTD_DCtx* ctx = nullptr;
+    size_t last = 0;   // 0 = the last frame is complete
+    bool finished = false, any = false;
+};
+
+ZstdSource::ZstdSource(std::unique_ptr<ByteSource> in) : in_(std::move(in)), state_(new State()) {
+    state_->ctx = ZSTD_createDCtx();
+    if (state_->ctx)
+        ZSTD_DCtx_setParameter(state_->ctx, ZSTD_d_windowLogMax, sizeof(void*) == 4 ? 30 : 31);
+}
+ZstdSource::~ZstdSource() { ZSTD_freeDCtx(state_->ctx); }
+
+bool ZstdSource::Read(uint8_t* dst, size_t want, size_t& got, std::string& error) {
+    State& s = *state_;
+    got = 0;
+    if (!s.ctx) { error = "out of memory while decoding zstd data"; return false; }
+    while (got == 0 && want && !s.finished) {
+        if (!s.in.Refill(*in_, error)) return false;
+        ZSTD_inBuffer input = {s.in.data.data(), s.in.len, s.in.pos};
+        ZSTD_outBuffer output = {dst, want, 0};
+        const size_t r = ZSTD_decompressStream(s.ctx, &output, &input);
+        if (ZSTD_isError(r)) {
+            error = std::string("zstd data is corrupt: ") + ZSTD_getErrorName(r);
+            return false;
+        }
+        const bool progress = input.pos != s.in.pos || output.pos != 0;
+        s.in.pos = input.pos;
+        got = output.pos;
+        s.last = r;
+        s.any = true;
+        if (!progress && s.in.end) {
+            if (s.last != 0) { error = "zstd data is truncated"; return false; }
+            s.finished = true;
+        }
+    }
+    return true;
+}
+
 // ---- layers ------------------------------------------------------------------
 
 std::unique_ptr<ByteSource> OpenMidiLayers(const wchar_t* path, std::string& format,
@@ -143,6 +295,8 @@ std::unique_ptr<ByteSource> OpenMidiLayers(const wchar_t* path, std::string& for
         const char* name = "";
         switch (layer) {
         case MidiLayer::Xz: next.reset(new XzSource(std::move(top))); name = "xz"; break;
+        case MidiLayer::Gzip: next.reset(new GzipSource(std::move(top))); name = "gzip"; break;
+        case MidiLayer::Zstd: next.reset(new ZstdSource(std::move(top))); name = "zstd"; break;
         default:
             error = "unsupported compression format";
             return nullptr;

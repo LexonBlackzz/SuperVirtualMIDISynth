@@ -1,0 +1,5 @@
+zstd 1.5.7: the single-file decoder, generated with build/single_file_libs/combine.py
+(as create_single_file_decoder.sh does) from the release tarball, plus zstd.h and zstd_errors.h.
+Downloaded from https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+SHA-256 of the archive: eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+Used under the BSD licence (LICENSE).

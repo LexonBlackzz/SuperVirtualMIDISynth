@@ -376,6 +376,13 @@ bool TestUnknownStaysPlain() {
     return true;
 }
 
+bool TestGzipLayer() { return ExpectFixtureDecodes(Bytes(kFixtureGz), L"a.mid.gz", "gzip", FixtureMidi()); }
+bool TestZstdLayer() { return ExpectFixtureDecodes(Bytes(kFixtureZst), L"a.mid.zst", "zstd", FixtureMidi()); }
+bool TestGzipBadCrc() { return ExpectOpenFails(Bytes(kFixtureGzBadCrc), L"badcrc.gz", "gzip crc"); }
+bool TestMixedNesting() {
+    return ExpectFixtureDecodes(Bytes(kFixtureXzGz), L"a.mid.xz.gz", "gzip+xz", FixtureMidi());
+}
+
 int RunStoreTests() {
     if (!TestForcedStoreMatchesMapped()) return 20;
     if (!TestStoreDedupsIdenticalTracks()) return 21;
@@ -388,6 +395,10 @@ int RunStoreTests() {
     if (!TestXzTruncated()) return 33;
     if (!TestRarRejected()) return 34;
     if (!TestUnknownStaysPlain()) return 35;
+    if (!TestGzipLayer()) return 40;
+    if (!TestZstdLayer()) return 41;
+    if (!TestGzipBadCrc()) return 42;
+    if (!TestMixedNesting()) return 43;
     return 0;
 }
 }

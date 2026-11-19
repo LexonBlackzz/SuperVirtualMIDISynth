@@ -11,9 +11,13 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 # whatever compiles events/MidiStream.cpp needs them, and the linker drops
 # them from the rest.
 set(SVMS_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party")
-file(GLOB SVMS_LZMA_SOURCES "${SVMS_THIRD_PARTY_DIR}/lzma/*.c")
-add_library(svms_midi_codecs STATIC ${SVMS_LZMA_SOURCES})
-target_compile_definitions(svms_midi_codecs PUBLIC Z7_ST)
+file(GLOB SVMS_CODEC_SOURCES
+    "${SVMS_THIRD_PARTY_DIR}/lzma/*.c"
+    "${SVMS_THIRD_PARTY_DIR}/miniz/*.c"
+    "${SVMS_THIRD_PARTY_DIR}/zstd/*.c")
+add_library(svms_midi_codecs STATIC ${SVMS_CODEC_SOURCES})
+target_compile_definitions(svms_midi_codecs PUBLIC
+    Z7_ST MINIZ_NO_ZLIB_COMPATIBLE_NAMES MINIZ_NO_ARCHIVE_WRITING_APIS)
 target_include_directories(svms_midi_codecs PUBLIC "${SVMS_THIRD_PARTY_DIR}")
 set_target_properties(svms_midi_codecs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 link_libraries(svms_midi_codecs)
