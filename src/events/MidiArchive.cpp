@@ -15,9 +15,15 @@
 #include <cstring>
 #include <vector>
 
+#include <limits>
+#include <new>
+
 extern "C" {
+#include "lzma/7z.h"
 #include "lzma/7zCrc.h"
 #include "lzma/Alloc.h"
+#include "lzma/Lzma2Dec.h"
+#include "lzma/LzmaDec.h"
 #include "lzma/Xz.h"
 #include "lzma/XzCrc64.h"
 }
@@ -475,6 +481,236 @@ std::unique_ptr<ByteSource> OpenZipEntry(const wchar_t* path, std::string& entry
         return std::unique_ptr<ByteSource>(std::move(src));
     });
 }
+// ---- 7z ----------------------------------------------------------------------
+
+struct SeekStream {
+    ISeekInStream vt;
+    const RandomFile* file;
+    uint64_t pos;
+};
+SRes SeekStreamRead(ISeekInStreamPtr pp, void* buf, size_t* size) {
+    SeekStream* s = reinterpret_cast<SeekStream*>(const_cast<ISeekInStream*>(pp));
+    *size = s->file->ReadAt(s->pos, buf, *size);
+    s->pos += *size;
+    return SZ_OK;
+}
+SRes SeekStreamSeek(ISeekInStreamPtr pp, Int64* pos, ESzSeek origin) {
+    SeekStream* s = reinterpret_cast<SeekStream*>(const_cast<ISeekInStream*>(pp));
+    const int64_t base = origin == SZ_SEEK_SET ? 0
+                       : origin == SZ_SEEK_CUR ? static_cast<int64_t>(s->pos)
+                       : static_cast<int64_t>(s->file->Size());
+    const int64_t target = base + *pos;
+    if (target < 0) return SZ_ERROR_PARAM;
+    s->pos = static_cast<uint64_t>(target);
+    *pos = target;
+    return SZ_OK;
+}
+
+std::string Utf16ToAscii(const UInt16* p, size_t n) {
+    std::string out;
+    for (size_t i = 0; i < n && p[i]; ++i) out.push_back(p[i] < 128 ? char(p[i]) : '?');
+    return out;
+}
+
+// One 7z entry, decoded as it is read: the folder's packed stream goes
+// through LZMA2, LZMA or Copy into a dictionary capped at the folder's size,
+// output before the entry (solid archives) is decoded and dropped, and the
+// entry's CRC is checked at its end. Nothing is extracted whole.
+class SevenZipEntrySource : public ByteSource {
+public:
+    SevenZipEntrySource() {
+        SzArEx_Init(&db_);
+        Lzma2Dec_Construct(&lzma2_);
+        LzmaDec_Construct(&lzma_);
+    }
+    ~SevenZipEntrySource() override {
+        if (method_ == kLzma2) { lzma2_.decoder.dic = nullptr; Lzma2Dec_FreeProbs(&lzma2_, &g_Alloc); }
+        if (method_ == kLzma) { lzma_.dic = nullptr; LzmaDec_FreeProbs(&lzma_, &g_Alloc); }
+        SzArEx_Free(&db_, &g_Alloc);
+    }
+    bool Open(const wchar_t* path, std::string& error) {
+        InitCrcTables();
+        if (!file_.Open(path)) { error = "cannot open MIDI file"; return false; }
+        seek_.vt.Read = SeekStreamRead;
+        seek_.vt.Seek = SeekStreamSeek;
+        seek_.file = &file_;
+        seek_.pos = 0;
+        lookBuf_.resize(1u << 18);
+        LookToRead2_CreateVTable(&look_, False);
+        look_.buf = lookBuf_.data();
+        look_.bufSize = lookBuf_.size();
+        look_.realStream = &seek_.vt;
+        LookToRead2_INIT(&look_);
+        const SRes res = SzArEx_Open(&db_, &look_.vt, &g_Alloc, &g_Alloc);
+        if (res != SZ_OK) {
+            error = res == SZ_ERROR_UNSUPPORTED ? "7z archive uses an unsupported feature (encrypted headers?)"
+                  : res == SZ_ERROR_MEM ? "out of memory while reading the 7z archive"
+                  : "7z archive is truncated or corrupt";
+            return false;
+        }
+        return true;
+    }
+    std::vector<std::pair<std::string, uint64_t>> Entries() const {
+        std::vector<std::pair<std::string, uint64_t>> out;
+        std::vector<UInt16> name;
+        for (UInt32 i = 0; i < db_.NumFiles; ++i) {
+            if (SzArEx_IsDir(&db_, i)) { out.push_back({std::string(), 0}); continue; }
+            name.resize(SzArEx_GetFileNameUtf16(&db_, i, nullptr) + 1);
+            SzArEx_GetFileNameUtf16(&db_, i, name.data());
+            out.push_back({Utf16ToAscii(name.data(), name.size()), SzArEx_GetFileSize(&db_, i)});
+        }
+        return out;
+    }
+    bool Select(UInt32 index, std::string& error) {
+        left_ = SzArEx_GetFileSize(&db_, index);
+        hasCrc_ = SzBitWithVals_Check(&db_.CRCs, index);
+        if (hasCrc_) expectCrc_ = db_.CRCs.Vals[index];
+        crc_ = CRC_INIT_VAL;
+        const UInt32 folder = db_.FileToFolder[index];
+        if (folder == static_cast<UInt32>(-1)) { method_ = kCopy; return true; }   // empty file
+        const Byte* coders = db_.db.CodersData + db_.db.FoCodersOffsets[folder];
+        CSzData sd = {coders, db_.db.FoCodersOffsets[folder + 1] - db_.db.FoCodersOffsets[folder]};
+        CSzFolder f;
+        if (SzGetNextFolderItem(&f, &sd) != SZ_OK) { error = "7z archive is truncated or corrupt"; return false; }
+        UInt32 bad = 0;
+        for (UInt32 c = 0; c < f.NumCoders; ++c) {
+            const UInt32 m = f.Coders[c].MethodID;
+            if (m != kCopy && m != kLzma && m != kLzma2) { bad = m; break; }
+        }
+        if (bad || f.NumCoders != 1 || f.NumPackStreams != 1) {
+            char text[96];
+            std::snprintf(text, sizeof(text), "7z method %X is not supported (LZMA, LZMA2 and Copy are)",
+                          unsigned(bad ? bad : f.Coders[0].MethodID));
+            error = text;
+            return false;
+        }
+        const CSzCoderInfo& coder = f.Coders[0];
+        const Byte* props = coders + coder.PropsOffset;
+        const UInt32 pack = db_.db.FoStartPackStreamIndex[folder];
+        packPos_ = db_.dataPos + db_.db.PackPositions[pack];
+        packLeft_ = db_.db.PackPositions[pack + 1] - db_.db.PackPositions[pack];
+        skip_ = db_.UnpackPositions[index] - db_.UnpackPositions[db_.FolderToFile[folder]];
+        const uint64_t folderSize = SzAr_GetFolderUnpackSize(&db_.db, folder);
+        uint64_t dict = 0;
+        if (coder.MethodID == kLzma2) {
+            if (coder.PropsSize != 1 || props[0] > 40) { error = "7z archive is truncated or corrupt"; return false; }
+            dict = props[0] == 40 ? 0xFFFFFFFFull : (uint64_t(2 | (props[0] & 1)) << (props[0] / 2 + 11));
+            if (Lzma2Dec_AllocateProbs(&lzma2_, props[0], &g_Alloc) != SZ_OK) return OutOfMemory(error);
+        } else if (coder.MethodID == kLzma) {
+            if (coder.PropsSize != 5) { error = "7z archive is truncated or corrupt"; return false; }
+            dict = props[1] | (props[2] << 8) | (props[3] << 16) | (uint64_t(props[4]) << 24);
+            if (LzmaDec_AllocateProbs(&lzma_, props, 5, &g_Alloc) != SZ_OK) return OutOfMemory(error);
+        }
+        method_ = coder.MethodID;
+        if (method_ != kCopy) {
+            const uint64_t cap = (std::max<uint64_t>)(4096, (std::min)(dict, folderSize));
+            if (cap > (std::numeric_limits<size_t>::max)() / 2) return OutOfMemory(error);
+            try { dic_.reset(new uint8_t[static_cast<size_t>(cap)]); }
+            catch (const std::bad_alloc&) { return OutOfMemory(error); }
+            if (method_ == kLzma2) {
+                lzma2_.decoder.dic = dic_.get();
+                lzma2_.decoder.dicBufSize = static_cast<SizeT>(cap);
+                Lzma2Dec_Init(&lzma2_);
+            } else {
+                lzma_.dic = dic_.get();
+                lzma_.dicBufSize = static_cast<SizeT>(cap);
+                LzmaDec_Init(&lzma_);
+            }
+        }
+        in_.resize(1u << 20);
+        return true;
+    }
+    bool Read(uint8_t* dst, size_t want, size_t& got, std::string& error) override {
+        got = 0;
+        std::vector<uint8_t> scratch;
+        while (got == 0 && want && left_ > 0) {
+            uint8_t* out = dst;
+            size_t room = static_cast<size_t>((std::min<uint64_t>)(want, left_));
+            if (skip_ > 0) {   // earlier files of a solid folder
+                if (scratch.empty()) scratch.resize(1u << 20);
+                out = scratch.data();
+                room = static_cast<size_t>((std::min<uint64_t>)(scratch.size(), skip_));
+            }
+            size_t made = 0;
+            if (!Decode(out, room, made, error)) return false;
+            if (skip_ > 0) { skip_ -= made; continue; }
+            crc_ = CrcUpdate(crc_, dst, made);
+            left_ -= made;
+            got = made;
+            if (left_ == 0 && hasCrc_ && CRC_GET_DIGEST(crc_) != expectCrc_) {
+                error = "7z entry failed its CRC check";
+                return false;
+            }
+        }
+        return true;
+    }
+private:
+    static constexpr UInt32 kCopy = 0, kLzma2 = 0x21, kLzma = 0x30101;
+    static bool OutOfMemory(std::string& error) {
+        error = "out of memory while decoding the 7z archive";
+        return false;
+    }
+    // Decodes up to `room` bytes of the folder's output.
+    bool Decode(uint8_t* out, size_t room, size_t& made, std::string& error) {
+        made = 0;
+        for (;;) {
+            if (inPos_ == inLen_ && packLeft_ > 0) {
+                const size_t ask = static_cast<size_t>((std::min<uint64_t>)(in_.size(), packLeft_));
+                inLen_ = file_.ReadAt(packPos_, in_.data(), ask);
+                inPos_ = 0;
+                if (inLen_ == 0) { error = "7z archive is truncated or corrupt"; return false; }
+                packPos_ += inLen_; packLeft_ -= inLen_;
+            }
+            if (method_ == kCopy) {
+                made = (std::min)(room, inLen_ - inPos_);
+                std::memcpy(out, in_.data() + inPos_, made);
+                inPos_ += made;
+            } else {
+                SizeT outLen = room, srcLen = inLen_ - inPos_;
+                ELzmaStatus status;
+                const SRes res = method_ == kLzma2
+                    ? Lzma2Dec_DecodeToBuf(&lzma2_, out, &outLen, in_.data() + inPos_, &srcLen, LZMA_FINISH_ANY, &status)
+                    : LzmaDec_DecodeToBuf(&lzma_, out, &outLen, in_.data() + inPos_, &srcLen, LZMA_FINISH_ANY, &status);
+                inPos_ += srcLen;
+                made = outLen;
+                if (res != SZ_OK) { error = "7z data is corrupt"; return false; }
+                if (made == 0 && status == LZMA_STATUS_FINISHED_WITH_MARK) {
+                    error = "7z data ends before the entry does"; return false;
+                }
+            }
+            if (made > 0) return true;
+            if (inPos_ == inLen_ && packLeft_ == 0) { error = "7z archive is truncated or corrupt"; return false; }
+        }
+    }
+
+    RandomFile file_;
+    SeekStream seek_{};
+    CLookToRead2 look_{};
+    std::vector<uint8_t> lookBuf_;
+    CSzArEx db_;
+    CLzma2Dec lzma2_;
+    CLzmaDec lzma_;
+    UInt32 method_ = 0xFFFFFFFFu;
+    std::unique_ptr<uint8_t[]> dic_;
+    std::vector<uint8_t> in_;
+    size_t inPos_ = 0, inLen_ = 0;
+    uint64_t packPos_ = 0, packLeft_ = 0, skip_ = 0, left_ = 0;
+    bool hasCrc_ = false;
+    UInt32 expectCrc_ = 0, crc_ = 0;
+};
+
+std::unique_ptr<ByteSource> OpenSevenZipEntry(const wchar_t* path, std::string& entryName,
+                                              std::string& error) {
+    std::unique_ptr<SevenZipEntrySource> probe(new SevenZipEntrySource());
+    if (!probe->Open(path, error)) return nullptr;
+    const auto entries = probe->Entries();
+    probe.reset();
+    return PickAndOpen(entries, entryName, error, [&](size_t i, std::string& err) {
+        std::unique_ptr<SevenZipEntrySource> src(new SevenZipEntrySource());
+        if (!src->Open(path, err) || !src->Select(static_cast<UInt32>(i), err)) return std::unique_ptr<ByteSource>();
+        return std::unique_ptr<ByteSource>(std::move(src));
+    });
+}
 } // namespace
 
 // ---- layers ------------------------------------------------------------------
@@ -502,12 +738,13 @@ std::unique_ptr<ByteSource> OpenMidiLayers(const wchar_t* path, std::string& for
                 error = "an archive inside a compressed file is not supported";
                 return nullptr;
             }
-            if (layer == MidiLayer::SevenZip) return nullptr;   // not handled yet: mapped as before
             std::string entry;
-            std::unique_ptr<ByteSource> src = OpenZipEntry(path, entry, error);
+            const bool zip = layer == MidiLayer::Zip;
+            std::unique_ptr<ByteSource> src = zip ? OpenZipEntry(path, entry, error)
+                                                  : OpenSevenZipEntry(path, entry, error);
             if (!src) return nullptr;
             ++layers;
-            format = "zip";
+            format = zip ? "zip" : "7z";
             top.reset(new PeekSource(std::move(src)));
             if (!top->Peek(16, error)) return nullptr;
             continue;

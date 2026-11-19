@@ -407,6 +407,19 @@ bool TestPickMidiEntry() {
     return ok;
 }
 
+bool TestSevenZipLzma2() { return ExpectFixtureDecodes(Bytes(kFixture7z), L"a.7z", "7z", FixtureMidi()); }
+bool TestSevenZipLzma() { return ExpectFixtureDecodes(Bytes(kFixture7zLzma), L"lzma.7z", "7z", FixtureMidi()); }
+// Solid archive: the MIDI is the last of four files in one folder.
+bool TestSevenZipSolidLastEntry() {
+    return ExpectFixtureDecodes(Bytes(kFixture7zSolid), L"solid.7z", "7z", FixtureMidi());
+}
+bool TestSevenZipPpmdRejected() {
+    return ExpectOpenFails(Bytes(kFixture7zPpmd), L"ppmd.7z", "7z ppmd",
+                           "7z method 30401 is not supported (LZMA, LZMA2 and Copy are)");
+}
+bool TestSevenZipTruncated() { return ExpectOpenFails(Bytes(kFixture7zTrunc), L"trunc.7z", "truncated 7z"); }
+bool TestSevenZipEncrypted() { return ExpectOpenFails(Bytes(kFixture7zEncrypted), L"enc.7z", "encrypted 7z"); }
+
 int RunStoreTests() {
     if (!TestForcedStoreMatchesMapped()) return 20;
     if (!TestStoreDedupsIdenticalTracks()) return 21;
@@ -429,6 +442,12 @@ int RunStoreTests() {
     if (!TestZipNoMidi()) return 53;
     if (!TestZipTruncated()) return 54;
     if (!TestPickMidiEntry()) return 55;
+    if (!TestSevenZipLzma2()) return 60;
+    if (!TestSevenZipLzma()) return 61;
+    if (!TestSevenZipSolidLastEntry()) return 62;
+    if (!TestSevenZipPpmdRejected()) return 63;
+    if (!TestSevenZipTruncated()) return 64;
+    if (!TestSevenZipEncrypted()) return 65;
     return 0;
 }
 }
