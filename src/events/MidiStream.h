@@ -4,6 +4,7 @@
 #include "synth/Portability.h"
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -40,17 +41,31 @@ struct MidiStreamInfo {
     uint64_t peakFrame = 0;
 };
 
+class MidiChunkStore;
+struct MidiChunkParams;
+
+// An opened MIDI file. A plain .mid is memory-mapped (Data()/Size()); a file
+// read through a chunk store (Store()) has its tracks held in deduplicated
+// chunks instead, and Data() is null.
 class MappedMidiFile {
 public:
     MappedMidiFile();
     ~MappedMidiFile();
     MappedMidiFile(const MappedMidiFile&) = delete;
     MappedMidiFile& operator=(const MappedMidiFile&) = delete;
-    bool Open(const wchar_t* path, std::string& error);
+    // forceStore: read even a plain MIDI into a chunk store with these chunk
+    // parameters (tests, and loading a file into memory in one sequential read).
+    bool Open(const wchar_t* path, std::string& error,
+              const MidiChunkParams* forceStore = nullptr);
     void Close();
     const uint8_t* Data() const { return data_; }
     uint64_t Size() const { return size_; }
+    const MidiChunkStore* Store() const { return store_.get(); }
+    // "midi" for a plain file, else the layers outermost first ("xz", "zip+xz").
+    const char* Format() const { return format_.c_str(); }
 private:
+    std::unique_ptr<MidiChunkStore> store_;
+    std::string format_;
 #if defined(_WIN32)
     void* file_;
     void* mapping_;

@@ -1,4 +1,6 @@
 #include "events/MidiStream.h"
+#include "events/ByteSource.h"
+#include "events/MidiChunkStore.h"
 #include "events/SysEx.h"
 #if defined(_WIN32)
 #include <windows.h>
@@ -46,6 +48,8 @@ struct RawEvent {
     bool sysex = false;
     bool valid = false;
 };
+// A track is one byte range (a mapped file) or a list of chunk-store ranges.
+// Ranges always end after a complete event, so no event spans two of them.
 struct Track {
     const uint8_t* p = nullptr;
     const uint8_t* end = nullptr;
@@ -53,10 +57,29 @@ struct Track {
     uint32_t order = 0;
     uint8_t running = 0;
     bool done = false;
+    const MidiChunkStore* store = nullptr;
+    const uint32_t* ref = nullptr;      // next chunk id
+    const uint32_t* refEnd = nullptr;
+    const uint8_t* rangeBegin = nullptr;
+    uint64_t doneBytes = 0;             // bytes of the ranges already left
+    uint64_t size = 0;                  // whole track, for progress
 };
+// At the end of the current range, moves to the next one.
+inline bool StepRange(Track& t) {
+    if (t.ref == t.refEnd) return false;
+    t.doneBytes += static_cast<uint64_t>(t.end - t.rangeBegin);
+    const MidiChunk c = t.store->Chunk(*t.ref++);
+    t.rangeBegin = t.p = c.data;
+    t.end = c.data + c.size;
+    return true;
+}
+inline uint64_t TrackConsumed(const Track& t) {
+    return t.doneBytes + static_cast<uint64_t>(t.p - t.rangeBegin);
+}
+inline uint64_t TrackTotal(const Track& t) { return t.size; }
 bool Next(Track& t, RawEvent& out, std::string& error) {
     out = {};
-    while (!t.done && t.p < t.end) {
+    while (!t.done && (t.p < t.end || StepRange(t))) {
         uint32_t delta = 0;
         if (!VLen(t.p, t.end, delta)) { error = "invalid MIDI delta VLQ"; return false; }
         t.tick += delta;
@@ -130,8 +153,41 @@ bool Next(Track& t, RawEvent& out, std::string& error) {
     t.done = true;
     return true;
 }
+bool StoreTracks(const MidiChunkStore& s, MidiStreamInfo& info,
+                 std::vector<Track>& tracks, std::string& error) {
+    const uint8_t* h = s.Header();
+    if (s.HeaderBytes() < 14 || std::memcmp(h, "MThd", 4) != 0) {
+        error = "not a Standard MIDI File"; return false;
+    }
+    if (BE32(h + 4) < 6 || !s.HeaderComplete()) {
+        error = "invalid MIDI header"; return false;
+    }
+    info.format = BE16(h + 8); info.tracks = BE16(h + 10); info.division = BE16(h + 12);
+    if (info.format > 1) { error = "SMF format 2 is not supported"; return false; }
+    if (info.division == 0 || (info.division & 0x8000)) {
+        error = "SMPTE MIDI time division is not supported"; return false;
+    }
+    tracks.clear(); tracks.reserve(info.tracks);
+    for (uint32_t i = 0; i < s.TrackCount() && tracks.size() < info.tracks; ++i) {
+        Track t;
+        uint32_t count = 0;
+        t.store = &s;
+        t.ref = s.TrackRefs(i, count);
+        t.refEnd = t.ref + count;
+        t.size = s.TrackSize(i);
+        tracks.push_back(t);
+    }
+    if (tracks.size() != info.tracks || tracks.empty()) {
+        if (s.EndStatus() == MidiChunkStore::End::TruncatedChunk) error = "truncated MIDI chunk";
+        else if (s.EndStatus() == MidiChunkStore::End::TruncatedTrack) error = "truncated MIDI track";
+        else error = "missing MIDI track chunks";
+        return false;
+    }
+    return true;
+}
 bool Tracks(const MappedMidiFile& file, MidiStreamInfo& info,
             std::vector<Track>& tracks, std::string& error) {
+    if (file.Store()) return StoreTracks(*file.Store(), info, tracks, error);
     const uint8_t* p = file.Data();
     const uint8_t* end = p + file.Size();
     if (!p || file.Size() < 14 || std::memcmp(p, "MThd", 4) != 0) {
@@ -152,8 +208,13 @@ bool Tracks(const MappedMidiFile& file, MidiStreamInfo& info,
         if (end - p < 8) { error = "truncated MIDI chunk"; return false; }
         const uint32_t length = BE32(p + 4);
         if (uint64_t(end - (p + 8)) < length) { error = "truncated MIDI track"; return false; }
-        if (std::memcmp(p, "MTrk", 4) == 0)
-            tracks.push_back({p + 8, p + 8 + length});
+        if (std::memcmp(p, "MTrk", 4) == 0) {
+            Track t;
+            t.rangeBegin = t.p = p + 8;
+            t.end = p + 8 + length;
+            t.size = length;
+            tracks.push_back(t);
+        }
         p += 8 + length;
     }
     if (tracks.size() != info.tracks || tracks.empty()) {
@@ -178,15 +239,15 @@ bool Run(const MappedMidiFile& file, uint32_t rate, MidiStreamDecoder::Sink sink
     if (!Tracks(file, info, tracks, error)) return false;
     uint64_t totalTrackBytes = 0;
     for (const Track& track : tracks)
-        totalTrackBytes += static_cast<uint64_t>(track.end - track.p);
+        totalTrackBytes += TrackTotal(track);
     uint64_t processedTrackBytes = 0;
     uint64_t processedRecords = 0;
     auto nextEvent = [&](uint32_t trackIndex, RawEvent& event) {
         Track& track = tracks[trackIndex];
         if (!scanProgress) return Next(track, event, error);
-        const uint8_t* before = track.p;
+        const uint64_t before = TrackConsumed(track);
         const bool ok = Next(track, event, error);
-        processedTrackBytes += static_cast<uint64_t>(track.p - before);
+        processedTrackBytes += TrackConsumed(track) - before;
         return ok;
     };
     auto reportScanProgress = [&](bool force) {
@@ -373,8 +434,18 @@ MappedMidiFile::MappedMidiFile() : file_(INVALID_HANDLE_VALUE), mapping_(nullptr
 MappedMidiFile::MappedMidiFile() : file_(-1), data_(nullptr), size_(0) {}
 #endif
 MappedMidiFile::~MappedMidiFile() { Close(); }
-bool MappedMidiFile::Open(const wchar_t* path, std::string& error) {
+bool MappedMidiFile::Open(const wchar_t* path, std::string& error,
+                          const MidiChunkParams* forceStore) {
     Close();
+    format_ = "midi";
+    if (forceStore) {
+        FileSource source;
+        if (!source.Open(path, error)) return false;
+        std::unique_ptr<MidiChunkStore> store(new MidiChunkStore());
+        if (!store->Build(source, *forceStore, error)) return false;
+        store_ = std::move(store);
+        return true;
+    }
 #if defined(_WIN32)
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -410,6 +481,8 @@ bool MappedMidiFile::Open(const wchar_t* path, std::string& error) {
     return true;
 }
 void MappedMidiFile::Close() {
+    store_.reset();
+    format_.clear();
 #if defined(_WIN32)
     if (data_) UnmapViewOfFile(data_);
     if (mapping_) CloseHandle(static_cast<HANDLE>(mapping_));
@@ -440,7 +513,6 @@ bool MidiStreamDecoder::Decode(const MappedMidiFile& file, uint32_t rate, Sink s
 namespace {
 struct PTrack {
     Track t;
-    const uint8_t* begin = nullptr;
     RawEvent pending;
     bool has = false;
     bool dropNotes = false;
@@ -505,11 +577,12 @@ struct TrackMeasure {
 // Same record grammar as Next(), minus event construction and data-byte
 // validation (Decode() reports those).
 bool MeasureTrack(const Track& tr, TrackMeasure& out) {
-    const uint8_t* p = tr.p;
-    const uint8_t* end = tr.end;
+    Track t = tr;
+    const uint8_t*& p = t.p;
+    const uint8_t*& end = t.end;
     uint64_t tick = 0;
     uint8_t running = 0;
-    while (p < end) {
+    while (p < end || StepRange(t)) {
         uint32_t delta = 0;
         if (!VLen(p, end, delta)) return false;
         tick += delta;
@@ -662,8 +735,7 @@ bool ParallelMidiDecoder::Decode(const MappedMidiFile& file, uint32_t rate,
     uint64_t total = 0;
     for (size_t i = 0; i < raw.size(); ++i) {
         tracks[i].t = raw[i];
-        tracks[i].begin = raw[i].p;
-        total += static_cast<uint64_t>(raw[i].end - raw[i].p);
+        total += TrackTotal(raw[i]);
     }
     if (!keepNoteTracks.empty()) {
         for (PTrack& pt : tracks) pt.dropNotes = true;
@@ -682,7 +754,7 @@ bool ParallelMidiDecoder::Decode(const MappedMidiFile& file, uint32_t rate,
             workers[k].first = idx;
             const uint64_t target = total / n * (k + 1);
             while (idx < tracks.size() && (acc < target || k + 1 == n)) {
-                acc += static_cast<uint64_t>(tracks[idx].t.end - tracks[idx].t.p);
+                acc += TrackTotal(tracks[idx].t);
                 ++idx;
             }
             workers[k].last = idx;
@@ -807,7 +879,7 @@ bool ParallelMidiDecoder::Decode(const MappedMidiFile& file, uint32_t rate,
         if (bytesDone && (windowIndex & 7u) == 0u) {
             uint64_t done = 0;
             for (const PTrack& pt : tracks)
-                done += static_cast<uint64_t>(pt.t.p - pt.begin);
+                done += TrackConsumed(pt.t);
             bytesDone->store(done, std::memory_order_relaxed);
         }
         if (allDone) break;

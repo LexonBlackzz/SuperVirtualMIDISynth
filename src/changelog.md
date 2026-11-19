@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-19 `feat(v3): MIDI tracks can be read from a deduplicated chunk store` - a MIDI read from a stream (the groundwork for compressed files) keeps its track bytes in chunks cut after complete events at content-defined points, each distinct chunk stored once; the decoders walk a track as a list of ranges and read exactly the bytes they read before.
 - 2026-11-18 `fix(v3): offline renders honour synth.lean_voices` - the offline synth (and with it the BASS shim and the MIDI song renderer) applied every other engine switch from the config but not this one, so turning the lean path off for an offline A/B did nothing.
 
 - 2026-11-18 `perf(v3): render-hot voice fields share one cache line` - cursor, gain, mix, release countdown, sample bounds and the lifecycle bytes moved out of 19 separate arrays into one 64-byte record per voice. I built it for tiny blocks and it does nothing there (within 3%), but a steal now touches one line for those fields instead of one per array, and the plan at 5M notes/s costs 15-23% fewer cycles (chopped-notes, 2048-frame blocks, 14 threads: 4092 voices 158% -> 124% p50, 8192 170% -> 132%, 65536 552% -> 464%; 15M notes/s at 8192 852% -> 716%). Envelope, dense and 2048-frame release/sustained are within 2%.

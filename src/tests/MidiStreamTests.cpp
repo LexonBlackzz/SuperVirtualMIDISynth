@@ -1,5 +1,6 @@
 #include "events/MidiStream.h"
 #include "events/EventCompile.h"
+#include "events/MidiChunkStore.h"
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -46,6 +47,236 @@ bool WriteFixture(const wchar_t* path) {
 #endif
     if(!f)return false;
     const bool ok=fwrite(bytes,1,sizeof(bytes),f)==sizeof(bytes);fclose(f);return ok;
+}
+
+// ---- chunk store tests ------------------------------------------------------
+
+std::wstring TempPath(const wchar_t* name) {
+#if defined(_WIN32)
+    wchar_t dir[MAX_PATH]; GetTempPathW(MAX_PATH, dir);
+    return std::wstring(dir) + L"svms_midi_" + name;
+#else
+    return std::wstring(L"/tmp/svms_midi_") + name;
+#endif
+}
+bool WriteBytes(const std::wstring& path, const std::vector<uint8_t>& bytes) {
+#if defined(_WIN32)
+    FILE* f = _wfopen(path.c_str(), L"wb");
+#else
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    FILE* f = fopen(converter.to_bytes(path).c_str(), "wb");
+#endif
+    if (!f) return false;
+    const bool ok = bytes.empty() || fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    fclose(f);
+    return ok;
+}
+void RemoveFile(const std::wstring& path) {
+#if defined(_WIN32)
+    DeleteFileW(path.c_str());
+#else
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    unlink(converter.to_bytes(path).c_str());
+#endif
+}
+void PutVlq(std::vector<uint8_t>& o, uint32_t v) {
+    uint8_t tmp[5]; int n = 0;
+    tmp[n++] = uint8_t(v & 0x7f);
+    while (v >>= 7) tmp[n++] = uint8_t(0x80 | (v & 0x7f));
+    while (n) o.push_back(tmp[--n]);
+}
+void PutTrack(std::vector<uint8_t>& o, const std::vector<uint8_t>& body) {
+    const uint32_t n = uint32_t(body.size());
+    const uint8_t h[8] = {'M','T','r','k',uint8_t(n>>24),uint8_t(n>>16),uint8_t(n>>8),uint8_t(n)};
+    o.insert(o.end(), h, h + 8);
+    o.insert(o.end(), body.begin(), body.end());
+}
+std::vector<uint8_t> NoteBody(uint32_t seed, uint32_t notes) {
+    std::vector<uint8_t> b;
+    uint32_t x = seed;
+    for (uint32_t i = 0; i < notes; ++i) {
+        x = x * 1664525u + 1013904223u;
+        const uint8_t key = uint8_t(36 + (x >> 24) % 48);
+        PutVlq(b, (x >> 8) % 7); b.push_back(0x90); b.push_back(key); b.push_back(uint8_t(1 + (x >> 16) % 126));
+        PutVlq(b, 1 + (x >> 4) % 30); b.push_back(key); b.push_back(0);   // running-status note-off
+    }
+    return b;
+}
+void EndOfTrack(std::vector<uint8_t>& b) { b.push_back(0); b.push_back(0xff); b.push_back(0x2f); b.push_back(0); }
+
+// Deterministic format-1 MIDI: tempos, `noteTracks` note tracks built from
+// `distinctBodies` different bodies (identical tracks repeat), a track with a
+// 5000-byte SysEx between notes, CC and bend, and a track with trailing bytes
+// after its End-of-Track (inside the MTrk length).
+std::vector<uint8_t> BuildArchiveTestMidi(uint32_t noteTracks = 3, uint32_t distinctBodies = 1) {
+    std::vector<uint8_t> o = {'M','T','h','d',0,0,0,6,0,1,0,0,1,0xe0};
+    const uint32_t tracks = 3 + noteTracks;
+    o[10] = uint8_t(tracks >> 8); o[11] = uint8_t(tracks);
+    std::vector<uint8_t> t0 = {0,0xff,0x51,3,7,0xa1,0x20};
+    PutVlq(t0, 1920); t0.insert(t0.end(), {0xff,0x51,3,3,0xd0,0x90});
+    EndOfTrack(t0); PutTrack(o, t0);
+    for (uint32_t i = 0; i < noteTracks; ++i) {
+        std::vector<uint8_t> b = NoteBody(7 + i % distinctBodies, 2000);
+        EndOfTrack(b); PutTrack(o, b);
+    }
+    std::vector<uint8_t> t4 = NoteBody(99, 300);
+    t4.push_back(0); t4.push_back(0xf0); PutVlq(t4, 5000);
+    for (uint32_t i = 0; i < 4999; ++i) t4.push_back(uint8_t(i % 0x7f));
+    t4.push_back(0xf7);
+    for (uint32_t i = 0; i < 200; ++i) {
+        t4.insert(t4.end(), {3, 0xb1, 7, uint8_t(i % 128), 2, 0xe1, uint8_t(i % 128), 64});
+    }
+    std::vector<uint8_t> more = NoteBody(5, 300);
+    t4.insert(t4.end(), more.begin(), more.end());
+    EndOfTrack(t4); PutTrack(o, t4);
+    std::vector<uint8_t> t5 = NoteBody(1234, 500);
+    EndOfTrack(t5);
+    t5.insert(t5.end(), {0x90, 1, 2, 3, 0xff, 0xff, 0x80});
+    PutTrack(o, t5);
+    return o;
+}
+
+struct Decoded {
+    bool ok = false;
+    std::string error;
+    std::vector<svms::PackedMidiEvent> serial, parallel;
+    svms::MidiStreamInfo scan{}, parallelInfo{};
+    uint64_t frames = 0;
+    std::vector<uint64_t> noteOnsPerTrack;
+    std::vector<uint32_t> noteTracks;
+    std::string stage;
+};
+Decoded DecodeAll(const std::wstring& path, const svms::MidiChunkParams* params) {
+    Decoded d;
+    svms::MappedMidiFile file;
+    if (!file.Open(path.c_str(), d.error, params)) { d.stage = "open"; return d; }
+    svms::MidiStreamDecoder decoder;
+    std::atomic<bool> cancel{false};
+    if (!decoder.Scan(file, 48000, d.scan, d.error)) { d.stage = "scan"; return d; }
+    if (!decoder.Decode(file, 48000, Collect, &d.serial, &cancel, nullptr, d.error)) { d.stage = "decode"; return d; }
+    svms::ParallelMidiDecoder parallel;
+    if (!parallel.Decode(file, 48000, Collect, &d.parallel, &cancel, &d.parallelInfo, d.error,
+                         nullptr, nullptr, 4)) { d.stage = "parallel"; return d; }
+    if (!svms::ParallelMidiDecoder::MeasureDuration(file, 48000, d.frames, d.error, nullptr, 4,
+                                                    &d.noteOnsPerTrack)) { d.stage = "measure"; return d; }
+    if (!svms::ParallelMidiDecoder::NoteTracks(file, d.noteTracks, d.error)) { d.stage = "notetracks"; return d; }
+    d.ok = true;
+    return d;
+}
+bool SameEvents(const std::vector<svms::PackedMidiEvent>& a, const std::vector<svms::PackedMidiEvent>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].outputFrame != b[i].outputFrame || a[i].sequence != b[i].sequence ||
+            a[i].message != b[i].message) return false;
+    return true;
+}
+bool SameInfo(const svms::MidiStreamInfo& a, const svms::MidiStreamInfo& b) {
+    return a.format == b.format && a.division == b.division && a.tracks == b.tracks &&
+           a.eventCount == b.eventCount && a.noteOnCount == b.noteOnCount &&
+           a.totalFrames == b.totalFrames && a.peakEventsPerSecond == b.peakEventsPerSecond &&
+           a.peakNoteOnsPerSecond == b.peakNoteOnsPerSecond && a.peakEventsAtFrame == b.peakEventsAtFrame &&
+           a.peakNoteOnsAtFrame == b.peakNoteOnsAtFrame &&
+           a.peakExactDuplicateNoteOnsAtFrame == b.peakExactDuplicateNoteOnsAtFrame &&
+           a.peakKeyDuplicateNoteOnsAtFrame == b.peakKeyDuplicateNoteOnsAtFrame &&
+           a.exactDuplicateNoteOnCount == b.exactDuplicateNoteOnCount &&
+           a.keyDuplicateNoteOnCount == b.keyDuplicateNoteOnCount &&
+           a.noteRunExactDuplicateCount == b.noteRunExactDuplicateCount &&
+           a.peakNoteRunExactDuplicatesAtFrame == b.peakNoteRunExactDuplicatesAtFrame &&
+           a.adjacentExactDuplicateNoteOnCount == b.adjacentExactDuplicateNoteOnCount &&
+           a.noteOnFrameCount == b.noteOnFrameCount && a.peakEventSecond == b.peakEventSecond &&
+           a.peakNoteOnSecond == b.peakNoteOnSecond && a.peakFrame == b.peakFrame;
+}
+bool ExpectSameDecode(const std::wstring& a, const svms::MidiChunkParams* pa,
+                      const std::wstring& b, const svms::MidiChunkParams* pb, const char* label) {
+    const Decoded x = DecodeAll(a, pa), y = DecodeAll(b, pb);
+    const char* what = nullptr;
+    if (!x.ok) { std::printf("FAIL %s: reference %s failed: %s\n", label, x.stage.c_str(), x.error.c_str()); return false; }
+    if (!y.ok) { std::printf("FAIL %s: %s failed: %s\n", label, y.stage.c_str(), y.error.c_str()); return false; }
+    if (!SameEvents(x.serial, y.serial)) what = "serial events";
+    else if (!SameEvents(x.parallel, y.parallel)) what = "parallel events";
+    else if (!SameInfo(x.scan, y.scan)) what = "scan info";
+    else if (!SameInfo(x.parallelInfo, y.parallelInfo)) what = "parallel info";
+    else if (x.frames != y.frames) what = "measured duration";
+    else if (x.noteOnsPerTrack != y.noteOnsPerTrack) what = "note-ons per track";
+    else if (x.noteTracks != y.noteTracks) what = "note tracks";
+    if (what) { std::printf("FAIL %s: %s differ\n", label, what); return false; }
+    return true;
+}
+// Same failure, same stage, same text on both paths.
+bool ExpectSameFailure(const std::wstring& path, const svms::MidiChunkParams& params, const char* label) {
+    const Decoded x = DecodeAll(path, nullptr), y = DecodeAll(path, &params);
+    if (x.ok || y.ok || x.stage != y.stage || x.error != y.error) {
+        std::printf("FAIL %s: mapped [%s] %s vs store [%s] %s\n", label, x.stage.c_str(),
+                    x.error.c_str(), y.stage.c_str(), y.error.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool TestForcedStoreMatchesMapped() {
+    const std::wstring path = TempPath(L"store_a.mid");
+    if (!WriteBytes(path, BuildArchiveTestMidi())) return false;
+    svms::MidiChunkParams tiny; tiny.minChunk = 1; tiny.maxChunk = 1; tiny.mask = 0;
+    svms::MidiChunkParams defaults;
+    const bool ok = ExpectSameDecode(path, nullptr, path, &tiny, "forced store, one event per chunk") &&
+                    ExpectSameDecode(path, nullptr, path, &defaults, "forced store, default chunks");
+    RemoveFile(path);
+    return ok;
+}
+bool TestStoreDedupsIdenticalTracks() {
+    const std::wstring path = TempPath(L"store_b.mid");
+    if (!WriteBytes(path, BuildArchiveTestMidi())) return false;
+    svms::MidiChunkParams defaults;
+    svms::MappedMidiFile file; std::string error;
+    bool ok = file.Open(path.c_str(), error, &defaults) && file.Store();
+    if (ok && !(double(file.Store()->StoredBytes()) < double(file.Store()->MidiBytes()) * 0.6)) {
+        std::printf("FAIL dedup: stored %llu of %llu bytes\n",
+                    (unsigned long long)file.Store()->StoredBytes(),
+                    (unsigned long long)file.Store()->MidiBytes());
+        ok = false;
+    }
+    file.Close();
+    RemoveFile(path);
+    if (!ok) std::printf("FAIL dedup %s\n", error.c_str());
+    return ok;
+}
+bool TestStoreSysExIsOneChunk() {
+    const std::wstring path = TempPath(L"store_c.mid");
+    if (!WriteBytes(path, BuildArchiveTestMidi())) return false;
+    svms::MidiChunkParams narrow; narrow.maxChunk = 64;
+    svms::MappedMidiFile file; std::string error;
+    bool found = false;
+    if (file.Open(path.c_str(), error, &narrow) && file.Store()) {
+        uint32_t count = 0;
+        const uint32_t* refs = file.Store()->TrackRefs(4, count);
+        for (uint32_t i = 0; i < count; ++i)
+            if (file.Store()->Chunk(refs[i]).size >= 5000) found = true;
+    }
+    file.Close();
+    RemoveFile(path);
+    if (!found) std::printf("FAIL sysex chunk: no chunk of track 4 holds the whole SysEx\n");
+    return found;
+}
+bool TestForcedStoreErrorsMatch() {
+    svms::MidiChunkParams defaults;
+    const std::wstring path = TempPath(L"store_d.mid");
+    bool ok = WriteBytes(path, {'M','T','h','d',0,0,0,6,0,1}) &&
+              ExpectSameFailure(path, defaults, "10-byte file");
+    std::vector<uint8_t> lies = BuildArchiveTestMidi(1);   // 4 tracks
+    lies[11] = 5;                                          // header claims 5
+    ok = ok && WriteBytes(path, lies) && ExpectSameFailure(path, defaults, "header declares more tracks");
+    std::vector<uint8_t> cut = BuildArchiveTestMidi(1);
+    cut.resize(cut.size() - 40);                           // last track runs past the end
+    ok = ok && WriteBytes(path, cut) && ExpectSameFailure(path, defaults, "truncated last track");
+    RemoveFile(path);
+    return ok;
+}
+int RunStoreTests() {
+    if (!TestForcedStoreMatchesMapped()) return 20;
+    if (!TestStoreDedupsIdenticalTracks()) return 21;
+    if (!TestStoreSysExIsOneChunk()) return 22;
+    if (!TestForcedStoreErrorsMatch()) return 23;
+    return 0;
 }
 }
 #if defined(_WIN32)
@@ -108,5 +339,6 @@ int main() {
     svms::ParsedEventRing ring(1);if(!ring.IsValid()||ring.Capacity()!=65536)return 9;
     for(const auto& e:events)if(!ring.Push(e,cancel))return 10;
     svms::PackedMidiEvent e{};for(const auto& expected:events){if(!ring.Pop(e)||e.sequence!=expected.sequence)return 11;}
-    return ring.Size()==0?0:12;
+    if(ring.Size()!=0)return 12;
+    return RunStoreTests();
 }

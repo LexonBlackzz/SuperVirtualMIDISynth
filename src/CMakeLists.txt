@@ -349,7 +349,7 @@ if(NOT WIN32)
 
     add_executable(svms_v3_render
         synth/OfflineRenderer.cpp
-        events/MidiStream.cpp
+        events/MidiStream.cpp events/MidiChunkStore.cpp
         ${SVMS_PORTABLE_RENDER_SOURCES})
     target_include_directories(svms_v3_render PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -455,7 +455,7 @@ if(NOT WIN32)
 
         add_executable(svms_v3_midi_stream_tests
             tests/MidiStreamTests.cpp
-            events/MidiStream.cpp)
+            events/MidiStream.cpp events/MidiChunkStore.cpp)
         target_include_directories(svms_v3_midi_stream_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_midi_stream_tests PRIVATE Threads::Threads)
@@ -598,7 +598,7 @@ set(SVMS_DRIVER_SOURCES
     driver/DriverRender.cpp
     frontends/FrontNative.cpp
     frontends/FrontKDMAPI.cpp
-    events/MidiStream.cpp
+    events/MidiStream.cpp events/MidiChunkStore.cpp
     driver/DllMain.cpp
 )
 if(SVMS_BASS_SHIM)
@@ -1115,7 +1115,7 @@ if(NOT SVMS_XP_COMPAT)
     add_executable(svms_v3_render
         synth/OfflineRenderer.cpp
         synth/Config.cpp
-        events/MidiStream.cpp
+        events/MidiStream.cpp events/MidiChunkStore.cpp
         synth/SoundFont.cpp
         synth/SfzLoader.cpp
         render/RenderKernels.cpp
@@ -1602,7 +1602,7 @@ if(SVMS_BUILD_TESTS)
             tests/V3MidiSong.cpp
             frontends/RemoteClient.cpp
             synth/Config.cpp
-            events/MidiStream.cpp
+            events/MidiStream.cpp events/MidiChunkStore.cpp
             synth/SoundFont.cpp
             synth/SfzLoader.cpp
             render/RenderKernels.cpp
@@ -1623,7 +1623,7 @@ if(SVMS_BUILD_TESTS)
             SKIP_RETURN_CODE 77 TIMEOUT 600)
     else()
         add_executable(svms_v3_midi_stream_tests
-            tests/MidiStreamTests.cpp events/MidiStream.cpp)
+            tests/MidiStreamTests.cpp events/MidiStream.cpp events/MidiChunkStore.cpp)
         target_compile_definitions(svms_v3_midi_stream_tests PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_v3_midi_stream_tests PRIVATE
@@ -1757,7 +1757,7 @@ if(SVMS_BUILD_TESTS)
             tests/V3MidiSong.cpp
             frontends/RemoteClient.cpp
             synth/Config.cpp
-            events/MidiStream.cpp
+            events/MidiStream.cpp events/MidiChunkStore.cpp
             synth/SoundFont.cpp
             synth/SfzLoader.cpp
             render/RenderKernels.cpp
@@ -1800,7 +1800,7 @@ if(SVMS_BUILD_TESTS)
         target_include_directories(svms_v3_event_bench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
 
-        add_executable(svms_policy_lab tests/PolicyLab.cpp events/MidiStream.cpp)
+        add_executable(svms_policy_lab tests/PolicyLab.cpp events/MidiStream.cpp events/MidiChunkStore.cpp)
         target_compile_definitions(svms_policy_lab PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_policy_lab PRIVATE
