@@ -17,6 +17,19 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <new>
+
+// Allocation fault injection: when armed, the next allocation of exactly
+// g_failSize bytes throws once.
+static std::atomic<size_t> g_failSize{0};
+void* operator new(size_t n) {
+    size_t armed = n;
+    if (n && g_failSize.compare_exchange_strong(armed, 0)) throw std::bad_alloc();
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
 
 namespace {
 bool Collect(const svms::PackedMidiEvent& e, void* user) {
@@ -328,6 +341,28 @@ bool TestParallelStoreMatchesSerial() {
     RemoveFile(path);
     return ok;
 }
+// A shard block allocation that fails on a worker must end the build with a
+// clean error while the other workers keep interning.
+bool TestStoreSurvivesFailedBlock() {
+    const std::wstring path = TempPath(L"store_oom.mid");
+    if (!WriteBytes(path, BuildArchiveTestMidi(61, 61))) return false;
+    svms::MidiChunkParams pooled; pooled.threads = 8; pooled.pooledTrackMax = 1u << 20;
+    bool ok = true;
+    for (int round = 0; round < 8 && ok; ++round) {
+        svms::MappedMidiFile file; std::string error;
+        g_failSize = size_t(64u << 10);
+        const bool opened = file.Open(path.c_str(), error, &pooled);
+        const bool fired = g_failSize.exchange(0) == 0;
+        file.Close();
+        if (fired && (opened || error != "out of memory while loading the MIDI")) {
+            std::printf("FAIL failed block: open %s, error '%s'\n", opened ? "succeeded" : "failed",
+                        error.c_str());
+            ok = false;
+        }
+    }
+    RemoveFile(path);
+    return ok;
+}
 // ---- compressed files -------------------------------------------------------
 
 template <size_t N>
@@ -490,6 +525,7 @@ int RunStoreTests() {
     if (!TestForcedStoreErrorsMatch()) return 23;
     if (!TestParallelStoreMatchesSerial()) return 24;
     if (!TestStoreArenaFitsSmallMidi()) return 25;
+    if (!TestStoreSurvivesFailedBlock()) return 26;
     if (!TestXzLayer()) return 30;
     if (!TestXzNested()) return 31;
     if (!TestXzSplitStreams()) return 32;

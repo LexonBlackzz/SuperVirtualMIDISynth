@@ -199,18 +199,23 @@ bool MidiChunkStore::Intern(const uint8_t* p, uint32_t n, uint32_t& id, std::str
     }
     if (s.chunks.size() > kIndexMask) { error = "MIDI has too many distinct chunks"; return false; }
     uint8_t* dst;
+    // A failed allocation must leave the shard as it was: another worker may
+    // still intern into it before the build stops.
     if (n > (1u << 20)) {
-        s.blocks.emplace_back(new uint8_t[n]);
+        std::unique_ptr<uint8_t[]> block(new uint8_t[n]);
+        s.blocks.push_back(std::move(block));
         s.arena += n;
         dst = s.blocks.back().get();
     } else {
         if (s.smallUsed + n > s.smallSize) {
             // Blocks grow 64 KB -> 4 MB per shard, so a small MIDI does not
             // pay for 64 big blocks and the unused tail of a full one stays small.
-            s.smallSize = std::max<size_t>(n, s.smallSize ? std::min<size_t>(s.smallSize * 2, 4u << 20)
-                                                  : size_t(64u << 10));
-            s.blocks.emplace_back(new uint8_t[s.smallSize]);
-            s.arena += s.smallSize;
+            const size_t size = std::max<size_t>(n, s.smallSize ? std::min<size_t>(s.smallSize * 2, 4u << 20)
+                                                                : size_t(64u << 10));
+            std::unique_ptr<uint8_t[]> block(new uint8_t[size]);
+            s.blocks.push_back(std::move(block));
+            s.arena += size;
+            s.smallSize = size;
             s.smallBlock = s.blocks.back().get();
             s.smallUsed = 0;
         }
