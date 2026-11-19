@@ -1178,7 +1178,8 @@ bool RingSink(const PackedMidiEvent& e, void* p) {
 } // namespace
 } // namespace svms
 
-static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig);
+static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
+                     const svms::MappedMidiFile* shared = nullptr);
 
 namespace {
 std::string NarrowPath(const std::wstring& path) {
@@ -1325,14 +1326,12 @@ int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
     using namespace svms;
     std::string error;
     std::vector<uint32_t> tracks;
-    {
-        MappedMidiFile midi;
-        if (!OpenMidiFile(midi, o.midi, error) ||
-            !ParallelMidiDecoder::NoteTracks(midi, tracks, error)) {
-            MachineStatus(o, "ERROR", error);
-            std::fprintf(stderr, "error: %s\n", error.c_str());
-            return 1;
-        }
+    MappedMidiFile midi;   // opened once, read by every stem
+    if (!OpenMidiFile(midi, o.midi, error) ||
+        !ParallelMidiDecoder::NoteTracks(midi, tracks, error)) {
+        MachineStatus(o, "ERROR", error);
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
     }
     if (tracks.empty()) {
         MachineStatus(o, "ERROR", "no track contains notes");
@@ -1380,7 +1379,7 @@ int RunStems(const svms::Options& o, const svms::EngineConfig& cfg) {
                 c.machineProgress = false;
                 c.renderThreads = perInstance;
                 c.eventBufferMB = (std::max)(8u, o.eventBufferMB / concurrent);
-                const int r = RenderOne(c, cfg);
+                const int r = RenderOne(c, cfg, &midi);
                 if (r != 0) {
                     int none = 0;
                     failure.compare_exchange_strong(none, r);
@@ -1463,7 +1462,8 @@ int RendererMain(int argc, wchar_t** argv) {
 
 // One complete render (decode -> synth -> WAV) of `o`. Stem mode runs several
 // of these side by side, each with its own synth instance.
-static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
+static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
+                     const svms::MappedMidiFile* shared) {
     using namespace svms;
     auto fail = [&](const std::string& message) {
         MachineStatus(o, "ERROR", message);
@@ -1486,8 +1486,11 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig) {
         return cancel.load(std::memory_order_relaxed);
     };
 
-    MappedMidiFile midi;
-    if (!OpenMidiFile(midi, o.midi, error)) return fail(error);
+    // Stems pass the MIDI their caller already opened (a compressed one would
+    // otherwise be decompressed and held once per stem).
+    MappedMidiFile own;
+    if (!shared && !OpenMidiFile(own, o.midi, error)) return fail(error);
+    const MappedMidiFile& midi = shared ? *shared : own;
 
     MidiStreamDecoder decoder;
     MidiStreamInfo info;

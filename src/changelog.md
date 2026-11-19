@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-19 `perf(v3): stem renders share one opened MIDI` - every stem opened the MIDI itself, so a compressed MIDI was decompressed and held once per stem running at the same time (up to 16 copies of DYHTM's 1 GB store). The stems now read the copy the stem runner opened; the stem WAVs are byte-identical.
 - 2026-11-19 `fix(v3): a track that breaks in its first event is not kept whole` - a broken event (bad delta or running status) made the store keep every byte left in its track, so a tiny compressed file declaring a 4 GB track could demand 8 GB. The decoders stop at that event, so the store now keeps 64 bytes past it and skips the rest. The error text is unchanged.
 - 2026-11-19 `fix(v3): a failed chunk block allocation no longer corrupts the store` - the shard's block size was raised before the allocation, so after an out-of-memory another worker could write past the old block (or through a null one). The shard now changes only once the block exists. Most likely on 32-bit with a big 7z dictionary.
 - 2026-11-19 `fix(v3): opening a MIDI ignores old text in the error string` - the layer probe returned early when the caller's error string was not empty, so the player failed every second song it opened (its status string still held the last load line).
