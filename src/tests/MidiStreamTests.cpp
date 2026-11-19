@@ -383,6 +383,30 @@ bool TestMixedNesting() {
     return ExpectFixtureDecodes(Bytes(kFixtureXzGz), L"a.mid.xz.gz", "gzip+xz", FixtureMidi());
 }
 
+bool TestZipPicksLargestMidi() {
+    return ExpectFixtureDecodes(Bytes(kFixtureZipTwo), L"two.zip", "zip", FixtureMidi());
+}
+bool TestZipEntryNestedXz() {
+    return ExpectFixtureDecodes(Bytes(kFixtureZipXz), L"xzin.zip", "zip+xz", FixtureMidi());
+}
+bool TestZipSniffsUnnamedEntry() {
+    return ExpectFixtureDecodes(Bytes(kFixtureZipNoName), L"noname.zip", "zip", FixtureMidi());
+}
+bool TestZipNoMidi() {
+    return ExpectOpenFails(Bytes(kFixtureZipNone), L"none.zip", "zip without a MIDI",
+                           "no MIDI file found in the archive");
+}
+bool TestZipTruncated() { return ExpectOpenFails(Bytes(kFixtureZipTrunc), L"trunc.zip", "truncated zip"); }
+bool TestPickMidiEntry() {
+    using Entries = std::vector<std::pair<std::string, uint64_t>>;
+    const bool ok = svms::PickMidiEntry(Entries{{"x.MID", 5}, {"y.midi.xz", 9}}) == 1 &&
+                    svms::PickMidiEntry(Entries{{"a.txt", 9}}) == -1 &&
+                    svms::PickMidiEntry(Entries{{"big.mid", 900}, {"small.mid", 10}, {"z.zst", 5000}}) == 0 &&
+                    svms::PickMidiEntry(Entries{{"song.mid.gz", 3}, {"notes.midi.txt", 99}}) == 0;
+    if (!ok) std::printf("FAIL PickMidiEntry\n");
+    return ok;
+}
+
 int RunStoreTests() {
     if (!TestForcedStoreMatchesMapped()) return 20;
     if (!TestStoreDedupsIdenticalTracks()) return 21;
@@ -399,6 +423,12 @@ int RunStoreTests() {
     if (!TestZstdLayer()) return 41;
     if (!TestGzipBadCrc()) return 42;
     if (!TestMixedNesting()) return 43;
+    if (!TestZipPicksLargestMidi()) return 50;
+    if (!TestZipEntryNestedXz()) return 51;
+    if (!TestZipSniffsUnnamedEntry()) return 52;
+    if (!TestZipNoMidi()) return 53;
+    if (!TestZipTruncated()) return 54;
+    if (!TestPickMidiEntry()) return 55;
     return 0;
 }
 }

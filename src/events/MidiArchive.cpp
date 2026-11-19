@@ -1,6 +1,17 @@
 #include "events/MidiArchive.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <codecvt>
+#include <fcntl.h>
+#include <locale>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -265,6 +276,207 @@ bool ZstdSource::Read(uint8_t* dst, size_t want, size_t& got, std::string& error
     return true;
 }
 
+// ---- archives ----------------------------------------------------------------
+
+namespace {
+// A file read at offsets (archives keep their directory at the end).
+class RandomFile {
+public:
+    ~RandomFile() {
+#if defined(_WIN32)
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+#else
+        if (file_ >= 0) ::close(file_);
+#endif
+    }
+    bool Open(const wchar_t* path) {
+#if defined(_WIN32)
+        file_ = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+        LARGE_INTEGER size{};
+        if (file_ == INVALID_HANDLE_VALUE || !GetFileSizeEx(file_, &size)) return false;
+        size_ = static_cast<uint64_t>(size.QuadPart);
+#else
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        file_ = ::open(converter.to_bytes(path).c_str(), O_RDONLY);
+        struct stat st{};
+        if (file_ < 0 || fstat(file_, &st) != 0) return false;
+        size_ = static_cast<uint64_t>(st.st_size);
+#endif
+        return true;
+    }
+    uint64_t Size() const { return size_; }
+    size_t ReadAt(uint64_t offset, void* dst, size_t n) const {
+        size_t done = 0;
+        while (done < n) {
+            const size_t ask = (std::min<size_t>)(n - done, 1u << 30);
+#if defined(_WIN32)
+            OVERLAPPED at{};
+            at.Offset = static_cast<DWORD>(offset + done);
+            at.OffsetHigh = static_cast<DWORD>((offset + done) >> 32);
+            DWORD got = 0;
+            if (!ReadFile(file_, static_cast<uint8_t*>(dst) + done, static_cast<DWORD>(ask), &got, &at) ||
+                got == 0) break;
+#else
+            const ssize_t got = ::pread(file_, static_cast<uint8_t*>(dst) + done, ask,
+                                        static_cast<off_t>(offset + done));
+            if (got <= 0) break;
+#endif
+            done += static_cast<size_t>(got);
+        }
+        return done;
+    }
+private:
+#if defined(_WIN32)
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+#else
+    int file_ = -1;
+#endif
+    uint64_t size_ = 0;
+};
+
+bool EndsWith(const std::string& s, const char* tail) {
+    const size_t n = std::strlen(tail);
+    if (s.size() < n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (std::tolower(static_cast<unsigned char>(s[s.size() - n + i])) != tail[i]) return false;
+    return true;
+}
+bool IsMidiName(std::string name) {
+    for (const char* stream : {".xz", ".gz", ".zst"})
+        if (EndsWith(name, stream)) { name.resize(name.size() - std::strlen(stream)); break; }
+    return EndsWith(name, ".mid") || EndsWith(name, ".midi");
+}
+// Entry indices, largest first: named MIDIs first (if any), else all.
+std::vector<size_t> CandidateOrder(const std::vector<std::pair<std::string, uint64_t>>& entries) {
+    std::vector<size_t> order(entries.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return entries[a].second > entries[b].second; });
+    return order;
+}
+} // namespace
+
+int PickMidiEntry(const std::vector<std::pair<std::string, uint64_t>>& entries) {
+    int best = -1;
+    for (size_t i = 0; i < entries.size(); ++i)
+        if (IsMidiName(entries[i].first) &&
+            (best < 0 || entries[i].second > entries[static_cast<size_t>(best)].second))
+            best = static_cast<int>(i);
+    return best;
+}
+
+namespace {
+// Chooses the entry to load and opens it: the named pick, else the largest
+// entry whose first bytes are a MIDI or a stream layer.
+template <class OpenEntry>
+std::unique_ptr<ByteSource> PickAndOpen(const std::vector<std::pair<std::string, uint64_t>>& entries,
+                                        std::string& entryName, std::string& error,
+                                        OpenEntry open) {
+    const int picked = PickMidiEntry(entries);
+    if (picked >= 0) {
+        entryName = entries[static_cast<size_t>(picked)].first;
+        return open(static_cast<size_t>(picked), error);
+    }
+    for (size_t i : CandidateOrder(entries)) {
+        std::string ignored;
+        std::unique_ptr<ByteSource> src = open(i, ignored);
+        if (!src) continue;
+        std::unique_ptr<PeekSource> peek(new PeekSource(std::move(src)));
+        if (!peek->Peek(16, ignored)) continue;
+        const MidiLayer layer = SniffLayer(peek->Head(), peek->HeadBytes());
+        if (layer == MidiLayer::Midi || layer == MidiLayer::Xz || layer == MidiLayer::Gzip ||
+            layer == MidiLayer::Zstd) {
+            entryName = entries[i].first;
+            return std::unique_ptr<ByteSource>(std::move(peek));
+        }
+    }
+    error = "no MIDI file found in the archive";
+    return nullptr;
+}
+
+size_t ZipRead(void* opaque, mz_uint64 offset, void* dst, size_t n) {
+    return static_cast<RandomFile*>(opaque)->ReadAt(offset, dst, n);
+}
+
+// One zip entry, inflated as it is read; CRC and size checked at its end.
+class ZipEntrySource : public ByteSource {
+public:
+    ~ZipEntrySource() override {
+        if (iter_) mz_zip_reader_extract_iter_free(iter_);
+        mz_zip_reader_end(&zip_);
+    }
+    bool Open(const wchar_t* path, std::string& error) {
+        if (!file_.Open(path)) { error = "cannot open MIDI file"; return false; }
+        zip_.m_pRead = ZipRead;
+        zip_.m_pIO_opaque = &file_;
+        if (!mz_zip_reader_init(&zip_, file_.Size(), 0)) return Fail(error);
+        return true;
+    }
+    std::vector<std::pair<std::string, uint64_t>> Entries() {
+        std::vector<std::pair<std::string, uint64_t>> out;
+        const mz_uint n = mz_zip_reader_get_num_files(&zip_);
+        for (mz_uint i = 0; i < n; ++i) {
+            mz_zip_archive_file_stat st;
+            if (!mz_zip_reader_file_stat(&zip_, i, &st) || st.m_is_directory) {
+                out.push_back({std::string(), 0});   // never picked: empty name, no size
+                continue;
+            }
+            out.push_back({st.m_filename, st.m_uncomp_size});
+        }
+        return out;
+    }
+    bool Select(mz_uint index, std::string& error) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&zip_, index, &st)) return Fail(error);
+        if (st.m_is_encrypted) { error = "the zip entry is encrypted"; return false; }
+        if (st.m_method != 0 && st.m_method != MZ_DEFLATED) {
+            char text[96];
+            std::snprintf(text, sizeof(text), "zip method %u is not supported (Stored and Deflate are)",
+                          unsigned(st.m_method));
+            error = text;
+            return false;
+        }
+        iter_ = mz_zip_reader_extract_iter_new(&zip_, index, 0);
+        if (!iter_) return Fail(error);
+        return true;
+    }
+    bool Read(uint8_t* dst, size_t want, size_t& got, std::string& error) override {
+        got = 0;
+        if (!iter_ || !want) return true;
+        got = mz_zip_reader_extract_iter_read(iter_, dst, want);
+        if (got == 0) {
+            const bool ok = mz_zip_reader_extract_iter_free(iter_) != 0;
+            iter_ = nullptr;
+            if (!ok) return Fail(error);
+        }
+        return true;
+    }
+private:
+    bool Fail(std::string& error) {
+        error = std::string("zip archive is truncated or corrupt (") +
+                mz_zip_get_error_string(mz_zip_get_last_error(&zip_)) + ")";
+        return false;
+    }
+    RandomFile file_;
+    mz_zip_archive zip_{};
+    mz_zip_reader_extract_iter_state* iter_ = nullptr;
+};
+
+std::unique_ptr<ByteSource> OpenZipEntry(const wchar_t* path, std::string& entryName,
+                                         std::string& error) {
+    std::unique_ptr<ZipEntrySource> probe(new ZipEntrySource());
+    if (!probe->Open(path, error)) return nullptr;
+    const auto entries = probe->Entries();
+    probe.reset();
+    return PickAndOpen(entries, entryName, error, [&](size_t i, std::string& err) {
+        std::unique_ptr<ZipEntrySource> src(new ZipEntrySource());
+        if (!src->Open(path, err) || !src->Select(static_cast<mz_uint>(i), err)) return std::unique_ptr<ByteSource>();
+        return std::unique_ptr<ByteSource>(std::move(src));
+    });
+}
+} // namespace
+
 // ---- layers ------------------------------------------------------------------
 
 std::unique_ptr<ByteSource> OpenMidiLayers(const wchar_t* path, std::string& format,
@@ -286,9 +498,19 @@ std::unique_ptr<ByteSource> OpenMidiLayers(const wchar_t* path, std::string& for
             return nullptr;   // plain file: mapped as before
         if (layer == MidiLayer::Midi || layer == MidiLayer::Unknown) return top;
         if (layer == MidiLayer::Zip || layer == MidiLayer::SevenZip) {
-            if (layers == 0) return nullptr;
-            error = "an archive inside a compressed file is not supported";
-            return nullptr;
+            if (layers > 0) {
+                error = "an archive inside a compressed file is not supported";
+                return nullptr;
+            }
+            if (layer == MidiLayer::SevenZip) return nullptr;   // not handled yet: mapped as before
+            std::string entry;
+            std::unique_ptr<ByteSource> src = OpenZipEntry(path, entry, error);
+            if (!src) return nullptr;
+            ++layers;
+            format = "zip";
+            top.reset(new PeekSource(std::move(src)));
+            if (!top->Peek(16, error)) return nullptr;
+            continue;
         }
         if (++layers > kMaxLayers) { error = "too many nested compression layers"; return nullptr; }
         std::unique_ptr<ByteSource> next;

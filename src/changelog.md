@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-19 `feat(v3): open MIDIs inside .zip archives` - the largest entry named .mid/.midi (or .mid.xz and friends) is inflated as it is read, never extracted; without such a name, the largest entry that starts like a MIDI or a compressed stream. CRC and size are checked at the end of the entry.
 - 2026-11-19 `feat(v3): open .gz and .zst MIDIs` - gzip (multi-member, CRC and length checked) through miniz (MIT) and zstd (multi-frame, long windows) through zstd's single-file decoder (BSD), both vendored in third_party. They nest with .xz in any order.
 - 2026-11-19 `feat(v3): open .xz MIDIs, nested up to four layers` - a .xz MIDI (one or more concatenated streams, and .mid.xz.xz) now opens directly everywhere a MIDI opens, read straight into the chunk store without ever existing whole in memory. DYHTM Community Merge (35 MB .xz, 6.6 GB MIDI) loads in 9.4 s and keeps 960 MB. The decoder is the LZMA SDK (public domain), vendored in third_party/lzma. RAR archives get a clear error.
 - 2026-11-19 `perf(v3): chunk store builds tracks on worker threads` - the reading thread copies each track up to 64 MB out of the stream and workers chunk them (256 MB in flight at most); bigger tracks are chunked by the reader as they stream. Track order comes from the track index, never from which worker finishes first.

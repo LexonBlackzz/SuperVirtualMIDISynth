@@ -4,6 +4,8 @@
 #include "events/ByteSource.h"
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace svms {
 
@@ -19,6 +21,12 @@ MidiLayer SniffLayer(const uint8_t* head, size_t n);
 // ("xz", "zip+xz").
 std::unique_ptr<ByteSource> OpenMidiLayers(const wchar_t* path, std::string& format,
                                            std::string& error);
+
+// The archive entry to load among (name, uncompressed size) entries: the
+// largest whose name ends in .mid or .midi (case-insensitive), optionally
+// followed by .xz, .gz or .zst. -1 when no name qualifies; the caller then
+// looks at the entries' first bytes, largest first.
+int PickMidiEntry(const std::vector<std::pair<std::string, uint64_t>>& entries);
 
 // Reads a few bytes ahead to look at the next layer, then replays them.
 class PeekSource : public ByteSource {
