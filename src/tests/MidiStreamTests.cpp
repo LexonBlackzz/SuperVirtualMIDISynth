@@ -1,6 +1,8 @@
 #include "events/MidiStream.h"
 #include "events/EventCompile.h"
+#include "events/MidiArchive.h"
 #include "events/MidiChunkStore.h"
+#include "tests/MidiArchiveFixtures.h"
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -9,6 +11,7 @@
 #include <unistd.h>
 #endif
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -108,7 +111,8 @@ void EndOfTrack(std::vector<uint8_t>& b) { b.push_back(0); b.push_back(0xff); b.
 // `distinctBodies` different bodies (identical tracks repeat), a track with a
 // 5000-byte SysEx between notes, CC and bend, and a track with trailing bytes
 // after its End-of-Track (inside the MTrk length).
-std::vector<uint8_t> BuildArchiveTestMidi(uint32_t noteTracks = 3, uint32_t distinctBodies = 1) {
+std::vector<uint8_t> BuildArchiveTestMidi(uint32_t noteTracks = 3, uint32_t distinctBodies = 1,
+                                          uint32_t notes = 2000) {
     std::vector<uint8_t> o = {'M','T','h','d',0,0,0,6,0,1,0,0,1,0xe0};
     const uint32_t tracks = 3 + noteTracks;
     o[10] = uint8_t(tracks >> 8); o[11] = uint8_t(tracks);
@@ -116,20 +120,20 @@ std::vector<uint8_t> BuildArchiveTestMidi(uint32_t noteTracks = 3, uint32_t dist
     PutVlq(t0, 1920); t0.insert(t0.end(), {0xff,0x51,3,3,0xd0,0x90});
     EndOfTrack(t0); PutTrack(o, t0);
     for (uint32_t i = 0; i < noteTracks; ++i) {
-        std::vector<uint8_t> b = NoteBody(7 + i % distinctBodies, 2000);
+        std::vector<uint8_t> b = NoteBody(7 + i % distinctBodies, notes);
         EndOfTrack(b); PutTrack(o, b);
     }
-    std::vector<uint8_t> t4 = NoteBody(99, 300);
+    std::vector<uint8_t> t4 = NoteBody(99, notes * 3 / 20);
     t4.push_back(0); t4.push_back(0xf0); PutVlq(t4, 5000);
     for (uint32_t i = 0; i < 4999; ++i) t4.push_back(uint8_t(i % 0x7f));
     t4.push_back(0xf7);
     for (uint32_t i = 0; i < 200; ++i) {
         t4.insert(t4.end(), {3, 0xb1, 7, uint8_t(i % 128), 2, 0xe1, uint8_t(i % 128), 64});
     }
-    std::vector<uint8_t> more = NoteBody(5, 300);
+    std::vector<uint8_t> more = NoteBody(5, notes * 3 / 20);
     t4.insert(t4.end(), more.begin(), more.end());
     EndOfTrack(t4); PutTrack(o, t4);
-    std::vector<uint8_t> t5 = NoteBody(1234, 500);
+    std::vector<uint8_t> t5 = NoteBody(1234, notes / 4);
     EndOfTrack(t5);
     t5.insert(t5.end(), {0x90, 1, 2, 3, 0xff, 0xff, 0x80});
     PutTrack(o, t5);
@@ -302,20 +306,131 @@ bool TestParallelStoreMatchesSerial() {
     RemoveFile(path);
     return ok;
 }
+// ---- compressed files -------------------------------------------------------
+
+template <size_t N>
+std::vector<uint8_t> Bytes(const unsigned char (&a)[N]) { return std::vector<uint8_t>(a, a + N); }
+
+// The fixture opens through a chunk store with the given format and decodes
+// exactly like the plain MIDI it was made from.
+bool ExpectFixtureDecodes(const std::vector<uint8_t>& bytes, const wchar_t* name,
+                          const char* format, const std::vector<uint8_t>& plain) {
+    const std::wstring plainPath = TempPath(L"plain.mid"), path = TempPath(name);
+    bool ok = WriteBytes(plainPath, plain) && WriteBytes(path, bytes);
+    if (ok) {
+        svms::MappedMidiFile file; std::string error;
+        if (!file.Open(path.c_str(), error)) {
+            std::printf("FAIL %s: open failed: %s\n", format, error.c_str()); ok = false;
+        } else if (!file.Store() || std::string(file.Format()) != format) {
+            std::printf("FAIL %s: opened as '%s'%s\n", format, file.Format(),
+                        file.Store() ? "" : " without a store");
+            ok = false;
+        }
+    }
+    ok = ok && ExpectSameDecode(plainPath, nullptr, path, nullptr, format);
+    RemoveFile(plainPath); RemoveFile(path);
+    return ok;
+}
+// Open fails; when `expected` is given the error text must be exactly that.
+bool ExpectOpenFails(const std::vector<uint8_t>& bytes, const wchar_t* name, const char* label,
+                     const char* expected = nullptr) {
+    const std::wstring path = TempPath(name);
+    if (!WriteBytes(path, bytes)) return false;
+    svms::MappedMidiFile file; std::string error;
+    const bool opened = file.Open(path.c_str(), error);
+    file.Close();
+    RemoveFile(path);
+    if (opened || error.empty() || (expected && error != expected)) {
+        std::printf("FAIL %s: open %s, error '%s'\n", label, opened ? "succeeded" : "failed",
+                    error.c_str());
+        return false;
+    }
+    return true;
+}
+std::vector<uint8_t> FixtureMidi() { return BuildArchiveTestMidi(3, 1, 200); }
+
+bool TestXzLayer() { return ExpectFixtureDecodes(Bytes(kFixtureXz), L"a.mid.xz", "xz", FixtureMidi()); }
+bool TestXzNested() {
+    return ExpectFixtureDecodes(Bytes(kFixtureXzXz), L"a.mid.xz.xz", "xz+xz", FixtureMidi());
+}
+bool TestXzSplitStreams() {
+    return ExpectFixtureDecodes(Bytes(kFixtureXzSplit), L"split.xz", "xz", FixtureMidi());
+}
+bool TestXzTruncated() { return ExpectOpenFails(Bytes(kFixtureXzTrunc), L"trunc.xz", "truncated xz"); }
+bool TestRarRejected() {
+    std::vector<uint8_t> rar = {0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00};
+    rar.resize(32, 0);
+    return ExpectOpenFails(rar, L"a.rar", "rar",
+                           "RAR archives are not supported yet; extract the MIDI first");
+}
+bool TestUnknownStaysPlain() {
+    const std::wstring path = TempPath(L"notes.txt");
+    const char text[] = "this is not a MIDI file at all";
+    if (!WriteBytes(path, std::vector<uint8_t>(text, text + sizeof(text) - 1))) return false;
+    const Decoded d = DecodeAll(path, nullptr);
+    RemoveFile(path);
+    if (d.ok || d.stage != "scan" || d.error != "not a Standard MIDI File") {
+        std::printf("FAIL unknown file: [%s] %s\n", d.stage.c_str(), d.error.c_str());
+        return false;
+    }
+    return true;
+}
+
 int RunStoreTests() {
     if (!TestForcedStoreMatchesMapped()) return 20;
     if (!TestStoreDedupsIdenticalTracks()) return 21;
     if (!TestStoreSysExIsOneChunk()) return 22;
     if (!TestForcedStoreErrorsMatch()) return 23;
     if (!TestParallelStoreMatchesSerial()) return 24;
+    if (!TestXzLayer()) return 30;
+    if (!TestXzNested()) return 31;
+    if (!TestXzSplitStreams()) return 32;
+    if (!TestXzTruncated()) return 33;
+    if (!TestRarRejected()) return 34;
+    if (!TestUnknownStaysPlain()) return 35;
     return 0;
 }
 }
+// Fixture source for the compressed-file tests: the archive fixtures are this
+// output (and WriteFixture's) compressed by xz, gzip, zstd and 7-Zip.
+int WriteFixtureMode(const std::wstring& mode, const std::wstring& path) {
+    if (mode == L"--write-archive-midi") return WriteBytes(path, BuildArchiveTestMidi(3, 1, 200)) ? 0 : 1;
+    if (mode == L"--write-small-midi") return WriteFixture(path.c_str()) ? 0 : 1;
+    if (mode == L"--probe-decode") {   // decompression alone, output dropped
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string format, error;
+        std::unique_ptr<svms::ByteSource> src = svms::OpenMidiLayers(path.c_str(), format, error);
+        if (!src) { std::printf("error: %s\n", error.empty() ? "not compressed" : error.c_str()); return 1; }
+        std::vector<uint8_t> buf(4u << 20);
+        uint64_t total = 0; size_t got = 0;
+        while (src->Read(buf.data(), buf.size(), got, error) && got) total += got;
+        if (!error.empty()) { std::printf("error: %s\n", error.c_str()); return 1; }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("format=%s decode_s=%.2f out_mb=%.1f\n", format.c_str(), s, total / 1e6);
+        return 0;
+    }
+    if (mode == L"--probe") {
+        const auto t0 = std::chrono::steady_clock::now();
+        svms::MappedMidiFile file; std::string error;
+        if (!file.Open(path.c_str(), error)) { std::printf("error: %s\n", error.c_str()); return 1; }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const svms::MidiChunkStore* st = file.Store();
+        std::printf("format=%s load_s=%.2f store_mb=%.1f midi_mb=%.1f\n", file.Format(), s,
+                    st ? st->StoredBytes() / 1e6 : 0.0, st ? st->MidiBytes() / 1e6 : file.Size() / 1e6);
+        return 0;
+    }
+    return -1;
+}
 #if defined(_WIN32)
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
+    if (argc == 3) return WriteFixtureMode(argv[1], argv[2]);
     wchar_t dir[MAX_PATH],path[MAX_PATH];GetTempPathW(MAX_PATH,dir);GetTempFileNameW(dir,L"svm",0,path);
 #else
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3) {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> args;
+        return WriteFixtureMode(args.from_bytes(argv[1]), args.from_bytes(argv[2]));
+    }
     char temporary[] = "/tmp/svms-midi-stream-XXXXXX";
     const int descriptor = mkstemp(temporary);
     if (descriptor < 0) return 1;

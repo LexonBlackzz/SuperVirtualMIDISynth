@@ -1,0 +1,4 @@
+LZMA SDK 26.05 (C sources only: the xz and 7z decoders).
+Downloaded from https://github.com/ip7z/7zip/releases/download/26.05/lzma2605.7z
+SHA-256 of the archive: 668fda469b7f584f246008cf28359c66ef98d65fafb3b22a52672eebe6970c28
+Unchanged; built with Z7_ST (single-threaded) defined.

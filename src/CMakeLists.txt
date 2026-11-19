@@ -6,6 +6,18 @@ include(CTest)
 # Sources include each other by path from src/ (e.g. "synth/Types.h").
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 
+# Decoders for compressed MIDI files, vendored as source (versions and
+# download sources in third_party/*/VERSION.txt). Every target links them:
+# whatever compiles events/MidiStream.cpp needs them, and the linker drops
+# them from the rest.
+set(SVMS_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party")
+file(GLOB SVMS_LZMA_SOURCES "${SVMS_THIRD_PARTY_DIR}/lzma/*.c")
+add_library(svms_midi_codecs STATIC ${SVMS_LZMA_SOURCES})
+target_compile_definitions(svms_midi_codecs PUBLIC Z7_ST)
+target_include_directories(svms_midi_codecs PUBLIC "${SVMS_THIRD_PARTY_DIR}")
+set_target_properties(svms_midi_codecs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+link_libraries(svms_midi_codecs)
+
 option(SVMS_XP_COMPAT "Build the 32-bit Windows XP DirectSound variant" OFF)
 option(SVMS_CUDA "Embed the CUDA kernels of the GPU render stage (needs nvcc; point CUDA_PATH at the toolkit)" ON)
 option(SVMS_VULKAN "Embed the SPIR-V kernels of the GPU render stage (needs the Vulkan SDK: headers and glslc)" ON)
@@ -349,7 +361,7 @@ if(NOT WIN32)
 
     add_executable(svms_v3_render
         synth/OfflineRenderer.cpp
-        events/MidiStream.cpp events/MidiChunkStore.cpp
+        events/MidiStream.cpp events/MidiChunkStore.cpp events/MidiArchive.cpp
         ${SVMS_PORTABLE_RENDER_SOURCES})
     target_include_directories(svms_v3_render PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -455,7 +467,7 @@ if(NOT WIN32)
 
         add_executable(svms_v3_midi_stream_tests
             tests/MidiStreamTests.cpp
-            events/MidiStream.cpp events/MidiChunkStore.cpp)
+            events/MidiStream.cpp events/MidiChunkStore.cpp events/MidiArchive.cpp)
         target_include_directories(svms_v3_midi_stream_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(svms_v3_midi_stream_tests PRIVATE Threads::Threads)
@@ -598,7 +610,7 @@ set(SVMS_DRIVER_SOURCES
     driver/DriverRender.cpp
     frontends/FrontNative.cpp
     frontends/FrontKDMAPI.cpp
-    events/MidiStream.cpp events/MidiChunkStore.cpp
+    events/MidiStream.cpp events/MidiChunkStore.cpp events/MidiArchive.cpp
     driver/DllMain.cpp
 )
 if(SVMS_BASS_SHIM)
@@ -1115,7 +1127,7 @@ if(NOT SVMS_XP_COMPAT)
     add_executable(svms_v3_render
         synth/OfflineRenderer.cpp
         synth/Config.cpp
-        events/MidiStream.cpp events/MidiChunkStore.cpp
+        events/MidiStream.cpp events/MidiChunkStore.cpp events/MidiArchive.cpp
         synth/SoundFont.cpp
         synth/SfzLoader.cpp
         render/RenderKernels.cpp
@@ -1602,7 +1614,7 @@ if(SVMS_BUILD_TESTS)
             tests/V3MidiSong.cpp
             frontends/RemoteClient.cpp
             synth/Config.cpp
-            events/MidiStream.cpp events/MidiChunkStore.cpp
+            events/MidiStream.cpp events/MidiChunkStore.cpp events/MidiArchive.cpp
             synth/SoundFont.cpp
             synth/SfzLoader.cpp
             render/RenderKernels.cpp
@@ -1623,7 +1635,7 @@ if(SVMS_BUILD_TESTS)
             SKIP_RETURN_CODE 77 TIMEOUT 600)
     else()
         add_executable(svms_v3_midi_stream_tests
-            tests/MidiStreamTests.cpp events/MidiStream.cpp events/MidiChunkStore.cpp)
+            tests/MidiStreamTests.cpp events/MidiStream.cpp events/MidiChunkStore.cpp events/MidiArchive.cpp)
         target_compile_definitions(svms_v3_midi_stream_tests PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_v3_midi_stream_tests PRIVATE
@@ -1757,7 +1769,7 @@ if(SVMS_BUILD_TESTS)
             tests/V3MidiSong.cpp
             frontends/RemoteClient.cpp
             synth/Config.cpp
-            events/MidiStream.cpp events/MidiChunkStore.cpp
+            events/MidiStream.cpp events/MidiChunkStore.cpp events/MidiArchive.cpp
             synth/SoundFont.cpp
             synth/SfzLoader.cpp
             render/RenderKernels.cpp
@@ -1800,7 +1812,7 @@ if(SVMS_BUILD_TESTS)
         target_include_directories(svms_v3_event_bench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
 
-        add_executable(svms_policy_lab tests/PolicyLab.cpp events/MidiStream.cpp events/MidiChunkStore.cpp)
+        add_executable(svms_policy_lab tests/PolicyLab.cpp events/MidiStream.cpp events/MidiChunkStore.cpp events/MidiArchive.cpp)
         target_compile_definitions(svms_policy_lab PRIVATE
             NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
         target_include_directories(svms_policy_lab PRIVATE

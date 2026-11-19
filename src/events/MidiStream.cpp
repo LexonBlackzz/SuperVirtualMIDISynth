@@ -1,5 +1,6 @@
 #include "events/MidiStream.h"
 #include "events/ByteSource.h"
+#include "events/MidiArchive.h"
 #include "events/MidiChunkStore.h"
 #include "events/SysEx.h"
 #if defined(_WIN32)
@@ -445,6 +446,18 @@ bool MappedMidiFile::Open(const wchar_t* path, std::string& error,
         if (!store->Build(source, *forceStore, error)) return false;
         store_ = std::move(store);
         return true;
+    }
+    {   // a compressed or archived MIDI goes through the chunk store
+        std::string layers;
+        std::unique_ptr<ByteSource> source = OpenMidiLayers(path, layers, error);
+        if (!source && !error.empty()) return false;
+        if (source) {
+            std::unique_ptr<MidiChunkStore> store(new MidiChunkStore());
+            if (!store->Build(*source, MidiChunkParams(), error)) return false;
+            store_ = std::move(store);
+            format_ = layers;
+            return true;
+        }
     }
 #if defined(_WIN32)
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
