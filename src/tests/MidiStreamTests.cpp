@@ -271,11 +271,43 @@ bool TestForcedStoreErrorsMatch() {
     RemoveFile(path);
     return ok;
 }
+uint64_t StoredBytesWith(const std::wstring& path, const svms::MidiChunkParams& params,
+                         uint32_t* workers) {
+    svms::MappedMidiFile file; std::string error;
+    if (!file.Open(path.c_str(), error, &params) || !file.Store()) return 0;
+    if (workers) *workers = file.Store()->WorkersUsed();
+    return file.Store()->StoredBytes();
+}
+bool TestParallelStoreMatchesSerial() {
+    const std::wstring path = TempPath(L"store_e.mid");
+    if (!WriteBytes(path, BuildArchiveTestMidi(61, 3))) return false;   // 64 tracks
+    svms::MidiChunkParams serial; serial.threads = 1;
+    svms::MidiChunkParams pooled; pooled.threads = 8; pooled.pooledTrackMax = 1u << 20;
+    svms::MidiChunkParams inline_; inline_.threads = 8; inline_.pooledTrackMax = 0;
+    svms::MidiChunkParams tight; tight.threads = 8; tight.pooledTrackMax = 1u << 20; tight.inFlightMax = 8192;
+    bool ok = ExpectSameDecode(path, &serial, path, &pooled, "pooled tracks on workers") &&
+              ExpectSameDecode(path, &serial, path, &inline_, "every track on the reader") &&
+              ExpectSameDecode(path, &serial, path, &tight, "tiny in-flight budget");
+    uint32_t workers = 0;
+    const uint64_t a = StoredBytesWith(path, serial, nullptr);
+    const uint64_t b = StoredBytesWith(path, pooled, &workers);
+    const uint64_t c = StoredBytesWith(path, inline_, nullptr);
+    const uint64_t d = StoredBytesWith(path, tight, nullptr);
+    if (ok && (a == 0 || a != b || a != c || a != d)) {
+        std::printf("FAIL parallel store: stored bytes %llu %llu %llu %llu\n", (unsigned long long)a,
+                    (unsigned long long)b, (unsigned long long)c, (unsigned long long)d);
+        ok = false;
+    }
+    if (ok && workers <= 1) { std::printf("FAIL parallel store: %u workers used\n", workers); ok = false; }
+    RemoveFile(path);
+    return ok;
+}
 int RunStoreTests() {
     if (!TestForcedStoreMatchesMapped()) return 20;
     if (!TestStoreDedupsIdenticalTracks()) return 21;
     if (!TestStoreSysExIsOneChunk()) return 22;
     if (!TestForcedStoreErrorsMatch()) return 23;
+    if (!TestParallelStoreMatchesSerial()) return 24;
     return 0;
 }
 }

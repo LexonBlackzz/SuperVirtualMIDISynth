@@ -84,6 +84,7 @@ private:
     };
     friend class MidiTrackChunker;
     bool Intern(const uint8_t* p, uint32_t n, uint32_t& id, std::string& error);
+    bool ReadTracks(ByteSource& src, const MidiChunkParams& params, std::string& error);
 
     uint8_t head_[14] = {};
     size_t headBytes_ = 0;

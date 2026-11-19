@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-19 `perf(v3): chunk store builds tracks on worker threads` - the reading thread copies each track up to 64 MB out of the stream and workers chunk them (256 MB in flight at most); bigger tracks are chunked by the reader as they stream. Track order comes from the track index, never from which worker finishes first.
 - 2026-11-19 `feat(v3): MIDI tracks can be read from a deduplicated chunk store` - a MIDI read from a stream (the groundwork for compressed files) keeps its track bytes in chunks cut after complete events at content-defined points, each distinct chunk stored once; the decoders walk a track as a list of ranges and read exactly the bytes they read before.
 - 2026-11-18 `fix(v3): offline renders honour synth.lean_voices` - the offline synth (and with it the BASS shim and the MIDI song renderer) applied every other engine switch from the config but not this one, so turning the lean path off for an offline A/B did nothing.
 

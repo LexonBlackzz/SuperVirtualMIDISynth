@@ -9,8 +9,12 @@
 #include <unistd.h>
 #endif
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <iterator>
 #include <new>
+#include <thread>
 
 namespace svms {
 
@@ -338,39 +342,140 @@ bool MidiChunkStore::Build(ByteSource& src, const MidiChunkParams& params, std::
         if (skipped != headerLength - 6u) return true;
         headerComplete_ = true;
 
-        const uint32_t declared = (uint32_t(head_[10]) << 8) | head_[11];
-        std::vector<uint8_t> window(4u << 20);
-        while (refs_.size() < declared) {
-            uint8_t chunk[8];
-            if (!ReadExact(src, chunk, 8, got, error)) return false;
-            midiBytes_ += got;
-            if (got == 0) break;
-            if (got < 8) { end_ = End::TruncatedChunk; break; }
-            const uint32_t length = BE32(chunk + 4);
-            if (std::memcmp(chunk, "MTrk", 4) != 0) {
-                if (!Skip(src, length, skipped, error)) return false;
-                midiBytes_ += skipped;
-                if (skipped != length) { end_ = End::TruncatedTrack; break; }
-                continue;
-            }
-            TrackFeed f;
-            f.src = &src; f.own = &window; f.buf = window.data(); f.cap = window.size();
-            f.left = length; f.counter = &midiBytes_; f.error = &error;
-            std::vector<uint32_t> refs;
-            if (!MidiTrackChunker::Run(*this, f, params, refs, error)) {
-                if (f.failed || !error.empty()) return false;
-                end_ = End::TruncatedTrack;
-                break;
-            }
-            refs.shrink_to_fit();
-            refs_.push_back(std::move(refs));
-            trackSize_.push_back(length);
-        }
-        return true;
+        return ReadTracks(src, params, error);
     } catch (const std::bad_alloc&) {
         error = "out of memory while loading the MIDI";
         return false;
     }
+}
+
+// The calling thread reads the stream. A track up to pooledTrackMax is copied
+// out and chunked by a worker; a bigger one is chunked here as it streams.
+// Each track's chunk list goes to its own slot, so track order never depends
+// on which worker finishes first.
+bool MidiChunkStore::ReadTracks(ByteSource& src, const MidiChunkParams& params,
+                                std::string& error) {
+    const uint32_t declared = (uint32_t(head_[10]) << 8) | head_[11];
+    const uint32_t threads = params.threads
+        ? params.threads
+        : (std::min)(16u, (std::max)(1u, std::thread::hardware_concurrency()));
+    const uint32_t workerCount = threads > 1 ? threads - 1 : 0;
+
+    struct Job { size_t slot; std::vector<uint8_t> bytes; };
+    std::mutex m;
+    std::condition_variable wake, room;
+    std::deque<Job> queue;
+    std::deque<std::vector<uint32_t>> slots;   // stable under push_back
+    uint64_t inFlight = 0;
+    bool closing = false, failed = false;
+    std::string workerError;
+
+    auto worker = [&] {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(m);
+                wake.wait(lock, [&] { return closing || !queue.empty(); });
+                if (queue.empty()) return;
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            std::vector<uint32_t> refs;
+            std::string jobError;
+            bool ok = true;
+            try {
+                TrackFeed f;
+                uint64_t unused = 0;
+                f.buf = job.bytes.data(); f.cap = f.end = job.bytes.size();
+                f.counter = &unused; f.error = &jobError;
+                ok = MidiTrackChunker::Run(*this, f, params, refs, jobError);
+                refs.shrink_to_fit();
+            } catch (const std::bad_alloc&) {
+                ok = false; jobError = "out of memory while loading the MIDI";
+            }
+            std::lock_guard<std::mutex> lock(m);
+            inFlight -= job.bytes.size();
+            if (ok) slots[job.slot] = std::move(refs);
+            else if (!failed) { failed = true; workerError = jobError; }
+            room.notify_one();
+        }
+    };
+    std::vector<std::thread> pool;
+    struct Joiner {
+        std::mutex& m; std::condition_variable& wake; bool& closing;
+        std::vector<std::thread>& pool;
+        ~Joiner() {
+            { std::lock_guard<std::mutex> lock(m); closing = true; }
+            wake.notify_all();
+            for (auto& t : pool) t.join();
+        }
+    } joiner{m, wake, closing, pool};
+    for (uint32_t i = 0; i < workerCount; ++i) pool.emplace_back(worker);
+    workersUsed_ = workerCount ? workerCount : 1;
+
+    std::vector<uint8_t> window(4u << 20);
+    bool readOk = true;
+    while (slots.size() < declared) {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            if (failed) break;
+        }
+        uint8_t chunk[8];
+        size_t got = 0;
+        if (!ReadExact(src, chunk, 8, got, error)) { readOk = false; break; }
+        midiBytes_ += got;
+        if (got == 0) break;
+        if (got < 8) { end_ = End::TruncatedChunk; break; }
+        const uint32_t length = BE32(chunk + 4);
+        if (std::memcmp(chunk, "MTrk", 4) != 0) {
+            uint64_t skipped = 0;
+            if (!Skip(src, length, skipped, error)) { readOk = false; break; }
+            midiBytes_ += skipped;
+            if (skipped != length) { end_ = End::TruncatedTrack; break; }
+            continue;
+        }
+        if (workerCount && length <= params.pooledTrackMax) {
+            std::vector<uint8_t> bytes(length);
+            if (!ReadExact(src, bytes.data(), length, got, error)) { readOk = false; break; }
+            midiBytes_ += got;
+            if (got != length) { end_ = End::TruncatedTrack; break; }
+            std::unique_lock<std::mutex> lock(m);
+            room.wait(lock, [&] {
+                return failed || inFlight == 0 || inFlight + length <= params.inFlightMax;
+            });
+            if (failed) break;
+            inFlight += length;
+            slots.emplace_back();
+            trackSize_.push_back(length);
+            queue.push_back({slots.size() - 1, std::move(bytes)});
+            wake.notify_one();
+            continue;
+        }
+        TrackFeed f;
+        f.src = &src; f.own = &window; f.buf = window.data(); f.cap = window.size();
+        f.left = length; f.counter = &midiBytes_; f.error = &error;
+        std::vector<uint32_t> refs;
+        if (!MidiTrackChunker::Run(*this, f, params, refs, error)) {
+            if (f.failed || !error.empty()) { readOk = false; break; }
+            end_ = End::TruncatedTrack;
+            break;
+        }
+        refs.shrink_to_fit();
+        std::lock_guard<std::mutex> lock(m);
+        slots.push_back(std::move(refs));
+        trackSize_.push_back(length);
+    }
+    {   // let the workers finish what is queued
+        std::unique_lock<std::mutex> lock(m);
+        closing = true;
+        wake.notify_all();
+    }
+    for (auto& t : pool) t.join();
+    pool.clear();
+    if (!readOk) return false;
+    if (failed) { error = workerError; return false; }
+    refs_.assign(std::make_move_iterator(slots.begin()), std::make_move_iterator(slots.end()));
+    return true;
 }
 
 } // namespace svms
