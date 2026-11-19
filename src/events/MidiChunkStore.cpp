@@ -485,6 +485,11 @@ bool MidiChunkStore::ReadTracks(ByteSource& src, const MidiChunkParams& params,
     pool.clear();
     if (!readOk) return false;
     if (failed) { error = workerError; return false; }
+    // Read the stream to its end even past the last track: the xz index and
+    // footer, the zip entry CRC and the zstd frame end are only checked there.
+    uint64_t rest = 0;
+    if (!Skip(src, UINT64_MAX, rest, error)) return false;
+    midiBytes_ += rest;
     refs_.assign(std::make_move_iterator(slots.begin()), std::make_move_iterator(slots.end()));
     return true;
 }

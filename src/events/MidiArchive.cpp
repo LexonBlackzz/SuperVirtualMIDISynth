@@ -272,7 +272,9 @@ bool ZstdSource::Read(uint8_t* dst, size_t want, size_t& got, std::string& error
         const bool progress = input.pos != s.in.pos || output.pos != 0;
         s.in.pos = input.pos;
         got = output.pos;
-        s.last = r;
+        // An idle call after a finished frame asks for the next frame header
+        // (r > 0): only a call that moved data says whether a frame is open.
+        if (progress) s.last = r;
         s.any = true;
         if (!progress && s.in.end) {
             if (s.last != 0) { error = "zstd data is truncated"; return false; }

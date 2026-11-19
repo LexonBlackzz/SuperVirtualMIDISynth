@@ -419,6 +419,35 @@ bool TestZipNoMidi() {
                            "no MIDI file found in the archive");
 }
 bool TestZipTruncated() { return ExpectOpenFails(Bytes(kFixtureZipTrunc), L"trunc.zip", "truncated zip"); }
+// The integrity checks sit after the last track byte (xz block check, index
+// and footer; zip entry CRC; zstd frame end): they must still run.
+bool TestXzBadCheck() {
+    std::vector<uint8_t> xz = Bytes(kFixtureXz);
+    const size_t n = xz.size();
+    const uint32_t backward = xz[n - 8] | (xz[n - 7] << 8) | (xz[n - 6] << 16) | (uint32_t(xz[n - 5]) << 24);
+    const size_t indexStart = n - 12 - (size_t(backward) + 1) * 4;
+    xz[indexStart - 1] ^= 0xFF;   // last byte of the block check
+    return ExpectOpenFails(xz, L"badcheck.xz", "xz bad check");
+}
+bool TestXzNoFooter() {
+    std::vector<uint8_t> xz = Bytes(kFixtureXz);
+    xz.resize(xz.size() - 12);
+    return ExpectOpenFails(xz, L"nofooter.xz", "xz without footer");
+}
+bool TestZipBadCrc() {
+    std::vector<uint8_t> zip = Bytes(kFixtureZipTwo);
+    for (size_t i = 0; i + 20 < zip.size(); ++i) {
+        if (zip[i] != 'P' || zip[i + 1] != 'K') continue;
+        if (zip[i + 2] == 3 && zip[i + 3] == 4) zip[i + 14] ^= 0xFF;
+        if (zip[i + 2] == 1 && zip[i + 3] == 2) zip[i + 16] ^= 0xFF;
+    }
+    return ExpectOpenFails(zip, L"badcrc.zip", "zip crc");
+}
+bool TestZstdTruncatedEnd() {
+    std::vector<uint8_t> zst = Bytes(kFixtureZst);
+    zst.resize(zst.size() - 1);
+    return ExpectOpenFails(zst, L"trunc.zst", "zstd truncated end");
+}
 bool TestPickMidiEntry() {
     using Entries = std::vector<std::pair<std::string, uint64_t>>;
     const bool ok = svms::PickMidiEntry(Entries{{"x.MID", 5}, {"y.midi.xz", 9}}) == 1 &&
@@ -471,6 +500,11 @@ int RunStoreTests() {
     if (!TestSevenZipPpmdRejected()) return 63;
     if (!TestSevenZipTruncated()) return 64;
     if (!TestSevenZipEncrypted()) return 65;
+    bool integrity = TestXzBadCheck();
+    integrity = TestXzNoFooter() && integrity;
+    integrity = TestZipBadCrc() && integrity;
+    integrity = TestZstdTruncatedEnd() && integrity;
+    if (!integrity) return 70;
     return 0;
 }
 }
