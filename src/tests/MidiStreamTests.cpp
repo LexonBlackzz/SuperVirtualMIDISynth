@@ -310,6 +310,33 @@ bool TestForcedStoreErrorsMatch() {
     RemoveFile(path);
     return ok;
 }
+// A huge track that breaks in its first event: the decoders stop right there,
+// so the store must not keep the rest of the track.
+bool TestStoreBadHugeTrackStaysSmall() {
+    const std::wstring path = TempPath(L"store_huge.mid");
+    const uint32_t length = 16u << 20;
+    svms::MidiChunkParams serial; serial.threads = 1;
+    bool ok = true;
+    const std::vector<std::vector<uint8_t>> starts = {{0x00, 0x40}, {0x80, 0x80, 0x80, 0x80, 0x80}};
+    for (const auto& start : starts) {
+        std::vector<uint8_t> midi = {'M','T','h','d',0,0,0,6,0,0,0,1,0x01,0xE0,'M','T','r','k',
+                                     uint8_t(length >> 24), uint8_t(length >> 16), uint8_t(length >> 8),
+                                     uint8_t(length)};
+        midi.insert(midi.end(), start.begin(), start.end());
+        midi.resize(22 + size_t(length), 0);
+        if (!WriteBytes(path, midi)) return false;
+        ok = ExpectSameFailure(path, serial, "bad huge track") && ok;
+        svms::MappedMidiFile file; std::string error;
+        if (file.Open(path.c_str(), error, &serial) && file.Store()->ArenaBytes() > (1u << 20)) {
+            std::printf("FAIL bad huge track: %llu bytes kept\n",
+                        (unsigned long long)file.Store()->ArenaBytes());
+            ok = false;
+        }
+        file.Close();
+    }
+    RemoveFile(path);
+    return ok;
+}
 uint64_t StoredBytesWith(const std::wstring& path, const svms::MidiChunkParams& params,
                          uint32_t* workers) {
     svms::MappedMidiFile file; std::string error;
@@ -526,6 +553,7 @@ int RunStoreTests() {
     if (!TestParallelStoreMatchesSerial()) return 24;
     if (!TestStoreArenaFitsSmallMidi()) return 25;
     if (!TestStoreSurvivesFailedBlock()) return 26;
+    if (!TestStoreBadHugeTrackStaysSmall()) return 27;
     if (!TestXzLayer()) return 30;
     if (!TestXzNested()) return 31;
     if (!TestXzSplitStreams()) return 32;

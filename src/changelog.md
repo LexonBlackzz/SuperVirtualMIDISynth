@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-19 `fix(v3): a track that breaks in its first event is not kept whole` - a broken event (bad delta or running status) made the store keep every byte left in its track, so a tiny compressed file declaring a 4 GB track could demand 8 GB. The decoders stop at that event, so the store now keeps 64 bytes past it and skips the rest. The error text is unchanged.
 - 2026-11-19 `fix(v3): a failed chunk block allocation no longer corrupts the store` - the shard's block size was raised before the allocation, so after an out-of-memory another worker could write past the old block (or through a null one). The shard now changes only once the block exists. Most likely on 32-bit with a big 7z dictionary.
 - 2026-11-19 `fix(v3): opening a MIDI ignores old text in the error string` - the layer probe returned early when the caller's error string was not empty, so the player failed every second song it opened (its status string still held the last load line).
 - 2026-11-19 `fix(v3): corrupt compressed MIDIs fail instead of loading` - the store stopped reading after the last declared track, so the checks that sit after it (the xz index and footer, a zip entry's CRC, the end of a zstd frame) never ran and a damaged file loaded with wrong notes. It now reads the stream to its end; that also showed the zstd reader mistaking a clean end for a cut-off one.

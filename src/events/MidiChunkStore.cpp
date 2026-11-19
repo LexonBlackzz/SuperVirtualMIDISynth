@@ -305,7 +305,14 @@ bool MidiTrackChunker::Run(MidiChunkStore& store, TrackFeed& f, const MidiChunkP
         const size_t length = EventLength(f, running, endOfTrack);
         if (f.failed || f.truncated) return false;
         if (length == 0) {
-            // The decoders stop with an error in here: keep every byte left.
+            // The decoders stop with an error in here. With track bytes still
+            // unread the event did not run out of track: a bad VLQ or running
+            // status, found within its first few bytes, so keep only those.
+            if (f.left) {
+                f.pos = (std::min)(f.end, f.pos + 64);
+                return emit(f.pos) && f.Drain();
+            }
+            // It runs past the end of the track: keep every byte left.
             if (!f.All()) return false;
             f.pos = f.end;
             return emit(f.pos);
