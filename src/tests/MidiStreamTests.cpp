@@ -448,6 +448,18 @@ bool TestZstdTruncatedEnd() {
     zst.resize(zst.size() - 1);
     return ExpectOpenFails(zst, L"trunc.zst", "zstd truncated end");
 }
+// A plain MIDI opens whatever text the caller's error string already holds.
+bool TestOpenIgnoresStaleError() {
+    const std::wstring path = TempPath(L"stale.mid");
+    if (!WriteBytes(path, FixtureMidi())) return false;
+    svms::MappedMidiFile file;
+    std::string error = "loaded: 5 events";
+    const bool ok = file.Open(path.c_str(), error);
+    file.Close();
+    RemoveFile(path);
+    if (!ok) std::printf("FAIL stale error: %s\n", error.c_str());
+    return ok;
+}
 bool TestPickMidiEntry() {
     using Entries = std::vector<std::pair<std::string, uint64_t>>;
     const bool ok = svms::PickMidiEntry(Entries{{"x.MID", 5}, {"y.midi.xz", 9}}) == 1 &&
@@ -505,6 +517,7 @@ int RunStoreTests() {
     integrity = TestZipBadCrc() && integrity;
     integrity = TestZstdTruncatedEnd() && integrity;
     if (!integrity) return 70;
+    if (!TestOpenIgnoresStaleError()) return 71;
     return 0;
 }
 }

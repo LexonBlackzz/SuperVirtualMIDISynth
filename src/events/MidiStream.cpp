@@ -439,6 +439,7 @@ bool MappedMidiFile::Open(const wchar_t* path, std::string& error,
                           const MidiChunkParams* forceStore) {
     Close();
     format_ = "midi";
+    error.clear();   // callers may pass a string that still holds older text
     if (forceStore) {
         FileSource source;
         if (!source.Open(path, error)) return false;
