@@ -124,11 +124,42 @@ static bool ParseAudioOutputRequest(const char* text, AudioOutputSettings& s,
     return true;
 }
 
+// Settings each engine core keeps for itself (ingress gates, compiler flags,
+// its own renderer and voice pool). On a sharded engine the master hands these
+// to every shard too, so a live change reaches all keys, not just the master's.
+// Mailbox state (master volume, correctness, phase rotation) is copied to the
+// shards each block by KickShards; output-stage settings live on the master.
+static bool IsPerCoreCommand(svms::RLCommandType type) {
+    using RT = svms::RLCommandType;
+    switch (type) {
+    case RT::SetNoteOnCollapse:   case RT::SetNoteOnReexcite:
+    case RT::SetPerKeyVoiceCap:   case RT::SetStealReject:
+    case RT::SetThreadAffinityMode: case RT::SetFastProducer:
+    case RT::SetCcCollapse:       case RT::SetBendCollapse:
+    case RT::SetMinNoteLength:    case RT::SetLeanVoices:
+    case RT::SetBulkAdmission:    case RT::SetDecimation:
+    case RT::SetNoteMerge:        case RT::SetNestedNoteOff:
+    case RT::SetHalfRate:         case RT::SetBlockTiming:
+    case RT::SetGhostBudget:      case RT::SetUnboundedRender:
+        return true;
+    default:
+        return false;
+    }
+}
+
 svms::RLResult Driver::HandleRuntimeLinkCommand(
     const svms::RuntimeLinkCommandV2& cmd, char* resultText) {
     using RT = svms::RLCommandType;
     constexpr uint32_t kText = svms::kRuntimeLinkResultTextCapacity;
     std::lock_guard<std::mutex> commandLock(runtimeCommandMutex_);
+
+    // Shards validate the same way; the master's result is the one reported.
+    if (IsPerCoreCommand(static_cast<RT>(cmd.type))) {
+        for (Driver* shard : shards_) {
+            char shardText[kText] = {};
+            (void)shard->HandleRuntimeLinkCommand(cmd, shardText);
+        }
+    }
 
     switch (static_cast<RT>(cmd.type)) {
     case RT::Ping:
@@ -522,7 +553,7 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
     }
     case RT::SetBendCollapse: {
         // param = opt-in compiler-side collapse of superseded pitch bends
-        // inside one page. Read at page-fill time; shard cores follow.
+        // inside one page. Read at page-fill time.
         if (cmd.param > 1u) {
             strncpy_s(resultText, kText, "bend collapse must be 0 or 1",
                       _TRUNCATE);
@@ -530,9 +561,6 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
         }
         bendCollapseEnabled_.store(cmd.param != 0u,
                                    std::memory_order_relaxed);
-        for (Driver* shard : shards_)
-            shard->bendCollapseEnabled_.store(cmd.param != 0u,
-                                              std::memory_order_relaxed);
         engineConfig_.bendCollapse = cmd.param != 0u;
         strncpy_s(resultText, kText,
                   cmd.param ? "bend collapse: on (compiler-side, lowers accuracy)"
@@ -572,15 +600,13 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
     }
     case RT::SetMinNoteLength: {
         // param = minimum note length in ms (0 = off).  Read per compiler
-        // page; shard cores follow.
+        // page.
         if (cmd.param > 200u) {
             strncpy_s(resultText, kText, "minimum note length must be 0..200 ms",
                       _TRUNCATE);
             return svms::RLResult::InvalidArgument;
         }
         minNoteMs_.store(cmd.param, std::memory_order_relaxed);
-        for (Driver* shard : shards_)
-            shard->minNoteMs_.store(cmd.param, std::memory_order_relaxed);
         engineConfig_.minNoteMs = cmd.param;
         strncpy_s(resultText, kText,
                   cmd.param ? "minimum note length: on (lowers accuracy)"
@@ -611,9 +637,6 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
             return svms::RLResult::InvalidArgument;
         }
         renderScalar->SetLeanVoices(cmd.param != 0u);
-        for (Driver* shard : shards_)
-            if (shard->renderScalar)
-                shard->renderScalar->SetLeanVoices(cmd.param != 0u);
         engineConfig_.leanVoices = cmd.param != 0u;
         strncpy_s(resultText, kText,
                   cmd.param ? "lean voices: on" : "lean voices: off",

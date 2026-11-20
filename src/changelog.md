@@ -10,6 +10,7 @@ Format: newest first, one bullet per landed change, matching the commit's
 
 ## Unreleased
 
+- 2026-11-20 `fix(v3): live settings reach every shard core` - with `synth.shards` above 1, most live settings from the configurator (note-on coalescing, re-excite, decimation, per-key cap, ghost budget, bulk admission and more) only changed the master core, so they applied to roughly 1/N of the keys and looked like they did nothing. The master now hands each per-core command to every shard. A test drives a two-core engine and checks coalescing on and off.
 - 2026-11-19 `perf(v3): stem renders share one opened MIDI` - every stem opened the MIDI itself, so a compressed MIDI was decompressed and held once per stem running at the same time (up to 16 copies of DYHTM's 1 GB store). The stems now read the copy the stem runner opened; the stem WAVs are byte-identical.
 - 2026-11-19 `fix(v3): a track that breaks in its first event is not kept whole` - a broken event (bad delta or running status) made the store keep every byte left in its track, so a tiny compressed file declaring a 4 GB track could demand 8 GB. The decoders stop at that event, so the store now keeps 64 bytes past it and skips the rest. The error text is unchanged.
 - 2026-11-19 `fix(v3): a failed chunk block allocation no longer corrupts the store` - the shard's block size was raised before the allocation, so after an out-of-memory another worker could write past the old block (or through a null one). The shard now changes only once the block exists. Most likely on 32-bit with a big 7z dictionary.
