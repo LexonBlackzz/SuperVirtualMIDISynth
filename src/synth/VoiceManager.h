@@ -704,6 +704,8 @@ public:
     // Retire a voice (frees the slot immediately).  Called when the voice
     // has finished (end of sample, or gain below kVoiceRetireThreshold).
     void RetireVoice(VoiceHandle handle);
+    // Cache hints for a retirement `stage` (0 own lines, 1 neighbours) ahead.
+    void PrefetchRetireLines(VoiceHandle handle, uint32_t stage);
 
     bool IsActive(VoiceHandle handle) const;
 

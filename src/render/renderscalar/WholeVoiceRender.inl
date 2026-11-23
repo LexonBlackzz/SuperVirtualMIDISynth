@@ -1638,7 +1638,22 @@ inline void RenderScalar::RenderWholeVoiceBlock(
                 return a.frameOffset < b.frameOffset;
             return a.capturePosition < b.capturePosition;
         });
+    // The list is known up front: ask for each retirement's lines a few
+    // retirements ahead (own row first, its chain neighbours once that row
+    // has arrived), so the unlinks below find them in cache.
     for (uint32_t i = 0u; i < retireTotal; ++i) {
+        if (i + 16u < retireTotal) {
+            const uint32_t ahead = retirements_[i + 16u].handle;
+            voices.PrefetchRetireLines(static_cast<VoiceHandle>(ahead), 0u);
+#if defined(SVMS_VM_HAS_PREFETCH)
+            if (ahead < wvHandleCapacity_)
+                _mm_prefetch(reinterpret_cast<const char*>(&wvOpIndex_[ahead]),
+                             _MM_HINT_T0);
+#endif
+        }
+        if (i + 6u < retireTotal)
+            voices.PrefetchRetireLines(
+                static_cast<VoiceHandle>(retirements_[i + 6u].handle), 1u);
         voices.SetCurrentFrame(blockStartFrame + retirements_[i].frameOffset);
         const VoiceHandle retiring =
             static_cast<VoiceHandle>(retirements_[i].handle);

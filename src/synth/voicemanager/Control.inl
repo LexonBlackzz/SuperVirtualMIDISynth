@@ -134,9 +134,33 @@ inline void VoiceManager::NoteOffPlayIndex(uint8_t channel, uint8_t note,
         return;
     }
 
-    // Preserve the public helper's behavior for uncommon callers that name a
-    // non-oldest generation explicitly.
+    // Newest-first note-off (nested pairing) names the head generation. Its
+    // layers are the adjacent run at the head, so the walk ends with the run
+    // instead of visiting every older retrigger on the key. Same voices, same
+    // head-to-tail order as the full walk below.
     current = channelKeyVoiceHead_[channel][note];
+    if (current >= 0 && v.playIndex[static_cast<uint32_t>(current)] == playIndex) {
+        while (current >= 0) {
+            const VoiceHandle handle = static_cast<VoiceHandle>(current);
+            if (v.state[handle] != static_cast<uint8_t>(VoiceState::Free) &&
+                v.playIndex[handle] != playIndex)
+                break;
+            current = v.nextChannelKeyVoice[handle];
+            if (v.state[handle] == static_cast<uint8_t>(VoiceState::Free))
+                continue;
+            if (sustain || v.heldBySostenuto[handle]) {
+                if (sustain) v.heldBySustain[handle] = 1u;
+                UnlinkChannelKey(handle);
+            } else {
+                v.releaseStartInBlock[handle] = blockOffset;
+                StartRelease(handle);
+            }
+        }
+        return;
+    }
+
+    // Preserve the public helper's behavior for uncommon callers that name a
+    // generation in the middle of the chain explicitly.
     while (current >= 0) {
         const VoiceHandle handle = static_cast<VoiceHandle>(current);
         current = v.nextChannelKeyVoice[handle];

@@ -163,6 +163,7 @@ int main() {
     TestFilteredGroupKernel();
     TestWholeVoiceCCDifferential();
     TestBucketStealIndex();
+    TestOverlappingRetriggerGenerations();
     TestFastChunkMathDifferential();
     TestRotationStateFollowsPoolGrowth();
     TestLeanVoicesIdentity();

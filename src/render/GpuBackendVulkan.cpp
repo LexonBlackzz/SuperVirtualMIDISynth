@@ -16,6 +16,10 @@
 // Host-visible staging (lists, upload records, read-back) comes in two slots
 // that alternate per block, so a late block the GPU is still working on never
 // shares a buffer with the next one.
+// Every backend in the process (one per engine shard) shares one instance and
+// device and takes its own queue of the compute family.  Separate devices are
+// separate GPU contexts, which the driver time-slices: the shards' blocks ran
+// one after another instead of side by side.
 
 #include "render/GpuBackend.h"
 
@@ -24,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -91,6 +96,37 @@ struct Push {
 };
 static_assert(sizeof(Push) == 36u, "push block of the shaders");
 
+// The process-wide device.  `lock` guards creation and teardown; each queue
+// has its own submit lock, needed only when more backends than queues exist.
+struct SharedDevice {
+    static constexpr uint32_t kMaxQueues = 16u;
+    std::mutex lock;
+    uint32_t refs = 0u;
+    uint32_t adapter = 0u;
+    uint32_t queueCount = 1u;
+    uint32_t nextQueue = 0u;
+    VkFns vk;
+#if defined(_WIN32)
+    HMODULE lib = nullptr;
+#else
+    void* lib = nullptr;
+#endif
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice phys = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    uint32_t family = 0u;
+    VkPhysicalDeviceMemoryProperties memProps = {};
+    VkDeviceSize maxStorageRange = 0u;
+    bool subgroup32 = false;
+    std::string name;
+    std::mutex queueLocks[kMaxQueues];
+};
+
+SharedDevice& Shared() {
+    static SharedDevice* shared = new SharedDevice();  // lives until exit
+    return *shared;
+}
+
 class VulkanBackend final : public Backend {
 public:
     ~VulkanBackend() override { Shutdown(); }
@@ -148,6 +184,7 @@ private:
     bool Ok(VkResult r, const char* what);
     bool LoadLibraryAndInstance(std::string& error);
     bool PickDevice(uint32_t adapterIndex, std::string& error);
+    bool CreateDevice(std::string& error);
     bool CreateDeviceObjects(std::string& error);
     bool AllocBuf(Buf& b, VkDeviceSize bytes, VkBufferUsageFlags usage, Mem kind);
     void FreeBuf(Buf& b);
@@ -171,7 +208,9 @@ private:
     VkPhysicalDevice phys_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
+    std::mutex* queueLock_ = nullptr;
     uint32_t family_ = 0u;
+    uint32_t familyQueues_ = 1u;
     VkPhysicalDeviceMemoryProperties memProps_ = {};
     VkDeviceSize maxStorageRange_ = 0u;
     bool subgroup32_ = false;
@@ -283,6 +322,7 @@ bool VulkanBackend::PickDevice(uint32_t adapterIndex, std::string& error) {
     struct Candidate {
         VkPhysicalDevice device;
         uint32_t family;
+        uint32_t queues;
         int rank;
     };
     std::vector<Candidate> found;
@@ -309,7 +349,7 @@ bool VulkanBackend::PickDevice(uint32_t adapterIndex, std::string& error) {
         // Discrete GPUs first, then integrated, then the rest.
         const int rank = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 0
                          : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 2;
-        found.push_back({d, family, rank});
+        found.push_back({d, family, fams[family].queueCount, rank});
     }
     std::stable_sort(found.begin(), found.end(),
                      [](const Candidate& a, const Candidate& b) { return a.rank < b.rank; });
@@ -319,6 +359,8 @@ bool VulkanBackend::PickDevice(uint32_t adapterIndex, std::string& error) {
     }
     phys_ = found[adapterIndex].device;
     family_ = found[adapterIndex].family;
+    familyQueues_ = (std::max)(1u, (std::min)(found[adapterIndex].queues,
+                                              SharedDevice::kMaxQueues));
 
     VkPhysicalDeviceSubgroupProperties sub = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -344,12 +386,14 @@ bool VulkanBackend::PickDevice(uint32_t adapterIndex, std::string& error) {
     return true;
 }
 
-bool VulkanBackend::CreateDeviceObjects(std::string& error) {
-    const float priority = 1.0f;
+bool VulkanBackend::CreateDevice(std::string& error) {
+    const float priorities[SharedDevice::kMaxQueues] = {
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family_;
-    qci.queueCount = 1u;
-    qci.pQueuePriorities = &priority;
+    qci.queueCount = familyQueues_;
+    qci.pQueuePriorities = priorities;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1u;
     dci.pQueueCreateInfos = &qci;
@@ -366,8 +410,11 @@ bool VulkanBackend::CreateDeviceObjects(std::string& error) {
         error = "the Vulkan driver is missing device entry points";
         return false;
     }
-    vk_.GetDeviceQueue(device_, family_, 0u, &queue_);
+    return true;
+}
 
+bool VulkanBackend::CreateDeviceObjects(std::string& error) {
+    bool ok = true;
     VkDescriptorSetLayoutBinding binds[kBindings];
     for (uint32_t i = 0u; i < kBindings; ++i) {
         binds[i] = {};
@@ -442,11 +489,56 @@ bool VulkanBackend::CreateDeviceObjects(std::string& error) {
 }
 
 bool VulkanBackend::Init(uint32_t adapterIndex, std::string& error) {
-    created_ = true;
-    if (!LoadLibraryAndInstance(error) || !PickDevice(adapterIndex, error) ||
-        !CreateDeviceObjects(error)) {
-        if (error.empty()) error = name_;
+    SharedDevice& shared = Shared();
+    std::lock_guard<std::mutex> guard(shared.lock);
+    if (shared.refs != 0u && shared.adapter != adapterIndex) {
+        error = "the Vulkan stage already runs on another adapter in this process";
         return false;
+    }
+    if (shared.refs == 0u) {
+        if (!LoadLibraryAndInstance(error) || !PickDevice(adapterIndex, error) ||
+            !CreateDevice(error)) {
+            if (error.empty()) error = name_;
+            if (device_ && vk_.DestroyDevice) vk_.DestroyDevice(device_, nullptr);
+            if (instance_ && vk_.DestroyInstance) vk_.DestroyInstance(instance_, nullptr);
+            device_ = VK_NULL_HANDLE;
+            instance_ = VK_NULL_HANDLE;
+            return false;
+        }
+        shared.vk = vk_;
+        shared.lib = lib_;
+        shared.instance = instance_;
+        shared.phys = phys_;
+        shared.device = device_;
+        shared.family = family_;
+        shared.queueCount = familyQueues_;
+        shared.memProps = memProps_;
+        shared.maxStorageRange = maxStorageRange_;
+        shared.subgroup32 = subgroup32_;
+        shared.name = name_;
+        shared.adapter = adapterIndex;
+        shared.nextQueue = 0u;
+    } else {
+        vk_ = shared.vk;
+        lib_ = shared.lib;
+        instance_ = shared.instance;
+        phys_ = shared.phys;
+        device_ = shared.device;
+        family_ = shared.family;
+        familyQueues_ = shared.queueCount;
+        memProps_ = shared.memProps;
+        maxStorageRange_ = shared.maxStorageRange;
+        subgroup32_ = shared.subgroup32;
+        name_ = shared.name;
+    }
+    ++shared.refs;
+    created_ = true;
+    const uint32_t queueIndex = shared.nextQueue++ % shared.queueCount;
+    vk_.GetDeviceQueue(device_, family_, queueIndex, &queue_);
+    queueLock_ = &shared.queueLocks[queueIndex];
+    if (!CreateDeviceObjects(error)) {
+        if (error.empty()) error = name_;
+        return false;   // Shutdown (destructor) releases the reference
     }
     return true;
 }
@@ -546,7 +638,12 @@ void VulkanBackend::UpdateDescriptors() {
 }
 
 void VulkanBackend::WaitIdle() {
-    if (device_) vk_.DeviceWaitIdle(device_);
+    // Only this backend's queue: the device's other queues belong to the other
+    // shards (and vkDeviceWaitIdle would need all of them locked).
+    if (queue_) {
+        std::lock_guard<std::mutex> guard(*queueLock_);
+        vk_.QueueWaitIdle(queue_);
+    }
 }
 
 bool VulkanBackend::UploadStore(const int16_t* data, uint32_t frames) {
@@ -593,8 +690,11 @@ bool VulkanBackend::UploadStore(const int16_t* data, uint32_t frames) {
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1u;
         si.pCommandBuffers = &cmd;
-        ok = Ok(vk_.QueueSubmit(queue_, 1u, &si, VK_NULL_HANDLE), "store submit") &&
-             Ok(vk_.QueueWaitIdle(queue_), "store wait");
+        {
+            std::lock_guard<std::mutex> guard(*queueLock_);
+            ok = Ok(vk_.QueueSubmit(queue_, 1u, &si, VK_NULL_HANDLE), "store submit") &&
+                 Ok(vk_.QueueWaitIdle(queue_), "store wait");
+        }
         done += n;
     }
     vk_.DestroyCommandPool(device_, pool, nullptr);
@@ -716,7 +816,10 @@ bool VulkanBackend::EndOp(VkCommandBuffer cmd, VkFence fence) {
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1u;
     si.pCommandBuffers = &cmd;
-    if (!Ok(vk_.QueueSubmit(queue_, 1u, &si, fence), "submit")) return false;
+    {
+        std::lock_guard<std::mutex> guard(*queueLock_);
+        if (!Ok(vk_.QueueSubmit(queue_, 1u, &si, fence), "submit")) return false;
+    }
     s.submitted[s.used - 1u] = 1u;
     return true;
 }
@@ -959,11 +1062,20 @@ void VulkanBackend::Shutdown() {
         if (descPool_) vk_.DestroyDescriptorPool(device_, descPool_, nullptr);
         if (pipeLayout_) vk_.DestroyPipelineLayout(device_, pipeLayout_, nullptr);
         if (setLayout_) vk_.DestroyDescriptorSetLayout(device_, setLayout_, nullptr);
-        vk_.DestroyDevice(device_, nullptr);
     }
-    if (instance_ && vk_.DestroyInstance) vk_.DestroyInstance(instance_, nullptr);
+    {
+        SharedDevice& shared = Shared();
+        std::lock_guard<std::mutex> guard(shared.lock);
+        if (shared.refs != 0u && --shared.refs == 0u) {
+            if (shared.device) shared.vk.DestroyDevice(shared.device, nullptr);
+            if (shared.instance) shared.vk.DestroyInstance(shared.instance, nullptr);
+            shared.device = VK_NULL_HANDLE;
+            shared.instance = VK_NULL_HANDLE;
+        }
+    }
     device_ = VK_NULL_HANDLE;
     instance_ = VK_NULL_HANDLE;
+    queue_ = VK_NULL_HANDLE;
     created_ = false;
     // The loader stays loaded for the life of the process.
 }

@@ -1372,6 +1372,32 @@ void TestOverlappingRetriggerGenerations() {
               nested->v.state[longRight] ==
                   static_cast<uint8_t>(svms::VoiceState::Releasing),
           "the second nested note-off ends every layer of the long note");
+
+    // A layered newest generation on top of older ones: the note-off takes
+    // both of its layers (pedal down: held, not released) and stops there.
+    auto layered = std::make_unique<svms::VoiceManager>();
+    layered->Initialize(8);
+    const auto old0 = layered->AllocateVoice(3, 50, 100);
+    const auto old1 = layered->AllocateVoice(3, 50, 100);
+    const auto new0 = layered->AllocateVoice(3, 50, 100);
+    const auto new1 = layered->AllocateVoice(3, 50, 100);
+    layered->SetVoicePlayIndex(old0, 40u);
+    layered->SetVoicePlayIndex(old1, 41u);
+    layered->SetVoicePlayIndex(new0, 42u);
+    layered->SetVoicePlayIndex(new1, 42u);
+    Check(layered->NoteOffOldestPlayIndices(3, 50, 1u, true, 2u, true) == 1u &&
+              layered->v.heldBySustain[new0] == 1u &&
+              layered->v.heldBySustain[new1] == 1u &&
+              layered->v.heldBySustain[old0] == 0u &&
+              layered->v.heldBySustain[old1] == 0u &&
+              layered->FindNewestPlayIndex(3, 50) == 41u,
+          "nested note-off holds both layers of the newest note and stops");
+    Check(layered->NoteOffOldestPlayIndices(3, 50, 1u, false, 4u, true) == 1u &&
+              layered->v.state[old1] ==
+                  static_cast<uint8_t>(svms::VoiceState::Releasing) &&
+              layered->v.state[old0] ==
+                  static_cast<uint8_t>(svms::VoiceState::Active),
+          "the next nested note-off ends only the next newest note");
 }
 
 // Bucketed steal index: quiet voices go first, capacity holds through a

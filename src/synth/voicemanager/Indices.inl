@@ -220,6 +220,42 @@ inline void VoiceManager::PrefetchLaunchLines(VoiceHandle handle) {
 #endif
 }
 
+// Retirement runs through a known list, so its misses can be asked for ahead:
+// stage 0 pulls the voice's own lines, stage 1 (a few retirements later, when
+// those lines have arrived) the chain neighbours and channel page that
+// RetireVoice will unlink it from.  Hints only: a neighbour that changes
+// before the retirement is reached costs a wasted prefetch, nothing else.
+inline void VoiceManager::PrefetchRetireLines(VoiceHandle handle,
+                                              uint32_t stage) {
+#if defined(SVMS_VM_HAS_PREFETCH)
+    if (handle >= maxVoices_) return;
+#define SVMS_PREFETCH_LINE(address) _mm_prefetch(reinterpret_cast<const char*>(address), _MM_HINT_T0)
+    if (stage == 0u) {
+        SVMS_PREFETCH_LINE(&v.state[handle]);
+        SVMS_PREFETCH_LINE(&v.rows[handle]);
+        SVMS_PREFETCH_LINE(&linkRows_[handle]);
+        SVMS_PREFETCH_LINE(&v.birthFrame[handle]);
+        SVMS_PREFETCH_LINE(&activePosition_[handle]);
+        return;
+    }
+    const int32_t keyPrev = v.prevChannelKeyVoice[handle];
+    const int32_t keyNext = v.nextChannelKeyVoice[handle];
+    const int32_t groupPrev = playGroupPrev_[handle];
+    const int32_t groupNext = playGroupNext_[handle];
+    const uint32_t block = channelActiveBlock_[handle];
+    if (keyPrev >= 0) SVMS_PREFETCH_LINE(&v.rows[static_cast<uint32_t>(keyPrev)]);
+    if (keyNext >= 0) SVMS_PREFETCH_LINE(&v.rows[static_cast<uint32_t>(keyNext)]);
+    if (groupPrev >= 0) SVMS_PREFETCH_LINE(&linkRows_[static_cast<uint32_t>(groupPrev)]);
+    if (groupNext >= 0) SVMS_PREFETCH_LINE(&linkRows_[static_cast<uint32_t>(groupNext)]);
+    if (block < channelIndexBlockCount_)
+        SVMS_PREFETCH_LINE(&channelIndexBlocks_[block].handles[channelActiveOffset_[handle]]);
+#undef SVMS_PREFETCH_LINE
+#else
+    (void)handle;
+    (void)stage;
+#endif
+}
+
 inline void VoiceManager::InitializeVoice(VoiceHandle handle, uint8_t channel, uint8_t note, uint8_t velocity) {
     ++stealPeekEpoch_;
     v.state[handle]        = static_cast<uint8_t>(VoiceState::Active);
