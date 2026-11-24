@@ -142,8 +142,13 @@ private:
     PackedMidiEvent* events_;
     uint64_t capacity_;
     uint64_t mask_;
+    // Each side keeps its own index and a copy of the other side's, each pair
+    // on its own cache line, and reloads the other index only when the copy
+    // says the ring is empty (consumer) or full (producer).
     alignas(64) std::atomic<uint64_t> head_;
+    uint64_t tailSeen_;
     alignas(64) std::atomic<uint64_t> tail_;
+    mutable uint64_t headSeen_;
 };
 
 } // namespace svms

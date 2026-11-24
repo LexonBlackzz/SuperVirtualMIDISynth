@@ -906,7 +906,7 @@ bool ParallelMidiDecoder::Decode(const MappedMidiFile& file, uint32_t rate,
     return true;
 }
 
-ParsedEventRing::ParsedEventRing(uint32_t mb) : events_(nullptr), capacity_(0), mask_(0), head_(0), tail_(0) {
+ParsedEventRing::ParsedEventRing(uint32_t mb) : events_(nullptr), capacity_(0), mask_(0), head_(0), tailSeen_(0), tail_(0), headSeen_(0) {
     uint64_t slots = (uint64_t(mb ? mb : 1) << 20) / sizeof(PackedMidiEvent);
     uint64_t power = 1; while ((power << 1) <= slots) power <<= 1;
     capacity_ = power; mask_ = power - 1;
@@ -915,28 +915,45 @@ ParsedEventRing::ParsedEventRing(uint32_t mb) : events_(nullptr), capacity_(0), 
 }
 ParsedEventRing::~ParsedEventRing() { _aligned_free(events_); }
 bool ParsedEventRing::Push(const PackedMidiEvent& event, const std::atomic<bool>& cancel) {
-    while (!cancel.load(std::memory_order_relaxed)) {
-        const uint64_t h = head_.load(std::memory_order_relaxed);
-        if (h - tail_.load(std::memory_order_acquire) < capacity_) {
-            events_[h & mask_] = event;
-            head_.store(h + 1, std::memory_order_release); return true;
-        }
+    const uint64_t h = head_.load(std::memory_order_relaxed);
+    if (h - tailSeen_ >= capacity_) {
+        tailSeen_ = tail_.load(std::memory_order_acquire);
+        if (h - tailSeen_ >= capacity_) {
+            // Full: wait until a slack of slots is free, so the producer does
+            // not write the lines the consumer is reading one event at a time.
+            // After a few yields it sleeps: a spinning producer takes a core
+            // (often the render thread's sibling) for nothing, and the slack
+            // still holds many milliseconds of events.
+            const uint64_t slack = capacity_ / 64u ? capacity_ / 64u : 1u;
+            for (uint32_t waits = 0u;; ++waits) {
+                if (cancel.load(std::memory_order_relaxed)) return false;
+                tailSeen_ = tail_.load(std::memory_order_acquire);
+                if (h - tailSeen_ <= capacity_ - slack) break;
 #if defined(_WIN32)
-        Sleep(0);
+                Sleep(waits < 16u ? 0u : 1u);
 #else
-        sched_yield();
+                if (waits < 16u) sched_yield(); else usleep(1000);
 #endif
+            }
+        }
     }
-    return false;
+    events_[h & mask_] = event;
+    head_.store(h + 1, std::memory_order_release); return true;
 }
 bool ParsedEventRing::Peek(PackedMidiEvent& event) const {
     const uint64_t t = tail_.load(std::memory_order_relaxed);
-    if (t == head_.load(std::memory_order_acquire)) return false;
+    if (t == headSeen_) {
+        headSeen_ = head_.load(std::memory_order_acquire);
+        if (t == headSeen_) return false;
+    }
     event = events_[t & mask_]; return true;
 }
 bool ParsedEventRing::Pop(PackedMidiEvent& event) {
     const uint64_t t = tail_.load(std::memory_order_relaxed);
-    if (t == head_.load(std::memory_order_acquire)) return false;
+    if (t == headSeen_) {
+        headSeen_ = head_.load(std::memory_order_acquire);
+        if (t == headSeen_) return false;
+    }
     event = events_[t & mask_]; tail_.store(t + 1, std::memory_order_release); return true;
 }
 uint64_t ParsedEventRing::Size() const {

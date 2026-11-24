@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 #include <new>
 
@@ -730,5 +731,23 @@ int main(int argc, char** argv) {
     for(const auto& e:events)if(!ring.Push(e,cancel))return 10;
     svms::PackedMidiEvent e{};for(const auto& expected:events){if(!ring.Pop(e)||e.sequence!=expected.sequence)return 11;}
     if(ring.Size()!=0)return 12;
+    {
+        // Producer and consumer on two threads, the ring filled four times
+        // over: every event arrives once, in order, and Peek agrees with Pop.
+        const uint32_t total = static_cast<uint32_t>(ring.Capacity()) * 4u + 777u;
+        std::thread producer([&]{
+            for(uint32_t i=0;i<total;++i){svms::PackedMidiEvent p{};p.sequence=i;p.message=i*2654435761u;if(!ring.Push(p,cancel))return;}
+        });
+        uint32_t next=0;bool ordered=true;
+        while(next<total&&ordered){
+            svms::PackedMidiEvent peeked{};
+            if(!ring.Peek(peeked))continue;
+            if(!ring.Pop(e)){ordered=false;break;}
+            ordered=peeked.sequence==next&&e.sequence==next&&e.message==next*2654435761u;
+            ++next;
+        }
+        producer.join();
+        if(!ordered||ring.Size()!=0)return 13;
+    }
     return RunStoreTests();
 }
