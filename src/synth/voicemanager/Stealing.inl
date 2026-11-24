@@ -355,12 +355,16 @@ SVMS_VM_FORCEINLINE void VoiceManager::RefreshStealWinnerPath(
         BucketPush(handle);
         return;
     }
+    // Every node holds the larger of its children. Once a recomputed node
+    // keeps its stored value, every ancestor above it is already right, so
+    // the walk stops there instead of climbing to the root.
     uint32_t node = stealTreeLeafBase_ + handle;
     uint64_t winner = stealWinnerTree_[node];
     while (node > 1u) {
         const uint64_t sibling = stealWinnerTree_[node ^ 1u];
         winner = winner > sibling ? winner : sibling;
         node >>= 1u;
+        if (stealWinnerTree_[node] == winner) return;
         stealWinnerTree_[node] = winner;
     }
 }
@@ -402,7 +406,10 @@ inline void VoiceManager::RefreshStealWinnerPaths(
             const uint32_t node = nodes[i];
             const uint64_t left = stealWinnerTree_[node << 1u];
             const uint64_t right = stealWinnerTree_[(node << 1u) + 1u];
-            stealWinnerTree_[node] = left > right ? left : right;
+            const uint64_t winner = left > right ? left : right;
+            // Unchanged node: its ancestors need nothing from this path.
+            if (stealWinnerTree_[node] == winner) continue;
+            stealWinnerTree_[node] = winner;
             if (node == 1u) continue;
             const uint32_t parent = node >> 1u;
             bool duplicate = false;

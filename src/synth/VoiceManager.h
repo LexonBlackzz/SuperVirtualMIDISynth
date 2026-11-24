@@ -1038,6 +1038,21 @@ public:
     uint32_t GetStealTreeLeafBaseForTest() const {
         return stealTreeLeafBase_;
     }
+    // True when every node of the steal tree holds the larger of its children
+    // and the root is the largest leaf (vacuously true without a tree).
+    bool StealTreeConsistentForTest() const {
+        if (!stealHeapValid_ || bucketSteal_ || stealWinnerTree_ == nullptr)
+            return true;
+        uint64_t best = 0u;
+        for (uint32_t leaf = stealTreeLeafBase_; leaf < 2u * stealTreeLeafBase_; ++leaf)
+            best = stealWinnerTree_[leaf] > best ? stealWinnerTree_[leaf] : best;
+        for (uint32_t node = 1u; node < stealTreeLeafBase_; ++node) {
+            const uint64_t l = stealWinnerTree_[2u * node];
+            const uint64_t r = stealWinnerTree_[2u * node + 1u];
+            if (stealWinnerTree_[node] != (l > r ? l : r)) return false;
+        }
+        return stealTreeLeafBase_ < 2u || stealWinnerTree_[1] == best;
+    }
     uint64_t GetGroupReuseAttemptCountForTest() const {
         return groupReuseAttemptCount_;
     }

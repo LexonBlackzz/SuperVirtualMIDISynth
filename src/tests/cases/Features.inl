@@ -1517,6 +1517,56 @@ void TestMergedForkInFullPool() {
           "surplus note-offs beyond the outstanding units are ignored");
 }
 
+// The steal tournament tree stops repairing a path at the first node whose
+// value does not change. That is only exact while every node holds the larger
+// of its children, so a steal storm (full pool, merged notes, partial
+// releases that fork twins) checks exactly that after every operation, and
+// that the root is the best leaf.
+void TestStealTreeStaysConsistent() {
+    constexpr uint32_t kPool = 96u;
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    svms::ChannelCache channels;
+    channels.SetMasterVolume(1.0f);
+    channels.RebuildCache(cfg, 44100.0f);
+    svms::VoiceManager voices;
+    Check(voices.Initialize(kPool, 44100u), "steal tree test allocates");
+
+    uint32_t rng = 12345u;
+    const auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    uint32_t playIndex = 1u;
+    uint32_t bad = 0u;
+    for (uint32_t step = 0u; step < 4000u; ++step) {
+        const uint8_t key = static_cast<uint8_t>(40u + next() % 24u);
+        if (next() % 3u != 0u) {
+            svms::VoiceConfiguration setup{};
+            setup.sampleEnd = 4096u;
+            setup.loopStart = 64u;
+            setup.loopEnd = 4032u;
+            setup.loopMode = 1u;
+            setup.phaseStep = setup.basePhaseStep = 1.0f;
+            setup.initialGain = 0.05f + 0.9f * static_cast<float>(next() % 1000u) / 1000.0f;
+            setup.sustainLevel = 1.0f;
+            setup.decaySlope = 1.0f;
+            setup.releaseDecay = 0.999f;
+            setup.gainLeft = setup.gainRight = 0.02f;
+            setup.sampleBacked = 1u;
+            setup.playIndex = playIndex;
+            svms::VoiceHandle handle = svms::kInvalidVoice;
+            voices.LaunchVoiceGroup(0u, key, 100u, &setup, 1u, playIndex++,
+                                    channels.GetParams()[0], &handle, 0u,
+                                    1u + next() % 4u);
+        } else {
+            voices.NoteOffOldestPlayIndices(0u, key, 1u + next() % 2u, false, 0u);
+        }
+        if (!voices.StealTreeConsistentForTest()) ++bad;
+    }
+    Check(voices.GetForkCount() != 0u && voices.stealCount_ != 0u,
+          "steal tree storm forks twins and steals");
+    Check(bad == 0u, "steal tree keeps every node the max of its children");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Note-on re-excite (VoiceManager::ReExciteKey + RenderEventType::NoteReExcite).
 // ═══════════════════════════════════════════════════════════════════════
