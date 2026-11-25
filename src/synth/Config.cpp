@@ -468,6 +468,7 @@ json MakeDefaultJson(const EngineConfig& cfg) {
             {"launch_staging", cfg.launchStaging},
             {"launch_staging_auto", cfg.launchStagingAuto},
             {"bulk_admission_percent", cfg.bulkAdmissionPercent},
+            {"render_cap_percent", cfg.renderCapPercent},
             {"steal_index", cfg.stealIndexBuckets ? 1 : 0},
             {"sampled_steal", cfg.sampledSteal}
         }},
@@ -1117,6 +1118,9 @@ void ApplyJson(const json& root, EngineConfig& cfg) {
         if (!ReadValue(*it, "bulk_admission_percent", cfg.bulkAdmissionPercent,
                        0u, 1000u))
             AppendWarning(cfg.configWarning, "voices.bulk_admission_percent");
+        if (!ReadValue(*it, "render_cap_percent", cfg.renderCapPercent,
+                       0u, 100u))
+            AppendWarning(cfg.configWarning, "voices.render_cap_percent");
         {
             uint32_t stealIndex = cfg.stealIndexBuckets ? 1u : 0u;
             if (!ReadValue(*it, "steal_index", stealIndex, 0u, 1u))
@@ -1314,6 +1318,7 @@ EngineConfig EngineConfig::Default() {
     cfg.launchStaging = false;    // forced staging is opt-in
     cfg.launchStagingAuto = true; // large pools stage on their own
     cfg.bulkAdmissionPercent = 0; // opt-in: every note-on launches
+    cfg.renderCapPercent = 0;     // opt-in: no render-time cap
     cfg.stealIndexBuckets = false;  // opt-in: exact tournament tree by default
     cfg.monoDownmix = false;
     cfg.sampledSteal = false;       // opt-in: quietest-first ranking by default

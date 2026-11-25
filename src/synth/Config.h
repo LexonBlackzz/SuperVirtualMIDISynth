@@ -175,6 +175,9 @@ struct EngineConfig {
     // launches the rest. 0 = off (default),
     // so every note-on is launched and stolen in order as before.
     uint32_t bulkAdmissionPercent;
+    // Render-time cap, percent of a block's real duration (0 = off): over
+    // it, only the loudest new notes start (RenderCapGovernor).
+    uint32_t renderCapPercent;
     // Experimental: bucketed steal index (O(1) updates; the victim is taken
     // from the quietest 16-bit level bucket instead of the exact minimum).
     // Applied at engine init. Off by default (exact tournament tree).

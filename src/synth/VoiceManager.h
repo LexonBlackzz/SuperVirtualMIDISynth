@@ -839,6 +839,7 @@ public:
     uint32_t GetLaunchLayersHighWater() const { return launchLayersHighWater_; }
     // Logical live ceiling. It may move freely inside (or grow) the pool.
     uint32_t GetVoiceLimit() const { return voiceLimit_; }
+    uint32_t GetSampleRate() const { return sampleRate_; }
     bool GrowCapacity(uint32_t capacity);
     // NOTE: phase rotation is no longer applied per-voice at note-on (see
     // PhaseRotator below). Delaying individual voice onsets only rotates

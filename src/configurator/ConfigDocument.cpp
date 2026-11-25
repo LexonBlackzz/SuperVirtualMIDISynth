@@ -194,6 +194,7 @@ ConfigValues ConfigDocument::Defaults() {
     d.launchStaging = false;
     d.launchStagingAuto = true;
     d.bulkAdmissionPercent = 0u;
+    d.renderCapPercent = 0u;
     d.apiBackend = 0u;
     d.apiAllowNested = false;
     d.apiWinMmDevice = 0u;
@@ -500,6 +501,7 @@ void ConfigDocument::FromJson(const json& root) {
         ReadBool(*it, "launch_staging_auto", working_.launchStagingAuto);
         ReadNum(*it, "bulk_admission_percent", working_.bulkAdmissionPercent,
                   0u, 1000u);
+        ReadNum(*it, "render_cap_percent", working_.renderCapPercent, 0u, 100u);
     }
     if (auto it = root.find("diagnostics"); it != root.end() && it->is_object()) {
         ReadBool(*it, "enabled", working_.diagnosticsEnabled);
@@ -650,6 +652,7 @@ nlohmann::json ConfigDocument::ToJson() const {
     root["voices"]["launch_staging"] = working_.launchStaging;
     root["voices"]["launch_staging_auto"] = working_.launchStagingAuto;
     root["voices"]["bulk_admission_percent"] = working_.bulkAdmissionPercent;
+    root["voices"]["render_cap_percent"] = working_.renderCapPercent;
     root["synth"]["thread_affinity_mode"] = working_.threadAffinityMode;
     root["synth"]["gpu_api"] = working_.gpuApi;
     root["synth"]["gpu_device"] = working_.gpuDevice;
@@ -876,6 +879,7 @@ bool ConfigValuesEqual(const ConfigValues& a, const ConfigValues& b) {
         && a.launchStaging == b.launchStaging
         && a.launchStagingAuto == b.launchStagingAuto
         && a.bulkAdmissionPercent == b.bulkAdmissionPercent
+        && a.renderCapPercent == b.renderCapPercent
         && a.threadAffinityMode == b.threadAffinityMode
         && a.gpuApi == b.gpuApi
         && a.gpuDevice == b.gpuDevice

@@ -15,6 +15,7 @@
 #include "render/VoiceFilter.h"
 #include "render/RenderWorkers.h"
 #include "render/HalfRateBus.h"
+#include "render/RenderCap.h"
 // GPU render stage (default off; compiled out of the XP build).
 #if !defined(SVMS_XP_COMPAT) && !defined(SVMS_NO_GPU_STAGE)
 #define SVMS_GPU_STAGE 1
@@ -22,6 +23,7 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <vector>
 #include <cstdlib>
@@ -633,6 +635,8 @@ private:
     bool HalfRateCandidate(const VoiceSoA& v, uint32_t handle,
                            uint32_t frameCount) const;
     uint64_t bulkAdmissionDropped_ = 0u;
+    RenderCapGovernor renderCap_;
+    uint64_t renderCapDropped_ = 0u;
     std::vector<RenderEvent> admittedEvents_;
     float* splitBusLeft_[kChannelCount] = {};
     float* splitBusRight_[kChannelCount] = {};
@@ -1053,6 +1057,12 @@ public:
         bulkAdmissionPercent_.store(percent, std::memory_order_relaxed);
     }
     uint64_t GetBulkAdmissionDropped() const { return bulkAdmissionDropped_; }
+    // Render-time cap (see RenderCapGovernor), percent of the block's real
+    // duration; 0 = off. Read once per block.
+    void SetRenderCapPercent(uint32_t percent) { renderCap_.SetPercent(percent); }
+    uint32_t GetRenderCapPercent() const { return renderCap_.Percent(); }
+    uint64_t GetRenderCapDropped() const { return renderCapDropped_; }
+    RenderCapGovernor& RenderCapForTest() { return renderCap_; }
     // Pure filter behind it (public for the tests).  Returns the note-on units
     // dropped; `out` is filled only when that is non-zero.
     static uint32_t BulkAdmissionFilter(const RenderEvent* events,

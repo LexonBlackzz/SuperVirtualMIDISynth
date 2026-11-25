@@ -3216,6 +3216,165 @@ void TestBulkAdmission() {
           "bulk admission: both renderers launched the same notes");
 }
 
+// Render-time cap (RenderCapGovernor): the budget rules on their own, then
+// RenderBlock dropping exactly what the budget says.
+void TestRenderCap() {
+    using svms::RenderCapGovernor;
+    const double block = 0.02;  // block duration, seconds
+    {   // Off, or never over the cap: no budget at all.
+        RenderCapGovernor g;
+        g.Update(10.0 * block, block, 5000u, 5000u);
+        Check(g.Budget() == RenderCapGovernor::kUnlimited,
+              "render cap: off never limits");
+        g.SetPercent(80u);
+        for (int i = 0; i < 100; ++i) g.Update(0.79 * block, block, 5000u, 5000u);
+        Check(g.Budget() == RenderCapGovernor::kUnlimited,
+              "render cap: blocks under the cap are never limited");
+    }
+    {   // Over the cap: the budget shrinks in proportion, with a floor.
+        RenderCapGovernor g;
+        g.SetPercent(50u);
+        g.Update(2.0 * 0.5 * block, block, 1000u, 1000u);  // twice the target
+        Check(g.Budget() == 500u, "render cap: overrun scales the budget");
+        g.Update(4.0 * 0.5 * block, block, 1000u, 500u);
+        Check(g.Budget() == 125u, "render cap: a second overrun scales again");
+        g.Update(100.0 * block, block, 1000u, 125u);
+        Check(g.Budget() == RenderCapGovernor::kFloorUnits,
+              "render cap: the budget never falls under the floor");
+        g.Update(100.0 * block, block, 0u, 0u);
+        Check(g.Budget() == RenderCapGovernor::kFloorUnits,
+              "render cap: a block with no new notes leaves the budget alone");
+    }
+    {   // Under the cap the budget grows back, at most a quarter per block,
+        // and is lifted after a run of comfortable blocks.
+        RenderCapGovernor g;
+        g.SetPercent(50u);
+        g.Update(2.0 * 0.5 * block, block, 1000u, 1000u);   // budget 500
+        g.Update(0.45 * block, block, 1000u, 500u);          // binding, 90% of target
+        Check(g.Budget() > 500u && g.Budget() <= 557u,
+              "render cap: growth follows the headroom");
+        const uint32_t before = g.Budget();
+        g.Update(0.01 * block, block, 1000u, before);
+        Check(g.Budget() == static_cast<uint32_t>(before * 1.25 + 1.0),
+              "render cap: growth is at most a quarter per block");
+        for (uint32_t i = 0u; i + 1u < RenderCapGovernor::kReleaseBlocks; ++i)
+            g.Update(0.01 * block, block, 10u, 10u);
+        Check(g.Budget() != RenderCapGovernor::kUnlimited,
+              "render cap: not lifted before the calm run ends");
+        g.Update(0.01 * block, block, 10u, 10u);
+        Check(g.Budget() == RenderCapGovernor::kUnlimited,
+              "render cap: lifted after the calm run");
+        g.Update(2.0 * 0.5 * block, block, 1000u, 1000u);
+        g.SetPercent(0u);
+        Check(g.Budget() == RenderCapGovernor::kUnlimited,
+              "render cap: turning it off lifts the budget at once");
+    }
+
+    // Through RenderBlock: with the budget forced each block, the capped
+    // renderer equals a plain one fed the bulk admission filter's output.
+    using svms::RenderEvent;
+    using svms::RenderEventType;
+    constexpr uint32_t kFrames = 512u;
+    constexpr uint32_t kBlocks = 6u;
+    constexpr uint32_t kPool = 16u;
+    constexpr uint32_t kBudget = 20u;
+    const uint32_t sampleCount = 4096u;
+    std::vector<int16_t> samples(4096u + 8u, 0);
+    for (uint32_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            (0.35f * std::sin(static_cast<float>(i) * 0.071f)) * 32767.0f);
+    svms::RuntimeConfigSnapshot cfg{};
+    cfg.masterVolume = 1.0f;
+    cfg.panLaw = svms::PanLaw::ConstantPower;
+    cfg.correctnessMode = true;
+    svms::ChannelCache seedChannels;
+    seedChannels.SetMasterVolume(1.0f);
+    seedChannels.RebuildCache(cfg, 44100.0f);
+    auto capVoices = std::make_unique<svms::VoiceManager>();
+    auto plainVoices = std::make_unique<svms::VoiceManager>();
+    ConfigureWholeVoiceSeedPool(*capVoices, seedChannels, kPool, kPool);
+    ConfigureWholeVoiceSeedPool(*plainVoices, seedChannels, kPool, kPool);
+    svms::ChannelCache capChannels = seedChannels;
+    svms::ChannelCache plainChannels = seedChannels;
+    svms::RenderScalar capped;
+    svms::RenderScalar plain;
+    Check(capped.ReserveVoiceCapacity(kPool) && plain.ReserveVoiceCapacity(kPool) &&
+              capped.ConfigureRenderThreads(1u, kFrames) &&
+              plain.ConfigureRenderThreads(1u, kFrames),
+          "render cap renderers start");
+    capped.SetRenderCapPercent(50u);
+    WholeVoiceLaunchContext capContext{capVoices.get(), capChannels.GetParams()};
+    WholeVoiceLaunchContext plainContext{plainVoices.get(),
+                                         plainChannels.GetParams()};
+    capped.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent, &capContext);
+    plain.SetEventBatchDispatcher(DispatchWholeVoiceLaunchEvent, &plainContext);
+    WholeVoiceRng rng;
+    uint32_t mismatchedBlocks = 0u;
+    uint64_t totalDropped = 0u;
+    for (uint32_t block = 0; block < kBlocks; ++block) {
+        // Force the budget: an overrun of exactly 2x with 2*kBudget admitted.
+        svms::RenderCapGovernor& g = capped.RenderCapForTest();
+        g.SetPercent(0u);
+        g.Update(0.0, 1.0, 0u, 0u);
+        g.SetPercent(50u);
+        g.Update(1.0, 1.0, 2u * kBudget, 2u * kBudget);
+        const uint64_t blockStartFrame = 20000u + block * kFrames;
+        std::vector<RenderEvent> events;
+        uint32_t sequence = 0u;
+        for (uint32_t j = 0; j < 90u; ++j) {
+            RenderEvent on{};
+            on.type = RenderEventType::NoteOn;
+            on.channel = static_cast<uint8_t>(rng.Next() % 3u);
+            on.data1 = static_cast<uint8_t>(40u + rng.Next() % 24u);
+            on.data2 = static_cast<uint8_t>(30u + rng.Next() % 90u);
+            on.frameOffset = rng.Next() % (kFrames - 40u);
+            on.count = 1u;
+            on.ingressSequence = sequence++;
+            events.push_back(on);
+            if ((rng.Next() % 3u) != 0u) {
+                RenderEvent off = on;
+                off.type = RenderEventType::NoteOff;
+                off.data2 = 0u;
+                off.frameOffset = on.frameOffset + 1u + rng.Next() % 38u;
+                off.ingressSequence = sequence++;
+                events.push_back(off);
+            }
+        }
+        std::stable_sort(events.begin(), events.end(),
+            [](const RenderEvent& a, const RenderEvent& b) {
+                return a.frameOffset < b.frameOffset;
+            });
+        std::vector<RenderEvent> filtered;
+        const uint32_t dropped = svms::RenderScalar::BulkAdmissionFilter(
+            events.data(), static_cast<uint32_t>(events.size()), kBudget,
+            filtered);
+        totalDropped += dropped;
+        std::vector<float> capLeft(kFrames, 0.0f), capRight(kFrames, 0.0f);
+        std::vector<float> plainLeft(kFrames, 0.0f), plainRight(kFrames, 0.0f);
+        capped.RenderBlock(*capVoices, capChannels, samples.data(), sampleCount,
+                           capLeft.data(), capRight.data(), kFrames, cfg,
+                           events.data(), static_cast<uint32_t>(events.size()),
+                           true, blockStartFrame);
+        plain.RenderBlock(*plainVoices, plainChannels, samples.data(),
+                          sampleCount, plainLeft.data(), plainRight.data(),
+                          kFrames, cfg, filtered.data(),
+                          static_cast<uint32_t>(filtered.size()), true,
+                          blockStartFrame);
+        const bool same =
+            std::memcmp(capLeft.data(), plainLeft.data(),
+                        kFrames * sizeof(float)) == 0 &&
+            std::memcmp(capRight.data(), plainRight.data(),
+                        kFrames * sizeof(float)) == 0 &&
+            capVoices->GetActiveCount() == plainVoices->GetActiveCount();
+        if (!same) ++mismatchedBlocks;
+    }
+    Check(totalDropped > 0u, "render cap: the forced budget drops notes");
+    Check(mismatchedBlocks == 0u,
+          "render cap: RenderBlock equals the filtered stream, bit for bit");
+    Check(capped.GetRenderCapDropped() == totalDropped,
+          "render cap: dropped-unit counter matches the filter");
+}
+
 // Pitch bends fused into a voice's span (SetBendFusion) must not change what
 // plays: the same bend-heavy stream through an AVX2 renderer that fuses and one
 // that splits at every bend leaves every voice in a bit-identical state and

@@ -123,6 +123,12 @@ public:
         if (const char* bulk = std::getenv("SVMS_BULK_ADMISSION"))
             renderer_.SetBulkAdmissionPercent(
                 static_cast<uint32_t>(std::atoi(bulk)));
+        // The render-time cap is a realtime setting: an offline render takes
+        // it only from this switch (for tests), never from the config, since
+        // it makes the output depend on how fast the machine renders.
+        if (const char* cap = std::getenv("SVMS_RENDER_CAP"))
+            renderer_.SetRenderCapPercent(
+                static_cast<uint32_t>(std::atoi(cap)));
         monoDownmix_ = config.monoDownmix || (config.tuning && config.tuning->monoDownmix);
         if (config.stealReject) {
             voices_.SetStealReject(true);
@@ -432,6 +438,11 @@ public:
                          bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0, (unsigned long long)bus_.Moves(),
                          BusMsPerSecond(bus_.MoveNs()), BusMsPerSecond(bus_.BusNs()), BusMsPerSecond(busRenderNs_ - bus_.BusNs()),
                          BusMsPerSecond(busPlanNs_), BusMsPerSecond(busKernels_.BuildNs()));
+        if (renderer_.GetRenderCapPercent() != 0u)
+            std::fprintf(stderr, "[SVMS] render cap %u%%: %llu note-on units dropped, %llu launched\n",
+                         renderer_.GetRenderCapPercent(),
+                         (unsigned long long)renderer_.GetRenderCapDropped(),
+                         (unsigned long long)notes_);
         // Opt-in end-of-session diagnostic: every plan refusal is a skipped
         // stretch (silence), so a real file should report zero.
         if (std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {

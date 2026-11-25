@@ -563,6 +563,10 @@ typedef enum SVMS_Command {
     /* text = ASIO driver name. Result text: its legal buffer sizes, preferred size,
      * sample rates, output count and output names ("|"-separated). */
     SVMS_COMMAND_PROBE_ASIO_DRIVER       = 0x0000012E,
+    /* param = render-time cap, percent of a block's real duration (0 = off,
+     * 1..100): while a render would take longer, only the loudest new
+     * note-ons start. Controllers and note-offs are never dropped. */
+    SVMS_COMMAND_SET_RENDER_CAP          = 0x00000130,
     /* Reload the configured SoundFont (text = optional UTF-8 path). */
     SVMS_COMMAND_RELOAD_SOUNDFONT        = 0x00000101,
     SVMS_COMMAND_RESET_VOICES            = 0x00000102,

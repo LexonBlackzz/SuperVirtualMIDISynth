@@ -87,6 +87,7 @@ const SettingDef kSettings[] = {
     {"bulkAdmission", "Bulk note admission (experimental)", X, "Experimental", "bulk admission block budget velocity drop notes black midi overload dense saturated", nullptr, nullptr, false, D(&V::bulkAdmissionPercent)},
     {"retire", "Retire floor", P, "Performance \xE2\x80\xBA Engine internals", "voice retire floor release tail -76 db", nullptr, "perf", false, D(&V::voiceRetireThreshold)},
     {"perKey", "Per-key voice cap", P, "Performance \xE2\x80\xBA Engine internals", "per key cap", nullptr, "perf", false, D(&V::perKeyVoiceCap)},
+    {"renderCap", "Render time cap", P, "Performance › CPU and threads", "render time cap budget overload stutter keep up drop quiet notes black midi dense cpu", nullptr, "threads", false, D(&V::renderCapPercent)},
     {"ghost", "Ghost budget", P, "Performance \xE2\x80\xBA Engine internals", "ghost steal storm", nullptr, "perf", false, D(&V::ghostBudget)},
     {"voiceMem", "Voice memory cap", P, "Performance \xE2\x80\xBA Engine internals", "voice memory budget mib ram", nullptr, "perf", true, D(&V::voiceMemoryBudgetMB)},
     {"midiIn", "MIDI keyboard input", M, "MIDI", "keyboard input hardware device physical", nullptr, nullptr, true, D(&V::midiInputEnabled)},

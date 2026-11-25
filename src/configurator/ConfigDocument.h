@@ -155,6 +155,8 @@ struct ConfigValues {
     bool launchStagingAuto = true;
     // Bulk block admission, percent of the voice limit per block (0 = off).
     uint32_t bulkAdmissionPercent = 0u;
+    // Render-time cap, percent of each block (0 = off).
+    uint32_t renderCapPercent = 0u;
     // Synth backend routing: 0 SVMS engine, 1 SVMS-API DLL, 2 KDMAPI DLL,
     // 3 WinMM device. Applied at driver init (restart).
     uint32_t apiBackend = 0u;

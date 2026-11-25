@@ -378,6 +378,19 @@ void CpuCard(ConfigDocument& doc) {
             Wrapped("Use at least two render threads per shard.", ui::Tok().acc, 13.0f);
     }
     {
+        const ImVec2 size(258.0f * s, 28.0f * s);
+        ui::BeginRow("renderCap", "Render time cap",
+                     "The most of each audio block the synth may spend rendering. While it stays under, nothing changes. When a passage would take longer, only the loudest new notes start, so playback keeps up instead of stuttering; notes already playing, controllers and note-offs are never touched. 80% leaves room for the rest of the PC. Off plays every note even if the audio falls behind.",
+                     size);
+        int v = static_cast<int>(w.renderCapPercent);
+        if (SliderControl("##rendercap", &v, 0, 100, "Off", size)) {
+            w.renderCapPercent = static_cast<uint32_t>(v);
+            doc.MarkDirty();
+            SendLiveCommand(SVMS_COMMAND_SET_RENDER_CAP, w.renderCapPercent);
+        }
+        ui::EndRow();
+    }
+    {
         static const char* labels[3] = {"Windows decides", "All on P-cores", "Audio on P-cores"};
         int idx = static_cast<int>((std::min)(2u, w.threadAffinityMode));
         ui::BeginRow("affinity", "Core placement", "For Intel CPUs with P- and E-cores.",

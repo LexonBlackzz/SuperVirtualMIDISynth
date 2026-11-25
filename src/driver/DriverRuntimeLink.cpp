@@ -141,6 +141,7 @@ static bool IsPerCoreCommand(svms::RLCommandType type) {
     case RT::SetNoteMerge:        case RT::SetNestedNoteOff:
     case RT::SetHalfRate:         case RT::SetBlockTiming:
     case RT::SetGhostBudget:      case RT::SetUnboundedRender:
+    case RT::SetRenderCap:
         return true;
     default:
         return false;
@@ -673,6 +674,23 @@ svms::RLResult Driver::HandleRuntimeLinkCommand(
             _snprintf_s(resultText, kText, _TRUNCATE,
                         "bulk admission: %u%% of the voice limit per block",
                         cmd.param);
+        return svms::RLResult::Ok;
+    }
+    case RT::SetRenderCap: {
+        // param = percent of the block's real duration a render may take;
+        // 0 = off. Read once per block by the renderer.
+        if (cmd.param > 100u || !renderScalar) {
+            strncpy_s(resultText, kText,
+                      "render cap must be 0 (off) to 100 percent", _TRUNCATE);
+            return svms::RLResult::InvalidArgument;
+        }
+        renderScalar->SetRenderCapPercent(cmd.param);
+        engineConfig_.renderCapPercent = cmd.param;
+        if (cmd.param == 0u)
+            strncpy_s(resultText, kText, "render cap: off", _TRUNCATE);
+        else
+            _snprintf_s(resultText, kText, _TRUNCATE,
+                        "render cap: %u%% of each block", cmd.param);
         return svms::RLResult::Ok;
     }
     case RT::SetNoteOnReexcite: {

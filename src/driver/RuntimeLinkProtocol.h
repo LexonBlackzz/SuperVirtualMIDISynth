@@ -283,6 +283,9 @@ enum class RLCommandType : uint32_t {
     // param = 1: voices no event touches render on the lean path (default);
     // 0 = every voice on the per-voice path. Applies from the next block.
     SetLeanVoices         = 0x0000012F,
+    // param = render-time cap, percent of a block's real duration (0 = off,
+    // 1..100): over it, only the loudest new notes start.
+    SetRenderCap          = 0x00000130,
 
 
     Invalid              = 0xFFFFFFFF,

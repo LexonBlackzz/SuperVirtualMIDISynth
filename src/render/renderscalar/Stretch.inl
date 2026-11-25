@@ -27,17 +27,52 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
                                       float* const* channelBusLeft,
                                       float* const* channelBusRight) {
     (void)cfg;
+    // Render-time cap: time this block and hand the governor what it was
+    // offered and what it started, on every way out of the block.
+    const bool capOn = renderCap_.Percent() != 0u;
+    struct CapClock {
+        RenderCapGovernor& governor;
+        bool on;
+        std::chrono::steady_clock::time_point start;
+        double blockSeconds;
+        uint64_t offered = 0u;
+        uint64_t admitted = 0u;
+        ~CapClock() {
+            if (!on) return;
+            const double spent = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            governor.Update(spent, blockSeconds, offered, admitted);
+        }
+    } capClock{renderCap_, capOn,
+               capOn ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{},
+               voices.GetSampleRate() != 0u
+                   ? static_cast<double>(numFrames) / voices.GetSampleRate()
+                   : 0.0};
+    if (capOn) {
+        for (uint32_t i = 0u; i < eventCount; ++i)
+            if (events[i].type == RenderEventType::NoteOn)
+                capClock.offered += events[i].count > 1u ? events[i].count : 1u;
+        capClock.admitted = capClock.offered;
+    }
+    const uint32_t capBudget = renderCap_.Budget();
     const uint32_t bulkPercent =
         bulkAdmissionPercent_.load(std::memory_order_relaxed);
-    if (bulkPercent != 0u && eventCount != 0u) {
-        const uint64_t budget = (static_cast<uint64_t>(voices.GetVoiceLimit()) *
-                                 bulkPercent + 99u) / 100u;
+    if ((bulkPercent != 0u || capBudget != RenderCapGovernor::kUnlimited) &&
+        eventCount != 0u) {
+        uint64_t budget = UINT32_MAX;
+        if (bulkPercent != 0u)
+            budget = (static_cast<uint64_t>(voices.GetVoiceLimit()) *
+                      bulkPercent + 99u) / 100u;
+        const bool capBinds = capBudget < budget;
+        if (capBinds) budget = capBudget;
         const uint32_t dropped = BulkAdmissionFilter(
             events, eventCount,
             static_cast<uint32_t>((std::min<uint64_t>)(budget, UINT32_MAX)),
             admittedEvents_);
         if (dropped != 0u) {
-            bulkAdmissionDropped_ += dropped;
+            (capBinds ? renderCapDropped_ : bulkAdmissionDropped_) += dropped;
+            capClock.admitted -= (std::min<uint64_t>)(dropped, capClock.admitted);
             events = admittedEvents_.data();
             eventCount = static_cast<uint32_t>(admittedEvents_.size());
         }

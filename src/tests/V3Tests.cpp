@@ -151,6 +151,7 @@ int main() {
     TestLaunchStagingIdentity();
     TestLaunchStagingAutoByPoolSize();
     TestBulkAdmission();
+    TestRenderCap();
     TestStepBreakKernels();
     TestBendFusionIdentity();
     TestLazyLaunchIdentity();

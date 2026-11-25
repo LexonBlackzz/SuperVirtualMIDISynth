@@ -628,6 +628,7 @@ bool Driver::Initialize() {
     renderScalar = new RenderScalar();
     renderScalar->SetGhostBudget(cfg.ghostBudget);
     renderScalar->SetBulkAdmissionPercent(cfg.bulkAdmissionPercent);
+    renderScalar->SetRenderCapPercent(cfg.renderCapPercent);
     renderScalar->SetDecimationEnabled(cfg.decimation);
     renderScalar->SetHalfRate(cfg.halfRate, 0.0f);
     renderScalar->SetDecimationByLevel(cfg.decimationByLevel);
