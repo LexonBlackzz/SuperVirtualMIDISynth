@@ -18,6 +18,7 @@
 #include "synth/ThreadAffinity.h"
 #include "render/PostFilter.h"
 #include "render/RenderScalar.h"
+#include "render/ReleaseKernels.h"
 #include "synth/SoundFont.h"
 #include "synth/Oversample.h"
 #include "synth/VoiceManager.h"
@@ -318,6 +319,49 @@ public:
     }
 
     uint32_t SoundFontCount() const { return uint32_t(banks_.size()); }
+
+    // Release bus: what the voice path reads for region `localRegion` of font `font` on `note`, held, at velocity
+    // gain 1, no bend and unity channel mix (ReleaseKernels.h). Read-only, so the kernel builder may call it from
+    // its own thread while the SoundFont stack stays loaded. False if the region is not playable.
+    bool ReleaseKernelSource(uint32_t font, uint32_t localRegion, uint8_t note,
+                             bus::KernelSource& out) const {
+        if (font >= banks_.size() || note >= kNoteCount) return false;
+        const Bank& bank = banks_[font];
+        if (localRegion >= bank.data->regionCount) return false;
+        const uint32_t index = bank.regionBase + localRegion;
+        if (index >= prepared_.size() || !prepared_[index].valid) return false;
+        const SFSampleRegion& region = bank.data->regions[localRegion];
+        const PreparedRegion& p = prepared_[index];
+        out = bus::KernelSource{};
+        out.samples = sampleData_.data();
+        out.sampleFrames = sampleFrames_;
+        out.sampleStart = bank.sampleBase + uint32_t(region.startOffset);
+        out.sampleEnd = bank.sampleBase + uint32_t(region.endOffset);
+        out.loopStart = bank.sampleBase + uint32_t(region.loopStartOffset);
+        out.loopEnd = bank.sampleBase + uint32_t(region.loopEndOffset);
+        out.loopMode = region.loopMode;
+        out.phaseStep = p.baseStep[note];
+        out.gain = p.attenuation * holdGain_;
+        out.panL = p.panL;
+        out.panR = p.panR;
+        out.delay = p.delay;
+        out.hold = p.hold;
+        out.attack = holdOnset_ ? holdOnset_ : p.attack;
+        out.decay = p.decay;
+        out.decaySlope = p.decaySlope;
+        out.sustain = p.sustain;
+        out.releaseDecay = p.releaseDecay;
+        out.releaseFrames = p.release;
+        out.filter = p.filter;
+        return true;
+    }
+    float VelocityGain(uint8_t velocity) const { return velGain_[velocity & 127u]; }
+    // The channel's current mix gains (volume, expression, pan, master) that multiply every voice on it.
+    void ChannelMixScale(uint8_t channel, float& left, float& right) const {
+        const ChannelParamsSnapshot& cp = channels_.GetParams()[channel & 15u];
+        left = cp.mixScaleLeft;
+        right = cp.mixScaleRight;
+    }
 
     ~StandaloneSynth() {
 #if defined(SVMS_GPU_STAGE)

@@ -447,6 +447,14 @@ if(NOT WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_release_convolver COMMAND svms_v3_release_convolver_tests)
 
+        add_executable(svms_v3_release_kernel_tests
+            tests/ReleaseKernelTests.cpp
+            ${SVMS_PORTABLE_RENDER_SOURCES})
+        target_include_directories(svms_v3_release_kernel_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(svms_v3_release_kernel_tests PRIVATE Threads::Threads)
+        add_test(NAME svms_v3_release_kernel COMMAND svms_v3_release_kernel_tests)
+
         add_executable(svms_v3_stage_solver_tests tests/StageSolverTests.cpp)
         target_include_directories(svms_v3_stage_solver_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -1542,6 +1550,28 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_release_convolver_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_release_convolver COMMAND svms_v3_release_convolver_tests)
+
+    add_executable(svms_v3_release_kernel_tests
+        tests/ReleaseKernelTests.cpp
+        synth/Config.cpp
+        synth/SoundFont.cpp
+        synth/SfzLoader.cpp
+        render/RenderKernels.cpp
+        render/RenderWorkers.cpp
+        render/RenderDispatch.cpp
+        render/RenderKernelsSSE2.cpp
+        render/RenderKernelsAVX2.cpp
+        render/GpuSynth.cpp
+        render/GpuDevice.cpp
+        render/GpuStage.cpp
+        render/GpuBackendGL.cpp $<TARGET_OBJECTS:svms_gpu_cuda>)
+    target_compile_definitions(svms_v3_release_kernel_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_release_kernel_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party")
+    target_link_libraries(svms_v3_release_kernel_tests PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME svms_v3_release_kernel COMMAND svms_v3_release_kernel_tests)
 
     add_executable(svms_v3_stage_solver_tests
         tests/StageSolverTests.cpp)
