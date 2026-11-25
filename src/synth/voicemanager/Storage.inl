@@ -261,6 +261,8 @@ inline void VoiceManager::CopyFrom(const VoiceManager& other) {
     retireImmediateCount_ = other.retireImmediateCount_;
     stealCount_ = other.stealCount_;
     voiceLimit_ = other.voiceLimit_;
+    configuredVoiceLimit_ = other.configuredVoiceLimit_;
+    shedVoiceLimit_ = other.shedVoiceLimit_;
     stealFadeFrames_ = other.stealFadeFrames_;
     currentFrame_ = other.currentFrame_;
     lastVoiceLimitEnforceFrame_ = other.lastVoiceLimitEnforceFrame_;
@@ -358,6 +360,7 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
         !ReserveMetadata(requested)) {
         maxVoices_ = 0u;
         voiceLimit_ = 0u;
+        configuredVoiceLimit_ = 0u;
         return false;
     }
     // The releasing ring is a stand-in for what the bucketed index does for
@@ -368,6 +371,8 @@ inline bool VoiceManager::Initialize(uint32_t maxVoices, uint32_t sampleRate) {
     }
     maxVoices_ = requested;
     voiceLimit_ = requested;
+    configuredVoiceLimit_ = requested;
+    shedVoiceLimit_ = UINT32_MAX;
     sampleRate_ = sampleRate > 0 ? sampleRate : 44100;
     stealFadeFrames_ = kStealFadeFrames;
     Reset();
@@ -646,6 +651,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
         grown.releasingRing_[i & grown.releasingRingMask_] =
             releasingRing_[(releasingRingHead_ + i) & releasingRingMask_];
     grown.voiceLimit_ = voiceLimit_;
+    grown.configuredVoiceLimit_ = configuredVoiceLimit_;
+    grown.shedVoiceLimit_ = shedVoiceLimit_;
     grown.currentFrame_ = currentFrame_;
     grown.lastVoiceLimitEnforceFrame_ = lastVoiceLimitEnforceFrame_;
     grown.stealFadeFrames_ = stealFadeFrames_;
@@ -707,6 +714,8 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
 
     maxVoices_ = capacity;
     voiceLimit_ = grown.voiceLimit_;
+    configuredVoiceLimit_ = grown.configuredVoiceLimit_;
+    shedVoiceLimit_ = grown.shedVoiceLimit_;
     activeCount_ = grown.activeCount_;
     freeTop_ = grown.freeTop_;
     poolDirty_ = true;
@@ -761,9 +770,23 @@ inline bool VoiceManager::GrowCapacity(uint32_t capacity) {
 
 inline bool VoiceManager::SetVoiceLimit(uint32_t limit) {
     if (limit == 0u || limit > maxVoices_) return false;
-    voiceLimit_ = limit;
+    configuredVoiceLimit_ = limit;
+    voiceLimit_ = limit < shedVoiceLimit_ ? limit : shedVoiceLimit_;
     PublishAppliedRuntimeVoiceLimit(limit);
     return true;
+}
+
+inline void VoiceManager::SetShedVoiceLimit(uint32_t limit) {
+    if (limit == 0u) limit = 1u;
+    if (limit == shedVoiceLimit_) return;
+    shedVoiceLimit_ = limit;
+    if (configuredVoiceLimit_ == 0u) return;
+    const uint32_t effective =
+        configuredVoiceLimit_ < limit ? configuredVoiceLimit_ : limit;
+    if (effective == voiceLimit_) return;
+    voiceLimit_ = effective;
+    if (activeCount_ > voiceLimit_)
+        lastVoiceLimitEnforceFrame_ = UINT64_MAX;  // shed at the next boundary
 }
 
 inline uint32_t VoiceManager::EnforceVoiceLimit(uint32_t maxReleases,
@@ -1023,20 +1046,20 @@ inline void VoiceManager::ApplyRuntimeVoiceLimit(uint64_t frame) {
     // render workers are consuming the block.
     uint32_t requestedLimit = RequestedRuntimeVoiceLimit();
     if (requestedLimit > RuntimeVoiceGrowthCeiling()) {
-        RequestRuntimeVoiceLimit(voiceLimit_);
-        requestedLimit = voiceLimit_;
+        RequestRuntimeVoiceLimit(configuredVoiceLimit_);
+        requestedLimit = configuredVoiceLimit_;
     }
     if (requestedLimit > maxVoices_ && requestedLimit <= kMaxPolyphony) {
         if (!GrowCapacity(requestedLimit)) {
             // Do not retry a failed large allocation every render boundary.
             // Keep the last applied cap and let a later user action request
             // growth again explicitly.
-            RequestRuntimeVoiceLimit(voiceLimit_);
-            requestedLimit = voiceLimit_;
+            RequestRuntimeVoiceLimit(configuredVoiceLimit_);
+            requestedLimit = configuredVoiceLimit_;
         }
     }
     if (requestedLimit != 0u && requestedLimit <= maxVoices_ &&
-        requestedLimit != voiceLimit_) {
+        requestedLimit != configuredVoiceLimit_) {
         SetVoiceLimit(requestedLimit);
         lastVoiceLimitEnforceFrame_ = UINT64_MAX; // enforce this boundary
     }

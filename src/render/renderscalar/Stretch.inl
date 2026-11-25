@@ -29,26 +29,40 @@ inline void RenderScalar::RenderBlock(VoiceManager& voices, const ChannelCache& 
     (void)cfg;
     // Render-time cap: time this block and hand the governor what it was
     // offered and what it started, on every way out of the block.
+    // The planning share comes from the whole-voice phase counters (MSVC
+    // builds); without them the whole block counts as planning.
     const bool capOn = renderCap_.Percent() != 0u;
     struct CapClock {
-        RenderCapGovernor& governor;
+        RenderScalar& renderer;
+        VoiceManager& voices;
         bool on;
         std::chrono::steady_clock::time_point start;
         double blockSeconds;
+        uint64_t plan0, phases0;
         uint64_t offered = 0u;
         uint64_t admitted = 0u;
         ~CapClock() {
             if (!on) return;
             const double spent = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - start).count();
-            governor.Update(spent, blockSeconds, offered, admitted);
+            const uint64_t plan = renderer.wvPlanCycles_ - plan0;
+            const uint64_t phases = renderer.wvPlanCycles_ +
+                renderer.wvJobCycles_ + renderer.wvPostCycles_ - phases0;
+            const double planShare = phases != 0u
+                ? static_cast<double>(plan) / static_cast<double>(phases) : 1.0;
+            renderer.renderCap_.Update(spent, blockSeconds, offered, admitted,
+                                       planShare, voices.GetActiveCount());
         }
-    } capClock{renderCap_, capOn,
+    } capClock{*this, voices, capOn,
                capOn ? std::chrono::steady_clock::now()
                      : std::chrono::steady_clock::time_point{},
                voices.GetSampleRate() != 0u
                    ? static_cast<double>(numFrames) / voices.GetSampleRate()
-                   : 0.0};
+                   : 0.0,
+               wvPlanCycles_, wvPlanCycles_ + wvJobCycles_ + wvPostCycles_};
+    // The voice limit the cap holds (none while it is off) lands before the
+    // runtime voice limit below sheds anything above it.
+    voices.SetShedVoiceLimit(renderCap_.VoiceBudget());
     if (capOn) {
         for (uint32_t i = 0u; i < eventCount; ++i)
             if (events[i].type == RenderEventType::NoteOn)

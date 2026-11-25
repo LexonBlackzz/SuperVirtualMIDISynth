@@ -3231,14 +3231,17 @@ void TestRenderCap() {
         Check(g.Budget() == RenderCapGovernor::kUnlimited,
               "render cap: blocks under the cap are never limited");
     }
-    {   // Over the cap: the budget shrinks in proportion, with a floor.
+    {   // Over the cap with planning the whole cost: planning gets half the
+        // cap, so the note budget shrinks to fit that, with a floor.
         RenderCapGovernor g;
         g.SetPercent(50u);
         g.Update(2.0 * 0.5 * block, block, 1000u, 1000u);  // twice the target
-        Check(g.Budget() == 500u, "render cap: overrun scales the budget");
-        g.Update(4.0 * 0.5 * block, block, 1000u, 500u);
-        Check(g.Budget() == 125u, "render cap: a second overrun scales again");
-        g.Update(100.0 * block, block, 1000u, 125u);
+        Check(g.Budget() == 250u, "render cap: overrun scales the budget");
+        Check(g.VoiceBudget() == RenderCapGovernor::kUnlimited,
+              "render cap: planning-bound blocks keep every voice");
+        g.Update(4.0 * 0.5 * block, block, 1000u, 250u);
+        Check(g.Budget() == 31u, "render cap: a second overrun scales again");
+        g.Update(100.0 * block, block, 1000u, 31u);
         Check(g.Budget() == RenderCapGovernor::kFloorUnits,
               "render cap: the budget never falls under the floor");
         g.Update(100.0 * block, block, 0u, 0u);
@@ -3249,9 +3252,9 @@ void TestRenderCap() {
         // and is lifted after a run of comfortable blocks.
         RenderCapGovernor g;
         g.SetPercent(50u);
-        g.Update(2.0 * 0.5 * block, block, 1000u, 1000u);   // budget 500
-        g.Update(0.45 * block, block, 1000u, 500u);          // binding, 90% of target
-        Check(g.Budget() > 500u && g.Budget() <= 557u,
+        g.Update(2.0 * 0.5 * block, block, 1000u, 1000u);   // budget 250
+        g.Update(0.45 * block, block, 1000u, 250u);          // binding, 90% of target
+        Check(g.Budget() > 250u && g.Budget() <= 279u,
               "render cap: growth follows the headroom");
         const uint32_t before = g.Budget();
         g.Update(0.01 * block, block, 1000u, before);
@@ -3268,6 +3271,58 @@ void TestRenderCap() {
         g.SetPercent(0u);
         Check(g.Budget() == RenderCapGovernor::kUnlimited,
               "render cap: turning it off lifts the budget at once");
+    }
+    {   // Over the cap with the sounding voices the cost: new notes keep
+        // starting and the voice limit comes down instead.
+        RenderCapGovernor g;
+        g.SetPercent(50u);
+        const double target = 0.5 * block;
+        g.Update(2.0 * target, block, 1000u, 1000u, 0.1, 10000u);
+        // Planning 0.2 target fits its half; voices 1.8 target get 0.8.
+        Check(g.Budget() == RenderCapGovernor::kUnlimited,
+              "render cap: voice-bound blocks start every new note");
+        Check(g.VoiceBudget() == 4444u,
+              "render cap: voice-bound overrun scales the voice limit");
+        g.Update(100.0 * target, block, 1000u, 1000u, 0.0, 4444u);
+        Check(g.VoiceBudget() == RenderCapGovernor::kFloorVoices,
+              "render cap: the voice limit never falls under its floor");
+        // Both costs over: both limits come down.
+        RenderCapGovernor both;
+        both.SetPercent(50u);
+        both.Update(4.0 * target, block, 1000u, 1000u, 0.5, 8000u);
+        Check(both.Budget() == 250u && both.VoiceBudget() == 2000u,
+              "render cap: planning and voices are cut each to its share");
+        // Voices still at the limit are binding: no lift while they are.
+        for (uint32_t i = 0u; i < 2u * RenderCapGovernor::kReleaseBlocks; ++i)
+            both.Update(0.01 * block, block, 10u, 10u, 0.5, both.VoiceBudget());
+        Check(both.VoiceBudget() != RenderCapGovernor::kUnlimited &&
+                  both.VoiceBudget() > 2000u,
+              "render cap: a binding voice limit grows instead of lifting");
+        for (uint32_t i = 0u; i < RenderCapGovernor::kReleaseBlocks; ++i)
+            both.Update(0.01 * block, block, 10u, 10u, 0.5, 100u);
+        Check(both.VoiceBudget() == RenderCapGovernor::kUnlimited &&
+                  both.Budget() == RenderCapGovernor::kUnlimited,
+              "render cap: both limits lift after the calm run");
+    }
+    {   // The voice manager sheds down to a shed limit and comes back to the
+        // configured limit once it is lifted, without touching that limit.
+        svms::VoiceManager voices;
+        Check(voices.Initialize(512u, 44100u), "render cap shed pool allocates");
+        voices.SetVoiceLimit(400u);
+        voices.SetShedVoiceLimit(300u);
+        Check(voices.GetVoiceLimit() == 300u &&
+                  voices.GetConfiguredVoiceLimit() == 400u,
+              "render cap: a shed limit lowers the effective limit only");
+        voices.SetVoiceLimit(350u);
+        Check(voices.GetVoiceLimit() == 300u &&
+                  voices.GetConfiguredVoiceLimit() == 350u,
+              "render cap: a new configured limit stays under the shed limit");
+        voices.SetShedVoiceLimit(RenderCapGovernor::kUnlimited);
+        Check(voices.GetVoiceLimit() == 350u,
+              "render cap: lifting the shed limit restores the configured one");
+        voices.SetShedVoiceLimit(1000u);
+        Check(voices.GetVoiceLimit() == 350u,
+              "render cap: a shed limit above the configured one changes nothing");
     }
 
     // Through RenderBlock: with the budget forced each block, the capped
@@ -3312,12 +3367,13 @@ void TestRenderCap() {
     uint32_t mismatchedBlocks = 0u;
     uint64_t totalDropped = 0u;
     for (uint32_t block = 0; block < kBlocks; ++block) {
-        // Force the budget: an overrun of exactly 2x with 2*kBudget admitted.
+        // Force the budget: planning alone at 2x the cap (half of it allowed),
+        // with 4*kBudget admitted, gives exactly kBudget.
         svms::RenderCapGovernor& g = capped.RenderCapForTest();
         g.SetPercent(0u);
         g.Update(0.0, 1.0, 0u, 0u);
         g.SetPercent(50u);
-        g.Update(1.0, 1.0, 2u * kBudget, 2u * kBudget);
+        g.Update(1.0, 1.0, 4u * kBudget, 4u * kBudget);
         const uint64_t blockStartFrame = 20000u + block * kFrames;
         std::vector<RenderEvent> events;
         uint32_t sequence = 0u;

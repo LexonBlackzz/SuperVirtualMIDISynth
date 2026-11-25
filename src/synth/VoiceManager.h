@@ -840,6 +840,12 @@ public:
     // Logical live ceiling. It may move freely inside (or grow) the pool.
     uint32_t GetVoiceLimit() const { return voiceLimit_; }
     uint32_t GetSampleRate() const { return sampleRate_; }
+    // The limit set by the user or the config, before any shed limit.
+    uint32_t GetConfiguredVoiceLimit() const { return configuredVoiceLimit_; }
+    // Render-time cap: holds the effective voice limit at `limit` (UINT32_MAX
+    // = no shed limit) without changing the configured one. Voices above it
+    // leave over a short release at the next block boundary, quietest first.
+    void SetShedVoiceLimit(uint32_t limit);
     bool GrowCapacity(uint32_t capacity);
     // NOTE: phase rotation is no longer applied per-voice at note-on (see
     // PhaseRotator below). Delaying individual voice onsets only rotates
@@ -1315,6 +1321,10 @@ private:
     };
     uint32_t maxVoices_;
     uint32_t voiceLimit_;
+    // The configured limit, and the render cap's shed limit under it
+    // (UINT32_MAX = none). voiceLimit_ is the smaller of the two.
+    uint32_t configuredVoiceLimit_ = 0u;
+    uint32_t shedVoiceLimit_ = UINT32_MAX;
     uint32_t sampleRate_;
     // Per-voice phase rotation (PhaseRotation.h).  Audio-thread-only;
     // 0 = Coherent (v.rot == nullptr, bit-exact render path).
