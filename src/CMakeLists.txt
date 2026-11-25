@@ -442,6 +442,11 @@ if(NOT WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
 
+        add_executable(svms_v3_release_convolver_tests tests/ReleaseConvolverTests.cpp)
+        target_include_directories(svms_v3_release_convolver_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME svms_v3_release_convolver COMMAND svms_v3_release_convolver_tests)
+
         add_executable(svms_v3_stage_solver_tests tests/StageSolverTests.cpp)
         target_include_directories(svms_v3_stage_solver_tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -1529,6 +1534,14 @@ if(SVMS_BUILD_TESTS)
     target_include_directories(svms_v3_limiter_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME svms_v3_limiter COMMAND svms_v3_limiter_tests)
+
+    add_executable(svms_v3_release_convolver_tests
+        tests/ReleaseConvolverTests.cpp)
+    target_compile_definitions(svms_v3_release_convolver_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(svms_v3_release_convolver_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME svms_v3_release_convolver COMMAND svms_v3_release_convolver_tests)
 
     add_executable(svms_v3_stage_solver_tests
         tests/StageSolverTests.cpp)

@@ -1,0 +1,159 @@
+#include "render/ReleaseConvolver.h"
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <vector>
+
+namespace {
+
+using svms::bus::ConvHistory;
+using svms::bus::ConvKernel;
+using svms::bus::MakeKernel;
+
+struct Kernel {
+    std::vector<float> l, r;
+};
+
+Kernel RandomKernel(int length, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    Kernel k;
+    k.l.resize(static_cast<size_t>(length));
+    k.r.resize(static_cast<size_t>(length));
+    for (int i = 0; i < length; ++i) {
+        const float fade = std::exp(-3.0f * i / length);
+        k.l[static_cast<size_t>(i)] = u(rng) * fade;
+        k.r[static_cast<size_t>(i)] = u(rng) * fade;
+    }
+    return k;
+}
+
+// Sparse impulses (most of the input of a bus) with a stretch of dense noise in the middle.
+std::vector<float> RandomInput(int frames, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> gap(0, 40);
+    std::vector<float> x(static_cast<size_t>(frames), 0.0f);
+    for (int i = 0; i < frames; i += 1 + gap(rng)) x[static_cast<size_t>(i)] = u(rng);
+    for (int i = frames / 3; i < frames / 3 + 500 && i < frames; ++i) x[static_cast<size_t>(i)] = u(rng);
+    return x;
+}
+
+// Runs the convolver block by block and returns the stereo output, interleaved by side: [0, frames) left,
+// [frames, 2 frames) right.
+std::vector<float> Convolve(const ConvKernel& k, const std::vector<float>& x, int block) {
+    const int frames = static_cast<int>(x.size());
+    std::vector<float> out(static_cast<size_t>(2 * frames), 0.0f);
+    ConvHistory h;
+    h.Prepare(k);
+    for (int b = 0; b + block <= frames; b += block)
+        h.Process(k, &x[static_cast<size_t>(b)], &out[static_cast<size_t>(b)], &out[static_cast<size_t>(frames + b)]);
+    return out;
+}
+
+// Largest error against direct convolution in double, relative to the reference's peak.
+double DirectError(const Kernel& kern, const std::vector<float>& x, const std::vector<float>& got) {
+    const int frames = static_cast<int>(x.size()), len = static_cast<int>(kern.l.size());
+    double peak = 0.0, err = 0.0;
+    for (int side = 0; side < 2; ++side) {
+        const std::vector<float>& h = side ? kern.r : kern.l;
+        for (int t = 0; t < frames; ++t) {
+            double y = 0.0;
+            for (int tau = 0; tau < len && tau <= t; ++tau) y += double(h[static_cast<size_t>(tau)]) * x[static_cast<size_t>(t - tau)];
+            peak = std::fmax(peak, std::fabs(y));
+            err = std::fmax(err, std::fabs(y - got[static_cast<size_t>(side * frames + t)]));
+        }
+    }
+    return err / (std::max)(peak, 1e-30);
+}
+
+bool MatchesDirect(int block, int length, int levels, int blocks, unsigned seed, const char* name) {
+    const Kernel kern = RandomKernel(length, seed);
+    const ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, levels);
+    const std::vector<float> x = RandomInput(block * blocks, seed + 1);
+    const double e = DirectError(kern, x, Convolve(k, x, block));
+    const bool ok = e < 2e-6;
+    std::printf("%s %s: block %d, kernel %d frames, %zu levels, error %.2e of peak\n", ok ? "PASS" : "FAIL", name,
+                block, length, k.levels.size(), e);
+    return ok;
+}
+
+// An impulse in a block's first frame reaches that block's own output: no latency, left and right apart.
+bool ZeroLatency() {
+    const int block = 64, length = 64 * 40;
+    const Kernel kern = RandomKernel(length, 7);
+    const ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, 3);
+    std::vector<float> x(static_cast<size_t>(block * 50), 0.0f);
+    x[static_cast<size_t>(3 * block)] = 1.0f;
+    const std::vector<float> y = Convolve(k, x, block);
+    double err = 0.0;
+    for (int t = 0; t < length; ++t) {
+        err = std::fmax(err, std::fabs(y[static_cast<size_t>(3 * block + t)] - kern.l[static_cast<size_t>(t)]));
+        err = std::fmax(err, std::fabs(y[x.size() + static_cast<size_t>(3 * block + t)] - kern.r[static_cast<size_t>(t)]));
+    }
+    double before = 0.0;
+    for (int t = 0; t < 3 * block; ++t) before = std::fmax(before, std::fabs(y[static_cast<size_t>(t)]));
+    const bool ok = err < 1e-5 && before == 0.0;
+    std::printf("%s zero latency: impulse response error %.2e, output before the impulse %.2e\n", ok ? "PASS" : "FAIL", err, before);
+    return ok;
+}
+
+// The work of the long partitions is spread: no block does much more than the average.
+bool EvenWork() {
+    const int block = 1024, length = 240000;
+    const Kernel kern = RandomKernel(length, 11);
+    const ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, 3);
+    ConvHistory h;
+    h.Prepare(k);
+    std::vector<float> in(static_cast<size_t>(block), 0.0f), l(static_cast<size_t>(block)), r(static_cast<size_t>(block));
+    double sum = 0.0, most = 0.0;
+    const int blocks = 512;
+    for (int b = 0; b < blocks; ++b) {
+        h.Process(k, in.data(), l.data(), r.data());
+        sum += h.LastBlockFlops();
+        most = std::fmax(most, h.LastBlockFlops());
+    }
+    const double mean = sum / blocks, perFrame = svms::bus::FlopsPerFrame(k);
+    const bool ok = most < 1.35 * mean && std::fabs(mean / block - perFrame) < 0.01 * perFrame;
+    std::printf("%s even work: %zu levels, %.0f flops per frame, busiest block %.2fx the mean\n", ok ? "PASS" : "FAIL",
+                k.levels.size(), perFrame, most / mean);
+    return ok;
+}
+
+// Time per second of 48 kHz output for one history on a release-bus-sized kernel. Informational.
+void Bench() {
+    const int block = 1024, length = 240000, blocks = 4000;
+    const Kernel kern = RandomKernel(length, 13);
+    const ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, 3);
+    ConvHistory h;
+    h.Prepare(k);
+    std::vector<float> in(static_cast<size_t>(block), 0.0f), l(static_cast<size_t>(block)), r(static_cast<size_t>(block));
+    in[5] = 1.0f;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int b = 0; b < blocks; ++b) h.Process(k, in.data(), l.data(), r.data());
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double audio = double(blocks) * block / 48000.0;
+    std::printf("bench: %.0f flops per frame, %.2f ms per second of audio (%.2f GFLOP/s), %.0f histories per core in realtime\n",
+                svms::bus::FlopsPerFrame(k), 1000.0 * s / audio, svms::bus::FlopsPerFrame(k) * blocks * block / s / 1e9,
+                audio / s);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "--bench")) { Bench(); return 0; }
+    bool ok = true;
+    ok &= MatchesDirect(64, 10, 3, 20, 1, "shorter than a block");
+    ok &= MatchesDirect(64, 64 * 8, 3, 40, 2, "level 0 only");
+    ok &= MatchesDirect(64, 64 * 32, 3, 120, 3, "two levels, exact");
+    ok &= MatchesDirect(64, 64 * 45 + 17, 3, 200, 4, "three levels");
+    ok &= MatchesDirect(32, 32 * 150 + 5, 4, 400, 5, "four levels");
+    ok &= MatchesDirect(64, 64 * 45 + 17, 1, 120, 6, "one uniform level");
+    ok &= ZeroLatency();
+    ok &= EvenWork();
+    std::printf(ok ? "all release convolver tests passed\n" : "release convolver tests FAILED\n");
+    return ok ? 0 : 1;
+}
